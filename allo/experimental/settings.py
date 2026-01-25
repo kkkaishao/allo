@@ -1,0 +1,2 @@
+USE_TENSOR = False
+SANITIZE_OVERFLOW = False

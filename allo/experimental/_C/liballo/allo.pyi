@@ -1,0 +1,229 @@
+from enum import Enum
+from typing import Sequence, Optional
+from . import ir
+
+class CallOp(ir.OpState):
+    def __init__(*args, **kwargs): ...
+    @staticmethod
+    def create(
+        builder: ir.AlloOpBuilder,
+        kernel: KernelOp,
+        args: Sequence[ir.Value],
+    ) -> CallOp: ...
+
+class KernelOp(ir.OpState):
+    def __init__(*args, **kwargs): ...
+    def add_entry_block(self) -> ir.Block: ...
+    @staticmethod
+    def create(
+        builder: ir.AlloOpBuilder,
+        name: str,
+        type: ir.FunctionType,
+        arg_attrs: Sequence[ir.DictionaryAttr] = [],
+        virtual_mapping: Sequence[int] | None = None,
+    ) -> KernelOp: ...
+    def get_arg_at(self, idx: int) -> ir.BlockArgument: ...
+    @property
+    def func_name(self) -> str: ...
+    @property
+    def func_type(self) -> ir.FunctionType: ...
+    @property
+    def num_args(self) -> int: ...
+    @property
+    def virtual_mapping(self) -> list[int] | None: ...
+    @virtual_mapping.setter
+    def virtual_mapping(self, map: Sequence[int]) -> None: ...
+    def set_arg_attr(self, arg_no: int, name: str, attr: ir.Attribute) -> None: ...
+    def set_type(self, type: ir.Type) -> None: ...
+
+class ReturnOp(ir.OpState):
+    def __init__(*args, **kwargs): ...
+    @staticmethod
+    def create(builder: ir.AlloOpBuilder, operands: Sequence[ir.Value]) -> ReturnOp: ...
+
+class StreamCreateOp(ir.OpState):
+    def __init__(*args, **kwargs): ...
+    @staticmethod
+    def create(
+        builder: ir.AlloOpBuilder, name: str, stream_type: StreamType
+    ) -> StreamCreateOp: ...
+
+class StreamGetOp(ir.OpState):
+    def __init__(*args, **kwargs): ...
+    @staticmethod
+    def create(builder: ir.AlloOpBuilder, stream: ir.Value) -> ir.Value: ...
+
+class StreamPutOp(ir.OpState):
+    def __init__(*args, **kwargs): ...
+    @staticmethod
+    def create(
+        builder: ir.AlloOpBuilder, value: ir.Value, stream: ir.Value
+    ) -> StreamPutOp: ...
+
+class StreamType(ir.Type):
+    def __init__(*args, **kwargs): ...
+    @staticmethod
+    def get(context: ir.Context, base_type: ir.Type, depth: int = 2) -> StreamType: ...
+
+class ChannelType(ir.Type):
+    def __int__(*args, **kwargs): ...
+    @staticmethod
+    def get(
+        context: ir.Context, data_type: ir.Type, capacity: int = 2
+    ) -> ChannelType: ...
+
+class ChanToStreamOp(ir.OpState):
+    def __init__(*args, **kwargs): ...
+    @staticmethod
+    def create(
+        builder: ir.AlloOpBuilder,
+        chan: str,
+        indices: Sequence[ir.Value],
+        stream_ty: StreamType,
+        map: ir.AffineMap,
+    ) -> ir.Value: ...
+    @property
+    def chan(self) -> str: ...
+    @property
+    def map(self) -> ir.AffineMap: ...
+
+class ChanAcquireBufferOp(ir.OpState):
+    def __init__(*args, **kwargs): ...
+    @staticmethod
+    def create(
+        builder: ir.AlloOpBuilder,
+        chan: str,
+        indices: Sequence[ir.Value],
+        tys: ir.Type,
+        size: int = 1,
+    ) -> ChanAcquireBufferOp: ...
+    @property
+    def chan(self) -> str: ...
+
+class ChanReleaseBufferOp(ir.OpState):
+    def __init__(*args, **kwargs): ...
+    @staticmethod
+    def create(
+        builder: ir.AlloOpBuilder,
+        chan: str,
+        indices: Sequence[ir.Value],
+        buffers: Sequence[ir.Value],
+    ) -> ChanReleaseBufferOp: ...
+    @property
+    def chan(self) -> str: ...
+
+class ChanCreateOp(ir.OpState):
+    def __init__(*args, **kwargs): ...
+    @staticmethod
+    def create(
+        builder: ir.AlloOpBuilder,
+        name: str,
+        chan_ty: ChannelType,
+        shape: Sequence[int] = [],
+    ) -> ChanCreateOp: ...
+
+class RaiseToAffineOp(ir.OpState):
+    def __init__(*args, **kwargs): ...
+    @staticmethod
+    def create(builder: ir.AlloOpBuilder, target: ir.Value) -> RaiseToAffineOp: ...
+
+class OutlineOp(ir.OpState):
+    def __init__(*args, **kwargs): ...
+    @staticmethod
+    def create(
+        builder: ir.AlloOpBuilder, target: ir.Value, func_name: str
+    ) -> OutlineOp: ...
+
+class TagPipelineOp(ir.OpState):
+    def __init__(*args, **kwargs): ...
+    @staticmethod
+    def create(
+        builder: ir.AlloOpBuilder, target: ir.Value, ii: int
+    ) -> TagPipelineOp: ...
+
+class TagUnrollOp(ir.OpState):
+    def __init__(*args, **kwargs): ...
+    @staticmethod
+    def create(
+        builder: ir.AlloOpBuilder, target: ir.Value, factor: int
+    ) -> TagUnrollOp: ...
+
+class LoopSplitOp(ir.OpState):
+    def __init__(*args, **kwargs): ...
+    @staticmethod
+    def create(
+        builder: ir.AlloOpBuilder, loop: ir.Value, factor: int
+    ) -> LoopSplitOp: ...
+
+class LoopTileOp(ir.OpState):
+    def __init__(*args, **kwargs): ...
+    @staticmethod
+    def create(
+        builder: ir.AlloOpBuilder, loops: ir.Value, factors: Sequence[int]
+    ) -> LoopTileOp: ...
+
+class LoopFlattenOp(ir.OpState):
+    def __init__(*args, **kwargs): ...
+    @staticmethod
+    def create(builder: ir.AlloOpBuilder, loops: ir.Value) -> LoopFlattenOp: ...
+
+class LoopReorderOp(ir.OpState):
+    def __init__(*args, **kwargs): ...
+    @staticmethod
+    def create(
+        builder: ir.AlloOpBuilder, loops: ir.Value, permutation: Sequence[int]
+    ) -> LoopReorderOp: ...
+
+class ComputeAtOp(ir.OpState):
+    def __init__(*args, **kwargs): ...
+    @staticmethod
+    def create(
+        builder: ir.AlloOpBuilder, producer: ir.Value, consumer_loop: ir.Value
+    ) -> ComputeAtOp: ...
+
+class ReuseAtOp(ir.OpState):
+    def __init__(*args, **kwargs): ...
+    @staticmethod
+    def create(
+        builder: ir.AlloOpBuilder, target: ir.Value, axis: ir.Value
+    ) -> ReuseAtOp: ...
+
+class RenameOp(ir.OpState):
+    def __init__(*args, **kwargs): ...
+    @staticmethod
+    def create(
+        builder: ir.AlloOpBuilder, target: ir.Value, new_name: str
+    ) -> RenameOp: ...
+
+class GetProgramIdOp(ir.OpState):
+    def __init__(*args, **kwargs): ...
+    @staticmethod
+    def create(builder: ir.AlloOpBuilder, dim: int) -> ir.Value: ...
+
+class GetNumProgramsOp(ir.OpState):
+    def __init__(*args, **kwargs): ...
+    @staticmethod
+    def create(builder: ir.AlloOpBuilder, dim: int) -> ir.Value: ...
+
+class BitExtractOp(ir.OpState):
+    def __init__(*args, **kwargs): ...
+    @staticmethod
+    def create(
+        builder: ir.AlloOpBuilder, src: ir.Value, lo: ir.Value, width: int
+    ) -> ir.Value: ...
+
+class BitInsertOp(ir.OpState):
+    def __init__(*args, **kwargs): ...
+    @staticmethod
+    def create(
+        builder: ir.AlloOpBuilder,
+        dst: ir.Value,
+        src: ir.Value,
+        lo: ir.Value,
+        width: int,
+    ) -> ir.Value: ...
+
+class BitConcatOp(ir.OpState):
+    def __init__(*args, **kwargs): ...
+    @staticmethod
+    def create(builder: ir.AlloOpBuilder, srcs: Sequence[ir.Value]) -> ir.Value: ...

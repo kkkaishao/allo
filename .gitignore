@@ -62,6 +62,7 @@ rapidjson
 
 build
 .vscode
+.idea
 
 # MLIR intermediate results
 *.opt
@@ -82,6 +83,10 @@ tmp
 *.dot
 *.egg-info
 *.so
+.DS_Store
+__pycache__
+.cache
+.venv
 
 docs/source/gallery
 log

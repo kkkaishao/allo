@@ -31,10 +31,23 @@ class CMakeBuild(build_ext):
             self.build_extension(ext)
 
     def build_extension(self, ext):
-        # Retrieve LLVM_BUILD_DIR from environment variable
+        # Auto-detect LLVM build directory if not set
         llvm_build_dir = os.environ.get("LLVM_BUILD_DIR")
         if not llvm_build_dir:
-            raise RuntimeError("LLVM_BUILD_DIR environment variable is not set")
+            default_dir = os.path.join(os.getcwd(), "externals", "llvm-project", "build")
+            if not os.path.exists(default_dir):
+                raise RuntimeError(
+                    "LLVM_BUILD_DIR environment variable is not set and default directory does not exist. "
+                    "Please set LLVM_BUILD_DIR to the path of your LLVM build directory."
+                )
+            llvm_build_dir = default_dir
+            default_dir = os.path.join(os.getcwd(), "externals", "llvm-project", "build")
+            if not os.path.exists(default_dir):
+                raise RuntimeError(
+                    "LLVM_BUILD_DIR environment variable is not set and default directory does not exist. "
+                    "Please set LLVM_BUILD_DIR to the path of your LLVM build directory."
+                )
+            llvm_build_dir = default_dir
 
         # Auto-detect nanobind cmake directory if not set
         nanobind_cmake_dir = os.environ.get("NANOBIND_CMAKE_DIR")
@@ -50,9 +63,10 @@ class CMakeBuild(build_ext):
                 )
         cmake_args = [
             f"-DMLIR_DIR={llvm_build_dir}/lib/cmake/mlir",
+            f"-DLLVM_DIR={llvm_build_dir}/lib/cmake/llvm",
             f"-DPython3_EXECUTABLE={sys.executable}",
+            f"-DPython_EXECUTABLE={sys.executable}",
             f"-Dnanobind_DIR={nanobind_cmake_dir}",
-            "-DMLIR_BINDINGS_PYTHON_NB_DOMAIN=allo",
         ]
 
         build_temp = os.path.join(ext.sourcedir, "build")
@@ -106,7 +120,8 @@ if __name__ == "__main__":
         setup_requires=["nanobind>=2.9"],
         install_requires=parse_requirements("requirements.txt"),
         packages=find_packages(),
-        ext_modules=[CMakeExtension("mlir", sourcedir="mlir")],
+        package_data={"allo.experimental.core": ["types.pyi"]},
+        ext_modules=[CMakeExtension("allo", sourcedir="")],
         cmdclass={"build_ext": CMakeBuild},
         url="https://github.com/cornell-zhang/allo",
         python_requires=">=3.12",

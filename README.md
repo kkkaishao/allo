@@ -1,6 +1,30 @@
 <!--- Copyright Allo authors. All Rights Reserved. -->
 <!--- SPDX-License-Identifier: Apache-2.0  -->
 
+## Test
+
+To compile python bindings
+```bash
+cd mlir
+mkdir build && cd build
+conda activate allo
+# requires nanobind, make sure it is installed in your conda environment
+cmake -G Ninja .. -DLLVM_DIR=/path/to/llvm/lib/cmake/llvm -DMLIR_DIR=/path/to/mlir/lib/cmake/mlir
+ninja _liballo
+```
+
+simple demo
+```bash
+python test.py
+```
+
+To add a new library op and its implementation, follow the steps below:
+1. Wrap the op with `@builtin` in `experimental/language/dsl.py`.
+2. Create Python bindings for your op in `mlir/python/ops.cpp` (I didn't use upstream Python bindings)
+3. Implement the op in `experimental/language/semantics.py` under `AlloSemantic` class.
+4. Export the op in `experimental/language/__init__.py`.
+
+
 <img src="tutorials/allo-icon.png" width=128/> Accelerator Design and Programming Language
 ==============================================================================
 

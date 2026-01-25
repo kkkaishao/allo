@@ -1,12 +1,12 @@
-# Copyright Allo authors. All Rights Reserved.
-# SPDX-License-Identifier: Apache-2.0
-
 cmake_minimum_required(VERSION 3.20.0)
 cmake_policy(SET CMP0116 NEW)
 
-project(allo-dialect LANGUAGES CXX C)
+project(allo LANGUAGES C CXX)
 
 set(CMAKE_BUILD_WITH_INSTALL_NAME_DIR ON)
+set(LLVM_LIT_ARGS "-sv" CACHE STRING "Default options for lit")
+set(ALLO_SOURCE_DIR ${PROJECT_SOURCE_DIR})
+set(ALLO_BINARY_DIR ${PROJECT_BINARY_DIR})
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -37,11 +37,8 @@ include_directories(${PROJECT_SOURCE_DIR}/include)
 include_directories(${PROJECT_BINARY_DIR}/include)
 add_definitions(${LLVM_DEFINITIONS})
 
-#message(STATUS "Using Python binding")
-#include(MLIRDetectPythonEnv)
-#mlir_configure_python_dev_packages()
-
 add_subdirectory(include)
 add_subdirectory(lib)
 add_subdirectory(tools)
 add_subdirectory(python)
+add_subdirectory(test)
