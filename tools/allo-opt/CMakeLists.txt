@@ -12,8 +12,8 @@ target_link_libraries(allo-opt
     ${dialect_libs}
     ${conversion_libs}
     MLIRIR
-    MLIRRegisterAllPasses
     MLIROptLib
     MLIRAllo
+    MLIRAlloTransform
     MLIRAlloTransformOps
 )

@@ -27,13 +27,9 @@ target_link_libraries(_liballo
     # MLIR Libraries
     ${dialect_libs}
     ${conversion_libs}
-    MLIRIR
-
-    MLIRBytecodeWriter
-    MLIRSupport
-    MLIRTransforms
-
+    
     MLIRAllo
+    MLIRAlloTransform
     MLIRAlloTransformOps
 
     Python3::Module
@@ -43,7 +39,10 @@ if (WIN32)
     target_link_libraries(_liballo PRIVATE ${CMAKE_DL_LIBS})
     set_target_properties(_liballo PROPERTIES SUFFIX ".pyd")
     set_target_properties(_liballo PROPERTIES PREFIX "lib")
-else()
+elseif (DARWIN)
+    target_link_options(_liballo PRIVATE "-Wl,-no_warn_duplicate_libraries")
+    target_link_libraries(_liballo PRIVATE z)
+else ()
     target_link_libraries(_liballo PRIVATE z)
 endif ()
 target_link_options(_liballo PRIVATE ${LLVM_LDFLAGS})

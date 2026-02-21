@@ -4,8 +4,6 @@
 
 #include "allo/IR/AlloDialect.cpp.inc"
 
-#include <mlir/IR/PatternMatch.h>
-
 using namespace mlir;
 using namespace mlir::allo;
 
@@ -21,21 +19,20 @@ using namespace mlir::allo;
 #include "allo/IR/AlloOps.cpp.inc"
 
 void AlloDialect::initialize() {
+  // clang-format off
   addTypes<
 #define GET_TYPEDEF_LIST
 #include "allo/IR/AlloTypes.cpp.inc"
-
       >();
   addAttributes<
 #define GET_ATTRDEF_LIST
 #include "allo/IR/AlloAttrs.cpp.inc"
-
       >();
   addOperations<
 #define GET_OP_LIST
 #include "allo/IR/AlloOps.cpp.inc"
-
       >();
+  // clang-format on
 }
 
 void KernelOp::build(OpBuilder &builder, OperationState &state, StringRef name,
@@ -112,12 +109,17 @@ ParseResult KernelOp::parse(OpAsmParser &parser, OperationState &result) {
                              result.attributes))
     return failure();
   // Parse virtual mapping.
-  if (parser.parseKeyword("virtual_map"))
-    return failure();
-  ArrayAttr vMapAttr;
-  if (parser.parseAttribute(vMapAttr, getVirtualMappingAttrName(result.name),
-                            result.attributes))
-    return failure();
+  if (!parser.parseOptionalKeyword("virtual_map")) {
+    // virtual mapping is specified, parse the attribute.
+    ArrayAttr vMapAttr;
+    if (parser.parseAttribute(vMapAttr, getVirtualMappingAttrName(result.name),
+                              result.attributes))
+      return failure();
+  } else {
+    // virtual mapping is not specified, use default value.
+    result.addAttribute(getVirtualMappingAttrName(result.name),
+                        builder.getI64ArrayAttr(1));
+  }
   // Parse the function signature.
   SMLoc signatureLocation = parser.getCurrentLocation();
   bool isVariadic = false;

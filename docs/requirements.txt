@@ -1,0 +1,10 @@
+sphinx
+sphinx-gallery
+sphinx-copybutton
+autodocsumm
+piccolo-theme
+matplotlib
+sphinxcontrib-googleanalytics
+sphinx_rtd_theme
+numpy
+astpretty

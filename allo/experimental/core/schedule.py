@@ -1,3 +1,6 @@
+# Copyright Allo authors. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 from .._C.liballo import ir, transform as tran_d, allo as allo_d
 import inspect as pyinspect
 from dataclasses import dataclass

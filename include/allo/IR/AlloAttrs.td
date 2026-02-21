@@ -4,24 +4,24 @@
 include "mlir/IR/EnumAttr.td"
 include "allo/IR/Allo.td"
 
-def CompletePartition: I32EnumAttrCase<"Complete", 0>;
-def BlockPartition: I32EnumAttrCase<"Block", 1>;
-def CyclicPartition: I32EnumAttrCase<"Cyclic", 2>;
-
 def PartitionKindEnum : I32EnumAttr<"PartitionKindEnum",
-        "Partition kind enum for array partitioning",
-        [CompletePartition, BlockPartition, CyclicPartition]> {
-    let cppNamespace = "mlir::allo";
+  "HLS array partitioning kind",
+  [
+    I32EnumAttrCase<"Complete", 0, "complete">,
+    I32EnumAttrCase<"Block",    1, "block">,
+    I32EnumAttrCase<"Cyclic",   2, "cyclic">
+  ]> {
+  let cppNamespace = "::mlir::allo";
 }
 
 def PartitionAttr : Allo_Attr<"Partition"> {
   let mnemonic = "partition";
-  let parameters = (ins 
-    ArrayRefParameter<"allo::PartitionKindEnum">:$kinds, 
-    ArrayRefParameter<"unsigned">:$factors
-  );
+  let parameters = (ins
+    "allo::PartitionKindEnum":$kind,
+    "int64_t":$factor,
+    "int64_t":$dim);
   let assemblyFormat = [{
-    `<` `{` `kinds` `=` $kinds `,` `factors` `=` $factors `}` `>`
+    `<` `{` `kind` `=` $kind `,` `factor` `=` $factor `,` `dim` `=` $dim `}` `>`
   }];
   let cppNamespace = "mlir::allo";
 }
@@ -37,15 +37,5 @@ def StorageKindEnum : I32EnumAttr<"StorageKindEnum",
         [BRAMStorage, URAMStorage, LUTRAMStorage, DDRStorage, HBMStorage]> {
     let cppNamespace = "mlir::allo";
 }
-
-def DataflowRoleAttr : I32EnumAttr<"DataflowRoleEnum",
-  "Dataflow role annotations",
-  [
-    I32EnumAttrCase<"Consumer", 0>,
-    I32EnumAttrCase<"Producer", 1>
-  ]> {
-  let cppNamespace = "mlir::allo";
-}
-
 
 #endif // ALLO_ATTRS

@@ -57,7 +57,7 @@ allo::KernelOp convertFuncToKernel(RewriterBase &b, func::FuncOp func) {
   auto kernel = allo::KernelOp::create(
       b, func.getLoc(), func.getName(), func.getFunctionType(),
       func.getSymVisibilityAttr(), func.getArgAttrsAttr(),
-      func.getResAttrsAttr(), /*virtual_mapping=*/{});
+      func.getResAttrsAttr(), /*virtual_mapping=*/b.getI64ArrayAttr(1));
   Region &kernelRegion = kernel.getRegion();
   kernelRegion.takeBody(func.getBody());
   b.eraseOp(func);

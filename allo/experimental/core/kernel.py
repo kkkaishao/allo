@@ -289,7 +289,7 @@ class Kernel(KernelLike, Generic[P, R]):
         self.__qualname__ = fn.__qualname__
 
         self.attrs = attrs or {}
-        self.mapping = mapping or []
+        self.mapping = [_unwrap_if_constexpr(m) for m in (mapping or [])]
         _validate_mapping(self.mapping)
         self.arg_types = [None] * len(self.params)
         self._parsed_template: ast.Module | None = None
@@ -719,14 +719,14 @@ def kernel(fn: Callable[P, R]) -> Kernel[P, R]: ...
 
 @overload
 def kernel(
-    *, mapping: Optional[Sequence[int]] = None, attrs=None
+    *, mapping: Optional[Sequence] = None, attrs=None
 ) -> Callable[[Callable[P, R]], Kernel[P, R]]: ...
 
 
 def kernel(
     fn: Optional[Callable[P, R]] = None,
     *,
-    mapping: Optional[Sequence[int]] = None,
+    mapping: Optional[Sequence] = None,
     attrs=None,
 ) -> Callable[[Callable[P, R]], Kernel[P, R]] | Kernel[P, R]:
 

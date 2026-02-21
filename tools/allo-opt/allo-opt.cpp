@@ -7,7 +7,7 @@
 #include "mlir/Dialect/Tensor/TransformOps/TensorTransformOps.h"
 #include "mlir/Dialect/Vector/TransformOps/VectorTransformOps.h"
 #include "InitAllDialects.h"
-#include "mlir/InitAllPasses.h"
+#include "InitAllPasses.h"
 #include "mlir/Tools/mlir-opt/MlirOptMain.h"
 
 using namespace mlir;
@@ -15,7 +15,7 @@ using namespace mlir;
 int main(int argc, char **argv) {
   DialectRegistry registry;
   allo::registerAllDialects(registry);
-  registerAllPasses();
+  allo::registerAllPasses();
   allo::registerTransformDialectExtension(registry);
   linalg::registerTransformDialectExtension(registry);
   bufferization::registerTransformDialectExtension(registry);

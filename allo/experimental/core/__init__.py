@@ -1,9 +1,6 @@
 # Copyright Allo authors. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-from importlib import import_module
-from typing import Any
-
 from .types import (
     constexpr,
     int1,
@@ -65,12 +62,4 @@ from .types import (
 )
 
 from .library import *
-
-
-def __getattr__(name: str) -> Any:
-    if name in ("kernel", "consteval"):
-        module = import_module("allo.experimental.core.kernel")
-        value = getattr(module, name)
-        globals()[name] = value
-        return value
-    raise AttributeError(f"module '{__name__}' has no attribute '{name}'")
+from .kernel import kernel, consteval

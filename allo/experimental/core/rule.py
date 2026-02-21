@@ -1,6 +1,6 @@
-import ast
-import builtins
-from dataclasses import dataclass
+# Copyright Allo authors. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 from typing import List
 from .types import APInt, APFloat, fp32, fp64, fp16, scalar_type, index_type, index
 

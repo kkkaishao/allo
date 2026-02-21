@@ -133,6 +133,21 @@ void init_transform(nb::module_ &m) {
           [](transform::ApplyPatternsOp &self) { return self.getBody(); },
           nb::rv_policy::reference);
 
+  nb::class_<transform::ApplyRegisteredPassOp, OpState>(m,
+                                                        "ApplyRegisteredPassOp")
+      .def_static(
+          "create",
+          [](AlloOpBuilder &builder, Value &target, const std::string &passName,
+             DictionaryAttr passOptions,
+             const std::vector<Value> &dynamicArgs) {
+            auto anyOpType = transform::AnyOpType::get(builder.getContext());
+            return transform::ApplyRegisteredPassOp::create(
+                builder, builder.get_loc(), anyOpType, target, passName,
+                passOptions, dynamicArgs);
+          },
+          nb::arg("builder"), nb::arg("target"), nb::arg("pass_name"),
+          nb::arg("pass_options"), nb::arg("dynamic_args"));
+
   // operation matching
   nb::class_<transform::MatchOp, OpState>(m, "MatchOp")
       .def_static(
