@@ -13,6 +13,7 @@ allo::KernelOp convertFuncToKernel(RewriterBase &b, func::FuncOp func);
 bool affineExprUsesValue(AffineExpr expr, ValueRange mapOperands,
                          unsigned numDims, Value needle);
 int findMemRefAxisFromIV(affine::AffineStoreOp storeOp, Value iv);
+Value resolveMemRefValueRoot(Value value);
 } // namespace mlir::allo
 
 #endif // ALLO_TRANSFORM_OPS_UTILS_H

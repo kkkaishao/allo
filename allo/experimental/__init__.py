@@ -1,6 +1,6 @@
 # Copyright Allo authors. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
-
+from enum import Enum
 from importlib import import_module
 from typing import Any
 
@@ -128,3 +128,14 @@ def __getattr__(name: str) -> Any:
 
 def __dir__() -> list[str]:
     return sorted(__all__)
+
+
+class PartitionKind(Enum):
+    Complete = 0
+    Cyclic = 1
+    Block = 2
+
+
+Complete = PartitionKind.Complete
+Cyclic = PartitionKind.Cyclic
+Block = PartitionKind.Block

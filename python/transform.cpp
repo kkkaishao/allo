@@ -307,4 +307,25 @@ void init_allo_transforms(nb::module_ &m) {
                                                   producer, consumer);
           },
           nb::arg("builder"), nb::arg("producer"), nb::arg("consumer_loop"));
+
+  nb::class_<transform::MatchValueOp, OpState>(m, "MatchValueOp")
+      .def_static(
+          "create",
+          [](AlloOpBuilder &builder, Value &target, const std::string &name,
+             int64_t index) -> Value {
+            return transform::MatchValueOp::create(builder, builder.get_loc(),
+                                                   target, name, index);
+          },
+          nb::arg("builder"), nb::arg("target"), nb::arg("name"),
+          nb::arg("index"));
+
+  nb::class_<transform::PartitionOp, OpState>(m, "PartitionOp")
+      .def_static(
+          "create",
+          [](AlloOpBuilder &builder, Value &target,
+             allo::PartitionAttr &partition) {
+            return transform::PartitionOp::create(builder, builder.get_loc(),
+                                                  target, partition);
+          },
+          nb::arg("builder"), nb::arg("target"), nb::arg("partition"));
 }

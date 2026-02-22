@@ -1,5 +1,6 @@
 #include "allo/TransformOps/Utils.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/MemRef/IR/MemRef.h"
 
 namespace {
 
@@ -105,5 +106,41 @@ int findMemRefAxisFromIV(affine::AffineStoreOp storeOp, Value iv) {
       return static_cast<int>(i);
   }
   return -1;
+}
+
+// Follow view-like aliases and resolve to a root buffer value.
+Value resolveMemRefValueRoot(Value value) {
+  SmallPtrSet<Value, 8> visited;
+  while (value && visited.insert(value).second) {
+    if (isa<BlockArgument>(value))
+      return value;
+
+    Operation *defOp = value.getDefiningOp();
+    if (!defOp)
+      return value;
+
+    if (auto subview = dyn_cast<memref::SubViewOp>(defOp)) {
+      value = subview.getSource();
+      continue;
+    }
+    if (auto view = dyn_cast<memref::ViewOp>(defOp)) {
+      value = view.getSource();
+      continue;
+    }
+    if (auto reinterpretCast = dyn_cast<memref::ReinterpretCastOp>(defOp)) {
+      value = reinterpretCast.getSource();
+      continue;
+    }
+    if (auto castOp = dyn_cast<memref::CastOp>(defOp)) {
+      value = castOp.getSource();
+      continue;
+    }
+    if (auto transpose = dyn_cast<memref::TransposeOp>(defOp)) {
+      value = transpose.getIn();
+      continue;
+    }
+    return value;
+  }
+  return value;
 }
 } // namespace mlir::allo

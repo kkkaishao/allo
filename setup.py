@@ -67,6 +67,7 @@ class CMakeBuild(build_ext):
             f"-DPython3_EXECUTABLE={sys.executable}",
             f"-DPython_EXECUTABLE={sys.executable}",
             f"-Dnanobind_DIR={nanobind_cmake_dir}",
+            f"-DCMAKE_BUILD_TYPE=Release",
         ]
 
         build_temp = os.path.join(ext.sourcedir, "build")
@@ -120,8 +121,10 @@ if __name__ == "__main__":
         setup_requires=["nanobind>=2.9"],
         install_requires=parse_requirements("requirements.txt"),
         packages=find_packages(),
-        package_data={"allo.experimental.core": ["types.pyi"]},
-        ext_modules=[CMakeExtension("allo", sourcedir="")],
+        package_data={
+            "allo.experimental.core": ["types.pyi"],
+        },
+        ext_modules=[CMakeExtension("allo._liballo", sourcedir="")],
         cmdclass={"build_ext": CMakeBuild},
         url="https://github.com/cornell-zhang/allo",
         python_requires=">=3.12",

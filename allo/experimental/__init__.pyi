@@ -1,6 +1,13 @@
-# Copyright Allo authors. All Rights Reserved.
-# SPDX-License-Identifier: Apache-2.0
-
-from .core import *
 from .dsl import *
-from . import settings as settings
+from .core import *
+
+from . import settings
+
+class PartitionKind(Enum):
+    Complete = 0
+    Cyclic = 1
+    Block = 2
+
+Complete = PartitionKind.Complete
+Cyclic = PartitionKind.Cyclic
+Block = PartitionKind.Block

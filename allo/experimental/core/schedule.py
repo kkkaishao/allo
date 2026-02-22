@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from .._C.liballo import ir, transform as tran_d, allo as allo_d
+from .. import PartitionKind
 import inspect as pyinspect
 from dataclasses import dataclass
 from typing import Dict, List
@@ -776,3 +777,47 @@ class Schedule:
             ],
         )
         return self
+
+    ########################
+    # Buffer Transformations
+    ########################
+    def partition(
+        self,
+        sym_name: str | None = None,
+        indices: List[int] | int = 0,
+        dim: int = 0,
+        kind: PartitionKind = PartitionKind.Complete,
+        factor: int = 0,
+    ):
+        """
+        Partition the buffer with given `dim`, `kind`, and `factor`.
+
+        `sym_name` is the handle to the buffer allocation.
+        If `sym_name` points to a kernel, the `indices`-th input buffer of the kernel will be partitioned.
+        If `sym_name` points to an allocation with multiple buffers, the `indices`-th buffer will be partitioned.
+
+        :param kind: Partition kind. Can be `Complete`, `Cyclic`, or `Block`.
+        :param dim: Dimension to partition.
+        :param factor: Partition factor. Must be 0 if `kind` is `Complete`. Must be > 0 if `kind` is `Cyclic` or `Block`.
+        """
+        target = self._resolve_target(
+            sym_name, "buffer partitioning", allow_auto_sym_match=True
+        )
+        name = self._resolve_handle_name(sym_name, "buffer partitioning")
+        if isinstance(indices, int):
+            indices = [indices]
+        # prepare partition attribute
+        if kind == PartitionKind.Complete and factor != 0:
+            raise ValueError("Complete partition cannot have non-zero factor.")
+        if kind != PartitionKind.Complete and factor <= 0:
+            raise ValueError(f"{kind} partition must have positive factor, got {factor}.")
+        part = allo_d.PartitionAttr.get(self.context, [dim], [kind.value], [factor])
+        self._refresh_builder_loc_from_callsite()
+        for idx in indices:
+            if idx < 0:
+                raise ValueError(f"Partition target indices must be non-negative, got {idx}.")
+            value = allo_d.MatchValueOp.create(self.builder, target, name, idx)
+            allo_d.PartitionOp.create(self.builder, value, part)
+        # does not consume or produce new handles
+        return self
+

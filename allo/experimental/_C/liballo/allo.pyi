@@ -2,6 +2,21 @@ from enum import Enum
 from typing import Sequence, Optional
 from . import ir
 
+class PartitionKind(Enum):
+    Complete = 0
+    Cyclic = 1
+    Block = 2
+
+class PartitionAttr(ir.Attribute):
+    def __init__(*args, **kwargs): ...
+    @staticmethod
+    def get(
+        context: ir.Context,
+        dims: Sequence[int],
+        kinds: Sequence[int],
+        factors: Sequence[int],
+    ) -> PartitionAttr: ...
+
 class CallOp(ir.OpState):
     def __init__(*args, **kwargs): ...
     @staticmethod
@@ -227,3 +242,17 @@ class BitConcatOp(ir.OpState):
     def __init__(*args, **kwargs): ...
     @staticmethod
     def create(builder: ir.AlloOpBuilder, srcs: Sequence[ir.Value]) -> ir.Value: ...
+
+class MatchValueOp(ir.OpState):
+    def __init__(*args, **kwargs): ...
+    @staticmethod
+    def create(
+        builder: ir.AlloOpBuilder, target: ir.Value, name: str, idx: int
+    ) -> ir.Value: ...
+
+class PartitionOp(ir.OpState):
+    def __init__(*args, **kwargs): ...
+    @staticmethod
+    def create(
+        builder: ir.AlloOpBuilder, target: ir.Value, partition: PartitionAttr
+    ) -> PartitionOp: ...

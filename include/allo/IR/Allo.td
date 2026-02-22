@@ -14,6 +14,7 @@ def Allo_Dialect : Dialect {
     let description = [{
         Allo is a dialect designed for accelerator programming and designing
     }];
+    let useDefaultAttributePrinterParser = 1;
     let useDefaultTypePrinterParser = 1;
     let cppNamespace = "::mlir::allo";
 }

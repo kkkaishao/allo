@@ -4,6 +4,28 @@ using namespace mlir;
 using namespace mlir::allo;
 
 void init_allo_ir(nb::module_ &m) {
+
+  nb::enum_<allo::PartitionKindEnum>(m, "PartitionKind")
+      .value("Complete", allo::PartitionKindEnum::Complete)
+      .value("Block", allo::PartitionKindEnum::Block)
+      .value("Cyclic", allo::PartitionKindEnum::Cyclic);
+
+  nb::class_<allo::PartitionAttr, Attribute>(m, "PartitionAttr")
+      .def_static(
+          "get",
+          [](MLIRContext &context, const std::vector<int64_t> &dims,
+             const std::vector<uint32_t> &kinds,
+             const std::vector<int64_t> &factors) {
+            SmallVector<PartitionKindEnum, 4> kindAttrs;
+            for (auto k : kinds) {
+              kindAttrs.push_back(static_cast<PartitionKindEnum>(k));
+            }
+            return allo::PartitionAttr::get(&context, kindAttrs, factors, dims);
+          },
+          nb::arg("context"), nb::arg("dims"), nb::arg("kinds"),
+          nb::arg("factors"));
+  PyAttributeRegistry::registerAttr<allo::PartitionAttr>();
+
   nb::class_<allo::ChannelType, Type>(m, "ChannelType")
       .def_static(
           "get",

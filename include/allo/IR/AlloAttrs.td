@@ -7,23 +7,40 @@ include "allo/IR/Allo.td"
 def PartitionKindEnum : I32EnumAttr<"PartitionKindEnum",
   "HLS array partitioning kind",
   [
-    I32EnumAttrCase<"Complete", 0, "complete">,
-    I32EnumAttrCase<"Block",    1, "block">,
-    I32EnumAttrCase<"Cyclic",   2, "cyclic">
+    I32EnumAttrCase<"Complete", 0>,
+    I32EnumAttrCase<"Block",    1>,
+    I32EnumAttrCase<"Cyclic",   2>
   ]> {
   let cppNamespace = "::mlir::allo";
 }
 
 def PartitionAttr : Allo_Attr<"Partition"> {
-  let mnemonic = "partition";
+  let mnemonic = "part";
   let parameters = (ins
-    "allo::PartitionKindEnum":$kind,
-    "int64_t":$factor,
-    "int64_t":$dim);
+    ArrayRefParameter<"allo::PartitionKindEnum">:$kinds,
+    ArrayRefParameter<"int64_t">:$factors,
+    ArrayRefParameter<"int64_t">:$dims);
   let assemblyFormat = [{
-    `<` `{` `kind` `=` $kind `,` `factor` `=` $factor `,` `dim` `=` $dim `}` `>`
+    `<` `{` `kinds` `=` `[` $kinds `]` `,` `factors` `=` `[` $factors `]` `,` `dims` `=` `[` $dims `]` `}` `>`
   }];
-  let cppNamespace = "mlir::allo";
+  let cppNamespace = "::mlir::allo";
+  let genVerifyDecl = 1;
+  let extraClassDeclaration = [{
+    PartitionInfoVec getPartitionInfoVec() const {
+      PartitionInfoVec result;
+      for (auto [dim, kind, factor] : llvm::zip(getDims(), getKinds(), getFactors())) {
+        result.push_back({dim, kind, factor});
+      }
+      return result;
+    }
+    PartitionInfoMap getPartitionInfoMap() const {
+      PartitionInfoMap result;
+      for (auto [dim, kind, factor] : llvm::zip(getDims(), getKinds(), getFactors())) {
+        result[dim] = {kind, factor};
+      }
+      return result;
+    }
+  }];
 }
 
 def BRAMStorage : I32EnumAttrCase<"BRAM", 0>;

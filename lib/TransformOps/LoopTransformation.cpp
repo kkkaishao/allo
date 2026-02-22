@@ -112,7 +112,7 @@ transform::OutlineOp::apply(transform::TransformRewriter &rewriter,
       symbolTable.insert(kernel);
       newCall.setCalleeAttr(FlatSymbolRefAttr::get(kernel));
     }
-    newCall->setAttr("sym_name",
+    newCall->setAttr(OpIdentifier,
                      rewriter.getStringAttr(getKernelName() + ".call"));
     // `scf.execute_region` is only an outlining helper container. Inline it
     // back so the final IR directly contains `allo.call`.
@@ -338,7 +338,7 @@ transform::LoopSplitOp::applyToOne(transform::TransformRewriter &rewriter,
   }
   // Case 1: affine.for loop
   if (auto forOp = dyn_cast<affine::AffineForOp>(target)) {
-    StringAttr symName = forOp->getAttrOfType<StringAttr>("sym_name");
+    StringAttr symName = forOp->getAttrOfType<StringAttr>(OpIdentifier);
     if (!checkSplitFactor(forOp, factor)) {
       return emitSilenceableFailure(forOp)
              << "split factor is larger than or equal to the loop range";
@@ -382,8 +382,8 @@ transform::LoopSplitOp::applyToOne(transform::TransformRewriter &rewriter,
     // set sym_name
     if (symName) {
       auto symStr = symName.getValue();
-      inner->setAttr("sym_name", rewriter.getStringAttr(symStr + ".inner"));
-      outer->setAttr("sym_name", rewriter.getStringAttr(symStr + ".outer"));
+      inner->setAttr(OpIdentifier, rewriter.getStringAttr(symStr + ".inner"));
+      outer->setAttr(OpIdentifier, rewriter.getStringAttr(symStr + ".outer"));
     }
     // record results
     results.push_back(outer);
@@ -392,7 +392,7 @@ transform::LoopSplitOp::applyToOne(transform::TransformRewriter &rewriter,
   }
   // Case 2: scf.for loop
   if (auto forOp = dyn_cast<scf::ForOp>(target)) {
-    StringAttr symName = forOp->getAttrOfType<StringAttr>("sym_name");
+    StringAttr symName = forOp->getAttrOfType<StringAttr>(OpIdentifier);
     if (!checkSplitFactor(forOp, factor)) {
       return emitSilenceableFailure(forOp)
              << "split factor is larger than or equal to the loop range";
@@ -408,8 +408,8 @@ transform::LoopSplitOp::applyToOne(transform::TransformRewriter &rewriter,
     // set sym_name
     if (symName) {
       auto symStr = symName.getValue();
-      forOp->setAttr("sym_name", rewriter.getStringAttr(symStr + ".outer"));
-      loops.back()->setAttr("sym_name",
+      forOp->setAttr(OpIdentifier, rewriter.getStringAttr(symStr + ".outer"));
+      loops.back()->setAttr(OpIdentifier,
                             rewriter.getStringAttr(symStr + ".inner"));
     }
     // record results
@@ -493,7 +493,7 @@ SmallVector<StringAttr, 4> collectLoopSymNames(ArrayRef<ForOp> loops) {
   SmallVector<StringAttr, 4> symNames;
   symNames.reserve(loops.size());
   for (ForOp loop : loops)
-    symNames.push_back(loop->template getAttrOfType<StringAttr>("sym_name"));
+    symNames.push_back(loop->template getAttrOfType<StringAttr>(OpIdentifier));
   return symNames;
 }
 
@@ -511,8 +511,8 @@ void annotateTiledLoopSymNames(RewriterBase &rewriter,
     if (!symName)
       continue;
     StringRef base = symName.getValue();
-    tileLoop->setAttr("sym_name", rewriter.getStringAttr(base + ".tile"));
-    pointLoop->setAttr("sym_name", rewriter.getStringAttr(base + ".point"));
+    tileLoop->setAttr(OpIdentifier, rewriter.getStringAttr(base + ".tile"));
+    pointLoop->setAttr(OpIdentifier, rewriter.getStringAttr(base + ".point"));
   }
 }
 } // namespace
@@ -527,10 +527,10 @@ transform::LoopTileOp::apply(transform::TransformRewriter &rewriter,
   // Collect payload loops in handle iteration order.
   // This order is the semantic order for mapping input factors to loops.
   for (auto payload : state.getPayloadOps(getLoops())) {
-    if (auto forOp = dyn_cast<affine::AffineForOp>(payload)) {
-      affineLoops.push_back(forOp);
-    } else if (auto forOp = dyn_cast<scf::ForOp>(payload)) {
-      scfLoops.push_back(forOp);
+    if (auto affineFor = dyn_cast<affine::AffineForOp>(payload)) {
+      affineLoops.push_back(affineFor);
+    } else if (auto scfFor = dyn_cast<scf::ForOp>(payload)) {
+      scfLoops.push_back(scfFor);
     } else {
       return emitSilenceableFailure(payload)
              << "expected an affine.for or scf.for operation";
@@ -914,7 +914,7 @@ transform::LoopFlattenOp::apply(transform::TransformRewriter &rewriter,
     return DiagnosedSilenceableFailure::success();
   }
 
-  auto namePrefix = loops.front()->getAttrOfType<StringAttr>("sym_name");
+  auto namePrefix = loops.front()->getAttrOfType<StringAttr>(OpIdentifier);
 
   // Flatten supports unordered loop handles; normalize to depth order first.
   llvm::sort(loops, [](auto a, auto b) {
@@ -966,7 +966,7 @@ transform::LoopFlattenOp::apply(transform::TransformRewriter &rewriter,
   // set sym_name
   if (namePrefix) {
     auto symStr = namePrefix.getValue() + ".flat";
-    flattenBand.front()->setAttr("sym_name", rewriter.getStringAttr(symStr));
+    flattenBand.front()->setAttr(OpIdentifier, rewriter.getStringAttr(symStr));
   }
   // record results
   results.set(cast<OpResult>(getResult()), {flattenBand.front()});
@@ -2010,10 +2010,11 @@ transform::ReuseAtOp::apply(transform::TransformRewriter &rewriter,
       rewriter, rootLoop.getLoc(),
       MemRefType::get(reuseBufferShape, targetType.getElementType()));
   if (Operation *targetDef = target.getDefiningOp()) {
-    if (auto targetSymName = targetDef->getAttrOfType<StringAttr>("sym_name")) {
+    if (auto targetSymName =
+            targetDef->getAttrOfType<StringAttr>(OpIdentifier)) {
       reuseBuffer->setAttr(
-          "sym_name", StringAttr::get(reuseBuffer->getContext(),
-                                      targetSymName.getValue() + ".reuse"));
+          OpIdentifier, StringAttr::get(reuseBuffer->getContext(),
+                                        targetSymName.getValue() + ".reuse"));
     }
   }
 

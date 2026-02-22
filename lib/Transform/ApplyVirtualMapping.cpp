@@ -9,9 +9,7 @@ namespace mlir::allo {
 namespace impl {
 struct ApplyVirtualMapping
     : public impl::ApplyVirtualMappingBase<ApplyVirtualMapping> {
-  void runOnOperation() override {
-    return;
-  }
+  void runOnOperation() override { return; }
 };
 } // namespace impl
-} // namespace
+} // namespace mlir::allo

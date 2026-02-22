@@ -554,12 +554,11 @@ raiseForOp(transform::TransformRewriter &rewriter, scf::ForOp forOp,
     argRepls.push_back(affineLoop.getInductionVar());
     for (Value iterArg : affineLoop.getRegionIterArgs())
       argRepls.push_back(iterArg);
-    rewriter.mergeBlocks(forOp.getBody(), affineLoop.getBody(),
-                         argRepls);
+    rewriter.mergeBlocks(forOp.getBody(), affineLoop.getBody(), argRepls);
     // After raising loops, try to raise in-body memref accesses to affine ops.
     raiseMemrefToAffineAccess(rewriter, affineLoop);
-    if (forOp->hasAttr("sym_name"))
-      affineLoop->setAttr("sym_name", forOp->getAttr("sym_name"));
+    if (forOp->hasAttr(OpIdentifier))
+      affineLoop->setAttr(OpIdentifier, forOp->getAttr(OpIdentifier));
     rewriter.replaceOp(forOp, affineLoop);
     results.push_back(affineLoop);
     return DiagnosedSilenceableFailure::success();
@@ -651,8 +650,8 @@ raiseParallelOp(transform::TransformRewriter &rewriter,
   rewriter.mergeBlocks(parallelOp.getBody(), affineParallel.getBody(),
                        affineIvs);
   raiseMemrefToAffineAccess(rewriter, affineParallel);
-  if (parallelOp->hasAttr("sym_name"))
-    affineParallel->setAttr("sym_name", parallelOp->getAttr("sym_name"));
+  if (parallelOp->hasAttr(OpIdentifier))
+    affineParallel->setAttr(OpIdentifier, parallelOp->getAttr(OpIdentifier));
   rewriter.replaceOp(parallelOp, affineParallel->getResults());
   results.push_back(affineParallel);
   return DiagnosedSilenceableFailure::success();

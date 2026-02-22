@@ -393,4 +393,54 @@ def RenameOp : Op<Transform_Dialect, "allo.rename",
   }];
 }
 
+def MatchValueOp : Op<Transform_Dialect, "allo.match_value",
+  [NavigationTransformOpTrait, MemoryEffectsOpInterface,
+   TransformOpInterface, TransformEachOpTrait,
+   ReportTrackingListenerFailuresOpTrait]> {
+  let summary = "Match target values";
+  let description = [{
+    Match target values by the name of their defining operation.
+    If the value is introduced as a block argument, match by the name of the parent
+    operation and the argument index
+    (e.g., `foo:0` for the first argument of an op named `foo`).
+
+    The argument index will be ignored if the value has a defining operation.
+  }];
+  let arguments = (ins
+    TransformHandleTypeInterface:$target,
+    StrAttr:$name,
+    I64Attr:$number);
+  let results = (outs TransformValueHandleTypeInterface:$result);
+  let assemblyFormat = [{
+    $number `of` $name `in` $target attr-dict `:` type($target) `->` type($result)
+  }];
+  let extraClassDeclaration = [{
+    ::mlir::DiagnosedSilenceableFailure applyToOne(
+        ::mlir::transform::TransformRewriter &rewriter,
+        ::mlir::Operation *target,
+        ::mlir::transform::ApplyToEachResultList &results,
+        ::mlir::transform::TransformState &state);
+  }];
+  let builders = [
+    OpBuilder<(ins "Value":$target, "StringRef":$name, "int64_t":$number), [{
+      auto anyType = transform::AnyValueType::get($_builder.getContext());
+      build($_builder, $_state, anyType, target, name, static_cast<uint64_t>(number));
+    }]>
+  ];
+}
+
+def PartitionOp : Op<Transform_Dialect, "allo.partition", [
+  NavigationTransformOpTrait, MemoryEffectsOpInterface,
+  DeclareOpInterfaceMethods<TransformOpInterface>,
+  ReportTrackingListenerFailuresOpTrait]> {
+  let summary = "Partition the given array";
+  let description = [{
+
+  }];
+  let arguments = (ins TransformValueHandleTypeInterface:$target, PartitionAttr:$partition);
+  let results = (outs);
+  let assemblyFormat = [{
+    $target `with` $partition attr-dict `:` type($target)
+  }];
+}
 #endif // ALLO_TRANSFORM_OPS

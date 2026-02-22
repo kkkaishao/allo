@@ -18,6 +18,21 @@ using namespace mlir::allo;
 #define GET_OP_CLASSES
 #include "allo/IR/AlloOps.cpp.inc"
 
+namespace {
+// Used to customize partition attribute printing and parsing in the IR
+struct AlloOpAsmDialectInterface : public OpAsmDialectInterface {
+  using OpAsmDialectInterface::OpAsmDialectInterface;
+
+  AliasResult getAlias(Attribute attr, raw_ostream &os) const override {
+    if (isa<PartitionAttr>(attr)) {
+      os << "part";
+      return AliasResult::OverridableAlias;
+    }
+    return AliasResult::NoAlias;
+  }
+};
+} // namespace
+
 void AlloDialect::initialize() {
   // clang-format off
   addTypes<
@@ -28,11 +43,52 @@ void AlloDialect::initialize() {
 #define GET_ATTRDEF_LIST
 #include "allo/IR/AlloAttrs.cpp.inc"
       >();
+  addInterface<AlloOpAsmDialectInterface>();
   addOperations<
 #define GET_OP_LIST
 #include "allo/IR/AlloOps.cpp.inc"
       >();
   // clang-format on
+}
+
+LogicalResult
+PartitionAttr::verify(llvm::function_ref<InFlightDiagnostic()> emitError,
+                      ArrayRef<PartitionKindEnum> kinds,
+                      ArrayRef<int64_t> factors, ArrayRef<int64_t> dims) {
+  if (kinds.size() != factors.size() || kinds.size() != dims.size()) {
+    emitError()
+        << "the size of 'kinds', 'factors', and 'dims' must be the same";
+    return failure();
+  }
+  llvm::DenseSet<int64_t> seen;
+  for (auto [dim, factor, kind] : llvm::zip_equal(dims, factors, kinds)) {
+    if (dim < 0) {
+      emitError() << "partition dimension must be non-negative";
+      return failure();
+    }
+    if (seen.contains(dim)) {
+      emitError() << "duplicate partition dimension: " << dim;
+      return failure();
+    }
+    seen.insert(dim);
+    if (kind != PartitionKindEnum::Complete) {
+      if (factor <= 0) {
+        emitError() << "partition factor must be a positive integer for "
+                       "non-complete partition";
+        return failure();
+      }
+      if (factor == 1) {
+        emitError() << "partition factor must be greater than 1 for "
+                       "non-complete partition";
+        return failure();
+      }
+    }
+    if (kind == PartitionKindEnum::Complete && factor != 0) {
+      emitError() << "partition factor must be 0 for complete partition";
+      return failure();
+    }
+  }
+  return success();
 }
 
 void KernelOp::build(OpBuilder &builder, OperationState &state, StringRef name,
