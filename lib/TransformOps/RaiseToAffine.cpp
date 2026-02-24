@@ -3,7 +3,6 @@
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
-#include "mlir/IR/Dominance.h"
 #include "mlir/IR/Matchers.h"
 #include "llvm/ADT/DenseSet.h"
 
@@ -366,41 +365,45 @@ FailureOr<AffineBound> computeAffineMapAndArgs(MLIRContext *ctx,
   return builder.composeResults();
 }
 
-void raiseMemrefToAffineAccess(transform::TransformRewriter &rewriter,
-                               Operation *root) {
-  SmallVector<memref::LoadOp> loads;
-  SmallVector<memref::StoreOp> stores;
-  // Collect in one walk to reduce traversal cost on large loop bodies.
+template <typename OpTy>
+void updateIndicesToAffineApply(RewriterBase &b, OpTy op) {
+  OpBuilder::InsertionGuard g(b);
+  MLIRContext *ctx = b.getContext();
+  auto indices = op.getIndices();
+  auto mapOr = computeAffineMapAndArgs(ctx, indices);
+  if (failed(mapOr)) {
+    return;
+  }
+  b.setInsertionPoint(op);
+  if constexpr (std::is_same_v<OpTy, memref::LoadOp>) {
+    b.replaceOpWithNewOp<affine::AffineLoadOp>(op, op.getMemRef(), mapOr->map,
+                                               mapOr->operands);
+  } else if constexpr (std::is_same_v<OpTy, memref::StoreOp>) {
+    b.replaceOpWithNewOp<affine::AffineStoreOp>(
+        op, op.getValueToStore(), op.getMemRef(), mapOr->map, mapOr->operands);
+  } else {
+    // replace indices with the result of affine.apply
+    SmallVector<Value, 4> newIndices;
+    for (unsigned i = 0; i < indices.size(); ++i) {
+      auto subMap = mapOr->map.getSubMap(i);
+      auto apply = affine::AffineApplyOp::create(
+          b, op.getLoc(), indices[i].getType(), subMap, mapOr->operands);
+      newIndices.push_back(apply);
+    }
+    b.modifyOpInPlace(op, [&]() { op.getIndicesMutable().assign(newIndices); });
+  }
+}
+
+void raiseAccesses(transform::TransformRewriter &rewriter, Operation *root) {
   root->walk([&](Operation *op) {
-    if (auto load = dyn_cast<memref::LoadOp>(op))
-      loads.push_back(load);
-    else if (auto store = dyn_cast<memref::StoreOp>(op))
-      stores.push_back(store);
+    if (auto load = dyn_cast<memref::LoadOp>(op)) {
+      updateIndicesToAffineApply(rewriter, load);
+    } else if (auto store = dyn_cast<memref::StoreOp>(op)) {
+      updateIndicesToAffineApply(rewriter, store);
+    } else if (auto chanOp = dyn_cast<ChannelAccessOpInterface>(op)) {
+      updateIndicesToAffineApply(rewriter, chanOp);
+    }
   });
-
-  for (memref::LoadOp load : loads) {
-    if (!load->getBlock())
-      continue;
-    auto mapOr = computeAffineMapAndArgs(load.getContext(), load.getIndices());
-    if (failed(mapOr))
-      continue;
-    rewriter.setInsertionPoint(load);
-    rewriter.replaceOpWithNewOp<affine::AffineLoadOp>(
-        load, load.getMemRef(), mapOr->map, mapOr->operands);
-  }
-
-  for (memref::StoreOp store : stores) {
-    if (!store->getBlock())
-      continue;
-    auto mapOr =
-        computeAffineMapAndArgs(store.getContext(), store.getIndices());
-    if (failed(mapOr))
-      continue;
-    rewriter.setInsertionPoint(store);
-    rewriter.replaceOpWithNewOp<affine::AffineStoreOp>(
-        store, store.getValueToStore(), store.getMemRef(), mapOr->map,
-        mapOr->operands);
-  }
 }
 
 FailureOr<AffineParallelBoundSet>
@@ -556,7 +559,7 @@ raiseForOp(transform::TransformRewriter &rewriter, scf::ForOp forOp,
       argRepls.push_back(iterArg);
     rewriter.mergeBlocks(forOp.getBody(), affineLoop.getBody(), argRepls);
     // After raising loops, try to raise in-body memref accesses to affine ops.
-    raiseMemrefToAffineAccess(rewriter, affineLoop);
+    raiseAccesses(rewriter, affineLoop);
     if (forOp->hasAttr(OpIdentifier))
       affineLoop->setAttr(OpIdentifier, forOp->getAttr(OpIdentifier));
     rewriter.replaceOp(forOp, affineLoop);
@@ -649,7 +652,7 @@ raiseParallelOp(transform::TransformRewriter &rewriter,
   ValueRange affineIvs(affineParallel.getIVs());
   rewriter.mergeBlocks(parallelOp.getBody(), affineParallel.getBody(),
                        affineIvs);
-  raiseMemrefToAffineAccess(rewriter, affineParallel);
+  raiseAccesses(rewriter, affineParallel);
   if (parallelOp->hasAttr(OpIdentifier))
     affineParallel->setAttr(OpIdentifier, parallelOp->getAttr(OpIdentifier));
   rewriter.replaceOp(parallelOp, affineParallel->getResults());
@@ -664,12 +667,14 @@ DiagnosedSilenceableFailure transform::RaiseToAffineOp::applyToOne(
     transform::TransformState &state) {
   if (auto forOp = dyn_cast<scf::ForOp>(target)) {
     return raiseForOp(rewriter, forOp, results, state);
-  } else if (auto parallelOp = dyn_cast<scf::ParallelOp>(target)) {
+  }
+  if (auto parallelOp = dyn_cast<scf::ParallelOp>(target)) {
     return raiseParallelOp(rewriter, parallelOp, results, state);
-  } else if (isa<affine::AffineForOp, affine::AffineParallelOp>(target)) {
+  }
+  if (isa<affine::AffineForOp, affine::AffineParallelOp>(target)) {
     // Already affine loops; just try to raise in-body memref accesses to affine
     // ops.
-    raiseMemrefToAffineAccess(rewriter, target);
+    raiseAccesses(rewriter, target);
     results.push_back(target);
     return DiagnosedSilenceableFailure::success();
   }

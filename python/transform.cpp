@@ -328,4 +328,40 @@ void init_allo_transforms(nb::module_ &m) {
                                                   target, partition);
           },
           nb::arg("builder"), nb::arg("target"), nb::arg("partition"));
+
+  nb::class_<transform::ApplyVirtualMapOp, OpState>(m, "ApplyVirtualMapOp")
+      .def_static(
+          "create",
+          [](AlloOpBuilder &builder, Value &target,
+             const std::vector<int64_t> &mapping, bool enableSccp = false) {
+            allo::VirtMapAttr vMapAttr;
+            if (!mapping.empty()) {
+              vMapAttr = allo::VirtMapAttr::get(builder.getContext(), mapping);
+            }
+            return transform::ApplyVirtualMapOp::create(
+                builder, builder.get_loc(), target, vMapAttr, enableSccp);
+          },
+          nb::arg("builder"), nb::arg("target"),
+          nb::arg("mapping") = std::vector<int64_t>{},
+          nb::arg("enable_sccp") = false);
+
+  nb::class_<transform::ChainOp, OpState>(m, "ChainOp")
+      .def_static(
+          "create",
+          [](AlloOpBuilder &builder, Value &kernels) {
+            auto anyOpType = transform::AnyOpType::get(builder.getContext());
+            return transform::ChainOp::create(builder, builder.get_loc(),
+                                              anyOpType, kernels);
+          },
+          nb::arg("builder"), nb::arg("kernels"));
+
+  nb::class_<transform::BundleOp, OpState>(m, "BundleOp")
+      .def_static(
+          "create",
+          [](AlloOpBuilder &builder, Value &inputs) {
+            auto anyOpType = transform::AnyOpType::get(builder.getContext());
+            return transform::BundleOp::create(builder, builder.get_loc(),
+                                               anyOpType, inputs);
+          },
+          nb::arg("builder"), nb::arg("inputs"));
 }

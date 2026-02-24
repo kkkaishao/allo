@@ -20,10 +20,16 @@ mlir_tablegen(AlloEnums.h.inc -gen-enum-decls)
 mlir_tablegen(AlloEnums.cpp.inc -gen-enum-defs)
 add_public_tablegen_target(MLIRAlloEnumsIncGen)
 
+set(LLVM_TARGET_DEFINITIONS AlloInterfaces.td)
+mlir_tablegen(AlloInterfaces.h.inc -gen-op-interface-decls)
+mlir_tablegen(AlloInterfaces.cpp.inc -gen-op-interface-defs)
+add_public_tablegen_target(MLIRAlloInterfacesIncGen)
+
 add_custom_target(MLIRAlloIncGen
     DEPENDS
     MLIRAlloOpsIncGen
     MLIRAlloTypesIncGen
     MLIRAlloAttrsIncGen
     MLIRAlloEnumsIncGen
+    MLIRAlloInterfacesIncGen
 )

@@ -29,7 +29,6 @@ target_link_libraries(_liballo
     ${conversion_libs}
     
     MLIRAllo
-    MLIRAlloTransform
     MLIRAlloTransformOps
 
     Python3::Module

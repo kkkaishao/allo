@@ -21,8 +21,6 @@
 #include "mlir/Target/LLVMIR/Transforms/Passes.h"
 #include "mlir/Transforms/Passes.h"
 
-#include "allo/Transform/Passes.h"
-
 namespace mlir::allo {
 inline void registerAllPasses() {
   // general passes
@@ -54,8 +52,6 @@ inline void registerAllPasses() {
   bufferization::registerBufferizationPipelines();
   tosa::registerTosaToLinalgPipelines();
 
-  // allo passes
-  allo::registerApplyVirtualMapping();
 }
 } // namespace mlir::allo
 #endif // ALLO_INIT_ALL_PASSES_H

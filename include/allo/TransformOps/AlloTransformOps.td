@@ -443,4 +443,60 @@ def PartitionOp : Op<Transform_Dialect, "allo.partition", [
     $target `with` $partition attr-dict `:` type($target)
   }];
 }
+
+def ApplyVirtualMapOp : Op<Transform_Dialect, "allo.virtmap", [
+  FunctionalStyleTransformOpTrait, MemoryEffectsOpInterface,
+  TransformOpInterface, TransformEachOpTrait,
+  ReportTrackingListenerFailuresOpTrait]> {
+  let summary = "Apply the virtual mapping of the given kernel";
+  let description = [{
+
+  }];
+  let arguments = (ins
+    TransformHandleTypeInterface:$target,
+    OptionalAttr<VirtMapAttr>:$mapping,
+    UnitAttr:$sccp);
+  let results = (outs);
+  let assemblyFormat = [{
+    $target (`to` $mapping^ )? (`sccp` $sccp^)? attr-dict `:` type($target)
+  }];
+  let extraClassDeclaration = [{
+    ::mlir::DiagnosedSilenceableFailure applyToOne(
+        ::mlir::transform::TransformRewriter &rewriter,
+        ::mlir::Operation *target,
+        ::mlir::transform::ApplyToEachResultList &results,
+        ::mlir::transform::TransformState &state);
+  }];
+}
+
+def ChainOp : Op<Transform_Dialect, "allo.chain", [
+  FunctionalStyleTransformOpTrait, MemoryEffectsOpInterface,
+  DeclareOpInterfaceMethods<TransformOpInterface>,
+  ReportTrackingListenerFailuresOpTrait]> {
+  let summary = "Chain two functions into one";
+  let description = [{
+
+  }];
+  let arguments = (ins TransformHandleTypeInterface:$kernels);
+  let results = (outs TransformHandleTypeInterface:$result);
+  let assemblyFormat = [{
+    $kernels attr-dict `:` functional-type(operands, results)
+  }];
+}
+
+def BundleOp : Op<Transform_Dialect, "allo.bundle", [
+  FunctionalStyleTransformOpTrait, MemoryEffectsOpInterface,
+  DeclareOpInterfaceMethods<TransformOpInterface>,
+  ReportTrackingListenerFailuresOpTrait]> {
+  let summary = "Bundle multiple functions into one";
+  let description = [{
+
+  }];
+  let arguments = (ins TransformHandleTypeInterface:$inputs);
+  let results = (outs TransformHandleTypeInterface:$result);
+  let assemblyFormat = [{
+    $inputs attr-dict `:` functional-type(operands, results)
+  }];
+}
+
 #endif // ALLO_TRANSFORM_OPS

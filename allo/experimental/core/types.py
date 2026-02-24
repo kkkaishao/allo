@@ -207,10 +207,6 @@ def _is_array_of_scalar_tensor(o: Any) -> bool:
     )
 
 
-def _is_allo_stream(o: Any) -> bool:
-    return isinstance(o, tensor) and isinstance(o.type, Stream)
-
-
 ##############
 # Scalar types
 ##############
@@ -581,7 +577,7 @@ class tuple_type(base_type):
 
 
 class Channel(base_type):
-    last_indices: List[tensor] = []
+    last_indices: List[List[tensor]] = []
 
     def __init__(
         self,
@@ -639,41 +635,6 @@ class Channel(base_type):
 
 # export to user interface
 channel = Channel("placeholder", type_placeholder, [], 2)
-
-
-class Stream(base_type):
-    def __init__(self, base_ty: scalar_type, depth: int = 2):
-        self.base_ty = base_ty
-        self.depth = depth
-
-    def __eq__(self, other):
-        return (
-            isinstance(other, Stream)
-            and self.base_ty == other.base_ty
-            and self.depth == other.depth
-        )
-
-    def __str__(self):
-        return f"Stream<{self.base_ty},{self.depth}>"
-
-    def __repr__(self):
-        return self.__str__()
-
-    def __hash__(self):
-        return hash((self.base_ty, self.depth))
-
-    def append_ir_types(self, builder: ir.OpBuilder, out: List[ir.Type]) -> None:
-        base_ty = self.base_ty.to_ir(builder)
-        stream_ty = allo_d.StreamType.get(builder.context, base_ty, self.depth)
-        out.append(stream_ty)
-
-    def gen_proxy_value(
-        self, handles: List[ir.Value], cursor: int
-    ) -> Tuple[base_value, int]:
-        return tensor(handles[cursor], self), cursor + 1
-
-    def mangle(self) -> str:
-        return f"s{self.depth}b{self.base_ty.mangle()}"
 
 
 def _type_for_tuple_values(values, fields=None):
@@ -815,8 +776,6 @@ class tensor(base_value):
         self.type = type  # the underlying frontend type
         # we use dtype to refer to the primitive scalar type
         if isinstance(type, Array):
-            self.dtype = type.base_ty
-        elif isinstance(type, Stream):
             self.dtype = type.base_ty
         elif isinstance(type, Channel):
             self.dtype = (

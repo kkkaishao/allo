@@ -34,7 +34,7 @@ def _lower_load(builder: AlloOpBuilder, buffer: tensor, slices: Union[slice, tup
                 builder.compile_error(
                     "Number of indices does not match channel group dimensions."
                 )
-            buffer.type.last_indices = indices
+            buffer.type.last_indices.append(indices)
             return buffer
         if _is_array_of_scalar_tensor(buffer):
             if len(buffer.shape) != len(indices):

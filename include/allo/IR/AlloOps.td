@@ -1,10 +1,6 @@
 #ifndef ALLO_OPS
 #define ALLO_OPS
 
-include "allo/IR/Allo.td"
-include "allo/IR/AlloAttrs.td"
-include "allo/IR/AlloTypes.td"
-
 include "mlir/IR/EnumAttr.td"
 include "mlir/IR/BuiltinTypes.td"
 include "mlir/IR/OpAsmInterface.td"
@@ -15,6 +11,11 @@ include "mlir/Interfaces/FunctionInterfaces.td"
 include "mlir/Interfaces/InferTypeOpInterface.td"
 include "mlir/Interfaces/SideEffectInterfaces.td"
 include "mlir/IR/SymbolInterfaces.td"
+
+include "allo/IR/Allo.td"
+include "allo/IR/AlloAttrs.td"
+include "allo/IR/AlloTypes.td"
+include "allo/IR/AlloInterfaces.td"
 
 //===----------------------------------------------------------------------===//
 // SPMD Operations
@@ -65,7 +66,7 @@ def KernelOp : Allo_Op<"kernel", [
                        OptionalAttr<StrAttr>:$sym_visibility,
                        OptionalAttr<DictArrayAttr>:$arg_attrs,
                        OptionalAttr<DictArrayAttr>:$res_attrs,
-                       I64ArrayAttr:$virtual_mapping);
+                       VirtMapAttr:$virtual_mapping);
   let regions = (region AnyRegion:$body);
 
   let builders = [OpBuilder<(ins
@@ -115,6 +116,14 @@ def KernelOp : Allo_Op<"kernel", [
     //===------------------------------------------------------------------===//
 
     bool isDeclaration() { return isExternal(); }
+
+    //===------------------------------------------------------------------===//
+    // Custom Methods
+    //===------------------------------------------------------------------===//
+
+    ArrayRef<int64_t> getVirtualMappingVec() {
+      return getVirtualMapping().getRanges();
+    }
   }];
   let hasCustomAssemblyFormat = 1;
 }
@@ -269,135 +278,58 @@ def ChanCreateOp : Allo_Op<"chan.create", [Symbol, HasParent<"ModuleOp">]> {
   ];
 }
 
-def ChanToStreamOp : Allo_Op<"chan.to_stream", [Pure,
-  DeclareOpInterfaceMethods<SymbolUserOpInterface>]> {
-  let summary = "Channel to stream conversion operation";
+def ChanGetOp : Allo_Op<"chan.get", [
+  DeclareOpInterfaceMethods<SymbolUserOpInterface>,
+  DeclareOpInterfaceMethods<ChannelAccessOpInterface>,
+  MemoryEffects<[MemWrite, MemRead]>]> {
+  let summary = "get an element from a channel";
   let description = [{
-    The `chan.to_stream` operation gets a stream view of a channel.
 
-    `to_stream` doesn't have a corresponding `release_stream` operation,
-    it only obtains a stream view of the elements in a channel.
-
-    For a channel with scalar element type, the stream view simply streams the
-    elements as they are received from the channel.
-    While for a channel with composite element type (e.g., tensor), an
-    extra affine map is needed to flatten the composite type into a stream of
-    scalar elements. (default is a row-major flattening map)
-
-    Example:
-    ```
-    allo.chan.create @scalar_chan : !allo.chan<f32,16>
-    allo.chan.create @tensor_chan : !allo.chan<tensor<16x16xf32>,2>
-    %stream = allo.chan.to_stream @scalar_chan : !allo.stream<f32,16>
-    // read in row-major order
-    %stream = allo.chan.to_stream @tensor_chan
-        {map = affine_map<(d0, d1) -> (d0 * 16 + d1)>} : !allo.stream<f32>
-    // read in column-major order
-    %stream = allo.chan.to_stream @tensor_chan
-        {map = affine_map<(d0, d1) -> (d1 * 16 + d0)>} : !allo.stream<f32>
-    ```
-  }];
-
-  let arguments = (ins FlatSymbolRefAttr:$chan, 
-    Variadic<Index>:$indices,
-    AffineMapAttr:$map);
-  let results = (outs StreamType:$stream);
-  let assemblyFormat = [{
-    $chan `[` $indices `]` `map` $map attr-dict `:` qualified(type($stream))
-  }];
-  let builders = [
-    OpBuilder<(ins "StringRef":$chan, "ValueRange":$indices, 
-              "StreamType":$type, "AffineMap":$map), [{
-      build($_builder, $_state, StringAttr::get($_builder.getContext(), chan), indices, type, map);
-    }]>,
-    OpBuilder<(ins "StringAttr":$chan, "ValueRange":$indices, 
-              "StreamType":$type, "AffineMap":$map), [{
-      build($_builder, $_state, FlatSymbolRefAttr::get(chan), indices, type, map);
-    }]>,
-    OpBuilder<(ins "FlatSymbolRefAttr":$chan, "ValueRange":$indices, 
-              "StreamType":$type, "AffineMap":$map), [{
-      $_state.addOperands(indices);
-      $_state.addAttribute(getChanAttrName($_state.name), chan);
-      $_state.addAttribute(getMapAttrName($_state.name), AffineMapAttr::get(map));
-      $_state.addTypes(type);
-    }]>,
-  ];
-  let hasVerifier = 1;
-  let skipDefaultBuilders = 1;
-}
-
-def StreamGetOp : Allo_Op<"stream_get", [MemoryEffects<[MemWrite, MemRead]>]> {
-  let summary = "get an element from a stream";
-  let description = [{
-    The `stream_get` operation gets an element from a stream view.
-
-    Reading an element from a stream will remove it from the stream,
-    so the operation has the `MemWrite` effect.
-  }];
-  let arguments = (ins StreamType:$stream);
-  let results = (outs AnyType:$value);
-  let assemblyFormat = [{
-    $stream attr-dict `:` type($value) `from` qualified(type($stream))
-  }];
-  let builders = [
-    OpBuilder<(ins "Value":$stream), [{
-      auto streamTy = dyn_cast<StreamType>(stream.getType());
-      assert(streamTy && "must provide a StreamType value to construct StreamGetOp!");
-      build($_builder, $_state, streamTy.getDataType(), stream);
-    }]>
-  ];
-  let hasVerifier = 1;
-}
-
-def StreamPutOp : Allo_Op<"stream_put", [MemoryEffects<[MemWrite]>]> {
-  let summary = "put an element to a stream";
-  let description = [{
-    The `stream_put` operation puts an element to a stream view.
-  }];
-  let arguments = (ins StreamType:$stream, AnyType:$value);
-  let results = (outs);
-  let assemblyFormat = [{
-    `(` $value `,` $stream `)` attr-dict `:` type($value) `to` qualified(type($stream))
-  }];
-  let hasVerifier = 1;
-}
-
-def ChanAcquireBufferOp : Allo_Op<"chan.acq_buffer", [
-  DeclareOpInterfaceMethods<SymbolUserOpInterface>]> {
-  let summary = "Channel to buffer conversion operation";
-  let description = [{
-    The `chan.acquire_buffer` operation gets a buffer view of a channel.
-
-    `acquire_buffer` requires a corresponding `release_buffer`, because
-    `acquire_buffer` is ususally used in dma operations, which require an
-    explicit synchronization management.
-
-    Channels with a scalar element type can not be converted to buffers.
-    To view a channel as a buffer, an `chan.acquire` operation must be called first.
-
-    Example:
-    ```
-    allo.chan.create @tensor_chan : !allo.chan<tensor<16x16xf32>,2>
-    // acquire one buffer out of two buffers in the channel
-    // and the acquisition is for consume (use the data from the buffer)
-    %0 = allo.chan.acquire_buffer @tensor_chan (Consume, 1) : tensor<16x16xf32>
-    // the acquisition is for produce (write data into the buffer)
-    %1 = allo.chan.acquire_buffer @tensor_chan (Produce, 1) : tensor<16x16xf32>
-
-    // acquire two buffers from the channel to consume
-    %2, %3 = allo.chan.acquire_buffer @tensor_chan (Produce, 2) : tensor<16x16xf32>
-    // compute with %2, %3
-    // release the buffers back to the channel after use
-    allo.chan.release_buffer @tensor_chan (Produce, 2)
-    ```
   }];
   let arguments = (ins
-    FlatSymbolRefAttr:$chan,
+    FlatSymbolRefAttr:$channel,
     Variadic<Index>:$indices,
-    ConfinedAttr<I32Attr, [IntMinValue<1>]>:$size);
+    UnitAttr:$blocking);
+  let results = (outs AnyType:$value);
+  let assemblyFormat = [{
+    $channel `[` $indices `]` (`blocking` $blocking^)? attr-dict `:` type($value)
+  }];
+}
+
+def ChanPutOp : Allo_Op<"chan.put", [
+  DeclareOpInterfaceMethods<SymbolUserOpInterface>,
+  DeclareOpInterfaceMethods<ChannelAccessOpInterface>,
+  MemoryEffects<[MemWrite]>]> {
+  let summary = "put an element to a channel";
+  let description = [{
+
+  }];
+  let arguments = (ins
+    FlatSymbolRefAttr:$channel,
+    Variadic<Index>:$indices,
+    AnyType:$value,
+    UnitAttr:$blocking);
+  let results = (outs);
+  let assemblyFormat = [{
+    $value `,` $channel `[` $indices `]` (`blocking` $blocking^)? attr-dict `:` type($value)
+  }];
+}
+
+def ChanAcquireOp : Allo_Op<"chan.acquire", [
+  DeclareOpInterfaceMethods<SymbolUserOpInterface>,
+  DeclareOpInterfaceMethods<ChannelAccessOpInterface>,
+  ]> {
+  let summary = "Channel to buffer conversion operation";
+  let description = [{
+  }];
+  let arguments = (ins
+    FlatSymbolRefAttr:$channel,
+    Variadic<Index>:$indices,
+    ConfinedAttr<I64Attr, [IntMinValue<1>]>:$size,
+    UnitAttr:$blocking);
   let results = (outs Variadic<AnyType>:$buffers);
   let assemblyFormat = [{
-    $chan `[` $indices `]` `,` $size attr-dict `:` type($buffers)
+    $channel `[` $indices `]` `,` $size (`blocking` $blocking^)? attr-dict `:` type($buffers)
   }];
   let builders = [
     OpBuilder<(ins "StringRef":$chan, "ValueRange":$indices, "Type":$dataType, 
@@ -411,7 +343,7 @@ def ChanAcquireBufferOp : Allo_Op<"chan.acq_buffer", [
     OpBuilder<(ins "FlatSymbolRefAttr":$chan, "ValueRange":$indices, "Type":$dataType,                
               CArg<"int", "1">:$size), [{
       $_state.addOperands(indices);
-      $_state.addAttribute(getChanAttrName($_state.name), chan);
+      $_state.addAttribute(getChannelAttrName($_state.name), chan);
       $_state.addAttribute(getSizeAttrName($_state.name), $_builder.getI32IntegerAttr(size));
       llvm::SmallVector<Type, 4> types(size, dataType);
       $_state.addTypes(types);
@@ -420,33 +352,22 @@ def ChanAcquireBufferOp : Allo_Op<"chan.acq_buffer", [
   let skipDefaultBuilders = 1;
 }
 
-def ChanReleaseBufferOp : Allo_Op<"chan.rel_buffer", [
+def ChanReleaseOp : Allo_Op<"chan.release", [
   DeclareOpInterfaceMethods<SymbolUserOpInterface>,
+  DeclareOpInterfaceMethods<ChannelAccessOpInterface>,
   AttrSizedOperandSegments]> {
   let summary = "Release buffers back to the channel";
   let description = [{
-    The `chan.release_buffer` operation releases previously acquired buffers
-    back to the channel.
-
-    Example:
-    ```
-    allo.chan.create @tensor_chan : !allo.chan<tensor<16x16xf32>,2>
-    // acquire two buffers from the channel to produce
-    %0, %1 = allo.chan.acquire_buffer @tensor_chan [0], 2: tensor<16x16xf32>
-    // write data into %0, %1
-    %2 = ...
-    // release the buffers back to the channel after use
-    allo.chan.release_buffer @tensor_chan [0], %2 : tensor<16x16xf32>
-    ```
   }];
 
   let arguments = (ins
-    FlatSymbolRefAttr:$chan,
+    FlatSymbolRefAttr:$channel,
     Variadic<Index>:$indices,
-    Variadic<AnyType>:$buffers);
+    Variadic<AnyType>:$buffers,
+    UnitAttr:$blocking);
   let results = (outs);
   let assemblyFormat = [{
-    attr-dict $chan `[` $indices `]` `,` $buffers `:` type($buffers)
+    $channel `[` $indices `]` `,` $buffers (`blocking` $blocking^)? attr-dict `:` type($buffers)
   }];
   let builders = [
     OpBuilder<(ins "StringRef":$chan, "ValueRange":$indices, "ValueRange":$buffers), [{
@@ -456,7 +377,7 @@ def ChanReleaseBufferOp : Allo_Op<"chan.rel_buffer", [
       build($_builder, $_state, FlatSymbolRefAttr::get(chan), indices, buffers);
     }]>,
     OpBuilder<(ins "FlatSymbolRefAttr":$chan, "ValueRange":$indices, "ValueRange":$buffers), [{
-      $_state.addAttribute(getChanAttrName($_state.name), chan);
+      $_state.addAttribute(getChannelAttrName($_state.name), chan);
       $_state.addOperands(indices);
       $_state.addOperands(buffers);
       SmallVector<int32_t, 4> segSizes = 

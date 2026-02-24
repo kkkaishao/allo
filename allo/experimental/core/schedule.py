@@ -263,7 +263,6 @@ class Schedule:
         self,
         consumes: List[_HandleConsume],
         provides: List[_HandleProvide] | None = None,
-        invalidate_unrelated: bool = False,
     ):
         """
         Apply handle lifecycle updates after a transform op.
@@ -279,10 +278,6 @@ class Schedule:
             consumed_aliases.update(self._handle_aliases(consume.value))
 
         to_invalidate = {name for name in consumed_aliases if name != "module"}
-        if invalidate_unrelated:
-            for name in self.sym_table.keys():
-                if name != "module" and name not in consumed_aliases:
-                    to_invalidate.add(name)
 
         if len(to_invalidate) > 0:
             self._invalidate(sorted(to_invalidate))
@@ -796,9 +791,10 @@ class Schedule:
         If `sym_name` points to a kernel, the `indices`-th input buffer of the kernel will be partitioned.
         If `sym_name` points to an allocation with multiple buffers, the `indices`-th buffer will be partitioned.
 
-        :param kind: Partition kind. Can be `Complete`, `Cyclic`, or `Block`.
-        :param dim: Dimension to partition.
-        :param factor: Partition factor. Must be 0 if `kind` is `Complete`. Must be > 0 if `kind` is `Cyclic` or `Block`.
+        Args:
+            kind: Partition kind. Can be `Complete`, `Cyclic`, or `Block`.
+            dim: Dimension to partition.
+            factor: Partition factor. Must be 0 if `kind` is `Complete`. Must be > 0 if `kind` is `Cyclic` or `Block`.
         """
         target = self._resolve_target(
             sym_name, "buffer partitioning", allow_auto_sym_match=True
@@ -810,14 +806,129 @@ class Schedule:
         if kind == PartitionKind.Complete and factor != 0:
             raise ValueError("Complete partition cannot have non-zero factor.")
         if kind != PartitionKind.Complete and factor <= 0:
-            raise ValueError(f"{kind} partition must have positive factor, got {factor}.")
+            raise ValueError(
+                f"{kind} partition must have positive factor, got {factor}."
+            )
         part = allo_d.PartitionAttr.get(self.context, [dim], [kind.value], [factor])
         self._refresh_builder_loc_from_callsite()
         for idx in indices:
             if idx < 0:
-                raise ValueError(f"Partition target indices must be non-negative, got {idx}.")
+                raise ValueError(
+                    f"Partition target indices must be non-negative, got {idx}."
+                )
             value = allo_d.MatchValueOp.create(self.builder, target, name, idx)
             allo_d.PartitionOp.create(self.builder, value, part)
         # does not consume or produce new handles
         return self
 
+    def virtmap(
+        self,
+        sym_name: str | None = None,
+        mapping: List[int] | None = None,
+        enable_sccp: bool = False,
+    ):
+        """
+        Apply virtual mapping to the target kernel. The handle must refer to a kernel.
+
+        Args:
+            sym_name: Kernel handle name. If None, uses current active handle.
+            mapping: Virtual mapping to override. If None, uses default mapping.
+            enable_sccp: Whether to enable more aggressive constant propagation
+        """
+        target = self._resolve_target(
+            sym_name, "virtual mapping", allow_auto_sym_match=True
+        )
+        if mapping is not None:
+            if not isinstance(mapping, list) or not all(
+                isinstance(i, int) for i in mapping
+            ):
+                raise ValueError(
+                    "Virtual mapping `mapping` must be a list of integers."
+                )
+        else:
+            mapping = []
+        self._refresh_builder_loc_from_callsite()
+        allo_d.ApplyVirtualMapOp.create(self.builder, target, mapping, enable_sccp)
+        # consume original kernel
+        self._apply_handle_effects(consumes=[_HandleConsume(value=target)])
+        return self
+
+    def chain(self, first: str, second: str, as_name: str | None = None):
+        """
+        Chain two kernel handles into one fused kernel handle.
+
+        Args:
+            first: Producer kernel handle.
+            second: Consumer kernel handle.
+            as_name: Optional name for the produced handle.
+        """
+        first_name = self._resolve_handle_name(first, "chaining")
+        second_name = self._resolve_handle_name(second, "chaining")
+        first_target = self._resolve_target(
+            first, "chaining", allow_auto_sym_match=True
+        )
+        second_target = self._resolve_target(
+            second, "chaining", allow_auto_sym_match=True
+        )
+        if first_target == second_target:
+            raise ValueError("chain requires two distinct kernel handles.")
+        self._refresh_builder_loc_from_callsite()
+        chain_op = allo_d.ChainOp.create(self.builder, first_target, second_target)
+        chained = chain_op.get_result_at(0)
+        handle_name = as_name if as_name is not None else f"{first_name}-{second_name}"
+        self._apply_handle_effects(
+            consumes=[
+                _HandleConsume(value=first_target),
+                _HandleConsume(value=second_target),
+            ],
+            provides=[
+                _HandleProvide(name=handle_name, value=chained, select=True),
+            ],
+        )
+        return self
+
+    def bundle(
+        self,
+        inputs: List[str] | str | None = None,
+        as_name: str | None = None,
+    ):
+        """
+        Bundle multiple kernel handles into one kernel handle.
+
+        Args:
+            inputs: One handle or a handle list. The list will be merged first.
+            as_name: Optional name for the produced handle.
+        """
+        names = self._normalize_handle_names(inputs, "bundling")
+        pairs: List[tuple[str, ir.Value]] = []
+        for name in names:
+            target = self._resolve_target(name, "bundling", allow_auto_sym_match=True)
+            if all(existing != target for _, existing in pairs):
+                pairs.append((name, target))
+        if len(pairs) == 0:
+            raise ValueError("No valid handle for bundling.")
+
+        base_names = [name for name, _ in pairs]
+        targets = [target for _, target in pairs]
+        bundle_input = targets[0]
+        if len(targets) > 1:
+            self._refresh_builder_loc_from_callsite()
+            bundle_input = tran_d.MergeHandlesOp.create(
+                self.builder, targets, deduplicate=True
+            ).get_result_at(0)
+        self._refresh_builder_loc_from_callsite()
+        bundle_op = allo_d.BundleOp.create(self.builder, bundle_input)
+        bundled = bundle_op.get_result_at(0)
+        if as_name is not None:
+            handle_name = as_name
+        elif len(base_names) > 1:
+            handle_name = f"{base_names[0]}x{len(base_names)}"
+        else:
+            handle_name = f"{base_names[0]}xN"
+        self._apply_handle_effects(
+            consumes=[_HandleConsume(value=target) for target in targets],
+            provides=[
+                _HandleProvide(name=handle_name, value=bundled, select=True),
+            ],
+        )
+        return self

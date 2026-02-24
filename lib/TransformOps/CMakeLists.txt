@@ -1,7 +1,8 @@
 add_mlir_library(MLIRAlloTransformOps
     DialectExtension.cpp
-    RaiseToAffine.cpp
+    DataflowTransformation.cpp
     LoopTransformation.cpp
+    RaiseToAffine.cpp
     Utils.cpp
 
     DEPENDS

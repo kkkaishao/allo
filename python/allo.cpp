@@ -29,23 +29,12 @@ void init_allo_ir(nb::module_ &m) {
   nb::class_<allo::ChannelType, Type>(m, "ChannelType")
       .def_static(
           "get",
-          [](MLIRContext &context, Type type, unsigned capacity = 2) {
-            return allo::ChannelType::get(&context, type, capacity);
+          [](MLIRContext &context, Type type, unsigned depth = 2) {
+            return allo::ChannelType::get(&context, type, depth);
           },
           nb::arg("context"), nb::arg("data_type"), nb::arg("capacity") = 2);
   PyTypeRegistry::registerType(allo::ChannelType::getTypeID(), [](Type t) {
     return nb::cast(mlir::cast<allo::ChannelType>(t));
-  });
-
-  nb::class_<allo::StreamType, Type>(m, "StreamType")
-      .def_static(
-          "get",
-          [](MLIRContext &context, Type type, unsigned depth = 2) {
-            return allo::StreamType::get(&context, type, depth);
-          },
-          nb::arg("context"), nb::arg("data_type"), nb::arg("depth") = 2);
-  PyTypeRegistry::registerType(allo::StreamType::getTypeID(), [](Type t) {
-    return nb::cast(mlir::cast<allo::StreamType>(t));
   });
 
   nb::class_<allo::ChanCreateOp, OpState>(m, "ChanCreateOp")
@@ -59,67 +48,39 @@ void init_allo_ir(nb::module_ &m) {
           nb::arg("builder"), nb::arg("name"), nb::arg("chan_type"),
           nb::arg("shape") = std::vector<int64_t>{});
 
-  nb::class_<allo::ChanToStreamOp, OpState>(m, "ChanToStreamOp")
-      .def_static(
-          "create",
-          [](AlloOpBuilder &builder, const std::string &chan,
-             const std::vector<Value> &indices, StreamType &type,
-             std::optional<AffineMap> map) -> Value {
-            return allo::ChanToStreamOp::create(builder, builder.get_loc(),
-                                                chan, indices, type,
-                                                map.value_or(AffineMap{}));
-          },
-          nb::arg("builder"), nb::arg("chan"), nb::arg("indices"),
-          nb::arg("type"), nb::arg("map").none() = std::nullopt)
-      .def_prop_ro("chan",
-                   [](ChanToStreamOp &self) { return self.getChan().str(); })
-      .def_prop_ro("map", [](ChanToStreamOp &self) { return self.getMap(); });
-
-  nb::class_<allo::ChanAcquireBufferOp, OpState>(m, "ChanAcquireBufferOp")
-      .def_static(
-          "create",
-          [](AlloOpBuilder &builder, const std::string &chan,
-             const std::vector<Value> &indices, Type &dataType, int size = 1) {
-            return allo::ChanAcquireBufferOp::create(
-                builder, builder.get_loc(), chan, indices, dataType, size);
-          })
-      .def_prop_ro("chan", [](ChanAcquireBufferOp &self) {
-        return self.getChan().str();
+  nb::class_<allo::ChanAcquireOp, OpState>(m, "ChanAcquireOp")
+      .def_static("create", [](AlloOpBuilder &builder, const std::string &chan,
+                               const std::vector<Value> &indices,
+                               Type &dataType, int size = 1) {
+        return allo::ChanAcquireOp::create(builder, builder.get_loc(), chan,
+                                           indices, dataType, size);
       });
 
-  nb::class_<allo::ChanReleaseBufferOp, OpState>(m, "ChanReleaseBufferOp")
+  nb::class_<allo::ChanReleaseOp, OpState>(m, "ChanReleaseOp")
+      .def_static("create", [](AlloOpBuilder &builder, const std::string &chan,
+                               const std::vector<Value> &indices,
+                               const std::vector<Value> &buffers) {
+        return allo::ChanReleaseOp::create(builder, builder.get_loc(), chan,
+                                           indices, buffers);
+      });
+
+  nb::class_<allo::ChanGetOp, OpState>(m, "ChanGetOp")
       .def_static("create",
-                  [](AlloOpBuilder &builder, const std::string &chan,
-                     const std::vector<Value> &indices,
-                     const std::vector<Value> &buffers) {
-                    return allo::ChanReleaseBufferOp::create(
-                        builder, builder.get_loc(), chan, indices, buffers);
-                  })
-      .def_prop_ro("chan", [](ChanReleaseBufferOp &self) {
-        return self.getChan().str();
+                  [](AlloOpBuilder &builder, Type &dataTy,
+                     const std::string &chan, const std::vector<Value> &indices,
+                     bool blocking = false) -> Value {
+                    return allo::ChanGetOp::create(builder, builder.get_loc(),
+                                                   dataTy, chan, indices,
+                                                   blocking);
+                  });
+
+  nb::class_<allo::ChanPutOp, OpState>(m, "ChanPutOp")
+      .def_static("create", [](AlloOpBuilder &builder, const std::string &chan,
+                               const std::vector<Value> &indices, Value &val,
+                               bool blocking = false) {
+        return allo::ChanPutOp::create(builder, builder.get_loc(), chan,
+                                       indices, val, blocking);
       });
-
-  nb::class_<allo::StreamGetOp, OpState>(m, "StreamGetOp")
-      .def_static(
-          "create",
-          [](AlloOpBuilder &builder, Value &stream) -> Value {
-            if (!isa<StreamType>(stream.getType())) {
-              throw nb::value_error(
-                  "StreamGetOp must be created with a StreamType value!");
-            }
-            return allo::StreamGetOp::create(builder, builder.get_loc(),
-                                             stream);
-          },
-          nb::arg("builder"), nb::arg("stream"));
-
-  nb::class_<allo::StreamPutOp, OpState>(m, "StreamPutOp")
-      .def_static(
-          "create",
-          [](AlloOpBuilder &builder, Value &val, Value &stream) {
-            return allo::StreamPutOp::create(builder, builder.get_loc(), stream,
-                                             val);
-          },
-          nb::arg("builder"), nb::arg("val"), nb::arg("stream"));
 
   nb::class_<allo::KernelOp, OpState>(m, "KernelOp")
       .def_static(
@@ -164,24 +125,11 @@ void init_allo_ir(nb::module_ &m) {
       .def_prop_rw(
           "virtual_mapping",
           [](allo::KernelOp &self) {
-            auto attrs = self.getVirtualMapping().getAsRange<IntegerAttr>();
-            std::vector<int64_t> vmap;
-            for (auto attr : attrs) {
-              vmap.push_back(attr.getInt());
-            }
-            return vmap;
+            return std::vector<int64_t>(self.getVirtualMappingVec());
           },
           [](allo::KernelOp &self, const std::vector<int64_t> &vmap) {
-            SmallVector<Attribute, 4> newMap;
-            auto i64 = IntegerType::get(self->getContext(), 64);
-            for (auto v : vmap) {
-              newMap.push_back(IntegerAttr::get(i64, v));
-            }
-            if (!newMap.empty()) {
-              newMap.push_back(IntegerAttr::get(i64, 1));
-            }
             self.setVirtualMappingAttr(
-                ArrayAttr::get(self->getContext(), newMap));
+                VirtMapAttr::get(self.getContext(), vmap));
           });
 
   nb::class_<allo::ReturnOp, OpState>(m, "ReturnOp")

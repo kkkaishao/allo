@@ -47,7 +47,6 @@ from .types import (
     APFloat,
     tensor,
     array,
-    Stream,
     Channel,
     channel,
     tuple,

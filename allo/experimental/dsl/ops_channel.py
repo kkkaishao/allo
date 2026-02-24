@@ -51,48 +51,32 @@ def _lower_get_num_progs(builder: AlloOpBuilder, dim: constexpr) -> tensor:
     return builder.create_get_n_progs_op(dim.value)
 
 
-@as_member_function
-@operation
-def to_stream(chan: tensor, depth: int = 2) -> tensor:
-    pass
-
-
-@to_stream.validate
-def _validate_to_stream(chan: tensor, depth=constexpr(2)) -> str:
-    if not isinstance(chan.type, core.Channel):
-        return (
-            "to_stream operation requires 'chan' argument to be Channel, "
-            f"got {chan.type}."
-        )
-    if not _is_const_positive_int(depth):
-        return (
-            "to_stream operation requires 'depth' to be a positive integer constexpr, "
-            f"got {depth}."
-        )
-    return ""
-
-
-@to_stream.lower
-def _lower_to_stream(builder: AlloOpBuilder, chan: tensor, depth=constexpr(2)):
-    depth_v = depth.value
-    name_v = chan.type.name
-    indices = [i.handle for i in chan.type.last_indices]
-    dtype = chan.dtype
-    stream_ty = allo_d.StreamType.get(builder.context, dtype.to_ir(builder), depth_v)
-    rank = 1 if not chan.type.dshape else len(chan.type.dshape)
-    affine_map = builder.get_identity_map(rank)
-    ret = allo_d.ChanToStreamOp.create(builder, name_v, indices, stream_ty, affine_map)
-    return tensor(ret, core.types.Stream(dtype, depth_v))
+def _gen_channel_indices(builder: AlloOpBuilder, chan_ty: core.Channel):
+    indices_v = []
+    assert (
+        len(chan_ty.last_indices) > 0
+    ), "Channel type must have at least one index for codegen."
+    for val in chan_ty.last_indices.pop():
+        if _is_const_positive_int(val, allow_zero=True):
+            indices_v.append(builder.create_const_index(val.value).handle)
+        elif _is_scalar_tensor(val):
+            indices_v.append(builder.scalar_cast(val, core.index).handle)
+        else:
+            builder.compile_error(
+                f"Invalid index value in channel indices: {val}. "
+                "Expected integer constexpr or scalar tensor."
+            )
+    return indices_v
 
 
 @as_member_function
 @operation
-def acq_buf(name: str, size: int = 1) -> tensor:
+def acquire(name: str, size: int = 1) -> tensor:
     pass
 
 
-@acq_buf.validate
-def _validate_acq_buf(chan: tensor, size=constexpr(1)) -> str:
+@acquire.validate
+def _validate_acquire(chan: tensor, size=constexpr(1)) -> str:
     if not isinstance(chan.type, core.Channel):
         return (
             "acq_buf operation requires 'chan' argument to be Channel, "
@@ -106,23 +90,14 @@ def _validate_acq_buf(chan: tensor, size=constexpr(1)) -> str:
     return ""
 
 
-@acq_buf.lower
-def _lower_acq_buf(builder: AlloOpBuilder, chan: tensor, size=constexpr(1)):
+@acquire.lower
+def _lower_acquire(builder: AlloOpBuilder, chan: tensor, size=constexpr(1)):
     size_v = size.value
     indices_v = []
     chan_ty = chan.type
-    for val in chan_ty.last_indices:
-        if _is_const_positive_int(val, allow_zero=True):
-            indices_v.append(builder.create_const_index(val.value).handle)
-        elif _is_scalar_tensor(val):
-            indices_v.append(builder.scalar_cast(val, core.index).handle)
-        else:
-            builder.compile_error(
-                f"Invalid index value in channel indices: {val}. "
-                "Expected integer constexpr or scalar tensor."
-            )
+    indices_v = _gen_channel_indices(builder, chan_ty)
     elem_ty = chan_ty.data_ty
-    ac_op = allo_d.ChanAcquireBufferOp.create(
+    ac_op = allo_d.ChanAcquireOp.create(
         builder, chan_ty.name, indices_v, elem_ty.to_ir(builder), size_v
     )
     tensors = [tensor(ac_op.get_result_at(i), elem_ty) for i in range(size_v)]
@@ -131,12 +106,12 @@ def _lower_acq_buf(builder: AlloOpBuilder, chan: tensor, size=constexpr(1)):
 
 @as_member_function
 @operation
-def rel_buf(chan: tensor, *buffers) -> None:
+def release(chan: tensor, *buffers) -> None:
     pass
 
 
-@rel_buf.validate
-def _validate_rel_buf(chan: tensor, *buffers) -> str:
+@release.validate
+def _validate_release(chan: tensor, *buffers) -> str:
     if not isinstance(chan.type, core.Channel):
         return (
             "rel_buf operation requires 'chan' argument to be Channel, "
@@ -151,61 +126,82 @@ def _validate_rel_buf(chan: tensor, *buffers) -> str:
     return ""
 
 
-@rel_buf.lower
-def _lower_rel_buf(builder: AlloOpBuilder, chan: tensor, *buffers):
+@release.lower
+def _lower_release(builder: AlloOpBuilder, chan: tensor, *buffers):
     name_v = chan.type.name
-    indices = [i.handle for i in chan.type.last_indices]
+    indices_v = _gen_channel_indices(builder, chan.type)
     buffer_handles = [buf.handle for buf in buffers]
-    allo_d.ChanReleaseBufferOp.create(builder, name_v, indices, buffer_handles)
+    allo_d.ChanReleaseOp.create(builder, name_v, indices_v, buffer_handles)
 
 
 @as_member_function
 @operation
-def put(stream, value) -> None:
+def put(stream, value, blocking=False) -> None:
     pass
 
 
 @put.validate
-def _validate_put(stream: tensor, value: tensor | constexpr) -> str:
-    if not isinstance(stream.type, core.types.Stream):
+def _validate_put(
+    chan: tensor, value: tensor | constexpr, blocking=constexpr(False)
+) -> str:
+    if not isinstance(chan.type, core.types.Channel):
         return (
-            "put operation requires 'stream' argument to be Stream, "
-            f"got {stream.type}."
+            "put operation requires 'chan' argument to be Channel, " f"got {chan.type}."
         )
     if not _is_scalar_tensor(value) and not isinstance(value, constexpr):
         return (
             "put operation requires value to be scalar tensor or constexpr, "
             f"got {value}."
         )
+    if not isinstance(blocking, constexpr):
+        return "put operation requires `blocking` argument to be constexpr"
     return ""
 
 
 @put.lower
-def _lower_put(builder: AlloOpBuilder, stream: tensor, value: tensor | constexpr):
-    if isinstance(value, constexpr):
-        value = builder.make_scalar(value.value, stream.dtype)
-    else:
-        value = builder.scalar_cast(value, stream.dtype)
-    allo_d.StreamPutOp.create(builder, value.handle, stream.handle)
+def _lower_put(
+    builder: AlloOpBuilder,
+    chan: tensor,
+    value: tensor | constexpr,
+    blocking=constexpr(False),
+):
+    chan_ty = chan.type
+    indices_v = _gen_channel_indices(builder, chan_ty)
+    elem_ty = chan_ty.data_ty
+    value = builder.make_or_cast(value, elem_ty)
+    blocking_v = blocking.value
+    allo_d.ChanPutOp.create(builder, chan_ty.name, indices_v, value.handle, blocking_v)
 
 
 @as_member_function
 @operation
-def get(stream) -> tensor:
+def get(stream, blocking=False) -> tensor:
     pass
 
 
 @get.validate
-def _validate_get(stream: tensor) -> str:
-    if not isinstance(stream.type, core.types.Stream):
+def _validate_get(chan: tensor, blocking=constexpr(False)) -> str:
+    if not isinstance(chan.type, core.types.Channel):
         return (
-            "get operation requires 'stream' argument to be Stream, "
-            f"got {stream.type}."
+            "get operation requires 'chan' argument to be Channel, " f"got {chan.type}."
         )
+    if not isinstance(chan.type.data_ty, core.scalar_type):
+        return (
+            "get operation requires channel data type to be scalar, "
+            f"got {chan.type.data_ty}."
+        )
+    if not isinstance(blocking, constexpr):
+        return "get operation requires `blocking` argument to be constexpr"
     return ""
 
 
 @get.lower
-def _lower_get(builder: AlloOpBuilder, stream: tensor) -> tensor:
-    ret = allo_d.StreamGetOp.create(builder, stream.handle)
-    return tensor(ret, stream.dtype)
+def _lower_get(
+    builder: AlloOpBuilder, chan: tensor, blocking=constexpr(False)
+) -> tensor:
+    chan_ty = chan.type
+    indices_v = _gen_channel_indices(builder, chan_ty)
+    elt_ty = chan.dtype.to_ir(builder)
+    blocking_v = blocking.value
+    ret = allo_d.ChanGetOp.create(builder, elt_ty, chan_ty.name, indices_v, blocking_v)
+    return tensor(ret, chan.dtype)

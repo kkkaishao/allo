@@ -56,29 +56,27 @@ class ReturnOp(ir.OpState):
     @staticmethod
     def create(builder: ir.AlloOpBuilder, operands: Sequence[ir.Value]) -> ReturnOp: ...
 
-class StreamCreateOp(ir.OpState):
+class ChanGetOp(ir.OpState):
     def __init__(*args, **kwargs): ...
     @staticmethod
     def create(
-        builder: ir.AlloOpBuilder, name: str, stream_type: StreamType
-    ) -> StreamCreateOp: ...
+        builder: ir.AlloOpBuilder,
+        elt_ty: ir.Type,
+        chan: str,
+        indices: Sequence[ir.Value],
+        blocking: bool = False,
+    ) -> ir.Value: ...
 
-class StreamGetOp(ir.OpState):
-    def __init__(*args, **kwargs): ...
-    @staticmethod
-    def create(builder: ir.AlloOpBuilder, stream: ir.Value) -> ir.Value: ...
-
-class StreamPutOp(ir.OpState):
+class ChanPutOp(ir.OpState):
     def __init__(*args, **kwargs): ...
     @staticmethod
     def create(
-        builder: ir.AlloOpBuilder, value: ir.Value, stream: ir.Value
-    ) -> StreamPutOp: ...
-
-class StreamType(ir.Type):
-    def __init__(*args, **kwargs): ...
-    @staticmethod
-    def get(context: ir.Context, base_type: ir.Type, depth: int = 2) -> StreamType: ...
+        builder: ir.AlloOpBuilder,
+        chan: str,
+        indices: Sequence[ir.Value],
+        value: ir.Value,
+        blocking: bool = False,
+    ) -> ChanPutOp: ...
 
 class ChannelType(ir.Type):
     def __int__(*args, **kwargs): ...
@@ -87,22 +85,7 @@ class ChannelType(ir.Type):
         context: ir.Context, data_type: ir.Type, capacity: int = 2
     ) -> ChannelType: ...
 
-class ChanToStreamOp(ir.OpState):
-    def __init__(*args, **kwargs): ...
-    @staticmethod
-    def create(
-        builder: ir.AlloOpBuilder,
-        chan: str,
-        indices: Sequence[ir.Value],
-        stream_ty: StreamType,
-        map: ir.AffineMap,
-    ) -> ir.Value: ...
-    @property
-    def chan(self) -> str: ...
-    @property
-    def map(self) -> ir.AffineMap: ...
-
-class ChanAcquireBufferOp(ir.OpState):
+class ChanAcquireOp(ir.OpState):
     def __init__(*args, **kwargs): ...
     @staticmethod
     def create(
@@ -111,11 +94,9 @@ class ChanAcquireBufferOp(ir.OpState):
         indices: Sequence[ir.Value],
         tys: ir.Type,
         size: int = 1,
-    ) -> ChanAcquireBufferOp: ...
-    @property
-    def chan(self) -> str: ...
+    ) -> ChanAcquireOp: ...
 
-class ChanReleaseBufferOp(ir.OpState):
+class ChanReleaseOp(ir.OpState):
     def __init__(*args, **kwargs): ...
     @staticmethod
     def create(
@@ -123,9 +104,7 @@ class ChanReleaseBufferOp(ir.OpState):
         chan: str,
         indices: Sequence[ir.Value],
         buffers: Sequence[ir.Value],
-    ) -> ChanReleaseBufferOp: ...
-    @property
-    def chan(self) -> str: ...
+    ) -> ChanReleaseOp: ...
 
 class ChanCreateOp(ir.OpState):
     def __init__(*args, **kwargs): ...
@@ -256,3 +235,25 @@ class PartitionOp(ir.OpState):
     def create(
         builder: ir.AlloOpBuilder, target: ir.Value, partition: PartitionAttr
     ) -> PartitionOp: ...
+
+class ApplyVirtualMapOp(ir.OpState):
+    def __init__(*args, **kwargs): ...
+    @staticmethod
+    def create(
+        builder: ir.AlloOpBuilder,
+        target: ir.Value,
+        mapping: Sequence[int] = [],
+        enable_sccp: bool = False,
+    ) -> ApplyVirtualMapOp: ...
+
+class ChainOp(ir.OpState):
+    def __init__(*args, **kwargs): ...
+    @staticmethod
+    def create(
+        builder: ir.AlloOpBuilder, first: ir.Value, second: ir.Value
+    ) -> ChainOp: ...
+
+class BundleOp(ir.OpState):
+    def __init__(*args, **kwargs): ...
+    @staticmethod
+    def create(builder: ir.AlloOpBuilder, inputs: ir.Value) -> BundleOp: ...

@@ -7,6 +7,8 @@ import contextlib
 import copy
 import textwrap
 import hashlib
+from functools import cached_property
+
 from dataclasses import dataclass, field
 from types import ModuleType
 from typing import (
@@ -261,8 +263,6 @@ class CodeGenerator(ast.NodeVisitor):
     """
     Lower one kernel AST into Allo/MLIR with explicit scope + CFG bookkeeping.
     """
-
-    _cached_consteval_runtime_types: tuple[type, ...] | None = None
 
     def __init__(
         self,
@@ -533,12 +533,9 @@ class CodeGenerator(ast.NodeVisitor):
         nested = self.hoisted_nested_kernels.get(node.name)
         return nested is not None and nested.func_def is node
 
-    @staticmethod
-    def _consteval_mlir_runtime_types():
+    @cached_property
+    def _consteval_mlir_runtime_types(self):
         """Best-effort MLIR runtime proxy type set used by consteval safety checks."""
-
-        if CodeGenerator._cached_consteval_runtime_types is not None:
-            return CodeGenerator._cached_consteval_runtime_types
         runtime_types = []
         for name in [
             "Value",
@@ -554,8 +551,7 @@ class CodeGenerator(ast.NodeVisitor):
             ty = getattr(ir, name, None)
             if isinstance(ty, type):
                 runtime_types.append(ty)
-        CodeGenerator._cached_consteval_runtime_types = tuple(runtime_types)
-        return CodeGenerator._cached_consteval_runtime_types
+        return tuple(runtime_types)
 
     def _find_runtime_dependent_consteval_value(self, value, path: str):
         """Return first runtime-dependent object found in `value`, or None."""
@@ -573,7 +569,7 @@ class CodeGenerator(ast.NodeVisitor):
         if isinstance(value, base_value):
             # Reject non-constexpr frontend values by default.
             return path, value
-        if isinstance(value, self._consteval_mlir_runtime_types()):
+        if isinstance(value, self._consteval_mlir_runtime_types):
             return path, value
         if isinstance(value, dict):
             for k, v in value.items():

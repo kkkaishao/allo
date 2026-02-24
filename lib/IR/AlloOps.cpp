@@ -2,8 +2,6 @@
 #include "allo/IR/AlloAttrs.h"
 #include "allo/IR/AlloTypes.h"
 
-#include "allo/IR/AlloDialect.cpp.inc"
-
 using namespace mlir;
 using namespace mlir::allo;
 
@@ -15,8 +13,12 @@ using namespace mlir::allo;
 
 #include "allo/IR/AlloEnums.cpp.inc"
 
+#include "allo/IR/AlloInterfaces.cpp.inc"
+
 #define GET_OP_CLASSES
 #include "allo/IR/AlloOps.cpp.inc"
+
+#include "allo/IR/AlloDialect.cpp.inc"
 
 namespace {
 // Used to customize partition attribute printing and parsing in the IR
@@ -26,6 +28,10 @@ struct AlloOpAsmDialectInterface : public OpAsmDialectInterface {
   AliasResult getAlias(Attribute attr, raw_ostream &os) const override {
     if (isa<PartitionAttr>(attr)) {
       os << "part";
+      return AliasResult::OverridableAlias;
+    }
+    if (isa<VirtMapAttr>(attr)) {
+      os << "virtmap";
       return AliasResult::OverridableAlias;
     }
     return AliasResult::NoAlias;
@@ -38,15 +44,21 @@ void AlloDialect::initialize() {
   addTypes<
 #define GET_TYPEDEF_LIST
 #include "allo/IR/AlloTypes.cpp.inc"
+
+
       >();
   addAttributes<
 #define GET_ATTRDEF_LIST
 #include "allo/IR/AlloAttrs.cpp.inc"
+
+
       >();
   addInterface<AlloOpAsmDialectInterface>();
   addOperations<
 #define GET_OP_LIST
 #include "allo/IR/AlloOps.cpp.inc"
+
+
       >();
   // clang-format on
 }
@@ -98,12 +110,13 @@ void KernelOp::build(OpBuilder &builder, OperationState &state, StringRef name,
   state.addAttribute(SymbolTable::getSymbolAttrName(),
                      builder.getStringAttr(name));
   state.addAttribute(getFunctionTypeAttrName(state.name), TypeAttr::get(type));
-  auto vmap = llvm::to_vector<4>(vtMap);
-  if (vmap.empty()) {
-    vmap.push_back(1);
+  VirtMapAttr vMapAttr;
+  if (vtMap.empty()) {
+    vMapAttr = VirtMapAttr::get(builder.getContext(), 1);
+  } else {
+    vMapAttr = VirtMapAttr::get(builder.getContext(), vtMap);
   }
-  state.addAttribute(getVirtualMappingAttrName(state.name),
-                     builder.getI64ArrayAttr(vmap));
+  state.addAttribute(getVirtualMappingAttrName(state.name), vMapAttr);
   state.addAttributes(attrs);
   state.addRegion();
 
@@ -132,9 +145,12 @@ void KernelOp::print(OpAsmPrinter &p) {
   }
   p.printSymbolName(funcName);
   // print virtual mapping
-  p << " virtual_map";
-  p.printAttribute(getVirtualMappingAttr());
-  p << " ";
+  auto virtmap = getVirtualMappingVec();
+  if (virtmap.size() != 1 || virtmap.front() != 1) {
+    p << " " << VirtMapAttrName << " ";
+    p.printAttribute(getVirtualMappingAttr());
+    p << " ";
+  }
   ArrayRef<Type> argTypes = getArgumentTypes();
   ArrayRef<Type> resTypes = getResultTypes();
   function_interface_impl::printFunctionSignature(
@@ -165,16 +181,16 @@ ParseResult KernelOp::parse(OpAsmParser &parser, OperationState &result) {
                              result.attributes))
     return failure();
   // Parse virtual mapping.
-  if (!parser.parseOptionalKeyword("virtual_map")) {
+  if (succeeded(parser.parseOptionalKeyword(VirtMapAttrName))) {
     // virtual mapping is specified, parse the attribute.
-    ArrayAttr vMapAttr;
+    VirtMapAttr vMapAttr;
     if (parser.parseAttribute(vMapAttr, getVirtualMappingAttrName(result.name),
                               result.attributes))
       return failure();
   } else {
     // virtual mapping is not specified, use default value.
     result.addAttribute(getVirtualMappingAttrName(result.name),
-                        builder.getI64ArrayAttr(1));
+                        VirtMapAttr::get(result.getContext(), 1));
   }
   // Parse the function signature.
   SMLoc signatureLocation = parser.getCurrentLocation();
@@ -235,7 +251,7 @@ ParseResult KernelOp::parse(OpAsmParser &parser, OperationState &result) {
 
 LogicalResult CallOp::verifySymbolUses(SymbolTableCollection &symbolTable) {
   // Check that the callee attribute was specified.
-  auto fnAttr = (*this).getProperties().callee;
+  auto fnAttr = this->getProperties().callee;
   if (!fnAttr)
     return emitOpError("requires a 'callee' symbol reference attribute");
   auto fn = symbolTable.lookupNearestSymbolFrom<KernelOp>(*this, fnAttr);
@@ -289,6 +305,15 @@ LogicalResult ReturnOp::verify() {
   return success();
 }
 
+LogicalResult
+VirtMapAttr::verify(llvm::function_ref<InFlightDiagnostic()> emitError,
+                    ArrayRef<int64_t> ranges) {
+  if (llvm::any_of(ranges, [](int64_t x) { return x <= 0; })) {
+    return emitError() << "ranges of virtual map must be all positive";
+  }
+  return success();
+}
+
 //===----------------------------------------------------------------------===//
 // SPMD Operations
 //===----------------------------------------------------------------------===//
@@ -300,11 +325,11 @@ LogicalResult GetProgramIdOp::verify() {
   auto dim = getAxiAttr().getInt();
   auto vMap = parent.getVirtualMapping();
 
-  if (dim < 0 || static_cast<uint64_t>(dim) >= vMap.size()) {
+  if (dim < 0 || static_cast<uint64_t>(dim) >= vMap.getRanges().size()) {
     return emitOpError()
            << "dimension " << dim
            << " is out of bounds for KernelOp virtual mapping of size "
-           << vMap.size();
+           << vMap.getRanges().size();
   }
   return success();
 }
@@ -316,11 +341,11 @@ LogicalResult GetNumProgramsOp::verify() {
   }
   auto dim = getAxi();
   auto vMap = parent.getVirtualMapping();
-  if (dim < 0 || static_cast<uint64_t>(dim) >= vMap.size()) {
+  if (dim < 0 || static_cast<uint64_t>(dim) >= vMap.getRanges().size()) {
     return emitOpError()
            << "dimension " << dim
            << " is out of bounds for KernelOp virtual mapping of size "
-           << vMap.size();
+           << vMap.getRanges().size();
   }
   return success();
 }
@@ -328,133 +353,103 @@ LogicalResult GetNumProgramsOp::verify() {
 //===----------------------------------------------------------------------===//
 // Stream Operations
 //===----------------------------------------------------------------------===//
-LogicalResult ChanToStreamOp::verify() {
-  if (isa<ShapedType>(getStream().getType().getDataType())) {
+
+LogicalResult ChanPutOp::verifySymbolUses(SymbolTableCollection &symbolTable) {
+  auto chan = SymbolTable::lookupNearestSymbolFrom<ChanCreateOp>(
+      *this, getChannelAttr());
+  if (!chan) {
+    return emitOpError() << "must refer a valid channel";
+  }
+  if (getIndices().size() != chan.getShape().size()) {
     return emitOpError()
-           << "must acquire from a stream with primitive type elements";
+           << "rank of indices does not match that of the referred channel";
+  }
+  auto dataType = chan.getChanType().getDataType();
+  auto valueTy = getValue().getType();
+  if (dataType != valueTy) {
+    return emitOpError() << "type mismatch between the input value and the "
+                            "channel data type";
+  }
+  return success();
+}
+
+LogicalResult ChanGetOp::verifySymbolUses(SymbolTableCollection &symbolTable) {
+  auto chan = SymbolTable::lookupNearestSymbolFrom<ChanCreateOp>(
+      *this, getChannelAttr());
+  if (!chan) {
+    return emitOpError() << "must refer a valid channel";
+  }
+  if (getIndices().size() != chan.getShape().size()) {
+    return emitOpError()
+           << "rank of indices does not match that of the referred channel";
+  }
+  auto dataType = chan.getChanType().getDataType();
+  auto valueTy = getValue().getType();
+  if (dataType != valueTy) {
+    return emitOpError() << "type mismatch between the return value and the "
+                            "channel data type";
   }
   return success();
 }
 
 LogicalResult
-ChanToStreamOp::verifySymbolUses(SymbolTableCollection &symbolTable) {
-  auto chan =
-      SymbolTable::lookupNearestSymbolFrom<ChanCreateOp>(*this, getChanAttr());
+ChanAcquireOp::verifySymbolUses(SymbolTableCollection &symbolTable) {
+  auto chan = SymbolTable::lookupNearestSymbolFrom<ChanCreateOp>(
+      *this, getChannelAttr());
   if (!chan) {
     return emitOpError() << "must refer a valid channel";
   }
-  unsigned indices = chan.getShape().size();
-  if (indices != getIndices().size()) {
-    return emitOpError() << "requires the number of indices must match that of "
-                            "the channel's shape";
-  }
-  auto type = chan.getChanType().getDataType();
-  auto map = getMap();
-  if (!isa<ShapedType>(type)) {
-    // channel is of scalar values
-    if (map.getNumDims() != 1 || !map.isIdentity()) {
-      return emitOpError() << "requires a 1-D identity map when the data type"
-                              "in the channel is scalar";
-    }
-    return success();
-  }
-  // channel is of memref/tensor values
-  // check if the rank of input matches the number of dims of the map
-  // e.g. for !allo.chan<tensor<16x16xf32>,2>,
-  // affine map <(d0) -> (d0)> is invalid
-  auto shaped = dyn_cast<ShapedType>(type);
-  if (!shaped.hasRank()) {
-    return emitOpError() << "requires ranked memref/tensor values";
-  }
-  int64_t rank = shaped.getRank();
-  if (rank != map.getNumDims()) {
+  if (getIndices().size() != chan.getShape().size()) {
     return emitOpError()
-           << "requires the number of dims of the affine map must match "
-              "the rank of input data type";
+           << "rank of indices does not match that of the channel";
+  }
+  auto dataType = chan.getChanType().getDataType();
+  auto valueTys = getBuffers().getTypes();
+  // check if value types are the same
+  Type firstTy = valueTys.front();
+  if (llvm::any_of(valueTys, [&](Type ty) { return ty != firstTy; })) {
+    return emitOpError() << "return value types must be identical";
+  }
+  if (dataType != firstTy) {
+    return emitOpError() << "type mismatch between the return value and the "
+                            "channel data type";
+  }
+  int64_t size = getSizeAttr().getInt();
+  if (size <= 0 ||
+      static_cast<uint64_t>(size) > chan.getChanType().getDepth()) {
+    return emitOpError() << "the number of buffers to acquire must be positive "
+                            "and not exceed the depth of the channel";
   }
   return success();
 }
 
 LogicalResult
-ChanAcquireBufferOp::verifySymbolUses(SymbolTableCollection &symbolTable) {
-  auto chan =
-      SymbolTable::lookupNearestSymbolFrom<ChanCreateOp>(*this, getChanAttr());
+ChanReleaseOp::verifySymbolUses(SymbolTableCollection &symbolTable) {
+  auto chan = SymbolTable::lookupNearestSymbolFrom<ChanCreateOp>(
+      *this, getChannelAttr());
   if (!chan) {
     return emitOpError() << "must refer a valid channel";
   }
-  unsigned indices = chan.getShape().size();
-  if (indices != getIndices().size()) {
-    return emitOpError() << "requires the number of indices must match that of "
-                            "the channel's shape";
-  }
-  auto type = chan.getChanType().getDataType();
-  if (!isa<ShapedType>(type)) {
+  if (getIndices().size() != chan.getShape().size()) {
     return emitOpError()
-           << "must acquire from a channel with shaped type values";
+           << "rank of indices does not match that of the channel";
   }
-  auto size = getSizeAttr().getInt();
-  auto capacity = chan.getChanType().getCapacity();
-  if (size < 0 || static_cast<uint64_t>(size) > capacity) {
+  auto dataType = chan.getChanType().getDataType();
+  auto valueTys = getBuffers().getTypes();
+  // check if value types are the same
+  Type firstTy = valueTys.front();
+  if (llvm::any_of(valueTys, [&](Type ty) { return ty != firstTy; })) {
+    return emitOpError() << "return value types must be identical";
+  }
+  if (dataType != firstTy) {
+    return emitOpError() << "type mismatch between the return value and the "
+                            "channel data type";
+  }
+  unsigned nBuffers = valueTys.size();
+  if (nBuffers > chan.getChanType().getDepth()) {
     return emitOpError()
-           << "cannot acquire elements more than the channel's capacity";
-  }
-  auto buffers = getBuffers();
-  if (static_cast<uint64_t>(size) != buffers.size()) {
-    return emitOpError()
-           << "requires the number of results must match the number of "
-              "acquired buffers";
-  }
-  for (auto buffer : buffers) {
-    if (buffer.getType() != type) {
-      return emitOpError() << "requires the type of result #"
-                           << buffer.getResultNumber() << " "
-                           << "must match that of channel elements";
-    }
-  }
-  return success();
-}
-
-LogicalResult
-ChanReleaseBufferOp::verifySymbolUses(SymbolTableCollection &symbolTable) {
-  auto chan =
-      SymbolTable::lookupNearestSymbolFrom<ChanCreateOp>(*this, getChanAttr());
-  if (!chan) {
-    return emitOpError() << "must refer a valid channel";
-  }
-  unsigned indices = chan.getShape().size();
-  if (indices != getIndices().size()) {
-    return emitOpError() << "requires the number of indices must match that of "
-                            "the channel's shape";
-  }
-  auto type = chan.getChanType().getDataType();
-  if (!isa<ShapedType>(type)) {
-    return emitOpError() << "must release to a channel with shaped type values";
-  }
-  auto size = getBuffers().size();
-  auto capacity = chan.getChanType().getCapacity();
-  if (size > capacity) {
-    return emitOpError()
-           << "cannot release elements more than the channel's capacity";
-  }
-  return success();
-}
-
-LogicalResult StreamPutOp::verify() {
-  auto valTy = getValue().getType();
-  auto primitiveTy = getStream().getType().getDataType();
-  if (valTy != primitiveTy) {
-    return emitOpError() << "requires the type of value must match the base "
-                            "type of the stream";
-  }
-  return success();
-}
-
-LogicalResult StreamGetOp::verify() {
-  auto valTy = getValue().getType();
-  auto primitiveTy = getStream().getType().getDataType();
-  if (valTy != primitiveTy) {
-    return emitOpError() << "requires the type of value must match the base "
-                            "type of the stream";
+           << "the number of buffers to release must not exceed the "
+              "depth of the channel";
   }
   return success();
 }

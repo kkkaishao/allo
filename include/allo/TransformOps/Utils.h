@@ -14,6 +14,8 @@ bool affineExprUsesValue(AffineExpr expr, ValueRange mapOperands,
                          unsigned numDims, Value needle);
 int findMemRefAxisFromIV(affine::AffineStoreOp storeOp, Value iv);
 Value resolveMemRefValueRoot(Value value);
+bool isTrivialMapping(ArrayRef<int64_t> mapping);
+SmallVector<int64_t> convertMappingAttrToVec(ArrayAttr mappingAttr);
 } // namespace mlir::allo
 
 #endif // ALLO_TRANSFORM_OPS_UTILS_H

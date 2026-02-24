@@ -43,6 +43,17 @@ def PartitionAttr : Allo_Attr<"Partition"> {
   }];
 }
 
+def VirtMapAttr : Allo_Attr<"VirtMap"> {
+  let mnemonic = "virtmap";
+  let parameters = (ins
+    ArrayRefParameter<"int64_t">:$ranges);
+  let assemblyFormat = [{
+    `<` `[` $ranges `]` `>`
+  }];
+  let cppNamespace = "::mlir::allo";
+  let genVerifyDecl = 1;
+}
+
 def BRAMStorage : I32EnumAttrCase<"BRAM", 0>;
 def URAMStorage : I32EnumAttrCase<"URAM", 1>;
 def LUTRAMStorage : I32EnumAttrCase<"LUTRAM", 2>;

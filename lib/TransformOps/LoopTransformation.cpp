@@ -64,7 +64,7 @@ void replaceOpWithRegion(RewriterBase &rewriter, Operation *op,
   Block *block = &region.front();
   Operation *terminator = block->getTerminator();
   ValueRange results = terminator->getOperands();
-  rewriter.inlineBlockBefore(block, op, /*blockArgs=*/{});
+  rewriter.inlineBlockBefore(block, op, /*argValues=*/{});
   rewriter.replaceOp(op, results);
   rewriter.eraseOp(terminator);
 }
@@ -338,7 +338,7 @@ transform::LoopSplitOp::applyToOne(transform::TransformRewriter &rewriter,
   }
   // Case 1: affine.for loop
   if (auto forOp = dyn_cast<affine::AffineForOp>(target)) {
-    StringAttr symName = forOp->getAttrOfType<StringAttr>(OpIdentifier);
+    auto symName = forOp->getAttrOfType<StringAttr>(OpIdentifier);
     if (!checkSplitFactor(forOp, factor)) {
       return emitSilenceableFailure(forOp)
              << "split factor is larger than or equal to the loop range";
@@ -392,7 +392,7 @@ transform::LoopSplitOp::applyToOne(transform::TransformRewriter &rewriter,
   }
   // Case 2: scf.for loop
   if (auto forOp = dyn_cast<scf::ForOp>(target)) {
-    StringAttr symName = forOp->getAttrOfType<StringAttr>(OpIdentifier);
+    auto symName = forOp->getAttrOfType<StringAttr>(OpIdentifier);
     if (!checkSplitFactor(forOp, factor)) {
       return emitSilenceableFailure(forOp)
              << "split factor is larger than or equal to the loop range";

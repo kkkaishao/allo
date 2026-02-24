@@ -1,5 +1,3 @@
-#include "allo/TransformOps/AlloTransformOps.h"
-#include "allo/TransformOps/Utils.h"
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Bufferization/IR/Bufferization.h"
@@ -12,7 +10,9 @@
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/Dialect/Vector/IR/VectorOps.h"
 #include "mlir/IR/SymbolTable.h"
-#include "llvm/ADT/SmallPtrSet.h"
+
+#include "allo/TransformOps/AlloTransformOps.h"
+#include "allo/TransformOps/Utils.h"
 
 #include <optional>
 
@@ -166,20 +166,6 @@ PartitionAttr mergePartitionAttrs(PartitionAttr a, PartitionAttr b) {
 
   return PartitionAttr::get(a.getContext(), kinds, factors, dims);
 }
-
-LogicalResult verifyPartitionAttr(PartitionAttr partition,
-                                  MemRefType memrefType) {
-  int64_t rank = memrefType.getRank();
-  auto triples = llvm::zip_equal(partition.getDims(), partition.getFactors(),
-                                 partition.getKinds());
-  for (auto [dim, factor, kind] : triples) {
-    if (dim < 0 || dim >= rank)
-      return failure();
-    if (kind != PartitionKindEnum::Complete && factor <= 0)
-      return failure();
-  }
-  return success();
-}
 } // namespace
 
 DiagnosedSilenceableFailure
@@ -248,10 +234,6 @@ transform::PartitionOp::apply(transform::TransformRewriter &rewriter,
 
     auto oldPart = dyn_cast_if_present<PartitionAttr>(oldAttr);
     auto mergedPart = mergePartitionAttrs(oldPart, newPart);
-    if (failed(verifyPartitionAttr(mergedPart, rootMemrefType))) {
-      return emitSilenceableError()
-             << "invalid partition spec for memref type " << rootMemrefType;
-    }
 
     if (argNumber.has_value()) {
       auto kernel = cast<allo::KernelOp>(attrOwner);

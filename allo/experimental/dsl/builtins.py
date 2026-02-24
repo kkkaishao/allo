@@ -30,13 +30,12 @@ from .ops_arith import (
     min,
 )
 from .ops_channel import (
-    acq_buf,
+    acquire,
     get,
     get_num_progs,
     get_pid,
     put,
-    rel_buf,
-    to_stream,
+    release,
 )
 from .ops_memory import load, store
 from .ops_types import cast  # also binds type constructor operations to core types.
@@ -71,11 +70,10 @@ __all__ = [
     "cast",
     "max",
     "min",
-    "acq_buf",
-    "rel_buf",
+    "acquire",
+    "release",
     "get_pid",
     "get_num_progs",
-    "to_stream",
     "put",
     "get",
 ]
