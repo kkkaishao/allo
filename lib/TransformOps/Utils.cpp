@@ -1,10 +1,9 @@
 #include "allo/TransformOps/Utils.h"
+#include "mlir/Dialect/Affine/IR/AffineValueMap.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 
-namespace {
-
-bool mapOperandDependsOnValue(mlir::Value operand, mlir::Value needle) {
+static bool mapOperandDependsOnValue(mlir::Value operand, mlir::Value needle) {
   if (operand == needle)
     return true;
 
@@ -36,8 +35,6 @@ bool mapOperandDependsOnValue(mlir::Value operand, mlir::Value needle) {
 
   return arithDependsOnNeedle(operand.getDefiningOp());
 }
-
-} // namespace
 
 namespace mlir::allo {
 
@@ -154,4 +151,19 @@ SmallVector<int64_t> convertMappingAttrToVec(ArrayAttr mappingAttr) {
                  [&](IntegerAttr attr) { result.push_back(attr.getInt()); });
   return result;
 }
+
+Value stripCast(Value value) {
+  while (true) {
+    auto *defOp = value.getDefiningOp();
+    if (!defOp)
+      return value;
+    if (isa<arith::IndexCastOp, arith::ExtSIOp, arith::ExtUIOp,
+            arith::TruncIOp>(defOp)) {
+      value = defOp->getOperand(0);
+    } else {
+      return value;
+    }
+  }
+}
+
 } // namespace mlir::allo

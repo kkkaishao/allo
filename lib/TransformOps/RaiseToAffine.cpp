@@ -1,4 +1,5 @@
 #include "allo/TransformOps/AlloTransformOps.h"
+#include "allo/TransformOps/Utils.h"
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
@@ -9,20 +10,188 @@
 using namespace mlir;
 using namespace mlir::allo;
 
-namespace {
 
-Value stripCast(Value value) {
-  while (true) {
-    auto defOp = value.getDefiningOp();
-    if (!defOp)
-      break;
-    if (isa<arith::IndexCastOp, arith::IndexCastUIOp, arith::ExtSIOp,
-            arith::ExtUIOp, arith::TruncIOp>(defOp))
-      value = defOp->getOperand(0);
-    else
-      break;
+namespace {
+struct AffineValueMapBuilder {
+  MLIRContext *ctx;
+  SmallVector<Value, 4> dims;
+  SmallVector<Value, 4> syms;
+  llvm::SmallDenseSet<Value, 4> exprFailureCache;
+  SmallVector<AffineExpr, 4> results;
+
+  explicit AffineValueMapBuilder(MLIRContext *ctx) : ctx(ctx) {}
+
+  LogicalResult importValue(Value v) {
+    auto result = importValueInternal(v);
+    if (failed(result))
+      return failure();
+    results.push_back(*result);
+    return success();
   }
-  return value;
+
+  LogicalResult importMapAndOperands(AffineMap map, ValueRange dims,
+                                     ValueRange syms,
+                                     bool allowMultiResults = false);
+  affine::AffineValueMap compose() const;
+  void reset();
+
+private:
+  LogicalResult cacheFailure(Value v) {
+    exprFailureCache.insert(v);
+    return failure();
+  }
+  FailureOr<AffineExpr> importValueInternal(Value v);
+  AffineExpr addDim(Value v);
+  AffineExpr addSym(Value v);
+};
+}
+
+AffineExpr AffineValueMapBuilder::addDim(Value v) {
+  auto *it = llvm::find(dims, v);
+  // if found, return its existing position
+  if (it != dims.end()) {
+    return getAffineDimExpr(std::distance(dims.begin(), it), ctx);
+  }
+  // otherwise, register it
+  unsigned pos = dims.size();
+  dims.push_back(v);
+  return getAffineDimExpr(pos, ctx);
+}
+
+AffineExpr AffineValueMapBuilder::addSym(Value v) {
+  // same as adding a dim
+  auto *it = llvm::find(syms, v);
+  if (it != syms.end()) {
+    return getAffineSymbolExpr(std::distance(syms.begin(), it), ctx);
+  }
+  unsigned pos = syms.size();
+  syms.push_back(v);
+  return getAffineSymbolExpr(pos, ctx);
+}
+
+FailureOr<AffineExpr> AffineValueMapBuilder::importValueInternal(Value v) {
+  v = stripCast(v);
+  // Case 0: fast reject
+  if (exprFailureCache.contains(v))
+    return failure();
+  // Case 1: constant integer
+  IntegerAttr::ValueType cst;
+  if (matchPattern(v, m_ConstantInt(&cst))) {
+    return getAffineConstantExpr(cst.getSExtValue(), ctx);
+  }
+  // Case 2: affine dim or symbol, use upstream utils
+  if (affine::isValidDim(v)) {
+    return addDim(v);
+  }
+  if (affine::isValidSymbol(v)) {
+    return addSym(v);
+  }
+
+  // Case 3: affine.apply, recursively import its map results
+  auto *defOp = v.getDefiningOp();
+  if (auto applyOp = dyn_cast_if_present<affine::AffineApplyOp>(defOp)) {
+    if (failed(importMapAndOperands(
+            applyOp.getAffineMap(), applyOp.getDimOperands(),
+            applyOp.getSymbolOperands(), /*allowMultiResults=*/false)))
+      return cacheFailure(v);
+    return results.back();
+  }
+  // Case 4: arithmetic operations
+  if (auto addOp = dyn_cast_if_present<arith::AddIOp>(defOp)) {
+    auto lhs = importValueInternal(addOp.getLhs());
+    auto rhs = importValueInternal(addOp.getRhs());
+    if (failed(lhs) || failed(rhs))
+      return cacheFailure(v);
+    return *lhs + *rhs;
+  }
+  if (auto subOp = dyn_cast_if_present<arith::SubIOp>(defOp)) {
+    auto lhs = importValueInternal(subOp.getLhs());
+    auto rhs = importValueInternal(subOp.getRhs());
+    if (failed(lhs) || failed(rhs))
+      return cacheFailure(v);
+    return *lhs - *rhs;
+  }
+  if (auto mulOp = dyn_cast_if_present<arith::MulIOp>(defOp)) {
+    auto lhs = importValueInternal(mulOp.getLhs());
+    auto rhs = importValueInternal(mulOp.getRhs());
+    if (failed(lhs) || failed(rhs))
+      return cacheFailure(v);
+    // multiplication of affine exprs is not affine unless one of them is a
+    // symbol d0 * d1 is not affine, but s0 * d0 or s0 * s1 is affine.
+    auto result = *lhs * *rhs;
+    if (!result.isPureAffine())
+      return cacheFailure(v);
+    return result;
+  }
+  if (isa_and_present<arith::DivSIOp, arith::DivUIOp>(defOp)) {
+    auto lhs = importValueInternal(defOp->getOperand(0));
+    auto rhs = importValueInternal(defOp->getOperand(1));
+    if (failed(lhs) || failed(rhs))
+      return cacheFailure(v);
+    // division of affine exprs is not affine unless the divisor is a symbol or
+    // constant
+    auto result = lhs->floorDiv(*rhs);
+    if (!result.isPureAffine())
+      return cacheFailure(v);
+    return result;
+  }
+  if (isa_and_present<arith::RemSIOp, arith::RemUIOp>(defOp)) {
+    auto lhs = importValueInternal(defOp->getOperand(0));
+    auto rhs = importValueInternal(defOp->getOperand(1));
+    if (failed(lhs) || failed(rhs))
+      return cacheFailure(v);
+    // remainder of affine exprs is not affine unless the divisor is a symbol or
+    // constant
+    auto result = *lhs % *rhs;
+    if (!result.isPureAffine())
+      return cacheFailure(v);
+    return result;
+  }
+  // AffineExpr can only be +, -, *, //, %, while max/min is not an AffineExpr.
+  return cacheFailure(v);
+}
+
+affine::AffineValueMap AffineValueMapBuilder::compose() const {
+  SmallVector<Value, 4> operands(dims);
+  llvm::append_range(operands, syms);
+  auto map = AffineMap::get(dims.size(), syms.size(), results, ctx);
+  affine::AffineValueMap vMap(map, operands);
+  vMap.composeSimplifyAndCanonicalize();
+  return vMap;
+}
+
+void AffineValueMapBuilder::reset() {
+  dims.clear();
+  syms.clear();
+  // exprFailureCache.clear();
+  results.clear();
+}
+
+LogicalResult AffineValueMapBuilder::importMapAndOperands(
+    AffineMap map, ValueRange dims, ValueRange syms, bool allowMultiResults) {
+  if (map.getNumResults() > 1 && !allowMultiResults)
+    return failure();
+  SmallVector<AffineExpr, 4> dimExprs;
+  SmallVector<AffineExpr, 4> symExprs;
+
+  for (auto dim : dims) {
+    auto dimExpr = importValueInternal(dim);
+    if (failed(dimExpr))
+      return failure();
+    dimExprs.push_back(*dimExpr);
+  }
+  for (auto sym : syms) {
+    auto symExpr = importValueInternal(sym);
+    if (failed(symExpr))
+      return failure();
+    symExprs.push_back(*symExpr);
+  }
+  for (auto result : map.getResults()) {
+    // affine.min/max may carry multi-result maps; each result is one
+    // candidate bound expression in the final min/max set.
+    results.push_back(result.replaceDimsAndSymbols(dimExprs, symExprs));
+  }
+  return success();
 }
 
 /// Try to interpret select(cmp, a, b) as min/max(a,b).
@@ -41,7 +210,7 @@ Value stripCast(Value value) {
 /// Case 4:
 /// %cmp = cmpi sle/ule/slt/ult %a, %b
 /// $res = select %cmp, %b, %a => max(%a, %b)
-FailureOr<std::tuple<bool, Value, Value>>
+static FailureOr<std::tuple<bool, Value, Value>>
 matchSelectAsMinMax(arith::SelectOp sel) {
   auto cmp = sel.getCondition().getDefiningOp<arith::CmpIOp>();
   if (!cmp)
@@ -88,221 +257,59 @@ matchSelectAsMinMax(arith::SelectOp sel) {
   if (!swapped) {
     if (predIsGE)
       return std::make_tuple(true, lhs, rhs); // max
-    else
-      return std::make_tuple(false, lhs, rhs); // min
-  } else {
-    if (predIsGE)
-      return std::make_tuple(false, lhs, rhs); // min
-    else
-      return std::make_tuple(true, lhs, rhs); // max
+    return std::make_tuple(false, lhs, rhs);  // min
   }
+  if (predIsGE)
+    return std::make_tuple(false, lhs, rhs); // min
+  return std::make_tuple(true, lhs, rhs);    // max
 }
 
-struct AffineBound {
-  AffineMap map;
-  SmallVector<Value, 4> operands;
-};
-
+namespace {
 struct AffineParallelBoundSet {
   SmallVector<AffineMap, 4> maps;
   SmallVector<Value, 8> operands;
+  AffineParallelBoundSet(SmallVectorImpl<AffineMap> &&maps,
+                         SmallVectorImpl<Value> &&operands)
+      : maps(std::move(maps)), operands(std::move(operands)) {}
 };
+} // namespace
 
-struct AffineExprBuilder {
-  MLIRContext *ctx;
-  SmallVector<Value, 4> dims;
-  SmallVector<Value, 4> syms;
-  llvm::SmallDenseMap<Value, unsigned> dimPos;
-  llvm::SmallDenseMap<Value, unsigned> symPos;
-  llvm::SmallDenseMap<Value, AffineExpr> exprCache;
-  llvm::SmallDenseSet<Value, 4> exprFailureCache;
-  SmallVector<AffineExpr, 4> results;
+static LogicalResult collectBoundExprs(AffineValueMapBuilder &builder,
+                                       Value value, bool isLowerBound);
 
-  explicit AffineExprBuilder(MLIRContext *ctx) : ctx(ctx) {}
-
-  AffineExpr addDim(Value v) {
-    auto it = dimPos.find(v);
-    if (it != dimPos.end()) {
-      return getAffineDimExpr(it->second, ctx);
-    }
-    unsigned pos = dims.size();
-    dims.push_back(v);
-    dimPos[v] = pos;
-    return getAffineDimExpr(pos, ctx);
-  }
-
-  AffineExpr addSym(Value v) {
-    auto it = symPos.find(v);
-    if (it != symPos.end()) {
-      return getAffineSymbolExpr(it->second, ctx);
-    }
-    unsigned pos = syms.size();
-    syms.push_back(v);
-    symPos[v] = pos;
-    return getAffineSymbolExpr(pos, ctx);
-  }
-
-  FailureOr<AffineExpr> importValueAsExpr(Value v) {
-    using namespace matchers;
-    v = stripCast(v);
-    if (auto it = exprCache.find(v); it != exprCache.end())
-      return it->second;
-    if (exprFailureCache.contains(v))
-      return failure();
-
-    IntegerAttr::ValueType cst;
-    if (matchPattern(v, m_ConstantInt(&cst))) {
-      auto expr = getAffineConstantExpr(cst.getSExtValue(), ctx);
-      exprCache[v] = expr;
-      return expr;
-    }
-
-    auto cacheFailure = [&]() -> FailureOr<AffineExpr> {
-      exprFailureCache.insert(v);
-      return failure();
-    };
-
-    // Memoize affine expression import so shared index DAGs are expanded once.
-    if (affine::isValidDim(v))
-      return exprCache.try_emplace(v, addDim(v)).first->second;
-    if (affine::isValidSymbol(v))
-      return exprCache.try_emplace(v, addSym(v)).first->second;
-
-    if (auto applyOp = v.getDefiningOp<affine::AffineApplyOp>()) {
-      auto map = applyOp.getAffineMap();
-      // only support single result maps
-      if (map.getNumResults() != 1)
-        return failure();
-      auto operands = applyOp.getOperands();
-      SmallVector<AffineExpr, 4> dimExprs;
-      SmallVector<AffineExpr, 4> symExprs;
-
-      for (unsigned i = 0; i < map.getNumDims(); ++i) {
-        auto dimExpr = importValueAsExpr(operands[i]);
-        if (failed(dimExpr))
-          return cacheFailure();
-        dimExprs.push_back(*dimExpr);
-      }
-      for (unsigned i = 0; i < map.getNumSymbols(); ++i) {
-        auto symExpr = importValueAsExpr(operands[map.getNumDims() + i]);
-        if (failed(symExpr))
-          return cacheFailure();
-        symExprs.push_back(*symExpr);
-      }
-      AffineExpr result =
-          map.getResult(0).replaceDimsAndSymbols(dimExprs, symExprs);
-      exprCache[v] = result;
-      return result;
-    }
-    if (auto addi = v.getDefiningOp<arith::AddIOp>()) {
-      auto lhs = importValueAsExpr(addi.getLhs());
-      auto rhs = importValueAsExpr(addi.getRhs());
-      if (failed(lhs) || failed(rhs))
-        return cacheFailure();
-      auto expr = *lhs + *rhs;
-      exprCache[v] = expr;
-      return expr;
-    }
-    if (auto subi = v.getDefiningOp<arith::SubIOp>()) {
-      auto lhs = importValueAsExpr(subi.getLhs());
-      auto rhs = importValueAsExpr(subi.getRhs());
-      if (failed(lhs) || failed(rhs))
-        return cacheFailure();
-      auto expr = *lhs - *rhs;
-      exprCache[v] = expr;
-      return expr;
-    }
-    if (auto muli = v.getDefiningOp<arith::MulIOp>()) {
-      auto lhs = importValueAsExpr(muli.getLhs());
-      auto rhs = importValueAsExpr(muli.getRhs());
-      if (failed(lhs) || failed(rhs))
-        return cacheFailure();
-      if (!lhs->isSymbolicOrConstant() && !rhs->isSymbolicOrConstant())
-        return cacheFailure();
-      auto expr = *lhs * *rhs;
-      exprCache[v] = expr;
-      return expr;
-    }
-    // TODO: support more arith operations that can be represented in affine
-    // expressions.
-    return cacheFailure();
-  }
-
-  AffineBound composeResults() {
-    SmallVector<Value, 4> operands;
-    operands.append(dims);
-    operands.append(syms);
-
-    auto map = AffineMap::get(dims.size(), syms.size(), results, ctx);
-    affine::fullyComposeAffineMapAndOperands(&map, &operands,
-                                             /*composeAffineMin=*/true);
-    affine::canonicalizeMapAndOperands(&map, &operands);
-    MutableAffineMap mMap(map);
-    mMap.simplify();
-    return {mMap.getAffineMap(), operands};
-  }
-};
-
-LogicalResult importAffineMapResults(AffineExprBuilder &builder, AffineMap map,
-                                     ValueRange operands) {
-  SmallVector<AffineExpr, 4> dimExprs;
-  SmallVector<AffineExpr, 4> symExprs;
-
-  for (unsigned i = 0; i < map.getNumDims(); ++i) {
-    auto dimExpr = builder.importValueAsExpr(operands[i]);
-    if (failed(dimExpr))
-      return failure();
-    dimExprs.push_back(*dimExpr);
-  }
-  for (unsigned i = 0; i < map.getNumSymbols(); ++i) {
-    auto symExpr = builder.importValueAsExpr(operands[map.getNumDims() + i]);
-    if (failed(symExpr))
-      return failure();
-    symExprs.push_back(*symExpr);
-  }
-  for (AffineExpr result : map.getResults()) {
-    // affine.min/max may carry multi-result maps; each result is one candidate
-    // bound expression in the final min/max set.
-    builder.results.push_back(result.replaceDimsAndSymbols(dimExprs, symExprs));
-  }
-  return success();
-}
-
-LogicalResult collectBoundExprs(Value value, bool isLowerBound,
-                                AffineExprBuilder &builder);
-
-LogicalResult collectBinaryBoundExprs(Value lhs, Value rhs, bool isLowerBound,
-                                      AffineExprBuilder &builder) {
-  if (failed(collectBoundExprs(lhs, isLowerBound, builder)))
+static LogicalResult collectBinaryBoundExprs(AffineValueMapBuilder &builder,
+                                             Value lhs, Value rhs,
+                                             bool isLowerBound) {
+  if (failed(collectBoundExprs(builder, lhs, isLowerBound)))
     return failure();
-  if (failed(collectBoundExprs(rhs, isLowerBound, builder)))
+  if (failed(collectBoundExprs(builder, rhs, isLowerBound)))
     return failure();
   return success();
 }
 
-LogicalResult collectBoundExprs(Value value, bool isLowerBound,
-                                AffineExprBuilder &builder) {
+static LogicalResult collectBoundExprs(AffineValueMapBuilder &builder,
+                                       Value value, bool isLowerBound) {
   Value v = stripCast(value);
   Operation *defOp = v.getDefiningOp();
 
   // Expand arithmetic max for lower bounds and min for upper bounds.
   if (isLowerBound) {
     if (auto maxOp = dyn_cast_or_null<arith::MaxSIOp>(defOp)) {
-      return collectBinaryBoundExprs(maxOp.getLhs(), maxOp.getRhs(),
-                                     isLowerBound, builder);
+      return collectBinaryBoundExprs(builder, maxOp.getLhs(), maxOp.getRhs(),
+                                     isLowerBound);
     }
     if (auto maxOp = dyn_cast_or_null<arith::MaxUIOp>(defOp)) {
-      return collectBinaryBoundExprs(maxOp.getLhs(), maxOp.getRhs(),
-                                     isLowerBound, builder);
+      return collectBinaryBoundExprs(builder, maxOp.getLhs(), maxOp.getRhs(),
+                                     isLowerBound);
     }
   } else {
     if (auto minOp = dyn_cast_or_null<arith::MinSIOp>(defOp)) {
-      return collectBinaryBoundExprs(minOp.getLhs(), minOp.getRhs(),
-                                     isLowerBound, builder);
+      return collectBinaryBoundExprs(builder, minOp.getLhs(), minOp.getRhs(),
+                                     isLowerBound);
     }
     if (auto minOp = dyn_cast_or_null<arith::MinUIOp>(defOp)) {
-      return collectBinaryBoundExprs(minOp.getLhs(), minOp.getRhs(),
-                                     isLowerBound, builder);
+      return collectBinaryBoundExprs(builder, minOp.getLhs(), minOp.getRhs(),
+                                     isLowerBound);
     }
   }
 
@@ -312,7 +319,7 @@ LogicalResult collectBoundExprs(Value value, bool isLowerBound,
     if (succeeded(match)) {
       auto [isMax, x, y] = *match;
       if ((isLowerBound && isMax) || (!isLowerBound && !isMax)) {
-        return collectBinaryBoundExprs(x, y, isLowerBound, builder);
+        return collectBinaryBoundExprs(builder, x, y, isLowerBound);
       }
     }
   }
@@ -321,115 +328,53 @@ LogicalResult collectBoundExprs(Value value, bool isLowerBound,
   if (auto maxOp = dyn_cast_or_null<affine::AffineMaxOp>(defOp)) {
     if (!isLowerBound)
       return failure();
-    return importAffineMapResults(builder, maxOp.getAffineMap(),
-                                  maxOp.getOperands());
+    return builder.importMapAndOperands(
+        maxOp.getAffineMap(), maxOp.getDimOperands(), maxOp.getSymbolOperands(),
+        /*allowMultiResults=*/true);
   }
   if (auto minOp = dyn_cast_or_null<affine::AffineMinOp>(defOp)) {
     if (isLowerBound)
       return failure();
-    return importAffineMapResults(builder, minOp.getAffineMap(),
-                                  minOp.getOperands());
+    return builder.importMapAndOperands(
+        minOp.getAffineMap(), minOp.getDimOperands(), minOp.getSymbolOperands(),
+        /*allowMultiResults=*/true);
   }
 
   // Leaf case: import as a single affine expression.
   // This covers plain dim/symbol/constant expressions and affine.apply chains.
-  auto expr = builder.importValueAsExpr(v);
-  if (failed(expr))
+  if (failed(builder.importValue(value)))
     return failure();
-  builder.results.push_back(*expr);
   return success();
 }
 
-FailureOr<AffineBound> matchAffineBound(Value root, bool isLowerBound) {
-  AffineExprBuilder builder(root.getContext());
-  if (failed(collectBoundExprs(root, isLowerBound, builder)))
+static FailureOr<affine::AffineValueMap>
+matchAffineBound(AffineValueMapBuilder &builder, Value root,
+                 bool isLowerBound) {
+  if (failed(collectBoundExprs(builder, root, isLowerBound)))
     return failure();
-  if (builder.results.empty())
-    return failure();
-  return builder.composeResults();
+  return builder.compose();
 }
 
-FailureOr<AffineBound> computeAffineMapAndArgs(MLIRContext *ctx,
-                                               ValueRange indices) {
-  if (indices.empty())
-    return AffineBound{AffineMap::get(0, 0, {}, ctx), {}};
-
-  AffineExprBuilder builder(ctx);
-  for (Value idx : indices) {
-    // Build one affine map result per memref index expression.
-    auto expr = builder.importValueAsExpr(idx);
-    if (failed(expr))
-      return failure();
-    builder.results.push_back(*expr);
-  }
-  return builder.composeResults();
-}
-
-template <typename OpTy>
-void updateIndicesToAffineApply(RewriterBase &b, OpTy op) {
-  OpBuilder::InsertionGuard g(b);
-  MLIRContext *ctx = b.getContext();
-  auto indices = op.getIndices();
-  auto mapOr = computeAffineMapAndArgs(ctx, indices);
-  if (failed(mapOr)) {
-    return;
-  }
-  b.setInsertionPoint(op);
-  if constexpr (std::is_same_v<OpTy, memref::LoadOp>) {
-    b.replaceOpWithNewOp<affine::AffineLoadOp>(op, op.getMemRef(), mapOr->map,
-                                               mapOr->operands);
-  } else if constexpr (std::is_same_v<OpTy, memref::StoreOp>) {
-    b.replaceOpWithNewOp<affine::AffineStoreOp>(
-        op, op.getValueToStore(), op.getMemRef(), mapOr->map, mapOr->operands);
-  } else {
-    // replace indices with the result of affine.apply
-    SmallVector<Value, 4> newIndices;
-    for (unsigned i = 0; i < indices.size(); ++i) {
-      auto subMap = mapOr->map.getSubMap(i);
-      auto apply = affine::AffineApplyOp::create(
-          b, op.getLoc(), indices[i].getType(), subMap, mapOr->operands);
-      newIndices.push_back(apply);
-    }
-    b.modifyOpInPlace(op, [&]() { op.getIndicesMutable().assign(newIndices); });
-  }
-}
-
-void raiseAccesses(transform::TransformRewriter &rewriter, Operation *root) {
-  root->walk([&](Operation *op) {
-    if (auto load = dyn_cast<memref::LoadOp>(op)) {
-      updateIndicesToAffineApply(rewriter, load);
-    } else if (auto store = dyn_cast<memref::StoreOp>(op)) {
-      updateIndicesToAffineApply(rewriter, store);
-    } else if (auto chanOp = dyn_cast<ChannelAccessOpInterface>(op)) {
-      updateIndicesToAffineApply(rewriter, chanOp);
-    }
-  });
-}
-
-FailureOr<AffineParallelBoundSet>
-normalizeParallelBounds(ArrayRef<AffineBound> bounds) {
+static FailureOr<AffineParallelBoundSet>
+normalizeParallelBounds(ArrayRef<affine::AffineValueMap> bounds) {
   if (bounds.empty())
     return failure();
 
-  MLIRContext *ctx = bounds.front().map.getContext();
-  SmallVector<Value, 8> dims;
-  SmallVector<Value, 8> syms;
-  llvm::SmallDenseMap<Value, unsigned> dimPos;
-  llvm::SmallDenseMap<Value, unsigned> symPos;
+  MLIRContext *ctx = bounds.front().getAffineMap().getContext();
+  llvm::SmallMapVector<Value, unsigned, 8> globalDims;
+  llvm::SmallMapVector<Value, unsigned, 8> globalSyms;
 
   auto registerOperand = [&](Value v) -> LogicalResult {
     v = stripCast(v);
     auto addDim = [&]() {
-      if (!dimPos.count(v)) {
-        dimPos[v] = dims.size();
-        dims.push_back(v);
+      if (!globalDims.contains(v)) {
+        globalDims[v] = globalDims.size();
       }
       return success();
     };
     auto addSym = [&]() {
-      if (!symPos.count(v)) {
-        symPos[v] = syms.size();
-        syms.push_back(v);
+      if (!globalSyms.count(v)) {
+        globalSyms[v] = globalSyms.size();
       }
       return success();
     };
@@ -441,8 +386,8 @@ normalizeParallelBounds(ArrayRef<AffineBound> bounds) {
     return failure();
   };
 
-  for (const AffineBound &bound : bounds) {
-    for (Value operand : bound.operands) {
+  for (const auto &bound : bounds) {
+    for (Value operand : bound.getOperands()) {
       if (failed(registerOperand(operand)))
         return failure();
     }
@@ -451,79 +396,132 @@ normalizeParallelBounds(ArrayRef<AffineBound> bounds) {
   SmallVector<AffineMap, 4> normalizedMaps;
   normalizedMaps.reserve(bounds.size());
 
-  auto getGlobalExpr = [&](Value v) -> FailureOr<AffineExpr> {
+  auto getGlobalExpr = [&](Value v) {
     v = stripCast(v);
-    if (auto it = dimPos.find(v); it != dimPos.end())
-      return getAffineDimExpr(it->second, ctx);
-    if (auto it = symPos.find(v); it != symPos.end())
-      return getAffineSymbolExpr(it->second, ctx);
-    return failure();
+    if (globalDims.contains(v)) {
+      return getAffineDimExpr(globalDims[v], ctx);
+    }
+    if (globalSyms.contains(v)) {
+      return getAffineSymbolExpr(globalSyms[v], ctx);
+    }
+    llvm_unreachable("operand was not registered as either dim or symbol");
   };
 
-  for (const AffineBound &bound : bounds) {
+  for (const auto &bound : bounds) {
     SmallVector<AffineExpr, 4> dimExprs;
     SmallVector<AffineExpr, 4> symExprs;
-    dimExprs.reserve(bound.map.getNumDims());
-    symExprs.reserve(bound.map.getNumSymbols());
 
-    unsigned numDims = bound.map.getNumDims();
-    unsigned numSyms = bound.map.getNumSymbols();
-    if (bound.operands.size() != numDims + numSyms)
-      return failure();
+    unsigned nDims = bound.getNumDims();
+    unsigned nSyms = bound.getNumSymbols();
+    auto operands = bound.getOperands();
+    assert(nDims + nSyms == operands.size());
 
-    for (unsigned i = 0; i < numDims; ++i) {
-      auto expr = getGlobalExpr(bound.operands[i]);
-      if (failed(expr))
-        return failure();
-      dimExprs.push_back(*expr);
+    for (unsigned i = 0; i < nDims; ++i) {
+      dimExprs.push_back(getGlobalExpr(operands[i]));
     }
-    for (unsigned i = 0; i < numSyms; ++i) {
-      auto expr = getGlobalExpr(bound.operands[numDims + i]);
-      if (failed(expr))
-        return failure();
-      symExprs.push_back(*expr);
+    for (unsigned i = 0; i < nSyms; ++i) {
+      symExprs.push_back(getGlobalExpr(operands[nDims + i]));
     }
 
     SmallVector<AffineExpr, 4> results;
-    results.reserve(bound.map.getNumResults());
-    for (AffineExpr expr : bound.map.getResults())
+    for (AffineExpr expr : bound.getAffineMap().getResults())
       results.push_back(expr.replaceDimsAndSymbols(dimExprs, symExprs));
 
     // Rebuild each bound map in a shared input space required by
     // affine.parallel.
     normalizedMaps.push_back(
-        AffineMap::get(dims.size(), syms.size(), results, ctx));
+        AffineMap::get(globalDims.size(), globalSyms.size(), results, ctx));
   }
-
-  SmallVector<Value, 8> operands;
-  operands.append(dims);
-  operands.append(syms);
-  return AffineParallelBoundSet{normalizedMaps, operands};
+  auto operands = llvm::to_vector<8>(globalDims.keys());
+  llvm::append_range(operands, globalSyms.keys());
+  return AffineParallelBoundSet(std::move(normalizedMaps), std::move(operands));
 }
 
-std::optional<int64_t> getConstPositiveStep(Value step) {
-  auto cstOp = step.getDefiningOp<arith::ConstantIndexOp>();
-  if (!cstOp)
+static FailureOr<affine::AffineValueMap>
+computeAffineMapAndArgs(AffineValueMapBuilder &builder, ValueRange indices) {
+  for (Value idx : indices) {
+    // Build one affine map result per index expression.
+    auto expr = builder.importValue(idx);
+    if (failed(expr))
+      return failure();
+  }
+  return builder.compose();
+}
+
+template <typename OpTy>
+static void updateIndicesToAffineApply(RewriterBase &b,
+                                       AffineValueMapBuilder &builder,
+                                       OpTy op) {
+  OpBuilder::InsertionGuard g(b);
+  builder.reset();
+  auto indices = op.getIndices();
+  auto mapOr = computeAffineMapAndArgs(builder, indices);
+  if (failed(mapOr)) {
+    return;
+  }
+  auto map = mapOr->getAffineMap();
+  auto operands = mapOr->getOperands();
+  b.setInsertionPoint(op);
+  if constexpr (std::is_same_v<OpTy, memref::LoadOp>) {
+    b.replaceOpWithNewOp<affine::AffineLoadOp>(op, op.getMemRef(), map,
+                                               operands);
+  } else if constexpr (std::is_same_v<OpTy, memref::StoreOp>) {
+    b.replaceOpWithNewOp<affine::AffineStoreOp>(op, op.getValueToStore(),
+                                                op.getMemRef(), map, operands);
+  } else if constexpr (std::is_base_of_v<ChannelAccessOpInterface, OpTy>) {
+    // replace indices with the result of affine.apply
+    SmallVector<Value, 4> newIndices;
+    for (unsigned i = 0; i < indices.size(); ++i) {
+      auto subMap = map.getSubMap(i);
+      auto apply = affine::AffineApplyOp::create(
+          b, op.getLoc(), indices[i].getType(), subMap, operands);
+      newIndices.push_back(apply);
+    }
+    b.modifyOpInPlace(op, [&]() { op.getIndicesMutable().assign(newIndices); });
+  } else {
+    static_assert(0, "unsupported op type for updateIndicesToAffineApply");
+  }
+}
+
+static void raiseAccesses(AffineValueMapBuilder &builder,
+                          transform::TransformRewriter &rewriter,
+                          Operation *root) {
+  root->walk([&](Operation *op) {
+    if (auto load = dyn_cast<memref::LoadOp>(op)) {
+      updateIndicesToAffineApply(rewriter, builder, load);
+    } else if (auto store = dyn_cast<memref::StoreOp>(op)) {
+      updateIndicesToAffineApply(rewriter, builder, store);
+    } else if (auto chanOp = dyn_cast<ChannelAccessOpInterface>(op)) {
+      updateIndicesToAffineApply(rewriter, builder, chanOp);
+    }
+  });
+}
+
+static std::optional<int64_t> getConstPositiveStep(Value step) {
+  IntegerAttr::ValueType cst;
+  if (!matchPattern(step, m_ConstantInt(&cst)))
     return std::nullopt;
-  int64_t stepVal = cstOp.value();
+  int64_t stepVal = cst.getSExtValue();
   if (stepVal <= 0)
     return std::nullopt;
   return stepVal;
 }
 
 /// raise `scf.for` to `affine.for` if the bounds and step are affine.
-DiagnosedSilenceableFailure
+static DiagnosedSilenceableFailure
 raiseForOp(transform::TransformRewriter &rewriter, scf::ForOp forOp,
            transform::ApplyToEachResultList &results,
            transform::TransformState &state) {
-
+  AffineValueMapBuilder builder(forOp.getContext());
   rewriter.setInsertionPoint(forOp);
-  auto lbOr = matchAffineBound(forOp.getLowerBound(), /*isLowerBound=*/true);
+  auto lbOr =
+      matchAffineBound(builder, forOp.getLowerBound(), /*isLowerBound=*/true);
   if (failed(lbOr)) {
     return emitSilenceableFailure(forOp)
            << "lower bound does not match affine bound pattern";
   }
-  auto ubOr = matchAffineBound(forOp.getUpperBound(), /*isLowerBound=*/false);
+  auto ubOr =
+      matchAffineBound(builder, forOp.getUpperBound(), /*isLowerBound=*/false);
   if (failed(ubOr)) {
     return emitSilenceableFailure(forOp)
            << "upper bound does not match affine bound pattern";
@@ -536,10 +534,10 @@ raiseForOp(transform::TransformRewriter &rewriter, scf::ForOp forOp,
   // Fast path: constant positive step
   if (auto stepInt = getConstPositiveStep(step)) {
     auto affineLoop = affine::AffineForOp::create(
-        rewriter, forOp->getLoc(), lb.operands, lb.map, ub.operands, ub.map,
-        *stepInt, forOp.getInitArgs());
+        rewriter, forOp->getLoc(), lb.getOperands(), lb.getAffineMap(),
+        ub.getOperands(), ub.getAffineMap(), *stepInt, forOp.getInitArgs());
     // merge loop body into the new loop and update induction variable uses.
-    auto affineBody = affineLoop.getBody();
+    Block *affineBody = affineLoop.getBody();
     // delete the implicit yield
     if (affineLoop->getNumResults() == 0) {
       affineBody->getTerminator()->erase();
@@ -559,7 +557,7 @@ raiseForOp(transform::TransformRewriter &rewriter, scf::ForOp forOp,
       argRepls.push_back(iterArg);
     rewriter.mergeBlocks(forOp.getBody(), affineLoop.getBody(), argRepls);
     // After raising loops, try to raise in-body memref accesses to affine ops.
-    raiseAccesses(rewriter, affineLoop);
+    raiseAccesses(builder, rewriter, affineLoop);
     if (forOp->hasAttr(OpIdentifier))
       affineLoop->setAttr(OpIdentifier, forOp->getAttr(OpIdentifier));
     rewriter.replaceOp(forOp, affineLoop);
@@ -570,42 +568,43 @@ raiseForOp(transform::TransformRewriter &rewriter, scf::ForOp forOp,
          << "step is not a constant positive integer";
 }
 
-DiagnosedSilenceableFailure
-raiseParallelOp(transform::TransformRewriter &rewriter,
-                scf::ParallelOp parallelOp,
+static DiagnosedSilenceableFailure
+raiseParallelOp(transform::TransformRewriter &rewriter, scf::ParallelOp parOp,
                 transform::ApplyToEachResultList &results,
                 transform::TransformState &state) {
-  if (parallelOp.getNumReductions() != 0) {
+  AffineValueMapBuilder builder(parOp.getContext());
+  if (parOp.getNumReductions() != 0) {
     // Keep this path conservative for now; only non-reduction parallel loops
     // are raised in this transform.
-    return emitSilenceableFailure(parallelOp)
+    return emitSilenceableFailure(parOp)
            << "parallel reduction is not supported yet";
   }
 
-  unsigned numLoops = parallelOp.getNumLoops();
-  auto lowerBounds = parallelOp.getLowerBound();
-  auto upperBounds = parallelOp.getUpperBound();
-  auto stepValues = parallelOp.getStep();
-  SmallVector<AffineBound, 4> lbs;
-  SmallVector<AffineBound, 4> ubs;
+  unsigned numLoops = parOp.getNumLoops();
+  auto lowerBounds = parOp.getLowerBound();
+  auto upperBounds = parOp.getUpperBound();
+  auto stepValues = parOp.getStep();
+  SmallVector<affine::AffineValueMap, 4> lbs;
+  SmallVector<affine::AffineValueMap, 4> ubs;
   SmallVector<int64_t, 4> steps;
   lbs.reserve(numLoops);
   ubs.reserve(numLoops);
   steps.reserve(numLoops);
 
   for (unsigned i = 0; i < numLoops; ++i) {
-    // Cache ranges above: getLower/Upper/Step can materialize temporary ranges.
-    auto lbOr = matchAffineBound(lowerBounds[i], /*isLowerBound=*/true);
+    auto lbOr =
+        matchAffineBound(builder, lowerBounds[i], /*isLowerBound=*/true);
     if (failed(lbOr)) {
-      return emitSilenceableFailure(parallelOp)
+      return emitSilenceableFailure(parOp)
              << "lower bound of loop dim " << i
              << " does not match affine bound pattern";
     }
     lbs.push_back(*lbOr);
 
-    auto ubOr = matchAffineBound(upperBounds[i], /*isLowerBound=*/false);
+    auto ubOr =
+        matchAffineBound(builder, upperBounds[i], /*isLowerBound=*/false);
     if (failed(ubOr)) {
-      return emitSilenceableFailure(parallelOp)
+      return emitSilenceableFailure(parOp)
              << "upper bound of loop dim " << i
              << " does not match affine bound pattern";
     }
@@ -614,7 +613,7 @@ raiseParallelOp(transform::TransformRewriter &rewriter,
     Value step = stripCast(stepValues[i]);
     auto stepInt = getConstPositiveStep(step);
     if (!stepInt) {
-      return emitSilenceableFailure(parallelOp)
+      return emitSilenceableFailure(parOp)
              << "step of loop dim " << i
              << " is not a constant positive integer";
     }
@@ -623,43 +622,41 @@ raiseParallelOp(transform::TransformRewriter &rewriter,
 
   auto normLBs = normalizeParallelBounds(lbs);
   if (failed(normLBs)) {
-    return emitSilenceableFailure(parallelOp)
+    return emitSilenceableFailure(parOp)
            << "failed to normalize lower bounds to affine.parallel input space";
   }
   auto normUBs = normalizeParallelBounds(ubs);
   if (failed(normUBs)) {
-    return emitSilenceableFailure(parallelOp)
+    return emitSilenceableFailure(parOp)
            << "failed to normalize upper bounds to affine.parallel input space";
   }
 
-  rewriter.setInsertionPoint(parallelOp);
+  rewriter.setInsertionPoint(parOp);
   SmallVector<arith::AtomicRMWKind> reductions;
   // Construct affine.parallel with normalized per-dimension min/max bounds.
   auto affineParallel = affine::AffineParallelOp::create(
-      rewriter, parallelOp.getLoc(), TypeRange{}, reductions, normLBs->maps,
+      rewriter, parOp.getLoc(), TypeRange{}, reductions, normLBs->maps,
       normLBs->operands, normUBs->maps, normUBs->operands, steps);
 
-  auto affineBody = affineParallel.getBody();
+  Block *affineBody = affineParallel.getBody();
   if (affineParallel->getNumResults() == 0)
     affineBody->getTerminator()->erase();
 
-  auto reduce = cast<scf::ReduceOp>(parallelOp.getBody()->getTerminator());
+  auto reduce = cast<scf::ReduceOp>(parOp.getBody()->getTerminator());
   rewriter.setInsertionPoint(reduce);
   affine::AffineYieldOp::create(rewriter, reduce.getLoc(),
                                 reduce.getOperands());
   reduce->erase();
 
   ValueRange affineIvs(affineParallel.getIVs());
-  rewriter.mergeBlocks(parallelOp.getBody(), affineParallel.getBody(),
-                       affineIvs);
-  raiseAccesses(rewriter, affineParallel);
-  if (parallelOp->hasAttr(OpIdentifier))
-    affineParallel->setAttr(OpIdentifier, parallelOp->getAttr(OpIdentifier));
-  rewriter.replaceOp(parallelOp, affineParallel->getResults());
+  rewriter.mergeBlocks(parOp.getBody(), affineParallel.getBody(), affineIvs);
+  raiseAccesses(builder, rewriter, affineParallel);
+  if (parOp->hasAttr(OpIdentifier))
+    affineParallel->setAttr(OpIdentifier, parOp->getAttr(OpIdentifier));
+  rewriter.replaceOp(parOp, affineParallel->getResults());
   results.push_back(affineParallel);
   return DiagnosedSilenceableFailure::success();
 }
-} // namespace
 
 DiagnosedSilenceableFailure transform::RaiseToAffineOp::applyToOne(
     TransformRewriter &rewriter, Operation *target,
@@ -668,13 +665,14 @@ DiagnosedSilenceableFailure transform::RaiseToAffineOp::applyToOne(
   if (auto forOp = dyn_cast<scf::ForOp>(target)) {
     return raiseForOp(rewriter, forOp, results, state);
   }
-  if (auto parallelOp = dyn_cast<scf::ParallelOp>(target)) {
-    return raiseParallelOp(rewriter, parallelOp, results, state);
+  if (auto parOp = dyn_cast<scf::ParallelOp>(target)) {
+    return raiseParallelOp(rewriter, parOp, results, state);
   }
   if (isa<affine::AffineForOp, affine::AffineParallelOp>(target)) {
     // Already affine loops; just try to raise in-body memref accesses to affine
     // ops.
-    raiseAccesses(rewriter, target);
+    AffineValueMapBuilder builder(target->getContext());
+    raiseAccesses(builder, rewriter, target);
     results.push_back(target);
     return DiagnosedSilenceableFailure::success();
   }

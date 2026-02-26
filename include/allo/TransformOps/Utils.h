@@ -3,11 +3,11 @@
 
 #include "allo/IR/AlloOps.h"
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
+#include "mlir/Dialect/Affine/IR/AffineValueMap.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/PatternMatch.h"
 
 namespace mlir::allo {
-
 allo::CallOp convertCallToAlloCall(RewriterBase &b, func::CallOp call);
 allo::KernelOp convertFuncToKernel(RewriterBase &b, func::FuncOp func);
 bool affineExprUsesValue(AffineExpr expr, ValueRange mapOperands,
@@ -16,6 +16,10 @@ int findMemRefAxisFromIV(affine::AffineStoreOp storeOp, Value iv);
 Value resolveMemRefValueRoot(Value value);
 bool isTrivialMapping(ArrayRef<int64_t> mapping);
 SmallVector<int64_t> convertMappingAttrToVec(ArrayAttr mappingAttr);
+// strip away index casts, extension/truncation ops,
+// which do not affect the value as an affine expression
+Value stripCast(Value value);
+
 } // namespace mlir::allo
 
 #endif // ALLO_TRANSFORM_OPS_UTILS_H
