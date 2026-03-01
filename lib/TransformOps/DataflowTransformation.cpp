@@ -10,7 +10,10 @@
 #include "mlir/IR/SymbolTable.h"
 #include "mlir/Pass/PassManager.h"
 #include "mlir/Transforms/Passes.h"
+#include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/SetVector.h"
+#include "llvm/ADT/SmallSet.h"
 #include <optional>
 
 using namespace mlir;
@@ -20,11 +23,12 @@ using namespace mlir::allo;
 /// ApplyVirtualMapOp
 ///===----------------------------------------------------------------------===//
 namespace {
-using Pid = SmallVector<int64_t, 4>;
+using Pid = SmallVector<int32_t, 4>;
 using PidList = SmallVector<Pid, 8>;
+} // namespace
 
-void enumeratePids(ArrayRef<int64_t> mapping, unsigned dim, Pid &current,
-                   PidList &out) {
+static void enumeratePids(ArrayRef<int32_t> mapping, unsigned dim, Pid &current,
+                          PidList &out) {
   if (dim == mapping.size()) {
     out.push_back(current);
     return;
@@ -36,33 +40,28 @@ void enumeratePids(ArrayRef<int64_t> mapping, unsigned dim, Pid &current,
   }
 }
 
-std::string buildInstanceName(StringRef base, ArrayRef<int64_t> pid) {
+static std::string buildInstanceName(StringRef base, ArrayRef<int32_t> pid) {
   std::string name = base.str() + "__vm";
-  for (int64_t v : pid)
+  for (int32_t v : pid)
     name += "_" + std::to_string(v);
   return name;
 }
-} // namespace
 
-DiagnosedSilenceableFailure transform::ApplyVirtualMapOp::applyToOne(
-    transform::TransformRewriter &rewriter, Operation *target,
-    transform::ApplyToEachResultList &results,
-    transform::TransformState &state) {
+DiagnosedSilenceableFailure
+transform::MapGridOp::applyToOne(transform::TransformRewriter &rewriter,
+                                 Operation *target,
+                                 transform::ApplyToEachResultList &results,
+                                 transform::TransformState &state) {
   auto k = dyn_cast<allo::KernelOp>(target);
   if (!k) {
     return emitSilenceableFailure(target)
            << "expected allo.kernel op, got " << target->getName();
   }
-  auto givenMapping = getMapping();
-  ArrayRef<int64_t> mapping;
+  auto givenGrid = getGrid();
   // if given, use the mapping from the op attribute
-  if (givenMapping.has_value()) {
-    mapping = getMapping()->getRanges();
-  } else {
-    mapping = k.getVirtualMappingVec();
-  }
+  auto grid = givenGrid.has_value() ? *givenGrid : k.getGrid();
   // if no mapping is needed, skip the transformation
-  if (isTrivialMapping(mapping))
+  if (isTrivialMapping(grid))
     return DiagnosedSilenceableFailure::success();
 
   // TODO: support non-void kernels
@@ -76,7 +75,7 @@ DiagnosedSilenceableFailure transform::ApplyVirtualMapOp::applyToOne(
   PidList pids;
   {
     Pid current;
-    enumeratePids(mapping, /*dim=*/0, current, pids);
+    enumeratePids(grid, /*dim=*/0, current, pids);
   }
 
   // prepare for constant propagation after cloning the kernel
@@ -106,8 +105,7 @@ DiagnosedSilenceableFailure transform::ApplyVirtualMapOp::applyToOne(
     auto clone = cast<allo::KernelOp>(rewriter.clone(*k));
     clone->setAttr(SymbolTable::getSymbolAttrName(),
                    rewriter.getStringAttr(kName));
-    clone->setAttr(clone.getVirtualMappingAttrName(),
-                   VirtMapAttr::get(rewriter.getContext(), 1));
+    clone->setAttr(clone.getGridAttrName(), rewriter.getDenseI32ArrayAttr(1));
 
     // replace get_pid and get_n_progs to constants
     SmallVector<Operation *, 8> opToErase;
@@ -123,12 +121,12 @@ DiagnosedSilenceableFailure transform::ApplyVirtualMapOp::applyToOne(
         int64_t dim = nProgsOp.getAxi();
         rewriter.setInsertionPoint(nProgsOp);
         auto cst = arith::ConstantIndexOp::create(rewriter, nProgsOp.getLoc(),
-                                                  mapping[dim]);
+                                                  grid[dim]);
         rewriter.replaceAllOpUsesWith(nProgsOp, cst);
         opToErase.push_back(nProgsOp);
       }
     });
-    for (auto op : opToErase)
+    for (auto *op : opToErase)
       rewriter.eraseOp(op);
 
     // constant propagation
@@ -145,12 +143,12 @@ DiagnosedSilenceableFailure transform::ApplyVirtualMapOp::applyToOne(
     return DiagnosedSilenceableFailure::success();
   }
   for (auto use : *mayCalls) {
-    auto call = dyn_cast<allo::CallOp>(use.getUser());
+    auto call = dyn_cast<CallOpInterface>(use.getUser());
     assert(call && "expected call op");
     rewriter.setInsertionPoint(call);
     for (const auto &inst : instNames) {
-      allo::CallOp::create(rewriter, call.getLoc(), inst, call.getResultTypes(),
-                           call.getOperands());
+      allo::CallOp::create(rewriter, call.getLoc(), inst,
+                           call->getResultTypes(), call.getArgOperands());
     }
     rewriter.eraseOp(call);
   }
@@ -159,33 +157,36 @@ DiagnosedSilenceableFailure transform::ApplyVirtualMapOp::applyToOne(
   return DiagnosedSilenceableFailure::success();
 }
 
+LogicalResult transform::MapGridOp::verify() {
+  auto grid = getGrid();
+  if (grid.has_value()) {
+    if (llvm::any_of(*grid, [](int32_t v) { return v <= 0; })) {
+      return emitOpError() << "invalid grid mapping: " << *grid;
+    }
+  }
+  return success();
+}
+
 ///===----------------------------------------------------------------------===//
 /// ChainOp
 ///===----------------------------------------------------------------------===//
-namespace {
-std::string makeMergedKernelName(StringRef first, StringRef second) {
+static std::string makeMergedKernelName(StringRef first, StringRef second) {
   return first.str() + "-" + second.str();
 }
 
-allo::KernelOp createMergedEmptyKernel(RewriterBase &b, KernelOp first,
-                                       KernelOp second, IRMapping &mapper) {
-  OpBuilder::InsertionGuard g(b);
-  // merge arguments
-  auto argTypes = llvm::to_vector(first.getArgumentTypes());
-  llvm::append_range(argTypes, second.getArgumentTypes());
-  auto resTypes = second.getResultTypes();
-  auto funcTy = FunctionType::get(b.getContext(), argTypes, resTypes);
-  b.setInsertionPoint(first);
-  auto funcName = makeMergedKernelName(first.getSymName(), second.getSymName());
-  // merge attributes
-  NamedAttrList attrList(first->getDiscardableAttrDictionary());
+static void mergeKernelAttrs(KernelOp first, KernelOp second,
+                             NamedAttrList &kernelAttr,
+                             SmallVectorImpl<DictionaryAttr> &argAttrs) {
+  // merge kernel attributes
+  for (auto attr : first->getDiscardableAttrDictionary()) {
+    kernelAttr.set(attr.getName(), attr.getValue());
+  }
   for (auto attr : second->getDiscardableAttrDictionary()) {
-    if (attrList.getNamed(attr.getName())) {
-      return nullptr; // conflict, cannot merge
-    }
+    assert(!kernelAttr.getNamed(attr.getName()).has_value() &&
+           "conflicting kernel attributes when merging kernels");
+    kernelAttr.set(attr.getName(), attr.getValue());
   }
   // merge arg attributes
-  SmallVector<DictionaryAttr, 8> argAttrs;
   if (auto firstArgAttrs = first.getArgAttrsAttr()) {
     llvm::append_range(argAttrs, firstArgAttrs.getAsRange<DictionaryAttr>());
   } else {
@@ -198,11 +199,30 @@ allo::KernelOp createMergedEmptyKernel(RewriterBase &b, KernelOp first,
     argAttrs.append(second.getNumArguments(),
                     DictionaryAttr::get(second.getContext()));
   }
+}
+
+static allo::KernelOp createMergedKernel(RewriterBase &b, KernelOp first,
+                                         KernelOp second, IRMapping &mapper) {
+  OpBuilder::InsertionGuard g(b);
+  // merge arguments
+  auto argTys = llvm::to_vector(first.getArgumentTypes());
+  llvm::append_range(argTys, second.getArgumentTypes());
+  if (!first.getResultTypes().empty() || !second.getResultTypes().empty()) {
+    // TODO: support non-void kernels
+    return nullptr;
+  }
+  auto funcTy = FunctionType::get(b.getContext(), argTys, {});
+  b.setInsertionPoint(first);
+  auto funcName = makeMergedKernelName(first.getSymName(), second.getSymName());
+  // merge attributes
+  NamedAttrList attrList(first->getDiscardableAttrDictionary());
+  SmallVector<DictionaryAttr, 8> argAttrs;
+  mergeKernelAttrs(first, second, attrList, argAttrs);
+  // create merged kernel
   auto merged = allo::KernelOp::create(b, first.getLoc(), funcName, funcTy,
                                        attrList, argAttrs, 1);
   Block *body = merged.addEntryBlock();
   b.setInsertionPointToEnd(body);
-  allo::ReturnOp::create(b, first.getLoc(), {});
   // map from old args to new args
   unsigned nFirstArgs = first.getNumArguments();
   unsigned nSecondArgs = second.getNumArguments();
@@ -212,9 +232,131 @@ allo::KernelOp createMergedEmptyKernel(RewriterBase &b, KernelOp first,
   for (unsigned i = 0; i < nSecondArgs; ++i) {
     mapper.map(second.getArgument(i), merged.getArgument(nFirstArgs + i));
   }
+  // clone body
+  if (first.getBlocks().size() != 1 || second.getBlocks().size() != 1) {
+    // TODO: support unstructured control flow in kernels
+    return nullptr;
+  }
+  Block &firstBody = first.getBody().front();
+  for (auto &op : firstBody.getOperations()) {
+    if (isa<allo::ReturnOp>(op))
+      continue;
+    b.clone(op, mapper);
+  }
+  Block &secondBody = second.getBody().front();
+  for (auto &op : secondBody.getOperations()) {
+    if (isa<allo::ReturnOp>(op))
+      continue;
+    b.clone(op, mapper);
+  }
+  allo::ReturnOp::create(b, first.getLoc(), ValueRange{});
   return merged;
 }
-} // namespace
+
+static DenseMap<Block *, SmallVector<CallOpInterface, 4>>
+groupAndSortCallsByBlock(ArrayRef<CallOpInterface> ops) {
+  DenseMap<Block *, SmallVector<CallOpInterface, 4>> blockToCalls;
+  for (auto op : ops) {
+    blockToCalls[op->getBlock()].push_back(op);
+  }
+  for (auto &[_, calls] : blockToCalls) {
+    llvm::sort(calls, [](CallOpInterface a, CallOpInterface b) {
+      return a->isBeforeInBlock(b);
+    });
+  }
+  return blockToCalls;
+}
+
+static LogicalResult replaceCallsToNewKernel(RewriterBase &b,
+                                             ArrayRef<CallOpInterface> opsA,
+                                             ArrayRef<CallOpInterface> opsB,
+                                             StringRef kernelName) {
+  OpBuilder::InsertionGuard g(b);
+  auto groupedA = groupAndSortCallsByBlock(opsA);
+  auto groupedB = groupAndSortCallsByBlock(opsB);
+
+  // verify the calls have the same block-level grouping.
+  if (groupedA.size() != groupedB.size())
+    return failure();
+  for (auto &[block, callAs] : groupedA) {
+    auto it = groupedB.find(block);
+    if (it == groupedB.end())
+      return failure();
+    if (callAs.size() != it->second.size())
+      return failure();
+  }
+  for (auto &[block, callAs] : groupedA) {
+    auto &callBs = groupedB.find(block)->second;
+    for (auto [callA, callB] : llvm::zip(callAs, callBs)) {
+      auto later = callA->isBeforeInBlock(callB) ? callB : callA;
+      b.setInsertionPoint(later);
+
+      SmallVector<Value, 4> operands;
+      llvm::append_range(operands, callA->getOperands());
+      llvm::append_range(operands, callB->getOperands());
+      SmallVector<Type, 4> resTypes;
+      llvm::append_range(resTypes, callA->getResultTypes());
+      llvm::append_range(resTypes, callB->getResultTypes());
+      auto call = allo::CallOp::create(b, later.getLoc(), kernelName, resTypes,
+                                       operands);
+      auto newResults = call.getResults();
+      auto aNumResults = callA->getNumResults();
+      b.replaceAllUsesWith(callA->getResults(),
+                           newResults.take_front(aNumResults));
+      b.replaceAllUsesWith(callB->getResults(),
+                           newResults.drop_front(aNumResults));
+
+      b.eraseOp(callA);
+      b.eraseOp(callB);
+    }
+  }
+  return success();
+}
+
+static LogicalResult applyForwardingOnMergedKernel(
+    RewriterBase &b, const DominanceInfo &dom,
+    const DenseMap<Operation *, Operation *> &opMap,
+    SmallVectorImpl<ChannelForwardPair> &matchedPairs) {
+  OpBuilder::InsertionGuard g(b);
+  for (auto &pair : matchedPairs) {
+    Operation *clonedWriteOp = opMap.lookup(pair.WriteOp);
+    Operation *clonedReadOp = opMap.lookup(pair.ReadOp);
+    assert(clonedReadOp && clonedWriteOp &&
+           "expected matched ops to be cloned into merged kernel");
+    auto put = dyn_cast<ChanPutOp>(clonedWriteOp);
+    auto get = dyn_cast<ChanGetOp>(clonedReadOp);
+    auto acq = dyn_cast<ChanAcquireOp>(clonedReadOp);
+    auto rel = dyn_cast<ChanReleaseOp>(clonedWriteOp);
+    if (put && get) {
+      if (!dom.dominates(put.getValue(), get)) {
+        InFlightDiagnostic diag = emitRemark(put.getLoc());
+        diag << "forwarding chan.put does not dominate chan.get in merged "
+                "kernel";
+        diag.attachNote(get.getLoc()) << "chan.get here";
+        return failure();
+      }
+      // perform forwarding
+      b.replaceAllUsesWith(get.getValue(), put.getValue());
+      b.eraseOp(get);
+      b.eraseOp(put);
+    } else if (acq && rel) {
+      if (!dom.dominates(rel, acq)) {
+        InFlightDiagnostic diag = emitRemark(rel.getLoc());
+        diag << "forwarded release does not dominate acquire in merged kernel";
+        diag.attachNote(acq.getLoc()) << "acquire here";
+        return failure();
+      }
+      // perform forwarding
+      b.replaceAllUsesWith(acq.getBuffers(), rel.getBuffers());
+      b.eraseOp(acq);
+      b.eraseOp(rel);
+    } else {
+      llvm_unreachable(
+          "unexpected matched pair of channel access ops for forwarding");
+    }
+  }
+  return success();
+}
 
 DiagnosedSilenceableFailure
 transform::ChainOp::apply(transform::TransformRewriter &rewriter,
@@ -233,41 +375,93 @@ transform::ChainOp::apply(transform::TransformRewriter &rewriter,
            << "chain requires at least two kernels as input";
   }
   auto mod = kernels.front()->getParentOfType<ModuleOp>();
-  if (llvm::all_of(kernels, [&](Operation *op) {
+  if (!llvm::all_of(kernels, [&](Operation *op) {
         return op->getParentOfType<ModuleOp>() == mod;
       })) {
     return emitSilenceableError()
            << "chain requires kernels in the same module";
   }
-  for (unsigned i = 0; i < kernels.size() - 1; ++i) {
-    // create fused kernel with empty body
-    auto first = cast<allo::KernelOp>(kernels[i]);
-    auto second = cast<allo::KernelOp>(kernels[i + 1]);
-    IRMapping mapper;
-    auto merged = createMergedEmptyKernel(rewriter, first, second, mapper);
-    if (!merged) {
-      DiagnosedSilenceableFailure diag = emitSilenceableFailure(first);
-      diag << "cannot resolve attributes/arguments conflicts when merging "
-              "kernels";
-      diag.attachNote(second.getLoc()) << "conflicting kernel here";
+
+  DataflowGraph graph(mod);
+  graph.init();
+
+  auto current = cast<KernelOp>(kernels.front());
+  for (unsigned i = 1; i < kernels.size(); ++i) {
+    auto next = cast<KernelOp>(kernels[i]);
+    // check if violate data dependence
+    if (graph.hasBackwardDependence(current, next)) {
+      DiagnosedSilenceableFailure diag =
+          emitSilenceableFailure(current)
+          << "cannot chain kernels with backward dataflow dependence: @"
+          << current.getSymName() << " and @" << next.getSymName();
+      diag.attachNote(next.getLoc()) << "conflicting kernel here";
       return diag;
     }
-    // merge bodies to the new kernel
-    Block &firstBody = first.getBody().front();
-    rewriter.setInsertionPointToStart(&merged.getBody().front());
-    for (auto &op : firstBody.getOperations()) {
-      if (isa<allo::ReturnOp>(op))
-        continue;
-      Operation *cloned = rewriter.clone(op, mapper);
+    // merge kernel bodies
+    IRMapping mapper;
+    auto merged = createMergedKernel(rewriter, current, next, mapper);
+    if (!merged) {
+      DiagnosedSilenceableFailure diag = emitSilenceableFailure(current);
+      diag << "cannot resolve attributes/arguments conflicts when merging "
+              "kernels";
+      diag.attachNote(next.getLoc()) << "conflicting kernel here";
+      return diag;
     }
-    Block &secondBody = second.getBody().front();
-    rewriter.setInsertionPointToStart(&merged.getBody().front());
-    for (auto &op : secondBody.getOperations()) {
-      if (isa<allo::ReturnOp>(op))
+    DenseSet<StringAttr> channels;
+    for (auto *dep : graph.getEdge(current, next))
+      channels.insert(dep->Channel);
+
+    for (auto channelAttr : llvm::make_early_inc_range(channels)) {
+      // get analysis of the chan.put/get pair
+      auto fwdPairsOr = graph.analyzePutGetForward(current, next, channelAttr,
+                                                   /*emitError=*/true);
+      if (failed(fwdPairsOr)) {
+        InFlightDiagnostic diag = emitWarning()
+                                  << "skipping forwarding for channel @"
+                                  << channelAttr.getValue();
         continue;
-      Operation *cloned = rewriter.clone(op, mapper);
+      }
+      DominanceInfo dom(merged);
+      if (failed(applyForwardingOnMergedKernel(
+              rewriter, dom, mapper.getOperationMap(), *fwdPairsOr))) {
+        continue;
+      }
+      channels.erase(channelAttr);
     }
+
+    // rewrite calls to current and next to call the merged kernel
+    auto currUsesOr = SymbolTable::getSymbolUses(current.getSymNameAttr(), mod);
+    auto nextUsesOr = SymbolTable::getSymbolUses(next.getSymNameAttr(), mod);
+    if (!currUsesOr || !nextUsesOr) {
+      current = merged;
+      continue;
+    }
+    SmallVector<CallOpInterface, 4> currCalls, nextCalls;
+    for (auto use : *currUsesOr) {
+      auto call = dyn_cast<CallOpInterface>(use.getUser());
+      assert(call);
+      currCalls.push_back(call);
+    }
+    for (auto use : *nextUsesOr) {
+      auto call = dyn_cast<CallOpInterface>(use.getUser());
+      assert(call);
+      nextCalls.push_back(call);
+    }
+    if (failed(replaceCallsToNewKernel(rewriter, currCalls, nextCalls,
+                                       merged.getSymName()))) {
+      return emitSilenceableFailure(current)
+             << "cannot rewrite calls to merged kernel";
+    }
+    if (failed(graph.mergeNodes(current, next, merged, channels))) {
+      return emitSilenceableFailure(current)
+             << "dataflow graph update failed after merging kernels";
+    }
+    rewriter.eraseOp(current);
+    rewriter.eraseOp(next);
+    current = merged;
   }
+
+  results.set(cast<OpResult>(getResult()), {current.getOperation()});
   return DiagnosedSilenceableFailure::success();
 }
 
@@ -278,6 +472,5 @@ DiagnosedSilenceableFailure
 transform::BundleOp::apply(transform::TransformRewriter &rewriter,
                            transform::TransformResults &results,
                            transform::TransformState &state) {
-  // TODO:
-  return DiagnosedSilenceableFailure::success();
+  return emitSilenceableError() << "transform.bundle is not implemented yet";
 }

@@ -7,7 +7,7 @@ include "mlir/IR/OpBase.td"
 include "mlir/Interfaces/SideEffectInterfaces.td"
 include "allo/IR/AlloAttrs.td"
 
-def RaiseToAffineOp : Op<Transform_Dialect, "allo.raise_to_affine", 
+def Allo_RaiseToAffineOp : Op<Transform_Dialect, "allo.raise_to_affine",
   [FunctionalStyleTransformOpTrait, MemoryEffectsOpInterface, 
    TransformOpInterface, TransformEachOpTrait,
    ReportTrackingListenerFailuresOpTrait]> {
@@ -51,7 +51,7 @@ def RaiseToAffineOp : Op<Transform_Dialect, "allo.raise_to_affine",
   }];
 }
 
-def OutlineOp : Op<Transform_Dialect, "allo.outline", 
+def Allo_OutlineOp : Op<Transform_Dialect, "allo.outline",
   [FunctionalStyleTransformOpTrait, MemoryEffectsOpInterface, 
    DeclareOpInterfaceMethods<TransformOpInterface>,
    ReportTrackingListenerFailuresOpTrait]> {
@@ -87,7 +87,7 @@ def OutlineOp : Op<Transform_Dialect, "allo.outline",
   ];
 }
 
-def LoopReorderOp : Op<Transform_Dialect, "allo.reorder",
+def Allo_LoopReorderOp : Op<Transform_Dialect, "allo.reorder",
   [NavigationTransformOpTrait, MemoryEffectsOpInterface,
    DeclareOpInterfaceMethods<TransformOpInterface>,
    ReportTrackingListenerFailuresOpTrait]> {
@@ -122,7 +122,7 @@ def LoopReorderOp : Op<Transform_Dialect, "allo.reorder",
   ];
 }
 
-def LoopSplitOp : Op<Transform_Dialect, "allo.split",
+def Allo_LoopSplitOp : Op<Transform_Dialect, "allo.split",
   [FunctionalStyleTransformOpTrait, MemoryEffectsOpInterface,
    TransformOpInterface, TransformEachOpTrait,
    ReportTrackingListenerFailuresOpTrait]> {
@@ -163,7 +163,7 @@ def LoopSplitOp : Op<Transform_Dialect, "allo.split",
   ];
 }
 
-def LoopTileOp : Op<Transform_Dialect, "allo.tile",
+def Allo_LoopTileOp : Op<Transform_Dialect, "allo.tile",
   [FunctionalStyleTransformOpTrait, MemoryEffectsOpInterface,
    DeclareOpInterfaceMethods<TransformOpInterface>,
    ReportTrackingListenerFailuresOpTrait]> {
@@ -204,7 +204,7 @@ def LoopTileOp : Op<Transform_Dialect, "allo.tile",
   ];
 }
 
-def LoopFlattenOp : Op<Transform_Dialect, "allo.flatten",
+def Allo_LoopFlattenOp : Op<Transform_Dialect, "allo.flatten",
   [FunctionalStyleTransformOpTrait, MemoryEffectsOpInterface,
    DeclareOpInterfaceMethods<TransformOpInterface>,
    ReportTrackingListenerFailuresOpTrait]> {
@@ -243,7 +243,7 @@ def LoopFlattenOp : Op<Transform_Dialect, "allo.flatten",
   ];
 }
 
-def ComputeAtOp : Op<Transform_Dialect, "allo.compute_at",
+def Allo_ComputeAtOp : Op<Transform_Dialect, "allo.compute_at",
   [DeclareOpInterfaceMethods<MemoryEffectsOpInterface>,
    DeclareOpInterfaceMethods<TransformOpInterface>,
    ReportTrackingListenerFailuresOpTrait]> {
@@ -271,7 +271,7 @@ def ComputeAtOp : Op<Transform_Dialect, "allo.compute_at",
   }];
 }
 
-def ReuseAtOp : Op<Transform_Dialect, "allo.reuse_at",
+def Allo_ReuseAtOp : Op<Transform_Dialect, "allo.reuse_at",
   [FunctionalStyleTransformOpTrait, MemoryEffectsOpInterface,
    DeclareOpInterfaceMethods<TransformOpInterface>,
    ReportTrackingListenerFailuresOpTrait]> {
@@ -289,7 +289,7 @@ def ReuseAtOp : Op<Transform_Dialect, "allo.reuse_at",
     Output:
       - `$result` is the created reuse buffer handle.
   }];
-  let arguments = (ins TransformHandleTypeInterface:$target, TransformHandleTypeInterface:$axis);
+  let arguments = (ins TransformValueHandleTypeInterface:$target, TransformHandleTypeInterface:$axis);
   let results = (outs TransformHandleTypeInterface:$result);
   let assemblyFormat = [{
     $target `at` $axis attr-dict `:` functional-type(operands, results)
@@ -302,7 +302,7 @@ def ReuseAtOp : Op<Transform_Dialect, "allo.reuse_at",
   ];
 }
 
-def TagPipelineOp : Op<Transform_Dialect, "allo.pipeline",
+def Allo_TagPipelineOp : Op<Transform_Dialect, "allo.pipeline",
   [NavigationTransformOpTrait, MemoryEffectsOpInterface,
    TransformOpInterface, TransformEachOpTrait,
    ReportTrackingListenerFailuresOpTrait]> {
@@ -332,7 +332,7 @@ def TagPipelineOp : Op<Transform_Dialect, "allo.pipeline",
   }];
 }
 
-def TagUnrollOp : Op<Transform_Dialect, "allo.unroll",
+def Allo_TagUnrollOp : Op<Transform_Dialect, "allo.unroll",
   [NavigationTransformOpTrait, MemoryEffectsOpInterface,
    TransformOpInterface, TransformEachOpTrait,
    ReportTrackingListenerFailuresOpTrait]> {
@@ -363,7 +363,7 @@ def TagUnrollOp : Op<Transform_Dialect, "allo.unroll",
   }];
 }
 
-def RenameOp : Op<Transform_Dialect, "allo.rename",
+def Allo_RenameOp : Op<Transform_Dialect, "allo.rename",
   [NavigationTransformOpTrait, MemoryEffectsOpInterface,
    TransformOpInterface, TransformEachOpTrait,
    ReportTrackingListenerFailuresOpTrait]> {
@@ -393,7 +393,7 @@ def RenameOp : Op<Transform_Dialect, "allo.rename",
   }];
 }
 
-def MatchValueOp : Op<Transform_Dialect, "allo.match_value",
+def Allo_MatchValueOp : Op<Transform_Dialect, "allo.match_value",
   [NavigationTransformOpTrait, MemoryEffectsOpInterface,
    TransformOpInterface, TransformEachOpTrait,
    ReportTrackingListenerFailuresOpTrait]> {
@@ -408,11 +408,10 @@ def MatchValueOp : Op<Transform_Dialect, "allo.match_value",
   }];
   let arguments = (ins
     TransformHandleTypeInterface:$target,
-    StrAttr:$name,
     I64Attr:$number);
   let results = (outs TransformValueHandleTypeInterface:$result);
   let assemblyFormat = [{
-    $number `of` $name `in` $target attr-dict `:` type($target) `->` type($result)
+    $number `of` $target attr-dict `:` type($target) `->` type($result)
   }];
   let extraClassDeclaration = [{
     ::mlir::DiagnosedSilenceableFailure applyToOne(
@@ -422,14 +421,14 @@ def MatchValueOp : Op<Transform_Dialect, "allo.match_value",
         ::mlir::transform::TransformState &state);
   }];
   let builders = [
-    OpBuilder<(ins "Value":$target, "StringRef":$name, "int64_t":$number), [{
+    OpBuilder<(ins "Value":$target, "int64_t":$number), [{
       auto anyType = transform::AnyValueType::get($_builder.getContext());
-      build($_builder, $_state, anyType, target, name, static_cast<uint64_t>(number));
+      build($_builder, $_state, anyType, target, static_cast<uint64_t>(number));
     }]>
   ];
 }
 
-def PartitionOp : Op<Transform_Dialect, "allo.partition", [
+def Allo_PartitionOp : Op<Transform_Dialect, "allo.partition", [
   NavigationTransformOpTrait, MemoryEffectsOpInterface,
   DeclareOpInterfaceMethods<TransformOpInterface>,
   ReportTrackingListenerFailuresOpTrait]> {
@@ -444,7 +443,7 @@ def PartitionOp : Op<Transform_Dialect, "allo.partition", [
   }];
 }
 
-def ApplyVirtualMapOp : Op<Transform_Dialect, "allo.virtmap", [
+def Allo_MapGridOp : Op<Transform_Dialect, "allo.map_grid", [
   FunctionalStyleTransformOpTrait, MemoryEffectsOpInterface,
   TransformOpInterface, TransformEachOpTrait,
   ReportTrackingListenerFailuresOpTrait]> {
@@ -454,11 +453,11 @@ def ApplyVirtualMapOp : Op<Transform_Dialect, "allo.virtmap", [
   }];
   let arguments = (ins
     TransformHandleTypeInterface:$target,
-    OptionalAttr<VirtMapAttr>:$mapping,
+    OptionalAttr<DenseI32ArrayAttr>:$grid,
     UnitAttr:$sccp);
   let results = (outs);
   let assemblyFormat = [{
-    $target (`to` $mapping^ )? (`sccp` $sccp^)? attr-dict `:` type($target)
+    $target (`to` $grid^ )? (`sccp` $sccp^)? attr-dict `:` type($target)
   }];
   let extraClassDeclaration = [{
     ::mlir::DiagnosedSilenceableFailure applyToOne(
@@ -467,9 +466,10 @@ def ApplyVirtualMapOp : Op<Transform_Dialect, "allo.virtmap", [
         ::mlir::transform::ApplyToEachResultList &results,
         ::mlir::transform::TransformState &state);
   }];
+  let hasVerifier = 1;
 }
 
-def ChainOp : Op<Transform_Dialect, "allo.chain", [
+def Allo_ChainOp : Op<Transform_Dialect, "allo.chain", [
   FunctionalStyleTransformOpTrait, MemoryEffectsOpInterface,
   DeclareOpInterfaceMethods<TransformOpInterface>,
   ReportTrackingListenerFailuresOpTrait]> {
@@ -484,7 +484,7 @@ def ChainOp : Op<Transform_Dialect, "allo.chain", [
   }];
 }
 
-def BundleOp : Op<Transform_Dialect, "allo.bundle", [
+def Allo_BundleOp : Op<Transform_Dialect, "allo.bundle", [
   FunctionalStyleTransformOpTrait, MemoryEffectsOpInterface,
   DeclareOpInterfaceMethods<TransformOpInterface>,
   ReportTrackingListenerFailuresOpTrait]> {

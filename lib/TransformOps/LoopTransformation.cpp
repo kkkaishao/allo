@@ -25,12 +25,12 @@ using namespace mlir::allo;
 ///===----------------------------------------------------------------------===//
 /// OutlineOp implementation
 ///===----------------------------------------------------------------------===//
-namespace {
 /// Wraps the given operation `op` into an `scf.execute_region` operation. Uses
 /// the provided rewriter for all operations to remain compatible with the
 /// rewriting infra, as opposed to just splicing the op in place.
 /// Supports operations with either zero or one region.
-scf::ExecuteRegionOp wrapInExecuteRegion(RewriterBase &b, Operation *op) {
+static scf::ExecuteRegionOp wrapInExecuteRegion(RewriterBase &b,
+                                                Operation *op) {
   if (op->getNumRegions() > 1)
     return nullptr;
   OpBuilder::InsertionGuard g(b);
@@ -58,8 +58,8 @@ scf::ExecuteRegionOp wrapInExecuteRegion(RewriterBase &b, Operation *op) {
 
 /// Replaces the given op with the contents of the given single-block region,
 /// using the operands of the block terminator to replace operation results.
-void replaceOpWithRegion(RewriterBase &rewriter, Operation *op,
-                         Region &region) {
+static void replaceOpWithRegion(RewriterBase &rewriter, Operation *op,
+                                Region &region) {
   assert(region.hasOneBlock() && "expected single-block region");
   Block *block = &region.front();
   Operation *terminator = block->getTerminator();
@@ -68,7 +68,6 @@ void replaceOpWithRegion(RewriterBase &rewriter, Operation *op,
   rewriter.replaceOp(op, results);
   rewriter.eraseOp(terminator);
 }
-} // namespace
 
 /// Modified from
 /// https://github.com/llvm/llvm-project/blob/main/mlir/lib/Dialect/SCF/TransformOps/SCFTransformOps.cpp
@@ -82,7 +81,7 @@ transform::OutlineOp::apply(transform::TransformRewriter &rewriter,
   SmallVector<Operation *, 4> calls;
   DenseMap<Operation *, SymbolTable> symbolTables;
 
-  for (auto target : state.getPayloadOps(getTarget())) {
+  for (Operation *target : state.getPayloadOps(getTarget())) {
     Location loc = target->getLoc();
     if (target->getNumRegions() > 1) {
       return emitSilenceableFailure(target)
@@ -129,11 +128,10 @@ transform::OutlineOp::apply(transform::TransformRewriter &rewriter,
 /// ReorderOp implementation
 ///===-------------------------------------------------------------------===//
 
-namespace {
 /// Checks if the given loops are in the same perfectly nested loop band.
 /// Return the outermost loop if true. Otherwise returns null.
 /// The input loops do not need to be contiguous, or sorted by depth
-affine::AffineForOp
+static affine::AffineForOp
 inSamePerfectlyNestedLoopBand(ArrayRef<affine::AffineForOp> loops) {
   if (loops.empty())
     return {};
@@ -180,7 +178,6 @@ inSamePerfectlyNestedLoopBand(ArrayRef<affine::AffineForOp> loops) {
   // return the top-level loop
   return tmp.front();
 }
-} // namespace
 
 DiagnosedSilenceableFailure
 transform::LoopReorderOp::apply(transform::TransformRewriter &rewriter,
@@ -189,7 +186,7 @@ transform::LoopReorderOp::apply(transform::TransformRewriter &rewriter,
 
   SmallVector<affine::AffineForOp> loops;
   // validate input operation handles
-  for (auto payload : state.getPayloadOps(getLoops())) {
+  for (Operation *payload : state.getPayloadOps(getLoops())) {
     if (auto forOp = dyn_cast<affine::AffineForOp>(payload)) {
       loops.push_back(forOp);
     } else {
@@ -228,7 +225,7 @@ transform::LoopReorderOp::apply(transform::TransformRewriter &rewriter,
   // Map selected loops to their original positions in the full perfect band.
   SmallVector<unsigned, 4> selectedOrgIndices;
   for (auto l : loops) {
-    auto it = llvm::find(band, l);
+    auto *it = llvm::find(band, l);
     if (it == band.end())
       return emitSilenceableError() << "selected loop is not in the loop band";
     unsigned idx = std::distance(band.begin(), it);
@@ -279,11 +276,11 @@ LogicalResult transform::LoopReorderOp::verify() {
 ///===----------------------------------------------------------------------===//
 /// SplitOp implementation
 ///===----------------------------------------------------------------------===//
-namespace {
+
 /// Checks if the given split factor is valid for the given loop.
 /// A valid split factor should be positive and smaller than the loop range.
 /// only checks constant bounds loops
-bool checkSplitFactor(affine::AffineForOp loop, int64_t factor) {
+static bool checkSplitFactor(affine::AffineForOp loop, int64_t factor) {
   if (!loop.hasConstantBounds()) {
     return true;
   }
@@ -293,7 +290,7 @@ bool checkSplitFactor(affine::AffineForOp loop, int64_t factor) {
   return factor > 0 && factor < range;
 }
 
-FailureOr<int64_t> stripCast(Value value) {
+static FailureOr<int64_t> stripCastInt(Value value) {
   Value current = value;
   while (true) {
     Operation *defOp = current.getDefiningOp();
@@ -313,9 +310,9 @@ FailureOr<int64_t> stripCast(Value value) {
   }
 }
 
-bool checkSplitFactor(scf::ForOp loop, int64_t factor) {
-  auto lbOr = stripCast(loop.getLowerBound());
-  auto ubOr = stripCast(loop.getUpperBound());
+static bool checkSplitFactor(scf::ForOp loop, int64_t factor) {
+  auto lbOr = stripCastInt(loop.getLowerBound());
+  auto ubOr = stripCastInt(loop.getUpperBound());
   if (failed(lbOr) || failed(ubOr)) {
     return true;
   }
@@ -324,7 +321,6 @@ bool checkSplitFactor(scf::ForOp loop, int64_t factor) {
   int64_t range = ub - lb;
   return factor > 0 && factor < range;
 }
-} // namespace
 
 DiagnosedSilenceableFailure
 transform::LoopSplitOp::applyToOne(transform::TransformRewriter &rewriter,
@@ -424,8 +420,7 @@ transform::LoopSplitOp::applyToOne(transform::TransformRewriter &rewriter,
 ///===----------------------------------------------------------------------===///
 /// LoopTileOp implementation
 ///===----------------------------------------------------------------------===///
-namespace {
-unsigned getOperationDepth(Operation *op) {
+static unsigned getOperationDepth(Operation *op) {
   unsigned depth = 0;
   Operation *curr = op;
   while ((curr = curr->getParentOp()))
@@ -433,37 +428,39 @@ unsigned getOperationDepth(Operation *op) {
   return depth;
 }
 
+namespace {
 template <typename ForOp> struct LoopWithFactor {
-  ForOp loop;
-  uint64_t factor;
+  ForOp Loop;
+  uint64_t Factor;
 };
+} // namespace
 
 /// Sort (loop, factor) pairs by loop depth and check they form a single
 /// ancestor chain with unique loops.
 template <typename ForOp>
-LogicalResult
+static LogicalResult
 sortAndCheckLoopFactorPairs(SmallVectorImpl<LoopWithFactor<ForOp>> &pairs) {
   DenseSet<Operation *> seenLoops;
   for (auto pair : pairs) {
-    if (!seenLoops.insert(pair.loop).second)
+    if (!seenLoops.insert(pair.Loop).second)
       return failure();
   }
 
   llvm::sort(pairs, [](const LoopWithFactor<ForOp> &a,
                        const LoopWithFactor<ForOp> &b) {
-    return getOperationDepth(a.loop) < getOperationDepth(b.loop);
+    return getOperationDepth(a.Loop) < getOperationDepth(b.Loop);
   });
 
   // Check they belong to one loop nest.
   for (unsigned i = 0; i < pairs.size() - 1; ++i) {
-    if (!pairs[i].loop->isProperAncestor(pairs[i + 1].loop))
+    if (!pairs[i].Loop->isProperAncestor(pairs[i + 1].Loop))
       return failure();
   }
   return success();
 }
 
 template <typename ForOp>
-bool isContiguousPerfectBand(SmallVectorImpl<ForOp> &loops) {
+static bool isContiguousPerfectBand(SmallVectorImpl<ForOp> &loops) {
   if (loops.size() <= 1)
     return true;
   for (unsigned i = 0; i < loops.size() - 1; ++i) {
@@ -476,7 +473,7 @@ bool isContiguousPerfectBand(SmallVectorImpl<ForOp> &loops) {
   return true;
 }
 
-FailureOr<SmallVector<uint64_t, 4>> parseTileFactors(ArrayAttr attr) {
+static FailureOr<SmallVector<uint64_t, 4>> parseTileFactors(ArrayAttr attr) {
   SmallVector<uint64_t, 4> factors;
   factors.reserve(attr.size());
   for (Attribute a : attr) {
@@ -489,7 +486,7 @@ FailureOr<SmallVector<uint64_t, 4>> parseTileFactors(ArrayAttr attr) {
 }
 
 template <typename ForOp>
-SmallVector<StringAttr, 4> collectLoopSymNames(ArrayRef<ForOp> loops) {
+static SmallVector<StringAttr, 4> collectLoopSymNames(ArrayRef<ForOp> loops) {
   SmallVector<StringAttr, 4> symNames;
   symNames.reserve(loops.size());
   for (ForOp loop : loops)
@@ -497,10 +494,10 @@ SmallVector<StringAttr, 4> collectLoopSymNames(ArrayRef<ForOp> loops) {
   return symNames;
 }
 
-void annotateTiledLoopSymNames(RewriterBase &rewriter,
-                               ArrayRef<StringAttr> inputSymNames,
-                               ArrayRef<Operation *> tileLoops,
-                               ArrayRef<Operation *> pointLoops) {
+static void annotateTiledLoopSymNames(RewriterBase &rewriter,
+                                      ArrayRef<StringAttr> inputSymNames,
+                                      ArrayRef<Operation *> tileLoops,
+                                      ArrayRef<Operation *> pointLoops) {
   assert(inputSymNames.size() == tileLoops.size() &&
          "expected one sym_name per tile loop");
   assert(inputSymNames.size() == pointLoops.size() &&
@@ -515,7 +512,6 @@ void annotateTiledLoopSymNames(RewriterBase &rewriter,
     pointLoop->setAttr(OpIdentifier, rewriter.getStringAttr(base + ".point"));
   }
 }
-} // namespace
 
 DiagnosedSilenceableFailure
 transform::LoopTileOp::apply(transform::TransformRewriter &rewriter,
@@ -526,7 +522,7 @@ transform::LoopTileOp::apply(transform::TransformRewriter &rewriter,
 
   // Collect payload loops in handle iteration order.
   // This order is the semantic order for mapping input factors to loops.
-  for (auto payload : state.getPayloadOps(getLoops())) {
+  for (Operation *payload : state.getPayloadOps(getLoops())) {
     if (auto affineFor = dyn_cast<affine::AffineForOp>(payload)) {
       affineLoops.push_back(affineFor);
     } else if (auto scfFor = dyn_cast<scf::ForOp>(payload)) {
@@ -579,8 +575,8 @@ transform::LoopTileOp::apply(transform::TransformRewriter &rewriter,
     sortedLoops.reserve(loopFactors.size());
     sortedFactors.reserve(loopFactors.size());
     for (const auto &it : loopFactors) {
-      sortedLoops.push_back(it.loop);
-      sortedFactors.push_back(it.factor);
+      sortedLoops.push_back(it.Loop);
+      sortedFactors.push_back(it.Factor);
     }
     SmallVector<StringAttr, 4> inputSymNames =
         collectLoopSymNames<affine::AffineForOp>(sortedLoops);
@@ -725,8 +721,8 @@ transform::LoopTileOp::apply(transform::TransformRewriter &rewriter,
     sortedLoops.reserve(loopFactors.size());
     sortedFactors.reserve(loopFactors.size());
     for (const auto &it : loopFactors) {
-      sortedLoops.push_back(it.loop);
-      sortedFactors.push_back(it.factor);
+      sortedLoops.push_back(it.Loop);
+      sortedFactors.push_back(it.Factor);
     }
     SmallVector<StringAttr, 4> inputSymNames =
         collectLoopSymNames<scf::ForOp>(sortedLoops);
@@ -791,11 +787,10 @@ transform::LoopTileOp::apply(transform::TransformRewriter &rewriter,
 /// LoopFlattenOp implementation
 ///===----------------------------------------------------------------------===///
 
-namespace {
 // modified from lib/Transforms/Utils/LoopUtils.cpp
-void coalesceLoops(MutableArrayRef<affine::AffineForOp> loops,
-                   int64_t flattenedTripCount,
-                   transform::TransformRewriter &rewriter) {
+static void coalesceLoops(MutableArrayRef<affine::AffineForOp> loops,
+                          int64_t flattenedTripCount,
+                          transform::TransformRewriter &rewriter) {
   // RAII helper to restore the insertion point.
   OpBuilder::InsertionGuard guard(rewriter);
 
@@ -871,8 +866,8 @@ void coalesceLoops(MutableArrayRef<affine::AffineForOp> loops,
     if (nestedLoop == outermost)
       return;
     bool canSinkAll = true;
-    for (auto op : opToSink) {
-      for (auto user : op->getUsers()) {
+    for (Operation *op : opToSink) {
+      for (Operation *user : op->getUsers()) {
         if (!nestedLoop->isAncestor(user)) {
           canSinkAll = false;
           break;
@@ -883,13 +878,12 @@ void coalesceLoops(MutableArrayRef<affine::AffineForOp> loops,
     }
     if (canSinkAll) {
       Block *body = nestedLoop.getBody();
-      for (auto op : opToSink) {
+      for (Operation *op : opToSink) {
         op->moveBefore(&body->front());
       }
     }
   });
 }
-} // namespace
 
 DiagnosedSilenceableFailure
 transform::LoopFlattenOp::apply(transform::TransformRewriter &rewriter,
@@ -897,7 +891,7 @@ transform::LoopFlattenOp::apply(transform::TransformRewriter &rewriter,
                                 transform::TransformState &state) {
   SmallVector<affine::AffineForOp, 4> loops;
   // validate input operation handles
-  for (auto payload : state.getPayloadOps(getLoops())) {
+  for (Operation *payload : state.getPayloadOps(getLoops())) {
     if (auto forOp = dyn_cast<affine::AffineForOp>(payload)) {
       loops.push_back(forOp);
     } else {
@@ -930,7 +924,7 @@ transform::LoopFlattenOp::apply(transform::TransformRewriter &rewriter,
   // Flatten a contiguous band from selected outermost to selected innermost.
   SmallVector<affine::AffineForOp, 4> perfectBand;
   affine::getPerfectlyNestedLoops(perfectBand, selectedOutermost);
-  auto endIt = llvm::find(perfectBand, loops.back());
+  auto *endIt = llvm::find(perfectBand, loops.back());
   if (endIt == perfectBand.end()) {
     return emitSilenceableError()
            << "failed to find selected innermost loop in perfect loop band";
@@ -965,8 +959,8 @@ transform::LoopFlattenOp::apply(transform::TransformRewriter &rewriter,
 
   // set sym_name
   if (namePrefix) {
-    auto symStr = namePrefix.getValue() + ".flat";
-    flattenBand.front()->setAttr(OpIdentifier, rewriter.getStringAttr(symStr));
+    flattenBand.front()->setAttr(
+        OpIdentifier, rewriter.getStringAttr(namePrefix.getValue() + ".flat"));
   }
   // record results
   results.set(cast<OpResult>(getResult()), {flattenBand.front()});
@@ -977,10 +971,9 @@ transform::LoopFlattenOp::apply(transform::TransformRewriter &rewriter,
 /// ComputeAt implementation
 ///===----------------------------------------------------------------------===///
 
-namespace {
-std::optional<std::string> tryAffineLoopFusion(affine::AffineForOp producer,
-                                               affine::AffineForOp consumer,
-                                               unsigned targetDepth) {
+static std::optional<std::string>
+tryAffineLoopFusion(affine::AffineForOp producer, affine::AffineForOp consumer,
+                    unsigned targetDepth) {
   using affine::FusionResult;
   affine::ComputationSliceState sliceState;
   affine::FusionStrategy strategy(affine::FusionStrategy::ProducerConsumer);
@@ -1006,6 +999,7 @@ std::optional<std::string> tryAffineLoopFusion(affine::AffineForOp producer,
   return reason;
 }
 
+namespace {
 enum class DependenceType : uint8_t {
   NONE = 0,
   RAW = 1 << 1u,
@@ -1022,13 +1016,14 @@ DependenceType operator&(DependenceType a, DependenceType b) {
   return static_cast<DependenceType>(static_cast<uint8_t>(a) &
                                      static_cast<uint8_t>(b));
 }
+} // namespace
 
 // check dependencies between two affine.for loop nests up to a certain depth
 // assume forOpA is source, forOpB is sink
 // return a bitmask of DependenceType
-FailureOr<DependenceType> checkDependencies(affine::AffineForOp forOpA,
-                                            affine::AffineForOp forOpB,
-                                            unsigned depth) {
+static FailureOr<DependenceType> checkDependencies(affine::AffineForOp forOpA,
+                                                   affine::AffineForOp forOpB,
+                                                   unsigned depth) {
   SmallVector<affine::MemRefAccess, 4> accA;
   SmallVector<affine::MemRefAccess, 4> accB;
   bool hasUnsupportedAccess = false;
@@ -1084,12 +1079,15 @@ FailureOr<DependenceType> checkDependencies(affine::AffineForOp forOpA,
   return ret;
 }
 
+namespace {
 struct ConstantBoundsPrefix {
-  SmallVector<int64_t, 4> lowerBounds;
-  SmallVector<int64_t, 4> upperBounds;
+  SmallVector<int64_t, 4> LowerBounds;
+  SmallVector<int64_t, 4> UpperBounds;
 };
+} // namespace
 
-SmallVector<affine::AffineForOp, 4> collectAffineLoopChain(Operation *op) {
+static SmallVector<affine::AffineForOp, 4>
+collectAffineLoopChain(Operation *op) {
   SmallVector<affine::AffineForOp, 4> chain;
   for (Operation *curr = op; curr; curr = curr->getParentOp()) {
     if (auto loop = dyn_cast<affine::AffineForOp>(curr))
@@ -1099,25 +1097,25 @@ SmallVector<affine::AffineForOp, 4> collectAffineLoopChain(Operation *op) {
   return chain;
 }
 
-FailureOr<ConstantBoundsPrefix>
+static FailureOr<ConstantBoundsPrefix>
 getConstantBoundsPrefix(ArrayRef<affine::AffineForOp> chain, unsigned depth) {
   if (chain.size() < depth)
     return failure();
   ConstantBoundsPrefix bounds;
-  bounds.lowerBounds.reserve(depth);
-  bounds.upperBounds.reserve(depth);
+  bounds.LowerBounds.reserve(depth);
+  bounds.UpperBounds.reserve(depth);
   for (unsigned i = 0; i < depth; ++i) {
     affine::AffineForOp loop = chain[i];
     if (!loop.hasConstantBounds())
       return failure();
-    bounds.lowerBounds.push_back(loop.getConstantLowerBound());
-    bounds.upperBounds.push_back(loop.getConstantUpperBound());
+    bounds.LowerBounds.push_back(loop.getConstantLowerBound());
+    bounds.UpperBounds.push_back(loop.getConstantUpperBound());
   }
   return bounds;
 }
 
-bool hasSinglePathLoopPrefix(ArrayRef<affine::AffineForOp> chain,
-                             unsigned prefixDepth) {
+static bool hasSinglePathLoopPrefix(ArrayRef<affine::AffineForOp> chain,
+                                    unsigned prefixDepth) {
   if (prefixDepth > chain.size())
     return false;
   for (unsigned i = 0; i + 1 < prefixDepth; ++i) {
@@ -1132,39 +1130,39 @@ bool hasSinglePathLoopPrefix(ArrayRef<affine::AffineForOp> chain,
   return true;
 }
 
-bool hasIdenticalBounds(const ConstantBoundsPrefix &a,
-                        const ConstantBoundsPrefix &b) {
-  return a.lowerBounds == b.lowerBounds && a.upperBounds == b.upperBounds;
+static bool hasIdenticalBounds(const ConstantBoundsPrefix &a,
+                               const ConstantBoundsPrefix &b) {
+  return a.LowerBounds == b.LowerBounds && a.UpperBounds == b.UpperBounds;
 }
 
-bool isSubsetBounds(const ConstantBoundsPrefix &producerBounds,
-                    const ConstantBoundsPrefix &consumerBounds) {
+static bool isSubsetBounds(const ConstantBoundsPrefix &producerBounds,
+                           const ConstantBoundsPrefix &consumerBounds) {
   for (auto [prodLb, prodUb, consLb, consUb] : llvm::zip_equal(
-           producerBounds.lowerBounds, producerBounds.upperBounds,
-           consumerBounds.lowerBounds, consumerBounds.upperBounds)) {
+           producerBounds.LowerBounds, producerBounds.UpperBounds,
+           consumerBounds.LowerBounds, consumerBounds.UpperBounds)) {
     if (prodLb < consLb || prodUb > consUb)
       return false;
   }
   return true;
 }
 
-IntegerSet buildSubsetGuardSet(OpBuilder &builder,
-                               const ConstantBoundsPrefix &bounds) {
-  unsigned depth = bounds.lowerBounds.size();
+static IntegerSet buildSubsetGuardSet(OpBuilder &builder,
+                                      const ConstantBoundsPrefix &bounds) {
+  unsigned depth = bounds.LowerBounds.size();
   SmallVector<AffineExpr, 8> constraints;
   constraints.reserve(depth * 2);
   for (unsigned i = 0; i < depth; ++i) {
     AffineExpr dim = builder.getAffineDimExpr(i);
-    constraints.push_back(dim - bounds.lowerBounds[i]);
-    constraints.push_back((bounds.upperBounds[i] - 1) - dim);
+    constraints.push_back(dim - bounds.LowerBounds[i]);
+    constraints.push_back((bounds.UpperBounds[i] - 1) - dim);
   }
   SmallVector<bool, 8> isEq(constraints.size(), false);
   return IntegerSet::get(depth, /*symbolCount=*/0, constraints, isEq);
 }
 
-void remapProducerIVPrefix(ArrayRef<affine::AffineForOp> producerChain,
-                           ArrayRef<affine::AffineForOp> consumerChain,
-                           unsigned depth, Region &region) {
+static void remapProducerIVPrefix(ArrayRef<affine::AffineForOp> producerChain,
+                                  ArrayRef<affine::AffineForOp> consumerChain,
+                                  unsigned depth, Region &region) {
   for (unsigned i = 0; i < depth; ++i) {
     affine::AffineForOp producer = producerChain[i];
     affine::AffineForOp consumer = consumerChain[i];
@@ -1173,7 +1171,7 @@ void remapProducerIVPrefix(ArrayRef<affine::AffineForOp> producerChain,
   }
 }
 
-bool hasBlockingSideEffectsBetween(Operation *before, Operation *after) {
+static bool hasBlockingSideEffectsBetween(Operation *before, Operation *after) {
   assert(before->getBlock() == after->getBlock() &&
          "expected operations in the same block");
   assert(before->isBeforeInBlock(after) &&
@@ -1187,83 +1185,85 @@ bool hasBlockingSideEffectsBetween(Operation *before, Operation *after) {
   return false;
 }
 
+namespace {
 struct ComputeAtAnalysis {
-  Operation *producerOp = nullptr;
-  affine::AffineForOp consumerLoop = nullptr;
-  SmallVector<affine::AffineForOp, 4> producerChain;
-  SmallVector<affine::AffineForOp, 4> consumerChain;
-  affine::AffineForOp producerRoot = nullptr;
-  affine::AffineForOp consumerRoot = nullptr;
-  unsigned producerDepth = 0;
-  unsigned consumerDepth = 0;
-  SmallVector<Value, 4> consumerPrefixIVs;
+  Operation *ProducerOp = nullptr;
+  affine::AffineForOp ConsumerLoop = nullptr;
+  SmallVector<affine::AffineForOp, 4> ProducerChain;
+  SmallVector<affine::AffineForOp, 4> ConsumerChain;
+  affine::AffineForOp ProducerRoot = nullptr;
+  affine::AffineForOp ConsumerRoot = nullptr;
+  unsigned ProducerDepth = 0;
+  unsigned ConsumerDepth = 0;
+  SmallVector<Value, 4> ConsumerPrefixIVs;
 };
+} // namespace
 
-std::optional<std::string> analyzeComputeAt(Operation *producerOp,
-                                            affine::AffineForOp consumerLoop,
-                                            ComputeAtAnalysis &analysis) {
+static std::optional<std::string>
+analyzeComputeAt(Operation *producerOp, affine::AffineForOp consumerLoop,
+                 ComputeAtAnalysis &analysis) {
   // Normalize producer/consumer into loop-chain metadata once so execution
   // paths can focus on transformation mechanics.
-  analysis.producerOp = producerOp;
-  analysis.consumerLoop = consumerLoop;
-  analysis.producerChain = collectAffineLoopChain(producerOp);
-  if (analysis.producerChain.empty()) {
+  analysis.ProducerOp = producerOp;
+  analysis.ConsumerLoop = consumerLoop;
+  analysis.ProducerChain = collectAffineLoopChain(producerOp);
+  if (analysis.ProducerChain.empty()) {
     return std::string("producer must be inside an affine.for loop nest");
   }
 
-  analysis.consumerChain = collectAffineLoopChain(consumerLoop);
-  if (analysis.consumerChain.empty()) {
+  analysis.ConsumerChain = collectAffineLoopChain(consumerLoop);
+  if (analysis.ConsumerChain.empty()) {
     return std::string("expected consumer_loop to resolve to an affine.for");
   }
 
-  analysis.producerDepth = analysis.producerChain.size();
-  analysis.consumerDepth = analysis.consumerChain.size();
-  analysis.producerRoot = analysis.producerChain.front();
-  analysis.consumerRoot = analysis.consumerChain.front();
+  analysis.ProducerDepth = analysis.ProducerChain.size();
+  analysis.ConsumerDepth = analysis.ConsumerChain.size();
+  analysis.ProducerRoot = analysis.ProducerChain.front();
+  analysis.ConsumerRoot = analysis.ConsumerChain.front();
 
-  analysis.consumerPrefixIVs.clear();
-  analysis.consumerPrefixIVs.reserve(analysis.consumerDepth);
-  for (affine::AffineForOp loop : analysis.consumerChain)
-    analysis.consumerPrefixIVs.push_back(loop.getInductionVar());
+  analysis.ConsumerPrefixIVs.clear();
+  analysis.ConsumerPrefixIVs.reserve(analysis.ConsumerDepth);
+  for (affine::AffineForOp loop : analysis.ConsumerChain)
+    analysis.ConsumerPrefixIVs.push_back(loop.getInductionVar());
 
-  if (analysis.producerRoot == analysis.consumerRoot) {
+  if (analysis.ProducerRoot == analysis.ConsumerRoot) {
     return std::string(
         "producer and consumer must belong to different root loop nests");
   }
-  if (analysis.producerRoot->getBlock() != analysis.consumerRoot->getBlock()) {
+  if (analysis.ProducerRoot->getBlock() != analysis.ConsumerRoot->getBlock()) {
     return std::string(
         "producer and consumer loop nests must be in the same block");
   }
-  if (analysis.producerDepth < analysis.consumerDepth) {
+  if (analysis.ProducerDepth < analysis.ConsumerDepth) {
     return std::string(
         "producer loop nest depth is shallower than consumer depth");
   }
   return std::nullopt;
 }
 
-std::optional<std::string>
+static std::optional<std::string>
 applyNoDependenceMove(transform::TransformRewriter &rewriter,
                       ComputeAtAnalysis &analysis) {
-  unsigned consumerDepth = analysis.consumerDepth;
-  unsigned producerDepth = analysis.producerDepth;
+  unsigned consumerDepth = analysis.ConsumerDepth;
+  unsigned producerDepth = analysis.ProducerDepth;
 
   // We only rewrite a single-path producer prefix; imperfect control flow in
   // this prefix would make region move/remap semantics ambiguous.
   unsigned prefixDepthToValidate =
       producerDepth == consumerDepth ? producerDepth : consumerDepth + 1;
-  if (!hasSinglePathLoopPrefix(analysis.producerChain, prefixDepthToValidate)) {
+  if (!hasSinglePathLoopPrefix(analysis.ProducerChain, prefixDepthToValidate)) {
     return std::string(
         "producer loop prefix to be rewritten must be perfectly nested");
   }
 
   // No-dependence move must preserve top-level order and cannot jump over
   // side-effecting operations between producer root and consumer root.
-  if (!analysis.producerRoot->isBeforeInBlock(analysis.consumerRoot)) {
+  if (!analysis.ProducerRoot->isBeforeInBlock(analysis.ConsumerRoot)) {
     return std::string(
         "producer root loop must appear before consumer root loop");
   }
-  if (hasBlockingSideEffectsBetween(analysis.producerRoot,
-                                    analysis.consumerRoot)) {
+  if (hasBlockingSideEffectsBetween(analysis.ProducerRoot,
+                                    analysis.ConsumerRoot)) {
     return std::string("cannot move producer across side-effecting operations "
                        "between producer and consumer roots");
   }
@@ -1271,9 +1271,9 @@ applyNoDependenceMove(transform::TransformRewriter &rewriter,
   // No-dependence path currently supports constant-bound prefix reasoning only;
   // subset bounds are handled by generating an affine.if guard.
   FailureOr<ConstantBoundsPrefix> producerBounds =
-      getConstantBoundsPrefix(analysis.producerChain, consumerDepth);
+      getConstantBoundsPrefix(analysis.ProducerChain, consumerDepth);
   FailureOr<ConstantBoundsPrefix> consumerBounds =
-      getConstantBoundsPrefix(analysis.consumerChain, consumerDepth);
+      getConstantBoundsPrefix(analysis.ConsumerChain, consumerDepth);
   if (failed(producerBounds) || failed(consumerBounds)) {
     return std::string("compute_at currently supports only constant-bounds "
                        "loops for no-dependence move");
@@ -1287,29 +1287,29 @@ applyNoDependenceMove(transform::TransformRewriter &rewriter,
 
   // Move producer body/subtree under consumer loop. If bounds are subset-only,
   // first materialize an affine.if so execution stays within producer domain.
-  Block *destination = analysis.consumerLoop.getBody();
-  Region *ivRemapRegion = &analysis.consumerLoop.getRegion();
+  Block *destination = analysis.ConsumerLoop.getBody();
+  Region *ivRemapRegion = &analysis.ConsumerLoop.getRegion();
   if (!identicalBounds) {
-    rewriter.setInsertionPointToStart(analysis.consumerLoop.getBody());
+    rewriter.setInsertionPointToStart(analysis.ConsumerLoop.getBody());
     auto ifOp = affine::AffineIfOp::create(
-        rewriter, analysis.consumerLoop.getLoc(),
+        rewriter, analysis.ConsumerLoop.getLoc(),
         buildSubsetGuardSet(rewriter, *producerBounds),
-        analysis.consumerPrefixIVs,
+        analysis.ConsumerPrefixIVs,
         /*withElseRegion=*/false);
     destination = ifOp.getThenBlock();
     ivRemapRegion = &ifOp.getThenRegion();
   }
 
   if (producerDepth == consumerDepth) {
-    Block *producerInnermostBody = analysis.producerChain.back().getBody();
-    Value consumerInnermostIV = analysis.consumerChain.back().getInductionVar();
+    Block *producerInnermostBody = analysis.ProducerChain.back().getBody();
+    Value consumerInnermostIV = analysis.ConsumerChain.back().getInductionVar();
     rewriter.eraseOp(producerInnermostBody->getTerminator());
     rewriter.inlineBlockBefore(producerInnermostBody, destination,
                                destination->begin(),
                                ValueRange{consumerInnermostIV});
   } else {
     Operation *producerSubtree =
-        analysis.producerChain[consumerDepth].getOperation();
+        analysis.ProducerChain[consumerDepth].getOperation();
     rewriter.moveOpBefore(producerSubtree, destination, destination->begin());
   }
 
@@ -1317,14 +1317,14 @@ applyNoDependenceMove(transform::TransformRewriter &rewriter,
   if (producerDepth == consumerDepth)
     remapDepth -= 1;
   // Rewrite producer IV uses to consumer IVs in the moved region prefix.
-  remapProducerIVPrefix(analysis.producerChain, analysis.consumerChain,
+  remapProducerIVPrefix(analysis.ProducerChain, analysis.ConsumerChain,
                         remapDepth, *ivRemapRegion);
-  analysis.producerRoot.erase();
+  analysis.ProducerRoot.erase();
   return std::nullopt;
 }
 
-bool mayWriteAliasingMemref(Operation *op, Value memref,
-                            AliasAnalysis &aliasAnalysis) {
+static bool mayWriteAliasingMemref(Operation *op, Value memref,
+                                   AliasAnalysis &aliasAnalysis) {
   if (auto writeOp = dyn_cast<affine::AffineWriteOpInterface>(op))
     return !aliasAnalysis.alias(writeOp.getMemRef(), memref).isNo();
 
@@ -1359,7 +1359,7 @@ bool mayWriteAliasingMemref(Operation *op, Value memref,
   return true;
 }
 
-void runComputeAtPostCleanup(affine::AffineForOp consumerLoop) {
+static void runComputeAtPostCleanup(affine::AffineForOp consumerLoop) {
   // Run local store-to-load forwarding in the transformed loop nest only.
   // This avoids full-function affineScalarReplace on large kernels.
   Operation *scopeOp = nullptr;
@@ -1414,7 +1414,6 @@ void runComputeAtPostCleanup(affine::AffineForOp consumerLoop) {
   for (Operation *load : loadsToErase)
     load->erase();
 }
-} // namespace
 
 DiagnosedSilenceableFailure
 transform::ComputeAtOp::apply(transform::TransformRewriter &rewriter,
@@ -1445,7 +1444,7 @@ transform::ComputeAtOp::apply(transform::TransformRewriter &rewriter,
   // Classify producer->consumer dependence first; this decides whether to use
   // affine fusion or conservative manual move.
   auto depTypeOr = checkDependencies(
-      analysis.producerRoot, analysis.consumerLoop, analysis.consumerDepth);
+      analysis.ProducerRoot, analysis.ConsumerLoop, analysis.ConsumerDepth);
   if (failed(depTypeOr)) {
     return emitSilenceableError()
            << "dependence analysis failed; refusing compute_at";
@@ -1456,7 +1455,7 @@ transform::ComputeAtOp::apply(transform::TransformRewriter &rewriter,
     // RAW dependence requires true producer-consumer fusion to preserve
     // semantics while changing loop placement.
     auto reason = tryAffineLoopFusion(
-        analysis.producerRoot, analysis.consumerLoop, analysis.consumerDepth);
+        analysis.ProducerRoot, analysis.ConsumerLoop, analysis.ConsumerDepth);
     if (reason.has_value()) {
       return emitSilenceableError()
              << "cannot fuse producer and consumer loop nests: "
@@ -1472,7 +1471,7 @@ transform::ComputeAtOp::apply(transform::TransformRewriter &rewriter,
            << "compute_at does not support WAR/WAW-only dependences";
   }
 
-  runComputeAtPostCleanup(analysis.consumerLoop);
+  runComputeAtPostCleanup(analysis.ConsumerLoop);
 
   // results.set(cast<OpResult>(getResult()), {targetForOp});
   return DiagnosedSilenceableFailure::success();
@@ -1489,10 +1488,9 @@ void transform::ComputeAtOp::getEffects(
 ///===----------------------------------------------------------------------===//
 /// ReuseAt implementation
 ///===----------------------------------------------------------------------===///
-namespace {
 // Extract the last constant term encountered in an affine expression.
 // ReuseAt uses this as a lightweight ordering key for sliding-window loads.
-int64_t findConstantExprValue(const AffineExpr &exp) {
+static int64_t findConstantExprValue(const AffineExpr &exp) {
   int64_t value = -1;
   // TODO: only support one constant now
   exp.walk([&](AffineExpr inner) {
@@ -1502,6 +1500,7 @@ int64_t findConstantExprValue(const AffineExpr &exp) {
   return value;
 }
 
+namespace {
 struct ExprCompare {
   // Order expressions by their constant offset so we can process loads
   // from low-to-high offsets on the reuse axis.
@@ -1511,16 +1510,16 @@ struct ExprCompare {
     return val1 < val2;
   }
 };
-
 struct LoopRoleInfo {
-  DenseSet<Value> spatialIVs;
-  DenseSet<Value> reductionIVs;
-  DenseMap<Value, int64_t> reductionUpperBounds;
+  DenseSet<Value> SpatialIVs;
+  DenseSet<Value> ReductionIVs;
+  DenseMap<Value, int64_t> ReductionUpperBounds;
 };
+} // namespace
 
-bool valueDependsOnTargetLoad(Value value, Value target,
-                              DenseMap<Value, bool> &cache,
-                              SmallPtrSetImpl<Value> &visiting) {
+static bool valueDependsOnTargetLoad(Value value, Value target,
+                                     DenseMap<Value, bool> &cache,
+                                     SmallPtrSetImpl<Value> &visiting) {
   if (auto it = cache.find(value); it != cache.end())
     return it->second;
   if (!visiting.insert(value).second)
@@ -1541,53 +1540,22 @@ bool valueDependsOnTargetLoad(Value value, Value target,
 }
 
 // ReuseAt assumes canonical affine loops: lb=0, step=1, constant bounds.
-bool requireNormalizedLoop(affine::AffineForOp forOp) {
+static bool requireNormalizedLoop(affine::AffineForOp forOp) {
   return forOp.getStepAsInt() == 1 && forOp.hasConstantBounds() &&
          forOp.getConstantLowerBound() == 0;
 }
 
 // Walk parent loops to the outermost loop of the selected axis loop.
-affine::AffineForOp getRootLoop(affine::AffineForOp loop) {
+static affine::AffineForOp getRootLoop(affine::AffineForOp loop) {
   affine::AffineForOp root = loop;
   while (auto parent = root->getParentOfType<affine::AffineForOp>())
     root = parent;
   return root;
 }
 
-// Resolve the transform handle/value to exactly one memref SSA value.
-// Any ambiguity is rejected to keep rewrite semantics deterministic.
-FailureOr<Value> resolveTargetMemref(transform::TransformState &state,
-                                     transform::ReuseAtOp op) {
-  DenseSet<Value> seen;
-  SmallVector<Value, 2> candidates;
-  auto addCandidate = [&](Value value) {
-    if (seen.insert(value).second)
-      candidates.push_back(value);
-  };
-
-  Type targetType = op.getTarget().getType();
-  if (isa<transform::TransformValueHandleTypeInterface>(targetType)) {
-    for (Value value : state.getPayloadValues(op.getTarget()))
-      addCandidate(value);
-  }
-  if (isa<transform::TransformHandleTypeInterface>(targetType)) {
-    for (Operation *payloadOp : state.getPayloadOps(op.getTarget())) {
-      if (payloadOp->getNumResults() != 1)
-        return failure();
-      addCandidate(payloadOp->getResult(0));
-    }
-  }
-
-  if (candidates.size() != 1)
-    return failure();
-  if (!isa<MemRefType>(candidates.front().getType()))
-    return failure();
-  return candidates.front();
-}
-
 // Resolve the axis handle to exactly one affine.for loop.
-FailureOr<affine::AffineForOp> resolveAxisLoop(transform::TransformState &state,
-                                               transform::ReuseAtOp op) {
+static FailureOr<affine::AffineForOp>
+resolveAxisLoop(transform::TransformState &state, transform::ReuseAtOp op) {
   auto payloadOps = state.getPayloadOps(op.getAxis());
   if (!llvm::hasSingleElement(payloadOps))
     return failure();
@@ -1601,7 +1569,7 @@ FailureOr<affine::AffineForOp> resolveAxisLoop(transform::TransformState &state,
 // - spatial: contributes to store indexing
 // - reduction: contributes to target-load indexing but not store indexing
 // Also cache reduction loop upper bounds for span/distance derivation.
-LogicalResult
+static LogicalResult
 classifyLoopRoles(affine::AffineForOp rootForOp, Value target,
                   LoopRoleInfo &roles,
                   SmallVectorImpl<affine::AffineForOp> &allLoops) {
@@ -1656,35 +1624,37 @@ classifyLoopRoles(affine::AffineForOp rootForOp, Value target,
   if (loadCandidates.empty())
     return failure();
 
-  roles.spatialIVs = std::move(spatialCandidates);
+  roles.SpatialIVs = std::move(spatialCandidates);
   for (Value iv : loadCandidates) {
-    if (!roles.spatialIVs.contains(iv))
-      roles.reductionIVs.insert(iv);
+    if (!roles.SpatialIVs.contains(iv))
+      roles.ReductionIVs.insert(iv);
   }
 
   for (affine::AffineForOp loop : allLoops) {
     Value iv = loop.getInductionVar();
-    if (!roles.reductionIVs.contains(iv))
+    if (!roles.ReductionIVs.contains(iv))
       continue;
-    roles.reductionUpperBounds[iv] = loop.getConstantUpperBound();
+    roles.ReductionUpperBounds[iv] = loop.getConstantUpperBound();
   }
   return success();
 }
 
 // True if the loop IV is inferred as reduction-only in the current nest.
-bool isReductionLoop(affine::AffineForOp forOp, const LoopRoleInfo &roles) {
-  return roles.reductionIVs.contains(forOp.getInductionVar());
+static bool isReductionLoop(affine::AffineForOp forOp,
+                            const LoopRoleInfo &roles) {
+  return roles.ReductionIVs.contains(forOp.getInductionVar());
 }
 
 // True if the loop IV appears in spatial indexing (store side).
-bool isSpatialLoop(affine::AffineForOp forOp, const LoopRoleInfo &roles) {
-  return roles.spatialIVs.contains(forOp.getInductionVar());
+static bool isSpatialLoop(affine::AffineForOp forOp,
+                          const LoopRoleInfo &roles) {
+  return roles.SpatialIVs.contains(forOp.getInductionVar());
 }
 
 // Stage 1 analysis:
 // Collect load expressions under the selected axis loop and infer
 // per-dimension span plus axis stride used by the later rewrites.
-std::optional<std::string>
+static std::optional<std::string>
 analyzeSpanAndStride(affine::AffineForOp axisLoop, Value target, unsigned rank,
                      const DenseMap<Value, int64_t> &reductionUpperBounds,
                      RewriterBase &rewriter, SmallVectorImpl<int64_t> &spans,
@@ -1791,7 +1761,7 @@ analyzeSpanAndStride(affine::AffineForOp axisLoop, Value target, unsigned rank,
 // Stage 2 analysis:
 // Infer the reusable axis and distance window from target loads, and collect
 // ordered loads + reduction-dimension metadata for legality checks.
-std::optional<std::string>
+static std::optional<std::string>
 analyzeAxisReuseWindow(affine::AffineForOp axisLoop, Value target, Value axisIV,
                        const DenseMap<Value, int64_t> &reductionUpperBounds,
                        RewriterBase &rewriter, unsigned &axis,
@@ -1888,7 +1858,7 @@ analyzeAxisReuseWindow(affine::AffineForOp axisLoop, Value target, Value axisIV,
 // Stage 3 analysis:
 // Validate the inferred axis window is a supported pattern and materialize
 // the base axis expression used by index remapping.
-std::optional<std::string> validateAxisReuseWindow(
+static std::optional<std::string> validateAxisReuseWindow(
     const std::set<AffineExpr, ExprCompare> &requestedAxisExprs,
     ArrayRef<affine::AffineLoadOp> orderedLoadOps, unsigned axis,
     const DenseMap<unsigned, int64_t> &reductionDimBounds,
@@ -1925,7 +1895,6 @@ std::optional<std::string> validateAxisReuseWindow(
 
   return std::nullopt;
 }
-} // namespace
 
 DiagnosedSilenceableFailure
 transform::ReuseAtOp::apply(transform::TransformRewriter &rewriter,
@@ -1933,12 +1902,16 @@ transform::ReuseAtOp::apply(transform::TransformRewriter &rewriter,
                             transform::TransformState &state) {
   // Stage 0: resolve transform handles to concrete payload IR objects.
   // Resolve concrete payloads first; ReuseAt requires a single memref and loop.
-  auto targetOr = resolveTargetMemref(state, *this);
-  if (failed(targetOr))
+  auto targets = llvm::to_vector(state.getPayloadValues(getTarget()));
+  if (targets.size() != 1) {
     return emitSilenceableError()
-           << "expected target to resolve to exactly one memref value";
-  Value target = *targetOr;
-  MemRefType targetType = cast<MemRefType>(target.getType());
+           << "expected target handle to resolve to exactly one payload value";
+  }
+  Value target = targets.front();
+  MemRefType targetType = dyn_cast<MemRefType>(target.getType());
+  if (!targetType)
+    return emitSilenceableError()
+           << "expected target to resolve to a memref value";
 
   auto axisLoopOr = resolveAxisLoop(state, *this);
   if (failed(axisLoopOr))
@@ -1965,7 +1938,7 @@ transform::ReuseAtOp::apply(transform::TransformRewriter &rewriter,
     return emitSilenceableError()
            << "selected axis loop is not classified as a spatial loop";
 
-  DenseMap<Value, int64_t> reductionUpperBounds = roles.reductionUpperBounds;
+  DenseMap<Value, int64_t> reductionUpperBounds = roles.ReductionUpperBounds;
   int64_t stride = 1;
   SmallVector<int64_t, 8> spans;
   // Stage 1: infer shape/stride information used by buffer allocation/remap.

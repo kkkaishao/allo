@@ -10,7 +10,6 @@
 using namespace mlir;
 using namespace mlir::allo;
 
-
 namespace {
 struct AffineValueMapBuilder {
   MLIRContext *ctx;
@@ -44,7 +43,7 @@ private:
   AffineExpr addDim(Value v);
   AffineExpr addSym(Value v);
 };
-}
+} // namespace
 
 AffineExpr AffineValueMapBuilder::addDim(Value v) {
   auto *it = llvm::find(dims, v);

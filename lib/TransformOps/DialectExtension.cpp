@@ -102,34 +102,25 @@ transform::MatchValueOp::applyToOne(transform::TransformRewriter &rewriter,
                                     Operation *target,
                                     transform::ApplyToEachResultList &results,
                                     transform::TransformState &state) {
-  auto name = getName();
   int64_t number = getNumberAttr().getInt();
 
-  auto matchFn = [&](Operation *op) {
-    auto symName = op->getAttrOfType<StringAttr>(OpIdentifier);
-    if (symName && symName.getValue() == name) {
-      // matched target
-      auto blockArgs = getBlockArguments(op);
-      if (blockArgs.empty()) {
-        // Case 1: no block argument, match the operation itself
-        if (number < 0 ||
-            static_cast<uint64_t>(number) >= op->getNumResults()) {
-          return WalkResult::interrupt();
-        }
-        results.push_back(op->getResult(number));
-        return WalkResult::interrupt();
-      }
-      // Case 2: match the block argument
-      if (number < 0 || static_cast<uint64_t>(number) >= blockArgs.size()) {
-        return WalkResult::interrupt();
-      }
-      results.push_back(blockArgs[number]);
-      return WalkResult::interrupt();
+  auto blockArgs = getBlockArguments(target);
+  if (blockArgs.empty()) {
+    // Case 1: no block argument, match the operation itself
+    if (number < 0 ||
+        static_cast<uint64_t>(number) >= target->getNumResults()) {
+      return emitSilenceableError()
+             << "result number out of bounds for the target operation";
     }
-    return WalkResult::advance();
-  };
-
-  target->walk(matchFn);
+    results.push_back(target->getResult(number));
+    return DiagnosedSilenceableFailure::success();
+  }
+  // Case 2: match the block argument
+  if (number < 0 || static_cast<uint64_t>(number) >= blockArgs.size()) {
+    return emitSilenceableError()
+           << "block argument number out of bounds for the target operation";
+  }
+  results.push_back(blockArgs[number]);
   return DiagnosedSilenceableFailure::success();
 }
 

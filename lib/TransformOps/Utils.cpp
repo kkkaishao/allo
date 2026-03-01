@@ -55,7 +55,7 @@ allo::KernelOp convertFuncToKernel(RewriterBase &b, func::FuncOp func) {
   auto kernel = allo::KernelOp::create(
       b, func.getLoc(), func.getName(), func.getFunctionType(),
       func.getSymVisibilityAttr(), func.getArgAttrsAttr(),
-      func.getResAttrsAttr(), VirtMapAttr::get(b.getContext(), 1));
+      func.getResAttrsAttr(), 1);
   Region &kernelRegion = kernel.getRegion();
   kernelRegion.takeBody(func.getBody());
   b.eraseOp(func);
@@ -141,15 +141,8 @@ Value resolveMemRefValueRoot(Value value) {
   return value;
 }
 
-bool isTrivialMapping(ArrayRef<int64_t> mapping) {
+bool isTrivialMapping(ArrayRef<int32_t> mapping) {
   return mapping.empty() || (mapping.size() == 1 && mapping.front() == 1);
-}
-
-SmallVector<int64_t> convertMappingAttrToVec(ArrayAttr mappingAttr) {
-  SmallVector<int64_t> result;
-  llvm::for_each(mappingAttr.getAsRange<IntegerAttr>(),
-                 [&](IntegerAttr attr) { result.push_back(attr.getInt()); });
-  return result;
 }
 
 Value stripCast(Value value) {

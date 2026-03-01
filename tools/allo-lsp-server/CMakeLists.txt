@@ -14,6 +14,7 @@ target_link_libraries(allo-lsp-server
     MLIRIR
     MLIRLspServerLib
     MLIRAllo
+    MLIRAlloAnalysis
     MLIRAlloTransformOps
 )
 

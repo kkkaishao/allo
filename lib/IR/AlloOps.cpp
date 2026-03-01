@@ -30,10 +30,6 @@ struct AlloOpAsmDialectInterface : public OpAsmDialectInterface {
       os << "part";
       return AliasResult::OverridableAlias;
     }
-    if (isa<VirtMapAttr>(attr)) {
-      os << "virtmap";
-      return AliasResult::OverridableAlias;
-    }
     return AliasResult::NoAlias;
   }
 };
@@ -44,21 +40,15 @@ void AlloDialect::initialize() {
   addTypes<
 #define GET_TYPEDEF_LIST
 #include "allo/IR/AlloTypes.cpp.inc"
-
-
       >();
   addAttributes<
 #define GET_ATTRDEF_LIST
 #include "allo/IR/AlloAttrs.cpp.inc"
-
-
       >();
   addInterface<AlloOpAsmDialectInterface>();
   addOperations<
 #define GET_OP_LIST
 #include "allo/IR/AlloOps.cpp.inc"
-
-
       >();
   // clang-format on
 }
@@ -106,17 +96,16 @@ PartitionAttr::verify(llvm::function_ref<InFlightDiagnostic()> emitError,
 void KernelOp::build(OpBuilder &builder, OperationState &state, StringRef name,
                      FunctionType type, ArrayRef<NamedAttribute> attrs,
                      ArrayRef<DictionaryAttr> argAttrs,
-                     ArrayRef<int64_t> vtMap) {
+                     ArrayRef<int32_t> grid) {
   state.addAttribute(SymbolTable::getSymbolAttrName(),
                      builder.getStringAttr(name));
   state.addAttribute(getFunctionTypeAttrName(state.name), TypeAttr::get(type));
-  VirtMapAttr vMapAttr;
-  if (vtMap.empty()) {
-    vMapAttr = VirtMapAttr::get(builder.getContext(), 1);
-  } else {
-    vMapAttr = VirtMapAttr::get(builder.getContext(), vtMap);
-  }
-  state.addAttribute(getVirtualMappingAttrName(state.name), vMapAttr);
+  DenseI32ArrayAttr gridAttr;
+  if (grid.empty())
+    gridAttr = DenseI32ArrayAttr::get(builder.getContext(), {1});
+  else
+    gridAttr = DenseI32ArrayAttr::get(builder.getContext(), grid);
+  state.addAttribute(getGridAttrName(state.name), gridAttr);
   state.addAttributes(attrs);
   state.addRegion();
 
@@ -144,20 +133,18 @@ void KernelOp::print(OpAsmPrinter &p) {
     p << visibility.value() << ' ';
   }
   p.printSymbolName(funcName);
-  // print virtual mapping
-  auto virtmap = getVirtualMappingVec();
-  if (virtmap.size() != 1 || virtmap.front() != 1) {
-    p << " " << VirtMapAttrName << " ";
-    p.printAttribute(getVirtualMappingAttr());
-    p << " ";
-  }
   ArrayRef<Type> argTypes = getArgumentTypes();
   ArrayRef<Type> resTypes = getResultTypes();
   function_interface_impl::printFunctionSignature(
       p, *this, argTypes, /*isVariadic=*/false, resTypes);
+  // print grid
+  p << " grid=[";
+  auto grid = getGrid();
+  llvm::interleaveComma(grid, p, [&](int32_t v) { p << v; });
+  p << "]";
   function_interface_impl::printFunctionAttributes(
       p, *this,
-      {visibilityName, getVirtualMappingAttrName(), getFunctionTypeAttrName(),
+      {visibilityName, getGridAttrName(), getFunctionTypeAttrName(),
        getArgAttrsAttrName(), getResAttrsAttrName()});
   Region &body = getBody();
   if (!body.empty()) {
@@ -180,18 +167,6 @@ ParseResult KernelOp::parse(OpAsmParser &parser, OperationState &result) {
   if (parser.parseSymbolName(nameAttr, SymbolTable::getSymbolAttrName(),
                              result.attributes))
     return failure();
-  // Parse virtual mapping.
-  if (succeeded(parser.parseOptionalKeyword(VirtMapAttrName))) {
-    // virtual mapping is specified, parse the attribute.
-    VirtMapAttr vMapAttr;
-    if (parser.parseAttribute(vMapAttr, getVirtualMappingAttrName(result.name),
-                              result.attributes))
-      return failure();
-  } else {
-    // virtual mapping is not specified, use default value.
-    result.addAttribute(getVirtualMappingAttrName(result.name),
-                        VirtMapAttr::get(result.getContext(), 1));
-  }
   // Parse the function signature.
   SMLoc signatureLocation = parser.getCurrentLocation();
   bool isVariadic = false;
@@ -210,6 +185,20 @@ ParseResult KernelOp::parse(OpAsmParser &parser, OperationState &result) {
   }
   result.addAttribute(getFunctionTypeAttrName(result.name),
                       TypeAttr::get(type));
+  // parse grid attribute
+  if (parser.parseOptionalKeyword("grid")) {
+    // if "grid" keyword is not present, use default grid value of [1]
+    result.addAttribute(getGridAttrName(result.name),
+                        DenseI32ArrayAttr::get(builder.getContext(), {1}));
+  } else {
+    // if "grid" keyword is present, the grid attribute must be specified
+    if (parser.parseEqual())
+      return failure();
+    auto grid = DenseI32ArrayAttr::parse(parser, Type());
+
+    result.addAttribute(getGridAttrName(result.name), grid);
+  }
+
   // If function attributes are present, parse them.
   NamedAttrList parsedAttributes;
   SMLoc attributeDictLocation = parser.getCurrentLocation();
@@ -219,6 +208,7 @@ ParseResult KernelOp::parse(OpAsmParser &parser, OperationState &result) {
   // dictionary.
   for (StringRef disallowed :
        {SymbolTable::getVisibilityAttrName(), SymbolTable::getSymbolAttrName(),
+        getGridAttrName(result.name).getValue(),
         getFunctionTypeAttrName(result.name).getValue()}) {
     if (parsedAttributes.get(disallowed))
       return parser.emitError(attributeDictLocation, "'")
@@ -245,6 +235,17 @@ ParseResult KernelOp::parse(OpAsmParser &parser, OperationState &result) {
     // Function body was parsed, make sure its not empty.
     if (body->empty())
       return parser.emitError(loc, "expected non-empty function body");
+  }
+  return success();
+}
+
+LogicalResult KernelOp::verify() {
+  auto grid = getGrid();
+  if (grid.empty()) {
+    return emitOpError() << "grid attribute must be specified and non-empty";
+  }
+  if (llvm::any_of(grid, [](int32_t v) { return v <= 0; })) {
+    return emitOpError() << "all dimensions in grid attribute must be positive";
   }
   return success();
 }
@@ -305,15 +306,6 @@ LogicalResult ReturnOp::verify() {
   return success();
 }
 
-LogicalResult
-VirtMapAttr::verify(llvm::function_ref<InFlightDiagnostic()> emitError,
-                    ArrayRef<int64_t> ranges) {
-  if (llvm::any_of(ranges, [](int64_t x) { return x <= 0; })) {
-    return emitError() << "ranges of virtual map must be all positive";
-  }
-  return success();
-}
-
 //===----------------------------------------------------------------------===//
 // SPMD Operations
 //===----------------------------------------------------------------------===//
@@ -323,13 +315,12 @@ LogicalResult GetProgramIdOp::verify() {
     return emitOpError() << "must be nested inside a KernelOp";
   }
   auto dim = getAxiAttr().getInt();
-  auto vMap = parent.getVirtualMapping();
+  auto grid = parent.getGrid();
 
-  if (dim < 0 || static_cast<uint64_t>(dim) >= vMap.getRanges().size()) {
-    return emitOpError()
-           << "dimension " << dim
-           << " is out of bounds for KernelOp virtual mapping of size "
-           << vMap.getRanges().size();
+  if (dim < 0 || static_cast<size_t>(dim) >= grid.size()) {
+    return emitOpError() << "dimension " << dim
+                         << " is out of bounds for KernelOp grid of size "
+                         << grid.size();
   }
   return success();
 }
@@ -339,13 +330,13 @@ LogicalResult GetNumProgramsOp::verify() {
   if (!parent) {
     return emitOpError() << "must be nested inside a KernelOp";
   }
-  auto dim = getAxi();
-  auto vMap = parent.getVirtualMapping();
-  if (dim < 0 || static_cast<uint64_t>(dim) >= vMap.getRanges().size()) {
-    return emitOpError()
-           << "dimension " << dim
-           << " is out of bounds for KernelOp virtual mapping of size "
-           << vMap.getRanges().size();
+  auto dim = getAxiAttr().getInt();
+  auto grid = parent.getGrid();
+
+  if (dim < 0 || static_cast<size_t>(dim) >= grid.size()) {
+    return emitOpError() << "dimension " << dim
+                         << " is out of bounds for KernelOp grid of size "
+                         << grid.size();
   }
   return success();
 }

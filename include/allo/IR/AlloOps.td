@@ -66,14 +66,14 @@ def KernelOp : Allo_Op<"kernel", [
                        OptionalAttr<StrAttr>:$sym_visibility,
                        OptionalAttr<DictArrayAttr>:$arg_attrs,
                        OptionalAttr<DictArrayAttr>:$res_attrs,
-                       VirtMapAttr:$virtual_mapping);
+                       DenseI32ArrayAttr:$grid);
   let regions = (region AnyRegion:$body);
 
   let builders = [OpBuilder<(ins
     "StringRef":$name, "FunctionType":$type,
     CArg<"ArrayRef<NamedAttribute>", "{}">:$attrs,
     CArg<"ArrayRef<DictionaryAttr>", "{}">:$argAttrs,
-    CArg<"ArrayRef<int64_t>", "{}">:$virtual_mapping)
+    CArg<"ArrayRef<int32_t>", "{}">:$grid)
   >];
   let extraClassDeclaration = [{
     //===------------------------------------------------------------------===//
@@ -116,16 +116,9 @@ def KernelOp : Allo_Op<"kernel", [
     //===------------------------------------------------------------------===//
 
     bool isDeclaration() { return isExternal(); }
-
-    //===------------------------------------------------------------------===//
-    // Custom Methods
-    //===------------------------------------------------------------------===//
-
-    ArrayRef<int64_t> getVirtualMappingVec() {
-      return getVirtualMapping().getRanges();
-    }
   }];
   let hasCustomAssemblyFormat = 1;
+  let hasVerifier = 1;
 }
 
 def ReturnOp : Allo_Op<"return", [Pure, HasParent<"allo::KernelOp">, 
@@ -258,19 +251,19 @@ def ChanCreateOp : Allo_Op<"chan.create", [Symbol, HasParent<"ModuleOp">]> {
     or converted to a stream using `allo.chan.to_stream` operation.
   }];
   let arguments = (ins SymbolNameAttr:$sym_name,
-    I64ArrayAttr:$shape,
+    DenseI32ArrayAttr:$shape,
     TypeAttrOf<ChannelType>:$chan_type);
   let results = (outs);
   let assemblyFormat = [{
     $sym_name $shape attr-dict `:` $chan_type
   }];
   let builders = [
-    OpBuilder<(ins "StringRef":$name, "ChannelType":$chanType, CArg<"ArrayRef<int64_t>", "{}">:$shape), [{
+    OpBuilder<(ins "StringRef":$name, "ChannelType":$chanType, CArg<"ArrayRef<int32_t>", "{}">:$shape), [{
       build($_builder, $_state, StringAttr::get($_builder.getContext(), name), chanType, shape);
     }]>,
-    OpBuilder<(ins "StringAttr":$name, "ChannelType":$chanType, CArg<"ArrayRef<int64_t>", "{}">:$shape), [{
+    OpBuilder<(ins "StringAttr":$name, "ChannelType":$chanType, CArg<"ArrayRef<int32_t>", "{}">:$shape), [{
       $_state.addAttribute(SymbolTable::getSymbolAttrName(), name);
-      auto shapeAttr = $_builder.getI64ArrayAttr(shape);
+      auto shapeAttr = $_builder.getDenseI32ArrayAttr(shape);
       $_state.addAttribute(getShapeAttrName($_state.name), shapeAttr);
       auto chanAttr = TypeAttr::get(chanType);
       $_state.addAttribute(getChanTypeAttrName($_state.name), chanAttr);
