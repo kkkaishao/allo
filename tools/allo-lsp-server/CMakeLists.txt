@@ -12,6 +12,8 @@ target_link_libraries(allo-lsp-server
     ${dialect_libs}
     ${conversion_libs}
     MLIRIR
+    MLIRRegisterAllDialects
+    MLIRTensorShardingExtensions
     MLIRLspServerLib
     MLIRAllo
     MLIRAlloAnalysis

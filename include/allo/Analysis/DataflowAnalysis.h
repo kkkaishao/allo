@@ -6,7 +6,6 @@
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallVector.h"
 #include <memory>
-#include <optional>
 #include <string>
 #include <utility>
 
@@ -15,54 +14,54 @@ namespace mlir::allo {
 enum class ChannelPatternKind { None, SPSC, SPMC, MPSC, MPMC };
 
 struct ChannelPatternInfo {
-  ChannelPatternKind Kind = ChannelPatternKind::None;
-  ArrayRef<ChannelAccessOpInterface> WriteOps;
-  ArrayRef<ChannelAccessOpInterface> ReadOps;
+  ChannelPatternKind kind = ChannelPatternKind::None;
+  ArrayRef<ChannelAccessOpInterface> writeOps;
+  ArrayRef<ChannelAccessOpInterface> readOps;
 };
 
 struct ChannelAccessPoints {
-  SetVector<ChannelAccessOpInterface> WriteOps;
-  SetVector<ChannelAccessOpInterface> ReadOps;
+  SetVector<ChannelAccessOpInterface> writeOps;
+  SetVector<ChannelAccessOpInterface> readOps;
 };
 
 enum class ChannelAccessKind { Put, Get, Acquire, Release };
 
 struct ChannelForwardPair {
-  ChannelAccessOpInterface WriteOp;
-  ChannelAccessOpInterface ReadOp;
+  ChannelAccessOpInterface writeOp;
+  ChannelAccessOpInterface readOp;
 };
 
 enum class KernelIsoKind { Iso, DifferOnlyByConstants, NotIso };
 
 struct DataflowNode;
 struct DataflowEdge {
-  StringAttr Channel;
-  ChannelAccessOpInterface SrcOp = nullptr;
-  ChannelAccessOpInterface DstOp = nullptr;
-  DataflowNode *SrcNode = nullptr;
-  DataflowNode *DstNode = nullptr;
+  StringAttr channel;
+  ChannelAccessOpInterface srcOp = nullptr;
+  ChannelAccessOpInterface dstOp = nullptr;
+  DataflowNode *srcNode = nullptr;
+  DataflowNode *dstNode = nullptr;
 };
 
 struct DataflowNode {
-  explicit DataflowNode(KernelOp kernel) : Kernel(kernel) {}
-  allo::KernelOp Kernel;
+  explicit DataflowNode(KernelOp kernel) : kernel(kernel) {}
+  allo::KernelOp kernel;
 };
 
 struct DataflowGraph {
   using KernelPair = std::pair<KernelOp, KernelOp>;
   using DataflowEdgeList = SmallVector<DataflowEdge *, 4>;
 
-  ModuleOp Mod;
-  MLIRContext *Ctx;
+  ModuleOp mod;
+  MLIRContext *ctx;
   // hold the nodes and edges
-  SmallVector<std::unique_ptr<DataflowNode>> Nodes;
-  SmallVector<std::unique_ptr<DataflowEdge>> Edges;
-  DenseMap<KernelOp, DataflowNode *> NodeMap;
-  DenseMap<DataflowNode *, DataflowEdgeList> InEdges;
-  DenseMap<DataflowNode *, DataflowEdgeList> OutEdges;
-  DenseMap<StringAttr, ChannelAccessPoints> ChannelAccesses;
+  SmallVector<std::unique_ptr<DataflowNode>> nodes;
+  SmallVector<std::unique_ptr<DataflowEdge>> edges;
+  DenseMap<KernelOp, DataflowNode *> nodeMap;
+  DenseMap<DataflowNode *, DataflowEdgeList> inEdges;
+  DenseMap<DataflowNode *, DataflowEdgeList> outEdges;
+  DenseMap<StringAttr, ChannelAccessPoints> channelAccesses;
 
-  explicit DataflowGraph(ModuleOp mod) : Mod(mod), Ctx(mod.getContext()) {}
+  explicit DataflowGraph(ModuleOp mod) : mod(mod), ctx(mod.getContext()) {}
 
   void init();
   DataflowNode *addNode(KernelOp kernel);
@@ -70,7 +69,7 @@ struct DataflowGraph {
                         ChannelAccessOpInterface dstOp);
   DataflowEdge *addEdge(StringRef channel, ChannelAccessOpInterface srcOp,
                         ChannelAccessOpInterface dstOp) {
-    return addEdge(StringAttr::get(Ctx, channel), srcOp, dstOp);
+    return addEdge(StringAttr::get(ctx, channel), srcOp, dstOp);
   }
   LogicalResult removeNode(DataflowNode *node);
   LogicalResult removeEdge(DataflowEdge *edge);
@@ -88,7 +87,7 @@ struct DataflowGraph {
   bool hasDependence(KernelOp lhs, KernelOp rhs) const;
   ChannelPatternInfo analyzeChannelPattern(StringAttr channel) const;
   ChannelPatternInfo analyzeChannelPattern(StringRef channel) const {
-    return analyzeChannelPattern(StringAttr::get(Ctx, channel));
+    return analyzeChannelPattern(StringAttr::get(ctx, channel));
   }
   static FailureOr<std::string>
   getAccessSiteSignature(ChannelAccessOpInterface op);

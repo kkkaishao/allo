@@ -20,7 +20,7 @@ using namespace mlir;
 using namespace mlir::allo;
 
 ///===----------------------------------------------------------------------===//
-/// ApplyVirtualMapOp
+/// MapGridOp
 ///===----------------------------------------------------------------------===//
 namespace {
 using Pid = SmallVector<int32_t, 4>;
@@ -319,8 +319,8 @@ static LogicalResult applyForwardingOnMergedKernel(
     SmallVectorImpl<ChannelForwardPair> &matchedPairs) {
   OpBuilder::InsertionGuard g(b);
   for (auto &pair : matchedPairs) {
-    Operation *clonedWriteOp = opMap.lookup(pair.WriteOp);
-    Operation *clonedReadOp = opMap.lookup(pair.ReadOp);
+    Operation *clonedWriteOp = opMap.lookup(pair.writeOp);
+    Operation *clonedReadOp = opMap.lookup(pair.readOp);
     assert(clonedReadOp && clonedWriteOp &&
            "expected matched ops to be cloned into merged kernel");
     auto put = dyn_cast<ChanPutOp>(clonedWriteOp);
@@ -409,7 +409,7 @@ transform::ChainOp::apply(transform::TransformRewriter &rewriter,
     }
     DenseSet<StringAttr> channels;
     for (auto *dep : graph.getEdge(current, next))
-      channels.insert(dep->Channel);
+      channels.insert(dep->channel);
 
     for (auto channelAttr : llvm::make_early_inc_range(channels)) {
       // get analysis of the chan.put/get pair

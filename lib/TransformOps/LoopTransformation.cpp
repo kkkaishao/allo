@@ -430,8 +430,8 @@ static unsigned getOperationDepth(Operation *op) {
 
 namespace {
 template <typename ForOp> struct LoopWithFactor {
-  ForOp Loop;
-  uint64_t Factor;
+  ForOp loop;
+  uint64_t factor;
 };
 } // namespace
 
@@ -442,18 +442,18 @@ static LogicalResult
 sortAndCheckLoopFactorPairs(SmallVectorImpl<LoopWithFactor<ForOp>> &pairs) {
   DenseSet<Operation *> seenLoops;
   for (auto pair : pairs) {
-    if (!seenLoops.insert(pair.Loop).second)
+    if (!seenLoops.insert(pair.loop).second)
       return failure();
   }
 
   llvm::sort(pairs, [](const LoopWithFactor<ForOp> &a,
                        const LoopWithFactor<ForOp> &b) {
-    return getOperationDepth(a.Loop) < getOperationDepth(b.Loop);
+    return getOperationDepth(a.loop) < getOperationDepth(b.loop);
   });
 
   // Check they belong to one loop nest.
   for (unsigned i = 0; i < pairs.size() - 1; ++i) {
-    if (!pairs[i].Loop->isProperAncestor(pairs[i + 1].Loop))
+    if (!pairs[i].loop->isProperAncestor(pairs[i + 1].loop))
       return failure();
   }
   return success();
@@ -575,8 +575,8 @@ transform::LoopTileOp::apply(transform::TransformRewriter &rewriter,
     sortedLoops.reserve(loopFactors.size());
     sortedFactors.reserve(loopFactors.size());
     for (const auto &it : loopFactors) {
-      sortedLoops.push_back(it.Loop);
-      sortedFactors.push_back(it.Factor);
+      sortedLoops.push_back(it.loop);
+      sortedFactors.push_back(it.factor);
     }
     SmallVector<StringAttr, 4> inputSymNames =
         collectLoopSymNames<affine::AffineForOp>(sortedLoops);
@@ -721,8 +721,8 @@ transform::LoopTileOp::apply(transform::TransformRewriter &rewriter,
     sortedLoops.reserve(loopFactors.size());
     sortedFactors.reserve(loopFactors.size());
     for (const auto &it : loopFactors) {
-      sortedLoops.push_back(it.Loop);
-      sortedFactors.push_back(it.Factor);
+      sortedLoops.push_back(it.loop);
+      sortedFactors.push_back(it.factor);
     }
     SmallVector<StringAttr, 4> inputSymNames =
         collectLoopSymNames<scf::ForOp>(sortedLoops);
@@ -1081,8 +1081,8 @@ static FailureOr<DependenceType> checkDependencies(affine::AffineForOp forOpA,
 
 namespace {
 struct ConstantBoundsPrefix {
-  SmallVector<int64_t, 4> LowerBounds;
-  SmallVector<int64_t, 4> UpperBounds;
+  SmallVector<int64_t, 4> lowerBounds;
+  SmallVector<int64_t, 4> upperBounds;
 };
 } // namespace
 
@@ -1102,14 +1102,14 @@ getConstantBoundsPrefix(ArrayRef<affine::AffineForOp> chain, unsigned depth) {
   if (chain.size() < depth)
     return failure();
   ConstantBoundsPrefix bounds;
-  bounds.LowerBounds.reserve(depth);
-  bounds.UpperBounds.reserve(depth);
+  bounds.lowerBounds.reserve(depth);
+  bounds.upperBounds.reserve(depth);
   for (unsigned i = 0; i < depth; ++i) {
     affine::AffineForOp loop = chain[i];
     if (!loop.hasConstantBounds())
       return failure();
-    bounds.LowerBounds.push_back(loop.getConstantLowerBound());
-    bounds.UpperBounds.push_back(loop.getConstantUpperBound());
+    bounds.lowerBounds.push_back(loop.getConstantLowerBound());
+    bounds.upperBounds.push_back(loop.getConstantUpperBound());
   }
   return bounds;
 }
@@ -1132,14 +1132,14 @@ static bool hasSinglePathLoopPrefix(ArrayRef<affine::AffineForOp> chain,
 
 static bool hasIdenticalBounds(const ConstantBoundsPrefix &a,
                                const ConstantBoundsPrefix &b) {
-  return a.LowerBounds == b.LowerBounds && a.UpperBounds == b.UpperBounds;
+  return a.lowerBounds == b.lowerBounds && a.upperBounds == b.upperBounds;
 }
 
 static bool isSubsetBounds(const ConstantBoundsPrefix &producerBounds,
                            const ConstantBoundsPrefix &consumerBounds) {
   for (auto [prodLb, prodUb, consLb, consUb] : llvm::zip_equal(
-           producerBounds.LowerBounds, producerBounds.UpperBounds,
-           consumerBounds.LowerBounds, consumerBounds.UpperBounds)) {
+           producerBounds.lowerBounds, producerBounds.upperBounds,
+           consumerBounds.lowerBounds, consumerBounds.upperBounds)) {
     if (prodLb < consLb || prodUb > consUb)
       return false;
   }
@@ -1148,13 +1148,13 @@ static bool isSubsetBounds(const ConstantBoundsPrefix &producerBounds,
 
 static IntegerSet buildSubsetGuardSet(OpBuilder &builder,
                                       const ConstantBoundsPrefix &bounds) {
-  unsigned depth = bounds.LowerBounds.size();
+  unsigned depth = bounds.lowerBounds.size();
   SmallVector<AffineExpr, 8> constraints;
   constraints.reserve(depth * 2);
   for (unsigned i = 0; i < depth; ++i) {
     AffineExpr dim = builder.getAffineDimExpr(i);
-    constraints.push_back(dim - bounds.LowerBounds[i]);
-    constraints.push_back((bounds.UpperBounds[i] - 1) - dim);
+    constraints.push_back(dim - bounds.lowerBounds[i]);
+    constraints.push_back((bounds.upperBounds[i] - 1) - dim);
   }
   SmallVector<bool, 8> isEq(constraints.size(), false);
   return IntegerSet::get(depth, /*symbolCount=*/0, constraints, isEq);
@@ -1187,15 +1187,15 @@ static bool hasBlockingSideEffectsBetween(Operation *before, Operation *after) {
 
 namespace {
 struct ComputeAtAnalysis {
-  Operation *ProducerOp = nullptr;
-  affine::AffineForOp ConsumerLoop = nullptr;
-  SmallVector<affine::AffineForOp, 4> ProducerChain;
-  SmallVector<affine::AffineForOp, 4> ConsumerChain;
-  affine::AffineForOp ProducerRoot = nullptr;
-  affine::AffineForOp ConsumerRoot = nullptr;
-  unsigned ProducerDepth = 0;
-  unsigned ConsumerDepth = 0;
-  SmallVector<Value, 4> ConsumerPrefixIVs;
+  Operation *producerOp = nullptr;
+  affine::AffineForOp consumerLoop = nullptr;
+  SmallVector<affine::AffineForOp, 4> producerChain;
+  SmallVector<affine::AffineForOp, 4> consumerChain;
+  affine::AffineForOp producerRoot = nullptr;
+  affine::AffineForOp consumerRoot = nullptr;
+  unsigned producerDepth = 0;
+  unsigned consumerDepth = 0;
+  SmallVector<Value, 4> consumerPrefixIVs;
 };
 } // namespace
 
@@ -1204,37 +1204,37 @@ analyzeComputeAt(Operation *producerOp, affine::AffineForOp consumerLoop,
                  ComputeAtAnalysis &analysis) {
   // Normalize producer/consumer into loop-chain metadata once so execution
   // paths can focus on transformation mechanics.
-  analysis.ProducerOp = producerOp;
-  analysis.ConsumerLoop = consumerLoop;
-  analysis.ProducerChain = collectAffineLoopChain(producerOp);
-  if (analysis.ProducerChain.empty()) {
+  analysis.producerOp = producerOp;
+  analysis.consumerLoop = consumerLoop;
+  analysis.producerChain = collectAffineLoopChain(producerOp);
+  if (analysis.producerChain.empty()) {
     return std::string("producer must be inside an affine.for loop nest");
   }
 
-  analysis.ConsumerChain = collectAffineLoopChain(consumerLoop);
-  if (analysis.ConsumerChain.empty()) {
+  analysis.consumerChain = collectAffineLoopChain(consumerLoop);
+  if (analysis.consumerChain.empty()) {
     return std::string("expected consumer_loop to resolve to an affine.for");
   }
 
-  analysis.ProducerDepth = analysis.ProducerChain.size();
-  analysis.ConsumerDepth = analysis.ConsumerChain.size();
-  analysis.ProducerRoot = analysis.ProducerChain.front();
-  analysis.ConsumerRoot = analysis.ConsumerChain.front();
+  analysis.producerDepth = analysis.producerChain.size();
+  analysis.consumerDepth = analysis.consumerChain.size();
+  analysis.producerRoot = analysis.producerChain.front();
+  analysis.consumerRoot = analysis.consumerChain.front();
 
-  analysis.ConsumerPrefixIVs.clear();
-  analysis.ConsumerPrefixIVs.reserve(analysis.ConsumerDepth);
-  for (affine::AffineForOp loop : analysis.ConsumerChain)
-    analysis.ConsumerPrefixIVs.push_back(loop.getInductionVar());
+  analysis.consumerPrefixIVs.clear();
+  analysis.consumerPrefixIVs.reserve(analysis.consumerDepth);
+  for (affine::AffineForOp loop : analysis.consumerChain)
+    analysis.consumerPrefixIVs.push_back(loop.getInductionVar());
 
-  if (analysis.ProducerRoot == analysis.ConsumerRoot) {
+  if (analysis.producerRoot == analysis.consumerRoot) {
     return std::string(
         "producer and consumer must belong to different root loop nests");
   }
-  if (analysis.ProducerRoot->getBlock() != analysis.ConsumerRoot->getBlock()) {
+  if (analysis.producerRoot->getBlock() != analysis.consumerRoot->getBlock()) {
     return std::string(
         "producer and consumer loop nests must be in the same block");
   }
-  if (analysis.ProducerDepth < analysis.ConsumerDepth) {
+  if (analysis.producerDepth < analysis.consumerDepth) {
     return std::string(
         "producer loop nest depth is shallower than consumer depth");
   }
@@ -1244,26 +1244,26 @@ analyzeComputeAt(Operation *producerOp, affine::AffineForOp consumerLoop,
 static std::optional<std::string>
 applyNoDependenceMove(transform::TransformRewriter &rewriter,
                       ComputeAtAnalysis &analysis) {
-  unsigned consumerDepth = analysis.ConsumerDepth;
-  unsigned producerDepth = analysis.ProducerDepth;
+  unsigned consumerDepth = analysis.consumerDepth;
+  unsigned producerDepth = analysis.producerDepth;
 
   // We only rewrite a single-path producer prefix; imperfect control flow in
   // this prefix would make region move/remap semantics ambiguous.
   unsigned prefixDepthToValidate =
       producerDepth == consumerDepth ? producerDepth : consumerDepth + 1;
-  if (!hasSinglePathLoopPrefix(analysis.ProducerChain, prefixDepthToValidate)) {
+  if (!hasSinglePathLoopPrefix(analysis.producerChain, prefixDepthToValidate)) {
     return std::string(
         "producer loop prefix to be rewritten must be perfectly nested");
   }
 
   // No-dependence move must preserve top-level order and cannot jump over
   // side-effecting operations between producer root and consumer root.
-  if (!analysis.ProducerRoot->isBeforeInBlock(analysis.ConsumerRoot)) {
+  if (!analysis.producerRoot->isBeforeInBlock(analysis.consumerRoot)) {
     return std::string(
         "producer root loop must appear before consumer root loop");
   }
-  if (hasBlockingSideEffectsBetween(analysis.ProducerRoot,
-                                    analysis.ConsumerRoot)) {
+  if (hasBlockingSideEffectsBetween(analysis.producerRoot,
+                                    analysis.consumerRoot)) {
     return std::string("cannot move producer across side-effecting operations "
                        "between producer and consumer roots");
   }
@@ -1271,9 +1271,9 @@ applyNoDependenceMove(transform::TransformRewriter &rewriter,
   // No-dependence path currently supports constant-bound prefix reasoning only;
   // subset bounds are handled by generating an affine.if guard.
   FailureOr<ConstantBoundsPrefix> producerBounds =
-      getConstantBoundsPrefix(analysis.ProducerChain, consumerDepth);
+      getConstantBoundsPrefix(analysis.producerChain, consumerDepth);
   FailureOr<ConstantBoundsPrefix> consumerBounds =
-      getConstantBoundsPrefix(analysis.ConsumerChain, consumerDepth);
+      getConstantBoundsPrefix(analysis.consumerChain, consumerDepth);
   if (failed(producerBounds) || failed(consumerBounds)) {
     return std::string("compute_at currently supports only constant-bounds "
                        "loops for no-dependence move");
@@ -1287,29 +1287,29 @@ applyNoDependenceMove(transform::TransformRewriter &rewriter,
 
   // Move producer body/subtree under consumer loop. If bounds are subset-only,
   // first materialize an affine.if so execution stays within producer domain.
-  Block *destination = analysis.ConsumerLoop.getBody();
-  Region *ivRemapRegion = &analysis.ConsumerLoop.getRegion();
+  Block *destination = analysis.consumerLoop.getBody();
+  Region *ivRemapRegion = &analysis.consumerLoop.getRegion();
   if (!identicalBounds) {
-    rewriter.setInsertionPointToStart(analysis.ConsumerLoop.getBody());
+    rewriter.setInsertionPointToStart(analysis.consumerLoop.getBody());
     auto ifOp = affine::AffineIfOp::create(
-        rewriter, analysis.ConsumerLoop.getLoc(),
+        rewriter, analysis.consumerLoop.getLoc(),
         buildSubsetGuardSet(rewriter, *producerBounds),
-        analysis.ConsumerPrefixIVs,
+        analysis.consumerPrefixIVs,
         /*withElseRegion=*/false);
     destination = ifOp.getThenBlock();
     ivRemapRegion = &ifOp.getThenRegion();
   }
 
   if (producerDepth == consumerDepth) {
-    Block *producerInnermostBody = analysis.ProducerChain.back().getBody();
-    Value consumerInnermostIV = analysis.ConsumerChain.back().getInductionVar();
+    Block *producerInnermostBody = analysis.producerChain.back().getBody();
+    Value consumerInnermostIV = analysis.consumerChain.back().getInductionVar();
     rewriter.eraseOp(producerInnermostBody->getTerminator());
     rewriter.inlineBlockBefore(producerInnermostBody, destination,
                                destination->begin(),
                                ValueRange{consumerInnermostIV});
   } else {
     Operation *producerSubtree =
-        analysis.ProducerChain[consumerDepth].getOperation();
+        analysis.producerChain[consumerDepth].getOperation();
     rewriter.moveOpBefore(producerSubtree, destination, destination->begin());
   }
 
@@ -1317,9 +1317,9 @@ applyNoDependenceMove(transform::TransformRewriter &rewriter,
   if (producerDepth == consumerDepth)
     remapDepth -= 1;
   // Rewrite producer IV uses to consumer IVs in the moved region prefix.
-  remapProducerIVPrefix(analysis.ProducerChain, analysis.ConsumerChain,
+  remapProducerIVPrefix(analysis.producerChain, analysis.consumerChain,
                         remapDepth, *ivRemapRegion);
-  analysis.ProducerRoot.erase();
+  analysis.producerRoot.erase();
   return std::nullopt;
 }
 
@@ -1444,7 +1444,7 @@ transform::ComputeAtOp::apply(transform::TransformRewriter &rewriter,
   // Classify producer->consumer dependence first; this decides whether to use
   // affine fusion or conservative manual move.
   auto depTypeOr = checkDependencies(
-      analysis.ProducerRoot, analysis.ConsumerLoop, analysis.ConsumerDepth);
+      analysis.producerRoot, analysis.consumerLoop, analysis.consumerDepth);
   if (failed(depTypeOr)) {
     return emitSilenceableError()
            << "dependence analysis failed; refusing compute_at";
@@ -1455,7 +1455,7 @@ transform::ComputeAtOp::apply(transform::TransformRewriter &rewriter,
     // RAW dependence requires true producer-consumer fusion to preserve
     // semantics while changing loop placement.
     auto reason = tryAffineLoopFusion(
-        analysis.ProducerRoot, analysis.ConsumerLoop, analysis.ConsumerDepth);
+        analysis.producerRoot, analysis.consumerLoop, analysis.consumerDepth);
     if (reason.has_value()) {
       return emitSilenceableError()
              << "cannot fuse producer and consumer loop nests: "
@@ -1471,7 +1471,7 @@ transform::ComputeAtOp::apply(transform::TransformRewriter &rewriter,
            << "compute_at does not support WAR/WAW-only dependences";
   }
 
-  runComputeAtPostCleanup(analysis.ConsumerLoop);
+  runComputeAtPostCleanup(analysis.consumerLoop);
 
   // results.set(cast<OpResult>(getResult()), {targetForOp});
   return DiagnosedSilenceableFailure::success();
@@ -1511,9 +1511,9 @@ struct ExprCompare {
   }
 };
 struct LoopRoleInfo {
-  DenseSet<Value> SpatialIVs;
-  DenseSet<Value> ReductionIVs;
-  DenseMap<Value, int64_t> ReductionUpperBounds;
+  DenseSet<Value> spatialIVs;
+  DenseSet<Value> reductionIVs;
+  DenseMap<Value, int64_t> reductionUpperBounds;
 };
 } // namespace
 
@@ -1624,17 +1624,17 @@ classifyLoopRoles(affine::AffineForOp rootForOp, Value target,
   if (loadCandidates.empty())
     return failure();
 
-  roles.SpatialIVs = std::move(spatialCandidates);
+  roles.spatialIVs = std::move(spatialCandidates);
   for (Value iv : loadCandidates) {
-    if (!roles.SpatialIVs.contains(iv))
-      roles.ReductionIVs.insert(iv);
+    if (!roles.spatialIVs.contains(iv))
+      roles.reductionIVs.insert(iv);
   }
 
   for (affine::AffineForOp loop : allLoops) {
     Value iv = loop.getInductionVar();
-    if (!roles.ReductionIVs.contains(iv))
+    if (!roles.reductionIVs.contains(iv))
       continue;
-    roles.ReductionUpperBounds[iv] = loop.getConstantUpperBound();
+    roles.reductionUpperBounds[iv] = loop.getConstantUpperBound();
   }
   return success();
 }
@@ -1642,13 +1642,13 @@ classifyLoopRoles(affine::AffineForOp rootForOp, Value target,
 // True if the loop IV is inferred as reduction-only in the current nest.
 static bool isReductionLoop(affine::AffineForOp forOp,
                             const LoopRoleInfo &roles) {
-  return roles.ReductionIVs.contains(forOp.getInductionVar());
+  return roles.reductionIVs.contains(forOp.getInductionVar());
 }
 
 // True if the loop IV appears in spatial indexing (store side).
 static bool isSpatialLoop(affine::AffineForOp forOp,
                           const LoopRoleInfo &roles) {
-  return roles.SpatialIVs.contains(forOp.getInductionVar());
+  return roles.spatialIVs.contains(forOp.getInductionVar());
 }
 
 // Stage 1 analysis:
@@ -1938,7 +1938,7 @@ transform::ReuseAtOp::apply(transform::TransformRewriter &rewriter,
     return emitSilenceableError()
            << "selected axis loop is not classified as a spatial loop";
 
-  DenseMap<Value, int64_t> reductionUpperBounds = roles.ReductionUpperBounds;
+  DenseMap<Value, int64_t> reductionUpperBounds = roles.reductionUpperBounds;
   int64_t stride = 1;
   SmallVector<int64_t, 8> spans;
   // Stage 1: infer shape/stride information used by buffer allocation/remap.

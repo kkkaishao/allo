@@ -1,5 +1,4 @@
 #include "allo/Analysis/DataflowAnalysis.h"
-
 #include "allo/TransformOps/Utils.h"
 #include "mlir/Dialect/Affine/Analysis/Utils.h"
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
@@ -238,7 +237,7 @@ static FailureOr<std::string> getAccessSiteSignature(Operation *op,
 }
 
 StringAttr DataflowGraph::getChannelAttr(StringRef channel) const {
-  return StringAttr::get(Ctx, channel);
+  return StringAttr::get(ctx, channel);
 }
 
 ChannelAccessKind
@@ -267,41 +266,41 @@ bool DataflowGraph::isChannelReadOp(ChannelAccessOpInterface op) {
 // return the node for the kernel, create one if it doesn't exist;
 DataflowNode *DataflowGraph::addNode(KernelOp kernel) {
   assert(kernel && "cannot add null kernel to dataflow graph");
-  auto it = NodeMap.find(kernel);
-  if (it != NodeMap.end()) {
+  auto it = nodeMap.find(kernel);
+  if (it != nodeMap.end()) {
     assert(it->second && "dataflow graph node map contains null pointer");
     return it->second;
   }
 
   auto node = std::make_unique<DataflowNode>(kernel);
   DataflowNode *nodePtr = node.get();
-  Nodes.push_back(std::move(node));
-  NodeMap[kernel] = nodePtr;
+  nodes.push_back(std::move(node));
+  nodeMap[kernel] = nodePtr;
   // initialize in/out edges vec
-  InEdges[nodePtr];
-  OutEdges[nodePtr];
+  inEdges[nodePtr];
+  outEdges[nodePtr];
   return nodePtr;
 }
 
 void DataflowGraph::init() {
-  for (auto kernel : Mod.getOps<KernelOp>())
+  for (auto kernel : mod.getOps<KernelOp>())
     addNode(kernel);
 
   // collect channel accesses and store access points
-  Mod.walk([&](ChannelAccessOpInterface chanOp) {
+  mod.walk([&](ChannelAccessOpInterface chanOp) {
     StringAttr chanAttr = chanOp.getChannelAttr().getAttr();
-    auto &accessPoints = ChannelAccesses[chanAttr];
+    auto &accessPoints = channelAccesses[chanAttr];
     if (isChannelReadOp(chanOp))
-      accessPoints.ReadOps.insert(chanOp);
+      accessPoints.readOps.insert(chanOp);
     else if (isChannelWriteOp(chanOp))
-      accessPoints.WriteOps.insert(chanOp);
+      accessPoints.writeOps.insert(chanOp);
   });
 
   // for each channel, create edges between all combinations of write and read
   // access points
-  for (auto &[chan, points] : ChannelAccesses) {
-    for (auto writeOp : points.WriteOps) {
-      for (auto readOp : points.ReadOps) {
+  for (auto &[chan, points] : channelAccesses) {
+    for (auto writeOp : points.writeOps) {
+      for (auto readOp : points.readOps) {
         addEdge(chan, writeOp, readOp);
       }
     }
@@ -313,57 +312,57 @@ LogicalResult DataflowGraph::removeEdge(DataflowEdge *edge) {
     return failure();
 
   // delete from in/out edges
-  auto outIt = OutEdges.find(edge->SrcNode);
-  if (outIt != OutEdges.end())
+  auto outIt = outEdges.find(edge->srcNode);
+  if (outIt != outEdges.end())
     llvm::erase_if(outIt->second, [&](DataflowEdge *e) { return e == edge; });
 
-  auto inIt = InEdges.find(edge->DstNode);
-  if (inIt != InEdges.end())
+  auto inIt = inEdges.find(edge->dstNode);
+  if (inIt != inEdges.end())
     llvm::erase_if(inIt->second, [&](DataflowEdge *e) { return e == edge; });
 
   // erase from main edge list
   auto *edgeIt = llvm::find_if(
-      Edges, [&](const auto &ownedEdge) { return ownedEdge.get() == edge; });
-  if (edgeIt == Edges.end())
+      edges, [&](const auto &ownedEdge) { return ownedEdge.get() == edge; });
+  if (edgeIt == edges.end())
     return failure();
   // erase entry
-  Edges.erase(edgeIt);
+  edges.erase(edgeIt);
   return success();
 }
 
 LogicalResult DataflowGraph::removeNode(DataflowNode *node) {
   if (!node)
     return failure();
-  auto nodeIt = NodeMap.find(node->Kernel);
-  if (nodeIt == NodeMap.end())
+  auto nodeIt = nodeMap.find(node->kernel);
+  if (nodeIt == nodeMap.end())
     return failure();
   // remove all the in/out edges of the node
   llvm::SmallDenseSet<DataflowEdge *, 8> edgesToRemove;
-  auto inIt = InEdges.find(node);
-  if (inIt != InEdges.end()) {
+  auto inIt = inEdges.find(node);
+  if (inIt != inEdges.end()) {
     edgesToRemove.insert_range(inIt->second);
   }
-  auto outIt = OutEdges.find(node);
-  if (outIt != OutEdges.end()) {
+  auto outIt = outEdges.find(node);
+  if (outIt != outEdges.end()) {
     edgesToRemove.insert_range(outIt->second);
   }
   for (auto *edge : edgesToRemove) {
     (void)removeEdge(edge);
   }
   // delete the entry for the node
-  InEdges.erase(node);
-  OutEdges.erase(node);
-  NodeMap.erase(nodeIt);
-  llvm::erase_if(Nodes, [&](const auto &n) { return n.get() == node; });
+  inEdges.erase(node);
+  outEdges.erase(node);
+  nodeMap.erase(nodeIt);
+  llvm::erase_if(nodes, [&](const auto &n) { return n.get() == node; });
 
   // delete all the access points belonging to the kernel
-  for (auto it = ChannelAccesses.begin(); it != ChannelAccesses.end();) {
+  for (auto it = channelAccesses.begin(); it != channelAccesses.end();) {
     auto current = it++;
     auto &accessPoints = current->second;
-    accessPoints.WriteOps.remove_if(
-        [&](auto op) { return belongsToKernel(op, node->Kernel); });
-    accessPoints.ReadOps.remove_if(
-        [&](auto op) { return belongsToKernel(op, node->Kernel); });
+    accessPoints.writeOps.remove_if(
+        [&](auto op) { return belongsToKernel(op, node->kernel); });
+    accessPoints.readOps.remove_if(
+        [&](auto op) { return belongsToKernel(op, node->kernel); });
   }
   return success();
 }
@@ -392,22 +391,22 @@ DataflowEdge *DataflowGraph::addEdge(StringAttr channel,
 
   // make edge
   auto edge = std::make_unique<DataflowEdge>();
-  edge->SrcNode = srcNode;
-  edge->DstNode = dstNode;
-  edge->SrcOp = srcOp;
-  edge->DstOp = dstOp;
-  edge->Channel = channel;
+  edge->srcNode = srcNode;
+  edge->dstNode = dstNode;
+  edge->srcOp = srcOp;
+  edge->dstOp = dstOp;
+  edge->channel = channel;
 
   // update edge info
   DataflowEdge *edgePtr = edge.get();
-  InEdges[dstNode].push_back(edgePtr);
-  OutEdges[srcNode].push_back(edgePtr);
-  Edges.push_back(std::move(edge));
+  inEdges[dstNode].push_back(edgePtr);
+  outEdges[srcNode].push_back(edgePtr);
+  edges.push_back(std::move(edge));
 
   // update channel access points
-  auto &accessPoints = ChannelAccesses[channel];
-  accessPoints.WriteOps.insert(srcOp);
-  accessPoints.ReadOps.insert(dstOp);
+  auto &accessPoints = channelAccesses[channel];
+  accessPoints.writeOps.insert(srcOp);
+  accessPoints.readOps.insert(dstOp);
 
   return edgePtr;
 }
@@ -416,18 +415,18 @@ DataflowEdge *DataflowGraph::addEdge(StringAttr channel,
 // edge exists
 DataflowGraph::DataflowEdgeList DataflowGraph::getEdge(KernelOp src,
                                                        KernelOp dst) const {
-  auto srcIt = NodeMap.find(src);
-  if (srcIt == NodeMap.end()) {
+  auto srcIt = nodeMap.find(src);
+  if (srcIt == nodeMap.end()) {
     return {};
   }
-  auto dstIt = NodeMap.find(dst);
-  if (dstIt == NodeMap.end()) {
+  auto dstIt = nodeMap.find(dst);
+  if (dstIt == nodeMap.end()) {
     return {};
   }
-  auto firstOuts = OutEdges.find(srcIt->second);
+  auto firstOuts = outEdges.find(srcIt->second);
   DataflowEdgeList result;
   for (auto *edge : firstOuts->second) {
-    if (edge->DstNode == dstIt->second) {
+    if (edge->dstNode == dstIt->second) {
       result.push_back(edge);
     }
   }
@@ -438,18 +437,18 @@ DataflowGraph::DataflowEdgeList DataflowGraph::getEdge(KernelOp src,
 bool DataflowGraph::hasForwardDependence(KernelOp src, KernelOp dst) const {
   if (src == dst)
     return false;
-  auto srcIt = NodeMap.find(src);
-  if (srcIt == NodeMap.end())
+  auto srcIt = nodeMap.find(src);
+  if (srcIt == nodeMap.end())
     return false;
-  auto dstIt = NodeMap.find(dst);
-  if (dstIt == NodeMap.end())
+  auto dstIt = nodeMap.find(dst);
+  if (dstIt == nodeMap.end())
     return false;
 
-  auto srcOuts = OutEdges.find(srcIt->second);
-  if (srcOuts == OutEdges.end())
+  auto srcOuts = outEdges.find(srcIt->second);
+  if (srcOuts == outEdges.end())
     return false;
   if (llvm::any_of(srcOuts->second, [&](DataflowEdge *edge) {
-        return edge->DstNode == dstIt->second;
+        return edge->dstNode == dstIt->second;
       }))
     return true;
   return false;
@@ -460,19 +459,19 @@ bool DataflowGraph::hasForwardDependence(KernelOp src, KernelOp dst,
                                          StringRef channel) const {
   if (src == dst)
     return false;
-  auto srcIt = NodeMap.find(src);
-  if (srcIt == NodeMap.end())
+  auto srcIt = nodeMap.find(src);
+  if (srcIt == nodeMap.end())
     return false;
-  auto dstIt = NodeMap.find(dst);
-  if (dstIt == NodeMap.end())
+  auto dstIt = nodeMap.find(dst);
+  if (dstIt == nodeMap.end())
     return false;
 
-  auto srcOuts = OutEdges.find(srcIt->second);
-  if (srcOuts == OutEdges.end())
+  auto srcOuts = outEdges.find(srcIt->second);
+  if (srcOuts == outEdges.end())
     return false;
   if (llvm::any_of(srcOuts->second, [&](DataflowEdge *edge) {
-        return edge->DstNode == dstIt->second &&
-               edge->Channel.getValue() == channel;
+        return edge->dstNode == dstIt->second &&
+               edge->channel.getValue() == channel;
       }))
     return true;
   return false;
@@ -498,23 +497,23 @@ bool DataflowGraph::hasDependence(KernelOp lhs, KernelOp rhs) const {
 ChannelPatternInfo
 DataflowGraph::analyzeChannelPattern(StringAttr channel) const {
   ChannelPatternInfo info;
-  auto accessIt = ChannelAccesses.find(channel);
-  if (accessIt == ChannelAccesses.end())
+  auto accessIt = channelAccesses.find(channel);
+  if (accessIt == channelAccesses.end())
     return info;
 
-  auto &writeOps = accessIt->second.WriteOps;
-  auto &readOps = accessIt->second.ReadOps;
-  info.WriteOps = accessIt->second.WriteOps.getArrayRef();
-  info.ReadOps = accessIt->second.ReadOps.getArrayRef();
+  auto &writeOps = accessIt->second.writeOps;
+  auto &readOps = accessIt->second.readOps;
+  info.writeOps = accessIt->second.writeOps.getArrayRef();
+  info.readOps = accessIt->second.readOps.getArrayRef();
 
   if (readOps.size() == 1 && writeOps.size() == 1)
-    info.Kind = ChannelPatternKind::SPSC;
+    info.kind = ChannelPatternKind::SPSC;
   else if (readOps.size() > 1 && writeOps.size() == 1)
-    info.Kind = ChannelPatternKind::SPMC;
+    info.kind = ChannelPatternKind::SPMC;
   else if (readOps.size() == 1 && writeOps.size() > 1)
-    info.Kind = ChannelPatternKind::MPSC;
+    info.kind = ChannelPatternKind::MPSC;
   else if (readOps.size() > 1 && writeOps.size() > 1)
-    info.Kind = ChannelPatternKind::MPMC;
+    info.kind = ChannelPatternKind::MPMC;
   return info;
 }
 
@@ -530,8 +529,8 @@ FailureOr<SmallVector<ChannelForwardPair, 4>>
 DataflowGraph::analyzePutGetForward(KernelOp producer, KernelOp consumer,
                                     StringAttr channel, bool emitError) const {
   InFlightDiagnostic diag = emitRemark(producer.getLoc());
-  auto accessIt = ChannelAccesses.find(channel);
-  if (accessIt == ChannelAccesses.end()) {
+  auto accessIt = channelAccesses.find(channel);
+  if (accessIt == channelAccesses.end()) {
     if (emitError) {
       diag << "No access points found for channel " << channel.getValue()
            << "; cannot forward";
@@ -540,8 +539,8 @@ DataflowGraph::analyzePutGetForward(KernelOp producer, KernelOp consumer,
     return failure();
   }
   // get all the write and read access points for the channel
-  auto &writes = accessIt->second.WriteOps;
-  auto &reads = accessIt->second.ReadOps;
+  auto &writes = accessIt->second.writeOps;
+  auto &reads = accessIt->second.readOps;
   // fast checks:
   if (writes.size() != reads.size()) {
     if (emitError) {
@@ -696,17 +695,17 @@ DataflowGraph::analyzePutGetForward(KernelOp producer, KernelOp consumer,
 bool DataflowGraph::hasCycle() const {
   DenseMap<KernelOp, unsigned> inDegree;
   DenseMap<KernelOp, SmallVector<KernelOp, 4>> successors;
-  inDegree.reserve(NodeMap.size());
-  successors.reserve(NodeMap.size());
+  inDegree.reserve(nodeMap.size());
+  successors.reserve(nodeMap.size());
   // initialize in-degree and successor map
-  for (const auto &[k, _] : NodeMap) {
+  for (const auto &[k, _] : nodeMap) {
     inDegree[k] = 0;
     successors[k];
   }
   // populate in-degree and successor map based on edges
-  for (const auto &edge : Edges) {
-    KernelOp src = edge->SrcNode->Kernel;
-    KernelOp dst = edge->DstNode->Kernel;
+  for (const auto &edge : edges) {
+    KernelOp src = edge->srcNode->kernel;
+    KernelOp dst = edge->dstNode->kernel;
     // ignore self loops if any, as they do not contribute to cycles in the
     // graph
     if (src == dst)
@@ -752,9 +751,9 @@ LogicalResult DataflowGraph::mergeNodes(KernelOp kernelA, KernelOp kernelB,
   if (kernelA == kernelB)
     return failure();
 
-  auto nodeAIt = NodeMap.find(kernelA);
-  auto nodeBIt = NodeMap.find(kernelB);
-  if (nodeAIt == NodeMap.end() || nodeBIt == NodeMap.end())
+  auto nodeAIt = nodeMap.find(kernelA);
+  auto nodeBIt = nodeMap.find(kernelB);
+  if (nodeAIt == nodeMap.end() || nodeBIt == nodeMap.end())
     return failure();
 
   DataflowNode *nodeA = nodeAIt->second;
@@ -767,9 +766,9 @@ LogicalResult DataflowGraph::mergeNodes(KernelOp kernelA, KernelOp kernelB,
   // Collect all incident edges first since we will mutate edge lists.
   llvm::SmallSetVector<DataflowEdge *, 4> incidentEdgeSet;
   auto collectEdges = [&](DataflowNode *node) {
-    if (auto inIt = InEdges.find(node); inIt != InEdges.end())
+    if (auto inIt = inEdges.find(node); inIt != inEdges.end())
       incidentEdgeSet.insert_range(inIt->second);
-    if (auto outIt = OutEdges.find(node); outIt != OutEdges.end())
+    if (auto outIt = outEdges.find(node); outIt != outEdges.end())
       incidentEdgeSet.insert_range(outIt->second);
   };
   collectEdges(nodeA);
@@ -777,8 +776,8 @@ LogicalResult DataflowGraph::mergeNodes(KernelOp kernelA, KernelOp kernelB,
   auto incidentEdges = incidentEdgeSet.takeVector();
 
   for (DataflowEdge *edge : incidentEdges) {
-    DataflowNode *oldSrc = edge->SrcNode;
-    DataflowNode *oldDst = edge->DstNode;
+    DataflowNode *oldSrc = edge->srcNode;
+    DataflowNode *oldDst = edge->dstNode;
     DataflowNode *newSrc =
         (oldSrc == nodeA || oldSrc == nodeB) ? mergedNode : oldSrc;
     DataflowNode *newDst =
@@ -787,17 +786,17 @@ LogicalResult DataflowGraph::mergeNodes(KernelOp kernelA, KernelOp kernelB,
     // Internal dependences are removed by default after merge.
     // But channels in `ignores` must be preserved even if they form self loops.
     if (newSrc == mergedNode && newDst == mergedNode &&
-        !ignores.contains(edge->Channel)) {
+        !ignores.contains(edge->channel)) {
       (void)removeEdge(edge);
       continue;
     }
     if (newSrc == mergedNode) {
-      edge->SrcNode = newSrc;
-      OutEdges[mergedNode].push_back(edge);
+      edge->srcNode = newSrc;
+      outEdges[mergedNode].push_back(edge);
     }
     if (newDst == mergedNode) {
-      edge->DstNode = newDst;
-      InEdges[mergedNode].push_back(edge);
+      edge->dstNode = newDst;
+      inEdges[mergedNode].push_back(edge);
     }
   }
 
@@ -808,9 +807,9 @@ LogicalResult DataflowGraph::mergeNodes(KernelOp kernelA, KernelOp kernelB,
   mergedKernel.walk([&](ChannelAccessOpInterface op) {
     auto chanAttr = op.getChannelAttr().getAttr();
     if (isChannelReadOp(op))
-      ChannelAccesses[chanAttr].ReadOps.insert(op);
+      channelAccesses[chanAttr].readOps.insert(op);
     else if (isChannelWriteOp(op))
-      ChannelAccesses[chanAttr].WriteOps.insert(op);
+      channelAccesses[chanAttr].writeOps.insert(op);
   });
 
   return success();

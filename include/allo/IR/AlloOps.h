@@ -22,8 +22,8 @@
 
 #include "allo/IR/AlloAttrs.h"
 #include "allo/IR/AlloDialect.h.inc"
-#include "allo/IR/AlloTypes.h"
 #include "allo/IR/AlloInterfaces.h.inc"
+#include "allo/IR/AlloTypes.h"
 
 #define GET_OP_CLASSES
 #include "allo/IR/AlloOps.h.inc"
@@ -31,6 +31,6 @@
 namespace mlir::allo {
 constexpr StringLiteral OpIdentifier = "sym_name";
 constexpr StringLiteral VirtMapAttrName = "virtmap";
-}
+} // namespace mlir::allo
 
 #endif // ALLO_OPS_H

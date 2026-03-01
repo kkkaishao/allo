@@ -1,12 +1,12 @@
 #ifndef ALLO_BASEHLSEMITTER_H
 #define ALLO_BASEHLSEMITTER_H
 
+#include "allo/IR/AlloOps.h"
 #include "allo/Translation/BaseEmitter.h"
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
-#include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
-#include "allo/IR/AlloOps.h"
 
 namespace mlir::allo {
 
