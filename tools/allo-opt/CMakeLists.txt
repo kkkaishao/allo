@@ -14,7 +14,7 @@ target_link_libraries(allo-opt
     MLIRIR
     MLIRRegisterAllDialects
     MLIRRegisterAllPasses
-    MLIRTensorShardingExtensions
+    MLIRRegisterAllExtensions
     MLIROptLib
     MLIRAllo
     MLIRAlloAnalysis
