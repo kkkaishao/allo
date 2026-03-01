@@ -18,5 +18,6 @@ target_link_libraries(allo-opt
     MLIROptLib
     MLIRAllo
     MLIRAlloAnalysis
+    MLIRAlloTransforms
     MLIRAlloTransformOps
 )
