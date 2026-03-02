@@ -65,11 +65,11 @@ transform::MapGridOp::applyToOne(transform::TransformRewriter &rewriter,
     return DiagnosedSilenceableFailure::success();
 
   // TODO: support non-void kernels
-  if (k.getFunctionType().getNumResults() != 0) {
-    return emitSilenceableFailure(target)
-           << "apply-virtual-map only supports void allo.kernel: @"
-           << k.getName();
-  }
+  // if (k.getFunctionType().getNumResults() != 0) {
+  //   return emitSilenceableFailure(target)
+  //          << "map-grid only supports void allo.kernel: @"
+  //          << k.getName();
+  // }
 
   // get all pid combinations
   PidList pids;

@@ -1,4 +1,5 @@
 #include "allo/IR/AlloOps.h"
+#include "allo/TransformOps/AlloTransformOps.h"
 #include "allo/Transforms/ShardingInterfaceImpl.h"
 #include "mlir/InitAllDialects.h"
 #include "mlir/InitAllExtensions.h"
@@ -11,8 +12,9 @@ int main(int argc, char **argv) {
   DialectRegistry registry;
   registerAllDialects(registry);
   registry.insert<allo::AlloDialect>();
-  allo::registerShardingInterfaceExternalModels(registry);
   registerAllExtensions(registry);
+  allo::registerShardingInterfaceExternalModels(registry);
+  allo::registerTransformDialectExtension(registry);
   registerAllPasses();
   return asMainReturnCode(
       MlirOptMain(argc, argv, "Allo optimization driver\n", registry));
