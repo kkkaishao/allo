@@ -2183,3 +2183,398 @@ transform::TagUnrollOp::applyToOne(transform::TransformRewriter &rewriter,
   target->setAttr("unroll.f", getFactorAttr());
   return DiagnosedSilenceableFailure::success();
 }
+
+///===----------------------------------------------------------------------===///
+/// BufferAt implementation
+///===----------------------------------------------------------------------===///
+
+// returns true if `to` can be reached from `from` by traversing only
+// affine.apply ops.
+static bool isReachableThroughAffineApply(Value from, Value to) {
+  if (from == to)
+    return true;
+  llvm::SmallDenseSet<Value, 4> visited;
+  SmallVector<Value, 8> worklist;
+  worklist.push_back(from);
+
+  while (!worklist.empty()) {
+    Value current = worklist.pop_back_val();
+    if (!visited.insert(current).second)
+      continue;
+    if (current == to)
+      return true;
+
+    if (auto applyOp = current.getDefiningOp<affine::AffineApplyOp>()) {
+      llvm::append_range(worklist, applyOp.getMapOperands());
+    }
+  }
+  return false;
+}
+
+// returns true if the affine access function of the given map and operands is
+// transitively dependent on the target value through affine.apply ops.
+static bool isAffineAccessFunctionDependentOn(AffineMap map,
+                                              ValueRange mapOperands,
+                                              Value target) {
+  for (AffineExpr expr : map.getResults()) {
+    auto ret = expr.walk([&](AffineExpr inner) {
+      if (auto dimExpr = dyn_cast<AffineDimExpr>(inner)) {
+        unsigned dimPos = dimExpr.getPosition();
+        assert(dimPos < mapOperands.size() && "dim position out of bounds");
+        if (isReachableThroughAffineApply(mapOperands[dimPos], target)) {
+          return WalkResult::interrupt();
+        }
+        return WalkResult::advance();
+      }
+      if (auto symExpr = dyn_cast<AffineSymbolExpr>(inner)) {
+        unsigned symPos = symExpr.getPosition() + map.getNumDims();
+        assert(symPos < mapOperands.size() && "symbol position out of bounds");
+        if (isReachableThroughAffineApply(mapOperands[symPos], target)) {
+          return WalkResult::interrupt();
+        }
+        return WalkResult::advance();
+      }
+      return WalkResult::advance();
+    });
+    if (ret.wasInterrupted())
+      return true;
+  }
+  return false;
+}
+
+// check if the given operation is a supported reduction combiner or a cast of a
+// supported reduction combiner.
+static bool isReductionCombinerOp(Operation *op) {
+  if (!op)
+    return false;
+  // binary combiners
+  if (isa<arith::AddFOp, arith::AddIOp, arith::MulFOp, arith::MulIOp,
+          arith::MaximumFOp, arith::MinimumFOp, arith::MaxSIOp, arith::MaxUIOp,
+          arith::MinSIOp, arith::MinUIOp, arith::AndIOp, arith::OrIOp,
+          arith::XOrIOp>(op)) {
+    return true;
+  }
+  // cast operations
+  if (isa<arith::TruncFOp, arith::TruncIOp, arith::ExtFOp, arith::ExtSIOp,
+          arith::ExtUIOp, arith::IndexCastOp, arith::BitcastOp>(op)) {
+    return isReductionCombinerOp(op->getOperand(0).getDefiningOp());
+  }
+  return false;
+}
+
+static void
+getSourceLoadsForValue(SmallVectorImpl<affine::AffineReadOpInterface> &readOps,
+                       Value value, Block *block) {
+  llvm::SmallDenseSet<Value, 8> visited;
+  SmallVector<Value, 16> worklist;
+  worklist.push_back(value);
+
+  while (!worklist.empty()) {
+    Value current = worklist.pop_back_val();
+    if (!visited.insert(current).second)
+      continue;
+    Operation *defOp = current.getDefiningOp();
+    if (!defOp)
+      continue;
+    // limit the search to the given block to avoid traversing into other loops
+    if (defOp->getBlock() != block)
+      continue;
+    if (auto readOp = dyn_cast<affine::AffineReadOpInterface>(defOp)) {
+      readOps.push_back(readOp);
+    } else {
+      llvm::append_range(worklist, defOp->getOperands());
+    }
+  }
+}
+
+static bool isReductionLikeStoreOp(affine::AffineWriteOpInterface storeOp) {
+  Operation *combiner = storeOp.getValueToStore().getDefiningOp();
+  if (!combiner)
+    return false;
+  if (!isReductionCombinerOp(combiner))
+    return false;
+
+  SmallVector<affine::AffineReadOpInterface, 4> srcReads;
+  getSourceLoadsForValue(srcReads, storeOp.getValueToStore(),
+                         storeOp->getBlock());
+  affine::MemRefAccess storeAccess(storeOp);
+  if (llvm::any_of(srcReads, [&](affine::AffineReadOpInterface readOp) {
+        affine::MemRefAccess readAccess(readOp);
+        return readAccess == storeAccess;
+      })) {
+    return true;
+  }
+  return false;
+}
+
+// returns true if the loop contains a reduction-like store to the target buffer
+static bool isReductionLikeOnLoop(affine::AffineForOp loop, Value buffer) {
+  Value iv = loop.getInductionVar();
+
+  auto walkResult = loop.walk([&](affine::AffineWriteOpInterface writeOp) {
+    if (writeOp.getMemRef() != buffer)
+      return WalkResult::advance();
+    if (isAffineAccessFunctionDependentOn(writeOp.getAffineMap(),
+                                          writeOp.getMapOperands(), iv))
+      return WalkResult::advance();
+    if (isReductionLikeStoreOp(writeOp))
+      return WalkResult::interrupt();
+    return WalkResult::advance();
+  });
+  return walkResult.wasInterrupted();
+}
+
+static bool
+hasIVRelatedReadOrWrite(affine::AffineForOp forOp,
+                        ArrayRef<affine::AffineReadOpInterface> readOps,
+                        ArrayRef<affine::AffineWriteOpInterface> writeOps) {
+  Value iv = forOp.getInductionVar();
+  return llvm::any_of(readOps,
+                      [&](affine::AffineReadOpInterface readOp) {
+                        return isAffineAccessFunctionDependentOn(
+                            readOp.getAffineMap(), readOp.getMapOperands(), iv);
+                      }) ||
+         llvm::any_of(writeOps, [&](affine::AffineWriteOpInterface writeOp) {
+           return isAffineAccessFunctionDependentOn(
+               writeOp.getAffineMap(), writeOp.getMapOperands(), iv);
+         });
+}
+
+template <typename OpTy>
+static affine::AffineValueMap
+getProjectedMapAndOperands(OpTy op, ArrayRef<Value> prjOperands) {
+  AffineMap oldMap = op.getAffineMap();
+  llvm::SmallBitVector prjDims(oldMap.getNumDims());
+  SmallVector<Value, 4> newOperands(op.getMapOperands());
+  for (unsigned i = 0; i < prjOperands.size(); ++i) {
+    Value operand = prjOperands[i];
+    if (isAffineAccessFunctionDependentOn(oldMap, op.getMapOperands(),
+                                          operand)) {
+      prjDims.set(i);
+      llvm::erase_if(newOperands, [&](Value v) { return v == operand; });
+    }
+  }
+  AffineMap newMap = getProjectedMap(oldMap, prjDims, /*compressDimsFlag=*/true,
+                                     /*compressSymbolsFlag=*/false);
+  newMap = newMap.dropZeroResults();
+  return {newMap, newOperands};
+}
+
+DiagnosedSilenceableFailure
+transform::BufferAtOp::apply(transform::TransformRewriter &rewriter,
+                             transform::TransformResults &results,
+                             transform::TransformState &state) {
+  // precondition checks
+  auto buffers = llvm::to_vector(state.getPayloadValues(getTarget()));
+  if (buffers.size() != 1) {
+    return emitSilenceableError()
+           << "expected target handle to resolve to exactly one payload value";
+  }
+  auto buffer = buffers.front();
+  auto bufferType = dyn_cast<MemRefType>(buffer.getType());
+  if (!bufferType) {
+    return emitSilenceableError()
+           << "expected target to resolve to a memref value";
+  }
+  auto loops = llvm::to_vector(state.getPayloadOps(getAxis()));
+  if (loops.size() != 1) {
+    return emitSilenceableError() << "expected axis handle to resolve to "
+                                     "exactly one payload operation";
+  }
+  auto axisLoop = dyn_cast<affine::AffineForOp>(loops.front());
+  if (!axisLoop) {
+    return emitSilenceableError()
+           << "expected axis to resolve to a affine.for loop";
+  }
+  // buffer should be defined outside the axis loop
+  Operation *bufferDef = buffer.getDefiningOp();
+  if (bufferDef && axisLoop->isAncestor(bufferDef)) {
+    return emitSilenceableError() << "expected target buffer to be defined "
+                                     "outside the selected axis loop";
+  }
+
+  // get the root loop of the selected axis
+  affine::AffineForOp rootLoop = axisLoop;
+  while (auto parent = rootLoop->getParentOfType<affine::AffineForOp>())
+    rootLoop = parent;
+
+  SmallVector<affine::AffineForOp, 4> band;
+  affine::getPerfectlyNestedLoops(band, rootLoop);
+  if (band.empty())
+    return emitSilenceableError()
+           << "cannot find contiguous nested loops for buffer_at";
+
+  auto axisIt = llvm::find(band, axisLoop);
+  if (axisIt == band.end())
+    return emitSilenceableError()
+           << "selected axis is not in a contiguous loop band";
+  unsigned axisIdx = std::distance(band.begin(), axisIt);
+
+  if (axisIdx == band.size() - 1) {
+    return emitSilenceableError() << "cannot buffer at innermost loop axis";
+  }
+
+  // collect all read/writes inside the axis loop
+  SmallVector<affine::AffineReadOpInterface, 4> localLoads;
+  SmallVector<affine::AffineWriteOpInterface, 4> localStores;
+  axisLoop.walk([&](Operation *op) {
+    if (auto loadOp = dyn_cast<affine::AffineReadOpInterface>(op)) {
+      if (loadOp.getMemRef() == buffer)
+        localLoads.push_back(loadOp);
+    } else if (auto storeOp = dyn_cast<affine::AffineWriteOpInterface>(op)) {
+      if (storeOp.getMemRef() == buffer)
+        localStores.push_back(storeOp);
+    }
+  });
+
+  if (localLoads.empty() && localStores.empty()) {
+    return emitSilenceableError()
+           << "no load/store of the target buffer found within the selected "
+              "axis loop";
+  }
+  // check if the axis loop is reduction
+  if (isReductionLikeOnLoop(axisLoop, buffer)) {
+    return emitSilenceableError() << "cannot buffer at loop axis that contains "
+                                     "reduction-like store to "
+                                     "the target buffer";
+  }
+
+  SmallVector<affine::AffineForOp, 4> relatedLoops, unrelatedLoops;
+  for (auto it = band.begin(); it != axisIt + 1; ++it) {
+    bool reductionLike = isReductionLikeOnLoop(*it, buffer);
+    if (reductionLike) {
+      return emitSilenceableError()
+             << "cannot buffer at loop axis nested inside a reduction loop "
+                "with "
+             << "reduction-like store to the target buffer";
+    }
+    // check if any load/store is dependent on the loop IV
+    if (hasIVRelatedReadOrWrite(*it, localLoads, localStores)) {
+      relatedLoops.push_back(*it);
+    } else {
+      unrelatedLoops.push_back(*it);
+    }
+  }
+
+  SmallVector<affine::AffineForOp, 4> innerRelatedLoops;
+  for (auto it = axisIt + 1; it != band.end(); ++it) {
+    Value iv = it->getInductionVar();
+    if (hasIVRelatedReadOrWrite(*it, localLoads, localStores)) {
+      innerRelatedLoops.push_back(*it);
+    }
+  }
+
+  // check the inferred buffer shape matches the target buffer rank
+  // e.g. %A = memref.alloc() : memref<4x4x4xi8>
+  // buffer it under the 1st spatial loop -> buffer shape should be (4x4) to
+  // match the rank
+  unsigned bufferRank = bufferType.getRank();
+  // only those related dims will contribute to the buffer shape.
+  unsigned prefixDims = relatedLoops.size();
+  unsigned suffixDims = innerRelatedLoops.size();
+  if (prefixDims + suffixDims != bufferRank) {
+    return emitSilenceableError()
+           << "buffer_at cannot find a matching buffer shape for the target "
+              "buffer; expected rank: "
+           << prefixDims + suffixDims << ", actual rank: " << bufferRank;
+  }
+
+  SmallVector<int64_t, 4> bufferShape;
+  bool isScalarBuffer = suffixDims == 0;
+  if (isScalarBuffer) {
+    bufferShape.push_back(1);
+  } else {
+    for (auto loop : innerRelatedLoops) {
+      if (!loop.hasConstantBounds() || loop.getConstantLowerBound() != 0 ||
+          loop.getStepAsInt() != 1) {
+        return emitSilenceableError()
+               << "buffer_at requires normalized constant bounds on buffered "
+                  "spatial loops";
+      }
+      int64_t lb = loop.getConstantLowerBound();
+      int64_t ub = loop.getConstantUpperBound();
+      if (ub <= lb)
+        return emitSilenceableError()
+               << "buffer_at requires spatial loops with positive trip count";
+      bufferShape.push_back(ub - lb);
+    }
+  }
+
+  rewriter.setInsertionPointToStart(axisLoop.getBody());
+  Location loc = buffer.getLoc();
+  Value localBuffer = memref::AllocOp::create(
+      rewriter, loc, MemRefType::get(bufferShape, bufferType.getElementType()));
+
+  // Prologue: initialize the local buffer with the original global values if
+  // there are any local loads.
+  SmallVector<int64_t, 4> lbs(bufferShape.size(), 0);
+  SmallVector<int64_t, 4> steps(bufferShape.size(), 1);
+  SmallVector<Value, 4> prefixIVs;
+  for (auto loop : relatedLoops)
+    prefixIVs.push_back(loop.getInductionVar());
+  if (!localLoads.empty()) {
+    if (isScalarBuffer) {
+      Value index = arith::ConstantIndexOp::create(rewriter, loc, 0);
+      Value globalValue =
+          affine::AffineLoadOp::create(rewriter, loc, buffer, prefixIVs);
+      affine::AffineStoreOp::create(rewriter, loc, globalValue, localBuffer,
+                                    index);
+    } else {
+      affine::buildAffineLoopNest(
+          rewriter, loc, lbs, bufferShape, steps,
+          [&](OpBuilder &builder, Location loc, ValueRange ivs) {
+            SmallVector<Value, 4> globalIndices(prefixIVs);
+            llvm::append_range(globalIndices, ivs);
+            Value globalValue = affine::AffineLoadOp::create(
+                builder, loc, buffer, globalIndices);
+            affine::AffineStoreOp::create(builder, loc, globalValue,
+                                          localBuffer, ivs);
+          });
+    }
+  }
+
+  // Epilogue: write back only if localized stores exist.
+  if (!localStores.empty()) {
+    rewriter.setInsertionPoint(axisLoop.getBody()->getTerminator());
+    if (isScalarBuffer) {
+      Value index = arith::ConstantIndexOp::create(rewriter, loc, 0);
+      Value localLoad =
+          affine::AffineLoadOp::create(rewriter, loc, localBuffer, index);
+      affine::AffineStoreOp::create(rewriter, loc, localLoad, buffer,
+                                    prefixIVs);
+    } else {
+      affine::buildAffineLoopNest(
+          rewriter, loc, lbs, bufferShape, steps,
+          [&](OpBuilder &builder, Location loc, ValueRange ivs) {
+            SmallVector<Value, 4> globalIndices(prefixIVs);
+            llvm::append_range(globalIndices, ivs);
+            Value localLoad =
+                affine::AffineLoadOp::create(builder, loc, localBuffer, ivs);
+            affine::AffineStoreOp::create(builder, loc, localLoad, buffer,
+                                          globalIndices);
+          });
+    }
+  }
+
+  SmallVector<Operation *, 8> opsToErase;
+  for (auto loadOp : localLoads) {
+    rewriter.setInsertionPoint(loadOp);
+    auto vMap = getProjectedMapAndOperands(loadOp, prefixIVs);
+    auto newLoad = affine::AffineLoadOp::create(
+        rewriter, loc, localBuffer, vMap.getAffineMap(), vMap.getOperands());
+    rewriter.replaceAllUsesWith(loadOp.getValue(), newLoad.getValue());
+    opsToErase.push_back(loadOp);
+  }
+  for (auto storeOp : localStores) {
+    rewriter.setInsertionPoint(storeOp);
+    auto vMap = getProjectedMapAndOperands(storeOp, prefixIVs);
+    affine::AffineStoreOp::create(rewriter, loc, storeOp.getValueToStore(),
+                                  localBuffer, vMap.getAffineMap(),
+                                  vMap.getOperands());
+    opsToErase.push_back(storeOp);
+  }
+  for (Operation *op : opsToErase)
+    op->erase();
+
+  return DiagnosedSilenceableFailure::success();
+}

@@ -300,6 +300,32 @@ def Allo_ReuseAtOp : Op<Transform_Dialect, "allo.reuse_at",
   ];
 }
 
+def Allo_BufferAtOp : Op<Transform_Dialect, "allo.buffer_at",
+  [NavigationTransformOpTrait, MemoryEffectsOpInterface,
+   DeclareOpInterfaceMethods<TransformOpInterface>,
+   ReportTrackingListenerFailuresOpTrait]> {
+  let summary = "Create a buffer at a given affine loop axis";
+  let description = [{
+    Input:
+      - `$target` resolves to exactly one memref value, or one op with a
+        single memref result.
+      - `$axis` resolves to exactly one `affine.for`.
+
+    Behavior:
+      - Create a temporary buffer and rewrite all accesses of `$target` under the loop stage
+        containing `$axis` to read/write from it.
+      - The original buffer is left unchanged
+
+    Output:
+      - No result handle; this op mutates payload IR in place.
+  }];
+  let arguments = (ins TransformValueHandleTypeInterface:$target, TransformHandleTypeInterface:$axis);
+  let results = (outs);
+  let assemblyFormat = [{
+    $target `at` $axis attr-dict `:` type($target) `,` type($axis)
+  }];
+}
+
 def Allo_TagPipelineOp : Op<Transform_Dialect, "allo.pipeline",
   [NavigationTransformOpTrait, MemoryEffectsOpInterface,
    TransformOpInterface, TransformEachOpTrait,
