@@ -1,28 +1,25 @@
-# Copyright Allo authors. All Rights Reserved.
-# SPDX-License-Identifier: Apache-2.0
-# pylint: disable=import-self
+from typing import TYPE_CHECKING
+from . import _liballo as _C
 
-from typing import TYPE_CHECKING, Any
+__all__ = [
+    "ir",
+    "utils",
+    "arith",
+    "math",
+    "scf",
+    "cf",
+    "ub",
+    "func",
+    "affine",
+    "tensor",
+    "memref",
+    "linalg",
+    "transform",
+]
 
-if TYPE_CHECKING:
-    from . import (
-        ir,
-        arith,
-        math,
-        scf,
-        cf,
-        ub,
-        func,
-        affine,
-        tensor,
-        memref,
-        linalg,
-        allo,
-        transform,
-    )
-else:
-    _PUBLIC_SUBMODULES = (
-        "ir",
+_LAZY_SUBMODULES = frozenset(
+    {
+        "utils",
         "arith",
         "math",
         "scf",
@@ -33,28 +30,40 @@ else:
         "tensor",
         "memref",
         "linalg",
-        "allo",
         "transform",
+    }
+)
+
+if TYPE_CHECKING:
+    from . import (
+        ir,
+        utils,
+        arith,
+        math,
+        scf,
+        cf,
+        ub,
+        func,
+        affine,
+        tensor,
+        memref,
+        linalg,
+        transform,
     )
-    _liballo_module = None
+else:
+    ir = _C.ir
 
-    def _get_liballo_module():
-        global _liballo_module  # pylint: disable=global-statement
-        if _liballo_module is None:
-            from . import _liballo as loaded_module
+    def _load(name: str):
+        mod = _C._load_submodule(name)
+        globals()[name] = mod
+        return mod
 
-            _liballo_module = loaded_module
-        return _liballo_module
-
-    def __getattr__(name: str) -> Any:
-        if name not in _PUBLIC_SUBMODULES:
-            raise AttributeError(f"module '{__name__}' has no attribute '{name}'")
-        liballo = _get_liballo_module()
-        if name == "transform":
-            liballo._initialize_transform_bindings()  # pylint: disable=c-extension-no-member
-        value = getattr(liballo, name)
-        globals()[name] = value
-        return value
+    def __getattr__(name: str):
+        if name == "ir":
+            return ir
+        if name in _LAZY_SUBMODULES:
+            return _load(name)
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
     def __dir__():
-        return sorted(_PUBLIC_SUBMODULES)
+        return sorted(set(globals()) | set(__all__))

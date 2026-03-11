@@ -177,7 +177,7 @@ void init_transform(nb::module_ &m) {
       .def_static(
           "create",
           [](AlloOpBuilder &builder, const std::vector<Value> &handles,
-             bool deduplicate = true) {
+             bool deduplicate = true) -> Value {
             return transform::MergeHandlesOp::create(builder, builder.get_loc(),
                                                      handles, deduplicate);
           },
@@ -202,9 +202,37 @@ void init_transform(nb::module_ &m) {
                 static_cast<uint64_t>(factor));
           },
           nb::arg("builder"), nb::arg("target"), nb::arg("factor"));
-}
 
-void init_allo_transforms(nb::module_ &m) {
+  nb::enum_<allo::PartitionKindEnum>(m, "PartitionKind")
+      .value("Complete", allo::PartitionKindEnum::CompletePartition)
+      .value("Block", allo::PartitionKindEnum::BlockPartition)
+      .value("Cyclic", allo::PartitionKindEnum::CyclicPartition)
+      .export_values();
+
+  nb::class_<allo::PartitionAttr, Attribute>(m, "PartitionAttr")
+      .def_static(
+          "get",
+          [](MLIRContext &context, nb::list subPartitions) {
+            SmallVector<allo::PartitionAxisAttr> partitionAxes;
+            for (nb::handle item : subPartitions) {
+              auto triple = nb::cast<nb::tuple>(item);
+              if (triple.size() != 3) {
+                throw nb::value_error(
+                    "Each sub-partition must be a tuple/list of size 3: (dim, "
+                    "kind, factor).");
+              }
+              int64_t dim = nb::cast<int64_t>(triple[0]);
+              uint32_t kind = nb::cast<uint32_t>(triple[1]);
+              int64_t factor = nb::cast<int64_t>(triple[2]);
+              partitionAxes.push_back(allo::PartitionAxisAttr::get(
+                  &context, static_cast<allo::PartitionKindEnum>(kind), factor,
+                  dim));
+            }
+            return allo::PartitionAttr::get(&context, partitionAxes);
+          },
+          nb::arg("context"), nb::arg("sub_partitions"));
+  PyAttributeRegistry::registerAttr<allo::PartitionAttr>();
+
   nb::class_<transform::RenameOp, OpState>(m, "RenameOp")
       .def_static(
           "create",
@@ -217,7 +245,7 @@ void init_allo_transforms(nb::module_ &m) {
   nb::class_<transform::RaiseToAffineOp, OpState>(m, "RaiseToAffineOp")
       .def_static(
           "create",
-          [](AlloOpBuilder &builder, Value &target) {
+          [](AlloOpBuilder &builder, Value &target) -> Value {
             return transform::RaiseToAffineOp::create(
                 builder, builder.get_loc(), target);
           },
@@ -284,7 +312,7 @@ void init_allo_transforms(nb::module_ &m) {
   nb::class_<transform::LoopFlattenOp, OpState>(m, "LoopFlattenOp")
       .def_static(
           "create",
-          [](AlloOpBuilder &builder, Value &target) {
+          [](AlloOpBuilder &builder, Value &target) -> Value {
             return transform::LoopFlattenOp::create(builder, builder.get_loc(),
                                                     target);
           },
@@ -307,6 +335,15 @@ void init_allo_transforms(nb::module_ &m) {
                                                   producer, consumer);
           },
           nb::arg("builder"), nb::arg("producer"), nb::arg("consumer_loop"));
+
+  nb::class_<transform::BufferAtOp, OpState>(m, "BufferAtOp")
+      .def_static(
+          "create",
+          [](AlloOpBuilder &builder, Value &target, Value &axis) {
+            return transform::BufferAtOp::create(builder, builder.get_loc(),
+                                                 target, axis);
+          },
+          nb::arg("builder"), nb::arg("target"), nb::arg("axis"));
 
   nb::class_<transform::MatchValueOp, OpState>(m, "MatchValueOp")
       .def_static(

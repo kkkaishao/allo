@@ -2798,8 +2798,8 @@ transform::BufferAtOp::apply(transform::TransformRewriter &rewriter,
   if (!sourceIdentifier.empty()) {
     localBuffer->setAttr("allo.value_id",
                          rewriter.getStringAttr(sourceIdentifier + "::local"));
-    localBuffer->setAttr(
-        OpIdentifier, rewriter.getStringAttr(sourceIdentifier + "::local"));
+    localBuffer->setAttr(OpIdentifier,
+                         rewriter.getStringAttr(sourceIdentifier + "::local"));
   }
   results.setValues(cast<OpResult>(getResult()), {localBuffer});
 

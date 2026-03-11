@@ -1,44 +1,66 @@
 #include "ir.h"
 
+using InitFunc = void (*)(nb::module_ &);
+
+struct SubmoduleDesc {
+  std::string_view name;
+  InitFunc init;
+  const char *doc;
+};
+
+static constexpr SubmoduleDesc kSubmodules[] = {
+    {"utils", init_utils, "Utility functions and classes for MLIR"},
+    {"arith", init_arith_ops, "arith dialect"},
+    {"math", init_math_ops, "math dialect"},
+    {"scf", init_scf_ops, "scf dialect"},
+    {"cf", init_cf_ops, "cf dialect"},
+    {"ub", init_ub_ops, "ub dialect"},
+    {"func", init_func_ops, "func dialect"},
+    {"affine", init_affine_ops, "affine dialect"},
+    {"tensor", init_tensor_ops, "tensor dialect"},
+    {"memref", init_memref_ops, "memref dialect"},
+    {"linalg", init_linalg_ops, "linalg dialect"},
+    {"transform", init_transform, "transform dialect"},
+};
+
+static std::once_flag g_ir_once;
+static std::once_flag g_submodule_once[std::size(kSubmodules)];
+
+static nb::module_ ensure_ir_loaded(nb::module_ &parent) {
+  std::call_once(g_ir_once, [&] {
+    auto ir = parent.def_submodule("ir", "core IR");
+    init_ir(ir);
+  });
+  return nb::borrow<nb::module_>(parent.attr("ir"));
+}
+
+static nb::object load_submodule(nb::module_ &parent, std::string_view target) {
+  ensure_ir_loaded(parent);
+
+  for (size_t i = 0; i < std::size(kSubmodules); ++i) {
+    const auto &d = kSubmodules[i];
+    if (d.name != target)
+      continue;
+
+    std::call_once(g_submodule_once[i], [&] {
+      auto sm = parent.def_submodule(d.name.data(), d.doc);
+      d.init(sm);
+    });
+
+    return nb::borrow<nb::object>(parent.attr(d.name.data()));
+  }
+
+  throw nb::attribute_error("unknown submodule");
+}
+
 NB_MODULE(_liballo, m) {
   m.doc() = "Python bindings to the C++ Allo API";
   llvm::sys::PrintStackTraceOnErrorSignal("_liballo");
-  auto ir = m.def_submodule("ir");
-  init_ir(ir);
-  auto arith = m.def_submodule("arith");
-  init_arith_ops(arith);
-  auto math = m.def_submodule("math");
-  init_math_ops(math);
-  auto scf = m.def_submodule("scf");
-  init_scf_ops(scf);
-  auto cf = m.def_submodule("cf");
-  init_cf_ops(cf);
-  auto ub = m.def_submodule("ub");
-  init_ub_ops(ub);
-  auto func = m.def_submodule("func");
-  init_func_ops(func);
-  auto affine = m.def_submodule("affine");
-  init_affine_ops(affine);
-  auto tensor = m.def_submodule("tensor");
-  init_tensor_ops(tensor);
-  auto memref = m.def_submodule("memref");
-  init_memref_ops(memref);
-  auto linalg = m.def_submodule("linalg");
-  init_linalg_ops(linalg);
-  auto allo = m.def_submodule("allo");
-  init_allo_ir(allo);
 
-  // lazy load for perforance
-  m.def("_initialize_transform_bindings", []() {
-    static bool initialized = false;
-    if (initialized)
-      return;
+  ensure_ir_loaded(m);
 
-    auto self = nb::module_::import_("allo.bindings._liballo");
-    auto allo_mod = nb::cast<nb::module_>(self.attr("allo"));
-    init_allo_transforms(allo_mod);
-    auto transform = self.def_submodule("transform");
-    init_transform(transform);
-    initialized = true;
+  m.def("_load_submodule", [](std::string_view name) {
+    auto parent = nb::module_::import_("allo.bindings._liballo");
+    return load_submodule(parent, name);
   });
 }

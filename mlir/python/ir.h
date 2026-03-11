@@ -13,8 +13,10 @@
 #include "nanobind/stl/string.h"
 #include "nanobind/stl/vector.h"
 #include "nanobind/stl/unique_ptr.h"
+#include "nanobind/stl/string_view.h"
 
 #include "mlir/Bytecode/BytecodeWriter.h"
+#include "mlir/Interfaces/MemOpInterfaces.h"
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Bufferization/TransformOps/BufferizationTransformOps.h"
@@ -158,8 +160,7 @@ void init_affine_ops(nb::module_ &m);
 void init_tensor_ops(nb::module_ &m);
 void init_memref_ops(nb::module_ &m);
 void init_linalg_ops(nb::module_ &m);
-void init_allo_ir(nb::module_ &m);
 void init_transform(nb::module_ &m);
-void init_allo_transforms(nb::module_ &m);
+void init_utils(nb::module_ &m);
 
 #endif // ALLO_PYTHON_IR_H

@@ -1,3 +1,4 @@
+from enum import Enum
 from typing import Sequence
 
 from . import ir
@@ -89,6 +90,23 @@ class MatchOp(ir.OpState):
         op_attrs: ir.DictionaryAttr | None = None,
     ) -> ir.Value: ...
 
+class PartitionKind(Enum):
+    Complete = ...
+    Block = ...
+    Cyclic = ...
+
+Complete = PartitionKind.Complete
+Block = PartitionKind.Block
+Cyclic = PartitionKind.Cyclic
+
+class PartitionAttr(ir.Attribute):
+    def __init__(*args, **kwargs): ...
+    @staticmethod
+    def get(
+        context: ir.Context,
+        sub_partitions: Sequence[tuple[int, int, int]],
+    ) -> PartitionAttr: ...
+
 class LoopUnrollOp(ir.OpState):
     def __init__(self, *args, **kwargs): ...
     @staticmethod
@@ -105,7 +123,7 @@ class MergeHandlesOp(ir.OpState):
         builder: ir.AlloOpBuilder,
         handles: Sequence[ir.Value],
         deduplicate: bool = True,
-    ) -> MergeHandlesOp: ...
+    ) -> ir.Value: ...
 
 class SplitHandleOp(ir.OpState):
     def __init__(self, *args, **kwargs): ...
@@ -115,6 +133,125 @@ class SplitHandleOp(ir.OpState):
         handle: ir.Value,
         num_splits: int,
     ) -> SplitHandleOp: ...
+
+class RenameOp(ir.OpState):
+    def __init__(*args, **kwargs): ...
+    @staticmethod
+    def create(
+        builder: ir.AlloOpBuilder,
+        target: ir.Value,
+        name: str,
+    ) -> RenameOp: ...
+
+class RaiseToAffineOp(ir.OpState):
+    def __init__(*args, **kwargs): ...
+    @staticmethod
+    def create(builder: ir.AlloOpBuilder, target: ir.Value) -> ir.Value: ...
+
+class OutlineOp(ir.OpState):
+    def __init__(*args, **kwargs): ...
+    @staticmethod
+    def create(
+        builder: ir.AlloOpBuilder,
+        target: ir.Value,
+        kernel_name: str,
+    ) -> OutlineOp: ...
+
+class TagPipelineOp(ir.OpState):
+    def __init__(*args, **kwargs): ...
+    @staticmethod
+    def create(
+        builder: ir.AlloOpBuilder,
+        target: ir.Value,
+        ii: int,
+    ) -> TagPipelineOp: ...
+
+class TagUnrollOp(ir.OpState):
+    def __init__(*args, **kwargs): ...
+    @staticmethod
+    def create(
+        builder: ir.AlloOpBuilder,
+        target: ir.Value,
+        factor: int,
+    ) -> TagUnrollOp: ...
+
+class LoopReorderOp(ir.OpState):
+    def __init__(*args, **kwargs): ...
+    @staticmethod
+    def create(
+        builder: ir.AlloOpBuilder,
+        target: ir.Value,
+        order: Sequence[int],
+    ) -> LoopReorderOp: ...
+
+class LoopSplitOp(ir.OpState):
+    def __init__(*args, **kwargs): ...
+    @staticmethod
+    def create(
+        builder: ir.AlloOpBuilder,
+        target: ir.Value,
+        factor: int,
+    ) -> LoopSplitOp: ...
+
+class LoopTileOp(ir.OpState):
+    def __init__(*args, **kwargs): ...
+    @staticmethod
+    def create(
+        builder: ir.AlloOpBuilder,
+        target: ir.Value,
+        factors: Sequence[int],
+    ) -> LoopTileOp: ...
+
+class LoopFlattenOp(ir.OpState):
+    def __init__(*args, **kwargs): ...
+    @staticmethod
+    def create(builder: ir.AlloOpBuilder, target: ir.Value) -> ir.Value: ...
+
+class ReuseAtOp(ir.OpState):
+    def __init__(*args, **kwargs): ...
+    @staticmethod
+    def create(
+        builder: ir.AlloOpBuilder,
+        target: ir.Value,
+        axis: ir.Value,
+    ) -> ReuseAtOp: ...
+
+class ComputeAtOp(ir.OpState):
+    def __init__(*args, **kwargs): ...
+    @staticmethod
+    def create(
+        builder: ir.AlloOpBuilder,
+        producer: ir.Value,
+        consumer_loop: ir.Value,
+    ) -> ComputeAtOp: ...
+
+class BufferAtOp(ir.OpState):
+    def __init__(*args, **kwargs): ...
+    @staticmethod
+    def create(
+        builder: ir.AlloOpBuilder,
+        target: ir.Value,
+        consumer_loop: ir.Value,
+    ) -> BufferAtOp: ...
+
+class MatchValueOp(ir.OpState):
+    def __init__(*args, **kwargs): ...
+    @staticmethod
+    def create(
+        builder: ir.AlloOpBuilder,
+        target: ir.Value,
+        index: int,
+        source_kind: int = 0,
+    ) -> ir.Value: ...
+
+class PartitionOp(ir.OpState):
+    def __init__(*args, **kwargs): ...
+    @staticmethod
+    def create(
+        builder: ir.AlloOpBuilder,
+        target: ir.Value,
+        partition: PartitionAttr,
+    ) -> PartitionOp: ...
 
 def apply_transforms(
     payload: ir.Operation,

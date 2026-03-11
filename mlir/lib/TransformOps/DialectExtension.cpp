@@ -169,11 +169,11 @@ PartitionAttr mergePartitionAttrs(PartitionAttr a, PartitionAttr b) {
   auto partB = b.getPartitions();
   std::map<int64_t, std::pair<PartitionKindEnum, int64_t>> partMap;
   // init with A
-  for (auto part : partB) {
+  for (auto part : partA) {
     partMap[part.getDim()] = {part.getKind(), part.getFactor()};
   }
   // merge B to A
-  for (auto part : partA) {
+  for (auto part : partB) {
     partMap[part.getDim()] = {part.getKind(), part.getFactor()};
   }
   // part map is an ordered map

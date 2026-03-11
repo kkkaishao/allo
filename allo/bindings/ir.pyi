@@ -82,8 +82,6 @@ class IndexType(Type):
     def __init__(*args, **kwargs): ...
     @staticmethod
     def get(context: Context) -> IndexType: ...
-    @staticmethod
-    def isa(ty: Type) -> bool: ...
 
 class IntegerType(Type):
     def __init__(*args, **kwargs): ...
@@ -386,39 +384,3 @@ class DictionaryAttr(Attribute):
     def __init__(*args, **kwargs): ...
     @staticmethod
     def get(context: Context, d: Dict[str, Attribute]) -> DictionaryAttr: ...
-
-def verify(arg: Operation, /) -> bool: ...
-
-OP_IDENTIFIER_ATTR_NAME: str
-
-def parse_proxy_tree(module: ModuleOp) -> ProxyNode: ...
-def complete_op_identifiers(
-    module: ModuleOp, overwrite: bool = False
-) -> Dict[str, int]: ...
-def finalize_transform(module: ModuleOp) -> Dict[str, int]: ...
-def parse_from_string(context: Context, s: str) -> ModuleOp: ...
-def parse_from_file(context: Context, filename: str) -> ModuleOp: ...
-@dataclass
-class ProxyNode:
-    parent: ProxyNode | None
-    children: list[ProxyNode]
-    values: list[ProxyValueInfo]
-    op: Operation
-    op_kind: str
-    hierarchy_name: str
-    op_identifier: str
-    def __str__(self): ...
-
-@dataclass
-class ProxyValueInfo:
-    value: Value
-    value_identifier: str
-    owner_op_identifier: str
-    owner_op_kind: str
-    source_kind: str
-    source_index: int
-    type_str: str
-    is_memref: bool
-    root_kind: str
-    root_owner_identifier: str
-    root_arg_number: int
