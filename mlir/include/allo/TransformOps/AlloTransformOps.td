@@ -317,13 +317,19 @@ def Allo_BufferAtOp : Op<Transform_Dialect, "allo.buffer_at",
       - The original buffer is left unchanged
 
     Output:
-      - No result handle; this op mutates payload IR in place.
+      - Result is the created buffer handle.
   }];
   let arguments = (ins TransformValueHandleTypeInterface:$target, TransformHandleTypeInterface:$axis);
-  let results = (outs);
+  let results = (outs TransformValueHandleTypeInterface:$result);
   let assemblyFormat = [{
-    $target `at` $axis attr-dict `:` type($target) `,` type($axis)
+    $target `at` $axis attr-dict `:` functional-type(operands, results)
   }];
+  let builders = [
+    OpBuilder<(ins "Value":$target, "Value":$axis), [{
+      auto anyType = transform::AnyValueType::get($_builder.getContext());
+      build($_builder, $_state, anyType, target, axis);
+    }]>
+  ];
 }
 
 def Allo_TagPipelineOp : Op<Transform_Dialect, "allo.pipeline",
