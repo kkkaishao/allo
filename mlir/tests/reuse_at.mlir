@@ -61,10 +61,24 @@ module attributes {transform.with_named_sequence} {
 // CHECK:         affine.store %{{.*}}, %[[REUSE]][%{{.*}}] : memref<3xi32>
 // CHECK:       affine.for %{{.*}} = 0 to 1 {
 // CHECK:         affine.store %{{.*}}, %[[REUSE]][%{{.*}}] : memref<3xi32>
-// CHECK:     %{{.*}} = affine.if
+// CHECK-NOT: = affine.if #set1
+// CHECK:     affine.if #set1(
 // CHECK:       %{{.*}} = affine.load %[[SRC]][%{{.*}}, %{{.*}}] : memref<8x8xi32>
+// CHECK:       affine.store %{{.*}}, %[[REUSE]][%{{.*}}] : memref<3xi32>
+// CHECK:       %{{.*}} = affine.load %[[SRC]][%{{.*}}, %{{.*}} + 1] : memref<8x8xi32>
+// CHECK:       affine.store %{{.*}}, %[[REUSE]][%{{.*}}] : memref<3xi32>
+// CHECK:       %{{.*}} = affine.load %[[SRC]][%{{.*}}, %{{.*}} + 2] : memref<8x8xi32>
+// CHECK:       affine.store %{{.*}}, %[[REUSE]][%{{.*}}] : memref<3xi32>
+// CHECK:       %{{.*}} = arith.addi %{{.*}}, %{{.*}} : i32
+// CHECK:       %{{.*}} = arith.addi %{{.*}}, %{{.*}} : i32
+// CHECK:       affine.store %{{.*}}, %arg0[%{{.*}}, %{{.*}}] : memref<8x6xi32>
 // CHECK:     } else {
 // CHECK:       %{{.*}} = affine.load %[[REUSE]][%{{.*}}] : memref<3xi32>
+// CHECK:       %{{.*}} = affine.load %[[REUSE]][%{{.*}}] : memref<3xi32>
+// CHECK:       %{{.*}} = affine.load %[[REUSE]][%{{.*}}] : memref<3xi32>
+// CHECK:       %{{.*}} = arith.addi %{{.*}}, %{{.*}} : i32
+// CHECK:       %{{.*}} = arith.addi %{{.*}}, %{{.*}} : i32
+// CHECK:       affine.store %{{.*}}, %arg0[%{{.*}}, %{{.*}}] : memref<8x6xi32>
 func.func @reuse_at_basic_no_ring(%out: memref<8x6xi32>) {
   %plain_buf = memref.alloc() {sym_name = "plain_buf"} : memref<8x8xi32>
   affine.for %y = 0 to 8 {

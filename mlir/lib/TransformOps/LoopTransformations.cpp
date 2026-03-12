@@ -20,10 +20,12 @@
 #include "mlir/Dialect/SCF/Transforms/Transforms.h"
 #include "mlir/Dialect/SCF/Utils/Utils.h"
 #include "mlir/IR/IntegerSet.h"
+#include "mlir/IR/PatternMatch.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
+#include "mlir/Transforms/CSE.h"
+#include "mlir/Transforms/GreedyPatternRewriteDriver.h"
+#include "mlir/Transforms/Passes.h"
 #include "llvm/ADT/DenseSet.h"
-
-#include <cstdlib>
 
 using namespace mlir;
 using namespace mlir::allo;
@@ -662,7 +664,7 @@ transform::LoopTileOp::apply(transform::TransformRewriter &rewriter,
             AffineMap composed = addMap.compose(applyOp.getAffineMap());
             SmallVector<AffineExpr, 2> exprs{ubMap.getResult(0),
                                              composed.getResult(0)};
-            AffineMap finalMap = AffineMap::get(
+            auto finalMap = AffineMap::get(
                 /*dimCount=*/1, /*symbolCount=*/0, exprs,
                 rewriter.getContext());
             loop.setUpperBound(outerIV, finalMap);
@@ -1726,7 +1728,7 @@ struct NoRingReuseWrapper {
 
 static std::optional<NoRingReuseWrapper>
 matchNoRingReuseWrapper(affine::AffineIfOp ifOp, Value target) {
-  if (!ifOp.getElseBlock() || ifOp.getNumResults() != 1)
+  if (!ifOp.hasElse() || ifOp.getNumResults() != 1)
     return std::nullopt;
 
   auto *thenTerminator = ifOp.getThenBlock()->getTerminator();
@@ -1746,9 +1748,9 @@ matchNoRingReuseWrapper(affine::AffineIfOp ifOp, Value target) {
     return std::nullopt;
 
   auto thenLoad = dyn_cast<affine::AffineLoadOp>(&*thenIt++);
-  auto thenStore =
-      thenIt == thenOps.end() ? affine::AffineStoreOp() :
-                                dyn_cast<affine::AffineStoreOp>(&*thenIt++);
+  auto thenStore = thenIt == thenOps.end()
+                       ? affine::AffineStoreOp()
+                       : dyn_cast<affine::AffineStoreOp>(&*thenIt++);
   auto elseLoad = dyn_cast<affine::AffineLoadOp>(&*elseIt++);
   if (!thenLoad || !thenStore || !elseLoad || thenIt != thenOps.end() ||
       elseIt != elseOps.end()) {
@@ -1791,15 +1793,16 @@ static bool valueDependsOnTargetLoad(Value value, Value target,
         auto yieldOp = dyn_cast<affine::AffineYieldOp>(block->getTerminator());
         if (!yieldOp || resultNumber >= yieldOp.getNumOperands())
           return false;
-        return valueDependsOnTargetLoad(yieldOp.getOperand(resultNumber), target,
-                                        cache, visiting);
+        return valueDependsOnTargetLoad(yieldOp.getOperand(resultNumber),
+                                        target, cache, visiting);
       };
       depends = yieldedDependsOnTarget(ifOp.getThenBlock()) ||
                 yieldedDependsOnTarget(ifOp.getElseBlock());
     } else {
-      depends = llvm::any_of(result.getOwner()->getOperands(), [&](Value operand) {
-        return valueDependsOnTargetLoad(operand, target, cache, visiting);
-      });
+      depends =
+          llvm::any_of(result.getOwner()->getOperands(), [&](Value operand) {
+            return valueDependsOnTargetLoad(operand, target, cache, visiting);
+          });
     }
   } else if (Operation *defOp = value.getDefiningOp()) {
     depends = llvm::any_of(defOp->getOperands(), [&](Value operand) {
@@ -1940,65 +1943,64 @@ collectReuseAccesses(affine::AffineForOp axisLoop, Value target,
   collectReuseInnerLoops(axisLoop, innerLoops);
 
   Value targetRoot = resolveMemRefValueRoot(target);
-  WalkResult walk =
-      axisLoop.walk<WalkOrder::PreOrder>([&](Operation *op) -> WalkResult {
-        if (auto ifOp = dyn_cast<affine::AffineIfOp>(op)) {
-          if (auto wrapper = matchNoRingReuseWrapper(ifOp, target)) {
-            accesses.push_back(
-                composeBufferAccess(wrapper->elseLoad.getOperation()));
-            return WalkResult::skip();
-          }
-        }
+  WalkResult walk = axisLoop.walk<WalkOrder::PreOrder>([&](Operation *op)
+                                                           -> WalkResult {
+    if (auto ifOp = dyn_cast<affine::AffineIfOp>(op)) {
+      if (auto wrapper = matchNoRingReuseWrapper(ifOp, target)) {
+        accesses.push_back(
+            composeBufferAccess(wrapper->elseLoad.getOperation()));
+        return WalkResult::skip();
+      }
+    }
 
-        Value memref;
-        if (auto readOp = dyn_cast<affine::AffineReadOpInterface>(op)) {
-          memref = readOp.getMemRef();
-          if (memref == target)
-            accesses.push_back(composeBufferAccess(op));
-        } else if (auto writeOp =
-                       dyn_cast<affine::AffineWriteOpInterface>(op)) {
-          memref = writeOp.getMemRef();
-          if (resolveMemRefValueRoot(memref) == targetRoot) {
-            auto diag = axisLoop.emitError()
-                        << "reuse_at requires the target buffer to be read-only "
-                           "within the selected axis loop";
-            diag.attachNote(writeOp->getLoc()) << "see write op here";
-            return WalkResult::interrupt();
-          }
-        } else if (auto loadOp = dyn_cast<memref::LoadOp>(op)) {
-          memref = loadOp.getMemRef();
-          if (resolveMemRefValueRoot(memref) == targetRoot) {
-            auto diag = emitError(targetRoot.getLoc())
-                        << "reuse_at only supports affine.load accesses to the "
-                           "target buffer";
-            diag.attachNote(loadOp.getLoc()) << "see memref.load op here";
-            return WalkResult::interrupt();
-          }
-        } else if (auto storeOp = dyn_cast<memref::StoreOp>(op)) {
-          memref = storeOp.getMemRef();
-          if (resolveMemRefValueRoot(memref) == targetRoot) {
-            auto diag = axisLoop.emitError()
-                        << "reuse_at requires the target buffer to be read-only "
-                           "within the selected axis loop";
-            diag.attachNote(storeOp.getLoc()) << "see memref.store op here";
-            return WalkResult::interrupt();
-          }
-        } else if (isMemRefCastOrViewLike(op)) {
-          bool aliasesTarget = llvm::any_of(op->getResults(), [&](Value result) {
-            return isa<BaseMemRefType>(result.getType()) &&
-                   resolveMemRefValueRoot(result) == targetRoot;
-          });
-          if (aliasesTarget) {
-            auto diag = axisLoop.emitError()
-                        << "reuse_at does not support aliasing/view accesses "
-                           "to the "
-                           "target buffer within the selected axis loop";
-            diag.attachNote(op->getLoc()) << "see aliasing/view op here";
-            return WalkResult::interrupt();
-          }
-        }
-        return WalkResult::advance();
+    Value memref;
+    if (auto readOp = dyn_cast<affine::AffineReadOpInterface>(op)) {
+      memref = readOp.getMemRef();
+      if (memref == target)
+        accesses.push_back(composeBufferAccess(op));
+    } else if (auto writeOp = dyn_cast<affine::AffineWriteOpInterface>(op)) {
+      memref = writeOp.getMemRef();
+      if (resolveMemRefValueRoot(memref) == targetRoot) {
+        auto diag = axisLoop.emitError()
+                    << "reuse_at requires the target buffer to be read-only "
+                       "within the selected axis loop";
+        diag.attachNote(writeOp->getLoc()) << "see write op here";
+        return WalkResult::interrupt();
+      }
+    } else if (auto loadOp = dyn_cast<memref::LoadOp>(op)) {
+      memref = loadOp.getMemRef();
+      if (resolveMemRefValueRoot(memref) == targetRoot) {
+        auto diag = emitError(targetRoot.getLoc())
+                    << "reuse_at only supports affine.load accesses to the "
+                       "target buffer";
+        diag.attachNote(loadOp.getLoc()) << "see memref.load op here";
+        return WalkResult::interrupt();
+      }
+    } else if (auto storeOp = dyn_cast<memref::StoreOp>(op)) {
+      memref = storeOp.getMemRef();
+      if (resolveMemRefValueRoot(memref) == targetRoot) {
+        auto diag = axisLoop.emitError()
+                    << "reuse_at requires the target buffer to be read-only "
+                       "within the selected axis loop";
+        diag.attachNote(storeOp.getLoc()) << "see memref.store op here";
+        return WalkResult::interrupt();
+      }
+    } else if (isMemRefCastOrViewLike(op)) {
+      bool aliasesTarget = llvm::any_of(op->getResults(), [&](Value result) {
+        return isa<BaseMemRefType>(result.getType()) &&
+               resolveMemRefValueRoot(result) == targetRoot;
       });
+      if (aliasesTarget) {
+        auto diag = axisLoop.emitError()
+                    << "reuse_at does not support aliasing/view accesses "
+                       "to the "
+                       "target buffer within the selected axis loop";
+        diag.attachNote(op->getLoc()) << "see aliasing/view op here";
+        return WalkResult::interrupt();
+      }
+    }
+    return WalkResult::advance();
+  });
 
   if (walk.wasInterrupted())
     return failure();
@@ -2348,10 +2350,10 @@ static Value materializeGlobalAccessIndex(OpBuilder &builder, Location loc,
 static affine::AffineForOp createConstantAffineFor(OpBuilder &builder,
                                                    Location loc, int64_t lb,
                                                    int64_t ub) {
-  AffineMap lowerMap = AffineMap::get(/*dimCount=*/0, /*symbolCount=*/0,
-                                      builder.getAffineConstantExpr(lb));
-  AffineMap upperMap = AffineMap::get(/*dimCount=*/0, /*symbolCount=*/0,
-                                      builder.getAffineConstantExpr(ub));
+  auto lowerMap = AffineMap::get(/*dimCount=*/0, /*symbolCount=*/0,
+                                 builder.getAffineConstantExpr(lb));
+  auto upperMap = AffineMap::get(/*dimCount=*/0, /*symbolCount=*/0,
+                                 builder.getAffineConstantExpr(ub));
   return affine::createCanonicalizedAffineForOp(
       builder, loc, /*lbOperands=*/ValueRange{}, lowerMap,
       /*ubOperands=*/ValueRange{}, upperMap, /*step=*/1);
@@ -2397,6 +2399,7 @@ static void generateReuseStateShift(OpBuilder &builder, Location loc,
 
   OpBuilder::InsertionGuard guard(builder);
   SmallVector<Value, 4> loopIvs(plan.keptDims.size());
+  SmallVector<affine::AffineForOp, 4> shiftLoops;
   for (auto [reusePos, dim] : llvm::enumerate(plan.keptDims)) {
     int64_t lb = 0;
     int64_t ub = plan.shape[reusePos];
@@ -2412,6 +2415,7 @@ static void generateReuseStateShift(OpBuilder &builder, Location loc,
     builder.setInsertionPoint(
         forOp.getBody(), Block::iterator(forOp.getBody()->getTerminator()));
     loopIvs[reusePos] = forOp.getInductionVar();
+    shiftLoops.push_back(forOp);
   }
 
   SmallVector<Value, 4> srcIndices = loopIvs;
@@ -2422,6 +2426,11 @@ static void generateReuseStateShift(OpBuilder &builder, Location loc,
   Value shifted =
       affine::AffineLoadOp::create(builder, loc, reuseBuffer, srcIndices);
   affine::AffineStoreOp::create(builder, loc, shifted, reuseBuffer, dstIndices);
+  // fully unroll shifting logic
+  for (auto loop : shiftLoops) {
+    auto ret = affine::loopUnrollFull(loop);
+    assert(succeeded(ret) && "expected to fully unroll shifting loops");
+  }
 }
 
 static Value buildModuloOffsetValue(OpBuilder &builder, Location loc, Value lhs,
@@ -2491,6 +2500,7 @@ static void generateReuseStateRefill(OpBuilder &builder, Location loc,
   OpBuilder::InsertionGuard guard(builder);
   SmallVector<Value, 4> logicalIndices(plan.keptDims.size());
   Value physicalSlidingIndex;
+  SmallVector<affine::AffineForOp, 4> refillLoops;
   if (slidingReusePos >= 0) {
     affine::AffineForOp enteringFaceFor = createConstantAffineFor(
         builder, loc, /*lb=*/0, /*ub=*/executionPlan.slidingStepAbs);
@@ -2507,6 +2517,7 @@ static void generateReuseStateRefill(OpBuilder &builder, Location loc,
           builder, loc, ringHead, logicalIndices[slidingReusePos],
           slidingExtent);
     }
+    refillLoops.push_back(enteringFaceFor);
   }
 
   for (auto [reusePos, dim] : llvm::enumerate(plan.keptDims)) {
@@ -2518,6 +2529,7 @@ static void generateReuseStateRefill(OpBuilder &builder, Location loc,
     builder.setInsertionPoint(
         forOp.getBody(), Block::iterator(forOp.getBody()->getTerminator()));
     logicalIndices[reusePos] = forOp.getInductionVar();
+    refillLoops.push_back(forOp);
   }
 
   SmallVector<Value, 4> globalIndices(plan.dims.size());
@@ -2543,6 +2555,11 @@ static void generateReuseStateRefill(OpBuilder &builder, Location loc,
   }
   affine::AffineStoreOp::create(builder, loc, loaded, reuseBuffer,
                                 logicalIndices);
+
+  for (auto loop : refillLoops) {
+    auto ret = affine::loopUnrollFull(loop);
+    assert(succeeded(ret) && "expected to fully unroll refilling loops");
+  }
 }
 
 static Value createConditionalReuseLoad(OpBuilder &builder, Location loc,
@@ -2555,7 +2572,7 @@ static Value createConditionalReuseLoad(OpBuilder &builder, Location loc,
   SmallVector<Value, 4> logicalIndices =
       materializeLogicalReuseIndices(builder, loc, plan, access, stateOperands);
 
-  IntegerSet warmupSet = IntegerSet::get(
+  auto warmupSet = IntegerSet::get(
       /*dimCount=*/1, /*symbolCount=*/0,
       ArrayRef<AffineExpr>{builder.getAffineDimExpr(0)}, ArrayRef<bool>{true});
   auto ifOp = affine::AffineIfOp::create(
@@ -2588,6 +2605,267 @@ static Value createConditionalReuseLoad(OpBuilder &builder, Location loc,
   }
 
   return ifOp.getResult(0);
+}
+
+namespace {
+struct MergeSameAffineIfsPattern
+    : public OpRewritePattern<affine::AffineForOp> {
+  using OpRewritePattern::OpRewritePattern;
+  using AdjacentIfList = SmallVector<affine::AffineIfOp, 4>;
+
+private:
+  static bool haveSameIfStructure(affine::AffineIfOp lhs,
+                                  affine::AffineIfOp rhs) {
+    return lhs.getIntegerSet() == rhs.getIntegerSet() &&
+           llvm::equal(lhs.getOperands(), rhs.getOperands()) &&
+           lhs.hasElse() == rhs.hasElse() &&
+           lhs->getNumResults() == rhs.getNumResults();
+  }
+
+  static SmallVector<AdjacentIfList, 4>
+  collectAdjacentIfLists(affine::AffineForOp forOp) {
+    SmallVector<AdjacentIfList, 4> ifLists;
+    AdjacentIfList currentList;
+    for (Operation &op : forOp.getBody()->getOperations()) {
+      if (auto ifOp = dyn_cast<affine::AffineIfOp>(op)) {
+        if (!currentList.empty() &&
+            !haveSameIfStructure(currentList.back(), ifOp)) {
+          if (currentList.size() > 1)
+            ifLists.push_back(std::move(currentList));
+          currentList.clear();
+        }
+        currentList.push_back(ifOp);
+      } else {
+        if (currentList.size() > 1)
+          ifLists.push_back(std::move(currentList));
+        currentList.clear();
+      }
+    }
+    if (currentList.size() > 1)
+      ifLists.push_back(std::move(currentList));
+    return ifLists;
+  }
+
+  void mergeAdjacentIfs(AdjacentIfList &ifOps, affine::AffineForOp parentOp,
+                        PatternRewriter &rewriter) const {
+    // ifs can not use each others results
+    for (auto ifOp : ifOps) {
+      for (auto result : ifOp.getResults()) {
+        for (Operation *user : result.getUsers()) {
+          if (llvm::is_contained(ifOps, user->getParentOp()))
+            return;
+        }
+      }
+    }
+
+    // merge the ifs
+    IRMapping mapping;
+    auto firstIf = ifOps.front();
+    if (!firstIf.hasElse() ||
+        firstIf->getNumResults() != 1) // we only merge reuse_at accesses
+      return;
+
+    rewriter.setInsertionPoint(firstIf);
+    Location loc = parentOp.getLoc();
+    // create a free block
+    Block *thenBlock = rewriter.createBlock(parentOp.getBody());
+    rewriter.setInsertionPointToStart(thenBlock);
+    SmallVector<Value, 4> thenResults;
+    SmallVector<Type, 4> resultTypes;
+    for (auto ifOp : ifOps) {
+      Block *thenBlock = ifOp.getThenBlock();
+      // clone without mapping since the ifs can not use each others results
+      for (Operation &op : thenBlock->without_terminator())
+        rewriter.clone(op, mapping);
+      auto yieldOp = cast<affine::AffineYieldOp>(thenBlock->getTerminator());
+      for (auto result : yieldOp.getOperands()) {
+        thenResults.push_back(mapping.lookupOrDefault(result));
+        resultTypes.push_back(result.getType());
+      }
+    }
+    // create a single yield op with all results
+    affine::AffineYieldOp::create(rewriter, loc, thenResults);
+
+    Block *elseBlock = rewriter.createBlock(parentOp.getBody());
+    rewriter.setInsertionPointToStart(elseBlock);
+    SmallVector<Value, 4> elseResults;
+    for (auto ifOp : ifOps) {
+      Block *elseBlock = ifOp.getElseBlock();
+      for (Operation &op : elseBlock->without_terminator())
+        rewriter.clone(op, mapping);
+      auto yieldOp = cast<affine::AffineYieldOp>(elseBlock->getTerminator());
+      for (auto result : yieldOp.getOperands())
+        elseResults.push_back(mapping.lookupOrDefault(result));
+    }
+    affine::AffineYieldOp::create(rewriter, loc, elseResults);
+    assert(thenResults.size() == elseResults.size() &&
+           "expected same number of results from then and else blocks");
+
+    rewriter.setInsertionPoint(firstIf);
+    auto mergedIf = affine::AffineIfOp::create(rewriter, loc, resultTypes,
+                                               firstIf.getCondition(),
+                                               firstIf.getOperands(), true);
+
+    rewriter.mergeBlocks(thenBlock, mergedIf.getThenBlock());
+    rewriter.mergeBlocks(elseBlock, mergedIf.getElseBlock());
+
+    // replace uses of original ifs
+    unsigned resultIdx = 0;
+    for (auto ifOp : ifOps) {
+      for (auto [idx, result] : llvm::enumerate(ifOp.getResults())) {
+        rewriter.replaceAllUsesWith(result,
+                                    mergedIf.getResult(resultIdx + idx));
+      }
+      resultIdx += ifOp.getNumResults();
+    }
+    // erase original ifs
+    for (auto ifOp : ifOps)
+      rewriter.eraseOp(ifOp);
+  }
+
+public:
+  LogicalResult matchAndRewrite(affine::AffineForOp forOp,
+                                PatternRewriter &rewriter) const override {
+    auto adjacentIfLists = collectAdjacentIfLists(forOp);
+    for (auto &list : adjacentIfLists) {
+      mergeAdjacentIfs(list, forOp, rewriter);
+    }
+    return success();
+  }
+};
+
+struct MergeStoreIntoAffineIfPattern : OpRewritePattern<affine::AffineIfOp> {
+  using OpRewritePattern<affine::AffineIfOp>::OpRewritePattern;
+
+private:
+  static FailureOr<affine::AffineStoreOp>
+  collectSingleStoreSlice(affine::AffineIfOp ifOp,
+                          SmallVectorImpl<Operation *> &intermediates) {
+    llvm::SmallDenseSet<Operation *, 4> visited;
+    SmallVector<Operation *, 8> worklist;
+    for (Value v : ifOp.getResults()) {
+      llvm::append_range(worklist, v.getUsers());
+    }
+    affine::AffineStoreOp foundStore = nullptr;
+
+    while (!worklist.empty()) {
+      Operation *op = worklist.pop_back_val();
+      if (!visited.insert(op).second)
+        continue;
+      if (op->getBlock() != ifOp->getBlock())
+        return failure(); // require in the same block
+
+      if (foundStore && foundStore->isBeforeInBlock(op))
+        return failure(); // reject if any uses after store
+
+      if (auto store = dyn_cast<affine::AffineStoreOp>(op)) {
+        if (foundStore && foundStore != store)
+          return failure(); // multiple sinks, ignore
+        foundStore = store;
+        intermediates.push_back(op);
+        continue;
+      }
+
+      if (!isMemoryEffectFree(op))
+        return failure(); // require no mem effects
+
+      intermediates.push_back(op);
+      for (Value res : op->getResults()) {
+        llvm::append_range(worklist, res.getUsers());
+      }
+    }
+    llvm::sort(intermediates, [](Operation *a, Operation *b) {
+      return a->isBeforeInBlock(b);
+    });
+    if (!foundStore)
+      return failure(); // require at least one store
+    return foundStore;
+  }
+
+  static void
+  cloneIntermediatesIntoBranch(SmallVectorImpl<Operation *> &intermediates,
+                               Block *src, Block *dst, affine::AffineIfOp ifOp,
+                               PatternRewriter &rewriter) {
+    IRMapping mapping;
+    rewriter.setInsertionPointToStart(dst);
+    for (Operation &op : src->without_terminator())
+      rewriter.clone(op, mapping);
+    // map yield operands
+    auto yield = cast<affine::AffineYieldOp>(src->getTerminator());
+    for (OpOperand &v : yield->getOpOperands())
+      mapping.map(ifOp->getResult(v.getOperandNumber()),
+                  mapping.lookupOrDefault(v.get()));
+    // clone intermediates to block
+    for (Operation *op : intermediates)
+      rewriter.clone(*op, mapping);
+  }
+
+public:
+  LogicalResult matchAndRewrite(affine::AffineIfOp ifOp,
+                                PatternRewriter &rewriter) const override {
+    if (ifOp.getNumResults() == 0)
+      return failure();
+
+    SmallVector<Operation *, 4> intermediates;
+    auto foundStoreOr = collectSingleStoreSlice(ifOp, intermediates);
+    if (failed(foundStoreOr))
+      return failure();
+    affine::AffineStoreOp foundStore = *foundStoreOr;
+
+    auto thenYield =
+        cast<affine::AffineYieldOp>(ifOp.getThenBlock()->getTerminator());
+    auto elseYield =
+        cast<affine::AffineYieldOp>(ifOp.getElseBlock()->getTerminator());
+
+    rewriter.setInsertionPoint(ifOp);
+    auto newIf = affine::AffineIfOp::create(
+        rewriter, ifOp->getLoc(), ifOp.getCondition(), ifOp.getOperands(),
+        /*withElseRegion=*/true);
+
+    // clone then region
+    cloneIntermediatesIntoBranch(intermediates, ifOp.getThenBlock(),
+                                 newIf.getThenBlock(), ifOp, rewriter);
+    // clone else region
+    cloneIntermediatesIntoBranch(intermediates, ifOp.getElseBlock(),
+                                 newIf.getElseBlock(), ifOp, rewriter);
+
+    // remove intermediates
+    for (Operation *op : llvm::reverse(intermediates))
+      rewriter.eraseOp(op);
+    rewriter.eraseOp(ifOp);
+
+    return success();
+  }
+};
+} // namespace
+
+static bool hasReuseAtUsers(OpResult handle) {
+  return llvm::any_of(handle.getUsers(), [](Operation *user) {
+    return isa<transform::ReuseAtOp>(user);
+  });
+}
+
+static void runReuseAtPostCleanup(RewriterBase &rewriter,
+                                  affine::AffineForOp axisLoop) {
+  DominanceInfo dom(axisLoop->getParentOp());
+  RewritePatternSet patterns(rewriter.getContext());
+  auto funcOp = axisLoop->getParentOfType<FunctionOpInterface>();
+  // cse + canonicalize
+  eliminateCommonSubExpressions(rewriter, dom, funcOp);
+  MLIRContext *context = rewriter.getContext();
+  for (auto *dialect : context->getLoadedDialects())
+    dialect->getCanonicalizationPatterns(patterns);
+  for (RegisteredOperationName op : context->getRegisteredOperations())
+    op.getCanonicalizationPatterns(patterns, context);
+  (void)applyPatternsGreedily(funcOp, std::move(patterns));
+  patterns.clear();
+  // merge same affine.ifs
+  patterns.add<MergeSameAffineIfsPattern>(rewriter.getContext());
+  (void)applyPatternsGreedily(funcOp, std::move(patterns));
+  patterns.clear();
+  // merge store
+  patterns.add<MergeStoreIntoAffineIfPattern>(rewriter.getContext());
+  (void)applyPatternsGreedily(funcOp, std::move(patterns));
 }
 
 static Value materializeGlobalAccessIndex(OpBuilder &builder, Location loc,
@@ -2707,7 +2985,7 @@ transform::ReuseAtOp::apply(transform::TransformRewriter &rewriter,
 
   rewriter.setInsertionPointToStart(axisLoop.getBody());
   Value currentIterationRingHead;
-  IntegerSet steadyStateSet = IntegerSet::get(
+  auto steadyStateSet = IntegerSet::get(
       /*dimCount=*/1, /*symbolCount=*/0,
       ArrayRef<AffineExpr>{rewriter.getAffineDimExpr(0) -
                            executionPlan.steadyStateStart},
@@ -2762,6 +3040,9 @@ transform::ReuseAtOp::apply(transform::TransformRewriter &rewriter,
         stateOperands, axisIV, currentIterationRingHead);
     rewriter.replaceOp(access.op, rewritten);
   }
+
+  if (!hasReuseAtUsers(cast<OpResult>(getResult())))
+    runReuseAtPostCleanup(rewriter, axisLoop);
 
   results.setValues(cast<OpResult>(getResult()), {reuseBuffer});
   return DiagnosedSilenceableFailure::success();
@@ -3153,8 +3434,8 @@ static void generateBufferAtCopy(OpBuilder &builder, Location loc,
     globalIndices.push_back(forOp.getInductionVar());
   }
 
-  AffineMap localMap = AffineMap::get(2 * rank, /*symbolCount=*/0, localExprs,
-                                      builder.getContext());
+  auto localMap = AffineMap::get(2 * rank, /*symbolCount=*/0, localExprs,
+                                 builder.getContext());
   affine::fullyComposeAffineMapAndOperands(&localMap, &localOperands);
   localMap = simplifyAffineMap(localMap);
   affine::canonicalizeMapAndOperands(&localMap, &localOperands);
