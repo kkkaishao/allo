@@ -270,7 +270,7 @@ def Allo_ComputeAtOp : Op<Transform_Dialect, "allo.compute_at",
 }
 
 def Allo_ReuseAtOp : Op<Transform_Dialect, "allo.reuse_at",
-  [FunctionalStyleTransformOpTrait, MemoryEffectsOpInterface,
+  [NavigationTransformOpTrait, MemoryEffectsOpInterface,
    DeclareOpInterfaceMethods<TransformOpInterface>,
    ReportTrackingListenerFailuresOpTrait]> {
   let summary = "Create a reuse buffer at a given affine loop axis";
@@ -287,14 +287,17 @@ def Allo_ReuseAtOp : Op<Transform_Dialect, "allo.reuse_at",
     Output:
       - `$result` is the created reuse buffer handle.
   }];
-  let arguments = (ins TransformValueHandleTypeInterface:$target, TransformHandleTypeInterface:$axis);
-  let results = (outs TransformHandleTypeInterface:$result);
+  let arguments = (ins
+    TransformValueHandleTypeInterface:$target,
+    TransformHandleTypeInterface:$axis,
+    UnitAttr:$use_ring_buffer);
+  let results = (outs TransformValueHandleTypeInterface:$result);
   let assemblyFormat = [{
-    $target `at` $axis attr-dict `:` functional-type(operands, results)
+    $target `at` $axis (`ring` $use_ring_buffer^)? attr-dict `:` functional-type(operands, results)
   }];
   let builders = [
     OpBuilder<(ins "Value":$target, "Value":$axis), [{
-      auto anyType = transform::AnyOpType::get($_builder.getContext());
+      auto anyType = transform::AnyValueType::get($_builder.getContext());
       build($_builder, $_state, anyType, target, axis);
     }]>
   ];
