@@ -81,6 +81,11 @@ int findMemRefAxisFromIVs(affine::AffineStoreOp storeOp, Value iv) {
   return -1;
 }
 
+bool isMemRefCastOrViewLike(Operation *op) {
+  return isa<memref::SubViewOp, memref::ViewOp, memref::ReinterpretCastOp,
+             memref::CastOp, memref::TransposeOp>(op);
+}
+
 // Follow view-like aliases and resolve to a root buffer value.
 Value resolveMemRefValueRoot(Value value) {
   SmallPtrSet<Value, 8> visited;
@@ -92,24 +97,8 @@ Value resolveMemRefValueRoot(Value value) {
     if (!defOp)
       return value;
 
-    if (auto subview = dyn_cast<memref::SubViewOp>(defOp)) {
-      value = subview.getSource();
-      continue;
-    }
-    if (auto view = dyn_cast<memref::ViewOp>(defOp)) {
-      value = view.getSource();
-      continue;
-    }
-    if (auto reinterpretCast = dyn_cast<memref::ReinterpretCastOp>(defOp)) {
-      value = reinterpretCast.getSource();
-      continue;
-    }
-    if (auto castOp = dyn_cast<memref::CastOp>(defOp)) {
-      value = castOp.getSource();
-      continue;
-    }
-    if (auto transpose = dyn_cast<memref::TransposeOp>(defOp)) {
-      value = transpose.getIn();
+    if (isMemRefCastOrViewLike(defOp)) {
+      value = defOp->getOperand(0);
       continue;
     }
     return value;

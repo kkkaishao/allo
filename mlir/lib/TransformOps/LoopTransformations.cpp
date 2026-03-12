@@ -1513,34 +1513,177 @@ void transform::ComputeAtOp::getEffects(
 }
 
 ///===----------------------------------------------------------------------===//
-/// ReuseAt implementation
-///===----------------------------------------------------------------------===///
-// Extract the last constant term encountered in an affine expression.
-// ReuseAt uses this as a lightweight ordering key for sliding-window loads.
-static int64_t findConstantExprValue(const AffineExpr &exp) {
-  int64_t value = -1;
-  // TODO: only support one constant now
-  exp.walk([&](AffineExpr inner) {
-    if (llvm::isa<AffineConstantExpr>(inner))
-      value = llvm::cast<AffineConstantExpr>(inner).getValue();
-  });
-  return value;
+/// Shared buffer-access analysis helpers
+///===----------------------------------------------------------------------===//
+namespace {
+struct ComposedBufferAccess {
+  Operation *op = nullptr;
+  AffineMap map;
+  SmallVector<Value, 4> operands;
+};
+} // namespace
+
+static ComposedBufferAccess composeBufferAccess(Operation *accessOp) {
+  affine::MemRefAccess access(accessOp);
+  affine::AffineValueMap accessValueMap;
+  access.getAccessMap(&accessValueMap);
+  accessValueMap.composeSimplifyAndCanonicalize();
+  return {accessOp, accessValueMap.getAffineMap(),
+          llvm::to_vector(accessValueMap.getOperands())};
 }
 
-namespace {
-struct ExprCompare {
-  // Order expressions by their constant offset so we can process loads
-  // from low-to-high offsets on the reuse axis.
-  bool operator()(const AffineExpr &exp1, const AffineExpr &exp2) const {
-    int64_t val1 = findConstantExprValue(exp1);
-    int64_t val2 = findConstantExprValue(exp2);
-    return val1 < val2;
+static void
+collectFootprintOperands(ArrayRef<ComposedBufferAccess> accesses,
+                         ArrayRef<affine::AffineForOp> innerLoops,
+                         ArrayRef<Value> excludedValues,
+                         DenseMap<Value, unsigned> &prefixOperandPos,
+                         SmallVectorImpl<Value> &prefixOperands) {
+  DenseSet<Value> excluded;
+  for (Value value : excludedValues)
+    excluded.insert(stripCast(value));
+  for (affine::AffineForOp loop : innerLoops)
+    excluded.insert(stripCast(loop.getInductionVar()));
+
+  for (const ComposedBufferAccess &access : accesses) {
+    for (AffineExpr resultExpr : access.map.getResults()) {
+      for (Value operand : access.operands) {
+        operand = stripCast(operand);
+        if (excluded.contains(operand))
+          continue;
+        if (!affineExprUsesValue(resultExpr, access.operands,
+                                 access.map.getNumDims(), operand)) {
+          continue;
+        }
+        if (prefixOperandPos.contains(operand))
+          continue;
+        prefixOperandPos[operand] = prefixOperands.size();
+        prefixOperands.push_back(operand);
+      }
+    }
   }
-};
+}
+
+static void populateExprReplacements(
+    AffineMap accessMap, ValueRange accessOperands,
+    DenseMap<Value, unsigned> &prefixOperandPos,
+    ArrayRef<std::pair<Value, AffineExpr>> explicitReplacements,
+    unsigned prefixDimOffset, SmallVectorImpl<AffineExpr> &dimReplacements,
+    SmallVectorImpl<AffineExpr> &symReplacements) {
+  dimReplacements.clear();
+  symReplacements.clear();
+  dimReplacements.reserve(accessMap.getNumDims());
+  symReplacements.reserve(accessMap.getNumSymbols());
+
+  auto getReplacement = [&](Value operand) {
+    operand = stripCast(operand);
+    for (const auto &[explicitOperand, replacement] : explicitReplacements) {
+      if (operand == stripCast(explicitOperand))
+        return replacement;
+    }
+
+    auto it = prefixOperandPos.find(operand);
+    if (it == prefixOperandPos.end())
+      return getAffineConstantExpr(0, accessMap.getContext());
+    return getAffineDimExpr(prefixDimOffset + it->second,
+                            accessMap.getContext());
+  };
+
+  for (unsigned i = 0; i < accessMap.getNumDims(); ++i)
+    dimReplacements.push_back(getReplacement(accessOperands[i]));
+  for (unsigned i = 0; i < accessMap.getNumSymbols(); ++i)
+    symReplacements.push_back(
+        getReplacement(accessOperands[accessMap.getNumDims() + i]));
+}
+
+static void populateExprReplacements(
+    AffineMap accessMap, ArrayRef<Value> accessOperands,
+    DenseMap<Value, unsigned> &prefixOperandPos,
+    SmallVectorImpl<Value> & /*prefixOperands*/, Value targetLoopIV,
+    std::optional<int64_t> targetLoopConstant,
+    std::optional<unsigned> targetLoopDimPos, unsigned prefixDimOffset,
+    SmallVectorImpl<AffineExpr> &dimReplacements,
+    SmallVectorImpl<AffineExpr> &symReplacements) {
+  SmallVector<std::pair<Value, AffineExpr>, 1> explicitReplacements;
+  if (targetLoopIV) {
+    assert(targetLoopConstant.has_value() != targetLoopDimPos.has_value() &&
+           "expected exactly one loop replacement kind");
+    AffineExpr replacement =
+        targetLoopDimPos
+            ? getAffineDimExpr(*targetLoopDimPos, accessMap.getContext())
+            : getAffineConstantExpr(*targetLoopConstant,
+                                    accessMap.getContext());
+    explicitReplacements.emplace_back(targetLoopIV, replacement);
+  }
+
+  populateExprReplacements(accessMap, accessOperands, prefixOperandPos,
+                           explicitReplacements, prefixDimOffset,
+                           dimReplacements, symReplacements);
+}
+
+static FailureOr<int64_t> getLinearAffineDimCoefficient(AffineExpr expr,
+                                                        unsigned numDims,
+                                                        unsigned dimPos) {
+  FlatLinearConstraints localVarCst(numDims, /*numSymbols=*/0);
+  SmallVector<int64_t, 8> flattenedExpr;
+  if (failed(getFlattenedAffineExpr(expr, numDims, /*numSymbols=*/0,
+                                    &flattenedExpr, &localVarCst)))
+    return failure();
+  if (localVarCst.getNumLocalVars() != 0 || flattenedExpr.size() != numDims + 1)
+    return failure();
+  return flattenedExpr[dimPos];
+}
+
+static FailureOr<int64_t> getConstantExprDelta(AffineExpr lhs, AffineExpr rhs,
+                                               unsigned numDims) {
+  FlatLinearConstraints localVarCst(numDims, /*numSymbols=*/0);
+  SmallVector<int64_t, 8> flattenedExpr;
+  AffineExpr diff = simplifyAffineExpr(lhs - rhs, numDims, /*numSymbols=*/0);
+  if (failed(getFlattenedAffineExpr(diff, numDims, /*numSymbols=*/0,
+                                    &flattenedExpr, &localVarCst)))
+    return failure();
+  if (localVarCst.getNumLocalVars() != 0 || flattenedExpr.size() != numDims + 1)
+    return failure();
+  for (unsigned i = 0, e = flattenedExpr.size() - 1; i < e; ++i)
+    if (flattenedExpr[i] != 0)
+      return failure();
+  return flattenedExpr.back();
+}
+
+///===----------------------------------------------------------------------===//
+/// ReuseAt implementation
+///===----------------------------------------------------------------------===///
+namespace {
 struct LoopRoleInfo {
   DenseSet<Value> spatialIVs;
   DenseSet<Value> reductionIVs;
   DenseMap<Value, int64_t> reductionUpperBounds;
+};
+
+struct ReuseDimPlan {
+  AffineMap anchorMap;
+  int64_t extent = 1;
+  int64_t axisCoeff = 0;
+  int64_t innerMinOffset = 0;
+  int64_t innerMaxOffset = 0;
+  bool isSliding = false;
+};
+
+struct ReuseStatePlan {
+  SmallVector<ReuseDimPlan, 4> dims;
+  SmallVector<Value, 4> prefixOperands;
+  SmallVector<unsigned, 4> keptDims;
+  SmallVector<int64_t, 4> shape;
+  SmallVector<int, 4> resultToReusePos;
+  unsigned slidingDim = 0;
+  int64_t slidingCoeff = 1;
+};
+
+struct ReuseDimFootprint {
+  AffineExpr lowerExpr;
+  int64_t extent = 1;
+  int64_t axisCoeff = 0;
+  int64_t innerMinOffset = 0;
+  int64_t innerMaxOffset = 0;
 };
 } // namespace
 
@@ -1678,257 +1821,581 @@ static bool isSpatialLoop(affine::AffineForOp forOp,
   return roles.spatialIVs.contains(forOp.getInductionVar());
 }
 
-// Stage 1 analysis:
-// Collect load expressions under the selected axis loop and infer
-// per-dimension span plus axis stride used by the later rewrites.
-static std::optional<std::string>
-analyzeSpanAndStride(affine::AffineForOp axisLoop, Value target, unsigned rank,
-                     const DenseMap<Value, int64_t> &reductionUpperBounds,
-                     RewriterBase &rewriter, SmallVectorImpl<int64_t> &spans,
-                     int64_t &stride) {
-  SmallVector<SmallVector<AffineExpr>, 8> loadExprsByResultDim(rank);
-  DenseMap<AffineExpr, Value> dimExprToOperand;
-  int numTargetLoads = 0;
-
-  axisLoop.walk([&](affine::AffineLoadOp loadOp) {
-    if (loadOp.getMemRef() != target)
-      return WalkResult::advance();
-
-    ++numTargetLoads;
-    AffineMap loadMap = loadOp.getAffineMap();
-    for (unsigned i = 0; i < rank; ++i)
-      loadExprsByResultDim[i].push_back(loadMap.getResult(i));
-
-    for (auto operandItem : llvm::enumerate(loadOp.getMapOperands())) {
-      dimExprToOperand[rewriter.getAffineDimExpr(operandItem.index())] =
-          operandItem.value();
-    }
-    return WalkResult::advance();
+static void
+collectReuseInnerLoops(affine::AffineForOp axisLoop,
+                       SmallVectorImpl<affine::AffineForOp> &innerLoops) {
+  axisLoop.walk([&](affine::AffineForOp forOp) {
+    if (forOp != axisLoop)
+      innerLoops.push_back(forOp);
   });
-
-  if (numTargetLoads == 0)
-    // Without target loads in the selected scope, no reuse window can be built.
-    return std::string("cannot find target loads under selected axis loop");
-
-  auto computeSpanForResultDim = [&](unsigned dim) -> FailureOr<int64_t> {
-    if (loadExprsByResultDim[dim].empty())
-      return static_cast<int64_t>(1);
-
-    int64_t span = 0;
-    AffineExpr baseExpr = loadExprsByResultDim[dim][0];
-    int64_t baseCst = 0;
-
-    if (isa<AffineDimExpr>(baseExpr)) {
-      bool allDimExpr = true;
-      for (int j = 0; j < numTargetLoads; ++j) {
-        AffineExpr expr = loadExprsByResultDim[dim][j];
-        AffineExpr diff = expr - baseExpr;
-        if (!isa<AffineDimExpr>(expr))
-          allDimExpr = false;
-        if (auto cst = dyn_cast<AffineConstantExpr>(diff))
-          span = std::max(span, cst.getValue() + 1);
-      }
-      if (allDimExpr) {
-        auto dimExpr = cast<AffineDimExpr>(baseExpr);
-        auto operandIt = dimExprToOperand.find(dimExpr);
-        if (operandIt != dimExprToOperand.end() &&
-            reductionUpperBounds.count(operandIt->second) > 0) {
-          span = reductionUpperBounds.lookup(operandIt->second);
-        }
-      }
-    } else if (isa<AffineConstantExpr>(baseExpr)) {
-      for (int j = 0; j < numTargetLoads; ++j) {
-        AffineExpr diff = loadExprsByResultDim[dim][j] - baseExpr;
-        if (auto cst = dyn_cast<AffineConstantExpr>(diff))
-          span = std::max(span, cst.getValue() + 1);
-      }
-    } else if (auto binaryExpr = dyn_cast<AffineBinaryOpExpr>(baseExpr)) {
-      AffineExpr lhs = binaryExpr.getLHS();
-      AffineExpr rhs = binaryExpr.getRHS();
-      if (auto dimExpr = dyn_cast<AffineDimExpr>(rhs)) {
-        auto operandIt = dimExprToOperand.find(dimExpr);
-        if (operandIt != dimExprToOperand.end() &&
-            reductionUpperBounds.count(operandIt->second) > 0) {
-          span = reductionUpperBounds.lookup(operandIt->second);
-        }
-      } else if (auto cst = dyn_cast<AffineConstantExpr>(rhs)) {
-        int64_t value = cst.getValue();
-        if (baseCst == 0)
-          baseCst = value;
-        span = std::max(span, value - baseCst + 1);
-      }
-
-      if (auto lhsBinary = dyn_cast<AffineBinaryOpExpr>(lhs)) {
-        if (auto cst = dyn_cast<AffineConstantExpr>(lhsBinary.getRHS()))
-          stride = cst.getValue();
-      }
-    } else {
-      // Unsupported expression shape means we cannot safely derive span/stride.
-      return failure();
-    }
-
-    if (span == 0)
-      span = 1;
-    return span;
-  };
-
-  spans.clear();
-  spans.reserve(rank);
-  for (unsigned i = 0; i < rank; ++i) {
-    FailureOr<int64_t> span = computeSpanForResultDim(i);
-    if (failed(span))
-      // Fail fast when span inference is ambiguous to avoid unsafe rewrites.
-      return std::string("unsupported load expression form for reuse analysis");
-    spans.push_back(*span);
-  }
-
-  return std::nullopt;
 }
 
-// Stage 2 analysis:
-// Infer the reusable axis and distance window from target loads, and collect
-// ordered loads + reduction-dimension metadata for legality checks.
-static std::optional<std::string>
-analyzeAxisReuseWindow(affine::AffineForOp axisLoop, Value target, Value axisIV,
-                       const DenseMap<Value, int64_t> &reductionUpperBounds,
-                       RewriterBase &rewriter, unsigned &axis,
-                       int64_t &distance,
-                       std::set<AffineExpr, ExprCompare> &requestedAxisExprs,
-                       SmallVectorImpl<affine::AffineLoadOp> &orderedLoadOps,
-                       DenseMap<unsigned, int64_t> &reductionDimBounds) {
-  auto insertLoadByAxisOffset = [&](affine::AffineLoadOp loadOp) {
-    unsigned size = orderedLoadOps.size();
-    AffineExpr lhs = loadOp.getAffineMap().getResult(axis);
-    for (unsigned i = 0; i < size; ++i) {
-      AffineExpr rhs = orderedLoadOps[i].getAffineMap().getResult(axis);
-      if (findConstantExprValue(lhs) < findConstantExprValue(rhs)) {
-        orderedLoadOps.insert(orderedLoadOps.begin() + i, loadOp);
-        return;
-      }
-    }
-    orderedLoadOps.push_back(loadOp);
-  };
+static LogicalResult
+collectReuseAccesses(affine::AffineForOp axisLoop, Value target,
+                     SmallVectorImpl<ComposedBufferAccess> &accesses,
+                     SmallVectorImpl<affine::AffineForOp> &innerLoops) {
+  collectReuseInnerLoops(axisLoop, innerLoops);
 
-  std::optional<unsigned> detectedAxis;
-  axis = 0;
-  distance = -1;
-  requestedAxisExprs.clear();
-  orderedLoadOps.clear();
-  reductionDimBounds.clear();
-
-  axisLoop.walk([&](affine::AffineLoadOp loadOp) {
-    if (loadOp.getMemRef() != target)
-      return WalkResult::advance();
-
-    AffineMap loadMap = loadOp.getAffineMap();
-    unsigned numDims = loadMap.getNumDims();
-    ValueRange operands = loadOp.getMapOperands();
-    std::optional<unsigned> reductionDimOnAxis;
-
-    for (unsigned j = 0; j < loadMap.getNumResults(); ++j) {
-      AffineExpr expr = loadMap.getResult(j);
-      bool resultUsesAxis =
-          affineExprUsesValue(expr, operands, numDims, axisIV);
-      if (!detectedAxis && resultUsesAxis)
-        detectedAxis = j;
-      bool isAxisResult = detectedAxis && *detectedAxis == j;
-
-      for (unsigned i = 0; i < numDims; ++i) {
-        if (!expr.isFunctionOfDim(i) || i >= operands.size())
-          continue;
-        auto reductionIt = reductionUpperBounds.find(operands[i]);
-        if (reductionIt == reductionUpperBounds.end())
-          continue;
-        reductionDimBounds[i] = reductionIt->second;
-        if (isAxisResult)
-          reductionDimOnAxis = i;
-      }
-    }
-
-    if (!detectedAxis || *detectedAxis >= loadMap.getNumResults())
-      // If no result dimension can be matched to axisIV, this load is not
-      // reusable.
-      return WalkResult::interrupt();
-    axis = *detectedAxis;
-
-    AffineExpr axisExpr = loadMap.getResult(axis);
-    insertLoadByAxisOffset(loadOp);
-
-    if (reductionDimOnAxis) {
-      int64_t ub = reductionUpperBounds.lookup(operands[*reductionDimOnAxis]);
-      distance = std::max(distance, ub - 1);
-      for (int64_t j = 0; j < ub; ++j) {
-        AffineExpr ubExpr = rewriter.getAffineConstantExpr(j);
-        AffineExpr expandedExpr = axisExpr.replace(
-            rewriter.getAffineDimExpr(*reductionDimOnAxis), ubExpr);
-        requestedAxisExprs.insert(expandedExpr);
-      }
-    } else {
-      requestedAxisExprs.insert(axisExpr);
-      AffineExpr offset = axisExpr - *requestedAxisExprs.begin();
-      auto cst = dyn_cast<AffineConstantExpr>(offset);
-      if (!cst)
+  Value targetRoot = resolveMemRefValueRoot(target);
+  WalkResult walk = axisLoop.walk([&](Operation *op) -> WalkResult {
+    Value memref;
+    if (auto readOp = dyn_cast<affine::AffineReadOpInterface>(op)) {
+      memref = readOp.getMemRef();
+      if (memref == target)
+        accesses.push_back(composeBufferAccess(op));
+    } else if (auto writeOp = dyn_cast<affine::AffineWriteOpInterface>(op)) {
+      memref = writeOp.getMemRef();
+      if (resolveMemRefValueRoot(memref) == targetRoot) {
+        auto diag = axisLoop.emitError()
+                    << "reuse_at requires the target buffer to be read-only "
+                       "within the selected axis loop";
+        diag.attachNote(writeOp->getLoc()) << "see write op here";
         return WalkResult::interrupt();
-      distance = std::max(distance, cst.getValue());
+      }
+    } else if (auto loadOp = dyn_cast<memref::LoadOp>(op)) {
+      memref = loadOp.getMemRef();
+      if (resolveMemRefValueRoot(memref) == targetRoot) {
+        auto diag = emitError(targetRoot.getLoc())
+                    << "reuse_at only supports affine.load accesses to the "
+                       "target buffer";
+        diag.attachNote(loadOp.getLoc()) << "see memref.load op here";
+        return WalkResult::interrupt();
+      }
+    } else if (auto storeOp = dyn_cast<memref::StoreOp>(op)) {
+      memref = storeOp.getMemRef();
+      if (resolveMemRefValueRoot(memref) == targetRoot) {
+        auto diag = axisLoop.emitError()
+                    << "reuse_at requires the target buffer to be read-only "
+                       "within the selected axis loop";
+        diag.attachNote(storeOp.getLoc()) << "see memref.store op here";
+        return WalkResult::interrupt();
+      }
+    } else if (isMemRefCastOrViewLike(op)) {
+      auto diag = axisLoop.emitError()
+                  << "reuse_at does not support aliasing/view accesses "
+                     "to the "
+                     "target buffer within the selected axis loop";
+      diag.attachNote(op->getLoc()) << "see aliasing/view op here";
+      return WalkResult::interrupt();
     }
     return WalkResult::advance();
   });
 
-  if (!detectedAxis || requestedAxisExprs.empty())
-    // Require a concrete axis and at least one requested index expression.
-    return std::string("cannot find reusable load axis");
-  axis = *detectedAxis;
-
-  return std::nullopt;
+  if (walk.wasInterrupted())
+    return failure();
+  if (accesses.empty()) {
+    auto diag =
+        axisLoop.emitError()
+        << "no affine.load access to the target buffer found within the "
+           "selected axis loop";
+    return diag;
+  }
+  return success();
 }
 
-// Stage 3 analysis:
-// Validate the inferred axis window is a supported pattern and materialize
-// the base axis expression used by index remapping.
-static std::optional<std::string> validateAxisReuseWindow(
-    const std::set<AffineExpr, ExprCompare> &requestedAxisExprs,
-    ArrayRef<affine::AffineLoadOp> orderedLoadOps, unsigned axis,
-    const DenseMap<unsigned, int64_t> &reductionDimBounds,
-    AffineExpr &baseAxisExpr) {
-  bool hasStrideOneWindow = false;
-  for (AffineExpr expr : requestedAxisExprs) {
-    if (requestedAxisExprs.find(expr + 1) != requestedAxisExprs.end()) {
-      hasStrideOneWindow = true;
-      break;
+static FailureOr<ReuseDimFootprint>
+computeReuseDimFootprint(const ComposedBufferAccess &access, unsigned resultPos,
+                         ArrayRef<affine::AffineForOp> innerLoops, Value axisIV,
+                         DenseMap<Value, unsigned> &prefixOperandPos,
+                         ArrayRef<Value> prefixOperands) {
+  AffineExpr accessExpr = access.map.getResult(resultPos);
+  SmallVector<affine::AffineForOp, 4> dependentLoops;
+  for (affine::AffineForOp loop : innerLoops) {
+    if (affineExprUsesValue(accessExpr, access.operands,
+                            access.map.getNumDims(), loop.getInductionVar())) {
+      dependentLoops.push_back(loop);
     }
   }
-  if (!hasStrideOneWindow)
-    // Current implementation only supports consecutive stride-1 reuse windows.
-    return std::string("cannot find stride-1 reuse pattern on selected axis");
 
-  baseAxisExpr = *requestedAxisExprs.begin();
-  auto hasReductionDimInExpr = [&](AffineExpr expr) {
-    for (auto [dim, _] : reductionDimBounds) {
-      if (expr.isFunctionOfDim(dim))
-        return true;
-    }
-    return false;
-  };
+  unsigned prefixDimCount = prefixOperands.size();
+  SmallVector<AffineExpr, 8> dimReplacements, symReplacements;
+  SmallVector<std::pair<Value, AffineExpr>, 4> lowerReplacements;
+  lowerReplacements.emplace_back(axisIV,
+                                 getAffineDimExpr(0, access.map.getContext()));
+  populateExprReplacements(
+      access.map, access.operands, prefixOperandPos, lowerReplacements,
+      /*prefixDimOffset=*/1, dimReplacements, symReplacements);
+  AffineExpr lowerExpr = simplifyAffineExpr(
+      accessExpr.replaceDimsAndSymbols(dimReplacements, symReplacements),
+      1 + prefixDimCount, /*numSymbols=*/0);
+  FailureOr<int64_t> axisCoeffOr =
+      getLinearAffineDimCoefficient(lowerExpr, 1 + prefixDimCount,
+                                    /*dimPos=*/0);
+  if (failed(axisCoeffOr))
+    return failure();
 
-  for (affine::AffineLoadOp loadOp : orderedLoadOps) {
-    AffineExpr diff = loadOp.getAffineMap().getResult(axis) - baseAxisExpr;
-    if (hasReductionDimInExpr(diff))
-      // Reduction-indexed axis reuse needs extra handling not implemented yet.
-      return std::string("reduction reuse not fully implemented");
-    if (!isa<AffineConstantExpr>(diff))
-      // Non-constant deltas break fixed-window addressing assumptions.
-      return std::string("cannot support non-constant stride");
+  ReuseDimFootprint footprint;
+  footprint.lowerExpr = lowerExpr;
+  footprint.axisCoeff = *axisCoeffOr;
+
+  if (dependentLoops.empty())
+    return footprint;
+
+  SmallVector<affine::AffineForOp, 4> activeLoops;
+  SmallVector<int64_t, 4> activeLoopExtents;
+  activeLoops.reserve(dependentLoops.size());
+  activeLoopExtents.reserve(dependentLoops.size());
+  for (affine::AffineForOp loop : dependentLoops) {
+    if (!loop.hasConstantBounds() || loop.getStepAsInt() != 1 ||
+        loop.getConstantLowerBound() != 0)
+      return failure();
+    int64_t extent =
+        loop.getConstantUpperBound() - loop.getConstantLowerBound();
+    if (extent <= 0)
+      return failure();
+    activeLoops.push_back(loop);
+    activeLoopExtents.push_back(extent);
   }
 
-  return std::nullopt;
+  SmallVector<std::pair<Value, AffineExpr>, 6> offsetReplacements;
+  for (auto [idx, loop] : llvm::enumerate(activeLoops)) {
+    offsetReplacements.emplace_back(
+        loop.getInductionVar(), getAffineDimExpr(idx, access.map.getContext()));
+  }
+  populateExprReplacements(
+      access.map, access.operands, prefixOperandPos, offsetReplacements,
+      /*prefixDimOffset=*/activeLoops.size(), dimReplacements, symReplacements);
+  AffineExpr offsetExpr = simplifyAffineExpr(
+      accessExpr.replaceDimsAndSymbols(dimReplacements, symReplacements),
+      activeLoops.size() + prefixDimCount, /*numSymbols=*/0);
+
+  SmallVector<AffineExpr, 4> expandedLowerDims;
+  expandedLowerDims.reserve(1 + prefixDimCount);
+  expandedLowerDims.push_back(
+      getAffineConstantExpr(0, access.map.getContext()));
+  for (unsigned i = 0; i < prefixDimCount; ++i)
+    expandedLowerDims.push_back(
+        getAffineDimExpr(activeLoops.size() + i, access.map.getContext()));
+  AffineExpr expandedLowerExpr =
+      simplifyAffineExpr(lowerExpr.replaceDims(expandedLowerDims),
+                         activeLoops.size() + prefixDimCount, /*numSymbols=*/0);
+  AffineExpr innerOffsetExpr = simplifyAffineExpr(
+      offsetExpr - expandedLowerExpr, activeLoops.size() + prefixDimCount,
+      /*numSymbols=*/0);
+
+  FailureOr<int64_t> innerConstOr = getConstantExprDelta(
+      offsetExpr, expandedLowerExpr, activeLoops.size() + prefixDimCount);
+  if (succeeded(innerConstOr) && *innerConstOr == 0)
+    return footprint;
+
+  FlatLinearConstraints localVarCst(activeLoops.size(), /*numSymbols=*/0);
+  SmallVector<int64_t, 8> flattenedExpr;
+  if (failed(getFlattenedAffineExpr(innerOffsetExpr, activeLoops.size(),
+                                    /*numSymbols=*/0, &flattenedExpr,
+                                    &localVarCst)))
+    return failure();
+  if (localVarCst.getNumLocalVars() != 0 ||
+      flattenedExpr.size() != activeLoops.size() + 1)
+    return failure();
+  if (flattenedExpr.back() != 0)
+    return failure();
+
+  int64_t maxOffset = 0;
+  for (auto [idx, coeff] :
+       llvm::enumerate(ArrayRef<int64_t>(flattenedExpr).drop_back())) {
+    if (coeff < 0 || coeff > 1)
+      return failure();
+    if (coeff == 0)
+      continue;
+    maxOffset += activeLoopExtents[idx] - 1;
+  }
+
+  footprint.extent = maxOffset + 1;
+  footprint.innerMaxOffset = maxOffset;
+  return footprint;
+}
+
+static FailureOr<ReuseStatePlan>
+analyzeReuseStatePlan(ArrayRef<ComposedBufferAccess> accesses,
+                      ArrayRef<affine::AffineForOp> innerLoops,
+                      affine::AffineForOp axisLoop, unsigned bufferRank,
+                      MLIRContext *ctx) {
+  ReuseStatePlan plan;
+  Value axisIV = axisLoop.getInductionVar();
+  DenseMap<Value, unsigned> prefixOperandPos;
+  collectFootprintOperands(accesses, innerLoops, ArrayRef<Value>{axisIV},
+                           prefixOperandPos, plan.prefixOperands);
+  unsigned prefixDimCount = plan.prefixOperands.size();
+
+  SmallVector<bool, 4> stationarySeen(bufferRank, false);
+  SmallVector<AffineExpr, 4> refLower(bufferRank);
+  SmallVector<int64_t, 4> minOffset(bufferRank, 0);
+  SmallVector<int64_t, 4> maxUpper(bufferRank, 0);
+  SmallVector<int64_t, 4> windowMinOffset(bufferRank, 0);
+  SmallVector<int64_t, 4> windowMaxOffset(bufferRank, 0);
+  SmallVector<SmallVector<int64_t, 4>, 8> axisCoeffs(accesses.size());
+
+  std::optional<unsigned> detectedSlidingDim;
+  std::optional<int64_t> detectedSlidingCoeff;
+
+  for (auto [accessIdx, access] : llvm::enumerate(accesses)) {
+    auto readOp = cast<affine::AffineReadOpInterface>(access.op);
+    if (access.map.getNumResults() != bufferRank) {
+      auto diag = readOp->emitError()
+                  << "reuse_at requires candidate loads to match the target "
+                     "buffer rank";
+      diag.attachNote(readOp->getLoc())
+          << "candidate affine.load has " << access.map.getNumResults()
+          << " indices, but the target buffer rank is " << bufferRank;
+      return diag;
+    }
+
+    axisCoeffs[accessIdx].resize(bufferRank, 0);
+    for (unsigned d = 0; d < bufferRank; ++d) {
+      FailureOr<ReuseDimFootprint> footprintOr = computeReuseDimFootprint(
+          access, d, innerLoops, axisIV, prefixOperandPos, plan.prefixOperands);
+      if (failed(footprintOr)) {
+        auto diag = readOp->emitError()
+                    << "reuse_at requires buffer dimensions to have bounded "
+                       "contiguous affine footprints";
+        diag.attachNote(readOp->getLoc())
+            << "failed to derive a contiguous local footprint for buffer "
+               "dimension "
+            << d;
+        return diag;
+      }
+      const ReuseDimFootprint &footprint = *footprintOr;
+      int64_t coeff = footprint.axisCoeff;
+      axisCoeffs[accessIdx][d] = coeff;
+
+      if (coeff != 0) {
+        if (std::abs(coeff) != 1) {
+          auto diag =
+              readOp->emitError()
+              << "reuse_at only supports unit translation on the sliding "
+                 "dimension";
+          diag.attachNote(readOp->getLoc())
+              << "candidate affine.load moves by " << coeff
+              << " per selected-axis iteration in buffer dimension " << d;
+          return diag;
+        }
+        if (detectedSlidingDim && *detectedSlidingDim != d) {
+          auto diag = readOp->emitError()
+                      << "candidate loads do not share a common sliding "
+                         "dimension";
+          diag.attachNote(readOp->getLoc())
+              << "candidate affine.load slides along buffer dimension " << d
+              << ", but previous candidates slide along buffer dimension "
+              << *detectedSlidingDim;
+          return diag;
+        }
+        if (detectedSlidingCoeff && *detectedSlidingCoeff != coeff) {
+          auto diag = readOp->emitError()
+                      << "candidate loads do not share a common sliding "
+                         "direction";
+          diag.attachNote(readOp->getLoc())
+              << "candidate affine.load uses selected-axis coefficient "
+              << coeff << " in buffer dimension " << d
+              << ", but previous candidates use coefficient "
+              << *detectedSlidingCoeff;
+          return diag;
+        }
+        detectedSlidingDim = d;
+        detectedSlidingCoeff = coeff;
+      }
+
+      if (!stationarySeen[d]) {
+        stationarySeen[d] = true;
+        refLower[d] = footprint.lowerExpr;
+        minOffset[d] = 0;
+        maxUpper[d] = footprint.extent;
+        windowMinOffset[d] = footprint.innerMinOffset;
+        windowMaxOffset[d] = footprint.innerMaxOffset;
+        continue;
+      }
+
+      FailureOr<int64_t> offsetOr = getConstantExprDelta(
+          footprint.lowerExpr, refLower[d], 1 + prefixDimCount);
+      if (failed(offsetOr)) {
+        auto diag =
+            readOp->emitError()
+            << (coeff != 0 ? "candidate loads do not share a common sliding "
+                             "coordinate system"
+                           : "candidate loads do not share a common local "
+                             "coordinate system");
+        diag.attachNote(readOp->getLoc())
+            << "candidate affine.load uses a non-constant local offset for "
+               "buffer dimension "
+            << d;
+        return diag;
+      }
+      minOffset[d] = std::min(minOffset[d], *offsetOr);
+      maxUpper[d] = std::max(maxUpper[d], *offsetOr + footprint.extent);
+      windowMinOffset[d] =
+          std::min(windowMinOffset[d], *offsetOr + footprint.innerMinOffset);
+      windowMaxOffset[d] =
+          std::max(windowMaxOffset[d], *offsetOr + footprint.innerMaxOffset);
+    }
+  }
+
+  if (!detectedSlidingDim || !detectedSlidingCoeff) {
+    auto diag = axisLoop->emitError()
+                << "cannot find a reusable sliding dimension for the selected "
+                   "axis";
+    diag.attachNote(axisLoop.getLoc())
+        << "none of the candidate affine.load accesses varies with the "
+           "selected axis";
+    return diag;
+  }
+
+  for (auto [accessIdx, coeffs] : llvm::enumerate(axisCoeffs)) {
+    if (coeffs[*detectedSlidingDim] == 0) {
+      auto readOp = cast<affine::AffineReadOpInterface>(accesses[accessIdx].op);
+      auto diag = readOp->emitError()
+                  << "candidate loads do not all depend on the selected axis "
+                     "through the same sliding dimension";
+      diag.attachNote(readOp->getLoc())
+          << "candidate affine.load does not depend on the selected axis "
+             "through buffer dimension "
+          << *detectedSlidingDim;
+      return diag;
+    }
+    for (auto [dim, coeff] : llvm::enumerate(coeffs)) {
+      if (dim != *detectedSlidingDim && coeff != 0) {
+        auto readOp =
+            cast<affine::AffineReadOpInterface>(accesses[accessIdx].op);
+        auto diag = readOp->emitError()
+                    << "candidate loads do not share a common sliding "
+                       "dimension";
+        diag.attachNote(readOp->getLoc())
+            << "candidate affine.load also depends on the selected axis "
+               "through buffer dimension "
+            << dim;
+        return diag;
+      }
+    }
+  }
+
+  plan.dims.resize(bufferRank);
+  plan.resultToReusePos.assign(bufferRank, -1);
+  plan.slidingDim = *detectedSlidingDim;
+  plan.slidingCoeff = *detectedSlidingCoeff;
+
+  for (unsigned d = 0; d < bufferRank; ++d) {
+    ReuseDimPlan &dimPlan = plan.dims[d];
+    if (!stationarySeen[d]) {
+      auto diag = axisLoop->emitError()
+                  << "reuse_at failed to derive a local footprint for a "
+                     "buffer dimension";
+      diag.attachNote(axisLoop.getLoc())
+          << "failed while materializing local state for buffer dimension "
+          << d;
+      return diag;
+    }
+
+    AffineExpr anchorExpr =
+        simplifyAffineExpr(refLower[d] + minOffset[d], 1 + prefixDimCount,
+                           /*numSymbols=*/0);
+    dimPlan.anchorMap =
+        AffineMap::get(1 + prefixDimCount, /*symbolCount=*/0, anchorExpr, ctx);
+    dimPlan.extent = maxUpper[d] - minOffset[d];
+    dimPlan.axisCoeff = d == *detectedSlidingDim ? *detectedSlidingCoeff : 0;
+    dimPlan.innerMinOffset = windowMinOffset[d] - minOffset[d];
+    dimPlan.innerMaxOffset = windowMaxOffset[d] - minOffset[d];
+    dimPlan.isSliding = d == *detectedSlidingDim;
+
+    if (dimPlan.extent <= 0) {
+      auto diag = axisLoop->emitError()
+                  << "reuse_at derived a non-positive local state extent";
+      diag.attachNote(axisLoop.getLoc()) << "derived extent " << dimPlan.extent
+                                         << " for buffer dimension " << d;
+      return diag;
+    }
+
+    if (dimPlan.isSliding || dimPlan.extent > 1) {
+      plan.resultToReusePos[d] = static_cast<int>(plan.keptDims.size());
+      plan.keptDims.push_back(d);
+      plan.shape.push_back(dimPlan.extent);
+    }
+  }
+  return plan;
+}
+
+static SmallVector<Value, 4>
+getReuseStateOperands(Value axisIV, ArrayRef<Value> prefixOperands) {
+  SmallVector<Value, 4> operands;
+  operands.push_back(axisIV);
+  operands.append(prefixOperands.begin(), prefixOperands.end());
+  return operands;
+}
+
+static affine::AffineForOp createConstantAffineFor(OpBuilder &builder,
+                                                   Location loc, int64_t lb,
+                                                   int64_t ub) {
+  AffineMap lowerMap = AffineMap::get(/*dimCount=*/0, /*symbolCount=*/0,
+                                      builder.getAffineConstantExpr(lb));
+  AffineMap upperMap = AffineMap::get(/*dimCount=*/0, /*symbolCount=*/0,
+                                      builder.getAffineConstantExpr(ub));
+  return affine::createCanonicalizedAffineForOp(
+      builder, loc, /*lbOperands=*/ValueRange{}, lowerMap,
+      /*ubOperands=*/ValueRange{}, upperMap, /*step=*/1);
+}
+
+static Value buildAnchorValue(OpBuilder &builder, Location loc,
+                              const ReuseDimPlan &dimPlan,
+                              ValueRange stateOperands) {
+  SmallVector<OpFoldResult, 4> ofrs;
+  ofrs.reserve(stateOperands.size());
+  for (Value operand : stateOperands)
+    ofrs.push_back(operand);
+  return affine::makeComposedAffineApply(builder, loc, dimPlan.anchorMap, ofrs);
+}
+
+static Value buildOffsetValue(OpBuilder &builder, Location loc, Value base,
+                              Value offset) {
+  AffineExpr d0 = builder.getAffineDimExpr(0);
+  AffineExpr d1 = builder.getAffineDimExpr(1);
+  return affine::makeComposedAffineApply(
+      builder, loc, AffineMap::get(/*dimCount=*/2, /*symbolCount=*/0, d0 + d1),
+      {base, offset});
+}
+
+static Value buildOffsetValue(OpBuilder &builder, Location loc, Value base,
+                              int64_t offset) {
+  AffineExpr d0 = builder.getAffineDimExpr(0);
+  return affine::makeComposedAffineApply(
+      builder, loc,
+      AffineMap::get(/*dimCount=*/1, /*symbolCount=*/0,
+                     d0 + builder.getAffineConstantExpr(offset)),
+      {base});
+}
+
+static void generateReuseStateInit(OpBuilder &builder, Location loc,
+                                   Value sourceBuffer, Value reuseBuffer,
+                                   const ReuseStatePlan &plan,
+                                   ValueRange stateOperands) {
+  OpBuilder::InsertionGuard guard(builder);
+  SmallVector<Value, 4> localIndices(plan.keptDims.size());
+  for (auto [reusePos, extent] : llvm::enumerate(plan.shape)) {
+    affine::AffineForOp forOp =
+        createConstantAffineFor(builder, loc, /*lb=*/0, /*ub=*/extent);
+    builder.setInsertionPoint(
+        forOp.getBody(), Block::iterator(forOp.getBody()->getTerminator()));
+    localIndices[reusePos] = forOp.getInductionVar();
+  }
+
+  SmallVector<Value, 4> globalIndices(plan.dims.size());
+  for (auto [resultDim, dimPlan] : llvm::enumerate(plan.dims)) {
+    Value anchor = buildAnchorValue(builder, loc, dimPlan, stateOperands);
+    int reusePos = plan.resultToReusePos[resultDim];
+    globalIndices[resultDim] =
+        reusePos >= 0
+            ? buildOffsetValue(builder, loc, anchor, localIndices[reusePos])
+            : anchor;
+  }
+
+  Value loaded =
+      affine::AffineLoadOp::create(builder, loc, sourceBuffer, globalIndices);
+  affine::AffineStoreOp::create(builder, loc, loaded, reuseBuffer,
+                                localIndices);
+}
+
+static void generateReuseStateShift(OpBuilder &builder, Location loc,
+                                    Value reuseBuffer,
+                                    const ReuseStatePlan &plan) {
+  int slidingReusePos = plan.resultToReusePos[plan.slidingDim];
+  int64_t slidingExtent = plan.dims[plan.slidingDim].extent;
+  if (slidingReusePos < 0 || slidingExtent <= 1)
+    return;
+
+  OpBuilder::InsertionGuard guard(builder);
+  SmallVector<Value, 4> loopIvs(plan.keptDims.size());
+  for (auto [reusePos, dim] : llvm::enumerate(plan.keptDims)) {
+    int64_t lb = 0;
+    int64_t ub = plan.shape[reusePos];
+    if (static_cast<int>(reusePos) == slidingReusePos)
+      ub = slidingExtent - 1;
+    affine::AffineForOp forOp =
+        createConstantAffineFor(builder, loc, /*lb=*/lb, /*ub=*/ub);
+    builder.setInsertionPoint(
+        forOp.getBody(), Block::iterator(forOp.getBody()->getTerminator()));
+    loopIvs[reusePos] = forOp.getInductionVar();
+  }
+
+  SmallVector<Value, 4> srcIndices = loopIvs;
+  SmallVector<Value, 4> dstIndices = loopIvs;
+  if (plan.slidingCoeff > 0) {
+    Value sourceSliding =
+        buildOffsetValue(builder, loc, loopIvs[slidingReusePos], /*offset=*/1);
+    srcIndices[slidingReusePos] = sourceSliding;
+    dstIndices[slidingReusePos] = loopIvs[slidingReusePos];
+  } else {
+    Value reverseSliding = affine::makeComposedAffineApply(
+        builder, loc,
+        AffineMap::get(/*dimCount=*/1, /*symbolCount=*/0,
+                       builder.getAffineConstantExpr(slidingExtent - 2) -
+                           builder.getAffineDimExpr(0)),
+        {loopIvs[slidingReusePos]});
+    srcIndices[slidingReusePos] = reverseSliding;
+    dstIndices[slidingReusePos] =
+        buildOffsetValue(builder, loc, reverseSliding, /*offset=*/1);
+  }
+
+  Value shifted =
+      affine::AffineLoadOp::create(builder, loc, reuseBuffer, srcIndices);
+  affine::AffineStoreOp::create(builder, loc, shifted, reuseBuffer, dstIndices);
+}
+
+static void generateReuseStateRefill(OpBuilder &builder, Location loc,
+                                     Value sourceBuffer, Value reuseBuffer,
+                                     const ReuseStatePlan &plan,
+                                     ValueRange stateOperands) {
+  int slidingReusePos = plan.resultToReusePos[plan.slidingDim];
+  int64_t enteringLocalOffset =
+      plan.slidingCoeff > 0 ? plan.dims[plan.slidingDim].extent - 1 : 0;
+
+  OpBuilder::InsertionGuard guard(builder);
+  SmallVector<Value, 4> localIndices(plan.keptDims.size());
+  for (auto [reusePos, dim] : llvm::enumerate(plan.keptDims)) {
+    if (static_cast<int>(reusePos) == slidingReusePos)
+      continue;
+    affine::AffineForOp forOp =
+        createConstantAffineFor(builder, loc, /*lb=*/0,
+                                /*ub=*/plan.shape[reusePos]);
+    builder.setInsertionPoint(
+        forOp.getBody(), Block::iterator(forOp.getBody()->getTerminator()));
+    localIndices[reusePos] = forOp.getInductionVar();
+  }
+
+  if (slidingReusePos >= 0) {
+    localIndices[slidingReusePos] =
+        arith::ConstantIndexOp::create(builder, loc, enteringLocalOffset);
+  }
+
+  SmallVector<Value, 4> globalIndices(plan.dims.size());
+  for (auto [resultDim, dimPlan] : llvm::enumerate(plan.dims)) {
+    Value anchor = buildAnchorValue(builder, loc, dimPlan, stateOperands);
+    int reusePos = plan.resultToReusePos[resultDim];
+    if (reusePos < 0) {
+      globalIndices[resultDim] = anchor;
+      continue;
+    }
+    globalIndices[resultDim] =
+        buildOffsetValue(builder, loc, anchor, localIndices[reusePos]);
+  }
+
+  Value loaded =
+      affine::AffineLoadOp::create(builder, loc, sourceBuffer, globalIndices);
+  affine::AffineStoreOp::create(builder, loc, loaded, reuseBuffer,
+                                localIndices);
+}
+
+static Value materializeGlobalAccessIndex(OpBuilder &builder, Location loc,
+                                          const ComposedBufferAccess &access,
+                                          unsigned resultDim) {
+  AffineMap singleResultMap = access.map.getSubMap(resultDim);
+  SmallVector<OpFoldResult, 4> ofrs;
+  for (Value operand : access.operands)
+    ofrs.push_back(operand);
+  return affine::makeComposedAffineApply(builder, loc, singleResultMap, ofrs);
 }
 
 DiagnosedSilenceableFailure
 transform::ReuseAtOp::apply(transform::TransformRewriter &rewriter,
                             transform::TransformResults &results,
                             transform::TransformState &state) {
-  // Stage 0: resolve transform handles to concrete payload IR objects.
-  // Resolve concrete payloads first; ReuseAt requires a single memref and loop.
+  // preconditions: input handles must resolve to exactly one value/operation of
+  // the expected type
   auto targets = llvm::to_vector(state.getPayloadValues(getTarget()));
   if (targets.size() != 1) {
     return emitSilenceableError()
@@ -1940,15 +2407,33 @@ transform::ReuseAtOp::apply(transform::TransformRewriter &rewriter,
     return emitSilenceableError()
            << "expected target to resolve to a memref value";
 
-  auto axisLoopOr = resolveAxisLoop(state, *this);
-  if (failed(axisLoopOr))
+  auto loops = llvm::to_vector(state.getPayloadOps(getAxis()));
+  if (loops.size() != 1) {
+    return emitSilenceableError() << "expected axis handle to resolve to "
+                                     "exactly one payload operation";
+  }
+  auto axisLoop = dyn_cast<affine::AffineForOp>(loops.front());
+  if (!axisLoop)
     return emitSilenceableError()
            << "expected axis to resolve to exactly one affine.for loop";
-  affine::AffineForOp axisLoop = *axisLoopOr;
+
+  // require normalized loops
+  if (axisLoop.getStepAsInt() != 1 || !axisLoop.hasConstantBounds() ||
+      axisLoop.getConstantLowerBound() != 0)
+    return emitSilenceableError()
+           << "reuse_at requires the selected axis loop to have lower bound 0, "
+              "step 1, and constant bounds";
+
+  // require the target buffer to be defined outside the axis loop
+  Operation *targetDef = target.getDefiningOp();
+  if (targetDef && axisLoop->isAncestor(targetDef))
+    return emitSilenceableError()
+           << "expected target buffer to be defined outside the selected axis "
+              "loop";
+
   Value axisIV = axisLoop.getInductionVar();
   unsigned rank = targetType.getRank();
 
-  // Stage 0.5: classify loop roles and reject unsupported axis selections.
   affine::AffineForOp rootLoop = getRootLoop(axisLoop);
   LoopRoleInfo roles;
   SmallVector<affine::AffineForOp, 8> allLoops;
@@ -1965,213 +2450,73 @@ transform::ReuseAtOp::apply(transform::TransformRewriter &rewriter,
     return emitSilenceableError()
            << "selected axis loop is not classified as a spatial loop";
 
-  DenseMap<Value, int64_t> reductionUpperBounds = roles.reductionUpperBounds;
-  int64_t stride = 1;
-  SmallVector<int64_t, 8> spans;
-  // Stage 1: infer shape/stride information used by buffer allocation/remap.
-  if (auto reason =
-          analyzeSpanAndStride(axisLoop, target, rank, reductionUpperBounds,
-                               rewriter, spans, stride)) {
-    return emitSilenceableError() << *reason;
-  }
+  SmallVector<ComposedBufferAccess, 8> accesses;
+  SmallVector<affine::AffineForOp, 8> innerLoops;
+  if (failed(collectReuseAccesses(axisLoop, target, accesses, innerLoops)))
+    return emitSilenceableError()
+           << "failed to collect reuse candidate accesses";
 
-  std::set<AffineExpr, ExprCompare> requestedAxisExprs;
-  SmallVector<affine::AffineLoadOp, 8> orderedLoadOps;
-  DenseMap<unsigned, int64_t> reductionDimBounds;
-  unsigned axis = 0;
-  int64_t distance = -1;
-  // Stage 2: infer reusable axis and requested index window.
-  if (auto reason = analyzeAxisReuseWindow(
-          axisLoop, target, axisIV, reductionUpperBounds, rewriter, axis,
-          distance, requestedAxisExprs, orderedLoadOps, reductionDimBounds)) {
-    return emitSilenceableError() << *reason;
-  }
+  FailureOr<ReuseStatePlan> planOr = analyzeReuseStatePlan(
+      accesses, innerLoops, axisLoop, rank, rewriter.getContext());
+  if (failed(planOr))
+    return emitSilenceableError() << "failed to analyze reuse state plan";
+  ReuseStatePlan plan = std::move(*planOr);
 
-  AffineExpr baseAxisExpr;
-  // Stage 3: validate pattern constraints before mutating IR.
-  if (auto reason =
-          validateAxisReuseWindow(requestedAxisExprs, orderedLoadOps, axis,
-                                  reductionDimBounds, baseAxisExpr)) {
-    return emitSilenceableError() << *reason;
-  }
-
-  // Stage 4: materialize the reuse buffer shape and allocate it at root scope.
-  SmallVector<int64_t, 8> reuseBufferShape;
-  for (unsigned i = 0; i < axis; ++i) {
-    if (spans[i] > 1)
-      reuseBufferShape.push_back(spans[i]);
-  }
-  reuseBufferShape.push_back(distance + 1);
-  for (unsigned i = axis + 1; i < rank; ++i)
-    reuseBufferShape.push_back(targetType.getShape()[i]);
-
-  rewriter.setInsertionPoint(rootLoop);
+  rewriter.setInsertionPoint(axisLoop);
   auto reuseBuffer = memref::AllocOp::create(
-      rewriter, rootLoop.getLoc(),
-      MemRefType::get(reuseBufferShape, targetType.getElementType()));
-  if (Operation *targetDef = target.getDefiningOp()) {
-    if (auto targetSymName =
-            targetDef->getAttrOfType<StringAttr>(OpIdentifier)) {
+      rewriter, axisLoop.getLoc(),
+      MemRefType::get(plan.shape, targetType.getElementType()));
+  if (targetDef) {
+    if (auto targetSymName = targetDef->getAttrOfType<StringAttr>(OpIdentifier))
       reuseBuffer->setAttr(
           OpIdentifier, StringAttr::get(reuseBuffer->getContext(),
                                         targetSymName.getValue() + "::reuse"));
-    }
   }
 
-  // Stage 5: extend the axis loop domain and rebase dependent arithmetic users.
-  // Extend loop bound to include the warmup distance for the reuse window.
-  int64_t originalUpperBound = axisLoop.getConstantUpperBound();
-  axisLoop.setConstantUpperBound(originalUpperBound * stride + distance);
+  SmallVector<Value, 4> stateOperands =
+      getReuseStateOperands(axisIV, plan.prefixOperands);
 
-  for (auto &use : llvm::make_early_inc_range(axisIV.getUses())) {
-    auto castOp = dyn_cast<arith::IndexCastOp>(use.getOwner());
-    if (!castOp)
-      continue;
-    for (auto &castUse :
-         llvm::make_early_inc_range(castOp.getResult().getUses())) {
-      auto mulOp = dyn_cast<arith::MulIOp>(castUse.getOwner());
-      if (!mulOp)
-        continue;
-      rewriter.setInsertionPoint(mulOp);
-      Type dtype = mulOp.getResult().getType();
-      // Rebase axis-related arithmetic to the shifted reuse window coordinates.
-      auto strideCst =
-          arith::ConstantOp::create(rewriter, mulOp.getLoc(), dtype,
-                                    rewriter.getIntegerAttr(dtype, stride));
-      auto shifted = arith::SubIOp::create(rewriter, mulOp.getLoc(),
-                                           castOp.getResult(), strideCst);
-      mulOp.replaceAllUsesWith(shifted.getResult());
-      mulOp.erase();
-    }
+  rewriter.setInsertionPointToStart(axisLoop.getBody());
+  IntegerSet initSet = IntegerSet::get(
+      /*dimCount=*/1, /*symbolCount=*/0,
+      ArrayRef<AffineExpr>{rewriter.getAffineDimExpr(0)}, ArrayRef<bool>{true});
+  auto initIf = affine::AffineIfOp::create(rewriter, axisLoop.getLoc(), initSet,
+                                           ValueRange{axisIV},
+                                           /*withElseRegion=*/true);
+  {
+    OpBuilder thenBuilder = initIf.getThenBodyBuilder();
+    generateReuseStateInit(thenBuilder, axisLoop.getLoc(), target, reuseBuffer,
+                           plan, stateOperands);
+  }
+  {
+    OpBuilder elseBuilder = initIf.getElseBodyBuilder();
+    generateReuseStateShift(elseBuilder, axisLoop.getLoc(), reuseBuffer, plan);
+    generateReuseStateRefill(elseBuilder, axisLoop.getLoc(), target,
+                             reuseBuffer, plan, stateOperands);
   }
 
-  // Stage 6: rewrite stores so axis indices match the shifted/scaled loop
-  // space.
-  SmallVector<Operation *, 8> storesToErase;
-  axisLoop.walk([&](affine::AffineStoreOp storeOp) {
-    MemRefType storeType = dyn_cast<MemRefType>(storeOp.getMemRef().getType());
-    if (!storeType ||
-        (storeType.getRank() == 1 && storeType.getShape()[0] == 1)) {
-      return WalkResult::advance();
+  for (const auto &access : accesses) {
+    auto readOp = cast<affine::AffineReadOpInterface>(access.op);
+    rewriter.setInsertionPoint(access.op);
+    Location loadLoc = access.op->getLoc();
+    SmallVector<Value, 4> localIndices;
+    localIndices.reserve(plan.keptDims.size());
+    for (unsigned resultDim : plan.keptDims) {
+      Value globalIndex =
+          materializeGlobalAccessIndex(rewriter, loadLoc, access, resultDim);
+      Value anchor = buildAnchorValue(rewriter, loadLoc, plan.dims[resultDim],
+                                      stateOperands);
+      localIndices.push_back(affine::makeComposedAffineApply(
+          rewriter, loadLoc,
+          AffineMap::get(/*dimCount=*/2, /*symbolCount=*/0,
+                         rewriter.getAffineDimExpr(0) -
+                             rewriter.getAffineDimExpr(1)),
+          {globalIndex, anchor}));
     }
-
-    rewriter.setInsertionPoint(storeOp);
-    SmallVector<AffineExpr, 8> remappedIndices;
-    AffineMap oldMap = storeOp.getAffineMap();
-    int axisResultIdx = findMemRefAxisFromIVs(storeOp, axisIV);
-    for (unsigned i = 0, e = oldMap.getNumResults(); i < e; ++i) {
-      if (static_cast<int>(i) != axisResultIdx) {
-        remappedIndices.push_back(oldMap.getResult(i));
-        continue;
-      }
-      // Axis dimension is remapped by distance/stride; others keep original
-      // form.
-      if (stride != 1) {
-        AffineExpr strideExpr = rewriter.getAffineConstantExpr(stride);
-        remappedIndices.push_back(
-            (oldMap.getResult(i) - distance).floorDiv(strideExpr));
-      } else {
-        remappedIndices.push_back(oldMap.getResult(i) - distance);
-      }
-    }
-
-    AffineMap newMap = AffineMap::get(storeType.getRank(), 0, remappedIndices,
-                                      rewriter.getContext());
-    affine::AffineStoreOp::create(
-        rewriter, storeOp->getLoc(), storeOp.getValueToStore(),
-        storeOp.getMemRef(), newMap, storeOp.getIndices());
-    storesToErase.push_back(storeOp);
-    return WalkResult::advance();
-  });
-  for (Operation *store : storesToErase)
-    store->erase();
-
-  // Stage 7: update affine.if guards that directly depend on the axis IV.
-  axisLoop.walk([&](affine::AffineIfOp ifOp) {
-    int axisOperandIdx = -1;
-    for (auto item : llvm::enumerate(ifOp.getOperands())) {
-      if (item.value() == axisIV) {
-        axisOperandIdx = static_cast<int>(item.index());
-        break;
-      }
-    }
-    if (axisOperandIdx == -1)
-      return WalkResult::advance();
-
-    IntegerSet condSet = ifOp.getIntegerSet();
-    AffineExpr distanceExpr = rewriter.getAffineConstantExpr(distance);
-    AffineExpr strideAdjust = rewriter.getAffineConstantExpr(stride - 1) *
-                              rewriter.getAffineDimExpr(axisOperandIdx);
-
-    SmallVector<AffineExpr, 8> updatedConds;
-    for (AffineExpr cond : condSet.getConstraints()) {
-      bool hasNegativeSign = false;
-      cond.walk([&](AffineExpr expr) {
-        auto binary = dyn_cast<AffineBinaryOpExpr>(expr);
-        if (!binary || binary.getKind() != AffineExprKind::Mul)
-          return;
-        if (auto cst = dyn_cast<AffineConstantExpr>(binary.getRHS()))
-          hasNegativeSign = cst.getValue() == -1;
-      });
-
-      if (!cond.isFunctionOfDim(axisOperandIdx)) {
-        updatedConds.push_back(cond);
-      } else if (hasNegativeSign) {
-        // Preserve inequality direction when the condition is negated.
-        updatedConds.push_back(cond + distanceExpr + strideAdjust);
-      } else {
-        updatedConds.push_back(cond - distanceExpr - strideAdjust);
-      }
-    }
-
-    IntegerSet updatedSet = IntegerSet::get(condSet.getNumDims(), 0,
-                                            updatedConds, condSet.getEqFlags());
-    ifOp.setIntegerSet(updatedSet);
-    return WalkResult::advance();
-  });
-
-  // Stage 8: rewrite original target loads to read from the reuse buffer.
-  for (affine::AffineLoadOp loadOp : orderedLoadOps) {
-    rewriter.setInsertionPoint(loadOp);
-
-    AffineMap loadMap = loadOp.getAffineMap();
-    SmallVector<Value, 8> operands = llvm::to_vector(loadOp.getMapOperands());
-    SmallVector<AffineExpr, 8> reuseLoadExprs;
-    SmallVector<Value, 8> reuseLoadOperands;
-
-    reuseLoadExprs.push_back(loadMap.getResult(axis) - baseAxisExpr);
-
-    unsigned reducedRank = 0;
-    unsigned operandIdx = 0;
-    for (unsigned i = 0; i < axis; ++i) {
-      if (spans[i] > 1)
-        reuseLoadExprs.push_back(loadMap.getResult(i));
-    }
-
-    SmallVector<AffineExpr, 8> dims;
-    for (unsigned i = 0; i < axis + 1; ++i) {
-      AffineExpr expr = loadMap.getResult(i);
-      if (!isa<AffineConstantExpr>(expr)) {
-        ++operandIdx;
-        dims.push_back(rewriter.getAffineDimExpr(0)); // placeholder
-      }
-    }
-    for (unsigned i = axis + 1; i < rank; ++i)
-      dims.push_back(rewriter.getAffineDimExpr(reducedRank++));
-
-    for (unsigned i = axis + 1; i < rank; ++i) {
-      AffineExpr expr = loadMap.getResult(i);
-      reuseLoadExprs.push_back(expr.replaceDims(dims));
-      reuseLoadOperands.push_back(operands[operandIdx++]);
-    }
-
-    AffineMap reuseLoadMap =
-        AffineMap::get(reducedRank, 0, reuseLoadExprs, rewriter.getContext());
-    rewriter.replaceOpWithNewOp<affine::AffineLoadOp>(
-        loadOp, reuseBuffer, reuseLoadMap, reuseLoadOperands);
+    rewriter.replaceOpWithNewOp<affine::AffineLoadOp>(readOp, reuseBuffer,
+                                                      localIndices);
   }
 
-  // Stage 9: return the allocated reuse buffer as transform result.
   results.set(cast<OpResult>(getResult()), {reuseBuffer.getOperation()});
   return DiagnosedSilenceableFailure::success();
 }
@@ -2232,143 +2577,68 @@ struct BufferAtFootprint {
   SmallVector<Value, 4> symbols;
   AffineMap localIndexRemap;
 };
-
-struct ComposedBufferAccess {
-  Operation *op = nullptr;
-  AffineMap map;
-  SmallVector<Value, 4> operands;
-};
 } // namespace
 
 static LogicalResult
-collectBufferAtAccesses(transform::BufferAtOp transformOp,
-                        affine::AffineForOp axisLoop, Value buffer,
+collectBufferAtAccesses(affine::AffineForOp axisLoop, Value buffer,
                         SmallVectorImpl<Operation *> &accessOps, bool &hasLoads,
                         bool &hasStores) {
   // Gather the affine accesses that will be rewritten to the local buffer.
-  // At the same time, reject alias/view-based accesses because the later remap
-  // step only understands direct accesses to the chosen memref value.
+  // At the same time, reject non-affine direct accesses and alias/view-based
+  // accesses because the later remap step only understands direct affine
+  // accesses to the chosen memref value.
   Value bufferRoot = resolveMemRefValueRoot(buffer);
-  LogicalResult result = success();
 
   auto walkResult = axisLoop.walk([&](Operation *op) {
-    Value memref;
     if (auto readOp = dyn_cast<affine::AffineReadOpInterface>(op)) {
-      memref = readOp.getMemRef();
+      Value memref = readOp.getMemRef();
       if (memref == buffer) {
         accessOps.push_back(op);
         hasLoads = true;
       }
     } else if (auto writeOp = dyn_cast<affine::AffineWriteOpInterface>(op)) {
-      memref = writeOp.getMemRef();
+      Value memref = writeOp.getMemRef();
       if (memref == buffer) {
         accessOps.push_back(op);
         hasStores = true;
       }
     } else if (auto loadOp = dyn_cast<memref::LoadOp>(op)) {
-      memref = loadOp.getMemRef();
+      Value memref = loadOp.getMemRef();
+      if (resolveMemRefValueRoot(memref) == bufferRoot) {
+        auto diag = axisLoop.emitError()
+                    << "buffer_at only supports affine.load/store accesses "
+                       "to the target buffer within the selected axis loop";
+        diag.attachNote(loadOp->getLoc()) << "see memref.load op here";
+        return WalkResult::interrupt();
+      }
     } else if (auto storeOp = dyn_cast<memref::StoreOp>(op)) {
-      memref = storeOp.getMemRef();
-    } else {
-      return WalkResult::advance();
-    }
-
-    if (!memref || memref == buffer)
-      return WalkResult::advance();
-
-    if (resolveMemRefValueRoot(memref) == bufferRoot) {
-      InFlightDiagnostic diag = transformOp.emitOpError();
-      diag << "buffer_at does not support aliasing/view accesses to the target "
-              "buffer "
-           << "within the selected axis loop";
-      diag.attachNote(op->getLoc())
-          << "aliasing/view access to the same underlying buffer here";
-      return WalkResult::interrupt();
+      Value memref = storeOp.getMemRef();
+      if (resolveMemRefValueRoot(memref) == bufferRoot) {
+        auto diag = axisLoop.emitError()
+                    << "buffer_at only supports affine.load/store accesses "
+                       "to the target buffer within the selected axis loop";
+        diag.attachNote(storeOp->getLoc()) << "see memref.store op here";
+        return WalkResult::interrupt();
+      }
+    } else if (isMemRefCastOrViewLike(op)) {
+      bool aliasesBuffer = llvm::any_of(op->getResults(), [&](Value result) {
+        return isa<BaseMemRefType>(result.getType()) &&
+               resolveMemRefValueRoot(result) == bufferRoot;
+      });
+      if (aliasesBuffer) {
+        auto diag = axisLoop.emitError()
+                    << "buffer_at does not support aliasing/view accesses to "
+                       "the target buffer within the selected axis loop";
+        diag.attachNote(op->getLoc()) << "see aliasing/view op here";
+        return WalkResult::interrupt();
+      }
     }
     return WalkResult::advance();
   });
 
   if (walkResult.wasInterrupted())
-    return result;
+    return failure();
   return success();
-}
-
-static ComposedBufferAccess composeBufferAccess(Operation *accessOp) {
-  affine::MemRefAccess access(accessOp);
-  affine::AffineValueMap accessValueMap;
-  access.getAccessMap(&accessValueMap);
-  return {accessOp, accessValueMap.getAffineMap(),
-          llvm::to_vector(accessValueMap.getOperands())};
-}
-
-static void
-collectFootprintOperands(ArrayRef<ComposedBufferAccess> accesses,
-                         ArrayRef<affine::AffineForOp> innerLoops,
-                         DenseMap<Value, unsigned> &prefixOperandPos,
-                         SmallVectorImpl<Value> &prefixOperands) {
-  // Record the non-inner-loop operands that appear in access expressions.
-  // These become the symbolic parameters of the per-instance footprint and the
-  // local index remapping.
-  for (const ComposedBufferAccess &access : accesses) {
-    for (AffineExpr resultExpr : access.map.getResults()) {
-      for (Value operand : access.operands) {
-        operand = stripCast(operand);
-        if (llvm::any_of(innerLoops, [&](affine::AffineForOp loop) {
-              return loop.getInductionVar() == operand;
-            })) {
-          continue;
-        }
-        if (!affineExprUsesValue(resultExpr, access.operands,
-                                 access.map.getNumDims(), operand)) {
-          continue;
-        }
-        if (prefixOperandPos.contains(operand))
-          continue;
-        prefixOperandPos[operand] = prefixOperands.size();
-        prefixOperands.push_back(operand);
-      }
-    }
-  }
-}
-
-static void populateExprReplacements(
-    AffineMap accessMap, ArrayRef<Value> accessOperands,
-    DenseMap<Value, unsigned> &prefixOperandPos,
-    SmallVectorImpl<Value> &prefixOperands, Value targetLoopIV,
-    std::optional<int64_t> targetLoopConstant,
-    std::optional<unsigned> targetLoopDimPos, unsigned prefixDimOffset,
-    SmallVectorImpl<AffineExpr> &dimReplacements,
-    SmallVectorImpl<AffineExpr> &symReplacements) {
-  // Normalize one access expression into a common coordinate system.
-  // The analyzed loop IV is substituted either with a constant bound or with a
-  // fresh dim, while outer operands are packed into the prefix dims.
-  dimReplacements.clear();
-  symReplacements.clear();
-  dimReplacements.reserve(accessMap.getNumDims());
-  symReplacements.reserve(accessMap.getNumSymbols());
-
-  auto getReplacement = [&](Value operand) {
-    operand = stripCast(operand);
-    if (operand == targetLoopIV) {
-      if (targetLoopDimPos.has_value())
-        return getAffineDimExpr(*targetLoopDimPos, accessMap.getContext());
-      assert(targetLoopConstant.has_value() &&
-             "expected either a loop dim or a loop constant replacement");
-      return getAffineConstantExpr(*targetLoopConstant, accessMap.getContext());
-    }
-
-    auto it = prefixOperandPos.find(operand);
-    if (it == prefixOperandPos.end())
-      return getAffineConstantExpr(0, accessMap.getContext());
-    return getAffineDimExpr(prefixDimOffset + it->second,
-                            accessMap.getContext());
-  };
-
-  for (unsigned i = 0; i < accessMap.getNumDims(); ++i)
-    dimReplacements.push_back(getReplacement(accessOperands[i]));
-  for (unsigned i = 0; i < accessMap.getNumSymbols(); ++i)
-    symReplacements.push_back(
-        getReplacement(accessOperands[accessMap.getNumDims() + i]));
 }
 
 static FailureOr<std::pair<AffineExpr, int64_t>>
@@ -2470,8 +2740,8 @@ analyzeBufferAtFootprint(ArrayRef<Operation *> accessOps,
     accesses.push_back(composeBufferAccess(accessOp));
 
   DenseMap<Value, unsigned> prefixOperandPos;
-  collectFootprintOperands(accesses, innerLoops, prefixOperandPos,
-                           footprint.symbols);
+  collectFootprintOperands(accesses, innerLoops, /*excludedValues=*/{},
+                           prefixOperandPos, footprint.symbols);
   SmallVector<std::pair<AffineExpr, int64_t>, 4> commonFootprint;
   commonFootprint.reserve(bufferRank);
 
@@ -2533,25 +2803,8 @@ static bool affineExprUsesDimPosition(AffineExpr expr, unsigned dimPos) {
   return used;
 }
 
-static FailureOr<int64_t> getLinearAffineDimCoefficient(AffineExpr expr,
-                                                        unsigned numDims,
-                                                        unsigned dimPos) {
-  // Flatten the lower-bound expression so we can measure how fast the selected
-  // axis shifts the accessed region. This is later used to test whether two
-  // neighboring axis iterations are guaranteed to land on disjoint tiles.
-  FlatLinearConstraints localVarCst(numDims, /*numSymbols=*/0);
-  SmallVector<int64_t, 8> flattenedExpr;
-  if (failed(getFlattenedAffineExpr(expr, numDims, /*numSymbols=*/0,
-                                    &flattenedExpr, &localVarCst)))
-    return failure();
-  if (localVarCst.getNumLocalVars() != 0 || flattenedExpr.size() != numDims + 1)
-    return failure();
-  return flattenedExpr[dimPos];
-}
-
 static LogicalResult
-checkBufferAtFootprintSeparability(transform::BufferAtOp transformOp,
-                                   const BufferAtFootprint &footprint,
+checkBufferAtFootprintSeparability(const BufferAtFootprint &footprint,
                                    affine::AffineForOp axisLoop) {
   // A legal buffer_at needs the selected axis to separate per-instance regions.
   // We approximate this by checking whether the axis moves some footprint bound
@@ -2559,7 +2812,7 @@ checkBufferAtFootprintSeparability(transform::BufferAtOp transformOp,
   Value axisIV = axisLoop.getInductionVar();
   auto it = llvm::find(footprint.symbols, axisIV);
   if (it == footprint.symbols.end()) {
-    InFlightDiagnostic diag = transformOp.emitOpError();
+    InFlightDiagnostic diag = axisLoop.emitError();
     diag << "cannot buffer_at on this axis because the target buffer cannot "
             "be made private to each iteration";
     diag.attachNote(axisLoop.getLoc())
@@ -2590,7 +2843,7 @@ checkBufferAtFootprintSeparability(transform::BufferAtOp transformOp,
   }
 
   if (!foundAxisSensitiveDim) {
-    InFlightDiagnostic diag = transformOp.emitOpError();
+    InFlightDiagnostic diag = axisLoop.emitError();
     diag << "cannot buffer_at on this axis because the target buffer cannot "
             "be made private to each iteration";
     diag.attachNote(axisLoop.getLoc())
@@ -2598,7 +2851,7 @@ checkBufferAtFootprintSeparability(transform::BufferAtOp transformOp,
            "axis, so every iteration would use the same region";
     return failure();
   }
-  InFlightDiagnostic diag = transformOp.emitOpError();
+  InFlightDiagnostic diag = axisLoop.emitError();
   diag << "cannot buffer_at on this axis because the target buffer cannot be "
           "made private to each iteration";
   diag.attachNote(axisLoop.getLoc())
@@ -2712,9 +2965,7 @@ transform::BufferAtOp::apply(transform::TransformRewriter &rewriter,
   }
 
   // get the root loop of the selected axis
-  affine::AffineForOp rootLoop = axisLoop;
-  while (auto parent = rootLoop->getParentOfType<affine::AffineForOp>())
-    rootLoop = parent;
+  affine::AffineForOp rootLoop = getRootLoop(axisLoop);
 
   SmallVector<affine::AffineForOp, 4> band;
   affine::getPerfectlyNestedLoops(band, rootLoop);
@@ -2738,8 +2989,8 @@ transform::BufferAtOp::apply(transform::TransformRewriter &rewriter,
   SmallVector<Operation *, 8> localAccessOps;
   bool hasLoads = false;
   bool hasStores = false;
-  if (failed(collectBufferAtAccesses(*this, axisLoop, buffer, localAccessOps,
-                                     hasLoads, hasStores)))
+  if (failed(collectBufferAtAccesses(axisLoop, buffer, localAccessOps, hasLoads,
+                                     hasStores)))
     return emitSilenceableError() << "buffer_at failed";
   if (localAccessOps.empty()) {
     return emitSilenceableError()
@@ -2759,7 +3010,7 @@ transform::BufferAtOp::apply(transform::TransformRewriter &rewriter,
               "footprint for the target buffer";
   }
   BufferAtFootprint footprint = std::move(*footprintOr);
-  if (failed(checkBufferAtFootprintSeparability(*this, footprint, axisLoop)))
+  if (failed(checkBufferAtFootprintSeparability(footprint, axisLoop)))
     return emitSilenceableError() << "buffer_at failed";
 
   // Finally allocate the local buffer, emit copy-in/copy-out around the axis

@@ -129,7 +129,7 @@ func.func @buffer_at_overlapping_axis_tiles_rejected() {
   %tmp = memref.alloc() {sym_name = "tmp"} : memref<16xi32>
   %c1 = arith.constant 1 : i32
   // expected-note @+1 {{different iterations of the selected axis access overlapping regions of the target buffer}}
-  affine.for %i = 0 to 8 {
+  affine.for %i = 0 to 8 { // expected-error {{the target buffer cannot be made private to each iteration}}
     affine.for %j = 0 to 8 {
       affine.store %c1, %tmp[%i + %j] : memref<16xi32>
     } {sym_name = "j"}
@@ -145,7 +145,6 @@ module attributes {transform.with_named_sequence} {
       : !transform.any_op -> !transform.any_value
     %axis = transform.structured.match attributes {sym_name = "i"} in %root
       : (!transform.any_op) -> !transform.any_op
-    // expected-error @+1 {{the target buffer cannot be made private to each iteration}}
     %local = transform.allo.buffer_at %target at %axis  // expected-error {{buffer_at failed}}
       : (!transform.any_value, !transform.any_op) -> !transform.any_value
     transform.yield
@@ -213,6 +212,58 @@ module attributes {transform.with_named_sequence} {
 
 // -----
 
+func.func @buffer_at_memref_load_rejected() {
+  %tmp = memref.alloc() {sym_name = "tmp_non_affine_load"} : memref<8x8xi32>
+  affine.for %i = 0 to 8 { // expected-error {{only supports affine.load/store}}
+    affine.for %j = 0 to 8 {
+      %0 = memref.load %tmp[%i, %j] : memref<8x8xi32> // expected-note {{see memref.load op here}}
+    } {sym_name = "j"}
+  } {sym_name = "i"}
+  func.return
+}
+
+module attributes {transform.with_named_sequence} {
+  transform.named_sequence @__transform_main(%root: !transform.any_op) {
+    %alloc = transform.structured.match attributes {sym_name = "tmp_non_affine_load"} in %root
+      : (!transform.any_op) -> !transform.any_op
+    %target = transform.allo.match_value 0 of %alloc kind 2
+      : !transform.any_op -> !transform.any_value
+    %axis = transform.structured.match attributes {sym_name = "i"} in %root
+      : (!transform.any_op) -> !transform.any_op
+    %local = transform.allo.buffer_at %target at %axis  // expected-error {{buffer_at failed}}
+      : (!transform.any_value, !transform.any_op) -> !transform.any_value
+    transform.yield
+  }
+}
+
+// -----
+
+func.func @buffer_at_alias_view_rejected() {
+  %tmp = memref.alloc() {sym_name = "tmp_alias"} : memref<8x8xi32>
+  affine.for %i = 0 to 8 { // expected-error {{aliasing/view accesses}}
+    affine.for %j = 0 to 8 {
+      %view = memref.cast %tmp : memref<8x8xi32> to memref<?x?xi32> // expected-note {{see aliasing/view op here}}
+    } {sym_name = "j"}
+  } {sym_name = "i"}
+  func.return
+}
+
+module attributes {transform.with_named_sequence} {
+  transform.named_sequence @__transform_main(%root: !transform.any_op) {
+    %alloc = transform.structured.match attributes {sym_name = "tmp_alias"} in %root
+      : (!transform.any_op) -> !transform.any_op
+    %target = transform.allo.match_value 0 of %alloc kind 2
+      : !transform.any_op -> !transform.any_value
+    %axis = transform.structured.match attributes {sym_name = "i"} in %root
+      : (!transform.any_op) -> !transform.any_op
+    %local = transform.allo.buffer_at %target at %axis  // expected-error {{buffer_at failed}}
+      : (!transform.any_value, !transform.any_op) -> !transform.any_value
+    transform.yield
+  }
+}
+
+// -----
+
 // CHECK-LABEL: func.func @buffer_at_gemm_non_reduction
 func.func @buffer_at_gemm_non_reduction(%a: memref<4x4xi32>,
                                         %b: memref<4x8xi32>) {
@@ -254,7 +305,7 @@ func.func @buffer_at_gemm_reduction_rejected(%a: memref<4x4xi32>,
   %acc = memref.alloc() {sym_name = "acc"} : memref<4x8xi32>
   affine.for %i = 0 to 4 {
     // expected-note @+1 {{the target-buffer access pattern does not depend on the selected axis, so every iteration would use the same region}}
-    affine.for %r = 0 to 4 {
+    affine.for %r = 0 to 4 { // expected-error {{the target buffer cannot be made private to each iteration}}
       affine.for %j = 0 to 8 {
         %lhs = affine.load %a[%i, %r] : memref<4x4xi32>
         %rhs = affine.load %b[%r, %j] : memref<4x8xi32>
@@ -276,7 +327,6 @@ module attributes {transform.with_named_sequence} {
       : !transform.any_op -> !transform.any_value
     %axis = transform.structured.match attributes {sym_name = "r"} in %root
       : (!transform.any_op) -> !transform.any_op
-    // expected-error @+1 {{the target buffer cannot be made private to each iteration}}
    %local = transform.allo.buffer_at %target at %axis  // expected-error {{buffer_at failed}}
       : (!transform.any_value, !transform.any_op) -> !transform.any_value
     transform.yield
