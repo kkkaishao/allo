@@ -1334,8 +1334,7 @@ applyNoDependenceMove(transform::TransformRewriter &rewriter,
     Value consumerInnermostIV = analysis.consumerChain.back().getInductionVar();
     rewriter.eraseOp(producerInnermostBody->getTerminator());
     rewriter.inlineBlockBefore(producerInnermostBody, destination,
-                               destination->begin(),
-                               ValueRange{consumerInnermostIV});
+                               destination->begin(), consumerInnermostIV);
   } else {
     Operation *producerSubtree =
         analysis.producerChain[consumerDepth].getOperation();
@@ -1686,6 +1685,12 @@ enum class ReuseBufferStrategy {
   Ring,
 };
 
+struct ReuseResetBoundaryPlan {
+  affine::AffineForOp rootLoop;
+  affine::AffineForOp resetBoundaryLoop;
+  bool canHoist = false;
+};
+
 struct ReuseExecutionPlan {
   explicit ReuseExecutionPlan(ReuseStatePlan statePlan, bool enableRing)
       : statePlan(std::move(statePlan)),
@@ -1724,10 +1729,21 @@ struct NoRingReuseWrapper {
   affine::AffineStoreOp thenStore;
   affine::AffineLoadOp elseLoad;
 };
+
+struct RingAccessCluster {
+  SmallVector<unsigned, 4> accessIndices;
+};
+
+struct RingAccessPrecomputedIndices {
+  SmallVector<Value, 4> logicalIndices;
+  SmallVector<Value, 4> physicalIndices;
+};
 } // namespace
 
 static std::optional<NoRingReuseWrapper>
 matchNoRingReuseWrapper(affine::AffineIfOp ifOp, Value target) {
+  // Match the no-ring warm-up wrapper emitted by a previous reuse_at.
+  // Chained no-ring reuse reuses the target load hidden in this affine.if.
   if (!ifOp.hasElse() || ifOp.getNumResults() != 1)
     return std::nullopt;
 
@@ -1776,6 +1792,8 @@ matchNoRingReuseWrapper(affine::AffineIfOp ifOp, Value target) {
 static bool valueDependsOnTargetLoad(Value value, Value target,
                                      DenseMap<Value, bool> &cache,
                                      SmallPtrSetImpl<Value> &visiting) {
+  // Trace through arithmetic and affine.if results to see whether a value
+  // ultimately depends on an affine.load from the target buffer.
   if (auto it = cache.find(value); it != cache.end())
     return it->second;
   if (!visiting.insert(value).second)
@@ -1849,6 +1867,8 @@ static LogicalResult
 classifyLoopRoles(affine::AffineForOp rootForOp, Value target,
                   LoopRoleInfo &roles,
                   SmallVectorImpl<affine::AffineForOp> &allLoops) {
+  // Spatial loops affect stores fed by target loads; reduction loops only
+  // affect target-load indexing. reuse_at uses this split to validate the axis.
   WalkResult walkResult = rootForOp.walk([&](affine::AffineForOp forOp) {
     if (!requireNormalizedLoop(forOp))
       return WalkResult::interrupt();
@@ -1940,6 +1960,8 @@ static LogicalResult
 collectReuseAccesses(affine::AffineForOp axisLoop, Value target,
                      SmallVectorImpl<ComposedBufferAccess> &accesses,
                      SmallVectorImpl<affine::AffineForOp> &innerLoops) {
+  // Collect canonicalized target reads under the selected axis, while
+  // rejecting writes and aliasing that would invalidate reuse state.
   collectReuseInnerLoops(axisLoop, innerLoops);
 
   Value targetRoot = resolveMemRefValueRoot(target);
@@ -2019,6 +2041,8 @@ computeReuseDimFootprint(const ComposedBufferAccess &access, unsigned resultPos,
                          ArrayRef<affine::AffineForOp> innerLoops, Value axisIV,
                          DenseMap<Value, unsigned> &prefixOperandPos,
                          ArrayRef<Value> prefixOperands) {
+  // Decompose one accessed buffer dimension into:
+  //   lower(anchor over axis/prefix) + bounded contiguous inner-loop offsets.
   AffineExpr accessExpr = access.map.getResult(resultPos);
   SmallVector<affine::AffineForOp, 4> dependentLoops;
   for (affine::AffineForOp loop : innerLoops) {
@@ -2131,6 +2155,8 @@ analyzeReuseStatePlan(ArrayRef<ComposedBufferAccess> accesses,
                       ArrayRef<affine::AffineForOp> innerLoops,
                       affine::AffineForOp axisLoop, unsigned bufferRank,
                       MLIRContext *ctx) {
+  // Build one logical reuse state shared by all candidate loads:
+  // common sliding dim, common anchors, and one bounded local box.
   ReuseStatePlan plan;
   Value axisIV = axisLoop.getInductionVar();
   DenseMap<Value, unsigned> prefixOperandPos;
@@ -2163,6 +2189,8 @@ analyzeReuseStatePlan(ArrayRef<ComposedBufferAccess> accesses,
 
     axisCoeffs[accessIdx].resize(bufferRank, 0);
     for (unsigned d = 0; d < bufferRank; ++d) {
+      // Derive the per-access footprint for this result dimension, then record
+      // how the selected axis translates that footprint across iterations.
       FailureOr<ReuseDimFootprint> footprintOr = computeReuseDimFootprint(
           access, d, innerLoops, axisIV, prefixOperandPos, plan.prefixOperands);
       if (failed(footprintOr)) {
@@ -2206,6 +2234,7 @@ analyzeReuseStatePlan(ArrayRef<ComposedBufferAccess> accesses,
       }
 
       if (!stationarySeen[d]) {
+        // Seed the common coordinate system from the first candidate access.
         stationarySeen[d] = true;
         refLower[d] = footprint.lowerExpr;
         minOffset[d] = 0;
@@ -2250,6 +2279,7 @@ analyzeReuseStatePlan(ArrayRef<ComposedBufferAccess> accesses,
   }
 
   for (auto [accessIdx, coeffs] : llvm::enumerate(axisCoeffs)) {
+    // Every candidate must slide along exactly one common buffer dimension.
     if (coeffs[*detectedSlidingDim] == 0) {
       auto readOp = cast<affine::AffineReadOpInterface>(accesses[accessIdx].op);
       auto diag = readOp->emitError()
@@ -2295,6 +2325,7 @@ analyzeReuseStatePlan(ArrayRef<ComposedBufferAccess> accesses,
       return diag;
     }
 
+    // Convert the relative offsets gathered above into a single local box.
     AffineExpr anchorExpr =
         simplifyAffineExpr(refLower[d] + minOffset[d], 1 + prefixDimCount,
                            /*numSymbols=*/0);
@@ -2322,6 +2353,7 @@ analyzeReuseStatePlan(ArrayRef<ComposedBufferAccess> accesses,
   }
 
   int64_t slidingExtent = plan.dims[plan.slidingDim].extent;
+  // Reuse only helps when consecutive axis iterations still overlap.
   if (plan.slidingStepAbs >= slidingExtent) {
     auto diag = axisLoop->emitError()
                 << "reuse_at requires cross-iteration overlap on the sliding "
@@ -2343,20 +2375,48 @@ getReuseStateOperands(Value axisIV, ArrayRef<Value> prefixOperands) {
   return operands;
 }
 
+static ReuseResetBoundaryPlan
+analyzeReuseResetBoundary(affine::AffineForOp axisLoop,
+                          affine::AffineForOp rootLoop,
+                          const ReuseExecutionPlan &executionPlan) {
+  // Hoisting is only a placement optimization. Keep it tied to the current
+  // one-iteration warm-up model so failing the proof never rejects reuse_at.
+  ReuseResetBoundaryPlan plan;
+  plan.rootLoop = rootLoop;
+  plan.resetBoundaryLoop = axisLoop->getParentOfType<affine::AffineForOp>();
+
+  // The current codegen has exactly one warm-up iteration: when axisIV == 0,
+  // every rewritten load falls back to the source buffer and stores the loaded
+  // value into the same logical reuse slot that steady-state later reads. This
+  // is enough to safely reuse storage across outer-loop instances; ring mode
+  // additionally requires resetting the head at the boundary where the axis
+  // stream restarts.
+  if (executionPlan.steadyStateStart != 1)
+    return plan;
+
+  plan.canHoist = true;
+  return plan;
+}
+
 static Value materializeGlobalAccessIndex(OpBuilder &builder, Location loc,
                                           const ComposedBufferAccess &access,
                                           unsigned resultDim);
 
 static affine::AffineForOp createConstantAffineFor(OpBuilder &builder,
                                                    Location loc, int64_t lb,
-                                                   int64_t ub) {
-  auto lowerMap = AffineMap::get(/*dimCount=*/0, /*symbolCount=*/0,
-                                 builder.getAffineConstantExpr(lb));
-  auto upperMap = AffineMap::get(/*dimCount=*/0, /*symbolCount=*/0,
-                                 builder.getAffineConstantExpr(ub));
-  return affine::createCanonicalizedAffineForOp(
-      builder, loc, /*lbOperands=*/ValueRange{}, lowerMap,
-      /*ubOperands=*/ValueRange{}, upperMap, /*step=*/1);
+                                                   int64_t ub,
+                                                   ValueRange iterArgs = {}) {
+  // Build a constant-bounds affine.for, optionally carrying iter_args when the
+  // generated loop must thread ring state such as a rolling physical slot.
+  if (iterArgs.empty()) {
+    return affine::AffineForOp::create(builder, loc, lb, ub, 1);
+  } else {
+    return affine::AffineForOp::create(
+        builder, loc, lb, ub, 1, iterArgs,
+        [](OpBuilder &builder, Location loc, Value, ValueRange iterArgs) {
+          affine::AffineYieldOp::create(builder, loc, iterArgs);
+        });
+  }
 }
 
 static Value buildAnchorValue(OpBuilder &builder, Location loc,
@@ -2399,7 +2459,6 @@ static void generateReuseStateShift(OpBuilder &builder, Location loc,
 
   OpBuilder::InsertionGuard guard(builder);
   SmallVector<Value, 4> loopIvs(plan.keptDims.size());
-  SmallVector<affine::AffineForOp, 4> shiftLoops;
   for (auto [reusePos, dim] : llvm::enumerate(plan.keptDims)) {
     int64_t lb = 0;
     int64_t ub = plan.shape[reusePos];
@@ -2415,7 +2474,6 @@ static void generateReuseStateShift(OpBuilder &builder, Location loc,
     builder.setInsertionPoint(
         forOp.getBody(), Block::iterator(forOp.getBody()->getTerminator()));
     loopIvs[reusePos] = forOp.getInductionVar();
-    shiftLoops.push_back(forOp);
   }
 
   SmallVector<Value, 4> srcIndices = loopIvs;
@@ -2426,11 +2484,6 @@ static void generateReuseStateShift(OpBuilder &builder, Location loc,
   Value shifted =
       affine::AffineLoadOp::create(builder, loc, reuseBuffer, srcIndices);
   affine::AffineStoreOp::create(builder, loc, shifted, reuseBuffer, dstIndices);
-  // fully unroll shifting logic
-  for (auto loop : shiftLoops) {
-    auto ret = affine::loopUnrollFull(loop);
-    assert(succeeded(ret) && "expected to fully unroll shifting loops");
-  }
 }
 
 static Value buildModuloOffsetValue(OpBuilder &builder, Location loc, Value lhs,
@@ -2440,9 +2493,22 @@ static Value buildModuloOffsetValue(OpBuilder &builder, Location loc, Value lhs,
   return arith::RemUIOp::create(builder, loc, sum, modulusValue);
 }
 
+static Value buildWrappedIncrementValue(OpBuilder &builder, Location loc,
+                                        Value current, int64_t modulus) {
+  Value zero = arith::ConstantIndexOp::create(builder, loc, 0);
+  Value one = arith::ConstantIndexOp::create(builder, loc, 1);
+  Value last = arith::ConstantIndexOp::create(builder, loc, modulus - 1);
+  Value atLast = arith::CmpIOp::create(builder, loc, arith::CmpIPredicate::eq,
+                                       current, last);
+  Value next = arith::AddIOp::create(builder, loc, current, one);
+  return arith::SelectOp::create(builder, loc, atLast, zero, next);
+}
+
 static SmallVector<Value, 4> materializeLogicalReuseIndices(
     OpBuilder &builder, Location loc, const ReuseStatePlan &plan,
     const ComposedBufferAccess &access, ValueRange stateOperands) {
+  // Rewrite one access into reuse-buffer coordinates by subtracting the
+  // analyzed anchor of each kept dimension from the original global index.
   SmallVector<Value, 4> logicalIndices;
   logicalIndices.reserve(plan.keptDims.size());
   for (unsigned resultDim : plan.keptDims) {
@@ -2465,6 +2531,8 @@ materializePhysicalReuseIndices(OpBuilder &builder, Location loc,
                                 const ReuseExecutionPlan &executionPlan,
                                 ArrayRef<Value> logicalIndices, Value ringHead,
                                 Value physicalSlidingIndex = Value()) {
+  // Ring mode keeps logical indices stable and only remaps the sliding
+  // dimension to the current physical head position.
   const ReuseStatePlan &plan = executionPlan.statePlan;
   SmallVector<Value, 4> physicalIndices(logicalIndices.begin(),
                                         logicalIndices.end());
@@ -2484,11 +2552,71 @@ materializePhysicalReuseIndices(OpBuilder &builder, Location loc,
   return physicalIndices;
 }
 
+static SmallVector<RingAccessCluster, 4>
+collectRingAccessClusters(ArrayRef<ComposedBufferAccess> accesses) {
+  SmallVector<RingAccessCluster, 4> clusters;
+  if (accesses.empty())
+    return clusters;
+
+  RingAccessCluster currentCluster;
+  currentCluster.accessIndices.push_back(0);
+  for (unsigned idx = 1, e = accesses.size(); idx < e; ++idx) {
+    Operation *prev = accesses[idx - 1].op;
+    Operation *current = accesses[idx].op;
+    if (prev->getBlock() == current->getBlock() &&
+        prev->getNextNode() == current) {
+      currentCluster.accessIndices.push_back(idx);
+      continue;
+    }
+    clusters.push_back(std::move(currentCluster));
+    currentCluster = RingAccessCluster();
+    currentCluster.accessIndices.push_back(idx);
+  }
+  clusters.push_back(std::move(currentCluster));
+  return clusters;
+}
+
+static DenseMap<Operation *, RingAccessPrecomputedIndices>
+precomputeRingAccessClusterIndices(OpBuilder &builder, Location loc,
+                                   ArrayRef<ComposedBufferAccess> accesses,
+                                   const ReuseExecutionPlan &executionPlan,
+                                   ValueRange stateOperands,
+                                   Value currentIterationRingHead) {
+  // Precompute per-cluster ring slots once before rewriting the loads in that
+  // block, so each load wrapper reuses the same physical index materialization.
+  DenseMap<Operation *, RingAccessPrecomputedIndices> precomputed;
+  if (executionPlan.strategy != ReuseBufferStrategy::Ring)
+    return precomputed;
+
+  const ReuseStatePlan &plan = executionPlan.statePlan;
+  int slidingReusePos = plan.resultToReusePos[plan.slidingDim];
+  assert(slidingReusePos >= 0 && "expected sliding dimension to be kept");
+
+  for (const RingAccessCluster &cluster : collectRingAccessClusters(accesses)) {
+    OpBuilder::InsertionGuard guard(builder);
+    builder.setInsertionPoint(accesses[cluster.accessIndices.front()].op);
+    for (unsigned accessIdx : cluster.accessIndices) {
+      const ComposedBufferAccess &access = accesses[accessIdx];
+      RingAccessPrecomputedIndices indices;
+      indices.logicalIndices = materializeLogicalReuseIndices(
+          builder, loc, plan, access, stateOperands);
+      indices.physicalIndices = materializePhysicalReuseIndices(
+          builder, loc, executionPlan, indices.logicalIndices,
+          currentIterationRingHead);
+      precomputed.try_emplace(access.op, std::move(indices));
+    }
+  }
+
+  return precomputed;
+}
+
 static void generateReuseStateRefill(OpBuilder &builder, Location loc,
                                      Value sourceBuffer, Value reuseBuffer,
                                      const ReuseExecutionPlan &executionPlan,
                                      ValueRange stateOperands,
                                      Value ringHead = Value()) {
+  // Refill only the entering face of the reuse state. Ring mode threads the
+  // physical slot with an iter_arg instead of recomputing modulo per element.
   const ReuseStatePlan &plan = executionPlan.statePlan;
   int slidingReusePos = plan.resultToReusePos[plan.slidingDim];
   int64_t slidingExtent = plan.dims[plan.slidingDim].extent;
@@ -2500,24 +2628,43 @@ static void generateReuseStateRefill(OpBuilder &builder, Location loc,
   OpBuilder::InsertionGuard guard(builder);
   SmallVector<Value, 4> logicalIndices(plan.keptDims.size());
   Value physicalSlidingIndex;
-  SmallVector<affine::AffineForOp, 4> refillLoops;
   if (slidingReusePos >= 0) {
-    affine::AffineForOp enteringFaceFor = createConstantAffineFor(
-        builder, loc, /*lb=*/0, /*ub=*/executionPlan.slidingStepAbs);
-    builder.setInsertionPoint(
-        enteringFaceFor.getBody(),
-        Block::iterator(enteringFaceFor.getBody()->getTerminator()));
-    Value enteringFaceIV = enteringFaceFor.getInductionVar();
-    logicalIndices[slidingReusePos] =
-        executionPlan.slidingDelta > 0
-            ? buildOffsetValue(builder, loc, enteringFaceIV, enteringBaseOffset)
-            : enteringFaceIV;
     if (executionPlan.strategy == ReuseBufferStrategy::Ring) {
-      physicalSlidingIndex = buildModuloOffsetValue(
-          builder, loc, ringHead, logicalIndices[slidingReusePos],
+      Value firstPhysicalSlot = buildModuloOffsetValue(
+          builder, loc, ringHead,
+          arith::ConstantIndexOp::create(builder, loc, enteringBaseOffset),
           slidingExtent);
+      affine::AffineForOp enteringFaceFor = createConstantAffineFor(
+          builder, loc, /*lb=*/0, /*ub=*/executionPlan.slidingStepAbs,
+          firstPhysicalSlot);
+      builder.setInsertionPoint(
+          enteringFaceFor.getBody(),
+          Block::iterator(enteringFaceFor.getBody()->getTerminator()));
+      Value enteringFaceIV = enteringFaceFor.getInductionVar();
+      logicalIndices[slidingReusePos] =
+          executionPlan.slidingDelta > 0
+              ? buildOffsetValue(builder, loc, enteringFaceIV,
+                                 enteringBaseOffset)
+              : enteringFaceIV;
+      physicalSlidingIndex = enteringFaceFor.getRegionIterArgs().front();
+      auto yieldOp = cast<affine::AffineYieldOp>(
+          enteringFaceFor.getBody()->getTerminator());
+      Value nextPhysicalSlot = buildWrappedIncrementValue(
+          builder, loc, physicalSlidingIndex, slidingExtent);
+      yieldOp->setOperand(0, nextPhysicalSlot);
+    } else {
+      affine::AffineForOp enteringFaceFor = createConstantAffineFor(
+          builder, loc, /*lb=*/0, /*ub=*/executionPlan.slidingStepAbs);
+      builder.setInsertionPoint(
+          enteringFaceFor.getBody(),
+          Block::iterator(enteringFaceFor.getBody()->getTerminator()));
+      Value enteringFaceIV = enteringFaceFor.getInductionVar();
+      logicalIndices[slidingReusePos] =
+          executionPlan.slidingDelta > 0
+              ? buildOffsetValue(builder, loc, enteringFaceIV,
+                                 enteringBaseOffset)
+              : enteringFaceIV;
     }
-    refillLoops.push_back(enteringFaceFor);
   }
 
   for (auto [reusePos, dim] : llvm::enumerate(plan.keptDims)) {
@@ -2529,7 +2676,6 @@ static void generateReuseStateRefill(OpBuilder &builder, Location loc,
     builder.setInsertionPoint(
         forOp.getBody(), Block::iterator(forOp.getBody()->getTerminator()));
     logicalIndices[reusePos] = forOp.getInductionVar();
-    refillLoops.push_back(forOp);
   }
 
   SmallVector<Value, 4> globalIndices(plan.dims.size());
@@ -2555,29 +2701,31 @@ static void generateReuseStateRefill(OpBuilder &builder, Location loc,
   }
   affine::AffineStoreOp::create(builder, loc, loaded, reuseBuffer,
                                 logicalIndices);
-
-  for (auto loop : refillLoops) {
-    auto ret = affine::loopUnrollFull(loop);
-    assert(succeeded(ret) && "expected to fully unroll refilling loops");
-  }
 }
 
-static Value createConditionalReuseLoad(OpBuilder &builder, Location loc,
-                                        const ComposedBufferAccess &access,
-                                        Value sourceBuffer, Value reuseBuffer,
-                                        const ReuseExecutionPlan &executionPlan,
-                                        ValueRange stateOperands, Value axisIV,
-                                        Value currentIterationRingHead) {
+static Value createConditionalReuseLoad(
+    OpBuilder &builder, Location loc, const ComposedBufferAccess &access,
+    Value sourceBuffer, Value reuseBuffer,
+    const ReuseExecutionPlan &executionPlan, ValueRange stateOperands,
+    Value axisIV, Value currentIterationRingHead,
+    ArrayRef<Value> precomputedLogicalIndices = {},
+    ArrayRef<Value> precomputedPhysicalIndices = {}) {
+  // Warm-up keeps the original load and captures it into reuse state.
+  // Steady-state switches the same use to the analyzed reuse coordinates.
   const ReuseStatePlan &plan = executionPlan.statePlan;
-  SmallVector<Value, 4> logicalIndices =
-      materializeLogicalReuseIndices(builder, loc, plan, access, stateOperands);
+  SmallVector<Value, 4> logicalIndices(precomputedLogicalIndices.begin(),
+                                       precomputedLogicalIndices.end());
+  if (logicalIndices.empty()) {
+    logicalIndices = materializeLogicalReuseIndices(builder, loc, plan, access,
+                                                    stateOperands);
+  }
 
   auto warmupSet = IntegerSet::get(
       /*dimCount=*/1, /*symbolCount=*/0,
       ArrayRef<AffineExpr>{builder.getAffineDimExpr(0)}, ArrayRef<bool>{true});
   auto ifOp = affine::AffineIfOp::create(
-      builder, loc, TypeRange{access.op->getResult(0).getType()}, warmupSet,
-      ValueRange{axisIV}, /*withElseRegion=*/true);
+      builder, loc, access.op->getResult(0).getType(), warmupSet, axisIV,
+      /*withElseRegion=*/true);
 
   {
     OpBuilder::InsertionGuard guard(builder);
@@ -2591,8 +2739,13 @@ static Value createConditionalReuseLoad(OpBuilder &builder, Location loc,
   {
     OpBuilder::InsertionGuard guard(builder);
     builder.setInsertionPointToEnd(ifOp.getElseBlock());
-    SmallVector<Value, 4> physicalIndices = materializePhysicalReuseIndices(
-        builder, loc, executionPlan, logicalIndices, currentIterationRingHead);
+    SmallVector<Value, 4> physicalIndices(precomputedPhysicalIndices.begin(),
+                                          precomputedPhysicalIndices.end());
+    if (physicalIndices.empty()) {
+      physicalIndices = materializePhysicalReuseIndices(
+          builder, loc, executionPlan, logicalIndices,
+          currentIterationRingHead);
+    }
     Value reused;
     if (executionPlan.strategy == ReuseBufferStrategy::Ring) {
       reused =
@@ -2847,6 +3000,8 @@ static bool hasReuseAtUsers(OpResult handle) {
 
 static void runReuseAtPostCleanup(RewriterBase &rewriter,
                                   affine::AffineForOp axisLoop) {
+  // Final cleanup is purely local IR simplification: canonicalize/CSE first,
+  // then merge repeated affine.if wrappers and sink pure tails into branches.
   DominanceInfo dom(axisLoop->getParentOp());
   RewritePatternSet patterns(rewriter.getContext());
   auto funcOp = axisLoop->getParentOfType<FunctionOpInterface>();
@@ -2882,8 +3037,8 @@ DiagnosedSilenceableFailure
 transform::ReuseAtOp::apply(transform::TransformRewriter &rewriter,
                             transform::TransformResults &results,
                             transform::TransformState &state) {
-  // preconditions: input handles must resolve to exactly one value/operation of
-  // the expected type
+  // Stage 0: resolve payload handles and validate basic structural
+  // preconditions.
   auto targets = llvm::to_vector(state.getPayloadValues(getTarget()));
   if (targets.size() != 1) {
     return emitSilenceableError()
@@ -2922,6 +3077,7 @@ transform::ReuseAtOp::apply(transform::TransformRewriter &rewriter,
   Value axisIV = axisLoop.getInductionVar();
   unsigned rank = targetType.getRank();
 
+  // Stage 1: analyze the loop nest and the candidate accesses under the axis.
   affine::AffineForOp rootLoop = getRootLoop(axisLoop);
   LoopRoleInfo roles;
   SmallVector<affine::AffineForOp, 8> allLoops;
@@ -2949,9 +3105,12 @@ transform::ReuseAtOp::apply(transform::TransformRewriter &rewriter,
   if (failed(planOr))
     return emitSilenceableError() << "failed to analyze reuse state plan";
   ReuseExecutionPlan executionPlan(std::move(*planOr), getUseRingBuffer());
+  ReuseResetBoundaryPlan resetBoundaryPlan =
+      analyzeReuseResetBoundary(axisLoop, rootLoop, executionPlan);
   const ReuseStatePlan &plan = executionPlan.statePlan;
 
-  rewriter.setInsertionPoint(axisLoop);
+  // Stage 2: materialize the reuse buffer and prepare any loop-carried state.
+  rewriter.setInsertionPoint(resetBoundaryPlan.canHoist ? rootLoop : axisLoop);
   auto reuseBuffer = memref::AllocOp::create(
       rewriter, axisLoop.getLoc(),
       MemRefType::get(plan.shape, targetType.getElementType()));
@@ -2961,28 +3120,26 @@ transform::ReuseAtOp::apply(transform::TransformRewriter &rewriter,
           OpIdentifier, StringAttr::get(reuseBuffer->getContext(),
                                         targetSymName.getValue() + "::reuse"));
   }
-  Value ringHeadBuffer;
   if (executionPlan.strategy == ReuseBufferStrategy::Ring) {
-    ringHeadBuffer = memref::AllocOp::create(
-        rewriter, axisLoop.getLoc(),
-        MemRefType::get(/*shape=*/{}, rewriter.getIndexType()));
-    if (targetDef) {
-      if (auto targetSymName =
-              targetDef->getAttrOfType<StringAttr>(OpIdentifier)) {
-        cast<memref::AllocOp>(ringHeadBuffer.getDefiningOp())
-            ->setAttr(OpIdentifier, StringAttr::get(rewriter.getContext(),
-                                                    targetSymName.getValue() +
-                                                        "::reuse_head"));
-      }
-    }
     Value zero = arith::ConstantIndexOp::create(rewriter, axisLoop.getLoc(), 0);
-    memref::StoreOp::create(rewriter, axisLoop.getLoc(), zero, ringHeadBuffer,
-                            ValueRange{});
+    auto newLoopOr = axisLoop.replaceWithAdditionalYields(
+        rewriter, zero,
+        /*replaceInitOperandUsesInLoop=*/false,
+        [&](OpBuilder &b, Location loc, ArrayRef<BlockArgument> newBbArgs) {
+          return SmallVector<Value, 1>{newBbArgs.front()};
+        });
+    if (failed(newLoopOr))
+      return emitDefiniteFailure();
+    axisLoop = cast<affine::AffineForOp>(*newLoopOr);
+    axisIV = axisLoop.getInductionVar();
+    for (ComposedBufferAccess &access : accesses)
+      access = composeBufferAccess(access.op);
   }
 
   SmallVector<Value, 4> stateOperands =
       getReuseStateOperands(axisIV, plan.prefixOperands);
 
+  // Stage 3: emit per-iteration state maintenance for ring or shift mode.
   rewriter.setInsertionPointToStart(axisLoop.getBody());
   Value currentIterationRingHead;
   auto steadyStateSet = IntegerSet::get(
@@ -2991,37 +3148,36 @@ transform::ReuseAtOp::apply(transform::TransformRewriter &rewriter,
                            executionPlan.steadyStateStart},
       ArrayRef<bool>{false});
   if (executionPlan.strategy == ReuseBufferStrategy::Ring) {
-    auto updateIf = affine::AffineIfOp::create(
-        rewriter, axisLoop.getLoc(), TypeRange{rewriter.getIndexType()},
-        steadyStateSet, ValueRange{axisIV}, /*withElseRegion=*/true);
+    Value previousIterationRingHead = axisLoop.getRegionIterArgs().back();
+    Value zero = arith::ConstantIndexOp::create(rewriter, axisLoop.getLoc(), 0);
+    Value steadyStateStart = arith::ConstantIndexOp::create(
+        rewriter, axisLoop.getLoc(), executionPlan.steadyStateStart);
+    Value isSteady = arith::CmpIOp::create(rewriter, axisLoop.getLoc(),
+                                           arith::CmpIPredicate::sge, axisIV,
+                                           steadyStateStart);
+    int64_t slidingExtent = plan.dims[plan.slidingDim].extent;
+    Value increment = arith::ConstantIndexOp::create(
+        rewriter, axisLoop.getLoc(), executionPlan.ringIncrement);
+    Value nextHead = buildModuloOffsetValue(rewriter, axisLoop.getLoc(),
+                                            previousIterationRingHead,
+                                            increment, slidingExtent);
+    auto updateIf = affine::AffineIfOp::create(rewriter, axisLoop.getLoc(),
+                                               steadyStateSet, axisIV,
+                                               /*withElseRegion=*/false);
     {
       OpBuilder::InsertionGuard guard(rewriter);
-      rewriter.setInsertionPointToEnd(updateIf.getThenBlock());
-      int64_t slidingExtent = plan.dims[plan.slidingDim].extent;
-      Value currentHead = memref::LoadOp::create(rewriter, axisLoop.getLoc(),
-                                                 ringHeadBuffer, ValueRange{});
-      Value increment = arith::ConstantIndexOp::create(
-          rewriter, axisLoop.getLoc(), executionPlan.ringIncrement);
-      Value nextHead = buildModuloOffsetValue(
-          rewriter, axisLoop.getLoc(), currentHead, increment, slidingExtent);
-      memref::StoreOp::create(rewriter, axisLoop.getLoc(), nextHead,
-                              ringHeadBuffer, ValueRange{});
+      rewriter.setInsertionPoint(
+          updateIf.getThenBlock(),
+          Block::iterator(updateIf.getThenBlock()->getTerminator()));
       generateReuseStateRefill(rewriter, axisLoop.getLoc(), target, reuseBuffer,
                                executionPlan, stateOperands, nextHead);
-      affine::AffineYieldOp::create(rewriter, axisLoop.getLoc(), nextHead);
     }
-    {
-      OpBuilder::InsertionGuard guard(rewriter);
-      rewriter.setInsertionPointToEnd(updateIf.getElseBlock());
-      Value zero =
-          arith::ConstantIndexOp::create(rewriter, axisLoop.getLoc(), 0);
-      affine::AffineYieldOp::create(rewriter, axisLoop.getLoc(), zero);
-    }
-    currentIterationRingHead = updateIf.getResult(0);
+    currentIterationRingHead = arith::SelectOp::create(
+        rewriter, axisLoop.getLoc(), isSteady, nextHead, zero);
   } else {
-    auto updateIf = affine::AffineIfOp::create(
-        rewriter, axisLoop.getLoc(), steadyStateSet, ValueRange{axisIV},
-        /*withElseRegion=*/false);
+    auto updateIf = affine::AffineIfOp::create(rewriter, axisLoop.getLoc(),
+                                               steadyStateSet, axisIV,
+                                               /*withElseRegion=*/false);
     OpBuilder::InsertionGuard guard(rewriter);
     rewriter.setInsertionPoint(
         updateIf.getThenBlock(),
@@ -3032,15 +3188,38 @@ transform::ReuseAtOp::apply(transform::TransformRewriter &rewriter,
                              executionPlan, stateOperands);
   }
 
+  auto ringPrecomputedIndices = precomputeRingAccessClusterIndices(
+      rewriter, axisLoop.getLoc(), accesses, executionPlan, stateOperands,
+      currentIterationRingHead);
+
+  // Stage 4: rewrite each candidate load to the new reuse state.
   for (const auto &access : accesses) {
     rewriter.setInsertionPoint(access.op);
     Location loadLoc = access.op->getLoc();
+    ArrayRef<Value> precomputedLogicalIndices;
+    ArrayRef<Value> precomputedPhysicalIndices;
+    if (auto it = ringPrecomputedIndices.find(access.op);
+        it != ringPrecomputedIndices.end()) {
+      precomputedLogicalIndices = it->second.logicalIndices;
+      precomputedPhysicalIndices = it->second.physicalIndices;
+    }
     Value rewritten = createConditionalReuseLoad(
         rewriter, loadLoc, access, target, reuseBuffer, executionPlan,
-        stateOperands, axisIV, currentIterationRingHead);
+        stateOperands, axisIV, currentIterationRingHead,
+        precomputedLogicalIndices, precomputedPhysicalIndices);
     rewriter.replaceOp(access.op, rewritten);
   }
 
+  if (executionPlan.strategy == ReuseBufferStrategy::Ring) {
+    auto yieldOp =
+        cast<affine::AffineYieldOp>(axisLoop.getBody()->getTerminator());
+    rewriter.modifyOpInPlace(yieldOp, [&]() {
+      yieldOp->setOperand(yieldOp.getNumOperands() - 1,
+                          currentIterationRingHead);
+    });
+  }
+
+  // Stage 5: run local cleanup patterns, then publish the new buffer handle.
   if (!hasReuseAtUsers(cast<OpResult>(getResult())))
     runReuseAtPostCleanup(rewriter, axisLoop);
 
@@ -3397,15 +3576,13 @@ static void generateBufferAtCopy(OpBuilder &builder, Location loc,
   unsigned rank = cast<MemRefType>(globalBuffer.getType()).getRank();
   if (rank == 0) {
     if (!isCopyOut) {
-      Value globalLoad = affine::AffineLoadOp::create(
-          builder, loc, globalBuffer, ValueRange{});
-      affine::AffineStoreOp::create(builder, loc, globalLoad, localBuffer,
-                                    ValueRange{});
+      Value globalLoad =
+          affine::AffineLoadOp::create(builder, loc, globalBuffer, {});
+      affine::AffineStoreOp::create(builder, loc, globalLoad, localBuffer, {});
     } else {
       Value localLoad =
-          affine::AffineLoadOp::create(builder, loc, localBuffer, ValueRange{});
-      affine::AffineStoreOp::create(builder, loc, localLoad, globalBuffer,
-                                    ValueRange{});
+          affine::AffineLoadOp::create(builder, loc, localBuffer, {});
+      affine::AffineStoreOp::create(builder, loc, localLoad, globalBuffer, {});
     }
     return;
   }

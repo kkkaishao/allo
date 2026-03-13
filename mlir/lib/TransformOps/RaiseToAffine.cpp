@@ -10,7 +10,6 @@
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/Matchers.h"
-#include "llvm/ADT/DenseSet.h"
 
 using namespace mlir;
 using namespace mlir::allo;
@@ -358,8 +357,8 @@ raiseForOp(transform::TransformRewriter &rewriter, scf::ForOp forOp,
            << "upper bound does not match affine bound pattern";
   }
 
-  auto lb = *lbOr;
-  auto ub = *ubOr;
+  affine::AffineValueMap &lb = *lbOr;
+  affine::AffineValueMap &ub = *ubOr;
   Value step = stripCast(forOp.getStep());
 
   // Fast path: constant positive step
