@@ -3,7 +3,6 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-#include "allo/Dialect/AlloOps.h"
 #include "allo/TransformOps/AlloTransformOps.h"
 #include "allo/TransformOps/Utils.h"
 #include "mlir/Analysis/FlatLinearValueConstraints.h"
@@ -24,8 +23,8 @@
 #include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "mlir/Transforms/CSE.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
-#include "mlir/Transforms/Passes.h"
 #include "llvm/ADT/DenseSet.h"
+#include <numeric>
 
 using namespace mlir;
 using namespace mlir::allo;
@@ -629,8 +628,8 @@ transform::LoopTileOp::apply(transform::TransformRewriter &rewriter,
         uFactors.push_back(static_cast<unsigned>(factor));
       }
       SmallVector<affine::AffineForOp, 8> tiledNest;
-      SmallVector<affine::AffineForOp, 4> band = sortedLoops;
-      if (failed(affine::tilePerfectlyNested(band, uFactors, &tiledNest)))
+      if (failed(
+              affine::tilePerfectlyNested(sortedLoops, uFactors, &tiledNest)))
         return emitSilenceableFailure(sortedLoops.front())
                << "failed to tile affine perfectly nested loops";
       if (tiledNest.size() < sortedLoops.size() * 2)
@@ -1662,6 +1661,7 @@ struct LoopRoleInfo {
 
 struct ReuseDimPlan {
   AffineMap anchorMap;
+  int64_t layoutStride = 1;
   int64_t extent = 1;
   int64_t axisCoeff = 0;
   int64_t innerMinOffset = 0;
@@ -1680,6 +1680,15 @@ struct ReuseStatePlan {
   int64_t slidingStepAbs = 1;
 };
 
+struct LoopNormalizationInfo {
+  affine::AffineForOp loop;
+  Value inductionVar;
+  int64_t lowerBound = 0;
+  int64_t upperBound = 0;
+  int64_t step = 1;
+  int64_t tripCount = 0;
+};
+
 enum class ReuseBufferStrategy {
   PhysicalShift,
   Ring,
@@ -1691,11 +1700,32 @@ struct ReuseResetBoundaryPlan {
   bool canHoist = false;
 };
 
+struct ReuseAccessValidity {
+  int64_t slidingLocalMin = 0;
+  int64_t slidingLocalMax = 0;
+  int64_t firstReusableIter = 1;
+  int64_t lastReusableIter = 0;
+};
+
+struct ReuseValidityPlan {
+  int64_t axisTripCount = 0;
+  int64_t steadyStateStart = 1;
+  int64_t updateStartIter = 1;
+  int64_t updateEndIter = 0;
+  SmallVector<int64_t, 4> slotFirstFillIters;
+  SmallVector<int64_t, 4> slotLastUseIters;
+  SmallVector<ReuseAccessValidity, 8> accesses;
+};
+
 struct ReuseExecutionPlan {
-  explicit ReuseExecutionPlan(ReuseStatePlan statePlan, bool enableRing)
-      : statePlan(std::move(statePlan)),
+  explicit ReuseExecutionPlan(ReuseStatePlan statePlan,
+                              ReuseValidityPlan validityPlan, bool enableRing)
+      : statePlan(std::move(statePlan)), validityPlan(std::move(validityPlan)),
         slidingDelta(this->statePlan.slidingDelta),
-        slidingStepAbs(this->statePlan.slidingStepAbs) {
+        slidingStepAbs(this->statePlan.slidingStepAbs),
+        steadyStateStart(this->validityPlan.steadyStateStart),
+        updateStartIter(this->validityPlan.updateStartIter),
+        updateEndIter(this->validityPlan.updateEndIter) {
     int slidingReusePos =
         this->statePlan.resultToReusePos[this->statePlan.slidingDim];
     int64_t slidingExtent =
@@ -1709,25 +1739,102 @@ struct ReuseExecutionPlan {
   }
 
   ReuseStatePlan statePlan;
+  ReuseValidityPlan validityPlan;
   ReuseBufferStrategy strategy = ReuseBufferStrategy::PhysicalShift;
   int64_t slidingDelta = 1;
   int64_t slidingStepAbs = 1;
   int64_t steadyStateStart = 1;
+  int64_t updateStartIter = 1;
+  int64_t updateEndIter = 0;
   int64_t ringIncrement = 0;
 };
 
 struct ReuseDimFootprint {
   AffineExpr lowerExpr;
+  SmallVector<int64_t, 4> innerCoeffs;
+  SmallVector<int64_t, 4> innerExtents;
+  int64_t layoutStride = 1;
   int64_t extent = 1;
   int64_t axisCoeff = 0;
   int64_t innerMinOffset = 0;
   int64_t innerMaxOffset = 0;
 };
 
-struct NoRingReuseWrapper {
-  affine::AffineLoadOp thenLoad;
-  affine::AffineStoreOp thenStore;
-  affine::AffineLoadOp elseLoad;
+struct ReuseLogicalAccess {
+  Operation *anchorOp = nullptr;
+  Value exposedValue;
+  Value missValue;
+  Value rootSourceBuffer;
+  ComposedBufferAccess stageAccess;
+  ComposedBufferAccess semanticAccess;
+  bool fromProvenanceWrapper = false;
+};
+
+struct ReuseValueProvenance {
+  // stageAccess stays in the producer stage's local buffer coordinates.
+  // semanticAccess keeps the projected source-space meaning for chaining.
+  Value stageBuffer;
+  Value rootSourceBuffer;
+  ComposedBufferAccess stageAccess;
+  ComposedBufferAccess semanticAccess;
+};
+
+struct ReuseBufferContext {
+  // Buffer-level context is keyed by the newly created reuse buffer so later
+  // stages can recover root-source and validity information from extension.
+  Value stageSourceBuffer;
+  Value rootSourceBuffer;
+  ReuseBufferStrategy strategy = ReuseBufferStrategy::PhysicalShift;
+  LoopNormalizationInfo axisInfo;
+  ReuseStatePlan statePlan;
+  ReuseValidityPlan validityPlan;
+};
+
+class ReuseAtTransformStateExtension
+    : public transform::TransformState::Extension {
+public:
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(ReuseAtTransformStateExtension)
+
+  explicit ReuseAtTransformStateExtension(transform::TransformState &state)
+      : Extension(state) {}
+
+  void registerBufferContext(Value buffer, ReuseBufferContext context) {
+    bufferContexts[buffer] = std::move(context);
+  }
+
+  const ReuseBufferContext *findBufferContext(Value buffer) const {
+    auto it = bufferContexts.find(buffer);
+    return it == bufferContexts.end() ? nullptr : &it->second;
+  }
+
+  bool hasBufferContext(Value buffer) const {
+    return bufferContexts.contains(buffer);
+  }
+
+  void registerValueProvenance(Value value, ReuseValueProvenance provenance) {
+    valueProvenances[value] = std::move(provenance);
+  }
+
+  const ReuseValueProvenance *findValueProvenance(Value value) const {
+    auto it = valueProvenances.find(value);
+    return it == valueProvenances.end() ? nullptr : &it->second;
+  }
+
+  void registerMaintenanceWrite(Value buffer, Operation *op) {
+    maintenanceWrites[buffer].insert(op);
+  }
+
+  bool isMaintenanceWrite(Value buffer, Operation *op) const {
+    auto it = maintenanceWrites.find(buffer);
+    return it != maintenanceWrites.end() && it->second.contains(op);
+  }
+
+private:
+  // Value provenance feeds chained legality/validity. Maintenance writes stay
+  // per-stage-buffer so unrelated stores are never silently ignored.
+  DenseMap<Value, ReuseBufferContext> bufferContexts;
+  DenseMap<Value, ReuseValueProvenance> valueProvenances;
+  DenseMap<Value, DenseSet<Operation *>> maintenanceWrites;
 };
 
 struct RingAccessCluster {
@@ -1738,55 +1845,60 @@ struct RingAccessPrecomputedIndices {
   SmallVector<Value, 4> logicalIndices;
   SmallVector<Value, 4> physicalIndices;
 };
+
+struct ReuseConditionalLoadResult {
+  Value value;
+  SmallVector<Value, 4> logicalIndices;
+};
+
+struct ReuseAccessFamilyAnalysis {
+  SmallVector<ReuseLogicalAccess, 8> accesses;
+  SmallVector<affine::AffineForOp, 8> innerLoops;
+  ReuseExecutionPlan executionPlan;
+  ReuseResetBoundaryPlan resetBoundaryPlan;
+  Value rootSourceBuffer;
+
+  ReuseAccessFamilyAnalysis(SmallVector<ReuseLogicalAccess, 8> accesses,
+                            SmallVector<affine::AffineForOp, 8> innerLoops,
+                            ReuseExecutionPlan executionPlan,
+                            ReuseResetBoundaryPlan resetBoundaryPlan,
+                            Value rootSourceBuffer)
+      : accesses(std::move(accesses)), innerLoops(std::move(innerLoops)),
+        executionPlan(std::move(executionPlan)),
+        resetBoundaryPlan(resetBoundaryPlan),
+        rootSourceBuffer(rootSourceBuffer) {}
+};
 } // namespace
 
-static std::optional<NoRingReuseWrapper>
-matchNoRingReuseWrapper(affine::AffineIfOp ifOp, Value target) {
-  // Match the no-ring warm-up wrapper emitted by a previous reuse_at.
-  // Chained no-ring reuse reuses the target load hidden in this affine.if.
-  if (!ifOp.hasElse() || ifOp.getNumResults() != 1)
-    return std::nullopt;
+static ReuseAtTransformStateExtension &
+getOrCreateReuseAtExtension(transform::TransformState &state) {
+  if (auto *extension = state.getExtension<ReuseAtTransformStateExtension>())
+    return *extension;
+  return state.addExtension<ReuseAtTransformStateExtension>();
+}
 
-  auto *thenTerminator = ifOp.getThenBlock()->getTerminator();
-  auto *elseTerminator = ifOp.getElseBlock()->getTerminator();
-  auto thenYield = dyn_cast<affine::AffineYieldOp>(thenTerminator);
-  auto elseYield = dyn_cast<affine::AffineYieldOp>(elseTerminator);
-  if (!thenYield || !elseYield || thenYield.getNumOperands() != 1 ||
-      elseYield.getNumOperands() != 1) {
-    return std::nullopt;
-  }
+static ReuseLogicalAccess makeDirectReuseLogicalAccess(Operation *op) {
+  auto readOp = cast<affine::AffineReadOpInterface>(op);
+  ComposedBufferAccess access = composeBufferAccess(op);
+  return {op,
+          readOp.getValue(),
+          nullptr,
+          resolveMemRefValueRoot(readOp.getMemRef()),
+          access,
+          access,
+          /*fromProvenanceWrapper=*/false};
+}
 
-  auto thenOps = ifOp.getThenBlock()->without_terminator();
-  auto elseOps = ifOp.getElseBlock()->without_terminator();
-  auto thenIt = thenOps.begin();
-  auto elseIt = elseOps.begin();
-  if (thenIt == thenOps.end() || elseIt == elseOps.end())
-    return std::nullopt;
-
-  auto thenLoad = dyn_cast<affine::AffineLoadOp>(&*thenIt++);
-  auto thenStore = thenIt == thenOps.end()
-                       ? affine::AffineStoreOp()
-                       : dyn_cast<affine::AffineStoreOp>(&*thenIt++);
-  auto elseLoad = dyn_cast<affine::AffineLoadOp>(&*elseIt++);
-  if (!thenLoad || !thenStore || !elseLoad || thenIt != thenOps.end() ||
-      elseIt != elseOps.end()) {
-    return std::nullopt;
-  }
-
-  if (thenStore.getMemRef() != target || elseLoad.getMemRef() != target)
-    return std::nullopt;
-  if (thenStore.getValueToStore() != thenLoad.getResult())
-    return std::nullopt;
-  if (thenYield.getOperand(0) != thenLoad.getResult() ||
-      elseYield.getOperand(0) != elseLoad.getResult()) {
-    return std::nullopt;
-  }
-  if (thenStore.getAffineMap() != elseLoad.getAffineMap() ||
-      !llvm::equal(thenStore.getMapOperands(), elseLoad.getMapOperands())) {
-    return std::nullopt;
-  }
-
-  return NoRingReuseWrapper{thenLoad, thenStore, elseLoad};
+static ReuseLogicalAccess
+makeProvenanceReuseLogicalAccess(Operation *anchorOp, Value exposedValue,
+                                 const ReuseValueProvenance &provenance) {
+  return {anchorOp,
+          exposedValue,
+          exposedValue,
+          provenance.rootSourceBuffer,
+          provenance.stageAccess,
+          provenance.semanticAccess,
+          /*fromProvenanceWrapper=*/true};
 }
 
 static bool valueDependsOnTargetLoad(Value value, Value target,
@@ -1833,10 +1945,41 @@ static bool valueDependsOnTargetLoad(Value value, Value target,
   return depends;
 }
 
-// ReuseAt assumes canonical affine loops: lb=0, step=1, constant bounds.
-static bool requireNormalizedLoop(affine::AffineForOp forOp) {
-  return forOp.getStepAsInt() == 1 && forOp.hasConstantBounds() &&
-         forOp.getConstantLowerBound() == 0;
+static FailureOr<LoopNormalizationInfo>
+analyzeLoopNormalization(affine::AffineForOp forOp) {
+  // ReuseAt normalizes loops logically, but still requires a static affine
+  // iteration space with constant bounds and a positive constant step.
+  if (!forOp.hasConstantBounds() || forOp.getStepAsInt() <= 0)
+    return failure();
+
+  int64_t lb = forOp.getConstantLowerBound();
+  int64_t ub = forOp.getConstantUpperBound();
+  int64_t step = forOp.getStepAsInt();
+  int64_t span = std::max<int64_t>(ub - lb, 0);
+  int64_t tripCount = span == 0 ? 0 : (span + step - 1) / step;
+  return LoopNormalizationInfo{forOp,    forOp.getInductionVar(), lb, ub, step,
+                               tripCount};
+}
+
+static AffineExpr getNormalizedLoopReplacementExpr(
+    MLIRContext *ctx, const LoopNormalizationInfo &info, unsigned dimPos) {
+  return getAffineConstantExpr(info.lowerBound, ctx) +
+         getAffineConstantExpr(info.step, ctx) * getAffineDimExpr(dimPos, ctx);
+}
+
+static Value materializeNormalizedLoopIndex(OpBuilder &builder, Location loc,
+                                            const LoopNormalizationInfo &info,
+                                            Value iv) {
+  // Materialize the logical zero-based iteration count used by reuse_at
+  // analysis without changing the payload loop bounds or step.
+  if (info.lowerBound == 0 && info.step == 1)
+    return iv;
+  auto d0 = builder.getAffineDimExpr(0);
+  auto normalizedMap = AffineMap::get(
+      /*dimCount=*/1, /*symbolCount=*/0,
+      (d0 - builder.getAffineConstantExpr(info.lowerBound))
+          .floorDiv(info.step));
+  return affine::makeComposedAffineApply(builder, loc, normalizedMap, {iv});
 }
 
 // Walk parent loops to the outermost loop of the selected axis loop.
@@ -1847,18 +1990,6 @@ static affine::AffineForOp getRootLoop(affine::AffineForOp loop) {
   return root;
 }
 
-// Resolve the axis handle to exactly one affine.for loop.
-static FailureOr<affine::AffineForOp>
-resolveAxisLoop(transform::TransformState &state, transform::ReuseAtOp op) {
-  auto payloadOps = state.getPayloadOps(op.getAxis());
-  if (!llvm::hasSingleElement(payloadOps))
-    return failure();
-  auto axisLoop = dyn_cast<affine::AffineForOp>(*payloadOps.begin());
-  if (!axisLoop)
-    return failure();
-  return axisLoop;
-}
-
 // Classify each loop IV in the root nest:
 // - spatial: contributes to store indexing
 // - reduction: contributes to target-load indexing but not store indexing
@@ -1866,13 +1997,16 @@ resolveAxisLoop(transform::TransformState &state, transform::ReuseAtOp op) {
 static LogicalResult
 classifyLoopRoles(affine::AffineForOp rootForOp, Value target,
                   LoopRoleInfo &roles,
+                  DenseMap<Value, LoopNormalizationInfo> &loopInfos,
                   SmallVectorImpl<affine::AffineForOp> &allLoops) {
   // Spatial loops affect stores fed by target loads; reduction loops only
   // affect target-load indexing. reuse_at uses this split to validate the axis.
   WalkResult walkResult = rootForOp.walk([&](affine::AffineForOp forOp) {
-    if (!requireNormalizedLoop(forOp))
+    auto infoOr = analyzeLoopNormalization(forOp);
+    if (failed(infoOr))
       return WalkResult::interrupt();
     allLoops.push_back(forOp);
+    loopInfos[forOp.getInductionVar()] = *infoOr;
     return WalkResult::advance();
   });
   if (walkResult.wasInterrupted())
@@ -1930,7 +2064,7 @@ classifyLoopRoles(affine::AffineForOp rootForOp, Value target,
     Value iv = loop.getInductionVar();
     if (!roles.reductionIVs.contains(iv))
       continue;
-    roles.reductionUpperBounds[iv] = loop.getConstantUpperBound();
+    roles.reductionUpperBounds[iv] = loopInfos.lookup(iv).upperBound;
   }
   return success();
 }
@@ -1958,91 +2092,112 @@ collectReuseInnerLoops(affine::AffineForOp axisLoop,
 
 static LogicalResult
 collectReuseAccesses(affine::AffineForOp axisLoop, Value target,
-                     SmallVectorImpl<ComposedBufferAccess> &accesses,
+                     ReuseAtTransformStateExtension &extension,
+                     SmallVectorImpl<ReuseLogicalAccess> &accesses,
                      SmallVectorImpl<affine::AffineForOp> &innerLoops) {
-  // Collect canonicalized target reads under the selected axis, while
-  // rejecting writes and aliasing that would invalidate reuse state.
+  // Chained legality only trusts extension-registered provenance.
+  // Structural wrapper matching is intentionally not part of this path.
   collectReuseInnerLoops(axisLoop, innerLoops);
 
   Value targetRoot = resolveMemRefValueRoot(target);
-  WalkResult walk = axisLoop.walk<WalkOrder::PreOrder>([&](Operation *op)
-                                                           -> WalkResult {
-    if (auto ifOp = dyn_cast<affine::AffineIfOp>(op)) {
-      if (auto wrapper = matchNoRingReuseWrapper(ifOp, target)) {
-        accesses.push_back(
-            composeBufferAccess(wrapper->elseLoad.getOperation()));
-        return WalkResult::skip();
-      }
-    }
+  bool targetHasBufferContext = extension.hasBufferContext(target);
+  WalkResult walk =
+      axisLoop.walk<WalkOrder::PreOrder>([&](Operation *op) -> WalkResult {
+        bool collectedProvenance = false;
+        for (Value result : op->getResults()) {
+          auto *provenance = extension.findValueProvenance(result);
+          if (!provenance || provenance->stageBuffer != target)
+            continue;
+          accesses.push_back(
+              makeProvenanceReuseLogicalAccess(op, result, *provenance));
+          collectedProvenance = true;
+        }
+        if (collectedProvenance)
+          return WalkResult::skip();
 
-    Value memref;
-    if (auto readOp = dyn_cast<affine::AffineReadOpInterface>(op)) {
-      memref = readOp.getMemRef();
-      if (memref == target)
-        accesses.push_back(composeBufferAccess(op));
-    } else if (auto writeOp = dyn_cast<affine::AffineWriteOpInterface>(op)) {
-      memref = writeOp.getMemRef();
-      if (resolveMemRefValueRoot(memref) == targetRoot) {
-        auto diag = axisLoop.emitError()
-                    << "reuse_at requires the target buffer to be read-only "
-                       "within the selected axis loop";
-        diag.attachNote(writeOp->getLoc()) << "see write op here";
-        return WalkResult::interrupt();
-      }
-    } else if (auto loadOp = dyn_cast<memref::LoadOp>(op)) {
-      memref = loadOp.getMemRef();
-      if (resolveMemRefValueRoot(memref) == targetRoot) {
-        auto diag = emitError(targetRoot.getLoc())
-                    << "reuse_at only supports affine.load accesses to the "
-                       "target buffer";
-        diag.attachNote(loadOp.getLoc()) << "see memref.load op here";
-        return WalkResult::interrupt();
-      }
-    } else if (auto storeOp = dyn_cast<memref::StoreOp>(op)) {
-      memref = storeOp.getMemRef();
-      if (resolveMemRefValueRoot(memref) == targetRoot) {
-        auto diag = axisLoop.emitError()
-                    << "reuse_at requires the target buffer to be read-only "
-                       "within the selected axis loop";
-        diag.attachNote(storeOp.getLoc()) << "see memref.store op here";
-        return WalkResult::interrupt();
-      }
-    } else if (isMemRefCastOrViewLike(op)) {
-      bool aliasesTarget = llvm::any_of(op->getResults(), [&](Value result) {
-        return isa<BaseMemRefType>(result.getType()) &&
-               resolveMemRefValueRoot(result) == targetRoot;
+        Value memref = nullptr;
+        if (auto readOp = dyn_cast<affine::AffineReadOpInterface>(op)) {
+          memref = readOp.getMemRef();
+          if (memref == target) {
+            // Chained stages must consume explicit provenance only. Direct
+            // affine.loads from an intermediate reuse buffer are internal IR.
+            if (targetHasBufferContext)
+              return WalkResult::advance();
+            accesses.push_back(makeDirectReuseLogicalAccess(op));
+            return WalkResult::advance();
+          }
+        }
+
+        if (auto writeOp = dyn_cast<affine::AffineWriteOpInterface>(op)) {
+          memref = writeOp.getMemRef();
+          if (resolveMemRefValueRoot(memref) == targetRoot) {
+            if (extension.isMaintenanceWrite(target, op))
+              return WalkResult::advance();
+            auto diag =
+                axisLoop.emitError()
+                << "reuse_at requires the target buffer to be read-only "
+                   "within the selected axis loop";
+            diag.attachNote(writeOp->getLoc()) << "see write op here";
+            return WalkResult::interrupt();
+          }
+        } else if (auto loadOp = dyn_cast<memref::LoadOp>(op)) {
+          memref = loadOp.getMemRef();
+          if (resolveMemRefValueRoot(memref) == targetRoot) {
+            auto diag = emitError(targetRoot.getLoc())
+                        << "reuse_at only supports affine.load accesses to the "
+                           "target buffer";
+            diag.attachNote(loadOp.getLoc()) << "see memref.load op here";
+            return WalkResult::interrupt();
+          }
+        } else if (auto storeOp = dyn_cast<memref::StoreOp>(op)) {
+          memref = storeOp.getMemRef();
+          if (resolveMemRefValueRoot(memref) == targetRoot) {
+            auto diag =
+                axisLoop.emitError()
+                << "reuse_at requires the target buffer to be read-only "
+                   "within the selected axis loop";
+            diag.attachNote(storeOp.getLoc()) << "see memref.store op here";
+            return WalkResult::interrupt();
+          }
+        } else if (isMemRefCastOrViewLike(op)) {
+          bool aliasesTarget =
+              llvm::any_of(op->getResults(), [&](Value result) {
+                return isa<BaseMemRefType>(result.getType()) &&
+                       resolveMemRefValueRoot(result) == targetRoot;
+              });
+          if (aliasesTarget) {
+            auto diag = axisLoop.emitError()
+                        << "reuse_at does not support aliasing/view accesses "
+                           "to the "
+                           "target buffer within the selected axis loop";
+            diag.attachNote(op->getLoc()) << "see aliasing/view op here";
+            return WalkResult::interrupt();
+          }
+        }
+        return WalkResult::advance();
       });
-      if (aliasesTarget) {
-        auto diag = axisLoop.emitError()
-                    << "reuse_at does not support aliasing/view accesses "
-                       "to the "
-                       "target buffer within the selected axis loop";
-        diag.attachNote(op->getLoc()) << "see aliasing/view op here";
-        return WalkResult::interrupt();
-      }
-    }
-    return WalkResult::advance();
-  });
 
   if (walk.wasInterrupted())
     return failure();
   if (accesses.empty()) {
-    auto diag =
-        axisLoop.emitError()
-        << "no affine.load access to the target buffer found within the "
-           "selected axis loop";
+    auto diag = axisLoop.emitError()
+                << "no direct affine.load or registered chained reuse access "
+                   "to the target buffer found within the selected axis loop";
     return diag;
   }
   return success();
 }
 
 static FailureOr<ReuseDimFootprint>
-computeReuseDimFootprint(const ComposedBufferAccess &access, unsigned resultPos,
-                         ArrayRef<affine::AffineForOp> innerLoops, Value axisIV,
-                         DenseMap<Value, unsigned> &prefixOperandPos,
-                         ArrayRef<Value> prefixOperands) {
+computeRawReuseDimFootprint(const ComposedBufferAccess &access,
+                            unsigned resultPos,
+                            ArrayRef<affine::AffineForOp> innerLoops,
+                            const LoopNormalizationInfo &axisInfo,
+                            DenseMap<Value, LoopNormalizationInfo> &loopInfos,
+                            DenseMap<Value, unsigned> &prefixOperandPos,
+                            ArrayRef<Value> prefixOperands) {
   // Decompose one accessed buffer dimension into:
-  //   lower(anchor over axis/prefix) + bounded contiguous inner-loop offsets.
+  //   lower(anchor over axis/prefix) + non-negative inner-loop coefficients.
   AffineExpr accessExpr = access.map.getResult(resultPos);
   SmallVector<affine::AffineForOp, 4> dependentLoops;
   for (affine::AffineForOp loop : innerLoops) {
@@ -2054,16 +2209,25 @@ computeReuseDimFootprint(const ComposedBufferAccess &access, unsigned resultPos,
 
   unsigned prefixDimCount = prefixOperands.size();
   SmallVector<AffineExpr, 8> dimReplacements, symReplacements;
-  SmallVector<std::pair<Value, AffineExpr>, 4> lowerReplacements;
-  lowerReplacements.emplace_back(axisIV,
-                                 getAffineDimExpr(0, access.map.getContext()));
+  SmallVector<std::pair<Value, AffineExpr>, 8> lowerReplacements;
+  Value axisIV = axisInfo.inductionVar;
+  lowerReplacements.emplace_back(axisIV, getNormalizedLoopReplacementExpr(
+                                             access.map.getContext(), axisInfo,
+                                             /*dimPos=*/0));
+  for (affine::AffineForOp loop : innerLoops) {
+    Value loopIV = loop.getInductionVar();
+    LoopNormalizationInfo loopInfo = loopInfos.lookup(loop.getInductionVar());
+    lowerReplacements.emplace_back(
+        loopIV,
+        getAffineConstantExpr(loopInfo.lowerBound, access.map.getContext()));
+  }
   populateExprReplacements(
       access.map, access.operands, prefixOperandPos, lowerReplacements,
       /*prefixDimOffset=*/1, dimReplacements, symReplacements);
   AffineExpr lowerExpr = simplifyAffineExpr(
       accessExpr.replaceDimsAndSymbols(dimReplacements, symReplacements),
       1 + prefixDimCount, /*numSymbols=*/0);
-  FailureOr<int64_t> axisCoeffOr =
+  auto axisCoeffOr =
       getLinearAffineDimCoefficient(lowerExpr, 1 + prefixDimCount,
                                     /*dimPos=*/0);
   if (failed(axisCoeffOr))
@@ -2081,21 +2245,33 @@ computeReuseDimFootprint(const ComposedBufferAccess &access, unsigned resultPos,
   activeLoops.reserve(dependentLoops.size());
   activeLoopExtents.reserve(dependentLoops.size());
   for (affine::AffineForOp loop : dependentLoops) {
-    if (!loop.hasConstantBounds() || loop.getStepAsInt() != 1 ||
-        loop.getConstantLowerBound() != 0)
-      return failure();
-    int64_t extent =
-        loop.getConstantUpperBound() - loop.getConstantLowerBound();
+    LoopNormalizationInfo loopInfo = loopInfos.lookup(loop.getInductionVar());
+    int64_t extent = loopInfo.tripCount;
     if (extent <= 0)
       return failure();
     activeLoops.push_back(loop);
     activeLoopExtents.push_back(extent);
   }
 
-  SmallVector<std::pair<Value, AffineExpr>, 6> offsetReplacements;
-  for (auto [idx, loop] : llvm::enumerate(activeLoops)) {
+  SmallVector<std::pair<Value, AffineExpr>, 8> offsetReplacements;
+  offsetReplacements.emplace_back(
+      axisIV,
+      getAffineConstantExpr(axisInfo.lowerBound, access.map.getContext()));
+  for (affine::AffineForOp loop : innerLoops) {
+    Value loopIV = loop.getInductionVar();
+    LoopNormalizationInfo loopInfo = loopInfos.lookup(loop.getInductionVar());
+    auto *activeIt = llvm::find(activeLoops, loop);
+    if (activeIt == activeLoops.end()) {
+      offsetReplacements.emplace_back(
+          loopIV,
+          getAffineConstantExpr(loopInfo.lowerBound, access.map.getContext()));
+      continue;
+    }
+    unsigned idx = std::distance(activeLoops.begin(), activeIt);
     offsetReplacements.emplace_back(
-        loop.getInductionVar(), getAffineDimExpr(idx, access.map.getContext()));
+        loopIV,
+        getNormalizedLoopReplacementExpr(access.map.getContext(), loopInfo,
+                                         /*dimPos=*/idx));
   }
   populateExprReplacements(
       access.map, access.operands, prefixOperandPos, offsetReplacements,
@@ -2118,8 +2294,8 @@ computeReuseDimFootprint(const ComposedBufferAccess &access, unsigned resultPos,
       offsetExpr - expandedLowerExpr, activeLoops.size() + prefixDimCount,
       /*numSymbols=*/0);
 
-  FailureOr<int64_t> innerConstOr = getConstantExprDelta(
-      offsetExpr, expandedLowerExpr, activeLoops.size() + prefixDimCount);
+  auto innerConstOr = getConstantExprDelta(offsetExpr, expandedLowerExpr,
+                                           activeLoops.size() + prefixDimCount);
   if (succeeded(innerConstOr) && *innerConstOr == 0)
     return footprint;
 
@@ -2135,95 +2311,217 @@ computeReuseDimFootprint(const ComposedBufferAccess &access, unsigned resultPos,
   if (flattenedExpr.back() != 0)
     return failure();
 
-  int64_t maxOffset = 0;
-  for (auto [idx, coeff] :
-       llvm::enumerate(ArrayRef<int64_t>(flattenedExpr).drop_back())) {
-    if (coeff < 0 || coeff > 1)
+  footprint.innerCoeffs.assign(flattenedExpr.begin(), flattenedExpr.end() - 1);
+  footprint.innerExtents.assign(activeLoopExtents.begin(),
+                                activeLoopExtents.end());
+  for (int64_t coeff : footprint.innerCoeffs) {
+    if (coeff < 0)
       return failure();
-    if (coeff == 0)
-      continue;
-    maxOffset += activeLoopExtents[idx] - 1;
   }
-
-  footprint.extent = maxOffset + 1;
-  footprint.innerMaxOffset = maxOffset;
   return footprint;
 }
 
+static void updateLayoutStrideGCD(int64_t &layoutStride, int64_t value) {
+  if (value == 0)
+    return;
+  int64_t absValue = std::abs(value);
+  layoutStride =
+      layoutStride == 0 ? absValue : std::gcd(layoutStride, absValue);
+}
+
+static FailureOr<int64_t> computeDenseSlotMaxOffset(ArrayRef<int64_t> coeffs,
+                                                    ArrayRef<int64_t> extents) {
+  SmallVector<std::pair<int64_t, int64_t>, 4> activeTerms;
+  for (auto [coeff, extent] : llvm::zip_equal(coeffs, extents)) {
+    if (coeff < 0)
+      return failure();
+    if (coeff == 0)
+      continue;
+    activeTerms.emplace_back(coeff, extent);
+  }
+  llvm::sort(activeTerms, [](const auto &lhs, const auto &rhs) {
+    return lhs.first < rhs.first;
+  });
+
+  int64_t coveredMax = 0;
+  for (auto [coeff, extent] : activeTerms) {
+    if (coeff > coveredMax + 1)
+      return failure();
+    coveredMax += coeff * (extent - 1);
+  }
+  return coveredMax;
+}
+
+static FailureOr<ReuseDimFootprint>
+projectReuseDimFootprintToSlots(const ReuseDimFootprint &rawFootprint,
+                                int64_t layoutStride) {
+  if (layoutStride <= 0)
+    return failure();
+  if (rawFootprint.axisCoeff % layoutStride != 0)
+    return failure();
+
+  ReuseDimFootprint slotFootprint = rawFootprint;
+  slotFootprint.layoutStride = layoutStride;
+  slotFootprint.axisCoeff = rawFootprint.axisCoeff / layoutStride;
+
+  SmallVector<int64_t, 4> slotCoeffs;
+  slotCoeffs.reserve(rawFootprint.innerCoeffs.size());
+  for (auto [coeff, extent] :
+       llvm::zip_equal(rawFootprint.innerCoeffs, rawFootprint.innerExtents)) {
+    if (coeff % layoutStride != 0)
+      return failure();
+    slotCoeffs.push_back(coeff / layoutStride);
+  }
+  auto maxSlotOffsetOr =
+      computeDenseSlotMaxOffset(slotCoeffs, rawFootprint.innerExtents);
+  if (failed(maxSlotOffsetOr))
+    return failure();
+
+  slotFootprint.extent = *maxSlotOffsetOr + 1;
+  slotFootprint.innerMinOffset = 0;
+  slotFootprint.innerMaxOffset = *maxSlotOffsetOr;
+  return slotFootprint;
+}
+
 static FailureOr<ReuseStatePlan>
-analyzeReuseStatePlan(ArrayRef<ComposedBufferAccess> accesses,
+analyzeReuseStatePlan(ArrayRef<ReuseLogicalAccess> accesses,
                       ArrayRef<affine::AffineForOp> innerLoops,
-                      affine::AffineForOp axisLoop, unsigned bufferRank,
-                      MLIRContext *ctx) {
+                      affine::AffineForOp axisLoop,
+                      const LoopNormalizationInfo &axisInfo,
+                      DenseMap<Value, LoopNormalizationInfo> &loopInfos,
+                      unsigned bufferRank, MLIRContext *ctx) {
   // Build one logical reuse state shared by all candidate loads:
   // common sliding dim, common anchors, and one bounded local box.
   ReuseStatePlan plan;
-  Value axisIV = axisLoop.getInductionVar();
   DenseMap<Value, unsigned> prefixOperandPos;
-  collectFootprintOperands(accesses, innerLoops, ArrayRef<Value>{axisIV},
+  SmallVector<ComposedBufferAccess, 8> composedAccesses;
+  composedAccesses.reserve(accesses.size());
+  for (const ReuseLogicalAccess &access : accesses)
+    composedAccesses.push_back(access.semanticAccess);
+  collectFootprintOperands(composedAccesses, innerLoops,
+                           ArrayRef<Value>{axisLoop.getInductionVar()},
                            prefixOperandPos, plan.prefixOperands);
   unsigned prefixDimCount = plan.prefixOperands.size();
 
-  SmallVector<bool, 4> stationarySeen(bufferRank, false);
+  SmallVector<bool, 4> footprintSeen(bufferRank, false);
   SmallVector<AffineExpr, 4> refLower(bufferRank);
+  SmallVector<int64_t, 4> layoutStrides(bufferRank, 1);
   SmallVector<int64_t, 4> minOffset(bufferRank, 0);
   SmallVector<int64_t, 4> maxUpper(bufferRank, 0);
   SmallVector<int64_t, 4> windowMinOffset(bufferRank, 0);
   SmallVector<int64_t, 4> windowMaxOffset(bufferRank, 0);
+  SmallVector<SmallVector<int64_t, 4>, 8> lowerOffsets(accesses.size());
+  SmallVector<SmallVector<ReuseDimFootprint, 4>, 8> rawFootprints(
+      accesses.size());
   SmallVector<SmallVector<int64_t, 4>, 8> axisCoeffs(accesses.size());
 
-  std::optional<unsigned> detectedSlidingDim;
-  std::optional<int64_t> detectedSlidingDelta;
-
   for (auto [accessIdx, access] : llvm::enumerate(accesses)) {
-    auto readOp = cast<affine::AffineReadOpInterface>(access.op);
-    if (access.map.getNumResults() != bufferRank) {
-      auto diag = readOp->emitError()
+    if (access.semanticAccess.map.getNumResults() != bufferRank) {
+      auto diag = access.anchorOp->emitError()
                   << "reuse_at requires candidate loads to match the target "
                      "buffer rank";
-      diag.attachNote(readOp->getLoc())
-          << "candidate affine.load has " << access.map.getNumResults()
+      diag.attachNote(access.anchorOp->getLoc())
+          << "candidate access has "
+          << access.semanticAccess.map.getNumResults()
           << " indices, but the target buffer rank is " << bufferRank;
       return diag;
     }
 
-    axisCoeffs[accessIdx].resize(bufferRank, 0);
+    lowerOffsets[accessIdx].assign(bufferRank, 0);
+    rawFootprints[accessIdx].resize(bufferRank);
     for (unsigned d = 0; d < bufferRank; ++d) {
-      // Derive the per-access footprint for this result dimension, then record
-      // how the selected axis translates that footprint across iterations.
-      FailureOr<ReuseDimFootprint> footprintOr = computeReuseDimFootprint(
-          access, d, innerLoops, axisIV, prefixOperandPos, plan.prefixOperands);
+      // Derive a source-space footprint first; the common lattice stride is a
+      // property of the whole access family, not of one access in isolation.
+      auto footprintOr = computeRawReuseDimFootprint(
+          access.semanticAccess, d, innerLoops, axisInfo, loopInfos,
+          prefixOperandPos, plan.prefixOperands);
       if (failed(footprintOr)) {
-        auto diag = readOp->emitError()
+        auto diag = access.anchorOp->emitError()
                     << "reuse_at requires buffer dimensions to have bounded "
-                       "contiguous affine footprints";
-        diag.attachNote(readOp->getLoc())
-            << "failed to derive a contiguous local footprint for buffer "
+                       "strided affine-lattice footprints";
+        diag.attachNote(access.anchorOp->getLoc())
+            << "failed to derive a bounded lattice footprint for buffer "
                "dimension "
             << d;
         return diag;
       }
-      const ReuseDimFootprint &footprint = *footprintOr;
+      rawFootprints[accessIdx][d] = *footprintOr;
+
+      if (!footprintSeen[d]) {
+        // Seed the common coordinate system from the first candidate access.
+        footprintSeen[d] = true;
+        refLower[d] = footprintOr->lowerExpr;
+        continue;
+      }
+
+      auto offsetOr = getConstantExprDelta(footprintOr->lowerExpr, refLower[d],
+                                           1 + prefixDimCount);
+      if (failed(offsetOr)) {
+        auto diag =
+            access.anchorOp->emitError()
+            << "candidate loads do not share a common lattice coordinate "
+               "system";
+        diag.attachNote(access.anchorOp->getLoc())
+            << "candidate access uses a non-constant local offset for "
+               "buffer dimension "
+            << d;
+        return diag;
+      }
+      lowerOffsets[accessIdx][d] = *offsetOr;
+    }
+  }
+
+  for (unsigned d = 0; d < bufferRank; ++d) {
+    int64_t layoutStride = 0;
+    for (auto [accessIdx, access] : llvm::enumerate(accesses)) {
+      const ReuseDimFootprint &footprint = rawFootprints[accessIdx][d];
+      updateLayoutStrideGCD(layoutStride, footprint.axisCoeff);
+      updateLayoutStrideGCD(layoutStride, lowerOffsets[accessIdx][d]);
+      for (int64_t coeff : footprint.innerCoeffs)
+        updateLayoutStrideGCD(layoutStride, coeff);
+    }
+    layoutStrides[d] = layoutStride == 0 ? 1 : layoutStride;
+  }
+
+  std::optional<unsigned> detectedSlidingDim;
+  std::optional<int64_t> detectedSlidingDelta;
+  for (auto [accessIdx, access] : llvm::enumerate(accesses)) {
+    axisCoeffs[accessIdx].resize(bufferRank, 0);
+    for (unsigned d = 0; d < bufferRank; ++d) {
+      auto slotFootprintOr = projectReuseDimFootprintToSlots(
+          rawFootprints[accessIdx][d], layoutStrides[d]);
+      if (failed(slotFootprintOr) ||
+          lowerOffsets[accessIdx][d] % layoutStrides[d] != 0) {
+        auto diag = access.anchorOp->emitError()
+                    << "reuse_at requires buffer dimensions to have bounded "
+                       "strided affine-lattice footprints";
+        diag.attachNote(access.anchorOp->getLoc())
+            << "failed to project buffer dimension " << d
+            << " to a dense slot-space lattice";
+        return diag;
+      }
+      const ReuseDimFootprint &footprint = *slotFootprintOr;
+      int64_t slotOffset = lowerOffsets[accessIdx][d] / layoutStrides[d];
       int64_t delta = footprint.axisCoeff;
       axisCoeffs[accessIdx][d] = delta;
 
       if (delta != 0) {
         if (detectedSlidingDim && *detectedSlidingDim != d) {
-          auto diag = readOp->emitError()
+          auto diag = access.anchorOp->emitError()
                       << "candidate loads do not share a common sliding "
                          "dimension";
-          diag.attachNote(readOp->getLoc())
-              << "candidate affine.load slides along buffer dimension " << d
+          diag.attachNote(access.anchorOp->getLoc())
+              << "candidate access slides along buffer dimension " << d
               << ", but previous candidates slide along buffer dimension "
               << *detectedSlidingDim;
           return diag;
         }
         if (detectedSlidingDelta && *detectedSlidingDelta != delta) {
-          auto diag = readOp->emitError()
+          auto diag = access.anchorOp->emitError()
                       << "candidate loads do not share a common sliding "
                          "direction";
-          diag.attachNote(readOp->getLoc())
-              << "candidate affine.load uses selected-axis coefficient "
+          diag.attachNote(access.anchorOp->getLoc())
+              << "candidate access uses selected-axis slot coefficient "
               << delta << " in buffer dimension " << d
               << ", but previous candidates use coefficient "
               << *detectedSlidingDelta;
@@ -2233,38 +2531,19 @@ analyzeReuseStatePlan(ArrayRef<ComposedBufferAccess> accesses,
         detectedSlidingDelta = delta;
       }
 
-      if (!stationarySeen[d]) {
-        // Seed the common coordinate system from the first candidate access.
-        stationarySeen[d] = true;
-        refLower[d] = footprint.lowerExpr;
-        minOffset[d] = 0;
-        maxUpper[d] = footprint.extent;
-        windowMinOffset[d] = footprint.innerMinOffset;
-        windowMaxOffset[d] = footprint.innerMaxOffset;
+      if (accessIdx == 0) {
+        minOffset[d] = slotOffset;
+        maxUpper[d] = slotOffset + footprint.extent;
+        windowMinOffset[d] = slotOffset + footprint.innerMinOffset;
+        windowMaxOffset[d] = slotOffset + footprint.innerMaxOffset;
         continue;
       }
-
-      FailureOr<int64_t> offsetOr = getConstantExprDelta(
-          footprint.lowerExpr, refLower[d], 1 + prefixDimCount);
-      if (failed(offsetOr)) {
-        auto diag =
-            readOp->emitError()
-            << (delta != 0 ? "candidate loads do not share a common sliding "
-                             "coordinate system"
-                           : "candidate loads do not share a common local "
-                             "coordinate system");
-        diag.attachNote(readOp->getLoc())
-            << "candidate affine.load uses a non-constant local offset for "
-               "buffer dimension "
-            << d;
-        return diag;
-      }
-      minOffset[d] = std::min(minOffset[d], *offsetOr);
-      maxUpper[d] = std::max(maxUpper[d], *offsetOr + footprint.extent);
+      minOffset[d] = std::min(minOffset[d], slotOffset);
+      maxUpper[d] = std::max(maxUpper[d], slotOffset + footprint.extent);
       windowMinOffset[d] =
-          std::min(windowMinOffset[d], *offsetOr + footprint.innerMinOffset);
+          std::min(windowMinOffset[d], slotOffset + footprint.innerMinOffset);
       windowMaxOffset[d] =
-          std::max(windowMaxOffset[d], *offsetOr + footprint.innerMaxOffset);
+          std::max(windowMaxOffset[d], slotOffset + footprint.innerMaxOffset);
     }
   }
 
@@ -2281,25 +2560,22 @@ analyzeReuseStatePlan(ArrayRef<ComposedBufferAccess> accesses,
   for (auto [accessIdx, coeffs] : llvm::enumerate(axisCoeffs)) {
     // Every candidate must slide along exactly one common buffer dimension.
     if (coeffs[*detectedSlidingDim] == 0) {
-      auto readOp = cast<affine::AffineReadOpInterface>(accesses[accessIdx].op);
-      auto diag = readOp->emitError()
+      auto diag = accesses[accessIdx].anchorOp->emitError()
                   << "candidate loads do not all depend on the selected axis "
                      "through the same sliding dimension";
-      diag.attachNote(readOp->getLoc())
-          << "candidate affine.load does not depend on the selected axis "
+      diag.attachNote(accesses[accessIdx].anchorOp->getLoc())
+          << "candidate access does not depend on the selected axis "
              "through buffer dimension "
           << *detectedSlidingDim;
       return diag;
     }
     for (auto [dim, coeff] : llvm::enumerate(coeffs)) {
       if (dim != *detectedSlidingDim && coeff != 0) {
-        auto readOp =
-            cast<affine::AffineReadOpInterface>(accesses[accessIdx].op);
-        auto diag = readOp->emitError()
+        auto diag = accesses[accessIdx].anchorOp->emitError()
                     << "candidate loads do not share a common sliding "
                        "dimension";
-        diag.attachNote(readOp->getLoc())
-            << "candidate affine.load also depends on the selected axis "
+        diag.attachNote(accesses[accessIdx].anchorOp->getLoc())
+            << "candidate access also depends on the selected axis "
                "through buffer dimension "
             << dim;
         return diag;
@@ -2315,7 +2591,7 @@ analyzeReuseStatePlan(ArrayRef<ComposedBufferAccess> accesses,
 
   for (unsigned d = 0; d < bufferRank; ++d) {
     ReuseDimPlan &dimPlan = plan.dims[d];
-    if (!stationarySeen[d]) {
+    if (!footprintSeen[d]) {
       auto diag = axisLoop->emitError()
                   << "reuse_at failed to derive a local footprint for a "
                      "buffer dimension";
@@ -2326,11 +2602,13 @@ analyzeReuseStatePlan(ArrayRef<ComposedBufferAccess> accesses,
     }
 
     // Convert the relative offsets gathered above into a single local box.
-    AffineExpr anchorExpr =
-        simplifyAffineExpr(refLower[d] + minOffset[d], 1 + prefixDimCount,
-                           /*numSymbols=*/0);
+    AffineExpr anchorExpr = simplifyAffineExpr(
+        refLower[d] +
+            getAffineConstantExpr(minOffset[d] * layoutStrides[d], ctx),
+        1 + prefixDimCount, /*numSymbols=*/0);
     dimPlan.anchorMap =
         AffineMap::get(1 + prefixDimCount, /*symbolCount=*/0, anchorExpr, ctx);
+    dimPlan.layoutStride = layoutStrides[d];
     dimPlan.extent = maxUpper[d] - minOffset[d];
     dimPlan.axisCoeff = d == *detectedSlidingDim ? *detectedSlidingDelta : 0;
     dimPlan.innerMinOffset = windowMinOffset[d] - minOffset[d];
@@ -2367,6 +2645,107 @@ analyzeReuseStatePlan(ArrayRef<ComposedBufferAccess> accesses,
   return plan;
 }
 
+static FailureOr<ReuseValidityPlan>
+analyzeReuseValidityPlan(ArrayRef<ReuseLogicalAccess> accesses,
+                         ArrayRef<affine::AffineForOp> innerLoops,
+                         const LoopNormalizationInfo &axisInfo,
+                         DenseMap<Value, LoopNormalizationInfo> &loopInfos,
+                         const ReuseStatePlan &plan) {
+  // Direct-target reuse starts with one explicit source-backed iteration, but
+  // record the per-access local coverage now so later phases can refine it
+  // beyond the current one-iteration warm-up model.
+  ReuseValidityPlan validityPlan;
+  validityPlan.axisTripCount = axisInfo.tripCount;
+  validityPlan.steadyStateStart =
+      axisInfo.tripCount > 1 ? 1 : axisInfo.tripCount;
+  validityPlan.updateStartIter = validityPlan.steadyStateStart;
+
+  DenseMap<Value, unsigned> prefixOperandPos;
+  for (auto [idx, operand] : llvm::enumerate(plan.prefixOperands))
+    prefixOperandPos[stripCast(operand)] = idx;
+  unsigned prefixDimCount = plan.prefixOperands.size();
+  AffineExpr anchorExpr = plan.dims[plan.slidingDim].anchorMap.getResult(0);
+  int64_t layoutStride = plan.dims[plan.slidingDim].layoutStride;
+  int64_t slidingExtent = plan.dims[plan.slidingDim].extent;
+  validityPlan.slotFirstFillIters.assign(slidingExtent,
+                                         std::numeric_limits<int64_t>::max());
+  validityPlan.slotLastUseIters.assign(slidingExtent, -1);
+
+  validityPlan.accesses.reserve(accesses.size());
+  for (const ReuseLogicalAccess &access : accesses) {
+    auto footprintOr = computeRawReuseDimFootprint(
+        access.semanticAccess, plan.slidingDim, innerLoops, axisInfo, loopInfos,
+        prefixOperandPos, plan.prefixOperands);
+    if (failed(footprintOr)) {
+      auto diag = access.anchorOp->emitError()
+                  << "reuse_at failed to derive sliding-dimension validity";
+      diag.attachNote(access.anchorOp->getLoc())
+          << "failed while computing local validity coverage";
+      return diag;
+    }
+
+    auto slotFootprintOr =
+        projectReuseDimFootprintToSlots(*footprintOr, layoutStride);
+    auto localBaseOr = getConstantExprDelta(footprintOr->lowerExpr, anchorExpr,
+                                            1 + prefixDimCount);
+    if (failed(slotFootprintOr) || failed(localBaseOr) ||
+        *localBaseOr % layoutStride != 0) {
+      auto diag = access.anchorOp->emitError()
+                  << "reuse_at requires statically-bounded validity on the "
+                     "sliding dimension";
+      diag.attachNote(access.anchorOp->getLoc())
+          << "failed to express the access as a slot-space local offset";
+      return diag;
+    }
+
+    ReuseAccessValidity accessValidity;
+    int64_t slotBase = *localBaseOr / layoutStride;
+    accessValidity.slidingLocalMin = slotBase + slotFootprintOr->innerMinOffset;
+    accessValidity.slidingLocalMax = slotBase + slotFootprintOr->innerMaxOffset;
+    accessValidity.firstReusableIter = validityPlan.steadyStateStart;
+    accessValidity.lastReusableIter =
+        validityPlan.axisTripCount > 0 ? validityPlan.axisTripCount - 1 : 0;
+
+    if (accessValidity.slidingLocalMin < 0 ||
+        accessValidity.slidingLocalMax >= slidingExtent) {
+      auto diag = access.anchorOp->emitError()
+                  << "reuse_at derived an out-of-bounds local validity range";
+      diag.attachNote(access.anchorOp->getLoc())
+          << "derived local sliding range [" << accessValidity.slidingLocalMin
+          << ", " << accessValidity.slidingLocalMax << "] exceeds extent "
+          << slidingExtent;
+      return diag;
+    }
+
+    int64_t firstFillIter = accessValidity.firstReusableIter > 0
+                                ? 0
+                                : std::numeric_limits<int64_t>::max();
+    for (int64_t slot = accessValidity.slidingLocalMin;
+         slot <= accessValidity.slidingLocalMax; ++slot) {
+      validityPlan.slotFirstFillIters[slot] =
+          std::min(validityPlan.slotFirstFillIters[slot], firstFillIter);
+      validityPlan.slotLastUseIters[slot] = std::max(
+          validityPlan.slotLastUseIters[slot], accessValidity.lastReusableIter);
+    }
+    validityPlan.accesses.push_back(accessValidity);
+  }
+
+  validityPlan.updateStartIter =
+      validityPlan.accesses.empty()
+          ? validityPlan.steadyStateStart
+          : llvm::min_element(validityPlan.accesses,
+                              [](const ReuseAccessValidity &lhs,
+                                 const ReuseAccessValidity &rhs) {
+                                return lhs.firstReusableIter <
+                                       rhs.firstReusableIter;
+                              })
+                ->firstReusableIter;
+  int64_t maxLastUseIter = *llvm::max_element(validityPlan.slotLastUseIters);
+  validityPlan.updateEndIter = maxLastUseIter - 1;
+
+  return validityPlan;
+}
+
 static SmallVector<Value, 4>
 getReuseStateOperands(Value axisIV, ArrayRef<Value> prefixOperands) {
   SmallVector<Value, 4> operands;
@@ -2380,22 +2759,130 @@ analyzeReuseResetBoundary(affine::AffineForOp axisLoop,
                           affine::AffineForOp rootLoop,
                           const ReuseExecutionPlan &executionPlan) {
   // Hoisting is only a placement optimization. Keep it tied to the current
-  // one-iteration warm-up model so failing the proof never rejects reuse_at.
+  // validity model so failing the proof never rejects reuse_at.
   ReuseResetBoundaryPlan plan;
   plan.rootLoop = rootLoop;
   plan.resetBoundaryLoop = axisLoop->getParentOfType<affine::AffineForOp>();
 
-  // The current codegen has exactly one warm-up iteration: when axisIV == 0,
-  // every rewritten load falls back to the source buffer and stores the loaded
-  // value into the same logical reuse slot that steady-state later reads. This
-  // is enough to safely reuse storage across outer-loop instances; ring mode
-  // additionally requires resetting the head at the boundary where the axis
-  // stream restarts.
-  if (executionPlan.steadyStateStart != 1)
-    return plan;
+  int64_t slidingExtent =
+      executionPlan.statePlan.dims[executionPlan.statePlan.slidingDim].extent;
+  SmallVector<int64_t, 4> slotFirstReusableReadIters(
+      slidingExtent, std::numeric_limits<int64_t>::max());
+  for (const ReuseAccessValidity &accessValidity :
+       executionPlan.validityPlan.accesses) {
+    for (int64_t slot = accessValidity.slidingLocalMin;
+         slot <= accessValidity.slidingLocalMax; ++slot) {
+      slotFirstReusableReadIters[slot] = std::min(
+          slotFirstReusableReadIters[slot], accessValidity.firstReusableIter);
+    }
+  }
+
+  for (auto [firstFillIter, firstReadIter] :
+       llvm::zip_equal(executionPlan.validityPlan.slotFirstFillIters,
+                       slotFirstReusableReadIters)) {
+    if (firstReadIter == std::numeric_limits<int64_t>::max())
+      continue;
+    if (firstFillIter == std::numeric_limits<int64_t>::max() ||
+        firstFillIter >= firstReadIter)
+      return plan;
+  }
 
   plan.canHoist = true;
   return plan;
+}
+
+static Value inferRootSourceBuffer(ArrayRef<ReuseLogicalAccess> accesses) {
+  for (const ReuseLogicalAccess &access : accesses) {
+    Value buffer = access.rootSourceBuffer;
+    if (buffer)
+      return buffer;
+  }
+  return {};
+}
+
+static Value resolveRootSourceBuffer(ReuseAtTransformStateExtension &extension,
+                                     Value target,
+                                     ArrayRef<ReuseLogicalAccess> accesses) {
+  // Reuse buffers registered by earlier stages already know their root source.
+  if (auto *context = extension.findBufferContext(target))
+    return context->rootSourceBuffer;
+  if (Value buffer = inferRootSourceBuffer(accesses))
+    return buffer;
+  return resolveMemRefValueRoot(target);
+}
+
+static void
+registerReuseMaintenanceWrites(ReuseAtTransformStateExtension &extension,
+                               Operation *scope, Value reuseBuffer) {
+  // Internal writes are tracked per stage buffer so later collectors only
+  // ignore stores emitted by the current reuse_at pipeline.
+  scope->walk([&](Operation *nestedOp) {
+    if (auto writeOp = dyn_cast<affine::AffineWriteOpInterface>(nestedOp)) {
+      if (writeOp.getMemRef() == reuseBuffer)
+        extension.registerMaintenanceWrite(reuseBuffer, nestedOp);
+      return;
+    }
+    if (auto storeOp = dyn_cast<memref::StoreOp>(nestedOp)) {
+      if (storeOp.getMemRef() == reuseBuffer)
+        extension.registerMaintenanceWrite(reuseBuffer, nestedOp);
+    }
+  });
+}
+
+static ComposedBufferAccess buildLocalReuseBufferAccess(MLIRContext *ctx,
+                                                        ValueRange indices) {
+  SmallVector<AffineExpr, 4> results;
+  results.reserve(indices.size());
+  for (unsigned i = 0; i < indices.size(); ++i)
+    results.push_back(getAffineDimExpr(i, ctx));
+  affine::AffineValueMap accessValueMap(
+      AffineMap::get(indices.size(), /*symbolCount=*/0, results, ctx), indices);
+  accessValueMap.composeSimplifyAndCanonicalize();
+  return {nullptr, accessValueMap.getAffineMap(),
+          llvm::to_vector(accessValueMap.getOperands())};
+}
+
+static ComposedBufferAccess
+projectSemanticAccessForChainedReuse(const ReuseLogicalAccess &access,
+                                     const ReuseStatePlan &statePlan) {
+  // Downstream stages keep reasoning in the current stage's local coordinate
+  // space, but preserve source-space dependence through the projected map.
+  SmallVector<AffineExpr, 4> projectedResults;
+  projectedResults.reserve(statePlan.keptDims.size());
+  for (unsigned dim : statePlan.keptDims)
+    projectedResults.push_back(access.semanticAccess.map.getResult(dim));
+  affine::AffineValueMap accessValueMap(
+      AffineMap::get(access.semanticAccess.map.getNumDims(),
+                     access.semanticAccess.map.getNumSymbols(),
+                     projectedResults, access.semanticAccess.map.getContext()),
+      access.semanticAccess.operands);
+  accessValueMap.composeSimplifyAndCanonicalize();
+  return {nullptr, accessValueMap.getAffineMap(),
+          llvm::to_vector(accessValueMap.getOperands())};
+}
+
+static void registerNoRingReuseValueProvenance(
+    ReuseAtTransformStateExtension &extension, Value reuseBuffer,
+    const ReuseLogicalAccess &access, const ReuseStatePlan &statePlan,
+    const ReuseConditionalLoadResult &result) {
+  // Provenance registration must use the just-built wrapper metadata instead
+  // of re-matching IR structure after rewriting.
+  extension.registerValueProvenance(
+      result.value,
+      ReuseValueProvenance{
+          reuseBuffer, access.rootSourceBuffer,
+          buildLocalReuseBufferAccess(reuseBuffer.getContext(),
+                                      result.logicalIndices),
+          projectSemanticAccessForChainedReuse(access, statePlan)});
+}
+
+static void replaceComposedAccessOperand(ComposedBufferAccess &access,
+                                         Value from, Value to) {
+  // Ring scalarization recreates the axis loop and its IV. Refresh any
+  // synthetic chained access that still references the old IV.
+  for (Value &operand : access.operands)
+    if (operand == from)
+      operand = to;
 }
 
 static Value materializeGlobalAccessIndex(OpBuilder &builder, Location loc,
@@ -2410,13 +2897,12 @@ static affine::AffineForOp createConstantAffineFor(OpBuilder &builder,
   // generated loop must thread ring state such as a rolling physical slot.
   if (iterArgs.empty()) {
     return affine::AffineForOp::create(builder, loc, lb, ub, 1);
-  } else {
-    return affine::AffineForOp::create(
-        builder, loc, lb, ub, 1, iterArgs,
-        [](OpBuilder &builder, Location loc, Value, ValueRange iterArgs) {
-          affine::AffineYieldOp::create(builder, loc, iterArgs);
-        });
   }
+  return affine::AffineForOp::create(
+      builder, loc, lb, ub, 1, iterArgs,
+      [](OpBuilder &builder, Location loc, Value, ValueRange iterArgs) {
+        affine::AffineYieldOp::create(builder, loc, iterArgs);
+      });
 }
 
 static Value buildAnchorValue(OpBuilder &builder, Location loc,
@@ -2446,6 +2932,41 @@ static Value buildOffsetValue(OpBuilder &builder, Location loc, Value base,
       AffineMap::get(/*dimCount=*/1, /*symbolCount=*/0,
                      d0 + builder.getAffineConstantExpr(offset)),
       {base});
+}
+
+static Value buildStridedOffsetValue(OpBuilder &builder, Location loc,
+                                     Value base, Value offset, int64_t stride) {
+  if (stride == 1)
+    return buildOffsetValue(builder, loc, base, offset);
+  AffineExpr d0 = builder.getAffineDimExpr(0);
+  AffineExpr d1 = builder.getAffineDimExpr(1);
+  return affine::makeComposedAffineApply(
+      builder, loc,
+      AffineMap::get(/*dimCount=*/2, /*symbolCount=*/0,
+                     d0 + d1 * builder.getAffineConstantExpr(stride)),
+      {base, offset});
+}
+
+static Value buildStridedDifferenceValue(OpBuilder &builder, Location loc,
+                                         Value lhs, Value rhs, int64_t stride) {
+  auto d0 = builder.getAffineDimExpr(0);
+  auto d1 = builder.getAffineDimExpr(1);
+  AffineExpr difference = d0 - d1;
+  if (stride != 1)
+    difference = difference.floorDiv(stride);
+  return affine::makeComposedAffineApply(
+      builder, loc,
+      AffineMap::get(/*dimCount=*/2, /*symbolCount=*/0, difference),
+      {lhs, rhs});
+}
+
+static Value buildEnteringFaceLogicalIndex(OpBuilder &builder, Location loc,
+                                           Value enteringFaceIV,
+                                           const ReuseExecutionPlan &plan,
+                                           int64_t enteringBaseOffset) {
+  return plan.slidingDelta > 0 ? buildOffsetValue(builder, loc, enteringFaceIV,
+                                                  enteringBaseOffset)
+                               : enteringFaceIV;
 }
 
 static void generateReuseStateShift(OpBuilder &builder, Location loc,
@@ -2504,6 +3025,43 @@ static Value buildWrappedIncrementValue(OpBuilder &builder, Location loc,
   return arith::SelectOp::create(builder, loc, atLast, zero, next);
 }
 
+static IntegerSet buildReuseWarmupMissSet(OpBuilder &builder,
+                                          int64_t firstReusableIter) {
+  // Validity in this phase keeps the current direct-target lower-bound miss
+  // explicit. More precise tail predicates can layer on top of this plan.
+  auto d0 = builder.getAffineDimExpr(0);
+  return IntegerSet::get(/*dimCount=*/1, /*symbolCount=*/0,
+                         {-d0 + (firstReusableIter - 1)},
+                         /*eqFlags=*/{false});
+}
+
+static IntegerSet buildReuseReusableHitSet(OpBuilder &builder, int64_t lower,
+                                           int64_t upper) {
+  auto d0 = builder.getAffineDimExpr(0);
+  return IntegerSet::get(/*dimCount=*/1, /*symbolCount=*/0,
+                         {d0 - lower, -d0 + upper},
+                         /*eqFlags=*/{false, false});
+}
+
+static std::optional<IntegerSet>
+buildReuseUpdateActiveSet(OpBuilder &builder, int64_t lower, int64_t upper) {
+  if (upper < lower)
+    return std::nullopt;
+  auto d0 = builder.getAffineDimExpr(0);
+  return IntegerSet::get(/*dimCount=*/1, /*symbolCount=*/0,
+                         {d0 - lower, -d0 + upper},
+                         /*eqFlags=*/{false, false});
+}
+
+static ReuseConditionalLoadResult createConditionalReuseLoad(
+    OpBuilder &builder, Location loc, const ReuseLogicalAccess &access,
+    Value sourceBuffer, Value reuseBuffer,
+    const ReuseExecutionPlan &executionPlan, ValueRange stateOperands,
+    const ReuseAccessValidity &accessValidity, Value logicalAxisIV,
+    Value currentIterationRingHead,
+    ArrayRef<Value> precomputedLogicalIndices = {},
+    ArrayRef<Value> precomputedPhysicalIndices = {});
+
 static SmallVector<Value, 4> materializeLogicalReuseIndices(
     OpBuilder &builder, Location loc, const ReuseStatePlan &plan,
     const ComposedBufferAccess &access, ValueRange stateOperands) {
@@ -2516,12 +3074,8 @@ static SmallVector<Value, 4> materializeLogicalReuseIndices(
         materializeGlobalAccessIndex(builder, loc, access, resultDim);
     Value anchor =
         buildAnchorValue(builder, loc, plan.dims[resultDim], stateOperands);
-    logicalIndices.push_back(affine::makeComposedAffineApply(
-        builder, loc,
-        AffineMap::get(/*dimCount=*/2, /*symbolCount=*/0,
-                       builder.getAffineDimExpr(0) -
-                           builder.getAffineDimExpr(1)),
-        {globalIndex, anchor}));
+    logicalIndices.push_back(buildStridedDifferenceValue(
+        builder, loc, globalIndex, anchor, plan.dims[resultDim].layoutStride));
   }
   return logicalIndices;
 }
@@ -2530,7 +3084,7 @@ static SmallVector<Value, 4>
 materializePhysicalReuseIndices(OpBuilder &builder, Location loc,
                                 const ReuseExecutionPlan &executionPlan,
                                 ArrayRef<Value> logicalIndices, Value ringHead,
-                                Value physicalSlidingIndex = Value()) {
+                                Value physicalSlidingIndex = nullptr) {
   // Ring mode keeps logical indices stable and only remaps the sliding
   // dimension to the current physical head position.
   const ReuseStatePlan &plan = executionPlan.statePlan;
@@ -2553,7 +3107,7 @@ materializePhysicalReuseIndices(OpBuilder &builder, Location loc,
 }
 
 static SmallVector<RingAccessCluster, 4>
-collectRingAccessClusters(ArrayRef<ComposedBufferAccess> accesses) {
+collectRingAccessClusters(ArrayRef<ReuseLogicalAccess> accesses) {
   SmallVector<RingAccessCluster, 4> clusters;
   if (accesses.empty())
     return clusters;
@@ -2561,8 +3115,8 @@ collectRingAccessClusters(ArrayRef<ComposedBufferAccess> accesses) {
   RingAccessCluster currentCluster;
   currentCluster.accessIndices.push_back(0);
   for (unsigned idx = 1, e = accesses.size(); idx < e; ++idx) {
-    Operation *prev = accesses[idx - 1].op;
-    Operation *current = accesses[idx].op;
+    Operation *prev = accesses[idx - 1].anchorOp;
+    Operation *current = accesses[idx].anchorOp;
     if (prev->getBlock() == current->getBlock() &&
         prev->getNextNode() == current) {
       currentCluster.accessIndices.push_back(idx);
@@ -2578,7 +3132,7 @@ collectRingAccessClusters(ArrayRef<ComposedBufferAccess> accesses) {
 
 static DenseMap<Operation *, RingAccessPrecomputedIndices>
 precomputeRingAccessClusterIndices(OpBuilder &builder, Location loc,
-                                   ArrayRef<ComposedBufferAccess> accesses,
+                                   ArrayRef<ReuseLogicalAccess> accesses,
                                    const ReuseExecutionPlan &executionPlan,
                                    ValueRange stateOperands,
                                    Value currentIterationRingHead) {
@@ -2594,16 +3148,16 @@ precomputeRingAccessClusterIndices(OpBuilder &builder, Location loc,
 
   for (const RingAccessCluster &cluster : collectRingAccessClusters(accesses)) {
     OpBuilder::InsertionGuard guard(builder);
-    builder.setInsertionPoint(accesses[cluster.accessIndices.front()].op);
+    builder.setInsertionPoint(accesses[cluster.accessIndices.front()].anchorOp);
     for (unsigned accessIdx : cluster.accessIndices) {
-      const ComposedBufferAccess &access = accesses[accessIdx];
+      const ReuseLogicalAccess &access = accesses[accessIdx];
       RingAccessPrecomputedIndices indices;
       indices.logicalIndices = materializeLogicalReuseIndices(
-          builder, loc, plan, access, stateOperands);
+          builder, loc, plan, access.semanticAccess, stateOperands);
       indices.physicalIndices = materializePhysicalReuseIndices(
           builder, loc, executionPlan, indices.logicalIndices,
           currentIterationRingHead);
-      precomputed.try_emplace(access.op, std::move(indices));
+      precomputed.try_emplace(access.anchorOp, std::move(indices));
     }
   }
 
@@ -2614,7 +3168,7 @@ static void generateReuseStateRefill(OpBuilder &builder, Location loc,
                                      Value sourceBuffer, Value reuseBuffer,
                                      const ReuseExecutionPlan &executionPlan,
                                      ValueRange stateOperands,
-                                     Value ringHead = Value()) {
+                                     Value ringHead = nullptr) {
   // Refill only the entering face of the reuse state. Ring mode threads the
   // physical slot with an iter_arg instead of recomputing modulo per element.
   const ReuseStatePlan &plan = executionPlan.statePlan;
@@ -2627,7 +3181,7 @@ static void generateReuseStateRefill(OpBuilder &builder, Location loc,
 
   OpBuilder::InsertionGuard guard(builder);
   SmallVector<Value, 4> logicalIndices(plan.keptDims.size());
-  Value physicalSlidingIndex;
+  Value physicalSlidingIndex = nullptr;
   if (slidingReusePos >= 0) {
     if (executionPlan.strategy == ReuseBufferStrategy::Ring) {
       Value firstPhysicalSlot = buildModuloOffsetValue(
@@ -2641,11 +3195,8 @@ static void generateReuseStateRefill(OpBuilder &builder, Location loc,
           enteringFaceFor.getBody(),
           Block::iterator(enteringFaceFor.getBody()->getTerminator()));
       Value enteringFaceIV = enteringFaceFor.getInductionVar();
-      logicalIndices[slidingReusePos] =
-          executionPlan.slidingDelta > 0
-              ? buildOffsetValue(builder, loc, enteringFaceIV,
-                                 enteringBaseOffset)
-              : enteringFaceIV;
+      logicalIndices[slidingReusePos] = buildEnteringFaceLogicalIndex(
+          builder, loc, enteringFaceIV, executionPlan, enteringBaseOffset);
       physicalSlidingIndex = enteringFaceFor.getRegionIterArgs().front();
       auto yieldOp = cast<affine::AffineYieldOp>(
           enteringFaceFor.getBody()->getTerminator());
@@ -2659,11 +3210,8 @@ static void generateReuseStateRefill(OpBuilder &builder, Location loc,
           enteringFaceFor.getBody(),
           Block::iterator(enteringFaceFor.getBody()->getTerminator()));
       Value enteringFaceIV = enteringFaceFor.getInductionVar();
-      logicalIndices[slidingReusePos] =
-          executionPlan.slidingDelta > 0
-              ? buildOffsetValue(builder, loc, enteringFaceIV,
-                                 enteringBaseOffset)
-              : enteringFaceIV;
+      logicalIndices[slidingReusePos] = buildEnteringFaceLogicalIndex(
+          builder, loc, enteringFaceIV, executionPlan, enteringBaseOffset);
     }
   }
 
@@ -2686,8 +3234,8 @@ static void generateReuseStateRefill(OpBuilder &builder, Location loc,
       globalIndices[resultDim] = anchor;
       continue;
     }
-    globalIndices[resultDim] =
-        buildOffsetValue(builder, loc, anchor, logicalIndices[reusePos]);
+    globalIndices[resultDim] = buildStridedOffsetValue(
+        builder, loc, anchor, logicalIndices[reusePos], dimPlan.layoutStride);
   }
 
   Value loaded =
@@ -2703,42 +3251,188 @@ static void generateReuseStateRefill(OpBuilder &builder, Location loc,
                                 logicalIndices);
 }
 
-static Value createConditionalReuseLoad(
-    OpBuilder &builder, Location loc, const ComposedBufferAccess &access,
+static FailureOr<ReuseAccessFamilyAnalysis>
+analyzeReuseAccessFamily(affine::AffineForOp axisLoop,
+                         affine::AffineForOp rootLoop, Value target,
+                         unsigned rank, const LoopNormalizationInfo &axisInfo,
+                         DenseMap<Value, LoopNormalizationInfo> &loopInfos,
+                         ReuseAtTransformStateExtension &reuseExtension,
+                         MLIRContext *ctx, bool enableRing) {
+  SmallVector<ReuseLogicalAccess, 8> accesses;
+  SmallVector<affine::AffineForOp, 8> innerLoops;
+  if (failed(collectReuseAccesses(axisLoop, target, reuseExtension, accesses,
+                                  innerLoops))) {
+    return failure();
+  }
+
+  // Stage analysis always reasons in semantic slot-space. Direct accesses and
+  // chained provenance both arrive here through the same semantic view.
+  auto stagePlanOr = analyzeReuseStatePlan(accesses, innerLoops, axisLoop,
+                                           axisInfo, loopInfos, rank, ctx);
+  if (failed(stagePlanOr))
+    return failure();
+  auto validityOr = analyzeReuseValidityPlan(accesses, innerLoops, axisInfo,
+                                             loopInfos, *stagePlanOr);
+  if (failed(validityOr)) {
+    return failure();
+  }
+
+  ReuseExecutionPlan executionPlan(std::move(*stagePlanOr),
+                                   std::move(*validityOr), enableRing);
+  ReuseResetBoundaryPlan resetBoundaryPlan =
+      analyzeReuseResetBoundary(axisLoop, rootLoop, executionPlan);
+  Value rootSourceBuffer =
+      resolveRootSourceBuffer(reuseExtension, target, accesses);
+  return ReuseAccessFamilyAnalysis(std::move(accesses), std::move(innerLoops),
+                                   std::move(executionPlan), resetBoundaryPlan,
+                                   rootSourceBuffer);
+}
+
+static Value
+emitReuseStateMaintenance(OpBuilder &builder, affine::AffineForOp axisLoop,
+                          Location loc, Value target, Value reuseBuffer,
+                          const ReuseExecutionPlan &executionPlan,
+                          ValueRange stateOperands, Value logicalAxisIV,
+                          ReuseAtTransformStateExtension &reuseExtension) {
+  auto updateActiveSet = buildReuseUpdateActiveSet(
+      builder, executionPlan.updateStartIter, executionPlan.updateEndIter);
+  if (executionPlan.strategy != ReuseBufferStrategy::Ring) {
+    if (!updateActiveSet)
+      return {};
+    auto updateIf = affine::AffineIfOp::create(builder, loc, *updateActiveSet,
+                                               logicalAxisIV,
+                                               /*withElseRegion=*/false);
+    OpBuilder::InsertionGuard guard(builder);
+    builder.setInsertionPoint(
+        updateIf.getThenBlock(),
+        Block::iterator(updateIf.getThenBlock()->getTerminator()));
+    generateReuseStateShift(builder, loc, reuseBuffer, executionPlan);
+    generateReuseStateRefill(builder, loc, target, reuseBuffer, executionPlan,
+                             stateOperands);
+    registerReuseMaintenanceWrites(reuseExtension, updateIf, reuseBuffer);
+    return {};
+  }
+
+  Value previousIterationRingHead = axisLoop.getRegionIterArgs().back();
+  int64_t slidingExtent =
+      executionPlan.statePlan.dims[executionPlan.statePlan.slidingDim].extent;
+  Value increment =
+      arith::ConstantIndexOp::create(builder, loc, executionPlan.ringIncrement);
+  Value nextHead = buildModuloOffsetValue(
+      builder, loc, previousIterationRingHead, increment, slidingExtent);
+  if (!updateActiveSet)
+    return previousIterationRingHead;
+
+  Value updateStart = arith::ConstantIndexOp::create(
+      builder, loc, executionPlan.updateStartIter);
+  Value updateEnd =
+      arith::ConstantIndexOp::create(builder, loc, executionPlan.updateEndIter);
+  Value atOrAfterStart = arith::CmpIOp::create(
+      builder, loc, arith::CmpIPredicate::sge, logicalAxisIV, updateStart);
+  Value atOrBeforeEnd = arith::CmpIOp::create(
+      builder, loc, arith::CmpIPredicate::sle, logicalAxisIV, updateEnd);
+  Value isUpdateActive =
+      arith::AndIOp::create(builder, loc, atOrAfterStart, atOrBeforeEnd);
+  auto updateIf =
+      affine::AffineIfOp::create(builder, loc, *updateActiveSet, logicalAxisIV,
+                                 /*withElseRegion=*/false);
+  {
+    OpBuilder::InsertionGuard guard(builder);
+    builder.setInsertionPoint(
+        updateIf.getThenBlock(),
+        Block::iterator(updateIf.getThenBlock()->getTerminator()));
+    generateReuseStateRefill(builder, loc, target, reuseBuffer, executionPlan,
+                             stateOperands, nextHead);
+  }
+  registerReuseMaintenanceWrites(reuseExtension, updateIf, reuseBuffer);
+  return arith::SelectOp::create(builder, loc, isUpdateActive, nextHead,
+                                 previousIterationRingHead);
+}
+
+static LogicalResult
+rewriteReuseAccesses(RewriterBase &builder,
+                     ArrayRef<ReuseLogicalAccess> accesses, Value target,
+                     Value reuseBuffer, const ReuseExecutionPlan &executionPlan,
+                     ValueRange stateOperands, Value logicalAxisIV,
+                     Value currentIterationRingHead,
+                     ReuseAtTransformStateExtension &reuseExtension) {
+  auto ringPrecomputedIndices = precomputeRingAccessClusterIndices(
+      builder, reuseBuffer.getLoc(), accesses, executionPlan, stateOperands,
+      currentIterationRingHead);
+
+  for (auto [accessIdx, access] : llvm::enumerate(accesses)) {
+    if (access.fromProvenanceWrapper)
+      builder.setInsertionPointAfter(access.anchorOp);
+    else
+      builder.setInsertionPoint(access.anchorOp);
+
+    ArrayRef<Value> precomputedLogicalIndices;
+    ArrayRef<Value> precomputedPhysicalIndices;
+    if (auto it = ringPrecomputedIndices.find(access.anchorOp);
+        it != ringPrecomputedIndices.end()) {
+      precomputedLogicalIndices = it->second.logicalIndices;
+      precomputedPhysicalIndices = it->second.physicalIndices;
+    }
+
+    auto rewritten = createConditionalReuseLoad(
+        builder, access.anchorOp->getLoc(), access, target, reuseBuffer,
+        executionPlan, stateOperands,
+        executionPlan.validityPlan.accesses[accessIdx], logicalAxisIV,
+        currentIterationRingHead, precomputedLogicalIndices,
+        precomputedPhysicalIndices);
+    Operation *rewrittenOp = rewritten.value.getDefiningOp();
+    Value exposedValue = access.exposedValue;
+    exposedValue.replaceUsesWithIf(rewritten.value, [&](OpOperand &use) {
+      return !rewrittenOp->isAncestor(use.getOwner());
+    });
+    if (executionPlan.strategy != ReuseBufferStrategy::Ring) {
+      registerNoRingReuseValueProvenance(reuseExtension, reuseBuffer, access,
+                                         executionPlan.statePlan, rewritten);
+    }
+    if (!access.fromProvenanceWrapper && access.anchorOp->use_empty())
+      builder.eraseOp(access.anchorOp);
+  }
+  return success();
+}
+
+static ReuseConditionalLoadResult createConditionalReuseLoad(
+    OpBuilder &builder, Location loc, const ReuseLogicalAccess &access,
     Value sourceBuffer, Value reuseBuffer,
     const ReuseExecutionPlan &executionPlan, ValueRange stateOperands,
-    Value axisIV, Value currentIterationRingHead,
-    ArrayRef<Value> precomputedLogicalIndices = {},
-    ArrayRef<Value> precomputedPhysicalIndices = {}) {
+    const ReuseAccessValidity &accessValidity, Value logicalAxisIV,
+    Value currentIterationRingHead, ArrayRef<Value> precomputedLogicalIndices,
+    ArrayRef<Value> precomputedPhysicalIndices) {
   // Warm-up keeps the original load and captures it into reuse state.
   // Steady-state switches the same use to the analyzed reuse coordinates.
   const ReuseStatePlan &plan = executionPlan.statePlan;
   SmallVector<Value, 4> logicalIndices(precomputedLogicalIndices.begin(),
                                        precomputedLogicalIndices.end());
   if (logicalIndices.empty()) {
-    logicalIndices = materializeLogicalReuseIndices(builder, loc, plan, access,
-                                                    stateOperands);
+    logicalIndices = materializeLogicalReuseIndices(
+        builder, loc, plan, access.semanticAccess, stateOperands);
   }
 
-  auto warmupSet = IntegerSet::get(
-      /*dimCount=*/1, /*symbolCount=*/0,
-      ArrayRef<AffineExpr>{builder.getAffineDimExpr(0)}, ArrayRef<bool>{true});
-  auto ifOp = affine::AffineIfOp::create(
-      builder, loc, access.op->getResult(0).getType(), warmupSet, axisIV,
-      /*withElseRegion=*/true);
-
-  {
-    OpBuilder::InsertionGuard guard(builder);
-    builder.setInsertionPointToEnd(ifOp.getThenBlock());
-    Value loaded = affine::AffineLoadOp::create(builder, loc, sourceBuffer,
-                                                access.map, access.operands);
-    affine::AffineStoreOp::create(builder, loc, loaded, reuseBuffer,
-                                  logicalIndices);
-    affine::AffineYieldOp::create(builder, loc, loaded);
+  bool coversTail = accessValidity.lastReusableIter >=
+                    executionPlan.validityPlan.axisTripCount - 1;
+  affine::AffineIfOp ifOp;
+  if (coversTail) {
+    auto warmupSet =
+        buildReuseWarmupMissSet(builder, accessValidity.firstReusableIter);
+    ifOp = affine::AffineIfOp::create(
+        builder, loc, access.exposedValue.getType(), warmupSet, logicalAxisIV,
+        /*withElseRegion=*/true);
+  } else {
+    auto reusableSet =
+        buildReuseReusableHitSet(builder, accessValidity.firstReusableIter,
+                                 accessValidity.lastReusableIter);
+    ifOp = affine::AffineIfOp::create(
+        builder, loc, access.exposedValue.getType(), reusableSet, logicalAxisIV,
+        /*withElseRegion=*/true);
   }
-  {
+
+  auto buildReuseHit = [&](Block *block) {
     OpBuilder::InsertionGuard guard(builder);
-    builder.setInsertionPointToEnd(ifOp.getElseBlock());
+    builder.setInsertionPointToEnd(block);
     SmallVector<Value, 4> physicalIndices(precomputedPhysicalIndices.begin(),
                                           precomputedPhysicalIndices.end());
     if (physicalIndices.empty()) {
@@ -2755,9 +3449,30 @@ static Value createConditionalReuseLoad(
                                             physicalIndices);
     }
     affine::AffineYieldOp::create(builder, loc, reused);
-  }
+  };
 
-  return ifOp.getResult(0);
+  auto buildMiss = [&](Block *block) {
+    OpBuilder::InsertionGuard guard(builder);
+    builder.setInsertionPointToEnd(block);
+    Value loaded = access.missValue;
+    if (!loaded) {
+      loaded = affine::AffineLoadOp::create(builder, loc, sourceBuffer,
+                                            access.stageAccess.map,
+                                            access.stageAccess.operands);
+    }
+    affine::AffineStoreOp::create(builder, loc, loaded, reuseBuffer,
+                                  logicalIndices);
+    affine::AffineYieldOp::create(builder, loc, loaded);
+  };
+
+  if (coversTail) {
+    buildMiss(ifOp.getThenBlock());
+    buildReuseHit(ifOp.getElseBlock());
+    return {ifOp.getResult(0), std::move(logicalIndices)};
+  }
+  buildReuseHit(ifOp.getThenBlock());
+  buildMiss(ifOp.getElseBlock());
+  return {ifOp.getResult(0), std::move(logicalIndices)};
 }
 
 namespace {
@@ -2963,12 +3678,6 @@ public:
     auto foundStoreOr = collectSingleStoreSlice(ifOp, intermediates);
     if (failed(foundStoreOr))
       return failure();
-    affine::AffineStoreOp foundStore = *foundStoreOr;
-
-    auto thenYield =
-        cast<affine::AffineYieldOp>(ifOp.getThenBlock()->getTerminator());
-    auto elseYield =
-        cast<affine::AffineYieldOp>(ifOp.getElseBlock()->getTerminator());
 
     rewriter.setInsertionPoint(ifOp);
     auto newIf = affine::AffineIfOp::create(
@@ -3039,13 +3748,15 @@ transform::ReuseAtOp::apply(transform::TransformRewriter &rewriter,
                             transform::TransformState &state) {
   // Stage 0: resolve payload handles and validate basic structural
   // preconditions.
+  ReuseAtTransformStateExtension &reuseExtension =
+      getOrCreateReuseAtExtension(state);
   auto targets = llvm::to_vector(state.getPayloadValues(getTarget()));
   if (targets.size() != 1) {
     return emitSilenceableError()
            << "expected target handle to resolve to exactly one payload value";
   }
   Value target = targets.front();
-  MemRefType targetType = dyn_cast<MemRefType>(target.getType());
+  auto targetType = dyn_cast<MemRefType>(target.getType());
   if (!targetType)
     return emitSilenceableError()
            << "expected target to resolve to a memref value";
@@ -3060,12 +3771,12 @@ transform::ReuseAtOp::apply(transform::TransformRewriter &rewriter,
     return emitSilenceableError()
            << "expected axis to resolve to exactly one affine.for loop";
 
-  // require normalized loops
-  if (axisLoop.getStepAsInt() != 1 || !axisLoop.hasConstantBounds() ||
-      axisLoop.getConstantLowerBound() != 0)
+  auto axisInfoOr = analyzeLoopNormalization(axisLoop);
+  if (failed(axisInfoOr))
     return emitSilenceableError()
-           << "reuse_at requires the selected axis loop to have lower bound 0, "
-              "step 1, and constant bounds";
+           << "reuse_at requires the selected axis loop to have constant "
+              "bounds and a positive constant step";
+  LoopNormalizationInfo axisInfo = *axisInfoOr;
 
   // require the target buffer to be defined outside the axis loop
   Operation *targetDef = target.getDefiningOp();
@@ -3081,10 +3792,12 @@ transform::ReuseAtOp::apply(transform::TransformRewriter &rewriter,
   affine::AffineForOp rootLoop = getRootLoop(axisLoop);
   LoopRoleInfo roles;
   SmallVector<affine::AffineForOp, 8> allLoops;
-  if (failed(classifyLoopRoles(rootLoop, target, roles, allLoops))) {
+  DenseMap<Value, LoopNormalizationInfo> loopInfos;
+  if (failed(classifyLoopRoles(rootLoop, target, roles, loopInfos, allLoops))) {
     return emitSilenceableError()
-           << "failed to classify loop roles; loops must be normalized and "
-              "target must be loaded in the axis stage";
+           << "failed to classify loop roles; loops must have constant bounds "
+              "with positive constant step and target must be loaded in the "
+              "axis stage";
   }
   // The chosen axis must be spatial (store-indexing), not reduction-only.
   if (isReductionLoop(axisLoop, roles))
@@ -3094,19 +3807,17 @@ transform::ReuseAtOp::apply(transform::TransformRewriter &rewriter,
     return emitSilenceableError()
            << "selected axis loop is not classified as a spatial loop";
 
-  SmallVector<ComposedBufferAccess, 8> accesses;
-  SmallVector<affine::AffineForOp, 8> innerLoops;
-  if (failed(collectReuseAccesses(axisLoop, target, accesses, innerLoops)))
+  auto analysisOr = analyzeReuseAccessFamily(
+      axisLoop, rootLoop, target, rank, axisInfo, loopInfos, reuseExtension,
+      rewriter.getContext(), getUseRingBuffer());
+  if (failed(analysisOr))
     return emitSilenceableError()
-           << "failed to collect reuse candidate accesses";
-
-  FailureOr<ReuseStatePlan> planOr = analyzeReuseStatePlan(
-      accesses, innerLoops, axisLoop, rank, rewriter.getContext());
-  if (failed(planOr))
-    return emitSilenceableError() << "failed to analyze reuse state plan";
-  ReuseExecutionPlan executionPlan(std::move(*planOr), getUseRingBuffer());
-  ReuseResetBoundaryPlan resetBoundaryPlan =
-      analyzeReuseResetBoundary(axisLoop, rootLoop, executionPlan);
+           << "failed to analyze reuse candidate accesses";
+  ReuseAccessFamilyAnalysis analysis = std::move(*analysisOr);
+  SmallVector<ReuseLogicalAccess, 8> &accesses = analysis.accesses;
+  const ReuseExecutionPlan &executionPlan = analysis.executionPlan;
+  const ReuseResetBoundaryPlan &resetBoundaryPlan = analysis.resetBoundaryPlan;
+  Value rootSourceBuffer = analysis.rootSourceBuffer;
   const ReuseStatePlan &plan = executionPlan.statePlan;
 
   // Stage 2: materialize the reuse buffer and prepare any loop-carried state.
@@ -3130,84 +3841,38 @@ transform::ReuseAtOp::apply(transform::TransformRewriter &rewriter,
         });
     if (failed(newLoopOr))
       return emitDefiniteFailure();
+    Value oldAxisIV = axisIV;
     axisLoop = cast<affine::AffineForOp>(*newLoopOr);
     axisIV = axisLoop.getInductionVar();
-    for (ComposedBufferAccess &access : accesses)
-      access = composeBufferAccess(access.op);
+    // Direct accesses can be recomposed from their payload ops. Synthetic
+    // chained accesses instead need an explicit IV remap through extension.
+    for (ReuseLogicalAccess &access : accesses) {
+      if (access.stageAccess.op) {
+        access.stageAccess = composeBufferAccess(access.stageAccess.op);
+        access.semanticAccess = access.stageAccess;
+        continue;
+      }
+      replaceComposedAccessOperand(access.stageAccess, oldAxisIV, axisIV);
+      replaceComposedAccessOperand(access.semanticAccess, oldAxisIV, axisIV);
+    }
   }
-
-  SmallVector<Value, 4> stateOperands =
-      getReuseStateOperands(axisIV, plan.prefixOperands);
 
   // Stage 3: emit per-iteration state maintenance for ring or shift mode.
   rewriter.setInsertionPointToStart(axisLoop.getBody());
+  Value logicalAxisIV = materializeNormalizedLoopIndex(
+      rewriter, axisLoop.getLoc(), axisInfo, axisIV);
+  SmallVector<Value, 4> stateOperands =
+      getReuseStateOperands(logicalAxisIV, plan.prefixOperands);
   Value currentIterationRingHead;
-  auto steadyStateSet = IntegerSet::get(
-      /*dimCount=*/1, /*symbolCount=*/0,
-      ArrayRef<AffineExpr>{rewriter.getAffineDimExpr(0) -
-                           executionPlan.steadyStateStart},
-      ArrayRef<bool>{false});
-  if (executionPlan.strategy == ReuseBufferStrategy::Ring) {
-    Value previousIterationRingHead = axisLoop.getRegionIterArgs().back();
-    Value zero = arith::ConstantIndexOp::create(rewriter, axisLoop.getLoc(), 0);
-    Value steadyStateStart = arith::ConstantIndexOp::create(
-        rewriter, axisLoop.getLoc(), executionPlan.steadyStateStart);
-    Value isSteady = arith::CmpIOp::create(rewriter, axisLoop.getLoc(),
-                                           arith::CmpIPredicate::sge, axisIV,
-                                           steadyStateStart);
-    int64_t slidingExtent = plan.dims[plan.slidingDim].extent;
-    Value increment = arith::ConstantIndexOp::create(
-        rewriter, axisLoop.getLoc(), executionPlan.ringIncrement);
-    Value nextHead = buildModuloOffsetValue(rewriter, axisLoop.getLoc(),
-                                            previousIterationRingHead,
-                                            increment, slidingExtent);
-    auto updateIf = affine::AffineIfOp::create(rewriter, axisLoop.getLoc(),
-                                               steadyStateSet, axisIV,
-                                               /*withElseRegion=*/false);
-    {
-      OpBuilder::InsertionGuard guard(rewriter);
-      rewriter.setInsertionPoint(
-          updateIf.getThenBlock(),
-          Block::iterator(updateIf.getThenBlock()->getTerminator()));
-      generateReuseStateRefill(rewriter, axisLoop.getLoc(), target, reuseBuffer,
-                               executionPlan, stateOperands, nextHead);
-    }
-    currentIterationRingHead = arith::SelectOp::create(
-        rewriter, axisLoop.getLoc(), isSteady, nextHead, zero);
-  } else {
-    auto updateIf = affine::AffineIfOp::create(rewriter, axisLoop.getLoc(),
-                                               steadyStateSet, axisIV,
-                                               /*withElseRegion=*/false);
-    OpBuilder::InsertionGuard guard(rewriter);
-    rewriter.setInsertionPoint(
-        updateIf.getThenBlock(),
-        Block::iterator(updateIf.getThenBlock()->getTerminator()));
-    generateReuseStateShift(rewriter, axisLoop.getLoc(), reuseBuffer,
-                            executionPlan);
-    generateReuseStateRefill(rewriter, axisLoop.getLoc(), target, reuseBuffer,
-                             executionPlan, stateOperands);
-  }
-
-  auto ringPrecomputedIndices = precomputeRingAccessClusterIndices(
-      rewriter, axisLoop.getLoc(), accesses, executionPlan, stateOperands,
-      currentIterationRingHead);
+  currentIterationRingHead = emitReuseStateMaintenance(
+      rewriter, axisLoop, axisLoop.getLoc(), target, reuseBuffer, executionPlan,
+      stateOperands, logicalAxisIV, reuseExtension);
 
   // Stage 4: rewrite each candidate load to the new reuse state.
-  for (const auto &access : accesses) {
-    rewriter.setInsertionPoint(access.op);
-    Location loadLoc = access.op->getLoc();
-    ArrayRef<Value> precomputedLogicalIndices;
-    ArrayRef<Value> precomputedPhysicalIndices;
-    if (auto it = ringPrecomputedIndices.find(access.op);
-        it != ringPrecomputedIndices.end()) {
-      precomputedLogicalIndices = it->second.logicalIndices;
-      precomputedPhysicalIndices = it->second.physicalIndices;
-    }
-    Value rewritten = createConditionalReuseLoad(
-        rewriter, loadLoc, access, target, reuseBuffer, executionPlan,
-        stateOperands, axisIV, currentIterationRingHead,
-        precomputedLogicalIndices, precomputedPhysicalIndices);
-    rewriter.replaceOp(access.op, rewritten);
+  if (failed(rewriteReuseAccesses(rewriter, accesses, target, reuseBuffer,
+                                  executionPlan, stateOperands, logicalAxisIV,
+                                  currentIterationRingHead, reuseExtension))) {
+    return emitSilenceableError() << "failed to rewrite reuse accesses";
   }
 
   if (executionPlan.strategy == ReuseBufferStrategy::Ring) {
@@ -3223,6 +3888,11 @@ transform::ReuseAtOp::apply(transform::TransformRewriter &rewriter,
   if (!hasReuseAtUsers(cast<OpResult>(getResult())))
     runReuseAtPostCleanup(rewriter, axisLoop);
 
+  reuseExtension.registerBufferContext(
+      reuseBuffer,
+      ReuseBufferContext{target, rootSourceBuffer, executionPlan.strategy,
+                         axisInfo, executionPlan.statePlan,
+                         executionPlan.validityPlan});
   results.setValues(cast<OpResult>(getResult()), {reuseBuffer});
   return DiagnosedSilenceableFailure::success();
 }
@@ -3516,7 +4186,7 @@ checkBufferAtFootprintSeparability(const BufferAtFootprint &footprint,
   // We approximate this by checking whether the axis moves some footprint bound
   // far enough that adjacent iterations do not overlap on that dimension.
   Value axisIV = axisLoop.getInductionVar();
-  auto it = llvm::find(footprint.symbols, axisIV);
+  auto *it = llvm::find(footprint.symbols, axisIV);
   if (it == footprint.symbols.end()) {
     InFlightDiagnostic diag = axisLoop.emitError();
     diag << "cannot buffer_at on this axis because the target buffer cannot "
@@ -3677,7 +4347,7 @@ transform::BufferAtOp::apply(transform::TransformRewriter &rewriter,
     return emitSilenceableError()
            << "cannot find contiguous nested loops for buffer_at";
 
-  auto axisIt = llvm::find(band, axisLoop);
+  auto *axisIt = llvm::find(band, axisLoop);
   if (axisIt == band.end())
     return emitSilenceableError()
            << "selected axis is not in a contiguous loop band";

@@ -31,7 +31,6 @@ func.func @reuse_at_basic(%out: memref<8x6xi32>) {
       affine.store %t1, %out[%y, %x] : memref<8x6xi32>
     } {sym_name = "x"}
   } {sym_name = "y"}
-  memref.dealloc %in_buf : memref<8x8xi32>
   func.return
 }
 
@@ -93,7 +92,6 @@ func.func @reuse_at_basic_no_ring(%out: memref<8x6xi32>) {
       affine.store %t1, %out[%y, %x] : memref<8x6xi32>
     } {sym_name = "x"}
   } {sym_name = "y"}
-  memref.dealloc %plain_buf : memref<8x8xi32>
   func.return
 }
 
@@ -106,275 +104,6 @@ module attributes {transform.with_named_sequence} {
     %axis = transform.structured.match attributes {sym_name = "x"} in %root
       : (!transform.op<"builtin.module">) -> !transform.op<"affine.for">
     %reuse = transform.allo.reuse_at %target at %axis
-      : (!transform.any_value, !transform.op<"affine.for">) -> !transform.any_value
-    transform.yield
-  }
-}
-
-// -----
-
-// CHECK-LABEL: func.func @reuse_at_affine_apply_chain
-// CHECK: %[[REUSE:.*]] = memref.alloc() {sym_name = "chain_buf::reuse"} : memref<3xi32>
-// CHECK-NOT: reuse_head
-// CHECK: %{{.*}} = affine.for %{{.*}} = 0 to 6 iter_args(%{{.*}} = %c0) -> (index) {
-// CHECK:   affine.if #set1(
-// CHECK:     %{{.*}} = affine.load %{{.*}}[%{{.*}}, %{{.*}} + 1] : memref<8x10xi32>
-// CHECK:   } else {
-// CHECK:     %{{.*}} = memref.load %[[REUSE]][%{{.*}}] : memref<3xi32>
-func.func @reuse_at_affine_apply_chain(%out: memref<8x6xi32>) {
-  %chain_buf = memref.alloc() {sym_name = "chain_buf"} : memref<8x10xi32>
-  affine.for %y = 0 to 8 {
-    affine.for %x = 0 to 6 {
-      %x_shift = affine.apply affine_map<(d0) -> (d0 + 1)>(%x)
-      %a0 = affine.load %chain_buf[%y, %x_shift] : memref<8x10xi32>
-      %a1 = affine.load %chain_buf[%y, %x_shift + 1] : memref<8x10xi32>
-      %a2 = affine.load %chain_buf[%y, %x_shift + 2] : memref<8x10xi32>
-      %t0 = arith.addi %a0, %a1 : i32
-      %t1 = arith.addi %t0, %a2 : i32
-      affine.store %t1, %out[%y, %x] : memref<8x6xi32>
-    } {sym_name = "x"}
-  } {sym_name = "y"}
-  memref.dealloc %chain_buf : memref<8x10xi32>
-  func.return
-}
-
-module attributes {transform.with_named_sequence} {
-  transform.named_sequence @__transform_main(%root: !transform.op<"builtin.module">) {
-    %alloc = transform.structured.match ops{["memref.alloc"]} in %root
-      : (!transform.op<"builtin.module">) -> !transform.op<"memref.alloc">
-    %target = transform.allo.match_value 0 of %alloc kind 2
-      : !transform.op<"memref.alloc"> -> !transform.any_value
-    %axis = transform.structured.match attributes {sym_name = "x"} in %root
-      : (!transform.op<"builtin.module">) -> !transform.op<"affine.for">
-    %reuse = transform.allo.reuse_at %target at %axis ring
-      : (!transform.any_value, !transform.op<"affine.for">) -> !transform.any_value
-    transform.yield
-  }
-}
-
-// -----
-
-// CHECK-LABEL: func.func @reuse_at_stationary_inner_dims
-// CHECK: %[[REUSE:.*]] = memref.alloc() {sym_name = "line_buf::reuse"} : memref<3x8x2xi32>
-// CHECK-NOT: reuse_head
-// CHECK: %{{.*}} = affine.for %{{.*}} = 0 to 6 iter_args(%{{.*}} = %c0) -> (index) {
-// CHECK:   affine.if #set(
-// CHECK:     %{{.*}} = affine.for %{{.*}} = 0 to 1 iter_args(%{{.*}} = %{{.*}}) -> (index) {
-// CHECK:       memref.store %{{.*}}, %[[REUSE]][%{{.*}}, %{{.*}}, %{{.*}}] : memref<3x8x2xi32>
-// CHECK:   affine.for %{{.*}} = 0 to 8 {
-// CHECK:     affine.for %{{.*}} = 0 to 2 {
-// CHECK:       affine.if #set1(
-// CHECK:       } else {
-// CHECK:         %{{.*}} = memref.load %[[REUSE]][%{{.*}}, %{{.*}}, %{{.*}}] : memref<3x8x2xi32>
-func.func @reuse_at_stationary_inner_dims(%out: memref<6x8x2xi32>) {
-  %line_buf = memref.alloc() {sym_name = "line_buf"} : memref<8x8x2xi32>
-  affine.for %y = 0 to 6 {
-    affine.for %x = 0 to 8 {
-      affine.for %c = 0 to 2 {
-        %a0 = affine.load %line_buf[%y, %x, %c] : memref<8x8x2xi32>
-        %a1 = affine.load %line_buf[%y + 1, %x, %c] : memref<8x8x2xi32>
-        %a2 = affine.load %line_buf[%y + 2, %x, %c] : memref<8x8x2xi32>
-        %t0 = arith.addi %a0, %a1 : i32
-        %t1 = arith.addi %t0, %a2 : i32
-        affine.store %t1, %out[%y, %x, %c] : memref<6x8x2xi32>
-      } {sym_name = "c"}
-    } {sym_name = "x"}
-  } {sym_name = "y"}
-  memref.dealloc %line_buf : memref<8x8x2xi32>
-  func.return
-}
-
-module attributes {transform.with_named_sequence} {
-  transform.named_sequence @__transform_main(%root: !transform.op<"builtin.module">) {
-    %alloc = transform.structured.match ops{["memref.alloc"]} attributes {sym_name = "line_buf"} in %root
-      : (!transform.op<"builtin.module">) -> !transform.op<"memref.alloc">
-    %target = transform.allo.match_value 0 of %alloc kind 2
-      : !transform.op<"memref.alloc"> -> !transform.any_value
-    %axis = transform.structured.match attributes {sym_name = "y"} in %root
-      : (!transform.op<"builtin.module">) -> !transform.op<"affine.for">
-    %reuse = transform.allo.reuse_at %target at %axis ring
-      : (!transform.any_value, !transform.op<"affine.for">) -> !transform.any_value
-    transform.yield
-  }
-}
-
-// -----
-
-// CHECK-LABEL: func.func @reuse_at_reduction_window
-// CHECK: %[[REUSE:.*]] = memref.alloc() {sym_name = "reduce_buf::reuse"} : memref<3xi32>
-// CHECK-NOT: reuse_head
-// CHECK: %{{.*}} = affine.for %{{.*}} = 0 to 6 iter_args(%{{.*}} = %c0) -> (index) {
-// CHECK:   affine.if #set(
-// CHECK:     %{{.*}} = affine.for %{{.*}} = 0 to 1 iter_args(%{{.*}} = %{{.*}}) -> (index) {
-// CHECK:       memref.store %{{.*}}, %[[REUSE]][%{{.*}}] : memref<3xi32>
-// CHECK: affine.for %{{.*}} = 0 to 3 {
-// CHECK:   affine.if #set1(
-// CHECK:     %{{.*}} = affine.load %{{.*}}[%{{.*}}, %{{.*}} + %{{.*}}] : memref<8x8xi32>
-// CHECK:     affine.store %{{.*}}, %[[REUSE]][%{{.*}}] : memref<3xi32>
-// CHECK:   } else {
-// CHECK:     %{{.*}} = memref.load %[[REUSE]][%{{.*}}] : memref<3xi32>
-func.func @reuse_at_reduction_window(%out: memref<8x6xi32>) {
-  %in_buf = memref.alloc() {sym_name = "reduce_buf"} : memref<8x8xi32>
-  affine.for %y = 0 to 8 {
-    affine.for %x = 0 to 6 {
-      affine.for %r = 0 to 3 {
-        %v = affine.load %in_buf[%y, %x + %r] : memref<8x8xi32>
-        affine.store %v, %out[%y, %x] : memref<8x6xi32>
-      } {sym_name = "r"}
-    } {sym_name = "x"}
-  } {sym_name = "y"}
-  memref.dealloc %in_buf : memref<8x8xi32>
-  func.return
-}
-
-module attributes {transform.with_named_sequence} {
-  transform.named_sequence @__transform_main(%root: !transform.op<"builtin.module">) {
-    %alloc = transform.structured.match ops{["memref.alloc"]} in %root
-      : (!transform.op<"builtin.module">) -> !transform.op<"memref.alloc">
-    %target = transform.allo.match_value 0 of %alloc kind 2
-      : !transform.op<"memref.alloc"> -> !transform.any_value
-    %axis = transform.structured.match attributes {sym_name = "x"} in %root
-      : (!transform.op<"builtin.module">) -> !transform.op<"affine.for">
-    %reuse = transform.allo.reuse_at %target at %axis ring
-      : (!transform.any_value, !transform.op<"affine.for">) -> !transform.any_value
-    transform.yield
-  }
-}
-
-// -----
-
-// CHECK-LABEL: func.func @reuse_at_stride2_reduction_window
-// CHECK: %[[REUSE:.*]] = memref.alloc() {sym_name = "stride2_buf::reuse"} : memref<3xi32>
-// CHECK-NOT: reuse_head
-// CHECK: %{{.*}} = affine.for %{{.*}} = 0 to 4 iter_args(%{{.*}} = %c0) -> (index) {
-// CHECK:   %{{.*}} = arith.addi %{{.*}}, %c2 : index
-// CHECK:   affine.if #set(
-// CHECK:     %{{.*}} = arith.addi %{{.*}}, %c1 : index
-// CHECK:     %[[FIRST_SLOT:.*]] = arith.remui %{{.*}}, %c3 : index
-// CHECK:     affine.for %{{.*}} = 0 to 2 iter_args(%[[SLOT:.*]] = %[[FIRST_SLOT]]) -> (index) {
-// CHECK-NOT:   arith.remui
-// CHECK:       %{{.*}} = arith.cmpi eq, %[[SLOT]], %c2 : index
-// CHECK:       %{{.*}} = arith.addi %[[SLOT]], %c1 : index
-// CHECK:       %{{.*}} = arith.select %{{.*}}, %c0, %{{.*}} : index
-// CHECK:       memref.store %{{.*}}, %[[REUSE]][%[[SLOT]]] : memref<3xi32>
-// CHECK: affine.for %{{.*}} = 0 to 3 {
-// CHECK:   affine.if #set1(
-// CHECK:     %{{.*}} = affine.load %{{.*}}[%{{.*}}, %{{.*}} * 2 + %{{.*}}] : memref<8x10xi32>
-// CHECK:   } else {
-// CHECK:     %{{.*}} = memref.load %[[REUSE]][%{{.*}}] : memref<3xi32>
-func.func @reuse_at_stride2_reduction_window(%out: memref<8x4xi32>) {
-  %stride2_buf = memref.alloc() {sym_name = "stride2_buf"} : memref<8x10xi32>
-  affine.for %y = 0 to 8 {
-    affine.for %x = 0 to 4 {
-      affine.for %r = 0 to 3 {
-        %v = affine.load %stride2_buf[%y, %x * 2 + %r] : memref<8x10xi32>
-        affine.store %v, %out[%y, %x] : memref<8x4xi32>
-      } {sym_name = "r"}
-    } {sym_name = "x"}
-  } {sym_name = "y"}
-  memref.dealloc %stride2_buf : memref<8x10xi32>
-  func.return
-}
-
-module attributes {transform.with_named_sequence} {
-  transform.named_sequence @__transform_main(%root: !transform.op<"builtin.module">) {
-    %alloc = transform.structured.match ops{["memref.alloc"]} attributes {sym_name = "stride2_buf"} in %root
-      : (!transform.op<"builtin.module">) -> !transform.op<"memref.alloc">
-    %target = transform.allo.match_value 0 of %alloc kind 2
-      : !transform.op<"memref.alloc"> -> !transform.any_value
-    %axis = transform.structured.match attributes {sym_name = "x"} in %root
-      : (!transform.op<"builtin.module">) -> !transform.op<"affine.for">
-    %reuse = transform.allo.reuse_at %target at %axis ring
-      : (!transform.any_value, !transform.op<"affine.for">) -> !transform.any_value
-    transform.yield
-  }
-}
-
-// -----
-
-// CHECK-LABEL: func.func @reuse_at_2d_window_axis_x
-// CHECK: %[[REUSE:.*]] = memref.alloc() {sym_name = "window_x_buf::reuse"} : memref<3x3xi32>
-// CHECK-NOT: reuse_head
-// CHECK: %{{.*}} = affine.for %{{.*}} = 0 to 6 iter_args(%{{.*}} = %c0) -> (index) {
-// CHECK:   affine.if #set(
-// CHECK:     %{{.*}} = affine.for %{{.*}} = 0 to 1 iter_args(%{{.*}} = %{{.*}}) -> (index) {
-// CHECK:       affine.for %{{.*}} = 0 to 3 {
-// CHECK:         memref.store %{{.*}}, %[[REUSE]][%{{.*}}, %{{.*}}] : memref<3x3xi32>
-// CHECK: affine.for %{{.*}} = 0 to 3 {
-// CHECK:   affine.for %{{.*}} = 0 to 3 {
-// CHECK:     affine.if #set1(
-// CHECK:       affine.store %{{.*}}, %[[REUSE]][%{{.*}}, %{{.*}}] : memref<3x3xi32>
-// CHECK:     } else {
-// CHECK:       %{{.*}} = memref.load %[[REUSE]][%{{.*}}, %{{.*}}] : memref<3x3xi32>
-func.func @reuse_at_2d_window_axis_x(%out: memref<6x6xi32>) {
-  %window_x_buf = memref.alloc() {sym_name = "window_x_buf"} : memref<8x8xi32>
-  affine.for %y = 0 to 6 {
-    affine.for %x = 0 to 6 {
-      affine.for %ry = 0 to 3 {
-        affine.for %rx = 0 to 3 {
-          %v = affine.load %window_x_buf[%y + %ry, %x + %rx] : memref<8x8xi32>
-          affine.store %v, %out[%y, %x] : memref<6x6xi32>
-        } {sym_name = "rx"}
-      } {sym_name = "ry"}
-    } {sym_name = "x"}
-  } {sym_name = "y"}
-  memref.dealloc %window_x_buf : memref<8x8xi32>
-  func.return
-}
-
-module attributes {transform.with_named_sequence} {
-  transform.named_sequence @__transform_main(%root: !transform.op<"builtin.module">) {
-    %alloc = transform.structured.match ops{["memref.alloc"]} attributes {sym_name = "window_x_buf"} in %root
-      : (!transform.op<"builtin.module">) -> !transform.op<"memref.alloc">
-    %target = transform.allo.match_value 0 of %alloc kind 2
-      : !transform.op<"memref.alloc"> -> !transform.any_value
-    %axis = transform.structured.match attributes {sym_name = "x"} in %root
-      : (!transform.op<"builtin.module">) -> !transform.op<"affine.for">
-    %reuse = transform.allo.reuse_at %target at %axis ring
-      : (!transform.any_value, !transform.op<"affine.for">) -> !transform.any_value
-    transform.yield
-  }
-}
-
-// -----
-
-// CHECK-LABEL: func.func @reuse_at_2d_window_axis_y
-// CHECK: %[[REUSE:.*]] = memref.alloc() {sym_name = "window_y_buf::reuse"} : memref<3x8xi32>
-// CHECK-NOT: reuse_head
-// CHECK: %{{.*}} = affine.for %{{.*}} = 0 to 6 iter_args(%{{.*}} = %c0) -> (index) {
-// CHECK:   affine.if #set(
-// CHECK:     %{{.*}} = affine.for %{{.*}} = 0 to 1 iter_args(%{{.*}} = %{{.*}}) -> (index) {
-// CHECK:       affine.for %{{.*}} = 0 to 8 {
-// CHECK:         memref.store %{{.*}}, %[[REUSE]][%{{.*}}, %{{.*}}] : memref<3x8xi32>
-// CHECK: affine.if #set1(
-// CHECK:   affine.store %{{.*}}, %[[REUSE]][%{{.*}}, %{{.*}}] : memref<3x8xi32>
-// CHECK: } else {
-// CHECK:   %{{.*}} = memref.load %[[REUSE]][%{{.*}}, %{{.*}}] : memref<3x8xi32>
-func.func @reuse_at_2d_window_axis_y(%out: memref<6x6xi32>) {
-  %window_y_buf = memref.alloc() {sym_name = "window_y_buf"} : memref<8x8xi32>
-  affine.for %y = 0 to 6 {
-    affine.for %x = 0 to 6 {
-      affine.for %ry = 0 to 3 {
-        affine.for %rx = 0 to 3 {
-          %v = affine.load %window_y_buf[%y + %ry, %x + %rx] : memref<8x8xi32>
-          affine.store %v, %out[%y, %x] : memref<6x6xi32>
-        } {sym_name = "rx"}
-      } {sym_name = "ry"}
-    } {sym_name = "x"}
-  } {sym_name = "y"}
-  memref.dealloc %window_y_buf : memref<8x8xi32>
-  func.return
-}
-
-module attributes {transform.with_named_sequence} {
-  transform.named_sequence @__transform_main(%root: !transform.op<"builtin.module">) {
-    %alloc = transform.structured.match ops{["memref.alloc"]} attributes {sym_name = "window_y_buf"} in %root
-      : (!transform.op<"builtin.module">) -> !transform.op<"memref.alloc">
-    %target = transform.allo.match_value 0 of %alloc kind 2
-      : !transform.op<"memref.alloc"> -> !transform.any_value
-    %axis = transform.structured.match attributes {sym_name = "y"} in %root
-      : (!transform.op<"builtin.module">) -> !transform.op<"affine.for">
-    %reuse = transform.allo.reuse_at %target at %axis ring
       : (!transform.any_value, !transform.op<"affine.for">) -> !transform.any_value
     transform.yield
   }
@@ -414,7 +143,6 @@ func.func @reuse_at_avgpool_nchw_like(%out: memref<2x2x3x5xf32>) {
       } {sym_name = "h"}
     } {sym_name = "c"}
   } {sym_name = "n"}
-  memref.dealloc %avgpool_buf : memref<2x2x8x10xf32>
   func.return
 }
 
@@ -427,50 +155,6 @@ module attributes {transform.with_named_sequence} {
     %axis = transform.structured.match attributes {sym_name = "h"} in %root
       : (!transform.op<"builtin.module">) -> !transform.op<"affine.for">
     %reuse = transform.allo.reuse_at %target at %axis ring
-      : (!transform.any_value, !transform.op<"affine.for">) -> !transform.any_value
-    transform.yield
-  }
-}
-
-// -----
-
-// CHECK-LABEL: func.func @reuse_at_chained_no_ring_yx
-// CHECK: %[[SRC:.*]] = memref.alloc() {sym_name = "chain_no_ring_buf"} : memref<8x8xi32>
-// CHECK: %[[LINE:.*]] = memref.alloc() {sym_name = "chain_no_ring_buf::reuse"} : memref<3x8xi32>
-// CHECK: %[[WINDOW:.*]] = memref.alloc() {sym_name = "chain_no_ring_buf::reuse::reuse"} : memref<3x3xi32>
-// CHECK: %{{.*}} = affine.load %[[LINE]][%{{.*}}, %{{.*}}] : memref<3x8xi32>
-// CHECK: affine.store %{{.*}}, %[[WINDOW]][%{{.*}}, %{{.*}}] : memref<3x3xi32>
-// CHECK: %{{.*}} = affine.load %[[WINDOW]][%{{.*}}, %{{.*}}] : memref<3x3xi32>
-// CHECK-NOT: reuse_head
-func.func @reuse_at_chained_no_ring_yx(%out: memref<6x6xi32>) {
-  %chain_no_ring_buf = memref.alloc() {sym_name = "chain_no_ring_buf"} : memref<8x8xi32>
-  affine.for %y = 0 to 6 {
-    affine.for %x = 0 to 6 {
-      affine.for %ry = 0 to 3 {
-        affine.for %rx = 0 to 3 {
-          %v = affine.load %chain_no_ring_buf[%y + %ry, %x + %rx] : memref<8x8xi32>
-          affine.store %v, %out[%y, %x] : memref<6x6xi32>
-        } {sym_name = "rx"}
-      } {sym_name = "ry"}
-    } {sym_name = "x"}
-  } {sym_name = "y"}
-  memref.dealloc %chain_no_ring_buf : memref<8x8xi32>
-  func.return
-}
-
-module attributes {transform.with_named_sequence} {
-  transform.named_sequence @__transform_main(%root: !transform.op<"builtin.module">) {
-    %alloc = transform.structured.match ops{["memref.alloc"]} attributes {sym_name = "chain_no_ring_buf"} in %root
-      : (!transform.op<"builtin.module">) -> !transform.op<"memref.alloc">
-    %target = transform.allo.match_value 0 of %alloc kind 2
-      : !transform.op<"memref.alloc"> -> !transform.any_value
-    %y = transform.structured.match attributes {sym_name = "y"} in %root
-      : (!transform.op<"builtin.module">) -> !transform.op<"affine.for">
-    %line = transform.allo.reuse_at %target at %y
-      : (!transform.any_value, !transform.op<"affine.for">) -> !transform.any_value
-    %x = transform.structured.match attributes {sym_name = "x"} in %root
-      : (!transform.op<"builtin.module">) -> !transform.op<"affine.for">
-    %window = transform.allo.reuse_at %line at %x
       : (!transform.any_value, !transform.op<"affine.for">) -> !transform.any_value
     transform.yield
   }
@@ -501,7 +185,6 @@ func.func @reuse_at_chained_no_ring_then_ring(%out: memref<6x6xi32>) {
       } {sym_name = "ry"}
     } {sym_name = "x"}
   } {sym_name = "y"}
-  memref.dealloc %chain_tail_ring_buf : memref<8x8xi32>
   func.return
 }
 
@@ -525,38 +208,177 @@ module attributes {transform.with_named_sequence} {
 
 // -----
 
-// CHECK-LABEL: func.func @reuse_at_tiled_inner_reset_boundary
-// CHECK: %[[SRC:.*]] = memref.alloc() {sym_name = "tiled_inner_buf"} : memref<10x10xi32>
-// CHECK: %[[REUSE:.*]] = memref.alloc() {sym_name = "tiled_inner_buf::reuse"} : memref<3x3xi32>
+// CHECK-LABEL: func.func @reuse_at_stencil
+// CHECK: %[[REUSE:.*]] = memref.alloc() : memref<3x16xi32>
+// CHECK-NOT: reuse_head
+// CHECK: affine.for %{{.*}} = 0 to 10 {
+// CHECK:   %{{.*}} = affine.for %{{.*}} = 1 to 15 iter_args(%{{.*}} = %c0) -> (index) {
+// CHECK:     %{{.*}} = affine.apply
+// CHECK:     affine.if #set(
+// CHECK:       %{{.*}} = affine.for %{{.*}} = 0 to 1 iter_args(%{{.*}} = %{{.*}}) -> (index) {
+// CHECK:         affine.for %{{.*}} = 0 to 16 {
+// CHECK:           memref.store %{{.*}}, %[[REUSE]][%{{.*}}, %{{.*}}] : memref<3x16xi32>
+// CHECK:     affine.for %{{.*}} = 1 to 15 {
+// CHECK:       affine.if #set1(
+// CHECK:         affine.store %{{.*}}, %[[REUSE]][0, %{{.*}}] : memref<3x16xi32>
+// CHECK:         affine.store %{{.*}}, %[[REUSE]][2, %{{.*}}] : memref<3x16xi32>
+// CHECK:       } else {
+// CHECK:         %{{.*}} = memref.load %[[REUSE]][%{{.*}}, %{{.*}}] : memref<3x16xi32>
+func.func @reuse_at_stencil(%A: memref<16x16xi32>, %out: memref<16x16xi32>) {
+  %c5 = arith.constant 5 : i32
+  affine.for %t = 0 to 10 {
+    affine.for %x = 1 to 15 {
+      affine.for %y = 1 to 15 {
+        %0 = affine.load %A[%x - 1, %y] : memref<16x16xi32>
+        %1 = affine.load %A[%x + 1, %y] : memref<16x16xi32>
+        %2 = affine.load %A[%x, %y + 1] : memref<16x16xi32>
+        %3 = affine.load %A[%x, %y - 1] : memref<16x16xi32>
+        %4 = affine.load %A[%x, %y] : memref<16x16xi32>
+        %5 = arith.addi %0, %1 : i32
+        %6 = arith.addi %5, %2 : i32
+        %7 = arith.addi %6, %3 : i32
+        %8 = arith.addi %7, %4 : i32
+        %9 = arith.divsi %8, %c5 : i32
+        affine.store %9, %out[%x, %y] : memref<16x16xi32>
+      } {sym_name = "y"}
+    } {sym_name = "x"}
+  } {sym_name = "t"}
+  func.return
+}
+
+module attributes {transform.with_named_sequence} {
+  transform.named_sequence @__transform_main(%root: !transform.op<"builtin.module">) {
+    %f = transform.structured.match ops{["func.func"]} in %root
+      : (!transform.op<"builtin.module">) -> !transform.op<"func.func">
+    %target = transform.allo.match_value 0 of %f kind 0
+      : !transform.op<"func.func"> -> !transform.any_value
+    %axis = transform.structured.match attributes {sym_name = "x"} in %root
+      : (!transform.op<"builtin.module">) -> !transform.op<"affine.for">
+    %reuse = transform.allo.reuse_at %target at %axis ring
+      : (!transform.any_value, !transform.op<"affine.for">) -> !transform.any_value
+    transform.yield
+  }
+}
+
+// -----
+
+// CHECK-LABEL: func.func @reuse_at_lattice_window_direct
+// CHECK: %[[REUSE:.*]] = memref.alloc() {sym_name = "lattice_direct_buf::reuse"} : memref<3xi32>
+// CHECK-NOT: reuse_head
+// CHECK: affine.for %{{.*}} = 0 to 8 {
+// CHECK:   %{{.*}} = affine.for %{{.*}} = 0 to 8 step 2 iter_args(%{{.*}} = %c0) -> (index) {
+// CHECK:     affine.if #set(
+// CHECK:       %[[FIRST_SLOT:.*]] = arith.remui %{{.*}}, %c3 : index
+// CHECK:       affine.for %{{.*}} = 0 to 1 iter_args(%[[SLOT:.*]] = %[[FIRST_SLOT]]) -> (index) {
+// CHECK:         %{{.*}} = affine.load %{{.*}}[%{{.*}}, %{{.*}} * 2 + (%{{.*}} floordiv 2) * 2 + 4] : memref<8x16xi32>
+// CHECK:         memref.store %{{.*}}, %[[REUSE]][%[[SLOT]]] : memref<3xi32>
+// CHECK:     affine.if #set1(
+// CHECK:       %{{.*}} = affine.load %{{.*}}[%{{.*}}, %{{.*}} + %{{.*}} * 2] : memref<8x16xi32>
+// CHECK:     } else {
+// CHECK:       %{{.*}} = memref.load %[[REUSE]][%{{.*}}] : memref<3xi32>
+func.func @reuse_at_lattice_window_direct(%out: memref<8x4xi32>) {
+  %lattice_direct_buf = memref.alloc() {sym_name = "lattice_direct_buf"} : memref<8x16xi32>
+  affine.for %y = 0 to 8 {
+    affine.for %x = 0 to 8 step 2 {
+      affine.for %r = 0 to 3 {
+        %v = affine.load %lattice_direct_buf[%y, %x + %r * 2] : memref<8x16xi32>
+        affine.store %v, %out[%y, %x floordiv 2] : memref<8x4xi32>
+      } {sym_name = "r"}
+    } {sym_name = "x"}
+  } {sym_name = "y"}
+  func.return
+}
+
+module attributes {transform.with_named_sequence} {
+  transform.named_sequence @__transform_main(%root: !transform.op<"builtin.module">) {
+    %alloc = transform.structured.match ops{["memref.alloc"]} attributes {sym_name = "lattice_direct_buf"} in %root
+      : (!transform.op<"builtin.module">) -> !transform.op<"memref.alloc">
+    %target = transform.allo.match_value 0 of %alloc kind 2
+      : !transform.op<"memref.alloc"> -> !transform.any_value
+    %axis = transform.structured.match attributes {sym_name = "x"} in %root
+      : (!transform.op<"builtin.module">) -> !transform.op<"affine.for">
+    %reuse = transform.allo.reuse_at %target at %axis ring
+      : (!transform.any_value, !transform.op<"affine.for">) -> !transform.any_value
+    transform.yield
+  }
+}
+
+// -----
+
+// CHECK-LABEL: func.func @reuse_at_forward_window
+// CHECK: %[[REUSE:.*]] = memref.alloc() : memref<2xi32>
+// CHECK-NOT: reuse_head
+// CHECK: affine.for %{{.*}} = 0 to 16 {
+// CHECK:   affine.for %{{.*}} = 0 to 16 {
+// CHECK:     affine.if #set(
+// CHECK:       affine.for %{{.*}} = 0 to 1 {
+// CHECK:         %{{.*}} = affine.load %[[REUSE]][%{{.*}} + 1] : memref<2xi32>
+// CHECK:     affine.if #set1(
+// CHECK:       %{{.*}} = affine.load %{{.*}}[%{{.*}}, %{{.*}} + 2] : memref<16x20xi32>
+// CHECK:       %{{.*}} = affine.load %{{.*}}[%{{.*}}, %{{.*}} + 3] : memref<16x20xi32>
+// CHECK:     } else {
+// CHECK:       %{{.*}} = affine.load %[[REUSE]][0] : memref<2xi32>
+// CHECK:       %{{.*}} = affine.load %[[REUSE]][1] : memref<2xi32>
+func.func @reuse_at_forward_window(%A: memref<16x20xi32>, %out: memref<16x16xi32>) {
+  affine.for %x = 0 to 16 {
+    affine.for %y = 0 to 16 {
+      %0 = affine.load %A[%x, %y + 2] : memref<16x20xi32>
+      %1 = affine.load %A[%x, %y + 3] : memref<16x20xi32>
+      %2 = arith.addi %0, %1 : i32
+      affine.store %2, %out[%x, %y] : memref<16x16xi32>
+    } {sym_name = "y"}
+  } {sym_name = "x"}
+  func.return
+}
+
+module attributes {transform.with_named_sequence} {
+  transform.named_sequence @__transform_main(%root: !transform.op<"builtin.module">) {
+    %f = transform.structured.match ops{["func.func"]} in %root
+      : (!transform.op<"builtin.module">) -> !transform.op<"func.func">
+    %target = transform.allo.match_value 0 of %f kind 0
+      : !transform.op<"func.func"> -> !transform.any_value
+    %axis = transform.structured.match attributes {sym_name = "y"} in %root
+      : (!transform.op<"builtin.module">) -> !transform.op<"affine.for">
+    %reuse = transform.allo.reuse_at %target at %axis
+      : (!transform.any_value, !transform.op<"affine.for">) -> !transform.any_value
+    transform.yield
+  }
+}
+
+// -----
+
+// CHECK: #set = affine_set<(d0) : (d0 - 1 >= 0, -d0 + 2 >= 0)>
+// CHECK-LABEL: func.func @reuse_at_tiled_inner_tail_boundary
+// CHECK: %[[REUSE:.*]] = memref.alloc() {sym_name = "tiled_tail_buf::reuse"} : memref<3x3xi32>
 // CHECK-NOT: reuse_head
 // CHECK: affine.for %{{.*}} = 0 to 2 {
 // CHECK:   affine.for %{{.*}} = 0 to 8 {
-// CHECK:     %{{.*}} = affine.for %{{.*}} = 0 to 4 iter_args(%{{.*}} = %c0) -> (index) {
+// CHECK:     %{{.*}} = affine.for %{{.*}} = 0 to 4 iter_args(%[[HEAD:.*]] = %c0) -> (index) {
+// CHECK:       %{{.*}} = arith.cmpi sge, %{{.*}}, %c1 : index
+// CHECK:       %{{.*}} = arith.cmpi sle, %{{.*}}, %c2 : index
+// CHECK:       %[[ACTIVE:.*]] = arith.andi %{{.*}}, %{{.*}} : i1
 // CHECK:       affine.if #set(
-// CHECK:         %{{.*}} = affine.for %{{.*}} = 0 to 1 iter_args(%{{.*}} = %{{.*}}) -> (index) {
-// CHECK:           affine.for %{{.*}} = 0 to 3 {
-// CHECK:             memref.store %{{.*}}, %[[REUSE]][%{{.*}}, %{{.*}}] : memref<3x3xi32>
-func.func @reuse_at_tiled_inner_reset_boundary(%out: memref<8x2x4xi32>) {
-  %tiled_inner_buf = memref.alloc() {sym_name = "tiled_inner_buf"} : memref<10x10xi32>
+// CHECK:       %{{.*}} = arith.select %[[ACTIVE]], %{{.*}}, %[[HEAD]] : index
+func.func @reuse_at_tiled_inner_tail_boundary(%out: memref<8x2x4xi32>) {
+  %tiled_tail_buf = memref.alloc() {sym_name = "tiled_tail_buf"} : memref<10x10xi32>
   affine.for %xo = 0 to 2 {
     affine.for %y = 0 to 8 {
       affine.for %xi = 0 to 4 {
         affine.for %r = 0 to 3 {
           affine.for %c = 0 to 3 {
-            %v = affine.load %tiled_inner_buf[%y + %r, %xo * 4 + %xi + %c] : memref<10x10xi32>
+            %v = affine.load %tiled_tail_buf[%y + %r, %xo * 4 + %xi + %c] : memref<10x10xi32>
             affine.store %v, %out[%y, %xo, %xi] : memref<8x2x4xi32>
           } {sym_name = "c"}
         } {sym_name = "r"}
       } {sym_name = "xi"}
     } {sym_name = "y"}
   } {sym_name = "xo"}
-  memref.dealloc %tiled_inner_buf : memref<10x10xi32>
   func.return
 }
 
 module attributes {transform.with_named_sequence} {
   transform.named_sequence @__transform_main(%root: !transform.op<"builtin.module">) {
-    %alloc = transform.structured.match ops{["memref.alloc"]} attributes {sym_name = "tiled_inner_buf"} in %root
+    %alloc = transform.structured.match ops{["memref.alloc"]} attributes {sym_name = "tiled_tail_buf"} in %root
       : (!transform.op<"builtin.module">) -> !transform.op<"memref.alloc">
     %target = transform.allo.match_value 0 of %alloc kind 2
       : !transform.op<"memref.alloc"> -> !transform.any_value
@@ -570,50 +392,122 @@ module attributes {transform.with_named_sequence} {
 
 // -----
 
-// CHECK-LABEL: func.func @reuse_at_chained_no_ring_xyz
-// CHECK: %[[R0:.*]] = memref.alloc() {sym_name = "chain_xyz_buf::reuse"} : memref<3x8x8xi32>
-// CHECK: %[[R1:.*]] = memref.alloc() {sym_name = "chain_xyz_buf::reuse::reuse"} : memref<3x3x8xi32>
-// CHECK: %[[R2:.*]] = memref.alloc() {sym_name = "chain_xyz_buf::reuse::reuse::reuse"} : memref<3x3x3xi32>
-// CHECK: %{{.*}} = affine.load %[[R1]][%{{.*}}, %{{.*}}, %{{.*}}] : memref<3x3x8xi32>
-// CHECK: affine.store %{{.*}}, %[[R2]][%{{.*}}, %{{.*}}, %{{.*}}] : memref<3x3x3xi32>
+// CHECK-LABEL: func.func @reuse_at_chained_stencil_yx
+// CHECK: %[[LINE:.*]] = memref.alloc() : memref<3x8xi32>
+// CHECK: %[[WINDOW:.*]] = memref.alloc() : memref<3x3xi32>
 // CHECK-NOT: reuse_head
-func.func @reuse_at_chained_no_ring_xyz(%out: memref<6x6x6xi32>) {
-  %chain_xyz_buf = memref.alloc() {sym_name = "chain_xyz_buf"} : memref<8x8x8xi32>
-  affine.for %z = 0 to 6 {
-    affine.for %y = 0 to 6 {
-      affine.for %x = 0 to 6 {
-        affine.for %rz = 0 to 3 {
-          affine.for %ry = 0 to 3 {
-            affine.for %rx = 0 to 3 {
-              %v = affine.load %chain_xyz_buf[%z + %rz, %y + %ry, %x + %rx] : memref<8x8x8xi32>
-              affine.store %v, %out[%z, %y, %x] : memref<6x6x6xi32>
-            } {sym_name = "rx"}
-          } {sym_name = "ry"}
-        } {sym_name = "rz"}
-      } {sym_name = "x"}
-    } {sym_name = "y"}
-  } {sym_name = "z"}
-  memref.dealloc %chain_xyz_buf : memref<8x8x8xi32>
+// CHECK: %{{.*}} = affine.load %[[LINE]][%{{.*}}, %{{.*}}] : memref<3x8xi32>
+// CHECK: affine.store %{{.*}}, %[[WINDOW]][%{{.*}}, %{{.*}}] : memref<3x3xi32>
+func.func @reuse_at_chained_stencil_yx(%A: memref<10x10xi32>, %out: memref<6x6xi32>) {
+  affine.for %y = 1 to 7 {
+    affine.for %x = 1 to 7 {
+      affine.for %ry = 0 to 3 {
+        affine.for %rx = 0 to 3 {
+          %v = affine.load %A[%y + %ry - 1, %x + %rx - 1] : memref<10x10xi32>
+          affine.store %v, %out[%y - 1, %x - 1] : memref<6x6xi32>
+        } {sym_name = "rx"}
+      } {sym_name = "ry"}
+    } {sym_name = "x"}
+  } {sym_name = "y"}
   func.return
 }
 
 module attributes {transform.with_named_sequence} {
   transform.named_sequence @__transform_main(%root: !transform.op<"builtin.module">) {
-    %alloc = transform.structured.match ops{["memref.alloc"]} attributes {sym_name = "chain_xyz_buf"} in %root
-      : (!transform.op<"builtin.module">) -> !transform.op<"memref.alloc">
-    %target = transform.allo.match_value 0 of %alloc kind 2
-      : !transform.op<"memref.alloc"> -> !transform.any_value
-    %z = transform.structured.match attributes {sym_name = "z"} in %root
-      : (!transform.op<"builtin.module">) -> !transform.op<"affine.for">
-    %reuse_z = transform.allo.reuse_at %target at %z
-      : (!transform.any_value, !transform.op<"affine.for">) -> !transform.any_value
+    %f = transform.structured.match ops{["func.func"]} in %root
+      : (!transform.op<"builtin.module">) -> !transform.op<"func.func">
+    %target = transform.allo.match_value 0 of %f kind 0
+      : !transform.op<"func.func"> -> !transform.any_value
     %y = transform.structured.match attributes {sym_name = "y"} in %root
       : (!transform.op<"builtin.module">) -> !transform.op<"affine.for">
-    %reuse_y = transform.allo.reuse_at %reuse_z at %y
+    %line = transform.allo.reuse_at %target at %y
       : (!transform.any_value, !transform.op<"affine.for">) -> !transform.any_value
     %x = transform.structured.match attributes {sym_name = "x"} in %root
       : (!transform.op<"builtin.module">) -> !transform.op<"affine.for">
-    %reuse_x = transform.allo.reuse_at %reuse_y at %x
+    %window = transform.allo.reuse_at %line at %x
+      : (!transform.any_value, !transform.op<"affine.for">) -> !transform.any_value
+    transform.yield
+  }
+}
+
+// -----
+
+#fake_set = affine_set<(d0) : (-d0 >= 0)>
+
+func.func @reuse_at_extension_only_wrapper_rejected(%A: memref<8x8xi32>, %out: memref<6x6xi32>) {
+  %line = memref.alloc() {sym_name = "fake_chain_line"} : memref<3x8xi32>
+  affine.for %y = 0 to 6 {
+    affine.for %x = 0 to 6 {
+      affine.for %ry = 0 to 3 {
+        affine.for %rx = 0 to 3 {
+          %v = affine.if #fake_set(%y) -> i32 {
+            %s = affine.load %A[%y + %ry, %x + %rx] : memref<8x8xi32>
+            affine.store %s, %line[%ry, %x + %rx] : memref<3x8xi32>
+            affine.yield %s : i32
+          } else {
+            %idx = affine.apply affine_map<(d0, d1) -> (d0 + d1)>(%x, %rx)
+            %s = memref.load %line[%ry, %idx] : memref<3x8xi32>
+            affine.yield %s : i32
+          }
+          affine.store %v, %out[%y, %x] : memref<6x6xi32>
+        } {sym_name = "rx"}
+      } {sym_name = "ry"}
+    } {sym_name = "x"}
+  } {sym_name = "y"}
+  func.return
+}
+
+module attributes {transform.with_named_sequence} {
+  transform.named_sequence @__transform_main(%root: !transform.op<"builtin.module">) {
+    %alloc = transform.structured.match ops{["memref.alloc"]} attributes {sym_name = "fake_chain_line"} in %root
+      : (!transform.op<"builtin.module">) -> !transform.op<"memref.alloc">
+    %target = transform.allo.match_value 0 of %alloc kind 2
+      : !transform.op<"memref.alloc"> -> !transform.any_value
+    %axis = transform.structured.match attributes {sym_name = "x"} in %root
+      : (!transform.op<"builtin.module">) -> !transform.op<"affine.for">
+    // expected-error @below {{classify loop roles}}
+    %reuse = transform.allo.reuse_at %target at %axis
+      : (!transform.any_value, !transform.op<"affine.for">) -> !transform.any_value
+    transform.yield
+  }
+}
+
+// -----
+
+// CHECK-LABEL: func.func @reuse_at_chained_prefix_step2
+// CHECK: %[[LINE:.*]] = memref.alloc() : memref<3x3xi32>
+// CHECK: %[[WINDOW:.*]] = memref.alloc() : memref<7x3xi32>
+// CHECK-NOT: reuse_head
+// CHECK: %{{.*}} = affine.load %[[LINE]][%{{.*}}, %{{.*}} * 2 + %{{.*}} + 1] : memref<3x3xi32>
+// CHECK: affine.store %{{.*}}, %[[WINDOW]][%{{.*}}, %{{.*}} + 1] : memref<7x3xi32>
+// CHECK: %{{.*}} = affine.load %[[WINDOW]][%{{.*}}, %{{.*}}] : memref<7x3xi32>
+func.func @reuse_at_chained_prefix_step2(%A: memref<8x20xi32>, %out: memref<5x6xi32>) {
+  affine.for %x = 0 to 6 {
+    affine.for %y = 0 to 5 {
+      affine.for %ry = 0 to 3 {
+        affine.for %rx = 0 to 3 {
+          %v = affine.load %A[%y + %ry, %x * 2 + %rx] : memref<8x20xi32>
+          affine.store %v, %out[%y, %x] : memref<5x6xi32>
+        } {sym_name = "rx"}
+      } {sym_name = "ry"}
+    } {sym_name = "y"}
+  } {sym_name = "x"}
+  func.return
+}
+
+module attributes {transform.with_named_sequence} {
+  transform.named_sequence @__transform_main(%root: !transform.op<"builtin.module">) {
+    %f = transform.structured.match ops{["func.func"]} in %root
+      : (!transform.op<"builtin.module">) -> !transform.op<"func.func">
+    %target = transform.allo.match_value 0 of %f kind 0
+      : !transform.op<"func.func"> -> !transform.any_value
+    %y = transform.structured.match attributes {sym_name = "y"} in %root
+      : (!transform.op<"builtin.module">) -> !transform.op<"affine.for">
+    %line = transform.allo.reuse_at %target at %y
+      : (!transform.any_value, !transform.op<"affine.for">) -> !transform.any_value
+    %x = transform.structured.match attributes {sym_name = "x"} in %root
+      : (!transform.op<"builtin.module">) -> !transform.op<"affine.for">
+    %window = transform.allo.reuse_at %line at %x
       : (!transform.any_value, !transform.op<"affine.for">) -> !transform.any_value
     transform.yield
   }
@@ -633,7 +527,6 @@ func.func @reuse_at_chained_ring_middle_rejected(%out: memref<6x6xi32>) {
       } {sym_name = "ry"}
     } {sym_name = "x"}
   } {sym_name = "y"}
-  memref.dealloc %chain_middle_ring_buf : memref<8x8xi32>
   func.return
 }
 
@@ -663,13 +556,12 @@ func.func @reuse_at_noncontiguous_window_rejected(%out: memref<8x6xi32>) {
   affine.for %y = 0 to 8 {
     affine.for %x = 0 to 6 {
       affine.for %r = 0 to 3 {
-        // expected-note @+1 {{contiguous local footprint}}
-        %v = affine.load %in_buf[%y, %x + %r * 2] : memref<8x16xi32> // expected-error {{bounded contiguous affine footprints}}
+        // expected-note @+1 {{dense slot-space lattice}}
+        %v = affine.load %in_buf[%y, %x + %r * 2] : memref<8x16xi32> // expected-error {{bounded strided affine-lattice footprints}}
         affine.store %v, %out[%y, %x] : memref<8x6xi32>
       } {sym_name = "r"}
     } {sym_name = "x"}
   } {sym_name = "y"}
-  memref.dealloc %in_buf : memref<8x16xi32>
   func.return
 }
 
@@ -681,7 +573,40 @@ module attributes {transform.with_named_sequence} {
       : !transform.op<"memref.alloc"> -> !transform.any_value
     %axis = transform.structured.match attributes {sym_name = "x"} in %root
       : (!transform.op<"builtin.module">) -> !transform.op<"affine.for">
-    // expected-error @below {{analyze reuse state plan}}
+    // expected-error @below {{analyze reuse candidate accesses}}
+    %reuse = transform.allo.reuse_at %target at %axis
+      : (!transform.any_value, !transform.op<"affine.for">) -> !transform.any_value
+    transform.yield
+  }
+}
+
+// -----
+
+func.func @reuse_at_incompatible_lattice_stride_rejected(%out: memref<8x2xi32>) {
+  %in_buf = memref.alloc() {sym_name = "bad_lattice_buf"} : memref<8x24xi32>
+  affine.for %y = 0 to 8 {
+    affine.for %x = 0 to 12 step 6 {
+      affine.for %r = 0 to 3 {
+        // expected-note @+1 {{dense slot-space lattice}}
+        %a = affine.load %in_buf[%y, %x + %r * 2] : memref<8x24xi32> // expected-error {{bounded strided affine-lattice footprints}}
+        %b = affine.load %in_buf[%y, %x + %r * 3] : memref<8x24xi32>
+        %c = arith.addi %a, %b : i32
+        affine.store %c, %out[%y, %x floordiv 6] : memref<8x2xi32>
+      } {sym_name = "r"}
+    } {sym_name = "x"}
+  } {sym_name = "y"}
+  func.return
+}
+
+module attributes {transform.with_named_sequence} {
+  transform.named_sequence @__transform_main(%root: !transform.op<"builtin.module">) {
+    %alloc = transform.structured.match ops{["memref.alloc"]} attributes {sym_name = "bad_lattice_buf"} in %root
+      : (!transform.op<"builtin.module">) -> !transform.op<"memref.alloc">
+    %target = transform.allo.match_value 0 of %alloc kind 2
+      : !transform.op<"memref.alloc"> -> !transform.any_value
+    %axis = transform.structured.match attributes {sym_name = "x"} in %root
+      : (!transform.op<"builtin.module">) -> !transform.op<"affine.for">
+    // expected-error @below {{analyze reuse candidate accesses}}
     %reuse = transform.allo.reuse_at %target at %axis
       : (!transform.any_value, !transform.op<"affine.for">) -> !transform.any_value
     transform.yield
@@ -701,7 +626,6 @@ func.func @reuse_at_stride_no_overlap_rejected(%out: memref<8x4xi32>) {
       } {sym_name = "r"}
     } {sym_name = "x"}
   } {sym_name = "y"}
-  memref.dealloc %in_buf : memref<8x16xi32>
   func.return
 }
 
@@ -713,39 +637,7 @@ module attributes {transform.with_named_sequence} {
       : !transform.op<"memref.alloc"> -> !transform.any_value
     %axis = transform.structured.match attributes {sym_name = "x"} in %root
       : (!transform.op<"builtin.module">) -> !transform.op<"affine.for">
-    // expected-error @below {{analyze reuse state plan}}
-    %reuse = transform.allo.reuse_at %target at %axis
-      : (!transform.any_value, !transform.op<"affine.for">) -> !transform.any_value
-    transform.yield
-  }
-}
-
-// -----
-
-func.func @reuse_at_incompatible_sliding_dims(%out: memref<8x6xi32>) {
-  %in_buf = memref.alloc() {sym_name = "incompatible_buf"} : memref<8x8xi32>
-  affine.for %y = 0 to 8 {
-    affine.for %x = 0 to 6 {
-      %a0 = affine.load %in_buf[%y, %x] : memref<8x8xi32>
-      // expected-note @+1 {{previous candidates}}
-      %a1 = affine.load %in_buf[%x, %y] : memref<8x8xi32> // expected-error {{common sliding dimension}}
-      %t0 = arith.addi %a0, %a1 : i32
-      affine.store %t0, %out[%y, %x] : memref<8x6xi32>
-    } {sym_name = "x"}
-  } {sym_name = "y"}
-  memref.dealloc %in_buf : memref<8x8xi32>
-  func.return
-}
-
-module attributes {transform.with_named_sequence} {
-  transform.named_sequence @__transform_main(%root: !transform.op<"builtin.module">) {
-    %alloc = transform.structured.match ops{["memref.alloc"]} attributes {sym_name = "incompatible_buf"} in %root
-      : (!transform.op<"builtin.module">) -> !transform.op<"memref.alloc">
-    %target = transform.allo.match_value 0 of %alloc kind 2
-      : !transform.op<"memref.alloc"> -> !transform.any_value
-    %axis = transform.structured.match attributes {sym_name = "x"} in %root
-      : (!transform.op<"builtin.module">) -> !transform.op<"affine.for">
-    // expected-error @below {{analyze reuse state plan}}
+    // expected-error @below {{analyze reuse candidate accesses}}
     %reuse = transform.allo.reuse_at %target at %axis
       : (!transform.any_value, !transform.op<"affine.for">) -> !transform.any_value
     transform.yield
@@ -767,7 +659,6 @@ func.func @reuse_at_target_write_hazard(%out: memref<8x6xi32>) {
       affine.store %t0, %out[%y, %x] : memref<8x6xi32>
     } {sym_name = "x"}
   } {sym_name = "y"}
-  memref.dealloc %in_buf : memref<8x8xi32>
   func.return
 }
 
@@ -779,7 +670,7 @@ module attributes {transform.with_named_sequence} {
       : !transform.op<"memref.alloc"> -> !transform.any_value
     %axis = transform.structured.match attributes {sym_name = "x"} in %root
       : (!transform.op<"builtin.module">) -> !transform.op<"affine.for">
-    // expected-error @below {{collect reuse candidate accesses}}
+    // expected-error @below {{analyze reuse candidate accesses}}
     %reuse = transform.allo.reuse_at %target at %axis
       : (!transform.any_value, !transform.op<"affine.for">) -> !transform.any_value
     transform.yield
@@ -801,8 +692,6 @@ func.func @reuse_at_ignore_unrelated_store(%out: memref<8x6xi32>) {
       affine.store %c0, %out[%y, %x] : memref<8x6xi32>
     } {sym_name = "x"}
   } {sym_name = "y"}
-  memref.dealloc %scratch : memref<3xi32>
-  memref.dealloc %in_buf : memref<8x8xi32>
   func.return
 }
 
