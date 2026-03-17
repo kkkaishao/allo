@@ -33,5 +33,5 @@ inline void registerAllExtensions(DialectRegistry &registry) {
 
   allo::registerTransformDialectExtension(registry);
 }
-}
+} // namespace mlir::allo
 #endif // ALLO_INIT_ALL_EXTENSIONS_H

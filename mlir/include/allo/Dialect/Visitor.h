@@ -33,8 +33,7 @@ public:
         .template Case<
             // SCF statements.
             scf::ForOp, scf::IfOp, scf::WhileOp, scf::ConditionOp,
-            scf::ParallelOp, scf::ReduceOp,
-            scf::ReduceReturnOp, scf::YieldOp,
+            scf::ParallelOp, scf::ReduceOp, scf::ReduceReturnOp, scf::YieldOp,
             // Affine statements.
             affine::AffineForOp, affine::AffineIfOp, affine::AffineParallelOp,
             affine::AffineApplyOp, affine::AffineMaxOp, affine::AffineMinOp,
@@ -44,9 +43,9 @@ public:
             // Memref-related statements.
             memref::AllocOp, memref::AllocaOp, memref::LoadOp, memref::StoreOp,
             memref::GetGlobalOp, allo::GetGlobalFixedOp, memref::GlobalOp,
-            memref::DeallocOp, memref::DmaStartOp, memref::DmaWaitOp, memref::ReshapeOp,
-            memref::ViewOp, memref::SubViewOp, memref::ReinterpretCastOp,
-            memref::AtomicRMWOp,
+            memref::DeallocOp, memref::DmaStartOp, memref::DmaWaitOp,
+            memref::ReshapeOp, memref::ViewOp, memref::SubViewOp,
+            memref::ReinterpretCastOp, memref::AtomicRMWOp,
             // Tensor-related statements.
             tensor::ExtractOp, tensor::InsertOp, tensor::SplatOp, memref::DimOp,
             memref::RankOp,
@@ -60,10 +59,9 @@ public:
             arith::DivFOp, arith::RemFOp,
             // Integer binary expressions.
             arith::CmpIOp, arith::AddIOp, arith::SubIOp, arith::MulIOp,
-            arith::FloorDivSIOp,
-            arith::DivSIOp, arith::RemSIOp, arith::DivUIOp, arith::RemUIOp,
-            arith::MaxSIOp, arith::MinSIOp, arith::MaxUIOp, arith::MinUIOp,
-            arith::MaximumFOp, arith::MinimumFOp,
+            arith::FloorDivSIOp, arith::DivSIOp, arith::RemSIOp, arith::DivUIOp,
+            arith::RemUIOp, arith::MaxSIOp, arith::MinSIOp, arith::MaxUIOp,
+            arith::MinUIOp, arith::MaximumFOp, arith::MinimumFOp,
             // Logical expressions.
             arith::XOrIOp, arith::AndIOp, arith::OrIOp, arith::ShLIOp,
             arith::ShRSIOp, arith::ShRUIOp, allo::GetIntBitOp,

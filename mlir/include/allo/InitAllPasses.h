@@ -58,8 +58,6 @@ inline void registerAllPasses() {
   bufferization::registerBufferizationPipelines();
   tosa::registerTosaToLinalgPipelines();
 }
-}
-
-
+} // namespace mlir::allo
 
 #endif // ALLO_INIT_ALL_PASSES_H

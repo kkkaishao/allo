@@ -72,14 +72,15 @@ bool findContiguousNestedLoops(const AffineForOp &rootAffineForOp,
 /// Check if the lhsOp and rhsOp are in the same block. If so, return their
 /// ancestors that are located at the same block. Note that in this check,
 /// AffineIfOp is transparent.
-std::optional<std::pair<Operation *, Operation *>> checkSameLevel(Operation *lhsOp,
-                                                             Operation *rhsOp);
+std::optional<std::pair<Operation *, Operation *>>
+checkSameLevel(Operation *lhsOp, Operation *rhsOp);
 
 unsigned getCommonSurroundingLoops(Operation *A, Operation *B,
                                    AffineLoopBand *band);
 
 /// Calculate the upper and lower bound of "bound" if possible.
-std::optional<std::pair<int64_t, int64_t>> getBoundOfAffineBound(AffineBound bound);
+std::optional<std::pair<int64_t, int64_t>>
+getBoundOfAffineBound(AffineBound bound);
 
 /// Return the layout map of "memrefType".
 AffineMap getLayoutMap(MemRefType memrefType);
@@ -200,20 +201,19 @@ Value castToF64(OpBuilder &rewriter, const Value &src, bool hasUnsignedAttr);
 //===----------------------------------------------------------------------===//
 namespace mlir {
 namespace allo {
-bool replace(std::string& str, const std::string& from, const std::string& to);
+bool replace(std::string &str, const std::string &from, const std::string &to);
 bool getEnv(const std::string &key, std::string &value);
 
 } // namespace allo
 } // namespace mlir
 
-
 //===----------------------------------------------------------------------===//
 // SmallVector utils
 //===----------------------------------------------------------------------===//
-namespace mlir{
-namespace allo{
+namespace mlir {
+namespace allo {
 // TODO(Niansong): make this template function
-int getIndex(SmallVector<Operation*, 4> v, Operation* target);
+int getIndex(SmallVector<Operation *, 4> v, Operation *target);
 } // namespace allo
 } // namespace mlir
 

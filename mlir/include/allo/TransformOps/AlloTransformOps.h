@@ -6,8 +6,8 @@
 #ifndef ALLO_TRANSFORMOPS_H
 #define ALLO_TRANSFORMOPS_H
 
-#include "allo/Dialect/AlloDialect.h"
 #include "allo/Dialect/AlloAttrs.h"
+#include "allo/Dialect/AlloDialect.h"
 #include "mlir/Dialect/Transform/IR/TransformDialect.h"
 #include "mlir/Dialect/Transform/IR/TransformTypes.h"
 #include "mlir/Dialect/Transform/Interfaces/TransformInterfaces.h"
@@ -20,9 +20,6 @@ namespace mlir::allo {
 void registerTransformDialectExtension(DialectRegistry &registry);
 
 constexpr StringLiteral OpIdentifier = "sym_name";
-}
+} // namespace mlir::allo
 
 #endif // ALLO_TRANSFORMOPS_H
-
-
-
