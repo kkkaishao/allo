@@ -18,7 +18,7 @@ target_compile_options(nanobind-static
 )
 
 set_target_properties(_liballo PROPERTIES
-    LIBRARY_OUTPUT_DIRECTORY "${PROJECT_SOURCE_DIR}/../allo/bindings"
+    LIBRARY_OUTPUT_DIRECTORY "${PROJECT_SOURCE_DIR}/../allo/experimental/_C"
     CXX_VISIBILITY_PRESET hidden
 )
 

@@ -76,7 +76,7 @@ static void bindBuilder(nb::module_ &m) {
       .def(nb::init<MLIRContext *>(), nb::arg("context"))
       .def(nb::init<Operation *>(), nb::arg("operation"))
       .def(nb::init<Region *>(), nb::arg("region"))
-      .def("get_context", &OpBuilder::getContext)
+      .def_prop_ro("context", &OpBuilder::getContext)
       // insertion point management
       .def(
           "set_insertion_point",
@@ -131,11 +131,17 @@ static void bindBuilder(nb::module_ &m) {
       .def(
           "create_free_block",
           [](OpBuilder &self, Region &region,
-             const std::vector<Type> &argTypes = {}) {
+             const std::vector<Type> &argTypes = {},
+             std::optional<Location> loc = std::nullopt) {
+            if (loc) {
+              llvm::SmallVector<Location, 4> locs(argTypes.size(), loc.value());
+              return self.createBlock(&region, {}, argTypes, locs);
+            }
             return self.createBlock(self.getBlock()->getParent());
           },
           nb::rv_policy::reference, nb::arg("region"),
-          nb::arg("arg_types") = std::vector<Type>())
+          nb::arg("arg_types") = std::vector<Type>(),
+          nb::arg("loc").none() = nb::none())
       .def(
           "create_block_in_region",
           [](OpBuilder &self, Location loc, Region &region,
@@ -410,14 +416,31 @@ static void bindCoreIR(nb::module_ &m) {
       .def(
           "get_terminator", [](Block &self) { return self.getTerminator(); },
           nb::rv_policy::reference)
-      .def("erase", [](Block &self) { self.erase(); });
+      .def("erase", [](Block &self) { self.erase(); })
+      .def("merge_before",
+           [](Block &self, Block &dst) {
+             if (!self.hasNoPredecessors())
+               throw nb::value_error(
+                   "Only blocks with no predecessors can be merged");
+             if (self.getNumArguments() != 0)
+               throw nb::value_error(
+                   "Only blocks with no arguments can be merged");
+             auto insertPt = dst.empty() ? dst.end() : std::prev(dst.end());
+             dst.getOperations().splice(insertPt, self.getOperations());
+             self.erase();
+           })
+      .def("remove_terminator", [](Block &self) {
+        if (!self.empty() && self.back().hasTrait<OpTrait::IsTerminator>())
+          self.getTerminator()->erase();
+      });
 
   // Base Operation class
   nb::class_<Operation>(m, "Operation")
       .def("get_context", &Operation::getContext)
       .def("get_loc", &Operation::getLoc)
       .def("get_name",
-           [](Operation &self) { return self.getName().getStringRef().str(); });
+           [](Operation &self) { return self.getName().getStringRef().str(); })
+      .def("erase", &Operation::erase);
 
   nb::class_<OpState>(m, "OpState")
       .def("__init__",
@@ -494,9 +517,11 @@ static void bindCoreIR(nb::module_ &m) {
              self.print(os, printingFlags);
              return os.str();
            })
-      .def("verify", [](OpState &self) -> bool {
-        return succeeded(verify(self.getOperation()));
-      });
+      .def("verify",
+           [](OpState &self) -> bool {
+             return succeeded(verify(self.getOperation()));
+           })
+      .def("erase", &OpState::erase);
 
   auto moduleOp = bindOp<ModuleOp>(m, "ModuleOp");
   bindConstructor(moduleOp,

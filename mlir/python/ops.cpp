@@ -437,6 +437,8 @@ void bindMathOps(nb::module_ &m) {
   (void)bindUnaryValueOp<math::AbsIOp>(m, "AbsIOp");
   (void)bindBinaryValueOp<math::PowFOp>(m, "PowFOp", "base", "exponent");
   (void)bindUnaryValueOp<math::TanOp>(m, "TanOp");
+  (void)bindBinaryValueOp<math::IPowIOp>(m, "IPowIOp", "base", "exponent");
+  (void)bindBinaryValueOp<math::FPowIOp>(m, "FPowIOp", "base", "exponent");
 }
 
 void bindTensorOps(nb::module_ &m) {
@@ -743,4 +745,12 @@ void bindLinalgOps(nb::module_ &m) {
       nb::arg("values"));
 }
 
-void bindUBOps(nb::module_ &m) { (void)m; }
+void bindUBOps(nb::module_ &m) {
+  auto ub = bindOp<ub::PoisonOp>(m, "PoisonOp");
+  ub.def(
+      "__init__",
+      [](ub::PoisonOp &self, AlloOpBuilder builder, Type &resType) {
+        self = ub::PoisonOp::create(builder, builder.getLocation(), resType);
+      },
+      nb::arg("builder"), nb::arg("res_type"));
+}

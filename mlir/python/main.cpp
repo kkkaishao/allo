@@ -23,6 +23,7 @@ static constexpr SubmoduleDesc kSubmodules[] = {
     {"memref", bindMemRefOps, "memref dialect"},
     {"linalg", bindLinalgOps, "linalg dialect"},
     {"transform", bindTransform, "transform dialect"},
+    {"ub", bindUBOps, "ub dialect"},
 };
 
 static std::once_flag loadIROnce;
@@ -62,7 +63,7 @@ NB_MODULE(_liballo, m) {
   ensureIRLoaded(m);
 
   m.def("_load_submodule", [](std::string_view name) {
-    auto parent = nb::module_::import_("allo.bindings._liballo");
+    auto parent = nb::module_::import_("allo.experimental._C._liballo");
     return loadSubmodule(parent, name);
   });
 }
