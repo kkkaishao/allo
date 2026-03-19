@@ -4,6 +4,7 @@
 import ast
 import contextlib
 import builtins
+
 from dataclasses import dataclass
 
 from types import ModuleType
@@ -31,12 +32,22 @@ from ..core.types import (
 )
 from ..core import types
 from .builder import AlloOpBuilder
-from ..core.kernel import Kernel, ConstevalFunction, CompileOptions
+from ..core.kernel import (
+    Kernel,
+    ConstevalFunction,
+    CompileOptions,
+    _infer_value_type,
+    kernel as kernel_decorator,
+)
 from collections.abc import Sequence
 from .. import dsl
 from typing import Type, cast
 from ..core.library import Operator, BoundOperator, NO_FOLD
-from .errors import CompilationError, CompileTimeAssertionFailure
+from .errors import (
+    CompilationError,
+    CompileTimeAssertionFailure,
+    raise_compilation_warning,
+)
 
 
 def serialize_function_signature(
@@ -91,6 +102,14 @@ class ReturnPlacementChecker(ast.NodeVisitor):
         self.if_depth -= 1
 
 
+@dataclass(frozen=True)
+class NestedKernelSymbol:
+    name: str
+    node: ast.FunctionDef
+    owner_func_name: str
+    mapping_expr: ast.AST | None = None
+
+
 class CodeGenerator(ast.NodeVisitor):
     def __init__(
         self,
@@ -105,6 +124,11 @@ class CodeGenerator(ast.NodeVisitor):
         arg_types: Sequence[BaseType],
         res_types: Sequence[BaseType],
         options: CompileOptions = CompileOptions(),
+        callee_context: dict[str, Proxy | Constexpr] | None = None,
+        fscope: dict[str, NestedKernelSymbol | Kernel] | None = None,
+        closure_scope: dict[str, object] | None = None,
+        forbidden_closure_scope: dict[str, object] | None = None,
+        active_nested_calls: list[str] | None = None,
     ):
         # setup basic fields and context
         self.context = context
@@ -120,12 +144,29 @@ class CodeGenerator(ast.NodeVisitor):
         self._actual_res_types_recorded = False
         self.seen_return_stmt = False
         self.allow_implicit_type_infer = options.allow_implicit_type_infer
+        self._kernel_call_counter = 0
+        self._kernel_base_names = set()
+        self._entry_function_visited = False
 
         # trackers
         self.local_defs = {}  # track local variable definitions
+        # track what can be seen in the current scope
         self.lscope: dict[str, Proxy | Constexpr] = (
-            {}
-        )  # track what can be seen in the current scope
+            {} if callee_context is None else callee_context.copy()
+        )
+        # track callable symbols (nested kernels)
+        self.fscope: dict[str, NestedKernelSymbol | Kernel] = (
+            {} if fscope is None else fscope.copy()
+        )
+        # lexical closure values captured from outer kernels at call time
+        self.closure_scope = {} if closure_scope is None else closure_scope.copy()
+        self.forbidden_closure_scope = (
+            {} if forbidden_closure_scope is None else forbidden_closure_scope.copy()
+        )
+        self._active_nested_calls = (
+            [] if active_nested_calls is None else active_nested_calls
+        )
+
         self.gscope = {}
         self.module_map = options.module_map
         for k, v in gscope.items():
@@ -157,7 +198,25 @@ class CodeGenerator(ast.NodeVisitor):
 
     def _define_name_lookup(self):
         def local_lookup(name: str, absent):
-            return self.lscope.get(name, absent)
+            val = self.lscope.get(name, absent)
+            if val is not absent:
+                return val
+            return self.fscope.get(name, absent)
+
+        def closure_lookup(name: str, absent):
+            val = self.closure_scope.get(name, absent)
+            if val is not absent:
+                return val
+            if name in self.forbidden_closure_scope:
+                captured = self.forbidden_closure_scope[name]
+                if isinstance(captured, Proxy):
+                    captured_ty = str(captured.type)
+                else:
+                    captured_ty = type(captured).__name__
+                self.compile_error(
+                    f"Invalid closure capture '{name}' in kernel '{self.func_name}'. Only BaseType, constexpr, and kernel symbols can be captured from outer scope, but got '{captured_ty}'."
+                )
+            return absent
 
         def global_lookup(name: str, absent):
             val = self.gscope.get(name, absent)
@@ -170,7 +229,12 @@ class CodeGenerator(ast.NodeVisitor):
         absent_marker = object()
 
         def name_lookup(name: str):
-            for lookup in (local_lookup, self.builtin_namespace.get, global_lookup):
+            for lookup in (
+                local_lookup,
+                self.builtin_namespace.get,
+                closure_lookup,
+                global_lookup,
+            ):
                 val = lookup(name, absent_marker)
                 if val is not absent_marker:
                     return val
@@ -196,6 +260,7 @@ class CodeGenerator(ast.NodeVisitor):
         allowed = (
             isinstance(val, ModuleType)
             or isinstance(val, ConstevalFunction)
+            or isinstance(val, Kernel)
             or getattr(val, "__module__", "").startswith("allo.experimental.core")
             or isinstance(val, (Operator, BoundOperator))
             or isinstance(val, BaseType)
@@ -253,10 +318,17 @@ class CodeGenerator(ast.NodeVisitor):
     def generic_visit(self, node: ast.AST):
         self.compile_error(f"Unsupported syntax: {ast.unparse(node)}")
 
-    def visit_compound_stmts(self, stmts):
+    def visit_compound_stmts(self, stmts, allow_nested_kernel_def: bool = False):
         if not isinstance(stmts, builtins.list):
             stmts = [stmts]
         for stmt in stmts:
+            if isinstance(stmt, ast.FunctionDef):
+                if not allow_nested_kernel_def:
+                    self.compile_error(
+                        "Nested kernel definitions are only supported at the top level of a kernel/accelerator body."
+                    )
+                self.visit(stmt)
+                continue
             # ignore everything after return statement
             self.visit(stmt)
             if isinstance(stmt, ast.Return):
@@ -266,6 +338,13 @@ class CodeGenerator(ast.NodeVisitor):
         ast.NodeVisitor.generic_visit(self, node)
 
     def visit_FunctionDef(self, node: ast.FunctionDef):
+        if not self._entry_function_visited:
+            self._entry_function_visited = True
+            self._visit_entry_function_def(node)
+            return
+        self._register_nested_kernel_def(node)
+
+    def _visit_entry_function_def(self, node: ast.FunctionDef):
         self._precheck_return_placement(node)
         self.seen_return_stmt = False
 
@@ -275,6 +354,9 @@ class CodeGenerator(ast.NodeVisitor):
             arg_node = node.args.args[-i - 1]
             annotation = arg_node.annotation
             name = arg_node.arg
+            if name in self.lscope:
+                # Value provided by callsite binding already wins over default.
+                continue
             st_target = ast.Name(id=name, ctx=ast.Store())
             if annotation is None:
                 self.compile_error(
@@ -294,32 +376,91 @@ class CodeGenerator(ast.NodeVisitor):
             self.arg_types, self.res_types, self.context
         )
         func_op = func.FuncOp(self.builder, self.func_name, fn_ty)
+        if self.curr_fn is None:
+            self.curr_fn = func_op
         entry_block = func_op.add_entry_block()
 
         arg_handles = entry_block.get_args()
-        arg_proxies = [
-            Proxy(handle, ty) for handle, ty in zip(arg_handles, self.arg_types)
-        ]
-        for name, proxy in zip(arg_names, arg_proxies):
+        arg_idx = 0
+        for name, ty in zip(arg_names, self.arg_types):
+            if ty == Constexpr:
+                callee_val = self.lscope.get(name, None)
+                if not isinstance(callee_val, Constexpr):
+                    self.compile_error(
+                        f"Missing constexpr argument binding for parameter '{name}' in function '{self.func_name}'."
+                    )
+                continue
+            if arg_idx >= len(arg_handles):
+                self.compile_error(
+                    f"Internal error: argument count mismatch while lowering function '{self.func_name}'."
+                )
+            proxy = Proxy(arg_handles[arg_idx], ty)
+            arg_idx += 1
             self._maybe_set_loc_to_name(proxy, name)
             self._set_value(name, proxy)
+        if arg_idx != len(arg_handles):
+            self.compile_error(
+                f"Internal error: unbound function arguments remain while lowering function '{self.func_name}'."
+            )
 
         # visit function body
         self.builder.set_insertion_point_to_start(entry_block)
-        self.visit_compound_stmts(node.body)
+        self.visit_compound_stmts(node.body, allow_nested_kernel_def=True)
 
         if not self.seen_return_stmt:
             if len(self.res_types) == 0:
                 self.builder.set_insertion_point_to_end(entry_block)
                 func.ReturnOp(self.builder, [])
             else:
-                raise CompilationError(
-                    node,
-                    "Missing return statement for non-void function. Please add a top-level return statement matching the declared return type.",
-                    self.kernel.src,
+                self.compile_error(
+                    "Missing return statement for non-void function. Please add a top-level return statement matching the declared return type."
                 )
         # restore
         self.builder.set_insertion_point_after(func_op.get_operation())
+
+    def _register_nested_kernel_def(self, node: ast.FunctionDef):
+        if len(node.decorator_list) == 0:
+            self.compile_error(
+                f"Nested function '{node.name}' is not allowed. Nested functions must use bare '@kernel' decorator."
+            )
+        if len(node.decorator_list) != 1:
+            self.compile_error(
+                f"Nested function '{node.name}' must use exactly one '@kernel' decorator."
+            )
+        decorator = node.decorator_list[0]
+        mapping_expr = None
+        if isinstance(decorator, ast.Call):
+            if decorator.args:
+                raise_compilation_warning(
+                    f"Nested kernel '{node.name}' got unexpected positional arguments in decorator and will be ignored.",
+                )
+            for kw in decorator.keywords:
+                if kw.arg == "mapping":
+                    mapping_expr = kw.value
+                else:
+                    raise_compilation_warning(
+                        f"Nested kernel '{node.name}' got unexpected keyword argument '{kw.arg}' in decorator and will be ignored. Compile options are inherited from the parent kernel can cannot be overridden at nested kernel level.",
+                    )
+            decorator = self.visit(decorator.func)
+        if isinstance(decorator, ast.Name) or isinstance(decorator, ast.Attribute):
+            decorator = self.visit(decorator)
+            mapping_expr = None
+
+        if decorator is not kernel_decorator:
+            self.compile_error(
+                f"Nested function '{node.name}' is not allowed. Only allo kernels are supported for nested definitions."
+            )
+
+        if node.name in self.lscope or node.name in self.fscope:
+            self.compile_error(
+                f"Nested kernel name '{node.name}' conflicts with an existing local symbol."
+            )
+        self.fscope[node.name] = NestedKernelSymbol(
+            name=node.name,
+            node=node,
+            owner_func_name=self.func_name,
+            mapping_expr=mapping_expr,
+        )
 
     def _precheck_return_placement(self, node: ast.FunctionDef):
         checker = ReturnPlacementChecker(self.kernel.src)
@@ -1354,6 +1495,8 @@ class CodeGenerator(ast.NodeVisitor):
     def call_function(self, fn, args, kws):
         """Dispatch callable targets across kernel/op/type/consteval frontends."""
 
+        if isinstance(fn, NestedKernelSymbol):
+            return self.call_nested_kernel(fn, args, kws)
         if isinstance(fn, Kernel):
             return self.call_kernel(fn, args, kws)
         if isinstance(fn, Operator):
@@ -1375,12 +1518,375 @@ class CodeGenerator(ast.NodeVisitor):
             f"only allo kernel functions, operations, and consteval functions can be called in allo kernel functions, but got {fn_mod}.{fn_name}"
         )
 
+    def _next_called_kernel_name(self, fn: Kernel | NestedKernelSymbol | str) -> str:
+        if isinstance(fn, Kernel):
+            callee_name = fn.func_name
+        elif isinstance(fn, NestedKernelSymbol):
+            callee_name = fn.name
+        else:
+            callee_name = fn
+        call_id = self._kernel_call_counter
+        self._kernel_call_counter += 1
+        base_name = f"{self.func_name}.{callee_name}"
+        if base_name in self._kernel_base_names:
+            return base_name + f".{call_id}"
+        self._kernel_base_names.add(base_name)
+        return base_name
+
+    def _build_kernel_call_operand(self, value, expected_ty: BaseType, arg_name: str):
+        if isinstance(value, Proxy):
+            if value.type != expected_ty:
+                self.compile_error(
+                    f"Kernel call argument type mismatch for '{arg_name}': expected '{expected_ty}', got '{value.type}'."
+                )
+            return value.handle
+
+        if not isinstance(value, Constexpr):
+            value = Constexpr(value)
+
+        if isinstance(expected_ty, DType):
+            return self.builder.make_scalar(value.value, expected_ty).handle
+        if isinstance(expected_ty, ShapedType):
+            materialized = self._coerce_return_value(value, expected_ty)
+            return materialized.handle
+        self.compile_error(
+            f"Kernel call argument '{arg_name}' has unsupported destination type '{expected_ty}'."
+        )
+
+    def _decode_kernel_call_results(self, call_op, res_types: list[BaseType]):
+        if len(res_types) == 0:
+            return None
+        if call_op.get_num_results() != len(res_types):
+            self.compile_error(
+                f"Kernel call result count mismatch: expected {len(res_types)}, got {call_op.get_num_results()}."
+            )
+        results = [
+            Proxy(handle, ty) for handle, ty in zip(call_op.get_results(), res_types)
+        ]
+        if len(results) == 1:
+            return results[0]
+        return tuple(results)
+
+    def _resolve_annotation_symbol(self, annotation: ast.AST):
+        if isinstance(annotation, ast.Name):
+            return self.lookup(annotation.id)
+        if isinstance(annotation, ast.Attribute):
+            base = self._resolve_annotation_symbol(annotation.value)
+            return getattr(base, annotation.attr)
+        self.compile_error(
+            f"Unsupported annotation expression '{ast.unparse(annotation)}' in nested kernel."
+        )
+
+    def _parse_nested_annotation(self, annotation: ast.AST, arg_name: str) -> BaseType:
+        if isinstance(annotation, ast.Name) and annotation.id in {
+            "constexpr",
+            "Constexpr",
+        }:
+            return Constexpr
+        if isinstance(annotation, (ast.Name, ast.Attribute)):
+            resolved = self._resolve_annotation_symbol(annotation)
+            try:
+                return self.kernel.parse_type_annotation(resolved)
+            except Exception:
+                pass
+        annotation_text = ast.unparse(annotation)
+        if annotation_text in {"constexpr", "Constexpr"}:
+            return Constexpr
+        try:
+            return self.kernel.parse_type_annotation(annotation_text)
+        except Exception as e:
+            self.compile_error(
+                f"Unsupported type annotation '{annotation_text}' for nested kernel parameter '{arg_name}': {e}"
+            )
+
+    def _parse_nested_return_types(self, nested: NestedKernelSymbol) -> list[BaseType]:
+        returns = nested.node.returns
+        if returns is None or (
+            isinstance(returns, ast.Constant) and returns.value is None
+        ):
+            return []
+        if isinstance(returns, ast.Tuple):
+            return [
+                self._parse_nested_annotation(ret, f"return[{i}]")
+                for i, ret in enumerate(returns.elts)
+            ]
+        return [self._parse_nested_annotation(returns, "return")]
+
+    def _bind_nested_arguments(self, nested: NestedKernelSymbol, args, kws):
+        fn_args = nested.node.args
+        if (
+            len(fn_args.posonlyargs) > 0
+            or len(fn_args.kwonlyargs) > 0
+            or fn_args.vararg is not None
+            or fn_args.kwarg is not None
+        ):
+            self.compile_error(
+                f"Nested kernel '{nested.name}' only supports regular positional/keyword arguments (no posonly/kwonly/*args/**kwargs)."
+            )
+        params = fn_args.args
+        param_names = [param.arg for param in params]
+        if len(args) > len(params):
+            self.compile_error(
+                f"Invalid arguments for nested kernel '{nested.name}': expected at most {len(params)} positional arguments, got {len(args)}."
+            )
+
+        bound = {name: value for name, value in zip(param_names, args)}
+        for kw_name, kw_val in kws.items():
+            if kw_name not in param_names:
+                self.compile_error(
+                    f"Invalid arguments for nested kernel '{nested.name}': unexpected keyword argument '{kw_name}'."
+                )
+            if kw_name in bound:
+                self.compile_error(
+                    f"Invalid arguments for nested kernel '{nested.name}': multiple values for argument '{kw_name}'."
+                )
+            bound[kw_name] = kw_val
+
+        defaults = fn_args.defaults
+        first_default_idx = len(params) - len(defaults)
+        for idx, param in enumerate(params):
+            if param.arg in bound:
+                continue
+            if idx < first_default_idx:
+                self.compile_error(
+                    f"Invalid arguments for nested kernel '{nested.name}': missing required argument '{param.arg}'."
+                )
+            default_expr = defaults[idx - first_default_idx]
+            try:
+                self.visiting_default_args = True
+                bound[param.arg] = self.visit(default_expr)
+            finally:
+                self.visiting_default_args = False
+        # Normalize to declared parameter order to keep type checking and
+        # operand lowering deterministic for keyword-heavy call sites.
+        return {param.arg: bound[param.arg] for param in params}
+
+    def _infer_nested_arg_type(self, arg_name: str, arg_val) -> BaseType:
+        if isinstance(arg_val, Proxy):
+            return arg_val.type
+        if isinstance(arg_val, Constexpr):
+            try:
+                return _infer_value_type(
+                    arg_val.value, self.kernel.options.enable_tensor
+                )
+            except TypeError as e:
+                self.compile_error(
+                    f"Failed to infer type for nested kernel argument '{arg_name}' with value '{arg_val.value}': {e}"
+                )
+        self.compile_error(
+            f"Cannot infer type for nested kernel argument '{arg_name}' from value of type '{type(arg_val).__name__}'."
+        )
+
+    def _specialize_nested_kernel(self, nested: NestedKernelSymbol, bound):
+        arg_types = []
+        for param in nested.node.args.args:
+            arg_val = bound[param.arg]
+            if param.annotation is None:
+                arg_types.append(self._infer_nested_arg_type(param.arg, arg_val))
+            else:
+                arg_types.append(
+                    self._parse_nested_annotation(param.annotation, param.arg)
+                )
+        ret_types = self._parse_nested_return_types(nested)
+        return arg_types, ret_types
+
+    def _bind_nested_mapping(self, nested: NestedKernelSymbol):
+        mapping_expr = nested.mapping_expr
+        if mapping_expr is None:
+            return None
+        mapping_value = self.visit(mapping_expr)
+        from_constexpr_sequence = False
+        if isinstance(mapping_value, Constexpr):
+            mapping_value = mapping_value.value
+            from_constexpr_sequence = True
+        elif isinstance(mapping_value, Proxy):
+            self.compile_error(
+                f"Invalid mapping for nested kernel '{nested.name}': expected a constexpr integer sequence, but got runtime value of type '{mapping_value.type}'."
+            )
+
+        if not isinstance(mapping_value, Sequence) or isinstance(
+            mapping_value, (str, bytes)
+        ):
+            self.compile_error(
+                f"Invalid mapping for nested kernel '{nested.name}': expected a sequence of constexpr integers, but got '{type(mapping_value).__name__}'."
+            )
+
+        mapping: list[int] = []
+        for idx, item in enumerate(mapping_value):
+            if isinstance(item, Proxy):
+                self.compile_error(
+                    f"Invalid mapping for nested kernel '{nested.name}' at index {idx}: expected constexpr integer, but got runtime value of type '{item.type}'."
+                )
+            if isinstance(item, Constexpr):
+                item_constexpr = item
+            elif from_constexpr_sequence:
+                item_constexpr = Constexpr(item)
+            else:
+                self.compile_error(
+                    f"Invalid mapping for nested kernel '{nested.name}' at index {idx}: expected constexpr integer, but got '{type(item).__name__}'."
+                )
+            if type(item_constexpr.value) is not int:
+                self.compile_error(
+                    f"Invalid mapping for nested kernel '{nested.name}' at index {idx}: expected constexpr integer, but got value '{item_constexpr.value}' of type '{type(item_constexpr.value).__name__}'."
+                )
+            mapping.append(item_constexpr.value)
+        return tuple(mapping)
+
+    def _build_nested_closure_scopes(self):
+        closure_scope: dict[str, object] = {}
+        closure_fscope: dict[str, NestedKernelSymbol | Kernel] = {}
+        forbidden_scope: dict[str, object] = {}
+
+        for name, value in self.lscope.items():
+            if isinstance(value, (BaseType, Constexpr, Kernel)):
+                closure_scope[name] = value
+            else:
+                forbidden_scope[name] = value
+
+        for name, value in self.fscope.items():
+            if isinstance(value, (NestedKernelSymbol, Kernel)):
+                closure_fscope[name] = value
+            else:
+                forbidden_scope[name] = value
+
+        return closure_scope, closure_fscope, forbidden_scope
+
+    def call_nested_kernel(self, nested: NestedKernelSymbol, args, kws):
+        nested_key = f"{nested.owner_func_name}.{nested.name}"
+        if nested_key in self._active_nested_calls:
+            chain = " -> ".join(self._active_nested_calls + [nested_key])
+            self.compile_error(
+                f"Recursive nested kernel calls are not supported: {chain}"
+            )
+
+        bound = self._bind_nested_arguments(nested, args, kws)
+        _ = self._bind_nested_mapping(nested)
+        sub_arg_types, sub_res_types = self._specialize_nested_kernel(nested, bound)
+
+        if len(sub_arg_types) != len(bound):
+            self.compile_error(
+                f"Nested kernel specialization argument count mismatch for '{nested.name}': expected {len(bound)}, got {len(sub_arg_types)}."
+            )
+
+        callee_context: dict[str, Proxy | Constexpr] = {}
+        call_operands: list[Value] = []
+        for (arg_name, arg_val), expected_ty in zip(bound.items(), sub_arg_types):
+            if expected_ty == Constexpr:
+                if not isinstance(arg_val, Constexpr):
+                    if isinstance(arg_val, Proxy):
+                        self.compile_error(
+                            f"Kernel call argument '{arg_name}' must be constexpr, but got runtime value of type '{arg_val.type}'."
+                        )
+                    arg_val = Constexpr(arg_val)
+                callee_context[arg_name] = arg_val
+                continue
+            call_operands.append(
+                self._build_kernel_call_operand(arg_val, expected_ty, arg_name)
+            )
+
+        closure_scope, closure_fscope, forbidden_scope = (
+            self._build_nested_closure_scopes()
+        )
+
+        ip, last_loc = self.builder.get_insertion_point_and_loc()
+        sub_generator = None
+        self._active_nested_calls.append(nested_key)
+        try:
+            self.builder.set_insertion_point_to_end(self.module.get_body())
+            self.builder.set_loc(
+                Location(
+                    self.file_name,
+                    self.begin_line + nested.node.lineno - 1,
+                    1,
+                    self.context,
+                )
+            )
+            self.builder.src = self.kernel.src
+            sub_generator = CodeGenerator(
+                self.context,
+                self.module,
+                self.builder,
+                kernel=self.kernel,
+                func_name=self._next_called_kernel_name(nested),
+                file_name=self.file_name,
+                begin_line=self.begin_line,
+                gscope=self.gscope,
+                arg_types=sub_arg_types,
+                res_types=sub_res_types,
+                options=self.kernel.options,
+                callee_context=callee_context,
+                fscope=closure_fscope,
+                closure_scope=closure_scope,
+                forbidden_closure_scope=forbidden_scope,
+                active_nested_calls=self._active_nested_calls,
+            )
+            sub_generator.visit(nested.node)
+            if sub_generator.curr_fn is None:
+                self.compile_error(
+                    f"Internal error: failed to materialize nested kernel '{nested.name}'."
+                )
+        except CompilationError as e:
+            raise CompilationError(
+                e.node,
+                f"error when compiling kernel '{nested.name}' called from '{self.func_name}': {e.message}",
+                e.src if e.src is not None else self.kernel.src,
+            ) from e
+        finally:
+            self._active_nested_calls.pop()
+            self.builder.src = self.kernel.src
+            self.builder.set_insertion_point_and_loc(ip, last_loc)
+
+        assert sub_generator is not None and sub_generator.curr_fn is not None
+        call_op = func.CallOp(self.builder, sub_generator.curr_fn, call_operands)
+        return self._decode_kernel_call_results(call_op, sub_res_types)
+
     def call_kernel(self, fn: Kernel, args, kws):
         """Lower/call a kernel specialization and decode structured return values."""
 
-        sub_arg_types = fn.specialize_arg_types(args, kws)
-        sub_res_types = []
+        if fn.is_top:
+            self.compile_error(
+                f"Cannot call accelerator '{fn.func_name}' inside kernel '{self.func_name}'. Accelerators must be top-level entry kernels."
+            )
+
+        try:
+            bound = fn.signature.bind(*args, **kws)
+            bound.apply_defaults()
+        except TypeError as e:
+            self.compile_error(f"Invalid arguments for kernel '{fn.func_name}': {e}.")
+
+        try:
+            sub_arg_types = list(fn.specialize_arg_types(*args, **kws))
+            sub_res_types = list(
+                fn.parse_return_annotation(fn.signature.return_annotation)
+            )
+        except Exception as e:
+            self.compile_error(f"Failed to specialize kernel '{fn.func_name}': {e}")
+
+        if len(sub_arg_types) != len(bound.arguments):
+            self.compile_error(
+                f"Kernel specialization argument count mismatch for '{fn.func_name}': expected {len(bound.arguments)}, got {len(sub_arg_types)}."
+            )
+
+        callee_context: dict[str, Proxy | Constexpr] = {}
+        call_operands: list[Value] = []
+        for (arg_name, arg_val), expected_ty in zip(
+            bound.arguments.items(), sub_arg_types
+        ):
+            if expected_ty == Constexpr:
+                if not isinstance(arg_val, Constexpr):
+                    if isinstance(arg_val, Proxy):
+                        self.compile_error(
+                            f"Kernel call argument '{arg_name}' must be constexpr, but got runtime value of type '{arg_val.type}'."
+                        )
+                    arg_val = Constexpr(arg_val)
+                callee_context[arg_name] = arg_val
+                continue
+            call_operands.append(
+                self._build_kernel_call_operand(arg_val, expected_ty, arg_name)
+            )
+
         ip, last_loc = self.builder.get_insertion_point_and_loc()
+        sub_generator = None
         try:
             self.builder.set_insertion_point_to_end(self.module.get_body())
             self.builder.set_loc(Location(fn.file_name, fn.begin_line, 1, self.context))
@@ -1390,24 +1896,33 @@ class CodeGenerator(ast.NodeVisitor):
                 self.module,
                 self.builder,
                 kernel=fn,
-                func_name=fn.func_name,
+                func_name=self._next_called_kernel_name(fn),
                 file_name=fn.file_name,
                 begin_line=fn.begin_line,
                 gscope=fn.get_capture_scope(),
                 arg_types=sub_arg_types,
                 res_types=sub_res_types,
                 options=fn.options,
+                callee_context=callee_context,
             )
             sub_generator.visit(fn.parse())
+            if sub_generator.curr_fn is None:
+                self.compile_error(
+                    f"Internal error: failed to materialize callee function for kernel '{fn.func_name}'."
+                )
         except CompilationError as e:
             raise CompilationError(
                 e.node,
-                f"error when compiling kernel '{fn.func_name}' called from '{self.kernel.func_name}': {e.message}",
-                self.kernel.src,
+                f"error when compiling kernel '{fn.func_name}' called from '{self.func_name}': {e.message}",
+                e.src if e.src is not None else fn.src,
             ) from e
         finally:
             self.builder.src = self.kernel.src
             self.builder.set_insertion_point_and_loc(ip, last_loc)
+        assert sub_generator is not None and sub_generator.curr_fn is not None
+
+        call_op = func.CallOp(self.builder, sub_generator.curr_fn, call_operands)
+        return self._decode_kernel_call_results(call_op, sub_res_types)
 
     def call_operator(self, fn: Operator | BoundOperator, args, kws):  # noqa: ARG002
         if isinstance(fn, BoundOperator):

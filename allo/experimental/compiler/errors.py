@@ -23,6 +23,11 @@ class VerificationError(AlloError):
     pass
 
 
+def raise_compilation_warning(warning_msg: str):
+    assert warning_msg, "Warning message cannot be empty."
+    print(warning_msg + "\n", file=sys.stderr)
+
+
 class CompilationError(AlloError):
     source_line_count_max_in_message = 12
 
