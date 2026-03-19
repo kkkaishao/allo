@@ -1,3 +1,4 @@
+from ..core.library import operator
 from .ops_arith import (
     add,
     sub,
@@ -58,4 +59,11 @@ __all__ = [
     "min",
     "load",
     "store",
+    "static_assert",
 ]
+
+
+# placeholder for static_assert
+@operator
+def static_assert(condition: bool, msg: str = ""):
+    pass

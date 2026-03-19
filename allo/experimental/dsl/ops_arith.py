@@ -7,7 +7,7 @@ import builtins
 
 from ..compiler.builder import AlloOpBuilder, CmpPred
 from ..core.library import NO_FOLD, operator
-from ..core.types import Constexpr, DType, ShapedType
+from ..core.types import Constexpr, DType, ShapedType, BaseType
 from .ops_common import (
     binary_op_checks,
     cmp_op_create,
@@ -383,6 +383,8 @@ def eq(
 @eq.validate
 def _validate_eq(lhs, rhs, ordered=Constexpr(False)) -> str:
     msg = _validate_cmp_ordered_arg(ordered)
+    if isinstance(lhs, BaseType) and isinstance(rhs, BaseType):
+        return msg if msg else ""
     return msg if msg else binary_op_checks(lhs, rhs, "eq")
 
 
@@ -390,6 +392,8 @@ def _validate_eq(lhs, rhs, ordered=Constexpr(False)) -> str:
 def _fold_eq(lhs, rhs, ordered=Constexpr(False)):  # noqa: ARG001
     if isinstance(lhs, Constexpr) and isinstance(rhs, Constexpr):
         return Constexpr(lhs.value == rhs.value)
+    if isinstance(lhs, BaseType) and isinstance(rhs, BaseType):
+        return Constexpr(lhs == rhs)
     return NO_FOLD
 
 
@@ -408,6 +412,8 @@ def ne(
 @ne.validate
 def _validate_ne(lhs, rhs, ordered=Constexpr(False)) -> str:
     msg = _validate_cmp_ordered_arg(ordered)
+    if isinstance(lhs, BaseType) and isinstance(rhs, BaseType):
+        return msg if msg else ""
     return msg if msg else binary_op_checks(lhs, rhs, "ne")
 
 
@@ -415,6 +421,8 @@ def _validate_ne(lhs, rhs, ordered=Constexpr(False)) -> str:
 def _fold_ne(lhs, rhs, ordered=Constexpr(False)):  # noqa: ARG001
     if isinstance(lhs, Constexpr) and isinstance(rhs, Constexpr):
         return Constexpr(lhs.value != rhs.value)
+    if isinstance(lhs, BaseType) and isinstance(rhs, BaseType):
+        return Constexpr(lhs != rhs)
     return NO_FOLD
 
 

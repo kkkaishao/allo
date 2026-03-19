@@ -236,7 +236,6 @@ void bindTransform(nb::module_ &m) {
             return allo::PartitionAttr::get(&context, partitionAxes);
           },
           nb::arg("context"), nb::arg("sub_partitions"));
-  PyAttributeRegistry::registerAttr<allo::PartitionAttr>();
 
   auto renameOp = bindOp<transform::RenameOp>(m, "RenameOp");
   bindConstructor(

@@ -67,7 +67,7 @@ class AlloOpBuilder(ir.AlloOpBuilder):
         super().__init__(context)
 
     def compile_error(self, message: str):
-        raise CompilationError(self.curr_node, self.src, message)
+        raise CompilationError(self.curr_node, message, self.src)
 
     #####################
     # Constant Creation

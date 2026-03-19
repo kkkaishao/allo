@@ -2,44 +2,12 @@
 
 using namespace mlir;
 
-namespace {
-
-static bool isInstanceOf(nb::handle obj, nb::handle cls) {
-  int ret = PyObject_IsInstance(obj.ptr(), cls.ptr());
-  if (ret < 0)
-    throw nb::python_error();
-  return ret == 1;
-}
-
-static nb::object dynCastOperation(Operation *op, nb::handle cls) {
-  if (op == nullptr)
-    return nb::none();
-  nb::object wrapped = PyOpRegistry::create(op);
-  if (isInstanceOf(wrapped, cls))
-    return wrapped;
-  return nb::none();
-}
-
-static nb::object castOperation(Operation *op, nb::handle cls) {
-  nb::object wrapped = dynCastOperation(op, cls);
-  if (!wrapped.is_none())
-    return wrapped;
-  throw nb::type_error("Operation cannot be cast to the requested wrapper "
-                       "type");
-}
-
-} // namespace
-
 static void bindContext(nb::module_ &m) {
   nb::class_<MLIRContext>(m, "Context")
       .def("__init__",
            [](MLIRContext &self) {
              new (&self) MLIRContext(MLIRContext::Threading::DISABLED);
            })
-      .def("printOpOnDiagnostic", &MLIRContext::printOpOnDiagnostic,
-           nb::arg("enable"))
-      .def("printStackTraceOnDiagnostic",
-           &MLIRContext::printStackTraceOnDiagnostic, nb::arg("enable"))
       .def("load_dialects",
            [](MLIRContext &self) {
              DialectRegistry registry;
@@ -255,8 +223,7 @@ static void bindCoreIR(nb::module_ &m) {
       });
 
   nb::class_<Type>(m, "Type")
-      .def_static("cast",
-                  [](Type &other) { return PyTypeRegistry::create(other); })
+      .def_static("cast", [](Type &other) { return other; })
       .def("__init__",
            [](Type &self) {
              throw nb::type_error(
@@ -312,11 +279,7 @@ static void bindCoreIR(nb::module_ &m) {
       .def(
           "set_loc", [](Value &self, Location loc) { self.setLoc(loc); },
           nb::arg("loc"))
-      .def("get_type",
-           [](Value &self) {
-             auto t = self.getType();
-             return PyTypeRegistry::create(t);
-           })
+      .def("get_type", [](Value &self) { return self.getType(); })
       .def(
           "set_type", [](Value &self, Type ty) { self.setType(ty); },
           nb::arg("type"))
@@ -326,9 +289,7 @@ static void bindCoreIR(nb::module_ &m) {
           nb::arg("val"));
 
   nb::class_<Attribute>(m, "Attribute")
-      .def_static(
-          "cast",
-          [](Attribute &other) { return PyAttributeRegistry::create(other); })
+      .def_static("cast", [](Attribute &other) { return other; })
       .def("__str__",
            [](Attribute &self) {
              std::string str;
@@ -460,7 +421,7 @@ static void bindCoreIR(nb::module_ &m) {
       .def(
           "get_attribute",
           [](OpState &self, std::string_view attrName) {
-            return PyAttributeRegistry::create(self->getAttr(attrName));
+            return self->getAttr(attrName);
           },
           nb::arg("attr_name"))
       .def("get_num_operands",
@@ -484,6 +445,13 @@ static void bindCoreIR(nb::module_ &m) {
             return self->getResult(idx);
           },
           nb::arg("idx"))
+      .def("get_results",
+           [](OpState &self) {
+             std::vector<Value> results;
+             for (auto result : self->getResults())
+               results.push_back(result);
+             return results;
+           })
       .def("get_num_regions",
            [](OpState &self) { return self->getNumRegions(); })
       .def(
@@ -564,13 +532,11 @@ static void bindTypes(nb::module_ &m) {
            })
       .def("get_num_args", &FunctionType::getNumInputs)
       .def("get_num_results", &FunctionType::getNumResults);
-  PyTypeRegistry::registerType<FunctionType>();
 
   nb::class_<NoneType, Type>(m, "NoneType")
       .def_static(
           "get", [](MLIRContext &context) { return NoneType::get(&context); },
           nb::arg("context"));
-  PyTypeRegistry::registerType<NoneType>();
 
   nb::class_<IntegerType, Type>(m, "IntegerType")
       .def_static(
@@ -588,45 +554,38 @@ static void bindTypes(nb::module_ &m) {
             throw nb::type_error("Type is not an IntegerType");
           },
           nb::arg("ty"));
-  PyTypeRegistry::registerType<IntegerType>();
 
   nb::class_<IndexType, Type>(m, "IndexType")
       .def_static(
           "get", [](MLIRContext &context) { return IndexType::get(&context); },
           nb::arg("context"));
-  PyTypeRegistry::registerType<IndexType>();
 
   // Float Types
   (void)nb::class_<FloatType, Type>(m, "FloatType");
-  PyTypeRegistry::registerType<FloatType>();
 
   nb::class_<Float16Type, Type>(m, "F16Type")
       .def_static(
           "get",
           [](MLIRContext &context) { return Float16Type::get(&context); },
           nb::arg("context"));
-  PyTypeRegistry::registerType<Float16Type>();
 
   nb::class_<Float32Type, Type>(m, "F32Type")
       .def_static(
           "get",
           [](MLIRContext &context) { return Float32Type::get(&context); },
           nb::arg("context"));
-  PyTypeRegistry::registerType<Float32Type>();
 
   nb::class_<Float64Type, Type>(m, "F64Type")
       .def_static(
           "get",
           [](MLIRContext &context) { return Float64Type::get(&context); },
           nb::arg("context"));
-  PyTypeRegistry::registerType<Float64Type>();
 
   nb::class_<BFloat16Type, Type>(m, "BF16Type")
       .def_static(
           "get",
           [](MLIRContext &context) { return BFloat16Type::get(&context); },
           nb::arg("context"));
-  PyTypeRegistry::registerType<BFloat16Type>();
 
   nb::class_<UnrankedTensorType, Type>(m, "UnrankedTensorType")
       .def_static(
@@ -635,7 +594,6 @@ static void bindTypes(nb::module_ &m) {
           nb::arg("element_type"))
       .def("get_element_type",
            [](UnrankedTensorType &self) { return self.getElementType(); });
-  PyTypeRegistry::registerType<UnrankedTensorType>();
 
   // RankedTensorType
   nb::class_<RankedTensorType, Type>(m, "RankedTensorType")
@@ -677,7 +635,6 @@ static void bindTypes(nb::module_ &m) {
                                          self.getEncoding());
           },
           nb::arg("type"));
-  PyTypeRegistry::registerType<RankedTensorType>();
 
   nb::class_<UnrankedMemRefType, Type>(m, "UnrankedMemRefType")
       .def_static(
@@ -689,7 +646,6 @@ static void bindTypes(nb::module_ &m) {
           nb::arg("element_type"), nb::arg("memory_space").none() = nb::none())
       .def("get_element_type",
            [](UnrankedMemRefType &self) { return self.getElementType(); });
-  PyTypeRegistry::registerType<UnrankedMemRefType>();
 
   nb::class_<MemRefType, Type>(m, "MemRefType")
       .def_static(
@@ -713,7 +669,6 @@ static void bindTypes(nb::module_ &m) {
              return ret;
            })
       .def("get_rank", &MemRefType::getRank);
-  PyTypeRegistry::registerType<MemRefType>();
 }
 
 static void bindValues(nb::module_ &m) {
@@ -735,7 +690,6 @@ static void bindAttributes(nb::module_ &m) {
       .def("get_signless", &IntegerAttr::getInt)
       .def("get_signed", &IntegerAttr::getSInt)
       .def("get_unsigned", &IntegerAttr::getUInt);
-  PyAttributeRegistry::registerAttr<IntegerAttr>();
 
   nb::class_<FloatAttr, Attribute>(m, "FloatAttr")
       .def_static(
@@ -743,13 +697,10 @@ static void bindAttributes(nb::module_ &m) {
           [](Type ty, double value) { return FloatAttr::get(ty, value); },
           nb::arg("ty"), nb::arg("value"));
 
-  PyAttributeRegistry::registerAttr<FloatAttr>();
-
   nb::class_<UnitAttr, Attribute>(m, "UnitAttr")
       .def_static(
           "get", [](MLIRContext &context) { return UnitAttr::get(&context); },
           nb::arg("context"));
-  PyAttributeRegistry::registerAttr<UnitAttr>();
 
   nb::class_<StringAttr, Attribute>(m, "StringAttr")
       .def_static(
@@ -759,7 +710,6 @@ static void bindAttributes(nb::module_ &m) {
           },
           nb::arg("value"), nb::arg("context"))
       .def("get_value", [](StringAttr &self) { return self.getValue().str(); });
-  PyAttributeRegistry::registerAttr<StringAttr>();
 
   nb::class_<BoolAttr, Attribute>(m, "BoolAttr")
       .def_static(
@@ -768,7 +718,6 @@ static void bindAttributes(nb::module_ &m) {
             return BoolAttr::get(&context, value);
           },
           nb::arg("value"), nb::arg("context"));
-  PyAttributeRegistry::registerAttr<BoolAttr>();
 
   nb::class_<DenseI32ArrayAttr, Attribute>(m, "DenseI32ArrayAttr")
       .def_static(
@@ -779,7 +728,6 @@ static void bindAttributes(nb::module_ &m) {
           },
           nb::arg("context"), nb::arg("values"))
       .def("size", [](DenseI32ArrayAttr &self) { return self.getSize(); });
-  PyAttributeRegistry::registerAttr<DenseI32ArrayAttr>();
 
   nb::class_<DenseI64ArrayAttr, Attribute>(m, "DenseI64ArrayAttr")
       .def_static(
@@ -790,7 +738,6 @@ static void bindAttributes(nb::module_ &m) {
           },
           nb::arg("context"), nb::arg("values"))
       .def("size", [](DenseI64ArrayAttr &self) { return self.getSize(); });
-  PyAttributeRegistry::registerAttr<DenseI64ArrayAttr>();
 
   nb::class_<FlatSymbolRefAttr, Attribute>(m, "FlatSymbolRefAttr")
       .def_static(
@@ -801,7 +748,6 @@ static void bindAttributes(nb::module_ &m) {
           nb::arg("value"), nb::arg("context"))
       .def("get_value",
            [](FlatSymbolRefAttr &self) { return self.getValue().str(); });
-  PyAttributeRegistry::registerAttr<FlatSymbolRefAttr>();
 
   nb::class_<StridedLayoutAttr, Attribute>(m, "StridedLayoutAttr")
       .def_static(
@@ -820,7 +766,6 @@ static void bindAttributes(nb::module_ &m) {
              return strides;
            })
       .def("get_offset", &StridedLayoutAttr::getOffset);
-  PyAttributeRegistry::registerAttr<StridedLayoutAttr>();
 
   nb::class_<DictionaryAttr, Attribute>(m, "DictionaryAttr")
       .def_static(
@@ -836,13 +781,11 @@ static void bindAttributes(nb::module_ &m) {
             return DictionaryAttr::get(&context, attrs);
           },
           nb::arg("context"), nb::arg("d"));
-  PyAttributeRegistry::registerAttr<DictionaryAttr>();
 
   nb::class_<TypeAttr, Attribute>(m, "TypeAttr")
       .def_static(
           "get", [](Type ty) { return TypeAttr::get(ty); }, nb::arg("type"))
       .def("get_type", &TypeAttr::getValue);
-  PyAttributeRegistry::registerAttr<TypeAttr>();
 }
 
 static void bindAffineObjects(nb::module_ &m) {
@@ -962,39 +905,6 @@ static void bindAffineObjects(nb::module_ &m) {
 }
 
 void bindIR(nb::module_ &m) {
-  m.def(
-      "isa",
-      [](Operation *op, nb::handle cls) {
-        return !dynCastOperation(op, cls).is_none();
-      },
-      nb::arg("op"), nb::arg("cls"));
-  m.def(
-      "isa",
-      [](OpState &op, nb::handle cls) {
-        return !dynCastOperation(op.getOperation(), cls).is_none();
-      },
-      nb::arg("op"), nb::arg("cls"));
-  m.def(
-      "cast",
-      [](Operation *op, nb::handle cls) { return castOperation(op, cls); },
-      nb::arg("op"), nb::arg("cls"));
-  m.def(
-      "cast",
-      [](OpState &op, nb::handle cls) {
-        return castOperation(op.getOperation(), cls);
-      },
-      nb::arg("op"), nb::arg("cls"));
-  m.def(
-      "dyn_cast",
-      [](Operation *op, nb::handle cls) { return dynCastOperation(op, cls); },
-      nb::arg("op"), nb::arg("cls"));
-  m.def(
-      "dyn_cast",
-      [](OpState &op, nb::handle cls) {
-        return dynCastOperation(op.getOperation(), cls);
-      },
-      nb::arg("op"), nb::arg("cls"));
-
   bindContext(m);
   bindBuilder(m);
   bindCoreIR(m);

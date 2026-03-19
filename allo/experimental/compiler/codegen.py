@@ -4,6 +4,7 @@
 import ast
 import contextlib
 import builtins
+from dataclasses import dataclass
 
 from types import ModuleType
 from .._C.ir import (
@@ -13,8 +14,9 @@ from .._C.ir import (
     FunctionType,
     Value,
     BlockArgument,
+    Block,
 )
-from .._C import scf, func, ub as ub_d, arith
+from .._C import scf, func, ub as ub_d, arith, cf
 from ..core.types import (
     BaseType,
     Constexpr,
@@ -29,7 +31,7 @@ from ..core.types import (
 )
 from ..core import types
 from .builder import AlloOpBuilder
-from ..core.kernel import Kernel, ConstevalFunction
+from ..core.kernel import Kernel, ConstevalFunction, CompileOptions
 from collections.abc import Sequence
 from .. import dsl
 from typing import Type, cast
@@ -53,6 +55,42 @@ def serialize_function_signature(
     return FunctionType.get(args, rets, context)
 
 
+class ReturnPlacementChecker(ast.NodeVisitor):
+    def __init__(self, src: str):
+        self.src = src
+        self.loop_depth = 0
+        self.if_depth = 0
+
+    def visit_Return(self, ret_node: ast.Return):
+        if self.loop_depth > 0:
+            raise CompilationError(
+                ret_node,
+                "'return' is not supported inside loops (for/grid/while).",
+                self.src,
+            )
+        if self.if_depth > 1:
+            raise CompilationError(
+                ret_node,
+                "'return' is not supported inside nested 'if' statements.",
+                self.src,
+            )
+
+    def visit_For(self, for_node: ast.For):
+        self.loop_depth += 1
+        self.generic_visit(for_node)
+        self.loop_depth -= 1
+
+    def visit_While(self, while_node: ast.While):
+        self.loop_depth += 1
+        self.generic_visit(while_node)
+        self.loop_depth -= 1
+
+    def visit_If(self, if_node: ast.If):
+        self.if_depth += 1
+        self.generic_visit(if_node)
+        self.if_depth -= 1
+
+
 class CodeGenerator(ast.NodeVisitor):
     def __init__(
         self,
@@ -66,7 +104,7 @@ class CodeGenerator(ast.NodeVisitor):
         gscope: dict,
         arg_types: Sequence[BaseType],
         res_types: Sequence[BaseType],
-        module_map: dict = {},
+        options: CompileOptions = CompileOptions(),
     ):
         # setup basic fields and context
         self.context = context
@@ -77,8 +115,11 @@ class CodeGenerator(ast.NodeVisitor):
         self.begin_line = begin_line
         self.kernel = kernel
         self.arg_types = arg_types
-        self.res_types = res_types
-        self.allow_implicit_type_infer = False
+        self.res_types = list(res_types)
+        self.actual_res_types: list[BaseType] = []
+        self._actual_res_types_recorded = False
+        self.seen_return_stmt = False
+        self.allow_implicit_type_infer = options.allow_implicit_type_infer
 
         # trackers
         self.local_defs = {}  # track local variable definitions
@@ -86,17 +127,17 @@ class CodeGenerator(ast.NodeVisitor):
             {}
         )  # track what can be seen in the current scope
         self.gscope = {}
+        self.module_map = options.module_map
         for k, v in gscope.items():
             if isinstance(v, ModuleType):
                 # module-level remap
-                self.gscope[k] = module_map.get(v.__name__, v)
+                self.gscope[k] = self.module_map.get(v.__name__, v)
                 continue
             module_name = getattr(v, "__module__", None)
-            if module_name is not None and module_name in module_map:
-                self.gscope[k] = getattr(module_map[module_name], v.__name__)
+            if module_name is not None and module_name in self.module_map:
+                self.gscope[k] = getattr(self.module_map[module_name], v.__name__)
             else:
                 self.gscope[k] = v
-        self.module_map = module_map
         self.scf_stack = []
         self.curr_fn = None
         self.builder.curr_node = None
@@ -156,6 +197,7 @@ class CodeGenerator(ast.NodeVisitor):
             isinstance(val, ModuleType)
             or isinstance(val, ConstevalFunction)
             or getattr(val, "__module__", "").startswith("allo.experimental.core")
+            or isinstance(val, (Operator, BoundOperator))
             or isinstance(val, BaseType)
             or self._is_global_constexpr(name)
         )
@@ -215,12 +257,18 @@ class CodeGenerator(ast.NodeVisitor):
         if not isinstance(stmts, builtins.list):
             stmts = [stmts]
         for stmt in stmts:
+            # ignore everything after return statement
             self.visit(stmt)
+            if isinstance(stmt, ast.Return):
+                break
 
     def visit_Module(self, node: ast.Module):
         ast.NodeVisitor.generic_visit(self, node)
 
     def visit_FunctionDef(self, node: ast.FunctionDef):
+        self._precheck_return_placement(node)
+        self.seen_return_stmt = False
+
         arg_names, _ = self.visit(node.args)
         # init defaults
         for i, default in enumerate(node.args.defaults[::-1]):
@@ -248,7 +296,7 @@ class CodeGenerator(ast.NodeVisitor):
         func_op = func.FuncOp(self.builder, self.func_name, fn_ty)
         entry_block = func_op.add_entry_block()
 
-        arg_handles = [func_op.get_arg_at(i) for i in range(func_op.get_num_args())]
+        arg_handles = entry_block.get_args()
         arg_proxies = [
             Proxy(handle, ty) for handle, ty in zip(arg_handles, self.arg_types)
         ]
@@ -260,11 +308,23 @@ class CodeGenerator(ast.NodeVisitor):
         self.builder.set_insertion_point_to_start(entry_block)
         self.visit_compound_stmts(node.body)
 
-        # create a return op
-        self.builder.set_insertion_point_to_end(entry_block)
-        func.ReturnOp(self.builder, [])
+        if not self.seen_return_stmt:
+            if len(self.res_types) == 0:
+                self.builder.set_insertion_point_to_end(entry_block)
+                func.ReturnOp(self.builder, [])
+            else:
+                raise CompilationError(
+                    node,
+                    "Missing return statement for non-void function. Please add a top-level return statement matching the declared return type.",
+                    self.kernel.src,
+                )
         # restore
         self.builder.set_insertion_point_after(func_op.get_operation())
+
+    def _precheck_return_placement(self, node: ast.FunctionDef):
+        checker = ReturnPlacementChecker(self.kernel.src)
+        for stmt in node.body:
+            checker.visit(stmt)
 
     def visit_arguments(self, node: ast.arguments):
         arg_names = [self.visit(arg) for arg in node.args]
@@ -419,6 +479,102 @@ class CodeGenerator(ast.NodeVisitor):
             "'continue' statement is not supported in allo kernel functions"
         )
 
+    def _coerce_return_value(
+        self, value: Proxy | Constexpr, dst_type: BaseType
+    ) -> Proxy:
+        if isinstance(value, Constexpr):
+            if isinstance(dst_type, DType):
+                return self.builder.make_scalar(value.value, dst_type)
+            if isinstance(dst_type, ShapedType):
+                buffer = self.builder.make_buffer(dst_type)
+                const = self.builder.make_scalar(value.value, dst_type.dtype)
+                ret = self.builder.fill_buffer(buffer, const)
+                if ret is None:
+                    return buffer
+                return ret
+            self.compile_error(f"Unsupported return destination type '{dst_type}'.")
+
+        if isinstance(dst_type, DType):
+            if not isinstance(value.type, DType):
+                self.compile_error(
+                    f"Cannot return value of type '{value.type}' as scalar type '{dst_type}'."
+                )
+            return self.builder.cast(value, dst_type)
+
+        if isinstance(dst_type, TensorType):
+            if isinstance(value.type, DType):
+                buffer = self.builder.make_buffer(dst_type)
+                scalar = self.builder.cast(value, dst_type.dtype)
+                ret = self.builder.fill_buffer(buffer, scalar)
+                assert ret is not None
+                return ret
+            if isinstance(value.type, TensorType):
+                if value.type.shape != dst_type.shape:
+                    self.compile_error(
+                        f"Cannot return tensor of shape {value.type.shape} as shape {dst_type.shape}."
+                    )
+                return self.builder.tensor_cast(value, dst_type.dtype)
+            self.compile_error(
+                f"Cannot return value of type '{value.type}' as tensor type '{dst_type}'."
+            )
+
+        if isinstance(dst_type, BufferType):
+            if isinstance(value.type, DType):
+                buffer = self.builder.make_buffer(dst_type)
+                scalar = self.builder.cast(value, dst_type.dtype)
+                self.builder.fill_buffer(buffer, scalar)
+                return buffer
+            if isinstance(value.type, BufferType):
+                if value.type != dst_type:
+                    self.compile_error(
+                        f"Cannot return buffer of type '{value.type}' as '{dst_type}'."
+                    )
+                return value
+            self.compile_error(
+                f"Cannot return value of type '{value.type}' as buffer type '{dst_type}'."
+            )
+
+        self.compile_error(f"Unsupported return destination type '{dst_type}'.")
+
+    def visit_Return(self, node: ast.Return):
+        self.seen_return_stmt = True
+
+        if node.value is None or (
+            isinstance(node.value, ast.Constant) and node.value.value is None
+        ):
+            return_vals = []
+        elif isinstance(node.value, ast.Tuple):
+            return_vals = [self.visit(elt) for elt in node.value.elts]
+        else:
+            return_vals = [self.visit(node.value)]
+
+        curr_actual_res_types = []
+        for i, value in enumerate(return_vals):
+            if isinstance(value, Proxy):
+                curr_actual_res_types.append(value.type)
+            elif isinstance(value, Constexpr):
+                if i < len(self.res_types):
+                    curr_actual_res_types.append(self.res_types[i])
+            else:
+                self.compile_error(
+                    f"Unsupported return value '{value}' of type '{type(value).__name__}'."
+                )
+
+        if not self._actual_res_types_recorded:
+            self.actual_res_types = curr_actual_res_types
+            self._actual_res_types_recorded = True
+
+        if len(return_vals) != len(self.res_types):
+            self.compile_error(
+                f"Return value count mismatch: expected {len(self.res_types)}, got {len(return_vals)}."
+            )
+
+        coerced = []
+        for value, dst_type in zip(return_vals, self.res_types):
+            coerced.append(self._coerce_return_value(value, dst_type))
+
+        func.ReturnOp(self.builder, [v.handle for v in coerced])
+
     def visit_If(self, node: ast.If):
         cond = self.visit(node.test)
         if isinstance(cond, Proxy):
@@ -427,7 +583,14 @@ class CodeGenerator(ast.NodeVisitor):
                     "Condition of 'if' statement cannot be a shaped type."
                 )
             cond = self.builder.scalar_cast(cond, int1)
-            self.visit_if_impl(cond, node)
+            then_has_return = self._branch_has_return(node.body)
+            else_has_return = self._branch_has_return(node.orelse)
+            if then_has_return or else_has_return:
+                self._visit_if_with_return_impl(
+                    cond, node, then_has_return, else_has_return
+                )
+            else:
+                self.visit_if_impl(cond, node)
         else:
             # constexpr path
             assert isinstance(cond, Constexpr)
@@ -448,6 +611,67 @@ class CodeGenerator(ast.NodeVisitor):
         type(None),
     }
 
+    @staticmethod
+    def _branch_has_return(stmts) -> bool:
+        return any(isinstance(stmt, ast.Return) for stmt in stmts)
+
+    def _visit_if_with_return_impl(
+        self, cond: Proxy, node: ast.If, then_has_return, else_has_return
+    ):
+        continue_vals = None
+        end_if = None
+        with EnterSubRegion(self):
+            ip, last_loc = self.builder.get_insertion_point_and_loc()
+            parent_region = ip.get_block().get_parent_region()
+            then_block = self.builder.create_free_block(parent_region)
+            else_block = self.builder.create_free_block(parent_region)
+            end_if = self.builder.create_free_block(parent_region)
+
+            # branch out from current block to then/else
+            self.builder.set_insertion_point_and_loc(ip, last_loc)
+            cf.CondBranchOp(self.builder, cond.handle, then_block, else_block)
+
+            liveins = self.lscope.copy()
+
+            # then branch
+            self.builder.set_insertion_point_to_start(then_block)
+            self.visit_compound_stmts(node.body)
+            then_vals = self.lscope.copy()
+
+            # else branch
+            self.lscope = liveins
+            self.builder.set_insertion_point_to_start(else_block)
+            if node.orelse:
+                self.visit_compound_stmts(node.orelse)
+                else_vals = self.lscope.copy()
+            else:
+                else_vals = liveins.copy()
+
+            # if both branches return, there is no fallthrough path
+            if then_has_return and else_has_return:
+                continue_vals = liveins
+                end_if.erase()
+
+            # if exactly one branch returns, continue with the non-returning branch.
+            elif then_has_return and not else_has_return:
+                self.builder.set_insertion_point_to_end(else_block)
+                cf.BranchOp(self.builder, end_if, [])
+                continue_vals = else_vals
+
+            elif not then_has_return and else_has_return:
+                self.builder.set_insertion_point_to_end(then_block)
+                cf.BranchOp(self.builder, end_if, [])
+                continue_vals = then_vals
+
+            else:
+                self.compile_error(
+                    "Internal error: expected at least one direct return in if/else branches."
+                )
+
+        assert end_if is not None and continue_vals is not None
+        self.builder.set_insertion_point_to_start(end_if)
+        self.lscope = continue_vals.copy()
+
     def visit_if_impl(self, cond: Proxy, node: ast.If):
         with EnterSubRegion(self):
             ip, last_loc = self.builder.get_insertion_point_and_loc()
@@ -455,58 +679,13 @@ class CodeGenerator(ast.NodeVisitor):
             parent_region = ip.get_block().get_parent_region()
             then_block = self.builder.create_free_block(parent_region)
             else_block = self.builder.create_free_block(parent_region)
-            # get a copy of current live-ins
-            liveins = self.lscope.copy()
-            self.scf_stack.append(node)
-
-            # visit then block
-            self.builder.set_insertion_point_to_start(then_block)
-            self.visit_compound_stmts(node.body)
-            then_vals = self.lscope.copy()  # capture live-ins in then block
-
-            # restore lscope for else visiting
-            self.lscope = liveins
-
-            # visit else block
-            self.builder.set_insertion_point_to_start(else_block)
-            if node.orelse:
-                self.visit_compound_stmts(node.orelse)
-                else_vals = self.lscope.copy()  # capture live-ins in else block
-            else:
-                else_vals = liveins.copy()
 
             # compute phi arguments
-            phi_names = []
-            phi_types: list[BaseType] = []
-            then_handles = []
-            else_handles = []
-            for name, value in liveins.items():
-                then_proxy = then_vals[name]
-                else_proxy = else_vals[name]
-                if not isinstance(then_proxy, Proxy) or not isinstance(
-                    else_proxy, Proxy
-                ):
-                    continue
-                then_handle = then_proxy.handle
-                else_handle = else_proxy.handle
-                if then_handle == else_handle:
-                    continue  # value is not redefined in either block, no need for phi
-                # type check
-                if isinstance(value, Constexpr):
-                    self.compile_error(
-                        f"Variable '{name}' is defined as a constexpr in the outer scope, but is assigned to non-constexpr values in the then vs else branches."
-                    )
-                outer_ty = value.handle.get_type()
-                then_ty = then_handle.get_type()
-                else_ty = else_handle.get_type()
-                if then_ty != else_ty or then_ty != outer_ty:
-                    self.compile_error(
-                        f"Variable '{name}' has incompatible types in outer scope vs then vs else branches: {outer_ty} vs {then_ty} vs {else_ty}."
-                    )
-                phi_types.append(then_proxy.type)
-                phi_names.append(name)
-                then_handles.append(then_handle)
-                else_handles.append(else_handle)
+            self.scf_stack.append(node)
+            phi_names, phi_types, then_handles, else_handles = (
+                self._visit_then_else_block(node, then_block, else_block)
+            )
+            self.scf_stack.pop()
 
             # create if op
             self.builder.set_insertion_point_and_loc(ip, last_loc)
@@ -529,11 +708,62 @@ class CodeGenerator(ast.NodeVisitor):
                 else_block.erase()
 
         # update lscope with phi results
-        res_handles = [if_op.get_result_at(i) for i in range(len(phi_names))]
+        res_handles = if_op.get_results()
         phi_proxies = [Proxy(handle, ty) for handle, ty in zip(res_handles, phi_types)]
         for name, proxy in zip(phi_names, phi_proxies):
             self._set_value(name, proxy)
             self._maybe_set_loc_to_name(proxy, name)
+
+    def _visit_then_else_block(
+        self, node: ast.If, then_block: Block, else_block: Block
+    ):
+        # get a copy of current live-ins
+        liveins = self.lscope.copy()
+        # visit then block
+        self.builder.set_insertion_point_to_start(then_block)
+        self.visit_compound_stmts(node.body)
+        then_vals = self.lscope.copy()  # capture live-ins in then block
+        # restore lscope for else visiting
+        self.lscope = liveins
+        # visit else block
+        self.builder.set_insertion_point_to_start(else_block)
+        if node.orelse:
+            self.visit_compound_stmts(node.orelse)
+            else_vals = self.lscope.copy()  # capture live-ins in else block
+        else:
+            else_vals = liveins.copy()
+
+        # compute phi arguments
+        phi_names = []
+        phi_types: list[BaseType] = []
+        then_handles = []
+        else_handles = []
+        for name, value in liveins.items():
+            then_proxy = then_vals[name]
+            else_proxy = else_vals[name]
+            if not isinstance(then_proxy, Proxy) or not isinstance(else_proxy, Proxy):
+                continue
+            then_handle = then_proxy.handle
+            else_handle = else_proxy.handle
+            if then_handle == else_handle:
+                continue  # value is not redefined in either block, no need for phi
+            # type check
+            if isinstance(value, Constexpr):
+                self.compile_error(
+                    f"Variable '{name}' is defined as a constexpr in the outer scope, but is assigned to non-constexpr values in the then vs else branches."
+                )
+            outer_ty = value.handle.get_type()
+            then_ty = then_handle.get_type()
+            else_ty = else_handle.get_type()
+            if then_ty != else_ty or then_ty != outer_ty:
+                self.compile_error(
+                    f"Variable '{name}' has incompatible types in outer scope vs then vs else branches: {outer_ty} vs {then_ty} vs {else_ty}."
+                )
+            phi_types.append(then_proxy.type)
+            phi_names.append(name)
+            then_handles.append(then_handle)
+            else_handles.append(else_handle)
+        return phi_names, phi_types, then_handles, else_handles
 
     def visit_IfExp(self, node: ast.IfExp):
         cond = self.visit(node.test)
@@ -545,7 +775,6 @@ class CodeGenerator(ast.NodeVisitor):
             cond = self.builder.scalar_cast(cond, int1)
             # if exp cannot define new variables
             ip, last_loc = self.builder.get_insertion_point_and_loc()
-            parent_region = ip.get_block().get_parent_region()
 
             then_val = self.visit(node.body)
             else_val = self.visit(node.orelse)
@@ -684,7 +913,7 @@ class CodeGenerator(ast.NodeVisitor):
             self._maybe_set_loc_to_name(iv, node.target.id)
 
         # update lscope with iter args
-        res_handles = [for_op.get_result_at(i) for i in range(len(name))]
+        res_handles = for_op.get_results()
         res_proxies = [Proxy(handle, ty) for handle, ty in zip(res_handles, init_types)]
         for name, proxy in zip(name, res_proxies):
             self._maybe_set_loc_to_name(proxy, name)
@@ -796,7 +1025,7 @@ class CodeGenerator(ast.NodeVisitor):
                 self._maybe_set_loc_to_name(iv, target.id)
 
         # update lscope with iter args
-        res_handles = [par_op.get_result_at(i) for i in range(len(names))]
+        res_handles = par_op.get_results()
         res_proxies = [Proxy(handle, ty) for handle, ty in zip(res_handles, init_types)]
         for name, proxy in zip(names, res_proxies):
             self._maybe_set_loc_to_name(proxy, name)
@@ -819,7 +1048,7 @@ class CodeGenerator(ast.NodeVisitor):
                 while_op.get_before(), init_ir_types, self.builder.get_loc()
             )
             self.builder.set_insertion_point_to_start(before_block)
-            block_args = [before_block.get_arg_at(i) for i in range(len(names))]
+            block_args = before_block.get_args()
             for name, arg, ty in zip(names, block_args, init_types):
                 proxy = Proxy(arg, ty)
                 self._maybe_set_loc_to_name(proxy, name)
@@ -837,7 +1066,7 @@ class CodeGenerator(ast.NodeVisitor):
                 while_op.get_after(), init_ir_types, self.builder.get_loc()
             )
             self.builder.set_insertion_point_to_start(after_block)
-            body_handles = [after_block.get_arg_at(i) for i in range(len(names))]
+            body_handles = after_block.get_args()
             for name, arg, ty in zip(names, body_handles, init_types):
                 proxy = Proxy(arg, ty)
                 self._maybe_set_loc_to_name(proxy, name)
@@ -856,7 +1085,7 @@ class CodeGenerator(ast.NodeVisitor):
             scf.YieldOp(self.builder, yield_handles)
 
         # update lscope with iter args
-        res_handles = [while_op.get_result_at(i) for i in range(len(names))]
+        res_handles = while_op.get_results()
         res_proxies = [Proxy(handle, ty) for handle, ty in zip(res_handles, init_types)]
         for name, proxy in zip(names, res_proxies):
             self._maybe_set_loc_to_name(proxy, name)
@@ -1050,6 +1279,26 @@ class CodeGenerator(ast.NodeVisitor):
             results.append(self.visit(node.elt))
         return tuple(results)
 
+    def visit_JoinedStr(self, node):
+        values = list(node.values)
+        for i, value in enumerate(values):
+            if isinstance(value, ast.Constant):
+                values[i] = str(value.value)
+            elif isinstance(value, ast.FormattedValue):
+                conversion_code = value.conversion
+                evaluated = self.visit(value.value)
+                if not isinstance(evaluated, Constexpr):
+                    self.compile_error(
+                        "Cannot evaluate f-string containing non-constexpr conversion values, found conversion of type "
+                        + str(type(evaluated)),
+                    )
+                values[i] = (
+                    "{}" if conversion_code < 0 else "{!" + chr(conversion_code) + "}"
+                ).format(evaluated.value)
+            else:
+                assert False, f"unexpected value type in JoinedStr: {type(value)}"
+        return "".join(values)
+
     def visit_Attribute(self, node):
         lhs = self.visit(node.value)
         if isinstance(lhs, ModuleType):
@@ -1145,9 +1394,9 @@ class CodeGenerator(ast.NodeVisitor):
                 file_name=fn.file_name,
                 begin_line=fn.begin_line,
                 gscope=fn.get_capture_scope(),
-                module_map=self.module_map,
                 arg_types=sub_arg_types,
                 res_types=sub_res_types,
+                options=fn.options,
             )
             sub_generator.visit(fn.parse())
         except CompilationError as e:
@@ -1222,6 +1471,7 @@ class CodeGenerator(ast.NodeVisitor):
         return None
 
     statically_implemented_functions = {
+        dsl.static_assert: execute_static_assert,
         print: static_executor(print),
         len: static_executor(len),
     }
@@ -1249,46 +1499,69 @@ def compile(
     fn: Kernel,
     arg_types: Sequence[BaseType | str] = [],
     res_types: Sequence[BaseType | str] = [],
-    module_map: dict = {},
+    show_traceback: bool = False,
+    options: CompileOptions = CompileOptions(),
 ):
     """Compile a kernel function into an MLIR module."""
+    import os
+
+    if os.environ.get("ALLO_SHOW_COMPILER_TRACEBACK", "") == "1":
+        show_traceback = True
     if not isinstance(fn, Kernel):
         raise TypeError(
             "Only allo.kernel functions can be compiled with allo.compile()"
         )
     arg_types = [fn.parse_type_annotation(t) for t in arg_types]
+    if len(arg_types) != len(fn.signature.parameters):
+        raise ValueError(
+            f"The number of provided argument types ({len(arg_types)}) does not match the number of arguments in the kernel signature ({len(fn.signature.parameters)})."
+        )
     res_types = [fn.parse_type_annotation(t) for t in res_types]
 
-    context = Context()
-    context.load_dialects()
+    try:
+        context = Context()
+        context.load_dialects()
 
-    # initialize builder
-    builder = AlloOpBuilder(context)
-    builder.src = fn.src
-    builder.set_loc(Location(fn.file_name, fn.begin_line, 1, context))
-    module = ModuleOp(builder)
-    builder.module = module
-    builder.set_insertion_point_to_end(module.get_body())
+        # initialize builder
+        builder = AlloOpBuilder(context)
+        builder.src = fn.src
+        builder.set_loc(Location(fn.file_name, fn.begin_line, 1, context))
+        module = ModuleOp(builder)
+        builder.module = module
+        builder.set_insertion_point_to_end(module.get_body())
 
-    # start codegen
-    generator = CodeGenerator(
-        context,
-        module,
-        builder,
-        kernel=fn,
-        func_name=fn.func_name,
-        file_name=fn.file_name,
-        begin_line=fn.begin_line,
-        gscope=fn.get_capture_scope(),
-        module_map=module_map,
-        arg_types=arg_types,
-        res_types=res_types,
-    )
-    generator.visit(fn.parse())
+        # start codegen
+        generator = CodeGenerator(
+            context,
+            module,
+            builder,
+            kernel=fn,
+            func_name=fn.func_name,
+            file_name=fn.file_name,
+            begin_line=fn.begin_line,
+            gscope=fn.get_capture_scope(),
+            arg_types=arg_types,
+            res_types=res_types,
+            options=options,
+        )
+        generator.visit(fn.parse())
 
-    # verify
-    if not module.verify():
-        print(module)
-        raise RuntimeError(f"In function: {fn.func_name}, module verification failed.")
+        # verify
+        if not module.verify():
+            print(module)
+            raise RuntimeError(
+                f"In function: {fn.func_name}, module verification failed."
+            )
 
-    return module
+        return module
+    except Exception as exc:
+        if show_traceback:
+            raise
+        if isinstance(exc, (CompilationError, CompileTimeAssertionFailure)):
+            raise exc.with_traceback(None) from None
+        raise RuntimeError(
+            "Internal compiler error during Allo kernel compilation.\n"
+            f"Error type: {type(exc).__name__}\n"
+            f"Error message: {exc}\n"
+            "Re-run with show_traceback=True to see the full traceback."
+        ) from None

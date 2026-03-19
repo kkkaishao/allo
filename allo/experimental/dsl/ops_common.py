@@ -15,6 +15,10 @@ from ..core.library import NO_FOLD
 
 
 def binary_op_checks(lhs, rhs, op_name="") -> str:
+    if not isinstance(lhs, (Proxy, Constexpr)) or not isinstance(
+        rhs, (Proxy, Constexpr)
+    ):
+        return f"{op_name} can only be applied to Proxies or Constexprs, got {type(lhs)} and {type(rhs)}."
     lhs_ok = isinstance(lhs.type, (DType, ConstexprType)) or (
         isinstance(lhs.type, ShapedType) and isinstance(lhs.dtype, DType)
     )

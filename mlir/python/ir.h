@@ -64,119 +64,6 @@
 
 namespace nb = nanobind;
 
-/* Used to dispatch the correct wrapper type for a given mlir::Type or
- * mlir::Attribute. The creator function is expected to take the base mlir::Type
- * or mlir::Attribute and return the appropriate wrapper type.
- */
-class PyTypeRegistry {
-public:
-  using CreatorFunc = nb::object (*)(mlir::Type);
-
-  template <typename ConcreteType> static void registerType() {
-    registerType(mlir::TypeID::get<ConcreteType>(),
-                 [](mlir::Type t) -> nb::object {
-                   return nb::cast(mlir::cast<ConcreteType>(t));
-                 });
-  }
-
-  static void registerType(mlir::TypeID id, CreatorFunc &&creator) {
-    getMap()[id] = creator;
-  }
-
-  static nb::object create(mlir::Type t) {
-    if (!t)
-      return nb::none();
-    auto &map = getMap();
-    auto id = t.getTypeID();
-    auto it = map.find(id);
-    if (it != map.end()) {
-      return it->second(t);
-    }
-    return nb::cast(t);
-  }
-
-private:
-  static llvm::DenseMap<mlir::TypeID, CreatorFunc> &getMap() {
-    static llvm::DenseMap<mlir::TypeID, CreatorFunc> instance;
-    return instance;
-  }
-};
-
-class PyAttributeRegistry {
-public:
-  using CreatorFunc = nb::object (*)(mlir::Attribute);
-  template <typename ConcreteAttr> static void registerAttr() {
-    registerAttr(mlir::TypeID::get<ConcreteAttr>(),
-                 [](mlir::Attribute a) -> nb::object {
-                   return nb::cast(mlir::cast<ConcreteAttr>(a));
-                 });
-  }
-  static void registerAttr(mlir::TypeID id, CreatorFunc &&creator) {
-    getMap()[id] = creator;
-  }
-  static nb::object create(mlir::Attribute a) {
-    if (!a)
-      return nb::none();
-    auto &map = getMap();
-    auto id = a.getTypeID();
-    auto it = map.find(id);
-    if (it != map.end()) {
-      return it->second(a);
-    }
-    return nb::cast(a);
-  }
-
-private:
-  static llvm::DenseMap<mlir::TypeID, CreatorFunc> &getMap() {
-    static llvm::DenseMap<mlir::TypeID, CreatorFunc> instance;
-    return instance;
-  }
-};
-
-class PyOpRegistry {
-public:
-  using CreatorFunc = nb::object (*)(mlir::Operation *);
-
-  template <typename ConcreteOp> static void registerOp() {
-    registerOp(ConcreteOp::getOperationName(),
-               [](mlir::Operation *op) -> nb::object {
-                 auto concrete = mlir::dyn_cast<ConcreteOp>(op);
-                 if (!concrete)
-                   return nb::none();
-                 return nb::cast(concrete);
-               });
-  }
-
-  static void registerOp(std::string_view name, CreatorFunc &&creator) {
-    getMap()[llvm::StringRef(name)].push_back(creator);
-  }
-
-  static nb::object create(mlir::Operation *op) {
-    if (!op)
-      return nb::none();
-    auto &map = getMap();
-    auto name = op->getName().getStringRef();
-    auto it = map.find(name);
-    if (it != map.end()) {
-      for (auto creator = it->second.rbegin(); creator != it->second.rend();
-           ++creator) {
-        nb::object wrapped = (*creator)(op);
-        if (!wrapped.is_none())
-          return wrapped;
-      }
-    }
-    return nb::cast(op, nb::rv_policy::reference);
-  }
-
-private:
-  using CreatorList = llvm::SmallVector<CreatorFunc, 2>;
-
-  static llvm::StringMap<CreatorList> &getMap() {
-    static llvm::StringMap<CreatorList> instance;
-    return instance;
-  }
-};
-
 class AlloOpBuilder : public mlir::OpBuilder {
 public:
   using OpBuilder::OpBuilder;
@@ -220,7 +107,6 @@ using OpClass = nb::class_<ConcreteOp, Base>;
 
 template <typename ConcreteOp, typename Base = mlir::OpState>
 inline OpClass<ConcreteOp, Base> bindOp(nb::module_ &m, const char *pyName) {
-  PyOpRegistry::registerOp<ConcreteOp>();
   return nb::class_<ConcreteOp, Base>(m, pyName);
 }
 

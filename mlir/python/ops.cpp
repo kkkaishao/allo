@@ -20,6 +20,13 @@ void bindFuncOps(nb::module_ &m) {
             return self.getArgument(idx);
           },
           nb::arg("idx"))
+      .def("get_args",
+           [](func::FuncOp &self) {
+             std::vector<BlockArgument> args;
+             for (auto arg : self.getArguments())
+               args.push_back(arg);
+             return args;
+           })
       .def("get_num_args", &func::FuncOp::getNumArguments)
       .def(
           "add_entry_block",

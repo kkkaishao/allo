@@ -3,6 +3,7 @@ import inspect
 import textwrap
 import re
 import warnings
+from dataclasses import dataclass, field
 from typing import ParamSpec, TypeVar, Generic, Callable, overload, Optional, Any
 from collections.abc import Sequence
 from ..core.types import (
@@ -59,6 +60,13 @@ def _infer_value_type(val, enable_tensor: bool = True) -> BaseType:
         raise TypeError(f"Unsupported value type: {type(val)}")
 
 
+@dataclass(frozen=True)
+class CompileOptions:
+    allow_implicit_type_infer: bool = False
+    enable_tensor: bool = False
+    module_map: dict = field(default_factory=dict)
+
+
 class Kernel(Generic[P, R]):
     def __init__(
         self,
@@ -66,14 +74,15 @@ class Kernel(Generic[P, R]):
         *,
         mapping: Optional[Sequence],
         attr: dict,
-        use_tensor: bool,
         is_top: bool = False,
+        options: CompileOptions = CompileOptions(),
     ):
         # setup basic fields
         self.fn = fn
         self.file_name = fn.__code__.co_filename
         self.func_name = fn.__name__
         self.signature = inspect.signature(fn)
+        self.options = options
 
         try:
             raw_src, starting_line_number = inspect.getsourcelines(fn)
@@ -100,7 +109,6 @@ class Kernel(Generic[P, R]):
         self.attr = attr
         self.mapping = mapping
         self.is_top = is_top
-        self.use_tensor = use_tensor
 
         self.__name__ = fn.__name__
         self.__doc__ = fn.__doc__
@@ -134,12 +142,23 @@ class Kernel(Generic[P, R]):
         out += f"<{self.func_name} at {self.file_name}:{self.begin_line}>"
         return out
 
+    def compile(
+        self,
+        arg_types: Sequence[BaseType | str] = [],
+        res_types: Sequence[BaseType | str] = [],
+    ):
+        from ..compiler.codegen import compile
+
+        module = compile(self, arg_types=arg_types, res_types=res_types)
+        return module
+
     def __call__(self, *args: P.args, **kwargs: P.kwargs):
         from ..compiler.codegen import compile
 
         arg_types = self.specialize_arg_types(*args, **kwargs)
-        module = compile(self, arg_types, [])
-        print(module)
+        res_types = self.parse_return_annotation(self.signature.return_annotation)
+        module = compile(self, arg_types, res_types)
+        return module
 
     def specialize_arg_types(self, *args, **kwargs) -> Sequence[BaseType]:
         """Parse of infer argument types to get a list of frontend types for specialization."""
@@ -153,7 +172,7 @@ class Kernel(Generic[P, R]):
             if annotation is inspect.Parameter.empty:
                 # TODO: try infer
                 try:
-                    inferred = _infer_value_type(v, self.use_tensor)
+                    inferred = _infer_value_type(v, self.options.enable_tensor)
                 except TypeError as e:
                     raise TypeError(
                         f"Failed to infer type for parameter '{k}' with value '{v}': {e}. Please provide an explicit type annotation or use a value with an inferrable type."
@@ -193,11 +212,19 @@ class Kernel(Generic[P, R]):
                 ]
                 if dtype_str in globals() and isinstance(globals()[dtype_str], DType):
                     dtype = globals()[dtype_str]
-                    if self.use_tensor:
+                    if self.options.enable_tensor:
                         return TensorType(dtype=dtype, shape=shape)
                     else:
                         return BufferType(dtype=dtype, shape=shape)
         raise TypeError(f"Unsupported type annotation: {annotation}")
+
+    def parse_return_annotation(self, annotation: object) -> list[BaseType]:
+        annotation = unwrap_if_constexpr(annotation)
+        if annotation is inspect.Signature.empty or annotation is None:
+            return []
+        if isinstance(annotation, tuple):
+            return [self.parse_type_annotation(elt) for elt in annotation]
+        return [self.parse_type_annotation(annotation)]
 
 
 class ConstevalFunction(Generic[P, R]):
@@ -228,7 +255,10 @@ def kernel(fn: Callable[P, R]) -> Kernel[P, R]: ...
 
 @overload
 def kernel(
-    *, mapping: Optional[Sequence] = None, attr: dict = {}, use_tensor: bool = True
+    *,
+    mapping: Optional[Sequence] = None,
+    attr: dict = {},
+    options: CompileOptions = CompileOptions(),
 ) -> Callable[[Callable[P, R]], Kernel[P, R]]: ...
 
 
@@ -237,12 +267,12 @@ def kernel(
     *,
     mapping: Optional[Sequence] = None,
     attr: dict[str, Any] = {},
-    use_tensor: bool = True,
+    options: CompileOptions = CompileOptions(),
 ) -> Kernel[P, R] | Callable[[Callable[P, R]], Kernel[P, R]]:
 
     def decorator(fn: Callable[P, R]) -> Kernel[P, R]:
         assert callable(fn)
-        return Kernel(fn, mapping=mapping, attr=attr, use_tensor=use_tensor)
+        return Kernel(fn, mapping=mapping, attr=attr, options=options)
 
     if fn is not None:
         return decorator(fn)
@@ -256,7 +286,7 @@ def accelerator(fn: Callable[P, R]) -> Kernel[P, R]: ...
 
 @overload
 def accelerator(
-    *, attr: dict = {}, use_tensor: bool = False
+    *, attr: dict = {}, options: CompileOptions = CompileOptions()
 ) -> Callable[[Callable[P, R]], Kernel[P, R]]: ...
 
 
@@ -264,12 +294,12 @@ def accelerator(
     fn: Optional[Callable[P, R]] = None,
     *,
     attr: dict[str, Any] = {},
-    use_tensor: bool = False,
+    options: CompileOptions = CompileOptions(),
 ) -> Kernel[P, R] | Callable[[Callable[P, R]], Kernel[P, R]]:
 
     def decorator(fn: Callable[P, R]) -> Kernel[P, R]:
         assert callable(fn)
-        return Kernel(fn, mapping=None, attr=attr, use_tensor=use_tensor, is_top=True)
+        return Kernel(fn, mapping=None, attr=attr, options=options, is_top=True)
 
     if fn is not None:
         return decorator(fn)
