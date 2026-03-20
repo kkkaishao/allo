@@ -1,5 +1,8 @@
+# Copyright Allo authors. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 from ..core.library import operator
-from ..core.types import BufferType, TensorType, DType, Proxy, ShapedType, uint1
+from ..core.types import DType, Proxy, ShapedType, uint1
 from ..compiler.builder import AlloOpBuilder
 from .ops_common import prepare_tuple_indices
 

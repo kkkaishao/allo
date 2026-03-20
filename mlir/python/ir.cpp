@@ -211,7 +211,6 @@ static void bindCoreIR(nb::module_ &m) {
           nb::arg("name"));
 
   nb::class_<Type>(m, "Type")
-      .def_static("cast", [](Type &other) { return other; })
       .def("__init__",
            [](Type &self) {
              throw nb::type_error(
@@ -257,14 +256,12 @@ static void bindCoreIR(nb::module_ &m) {
           nb::arg("val"))
       .def("get_type", &Value::getType);
 
-  nb::class_<Attribute>(m, "Attribute")
-      .def_static("cast", [](Attribute &other) { return other; })
-      .def("__str__", [](Attribute &self) {
-        std::string str;
-        llvm::raw_string_ostream os(str);
-        self.print(os);
-        return os.str();
-      });
+  nb::class_<Attribute>(m, "Attribute").def("__str__", [](Attribute &self) {
+    std::string str;
+    llvm::raw_string_ostream os(str);
+    self.print(os);
+    return os.str();
+  });
 
   (void)nb::class_<Region>(m, "Region");
 

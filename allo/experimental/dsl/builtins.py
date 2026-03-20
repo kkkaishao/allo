@@ -1,3 +1,6 @@
+# Copyright Allo authors. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 from ..core.library import operator
 from .ops_arith import (
     add,
@@ -29,38 +32,6 @@ from .ops_arith import (
 )
 
 from .ops_memory import load, store
-
-__all__ = [
-    "add",
-    "sub",
-    "mul",
-    "div",
-    "floordiv",
-    "mod",
-    "pow",
-    "lshift",
-    "rshift",
-    "bitwise_and",
-    "bitwise_or",
-    "bitwise_xor",
-    "eq",
-    "ne",
-    "lt",
-    "le",
-    "gt",
-    "ge",
-    "pos",
-    "neg",
-    "invert",
-    "logical_and",
-    "logical_not",
-    "logical_or",
-    "max",
-    "min",
-    "load",
-    "store",
-    "static_assert",
-]
 
 
 # placeholder for static_assert

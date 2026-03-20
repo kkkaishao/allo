@@ -1,7 +1,9 @@
+# Copyright Allo authors. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import inspect
 
 from ..core.types import (
-    BaseType,
     Constexpr,
     ConstexprType,
     DType,
