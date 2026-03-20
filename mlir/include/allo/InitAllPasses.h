@@ -7,7 +7,7 @@
 #define ALLO_INIT_ALL_PASSES_H
 
 #include "mlir/Conversion/Passes.h"
-#include "mlir/Dialect/Affine/Passes.h"
+#include "mlir/Dialect/Affine/Transforms/Passes.h"
 #include "mlir/Dialect/Arith/Transforms/Passes.h"
 #include "mlir/Dialect/Bufferization/Pipelines/Passes.h"
 #include "mlir/Dialect/Bufferization/Transforms/Passes.h"
@@ -25,8 +25,6 @@
 #include "mlir/Dialect/Vector/Transforms/Passes.h"
 #include "mlir/Target/LLVMIR/Transforms/Passes.h"
 #include "mlir/Transforms/Passes.h"
-
-#include "allo/Transforms/Passes.h"
 
 namespace mlir::allo {
 inline void registerAllPasses() {
@@ -49,10 +47,9 @@ inline void registerAllPasses() {
   registerSCFPasses();
   registerShapePasses();
   tensor::registerTensorPasses();
-  tosa::registerTosaOptPasses();
+  tosa::registerTosaPasses();
   transform::registerTransformPasses();
   vector::registerVectorPasses();
-  allo::registerAlloPasses();
 
   // Dialect pipelines
   bufferization::registerBufferizationPipelines();

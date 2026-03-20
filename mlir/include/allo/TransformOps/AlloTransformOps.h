@@ -6,8 +6,8 @@
 #ifndef ALLO_TRANSFORMOPS_H
 #define ALLO_TRANSFORMOPS_H
 
-#include "allo/Dialect/AlloAttrs.h"
-#include "allo/Dialect/AlloDialect.h"
+#include "allo/IR/AlloAttrs.h"
+#include "allo/IR/AlloOps.h"
 #include "mlir/Dialect/Transform/IR/TransformDialect.h"
 #include "mlir/Dialect/Transform/IR/TransformTypes.h"
 #include "mlir/Dialect/Transform/Interfaces/TransformInterfaces.h"

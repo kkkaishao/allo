@@ -3,8 +3,8 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-#ifndef HETEROCL_OPS_H
-#define HETEROCL_OPS_H
+#ifndef ALLO_OPS_H
+#define ALLO_OPS_H
 
 #include "mlir/Bytecode/BytecodeOpInterface.h"
 #include "mlir/IR/BuiltinTypes.h"
@@ -19,10 +19,13 @@
 #include "mlir/Interfaces/InferTypeOpInterface.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
 
-#include "allo/Dialect/AlloAttrs.h"
-#include "allo/Dialect/AlloTypes.h"
+#include "allo/IR/AlloAttrs.h"
+#include "allo/IR/AlloTypes.h"
+#include "llvm/ADT/TypeSwitch.h"
+
+#include "allo/IR/AlloDialect.h.inc"
 
 #define GET_OP_CLASSES
-#include "allo/Dialect/AlloOps.h.inc"
+#include "allo/IR/AlloOps.h.inc"
 
-#endif // HETEROCL_OPS_H
+#endif // ALLO_OPS_H

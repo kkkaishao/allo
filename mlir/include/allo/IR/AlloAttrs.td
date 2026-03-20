@@ -6,7 +6,7 @@
 #ifndef ALLO_ATTRS
 #define ALLO_ATTRS
 
-include "allo/Dialect/AlloDialect.td"
+include "allo/IR/Allo.td"
 include "mlir/IR/EnumAttr.td"
 
 // https://mlir.llvm.org/docs/OpDefinitions/#enum-attributes

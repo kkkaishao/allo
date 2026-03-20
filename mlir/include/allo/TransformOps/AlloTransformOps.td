@@ -10,7 +10,7 @@ include "mlir/Dialect/Transform/IR/TransformDialect.td"
 include "mlir/Dialect/Transform/Interfaces/TransformInterfaces.td"
 include "mlir/IR/OpBase.td"
 include "mlir/Interfaces/SideEffectInterfaces.td"
-include "allo/Dialect/AlloAttrs.td"
+include "allo/IR/AlloAttrs.td"
 
 def Allo_RaiseToAffineOp : Op<Transform_Dialect, "allo.raise_to_affine",
   [FunctionalStyleTransformOpTrait, MemoryEffectsOpInterface,

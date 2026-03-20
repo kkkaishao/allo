@@ -8,9 +8,9 @@
 
 #include "mlir/IR/BuiltinAttributes.h"
 
-#include "allo/Dialect/AlloEnums.h.inc"
+#include "allo/IR/AlloEnums.h.inc"
 
 #define GET_ATTRDEF_CLASSES
-#include "allo/Dialect/AlloAttrs.h.inc"
+#include "allo/IR/AlloAttrs.h.inc"
 
 #endif // ALLO_ATTRS_H

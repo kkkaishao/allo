@@ -24,7 +24,7 @@
 #include "mlir/Dialect/Transform/IR/TransformOps.h"
 #include "mlir/Dialect/Vector/IR/VectorOps.h"
 
-#include "allo/Dialect/AlloDialect.h"
+#include "allo/IR/AlloOps.h"
 
 namespace mlir::allo {
 inline void registerAllDialects(DialectRegistry &registry) {

@@ -14,8 +14,7 @@
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/AffineExprVisitor.h"
 
-#include "allo/Dialect/AlloDialect.h"
-#include "allo/Dialect/AlloOps.h"
+#include "allo/IR/AlloOps.h"
 #include "allo/Translation/EmitterState.h"
 
 namespace mlir::allo {
@@ -65,10 +64,13 @@ private:
   void emitPartitionAttr(allo::PartitionAttr attr, Value value);
   void emitLoopDirectives(Operation *op);
   void emitBinaryOp(Operation *op, llvm::StringLiteral keyword);
-  void emitMaxMinOp(Operation *op, llvm::StringLiteral keyword);
+  void emitBinaryOp(Operation *op, llvm::StringLiteral keyword, bool isSigned);
+  void emitPrefixBinaryOp(Operation *op, llvm::StringLiteral keyword);
+  void emitPrefixBinaryOp(Operation *op, llvm::StringLiteral keyword,
+                          bool isSigned);
   void emitUnaryOp(Operation *op, llvm::StringLiteral keyword);
   void emitCastOp(Operation *op);
-  std::string getPrimitiveTypeName(Type type);
+  std::string getPrimitiveTypeName(Type type, bool isSigned = false);
 
   void dispatch(Operation *op);
 };

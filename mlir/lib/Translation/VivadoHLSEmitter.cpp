@@ -27,7 +27,7 @@ static std::string getIntegerTypeName(unsigned width, bool isSigned) {
   }
 }
 
-std::string VivadoHLSEmitter::getPrimitiveTypeName(Type type) {
+std::string VivadoHLSEmitter::getPrimitiveTypeName(Type type, bool isSigned) {
   if (auto shapedType = dyn_cast<ShapedType>(type))
     type = shapedType.getElementType();
   /// Primitive types
@@ -40,7 +40,6 @@ std::string VivadoHLSEmitter::getPrimitiveTypeName(Type type) {
 
   if (auto intType = dyn_cast<IntegerType>(type)) {
     unsigned width = intType.getWidth();
-    bool isSigned = intType.isSigned();
     return getIntegerTypeName(width, isSigned);
   }
 
@@ -541,9 +540,10 @@ void VivadoHLSEmitter::emitSCFYield(scf::YieldOp op) {
 void VivadoHLSEmitter::emitCastOp(Operation *op) {
   llvm::raw_ostream &os = state.os;
   emitValue(op->getResult(0));
-  os << " = (" << getPrimitiveTypeName(op->getResult(0).getType()) << ")";
+  os << " = static_cast<" << getPrimitiveTypeName(op->getResult(0).getType())
+     << ">(";
   emitValue(op->getOperand(0));
-  os << ";";
+  os << ");";
 }
 
 void VivadoHLSEmitter::emitConstant(arith::ConstantOp op) {
@@ -636,57 +636,71 @@ void VivadoHLSEmitter::dispatch(Operation *op) {
   llvm::TypeSwitch<Operation *, void>(op)
       // binary ops
       .Case<arith::AddIOp>([&](auto op) { emitBinaryOp(op, "+"); })
+      .Case<arith::AddFOp>([&](auto op) { emitBinaryOp(op, "+"); })
       .Case<arith::SubIOp>([&](auto op) { emitBinaryOp(op, "-"); })
+      .Case<arith::SubFOp>([&](auto op) { emitBinaryOp(op, "-"); })
       .Case<arith::MulIOp>([&](auto op) { emitBinaryOp(op, "*"); })
+      .Case<arith::MulFOp>([&](auto op) { emitBinaryOp(op, "*"); })
       .Case<arith::DivFOp>([&](auto op) { emitBinaryOp(op, "/"); })
-      .Case<arith::DivUIOp>([&](auto op) { emitBinaryOp(op, "/"); })
-      .Case<arith::DivSIOp>([&](auto op) { emitBinaryOp(op, "/"); })
-      .Case<arith::RemSIOp>([&](auto op) { emitBinaryOp(op, "%"); })
-      .Case<arith::RemUIOp>([&](auto op) { emitBinaryOp(op, "%"); })
+      .Case<arith::DivUIOp>([&](auto op) { emitBinaryOp(op, "/", false); })
+      .Case<arith::DivSIOp>([&](auto op) { emitBinaryOp(op, "/", true); })
+      .Case<arith::RemSIOp>([&](auto op) { emitBinaryOp(op, "%", true); })
+      .Case<arith::RemUIOp>([&](auto op) { emitBinaryOp(op, "%", false); })
+      .Case<arith::RemFOp>([&](auto op) { emitPrefixBinaryOp(op, "fmod"); })
       .Case<arith::AndIOp>([&](auto op) { emitBinaryOp(op, "&"); })
       .Case<arith::OrIOp>([&](auto op) { emitBinaryOp(op, "|"); })
       .Case<arith::XOrIOp>([&](auto op) { emitBinaryOp(op, "^"); })
       .Case<arith::ShLIOp>([&](auto op) { emitBinaryOp(op, "<<"); })
-      .Case<arith::ShRUIOp>([&](auto op) { emitBinaryOp(op, ">>"); })
-      .Case<arith::ShRSIOp>([&](auto op) { emitBinaryOp(op, ">>"); })
-      .Case<arith::FloorDivSIOp>([&](auto op) { emitBinaryOp(op, "/"); })
-      .Case<arith::CeilDivSIOp>([&](auto op) { emitBinaryOp(op, "/"); })
-      .Case<arith::CeilDivUIOp>([&](auto op) { emitBinaryOp(op, "/"); })
+      .Case<arith::ShRUIOp>([&](auto op) { emitBinaryOp(op, ">>", false); })
+      .Case<arith::ShRSIOp>([&](auto op) { emitBinaryOp(op, ">>", true); })
+      // Vitis has no ceildiv/floordiv
 
       // max/min ops
-      .Case<arith::MaxSIOp>([&](auto op) { emitMaxMinOp(op, "max"); })
-      .Case<arith::MinSIOp>([&](auto op) { emitMaxMinOp(op, "min"); })
-      .Case<arith::MaxUIOp>([&](auto op) { emitMaxMinOp(op, "max"); })
-      .Case<arith::MinUIOp>([&](auto op) { emitMaxMinOp(op, "min"); })
-      .Case<arith::MaximumFOp>([&](auto op) { emitMaxMinOp(op, "fmax"); })
-      .Case<arith::MinimumFOp>([&](auto op) { emitMaxMinOp(op, "fmin"); })
-      .Case<arith::MaxNumFOp>([&](auto op) { emitMaxMinOp(op, "fmax"); })
-      .Case<arith::MinNumFOp>([&](auto op) { emitMaxMinOp(op, "fmin"); })
+      .Case<arith::MaxSIOp>(
+          [&](auto op) { emitPrefixBinaryOp(op, "std::max"); })
+      .Case<arith::MinSIOp>(
+          [&](auto op) { emitPrefixBinaryOp(op, "std::min"); })
+      .Case<arith::MaxUIOp>(
+          [&](auto op) { emitPrefixBinaryOp(op, "std::max"); })
+      .Case<arith::MinUIOp>(
+          [&](auto op) { emitPrefixBinaryOp(op, "std::min"); })
+      .Case<arith::MaximumFOp>(
+          [&](auto op) { emitPrefixBinaryOp(op, "hls::fmax"); })
+      .Case<arith::MinimumFOp>(
+          [&](auto op) { emitPrefixBinaryOp(op, "hls::fmin"); })
+      .Case<arith::MaxNumFOp>(
+          [&](auto op) { emitPrefixBinaryOp(op, "hls::fmax"); })
+      .Case<arith::MinNumFOp>(
+          [&](auto op) { emitPrefixBinaryOp(op, "hls::fmin"); })
 
       // unary ops
       .Case<arith::NegFOp>([&](auto op) { emitUnaryOp(op, "-"); })
-      .Case<math::AbsIOp>([&](auto op) { emitUnaryOp(op, "abs"); })
-      .Case<math::AbsFOp>([&](auto op) { emitUnaryOp(op, "fabs"); })
-      .Case<math::ExpOp>([&](auto op) { emitUnaryOp(op, "exp"); })
-      .Case<math::Exp2Op>([&](auto op) { emitUnaryOp(op, "exp2"); })
-      .Case<math::LogOp>([&](auto op) { emitUnaryOp(op, "log"); })
-      .Case<math::Log2Op>([&](auto op) { emitUnaryOp(op, "log2"); })
-      .Case<math::Log10Op>([&](auto op) { emitUnaryOp(op, "log10"); })
-      .Case<math::SqrtOp>([&](auto op) { emitUnaryOp(op, "sqrt"); })
-      .Case<math::RsqrtOp>([&](auto op) { emitUnaryOp(op, "1 / sqrt"); })
-      .Case<math::SinOp>([&](auto op) { emitUnaryOp(op, "sin"); })
-      .Case<math::CosOp>([&](auto op) { emitUnaryOp(op, "cos"); })
-      .Case<math::TanOp>([&](auto op) { emitUnaryOp(op, "tan"); })
-      .Case<math::SinhOp>([&](auto op) { emitUnaryOp(op, "sinh"); })
-      .Case<math::CoshOp>([&](auto op) { emitUnaryOp(op, "cosh"); })
-      .Case<math::TanhOp>([&](auto op) { emitUnaryOp(op, "tanh"); })
-      .Case<math::PowFOp>([&](auto op) {
-        state.os << "pow(";
-        emitValue(op.getLhs());
-        state.os << ", ";
-        emitValue(op.getRhs());
-        state.os << ");";
-      })
+      .Case<math::AbsIOp>([&](auto op) { emitUnaryOp(op, "hls::abs"); })
+      .Case<math::AbsFOp>([&](auto op) { emitUnaryOp(op, "hls::fabs"); })
+      .Case<math::ExpOp>([&](auto op) { emitUnaryOp(op, "hls::exp"); })
+      .Case<math::Exp2Op>([&](auto op) { emitUnaryOp(op, "hls::exp2"); })
+      .Case<math::LogOp>([&](auto op) { emitUnaryOp(op, "hls::log"); })
+      .Case<math::Log2Op>([&](auto op) { emitUnaryOp(op, "hls::log2"); })
+      .Case<math::Log10Op>([&](auto op) { emitUnaryOp(op, "hls::log10"); })
+      .Case<math::SqrtOp>([&](auto op) { emitUnaryOp(op, "hls::sqrt"); })
+      .Case<math::RsqrtOp>([&](auto op) { emitUnaryOp(op, "hls::rsqrt"); })
+      .Case<math::SinOp>([&](auto op) { emitUnaryOp(op, "hls::sin"); })
+      .Case<math::CosOp>([&](auto op) { emitUnaryOp(op, "hls::cos"); })
+      .Case<math::TanOp>([&](auto op) { emitUnaryOp(op, "hls::tan"); })
+      .Case<math::SinhOp>([&](auto op) { emitUnaryOp(op, "hls::sinh"); })
+      .Case<math::CoshOp>([&](auto op) { emitUnaryOp(op, "hls::cosh"); })
+      .Case<math::TanhOp>([&](auto op) { emitUnaryOp(op, "hls::tanh"); })
+      .Case<math::PowFOp>([&](auto op) { emitPrefixBinaryOp(op, "hls::powf"); })
+      .Case<math::IPowIOp>([&](auto op) { emitPrefixBinaryOp(op, "hls::pow"); })
+      .Case<math::FPowIOp>(
+          [&](auto op) { emitPrefixBinaryOp(op, "hls::pown"); })
+      .Case<math::FmaOp>([&](auto op) { emitPrefixBinaryOp(op, "hls::fma"); })
+      .Case<math::AbsIOp>([&](auto op) { emitUnaryOp(op, "hls::abs"); })
+      .Case<math::AbsFOp>([&](auto op) { emitUnaryOp(op, "hls::fabs"); })
+      .Case<math::FloorOp>([&](auto op) { emitUnaryOp(op, "hls::floor"); })
+      .Case<math::CeilOp>([&](auto op) { emitUnaryOp(op, "hls::ceil"); })
+      .Case<math::TruncOp>([&](auto op) { emitUnaryOp(op, "hls::trunc"); })
+      .Case<math::RoundOp>([&](auto op) { emitUnaryOp(op, "hls::round"); })
 
       // cast ops
       .Case<arith::IndexCastOp, arith::FPToSIOp, arith::FPToUIOp,
@@ -737,6 +751,9 @@ void VivadoHLSEmitter::dispatch(Operation *op) {
   if (auto loc = dyn_cast<FileLineColLoc>(op->getLoc())) {
     state.os << "\t// " << loc.getFilename() << ":" << loc.getLine() << ":"
              << loc.getColumn() << "\n";
+  } else {
+    // ensure a new line
+    state.os << "\n";
   }
 }
 
@@ -752,6 +769,22 @@ void VivadoHLSEmitter::emitBinaryOp(Operation *op,
   os << ";";
 }
 
+void VivadoHLSEmitter::emitBinaryOp(Operation *op, llvm::StringLiteral keyword,
+                                    bool isSigned) {
+  llvm::raw_ostream &os = state.os;
+  Value result = op->getResult(0);
+  emitValue(result);
+  os << " = ";
+  os << "static_cast<"
+     << getPrimitiveTypeName(op->getOperand(0).getType(), isSigned) << ">(";
+  emitValue(op->getOperand(0));
+  os << ") " << keyword << " ";
+  os << "static_cast<"
+     << getPrimitiveTypeName(op->getOperand(1).getType(), isSigned) << ">(";
+  emitValue(op->getOperand(1));
+  os << ");";
+}
+
 void VivadoHLSEmitter::emitUnaryOp(Operation *op, llvm::StringLiteral keyword) {
   llvm::raw_ostream &os = state.os;
   Value result = op->getResult(0);
@@ -761,8 +794,8 @@ void VivadoHLSEmitter::emitUnaryOp(Operation *op, llvm::StringLiteral keyword) {
   os << ");";
 }
 
-void VivadoHLSEmitter::emitMaxMinOp(Operation *op,
-                                    llvm::StringLiteral keyword) {
+void VivadoHLSEmitter::emitPrefixBinaryOp(Operation *op,
+                                          llvm::StringLiteral keyword) {
   llvm::raw_ostream &os = state.os;
   Value result = op->getResult(0);
   emitValue(result);
@@ -771,6 +804,23 @@ void VivadoHLSEmitter::emitMaxMinOp(Operation *op,
   os << ", ";
   emitValue(op->getOperand(1));
   os << ");";
+}
+
+void VivadoHLSEmitter::emitPrefixBinaryOp(Operation *op,
+                                          llvm::StringLiteral keyword,
+                                          bool isSigned) {
+  llvm::raw_ostream &os = state.os;
+  Value result = op->getResult(0);
+  emitValue(result);
+  os << " = " << keyword << "(";
+  os << "static_cast<"
+     << getPrimitiveTypeName(op->getOperand(0).getType(), isSigned) << ">(";
+  emitValue(op->getOperand(0));
+  os << "), ";
+  os << "static_cast<"
+     << getPrimitiveTypeName(op->getOperand(1).getType(), isSigned) << ">(";
+  emitValue(op->getOperand(1));
+  os << "));";
 }
 
 static std::string getCmpIPredString(arith::CmpIPredicate pred) {
@@ -869,33 +919,6 @@ constexpr llvm::StringLiteral deviceHeader = R"XXX(
 #include <math.h>
 #include <stdint.h>
 using namespace std;
-)XXX";
-
-constexpr llvm::StringLiteral hostHeader = R"XXX(
-//===------------------------------------------------------------*- C++ -*-===//
-//
-// Automatically generated file for host
-//
-//===----------------------------------------------------------------------===//
-// standard C/C++ headers
-#include <cassert>
-#include <cstdio>
-#include <cstdlib>
-#include <string>
-#include <time.h>
-
-// vivado hls headers
-#include "kernel.h"
-#include <ap_fixed.h>
-#include <ap_int.h>
-#include <hls_stream.h>
-
-#include <ap_axi_sdata.h>
-#include <ap_fixed.h>
-#include <ap_int.h>
-#include <hls_math.h>
-#include <math.h>
-#include <stdint.h>
 )XXX";
 
 void VivadoHLSEmitter::emitModule(ModuleOp mod) {

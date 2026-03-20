@@ -10,6 +10,6 @@
 #include "mlir/IR/DialectImplementation.h"
 
 #define GET_TYPEDEF_CLASSES
-#include "allo/Dialect/AlloTypes.h.inc"
+#include "allo/IR/AlloTypes.h.inc"
 
 #endif // ALLO_TYPES_H

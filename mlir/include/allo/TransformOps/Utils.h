@@ -6,7 +6,7 @@
 #ifndef ALLO_TRANSFORM_OPS_UTILS_H
 #define ALLO_TRANSFORM_OPS_UTILS_H
 
-#include "allo/Dialect/AlloOps.h"
+#include "allo/IR/AlloOps.h"
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Affine/IR/AffineValueMap.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
