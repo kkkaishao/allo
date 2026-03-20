@@ -1,5 +1,9 @@
 #include "ir.h"
 
+#include "nanobind/stl/string_view.h"
+
+#include "llvm/Support/Signals.h"
+
 using InitFunc = void (*)(nb::module_ &);
 
 namespace {

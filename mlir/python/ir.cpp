@@ -1,5 +1,31 @@
 #include "ir.h"
 
+#include "nanobind/nanobind.h"
+#include "nanobind/stl/pair.h"
+#include "nanobind/stl/string.h"
+#include "nanobind/stl/string_view.h"
+#include "nanobind/stl/vector.h"
+
+#include "mlir/Bytecode/BytecodeWriter.h"
+#include "mlir/Dialect/Affine/IR/AffineOps.h"
+#include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/Dialect/MemRef/IR/MemRef.h"
+#include "mlir/IR/Builders.h"
+#include "mlir/IR/BuiltinOps.h"
+#include "mlir/IR/BuiltinTypes.h"
+#include "mlir/IR/Diagnostics.h"
+#include "mlir/IR/IntegerSet.h"
+#include "mlir/IR/MLIRContext.h"
+#include "mlir/IR/Verifier.h"
+#include "mlir/Parser/Parser.h"
+#include "mlir/Pass/PassManager.h"
+#include "mlir/Support/FileUtilities.h"
+#include "llvm/ADT/SmallVector.h"
+#include "llvm/Support/Signals.h"
+
+#include "allo/InitAllDialects.h"
+#include "allo/InitAllExtensions.h"
+
 using namespace mlir;
 
 static void bindContext(nb::module_ &m) {
@@ -97,29 +123,6 @@ static void bindBuilder(nb::module_ &m) {
           nb::arg("value"))
       .def("get_unknown_loc", &OpBuilder::getUnknownLoc)
       .def(
-          "create_free_block",
-          [](OpBuilder &self, Region &region,
-             const std::vector<Type> &argTypes = {},
-             std::optional<Location> loc = std::nullopt) {
-            if (loc) {
-              llvm::SmallVector<Location, 4> locs(argTypes.size(), loc.value());
-              return self.createBlock(&region, {}, argTypes, locs);
-            }
-            return self.createBlock(self.getBlock()->getParent());
-          },
-          nb::rv_policy::reference, nb::arg("region"),
-          nb::arg("arg_types") = std::vector<Type>(),
-          nb::arg("loc").none() = nb::none())
-      .def(
-          "create_block_in_region",
-          [](OpBuilder &self, Location loc, Region &region,
-             const std::vector<Type> &argTypes) {
-            llvm::SmallVector<Location, 4> locs(argTypes.size(), loc);
-            return self.createBlock(&region, {}, argTypes, locs);
-          },
-          nb::rv_policy::reference, nb::arg("loc"), nb::arg("region"),
-          nb::arg("arg_types"))
-      .def(
           "get_dict_attr",
           [](OpBuilder &self, nb::dict &dict) {
             llvm::SmallVector<NamedAttribute, 4> attrs;
@@ -148,7 +151,20 @@ static void bindBuilder(nb::module_ &m) {
            &AlloOpBuilder::getInsertionPointAndLoc)
       .def("set_insertion_point_and_loc",
            &AlloOpBuilder::setInsertionPointAndLoc, nb::arg("ip"),
-           nb::arg("new_loc"));
+           nb::arg("new_loc"))
+      .def(
+          "create_block",
+          [](AlloOpBuilder &self, Region &region,
+             const std::vector<Type> &argTypes = {}) {
+            if (!argTypes.empty()) {
+              llvm::SmallVector<Location, 4> locs(argTypes.size(),
+                                                  self.getLocation());
+              return self.createBlock(&region, {}, argTypes, locs);
+            }
+            return self.createBlock(&region);
+          },
+          nb::rv_policy::reference, nb::arg("region"),
+          nb::arg("arg_types") = std::vector<Type>());
 }
 
 static void bindCoreIR(nb::module_ &m) {
@@ -166,7 +182,7 @@ static void bindCoreIR(nb::module_ &m) {
           [](Location &self, std::string_view filename, unsigned line,
              unsigned col, MLIRContext &context) {
             StringAttr attr = StringAttr::get(&context, filename);
-            self = dyn_cast<Location>(FileLineColLoc::get(attr, line, col));
+            self = FileLineColLoc::get(attr, line, col);
           },
           nb::arg("filename"), nb::arg("line"), nb::arg("col"),
           nb::arg("context"))
@@ -179,7 +195,6 @@ static void bindCoreIR(nb::module_ &m) {
             self = dyn_cast<LocationAttr>(NameLoc::get(attr, childLoc));
           },
           nb::arg("child_loc"), nb::arg("name"), nb::arg("context"))
-      .def("get_context", &Location::getContext)
       .def("__str__",
            [](Location &self) {
              std::string str;
@@ -191,36 +206,9 @@ static void bindCoreIR(nb::module_ &m) {
           "set_name",
           [](Location &self, std::string_view name) {
             StringAttr attr = StringAttr::get(self.getContext(), name);
-            self = dyn_cast<Location>(NameLoc::get(attr, self));
+            self = NameLoc::get(attr, self);
           },
-          nb::arg("name"))
-      .def("get_col",
-           [](Location &self) {
-             if (auto fileLineColLoc = dyn_cast<FileLineColLoc>(self)) {
-               return fileLineColLoc.getColumn();
-             }
-             throw nb::value_error("Location is not a FileLineColLoc");
-           })
-      .def("get_line",
-           [](Location &self) {
-             if (auto fileLineColLoc = dyn_cast<FileLineColLoc>(self)) {
-               return fileLineColLoc.getLine();
-             }
-             throw nb::value_error("Location is not a FileLineColLoc");
-           })
-      .def("get_filename",
-           [](Location &self) {
-             if (auto fileLineColLoc = dyn_cast<FileLineColLoc>(self)) {
-               return fileLineColLoc.getFilename().str();
-             }
-             throw nb::value_error("Location is not a FileLineColLoc");
-           })
-      .def("get_name", [](Location &self) {
-        if (auto nameLoc = dyn_cast<NameLoc>(self)) {
-          return nameLoc.getName().str();
-        }
-        throw nb::value_error("Location is not a NameLoc");
-      });
+          nb::arg("name"));
 
   nb::class_<Type>(m, "Type")
       .def_static("cast", [](Type &other) { return other; })
@@ -259,69 +247,26 @@ static void bindCoreIR(nb::module_ &m) {
              self.print(os);
              return str;
            })
-      .def(
-          "set_attr",
-          [](Value &self, std::string_view name, Attribute &attr) {
-            if (Operation *defOp = self.getDefiningOp()) {
-              defOp->setAttr(name, attr);
-            } else {
-              auto arg = cast<BlockArgument>(self);
-              Block *owner = arg.getOwner();
-              if (owner->isEntryBlock() &&
-                  !isa<func::FuncOp>(owner->getParentOp())) {
-                owner->getParentOp()->setAttr(name, attr);
-              }
-            }
-          },
-          nb::arg("name"), nb::arg("attr"))
-      .def("get_context", &Value::getContext)
       .def("get_loc", &Value::getLoc)
       .def(
           "set_loc", [](Value &self, Location loc) { self.setLoc(loc); },
           nb::arg("loc"))
-      .def("get_type", [](Value &self) { return self.getType(); })
-      .def(
-          "set_type", [](Value &self, Type ty) { self.setType(ty); },
-          nb::arg("type"))
       .def(
           "replace_all_uses_with",
           [](Value &self, Value &val) { self.replaceAllUsesWith(val); },
-          nb::arg("val"));
+          nb::arg("val"))
+      .def("get_type", &Value::getType);
 
   nb::class_<Attribute>(m, "Attribute")
       .def_static("cast", [](Attribute &other) { return other; })
-      .def("__str__",
-           [](Attribute &self) {
-             std::string str;
-             llvm::raw_string_ostream os(str);
-             self.print(os);
-             return os.str();
-           })
-      .def("get_context", &Attribute::getContext);
+      .def("__str__", [](Attribute &self) {
+        std::string str;
+        llvm::raw_string_ostream os(str);
+        self.print(os);
+        return os.str();
+      });
 
-  nb::class_<Region>(m, "Region")
-      .def("get_context", &Region::getContext)
-      .def("get_parent_region", &Region::getParentRegion,
-           nb::rv_policy::reference)
-      .def("size", [](Region &self) { return self.getBlocks().size(); })
-      .def("empty", &Region::empty)
-      .def(
-          "front", [](Region &self) { return &self.front(); },
-          nb::rv_policy::reference)
-      .def(
-          "back", [](Region &self) { return &self.back(); },
-          nb::rv_policy::reference)
-      .def(
-          "push_back",
-          [](Region &self, Block *block) { self.push_back(block); },
-          nb::arg("block"))
-      .def(
-          "push_front",
-          [](Region &self, Block *block) { self.push_front(block); },
-          nb::arg("block"))
-      .def(
-          "emplace_block", [](Region &self) { return &self.emplaceBlock(); },
-          nb::rv_policy::reference);
+  (void)nb::class_<Region>(m, "Region");
 
   nb::class_<Block>(m, "Block")
       .def(
@@ -363,10 +308,6 @@ static void bindCoreIR(nb::module_ &m) {
           nb::arg("type"), nb::arg("loc"))
       .def("get_parent_region", &Block::getParent, nb::rv_policy::reference)
       .def("get_parent_op", &Block::getParentOp, nb::rv_policy::reference)
-      .def("insert_before", &Block::insertBefore, nb::arg("block"))
-      .def(
-          "move_before", [](Block &self, Block &dst) { self.moveBefore(&dst); },
-          nb::arg("dst"))
       .def("__str__",
            [](Block &self) {
              std::string str;
@@ -397,20 +338,12 @@ static void bindCoreIR(nb::module_ &m) {
 
   // Base Operation class
   nb::class_<Operation>(m, "Operation")
-      .def("get_context", &Operation::getContext)
       .def("get_loc", &Operation::getLoc)
       .def("get_name",
            [](Operation &self) { return self.getName().getStringRef().str(); })
       .def("erase", &Operation::erase);
 
   nb::class_<OpState>(m, "OpState")
-      .def("__init__",
-           [](OpState &self) {
-             throw nb::type_error("OpState cannot be directly instantiated, "
-                                  "use an Op's getState() "
-                                  "method to get an OpState");
-           })
-      .def("get_context", &OpState::getContext)
       .def("get_loc", &OpState::getLoc)
       .def(
           "set_attr",
@@ -418,12 +351,6 @@ static void bindCoreIR(nb::module_ &m) {
             self->setAttr(name, attr);
           },
           nb::arg("name"), nb::arg("attr"))
-      .def(
-          "get_attribute",
-          [](OpState &self, std::string_view attrName) {
-            return self->getAttr(attrName);
-          },
-          nb::arg("attr_name"))
       .def("get_num_operands",
            [](OpState &self) { return self->getNumOperands(); })
       .def(
@@ -435,6 +362,13 @@ static void bindCoreIR(nb::module_ &m) {
             return self->getOperand(idx);
           },
           nb::arg("idx"))
+      .def("get_operands",
+           [](OpState &self) {
+             std::vector<Value> operands;
+             for (auto operand : self->getOperands())
+               operands.push_back(operand);
+             return operands;
+           })
       .def("get_num_results",
            [](OpState &self) { return self->getNumResults(); })
       .def(
@@ -475,14 +409,6 @@ static void bindCoreIR(nb::module_ &m) {
              llvm::raw_string_ostream os(str);
              auto printingFlags = getOpPrintingFlags();
              self->print(os, printingFlags);
-             return os.str();
-           })
-      .def("dump_with_loc",
-           [](OpState &self) {
-             std::string str;
-             llvm::raw_string_ostream os(str);
-             auto printingFlags = getOpPrintingFlags(true);
-             self.print(os, printingFlags);
              return os.str();
            })
       .def("verify",
@@ -544,16 +470,7 @@ static void bindTypes(nb::module_ &m) {
           [](unsigned width, MLIRContext &context) {
             return IntegerType::get(&context, width);
           },
-          nb::arg("width"), nb::arg("context"))
-      .def_static(
-          "get_width",
-          [](Type &ty) {
-            if (auto intType = dyn_cast<IntegerType>(ty)) {
-              return intType.getWidth();
-            }
-            throw nb::type_error("Type is not an IntegerType");
-          },
-          nb::arg("ty"));
+          nb::arg("width"), nb::arg("context"));
 
   nb::class_<IndexType, Type>(m, "IndexType")
       .def_static(
@@ -587,98 +504,31 @@ static void bindTypes(nb::module_ &m) {
           [](MLIRContext &context) { return BFloat16Type::get(&context); },
           nb::arg("context"));
 
-  nb::class_<UnrankedTensorType, Type>(m, "UnrankedTensorType")
-      .def_static(
-          "get",
-          [](Type elementType) { return UnrankedTensorType::get(elementType); },
-          nb::arg("element_type"))
-      .def("get_element_type",
-           [](UnrankedTensorType &self) { return self.getElementType(); });
-
   // RankedTensorType
   nb::class_<RankedTensorType, Type>(m, "RankedTensorType")
       .def_static(
           "get",
           [](const std::vector<int64_t> &shape, Type elementType,
-             std::optional<Attribute> encoding) {
-            return RankedTensorType::get(shape, elementType,
-                                         encoding.value_or(Attribute()));
+             Attribute encoding = {}) {
+            return RankedTensorType::get(shape, elementType, encoding);
           },
           nb::arg("shape"), nb::arg("element_type"),
-          nb::arg("encoding").none() = nb::none())
-      .def("get_encoding", &RankedTensorType::getEncoding)
-      .def("get_element_type",
-           [](RankedTensorType &self) { return self.getElementType(); })
-      .def("get_shape",
-           [](RankedTensorType &self) {
-             auto shape = self.getShape();
-             std::vector<int64_t> ret;
-             for (auto dim : shape) {
-               ret.push_back(dim);
-             }
-             return ret;
-           })
-      .def("get_rank", &RankedTensorType::getRank)
-      .def(
-          "get_dim_size_at",
-          [](RankedTensorType &self, unsigned index) {
-            if (index >= self.getRank()) {
-              throw nb::index_error("tensor type dimension index out of range");
-            }
-            return self.getDimSize(index);
-          },
-          nb::arg("index"))
-      .def(
-          "set_element_type",
-          [](RankedTensorType &self, Type newElementType) {
-            return RankedTensorType::get(self.getShape(), newElementType,
-                                         self.getEncoding());
-          },
-          nb::arg("type"));
-
-  nb::class_<UnrankedMemRefType, Type>(m, "UnrankedMemRefType")
-      .def_static(
-          "get",
-          [](Type elementType, std::optional<Attribute> memorySpace) {
-            return UnrankedMemRefType::get(elementType,
-                                           memorySpace.value_or(Attribute{}));
-          },
-          nb::arg("element_type"), nb::arg("memory_space").none() = nb::none())
-      .def("get_element_type",
-           [](UnrankedMemRefType &self) { return self.getElementType(); });
+          nb::arg("encoding") = Attribute{});
 
   nb::class_<MemRefType, Type>(m, "MemRefType")
       .def_static(
           "get",
           [](const std::vector<int64_t> &shape, Type elementType, AffineMap map,
-             std::optional<Attribute> memorySpace) {
-            return MemRefType::get(shape, elementType, map,
-                                   memorySpace.value_or(IntegerAttr()));
+             Attribute memorySpace = {}) {
+            return MemRefType::get(shape, elementType, map, memorySpace);
           },
           nb::arg("shape"), nb::arg("element_type"), nb::arg("affine_maps"),
-          nb::arg("memory_space").none() = nb::none())
-      .def("get_element_type",
-           [](MemRefType &self) { return self.getElementType(); })
-      .def("get_shape",
-           [](MemRefType &self) {
-             auto shape = self.getShape();
-             std::vector<int64_t> ret;
-             for (auto dim : shape) {
-               ret.push_back(dim);
-             }
-             return ret;
-           })
-      .def("get_rank", &MemRefType::getRank);
+          nb::arg("memory_space") = Attribute{});
 }
 
 static void bindValues(nb::module_ &m) {
-  nb::class_<BlockArgument, Value>(m, "BlockArgument")
-      .def("get_arg_number", &BlockArgument::getArgNumber)
-      .def("get_owner", &BlockArgument::getOwner, nb::rv_policy::reference);
-
-  nb::class_<OpResult, Value>(m, "OpResult")
-      .def("get_owner", &OpResult::getOwner, nb::rv_policy::reference)
-      .def("get_res_no", &OpResult::getResultNumber);
+  (void)nb::class_<BlockArgument, Value>(m, "BlockArgument");
+  (void)nb::class_<OpResult, Value>(m, "OpResult");
 }
 
 static void bindAttributes(nb::module_ &m) {
@@ -686,10 +536,7 @@ static void bindAttributes(nb::module_ &m) {
       .def_static(
           "get",
           [](Type ty, int64_t value) { return IntegerAttr::get(ty, value); },
-          nb::arg("ty"), nb::arg("value"))
-      .def("get_signless", &IntegerAttr::getInt)
-      .def("get_signed", &IntegerAttr::getSInt)
-      .def("get_unsigned", &IntegerAttr::getUInt);
+          nb::arg("ty"), nb::arg("value"));
 
   nb::class_<FloatAttr, Attribute>(m, "FloatAttr")
       .def_static(
@@ -708,8 +555,7 @@ static void bindAttributes(nb::module_ &m) {
           [](std::string_view value, MLIRContext &context) {
             return StringAttr::get(&context, value);
           },
-          nb::arg("value"), nb::arg("context"))
-      .def("get_value", [](StringAttr &self) { return self.getValue().str(); });
+          nb::arg("value"), nb::arg("context"));
 
   nb::class_<BoolAttr, Attribute>(m, "BoolAttr")
       .def_static(
@@ -726,8 +572,7 @@ static void bindAttributes(nb::module_ &m) {
              const std::vector<int32_t> &values) -> DenseI32ArrayAttr {
             return DenseI32ArrayAttr::get(&context, values);
           },
-          nb::arg("context"), nb::arg("values"))
-      .def("size", [](DenseI32ArrayAttr &self) { return self.getSize(); });
+          nb::arg("context"), nb::arg("values"));
 
   nb::class_<DenseI64ArrayAttr, Attribute>(m, "DenseI64ArrayAttr")
       .def_static(
@@ -736,8 +581,7 @@ static void bindAttributes(nb::module_ &m) {
              const std::vector<int64_t> &values) -> DenseI64ArrayAttr {
             return DenseI64ArrayAttr::get(&context, values);
           },
-          nb::arg("context"), nb::arg("values"))
-      .def("size", [](DenseI64ArrayAttr &self) { return self.getSize(); });
+          nb::arg("context"), nb::arg("values"));
 
   nb::class_<FlatSymbolRefAttr, Attribute>(m, "FlatSymbolRefAttr")
       .def_static(
@@ -745,9 +589,7 @@ static void bindAttributes(nb::module_ &m) {
           [](std::string_view value, MLIRContext &context) {
             return FlatSymbolRefAttr::get(&context, value);
           },
-          nb::arg("value"), nb::arg("context"))
-      .def("get_value",
-           [](FlatSymbolRefAttr &self) { return self.getValue().str(); });
+          nb::arg("value"), nb::arg("context"));
 
   nb::class_<StridedLayoutAttr, Attribute>(m, "StridedLayoutAttr")
       .def_static(
@@ -756,16 +598,7 @@ static void bindAttributes(nb::module_ &m) {
              const std::vector<int64_t> &strides) {
             return StridedLayoutAttr::get(&context, offset, strides);
           },
-          nb::arg("context"), nb::arg("offset"), nb::arg("strides"))
-      .def("get_strides",
-           [](StridedLayoutAttr &self) {
-             std::vector<int64_t> strides;
-             for (auto stride : self.getStrides()) {
-               strides.push_back(stride);
-             }
-             return strides;
-           })
-      .def("get_offset", &StridedLayoutAttr::getOffset);
+          nb::arg("context"), nb::arg("offset"), nb::arg("strides"));
 
   nb::class_<DictionaryAttr, Attribute>(m, "DictionaryAttr")
       .def_static(
@@ -784,8 +617,7 @@ static void bindAttributes(nb::module_ &m) {
 
   nb::class_<TypeAttr, Attribute>(m, "TypeAttr")
       .def_static(
-          "get", [](Type ty) { return TypeAttr::get(ty); }, nb::arg("type"))
-      .def("get_type", &TypeAttr::getValue);
+          "get", [](Type ty) { return TypeAttr::get(ty); }, nb::arg("type"));
 }
 
 static void bindAffineObjects(nb::module_ &m) {
@@ -805,9 +637,6 @@ static void bindAffineObjects(nb::module_ &m) {
           },
           nb::arg("num_dims"), nb::arg("num_symbols"), nb::arg("constraints"),
           nb::arg("context"))
-      .def("get_num_dims", &IntegerSet::getNumDims)
-      .def("get_num_symbols", &IntegerSet::getNumSymbols)
-      .def("get_num_constraints", &IntegerSet::getNumConstraints)
       .def("__str__", [](IntegerSet &self) {
         std::string str;
         llvm::raw_string_ostream os(str);
@@ -870,38 +699,13 @@ static void bindAffineObjects(nb::module_ &m) {
             return AffineMap::getMultiDimIdentityMap(dimCount, &context);
           },
           nb::arg("dim_count"), nb::arg("context"))
-      .def("get_num_dims", &AffineMap::getNumDims)
-      .def("get_num_symbols", &AffineMap::getNumSymbols)
-      .def("get_num_results", &AffineMap::getNumResults)
       .def("get_sub_map", &AffineMap::getSubMap)
-      .def("__str__",
-           [](AffineMap &self) {
-             std::string str;
-             llvm::raw_string_ostream os(str);
-             self.print(os);
-             return os.str();
-           })
-      .def("simplify", [](AffineMap &self) { self = simplifyAffineMap(self); });
-
-  nb::class_<affine::AffineBound>(m, "AffineBound")
-      .def("get_map", &affine::AffineBound::getMap)
-      .def("get_operands", [](affine::AffineBound &self) {
-        std::vector<Value> vals;
-        for (Value val : self.getOperands()) {
-          vals.push_back(val);
-        }
-        return vals;
+      .def("__str__", [](AffineMap &self) {
+        std::string str;
+        llvm::raw_string_ostream os(str);
+        self.print(os);
+        return os.str();
       });
-
-  // some utils
-  m.def("fully_compose_affine_map",
-        [](AffineMap &map, const std::vector<Value> &operands) {
-          AffineMap composedMap = map;
-          SmallVector<Value, 4> ops(operands.begin(), operands.end());
-          affine::fullyComposeAffineMapAndOperands(&composedMap, &ops, true);
-          affine::canonicalizeMapAndOperands(&composedMap, &ops);
-          return std::make_pair(composedMap, ops);
-        });
 }
 
 void bindIR(nb::module_ &m) {

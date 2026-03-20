@@ -1,5 +1,27 @@
 #include "ir.h"
 
+#include "nanobind/nanobind.h"
+#include "nanobind/stl/pair.h"
+#include "nanobind/stl/string.h"
+#include "nanobind/stl/string_view.h"
+#include "nanobind/stl/vector.h"
+
+#include <utility>
+
+#include "mlir/Dialect/Linalg/TransformOps/DialectExtension.h"
+#include "mlir/Dialect/Linalg/TransformOps/LinalgTransformOps.h"
+#include "mlir/Dialect/MemRef/TransformOps/MemRefTransformOps.h"
+#include "mlir/Dialect/SCF/TransformOps/SCFTransformOps.h"
+#include "mlir/Dialect/Tensor/TransformOps/TensorTransformOps.h"
+#include "mlir/Dialect/Transform/IR/TransformOps.h"
+#include "mlir/Dialect/Transform/LoopExtension/LoopExtensionOps.h"
+#include "mlir/Dialect/Transform/Transforms/TransformInterpreterUtils.h"
+#include "mlir/Dialect/Vector/TransformOps/VectorTransformOps.h"
+
+#include "llvm/Support/SourceMgr.h"
+
+#include "allo/TransformOps/AlloTransformOps.h"
+
 using namespace mlir;
 
 void bindTransform(nb::module_ &m) {

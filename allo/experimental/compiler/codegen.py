@@ -764,9 +764,9 @@ class CodeGenerator(ast.NodeVisitor):
         with EnterSubRegion(self):
             ip, last_loc = self.builder.get_insertion_point_and_loc()
             parent_region = ip.get_block().get_parent_region()
-            then_block = self.builder.create_free_block(parent_region)
-            else_block = self.builder.create_free_block(parent_region)
-            end_if = self.builder.create_free_block(parent_region)
+            then_block = self.builder.create_block(parent_region)
+            else_block = self.builder.create_block(parent_region)
+            end_if = self.builder.create_block(parent_region)
 
             # branch out from current block to then/else
             self.builder.set_insertion_point_and_loc(ip, last_loc)
@@ -818,8 +818,8 @@ class CodeGenerator(ast.NodeVisitor):
             ip, last_loc = self.builder.get_insertion_point_and_loc()
 
             parent_region = ip.get_block().get_parent_region()
-            then_block = self.builder.create_free_block(parent_region)
-            else_block = self.builder.create_free_block(parent_region)
+            then_block = self.builder.create_block(parent_region)
+            else_block = self.builder.create_block(parent_region)
 
             # compute phi arguments
             self.scf_stack.append(node)
@@ -1063,7 +1063,7 @@ class CodeGenerator(ast.NodeVisitor):
     def _test_loop_iter_args(self, node, liveins: dict, ignore: set[str]):
         ip, last_loc = self.builder.get_insertion_point_and_loc()
         # create dummy block
-        block = self.builder.create_free_block(ip.get_block().get_parent_region())
+        block = self.builder.create_block(ip.get_block().get_parent_region())
         self.builder.set_insertion_point_to_start(block)
         # dry visit
         self.scf_stack.append(node)
@@ -1185,8 +1185,8 @@ class CodeGenerator(ast.NodeVisitor):
             while_op = scf.WhileOp(self.builder, init_ir_types, init_handles)
 
             # create before region
-            before_block = self.builder.create_free_block(
-                while_op.get_before(), init_ir_types, self.builder.get_loc()
+            before_block = self.builder.create_block(
+                while_op.get_before(), init_ir_types
             )
             self.builder.set_insertion_point_to_start(before_block)
             block_args = before_block.get_args()
@@ -1203,9 +1203,7 @@ class CodeGenerator(ast.NodeVisitor):
             scf.ConditionOp(self.builder, cond.handle, block_args)
 
             # create after region
-            after_block = self.builder.create_free_block(
-                while_op.get_after(), init_ir_types, self.builder.get_loc()
-            )
+            after_block = self.builder.create_block(while_op.get_after(), init_ir_types)
             self.builder.set_insertion_point_to_start(after_block)
             body_handles = after_block.get_args()
             for name, arg, ty in zip(names, body_handles, init_types):

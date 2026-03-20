@@ -6,61 +6,8 @@
 #ifndef ALLO_PYTHON_IR_H
 #define ALLO_PYTHON_IR_H
 
-#include "nanobind/nanobind.h"
-#include "nanobind/stl/function.h"
-#include "nanobind/stl/optional.h"
-#include "nanobind/stl/pair.h"
-#include "nanobind/stl/string.h"
-#include "nanobind/stl/string_view.h"
-#include "nanobind/stl/unique_ptr.h"
-#include "nanobind/stl/vector.h"
-
-#include <tuple>
-#include <type_traits>
-#include <utility>
-
-#include "mlir/Bytecode/BytecodeWriter.h"
-#include "mlir/Dialect/Affine/IR/AffineOps.h"
-#include "mlir/Dialect/Arith/IR/Arith.h"
-#include "mlir/Dialect/Bufferization/TransformOps/BufferizationTransformOps.h"
-#include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
-#include "mlir/Dialect/Func/IR/FuncOps.h"
-#include "mlir/Dialect/Linalg/IR/Linalg.h"
-#include "mlir/Dialect/Linalg/TransformOps/DialectExtension.h"
-#include "mlir/Dialect/Linalg/TransformOps/LinalgTransformOps.h"
-#include "mlir/Dialect/Math/IR/Math.h"
-#include "mlir/Dialect/MemRef/IR/MemRef.h"
-#include "mlir/Dialect/MemRef/TransformOps/MemRefTransformOps.h"
-#include "mlir/Dialect/SCF/IR/SCF.h"
-#include "mlir/Dialect/SCF/TransformOps/SCFTransformOps.h"
-#include "mlir/Dialect/Tensor/IR/Tensor.h"
-#include "mlir/Dialect/Tensor/TransformOps/TensorTransformOps.h"
-#include "mlir/Dialect/Transform/IR/TransformOps.h"
-#include "mlir/Dialect/Transform/LoopExtension/LoopExtensionOps.h"
-#include "mlir/Dialect/Transform/Transforms/TransformInterpreterUtils.h"
-#include "mlir/Dialect/Vector/TransformOps/VectorTransformOps.h"
 #include "mlir/IR/Builders.h"
-#include "mlir/IR/BuiltinOps.h"
-#include "mlir/IR/BuiltinTypes.h"
-#include "mlir/IR/Diagnostics.h"
-#include "mlir/IR/IntegerSet.h"
-#include "mlir/IR/MLIRContext.h"
-#include "mlir/IR/Verifier.h"
-#include "mlir/Interfaces/MemOpInterfaces.h"
-#include "mlir/Parser/Parser.h"
-#include "mlir/Pass/PassManager.h"
-#include "mlir/Support/FileUtilities.h"
-#include "llvm/ADT/DenseMap.h"
-#include "llvm/ADT/SmallVector.h"
-#include "llvm/ADT/StringMap.h"
-#include "llvm/Support/Format.h"
-#include "llvm/Support/Signals.h"
-#include "llvm/Support/SourceMgr.h"
-
-#include "allo/Dialect/AlloOps.h"
-#include "allo/InitAllDialects.h"
-#include "allo/InitAllExtensions.h"
-#include "allo/TransformOps/AlloTransformOps.h"
+#include "nanobind/nanobind.h"
 
 namespace nb = nanobind;
 

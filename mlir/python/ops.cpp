@@ -1,5 +1,23 @@
 #include "ir.h"
 
+#include "nanobind/nanobind.h"
+#include "nanobind/stl/string.h"
+#include "nanobind/stl/string_view.h"
+#include "nanobind/stl/vector.h"
+
+#include "mlir/Bytecode/BytecodeWriter.h"
+#include "mlir/Dialect/Affine/IR/AffineOps.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
+#include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/Dialect/Linalg/IR/Linalg.h"
+#include "mlir/Dialect/Math/IR/Math.h"
+#include "mlir/Dialect/MemRef/IR/MemRef.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/Dialect/Tensor/IR/Tensor.h"
+#include "mlir/Dialect/UB/IR/UBOps.h"
+#include "mlir/IR/IntegerSet.h"
+
 using namespace mlir;
 
 void bindFuncOps(nb::module_ &m) {
@@ -88,19 +106,7 @@ void bindAffineOps(nb::module_ &m) {
       .def("get_induction_var", &affine::AffineForOp::getInductionVar)
       .def(
           "get_body", [](affine::AffineForOp &self) { return self.getBody(); },
-          nb::rv_policy::reference)
-      .def("get_upper_bound", &affine::AffineForOp::getUpperBound)
-      .def("get_lower_bound", &affine::AffineForOp::getLowerBound)
-      .def("get_constant_upper_bound",
-           &affine::AffineForOp::getConstantUpperBound)
-      .def("get_constant_lower_bound",
-           &affine::AffineForOp::getConstantLowerBound)
-      .def("get_has_constant_lower_bound",
-           &affine::AffineForOp::hasConstantLowerBound)
-      .def("get_has_constant_upper_bound",
-           &affine::AffineForOp::hasConstantUpperBound)
-      .def("get_step", &affine::AffineForOp::getStepAsInt)
-      .def("has_constant_bounds", &affine::AffineForOp::hasConstantBounds);
+          nb::rv_policy::reference);
 
   auto affineIf = bindOp<affine::AffineIfOp>(m, "AffineIfOp");
   bindConstructor(
@@ -126,13 +132,6 @@ void bindAffineOps(nb::module_ &m) {
                                             memref, map, operands);
       },
       nb::arg("memref"), nb::arg("map"), nb::arg("operands"));
-  affineLoad.def("get_value", &affine::AffineLoadOp::getValue)
-      .def("get_memref", &affine::AffineLoadOp::getMemRef)
-      .def("get_map", &affine::AffineLoadOp::getAffineMap)
-      .def("get_operands", [](affine::AffineLoadOp &self) {
-        auto operands = self.getMapOperands();
-        return std::vector<Value>(operands.begin(), operands.end());
-      });
 
   auto affineStore = bindOp<affine::AffineStoreOp>(m, "AffineStoreOp");
   bindConstructor(
@@ -143,15 +142,6 @@ void bindAffineOps(nb::module_ &m) {
                                              value, memref, map, operands);
       },
       nb::arg("value"), nb::arg("memref"), nb::arg("map"), nb::arg("operands"));
-  affineStore
-      .def("get_value",
-           [](affine::AffineStoreOp &self) { return self.getValueToStore(); })
-      .def("get_memref", &affine::AffineStoreOp::getMemRef)
-      .def("get_map", &affine::AffineStoreOp::getAffineMap)
-      .def("get_operands", [](affine::AffineStoreOp &self) {
-        auto operands = self.getMapOperands();
-        return std::vector<Value>(operands.begin(), operands.end());
-      });
 
   auto affineApply = bindOp<affine::AffineApplyOp>(m, "AffineApplyOp");
   bindConstructor(
@@ -162,11 +152,6 @@ void bindAffineOps(nb::module_ &m) {
                                              map, operands);
       },
       nb::arg("map"), nb::arg("operands"));
-  affineApply.def("get_map", &affine::AffineApplyOp::getAffineMap)
-      .def("get_operands", [](affine::AffineApplyOp &self) {
-        auto operands = self.getMapOperands();
-        return std::vector<Value>(operands.begin(), operands.end());
-      });
 }
 
 void bindSCFOps(nb::module_ &m) {
