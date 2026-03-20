@@ -25,6 +25,7 @@ from ..core.types import (
     unwrap_if_constexpr,
     torch_types_to_core_types_map,
 )
+from .._C.ir import ModuleOp
 
 P = ParamSpec("P")
 R = TypeVar("R")
@@ -112,6 +113,7 @@ class Kernel(Generic[P, R]):
         self.attr = attr
         self.mapping = mapping
         self.is_top = is_top
+        self.module = None
 
         self.__name__ = fn.__name__
         self.__doc__ = fn.__doc__
@@ -145,17 +147,30 @@ class Kernel(Generic[P, R]):
         out += f"<{self.func_name} at {self.file_name}:{self.begin_line}>"
         return out
 
+    def schedule(self):
+        from ..schedule import Schedule
+
+        """Get the schedule object for this kernel. Kernel must be compiled before calling this method."""
+        if self.module is None:
+            raise RuntimeError(
+                f"Kernel {self.func_name} has not been compiled. Please compile the kernel before scheduling."
+            )
+        else:
+            return Schedule.from_module(self.module)
+
     def compile(
         self,
         arg_types: Sequence[BaseType | str] = [],
         res_types: Sequence[BaseType | str] = [],
     ):
+        """Compile the kernel with explicitly provided argument and return types."""
         from ..compiler.codegen import compile
 
         module = compile(self, arg_types=arg_types, res_types=res_types)
         return module
 
     def __call__(self, *args: P.args, **kwargs: P.kwargs):
+        """Compile the kernel with argument types inferred at callsite and return types from annotations"""
         from ..compiler.codegen import compile
 
         arg_types = self.specialize_arg_types(*args, **kwargs)
@@ -228,6 +243,25 @@ class Kernel(Generic[P, R]):
         if isinstance(annotation, tuple):
             return [self.parse_type_annotation(elt) for elt in annotation]
         return [self.parse_type_annotation(annotation)]
+
+
+def schedule(k: Kernel):
+    """Get the schedule object for a kernel. Kernel must be compiled before calling this function."""
+    from ..schedule import Schedule
+
+    if isinstance(k, Kernel):
+        if k.module is None:
+            raise RuntimeError(
+                f"Kernel {k.func_name} has not been compiled. Please compile the kernel before scheduling."
+            )
+        else:
+            return Schedule.from_module(k.module)
+    elif isinstance(k, ModuleOp):
+        return Schedule.from_module(k)
+    else:
+        raise TypeError(
+            f"Unsupported type for scheduling: {type(k)}. Expected Kernel or ModuleOp."
+        )
 
 
 class ConstevalFunction(Generic[P, R]):

@@ -1,7 +1,7 @@
 # Copyright Allo authors. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-from .kernel import accelerator, kernel, consteval
+from .kernel import accelerator, kernel, consteval, schedule
 from .types import (
     DType,
     BufferType,

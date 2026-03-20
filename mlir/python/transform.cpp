@@ -184,8 +184,8 @@ void bindTransform(nb::module_ &m) {
   bindConstructor(
       matchOp,
       [](AlloOpBuilder &builder, Value &target, Type &resType,
-         const std::vector<std::string> &opNames,
-         std::optional<DictionaryAttr> opAttrs) {
+         const std::vector<std::string> &opNames = {},
+         DictionaryAttr opAttrs = {}) {
         auto match = transform::MatchOp::create(builder, builder.getLocation(),
                                                 resType, target);
         if (!opNames.empty()) {
@@ -195,12 +195,11 @@ void bindTransform(nb::module_ &m) {
           auto opNamesAttr = builder.getStrArrayAttr(opNamesRef);
           match->setAttr(match.getOpsAttrName(), opNamesAttr);
         }
-        if (opAttrs.has_value())
-          match->setAttr(match.getOpAttrsAttrName(), *opAttrs);
+        match->setAttr(match.getOpAttrsAttrName(), opAttrs);
         return match;
       },
       nb::arg("target"), nb::arg("res_type"), nb::arg("op_names"),
-      nb::arg("op_attrs") = std::nullopt);
+      nb::arg("op_attrs") = DictionaryAttr());
 
   auto mergeHandles = bindOp<transform::MergeHandlesOp>(m, "MergeHandlesOp");
   bindConstructor(

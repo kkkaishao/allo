@@ -4,3 +4,4 @@
 from .core.kernel import kernel, accelerator, consteval
 from .compiler.codegen import compile
 from .dsl import *
+from .core.kernel import schedule

@@ -425,7 +425,8 @@ static void bindCoreIR(nb::module_ &m) {
       .def(
           "push_back",
           [](ModuleOp &self, Operation *op) { self.getBody()->push_back(op); },
-          nb::arg("op"));
+          nb::arg("op"))
+      .def("get_context", &ModuleOp::getContext, nb::rv_policy::reference);
 }
 
 static void bindTypes(nb::module_ &m) {
