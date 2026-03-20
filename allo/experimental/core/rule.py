@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from typing import List
-from .types import APInt, APFloat, fp32, fp64, fp16, DType, IndexType, index
+from .types import APInt, APFloat, fp32, fp64, DType, IndexType, index, int1
 
 
 # temporary int/uint class to distinguish between signed and unsigned integers
@@ -69,16 +69,62 @@ class TypeTable:
         return cls._REGISTRY[op_key].call_unary(t)
 
 
+class CppTypeTable:
+    _REGISTRY = {}
+
+    @classmethod
+    def register(cls, op_keys: List[str], rule_obj):
+        if not isinstance(op_keys, (list, tuple)):
+            op_keys = [op_keys]
+        for k in op_keys:
+            cls._REGISTRY[k] = rule_obj
+
+    @classmethod
+    def lookup_binary(cls, op_key: str, t1, t2) -> DType | None:
+        if op_key not in cls._REGISTRY:
+            return None
+        return cls._REGISTRY[op_key].call_binary(t1, t2)
+
+    @classmethod
+    def lookup_unary(cls, op_key: str, t) -> DType | None:
+        if op_key not in cls._REGISTRY:
+            return None
+        return cls._REGISTRY[op_key].call_unary(t)
+
+
+def select_cpp_common_int_type(t1: DType, t2: DType) -> APInt:
+    assert t1.is_int_signless() and t2.is_int_signless()
+
+    w1, w2 = t1.primitive_width, t2.primitive_width
+    s1, s2 = t1.is_int(), t2.is_int()
+
+    if s1 == s2:
+        return APInt(max(w1, w2), signed=s1)
+
+    ws = w1 if s1 else w2
+    wu = w2 if s1 else w1
+    if wu >= ws:
+        return APInt(wu, signed=False)
+    return APInt(ws, signed=True)
+
+
+def select_hls_common_int_type(t1: DType, t2: DType) -> APInt:
+    return select_cpp_common_int_type(t1, t2)
+
+
+def _select_wider_float_type(t1: APFloat, t2: APFloat) -> APFloat:
+    return t1 if t1.primitive_width >= t2.primitive_width else t2
+
+
 def add_sub_rule():
+    # In HLS style, index is treated as an opaque type and does not mix with
+    # int/uint/float in implicit promotion rules.
     int_rules = {
         (int, int): lambda t1, t2: APInt(
             max(t1.primitive_width, t2.primitive_width) + 1
         ),
         (int, uint): lambda t1, t2: APInt(
             max(t1.primitive_width, t2.primitive_width + 1) + 1
-        ),
-        (int, IndexType): lambda t1, t2: APInt(
-            max(t1.primitive_width, t2.primitive_width) + 1
         ),
         (int, APFloat): lambda t1, t2: t2,
     }
@@ -89,20 +135,10 @@ def add_sub_rule():
         (uint, int): lambda t1, t2: APInt(
             max(t1.primitive_width + 1, t2.primitive_width) + 1
         ),
-        (uint, IndexType): lambda t1, t2: APInt(
-            max(t1.primitive_width, t2.primitive_width) + 1, signed=False
-        ),
         (uint, APFloat): lambda t1, t2: t2,
     }
     index_rules = {
-        (IndexType, int): lambda t1, t2: APInt(
-            max(t1.primitive_width + 1, t2.primitive_width) + 1
-        ),
-        (IndexType, uint): lambda t1, t2: APInt(
-            max(t1.primitive_width, t2.primitive_width) + 1, signed=False
-        ),
         (IndexType, IndexType): lambda t1, t2: index,
-        (IndexType, APFloat): lambda t1, t2: t2,
     }
     float_rules = {
         (APFloat, APFloat): lambda t1, t2: (
@@ -110,7 +146,6 @@ def add_sub_rule():
         ),
         (APFloat, int): lambda t1, t2: t1,
         (APFloat, uint): lambda t1, t2: t1,
-        (APFloat, IndexType): lambda t1, t2: t1,
     }
     return TypingRule([int_rules, uint_rules, index_rules, float_rules])
 
@@ -120,7 +155,6 @@ def mul_rule():
         (int, int): lambda t1, t2: APInt(t1.primitive_width + t2.primitive_width),
         (int, uint): lambda t1, t2: APInt(t1.primitive_width + t2.primitive_width),
         (int, APFloat): lambda t1, t2: t2,
-        (int, IndexType): lambda t1, t2: APInt(t1.primitive_width + t2.primitive_width),
     }
     uint_rules = {
         (uint, uint): lambda t1, t2: APInt(
@@ -128,9 +162,6 @@ def mul_rule():
         ),
         # (uint, int): lambda t1, t2: apint(t1.primitive_width + t2.primitive_width),
         (uint, APFloat): lambda t1, t2: t2,
-        (uint, IndexType): lambda t1, t2: APInt(
-            t1.primitive_width + t2.primitive_width, signed=False
-        ),
     }
     index_rules = {
         # (IndexType, int): lambda t1, t2: apint(t1.primitive_width + t2.primitive_width),
@@ -138,7 +169,6 @@ def mul_rule():
         #     t1.primitive_width + t2.primitive_width, signed=False
         # ),
         (IndexType, IndexType): lambda t1, t2: index,
-        (IndexType, APFloat): lambda t1, t2: t2,
     }
     float_rules = {
         (APFloat, APFloat): lambda t1, t2: (
@@ -156,22 +186,17 @@ def mul_rule():
 
 def div_rule():
     int_rules = {
-        (int, int): lambda t1, t2: t1,
-        (int, uint): lambda t1, t2: t1,
-        (int, IndexType): lambda t1, t2: t1,
+        (int, int): select_hls_common_int_type,
+        (int, uint): select_hls_common_int_type,
         (int, APFloat): lambda t1, t2: t2,
     }
     uint_rules = {
-        (uint, uint): lambda t1, t2: t1,
-        (uint, int): lambda t1, t2: APInt(t1.primitive_width),
-        (uint, IndexType): lambda t1, t2: t1,
+        (uint, uint): select_hls_common_int_type,
+        (uint, int): select_hls_common_int_type,
         (uint, APFloat): lambda t1, t2: t2,
     }
     index_rules = {
-        (IndexType, int): lambda t1, t2: APInt(t1.primitive_width),
-        (IndexType, uint): lambda t1, t2: t1,
         (IndexType, IndexType): lambda t1, t2: index,
-        (IndexType, APFloat): lambda t1, t2: t2,
     }
     float_rules = {
         (APFloat, APFloat): lambda t1, t2: (
@@ -179,43 +204,23 @@ def div_rule():
         ),
         (APFloat, int): lambda t1, t2: t1,
         (APFloat, uint): lambda t1, t2: t1,
-        (APFloat, IndexType): lambda t1, t2: t1,
     }
     return TypingRule([int_rules, uint_rules, index_rules, float_rules])
 
 
 def mod_rule():
     int_rules = {
-        (int, int): lambda t1, t2: APInt(max(t1.primitive_width, t2.primitive_width)),
-        (int, uint): lambda t1, t2: APInt(
-            max(t1.primitive_width, t2.primitive_width + 1)
-        ),
-        (int, IndexType): lambda t1, t2: APInt(
-            max(t1.primitive_width, t2.primitive_width + 1)
-        ),
+        (int, int): select_hls_common_int_type,
+        (int, uint): select_hls_common_int_type,
         (int, APFloat): lambda t1, t2: t2,
     }
     uint_rules = {
-        (uint, uint): lambda t1, t2: APInt(
-            max(t1.primitive_width, t2.primitive_width), signed=False
-        ),
-        (uint, int): lambda t1, t2: APInt(
-            max(t1.primitive_width + 1, t2.primitive_width)
-        ),
-        (uint, IndexType): lambda t1, t2: APInt(
-            max(t1.primitive_width, t2.primitive_width), signed=False
-        ),
+        (uint, uint): select_hls_common_int_type,
+        (uint, int): select_hls_common_int_type,
         (uint, APFloat): lambda t1, t2: t2,
     }
     index_rules = {
-        (IndexType, int): lambda t1, t2: APInt(
-            max(t1.primitive_width + 1, t2.primitive_width)
-        ),
-        (IndexType, uint): lambda t1, t2: APInt(
-            max(t1.primitive_width, t2.primitive_width), signed=False
-        ),
         (IndexType, IndexType): lambda t1, t2: index,
-        (IndexType, APFloat): lambda t1, t2: t2,
     }
     float_rules = {
         (APFloat, APFloat): lambda t1, t2: (
@@ -229,36 +234,17 @@ def mod_rule():
 
 def cmp_rule():
     int_rules = {
-        (int, int): lambda t1, t2: APInt(max(t1.primitive_width, t2.primitive_width)),
-        (int, uint): lambda t1, t2: APInt(
-            max(t1.primitive_width, t2.primitive_width + 1)
-        ),
-        (int, IndexType): lambda t1, t2: APInt(
-            max(t1.primitive_width, t2.primitive_width + 1)
-        ),
+        (int, int): select_hls_common_int_type,
+        (int, uint): select_hls_common_int_type,
         (int, APFloat): lambda t1, t2: t2,
     }
     uint_rules = {
-        (uint, uint): lambda t1, t2: APInt(
-            max(t1.primitive_width, t2.primitive_width), signed=False
-        ),
-        (uint, int): lambda t1, t2: APInt(
-            max(t1.primitive_width + 1, t2.primitive_width)
-        ),
-        (uint, IndexType): lambda t1, t2: APInt(
-            max(t1.primitive_width, t2.primitive_width), signed=False
-        ),
+        (uint, uint): select_hls_common_int_type,
+        (uint, int): select_hls_common_int_type,
         (uint, APFloat): lambda t1, t2: t2,
     }
     index_rules = {
-        (IndexType, int): lambda t1, t2: APInt(
-            max(t1.primitive_width + 1, t2.primitive_width)
-        ),
-        (IndexType, uint): lambda t1, t2: APInt(
-            max(t1.primitive_width, t2.primitive_width), signed=False
-        ),
         (IndexType, IndexType): lambda t1, t2: index,
-        (IndexType, APFloat): lambda t1, t2: t2,
     }
     float_rules = {
         (APFloat, APFloat): lambda t1, t2: (
@@ -266,60 +252,43 @@ def cmp_rule():
         ),
         (APFloat, int): lambda t1, t2: t1,
         (APFloat, uint): lambda t1, t2: t1,
-        (APFloat, IndexType): lambda t1, t2: t1,
     }
     return TypingRule([int_rules, uint_rules, index_rules, float_rules])
 
 
 def pow_rule():
-    def select_float(t1, _):
-        return (
-            fp16
-            if t1.primitive_width <= fp16.primitive_width
-            else (fp32 if t1.primitive_width <= fp32.primitive_width else fp64)
-        )
-
     int_rules = {
-        (int, int): select_float,
-        (int, uint): select_float,
-        (int, IndexType): select_float,
+        (int, int): select_hls_common_int_type,
+        (int, uint): select_hls_common_int_type,
         (int, APFloat): lambda t1, t2: t2,
     }
     uint_rules = {
-        (uint, uint): select_float,
-        # (uint, int): select_float,
-        (uint, IndexType): select_float,
+        (uint, uint): select_hls_common_int_type,
+        (uint, int): select_hls_common_int_type,
         (uint, APFloat): lambda t1, t2: t2,
     }
-    index_rules = {(IndexType, IndexType): select_float}
+    index_rules = {}
     float_rules = {
         (APFloat, APFloat): lambda t1, t2: (
             t1 if t1.primitive_width >= t2.primitive_width else t2
         ),
-        # (apfloat, int): lambda t1, t2: t1,
-        # (apfloat, uint): lambda t1, t2: t1
-        # (apfloat, IndexType): lambda t1, t2: t1,
+        (APFloat, int): lambda t1, t2: t1,
+        (APFloat, uint): lambda t1, t2: t1,
     }
-    return TypingRule(
-        [int_rules, uint_rules, index_rules, float_rules], commutative=True
-    )
+    return TypingRule([int_rules, uint_rules, index_rules, float_rules])
 
 
 def shift_rule():
     int_rules = {
         (int, int): lambda t1, t2: t1,
         (int, uint): lambda t1, t2: t1,
-        (int, IndexType): lambda t1, t2: t1,
     }
     uint_rules = {
         (uint, uint): lambda t1, t2: t1,
         (uint, int): lambda t1, t2: t1,
-        (uint, IndexType): lambda t1, t2: t1,
     }
     index_rules = {
         (IndexType, IndexType): lambda t1, t2: index,
-        (IndexType, int): lambda t1, t2: index,
-        (IndexType, uint): lambda t1, t2: index,
     }
     # shifting float is meaningless
     return TypingRule([int_rules, uint_rules, index_rules])
@@ -327,20 +296,12 @@ def shift_rule():
 
 def bitwise_logic_rule():
     int_rules = {
-        (int, int): lambda t1, t2: APInt(max(t1.primitive_width, t2.primitive_width)),
-        (int, uint): lambda t1, t2: APInt(max(t1.primitive_width, t2.primitive_width)),
-        (int, IndexType): lambda t1, t2: APInt(
-            max(t1.primitive_width, t2.primitive_width)
-        ),
+        (int, int): select_hls_common_int_type,
+        (int, uint): select_hls_common_int_type,
     }
     uint_rules = {
-        (uint, uint): lambda t1, t2: APInt(
-            max(t1.primitive_width, t2.primitive_width), signed=False
-        ),
-        # (uint, int): lambda t1, t2: apint(max(t1.primitive_width, t2.primitive_width)),
-        (uint, IndexType): lambda t1, t2: APInt(
-            max(t1.primitive_width, t2.primitive_width), signed=False
-        ),
+        (uint, uint): select_hls_common_int_type,
+        (uint, int): select_hls_common_int_type,
     }
     index_rules = {
         (IndexType, IndexType): lambda t1, t2: index,
@@ -416,14 +377,12 @@ def special_function_rule():
         return fp32 if t.primitive_width <= fp32.primitive_width else fp64
 
     int_rules = {
-        (int,): lambda t: select_float,
+        (int,): lambda t: select_float(t),
     }
     uint_rules = {
-        (uint,): lambda t: select_float,
+        (uint,): lambda t: select_float(t),
     }
-    index_rules = {
-        (IndexType,): lambda t: select_float,
-    }
+    index_rules = {}
     float_rules = {
         (APFloat,): lambda t: t,
     }
@@ -432,25 +391,211 @@ def special_function_rule():
 
 def max_min_rule():
     int_rules = {
-        (int, int): lambda t1, t2: APInt(max(t1.primitive_width, t2.primitive_width)),
+        (int, int): select_hls_common_int_type,
+        (int, uint): select_hls_common_int_type,
         (int, APFloat): lambda t1, t2: t2,
     }
     uint_rules = {
-        (uint, uint): lambda t1, t2: APInt(
-            max(t1.primitive_width, t2.primitive_width), signed=False
-        ),
+        (uint, uint): select_hls_common_int_type,
+        (uint, int): select_hls_common_int_type,
         (uint, APFloat): lambda t1, t2: t2,
     }
     index_rules = {
         (IndexType, IndexType): lambda t1, t2: index,
-        (IndexType, APFloat): lambda t1, t2: t2,
     }
     float_rules = {
         (APFloat, APFloat): lambda t1, t2: (
             t1 if t1.primitive_width >= t2.primitive_width else t2
         )
     }
-    # we disable max/min for mixed int/uint types
+    return TypingRule(
+        [int_rules, uint_rules, index_rules, float_rules], commutative=True
+    )
+
+
+def cpp_common_numeric_rule():
+    int_rules = {
+        (int, int): select_cpp_common_int_type,
+        (int, uint): select_cpp_common_int_type,
+        (int, APFloat): lambda t1, t2: t2,
+    }
+    uint_rules = {
+        (uint, uint): select_cpp_common_int_type,
+        (uint, int): select_cpp_common_int_type,
+        (uint, APFloat): lambda t1, t2: t2,
+    }
+    index_rules = {
+        (IndexType, IndexType): lambda t1, t2: index,
+    }
+    float_rules = {
+        (APFloat, APFloat): _select_wider_float_type,
+        (APFloat, int): lambda t1, t2: t1,
+        (APFloat, uint): lambda t1, t2: t1,
+    }
+    return TypingRule(
+        [int_rules, uint_rules, index_rules, float_rules], commutative=True
+    )
+
+
+def cpp_shift_rule():
+    int_rules = {
+        (int, int): lambda t1, t2: t1,
+        (int, uint): lambda t1, t2: t1,
+    }
+    uint_rules = {
+        (uint, uint): lambda t1, t2: t1,
+        (uint, int): lambda t1, t2: t1,
+    }
+    index_rules = {
+        (IndexType, IndexType): lambda t1, t2: index,
+    }
+    return TypingRule([int_rules, uint_rules, index_rules])
+
+
+def cpp_bitwise_logic_rule():
+    int_rules = {
+        (int, int): select_cpp_common_int_type,
+        (int, uint): select_cpp_common_int_type,
+    }
+    uint_rules = {
+        (uint, uint): select_cpp_common_int_type,
+        (uint, int): select_cpp_common_int_type,
+    }
+    index_rules = {
+        (IndexType, IndexType): lambda t1, t2: index,
+    }
+    return TypingRule([int_rules, uint_rules, index_rules], commutative=True)
+
+
+def cpp_unary_neg_rule():
+    int_rules = {
+        (int,): lambda t: t,
+    }
+    uint_rules = {
+        (uint,): lambda t: t,
+    }
+    index_rules = {
+        (IndexType,): lambda t: t,
+    }
+    float_rules = {
+        (APFloat,): lambda t: t,
+    }
+    return TypingRule([int_rules, uint_rules, index_rules, float_rules])
+
+
+def cpp_unary_invert_rule():
+    int_rules = {
+        (int,): lambda t: t,
+    }
+    uint_rules = {
+        (uint,): lambda t: t,
+    }
+    index_rules = {
+        (IndexType,): lambda t: t,
+    }
+    return TypingRule([int_rules, uint_rules, index_rules])
+
+
+def cpp_logical_op_rule():
+    int_rules = {
+        (int, int): lambda t1, t2: int1,
+        (int, uint): lambda t1, t2: int1,
+        (int, APFloat): lambda t1, t2: int1,
+    }
+    uint_rules = {
+        (uint, uint): lambda t1, t2: int1,
+        (uint, int): lambda t1, t2: int1,
+        (uint, APFloat): lambda t1, t2: int1,
+    }
+    index_rules = {
+        (IndexType, IndexType): lambda t1, t2: int1,
+    }
+    float_rules = {
+        (APFloat, APFloat): lambda t1, t2: int1,
+        (APFloat, int): lambda t1, t2: int1,
+        (APFloat, uint): lambda t1, t2: int1,
+    }
+    return TypingRule(
+        [int_rules, uint_rules, index_rules, float_rules], commutative=True
+    )
+
+
+def cpp_logical_not_rule():
+    int_rules = {
+        (int,): lambda t: int1,
+    }
+    uint_rules = {
+        (uint,): lambda t: int1,
+    }
+    index_rules = {
+        (IndexType,): lambda t: int1,
+    }
+    float_rules = {
+        (APFloat,): lambda t: int1,
+    }
+    return TypingRule([int_rules, uint_rules, index_rules, float_rules])
+
+
+def cpp_pow_rule():
+    int_rules = {
+        (int, int): select_cpp_common_int_type,
+        (int, uint): select_cpp_common_int_type,
+        (int, APFloat): lambda t1, t2: t2,
+    }
+    uint_rules = {
+        (uint, uint): select_cpp_common_int_type,
+        (uint, int): select_cpp_common_int_type,
+        (uint, APFloat): lambda t1, t2: t2,
+    }
+    index_rules = {
+        (IndexType, IndexType): lambda t1, t2: index,
+    }
+    float_rules = {
+        (APFloat, APFloat): _select_wider_float_type,
+        (APFloat, int): lambda t1, t2: t1,
+        (APFloat, uint): lambda t1, t2: t1,
+    }
+    return TypingRule([int_rules, uint_rules, index_rules, float_rules])
+
+
+def cpp_special_function_rule():
+    def select_float(t):
+        return fp32 if t.primitive_width <= fp32.primitive_width else fp64
+
+    int_rules = {
+        (int,): select_float,
+    }
+    uint_rules = {
+        (uint,): select_float,
+    }
+    index_rules = {
+        (IndexType,): select_float,
+    }
+    float_rules = {
+        (APFloat,): lambda t: t,
+    }
+    return TypingRule([int_rules, uint_rules, index_rules, float_rules])
+
+
+def cpp_max_min_rule():
+    int_rules = {
+        (int, int): select_cpp_common_int_type,
+        (int, uint): select_cpp_common_int_type,
+        (int, APFloat): lambda t1, t2: t2,
+    }
+    uint_rules = {
+        (uint, uint): select_cpp_common_int_type,
+        (uint, int): select_cpp_common_int_type,
+        (uint, APFloat): lambda t1, t2: t2,
+    }
+    index_rules = {
+        (IndexType, IndexType): lambda t1, t2: index,
+    }
+    float_rules = {
+        (APFloat, APFloat): _select_wider_float_type,
+        (APFloat, int): lambda t1, t2: t1,
+        (APFloat, uint): lambda t1, t2: t1,
+    }
     return TypingRule(
         [int_rules, uint_rules, index_rules, float_rules], commutative=True
     )
@@ -484,3 +629,34 @@ TypeTable.register(
     special_function_rule(),
 )
 TypeTable.register(["max", "min"], max_min_rule())
+
+CppTypeTable.register(["add", "sub"], cpp_common_numeric_rule())
+CppTypeTable.register(["mul"], cpp_common_numeric_rule())
+CppTypeTable.register(["div", "floordiv"], cpp_common_numeric_rule())
+CppTypeTable.register(["mod"], cpp_common_numeric_rule())
+CppTypeTable.register(["pow"], cpp_pow_rule())
+CppTypeTable.register(["eq", "ne", "lt", "le", "gt", "ge"], cpp_common_numeric_rule())
+CppTypeTable.register(["lshift", "rshift"], cpp_shift_rule())
+CppTypeTable.register(
+    ["bitwise_and", "bitwise_or", "bitwise_xor"], cpp_bitwise_logic_rule()
+)
+CppTypeTable.register(["neg"], cpp_unary_neg_rule())
+CppTypeTable.register(["invert"], cpp_unary_invert_rule())
+CppTypeTable.register(["logical_and", "logical_or"], cpp_logical_op_rule())
+CppTypeTable.register(["logical_not"], cpp_logical_not_rule())
+CppTypeTable.register(
+    [
+        "sin",
+        "cos",
+        "tan",
+        "exp",
+        "exp2",
+        "log",
+        "sqrt",
+        "reciprocal",
+        "rsqrt",
+        "square",
+    ],
+    cpp_special_function_rule(),
+)
+CppTypeTable.register(["max", "min"], cpp_max_min_rule())

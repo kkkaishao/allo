@@ -143,7 +143,7 @@ class CodeGenerator(ast.NodeVisitor):
         self.actual_res_types: list[BaseType] = []
         self._actual_res_types_recorded = False
         self.seen_return_stmt = False
-        self.allow_implicit_type_infer = options.allow_implicit_type_infer
+        self.options = options
         self._kernel_call_counter = 0
         self._kernel_base_names = set()
         self._entry_function_visited = False
@@ -518,7 +518,181 @@ class CodeGenerator(ast.NodeVisitor):
     def _apply_binary_method(self, library_op, lhs, rhs):
         return self.call_operator(library_op, [lhs, rhs], {})
 
+    def _ast_expr_may_be_float(self, node: ast.AST) -> bool:
+        if isinstance(node, ast.Constant):
+            return isinstance(node.value, float)
+
+        if isinstance(node, ast.Name):
+            val = unwrap_if_constexpr(self.lookup(node.id))
+            if isinstance(val, Proxy):
+                return isinstance(val.dtype, DType) and val.dtype.is_float()
+            if isinstance(val, Constexpr):
+                return isinstance(val.value, float)
+            return False
+
+        if isinstance(node, ast.Subscript):
+            return self._ast_expr_may_be_float(node.value)
+
+        if isinstance(node, ast.UnaryOp):
+            return self._ast_expr_may_be_float(node.operand)
+
+        if isinstance(node, ast.BinOp):
+            return self._ast_expr_may_be_float(
+                node.left
+            ) or self._ast_expr_may_be_float(node.right)
+
+        if isinstance(node, ast.Call):
+            # Be conservative for call sites where return type cannot be inferred
+            # without lowering.
+            return True
+
+        return False
+
+    def _lower_binop_tree(self, node: ast.BinOp):
+        def lower_expr(expr):
+            if isinstance(expr, ast.BinOp):
+                lhs = lower_expr(expr.left)
+                rhs = lower_expr(expr.right)
+                library_op = self._available_binary_methods.get(type(expr.op), None)
+                if library_op is None:
+                    self.compile_error(
+                        f"Unsupported binary operator '{type(expr.op).__name__}' in allo kernel functions",
+                    )
+                return self._apply_binary_method(library_op, lhs, rhs)
+            return self.visit(expr)
+
+        return lower_expr(node)
+
+    def _reduce_balanced_values(self, values, combine):
+        assert len(values) > 0
+        curr = list(values)
+        while len(curr) > 1:
+            nxt = []
+            i = 0
+            while i < len(curr):
+                if i + 1 < len(curr):
+                    nxt.append(combine(curr[i], curr[i + 1]))
+                    i += 2
+                else:
+                    nxt.append(curr[i])
+                    i += 1
+            curr = nxt
+        return curr[0]
+
+    def _collect_add_sub_terms(self, node: ast.AST, sign: int, out):
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+            self._collect_add_sub_terms(node.left, sign, out)
+            self._collect_add_sub_terms(node.right, sign, out)
+            return
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Sub):
+            self._collect_add_sub_terms(node.left, sign, out)
+            self._collect_add_sub_terms(node.right, -sign, out)
+            return
+        out.append((self.visit(node), sign))
+
+    def _collect_mul_terms(self, node: ast.AST, out):
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Mult):
+            self._collect_mul_terms(node.left, out)
+            self._collect_mul_terms(node.right, out)
+            return
+        out.append(self.visit(node))
+
+    def _materialize_constexpr_terms(self, terms):
+        anchor = None
+        for term in terms:
+            if isinstance(term, Proxy):
+                anchor = term.dtype
+                break
+        if anchor is None:
+            return terms
+
+        materialized = []
+        for term in terms:
+            if isinstance(term, Constexpr):
+                materialized.append(self.builder.make_scalar(term.value, anchor))
+            else:
+                materialized.append(term)
+        return materialized
+
+    def _lower_nary_add_sub(self, node: ast.BinOp):
+        signed_terms = []
+        self._collect_add_sub_terms(node, sign=1, out=signed_terms)
+        values = [value for value, _ in signed_terms]
+        signs = [sign for _, sign in signed_terms]
+
+        if all(isinstance(value, Constexpr) for value in values):
+            total = 0
+            for value, sign in zip(values, signs):
+                total += sign * value.value
+            return Constexpr(total)
+
+        values = self._materialize_constexpr_terms(values)
+        if not all(isinstance(value, Proxy) for value in values):
+            self.compile_error(
+                "n-ary add/sub lowering expects runtime values to be Proxies"
+            )
+
+        if all(isinstance(value.type, DType) for value in values):
+            dtypes = [value.dtype for value in values]
+            op_name = "sub" if any(sign < 0 for sign in signs) else "add"
+            dst_ty = self.builder.get_promoted_dtype_nary(
+                op_name, dtypes, term_signs=signs
+            )
+            casted = [self.builder.scalar_cast(value, dst_ty) for value in values]
+            floating = dst_ty.is_float()
+            if any(sign < 0 for sign in signs):
+                return self.builder.create_sub_nary(casted, signs, floating=floating)
+            return self.builder.create_add_nary(casted, floating=floating)
+
+        normalized = []
+        for value, sign in zip(values, signs):
+            if sign < 0:
+                normalized.append(self.call_operator(dsl.neg, [value], {}))
+            else:
+                normalized.append(value)
+        return self._reduce_balanced_values(
+            normalized, lambda lhs, rhs: self._apply_binary_method(dsl.add, lhs, rhs)
+        )
+
+    def _lower_nary_mul(self, node: ast.BinOp):
+        terms = []
+        self._collect_mul_terms(node, terms)
+
+        if all(isinstance(term, Constexpr) for term in terms):
+            product = 1
+            for term in terms:
+                product *= term.value
+            return Constexpr(product)
+
+        terms = self._materialize_constexpr_terms(terms)
+        if not all(isinstance(term, Proxy) for term in terms):
+            self.compile_error(
+                "n-ary mul lowering expects runtime values to be Proxies"
+            )
+
+        if all(isinstance(term.type, DType) for term in terms):
+            dtypes = [term.dtype for term in terms]
+            dst_ty = self.builder.get_promoted_dtype_nary("mul", dtypes)
+            casted = [self.builder.scalar_cast(term, dst_ty) for term in terms]
+            return self.builder.create_mul_nary(casted, floating=dst_ty.is_float())
+
+        return self._reduce_balanced_values(
+            terms, lambda lhs, rhs: self._apply_binary_method(dsl.mul, lhs, rhs)
+        )
+
     def visit_BinOp(self, node):
+        if self.builder.typing_style == "hls":
+            if (
+                not self.options.fast_math
+                and isinstance(node.op, (ast.Add, ast.Sub, ast.Mult))
+                and self._ast_expr_may_be_float(node)
+            ):
+                return self._lower_binop_tree(node)
+            if isinstance(node.op, (ast.Add, ast.Sub)):
+                return self._lower_nary_add_sub(node)
+            if isinstance(node.op, ast.Mult):
+                return self._lower_nary_mul(node)
+
         lhs = self.visit(node.left)
         rhs = self.visit(node.right)
         library_op = self._available_binary_methods.get(type(node.op), None)
@@ -1350,7 +1524,7 @@ class CodeGenerator(ast.NodeVisitor):
             target = self.visit(target)
             # the first time we see a variable is considered its definition site, and its type if inferred from the assigned value. subsequent assignments to the same variable must be type-compatible with the first definition.
             if target not in self.lscope:
-                if not self.allow_implicit_type_infer:
+                if not self.options.allow_implicit_type_infer:
                     self.compile_error(
                         f"Cannot infer type for a new variable {target} without an initializer. Please provide an explicit type annotation for this variable."
                     )
@@ -2030,13 +2204,14 @@ def compile(
             f"The number of provided argument types ({len(arg_types)}) does not match the number of arguments in the kernel signature ({len(fn.signature.parameters)})."
         )
     res_types = [fn.parse_type_annotation(t) for t in res_types]
+    effective_options = options if options != CompileOptions() else fn.options
 
     try:
         context = Context()
         context.load_dialects()
 
         # initialize builder
-        builder = AlloOpBuilder(context)
+        builder = AlloOpBuilder(context, typing_style=effective_options.typing_style)
         builder.src = fn.src
         builder.set_loc(Location(fn.file_name, fn.begin_line, 1, context))
         module = ModuleOp(builder)
@@ -2055,7 +2230,7 @@ def compile(
             gscope=fn.get_capture_scope(),
             arg_types=arg_types,
             res_types=res_types,
-            options=options,
+            options=effective_options,
         )
         generator.visit(fn.parse())
 

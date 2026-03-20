@@ -247,8 +247,10 @@ class IndexType(DType):
     allo index type, represents a machine integer type used for indexing and loop bounds
     """
 
-    def __init__(self, bitwidth: int = 32):
-        super().__init__("index", bitwidth)
+    def __init__(self):
+        # set to 32 but this is really just a placeholder
+        # since index type is meant to be an opaque type
+        super().__init__("index", 32)
 
     def __eq__(self, value: object, /) -> bool:
         return (

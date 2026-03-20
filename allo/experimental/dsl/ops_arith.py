@@ -263,7 +263,7 @@ def _validate_rshift(lhs, rhs, signed=Constexpr(False)) -> str:
 
 
 @rshift.const_fold
-def _fold_rshift(lhs, rhs, signed: Constexpr):
+def _fold_rshift(lhs, rhs, signed=Constexpr(False)):
     if isinstance(lhs, Constexpr) and isinstance(rhs, Constexpr):
         if signed.value:
             return Constexpr(lhs.value >> rhs.value)
@@ -272,7 +272,7 @@ def _fold_rshift(lhs, rhs, signed: Constexpr):
 
 
 @rshift.lower
-def _lower_rshift(builder: AlloOpBuilder, lhs, rhs, signed: Constexpr):
+def _lower_rshift(builder: AlloOpBuilder, lhs, rhs, signed=Constexpr(False)):
     return lower_binary_op(
         builder,
         lhs,

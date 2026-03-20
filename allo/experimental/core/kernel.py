@@ -7,7 +7,16 @@ import textwrap
 import re
 import warnings
 from dataclasses import dataclass, field
-from typing import ParamSpec, TypeVar, Generic, Callable, overload, Optional, Any
+from typing import (
+    ParamSpec,
+    TypeVar,
+    Generic,
+    Callable,
+    overload,
+    Optional,
+    Any,
+    Literal,
+)
 from collections.abc import Sequence
 from ..core.types import (
     BaseType,
@@ -69,6 +78,8 @@ class CompileOptions:
     allow_implicit_type_infer: bool = False
     enable_tensor: bool = False
     module_map: dict = field(default_factory=dict)
+    typing_style: Literal["hls", "cpp"] = "hls"
+    fast_math: bool = False
 
 
 class Kernel(Generic[P, R]):
@@ -184,7 +195,7 @@ class Kernel(Generic[P, R]):
         from ..compiler.codegen import compile
 
         self.module, self.context = compile(
-            self, arg_types=arg_types, res_types=res_types
+            self, arg_types=arg_types, res_types=res_types, options=self.options
         )
         return self.module
 
@@ -194,7 +205,7 @@ class Kernel(Generic[P, R]):
 
         arg_types = self.specialize_arg_types(*args, **kwargs)
         res_types = self.parse_return_annotation(self.signature.return_annotation)
-        module = compile(self, arg_types, res_types)
+        module = compile(self, arg_types, res_types, options=self.options)
         return module
 
     def specialize_arg_types(self, *args, **kwargs) -> Sequence[BaseType]:

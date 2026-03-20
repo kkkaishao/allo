@@ -151,7 +151,10 @@ def _prepare_binary_operands(
         return lhs, rhs
 
     assert isinstance(lhs, Proxy) and isinstance(rhs, Proxy)
-    dst_ty = builder.get_promoted_dtype(lhs.dtype, rhs.dtype, op_name)
+    term_signs = [1, -1] if op_name == "sub" else None
+    dst_ty = builder.get_promoted_dtype_nary(
+        op_name, [lhs.dtype, rhs.dtype], term_signs=term_signs
+    )
     operands = []
     for operand in [lhs, rhs]:
         if isinstance(operand.type, DType):
@@ -211,7 +214,7 @@ def lower_unary_op(
     extra_kwargs: dict | None = None,
 ) -> Proxy:
     if promote:
-        dst_ty = builder.get_promoted_dtype(operand.dtype, None, op_name)
+        dst_ty = builder.get_promoted_dtype_nary(op_name, [operand.dtype])
         operand = builder.cast(operand, dst_ty)
     if floating is None:
         floating = operand.dtype.is_float()

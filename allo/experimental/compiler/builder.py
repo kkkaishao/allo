@@ -16,7 +16,7 @@ from .._C.ir import (
     Type,
     AffineMap,
 )
-from typing import Callable, Sequence, cast
+from typing import Callable, Sequence, cast, Literal
 from enum import Enum
 from .errors import CompilationError
 from ..core.types import (
@@ -30,10 +30,9 @@ from ..core.types import (
     BufferType,
     APFloat,
     Constexpr,
-    IndexType,
 )
 from .._C import arith, tensor, linalg, math, memref
-from ..core.rule import TypeTable
+from ..core.rule import TypeTable, CppTypeTable
 
 
 class CmpPred(Enum):
@@ -66,8 +65,11 @@ class AlloOpBuilder(ir.AlloOpBuilder):
     curr_node: ast.AST | None
     module: ModuleOp
 
-    def __init__(self, context: Context):
+    def __init__(
+        self, context: Context, *, typing_style: Literal["hls", "cpp"] = "hls"
+    ):
         super().__init__(context)
+        self.typing_style: Literal["hls", "cpp"] = typing_style
 
     def compile_error(self, message: str):
         raise CompilationError(self.curr_node, message, self.src)
@@ -288,20 +290,160 @@ class AlloOpBuilder(ir.AlloOpBuilder):
         else:
             self.compile_error(f"Unsupported type for cast: {src.type}")
 
+    @staticmethod
+    def _ceil_log2(n: int) -> int:
+        assert n >= 1
+        return (n - 1).bit_length()
+
+    def _get_promoted_dtype_nary_hls(
+        self,
+        op_name: str,
+        dtypes: Sequence[DType],
+        term_signs: Sequence[int] | None = None,
+    ) -> DType:
+        if len(dtypes) == 0:
+            self.compile_error("Type promotion requires at least one operand")
+
+        # HLS optimized n-ary integer rules for reduction-friendly add/sub/mul.
+        if op_name in {"add", "sub"} and all(dt.is_int_signless() for dt in dtypes):
+            if term_signs is None:
+                signs = [1] * len(dtypes)
+            else:
+                if len(term_signs) != len(dtypes):
+                    self.compile_error(
+                        f"Type promotion for '{op_name}' expects {len(dtypes)} signs, got {len(term_signs)}"
+                    )
+                signs = list(term_signs)
+
+            acc_signed = any(sign < 0 for sign in signs) or any(
+                dt.is_int() for dt in dtypes
+            )
+            eff_widths = []
+            for dt in dtypes:
+                width = dt.primitive_width
+                if acc_signed and dt.is_uint():
+                    width += 1
+                eff_widths.append(width)
+
+            result_width = max(eff_widths) + self._ceil_log2(len(dtypes))
+            return APInt(result_width, signed=acc_signed)
+
+        if op_name == "mul" and all(dt.is_int_signless() for dt in dtypes):
+            result_width = sum(dt.primitive_width for dt in dtypes)
+            result_signed = any(dt.is_int() for dt in dtypes)
+            return APInt(result_width, signed=result_signed)
+
+        return self._lookup_promoted_dtype_nary(
+            table=TypeTable, style_name="hls", op_name=op_name, dtypes=dtypes
+        )
+
+    def _lookup_promoted_dtype_nary(
+        self,
+        *,
+        table,
+        style_name: str,
+        op_name: str,
+        dtypes: Sequence[DType],
+    ) -> DType:
+        if len(dtypes) == 0:
+            self.compile_error("Type promotion requires at least one operand")
+
+        if len(dtypes) == 1:
+            ret = table.lookup_unary(op_name, dtypes[0])
+            if ret is None:
+                self.compile_error(
+                    f"No {style_name} type promotion rule for operator '{op_name}' with operand type {dtypes[0]}"
+                )
+            return ret
+
+        ret = dtypes[0]
+        for next_ty in dtypes[1:]:
+            merged = table.lookup_binary(op_name, ret, next_ty)
+            if merged is None:
+                self.compile_error(
+                    f"No {style_name} type promotion rule for operator '{op_name}' with operand types {ret} and {next_ty}"
+                )
+            ret = merged
+        return ret
+
+    def _get_promoted_dtype_nary_cpp(
+        self,
+        op_name: str,
+        dtypes: Sequence[DType],
+    ) -> DType:
+        return self._lookup_promoted_dtype_nary(
+            table=CppTypeTable, style_name="cpp", op_name=op_name, dtypes=dtypes
+        )
+
+    def get_promoted_dtype_nary(
+        self,
+        op_name: str,
+        dtypes: Sequence[DType],
+        term_signs: Sequence[int] | None = None,
+    ) -> DType:
+        if self.typing_style == "cpp":
+            return self._get_promoted_dtype_nary_cpp(op_name, dtypes)
+        return self._get_promoted_dtype_nary_hls(op_name, dtypes, term_signs)
+
     def get_promoted_dtype(self, lhs: DType, rhs: DType | None, op_name: str):
         if rhs is None:
-            ret = TypeTable.lookup_unary(op_name, lhs)
-            if ret is None:
-                self.compile_error(
-                    f"No type promotion rule for operator '{op_name}' with operand type {lhs}"
-                )
+            ret = self.get_promoted_dtype_nary(op_name, [lhs])
         else:
-            ret = TypeTable.lookup_binary(op_name, lhs, rhs)
-            if ret is None:
-                self.compile_error(
-                    f"No type promotion rule for operator '{op_name}' with operand types {lhs} and {rhs}"
-                )
+            signs = [1, -1] if op_name == "sub" else None
+            ret = self.get_promoted_dtype_nary(op_name, [lhs, rhs], term_signs=signs)
         return ret
+
+    def _reduce_balanced(
+        self, operands: Sequence[Proxy], combine: Callable[[Proxy, Proxy], Proxy]
+    ) -> Proxy:
+        if len(operands) == 0:
+            self.compile_error("Reduction requires at least one operand")
+        curr = list(operands)
+        while len(curr) > 1:
+            nxt = []
+            i = 0
+            while i < len(curr):
+                if i + 1 < len(curr):
+                    nxt.append(combine(curr[i], curr[i + 1]))
+                    i += 2
+                else:
+                    nxt.append(curr[i])
+                    i += 1
+            curr = nxt
+        return curr[0]
+
+    def create_add_nary(
+        self, operands: Sequence[Proxy], *, floating: bool = False
+    ) -> Proxy:
+        return self._reduce_balanced(
+            operands, lambda lhs, rhs: self.create_add(lhs, rhs, floating=floating)
+        )
+
+    def create_sub_nary(
+        self,
+        operands: Sequence[Proxy],
+        term_signs: Sequence[int],
+        *,
+        floating: bool = False,
+    ) -> Proxy:
+        if len(operands) != len(term_signs):
+            self.compile_error(
+                f"Sub reduction expects {len(operands)} signs, got {len(term_signs)}"
+            )
+        normalized = []
+        for operand, sign in zip(operands, term_signs):
+            if sign < 0:
+                normalized.append(self.create_neg(operand, floating=floating))
+            else:
+                normalized.append(operand)
+        return self.create_add_nary(normalized, floating=floating)
+
+    def create_mul_nary(
+        self, operands: Sequence[Proxy], *, floating: bool = False
+    ) -> Proxy:
+        return self._reduce_balanced(
+            operands, lambda lhs, rhs: self.create_mul(lhs, rhs, floating=floating)
+        )
 
     ######################
     # Basic arithmetic ops
@@ -448,7 +590,7 @@ class AlloOpBuilder(ir.AlloOpBuilder):
         if isinstance(base.type, ShapedType) and isinstance(exp.type, ShapedType):
             return self._create_elementwise_binary_linalg(base, exp, build_fn)
         else:
-            return Proxy(build_fn(base.handle, exp.handle), base.dtype)
+            return Proxy(build_fn(base, exp), base.dtype)
 
     def create_lshift(self, lhs: Proxy, rhs: Proxy) -> Proxy:
         assert isinstance(lhs.dtype, APInt) and isinstance(rhs.dtype, APInt)
@@ -500,32 +642,32 @@ class AlloOpBuilder(ir.AlloOpBuilder):
         return Proxy(op.get_result_at(0), operand.type)
 
     def create_neg(self, operand: Proxy, *, floating: bool = False) -> Proxy:
-        def build_fn(operand):
+        def build_fn(proxy):
             if floating:
-                return arith.NegFOp(self, operand).get_result_at(0)
+                return arith.NegFOp(self, proxy.handle).get_result_at(0)
             else:
                 # for integer, neg is the same as 0 - operand
-                zero = self.make_scalar(0, operand.dtype).handle
-                return arith.SubIOp(self, zero, operand).get_result_at(0)
+                zero = self.make_scalar(0, proxy.dtype).handle
+                return arith.SubIOp(self, zero, proxy.handle).get_result_at(0)
 
         if isinstance(operand.type, ShapedType):
             return self._create_elementwise_unary_linalg(operand, build_fn)
         else:
-            return Proxy(build_fn(operand.handle), operand.dtype)
+            return Proxy(build_fn(operand), operand.dtype)
 
     def create_invert(self, operand: Proxy) -> Proxy:
         assert isinstance(operand.dtype, APInt)
 
-        def build_fn(operand):
+        def build_fn(proxy):
             # for integer, invert is the same as -1 xor operand
-            ones = 2**operand.dtype.primitive_width - 1
-            ones_val = self.make_scalar(ones, operand.dtype).handle
-            return arith.XOrIOp(self, ones_val, operand).get_result_at(0)
+            ones = 2**proxy.dtype.primitive_width - 1
+            ones_val = self.make_scalar(ones, proxy.dtype).handle
+            return arith.XOrIOp(self, ones_val, proxy.handle).get_result_at(0)
 
         if isinstance(operand.type, ShapedType):
             return self._create_elementwise_unary_linalg(operand, build_fn)
         else:
-            return Proxy(build_fn(operand.handle), operand.dtype)
+            return Proxy(build_fn(operand), operand.dtype)
 
     #########################
     # Comparison ops
