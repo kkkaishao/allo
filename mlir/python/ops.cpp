@@ -18,6 +18,8 @@
 #include "mlir/Dialect/UB/IR/UBOps.h"
 #include "mlir/IR/IntegerSet.h"
 
+#include "allo/IR/AlloOps.h"
+
 using namespace mlir;
 
 void bindFuncOps(nb::module_ &m) {
@@ -739,10 +741,98 @@ void bindLinalgOps(nb::module_ &m) {
 
 void bindUBOps(nb::module_ &m) {
   auto ub = bindOp<ub::PoisonOp>(m, "PoisonOp");
-  ub.def(
-      "__init__",
-      [](ub::PoisonOp &self, AlloOpBuilder builder, Type &resType) {
-        self = ub::PoisonOp::create(builder, builder.getLocation(), resType);
+  bindConstructor(
+      ub,
+      [](AlloOpBuilder &builder, Type &resType) {
+        return ub::PoisonOp::create(builder, builder.getLocation(), resType);
       },
-      nb::arg("builder"), nb::arg("res_type"));
+      nb::arg("res_type"));
+}
+
+void bindAlloOps(nb::module_ &m) {
+  nb::class_<allo::StreamType, Type>(m, "StreamType")
+      .def_static(
+          "get",
+          [](MLIRContext &ctx, Type &baseType, size_t depth) {
+            return allo::StreamType::get(&ctx, baseType, depth);
+          },
+          nb::arg("context"), nb::arg("base_type"), nb::arg("depth"));
+
+  auto wid = bindOp<allo::GetWorkerIdOp>(m, "GetWorkerIdOp");
+  bindConstructor(
+      wid,
+      [](AlloOpBuilder &builder, uint32_t axis) {
+        return allo::GetWorkerIdOp::create(builder, builder.getLocation(),
+                                           axis);
+      },
+      nb::arg("axis"));
+
+  auto nw = bindOp<allo::GetNumWorkersOp>(m, "GetNumWorkersOp");
+  bindConstructor(
+      nw,
+      [](AlloOpBuilder &builder, uint32_t axis) {
+        return allo::GetNumWorkersOp::create(builder, builder.getLocation(),
+                                             axis);
+      },
+      nb::arg("axis"));
+
+  auto sget = bindOp<allo::StreamGetOp>(m, "StreamGetOp");
+  bindConstructor(
+      sget,
+      [](AlloOpBuilder &builder, Value &stream,
+         const std::vector<Value> &indices) {
+        return allo::StreamGetOp::create(builder, builder.getLocation(), stream,
+                                         indices);
+      },
+      nb::arg("stream"), nb::arg("indices"));
+
+  auto sput = bindOp<allo::StreamPutOp>(m, "StreamPutOp");
+  bindConstructor(
+      sput,
+      [](AlloOpBuilder &builder, Value &stream,
+         const std::vector<Value> &indices, Value &value) {
+        return allo::StreamPutOp::create(builder, builder.getLocation(), stream,
+                                         indices, value);
+      },
+      nb::arg("name"), nb::arg("indices"), nb::arg("value"));
+
+  auto gsget = bindOp<allo::GlobalStreamGetOp>(m, "GlobalStreamGetOp");
+  bindConstructor(
+      gsget,
+      [](AlloOpBuilder &builder, Type &resType, std::string_view name,
+         const std::vector<Value> &indices) {
+        return allo::GlobalStreamGetOp::create(builder, builder.getLocation(),
+                                               resType, name, indices);
+      },
+      nb::arg("res_type"), nb::arg("name"), nb::arg("indices"));
+
+  auto gsput = bindOp<allo::GlobalStreamPutOp>(m, "GlobalStreamPutOp");
+  bindConstructor(
+      gsput,
+      [](AlloOpBuilder &builder, std::string_view name,
+         const std::vector<Value> &indices, Value &value) {
+        return allo::GlobalStreamPutOp::create(builder, builder.getLocation(),
+                                               name, indices, value);
+      },
+      nb::arg("name"), nb::arg("indices"), nb::arg("value"));
+
+  auto screate = bindOp<allo::StreamCreateOp>(m, "StreamCreateOp");
+  bindConstructor(
+      screate,
+      [](AlloOpBuilder &builder, allo::StreamType &elementType,
+         const std::vector<int64_t> &shape) {
+        return allo::StreamCreateOp::create(builder, builder.getLocation(),
+                                            elementType, shape);
+      },
+      nb::arg("element_type"), nb::arg("shape"));
+
+  auto gscreate = bindOp<allo::GlobalStreamCreateOp>(m, "GlobalStreamCreateOp");
+  bindConstructor(
+      gscreate,
+      [](AlloOpBuilder &builder, std::string_view name,
+         allo::StreamType &streamType, const std::vector<int64_t> &shape) {
+        return allo::GlobalStreamCreateOp::create(
+            builder, builder.getLocation(), streamType, name, shape);
+      },
+      nb::arg("name"), nb::arg("stream_type"), nb::arg("shape"));
 }

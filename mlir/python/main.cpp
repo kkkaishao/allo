@@ -28,6 +28,7 @@ static constexpr SubmoduleDesc kSubmodules[] = {
     {"linalg", bindLinalgOps, "linalg dialect"},
     {"transform", bindTransform, "transform dialect"},
     {"ub", bindUBOps, "ub dialect"},
+    {"allo", bindAlloOps, "allo dialect"},
     {"passes", bindPasses, "compiler passes"},
 };
 

@@ -60,6 +60,12 @@ def StreamGetOp : Allo_Op<"stream.get", [MemoryEffects<[MemRead, MemWrite]>]> {
   let assemblyFormat = [{
     $stream `[` $indices `]` attr-dict `:` type($stream) `,` type($value)
   }];
+  let builders = [
+    OpBuilder<(ins "Value":$stream, "ArrayRef<Value>":$indices), [{
+      auto streamType = cast<allo::StreamType>(stream.getType());
+      build($_builder, $_state, streamType.getBaseType(), stream, indices);
+    }]>
+  ];
   let hasVerifier = 1;
 }
 
