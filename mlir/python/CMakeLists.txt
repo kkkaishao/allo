@@ -8,6 +8,7 @@ nanobind_add_module(_liballo
     main.cpp
     transform.cpp
     utils.cpp
+    passes.cpp
 )
 
 # turn off -Wcast-qual for nanobind
@@ -22,17 +23,61 @@ set_target_properties(_liballo PROPERTIES
     CXX_VISIBILITY_PRESET hidden
 )
 
-get_property(dialect_libs GLOBAL PROPERTY MLIR_DIALECT_LIBS)
-get_property(conversion_libs GLOBAL PROPERTY MLIR_CONVERSION_LIBS)
+set(ALLO_PYTHON_MLIR_LIBS
+    # Core IR / parser / pass infra used by python bindings.
+    MLIRIR
+    MLIRSupport
+    MLIRParser
+    MLIRPass
+    MLIRTransforms
+    MLIRAnalysis
+    MLIRDialect
+    MLIRDialectUtils
+    MLIRBytecodeWriter
+
+    # Dialects directly exposed in mlir/python.
+    MLIRAffineDialect
+    MLIRArithDialect
+    MLIRBufferizationDialect
+    MLIRControlFlowDialect
+    MLIRFuncDialect
+    MLIRIndexDialect
+    MLIRLLVMDialect
+    MLIRLinalgDialect
+    MLIRMathDialect
+    MLIRMemRefDialect
+    MLIROpenMPDialect
+    MLIRSCFDialect
+    MLIRShapeDialect
+    MLIRTensorDialect
+    MLIRTosaDialect
+    MLIRTransformDialect
+    MLIRUBDialect
+    MLIRVectorDialect
+
+    # Transform dialect extensions used by load_transform_dialects().
+    MLIRAffineTransformOps
+    MLIRBufferizationTransformOps
+    MLIRFuncTransformOps
+    MLIRLinalgTransformOps
+    MLIRMemRefTransformOps
+    MLIRSCFTransformOps
+    MLIRTensorTransformOps
+    MLIRTransformLoopExtension
+    MLIRTransformDialectInterfaces
+    MLIRTransformDialectTransforms
+    MLIRTransformDialectUtils
+    MLIRTransformUtils
+    MLIRVectorTransformOps
+)
 
 target_link_libraries(_liballo
     PRIVATE
-    # MLIR Libraries
-    ${dialect_libs}
-    ${conversion_libs}
+    ${ALLO_PYTHON_MLIR_LIBS}
 
     MLIRAllo
     MLIRAlloTransformOps
+    MLIRAlloTranslation
 
     Python3::Module
 )

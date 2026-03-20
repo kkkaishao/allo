@@ -23,7 +23,7 @@ static std::string getIntegerTypeName(unsigned width, bool isSigned) {
   case 64:
     return prefix + "int" + std::to_string(width) + "_t";
   default:
-    return "ap_" + prefix + "int" + std::to_string(width) + "_t";
+    return "ap_int<" + std::to_string(width) + ">";
   }
 }
 
@@ -944,9 +944,15 @@ static llvm::cl::opt<bool>
                  llvm::cl::init(false));
 
 static LogicalResult emitVivadoHLS(ModuleOp mod, llvm::raw_ostream &os) {
+  return emitVivadoHLS(mod, os, indexWidth, indent, withLocation);
+}
+
+LogicalResult allo::emitVivadoHLS(ModuleOp mod, llvm::raw_ostream &os,
+                                  unsigned indexWidth, unsigned indentSize,
+                                  bool withLocation) {
   VivadoHLSEmitter emitter(os);
   emitter.state.indexWidth = indexWidth;
-  emitter.state.indentSize = indent;
+  emitter.state.indentSize = indentSize;
   emitter.state.withLocation = withLocation;
   emitter.emitModule(mod);
   return failure(emitter.state.failed);
@@ -955,7 +961,7 @@ static LogicalResult emitVivadoHLS(ModuleOp mod, llvm::raw_ostream &os) {
 void allo::registerVivadoHLSTranslation() {
   static TranslateFromMLIRRegistration reg(
       "emit-vitis-hls", "Translate MLIR to C++ code for Vivado HLS",
-      emitVivadoHLS, [&](DialectRegistry &registry) {
+      ::emitVivadoHLS, [&](DialectRegistry &registry) {
         registry
             .insert<affine::AffineDialect, arith::ArithDialect,
                     math::MathDialect, memref::MemRefDialect, scf::SCFDialect,

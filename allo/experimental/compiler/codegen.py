@@ -2066,7 +2066,7 @@ def compile(
                 f"In function: {fn.func_name}, module verification failed."
             )
 
-        return module
+        return module, generator.context
     except Exception as exc:
         if show_traceback:
             raise

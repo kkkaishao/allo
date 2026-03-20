@@ -114,6 +114,7 @@ class Kernel(Generic[P, R]):
         self.mapping = mapping
         self.is_top = is_top
         self.module = None
+        self.context = None
 
         self.__name__ = fn.__name__
         self.__doc__ = fn.__doc__
@@ -147,6 +148,22 @@ class Kernel(Generic[P, R]):
         out += f"<{self.func_name} at {self.file_name}:{self.begin_line}>"
         return out
 
+    def emit_vivado_hls(self):
+        """Emit Vivado HLS compatible C++ code. Kernel must be compiled before calling this method."""
+        if self.module is None:
+            raise RuntimeError(
+                f"Kernel {self.func_name} has not been compiled. Please compile the kernel before emitting Vivado HLS code."
+            )
+        else:
+            from .._C.passes import emit_vivado_hls
+
+            code = emit_vivado_hls(self.module)
+            if code is None:
+                raise RuntimeError(
+                    f"Failed to emit Vivado HLS code for kernel {self.func_name}. Please check if the kernel is compatible with Vivado HLS and if the module was generated correctly."
+                )
+            return code
+
     def schedule(self):
         from ..schedule import Schedule
 
@@ -166,8 +183,10 @@ class Kernel(Generic[P, R]):
         """Compile the kernel with explicitly provided argument and return types."""
         from ..compiler.codegen import compile
 
-        module = compile(self, arg_types=arg_types, res_types=res_types)
-        return module
+        self.module, self.context = compile(
+            self, arg_types=arg_types, res_types=res_types
+        )
+        return self.module
 
     def __call__(self, *args: P.args, **kwargs: P.kwargs):
         """Compile the kernel with argument types inferred at callsite and return types from annotations"""

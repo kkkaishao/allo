@@ -123,6 +123,10 @@ private:
 
 void registerVivadoHLSTranslation();
 
+LogicalResult emitVivadoHLS(ModuleOp mod, llvm::raw_ostream &os,
+                            unsigned indexWidth, unsigned indentSize,
+                            bool withLocation);
+
 } // namespace mlir::allo
 
 #endif // ALLO_TRANSLATION_VIVADOHLSEMITTER_H
