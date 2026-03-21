@@ -27,7 +27,6 @@ from ..core.types import (
     TensorType,
     DType,
     unwrap_if_constexpr,
-    int1,
     index,
 )
 from ..core import types
@@ -563,22 +562,6 @@ class CodeGenerator(ast.NodeVisitor):
 
         return lower_expr(node)
 
-    def _reduce_balanced_values(self, values, combine):
-        assert len(values) > 0
-        curr = list(values)
-        while len(curr) > 1:
-            nxt = []
-            i = 0
-            while i < len(curr):
-                if i + 1 < len(curr):
-                    nxt.append(combine(curr[i], curr[i + 1]))
-                    i += 2
-                else:
-                    nxt.append(curr[i])
-                    i += 1
-            curr = nxt
-        return curr[0]
-
     def _collect_add_sub_terms(self, node: ast.AST, sign: int, out):
         if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
             self._collect_add_sub_terms(node.left, sign, out)
@@ -609,7 +592,7 @@ class CodeGenerator(ast.NodeVisitor):
         materialized = []
         for term in terms:
             if isinstance(term, Constexpr):
-                materialized.append(self.builder.make_scalar(term.value, anchor))
+                materialized.append(self.builder.cast(term, anchor))
             else:
                 materialized.append(term)
         return materialized
@@ -650,7 +633,7 @@ class CodeGenerator(ast.NodeVisitor):
                 normalized.append(self.call_operator(dsl.neg, [value], {}))
             else:
                 normalized.append(value)
-        return self._reduce_balanced_values(
+        return self.builder.reduce_balanced(
             normalized, lambda lhs, rhs: self._apply_binary_method(dsl.add, lhs, rhs)
         )
 
@@ -676,7 +659,7 @@ class CodeGenerator(ast.NodeVisitor):
             casted = [self.builder.scalar_cast(term, dst_ty) for term in terms]
             return self.builder.create_mul_nary(casted, floating=dst_ty.is_float())
 
-        return self._reduce_balanced_values(
+        return self.builder.reduce_balanced(
             terms, lambda lhs, rhs: self._apply_binary_method(dsl.mul, lhs, rhs)
         )
 
@@ -794,63 +777,6 @@ class CodeGenerator(ast.NodeVisitor):
             "'continue' statement is not supported in allo kernel functions"
         )
 
-    def _coerce_return_value(
-        self, value: Proxy | Constexpr, dst_type: BaseType
-    ) -> Proxy:
-        if isinstance(value, Constexpr):
-            if isinstance(dst_type, DType):
-                return self.builder.make_scalar(value.value, dst_type)
-            if isinstance(dst_type, ShapedType):
-                buffer = self.builder.make_buffer(dst_type)
-                const = self.builder.make_scalar(value.value, dst_type.dtype)
-                ret = self.builder.fill_buffer(buffer, const)
-                if ret is None:
-                    return buffer
-                return ret
-            self.compile_error(f"Unsupported return destination type '{dst_type}'.")
-
-        if isinstance(dst_type, DType):
-            if not isinstance(value.type, DType):
-                self.compile_error(
-                    f"Cannot return value of type '{value.type}' as scalar type '{dst_type}'."
-                )
-            return self.builder.cast(value, dst_type)
-
-        if isinstance(dst_type, TensorType):
-            if isinstance(value.type, DType):
-                buffer = self.builder.make_buffer(dst_type)
-                scalar = self.builder.cast(value, dst_type.dtype)
-                ret = self.builder.fill_buffer(buffer, scalar)
-                assert ret is not None
-                return ret
-            if isinstance(value.type, TensorType):
-                if value.type.shape != dst_type.shape:
-                    self.compile_error(
-                        f"Cannot return tensor of shape {value.type.shape} as shape {dst_type.shape}."
-                    )
-                return self.builder.tensor_cast(value, dst_type.dtype)
-            self.compile_error(
-                f"Cannot return value of type '{value.type}' as tensor type '{dst_type}'."
-            )
-
-        if isinstance(dst_type, BufferType):
-            if isinstance(value.type, DType):
-                buffer = self.builder.make_buffer(dst_type)
-                scalar = self.builder.cast(value, dst_type.dtype)
-                self.builder.fill_buffer(buffer, scalar)
-                return buffer
-            if isinstance(value.type, BufferType):
-                if value.type != dst_type:
-                    self.compile_error(
-                        f"Cannot return buffer of type '{value.type}' as '{dst_type}'."
-                    )
-                return value
-            self.compile_error(
-                f"Cannot return value of type '{value.type}' as buffer type '{dst_type}'."
-            )
-
-        self.compile_error(f"Unsupported return destination type '{dst_type}'.")
-
     def visit_Return(self, node: ast.Return):
         self.seen_return_stmt = True
 
@@ -886,18 +812,14 @@ class CodeGenerator(ast.NodeVisitor):
 
         coerced = []
         for value, dst_type in zip(return_vals, self.res_types):
-            coerced.append(self._coerce_return_value(value, dst_type))
+            coerced.append(self.builder.cast(value, dst_type))
 
         func.ReturnOp(self.builder, [v.handle for v in coerced])
 
     def visit_If(self, node: ast.If):
         cond = self.visit(node.test)
         if isinstance(cond, Proxy):
-            if isinstance(cond.type, ShapedType):
-                self.compile_error(
-                    "Condition of 'if' statement cannot be a shaped type."
-                )
-            cond = self.builder.scalar_cast(cond, int1)
+            cond = self.builder.as_condition_scalar(cond, kind="if")
             then_has_return = self._branch_has_return(node.body)
             else_has_return = self._branch_has_return(node.orelse)
             if then_has_return or else_has_return:
@@ -1083,11 +1005,7 @@ class CodeGenerator(ast.NodeVisitor):
     def visit_IfExp(self, node: ast.IfExp):
         cond = self.visit(node.test)
         if isinstance(cond, Proxy):
-            if isinstance(cond.type, ShapedType):
-                self.compile_error(
-                    "Condition of ternary expression cannot be a shaped type."
-                )
-            cond = self.builder.scalar_cast(cond, int1)
+            cond = self.builder.as_condition_scalar(cond, kind="ifexp")
             # if exp cannot define new variables
             ip, last_loc = self.builder.get_insertion_point_and_loc()
 
@@ -1111,23 +1029,10 @@ class CodeGenerator(ast.NodeVisitor):
                 res_type = then_val.type
             # Case 3: exactly one branch is a constexpr, use the other branch's type as the result type
             res_type = then_val.type if not then_is_constexpr else else_val.type
-            # if the non-constexpr branch is a shaped type, we need to broadcast the constexpr branch to the same shape
-            if isinstance(res_type, ShapedType):
-                if then_is_constexpr:
-                    const = self.builder.make_scalar(then_val.value, res_type.dtype)
-                    buffer = self.builder.make_buffer(res_type)
-                    ret = self.builder.fill_buffer(buffer, const)
-                    then_val = ret if ret is not None else buffer
-                if else_is_constexpr:
-                    const = self.builder.make_scalar(else_val.value, res_type.dtype)
-                    buffer = self.builder.make_buffer(res_type)
-                    ret = self.builder.fill_buffer(buffer, const)
-                    else_val = ret if ret is not None else buffer
-            else:
-                if then_is_constexpr:
-                    then_val = self.builder.make_scalar(then_val.value, res_type)
-                if else_is_constexpr:
-                    else_val = self.builder.make_scalar(else_val.value, res_type)
+            if then_is_constexpr:
+                then_val = self.builder.cast(then_val, res_type)
+            if else_is_constexpr:
+                else_val = self.builder.cast(else_val, res_type)
 
             # create select op
             self.builder.set_insertion_point_and_loc(ip, last_loc)
@@ -1178,9 +1083,7 @@ class CodeGenerator(ast.NodeVisitor):
         if not (isinstance(step, Constexpr) and step.value > 0):
             self.compile_error("loop step must be a positive integer in 'for' loops")
 
-        lb = self.builder.make_or_cast_scalar(lb, index)
-        ub = self.builder.make_or_cast_scalar(ub, index)
-        step = self.builder.make_or_cast_scalar(step, index)
+        lb, ub, step = self.builder.normalize_indices((lb, ub, step), expected_len=3)
 
         with EnterSubRegion(self):
             index_ty = index.to_mlir(self.context)
@@ -1291,9 +1194,9 @@ class CodeGenerator(ast.NodeVisitor):
         if not all(isinstance(s, Constexpr) and s.value > 0 for s in steps):
             self.compile_error("loop step must be a positive integer in 'for' loops")
 
-        lb_proxies = [self.builder.make_or_cast_scalar(lb, index) for lb in lbs]
-        ub_proxies = [self.builder.make_or_cast_scalar(ub, index) for ub in ubs]
-        step_proxies = [self.builder.make_or_cast_scalar(step, index) for step in steps]
+        lb_proxies = self.builder.normalize_indices(lbs)
+        ub_proxies = self.builder.normalize_indices(ubs)
+        step_proxies = self.builder.normalize_indices(steps)
 
         with EnterSubRegion(self):
             index_ty = index.to_mlir(self.context)
@@ -1428,72 +1331,53 @@ class CodeGenerator(ast.NodeVisitor):
             value = self.visit(node.value) if node.value else None
 
         target = self.visit(target)
+        if target in self.lscope:
+            self.compile_error(
+                f"Variable '{target}' is already defined in the current scope."
+            )
 
         if value is None:
-            # we only allow buffer to be declared without initializer
-            if not isinstance(parsed_type, ShapedType):
+            if parsed_type == Constexpr:
                 self.compile_error(
-                    f"Type annotation is required for variable declaration without initializer, and it must be a shaped type. Got '{annotation}'."
+                    f"Constexpr variables must be initialized with a constant value. Please provide an initializer for this variable."
                 )
-            proxy = self.builder.make_buffer(parsed_type)
+            proxy = parsed_type.make_default(self.builder)
             self._set_value_with_loc(target, proxy)
         else:
-            if isinstance(value, Constexpr):
-                # Case 1: target is also constexpr
-                if parsed_type == Constexpr:
+            if parsed_type == Constexpr:
+                if isinstance(value, Constexpr):
                     self._set_value(target, value)
-                # Case 2: target is a scalar
-                elif isinstance(parsed_type, DType):
-                    proxy = self.builder.make_scalar(value.value, parsed_type)
-                    self._set_value_with_loc(target, proxy)
-                # Case 3: target is a shaped type
-                elif isinstance(parsed_type, ShapedType):
-                    buffer = self.builder.make_buffer(parsed_type)
-                    const = self.builder.make_scalar(value.value, parsed_type.dtype)
-                    proxy = self.builder.fill_buffer(buffer, const)
-                    if proxy is None:
-                        self._set_value_with_loc(target, buffer)
-                    else:
-                        self._set_value_with_loc(target, proxy)
-            elif isinstance(value, Proxy):
-                # Case 4: target is dtype
-                if isinstance(parsed_type, DType) and isinstance(value.type, DType):
-                    proxy = self.builder.cast(value, parsed_type)
-                    self._set_value_with_loc(target, proxy)
-                # Case 5: target is tensor type
-                elif isinstance(parsed_type, TensorType):
-                    if isinstance(value.type, DType):
-                        buffer = self.builder.make_buffer(parsed_type)
-                        value = self.builder.cast(value, parsed_type.dtype)
-                        proxy = self.builder.fill_buffer(buffer, value)
-                        assert proxy is not None
-                        self._set_value_with_loc(target, proxy)
-                    elif isinstance(value.type, TensorType):
-                        if value.type != parsed_type:
-                            self.compile_error(
-                                f"Cannot assign a tensor of type '{value.type}' to a variable of type '{parsed_type}'."
-                            )
-                        proxy = self.builder.tensor_cast(value, parsed_type.dtype)
-                        self._set_value_with_loc(target, proxy)
-                # Case 6: target is buffer type
-                elif isinstance(parsed_type, BufferType):
-                    if isinstance(value.type, DType):
-                        buffer = self.builder.make_buffer(parsed_type)
-                        value = self.builder.cast(value, parsed_type.dtype)
-                        self.builder.fill_buffer(buffer, value)
-                        self._set_value_with_loc(target, buffer)
-                    elif isinstance(value.type, BufferType):
-                        self.compile_error(
-                            "Direct assignment between buffer types is not supported. If you want to copy data from one buffer to another, please use 'copy' operator to fill the target buffer with the source buffer."
-                        )
-                else:
+                    return
+                if isinstance(value, Proxy):
                     self.compile_error(
                         f"Unsupported assignment with type annotation '{annotation}' and value of type '{value.type}'."
                     )
-            else:
                 self.compile_error(
                     f"Unsupported initializer for variable assignment with type annotation '{annotation}'."
                 )
+
+            if not isinstance(value, (Proxy, Constexpr)):
+                self.compile_error(
+                    f"Unsupported initializer for variable assignment with type annotation '{annotation}'."
+                )
+
+            if (
+                isinstance(parsed_type, BufferType)
+                and isinstance(value, Proxy)
+                and isinstance(value.type, BufferType)
+            ):
+                self.compile_error(
+                    "Direct assignment between buffer types is not supported. If you want to copy data from one buffer to another, please use 'copy' operator to fill the target buffer with the source buffer."
+                )
+
+            try:
+                proxy = self.builder.cast(value, parsed_type)
+            except CompilationError:
+                value_ty = value.type if isinstance(value, Proxy) else "constexpr"
+                self.compile_error(
+                    f"Unsupported assignment with type annotation '{annotation}' and value of type '{value_ty}'."
+                )
+            self._set_value_with_loc(target, proxy)
 
     def visit_Assign(self, node: ast.Assign):
         targets = node.targets
@@ -1671,7 +1555,7 @@ class CodeGenerator(ast.NodeVisitor):
             return self.call_nested_kernel(fn, args, kws)
         if isinstance(fn, Kernel):
             return self.call_kernel(fn, args, kws)
-        if isinstance(fn, Operator):
+        if isinstance(fn, (Operator, BoundOperator)):
             return self.call_operator(fn, args, kws)
         if isinstance(fn, ConstevalFunction):
             try:
@@ -1716,14 +1600,12 @@ class CodeGenerator(ast.NodeVisitor):
         if not isinstance(value, Constexpr):
             value = Constexpr(value)
 
-        if isinstance(expected_ty, DType):
-            return self.builder.make_scalar(value.value, expected_ty).handle
-        if isinstance(expected_ty, ShapedType):
-            materialized = self._coerce_return_value(value, expected_ty)
-            return materialized.handle
-        self.compile_error(
-            f"Kernel call argument '{arg_name}' has unsupported destination type '{expected_ty}'."
-        )
+        try:
+            return self.builder.cast(value, expected_ty).handle
+        except CompilationError:
+            self.compile_error(
+                f"Kernel call argument '{arg_name}' has unsupported destination type '{expected_ty}'."
+            )
 
     def _decode_kernel_call_results(self, call_op, res_types: list[BaseType]):
         if len(res_types) == 0:
@@ -2100,16 +1982,20 @@ class CodeGenerator(ast.NodeVisitor):
         if isinstance(fn, BoundOperator):
             args = fn.bind_args(args)
             fn = fn.op
-        err_msg = fn.run_validate(*args, **kws)
-        if err_msg:
-            self.compile_error(
-                "Invalid arguments for operator '{}': {}".format(fn.__name__, err_msg)
-            )
+        ip, last_loc = self.builder.get_insertion_point_and_loc()
+        try:
+            err_msg = fn.run_validate(*args, **kws)
+            if err_msg:
+                self.compile_error(
+                    "Invalid arguments for operator '{}': {}".format(
+                        fn.__name__, err_msg
+                    )
+                )
+        except TypeError:
+            self.compile_error(f"Invalid argument number for operator '{fn.__name__}'.")
         folded = fn.run_const_fold(*args, **kws)
         if folded is not NO_FOLD:
             return folded
-        # save states
-        ip, last_loc = self.builder.get_insertion_point_and_loc()
         ret = fn.run_lower(self.builder, *args, **kws)
         # restore states
         self.builder.set_insertion_point_and_loc(ip, last_loc)
@@ -2241,6 +2127,7 @@ def compile(
                 f"In function: {fn.func_name}, module verification failed."
             )
 
+        module.cse_and_canonicalize()
         return module, generator.context
     except Exception as exc:
         if show_traceback:

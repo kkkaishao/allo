@@ -57,12 +57,12 @@ PartitionAxisAttr::verify(llvm::function_ref<InFlightDiagnostic()> emitError,
 
 LogicalResult
 PartitionAttr::verify(llvm::function_ref<InFlightDiagnostic()> emitError,
-                      ArrayRef<PartitionAxisAttr> axes) {
+                      ArrayRef<PartitionAxisAttr> partitions) {
   DenseSet<int64_t> seen;
-  for (auto &axi : axes) {
+  for (auto &axi : partitions) {
     seen.insert(axi.getDim());
   }
-  if (seen.size() < axes.size()) {
+  if (seen.size() < partitions.size()) {
     return emitError() << "duplicate partition axis detected";
   }
   return success();
@@ -75,7 +75,7 @@ LogicalResult StreamGetOp::verify() {
     return emitOpError() << "stream type " << streamTy
                          << " does not match value type " << valueTy;
   }
-  auto srcRank = getStream().getDefiningOp<StreamCreateOp>().getShape().size();
+  auto srcRank = streamTy.getShape().size();
   auto dstRank = getIndices().size();
   if (srcRank != dstRank) {
     return emitOpError() << "rank of stream (" << srcRank
@@ -92,7 +92,7 @@ LogicalResult StreamPutOp::verify() {
     return emitOpError() << "stream type " << streamTy
                          << " does not match value type " << valueTy;
   }
-  auto dstRank = getStream().getDefiningOp<StreamCreateOp>().getShape().size();
+  auto dstRank = streamTy.getShape().size();
   auto srcRank = getIndices().size();
   if (srcRank != dstRank) {
     return emitOpError() << "rank of stream (" << dstRank
@@ -116,7 +116,7 @@ GlobalStreamGetOp::verifySymbolUses(SymbolTableCollection &symbolTable) {
     return emitOpError() << "stream type " << streamTy
                          << " does not match value type " << valueTy;
   }
-  auto srcRank = globalStream.getShape().size();
+  auto srcRank = streamTy.getShape().size();
   auto dstRank = getIndices().size();
   if (srcRank != dstRank) {
     return emitOpError() << "rank of stream (" << srcRank
@@ -140,7 +140,7 @@ GlobalStreamPutOp::verifySymbolUses(SymbolTableCollection &symbolTable) {
     return emitOpError() << "stream type " << streamTy
                          << " does not match value type " << valueTy;
   }
-  auto dstRank = globalStream.getShape().size();
+  auto dstRank = streamTy.getShape().size();
   auto srcRank = getIndices().size();
   if (srcRank != dstRank) {
     return emitOpError() << "rank of stream (" << dstRank

@@ -32,6 +32,7 @@ from .ops_arith import (
 )
 
 from .ops_memory import load, store
+from .ops_spmd import get_wid, get_num_workers, get, put
 
 
 # placeholder for static_assert

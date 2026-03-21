@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import builtins
-import re
 from collections.abc import Sequence
 
 from .._C.ir import (
@@ -23,8 +22,12 @@ from .._C.ir import (
     RankedTensorType,
     OpState,
 )
+from .._C.allo import StreamType
 
-from typing import cast
+from typing import cast, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from ..compiler.builder import AlloOpBuilder
 
 ALLO_BUILTIN_ATTR = "__allo_builtin_attribute__"
 
@@ -41,13 +44,11 @@ class BaseType:
         eq = self.__eq__(value)
         return not eq
 
-    def to_frontend(
-        self, handles: Sequence[Value], cursor: int
-    ) -> builtins.tuple[BaseValue, int]:
-        raise NotImplementedError
-
     def to_mlir(self, context: Context) -> Type:
         raise NotImplementedError
+
+    def make_default(self, builder: AlloOpBuilder) -> Proxy:
+        builder.compile_error(f"Cannot create uninitialized value of type {self}")
 
 
 class BaseValue:
@@ -68,11 +69,6 @@ class ConstexprType(BaseType):
 
     def __eq__(self, value: object, /) -> bool:
         return isinstance(value, ConstexprType) and self.value == value.value
-
-    def to_frontend(
-        self, handles: Sequence[Value], cursor: int
-    ) -> builtins.tuple[BaseValue, int]:
-        return Constexpr(self.value), cursor
 
     def to_mlir(self, context: Context) -> Type:
         # constexprs will not occur in the IR
@@ -132,11 +128,6 @@ class DType(BaseType):
 
     def __hash__(self) -> int:
         return hash((self.name, self.primitive_width))
-
-    def to_frontend(
-        self, handles: Sequence[Value], cursor: int
-    ) -> builtins.tuple[BaseValue, int]:
-        return Proxy(handles[cursor], self), cursor + 1
 
     def to_mlir(self, context: Context) -> Type:
         raise NotImplementedError(
@@ -325,6 +316,9 @@ class ShapedType(BaseType):
         self.shape = [shape] if isinstance(shape, int) else shape
         self.rank = len(shape)
 
+    def make_default(self, builder: AlloOpBuilder) -> Proxy | Constexpr:
+        return builder.make_buffer(self)
+
 
 class BufferType(ShapedType):
     """
@@ -349,11 +343,6 @@ class BufferType(ShapedType):
 
     def __hash__(self) -> int:
         return hash((self.dtype, builtins.tuple(self.shape)))
-
-    def to_frontend(
-        self, handles: Sequence[Value], cursor: int
-    ) -> builtins.tuple[BaseValue, int]:
-        return Proxy(handles[cursor], self), cursor + 1
 
     def to_mlir(self, context: Context) -> MemRefType:
         identity = AffineMap.get_identity(len(self.shape), context)
@@ -385,13 +374,66 @@ class TensorType(ShapedType):
     def __hash__(self) -> int:
         return hash((self.dtype, builtins.tuple(self.shape)))
 
-    def to_frontend(
-        self, handles: Sequence[Value], cursor: int
-    ) -> builtins.tuple[BaseValue, int]:
-        return Proxy(handles[cursor], self), cursor + 1
-
     def to_mlir(self, context: Context) -> RankedTensorType:
         return RankedTensorType.get(self.shape, self.dtype.to_mlir(context))
+
+
+class Stream(BaseType):
+    """
+    allo stream type, represents a stream of data with a certain element type.
+    """
+
+    def __init__(
+        self, base_type: DType | ShapedType, depth: int = 2, shape: Sequence[int] = ()
+    ):
+        self.base_type = base_type
+        self.dtype = base_type.dtype if isinstance(base_type, ShapedType) else base_type
+        self.depth = depth
+        self.shape = shape
+        self.rank = len(shape)
+
+    def __eq__(self, value: object, /) -> bool:
+        return isinstance(value, Stream) and self.dtype == value.dtype
+
+    def __str__(self):
+        return f"stream<{"x".join(str(s) for s in self.shape)}x{self.base_type},{self.depth}>"
+
+    def __repr__(self) -> str:
+        return self.__str__()
+
+    def __hash__(self) -> int:
+        return hash((self.base_type, self.depth, builtins.tuple(self.shape)))
+
+    def to_mlir(self, context: Context) -> StreamType:
+        # stream types are currently opaque in the IR, so we just return the element type
+        return StreamType.get(
+            context, self.base_type.to_mlir(context), self.depth, self.shape
+        )
+
+    def make_default(self, builder: AlloOpBuilder) -> Proxy:
+        return builder.make_stream(self)
+
+
+class StreamRef(Stream):
+    def __init__(self, stream_type: Stream, indices: Sequence[Proxy]):
+        super().__init__(stream_type.base_type, stream_type.depth, stream_type.shape)
+        self.indices = indices
+
+    def __str__(self):
+        return f"stream_ref({self.base_type}, indices={[str(i) for i in self.indices]})"
+
+    def __repr__(self) -> str:
+        return self.__str__()
+
+    def to_mlir(self, context: Context) -> StreamType:
+        raise NotImplementedError(
+            "StreamRef is a frontend-only type and cannot be converted to MLIR"
+        )
+
+    def make_default(self, builder: AlloOpBuilder) -> Proxy:
+        raise NotImplementedError(
+            "StreamRef is a frontend-only type and cannot be instantiated"
+        )
 
 
 class Proxy(BaseValue):
@@ -399,7 +441,7 @@ class Proxy(BaseValue):
     allo frontend proxy value. This is the value type that is actually used in the frontend IR. It contains a handle to the underlying MLIR value, as well as metadata about the type and shape of the value for use in the frontend.
     """
 
-    def __init__(self, handle: Value | OpState, type: ShapedType | DType):
+    def __init__(self, handle: Value | OpState, type: ShapedType | DType | Stream):
         if isinstance(handle, OpState):
             if handle.get_num_results() != 1:
                 raise ValueError(
@@ -408,10 +450,12 @@ class Proxy(BaseValue):
             handle = handle.get_result_at(0)
         self._handle = cast(Value, handle)
         self.type = type
-        self.dtype = type.dtype if isinstance(type, ShapedType) else type
-        self.shape = tuple(type.shape) if isinstance(type, ShapedType) else ()
-        if len(self.shape) > 0:
-            self.shape = tuple(Constexpr(s) for s in self.shape)
+        if isinstance(type, (Stream, ShapedType)):
+            self.dtype = type.dtype
+            self.shape = tuple(Constexpr(s) for s in type.shape)
+        else:
+            self.dtype = type
+            self.shape = ()
 
     def __hash__(self) -> int:
         return hash(self._handle)

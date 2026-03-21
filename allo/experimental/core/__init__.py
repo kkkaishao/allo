@@ -54,4 +54,5 @@ from .types import (
     range,
     grid,
     constexpr,
+    Stream,
 )

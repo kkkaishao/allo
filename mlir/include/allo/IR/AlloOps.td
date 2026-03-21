@@ -58,7 +58,7 @@ def StreamGetOp : Allo_Op<"stream.get", [MemoryEffects<[MemRead, MemWrite]>]> {
   let arguments = (ins Stream:$stream, Variadic<Index>:$indices);
   let results = (outs AnyType:$value);
   let assemblyFormat = [{
-    $stream `[` $indices `]` attr-dict `:` type($stream) `,` type($value)
+    $stream `[` $indices `]` attr-dict `:` qualified(type($stream)) `,` type($value)
   }];
   let builders = [
     OpBuilder<(ins "Value":$stream, "ArrayRef<Value>":$indices), [{
@@ -78,7 +78,7 @@ def StreamPutOp : Allo_Op<"stream.put", [MemoryEffects<[MemWrite]>]> {
   let arguments = (ins Stream:$stream, Variadic<Index>:$indices, AnyType:$value);
   let results = (outs);
   let assemblyFormat = [{
-    $value `,` $stream `[` $indices `]` attr-dict `:` type($value) `,` type($stream)
+    $value `,` $stream `[` $indices `]` attr-dict `:` type($value) `,` qualified(type($stream))
   }];
   let hasVerifier = 1;
 }
@@ -88,10 +88,10 @@ def StreamCreateOp : Allo_Op<"stream.create", [MemoryEffects<[MemAlloc]>]> {
   let description = [{
     This operation creates a new stream.
   }];
-  let arguments = (ins DenseI64ArrayAttr:$shape);
+  let arguments = (ins);
   let results = (outs Stream:$stream);
   let assemblyFormat = [{
-    $shape attr-dict `:` type($stream)
+    attr-dict `:` qualified(type($stream))
   }];
 }
 
@@ -129,10 +129,10 @@ def GlobalStreamCreateOp : Allo_Op<"stream.create_global", [
   let description = [{
     This operation creates a new global stream.
   }];
-  let arguments = (ins SymbolNameAttr:$sym_name, DenseI64ArrayAttr:$shape);
+  let arguments = (ins SymbolNameAttr:$sym_name);
   let results = (outs Stream:$stream);
   let assemblyFormat = [{
-    $sym_name $shape attr-dict `:` type($stream)
+    $sym_name attr-dict `:` qualified(type($stream))
   }];
 }
 

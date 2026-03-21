@@ -753,10 +753,12 @@ void bindAlloOps(nb::module_ &m) {
   nb::class_<allo::StreamType, Type>(m, "StreamType")
       .def_static(
           "get",
-          [](MLIRContext &ctx, Type &baseType, size_t depth) {
-            return allo::StreamType::get(&ctx, baseType, depth);
+          [](MLIRContext &ctx, Type &baseType, size_t depth,
+             const std::vector<int64_t> &shape = {}) {
+            return allo::StreamType::get(&ctx, baseType, depth, shape);
           },
-          nb::arg("context"), nb::arg("base_type"), nb::arg("depth"));
+          nb::arg("context"), nb::arg("base_type"), nb::arg("depth"),
+          nb::arg("shape") = std::vector<int64_t>());
 
   auto wid = bindOp<allo::GetWorkerIdOp>(m, "GetWorkerIdOp");
   bindConstructor(
@@ -819,20 +821,19 @@ void bindAlloOps(nb::module_ &m) {
   auto screate = bindOp<allo::StreamCreateOp>(m, "StreamCreateOp");
   bindConstructor(
       screate,
-      [](AlloOpBuilder &builder, allo::StreamType &elementType,
-         const std::vector<int64_t> &shape) {
+      [](AlloOpBuilder &builder, allo::StreamType &streamType) {
         return allo::StreamCreateOp::create(builder, builder.getLocation(),
-                                            elementType, shape);
+                                            streamType);
       },
-      nb::arg("element_type"), nb::arg("shape"));
+      nb::arg("element_type"));
 
   auto gscreate = bindOp<allo::GlobalStreamCreateOp>(m, "GlobalStreamCreateOp");
   bindConstructor(
       gscreate,
       [](AlloOpBuilder &builder, std::string_view name,
-         allo::StreamType &streamType, const std::vector<int64_t> &shape) {
+         allo::StreamType &streamType) {
         return allo::GlobalStreamCreateOp::create(
-            builder, builder.getLocation(), streamType, name, shape);
+            builder, builder.getLocation(), streamType, name);
       },
-      nb::arg("name"), nb::arg("stream_type"), nb::arg("shape"));
+      nb::arg("name"), nb::arg("stream_type"));
 }

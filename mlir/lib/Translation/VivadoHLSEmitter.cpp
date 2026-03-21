@@ -396,6 +396,10 @@ void VivadoHLSEmitter::emitValue(Value val) {
       for (auto dim : shaped.getShape()) {
         state.os << "[" << dim << "]";
       }
+    } else if (auto streamType = dyn_cast<StreamType>(val.getType())) {
+      for (auto dim : streamType.getShape()) {
+        state.os << "[" << dim << "]";
+      }
     }
   }
 }
@@ -624,6 +628,38 @@ void VivadoHLSEmitter::emitCondition(scf::ConditionOp op) {
   // os << ";";
 }
 
+void VivadoHLSEmitter::emitStreamCreate(allo::StreamCreateOp op) {
+  llvm::raw_ostream &os = state.os;
+  emitValue(op.getResult());
+  os << ";";
+}
+
+void VivadoHLSEmitter::emitStreamGet(allo::StreamGetOp op) {
+  llvm::raw_ostream &os = state.os;
+  emitValue(op.getResult());
+  os << " = ";
+  emitValue(op.getStream());
+  for (auto idx : op.getIndices()) {
+    os << "[";
+    emitValue(idx);
+    os << "]";
+  }
+  os << ".read();";
+}
+
+void VivadoHLSEmitter::emitStreamPut(allo::StreamPutOp op) {
+  llvm::raw_ostream &os = state.os;
+  emitValue(op.getStream());
+  for (auto idx : op.getIndices()) {
+    os << "[";
+    emitValue(idx);
+    os << "]";
+  }
+  os << ".write(";
+  emitValue(op.getValue());
+  os << ");";
+}
+
 void VivadoHLSEmitter::dispatch(Operation *op) {
   if (isa<scf::YieldOp, affine::AffineYieldOp>(op) &&
       op->getNumOperands() == 0) {
@@ -736,6 +772,10 @@ void VivadoHLSEmitter::dispatch(Operation *op) {
       .Case<scf::IfOp>([&](auto op) { emitIf(op); })
       .Case<scf::YieldOp>([&](auto op) { emitSCFYield(op); })
       .Case<scf::WhileOp>([&](auto op) { emitWhile(op); })
+
+      .Case<allo::StreamCreateOp>([&](auto op) { emitStreamCreate(op); })
+      .Case<allo::StreamGetOp>([&](auto op) { emitStreamGet(op); })
+      .Case<allo::StreamPutOp>([&](auto op) { emitStreamPut(op); })
 
       .Default([&](auto op) {
         op->emitError() << "operation not supported in Vivado HLS emitter: "

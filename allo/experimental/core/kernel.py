@@ -29,6 +29,8 @@ from ..core.types import (
     int64,
     BufferType,
     TensorType,
+    ShapedType,
+    Stream,
     BaseValue,
     DType,
     unwrap_if_constexpr,
@@ -71,6 +73,56 @@ def _infer_value_type(val, enable_tensor: bool = True) -> BaseType:
             return BufferType(dtype=dtype, shape=val.shape)
     else:
         raise TypeError(f"Unsupported value type: {type(val)}")
+
+
+def _parse_shape_dims(content: str) -> list[int]:
+    raw = content.strip()
+    if raw == "":
+        raise TypeError(f"Unsupported type annotation: [{content}]")
+    dims = []
+    for tok in raw.split(","):
+        tok = tok.strip()
+        if not re.fullmatch(r"\d+", tok):
+            raise TypeError(f"Unsupported type annotation: [{content}]")
+        dims.append(int(tok))
+    if len(dims) == 0:
+        raise TypeError(f"Unsupported type annotation: [{content}]")
+    return dims
+
+
+def _split_annotation_groups(annotation: str) -> tuple[str, list[str]]:
+    text = annotation.strip()
+    match = re.match(r"[A-Za-z_]\w*", text)
+    if match is None:
+        raise TypeError(f"Unsupported type annotation: {annotation}")
+    head = match.group(0)
+    i = match.end()
+    groups = []
+    while i < len(text):
+        while i < len(text) and text[i].isspace():
+            i += 1
+        if i >= len(text):
+            break
+        if text[i] != "[":
+            raise TypeError(f"Unsupported type annotation: {annotation}")
+        start = i + 1
+        depth = 0
+        while i < len(text):
+            ch = text[i]
+            if ch == "[":
+                depth += 1
+            elif ch == "]":
+                depth -= 1
+                if depth == 0:
+                    groups.append(text[start:i].strip())
+                    i += 1
+                    break
+                if depth < 0:
+                    raise TypeError(f"Unsupported type annotation: {annotation}")
+            i += 1
+        if depth != 0:
+            raise TypeError(f"Unsupported type annotation: {annotation}")
+    return head, groups
 
 
 @dataclass(frozen=True)
@@ -248,22 +300,28 @@ class Kernel(Generic[P, R]):
         if isinstance(annotation, BaseType):
             return annotation
         if isinstance(annotation, str):
+            annotation = annotation.strip()
             # Case 1: direct type name, e.g. "int32"
-            if annotation in globals() and isinstance(globals()[annotation], BaseType):
-                return globals()[annotation]
-            # Case 2: buffer types, e.g. "int32[4][8]"
-            buffer_match = re.fullmatch(r"([A-Za-z_]\w*)((?:\[\d+\])+$)", annotation)
-            if buffer_match:
-                dtype_str = buffer_match.group(1)
-                shape = [
-                    int(x) for x in re.findall(r"\[(\d+)\]", buffer_match.group(2))
-                ]
-                if dtype_str in globals() and isinstance(globals()[dtype_str], DType):
-                    dtype = globals()[dtype_str]
+            primitive_type = self.__globals__.get(annotation, None)
+            if primitive_type is not None and isinstance(primitive_type, BaseType):
+                return primitive_type
+            head, groups = _split_annotation_groups(annotation)
+            if head in self.__globals__:
+                # Case 2: shaped type, e.g. "int32[4, 8]"
+                if isinstance(self.__globals__[head], DType) and len(groups) == 1:
+                    dtype = self.__globals__[head]
+                    shape = _parse_shape_dims(groups[0])
                     if self.options.enable_tensor:
                         return TensorType(dtype=dtype, shape=shape)
-                    else:
-                        return BufferType(dtype=dtype, shape=shape)
+                    return BufferType(dtype=dtype, shape=shape)
+                composite_type = self.__globals__[head]
+                # Case 3: stream type, e.g. "Stream[int32[4, 8]][2, 2]"
+                if composite_type == Stream and len(groups) in (1, 2):
+                    base_type = self.parse_type_annotation(groups[0])
+                    if not isinstance(base_type, (DType, ShapedType)):
+                        raise TypeError(f"Unsupported type annotation: {annotation}")
+                    shape = [] if len(groups) == 1 else _parse_shape_dims(groups[1])
+                    return Stream(base_type=base_type, shape=shape)
         raise TypeError(f"Unsupported type annotation: {annotation}")
 
     def parse_return_annotation(self, annotation: object) -> list[BaseType]:
@@ -280,12 +338,7 @@ def schedule(k: Kernel):
     from ..schedule import Schedule
 
     if isinstance(k, Kernel):
-        if k.module is None:
-            raise RuntimeError(
-                f"Kernel {k.func_name} has not been compiled. Please compile the kernel before scheduling."
-            )
-        else:
-            return Schedule.from_module(k.module)
+        return k.schedule()
     elif isinstance(k, ModuleOp):
         return Schedule.from_module(k)
     else:

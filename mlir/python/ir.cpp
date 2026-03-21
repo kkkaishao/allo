@@ -7,8 +7,6 @@
 #include "nanobind/stl/vector.h"
 
 #include "mlir/Bytecode/BytecodeWriter.h"
-#include "mlir/Dialect/Affine/IR/AffineOps.h"
-#include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinOps.h"
@@ -17,11 +15,9 @@
 #include "mlir/IR/IntegerSet.h"
 #include "mlir/IR/MLIRContext.h"
 #include "mlir/IR/Verifier.h"
-#include "mlir/Parser/Parser.h"
 #include "mlir/Pass/PassManager.h"
-#include "mlir/Support/FileUtilities.h"
+#include "mlir/Transforms/Passes.h"
 #include "llvm/ADT/SmallVector.h"
-#include "llvm/Support/Signals.h"
 
 #include "allo/InitAllDialects.h"
 #include "allo/InitAllExtensions.h"
@@ -426,7 +422,16 @@ static void bindCoreIR(nb::module_ &m) {
           "push_back",
           [](ModuleOp &self, Operation *op) { self.getBody()->push_back(op); },
           nb::arg("op"))
-      .def("get_context", &ModuleOp::getContext, nb::rv_policy::reference);
+      .def("get_context", &ModuleOp::getContext, nb::rv_policy::reference)
+      .def("cse_and_canonicalize", [](ModuleOp &self) {
+        PassManager pm(self.getContext());
+        pm.addPass(mlir::createCanonicalizerPass());
+        pm.addPass(mlir::createCSEPass());
+        if (failed(pm.run(self))) {
+          throw std::runtime_error(
+              "Failed to run CSE and Canonicalizer passes");
+        }
+      });
 }
 
 static void bindTypes(nb::module_ &m) {

@@ -51,6 +51,10 @@ struct VivadoHLSEmitter {
   void emitCmpI(arith::CmpIOp op);
   void emitCmpF(arith::CmpFOp op);
 
+  void emitStreamCreate(allo::StreamCreateOp op);
+  void emitStreamGet(allo::StreamGetOp op);
+  void emitStreamPut(allo::StreamPutOp op);
+
   void emitModule(ModuleOp);
 
   EmitterState state;

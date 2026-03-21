@@ -24,14 +24,17 @@ from ..core.types import (
     DType,
     Proxy,
     IndexType,
+    index,
     ShapedType,
     int1,
     TensorType,
     BufferType,
     APFloat,
     Constexpr,
+    Stream,
+    BaseType,
 )
-from .._C import arith, tensor, linalg, math, memref
+from .._C import arith, tensor, linalg, math, memref, allo
 from ..core.rule import TypeTable, CppTypeTable
 
 
@@ -112,12 +115,6 @@ class AlloOpBuilder(ir.AlloOpBuilder):
             else:
                 # memref mode has no return vals
                 return None
-
-    def make_or_cast_scalar(self, proxy: Proxy | Constexpr, dtype: DType) -> Proxy:
-        if isinstance(proxy, Constexpr):
-            return self.make_scalar(proxy.value, dtype)
-        else:
-            return self.scalar_cast(proxy, dtype)
 
     #####################
     # Type Casting
@@ -276,19 +273,105 @@ class AlloOpBuilder(ir.AlloOpBuilder):
         handle = tensor.CastOp(
             self, value, dst_type.to_mlir(self.context)
         ).get_result_at(0)
-        new_type = ShapedType(dst_type, src.type.shape)
+        if isinstance(src.type, TensorType):
+            new_type = TensorType(dst_type, src.type.shape)
+        elif isinstance(src.type, BufferType):
+            new_type = BufferType(dst_type, src.type.shape)
+        else:
+            new_type = ShapedType(dst_type, src.type.shape)
         return Proxy(handle, new_type)
 
-    def cast(self, src: Proxy, dst_type: DType) -> Proxy:
-        """
-        Generic entry point for type casting, it will dispatch to `scalar_cast` or `tensor_cast` based on the type of `src`. User must ensure that `dst_type` is a scalar type, and `src` is either a scalar or a tensor. The method will return a new proxy value with the same value as `src` but with type `dst_type`.
-        """
-        if isinstance(src.type, DType):
-            return self.scalar_cast(src, dst_type)
-        elif isinstance(src.type, ShapedType):
-            return self.tensor_cast(src, dst_type)
+    def as_condition_scalar(self, cond: Proxy, *, kind: str = "if") -> Proxy:
+        if isinstance(cond.type, ShapedType):
+            if kind == "ifexp":
+                self.compile_error(
+                    "Condition of ternary expression cannot be a shaped type."
+                )
+            self.compile_error("Condition of 'if' statement cannot be a shaped type.")
+        return self.scalar_cast(cond, int1)
+
+    def cast(self, src: Proxy | Constexpr, dst_type: BaseType) -> Proxy:
+        # Case 1: src is constexpr
+        if isinstance(src, Constexpr):
+            # Case 1.1: dst_type is DType
+            if isinstance(dst_type, DType):
+                return self.make_scalar(src.value, dst_type)
+            # Case 1.2: dst_type is ShapedType
+            if isinstance(dst_type, ShapedType):
+                const = self.make_scalar(src.value, dst_type.dtype)
+                buffer = self.make_buffer(dst_type)
+                fill_op = linalg.FillOp(self, const.handle, buffer.handle)
+                if isinstance(dst_type, TensorType):
+                    return Proxy(fill_op, dst_type)
+                if isinstance(dst_type, BufferType):
+                    return buffer
         else:
-            self.compile_error(f"Unsupported type for cast: {src.type}")
+            assert isinstance(src, Proxy)
+            # Case 2: src.type is DType
+            if isinstance(src.type, DType):
+                # Case 2.1: dst_type is DType
+                if isinstance(dst_type, DType):
+                    return self.scalar_cast(src, dst_type)
+                # Case 2.2: dst_type is ShapedType
+                if isinstance(dst_type, ShapedType):
+                    const = self.scalar_cast(src, dst_type.dtype)
+                    buffer = self.make_buffer(dst_type)
+                    fill_op = linalg.FillOp(self, const.handle, buffer.handle)
+                    if isinstance(dst_type, TensorType):
+                        return Proxy(fill_op, dst_type)
+                    if isinstance(dst_type, BufferType):
+                        return buffer
+            # Case 3: src.type is TensorType
+            if isinstance(src.type, TensorType):
+                # Case 3.1: dst_type is TensorType
+                if isinstance(dst_type, TensorType):
+                    # Case 3.1.1: same shape, dtype may differ
+                    if src.shape == dst_type.shape:
+                        return self.tensor_cast(src, dst_type.dtype)
+                    # Case 3.1.2: same dtype, shape may differ but broadcastable
+                    if src.dtype == dst_type.dtype:
+                        shape, indices_a, _ = self.infer_broadcast_shape(
+                            src.type.shape, dst_type.shape
+                        )
+                        if shape and indices_a:
+                            # need broadcasting
+                            init = tensor.EmptyOp(
+                                self, shape, dst_type.dtype.to_mlir(self.context)
+                            ).get_result_at(0)
+                            broadcast = linalg.BroadcastOp(
+                                self, src.handle, init, indices_a
+                            )
+                            return Proxy(broadcast, dst_type)
+                    # do not allow cast dtype and broadcast at the same time
+            # Case 4: src.type is BufferType
+            if isinstance(src.type, BufferType) and isinstance(dst_type, BufferType):
+                if src.type == dst_type:
+                    return src
+
+        src_ty = src.type if isinstance(src, Proxy) else "constexpr"
+        self.compile_error(
+            f"Cannot cast from {src_ty} to {dst_type}, unsupported type combination or value is not broadcastable"
+        )
+
+    def normalize_indices(
+        self,
+        indices: Sequence[Proxy | Constexpr | tuple],
+        *,
+        expected_len: int | None = None,
+        context: str | None = None,
+    ) -> list[Proxy]:
+        out = []
+        for val in indices:
+            if isinstance(val, tuple):
+                self.compile_error("Nested tuples are not supported in indices.")
+            out.append(self.cast(val, index))
+
+        if expected_len is not None and len(out) != expected_len:
+            prefix = f"{context} " if context else ""
+            self.compile_error(
+                f"{prefix}expects {expected_len} indices, got {len(out)}."
+            )
+        return out
 
     @staticmethod
     def _ceil_log2(n: int) -> int:
@@ -411,6 +494,11 @@ class AlloOpBuilder(ir.AlloOpBuilder):
                     i += 1
             curr = nxt
         return curr[0]
+
+    def reduce_balanced(
+        self, operands: Sequence[Proxy], combine: Callable[[Proxy, Proxy], Proxy]
+    ) -> Proxy:
+        return self._reduce_balanced(operands, combine)
 
     def create_add_nary(
         self, operands: Sequence[Proxy], *, floating: bool = False
@@ -916,6 +1004,9 @@ class AlloOpBuilder(ir.AlloOpBuilder):
         return res_shape, a_indices, b_indices
 
     def create_broadcast(self, lhs: Proxy, rhs: Proxy) -> tuple[Proxy, Proxy]:
+        assert (
+            lhs.dtype == rhs.dtype
+        ), "Broadcasting requires operands to have the same dtype"
         lhs_is_shaped = isinstance(lhs.type, ShapedType)
         rhs_is_shaped = isinstance(rhs.type, ShapedType)
 
@@ -929,11 +1020,14 @@ class AlloOpBuilder(ir.AlloOpBuilder):
                 self.compile_error(
                     f"Shapes {lhs_shape} and {rhs_shape} are not broadcastable"
                 )
+            init = tensor.EmptyOp(
+                self, shape, lhs.dtype.to_mlir(self.context)
+            ).get_result_at(0)
             if not indices_lhs and not indices_rhs:
                 return lhs, rhs
             if indices_lhs:
                 lhs_handle = linalg.BroadcastOp(
-                    self, lhs.handle, rhs.handle, indices_lhs
+                    self, lhs.handle, init, indices_lhs
                 ).get_result_at(0)
                 if isinstance(lhs.type, TensorType):
                     lhs_type = TensorType(cast(DType, lhs.dtype), shape)
@@ -942,7 +1036,7 @@ class AlloOpBuilder(ir.AlloOpBuilder):
                 return Proxy(lhs_handle, lhs_type), rhs
             else:
                 rhs_handle = linalg.BroadcastOp(
-                    self, rhs.handle, lhs.handle, indices_rhs
+                    self, rhs.handle, init, indices_rhs
                 ).get_result_at(0)
                 if isinstance(rhs.type, TensorType):
                     rhs_type = TensorType(cast(DType, rhs.dtype), shape)
@@ -1019,3 +1113,23 @@ class AlloOpBuilder(ir.AlloOpBuilder):
             return Proxy(insert_op, buffer.type)
         else:
             self.compile_error(f"Unsupported shaped type: {buffer.type}")
+
+    ########################
+    # Stream operations
+    ########################
+    def create_stream_get(self, stream: Proxy, indices: Sequence[Proxy]) -> Proxy:
+        assert isinstance(stream.type, Stream)
+        get = allo.StreamGetOp(self, stream.handle, [idx.handle for idx in indices])
+        return Proxy(get, stream.type.base_type)
+
+    def create_stream_put(
+        self, stream: Proxy, indices: Sequence[Proxy], value: Proxy
+    ) -> None:
+        assert isinstance(stream.type, Stream)
+        allo.StreamPutOp(
+            self, stream.handle, [idx.handle for idx in indices], value.handle
+        )
+
+    def make_stream(self, stream_type: Stream) -> Proxy:
+        stream = allo.StreamCreateOp(self, stream_type.to_mlir(self.context))
+        return Proxy(stream, stream_type)

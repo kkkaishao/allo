@@ -27,8 +27,13 @@ def UFixed : Allo_Type<"UFixed", [MemRefElementTypeInterface]> {
 def Stream : Allo_Type<"Stream"> {
   let summary = "stream type";
   let mnemonic = "stream";
-  let parameters = (ins AnyType:$baseType, "std::size_t":$depth);
-  let assemblyFormat = "`<` $baseType `,` $depth `>`";
+  let parameters = (ins
+    AnyType:$baseType,
+    "std::size_t":$depth,
+    ArrayRefParameter<"int64_t">:$shape);
+  let assemblyFormat = [{
+    `<` $baseType `,` `depth``` `=``` $depth `,` `shape` ```=``` `[` $shape `]` `>`
+  }];
 }
 
 #endif // ALLO_TYPES

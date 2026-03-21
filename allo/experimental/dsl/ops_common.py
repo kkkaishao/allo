@@ -10,7 +10,6 @@ from ..core.types import (
     ShapedType,
     BufferType,
     Proxy,
-    index,
 )
 from ..compiler.builder import AlloOpBuilder
 from ..core.library import NO_FOLD
@@ -32,40 +31,6 @@ def binary_op_checks(lhs, rhs, op_name="") -> str:
     if isinstance(lhs.type, BufferType) and isinstance(rhs.type, BufferType):
         return f"Cannot perform {op_name} on two buffers. Buffer operations must be performed through load and store."
     return ""
-
-
-def binary_op_create(
-    builder: AlloOpBuilder,
-    lhs: Proxy | Constexpr,
-    rhs: Proxy | Constexpr,
-    op_name: str,
-    create_fn,
-):
-    return lower_binary_op(
-        builder,
-        lhs,
-        rhs,
-        op_name,
-        create_fn,
-    )
-
-
-def binary_op_create_signed(
-    builder: AlloOpBuilder,
-    lhs: Proxy | Constexpr,
-    rhs: Proxy | Constexpr,
-    op_name: str,
-    create_fn,
-    signed=True,
-):
-    return lower_binary_op(
-        builder,
-        lhs,
-        rhs,
-        op_name,
-        create_fn,
-        signed=signed,
-    )
 
 
 def _invoke_with_supported_kwargs(fn, *args, **kwargs):
@@ -134,9 +99,9 @@ def _materialize_Constexpr_pair(
     if isinstance(lhs, Constexpr) and isinstance(rhs, Constexpr):
         return lhs, rhs
     if isinstance(lhs, Constexpr):
-        lhs = builder.make_scalar(lhs.value, rhs.dtype)
+        lhs = builder.cast(lhs, rhs.dtype)
     if isinstance(rhs, Constexpr):
-        rhs = builder.make_scalar(rhs.value, lhs.dtype)
+        rhs = builder.cast(rhs, lhs.dtype)
     return lhs, rhs
 
 
@@ -155,12 +120,7 @@ def _prepare_binary_operands(
     dst_ty = builder.get_promoted_dtype_nary(
         op_name, [lhs.dtype, rhs.dtype], term_signs=term_signs
     )
-    operands = []
-    for operand in [lhs, rhs]:
-        if isinstance(operand.type, DType):
-            operands.append(builder.scalar_cast(operand, dst_ty))
-        else:
-            operands.append(builder.tensor_cast(operand, dst_ty))
+    operands = [builder.cast(lhs, dst_ty), builder.cast(rhs, dst_ty)]
     lhs, rhs = builder.create_broadcast(operands[0], operands[1])
     return lhs, rhs
 
@@ -192,17 +152,6 @@ def unary_op_checks(operand, op_name="") -> str:
     return ""
 
 
-def unary_op_create(
-    builder: AlloOpBuilder, operand: Proxy, op_name: str, create_fn
-) -> Proxy:
-    return lower_unary_op(
-        builder,
-        operand,
-        op_name,
-        create_fn,
-    )
-
-
 def lower_unary_op(
     builder: AlloOpBuilder,
     operand: Proxy,
@@ -225,12 +174,3 @@ def lower_unary_op(
     if extra_kwargs is not None:
         kwargs.update(extra_kwargs)
     return _invoke_with_supported_kwargs(create_fn, operand, **kwargs)
-
-
-def prepare_tuple_indices(builder: AlloOpBuilder, slices: tuple) -> list[Proxy]:
-    out = []
-    for val in slices:
-        if isinstance(val, tuple):
-            builder.compile_error("Nested tuples are not supported in indices.")
-        out.append(builder.make_or_cast_scalar(val, index))
-    return out
