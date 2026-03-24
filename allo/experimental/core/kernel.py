@@ -232,31 +232,40 @@ class Kernel(Generic[P, R]):
 
         """Get the schedule object for this kernel. Kernel must be compiled before calling this method."""
         if self.module is None:
-            raise RuntimeError(
-                f"Kernel {self.func_name} has not been compiled. Please compile the kernel before scheduling."
-            )
+            self._ensure_compiled()
         else:
             return Schedule.from_module(self.module)
 
-    def compile(
+    def _ensure_compiled(
         self,
         arg_types: Sequence[BaseType | str] = [],
         res_types: Sequence[BaseType | str] = [],
     ):
-        """Compile the kernel with explicitly provided argument and return types."""
+        """Compile the kernel to Allo IR with explicitly provided argument and return types."""
+        if self.module is not None:
+            return self.module
+
         from ..compiler.codegen import compile
 
-        self.module, self.context = compile(
-            self, arg_types=arg_types, res_types=res_types, options=self.options
-        )
+        if not arg_types and not res_types:
+            # If no types are provided, try to infer from annotations
+            arg_types = self.parse_argument_annotations()
+            res_types = self.parse_return_annotation()
+        compile(self, arg_types=arg_types, res_types=res_types, options=self.options)
         return self.module
+
+    def build(self, target, prj_dir: str):
+        """Build the kernel for a specific target. This is a placeholder for future extension."""
+        self._ensure_compiled()
+
+        raise NotImplementedError()
 
     def __call__(self, *args: P.args, **kwargs: P.kwargs):
         """Compile the kernel with argument types inferred at callsite and return types from annotations"""
         from ..compiler.codegen import compile
 
         arg_types = self.specialize_arg_types(*args, **kwargs)
-        res_types = self.parse_return_annotation(self.signature.return_annotation)
+        res_types = self.parse_return_annotation()
         module = compile(self, arg_types, res_types, options=self.options)
         return module
 
@@ -284,12 +293,10 @@ class Kernel(Generic[P, R]):
             elif isinstance(annotation, BaseType) or annotation == Constexpr:
                 arg_types.append(annotation)
             else:
-                msg = textwrap.dedent(
-                    f"""
+                msg = textwrap.dedent(f"""
                     Unsupported type annotation for parameter '{k}': {annotation}.
                     For builtin types, such as int, float, bool, please use the corresponding allo types (e.g., int32, fp32, int1).
-                    """
-                )
+                    """)
                 raise TypeError(msg)
         return arg_types
 
@@ -324,7 +331,19 @@ class Kernel(Generic[P, R]):
                     return Stream(base_type=base_type, shape=shape)
         raise TypeError(f"Unsupported type annotation: {annotation}")
 
-    def parse_return_annotation(self, annotation: object) -> list[BaseType]:
+    def parse_argument_annotations(self) -> list[BaseType]:
+        arg_types = []
+        for param in self.signature.parameters.values():
+            annotation = param.annotation
+            if annotation is inspect.Parameter.empty:
+                raise TypeError(
+                    f"Parameter '{param.name}' is missing a type annotation. Please provide an explicit type annotation for all parameters."
+                )
+            arg_types.append(self.parse_type_annotation(annotation))
+        return arg_types
+
+    def parse_return_annotation(self) -> list[BaseType]:
+        annotation = self.signature.return_annotation
         annotation = unwrap_if_constexpr(annotation)
         if annotation is inspect.Signature.empty or annotation is None:
             return []

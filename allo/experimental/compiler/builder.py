@@ -768,8 +768,8 @@ class AlloOpBuilder(ir.AlloOpBuilder):
             rhs.dtype, (IndexType, APInt)
         )
         pred_val = predicate.value
-        if signed and predicate in {CmpPred.LT, CmpPred.LE, CmpPred.GT, CmpPred.GE}:
-            pred_val += 4  # add offset to get signed predicate value
+        if not signed and predicate in {CmpPred.LT, CmpPred.LE, CmpPred.GT, CmpPred.GE}:
+            pred_val += 4  # add offset to get unsigned predicate value
 
         def build_fn(lhs, rhs):
             return arith.CmpIOp(self, pred_val, lhs.handle, rhs.handle).get_result_at(0)

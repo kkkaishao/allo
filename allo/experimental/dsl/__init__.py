@@ -29,6 +29,7 @@ from .ops_arith import (
     logical_or,
     max,
     min,
+    cast,
 )
 
 from .ops_memory import load, store

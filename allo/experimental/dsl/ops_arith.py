@@ -7,7 +7,7 @@ import builtins
 
 from ..compiler.builder import AlloOpBuilder, CmpPred
 from ..core.library import NO_FOLD, operator
-from ..core.types import Constexpr, DType, ShapedType, BaseType
+from ..core.types import Constexpr, DType, Proxy, ShapedType, BaseType
 from .ops_common import (
     binary_op_checks,
     cmp_op_create,
@@ -768,3 +768,24 @@ def _lower_min(builder: AlloOpBuilder, lhs, rhs, propagate_nan=Constexpr(False))
         floating=lhs.dtype.is_float(),
         extra_kwargs={"propagate_nan": propagate_nan.value},
     )
+
+
+@operator
+def cast(lhs: Proxy | Constexpr, dst_type: BaseType) -> Proxy:
+    pass
+
+
+@cast.validate
+def _validate_cast(lhs, dst_type) -> str:
+    if not isinstance(lhs, (Proxy, Constexpr)):
+        return f"Unknown type for cast operator: {type(lhs)}."
+    if not isinstance(dst_type, BaseType):
+        return f"Unknown destination type for cast operator: {type(dst_type)}."
+    return ""
+
+
+@cast.lower
+def _lower_cast(
+    builder: AlloOpBuilder, lhs: Proxy | Constexpr, dst_type: BaseType
+) -> Proxy:
+    return builder.cast(lhs, dst_type)

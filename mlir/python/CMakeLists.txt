@@ -69,6 +69,15 @@ set(ALLO_PYTHON_MLIR_LIBS
     MLIRTransformDialectUtils
     MLIRTransformUtils
     MLIRVectorTransformOps
+
+    # Conversions
+    MLIRAffineToStandard
+    MLIRArithToLLVM
+    MLIRControlFlowToLLVM
+    MLIRFuncToLLVM
+    MLIRMemRefToLLVM
+    MLIRMathToLLVM
+    MLIRReconcileUnrealizedCasts
 )
 
 target_link_libraries(_liballo

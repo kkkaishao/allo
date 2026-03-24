@@ -4,6 +4,7 @@
 import ast
 import contextlib
 import builtins
+import copy
 
 from dataclasses import dataclass
 
@@ -1080,7 +1081,7 @@ class CodeGenerator(ast.NodeVisitor):
         if not isinstance(node.target, ast.Name):
             self.compile_error("loop target must be a single variable in 'for' loops")
 
-        if not (isinstance(step, Constexpr) and step.value > 0):
+        if isinstance(step, Constexpr) and step.value <= 0:
             self.compile_error("loop step must be a positive integer in 'for' loops")
 
         lb, ub, step = self.builder.normalize_indices((lb, ub, step), expected_len=3)
@@ -1191,7 +1192,7 @@ class CodeGenerator(ast.NodeVisitor):
         ubs = iterator.stops
         steps = iterator.steps
 
-        if not all(isinstance(s, Constexpr) and s.value > 0 for s in steps):
+        if any(isinstance(step, Constexpr) and step.value <= 0 for step in steps):
             self.compile_error("loop step must be a positive integer in 'for' loops")
 
         lb_proxies = self.builder.normalize_indices(lbs)
@@ -1435,6 +1436,18 @@ class CodeGenerator(ast.NodeVisitor):
             if ret is not None:
                 self._maybe_set_loc_to_name(ret, target)
                 self._set_value(target, ret)
+
+    def visit_AugAssign(self, node: ast.AugAssign):
+        lhs = copy.deepcopy(node.target)
+        lhs.ctx = ast.Load()
+        rhs = ast.BinOp(left=lhs, op=node.op, right=node.value)
+        assign = ast.Assign(targets=[node.target], value=rhs)
+        for x in ["lineno", "col_offset", "end_lineno", "end_col_offset"]:
+            if hasattr(node, x):
+                y = getattr(node, x)
+                setattr(rhs, x, y)
+                setattr(assign, x, y)
+        self.visit(assign)
 
     def visit_Store(self, node):
         ast.NodeVisitor.generic_visit(self, node)
@@ -1910,9 +1923,7 @@ class CodeGenerator(ast.NodeVisitor):
 
         try:
             sub_arg_types = list(fn.specialize_arg_types(*args, **kws))
-            sub_res_types = list(
-                fn.parse_return_annotation(fn.signature.return_annotation)
-            )
+            sub_res_types = list(fn.parse_return_annotation())
         except Exception as e:
             self.compile_error(f"Failed to specialize kernel '{fn.func_name}': {e}")
 
@@ -2084,12 +2095,18 @@ def compile(
         raise TypeError(
             "Only allo.kernel functions can be compiled with allo.compile()"
         )
-    arg_types = [fn.parse_type_annotation(t) for t in arg_types]
+    if not arg_types:
+        arg_types = fn.parse_argument_annotations()
+    else:
+        arg_types = [fn.parse_type_annotation(t) for t in arg_types]
     if len(arg_types) != len(fn.signature.parameters):
         raise ValueError(
             f"The number of provided argument types ({len(arg_types)}) does not match the number of arguments in the kernel signature ({len(fn.signature.parameters)})."
         )
-    res_types = [fn.parse_type_annotation(t) for t in res_types]
+    if not res_types:
+        res_types = fn.parse_return_annotation()
+    else:
+        res_types = [fn.parse_type_annotation(t) for t in res_types]
     effective_options = options if options != CompileOptions() else fn.options
 
     try:
@@ -2128,7 +2145,10 @@ def compile(
             )
 
         module.cse_and_canonicalize()
-        return module, generator.context
+        fn.module = module
+        # transfer the ownership of context to kernel
+        fn.context = context
+        return module
     except Exception as exc:
         if show_traceback:
             raise
