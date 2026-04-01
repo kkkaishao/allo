@@ -11,6 +11,8 @@ nanobind_add_module(_liballo
     passes.cpp
 )
 
+set(NANOBIND_OUTPUT_DIR "${PROJECT_SOURCE_DIR}/../allo/experimental/_C")
+
 # turn off -Wcast-qual for nanobind
 target_compile_options(nanobind-static
     PUBLIC
@@ -19,7 +21,7 @@ target_compile_options(nanobind-static
 )
 
 set_target_properties(_liballo PROPERTIES
-    LIBRARY_OUTPUT_DIRECTORY "${PROJECT_SOURCE_DIR}/../allo/experimental/_C"
+    LIBRARY_OUTPUT_DIRECTORY ${NANOBIND_OUTPUT_DIR}
     CXX_VISIBILITY_PRESET hidden
 )
 
@@ -87,8 +89,6 @@ target_link_libraries(_liballo
     MLIRAllo
     MLIRAlloTransformOps
     MLIRAlloTranslation
-
-    Python3::Module
 )
 
 target_link_options(_liballo PRIVATE ${LLVM_LDFLAGS})

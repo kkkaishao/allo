@@ -136,5 +136,90 @@ def GlobalStreamCreateOp : Allo_Op<"stream.create_global", [
   }];
 }
 
+//===----------------------------------------------------------------------===//
+// ISA Operations
+//===----------------------------------------------------------------------===//
+def IntegerSetArrayAttr : TypedArrayAttrBase<IntegerSetAttr,
+                                      "IntegerSet array attribute">;
+
+def InstructionYieldOp : Allo_Op<"instr.yield", [Pure, ReturnLike, Terminator]> {
+  let summary = "yield results from an instruction";
+  let description = [{
+    This operation yields the results of an instruction in the semantics region of `instr.define` operation.
+  }];
+  let arguments = (ins Variadic<AnyType>:$results);
+  let results = (outs);
+  let assemblyFormat = [{
+    $results attr-dict `:` type($results)
+  }];
+}
+
+def InstructionDefineOp : Allo_Op<"instr.define", [Symbol, RecursiveMemoryEffects]> {
+  let summary = "define an instruction";
+  let description = [{
+    This operation defines a tensor instruction in an ISA.
+
+    The definition contains following components:
+    1. The instruction name, which is used to identify the instruction
+    2. The instruction operand types, typically are tensor/memref types
+    3. The instruction result types, typically are tensor/memref types
+    4. The instruction indexing scheme, which specifies how to index into the operands and results of the instruction
+    5. The instruction semantics, which is a region that defines how the instruction computes its results from its operands.
+
+    The semantics region must be end with a `yield` operation that yields the results of the instruction.
+  }];
+  let arguments = (ins
+    SymbolNameAttr:$sym_name,
+    TypeArrayAttr:$source_types,
+    TypeArrayAttr:$destination_types,
+    StrArrayAttr:$index_symbols,
+    AffineMapArrayAttr:$index_maps,
+    StrArrayAttr:$domain_symbols,
+    IntegerSetArrayAttr:$index_sets);
+  let regions = (region SizedRegion<1>:$region);
+  let results = (outs);
+  let assemblyFormat = [{
+    $sym_name `{`
+      `signature` `src` $source_types `dst` $destination_types
+      `index_syms` $index_symbols
+      `index_maps` $index_maps
+      `domain_syms` $domain_symbols
+      `index_sets` $index_sets
+      `semantics` $region
+    `}` attr-dict
+  }];
+  let hasVerifier = 1;
+  let extraClassDeclaration = [{
+    Block *getSemantics() {
+       return &getRegion().front();
+    }
+  }];
+}
+
+def InstructionEmitOp : Allo_Op<"instr.emit", [
+  DeclareOpInterfaceMethods<SymbolUserOpInterface>,
+  DeclareOpInterfaceMethods<InferTypeOpInterface>,
+  AttrSizedOperandSegments]> {
+  let summary = "emit an instruction";
+  let description = [{
+    This operation emits an instruction defined by `instr.define` operation.
+
+    It takes the following components as input:
+    1. The instruction name
+    2. The instruction operands (SSA values), which must match the operand types defined in the instruction definition
+    3. The indexing symbols and domain symbols (Attributes), which are compile-tile known and used to instantiate the instruction scheme.
+  }];
+  let arguments = (ins
+    FlatSymbolRefAttr:$instruction,
+    Variadic<AnyType>:$sources,
+    Variadic<AnyType>:$destinations, // DPS style
+    DictionaryAttr:$symbol_values);
+  let results = (outs Variadic<AnyType>:$results);
+  let assemblyFormat = [{
+    $instruction `params` $symbol_values
+    `src``(` $sources `:` type($sources) `)`
+    `dst` `(` $destinations `:` type($destinations) `)` attr-dict
+  }];
+}
 
 #endif // ALLO_OPS
