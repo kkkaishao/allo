@@ -4,3 +4,5 @@
 add_subdirectory(allo-opt)
 add_subdirectory(allo-lsp-server)
 add_subdirectory(allo-translate)
+add_subdirectory(act-lsp-server)
+add_subdirectory(act-opt)

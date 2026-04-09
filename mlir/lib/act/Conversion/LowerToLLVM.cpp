@@ -5,16 +5,14 @@
 #include "mlir/Dialect/LLVMIR/Transforms/Passes.h"
 #include "mlir/Dialect/Linalg/Passes.h"
 #include "mlir/Dialect/MemRef/Transforms/Passes.h"
-#include "mlir/Pass/Pass.h"
 #include "mlir/Pass/PassManager.h"
 #include "mlir/Transforms/Passes.h"
 
-#include "allo/Conversion/Passes.h"
+#include "act/Conversion/Passes.h"
 
 using namespace mlir;
 
 static void assembleLLVMConversionPipeline(OpPassManager &pm) {
-  pm.addPass(allo::createConvertInstructionToCanonicalFormPass({true}));
   pm.addPass(createCanonicalizerPass());
   pm.addPass(createCSEPass());
 
@@ -54,7 +52,7 @@ static void assembleLLVMConversionPipeline(OpPassManager &pm) {
   pm.addPass(createCSEPass());
 }
 
-void allo::registerLLVMLoweringPipeline() {
+void act::registerLLVMLoweringPipeline() {
   PassPipelineRegistration<>("lower-to-llvm", "Lower to LLVM IR",
                              assembleLLVMConversionPipeline);
 }

@@ -13,4 +13,4 @@ namespace mlir::allo {
 void registerAlloTransforms();
 } // namespace mlir::allo
 
-#endif //ALLO_TRANSFORMS_PASSES_H
+#endif // ALLO_TRANSFORMS_PASSES_H

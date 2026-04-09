@@ -26,8 +26,6 @@
 #include "mlir/Target/LLVMIR/Transforms/Passes.h"
 #include "mlir/Transforms/Passes.h"
 
-#include "allo/Conversion/Passes.h"
-
 namespace mlir::allo {
 inline void registerAllPasses() {
   registerTransformsPasses();
@@ -56,8 +54,6 @@ inline void registerAllPasses() {
   // Dialect pipelines
   bufferization::registerBufferizationPipelines();
   tosa::registerTosaToLinalgPipelines();
-
-  allo::registerAlloConversions();
 }
 } // namespace mlir::allo
 
