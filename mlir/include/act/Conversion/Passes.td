@@ -6,17 +6,14 @@ include "mlir/Pass/PassBase.td"
 def ConvertActToCanonicalFormPass : Pass<"convert-act-to-canonical-form"> {
   let summary = "Convert ACT dialect to canonical form";
   let description = [{}];
+}
+
+def ConvertCanonicalFormToActPass : Pass<"convert-canonical-form-to-act"> {
+  let summary = "Convert canonical form to ACT dialect";
+  let description = [{}];
   let options = [
-    Option<"enableTensor", "enable-tensor", "bool", "true",
-           "Enable conversion to tensor types instead of memref types.">,
-  ];
-  let dependentDialects = [
-    "arith::ArithDialect",
-    "bufferization::BufferizationDialect",
-    "linalg::LinalgDialect",
-    "math::MathDialect",
-    "memref::MemRefDialect",
-    "tensor::TensorDialect",
+    Option<"isaPath", "isa-path", "std::optional<std::string>", "std::nullopt",
+           "Path to the ISA definition file.">,
   ];
 }
 

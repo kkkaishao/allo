@@ -121,5 +121,13 @@ def Act_State : Act_Type<"State"> {
   let genVerifyDecl = 1;
 }
 
+def Act_Pattern : Act_Type<"Pattern"> {
+  let summary = "A token type representing a access pattern";
+  let description = [{
+    Represents a token type that encodes a specific access pattern.
+    Syntax: `!act.pattern`
+  }];
+  let mnemonic = "pattern";
+}
 
 #endif // ACT_TYPES_TD

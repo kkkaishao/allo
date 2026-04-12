@@ -5,5 +5,6 @@ using namespace mlir::act;
 
 void act::registerActConversionPasses() {
   registerConvertActToCanonicalFormPass();
+  registerConvertCanonicalFormToActPass();
   registerLLVMLoweringPipeline();
 }

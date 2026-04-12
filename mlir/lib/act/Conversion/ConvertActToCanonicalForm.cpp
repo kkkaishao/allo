@@ -29,19 +29,8 @@ struct ActConversionContext {
   SymbolTable &symbolTable;
   SmallVector<memref::GlobalOp> globalBuffers;
   DenseMap<func::FuncOp, DenseMap<StringAttr, Value>> funcToBufferMap;
-  bool enableTensor = false;
   explicit ActConversionContext(SymbolTable &symbolTable)
       : symbolTable(symbolTable) {}
-
-  void dumpMap() const {
-    llvm::dbgs() << "Function to buffer map:\n";
-    for (auto &[func, bufferMap] : funcToBufferMap) {
-      llvm::dbgs() << "Function: " << "\n";
-      for (const auto &[symName, handle] : bufferMap) {
-        llvm::dbgs() << "  " << symName.getValue() << " -> " << handle << "\n";
-      }
-    }
-  }
 };
 } // namespace
 
@@ -84,14 +73,12 @@ static void createLocalHandles(RewriterBase &rewriter, func::FuncOp func,
   for (auto global : context.globalBuffers) {
     Value handle = memref::GetGlobalOp::create(
         rewriter, func.getLoc(), global.getType(), global.getSymName());
-    if (context.enableTensor) {
-      auto memrefTy = global.getType();
-      auto tensorTy =
-          RankedTensorType::get(memrefTy.getShape(), memrefTy.getElementType());
-      handle = bufferization::ToTensorOp::create(
-          rewriter, func.getLoc(), tensorTy, handle, /*restrict=*/true,
-          /*writable*/ true);
-    }
+    auto memrefTy = global.getType();
+    auto tensorTy =
+        RankedTensorType::get(memrefTy.getShape(), memrefTy.getElementType());
+    handle = bufferization::ToTensorOp::create(
+        rewriter, func.getLoc(), tensorTy, handle, /*restrict=*/true,
+        /*writable*/ true);
     bufferMap[global.getSymNameAttr()] = handle;
   }
   LLVM_DEBUG({
@@ -295,9 +282,12 @@ struct ConvertEmitOpPattern : public OpConversionPattern<EmitOp> {
         context.funcToBufferMap[op->getParentOfType<func::FuncOp>()];
     rewriter.setInsertionPoint(op);
     auto accessOps = getBufferAccessOps(rewriter, accessBlock, op, adaptor);
-    auto slices = materializeSliceOps(rewriter, op.getLoc(), bufferMap, declOp,
-                                      accessOps);
+    auto slicesOr = materializeSliceOps(rewriter, op.getLoc(), bufferMap,
+                                        declOp, accessOps);
+    if (failed(slicesOr))
+      return failure();
     auto computeArgs = generateExtraComputeArgs(rewriter, op, declOp);
+    auto slices = std::move(*slicesOr);
     slices.append(computeArgs);
     // map block arguments to slices
     IRMapping mapping;
@@ -310,16 +300,27 @@ struct ConvertEmitOpPattern : public OpConversionPattern<EmitOp> {
     if (failed(builder.build(semBlock)))
       return failure();
     // materialize write back ops
-    if (context.enableTensor) {
-      auto yieldOp = semBlock.getTerminator();
-      SmallVector<Value, 4> valuesToWrite;
-      for (Value operand : yieldOp->getOperands())
-        valuesToWrite.push_back(mapping.lookupOrDefault(operand));
-      materializeWriteBackOps(rewriter, op.getLoc(), bufferMap, declOp,
-                              valuesToWrite, accessOps);
+    Operation *yieldOp = semBlock.getTerminator();
+    SmallVector<Value, 4> valuesToWrite;
+    for (Value operand : yieldOp->getOperands())
+      valuesToWrite.push_back(mapping.lookupOrDefault(operand));
+    if (failed(materializeWriteBackOps(rewriter, op.getLoc(), bufferMap, declOp,
+                                       valuesToWrite, accessOps)))
+      return failure();
+    // Erase cloned access ops — walk relayout chains to collect all ops
+    for (auto accessOp : accessOps) {
+      SmallVector<Operation *, 4> toErase;
+      Operation *curr = accessOp.getOperation();
+      while (curr) {
+        toErase.push_back(curr);
+        if (auto relayout = dyn_cast<BufferRelayoutOpInterface>(curr))
+          curr = relayout.getSource().getDefiningOp();
+        else
+          break;
+      }
+      for (auto *op : toErase)
+        rewriter.eraseOp(op);
     }
-    for (auto accessOp : accessOps)
-      rewriter.eraseOp(accessOp);
     rewriter.eraseOp(op);
     return success();
   }
@@ -387,7 +388,7 @@ private:
     return computeArgs;
   }
 
-  SmallVector<Value, 4> materializeSliceOps(
+  FailureOr<SmallVector<Value, 4>> materializeSliceOps(
       RewriterBase &b, Location loc,
       llvm::DenseMap<StringAttr, Value> &bufferMap, DefineOp declOp,
       SmallVectorImpl<BufferAccessOpInterface> &accessOps) const {
@@ -405,13 +406,17 @@ private:
       auto it = bufferMap.find(bufferName);
       assert(it != bufferMap.end() && "buffer not found in local handle map");
       Value handle = it->second;
-      Value slice = accessOp.materialize(b, loc, handle, context.enableTensor);
-      slices.push_back(slice);
+      auto sliceOr = accessOp.materialize(b, loc, handle);
+      if (failed(sliceOr))
+        return accessOp.emitError()
+               << "failed to materialize buffer access for buffer '"
+               << bufferName.getValue() << "'";
+      slices.push_back(*sliceOr);
     }
-    return slices;
+    return std::move(slices);
   }
 
-  void materializeWriteBackOps(
+  LogicalResult materializeWriteBackOps(
       RewriterBase &b, Location loc,
       llvm::DenseMap<StringAttr, Value> &bufferMap, DefineOp declOp,
       SmallVectorImpl<Value> &valuesToWrite,
@@ -425,10 +430,15 @@ private:
       Value value = valuesToWrite[i];
       Value handle = bufferMap[bufferNames[i]];
       BufferAccessOpInterface accessOp = accessOps[i + nSrc];
-      Value slice = accessOp.materialize(b, loc, value, handle);
+      auto sliceOr = accessOp.materialize(b, loc, value, handle);
+      if (failed(sliceOr))
+        return accessOp.emitError()
+               << "failed to materialize buffer write-back for buffer '"
+               << bufferNames[i].getValue() << "'";
       // update buffer map
-      bufferMap[bufferNames[i]] = slice;
+      bufferMap[bufferNames[i]] = *sliceOr;
     }
+    return success();
   }
 };
 } // namespace
@@ -460,18 +470,11 @@ struct ConvertActToCanonicalFormPass
     : public act::impl::ConvertActToCanonicalFormPassBase<
           ConvertActToCanonicalFormPass> {
 
-  ConvertActToCanonicalFormPass() = default;
-  explicit ConvertActToCanonicalFormPass(
-      const ConvertActToCanonicalFormPassOptions &options) {
-    enableTensor = options.enableTensor;
-  }
-
   void runOnOperation() override {
     MLIRContext *ctx = &getContext();
     ConversionTarget target(*ctx);
     SymbolTable symbolTable(getOperation());
     ActConversionContext context(symbolTable);
-    context.enableTensor = enableTensor;
 
     // Step 1: convert resources to global buffers
     RewritePatternSet patterns(ctx);
@@ -491,13 +494,15 @@ struct ConvertActToCanonicalFormPass
     //===== primitive operation set starts ====//
     target.addLegalOp<tensor::ExtractSliceOp, tensor::InsertSliceOp,
                       tensor::ExpandShapeOp, tensor::CollapseShapeOp,
-                      tensor::DimOp, memref::SubViewOp>();
+                      tensor::EmptyOp, tensor::DimOp, memref::SubViewOp>();
     target.addLegalOp<math::Exp2Op, math::Log2Op, math::ExpOp, math::LogOp,
                       math::AbsFOp, math::AbsIOp, math::FloorOp, math::SqrtOp,
                       math::RsqrtOp, math::CeilOp, math::TruncOp>();
     target.addLegalOp<linalg::GenericOp, linalg::YieldOp, linalg::MapOp,
                       linalg::ReduceOp, linalg::TransposeOp, linalg::FillOp,
-                      linalg::ContractOp, linalg::SoftmaxOp>();
+                      linalg::ContractOp, linalg::SoftmaxOp, linalg::MatmulOp,
+                      linalg::BatchMatmulOp, linalg::AddOp, linalg::SubOp,
+                      linalg::MulOp, linalg::BroadcastOp>();
     target.addLegalDialect<arith::ArithDialect>();
     //===== primitive operation set ends ====//
     target.addIllegalOp<EmitOp>();
@@ -507,11 +512,10 @@ struct ConvertActToCanonicalFormPass
       signalPassFailure();
 
     // Step 3: write back to global buffers
-    if (enableTensor) {
-      getOperation()->walk([&](func::FuncOp func) {
-        writeBackLocalHandles(rewriter, func, context);
-      });
-    }
+    getOperation()->walk([&](func::FuncOp func) {
+      writeBackLocalHandles(rewriter, func, context);
+    });
+
     // Step 4: clean up instruction definitions
     SmallVector<DefineOp> defineOps;
     getOperation()->walk([&](DefineOp op) { defineOps.push_back(op); });
@@ -520,7 +524,13 @@ struct ConvertActToCanonicalFormPass
     LLVM_DEBUG(getOperation()->dumpPretty());
   }
 
-private:
-  bool enableTensor = true;
+  void getDependentDialects(DialectRegistry &registry) const override {
+    registry.insert<arith::ArithDialect>();
+    registry.insert<bufferization::BufferizationDialect>();
+    registry.insert<linalg::LinalgDialect>();
+    registry.insert<math::MathDialect>();
+    registry.insert<memref::MemRefDialect>();
+    registry.insert<tensor::TensorDialect>();
+  }
 };
 } // namespace

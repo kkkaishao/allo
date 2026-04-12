@@ -15,6 +15,7 @@ target_link_libraries(act-opt
     MLIROptLib
     MLIRAct
     MLIRActConversion
+    MLIRActSupport
     MLIRRegisterAllDialects
     MLIRRegisterAllExtensions
     MLIRRegisterAllPasses

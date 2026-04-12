@@ -144,23 +144,33 @@ def BufferAccessOpInterface : OpInterface<"BufferAccessOpInterface"> {
     "mlir::LogicalResult", "verifyCompatibility", (ins "BufferTypeInterface":$bufferType, "unsigned":$size)>,
 
     InterfaceMethod<"Materialize a read: extract a slice from the buffer according to this access pattern",
-    "mlir::Value", "materialize",
-    (ins "OpBuilder&":$builder, "Location":$loc, "Value":$buffer, "bool":$enableTensor)>,
+    "llvm::FailureOr<mlir::Value>", "materialize",
+    (ins "OpBuilder&":$builder, "Location":$loc, "Value":$buffer)>,
 
     InterfaceMethod<"Materialize a write: insert a value into the buffer according to this access pattern",
-    "mlir::Value", "materialize",
+    "llvm::FailureOr<mlir::Value>", "materialize",
     (ins "OpBuilder&":$builder, "Location":$loc, "Value":$value, "Value":$buffer)>
+
+    // TODO: add method to generate symbolic expression
   ];
 }
 
-class Act_BufferAccessOpBase<string mnemonic> : Act_Op<mnemonic,
-  [DeclareOpInterfaceMethods<BufferAccessOpInterface>,
-  AttrSizedOperandSegments, Pure,
-  HasParent<"act::DefineOp">]> {
-  let results = (outs NoneType); // token representing the access pattern
+def BufferRelayoutOpInterface : OpInterface<"BufferRelayoutOpInterface"> {
+  let cppNamespace = "::mlir::act";
+  let methods = [
+    InterfaceMethod<"get the source access pattern operand",
+    "mlir::Value", "getSource", (ins)>
+  ];
 }
 
-def Act_StridedOp : Act_BufferAccessOpBase<"strided"> {
+class Act_BufferAccessOpBase<string mnemonic, list<Trait> traits = []> :
+  Act_Op<mnemonic, !listconcat(traits, [
+  DeclareOpInterfaceMethods<BufferAccessOpInterface>, Pure,
+  HasParent<"act::DefineOp">])> {
+  let results = (outs Act_Pattern); // token representing the access pattern
+}
+
+def Act_StridedOp : Act_BufferAccessOpBase<"strided", [AttrSizedOperandSegments]> {
   let summary = "Strided buffer access pattern";
   let description = [{
     Defines a strided access pattern over a buffer. Parameters (basis, counts,
@@ -197,7 +207,7 @@ def Act_StridedOp : Act_BufferAccessOpBase<"strided"> {
   let hasVerifier = 1;
 }
 
-def Act_TiledOp : Act_BufferAccessOpBase<"tiled"> {
+def Act_TiledOp : Act_BufferAccessOpBase<"tiled", [AttrSizedOperandSegments]> {
   let summary = "Tiled buffer access pattern";
   let description = [{
     Defines a tiled access pattern over a buffer. Extends strided access with a
@@ -239,6 +249,80 @@ def Act_TiledOp : Act_BufferAccessOpBase<"tiled"> {
     attr-dict
   }];
   let hasVerifier = 1;
+}
+
+def Act_ExpandShapeOp : Act_BufferAccessOpBase<"expand_shape",
+    [DeclareOpInterfaceMethods<BufferRelayoutOpInterface>]> {
+  let summary = "Shape expansion access pattern (inverse of collapse_shape)";
+  let description = [{}];
+  let arguments = (ins
+    Act_Pattern:$source,
+    IndexListArrayAttr:$reassociation,
+    Variadic<Index>:$outputShape,
+    DenseI64ArrayAttr:$staticOutputShape);
+  let assemblyFormat = [{
+    $source $reassociation `output_shape`
+    custom<DynamicIndexList>($outputShape, $staticOutputShape)
+    attr-dict
+  }];
+  let extraClassDeclaration = [{
+    SmallVector<ReassociationIndices, 4> getReassociationIndices() {
+      SmallVector<ReassociationIndices, 4> reassociationIndices;
+      for (auto attr : getReassociation())
+        reassociationIndices.push_back(llvm::to_vector<2>(
+            llvm::map_range(::llvm::cast<ArrayAttr>(attr), [&](Attribute indexAttr) {
+              return ::llvm::cast<IntegerAttr>(indexAttr).getInt();
+            })));
+      return reassociationIndices;
+    }
+  }];
+}
+
+def Act_CollapseShapeOp : Act_BufferAccessOpBase<"collapse_shape",
+    [DeclareOpInterfaceMethods<BufferRelayoutOpInterface>]> {
+  let summary = "Shape collapse access pattern (inverse of expand_shape)";
+  let description = [{}];
+  let arguments = (ins Act_Pattern:$source, IndexListArrayAttr:$reassociation);
+  let assemblyFormat = [{
+    $source $reassociation
+    attr-dict
+  }];
+  let hasVerifier = 1;
+  let extraClassDeclaration = [{
+    SmallVector<ReassociationIndices, 4> getReassociationIndices() {
+      SmallVector<ReassociationIndices, 4> reassociationIndices;
+      for (auto attr : getReassociation())
+        reassociationIndices.push_back(llvm::to_vector<2>(
+            llvm::map_range(::llvm::cast<ArrayAttr>(attr), [&](Attribute indexAttr) {
+              return ::llvm::cast<IntegerAttr>(indexAttr).getInt();
+            })));
+      return reassociationIndices;
+    }
+  }];
+}
+
+def Act_TransposeOp : Act_BufferAccessOpBase<"transpose",
+    [DeclareOpInterfaceMethods<BufferRelayoutOpInterface>]> {
+  let summary = "Transpose access pattern (permutes dimensions)";
+  let description = [{
+    Permutes the dimensions of the accessed data. For example, a 2D access
+    pattern with shape [M, N] transposed with permutation [1, 0] produces
+    shape [N, M]. During materialization, this generates a `linalg.transpose`
+    on the read path and an inverse transpose on the write path.
+  }];
+  let arguments = (ins Act_Pattern:$source, DenseI64ArrayAttr:$permutation);
+  let assemblyFormat = [{
+    $source `permutation` `=` $permutation attr-dict
+  }];
+  let extraClassDeclaration = [{
+    SmallVector<int64_t> getInversePermutation() {
+      auto perm = getPermutation();
+      SmallVector<int64_t> inv(perm.size());
+      for (unsigned i = 0; i < perm.size(); ++i)
+        inv[perm[i]] = i;
+      return inv;
+    }
+  }];
 }
 
 ///===----------------------------------------------------------------------===//

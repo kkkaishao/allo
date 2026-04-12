@@ -7,4 +7,7 @@ add_mlir_dialect_library(MLIRAct
 
     LINK_LIBS PUBLIC
     MLIRIR
+    MLIRLinalgDialect
+    MLIRTensorDialect
+    MLIRMemRefDialect
 )

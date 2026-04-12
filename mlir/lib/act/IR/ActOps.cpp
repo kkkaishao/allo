@@ -1,3 +1,4 @@
+#include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 
@@ -172,8 +173,8 @@ LogicalResult StridedOp::verifyCompatibility(BufferTypeInterface bufferType,
   return success();
 }
 
-Value StridedOp::materialize(OpBuilder &builder, Location loc, Value buffer,
-                             bool enableTensor) {
+FailureOr<Value> StridedOp::materialize(OpBuilder &builder, Location loc,
+                                        Value buffer) {
   MLIRContext *ctx = builder.getContext();
   auto mixedBasis = getMixedValues(getStaticBasis(), getBasis(), ctx);
   auto mixedStrides = getMixedValues(getStaticStrides(), getStrides(), ctx);
@@ -188,25 +189,16 @@ Value StridedOp::materialize(OpBuilder &builder, Location loc, Value buffer,
   for (int i = 0; i < diff; ++i)
     mixedCounts.push_back(
         builder.getI64IntegerAttr(shaped.getDimSize(i + currRank)));
-  Value extracted;
-  if (enableTensor) {
-    // drop leading dimension if equals to 1
-    auto resultTy = tensor::ExtractSliceOp::inferCanonicalRankReducedResultType(
-        shaped.getRank() - 1, cast<RankedTensorType>(shaped), mixedCounts);
-    extracted = tensor::ExtractSliceOp::create(
-        builder, loc, resultTy, buffer, mixedBasis, mixedCounts, mixedStrides);
-  } else {
-    auto resultTy = memref::SubViewOp::inferRankReducedResultType(
-        shaped.getRank() - 1, cast<MemRefType>(shaped), mixedBasis, mixedCounts,
-        mixedStrides);
-    extracted = memref::SubViewOp::create(
-        builder, loc, resultTy, buffer, mixedBasis, mixedCounts, mixedStrides);
-  }
+  // drop leading dimension if equals to 1
+  auto resultTy = tensor::ExtractSliceOp::inferCanonicalRankReducedResultType(
+      shaped.getRank() - 1, cast<RankedTensorType>(shaped), mixedCounts);
+  Value extracted = tensor::ExtractSliceOp::create(
+      builder, loc, resultTy, buffer, mixedBasis, mixedCounts, mixedStrides);
   return extracted;
 }
 
-Value StridedOp::materialize(OpBuilder &builder, Location loc, Value value,
-                             Value buffer) {
+FailureOr<Value> StridedOp::materialize(OpBuilder &builder, Location loc,
+                                        Value value, Value buffer) {
   MLIRContext *ctx = builder.getContext();
   auto mixedBasis = getMixedValues(getStaticBasis(), getBasis(), ctx);
   auto mixedStrides = getMixedValues(getStaticStrides(), getStrides(), ctx);
@@ -316,14 +308,14 @@ LogicalResult TiledOp::verifyCompatibility(BufferTypeInterface bufferType,
   return success();
 }
 
-Value TiledOp::materialize(OpBuilder &builder, Location loc, Value buffer,
-                           bool enableTensor) {
-  return {}; // TODO
+FailureOr<Value> TiledOp::materialize(OpBuilder &builder, Location loc,
+                                      Value buffer) {
+  return failure(); // TODO
 }
 
-Value TiledOp::materialize(OpBuilder &builder, Location loc, Value value,
-                           Value buffer) {
-  return {}; // TODO
+FailureOr<Value> TiledOp::materialize(OpBuilder &builder, Location loc,
+                                      Value value, Value buffer) {
+  return failure(); // TODO
 }
 
 void DefineOp::print(OpAsmPrinter &p) {
@@ -482,14 +474,19 @@ LogicalResult DefineOp::verifySymbolUses(SymbolTableCollection &symbolTable) {
                          << "' does not exist";
     bufferArgs.push_back({destOp.getBufferType(), destOp.getSize()});
   }
-  SmallVector<BufferAccessOpInterface, 4> patterns;
+  // Walk relayout chains to find base access ops for buffer compatibility
+  SmallVector<BufferAccessOpInterface, 4> basePatterns;
   for (auto operand : getAccessBlock().getTerminator()->getOperands()) {
     auto pattern = operand.getDefiningOp<BufferAccessOpInterface>();
     assert(pattern);
-    patterns.push_back(pattern);
+    // Walk through relayout ops to find the base access op
+    Operation *curr = pattern.getOperation();
+    while (auto relayout = dyn_cast<BufferRelayoutOpInterface>(curr))
+      curr = relayout.getSource().getDefiningOp();
+    basePatterns.push_back(cast<BufferAccessOpInterface>(curr));
   }
-  // check compatibility
-  for (auto [bufferArg, pattern] : llvm::zip(bufferArgs, patterns)) {
+  // check compatibility on base access ops
+  for (auto [bufferArg, pattern] : llvm::zip(bufferArgs, basePatterns)) {
     auto [bufferType, bufferSize] = bufferArg;
     if (failed(pattern.verifyCompatibility(bufferType, bufferSize)))
       return emitError() << "buffer access pattern is not compatible with the "
@@ -514,4 +511,166 @@ LogicalResult EmitOp::verifySymbolUses(SymbolTableCollection &symbolTable) {
                           "of semantics region "
                           "arguments";
   return success();
+}
+
+LogicalResult CollapseShapeOp::verify() {
+  if (llvm::any_of(getReassociationIndices(),
+                   [](ReassociationIndices &group) { return group.empty(); })) {
+    return emitError("reassociation indices must not be empty");
+  }
+  return success();
+}
+
+// --- Relayout ops: verifyCompatibility delegates to base via chain walking ---
+
+LogicalResult ExpandShapeOp::verifyCompatibility(BufferTypeInterface bufferType,
+                                                 unsigned size) {
+  return success(); // base access op handles buffer-level checks
+}
+
+LogicalResult
+CollapseShapeOp::verifyCompatibility(BufferTypeInterface bufferType,
+                                     unsigned size) {
+  return success();
+}
+
+LogicalResult TransposeOp::verifyCompatibility(BufferTypeInterface bufferType,
+                                               unsigned size) {
+  return success();
+}
+
+// --- ExpandShapeOp materialize ---
+
+FailureOr<Value> ExpandShapeOp::materialize(OpBuilder &builder, Location loc,
+                                            Value buffer) {
+  auto sourceOp = getSource().getDefiningOp<BufferAccessOpInterface>();
+  if (!sourceOp)
+    return emitError() << "source must be a buffer access op";
+  auto baseSlice = sourceOp.materialize(builder, loc, buffer);
+  if (failed(baseSlice))
+    return failure();
+
+  auto reassoc = getReassociationIndices();
+  auto mixedOutputShape =
+      getMixedValues(getStaticOutputShape(), getOutputShape(), builder);
+  SmallVector<OpFoldResult> outputShape(mixedOutputShape.begin(),
+                                        mixedOutputShape.end());
+  auto srcType = cast<RankedTensorType>((*baseSlice).getType());
+  // Compute the result type
+  SmallVector<int64_t> resultDims;
+  for (auto ofr : outputShape) {
+    if (auto attr = dyn_cast<Attribute>(ofr))
+      resultDims.push_back(cast<IntegerAttr>(attr).getInt());
+    else
+      resultDims.push_back(ShapedType::kDynamic);
+  }
+  auto resultType = RankedTensorType::get(resultDims, srcType.getElementType());
+  Value expanded = tensor::ExpandShapeOp::create(
+      builder, loc, resultType, *baseSlice, reassoc, outputShape);
+  return expanded;
+}
+
+FailureOr<Value> ExpandShapeOp::materialize(OpBuilder &builder, Location loc,
+                                            Value value, Value buffer) {
+  auto sourceOp = getSource().getDefiningOp<BufferAccessOpInterface>();
+  if (!sourceOp)
+    return emitError() << "source must be a buffer access op";
+  // Inverse of expand = collapse
+  auto reassoc = getReassociationIndices();
+  Value collapsed =
+      tensor::CollapseShapeOp::create(builder, loc, value, reassoc);
+  return sourceOp.materialize(builder, loc, collapsed, buffer);
+}
+
+// --- CollapseShapeOp materialize ---
+
+FailureOr<Value> CollapseShapeOp::materialize(OpBuilder &builder, Location loc,
+                                              Value buffer) {
+  auto sourceOp = getSource().getDefiningOp<BufferAccessOpInterface>();
+  if (!sourceOp)
+    return emitError() << "source must be a buffer access op";
+  auto baseSlice = sourceOp.materialize(builder, loc, buffer);
+  if (failed(baseSlice))
+    return failure();
+
+  auto reassoc = getReassociationIndices();
+  Value collapsed =
+      tensor::CollapseShapeOp::create(builder, loc, *baseSlice, reassoc);
+  return collapsed;
+}
+
+FailureOr<Value> CollapseShapeOp::materialize(OpBuilder &builder, Location loc,
+                                              Value value, Value buffer) {
+  auto sourceOp = getSource().getDefiningOp<BufferAccessOpInterface>();
+  if (!sourceOp)
+    return emitError() << "source must be a buffer access op";
+  // Inverse of collapse = expand. Need the source's shape as output shape.
+  auto baseSlice = sourceOp.materialize(builder, loc, buffer);
+  if (failed(baseSlice))
+    return failure();
+  auto expandedType = cast<RankedTensorType>((*baseSlice).getType());
+  SmallVector<OpFoldResult> outputShape;
+  for (int64_t i = 0; i < expandedType.getRank(); ++i) {
+    if (expandedType.isDynamicDim(i))
+      outputShape.push_back(
+          tensor::DimOp::create(builder, loc, *baseSlice, i).getResult());
+    else
+      outputShape.push_back(
+          builder.getI64IntegerAttr(expandedType.getDimSize(i)));
+  }
+  auto reassoc = getReassociationIndices();
+  Value expanded = tensor::ExpandShapeOp::create(builder, loc, expandedType,
+                                                 value, reassoc, outputShape);
+  return sourceOp.materialize(builder, loc, expanded, buffer);
+}
+
+// --- TransposeOp materialize ---
+
+FailureOr<Value> TransposeOp::materialize(OpBuilder &builder, Location loc,
+                                          Value buffer) {
+  auto sourceOp = getSource().getDefiningOp<BufferAccessOpInterface>();
+  if (!sourceOp)
+    return emitError() << "source must be a buffer access op";
+  auto baseSlice = sourceOp.materialize(builder, loc, buffer);
+  if (failed(baseSlice))
+    return failure();
+
+  auto srcType = cast<RankedTensorType>((*baseSlice).getType());
+  auto perm = getPermutation();
+  SmallVector<int64_t> transposedShape;
+  SmallVector<Value> dynamicDims;
+  for (int64_t p : perm) {
+    transposedShape.push_back(srcType.getDimSize(p));
+    if (srcType.isDynamicDim(p))
+      dynamicDims.push_back(tensor::DimOp::create(builder, loc, *baseSlice, p));
+  }
+  auto destType =
+      RankedTensorType::get(transposedShape, srcType.getElementType());
+  Value empty = tensor::EmptyOp::create(builder, loc, destType, dynamicDims);
+  auto transposeOp =
+      linalg::TransposeOp::create(builder, loc, *baseSlice, empty, perm);
+  return transposeOp->getResult(0);
+}
+
+FailureOr<Value> TransposeOp::materialize(OpBuilder &builder, Location loc,
+                                          Value value, Value buffer) {
+  auto sourceOp = getSource().getDefiningOp<BufferAccessOpInterface>();
+  if (!sourceOp)
+    return emitError() << "source must be a buffer access op";
+  // Inverse transpose
+  auto invPerm = getInversePermutation();
+  auto valType = cast<RankedTensorType>(value.getType());
+  SmallVector<int64_t> invShape;
+  SmallVector<Value> dynamicDims;
+  for (int64_t p : invPerm) {
+    invShape.push_back(valType.getDimSize(p));
+    if (valType.isDynamicDim(p))
+      dynamicDims.push_back(tensor::DimOp::create(builder, loc, value, p));
+  }
+  auto invType = RankedTensorType::get(invShape, valType.getElementType());
+  Value empty = tensor::EmptyOp::create(builder, loc, invType, dynamicDims);
+  auto transposeOp =
+      linalg::TransposeOp::create(builder, loc, value, empty, invPerm);
+  Value invTransposed = transposeOp->getResult(0);
+  return sourceOp.materialize(builder, loc, invTransposed, buffer);
 }
