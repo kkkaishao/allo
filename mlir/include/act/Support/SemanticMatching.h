@@ -9,6 +9,12 @@
 
 namespace mlir::act {
 
+struct StaticSliceSpec {
+  SmallVector<int64_t> offsets;
+  SmallVector<int64_t> sizes;
+  SmallVector<int64_t> strides;
+};
+
 /// Semantic fingerprint of an instruction's core computation.
 struct SemanticFingerprint {
   enum Kind { Named, Generic, Identity };
@@ -32,6 +38,30 @@ struct SemanticFingerprint {
 struct MatchCandidate {
   Operation *sourceOp;
   DefineOp instruction;
+  unsigned numOuterDims = 0; // >0 for structural suffix matches (rank mismatch)
+};
+
+enum class EdgeLayoutDirection {
+  Input,
+  Output,
+};
+
+enum class EdgeLayoutTransformKind {
+  Transpose,
+  ExtractSlice,
+  InsertSlice,
+};
+
+/// Boundary transform annotation on a logical edge adjacent to a compute op.
+struct EdgeLayoutAnnotation {
+  EdgeLayoutDirection direction;
+  EdgeLayoutTransformKind transformKind;
+  Operation *layoutOp;     // linalg.transpose, tensor.extract_slice, etc.
+  Operation *computeOp;    // the adjacent compute op
+  unsigned edgeIdx;        // input operand idx or output result idx
+  unsigned transformOrder; // 0 = closest to logical value / writeback target
+  SmallVector<int64_t> permutation;
+  StaticSliceSpec sliceSpec;
 };
 
 /// Catalog of instruction fingerprints for fast lookup.
@@ -55,8 +85,17 @@ private:
 };
 
 /// Top-level: match all source compute ops against the instruction catalog.
-LogicalResult runSemanticMatching(ModuleOp module,
-                                  SmallVectorImpl<MatchCandidate> &results);
+/// Also collects layout ops as edge annotations.
+LogicalResult
+runSemanticMatching(ModuleOp module, SmallVectorImpl<MatchCandidate> &results,
+                    SmallVectorImpl<EdgeLayoutAnnotation> &layoutAnnotations);
+
+/// Structural matching: for source ops not matched by semantic fingerprinting,
+/// try suffix matching on iteration types + indexing map compatibility + body
+/// equivalence against all DefineOps in the module.
+LogicalResult runStructuralMatching(ModuleOp module,
+                                    ArrayRef<Operation *> unmatchedOps,
+                                    SmallVectorImpl<MatchCandidate> &results);
 
 } // namespace mlir::act
 
