@@ -14,14 +14,6 @@
 using namespace mlir;
 using namespace mlir::act;
 
-static bool isComputeOp(Operation *op) {
-  if (!isa<linalg::LinalgOp>(op))
-    return false;
-  if (isa<linalg::FillOp, linalg::TransposeOp>(op))
-    return false;
-  return true;
-}
-
 static void printSliceSpec(raw_ostream &os, const StaticSliceSpec &sliceSpec) {
   os << " offsets=[";
   for (unsigned i = 0; i < sliceSpec.offsets.size(); ++i) {
@@ -116,74 +108,35 @@ getStaticSliceSpec(tensor::InsertSliceOp sliceOp) {
   return spec;
 }
 
-static LogicalTransform
-toLogicalTransform(const EdgeLayoutAnnotation &annotation) {
-  switch (annotation.transformKind) {
-  case EdgeLayoutTransformKind::Transpose:
-    return LogicalTransform::transpose(annotation.permutation);
-  case EdgeLayoutTransformKind::ExtractSlice:
-    return LogicalTransform::extractSlice(annotation.sliceSpec);
-  case EdgeLayoutTransformKind::InsertSlice:
-    return LogicalTransform::insertSlice(annotation.sliceSpec);
-  }
-  llvm_unreachable("unknown edge layout annotation kind");
+/// Create a planner logical value for a selected node output at the compute
+/// boundary. Produced values are always unique, even if they share an IR Value
+/// with an external materialized form.
+static unsigned createProducedLogicalValue(LogicalPlan &plan, Value value,
+                                           unsigned definingNodeIdx) {
+  auto tensorType = dyn_cast<RankedTensorType>(value.getType());
+  assert(tensorType && "logical plan values must be ranked tensors");
+
+  unsigned valueId = plan.values.size();
+  plan.values.push_back(
+      {LogicalPlanValueKind::Produced, value, tensorType, definingNodeIdx, {}});
+  return valueId;
 }
 
-namespace {
-struct ResolvedInput {
-  Value baseValue;
-  LogicalTransformChain fallbackTransforms;
-  Operation *unsupportedTransformOp = nullptr;
-};
-} // namespace
-
-static ResolvedInput resolveLogicalInput(Value value) {
-  SmallVector<LogicalTransform, 2> reversedTransforms;
-  Value current = value;
-
-  while (true) {
-    if (auto transposeOp = current.getDefiningOp<linalg::TransposeOp>()) {
-      reversedTransforms.push_back(
-          LogicalTransform::transpose(transposeOp.getPermutation()));
-      current = transposeOp.getInput();
-      continue;
-    }
-    if (auto extractOp = current.getDefiningOp<tensor::ExtractSliceOp>()) {
-      auto sliceSpec = getStaticSliceSpec(extractOp);
-      if (sliceSpec) {
-        reversedTransforms.push_back(
-            LogicalTransform::extractSlice(*sliceSpec));
-      }
-      current = extractOp.getSource();
-      if (sliceSpec)
-        continue;
-      return {current, {}, extractOp};
-    }
-    if (auto expandOp = current.getDefiningOp<tensor::ExpandShapeOp>()) {
-      current = expandOp.getSrc();
-      continue;
-    }
-    if (auto collapseOp = current.getDefiningOp<tensor::CollapseShapeOp>()) {
-      current = collapseOp.getSrc();
-      continue;
-    }
-    break;
-  }
-
-  LogicalTransformChain transforms;
-  for (unsigned i = 0; i < reversedTransforms.size(); ++i)
-    transforms.push_back(reversedTransforms[reversedTransforms.size() - 1 - i]);
-
-  return {current, std::move(transforms), nullptr};
+static Operation *getPlanningErrorOp(const SemanticsGraphNode &node) {
+  if (node.domainSourceOp)
+    return node.domainSourceOp;
+  if (!node.sourceOps.empty())
+    return node.sourceOps.front();
+  return const_cast<DefineOp &>(node.instruction).getOperation();
 }
 
-static unsigned getOrCreateLogicalValue(
-    LogicalPlan &plan, Value value,
-    std::optional<unsigned> definingNodeIdx = std::nullopt) {
-  auto it = plan.valueIds.find(value);
-  if (it != plan.valueIds.end()) {
-    if (definingNodeIdx)
-      plan.values[it->second].definingNodeIdx = definingNodeIdx;
+/// Intern external logical values by their materialized SSA value.
+static unsigned getOrCreateExternalLogicalValue(LogicalPlan &plan, Value value,
+                                                LogicalPlanValueKind kind) {
+  auto it = plan.externalValueIds.find(value);
+  if (it != plan.externalValueIds.end()) {
+    assert(plan.values[it->second].kind == kind &&
+           "external logical value reused with inconsistent kind");
     return it->second;
   }
 
@@ -191,57 +144,21 @@ static unsigned getOrCreateLogicalValue(
   assert(tensorType && "logical plan values must be ranked tensors");
 
   unsigned valueId = plan.values.size();
-  plan.valueIds[value] = valueId;
-  plan.values.push_back({value, tensorType, definingNodeIdx, {}});
+  plan.externalValueIds[value] = valueId;
+  plan.values.push_back({kind, value, tensorType, std::nullopt, {}});
   return valueId;
 }
 
-static const TiledMatchCandidate *
-selectBestMatch(Operation *sourceOp,
-                ArrayRef<TiledMatchCandidate> tiledMatches) {
-  const TiledMatchCandidate *best = nullptr;
-  int64_t bestCost = std::numeric_limits<int64_t>::max();
-
-  for (auto &tm : tiledMatches) {
-    if (tm.base.sourceOp != sourceOp || !tm.isValid)
-      continue;
-    int64_t cost = 1;
-    for (auto &dim : tm.tiling.dims)
-      cost *= dim.tileFactor;
-    if (cost < bestCost) {
-      bestCost = cost;
-      best = &tm;
-    }
+static StringRef getLogicalValueKindName(LogicalPlanValueKind kind) {
+  switch (kind) {
+  case LogicalPlanValueKind::FunctionInput:
+    return "function-input";
+  case LogicalPlanValueKind::Produced:
+    return "produced";
+  case LogicalPlanValueKind::MaterializedOutput:
+    return "materialized-output";
   }
-
-  return best;
-}
-
-static LogicalTransformChain lookupAnnotatedTransforms(
-    DenseMap<Operation *, DenseMap<unsigned, LogicalTransformChain>>
-        &annotationMap,
-    Operation *consumerOp, unsigned operandIdx,
-    ArrayRef<LogicalTransform> fallback) {
-  auto opIt = annotationMap.find(consumerOp);
-  if (opIt == annotationMap.end())
-    return LogicalTransformChain(fallback.begin(), fallback.end());
-  auto operandIt = opIt->second.find(operandIdx);
-  if (operandIt == opIt->second.end())
-    return LogicalTransformChain(fallback.begin(), fallback.end());
-  return operandIt->second;
-}
-
-static LogicalTransformChain lookupAnnotatedOutputTransforms(
-    DenseMap<Operation *, DenseMap<unsigned, LogicalTransformChain>>
-        &annotationMap,
-    Operation *producerOp, unsigned resultIdx) {
-  auto opIt = annotationMap.find(producerOp);
-  if (opIt == annotationMap.end())
-    return {};
-  auto resultIt = opIt->second.find(resultIdx);
-  if (resultIt == opIt->second.end())
-    return {};
-  return resultIt->second;
+  llvm_unreachable("unknown logical plan value kind");
 }
 
 static bool isIdentityInstruction(DefineOp defineOp) {
@@ -337,9 +254,9 @@ static StridedOp findStridedOp(Value accessToken) {
   return dyn_cast_or_null<StridedOp>(op);
 }
 
-static FailureOr<int64_t> evaluateOperandSlotCount(DefineOp defineOp,
-                                                   unsigned operandIdx,
-                                                   const TilingScheme &tiling) {
+static FailureOr<int64_t>
+evaluateOperandSlotCount(DefineOp defineOp, unsigned operandIdx,
+                         const DenseMap<unsigned, int64_t> &solvedParams) {
   Block &addrBlock = defineOp.getAccessBlock();
   auto *yieldOp = addrBlock.getTerminator();
   if (operandIdx >= yieldOp->getNumOperands())
@@ -356,7 +273,7 @@ static FailureOr<int64_t> evaluateOperandSlotCount(DefineOp defineOp,
 
   unsigned numParams = addrBlock.getNumArguments();
   SmallVector<int64_t> paramValues(numParams, 0);
-  for (auto &[idx, val] : tiling.solvedParams) {
+  for (auto &[idx, val] : solvedParams) {
     if (idx < numParams)
       paramValues[idx] = val;
   }
@@ -493,11 +410,17 @@ struct LiveRange {
 };
 } // namespace
 
-static SmallVector<LiveRange> computeLiveRanges(func::FuncOp funcOp,
-                                                const LogicalPlan &plan) {
+static SmallVector<LiveRange>
+computeLiveRanges(func::FuncOp funcOp, const LogicalPlan &plan,
+                  const DenseMap<unsigned, unsigned> &layoutAliases) {
+  assert(funcOp.getFunctionBody().getBlocks().size() == 1 &&
+         "expected flat single-block function");
   DenseMap<unsigned, LiveRange> ranges;
 
   for (auto [valueId, value] : llvm::enumerate(plan.values)) {
+    auto aliasIt = layoutAliases.find(static_cast<unsigned>(valueId));
+    if (aliasIt != layoutAliases.end())
+      continue;
     int64_t numElts = 1;
     for (int64_t s : value.type.getShape())
       numElts *= s;
@@ -511,15 +434,23 @@ static SmallVector<LiveRange> computeLiveRanges(func::FuncOp funcOp,
     }
   }
 
-  funcOp.walk([&](func::ReturnOp retOp) {
-    for (Value val : retOp.getOperands()) {
-      auto it = plan.valueIds.find(val);
-      if (it != plan.valueIds.end()) {
-        ranges[it->second].liveEnd = std::max(
-            ranges[it->second].liveEnd, static_cast<int>(plan.nodes.size()));
-      }
-    }
-  });
+  auto &bodyBlock = funcOp.getFunctionBody().front();
+  auto returnOp = dyn_cast<func::ReturnOp>(bodyBlock.getTerminator());
+  assert(returnOp && "expected func.return terminator");
+  for (Value val : returnOp.getOperands()) {
+    auto it = plan.externalValueIds.find(val);
+    if (it == plan.externalValueIds.end())
+      continue;
+    unsigned valueId = it->second;
+    if (auto aliasIt = layoutAliases.find(valueId);
+        aliasIt != layoutAliases.end())
+      valueId = aliasIt->second;
+    auto rangeIt = ranges.find(valueId);
+    if (rangeIt == ranges.end())
+      continue;
+    rangeIt->second.liveEnd =
+        std::max(rangeIt->second.liveEnd, static_cast<int>(plan.nodes.size()));
+  }
 
   SmallVector<LiveRange> result;
   for (auto &[_, lr] : ranges)
@@ -528,6 +459,30 @@ static SmallVector<LiveRange> computeLiveRanges(func::FuncOp funcOp,
     return a.liveStart < b.liveStart;
   });
   return result;
+}
+
+/// Reuse HBM storage when a produced value and its materialized writeback
+/// target are physically identical.
+static DenseMap<unsigned, unsigned>
+computeLayoutAliases(const LogicalPlan &plan) {
+  DenseMap<unsigned, unsigned> aliases;
+  for (auto &node : plan.nodes) {
+    for (auto &output : node.outputs) {
+      if (!output.writebackTargetValueId ||
+          !isIdentityTransformChain(output.writebackTransforms))
+        continue;
+      unsigned producedValueId = output.valueId;
+      unsigned materializedValueId = *output.writebackTargetValueId;
+      if (producedValueId >= plan.values.size() ||
+          materializedValueId >= plan.values.size())
+        continue;
+      if (plan.values[producedValueId].sourceValue !=
+          plan.values[materializedValueId].sourceValue)
+        continue;
+      aliases[materializedValueId] = producedValueId;
+    }
+  }
+  return aliases;
 }
 
 static DenseMap<unsigned, int64_t> greedyAllocate(ArrayRef<LiveRange> ranges,
@@ -574,8 +529,8 @@ static SmallVector<ForwardingEdge>
 detectForwardingOpportunities(const LogicalPlan &plan, StringAttr hbmName) {
   SmallVector<ForwardingEdge> edges;
   for (unsigned i = 0; i + 1 < plan.nodes.size(); ++i) {
-    DefineOp producerDef = plan.nodes[i].match->base.instruction;
-    DefineOp consumerDef = plan.nodes[i + 1].match->base.instruction;
+    DefineOp producerDef = plan.nodes[i].instruction;
+    DefineOp consumerDef = plan.nodes[i + 1].instruction;
 
     unsigned pNumSrc = producerDef.getSources().size();
     unsigned pNumDst = producerDef.getDestinations().size();
@@ -600,12 +555,6 @@ detectForwardingOpportunities(const LogicalPlan &plan, StringAttr hbmName) {
     }
   }
   return edges;
-}
-
-static bool hasTiledReduction(const TiledMatchCandidate &tm) {
-  return llvm::any_of(tm.tiling.dims, [](const TilingScheme::DimTiling &dim) {
-    return dim.iterType == utils::IteratorType::reduction && dim.tileFactor > 1;
-  });
 }
 
 static int64_t getHBMBaseOffset(const ResourcePlan &plan, unsigned valueId) {
@@ -642,7 +591,7 @@ buildInputMovementPlan(func::FuncOp funcOp, const LogicalPlan &plan,
                        const ResourcePlan &layout, unsigned nodeIdx,
                        unsigned srcOperandIdx) {
   auto &node = plan.nodes[nodeIdx];
-  DefineOp defineOp = node.match->base.instruction;
+  DefineOp defineOp = node.instruction;
   StringAttr srcBuf = getOperandBuffer(defineOp, srcOperandIdx);
   unsigned hbmValueId = node.inputs[srcOperandIdx].valueId;
   auto &residence = layout.operandResidences[nodeIdx][srcOperandIdx];
@@ -685,7 +634,7 @@ buildAccumulatorInitPlan(func::FuncOp funcOp, const LogicalPlan &plan,
                          const ResourcePlan &layout, unsigned nodeIdx,
                          unsigned dstOperandIdx) {
   auto &node = plan.nodes[nodeIdx];
-  DefineOp defineOp = node.match->base.instruction;
+  DefineOp defineOp = node.instruction;
   unsigned numSrc = defineOp.getSources().size();
   unsigned operandIdx = numSrc + dstOperandIdx;
   StringAttr dstBuf = getOperandBuffer(defineOp, operandIdx);
@@ -742,7 +691,7 @@ buildOutputMovementPlan(func::FuncOp funcOp, const LogicalPlan &plan,
                         const ResourcePlan &layout, unsigned nodeIdx,
                         unsigned dstOperandIdx) {
   auto &node = plan.nodes[nodeIdx];
-  DefineOp defineOp = node.match->base.instruction;
+  DefineOp defineOp = node.instruction;
   unsigned numSrc = defineOp.getSources().size();
   unsigned operandIdx = numSrc + dstOperandIdx;
   StringAttr dstBuf = getOperandBuffer(defineOp, operandIdx);
@@ -807,7 +756,8 @@ void LogicalPlan::dump() const {
   llvm::dbgs() << "\n=== Logical Plan ===\n";
   llvm::dbgs() << "Values:\n";
   for (auto [idx, value] : llvm::enumerate(values)) {
-    llvm::dbgs() << "  v" << idx << ": ";
+    llvm::dbgs() << "  v" << idx << " (" << getLogicalValueKindName(value.kind)
+                 << "): ";
     if (value.sourceValue)
       llvm::dbgs() << value.sourceValue;
     else
@@ -831,10 +781,15 @@ void LogicalPlan::dump() const {
 
   llvm::dbgs() << "Nodes:\n";
   for (auto [idx, node] : llvm::enumerate(nodes)) {
-    llvm::dbgs()
-        << "  n" << idx << ": " << node.sourceOp->getName() << " -> @"
-        << const_cast<DefineOp &>(node.match->base.instruction).getSymName()
-        << " in=[";
+    llvm::dbgs() << "  n" << idx << ": ";
+    for (unsigned i = 0; i < node.sourceOps.size(); ++i) {
+      if (i)
+        llvm::dbgs() << "+";
+      llvm::dbgs() << node.sourceOps[i]->getName();
+    }
+    llvm::dbgs() << " -> @"
+                 << const_cast<DefineOp &>(node.instruction).getSymName()
+                 << " in=[";
     for (unsigned i = 0; i < node.inputs.size(); ++i) {
       if (i)
         llvm::dbgs() << ", ";
@@ -961,183 +916,173 @@ DataMovementCatalog::lookup(StringAttr src, StringAttr dst,
   return std::nullopt;
 }
 
-FailureOr<LogicalPlan>
-mlir::act::buildLogicalPlan(func::FuncOp funcOp,
-                            ArrayRef<TiledMatchCandidate> tiledMatches,
-                            ArrayRef<EdgeLayoutAnnotation> layoutAnnotations) {
-  LogicalPlan plan;
-  DenseMap<Operation *,
-           DenseMap<unsigned, SmallVector<EdgeLayoutAnnotation, 2>>>
-      inputAnnotationMap, outputAnnotationMap;
-  for (auto &annotation : layoutAnnotations) {
-    if (annotation.direction == EdgeLayoutDirection::Input)
-      inputAnnotationMap[annotation.computeOp][annotation.edgeIdx].push_back(
-          annotation);
-    else
-      outputAnnotationMap[annotation.computeOp][annotation.edgeIdx].push_back(
-          annotation);
-  }
-
-  auto sortAndConvertAnnotations =
-      [](SmallVector<EdgeLayoutAnnotation, 2> annotations) {
-        llvm::sort(annotations, [](const EdgeLayoutAnnotation &lhs,
-                                   const EdgeLayoutAnnotation &rhs) {
-          return lhs.transformOrder < rhs.transformOrder;
-        });
-        LogicalTransformChain transforms;
-        transforms.reserve(annotations.size());
-        for (auto &annotation : annotations)
-          transforms.push_back(toLogicalTransform(annotation));
-        return transforms;
-      };
-
-  DenseMap<Operation *, DenseMap<unsigned, LogicalTransformChain>>
-      inputTransforms, outputTransforms;
-  for (auto &[op, byEdge] : inputAnnotationMap)
-    for (auto &[edgeIdx, annotations] : byEdge)
-      inputTransforms[op][edgeIdx] = sortAndConvertAnnotations(annotations);
-  for (auto &[op, byEdge] : outputAnnotationMap)
-    for (auto &[edgeIdx, annotations] : byEdge)
-      outputTransforms[op][edgeIdx] = sortAndConvertAnnotations(annotations);
-
-  auto validateTransformChain = [&](Location loc, RankedTensorType baseType,
-                                    ArrayRef<LogicalTransform> transforms,
-                                    StringRef context) -> LogicalResult {
-    TensorLayout baseLayout{0,
-                            SmallVector<int64_t>(baseType.getShape().begin(),
-                                                 baseType.getShape().end()),
-                            computeRowMajorStrides(baseType.getShape())};
-    if (failed(applyLogicalTransforms(baseLayout, transforms))) {
-      emitError(loc) << "unsupported " << context
-                     << " transform chain: only static contiguous unit-stride "
-                        "slices are supported in Phase C iteration 3";
-      return failure();
+/// Convert a SemanticEdgeTransformChain to a LogicalTransformChain.
+static LogicalTransformChain
+toLogicalTransformChain(const SemanticEdgeTransformChain &chain) {
+  LogicalTransformChain result;
+  for (auto &t : chain) {
+    LogicalTransform lt;
+    switch (t.kind) {
+    case SemanticEdgeTransformKind::Transpose:
+      lt.kind = LogicalTransformKind::Transpose;
+      lt.permutation.assign(t.permutation.begin(), t.permutation.end());
+      break;
+    case SemanticEdgeTransformKind::ExtractSlice:
+      lt.kind = LogicalTransformKind::ExtractSlice;
+      lt.sliceSpec = t.sliceSpec;
+      break;
+    case SemanticEdgeTransformKind::InsertSlice:
+      lt.kind = LogicalTransformKind::InsertSlice;
+      lt.sliceSpec = t.sliceSpec;
+      break;
     }
-    return success();
-  };
+    result.push_back(std::move(lt));
+  }
+  return result;
+}
 
+/// Assign one planner node input slot exactly once from either an internal
+/// graph edge or a true external boundary input.
+static LogicalResult assignNodeInput(LogicalPlanNode &node, unsigned operandIdx,
+                                     unsigned valueId,
+                                     const LogicalTransformChain &transforms,
+                                     Operation *errorOp) {
+  if (operandIdx >= node.inputs.size())
+    return errorOp->emitError()
+           << "logical plan input slot " << operandIdx << " out of range";
+  if (node.inputs[operandIdx].valueId != GraphEdge::kNullIdx)
+    return errorOp->emitError() << "logical plan input slot " << operandIdx
+                                << " assigned more than once";
+  node.inputs[operandIdx] = {valueId, transforms};
+  return success();
+}
+
+FailureOr<LogicalPlan>
+mlir::act::buildLogicalPlan(func::FuncOp funcOp, const SemanticsGraph &graph,
+                            const GraphParamSolution &paramSolution) {
+  LogicalPlan plan;
+
+  // Register function arguments as logical values.
   for (auto arg : funcOp.getArguments()) {
     if (!isa<RankedTensorType>(arg.getType()))
       continue;
-    (void)getOrCreateLogicalValue(plan, arg);
+    (void)getOrCreateExternalLogicalValue(plan, arg,
+                                          LogicalPlanValueKind::FunctionInput);
   }
 
-  bool hasFailure = false;
-  funcOp.walk([&](Operation *op) {
-    if (!isComputeOp(op) || op->getParentOfType<DefineOp>())
-      return;
-
-    const TiledMatchCandidate *best = selectBestMatch(op, tiledMatches);
-    if (!best) {
-      op->emitError("no valid instruction match found for this operation");
-      hasFailure = true;
-      return;
+  // Create planner nodes and their produced output values first.
+  for (auto [graphNodeIdx, graphNode] : llvm::enumerate(graph.nodes)) {
+    auto &ps = paramSolution[graphNodeIdx];
+    if (!ps.isValid) {
+      getPlanningErrorOp(graphNode)->emitError(
+          "parameter solving failed for this instruction match");
+      return failure();
     }
 
     unsigned nodeIdx = plan.nodes.size();
     LogicalPlanNode node;
-    node.sourceOp = op;
-    node.match = best;
+    node.sourceOps = graphNode.sourceOps;
+    DefineOp instruction = const_cast<DefineOp &>(graphNode.instruction);
+    node.instruction = instruction;
+    node.solvedParams = ps.solvedParams;
+    node.paramKinds = ps.paramKinds;
 
-    auto linalgOp = cast<linalg::LinalgOp>(op);
-    for (auto [operandIdx, input] : llvm::enumerate(linalgOp.getDpsInputs())) {
-      auto resolved = resolveLogicalInput(input);
-      if (resolved.unsupportedTransformOp) {
-        resolved.unsupportedTransformOp->emitError()
-            << "unsupported tensor.extract_slice boundary: only static "
-               "contiguous unit-stride slices are supported";
-        hasFailure = true;
-        return;
-      }
-      unsigned valueId = getOrCreateLogicalValue(plan, resolved.baseValue);
-      LogicalTransformChain requiredTransforms = lookupAnnotatedTransforms(
-          inputTransforms, op, operandIdx, resolved.fallbackTransforms);
-      auto valueType = plan.values[valueId].type;
-      if (failed(validateTransformChain(
-              op->getLoc(), valueType, requiredTransforms, "input boundary"))) {
-        hasFailure = true;
-        return;
-      }
-      node.inputs.push_back({valueId, requiredTransforms});
-      plan.values[valueId].uses.push_back(
-          {nodeIdx, static_cast<unsigned>(operandIdx), requiredTransforms});
+    unsigned numTensorOperands =
+        instruction.getSources().size() + instruction.getDestinations().size();
+    node.inputs.resize(numTensorOperands);
+
+    unsigned numOutputs = instruction.getDestinations().size();
+    if (graphNode.boundaryOutputs.size() != numOutputs) {
+      return getPlanningErrorOp(graphNode)->emitError()
+             << "selected node @" << instruction.getSymName() << " has "
+             << graphNode.boundaryOutputs.size()
+             << " boundary outputs, expected " << numOutputs;
     }
 
-    for (auto [resultIdx, result] : llvm::enumerate(op->getResults())) {
-      if (!isa<RankedTensorType>(result.getType()))
+    node.outputs.resize(numOutputs);
+    for (auto [outputIdx, binding] :
+         llvm::enumerate(graphNode.boundaryOutputs)) {
+      unsigned producedValueId =
+          createProducedLogicalValue(plan, binding.producedValue, nodeIdx);
+      node.outputs[outputIdx].valueId = producedValueId;
+
+      if (!binding.materializedValue)
         continue;
-      unsigned valueId =
-          getOrCreateLogicalValue(plan, result, /*definingNodeIdx=*/nodeIdx);
-      LogicalPlanNodeOutput output{valueId, std::nullopt, {}};
 
-      auto writebackTransforms =
-          lookupAnnotatedOutputTransforms(outputTransforms, op, resultIdx);
-      if (!writebackTransforms.empty()) {
-        SmallVector<tensor::InsertSliceOp> insertUsers;
-        for (Operation *user : result.getUsers()) {
-          auto insertSliceOp = dyn_cast<tensor::InsertSliceOp>(user);
-          if (!insertSliceOp || insertSliceOp.getSource() != result) {
-            op->emitError() << "tensor.insert_slice writeback edges must be "
-                               "the only direct "
-                               "users of a compute result";
-            hasFailure = true;
-            return;
-          }
-          insertUsers.push_back(insertSliceOp);
-        }
-
-        if (insertUsers.size() != 1) {
-          op->emitError()
-              << "tensor.insert_slice writeback requires exactly one boundary "
-                 "insert per compute result";
-          hasFailure = true;
-          return;
-        }
-
-        tensor::InsertSliceOp insertSliceOp = insertUsers.front();
-        for (Operation *user : insertSliceOp.getResult().getUsers()) {
-          if (isComputeOp(user)) {
-            insertSliceOp.emitError()
-                << "tensor.insert_slice writeback targets cannot feed "
-                   "downstream compute in Phase C iteration 3";
-            hasFailure = true;
-            return;
-          }
-        }
-
-        Value targetValue = insertSliceOp.getResult();
-        unsigned targetValueId = getOrCreateLogicalValue(
-            plan, targetValue, /*definingNodeIdx=*/nodeIdx);
-        auto targetType = plan.values[targetValueId].type;
-        if (failed(validateTransformChain(insertSliceOp.getLoc(), targetType,
-                                          writebackTransforms,
-                                          "output writeback"))) {
-          hasFailure = true;
-          return;
-        }
-        output.writebackTargetValueId = targetValueId;
-        output.writebackTransforms = std::move(writebackTransforms);
-      } else {
-        for (Operation *user : result.getUsers()) {
-          auto insertSliceOp = dyn_cast<tensor::InsertSliceOp>(user);
-          if (insertSliceOp && insertSliceOp.getSource() == result) {
-            insertSliceOp.emitError()
-                << "unsupported tensor.insert_slice boundary: only static "
-                   "contiguous unit-stride slices are supported";
-            hasFailure = true;
-            return;
-          }
-        }
-      }
-
-      node.outputs.push_back(std::move(output));
+      unsigned materializedValueId = getOrCreateExternalLogicalValue(
+          plan, binding.materializedValue,
+          LogicalPlanValueKind::MaterializedOutput);
+      node.outputs[outputIdx].writebackTargetValueId = materializedValueId;
+      node.outputs[outputIdx].writebackTransforms =
+          toLogicalTransformChain(binding.transforms);
     }
 
     plan.nodes.push_back(std::move(node));
+  }
+
+  LLVM_DEBUG({
+    llvm::dbgs() << "Planner input wiring from SemanticsGraph edges:\n";
+    for (auto [edgeIdx, edge] : llvm::enumerate(graph.edges)) {
+      llvm::dbgs() << "  edge[" << edgeIdx << "] n" << edge.producerNodeIdx
+                   << ":out" << edge.prodIdx << " -> n" << edge.consumerNodeIdx
+                   << ":op" << edge.consIdx << "\n";
+    }
   });
 
-  if (hasFailure)
-    return failure();
+  // Wire inter-node uses from the selected graph edges.
+  for (auto [edgeIdx, edge] : llvm::enumerate(graph.edges)) {
+    if (edge.producerNodeIdx >= plan.nodes.size() ||
+        edge.consumerNodeIdx >= plan.nodes.size()) {
+      return funcOp.emitError() << "selected graph edge " << edgeIdx
+                                << " references an out-of-range planner node";
+    }
+
+    LogicalPlanNode &producer = plan.nodes[edge.producerNodeIdx];
+    LogicalPlanNode &consumer = plan.nodes[edge.consumerNodeIdx];
+    if (edge.prodIdx >= producer.outputs.size()) {
+      return producer.sourceOps.front()->emitError()
+             << "selected graph edge " << edgeIdx
+             << " references a missing producer output slot";
+    }
+
+    unsigned producedValueId = producer.outputs[edge.prodIdx].valueId;
+    LogicalTransformChain transforms = toLogicalTransformChain(edge.transforms);
+    if (failed(assignNodeInput(consumer, edge.consIdx, producedValueId,
+                               transforms, consumer.sourceOps.front())))
+      return failure();
+    plan.values[producedValueId].uses.push_back(
+        {edge.consumerNodeIdx, edge.consIdx, std::move(transforms)});
+  }
+
+  // Wire true external inputs after internal graph edges are fixed in place.
+  for (auto [graphNodeIdx, graphNode] : llvm::enumerate(graph.nodes)) {
+    LogicalPlanNode &node = plan.nodes[graphNodeIdx];
+    for (auto &binding : graphNode.boundaryInputs) {
+      unsigned valueId = getOrCreateExternalLogicalValue(
+          plan, binding.value, LogicalPlanValueKind::FunctionInput);
+      LogicalTransformChain transforms =
+          toLogicalTransformChain(binding.transforms);
+      if (failed(assignNodeInput(node, binding.boundaryOperandIdx, valueId,
+                                 transforms, getPlanningErrorOp(graphNode))))
+        return failure();
+      plan.values[valueId].uses.push_back(
+          {static_cast<unsigned>(graphNodeIdx),
+           static_cast<unsigned>(binding.boundaryOperandIdx),
+           std::move(transforms)});
+    }
+  }
+
+  // Validate that every tensor operand at the compute boundary is satisfied.
+  for (auto [nodeIdx, node] : llvm::enumerate(plan.nodes)) {
+    for (auto [operandIdx, input] : llvm::enumerate(node.inputs)) {
+      if (input.valueId != GraphEdge::kNullIdx)
+        continue;
+      return node.sourceOps.front()->emitError()
+             << "logical plan input slot " << operandIdx
+             << " for selected node " << nodeIdx
+             << " was not assigned by either a graph edge or an external input";
+    }
+  }
 
   LLVM_DEBUG(plan.dump());
   return plan;
@@ -1151,7 +1096,7 @@ FailureOr<ResourcePlan> mlir::act::buildResourcePlan(func::FuncOp funcOp,
     return empty;
   }
 
-  DefineOp defineOp = plan.nodes[0].match->base.instruction;
+  DefineOp defineOp = plan.nodes[0].instruction;
   bool singleBuffer = isSingleBufferInstruction(defineOp);
 
   if (singleBuffer) {
@@ -1167,7 +1112,8 @@ FailureOr<ResourcePlan> mlir::act::buildResourcePlan(func::FuncOp funcOp,
     layout.bufferSize = getBufferElementCapacity(bufOp);
     layout.operandResidences.resize(plan.nodes.size());
 
-    auto liveRanges = computeLiveRanges(funcOp, plan);
+    auto layoutAliases = computeLayoutAliases(plan);
+    auto liveRanges = computeLiveRanges(funcOp, plan, layoutAliases);
     int64_t peakAlloc = 0;
     auto allocatedOffsets = greedyAllocate(liveRanges, peakAlloc);
     for (auto &lr : liveRanges) {
@@ -1177,10 +1123,16 @@ FailureOr<ResourcePlan> mlir::act::buildResourcePlan(func::FuncOp funcOp,
           SmallVector<int64_t>(shape.begin(), shape.end()),
           computeRowMajorStrides(shape)};
     }
+    for (auto &[aliasValueId, baseValueId] : layoutAliases) {
+      auto it = layout.layouts.find(baseValueId);
+      if (it == layout.layouts.end())
+        continue;
+      layout.layouts[aliasValueId] = it->second;
+    }
     layout.totalAllocated = peakAlloc;
 
     for (unsigned nodeIdx = 0; nodeIdx < plan.nodes.size(); ++nodeIdx) {
-      DefineOp instrDef = plan.nodes[nodeIdx].match->base.instruction;
+      DefineOp instrDef = plan.nodes[nodeIdx].instruction;
       unsigned numOperands =
           instrDef.getSources().size() + instrDef.getDestinations().size();
       auto &residences = layout.operandResidences[nodeIdx];
@@ -1212,7 +1164,8 @@ FailureOr<ResourcePlan> mlir::act::buildResourcePlan(func::FuncOp funcOp,
   layout.dmCatalog = buildDataMovementCatalog(module);
   layout.operandResidences.resize(plan.nodes.size());
 
-  auto liveRanges = computeLiveRanges(funcOp, plan);
+  auto layoutAliases = computeLayoutAliases(plan);
+  auto liveRanges = computeLiveRanges(funcOp, plan, layoutAliases);
   int64_t peakAlloc = 0;
   auto allocatedOffsets = greedyAllocate(liveRanges, peakAlloc);
   for (auto &lr : liveRanges) {
@@ -1221,6 +1174,12 @@ FailureOr<ResourcePlan> mlir::act::buildResourcePlan(func::FuncOp funcOp,
         allocatedOffsets[lr.valueId],
         SmallVector<int64_t>(shape.begin(), shape.end()),
         computeRowMajorStrides(shape)};
+  }
+  for (auto &[aliasValueId, baseValueId] : layoutAliases) {
+    auto it = layout.layouts.find(baseValueId);
+    if (it == layout.layouts.end())
+      continue;
+    layout.layouts[aliasValueId] = it->second;
   }
   layout.totalAllocated = peakAlloc;
   if (layout.totalAllocated > layout.bufferSize) {
@@ -1236,8 +1195,7 @@ FailureOr<ResourcePlan> mlir::act::buildResourcePlan(func::FuncOp funcOp,
   DenseMap<std::pair<unsigned, unsigned>, std::pair<unsigned, unsigned>>
       forwardMap;
   for (auto &edge : layout.forwardingEdges) {
-    DefineOp producerDef =
-        plan.nodes[edge.producerNodeIdx].match->base.instruction;
+    DefineOp producerDef = plan.nodes[edge.producerNodeIdx].instruction;
     unsigned pNumSrc = producerDef.getSources().size();
     forwardMap[{edge.consumerNodeIdx, edge.consumerSrcOperandIdx}] = {
         edge.producerNodeIdx, pNumSrc + edge.producerDstOperandIdx};
@@ -1246,7 +1204,7 @@ FailureOr<ResourcePlan> mlir::act::buildResourcePlan(func::FuncOp funcOp,
   DenseMap<StringAttr, int64_t> maxPerBuffer;
   for (unsigned nodeIdx = 0; nodeIdx < plan.nodes.size(); ++nodeIdx) {
     auto &node = plan.nodes[nodeIdx];
-    DefineOp instrDef = node.match->base.instruction;
+    DefineOp instrDef = node.instruction;
     unsigned numOperands =
         instrDef.getSources().size() + instrDef.getDestinations().size();
     DenseMap<StringAttr, int64_t> entryNextSlot;
@@ -1281,7 +1239,7 @@ FailureOr<ResourcePlan> mlir::act::buildResourcePlan(func::FuncOp funcOp,
       }
 
       auto slotCount =
-          evaluateOperandSlotCount(instrDef, operandIdx, node.match->tiling);
+          evaluateOperandSlotCount(instrDef, operandIdx, node.solvedParams);
       if (failed(slotCount))
         return failure();
 
@@ -1309,7 +1267,7 @@ FailureOr<ResourcePlan> mlir::act::buildResourcePlan(func::FuncOp funcOp,
 
   for (unsigned nodeIdx = 0; nodeIdx < plan.nodes.size(); ++nodeIdx) {
     auto &node = plan.nodes[nodeIdx];
-    DefineOp instrDef = node.match->base.instruction;
+    DefineOp instrDef = node.instruction;
     unsigned numSrc = instrDef.getSources().size();
     unsigned numDst = instrDef.getDestinations().size();
 
@@ -1324,20 +1282,6 @@ FailureOr<ResourcePlan> mlir::act::buildResourcePlan(func::FuncOp funcOp,
       if (failed(inputPlan))
         return failure();
       layout.inputMovements.push_back(std::move(*inputPlan));
-    }
-
-    if (hasTiledReduction(*node.match)) {
-      for (unsigned dstIdx = 0; dstIdx < numDst; ++dstIdx) {
-        unsigned operandIdx = numSrc + dstIdx;
-        StringAttr dstBuf = getOperandBuffer(instrDef, operandIdx);
-        if (dstBuf == layout.bufferName)
-          continue;
-        auto initPlan =
-            buildAccumulatorInitPlan(funcOp, plan, layout, nodeIdx, dstIdx);
-        if (failed(initPlan))
-          return failure();
-        layout.accumulatorInits.push_back(std::move(*initPlan));
-      }
     }
 
     for (unsigned dstIdx = 0; dstIdx < numDst; ++dstIdx) {
@@ -1365,10 +1309,10 @@ FailureOr<ResourcePlan> mlir::act::buildResourcePlan(func::FuncOp funcOp,
   return layout;
 }
 
-LogicalTransformChain
-mlir::act::getRequiredTransforms(const LogicalPlan &plan, unsigned valueId,
-                                 unsigned consumerNodeIdx,
-                                 unsigned consumerOperandIdx) {
+LogicalTransformChain act::getRequiredTransforms(const LogicalPlan &plan,
+                                                 unsigned valueId,
+                                                 unsigned consumerNodeIdx,
+                                                 unsigned consumerOperandIdx) {
   if (consumerNodeIdx < plan.nodes.size()) {
     auto &node = plan.nodes[consumerNodeIdx];
     if (consumerOperandIdx < node.inputs.size() &&

@@ -1,8 +1,8 @@
 #ifndef ACT_SUPPORT_PLANNING_H
 #define ACT_SUPPORT_PLANNING_H
 
+#include "act/Support/ParamSolving.h"
 #include "act/Support/SemanticMatching.h"
-#include "act/Support/TilingAnalysis.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/BuiltinTypes.h"
@@ -56,6 +56,12 @@ using LogicalTransformChain = SmallVector<LogicalTransform, 2>;
 
 bool isIdentityTransformChain(ArrayRef<LogicalTransform> transforms);
 
+enum class LogicalPlanValueKind {
+  FunctionInput,
+  Produced,
+  MaterializedOutput,
+};
+
 /// One consumer use of a logical value.
 struct LogicalPlanInputUse {
   unsigned consumerNodeIdx;
@@ -64,18 +70,19 @@ struct LogicalPlanInputUse {
 };
 
 struct LogicalPlanNodeInput {
-  unsigned valueId;
+  unsigned valueId = GraphEdge::kNullIdx;
   LogicalTransformChain requiredTransforms;
 };
 
 struct LogicalPlanNodeOutput {
-  unsigned valueId;
+  unsigned valueId = GraphEdge::kNullIdx;
   std::optional<unsigned> writebackTargetValueId;
   LogicalTransformChain writebackTransforms;
 };
 
 /// Logical tensor value flowing between compute nodes.
 struct LogicalPlanValue {
+  LogicalPlanValueKind kind = LogicalPlanValueKind::Produced;
   Value sourceValue;
   RankedTensorType type;
   std::optional<unsigned> definingNodeIdx;
@@ -84,8 +91,10 @@ struct LogicalPlanValue {
 
 /// One selected compute node in the logical plan.
 struct LogicalPlanNode {
-  Operation *sourceOp;
-  const TiledMatchCandidate *match;
+  SmallVector<Operation *, 4> sourceOps;
+  DefineOp instruction;
+  DenseMap<unsigned, int64_t> solvedParams;
+  DenseMap<unsigned, AddrParamKind> paramKinds;
   SmallVector<LogicalPlanNodeInput, 2> inputs;
   SmallVector<LogicalPlanNodeOutput, 1> outputs;
 };
@@ -94,7 +103,7 @@ struct LogicalPlanNode {
 struct LogicalPlan {
   SmallVector<LogicalPlanNode, 4> nodes;
   SmallVector<LogicalPlanValue, 8> values;
-  DenseMap<Value, unsigned> valueIds;
+  DenseMap<Value, unsigned> externalValueIds;
 
   void dump() const;
 };
@@ -194,9 +203,8 @@ struct ResourcePlan {
 };
 
 FailureOr<LogicalPlan>
-buildLogicalPlan(func::FuncOp funcOp,
-                 ArrayRef<TiledMatchCandidate> tiledMatches,
-                 ArrayRef<EdgeLayoutAnnotation> layoutAnnotations);
+buildLogicalPlan(func::FuncOp funcOp, const SemanticsGraph &graph,
+                 const GraphParamSolution &paramSolution);
 
 FailureOr<ResourcePlan> buildResourcePlan(func::FuncOp funcOp,
                                           const LogicalPlan &plan,

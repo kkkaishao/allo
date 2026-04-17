@@ -3,7 +3,7 @@ add_mlir_library(MLIRActSupport
     Planning.cpp
     SemanticMatching.cpp
     SymbolicExpr.cpp
-    TilingAnalysis.cpp
+    ParamSolving.cpp
 
     DEPENDS
     MLIRActIncGen
@@ -13,7 +13,6 @@ add_mlir_library(MLIRActSupport
     MLIRArithDialect
     MLIRFuncDialect
     MLIRLinalgDialect
-    MLIRSCFDialect
     MLIRTensorDialect
     MLIRIR
 )

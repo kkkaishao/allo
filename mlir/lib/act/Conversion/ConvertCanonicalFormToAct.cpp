@@ -1,18 +1,19 @@
 #include "act/Conversion/Passes.h"
 #include "act/IR/ActOps.h"
 #include "act/Support/CodeEmission.h"
+#include "act/Support/ParamSolving.h"
 #include "act/Support/SemanticMatching.h"
-#include "act/Support/TilingAnalysis.h"
 
+#include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/Linalg/Passes.h"
-#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/Parser/Parser.h"
 #include "mlir/Pass/PassManager.h"
 #include "mlir/Support/FileUtilities.h"
+#include "mlir/Transforms/DialectConversion.h"
 #include "mlir/Transforms/Passes.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/MemoryBuffer.h"
@@ -26,6 +27,113 @@ namespace mlir::act {
 
 using namespace mlir;
 using namespace mlir::act;
+
+static bool isControlFlowOp(Operation *op) {
+  return isa<LoopLikeOpInterface, BranchOpInterface, RegionBranchOpInterface>(
+      op);
+}
+
+static LogicalResult validateInputProgram(func::FuncOp func, ModuleOp module) {
+  if (!func.symbolKnownUseEmpty(module))
+    return func.emitError()
+           << "cannot lower function @" << func.getSymName()
+           << " to act.sequence while it still has symbol users";
+
+  if (func.getFunctionBody().getBlocks().size() != 1)
+    return func.emitError()
+           << "non-flat function structure is not supported; expected exactly "
+              "one block in function body";
+
+  WalkResult walkResult = func.walk([&](Operation *op) {
+    if (isControlFlowOp(op)) {
+      op->emitError()
+          << "input control flow is not supported in instruction selection";
+      return WalkResult::interrupt();
+    }
+    return WalkResult::advance();
+  });
+  return success(!walkResult.wasInterrupted());
+}
+
+namespace {
+struct LowerFunctionToActPattern : OpConversionPattern<func::FuncOp> {
+  LowerFunctionToActPattern(MLIRContext *ctx, ModuleOp module,
+                            InstructionCatalog &catalog)
+      : OpConversionPattern(ctx), module(module), catalog(catalog) {}
+
+  LogicalResult
+  matchAndRewrite(func::FuncOp func, OpAdaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    FunctionLoweringPlan plan(func);
+
+    if (failed(validateInputProgram(func, module)))
+      return failure();
+
+    auto programOr = ProgramGraph::build(func);
+    if (failed(programOr))
+      return failure();
+
+    DenseSet<Operation *> semanticOps;
+    for (GraphNode &node : programOr->nodes)
+      semanticOps.insert(node.op);
+    if (semanticOps.empty()) {
+      plan.graph = SemanticsGraph{func, {}, {}};
+      plan.isComplete = true;
+    } else {
+      auto graphOr = runSemanticMatching(func, catalog);
+      if (failed(graphOr))
+        return failure();
+      plan.graph = std::move(*graphOr);
+
+      for (SemanticsGraphNode &node : plan.graph.nodes)
+        for (Operation *op : node.sourceOps)
+          plan.coveredSemanticOps.insert(op);
+
+      if (llvm::any_of(semanticOps, [&](Operation *op) {
+            return !plan.coveredSemanticOps.contains(op);
+          })) {
+        return func.emitError()
+               << "partial instruction lowering is not supported for function @"
+               << func.getSymName();
+      }
+      auto paramOr = runParamSolving(plan.graph, module);
+      if (failed(paramOr))
+        return failure();
+      plan.solution = std::move(*paramOr);
+
+      auto logicalOr = buildLogicalPlan(func, plan.graph, plan.solution);
+      if (failed(logicalOr))
+        return failure();
+      plan.logicalPlan = std::move(*logicalOr);
+
+      auto resourceOr = buildResourcePlan(func, plan.logicalPlan, module);
+      if (failed(resourceOr))
+        return failure();
+      plan.resourcePlan = std::move(*resourceOr);
+      plan.isComplete = true;
+    }
+
+    if (!plan.isComplete)
+      return func.emitError()
+             << "failed to build a complete lowering plan for function @"
+             << func.getSymName();
+
+    LLVM_DEBUG({
+      llvm::dbgs() << "Built FunctionLoweringPlan for @" << func.getSymName()
+                   << " with " << plan.logicalPlan.nodes.size()
+                   << " selected node(s)\n";
+    });
+
+    LLVM_DEBUG(llvm::dbgs() << "\n=== Lowering function @" << func.getSymName()
+                            << " ===\n";);
+    return emitInstructionSequence(rewriter, plan);
+  }
+
+private:
+  ModuleOp module;
+  InstructionCatalog &catalog;
+};
+} // namespace
 
 namespace {
 struct ConvertCanonicalToActPass
@@ -56,106 +164,26 @@ struct ConvertCanonicalToActPass
         return signalPassFailure();
     }
 
-    // Step 2: Semantic matching
-    SmallVector<MatchCandidate> matches;
-    SmallVector<EdgeLayoutAnnotation, 4> layoutAnnotations;
-    if (failed(runSemanticMatching(module, matches, layoutAnnotations)))
+    auto catalogOr = InstructionCatalog::build(module);
+    if (failed(catalogOr))
       return signalPassFailure();
-
-    // Step 2.5: Structural matching for rank-mismatched ops
-    {
-      DenseSet<Operation *> matchedOps;
-      for (auto &m : matches)
-        matchedOps.insert(m.sourceOp);
-
-      SmallVector<Operation *> unmatchedOps;
-      module.walk([&](func::FuncOp funcOp) {
-        funcOp.walk([&](Operation *op) {
-          if (!isa<linalg::LinalgOp>(op))
-            return;
-          // Skip layout ops (they are edge annotations, not compute)
-          if (isa<linalg::TransposeOp>(op))
-            return;
-          if (op->getParentOfType<DefineOp>())
-            return;
-          if (!matchedOps.contains(op))
-            unmatchedOps.push_back(op);
-        });
-      });
-
-      SmallVector<MatchCandidate> structuralMatches;
-      if (failed(
-              runStructuralMatching(module, unmatchedOps, structuralMatches)))
-        return signalPassFailure();
-
-      matches.append(structuralMatches.begin(), structuralMatches.end());
-    }
-
-    // Step 3: Report matching results
     LLVM_DEBUG({
-      llvm::dbgs() << "\n=== Matching Results ===\n";
-      for (auto &m : matches) {
-        llvm::dbgs() << "  " << m.sourceOp->getName() << " -> @"
-                     << m.instruction.getSymName();
-        if (m.numOuterDims > 0)
-          llvm::dbgs() << " [structural, outer=" << m.numOuterDims << "]";
-        llvm::dbgs() << "\n";
-      }
-      llvm::dbgs() << "=== " << matches.size() << " match(es) found ===\n";
+      llvm::dbgs() << "=== Instruction Catalog ===\n";
+      catalogOr->dump();
     });
 
-    // Step 4: Tiling analysis (Stage 2)
-    SmallVector<TiledMatchCandidate> tiledMatches;
-    if (failed(runTilingAnalysis(module, matches, tiledMatches)))
-      return signalPassFailure();
+    MLIRContext *ctx = &getContext();
+    ConversionTarget target(*ctx);
+    target.addLegalOp<ModuleOp>();
+    target.addLegalDialect<act::ActDialect, affine::AffineDialect,
+                           arith::ArithDialect, linalg::LinalgDialect,
+                           tensor::TensorDialect>();
+    target.addIllegalOp<func::FuncOp>();
 
-    // Step 5: Report Stage 2 results
-    LLVM_DEBUG({
-      llvm::dbgs() << "\n=== Tiling Analysis Results ===\n";
-      for (auto &tm : tiledMatches) {
-        llvm::dbgs() << "  " << tm.base.sourceOp->getName() << " -> @"
-                     << tm.base.instruction.getSymName();
-        if (tm.isValid) {
-          llvm::dbgs() << " [valid]";
-          if (tm.needsTiling())
-            llvm::dbgs() << " needs-tiling";
-          else
-            llvm::dbgs() << " single-invocation";
-          // Print solved params
-          if (!tm.tiling.solvedParams.empty()) {
-            llvm::dbgs() << " params={";
-            bool first = true;
-            for (auto &[idx, val] : tm.tiling.solvedParams) {
-              if (!first)
-                llvm::dbgs() << ",";
-              llvm::dbgs() << "p" << idx << "=" << val;
-              first = false;
-            }
-            llvm::dbgs() << "}";
-          }
-          // Print outer dims info
-          if (tm.numOuterDims > 0)
-            llvm::dbgs() << " outer-dims=" << tm.numOuterDims;
-          // Print tiling factors if tiling needed
-          if (tm.needsTiling()) {
-            llvm::dbgs() << " tiles=[";
-            for (unsigned i = 0; i < tm.tiling.dims.size(); ++i) {
-              if (i > 0)
-                llvm::dbgs() << ",";
-              llvm::dbgs() << tm.tiling.dims[i].tileFactor;
-            }
-            llvm::dbgs() << "]";
-          }
-        } else {
-          llvm::dbgs() << " [INFEASIBLE]";
-        }
-        llvm::dbgs() << "\n";
-      }
-      llvm::dbgs() << "=== " << tiledMatches.size() << " tiled match(es) ===\n";
-    });
-
-    // Step 6: Code emission (Stage 3)
-    if (failed(runCodeEmission(module, tiledMatches, layoutAnnotations)))
+    RewritePatternSet patterns(ctx);
+    patterns.add<LowerFunctionToActPattern>(ctx, module, *catalogOr);
+    if (failed(applyPartialConversion(getOperation(), target,
+                                      std::move(patterns))))
       return signalPassFailure();
   }
 
@@ -163,7 +191,6 @@ struct ConvertCanonicalToActPass
     registry.insert<act::ActDialect>();
     registry.insert<arith::ArithDialect>();
     registry.insert<linalg::LinalgDialect>();
-    registry.insert<scf::SCFDialect>();
     registry.insert<tensor::TensorDialect>();
   }
 

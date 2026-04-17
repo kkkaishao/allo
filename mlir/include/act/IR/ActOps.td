@@ -410,4 +410,40 @@ def Act_EmitOp : Act_Op<"emit", [
   }];
 }
 
+def Act_SequenceOp : Act_Op<"sequence", [AutomaticAllocationScope, IsolatedFromAbove, Symbol, NoTerminator]> {
+  let summary = "Define a flat sequence of instructions";
+  let description = [{
+    Defines a named sequence of instructions. The sequence body can contain
+    `act.emit` operations to invoke defined instructions. The body is a flat
+    instruction stream for now; control flow is rejected until explicit `cf`
+    support is added.
+  }];
+  let arguments = (ins SymbolNameAttr:$sym_name);
+  let results = (outs);
+  let regions = (region AnyRegion:$body);
+  let hasVerifier = 1;
+  let assemblyFormat = [{
+    $sym_name $body attr-dict
+  }];
+  let extraClassDeclaration = [{
+    Block *addEntryBlock() {
+      return &getBody().emplaceBlock();
+    }
+  }];
+}
+
+def Act_LaunchOp : Act_Op<"launch", [DeclareOpInterfaceMethods<SymbolUserOpInterface>]> {
+  let summary = "Launch a sequence of instructions asynchronously";
+  let description = [{
+    Launches a sequence defined by `act.sequence` to execute. The
+    launched sequence can contain any instructions, but must not contain another
+    `act.launch`.
+  }];
+  let arguments = (ins FlatSymbolRefAttr:$sequence, UnitAttr:$async);
+  let results = (outs);
+  let assemblyFormat = [{
+    $sequence (`async` $async^)? attr-dict
+  }];
+}
+
 #endif // ACT_OPS_TD

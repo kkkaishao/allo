@@ -1,34 +1,147 @@
 #include "act/Support/SemanticMatching.h"
 
+#include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/Dialect/Utils/StructuredOpsUtils.h"
-#include "mlir/IR/AffineExpr.h"
+#include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/OperationSupport.h"
+#include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/DenseSet.h"
+#include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/ScopeExit.h"
 #include "llvm/Support/Debug.h"
+
+#include <optional>
+#include <tuple>
 
 #define DEBUG_TYPE "semantic-matching"
 
 using namespace mlir;
 using namespace mlir::act;
 
-//===----------------------------------------------------------------------===//
-// Layout op classification
-//===----------------------------------------------------------------------===//
+namespace {
 
-static bool isLayoutOp(Operation *op) {
-  return isa<tensor::ExpandShapeOp, tensor::CollapseShapeOp,
-             tensor::ExtractSliceOp, tensor::InsertSliceOp,
-             linalg::TransposeOp>(op);
+struct RelayoutChain {
+  Value source;
+  SemanticEdgeTransformChain transforms;
+  Operation *unsupported = nullptr;
+};
+
+struct MatchState {
+  const InstructionGraph &pattern;
+  const ProgramGraph &program;
+  SmallVector<unsigned, 4> patternToSourceNodeIdx;
+  SmallVector<unsigned, 4> sourceToPatternNodeIdx;
+  SmallVector<bool, 4> mappedPatternNodes;
+  SmallVector<bool, 8> usedSourceNodes;
+};
+
+struct MaterializedOutputInfo {
+  Value value;
+  SemanticEdgeTransformChain transforms;
+};
+
+} // namespace
+
+static void printSliceSpec(raw_ostream &os, const StaticSliceSpec &slice) {
+  auto printVec = [&](StringRef label, ArrayRef<int64_t> values) {
+    os << " " << label << "=[";
+    for (auto [idx, value] : llvm::enumerate(values)) {
+      if (idx)
+        os << ",";
+      os << value;
+    }
+    os << "]";
+  };
+  printVec("offsets", slice.offsets);
+  printVec("sizes", slice.sizes);
+  printVec("strides", slice.strides);
 }
 
-template <typename SliceOp>
-static std::optional<StaticSliceSpec> getStaticSliceSpec(SliceOp op) {
+static void printTransform(raw_ostream &os, const SemanticEdgeTransform &tx) {
+  switch (tx.kind) {
+  case SemanticEdgeTransformKind::Transpose:
+    os << "transpose[";
+    for (auto [idx, value] : llvm::enumerate(tx.permutation)) {
+      if (idx)
+        os << ",";
+      os << value;
+    }
+    os << "]";
+    return;
+  case SemanticEdgeTransformKind::ExtractSlice:
+    os << "extract_slice";
+    assert(tx.sliceSpec && "extract_slice requires static slice spec");
+    printSliceSpec(os, *tx.sliceSpec);
+    return;
+  case SemanticEdgeTransformKind::InsertSlice:
+    os << "insert_slice";
+    assert(tx.sliceSpec && "insert_slice requires static slice spec");
+    printSliceSpec(os, *tx.sliceSpec);
+    return;
+  }
+  llvm_unreachable("unknown semantic edge transform");
+}
+
+static void printTransformChain(raw_ostream &os,
+                                ArrayRef<SemanticEdgeTransform> transforms) {
+  if (transforms.empty()) {
+    os << "identity";
+    return;
+  }
+  for (auto [idx, tx] : llvm::enumerate(transforms)) {
+    if (idx)
+      os << " -> ";
+    printTransform(os, tx);
+  }
+}
+
+static void printValueRef(raw_ostream &os, Value value) {
+  if (!value) {
+    os << "<null>";
+    return;
+  }
+  if (auto arg = dyn_cast<BlockArgument>(value)) {
+    os << "%arg" << arg.getArgNumber();
+    return;
+  }
+  auto result = cast<OpResult>(value);
+  os << "%" << result.getOwner()->getName().getStringRef() << "."
+     << result.getResultNumber();
+}
+
+static void printFingerprint(raw_ostream &os, const SemanticFingerprint &fp) {
+  switch (fp.kind) {
+  case SemanticFingerprint::Named:
+    os << fp.opName;
+    return;
+  case SemanticFingerprint::Generic:
+    os << "linalg.generic";
+    return;
+  case SemanticFingerprint::Identity:
+    os << "identity";
+    return;
+  case SemanticFingerprint::Opaque:
+    os << "opaque(" << fp.opName << ")";
+    return;
+  }
+  llvm_unreachable("unknown fingerprint kind");
+}
+
+static StringRef getDefineName(DefineOp defineOp) {
+  return defineOp.getSymName();
+}
+
+static StringRef getFuncName(func::FuncOp funcOp) { return funcOp.getName(); }
+
+static std::optional<StaticSliceSpec>
+getStaticSliceSpec(tensor::ExtractSliceOp sliceOp) {
   StaticSliceSpec spec;
-  auto staticOffsets = op.getStaticOffsets();
-  auto staticSizes = op.getStaticSizes();
-  auto staticStrides = op.getStaticStrides();
+  auto staticOffsets = sliceOp.getStaticOffsets();
+  auto staticSizes = sliceOp.getStaticSizes();
+  auto staticStrides = sliceOp.getStaticStrides();
   if (llvm::any_of(staticOffsets,
                    [](int64_t v) { return v == ShapedType::kDynamic; }) ||
       llvm::any_of(staticSizes,
@@ -43,111 +156,70 @@ static std::optional<StaticSliceSpec> getStaticSliceSpec(SliceOp op) {
   return spec;
 }
 
-static void collectInputBoundaryAnnotations(
-    Value value, Operation *computeOp, unsigned operandIdx,
-    SmallVectorImpl<EdgeLayoutAnnotation> &layoutAnnotations) {
-  SmallVector<EdgeLayoutAnnotation, 2> reversedAnnotations;
-  Value current = value;
-
-  while (Operation *defOp = current.getDefiningOp()) {
-    if (auto transposeOp = dyn_cast<linalg::TransposeOp>(defOp)) {
-      EdgeLayoutAnnotation ann;
-      ann.direction = EdgeLayoutDirection::Input;
-      ann.transformKind = EdgeLayoutTransformKind::Transpose;
-      ann.layoutOp = transposeOp;
-      ann.computeOp = computeOp;
-      ann.edgeIdx = operandIdx;
-      auto perm = transposeOp.getPermutation();
-      ann.permutation.assign(perm.begin(), perm.end());
-      reversedAnnotations.push_back(std::move(ann));
-      current = transposeOp.getInput();
-      continue;
-    }
-
-    if (auto extractSliceOp = dyn_cast<tensor::ExtractSliceOp>(defOp)) {
-      if (auto sliceSpec = getStaticSliceSpec(extractSliceOp)) {
-        EdgeLayoutAnnotation ann;
-        ann.direction = EdgeLayoutDirection::Input;
-        ann.transformKind = EdgeLayoutTransformKind::ExtractSlice;
-        ann.layoutOp = extractSliceOp;
-        ann.computeOp = computeOp;
-        ann.edgeIdx = operandIdx;
-        ann.sliceSpec = *sliceSpec;
-        reversedAnnotations.push_back(std::move(ann));
-      }
-      current = extractSliceOp.getSource();
-      continue;
-    }
-
-    if (auto expandOp = dyn_cast<tensor::ExpandShapeOp>(defOp)) {
-      current = expandOp.getSrc();
-      continue;
-    }
-    if (auto collapseOp = dyn_cast<tensor::CollapseShapeOp>(defOp)) {
-      current = collapseOp.getSrc();
-      continue;
-    }
-    break;
+static std::optional<StaticSliceSpec>
+getStaticSliceSpec(tensor::InsertSliceOp sliceOp) {
+  StaticSliceSpec spec;
+  auto staticOffsets = sliceOp.getStaticOffsets();
+  auto staticSizes = sliceOp.getStaticSizes();
+  auto staticStrides = sliceOp.getStaticStrides();
+  if (llvm::any_of(staticOffsets,
+                   [](int64_t v) { return v == ShapedType::kDynamic; }) ||
+      llvm::any_of(staticSizes,
+                   [](int64_t v) { return v == ShapedType::kDynamic; }) ||
+      llvm::any_of(staticStrides,
+                   [](int64_t v) { return v == ShapedType::kDynamic; })) {
+    return std::nullopt;
   }
+  spec.offsets.assign(staticOffsets.begin(), staticOffsets.end());
+  spec.sizes.assign(staticSizes.begin(), staticSizes.end());
+  spec.strides.assign(staticStrides.begin(), staticStrides.end());
+  return spec;
+}
 
-  for (unsigned i = 0; i < reversedAnnotations.size(); ++i) {
-    auto ann =
-        std::move(reversedAnnotations[reversedAnnotations.size() - 1 - i]);
-    ann.transformOrder = i;
-    layoutAnnotations.push_back(std::move(ann));
+static bool isAnyLayoutOp(Operation *op) {
+  return isa<tensor::ExpandShapeOp, tensor::CollapseShapeOp,
+             tensor::ExtractSliceOp, tensor::InsertSliceOp,
+             linalg::TransposeOp>(op);
+}
+
+static bool isAlwaysNonSemanticLayoutOp(Operation *op) {
+  return isa<tensor::ExpandShapeOp, tensor::CollapseShapeOp,
+             tensor::ExtractSliceOp, tensor::InsertSliceOp>(op);
+}
+
+static bool isPotentialSemanticOp(Operation *op) {
+  if (isa<linalg::FillOp>(op) || isAlwaysNonSemanticLayoutOp(op))
+    return false;
+  return isa<linalg::LinalgOp, linalg::SoftmaxOp>(op);
+}
+
+static unsigned getFingerprintSpecificity(const SemanticFingerprint &fp) {
+  switch (fp.kind) {
+  case SemanticFingerprint::Generic:
+    return 3;
+  case SemanticFingerprint::Named:
+    return 2;
+  default:
+    return 0;
   }
 }
 
-static void collectOutputBoundaryAnnotations(
-    Operation *computeOp,
-    SmallVectorImpl<EdgeLayoutAnnotation> &layoutAnnotations) {
-  for (auto [resultIdx, result] : llvm::enumerate(computeOp->getResults())) {
-    for (Operation *user : result.getUsers()) {
-      auto insertSliceOp = dyn_cast<tensor::InsertSliceOp>(user);
-      if (!insertSliceOp || insertSliceOp.getSource() != result)
-        continue;
-      if (auto sliceSpec = getStaticSliceSpec(insertSliceOp)) {
-        EdgeLayoutAnnotation ann;
-        ann.direction = EdgeLayoutDirection::Output;
-        ann.transformKind = EdgeLayoutTransformKind::InsertSlice;
-        ann.layoutOp = insertSliceOp;
-        ann.computeOp = computeOp;
-        ann.edgeIdx = resultIdx;
-        ann.transformOrder = 0;
-        ann.sliceSpec = *sliceSpec;
-        layoutAnnotations.push_back(std::move(ann));
-      }
-    }
-  }
-}
-
-//===----------------------------------------------------------------------===//
-// Compute region validation
-//===----------------------------------------------------------------------===//
-
-/// Validate that a compute region contains no layout ops. After the
-/// compute/access separation, all layout transforms belong in the addr
-/// region. If layout ops are found, they are classified as boundary
-/// transforms (pre/post) and reported as errors — the ISA author should
-/// move them to the addr region.
-
-/// Identify pre-transform ops: layout ops whose operands are all block args
-/// or other pre-transforms. Fixed-point iteration.
 static DenseSet<Operation *> findPreTransforms(Block &block) {
   DenseSet<Operation *> preTransforms;
   bool changed = true;
   while (changed) {
     changed = false;
     for (Operation &op : block) {
-      if (preTransforms.contains(&op) || !isLayoutOp(&op))
+      if (preTransforms.contains(&op) || !isAnyLayoutOp(&op))
         continue;
       bool allOperandsFromBoundary =
           llvm::all_of(op.getOperands(), [&](Value v) {
             if (isa<BlockArgument>(v))
               return true;
-            auto *defOp = v.getDefiningOp();
-            return defOp && (preTransforms.contains(defOp) ||
-                             isa<arith::ConstantOp>(defOp));
+            if (auto *defOp = v.getDefiningOp())
+              return preTransforms.contains(defOp) ||
+                     isa<arith::ConstantOp>(defOp);
+            return false;
           });
       if (allOperandsFromBoundary) {
         preTransforms.insert(&op);
@@ -158,17 +230,15 @@ static DenseSet<Operation *> findPreTransforms(Block &block) {
   return preTransforms;
 }
 
-/// Identify post-transform ops: layout ops whose results feed only into
-/// yield or other post-transforms. Fixed-point iteration.
 static DenseSet<Operation *> findPostTransforms(Block &block) {
   DenseSet<Operation *> postTransforms;
-  auto *yieldOp = block.getTerminator();
+  Operation *yieldOp = block.getTerminator();
 
   bool changed = true;
   while (changed) {
     changed = false;
     for (Operation &op : block) {
-      if (postTransforms.contains(&op) || !isLayoutOp(&op))
+      if (postTransforms.contains(&op) || !isAnyLayoutOp(&op))
         continue;
       bool allUsersAtBoundary =
           llvm::all_of(op.getResults(), [&](Value result) {
@@ -185,611 +255,1212 @@ static DenseSet<Operation *> findPostTransforms(Block &block) {
   return postTransforms;
 }
 
-/// Check that a compute block has no boundary layout ops. Returns failure
-/// and emits diagnostics if any are found.
+static DenseSet<Operation *> collectBoundaryLayoutOps(Block &block) {
+  auto preTransforms = findPreTransforms(block);
+  auto postTransforms = findPostTransforms(block);
+  preTransforms.insert(postTransforms.begin(), postTransforms.end());
+  return preTransforms;
+}
+
 static LogicalResult validateComputeRegion(DefineOp defineOp) {
   Block &block = defineOp.getSemanticsBlock();
   auto preTransforms = findPreTransforms(block);
   auto postTransforms = findPostTransforms(block);
 
   bool hasErrors = false;
-  for (auto *op : preTransforms) {
-    defineOp.emitWarning()
+  for (Operation *op : preTransforms) {
+    defineOp.emitError()
         << "compute region of @" << defineOp.getSymName()
         << " contains boundary layout op '" << op->getName()
         << "' that should be in the addr region (pre-transform)";
     hasErrors = true;
   }
-  for (auto *op : postTransforms) {
-    defineOp.emitWarning()
+  for (Operation *op : postTransforms) {
+    defineOp.emitError()
         << "compute region of @" << defineOp.getSymName()
         << " contains boundary layout op '" << op->getName()
         << "' that should be in the addr region (post-transform)";
     hasErrors = true;
   }
-
-  if (hasErrors) {
-    LLVM_DEBUG(llvm::dbgs() << "  [warning] @" << defineOp.getSymName()
-                            << " has " << preTransforms.size()
-                            << " pre-transform(s) and " << postTransforms.size()
-                            << " post-transform(s) in compute region\n");
-  }
   return success(!hasErrors);
 }
 
-/// Collect core compute ops from a compute block, filtering out yield,
-/// constants, and tensor.empty (allocation, not compute). After the
-/// compute/access separation, all remaining ops should be compute ops.
-static SmallVector<Operation *> collectCoreOps(Block &block) {
-  SmallVector<Operation *> coreOps;
-  for (Operation &op : block) {
-    if (isa<YieldOp>(&op) || isa<arith::ConstantOp>(&op) ||
-        isa<tensor::EmptyOp>(&op))
-      continue;
-    coreOps.push_back(&op);
-  }
-  return coreOps;
-}
-
-//===----------------------------------------------------------------------===//
-// Compute region linalg op extraction
-//===----------------------------------------------------------------------===//
-
-/// Find the single linalg op in a DefineOp's compute region, or nullptr.
-static linalg::LinalgOp findComputeLinalgOp(DefineOp defineOp) {
-  Block &block = defineOp.getSemanticsBlock();
-  auto coreOps = collectCoreOps(block);
-  if (coreOps.size() != 1)
-    return nullptr;
-  return dyn_cast<linalg::LinalgOp>(coreOps[0]);
-}
-
-//===----------------------------------------------------------------------===//
-// Fingerprint extraction
-//===----------------------------------------------------------------------===//
-
-/// Extract a semantic fingerprint from an act.define's compute region.
-static SemanticFingerprint extractFingerprint(DefineOp defineOp) {
-  Block &block = defineOp.getSemanticsBlock();
-  auto coreOps = collectCoreOps(block);
-
-  // Identity: no core compute ops
-  if (coreOps.empty())
-    return {SemanticFingerprint::Identity, {}, {}, {}, nullptr, 0, 0};
-
-  // Single core op
-  if (coreOps.size() == 1) {
-    Operation *op = coreOps[0];
-    if (auto linalgOp = dyn_cast<linalg::LinalgOp>(op)) {
-      // Named linalg op (not generic)
-      if (!isa<linalg::GenericOp>(op)) {
-        return {SemanticFingerprint::Named,
-                op->getName().getStringRef(),
-                {},
-                {},
-                nullptr,
-                0,
-                0};
-      }
-      // linalg.generic — extract structural info
-      return {SemanticFingerprint::Generic,
-              {},
-              linalgOp.getIndexingMapsArray(),
-              linalgOp.getIteratorTypesArray(),
-              &op->getRegion(0),
-              static_cast<unsigned>(linalgOp.getNumDpsInputs()),
-              static_cast<unsigned>(linalgOp.getNumDpsInits())};
-    }
-    // Non-linalg single op (shouldn't normally happen)
-    return {SemanticFingerprint::Named,
-            op->getName().getStringRef(),
-            {},
-            {},
-            nullptr,
-            0,
-            0};
-  }
-
-  // Multi-op: not yet supported, log and return identity as fallback
-  LLVM_DEBUG(llvm::dbgs() << "  [skip] multi-op pattern in @"
-                          << defineOp.getSymName() << " (not yet supported)\n");
-  return {SemanticFingerprint::Identity, {}, {}, {}, nullptr, 0, 0};
-}
-
-/// Compute a semantic fingerprint for a source op.
-static SemanticFingerprint computeSourceFingerprint(Operation *op) {
-  if (auto linalgOp = dyn_cast<linalg::LinalgOp>(op)) {
-    if (!isa<linalg::GenericOp>(op)) {
-      return {SemanticFingerprint::Named,
-              op->getName().getStringRef(),
-              {},
-              {},
-              nullptr,
-              0,
-              0};
-    }
-    return {SemanticFingerprint::Generic,
-            {},
-            linalgOp.getIndexingMapsArray(),
-            linalgOp.getIteratorTypesArray(),
-            &op->getRegion(0),
-            static_cast<unsigned>(linalgOp.getNumDpsInputs()),
-            static_cast<unsigned>(linalgOp.getNumDpsInits())};
-  }
-  // Non-linalg op — use op name
-  return {SemanticFingerprint::Named,
-          op->getName().getStringRef(),
-          {},
-          {},
-          nullptr,
-          0,
-          0};
-}
-
-//===----------------------------------------------------------------------===//
-// SemanticFingerprint hashing and comparison
-//===----------------------------------------------------------------------===//
-
-llvm::hash_code SemanticFingerprint::hash() const {
-  switch (kind) {
-  case Named:
-    return llvm::hash_combine(kind, opName);
-  case Generic: {
-    // Hash iterator types + input/output counts (not body — used for lookup)
-    llvm::hash_code h = llvm::hash_combine(kind, numInputs, numOutputs);
-    for (auto it : iteratorTypes)
-      h = llvm::hash_combine(h, static_cast<int>(it));
-    return h;
-  }
-  case Identity:
-    return llvm::hash_combine(kind);
-  }
-  llvm_unreachable("unknown fingerprint kind");
-}
-
-bool SemanticFingerprint::matches(const SemanticFingerprint &other) const {
-  if (kind != other.kind)
+static bool isSemanticNodeOp(Operation *op,
+                             const DenseSet<Operation *> &boundaryLayoutOps) {
+  if (!isPotentialSemanticOp(op))
     return false;
-
-  switch (kind) {
-  case Named:
-    return opName == other.opName;
-
-  case Generic: {
-    // Compare indexing maps structurally
-    if (indexingMaps.size() != other.indexingMaps.size())
-      return false;
-    for (size_t i = 0; i < indexingMaps.size(); ++i)
-      if (indexingMaps[i] != other.indexingMaps[i])
-        return false;
-    // Compare iterator types
-    if (iteratorTypes != other.iteratorTypes)
-      return false;
-    // Compare body regions
-    if (!bodyRegion || !other.bodyRegion)
-      return false;
-    // Use OperationEquivalence for body comparison.
-    // Block args match by position, ignoring types (shape-agnostic).
-    return OperationEquivalence::isRegionEquivalentTo(
-        bodyRegion, other.bodyRegion,
-        [](Value lhs, Value rhs) -> LogicalResult {
-          auto lhsArg = dyn_cast<BlockArgument>(lhs);
-          auto rhsArg = dyn_cast<BlockArgument>(rhs);
-          if (lhsArg && rhsArg)
-            return success(lhsArg.getArgNumber() == rhsArg.getArgNumber());
-          return failure();
-        },
-        /*markEquivalent=*/nullptr,
-        OperationEquivalence::Flags::IgnoreLocations);
-  }
-
-  case Identity:
-    return true;
-  }
-  llvm_unreachable("unknown fingerprint kind");
-}
-
-//===----------------------------------------------------------------------===//
-// InstructionCatalog
-//===----------------------------------------------------------------------===//
-
-InstructionCatalog InstructionCatalog::build(ModuleOp module) {
-  InstructionCatalog catalog;
-  module.walk([&](DefineOp defineOp) {
-    // Validate that compute regions are free of boundary layout ops.
-    (void)validateComputeRegion(defineOp);
-
-    auto fp = extractFingerprint(defineOp);
-    LLVM_DEBUG({
-      llvm::dbgs() << "  Instruction @" << defineOp.getSymName() << ": ";
-      switch (fp.kind) {
-      case SemanticFingerprint::Named:
-        llvm::dbgs() << "Named(" << fp.opName << ")";
-        break;
-      case SemanticFingerprint::Generic:
-        llvm::dbgs() << "Generic(inputs=" << fp.numInputs
-                     << ", outputs=" << fp.numOutputs << ")";
-        break;
-      case SemanticFingerprint::Identity:
-        llvm::dbgs() << "Identity";
-        break;
-      }
-      llvm::dbgs() << "\n";
-    });
-    // Identity instructions (data movement) never match source compute ops.
-    if (fp.kind == SemanticFingerprint::Identity)
-      return;
-    auto h = fp.hash();
-    catalog.index[h].push_back({defineOp, std::move(fp)});
-  });
-  return catalog;
-}
-
-SmallVector<MatchCandidate>
-InstructionCatalog::match(Operation *sourceOp) const {
-  auto sourceFP = computeSourceFingerprint(sourceOp);
-  auto h = sourceFP.hash();
-
-  SmallVector<MatchCandidate> results;
-  auto it = index.find(h);
-  if (it == index.end())
-    return results;
-
-  for (auto &entry : it->second) {
-    if (entry.fingerprint.matches(sourceFP))
-      results.push_back({sourceOp, entry.defineOp});
-  }
-  return results;
-}
-
-void InstructionCatalog::dump() {
-  llvm::dbgs() << "InstructionCatalog (" << index.size() << " hash buckets):\n";
-  for (auto &[h, entries] : index) {
-    for (auto &entry : entries) {
-      llvm::dbgs() << "  @" << entry.defineOp.getSymName() << " -> ";
-      switch (entry.fingerprint.kind) {
-      case SemanticFingerprint::Named:
-        llvm::dbgs() << "Named(" << entry.fingerprint.opName << ")";
-        break;
-      case SemanticFingerprint::Generic:
-        llvm::dbgs() << "Generic";
-        break;
-      case SemanticFingerprint::Identity:
-        llvm::dbgs() << "Identity";
-        break;
-      }
-      llvm::dbgs() << "\n";
-    }
-  }
-}
-
-//===----------------------------------------------------------------------===//
-// Top-level semantic matching
-//===----------------------------------------------------------------------===//
-
-LogicalResult mlir::act::runSemanticMatching(
-    ModuleOp module, SmallVectorImpl<MatchCandidate> &results,
-    SmallVectorImpl<EdgeLayoutAnnotation> &layoutAnnotations) {
-  LLVM_DEBUG(llvm::dbgs() << "Building instruction catalog...\n");
-  auto catalog = InstructionCatalog::build(module);
-  LLVM_DEBUG(catalog.dump());
-
-  LLVM_DEBUG(llvm::dbgs() << "\nMatching source ops...\n");
-  module.walk([&](func::FuncOp funcOp) {
-    funcOp.walk([&](Operation *op) {
-      // Only match linalg compute ops (skip layout ops like transpose)
-      if (!isa<linalg::LinalgOp>(op))
-        return;
-      if (isLayoutOp(op))
-        return;
-      // Skip linalg ops inside act.define regions
-      if (op->getParentOfType<DefineOp>())
-        return;
-
-      auto matches = catalog.match(op);
-      if (matches.empty()) {
-        LLVM_DEBUG(llvm::dbgs() << "  [unmatched] " << op->getName() << " at "
-                                << op->getLoc() << "\n");
-      } else {
-        for (auto &m : matches) {
-          LLVM_DEBUG(llvm::dbgs() << "  [matched] " << op->getName() << " -> @"
-                                  << m.instruction.getSymName() << "\n");
-          results.push_back(std::move(m));
-        }
-      }
-    });
-  });
-
-  // Collect layout ops as edge annotations
-  LLVM_DEBUG(llvm::dbgs() << "\nCollecting layout edge annotations...\n");
-  module.walk([&](func::FuncOp funcOp) {
-    funcOp.walk([&](Operation *op) {
-      if (op->getParentOfType<DefineOp>() || !isa<linalg::LinalgOp>(op) ||
-          isLayoutOp(op))
-        return;
-
-      auto linalgOp = cast<linalg::LinalgOp>(op);
-      for (auto [idx, input] : llvm::enumerate(linalgOp.getDpsInputs()))
-        collectInputBoundaryAnnotations(input, op, idx, layoutAnnotations);
-      collectOutputBoundaryAnnotations(op, layoutAnnotations);
-    });
-  });
-
-  LLVM_DEBUG({
-    for (auto &ann : layoutAnnotations) {
-      llvm::dbgs() << "  [edge] "
-                   << (ann.direction == EdgeLayoutDirection::Input ? "input "
-                                                                   : "output ")
-                   << ann.computeOp->getName() << " edge " << ann.edgeIdx
-                   << " order " << ann.transformOrder << " ";
-      switch (ann.transformKind) {
-      case EdgeLayoutTransformKind::Transpose:
-        llvm::dbgs() << "transpose[";
-        for (unsigned i = 0; i < ann.permutation.size(); ++i) {
-          if (i)
-            llvm::dbgs() << ",";
-          llvm::dbgs() << ann.permutation[i];
-        }
-        llvm::dbgs() << "]";
-        break;
-      case EdgeLayoutTransformKind::ExtractSlice:
-      case EdgeLayoutTransformKind::InsertSlice:
-        llvm::dbgs() << (ann.transformKind ==
-                                 EdgeLayoutTransformKind::ExtractSlice
-                             ? "extract_slice"
-                             : "insert_slice")
-                     << " offsets=[";
-        for (unsigned i = 0; i < ann.sliceSpec.offsets.size(); ++i) {
-          if (i)
-            llvm::dbgs() << ",";
-          llvm::dbgs() << ann.sliceSpec.offsets[i];
-        }
-        llvm::dbgs() << "] sizes=[";
-        for (unsigned i = 0; i < ann.sliceSpec.sizes.size(); ++i) {
-          if (i)
-            llvm::dbgs() << ",";
-          llvm::dbgs() << ann.sliceSpec.sizes[i];
-        }
-        llvm::dbgs() << "] strides=[";
-        for (unsigned i = 0; i < ann.sliceSpec.strides.size(); ++i) {
-          if (i)
-            llvm::dbgs() << ",";
-          llvm::dbgs() << ann.sliceSpec.strides[i];
-        }
-        llvm::dbgs() << "]";
-        break;
-      }
-      llvm::dbgs() << "\n";
-    }
-  });
-
-  return success();
-}
-
-//===----------------------------------------------------------------------===//
-// Structural suffix matching (rank mismatch)
-//===----------------------------------------------------------------------===//
-
-/// Check if instrTypes is a suffix of sourceTypes with all-parallel prefix.
-/// Returns the offset (number of outer dims) or std::nullopt on failure.
-static std::optional<unsigned>
-checkIteratorTypeSuffix(ArrayRef<utils::IteratorType> sourceTypes,
-                        ArrayRef<utils::IteratorType> instrTypes) {
-  if (sourceTypes.size() <= instrTypes.size())
-    return std::nullopt;
-  unsigned offset = sourceTypes.size() - instrTypes.size();
-  // Check suffix match
-  for (unsigned i = 0; i < instrTypes.size(); ++i) {
-    if (sourceTypes[offset + i] != instrTypes[i])
-      return std::nullopt;
-  }
-  // Check prefix is all parallel
-  for (unsigned i = 0; i < offset; ++i) {
-    if (sourceTypes[i] != utils::IteratorType::parallel)
-      return std::nullopt;
-  }
-  return offset;
-}
-
-/// Check indexing map compatibility: strip results referencing batch dims
-/// from source maps, reindex remaining dims, and compare with instruction maps.
-static bool checkIndexingMapCompatibility(linalg::LinalgOp sourceOp,
-                                          linalg::LinalgOp instrOp,
-                                          unsigned offset) {
-  auto sourceMaps = sourceOp.getIndexingMapsArray();
-  auto instrMaps = instrOp.getIndexingMapsArray();
-  if (sourceMaps.size() != instrMaps.size())
+  if (isAlwaysNonSemanticLayoutOp(op))
     return false;
-
-  MLIRContext *ctx = sourceOp.getContext();
-  unsigned sourceNumDims = sourceMaps[0].getNumDims();
-  unsigned instrNumDims = instrMaps[0].getNumDims();
-  if (sourceNumDims != instrNumDims + offset)
+  if (isa<linalg::TransposeOp>(op) && boundaryLayoutOps.contains(op))
     return false;
-
-  // Build replacement: d_i -> d_{i-offset} for i >= offset
-  SmallVector<AffineExpr> dimReplacements(sourceNumDims);
-  for (unsigned i = 0; i < offset; ++i)
-    dimReplacements[i] = getAffineConstantExpr(0, ctx);
-  for (unsigned i = offset; i < sourceNumDims; ++i)
-    dimReplacements[i] = getAffineDimExpr(i - offset, ctx);
-
-  for (unsigned opIdx = 0; opIdx < sourceMaps.size(); ++opIdx) {
-    AffineMap srcMap = sourceMaps[opIdx];
-    AffineMap instrMap = instrMaps[opIdx];
-
-    // Strip results that reference only batch dims (d0..d_{offset-1})
-    SmallVector<AffineExpr> strippedResults;
-    for (unsigned r = 0; r < srcMap.getNumResults(); ++r) {
-      AffineExpr expr = srcMap.getResult(r);
-      auto dimExpr = dyn_cast<AffineDimExpr>(expr);
-      if (dimExpr && dimExpr.getPosition() < offset)
-        continue; // batch dim result — strip it
-      strippedResults.push_back(expr);
-    }
-
-    if (strippedResults.size() != instrMap.getNumResults())
-      return false;
-
-    // Reindex: replace d_i with d_{i-offset}
-    AffineMap strippedMap =
-        AffineMap::get(sourceNumDims, 0, strippedResults, ctx)
-            .replaceDimsAndSymbols(dimReplacements, {}, instrNumDims, 0);
-
-    if (strippedMap != instrMap)
-      return false;
-  }
   return true;
 }
 
-/// Check body region equivalence between two linalg ops.
-/// Compares the scalar body operations structurally: same op names, same
-/// operand patterns (by block arg index or intra-body def position).
-static bool checkBodyEquivalence(linalg::LinalgOp sourceOp,
-                                 linalg::LinalgOp instrOp) {
-  Region &sourceRegion = sourceOp->getRegion(0);
-  Region &instrRegion = instrOp->getRegion(0);
+/// Walk value-def chains through layout-only relayouts until reaching either a
+/// semantic node result or an external value. The returned transform chain is
+/// ordered from the boundary-visible value toward the consumer.
+static RelayoutChain resolveValue(Value value,
+                                  const DenseSet<Operation *> &semanticNodes) {
+  Value current = value;
+  SemanticEdgeTransformChain transforms;
 
-  if (sourceRegion.empty() || instrRegion.empty())
-    return false;
-
-  Block &srcBlock = sourceRegion.front();
-  Block &instrBlock = instrRegion.front();
-
-  if (srcBlock.getNumArguments() != instrBlock.getNumArguments())
-    return false;
-
-  // Check block argument types match
-  for (unsigned i = 0; i < srcBlock.getNumArguments(); ++i) {
-    if (srcBlock.getArgument(i).getType() !=
-        instrBlock.getArgument(i).getType())
-      return false;
+  while (Operation *defOp = current.getDefiningOp()) {
+    if (semanticNodes.contains(defOp))
+      break;
+    if (auto transposeOp = dyn_cast<linalg::TransposeOp>(defOp)) {
+      SemanticEdgeTransform tx;
+      tx.kind = SemanticEdgeTransformKind::Transpose;
+      tx.permutation.assign(transposeOp.getPermutation().begin(),
+                            transposeOp.getPermutation().end());
+      transforms.push_back(std::move(tx));
+      current = transposeOp.getInput();
+      continue;
+    }
+    if (auto extractSliceOp = dyn_cast<tensor::ExtractSliceOp>(defOp)) {
+      auto sliceSpec = getStaticSliceSpec(extractSliceOp);
+      if (!sliceSpec)
+        return {current, {}, extractSliceOp};
+      SemanticEdgeTransform tx;
+      tx.kind = SemanticEdgeTransformKind::ExtractSlice;
+      tx.sliceSpec = *sliceSpec;
+      transforms.push_back(std::move(tx));
+      current = extractSliceOp.getSource();
+      continue;
+    }
+    if (auto insertSliceOp = dyn_cast<tensor::InsertSliceOp>(defOp)) {
+      auto sliceSpec = getStaticSliceSpec(insertSliceOp);
+      if (!sliceSpec)
+        return {current, {}, insertSliceOp};
+      SemanticEdgeTransform tx;
+      tx.kind = SemanticEdgeTransformKind::InsertSlice;
+      tx.sliceSpec = *sliceSpec;
+      transforms.push_back(std::move(tx));
+      current = insertSliceOp.getSource();
+      continue;
+    }
+    if (auto expandOp = dyn_cast<tensor::ExpandShapeOp>(defOp)) {
+      current = expandOp.getSrc();
+      continue;
+    }
+    if (auto collapseOp = dyn_cast<tensor::CollapseShapeOp>(defOp)) {
+      current = collapseOp.getSrc();
+      continue;
+    }
+    break;
   }
 
-  // Check same number of operations
-  if (std::distance(srcBlock.begin(), srcBlock.end()) !=
-      std::distance(instrBlock.begin(), instrBlock.end()))
-    return false;
+  return {current, std::move(transforms), nullptr};
+}
 
-  // Build a value mapping: block args map by index, SSA results map by
-  // matching definition order
-  DenseMap<Value, unsigned> srcValueId;
-  DenseMap<Value, unsigned> instrValueId;
-  unsigned nextId = 0;
+/// Trace forward from a produced compute value to the unique external
+/// materialized value that escapes the selected node, if such a value exists.
+static FailureOr<std::optional<MaterializedOutputInfo>>
+resolveUniqueMaterializedOutput(Value producedValue,
+                                const DenseSet<Operation *> &semanticNodes) {
+  struct WorkItem {
+    Value value;
+    SemanticEdgeTransformChain forwardTransforms;
+  };
 
-  // Map block args
-  for (unsigned i = 0; i < srcBlock.getNumArguments(); ++i) {
-    srcValueId[srcBlock.getArgument(i)] = nextId;
-    instrValueId[instrBlock.getArgument(i)] = nextId;
-    ++nextId;
+  SmallVector<WorkItem, 4> worklist;
+  worklist.push_back({producedValue, {}});
+  std::optional<MaterializedOutputInfo> materialized;
+
+  while (!worklist.empty()) {
+    WorkItem item = std::move(worklist.pop_back_val());
+    bool advanced = false;
+    bool sawNonSemanticUse = false;
+
+    for (Operation *user : item.value.getUsers()) {
+      if (semanticNodes.contains(user))
+        continue;
+      sawNonSemanticUse = true;
+
+      if (auto transposeOp = dyn_cast<linalg::TransposeOp>(user)) {
+        WorkItem next = item;
+        SemanticEdgeTransform tx;
+        tx.kind = SemanticEdgeTransformKind::Transpose;
+        tx.permutation.assign(transposeOp.getPermutation().begin(),
+                              transposeOp.getPermutation().end());
+        next.forwardTransforms.push_back(std::move(tx));
+        next.value = transposeOp->getResult(0);
+        worklist.push_back(std::move(next));
+        advanced = true;
+        continue;
+      }
+      if (auto extractSliceOp = dyn_cast<tensor::ExtractSliceOp>(user)) {
+        auto sliceSpec = getStaticSliceSpec(extractSliceOp);
+        if (!sliceSpec)
+          return user->emitError()
+                 << "dynamic layout transform is not supported by semantic "
+                    "matching output binding construction";
+        WorkItem next = item;
+        SemanticEdgeTransform tx;
+        tx.kind = SemanticEdgeTransformKind::ExtractSlice;
+        tx.sliceSpec = *sliceSpec;
+        next.forwardTransforms.push_back(std::move(tx));
+        next.value = extractSliceOp.getResult();
+        worklist.push_back(std::move(next));
+        advanced = true;
+        continue;
+      }
+      if (auto insertSliceOp = dyn_cast<tensor::InsertSliceOp>(user)) {
+        auto sliceSpec = getStaticSliceSpec(insertSliceOp);
+        if (!sliceSpec)
+          return user->emitError()
+                 << "dynamic layout transform is not supported by semantic "
+                    "matching output binding construction";
+        WorkItem next = item;
+        SemanticEdgeTransform tx;
+        tx.kind = SemanticEdgeTransformKind::InsertSlice;
+        tx.sliceSpec = *sliceSpec;
+        next.forwardTransforms.push_back(std::move(tx));
+        next.value = insertSliceOp.getResult();
+        worklist.push_back(std::move(next));
+        advanced = true;
+        continue;
+      }
+      if (auto expandOp = dyn_cast<tensor::ExpandShapeOp>(user)) {
+        worklist.push_back({expandOp.getResult(), item.forwardTransforms});
+        advanced = true;
+        continue;
+      }
+      if (auto collapseOp = dyn_cast<tensor::CollapseShapeOp>(user)) {
+        worklist.push_back({collapseOp.getResult(), item.forwardTransforms});
+        advanced = true;
+        continue;
+      }
+    }
+
+    if (advanced || !sawNonSemanticUse)
+      continue;
+
+    MaterializedOutputInfo candidate;
+    candidate.value = item.value;
+    candidate.transforms.assign(item.forwardTransforms.rbegin(),
+                                item.forwardTransforms.rend());
+
+    if (!materialized) {
+      materialized = std::move(candidate);
+      continue;
+    }
+
+    if (materialized->value == candidate.value &&
+        materialized->transforms == candidate.transforms)
+      continue;
+
+    return producedValue.getDefiningOp()->emitError()
+           << "selected node output escapes through multiple external "
+              "materializations; Phase C1 requires a unique writeback target";
   }
 
-  // Walk ops in lockstep
-  auto srcIt = srcBlock.begin();
-  auto instrIt = instrBlock.begin();
-  for (; srcIt != srcBlock.end(); ++srcIt, ++instrIt) {
-    Operation &srcOp = *srcIt;
-    Operation &instrOp = *instrIt;
+  return materialized;
+}
 
-    // Same op name
-    if (srcOp.getName() != instrOp.getName())
+static llvm::hash_code hashGenericBody(Block *body) {
+  llvm::SmallDenseMap<Value, unsigned, 16> valueIds;
+  for (BlockArgument arg : body->getArguments())
+    valueIds[arg] = arg.getArgNumber();
+
+  unsigned nextValueId = body->getNumArguments();
+  llvm::hash_code hash = llvm::hash_combine(body->getNumArguments());
+  for (Operation &op : *body) {
+    if (isa<linalg::YieldOp>(op))
+      continue;
+    SmallVector<unsigned, 8> operandIds;
+    operandIds.reserve(op.getNumOperands());
+    for (Value operand : op.getOperands()) {
+      auto it = valueIds.find(operand);
+      operandIds.push_back(it == valueIds.end() ? GraphEdge::kNullIdx
+                                                : it->second);
+    }
+    llvm::hash_code opHash = llvm::hash_combine(
+        op.getName().getStringRef(),
+        llvm::hash_combine_range(operandIds.begin(), operandIds.end()));
+    if (auto cst = dyn_cast<arith::ConstantOp>(&op))
+      opHash = llvm::hash_combine(opHash, cst.getValue());
+    hash = llvm::hash_combine(hash, opHash);
+    for (Value result : op.getResults())
+      valueIds[result] = nextValueId++;
+  }
+  return hash;
+}
+
+static bool genericBodiesMatch(Block *lhs, Block *rhs) {
+  if (lhs->getNumArguments() != rhs->getNumArguments())
+    return false;
+
+  llvm::SmallDenseMap<Value, unsigned, 16> lhsIds;
+  llvm::SmallDenseMap<Value, unsigned, 16> rhsIds;
+  for (auto [idx, arg] : llvm::enumerate(lhs->getArguments()))
+    lhsIds[arg] = idx;
+  for (auto [idx, arg] : llvm::enumerate(rhs->getArguments()))
+    rhsIds[arg] = idx;
+
+  auto lhsIt = lhs->begin();
+  auto rhsIt = rhs->begin();
+  unsigned nextId = lhs->getNumArguments();
+  for (; lhsIt != lhs->end() && rhsIt != rhs->end(); ++lhsIt, ++rhsIt) {
+    if (isa<linalg::YieldOp>(*lhsIt) || isa<linalg::YieldOp>(*rhsIt))
+      return isa<linalg::YieldOp>(*lhsIt) && isa<linalg::YieldOp>(*rhsIt);
+
+    if (lhsIt->getName() != rhsIt->getName() ||
+        lhsIt->getNumOperands() != rhsIt->getNumOperands() ||
+        lhsIt->getNumResults() != rhsIt->getNumResults())
       return false;
 
-    // Same number of operands and results
-    if (srcOp.getNumOperands() != instrOp.getNumOperands())
-      return false;
-    if (srcOp.getNumResults() != instrOp.getNumResults())
-      return false;
-
-    // Same attributes (ignoring location)
-    if (srcOp.getAttrDictionary() != instrOp.getAttrDictionary())
-      return false;
-
-    // Check operands match by value ID
-    for (unsigned i = 0; i < srcOp.getNumOperands(); ++i) {
-      auto srcIdIt = srcValueId.find(srcOp.getOperand(i));
-      auto instrIdIt = instrValueId.find(instrOp.getOperand(i));
-      if (srcIdIt == srcValueId.end() || instrIdIt == instrValueId.end())
-        return false;
-      if (srcIdIt->second != instrIdIt->second)
+    for (unsigned i = 0; i < lhsIt->getNumOperands(); ++i) {
+      if (lhsIds.lookup(lhsIt->getOperand(i)) !=
+          rhsIds.lookup(rhsIt->getOperand(i)))
         return false;
     }
 
-    // Map results
-    for (unsigned i = 0; i < srcOp.getNumResults(); ++i) {
-      srcValueId[srcOp.getResult(i)] = nextId;
-      instrValueId[instrOp.getResult(i)] = nextId;
+    if (auto lhsConst = dyn_cast<arith::ConstantOp>(&*lhsIt)) {
+      auto rhsConst = dyn_cast<arith::ConstantOp>(&*rhsIt);
+      if (!rhsConst || lhsConst.getValue() != rhsConst.getValue())
+        return false;
+    }
+
+    for (auto [lhsResult, rhsResult] :
+         llvm::zip(lhsIt->getResults(), rhsIt->getResults())) {
+      lhsIds[lhsResult] = nextId;
+      rhsIds[rhsResult] = nextId;
       ++nextId;
     }
   }
+  return lhsIt == lhs->end() && rhsIt == rhs->end();
+}
 
+llvm::hash_code SemanticFingerprint::hash() const {
+  llvm::hash_code hash =
+      llvm::hash_combine(kind, opName, numInputs, numOutputs);
+  if (kind == Generic) {
+    hash = llvm::hash_combine(
+        hash,
+        llvm::hash_combine_range(indexingMaps.begin(), indexingMaps.end()),
+        llvm::hash_combine_range(iteratorTypes.begin(), iteratorTypes.end()),
+        body ? hashGenericBody(body) : llvm::hash_combine(0u));
+  }
+  return hash;
+}
+
+bool SemanticFingerprint::matches(const SemanticFingerprint &other) const {
+  if (kind != other.kind || opName != other.opName ||
+      numInputs != other.numInputs || numOutputs != other.numOutputs)
+    return false;
+  if (kind != Generic)
+    return true;
+  return indexingMaps == other.indexingMaps &&
+         iteratorTypes == other.iteratorTypes && body && other.body &&
+         genericBodiesMatch(body, other.body);
+}
+
+SemanticFingerprint::SemanticFingerprint(Operation *op) {
+  opName = op->getName().getStringRef();
+  if (auto linalgOp = dyn_cast<linalg::LinalgOp>(op)) {
+    llvm::append_range(indexingMaps, linalgOp.getIndexingMapsArray());
+    llvm::append_range(iteratorTypes, linalgOp.getIteratorTypesArray());
+    body = linalgOp.getBlock();
+    numInputs = linalgOp.getNumDpsInputs();
+    numOutputs = linalgOp.getNumDpsInits();
+    kind = isa<linalg::GenericOp>(linalgOp) ? Generic : Named;
+    return;
+  }
+  if (isa<linalg::SoftmaxOp>(op)) {
+    numInputs = op->getNumOperands();
+    numOutputs = op->getNumResults();
+    kind = Named;
+    return;
+  }
+  numInputs = op->getNumOperands();
+  numOutputs = op->getNumResults();
+  kind = Opaque;
+}
+
+static unsigned selectAnchorNode(const GraphBase &graph) {
+  assert(!graph.nodes.empty() && "cannot select anchor from empty graph");
+  unsigned bestIdx = 0;
+  auto bestKey = std::tuple<unsigned, unsigned, int>(
+      getFingerprintSpecificity(graph.nodes[0].fp),
+      graph.nodes[0].inEdgeIdxs.size() + graph.nodes[0].outEdgeIdxs.size(), 0);
+  for (unsigned idx = 1; idx < graph.nodes.size(); ++idx) {
+    const GraphNode &node = graph.nodes[idx];
+    auto key = std::tuple<unsigned, unsigned, int>(
+        getFingerprintSpecificity(node.fp),
+        node.inEdgeIdxs.size() + node.outEdgeIdxs.size(),
+        -static_cast<int>(idx));
+    if (key > bestKey) {
+      bestIdx = idx;
+      bestKey = key;
+    }
+  }
+  return bestIdx;
+}
+
+static FailureOr<unsigned> getSemanticOpLoopRank(Operation *op) {
+  if (auto linalgOp = dyn_cast<linalg::LinalgOp>(op))
+    return linalgOp.getNumLoops();
+  if (auto softmaxOp = dyn_cast<linalg::SoftmaxOp>(op))
+    return softmaxOp.getInputOperandRank();
+  return op->emitError() << "semantic op does not expose an iteration domain";
+}
+
+static FailureOr<unsigned> selectDomainNode(DefineOp defineOp,
+                                            const GraphBase &graph) {
+  assert(!graph.nodes.empty() && "cannot select domain from empty graph");
+
+  unsigned bestIdx = 0;
+  unsigned bestRank = 0;
+  bool hasBest = false;
+  bool ambiguous = false;
+
+  for (unsigned idx = 0; idx < graph.nodes.size(); ++idx) {
+    auto rankOr = getSemanticOpLoopRank(graph.nodes[idx].op);
+    if (failed(rankOr)) {
+      return defineOp.emitError()
+             << "semantic op '" << graph.nodes[idx].op->getName()
+             << "' does not expose an iteration domain";
+    }
+    unsigned rank = *rankOr;
+    if (!hasBest || rank > bestRank) {
+      bestIdx = idx;
+      bestRank = rank;
+      hasBest = true;
+      ambiguous = false;
+      continue;
+    }
+
+    if (rank == bestRank)
+      ambiguous = true;
+  }
+
+  if (ambiguous) {
+    return defineOp.emitError()
+           << "compute region of @" << defineOp.getSymName()
+           << " has multiple semantic ops with maximal iteration rank "
+           << bestRank << "; cannot derive a unique domain carrier";
+  }
+
+  return bestIdx;
+}
+
+static unsigned countAdjacentMappedNeighbors(const InstructionGraph &pattern,
+                                             const MatchState &state,
+                                             unsigned patternNodeIdx) {
+  unsigned count = 0;
+  const GraphNode &node = pattern.nodes[patternNodeIdx];
+  for (unsigned edgeIdx : node.inEdgeIdxs) {
+    if (state.mappedPatternNodes[pattern.edges[edgeIdx].producerNodeIdx])
+      ++count;
+  }
+  for (unsigned edgeIdx : node.outEdgeIdxs) {
+    if (state.mappedPatternNodes[pattern.edges[edgeIdx].consumerNodeIdx])
+      ++count;
+  }
+  return count;
+}
+
+/// Pick the next pattern node to extend from the current partial match. This
+/// mirrors instruction selectors: grow from the anchor through the most
+/// constrained frontier node first.
+static unsigned chooseNextPatternNode(const MatchState &state) {
+  unsigned bestIdx = GraphEdge::kNullIdx;
+  auto bestKey = std::tuple<unsigned, unsigned, unsigned>(0, 0, 0);
+  for (unsigned idx = 0; idx < state.pattern.nodes.size(); ++idx) {
+    if (state.mappedPatternNodes[idx])
+      continue;
+    unsigned mappedNeighbors =
+        countAdjacentMappedNeighbors(state.pattern, state, idx);
+    const GraphNode &node = state.pattern.nodes[idx];
+    auto key = std::tuple<unsigned, unsigned, unsigned>(
+        mappedNeighbors, getFingerprintSpecificity(node.fp),
+        node.inEdgeIdxs.size() + node.outEdgeIdxs.size());
+    if (bestIdx == GraphEdge::kNullIdx || key > bestKey) {
+      bestIdx = idx;
+      bestKey = key;
+    }
+  }
+  return bestIdx;
+}
+
+static bool transformsMatch(ArrayRef<SemanticEdgeTransform> lhs,
+                            ArrayRef<SemanticEdgeTransform> rhs) {
+  auto sliceSpecsMatch = [](const std::optional<StaticSliceSpec> &lhsSpec,
+                            const std::optional<StaticSliceSpec> &rhsSpec) {
+    if (lhsSpec.has_value() != rhsSpec.has_value())
+      return false;
+    if (!lhsSpec)
+      return true;
+    return lhsSpec->offsets == rhsSpec->offsets &&
+           lhsSpec->sizes == rhsSpec->sizes &&
+           lhsSpec->strides == rhsSpec->strides;
+  };
+  if (lhs.size() != rhs.size())
+    return false;
+  for (auto [lhsTx, rhsTx] : llvm::zip(lhs, rhs)) {
+    if (lhsTx.kind != rhsTx.kind || lhsTx.permutation != rhsTx.permutation ||
+        !sliceSpecsMatch(lhsTx.sliceSpec, rhsTx.sliceSpec))
+      return false;
+  }
   return true;
 }
 
-LogicalResult
-mlir::act::runStructuralMatching(ModuleOp module,
-                                 ArrayRef<Operation *> unmatchedOps,
-                                 SmallVectorImpl<MatchCandidate> &results) {
-  LLVM_DEBUG(llvm::dbgs() << "\n=== Structural Matching (Rank Mismatch) ===\n");
+const GraphEdge *GraphBase::findEdge(unsigned producerNodeIdx,
+                                     unsigned consumerNodeIdx,
+                                     unsigned producerResultIdx,
+                                     unsigned consumerOperandIdx) const {
+  if (producerNodeIdx >= nodes.size())
+    return nullptr;
+  for (unsigned edgeIdx : nodes[producerNodeIdx].outEdgeIdxs) {
+    const GraphEdge &edge = edges[edgeIdx];
+    if (edge.consumerNodeIdx == consumerNodeIdx &&
+        edge.producerResultIdx == producerResultIdx &&
+        edge.consumerOperandIdx == consumerOperandIdx)
+      return &edge;
+  }
+  return nullptr;
+}
 
-  if (unmatchedOps.empty()) {
-    LLVM_DEBUG(llvm::dbgs() << "  No unmatched ops to try.\n");
-    return success();
+bool GraphBase::hasAnyEdgeBetween(unsigned lhsNodeIdx,
+                                  unsigned rhsNodeIdx) const {
+  if (lhsNodeIdx >= nodes.size() || rhsNodeIdx >= nodes.size())
+    return false;
+  for (unsigned edgeIdx : nodes[lhsNodeIdx].outEdgeIdxs) {
+    if (edges[edgeIdx].consumerNodeIdx == rhsNodeIdx)
+      return true;
+  }
+  for (unsigned edgeIdx : nodes[rhsNodeIdx].outEdgeIdxs) {
+    if (edges[edgeIdx].consumerNodeIdx == lhsNodeIdx)
+      return true;
+  }
+  return false;
+}
+
+std::optional<unsigned> GraphBase::getNodeIndex(Operation *op) const {
+  for (unsigned idx = 0; idx < nodes.size(); ++idx) {
+    if (nodes[idx].op == op)
+      return idx;
+  }
+  return std::nullopt;
+}
+
+static bool edgeShapeMatches(const GraphEdge &patternEdge,
+                             const GraphEdge &sourceEdge) {
+  return patternEdge.producerResultIdx == sourceEdge.producerResultIdx &&
+         patternEdge.consumerOperandIdx == sourceEdge.consumerOperandIdx &&
+         transformsMatch(patternEdge.transforms, sourceEdge.transforms);
+}
+
+/// Verify all edges between the new source node and already-mapped source nodes
+/// exactly match the pattern graph. This enforces induced-exact matching.
+static bool hasConsistentEdges(const MatchState &state, unsigned patternNodeIdx,
+                               unsigned sourceNodeIdx) {
+  for (unsigned otherPatternIdx = 0;
+       otherPatternIdx < state.pattern.nodes.size(); ++otherPatternIdx) {
+    if (!state.mappedPatternNodes[otherPatternIdx] ||
+        otherPatternIdx == patternNodeIdx)
+      continue;
+    unsigned otherSourceIdx = state.patternToSourceNodeIdx[otherPatternIdx];
+
+    for (unsigned edgeIdx : state.pattern.nodes[patternNodeIdx].outEdgeIdxs) {
+      const GraphEdge &patternEdge = state.pattern.edges[edgeIdx];
+      if (patternEdge.consumerNodeIdx != otherPatternIdx)
+        continue;
+      const GraphEdge *sourceEdge = state.program.findEdge(
+          sourceNodeIdx, otherSourceIdx, patternEdge.producerResultIdx,
+          patternEdge.consumerOperandIdx);
+      if (!sourceEdge || !edgeShapeMatches(patternEdge, *sourceEdge))
+        return false;
+    }
+    for (unsigned edgeIdx : state.pattern.nodes[patternNodeIdx].inEdgeIdxs) {
+      const GraphEdge &patternEdge = state.pattern.edges[edgeIdx];
+      if (patternEdge.producerNodeIdx != otherPatternIdx)
+        continue;
+      const GraphEdge *sourceEdge = state.program.findEdge(
+          otherSourceIdx, sourceNodeIdx, patternEdge.producerResultIdx,
+          patternEdge.consumerOperandIdx);
+      if (!sourceEdge || !edgeShapeMatches(patternEdge, *sourceEdge))
+        return false;
+    }
+
+    for (unsigned sourceEdgeIdx :
+         state.program.nodes[sourceNodeIdx].outEdgeIdxs) {
+      const GraphEdge &sourceEdge = state.program.edges[sourceEdgeIdx];
+      if (sourceEdge.consumerNodeIdx != otherSourceIdx)
+        continue;
+      bool matched = false;
+      for (unsigned patternEdgeIdx :
+           state.pattern.nodes[patternNodeIdx].outEdgeIdxs) {
+        const GraphEdge &patternEdge = state.pattern.edges[patternEdgeIdx];
+        if (patternEdge.consumerNodeIdx == otherPatternIdx &&
+            edgeShapeMatches(patternEdge, sourceEdge)) {
+          matched = true;
+          break;
+        }
+      }
+      if (!matched)
+        return false;
+    }
+    for (unsigned sourceEdgeIdx :
+         state.program.nodes[sourceNodeIdx].inEdgeIdxs) {
+      const GraphEdge &sourceEdge = state.program.edges[sourceEdgeIdx];
+      if (sourceEdge.producerNodeIdx != otherSourceIdx)
+        continue;
+      bool matched = false;
+      for (unsigned patternEdgeIdx :
+           state.pattern.nodes[patternNodeIdx].inEdgeIdxs) {
+        const GraphEdge &patternEdge = state.pattern.edges[patternEdgeIdx];
+        if (patternEdge.producerNodeIdx == otherPatternIdx &&
+            edgeShapeMatches(patternEdge, sourceEdge)) {
+          matched = true;
+          break;
+        }
+      }
+      if (!matched)
+        return false;
+    }
+  }
+  return true;
+}
+
+/// Collect the candidate source nodes for the next pattern node using anchor
+/// fingerprint matching and already-mapped neighbors as pruning constraints.
+static SmallVector<unsigned, 8>
+collectCandidateSourceNodes(const MatchState &state, unsigned patternNodeIdx) {
+  SmallVector<unsigned, 8> candidates;
+  const GraphNode &patternNode = state.pattern.nodes[patternNodeIdx];
+  for (unsigned sourceNodeIdx = 0; sourceNodeIdx < state.program.nodes.size();
+       ++sourceNodeIdx) {
+    if (state.usedSourceNodes[sourceNodeIdx])
+      continue;
+    const GraphNode &sourceNode = state.program.nodes[sourceNodeIdx];
+    if (!patternNode.fp.matches(sourceNode.fp))
+      continue;
+    if (!hasConsistentEdges(state, patternNodeIdx, sourceNodeIdx))
+      continue;
+    candidates.push_back(sourceNodeIdx);
   }
 
-  // Collect all DefineOps
-  SmallVector<DefineOp> defineOps;
-  module.walk([&](DefineOp op) { defineOps.push_back(op); });
+  llvm::sort(candidates, [&](unsigned lhs, unsigned rhs) {
+    const GraphNode &lhsNode = state.program.nodes[lhs];
+    const GraphNode &rhsNode = state.program.nodes[rhs];
+    auto lhsKey = std::tuple<unsigned, unsigned, int>(
+        lhsNode.inEdgeIdxs.size() + lhsNode.outEdgeIdxs.size(),
+        getFingerprintSpecificity(lhsNode.fp), -static_cast<int>(lhs));
+    auto rhsKey = std::tuple<unsigned, unsigned, int>(
+        rhsNode.inEdgeIdxs.size() + rhsNode.outEdgeIdxs.size(),
+        getFingerprintSpecificity(rhsNode.fp), -static_cast<int>(rhs));
+    return lhsKey > rhsKey;
+  });
+  return candidates;
+}
 
-  for (Operation *sourceOp : unmatchedOps) {
-    auto sourceLinalgOp = dyn_cast<linalg::LinalgOp>(sourceOp);
-    if (!sourceLinalgOp)
+static void appendBoundaryInputBindings(SubgraphMatchCandidate &candidate,
+                                        const MatchState &state) {
+  DenseSet<Operation *> semanticNodeOps;
+  for (auto &node : state.program.nodes)
+    semanticNodeOps.insert(node.op);
+
+  for (const GraphBoundaryPort &patternPort : state.pattern.boundaryInputs) {
+    if (patternPort.boundaryOperandIdx == GraphEdge::kNullIdx)
       continue;
 
-    auto sourceIterTypes = sourceLinalgOp.getIteratorTypesArray();
+    unsigned sourceNodeIdx =
+        candidate.patternToSourceNodeIdx[patternPort.nodeIdx];
+    Operation *sourceOp = state.program.nodes[sourceNodeIdx].op;
+    auto resolved = resolveValue(sourceOp->getOperand(patternPort.portIdx),
+                                 semanticNodeOps);
 
-    for (DefineOp defineOp : defineOps) {
-      linalg::LinalgOp instrLinalgOp = findComputeLinalgOp(defineOp);
-      if (!instrLinalgOp)
+    SubgraphBoundaryInputBinding binding;
+    binding.patternNodeIdx = patternPort.nodeIdx;
+    binding.patternPortIdx = patternPort.portIdx;
+    binding.boundaryOperandIdx = patternPort.boundaryOperandIdx;
+    binding.transforms = std::move(resolved.transforms);
+    binding.value = resolved.source;
+
+    if (auto *baseOp = resolved.source.getDefiningOp()) {
+      if (auto sourceProducerIdx = state.program.getNodeIndex(baseOp)) {
+        if (state.sourceToPatternNodeIdx[*sourceProducerIdx] ==
+            GraphEdge::kNullIdx) {
+          binding.sourceNodeIdx = *sourceProducerIdx;
+          if (auto result = dyn_cast<OpResult>(resolved.source))
+            binding.sourcePortIdx = result.getResultNumber();
+        }
+      }
+    }
+
+    candidate.boundaryInputs.push_back(std::move(binding));
+  }
+}
+
+static LogicalResult
+appendBoundaryOutputBindings(SubgraphMatchCandidate &candidate,
+                             const MatchState &state) {
+  DenseSet<Operation *> semanticNodeOps;
+  for (auto &node : state.program.nodes)
+    semanticNodeOps.insert(node.op);
+
+  for (const GraphBoundaryPort &patternPort : state.pattern.boundaryOutputs) {
+    unsigned sourceNodeIdx =
+        candidate.patternToSourceNodeIdx[patternPort.nodeIdx];
+    Operation *sourceOp = state.program.nodes[sourceNodeIdx].op;
+
+    auto materialized = resolveUniqueMaterializedOutput(
+        sourceOp->getResult(patternPort.portIdx), semanticNodeOps);
+    if (failed(materialized))
+      return failure();
+
+    SubgraphBoundaryOutputBinding binding;
+    binding.patternNodeIdx = patternPort.nodeIdx;
+    binding.patternPortIdx = patternPort.portIdx;
+    binding.sourceNodeIdx = sourceNodeIdx;
+    binding.sourcePortIdx = patternPort.portIdx;
+    binding.producedValue = sourceOp->getResult(patternPort.portIdx);
+    if (*materialized) {
+      binding.materializedValue = (*materialized)->value;
+      binding.transforms = std::move((*materialized)->transforms);
+    }
+    candidate.boundaryOutputs.push_back(std::move(binding));
+  }
+  return success();
+}
+
+static unsigned computeCandidatePriority(const InstructionGraph &pattern) {
+  return pattern.nodes.size() * 1000 +
+         getFingerprintSpecificity(pattern.nodes[pattern.anchorNodeIdx].fp) *
+             100 +
+         pattern.edges.size();
+}
+
+static LogicalResult
+buildMatchCandidate(const MatchState &state, unsigned sourceAnchorNodeIdx,
+                    SmallVectorImpl<SubgraphMatchCandidate> &results) {
+  SubgraphMatchCandidate candidate;
+  candidate.pattern = &state.pattern;
+  candidate.patternToSourceNodeIdx = state.patternToSourceNodeIdx;
+  candidate.sourceAnchorNodeIdx = sourceAnchorNodeIdx;
+  candidate.priority = computeCandidatePriority(state.pattern);
+
+  for (unsigned patternNodeIdx = 0; patternNodeIdx < state.pattern.nodes.size();
+       ++patternNodeIdx) {
+    candidate.sourceOps.push_back(
+        state.program.nodes[state.patternToSourceNodeIdx[patternNodeIdx]].op);
+  }
+
+  appendBoundaryInputBindings(candidate, state);
+  if (failed(appendBoundaryOutputBindings(candidate, state)))
+    return failure();
+  results.push_back(std::move(candidate));
+  return success();
+}
+
+static LogicalResult
+matchFromAnchor(MatchState &state, unsigned sourceAnchorNodeIdx,
+                SmallVectorImpl<SubgraphMatchCandidate> &results) {
+  if (llvm::all_of(state.mappedPatternNodes,
+                   [](bool mapped) { return mapped; })) {
+    return buildMatchCandidate(state, sourceAnchorNodeIdx, results);
+  }
+
+  unsigned nextPatternNodeIdx = chooseNextPatternNode(state);
+  auto candidates = collectCandidateSourceNodes(state, nextPatternNodeIdx);
+
+  for (unsigned sourceNodeIdx : candidates) {
+    state.patternToSourceNodeIdx[nextPatternNodeIdx] = sourceNodeIdx;
+    state.sourceToPatternNodeIdx[sourceNodeIdx] = nextPatternNodeIdx;
+    state.mappedPatternNodes[nextPatternNodeIdx] = true;
+    state.usedSourceNodes[sourceNodeIdx] = true;
+    auto cleanup = llvm::scope_exit([&] {
+      state.patternToSourceNodeIdx[nextPatternNodeIdx] = GraphEdge::kNullIdx;
+      state.sourceToPatternNodeIdx[sourceNodeIdx] = GraphEdge::kNullIdx;
+      state.mappedPatternNodes[nextPatternNodeIdx] = false;
+      state.usedSourceNodes[sourceNodeIdx] = false;
+    });
+    if (failed(matchFromAnchor(state, sourceAnchorNodeIdx, results)))
+      return failure();
+  }
+  return success();
+}
+
+static FailureOr<SmallVector<SubgraphMatchCandidate, 4>>
+collectMatchesForAnchor(const InstructionGraph &pattern,
+                        const ProgramGraph &program,
+                        unsigned sourceAnchorNodeIdx) {
+  SmallVector<SubgraphMatchCandidate, 4> matches;
+  MatchState state{
+      pattern,
+      program,
+      SmallVector<unsigned, 4>(pattern.nodes.size(), GraphEdge::kNullIdx),
+      SmallVector<unsigned, 4>(program.nodes.size(), GraphEdge::kNullIdx),
+      SmallVector<bool, 4>(pattern.nodes.size(), false),
+      SmallVector<bool, 8>(program.nodes.size(), false)};
+
+  state.patternToSourceNodeIdx[pattern.anchorNodeIdx] = sourceAnchorNodeIdx;
+  state.sourceToPatternNodeIdx[sourceAnchorNodeIdx] = pattern.anchorNodeIdx;
+  state.mappedPatternNodes[pattern.anchorNodeIdx] = true;
+  state.usedSourceNodes[sourceAnchorNodeIdx] = true;
+  if (failed(matchFromAnchor(state, sourceAnchorNodeIdx, matches)))
+    return failure();
+  return matches;
+}
+
+LogicalResult GraphBase::init(Block &block) {
+  DenseMap<Operation *, unsigned> nodeIdxByOp;
+  DenseSet<Operation *> semanticNodeOps;
+  auto boundaryLayoutOps = collectBoundaryLayoutOps(block);
+
+  for (Operation &op : block.without_terminator()) {
+    if (!isSemanticNodeOp(&op, boundaryLayoutOps))
+      continue;
+    unsigned nodeIdx = nodes.size();
+    nodeIdxByOp[&op] = nodeIdx;
+    semanticNodeOps.insert(&op);
+    nodes.push_back({&op, SemanticFingerprint(&op), {}, {}});
+  }
+  if (nodes.empty())
+    return success();
+
+  for (unsigned nodeIdx = 0; nodeIdx < nodes.size(); ++nodeIdx) {
+    Operation *op = nodes[nodeIdx].op;
+    for (unsigned operandIdx = 0; operandIdx < op->getNumOperands();
+         ++operandIdx) {
+      Value operand = op->getOperand(operandIdx);
+      if (!isa<RankedTensorType>(operand.getType()))
         continue;
 
-      auto instrIterTypes = instrLinalgOp.getIteratorTypesArray();
-
-      // Check iterator type suffix match + all-parallel prefix
-      auto offset = checkIteratorTypeSuffix(sourceIterTypes, instrIterTypes);
-      if (!offset)
-        continue;
-
-      // Check body equivalence
-      if (!checkBodyEquivalence(sourceLinalgOp, instrLinalgOp)) {
-        LLVM_DEBUG(llvm::dbgs()
-                   << "  [skip] " << sourceOp->getName() << " vs @"
-                   << defineOp.getSymName() << ": body mismatch\n");
-        continue;
+      auto resolved = resolveValue(operand, semanticNodeOps);
+      if (resolved.unsupported) {
+        return resolved.unsupported->emitError()
+               << "dynamic layout transform is not supported by semantic "
+                  "matching graph construction";
       }
 
-      // Check indexing map compatibility
-      if (!checkIndexingMapCompatibility(sourceLinalgOp, instrLinalgOp,
-                                         *offset)) {
-        LLVM_DEBUG(llvm::dbgs() << "  [skip] " << sourceOp->getName() << " vs @"
-                                << defineOp.getSymName()
-                                << ": indexing map incompatibility\n");
-        continue;
+      if (auto *baseOp = resolved.source.getDefiningOp()) {
+        auto it = nodeIdxByOp.find(baseOp);
+        if (it != nodeIdxByOp.end()) {
+          auto result = dyn_cast<OpResult>(resolved.source);
+          if (!result)
+            return op->emitError()
+                   << "expected internal semantic edge to originate from an op "
+                      "result";
+
+          unsigned edgeIdx = edges.size();
+          edges.push_back({it->second, nodeIdx, result.getResultNumber(),
+                           operandIdx, std::move(resolved.transforms)});
+          nodes[it->second].outEdgeIdxs.push_back(edgeIdx);
+          nodes[nodeIdx].inEdgeIdxs.push_back(edgeIdx);
+          continue;
+        }
       }
 
-      LLVM_DEBUG(llvm::dbgs() << "  [structural-match] " << sourceOp->getName()
-                              << " -> @" << defineOp.getSymName()
-                              << " (outer dims=" << *offset << ")\n");
-
-      MatchCandidate mc;
-      mc.sourceOp = sourceOp;
-      mc.instruction = defineOp;
-      mc.numOuterDims = *offset;
-      results.push_back(std::move(mc));
+      unsigned boundaryOperandIdx = GraphEdge::kNullIdx;
+      if (auto blockArg = dyn_cast<BlockArgument>(resolved.source))
+        boundaryOperandIdx = blockArg.getArgNumber();
+      boundaryInputs.push_back({nodeIdx, operandIdx, boundaryOperandIdx,
+                                resolved.source,
+                                std::move(resolved.transforms)});
     }
   }
 
-  LLVM_DEBUG(llvm::dbgs() << "=== " << results.size()
-                          << " structural match(es) found ===\n");
+  Operation *terminator = block.getTerminator();
+  for (Value operand : terminator->getOperands()) {
+    if (!isa<RankedTensorType>(operand.getType()))
+      continue;
+    auto resolved = resolveValue(operand, semanticNodeOps);
+    if (resolved.unsupported) {
+      return resolved.unsupported->emitError()
+             << "dynamic layout transform is not supported by semantic "
+                "matching graph construction";
+    }
+    if (auto result = dyn_cast<OpResult>(resolved.source)) {
+      auto it = nodeIdxByOp.find(result.getOwner());
+      if (it != nodeIdxByOp.end()) {
+        boundaryOutputs.push_back({it->second, result.getResultNumber(),
+                                   GraphEdge::kNullIdx, resolved.source,
+                                   std::move(resolved.transforms)});
+      }
+    }
+  }
+
   return success();
+}
+
+void GraphBase::dump(raw_ostream &os, StringRef title) const {
+  os << title << "\n";
+  os << "  nodes: " << nodes.size() << ", edges: " << edges.size()
+     << ", boundaryInputs: " << boundaryInputs.size()
+     << ", boundaryOutputs: " << boundaryOutputs.size() << "\n";
+  for (auto [nodeIdx, node] : llvm::enumerate(nodes)) {
+    os << "  node[" << nodeIdx << "] " << node.op->getName() << " fp=";
+    printFingerprint(os, node.fp);
+    os << " in=" << node.inEdgeIdxs.size() << " out=" << node.outEdgeIdxs.size()
+       << "\n";
+  }
+  for (auto [edgeIdx, edge] : llvm::enumerate(edges)) {
+    os << "  edge[" << edgeIdx << "] " << edge.producerNodeIdx << ":"
+       << edge.producerResultIdx << " -> " << edge.consumerNodeIdx << ":"
+       << edge.consumerOperandIdx << " [";
+    printTransformChain(os, edge.transforms);
+    os << "]\n";
+  }
+  for (auto [idx, input] : llvm::enumerate(boundaryInputs)) {
+    os << "  boundary-input[" << idx << "] -> " << input.nodeIdx << ":"
+       << input.portIdx << " value=";
+    printValueRef(os, input.value);
+    if (input.boundaryOperandIdx != GraphEdge::kNullIdx)
+      os << " boundary-op=" << input.boundaryOperandIdx;
+    os << " [";
+    printTransformChain(os, input.transforms);
+    os << "]\n";
+  }
+  for (auto [idx, output] : llvm::enumerate(boundaryOutputs)) {
+    os << "  boundary-output[" << idx << "] " << output.nodeIdx << ":"
+       << output.portIdx << " value=";
+    printValueRef(os, output.value);
+    os << " [";
+    printTransformChain(os, output.transforms);
+    os << "]\n";
+  }
+}
+
+FailureOr<InstructionGraph> InstructionGraph::build(DefineOp defineOp) {
+  if (failed(validateComputeRegion(defineOp)))
+    return failure();
+
+  InstructionGraph graph;
+  graph.instruction = defineOp;
+  if (failed(graph.init(defineOp.getSemanticsBlock())))
+    return failure();
+  if (!graph.nodes.empty()) {
+    graph.anchorNodeIdx = selectAnchorNode(graph);
+    auto domainNodeIdx = selectDomainNode(defineOp, graph);
+    if (failed(domainNodeIdx))
+      return failure();
+    graph.domainNodeIdx = *domainNodeIdx;
+  }
+  return std::move(graph);
+}
+
+void InstructionGraph::dump() const {
+  llvm::dbgs() << "InstructionGraph @" << getDefineName(instruction)
+               << " anchor=" << anchorNodeIdx << " domain=" << domainNodeIdx
+               << "\n";
+  GraphBase::dump(llvm::dbgs(), "  graph");
+}
+
+FailureOr<ProgramGraph> ProgramGraph::build(func::FuncOp funcOp) {
+  if (funcOp.getBody().getBlocks().size() != 1)
+    return funcOp.emitError() << "expected exactly one block in function body";
+  ProgramGraph graph;
+  graph.funcOp = funcOp;
+  if (failed(graph.init(funcOp.getFunctionBody().front())))
+    return failure();
+  return std::move(graph);
+}
+
+void ProgramGraph::dump() {
+  llvm::dbgs() << "ProgramGraph @"
+               << getFuncName(cast<func::FuncOp>(funcOp.getOperation()))
+               << "\n";
+  GraphBase::dump(llvm::dbgs(), "  graph");
+}
+
+void SubgraphMatchCandidate::dump() const {
+  llvm::dbgs() << "MatchCandidate @" << getDefineName(pattern->instruction)
+               << " priority=" << priority
+               << " sourceAnchor=" << sourceAnchorNodeIdx
+               << " patternAnchor=" << pattern->anchorNodeIdx
+               << " patternDomain=" << pattern->domainNodeIdx << "\n";
+  for (auto [idx, op] : llvm::enumerate(sourceOps))
+    llvm::dbgs() << "  sourceOp[" << idx << "] " << op->getName() << "\n";
+  for (auto [idx, input] : llvm::enumerate(boundaryInputs)) {
+    llvm::dbgs() << "  input[" << idx << "] pattern " << input.patternNodeIdx
+                 << ":" << input.patternPortIdx
+                 << " boundary-op=" << input.boundaryOperandIdx << " value=";
+    printValueRef(llvm::dbgs(), input.value);
+    llvm::dbgs() << " [";
+    printTransformChain(llvm::dbgs(), input.transforms);
+    llvm::dbgs() << "]\n";
+  }
+  for (auto [idx, output] : llvm::enumerate(boundaryOutputs)) {
+    llvm::dbgs() << "  output[" << idx << "] pattern " << output.patternNodeIdx
+                 << ":" << output.patternPortIdx << " produced=";
+    printValueRef(llvm::dbgs(), output.producedValue);
+    if (output.materializedValue) {
+      llvm::dbgs() << " materialized=";
+      printValueRef(llvm::dbgs(), output.materializedValue);
+      llvm::dbgs() << " [";
+      printTransformChain(llvm::dbgs(), output.transforms);
+      llvm::dbgs() << "]";
+    }
+    llvm::dbgs() << "\n";
+  }
+}
+
+void SemanticsGraph::dump() const {
+  llvm::dbgs() << "SemanticsGraph @"
+               << getFuncName(const_cast<func::FuncOp &>(funcOp)) << "\n";
+  llvm::dbgs() << "  nodes=" << nodes.size() << ", edges=" << edges.size()
+               << "\n";
+  for (auto [nodeIdx, node] : llvm::enumerate(nodes)) {
+    llvm::dbgs() << "  node[" << nodeIdx << "] @"
+                 << getDefineName(node.instruction)
+                 << " anchor=" << node.anchorNodeIdx
+                 << " domain=" << node.domainNodeIdx
+                 << " sourceOps=" << node.sourceOps.size() << "\n";
+    for (auto *op : node.sourceOps)
+      llvm::dbgs() << "    " << op->getName() << "\n";
+    if (node.domainComputeOp)
+      llvm::dbgs() << "    domain-compute=" << node.domainComputeOp->getName()
+                   << "\n";
+    if (node.domainSourceOp)
+      llvm::dbgs() << "    domain-source=" << node.domainSourceOp->getName()
+                   << "\n";
+    for (auto [idx, input] : llvm::enumerate(node.boundaryInputs)) {
+      llvm::dbgs() << "    in[" << idx << "] value=";
+      printValueRef(llvm::dbgs(), input.value);
+      llvm::dbgs() << " [";
+      printTransformChain(llvm::dbgs(), input.transforms);
+      llvm::dbgs() << "]\n";
+    }
+    for (auto [idx, output] : llvm::enumerate(node.boundaryOutputs)) {
+      llvm::dbgs() << "    out[" << idx << "] produced=";
+      printValueRef(llvm::dbgs(), output.producedValue);
+      if (output.materializedValue) {
+        llvm::dbgs() << " materialized=";
+        printValueRef(llvm::dbgs(), output.materializedValue);
+        llvm::dbgs() << " [";
+        printTransformChain(llvm::dbgs(), output.transforms);
+        llvm::dbgs() << "]";
+      }
+      llvm::dbgs() << "\n";
+    }
+  }
+  for (auto [edgeIdx, edge] : llvm::enumerate(edges)) {
+    llvm::dbgs() << "  edge[" << edgeIdx << "] " << edge.producerNodeIdx << ":"
+                 << edge.prodIdx << " -> " << edge.consumerNodeIdx << ":"
+                 << edge.consIdx << " [";
+    printTransformChain(llvm::dbgs(), edge.transforms);
+    llvm::dbgs() << "]\n";
+  }
+}
+
+FailureOr<InstructionCatalog> InstructionCatalog::build(ModuleOp module) {
+  InstructionCatalog catalog;
+  for (DefineOp defineOp : module.getOps<DefineOp>()) {
+    auto graphOr = InstructionGraph::build(defineOp);
+    if (failed(graphOr))
+      return failure();
+    if (graphOr->nodes.empty())
+      continue;
+    catalog.graphs.push_back(std::move(*graphOr));
+  }
+
+  llvm::sort(catalog.graphs, [](const InstructionGraph &lhs,
+                                const InstructionGraph &rhs) {
+    return getDefineName(lhs.instruction) < getDefineName(rhs.instruction);
+  });
+
+  for (unsigned i = 0; i < catalog.graphs.size(); ++i)
+    catalog
+        .byAnchor
+            [catalog.graphs[i].nodes[catalog.graphs[i].anchorNodeIdx].fp.hash()]
+        .push_back(i);
+
+  for (auto &[_, bucket] : catalog.byAnchor) {
+    llvm::sort(bucket, [&](unsigned lhsIdx, unsigned rhsIdx) {
+      const InstructionGraph &lhs = catalog.graphs[lhsIdx];
+      const InstructionGraph &rhs = catalog.graphs[rhsIdx];
+      auto lhsKey = std::tuple<unsigned, unsigned, unsigned, StringRef>(
+          lhs.nodes.size(),
+          getFingerprintSpecificity(lhs.nodes[lhs.anchorNodeIdx].fp),
+          lhs.edges.size(), getDefineName(lhs.instruction));
+      auto rhsKey = std::tuple<unsigned, unsigned, unsigned, StringRef>(
+          rhs.nodes.size(),
+          getFingerprintSpecificity(rhs.nodes[rhs.anchorNodeIdx].fp),
+          rhs.edges.size(), getDefineName(rhs.instruction));
+      return lhsKey > rhsKey;
+    });
+  }
+
+  return std::move(catalog);
+}
+
+SmallVector<const InstructionGraph *, 4>
+InstructionCatalog::lookup(const SemanticFingerprint &anchorFp) const {
+  SmallVector<const InstructionGraph *, 4> matches;
+  auto it = byAnchor.find(anchorFp.hash());
+  if (it == byAnchor.end())
+    return matches;
+  for (unsigned idx : it->second) {
+    const InstructionGraph &graph = graphs[idx];
+    if (graph.nodes[graph.anchorNodeIdx].fp.matches(anchorFp))
+      matches.push_back(&graph);
+  }
+  return matches;
+}
+
+void InstructionCatalog::dump() const {
+  llvm::dbgs() << "InstructionCatalog: " << graphs.size() << " graph(s)\n";
+  for (const InstructionGraph &graph : graphs)
+    graph.dump();
+}
+
+static FailureOr<SmallVector<SubgraphMatchCandidate, 8>>
+collectCandidatesForFunction(const InstructionCatalog &catalog,
+                             const ProgramGraph &program) {
+  SmallVector<SubgraphMatchCandidate, 8> candidates;
+  for (unsigned sourceNodeIdx = 0; sourceNodeIdx < program.nodes.size();
+       ++sourceNodeIdx) {
+    const GraphNode &sourceNode = program.nodes[sourceNodeIdx];
+    auto patterns = catalog.lookup(sourceNode.fp);
+    LLVM_DEBUG({
+      llvm::dbgs() << "  source node[" << sourceNodeIdx << "] "
+                   << sourceNode.op->getName() << " -> " << patterns.size()
+                   << " anchor pattern(s)\n";
+    });
+    for (const InstructionGraph *pattern : patterns) {
+      auto matches = collectMatchesForAnchor(*pattern, program, sourceNodeIdx);
+      if (failed(matches))
+        return failure();
+      for (SubgraphMatchCandidate &match : *matches) {
+        LLVM_DEBUG(match.dump());
+        candidates.push_back(std::move(match));
+      }
+    }
+  }
+  return candidates;
+}
+
+static SemanticsGraph
+buildSelectedGraph(ProgramGraph &program,
+                   SmallVectorImpl<SubgraphMatchCandidate> &candidates) {
+  llvm::sort(
+      candidates, [](SubgraphMatchCandidate &lhs, SubgraphMatchCandidate &rhs) {
+        auto lhsKey = std::tuple<unsigned, unsigned, unsigned, StringRef>(
+            lhs.priority, lhs.sourceOps.size(),
+            GraphEdge::kNullIdx - lhs.sourceAnchorNodeIdx,
+            getDefineName(lhs.getInstruction()));
+        auto rhsKey = std::tuple<unsigned, unsigned, unsigned, StringRef>(
+            rhs.priority, rhs.sourceOps.size(),
+            GraphEdge::kNullIdx - rhs.sourceAnchorNodeIdx,
+            getDefineName(rhs.getInstruction()));
+        return lhsKey > rhsKey;
+      });
+
+  DenseSet<Operation *> coveredOps;
+  SmallVector<SubgraphMatchCandidate *, 8> selected;
+  for (SubgraphMatchCandidate &candidate : candidates) {
+    if (llvm::any_of(candidate.sourceOps,
+                     [&](Operation *op) { return coveredOps.contains(op); }))
+      continue;
+    for (Operation *op : candidate.sourceOps)
+      coveredOps.insert(op);
+    selected.push_back(&candidate);
+  }
+
+  llvm::sort(selected,
+             [&](SubgraphMatchCandidate *lhs, SubgraphMatchCandidate *rhs) {
+               auto lhsMin = llvm::min_element(lhs->patternToSourceNodeIdx);
+               auto rhsMin = llvm::min_element(rhs->patternToSourceNodeIdx);
+               return *lhsMin < *rhsMin;
+             });
+
+  SemanticsGraph graph;
+  graph.funcOp = program.funcOp;
+
+  DenseMap<Value, std::pair<unsigned, unsigned>> producedOutputs;
+  for (auto [nodeIdx, candidate] : llvm::enumerate(selected)) {
+    SemanticsGraphNode node;
+    node.sourceOps = candidate->sourceOps;
+    node.anchorNodeIdx = candidate->pattern->anchorNodeIdx;
+    node.domainNodeIdx = candidate->pattern->domainNodeIdx;
+    node.instruction = candidate->getInstruction();
+    node.boundaryOutputs = candidate->boundaryOutputs;
+    node.domainComputeOp = candidate->pattern->nodes[node.domainNodeIdx].op;
+    unsigned sourceDomainProgramIdx =
+        candidate->patternToSourceNodeIdx[node.domainNodeIdx];
+    node.domainSourceOp = program.nodes[sourceDomainProgramIdx].op;
+
+    graph.nodes.push_back(std::move(node));
+    for (auto [outputIdx, output] :
+         llvm::enumerate(candidate->boundaryOutputs)) {
+      auto inserted =
+          producedOutputs.try_emplace(output.producedValue, nodeIdx, outputIdx);
+      assert(inserted.second &&
+             "duplicate produced output value in selected graph");
+    }
+  }
+
+  for (auto [consumerNodeIdx, candidate] : llvm::enumerate(selected)) {
+    SemanticsGraphNode &node = graph.nodes[consumerNodeIdx];
+    for (auto [inputIdx, input] : llvm::enumerate(candidate->boundaryInputs)) {
+      auto producedIt = producedOutputs.find(input.value);
+      if (producedIt != producedOutputs.end() &&
+          producedIt->second.first != consumerNodeIdx) {
+        graph.edges.push_back({producedIt->second.first,
+                               static_cast<unsigned>(consumerNodeIdx),
+                               producedIt->second.second,
+                               input.boundaryOperandIdx, input.transforms});
+        continue;
+      }
+      node.boundaryInputs.push_back(input);
+    }
+  }
+
+  return graph;
+}
+
+FailureOr<SemanticsGraph>
+act::runSemanticMatching(func::FuncOp func, InstructionCatalog &catalog) {
+  LLVM_DEBUG(llvm::dbgs() << "=== Semantic Matching for function @"
+                          << getFuncName(func) << " ===\n");
+  auto programOr = ProgramGraph::build(func);
+  if (failed(programOr))
+    return failure();
+  ProgramGraph program = std::move(*programOr);
+  if (program.nodes.empty()) {
+    func.emitWarning() << "no supported operations found for semantic matching";
+    return SemanticsGraph{func, {}, {}};
+  }
+
+  LLVM_DEBUG(program.dump());
+  auto candidates = collectCandidatesForFunction(catalog, program);
+  if (failed(candidates))
+    return failure();
+  SemanticsGraph graph = buildSelectedGraph(program, *candidates);
+  LLVM_DEBUG(graph.dump());
+  return graph;
+}
+
+FailureOr<SemanticsGraphs> act::runSemanticMatching(ModuleOp module) {
+  LLVM_DEBUG(llvm::dbgs() << "=== Semantic Matching (Stage 1) ===\n");
+
+  auto catalog = InstructionCatalog::build(module);
+  if (failed(catalog))
+    return failure();
+  LLVM_DEBUG(catalog->dump());
+
+  SemanticsGraphs graphs;
+  for (func::FuncOp funcOp : module.getOps<func::FuncOp>()) {
+    auto programOr = ProgramGraph::build(funcOp);
+    if (failed(programOr))
+      return failure();
+    ProgramGraph program = std::move(*programOr);
+    if (program.nodes.empty()) {
+      funcOp.emitWarning()
+          << "no supported operations found for semantic matching";
+      continue;
+    }
+
+    LLVM_DEBUG(program.dump());
+    auto candidates = collectCandidatesForFunction(*catalog, program);
+    if (failed(candidates))
+      return failure();
+    SemanticsGraph graph = buildSelectedGraph(program, *candidates);
+    LLVM_DEBUG(graph.dump());
+    graphs.push_back(std::move(graph));
+  }
+
+  return graphs;
 }

@@ -1,6 +1,9 @@
+#include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
+#include "mlir/Interfaces/LoopLikeInterface.h"
 
 #include "act/IR/ActOps.h"
 
@@ -513,6 +516,28 @@ LogicalResult EmitOp::verifySymbolUses(SymbolTableCollection &symbolTable) {
   return success();
 }
 
+static bool isUnsupportedSequenceControlOp(Operation *op) {
+  return isa<LoopLikeOpInterface, BranchOpInterface, RegionBranchOpInterface>(
+             op) ||
+         isa<affine::AffineIfOp, scf::IfOp>(op);
+}
+
+LogicalResult SequenceOp::verify() {
+  Region &body = getBody();
+  if (body.empty())
+    return emitError() << "sequence body must contain an entry block";
+  if (body.front().getNumArguments() != 0)
+    return emitError() << "sequence entry block must not have arguments";
+
+  WalkResult walkResult = body.walk([&](Operation *op) {
+    if (!isUnsupportedSequenceControlOp(op))
+      return WalkResult::advance();
+    op->emitError() << "control flow is not supported in act.sequence";
+    return WalkResult::interrupt();
+  });
+  return success(!walkResult.wasInterrupted());
+}
+
 LogicalResult CollapseShapeOp::verify() {
   if (llvm::any_of(getReassociationIndices(),
                    [](ReassociationIndices &group) { return group.empty(); })) {
@@ -673,4 +698,13 @@ FailureOr<Value> TransposeOp::materialize(OpBuilder &builder, Location loc,
       linalg::TransposeOp::create(builder, loc, value, empty, invPerm);
   Value invTransposed = transposeOp->getResult(0);
   return sourceOp.materialize(builder, loc, invTransposed, buffer);
+}
+
+LogicalResult LaunchOp::verifySymbolUses(SymbolTableCollection &symbolTable) {
+  auto defineOp =
+      symbolTable.lookupNearestSymbolFrom<SequenceOp>(*this, getSequenceAttr());
+  if (!defineOp)
+    return emitError() << "referred sequence '" << getSequence()
+                       << "' does not exist";
+  return success();
 }

@@ -290,15 +290,17 @@ Configuration instructions (`act.state.write`, `act.desc.write`) are not matched
 4. **Layout transforms**: `tensor.collapse_shape`/`expand_shape`/`linalg.transpose` in compute regions already express these. Layout ops in the source graph should match layout ops in instruction patterns.
 5. **Pass placement**: runs before `ConvertActToCanonicalForm`. Input = canonical MLIR + `act.define` library. Output = `act.emit` calls + tiling loops + state/descriptor config. Then `ConvertActToCanonicalForm` lowers for simulation.
 
-### Pipeline overview [Version 1]
+### Pipeline overview [Version 2]
 
 Design principles:
-- Semantics matching and address/tiling generation are decoupled into separate stages.
+- Semantics matching and parameter solving are decoupled into separate stages.
+- **Tiling is a midend concern, not a backend concern.** The backend assumes input programs are already well-tiled. Each linalg op at the point of instruction selection must have shapes that fit within some instruction's native capacity.
 - Progressive: each stage produces valid (possibly incomplete) output. The compiler can stop early and report what it matched and where it got stuck.
 - No e-graphs. Algebraic rewrites (if needed) are applied as explicit MLIR canonicalization passes before instruction selection, not during it.
+- The backend operates **per-region** — when the source IR contains affine loop nests (from midend tiling), instruction selection runs inside each innermost loop body independently.
 
 #### Input
-- A computation graph in canonical MLIR (linalg/tensor ops on ranked tensors), contained in `func.func` ops.
+- A computation graph in canonical MLIR (linalg/tensor ops on ranked tensors), contained in `func.func` ops. If the program requires tiling, it should already contain affine loop nests with appropriately sized linalg ops inside.
 - An instruction library: a set of `act.define` ops (with `act.buffer`/`act.desc`/`act.state` declarations) describing the target accelerator's ISA.
 
 #### Stage 1: Semantic matching
@@ -307,21 +309,24 @@ See [stage1.md](stage1.md) for the detailed design.
 
 Summary: extract semantic fingerprints from instruction compute regions, specialize source `linalg.generic` ops to named ops via `specialize-generic-ops` pre-pass, then match by op name (common case) or structural comparison of `linalg.generic` bodies (fallback). Multi-op fused patterns matched by subgraph isomorphism, prioritized over single-op matches. After the compute/access separation, boundary stripping is repurposed as a **validation pass** — it detects and warns about layout ops that should have been placed in the addr region, rather than being used to extract fingerprints.
 
-#### Stage 2: Tiling and address parameter generation
+#### Stage 2: Parameter solving
 
 See [stage2.md](stage2.md) for the detailed design.
 
-Summary: Build symbolic shape expressions from the addr region's access chain via a `generateShapeExpr` interface method on each access pattern op. The symbolic framework (`SymExpr` tree) represents integer expressions over addr parameters — supporting constants, params, add, and mul. Phase 2a maps symbolic shapes to iteration domain bounds (via linalg indexing maps), compares against the source iteration domain, and solves constraints to determine shape params and tiling factors. Phase 2b classifies addr params into shape params (constant per tile, solved by Phase 2a) and offset params (functions of tiling loop IVs). Rank mismatches (e.g., `batch_matmul` vs 2D `@gemm`) are handled by structural suffix matching on iteration types — extra leading parallel dims become outer loops — but deferred to iteration 2.
+Summary: Build symbolic shape expressions from the addr region's access chain via a `generateShapeExpr` free function on each access pattern op. The symbolic framework (`SymExpr` tree) represents integer expressions over addr parameters — supporting constants, params, add, and mul. Map symbolic shapes to iteration domain bounds (via linalg indexing maps), compare against the source iteration domain, and solve constraints to determine shape parameter values. If any dimension doesn't match (source exceeds instruction capacity), the match is **rejected** — the midend should have tiled it. Classify addr params into shape params (solved by constraint solving) and offset params (derived from source IR during emission). No tiling factors are computed; no loops are generated.
 
-#### Stage 3: Coverage resolution and code emission
+#### Stage 3: Code emission
 
 See [stage3.md](stage3.md) for the detailed design.
 
-Summary: Three phases — (3a) coverage resolution: select the best valid TiledMatchCandidate per source op, preferring fewer tiling iterations; (3b) memory layout: assign HBM regions for source tensors (sequential placement) and scratchpad buffer slots for instruction operands (sequential allocation per buffer), build a data movement catalog from identity instructions; (3c) code emission: generate `scf.for` tiling loops (parallel outer, reduction inner), emit load instructions (HBM → scratchpad), compute `act.emit` calls with solved addr params, and store instructions (scratchpad → HBM). Reduction dims require accumulator initialization before the reduction loop and stores after it. Source functions are rewritten to operate on buffers (no tensor args/returns). For instructions operating directly on HBM (like `@matmul` on `@devmem`), no data movement is needed — addr params are computed as flat HBM offsets from loop IVs and tensor strides.
+Summary: Three phases — (3a) logical planning: build a `LogicalPlan` from the semantics graph and param solutions, wiring inter-node dataflow and transform chains; (3b) resource planning: assign HBM regions for source tensors (live range analysis + greedy allocation), allocate scratchpad buffer slots for instruction operands, build a data movement catalog from identity instructions, detect forwarding opportunities; (3c) code emission: emit `act.emit` calls with addr params computed from solved shape params and source-IR offset information. For multi-buffer instructions, emit load/store sequences around compute. Offsets are either static (from HBM layout) or dynamic (traced from source IR using `AffineValueMapBuilder`, which composes SSA chains into affine maps). Source functions are rewritten to operate on buffers (no tensor args/returns). No tiling loops are generated by the backend.
 
 #### Stage 4 (future): Optimization
 
 Not part of the MVP. Potential extensions:
-- **Scheduling**: reorder instructions within tiling loops for better data reuse (e.g., double buffering, software pipelining). This is a separate pass operating on the `scf.for` + `act.emit` IR.
+- **Scheduling**: reorder instructions for better data reuse (e.g., double buffering, software pipelining). This is a separate pass operating on the `act.emit` IR.
 - **Algebraic rewrites**: apply a small set of targeted rewrites before Stage 1 (e.g., fuse adjacent elementwise ops, reassociate reductions). These are standard MLIR canonicalization passes, not e-graph exploration.
-- **Cost-model-driven tiling**: replace the analytical tiling in Stage 2 with a cost-model search when multiple valid tilings exist (e.g., choosing between tiling M vs N first for matmul).
+
+#### Input validation (potential improvement)
+
+A diagnostic pass that checks whether each linalg op in the input program can be covered by some instruction in the ISA, without transforming the IR. Would run as an optional early check before the full pipeline, reporting which ops have no valid match and why (shape mismatch, no matching fingerprint, unsupported constraint form). This gives users actionable feedback about what their midend tiling pass needs to produce.
