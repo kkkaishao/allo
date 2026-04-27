@@ -2,6 +2,7 @@
 #include "act/IR/ActOps.h"
 #include "act/Support/CodeEmission.h"
 #include "act/Support/ParamSolving.h"
+#include "act/Support/Planning.h"
 #include "act/Support/SemanticMatching.h"
 
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
@@ -58,80 +59,88 @@ static LogicalResult validateInputProgram(func::FuncOp func, ModuleOp module) {
 namespace {
 struct LowerFunctionToActPattern : OpConversionPattern<func::FuncOp> {
   LowerFunctionToActPattern(MLIRContext *ctx, ModuleOp module,
-                            InstructionCatalog &catalog)
-      : OpConversionPattern(ctx), module(module), catalog(catalog) {}
+                            InstructionCollection &collection)
+      : OpConversionPattern(ctx), module(module), collection(collection) {}
 
   LogicalResult
   matchAndRewrite(func::FuncOp func, OpAdaptor,
                   ConversionPatternRewriter &rewriter) const override {
-    FunctionLoweringPlan plan(func);
-
     if (failed(validateInputProgram(func, module)))
       return failure();
 
-    auto programOr = ProgramGraph::build(func);
-    if (failed(programOr))
+    auto graphOr = runSemanticMatching(func, collection);
+    if (failed(graphOr))
       return failure();
-
-    DenseSet<Operation *> semanticOps;
-    for (GraphNode &node : programOr->nodes)
-      semanticOps.insert(node.op);
-    if (semanticOps.empty()) {
-      plan.graph = SemanticsGraph{func, {}, {}};
-      plan.isComplete = true;
-    } else {
-      auto graphOr = runSemanticMatching(func, catalog);
-      if (failed(graphOr))
-        return failure();
-      plan.graph = std::move(*graphOr);
-
-      for (SemanticsGraphNode &node : plan.graph.nodes)
-        for (Operation *op : node.sourceOps)
-          plan.coveredSemanticOps.insert(op);
-
-      if (llvm::any_of(semanticOps, [&](Operation *op) {
-            return !plan.coveredSemanticOps.contains(op);
-          })) {
-        return func.emitError()
-               << "partial instruction lowering is not supported for function @"
-               << func.getSymName();
-      }
-      auto paramOr = runParamSolving(plan.graph, module);
-      if (failed(paramOr))
-        return failure();
-      plan.solution = std::move(*paramOr);
-
-      auto logicalOr = buildLogicalPlan(func, plan.graph, plan.solution);
-      if (failed(logicalOr))
-        return failure();
-      plan.logicalPlan = std::move(*logicalOr);
-
-      auto resourceOr = buildResourcePlan(func, plan.logicalPlan, module);
-      if (failed(resourceOr))
-        return failure();
-      plan.resourcePlan = std::move(*resourceOr);
-      plan.isComplete = true;
-    }
-
-    if (!plan.isComplete)
-      return func.emitError()
-             << "failed to build a complete lowering plan for function @"
-             << func.getSymName();
-
-    LLVM_DEBUG({
-      llvm::dbgs() << "Built FunctionLoweringPlan for @" << func.getSymName()
-                   << " with " << plan.logicalPlan.nodes.size()
-                   << " selected node(s)\n";
-    });
-
-    LLVM_DEBUG(llvm::dbgs() << "\n=== Lowering function @" << func.getSymName()
-                            << " ===\n";);
-    return emitInstructionSequence(rewriter, plan);
+    auto solutionsOr = runParamSolving(*graphOr);
+    if (failed(solutionsOr))
+      return failure();
+    auto planOr = buildExecutionPlan(*graphOr, *solutionsOr);
+    if (failed(planOr))
+      return failure();
+    if (failed(emitInstructionSequence(rewriter, *planOr)))
+      return failure();
+    return success();
+    // DenseSet<Operation *> semanticOps;
+    // for (GraphNode &node : programOr->nodes)
+    //   semanticOps.insert(node.op);
+    // if (semanticOps.empty()) {
+    //   plan.graph = SemanticsGraph{func, {}, {}};
+    //   plan.isComplete = true;
+    // } else {
+    //   auto graphOr = runSemanticMatching(func, catalog);
+    //   if (failed(graphOr))
+    //     return failure();
+    //   plan.graph = std::move(*graphOr);
+    //
+    //   for (SemanticsGraphNode &node : plan.graph.nodes)
+    //     for (Operation *op : node.sourceOps)
+    //       plan.coveredSemanticOps.insert(op);
+    //
+    //   if (llvm::any_of(semanticOps, [&](Operation *op) {
+    //         return !plan.coveredSemanticOps.contains(op);
+    //       })) {
+    //     return func.emitError()
+    //            << "partial instruction lowering is not supported for function
+    //            @"
+    //            << func.getSymName();
+    //   }
+    //   auto paramOr = runParamSolving(plan.graph, module);
+    //   if (failed(paramOr))
+    //     return failure();
+    //   plan.solution = std::move(*paramOr);
+    //
+    //   auto logicalOr = buildLogicalPlan(func, plan.graph, plan.solution);
+    //   if (failed(logicalOr))
+    //     return failure();
+    //   plan.logicalPlan = std::move(*logicalOr);
+    //
+    //   auto resourceOr = buildResourcePlan(func, plan.logicalPlan, module);
+    //   if (failed(resourceOr))
+    //     return failure();
+    //   plan.resourcePlan = std::move(*resourceOr);
+    //   plan.isComplete = true;
+    // }
+    //
+    // if (!plan.isComplete)
+    //   return func.emitError()
+    //          << "failed to build a complete lowering plan for function @"
+    //          << func.getSymName();
+    //
+    // LLVM_DEBUG({
+    //   llvm::dbgs() << "Built FunctionLoweringPlan for @" << func.getSymName()
+    //                << " with " << plan.logicalPlan.nodes.size()
+    //                << " selected node(s)\n";
+    // });
+    //
+    // LLVM_DEBUG(llvm::dbgs() << "\n=== Lowering function @" <<
+    // func.getSymName()
+    //                         << " ===\n";);
+    // return emitInstructionSequence(rewriter, plan);
   }
 
 private:
   ModuleOp module;
-  InstructionCatalog &catalog;
+  InstructionCollection &collection;
 };
 } // namespace
 
@@ -164,13 +173,13 @@ struct ConvertCanonicalToActPass
         return signalPassFailure();
     }
 
-    auto catalogOr = InstructionCatalog::build(module);
-    if (failed(catalogOr))
+    auto collectionOr = InstructionCollection::build(module);
+    if (failed(collectionOr)) {
+      module.emitError()
+          << "failed to build instruction collection for semantic "
+             "matching";
       return signalPassFailure();
-    LLVM_DEBUG({
-      llvm::dbgs() << "=== Instruction Catalog ===\n";
-      catalogOr->dump();
-    });
+    }
 
     MLIRContext *ctx = &getContext();
     ConversionTarget target(*ctx);
@@ -179,9 +188,8 @@ struct ConvertCanonicalToActPass
                            arith::ArithDialect, linalg::LinalgDialect,
                            tensor::TensorDialect>();
     target.addIllegalOp<func::FuncOp>();
-
     RewritePatternSet patterns(ctx);
-    patterns.add<LowerFunctionToActPattern>(ctx, module, *catalogOr);
+    patterns.add<LowerFunctionToActPattern>(ctx, module, *collectionOr);
     if (failed(applyPartialConversion(getOperation(), target,
                                       std::move(patterns))))
       return signalPassFailure();

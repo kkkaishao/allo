@@ -1,202 +1,249 @@
 #include "act/Support/SymbolicExpr.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
-#include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/IR/BuiltinAttributes.h"
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/Support/Debug.h"
+#include "llvm/Support/ErrorHandling.h"
+
+#include <utility>
 
 #define DEBUG_TYPE "symbolic-expr"
 
 using namespace mlir;
 using namespace mlir::act;
 
-//===----------------------------------------------------------------------===//
-// buildSymExpr
-//===----------------------------------------------------------------------===//
+int64_t SymExpr::evaluate(ArrayRef<int64_t> paramValues) const {
+  switch (kind) {
+  case Kind::Constant:
+    return value;
+  case Kind::Param:
+    assert(paramIdx < paramValues.size() && "param index out of bounds");
+    return paramValues[paramIdx];
+  case Kind::Add:
+    assert(lhs && rhs && "expected binary expression operands");
+    return lhs->evaluate(paramValues) + rhs->evaluate(paramValues);
+  case Kind::Mul:
+    assert(lhs && rhs && "expected binary expression operands");
+    return lhs->evaluate(paramValues) * rhs->evaluate(paramValues);
+  }
+  llvm_unreachable("unknown symbolic expression kind");
+}
 
-FailureOr<SymExpr> mlir::act::buildSymExpr(Value v) {
-  // Block argument → Param
-  if (auto arg = dyn_cast<BlockArgument>(v))
+void SymExpr::collectParams(DenseSet<unsigned> &params) const {
+  switch (kind) {
+  case Kind::Constant:
+    return;
+  case Kind::Param:
+    params.insert(paramIdx);
+    return;
+  case Kind::Add:
+  case Kind::Mul:
+    assert(lhs && rhs && "expected binary expression operands");
+    lhs->collectParams(params);
+    rhs->collectParams(params);
+    return;
+  }
+  llvm_unreachable("unknown symbolic expression kind");
+}
+
+std::optional<int64_t> SymExpr::getConstantValue() const {
+  if (isConstant())
+    return value;
+  return std::nullopt;
+}
+
+std::optional<unsigned> SymExpr::getParamIdx() const {
+  if (isParam())
+    return paramIdx;
+  return std::nullopt;
+}
+
+std::string SymExpr::toString() const {
+  switch (kind) {
+  case Kind::Constant:
+    return "Const(" + std::to_string(value) + ")";
+  case Kind::Param:
+    return "Param<" + std::to_string(paramIdx) + ">";
+  case Kind::Add:
+    assert(lhs && rhs && "expected binary expression operands");
+    return "(" + lhs->toString() + " + " + rhs->toString() + ")";
+  case Kind::Mul:
+    assert(lhs && rhs && "expected binary expression operands");
+    return "(" + lhs->toString() + " * " + rhs->toString() + ")";
+  }
+  llvm_unreachable("unknown symbolic expression kind");
+}
+
+FailureOr<SymExpr> mlir::act::buildSymExpr(Value value) {
+  if (auto arg = dyn_cast<BlockArgument>(value))
     return SymExpr::param(arg.getArgNumber());
 
-  auto *defOp = v.getDefiningOp();
+  Operation *defOp = value.getDefiningOp();
   if (!defOp)
     return failure();
 
-  // arith.constant → Constant
-  if (auto constOp = dyn_cast<arith::ConstantOp>(defOp)) {
-    if (auto intAttr = dyn_cast<IntegerAttr>(constOp.getValue()))
-      return SymExpr::constant(intAttr.getInt());
-    return failure();
+  if (auto constant = dyn_cast<arith::ConstantOp>(defOp)) {
+    auto intAttr = dyn_cast<IntegerAttr>(constant.getValue());
+    if (!intAttr)
+      return failure();
+    return SymExpr::constant(intAttr.getInt());
   }
 
-  // arith.muli → Mul
-  if (auto mulOp = dyn_cast<arith::MulIOp>(defOp)) {
-    auto lhs = buildSymExpr(mulOp.getLhs());
-    auto rhs = buildSymExpr(mulOp.getRhs());
+  if (auto add = dyn_cast<arith::AddIOp>(defOp)) {
+    auto lhs = buildSymExpr(add.getLhs());
+    auto rhs = buildSymExpr(add.getRhs());
     if (failed(lhs) || failed(rhs))
       return failure();
-    return SymExpr::mul(*lhs, *rhs);
+    return *lhs + *rhs;
   }
 
-  // arith.addi → Add
-  if (auto addOp = dyn_cast<arith::AddIOp>(defOp)) {
-    auto lhs = buildSymExpr(addOp.getLhs());
-    auto rhs = buildSymExpr(addOp.getRhs());
+  if (auto mul = dyn_cast<arith::MulIOp>(defOp)) {
+    auto lhs = buildSymExpr(mul.getLhs());
+    auto rhs = buildSymExpr(mul.getRhs());
     if (failed(lhs) || failed(rhs))
       return failure();
-    return SymExpr::add(*lhs, *rhs);
+    return *lhs * *rhs;
   }
 
-  LLVM_DEBUG(llvm::dbgs() << "  [buildSymExpr] unsupported op: "
+  LLVM_DEBUG(llvm::dbgs() << "unsupported symbolic expr op: "
                           << defOp->getName() << "\n");
   return failure();
 }
 
-FailureOr<SymExpr> mlir::act::buildSymExpr(OpFoldResult ofr) {
-  if (auto attr = dyn_cast<Attribute>(ofr)) {
-    if (auto intAttr = dyn_cast<IntegerAttr>(attr))
-      return SymExpr::constant(intAttr.getInt());
-    return failure();
+FailureOr<SymExpr> mlir::act::buildSymExpr(OpFoldResult value) {
+  if (auto attr = dyn_cast<Attribute>(value)) {
+    auto intAttr = dyn_cast<IntegerAttr>(attr);
+    if (!intAttr)
+      return failure();
+    return SymExpr::constant(intAttr.getInt());
   }
-  return buildSymExpr(cast<Value>(ofr));
+  return buildSymExpr(cast<Value>(value));
 }
 
-//===----------------------------------------------------------------------===//
-// generateShapeExpr — per-op implementations
-//===----------------------------------------------------------------------===//
-
-/// StridedOp: shape = [counts...] ++ bufferType.getShape() (non-HBM only)
-/// With rank reduction: drop leading count dim if it's Constant(1) and there
-/// are trailing element dims.
-static FailureOr<SymShape> generateShapeExprStrided(StridedOp op,
-                                                    BufferTypeInterface bufTy) {
-  auto ctx = op.getContext();
-  auto mixedCounts = getMixedValues(op.getStaticCounts(), op.getCounts(), ctx);
+static FailureOr<SymShape> generateStridedShape(StridedOp op,
+                                                BufferTypeInterface bufferTy) {
+  MLIRContext *ctx = op.getContext();
+  auto counts = getMixedValues(op.getStaticCounts(), op.getCounts(), ctx);
 
   SymShape shape;
-  for (auto &count : mixedCounts) {
+  for (OpFoldResult count : counts) {
     auto expr = buildSymExpr(count);
     if (failed(expr))
-      return op.emitError() << "failed to build symbolic expr for count";
+      return op.emitError() << "failed to build symbolic count expression";
     shape.push_back(*expr);
   }
 
-  // Append buffer element dimensions for non-HBM buffers
-  if (!isa<HBMBufferType>(bufTy)) {
-    for (int64_t dim : bufTy.getShape())
+  if (!isa<HBMBufferType>(bufferTy)) {
+    for (int64_t dim : bufferTy.getShape())
       shape.push_back(SymExpr::constant(dim));
   }
 
-  // Rank reduction: StridedOp::materialize calls
-  // inferCanonicalRankReducedResultType(shaped.getRank()-1, ...) which drops
-  // the leading count dim when it's statically 1 (one slot = the element
-  // itself)
-  if (shape.size() > 1 && shape[0].isConstant() && shape[0].value == 1)
+  if (shape.size() > 1 && shape.front().getConstantValue() == 1)
     shape.erase(shape.begin());
 
   return shape;
 }
 
-/// ExpandShapeOp: replace source dims according to reassociation with
-/// output_shape dims.
-static FailureOr<SymShape> generateShapeExprExpand(ExpandShapeOp op,
-                                                   BufferTypeInterface bufTy) {
-  auto sourceOp = op.getSource().getDefiningOp();
+static FailureOr<SymShape> generateExpandShape(ExpandShapeOp op,
+                                               BufferTypeInterface bufferTy) {
+  Operation *sourceOp = op.getSource().getDefiningOp();
   if (!sourceOp)
-    return op.emitError() << "source has no defining op";
+    return op.emitError() << "source access pattern has no defining op";
 
-  auto sourceShape = generateShapeExpr(sourceOp, bufTy);
+  auto sourceShape = generateShapeExpr(sourceOp, bufferTy);
   if (failed(sourceShape))
     return failure();
 
-  auto reassoc = op.getReassociationIndices();
-  auto mixedOutputShape = getMixedValues(op.getStaticOutputShape(),
-                                         op.getOutputShape(), op.getContext());
+  auto outputShape = getMixedValues(op.getStaticOutputShape(),
+                                    op.getOutputShape(), op.getContext());
 
-  // Build result shape: for each reassociation group, replace source dim(s)
-  // with the corresponding output dims
-  SymShape result;
-  unsigned outputIdx = 0;
-  for (auto &group : reassoc) {
-    // Each group maps one or more source dims to multiple output dims
-    unsigned numOutputDims = group.size();
-    // The output dims for this group come from mixedOutputShape
-    // For expand_shape: the number of output dims per group = group.size()
-    // But wait — reassociation in expand_shape means source has fewer dims.
-    // reassociation[i] lists which OUTPUT dims correspond to source dim i.
-    // So reassoc.size() == sourceShape.size(), and each group lists output dim
-    // indices.
-    for (unsigned idx : group) {
-      if (idx >= mixedOutputShape.size())
-        return op.emitError() << "output shape index out of bounds";
-      auto expr = buildSymExpr(mixedOutputShape[idx]);
-      if (failed(expr))
-        return op.emitError() << "failed to build symbolic expr for output dim";
-      result.push_back(*expr);
+  SymShape shape;
+  for (OpFoldResult dim : outputShape) {
+    auto expr = buildSymExpr(dim);
+    if (failed(expr))
+      return op.emitError() << "failed to build symbolic output shape";
+    shape.push_back(*expr);
+  }
+  return shape;
+}
+
+static FailureOr<SymShape> generateCollapseShape(CollapseShapeOp op,
+                                                 BufferTypeInterface bufferTy) {
+  Operation *sourceOp = op.getSource().getDefiningOp();
+  if (!sourceOp)
+    return op.emitError() << "source access pattern has no defining op";
+
+  auto sourceShape = generateShapeExpr(sourceOp, bufferTy);
+  if (failed(sourceShape))
+    return failure();
+
+  auto reassociation = op.getReassociationIndices();
+  SymShape shape;
+  for (ArrayRef<int64_t> group : reassociation) {
+    assert(!group.empty() && "expected non-empty reassociation group");
+    assert(group.front() < sourceShape->size() &&
+           "reassociation index out of source shape bounds");
+    SymExpr dim = (*sourceShape)[group.front()];
+    for (int64_t idx : group.drop_front()) {
+      assert(idx < static_cast<int64_t>(sourceShape->size()) &&
+             "reassociation index out of source shape bounds");
+      dim = dim * (*sourceShape)[idx];
     }
+    shape.push_back(std::move(dim));
   }
-
-  return result;
+  return shape;
 }
 
-/// CollapseShapeOp: merge source dims according to reassociation with Mul.
 static FailureOr<SymShape>
-generateShapeExprCollapse(CollapseShapeOp op, BufferTypeInterface bufTy) {
-  auto sourceOp = op.getSource().getDefiningOp();
+generateTransposeShape(TransposeOp op, BufferTypeInterface bufferTy) {
+  Operation *sourceOp = op.getSource().getDefiningOp();
   if (!sourceOp)
-    return op.emitError() << "source has no defining op";
+    return op.emitError() << "source access pattern has no defining op";
 
-  auto sourceShape = generateShapeExpr(sourceOp, bufTy);
+  auto sourceShape = generateShapeExpr(sourceOp, bufferTy);
   if (failed(sourceShape))
     return failure();
 
-  auto reassoc = op.getReassociationIndices();
-  SymShape result;
-  for (auto &group : reassoc) {
-    // Merge all source dims in this group with multiplication
-    SymExpr merged = (*sourceShape)[group[0]];
-    for (unsigned i = 1; i < group.size(); ++i)
-      merged = SymExpr::mul(std::move(merged), (*sourceShape)[group[i]]);
-    result.push_back(std::move(merged));
+  auto permutation = op.getPermutation();
+  SymShape shape;
+  shape.reserve(permutation.size());
+  for (int64_t dim : permutation) {
+    assert(dim >= 0 && dim < static_cast<int64_t>(sourceShape->size()) &&
+           "transpose permutation index out of source shape bounds");
+    shape.push_back((*sourceShape)[dim]);
   }
-
-  return result;
+  return shape;
 }
 
-/// TransposeOp: permute source dims.
-static FailureOr<SymShape>
-generateShapeExprTranspose(TransposeOp op, BufferTypeInterface bufTy) {
-  auto sourceOp = op.getSource().getDefiningOp();
-  if (!sourceOp)
-    return op.emitError() << "source has no defining op";
+FailureOr<SymShape>
+mlir::act::generateShapeExpr(Operation *accessOp,
+                             BufferTypeInterface bufferType) {
+  assert(accessOp && "expected access pattern op");
 
-  auto sourceShape = generateShapeExpr(sourceOp, bufTy);
-  if (failed(sourceShape))
-    return failure();
-
-  auto perm = op.getPermutation();
-  SymShape result(perm.size());
-  for (unsigned i = 0; i < perm.size(); ++i)
-    result[i] = (*sourceShape)[perm[i]];
-
-  return result;
-}
-
-//===----------------------------------------------------------------------===//
-// generateShapeExpr — top-level dispatch
-//===----------------------------------------------------------------------===//
-
-FailureOr<SymShape> mlir::act::generateShapeExpr(Operation *accessOp,
-                                                 BufferTypeInterface bufTy) {
   if (auto strided = dyn_cast<StridedOp>(accessOp))
-    return generateShapeExprStrided(strided, bufTy);
+    return generateStridedShape(strided, bufferType);
   if (auto expand = dyn_cast<ExpandShapeOp>(accessOp))
-    return generateShapeExprExpand(expand, bufTy);
+    return generateExpandShape(expand, bufferType);
   if (auto collapse = dyn_cast<CollapseShapeOp>(accessOp))
-    return generateShapeExprCollapse(collapse, bufTy);
+    return generateCollapseShape(collapse, bufferType);
   if (auto transpose = dyn_cast<TransposeOp>(accessOp))
-    return generateShapeExprTranspose(transpose, bufTy);
+    return generateTransposeShape(transpose, bufferType);
+  if (isa<TiledOp>(accessOp))
+    return accessOp->emitError()
+           << "symbolic shape extraction for act.tiled is not supported yet";
 
-  return accessOp->emitError() << "unsupported access op for generateShapeExpr";
+  return accessOp->emitError()
+         << "unsupported access pattern op for symbolic shape extraction";
+}
+
+std::string mlir::act::symShapeToString(const SymShape &shape) {
+  std::string result = "[";
+  for (auto [idx, dim] : llvm::enumerate(shape)) {
+    if (idx != 0)
+      result += ", ";
+    result += dim.toString();
+  }
+  result += "]";
+  return result;
 }

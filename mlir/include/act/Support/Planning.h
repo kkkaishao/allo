@@ -4,216 +4,211 @@
 #include "act/Support/ParamSolving.h"
 #include "act/Support/SemanticMatching.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
-#include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/BuiltinTypes.h"
+#include "llvm/ADT/DenseMap.h"
+#include "llvm/Support/raw_ostream.h"
 
 #include <optional>
+#include <utility>
 
 namespace mlir::act {
 
-enum class LogicalTransformKind {
-  Transpose,
-  ExtractSlice,
-  InsertSlice,
-};
-
-struct LogicalTransform {
-  LogicalTransformKind kind = LogicalTransformKind::Transpose;
-  SmallVector<int64_t> permutation;
-  std::optional<StaticSliceSpec> sliceSpec;
-
-  static LogicalTransform transpose(ArrayRef<int64_t> perm) {
-    LogicalTransform layout;
-    layout.kind = LogicalTransformKind::Transpose;
-    layout.permutation.assign(perm.begin(), perm.end());
-    return layout;
-  }
-
-  static LogicalTransform extractSlice(const StaticSliceSpec &slice) {
-    LogicalTransform layout;
-    layout.kind = LogicalTransformKind::ExtractSlice;
-    layout.sliceSpec = slice;
-    return layout;
-  }
-
-  static LogicalTransform insertSlice(const StaticSliceSpec &slice) {
-    LogicalTransform layout;
-    layout.kind = LogicalTransformKind::InsertSlice;
-    layout.sliceSpec = slice;
-    return layout;
-  }
-
-  bool isTranspose() const { return kind == LogicalTransformKind::Transpose; }
-  bool isExtractSlice() const {
-    return kind == LogicalTransformKind::ExtractSlice;
-  }
-  bool isInsertSlice() const {
-    return kind == LogicalTransformKind::InsertSlice;
-  }
-};
-
-using LogicalTransformChain = SmallVector<LogicalTransform, 2>;
-
-bool isIdentityTransformChain(ArrayRef<LogicalTransform> transforms);
-
-enum class LogicalPlanValueKind {
-  FunctionInput,
+enum class PlanValueKind {
+  HBMInput,
+  Placeholder,
   Produced,
-  MaterializedOutput,
 };
 
-/// One consumer use of a logical value.
-struct LogicalPlanInputUse {
-  unsigned consumerNodeIdx;
-  unsigned consumerOperandIdx;
-  LogicalTransformChain requiredTransforms;
+enum class PlanActionKind {
+  Compute,
+  Writeback,
 };
 
-struct LogicalPlanNodeInput {
-  unsigned valueId = GraphEdge::kNullIdx;
-  LogicalTransformChain requiredTransforms;
+enum class PlanScheduleKind {
+  Compute,
+  Move,
 };
 
-struct LogicalPlanNodeOutput {
-  unsigned valueId = GraphEdge::kNullIdx;
-  std::optional<unsigned> writebackTargetValueId;
-  LogicalTransformChain writebackTransforms;
+struct FlatStridedRegion {
+  int64_t base = 0;
+  SmallVector<int64_t, 4> sizes;
+  SmallVector<int64_t, 4> strides;
 };
 
-/// Logical tensor value flowing between compute nodes.
-struct LogicalPlanValue {
-  LogicalPlanValueKind kind = LogicalPlanValueKind::Produced;
-  Value sourceValue;
-  RankedTensorType type;
-  std::optional<unsigned> definingNodeIdx;
-  SmallVector<LogicalPlanInputUse, 1> uses;
-};
-
-/// One selected compute node in the logical plan.
-struct LogicalPlanNode {
-  SmallVector<Operation *, 4> sourceOps;
-  DefineOp instruction;
-  DenseMap<unsigned, int64_t> solvedParams;
-  DenseMap<unsigned, AddrParamKind> paramKinds;
-  SmallVector<LogicalPlanNodeInput, 2> inputs;
-  SmallVector<LogicalPlanNodeOutput, 1> outputs;
-};
-
-/// Selected-only compute/dataflow plan used by Stage 3.
-struct LogicalPlan {
-  SmallVector<LogicalPlanNode, 4> nodes;
-  SmallVector<LogicalPlanValue, 8> values;
-  DenseMap<Value, unsigned> externalValueIds;
-
-  void dump() const;
-};
-
-/// Layout of a single logical value in the shared buffer.
-struct TensorLayout {
-  int64_t baseOffset;
-  SmallVector<int64_t> shape;
-  SmallVector<int64_t> strides;
-};
-
-/// Planned residence of one instruction operand.
-struct OperandResidence {
+struct PhysicalRegion {
   StringAttr bufferName;
-  int64_t offset;
-  int64_t size;
-  unsigned operandIdx;
+  int64_t offset = 0;
+  int64_t size = 0;
 };
 
-/// One planned data movement step.
-struct MovementStep {
-  DefineOp instruction;
-  StringAttr srcBuffer;
-  int64_t srcOffset;
-  StringAttr dstBuffer;
-  int64_t dstOffset;
-  int64_t size;
+struct ScratchResource {
+  StringAttr bufferName;
+  BufferTypeInterface bufferType;
+  int64_t capacity = 0;
 };
 
-/// Layout signature extracted from an identity instruction's addr region.
+struct HBMAllocation {
+  Value value;
+  RankedTensorType type;
+  unsigned boundaryIdx = kNullId;
+  int64_t base = 0;
+  SmallVector<int64_t, 4> shape;
+  SmallVector<int64_t, 4> strides;
+  bool isResult = false;
+};
+
+struct ValueLifetime {
+  unsigned firstAction = kNullId;
+  unsigned lastAction = kNullId;
+
+  bool isValid() { return firstAction != kNullId && lastAction != kNullId; }
+};
+
+struct ValuePlacement {
+  unsigned valueId = kNullId;
+  PhysicalRegion region;
+  unsigned firstAction = kNullId;
+  unsigned lastAction = kNullId;
+  bool overCapacity = false;
+};
+
+struct PlanValueUse {
+  unsigned nodeIdx = kNullId;
+  unsigned accessOperandIdx = kNullId;
+};
+
+struct PlanValueWriteback {
+  unsigned nodeIdx = kNullId;
+  unsigned outputIdx = kNullId;
+  unsigned funcResultIdx = kNullId;
+  unsigned actionId = kNullId;
+  Value value;
+  LayoutChain layout;
+  std::optional<FlatStridedRegion> hbmRegion;
+};
+
 struct LayoutSignature {
   bool hasTranspose = false;
-  SmallVector<int64_t> permutation;
-  bool matches(const LayoutSignature &required) const;
+  SmallVector<int64_t, 4> permutation;
+
+  bool matches(LayoutSignature &required);
 };
 
-/// Data movement catalog: maps (srcBuffer, dstBuffer) -> identity DefineOps
-/// with layout signatures, enabling layout-aware instruction selection.
+struct PlanValue {
+  PlanValueKind kind = PlanValueKind::HBMInput;
+  Value value;
+  Value baseValue;
+  RankedTensorType type;
+  std::optional<unsigned> definingNodeIdx;
+  std::optional<unsigned> outputIdx;
+  ValueLifetime lifetime;
+  bool requiresMovement = false;
+  SmallVector<unsigned, 2> placementIds;
+  SmallVector<PlanValueUse, 4> uses;
+  SmallVector<PlanValueWriteback, 2> writebacks;
+};
+
+struct PlanOperandAccess {
+  SymbolicAccess access;
+  AccessRole role = AccessRole::Read;
+  std::optional<unsigned> inputValueId;
+  Value value;
+  LayoutChain layout;
+  unsigned sourceNodeId = kNullId;
+  unsigned sourcePatternNodeId = kNullId;
+  unsigned sourceResultId = kNullId;
+  std::optional<unsigned> placementId;
+  std::optional<FlatStridedRegion> hbmRegion;
+  std::optional<PhysicalRegion> scratchRegion;
+  bool forwarded = false;
+  bool requiresMovement = false;
+  bool requiresInit = false;
+  bool overCapacity = false;
+};
+
+struct PlanNode {
+  SemanticGraphNode *semanticNode = nullptr;
+  DefineOp instruction;
+  unsigned actionId = kNullId;
+  DenseMap<unsigned, int64_t> paramBindings;
+  SmallVector<PlanOperandAccess, 4> operands;
+  SmallVector<unsigned, 2> outputValueIds;
+};
+
+struct PlanActionAccess {
+  AccessRole role = AccessRole::Read;
+  unsigned nodeIdx = kNullId;
+  unsigned accessOperandIdx = kNullId;
+  unsigned valueId = kNullId;
+  std::optional<unsigned> placementId;
+  std::optional<PhysicalRegion> scratchRegion;
+  std::optional<FlatStridedRegion> hbmRegion;
+};
+
+struct PlanAction {
+  PlanActionKind kind = PlanActionKind::Compute;
+  unsigned nodeIdx = kNullId;
+  unsigned outputIdx = kNullId;
+  unsigned valueId = kNullId;
+  unsigned writebackIdx = kNullId;
+  SmallVector<PlanActionAccess, 4> accesses;
+};
+
+struct PlanMoveEndpoint {
+  bool isHBM = false;
+  bool isResult = false;
+  unsigned boundaryIdx = kNullId;
+  unsigned valueId = kNullId;
+  std::optional<FlatStridedRegion> hbmRegion;
+  std::optional<StaticSlice> hbmSlice;
+  std::optional<PhysicalRegion> scratchRegion;
+};
+
+struct PlanMoveNode {
+  DefineOp instruction;
+  DenseMap<unsigned, int64_t> paramBindings;
+  PlanMoveEndpoint src;
+  PlanMoveEndpoint dst;
+  LayoutSignature layout;
+  unsigned anchorActionId = kNullId;
+};
+
+struct PlanScheduleStep {
+  PlanScheduleKind kind = PlanScheduleKind::Compute;
+  unsigned nodeIdx = kNullId;
+};
+
 struct DataMovementCatalog {
   DenseMap<std::pair<StringAttr, StringAttr>,
-           SmallVector<std::pair<LayoutSignature, DefineOp>>>
+           SmallVector<std::pair<LayoutSignature, DefineOp>, 2>>
       entries;
 
   std::optional<DefineOp> lookup(StringAttr src, StringAttr dst,
-                                 const LayoutSignature &required = {}) const;
+                                 LayoutSignature required = {});
 };
 
-/// Scratchpad forwarding: skip HBM round-trip between consecutive nodes.
-struct ForwardingEdge {
-  unsigned producerNodeIdx;
-  unsigned producerDstOperandIdx;
-  unsigned consumerNodeIdx;
-  unsigned consumerSrcOperandIdx;
-  StringAttr bufferName;
+struct ExecutionPlan {
+  func::FuncOp func;
+  SmallVector<PlanNode, 4> nodes;
+  SmallVector<PlanMoveNode, 8> moveNodes;
+  SmallVector<PlanScheduleStep, 16> schedule;
+  SmallVector<PlanValue, 8> values;
+  SmallVector<PlanAction, 8> actions;
+  SmallVector<ValuePlacement, 8> placements;
+  DenseMap<Value, unsigned> externalValueIds;
+  StringAttr hbmBufferName;
+  int64_t hbmCapacity = 0;
+  int64_t hbmUsed = 0;
+  SmallVector<HBMAllocation, 4> hbmInputs;
+  SmallVector<HBMAllocation, 2> hbmResults;
+  DenseMap<Value, unsigned> hbmInputIds;
+  SmallVector<ScratchResource, 4> scratchResources;
+
+  void dump(llvm::raw_ostream &os);
 };
 
-struct InputMovementPlan {
-  unsigned nodeIdx;
-  unsigned srcOperandIdx;
-  unsigned hbmValueId;
-  LogicalTransformChain hbmTransforms;
-  SmallVector<MovementStep> steps;
-};
-
-struct AccumulatorInitPlan {
-  unsigned nodeIdx;
-  unsigned dstOperandIdx;
-  unsigned hbmValueId;
-  LogicalTransformChain hbmTransforms;
-  SmallVector<MovementStep> steps;
-};
-
-struct OutputMovementPlan {
-  unsigned nodeIdx;
-  unsigned dstOperandIdx;
-  unsigned hbmValueId;
-  LogicalTransformChain hbmTransforms;
-  SmallVector<MovementStep> steps;
-};
-
-/// Resource annotations derived from a logical plan.
-struct ResourcePlan {
-  StringAttr bufferName;
-  int64_t bufferSize = 0;
-  DenseMap<unsigned, TensorLayout> layouts;
-  int64_t totalAllocated = 0;
-
-  bool needsDataMovement = false;
-  SmallVector<SmallVector<OperandResidence>> operandResidences;
-  DataMovementCatalog dmCatalog;
-  SmallVector<ForwardingEdge> forwardingEdges;
-  SmallVector<InputMovementPlan, 2> inputMovements;
-  SmallVector<AccumulatorInitPlan, 1> accumulatorInits;
-  SmallVector<OutputMovementPlan, 1> outputMovements;
-
-  void dump() const;
-};
-
-FailureOr<LogicalPlan>
-buildLogicalPlan(func::FuncOp funcOp, const SemanticsGraph &graph,
-                 const GraphParamSolution &paramSolution);
-
-FailureOr<ResourcePlan> buildResourcePlan(func::FuncOp funcOp,
-                                          const LogicalPlan &plan,
-                                          ModuleOp module);
-
-LogicalTransformChain getRequiredTransforms(const LogicalPlan &plan,
-                                            unsigned valueId,
-                                            unsigned consumerNodeIdx,
-                                            unsigned consumerOperandIdx);
+FailureOr<ExecutionPlan> buildExecutionPlan(SemanticGraph &graph,
+                                            GraphParamSolution &solutions);
 
 } // namespace mlir::act
 
