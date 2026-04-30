@@ -73,7 +73,7 @@ Typically, the pass works as follows:
 
 The most important part of the pass is how to instantiate the compute region. The basic idea is leveraging `inferReturnTypes` or `ReifyRankedShapedTypeOpInterface` to infer the actual types for LinalgStructuredOps. For `arith.*` operations, it's quite trivial to infer the result type from the new operand types.
 
-The implementation is placed in `mlir/act/lib/Conversion/ConvertActToCanonicalForm.cpp`, and only `enableTensor` path is supported preliminarily. the path with `enableTensor=false` is not working yet (supporting it is in low priority)
+The implementation is placed in `mlir/lib/act/Conversion/ConvertActToCanonicalForm.cpp`, and only the `enableTensor` path is supported preliminarily. The path with `enableTensor=false` is not working currently (supporting it is low priority).
 
 ## Layer X+1: Lower to LLVM for simulation
 Lowering to LLVM is straightforward, through a predefined lowering pipeline.
@@ -90,7 +90,7 @@ The preferred direction is to extend the access pattern layer (Path B) — e.g.,
 
 An alternative (Path C) is a separate "transform" region between addr and compute, but this adds structural complexity and is likely premature until more operand mode patterns are known.
 
-This is deferred until instruction selection is actively being worked on, at which point the concrete set of needed sub-element modes will be clearer.
+This is not implemented in the current instruction selection path. It should be revisited only when concrete operand-mode workloads require it.
 
 ## Design Decision: Separation of Computation and Access Regions
 
@@ -172,161 +172,130 @@ act.define @matmul {
 
 The compute region is now purely `linalg.matmul`. The addr region encodes the full access-and-reshape pipeline.
 
-## Symbolic Address Expressions for Parameter Solving
+## Instruction Selection Implementation Overview
 
-> Implementation details and worked examples are in [stage2.md](stage2.md).
+> Current implementation details are split across [stage1.md](stage1.md),
+> [stage2.md](stage2.md), and [stage3.md](stage3.md). This section is the
+> top-level map of the implemented pipeline in `mlir/lib/act/Support`.
 
-### Problem statement
+### Goal and scope
 
-Given a semantic match between a source op and an instruction (Stage 1), Stage 2 must determine the instruction's address parameters that make the source tensor shapes fit. For example, if the source has `linalg.matmul ins(tensor<10x20xf32>, tensor<20x30xf32>)` and the instruction `@matmul` has addr parameter `%size` controlling the computation shape, we need to solve for `%size`.
+The instruction selection pass lowers a flat tensor-level `func.func` into an
+`act.sequence` containing concrete `act.emit` instructions. It is implemented by
+`ConvertCanonicalFormToAct.cpp`, with the stage-specific logic factored into:
 
-With boundary transforms moved to the addr region, each addr operand's access chain produces a **symbolic shape expression** — a function from addr parameters to the tensor shape that the compute region will see. Solving for parameters reduces to equating this symbolic shape with the source tensor shape.
+- `SemanticMatching.cpp`: build source and instruction semantic graphs, then
+  select a complete instruction covering.
+- `SymbolicExpr.cpp` and `ParamSolving.cpp`: derive symbolic access models from
+  instruction addr regions and solve shape-controlled addr parameters.
+- `Planning.cpp`: build an execution plan, allocate HBM/scratch resources, insert
+  data movement, and produce a flat schedule.
+- `CodeEmission.cpp`: emit the scheduled `act.emit` ops into a new
+  `act.sequence`.
 
-### Compositional address expression generation
+Current backend contract:
 
-Each access pattern op and relayout op in the addr region implements a method:
+- The input function must have exactly one block, no control flow, and no symbol
+  users. The pass rejects `LoopLikeOpInterface`, branch, and region-branch ops.
+- Tensor boundary shapes must be ranked and static.
+- The backend does not tile and does not generate loops. Inputs must already be
+  shaped so every selected instruction invocation fits exactly.
+- Addr params are emitted as static integer attributes. Dynamic offsets and extra
+  compute params are not implemented in the current code emission path.
+- `act.tiled` symbolic shape/storage extraction is not supported in the current
+  implementation.
 
-```
-generateAddressExpr(currentExpr) -> newExpr
-```
+### Pass pipeline
 
-that composes its contribution onto the current symbolic expression. The expression is built by walking the addr region's SSA chain from base access to yield:
+The pass invoked by `-convert-canonical-form-to-act` runs as follows:
 
-1. **`act.strided basis(b) counts(c) strides(s)`** initializes the expression:
-   - Symbolic shape: `[c]` (1D, `c` may be a symbolic expression of addr params)
-   - Address mapping: element `i` maps to buffer offset `b + i * s`
+1. Optionally parse and inline an external ISA module when `isa-path` is set.
+2. Normalize the input module with `linalg-morph-ops` (`genericToNamed`),
+   `canonicalize`, and `cse`.
+3. Build an `InstructionCollection` from all non-identity `act.define`
+   instructions in the module. Identity instructions are ignored by semantic
+   matching and are used later as data movement candidates.
+4. For each `func.func`, validate the flat-function contract.
+5. Run Stage 1 to build a `SemanticGraph`: source semantic ops are covered by
+   selected instruction graphs, and boundary values are bound to instruction
+   access operands.
+6. Run Stage 2 to build an `InstructionParamModel` for each selected
+   instruction and solve shape parameters from the matched source tensor shapes.
+7. Run Stage 3 planning to assign HBM regions, scratch placements, forwarding,
+   load/store moves, and a final schedule.
+8. Emit a new `act.sequence @func_name` and erase the original `func.func`.
 
-2. **`act.expand_shape %tok [[0, 1]] output_shape [d0, d1]`** refines dimensionality:
-   - Input shape `[c]` → output shape `[d0, d1]` where `d0 * d1 = c`
-   - Address mapping preserved (row-major linearization)
-   - `d0`, `d1` may be symbolic (addr params or derived expressions)
+### Stage 1: semantic matching
 
-3. **`act.collapse_shape %tok [[0, 1]]`** reduces dimensionality:
-   - Input shape `[d0, d1]` → output shape `[d0 * d1]`
+Stage 1 treats computation and layout separately. Primitive semantic ops become
+graph nodes. Layout and placeholder ops are not selected directly; they are
+traced as `LayoutChain` metadata on graph edges so later stages know which
+source boundary value and static slice feed an instruction operand.
 
-4. **`act.transpose %tok permutation = [1, 0]`** reorders dimensions:
-   - Input shape `[d0, d1]` → output shape `[d1, d0]`
-   - Address mapping reordered accordingly
+The current primitive semantic set is:
 
-The final symbolic shape at the yield point is what the compute region will see.
+- `linalg.generic`, `linalg.softmax`, `linalg.map`, `linalg.reduce`,
+  `linalg.contract`
+- `linalg.add`, `linalg.matmul`
 
-### Solving for parameters
+An `InstructionGraph` is built from each instruction compute region using the
+same node/edge representation as the source `ProgramGraph`. Matching uses an
+anchor node selected by graph degree, a hash-based lookup on the anchor semantic
+identity, and backtracking subgraph matching with induced-exact internal edges.
+The selected candidates must cover every primitive source semantic op; partial
+lowering is rejected.
 
-Given:
-- Source operand shape (concrete, e.g., `[10, 20]`)
-- Symbolic shape expression from addr chain (e.g., `[%size, %size]`)
+### Stage 2: parameter solving
 
-Set up equations: `%size = 10` and `%size = 20`. If consistent, we have a direct solution. If inconsistent (as here), it means the instruction cannot cover the full source in one invocation — tiling is needed.
+Stage 2 is exact shape fitting, not tiling. For each selected instruction, the
+addr region is converted into symbolic access models:
 
-The solver proceeds as:
-1. **Collect constraints.** For each operand of the matched instruction, equate the symbolic shape with the source shape dimension-by-dimension. This yields a system of equalities over addr params.
-2. **Solve the constraint system.** For simple cases (one param constrained to a constant), this is direct substitution. For overconstrained systems, identify the maximal consistent assignment — the remaining dimensions require tiling.
-3. **Compute tiling factors.** For each dimension where `source_dim > native_dim(params)`, the tiling factor is `ceil(source_dim / native_dim)`. Dimensions where `source_dim` is not divisible by `native_dim` are flagged for padding analysis.
+- `visibleShape`: what the compute region sees for each source/destination
+  operand.
+- `storage`: the underlying strided basis/count/stride region used for resource
+  planning.
+- `paramKinds`: addr block arguments classified as `Shape`, `Offset`, or
+  `Mixed`.
 
-### Feasibility argument
+Symbolic expressions support constants, addr params, `arith.addi`, and
+`arith.muli`. `act.strided`, `act.expand_shape`, `act.collapse_shape`, and
+`act.transpose` have shape semantics; relayout ops preserve the underlying
+storage region for allocation. Every access operand must receive a static source
+shape constraint from Stage 1 bindings. Constants must match exactly; params are
+bound to the concrete source dimension; simple add/mul expressions can be solved
+when one side is already known. Inconsistent or unsupported constraints reject
+the match.
 
-The symbolic expressions involved are restricted to:
-- **Integer affine expressions** over addr parameters (from `arith.muli`, `arith.addi` in the addr region)
-- **Reshape constraints** (`d0 * d1 = c`, from expand/collapse)
-- **Permutations** (from transpose, which only reorder dimensions)
+### Stage 3: planning and code emission
 
-This means the constraint system is a set of **integer polynomial equations of low degree** (typically degree 1-2, since reshape introduces at most one multiplication). For the vast majority of real instructions:
-- Most addr parameters control base addresses (offsets), not shapes — they don't appear in shape expressions at all.
-- Shape-controlling parameters are few (0-2 per instruction in all ISAs examined).
-- The equations are small: one equation per dimension per operand.
+Stage 3 converts the semantic graph plus parameter solutions into concrete
+emission:
 
-Concretely, for all instructions in tpu.mlir and qkv.mlir:
-- `@vadd`, `@vmul`, `@vsub`, `@vrelu`, `@vload`, `@vstore`: 0 shape params, fixed shapes. Solving = checking divisibility.
-- `@matmul`: 1 shape param (`%size`), all operand shapes are `[%size, %size]`. Solving = one variable, multiple constraints.
-- `@gemm`: 0 shape params, fixed `64x64`. Solving = checking divisibility.
-- `@softmax`, `@load_rm`, `@load_cm`, `@store_rm`, `@mov`: 1 shape param (`%size`), one dynamic dim. Solving = one variable.
+1. Create `PlanNode`s and logical values from selected semantic nodes.
+2. Allocate one flat HBM address space for tensor function args/results using the
+   single declared `!act.hbm` buffer.
+3. Allocate non-HBM scratch resources for instruction operands. Current scratch
+   allocation supports one-dimensional, unit-stride on-chip storage regions.
+4. Track lifetimes and reuse placements when safe. Producer-to-consumer scratch
+   forwarding is detected before inserting data movement.
+5. Build a data movement catalog from identity `act.define` ops with one source
+   and one destination. Layout signatures currently record transposes.
+6. Insert required load, scratch-to-scratch, store, or one-hop store moves around
+   compute actions.
+7. Emit a flat `act.sequence` schedule. Each schedule step becomes one
+   `act.emit @instruction addr(...) compute()` with static dense integer attrs.
 
-Even for hypothetical instructions with 3-4 shape params, the system remains small enough for direct solving or bounded enumeration. The search space is at most `O(product of valid values per param)`, which for integer divisors of typical tensor dimensions is negligible.
+### Current limitations and possible extensions
 
-This compositional, symbolic approach avoids the need for brute-force search over the full address parameter space, and it leverages the structured nature of the addr region (a chain of well-defined ops with known symbolic semantics) to make parameter solving tractable and general.
+These are unsupported by the current implementation. They are not committed
+roadmap items; each one should be evaluated only if a concrete workload needs it.
 
-## Layer X+2: Instruction selection and code emission [RESEARCHING]
-
-### Background
-The original ACT (ACT.pdf) uses equality saturation over XLA-HLO tensor computation graphs:
-1. E-graph initializer builds from the input tensor computation graph
-2. Rewrite applier applies IR-to-IR rewrites (XLA foundational axioms) and IR-to-ISA rewrites (auto-generated from ISA description)
-3. Graph extractor extracts optimal pi graphs (partially instantiated instructions) via compile-time constant detection
-4. Phase 2 handles memory allocation via integer constraint programming
-
-Limitations (draft.pdf) already partially addressed by our MLIR design:
-- Stateless model → we have `act.state`, `act.desc`
-- Uniform tensor-buffer memory → we have typed heterogeneous resources
-- String-based XLA-HLO semantics → we have typed, verifiable MLIR compute regions
-
-### Key observation
-Our `act.define` cleanly separates "what computation" (compute region) from "how to access buffers" (addr region). Instruction selection can exploit this structure — match semantics and fit access patterns as two decoupled subproblems, rather than searching a flat space.
-
-### Candidate approaches
-
-**Idea 1: Inverse lowering (derive match patterns from `act.define`)**
-Since `ConvertActToCanonicalForm` lowers `act.define` → canonical MLIR, instruction selection is the inverse. For each instruction, lower its compute region to get a canonical "semantic fingerprint" (e.g., linalg.generic with specific indexing maps + body). Then match these fingerprints against the source computation graph. Patterns are derived automatically — no manual pattern writing. Soundness is structural.
-
-**Idea 2: Two-level selection (semantic match + access pattern fitting)**
-Level 1 — semantic matching: operate at linalg level, match source subgraphs against compute region patterns, abstracting over shapes. Determines "which instruction covers which computation."
-Level 2 — access pattern fitting: given a matched instruction, determine how to tile source data into instruction-sized chunks. The addr region's access patterns constrain valid tilings. This is a constraint problem: find addr params and tiling factors that cover the full computation. Mirrors ACT's Phase 1 / Phase 2 split but exploits the structured `act.define` representation.
-
-**Idea 3: E-graphs on linalg (adapt equality saturation to MLIR)**
-E-graph nodes = linalg ops + tensor ops. IR-to-IR rewrites = linalg algebraic identities (associativity of contraction, fusion/fission of generic, tiling identities, layout transform equivalences). IR-to-ISA rewrites = auto-generated from `act.define` compute regions. Key advantage over original ACT: linalg ops have indexing maps and iterator types that structurally encode semantics — two linalg.generic ops with the same maps/iterators/body are equivalent regardless of shape. More robust than XLA-HLO string matching. Tools: egg/egglog, or custom MLIR-native e-graph.
-
-**Idea 4: State and configuration as ordering constraints**
-Configuration instructions (`act.state.write`, `act.desc.write`) are not matched against the computation graph — they're inserted based on what compute instructions require. Each `act.define` can declare state preconditions. The selector treats state-setting as scheduling constraints. Modeled as a configuration planner that runs after semantic matching.
-
-**Idea 5: Progressive refinement (pragmatic MVP path)**
-- Stage A: 1:1 named op matching (`linalg.contract` → `@gemm`, etc.). No tiling, works when source ops match instruction granularity.
-- Stage B: Add tiling. When source shapes exceed instruction capacity, introduce `scf.for` loops around `act.emit`. Use `verifyCompatibility` to determine valid tile sizes. Leverage MLIR's tiling infrastructure.
-- Stage C: Multi-instruction fusion. Recognize `gemm` + `relu` → `gemm_relu` if such instruction exists. Greedy largest-pattern-first.
-- Stage D: Equality saturation for optimality (Idea 3), only where needed.
-
-### Open design decisions
-1. **Matching IR level**: linalg named ops (easy but limited) vs. linalg generic (universal but harder). Suggested: match named ops first, fall back to generic.
-2. **Parametric matching**: semantic patterns should be shape-polymorphic. Two `linalg.contract` ops match if indexing maps and body match, regardless of tensor shapes. Shapes determine addr params.
-3. **Tiling strategy**: ACT uses identity instructions (slice/concat) — elegant but large search space. Alternative: use MLIR's tiling infrastructure (`scf.for`/`scf.forall`) explicitly, decouple tiling from instruction selection. Select instructions assuming infinite hardware, then tile to fit.
-4. **Layout transforms**: `tensor.collapse_shape`/`expand_shape`/`linalg.transpose` in compute regions already express these. Layout ops in the source graph should match layout ops in instruction patterns.
-5. **Pass placement**: runs before `ConvertActToCanonicalForm`. Input = canonical MLIR + `act.define` library. Output = `act.emit` calls + tiling loops + state/descriptor config. Then `ConvertActToCanonicalForm` lowers for simulation.
-
-### Pipeline overview [Version 2]
-
-Design principles:
-- Semantics matching and parameter solving are decoupled into separate stages.
-- **Tiling is a midend concern, not a backend concern.** The backend assumes input programs are already well-tiled. Each linalg op at the point of instruction selection must have shapes that fit within some instruction's native capacity.
-- Progressive: each stage produces valid (possibly incomplete) output. The compiler can stop early and report what it matched and where it got stuck.
-- No e-graphs. Algebraic rewrites (if needed) are applied as explicit MLIR canonicalization passes before instruction selection, not during it.
-- The backend operates **per-region** — when the source IR contains affine loop nests (from midend tiling), instruction selection runs inside each innermost loop body independently.
-
-#### Input
-- A computation graph in canonical MLIR (linalg/tensor ops on ranked tensors), contained in `func.func` ops. If the program requires tiling, it should already contain affine loop nests with appropriately sized linalg ops inside.
-- An instruction library: a set of `act.define` ops (with `act.buffer`/`act.desc`/`act.state` declarations) describing the target accelerator's ISA.
-
-#### Stage 1: Semantic matching
-
-See [stage1.md](stage1.md) for the detailed design.
-
-Summary: extract semantic fingerprints from instruction compute regions, specialize source `linalg.generic` ops to named ops via `specialize-generic-ops` pre-pass, then match by op name (common case) or structural comparison of `linalg.generic` bodies (fallback). Multi-op fused patterns matched by subgraph isomorphism, prioritized over single-op matches. After the compute/access separation, boundary stripping is repurposed as a **validation pass** — it detects and warns about layout ops that should have been placed in the addr region, rather than being used to extract fingerprints.
-
-#### Stage 2: Parameter solving
-
-See [stage2.md](stage2.md) for the detailed design.
-
-Summary: Build symbolic shape expressions from the addr region's access chain via a `generateShapeExpr` free function on each access pattern op. The symbolic framework (`SymExpr` tree) represents integer expressions over addr parameters — supporting constants, params, add, and mul. Map symbolic shapes to iteration domain bounds (via linalg indexing maps), compare against the source iteration domain, and solve constraints to determine shape parameter values. If any dimension doesn't match (source exceeds instruction capacity), the match is **rejected** — the midend should have tiled it. Classify addr params into shape params (solved by constraint solving) and offset params (derived from source IR during emission). No tiling factors are computed; no loops are generated.
-
-#### Stage 3: Code emission
-
-See [stage3.md](stage3.md) for the detailed design.
-
-Summary: Three phases — (3a) logical planning: build a `LogicalPlan` from the semantics graph and param solutions, wiring inter-node dataflow and transform chains; (3b) resource planning: assign HBM regions for source tensors (live range analysis + greedy allocation), allocate scratchpad buffer slots for instruction operands, build a data movement catalog from identity instructions, detect forwarding opportunities; (3c) code emission: emit `act.emit` calls with addr params computed from solved shape params and source-IR offset information. For multi-buffer instructions, emit load/store sequences around compute. Offsets are either static (from HBM layout) or dynamic (traced from source IR using `AffineValueMapBuilder`, which composes SSA chains into affine maps). Source functions are rewritten to operate on buffers (no tensor args/returns). No tiling loops are generated by the backend.
-
-#### Stage 4 (future): Optimization
-
-Not part of the MVP. Potential extensions:
-- **Scheduling**: reorder instructions for better data reuse (e.g., double buffering, software pipelining). This is a separate pass operating on the `act.emit` IR.
-- **Algebraic rewrites**: apply a small set of targeted rewrites before Stage 1 (e.g., fuse adjacent elementwise ops, reassociate reductions). These are standard MLIR canonicalization passes, not e-graph exploration.
-
-#### Input validation (potential improvement)
-
-A diagnostic pass that checks whether each linalg op in the input program can be covered by some instruction in the ISA, without transforming the IR. Would run as an optional early check before the full pipeline, reporting which ops have no valid match and why (shape mismatch, no matching fingerprint, unsupported constraint form). This gives users actionable feedback about what their midend tiling pass needs to produce.
+- Region-local lowering inside loop bodies, control-flow-aware selection, or
+  dynamic affine offset emission.
+- Backend tiling or padding. The current design keeps tiling/padding outside the
+  backend: the input should already be shaped for exact instruction fits.
+- Extra compute params and dynamic addr SSA operands in `act.emit`.
+- More complete primitive semantic op coverage and transform-chain comparison
+  during graph matching.
+- Diagnostics that report all failed candidate reasons instead of failing at the
+  first unsupported shape, layout, or movement case.
