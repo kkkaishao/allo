@@ -4,6 +4,9 @@
 
 from typing import TYPE_CHECKING
 import importlib
+import sys
+
+from . import _liballo
 
 __all__ = [
     "ir",
@@ -18,24 +21,26 @@ __all__ = [
     "tensor",
     "memref",
     "linalg",
+    "allo",
+    "passes",
     "transform",
 ]
 
-_LAZY_SUBMODULES = frozenset(
-    {
-        "utils",
-        "arith",
-        "math",
-        "scf",
-        "cf",
-        "ub",
-        "func",
-        "affine",
-        "tensor",
-        "memref",
-        "linalg",
-        "transform",
-    }
+_EAGER_SUBMODULES = (
+    "ir",
+    "utils",
+    "arith",
+    "math",
+    "scf",
+    "cf",
+    "ub",
+    "func",
+    "affine",
+    "tensor",
+    "memref",
+    "linalg",
+    "allo",
+    "passes",
 )
 
 if TYPE_CHECKING:
@@ -52,15 +57,20 @@ if TYPE_CHECKING:
         tensor,
         memref,
         linalg,
+        allo,
+        passes,
         transform,
     )
 else:
-    ir = importlib.import_module(".ir", __name__)
+    for _name in _EAGER_SUBMODULES:
+        _mod = getattr(_liballo, _name)
+        globals()[_name] = _mod
+        sys.modules[f"{__name__}.{_name}"] = _mod
+    del _mod
+    del _name
 
     def __getattr__(name: str):
-        if name == "ir":
-            return ir
-        if name in _LAZY_SUBMODULES:
+        if name == "transform":
             mod = importlib.import_module(f".{name}", __name__)
             globals()[name] = mod
             return mod

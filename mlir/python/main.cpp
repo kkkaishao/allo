@@ -27,7 +27,6 @@ static constexpr SubmoduleDesc kSubmodules[] = {
     {"memref", bindMemRefOps, "memref dialect"},
     {"linalg", bindLinalgOps, "linalg dialect"},
     {"transform", bindTransform, "transform dialect"},
-    {"ub", bindUBOps, "ub dialect"},
     {"allo", bindAlloOps, "allo dialect"},
     {"passes", bindPasses, "compiler passes"},
 };
@@ -43,6 +42,27 @@ static nb::module_ ensureIRLoaded(nb::module_ &parent) {
   return nb::borrow<nb::module_>(parent.attr("ir"));
 }
 
+static bool isLazySubmodule(std::string_view name) {
+  return name == "transform";
+}
+
+static nb::object ensureSubmoduleLoaded(nb::module_ &parent, size_t index) {
+  const auto &d = kSubmodules[index];
+  std::call_once(loadSubmoduleOnce[index], [&] {
+    auto sm = parent.def_submodule(d.name.data(), d.doc);
+    d.init(sm);
+  });
+  return nb::borrow<nb::object>(parent.attr(d.name.data()));
+}
+
+static void loadEagerSubmodules(nb::module_ &parent) {
+  ensureIRLoaded(parent);
+  for (size_t i = 0; i < std::size(kSubmodules); ++i) {
+    if (!isLazySubmodule(kSubmodules[i].name))
+      ensureSubmoduleLoaded(parent, i);
+  }
+}
+
 static nb::object loadSubmodule(nb::module_ &parent, std::string_view target) {
   ensureIRLoaded(parent);
 
@@ -51,12 +71,7 @@ static nb::object loadSubmodule(nb::module_ &parent, std::string_view target) {
     if (d.name != target)
       continue;
 
-    std::call_once(loadSubmoduleOnce[i], [&] {
-      auto sm = parent.def_submodule(d.name.data(), d.doc);
-      d.init(sm);
-    });
-
-    return nb::borrow<nb::object>(parent.attr(d.name.data()));
+    return ensureSubmoduleLoaded(parent, i);
   }
 
   throw nb::attribute_error("unknown submodule");
@@ -66,10 +81,10 @@ NB_MODULE(_liballo, m) {
   m.doc() = "Python bindings to the C++ Allo API";
   llvm::sys::PrintStackTraceOnErrorSignal("_liballo");
 
-  ensureIRLoaded(m);
+  loadEagerSubmodules(m);
 
   m.def("_load_submodule", [](std::string_view name) {
-    auto parent = nb::module_::import_("allo.experimental._C._liballo");
+    auto parent = nb::module_::import_("allo.exp._C._liballo");
     return loadSubmodule(parent, name);
   });
 }

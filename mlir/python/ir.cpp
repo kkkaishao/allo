@@ -410,11 +410,13 @@ static void bindCoreIR(nb::module_ &m) {
            })
       .def("erase", &OpState::erase);
 
-  auto moduleOp = bindOp<ModuleOp>(m, "ModuleOp");
-  bindConstructor(moduleOp,
-                  [](AlloOpBuilder &builder) {
-                    return ModuleOp::create(builder.getLocation());
-                  })
+  nb::class_<ModuleOp, OpState>(m, "ModuleOp")
+      .def(
+          "__init__",
+          [](ModuleOp &self, AlloOpBuilder &builder) {
+            self = ModuleOp::create(builder.getLocation());
+          },
+          nb::arg("builder"))
       .def(
           "get_body", [](ModuleOp &self) { return self.getBody(); },
           nb::rv_policy::reference)

@@ -11,7 +11,7 @@ nanobind_add_module(_liballo
     passes.cpp
 )
 
-set(NANOBIND_OUTPUT_DIR "${PROJECT_SOURCE_DIR}/../allo/experimental/_C")
+set(NANOBIND_OUTPUT_DIR "${PROJECT_SOURCE_DIR}/../allo/exp/_C")
 
 # turn off -Wcast-qual for nanobind
 target_compile_options(nanobind-static
