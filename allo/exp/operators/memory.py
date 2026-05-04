@@ -4,15 +4,16 @@
 from ..lang.operator import operator
 from ..lang.core import DType, AlloValue, ShapedType, u1
 from ..compiler.builder import AlloOpBuilder
+from .utils import operator_body_unreachable
 
 
 @operator
 def load(lhs, slices):
-    pass
+    operator_body_unreachable()
 
 
 @load.build
-def _load_build(builder: AlloOpBuilder, lhs: AlloValue, slices: slice | tuple):
+def _(builder: AlloOpBuilder, lhs: AlloValue, slices: slice | tuple):
     if isinstance(slices, tuple):
         indices = builder.normalize_indices(slices)
         if isinstance(lhs.type, ShapedType):
@@ -38,13 +39,11 @@ def _load_build(builder: AlloOpBuilder, lhs: AlloValue, slices: slice | tuple):
 
 @operator
 def store(dst, slices, value):
-    pass
+    operator_body_unreachable()
 
 
 @store.build
-def _store_build(
-    builder: AlloOpBuilder, dst: AlloValue, slices: slice | tuple, value: AlloValue
-):
+def _(builder: AlloOpBuilder, dst: AlloValue, slices: slice | tuple, value: AlloValue):
     if isinstance(slices, tuple):
         indices = builder.normalize_indices(slices)
         if isinstance(dst.type, ShapedType):

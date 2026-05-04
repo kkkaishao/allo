@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import inspect
 
+from typing import NoReturn
 from ..compiler.builder import AlloOpBuilder, CmpPred
 from ..lang.core import AlloValue, ConstexprValue
 
@@ -130,3 +131,7 @@ def lower_unary_op(
     if extra_kwargs is not None:
         kwargs.update(extra_kwargs)
     return _invoke_with_supported_kwargs(create_fn, operand, **kwargs)
+
+
+def operator_body_unreachable() -> NoReturn:
+    raise RuntimeError("Allo operator declarations are not directly executed.")
