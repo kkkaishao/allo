@@ -350,6 +350,13 @@ def _special_function_rule(include_index: bool = False) -> TypingRule:
     return TypingRule(int_rules, uint_rules, index_rules, float_rules)
 
 
+def _abs_rule() -> TypingRule:
+    int_rules = {(_SignedInt,): lambda dtype: dtype}
+    uint_rules = {(_UnsignedInt,): lambda dtype: dtype}
+    float_rules = {(APFloat,): lambda dtype: dtype}
+    return TypingRule(int_rules, uint_rules, float_rules)
+
+
 _SPECIAL_FUNCTIONS = (
     "sin",
     "cos",
@@ -357,10 +364,14 @@ _SPECIAL_FUNCTIONS = (
     "exp",
     "exp2",
     "log",
+    "log2",
     "sqrt",
-    "reciprocal",
     "rsqrt",
+    "reciprocal",
     "square",
+    "floor",
+    "ceil",
+    "erf",
 )
 
 
@@ -387,6 +398,7 @@ def _make_hls_type_rules() -> TypeRuleTable:
     table.register(("logical_and", "logical_or"), _logical_binary_rule(True))
     table.register("logical_not", _logical_not_rule())
     table.register(_SPECIAL_FUNCTIONS, _special_function_rule(False))
+    table.register("abs", _abs_rule())
     table.register(
         ("max", "min"),
         _common_numeric_rule(select_hls_common_int_type, commutative=True),
@@ -415,6 +427,7 @@ def _make_cpp_type_rules() -> TypeRuleTable:
     table.register(("logical_and", "logical_or"), _logical_binary_rule(True))
     table.register("logical_not", _logical_not_rule())
     table.register(_SPECIAL_FUNCTIONS, _special_function_rule(True))
+    table.register("abs", _abs_rule())
     table.register(
         ("max", "min"),
         _common_numeric_rule(select_cpp_common_int_type, commutative=True),

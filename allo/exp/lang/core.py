@@ -284,7 +284,8 @@ class TensorType(ShapedType):
     """
 
     def __init__(self, shape: Sequence[int], dtype: DType):
-        name = f"tensor<{'x'.join(map(str, shape))}x{dtype.name}>"
+        prefix = "x".join(map(str, shape))
+        name = f"tensor<{prefix + 'x' if prefix else ''}{dtype.name}>"
         super().__init__(name, shape, dtype)
 
     def materialize(self, context: Context, /) -> Type:
@@ -300,7 +301,8 @@ class BufferType(ShapedType):
     """
 
     def __init__(self, shape: Sequence[int], dtype: DType):
-        name = f"memref<{'x'.join(map(str, shape))}x{dtype.name}>"
+        prefix = "x".join(map(str, shape))
+        name = f"memref<{prefix + 'x' if prefix else ''}{dtype.name}>"
         super().__init__(name, shape, dtype)
 
     def materialize(self, context: Context, /) -> Type:

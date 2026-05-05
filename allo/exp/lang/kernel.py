@@ -26,15 +26,13 @@ T = TypeVar("T")
 def _parse_shape_dims(content: str) -> list[int]:
     raw = content.strip()
     if raw == "":
-        raise TypeError(f"Unsupported type annotation: [{content}]")
+        return []
     dims = []
     for tok in raw.split(","):
         tok = tok.strip()
         if not re.fullmatch(r"\d+", tok):
             raise TypeError(f"Unsupported type annotation: [{content}]")
         dims.append(int(tok))
-    if len(dims) == 0:
-        raise TypeError(f"Unsupported type annotation: [{content}]")
     return dims
 
 

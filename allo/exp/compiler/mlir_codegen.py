@@ -578,6 +578,15 @@ class MLIRCodeGenerator(ast.NodeVisitor):
                 f"Binary operator '{op_name}' expects runtime values to be AlloValues"
             )
 
+        if isinstance(lhs.type, ShapedType) or isinstance(rhs.type, ShapedType):
+            if op_name == "add":
+                return self.call_operator(arith_ops.add, [lhs, rhs])
+            if op_name == "sub":
+                return self.call_operator(arith_ops.sub, [lhs, rhs])
+            if op_name == "mul":
+                return self.call_operator(arith_ops.mul, [lhs, rhs])
+            assert False, f"Unsupported direct binary operator: {op_name}"
+
         lhs, rhs = self._prepare_binary_operands(lhs, rhs, op_name)
         floating = lhs.dtype.is_float()
         if op_name == "add":
@@ -648,18 +657,6 @@ class MLIRCodeGenerator(ast.NodeVisitor):
                 materialized.append(term)
         return materialized
 
-    def _lower_neg_value(self, value):
-        if isinstance(value, ConstexprValue):
-            return ConstexprValue(-value.value)
-        if not isinstance(value, AlloValue):
-            return self.compile_error(
-                "Unary negation expects a constexpr or runtime AlloValue"
-            )
-
-        dst_ty = self.builder.get_promoted_dtype_nary("neg", [value.dtype])
-        value = self.builder.cast_to_dtype(value, dst_ty)
-        return self.builder.create_neg(value, floating=value.dtype.is_float())
-
     def _lower_nary_add_sub(self, node: ast.BinOp):
         signed_terms = []
         self._collect_add_sub_terms(node, sign=1, out=signed_terms)
@@ -690,16 +687,26 @@ class MLIRCodeGenerator(ast.NodeVisitor):
                 return self.builder.create_sub_nary(casted, signs, floating=floating)
             return self.builder.create_add_nary(casted, floating=floating)
 
-        normalized = []
+        if all(sign > 0 for sign in signs):
+            return self.builder.reduce_balanced(
+                values,
+                lambda lhs, rhs: self.call_operator(arith_ops.add, [lhs, rhs]),
+            )
+
+        result = None
         for value, sign in zip(values, signs):
-            if sign < 0:
-                normalized.append(self._lower_neg_value(value))
+            if result is None:
+                result = (
+                    value
+                    if sign > 0
+                    else self.call_operator(arith_ops.sub, [ConstexprValue(0), value])
+                )
+            elif sign > 0:
+                result = self.call_operator(arith_ops.add, [result, value])
             else:
-                normalized.append(value)
-        return self.builder.reduce_balanced(
-            normalized,
-            lambda lhs, rhs: self._lower_direct_binary("add", lhs, rhs),
-        )
+                result = self.call_operator(arith_ops.sub, [result, value])
+        assert result is not None
+        return result
 
     def _lower_nary_mul(self, node: ast.BinOp):
         terms = []
@@ -725,7 +732,7 @@ class MLIRCodeGenerator(ast.NodeVisitor):
 
         return self.builder.reduce_balanced(
             terms,
-            lambda lhs, rhs: self._lower_direct_binary("mul", lhs, rhs),
+            lambda lhs, rhs: self.call_operator(arith_ops.mul, [lhs, rhs]),
         )
 
     def visit_BinOp(self, node):
