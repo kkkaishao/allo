@@ -1210,6 +1210,40 @@ class MLIRCodeGenerator(ast.NodeVisitor):
         assert ctx is None
         return tuple([self.visit(e) for e in node.elts])
 
+    def _flatten_list_initializer(self, node: ast.AST):
+        if isinstance(node, ast.List):
+            values = []
+            shapes = []
+            for elt in node.elts:
+                shape, flat_values = self._flatten_list_initializer(elt)
+                shapes.append(shape)
+                values.extend(flat_values)
+            if len(shapes) == 0:
+                return (0,), values
+            first_shape = shapes[0]
+            if any(shape != first_shape for shape in shapes):
+                return self.compile_error(
+                    f"Ragged list initializer '{ast.unparse(node)}' is not supported."
+                )
+            return (len(node.elts), *first_shape), values
+
+        value = unwrap_if_constexpr(self.visit(node))
+        if type(value) not in (builtins.int, builtins.float):
+            return self.compile_error(
+                f"List initializer elements must be compile-time int or float constants, got '{ast.unparse(node)}'."
+            )
+        return (), [value]
+
+    def _visit_shaped_list_initializer(
+        self, node: ast.List, dst_type: ShapedType, name: str
+    ):
+        shape, values = self._flatten_list_initializer(node)
+        if tuple(shape) != tuple(dst_type.shape):
+            return self.compile_error(
+                f"List initializer shape mismatch for '{name}': expected {tuple(dst_type.shape)}, got {shape}."
+            )
+        return self.builder.make_shaped_constant(values, dst_type, name)
+
     def visit_AugAssign(self, node: ast.AugAssign):
         lhs = copy.deepcopy(node.target)
         lhs.ctx = ast.Load()
@@ -1297,6 +1331,14 @@ class MLIRCodeGenerator(ast.NodeVisitor):
             return self.compile_error(
                 f"Annotated variable '{node.target.id}' must have an initializer."
             )
+
+        if isinstance(parsed_type, ShapedType) and isinstance(node.value, ast.List):
+            with self._name_loc_prefix(node.target.id):
+                value = self._visit_shaped_list_initializer(
+                    node.value, parsed_type, node.target.id
+                )
+            self._set_value_with_loc(node.target.id, value)
+            return
 
         with self._name_loc_prefix(node.target.id):
             value = self.visit(node.value)

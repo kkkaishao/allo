@@ -82,8 +82,8 @@ void bindTransform(nb::module_ &m) {
   nb::class_<transform::AnnotateOp, OpState>(m, "AnnotateOp")
       .def(
           "__init__",
-          [](transform::AnnotateOp &self, AlloOpBuilder &builder,
-             Value &target, std::string_view name, Attribute value) {
+          [](transform::AnnotateOp &self, AlloOpBuilder &builder, Value &target,
+             std::string_view name, Attribute value) {
             auto anyParam = transform::AnyParamType::get(builder.getContext());
             auto param = transform::ParamConstantOp::create(
                 builder, builder.getLocation(), anyParam, value);
@@ -175,8 +175,8 @@ void bindTransform(nb::module_ &m) {
           },
           nb::arg("builder"));
 
-  nb::class_<transform::ApplyLoopInvariantCodeMotionOp, OpState>(
-      m, "ApplyLICMOp")
+  nb::class_<transform::ApplyLoopInvariantCodeMotionOp, OpState>(m,
+                                                                 "ApplyLICMOp")
       .def(
           "__init__",
           [](transform::ApplyLoopInvariantCodeMotionOp &self,
@@ -200,8 +200,8 @@ void bindTransform(nb::module_ &m) {
           [](transform::ApplyPatternsOp &self) { return self.getBody(); },
           nb::rv_policy::reference);
 
-  nb::class_<transform::ApplyRegisteredPassOp, OpState>(
-      m, "ApplyRegisteredPassOp")
+  nb::class_<transform::ApplyRegisteredPassOp, OpState>(m,
+                                                        "ApplyRegisteredPassOp")
       .def(
           "__init__",
           [](transform::ApplyRegisteredPassOp &self, AlloOpBuilder &builder,
@@ -372,10 +372,10 @@ void bindTransform(nb::module_ &m) {
   nb::class_<transform::LoopTileOp, OpState>(m, "LoopTileOp")
       .def(
           "__init__",
-          [](transform::LoopTileOp &self, AlloOpBuilder &builder,
-             Value &target, const std::vector<int64_t> &factors) {
-            self = transform::LoopTileOp::create(
-                builder, builder.getLocation(), target, factors);
+          [](transform::LoopTileOp &self, AlloOpBuilder &builder, Value &target,
+             const std::vector<int64_t> &factors) {
+            self = transform::LoopTileOp::create(builder, builder.getLocation(),
+                                                 target, factors);
           },
           nb::arg("builder"), nb::arg("target"), nb::arg("factors"));
 
@@ -392,10 +392,10 @@ void bindTransform(nb::module_ &m) {
   nb::class_<transform::ReuseAtOp, OpState>(m, "ReuseAtOp")
       .def(
           "__init__",
-          [](transform::ReuseAtOp &self, AlloOpBuilder &builder,
-             Value &target, Value &axis, bool ring) {
-            self = transform::ReuseAtOp::create(
-                builder, builder.getLocation(), target, axis, ring);
+          [](transform::ReuseAtOp &self, AlloOpBuilder &builder, Value &target,
+             Value &axis, bool ring) {
+            self = transform::ReuseAtOp::create(builder, builder.getLocation(),
+                                                target, axis, ring);
           },
           nb::arg("builder"), nb::arg("target"), nb::arg("axis"),
           nb::arg("ring") = false);
@@ -413,10 +413,10 @@ void bindTransform(nb::module_ &m) {
   nb::class_<transform::BufferAtOp, OpState>(m, "BufferAtOp")
       .def(
           "__init__",
-          [](transform::BufferAtOp &self, AlloOpBuilder &builder,
-             Value &target, Value &axis) {
-            self = transform::BufferAtOp::create(
-                builder, builder.getLocation(), target, axis);
+          [](transform::BufferAtOp &self, AlloOpBuilder &builder, Value &target,
+             Value &axis) {
+            self = transform::BufferAtOp::create(builder, builder.getLocation(),
+                                                 target, axis);
           },
           nb::arg("builder"), nb::arg("target"), nb::arg("axis"));
 

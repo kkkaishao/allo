@@ -21,7 +21,6 @@ from allo.exp.lang.core import (
 from allo.exp.lang.kernel import KernelOptions, consteval, kernel
 from allo.exp.operators.arith import max as allo_max
 
-
 _GLOBAL_SHAPE_M = 2
 _GLOBAL_SHAPE_N = 3
 _GLOBAL_INT_CONST = 3
@@ -425,6 +424,40 @@ def test_local_tensor_declaration_without_initializer():
         "tensor.empty",
         "tensor<4xf32>",
         "return",
+    )
+
+
+def test_memref_list_initializer_uses_global():
+    @kernel
+    def memref_list_initializer_uses_global(out: "i32[2,2]"):
+        scale: constexpr = _GLOBAL_INT_CONST
+        buf: "i32[2,2]" = [[1, scale], [scale + 1, scale + 2]]
+        for i, j in allo_grid(2, 2):
+            out[i, j] = buf[i, j]
+
+    ir = _compile_ir(memref_list_initializer_uses_global)
+    _assert_contains(
+        ir,
+        'memref.global "private" @buf_initializer_0',
+        "memref.get_global @buf_initializer_0",
+        "dense<[[1, 3], [4, 5]]>",
+        "memref.load",
+    )
+    assert "memref.copy" not in ir
+
+
+def test_tensor_list_initializer_uses_arith_constant():
+    @kernel(options=KernelOptions(enable_tensor=True))
+    def tensor_list_initializer_uses_arith_constant() -> "i32[2,2]":
+        buf: "i32[2,2]" = [[1, 2], [3, 4]]
+        return buf
+
+    ir = _compile_ir(tensor_list_initializer_uses_arith_constant)
+    _assert_contains(
+        ir,
+        "arith.constant dense<[[1, 2], [3, 4]]> : tensor<2x2xi32>",
+        "return",
+        "tensor<2x2xi32>",
     )
 
 

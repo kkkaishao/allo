@@ -69,6 +69,7 @@ class AlloOpBuilder(ir.AlloOpBuilder):
         self.file_name = None
         self.begin_line = 1
         self.curr_node = None
+        self._global_initializer_counter = 0
 
     def compile_error(self, message: str):
         raise CompilationError(
@@ -120,6 +121,44 @@ class AlloOpBuilder(ir.AlloOpBuilder):
             return self.make_scalar(value, proxy.type)
         assert isinstance(proxy.type, ShapedType)
         return self._fill_shaped_value(self.make_scalar(value, proxy.dtype), proxy)
+
+    def _dense_element_attr(self, value, dtype: DType):
+        assert type(value) in (int, float)
+        ir_ty = dtype.materialize(self.context)
+        if dtype.is_float():
+            return ir.FloatAttr.get(ir_ty, float(value))
+        if dtype.is_int_signless() or dtype.is_index():
+            return ir.IntegerAttr.get(ir_ty, int(value))
+        assert False, f"Unsupported dense element type: {dtype}"
+
+    def _next_initializer_name(self, name: str) -> str:
+        suffix = self._global_initializer_counter
+        self._global_initializer_counter += 1
+        return f"{name}_initializer_{suffix}"
+
+    def make_shaped_constant(
+        self, values: Sequence[int | float], dst_type: ShapedType, name: str
+    ) -> AlloValue:
+        num_elements = 1
+        for dim in dst_type.shape:
+            num_elements *= dim
+        assert len(values) == num_elements
+
+        attr_type = TensorType(dst_type.shape, dst_type.dtype).materialize(self.context)
+        elements = [self._dense_element_attr(value, dst_type.dtype) for value in values]
+        dense_attr = ir.DenseElementsAttr.get(attr_type, elements)
+        if isinstance(dst_type, TensorType):
+            return AlloValue(arith.ConstantOp(self, dense_attr), dst_type)
+
+        assert isinstance(dst_type, BufferType)
+        assert self.module is not None
+        memref_type = dst_type.materialize(self.context)
+        global_name = self._next_initializer_name(name)
+        ip, loc = self.get_insertion_point_and_loc()
+        self.set_insertion_point_to_end(self.module.get_body())
+        memref.GlobalOp(self, global_name, "private", memref_type, dense_attr, False)
+        self.set_insertion_point_and_loc(ip, loc)
+        return AlloValue(memref.GetGlobalOp(self, memref_type, global_name), dst_type)
 
     #####################
     # Type Casting

@@ -9,6 +9,7 @@
 #include "mlir/Bytecode/BytecodeWriter.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/IR/Builders.h"
+#include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/Diagnostics.h"
@@ -587,6 +588,17 @@ static void bindAttributes(nb::module_ &m) {
             return DenseI64ArrayAttr::get(&context, values);
           },
           nb::arg("context"), nb::arg("values"));
+
+  nb::class_<DenseElementsAttr, Attribute>(m, "DenseElementsAttr")
+      .def_static(
+          "get",
+          [](Type type, const std::vector<Attribute> &values) {
+            auto shapedType = llvm::dyn_cast<ShapedType>(type);
+            if (!shapedType)
+              throw nb::type_error("DenseElementsAttr requires a shaped type");
+            return DenseElementsAttr::get(shapedType, values);
+          },
+          nb::arg("type"), nb::arg("values"));
 
   nb::class_<FlatSymbolRefAttr, Attribute>(m, "FlatSymbolRefAttr")
       .def_static(

@@ -16,6 +16,7 @@
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/Dialect/UB/IR/UBOps.h"
+#include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/IntegerSet.h"
 
 #include "allo/IR/AlloOps.h"
@@ -72,8 +73,8 @@ void bindFuncOps(nb::module_ &m) {
           "__init__",
           [](func::ReturnOp &self, AlloOpBuilder &builder,
              const std::vector<Value> &operands) {
-            self =
-                func::ReturnOp::create(builder, builder.getLocation(), operands);
+            self = func::ReturnOp::create(builder, builder.getLocation(),
+                                          operands);
           },
           nb::arg("builder"), nb::arg("operands"));
 
@@ -147,8 +148,8 @@ void bindAffineOps(nb::module_ &m) {
           [](affine::AffineStoreOp &self, AlloOpBuilder &builder, Value &value,
              Value &memref, AffineMap &map,
              const std::vector<Value> &operands) {
-            self = affine::AffineStoreOp::create(
-                builder, builder.getLocation(), value, memref, map, operands);
+            self = affine::AffineStoreOp::create(builder, builder.getLocation(),
+                                                 value, memref, map, operands);
           },
           nb::arg("builder"), nb::arg("value"), nb::arg("memref"),
           nb::arg("map"), nb::arg("operands"));
@@ -158,8 +159,8 @@ void bindAffineOps(nb::module_ &m) {
           "__init__",
           [](affine::AffineApplyOp &self, AlloOpBuilder &builder,
              AffineMap &map, const std::vector<Value> &operands) {
-            self = affine::AffineApplyOp::create(
-                builder, builder.getLocation(), map, operands);
+            self = affine::AffineApplyOp::create(builder, builder.getLocation(),
+                                                 map, operands);
           },
           nb::arg("builder"), nb::arg("map"), nb::arg("operands"));
 }
@@ -185,8 +186,7 @@ void bindSCFOps(nb::module_ &m) {
       .def(
           "__init__",
           [](scf::IfOp &self, AlloOpBuilder &builder,
-             const std::vector<Type> &resultTypes, Value &cond,
-             bool withElse) {
+             const std::vector<Type> &resultTypes, Value &cond, bool withElse) {
             self = scf::IfOp::create(builder, builder.getLocation(),
                                      resultTypes, cond, withElse);
           },
@@ -202,7 +202,8 @@ void bindSCFOps(nb::module_ &m) {
           "__init__",
           [](scf::YieldOp &self, AlloOpBuilder &builder,
              const std::vector<Value> &results) {
-            self = scf::YieldOp::create(builder, builder.getLocation(), results);
+            self =
+                scf::YieldOp::create(builder, builder.getLocation(), results);
           },
           nb::arg("builder"), nb::arg("results"));
 
@@ -239,8 +240,8 @@ void bindSCFOps(nb::module_ &m) {
             self = scf::ParallelOp::create(builder, builder.getLocation(), lbs,
                                            ubs, steps, initArgs);
           },
-          nb::arg("builder"), nb::arg("lbs"), nb::arg("ubs"),
-          nb::arg("steps"), nb::arg("init_args") = std::vector<Value>())
+          nb::arg("builder"), nb::arg("lbs"), nb::arg("ubs"), nb::arg("steps"),
+          nb::arg("init_args") = std::vector<Value>())
       .def(
           "get_body", [](scf::ParallelOp &self) { return self.getBody(); },
           nb::rv_policy::reference)
@@ -267,15 +268,27 @@ void bindCFOps(nb::module_ &m) {
           "__init__",
           [](cf::BranchOp &self, AlloOpBuilder &builder, Block *dest,
              const std::vector<Value> &args) {
-            self =
-                cf::BranchOp::create(builder, builder.getLocation(), dest, args);
+            self = cf::BranchOp::create(builder, builder.getLocation(), dest,
+                                        args);
           },
           nb::arg("builder"), nb::arg("dest"), nb::arg("args"));
 }
 
 void bindArithOps(nb::module_ &m) {
   // constant ops
-  nb::class_<arith::ConstantOp, OpState>(m, "ConstantOp");
+  nb::class_<arith::ConstantOp, OpState>(m, "ConstantOp")
+      .def(
+          "__init__",
+          [](arith::ConstantOp &self, AlloOpBuilder &builder,
+             Attribute &value) {
+            auto typedValue = llvm::dyn_cast<TypedAttr>(value);
+            if (!typedValue)
+              throw nb::type_error(
+                  "arith.ConstantOp requires a typed attribute");
+            self = arith::ConstantOp::create(builder, builder.getLocation(),
+                                             typedValue);
+          },
+          nb::arg("builder"), nb::arg("value"));
 
   nb::class_<arith::ConstantIntOp, arith::ConstantOp>(m, "ConstantIntOp")
       .def(
@@ -454,8 +467,8 @@ void bindArithOps(nb::module_ &m) {
           "__init__",
           [](arith::AddFOp &self, AlloOpBuilder &builder, Value &lhs,
              Value &rhs) {
-            self = arith::AddFOp::create(builder, builder.getLocation(), lhs,
-                                         rhs);
+            self =
+                arith::AddFOp::create(builder, builder.getLocation(), lhs, rhs);
           },
           nb::arg("builder"), nb::arg("lhs"), nb::arg("rhs"));
 
@@ -464,8 +477,8 @@ void bindArithOps(nb::module_ &m) {
           "__init__",
           [](arith::SubFOp &self, AlloOpBuilder &builder, Value &lhs,
              Value &rhs) {
-            self = arith::SubFOp::create(builder, builder.getLocation(), lhs,
-                                         rhs);
+            self =
+                arith::SubFOp::create(builder, builder.getLocation(), lhs, rhs);
           },
           nb::arg("builder"), nb::arg("lhs"), nb::arg("rhs"));
 
@@ -474,8 +487,8 @@ void bindArithOps(nb::module_ &m) {
           "__init__",
           [](arith::MulFOp &self, AlloOpBuilder &builder, Value &lhs,
              Value &rhs) {
-            self = arith::MulFOp::create(builder, builder.getLocation(), lhs,
-                                         rhs);
+            self =
+                arith::MulFOp::create(builder, builder.getLocation(), lhs, rhs);
           },
           nb::arg("builder"), nb::arg("lhs"), nb::arg("rhs"));
 
@@ -484,8 +497,8 @@ void bindArithOps(nb::module_ &m) {
           "__init__",
           [](arith::DivFOp &self, AlloOpBuilder &builder, Value &lhs,
              Value &rhs) {
-            self = arith::DivFOp::create(builder, builder.getLocation(), lhs,
-                                         rhs);
+            self =
+                arith::DivFOp::create(builder, builder.getLocation(), lhs, rhs);
           },
           nb::arg("builder"), nb::arg("lhs"), nb::arg("rhs"));
 
@@ -494,8 +507,8 @@ void bindArithOps(nb::module_ &m) {
           "__init__",
           [](arith::RemFOp &self, AlloOpBuilder &builder, Value &lhs,
              Value &rhs) {
-            self = arith::RemFOp::create(builder, builder.getLocation(), lhs,
-                                         rhs);
+            self =
+                arith::RemFOp::create(builder, builder.getLocation(), lhs, rhs);
           },
           nb::arg("builder"), nb::arg("lhs"), nb::arg("rhs"));
 
@@ -503,8 +516,7 @@ void bindArithOps(nb::module_ &m) {
       .def(
           "__init__",
           [](arith::NegFOp &self, AlloOpBuilder &builder, Value &input) {
-            self =
-                arith::NegFOp::create(builder, builder.getLocation(), input);
+            self = arith::NegFOp::create(builder, builder.getLocation(), input);
           },
           nb::arg("builder"), nb::arg("input"));
 
@@ -514,8 +526,8 @@ void bindArithOps(nb::module_ &m) {
           "__init__",
           [](arith::AddIOp &self, AlloOpBuilder &builder, Value &lhs,
              Value &rhs) {
-            self = arith::AddIOp::create(builder, builder.getLocation(), lhs,
-                                         rhs);
+            self =
+                arith::AddIOp::create(builder, builder.getLocation(), lhs, rhs);
           },
           nb::arg("builder"), nb::arg("lhs"), nb::arg("rhs"));
 
@@ -524,8 +536,8 @@ void bindArithOps(nb::module_ &m) {
           "__init__",
           [](arith::SubIOp &self, AlloOpBuilder &builder, Value &lhs,
              Value &rhs) {
-            self = arith::SubIOp::create(builder, builder.getLocation(), lhs,
-                                         rhs);
+            self =
+                arith::SubIOp::create(builder, builder.getLocation(), lhs, rhs);
           },
           nb::arg("builder"), nb::arg("lhs"), nb::arg("rhs"));
 
@@ -534,8 +546,8 @@ void bindArithOps(nb::module_ &m) {
           "__init__",
           [](arith::MulIOp &self, AlloOpBuilder &builder, Value &lhs,
              Value &rhs) {
-            self = arith::MulIOp::create(builder, builder.getLocation(), lhs,
-                                         rhs);
+            self =
+                arith::MulIOp::create(builder, builder.getLocation(), lhs, rhs);
           },
           nb::arg("builder"), nb::arg("lhs"), nb::arg("rhs"));
 
@@ -564,8 +576,8 @@ void bindArithOps(nb::module_ &m) {
           "__init__",
           [](arith::CeilDivSIOp &self, AlloOpBuilder &builder, Value &lhs,
              Value &rhs) {
-            self = arith::CeilDivSIOp::create(
-                builder, builder.getLocation(), lhs, rhs);
+            self = arith::CeilDivSIOp::create(builder, builder.getLocation(),
+                                              lhs, rhs);
           },
           nb::arg("builder"), nb::arg("lhs"), nb::arg("rhs"));
 
@@ -574,8 +586,8 @@ void bindArithOps(nb::module_ &m) {
           "__init__",
           [](arith::CeilDivUIOp &self, AlloOpBuilder &builder, Value &lhs,
              Value &rhs) {
-            self = arith::CeilDivUIOp::create(
-                builder, builder.getLocation(), lhs, rhs);
+            self = arith::CeilDivUIOp::create(builder, builder.getLocation(),
+                                              lhs, rhs);
           },
           nb::arg("builder"), nb::arg("lhs"), nb::arg("rhs"));
 
@@ -584,8 +596,8 @@ void bindArithOps(nb::module_ &m) {
           "__init__",
           [](arith::FloorDivSIOp &self, AlloOpBuilder &builder, Value &lhs,
              Value &rhs) {
-            self = arith::FloorDivSIOp::create(
-                builder, builder.getLocation(), lhs, rhs);
+            self = arith::FloorDivSIOp::create(builder, builder.getLocation(),
+                                               lhs, rhs);
           },
           nb::arg("builder"), nb::arg("lhs"), nb::arg("rhs"));
 
@@ -625,8 +637,8 @@ void bindArithOps(nb::module_ &m) {
           "__init__",
           [](arith::ShLIOp &self, AlloOpBuilder &builder, Value &lhs,
              Value &rhs) {
-            self = arith::ShLIOp::create(builder, builder.getLocation(), lhs,
-                                         rhs);
+            self =
+                arith::ShLIOp::create(builder, builder.getLocation(), lhs, rhs);
           },
           nb::arg("builder"), nb::arg("lhs"), nb::arg("rhs"));
 
@@ -761,8 +773,8 @@ void bindArithOps(nb::module_ &m) {
           "__init__",
           [](arith::AndIOp &self, AlloOpBuilder &builder, Value &lhs,
              Value &rhs) {
-            self = arith::AndIOp::create(builder, builder.getLocation(), lhs,
-                                         rhs);
+            self =
+                arith::AndIOp::create(builder, builder.getLocation(), lhs, rhs);
           },
           nb::arg("builder"), nb::arg("lhs"), nb::arg("rhs"));
 
@@ -771,8 +783,8 @@ void bindArithOps(nb::module_ &m) {
           "__init__",
           [](arith::XOrIOp &self, AlloOpBuilder &builder, Value &lhs,
              Value &rhs) {
-            self = arith::XOrIOp::create(builder, builder.getLocation(), lhs,
-                                         rhs);
+            self =
+                arith::XOrIOp::create(builder, builder.getLocation(), lhs, rhs);
           },
           nb::arg("builder"), nb::arg("lhs"), nb::arg("rhs"));
 
@@ -781,8 +793,8 @@ void bindArithOps(nb::module_ &m) {
           "__init__",
           [](arith::OrIOp &self, AlloOpBuilder &builder, Value &lhs,
              Value &rhs) {
-            self = arith::OrIOp::create(builder, builder.getLocation(), lhs,
-                                        rhs);
+            self =
+                arith::OrIOp::create(builder, builder.getLocation(), lhs, rhs);
           },
           nb::arg("builder"), nb::arg("lhs"), nb::arg("rhs"));
 
@@ -1019,9 +1031,9 @@ void bindTensorOps(nb::module_ &m) {
              Value &source, const std::vector<Value> &offsets,
              const std::vector<Value> &sizes,
              const std::vector<Value> &strides) {
-            self = tensor::ExtractSliceOp::create(
-                builder, builder.getLocation(), source, offsets, sizes,
-                strides);
+            self =
+                tensor::ExtractSliceOp::create(builder, builder.getLocation(),
+                                               source, offsets, sizes, strides);
           },
           nb::arg("builder"), nb::arg("source"), nb::arg("offsets"),
           nb::arg("sizes"), nb::arg("strides"))
@@ -1045,13 +1057,13 @@ void bindTensorOps(nb::module_ &m) {
   nb::class_<tensor::InsertSliceOp, OpState>(m, "InsertSliceOp")
       .def(
           "__init__",
-          [](tensor::InsertSliceOp &self, AlloOpBuilder &builder,
-             Value &source, Value &dest, const std::vector<Value> &offsets,
+          [](tensor::InsertSliceOp &self, AlloOpBuilder &builder, Value &source,
+             Value &dest, const std::vector<Value> &offsets,
              const std::vector<Value> &sizes,
              const std::vector<Value> &strides) {
-            self = tensor::InsertSliceOp::create(
-                builder, builder.getLocation(), source, dest, offsets, sizes,
-                strides);
+            self = tensor::InsertSliceOp::create(builder, builder.getLocation(),
+                                                 source, dest, offsets, sizes,
+                                                 strides);
           },
           nb::arg("builder"), nb::arg("source"), nb::arg("dest"),
           nb::arg("offsets"), nb::arg("sizes"), nb::arg("strides"))
@@ -1126,7 +1138,8 @@ void bindMemRefOps(nb::module_ &m) {
       .def(
           "__init__",
           [](memref::AllocOp &self, AlloOpBuilder &builder, MemRefType &type) {
-            self = memref::AllocOp::create(builder, builder.getLocation(), type);
+            self =
+                memref::AllocOp::create(builder, builder.getLocation(), type);
           },
           nb::arg("builder"), nb::arg("type"));
 
@@ -1134,8 +1147,7 @@ void bindMemRefOps(nb::module_ &m) {
       .def(
           "__init__",
           [](memref::SubViewOp &self, AlloOpBuilder &builder, Value &source,
-             const std::vector<Value> &offsets,
-             const std::vector<Value> &sizes,
+             const std::vector<Value> &offsets, const std::vector<Value> &sizes,
              const std::vector<Value> &strides) {
             self = memref::SubViewOp::create(builder, builder.getLocation(),
                                              source, offsets, sizes, strides);
@@ -1189,13 +1201,25 @@ void bindMemRefOps(nb::module_ &m) {
             auto visAttr = builder.getStringAttr(visibility);
             auto alignAttr =
                 builder.getIntegerAttr(builder.getI64Type(), alignment);
-            self = memref::GlobalOp::create(
-                builder, builder.getLocation(), name, visAttr, type, initValue,
-                isConstant, alignAttr);
+            self = memref::GlobalOp::create(builder, builder.getLocation(),
+                                            name, visAttr, type, initValue,
+                                            isConstant, alignAttr);
           },
           nb::arg("builder"), nb::arg("name"), nb::arg("visibility"),
           nb::arg("res_type"), nb::arg("init_value"), nb::arg("is_constant"),
-          nb::arg("alignment"));
+          nb::arg("alignment"))
+      .def(
+          "__init__",
+          [](memref::GlobalOp &self, AlloOpBuilder &builder,
+             std::string_view name, std::string_view visibility,
+             MemRefType &type, Attribute &initValue, bool isConstant) {
+            auto visAttr = builder.getStringAttr(visibility);
+            self = memref::GlobalOp::create(builder, builder.getLocation(),
+                                            name, visAttr, type, initValue,
+                                            isConstant, IntegerAttr());
+          },
+          nb::arg("builder"), nb::arg("name"), nb::arg("visibility"),
+          nb::arg("res_type"), nb::arg("init_value"), nb::arg("is_constant"));
 
   nb::class_<memref::GetGlobalOp, OpState>(m, "GetGlobalOp")
       .def(
@@ -1213,8 +1237,8 @@ void bindMemRefOps(nb::module_ &m) {
           [](memref::TransposeOp &self, AlloOpBuilder &builder, Value &input,
              AffineMap &permutation) {
             auto permAttr = AffineMapAttr::get(permutation);
-            self = memref::TransposeOp::create(
-                builder, builder.getLocation(), input, permAttr);
+            self = memref::TransposeOp::create(builder, builder.getLocation(),
+                                               input, permAttr);
           },
           nb::arg("builder"), nb::arg("input"), nb::arg("permutation"));
 
@@ -1248,8 +1272,8 @@ void bindLinalgOps(nb::module_ &m) {
           "__init__",
           [](linalg::FillOp &self, AlloOpBuilder &builder, Value &value,
              Value &output) {
-            self = linalg::FillOp::create(builder, builder.getLocation(),
-                                          value, output);
+            self = linalg::FillOp::create(builder, builder.getLocation(), value,
+                                          output);
           },
           nb::arg("builder"), nb::arg("value"), nb::arg("output"));
 
@@ -1269,9 +1293,9 @@ void bindLinalgOps(nb::module_ &m) {
           "__init__",
           [](linalg::AddOp &self, AlloOpBuilder &builder, Value &lhs,
              Value &rhs, Value &init) {
-            self = linalg::AddOp::create(
-                builder, builder.getLocation(),
-                std::initializer_list<Value>{lhs, rhs}, init);
+            self = linalg::AddOp::create(builder, builder.getLocation(),
+                                         std::initializer_list<Value>{lhs, rhs},
+                                         init);
           },
           nb::arg("builder"), nb::arg("lhs"), nb::arg("rhs"), nb::arg("init"));
 
@@ -1280,9 +1304,9 @@ void bindLinalgOps(nb::module_ &m) {
           "__init__",
           [](linalg::SubOp &self, AlloOpBuilder &builder, Value &lhs,
              Value &rhs, Value &init) {
-            self = linalg::SubOp::create(
-                builder, builder.getLocation(),
-                std::initializer_list<Value>{lhs, rhs}, init);
+            self = linalg::SubOp::create(builder, builder.getLocation(),
+                                         std::initializer_list<Value>{lhs, rhs},
+                                         init);
           },
           nb::arg("builder"), nb::arg("lhs"), nb::arg("rhs"), nb::arg("init"));
 
@@ -1291,9 +1315,9 @@ void bindLinalgOps(nb::module_ &m) {
           "__init__",
           [](linalg::MulOp &self, AlloOpBuilder &builder, Value &lhs,
              Value &rhs, Value &init) {
-            self = linalg::MulOp::create(
-                builder, builder.getLocation(),
-                std::initializer_list<Value>{lhs, rhs}, init);
+            self = linalg::MulOp::create(builder, builder.getLocation(),
+                                         std::initializer_list<Value>{lhs, rhs},
+                                         init);
           },
           nb::arg("builder"), nb::arg("lhs"), nb::arg("rhs"), nb::arg("init"));
 
@@ -1302,9 +1326,9 @@ void bindLinalgOps(nb::module_ &m) {
           "__init__",
           [](linalg::DivOp &self, AlloOpBuilder &builder, Value &lhs,
              Value &rhs, Value &init) {
-            self = linalg::DivOp::create(
-                builder, builder.getLocation(),
-                std::initializer_list<Value>{lhs, rhs}, init);
+            self = linalg::DivOp::create(builder, builder.getLocation(),
+                                         std::initializer_list<Value>{lhs, rhs},
+                                         init);
           },
           nb::arg("builder"), nb::arg("lhs"), nb::arg("rhs"), nb::arg("init"));
 
@@ -1366,8 +1390,8 @@ void bindLinalgOps(nb::module_ &m) {
           "__init__",
           [](linalg::SqrtOp &self, AlloOpBuilder &builder, Value &input,
              Value &init) {
-            self = linalg::SqrtOp::create(builder, builder.getLocation(),
-                                          input, init);
+            self = linalg::SqrtOp::create(builder, builder.getLocation(), input,
+                                          init);
           },
           nb::arg("builder"), nb::arg("input"), nb::arg("init"));
 
@@ -1406,9 +1430,9 @@ void bindLinalgOps(nb::module_ &m) {
           "__init__",
           [](linalg::DotOp &self, AlloOpBuilder &builder, Value &lhs,
              Value &rhs, Value &init) {
-            self = linalg::DotOp::create(
-                builder, builder.getLocation(),
-                std::initializer_list<Value>{lhs, rhs}, init);
+            self = linalg::DotOp::create(builder, builder.getLocation(),
+                                         std::initializer_list<Value>{lhs, rhs},
+                                         init);
           },
           nb::arg("builder"), nb::arg("lhs"), nb::arg("rhs"), nb::arg("init"));
 
@@ -1426,9 +1450,9 @@ void bindLinalgOps(nb::module_ &m) {
              const std::vector<Value> &outputs,
              const std::vector<AffineMap> &indexingMaps,
              const std::vector<utils::IteratorType> &iteratorTypes) {
-            self = linalg::GenericOp::create(
-                builder, builder.getLocation(), resTypes, inputs, outputs,
-                indexingMaps, iteratorTypes);
+            self = linalg::GenericOp::create(builder, builder.getLocation(),
+                                             resTypes, inputs, outputs,
+                                             indexingMaps, iteratorTypes);
           },
           nb::arg("builder"), nb::arg("result_types"), nb::arg("inputs"),
           nb::arg("outputs"), nb::arg("indexing_maps"),
@@ -1459,8 +1483,8 @@ void bindLinalgOps(nb::module_ &m) {
           "__init__",
           [](linalg::YieldOp &self, AlloOpBuilder &builder,
              const std::vector<Value> &values) {
-            self = linalg::YieldOp::create(builder, builder.getLocation(),
-                                           values);
+            self =
+                linalg::YieldOp::create(builder, builder.getLocation(), values);
           },
           nb::arg("builder"), nb::arg("values"));
 }
@@ -1470,8 +1494,8 @@ void bindUBOps(nb::module_ &m) {
       .def(
           "__init__",
           [](ub::PoisonOp &self, AlloOpBuilder &builder, Type &resType) {
-            self = ub::PoisonOp::create(builder, builder.getLocation(),
-                                        resType);
+            self =
+                ub::PoisonOp::create(builder, builder.getLocation(), resType);
           },
           nb::arg("builder"), nb::arg("res_type"));
 }
@@ -1490,8 +1514,7 @@ void bindAlloOps(nb::module_ &m) {
   nb::class_<allo::GetWorkerIdOp, OpState>(m, "GetWorkerIdOp")
       .def(
           "__init__",
-          [](allo::GetWorkerIdOp &self, AlloOpBuilder &builder,
-             uint32_t axis) {
+          [](allo::GetWorkerIdOp &self, AlloOpBuilder &builder, uint32_t axis) {
             self = allo::GetWorkerIdOp::create(builder, builder.getLocation(),
                                                axis);
           },
@@ -1502,8 +1525,8 @@ void bindAlloOps(nb::module_ &m) {
           "__init__",
           [](allo::GetNumWorkersOp &self, AlloOpBuilder &builder,
              uint32_t axis) {
-            self = allo::GetNumWorkersOp::create(builder,
-                                                 builder.getLocation(), axis);
+            self = allo::GetNumWorkersOp::create(builder, builder.getLocation(),
+                                                 axis);
           },
           nb::arg("builder"), nb::arg("axis"));
 
