@@ -6,7 +6,6 @@ from __future__ import annotations
 from .errors import ActError
 from ..lang.act import (
     ActTensorType,
-    BufferSpec,
     ComputeSpec,
     ISA,
     IndexExpr,
@@ -72,6 +71,9 @@ class AddrRegionEmitter:
         self.counter += 1
         return name
 
+    def emit(self, line: str = ""):
+        self.emitter.emit(line)
+
     def materialize_index(self, expr: IndexExpr) -> str:
         if expr.kind == "param":
             return f"%{expr.value}"
@@ -98,43 +100,23 @@ class AddrRegionEmitter:
     def format_square_list(self, exprs: tuple[IndexExpr, ...]) -> str:
         return "[" + ", ".join(self.format_index(expr) for expr in exprs) + "]"
 
+    def format_reassociation(self, reassociation: tuple[tuple[int, ...], ...]) -> str:
+        groups = [
+            "[" + ", ".join(str(i) for i in group) + "]" for group in reassociation
+        ]
+        return "[" + ", ".join(groups) + "]"
+
     def emit_pattern(self, pattern: PatternExpr) -> str:
         key = id(pattern)
         if key in self.pattern_values:
             return self.pattern_values[key]
-        if pattern.kind == "strided":
-            basis = self.format_paren_list(pattern.basis)
-            counts = self.format_paren_list(pattern.counts)
-            strides = self.format_paren_list(pattern.strides)
-            result = self.value()
-            self.emitter.emit(
-                f"{result} = act.strided basis{basis} counts{counts} strides{strides}"
+        lower = pattern.pattern.lower_impl
+        if lower is None:
+            raise ActError(
+                f"Pattern '{pattern.kind}' does not define lowering.",
+                location=pattern.location,
             )
-        elif pattern.kind == "expand":
-            assert pattern.source is not None
-            source = self.emit_pattern(pattern.source)
-            result = self.value()
-            reassociation = _format_reassociation(pattern.reassociation)
-            shape = self.format_square_list(pattern.output_shape)
-            self.emitter.emit(
-                f"{result} = act.expand_shape {source} {reassociation} output_shape {shape}"
-            )
-        elif pattern.kind == "collapse":
-            assert pattern.source is not None
-            source = self.emit_pattern(pattern.source)
-            result = self.value()
-            reassociation = _format_reassociation(pattern.reassociation)
-            self.emitter.emit(f"{result} = act.collapse_shape {source} {reassociation}")
-        elif pattern.kind == "transpose":
-            assert pattern.source is not None
-            source = self.emit_pattern(pattern.source)
-            result = self.value()
-            permutation = "[" + ", ".join(str(v) for v in pattern.permutation) + "]"
-            self.emitter.emit(
-                f"{result} = act.transpose {source} permutation = {permutation}"
-            )
-        else:
-            assert False, f"unknown pattern kind: {pattern.kind}"
+        result = lower(self, pattern)
         self.pattern_values[key] = result
         return result
 
@@ -149,11 +131,6 @@ def _emit_addr_region(emitter: TextEmitter, inst: InstructionSpec):
     emitter.emit(f"act.yield {', '.join(values)} : {types}")
     emitter.indent -= 1
     emitter.emit("}")
-
-
-def _format_reassociation(reassociation: tuple[tuple[int, ...], ...]) -> str:
-    groups = ["[" + ", ".join(str(i) for i in group) + "]" for group in reassociation]
-    return "[" + ", ".join(groups) + "]"
 
 
 class ComputeRegionEmitter:

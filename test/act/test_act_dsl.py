@@ -4,9 +4,10 @@ from pathlib import Path
 import pytest
 
 from allo.exp.compiler.errors import ActError
-from allo.exp.lang.act import ActPrimitive, ISA, parse_tensor_annotation
+from allo.exp.lang.act import ISA, Primitive, parse_tensor_annotation
 from allo.exp.lang.core import bf16, f32, i32
-from allo.exp.operators import act as prim
+from allo.exp.operators.act.patterns import collapse, expand, strided, transpose
+from allo.exp.operators.act import primitives as prim
 
 
 def build_qkv():
@@ -18,14 +19,13 @@ def build_qkv():
     @qkv.instruction("load_rm", src=hbm, dst=d1)
     def _(I):
         @I.access
-        def _(I):
-            addr_in, addr_out, size = I.addr_params("addr_in", "addr_out", "size")
-            src = I.expand(
-                I.strided(hbm, basis=addr_in, counts=size * 64, strides=1),
+        def _(addr_in, addr_out, size):
+            src = expand(
+                strided(hbm, basis=addr_in, counts=size * 64, strides=1),
                 [[0, 1]],
                 shape=(size, 64),
             )
-            dst = I.strided(d1, basis=addr_out, counts=size, strides=1)
+            dst = strided(d1, basis=addr_out, counts=size, strides=1)
             return src, dst
 
         @I.compute
@@ -35,15 +35,14 @@ def build_qkv():
     @qkv.instruction("load_cm", src=hbm, dst=d1)
     def _(I):
         @I.access
-        def _(I):
-            addr_in, addr_out, size = I.addr_params("addr_in", "addr_out", "size")
-            src = I.expand(
-                I.strided(hbm, basis=addr_in, counts=size * 64, strides=1),
+        def _(addr_in, addr_out, size):
+            src = expand(
+                strided(hbm, basis=addr_in, counts=size * 64, strides=1),
                 [[0, 1]],
                 shape=(size, 64),
             )
-            dst = I.strided(d1, basis=addr_out, counts=size, strides=1)
-            return I.transpose(src, [1, 0]), I.transpose(dst, [1, 0])
+            dst = strided(d1, basis=addr_out, counts=size, strides=1)
+            return transpose(src, [1, 0]), transpose(dst, [1, 0])
 
         @I.compute
         def _(x: "bf16[64,?]", out: "bf16[64,?]"):
@@ -52,11 +51,10 @@ def build_qkv():
     @qkv.instruction("store_rm", src=d1, dst=hbm)
     def _(I):
         @I.access
-        def _(I):
-            addr_in, addr_out, size = I.addr_params("addr_in", "addr_out", "size")
-            src = I.strided(d1, basis=addr_in, counts=size, strides=1)
-            dst = I.expand(
-                I.strided(hbm, basis=addr_out, counts=size * 64, strides=1),
+        def _(addr_in, addr_out, size):
+            src = strided(d1, basis=addr_in, counts=size, strides=1)
+            dst = expand(
+                strided(hbm, basis=addr_out, counts=size * 64, strides=1),
                 [[0, 1]],
                 shape=(size, 64),
             )
@@ -69,11 +67,10 @@ def build_qkv():
     @qkv.instruction("mov", src=d2, dst=d1)
     def _(I):
         @I.access
-        def _(I):
-            addr_in, addr_out, size = I.addr_params("addr_in", "addr_out", "size")
+        def _(addr_in, addr_out, size):
             return (
-                I.strided(d2, basis=addr_in, counts=size, strides=1),
-                I.strided(d1, basis=addr_out, counts=size, strides=1),
+                strided(d2, basis=addr_in, counts=size, strides=1),
+                strided(d1, basis=addr_out, counts=size, strides=1),
             )
 
         @I.compute
@@ -83,12 +80,11 @@ def build_qkv():
     @qkv.instruction("gemm_f32acc", src=[d1, d1], dst=d2)
     def _(I):
         @I.access
-        def _(I):
-            addr_a, addr_b, addr_c = I.addr_params("addr_a", "addr_b", "addr_c")
+        def _(addr_a, addr_b, addr_c):
             return (
-                I.strided(d1, basis=addr_a, counts=64, strides=1),
-                I.strided(d1, basis=addr_b, counts=64, strides=1),
-                I.strided(d2, basis=addr_c, counts=64, strides=1),
+                strided(d1, basis=addr_a, counts=64, strides=1),
+                strided(d1, basis=addr_b, counts=64, strides=1),
+                strided(d2, basis=addr_c, counts=64, strides=1),
             )
 
         @I.compute
@@ -98,12 +94,11 @@ def build_qkv():
     @qkv.instruction("gemm", src=[d1, d1], dst=d2)
     def _(I):
         @I.access
-        def _(I):
-            addr_a, addr_b, addr_c = I.addr_params("addr_a", "addr_b", "addr_c")
+        def _(addr_a, addr_b, addr_c):
             return (
-                I.strided(d1, basis=addr_a, counts=64, strides=1),
-                I.strided(d1, basis=addr_b, counts=64, strides=1),
-                I.strided(d2, basis=addr_c, counts=64, strides=1),
+                strided(d1, basis=addr_a, counts=64, strides=1),
+                strided(d1, basis=addr_b, counts=64, strides=1),
+                strided(d2, basis=addr_c, counts=64, strides=1),
             )
 
         @I.compute
@@ -113,9 +108,8 @@ def build_qkv():
     @qkv.instruction("softmax", src=d2, dst=d2)
     def _(I):
         @I.access
-        def _(I):
-            addr, n = I.addr_params("addr", "n")
-            pat = I.strided(d2, basis=addr, counts=n, strides=1)
+        def _(addr, n):
+            pat = strided(d2, basis=addr, counts=n, strides=1)
             return pat, pat
 
         @I.compute
@@ -134,7 +128,7 @@ def test_parse_tensor_annotation():
 
 
 def test_primitives_have_schema_and_nodes_reference_it():
-    assert isinstance(prim.matmul, ActPrimitive)
+    assert isinstance(prim.matmul, Primitive)
     assert prim.matmul.infer_impl is not None
     assert prim.matmul.build_impl is not None
     assert prim.matmul.lower_impl is not None
@@ -158,9 +152,8 @@ def test_invalid_compute_rejects_bare_tensor_return():
         @qkv.instruction("bad", src=d1, dst=d1)
         def _(I):
             @I.access
-            def _(I):
-                addr, n = I.addr_params("addr", "n")
-                pat = I.strided(d1, basis=addr, counts=n, strides=1)
+            def _(addr, n):
+                pat = strided(d1, basis=addr, counts=n, strides=1)
                 return pat, pat
 
             @I.compute
@@ -187,9 +180,8 @@ def test_duplicate_instruction_name_is_rejected():
     @isa.instruction("copy", src=d1, dst=d1)
     def _(I):
         @I.access
-        def _(I):
-            addr, n = I.addr_params("addr", "n")
-            pat = I.strided(d1, basis=addr, counts=n, strides=1)
+        def _(addr, n):
+            pat = strided(d1, basis=addr, counts=n, strides=1)
             return pat, pat
 
         @I.compute
@@ -201,9 +193,8 @@ def test_duplicate_instruction_name_is_rejected():
         @isa.instruction("copy", src=d1, dst=d1)
         def _(I):
             @I.access
-            def _(I):
-                addr, n = I.addr_params("addr", "n")
-                pat = I.strided(d1, basis=addr, counts=n, strides=1)
+            def _(addr, n):
+                pat = strided(d1, basis=addr, counts=n, strides=1)
                 return pat, pat
 
             @I.compute
@@ -211,21 +202,54 @@ def test_duplicate_instruction_name_is_rejected():
                 return prim.identity(x)
 
 
-def test_address_params_are_unique_and_valid():
+def test_access_signature_parameters_are_checked():
     isa = ISA("AddrParams")
     d1 = isa.vector("d1", slots=1, shape=(64,), dtype=bf16)
 
-    with pytest.raises(ActError):
+    with pytest.raises(ActError, match="must declare address parameters"):
 
-        @isa.instruction("dup_param", src=d1, dst=d1)
+        @isa.instruction("missing_param", src=d1, dst=d1)
         def _(I):
-            I.addr_params("addr", "addr")
+            @I.access
+            def _():
+                pat = strided(d1, basis=0, counts=1, strides=1)
+                return pat, pat
 
-    with pytest.raises(ActError):
+    with pytest.raises(ActError, match="default value"):
 
-        @isa.instruction("bad_param", src=d1, dst=d1)
+        @isa.instruction("default_param", src=d1, dst=d1)
         def _(I):
-            I.addr_params("bad name")
+            @I.access
+            def _(addr=0):
+                pat = strided(d1, basis=addr, counts=1, strides=1)
+                return pat, pat
+
+    with pytest.raises(ActError, match="does not support \\*args"):
+
+        @isa.instruction("varargs_param", src=d1, dst=d1)
+        def _(I):
+            @I.access
+            def _(*addr):
+                pat = strided(d1, basis=0, counts=1, strides=1)
+                return pat, pat
+
+    with pytest.raises(ActError, match="does not support \\*\\*kwargs"):
+
+        @isa.instruction("kwargs_param", src=d1, dst=d1)
+        def _(I):
+            @I.access
+            def _(**addr):
+                pat = strided(d1, basis=0, counts=1, strides=1)
+                return pat, pat
+
+    with pytest.raises(ActError, match="positional address parameters"):
+
+        @isa.instruction("keyword_only_param", src=d1, dst=d1)
+        def _(I):
+            @I.access
+            def _(*, addr):
+                pat = strided(d1, basis=addr, counts=1, strides=1)
+                return pat, pat
 
 
 def test_access_pattern_arity_and_base_buffer_are_checked():
@@ -238,18 +262,16 @@ def test_access_pattern_arity_and_base_buffer_are_checked():
         @isa.instruction("bad_arity", src=d1, dst=d2)
         def _(I):
             @I.access
-            def _(I):
-                addr, n = I.addr_params("addr", "n")
-                return I.strided(d1, basis=addr, counts=n, strides=1)
+            def _(addr, n):
+                return strided(d1, basis=addr, counts=n, strides=1)
 
     with pytest.raises(ActError, match="dst\\[0\\] buffer 'd2'"):
 
         @isa.instruction("bad_base", src=d1, dst=d2)
         def _(I):
             @I.access
-            def _(I):
-                addr, n = I.addr_params("addr", "n")
-                pat = I.strided(d1, basis=addr, counts=n, strides=1)
+            def _(addr, n):
+                pat = strided(d1, basis=addr, counts=n, strides=1)
                 return pat, pat
 
 
@@ -263,11 +285,10 @@ def test_strided_access_parameters_are_checked():
         @isa.instruction("bad_hbm_rank", src=hbm, dst=d1)
         def _(I):
             @I.access
-            def _(I):
-                addr, n = I.addr_params("addr", "n")
+            def _(addr, n):
                 return (
-                    I.strided(hbm, basis=addr, counts=n, strides=1),
-                    I.strided(d1, basis=0, counts=1, strides=1),
+                    strided(hbm, basis=addr, counts=n, strides=1),
+                    strided(d1, basis=0, counts=1, strides=1),
                 )
 
     with pytest.raises(ActError, match="counts must be positive"):
@@ -275,11 +296,10 @@ def test_strided_access_parameters_are_checked():
         @isa.instruction("bad_count", src=d1, dst=d1)
         def _(I):
             @I.access
-            def _(I):
-                I.addr_params("addr")
+            def _(addr):
                 return (
-                    I.strided(d1, basis=0, counts=0, strides=1),
-                    I.strided(d1, basis=0, counts=1, strides=1),
+                    strided(d1, basis=0, counts=0, strides=1),
+                    strided(d1, basis=0, counts=1, strides=1),
                 )
 
     with pytest.raises(ActError, match="out of bounds"):
@@ -287,11 +307,10 @@ def test_strided_access_parameters_are_checked():
         @isa.instruction("bad_bounds", src=d1, dst=d1)
         def _(I):
             @I.access
-            def _(I):
-                I.addr_params("addr")
+            def _(addr):
                 return (
-                    I.strided(d1, basis=3, counts=2, strides=1),
-                    I.strided(d1, basis=0, counts=1, strides=1),
+                    strided(d1, basis=3, counts=2, strides=1),
+                    strided(d1, basis=0, counts=1, strides=1),
                 )
 
 
@@ -304,34 +323,31 @@ def test_relayout_patterns_are_checked():
         @isa.instruction("bad_expand", src=d1, dst=d1)
         def _(I):
             @I.access
-            def _(I):
-                addr = I.addr_params("addr")
-                pat = I.strided(d1, basis=addr, counts=1, strides=1)
-                return I.expand(pat, [[0], [1]], shape=(1, 64))
+            def _(addr):
+                pat = strided(d1, basis=addr, counts=1, strides=1)
+                return expand(pat, [[0], [1]], shape=(1, 64))
 
     with pytest.raises(ActError, match="cover dimensions"):
 
         @isa.instruction("bad_collapse", src=d1, dst=d1)
         def _(I):
             @I.access
-            def _(I):
-                addr = I.addr_params("addr")
-                pat = I.expand(
-                    I.strided(d1, basis=addr, counts=1, strides=1),
+            def _(addr):
+                pat = expand(
+                    strided(d1, basis=addr, counts=1, strides=1),
                     [[0, 1]],
                     shape=(1, 64),
                 )
-                return I.collapse(pat, [[1, 0]])
+                return collapse(pat, [[1, 0]])
 
     with pytest.raises(ActError, match="does not match rank"):
 
         @isa.instruction("bad_transpose", src=d1, dst=d1)
         def _(I):
             @I.access
-            def _(I):
-                addr = I.addr_params("addr")
-                pat = I.strided(d1, basis=addr, counts=1, strides=1)
-                return I.transpose(pat, [1, 0])
+            def _(addr):
+                pat = strided(d1, basis=addr, counts=1, strides=1)
+                return transpose(pat, [1, 0])
 
 
 def test_access_and_compute_are_defined_once():
@@ -343,14 +359,13 @@ def test_access_and_compute_are_defined_once():
         @isa.instruction("dup_access", src=d1, dst=d1)
         def _(I):
             @I.access
-            def _(I):
-                I.addr_params("addr")
-                pat = I.strided(d1, basis=0, counts=1, strides=1)
+            def _(addr):
+                pat = strided(d1, basis=0, counts=1, strides=1)
                 return pat, pat
 
             @I.access
-            def _(I):
-                pat = I.strided(d1, basis=0, counts=1, strides=1)
+            def _(addr):
+                pat = strided(d1, basis=0, counts=1, strides=1)
                 return pat, pat
 
     with pytest.raises(ActError, match="already defines compute semantics"):
@@ -358,9 +373,8 @@ def test_access_and_compute_are_defined_once():
         @isa.instruction("dup_compute", src=d1, dst=d1)
         def _(I):
             @I.access
-            def _(I):
-                I.addr_params("addr")
-                pat = I.strided(d1, basis=0, counts=1, strides=1)
+            def _(addr):
+                pat = strided(d1, basis=0, counts=1, strides=1)
                 return pat, pat
 
             @I.compute
@@ -381,8 +395,7 @@ def test_access_return_and_static_shape_consistency_are_checked():
         @isa.instruction("bad_return", src=d1, dst=d1)
         def _(I):
             @I.access
-            def _(I):
-                I.addr_params("addr")
+            def _(addr):
                 return 1
 
     with pytest.raises(ActError, match="static shape mismatch"):
@@ -390,10 +403,9 @@ def test_access_return_and_static_shape_consistency_are_checked():
         @isa.instruction("bad_expand_product", src=d1, dst=d1)
         def _(I):
             @I.access
-            def _(I):
-                I.addr_params("addr")
-                pat = I.strided(d1, basis=0, counts=1, strides=1)
-                return I.expand(pat, [[0, 1]], shape=(2, 33))
+            def _(addr):
+                pat = strided(d1, basis=0, counts=1, strides=1)
+                return expand(pat, [[0, 1]], shape=(2, 33))
 
 
 def test_collapse_static_product_and_dst_value_semantics():
@@ -405,14 +417,13 @@ def test_collapse_static_product_and_dst_value_semantics():
         @isa.instruction("bad_collapse_annotation", src=d1, dst=d1)
         def _(I):
             @I.access
-            def _(I):
-                I.addr_params("addr")
-                expanded = I.expand(
-                    I.strided(d1, basis=0, counts=1, strides=1),
+            def _(addr):
+                expanded = expand(
+                    strided(d1, basis=0, counts=1, strides=1),
                     [[0, 1]],
                     shape=(8, 8),
                 )
-                collapsed = I.collapse(expanded, [[0, 1]])
+                collapsed = collapse(expanded, [[0, 1]])
                 return collapsed, collapsed
 
             @I.compute
@@ -422,9 +433,8 @@ def test_collapse_static_product_and_dst_value_semantics():
     @isa.instruction("read_dst", src=d1, dst=d1)
     def _(I):
         @I.access
-        def _(I):
-            I.addr_params("addr")
-            pat = I.strided(d1, basis=0, counts=1, strides=1)
+        def _(addr):
+            pat = strided(d1, basis=0, counts=1, strides=1)
             return pat, pat
 
         @I.compute
@@ -445,9 +455,8 @@ def test_compute_arguments_are_checked_against_buffers_and_patterns():
         @isa.instruction("bad_dtype", src=d1, dst=d1)
         def _(I):
             @I.access
-            def _(I):
-                addr, n = I.addr_params("addr", "n")
-                pat = I.strided(d1, basis=addr, counts=n, strides=1)
+            def _(addr, n):
+                pat = strided(d1, basis=addr, counts=n, strides=1)
                 return pat, pat
 
             @I.compute
@@ -459,9 +468,8 @@ def test_compute_arguments_are_checked_against_buffers_and_patterns():
         @isa.instruction("bad_arity", src=d1, dst=d1)
         def _(I):
             @I.access
-            def _(I):
-                addr, n = I.addr_params("addr", "n")
-                pat = I.strided(d1, basis=addr, counts=n, strides=1)
+            def _(addr, n):
+                pat = strided(d1, basis=addr, counts=n, strides=1)
                 return pat, pat
 
             @I.compute
@@ -476,9 +484,8 @@ def test_compute_arguments_are_checked_against_buffers_and_patterns():
         @isa.instruction("bad_dim", src=d1, dst=d1)
         def _(I):
             @I.access
-            def _(I):
-                addr, n = I.addr_params("addr", "n")
-                pat = I.strided(d1, basis=addr, counts=n, strides=1)
+            def _(addr, n):
+                pat = strided(d1, basis=addr, counts=n, strides=1)
                 return pat, pat
 
             @I.compute
@@ -490,9 +497,8 @@ def test_compute_arguments_are_checked_against_buffers_and_patterns():
         @isa.instruction("bad_default", src=d1, dst=d1)
         def _(I):
             @I.access
-            def _(I):
-                addr, n = I.addr_params("addr", "n")
-                pat = I.strided(d1, basis=addr, counts=n, strides=1)
+            def _(addr, n):
+                pat = strided(d1, basis=addr, counts=n, strides=1)
                 return pat, pat
 
             @I.compute
@@ -504,9 +510,8 @@ def test_compute_arguments_are_checked_against_buffers_and_patterns():
         @isa.instruction("missing_annotation", src=d1, dst=d1)
         def _(I):
             @I.access
-            def _(I):
-                addr, n = I.addr_params("addr", "n")
-                pat = I.strided(d1, basis=addr, counts=n, strides=1)
+            def _(addr, n):
+                pat = strided(d1, basis=addr, counts=n, strides=1)
                 return pat, pat
 
             @I.compute
@@ -526,12 +531,11 @@ def test_primitive_and_return_types_are_checked():
         @isa.instruction("bad_matmul", src=[a_buf, b_buf], dst=c_buf)
         def _(I):
             @I.access
-            def _(I):
-                I.addr_params("addr")
+            def _(addr):
                 return (
-                    I.strided(a_buf, basis=0, counts=2, strides=1),
-                    I.strided(b_buf, basis=0, counts=4, strides=1),
-                    I.strided(c_buf, basis=0, counts=2, strides=1),
+                    strided(a_buf, basis=0, counts=2, strides=1),
+                    strided(b_buf, basis=0, counts=4, strides=1),
+                    strided(c_buf, basis=0, counts=2, strides=1),
                 )
 
             @I.compute
@@ -543,9 +547,8 @@ def test_primitive_and_return_types_are_checked():
         @isa.instruction("bad_softmax_dim", src=d1, dst=d1)
         def _(I):
             @I.access
-            def _(I):
-                addr, n = I.addr_params("addr", "n")
-                pat = I.strided(d1, basis=addr, counts=n, strides=1)
+            def _(addr, n):
+                pat = strided(d1, basis=addr, counts=n, strides=1)
                 return pat, pat
 
             @I.compute
@@ -557,9 +560,8 @@ def test_primitive_and_return_types_are_checked():
         @isa.instruction("bad_cast", src=d1, dst=d1)
         def _(I):
             @I.access
-            def _(I):
-                addr, n = I.addr_params("addr", "n")
-                pat = I.strided(d1, basis=addr, counts=n, strides=1)
+            def _(addr, n):
+                pat = strided(d1, basis=addr, counts=n, strides=1)
                 return pat, pat
 
             @I.compute
@@ -571,9 +573,8 @@ def test_primitive_and_return_types_are_checked():
         @isa.instruction("bad_return", src=d1, dst=d1)
         def _(I):
             @I.access
-            def _(I):
-                addr, n = I.addr_params("addr", "n")
-                pat = I.strided(d1, basis=addr, counts=n, strides=1)
+            def _(addr, n):
+                pat = strided(d1, basis=addr, counts=n, strides=1)
                 return pat, pat
 
             @I.compute
@@ -585,9 +586,8 @@ def test_primitive_and_return_types_are_checked():
         @isa.instruction("bad_return_arity", src=d1, dst=d1)
         def _(I):
             @I.access
-            def _(I):
-                addr, n = I.addr_params("addr", "n")
-                pat = I.strided(d1, basis=addr, counts=n, strides=1)
+            def _(addr, n):
+                pat = strided(d1, basis=addr, counts=n, strides=1)
                 return pat, pat
 
             @I.compute

@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import inspect
 import re
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Sequence, overload
@@ -19,6 +21,9 @@ from . import core as _core
 from .core import DType
 
 _BARE_SYMBOL_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_.$-]*")
+_CURRENT_ACCESS_BUILDER: ContextVar["InstructionBuilder | None"] = ContextVar(
+    "_CURRENT_ACCESS_BUILDER", default=None
+)
 
 
 def _check_symbol_name(name: str, kind: str):
@@ -183,72 +188,6 @@ def as_index_expr(value) -> IndexExpr:
     raise ActError(f"Expected an index expression, got '{value}'.")
 
 
-def _mul_shape_dims(dims: Sequence[IndexExpr]) -> IndexExpr:
-    assert len(dims) > 0
-    if all(dim.is_static for dim in dims):
-        value = 1
-        for dim in dims:
-            value *= dim.static_value
-        return IndexExpr("const", value=value)
-    result = dims[0]
-    for dim in dims[1:]:
-        result = result * dim
-    return result
-
-
-def _static_product(dims: Sequence[IndexExpr]) -> int | None:
-    if not all(dim.is_static for dim in dims):
-        return None
-    value = 1
-    for dim in dims:
-        value *= dim.static_value
-    return value
-
-
-def _check_static_index(expr: IndexExpr, pred: Callable[[int], bool], message: str):
-    if expr.is_static and not pred(expr.static_value):
-        raise ActError(message)
-
-
-def _check_static_dim(expr: IndexExpr, where: str):
-    _check_static_index(
-        expr, lambda value: value > 0, f"{where} dimensions must be positive."
-    )
-
-
-def _check_reassociation_covers(
-    reassociation: tuple[tuple[int, ...], ...], rank: int, where: str
-):
-    if len(reassociation) == 0:
-        raise ActError(f"{where} reassociation must not be empty.")
-    if any(len(group) == 0 for group in reassociation):
-        raise ActError(f"{where} reassociation groups must not be empty.")
-    flat = [idx for group in reassociation for idx in group]
-    if flat != list(range(rank)):
-        raise ActError(
-            f"{where} reassociation must cover dimensions 0..{rank - 1} in order."
-        )
-
-
-def _check_expand_shape_static_consistency(
-    source_shape: tuple[IndexExpr, ...],
-    reassociation: tuple[tuple[int, ...], ...],
-    output_shape: tuple[IndexExpr, ...],
-):
-    for source_dim, group in zip(source_shape, reassociation):
-        output_product = _static_product([output_shape[i] for i in group])
-        if (
-            source_dim.is_static
-            and output_product is not None
-            and source_dim.static_value != output_product
-        ):
-            raise ActError(
-                "expand_shape static shape mismatch: "
-                f"source dimension is {source_dim.static_value}, "
-                f"but reassociation group {group} has product {output_product}."
-            )
-
-
 def _operand_role(inst: "InstructionSpec", index: int) -> str:
     if index < len(inst.sources):
         return f"src[{index}] buffer '{inst.sources[index].name}'"
@@ -289,48 +228,133 @@ class BufferSpec:
         return shape
 
 
+class PatternOp:
+    def __init__(self, fn: Callable[..., Any]):
+        self.name = fn.__name__
+        self.build_impl: Callable[..., "PatternExpr"] | None = None
+        self.shape_impl: Callable[["PatternExpr"], tuple[IndexExpr, ...]] | None = None
+        self.verify_impl: Callable[["PatternExpr"], None] | None = None
+        self.lower_impl: Callable[..., str] | None = None
+        self.__doc__ = fn.__doc__
+        self.__name__ = fn.__name__
+
+    def __call__(self, *args: Any, **kwargs: Any) -> "PatternExpr":
+        location = capture_act_location()
+        builder = _require_access_builder(f"Pattern '{self.name}'")
+        if self.build_impl is None:
+            raise ActError(
+                f"Pattern '{self.name}' does not define trace construction.",
+                location=location,
+            )
+        try:
+            result = self.build_impl(*args, **kwargs)
+            builder._check_pattern(result)
+        except ActError as error:
+            error.attach_location(location)
+            raise
+        result.location = location
+        return result
+
+    def build(self, fn: Callable[..., "PatternExpr"]) -> Callable[..., "PatternExpr"]:
+        assert self.build_impl is None
+        assert callable(fn), "Pattern build function must be callable."
+        self.build_impl = fn
+        return fn
+
+    def shape(
+        self, fn: Callable[["PatternExpr"], tuple[IndexExpr, ...]]
+    ) -> Callable[["PatternExpr"], tuple[IndexExpr, ...]]:
+        assert self.shape_impl is None
+        assert callable(fn), "Pattern shape function must be callable."
+        self.shape_impl = fn
+        return fn
+
+    def verify(
+        self, fn: Callable[["PatternExpr"], None]
+    ) -> Callable[["PatternExpr"], None]:
+        assert self.verify_impl is None
+        assert callable(fn), "Pattern verify function must be callable."
+        self.verify_impl = fn
+        return fn
+
+    def lower(self, fn: Callable[..., str]) -> Callable[..., str]:
+        assert self.lower_impl is None
+        assert callable(fn), "Pattern lower function must be callable."
+        self.lower_impl = fn
+        return fn
+
+    def create(
+        self,
+        *,
+        attrs: dict[str, Any] | None = None,
+        source: "PatternExpr | None" = None,
+        buffer: BufferSpec | None = None,
+        location: DiagnosticLocation | None = None,
+    ) -> "PatternExpr":
+        expr = PatternExpr(
+            self, attrs or {}, source=source, buffer=buffer, location=location
+        )
+        if self.verify_impl is not None:
+            self.verify_impl(expr)
+        return expr
+
+
+def pattern(fn: Callable[..., Any]) -> PatternOp:
+    return PatternOp(fn)
+
+
+def _collect_index_params(value) -> set[str]:
+    if isinstance(value, IndexExpr):
+        return value.collect_params()
+    if isinstance(value, (tuple, list)):
+        params = set()
+        for item in value:
+            params |= _collect_index_params(item)
+        return params
+    return set()
+
+
+@contextmanager
+def _access_context(builder: "InstructionBuilder"):
+    token = _CURRENT_ACCESS_BUILDER.set(builder)
+    try:
+        yield
+    finally:
+        _CURRENT_ACCESS_BUILDER.reset(token)
+
+
+def _require_access_builder(where: str) -> "InstructionBuilder":
+    builder = _CURRENT_ACCESS_BUILDER.get()
+    if builder is None:
+        raise ActError(f"{where} can only be used inside an access region.")
+    return builder
+
+
 @dataclass
 class PatternExpr:
-    kind: str
-    buffer: BufferSpec | None = None
-    basis: tuple[IndexExpr, ...] = ()
-    counts: tuple[IndexExpr, ...] = ()
-    strides: tuple[IndexExpr, ...] = ()
+    pattern: PatternOp
+    attrs: dict[str, Any] = field(default_factory=dict)
     source: "PatternExpr | None" = None
-    reassociation: tuple[tuple[int, ...], ...] = ()
-    output_shape: tuple[IndexExpr, ...] = ()
-    permutation: tuple[int, ...] = ()
+    buffer: BufferSpec | None = None
+    location: DiagnosticLocation | None = None
+
+    @property
+    def kind(self) -> str:
+        return self.pattern.name
 
     def visible_shape(self) -> tuple[IndexExpr, ...]:
-        if self.kind == "strided":
-            assert self.buffer is not None
-            return self.buffer.visible_shape_for_counts(self.counts)
-        if self.kind == "expand":
-            return self.output_shape
-        if self.kind == "collapse":
-            assert self.source is not None
-            source_shape = self.source.visible_shape()
-            return tuple(
-                _mul_shape_dims([source_shape[i] for i in group])
-                for group in self.reassociation
-            )
-        if self.kind == "transpose":
-            assert self.source is not None
-            source_shape = self.source.visible_shape()
-            return tuple(source_shape[i] for i in self.permutation)
-        assert False, f"unknown pattern kind: {self.kind}"
+        shape = self.pattern.shape_impl
+        assert shape is not None, f"Pattern '{self.kind}' does not define shape."
+        return shape(self)
 
     def collect_params(self) -> set[str]:
-        params = set()
-        for expr in self.basis + self.counts + self.strides + self.output_shape:
-            params |= expr.collect_params()
-        if self.source is not None:
-            params |= self.source.collect_params()
+        params = self.source.collect_params() if self.source is not None else set()
+        for value in self.attrs.values():
+            params |= _collect_index_params(value)
         return params
 
     def base_buffer(self) -> BufferSpec:
-        if self.kind == "strided":
-            assert self.buffer is not None
+        if self.buffer is not None:
             return self.buffer
         assert self.source is not None
         return self.source.base_buffer()
@@ -344,14 +368,13 @@ class TensorProxy:
     producer: "PrimitiveNode | None" = None
 
 
-class ActPrimitive:
+class Primitive:
     def __init__(
         self,
         fn: Callable[..., Any],
         *,
         legal_regions: Sequence[str] = ("compute",),
     ):
-        self.fn = fn
         self.name = fn.__name__
         self.legal_regions = tuple(legal_regions)
         self.infer_impl: Callable[..., ActTensorType] | None = None
@@ -414,22 +437,22 @@ class ActPrimitive:
 
 
 @overload
-def primitive(fn: Callable[..., Any]) -> ActPrimitive: ...
+def primitive(fn: Callable[..., Any]) -> Primitive: ...
 
 
 @overload
 def primitive(
     *, legal_regions: Sequence[str] = ("compute",)
-) -> Callable[[Callable[..., Any]], ActPrimitive]: ...
+) -> Callable[[Callable[..., Any]], Primitive]: ...
 
 
 def primitive(
     fn: Callable[..., Any] | None = None,
     *,
     legal_regions: Sequence[str] = ("compute",),
-) -> ActPrimitive | Callable[[Callable[..., Any]], ActPrimitive]:
-    def decorator(fn: Callable[..., Any]) -> ActPrimitive:
-        return ActPrimitive(fn, legal_regions=legal_regions)
+) -> Primitive | Callable[[Callable[..., Any]], Primitive]:
+    def decorator(fn: Callable[..., Any]) -> Primitive:
+        return Primitive(fn, legal_regions=legal_regions)
 
     if fn is not None:
         return decorator(fn)
@@ -438,7 +461,7 @@ def primitive(
 
 @dataclass(eq=False)
 class PrimitiveNode:
-    primitive: ActPrimitive
+    primitive: Primitive
     inputs: tuple[TensorProxy, ...]
     attrs: dict
     result_type: ActTensorType
@@ -484,12 +507,12 @@ class ComputeContext:
 
     def add_node(
         self,
-        primitive: ActPrimitive,
+        primitive: Primitive,
         inputs: Sequence[TensorProxy],
         attrs: dict,
         result_type: ActTensorType,
     ) -> TensorProxy:
-        assert isinstance(primitive, ActPrimitive)
+        assert isinstance(primitive, Primitive)
         assert isinstance(result_type, ActTensorType)
         for inp in inputs:
             if not isinstance(inp, TensorProxy):
@@ -584,96 +607,6 @@ class InstructionBuilder:
     def __init__(self, spec: InstructionSpec):
         self.spec = spec
 
-    def addr_params(self, *names: str):
-        if len(self.spec.addr_params) != 0:
-            raise ActError(
-                f"Instruction '{self.spec.name}' already declared address parameters."
-            )
-        if len(set(names)) != len(names):
-            raise ActError(
-                f"Instruction '{self.spec.name}' has duplicate address parameters."
-            )
-        for name in names:
-            _check_symbol_name(name, "address parameter")
-        self.spec.addr_params = list(names)
-        values = tuple(IndexExpr("param", value=name) for name in names)
-        return values[0] if len(values) == 1 else values
-
-    def strided(self, buffer: BufferSpec, *, basis, counts, strides) -> PatternExpr:
-        self._check_buffer(buffer)
-        basis_exprs = tuple(as_index_expr(v) for v in _as_tuple(basis))
-        count_exprs = tuple(as_index_expr(v) for v in _as_tuple(counts))
-        stride_exprs = tuple(as_index_expr(v) for v in _as_tuple(strides))
-        self._check_strided_indices(buffer, basis_exprs, count_exprs, stride_exprs)
-        return PatternExpr(
-            "strided",
-            buffer=buffer,
-            basis=basis_exprs,
-            counts=count_exprs,
-            strides=stride_exprs,
-        )
-
-    def expand(
-        self,
-        source: PatternExpr,
-        reassociation: Sequence[Sequence[int]],
-        *,
-        shape: Sequence,
-    ) -> PatternExpr:
-        self._check_pattern(source)
-        reassoc = tuple(tuple(group) for group in reassociation)
-        output_shape = tuple(as_index_expr(dim) for dim in shape)
-        if len(reassoc) != len(source.visible_shape()):
-            raise ActError(
-                "expand_shape reassociation must have one group per source dimension."
-            )
-        _check_reassociation_covers(reassoc, len(output_shape), "expand_shape")
-        for dim in output_shape:
-            _check_static_dim(dim, "expand_shape output")
-        _check_expand_shape_static_consistency(
-            source.visible_shape(), reassoc, output_shape
-        )
-        return PatternExpr(
-            "expand",
-            source=source,
-            reassociation=reassoc,
-            output_shape=output_shape,
-        )
-
-    def expand_shape(
-        self,
-        source: PatternExpr,
-        reassociation: Sequence[Sequence[int]],
-        *,
-        shape: Sequence,
-    ) -> PatternExpr:
-        return self.expand(source, reassociation, shape=shape)
-
-    def collapse(
-        self, source: PatternExpr, reassociation: Sequence[Sequence[int]]
-    ) -> PatternExpr:
-        self._check_pattern(source)
-        reassoc = tuple(tuple(group) for group in reassociation)
-        _check_reassociation_covers(
-            reassoc, len(source.visible_shape()), "collapse_shape"
-        )
-        return PatternExpr("collapse", source=source, reassociation=reassoc)
-
-    def collapse_shape(
-        self, source: PatternExpr, reassociation: Sequence[Sequence[int]]
-    ) -> PatternExpr:
-        return self.collapse(source, reassociation)
-
-    def transpose(self, source: PatternExpr, permutation: Sequence[int]) -> PatternExpr:
-        self._check_pattern(source)
-        shape_rank = len(source.visible_shape())
-        perm = tuple(permutation)
-        if sorted(perm) != list(range(shape_rank)):
-            raise ActError(
-                f"transpose permutation {perm} does not match rank {shape_rank}."
-            )
-        return PatternExpr("transpose", source=source, permutation=perm)
-
     def access(self, fn: Callable):
         location = callable_diagnostic_location(fn, marker=".access")
         if len(self.spec.patterns) != 0:
@@ -685,18 +618,9 @@ class InstructionBuilder:
         try:
             signature = inspect.signature(fn)
             params = list(signature.parameters.values())
-            if len(params) != 1 or params[0].kind not in (
-                inspect.Parameter.POSITIONAL_ONLY,
-                inspect.Parameter.POSITIONAL_OR_KEYWORD,
-            ):
-                raise ActError(
-                    f"Access for '{self.spec.name}' expects one builder argument."
-                )
-            if params[0].default is not inspect.Parameter.empty:
-                raise ActError(
-                    f"Access argument '{params[0].name}' must not have a default value."
-                )
-            result = fn(self)
+            args = self._make_access_args(params)
+            with _access_context(self):
+                result = fn(*args)
         except ActError as error:
             error.attach_location(location or self.spec.location)
             raise
@@ -707,6 +631,36 @@ class InstructionBuilder:
             error.attach_location(location or self.spec.location, override=True)
             raise
         return fn
+
+    def _make_access_args(self, params: Sequence[inspect.Parameter]):
+        if len(params) == 0:
+            raise ActError(
+                f"Access for '{self.spec.name}' must declare address parameters."
+            )
+        for param in params:
+            self._check_access_param(param)
+        names = [param.name for param in params]
+        if len(set(names)) != len(names):
+            raise ActError(
+                f"Instruction '{self.spec.name}' has duplicate address parameters."
+            )
+        self.spec.addr_params = names
+        return [IndexExpr("param", value=name) for name in names]
+
+    def _check_access_param(self, param: inspect.Parameter):
+        if param.kind == inspect.Parameter.VAR_POSITIONAL:
+            raise ActError(f"Access for '{self.spec.name}' does not support *args.")
+        if param.kind == inspect.Parameter.VAR_KEYWORD:
+            raise ActError(f"Access for '{self.spec.name}' does not support **kwargs.")
+        if param.kind == inspect.Parameter.KEYWORD_ONLY:
+            raise ActError(
+                f"Access for '{self.spec.name}' only supports positional address parameters."
+            )
+        if param.default is not inspect.Parameter.empty:
+            raise ActError(
+                f"Access parameter '{param.name}' must not have a default value."
+            )
+        _check_symbol_name(param.name, "address parameter")
 
     def _normalize_access_return(self, result) -> tuple[PatternExpr, ...]:
         if isinstance(result, PatternExpr):
@@ -788,94 +742,15 @@ class InstructionBuilder:
                 f"Instruction '{self.spec.name}' references a buffer outside ISA '{self.spec.isa.name}'."
             )
 
-    def _check_strided_indices(
-        self,
-        buffer: BufferSpec,
-        basis: Sequence[IndexExpr],
-        counts: Sequence[IndexExpr],
-        strides: Sequence[IndexExpr],
-    ):
-        if not (len(basis) == len(counts) == len(strides)):
-            raise ActError(
-                "strided basis, counts, and strides must have the same rank."
-            )
-        if buffer.kind == "hbm" and len(counts) != len(buffer.shape):
-            raise ActError(
-                f"HBM strided access expects rank {len(buffer.shape)}, got {len(counts)}."
-            )
-        if buffer.kind != "hbm" and len(counts) != 1:
-            raise ActError("MVP frontend only supports 1-D on-chip strided accesses.")
-        for expr in basis:
-            _check_static_index(
-                expr,
-                lambda value: value >= 0,
-                "strided basis must be non-negative.",
-            )
-        for expr in counts:
-            _check_static_index(
-                expr, lambda value: value > 0, "strided counts must be positive."
-            )
-        for expr in strides:
-            _check_static_index(
-                expr, lambda value: value > 0, "strided strides must be positive."
-            )
-
-        limits = buffer.shape if buffer.kind == "hbm" else (buffer.slots,)
-        for i, (base, count, stride, limit) in enumerate(
-            zip(basis, counts, strides, limits)
-        ):
-            if base.is_static and count.is_static and stride.is_static:
-                max_index = base.static_value + stride.static_value * (
-                    count.static_value - 1
-                )
-                if max_index >= limit:
-                    raise ActError(
-                        f"strided access for buffer '{buffer.name}' is out of bounds in dimension {i}."
-                    )
-
     def _check_pattern(self, pattern: PatternExpr):
         if not isinstance(pattern, PatternExpr):
             raise ActError(
                 f"Instruction '{self.spec.name}' access expects access patterns."
             )
-        if pattern.kind == "strided":
-            assert pattern.buffer is not None
+        if pattern.buffer is not None:
             self._check_buffer(pattern.buffer)
-            self._check_strided_indices(
-                pattern.buffer, pattern.basis, pattern.counts, pattern.strides
-            )
-            return
-        assert pattern.source is not None
-        self._check_pattern(pattern.source)
-        if pattern.kind == "expand":
-            if len(pattern.reassociation) != len(pattern.source.visible_shape()):
-                raise ActError(
-                    "expand_shape reassociation must have one group per source dimension."
-                )
-            _check_reassociation_covers(
-                pattern.reassociation, len(pattern.output_shape), "expand_shape"
-            )
-            for dim in pattern.output_shape:
-                _check_static_dim(dim, "expand_shape output")
-            _check_expand_shape_static_consistency(
-                pattern.source.visible_shape(),
-                pattern.reassociation,
-                pattern.output_shape,
-            )
-        elif pattern.kind == "collapse":
-            _check_reassociation_covers(
-                pattern.reassociation,
-                len(pattern.source.visible_shape()),
-                "collapse_shape",
-            )
-        elif pattern.kind == "transpose":
-            shape_rank = len(pattern.source.visible_shape())
-            if sorted(pattern.permutation) != list(range(shape_rank)):
-                raise ActError(
-                    f"transpose permutation {pattern.permutation} does not match rank {shape_rank}."
-                )
-        else:
-            raise ActError(f"Unsupported access pattern '{pattern.kind}'.")
+        if pattern.source is not None:
+            self._check_pattern(pattern.source)
 
     def _check_compute_param(self, param: inspect.Parameter):
         if param.kind not in (

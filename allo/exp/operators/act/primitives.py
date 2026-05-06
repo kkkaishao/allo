@@ -5,14 +5,14 @@ from __future__ import annotations
 
 from typing import NoReturn
 
-from ..compiler.errors import ActError
-from ..lang.act import (
+from ...compiler.errors import ActError
+from ...lang.act import (
     ActTensorType,
     TensorProxy,
     dtype_to_mlir,
     primitive,
 )
-from ..lang.core import DType
+from ...lang.core import DType
 
 
 def _expect_tensor(value, name: str) -> TensorProxy:
