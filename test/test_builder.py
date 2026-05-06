@@ -22,6 +22,12 @@ from allo.exp.lang.kernel import KernelOptions, consteval, kernel
 from allo.exp.operators.arith import max as allo_max
 
 
+_GLOBAL_SHAPE_M = 2
+_GLOBAL_SHAPE_N = 3
+_GLOBAL_INT_CONST = 3
+_GLOBAL_FLOAT_CONST = 1.5
+
+
 def _compile_ir(fn, *, options=None) -> str:
     return str(compile_kernel(fn, options=options))
 
@@ -265,6 +271,22 @@ def test_range_loop_store():
     )
 
 
+def test_python_builtin_range_loop_store():
+    @kernel
+    def python_builtin_range_loop_store(out: "i32[4]"):
+        for i in range(4):
+            out[i] = i
+
+    ir = _compile_ir(python_builtin_range_loop_store)
+    _assert_contains(
+        ir,
+        "func.func @python_builtin_range_loop_store",
+        "scf.for",
+        "to %c4 step %c1",
+        "memref.store",
+    )
+
+
 def test_grid_loop_store():
     @kernel
     def grid_loop_store(out: "i32[2, 2]"):
@@ -292,6 +314,138 @@ def test_direct_operator_call():
     ir = _compile_ir(direct_operator_call)
     _assert_contains(
         ir, "func.func @direct_operator_call", "arith.maxsi", "memref.store"
+    )
+
+
+def test_python_builtin_max_min_calls():
+    @kernel
+    def python_builtin_max_min_calls(x: i32, y: i32, out: "i32[2]"):
+        out[0] = max(x, y)
+        out[1] = min(x, y)
+
+    ir = _compile_ir(python_builtin_max_min_calls)
+    _assert_contains(
+        ir,
+        "func.func @python_builtin_max_min_calls",
+        "arith.maxsi",
+        "arith.minsi",
+        "memref.store",
+    )
+
+
+def test_global_scalar_constants_are_constexpr():
+    @kernel
+    def global_scalar_constants_are_constexpr(x: i32, y: f32, out: "f32[2]"):
+        out[0] = x + _GLOBAL_INT_CONST
+        out[1] = y + _GLOBAL_FLOAT_CONST
+
+    ir = _compile_ir(global_scalar_constants_are_constexpr)
+    _assert_contains(
+        ir,
+        "func.func @global_scalar_constants_are_constexpr",
+        "arith.constant 3",
+        "arith.constant 1.500000e+00",
+        "arith.addi",
+        "arith.addf",
+        "memref.store",
+    )
+
+
+def test_global_constexpr_shape_expression_annotation():
+    @kernel
+    def global_constexpr_shape_expression_annotation(
+        inp: "i32[_GLOBAL_SHAPE_M * _GLOBAL_SHAPE_N]",
+        out: "i32[_GLOBAL_SHAPE_M, _GLOBAL_SHAPE_N]",
+    ):
+        for i in range(_GLOBAL_SHAPE_M):
+            for j in range(_GLOBAL_SHAPE_N):
+                out[i, j] = inp[i * _GLOBAL_SHAPE_N + j]
+
+    ir = _compile_ir(global_constexpr_shape_expression_annotation)
+    _assert_contains(
+        ir,
+        "func.func @global_constexpr_shape_expression_annotation",
+        "memref<6xi32>",
+        "memref<2x3xi32>",
+        "scf.for",
+        "memref.store",
+    )
+
+
+def test_definition_scope_shape_annotation():
+    rows = 2
+    cols = 2
+
+    @kernel
+    def definition_scope_shape_annotation(out: "i32[rows, cols]"):
+        for i, j in allo_grid(2, 2):
+            out[i, j] = i + j
+
+    ir = _compile_ir(definition_scope_shape_annotation)
+    _assert_contains(
+        ir,
+        "func.func @definition_scope_shape_annotation",
+        "memref<2x2xi32>",
+        "scf.parallel",
+        "memref.store",
+    )
+
+
+def test_local_memref_declaration_without_initializer():
+    @kernel
+    def local_memref_declaration_without_initializer(out: "i32[4]"):
+        N: constexpr = 4
+        buf: "i32[N]"
+        for i in range(N):
+            buf[i] = i
+            out[i] = buf[i]
+
+    ir = _compile_ir(local_memref_declaration_without_initializer)
+    _assert_contains(
+        ir,
+        "func.func @local_memref_declaration_without_initializer",
+        "memref.alloc",
+        "memref<4xi32>",
+        "memref.load",
+        "memref.store",
+    )
+
+
+def test_local_tensor_declaration_without_initializer():
+    @kernel(options=KernelOptions(enable_tensor=True))
+    def local_tensor_declaration_without_initializer() -> "f32[4]":
+        N: constexpr = 4
+        buf: "f32[N]"
+        return buf
+
+    ir = _compile_ir(local_tensor_declaration_without_initializer)
+    _assert_contains(
+        ir,
+        "func.func @local_tensor_declaration_without_initializer",
+        "tensor.empty",
+        "tensor<4xf32>",
+        "return",
+    )
+
+
+def test_while_loop_carried_values():
+    @kernel
+    def while_loop_carried_values(out: "i32[1]"):
+        i: i32 = 0
+        acc: i32 = 0
+        while i < 4:
+            acc += i
+            i += 1
+        out[0] = acc
+
+    ir = _compile_ir(while_loop_carried_values)
+    _assert_contains(
+        ir,
+        "func.func @while_loop_carried_values",
+        "scf.while",
+        "scf.condition",
+        "scf.yield",
+        "memref.store",
     )
 
 

@@ -23,16 +23,49 @@ R = TypeVar("R")
 T = TypeVar("T")
 
 
-def _parse_shape_dims(content: str) -> list[int]:
+def _eval_shape_dim(node: ast.AST, scope: dict[str, object]) -> int:
+    if isinstance(node, ast.Constant):
+        value = node.value
+    elif isinstance(node, ast.Name):
+        if node.id not in scope:
+            raise TypeError(f"Unknown shape variable '{node.id}'")
+        value = unwrap_if_constexpr(scope[node.id])
+    elif isinstance(node, ast.UnaryOp):
+        value = _eval_shape_dim(node.operand, scope)
+        if isinstance(node.op, ast.UAdd):
+            return value
+        if isinstance(node.op, ast.USub):
+            return -value
+        raise TypeError(f"Unsupported shape expression: {ast.unparse(node)}")
+    elif isinstance(node, ast.BinOp):
+        lhs = _eval_shape_dim(node.left, scope)
+        rhs = _eval_shape_dim(node.right, scope)
+        if isinstance(node.op, ast.Add):
+            return lhs + rhs
+        if isinstance(node.op, ast.Sub):
+            return lhs - rhs
+        if isinstance(node.op, ast.Mult):
+            return lhs * rhs
+        if isinstance(node.op, ast.FloorDiv):
+            return lhs // rhs
+        raise TypeError(f"Unsupported shape expression: {ast.unparse(node)}")
+    else:
+        raise TypeError(f"Unsupported shape expression: {ast.unparse(node)}")
+
+    if type(value) is not int:
+        raise TypeError(f"Shape expression '{ast.unparse(node)}' must be constexpr int")
+    return value
+
+
+def _parse_shape_dims(content: str, scope: dict[str, object]) -> list[int]:
     raw = content.strip()
     if raw == "":
         return []
-    dims = []
-    for tok in raw.split(","):
-        tok = tok.strip()
-        if not re.fullmatch(r"\d+", tok):
-            raise TypeError(f"Unsupported type annotation: [{content}]")
-        dims.append(int(tok))
+    expr = ast.parse(raw, mode="eval").body
+    dim_exprs = expr.elts if isinstance(expr, ast.Tuple) else [expr]
+    dims = [_eval_shape_dim(dim, scope) for dim in dim_exprs]
+    if any(dim < 0 for dim in dims):
+        raise TypeError(f"Shape dimensions must be non-negative: [{content}]")
     return dims
 
 
@@ -80,7 +113,12 @@ class KernelOptions:
 
 class Kernel(Generic[P, R]):
     def __init__(
-        self, fn: Callable[P, R], *, mapping: Sequence, options: KernelOptions
+        self,
+        fn: Callable[P, R],
+        *,
+        mapping: Sequence,
+        options: KernelOptions,
+        definition_scope: dict[str, object] | None = None,
     ):
         self.fn = fn
         self.file_name = fn.__code__.co_filename
@@ -88,6 +126,9 @@ class Kernel(Generic[P, R]):
         self.signature = inspect.signature(fn)
         self.mapping = mapping
         self.options = options
+        self.definition_scope = (
+            {} if definition_scope is None else definition_scope.copy()
+        )
         self.module: ModuleOp | None = None
         self.context: Context | None = None
 
@@ -130,15 +171,20 @@ class Kernel(Generic[P, R]):
 
     def get_capture_scope(self):
         fn = self.fn
+        scope = self.__globals__ | self.definition_scope
         if fn.__closure__ is None:
-            return self.__globals__
+            return scope
         nonlocals = {
             name: cell.cell_contents
             for name, cell in zip(fn.__code__.co_freevars, fn.__closure__)
         }
-        return self.__globals__ | nonlocals
+        return scope | nonlocals
 
-    def parse_type_annotation(self, annotation: object) -> TypeBase:
+    def parse_type_annotation(
+        self, annotation: object, scope: dict[str, object] | None = None
+    ) -> TypeBase:
+        if scope is None:
+            scope = self.get_capture_scope()
         annotation = unwrap_if_constexpr(annotation)
         if annotation is constexpr:
             return constexpr
@@ -147,30 +193,31 @@ class Kernel(Generic[P, R]):
         if isinstance(annotation, str):
             annotation = annotation.strip()
             # Case 1: direct type name, e.g. "int32"
-            primitive_type = self.__globals__.get(annotation, None)
+            primitive_type = unwrap_if_constexpr(scope.get(annotation, None))
             if primitive_type is not None and isinstance(primitive_type, TypeBase):
                 return primitive_type
             head, groups = _split_annotation_groups(annotation)
-            if head in self.__globals__:
+            if head in scope:
                 # Case 2: shaped type, e.g. "int32[4, 8]"
-                if isinstance(self.__globals__[head], DType) and len(groups) == 1:
-                    dtype = self.__globals__[head]
-                    shape = _parse_shape_dims(groups[0])
+                head_value = unwrap_if_constexpr(scope[head])
+                if isinstance(head_value, DType) and len(groups) == 1:
+                    dtype = head_value
+                    shape = _parse_shape_dims(groups[0], scope)
                     if self.options.enable_tensor:
                         return TensorType(dtype=dtype, shape=shape)
                     return BufferType(dtype=dtype, shape=shape)
-                composite_type = self.__globals__[head]
         raise TypeError(f"Unsupported type annotation: {annotation}")
 
     def parse_argument_annotations(self) -> list[TypeBase]:
         arg_types = []
+        scope = self.get_capture_scope()
         for param in self.signature.parameters.values():
             annotation = param.annotation
             if annotation is inspect.Parameter.empty:
                 raise TypeError(
                     f"Parameter '{param.name}' is missing a type annotation. Please provide an explicit type annotation for all parameters."
                 )
-            arg_types.append(self.parse_type_annotation(annotation))
+            arg_types.append(self.parse_type_annotation(annotation, scope=scope))
         return arg_types
 
     def parse_return_annotation(self) -> list[TypeBase]:
@@ -178,9 +225,10 @@ class Kernel(Generic[P, R]):
         annotation = unwrap_if_constexpr(annotation)
         if annotation is inspect.Signature.empty or annotation is None:
             return []
+        scope = self.get_capture_scope()
         if isinstance(annotation, tuple):
-            return [self.parse_type_annotation(elt) for elt in annotation]
-        return [self.parse_type_annotation(annotation)]
+            return [self.parse_type_annotation(elt, scope=scope) for elt in annotation]
+        return [self.parse_type_annotation(annotation, scope=scope)]
 
     def compile(self):
         if self.module is not None:
@@ -209,12 +257,17 @@ def kernel(
     mapping: Sequence = (),
     options: KernelOptions = KernelOptions(),
 ) -> Kernel[P, R] | Callable[[Callable[P, R]], Kernel[P, R]]:
+    frame = inspect.currentframe()
+    assert frame is not None and frame.f_back is not None
+    definition_scope = frame.f_back.f_locals.copy()
 
     def decorator(fn: Callable[P, R]) -> Kernel[P, R]:
         assert callable(
             fn
         ), "The @kernel decorator can only be applied to callable objects"
-        return Kernel(fn, mapping=mapping, options=options)
+        return Kernel(
+            fn, mapping=mapping, options=options, definition_scope=definition_scope
+        )
 
     if fn is not None:
         return decorator(fn)

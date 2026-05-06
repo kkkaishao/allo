@@ -177,7 +177,11 @@ class MLIRCodeGenerator(ast.NodeVisitor):
 
         self.compile_error = self.builder.compile_error
 
-    builtin_namespace = {}
+    builtin_namespace = {
+        "range": Range,
+        "max": arith_ops.max,
+        "min": arith_ops.min,
+    }
 
     def _define_name_lookup(self):
         def local_lookup(name: str, absent):
@@ -213,6 +217,8 @@ class MLIRCodeGenerator(ast.NodeVisitor):
         def global_lookup(name: str, absent):
             val = self.gscope.get(name, absent)
             if self._is_allowed_global_var(name, val, absent):
+                if self._is_python_scalar_const(val):
+                    return ConstexprValue(val)
                 return val
             return absent
 
@@ -241,6 +247,10 @@ class MLIRCodeGenerator(ast.NodeVisitor):
             return False
         return isinstance(val, ConstexprValue)
 
+    @staticmethod
+    def _is_python_scalar_const(val: object):
+        return isinstance(val, (builtins.int, builtins.float))
+
     def _is_allowed_static_value(self, name: str, val: object):
         return (
             name in self.builtin_namespace
@@ -263,8 +273,10 @@ class MLIRCodeGenerator(ast.NodeVisitor):
             # allow all global names when visiting default argument values, since we don't have good way to track the usage of default argument values and enforce the restriction only on used ones. This is a bit unsound but should be fine in practice since default argument values are usually simple and unlikely to have side effects.
             return True
 
-        return self._is_allowed_static_value(name, val) or self._is_global_constexpr(
-            name
+        return (
+            self._is_allowed_static_value(name, val)
+            or self._is_global_constexpr(name)
+            or self._is_python_scalar_const(val)
         )
 
     @contextmanager
@@ -1222,12 +1234,24 @@ class MLIRCodeGenerator(ast.NodeVisitor):
             f"Unsupported annotation expression '{ast.unparse(annotation)}'."
         )
 
+    def _type_annotation_scope(self):
+        scope = self.builtin_namespace.copy()
+        scope.update(self.gscope)
+        scope.update(self.closure_scope)
+        scope.update(self.fscope)
+        scope.update(self.lscope)
+        for key, value in list(scope.items()):
+            if self._is_python_scalar_const(value):
+                scope[key] = ConstexprValue(value)
+        return scope
+
     def _parse_annotation(self, annotation: ast.AST, name: str) -> TypeBase:
+        scope = self._type_annotation_scope()
         if isinstance(annotation, ast.Constant) and annotation.value is None:
             return self.compile_error(f"Missing type annotation for '{name}'.")
         if isinstance(annotation, ast.Constant) and isinstance(annotation.value, str):
             try:
-                return self.kernel.parse_type_annotation(annotation.value)
+                return self.kernel.parse_type_annotation(annotation.value, scope=scope)
             except Exception as e:
                 return self.compile_error(
                     f"Unsupported type annotation '{annotation.value}' for '{name}': {e}"
@@ -1235,7 +1259,7 @@ class MLIRCodeGenerator(ast.NodeVisitor):
         if isinstance(annotation, (ast.Name, ast.Attribute)):
             resolved = self._resolve_annotation_symbol(annotation)
             try:
-                return self.kernel.parse_type_annotation(resolved)
+                return self.kernel.parse_type_annotation(resolved, scope=scope)
             except Exception:
                 pass
 
@@ -1243,7 +1267,7 @@ class MLIRCodeGenerator(ast.NodeVisitor):
         if annotation_text in {"constexpr", "Constexpr"}:
             return constexpr
         try:
-            return self.kernel.parse_type_annotation(annotation_text)
+            return self.kernel.parse_type_annotation(annotation_text, scope=scope)
         except Exception as e:
             return self.compile_error(
                 f"Unsupported type annotation '{annotation_text}' for '{name}': {e}"
@@ -1262,12 +1286,18 @@ class MLIRCodeGenerator(ast.NodeVisitor):
             return self.compile_error(
                 f"Variable '{node.target.id}' is already defined in the current scope."
             )
+
+        parsed_type = self._parse_annotation(node.annotation, node.target.id)
         if node.value is None:
+            if isinstance(parsed_type, ShapedType):
+                self._set_value_with_loc(
+                    node.target.id, self.builder.make_buffer(parsed_type)
+                )
+                return
             return self.compile_error(
                 f"Annotated variable '{node.target.id}' must have an initializer."
             )
 
-        parsed_type = self._parse_annotation(node.annotation, node.target.id)
         with self._name_loc_prefix(node.target.id):
             value = self.visit(node.value)
 
@@ -1386,7 +1416,7 @@ class MLIRCodeGenerator(ast.NodeVisitor):
                 node, liveins, ignore=set()
             )
             # create while op
-            init_ir_types = [ty.to_mlir(self.context) for ty in init_types]
+            init_ir_types = [ty.materialize(self.context) for ty in init_types]
             while_op = WhileOp(self.builder, init_ir_types, init_handles)
 
             # create before region
@@ -1432,8 +1462,7 @@ class MLIRCodeGenerator(ast.NodeVisitor):
             AlloValue(handle, ty) for handle, ty in zip(res_handles, init_types)
         ]
         for name, proxy in zip(names, res_proxies):
-            self._maybe_set_loc_to_name(proxy, name)
-            self._set_value(name, proxy)
+            self._set_value_with_loc(name, proxy)
 
     def visit_For(self, node: ast.For):
         if node.orelse:
@@ -1524,6 +1553,10 @@ class MLIRCodeGenerator(ast.NodeVisitor):
             self._set_value_with_loc(name, proxy)
 
     def visit_Grid(self, node: ast.For, iterator: Grid):
+        if len(iterator.starts) <= 1:
+            return self.compile_error(
+                "Use range() for single-dimensional loops; grid() requires at least two dimensions."
+            )
         if not isinstance(node.target, ast.Tuple):
             return self.compile_error(
                 "loop target must be a tuple of variables in 'for' loops over 'grid()'"
