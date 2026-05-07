@@ -2252,7 +2252,7 @@ def compile(
                 f"In function: {fn.func_name}, module verification failed."
             )
 
-        module.cse_and_canonicalize()
+        module.run_canonicalize()
         fn.module = module
         # transfer the ownership of context to kernel
         fn.context = context

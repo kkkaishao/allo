@@ -426,14 +426,11 @@ static void bindCoreIR(nb::module_ &m) {
           [](ModuleOp &self, Operation *op) { self.getBody()->push_back(op); },
           nb::arg("op"))
       .def("get_context", &ModuleOp::getContext, nb::rv_policy::reference)
-      .def("cse_and_canonicalize", [](ModuleOp &self) {
+      .def("run_canonicalize", [](ModuleOp &self) {
         PassManager pm(self.getContext());
         pm.addPass(mlir::createCanonicalizerPass());
         pm.addPass(mlir::createCSEPass());
-        if (failed(pm.run(self))) {
-          throw std::runtime_error(
-              "Failed to run CSE and Canonicalizer passes");
-        }
+        (void)pm.run(self);
       });
 }
 

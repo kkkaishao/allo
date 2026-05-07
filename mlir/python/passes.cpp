@@ -2,7 +2,7 @@
 
 #include "nanobind/nanobind.h"
 #include "nanobind/stl/optional.h"
-#include "nanobind/stl/string.h"
+#include "nanobind/stl/string_view.h"
 
 #include "allo/Translation/VivadoHLSEmitter.h"
 #include "mlir/Conversion/ArithToLLVM/ArithToLLVM.h"
@@ -18,6 +18,28 @@ using namespace mlir;
 using namespace mlir::allo;
 
 void bindPasses(nb::module_ &m) {
+  m.def("run", [](std::string_view pipeline, Operation *op) {
+    std::string error;
+    llvm::raw_string_ostream os(error);
+    auto pmOr = parsePassPipeline(pipeline, os);
+    if (failed(pmOr))
+      throw std::runtime_error("Failed to parse pass pipeline: " + os.str());
+    PassManager pm(op->getContext(), pmOr->getOpAnchorName());
+    pm.enableVerifier();
+
+    static_cast<OpPassManager &>(pm) = std::move(*pmOr);
+    if (failed(pm.run(op)))
+      throw std::runtime_error("Failed to run pass pipeline: " + os.str());
+  });
+
+  m.def("run_canonicalize", [](Operation *op) {
+    PassManager pm(op->getContext());
+    pm.addPass(createCSEPass());
+    pm.addPass(createCanonicalizerPass());
+    if (failed(pm.run(op)))
+      throw std::runtime_error("Failed to run canonicalizer pass");
+  });
+
   m.def(
       "emit_vivado_hls",
       [](ModuleOp mod, unsigned indexWidth = 32, unsigned indentSize = 2,
@@ -32,41 +54,4 @@ void bindPasses(nb::module_ &m) {
       },
       nb::arg("mod"), nb::arg("index_width") = 32, nb::arg("indent_size") = 2,
       nb::arg("with_location") = false);
-
-  m.def("cse_and_canonicalize", [](Operation *op) {
-    PassManager pm(op->getContext());
-    pm.addPass(createCSEPass());
-    pm.addPass(createCanonicalizerPass());
-    if (failed(pm.run(op)))
-      throw std::runtime_error("CSE pass failed");
-  });
-
-  m.def("lower_to_llvm", [](ModuleOp mod) {
-    PassManager pm(mod.getContext());
-    pm.addPass(createCanonicalizerPass());
-    pm.addPass(createCSEPass());
-    // pm.addPass(createConvertTensorToLinalgPass());
-    // pm.addPass(bufferization::createEmptyTensorToAllocTensorPass());
-    // bufferization::OneShotBufferizePassOptions options;
-    // options.bufferizeFunctionBoundaries = true;
-    // options.bufferAlignment = 64;
-    // options.functionBoundaryTypeConversion =
-    //     mlir::bufferization::LayoutMapOption::IdentityLayoutMap;
-    // pm.addPass(bufferization::createOneShotBufferizePass(options));
-    // pm.addPass(bufferization::createOwnershipBasedBufferDeallocationPass());
-    pm.addPass(createCanonicalizerPass());
-    pm.addPass(createCSEPass());
-    pm.addPass(createConvertLinalgToLoopsPass());
-    pm.addPass(createLowerAffinePass());
-    pm.addPass(createSCFToControlFlowPass());
-    pm.addPass(memref::createExpandStridedMetadataPass());
-    pm.addPass(createConvertMathToLLVMPass());
-    pm.addPass(createArithToLLVMConversionPass());
-    pm.addPass(createConvertControlFlowToLLVMPass());
-    pm.addPass(createConvertFuncToLLVMPass());
-    pm.addPass(createFinalizeMemRefToLLVMConversionPass());
-    pm.addPass(createReconcileUnrealizedCastsPass());
-    if (failed(pm.run(mod)))
-      throw std::runtime_error("Lowering to LLVM failed");
-  });
 }
