@@ -48,6 +48,7 @@ from .core import (
     constexpr,
     torch_dtype_map,
     unwrap_if_constexpr,
+    Template,
     grid,
     range,
     bool,

@@ -1160,6 +1160,9 @@ class MLIRCodeGenerator(ast.NodeVisitor):
         assert isinstance(node.ctx, ast.Load)
         lhs = self.visit(node.value)
         slices = self.visit(node.slice)
+        if isinstance(lhs, Kernel):
+            template_args = slices if isinstance(slices, tuple) else (slices,)
+            return lhs[template_args]
         if isinstance(lhs, tuple) and isinstance(slices, ConstexprValue):
             return lhs[slices.value]
         slices = (
@@ -1764,7 +1767,10 @@ class MLIRCodeGenerator(ast.NodeVisitor):
         return base_name
 
     def _kernel_call_key(self, fn: Kernel) -> str:
-        return f"kernel:{fn.__module__}.{fn.__qualname__}"
+        bindings = ",".join(
+            f"{name}={value}" for name, value in sorted(fn.template_bindings.items())
+        )
+        return f"kernel:{fn.__module__}.{fn.__qualname__}[{bindings}]"
 
     def _nested_call_key(self, nested: NestedKernelSymbol) -> str:
         return f"nested:{nested.owner_func_name}.{nested.name}"
@@ -2192,6 +2198,7 @@ def compile(
         raise TypeError(
             "Only allo.kernel functions can be compiled with allo.compile()"
         )
+    fn.ensure_templates_bound()
     if not arg_types:
         arg_types = fn.parse_argument_annotations()
     else:

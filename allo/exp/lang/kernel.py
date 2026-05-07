@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from allo.exp.lang.core import (
     constexpr,
     TypeBase,
+    Template,
     TensorType,
     BufferType,
     DType,
@@ -118,14 +119,26 @@ class Kernel(Generic[P, R]):
         *,
         mapping: Sequence,
         options: KernelOptions,
+        template: Sequence[Template] = (),
+        template_bindings: dict[str, object] | None = None,
         definition_scope: dict[str, object] | None = None,
     ):
+        assert all(isinstance(arg, Template) for arg in template)
+        template_names = [arg.name for arg in template]
+        assert len(template_names) == len(
+            set(template_names)
+        ), "template argument names must be unique"
         self.fn = fn
         self.file_name = fn.__code__.co_filename
         self.func_name = fn.__name__
         self.signature = inspect.signature(fn)
         self.mapping = mapping
         self.options = options
+        self.template = tuple(template)
+        self.template_bindings = (
+            {} if template_bindings is None else template_bindings.copy()
+        )
+        assert set(self.template_bindings).issubset(set(template_names))
         self.definition_scope = (
             {} if definition_scope is None else definition_scope.copy()
         )
@@ -165,6 +178,53 @@ class Kernel(Generic[P, R]):
     def __call__(self, *args: P.args, **kwargs: P.kwargs) -> R:
         raise RuntimeError(f"Kernel {self.func_name} can only be used in allo context")
 
+    def __getitem__(self, bindings):
+        if not self.template:
+            raise TypeError(f"Kernel '{self.func_name}' has no template arguments")
+        if self.template_bindings:
+            raise TypeError(f"Kernel '{self.func_name}' is already specialized")
+        if not isinstance(bindings, tuple):
+            bindings = (bindings,)
+        if len(bindings) != len(self.template):
+            raise TypeError(
+                f"Kernel '{self.func_name}' expects {len(self.template)} template arguments, "
+                f"got {len(bindings)}"
+            )
+        assert len(bindings) == len(self.template), (
+            f"Kernel {self.func_name} expects {len(self.template)} template arguments, "
+            f"got {len(bindings)}"
+        )
+
+        template_bindings = {}
+        for template, value in zip(self.template, bindings):
+            value = unwrap_if_constexpr(value)
+            if not isinstance(value, (TypeBase, int, float)):
+                raise TypeError(
+                    f"Unsupported template binding for '{template.name}' in kernel "
+                    f"'{self.func_name}': {type(value).__name__}"
+                )
+            template_bindings[template.name] = value
+
+        return Kernel(
+            self.fn,
+            mapping=self.mapping,
+            options=self.options,
+            template=self.template,
+            template_bindings=template_bindings,
+            definition_scope=self.definition_scope,
+        )
+
+    def ensure_templates_bound(self):
+        if not self.template:
+            return
+        expected = {arg.name for arg in self.template}
+        if set(self.template_bindings) != expected:
+            missing = ", ".join(sorted(expected - set(self.template_bindings)))
+            raise TypeError(
+                f"Templated kernel '{self.func_name}' must be specialized before compilation"
+                + (f": missing {missing}" if missing else "")
+            )
+
     def parse(self):
         tree = ast.parse(self.src)
         assert isinstance(tree, ast.Module)
@@ -176,12 +236,12 @@ class Kernel(Generic[P, R]):
         fn = self.fn
         scope = self.__globals__ | self.definition_scope
         if fn.__closure__ is None:
-            return scope
+            return scope | self.template_bindings
         nonlocals = {
             name: cell.cell_contents
             for name, cell in zip(fn.__code__.co_freevars, fn.__closure__)
         }
-        return scope | nonlocals
+        return scope | nonlocals | self.template_bindings
 
     def parse_type_annotation(
         self, annotation: object, scope: dict[str, object] | None = None
@@ -191,6 +251,15 @@ class Kernel(Generic[P, R]):
         annotation = unwrap_if_constexpr(annotation)
         if annotation is constexpr:
             return constexpr
+        if isinstance(annotation, Template):
+            if annotation.name not in scope:
+                raise TypeError(f"Template '{annotation.name}' is not bound")
+            bound = unwrap_if_constexpr(scope[annotation.name])
+            if not isinstance(bound, TypeBase):
+                raise TypeError(
+                    f"Template '{annotation.name}' must bind to a type in type annotations"
+                )
+            return bound
         if isinstance(annotation, TypeBase):
             return annotation
         if isinstance(annotation, str):
@@ -239,6 +308,7 @@ class Kernel(Generic[P, R]):
 
         from ..compiler.mlir_codegen import compile
 
+        self.ensure_templates_bound()
         arg_types = self.parse_argument_annotations()
         res_types = self.parse_return_annotation()
         return compile(self, arg_types, res_types, options=self.options)
@@ -250,26 +320,38 @@ def kernel(fn: Callable[P, R]) -> Kernel[P, R]: ...
 
 @overload
 def kernel(
-    *, mapping: Sequence = (), options: KernelOptions = KernelOptions()
+    *template: Template,
+    mapping: Sequence = (),
+    options: KernelOptions = KernelOptions(),
 ) -> Callable[[Callable[P, R]], Kernel[P, R]]: ...
 
 
 def kernel(
-    fn: Callable[P, R] | None = None,
-    *,
+    *args,
     mapping: Sequence = (),
     options: KernelOptions = KernelOptions(),
 ) -> Kernel[P, R] | Callable[[Callable[P, R]], Kernel[P, R]]:
     frame = inspect.currentframe()
     assert frame is not None and frame.f_back is not None
     definition_scope = frame.f_back.f_locals.copy()
+    if len(args) == 1 and callable(args[0]) and not isinstance(args[0], Template):
+        fn = args[0]
+        template = ()
+    else:
+        fn = None
+        template = args
+        assert all(isinstance(arg, Template) for arg in template)
 
     def decorator(fn: Callable[P, R]) -> Kernel[P, R]:
         assert callable(
             fn
         ), "The @kernel decorator can only be applied to callable objects"
         return Kernel(
-            fn, mapping=mapping, options=options, definition_scope=definition_scope
+            fn,
+            mapping=mapping,
+            options=options,
+            template=template,
+            definition_scope=definition_scope,
         )
 
     if fn is not None:

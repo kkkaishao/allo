@@ -9,6 +9,7 @@ import allo.exp.lang.core as allo_core
 from allo.exp.compiler.errors import CompilationError
 from allo.exp.compiler.mlir_codegen import compile as compile_kernel
 from allo.exp.lang.core import (
+    Template,
     bool as allo_bool,
     constexpr,
     f32,
@@ -447,6 +448,67 @@ def test_definition_scope_shape_annotation():
         "func.func @definition_scope_shape_annotation",
         "memref<2x2xi32>",
         "scf.parallel",
+        "memref.store",
+    )
+
+
+def test_template_kernel_signature_and_shape():
+    T = Template("T")
+    N = Template("N")
+
+    @kernel(T, N)
+    def template_kernel_signature_and_shape(x: T, out: "T[N]"):
+        tmp: T = x
+        for i in range(N):
+            out[i] = tmp
+
+    ir = _compile_ir(template_kernel_signature_and_shape[f32, 2])
+    _assert_contains(
+        ir,
+        "func.func @template_kernel_signature_and_shape",
+        "f32",
+        "memref<2xf32>",
+        "scf.for",
+        "memref.store",
+    )
+
+
+def test_template_kernel_call_specializes_helper():
+    T = Template("T")
+
+    @kernel(T)
+    def template_identity(x: T) -> T:
+        return x
+
+    @kernel(T)
+    def template_kernel_call_specializes_helper(x: T, out: "T[1]"):
+        out[0] = template_identity[T](x)
+
+    ir = _compile_ir(template_kernel_call_specializes_helper[i32])
+    _assert_contains(
+        ir,
+        "func.func @template_kernel_call_specializes_helper",
+        "func.func @template_kernel_call_specializes_helper.template_identity",
+        "call @template_kernel_call_specializes_helper.template_identity",
+        "i32",
+        "memref.store",
+    )
+
+
+def test_template_kernel_external_specialization_object():
+    T = Template("T")
+
+    @kernel(T)
+    def template_kernel_external_specialization_object(x: T, out: "T[1]"):
+        out[0] = x
+
+    specialized = template_kernel_external_specialization_object[f32]
+    ir = _compile_ir(specialized)
+    _assert_contains(
+        ir,
+        "func.func @template_kernel_external_specialization_object",
+        "f32",
+        "memref<1xf32>",
         "memref.store",
     )
 

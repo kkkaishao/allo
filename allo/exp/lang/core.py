@@ -57,6 +57,20 @@ class TypeBase:
         raise NotImplementedError()
 
 
+class Template:
+    def __init__(self, name: str):
+        assert (
+            isinstance(name, str) and name.isidentifier()
+        ), f"invalid template name: {name}"
+        self.name = name
+
+    def __str__(self) -> str:
+        return self.name
+
+    def __repr__(self) -> str:
+        return self.name
+
+
 class ConstexprType(TypeBase):
     """
     Represents a constexpr type in the Allo compiler.
