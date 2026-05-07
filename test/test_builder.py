@@ -172,6 +172,22 @@ def test_bitwise_xor():
     _assert_contains(ir, "func.func @bitwise_xor", "arith.xori", "memref.store")
 
 
+def test_shift_by_range_index_expression():
+    @kernel
+    def shift_by_range_index_expression(x: i32, out: "i32[4]"):
+        for i in range(4):
+            out[i] = x >> (i * 2)
+
+    ir = _compile_ir(shift_by_range_index_expression)
+    _assert_contains(
+        ir,
+        "func.func @shift_by_range_index_expression",
+        "arith.index_cast",
+        "arith.shrui",
+        "memref.store",
+    )
+
+
 def test_comparison_lt():
     @kernel
     def comparison_lt(x: i32, y: i32, out: "u1[1]"):
@@ -225,6 +241,33 @@ def test_if_statement_phi():
     )
 
 
+def test_if_branch_local_buffers_inside_loop():
+    @kernel
+    def if_branch_local_buffers_inside_loop(out: "i32[8]"):
+        for r in range(2):
+            r_i32: i32 = r
+            if r_i32 == 0:
+                then_buf: "i32[4]"
+                for j in range(4):
+                    then_buf[j] = j
+                    out[j] = then_buf[j]
+            else:
+                else_buf: "i32[4]"
+                for j in range(4):
+                    else_buf[j] = j + 1
+                    out[j + 4] = else_buf[j]
+
+    ir = _compile_ir(if_branch_local_buffers_inside_loop)
+    _assert_contains(
+        ir,
+        "func.func @if_branch_local_buffers_inside_loop",
+        "scf.if",
+        "scf.for",
+        "memref.alloc",
+        "memref.store",
+    )
+
+
 def test_ternary_expression():
     @kernel
     def ternary_expression(cond: allo_bool, x: i32, y: i32, out: "i32[1]"):
@@ -266,6 +309,24 @@ def test_range_loop_store():
         "to %c4 step %c1",
         "arith.index_cast",
         "index to i32",
+        "memref.store",
+    )
+
+
+def test_index_runtime_int_arithmetic():
+    @kernel
+    def index_runtime_int_arithmetic(stride: i32, out: "i32[8]"):
+        offset: i32 = 2
+        for i in range(4):
+            out[offset + stride * i] = i
+
+    ir = _compile_ir(index_runtime_int_arithmetic)
+    _assert_contains(
+        ir,
+        "func.func @index_runtime_int_arithmetic",
+        "arith.index_cast",
+        "arith.addi",
+        "arith.muli",
         "memref.store",
     )
 
@@ -461,6 +522,26 @@ def test_tensor_list_initializer_uses_arith_constant():
     )
 
 
+def test_for_loop_carried_values():
+    @kernel
+    def for_loop_carried_values(out: "i32[1]"):
+        acc: i32 = 0
+        for i in range(4):
+            i_i32: i32 = i
+            acc += i_i32
+        out[0] = acc
+
+    ir = _compile_ir(for_loop_carried_values)
+    _assert_contains(
+        ir,
+        "func.func @for_loop_carried_values",
+        "scf.for",
+        "iter_args",
+        "scf.yield",
+        "memref.store",
+    )
+
+
 def test_while_loop_carried_values():
     @kernel
     def while_loop_carried_values(out: "i32[1]"):
@@ -519,6 +600,28 @@ def test_nested_kernel_call_store():
         "call @nested_kernel_call_store.add_one",
         "memref.store",
     )
+
+
+def test_helper_call_in_loop_dry_run_does_not_clone_callee():
+    @kernel
+    def add_one(v: i32) -> i32:
+        return v + 1
+
+    @kernel
+    def helper_call_in_loop(x: i32, out: "i32[1]"):
+        acc: i32 = 0
+        for i in range(2):
+            acc = add_one(x)
+        out[0] = acc
+
+    ir = _compile_ir(helper_call_in_loop)
+    callee_defs = [
+        line.strip()
+        for line in ir.splitlines()
+        if line.strip().startswith("func.func @helper_call_in_loop.add_one")
+    ]
+    assert callee_defs == ["func.func @helper_call_in_loop.add_one(%v: i32) -> i32 {"]
+    _assert_contains(ir, "call @helper_call_in_loop.add_one")
 
 
 def test_nested_kernel_multiple_returns():

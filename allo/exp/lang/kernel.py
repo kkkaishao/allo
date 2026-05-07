@@ -162,6 +162,9 @@ class Kernel(Generic[P, R]):
         self.__module__ = fn.__module__
         self.__qualname__ = fn.__qualname__
 
+    def __call__(self, *args: P.args, **kwargs: P.kwargs) -> R:
+        raise RuntimeError(f"Kernel {self.func_name} can only be used in allo context")
+
     def parse(self):
         tree = ast.parse(self.src)
         assert isinstance(tree, ast.Module)

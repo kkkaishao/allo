@@ -172,6 +172,7 @@ class MLIRCodeGenerator(ast.NodeVisitor):
         self.lookup = self._define_name_lookup()
         self.visiting_consteval_fn = False
         self.visiting_default_args = False
+        self.dry_run_loop_analysis = False
         self.block_terminated = False
         self.has_explicit_return_annotation = False
 
@@ -1020,8 +1021,8 @@ class MLIRCodeGenerator(ast.NodeVisitor):
         then_handles = []
         else_handles = []
         for name, value in liveins.items():
-            then_proxy = then_vals[name]
-            else_proxy = else_vals[name]
+            then_proxy = then_vals.get(name, value)
+            else_proxy = else_vals.get(name, value)
             if not isinstance(then_proxy, AlloValue) or not isinstance(
                 else_proxy, AlloValue
             ):
@@ -1413,9 +1414,14 @@ class MLIRCodeGenerator(ast.NodeVisitor):
         block = self.builder.create_block(ip.get_block().get_parent_region())
         self.builder.set_insertion_point_to_start(block)
         # dry visit
+        old_dry_run = self.dry_run_loop_analysis
+        self.dry_run_loop_analysis = True
         self.scf_stack.append(node)
-        self.visit_compound_stmts(node.body)
-        self.scf_stack.pop()
+        try:
+            self.visit_compound_stmts(node.body)
+        finally:
+            self.scf_stack.pop()
+            self.dry_run_loop_analysis = old_dry_run
         # restore state
         block.erase()
         self.builder.set_insertion_point_and_loc(ip, last_loc)
@@ -1551,7 +1557,7 @@ class MLIRCodeGenerator(ast.NodeVisitor):
             self._set_value(node.target.id, AlloValue(iv_placeholder, index))
 
             liveins = self.lscope.copy()  # capture live-ins before visiting loop body
-            name, init_handles, init_types = self._test_loop_iter_args(
+            names, init_handles, init_types = self._test_loop_iter_args(
                 node, liveins, ignore={node.target.id}
             )
             # create for op
@@ -1569,13 +1575,13 @@ class MLIRCodeGenerator(ast.NodeVisitor):
             block_args = [
                 AlloValue(handle, ty) for handle, ty in zip(block_handles, init_types)
             ]
-            for name, proxy in zip(name, block_args):
-                self._set_value_with_loc(name, proxy)
+            for iter_name, proxy in zip(names, block_args):
+                self._set_value_with_loc(iter_name, proxy)
             # visit loop body
             self.visit_compound_stmts(node.body)
             self.scf_stack.pop()
             # create yield
-            yield_handles = [self.lscope[name].handle for name in name]
+            yield_handles = [self.lscope[iter_name].handle for iter_name in names]
             self.builder.set_insertion_point_to_end(for_op_body)
             # remove the default terminator
             for_op_body.remove_terminator()
@@ -1590,9 +1596,9 @@ class MLIRCodeGenerator(ast.NodeVisitor):
 
         # update lscope with iter args
         res_handles = for_op.get_results()
-        for name, handle, ty in zip(name, res_handles, init_types):
+        for iter_name, handle, ty in zip(names, res_handles, init_types):
             proxy = AlloValue(handle, ty)
-            self._set_value_with_loc(name, proxy)
+            self._set_value_with_loc(iter_name, proxy)
 
     def visit_Grid(self, node: ast.For, iterator: Grid):
         if len(iterator.starts) <= 1:
@@ -1832,6 +1838,21 @@ class MLIRCodeGenerator(ast.NodeVisitor):
             return results[0]
         return tuple(results)
 
+    def _make_dry_run_call_results(self, res_types: Sequence[TypeBase]):
+        if any(isinstance(ty, ConstexprType) for ty in res_types):
+            return self.compile_error(
+                "Kernel calls returning constexpr values are not supported."
+            )
+        if len(res_types) == 0:
+            return None
+        results = [
+            AlloValue(PoisonOp(self.builder, ty.materialize(self.context)), ty)
+            for ty in res_types
+        ]
+        if len(results) == 1:
+            return results[0]
+        return tuple(results)
+
     def _parse_return_types(self, node: ast.FunctionDef) -> list[TypeBase]:
         if node.returns is None or (
             isinstance(node.returns, ast.Constant) and node.returns.value is None
@@ -1934,6 +1955,9 @@ class MLIRCodeGenerator(ast.NodeVisitor):
             self._build_nested_capture_scopes()
         )
 
+        if self.dry_run_loop_analysis:
+            return self._make_dry_run_call_results(sub_res_types)
+
         ip, last_loc = self.builder.get_insertion_point_and_loc()
         sub_generator = None
         self._active_kernel_calls.append(key)
@@ -2015,6 +2039,9 @@ class MLIRCodeGenerator(ast.NodeVisitor):
         callee_context, call_operands = self._prepare_kernel_call_args(
             fn.func_name, bound.arguments.items(), sub_arg_types
         )
+
+        if self.dry_run_loop_analysis:
+            return self._make_dry_run_call_results(sub_res_types)
 
         ip, last_loc = self.builder.get_insertion_point_and_loc()
         sub_generator = None

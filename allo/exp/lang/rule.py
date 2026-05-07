@@ -193,7 +193,15 @@ def _common_numeric_rule(
         (_UnsignedInt, APFloat): lambda lhs, rhs: rhs,
     }
     index_rules = (
-        {(IndexType, IndexType): lambda lhs, rhs: index} if include_index else {}
+        {
+            (IndexType, IndexType): lambda lhs, rhs: index,
+            (IndexType, _SignedInt): lambda lhs, rhs: index,
+            (IndexType, _UnsignedInt): lambda lhs, rhs: index,
+            (_SignedInt, IndexType): lambda lhs, rhs: index,
+            (_UnsignedInt, IndexType): lambda lhs, rhs: index,
+        }
+        if include_index
+        else {}
     )
     float_rules = {
         (APFloat, APFloat): _wider_float,
@@ -224,7 +232,13 @@ def _hls_add_sub_rule() -> TypingRule:
         ),
         (_UnsignedInt, APFloat): lambda lhs, rhs: rhs,
     }
-    index_rules = {(IndexType, IndexType): lambda lhs, rhs: index}
+    index_rules = {
+        (IndexType, IndexType): lambda lhs, rhs: index,
+        (IndexType, _SignedInt): lambda lhs, rhs: index,
+        (IndexType, _UnsignedInt): lambda lhs, rhs: index,
+        (_SignedInt, IndexType): lambda lhs, rhs: index,
+        (_UnsignedInt, IndexType): lambda lhs, rhs: index,
+    }
     float_rules = {
         (APFloat, APFloat): _wider_float,
         (APFloat, _SignedInt): lambda lhs, rhs: lhs,
@@ -249,7 +263,13 @@ def _hls_mul_rule() -> TypingRule:
         ),
         (_UnsignedInt, APFloat): lambda lhs, rhs: rhs,
     }
-    index_rules = {(IndexType, IndexType): lambda lhs, rhs: index}
+    index_rules = {
+        (IndexType, IndexType): lambda lhs, rhs: index,
+        (IndexType, _SignedInt): lambda lhs, rhs: index,
+        (IndexType, _UnsignedInt): lambda lhs, rhs: index,
+        (_SignedInt, IndexType): lambda lhs, rhs: index,
+        (_UnsignedInt, IndexType): lambda lhs, rhs: index,
+    }
     float_rules = {(APFloat, APFloat): _wider_float}
     return TypingRule(int_rules, uint_rules, index_rules, float_rules, commutative=True)
 
@@ -264,10 +284,12 @@ def _shift_rule() -> TypingRule:
     int_rules = {
         (_SignedInt, _SignedInt): lambda lhs, rhs: lhs,
         (_SignedInt, _UnsignedInt): lambda lhs, rhs: lhs,
+        (_SignedInt, IndexType): lambda lhs, rhs: lhs,
     }
     uint_rules = {
         (_UnsignedInt, _UnsignedInt): lambda lhs, rhs: lhs,
         (_UnsignedInt, _SignedInt): lambda lhs, rhs: lhs,
+        (_UnsignedInt, IndexType): lambda lhs, rhs: lhs,
     }
     index_rules = {(IndexType, IndexType): lambda lhs, rhs: index}
     return TypingRule(int_rules, uint_rules, index_rules)
