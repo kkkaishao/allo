@@ -5,6 +5,8 @@
 
 from allo.exp.lang import f32, i32, index, kernel
 from allo.exp.operators import math as allo_math
+from .. import run_machsuite_kernel
+import numpy as np
 
 
 @kernel
@@ -553,3 +555,13 @@ def fft1D_512(work_x: "f32[512]", work_y: "f32[512]"):
         work_y[5 * stride + tid] = data_y[reversed[5]]
         work_y[6 * stride + tid] = data_y[reversed[6]]
         work_y[7 * stride + tid] = data_y[reversed[7]]
+
+
+def np_fft1D_512(work_x, work_y):
+    out = np.fft.fft(work_x.astype(np.complex64) + 1j * work_y.astype(np.complex64))
+    work_x[...] = out.real.astype(np.float32)
+    work_y[...] = out.imag.astype(np.float32)
+
+
+def test_fft1D_512():
+    run_machsuite_kernel(fft1D_512, "fft_transpose")

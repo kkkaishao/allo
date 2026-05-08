@@ -2,8 +2,10 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from allo.exp.lang import i32, kernel
+from .. import run_machsuite_kernel
+import numpy as np
 
-M, N, K = 1024, 1024, 1024
+M, N, K = 64, 64, 64
 S = 8
 
 
@@ -29,3 +31,11 @@ def bbgemm(A: "i32[M, K]", B: "i32[K, N]") -> "i32[M, N]":
                             sum_value += A[ii, kk] * B[kk, jj]
                         C[ii, jj] += sum_value
     return C
+
+
+def np_bbgemm(A, B):
+    return (A.astype(np.int64) @ B.astype(np.int64)).astype(np.int32)
+
+
+def test_bbgemm():
+    run_machsuite_kernel(bbgemm, "gemm_blocked")

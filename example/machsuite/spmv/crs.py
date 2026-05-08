@@ -2,9 +2,11 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from allo.exp.lang import f64, i32, kernel
+from .. import run_machsuite_kernel
+import numpy as np
 
-N = 494
-NNZ = 1666
+N = 64
+NNZ = 192
 
 
 @kernel
@@ -21,3 +23,15 @@ def crs(
             out[i] += val[j] * vec[cols[j]]
 
     return out
+
+
+def np_crs(val, cols, row, vec):
+    out = np.zeros(N, dtype=np.float64)
+    for i in range(N):
+        for j in range(row[i], row[i + 1]):
+            out[i] += val[j] * vec[cols[j]]
+    return out
+
+
+def test_crs():
+    run_machsuite_kernel(crs, "spmv_crs")

@@ -2,8 +2,10 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from allo.exp.lang import i32, kernel
+from . import run_machsuite_kernel
+import numpy as np
 
-N = 2048
+N = 256
 
 
 @kernel
@@ -59,3 +61,12 @@ def merge_sort(a: "i32[N]") -> "i32[N]":
         m += m
 
     return a
+
+
+def np_merge_sort(a):
+    a[...] = np.sort(a)
+    return a
+
+
+def test_merge_sort():
+    run_machsuite_kernel(merge_sort, "mergesort")

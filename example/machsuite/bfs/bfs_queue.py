@@ -2,11 +2,13 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from allo.exp.lang import i32, kernel
+from .. import run_machsuite_kernel
+import numpy as np
 
-N_NODES = 256
-N_NODES_2 = 512
-N_EDGES = 4096
-N_LEVELS = 10
+N_NODES = 32
+N_NODES_2 = N_NODES * 2
+N_EDGES = 128
+N_LEVELS = 6
 MAX_LEVEL = 999999
 
 
@@ -42,3 +44,33 @@ def bfs_queue(
                 rear = (rear + 1) % N_NODES
 
     return level, level_counts
+
+
+def np_bfs_queue(nodes, edges, starting_node):
+    level = np.full(N_NODES, MAX_LEVEL, dtype=np.int32)
+    level_counts = np.zeros(N_LEVELS, dtype=np.int32)
+    queue = np.zeros(N_NODES, dtype=np.int32)
+    front = 0
+    rear = 0
+
+    level[starting_node] = 0
+    level_counts[0] = 1
+    queue[rear] = starting_node
+    rear = (rear + 1) % N_NODES
+
+    while front != rear:
+        n = queue[front]
+        front = (front + 1) % N_NODES
+        for e in range(nodes[2 * n], nodes[2 * n + 1]):
+            dst = edges[e]
+            if level[dst] == MAX_LEVEL:
+                tmp_level = level[n] + 1
+                level[dst] = tmp_level
+                level_counts[tmp_level] += 1
+                queue[rear] = dst
+                rear = (rear + 1) % N_NODES
+    return level, level_counts
+
+
+def test_bfs_queue():
+    run_machsuite_kernel(bfs_queue, "bfs_queue")

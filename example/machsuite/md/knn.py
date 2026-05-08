@@ -2,9 +2,11 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from allo.exp.lang import f64, i32, kernel
+from .. import run_machsuite_kernel
+import numpy as np
 
-nAtoms = 256
-maxNeighbors = 16
+nAtoms = 64
+maxNeighbors = 8
 lj1 = 1.5
 lj2 = 2.0
 domainEdge = 20.0
@@ -158,3 +160,63 @@ def md_z(
             fz = fz + delz * force
         force_z[i] = fz
     return force_z
+
+
+def np_md_x(position_x, position_y, position_z, NL):
+    return _np_md(position_x, position_y, position_z, NL)[0]
+
+
+def np_md_y(position_x, position_y, position_z, NL):
+    return _np_md(position_x, position_y, position_z, NL)[1]
+
+
+def np_md_z(position_x, position_y, position_z, NL):
+    return _np_md(position_x, position_y, position_z, NL)[2]
+
+
+def _np_md(position_x, position_y, position_z, NL):
+    force_x = np.zeros(nAtoms, dtype=np.float64)
+    force_y = np.zeros(nAtoms, dtype=np.float64)
+    force_z = np.zeros(nAtoms, dtype=np.float64)
+
+    for i in range(nAtoms):
+        i_x = position_x[i]
+        i_y = position_y[i]
+        i_z = position_z[i]
+        fx = 0.0
+        fy = 0.0
+        fz = 0.0
+
+        for j in range(maxNeighbors):
+            jidx = NL[i * maxNeighbors + j]
+            delx = i_x - position_x[jidx]
+            dely = i_y - position_y[jidx]
+            delz = i_z - position_z[jidx]
+            r2 = delx * delx + dely * dely + delz * delz
+            if r2 == 0:
+                r2inv = (domainEdge * domainEdge * 3.0) * 1000
+            else:
+                r2inv = 1.0 / r2
+            r6inv = r2inv * r2inv * r2inv
+            potential = r6inv * (lj1 * r6inv - lj2)
+            force = r2inv * potential
+            fx += delx * force
+            fy += dely * force
+            fz += delz * force
+
+        force_x[i] = fx
+        force_y[i] = fy
+        force_z[i] = fz
+    return force_x, force_y, force_z
+
+
+def test_md_x():
+    run_machsuite_kernel(md_x, "md_knn_x")
+
+
+def test_md_y():
+    run_machsuite_kernel(md_y, "md_knn_y")
+
+
+def test_md_z():
+    run_machsuite_kernel(md_z, "md_knn_z")

@@ -2,14 +2,16 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from allo.exp.lang import i32, kernel
+from . import run_machsuite_kernel
+import numpy as np
 
-SIZE = 2048
-NUMOFBLOCKS = 512
 ELEMENTSPERBLOCK = 4
+SIZE = 256
+NUMOFBLOCKS = SIZE // ELEMENTSPERBLOCK
 RADIXSIZE = 4
-BUCKETSIZE = NUMOFBLOCKS * RADIXSIZE
+BUCKETSIZE = NUMOFBLOCKS * RADIXSIZE + 1
 SCAN_BLOCK = 16
-SCAN_RADIX = BUCKETSIZE // SCAN_BLOCK
+SCAN_RADIX = (BUCKETSIZE - 1) // SCAN_BLOCK
 
 
 @kernel
@@ -80,3 +82,12 @@ def ss_sort(a: "i32[SIZE]") -> "i32[SIZE]":
             valid_buffer = 0
 
     return a
+
+
+def np_ss_sort(a):
+    a[...] = np.sort(a)
+    return a
+
+
+def test_ss_sort():
+    run_machsuite_kernel(ss_sort, "radixsort")

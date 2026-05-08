@@ -3,26 +3,27 @@
 
 # strided_fft.py
 
-from allo.exp.lang import f32, i32, kernel
+from allo.exp.lang import f64, i32, kernel
+from .. import run_machsuite_kernel
 
-FFT_SIZE = 1024
+FFT_SIZE = 128
 FFT_SIZE_HALF = int(FFT_SIZE / 2)
 
 
 # void fft(double real[FFT_SIZE], double img[FFT_SIZE], double real_twid[FFT_SIZE/2], double img_twid[FFT_SIZE/2]){
 @kernel
 def fft(
-    real: "f32[FFT_SIZE]",
-    img: "f32[FFT_SIZE]",
-    real_twid: "f32[FFT_SIZE_HALF]",
-    img_twid: "f32[FFT_SIZE_HALF]",
+    real: "f64[FFT_SIZE]",
+    img: "f64[FFT_SIZE]",
+    real_twid: "f64[FFT_SIZE_HALF]",
+    img_twid: "f64[FFT_SIZE_HALF]",
 ):
     span: i32 = FFT_SIZE >> 1
     log: i32 = 0
     even: i32 = 0
     odd: i32 = 0
     rootindex: i32 = 0
-    temp: f32 = 0.0
+    temp: f64 = 0.0
 
     # outer loop iterates over different stages of FFT
     while span > 0:
@@ -70,3 +71,36 @@ def fft(
         # keeps track of stages using log
         span >>= 1
         log += 1
+
+
+def np_fft(real, img, real_twid, img_twid):
+    span = FFT_SIZE >> 1
+    log = 0
+    while span > 0:
+        odd = span
+        while odd < FFT_SIZE:
+            odd |= span
+            even = odd ^ span
+
+            temp = real[even] + real[odd]
+            real[odd] = real[even] - real[odd]
+            real[even] = temp
+
+            temp = img[even] + img[odd]
+            img[odd] = img[even] - img[odd]
+            img[even] = temp
+
+            rootindex = (even << log) & (FFT_SIZE - 1)
+            if rootindex > 0:
+                temp = real_twid[rootindex] * real[odd] - img_twid[rootindex] * img[odd]
+                img[odd] = (
+                    real_twid[rootindex] * img[odd] + img_twid[rootindex] * real[odd]
+                )
+                real[odd] = temp
+            odd += 1
+        span >>= 1
+        log += 1
+
+
+def test_fft():
+    run_machsuite_kernel(fft, "fft_strided")
