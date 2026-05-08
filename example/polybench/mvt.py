@@ -1,9 +1,17 @@
 # Copyright Allo authors. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import numpy as np
+
 from allo.exp.lang import f32, kernel
 
 N = 120
+
+
+def np_mvt(A, A_copy, y1, y2, x1, x2, x1_out, x2_out):
+    x1_out[:] = x1 + np.dot(A, y1)
+    x2_out[:] = x2 + np.dot(A_copy.T, y2)
+    return x1_out, x2_out
 
 
 @kernel

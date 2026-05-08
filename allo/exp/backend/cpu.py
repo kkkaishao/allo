@@ -390,5 +390,5 @@ class CPU(Backend):
         return project_path
 
     def _ensure_compiled(self):
-        if self.module is None:
+        if self.engine is None:
             self.compile()

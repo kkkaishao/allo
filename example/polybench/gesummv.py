@@ -1,11 +1,20 @@
 # Copyright Allo authors. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import numpy as np
+
 from allo.exp.lang import f32, kernel
 
 N = 90
 alpha = 0.1
 beta = 0.1
+
+
+def np_gesummv(A, B, x, y):
+    tmp = np.dot(A, x)
+    y_fifo = np.dot(B, x)
+    y[:] = alpha * tmp + beta * y_fifo
+    return y
 
 
 @kernel

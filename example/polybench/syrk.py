@@ -9,6 +9,23 @@ alpha = 1.5
 beta = 1.2
 
 
+def np_syrk(A, A_copy, Cin, Cout):
+    buffer = Cin.copy()
+    for i in range(N):
+        for j in range(N):
+            if j <= i:
+                buffer[i, j] = beta * Cin[i, j]
+
+    for i in range(N):
+        for k in range(M):
+            for j in range(N):
+                if j <= i:
+                    buffer[i, j] += alpha * A[i, k] * A_copy[j, k]
+
+    Cout[:, :] = buffer
+    return Cout
+
+
 @kernel
 def update_C(Cin: "f32[N, N]", Cout: "f32[N, N]"):
     for i0 in range(N):

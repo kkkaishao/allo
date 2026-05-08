@@ -8,6 +8,17 @@ N = 80
 alpha = 1.5
 
 
+def np_trmm(A, B):
+    for i in range(M):
+        for j in range(N):
+            for k in range(M):
+                if k > i:
+                    B[i, j] += A[k, i] * B[k, j]
+
+    B[:, :] = B * alpha
+    return B
+
+
 @kernel
 def S0(A: "f32[M, M]", B: "f32[M, N]"):
     for i1 in range(M):

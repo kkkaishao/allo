@@ -176,7 +176,10 @@ class Kernel(Generic[P, R]):
         self.__qualname__ = fn.__qualname__
 
     def __call__(self, *args: P.args, **kwargs: P.kwargs) -> R:
-        raise RuntimeError(f"Kernel {self.func_name} can only be used in allo context")
+        """Run the kernel with the given arguments using CPU simulation"""
+        from ..backend import CPU
+
+        return CPU(self).run(*args, **kwargs)
 
     def __getitem__(self, bindings):
         if not self.template:

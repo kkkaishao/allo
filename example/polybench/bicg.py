@@ -1,10 +1,18 @@
 # Copyright Allo authors. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import numpy as np
+
 from allo.exp.lang import f32, kernel
 
 M = 116
 N = 124
+
+
+def np_bicg(A, A_copy, p, r, q, s):
+    s += np.dot(A.T, r)
+    q += np.dot(A_copy, p)
+    return q, s
 
 
 @kernel

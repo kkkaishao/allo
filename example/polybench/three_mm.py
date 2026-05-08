@@ -1,6 +1,8 @@
 # Copyright Allo authors. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import numpy as np
+
 from allo.exp.lang import f32, kernel
 
 P = 40
@@ -8,6 +10,10 @@ R = 50
 Q = 60
 T = 70
 S = 80
+
+
+def np_three_mm(A, B, C, D):
+    return np.dot(np.dot(A, B), np.dot(C, D))
 
 
 @kernel

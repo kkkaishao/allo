@@ -1,11 +1,21 @@
 # Copyright Allo authors. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import numpy as np
+
 from allo.exp.lang import f32, kernel
 
 N = 120
 alpha = 0.1
 beta = 0.1
+
+
+def np_gemver(A, u1, u2, v1, v2, x, y, w, z):
+    A += np.outer(u1, v1) + np.outer(u2, v2)
+    x += beta * np.dot(A.T, y)
+    x += z
+    w += alpha * np.dot(A, x)
+    return A, x, w
 
 
 @kernel

@@ -1,10 +1,18 @@
 # Copyright Allo authors. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import numpy as np
+
 from allo.exp.lang import f32, kernel
 
 M = 116
 N = 124
+
+
+def np_atax(A, x, y):
+    out_Ax = np.dot(A, x)
+    y += np.dot(A.T, out_Ax)
+    return y
 
 
 @kernel

@@ -1,6 +1,8 @@
 # Copyright Allo authors. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import numpy as np
+
 from allo.exp.lang import f32, kernel
 from allo.exp.operators import math as amath
 
@@ -8,6 +10,41 @@ M = 80
 N = 100
 N_float = 100.0
 epsilon = 1e-5
+
+
+def np_correlation(data_mean, data_stddev, data_for_center, corr):
+    mean = np.zeros((M,), dtype=data_mean.dtype)
+    stddev = np.zeros((M,), dtype=data_mean.dtype)
+    data_centered = np.zeros((N, M), dtype=data_mean.dtype)
+
+    for x in range(M):
+        mean[x] = np.sum(data_mean[:, x]) / N
+
+    for x in range(M):
+        variance = 0.0
+        for m in range(N):
+            variance += (data_stddev[m, x] - mean[x]) * (data_stddev[m, x] - mean[x])
+        stddev[x] = np.sqrt(variance / N_float)
+        if stddev[x] <= epsilon:
+            stddev[x] = 1.0
+
+    for x in range(N):
+        for y in range(M):
+            data_centered[x, y] = (data_for_center[x, y] - mean[y]) / (
+                np.sqrt(N_float) * stddev[y]
+            )
+
+    for i in range(M - 1):
+        corr[i, i] = 1.0
+        for j in range(i + 1, M):
+            corr_v = 0.0
+            for k in range(N):
+                corr_v += data_centered[k, i] * data_centered[k, j]
+            corr[j, i] = corr_v
+            corr[i, j] = corr_v
+
+    corr[M - 1, M - 1] = 1.0
+    return corr
 
 
 @kernel

@@ -1,12 +1,19 @@
 # Copyright Allo authors. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import numpy as np
+
 from allo.exp.lang import f32, kernel
 
 P = 60
 R = 70
 Q = 80
 beta = 0.1
+
+
+def np_gemm(A, B, C, output):
+    output[:, :] = beta * C + np.dot(A, B)
+    return output
 
 
 @kernel

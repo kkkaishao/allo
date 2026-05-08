@@ -1,6 +1,8 @@
 # Copyright Allo authors. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import numpy as np
+
 from allo.exp.lang import f32, kernel
 
 P = 40
@@ -9,6 +11,12 @@ Q = 70
 S = 80
 alpha = 0.1
 beta = 0.5
+
+
+def np_two_mm(A, B, C, D):
+    out_AB = np.dot(A, B)
+    out_ABC = np.dot(out_AB, C)
+    return out_ABC * beta + D * alpha
 
 
 @kernel
