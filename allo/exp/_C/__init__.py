@@ -10,7 +10,6 @@ from . import _liballo
 
 __all__ = [
     "ir",
-    "utils",
     "arith",
     "math",
     "scf",
@@ -28,7 +27,6 @@ __all__ = [
 
 _EAGER_SUBMODULES = (
     "ir",
-    "utils",
     "arith",
     "math",
     "scf",
@@ -46,7 +44,6 @@ _EAGER_SUBMODULES = (
 if TYPE_CHECKING:
     from . import (
         ir,
-        utils,
         arith,
         math,
         scf,

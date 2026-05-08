@@ -7,8 +7,8 @@ nanobind_add_module(_liballo
     ops.cpp
     main.cpp
     transform.cpp
-    utils.cpp
     passes.cpp
+    execution_engine.cpp
 )
 
 set(NANOBIND_OUTPUT_DIR "${PROJECT_SOURCE_DIR}/../allo/exp/_C")
@@ -73,6 +73,8 @@ set(ALLO_PYTHON_MLIR_LIBS
     MLIRVectorTransformOps
 
     # Conversions
+    MLIRTensorToLinalg
+    MLIRBufferizationToMemRef
     MLIRAffineToStandard
     MLIRArithToLLVM
     MLIRControlFlowToLLVM
@@ -80,6 +82,12 @@ set(ALLO_PYTHON_MLIR_LIBS
     MLIRMemRefToLLVM
     MLIRMathToLLVM
     MLIRReconcileUnrealizedCasts
+
+    # Passes
+    MLIRBufferizationPipelines
+    MLIRTensorTransforms
+    MLIRLLVMIRTransforms
+    MLIRAffineTransforms
 )
 
 target_link_libraries(_liballo

@@ -1,6 +1,7 @@
 #include "ir.h"
 
 #include "nanobind/nanobind.h"
+#include "nanobind/stl/optional.h"
 #include "nanobind/stl/pair.h"
 #include "nanobind/stl/string.h"
 #include "nanobind/stl/string_view.h"
@@ -409,7 +410,10 @@ static void bindCoreIR(nb::module_ &m) {
            [](OpState &self) -> bool {
              return succeeded(verify(self.getOperation()));
            })
-      .def("erase", &OpState::erase);
+      .def("erase", &OpState::erase)
+      .def(
+          "clone", [](OpState &self) { return self->clone(); },
+          nb::rv_policy::reference);
 
   nb::class_<ModuleOp, OpState>(m, "ModuleOp")
       .def(
@@ -426,12 +430,22 @@ static void bindCoreIR(nb::module_ &m) {
           [](ModuleOp &self, Operation *op) { self.getBody()->push_back(op); },
           nb::arg("op"))
       .def("get_context", &ModuleOp::getContext, nb::rv_policy::reference)
-      .def("run_canonicalize", [](ModuleOp &self) {
-        PassManager pm(self.getContext());
-        pm.addPass(mlir::createCanonicalizerPass());
-        pm.addPass(mlir::createCSEPass());
-        (void)pm.run(self);
-      });
+      .def("run_canonicalize",
+           [](ModuleOp &self) {
+             PassManager pm(self.getContext());
+             pm.addPass(mlir::createCanonicalizerPass());
+             pm.addPass(mlir::createCSEPass());
+             (void)pm.run(self);
+           })
+      .def("clone", [](ModuleOp &self) { return cast<ModuleOp>(self.clone()); })
+      .def("lookup_func",
+           [](ModuleOp &self,
+              std::string_view name) -> std::optional<func::FuncOp> {
+             auto sym = self.lookupSymbol<func::FuncOp>(name);
+             if (!sym)
+               return std::nullopt;
+             return sym;
+           });
 }
 
 static void bindTypes(nb::module_ &m) {

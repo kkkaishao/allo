@@ -95,7 +95,17 @@ class Backend(ABC):
 
     @abstractmethod
     def compile(self) -> Any:
-        """Run backend-specific lowering and return the lowered artifact."""
+        """Run backend-specific lowering and return the lowered artifacts."""
+
+    @abstractmethod
+    def run(self, *args, **kwargs) -> Any:
+        """Run the backend and return the results.
+
+        For CPU backend, the behavior of this method is to execute the compiled kernel and return the output.
+
+        For hardware backend, the behavior of this method is to run the complete implementation flow, including
+        synthesis and implementation.
+        """
 
     @abstractmethod
     def scaffold_project(
@@ -109,7 +119,7 @@ class Backend(ABC):
     def supports(self, stage: BackendStage) -> bool:
         return stage in self.supported_stages
 
-    def sim(self, *args: Any, **kwargs: Any) -> BackendRunResult:
+    def simulate(self, *args: Any, **kwargs: Any) -> BackendRunResult:
         return self._raise_unsupported(BackendStage.SIMULATION)
 
     def synth(self, **kwargs: Any) -> BackendRunResult:
@@ -118,7 +128,7 @@ class Backend(ABC):
     def cosim(self, *args: Any, **kwargs: Any) -> BackendRunResult:
         return self._raise_unsupported(BackendStage.COSIMULATION)
 
-    def impl(self, **kwargs: Any) -> BackendRunResult:
+    def implement(self, **kwargs: Any) -> BackendRunResult:
         return self._raise_unsupported(BackendStage.IMPLEMENTATION)
 
     def report(self, stage: BackendStage | None = None) -> BackendReport:
