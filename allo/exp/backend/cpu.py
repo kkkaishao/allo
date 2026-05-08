@@ -11,8 +11,10 @@ from typing import Any
 import ml_dtypes
 import numpy as np
 
+from .utils import make_project_path
+
 from ..lang.core import APFloat, APInt, BufferType, DType, IndexType, TypeBase
-from .base import Backend, BackendConfig, BackendStage
+from .base import Backend
 
 
 class _F16(ctypes.Structure):
@@ -298,17 +300,15 @@ def _convert_back(array, dtype):
 
 class CPU(Backend):
     name = "cpu"
-    supported_stages = frozenset({BackendStage.SIMULATION})
 
     def __init__(
         self,
         kernel,
-        config: BackendConfig = BackendConfig(),
         *,
         opt_level: int = 2,
         shared_libs: list[str] | None = None,
     ):
-        super().__init__(kernel, config)
+        super().__init__(kernel)
         self.opt_level = opt_level
         self.shared_libs = shared_libs
         self.engine = None
@@ -347,7 +347,7 @@ class CPU(Backend):
         return module
 
     def run(self, *args, **kwargs) -> Any:
-        self.compile()
+        self._ensure_compiled()
         return self.simulate(*args, **kwargs)
 
     def simulate(self, *args, **kwargs) -> Any:
@@ -372,18 +372,11 @@ class CPU(Backend):
 
     def scaffold_project(
         self,
-        project: Path | str | None = None,
+        project: str | None = None,
         *,
         overwrite: bool = False,
     ) -> Path:
-        project_path = (
-            Path(project) if project is not None else self.config.project_path()
-        )
-        if project_path is None:
-            raise ValueError("CPU.scaffold_project requires a project path")
-        if project_path.exists() and any(project_path.iterdir()) and not overwrite:
-            raise FileExistsError(f"Project directory is not empty: {project_path}")
-        project_path.mkdir(parents=True, exist_ok=True)
+        project_path = make_project_path(project, self.kernel.func_name, overwrite)
         self._ensure_compiled()
         assert self.module is not None
         (project_path / "lowered.mlir").write_text(str(self.module), encoding="utf-8")

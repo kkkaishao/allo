@@ -9,6 +9,8 @@
 
 #include "allo/Translation/VivadoHLSEmitter.h"
 
+#include <cctype>
+
 using namespace mlir;
 using namespace mlir::allo;
 
@@ -23,8 +25,85 @@ static std::string getIntegerTypeName(unsigned width, bool isSigned) {
   case 64:
     return prefix + "int" + std::to_string(width) + "_t";
   default:
-    return "ap_int<" + std::to_string(width) + ">";
+    return (isSigned ? "ap_int<" : "ap_uint<") + std::to_string(width) + ">";
   }
+}
+
+static std::string sanitizeCppIdentifier(llvm::StringRef name) {
+  std::string result;
+  result.reserve(name.size());
+  for (char c : name) {
+    unsigned char uc = static_cast<unsigned char>(c);
+    result.push_back(std::isalnum(uc) || c == '_' ? c : '_');
+  }
+  if (result.empty() ||
+      std::isdigit(static_cast<unsigned char>(result.front())))
+    result.insert(result.begin(), '_');
+  return result;
+}
+
+std::string VivadoHLSEmitter::getSymbolName(llvm::StringRef name) {
+  auto existing = symbolNameTable.find(name);
+  if (existing != symbolNameTable.end())
+    return existing->second;
+
+  std::string base = sanitizeCppIdentifier(name);
+  std::string unique = base;
+  unsigned suffix = 0;
+  while (usedSymbolNames.contains(unique))
+    unique = base + "_" + std::to_string(++suffix);
+
+  usedSymbolNames.insert(unique);
+  symbolNameTable[name] = unique;
+  return unique;
+}
+
+bool VivadoHLSEmitter::hasUnsupportedType(Type type) {
+  if (isa<StreamType>(type))
+    return true;
+  if (auto shaped = dyn_cast<ShapedType>(type))
+    return hasUnsupportedType(shaped.getElementType());
+  return false;
+}
+
+LogicalResult VivadoHLSEmitter::validateModule(ModuleOp mod) {
+  WalkResult result = mod->walk([&](Operation *op) -> WalkResult {
+    if (isa<allo::StreamCreateOp, allo::StreamGetOp, allo::StreamPutOp>(op)) {
+      op->emitError()
+          << "Stream operations are not supported in Vivado HLS emitter.";
+      state.failed = true;
+      return WalkResult::interrupt();
+    }
+
+    if (auto func = dyn_cast<func::FuncOp>(op)) {
+      for (Type type : func.getArgumentTypes()) {
+        if (hasUnsupportedType(type)) {
+          func->emitError()
+              << "StreamType is not supported in Vivado HLS emitter.";
+          state.failed = true;
+          return WalkResult::interrupt();
+        }
+      }
+      for (Type type : func.getResultTypes()) {
+        if (hasUnsupportedType(type)) {
+          func->emitError()
+              << "StreamType is not supported in Vivado HLS emitter.";
+          state.failed = true;
+          return WalkResult::interrupt();
+        }
+      }
+    }
+
+    for (Type type : op->getResultTypes()) {
+      if (hasUnsupportedType(type)) {
+        op->emitError() << "StreamType is not supported in Vivado HLS emitter.";
+        state.failed = true;
+        return WalkResult::interrupt();
+      }
+    }
+    return WalkResult::advance();
+  });
+  return failure(result.wasInterrupted());
 }
 
 std::string VivadoHLSEmitter::getPrimitiveTypeName(Type type, bool isSigned) {
@@ -63,24 +142,6 @@ std::string VivadoHLSEmitter::getPrimitiveTypeName(Type type, bool isSigned) {
            std::to_string(width - frac) + ">";
   }
 
-  if (auto streamType = dyn_cast<StreamType>(type)) {
-    // Check if the base type is a shaped type (tensor/array) - stream of blocks
-    if (auto shapedType =
-            llvm::dyn_cast<ShapedType>(streamType.getBaseType())) {
-      // Stream of blocks using hls::vector: Stream[elementType[dims...], depth]
-      // Flatten all dimensions into a single vector size
-      int64_t vectorSize = std::accumulate(shapedType.getShape().begin(),
-                                           shapedType.getShape().end(), 1LL,
-                                           std::multiplies<int64_t>());
-      std::string elementTypeName =
-          getPrimitiveTypeName(shapedType.getElementType());
-      return "hls::stream<hls::vector<" + elementTypeName + ", " +
-             std::to_string(vectorSize) + ">>";
-    }
-    return "hls::stream<" + getPrimitiveTypeName(streamType.getBaseType()) +
-           ">";
-  }
-
   llvm_unreachable("unsupported types");
 }
 
@@ -96,7 +157,7 @@ void VivadoHLSEmitter::emitFunction(func::FuncOp func) {
   }
 
   emitFunctionReturnType(func);
-  state.os << " " << func.getSymName() << "(";
+  state.os << " " << getSymbolName(func.getSymName()) << "(";
   emitFunctionArguments(func);
   state.os << ") {\n";
   state.addIndent();
@@ -126,11 +187,8 @@ void VivadoHLSEmitter::emitFunctionArguments(func::FuncOp func) {
       state.os << ", ";
     state.os << getPrimitiveTypeName(arg.getType()) << " "
              << state.getOrAddName(arg);
-    if (auto shaped = dyn_cast<ShapedType>(arg.getType())) {
-      for (auto dim : shaped.getShape()) {
-        state.os << "[" << dim << "]";
-      }
-    }
+    if (auto shaped = dyn_cast<ShapedType>(arg.getType()))
+      emitArraySuffix(shaped, arg.getLoc());
   }
 }
 
@@ -166,15 +224,21 @@ void VivadoHLSEmitter::emitFunctionDirectives(func::FuncOp func) {
 void VivadoHLSEmitter::emitCall(func::CallOp op) {
   llvm::raw_ostream &os = state.os;
   // cpp cannot handle multiple return values
+  if (op->getNumResults() > 1) {
+    op->emitError()
+        << "Multiple call results are not supported in Vivado HLS emitter.";
+    state.failed = true;
+    return;
+  }
   if (op->getNumResults() == 1) {
-    emitValue(op.getResult(0));
+    emitValueDecl(op.getResult(0));
     os << " = ";
   }
-  os << op.getCallee() << "(";
+  os << getSymbolName(op.getCallee()) << "(";
   for (unsigned i = 0; i < op.getNumOperands(); ++i) {
     if (i > 0)
       os << ", ";
-    emitValue(op.getOperand(i));
+    emitValueRef(op.getOperand(i));
   }
   os << ");";
 }
@@ -206,9 +270,9 @@ void VivadoHLSEmitter::emitAffineFor(affine::AffineForOp op) {
   // declare variables for iter args
   for (auto [result, iter, init] :
        llvm::zip(op.getResults(), op.getRegionIterArgs(), op.getInits())) {
-    emitValue(iter);
+    emitValueDecl(iter);
     os << " = ";
-    emitValue(init);
+    emitValueRef(init);
     os << ";\n";
     state.nameTable[result] = state.getName(iter);
   }
@@ -216,32 +280,26 @@ void VivadoHLSEmitter::emitAffineFor(affine::AffineForOp op) {
   if (op.getNumResults())
     os.indent(state.currentIndent);
   os << "for (";
-  emitValue(op.getInductionVar());
+  emitValueDecl(op.getInductionVar());
   os << " = ";
   std::string ivName = state.getName(op.getInductionVar());
-  AffineExprEmitter lbEmitter(state, op.getLowerBoundOperands());
   AffineMap lbMap = op.getLowerBoundMap();
   // if lb num results > 1, affine.for will take the max of all results as the
   // lower bound
-  if (lbMap.getNumResults() > 1) {
-    os << "max(";
-    lbEmitter.emitAffineMap(lbMap);
-    os << ")";
-  } else {
-    lbEmitter.emitAffineMap(lbMap);
-  }
+  if (lbMap.getNumResults() > 1)
+    emitAffineMapReduction(lbMap, op.getLowerBoundOperands(), "std::max");
+  else
+    AffineExprEmitter(state, op.getLowerBoundOperands(), lbMap.getNumDims())
+        .emitAffineMap(lbMap);
   // if ub num results > 1, affine.for will take the min of all results as the
   // upper bound
   os << "; " << ivName << " < ";
-  AffineExprEmitter ubEmitter(state, op.getUpperBoundOperands());
   AffineMap ubMap = op.getUpperBoundMap();
-  if (ubMap.getNumResults() > 1) {
-    os << "min(";
-    ubEmitter.emitAffineMap(ubMap);
-    os << ")";
-  } else {
-    ubEmitter.emitAffineMap(ubMap);
-  }
+  if (ubMap.getNumResults() > 1)
+    emitAffineMapReduction(ubMap, op.getUpperBoundOperands(), "std::min");
+  else
+    AffineExprEmitter(state, op.getUpperBoundOperands(), ubMap.getNumDims())
+        .emitAffineMap(ubMap);
   // emit step
   os << "; " << ivName << " += " << op.getStep() << ") {\n";
   state.addIndent();
@@ -271,11 +329,12 @@ void VivadoHLSEmitter::emitLoopDirectives(Operation *op) {
 
 void VivadoHLSEmitter::emitAffineLoad(affine::AffineLoadOp op) {
   llvm::raw_ostream &os = state.os;
-  emitValue(op.getResult());
+  emitValueDecl(op.getResult());
   os << " = ";
-  emitValue(op.getMemref());
-  AffineExprEmitter indexEmitter(state, op.getMapOperands());
   AffineMap indexMap = op.getAffineMap();
+  AffineExprEmitter indexEmitter(state, op.getMapOperands(),
+                                 indexMap.getNumDims());
+  emitValueRef(op.getMemref());
   for (unsigned i = 0; i < indexMap.getNumResults(); ++i) {
     os << "[";
     indexEmitter.visit(indexMap.getResult(i));
@@ -286,16 +345,17 @@ void VivadoHLSEmitter::emitAffineLoad(affine::AffineLoadOp op) {
 
 void VivadoHLSEmitter::emitAffineStore(affine::AffineStoreOp op) {
   llvm::raw_ostream &os = state.os;
-  emitValue(op.getMemref());
-  AffineExprEmitter indexEmitter(state, op.getMapOperands());
   AffineMap indexMap = op.getAffineMap();
+  AffineExprEmitter indexEmitter(state, op.getMapOperands(),
+                                 indexMap.getNumDims());
+  emitValueRef(op.getMemref());
   for (unsigned i = 0; i < indexMap.getNumResults(); ++i) {
     os << "[";
     indexEmitter.visit(indexMap.getResult(i));
     os << "]";
   }
   os << " = ";
-  emitValue(op.getValueToStore());
+  emitValueRef(op.getValueToStore());
   os << ";";
 }
 
@@ -303,16 +363,16 @@ void VivadoHLSEmitter::emitAffineIf(affine::AffineIfOp op) {
   llvm::raw_ostream &os = state.os;
   // emit results
   for (auto result : op.getResults()) {
-    emitValue(result);
+    emitValueDecl(result);
     os << ";\n"; // leave it uninitialized for now, will be assigned in the
                  // then/else blocks
   }
   if (op.getNumResults())
     os.indent(state.currentIndent);
   os << "if (";
-  AffineExprEmitter condEmitter(state, op->getOperands());
 
   IntegerSet conds = op.getCondition();
+  AffineExprEmitter condEmitter(state, op->getOperands(), conds.getNumDims());
   unsigned nConds = conds.getNumConstraints();
   unsigned condIdx = 0;
   for (auto [cond, eq] :
@@ -347,28 +407,15 @@ void VivadoHLSEmitter::emitAffineYield(affine::AffineYieldOp op) {
   if (op->getNumOperands() == 0)
     return;
 
-  llvm::raw_ostream &os = state.os;
-  auto parent = op->getParentOp();
-  unsigned cnt = 0;
-  unsigned nResults = parent->getNumResults();
-  for (auto [iter, operand] :
-       llvm::zip(parent->getResults(), op->getOperands())) {
-    emitValue(iter);
-    os << " = ";
-    emitValue(operand);
-    os << ";";
-    if (++cnt != nResults) {
-      os << "\n";
-      os.indent(state.currentIndent);
-    }
-  }
+  emitYieldAssignments(op->getParentOp(), op->getOperands());
 }
 
 void VivadoHLSEmitter::emitAffineApply(affine::AffineApplyOp op) {
   llvm::raw_ostream &os = state.os;
-  emitValue(op.getResult());
+  emitValueDecl(op.getResult());
   os << " = ";
-  AffineExprEmitter exprEmitter(state, op.getMapOperands());
+  AffineExprEmitter exprEmitter(state, op.getMapOperands(),
+                                op.getAffineMap().getNumDims());
   exprEmitter.emitAffineMap(op.getAffineMap());
   os << ";";
 }
@@ -379,66 +426,115 @@ void VivadoHLSEmitter::emitBlock(Block &block) {
   }
 }
 
-void VivadoHLSEmitter::emitValue(Value val) {
-  // generate type declaration if not declared yet
+void VivadoHLSEmitter::emitArraySuffix(ShapedType type, Location loc) {
+  if (!type.hasRank()) {
+    emitError(loc)
+        << "Unranked shaped types are not supported in Vivado HLS emitter.";
+    state.failed = true;
+    return;
+  }
+  for (int64_t dim : type.getShape()) {
+    if (ShapedType::isDynamic(dim)) {
+      emitError(loc)
+          << "Dynamic shaped types are not supported in Vivado HLS emitter.";
+      state.failed = true;
+      return;
+    }
+    state.os << "[" << dim << "]";
+  }
+}
+
+void VivadoHLSEmitter::emitValueDecl(Value val) {
   if (state.hasName(val)) {
     state.os << state.getName(val);
-  } else {
-    state.os << getPrimitiveTypeName(val.getType()) << " "
-             << state.addName(val);
-    if (auto shaped = dyn_cast<ShapedType>(val.getType())) {
-      if (!shaped.hasRank()) {
-        emitError(val.getLoc())
-            << "Unranked shaped types are not supported in Vivado HLS emitter.";
-        state.failed = true;
-      }
-      // if it's a shaped type, we need to declare the shape as well
-      for (auto dim : shaped.getShape()) {
-        state.os << "[" << dim << "]";
-      }
-    } else if (auto streamType = dyn_cast<StreamType>(val.getType())) {
-      for (auto dim : streamType.getShape()) {
-        state.os << "[" << dim << "]";
-      }
+    return;
+  }
+
+  state.os << getPrimitiveTypeName(val.getType()) << " " << state.addName(val);
+  if (auto shaped = dyn_cast<ShapedType>(val.getType()))
+    emitArraySuffix(shaped, val.getLoc());
+}
+
+void VivadoHLSEmitter::emitValueRef(Value val) {
+  if (!state.hasName(val)) {
+    emitError(val.getLoc()) << "value used before declaration in Vivado HLS "
+                               "emitter.";
+    state.failed = true;
+    state.os << "/*unknown*/";
+    return;
+  }
+  state.os << state.getName(val);
+}
+
+void VivadoHLSEmitter::emitIndexedValue(Value value, ValueRange indices) {
+  emitValueRef(value);
+  for (Value index : indices) {
+    state.os << "[";
+    emitValueRef(index);
+    state.os << "]";
+  }
+}
+
+void VivadoHLSEmitter::emitYieldAssignments(Operation *parent,
+                                            OperandRange operands) {
+  llvm::raw_ostream &os = state.os;
+  unsigned cnt = 0;
+  unsigned nResults = parent->getNumResults();
+  for (auto [iter, operand] : llvm::zip(parent->getResults(), operands)) {
+    emitValueRef(iter);
+    os << " = ";
+    emitValueRef(operand);
+    os << ";";
+    if (++cnt != nResults) {
+      os << "\n";
+      os.indent(state.currentIndent);
     }
   }
 }
 
+void VivadoHLSEmitter::emitAffineMapReduction(
+    AffineMap map, OperandRange operands, llvm::StringLiteral functionName) {
+  assert(map.getNumResults() > 0 && "expected affine map result");
+  AffineExprEmitter emitter(state, operands, map.getNumDims());
+  if (map.getNumResults() == 1) {
+    emitter.visit(map.getResult(0));
+    return;
+  }
+  for (unsigned i = 0; i + 1 < map.getNumResults(); ++i) {
+    state.os << functionName << "(";
+    emitter.visit(map.getResult(i));
+    state.os << ", ";
+  }
+  emitter.visit(map.getResult(map.getNumResults() - 1));
+  for (unsigned i = 0; i + 1 < map.getNumResults(); ++i)
+    state.os << ")";
+}
+
 void VivadoHLSEmitter::emitMemrefAlloc(memref::AllocOp op) {
   llvm::raw_ostream &os = state.os;
-  emitValue(op.getResult());
+  emitValueDecl(op.getResult());
   os << ";";
 }
 
 void VivadoHLSEmitter::emitMemrefAlloca(memref::AllocaOp op) {
   llvm::raw_ostream &os = state.os;
-  emitValue(op.getResult());
+  emitValueDecl(op.getResult());
   os << ";";
 }
 
 void VivadoHLSEmitter::emitMemrefLoad(memref::LoadOp op) {
   llvm::raw_ostream &os = state.os;
-  emitValue(op.getResult());
+  emitValueDecl(op.getResult());
   os << " = ";
-  emitValue(op.getMemref());
-  for (auto index : op.getIndices()) {
-    os << "[";
-    emitValue(index);
-    os << "]";
-  }
+  emitIndexedValue(op.getMemref(), op.getIndices());
   os << ";";
 }
 
 void VivadoHLSEmitter::emitMemrefStore(memref::StoreOp op) {
   llvm::raw_ostream &os = state.os;
-  emitValue(op.getMemref());
-  for (auto index : op.getIndices()) {
-    os << "[";
-    emitValue(index);
-    os << "]";
-  }
+  emitIndexedValue(op.getMemref(), op.getIndices());
   os << " = ";
-  emitValue(op.getValueToStore());
+  emitValueRef(op.getValueToStore());
   os << ";";
 }
 
@@ -448,16 +544,14 @@ void VivadoHLSEmitter::emitMemrefGlobal(memref::GlobalOp op) {
   os << "extern ";
   auto type = cast<MemRefType>(op.getType());
   os << getPrimitiveTypeName(type);
-  os << " " << op.getSymName();
-  for (auto dim : type.getShape()) {
-    os << "[" << dim << "]";
-  }
+  os << " " << getSymbolName(op.getSymName());
+  emitArraySuffix(type, op.getLoc());
   os << ";";
 }
 
 void VivadoHLSEmitter::emitMemrefGetGlobal(memref::GetGlobalOp op) {
   // we only need to map the result of get_global to the global variable name
-  state.nameTable[op.getResult()] = op.getName();
+  state.nameTable[op.getResult()] = getSymbolName(op.getName());
 }
 
 void VivadoHLSEmitter::emitFor(scf::ForOp op) {
@@ -465,9 +559,9 @@ void VivadoHLSEmitter::emitFor(scf::ForOp op) {
   // declare variables for iter args
   for (auto [result, iter, init] :
        llvm::zip(op.getResults(), op.getRegionIterArgs(), op.getInits())) {
-    emitValue(iter);
+    emitValueDecl(iter);
     os << " = ";
-    emitValue(init);
+    emitValueRef(init);
     os << ";\n";
     state.nameTable[result] = state.getName(iter);
   }
@@ -475,13 +569,13 @@ void VivadoHLSEmitter::emitFor(scf::ForOp op) {
   if (op.getNumResults())
     os.indent(state.currentIndent);
   os << "for (";
-  emitValue(op.getInductionVar());
+  emitValueDecl(op.getInductionVar());
   os << " = ";
-  emitValue(op.getLowerBound());
+  emitValueRef(op.getLowerBound());
   os << "; " << state.getName(op.getInductionVar()) << " < ";
-  emitValue(op.getUpperBound());
+  emitValueRef(op.getUpperBound());
   os << "; " << state.getName(op.getInductionVar()) << " += ";
-  emitValue(op.getStep());
+  emitValueRef(op.getStep());
   os << ") {\n";
   state.addIndent();
   // emit pragmas
@@ -496,14 +590,14 @@ void VivadoHLSEmitter::emitIf(scf::IfOp op) {
   llvm::raw_ostream &os = state.os;
   // emit results
   for (auto result : op.getResults()) {
-    emitValue(result);
+    emitValueDecl(result);
     os << ";\n"; // leave it unintialized for now, will be assigned in the
                  // then/else blocks
   }
   if (op.getNumResults())
     os.indent(state.currentIndent);
   os << "if (";
-  emitValue(op.getCondition());
+  emitValueRef(op.getCondition());
   os << ") {\n";
   state.addIndent();
   emitBlock(*op.thenBlock());
@@ -524,35 +618,21 @@ void VivadoHLSEmitter::emitIf(scf::IfOp op) {
 void VivadoHLSEmitter::emitSCFYield(scf::YieldOp op) {
   if (op->getNumOperands() == 0)
     return;
-  llvm::raw_ostream &os = state.os;
-  Operation *parent = op->getParentOp();
-  unsigned cnt = 0;
-  unsigned nIterArgs = parent->getNumResults();
-  for (auto [iter, operand] :
-       llvm::zip(parent->getResults(), op->getOperands())) {
-    emitValue(iter);
-    os << " = ";
-    emitValue(operand);
-    os << ";";
-    if (++cnt != nIterArgs) {
-      os << "\n";
-      os.indent(state.currentIndent);
-    }
-  }
+  emitYieldAssignments(op->getParentOp(), op->getOperands());
 }
 
 void VivadoHLSEmitter::emitCastOp(Operation *op) {
   llvm::raw_ostream &os = state.os;
-  emitValue(op->getResult(0));
+  emitValueDecl(op->getResult(0));
   os << " = static_cast<" << getPrimitiveTypeName(op->getResult(0).getType())
      << ">(";
-  emitValue(op->getOperand(0));
+  emitValueRef(op->getOperand(0));
   os << ");";
 }
 
 void VivadoHLSEmitter::emitConstant(arith::ConstantOp op) {
   state.os << "constexpr ";
-  emitValue(op.getResult());
+  emitValueDecl(op.getResult());
   state.os << " = ";
   if (auto intAttr = dyn_cast<IntegerAttr>(op.getValue())) {
     state.os << intAttr.getInt();
@@ -566,13 +646,13 @@ void VivadoHLSEmitter::emitConstant(arith::ConstantOp op) {
 
 void VivadoHLSEmitter::emitSelect(arith::SelectOp op) {
   llvm::raw_ostream &os = state.os;
-  emitValue(op.getResult());
+  emitValueDecl(op.getResult());
   os << " = ";
-  emitValue(op.getCondition());
+  emitValueRef(op.getCondition());
   os << " ? ";
-  emitValue(op.getTrueValue());
+  emitValueRef(op.getTrueValue());
   os << " : ";
-  emitValue(op.getFalseValue());
+  emitValueRef(op.getFalseValue());
   os << ";";
 }
 
@@ -582,9 +662,9 @@ void VivadoHLSEmitter::emitWhile(scf::WhileOp op) {
   // declare variables for iter args
   bool emittedIterInit = false;
   for (auto [iter, init] : llvm::zip(op.getResults(), op.getInits())) {
-    emitValue(iter);
+    emitValueDecl(iter);
     os << " = ";
-    emitValue(init);
+    emitValueRef(init);
     os << ";\n";
     emittedIterInit = true;
   }
@@ -595,8 +675,9 @@ void VivadoHLSEmitter::emitWhile(scf::WhileOp op) {
   // construct before block
   emitBlock(*op.getBeforeBody());
   // evaluate condition
+  os.indent(state.currentIndent);
   os << "if (!(";
-  emitValue(op.getConditionOp().getCondition());
+  emitValueRef(op.getConditionOp().getCondition());
   os << "))\n";
   os.indent(state.currentIndent + state.indentSize);
   os << "break;\n";
@@ -608,62 +689,82 @@ void VivadoHLSEmitter::emitWhile(scf::WhileOp op) {
 
 void VivadoHLSEmitter::emitReturn(func::ReturnOp op) {
   llvm::raw_ostream &os = state.os;
+  if (op.getNumOperands() > 1) {
+    op->emitError()
+        << "Multiple return operands are not supported in Vivado HLS emitter.";
+    state.failed = true;
+    return;
+  }
   os << "return";
   if (op.getNumOperands() > 0) {
     os << " ";
-    for (unsigned i = 0; i < op.getNumOperands(); ++i) {
-      if (i > 0)
-        os << ", ";
-      emitValue(op.getOperand(i));
-    }
+    emitValueRef(op.getOperand(0));
   }
   os << ";";
 }
 
-void VivadoHLSEmitter::emitCondition(scf::ConditionOp op) {
-  // llvm::raw_ostream &os = state.os;
-  // emitValue(op.getCondition());
-  // os << " = ";
-  // emitValue(op.getOperand());
-  // os << ";";
-}
-
-void VivadoHLSEmitter::emitStreamCreate(allo::StreamCreateOp op) {
+void VivadoHLSEmitter::emitLinalgFill(linalg::FillOp op) {
   llvm::raw_ostream &os = state.os;
-  emitValue(op.getResult());
-  os << ";";
-}
 
-void VivadoHLSEmitter::emitStreamGet(allo::StreamGetOp op) {
-  llvm::raw_ostream &os = state.os;
-  emitValue(op.getResult());
+  if (op.getInputs().size() != 1 || op.getOutputs().size() != 1) {
+    op->emitError()
+        << "Only single-input single-output linalg.fill is supported in "
+           "Vivado HLS emitter.";
+    state.failed = true;
+    return;
+  }
+
+  Value fillValue = op.getInputs().front();
+  Value output = op.getOutputs().front();
+  auto type = dyn_cast<MemRefType>(output.getType());
+  if (!type || !type.hasStaticShape()) {
+    op->emitError()
+        << "Only static ranked memref linalg.fill outputs are supported in "
+           "Vivado HLS emitter.";
+    state.failed = true;
+    return;
+  }
+
+  if (type.getRank() == 0) {
+    emitValueRef(output);
+    os << " = ";
+    emitValueRef(fillValue);
+    os << ";";
+    return;
+  }
+
+  std::string indexType = getIntegerTypeName(state.indexWidth, true);
+  SmallVector<std::string, 4> loopVars;
+  loopVars.reserve(type.getRank());
+  for (int64_t dim = 0; dim < type.getRank(); ++dim) {
+    std::string iv = "i" + std::to_string(dim);
+    loopVars.push_back(iv);
+    os << "for (" << indexType << " " << iv << " = 0; " << iv << " < "
+       << type.getDimSize(dim) << "; ++" << iv << ") {\n";
+    state.addIndent();
+    os.indent(state.currentIndent);
+  }
+
+  emitValueRef(output);
+  for (const std::string &iv : loopVars)
+    os << "[" << iv << "]";
   os << " = ";
-  emitValue(op.getStream());
-  for (auto idx : op.getIndices()) {
-    os << "[";
-    emitValue(idx);
-    os << "]";
-  }
-  os << ".read();";
-}
+  emitValueRef(fillValue);
+  os << ";";
 
-void VivadoHLSEmitter::emitStreamPut(allo::StreamPutOp op) {
-  llvm::raw_ostream &os = state.os;
-  emitValue(op.getStream());
-  for (auto idx : op.getIndices()) {
-    os << "[";
-    emitValue(idx);
-    os << "]";
+  for (int64_t dim = type.getRank() - 1; dim >= 0; --dim) {
+    state.reduceIndent();
+    os << "\n";
+    os.indent(state.currentIndent);
+    os << "}";
   }
-  os << ".write(";
-  emitValue(op.getValue());
-  os << ");";
 }
 
 void VivadoHLSEmitter::dispatch(Operation *op) {
-  if (isa<scf::YieldOp, affine::AffineYieldOp>(op) &&
-      op->getNumOperands() == 0) {
-    // Skip empty yields to avoid generating blank lines.
+  if ((isa<scf::YieldOp, affine::AffineYieldOp>(op) &&
+       op->getNumOperands() == 0) ||
+      isa<scf::ConditionOp>(op)) {
+    // Skip terminators that do not materialize as standalone statements.
     return;
   }
 
@@ -773,9 +874,7 @@ void VivadoHLSEmitter::dispatch(Operation *op) {
       .Case<scf::YieldOp>([&](auto op) { emitSCFYield(op); })
       .Case<scf::WhileOp>([&](auto op) { emitWhile(op); })
 
-      .Case<allo::StreamCreateOp>([&](auto op) { emitStreamCreate(op); })
-      .Case<allo::StreamGetOp>([&](auto op) { emitStreamGet(op); })
-      .Case<allo::StreamPutOp>([&](auto op) { emitStreamPut(op); })
+      .Case<linalg::FillOp>([&](auto op) { emitLinalgFill(op); })
 
       .Default([&](auto op) {
         op->emitError() << "operation not supported in Vivado HLS emitter: "
@@ -801,11 +900,11 @@ void VivadoHLSEmitter::emitBinaryOp(Operation *op,
                                     llvm::StringLiteral keyword) {
   llvm::raw_ostream &os = state.os;
   Value result = op->getResult(0);
-  emitValue(result);
+  emitValueDecl(result);
   os << " = ";
-  emitValue(op->getOperand(0));
+  emitValueRef(op->getOperand(0));
   os << " " << keyword << " ";
-  emitValue(op->getOperand(1));
+  emitValueRef(op->getOperand(1));
   os << ";";
 }
 
@@ -813,24 +912,24 @@ void VivadoHLSEmitter::emitBinaryOp(Operation *op, llvm::StringLiteral keyword,
                                     bool isSigned) {
   llvm::raw_ostream &os = state.os;
   Value result = op->getResult(0);
-  emitValue(result);
+  emitValueDecl(result);
   os << " = ";
   os << "static_cast<"
      << getPrimitiveTypeName(op->getOperand(0).getType(), isSigned) << ">(";
-  emitValue(op->getOperand(0));
+  emitValueRef(op->getOperand(0));
   os << ") " << keyword << " ";
   os << "static_cast<"
      << getPrimitiveTypeName(op->getOperand(1).getType(), isSigned) << ">(";
-  emitValue(op->getOperand(1));
+  emitValueRef(op->getOperand(1));
   os << ");";
 }
 
 void VivadoHLSEmitter::emitUnaryOp(Operation *op, llvm::StringLiteral keyword) {
   llvm::raw_ostream &os = state.os;
   Value result = op->getResult(0);
-  emitValue(result);
+  emitValueDecl(result);
   os << " = " << keyword << "(";
-  emitValue(op->getOperand(0));
+  emitValueRef(op->getOperand(0));
   os << ");";
 }
 
@@ -838,11 +937,11 @@ void VivadoHLSEmitter::emitPrefixBinaryOp(Operation *op,
                                           llvm::StringLiteral keyword) {
   llvm::raw_ostream &os = state.os;
   Value result = op->getResult(0);
-  emitValue(result);
+  emitValueDecl(result);
   os << " = " << keyword << "(";
-  emitValue(op->getOperand(0));
+  emitValueRef(op->getOperand(0));
   os << ", ";
-  emitValue(op->getOperand(1));
+  emitValueRef(op->getOperand(1));
   os << ");";
 }
 
@@ -851,15 +950,15 @@ void VivadoHLSEmitter::emitPrefixBinaryOp(Operation *op,
                                           bool isSigned) {
   llvm::raw_ostream &os = state.os;
   Value result = op->getResult(0);
-  emitValue(result);
+  emitValueDecl(result);
   os << " = " << keyword << "(";
   os << "static_cast<"
      << getPrimitiveTypeName(op->getOperand(0).getType(), isSigned) << ">(";
-  emitValue(op->getOperand(0));
+  emitValueRef(op->getOperand(0));
   os << "), ";
   os << "static_cast<"
      << getPrimitiveTypeName(op->getOperand(1).getType(), isSigned) << ">(";
-  emitValue(op->getOperand(1));
+  emitValueRef(op->getOperand(1));
   os << "));";
 }
 
@@ -924,22 +1023,22 @@ static std::string getCmpFPredString(arith::CmpFPredicate pred) {
 void VivadoHLSEmitter::emitCmpI(arith::CmpIOp op) {
   llvm::raw_ostream &os = state.os;
   Value result = op.getResult();
-  emitValue(result);
+  emitValueDecl(result);
   os << " = ";
-  emitValue(op.getLhs());
+  emitValueRef(op.getLhs());
   os << " " << getCmpIPredString(op.getPredicate()) << " ";
-  emitValue(op.getRhs());
+  emitValueRef(op.getRhs());
   os << ";";
 }
 
 void VivadoHLSEmitter::emitCmpF(arith::CmpFOp op) {
   llvm::raw_ostream &os = state.os;
   Value result = op.getResult();
-  emitValue(result);
+  emitValueDecl(result);
   os << " = ";
-  emitValue(op.getLhs());
+  emitValueRef(op.getLhs());
   os << " " << getCmpFPredString(op.getPredicate()) << " ";
-  emitValue(op.getRhs());
+  emitValueRef(op.getRhs());
   os << ";";
 }
 
@@ -954,8 +1053,6 @@ constexpr llvm::StringLiteral deviceHeader = R"XXX(
 #include <ap_fixed.h>
 #include <ap_int.h>
 #include <hls_math.h>
-#include <hls_stream.h>
-#include <hls_vector.h>
 #include <math.h>
 #include <stdint.h>
 using namespace std;
@@ -964,6 +1061,9 @@ using namespace std;
 void VivadoHLSEmitter::emitModule(ModuleOp mod) {
   // TODO: add host-side codegen
   llvm::raw_ostream &os = state.os;
+  if (failed(validateModule(mod)))
+    return;
+
   os << deviceHeader << "\n";
   // Step 1: emit global variables
   mod->walk([&](memref::GlobalOp op) { dispatch(op); });
@@ -971,7 +1071,7 @@ void VivadoHLSEmitter::emitModule(ModuleOp mod) {
   // Step 2: generate all function declarations
   for (auto func : mod.getOps<func::FuncOp>()) {
     emitFunctionReturnType(func);
-    os << " " << func.getName() << "(";
+    os << " " << getSymbolName(func.getSymName()) << "(";
     emitFunctionArguments(func);
     os << ");";
     if (state.withLocation) {
@@ -1025,9 +1125,9 @@ void allo::registerVivadoHLSTranslation() {
   static TranslateFromMLIRRegistration reg(
       "emit-vitis-hls", "Translate MLIR to C++ code for Vivado HLS",
       ::emitVivadoHLS, [&](DialectRegistry &registry) {
-        registry
-            .insert<affine::AffineDialect, arith::ArithDialect,
-                    math::MathDialect, memref::MemRefDialect, scf::SCFDialect,
-                    func::FuncDialect, allo::AlloDialect>();
+        registry.insert<affine::AffineDialect, arith::ArithDialect,
+                        linalg::LinalgDialect, math::MathDialect,
+                        memref::MemRefDialect, scf::SCFDialect,
+                        func::FuncDialect, allo::AlloDialect>();
       });
 }

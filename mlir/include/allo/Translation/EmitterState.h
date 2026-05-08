@@ -19,7 +19,7 @@ struct EmitterState {
   DenseMap<Value, std::string> nameTable;
   unsigned indexWidth = 32;
   bool withLocation = false;
-  bool failed;
+  bool failed = false;
 
   explicit EmitterState(llvm::raw_ostream &os) : os(os) {}
 

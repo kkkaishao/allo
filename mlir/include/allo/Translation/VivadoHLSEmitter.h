@@ -9,10 +9,13 @@
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/AffineExprVisitor.h"
+#include "llvm/ADT/StringMap.h"
+#include "llvm/ADT/StringSet.h"
 
 #include "allo/IR/AlloOps.h"
 #include "allo/Translation/EmitterState.h"
@@ -43,7 +46,6 @@ struct VivadoHLSEmitter {
   void emitFor(scf::ForOp op);
   void emitIf(scf::IfOp op);
   void emitWhile(scf::WhileOp op);
-  void emitCondition(scf::ConditionOp op);
   void emitSCFYield(scf::YieldOp op);
 
   void emitSelect(arith::SelectOp op);
@@ -51,9 +53,7 @@ struct VivadoHLSEmitter {
   void emitCmpI(arith::CmpIOp op);
   void emitCmpF(arith::CmpFOp op);
 
-  void emitStreamCreate(allo::StreamCreateOp op);
-  void emitStreamGet(allo::StreamGetOp op);
-  void emitStreamPut(allo::StreamPutOp op);
+  void emitLinalgFill(linalg::FillOp op);
 
   void emitModule(ModuleOp);
 
@@ -61,12 +61,18 @@ struct VivadoHLSEmitter {
 
 private:
   void emitBlock(Block &block);
-  void emitValue(Value val);
+  void emitValueDecl(Value val);
+  void emitValueRef(Value val);
   void emitFunctionArguments(func::FuncOp func);
   void emitFunctionReturnType(func::FuncOp func);
   void emitFunctionDirectives(func::FuncOp func);
   void emitPartitionAttr(allo::PartitionAttr attr, Value value);
   void emitLoopDirectives(Operation *op);
+  void emitArraySuffix(ShapedType type, Location loc);
+  void emitIndexedValue(Value value, ValueRange indices);
+  void emitYieldAssignments(Operation *parent, OperandRange operands);
+  void emitAffineMapReduction(AffineMap map, OperandRange operands,
+                              llvm::StringLiteral functionName);
   void emitBinaryOp(Operation *op, llvm::StringLiteral keyword);
   void emitBinaryOp(Operation *op, llvm::StringLiteral keyword, bool isSigned);
   void emitPrefixBinaryOp(Operation *op, llvm::StringLiteral keyword);
@@ -74,20 +80,27 @@ private:
                           bool isSigned);
   void emitUnaryOp(Operation *op, llvm::StringLiteral keyword);
   void emitCastOp(Operation *op);
+  LogicalResult validateModule(ModuleOp mod);
+  bool hasUnsupportedType(Type type);
+  std::string getSymbolName(llvm::StringRef name);
   std::string getPrimitiveTypeName(Type type, bool isSigned = false);
 
   void dispatch(Operation *op);
+
+  llvm::StringMap<std::string> symbolNameTable;
+  llvm::StringSet<> usedSymbolNames;
 };
 
 struct AffineExprEmitter : public mlir::AffineExprVisitor<AffineExprEmitter> {
-  explicit AffineExprEmitter(EmitterState &state, OperandRange operands)
-      : state(state), operands(operands) {}
+  explicit AffineExprEmitter(EmitterState &state, OperandRange operands,
+                             unsigned numDims)
+      : state(state), operands(operands), numDims(numDims) {}
 
   void visitDimExpr(AffineDimExpr expr) {
     state.os << state.getName(operands[expr.getPosition()]);
   }
   void visitSymbolExpr(AffineSymbolExpr expr) {
-    state.os << state.getName(operands[expr.getPosition()]);
+    state.os << state.getName(operands[numDims + expr.getPosition()]);
   }
   void visitConstantExpr(AffineConstantExpr expr) {
     state.os << expr.getValue();
@@ -118,6 +131,7 @@ struct AffineExprEmitter : public mlir::AffineExprVisitor<AffineExprEmitter> {
 private:
   EmitterState &state;
   OperandRange operands;
+  unsigned numDims;
   void visitAffineBinExpr(AffineBinaryOpExpr expr, llvm::StringLiteral op) {
     state.os << "(";
     visit(expr.getLHS());

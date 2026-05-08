@@ -1,0 +1,25 @@
+import random
+import string
+import tempfile
+
+from pathlib import Path
+
+
+def generate_random_string(prefix: str, length: int = 8) -> str:
+    """Generate a random string with the given prefix."""
+    suffix = "".join(random.choices(string.ascii_lowercase + string.digits, k=length))
+    return f"{prefix}-{suffix}"
+
+
+def make_project_path(project: str | None, prefix: str, overwrite: bool) -> Path:
+    project_path = (
+        Path(project)
+        if project
+        else Path(tempfile.gettempdir()) / generate_random_string(prefix)
+    )
+    if project_path.exists() and any(project_path.iterdir()) and not overwrite:
+        raise FileExistsError(
+            f"Project path {project_path} already exists and is not empty. Use overwrite=True to overwrite."
+        )
+    project_path.mkdir(parents=True, exist_ok=True)
+    return project_path
