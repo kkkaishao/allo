@@ -4,6 +4,8 @@
 
 #include "llvm/Support/Signals.h"
 
+#include <mutex>
+
 using InitFunc = void (*)(nb::module_ &);
 
 namespace {
