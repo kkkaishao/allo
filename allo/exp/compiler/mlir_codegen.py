@@ -1036,9 +1036,10 @@ class MLIRCodeGenerator(ast.NodeVisitor):
                 return self.compile_error(
                     f"Variable '{name}' is defined as a constexpr in the outer scope, but is assigned to non-constexpr values in the then vs else branches."
                 )
-            outer_ty = value.handle.get_type()
-            then_ty = then_handle.get_type()
-            else_ty = else_handle.get_type()
+            assert isinstance(value, AlloValue)
+            outer_ty = value.type
+            then_ty = then_proxy.type
+            else_ty = else_proxy.type
             if then_ty != else_ty or then_ty != outer_ty:
                 return self.compile_error(
                     f"Variable '{name}' has incompatible types in outer scope vs then vs else branches: {outer_ty} vs {then_ty} vs {else_ty}."
@@ -1425,14 +1426,16 @@ class MLIRCodeGenerator(ast.NodeVisitor):
         finally:
             self.scf_stack.pop()
             self.dry_run_loop_analysis = old_dry_run
-        # restore state
-        block.erase()
+        # restore insertion point before analyzing dry-run live-outs. Keep the
+        # dummy block alive until after the analysis because lscope can still
+        # point to values created inside it.
         self.builder.set_insertion_point_and_loc(ip, last_loc)
 
         # compute live-outs
         init_types = []
         init_handles = []
         names = []
+        error_msg = None
 
         for name, livein in liveins.items():
             if name in ignore:
@@ -1445,15 +1448,17 @@ class MLIRCodeGenerator(ast.NodeVisitor):
                 continue  # variable is not assigned in the loop body
             # type check
             if type(loop_val) != type(livein) or loop_val.type != livein.type:
-                return self.compile_error(
-                    f"Loop variable '{name}' has incompatible types in outer scope vs loop body: {livein.type} vs {loop_val.type}."
-                )
+                error_msg = f"Loop variable '{name}' has incompatible types in outer scope vs loop body: {livein.type} vs {loop_val.type}."
+                break
             names.append(name)
             init_handles.append(livein.handle)
             init_types.append(livein.type)
 
         # restore lscope
         self.lscope = liveins.copy()
+        block.erase()
+        if error_msg is not None:
+            return self.compile_error(error_msg)
         return names, init_handles, init_types
 
     def visit_While(self, node: ast.While):

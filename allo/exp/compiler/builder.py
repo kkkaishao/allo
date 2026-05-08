@@ -251,7 +251,8 @@ class AlloOpBuilder(ir.AlloOpBuilder):
         if src_type.is_float() and dst_type.is_float():
             if src_type.primitive_width < dst_type.primitive_width:
                 return AlloValue(
-                    self.create_ext(value, dst_ir_type, floating=True), dst_type
+                    self.create_ext(value, dst_ir_type, signed=False, floating=True),
+                    dst_type,
                 )
             return AlloValue(
                 self.create_trunc(value, dst_ir_type, floating=True), dst_type
