@@ -12,6 +12,7 @@
 #include "mlir/Dialect/Affine/Transforms/Passes.h"
 #include "mlir/Dialect/Bufferization/Pipelines/Passes.h"
 #include "mlir/Dialect/Bufferization/Transforms/Passes.h"
+#include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/LLVMIR/Transforms/Passes.h"
 #include "mlir/Dialect/Linalg/Passes.h"
 #include "mlir/Dialect/MemRef/Transforms/Passes.h"
@@ -67,11 +68,11 @@ void bindPasses(nb::module_ &m) {
       bufferization::buildBufferDeallocationPipeline(pm);
       pm.addPass(createConvertBufferizationToMemRefPass());
     }
-    pm.addPass(LLVM::createLLVMRequestCWrappersPass());
-
-    pm.addPass(createConvertLinalgToAffineLoopsPass());
-    pm.addPass(affine::createAffineScalarReplacementPass());
-    pm.addPass(createLoopInvariantCodeMotionPass());
+    auto &funcPM = pm.nest<func::FuncOp>();
+    funcPM.addPass(LLVM::createLLVMRequestCWrappersPass());
+    funcPM.addPass(createConvertLinalgToAffineLoopsPass());
+    funcPM.addPass(affine::createAffineScalarReplacementPass());
+    funcPM.addPass(createLoopInvariantCodeMotionPass());
     pm.addPass(createLowerAffinePass());
     pm.addPass(createSCFToControlFlowPass());
     pm.addPass(createCanonicalizerPass());

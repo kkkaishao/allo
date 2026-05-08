@@ -23,6 +23,7 @@ __all__ = [
     "allo",
     "passes",
     "transform",
+    "execution_engine",
 ]
 
 _EAGER_SUBMODULES = (
@@ -57,6 +58,7 @@ if TYPE_CHECKING:
         allo,
         passes,
         transform,
+        execution_engine,
     )
 else:
     for _name in _EAGER_SUBMODULES:
@@ -67,7 +69,7 @@ else:
     del _name
 
     def __getattr__(name: str):
-        if name == "transform":
+        if name in {"transform", "execution_engine"}:
             mod = importlib.import_module(f".{name}", __name__)
             globals()[name] = mod
             return mod

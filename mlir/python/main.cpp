@@ -28,6 +28,7 @@ static constexpr SubmoduleDesc kSubmodules[] = {
     {"transform", bindTransform, "transform dialect"},
     {"allo", bindAlloOps, "allo dialect"},
     {"passes", bindPasses, "compiler passes"},
+    {"execution_engine", bindExecutionEngine, "MLIR execution engine"},
 };
 
 static std::once_flag loadIROnce;
@@ -42,7 +43,7 @@ static nb::module_ ensureIRLoaded(nb::module_ &parent) {
 }
 
 static bool isLazySubmodule(std::string_view name) {
-  return name == "transform";
+  return name == "transform" || name == "execution_engine";
 }
 
 static nb::object ensureSubmoduleLoaded(nb::module_ &parent, size_t index) {

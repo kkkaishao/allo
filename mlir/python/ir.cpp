@@ -410,10 +410,10 @@ static void bindCoreIR(nb::module_ &m) {
            [](OpState &self) -> bool {
              return succeeded(verify(self.getOperation()));
            })
-      .def("erase", &OpState::erase)
-      .def(
-          "clone", [](OpState &self) { return self->clone(); },
-          nb::rv_policy::reference);
+      .def("erase", &OpState::erase);
+
+  nb::class_<OwningOpRef<ModuleOp>>(m, "OwningModuleOp")
+      .def("get", [](OwningOpRef<ModuleOp> &self) { return self.get(); });
 
   nb::class_<ModuleOp, OpState>(m, "ModuleOp")
       .def(
@@ -437,7 +437,10 @@ static void bindCoreIR(nb::module_ &m) {
              pm.addPass(mlir::createCSEPass());
              (void)pm.run(self);
            })
-      .def("clone", [](ModuleOp &self) { return cast<ModuleOp>(self.clone()); })
+      .def("clone",
+           [](ModuleOp &self) {
+             return OwningOpRef<ModuleOp>(cast<ModuleOp>(self.clone()));
+           })
       .def("lookup_func",
            [](ModuleOp &self,
               std::string_view name) -> std::optional<func::FuncOp> {
@@ -525,22 +528,34 @@ static void bindTypes(nb::module_ &m) {
   nb::class_<RankedTensorType, Type>(m, "RankedTensorType")
       .def_static(
           "get",
+          [](const std::vector<int64_t> &shape, Type elementType) {
+            return RankedTensorType::get(shape, elementType);
+          },
+          nb::arg("shape"), nb::arg("element_type"))
+      .def_static(
+          "get",
           [](const std::vector<int64_t> &shape, Type elementType,
-             Attribute encoding = {}) {
+             Attribute encoding) {
             return RankedTensorType::get(shape, elementType, encoding);
           },
-          nb::arg("shape"), nb::arg("element_type"),
-          nb::arg("encoding") = Attribute{});
+          nb::arg("shape"), nb::arg("element_type"), nb::arg("encoding"));
 
   nb::class_<MemRefType, Type>(m, "MemRefType")
       .def_static(
           "get",
+          [](const std::vector<int64_t> &shape, Type elementType,
+             AffineMap map) {
+            return MemRefType::get(shape, elementType, map);
+          },
+          nb::arg("shape"), nb::arg("element_type"), nb::arg("affine_maps"))
+      .def_static(
+          "get",
           [](const std::vector<int64_t> &shape, Type elementType, AffineMap map,
-             Attribute memorySpace = {}) {
+             Attribute memorySpace) {
             return MemRefType::get(shape, elementType, map, memorySpace);
           },
           nb::arg("shape"), nb::arg("element_type"), nb::arg("affine_maps"),
-          nb::arg("memory_space") = Attribute{});
+          nb::arg("memory_space"));
 }
 
 static void bindValues(nb::module_ &m) {

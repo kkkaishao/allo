@@ -47,6 +47,7 @@ void bindUtils(nb::module_ &m);
 void bindUBOps(nb::module_ &m);
 void bindAlloOps(nb::module_ &m);
 void bindPasses(nb::module_ &m);
+void bindExecutionEngine(nb::module_ &m);
 
 inline mlir::OpPrintingFlags getOpPrintingFlags(bool debug = false) {
   auto printingFlags = mlir::OpPrintingFlags();

@@ -6,8 +6,12 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Any, ClassVar, Mapping, NoReturn, Sequence, Literal
+from typing import Any, ClassVar, Mapping, NoReturn, Sequence, Literal, TYPE_CHECKING
+
 from ..lang.kernel import Kernel
+
+if TYPE_CHECKING:
+    from .._C.ir import ModuleOp, OwningModuleOp
 
 
 class BackendStage(str, Enum):
@@ -91,7 +95,15 @@ class Backend(ABC):
     ):
         self.kernel = kernel
         self.config = config
-        self.module: Any | None = None
+        self.module: ModuleOp | None = None
+        self._module_owner: OwningModuleOp | None = None
+
+    def _get_working_module(self) -> ModuleOp:
+        """Return a backend-owned module clone for backend-specific mutation."""
+        if self.module is None:
+            self._module_owner = self.kernel.compile().clone()
+            self.module = self._module_owner.get()
+        return self.module
 
     @abstractmethod
     def compile(self) -> Any:

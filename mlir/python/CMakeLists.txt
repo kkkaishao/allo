@@ -88,6 +88,10 @@ set(ALLO_PYTHON_MLIR_LIBS
     MLIRTensorTransforms
     MLIRLLVMIRTransforms
     MLIRAffineTransforms
+
+    # Execution engine
+    MLIRCAPIExecutionEngine
+    MLIROpenMPToLLVMIRTranslation
 )
 
 target_link_libraries(_liballo
