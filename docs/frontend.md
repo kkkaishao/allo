@@ -29,7 +29,6 @@ have a type annotation.
 ```python
 from allo import f32, i32, kernel
 
-
 @kernel
 def saxpy(a: f32, x: "f32[16]", y: "f32[16]", out: "f32[16]"):
     for i in range(16):
@@ -42,7 +41,6 @@ Scalar annotations use type objects directly. Shaped annotations use strings:
 @kernel
 def scalar_add(x: i32, y: i32) -> i32:
     return x + y
-
 
 @kernel
 def vector_add(x: "i32[16]", y: "i32[16]") -> "i32[16]":
@@ -61,7 +59,6 @@ def fill(out: "i32[4]"):
     for i in range(4):
         out[i] = i
 
-
 @kernel
 def no_result(out: "i32[4]") -> None:
     return
@@ -73,7 +70,6 @@ Multiple return values are written as tuple annotations.
 @kernel
 def split_pair(x: i32, y: f32) -> (i32, f32):
     return x + 1, y + 1.0
-
 
 @kernel
 def caller(x: i32, y: f32, out: "f32[1]"):
@@ -135,7 +131,6 @@ from allo import apint, kernel
 u17 = apint(17)
 i23 = apint(23, signed=True)
 
-
 @kernel
 def custom_width(x: u17, y: i23, out: "u17[1]"):
     out[0] = x + y
@@ -158,7 +153,6 @@ operators `+`, `-`, `*`, and `//`.
 M = 4
 N = 8
 
-
 @kernel
 def reshape_like(inp: "i32[M * N]", out: "i32[M, N]"):
     for i, j in allo.grid(M, N):
@@ -171,7 +165,6 @@ tensors.
 
 ```python
 from allo import KernelOptions
-
 
 @kernel(options=KernelOptions(enable_tensor=True))
 def tensor_add(x: "f32[4]", y: "f32[4]") -> "f32[4]":
@@ -223,7 +216,6 @@ during compilation and cannot be reassigned.
 
 ```python
 from allo import constexpr
-
 
 @kernel
 def constexpr_bound(out: "i32[4]"):
@@ -408,8 +400,8 @@ The frontend supports the following Python operators.
 | Unary | `+x`, `-x`, `~x`, `not x` |
 | Comparison | `==`, `!=`, `<`, `<=`, `>`, `>=` |
 | Boolean | `and`, `or` |
-| Bitwise | `&`, `|`, `^`, `<<`, `>>` |
-| Assignment | `=`, `+=`, `-=`, `*=`, `/=`, `//=`, `%=`, `**=`, `&=`, `|=`, `^=`, `<<=`, `>>=` |
+| Bitwise | `&`, `\|`, `^`, `<<`, `>>` |
+| Assignment | `=`, `+=`, `-=`, `*=`, `/=`, `//=`, `%=`, `**=`, `&=`, `\|=`, `^=`, `<<=`, `>>=` |
 
 Multi-way comparisons such as `a < b < c` are not supported; write them with
 `and`.
@@ -426,7 +418,7 @@ the destination type. `KernelOptions(typing_style="cpp")` selects C++-style
 promotion rules.
 
 ```python
-@kernel(options=allo.KernelOptions(typing_style="cpp"))
+@kernel(options=KernelOptions(typing_style="cpp"))
 def cpp_style(x: allo.u32, y: i32, out: "u32[1]"):
     out[0] = x + y
 ```
@@ -506,7 +498,7 @@ output because the operation writes into an existing buffer. In tensor mode, the
 same operation can return a tensor value directly.
 
 ```python
-@kernel(options=allo.KernelOptions(enable_tensor=True))
+@kernel(options=KernelOptions(enable_tensor=True))
 def dense(a: "f32[2, 3]", b: "f32[3, 4]") -> "f32[2, 4]":
     return allo.linalg.matmul(a, b)
 ```
@@ -555,12 +547,10 @@ from allo import Template, f32, i32
 T = Template("T")
 N = Template("N")
 
-
 @kernel(T, N)
 def fill_template(x: T, out: "T[N]"):
     for i in range(N):
         out[i] = x
-
 
 fill_i32_4 = fill_template[i32, 4]
 ```
@@ -577,15 +567,12 @@ binding point that must be supplied by the caller.
 ```python
 FixedT = i32
 
-
 @kernel
 def fixed_alias(x: FixedT, out: "FixedT[4]"):
     for i in range(4):
         out[i] = x
 
-
 T = Template("T")
-
 
 @kernel(T)
 def delayed_type(x: T, out: "T[4]"):
@@ -685,7 +672,6 @@ The new form is:
 
 ```python
 from allo import f32, kernel
-
 
 @kernel
 def gemm(A: "f32[32, 32]", B: "f32[32, 32]") -> "f32[32, 32]":

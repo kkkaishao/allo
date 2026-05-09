@@ -229,12 +229,12 @@ and may emit IR.
 
 ```mermaid
 flowchart LR
-    Call[call_operator(op, args)] --> Fold{op.fold_impl?}
-    Fold -->|no| Build
-    Fold -->|yes| TryFold[run fold(args)]
-    TryFold -->|value != NO_FOLD| Done[return folded value]
-    TryFold -->|NO_FOLD| Build[run build(builder, args)]
-    Build --> Done2[return lowered result]
+    Call["call_operator(op, args)"] --> Fold{"op.fold_impl?"}
+    Fold -->|no| Build["run build(builder, args)"]
+    Fold -->|yes| TryFold["run fold(args)"]
+    TryFold -->|"value != NO_FOLD"| Done["return folded value"]
+    TryFold -->|"NO_FOLD"| Build
+    Build --> Done2["return lowered result"]
 ```
 
 ### Fold Rules
