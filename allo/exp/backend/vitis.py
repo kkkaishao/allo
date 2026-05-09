@@ -18,6 +18,7 @@ from .._C.ir import UnitAttr
 from .._C.passes import emit_vivado_hls
 from ..lang.core import BufferType, DType, ShapedType, TypeBase
 from ..lang.kernel import Kernel
+from ..logging import run_command, stage, terminate_on_error
 
 VitisMode = Literal["csim", "csyn", "sw_emu", "hw_emu", "hw"]
 FlowTarget = Literal["vitis", "vivado"]
@@ -247,9 +248,10 @@ class PythonNativeCSimulator:
             if array is not None:
                 arg_arrays.append((arg, array))
 
-        result = func(*packed_args)
-        _writeback_csim_arrays(arg_arrays)
-        return result
+        with stage("Running Vitis C Simulation"):
+            result = func(*packed_args)
+            _writeback_csim_arrays(arg_arrays)
+            return result
 
     def build(self) -> Path:
         (self.project_path / CSIM_MAKEFILE).write_text(
@@ -264,11 +266,12 @@ class PythonNativeCSimulator:
             f"OUT={CSIM_SHARED_LIBRARY}",
             *[f"{key}={value}" for key, value in self.make_vars.items()],
         ]
-        result = subprocess.run(cmd, cwd=self.project_path, env=env, check=False)
-        if result.returncode != 0:
-            raise RuntimeError(
-                f"Vitis Python-native csim build failed with exit code {result.returncode}"
-            )
+        run_command(
+            cmd,
+            cwd=self.project_path,
+            env=env,
+            stage_name="Building Vitis C Simulation Shared Library",
+        )
         return self.library_path
 
     def _make_env(self) -> dict[str, str]:
@@ -357,7 +360,7 @@ def _find_tool_in_env(env: Mapping[str, str]) -> VitisTool | None:
     return None
 
 
-def _detect_vitis_tool(settings64: Path) -> VitisTool | None:
+def _probe_vitis_tool(settings64: Path) -> VitisTool | None:
     sourced_env = _source_settings_env(settings64)
     if sourced_env is not None:
         tool = _find_tool_in_env(sourced_env)
@@ -367,9 +370,15 @@ def _detect_vitis_tool(settings64: Path) -> VitisTool | None:
     return _find_tool_in_env(os.environ)
 
 
+def _detect_vitis_tool(settings64: Path) -> VitisTool | None:
+    with stage("Detecting Vitis HLS Toolchain"):
+        return _probe_vitis_tool(settings64)
+
+
 class Vitis(Backend):
     name = "vitis"
 
+    @terminate_on_error
     def __init__(
         self,
         kernel: Kernel,
@@ -458,6 +467,7 @@ class Vitis(Backend):
     def project_path(self) -> Path | None:
         return self._project_path
 
+    @terminate_on_error
     def run(self, mode: VitisMode, *args, **kwargs) -> Any:
         if kwargs:
             raise TypeError("Vitis backend only accepts positional kernel arguments")
@@ -469,6 +479,7 @@ class Vitis(Backend):
             return self.synth()
         raise NotImplementedError(f"Vitis mode '{mode}' is not implemented yet")
 
+    @terminate_on_error
     def csim(self, *args) -> Any:
         if self._csim_tb_path is not None:
             raise NotImplementedError(
@@ -478,12 +489,14 @@ class Vitis(Backend):
         simulator = self._get_csimulator(project_path)
         return simulator.run(*args)
 
+    @terminate_on_error
     def synth(self) -> Path:
         """Generate an HLS csyn project and invoke Vitis HLS."""
         project_path = self.scaffold_project()
         self._invoke_csyn(project_path)
         return project_path
 
+    @terminate_on_error
     def scaffold_project(
         self, project: str | None = None, *, overwrite: bool = False
     ) -> Path:
@@ -505,11 +518,12 @@ class Vitis(Backend):
             )
 
         artifacts = self._ensure_compiled()
-        (project_path / "kernel.cpp").write_text(artifacts.kernel_cpp)
-        (project_path / "kernel.h").write_text(artifacts.kernel_h)
-        (project_path / "run.tcl").write_text(
-            _generate_run_tcl(artifacts.top, self.part, self.freq_mhz, self.flow)
-        )
+        with stage("Generating Vitis HLS Project"):
+            (project_path / "kernel.cpp").write_text(artifacts.kernel_cpp)
+            (project_path / "kernel.h").write_text(artifacts.kernel_h)
+            (project_path / "run.tcl").write_text(
+                _generate_run_tcl(artifacts.top, self.part, self.freq_mhz, self.flow)
+            )
 
         self._project_path = project_path
         return project_path
@@ -525,20 +539,22 @@ class Vitis(Backend):
 
     def _get_tool(self) -> VitisTool:
         if self.tool is None:
-            self.tool = _detect_vitis_tool(self._settings64)
-        if self.tool is None:
-            raise RuntimeError(
-                "Vitis HLS tool not found. Source "
-                f"{self._settings64} or pass settings64=... to the Vitis backend."
-            )
+            with stage("Detecting Vitis HLS Toolchain"):
+                self.tool = _probe_vitis_tool(self._settings64)
+                if self.tool is None:
+                    raise RuntimeError(
+                        "Vitis HLS tool not found. Source "
+                        f"{self._settings64} or pass settings64=... to the Vitis backend."
+                    )
         return self.tool
 
     def _get_vitis_env(self) -> dict[str, str]:
-        sourced_env = _source_settings_env(self._settings64)
-        if sourced_env is not None:
-            return sourced_env
         if self.tool is not None:
             return dict(self.tool.env)
+        with stage("Load Vitis environment"):
+            sourced_env = _source_settings_env(self._settings64)
+            if sourced_env is not None:
+                return sourced_env
         return dict(os.environ)
 
     def _get_vitis_root(self) -> Path:
@@ -580,16 +596,12 @@ class Vitis(Backend):
         else:
             cmd = [os.fspath(tool.executable), "-f", "run.tcl"]
 
-        result = subprocess.run(
+        run_command(
             cmd,
             cwd=project_path,
             env=dict(tool.env),
-            check=False,
+            stage_name="Run Vitis HLS synthesis",
         )
-        if result.returncode != 0:
-            raise RuntimeError(
-                f"Vitis HLS csyn failed with exit code {result.returncode}"
-            )
 
     def _validate_top_abi(self) -> None:
         ret_types = self.kernel.parse_return_annotation()
@@ -604,6 +616,7 @@ class Vitis(Backend):
                 "top kernel. Pass the output buffer as an explicit argument instead."
             )
 
+    @terminate_on_error
     def compile(self) -> CompiledArtifacts:
         if self.kernel.func_name == "kernel":
             raise ValueError(
@@ -611,27 +624,28 @@ class Vitis(Backend):
             )
         self._validate_top_abi()
 
-        module = self._get_working_module()
-        top_fn = module.lookup_func(self.kernel.func_name)
-        if top_fn is None:
-            raise RuntimeError(
-                f"Kernel function {self.kernel.func_name} not found in the module"
+        with stage("Compiling Vitis HLS Kernels"):
+            module = self._get_working_module()
+            top_fn = module.lookup_func(self.kernel.func_name)
+            if top_fn is None:
+                raise RuntimeError(
+                    f"Kernel function {self.kernel.func_name} not found in the module"
+                )
+            top_fn.set_attr("top", UnitAttr.get(module.get_context()))
+
+            passes.run(HLS_PREPARE_PIPELINE, module.get_operation())
+            hls_code = emit_vivado_hls(module)
+            if hls_code is None:
+                raise RuntimeError("Failed to emit Vitis HLS code")
+            hls_code = _add_extern_c_to_top(hls_code, self.kernel.func_name)
+            top_fn = None
+            module = None
+            self._release_working_module()
+
+            artifacts = CompiledArtifacts(
+                kernel_cpp=hls_code,
+                kernel_h=_generate_kernel_header(hls_code, self.kernel.func_name),
+                top=self.kernel.func_name,
             )
-        top_fn.set_attr("top", UnitAttr.get(module.get_context()))
-
-        passes.run(HLS_PREPARE_PIPELINE, module.get_operation())
-        hls_code = emit_vivado_hls(module)
-        if hls_code is None:
-            raise RuntimeError("Failed to emit Vitis HLS code")
-        hls_code = _add_extern_c_to_top(hls_code, self.kernel.func_name)
-        top_fn = None
-        module = None
-        self._release_working_module()
-
-        artifacts = CompiledArtifacts(
-            kernel_cpp=hls_code,
-            kernel_h=_generate_kernel_header(hls_code, self.kernel.func_name),
-            top=self.kernel.func_name,
-        )
-        self.artifacts = artifacts
-        return artifacts
+            self.artifacts = artifacts
+            return artifacts

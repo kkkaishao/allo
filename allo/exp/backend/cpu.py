@@ -14,6 +14,7 @@ import numpy as np
 from .utils import make_project_path
 
 from ..lang.core import APFloat, APInt, BufferType, DType, IndexType, TypeBase
+from ..logging import stage, terminate_on_error
 from .base import Backend
 
 
@@ -315,6 +316,7 @@ class CPU(Backend):
         self.arg_types = None
         self.res_types = None
 
+    @terminate_on_error
     def compile(self):
         from .._C import execution_engine, ir, passes
 
@@ -324,32 +326,39 @@ class CPU(Backend):
         if self.kernel.options.enable_tensor:
             raise NotImplementedError("CPU backend does not support tensor ABI yet")
 
-        module = self._get_working_module()
-        arg_types = self.kernel.parse_argument_annotations()
-        res_types = self.kernel.parse_return_annotation()
+        with stage("Compiling CPU Kernels"):
+            module = self._get_working_module()
+            arg_types = self.kernel.parse_argument_annotations()
+            res_types = self.kernel.parse_return_annotation()
 
-        top = module.lookup_func(self.kernel.func_name)
-        if top is None:
-            raise RuntimeError(f"Cannot find top function '{self.kernel.func_name}'")
-        top.set_attr("llvm.emit_c_interface", ir.UnitAttr.get(module.get_context()))
+            top = module.lookup_func(self.kernel.func_name)
+            if top is None:
+                raise RuntimeError(
+                    f"Cannot find top function '{self.kernel.func_name}'"
+                )
+            top.set_attr("llvm.emit_c_interface", ir.UnitAttr.get(module.get_context()))
 
-        passes.lower_to_llvm(module, False)
-        engine = execution_engine.ExecutionEngine(
-            module,
-            opt_level=self.opt_level,
-            shared_libs=(
-                _default_shared_libs() if self.shared_libs is None else self.shared_libs
-            ),
-        )
-        self.arg_types = arg_types
-        self.res_types = res_types
-        self.engine = engine
-        return module
+            passes.lower_to_llvm(module, False)
+            engine = execution_engine.ExecutionEngine(
+                module,
+                opt_level=self.opt_level,
+                shared_libs=(
+                    _default_shared_libs()
+                    if self.shared_libs is None
+                    else self.shared_libs
+                ),
+            )
+            self.arg_types = arg_types
+            self.res_types = res_types
+            self.engine = engine
+            return module
 
+    @terminate_on_error
     def run(self, *args, **kwargs) -> Any:
         self._ensure_compiled()
         return self.simulate(*args, **kwargs)
 
+    @terminate_on_error
     def simulate(self, *args, **kwargs) -> Any:
         if kwargs:
             raise TypeError("CPU.simulate only accepts positional kernel arguments")
@@ -364,12 +373,14 @@ class CPU(Backend):
         packed_args, _keepalive, arg_arrays, result_decode = _pack_kernel_args(
             args, self.arg_types, self.res_types
         )
-        self.engine.invoke(self.kernel.func_name, *packed_args)
-        _writeback_args(arg_arrays)
-        if result_decode is None:
-            return None
-        return result_decode()
+        with stage("Running CPU Kernels (JIT)"):
+            self.engine.invoke(self.kernel.func_name, *packed_args)
+            _writeback_args(arg_arrays)
+            if result_decode is None:
+                return None
+            return result_decode()
 
+    @terminate_on_error
     def scaffold_project(
         self,
         project: str | None = None,
