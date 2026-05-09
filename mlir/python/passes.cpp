@@ -19,10 +19,16 @@
 #include "mlir/Pass/PassManager.h"
 #include "mlir/Transforms/Passes.h"
 
+#include "allo/InitAllPasses.h"
+
+#include <mutex>
+
 using namespace mlir;
 using namespace mlir::allo;
 
 void bindPasses(nb::module_ &m) {
+  static std::once_flag registerPassesOnce;
+  std::call_once(registerPassesOnce, [] { allo::registerAllPasses(); });
 
   m.def("run", [](std::string_view pipeline, Operation *op) {
     std::string error;

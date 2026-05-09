@@ -31,7 +31,19 @@ inline void registerAllPasses() {
   registerTransformsPasses();
 
   // Conversion passes
-  registerConversionPasses();
+  registerArithToLLVMConversionPass();
+  registerConvertBufferizationToMemRefPass();
+  registerConvertControlFlowToLLVMPass();
+  registerConvertFuncToLLVMPass();
+  registerConvertIndexToLLVMPass();
+  registerConvertMathToLLVMPass();
+  registerConvertLinalgToStandardPass();
+  registerConvertTensorToLinalgPass();
+  registerConvertToLLVMPass();
+  registerFinalizeMemRefToLLVMConversionPass();
+  registerLowerAffinePass();
+  registerReconcileUnrealizedCastsPass();
+  registerSCFToControlFlowPass();
 
   // Dialect passes
   affine::registerAffinePasses();

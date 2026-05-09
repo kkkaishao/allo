@@ -82,12 +82,21 @@ set(ALLO_PYTHON_MLIR_LIBS
     MLIRMemRefToLLVM
     MLIRMathToLLVM
     MLIRReconcileUnrealizedCasts
+    MLIRTosaToLinalg
+    MLIRIndexToLLVM
+    MLIRSCFToControlFlow
+    MLIRLinalgToStandard
+    MLIRConvertToLLVMPass
 
     # Passes
     MLIRBufferizationPipelines
     MLIRTensorTransforms
     MLIRLLVMIRTransforms
     MLIRAffineTransforms
+    MLIRTargetLLVMIRTransforms
+    MLIRMathTransforms
+    MLIROpenMPTransforms
+    MLIRShapeOpsTransforms
 
     # Execution engine
     MLIRCAPIExecutionEngine
