@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import ctypes
 import os
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -16,6 +17,15 @@ from .utils import make_project_path
 from ..lang.core import APFloat, APInt, BufferType, DType, IndexType, TypeBase
 from ..logging import stage, terminate_on_error
 from .base import Backend
+
+
+@dataclass
+class _CPUCompileCacheEntry:
+    module_owner: Any
+    module: Any
+    engine: Any
+    arg_types: list[TypeBase]
+    res_types: list[TypeBase]
 
 
 class _F16(ctypes.Structure):
@@ -304,7 +314,7 @@ class CPU(Backend):
 
     def __init__(
         self,
-        kernel,
+        kernel=None,
         *,
         opt_level: int = 2,
         shared_libs: list[str] | None = None,
@@ -316,6 +326,13 @@ class CPU(Backend):
         self.arg_types = None
         self.res_types = None
 
+    def call_kernel(self, kernel, *args, **kwargs) -> Any:
+        return CPU(
+            kernel,
+            opt_level=self.opt_level,
+            shared_libs=self.shared_libs,
+        ).run(*args, **kwargs)
+
     @terminate_on_error
     def compile(self):
         from .._C import execution_engine, ir, passes
@@ -325,6 +342,27 @@ class CPU(Backend):
             return self.module
         if self.kernel.options.enable_tensor:
             raise NotImplementedError("CPU backend does not support tensor ABI yet")
+
+        shared_libs = (
+            _default_shared_libs() if self.shared_libs is None else self.shared_libs
+        )
+        cache_key = self._cache_key(
+            {
+                "backend": self.name,
+                "opt_level": self.opt_level,
+                "shared_libs": shared_libs,
+                "version": 1,
+            }
+        )
+        cached = self._process_cache_get("cpu.compile", cache_key)
+        if cached is not None:
+            with stage("Compiling CPU Kernels (Cache Hit)"):
+                self._module_owner = cached.module_owner
+                self.module = cached.module
+                self.engine = cached.engine
+                self.arg_types = cached.arg_types
+                self.res_types = cached.res_types
+            return self.module
 
         with stage("Compiling CPU Kernels"):
             module = self._get_working_module()
@@ -342,15 +380,22 @@ class CPU(Backend):
             engine = execution_engine.ExecutionEngine(
                 module,
                 opt_level=self.opt_level,
-                shared_libs=(
-                    _default_shared_libs()
-                    if self.shared_libs is None
-                    else self.shared_libs
-                ),
+                shared_libs=shared_libs,
             )
             self.arg_types = arg_types
             self.res_types = res_types
             self.engine = engine
+            self._process_cache_set(
+                "cpu.compile",
+                cache_key,
+                _CPUCompileCacheEntry(
+                    module_owner=self._module_owner,
+                    module=module,
+                    engine=engine,
+                    arg_types=arg_types,
+                    res_types=res_types,
+                ),
+            )
             return module
 
     @terminate_on_error

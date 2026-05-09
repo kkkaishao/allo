@@ -176,7 +176,13 @@ class Kernel(Generic[P, R]):
         self.__qualname__ = fn.__qualname__
 
     def __call__(self, *args: P.args, **kwargs: P.kwargs) -> R:
-        """Run the kernel with the given arguments using CPU simulation"""
+        """Run the kernel with the active backend context, or CPU by default."""
+        from ..backend.base import current_backend
+
+        backend = current_backend()
+        if backend is not None:
+            return backend.call_kernel(self, *args, **kwargs)
+
         from ..backend import CPU
 
         return CPU(self).run(*args, **kwargs)
