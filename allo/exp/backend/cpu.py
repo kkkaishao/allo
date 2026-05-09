@@ -72,10 +72,10 @@ _DTYPE_TO_CTYPE = {
 
 
 def _default_shared_libs() -> list[str]:
-    llvm_build_dir = os.environ.get("LLVM_BUILD_DIR")
+    llvm_base_dir = os.environ.get("LLVM_BASE_DIR")
     candidates = []
-    if llvm_build_dir:
-        candidates.append(Path(llvm_build_dir) / "lib")
+    if llvm_base_dir:
+        candidates.append(Path(llvm_base_dir) / "lib")
     candidates.append(
         Path(__file__).resolve().parents[3]
         / "externals"
