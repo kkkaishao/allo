@@ -86,6 +86,19 @@ def log_tail(title: str, text: str, *, max_lines: int = 100) -> None:
         log_detail(f"{title} (last {max_lines} lines):\n{tail}")
 
 
+def log_debug(message: str) -> None:
+    if os.getenv("ALLO_DEBUG") is not None:
+        text = message.rstrip()
+        if text:
+            log_detail(f"DEBUG {text}")
+
+
+def log_warning(message: str) -> None:
+    text = message.rstrip()
+    if text:
+        console.print(f"[yellow]Warning[/] {escape(text)}")
+
+
 def log_table(
     title: str,
     columns: Sequence[str],

@@ -67,7 +67,7 @@ def _render_template(name: str, **kwargs) -> str:
     return (TEMPLATE_DIR / name).read_text(encoding="utf-8").format(**kwargs)
 
 
-def _generate_run_tcl(top: str, part: str, freq_mhz: float, flow_target: str) -> str:
+def generate_run_tcl(top: str, part: str, freq_mhz: float, flow_target: str) -> str:
     clock_period = 1000.0 / freq_mhz
     return _render_template(
         "run.tcl",
@@ -108,7 +108,7 @@ def _extract_top_declaration(hls_code: str, top: str) -> str:
     raise RuntimeError(f"Failed to find emitted declaration for top function {top}")
 
 
-def _generate_kernel_header(hls_code: str, top: str) -> str:
+def generate_kernel_header(hls_code: str, top: str) -> str:
     declaration = _extract_top_declaration(hls_code, top)
     return _render_template("kernel.h", declaration=declaration)
 
@@ -357,28 +357,6 @@ def _log_synth_failure(log_path: Path, error: Exception) -> None:
     log_tail("Synthesis log tail", tail, max_lines=SYNTH_LOG_TAIL_LINES)
 
 
-def _settings_from_vitis_home(vitis_home: str | None) -> Path | None:
-    if not vitis_home:
-        return None
-    return Path(vitis_home) / "settings64.sh"
-
-
-def _resolve_settings64(
-    settings64: str | os.PathLike[str] | None,
-    vitis_home: str | None,
-    default_settings: Path,
-) -> Path:
-    if settings64:
-        return Path(settings64)
-    env_settings = os.getenv("VITIS_SETTINGS64")
-    if env_settings:
-        return Path(env_settings)
-    home_settings = _settings_from_vitis_home(vitis_home or os.getenv("VITIS_HOME"))
-    if home_settings:
-        return home_settings
-    return default_settings
-
-
 def _source_settings_env(settings64: Path) -> dict[str, str] | None:
     if not settings64.exists():
         return None
@@ -446,19 +424,21 @@ def _find_tool_in_env(env: Mapping[str, str]) -> VitisTool | None:
     return None
 
 
-def _probe_vitis_tool(settings64: Path) -> VitisTool | None:
+def _probe_vitis_tool(settings64: Path) -> VitisTool:
     sourced_env = _source_settings_env(settings64)
     if sourced_env is not None:
         tool = _find_tool_in_env(sourced_env)
         if tool is not None:
             return tool
 
-    return _find_tool_in_env(os.environ)
+    tool = _find_tool_in_env(os.environ)
+    if tool is None:
+        raise RuntimeError(f"Failed to detect Vitis HLS toolchain with {settings64}")
+    return tool
 
 
-def _detect_vitis_tool(settings64: Path) -> VitisTool | None:
+def detect_vitis_tool(settings64: Path) -> VitisTool:
     with stage("Detecting Vitis HLS Toolchain"):
         tool = _probe_vitis_tool(settings64)
-    if tool is not None:
-        log_info(f"Using Vitis {tool.executable}, Version: {tool.version}")
+    log_info(f"Using Vitis {tool.executable}, Version: {tool.version}")
     return tool

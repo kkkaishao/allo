@@ -12,7 +12,7 @@ import numpy as np
 from .utils import _render_template
 from ..base import write_text_if_changed
 from ...lang.core import BufferType, DType, TypeBase
-from ...logging import completed_output, log_detail, run_command, stage
+from ...logging import completed_output, log_debug, log_detail, run_command, stage
 
 CSIM_MAKEFILE = "csim.mk"
 CSIM_SHARED_LIBRARY = "libkernel.so"
@@ -196,12 +196,12 @@ class PythonNativeCSimulator:
         self._library: ctypes.CDLL | None = None
         self._function = None
 
-    def run(self, *args, overwrite: bool = False) -> Any:
+    def run(self, *args, exist_ok: bool = True) -> Any:
         if len(args) != len(self.arg_types):
             raise ValueError(
                 f"Expected {len(self.arg_types)} arguments, got {len(args)}"
             )
-        self.build(overwrite=overwrite)
+        self.build(exist_ok=exist_ok)
         func = self._get_function()
         packed_args = []
         arg_arrays = []
@@ -216,14 +216,15 @@ class PythonNativeCSimulator:
             _writeback_csim_arrays(arg_arrays)
             return result
 
-    def build(self, *, overwrite: bool = False) -> Path:
+    def build(self, *, exist_ok: bool = True) -> Path:
         write_text_if_changed(
             self.project_path / CSIM_MAKEFILE,
             _generate_csim_makefile(self.vitis_root),
         )
-        if self.library_path.exists() and not overwrite:
-            with stage("Building Vitis C Simulation Shared Library (Cache Hit)"):
-                pass
+        if self.library_path.exists() and exist_ok:
+            log_debug(
+                f"Building Vitis C Simulation Shared Library: {self.library_path} (cache hit)"
+            )
             return self.library_path
 
         self._library = None

@@ -4,7 +4,7 @@ import os
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Literal, Mapping
+from typing import Any, Literal, Mapping, Generic, TypeVar, ParamSpec
 
 from ..base import Backend, text_hash, write_json_if_changed, write_text_if_changed
 from ..utils import make_project_path
@@ -21,14 +21,13 @@ from .utils import (
     _INTERFACE_MODES,
     _add_extern_c_to_top,
     _apply_interface_pragmas,
-    _detect_vitis_tool,
-    _generate_kernel_header,
-    _generate_run_tcl,
+    detect_vitis_tool,
+    generate_kernel_header,
+    generate_run_tcl,
     _is_stream_type,
     _log_synth_failure,
     _log_synth_note,
     _normalize_interface_options,
-    _resolve_settings64,
     _set_if_provided,
     _source_settings_env,
     _synth_log_path,
@@ -38,7 +37,7 @@ from ..._C.ir import UnitAttr
 from ..._C.passes import emit_vivado_hls
 from ...lang.core import BufferType, ShapedType, TypeBase
 from ...lang.kernel import Kernel
-from ...logging import run_command, stage, terminate_on_error
+from ...logging import log_warning, run_command, stage, terminate_on_error
 
 VitisMode = Literal["csim", "csyn", "sw_emu", "hw_emu", "hw"]
 FlowTarget = Literal["vitis", "vivado"]
@@ -87,51 +86,67 @@ PART_NUMBERS = {
     "u280": "xcu280-fsvh2892-2L-e",
 }
 
+P = ParamSpec("P")
+R = TypeVar("R")
 
-class Vitis(Backend):
+
+class Vitis(Backend, Generic[P, R]):
     name = "vitis"
 
     @terminate_on_error
     def __init__(
         self,
-        kernel: Kernel | None = None,
+        kernel: Kernel[P, R] | None = None,
         vitis_home: str | None = None,
         project_path: str | None = None,
         *,
-        settings64: str | os.PathLike[str] | None = None,
-        device: str | None = DEFAULT_DEVICE,
+        device: str | None = None,
         part: str | None = None,
-        freq_mhz: float = DEFAULT_FREQ_MHZ,
+        freq_mhz: float = 300.0,
         flow: FlowTarget = "vitis",
     ):
         super().__init__(kernel)
-        self._settings64 = _resolve_settings64(
-            settings64, vitis_home, DEFAULT_VITIS_SETTINGS
+        # setup toolchain paths
+        self._settings64 = (
+            Path(vitis_home) / "settings64.sh" if vitis_home else DEFAULT_VITIS_SETTINGS
         )
-        self._project_path = Path(project_path) if project_path else None
         self._vitis_home = Path(vitis_home) if vitis_home else None
-        self._device = ""
-        self._part = ""
-        self._freq_mhz = DEFAULT_FREQ_MHZ
-        self._flow: FlowTarget = "vitis"
+        self.tool: VitisTool = detect_vitis_tool(self._settings64)
+        # setup project related settings
+        self._project_path = Path(project_path) if project_path else None
+        self._freq_mhz = freq_mhz
+        self._flow: FlowTarget = flow
         self._csim_make_vars: dict[str, str] = {}
-        self._csim_tb_path: Path | None = None
+        self._init_part_and_device(part, device)
+        # interface pragmas set by the user
         self._interface_pragmas: dict[int, dict[str, InterfacePragma]] = {}
-        self._scaffolded_project_path: Path | None = None
+        # intermediate stuffs
         self.artifacts: CompiledArtifacts | None = None
         self.csimulator: PythonNativeCSimulator | None = None
-        self.tool: VitisTool | None = None
 
-        if part is not None:
-            self.part = part
-        else:
-            self.device = device or DEFAULT_DEVICE
-        self.freq_mhz = freq_mhz
-        self.flow = flow
-
-    @property
-    def settings64(self) -> Path:
-        return self._settings64
+    def _init_part_and_device(self, part: str | None, device: str | None) -> None:
+        if part and device:
+            if PART_NUMBERS.get(device) != part:
+                raise ValueError("Cannot specify both part number and device")
+            self._part = part
+            self._device = device
+        if part is None and device is None:
+            log_warning(
+                "Neither device nor part number is specified for Vitis backend. The backend can be only used for C simulation until the part number is set, which is required for synthesis and implementation."
+            )
+            self._part = ""
+            self._device = ""
+        elif device is not None:
+            part = PART_NUMBERS.get(device)
+            if not part:
+                raise ValueError(
+                    f"Unknown device {device}. Please specify part number directly."
+                )
+            self._device = device
+            self._part = part
+        elif part is not None:
+            self._part = part
+            self._device = ""
 
     @property
     def part(self) -> str:
@@ -178,29 +193,23 @@ class Vitis(Backend):
             raise ValueError("Flow must be either 'vitis' or 'vivado'")
         self._flow = flow
 
-    @property
-    def project_path(self) -> Path | None:
-        return self._project_path
-
-    def call_kernel(self, kernel: Kernel, *args, **kwargs) -> Any:
+    def call_kernel(self, kernel: Kernel, *args: P.args, **kwargs: P.kwargs) -> R:
         backend = Vitis(
             kernel,
             os.fspath(self._vitis_home) if self._vitis_home is not None else None,
-            settings64=self._settings64,
         )
         backend._csim_make_vars = self._csim_make_vars.copy()
-        backend._csim_tb_path = self._csim_tb_path
         backend.tool = self.tool
         try:
             return backend.csim(*args, **kwargs)
         finally:
             self.tool = backend.tool
 
-    def _is_scaffolded_project_path(self, project_path: Path) -> bool:
-        return (
-            self._scaffolded_project_path is not None
-            and project_path.resolve() == self._scaffolded_project_path.resolve()
-        )
+    @terminate_on_error
+    def __call__(self, *args: P.args, **kwargs: P.kwargs) -> R:
+        if self.kernel is None:
+            raise RuntimeError("Vitis backend is not bound to a kernel")
+        return self.csim(*args, **kwargs)
 
     def set_csim_override(
         self,
@@ -251,9 +260,9 @@ class Vitis(Backend):
                 self._csim_make_vars[key] = value
         self.csimulator = None
 
-    def set_csim_tb(self, tb_path: str | os.PathLike[str] | None):
-        self._csim_tb_path = Path(tb_path) if tb_path is not None else None
-        self.csimulator = None
+    #################################
+    # Interface configuration methods
+    #################################
 
     def set_axi(
         self,
@@ -273,6 +282,11 @@ class Vitis(Backend):
         name: str | None = None,
         **kwargs: str | int | bool | None,
     ):
+        """
+        Set the indexed argument to be an AXI master interface with the given options. For details of the options, please refer to [Vitis HLS Interface Pragma](https://docs.amd.com/r/en-US/ug1399-vitis-hls/pragma-HLS-interface)
+
+        In Vitis HLS, AXI master interfaces can only be applied to pointer (buffer) arguments.
+        """
         arg_type = self._validate_interface_index(index, allow_return=False)
         if not isinstance(arg_type, BufferType):
             raise ValueError(
@@ -309,6 +323,11 @@ class Vitis(Backend):
         bundle: str | None = None,
         **kwargs: str | int | bool | None,
     ):
+        """
+        Set the indexed argument to be an AXI stream interface with the given options. For details of the options, please refer to [Vitis HLS Interface Pragma](https://docs.amd.com/r/en-US/ug1399-vitis-hls/pragma-HLS-interface)
+
+        The API cannot be used until frontend Stream type support is enabled, which is expected to be available in a future release.
+        """
         raise NotImplementedError(
             "Vitis axis interface is not available until frontend Stream type "
             "support is enabled."
@@ -341,6 +360,11 @@ class Vitis(Backend):
         storage_impl: AxiliteStorageImpl | None = None,
         **kwargs: str | int | bool | None,
     ):
+        """
+        Set the indexed argument or return value (index=-1) to be an AXI lite interface with the given options. For details of the options, please refer to [Vitis HLS Interface Pragma](https://docs.amd.com/r/en-US/ug1399-vitis-hls/pragma-HLS-interface)
+
+        In Vitis HLS, AXI lite interfaces can be applied to pointer (buffer) arguments and scalar return value. Setting an AXI lite interface on a pointer argument will cause the argument to be accessed through an AXI lite slave interface, which is typically used for control and configuration. Setting an AXI lite interface on the return value will cause it to be returned through an AXI lite slave interface, which is typically used for status reporting.
+        """
         self._validate_interface_index(index, allow_return=True)
         if index == -1 and register is True:
             raise ValueError(
@@ -365,55 +389,61 @@ class Vitis(Backend):
         self,
         mode: VitisMode,
         *args,
-        overwrite: bool = False,
+        exist_ok: bool = True,
         **kwargs,
     ) -> Any:
         if kwargs:
             raise TypeError(
                 "Vitis backend only accepts positional kernel arguments and "
-                "the overwrite keyword"
+                "the exist_ok keyword"
             )
         if mode == "csim":
-            return self.csim(*args, overwrite=overwrite)
+            return self.csim(*args, exist_ok=exist_ok)
         if args:
             raise TypeError("Vitis csyn does not accept runtime arguments")
         if mode == "csyn":
-            return self.synth(overwrite=overwrite)
+            return self.synth(exist_ok=exist_ok)
         raise NotImplementedError(f"Vitis mode '{mode}' is not implemented yet")
 
     @terminate_on_error
-    def csim(self, *args, overwrite: bool = False) -> Any:
-        if self._csim_tb_path is not None:
-            raise NotImplementedError(
-                "External tb.cpp csim mode is not implemented yet"
-            )
-        project_path, cache_key = self._materialize_csim_cache(overwrite=overwrite)
-        if overwrite:
+    def csim(self, *args, exist_ok: bool = True) -> Any:
+        project_path, cache_key = self._materialize_csim_cache(exist_ok=exist_ok)
+        if not exist_ok:
             self.csimulator = None
             self._process_cache_pop("vitis.csim", cache_key)
         simulator = self._get_csimulator(project_path, cache_key)
-        return simulator.run(*args, overwrite=overwrite)
+        return simulator.run(*args, exist_ok=exist_ok)
 
     @terminate_on_error
-    def synth(self, *, overwrite: bool = False) -> VitisSynthReport:
+    def synth(self, *, exist_ok: bool = True) -> VitisSynthReport:
         """Generate an HLS csyn project and invoke Vitis HLS."""
-        project_path = self._materialize_project(overwrite=overwrite)
+        project_path = self.scaffold_project(exist_ok=exist_ok)
         self._invoke_csyn(project_path)
         artifacts = self._ensure_compiled()
         rpt = VitisSynthReport(project_path=project_path, top=artifacts.top)
+        # automatically render
         rpt.render()
         return rpt
 
     @terminate_on_error
     def scaffold_project(
-        self, project: str | None = None, *, overwrite: bool = False
+        self, project: str | None = None, *, exist_ok: bool = True
     ) -> Path:
-        return self._materialize_project(project, overwrite=overwrite)
+        """
+        Generate the HLS project files without invoking Vitis HLS.
+
+        If the project argument is provided, the project will be generated to the specified path
+        """
+        if project is None and self._project_path is not None:
+            return self._materialize_project(self._project_path, exist_ok=exist_ok)
+        return self._materialize_project(project, exist_ok=exist_ok)
 
     def _materialize_project(
-        self, project: str | None = None, *, overwrite: bool = False
+        self, project: Path | str | None = None, *, exist_ok: bool = True
     ) -> Path:
-        project_path = self._resolve_project_path(project, overwrite=overwrite)
+        project_path = make_project_path(
+            project, f"allo-vitis-prj-{self.kernel.func_name}", exist_ok=exist_ok
+        )
 
         artifacts = self._ensure_compiled()
         with stage(f"Generating Vitis HLS Project to: {project_path.resolve()}"):
@@ -421,19 +451,17 @@ class Vitis(Backend):
             write_text_if_changed(project_path / "kernel.h", artifacts.kernel_h)
             write_text_if_changed(
                 project_path / "run.tcl",
-                _generate_run_tcl(artifacts.top, self.part, self.freq_mhz, self.flow),
+                generate_run_tcl(artifacts.top, self.part, self.freq_mhz, self.flow),
             )
 
         self._project_path = project_path
-        self._scaffolded_project_path = project_path
         return project_path
 
-    def _materialize_csim_cache(self, *, overwrite: bool = False) -> tuple[Path, str]:
+    def _materialize_csim_cache(self, *, exist_ok: bool = True) -> tuple[Path, str]:
         artifacts = self._ensure_compiled()
-        self._get_tool()
         vitis_root = self._get_vitis_root()
         makefile = _generate_csim_makefile(vitis_root)
-        payload = self._csim_cache_payload(artifacts, makefile, vitis_root)
+        payload = self._csim_cache_payload(artifacts, makefile)
         cache_key = self._cache_key(payload)
         project_path = self._cache_dir(
             "vitis",
@@ -447,7 +475,7 @@ class Vitis(Backend):
             project_path / "cache.json",
         )
 
-        if not overwrite and all(path.exists() for path in cache_files):
+        if exist_ok and all(path.exists() for path in cache_files):
             return project_path, cache_key
 
         with stage(f"Generating Vitis C Simulation Cache to: {project_path}"):
@@ -460,39 +488,20 @@ class Vitis(Backend):
                 {
                     "key": cache_key,
                     "payload": payload,
-                    "overwrite": overwrite,
+                    "exist_ok": exist_ok,
                 },
             )
 
         return project_path, cache_key
-
-    def _resolve_project_path(
-        self, project: str | None = None, *, overwrite: bool = False
-    ) -> Path:
-        if project is None and self._project_path is None:
-            return make_project_path(
-                None, f"allo-vitis-prj-{self.kernel.func_name}", overwrite
-            )
-
-        project_path = Path(project) if project is not None else self._project_path
-        assert project_path is not None
-        overwrite = overwrite or self._is_scaffolded_project_path(project_path)
-        if project_path.exists() and any(project_path.iterdir()) and not overwrite:
-            raise FileExistsError(
-                f"Project path {project_path} already exists and is not empty. "
-                "Use overwrite=True to overwrite."
-            )
-        project_path.mkdir(parents=True, exist_ok=True)
-        return project_path
 
     def _ensure_compiled(self) -> CompiledArtifacts:
         if self.artifacts is None:
             self.artifacts = self.compile()
         return self.artifacts
 
-    def _release_working_module(self) -> None:
-        self.module = None
-        self._module_owner = None
+    # def _release_working_module(self) -> None:
+    #     self.module = None
+    #     self._module_owner = None
 
     def _invalidate_compiled_artifacts(self) -> None:
         self.artifacts = None
@@ -560,16 +569,6 @@ class Vitis(Backend):
                     "Vitis axis interface can only be set on stream arguments"
                 )
 
-    def _get_tool(self) -> VitisTool:
-        if self.tool is None:
-            self.tool = _detect_vitis_tool(self._settings64)
-            if self.tool is None:
-                raise RuntimeError(
-                    "Vitis HLS tool not found. Source "
-                    f"{self._settings64} or pass settings64=... to the Vitis backend."
-                )
-        return self.tool
-
     def _get_vitis_env(self) -> dict[str, str]:
         if self.tool is not None:
             return dict(self.tool.env)
@@ -589,11 +588,10 @@ class Vitis(Backend):
         return DEFAULT_VITIS_SETTINGS.parent
 
     def _tool_cache_payload(self) -> dict[str, str]:
-        tool = self._get_tool()
         return {
-            "name": tool.name,
-            "executable": os.fspath(tool.executable),
-            "version": tool.version,
+            "name": self.tool.name,
+            "executable": os.fspath(self.tool.executable),
+            "version": self.tool.version,
             "settings64": os.fspath(self._settings64),
         }
 
@@ -606,32 +604,16 @@ class Vitis(Backend):
             for index, pragmas in sorted(self._interface_pragmas.items())
         }
 
-    def _compile_cache_key(self) -> str:
-        return self._cache_key(
-            {
-                "backend": self.name,
-                "phase": "hls-codegen",
-                "version": VITIS_COMPILE_CACHE_VERSION,
-                "hls_prepare_pipeline": HLS_PREPARE_PIPELINE,
-                "interface_pragmas": self._interface_cache_payload(),
-            }
-        )
-
     def _csim_cache_payload(
-        self, artifacts: CompiledArtifacts, makefile: str, vitis_root: Path
+        self, artifacts: CompiledArtifacts, makefile: str
     ) -> dict[str, Any]:
         return {
             "backend": self.name,
             "phase": "python-native-csim",
-            "version": VITIS_CSIM_CACHE_VERSION,
             "top": artifacts.top,
             "kernel_cpp_sha256": text_hash(artifacts.kernel_cpp),
             "kernel_h_sha256": text_hash(artifacts.kernel_h),
             "makefile_sha256": text_hash(makefile),
-            "arg_types": [str(arg) for arg in self.kernel.parse_argument_annotations()],
-            "res_types": [str(res) for res in self.kernel.parse_return_annotation()],
-            "make_vars": self._csim_make_vars,
-            "vitis_root": os.fspath(vitis_root),
             "tool": self._tool_cache_payload(),
         }
 
@@ -641,9 +623,9 @@ class Vitis(Backend):
         if self.csimulator is not None and self.csimulator.project_path == project_path:
             return self.csimulator
         cached = self._process_cache_get("vitis.csim", cache_key)
-        if cached is not None:
+        if cached:
             self.csimulator = cached
-            return self.csimulator
+            return cached
         self.csimulator = PythonNativeCSimulator(
             top=self.kernel.func_name,
             project_path=project_path,
@@ -657,11 +639,10 @@ class Vitis(Backend):
         return self.csimulator
 
     def _invoke_csyn(self, project_path: Path) -> None:
-        tool = self._get_tool()
         log_path = _synth_log_path(project_path)
-        if tool.name == "vitis-run":
+        if self.tool.name == "vitis-run":
             cmd = [
-                os.fspath(tool.executable),
+                os.fspath(self.tool.executable),
                 "--mode",
                 "hls",
                 "--tcl",
@@ -669,15 +650,17 @@ class Vitis(Backend):
                 ".",
                 "run.tcl",
             ]
+        elif self.tool.name == "vitis_hls":
+            cmd = [os.fspath(self.tool.executable), "-f", "run.tcl"]
         else:
-            cmd = [os.fspath(tool.executable), "-f", "run.tcl"]
+            assert False, "Unknown Vitis tool detected: " + self.tool.name
 
         with stage(
-            "Running Vitis HLS synthesis",
+            "Running Vitis HLS Synthesis",
             on_error=lambda error: _log_synth_failure(log_path, error),
             on_exit=lambda: _log_synth_note(log_path),
         ):
-            run_command(cmd, cwd=project_path, env=dict(tool.env))
+            run_command(cmd, cwd=project_path, env=dict(self.tool.env))
 
     def _validate_top_abi(self) -> None:
         ret_types = self.kernel.parse_return_annotation()
@@ -701,12 +684,8 @@ class Vitis(Backend):
         self._validate_top_abi()
         self._validate_interface_pragmas()
 
-        cache_key = self._compile_cache_key()
-        cached = self._process_cache_get("vitis.compile", cache_key)
-        if cached is not None:
-            self.artifacts = cached
-            return cached
-
+        # No cached artifacts are used for HLS codegen now,
+        # because the codegen is typically much faster than sim/synth/impl
         with stage("Compiling Vitis HLS Kernels"):
             module = self._get_working_module()
             top_fn = module.lookup_func(self.kernel.func_name)
@@ -724,15 +703,14 @@ class Vitis(Backend):
             hls_code = _apply_interface_pragmas(
                 hls_code, self.kernel.func_name, self._interface_pragmas
             )
-            top_fn = None
-            module = None
-            self._release_working_module()
+            # top_fn = None
+            # module = None
+            # self._release_working_module()
 
             artifacts = CompiledArtifacts(
                 kernel_cpp=hls_code,
-                kernel_h=_generate_kernel_header(hls_code, self.kernel.func_name),
+                kernel_h=generate_kernel_header(hls_code, self.kernel.func_name),
                 top=self.kernel.func_name,
             )
             self.artifacts = artifacts
-            self._process_cache_set("vitis.compile", cache_key, artifacts)
             return artifacts

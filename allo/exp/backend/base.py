@@ -17,8 +17,8 @@ from .._C import ir
 from ..lang.kernel import Kernel
 
 _PROCESS_CACHE: dict[tuple[str, str], Any] = {}
-_CURRENT_BACKEND: ContextVar["Backend | None"] = ContextVar(
-    "allo_exp_current_backend",
+_CURRENT_BACKEND: ContextVar[Backend | None] = ContextVar(
+    "allo_curr_backend",
     default=None,
 )
 
@@ -27,6 +27,7 @@ def clear_process_cache() -> None:
     _PROCESS_CACHE.clear()
 
 
+# avoid ModuleOp livetime issues
 atexit.register(clear_process_cache)
 
 
@@ -185,6 +186,6 @@ class Backend(ABC):
         self,
         project: str | None = None,
         *,
-        overwrite: bool = False,
+        exist_ok: bool = True,
     ) -> Path:
         """Create backend project files and return the project directory."""

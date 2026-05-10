@@ -7,7 +7,7 @@ import ctypes
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Generic, ParamSpec, TypeVar
 
 import ml_dtypes
 import numpy as np
@@ -15,15 +15,18 @@ import numpy as np
 from .utils import make_project_path
 
 from ..lang.core import APFloat, APInt, BufferType, DType, IndexType, TypeBase
-from ..logging import stage, terminate_on_error
+from ..logging import log_debug, stage, terminate_on_error
 from .base import Backend
+from ..lang.kernel import Kernel
+from .._C.ir import ModuleOp, OwningModuleOp, UnitAttr
+from .._C.execution_engine import ExecutionEngine
 
 
 @dataclass
 class _CPUCompileCacheEntry:
-    module_owner: Any
-    module: Any
-    engine: Any
+    module_owner: OwningModuleOp
+    module: ModuleOp
+    engine: ExecutionEngine
     arg_types: list[TypeBase]
     res_types: list[TypeBase]
 
@@ -309,12 +312,26 @@ def _convert_back(array, dtype):
     return array.astype(dtype, copy=False)
 
 
-class CPU(Backend):
+P = ParamSpec("P")
+R = TypeVar("R")
+
+
+class CPU(Backend, Generic[P, R]):
+    """
+    Backend for executing kernels on the CPU using LLVM's JIT compilation.
+
+    This backend lowers the kernel to LLVMIR Dialect, compiles it using MLIR's ExecutionEngine (LLVM JIT),
+    and executes it directly on the CPU. It supports buffer arguments as numpy arrays and scalar arguments
+    as Python scalars.
+
+    Currently the CPU backend does not support the tensor ABI, or arbitrary APInt/APFloat types
+    """
+
     name = "cpu"
 
     def __init__(
         self,
-        kernel=None,
+        kernel: Kernel[P, R] | None = None,
         *,
         opt_level: int = 2,
         shared_libs: list[str] | None = None,
@@ -322,11 +339,11 @@ class CPU(Backend):
         super().__init__(kernel)
         self.opt_level = opt_level
         self.shared_libs = shared_libs
-        self.engine = None
+        self.engine: ExecutionEngine | None = None
         self.arg_types = None
         self.res_types = None
 
-    def call_kernel(self, kernel, *args, **kwargs) -> Any:
+    def call_kernel(self, kernel, *args: P.args, **kwargs: P.kwargs) -> R:
         return CPU(
             kernel,
             opt_level=self.opt_level,
@@ -334,9 +351,13 @@ class CPU(Backend):
         ).run(*args, **kwargs)
 
     @terminate_on_error
-    def compile(self):
-        from .._C import execution_engine, ir, passes
+    def __call__(self, *args: P.args, **kwargs: P.kwargs) -> R:
+        if self.kernel is None:
+            raise RuntimeError("No kernel provided for CPU backend")
+        return self.run(*args, **kwargs)
 
+    @terminate_on_error
+    def compile(self):
         if self.engine is not None:
             assert self.module is not None
             return self.module
@@ -351,21 +372,21 @@ class CPU(Backend):
                 "backend": self.name,
                 "opt_level": self.opt_level,
                 "shared_libs": shared_libs,
-                "version": 1,
             }
         )
         cached = self._process_cache_get("cpu.compile", cache_key)
         if cached is not None:
-            with stage("Compiling CPU Kernels (Cache Hit)"):
-                self._module_owner = cached.module_owner
-                self.module = cached.module
-                self.engine = cached.engine
-                self.arg_types = cached.arg_types
-                self.res_types = cached.res_types
+            log_debug(f"Cache hit for CPU compilation: {cache_key[-8:]}")
+            self._module_owner = cached.module_owner
+            self.module = cached.module
+            self.engine = cached.engine
+            self.arg_types = cached.arg_types
+            self.res_types = cached.res_types
             return self.module
 
         with stage("Compiling CPU Kernels"):
             module = self._get_working_module()
+            assert self._module_owner is not None
             arg_types = self.kernel.parse_argument_annotations()
             res_types = self.kernel.parse_return_annotation()
 
@@ -374,10 +395,12 @@ class CPU(Backend):
                 raise RuntimeError(
                     f"Cannot find top function '{self.kernel.func_name}'"
                 )
-            top.set_attr("llvm.emit_c_interface", ir.UnitAttr.get(module.get_context()))
+            top.set_attr("llvm.emit_c_interface", UnitAttr.get(module.get_context()))
 
-            passes.lower_to_llvm(module, False)
-            engine = execution_engine.ExecutionEngine(
+            from .._C.passes import lower_to_llvm
+
+            lower_to_llvm(module, False)
+            engine = ExecutionEngine(
                 module,
                 opt_level=self.opt_level,
                 shared_libs=shared_libs,
@@ -430,9 +453,9 @@ class CPU(Backend):
         self,
         project: str | None = None,
         *,
-        overwrite: bool = False,
+        exist_ok: bool = True,
     ) -> Path:
-        project_path = make_project_path(project, self.kernel.func_name, overwrite)
+        project_path = make_project_path(project, self.kernel.func_name, exist_ok)
         self._ensure_compiled()
         assert self.module is not None
         (project_path / "lowered.mlir").write_text(str(self.module), encoding="utf-8")
