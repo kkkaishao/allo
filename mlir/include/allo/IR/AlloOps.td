@@ -19,6 +19,162 @@ include "mlir/Interfaces/FunctionInterfaces.td"
 include "mlir/Interfaces/InferTypeOpInterface.td"
 include "mlir/Interfaces/SideEffectInterfaces.td"
 
+
+//===----------------------------------------------------------------------===//
+// Basic Operations
+//===----------------------------------------------------------------------===//
+// Copied and modified from FuncOps.td
+def KernelOp : Allo_Op<"kernel", [
+  AffineScope, AutomaticAllocationScope,
+  FunctionOpInterface, IsolatedFromAbove, OpAsmOpInterface
+]> {
+  let summary = "An operation with a name containing a single `SSACFG` region";
+  let description = [{}];
+
+  let arguments = (ins SymbolNameAttr:$sym_name,
+                       TypeAttrOf<FunctionType>:$function_type,
+                       OptionalAttr<StrAttr>:$sym_visibility,
+                       OptionalAttr<DictArrayAttr>:$arg_attrs,
+                       OptionalAttr<DictArrayAttr>:$res_attrs,
+                       DenseI32ArrayAttr:$mapping);
+  let regions = (region AnyRegion:$body);
+
+  let builders = [OpBuilder<(ins
+    "StringRef":$name, "FunctionType":$type,
+  CArg<"ArrayRef<int32_t>", "{}">:$mapping,
+    CArg<"ArrayRef<NamedAttribute>", "{}">:$attrs,
+    CArg<"ArrayRef<DictionaryAttr>", "{}">:$argAttrs)
+  >];
+  let extraClassDeclaration = [{
+    //===------------------------------------------------------------------===//
+    // FunctionOpInterface Methods
+    //===------------------------------------------------------------------===//
+
+    /// Returns the region on the current operation that is callable. This may
+    /// return null in the case of an external callable object, e.g. an external
+    /// function.
+    ::mlir::Region *getCallableRegion() { return isExternal() ? nullptr : &getBody(); }
+
+    /// Returns the argument types of this function.
+    ArrayRef<Type> getArgumentTypes() { return getFunctionType().getInputs(); }
+
+    /// Returns the result types of this function.
+    ArrayRef<Type> getResultTypes() { return getFunctionType().getResults(); }
+
+    //===------------------------------------------------------------------===//
+    // OpAsmOpInterface Methods
+    //===------------------------------------------------------------------===//
+
+    /// Allow the dialect prefix to be omitted.
+    static StringRef getDefaultDialect() { return "allo"; }
+
+    //===------------------------------------------------------------------===//
+    // SymbolOpInterface Methods
+    //===------------------------------------------------------------------===//
+
+    bool isDeclaration() { return isExternal(); }
+  }];
+  let hasCustomAssemblyFormat = 1;
+}
+
+
+def ReturnOp : Allo_Op<"return", [Pure, HasParent<"KernelOp">,
+                                MemRefsNormalizable, ReturnLike, Terminator]> {
+  let summary = "Allo kernel return operation";
+  let description = [{}];
+
+  let arguments = (ins Variadic<AnyType>:$operands);
+
+  let builders = [OpBuilder<(ins), [{
+    build($_builder, $_state, {});
+  }]>];
+
+  let assemblyFormat = "attr-dict ($operands^ `:` type($operands))?";
+  let hasVerifier = 1;
+}
+
+def InvokeOp : Allo_Op<"invoke",
+    [CallOpInterface, DeclareOpInterfaceMethods<SymbolUserOpInterface>]> {
+  let summary = "invoke operation";
+  let description = [{}];
+
+  let arguments = (ins
+    FlatSymbolRefAttr:$callee,
+    Variadic<AnyType>:$operands,
+    OptionalAttr<DictArrayAttr>:$arg_attrs,
+    OptionalAttr<DictArrayAttr>:$res_attrs,
+    UnitAttr:$async
+  );
+
+  let results = (outs Variadic<AnyType>);
+
+  let builders = [
+    OpBuilder<(ins "KernelOp":$callee, CArg<"ValueRange", "{}">:$operands), [{
+      $_state.addOperands(operands);
+      $_state.addAttribute("callee", SymbolRefAttr::get(callee));
+      $_state.addTypes(callee.getFunctionType().getResults());
+    }]>,
+    OpBuilder<(ins "SymbolRefAttr":$callee, "TypeRange":$results,
+      CArg<"ValueRange", "{}">:$operands), [{
+      $_state.addOperands(operands);
+      $_state.addAttribute("callee", callee);
+      $_state.addTypes(results);
+    }]>,
+    OpBuilder<(ins "StringAttr":$callee, "TypeRange":$results,
+      CArg<"ValueRange", "{}">:$operands), [{
+      build($_builder, $_state, SymbolRefAttr::get(callee), results, operands);
+    }]>,
+    OpBuilder<(ins "StringRef":$callee, "TypeRange":$results,
+      CArg<"ValueRange", "{}">:$operands), [{
+      build($_builder, $_state, StringAttr::get($_builder.getContext(), callee),
+            results, operands);
+    }]>,
+    OpBuilder<(ins "TypeRange":$results, "FlatSymbolRefAttr":$callee,
+      CArg<"ValueRange", "{}">:$operands), [{
+      build($_builder, $_state, callee, results, operands);
+    }]>,
+    OpBuilder<(ins "TypeRange":$results, "StringAttr":$callee,
+      CArg<"ValueRange", "{}">:$operands), [{
+      build($_builder, $_state, callee, results, operands);
+    }]>,
+    OpBuilder<(ins "TypeRange":$results, "StringRef":$callee,
+      CArg<"ValueRange", "{}">:$operands), [{
+      build($_builder, $_state, callee, results, operands);
+    }]>];
+
+  let extraClassDeclaration = [{
+    FunctionType getCalleeType();
+
+    /// Get the argument operands to the called function.
+    operand_range getArgOperands() {
+      return {arg_operand_begin(), arg_operand_end()};
+    }
+
+    MutableOperandRange getArgOperandsMutable() {
+      return getOperandsMutable();
+    }
+
+    operand_iterator arg_operand_begin() { return operand_begin(); }
+    operand_iterator arg_operand_end() { return operand_end(); }
+
+    /// Return the callee of this operation.
+    CallInterfaceCallable getCallableForCallee() {
+      return (*this)->getAttrOfType<SymbolRefAttr>("callee");
+    }
+
+    /// Set the callee for this operation.
+    void setCalleeFromCallable(CallInterfaceCallable callee) {
+      (*this)->setAttr("callee", cast<SymbolRefAttr>(callee));
+    }
+  }];
+
+  let assemblyFormat = [{
+    $callee `(` $operands `)` (`async` $async^)?
+      attr-dict `:` functional-type($operands, results)
+  }];
+}
+
+
 //===----------------------------------------------------------------------===//
 // SPMW Operations
 //===----------------------------------------------------------------------===//
@@ -86,7 +242,7 @@ def StreamPutOp : Allo_Op<"stream.put", [MemoryEffects<[MemWrite]>]> {
 def StreamCreateOp : Allo_Op<"stream.create", [MemoryEffects<[MemAlloc]>]> {
   let summary = "create a stream";
   let description = [{
-    This operation creates a new stream.
+    This operation creates a new local stream.
   }];
   let arguments = (ins);
   let results = (outs Stream:$stream);
@@ -96,129 +252,29 @@ def StreamCreateOp : Allo_Op<"stream.create", [MemoryEffects<[MemAlloc]>]> {
 }
 
 def GlobalStreamGetOp : Allo_Op<"stream.get_global", [
-  MemoryEffects<[MemWrite, MemRead]>,
+  Pure,
   DeclareOpInterfaceMethods<SymbolUserOpInterface>]> {
-  let summary = "get a value from a global stream";
+  let summary = "get a local handle to a global stream";
   let description = [{
-    This operation retrieves a value from a global stream
+    This operation retrieves a local SSA handle to a global stream symbol.
   }];
-  let arguments = (ins FlatSymbolRefAttr:$stream, Variadic<Index>:$indices);
-  let results = (outs AnyType:$value);
+  let arguments = (ins FlatSymbolRefAttr:$stream);
+  let results = (outs Stream:$handle);
   let assemblyFormat = [{
-    $stream `[` $indices `]` attr-dict `:` type($value)
+    $stream attr-dict `:` qualified(type($handle))
   }];
 }
 
-def GlobalStreamPutOp : Allo_Op<"stream.put_global", [
-  MemoryEffects<[MemWrite]>,
-  DeclareOpInterfaceMethods<SymbolUserOpInterface>]> {
-  let summary = "put a value into a global stream";
-  let description = [{
-    This operation puts a value into a global stream
-  }];
-  let arguments = (ins FlatSymbolRefAttr:$stream, Variadic<Index>:$indices, AnyType:$value);
-  let results = (outs);
-  let assemblyFormat = [{
-    $value `,` $stream `[` $indices `]` attr-dict `:` type($value)
-  }];
-}
-
-def GlobalStreamCreateOp : Allo_Op<"stream.create_global", [
-  MemoryEffects<[MemAlloc]>, Symbol]> {
+def GlobalStreamCreateOp : Allo_Op<"stream.global", [
+  Symbol]> {
   let summary = "create a global stream";
   let description = [{
     This operation creates a new global stream.
   }];
-  let arguments = (ins SymbolNameAttr:$sym_name);
-  let results = (outs Stream:$stream);
-  let assemblyFormat = [{
-    $sym_name attr-dict `:` qualified(type($stream))
-  }];
-}
-
-//===----------------------------------------------------------------------===//
-// ISA Operations
-//===----------------------------------------------------------------------===//
-def IntegerSetArrayAttr : TypedArrayAttrBase<IntegerSetAttr,
-                                      "IntegerSet array attribute">;
-
-def InstructionYieldOp : Allo_Op<"instr.yield", [Pure, ReturnLike, Terminator]> {
-  let summary = "yield results from an instruction";
-  let description = [{
-    This operation yields the results of an instruction in the semantics region of `instr.define` operation.
-  }];
-  let arguments = (ins Variadic<AnyType>:$results);
+  let arguments = (ins SymbolNameAttr:$sym_name, TypeAttrOf<Stream>:$streamType);
   let results = (outs);
   let assemblyFormat = [{
-    $results attr-dict `:` type($results)
-  }];
-}
-
-def InstructionDefineOp : Allo_Op<"instr.define", [Symbol, RecursiveMemoryEffects]> {
-  let summary = "define an instruction";
-  let description = [{
-    This operation defines a tensor instruction in an ISA.
-
-    The definition contains following components:
-    1. The instruction name, which is used to identify the instruction
-    2. The instruction operand types, typically are tensor/memref types
-    3. The instruction result types, typically are tensor/memref types
-    4. The instruction indexing scheme, which specifies how to index into the operands and results of the instruction
-    5. The instruction semantics, which is a region that defines how the instruction computes its results from its operands.
-
-    The semantics region must be end with a `yield` operation that yields the results of the instruction.
-  }];
-  let arguments = (ins
-    SymbolNameAttr:$sym_name,
-    TypeArrayAttr:$source_types,
-    TypeArrayAttr:$destination_types,
-    StrArrayAttr:$index_symbols,
-    AffineMapArrayAttr:$index_maps,
-    StrArrayAttr:$domain_symbols,
-    IntegerSetArrayAttr:$index_sets);
-  let regions = (region SizedRegion<1>:$region);
-  let results = (outs);
-  let assemblyFormat = [{
-    $sym_name `{`
-      `signature` `src` $source_types `dst` $destination_types
-      `index_syms` $index_symbols
-      `index_maps` $index_maps
-      `domain_syms` $domain_symbols
-      `index_sets` $index_sets
-      `semantics` $region
-    `}` attr-dict
-  }];
-  let hasVerifier = 1;
-  let extraClassDeclaration = [{
-    Block *getSemantics() {
-       return &getRegion().front();
-    }
-  }];
-}
-
-def InstructionEmitOp : Allo_Op<"instr.emit", [
-  DeclareOpInterfaceMethods<SymbolUserOpInterface>,
-  DeclareOpInterfaceMethods<InferTypeOpInterface>,
-  AttrSizedOperandSegments]> {
-  let summary = "emit an instruction";
-  let description = [{
-    This operation emits an instruction defined by `instr.define` operation.
-
-    It takes the following components as input:
-    1. The instruction name
-    2. The instruction operands (SSA values), which must match the operand types defined in the instruction definition
-    3. The indexing symbols and domain symbols (Attributes), which are compile-tile known and used to instantiate the instruction scheme.
-  }];
-  let arguments = (ins
-    FlatSymbolRefAttr:$instruction,
-    Variadic<AnyType>:$sources,
-    Variadic<AnyType>:$destinations, // DPS style
-    DictionaryAttr:$symbol_values);
-  let results = (outs Variadic<AnyType>:$results);
-  let assemblyFormat = [{
-    $instruction `params` $symbol_values
-    `src``(` $sources `:` type($sources) `)`
-    `dst` `(` $destinations `:` type($destinations) `)` attr-dict
+    $sym_name attr-dict `:` $streamType
   }];
 }
 

@@ -8,13 +8,24 @@ NO_FOLD = object()
 
 
 class Operator(Generic[P, R]):
-    def __init__(self, fn: Callable[P, R]):
+    def __init__(
+        self,
+        fn: Callable[P, R],
+        *,
+        cls: type | tuple[type, ...] | None = None,
+    ):
         self.fn = fn
         self.n_args = len(inspect.signature(fn).parameters)
         self.fold_impl = None
         self.build_impl = None
         self.__doc__ = fn.__doc__
         self.__name__ = fn.__name__
+        if cls is not None:
+            classes = cls if isinstance(cls, tuple) else (cls,)
+            for owner in classes:
+                existing = getattr(owner, fn.__name__, None)
+                assert existing is None or existing is self
+                setattr(owner, fn.__name__, self)
 
     def __call__(self, *args: P.args, **kwargs: P.kwargs) -> R:
         raise RuntimeError(
@@ -62,14 +73,18 @@ def operator(fn: Callable[P, R]) -> Operator[P, R]: ...
 
 
 @overload
-def operator() -> Callable[[Callable[P, R]], Operator[P, R]]: ...
+def operator(
+    *, cls: type | tuple[type, ...] | None = None
+) -> Callable[[Callable[P, R]], Operator[P, R]]: ...
 
 
 def operator(
     fn: Callable[P, R] | None = None,
+    *,
+    cls: type | tuple[type, ...] | None = None,
 ) -> Operator[P, R] | Callable[[Callable[P, R]], Operator[P, R]]:
     def decorator(fn: Callable[P, R]) -> Operator[P, R]:
-        return Operator(fn)
+        return Operator(fn, cls=cls)
 
     if fn is not None:
         return decorator(fn)

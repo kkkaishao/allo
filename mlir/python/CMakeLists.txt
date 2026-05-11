@@ -108,6 +108,7 @@ target_link_libraries(_liballo
     ${ALLO_PYTHON_MLIR_LIBS}
 
     MLIRAllo
+    MLIRAlloConversion
     MLIRAlloTransformOps
     MLIRAlloTranslation
 )

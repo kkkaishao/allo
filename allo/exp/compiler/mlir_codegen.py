@@ -9,7 +9,7 @@ from typing import Type
 from types import ModuleType
 
 from .._C.ir import Context, ModuleOp, Location, Value, FunctionType, Block
-from .._C.func import FuncOp, ReturnOp, CallOp
+from .._C.allo import ReturnOp, InvokeOp, KernelOp
 from .._C.cf import BranchOp, CondBranchOp
 from .._C.scf import (
     IfOp,
@@ -27,9 +27,11 @@ from ..lang.kernel import kernel as kernel_decorator
 from ..lang.core import (
     ConstexprValue,
     AlloValue,
+    ValueBase,
     TypeBase,
     DType,
     ShapedType,
+    StreamType,
     Range,
     Grid,
     ConstexprType,
@@ -37,6 +39,7 @@ from ..lang.core import (
     unwrap_if_constexpr,
     index,
     bool,
+    AlloSymbolRef,
 )
 from ..lang.operator import Operator, BoundOperator, NO_FOLD
 from ..operators import arith as arith_ops, memory as mem_ops
@@ -48,11 +51,16 @@ def generate_function_type(
 ) -> FunctionType:
     mlir_arg_types = []
     for ty in arg_types:
+        if isinstance(ty, StreamType) and ty.is_global:
+            raise TypeError("GStream is not allowed as a kernel parameter.")
         if isinstance(ty, ConstexprType):
             continue
         mlir_arg_types.append(ty.materialize(context))
     mlir_res_types = []
     for ty in res_types:
+        if isinstance(ty, StreamType):
+            prefix = "GStream" if ty.is_global else "Stream"
+            raise TypeError(f"{prefix} is not allowed as a kernel return type.")
         if isinstance(ty, ConstexprType):
             continue
         mlir_res_types.append(ty.materialize(context))
@@ -136,6 +144,7 @@ class MLIRCodeGenerator(ast.NodeVisitor):
         closure_scope: dict[str, object] | None = None,
         forbidden_closure_scope: dict[str, object] | None = None,
         active_kernel_calls: list[str] | None = None,
+        is_top: builtins.bool = False,
     ):
         # setup basic info
         self.context = context
@@ -148,6 +157,7 @@ class MLIRCodeGenerator(ast.NodeVisitor):
         self.kernel = kernel
         self.arg_types = arg_types
         self.res_types = res_types
+        self.is_top = is_top
 
         # trackers
         self.gscope = gscope
@@ -205,7 +215,7 @@ class MLIRCodeGenerator(ast.NodeVisitor):
                 captured = self.forbidden_closure_scope[name]
                 captured_ty = (
                     captured.type
-                    if isinstance(captured, AlloValue)
+                    if isinstance(captured, ValueBase)
                     else type(captured).__name__
                 )
                 return self.compile_error(
@@ -262,6 +272,7 @@ class MLIRCodeGenerator(ast.NodeVisitor):
             or val in (Range, Grid)
             or isinstance(val, TypeBase)
             or isinstance(val, ConstexprValue)
+            or (isinstance(val, AlloSymbolRef) and not val.is_indexed)
             or isinstance(val, ConstevalFunction)
         )
 
@@ -290,9 +301,13 @@ class MLIRCodeGenerator(ast.NodeVisitor):
         self.lscope[name] = value
 
     def _maybe_set_loc_to_name(self, name, value):
-        if isinstance(value, AlloValue):
-            name_loc = Location(value.handle.get_loc(), name, self.context)
-            value.handle.set_loc(name_loc)
+        if isinstance(value, ValueBase):
+            handle = value.handle
+            if handle is None:
+                assert isinstance(value, AlloSymbolRef)
+                return
+            name_loc = Location(handle.get_loc(), name, self.context)
+            handle.set_loc(name_loc)
         elif isinstance(value, Value):
             name_loc = Location(value.get_loc(), name, self.context)
             value.set_loc(name_loc)
@@ -341,7 +356,9 @@ class MLIRCodeGenerator(ast.NodeVisitor):
     def generic_visit(self, node: ast.AST):
         return self.compile_error(f"Unsupported syntax: {ast.unparse(node)}")
 
-    def visit_compound_stmts(self, stmts, allow_nested_kernel_def: bool = False):
+    def visit_compound_stmts(
+        self, stmts, allow_nested_kernel_def: builtins.bool = False
+    ):
         if not isinstance(stmts, list):
             stmts = [stmts]
         for stmt in stmts:
@@ -398,7 +415,8 @@ class MLIRCodeGenerator(ast.NodeVisitor):
         fn_ty: FunctionType = generate_function_type(
             self.context, self.arg_types, self.res_types
         )
-        fn_op = FuncOp(self.builder, self.func_name, fn_ty)
+        visibility = "public" if self.is_top else "private"
+        fn_op = KernelOp(self.builder, self.func_name, fn_ty, visibility, self.kernel.mapping)  # type: ignore
         self.curr_func = fn_op
         self.generated_func = fn_op
 
@@ -1140,8 +1158,32 @@ class MLIRCodeGenerator(ast.NodeVisitor):
             self.visit_compound_stmts(selected)
 
     def visit_Attribute(self, node):
-        lhs = unwrap_if_constexpr(self.visit(node.value))
-        return getattr(lhs, node.attr)
+        lhs = self.visit(node.value)
+        try:
+            attr = getattr(lhs, node.attr)
+        except AttributeError:
+            if isinstance(lhs, ConstexprValue):
+                try:
+                    attr = getattr(lhs.value, node.attr)
+                except AttributeError:
+                    return self.compile_error(
+                        f"constexpr value '{lhs.value}' has no attribute '{node.attr}'."
+                    )
+            else:
+                lhs_type = (
+                    lhs.type if isinstance(lhs, ValueBase) else type(lhs).__name__
+                )
+                return self.compile_error(
+                    f"Object of type '{lhs_type}' has no attribute '{node.attr}'."
+                )
+
+        if isinstance(attr, BoundOperator):
+            return attr
+        if isinstance(attr, Operator):
+            if isinstance(lhs, ValueBase):
+                return BoundOperator(attr, lhs)
+            return attr
+        return attr
 
     def visit_Subscript(self, node: ast.Subscript):
         return self.visit_Subscript_Load(node)
@@ -1327,6 +1369,26 @@ class MLIRCodeGenerator(ast.NodeVisitor):
             )
 
         parsed_type = self._parse_annotation(node.annotation, node.target.id)
+        if isinstance(parsed_type, StreamType):
+            if node.value is not None:
+                prefix = "Global stream" if parsed_type.is_global else "Stream"
+                return self.compile_error(
+                    f"{prefix} '{node.target.id}' must be declared without an initializer."
+                )
+            if not parsed_type.is_global:
+                self._set_value_with_loc(
+                    node.target.id, self.builder.create_stream(parsed_type)
+                )
+                return
+            symbol_name = (
+                node.target.id if self.is_top else f"{self.func_name}.{node.target.id}"
+            )
+            self._set_value(
+                node.target.id,
+                self.builder.create_global_stream(symbol_name, parsed_type),
+            )
+            return
+
         if node.value is None:
             if isinstance(parsed_type, ShapedType):
                 self._set_value_with_loc(
@@ -1374,7 +1436,7 @@ class MLIRCodeGenerator(ast.NodeVisitor):
             value = self.visit(node.value)
         self._do_assignment(target, value)
 
-    def _do_assignment(self, target, value: ConstexprValue | AlloValue):
+    def _do_assignment(self, target, value: object):
         assert isinstance(target.ctx, ast.Store)
         if isinstance(target, ast.Subscript):
             return self.visit_Subscript_Store(target, value)
@@ -1389,11 +1451,17 @@ class MLIRCodeGenerator(ast.NodeVisitor):
             )
         if isinstance(target, ast.Name):
             target = self.visit(target)
+            # reject all symbol references on the rhs, since they are not SSA values and can lead to confusion.
+            # users can still use global symbols, but cannot assign global symbols to other variables.
+            if isinstance(value, AlloSymbolRef):
+                return self.compile_error(
+                    f"Cannot assign global symbol '{value.name}' to a new variable."
+                )
             # the first time we see a variable is considered its definition site, and its type if inferred from the assigned value. subsequent assignments to the same variable must be type-compatible with the first definition.
             if target not in self.lscope:
                 if isinstance(value, ConstexprValue):
                     return self.compile_error(
-                        "Constexpr variables must be explcitly declared with type annotation. Please add a type annotation of 'constexpr' to this variable."
+                        "Constexpr variables must be explicitly declared with type annotation. Please add a type annotation of 'constexpr' to this variable."
                     )
                 self._set_value_with_loc(target, value)
                 return
@@ -1402,10 +1470,16 @@ class MLIRCodeGenerator(ast.NodeVisitor):
                 return self.compile_error(
                     f"Cannot reassign to variable '{target}' defined as a constexpr"
                 )
+            if isinstance(proxy, AlloSymbolRef):
+                return self.compile_error(
+                    f"Cannot reassign to variable '{target}' defined as a global symbol"
+                )
             if isinstance(value, ConstexprValue):
                 ret = self.builder.materialize_literal_like(value.value, proxy)
             elif isinstance(value, AlloValue):
                 ret = self.builder.cast(value, proxy.type)
+            else:
+                assert False, f"unsupported assignment value: {value}"
             self._set_value_with_loc(target, ret)
 
     def _set_value_with_loc(self, target, value):
@@ -1792,6 +1866,10 @@ class MLIRCodeGenerator(ast.NodeVisitor):
     ):
         if isinstance(expected_ty, ConstexprType):
             assert False, "constexpr arguments do not have call operands"
+        if isinstance(expected_ty, StreamType) and not isinstance(value, AlloValue):
+            return self.compile_error(
+                f"Kernel call argument '{arg_name}' type mismatch: expected '{expected_ty}', got '{type(value).__name__}'."
+            )
         if not isinstance(value, (AlloValue, ConstexprValue)):
             value = ConstexprValue(value)
         try:
@@ -1829,7 +1907,7 @@ class MLIRCodeGenerator(ast.NodeVisitor):
         return callee_context, call_operands
 
     def _decode_kernel_call_results(
-        self, call_op: CallOp, res_types: Sequence[TypeBase]
+        self, call_op: InvokeOp, res_types: Sequence[TypeBase]
     ):
         if any(isinstance(ty, ConstexprType) for ty in res_types):
             return self.compile_error(
@@ -1870,11 +1948,19 @@ class MLIRCodeGenerator(ast.NodeVisitor):
         ):
             return []
         if isinstance(node.returns, ast.Tuple):
-            return [
+            res_types = [
                 self._parse_annotation(ret, f"return[{i}]")
                 for i, ret in enumerate(node.returns.elts)
             ]
-        return [self._parse_annotation(node.returns, "return")]
+        else:
+            res_types = [self._parse_annotation(node.returns, "return")]
+        if any(isinstance(ty, StreamType) for ty in res_types):
+            ty = next(ty for ty in res_types if isinstance(ty, StreamType))
+            prefix = "GStream" if ty.is_global else "Stream"
+            return self.compile_error(
+                f"{prefix} is not allowed as a kernel return type."
+            )
+        return res_types
 
     def _bind_nested_arguments(self, nested: NestedKernelSymbol, args, kws):
         fn_args = nested.node.args
@@ -1941,6 +2027,11 @@ class MLIRCodeGenerator(ast.NodeVisitor):
                 arg_types.append(self._infer_nested_arg_type(param.arg, value))
             else:
                 arg_types.append(self._parse_annotation(param.annotation, param.arg))
+        for param, ty in zip(nested.node.args.args, arg_types):
+            if isinstance(ty, StreamType) and ty.is_global:
+                return self.compile_error(
+                    f"GStream is not allowed as nested kernel parameter '{param.arg}'."
+                )
         return arg_types, self._parse_return_types(nested.node)
 
     def _build_nested_capture_scopes(self):
@@ -2022,7 +2113,7 @@ class MLIRCodeGenerator(ast.NodeVisitor):
             self.builder.set_insertion_point_and_loc(ip, last_loc)
 
         assert sub_generator is not None and sub_generator.generated_func is not None
-        call_op = CallOp(self.builder, sub_generator.generated_func, call_operands)
+        call_op = InvokeOp(self.builder, sub_generator.generated_func, call_operands)
         return self._decode_kernel_call_results(call_op, sub_res_types)
 
     def call_kernel(self, fn: Kernel, args, kws):
@@ -2075,6 +2166,7 @@ class MLIRCodeGenerator(ast.NodeVisitor):
                 options=fn.options,
                 callee_context=callee_context,
                 active_kernel_calls=self._active_kernel_calls,
+                is_top=False,
             )
             sub_generator.visit(fn.parse())
             if sub_generator.generated_func is None:
@@ -2097,7 +2189,7 @@ class MLIRCodeGenerator(ast.NodeVisitor):
             self.builder.set_insertion_point_and_loc(ip, last_loc)
 
         assert sub_generator is not None and sub_generator.generated_func is not None
-        call_op = CallOp(self.builder, sub_generator.generated_func, call_operands)
+        call_op = InvokeOp(self.builder, sub_generator.generated_func, call_operands)
         return self._decode_kernel_call_results(call_op, sub_res_types)
 
     def call_operator(self, fn: Operator | BoundOperator, args, kwargs={}):
@@ -2203,11 +2295,13 @@ def compile(
         raise TypeError(
             "Only allo.kernel functions can be compiled with allo.compile()"
         )
-    fn.ensure_templates_bound()
+    fn.check_templates_bounded()
     if not arg_types:
         arg_types = fn.parse_argument_annotations()
     else:
         arg_types = [fn.parse_type_annotation(t) for t in arg_types]
+    if any(isinstance(ty, StreamType) and ty.is_global for ty in arg_types):
+        raise TypeError("GStream is not allowed as a kernel parameter.")
     if len(arg_types) != len(fn.signature.parameters):
         raise ValueError(
             f"The number of provided argument types ({len(arg_types)}) does not match the number of arguments in the kernel signature ({len(fn.signature.parameters)})."
@@ -2216,6 +2310,10 @@ def compile(
         res_types = fn.parse_return_annotation()
     else:
         res_types = [fn.parse_type_annotation(t) for t in res_types]
+    if any(isinstance(ty, StreamType) for ty in res_types):
+        ty = next(ty for ty in res_types if isinstance(ty, StreamType))
+        prefix = "GStream" if ty.is_global else "Stream"
+        raise TypeError(f"{prefix} is not allowed as a kernel return type.")
     effective_options = fn.options if options is None else options
 
     try:
@@ -2247,6 +2345,7 @@ def compile(
             res_types=res_types,
             options=effective_options,
             active_kernel_calls=[f"kernel:{fn.__module__}.{fn.__qualname__}"],
+            is_top=True,
         )
         generator.visit(fn.parse())
 

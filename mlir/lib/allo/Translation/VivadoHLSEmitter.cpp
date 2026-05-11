@@ -58,52 +58,8 @@ std::string VivadoHLSEmitter::getSymbolName(llvm::StringRef name) {
   return unique;
 }
 
-bool VivadoHLSEmitter::hasUnsupportedType(Type type) {
-  if (isa<StreamType>(type))
-    return true;
-  if (auto shaped = dyn_cast<ShapedType>(type))
-    return hasUnsupportedType(shaped.getElementType());
-  return false;
-}
-
-LogicalResult VivadoHLSEmitter::validateModule(ModuleOp mod) {
-  WalkResult result = mod->walk([&](Operation *op) -> WalkResult {
-    if (isa<allo::StreamCreateOp, allo::StreamGetOp, allo::StreamPutOp>(op)) {
-      op->emitError()
-          << "Stream operations are not supported in Vivado HLS emitter.";
-      state.failed = true;
-      return WalkResult::interrupt();
-    }
-
-    if (auto func = dyn_cast<func::FuncOp>(op)) {
-      for (Type type : func.getArgumentTypes()) {
-        if (hasUnsupportedType(type)) {
-          func->emitError()
-              << "StreamType is not supported in Vivado HLS emitter.";
-          state.failed = true;
-          return WalkResult::interrupt();
-        }
-      }
-      for (Type type : func.getResultTypes()) {
-        if (hasUnsupportedType(type)) {
-          func->emitError()
-              << "StreamType is not supported in Vivado HLS emitter.";
-          state.failed = true;
-          return WalkResult::interrupt();
-        }
-      }
-    }
-
-    for (Type type : op->getResultTypes()) {
-      if (hasUnsupportedType(type)) {
-        op->emitError() << "StreamType is not supported in Vivado HLS emitter.";
-        state.failed = true;
-        return WalkResult::interrupt();
-      }
-    }
-    return WalkResult::advance();
-  });
-  return failure(result.wasInterrupted());
+std::string VivadoHLSEmitter::getTemporaryName(llvm::StringRef prefix) {
+  return (prefix + std::to_string(temporaryNameCounter++)).str();
 }
 
 std::string VivadoHLSEmitter::getPrimitiveTypeName(Type type, bool isSigned) {
@@ -143,6 +99,35 @@ std::string VivadoHLSEmitter::getPrimitiveTypeName(Type type, bool isSigned) {
   }
 
   llvm_unreachable("unsupported types");
+}
+
+std::string VivadoHLSEmitter::getBlockTypeName(ShapedType type, Location loc) {
+  if (!type.hasRank()) {
+    emitError(loc) << "Unranked stream block payloads are not supported in "
+                      "Vivado HLS emitter.";
+    state.failed = true;
+    return "/*unsupported_block*/";
+  }
+  std::string result = getPrimitiveTypeName(type);
+  for (int64_t dim : type.getShape()) {
+    if (ShapedType::isDynamic(dim)) {
+      emitError(loc) << "Dynamic stream block payloads are not supported in "
+                        "Vivado HLS emitter.";
+      state.failed = true;
+      return "/*unsupported_block*/";
+    }
+    result += "[" + std::to_string(dim) + "]";
+  }
+  return result;
+}
+
+std::string VivadoHLSEmitter::getStreamTypeName(StreamType type, Location loc) {
+  Type baseType = type.getBaseType();
+  if (auto shaped = dyn_cast<ShapedType>(baseType)) {
+    return "hls::stream_of_blocks<" + getBlockTypeName(shaped, loc) + ", " +
+           std::to_string(type.getDepth()) + ">";
+  }
+  return "hls::stream<" + getPrimitiveTypeName(baseType) + ">";
 }
 
 void VivadoHLSEmitter::emitFunction(func::FuncOp func) {
@@ -185,6 +170,16 @@ void VivadoHLSEmitter::emitFunctionArguments(func::FuncOp func) {
   for (auto arg : func.getArguments()) {
     if (arg != func.getArguments().front())
       state.os << ", ";
+    if (auto streamType = dyn_cast<StreamType>(arg.getType())) {
+      state.os << getStreamTypeName(streamType, arg.getLoc());
+      if (streamType.getShape().empty())
+        state.os << " &";
+      else
+        state.os << " ";
+      state.os << state.getOrAddName(arg);
+      emitArraySuffix(streamType.getShape(), arg.getLoc());
+      continue;
+    }
     state.os << getPrimitiveTypeName(arg.getType()) << " "
              << state.getOrAddName(arg);
     if (auto shaped = dyn_cast<ShapedType>(arg.getType()))
@@ -202,6 +197,15 @@ void VivadoHLSEmitter::emitFunctionDirectives(func::FuncOp func) {
     state.os << "#pragma HLS inline\n";
   else
     state.os << "#pragma HLS inline off\n";
+
+  for (auto arg : func.getArguments()) {
+    auto streamType = dyn_cast<StreamType>(arg.getType());
+    if (!streamType || isa<ShapedType>(streamType.getBaseType()))
+      continue;
+    state.os.indent(state.currentIndent);
+    state.os << "#pragma HLS stream variable=" << state.getName(arg)
+             << " depth=" << streamType.getDepth() << "\n";
+  }
 
   auto argAttrs = func.getArgAttrs();
   if (!argAttrs) {
@@ -426,14 +430,8 @@ void VivadoHLSEmitter::emitBlock(Block &block) {
   }
 }
 
-void VivadoHLSEmitter::emitArraySuffix(ShapedType type, Location loc) {
-  if (!type.hasRank()) {
-    emitError(loc)
-        << "Unranked shaped types are not supported in Vivado HLS emitter.";
-    state.failed = true;
-    return;
-  }
-  for (int64_t dim : type.getShape()) {
+void VivadoHLSEmitter::emitArraySuffix(ArrayRef<int64_t> shape, Location loc) {
+  for (int64_t dim : shape) {
     if (ShapedType::isDynamic(dim)) {
       emitError(loc)
           << "Dynamic shaped types are not supported in Vivado HLS emitter.";
@@ -444,9 +442,26 @@ void VivadoHLSEmitter::emitArraySuffix(ShapedType type, Location loc) {
   }
 }
 
+void VivadoHLSEmitter::emitArraySuffix(ShapedType type, Location loc) {
+  if (!type.hasRank()) {
+    emitError(loc)
+        << "Unranked shaped types are not supported in Vivado HLS emitter.";
+    state.failed = true;
+    return;
+  }
+  emitArraySuffix(type.getShape(), loc);
+}
+
 void VivadoHLSEmitter::emitValueDecl(Value val) {
   if (state.hasName(val)) {
     state.os << state.getName(val);
+    return;
+  }
+
+  if (auto streamType = dyn_cast<StreamType>(val.getType())) {
+    state.os << getStreamTypeName(streamType, val.getLoc()) << " "
+             << state.addName(val);
+    emitArraySuffix(streamType.getShape(), val.getLoc());
     return;
   }
 
@@ -473,6 +488,120 @@ void VivadoHLSEmitter::emitIndexedValue(Value value, ValueRange indices) {
     emitValueRef(index);
     state.os << "]";
   }
+}
+
+void VivadoHLSEmitter::emitStreamReference(Value stream, ValueRange indices) {
+  emitValueRef(stream);
+  for (Value index : indices) {
+    state.os << "[";
+    emitValueRef(index);
+    state.os << "]";
+  }
+}
+
+void VivadoHLSEmitter::emitBlockCopy(ShapedType type, llvm::StringRef dst,
+                                     llvm::StringRef src) {
+  emitBlockCopyLoops(type, {}, dst, src);
+}
+
+void VivadoHLSEmitter::emitBlockCopyLoops(ShapedType type,
+                                          ArrayRef<std::string> indices,
+                                          llvm::StringRef dst,
+                                          llvm::StringRef src) {
+  assert(type.hasRank() && "stream block payload must be ranked");
+  if (indices.size() == static_cast<size_t>(type.getRank())) {
+    state.os.indent(state.currentIndent);
+    state.os << dst;
+    for (auto index : indices)
+      state.os << "[" << index << "]";
+    state.os << " = " << src;
+    for (auto index : indices)
+      state.os << "[" << index << "]";
+    state.os << ";\n";
+    return;
+  }
+
+  int64_t dim = type.getDimSize(indices.size());
+  assert(!ShapedType::isDynamic(dim) && "stream block payload must be static");
+  std::string iv = getTemporaryName("i");
+  state.os.indent(state.currentIndent);
+  state.os << "for (" << getIntegerTypeName(state.indexWidth, true) << " " << iv
+           << " = 0; " << iv << " < " << dim << "; ++" << iv << ") {\n";
+  state.addIndent();
+  SmallVector<std::string> nestedIndices(indices.begin(), indices.end());
+  nestedIndices.push_back(iv);
+  emitBlockCopyLoops(type, nestedIndices, dst, src);
+  state.reduceIndent();
+  state.os.indent(state.currentIndent);
+  state.os << "}\n";
+}
+
+void VivadoHLSEmitter::emitStreamCreate(allo::StreamCreateOp op) {
+  llvm::raw_ostream &os = state.os;
+  auto streamType = cast<StreamType>(op.getStream().getType());
+  emitValueDecl(op.getStream());
+  os << ";";
+
+  if (isa<ShapedType>(streamType.getBaseType()))
+    return;
+
+  os << "\n";
+  os.indent(state.currentIndent);
+  os << "#pragma HLS stream variable=" << state.getName(op.getStream())
+     << " depth=" << streamType.getDepth();
+}
+
+void VivadoHLSEmitter::emitStreamGet(allo::StreamGetOp op) {
+  llvm::raw_ostream &os = state.os;
+  auto streamType = cast<StreamType>(op.getStream().getType());
+  if (auto blockType = dyn_cast<ShapedType>(streamType.getBaseType())) {
+    emitValueDecl(op.getValue());
+    os << ";\n";
+    os.indent(state.currentIndent);
+    os << "{\n";
+    state.addIndent();
+    std::string lockName = getTemporaryName("read_lock");
+    os.indent(state.currentIndent);
+    os << "hls::read_lock<" << getBlockTypeName(blockType, op.getLoc()) << "> "
+       << lockName << "(";
+    emitStreamReference(op.getStream(), op.getIndices());
+    os << ");\n";
+    emitBlockCopy(blockType, state.getName(op.getValue()), lockName);
+    state.reduceIndent();
+    os.indent(state.currentIndent);
+    os << "}";
+    return;
+  }
+
+  emitValueDecl(op.getValue());
+  os << " = ";
+  emitStreamReference(op.getStream(), op.getIndices());
+  os << ".read();";
+}
+
+void VivadoHLSEmitter::emitStreamPut(allo::StreamPutOp op) {
+  llvm::raw_ostream &os = state.os;
+  auto streamType = cast<StreamType>(op.getStream().getType());
+  if (auto blockType = dyn_cast<ShapedType>(streamType.getBaseType())) {
+    os << "{\n";
+    state.addIndent();
+    std::string lockName = getTemporaryName("write_lock");
+    os.indent(state.currentIndent);
+    os << "hls::write_lock<" << getBlockTypeName(blockType, op.getLoc()) << "> "
+       << lockName << "(";
+    emitStreamReference(op.getStream(), op.getIndices());
+    os << ");\n";
+    emitBlockCopy(blockType, lockName, state.getName(op.getValue()));
+    state.reduceIndent();
+    os.indent(state.currentIndent);
+    os << "}";
+    return;
+  }
+
+  emitStreamReference(op.getStream(), op.getIndices());
+  os << ".write(";
+  emitValueRef(op.getValue());
+  os << ");";
 }
 
 void VivadoHLSEmitter::emitYieldAssignments(Operation *parent,
@@ -864,6 +993,10 @@ void VivadoHLSEmitter::dispatch(Operation *op) {
       .Case<memref::GlobalOp>([&](auto op) { emitMemrefGlobal(op); })
       .Case<memref::GetGlobalOp>([&](auto op) { emitMemrefGetGlobal(op); })
 
+      .Case<allo::StreamCreateOp>([&](auto op) { emitStreamCreate(op); })
+      .Case<allo::StreamGetOp>([&](auto op) { emitStreamGet(op); })
+      .Case<allo::StreamPutOp>([&](auto op) { emitStreamPut(op); })
+
       .Case<arith::ConstantOp>([&](auto op) { emitConstant(op); })
       .Case<arith::SelectOp>([&](auto op) { emitSelect(op); })
       .Case<arith::CmpIOp>([&](auto op) { emitCmpI(op); })
@@ -1053,6 +1186,8 @@ constexpr llvm::StringLiteral deviceHeader = R"XXX(
 #include <ap_fixed.h>
 #include <ap_int.h>
 #include <hls_math.h>
+#include <hls_stream.h>
+#include <hls_streamofblocks.h>
 #include <math.h>
 #include <stdint.h>
 using namespace std;
@@ -1061,12 +1196,14 @@ using namespace std;
 void VivadoHLSEmitter::emitModule(ModuleOp mod) {
   // TODO: add host-side codegen
   llvm::raw_ostream &os = state.os;
-  if (failed(validateModule(mod)))
-    return;
 
   os << deviceHeader << "\n";
-  // Step 1: emit global variables
-  mod->walk([&](memref::GlobalOp op) { dispatch(op); });
+  // Step 1: emit top-level declarations other than functions.
+  for (Operation &op : mod.getBody()->without_terminator()) {
+    if (isa<func::FuncOp>(&op))
+      continue;
+    dispatch(&op);
+  }
 
   // Step 2: generate all function declarations
   for (auto func : mod.getOps<func::FuncOp>()) {

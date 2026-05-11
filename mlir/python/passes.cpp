@@ -5,6 +5,7 @@
 #include "nanobind/stl/string.h"
 #include "nanobind/stl/string_view.h"
 
+#include "allo/Conversion/Passes.h"
 #include "allo/Translation/VivadoHLSEmitter.h"
 #include "mlir/Conversion/ArithToLLVM/ArithToLLVM.h"
 #include "mlir/Conversion/Passes.h"
@@ -54,45 +55,7 @@ void bindPasses(nb::module_ &m) {
 
   m.def("lower_to_llvm", [](ModuleOp mod, bool enableTensor = false) {
     PassManager pm(mod->getContext());
-    pm.enableVerifier();
-    pm.addPass(createCanonicalizerPass());
-    pm.addPass(createCSEPass());
-
-    if (enableTensor) {
-      pm.addPass(createConvertTensorToLinalgPass());
-      bufferization::OneShotBufferizePassOptions options;
-      options.bufferizeFunctionBoundaries = true;
-      options.bufferAlignment = 64;
-      options.functionBoundaryTypeConversion =
-          bufferization::LayoutMapOption::IdentityLayoutMap;
-      options.allowReturnAllocsFromLoops = false;
-      pm.addPass(bufferization::createOneShotBufferizePass(options));
-      pm.addPass(bufferization::createDropEquivalentBufferResultsPass());
-
-      pm.addPass(createCanonicalizerPass());
-      pm.addPass(createCSEPass());
-      bufferization::buildBufferDeallocationPipeline(pm);
-      pm.addPass(createConvertBufferizationToMemRefPass());
-    }
-    auto &funcPM = pm.nest<func::FuncOp>();
-    funcPM.addPass(LLVM::createLLVMRequestCWrappersPass());
-    funcPM.addPass(createConvertLinalgToAffineLoopsPass());
-    funcPM.addPass(affine::createAffineScalarReplacementPass());
-    funcPM.addPass(createLoopInvariantCodeMotionPass());
-    pm.addPass(createLowerAffinePass());
-    pm.addPass(createSCFToControlFlowPass());
-    pm.addPass(createCanonicalizerPass());
-    pm.addPass(createCSEPass());
-
-    pm.addPass(memref::createExpandStridedMetadataPass());
-    pm.addPass(createConvertMathToLLVMPass());
-    pm.addPass(createConvertControlFlowToLLVMPass());
-    pm.addPass(createConvertFuncToLLVMPass());
-    pm.addPass(createFinalizeMemRefToLLVMConversionPass());
-    pm.addPass(createArithToLLVMConversionPass());
-    pm.addPass(createReconcileUnrealizedCastsPass());
-    pm.addPass(createCanonicalizerPass());
-    pm.addPass(createCSEPass());
+    populateLowerToLLVMPipeline(pm, enableTensor);
 
     if (failed(pm.run(mod)))
       throw std::runtime_error("Failed to run LLVM lowering pipeline");

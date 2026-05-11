@@ -1,6 +1,7 @@
 #ifndef ALLO_TRANSFORMS_PASSES_H
 #define ALLO_TRANSFORMS_PASSES_H
 
+#include "mlir/IR/BuiltinOps.h"
 #include "mlir/Pass/Pass.h"
 
 namespace mlir::allo {

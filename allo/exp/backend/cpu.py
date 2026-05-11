@@ -390,7 +390,7 @@ class CPU(Backend, Generic[P, R]):
             arg_types = self.kernel.parse_argument_annotations()
             res_types = self.kernel.parse_return_annotation()
 
-            top = module.lookup_func(self.kernel.func_name)
+            top = module.lookup_kernel(self.kernel.func_name)
             if top is None:
                 raise RuntimeError(
                     f"Cannot find top function '{self.kernel.func_name}'"

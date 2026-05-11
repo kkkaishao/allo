@@ -26,6 +26,8 @@
 #include "mlir/Target/LLVMIR/Transforms/Passes.h"
 #include "mlir/Transforms/Passes.h"
 
+#include "allo/Conversion/Passes.h"
+
 namespace mlir::allo {
 inline void registerAllPasses() {
   registerTransformsPasses();
@@ -44,6 +46,8 @@ inline void registerAllPasses() {
   registerLowerAffinePass();
   registerReconcileUnrealizedCastsPass();
   registerSCFToControlFlowPass();
+
+  allo::registerConvertAlloToFuncPass();
 
   // Dialect passes
   affine::registerAffinePasses();

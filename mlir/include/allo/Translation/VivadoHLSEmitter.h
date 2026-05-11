@@ -43,6 +43,10 @@ struct VivadoHLSEmitter {
   void emitMemrefGlobal(memref::GlobalOp op);
   void emitMemrefGetGlobal(memref::GetGlobalOp op);
 
+  void emitStreamCreate(allo::StreamCreateOp op);
+  void emitStreamGet(allo::StreamGetOp op);
+  void emitStreamPut(allo::StreamPutOp op);
+
   void emitFor(scf::ForOp op);
   void emitIf(scf::IfOp op);
   void emitWhile(scf::WhileOp op);
@@ -68,8 +72,13 @@ private:
   void emitFunctionDirectives(func::FuncOp func);
   void emitPartitionAttr(allo::PartitionAttr attr, Value value);
   void emitLoopDirectives(Operation *op);
+  void emitArraySuffix(ArrayRef<int64_t> shape, Location loc);
   void emitArraySuffix(ShapedType type, Location loc);
   void emitIndexedValue(Value value, ValueRange indices);
+  void emitStreamReference(Value stream, ValueRange indices);
+  void emitBlockCopy(ShapedType type, llvm::StringRef dst, llvm::StringRef src);
+  void emitBlockCopyLoops(ShapedType type, ArrayRef<std::string> indices,
+                          llvm::StringRef dst, llvm::StringRef src);
   void emitYieldAssignments(Operation *parent, OperandRange operands);
   void emitAffineMapReduction(AffineMap map, OperandRange operands,
                               llvm::StringLiteral functionName);
@@ -80,15 +89,17 @@ private:
                           bool isSigned);
   void emitUnaryOp(Operation *op, llvm::StringLiteral keyword);
   void emitCastOp(Operation *op);
-  LogicalResult validateModule(ModuleOp mod);
-  bool hasUnsupportedType(Type type);
   std::string getSymbolName(llvm::StringRef name);
+  std::string getTemporaryName(llvm::StringRef prefix);
   std::string getPrimitiveTypeName(Type type, bool isSigned = false);
+  std::string getBlockTypeName(ShapedType type, Location loc);
+  std::string getStreamTypeName(StreamType type, Location loc);
 
   void dispatch(Operation *op);
 
   llvm::StringMap<std::string> symbolNameTable;
   llvm::StringSet<> usedSymbolNames;
+  unsigned temporaryNameCounter = 0;
 };
 
 struct AffineExprEmitter : public mlir::AffineExprVisitor<AffineExprEmitter> {

@@ -48,11 +48,9 @@ AxiliteStorageImpl = Literal["auto", "bram", "uram"]
 DEFAULT_DEVICE = "u280"
 DEFAULT_FREQ_MHZ = 300.0
 DEFAULT_VITIS_SETTINGS = Path("/opt/xilinx/2025.2/Vitis/settings64.sh")
-HLS_PREPARE_PIPELINE = (
-    "builtin.module(func.func(convert-linalg-to-affine-loops),canonicalize,cse)"
-)
-VITIS_COMPILE_CACHE_VERSION = 1
-VITIS_CSIM_CACHE_VERSION = 1
+HLS_PREPARE_PIPELINE = """
+builtin.module(convert-allo-to-func,func.func(convert-linalg-to-affine-loops),canonicalize,cse)
+"""
 CSIM_CACHE_DIR_KEY_LENGTH = 24
 
 
@@ -688,7 +686,7 @@ class Vitis(Backend, Generic[P, R]):
         # because the codegen is typically much faster than sim/synth/impl
         with stage("Compiling Vitis HLS Kernels"):
             module = self._get_working_module()
-            top_fn = module.lookup_func(self.kernel.func_name)
+            top_fn = module.lookup_kernel(self.kernel.func_name)
             if top_fn is None:
                 raise RuntimeError(
                     f"Kernel function {self.kernel.func_name} not found in the module"

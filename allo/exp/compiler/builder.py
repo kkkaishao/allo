@@ -24,9 +24,11 @@ from ..lang.core import (
     bool as AlloBool,
     TensorType,
     BufferType,
+    StreamType,
     APFloat,
     ConstexprValue,
     TypeBase,
+    AlloSymbolRef,
 )
 from .._C import arith, tensor, linalg, math, memref, allo
 from ..lang.rule import get_type_rules
@@ -70,6 +72,7 @@ class AlloOpBuilder(ir.AlloOpBuilder):
         self.begin_line = 1
         self.curr_node = None
         self._global_initializer_counter = 0
+        self._global_stream_symbols: set[str] = set()
 
     def compile_error(self, message: str):
         raise CompilationError(
@@ -159,6 +162,35 @@ class AlloOpBuilder(ir.AlloOpBuilder):
         memref.GlobalOp(self, global_name, "private", memref_type, dense_attr, False)
         self.set_insertion_point_and_loc(ip, loc)
         return AlloValue(memref.GetGlobalOp(self, memref_type, global_name), dst_type)
+
+    #####################
+    # Stream Creation
+    #####################
+
+    def create_global_stream(self, name: str, stream_type: StreamType) -> AlloSymbolRef:
+        assert isinstance(stream_type, StreamType) and stream_type.is_global
+        if name in self._global_stream_symbols:
+            return self.compile_error(f"Global stream '{name}' is already defined")
+        assert self.module is not None
+        ip, loc = self.get_insertion_point_and_loc()
+        self.set_insertion_point_to_end(self.module.get_body())
+        allo.GlobalStreamCreateOp(self, name, stream_type.materialize(self.context))
+        self.set_insertion_point_and_loc(ip, loc)
+        self._global_stream_symbols.add(name)
+        return AlloSymbolRef(name, stream_type)
+
+    def create_stream(self, stream_type: StreamType) -> AlloValue:
+        assert isinstance(stream_type, StreamType) and not stream_type.is_global
+        return AlloValue(
+            allo.StreamCreateOp(self, stream_type.materialize(self.context)),
+            stream_type,
+        )
+
+    def get_global_stream_handle(self, symbol: AlloSymbolRef) -> Value:
+        assert isinstance(symbol.type, StreamType)
+        return allo.GlobalStreamGetOp(
+            self, symbol.type.materialize(self.context), symbol.name
+        ).get_result_at(0)
 
     #####################
     # Type Casting
@@ -317,6 +349,11 @@ class AlloOpBuilder(ir.AlloOpBuilder):
             assert False, f"Unsupported destination type: {dst_type}"
 
         assert isinstance(src, AlloValue)
+        if isinstance(dst_type, StreamType):
+            if src.type == dst_type:
+                return src
+            return self.compile_error(f"Cannot cast from {src.type} to {dst_type}")
+
         if isinstance(dst_type, DType):
             return self.cast_to_dtype(src, dst_type)
 
@@ -956,3 +993,29 @@ class AlloOpBuilder(ir.AlloOpBuilder):
             insert_op = tensor.InsertOp(self, value.handle, buffer.handle, index_values)
             return AlloValue(insert_op, buffer.type)
         assert False, f"Unsupported shaped type: {buffer.type}"
+
+    def _stream_handle_and_indices(
+        self, stream: AlloSymbolRef | AlloValue
+    ) -> tuple[Value, StreamType, tuple[AlloValue, ...]]:
+        assert isinstance(stream, (AlloSymbolRef, AlloValue))
+        assert isinstance(stream.type, StreamType)
+        assert stream.indices is not None
+        if isinstance(stream, AlloSymbolRef):
+            return self.get_global_stream_handle(stream), stream.type, stream.indices
+        assert not stream.type.is_global
+        return stream.handle, stream.type, stream.indices
+
+    def create_stream_get(self, stream: AlloSymbolRef | AlloValue) -> AlloValue:
+        handle, stream_type, indices = self._stream_handle_and_indices(stream)
+        index_values = [idx.handle for idx in indices]
+        get_op = allo.StreamGetOp(self, handle, index_values)
+        return AlloValue(get_op, stream_type.base_type)
+
+    def create_stream_put(
+        self, stream: AlloSymbolRef | AlloValue, value: AlloValue | ConstexprValue
+    ) -> None:
+        handle, stream_type, indices = self._stream_handle_and_indices(stream)
+        value = self.cast(value, stream_type.base_type)
+        index_values = [idx.handle for idx in indices]
+        allo.StreamPutOp(self, handle, index_values, value.handle)
+        return None

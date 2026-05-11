@@ -441,10 +441,10 @@ static void bindCoreIR(nb::module_ &m) {
            [](ModuleOp &self) {
              return OwningOpRef<ModuleOp>(cast<ModuleOp>(self.clone()));
            })
-      .def("lookup_func",
+      .def("lookup_kernel",
            [](ModuleOp &self,
-              std::string_view name) -> std::optional<func::FuncOp> {
-             auto sym = self.lookupSymbol<func::FuncOp>(name);
+              std::string_view name) -> std::optional<allo::KernelOp> {
+             auto sym = self.lookupSymbol<allo::KernelOp>(name);
              if (!sym)
                return std::nullopt;
              return sym;

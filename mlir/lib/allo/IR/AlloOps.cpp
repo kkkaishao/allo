@@ -3,10 +3,8 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-#include "mlir/IR/IntegerSet.h"
-
-#include "allo/IR/AlloAttrs.h"
 #include "allo/IR/AlloOps.h"
+#include "allo/IR/AlloAttrs.h"
 #include "allo/IR/AlloTypes.h"
 
 #include "allo/IR/AlloDialect.cpp.inc"
@@ -22,75 +20,231 @@
 #define GET_TYPEDEF_CLASSES
 #include "allo/IR/AlloTypes.cpp.inc"
 
+#include "mlir/Interfaces/FunctionImplementation.h"
+
 using namespace mlir;
 using namespace mlir::allo;
 
-static LogicalResult
-verifyNoDuplicateSymbols(ArrayAttr symbols, StringRef symbolKind,
-                         llvm::function_ref<InFlightDiagnostic()> emitError) {
-  llvm::SmallDenseSet<StringRef> seenSymbols;
-  for (auto sym : symbols) {
-    auto name = cast<StringAttr>(sym).getValue();
-    if (!seenSymbols.insert(name).second)
-      return emitError() << "duplicate " << symbolKind << " symbol '" << sym
-                         << "'";
+LogicalResult
+StreamType::verify(llvm::function_ref<InFlightDiagnostic()> emitError,
+                   Type baseType, std::size_t depth, ArrayRef<int64_t> shape) {
+  if (!baseType)
+    return emitError() << "expected stream base type";
+  if (depth == 0)
+    return emitError() << "stream depth must be positive";
+  for (int64_t dim : shape) {
+    if (dim < 0)
+      return emitError() << "stream shape dimensions must be non-negative";
   }
   return success();
 }
 
-static LogicalResult
-appendShapedTypes(ArrayAttr attrs, StringRef typeKind,
-                  SmallVectorImpl<ShapedType> &sigTypes,
-                  llvm::function_ref<InFlightDiagnostic()> emitError) {
-  for (auto attr : attrs.getAsRange<TypeAttr>()) {
-    Type ty = attr.getValue();
-    if (!isa<MemRefType, RankedTensorType>(ty))
-      return emitError() << typeKind
-                         << " type must be memref or tensor, but got " << ty;
-    sigTypes.push_back(cast<ShapedType>(ty));
+Type StreamType::parse(AsmParser &parser) {
+  if (parser.parseLess())
+    return {};
+
+  Type baseType;
+  uint64_t depth = 0;
+  SmallVector<int64_t> shape;
+  if (parser.parseType(baseType) || parser.parseComma() ||
+      parser.parseInteger(depth) || parser.parseComma() ||
+      parser.parseLSquare())
+    return {};
+
+  if (failed(parser.parseOptionalRSquare())) {
+    do {
+      int64_t dim = 0;
+      if (parser.parseInteger(dim))
+        return {};
+      shape.push_back(dim);
+    } while (succeeded(parser.parseOptionalComma()));
+    if (parser.parseRSquare())
+      return {};
+  }
+
+  if (parser.parseGreater())
+    return {};
+  return parser.getChecked<StreamType>(
+      parser.getCurrentLocation(), parser.getContext(), baseType, depth, shape);
+}
+
+void StreamType::print(AsmPrinter &printer) const {
+  printer << "<" << getBaseType() << "," << getDepth() << ",[";
+  for (auto [idx, dim] : llvm::enumerate(getShape())) {
+    if (idx != 0)
+      printer << ",";
+    printer << dim;
+  }
+  printer << "]>";
+}
+
+void KernelOp::print(OpAsmPrinter &p) {
+  p << ' ';
+  auto op = llvm::cast<FunctionOpInterface>(getOperation());
+  StringRef visibilityAttrName = SymbolTable::getVisibilityAttrName();
+  if (auto visibilty = op->getAttrOfType<StringAttr>(visibilityAttrName)) {
+    p << visibilty.getValue() << ' ';
+  }
+  auto kName = getSymNameAttr().getValue();
+  p.printSymbolName(kName);
+  function_interface_impl::printFunctionSignature(p, op, getArgumentTypes(),
+                                                  false, getResultTypes());
+  p << " mapping=";
+  p.printStrippedAttrOrType(getMappingAttr());
+  function_interface_impl::printFunctionAttributes(
+      p, op,
+      {
+          SymbolTable::getVisibilityAttrName(),
+          getFunctionTypeAttrName(),
+          getArgAttrsAttrName(),
+          getMappingAttrName(),
+
+      });
+  Region &body = getRegion();
+  if (!body.empty()) {
+    p << ' ';
+    p.printRegion(body, /*printEntryBlockArgs=*/false,
+                  /*printBlockTerminators=*/true);
+  }
+}
+
+ParseResult KernelOp::parse(OpAsmParser &p, OperationState &result) {
+  SmallVector<OpAsmParser::Argument> entryArgs;
+  SmallVector<DictionaryAttr> resAttrs;
+  SmallVector<Type> resTypes;
+  auto &builder = p.getBuilder();
+
+  // Parse visibilty
+  (void)impl::parseOptionalVisibilityKeyword(p, result.attributes);
+
+  // Parse the name as a symbol
+  StringAttr nameAttr;
+  if (p.parseSymbolName(nameAttr, SymbolTable::getSymbolAttrName(),
+                        result.attributes))
+    return failure();
+
+  // Parse the function signature
+  SMLoc signatureLocation = p.getCurrentLocation();
+  bool isVariadic = false;
+  if (function_interface_impl::parseFunctionSignatureWithArguments(
+          p, false, entryArgs, isVariadic, resTypes, resAttrs))
+    return failure();
+  SmallVector<Type> argTypes;
+  for (auto &arg : entryArgs)
+    argTypes.push_back(arg.type);
+  FunctionType type = builder.getFunctionType(argTypes, resTypes);
+  result.addAttribute(getFunctionTypeAttrName(result.name),
+                      TypeAttr::get(type));
+
+  // Parse the mapping attribute here
+  if (p.parseKeyword("mapping") || p.parseEqual())
+    return failure();
+  DenseI32ArrayAttr mapping;
+  if (p.parseCustomAttributeWithFallback(mapping, Type()))
+    return failure();
+  result.addAttribute(getMappingAttrName(result.name), mapping);
+
+  // If function attributes are present, parse them.
+  NamedAttrList parsedAttributes;
+  SMLoc attributeDictLocation = p.getCurrentLocation();
+  if (p.parseOptionalAttrDictWithKeyword(parsedAttributes))
+    return failure();
+
+  result.attributes.append(parsedAttributes);
+
+  // Add the attributes to the function arguments.
+  assert(resAttrs.size() == resTypes.size());
+  call_interface_impl::addArgAndResultAttrs(
+      builder, result, entryArgs, resAttrs, getArgAttrsAttrName(result.name),
+      getResAttrsAttrName(result.name));
+
+  // Parse the optional function body. The printer will not print the body if
+  // its empty, so disallow parsing of empty body in the parser.
+  auto *body = result.addRegion();
+  SMLoc loc = p.getCurrentLocation();
+  OptionalParseResult parseResult =
+      p.parseOptionalRegion(*body, entryArgs,
+                            /*enableNameShadowing=*/false);
+  if (parseResult.has_value()) {
+    if (failed(*parseResult))
+      return failure();
+    // Function body was parsed, make sure its not empty.
+    if (body->empty())
+      return p.emitError(loc, "expected non-empty function body");
   }
   return success();
 }
 
-static LogicalResult verifySemanticsArgAgainstSig(
-    Type argTy, ShapedType sig,
-    llvm::function_ref<InFlightDiagnostic()> emitError) {
-  auto shapedArg = dyn_cast<ShapedType>(argTy);
-  if (!shapedArg)
-    return emitError() << "semantics block arguments must be of shaped type";
-  if (shapedArg.getRank() != sig.getRank()) {
-    return emitError() << "semantics block argument has rank "
-                       << shapedArg.getRank()
-                       << ", but corresponding operand/result has rank "
-                       << sig.getRank();
-  }
-  if (shapedArg.getElementType() != sig.getElementType()) {
-    return emitError() << "semantics block argument has element type "
-                       << shapedArg.getElementType()
-                       << ", but corresponding operand/result has element type "
-                       << sig.getElementType();
-  }
+void KernelOp::build(OpBuilder &builder, OperationState &state, StringRef name,
+                     FunctionType type, ArrayRef<int32_t> mapping,
+                     ArrayRef<NamedAttribute> attrs,
+                     ArrayRef<DictionaryAttr> argAttrs) {
+  state.addAttribute(SymbolTable::getSymbolAttrName(),
+                     builder.getStringAttr(name));
+  state.addAttribute(getFunctionTypeAttrName(state.name), TypeAttr::get(type));
+  state.addAttribute(getMappingAttrName(state.name),
+                     builder.getDenseI32ArrayAttr(mapping));
+  state.attributes.append(attrs);
+  state.addRegion();
+
+  if (argAttrs.empty())
+    return;
+  assert(type.getNumInputs() == argAttrs.size());
+  call_interface_impl::addArgAndResultAttrs(
+      builder, state, argAttrs, /*resultAttrs=*/{},
+      getArgAttrsAttrName(state.name), getResAttrsAttrName(state.name));
+}
+
+LogicalResult ReturnOp::verify() {
+  auto kernel = cast<KernelOp>(this->getParentOp());
+  auto results = kernel.getFunctionType().getResults();
+  if (results.size() != getNumOperands())
+    return emitOpError("has ")
+           << getNumOperands() << " operands, but enclosing function (@"
+           << kernel.getName() << ") returns " << results.size();
+
+  for (unsigned i = 0, e = results.size(); i != e; ++i)
+    if (getOperand(i).getType() != results[i])
+      return emitError() << "type of return operand " << i << " ("
+                         << getOperand(i).getType()
+                         << ") doesn't match function result type ("
+                         << results[i] << ")"
+                         << " in kernel @" << kernel.getSymName();
   return success();
 }
 
-static LogicalResult verifyYieldTypeAgainstResult(
-    Type yieldTy, Type resultTy,
-    llvm::function_ref<InFlightDiagnostic()> emitError) {
-  auto shapedYield = dyn_cast<ShapedType>(yieldTy);
-  auto shapedResult = cast<ShapedType>(resultTy);
-  if (!shapedYield)
-    return emitError() << "yield operands must be of shaped type";
-  if (shapedYield.getRank() != shapedResult.getRank()) {
-    return emitError() << "yield operand has rank " << shapedYield.getRank()
-                       << ", but corresponding result has rank "
-                       << shapedResult.getRank();
-  }
-  if (shapedYield.getElementType() != shapedResult.getElementType()) {
-    return emitError() << "yield operand has element type "
-                       << shapedYield.getElementType()
-                       << ", but corresponding result has element type "
-                       << shapedResult.getElementType();
-  }
+LogicalResult InvokeOp::verifySymbolUses(SymbolTableCollection &symbolTable) {
+  // Check that the callee attribute was specified.
+  auto fnAttr = (*this)->getAttrOfType<FlatSymbolRefAttr>("callee");
+  if (!fnAttr)
+    return emitOpError("requires a 'callee' symbol reference attribute");
+  KernelOp fn = symbolTable.lookupNearestSymbolFrom<KernelOp>(*this, fnAttr);
+  if (!fn)
+    return emitOpError() << "'" << fnAttr.getValue()
+                         << "' does not reference a valid kernel";
+
+  // Verify that the operand and result types match the callee.
+  auto fnType = fn.getFunctionType();
+  if (fnType.getNumInputs() != getNumOperands())
+    return emitOpError("incorrect number of operands for callee");
+
+  for (unsigned i = 0, e = fnType.getNumInputs(); i != e; ++i)
+    if (getOperand(i).getType() != fnType.getInput(i))
+      return emitOpError("operand type mismatch: expected operand type ")
+             << fnType.getInput(i) << ", but provided "
+             << getOperand(i).getType() << " for operand number " << i;
+
+  if (fnType.getNumResults() != getNumResults())
+    return emitOpError("incorrect number of results for callee");
+
+  for (unsigned i = 0, e = fnType.getNumResults(); i != e; ++i)
+    if (getResult(i).getType() != fnType.getResult(i)) {
+      auto diag = emitOpError("result type mismatch at index ") << i;
+      diag.attachNote() << "    op result types: " << getResultTypes();
+      diag.attachNote() << "kernel result types: " << fnType.getResults();
+      return diag;
+    }
+
   return success();
 }
 
@@ -98,17 +252,14 @@ void AlloDialect::initialize() {
   addAttributes<
 #define GET_ATTRDEF_LIST
 #include "allo/IR/AlloAttrs.cpp.inc"
-
       >();
   addTypes<
 #define GET_TYPEDEF_LIST
 #include "allo/IR/AlloTypes.cpp.inc"
-
       >();
   addOperations<
 #define GET_OP_LIST
 #include "allo/IR/AlloOps.cpp.inc"
-
       >();
 }
 
@@ -143,7 +294,7 @@ PartitionAttr::verify(llvm::function_ref<InFlightDiagnostic()> emitError,
 }
 
 LogicalResult StreamGetOp::verify() {
-  auto streamTy = getStream().getType();
+  auto streamTy = cast<StreamType>(getStream().getType());
   auto valueTy = getValue().getType();
   if (streamTy.getBaseType() != valueTy) {
     return emitOpError() << "stream type " << streamTy
@@ -160,7 +311,7 @@ LogicalResult StreamGetOp::verify() {
 }
 
 LogicalResult StreamPutOp::verify() {
-  auto streamTy = getStream().getType();
+  auto streamTy = cast<StreamType>(getStream().getType());
   auto valueTy = getValue().getType();
   if (streamTy.getBaseType() != valueTy) {
     return emitOpError() << "stream type " << streamTy
@@ -184,204 +335,11 @@ GlobalStreamGetOp::verifySymbolUses(SymbolTableCollection &symbolTable) {
     return emitOpError() << "referenced global stream '" << getStream()
                          << "' does not exist";
   }
-  auto streamTy = globalStream.getStream().getType();
-  auto valueTy = getValue().getType();
-  if (streamTy.getBaseType() != valueTy) {
-    return emitOpError() << "stream type " << streamTy
-                         << " does not match value type " << valueTy;
+  auto streamTy = globalStream.getStreamType();
+  auto handleTy = cast<StreamType>(getHandle().getType());
+  if (streamTy != handleTy) {
+    return emitOpError() << "result type " << handleTy
+                         << " does not match global stream type " << streamTy;
   }
-  auto srcRank = streamTy.getShape().size();
-  auto dstRank = getIndices().size();
-  if (srcRank != dstRank) {
-    return emitOpError() << "rank of stream (" << srcRank
-                         << ") does not match number of indices (" << dstRank
-                         << ")";
-  }
-  return success();
-}
-
-LogicalResult
-GlobalStreamPutOp::verifySymbolUses(SymbolTableCollection &symbolTable) {
-  auto globalStream = symbolTable.lookupNearestSymbolFrom<GlobalStreamCreateOp>(
-      *this, getStreamAttr());
-  if (!globalStream) {
-    return emitOpError() << "referenced global stream '" << getStream()
-                         << "' does not exist";
-  }
-  auto streamTy = globalStream.getStream().getType();
-  auto valueTy = getValue().getType();
-  if (streamTy.getBaseType() != valueTy) {
-    return emitOpError() << "stream type " << streamTy
-                         << " does not match value type " << valueTy;
-  }
-  auto dstRank = streamTy.getShape().size();
-  auto srcRank = getIndices().size();
-  if (srcRank != dstRank) {
-    return emitOpError() << "rank of stream (" << dstRank
-                         << ") does not match number of indices (" << srcRank
-                         << ")";
-  }
-  return success();
-}
-
-LogicalResult InstructionDefineOp::verify() {
-  // Cond 1: no duplicate symbol names
-  if (failed(verifyNoDuplicateSymbols(getIndexSymbols(), "index",
-                                      [this] { return emitError(); })))
-    return failure();
-  if (failed(verifyNoDuplicateSymbols(getDomainSymbols(), "domain",
-                                      [this] { return emitError(); })))
-    return failure();
-
-  // Cond 2: input/output types must be memref/tensor
-  SmallVector<ShapedType, 4> sigTypes;
-  if (failed(appendShapedTypes(getSourceTypes(), "source", sigTypes,
-                               [this] { return emitError(); })))
-    return failure();
-  if (failed(appendShapedTypes(getDestinationTypes(), "target", sigTypes,
-                               [this] { return emitError(); })))
-    return failure();
-  // Cond 3: dim count of indexing maps must match operand/result rank
-  unsigned nMapSyms = getIndexSymbols().size();
-  if (getIndexMaps().size() != sigTypes.size()) {
-    return emitError()
-           << "number of indexing maps (" << getIndexMaps().size()
-           << ") does not match total number of operands and results ("
-           << sigTypes.size() << ")";
-  }
-  for (auto [mapAttr, sig] : llvm::zip(getIndexMaps(), sigTypes)) {
-    auto map = cast<AffineMapAttr>(mapAttr).getValue();
-    if (map.getNumDims() != sig.getRank()) {
-      return emitError()
-             << "indexing map has " << map.getNumDims()
-             << " dimensions, but corresponding operand/result has rank "
-             << sig.getRank();
-    }
-    if (map.getNumSymbols() != nMapSyms) {
-      return emitError() << "indexing map has " << map.getNumSymbols()
-                         << " symbols, but instruction defines " << nMapSyms
-                         << " index symbols";
-    }
-  }
-  // Cond 4: dim count of indexing sets must match operand/result rank
-  unsigned nSetSyms = getDomainSymbols().size();
-  if (getIndexSets().size() != sigTypes.size()) {
-    return emitError()
-           << "number of indexing sets (" << getIndexSets().size()
-           << ") does not match total number of operands and results ("
-           << sigTypes.size() << ")";
-  }
-  for (auto [setAttr, sig] : llvm::zip(getIndexSets(), sigTypes)) {
-    auto set = cast<IntegerSetAttr>(setAttr).getValue();
-    if (set.getNumDims() != sig.getRank()) {
-      return emitError()
-             << "indexing set has " << set.getNumDims()
-             << " elements, but corresponding operand/result has rank "
-             << sig.getRank();
-    }
-    if (set.getNumSymbols() != nSetSyms) {
-      return emitError() << "indexing set has " << set.getNumSymbols()
-                         << " symbols, but instruction defines " << nSetSyms
-                         << " domain symbols";
-    }
-  }
-  // Cond 5: semantics block must end with InstructionYieldOp
-  Block &sem = getRegion().front();
-  if (sem.empty() || !isa<InstructionYieldOp>(sem.back())) {
-    return emitError() << "semantics block must end with InstructionYieldOp";
-  }
-  // Cond 6: semantics block args must match operand types
-  auto semArgs = sem.getArguments();
-  if (semArgs.size() != sigTypes.size()) {
-    return emitError() << "number of semantics block arguments ("
-                       << semArgs.size()
-                       << ") does not match number of operands in signature ("
-                       << sigTypes.size() << ")";
-  }
-  for (auto [arg, sig] : llvm::zip(semArgs, sigTypes)) {
-    // We only require rank and element type to match because semantics describe
-    // computation relation among operands/results.
-    if (failed(verifySemanticsArgAgainstSig(arg.getType(), sig,
-                                            [this] { return emitError(); })))
-      return failure();
-  }
-  // Cond 7: yield types must match instruction results
-  auto yieldOp = cast<InstructionYieldOp>(sem.back());
-  auto yieldTypes = yieldOp.getOperandTypes();
-  auto resultTypes = getDestinationTypes();
-  if (yieldTypes.size() != resultTypes.size()) {
-    return emitError() << "number of yield operands (" << yieldTypes.size()
-                       << ") does not match number of results in signature ("
-                       << resultTypes.size() << ")";
-  }
-  for (auto [yieldTy, resultTy] : llvm::zip(yieldTypes, resultTypes)) {
-    if (failed(verifyYieldTypeAgainstResult(yieldTy,
-                                            cast<TypeAttr>(resultTy).getValue(),
-                                            [this] { return emitError(); })))
-      return failure();
-  }
-  return success();
-}
-
-LogicalResult
-InstructionEmitOp::verifySymbolUses(SymbolTableCollection &symbolTable) {
-  // Cond 1: referenced instruction must exist
-  auto defineOp = symbolTable.lookupNearestSymbolFrom<InstructionDefineOp>(
-      *this, getInstructionAttr());
-  if (!defineOp)
-    return emitError() << "referenced instruction '" << getInstruction()
-                       << "' does not exist";
-
-  // Cond 2: source types must match instruction signature
-  auto definedTypes =
-      llvm::to_vector<4>(defineOp.getSourceTypes().getAsRange<TypeAttr>());
-  llvm::append_range(definedTypes,
-                     defineOp.getDestinationTypes().getAsRange<TypeAttr>());
-  auto actualTypes = getOperandTypes();
-  if (actualTypes.size() != definedTypes.size()) {
-    return emitError()
-           << "number of operands (" << actualTypes.size()
-           << ") does not match total number of operands and results in "
-              "instruction signature ("
-           << definedTypes.size() << ")";
-  }
-  for (auto [actual, defined] : llvm::zip(actualTypes, definedTypes)) {
-    if (actual != cast<TypeAttr>(defined).getValue()) {
-      return emitError() << "operand type " << actual
-                         << " does not match expected type " << defined
-                         << " in instruction signature";
-    }
-  }
-
-  // Cond 3: every symbol value must have a corresponding symbol in the
-  // instruction definition
-  llvm::SmallDenseSet<StringAttr> syms;
-  for (auto sym : defineOp.getIndexSymbols())
-    syms.insert(cast<StringAttr>(sym));
-  for (auto sym : defineOp.getDomainSymbols())
-    syms.insert(cast<StringAttr>(sym));
-  for (auto sym : getSymbolValues()) {
-    auto name = sym.getName();
-    if (!syms.contains(name)) {
-      return emitError() << "symbol '" << name
-                         << "' is not defined in the "
-                            "referenced instruction definition";
-    }
-    if (!isa<IntegerAttr>(sym.getValue()))
-      return emitError() << "symbol value must be an integer attribute";
-  }
-  return success();
-}
-
-LogicalResult InstructionEmitOp::inferReturnTypes(
-    MLIRContext *, std::optional<Location>, ValueRange operands,
-    DictionaryAttr attributes, OpaqueProperties properties, RegionRange regions,
-    SmallVectorImpl<Type> &inferredReturnTypes) {
-  Adaptor adaptor(operands, attributes, properties, regions);
-  auto resTypes = adaptor.getDestinations().getTypes();
-  // memref is not of value semantics
-  auto tensorRange = llvm::make_filter_range(
-      resTypes, [](Type ty) { return isa<RankedTensorType>(ty); });
-  llvm::append_range(inferredReturnTypes, tensorRange);
   return success();
 }

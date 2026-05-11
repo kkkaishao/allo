@@ -64,9 +64,7 @@ void bindFuncOps(nb::module_ &m) {
           },
           nb::arg("arg_no"), nb::arg("name"), nb::arg("attr"))
       .def("get_func_type", &func::FuncOp::getFunctionType)
-      .def("set_type", &func::FuncOp::setType, nb::arg("type"))
-      .def("get_func_name",
-           [](func::FuncOp &self) { return self.getName().str(); });
+      .def("set_type", &func::FuncOp::setType, nb::arg("type"));
 
   nb::class_<func::ReturnOp, OpState>(m, "ReturnOp")
       .def(
@@ -1501,6 +1499,73 @@ void bindUBOps(nb::module_ &m) {
 }
 
 void bindAlloOps(nb::module_ &m) {
+  nb::class_<allo::KernelOp, OpState>(m, "KernelOp")
+      .def(
+          "__init__",
+          [](allo::KernelOp &self, AlloOpBuilder &builder,
+             const std::string &name, FunctionType type,
+             std::string_view visibility = "private",
+             const std::vector<int32_t> &mapping = {}) {
+            self = allo::KernelOp::create(
+                builder, builder.getLocation(), name, type,
+                builder.getStringAttr(visibility), {}, {}, mapping);
+          },
+          nb::arg("builder"), nb::arg("name"), nb::arg("type"),
+          nb::arg("visibility") = "private",
+          nb::arg("mapping") = std::vector<int32_t>{})
+      .def(
+          "get_arg_at",
+          [](allo::KernelOp &self, unsigned idx) -> BlockArgument {
+            if (idx >= self.getNumArguments())
+              throw nb::index_error("Function argument index out of range");
+            return self.getArgument(idx);
+          },
+          nb::arg("idx"))
+      .def("get_args",
+           [](allo::KernelOp &self) {
+             std::vector<BlockArgument> args;
+             for (auto arg : self.getArguments())
+               args.push_back(arg);
+             return args;
+           })
+      .def("get_num_args", &allo::KernelOp::getNumArguments)
+      .def(
+          "add_entry_block",
+          [](allo::KernelOp &self) -> Block * { return self.addEntryBlock(); },
+          nb::rv_policy::reference)
+      .def(
+          "set_arg_attr",
+          [](allo::KernelOp &self, unsigned argNo, std::string_view name,
+             Attribute &attr) {
+            if (argNo >= self.getNumArguments())
+              throw nb::index_error("Function argument index out of range");
+            // set arg attributes "name" to Value &"val"
+            self.setArgAttr(argNo, name, attr);
+          },
+          nb::arg("arg_no"), nb::arg("name"), nb::arg("attr"))
+      .def("get_func_type", &allo::KernelOp::getFunctionType)
+      .def("set_type", &allo::KernelOp::setType, nb::arg("type"));
+
+  nb::class_<allo::ReturnOp, OpState>(m, "ReturnOp")
+      .def(
+          "__init__",
+          [](allo::ReturnOp &self, AlloOpBuilder &builder,
+             const std::vector<Value> &operands) {
+            self = allo::ReturnOp::create(builder, builder.getLocation(),
+                                          operands);
+          },
+          nb::arg("builder"), nb::arg("operands"));
+
+  nb::class_<allo::InvokeOp, OpState>(m, "InvokeOp")
+      .def(
+          "__init__",
+          [](allo::InvokeOp &self, AlloOpBuilder &builder, allo::KernelOp &func,
+             const std::vector<Value> &args) {
+            self = allo::InvokeOp::create(builder, builder.getLocation(), func,
+                                          args);
+          },
+          nb::arg("builder"), nb::arg("kernel"), nb::arg("args"));
+
   nb::class_<allo::StreamType, Type>(m, "StreamType")
       .def_static(
           "get",
@@ -1548,32 +1613,18 @@ void bindAlloOps(nb::module_ &m) {
             self = allo::StreamPutOp::create(builder, builder.getLocation(),
                                              stream, indices, value);
           },
-          nb::arg("builder"), nb::arg("name"), nb::arg("indices"),
+          nb::arg("builder"), nb::arg("stream"), nb::arg("indices"),
           nb::arg("value"));
 
   nb::class_<allo::GlobalStreamGetOp, OpState>(m, "GlobalStreamGetOp")
       .def(
           "__init__",
           [](allo::GlobalStreamGetOp &self, AlloOpBuilder &builder,
-             Type &resType, std::string_view name,
-             const std::vector<Value> &indices) {
+             allo::StreamType &streamType, std::string_view name) {
             self = allo::GlobalStreamGetOp::create(
-                builder, builder.getLocation(), resType, name, indices);
+                builder, builder.getLocation(), streamType, name);
           },
-          nb::arg("builder"), nb::arg("res_type"), nb::arg("name"),
-          nb::arg("indices"));
-
-  nb::class_<allo::GlobalStreamPutOp, OpState>(m, "GlobalStreamPutOp")
-      .def(
-          "__init__",
-          [](allo::GlobalStreamPutOp &self, AlloOpBuilder &builder,
-             std::string_view name, const std::vector<Value> &indices,
-             Value &value) {
-            self = allo::GlobalStreamPutOp::create(
-                builder, builder.getLocation(), name, indices, value);
-          },
-          nb::arg("builder"), nb::arg("name"), nb::arg("indices"),
-          nb::arg("value"));
+          nb::arg("builder"), nb::arg("stream_type"), nb::arg("name"));
 
   nb::class_<allo::StreamCreateOp, OpState>(m, "StreamCreateOp")
       .def(
@@ -1591,7 +1642,7 @@ void bindAlloOps(nb::module_ &m) {
           [](allo::GlobalStreamCreateOp &self, AlloOpBuilder &builder,
              std::string_view name, allo::StreamType &streamType) {
             self = allo::GlobalStreamCreateOp::create(
-                builder, builder.getLocation(), streamType, name);
+                builder, builder.getLocation(), name, streamType);
           },
           nb::arg("builder"), nb::arg("name"), nb::arg("stream_type"));
 }

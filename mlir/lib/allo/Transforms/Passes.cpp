@@ -3,4 +3,4 @@
 using namespace mlir;
 using namespace mlir::allo;
 
-void allo::registerAlloTransforms() {}
+void allo::registerAlloTransforms() { registerLocalizeGlobalStreamPass(); }

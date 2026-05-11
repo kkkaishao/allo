@@ -58,13 +58,10 @@ class CommandError(RuntimeError):
         return message
 
 
-def error_reason(error: Exception) -> str:
-    reason = str(error)
-    return reason if reason else error.__class__.__name__
-
-
 def terminate(error: Exception, *, exit_code: int = 1) -> NoReturn:
-    console.print(f"[red]Error[/] {escape(error_reason(error))}")
+    reason = str(error)
+    reason = reason if reason else error.__class__.__name__
+    console.print(f"[red]Error[/] {escape(reason)}")
     raise SystemExit(exit_code) from None
 
 
@@ -97,6 +94,12 @@ def log_warning(message: str) -> None:
     text = message.rstrip()
     if text:
         console.print(f"[yellow]Warning[/] {escape(text)}")
+
+
+def log_fatal(message: str) -> None:
+    text = message.strip()
+    console.print(f"[red]Fatal[/] {escape(text)}")
+    raise SystemExit(1) from None
 
 
 def log_table(

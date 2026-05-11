@@ -31,9 +31,8 @@ def Stream : Allo_Type<"Stream"> {
     AnyType:$baseType,
     "std::size_t":$depth,
     ArrayRefParameter<"int64_t">:$shape);
-  let assemblyFormat = [{
-    `<` $baseType `,` `depth``` `=``` $depth `,` `shape` ```=``` `[` $shape `]` `>`
-  }];
+  let hasCustomAssemblyFormat = 1;
+  let genVerifyDecl = 1;
 }
 
 #endif // ALLO_TYPES

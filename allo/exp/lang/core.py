@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import builtins
 from collections.abc import Sequence
 
 
@@ -22,6 +23,7 @@ from .._C.ir import (
     AffineMap,
     OpState,
 )
+from .._C import allo
 
 # ==========================================================================#
 # Frontend type system
@@ -325,6 +327,80 @@ class BufferType(ShapedType):
         return MemRefType.get(self.shape, mlir_dtype, identity_maps)
 
 
+DEFAULT_STREAM_DEPTH = 2
+
+
+class StreamType(TypeBase):
+    """
+    Represents an Allo stream type.
+
+    `base_type` is the transmission unit. It can be either a scalar dtype or a
+    shaped buffer type. `shape` describes an array of streams; the empty shape is
+    a single rank-0 stream.
+    """
+
+    def __init__(
+        self,
+        base_type: DType | ShapedType,
+        depth: int = DEFAULT_STREAM_DEPTH,
+        shape: Sequence[int] = (),
+        *,
+        is_global: builtins.bool = False,
+    ):
+        assert isinstance(base_type, (DType, ShapedType))
+        assert isinstance(depth, int) and depth > 0
+        shape = tuple(shape)
+        assert all(isinstance(dim, int) and dim >= 0 for dim in shape)
+        prefix = "GStream" if is_global else "Stream"
+        shape_suffix = "[" + ",".join(str(dim) for dim in shape) + "]" if shape else ""
+        super().__init__(f"{prefix}[{base_type}]{shape_suffix}")
+        self.base_type = base_type
+        self.depth = depth
+        self.shape = shape
+        self.rank = len(shape)
+        self.is_global = is_global
+
+    def __getitem__(self, key):
+        if self.shape:
+            raise TypeError(f"Stream type '{self}' already has a shape")
+        if not isinstance(key, tuple):
+            key = (key,)
+        if len(key) == 0:
+            prefix = "GStream" if self.is_global else "Stream"
+            raise TypeError(f"{prefix}[Ty][] is invalid; use {prefix}[Ty] instead")
+        if not all(type(dim) is int and dim >= 0 for dim in key):
+            raise TypeError("Stream shape dimensions must be non-negative integers")
+        return StreamType(self.base_type, self.depth, key, is_global=self.is_global)
+
+    def materialize(self, context: Context, /) -> allo.StreamType:
+        return allo.StreamType.get(
+            context,
+            self.base_type.materialize(context),
+            self.depth,
+            self.shape,
+        )
+
+
+class _StreamFactory:
+    def __init__(self, prefix: str, *, is_global: builtins.bool):
+        self.prefix = prefix
+        self.is_global = is_global
+
+    def __getitem__(self, base_type):
+        if not isinstance(base_type, (DType, ShapedType)):
+            raise TypeError(f"{self.prefix} base type must be a scalar or buffer type")
+        return StreamType(base_type, DEFAULT_STREAM_DEPTH, (), is_global=self.is_global)
+
+    def __repr__(self) -> str:
+        return self.prefix
+
+    __str__ = __repr__
+
+
+Stream = _StreamFactory("Stream", is_global=False)
+GStream = _StreamFactory("GStream", is_global=True)
+
+
 # =========================================================================#
 # Frontend value system
 # =========================================================================#
@@ -378,7 +454,7 @@ class AlloValue(ValueBase):
     An Allo value should always have a corresponding MLIR value handle, as it represents a value that will be materialized into MLIR.
     """
 
-    def __init__(self, handle: Value, type: ShapedType | DType):
+    def __init__(self, handle: Value, type: TypeBase):
         assert handle is not None, "handle cannot be None for AlloValue"
         if isinstance(handle, OpState):
             assert handle.get_num_results() == 1
@@ -390,10 +466,11 @@ class AlloValue(ValueBase):
         # wrap the shape to frontend values
         self.shape = (
             [ConstexprValue(s) for s in type.shape]
-            if isinstance(type, ShapedType)
+            if isinstance(type, (ShapedType, StreamType))
             else ()
         )
         self.rank = len(self.shape)
+        self.indices: tuple[AlloValue, ...] | None = None
 
     def __str__(self) -> str:
         return f"AlloValue<{self.type}>"
@@ -404,6 +481,44 @@ class AlloValue(ValueBase):
     @property
     def handle(self) -> Value:
         return self._handle
+
+    @property
+    def is_indexed(self) -> builtins.bool:
+        return self.indices is not None
+
+
+class AlloSymbolRef(ValueBase):
+    """Frontend proxy for a global stream symbol, optionally with stream indices."""
+
+    def __init__(
+        self,
+        name: str,
+        type: StreamType,
+        indices: Sequence[AlloValue] | None = None,
+    ):
+        assert isinstance(name, str) and name
+        assert isinstance(type, StreamType)
+        assert type.is_global
+        assert indices is None or all(isinstance(idx, AlloValue) for idx in indices)
+        self.name = name
+        self.type = type
+        self.indices = None if indices is None else tuple(indices)
+        self.shape = [ConstexprValue(s) for s in type.shape]
+        self.rank = type.rank
+
+    @property
+    def is_indexed(self) -> builtins.bool:
+        return self.indices is not None
+
+    def __str__(self) -> str:
+        return f"AlloSymbolRef<{self.type}>(@{self.name})"
+
+    def __repr__(self) -> str:
+        return self.__str__()
+
+    @property
+    def handle(self):
+        return None
 
 
 # map from PyTorch dtype string to Allo DType, for easier interop with PyTorch/NumPy
