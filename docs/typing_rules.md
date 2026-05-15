@@ -48,6 +48,10 @@ The rules below describe element types. For shaped values, the same element
 promotion is used inside elementwise or linalg operations; shape compatibility is
 checked separately by the operator.
 
+`Stream` and `GStream` are not numeric types and do not participate in
+promotion. A stream's payload type is checked at `put(value)`: the value is cast
+to the stream `base_type`, and `get()` returns that exact payload type.
+
 ## Common Helpers
 
 Several rules reuse a common integer type selector.

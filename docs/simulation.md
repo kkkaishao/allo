@@ -10,7 +10,8 @@ keywords: ["Allo", "Simulation", "CPU", "Vitis", "JIT", "CSim"]
 
 This document describes the simulation interface in the new Allo frontend. The
 implementation is currently staged under `allo.exp`; the examples below use the
-current experimental imports.
+current experimental imports and `from __future__ import annotations` for
+unquoted shaped type annotations.
 
 Simulation is designed to behave like ordinary Python execution. A kernel is a
 callable Python object, and calling it runs the active simulation backend. This
@@ -24,6 +25,8 @@ An Allo kernel can be called directly. Without an active backend context, direct
 calls use the CPU backend.
 
 ```python
+from __future__ import annotations
+
 import numpy as np
 
 from allo.exp.lang import f32, kernel
@@ -32,7 +35,7 @@ N = 64
 
 
 @kernel
-def vec_add(A: "f32[N]", B: "f32[N]", C: "f32[N]"):
+def vec_add(A: f32[N], B: f32[N], C: f32[N]):
     for i in range(N):
         C[i] = A[i] + B[i]
 
@@ -129,6 +132,13 @@ In-place output buffers are the recommended style for kernels intended to move
 between CPU simulation and Vitis simulation. Scalar returns are supported by the
 simulation interface. For Vitis top kernels, shaped return values are currently
 rejected; pass shaped outputs as explicit buffer arguments instead.
+
+Stream values are intended for hardware-style communication inside kernels and
+between nested kernels. Local `Stream` declarations lower to HLS streams in the
+Vitis path, including block streams for shaped payloads. Stream-typed top-level
+Python call arguments are not part of the current CPU or Python-native Vitis
+CSim calling convention; use local streams inside the kernel and explicit NumPy
+buffers at the Python boundary.
 
 ## Backend Contexts
 
@@ -237,6 +247,11 @@ This gives Vitis C simulation a Python-native calling style:
 with Vitis():
     vec_add(A, B, C)
 ```
+
+Local streams in the kernel body are emitted into the generated HLS C++:
+scalar payloads use `hls::stream<T>`, while shaped payloads use
+`hls::stream_of_blocks`. Python arguments still follow the scalar and NumPy
+buffer calling convention described above.
 
 The current Vitis context path is intentionally limited to Python-native CSim.
 HLS synthesis and project-level operations remain explicit backend operations:

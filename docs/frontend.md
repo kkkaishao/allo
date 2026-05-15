@@ -13,8 +13,10 @@ currently staged under `allo.exp`, but this document uses the intended top-level
 API:
 
 ```python
+from __future__ import annotations
+
 import allo
-from allo import f32, i32, kernel
+from allo import bool, f32, i32, u1, u32, GStream, kernel, Stream
 ```
 
 The Python frontend is a restricted Python-embedded DSL (eDSL). It uses Python syntax for
@@ -24,18 +26,23 @@ language.
 ## Kernel Definition
 
 Allo kernels are Python functions decorated with `@kernel`. Every parameter must
-have a type annotation.
+have a type annotation. All examples in this document assume the Python file
+starts with `from __future__ import annotations`; this lets shaped annotations
+be written directly as `f32[16]` instead of quoted strings such as `"f32[16]"`.
 
 ```python
-from allo import f32, i32, kernel
+from __future__ import annotations
+
+from allo import f32, kernel
 
 @kernel
-def saxpy(a: f32, x: "f32[16]", y: "f32[16]", out: "f32[16]"):
+def saxpy(a: f32, x: f32[16], y: f32[16], out: f32[16]):
     for i in range(16):
         out[i] = a * x[i] + y[i]
 ```
 
-Scalar annotations use type objects directly. Shaped annotations use strings:
+Scalar annotations use type names directly. Shaped annotations use
+`dtype[shape]`:
 
 ```python
 @kernel
@@ -43,24 +50,31 @@ def scalar_add(x: i32, y: i32) -> i32:
     return x + y
 
 @kernel
-def vector_add(x: "i32[16]", y: "i32[16]") -> "i32[16]":
-    out: "i32[16]" = 0
+def vector_add(x: i32[16], y: i32[16]) -> i32[16]:
+    out: i32[16] = 0
     for i in range(16):
         out[i] = x[i] + y[i]
     return out
 ```
+
+Without `from __future__ import annotations`, Python evaluates annotations
+before Allo sees them. In that mode, scalar annotations such as `x: i32` still
+work, but shaped annotations must be quoted, for example `x: "i32[16]"`.
+With postponed annotations, prefer importing Allo types into the file's scope
+and using bare names such as `u32[4]`; the annotation parser resolves these
+names directly.
 
 Functions with no return value can omit the return annotation or use `-> None`.
 Returning a value requires an **explicit return annotation**.
 
 ```python
 @kernel
-def fill(out: "i32[4]"):
+def fill(out: i32[4]):
     for i in range(4):
         out[i] = i
 
 @kernel
-def no_result(out: "i32[4]") -> None:
+def no_result(out: i32[4]) -> None:
     return
 ```
 
@@ -72,7 +86,7 @@ def split_pair(x: i32, y: f32) -> (i32, f32):
     return x + 1, y + 1.0
 
 @kernel
-def caller(x: i32, y: f32, out: "f32[1]"):
+def caller(x: i32, y: f32, out: f32[1]):
     lhs, rhs = split_pair(x, y)
     out[0] = rhs + lhs
 ```
@@ -83,7 +97,7 @@ loops and nested `if` statements are rejected.
 
 ```python
 @kernel
-def choose(cond: allo.bool, x: i32, y: i32) -> i32:
+def choose(cond: bool, x: i32, y: i32) -> i32:
     if cond:
         return x
     return y
@@ -95,7 +109,7 @@ be declared at the top level of the enclosing kernel body, must use exactly one
 
 ```python
 @kernel
-def outer(x: i32, out: "i32[1]"):
+def outer(x: i32, out: i32[1]):
     @kernel
     def add_one(v: i32) -> i32:
         return v + 1
@@ -132,16 +146,17 @@ u17 = apint(17)
 i23 = apint(23, signed=True)
 
 @kernel
-def custom_width(x: u17, y: i23, out: "u17[1]"):
+def custom_width(x: u17, y: i23, out: u17[1]):
     out[0] = x + y
 ```
 
-Shaped values are written as `"dtype[shape]"`. A rank-0 shaped value uses an
-empty shape list.
+Shaped values are written as `dtype[shape]`. With postponed annotations, a
+rank-0 shaped value is written as `dtype[()]` because Python does not allow an
+empty subscript expression. The quoted spelling `"dtype[]"` is still accepted.
 
 ```python
 @kernel
-def shapes(a: "f32[8]", b: "i32[4, 4]", acc: "f32[]"):
+def shapes(a: f32[8], b: i32[4, 4], acc: f32[()]):
     acc[()] = a[0] + b[0, 0]
 ```
 
@@ -154,7 +169,7 @@ M = 4
 N = 8
 
 @kernel
-def reshape_like(inp: "i32[M * N]", out: "i32[M, N]"):
+def reshape_like(inp: i32[M * N], out: i32[M, N]):
     for i, j in allo.grid(M, N):
         out[i, j] = inp[i * N + j]
 ```
@@ -167,9 +182,70 @@ tensors.
 from allo import KernelOptions
 
 @kernel(options=KernelOptions(enable_tensor=True))
-def tensor_add(x: "f32[4]", y: "f32[4]") -> "f32[4]":
+def tensor_add(x: f32[4], y: f32[4]) -> f32[4]:
     return x + y
 ```
+
+### Streams
+
+`Stream` and `GStream` describe FIFO channels. The payload type can be a scalar
+dtype or a shaped buffer payload. The optional second bracket group describes an
+array of streams; omitting it creates a single rank-0 stream. The current
+frontend uses a default stream depth of `2`.
+
+```python
+from allo import GStream, Stream, i32
+
+@kernel
+def scalar_stream(x: i32, out: i32[1]):
+    fifo: Stream[i32]
+    fifo.put(x)
+    out[0] = fifo.get()
+
+@kernel
+def stream_array(x: i32, out: i32[1]):
+    fifo: Stream[i32][2, 2]
+    fifo[0, 1].put(x)
+    out[0] = fifo[0, 1].get()
+```
+
+A stream with a shaped payload transfers a whole block. In Vitis HLS emission,
+scalar payloads map to `hls::stream<T>` and shaped payloads map to
+`hls::stream_of_blocks<T[...], depth>`.
+
+```python
+@kernel
+def block_stream(out: i32[1]):
+    fifo: Stream[i32[4, 4]]
+    buf: i32[4, 4]
+    buf[0, 0] = 7
+    fifo.put(buf)
+    recv = fifo.get()
+    out[0] = recv[0, 0]
+```
+
+`GStream` declares a global stream symbol. It is useful when nested kernels need
+to communicate through a shared channel without passing a local stream argument.
+Global stream symbols can be captured by nested kernels, but they cannot be used
+as kernel parameters or return values.
+
+```python
+@kernel
+def global_stream(x: i32, out: i32[1]):
+    fifo: GStream[i32][2, 2]
+
+    @kernel
+    def worker(v: i32):
+        fifo[0, 1].put(v)
+
+    worker(x)
+    out[0] = fifo[0, 1].get()
+```
+
+Streams must be declared without initializers. A stream array must be indexed
+with exactly one scalar index per stream dimension before `get()` or `put()`.
+Stream references are not assignable; use `put(value)` to write and `get()` to
+read.
 
 ## Variables and Scope
 
@@ -177,9 +253,9 @@ Annotated assignments declare variables.
 
 ```python
 @kernel
-def declarations(x: i32, out: "i32[4]"):
+def declarations(x: i32, out: i32[4]):
     base: i32 = x
-    tmp: "i32[4]" = 0
+    tmp: i32[4] = 0
     for i in range(4):
         tmp[i] = base + i
         out[i] = tmp[i]
@@ -190,8 +266,8 @@ buffer in the default mode or an empty tensor in tensor mode.
 
 ```python
 @kernel
-def local_buffer(out: "i32[4]"):
-    buf: "i32[4]"
+def local_buffer(out: i32[4]):
+    buf: i32[4]
     for i in range(4):
         buf[i] = i
         out[i] = buf[i]
@@ -202,7 +278,7 @@ introduced by assigning an existing runtime value.
 
 ```python
 @kernel
-def inferred_local(cond: allo.bool, x: i32, y: i32, out: "i32[1]"):
+def inferred_local(cond: bool, x: i32, y: i32, out: i32[1]):
     v = x
     if cond:
         v = y
@@ -218,7 +294,7 @@ during compilation and cannot be reassigned.
 from allo import constexpr
 
 @kernel
-def constexpr_bound(out: "i32[4]"):
+def constexpr_bound(out: i32[4]):
     N: constexpr = 4
     for i in range(N):
         out[i] = i
@@ -229,9 +305,9 @@ compile-time `int` or `float`. The list shape must exactly match the annotation.
 
 ```python
 @kernel
-def constants(out: "i32[2, 2]"):
+def constants(out: i32[2, 2]):
     scale: constexpr = 3
-    table: "i32[2, 2]" = [[1, scale], [scale + 1, scale + 2]]
+    table: i32[2, 2] = [[1, scale], [scale + 1, scale + 2]]
     for i, j in allo.grid(2, 2):
         out[i, j] = table[i, j]
 ```
@@ -242,7 +318,7 @@ must be used afterward.
 
 ```python
 @kernel
-def scoped(cond: allo.bool, x: i32, out: "i32[1]"):
+def scoped(cond: bool, x: i32, out: i32[1]):
     value: i32 = 0
     if cond:
         value = x
@@ -263,7 +339,7 @@ Pass runtime values explicitly as nested-kernel arguments.
 
 ```python
 @kernel
-def captures(x: i32, out: "i32[1]"):
+def captures(x: i32, out: i32[1]):
     offset: constexpr = 2
     T: constexpr = i32
 
@@ -284,7 +360,7 @@ from allo import range as allo_range
 
 
 @kernel
-def ranges(out: "i32[20]"):
+def ranges(out: i32[20]):
     for i in range(10):
         out[i] = i
     for i in range(10, 20):
@@ -297,7 +373,7 @@ Loop bounds may depend on runtime values. Loop steps must be positive if they ar
 
 ```python
 @kernel
-def variable_bounds(a: "i32[10]", out: "i32[10]"):
+def variable_bounds(a: i32[10], out: i32[10]):
     for i in range(10):
         for j in range(a[i], 10, a[i]):
             out[j] += i
@@ -309,8 +385,8 @@ variables.
 
 ```python
 @kernel
-def matmul(a: "f32[32, 32]", b: "f32[32, 32]") -> "f32[32, 32]":
-    c: "f32[32, 32]" = 0.0
+def matmul(a: f32[32, 32], b: f32[32, 32]) -> f32[32, 32]:
+    c: f32[32, 32] = 0.0
     for i, j in allo.grid(32, 32):
         for k in range(32):
             c[i, j] += a[i, k] * b[k, j]
@@ -322,7 +398,7 @@ Grid dimensions may also be written as `(start, stop)` or
 
 ```python
 @kernel
-def strided_grid(out: "i32[8, 8]"):
+def strided_grid(out: i32[8, 8]):
     for i, j in allo.grid((0, 8, 2), (1, 8, 2)):
         out[i, j] = i + j
 ```
@@ -336,7 +412,7 @@ loop-carried scalar values.
 
 ```python
 @kernel
-def count(out: "i32[1]"):
+def count(out: i32[1]):
     i: i32 = 0
     acc: i32 = 0
     while i < 4:
@@ -369,7 +445,7 @@ Conditions may use comparison operators, `and`, `or`, and `not`.
 
 ```python
 @kernel
-def logic(a: "i32[3]", b: i32) -> i32:
+def logic(a: i32[3], b: i32) -> i32:
     out: i32 = 0
     if a[0] > 0 and b < 0:
         out = 1
@@ -383,7 +459,7 @@ At least one branch must be a runtime value so the result type can be inferred.
 
 ```python
 @kernel
-def select(cond: allo.bool, x: i32, y: i32) -> i32:
+def select(cond: bool, x: i32, y: i32) -> i32:
     return x if cond else y
 ```
 
@@ -408,7 +484,7 @@ Multi-way comparisons such as `a < b < c` are not supported; write them with
 
 ```python
 @kernel
-def comparisons(a: i32, b: i32, c: i32) -> allo.bool:
+def comparisons(a: i32, b: i32, c: i32) -> bool:
     return a < b and b < c
 ```
 
@@ -419,7 +495,7 @@ promotion rules.
 
 ```python
 @kernel(options=KernelOptions(typing_style="cpp"))
-def cpp_style(x: allo.u32, y: i32, out: "u32[1]"):
+def cpp_style(x: u32, y: i32, out: u32[1]):
     out[0] = x + y
 ```
 
@@ -443,7 +519,7 @@ rank.
 
 ```python
 @kernel
-def copy_2d(src: "f32[4, 4]", dst: "f32[4, 4]"):
+def copy_2d(src: f32[4, 4], dst: f32[4, 4]):
     for i, j in allo.grid(4, 4):
         dst[i, j] = src[i, j]
 ```
@@ -452,7 +528,7 @@ Rank-0 shaped values are indexed with `()`.
 
 ```python
 @kernel(options=allo.KernelOptions(enable_tensor=True))
-def dot_scalar(a: "f32[4]", b: "f32[4]") -> f32:
+def dot_scalar(a: f32[4], b: f32[4]) -> f32:
     return allo.linalg.dot(a, b)[()]
 ```
 
@@ -461,7 +537,7 @@ subscript syntax.
 
 ```python
 @kernel
-def bit_ops(x: allo.u32, out: "u1[1]"):
+def bit_ops(x: u32, out: u1[1]):
     out[0] = x[0]
 ```
 
@@ -477,7 +553,7 @@ accumulator.
 
 ```python
 @kernel
-def memref_elementwise(x: "f32[4]", y: "f32[4]", out: "f32[4]"):
+def memref_elementwise(x: f32[4], y: f32[4], out: f32[4]):
     allo.arith.add(x, y, acc=out)
 ```
 
@@ -487,7 +563,7 @@ values and on shaped values.
 
 ```python
 @kernel
-def sigmoid(x: "f32[8]", out: "f32[8]"):
+def sigmoid(x: f32[8], out: f32[8]):
     for i in range(8):
         out[i] = 1.0 / (1.0 + allo.math.exp(-x[i]))
 ```
@@ -499,13 +575,13 @@ same operation can return a tensor value directly.
 
 ```python
 @kernel(options=KernelOptions(enable_tensor=True))
-def dense(a: "f32[2, 3]", b: "f32[3, 4]") -> "f32[2, 4]":
+def dense(a: f32[2, 3], b: f32[3, 4]) -> f32[2, 4]:
     return allo.linalg.matmul(a, b)
 ```
 
 ```python
 @kernel
-def buffer_matmul(a: "f32[2, 3]", b: "f32[3, 4]", out: "f32[2, 4]"):
+def buffer_matmul(a: f32[2, 3], b: f32[3, 4], out: f32[2, 4]):
     allo.linalg.matmul(a, b, acc=out)
 ```
 
@@ -548,7 +624,7 @@ T = Template("T")
 N = Template("N")
 
 @kernel(T, N)
-def fill_template(x: T, out: "T[N]"):
+def fill_template(x: T, out: T[N]):
     for i in range(N):
         out[i] = x
 
@@ -556,7 +632,7 @@ fill_i32_4 = fill_template[i32, 4]
 ```
 
 Template bindings must be provided before compilation or execution. Type
-templates can be used in scalar annotations and as the head of shaped string
+templates can be used in scalar annotations and as the head of shaped
 annotations. Integer templates can be used in shape expressions and loop bounds.
 
 Templates are different from ordinary global aliases. A global alias such as
@@ -568,14 +644,14 @@ binding point that must be supplied by the caller.
 FixedT = i32
 
 @kernel
-def fixed_alias(x: FixedT, out: "FixedT[4]"):
+def fixed_alias(x: FixedT, out: FixedT[4]):
     for i in range(4):
         out[i] = x
 
 T = Template("T")
 
 @kernel(T)
-def delayed_type(x: T, out: "T[4]"):
+def delayed_type(x: T, out: T[4]):
     for i in range(4):
         out[i] = x
 
@@ -633,6 +709,8 @@ source location. The most important restrictions are:
   declaration, and never reassigned.
 - Runtime values from an outer kernel scope cannot be captured by nested
   kernels.
+- `GStream` may be declared in a kernel body and captured by nested kernels, but
+  it cannot be passed as a kernel parameter or returned from a kernel.
 - Recursive kernel calls, including indirect recursion through nested kernels,
   are not supported.
 - Python slices, partial tensor subviews, dynamic `...` shapes, tensor methods
@@ -648,8 +726,8 @@ new frontend should be documented from `test/`, `allo/exp`, and `example/`.
 | Area | Older upstream frontend | New frontend |
 | --- | --- | --- |
 | Kernel entry | Plain Python function passed to `allo.customize` | Function decorated with `@kernel` |
-| Import style | `from allo.ir.types import int32, float32, ConstExpr` | `from allo import i32, f32, constexpr, kernel` |
-| Shaped annotations | Often `int32[32, 32]` | String annotations such as `"i32[32, 32]"` |
+| Import style | `from allo.ir.types import int32, float32, ConstExpr` | `from __future__ import annotations`; `from allo import i32, f32, constexpr, kernel` |
+| Shaped annotations | Often `int32[32, 32]` | Postponed annotations such as `i32[32, 32]`; quoted strings are still accepted |
 | Compile-time constants | `ConstExpr[...]` | `constexpr` annotation and `@consteval` helpers |
 | Templates | Old Python generic syntax and scheduler instantiation | `Template("T")`, `@kernel(T)`, and `kernel[i32]` specialization |
 | Kernel calls | Helper functions inside customized functions | Calls between `@kernel` functions, including nested kernels |
@@ -671,11 +749,13 @@ s = allo.customize(gemm)
 The new form is:
 
 ```python
+from __future__ import annotations
+
 from allo import f32, kernel
 
 @kernel
-def gemm(A: "f32[32, 32]", B: "f32[32, 32]") -> "f32[32, 32]":
-    C: "f32[32, 32]" = 0.0
+def gemm(A: f32[32, 32], B: f32[32, 32]) -> f32[32, 32]:
+    C: f32[32, 32] = 0.0
     for i, j in allo.grid(32, 32):
         for k in range(32):
             C[i, j] += A[i, k] * B[k, j]

@@ -44,13 +44,16 @@ runtime interface to make Allo kernels feel more native in Python.
 The main changes in this fork are:
 
 - A revised kernel syntax based on `@kernel`, explicit annotations, nested
-  kernels, `constexpr`, `consteval`, templates, and clearer scoping rules.
+  kernels, `constexpr`, `consteval`, templates, postponed type annotations, and
+  clearer scoping rules.
 - Better command line loggings, such as a source-aware diagnostics with
   a Clang-like style for frontend errors.
 - Explicit HLS and C++ typing styles, including HLS-oriented bit growth and
   balanced-tree lowering for integer add, subtract, and multiply expressions.
 - Operator infrastructure for scalar, buffer, and tensor paths, including
   arithmetic, math, and linalg operators.
+- Local `Stream` and global `GStream` frontend types for FIFO communication,
+  including scalar and block payloads.
 - Smooth interaction between native Python code and hardware design/testing
   workflows.
 - Backend and compiler infrastructure changes that support the new frontend and
@@ -69,13 +72,13 @@ The current documents in this directory describe the new forked frontend and
 runtime stack:
 
 - [Frontend Syntax](frontend.md): user-facing syntax for kernels, types,
-  scopes, loops, operators, compile-time features, diagnostics, and differences
-  from the older upstream frontend.
+  scopes, streams, loops, operators, compile-time features, diagnostics, and
+  differences from the older upstream frontend.
 - [Typing Rules](typing_rules.md): type-promotion reference for HLS and C++
   typing styles.
 - [Compiler Infrastructure](compiler_infrastructure.md): developer guide for
-  the new frontend code generation, builder APIs, operator layer, and extension
-  points.
+  the new frontend code generation, value proxies including `AlloSymbolRef`,
+  builder APIs, operator layer, and extension points.
 - [Simulation](simulation.md): CPU and Vitis simulation interface, backend
   contexts, caching, and implementation notes.
 - [Scheduling](scheduling.md): reserved for the scheduling documentation.
