@@ -62,29 +62,6 @@ void allo::registerTransformDialectExtension(DialectRegistry &registry) {
 }
 
 ///===----------------------------------------------------------------------===//
-/// RenameOp implementation
-///===----------------------------------------------------------------------===//
-DiagnosedSilenceableFailure
-transform::RenameOp::applyToOne(transform::TransformRewriter &rewriter,
-                                Operation *target,
-                                transform::ApplyToEachResultList &results,
-                                transform::TransformState &state) {
-  if (isa<SymbolOpInterface>(target)) {
-    Operation *symTableOp = SymbolTable::getNearestSymbolTable(target);
-    if (!symTableOp)
-      return emitSilenceableError() << "cannot find symbol table for target";
-
-    SymbolTable symTable(symTableOp);
-    if (failed(symTable.rename(target, getName()))) {
-      return emitSilenceableError() << "failed to rename symbol";
-    }
-  } else {
-    target->setAttr(OpIdentifier, getNameAttr());
-  }
-  return DiagnosedSilenceableFailure::success();
-}
-
-///===----------------------------------------------------------------------===//
 /// MatchValueOp implementation
 ///===----------------------------------------------------------------------===//
 namespace {
@@ -271,4 +248,10 @@ transform::PartitionOp::apply(transform::TransformRewriter &rewriter,
   }
 
   return DiagnosedSilenceableFailure::success();
+}
+
+void transform::PartitionOp::getEffects(
+    SmallVectorImpl<MemoryEffects::EffectInstance> &effects) {
+  transform::onlyReadsHandle(getTargetMutable(), effects);
+  transform::modifiesPayload(effects);
 }

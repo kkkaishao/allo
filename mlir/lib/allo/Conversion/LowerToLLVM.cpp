@@ -16,6 +16,7 @@ using namespace mlir::allo;
 void allo::populateLowerToLLVMPipeline(OpPassManager &pm, bool enableTensor) {
   pm.addPass(createCanonicalizerPass());
   pm.addPass(createCSEPass());
+  pm.addPass(createLowerDataflowPass());
 
   if (enableTensor) {
     pm.addPass(createConvertTensorToLinalgPass());
@@ -51,7 +52,9 @@ void allo::populateLowerToLLVMPipeline(OpPassManager &pm, bool enableTensor) {
   pm.addPass(createConvertControlFlowToLLVMPass());
   pm.addPass(createConvertFuncToLLVMPass());
   pm.addPass(createFinalizeMemRefToLLVMConversionPass());
+  pm.addPass(createConvertIndexToLLVMPass());
   pm.addPass(createArithToLLVMConversionPass());
+  pm.addPass(createConvertOpenMPToLLVMPass());
   pm.addPass(createReconcileUnrealizedCastsPass());
   pm.addPass(createCanonicalizerPass());
   pm.addPass(createCSEPass());

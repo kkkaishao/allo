@@ -1,6 +1,7 @@
 #include "allo/IR/AlloOps.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/Dialect/OpenMP/OpenMPDialect.h"
 #include "mlir/Transforms/DialectConversion.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 
@@ -192,7 +193,8 @@ struct ConvertAlloToFuncPass
 
     ConversionTarget target(*context);
     patterns.clear();
-    target.addLegalDialect<arith::ArithDialect, func::FuncDialect>();
+    target.addLegalDialect<arith::ArithDialect, func::FuncDialect,
+                           omp::OpenMPDialect>();
     target.addIllegalOp<KernelOp, ReturnOp, GetWorkerIdOp, GetNumWorkersOp>();
     patterns.add<ConvertInvokeToFunc, ConvertReturnToFunc>(context);
     if (failed(applyPartialConversion(getOperation(), target,
@@ -208,7 +210,8 @@ struct ConvertAlloToFuncPass
   }
 
   void getDependentDialects(DialectRegistry &registry) const override {
-    registry.insert<arith::ArithDialect, func::FuncDialect>();
+    registry
+        .insert<arith::ArithDialect, func::FuncDialect, omp::OpenMPDialect>();
   }
 };
 } // namespace

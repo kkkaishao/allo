@@ -51,7 +51,6 @@ from .core import (
     Template,
     StreamType,
     Stream,
-    GStream,
     grid,
     range,
     bool,

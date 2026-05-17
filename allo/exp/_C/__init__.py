@@ -22,6 +22,7 @@ __all__ = [
     "linalg",
     "allo",
     "passes",
+    "schedule",
     "transform",
     "execution_engine",
 ]
@@ -57,6 +58,7 @@ if TYPE_CHECKING:
         linalg,
         allo,
         passes,
+        schedule,
         transform,
         execution_engine,
     )
@@ -69,7 +71,7 @@ else:
     del _name
 
     def __getattr__(name: str):
-        if name in {"transform", "execution_engine"}:
+        if name in {"transform", "schedule", "execution_engine"}:
             mod = importlib.import_module(f".{name}", __name__)
             globals()[name] = mod
             return mod

@@ -527,51 +527,6 @@ def test_tensor_list_initializer_uses_arith_constant():
     _assert_contains(ir, "arith.constant dense<[[1, 2], [3, 4]]> : tensor<2x2xi32>")
 
 
-def test_gstream_scalar_nested_capture_ir():
-    @kernel
-    def top(x: i32, out: "i32[1]"):
-        fifo: GStream[i32][2, 2]
-
-        @kernel
-        def worker(v: i32):
-            fifo[0, 1].put(v)
-
-        worker(x)
-        out[0] = fifo[0, 1].get()
-
-    ir = _compile_ir(top)
-    _assert_contains(
-        ir,
-        "allo.stream.global @fifo : !allo.stream<i32,2,[2,2]>",
-        "allo.stream.get_global @fifo : !allo.stream<i32,2,[2,2]>",
-        "allo.stream.put",
-        "allo.stream.get",
-        "invoke @top.worker",
-    )
-
-
-def test_gstream_buffer_payload_ir():
-    @kernel
-    def top(out: "i32[1]"):
-        fifo: "GStream[i32[4,4]]"
-        buf: "i32[4,4]"
-        buf[0, 0] = 7
-        fifo.put(buf)
-        recv = fifo.get()
-        out[0] = recv[0, 0]
-
-    ir = _compile_ir(top)
-    _assert_contains(
-        ir,
-        "allo.stream.global @fifo : !allo.stream<memref<4x4xi32>,2,[]>",
-        "allo.stream.get_global @fifo : !allo.stream<memref<4x4xi32>,2,[]>",
-        "allo.stream.put",
-        "allo.stream.get",
-        "memref<4x4xi32>",
-        "memref.load",
-    )
-
-
 def test_local_stream_scalar_ir():
     @kernel
     def top(x: i32, out: "i32[1]"):
@@ -612,58 +567,6 @@ def test_local_stream_nested_parameter_ir():
     )
 
 
-def test_gstream_empty_shape_annotation_is_rejected():
-    @kernel
-    def top():
-        fifo: "GStream[i32][]"
-
-    _assert_compile_error(
-        top,
-        "GStream[Ty][] is invalid",
-    )
-
-
-def test_gstream_parameter_and_return_are_rejected():
-    @kernel
-    def top(fifo: "GStream[i32]"):
-        fifo.get()
-
-    @kernel
-    def worker() -> "GStream[i32]":
-        fifo: GStream[i32]
-        return fifo
-
-    _assert_type_error(
-        top,
-        "GStream is not allowed as kernel parameter",
-    )
-    _assert_type_error(
-        worker,
-        "GStream is not allowed as a kernel return type",
-    )
-
-
-def test_gstream_index_rank_and_bounds_are_rejected():
-    @kernel
-    def top():
-        fifo: GStream[i32][2, 2]
-        fifo[0].put(1)
-
-    @kernel
-    def worker():
-        fifo: GStream[i32][2, 2]
-        fifo[2, 0].put(1)
-
-    _assert_compile_error(
-        top,
-        "Global stream 'fifo' expects 2 indices, got 1.",
-    )
-    _assert_compile_error(
-        worker,
-        "Global stream 'fifo' index 2 is out of bounds for dimension size 2.",
-    )
-
-
 def test_missing_bound_method_errors_are_compile_errors():
     @kernel
     def top(x: i32):
@@ -681,27 +584,6 @@ def test_missing_bound_method_errors_are_compile_errors():
     _assert_compile_error(
         worker,
         "constexpr value '1' has no attribute 'put'.",
-    )
-
-
-def test_gstream_subscript_misuse_is_rejected_by_memory_ops():
-    @kernel
-    def top():
-        fifo: GStream[i32][2, 2]
-        fifo[0, 1] = 1
-
-    @kernel
-    def worker():
-        fifo: GStream[i32][2, 2]
-        fifo[0, 1][0].get()
-
-    _assert_compile_error(
-        top,
-        "Cannot assign to global stream 'fifo'",
-    )
-    _assert_compile_error(
-        worker,
-        "Cannot index a specific stream",
     )
 
 

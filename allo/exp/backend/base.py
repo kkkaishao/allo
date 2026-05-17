@@ -10,6 +10,7 @@ import os
 from abc import ABC, abstractmethod
 from collections.abc import Mapping, Sequence
 from contextvars import ContextVar
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, ClassVar
 
@@ -83,6 +84,21 @@ def current_backend() -> "Backend | None":
     return _CURRENT_BACKEND.get()
 
 
+@dataclass
+class ModuleCacheEntry:
+    context: ir.Context | None
+    module_owner: ir.OwningModuleOp | None
+    module: ir.ModuleOp | None
+
+    def close(self) -> None:
+        self.module = None
+        self.module_owner = None
+        self.context = None
+
+    def __del__(self) -> None:
+        self.close()
+
+
 class Backend(ABC):
     """Base class for experimental Allo backends.
 
@@ -97,6 +113,7 @@ class Backend(ABC):
         self._kernel = kernel
         self.module: ir.ModuleOp | None = None
         self._module_owner: ir.OwningModuleOp | None = None
+        self._context_keepalive: ir.Context | None = None
         self._context_tokens: list[Any] = []
 
     @property
@@ -125,7 +142,10 @@ class Backend(ABC):
     def _get_working_module(self) -> ir.ModuleOp:
         """Return a backend-owned module clone for backend-specific mutation."""
         if self.module is None:
-            self._module_owner = self.kernel.compile().clone()
+            compiled = self.kernel.compile()
+            assert self.kernel.context is not None
+            self._context_keepalive = self.kernel.context
+            self._module_owner = compiled.clone()
             self.module = self._module_owner.get()
         return self.module
 

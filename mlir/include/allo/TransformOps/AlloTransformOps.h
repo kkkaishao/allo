@@ -18,8 +18,6 @@
 
 namespace mlir::allo {
 void registerTransformDialectExtension(DialectRegistry &registry);
-
-constexpr StringLiteral OpIdentifier = "sym_name";
 } // namespace mlir::allo
 
 #endif // ALLO_TRANSFORMOPS_H

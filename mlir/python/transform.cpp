@@ -297,16 +297,6 @@ void bindTransform(nb::module_ &m) {
           },
           nb::arg("context"), nb::arg("sub_partitions"));
 
-  nb::class_<transform::RenameOp, OpState>(m, "RenameOp")
-      .def(
-          "__init__",
-          [](transform::RenameOp &self, AlloOpBuilder &builder, Value &target,
-             std::string_view name) {
-            self = transform::RenameOp::create(builder, builder.getLocation(),
-                                               target, name);
-          },
-          nb::arg("builder"), nb::arg("target"), nb::arg("name"));
-
   nb::class_<transform::RaiseToAffineOp, OpState>(m, "RaiseToAffineOp")
       .def(
           "__init__",
@@ -325,7 +315,16 @@ void bindTransform(nb::module_ &m) {
             self = transform::OutlineOp::create(builder, builder.getLocation(),
                                                 target, kernelName);
           },
-          nb::arg("builder"), nb::arg("target"), nb::arg("kernel_name"));
+          nb::arg("builder"), nb::arg("target"), nb::arg("kernel_name"))
+      .def(
+          "__init__",
+          [](transform::OutlineOp &self, AlloOpBuilder &builder, Value &target,
+             std::string_view kernelName, const std::vector<int32_t> &mapping) {
+            self = transform::OutlineOp::create(builder, builder.getLocation(),
+                                                target, kernelName, mapping);
+          },
+          nb::arg("builder"), nb::arg("target"), nb::arg("kernel_name"),
+          nb::arg("mapping"));
 
   nb::class_<transform::TagPipelineOp, OpState>(m, "TagPipelineOp")
       .def(
@@ -338,16 +337,18 @@ void bindTransform(nb::module_ &m) {
           },
           nb::arg("builder"), nb::arg("target"), nb::arg("ii"));
 
-  nb::class_<transform::TagUnrollOp, OpState>(m, "TagUnrollOp")
+  nb::class_<transform::AlloLoopUnrollOp, OpState>(m, "AlloLoopUnrollOp")
       .def(
           "__init__",
-          [](transform::TagUnrollOp &self, AlloOpBuilder &builder,
-             Value &target, int factor) {
-            self = transform::TagUnrollOp::create(
+          [](transform::AlloLoopUnrollOp &self, AlloOpBuilder &builder,
+             Value &target, int64_t factor, bool tagOnly) {
+            UnitAttr tagOnlyAttr = tagOnly ? builder.getUnitAttr() : UnitAttr();
+            self = transform::AlloLoopUnrollOp::create(
                 builder, builder.getLocation(), target,
-                static_cast<uint64_t>(factor));
+                builder.getI64IntegerAttr(factor), tagOnlyAttr);
           },
-          nb::arg("builder"), nb::arg("target"), nb::arg("factor"));
+          nb::arg("builder"), nb::arg("target"), nb::arg("factor"),
+          nb::arg("tag_only") = false);
 
   nb::class_<transform::LoopReorderOp, OpState>(m, "LoopReorderOp")
       .def(

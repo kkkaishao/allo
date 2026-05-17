@@ -96,7 +96,7 @@ class CompilationError(AlloError):
             console.print(
                 Text.assemble(
                     " " * line_no_width,
-                    (" | ", "bold cyan"),
+                    " | ",
                     " " * col,
                     ("^" * max(1, span), "bold green"),
                 )

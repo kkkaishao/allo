@@ -328,6 +328,8 @@ class Kernel(Generic[P, R]):
                 )
             return bound
         if isinstance(annotation, TypeBase):
+            if isinstance(annotation, StreamType) and annotation.is_global:
+                raise TypeError(f"Unsupported type annotation: {annotation}")
             return annotation
         if isinstance(annotation, str):
             annotation = annotation.strip()
@@ -336,8 +338,8 @@ class Kernel(Generic[P, R]):
             if primitive_type is not None and isinstance(primitive_type, TypeBase):
                 return primitive_type
             head, groups = _split_annotation_groups(annotation)
-            if head in ("Stream", "GStream"):
-                return self._parse_stream_annotation(annotation, groups, scope, head)
+            if head == "Stream":
+                return self._parse_stream_annotation(annotation, groups, scope)
             if head in scope:
                 # Case 2: shaped type, e.g. "int32[4, 8]"
                 head_value = unwrap_if_constexpr(scope[head])
@@ -383,23 +385,20 @@ class Kernel(Generic[P, R]):
         annotation: str,
         groups: list[str],
         scope: dict[str, object],
-        prefix: str,
     ) -> StreamType:
         if len(groups) == 1:
             shape = []
         elif len(groups) == 2:
             if groups[1].strip() == "":
-                raise TypeError(f"{prefix}[Ty][] is invalid; use {prefix}[Ty] instead")
+                raise TypeError("Stream[Ty][] is invalid; use Stream[Ty] instead")
             shape = _parse_shape_dims(groups[1], scope)
         else:
             raise TypeError(
-                f"Unsupported {prefix} annotation '{annotation}', expected {prefix}[Ty] or {prefix}[Ty][shape]"
+                f"Unsupported Stream annotation '{annotation}', expected Stream[Ty] or Stream[Ty][shape]"
             )
 
-        base_type = self._parse_stream_base_type(groups[0], scope, prefix)
-        return StreamType(
-            base_type, DEFAULT_STREAM_DEPTH, shape, is_global=prefix == "GStream"
-        )
+        base_type = self._parse_stream_base_type(groups[0], scope, "Stream")
+        return StreamType(base_type, DEFAULT_STREAM_DEPTH, shape)
 
     def parse_argument_annotations(self) -> list[TypeBase]:
         arg_types = []
@@ -411,10 +410,7 @@ class Kernel(Generic[P, R]):
                     f"Parameter '{param.name}' is missing a type annotation. Please provide an explicit type annotation for all parameters."
                 )
             ty = self.parse_type_annotation(annotation, scope=scope)
-            if isinstance(ty, StreamType) and ty.is_global:
-                raise TypeError(
-                    f"GStream is not allowed as kernel parameter '{param.name}'. Declare it inside the kernel body instead."
-                )
+            assert not (isinstance(ty, StreamType) and ty.is_global)
             arg_types.append(ty)
         return arg_types
 
@@ -441,9 +437,9 @@ class Kernel(Generic[P, R]):
         else:
             res_types = [self.parse_type_annotation(annotation, scope=scope)]
         for ty in res_types:
+            assert not (isinstance(ty, StreamType) and ty.is_global)
             if isinstance(ty, StreamType):
-                prefix = "GStream" if ty.is_global else "Stream"
-                raise TypeError(f"{prefix} is not allowed as a kernel return type.")
+                raise TypeError("Stream is not allowed as a kernel return type.")
         return res_types
 
     def compile(self):

@@ -39,6 +39,7 @@ inline void registerAllPasses() {
   registerConvertFuncToLLVMPass();
   registerConvertIndexToLLVMPass();
   registerConvertMathToLLVMPass();
+  registerConvertOpenMPToLLVMPass();
   registerConvertLinalgToStandardPass();
   registerConvertTensorToLinalgPass();
   registerConvertToLLVMPass();
@@ -48,6 +49,7 @@ inline void registerAllPasses() {
   registerSCFToControlFlowPass();
 
   allo::registerConvertAlloToFuncPass();
+  allo::registerLowerDataflowPass();
 
   // Dialect passes
   affine::registerAffinePasses();

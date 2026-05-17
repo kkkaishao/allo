@@ -6,6 +6,7 @@ nanobind_add_module(_liballo
     ir.cpp
     ops.cpp
     main.cpp
+    schedule.cpp
     transform.cpp
     passes.cpp
     execution_engine.cpp
@@ -81,6 +82,7 @@ set(ALLO_PYTHON_MLIR_LIBS
     MLIRFuncToLLVM
     MLIRMemRefToLLVM
     MLIRMathToLLVM
+    MLIROpenMPToLLVM
     MLIRReconcileUnrealizedCasts
     MLIRTosaToLinalg
     MLIRIndexToLLVM

@@ -76,6 +76,53 @@ static void replaceOpWithRegion(RewriterBase &rewriter, Operation *op,
   rewriter.eraseOp(terminator);
 }
 
+static bool isFuncInherentAttr(StringRef name) {
+  return name == SymbolTable::getSymbolAttrName() || name == "function_type" ||
+         name == "sym_visibility" || name == "arg_attrs" || name == "res_attrs";
+}
+
+static KernelOp convertOutlinedFuncToKernel(RewriterBase &rewriter,
+                                            func::FuncOp func,
+                                            DenseI32ArrayAttr mapping) {
+  rewriter.setInsertionPoint(func);
+  auto kernel = KernelOp::create(
+      rewriter, func.getLoc(), func.getSymNameAttr(),
+      TypeAttr::get(func.getFunctionType()), func.getSymVisibilityAttr(),
+      func.getArgAttrsAttr(), func.getResAttrsAttr(), mapping);
+  for (NamedAttribute attr : func->getAttrs()) {
+    if (!isFuncInherentAttr(attr.getName().getValue()))
+      kernel->setAttr(attr.getName(), attr.getValue());
+  }
+
+  rewriter.inlineRegionBefore(func.getBody(), kernel.getBody(),
+                              kernel.getBody().end());
+
+  SmallVector<func::ReturnOp> returns;
+  kernel.walk([&](func::ReturnOp ret) { returns.push_back(ret); });
+  for (func::ReturnOp ret : returns) {
+    rewriter.setInsertionPoint(ret);
+    ReturnOp::create(rewriter, ret.getLoc(), ret.getOperands());
+    rewriter.eraseOp(ret);
+  }
+
+  rewriter.eraseOp(func);
+  return kernel;
+}
+
+static InvokeOp convertOutlinedCallToInvoke(RewriterBase &rewriter,
+                                            func::CallOp call,
+                                            KernelOp kernel) {
+  rewriter.setInsertionPoint(call);
+  auto invoke =
+      InvokeOp::create(rewriter, call.getLoc(), kernel, call.getOperands());
+  if (auto argAttrs = call.getArgAttrsAttr())
+    invoke->setAttr("arg_attrs", argAttrs);
+  if (auto resAttrs = call.getResAttrsAttr())
+    invoke->setAttr("res_attrs", resAttrs);
+  rewriter.replaceOp(call, invoke.getResults());
+  return invoke;
+}
+
 /// Modified from
 /// https://github.com/llvm/llvm-project/blob/main/mlir/lib/Dialect/SCF/TransformOps/SCFTransformOps.cpp
 /// to support outlining of arbitrary operations with at most one region
@@ -114,13 +161,19 @@ transform::OutlineOp::apply(transform::TransformRewriter &rewriter,
       symbolTable.insert(*outlined);
       call.setCalleeAttr(FlatSymbolRefAttr::get(*outlined));
     }
-    call->setAttr(OpIdentifier,
-                  rewriter.getStringAttr(getKernelName() + "::call"));
     // `scf.execute_region` is only an outlining helper container. Inline it
     // back so the final IR directly contains `allo.call`.
+    Operation *outlinedOp = *outlined;
+    Operation *callOp = call;
+    if (DenseI32ArrayAttr mapping = getMappingAttr()) {
+      auto kernel = convertOutlinedFuncToKernel(rewriter, *outlined, mapping);
+      auto invoke = convertOutlinedCallToInvoke(rewriter, call, kernel);
+      outlinedOp = kernel;
+      callOp = invoke;
+    }
     replaceOpWithRegion(rewriter, exec, exec.getRegion());
-    kernels.push_back(*outlined);
-    calls.push_back(call);
+    kernels.push_back(outlinedOp);
+    calls.push_back(callOp);
   }
   results.set(cast<OpResult>(getKernel()), kernels);
   results.set(cast<OpResult>(getCall()), calls);
@@ -180,37 +233,6 @@ inSamePerfectlyNestedLoopBand(ArrayRef<affine::AffineForOp> loops) {
   }
   // return the top-level loop
   return tmp.front();
-}
-
-static std::string getBufferAtSourceIdentifier(Value buffer) {
-  if (auto blockArg = dyn_cast<BlockArgument>(buffer)) {
-    Block *owner = blockArg.getOwner();
-    Operation *parentOp = owner ? owner->getParentOp() : nullptr;
-    if (!parentOp)
-      return "";
-    auto identifier = parentOp->getAttrOfType<StringAttr>(OpIdentifier);
-    if (!identifier)
-      return "";
-    return (identifier.getValue() + ":arg" +
-            std::to_string(blockArg.getArgNumber()))
-        .str();
-  }
-
-  auto opResult = dyn_cast<OpResult>(buffer);
-  if (!opResult)
-    return "";
-  Operation *defOp = opResult.getOwner();
-  auto identifier = defOp->getAttrOfType<StringAttr>(OpIdentifier);
-  if (!identifier)
-    return "";
-
-  if (opResult.getResultNumber() == 0 &&
-      isa<memref::AllocOp, memref::AllocaOp, memref::GetGlobalOp>(defOp)) {
-    return identifier.str();
-  }
-  return (identifier.getValue() + ":res" +
-          std::to_string(opResult.getResultNumber()))
-      .str();
 }
 
 DiagnosedSilenceableFailure
@@ -282,6 +304,12 @@ transform::LoopReorderOp::apply(transform::TransformRewriter &rewriter,
   return DiagnosedSilenceableFailure::success();
 }
 
+void transform::LoopReorderOp::getEffects(
+    SmallVectorImpl<MemoryEffects::EffectInstance> &effects) {
+  onlyReadsHandle(getLoopsMutable(), effects);
+  modifiesPayload(effects);
+}
+
 LogicalResult transform::LoopReorderOp::verify() {
   // we cannot know the number of loops at verification time
   // so we only check the validity of the permutation itself
@@ -306,8 +334,8 @@ LogicalResult transform::LoopReorderOp::verify() {
 ///===----------------------------------------------------------------------===//
 
 /// Checks if the given split factor is valid for the given loop.
-/// A valid split factor should be positive and smaller than the loop range.
-/// only checks constant bounds loops
+/// A valid split factor should be positive and smaller than the loop trip
+/// count. Only checks constant-bound loops.
 static bool checkSplitFactor(affine::AffineForOp loop, int64_t factor) {
   if (!loop.hasConstantBounds()) {
     return true;
@@ -315,7 +343,11 @@ static bool checkSplitFactor(affine::AffineForOp loop, int64_t factor) {
   int64_t lb = loop.getConstantLowerBound();
   int64_t ub = loop.getConstantUpperBound();
   int64_t range = ub - lb;
-  return factor > 0 && factor < range;
+  int64_t step = loop.getStepAsInt();
+  if (range <= 0 || step <= 0)
+    return false;
+  int64_t tripCount = (range - 1) / step + 1;
+  return factor > 0 && factor < tripCount;
 }
 
 static FailureOr<int64_t> stripCastInt(Value value) {
@@ -341,13 +373,18 @@ static FailureOr<int64_t> stripCastInt(Value value) {
 static bool checkSplitFactor(scf::ForOp loop, int64_t factor) {
   auto lbOr = stripCastInt(loop.getLowerBound());
   auto ubOr = stripCastInt(loop.getUpperBound());
-  if (failed(lbOr) || failed(ubOr)) {
+  auto stepOr = stripCastInt(loop.getStep());
+  if (failed(lbOr) || failed(ubOr) || failed(stepOr)) {
     return true;
   }
   int64_t lb = *lbOr;
   int64_t ub = *ubOr;
+  int64_t step = *stepOr;
   int64_t range = ub - lb;
-  return factor > 0 && factor < range;
+  if (range <= 0 || step <= 0)
+    return false;
+  int64_t tripCount = (range - 1) / step + 1;
+  return factor > 0 && factor < tripCount;
 }
 
 DiagnosedSilenceableFailure
@@ -362,10 +399,9 @@ transform::LoopSplitOp::applyToOne(transform::TransformRewriter &rewriter,
   }
   // Case 1: affine.for loop
   if (auto forOp = dyn_cast<affine::AffineForOp>(target)) {
-    auto symName = forOp->getAttrOfType<StringAttr>(OpIdentifier);
     if (!checkSplitFactor(forOp, factor)) {
       return emitSilenceableFailure(forOp)
-             << "split factor is larger than or equal to the loop range";
+             << "split factor is larger than or equal to the loop trip count";
     }
 
     // perform split
@@ -403,12 +439,6 @@ transform::LoopSplitOp::applyToOne(transform::TransformRewriter &rewriter,
         applyOp->moveBefore(&inner.getBody()->front());
       }
     }
-    // set sym_name
-    if (symName) {
-      auto symStr = symName.getValue();
-      inner->setAttr(OpIdentifier, rewriter.getStringAttr(symStr + "::inner"));
-      outer->setAttr(OpIdentifier, rewriter.getStringAttr(symStr + "::outer"));
-    }
     // record results
     results.push_back(outer);
     results.push_back(inner);
@@ -416,10 +446,9 @@ transform::LoopSplitOp::applyToOne(transform::TransformRewriter &rewriter,
   }
   // Case 2: scf.for loop
   if (auto forOp = dyn_cast<scf::ForOp>(target)) {
-    auto symName = forOp->getAttrOfType<StringAttr>(OpIdentifier);
     if (!checkSplitFactor(forOp, factor)) {
       return emitSilenceableFailure(forOp)
-             << "split factor is larger than or equal to the loop range";
+             << "split factor is larger than or equal to the loop trip count";
     }
     // perform split
     rewriter.setInsertionPoint(forOp);
@@ -428,13 +457,6 @@ transform::LoopSplitOp::applyToOne(transform::TransformRewriter &rewriter,
     auto loops = tilePerfectlyNested(forOp, cst);
     if (loops.size() != 1) {
       return emitSilenceableFailure(forOp) << "failed to split the loop";
-    }
-    // set sym_name
-    if (symName) {
-      auto symStr = symName.getValue();
-      forOp->setAttr(OpIdentifier, rewriter.getStringAttr(symStr + "::outer"));
-      loops.back()->setAttr(OpIdentifier,
-                            rewriter.getStringAttr(symStr + "::inner"));
     }
     // record results
     results.push_back(forOp);
@@ -513,34 +535,6 @@ static FailureOr<SmallVector<uint64_t, 4>> parseTileFactors(ArrayAttr attr) {
   return factors;
 }
 
-template <typename ForOp>
-static SmallVector<StringAttr, 4> collectLoopSymNames(ArrayRef<ForOp> loops) {
-  SmallVector<StringAttr, 4> symNames;
-  symNames.reserve(loops.size());
-  for (ForOp loop : loops)
-    symNames.push_back(loop->template getAttrOfType<StringAttr>(OpIdentifier));
-  return symNames;
-}
-
-static void annotateTiledLoopSymNames(RewriterBase &rewriter,
-                                      ArrayRef<StringAttr> inputSymNames,
-                                      ArrayRef<Operation *> tileLoops,
-                                      ArrayRef<Operation *> pointLoops) {
-  assert(inputSymNames.size() == tileLoops.size() &&
-         "expected one sym_name per tile loop");
-  assert(inputSymNames.size() == pointLoops.size() &&
-         "expected one sym_name per point loop");
-
-  for (auto [symName, tileLoop, pointLoop] :
-       llvm::zip_equal(inputSymNames, tileLoops, pointLoops)) {
-    if (!symName)
-      continue;
-    StringRef base = symName.getValue();
-    tileLoop->setAttr(OpIdentifier, rewriter.getStringAttr(base + "::tile"));
-    pointLoop->setAttr(OpIdentifier, rewriter.getStringAttr(base + "::point"));
-  }
-}
-
 DiagnosedSilenceableFailure
 transform::LoopTileOp::apply(transform::TransformRewriter &rewriter,
                              transform::TransformResults &results,
@@ -606,8 +600,6 @@ transform::LoopTileOp::apply(transform::TransformRewriter &rewriter,
       sortedLoops.push_back(it.loop);
       sortedFactors.push_back(it.factor);
     }
-    SmallVector<StringAttr, 4> inputSymNames =
-        collectLoopSymNames<affine::AffineForOp>(sortedLoops);
 
     SmallVector<Operation *, 4> tileLoops;
     SmallVector<Operation *, 4> pointLoops;
@@ -714,8 +706,6 @@ transform::LoopTileOp::apply(transform::TransformRewriter &rewriter,
         pointLoops.push_back(loop);
     }
 
-    annotateTiledLoopSymNames(rewriter, inputSymNames, tileLoops, pointLoops);
-
     // Output handles are always reported in depth order.
     results.set(cast<OpResult>(getTileLoops()), tileLoops);
     results.set(cast<OpResult>(getPointLoops()), pointLoops);
@@ -752,8 +742,6 @@ transform::LoopTileOp::apply(transform::TransformRewriter &rewriter,
       sortedLoops.push_back(it.loop);
       sortedFactors.push_back(it.factor);
     }
-    SmallVector<StringAttr, 4> inputSymNames =
-        collectLoopSymNames<scf::ForOp>(sortedLoops);
 
     SmallVector<Operation *, 4> tileLoops;
     SmallVector<Operation *, 4> pointLoops;
@@ -799,8 +787,6 @@ transform::LoopTileOp::apply(transform::TransformRewriter &rewriter,
       for (auto loop : point)
         pointLoops.push_back(loop);
     }
-
-    annotateTiledLoopSymNames(rewriter, inputSymNames, tileLoops, pointLoops);
 
     // Output handles are always reported in depth order.
     results.set(cast<OpResult>(getTileLoops()), tileLoops);
@@ -932,11 +918,9 @@ transform::LoopFlattenOp::apply(transform::TransformRewriter &rewriter,
     }
   }
   if (loops.size() < 2) {
-    results.set(cast<OpResult>(getResult()), loops);
-    return DiagnosedSilenceableFailure::success();
+    return emitSilenceableError()
+           << "at least two loops are required for flattening";
   }
-
-  auto namePrefix = loops.front()->getAttrOfType<StringAttr>(OpIdentifier);
 
   // Flatten supports unordered loop handles; normalize to depth order first.
   llvm::sort(loops, [](auto a, auto b) {
@@ -985,11 +969,6 @@ transform::LoopFlattenOp::apply(transform::TransformRewriter &rewriter,
   // perform flattening
   ::coalesceLoops(flattenBand, flattenedTripCount, rewriter);
 
-  // set sym_name
-  if (namePrefix) {
-    flattenBand.front()->setAttr(
-        OpIdentifier, rewriter.getStringAttr(namePrefix.getValue() + "::flat"));
-  }
   // record results
   results.set(cast<OpResult>(getResult()), {flattenBand.front()});
   return DiagnosedSilenceableFailure::success();
@@ -3847,12 +3826,6 @@ transform::ReuseAtOp::apply(transform::TransformRewriter &rewriter,
   auto reuseBuffer = memref::AllocOp::create(
       rewriter, axisLoop.getLoc(),
       MemRefType::get(plan.shape, targetType.getElementType()));
-  if (targetDef) {
-    if (auto targetSymName = targetDef->getAttrOfType<StringAttr>(OpIdentifier))
-      reuseBuffer->setAttr(
-          OpIdentifier, StringAttr::get(reuseBuffer->getContext(),
-                                        targetSymName.getValue() + "::reuse"));
-  }
   if (executionPlan.strategy == ReuseBufferStrategy::Ring) {
     Value zero = arith::ConstantIndexOp::create(rewriter, axisLoop.getLoc(), 0);
     auto newLoopOr = axisLoop.replaceWithAdditionalYields(
@@ -3919,6 +3892,17 @@ transform::ReuseAtOp::apply(transform::TransformRewriter &rewriter,
   return DiagnosedSilenceableFailure::success();
 }
 
+void transform::ReuseAtOp::getEffects(
+    SmallVectorImpl<MemoryEffects::EffectInstance> &effects) {
+  onlyReadsHandle(getTargetMutable(), effects);
+  if (getUseRingBuffer())
+    consumesHandle(getAxisMutable(), effects);
+  else
+    onlyReadsHandle(getAxisMutable(), effects);
+  producesHandle(getOperation()->getOpResults(), effects);
+  modifiesPayload(effects);
+}
+
 ///===----------------------------------------------------------------------===///
 /// LoopPipeline implementation
 ///===----------------------------------------------------------------------===///
@@ -3939,14 +3923,19 @@ transform::TagPipelineOp::applyToOne(transform::TransformRewriter &rewriter,
   return DiagnosedSilenceableFailure::success();
 }
 
+void transform::TagPipelineOp::getEffects(
+    SmallVectorImpl<MemoryEffects::EffectInstance> &effects) {
+  onlyReadsHandle(getLoopMutable(), effects);
+  modifiesPayload(effects);
+}
+
 ///===----------------------------------------------------------------------===///
 /// LoopUnroll implementation
 ///===----------------------------------------------------------------------===///
-DiagnosedSilenceableFailure
-transform::TagUnrollOp::applyToOne(transform::TransformRewriter &rewriter,
-                                   Operation *target,
-                                   transform::ApplyToEachResultList &results,
-                                   transform::TransformState &state) {
+DiagnosedSilenceableFailure transform::AlloLoopUnrollOp::applyToOne(
+    transform::TransformRewriter &rewriter, Operation *target,
+    transform::ApplyToEachResultList &results,
+    transform::TransformState &state) {
   if (!target || !isa<LoopLikeOpInterface>(target)) {
     return emitSilenceableError()
            << "expected target to resolve to exactly one loop-like operation";
@@ -3957,8 +3946,39 @@ transform::TagUnrollOp::applyToOne(transform::TransformRewriter &rewriter,
            << "expected unroll factor to be a non-negative "
            << "integer (0 for full unroll)";
   }
-  target->setAttr("unroll.f", getFactorAttr());
+
+  if (getTagOnly()) {
+    target->setAttr("unroll.f", getFactorAttr());
+    return DiagnosedSilenceableFailure::success();
+  }
+
+  LogicalResult result = failure();
+  if (auto forOp = dyn_cast<scf::ForOp>(target)) {
+    if (factor == 0) {
+      result = loopUnrollFull(forOp);
+    } else {
+      auto unrolled = loopUnrollByFactor(forOp, factor);
+      result = succeeded(unrolled) ? success() : failure();
+    }
+  } else if (auto forOp = dyn_cast<affine::AffineForOp>(target)) {
+    result = factor == 0 ? affine::loopUnrollFull(forOp)
+                         : affine::loopUnrollByFactor(forOp, factor);
+  } else {
+    return emitSilenceableError()
+           << "failed to unroll, expected scf.for or affine.for";
+  }
+  if (failed(result))
+    return emitSilenceableError() << "failed to unroll";
   return DiagnosedSilenceableFailure::success();
+}
+
+void transform::AlloLoopUnrollOp::getEffects(
+    SmallVectorImpl<MemoryEffects::EffectInstance> &effects) {
+  if (getTagOnly())
+    onlyReadsHandle(getLoopsMutable(), effects);
+  else
+    consumesHandle(getLoopsMutable(), effects);
+  modifiesPayload(effects);
 }
 
 ///===----------------------------------------------------------------------===///
@@ -4439,14 +4459,15 @@ transform::BufferAtOp::apply(transform::TransformRewriter &rewriter,
     }
   }
 
-  // Give the local alloc a stable identifier derived from the source buffer
-  // value so front-end value proxies can be reconstructed after refresh.
-  std::string sourceIdentifier = getBufferAtSourceIdentifier(buffer);
-  if (!sourceIdentifier.empty()) {
-    localBuffer->setAttr(OpIdentifier,
-                         rewriter.getStringAttr(sourceIdentifier + "::local"));
-  }
   results.setValues(cast<OpResult>(getResult()), {localBuffer});
 
   return DiagnosedSilenceableFailure::success();
+}
+
+void transform::BufferAtOp::getEffects(
+    SmallVectorImpl<MemoryEffects::EffectInstance> &effects) {
+  onlyReadsHandle(getTargetMutable(), effects);
+  onlyReadsHandle(getAxisMutable(), effects);
+  producesHandle(getOperation()->getOpResults(), effects);
+  modifiesPayload(effects);
 }

@@ -60,39 +60,53 @@ def Allo_OutlineOp : Op<Transform_Dialect, "allo.outline",
   [FunctionalStyleTransformOpTrait, MemoryEffectsOpInterface,
    DeclareOpInterfaceMethods<TransformOpInterface>,
    ReportTrackingListenerFailuresOpTrait]> {
-  let summary = "Outline payload ops into `allo.kernel` + `allo.call`";
+  let summary = "Outline payload ops into a callable + callsite";
   let description = [{
     Input:
       - `$target` is a handle to one or more payload operations.
       - Each payload operation must have at most one region.
-      - `$kernel_name` is the symbol name used for the outlined kernel.
+      - `$kernel_name` is the symbol name used for the outlined callable.
+      - `$mapping`, when present, is the dataflow mapping for the outlined
+        kernel.
 
     Behavior:
       - Each target is outlined independently.
-      - The outlined function is converted to `allo.kernel`.
-      - The original target site is replaced by an `allo.call` to that kernel.
+      - Without `$mapping`, the outlined callable is a `func.func` and the
+        original target site is replaced by a `func.call`.
+      - With `$mapping`, the outlined callable is an `allo.kernel` and the
+        original target site is replaced by an `allo.invoke`.
 
     Output:
-      - `$kernel` contains created `allo.kernel` ops.
-      - `$call` contains created `allo.call` ops.
+      - `$kernel` contains created callable ops.
+      - `$call` contains created callsite ops.
       - Both result handles have one payload op per input payload op.
   }];
 
-  let arguments = (ins TransformHandleTypeInterface:$target, StrAttr:$kernel_name);
+  let arguments = (ins TransformHandleTypeInterface:$target,
+                       StrAttr:$kernel_name,
+                       OptionalAttr<DenseI32ArrayAttr>:$mapping);
   let results = (outs TransformHandleTypeInterface:$kernel, TransformHandleTypeInterface:$call);
   let assemblyFormat = [{
-    $target `to` $kernel_name attr-dict `:` functional-type(operands, results)
+    $target `to` $kernel_name (`mapping` `=` $mapping^)? attr-dict
+      `:` functional-type(operands, results)
   }];
   let builders = [
     OpBuilder<(ins "Value":$target, "StringRef":$kernel_name), [{
       auto anyType = transform::AnyOpType::get($_builder.getContext());
-      build($_builder, $_state, {anyType, anyType}, target, kernel_name);
+      build($_builder, $_state, {anyType, anyType}, target, kernel_name,
+            nullptr);
+    }]>,
+    OpBuilder<(ins "Value":$target, "StringRef":$kernel_name,
+                   "ArrayRef<int32_t>":$mapping), [{
+      auto anyType = transform::AnyOpType::get($_builder.getContext());
+      build($_builder, $_state, {anyType, anyType}, target, kernel_name,
+            $_builder.getDenseI32ArrayAttr(mapping));
     }]>
   ];
 }
 
 def Allo_LoopReorderOp : Op<Transform_Dialect, "allo.reorder",
-  [NavigationTransformOpTrait, MemoryEffectsOpInterface,
+  [DeclareOpInterfaceMethods<MemoryEffectsOpInterface>,
    DeclareOpInterfaceMethods<TransformOpInterface>,
    ReportTrackingListenerFailuresOpTrait]> {
   let summary = "Reorder selected loops in an affine perfect band";
@@ -110,7 +124,7 @@ def Allo_LoopReorderOp : Op<Transform_Dialect, "allo.reorder",
       - Legality is checked with affine loop interchange constraints.
 
     Output:
-      - `$result` contains the reordered loops
+      - No result handle; this op mutates payload IR in place.
   }];
   let arguments = (ins TransformHandleTypeInterface:$loops, DenseI32ArrayAttr:$permutation);
   let results = (outs);
@@ -135,7 +149,6 @@ def Allo_LoopSplitOp : Op<Transform_Dialect, "allo.split",
 
     Behavior:
       - Each payload loop is split independently (`TransformEachOpTrait`).
-      - Input `sym_name` is preserved with suffixes `::outer`/`::inner`.
 
     Output:
       - `$outer` contains outer loops, one per input payload loop.
@@ -180,8 +193,6 @@ def Allo_LoopTileOp : Op<Transform_Dialect, "allo.tile",
 
     Behavior:
       - Uses perfect or imperfect tiling based on selected-loop contiguity.
-      - If input loops carry `sym_name`, outputs are annotated with `::tile` and
-        `::point` suffixes.
 
     Output:
       - `$tile_loops` and `$point_loops` each contain one loop per selected
@@ -221,12 +232,10 @@ def Allo_LoopFlattenOp : Op<Transform_Dialect, "allo.flatten",
       - Flattening requires normalized loops:
         step = 1, constant lower bound = 0, constant positive upper bound.
       - The multiplied trip count must fit in int64.
-      - If fewer than two loops are selected, this op is a no-op.
+      - At least two loops must be selected.
 
     Output:
       - `$result` contains the flattened outermost loop.
-      - For no-op cases (`<2` selected loops), `$result` forwards input payload
-        loops unchanged.
   }];
   let arguments = (ins TransformHandleTypeInterface:$loops);
   let results = (outs TransformHandleTypeInterface:$result);
@@ -270,7 +279,7 @@ def Allo_ComputeAtOp : Op<Transform_Dialect, "allo.compute_at",
 }
 
 def Allo_ReuseAtOp : Op<Transform_Dialect, "allo.reuse_at",
-  [NavigationTransformOpTrait, MemoryEffectsOpInterface,
+  [DeclareOpInterfaceMethods<MemoryEffectsOpInterface>,
    DeclareOpInterfaceMethods<TransformOpInterface>,
    ReportTrackingListenerFailuresOpTrait]> {
   let summary = "Create a reuse buffer at a given affine loop axis";
@@ -304,7 +313,7 @@ def Allo_ReuseAtOp : Op<Transform_Dialect, "allo.reuse_at",
 }
 
 def Allo_BufferAtOp : Op<Transform_Dialect, "allo.buffer_at",
-  [NavigationTransformOpTrait, MemoryEffectsOpInterface,
+  [DeclareOpInterfaceMethods<MemoryEffectsOpInterface>,
    DeclareOpInterfaceMethods<TransformOpInterface>,
    ReportTrackingListenerFailuresOpTrait]> {
   let summary = "Create a buffer at a given affine loop axis";
@@ -336,7 +345,7 @@ def Allo_BufferAtOp : Op<Transform_Dialect, "allo.buffer_at",
 }
 
 def Allo_TagPipelineOp : Op<Transform_Dialect, "allo.pipeline",
-  [NavigationTransformOpTrait, MemoryEffectsOpInterface,
+  [DeclareOpInterfaceMethods<MemoryEffectsOpInterface>,
    TransformOpInterface, TransformEachOpTrait,
    ReportTrackingListenerFailuresOpTrait]> {
   let summary = "Pipeline the given loop nest";
@@ -365,57 +374,30 @@ def Allo_TagPipelineOp : Op<Transform_Dialect, "allo.pipeline",
   }];
 }
 
-def Allo_TagUnrollOp : Op<Transform_Dialect, "allo.unroll",
-  [NavigationTransformOpTrait, MemoryEffectsOpInterface,
+// name as AlloLoopUnrollOp to avoid naming conflict with existing LoopUnrollOp in other dialects
+def Allo_AlloLoopUnrollOp : Op<Transform_Dialect, "allo.unroll",
+  [DeclareOpInterfaceMethods<MemoryEffectsOpInterface>,
    TransformOpInterface, TransformEachOpTrait,
    ReportTrackingListenerFailuresOpTrait]> {
   let summary = "Unroll the given loops by a constant factor";
   let description = [{
     Input:
-      - `$loops` must resolve to loops only.
-      - `$factor` must be a positive integer.
-      - The op does not check whether loops are actually unrollable with the given factor.
+      - `$loops` must resolve to loops.
+      - `$factor` must be a non-negative integer. 0 means full unroll.
 
     Behavior:
-      - Tag the selected loops with the given factor for unrolling.
+      - With `$tag_only`, tag the selected loops with the given factor for HLS
+        unrolling.
+      - Otherwise, structurally unroll `scf.for` or `affine.for` loops.
 
     Output:
       - No result handle; this op mutates payload IR in place.
   }];
-  let arguments = (ins TransformHandleTypeInterface:$loops, I64Attr:$factor);
+  let arguments = (ins TransformHandleTypeInterface:$loops, I64Attr:$factor,
+                   OptionalAttr<UnitAttr>:$tag_only);
   let results = (outs);
   let assemblyFormat = [{
-    $loops `with` $factor attr-dict `:` type($loops)
-  }];
-  let extraClassDeclaration = [{
-    ::mlir::DiagnosedSilenceableFailure applyToOne(
-        ::mlir::transform::TransformRewriter &rewriter,
-        ::mlir::Operation *target,
-        ::mlir::transform::ApplyToEachResultList &results,
-        ::mlir::transform::TransformState &state);
-  }];
-}
-
-def Allo_RenameOp : Op<Transform_Dialect, "allo.rename",
-  [NavigationTransformOpTrait, MemoryEffectsOpInterface,
-   TransformOpInterface, TransformEachOpTrait,
-   ReportTrackingListenerFailuresOpTrait]> {
-  let summary = "Rename the given operations";
-  let description = [{
-    Input:
-      - `$target` must resolve to operations only.
-      - `$name` is the new name for the target operations.
-
-    Behavior:
-      - Rename all target operations to the given name.
-
-    Output:
-      - No result handle; this op mutates payload IR in place.
-  }];
-  let arguments = (ins TransformHandleTypeInterface:$target, StrAttr:$name);
-  let results = (outs);
-  let assemblyFormat = [{
-    $target `to` $name attr-dict `:` type($target)
+    $loops `with` $factor (`tag_only` $tag_only^)? attr-dict `:` type($loops)
   }];
   let extraClassDeclaration = [{
     ::mlir::DiagnosedSilenceableFailure applyToOne(
@@ -469,7 +451,7 @@ def Allo_MatchValueOp : Op<Transform_Dialect, "allo.match_value",
 }
 
 def Allo_PartitionOp : Op<Transform_Dialect, "allo.partition", [
-  NavigationTransformOpTrait, MemoryEffectsOpInterface,
+  DeclareOpInterfaceMethods<MemoryEffectsOpInterface>,
   DeclareOpInterfaceMethods<TransformOpInterface>,
   ReportTrackingListenerFailuresOpTrait]> {
   let summary = "Partition the given array";

@@ -17,9 +17,12 @@
 #include "mlir/IR/IntegerSet.h"
 #include "mlir/IR/MLIRContext.h"
 #include "mlir/IR/Verifier.h"
+#include "mlir/Parser/Parser.h"
 #include "mlir/Pass/PassManager.h"
+#include "mlir/Support/FileUtilities.h"
 #include "mlir/Transforms/Passes.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/Support/SourceMgr.h"
 
 #include "allo/InitAllDialects.h"
 #include "allo/InitAllExtensions.h"
@@ -448,7 +451,32 @@ static void bindCoreIR(nb::module_ &m) {
              if (!sym)
                return std::nullopt;
              return sym;
-           });
+           })
+      .def_static("from_string",
+                  [](MLIRContext *ctx, std::string_view source) {
+                    ParserConfig config(ctx, true, nullptr);
+                    auto module =
+                        mlir::parseSourceString<ModuleOp>(source, config);
+                    if (!module)
+                      throw std::runtime_error(
+                          "failed to parse MLIR module from string");
+                    return module.release();
+                  })
+      .def_static("from_file", [](MLIRContext *ctx, std::string_view filename) {
+        std::string errorMessage;
+        auto file = mlir::openInputFile(filename, &errorMessage);
+        if (!file)
+          throw std::runtime_error("failed to open file: " + errorMessage);
+
+        llvm::SourceMgr sourceMgr;
+        sourceMgr.AddNewSourceBuffer(std::move(file), llvm::SMLoc());
+        ParserConfig config(ctx, true, nullptr);
+        auto module = mlir::parseSourceFile<ModuleOp>(sourceMgr, config);
+        if (!module)
+          throw std::runtime_error("failed to parse MLIR module from file: " +
+                                   std::string(filename));
+        return module.release();
+      });
 }
 
 static void bindTypes(nb::module_ &m) {

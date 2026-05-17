@@ -388,8 +388,6 @@ raiseForOp(transform::TransformRewriter &rewriter, scf::ForOp forOp,
     rewriter.mergeBlocks(forOp.getBody(), affineLoop.getBody(), argRepls);
     // After raising loops, try to raise in-body memref accesses to affine ops.
     raiseAccesses(builder, rewriter, affineLoop);
-    if (forOp->hasAttr(OpIdentifier))
-      affineLoop->setAttr(OpIdentifier, forOp->getAttr(OpIdentifier));
     rewriter.replaceOp(forOp, affineLoop);
     results.push_back(affineLoop);
     return DiagnosedSilenceableFailure::success();
@@ -481,8 +479,6 @@ raiseParallelOp(transform::TransformRewriter &rewriter, scf::ParallelOp parOp,
   ValueRange affineIvs(affineParallel.getIVs());
   rewriter.mergeBlocks(parOp.getBody(), affineParallel.getBody(), affineIvs);
   raiseAccesses(builder, rewriter, affineParallel);
-  if (parOp->hasAttr(OpIdentifier))
-    affineParallel->setAttr(OpIdentifier, parOp->getAttr(OpIdentifier));
   rewriter.replaceOp(parOp, affineParallel->getResults());
   results.push_back(affineParallel);
   return DiagnosedSilenceableFailure::success();

@@ -43,7 +43,7 @@ void bindTensorOps(nb::module_ &m);
 void bindMemRefOps(nb::module_ &m);
 void bindLinalgOps(nb::module_ &m);
 void bindTransform(nb::module_ &m);
-void bindUtils(nb::module_ &m);
+void bindSchedule(nb::module_ &m);
 void bindUBOps(nb::module_ &m);
 void bindAlloOps(nb::module_ &m);
 void bindPasses(nb::module_ &m);

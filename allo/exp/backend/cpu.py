@@ -14,21 +14,31 @@ import numpy as np
 
 from .utils import make_project_path
 
-from ..lang.core import APFloat, APInt, BufferType, DType, IndexType, TypeBase
+from ..lang.core import (
+    APFloat,
+    APInt,
+    BufferType,
+    DType,
+    IndexType,
+    StreamType,
+    TypeBase,
+)
 from ..logging import log_debug, stage, terminate_on_error
-from .base import Backend
+from .base import Backend, ModuleCacheEntry
 from ..lang.kernel import Kernel
-from .._C.ir import ModuleOp, OwningModuleOp, UnitAttr
+from .._C.ir import UnitAttr
 from .._C.execution_engine import ExecutionEngine
 
 
 @dataclass
-class _CPUCompileCacheEntry:
-    module_owner: OwningModuleOp
-    module: ModuleOp
-    engine: ExecutionEngine
+class _CPUCompileCacheEntry(ModuleCacheEntry):
+    engine: ExecutionEngine | None
     arg_types: list[TypeBase]
     res_types: list[TypeBase]
+
+    def close(self) -> None:
+        self.engine = None
+        super().close()
 
 
 class _F16(ctypes.Structure):
@@ -74,6 +84,53 @@ _DTYPE_TO_CTYPE = {
 }
 
 
+def _find_first(paths: list[Path], stem: str) -> str | None:
+    for lib_dir in paths:
+        for suffix in (".dylib", ".so"):
+            path = lib_dir / f"{stem}{suffix}"
+            if path.exists():
+                return str(path)
+    return None
+
+
+def _dataflow_runtime_lib() -> str:
+    exp_dir = Path(__file__).resolve().parents[1]
+    candidates = [
+        exp_dir / "_C",
+        exp_dir.parents[1] / "build" / "lib",
+    ]
+    path = _find_first(candidates, "liballo_dataflow_runtime")
+    if path is None:
+        raise RuntimeError(
+            "Cannot find liballo_dataflow_runtime. Rebuild Allo with `pip install -v -e .`."
+        )
+    return path
+
+
+def _libomp() -> str:
+    candidates = []
+    llvm_base_dir = os.environ.get("LLVM_BASE_DIR")
+    if llvm_base_dir:
+        llvm_base = Path(llvm_base_dir)
+        candidates.append(llvm_base / "lib")
+        candidates.append(
+            llvm_base / "runtimes" / "runtimes-bins" / "openmp" / "runtime" / "src"
+        )
+    default_llvm = (
+        Path(__file__).resolve().parents[3] / "externals" / "llvm-project" / "build"
+    )
+    candidates.append(default_llvm / "lib")
+    candidates.append(
+        default_llvm / "runtimes" / "runtimes-bins" / "openmp" / "runtime" / "src"
+    )
+    path = _find_first(candidates, "libomp")
+    if path is None:
+        raise RuntimeError(
+            "Cannot find libomp in LLVM_BASE_DIR or externals LLVM build"
+        )
+    return path
+
+
 def _default_shared_libs() -> list[str]:
     llvm_base_dir = os.environ.get("LLVM_BASE_DIR")
     candidates = []
@@ -105,7 +162,7 @@ def _default_shared_libs() -> list[str]:
         if len(found) == 2:
             libs.extend(found)
             break
-    return libs
+    return [*libs, _libomp(), _dataflow_runtime_lib()]
 
 
 def _make_nd_memref_descriptor(rank: int, dtype):
@@ -377,6 +434,7 @@ class CPU(Backend, Generic[P, R]):
         cached = self._process_cache_get("cpu.compile", cache_key)
         if cached is not None:
             log_debug(f"Cache hit for CPU compilation: {cache_key[-8:]}")
+            self._context_keepalive = cached.context
             self._module_owner = cached.module_owner
             self.module = cached.module
             self.engine = cached.engine
@@ -389,6 +447,10 @@ class CPU(Backend, Generic[P, R]):
             assert self._module_owner is not None
             arg_types = self.kernel.parse_argument_annotations()
             res_types = self.kernel.parse_return_annotation()
+            if any(isinstance(ty, StreamType) for ty in arg_types):
+                raise NotImplementedError(
+                    "CPU backend does not support stream top-level arguments"
+                )
 
             top = module.lookup_kernel(self.kernel.func_name)
             if top is None:
@@ -412,6 +474,7 @@ class CPU(Backend, Generic[P, R]):
                 "cpu.compile",
                 cache_key,
                 _CPUCompileCacheEntry(
+                    context=self._context_keepalive,
                     module_owner=self._module_owner,
                     module=module,
                     engine=engine,
