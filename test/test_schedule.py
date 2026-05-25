@@ -1,4 +1,4 @@
-from allo.exp.lang.core import i32
+from allo.exp.lang.core import grid, i32, range
 from allo.exp.lang.kernel import kernel
 from allo.exp.schedule import Schedule
 
@@ -16,7 +16,7 @@ module {
 
 def test_schedule_from_string():
     s = Schedule.from_string(AFFINE_LOOP_IR)
-    loop = s.query.loop().one()
+    loop = s.loop()
 
     s.pipeline(loop, ii=2).apply()
 
@@ -31,7 +31,7 @@ def test_pipeline_kernel_loop():
             B[i] = A[i] + 1
 
     s = top.schedule()
-    loop = s.query.loop().one()
+    loop = s.loop()
 
     s.pipeline(loop, ii=2).apply()
 
@@ -42,6 +42,22 @@ def test_pipeline_kernel_loop():
     assert s.payload.verify()
 
 
+def test_named_range_loop():
+    @kernel
+    def top(A: "i32[16]", B: "i32[16]"):
+        for i in range(16, name="i"):
+            B[i] = A[i] + 1
+
+    s = top.schedule()
+    loop = s.loop("i")
+
+    s.pipeline(loop, ii=2).apply()
+
+    assert loop.name == "i"
+    assert "pipeline.ii = 2 : i64" in str(s.payload)
+    assert s.payload.verify()
+
+
 def test_split_returns_live_loops():
     @kernel
     def top(A: "i32[16]", B: "i32[16]"):
@@ -49,7 +65,7 @@ def test_split_returns_live_loops():
             B[i] = A[i] + 1
 
     s = top.schedule()
-    loop = s.query.loop().one()
+    loop = s.loop()
 
     outer, inner = s.split(loop, factor=4)
     s.pipeline(inner, ii=1).apply()
@@ -62,6 +78,25 @@ def test_split_returns_live_loops():
     assert s.payload.verify()
 
 
+def test_named_nested_range_loops():
+    @kernel
+    def top(A: "i32[4,4]", B: "i32[4,4]"):
+        for i in range(4, name="i"):
+            for j in range(4, name="j"):
+                B[i, j] = A[i, j] + 1
+
+    s = top.schedule()
+    i, j = s.loops("i", "j")
+
+    i, j = s.affine((i, j))
+    flat = s.flatten((i, j))
+
+    assert [loop.name for loop in (i, j)] == ["i", "j"]
+    assert flat.id in s.snapshot.ops_by_id
+    assert str(s.payload).count("affine.for") == 1
+    assert s.payload.verify()
+
+
 def test_flatten_nested_loops():
     @kernel
     def top(A: "i32[4,4]", B: "i32[4,4]"):
@@ -70,8 +105,8 @@ def test_flatten_nested_loops():
                 B[i, j] = A[i, j] + 1
 
     s = top.schedule()
-    s.polyhedral(s.query.loop().all())
-    flat = s.flatten(s.query.loop().all())
+    loops = s.affine(s.loops())
+    flat = s.flatten(loops)
 
     text = str(s.payload)
     assert flat.id in s.snapshot.ops_by_id
@@ -80,21 +115,33 @@ def test_flatten_nested_loops():
     assert s.payload.verify()
 
 
+def test_named_grid_loop_like_op():
+    @kernel
+    def top(A: "i32[4,4]", B: "i32[4,4]"):
+        for i, j in grid(4, 4, name="ij"):
+            B[i, j] = A[i, j] + 1
+
+    s = top.schedule()
+    loop = s.loop("ij")
+
+    assert loop.name == "ij"
+    assert loop.kind == "scf.parallel"
+    assert loop.id in s.snapshot.ops_by_id
+
+
 def test_compute_at_kernel():
     @kernel
     def top(A: "i32[8]", C: "i32[8]"):
         B: "i32[8]" = 0
-        for i in range(8):
+        for i in range(8, name="i"):
             B[i] = A[i] * 2
-        for j in range(8):
+        for j in range(8, name="j"):
             C[j] = B[j] + 1
 
     s = top.schedule()
-    s.polyhedral(s.query.loop().all())
-    producer = s.query.op(kind="affine.store").all()[0]
-    consumer_loop = s.query.loop().all()[1]
+    producer_loop, consumer_loop = s.affine(s.loops("i", "j"))
 
-    loop = s.compute_at(producer, consumer_loop)
+    loop = s.compute_at(producer_loop, consumer_loop)
 
     text = str(s.payload)
     assert loop.id in s.snapshot.ops_by_id
@@ -107,15 +154,15 @@ def test_buffer_at_single_level():
     @kernel
     def top(out: "i32[4,4]"):
         B: "i32[4,4]" = 0
-        for i in range(4):
-            for j in range(4):
+        for i in range(4, name="i"):
+            for j in range(4, name="j"):
                 B[i, j] = i + j
                 out[i, j] = B[i, j]
 
     s = top.schedule()
-    s.polyhedral(s.query.loop().all())
-    buffer = s.query.buffer("B").one()
-    axis = s.query.loop().all()[0]
+    s.affine(s.loops())
+    buffer = s.buffer("B")
+    axis = s.loop("i")
 
     local = s.buffer_at(buffer, axis)
 

@@ -9,5 +9,4 @@ add_mlir_library(MLIRAlloTranslation
 
   LINK_LIBS PUBLIC
   MLIRAllo
-  MLIRLinalgDialect
 )

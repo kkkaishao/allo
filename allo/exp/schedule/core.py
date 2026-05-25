@@ -95,6 +95,50 @@ class Schedule:
         assert isinstance(ref, OpRef), f"unsupported ref type: {type(ref)}"
         return self.snapshot.op_ref(ref.id)
 
+    #####################################
+    # Alias methods for query operations
+    # To simplify the use of the schedule API
+    ####################################
+
+    def op(
+        self,
+        name: str | None = None,
+        *,
+        under: OpRef | str | None = None,
+        kind: str | None = None,
+        path: str | None = None,
+    ) -> OpRef:
+        return self.query.op(name, under=under, kind=kind, path=path).one()
+
+    def loop(
+        self,
+        name: str | None = None,
+        *,
+        under: OpRef | str | None = None,
+        path: str | None = None,
+    ) -> LoopRef:
+        return self.query.loop(name, under=under, path=path).one()
+
+    def loops(
+        self,
+        *names: str,
+        under: OpRef | str | None = None,
+        path: str | None = None,
+    ) -> tuple[LoopRef, ...]:
+        selection = self.query.loop(under=under, path=path)
+        if names:
+            return selection.names(*names)
+        return tuple(selection.all())
+
+    def buffer(
+        self,
+        name: str | None = None,
+        *,
+        under: OpRef | str | None = None,
+        path: str | None = None,
+    ) -> BufferRef:
+        return self.query.buffer(name, under=under, path=path).one()
+
     def cse(self, targets: Targets = None) -> Schedule:
         ops = self._resolve_op_targets(targets, "cse")
         self.script.set_callsite_loc()
@@ -287,24 +331,26 @@ class Schedule:
         )
         return self
 
-    def polyhedral(self, targets: Targets = None) -> Schedule:
-        loops = self._resolve_loop_targets(targets, "polyhedral")
+    def affine(self, targets: Targets = None) -> list[LoopRef]:
+        loops = self._resolve_loop_targets(targets, "affine")
         self.script.set_callsite_loc()
         for loop in loops:
             raised = tran_d.RaiseToAffineOp(
                 self.script.builder, self.script.op_handle(loop)
             ).get_result_at(0)
             self.script.annotate_schedule_id(raised, loop.id)
+            if loop.name is not None:
+                self.script.annotate_schedule_name(raised, loop.name)
             self.script.set_op_handle(loop, raised)
 
         self._mark_dirty()
         self._record_effect(
-            "polyhedral",
+            "affine",
             topology=True,
             targets=[loop.path for loop in loops],
         )
         self.apply()
-        return self
+        return [self.snapshot.loop_ref(loop.id) for loop in loops]
 
     def compute_at(self, target: SingleTarget, axis: SingleTarget) -> LoopRef:
         producer = self._resolve_single_op_target(target, "compute_at target")

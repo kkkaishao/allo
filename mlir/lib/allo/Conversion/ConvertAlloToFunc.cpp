@@ -5,6 +5,7 @@
 #include "mlir/Transforms/DialectConversion.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 
+#include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/STLExtras.h"
 
 #include "allo/Conversion/Passes.h"
@@ -28,6 +29,8 @@ static std::string makeInstanceName(StringRef base, ArrayRef<int32_t> grid) {
 
 using GridCoord = SmallVector<int32_t, 4>;
 using Grid = SmallVector<GridCoord>;
+using LoweredKernelMap =
+    DenseMap<StringAttr, SmallVector<FlatSymbolRefAttr, 4>>;
 
 static Grid generateGrid(ArrayRef<int32_t> mapping) {
   Grid grid(1, GridCoord(mapping.size(), 0));
@@ -56,10 +59,60 @@ static void copyInvokeAttrs(InvokeOp invoke, func::CallOp call) {
     call.setResAttrsAttr(resAttrs);
 }
 
+static LogicalResult lowerInvokeToFuncCalls(InvokeOp invoke,
+                                            ValueRange operands,
+                                            TypeRange results,
+                                            ArrayRef<FlatSymbolRefAttr> callees,
+                                            PatternRewriter &rewriter) {
+  assert(!callees.empty() && "expected at least one lowered callee");
+  rewriter.setInsertionPoint(invoke);
+  if (callees.size() == 1) {
+    auto call = func::CallOp::create(rewriter, invoke->getLoc(),
+                                     callees.front(), results, operands);
+    copyInvokeAttrs(invoke, call);
+    rewriter.replaceOp(invoke, call.getResults());
+    return success();
+  }
+
+  if (invoke->getNumResults() != 0)
+    return invoke->emitError()
+           << "Cannot convert non-void invokes to multiple func calls";
+
+  for (auto callee : callees) {
+    auto call = func::CallOp::create(rewriter, invoke->getLoc(), callee,
+                                     TypeRange{}, operands);
+    copyInvokeAttrs(invoke, call);
+  }
+  rewriter.eraseOp(invoke);
+  return success();
+}
+
+static LogicalResult lowerKnownInvokes(Operation *op,
+                                       LoweredKernelMap &loweredKernels,
+                                       PatternRewriter &rewriter) {
+  SmallVector<InvokeOp> invokes;
+  op->walk([&](InvokeOp invoke) {
+    if (loweredKernels.contains(invoke.getCalleeAttr().getAttr()))
+      invokes.push_back(invoke);
+  });
+
+  for (InvokeOp invoke : invokes) {
+    auto it = loweredKernels.find(invoke.getCalleeAttr().getAttr());
+    assert(it != loweredKernels.end() && "known invoke must have a callee");
+    if (failed(lowerInvokeToFuncCalls(invoke, invoke.getOperands(),
+                                      invoke->getResultTypes(), it->second,
+                                      rewriter)))
+      return failure();
+  }
+  return success();
+}
+
 namespace {
 struct ConvertKernelToFunc : OpRewritePattern<KernelOp> {
-  ConvertKernelToFunc(MLIRContext *ctx, Operation *symbolTableOp)
-      : OpRewritePattern(ctx), symbolTableOp(symbolTableOp) {}
+  ConvertKernelToFunc(MLIRContext *ctx, Operation *symbolTableOp,
+                      LoweredKernelMap &loweredKernels)
+      : OpRewritePattern(ctx), symbolTableOp(symbolTableOp),
+        loweredKernels(loweredKernels) {}
 
   LogicalResult matchAndRewrite(KernelOp op,
                                 PatternRewriter &rewriter) const override {
@@ -70,18 +123,20 @@ struct ConvertKernelToFunc : OpRewritePattern<KernelOp> {
                                 "identical mapping to func";
 
     Grid grid = generateGrid(mapping);
-    rewriter.setInsertionPoint(op);
     SmallVector<func::FuncOp> fns;
+    SmallVector<FlatSymbolRefAttr, 4> loweredCallees;
     for (auto &coord : grid) {
       std::string instName = identityMapping
                                  ? op.getSymName().str()
                                  : makeInstanceName(op.getSymName(), coord);
+      rewriter.setInsertionPoint(op);
       auto fn =
           func::FuncOp::create(rewriter, op->getLoc(), instName,
                                op.getFunctionType(), op.getSymVisibilityAttr(),
                                op.getArgAttrsAttr(), op.getResAttrsAttr());
       fn->setDiscardableAttrs(op->getDiscardableAttrDictionary());
       fns.push_back(fn);
+      loweredCallees.push_back(FlatSymbolRefAttr::get(fn));
       rewriter.cloneRegionBefore(op.getRegion(), fn.getBody(),
                                  fn.getBody().begin());
 
@@ -101,6 +156,13 @@ struct ConvertKernelToFunc : OpRewritePattern<KernelOp> {
     }
 
     assert(!fns.empty() && "kernel conversion must create at least one func");
+    assert(!loweredKernels.contains(op.getSymNameAttr()) &&
+           "kernel must be converted only once");
+    loweredKernels.insert({op.getSymNameAttr(), loweredCallees});
+    for (auto fn : fns)
+      if (failed(lowerKnownInvokes(fn, loweredKernels, rewriter)))
+        return failure();
+
     SmallVector<InvokeOp> invokes;
     auto uses = SymbolTable::getSymbolUses(op.getSymNameAttr(), symbolTableOp);
     if (!uses)
@@ -117,49 +179,38 @@ struct ConvertKernelToFunc : OpRewritePattern<KernelOp> {
       invokes.push_back(invoke);
     }
 
-    for (InvokeOp invoke : invokes) {
-      rewriter.setInsertionPoint(invoke);
-      if (identityMapping) {
-        auto call = func::CallOp::create(rewriter, invoke->getLoc(),
-                                         fns.front(), invoke.getOperands());
-        copyInvokeAttrs(invoke, call);
-        rewriter.replaceOp(invoke, call);
-      }
-      assert(invoke->getNumResults() == 0 &&
-             "non-identical kernel invokes must be void");
-      for (auto fn : fns) {
-        auto call = func::CallOp::create(rewriter, invoke->getLoc(), fn,
-                                         invoke.getOperands());
-        copyInvokeAttrs(invoke, call);
-      }
-      rewriter.eraseOp(invoke);
-    }
+    for (InvokeOp invoke : invokes)
+      if (failed(lowerInvokeToFuncCalls(invoke, invoke.getOperands(),
+                                        invoke->getResultTypes(),
+                                        loweredCallees, rewriter)))
+        return failure();
     rewriter.eraseOp(op);
     return success();
   }
 
 private:
   Operation *symbolTableOp;
+  LoweredKernelMap &loweredKernels;
 };
 } // namespace
 
 namespace {
 struct ConvertInvokeToFunc : OpConversionPattern<InvokeOp> {
-  using OpConversionPattern<InvokeOp>::OpConversionPattern;
+  ConvertInvokeToFunc(MLIRContext *ctx, LoweredKernelMap &loweredKernels)
+      : OpConversionPattern(ctx), loweredKernels(loweredKernels) {}
 
   LogicalResult
   matchAndRewrite(InvokeOp op, OpAdaptor adapter,
                   ConversionPatternRewriter &rewriter) const override {
-    if (SymbolTable::lookupNearestSymbolFrom<KernelOp>(op, op.getCalleeAttr()))
+    auto it = loweredKernels.find(op.getCalleeAttr().getAttr());
+    if (it == loweredKernels.end())
       return failure();
-    rewriter.setInsertionPoint(op);
-    auto call =
-        func::CallOp::create(rewriter, op->getLoc(), op.getCalleeAttr(),
-                             op->getResultTypes(), adapter.getOperands());
-    copyInvokeAttrs(op, call);
-    rewriter.replaceOp(op, call.getResults());
-    return success();
+    return lowerInvokeToFuncCalls(op, adapter.getOperands(),
+                                  op->getResultTypes(), it->second, rewriter);
   }
+
+private:
+  LoweredKernelMap &loweredKernels;
 };
 } // namespace
 
@@ -186,8 +237,9 @@ struct ConvertAlloToFuncPass
     : public allo::impl::ConvertAlloToFuncPassBase<ConvertAlloToFuncPass> {
   void runOnOperation() override {
     MLIRContext *context = &getContext();
+    LoweredKernelMap loweredKernels;
     RewritePatternSet patterns(context);
-    patterns.add<ConvertKernelToFunc>(context, getOperation());
+    patterns.add<ConvertKernelToFunc>(context, getOperation(), loweredKernels);
     if (failed(applyPatternsGreedily(getOperation(), std::move(patterns))))
       return signalPassFailure();
 
@@ -196,7 +248,8 @@ struct ConvertAlloToFuncPass
     target.addLegalDialect<arith::ArithDialect, func::FuncDialect,
                            omp::OpenMPDialect>();
     target.addIllegalOp<KernelOp, ReturnOp, GetWorkerIdOp, GetNumWorkersOp>();
-    patterns.add<ConvertInvokeToFunc, ConvertReturnToFunc>(context);
+    patterns.add<ConvertInvokeToFunc>(context, loweredKernels);
+    patterns.add<ConvertReturnToFunc>(context);
     if (failed(applyPartialConversion(getOperation(), target,
                                       std::move(patterns))))
       signalPassFailure();

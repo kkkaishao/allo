@@ -109,7 +109,7 @@ class Vitis(Backend, Generic[P, R]):
             Path(vitis_home) / "settings64.sh" if vitis_home else DEFAULT_VITIS_SETTINGS
         )
         self._vitis_home = Path(vitis_home) if vitis_home else None
-        self.tool: VitisTool = detect_vitis_tool(self._settings64)
+        self.tool: VitisTool | None = None
         # setup project related settings
         self._project_path = Path(project_path) if project_path else None
         self._freq_mhz = freq_mhz
@@ -145,6 +145,10 @@ class Vitis(Backend, Generic[P, R]):
         elif part is not None:
             self._part = part
             self._device = ""
+
+    def _require_vitis_tool(self):
+        if self.tool is None:
+            self.tool = detect_vitis_tool(self._settings64)
 
     @property
     def part(self) -> str:
@@ -405,6 +409,7 @@ class Vitis(Backend, Generic[P, R]):
 
     @terminate_on_error
     def csim(self, *args, exist_ok: bool = True) -> Any:
+        self._require_vitis_tool()
         project_path, cache_key = self._materialize_csim_cache(exist_ok=exist_ok)
         if not exist_ok:
             self.csimulator = None
@@ -415,6 +420,7 @@ class Vitis(Backend, Generic[P, R]):
     @terminate_on_error
     def synth(self, *, exist_ok: bool = True) -> VitisSynthReport:
         """Generate an HLS csyn project and invoke Vitis HLS."""
+        self._require_vitis_tool()
         project_path = self.scaffold_project(exist_ok=exist_ok)
         self._invoke_csyn(project_path)
         artifacts = self._ensure_compiled()

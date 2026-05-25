@@ -257,6 +257,21 @@ def test_if_branch_local_buffers():
     )
 
 
+def test_if_branch_local_loop_carried_value():
+    @kernel
+    def top(cond: allo_bool, x: i32, out: "i32[1]"):
+        if cond:
+            out[0] = x
+        else:
+            c: i32 = 0
+            for _ in range(2):
+                c += x
+            out[0] = c
+
+    ir = _compile_ir(top)
+    _assert_contains(ir, "scf.if", "scf.for")
+
+
 def test_ternary_expression():
     @kernel
     def top(cond: allo_bool, x: i32, y: i32, out: "i32[1]"):
@@ -564,6 +579,25 @@ def test_stream_nested_parameter_ir():
         "invoke @top.worker",
         "allo.stream.put",
         "allo.stream.get",
+    )
+
+
+def test_nested_kernel_mapping_ir():
+    @kernel
+    def top(out: "i32[1]"):
+        workers: constexpr = 2
+
+        @kernel(mapping=[workers])
+        def worker(buf: "i32[1]"):
+            buf[0] = 1
+
+        worker(out)
+
+    ir = _compile_ir(top)
+    _assert_contains(
+        ir,
+        "allo.kernel private @top.worker(%buf: memref<1xi32>) mapping=[2]",
+        "invoke @top.worker",
     )
 
 

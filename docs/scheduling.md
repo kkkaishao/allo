@@ -10,35 +10,49 @@ keywords: ["Allo", "Scheduling", "Schedule", "Transform", "MLIR"]
 
 This document describes the experimental schedule frontend under
 `allo.exp.schedule`. The scheduler works on MLIR modules and builds transform
-scripts against stable operation and value references. The public entry point is
-`Schedule`.
+scripts against stable operation and value references. For normal frontend use,
+construct a schedule from a kernel with `kernel.schedule()`.
 
 ```python
-from allo.exp.schedule import Schedule
+from allo.exp.lang.core import i32, range
+from allo.exp.lang.kernel import kernel
 
 
-schedule = Schedule.from_string(mlir_text)
-loop = schedule.query.loop().one()
+@kernel
+def top(A: "i32[16]", B: "i32[16]"):
+    for i in range(16, name="i"):
+        B[i] = A[i] + 1
 
-schedule.pipeline(loop, ii=2).unroll(loop, factor=4).apply()
 
-print(schedule.payload)
+s = top.schedule()
+i = s.loop("i")
+
+s.pipeline(i, ii=2).unroll(i, factor=4).apply()
+
+print(s.payload)
 ```
 
-The current scheduler is intentionally close to MLIR. It does not yet expose the
-older upstream `allo.customize` scheduling surface. Users select operations,
-loops, and buffers from the payload IR, apply schedule primitives, and inspect
-the transformed payload module.
+The current scheduler does not expose the older upstream `allo.customize`
+scheduling surface. Users select operations, loops, and buffers with typed refs,
+apply schedule primitives, and inspect the transformed payload module. The
+recommended selection APIs are the short aliases on `Schedule`, such as
+`s.loop("i")`, `s.loops("i", "j")`, `s.op("top")`, and `s.buffer("B")`.
 
 ## Constructing a Schedule
 
-`Schedule` can be constructed from an existing MLIR module, a text string, or a
-file:
+For frontend kernels, use `Kernel.schedule()`:
 
 ```python
-schedule = Schedule.from_module(module)
-schedule = Schedule.from_string(mlir_text)
-schedule = Schedule.from_file("kernel.mlir")
+s = top.schedule()
+```
+
+`Schedule` can also be constructed from an existing MLIR module, a text string,
+or a file:
+
+```python
+s = Schedule.from_module(module)
+s = Schedule.from_string(mlir_text)
+s = Schedule.from_file("kernel.mlir")
 ```
 
 The important public fields are:
@@ -47,7 +61,7 @@ The important public fields are:
 | --- | --- |
 | `payload` | The mutable MLIR module being scheduled. |
 | `snapshot` | Immutable view of operations and buffer values at the current schedule epoch. |
-| `query` | Query object used to select operations, loops, and buffers. |
+| `query` | Low-level query object used by the convenience selection aliases. |
 | `epoch` | Integer version of the topology snapshot. |
 | `dirty` | Whether pending transform operations have not been applied yet. |
 | `effects` | Recorded schedule effects for diagnostics and debugging. |
@@ -56,22 +70,31 @@ On construction, the scheduler annotates the payload with internal schedule IDs
 and collects a snapshot. These IDs are used to reconnect Python references to
 payload operations after transforms run.
 
-## Querying Targets
+## Selecting Targets
 
-Queries return a `RefSelection`. A selection can be converted to refs with
-`.one()`, `.first()`, `.all()`, or `.names(...)`.
+The user-facing selection methods on `Schedule` return refs directly:
 
 ```python
-loop = schedule.query.loop().one()
-loops = schedule.query.loop().all()
-i, j = schedule.query.loop().names("i", "j")
+i = s.loop("i")
+i, j = s.loops("i", "j")
+all_loops = s.loops()
 
-kernel = schedule.query.op("kernel").one()
-stores = schedule.query.op(kind="affine.store").all()
-buffer = schedule.query.buffer("tmp").one()
+top = s.op("top")
+B = s.buffer("B")
 ```
 
-The query methods are:
+These methods are aliases over the lower-level `s.query` API:
+
+| Alias | Equivalent query |
+| --- | --- |
+| `s.op(name, under=None, kind=None, path=None)` | `s.query.op(...).one()` |
+| `s.loop(name, under=None, path=None)` | `s.query.loop(...).one()` |
+| `s.loops()` | `tuple(s.query.loop().all())` |
+| `s.loops("i", "j")` | `s.query.loop().names("i", "j")` |
+| `s.buffer(name, under=None, path=None)` | `s.query.buffer(...).one()` |
+
+The lower-level query methods return a `RefSelection`. Use them when you need
+`.first()`, `.all()`, `kind=...`, `path=...`, or other MLIR-oriented selection:
 
 | Method | Result |
 | --- | --- |
@@ -80,9 +103,27 @@ The query methods are:
 | `query.loops(...)` | Alias for `query.loop(...)`. |
 | `query.buffer(name=None, under=None, path=None)` | Select buffer-like operation operands or results. |
 
-`under` scopes a query to operations nested under another operation ref or name.
-`path` selects a specific snapshot path. `kind` matches the MLIR operation name,
-for example `affine.for` or `func.func`.
+`under` scopes a query or alias to operations nested under another operation ref
+or name. `path` selects a specific snapshot path. `kind` matches the MLIR
+operation name, for example `affine.for` or `allo.kernel`; it is intentionally
+kept on `op`/`query.op` for advanced use.
+
+Loop names come from the frontend iterator names:
+
+```python
+@kernel
+def top(A: "i32[4,4]", B: "i32[4,4]"):
+    for i in range(4, name="i"):
+        for j in range(4, name="j"):
+            B[i, j] = A[i, j] + 1
+
+
+s = top.schedule()
+i, j = s.loops("i", "j")
+```
+
+`grid(..., name="ij")` names the whole loop-like `scf.parallel` operation, not
+the individual axes.
 
 Refs are lightweight immutable objects:
 
@@ -93,7 +134,8 @@ Refs are lightweight immutable objects:
 | `BufferRef` | Reference to a buffer value owned by an operation. |
 
 Schedule primitives accept refs, names, or iterables of refs/names where a
-multi-target operation is meaningful. A name must resolve unambiguously.
+multi-target operation is meaningful. A name must resolve unambiguously. If a
+name is missing or ambiguous, the scheduler reports a source-aware diagnostic.
 
 ## Schedule Primitives
 
@@ -136,12 +178,12 @@ Partition kind is one of `Schedule.Complete`, `Schedule.Block`, or
 partitions require a positive factor.
 
 ```python
-loop = schedule.query.loop().one()
-buf = schedule.query.buffer("A").one()
+loop = s.loop("i")
+A = s.buffer("A")
 
-schedule.pipeline(loop, ii=2)
-schedule.partition(buf, dim=1, kind=Schedule.Cyclic, factor=4)
-schedule.apply()
+s.pipeline(loop, ii=2)
+s.partition(A, dim=1, kind=Schedule.Cyclic, factor=4)
+s.apply()
 ```
 
 `unroll(..., tag_only=False)` performs physical unrolling and applies
@@ -160,13 +202,13 @@ refs for the new topology.
 | `schedule.flatten(targets)` | Flatten two or more loops and return the new loop ref. |
 
 ```python
-i, j = schedule.query.loop().all()
+i, j = s.loops("i", "j")
 
-outer, inner = schedule.split(i, factor=4)
-schedule.pipeline(inner, ii=1).apply()
+outer, inner = s.split(i, factor=4)
+s.pipeline(inner, ii=1).apply()
 
-tiles, points = schedule.tile([outer, j], factors=[2, 4])
-schedule.pipeline(points[-1], ii=1).apply()
+tiles, points = s.tile([outer, j], factors=[2, 4])
+s.pipeline(points[-1], ii=1).apply()
 ```
 
 `reorder`, `tile`, and `flatten` expect affine loops. `tile` accepts either a
@@ -176,13 +218,11 @@ factor per loop.
 ### Data Movement and Outlining
 
 These primitives move computation, buffers, or regions. Primitives that return
-new refs apply immediately; `polyhedral` is queued like other target transforms
-and should be followed by `.apply()` unless it is part of a larger pending
-chain.
+new refs apply immediately.
 
 | API | Effect |
 | --- | --- |
-| `schedule.polyhedral(targets=None)` | Raise loop targets to affine form. This queues a transform; call `.apply()` unless it is chained with other pending transforms. |
+| `schedule.affine(targets=None)` | Raise loop targets to affine form and return live loop refs. |
 | `schedule.compute_at(target, axis)` | Move a producer operation to the given affine loop axis and return the live axis ref. |
 | `schedule.buffer_at(target, axis)` | Create a localized buffer at an affine loop axis and return the new buffer ref. |
 | `schedule.outline(target, func_name, mapping=None)` | Outline an operation into a new function or Allo kernel and return `(kernel, call)`. |
@@ -192,13 +232,12 @@ chain.
 `allo.kernel` and `allo.invoke` with the mapping attached.
 
 ```python
-producer = schedule.query.op("producer_store").one()
-axis = schedule.query.loop("consumer_loop").one()
+producer_loop, consumer_loop = s.affine(s.loops("i", "j"))
 
-axis = schedule.compute_at(producer, axis)
-outer, inner = schedule.split(axis, factor=4)
+axis = s.compute_at(producer_loop, consumer_loop)
+outer, inner = s.split(axis, factor=4)
 
-kernel, call = schedule.outline(inner, func_name="stage0", mapping=[2, 1])
+kernel, call = s.outline(inner, func_name="stage0", mapping=[2, 1])
 ```
 
 ## Applying Transforms
@@ -206,9 +245,9 @@ kernel, call = schedule.outline(inner, func_name="stage0", mapping=[2, 1])
 `apply()` verifies and runs the pending transform script against `payload`.
 
 ```python
-schedule.pipeline(loop, ii=2)
-schedule.unroll(loop, factor=4)
-schedule.apply()
+s.pipeline(loop, ii=2)
+s.unroll(loop, factor=4)
+s.apply()
 ```
 
 The scheduler distinguishes topology-changing effects from attribute-only
@@ -223,16 +262,16 @@ effects:
   internally.
 
 When a topology-changing transform invalidates an old ref, use the refs returned
-by the primitive, run a fresh query, or call `schedule.live(ref)` to rebind a ref
-whose schedule ID still exists.
+by the primitive, select again with an alias such as `s.loop("j")`, or call
+`s.live(ref)` to rebind a ref whose schedule ID still exists.
 
 ```python
-i, j = schedule.query.loop().all()
-outer, inner = schedule.split(i, factor=4)
+i, j = s.loops("i", "j")
+outer, inner = s.split(i, factor=4)
 
 # `j` came from the previous epoch. Rebind it before using it.
-j = schedule.live(j)
-schedule.pipeline(j, ii=1).apply()
+j = s.live(j)
+s.pipeline(j, ii=1).apply()
 ```
 
 ## Scheduler Model
@@ -244,7 +283,8 @@ The scheduler has three layers:
    schedule ID, name, kind, and path.
 3. A transform script module that contains MLIR transform dialect operations.
 
-Queries read only from the snapshot. Schedule primitives resolve refs against
+Queries read only from the snapshot, and the `s.loop`/`s.op`/`s.buffer` aliases
+are thin wrappers around those queries. Schedule primitives resolve refs against
 the current snapshot, append transform operations to the transform script, and
 record an `Effect`. `apply()` verifies the transform script, applies it to the
 payload, verifies the payload, refreshes the snapshot, and starts a fresh

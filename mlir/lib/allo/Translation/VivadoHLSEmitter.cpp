@@ -150,7 +150,7 @@ void VivadoHLSEmitter::emitFunction(func::FuncOp func) {
   emitFunctionDirectives(func);
   emitBlock(func.getBlocks().front());
   state.reduceIndent();
-  state.os << "}";
+  state.os << "}\n";
 }
 
 void VivadoHLSEmitter::emitFunctionReturnType(func::FuncOp func) {
@@ -832,63 +832,6 @@ void VivadoHLSEmitter::emitReturn(func::ReturnOp op) {
   os << ";";
 }
 
-void VivadoHLSEmitter::emitLinalgFill(linalg::FillOp op) {
-  llvm::raw_ostream &os = state.os;
-
-  if (op.getInputs().size() != 1 || op.getOutputs().size() != 1) {
-    op->emitError()
-        << "Only single-input single-output linalg.fill is supported in "
-           "Vivado HLS emitter.";
-    state.failed = true;
-    return;
-  }
-
-  Value fillValue = op.getInputs().front();
-  Value output = op.getOutputs().front();
-  auto type = dyn_cast<MemRefType>(output.getType());
-  if (!type || !type.hasStaticShape()) {
-    op->emitError()
-        << "Only static ranked memref linalg.fill outputs are supported in "
-           "Vivado HLS emitter.";
-    state.failed = true;
-    return;
-  }
-
-  if (type.getRank() == 0) {
-    emitValueRef(output);
-    os << " = ";
-    emitValueRef(fillValue);
-    os << ";";
-    return;
-  }
-
-  std::string indexType = getIntegerTypeName(state.indexWidth, true);
-  SmallVector<std::string, 4> loopVars;
-  loopVars.reserve(type.getRank());
-  for (int64_t dim = 0; dim < type.getRank(); ++dim) {
-    std::string iv = "i" + std::to_string(dim);
-    loopVars.push_back(iv);
-    os << "for (" << indexType << " " << iv << " = 0; " << iv << " < "
-       << type.getDimSize(dim) << "; ++" << iv << ") {\n";
-    state.addIndent();
-    os.indent(state.currentIndent);
-  }
-
-  emitValueRef(output);
-  for (const std::string &iv : loopVars)
-    os << "[" << iv << "]";
-  os << " = ";
-  emitValueRef(fillValue);
-  os << ";";
-
-  for (int64_t dim = type.getRank() - 1; dim >= 0; --dim) {
-    state.reduceIndent();
-    os << "\n";
-    os.indent(state.currentIndent);
-    os << "}";
-  }
-}
-
 void VivadoHLSEmitter::dispatch(Operation *op) {
   if ((isa<scf::YieldOp, affine::AffineYieldOp>(op) &&
        op->getNumOperands() == 0) ||
@@ -1006,8 +949,6 @@ void VivadoHLSEmitter::dispatch(Operation *op) {
       .Case<scf::IfOp>([&](auto op) { emitIf(op); })
       .Case<scf::YieldOp>([&](auto op) { emitSCFYield(op); })
       .Case<scf::WhileOp>([&](auto op) { emitWhile(op); })
-
-      .Case<linalg::FillOp>([&](auto op) { emitLinalgFill(op); })
 
       .Default([&](auto op) {
         op->emitError() << "operation not supported in Vivado HLS emitter: "
@@ -1262,9 +1203,9 @@ void allo::registerVivadoHLSTranslation() {
   static TranslateFromMLIRRegistration reg(
       "emit-vitis-hls", "Translate MLIR to C++ code for Vivado HLS",
       ::emitVivadoHLS, [&](DialectRegistry &registry) {
-        registry.insert<affine::AffineDialect, arith::ArithDialect,
-                        linalg::LinalgDialect, math::MathDialect,
-                        memref::MemRefDialect, scf::SCFDialect,
-                        func::FuncDialect, allo::AlloDialect>();
+        registry
+            .insert<affine::AffineDialect, arith::ArithDialect,
+                    math::MathDialect, memref::MemRefDialect, scf::SCFDialect,
+                    func::FuncDialect, allo::AlloDialect>();
       });
 }

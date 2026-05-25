@@ -9,6 +9,7 @@ from typing import Type
 from types import ModuleType
 
 from .._C.ir import Context, ModuleOp, Location, Value, FunctionType, Block
+from .._C import schedule as schedule_d
 from .._C.allo import ReturnOp, InvokeOp, KernelOp
 from .._C.cf import BranchOp, CondBranchOp
 from .._C.scf import (
@@ -123,6 +124,7 @@ class NestedKernelSymbol:
     name: str
     node: ast.FunctionDef
     owner_func_name: str
+    mapping: tuple[int, ...]
 
 
 class MLIRCodeGenerator(ast.NodeVisitor):
@@ -155,6 +157,7 @@ class MLIRCodeGenerator(ast.NodeVisitor):
         self.begin_line = begin_line
         self.options = options
         self.kernel = kernel
+        self.mapping = tuple(kernel.mapping)
         self.arg_types = arg_types
         self.res_types = res_types
         self.is_top = is_top
@@ -376,6 +379,9 @@ class MLIRCodeGenerator(ast.NodeVisitor):
     def visit_Module(self, node: ast.Module):
         ast.NodeVisitor.generic_visit(self, node)
 
+    def visit_Pass(self, node):
+        pass
+
     def visit_FunctionDef(self, node: ast.FunctionDef):
         if not self._entry_function_visited:
             self._entry_function_visited = True
@@ -416,7 +422,9 @@ class MLIRCodeGenerator(ast.NodeVisitor):
             self.context, self.arg_types, self.res_types
         )
         visibility = "public" if self.is_top else "private"
-        fn_op = KernelOp(self.builder, self.func_name, fn_ty, visibility, self.kernel.mapping)  # type: ignore
+        fn_op = KernelOp(
+            self.builder, self.func_name, fn_ty, visibility, self.mapping  # type: ignore
+        )
         self.curr_func = fn_op
         self.generated_func = fn_op
 
@@ -462,6 +470,27 @@ class MLIRCodeGenerator(ast.NodeVisitor):
             return getattr(base, decorator.attr)
         return None
 
+    def _parse_nested_kernel_mapping(
+        self, node: ast.AST | None, kernel_name: str
+    ) -> tuple[int, ...]:
+        if node is None:
+            return ()
+        values = unwrap_if_constexpr(self.visit(node))
+        if isinstance(values, int):
+            values = (values,)
+        if not isinstance(values, tuple):
+            return self.compile_error(
+                f"Nested kernel '{kernel_name}' mapping must be a sequence of constant ints."
+            )
+        mapping = []
+        for value in values:
+            if not isinstance(value, int):
+                return self.compile_error(
+                    f"Nested kernel '{kernel_name}' mapping must be a sequence of constant ints."
+                )
+            mapping.append(value)
+        return tuple(mapping)
+
     def _register_nested_kernel_def(self, node: ast.FunctionDef):
         if len(node.decorator_list) != 1:
             return self.compile_error(
@@ -469,12 +498,14 @@ class MLIRCodeGenerator(ast.NodeVisitor):
             )
 
         decorator = node.decorator_list[0]
+        mapping_node = None
         if isinstance(decorator, ast.Call):
             for kw in decorator.keywords:
                 if kw.arg != "mapping":
                     return self.compile_error(
                         f"Nested kernel '{node.name}' does not support decorator keyword argument '{kw.arg}'."
                     )
+                mapping_node = kw.value
             decorator = decorator.func
 
         if self._resolve_kernel_decorator(decorator) is not kernel_decorator:
@@ -490,6 +521,7 @@ class MLIRCodeGenerator(ast.NodeVisitor):
             name=node.name,
             node=node,
             owner_func_name=self.func_name,
+            mapping=self._parse_nested_kernel_mapping(mapping_node, node.name),
         )
 
     def _precheck_return_placement(self, node: ast.FunctionDef):
@@ -503,7 +535,6 @@ class MLIRCodeGenerator(ast.NodeVisitor):
         return args_names, kwargs_names
 
     def visit_arg(self, node: ast.arg):
-        ast.NodeVisitor.generic_visit(self, node)
         return node.arg
 
     def visit_keyword(self, node: ast.keyword):
@@ -926,6 +957,7 @@ class MLIRCodeGenerator(ast.NodeVisitor):
             liveins = self.lscope.copy()
 
             # then branch
+            self.lscope = liveins.copy()
             self.builder.set_insertion_point_to_start(then_block)
             self.block_terminated = False
             self.visit_compound_stmts(node.body)
@@ -933,7 +965,7 @@ class MLIRCodeGenerator(ast.NodeVisitor):
             then_terminated = self.block_terminated
 
             # else branch
-            self.lscope = liveins
+            self.lscope = liveins.copy()
             self.builder.set_insertion_point_to_start(else_block)
             self.block_terminated = False
             if node.orelse:
@@ -1020,11 +1052,12 @@ class MLIRCodeGenerator(ast.NodeVisitor):
         # get a copy of current live-ins
         liveins = self.lscope.copy()
         # visit then block
+        self.lscope = liveins.copy()
         self.builder.set_insertion_point_to_start(then_block)
         self.visit_compound_stmts(node.body)
         then_vals = self.lscope.copy()  # capture live-ins in then block
         # restore lscope for else visiting
-        self.lscope = liveins
+        self.lscope = liveins.copy()
         # visit else block
         self.builder.set_insertion_point_to_start(else_block)
         if node.orelse:
@@ -1491,6 +1524,7 @@ class MLIRCodeGenerator(ast.NodeVisitor):
         # create dummy block
         block = self.builder.create_block(ip.get_block().get_parent_region())
         self.builder.set_insertion_point_to_start(block)
+        self.lscope = liveins.copy()
         # dry visit
         old_dry_run = self.dry_run_loop_analysis
         self.dry_run_loop_analysis = True
@@ -1500,9 +1534,10 @@ class MLIRCodeGenerator(ast.NodeVisitor):
         finally:
             self.scf_stack.pop()
             self.dry_run_loop_analysis = old_dry_run
+        dry_run_scope = self.lscope.copy()
         # restore insertion point before analyzing dry-run live-outs. Keep the
-        # dummy block alive until after the analysis because lscope can still
-        # point to values created inside it.
+        # dummy block alive until after the analysis because dry_run_scope can
+        # still point to values created inside it.
         self.builder.set_insertion_point_and_loc(ip, last_loc)
 
         # compute live-outs
@@ -1517,7 +1552,7 @@ class MLIRCodeGenerator(ast.NodeVisitor):
             if isinstance(livein, ConstexprValue):
                 continue
             assert isinstance(livein, AlloValue)
-            loop_val = self.lscope[name]
+            loop_val = dry_run_scope[name]
             if loop_val.handle == livein.handle:
                 continue  # variable is not assigned in the loop body
             # type check
@@ -1646,6 +1681,12 @@ class MLIRCodeGenerator(ast.NodeVisitor):
             for_op = ForOp(
                 self.builder, lb.handle, ub.handle, step.handle, init_handles
             )
+            if iterator.name:
+                assert isinstance(iterator.name, str)
+                for_op.set_attr(
+                    schedule_d.SCHEDULE_NAME_ATTR_NAME,
+                    self.builder.get_string_attr(iterator.name),
+                )
             self.scf_stack.append(node)
             for_op_body = for_op.get_body()
             self.builder.set_insertion_point_to_start(for_op_body)
@@ -1737,6 +1778,12 @@ class MLIRCodeGenerator(ast.NodeVisitor):
                 [step.handle for step in step_proxies],
                 init_handles,
             )
+            if iterator.name:
+                assert isinstance(iterator.name, str)
+                par_op.set_attr(
+                    schedule_d.SCHEDULE_NAME_ATTR_NAME,
+                    self.builder.get_string_attr(iterator.name),
+                )
             self.scf_stack.append(node)
             par_op_body = par_op.get_body()
             self.builder.set_insertion_point_to_start(par_op_body)
@@ -2092,6 +2139,8 @@ class MLIRCodeGenerator(ast.NodeVisitor):
                 forbidden_closure_scope=forbidden_scope,
                 active_kernel_calls=self._active_kernel_calls,
             )
+            # set the mapping for sub kernels
+            sub_generator.mapping = nested.mapping
             sub_generator.visit(nested.node)
             if sub_generator.generated_func is None:
                 return self.compile_error(

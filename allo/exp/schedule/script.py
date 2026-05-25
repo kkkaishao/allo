@@ -99,6 +99,14 @@ class TransformScript:
             self.builder.get_string_attr(schedule_id),
         )
 
+    def annotate_schedule_name(self, handle: ir.Value, schedule_name: str) -> None:
+        tran_d.AnnotateOp(
+            self.builder,
+            handle,
+            schedule_d.SCHEDULE_NAME_ATTR_NAME,
+            self.builder.get_string_attr(schedule_name),
+        )
+
     def _owner_ref(self, ref: BufferRef) -> OpRef:
         node = self.schedule.snapshot.ops_by_id[ref.owner_id]
         return OpRef(

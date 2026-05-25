@@ -4,10 +4,8 @@
 #include "nanobind/stl/string.h"
 
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
-#include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
-#include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/BuiltinTypes.h"
@@ -17,7 +15,6 @@
 #include "mlir/Interfaces/LoopLikeInterface.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "llvm/ADT/DenseMap.h"
-#include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/Twine.h"
 
 #include <string>
@@ -26,6 +23,7 @@
 using namespace mlir;
 
 static constexpr llvm::StringLiteral kScheduleIdAttr = "allo.schedule.id";
+static constexpr llvm::StringLiteral kScheduleNameAttr = "allo.schedule.name";
 
 enum ScheduleOpTrait : uint64_t {
   ScheduleOpTraitLoopLike = 1ULL << 0,
@@ -81,6 +79,8 @@ static std::optional<std::string> nameFromLoc(Location loc) {
 }
 
 static std::optional<std::string> bestOperationName(Operation *op) {
+  if (auto attr = op->getAttrOfType<StringAttr>(kScheduleNameAttr))
+    return attr.str();
   if (auto attr =
           op->getAttrOfType<StringAttr>(SymbolTable::getSymbolAttrName()))
     return attr.str();
@@ -292,6 +292,7 @@ static void collectSnapshotNode(Operation *op, llvm::StringRef parentId,
 
 void bindSchedule(nb::module_ &m) {
   m.attr("SCHEDULE_ID_ATTR_NAME") = nb::str(kScheduleIdAttr.data());
+  m.attr("SCHEDULE_NAME_ATTR_NAME") = nb::str(kScheduleNameAttr.data());
   nb::enum_<ScheduleOpTrait>(m, "ScheduleOpTrait", nb::is_arithmetic(),
                              nb::is_flag())
       .value("OP_TRAIT_LOOP_LIKE", ScheduleOpTraitLoopLike)
@@ -339,7 +340,7 @@ void bindSchedule(nb::module_ &m) {
   });
 
   m.def("collect_schedule_snapshot", [](ModuleOp module) {
-    auto root = module.getOperation();
+    Operation *root = module.getOperation();
     assert(root->getAttrOfType<StringAttr>(kScheduleIdAttr) &&
            "call annotate_schedule_ids before collect_schedule_snapshot");
 

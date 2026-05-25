@@ -9,7 +9,6 @@
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
-#include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
@@ -56,8 +55,6 @@ struct VivadoHLSEmitter {
   void emitConstant(arith::ConstantOp op);
   void emitCmpI(arith::CmpIOp op);
   void emitCmpF(arith::CmpFOp op);
-
-  void emitLinalgFill(linalg::FillOp op);
 
   void emitModule(ModuleOp);
 
