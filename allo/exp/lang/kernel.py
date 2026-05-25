@@ -451,6 +451,12 @@ class Kernel(Generic[P, R]):
         res_types = self.parse_return_annotation()
         return compile(self, arg_types, res_types, options=self.options)
 
+    def schedule(self):
+        from ..schedule import Schedule
+
+        module = self.compile()
+        return Schedule(module, self.context)
+
 
 @overload
 def kernel(fn: Callable[P, R]) -> Kernel[P, R]: ...

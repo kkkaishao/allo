@@ -38,9 +38,9 @@ class Schedule:
     query: Query
     script: TransformScript
 
-    def __init__(self, module: ir.ModuleOp):
+    def __init__(self, module: ir.ModuleOp, context: ir.Context | None = None):
         self.payload = module
-        self.context = module.get_context()
+        self.context = context if context is not None else module.get_context()
         self.context.load_transform_dialects()
         self.epoch = 0
         self.dirty = False
@@ -55,22 +55,24 @@ class Schedule:
         self.script = TransformScript(self)
 
     @classmethod
-    def from_module(cls, module: ir.ModuleOp) -> Schedule:
-        return cls(module)
+    def from_module(
+        cls, module: ir.ModuleOp, context: ir.Context | None = None
+    ) -> Schedule:
+        return cls(module, context)
 
     @classmethod
     def from_string(cls, text: str) -> Schedule:
         context = ir.Context()
         context.load_dialects()
         module = ir.ModuleOp.from_string(context, text)
-        return cls(module)
+        return cls(module, context)
 
     @classmethod
     def from_file(cls, path: str) -> Schedule:
         context = ir.Context()
         context.load_dialects()
         module = ir.ModuleOp.from_file(context, path)
-        return cls(module)
+        return cls(module, context)
 
     def cleanup_schedule_ids(self) -> Schedule:
         schedule_d.cleanup_schedule_ids(self.payload)
@@ -301,6 +303,7 @@ class Schedule:
             topology=True,
             targets=[loop.path for loop in loops],
         )
+        self.apply()
         return self
 
     def compute_at(self, target: SingleTarget, axis: SingleTarget) -> LoopRef:
