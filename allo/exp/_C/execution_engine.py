@@ -6,7 +6,7 @@ import ctypes
 
 from . import _liballo
 
-_backend = _liballo._load_submodule("execution_engine")
+_backend = _liballo.execution_engine
 
 
 class ExecutionEngine:

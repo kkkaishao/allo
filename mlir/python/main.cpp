@@ -1,94 +1,43 @@
 #include "ir.h"
 
-#include "nanobind/stl/string_view.h"
-
 #include "llvm/Support/Signals.h"
-
-#include <mutex>
-
-using InitFunc = void (*)(nb::module_ &);
-
-namespace {
-struct SubmoduleDesc {
-  std::string_view name;
-  InitFunc init;
-  const char *doc;
-};
-} // namespace
-
-static constexpr SubmoduleDesc kSubmodules[] = {
-    {"arith", bindArithOps, "arith dialect"},
-    {"math", bindMathOps, "math dialect"},
-    {"scf", bindSCFOps, "scf dialect"},
-    {"cf", bindCFOps, "cf dialect"},
-    {"ub", bindUBOps, "ub dialect"},
-    {"func", bindFuncOps, "func dialect"},
-    {"affine", bindAffineOps, "affine dialect"},
-    {"tensor", bindTensorOps, "tensor dialect"},
-    {"memref", bindMemRefOps, "memref dialect"},
-    {"linalg", bindLinalgOps, "linalg dialect"},
-    {"transform", bindTransform, "transform dialect"},
-    {"schedule", bindSchedule, "schedule analysis"},
-    {"allo", bindAlloOps, "allo dialect"},
-    {"passes", bindPasses, "compiler passes"},
-    {"execution_engine", bindExecutionEngine, "MLIR execution engine"},
-};
-
-static std::once_flag loadIROnce;
-static std::once_flag loadSubmoduleOnce[std::size(kSubmodules)];
-
-static nb::module_ ensureIRLoaded(nb::module_ &parent) {
-  std::call_once(loadIROnce, [&] {
-    auto ir = parent.def_submodule("ir", "core IR");
-    bindIR(ir);
-  });
-  return nb::borrow<nb::module_>(parent.attr("ir"));
-}
-
-static bool isLazySubmodule(std::string_view name) {
-  return name == "transform" || name == "schedule" ||
-         name == "execution_engine";
-}
-
-static nb::object ensureSubmoduleLoaded(nb::module_ &parent, size_t index) {
-  const auto &d = kSubmodules[index];
-  std::call_once(loadSubmoduleOnce[index], [&] {
-    auto sm = parent.def_submodule(d.name.data(), d.doc);
-    d.init(sm);
-  });
-  return nb::borrow<nb::object>(parent.attr(d.name.data()));
-}
-
-static void loadEagerSubmodules(nb::module_ &parent) {
-  ensureIRLoaded(parent);
-  for (size_t i = 0; i < std::size(kSubmodules); ++i) {
-    if (!isLazySubmodule(kSubmodules[i].name))
-      ensureSubmoduleLoaded(parent, i);
-  }
-}
-
-static nb::object loadSubmodule(nb::module_ &parent, std::string_view target) {
-  ensureIRLoaded(parent);
-
-  for (size_t i = 0; i < std::size(kSubmodules); ++i) {
-    const auto &d = kSubmodules[i];
-    if (d.name != target)
-      continue;
-
-    return ensureSubmoduleLoaded(parent, i);
-  }
-
-  throw nb::attribute_error("unknown submodule");
-}
 
 NB_MODULE(_liballo, m) {
   m.doc() = "Python bindings to the C++ Allo API";
   llvm::sys::PrintStackTraceOnErrorSignal("_liballo");
 
-  loadEagerSubmodules(m);
+  auto ir = m.def_submodule("ir", "core IR");
+  bindIR(ir);
 
-  m.def("_load_submodule", [](std::string_view name) {
-    auto parent = nb::module_::import_("allo.exp._C._liballo");
-    return loadSubmodule(parent, name);
-  });
+  auto arith = m.def_submodule("arith", "arith dialect");
+  bindArithOps(arith);
+  auto math = m.def_submodule("math", "math dialect");
+  bindMathOps(math);
+  auto scf = m.def_submodule("scf", "scf dialect");
+  bindSCFOps(scf);
+  auto cf = m.def_submodule("cf", "cf dialect");
+  bindCFOps(cf);
+  auto ub = m.def_submodule("ub", "ub dialect");
+  bindUBOps(ub);
+  auto func = m.def_submodule("func", "func dialect");
+  bindFuncOps(func);
+  auto affine = m.def_submodule("affine", "affine dialect");
+  bindAffineOps(affine);
+  auto tensor = m.def_submodule("tensor", "tensor dialect");
+  bindTensorOps(tensor);
+  auto memref = m.def_submodule("memref", "memref dialect");
+  bindMemRefOps(memref);
+  auto linalg = m.def_submodule("linalg", "linalg dialect");
+  bindLinalgOps(linalg);
+  auto transform = m.def_submodule("transform", "transform dialect");
+  bindTransform(transform);
+  auto schedule = m.def_submodule("schedule", "schedule analysis");
+  bindSchedule(schedule);
+  auto allo = m.def_submodule("allo", "allo dialect");
+  bindAlloOps(allo);
+  auto passes = m.def_submodule("passes", "compiler passes");
+  bindPasses(passes);
+  auto executionEngine =
+      m.def_submodule("execution_engine", "MLIR execution engine");
+  bindExecutionEngine(executionEngine);
 }
