@@ -46,7 +46,7 @@ def _assert_compile_error(fn, *patterns: str):
         pytest.param(allo_math.erf, "math.erf", id="erf"),
     ],
 )
-def test_unary_math_operator_mlir(op, pattern):
+def test_unary_math_mlir(op, pattern):
     @kernel
     def top(x: f32, out: "f32[1]"):
         out[0] = op(x)
@@ -55,7 +55,7 @@ def test_unary_math_operator_mlir(op, pattern):
     _assert_contains(ir, pattern)
 
 
-def test_abs_float_operator_mlir():
+def test_abs_float_mlir():
     @kernel
     def top(x: f32, out: "f32[1]"):
         out[0] = allo_math.abs(x)
@@ -64,7 +64,7 @@ def test_abs_float_operator_mlir():
     _assert_contains(ir, "math.absf")
 
 
-def test_abs_int_operator_mlir():
+def test_abs_int_mlir():
     @kernel
     def top(x: i32, out: "i32[1]"):
         out[0] = allo_math.abs(x)
@@ -73,7 +73,7 @@ def test_abs_int_operator_mlir():
     _assert_contains(ir, "math.absi")
 
 
-def test_pow_float_float_operator_mlir():
+def test_pow_float_float_mlir():
     @kernel
     def top(x: f32, y: f32, out: "f32[1]"):
         out[0] = allo_math.pow(x, y)
@@ -82,7 +82,7 @@ def test_pow_float_float_operator_mlir():
     _assert_contains(ir, "math.powf")
 
 
-def test_pow_float_int_operator_mlir():
+def test_pow_float_int_mlir():
     @kernel
     def top(x: f32, y: i32, out: "f32[1]"):
         out[0] = allo_math.pow(x, y)
@@ -91,7 +91,7 @@ def test_pow_float_int_operator_mlir():
     _assert_contains(ir, "math.fpowi")
 
 
-def test_pow_int_int_operator_mlir():
+def test_pow_int_int_mlir():
     @kernel
     def top(x: i32, y: i32, out: "i32[1]"):
         out[0] = allo_math.pow(x, y)
@@ -120,7 +120,7 @@ def test_pow_zero_fold():
     _assert_not_contains(ir, "math.powf", "math.fpowi", "math.ipowi")
 
 
-def test_tensor_exp_uses_linalg_named_op():
+def test_tensor_exp_linalg():
     @kernel(options=KernelOptions(enable_tensor=True))
     def top(x: "f32[4]") -> "f32[4]":
         return allo_math.exp(x)
@@ -129,7 +129,7 @@ def test_tensor_exp_uses_linalg_named_op():
     _assert_contains(ir, "linalg.exp")
 
 
-def test_tensor_exp2_uses_linalg_generic_fallback():
+def test_tensor_exp2_generic():
     @kernel(options=KernelOptions(enable_tensor=True))
     def top(x: "f32[4]") -> "f32[4]":
         return allo_math.exp2(x)
@@ -138,7 +138,7 @@ def test_tensor_exp2_uses_linalg_generic_fallback():
     _assert_contains(ir, "linalg.generic", "math.exp2")
 
 
-def test_tensor_exp_reuses_acc():
+def test_tensor_exp_acc():
     @kernel(options=KernelOptions(enable_tensor=True))
     def top(x: "f32[4]", acc: "f32[4]") -> "f32[4]":
         return allo_math.exp(x, acc=acc)
@@ -156,7 +156,7 @@ def test_memref_exp_requires_acc():
     _assert_compile_error(top, "requires acc for memref output")
 
 
-def test_memref_exp_uses_acc():
+def test_memref_exp_acc():
     @kernel
     def top(x: "f32[4]", out: "f32[4]"):
         allo_math.exp(x, acc=out)
@@ -181,7 +181,7 @@ def test_scalar_pow_acc_error():
     _assert_compile_error(top, "acc requires at least one shaped operand")
 
 
-def test_tensor_exp_acc_shape_mismatch_error():
+def test_tensor_exp_acc_shape_error():
     @kernel(options=KernelOptions(enable_tensor=True))
     def top(x: "f32[4]", acc: "f32[2]") -> "f32[2]":
         return allo_math.exp(x, acc=acc)
@@ -189,7 +189,7 @@ def test_tensor_exp_acc_shape_mismatch_error():
     _assert_compile_error(top, "not broadcastable")
 
 
-def test_memref_exp2_uses_linalg_generic_fallback():
+def test_memref_exp2_generic():
     @kernel
     def top(x: "f32[4]", out: "f32[4]"):
         allo_math.exp2(x, acc=out)
@@ -198,7 +198,7 @@ def test_memref_exp2_uses_linalg_generic_fallback():
     _assert_contains(ir, "linalg.generic", "math.exp2")
 
 
-def test_tensor_pow_broadcasts_scalar_to_acc_shape():
+def test_tensor_pow_scalar_broadcast():
     @kernel(options=KernelOptions(enable_tensor=True))
     def top(x: "f32[4]", acc: "f32[4]") -> "f32[4]":
         return allo_math.pow(x, 2, acc=acc)

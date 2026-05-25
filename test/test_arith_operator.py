@@ -24,7 +24,7 @@ def _assert_compile_error(fn, *patterns: str):
         assert pattern in message
 
 
-def test_tensor_add_uses_linalg_named_op():
+def test_tensor_add_linalg():
     @kernel(options=KernelOptions(enable_tensor=True))
     def top(x: "f32[4]", y: "f32[4]") -> "f32[4]":
         return x + y
@@ -33,7 +33,7 @@ def test_tensor_add_uses_linalg_named_op():
     _assert_contains(ir, "linalg.add")
 
 
-def test_tensor_rank0_add_uses_linalg_named_op():
+def test_tensor_rank0_add_linalg():
     @kernel(options=KernelOptions(enable_tensor=True))
     def top(x: "f32[]", y: "f32[]") -> "f32[]":
         return x + y
@@ -42,7 +42,7 @@ def test_tensor_rank0_add_uses_linalg_named_op():
     _assert_contains(ir, "linalg.add", "tensor<f32>")
 
 
-def test_tensor_add_broadcasts_scalar():
+def test_tensor_add_scalar_broadcast():
     @kernel(options=KernelOptions(enable_tensor=True))
     def top(x: "f32[4]") -> "f32[4]":
         return x + 1.0
@@ -51,7 +51,7 @@ def test_tensor_add_broadcasts_scalar():
     _assert_contains(ir, "linalg.add", "arith.constant 1.000000e+00")
 
 
-def test_memref_add_python_operator_requires_acc():
+def test_memref_add_requires_acc():
     @kernel
     def top(x: "f32[4]", y: "f32[4]", out: "f32[1]"):
         z: "f32[4]" = x + y
@@ -60,7 +60,7 @@ def test_memref_add_python_operator_requires_acc():
     _assert_compile_error(top, "requires acc for memref output")
 
 
-def test_memref_add_direct_call_uses_acc():
+def test_memref_add_acc():
     @kernel
     def top(x: "f32[4]", y: "f32[4]", out: "f32[4]"):
         allo_arith.add(x, y, acc=out)
@@ -69,7 +69,7 @@ def test_memref_add_direct_call_uses_acc():
     _assert_contains(ir, "linalg.add")
 
 
-def test_memref_div_accepts_positional_acc_before_signed():
+def test_memref_div_positional_acc():
     @kernel
     def top(x: "u32[4]", y: "u32[4]", out: "u32[4]"):
         allo_arith.div(x, y, out, signed=False)
@@ -78,7 +78,7 @@ def test_memref_div_accepts_positional_acc_before_signed():
     _assert_contains(ir, "linalg.div_unsigned")
 
 
-def test_tensor_lt_uses_linalg_generic_fallback():
+def test_tensor_lt_generic():
     @kernel(options=KernelOptions(enable_tensor=True))
     def top(x: "f32[4]", y: "f32[4]") -> "u1[4]":
         return x < y
@@ -87,7 +87,7 @@ def test_tensor_lt_uses_linalg_generic_fallback():
     _assert_contains(ir, "linalg.generic", "arith.cmpf")
 
 
-def test_tensor_lt_accepts_positional_acc_before_ordered():
+def test_tensor_lt_positional_acc():
     @kernel(options=KernelOptions(enable_tensor=True))
     def top(x: "f32[4]", y: "f32[4]", out: "u1[4]") -> "u1[4]":
         return allo_arith.lt(x, y, out, ordered=True)
@@ -96,7 +96,7 @@ def test_tensor_lt_accepts_positional_acc_before_ordered():
     _assert_contains(ir, "linalg.generic", "arith.cmpf")
 
 
-def test_tensor_max_accepts_positional_acc_before_propagate_nan():
+def test_tensor_max_positional_acc():
     @kernel(options=KernelOptions(enable_tensor=True))
     def top(x: "f32[4]", y: "f32[4]", out: "f32[4]") -> "f32[4]":
         return allo_arith.max(x, y, out, propagate_nan=True)

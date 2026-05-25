@@ -48,7 +48,7 @@ def _has_vitis() -> bool:
     return True
 
 
-def test_vitis_emits_basic_kernel_shape():
+def test_vitis_basic_kernel():
     @kernel
     def top(x: i32, out: "i32[1]"):
         out[0] = x + 1
@@ -64,7 +64,7 @@ def test_vitis_emits_basic_kernel_shape():
     )
 
 
-def test_vitis_emits_loop_shape():
+def test_vitis_loop():
     @kernel
     def top(x: "i32[4]", out: "i32[4]"):
         for i in allo_range(4):
@@ -74,7 +74,7 @@ def test_vitis_emits_loop_shape():
     _assert_contains(code, "void top(", "for (", " += ", "[")
 
 
-def test_vitis_converts_nested_kernel_calls():
+def test_vitis_nested_calls():
     @kernel
     def top(x: i32, out: "i32[1]"):
         @kernel
@@ -88,7 +88,7 @@ def test_vitis_converts_nested_kernel_calls():
     _assert_regex(code, r"void top_worker\(uint32_t v\d+, uint32_t v\d+\[1\]\);")
 
 
-def test_vitis_emits_local_scalar_stream():
+def test_vitis_scalar_stream():
     @kernel
     def top(x: i32, out: "i32[1]"):
         fifo: "Stream[i32][2,2]"
@@ -104,7 +104,7 @@ def test_vitis_emits_local_scalar_stream():
     _assert_contains(code, ".write(", ".read();")
 
 
-def test_vitis_emits_local_stream_nested_parameter():
+def test_vitis_stream_parameter():
     @kernel
     def top(x: i32, out: "i32[1]"):
         fifo: "Stream[i32][2,2]"
@@ -125,7 +125,7 @@ def test_vitis_emits_local_stream_nested_parameter():
     )
 
 
-def test_vitis_emits_local_block_stream():
+def test_vitis_block_stream():
     @kernel
     def top(out: "i32[1]"):
         fifo: "Stream[i32[2,2]]"
@@ -147,7 +147,7 @@ def test_vitis_emits_local_block_stream():
     assert ".read()" not in code
 
 
-def test_vitis_csim_local_scalar_stream():
+def test_vitis_csim_scalar_stream():
     if not _has_vitis():
         pytest.skip("Vitis HLS toolchain is not available")
 

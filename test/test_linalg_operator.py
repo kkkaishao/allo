@@ -24,7 +24,7 @@ def _assert_compile_error(fn, *patterns: str):
         assert pattern in message
 
 
-def test_tensor_matmul_operator_mlir():
+def test_tensor_matmul_mlir():
     @kernel(options=KernelOptions(enable_tensor=True))
     def top(a: "f32[2, 3]", b: "f32[3, 4]") -> "f32[2, 4]":
         return allo_linalg.matmul(a, b)
@@ -42,7 +42,7 @@ def test_memref_matmul_requires_acc():
     _assert_compile_error(top, "requires acc for memref output")
 
 
-def test_memref_matmul_uses_acc():
+def test_memref_matmul_acc():
     @kernel
     def top(a: "f32[2, 3]", b: "f32[3, 4]", out: "f32[2, 4]"):
         allo_linalg.matmul(a, b, acc=out)
@@ -51,7 +51,7 @@ def test_memref_matmul_uses_acc():
     _assert_contains(ir, "linalg.matmul")
 
 
-def test_matmul_shape_mismatch_error():
+def test_matmul_shape_error():
     @kernel(options=KernelOptions(enable_tensor=True))
     def top(a: "f32[2, 3]", b: "f32[2, 4]") -> "f32[2, 4]":
         return allo_linalg.matmul(a, b)
@@ -59,7 +59,7 @@ def test_matmul_shape_mismatch_error():
     _assert_compile_error(top, "incompatible contraction dimensions")
 
 
-def test_tensor_dot_operator_mlir():
+def test_tensor_dot_mlir():
     @kernel(options=KernelOptions(enable_tensor=True))
     def top(a: "f32[4]", b: "f32[4]") -> "f32[]":
         return allo_linalg.dot(a, b)
@@ -68,7 +68,7 @@ def test_tensor_dot_operator_mlir():
     _assert_contains(ir, "linalg.dot")
 
 
-def test_tensor_dot_rank0_scalar_extract_mlir():
+def test_tensor_dot_scalar_extract():
     @kernel(options=KernelOptions(enable_tensor=True))
     def top(a: "f32[4]", b: "f32[4]") -> f32:
         return allo_linalg.dot(a, b)[()]
@@ -77,7 +77,7 @@ def test_tensor_dot_rank0_scalar_extract_mlir():
     _assert_contains(ir, "linalg.dot", "tensor.extract")
 
 
-def test_tensor_dot_uses_rank0_acc_annotation():
+def test_tensor_dot_rank0_acc():
     @kernel(options=KernelOptions(enable_tensor=True))
     def top(a: "f32[4]", b: "f32[4]", acc: "f32[]") -> "f32[]":
         return allo_linalg.dot(a, b, acc=acc)
@@ -86,7 +86,7 @@ def test_tensor_dot_uses_rank0_acc_annotation():
     _assert_contains(ir, "linalg.dot")
 
 
-def test_memref_dot_uses_acc():
+def test_memref_dot_acc():
     @kernel
     def top(a: "f32[4]", b: "f32[4]", acc: "f32[]"):
         allo_linalg.dot(a, b, acc=acc)

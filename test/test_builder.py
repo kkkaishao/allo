@@ -53,7 +53,7 @@ def _assert_type_error(fn, *patterns: str):
         assert pattern in message
 
 
-def test_compilation_error_plain_diagnostic_points_to_source():
+def test_error_diagnostic_source():
     src = "def broken(x):\n    return x + y\n"
     module = ast.parse(src)
     fn = module.body[0]
@@ -171,7 +171,7 @@ def test_bitwise_xor():
     _assert_contains(ir, "arith.xori")
 
 
-def test_shift_by_range_index_expression():
+def test_shift_by_range_index():
     @kernel
     def top(x: i32, out: "i32[4]"):
         for i in range(4):
@@ -232,7 +232,7 @@ def test_if_statement_phi():
     )
 
 
-def test_if_branch_local_buffers_inside_loop():
+def test_if_branch_local_buffers():
     @kernel
     def top(out: "i32[8]"):
         for r in range(2):
@@ -297,7 +297,7 @@ def test_range_loop_store():
     )
 
 
-def test_index_runtime_int_arithmetic():
+def test_index_runtime_arithmetic():
     @kernel
     def top(stride: i32, out: "i32[8]"):
         offset: i32 = 2
@@ -313,7 +313,7 @@ def test_index_runtime_int_arithmetic():
     )
 
 
-def test_python_builtin_range_loop_store():
+def test_builtin_range_loop_store():
     @kernel
     def top(out: "i32[4]"):
         for i in range(4):
@@ -353,7 +353,7 @@ def test_direct_operator_invoke():
     _assert_contains(ir, "arith.maxsi")
 
 
-def test_python_builtin_max_min_invokes():
+def test_builtin_max_min():
     @kernel
     def top(x: i32, y: i32, out: "i32[2]"):
         out[0] = max(x, y)
@@ -367,7 +367,7 @@ def test_python_builtin_max_min_invokes():
     )
 
 
-def test_global_scalar_constants_are_constexpr():
+def test_global_scalar_constexpr():
     @kernel
     def top(x: i32, y: f32, out: "f32[2]"):
         out[0] = x + _GLOBAL_INT_CONST
@@ -383,7 +383,7 @@ def test_global_scalar_constants_are_constexpr():
     )
 
 
-def test_global_constexpr_shape_expression_annotation():
+def test_global_shape_annotation():
     @kernel
     def top(
         inp: "i32[_GLOBAL_SHAPE_M * _GLOBAL_SHAPE_N]",
@@ -402,7 +402,7 @@ def test_global_constexpr_shape_expression_annotation():
     )
 
 
-def test_definition_scope_shape_annotation():
+def test_scope_shape_annotation():
     rows = 2
     cols = 2
 
@@ -419,7 +419,7 @@ def test_definition_scope_shape_annotation():
     )
 
 
-def test_template_kernel_signature_and_shape():
+def test_template_signature_shape():
     T = Template("T")
     N = Template("N")
 
@@ -438,7 +438,7 @@ def test_template_kernel_signature_and_shape():
     )
 
 
-def test_template_kernel_invoke_specializes_helper():
+def test_template_helper_specialization():
     T = Template("T")
 
     @kernel(T)
@@ -458,7 +458,7 @@ def test_template_kernel_invoke_specializes_helper():
     )
 
 
-def test_template_kernel_external_specialization_object():
+def test_template_specialization_object():
     T = Template("T")
 
     @kernel(T)
@@ -470,7 +470,7 @@ def test_template_kernel_external_specialization_object():
     _assert_contains(ir, "f32", "memref<1xf32>")
 
 
-def test_local_memref_declaration_without_initializer():
+def test_local_memref_declaration():
     @kernel
     def top(out: "i32[4]"):
         N: constexpr = 4
@@ -488,7 +488,7 @@ def test_local_memref_declaration_without_initializer():
     )
 
 
-def test_local_tensor_declaration_without_initializer():
+def test_local_tensor_declaration():
     @kernel(options=KernelOptions(enable_tensor=True))
     def top() -> "f32[4]":
         N: constexpr = 4
@@ -499,7 +499,7 @@ def test_local_tensor_declaration_without_initializer():
     _assert_contains(ir, "tensor.empty", "tensor<4xf32>")
 
 
-def test_memref_list_initializer_uses_global():
+def test_memref_list_initializer():
     @kernel
     def top(out: "i32[2,2]"):
         scale: constexpr = _GLOBAL_INT_CONST
@@ -517,7 +517,7 @@ def test_memref_list_initializer_uses_global():
     )
 
 
-def test_tensor_list_initializer_uses_arith_constant():
+def test_tensor_list_initializer():
     @kernel(options=KernelOptions(enable_tensor=True))
     def top() -> "i32[2,2]":
         buf: "i32[2,2]" = [[1, 2], [3, 4]]
@@ -527,7 +527,7 @@ def test_tensor_list_initializer_uses_arith_constant():
     _assert_contains(ir, "arith.constant dense<[[1, 2], [3, 4]]> : tensor<2x2xi32>")
 
 
-def test_local_stream_scalar_ir():
+def test_stream_scalar_ir():
     @kernel
     def top(x: i32, out: "i32[1]"):
         fifo: "Stream[i32][2,2]"
@@ -543,7 +543,7 @@ def test_local_stream_scalar_ir():
     )
 
 
-def test_local_stream_nested_parameter_ir():
+def test_stream_nested_parameter_ir():
     @kernel
     def top(x: i32, out: "i32[1]"):
         fifo: "Stream[i32][2,2]"
@@ -567,7 +567,7 @@ def test_local_stream_nested_parameter_ir():
     )
 
 
-def test_missing_bound_method_errors_are_compile_errors():
+def test_bound_method_compile_errors():
     @kernel
     def top(x: i32):
         x.put(1)
@@ -614,7 +614,7 @@ def test_while_loop_carried_values():
     _assert_contains(ir, "scf.while", "scf.condition", "scf.yield")
 
 
-def test_consteval_value_in_expression():
+def test_consteval_expression():
     @consteval
     def factor():
         return 3
@@ -633,7 +633,7 @@ def test_consteval_value_in_expression():
     )
 
 
-def test_nested_kernel_invoke_store():
+def test_nested_invoke_store():
     @kernel
     def top(x: i32, out: "i32[1]"):
         @kernel
@@ -646,7 +646,7 @@ def test_nested_kernel_invoke_store():
     _assert_contains(ir, "allo.kernel private @top.worker", "invoke @top.worker")
 
 
-def test_nested_kernel_multiple_returns():
+def test_nested_multiple_returns():
     @kernel
     def top(x: i32, y: i32, out: "i32[1]"):
         @kernel
@@ -666,7 +666,7 @@ def test_nested_kernel_multiple_returns():
     )
 
 
-def test_nested_kernel_captures_constexpr_value():
+def test_nested_capture_constexpr():
     @kernel
     def top(x: i32, out: "i32[1]"):
         offset: constexpr = 3
@@ -681,7 +681,7 @@ def test_nested_kernel_captures_constexpr_value():
     _assert_contains(ir, "allo.kernel private @top.worker", "arith.constant 3")
 
 
-def test_nested_kernel_captures_type_alias():
+def test_nested_capture_type_alias():
     @kernel
     def top(out: "i32[1]"):
         T: constexpr = i32
@@ -701,7 +701,7 @@ def test_nested_kernel_captures_type_alias():
     )
 
 
-def test_nested_kernel_captures_consteval_function():
+def test_nested_capture_consteval():
     @consteval
     def amount():
         return 5
@@ -718,7 +718,7 @@ def test_nested_kernel_captures_consteval_function():
     _assert_contains(ir, "allo.kernel private @top.worker", "arith.constant 5")
 
 
-def test_nested_kernel_captures_kernel_alias():
+def test_nested_capture_kernel_alias():
     @kernel
     def callee(v: i32) -> i32:
         return v + 2
@@ -742,7 +742,7 @@ def test_nested_kernel_captures_kernel_alias():
     )
 
 
-def test_nested_kernel_captures_module_alias():
+def test_nested_capture_module_alias():
     @kernel
     def top(out: "i32[2]"):
         M: constexpr = allo_core
@@ -758,7 +758,7 @@ def test_nested_kernel_captures_module_alias():
     _assert_contains(ir, "allo.kernel private @top.worker", "scf.for")
 
 
-def test_cpp_typing_style_compile_path():
+def test_cpp_typing_compile():
     @kernel(options=KernelOptions(typing_style="cpp"))
     def top(x: u32, y: i32, out: "u32[1]"):
         out[0] = x + y
@@ -804,7 +804,7 @@ def test_return_multiple_values():
     )
 
 
-def test_return_from_if_else():
+def test_return_if_else():
     @kernel
     def top(cond: allo_bool, x: i32, y: i32) -> i32:
         if cond:
@@ -816,7 +816,7 @@ def test_return_from_if_else():
     _assert_contains(ir, "cf.cond_br", "return", ": i32")
 
 
-def test_return_from_if_with_fallthrough():
+def test_return_if_fallthrough():
     @kernel
     def top(cond: allo_bool, x: i32, y: i32) -> i32:
         if cond:
@@ -827,7 +827,7 @@ def test_return_from_if_with_fallthrough():
     _assert_contains(ir, "cf.cond_br", "return", ": i32")
 
 
-def test_return_value_requires_annotation():
+def test_return_requires_annotation():
     @kernel
     def top(x: i32):
         return x
@@ -838,7 +838,7 @@ def test_return_value_requires_annotation():
     )
 
 
-def test_return_missing_for_non_void_function():
+def test_return_missing_non_void():
     @kernel
     def top(x: i32) -> i32:
         y = x + x
@@ -849,7 +849,7 @@ def test_return_missing_for_non_void_function():
     )
 
 
-def test_return_value_count_mismatch():
+def test_return_count_mismatch():
     @kernel
     def top(x: i32, y: i32) -> (i32, i32):
         return x
@@ -871,7 +871,7 @@ def test_return_type_mismatch():
     )
 
 
-def test_return_inside_loop_is_rejected():
+def test_return_inside_loop_error():
     @kernel
     def top(x: i32) -> i32:
         for i in allo_range(4):
@@ -884,7 +884,7 @@ def test_return_inside_loop_is_rejected():
     )
 
 
-def test_return_inside_nested_if_is_rejected():
+def test_return_nested_if_error():
     @kernel
     def top(cond: allo_bool, inner: allo_bool, x: i32) -> i32:
         if cond:

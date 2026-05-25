@@ -14,7 +14,7 @@ module {
 """
 
 
-def test_from_string_entrypoint_still_works():
+def test_schedule_from_string():
     s = Schedule.from_string(AFFINE_LOOP_IR)
     loop = s.query.loop().one()
 
@@ -24,7 +24,7 @@ def test_from_string_entrypoint_still_works():
     assert s.payload.verify()
 
 
-def test_pipeline_schedules_actual_kernel():
+def test_pipeline_kernel_loop():
     @kernel
     def top(A: "i32[16]", B: "i32[16]"):
         for i in range(16):
@@ -42,7 +42,7 @@ def test_pipeline_schedules_actual_kernel():
     assert s.payload.verify()
 
 
-def test_split_schedules_actual_kernel_and_returns_live_refs():
+def test_split_returns_live_loops():
     @kernel
     def top(A: "i32[16]", B: "i32[16]"):
         for i in range(16):
@@ -62,7 +62,7 @@ def test_split_schedules_actual_kernel_and_returns_live_refs():
     assert s.payload.verify()
 
 
-def test_flatten_fuses_nested_actual_kernel_loops():
+def test_flatten_nested_loops():
     @kernel
     def top(A: "i32[4,4]", B: "i32[4,4]"):
         for i in range(4):
@@ -80,7 +80,7 @@ def test_flatten_fuses_nested_actual_kernel_loops():
     assert s.payload.verify()
 
 
-def test_compute_at_schedules_actual_kernel():
+def test_compute_at_kernel():
     @kernel
     def top(A: "i32[8]", C: "i32[8]"):
         B: "i32[8]" = 0
@@ -103,7 +103,7 @@ def test_compute_at_schedules_actual_kernel():
     assert s.payload.verify()
 
 
-def test_single_level_buffer_at_schedules_actual_kernel():
+def test_buffer_at_single_level():
     @kernel
     def top(out: "i32[4,4]"):
         B: "i32[4,4]" = 0

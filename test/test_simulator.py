@@ -7,7 +7,7 @@ from allo.exp.lang.core import i32
 from allo.exp.lang.kernel import kernel
 
 
-def test_dataflow_simulator_scalar_stream():
+def test_simulator_scalar_stream():
     @kernel
     def top(x: "i32[8]", out: "i32[8]"):
         fifo: "Stream[i32]"
@@ -33,7 +33,7 @@ def test_dataflow_simulator_scalar_stream():
     np.testing.assert_array_equal(out, (x + 1) * 2)
 
 
-def test_dataflow_simulator_block_stream():
+def test_simulator_block_stream():
     @kernel
     def top(out: "i32[2,2,2]"):
         fifo: "Stream[i32[2,2]]"
