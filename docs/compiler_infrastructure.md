@@ -19,8 +19,11 @@ The implementation currently lives under `allo/exp`, with three main layers:
   `operator.fold` and `operator.build`.
 
 The most important design rule is that frontend lowering keeps compile-time
-values, runtime SSA values, and global stream symbols distinct:
-`ConstexprValue`, `AlloValue`, and `AlloSymbolRef`.
+values and runtime SSA values distinct: `ConstexprValue` and `AlloValue`.
+`AlloSymbolRef` still exists in the implementation as an internal symbol proxy
+from earlier global-stream experiments, but `GStream` is not part of the current
+public frontend surface. New user-visible stream work should use local
+`StreamType` values represented by `AlloValue`.
 
 ## Value Model
 
@@ -36,29 +39,22 @@ and a frontend type. It represents values that are already in the IR: function
 arguments, operation results, loads, loop induction variables, allocated
 buffers, tensors, local streams, and materialized constants.
 
-`AlloSymbolRef` is the global stream symbol proxy. It stores a symbol name, a
-global `StreamType`, and optional stream-array indices, but intentionally has no
-MLIR `Value` handle. Declaring `fifo: GStream[i32]` emits an
-`allo.stream.global` symbol at module scope and binds `fifo` to an
-`AlloSymbolRef`. A `get()` or `put()` operation later materializes a local stream
-handle with `allo.stream.get_global` and emits `allo.stream.get` or
-`allo.stream.put`.
+Local streams are also `AlloValue`s. The handle is an `allo.stream.create`
+result, the frontend type is `StreamType`, and stream-array indexing stores
+normalized indices on a shallow stream proxy before `get()` or `put()` emits
+the transfer operation.
 
 ```mermaid
 flowchart LR
     AST[Python AST node] --> CG[MLIRCodeGenerator.visit]
     CG --> CV[ConstexprValue]
     CG --> AV[AlloValue]
-    CG --> SR[AlloSymbolRef]
 
     CV -->|fold / branch select / shape eval| Frontend[Frontend-only decisions]
     CV -->|builder.cast or materialize_literal_like| AV
     AV -->|handle + type| IR[MLIR operations]
-    SR -->|symbol name + StreamType| GST[allo.stream.global symbol]
-    SR -->|get/put: get_global + indices| IR
 
     Frontend -. no MLIR handle .-> CG
-    GST -. no SSA handle .-> CG
     IR --> CG
 ```
 
@@ -66,9 +62,7 @@ These proxies cooperate through explicit materialization. Codegen and operators
 should keep values as `ConstexprValue` as long as they can be folded or used for
 compile-time decisions. When a compile-time literal must interact with a runtime
 value, it is explicitly materialized with `builder.cast(...)` or
-`builder.materialize_literal_like(...)`. When a global stream symbol must be
-read or written, the stream operators materialize a local handle through the
-builder rather than pretending the symbol is an SSA value.
+`builder.materialize_literal_like(...)`.
 
 ```python
 # Typical operator-side pattern.
@@ -81,8 +75,6 @@ This boundary keeps IR generation predictable:
 
 - Constant folding never emits IR.
 - Runtime lowering always returns values with MLIR handles.
-- Global stream symbols remain symbol references until stream `get`/`put`
-  lowering needs a local handle.
 - Type and storage decisions stay visible at the materialization point.
 - Errors can explain whether the invalid value was compile-time or runtime.
 
@@ -116,7 +108,7 @@ flowchart TD
     O --> F{fold_impl exists?}
     F -->|returns value| R[ConstexprValue or folded result]
     F -->|NO_FOLD| Build[build_impl with AlloOpBuilder]
-    Build --> IR[AlloValue / AlloSymbolRef / side effect]
+    Build --> IR[AlloValue / side effect]
 ```
 
 ### Scopes
@@ -132,9 +124,9 @@ The code generator tracks several scopes:
 
 Names resolve through local scope, closure/function scope, allowed globals, and
 the small built-in namespace (`range`, `max`, `min`). Runtime locals are not
-capturable by nested kernels; callers must pass them as arguments. Unindexed
-`AlloSymbolRef` values are allowed static captures so a nested kernel can index
-and use a global stream declared by an enclosing kernel.
+capturable by nested kernels; callers must pass them as arguments. This includes
+local `Stream` values, which are passed explicitly to producer and consumer
+nested kernels.
 
 ### Statements
 
@@ -143,7 +135,7 @@ Statements are handled directly by `mlir_codegen.py`:
 - `visit_FunctionDef` creates the entry `func.func` or registers a nested
   kernel symbol.
 - `visit_AnnAssign` parses annotations, creates buffers/tensors, creates local
-  and global streams, handles `constexpr`, and casts initializers.
+  streams, handles `constexpr`, and casts initializers.
 - `visit_Assign` handles scalar assignment, tuple unpacking, and subscript
   stores.
 - `visit_For`, `visit_Grid`, and `visit_While` build SCF regions and discover
@@ -169,8 +161,7 @@ Builder APIs follow these conventions:
   Callers are responsible for materializing `ConstexprValue`s before calling
   them.
 - `create_*` methods usually return `AlloValue` unless they perform a pure side
-  effect or intentionally create a symbol proxy such as `AlloSymbolRef`.
-  Returned values must carry the correct frontend type or symbol type.
+  effect. Returned values must carry the correct frontend type.
 - `builder.cast(src, dst_type)` is the main bridge from `ConstexprValue` to IR.
   It accepts either `ConstexprValue` or `AlloValue` and returns an `AlloValue`.
 - `builder.cast_to_dtype(...)`, `scalar_cast(...)`, and `shaped_cast(...)`
@@ -226,24 +217,19 @@ returning `None`.
 
 ### Stream Helpers
 
-`StreamType` represents both local streams and global stream declarations. Its
-`base_type` is either a scalar `DType` or a shaped buffer payload, `shape`
-describes an array of streams, and `depth` is currently supplied by the default
-frontend depth.
+`StreamType` represents local streams. Its `base_type` is either a scalar
+`DType` or a shaped buffer payload, `shape` describes an array of streams, and
+`depth` is currently supplied by the default frontend depth.
 
-The builder exposes three stream-specific entry points:
+The builder exposes the local stream entry point:
 
 - `create_stream(stream_type)` emits `allo.stream.create` and returns an
   `AlloValue` for a local stream.
-- `create_global_stream(name, stream_type)` emits `allo.stream.global` at module
-  scope and returns an `AlloSymbolRef`.
-- `get_global_stream_handle(symbol)` emits `allo.stream.get_global` when a
-  stream operator needs a local SSA handle for a global symbol.
 
-`create_stream_get(...)` and `create_stream_put(...)` accept either an indexed
-local stream `AlloValue` or an indexed `AlloSymbolRef`. They assert that indices
-have already been normalized and cast the payload through the stream base type
-before emitting `allo.stream.get` or `allo.stream.put`.
+`create_stream_get(...)` and `create_stream_put(...)` consume an indexed local
+stream `AlloValue`. They assert that indices have already been normalized and
+cast the payload through the stream base type before emitting `allo.stream.get`
+or `allo.stream.put`.
 
 ## Operator Layer
 
@@ -314,8 +300,7 @@ Build functions are responsible for semantic lowering:
 - Cast operands to the chosen dtype.
 - Decide scalar vs shaped lowering.
 - Use linalg helpers for shaped elementwise and reduction-style operations.
-- Return the resulting `AlloValue`, `AlloSymbolRef` for symbol-like stream
-  references, or `None` for void side-effect operators.
+- Return the resulting `AlloValue` or `None` for void side-effect operators.
 
 Example shape of an elementwise binary build:
 
@@ -346,11 +331,11 @@ Most production operators should reuse the existing helpers in
 
 Stream indexing and transfer are split across two focused operator modules.
 `operators/memory.py` handles subscript load/store syntax; for stream values it
-turns `fifo[i, j]` into an indexed local stream proxy or indexed
-`AlloSymbolRef` and rejects assignment to stream references. `operators/spmw.py`
-implements `get()` and `put(value)`, validates that rank-0 streams have been
-materialized with empty indices and that stream arrays were indexed first, then
-delegates to the builder's stream helpers.
+turns `fifo[i, j]` into an indexed local stream proxy and rejects assignment to
+stream references. `operators/spmw.py` implements `get()` and `put(value)`,
+validates that rank-0 streams have been materialized with empty indices and that
+stream arrays were indexed first, then delegates to the builder's stream
+helpers.
 
 ## Extending Codegen
 
@@ -365,10 +350,11 @@ Use this decision order when adding frontend functionality:
 5. If the feature changes frontend types or values, update
    `allo/exp/lang/core.py`.
 
-For features that introduce named global IR objects, follow the `GStream` /
-`AlloSymbolRef` pattern: keep the source-level symbol distinct from runtime SSA
-values, allow only deliberate static captures, and materialize a handle only at
-the operation that consumes the symbol.
+For features that introduce named global IR objects, keep the source-level
+symbol distinct from runtime SSA values, allow only deliberate static captures,
+and materialize a handle only at the operation that consumes the symbol. Do not
+reintroduce user-facing global stream syntax without updating the frontend,
+backend, simulator, and documentation together.
 
 ### Adding a New Operator
 
@@ -431,8 +417,8 @@ or a construct that changes scope/lifetime.
 
 When adding a visitor:
 
-- Return only `ConstexprValue`, `AlloValue`, `AlloSymbolRef`, tuples/lists of
-  frontend values, or `None`.
+- Return only `ConstexprValue`, `AlloValue`, tuples/lists of frontend values, or
+  `None`.
 - Use `self.visit(...)` to preserve location tracking and diagnostics.
 - Use `self.call_operator(...)` for reusable operations.
 - Use `EnterSubRegion` when building nested regions so local scope and insertion
@@ -465,9 +451,9 @@ includes:
 - Scalar runtime lowering.
 - Tensor-mode shaped lowering.
 - Buffer-mode shaped lowering with explicit `acc=`.
-- Local and global stream declarations, indexed stream arrays, `get`/`put`, and
-  rejection paths for assigning or returning stream symbols when touching stream
-  behavior.
+- Local stream declarations, nested-kernel stream parameters, indexed stream
+  arrays, `get`/`put`, and rejection paths for assigning or returning stream
+  values when touching stream behavior.
 - Error cases with source-aware `CompilationError` messages.
 
 The existing tests under `test/test_builder.py`, `test/test_arith_operator.py`,

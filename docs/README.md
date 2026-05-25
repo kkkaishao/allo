@@ -52,8 +52,10 @@ The main changes in this fork are:
   balanced-tree lowering for integer add, subtract, and multiply expressions.
 - Operator infrastructure for scalar, buffer, and tensor paths, including
   arithmetic, math, and linalg operators.
-- Local `Stream` and global `GStream` frontend types for FIFO communication,
-  including scalar and block payloads.
+- Local `Stream` frontend types for FIFO communication, including scalar and
+  block payloads.
+- Dataflow simulation for local streams, so producer/consumer nested kernels
+  can be validated through the CPU simulation path.
 - Smooth interaction between native Python code and hardware design/testing
   workflows.
 - Backend and compiler infrastructure changes that support the new frontend and
@@ -77,11 +79,12 @@ runtime stack:
 - [Typing Rules](typing_rules.md): type-promotion reference for HLS and C++
   typing styles.
 - [Compiler Infrastructure](compiler_infrastructure.md): developer guide for
-  the new frontend code generation, value proxies including `AlloSymbolRef`,
-  builder APIs, operator layer, and extension points.
+  the new frontend code generation, value proxies, builder APIs, operator
+  layer, and extension points.
 - [Simulation](simulation.md): CPU and Vitis simulation interface, backend
-  contexts, caching, and implementation notes.
-- [Scheduling](scheduling.md): reserved for the scheduling documentation.
+  contexts, dataflow stream simulation, caching, and implementation notes.
+- [Scheduling](scheduling.md): experimental schedule API, query model,
+  transform primitives, and scheduler internals.
 
 The legacy upstream documentation under `docs/source/` is still useful for
 background on Allo's broader design and backend ecosystem.

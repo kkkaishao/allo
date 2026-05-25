@@ -12,12 +12,15 @@ Allo uses explicit type-promotion tables when lowering frontend expressions.
 The active table is selected by `KernelOptions(typing_style=...)`:
 
 ```python
-@kernel(options=allo.KernelOptions(typing_style="hls"))  # default
+from allo.exp.lang import KernelOptions, kernel
+
+
+@kernel(options=KernelOptions(typing_style="hls"))  # default
 def hls_kernel(...):
     ...
 
 
-@kernel(options=allo.KernelOptions(typing_style="cpp"))
+@kernel(options=KernelOptions(typing_style="cpp"))
 def cpp_kernel(...):
     ...
 ```
@@ -48,9 +51,9 @@ The rules below describe element types. For shaped values, the same element
 promotion is used inside elementwise or linalg operations; shape compatibility is
 checked separately by the operator.
 
-`Stream` and `GStream` are not numeric types and do not participate in
-promotion. A stream's payload type is checked at `put(value)`: the value is cast
-to the stream `base_type`, and `get()` returns that exact payload type.
+`Stream` is not a numeric type and does not participate in promotion. A stream's
+payload type is checked at `put(value)`: the value is cast to the stream
+`base_type`, and `get()` returns that exact payload type.
 
 ## Common Helpers
 

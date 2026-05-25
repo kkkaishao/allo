@@ -140,6 +140,66 @@ Python call arguments are not part of the current CPU or Python-native Vitis
 CSim calling convention; use local streams inside the kernel and explicit NumPy
 buffers at the Python boundary.
 
+## Dataflow Stream Simulation
+
+CPU simulation supports local `Stream` values through the dataflow simulator.
+There is no separate user-facing API: call the kernel normally, and the CPU
+lowering pipeline rewrites stream creation, `put`, and `get` operations to a
+small host runtime.
+
+```python
+from __future__ import annotations
+
+import numpy as np
+
+from allo.exp.lang import i32, kernel
+
+
+@kernel
+def top(x: i32[8], out: i32[8]):
+    fifo: "Stream[i32]"
+
+    @kernel
+    def producer(src: i32[8], stream: "Stream[i32]"):
+        for i in range(8):
+            stream.put(src[i] + 1)
+
+    @kernel
+    def consumer(stream: "Stream[i32]", dst: i32[8]):
+        for i in range(8):
+            dst[i] = stream.get() * 2
+
+    producer(x, fifo)
+    consumer(fifo, out)
+
+
+x = np.arange(8, dtype=np.int32)
+out = np.zeros((8,), dtype=np.int32)
+top(x, out)
+np.testing.assert_array_equal(out, (x + 1) * 2)
+```
+
+When two or more contiguous nested-kernel calls are connected by stream
+arguments, the lowering wraps those calls in OpenMP sections so producer and
+consumer stages can run concurrently. Stream lanes are modeled as bounded FIFO
+queues. `put` blocks when the selected lane is full, and `get` blocks when it is
+empty, matching the usual hardware FIFO behavior closely enough for functional
+simulation.
+
+Scalar payloads and statically shaped block payloads are supported. A stream
+array such as `Stream[i32][2, 2]` is simulated as multiple FIFO lanes selected
+by the stream indices. A shaped payload such as `Stream[i32[2, 2]]` transfers a
+whole contiguous block per `put`/`get`.
+
+Current dataflow simulation restrictions are intentionally simple:
+
+- Stream-connected nested-kernel calls in one dataflow group must be
+  contiguous.
+- A dataflow group cannot mix stream-connected invokes with non-stream invokes.
+- Stream-connected invokes in a dataflow group must not return values; pass
+  output buffers explicitly.
+- As with hardware FIFOs, an imbalanced producer/consumer pair can deadlock.
+
 ## Backend Contexts
 
 Backend contexts are lightweight configuration objects. They do not permanently
@@ -212,10 +272,12 @@ At a high level, CPU simulation does the following:
    the original kernel object.
 2. Mark the top function with the C interface attribute required by the MLIR
    execution engine.
-3. Lower the module to LLVM.
-4. Build an `ExecutionEngine` with the requested optimization level.
-5. Pack Python scalars and NumPy arrays into the ABI expected by MLIR's runtime.
-6. Invoke the compiled function and write converted arrays back to the original
+3. Lower local stream operations to the dataflow runtime ABI and wrap
+   stream-connected nested-kernel calls in OpenMP sections when needed.
+4. Lower the module to LLVM.
+5. Build an `ExecutionEngine` with the requested optimization level.
+6. Pack Python scalars and NumPy arrays into the ABI expected by MLIR's runtime.
+7. Invoke the compiled function and write converted arrays back to the original
    NumPy arguments when needed.
 
 The compiled engine is stored in the process cache. Repeated CPU simulation

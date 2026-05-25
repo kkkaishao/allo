@@ -9,14 +9,14 @@ keywords: ["Allo", "Frontend", "Syntax", "Kernel", "DSL"]
 # Frontend Syntax
 
 This document describes the new Allo frontend syntax. The implementation is
-currently staged under `allo.exp`, but this document uses the intended top-level
-API:
+currently staged under `allo.exp`; examples that need the package namespace use
+`import allo.exp as allo`.
 
 ```python
 from __future__ import annotations
 
-import allo
-from allo import bool, f32, i32, u1, u32, GStream, kernel, Stream
+import allo.exp as allo
+from allo.exp.lang import bool, f32, i32, u1, u32, kernel, Stream
 ```
 
 The Python frontend is a restricted Python-embedded DSL (eDSL). It uses Python syntax for
@@ -33,7 +33,7 @@ be written directly as `f32[16]` instead of quoted strings such as `"f32[16]"`.
 ```python
 from __future__ import annotations
 
-from allo import f32, kernel
+from allo.exp.lang import f32, kernel
 
 @kernel
 def saxpy(a: f32, x: f32[16], y: f32[16], out: f32[16]):
@@ -140,7 +140,7 @@ predefined aliases. Unsigned custom integers are the default; pass `signed=True`
 for signed integers.
 
 ```python
-from allo import apint, kernel
+from allo.exp.lang import apint, kernel
 
 u17 = apint(17)
 i23 = apint(23, signed=True)
@@ -179,7 +179,7 @@ By default, shaped annotations describe mutable buffers. With
 tensors.
 
 ```python
-from allo import KernelOptions
+from allo.exp.lang import KernelOptions
 
 @kernel(options=KernelOptions(enable_tensor=True))
 def tensor_add(x: f32[4], y: f32[4]) -> f32[4]:
@@ -188,13 +188,13 @@ def tensor_add(x: f32[4], y: f32[4]) -> f32[4]:
 
 ### Streams
 
-`Stream` and `GStream` describe FIFO channels. The payload type can be a scalar
-dtype or a shaped buffer payload. The optional second bracket group describes an
-array of streams; omitting it creates a single rank-0 stream. The current
-frontend uses a default stream depth of `2`.
+`Stream` describes local FIFO channels. The payload type can be a scalar dtype
+or a shaped buffer payload. The optional second bracket group describes an array
+of streams; omitting it creates a single rank-0 stream. The current frontend
+uses a default stream depth of `2`.
 
 ```python
-from allo import GStream, Stream, i32
+from allo.exp.lang import Stream, i32
 
 @kernel
 def scalar_stream(x: i32, out: i32[1]):
@@ -224,28 +224,31 @@ def block_stream(out: i32[1]):
     out[0] = recv[0, 0]
 ```
 
-`GStream` declares a global stream symbol. It is useful when nested kernels need
-to communicate through a shared channel without passing a local stream argument.
-Global stream symbols can be captured by nested kernels, but they cannot be used
-as kernel parameters or return values.
+Streams can be passed explicitly to nested kernels. This is the supported way to
+connect producer and consumer stages inside one top-level kernel.
 
 ```python
 @kernel
-def global_stream(x: i32, out: i32[1]):
-    fifo: GStream[i32][2, 2]
+def nested_stream(x: i32, out: i32[1]):
+    fifo: Stream[i32]
 
     @kernel
-    def worker(v: i32):
-        fifo[0, 1].put(v)
+    def producer(v: i32, stream: Stream[i32]):
+        stream.put(v + 1)
 
-    worker(x)
-    out[0] = fifo[0, 1].get()
+    @kernel
+    def consumer(stream: Stream[i32], dst: i32[1]):
+        dst[0] = stream.get()
+
+    producer(x, fifo)
+    consumer(fifo, out)
 ```
 
 Streams must be declared without initializers. A stream array must be indexed
 with exactly one scalar index per stream dimension before `get()` or `put()`.
 Stream references are not assignable; use `put(value)` to write and `get()` to
-read.
+read. Stream values are not valid kernel return values. `GStream` global stream
+syntax is not part of the current public frontend surface.
 
 ## Variables and Scope
 
@@ -291,7 +294,7 @@ Compile-time variables must be declared with `constexpr`. They are evaluated
 during compilation and cannot be reassigned.
 
 ```python
-from allo import constexpr
+from allo.exp.lang import constexpr
 
 @kernel
 def constexpr_bound(out: i32[4]):
@@ -356,7 +359,7 @@ Both Python `range` and `allo.range` are supported in kernels. They accept the
 same one-, two-, or three-argument forms.
 
 ```python
-from allo import range as allo_range
+from allo.exp.lang import range as allo_range
 
 
 @kernel
@@ -527,9 +530,13 @@ def copy_2d(src: f32[4, 4], dst: f32[4, 4]):
 Rank-0 shaped values are indexed with `()`.
 
 ```python
-@kernel(options=allo.KernelOptions(enable_tensor=True))
+from allo.exp.lang import KernelOptions
+from allo.exp.operators import linalg
+
+
+@kernel(options=KernelOptions(enable_tensor=True))
 def dot_scalar(a: f32[4], b: f32[4]) -> f32:
-    return allo.linalg.dot(a, b)[()]
+    return linalg.dot(a, b)[()]
 ```
 
 Integer scalar values support single-bit extraction and insertion with
@@ -549,12 +556,16 @@ frontend.
 
 Python operators cover scalar arithmetic and shaped elementwise expressions.
 Explicit operator calls are useful when an operation needs an output
-accumulator.
+accumulator. The current experimental operator modules live under
+`allo.exp.operators`.
 
 ```python
+from allo.exp.operators import arith, linalg, math
+
+
 @kernel
 def memref_elementwise(x: f32[4], y: f32[4], out: f32[4]):
-    allo.arith.add(x, y, acc=out)
+    arith.add(x, y, acc=out)
 ```
 
 Math operators include `exp`, `exp2`, `log`, `log2`, `abs`, `pow`, `sqrt`,
@@ -565,7 +576,7 @@ values and on shaped values.
 @kernel
 def sigmoid(x: f32[8], out: f32[8]):
     for i in range(8):
-        out[i] = 1.0 / (1.0 + allo.math.exp(-x[i]))
+        out[i] = 1.0 / (1.0 + math.exp(-x[i]))
 ```
 
 Linalg operators currently include `matmul` and `dot`. They support both
@@ -576,13 +587,13 @@ same operation can return a tensor value directly.
 ```python
 @kernel(options=KernelOptions(enable_tensor=True))
 def dense(a: f32[2, 3], b: f32[3, 4]) -> f32[2, 4]:
-    return allo.linalg.matmul(a, b)
+    return linalg.matmul(a, b)
 ```
 
 ```python
 @kernel
 def buffer_matmul(a: f32[2, 3], b: f32[3, 4], out: f32[2, 4]):
-    allo.linalg.matmul(a, b, acc=out)
+    linalg.matmul(a, b, acc=out)
 ```
 
 ## Compile-Time Features
@@ -601,7 +612,7 @@ def add_scale(x: i32) -> i32:
 `consteval` marks a Python helper function that runs during compilation.
 
 ```python
-from allo import consteval
+from allo.exp.lang import consteval
 
 
 @consteval
@@ -618,7 +629,7 @@ Templates parameterize kernels over compile-time types and values. A templated
 kernel is not concrete until it is specialized with `kernel[...]`.
 
 ```python
-from allo import Template, f32, i32
+from allo.exp.lang import Template, f32, i32
 
 T = Template("T")
 N = Template("N")
@@ -709,8 +720,8 @@ source location. The most important restrictions are:
   declaration, and never reassigned.
 - Runtime values from an outer kernel scope cannot be captured by nested
   kernels.
-- `GStream` may be declared in a kernel body and captured by nested kernels, but
-  it cannot be passed as a kernel parameter or returned from a kernel.
+- `Stream` may be declared in a kernel body and passed explicitly to nested
+  kernels, but it cannot be returned from a kernel.
 - Recursive kernel calls, including indirect recursion through nested kernels,
   are not supported.
 - Python slices, partial tensor subviews, dynamic `...` shapes, tensor methods
@@ -726,13 +737,14 @@ new frontend should be documented from `test/`, `allo/exp`, and `example/`.
 | Area | Older upstream frontend | New frontend |
 | --- | --- | --- |
 | Kernel entry | Plain Python function passed to `allo.customize` | Function decorated with `@kernel` |
-| Import style | `from allo.ir.types import int32, float32, ConstExpr` | `from __future__ import annotations`; `from allo import i32, f32, constexpr, kernel` |
+| Import style | `from allo.ir.types import int32, float32, ConstExpr` | `from __future__ import annotations`; `from allo.exp.lang import i32, f32, constexpr, kernel` |
 | Shaped annotations | Often `int32[32, 32]` | Postponed annotations such as `i32[32, 32]`; quoted strings are still accepted |
 | Compile-time constants | `ConstExpr[...]` | `constexpr` annotation and `@consteval` helpers |
 | Templates | Old Python generic syntax and scheduler instantiation | `Template("T")`, `@kernel(T)`, and `kernel[i32]` specialization |
 | Kernel calls | Helper functions inside customized functions | Calls between `@kernel` functions, including nested kernels |
 | Diagnostics | Many errors surfaced later or through Python exits | Frontend diagnostics point to source locations |
 | Default shaped value | Old tensor/memref behavior from upstream schedule flow | Mutable buffer by default; tensor mode with `KernelOptions(enable_tensor=True)` |
+| Streams | Older dataflow APIs and scheduling-driven stream insertion | Local `Stream` declarations with scalar/block payloads and explicit nested-kernel stream parameters |
 
 Some old examples are not current syntax:
 
@@ -751,7 +763,7 @@ The new form is:
 ```python
 from __future__ import annotations
 
-from allo import f32, kernel
+from allo.exp.lang import f32, kernel
 
 @kernel
 def gemm(A: f32[32, 32], B: f32[32, 32]) -> f32[32, 32]:
@@ -766,5 +778,6 @@ Features documented in the old frontend guide should not be copied into new
 documentation unless they are implemented in the new frontend. In particular,
 old `meta_if`/`meta_for`, dynamic `float32[...]` shapes, partial subviews,
 general Python slicing, tensor attributes such as `.T`, `.copy`, and `.reverse`,
-old fixed-point type attributes, and high-level neural-network library calls are
-outside the currently documented new frontend surface.
+old fixed-point type attributes, global `GStream` syntax, and high-level
+neural-network library calls are outside the currently documented new frontend
+surface.
