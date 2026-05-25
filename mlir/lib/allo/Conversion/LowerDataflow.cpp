@@ -2,6 +2,7 @@
 #include "allo/IR/AlloOps.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/OpenMP/OpenMPDialect.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinOps.h"
@@ -20,6 +21,8 @@ namespace {
 constexpr StringLiteral kCreate = "allo_sim_stream_create";
 constexpr StringLiteral kWrite = "allo_sim_stream_write";
 constexpr StringLiteral kRead = "allo_sim_stream_read";
+constexpr StringLiteral kWriteMem = "allo_sim_stream_write_mem";
+constexpr StringLiteral kReadMem = "allo_sim_stream_read_mem";
 constexpr StringLiteral kDestroy = "allo_sim_stream_destroy";
 constexpr StringLiteral kCreateAttr = "allo.dataflow.stream_create";
 } // namespace
@@ -59,6 +62,10 @@ static unsigned payloadWidth(Type type) {
   llvm_unreachable("expected scalar stream payload");
 }
 
+static bool isBlockElementPayload(Type type) {
+  return isa<IntegerType, IndexType, FloatType>(type);
+}
+
 static int64_t product(ArrayRef<int64_t> shape) {
   int64_t lanes = 1;
   for (int64_t dim : shape) {
@@ -87,11 +94,50 @@ static void declareRuntimeFuncs(ModuleOp module) {
   declareRuntimeFunc(module, kWrite,
                      FunctionType::get(ctx, {i64, i64, i64}, {}));
   declareRuntimeFunc(module, kRead, FunctionType::get(ctx, {i64, i64}, {i64}));
+  declareRuntimeFunc(module, kWriteMem,
+                     FunctionType::get(ctx, {i64, i64, i64}, {}));
+  declareRuntimeFunc(module, kReadMem,
+                     FunctionType::get(ctx, {i64, i64, i64}, {}));
   declareRuntimeFunc(module, kDestroy, FunctionType::get(ctx, {i64}, {}));
 }
 
 static Value makeI64Constant(OpBuilder &builder, Location loc, int64_t value) {
   return arith::ConstantIntOp::create(builder, loc, value, 64);
+}
+
+static FailureOr<int64_t> memrefPayloadBytes(MemRefType type) {
+  if (!type.hasStaticShape() || !isBlockElementPayload(type.getElementType()))
+    return failure();
+
+  SmallVector<int64_t> strides;
+  int64_t offset = 0;
+  if (failed(type.getStridesAndOffset(strides, offset)) || offset != 0)
+    return failure();
+
+  int64_t expectedStride = 1;
+  for (int64_t i = static_cast<int64_t>(type.getRank()) - 1; i >= 0; --i) {
+    if (strides[i] != expectedStride)
+      return failure();
+    expectedStride *= type.getDimSize(i);
+  }
+  return type.getNumElements() *
+         ((payloadWidth(type.getElementType()) + 7) / 8);
+}
+
+static FailureOr<int64_t> streamPayloadBytes(Type type) {
+  if (isScalarPayload(type))
+    return (payloadWidth(type) + 7) / 8;
+  if (auto memrefType = dyn_cast<MemRefType>(type))
+    return memrefPayloadBytes(memrefType);
+  return failure();
+}
+
+static Value alignedPointerAsI64(OpBuilder &builder, Location loc,
+                                 Value memref) {
+  auto i64 = IntegerType::get(builder.getContext(), 64);
+  Value ptr =
+      memref::ExtractAlignedPointerAsIndexOp::create(builder, loc, memref);
+  return arith::IndexCastOp::create(builder, loc, i64, ptr);
 }
 
 static Value linearizeLane(OpBuilder &builder, Location loc,
@@ -250,17 +296,18 @@ struct StreamCreateLowering : public OpConversionPattern<StreamCreateOp> {
                   ConversionPatternRewriter &rewriter) const override {
     auto streamType = op.getStream().getType();
     Type baseType = streamType.getBaseType();
-    if (!isScalarPayload(baseType))
+    FailureOr<int64_t> itemBytes = streamPayloadBytes(baseType);
+    if (failed(itemBytes))
       return op.emitOpError(
-          "lower-dataflow only supports scalar stream payloads");
+          "lower-dataflow only supports scalar or static contiguous memref "
+          "stream payloads");
 
     Location loc = op.getLoc();
     auto i64 = IntegerType::get(rewriter.getContext(), 64);
-    int64_t width = payloadWidth(baseType);
     SmallVector<Value> operands = {
         makeI64Constant(rewriter, loc, product(streamType.getShape())),
         makeI64Constant(rewriter, loc, streamType.getDepth()),
-        makeI64Constant(rewriter, loc, (width + 7) / 8),
+        makeI64Constant(rewriter, loc, *itemBytes),
     };
     auto call =
         func::CallOp::create(rewriter, loc, rewriter.getStringAttr(kCreate),
@@ -278,14 +325,24 @@ struct StreamPutLowering : public OpConversionPattern<StreamPutOp> {
   matchAndRewrite(StreamPutOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
     auto streamType = op.getStream().getType();
-    FailureOr<Value> bits =
-        packScalar(rewriter, op.getLoc(), adaptor.getValue());
+    Location loc = op.getLoc();
+    Value lane = linearizeLane(rewriter, loc, streamType, adaptor.getIndices());
+
+    if (isa<MemRefType>(streamType.getBaseType())) {
+      Value ptr = alignedPointerAsI64(rewriter, loc, adaptor.getValue());
+      func::CallOp::create(rewriter, loc, rewriter.getStringAttr(kWriteMem),
+                           TypeRange{},
+                           ValueRange{adaptor.getStream(), lane, ptr});
+      rewriter.eraseOp(op);
+      return success();
+    }
+
+    FailureOr<Value> bits = packScalar(rewriter, loc, adaptor.getValue());
     if (failed(bits))
       return op.emitOpError(
-          "lower-dataflow only supports scalar stream payloads");
-    Value lane =
-        linearizeLane(rewriter, op.getLoc(), streamType, adaptor.getIndices());
-    func::CallOp::create(rewriter, op.getLoc(), rewriter.getStringAttr(kWrite),
+          "lower-dataflow only supports scalar or static contiguous memref "
+          "stream payloads");
+    func::CallOp::create(rewriter, loc, rewriter.getStringAttr(kWrite),
                          TypeRange{},
                          ValueRange{adaptor.getStream(), lane, *bits});
     rewriter.eraseOp(op);
@@ -301,16 +358,28 @@ struct StreamGetLowering : public OpConversionPattern<StreamGetOp> {
                   ConversionPatternRewriter &rewriter) const override {
     auto i64 = IntegerType::get(rewriter.getContext(), 64);
     auto streamType = op.getStream().getType();
-    Value lane =
-        linearizeLane(rewriter, op.getLoc(), streamType, adaptor.getIndices());
+    Location loc = op.getLoc();
+    Value lane = linearizeLane(rewriter, loc, streamType, adaptor.getIndices());
+
+    if (auto memrefType = dyn_cast<MemRefType>(streamType.getBaseType())) {
+      auto alloc = memref::AllocOp::create(rewriter, loc, memrefType);
+      Value ptr = alignedPointerAsI64(rewriter, loc, alloc.getResult());
+      func::CallOp::create(rewriter, loc, rewriter.getStringAttr(kReadMem),
+                           TypeRange{},
+                           ValueRange{adaptor.getStream(), lane, ptr});
+      rewriter.replaceOp(op, alloc.getResult());
+      return success();
+    }
+
     auto call = func::CallOp::create(
-        rewriter, op.getLoc(), rewriter.getStringAttr(kRead), TypeRange{i64},
+        rewriter, loc, rewriter.getStringAttr(kRead), TypeRange{i64},
         ValueRange{adaptor.getStream(), lane});
-    FailureOr<Value> value = unpackScalar(
-        rewriter, op.getLoc(), op.getValue().getType(), call.getResult(0));
+    FailureOr<Value> value =
+        unpackScalar(rewriter, loc, op.getValue().getType(), call.getResult(0));
     if (failed(value))
       return op.emitOpError(
-          "lower-dataflow only supports scalar stream payloads");
+          "lower-dataflow only supports scalar or static contiguous memref "
+          "stream payloads");
     rewriter.replaceOp(op, *value);
     return success();
   }
@@ -410,8 +479,8 @@ struct LowerDataflowPass
   }
 
   void getDependentDialects(DialectRegistry &registry) const override {
-    registry
-        .insert<arith::ArithDialect, func::FuncDialect, omp::OpenMPDialect>();
+    registry.insert<arith::ArithDialect, func::FuncDialect,
+                    memref::MemRefDialect, omp::OpenMPDialect>();
   }
 
 private:
