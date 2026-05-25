@@ -22,6 +22,7 @@ from ..lang.core import (
 from ..logging import log_fatal
 
 from .._C.ir import ModuleOp, Context
+from ..logging import log_fatal
 
 P = ParamSpec("P")
 R = TypeVar("R")
@@ -190,14 +191,11 @@ class Kernel(Generic[P, R]):
         try:
             raw_src, begin_line = inspect.getsourcelines(fn)
         except OSError:
-            warnings.warn(
-                f"Could not retrieve source code for function {fn.__name__} defined in {self.file_name}. "
+            log_fatal(
+                f"Could not retrieve source code for function {fn.__name__}. "
                 "This may be due to the function being defined in an interactive environment or a dynamically generated function. "
-                "Line number information may be inaccurate.",
-                RuntimeWarning,
             )
-            raw_src = ""
-            begin_line = 1
+            raise SystemExit(1) from None
 
         src = textwrap.dedent("".join(raw_src))
         match = re.search(r"^def\s+\w+\s*\(", src, re.MULTILINE)

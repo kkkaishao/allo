@@ -42,7 +42,6 @@ class Schedule:
         self.payload = module
         self.context = module.get_context()
         self.context.load_transform_dialects()
-        self._module_owner = None
         self.epoch = 0
         self.dirty = False
         self.effects: list[Effect] = []
