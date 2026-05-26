@@ -49,7 +49,13 @@ DEFAULT_DEVICE = "u280"
 DEFAULT_FREQ_MHZ = 300.0
 DEFAULT_VITIS_SETTINGS = Path("/opt/xilinx/2025.2/Vitis/settings64.sh")
 HLS_PREPARE_PIPELINE = """
-builtin.module(convert-allo-to-func,func.func(convert-linalg-to-affine-loops),canonicalize,cse)
+builtin.module(
+grid-mapping,
+materialize-topology,
+canonicalize,
+cse,
+convert-allo-to-func,
+func.func(convert-linalg-to-affine-loops),canonicalize,cse)
 """
 CSIM_CACHE_DIR_KEY_LENGTH = 24
 
@@ -194,6 +200,11 @@ class Vitis(Backend, Generic[P, R]):
         if flow not in ("vitis", "vivado"):
             raise ValueError("Flow must be either 'vitis' or 'vivado'")
         self._flow = flow
+
+    @property
+    def kernel_cpp(self) -> str:
+        artifacts = self._ensure_compiled()
+        return artifacts.kernel_cpp
 
     def call_kernel(self, kernel: Kernel, *args: P.args, **kwargs: P.kwargs) -> R:
         backend = Vitis(

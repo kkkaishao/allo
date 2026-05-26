@@ -27,10 +27,12 @@
 #include "mlir/Transforms/Passes.h"
 
 #include "allo/Conversion/Passes.h"
+#include "allo/Transforms/Passes.h"
 
 namespace mlir::allo {
+
 inline void registerAllPasses() {
-  registerTransformsPasses();
+  mlir::registerTransformsPasses();
 
   // Conversion passes
   registerArithToLLVMConversionPass();
@@ -48,8 +50,8 @@ inline void registerAllPasses() {
   registerReconcileUnrealizedCastsPass();
   registerSCFToControlFlowPass();
 
-  allo::registerConvertAlloToFuncPass();
-  allo::registerLowerDataflowPass();
+  allo::registerConversionPasses();
+  allo::registerTransformsPasses();
 
   // Dialect passes
   affine::registerAffinePasses();

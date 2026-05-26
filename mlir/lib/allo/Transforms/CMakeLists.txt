@@ -1,6 +1,6 @@
 add_mlir_library(MLIRAlloTransforms
-    Passes.cpp
-    LocalizeGlobalStream.cpp
+    MaterializeTopology.cpp
+    GridMapping.cpp
 
     DEPENDS
     MLIRAlloIncGen

@@ -3,9 +3,19 @@
 
 include "mlir/Pass/PassBase.td"
 
-def LocalizeGlobalStreamPass : Pass<"localize-global-stream", "ModuleOp"> {
-  let summary = "Localize global stream accesses to the function level.";
-  let description = "Localize global stream accesses to the function level.";
+def MaterializeTopologyPass : Pass<"materialize-topology", "ModuleOp"> {
+  let summary = "Materialize static stream topology.";
+  let description = [{
+    Specialize mapped process interfaces by scalarizing statically indexed
+    ranked stream lanes and trimming unused process arguments.
+  }];
+}
+
+def GridMappingPass : Pass<"grid-mapping", "ModuleOp"> {
+  let summary = "Map processes to a grid.";
+  let description = [{
+    Map processes to a grid.
+  }];
 }
 
 #endif // ALLO_TRANSFORMS_PASSES_TD

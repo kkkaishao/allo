@@ -111,6 +111,7 @@ target_link_libraries(_liballo
 
     MLIRAllo
     MLIRAlloConversion
+    MLIRAlloTransforms
     MLIRAlloTransformOps
     MLIRAlloTranslation
 )
