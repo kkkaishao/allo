@@ -1,4 +1,5 @@
 #include "allo/IR/AlloOps.h"
+#include "allo/Support/TopologyGraph.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
@@ -72,6 +73,8 @@ struct SpecializeKernelsPattern : OpRewritePattern<KernelOp> {
       auto kernel = cast<KernelOp>(rewriter.clone(*op));
       kernel.setSymName(instName);
       kernel.setMapping({1});
+      kernel->setAttr(kGridAttrName, rewriter.getDenseI32ArrayAttr(mapping));
+      kernel->setAttr(kCoordAttrName, rewriter.getDenseI32ArrayAttr(coord));
       kernels.push_back(kernel);
 
       kernel.walk([&](Operation *nested) {

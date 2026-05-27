@@ -4,4 +4,7 @@ add_mlir_library(MLIRAlloTransforms
 
     DEPENDS
     MLIRAlloIncGen
+
+    LINK_LIBS PUBLIC
+    MLIRAlloSupport
 )

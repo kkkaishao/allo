@@ -9,6 +9,10 @@ def MaterializeTopologyPass : Pass<"materialize-topology", "ModuleOp"> {
     Specialize mapped process interfaces by scalarizing statically indexed
     ranked stream lanes and trimming unused process arguments.
   }];
+  let options = [
+    Option<"allowPublicAbiChange", "allow-public-abi-change", "bool", "false",
+           "Allow scalarizing ranked stream ports on public kernels.">
+  ];
 }
 
 def GridMappingPass : Pass<"grid-mapping", "ModuleOp"> {

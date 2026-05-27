@@ -120,7 +120,7 @@ def test_vitis_stream_parameter():
     _assert_contains(code, "top_worker")
     _assert_regex(
         code,
-        r"void top_worker\(hls::stream<uint32_t> v\d+\[2\]\[2\], uint32_t v\d+\);",
+        r"void top_worker\(hls::stream<uint32_t> &v\d+, uint32_t v\d+\);",
         r"#pragma HLS stream variable=v\d+ depth=2",
     )
 
