@@ -34,9 +34,7 @@ def _first_code_col(source_line: str | None) -> int:
 
 def _is_schedule_internal(file_name: str) -> bool:
     normalized = file_name.replace("\\", "/")
-    return "/allo/exp/schedule/" in normalized or normalized.endswith(
-        "/allo/exp/_C/schedule.py"
-    )
+    return "/allo/exp/schedule/" in normalized
 
 
 def _location_from_frame(frame) -> DiagnosticLocation:

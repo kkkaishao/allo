@@ -18,6 +18,8 @@
 #include "mlir/Interfaces/FunctionInterfaces.h"
 #include "mlir/Interfaces/InferTypeOpInterface.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
+// ISA relayout ops expose getReassociationIndices() (ReassociationIndices).
+#include "mlir/Dialect/Utils/ReshapeOpsUtils.h"
 
 #include "allo/IR/AlloAttrs.h"
 #include "allo/IR/AlloTypes.h"
@@ -25,7 +27,14 @@
 
 #include "allo/IR/AlloDialect.h.inc"
 
+// ISA op interfaces (BufferAccessOpInterface references BufferTypeInterface,
+// which is pulled in via AlloTypes.h above).
+#include "allo/IR/AlloOpInterfaces.h.inc"
+
 #define GET_OP_CLASSES
 #include "allo/IR/AlloOps.h.inc"
+
+#define GET_OP_CLASSES
+#include "allo/IR/AlloISAOps.h.inc"
 
 #endif // ALLO_OPS_H

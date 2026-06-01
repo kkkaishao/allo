@@ -7,12 +7,22 @@
 #include "allo/IR/AlloAttrs.h"
 #include "allo/IR/AlloTypes.h"
 
+// The generated ISA op parsers (custom<DynamicIndexList>) need these helpers.
+#include "mlir/Interfaces/ViewLikeInterface.h"
+
 #include "allo/IR/AlloDialect.cpp.inc"
 
 #include "allo/IR/AlloEnums.cpp.inc"
 
+// ISA interfaces must precede the op/type classes that implement them.
+#include "allo/IR/AlloOpInterfaces.cpp.inc"
+#include "allo/IR/AlloTypeInterfaces.cpp.inc"
+
 #define GET_OP_CLASSES
 #include "allo/IR/AlloOps.cpp.inc"
+
+#define GET_OP_CLASSES
+#include "allo/IR/AlloISAOps.cpp.inc"
 
 #define GET_ATTRDEF_CLASSES
 #include "allo/IR/AlloAttrs.cpp.inc"
@@ -38,6 +48,8 @@ StreamType::verify(llvm::function_ref<InFlightDiagnostic()> emitError,
   }
   return success();
 }
+
+// ISA type/op method bodies live in AlloISATypes.cpp and AlloISAOps.cpp.
 
 Type StreamType::parse(AsmParser &parser) {
   if (parser.parseLess())
@@ -260,6 +272,10 @@ void AlloDialect::initialize() {
   addOperations<
 #define GET_OP_LIST
 #include "allo/IR/AlloOps.cpp.inc"
+      >();
+  addOperations<
+#define GET_OP_LIST
+#include "allo/IR/AlloISAOps.cpp.inc"
       >();
 }
 

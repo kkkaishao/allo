@@ -8,7 +8,7 @@ from ..lang.core import (
 )
 from ..lang.operator import operator
 from ..compiler.builder import AlloOpBuilder
-from .._C import allo
+from ..._mlir.dialects import allo
 
 
 @operator
@@ -26,8 +26,10 @@ def _(builder: AlloOpBuilder, axis: ConstexprValue):
         return builder.compile_error(
             "The axis of allo.get_wid must be a constant non-negative int"
         )
-    wid = allo.GetWorkerIdOp(builder, axis.value)
-    return AlloValue(wid, index)
+    wid = allo.GetWorkerIdOp(
+        axis.value, ip=builder.save_insertion_point(), loc=builder.get_loc()
+    )
+    return AlloValue(wid.result, index)
 
 
 @operator
@@ -45,8 +47,10 @@ def _(builder: AlloOpBuilder, axis: ConstexprValue):
         return builder.compile_error(
             "The axis of allo.get_num_workers must be a constant non-negative int"
         )
-    nw = allo.GetNumWorkersOp(builder, axis.value)
-    return AlloValue(nw, index)
+    nw = allo.GetNumWorkersOp(
+        axis.value, ip=builder.save_insertion_point(), loc=builder.get_loc()
+    )
+    return AlloValue(nw.result, index)
 
 
 def _materialize_stream(builder: AlloOpBuilder, stream):

@@ -18,7 +18,7 @@ from .utils import (
     is_default_acc,
     operator_body_unreachable,
 )
-from .._C import linalg as linalg_dialect
+from ..._mlir.dialects import linalg as linalg_d
 
 
 def _fold_binary(lhs, rhs, fn):
@@ -345,7 +345,7 @@ def _(builder: AlloOpBuilder, x, y, acc=ConstexprValue(None)):
         "add",
         result_dtype,
         lambda lhs, rhs: _build_add(builder, lhs, rhs),
-        named_op_cls=linalg_dialect.AddOp,
+        named_op_cls=linalg_d.AddOp,
     )
 
 
@@ -374,7 +374,7 @@ def _(builder: AlloOpBuilder, x, y, acc=ConstexprValue(None)):
         "sub",
         result_dtype,
         lambda lhs, rhs: _build_sub(builder, lhs, rhs),
-        named_op_cls=linalg_dialect.SubOp,
+        named_op_cls=linalg_d.SubOp,
     )
 
 
@@ -403,7 +403,7 @@ def _(builder: AlloOpBuilder, x, y, acc=ConstexprValue(None)):
         "mul",
         result_dtype,
         lambda lhs, rhs: _build_mul(builder, lhs, rhs),
-        named_op_cls=linalg_dialect.MulOp,
+        named_op_cls=linalg_d.MulOp,
     )
 
 
@@ -432,9 +432,9 @@ def _(
     assert isinstance(x, AlloValue) and isinstance(y, AlloValue)
     result_dtype = _binary_result_dtype(builder, x, y, "div")
     named_op_cls = (
-        linalg_dialect.DivUnsignedOp
+        linalg_d.DivUnsignedOp
         if result_dtype.is_uint() and not signed_value
-        else linalg_dialect.DivOp
+        else linalg_d.DivOp
     )
     return _lower_binary_arith(
         builder,
@@ -536,7 +536,7 @@ def _(builder: AlloOpBuilder, x, y, acc=ConstexprValue(None)):
     assert isinstance(x, AlloValue) and isinstance(y, AlloValue)
     result_dtype = _binary_result_dtype(builder, x, y, "pow")
     named_op_cls = (
-        linalg_dialect.PowFOp if x.dtype.is_float() and y.dtype.is_float() else None
+        linalg_d.PowFOp if x.dtype.is_float() and y.dtype.is_float() else None
     )
     return _lower_binary_arith(
         builder,

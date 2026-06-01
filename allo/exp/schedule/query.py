@@ -18,8 +18,7 @@ from .model import (
     ScheduleSnapshot,
     ValueNode,
 )
-from .._C import schedule as schedule_d
-from .._C.schedule import ScheduleOpTrait
+from ..._mlir.schedule import ScheduleOpTrait
 
 RefT = TypeVar("RefT", OpRef, LoopRef, BufferRef)
 Node = OpNode | ValueNode
@@ -148,7 +147,7 @@ class Query:
         nodes = [
             node
             for node in self._op_nodes(name=name, under=under, path=path)
-            if node.has_trait(ScheduleOpTrait.OP_TRAIT_LOOP_LIKE)
+            if node.has_trait(ScheduleOpTrait.LOOP_LIKE)
         ]
         return RefSelection(self.schedule, nodes, LoopRef, "loop")
 
@@ -201,7 +200,7 @@ class Query:
         if isinstance(target, OpRef):
             self.snapshot.require_live(target, last_effect=self.schedule.last_effect)
             node = self.snapshot.ops_by_id[target.id]
-            if not node.has_trait(ScheduleOpTrait.OP_TRAIT_LOOP_LIKE):
+            if not node.has_trait(ScheduleOpTrait.LOOP_LIKE):
                 raise ScheduleTypeError(
                     f"{target.describe()} is not loop-like and cannot be used as a loop"
                 )

@@ -10,6 +10,7 @@ namespace mlir::allo {
 #include "allo/Conversion/Passes.h.inc"
 
 void populateLowerToLLVMPipeline(OpPassManager &pm, bool enableTensor);
+void registerAlloLLVMLoweringPipeline();
 
 } // namespace mlir::allo
 

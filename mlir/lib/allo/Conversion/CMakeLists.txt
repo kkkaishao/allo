@@ -1,5 +1,6 @@
 add_mlir_conversion_library(MLIRAlloConversion
     ConvertAlloToFunc.cpp
+    LowerInstructions.cpp
     LowerDataflow.cpp
     LowerToLLVM.cpp
     PARTIAL_SOURCES_INTENDED
@@ -10,10 +11,15 @@ add_mlir_conversion_library(MLIRAlloConversion
     LINK_LIBS PUBLIC
     MLIRAllo
     MLIRArithDialect
+    MLIRBufferizationDialect
     MLIRFuncDialect
     MLIRIR
+    MLIRLinalgDialect
+    MLIRMathDialect
+    MLIRMemRefDialect
     MLIROpenMPDialect
     MLIROpenMPToLLVM
+    MLIRTensorDialect
     MLIRTransformUtils
 )
 
@@ -22,5 +28,5 @@ add_library(allo_dataflow_runtime SHARED
 )
 
 set_target_properties(allo_dataflow_runtime PROPERTIES
-    LIBRARY_OUTPUT_DIRECTORY "${PROJECT_SOURCE_DIR}/../allo/exp/_C"
+    LIBRARY_OUTPUT_DIRECTORY "${PROJECT_SOURCE_DIR}/../allo/_mlir/_mlir_libs"
 )

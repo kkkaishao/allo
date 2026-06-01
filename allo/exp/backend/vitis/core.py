@@ -32,9 +32,8 @@ from .utils import (
     _source_settings_env,
     _synth_log_path,
 )
-from ..._C import passes
-from ..._C.ir import UnitAttr
-from ..._C.passes import emit_vivado_hls
+from allo._mlir.dialects.allo import emit_vivado_hls
+from ..base import run_pipeline, set_kernel_unit_attr
 from ...lang.core import BufferType, ShapedType, TypeBase
 from ...lang.kernel import Kernel
 from ...logging import log_warning, run_command, stage, terminate_on_error
@@ -514,10 +513,6 @@ class Vitis(Backend, Generic[P, R]):
             self.artifacts = self.compile()
         return self.artifacts
 
-    # def _release_working_module(self) -> None:
-    #     self.module = None
-    #     self._module_owner = None
-
     def _invalidate_compiled_artifacts(self) -> None:
         self.artifacts = None
         self.csimulator = None
@@ -637,7 +632,7 @@ class Vitis(Backend, Generic[P, R]):
     ) -> PythonNativeCSimulator:
         if self.csimulator is not None and self.csimulator.project_path == project_path:
             return self.csimulator
-        cached = self._process_cache_get("vitis.csim", cache_key)
+        cached = self._get_pcache("vitis.csim", cache_key)
         if cached:
             self.csimulator = cached
             return cached
@@ -703,14 +698,11 @@ class Vitis(Backend, Generic[P, R]):
         # because the codegen is typically much faster than sim/synth/impl
         with stage("Compiling Vitis HLS Kernels"):
             module = self._get_working_module()
-            top_fn = module.lookup_kernel(self.kernel.func_name)
-            if top_fn is None:
+            if not set_kernel_unit_attr(module, self.kernel.func_name, "top"):
                 raise RuntimeError(
                     f"Kernel function {self.kernel.func_name} not found in the module"
                 )
-            top_fn.set_attr("top", UnitAttr.get(module.get_context()))
-
-            passes.run(HLS_PREPARE_PIPELINE, module.get_operation())
+            run_pipeline(module, HLS_PREPARE_PIPELINE)
             hls_code = emit_vivado_hls(module)
             if hls_code is None:
                 raise RuntimeError("Failed to emit Vitis HLS code")
@@ -718,9 +710,6 @@ class Vitis(Backend, Generic[P, R]):
             hls_code = _apply_interface_pragmas(
                 hls_code, self.kernel.func_name, self._interface_pragmas
             )
-            # top_fn = None
-            # module = None
-            # self._release_working_module()
 
             artifacts = CompiledArtifacts(
                 kernel_cpp=hls_code,

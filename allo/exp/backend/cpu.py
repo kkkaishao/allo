@@ -23,30 +23,25 @@ from ..lang.core import (
     StreamType,
     TypeBase,
 )
-from ..logging import log_debug, stage, terminate_on_error
-from .base import Backend, ModuleCacheEntry
+from ..logging import stage, terminate_on_error
+from .base import Backend, run_pipeline, set_top_llvm_c_wrapper
 from ..lang.kernel import Kernel
-from .._C.ir import UnitAttr
-from .._C.execution_engine import ExecutionEngine
+from ..._mlir import ir
+from ..._mlir.execution_engine import ExecutionEngine
+from ..._mlir.runtime import (
+    as_ctype,
+    get_ranked_memref_descriptor,
+    make_nd_memref_descriptor,
+    ranked_memref_to_numpy,
+)
 
 
 @dataclass
-class _CPUCompileCacheEntry(ModuleCacheEntry):
-    engine: ExecutionEngine | None
+class _CPUCompileCacheEntry:
+    module: ir.Module
+    engine: ExecutionEngine
     arg_types: list[TypeBase]
     res_types: list[TypeBase]
-
-    def close(self) -> None:
-        self.engine = None
-        super().close()
-
-
-class _F16(ctypes.Structure):
-    _fields_ = [("f16", ctypes.c_int16)]
-
-
-class _BF16(ctypes.Structure):
-    _fields_ = [("bf16", ctypes.c_int16)]
 
 
 _DTYPE_TO_NP = {
@@ -96,7 +91,7 @@ def _find_first(paths: list[Path], stem: str) -> str | None:
 def _dataflow_runtime_lib() -> str:
     exp_dir = Path(__file__).resolve().parents[1]
     candidates = [
-        exp_dir / "_C",
+        exp_dir.parent / "_mlir" / "_mlir_libs",
         exp_dir.parents[1] / "build" / "lib",
     ]
     path = _find_first(candidates, "liballo_dataflow_runtime")
@@ -165,46 +160,6 @@ def _default_shared_libs() -> list[str]:
     return [*libs, _libomp(), _dataflow_runtime_lib()]
 
 
-def _make_nd_memref_descriptor(rank: int, dtype):
-    class MemRefDescriptor(ctypes.Structure):
-        _fields_ = [
-            ("allocated", ctypes.c_longlong),
-            ("aligned", ctypes.POINTER(dtype)),
-            ("offset", ctypes.c_longlong),
-            ("shape", ctypes.c_longlong * rank),
-            ("strides", ctypes.c_longlong * rank),
-        ]
-
-    return MemRefDescriptor
-
-
-def _get_ranked_memref_descriptor(array: np.ndarray):
-    ctp = _as_ctype(array.dtype)
-    desc = _make_nd_memref_descriptor(array.ndim, ctp)()
-    desc.allocated = array.ctypes.data
-    desc.aligned = array.ctypes.data_as(ctypes.POINTER(ctp))
-    desc.offset = 0
-    desc.shape = array.ctypes.shape
-    strides_t = ctypes.c_longlong * array.ndim
-    desc.strides = strides_t(*[stride // array.itemsize for stride in array.strides])
-    return desc
-
-
-def _ranked_memref_to_numpy(desc):
-    content_ptr = ctypes.cast(
-        ctypes.addressof(desc.aligned.contents)
-        + desc.offset * ctypes.sizeof(desc.aligned.contents),
-        type(desc.aligned),
-    )
-    array = np.ctypeslib.as_array(content_ptr, shape=desc.shape)
-    strided = np.lib.stride_tricks.as_strided(
-        array,
-        np.ctypeslib.as_array(desc.shape),
-        np.ctypeslib.as_array(desc.strides) * array.itemsize,
-    )
-    return _to_numpy(strided)
-
-
 def _make_output_struct(memref_descriptors):
     fields = [
         (f"memref{i}", memref.__class__) for i, memref in enumerate(memref_descriptors)
@@ -251,7 +206,7 @@ def _writeback_args(arg_arrays):
 def _pack_arg(arg, arg_type: TypeBase):
     if isinstance(arg_type, BufferType):
         array = _as_array(arg, arg_type)
-        desc = _get_ranked_memref_descriptor(array)
+        desc = get_ranked_memref_descriptor(array)
         ptr = ctypes.pointer(ctypes.pointer(desc))
         return ptr, (array, desc, ptr), array
 
@@ -275,15 +230,15 @@ def _pack_results(res_types: list[TypeBase]):
     for res_type in res_types:
         if not isinstance(res_type, BufferType):
             raise TypeError("Multiple CPU return values must be buffers")
-        ctp = _ctype_for_dtype(res_type.dtype)
-        desc = _make_nd_memref_descriptor(len(res_type.shape), ctp)()
+        ctp = as_ctype(np.dtype(_numpy_dtype_for_dtype(res_type.dtype)))
+        desc = make_nd_memref_descriptor(len(res_type.shape), ctp)()
         descriptors.append(desc)
         keepalive.append(desc)
 
     if len(descriptors) == 1:
         ptr = ctypes.pointer(ctypes.pointer(descriptors[0]))
         keepalive.append(ptr)
-        return ptr, keepalive, lambda: _ranked_memref_to_numpy(ptr[0][0])
+        return ptr, keepalive, lambda: ranked_memref_to_numpy(ptr[0])
 
     output = _make_output_struct(descriptors)
     ptr = ctypes.pointer(ctypes.pointer(output))
@@ -292,7 +247,7 @@ def _pack_results(res_types: list[TypeBase]):
         ptr,
         keepalive,
         lambda: [
-            _ranked_memref_to_numpy(getattr(ptr[0][0], f"memref{i}"))
+            ranked_memref_to_numpy(ctypes.pointer(getattr(ptr[0][0], f"memref{i}")))
             for i in range(len(descriptors))
         ],
     )
@@ -345,22 +300,6 @@ def _check_supported_dtype(dtype: DType):
     raise TypeError(f"Unsupported CPU dtype: {dtype}")
 
 
-def _as_ctype(dtype):
-    if dtype == np.dtype(np.float16):
-        return _F16
-    if dtype == ml_dtypes.bfloat16:
-        return _BF16
-    return np.ctypeslib.as_ctypes_type(dtype)
-
-
-def _to_numpy(array):
-    if array.dtype == _F16:
-        return array.view("float16")
-    if array.dtype == _BF16:
-        return array.view("bfloat16")
-    return array
-
-
 def _convert_back(array, dtype):
     if dtype == np.dtype(np.float16):
         return array.view(np.float16)
@@ -388,63 +327,52 @@ class CPU(Backend, Generic[P, R]):
 
     def __init__(
         self,
-        kernel: Kernel[P, R] | None = None,
+        kernel: Kernel[P, R],
         *,
         opt_level: int = 2,
-        shared_libs: list[str] | None = None,
+        shared_libs: list[str] = [],
     ):
         super().__init__(kernel)
         self.opt_level = opt_level
-        self.shared_libs = shared_libs
+        self.shared_libs = _default_shared_libs()
+        self.shared_libs.extend(shared_libs)
         self.engine: ExecutionEngine | None = None
-        self.arg_types = None
-        self.res_types = None
-
-    def call_kernel(self, kernel, *args: P.args, **kwargs: P.kwargs) -> R:
-        return CPU(
-            kernel,
-            opt_level=self.opt_level,
-            shared_libs=self.shared_libs,
-        ).run(*args, **kwargs)
+        self.arg_types: list[TypeBase] = []
+        self.res_types: list[TypeBase] = []
 
     @terminate_on_error
     def __call__(self, *args: P.args, **kwargs: P.kwargs) -> R:
-        if self.kernel is None:
-            raise RuntimeError("No kernel provided for CPU backend")
         return self.run(*args, **kwargs)
 
     @terminate_on_error
     def compile(self):
-        if self.engine is not None:
-            assert self.module is not None
-            return self.module
         if self.kernel.options.enable_tensor:
             raise NotImplementedError("CPU backend does not support tensor ABI yet")
-
-        shared_libs = (
-            _default_shared_libs() if self.shared_libs is None else self.shared_libs
-        )
         cache_key = self._cache_key(
             {
                 "backend": self.name,
                 "opt_level": self.opt_level,
-                "shared_libs": shared_libs,
+                "shared_libs": self.shared_libs,
             }
         )
-        cached = self._process_cache_get("cpu.compile", cache_key)
-        if cached is not None:
-            log_debug(f"Cache hit for CPU compilation: {cache_key[-8:]}")
-            self._context_keepalive = cached.context
-            self._module_owner = cached.module_owner
-            self.module = cached.module
-            self.engine = cached.engine
-            self.arg_types = cached.arg_types
-            self.res_types = cached.res_types
+        cache = self._pcache_get("cpu.compile", cache_key)
+        if cache is not None:
+            self.module = cache.module
+            self.engine = cache.engine
+            self.arg_types = cache.arg_types
+            self.res_types = cache.res_types
+            return self.module
+        else:
+            cache = self._build_pcache(self.shared_libs)
+            self._pcache_set("cpu.compile", cache_key, cache)
+            self.module = cache.module
+            self.engine = cache.engine
+            self.arg_types = cache.arg_types
+            self.res_types = cache.res_types
             return self.module
 
+    def _build_pcache(self, shared_libs: list[str]) -> _CPUCompileCacheEntry:
         with stage("Compiling CPU Kernels"):
-            module = self._get_working_module()
-            assert self._module_owner is not None
             arg_types = self.kernel.parse_argument_annotations()
             res_types = self.kernel.parse_return_annotation()
             if any(isinstance(ty, StreamType) for ty in arg_types):
@@ -452,64 +380,36 @@ class CPU(Backend, Generic[P, R]):
                     "CPU backend does not support stream top-level arguments"
                 )
 
-            top = module.lookup_kernel(self.kernel.func_name)
-            if top is None:
+            if not set_top_llvm_c_wrapper(self.module, self.kernel.func_name):
                 raise RuntimeError(
                     f"Cannot find top function '{self.kernel.func_name}'"
                 )
-            top.set_attr("llvm.emit_c_interface", UnitAttr.get(module.get_context()))
-
-            from .._C.passes import lower_to_llvm
-
-            lower_to_llvm(module, False)
+            run_pipeline(self.module, "builtin.module(allo-lower-to-llvm)")
             engine = ExecutionEngine(
-                module,
+                self.module,
                 opt_level=self.opt_level,
                 shared_libs=shared_libs,
             )
-            self.arg_types = arg_types
-            self.res_types = res_types
-            self.engine = engine
-            self._process_cache_set(
-                "cpu.compile",
-                cache_key,
-                _CPUCompileCacheEntry(
-                    context=self._context_keepalive,
-                    module_owner=self._module_owner,
-                    module=module,
-                    engine=engine,
-                    arg_types=arg_types,
-                    res_types=res_types,
-                ),
+            return _CPUCompileCacheEntry(
+                module=self.module,
+                engine=engine,
+                arg_types=arg_types,
+                res_types=res_types,
             )
-            return module
 
     @terminate_on_error
-    def run(self, *args, **kwargs) -> Any:
+    def run(self, *args: P.args, **kwargs: P.kwargs) -> R:
         self._ensure_compiled()
-        return self.simulate(*args, **kwargs)
-
-    @terminate_on_error
-    def simulate(self, *args, **kwargs) -> Any:
-        if kwargs:
-            raise TypeError("CPU.simulate only accepts positional kernel arguments")
-        if self.module is None:
-            raise RuntimeError(
-                "Kernel is not compiled yet. Run compilation before simulation."
-            )
-        assert self.engine is not None
-        assert self.arg_types is not None
-        assert self.res_types is not None
-
-        packed_args, _keepalive, arg_arrays, result_decode = _pack_kernel_args(
+        packed_args, _, arg_arrays, result_decode = _pack_kernel_args(
             args, self.arg_types, self.res_types
         )
         with stage("Running CPU Kernels (JIT)"):
+            assert self.engine is not None
             self.engine.invoke(self.kernel.func_name, *packed_args)
             _writeback_args(arg_arrays)
             if result_decode is None:
-                return None
-            return result_decode()
+                return None  # type: ignore
+            return result_decode()  # type: ignore
 
     @terminate_on_error
     def scaffold_project(

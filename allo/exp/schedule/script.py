@@ -2,9 +2,15 @@ from __future__ import annotations
 
 from typing import Protocol
 
+from ..._mlir import ir
+from ..._mlir.dialects import transform as t
+from ..._mlir.dialects.transform import structured as ts
+from ..._mlir.dialects.transform import allo as ta
+from ..._mlir.schedule import SCHEDULE_ID_ATTR_NAME, SCHEDULE_NAME_ATTR_NAME
+
 from .errors import capture_schedule_location
 from .model import BufferRef, OpRef, ScheduleSnapshot
-from .._C import ir, schedule as schedule_d, transform as tran_d
+from ..compiler.builder import AlloOpBuilder
 
 
 class TransformHost(Protocol):
@@ -14,32 +20,50 @@ class TransformHost(Protocol):
 
 
 class TransformScript:
+    """Builds a ``__transform_main`` named sequence on upstream `allo._mlir`.
+
+    Ops are inserted *before* the sequence's terminating ``transform.yield`` so
+    they accumulate in forward (data-dependency) order across primitive calls.
+    """
+
     def __init__(self, schedule: TransformHost):
         self.schedule = schedule
         self.context = schedule.context
-        self.builder = ir.AlloOpBuilder(self.context)
+        self.builder = AlloOpBuilder(self.context)
         self.builder.set_unknown_loc()
 
-        self.module = ir.ModuleOp(self.builder)
-        self.module.set_attr(
-            "transform.with_named_sequence", ir.UnitAttr.get(self.context)
-        )
+        with self.context, ir.Location.unknown(self.context):
+            self.module = ir.Module.create()
+            self.module.operation.attributes["transform.with_named_sequence"] = (
+                ir.UnitAttr.get(self.context)
+            )
+            self.any_op_type = t.AnyOpType.get()
+            self.any_value_type = t.AnyValueType.get()
+            self.any_param_type = t.AnyParamType.get()
+            root_type = t.OperationType.get("builtin.module")
 
-        self.builder.set_insertion_point_to_start(self.module.get_body())
-        root_type = tran_d.OperationType.get(self.context, "builtin.module")
-        self.sequence = tran_d.NamedSequenceOp(
-            self.builder, "__transform_main", root_type, []
-        )
+            self.builder.set_insertion_point_to_end(self.module.body)
+            self.sequence = t.NamedSequenceOp(
+                "__transform_main",
+                [root_type],
+                [],
+                ip=self.builder._ip,
+                loc=self.builder._loc,
+            )
 
-        entry = self.sequence.get_entry_block()
-        self.builder.set_insertion_point_to_end(entry)
-        tran_d.YieldOp(self.builder, [])
-        self.builder.set_insertion_point_to_start(entry)
+        entry = self.sequence.body
+        self.root = self.sequence.bodyTarget
+        yield_op = t.YieldOp([], ip=ir.InsertionPoint(entry), loc=self.builder._loc)
+        # Subsequent primitives insert immediately before the terminator.
+        self.builder.restore_insertion_point(ir.InsertionPoint(yield_op.operation))
 
-        self.root = self.sequence.get_arg_at(0)
-        self.any_op_type = tran_d.AnyOpType.get(self.context)
         self._op_handles = {schedule.snapshot.root_id: self.root}
         self._value_handles = {}
+
+    @property
+    def kw(self) -> dict:
+        """``ip``/``loc`` kwargs for upstream ODS op construction."""
+        return {"ip": self.builder._ip, "loc": self.builder._loc}
 
     def set_callsite_loc(self) -> None:
         loc = capture_schedule_location()
@@ -47,12 +71,7 @@ class TransformScript:
             self.builder.set_unknown_loc()
             return
         self.builder.set_loc(
-            ir.Location(
-                loc.file_name,
-                loc.line,
-                loc.col + 1,
-                self.context,
-            )
+            ir.Location.file(loc.file_name, loc.line, loc.col + 1, self.context)
         )
 
     def op_handle(self, ref: OpRef) -> ir.Value:
@@ -61,13 +80,14 @@ class TransformScript:
             return handle
 
         node = self.schedule.snapshot.ops_by_id[ref.id]
-        attrs = ir.DictionaryAttr.get(
-            self.context,
-            {schedule_d.SCHEDULE_ID_ATTR_NAME: self.builder.get_string_attr(ref.id)},
-        )
-        handle = tran_d.MatchOp(
-            self.builder, self.root, self.any_op_type, [node.kind], attrs
-        ).get_result_at(0)
+        handle = ts.MatchOp(
+            self.any_op_type,
+            self.root,
+            ops=[node.kind],
+            op_attrs={SCHEDULE_ID_ATTR_NAME: ir.StringAttr.get(ref.id, self.context)},
+            ip=self.builder._ip,
+            loc=self.builder._loc,
+        ).results[0]
         self._op_handles[ref.id] = handle
         return handle
 
@@ -79,9 +99,14 @@ class TransformScript:
         owner = self._owner_ref(ref)
         owner_handle = self.op_handle(owner)
         source_kind = {"arg": 1, "res": 2}[ref.source]
-        handle = tran_d.MatchValueOp(
-            self.builder, owner_handle, ref.number, source_kind
-        ).get_result_at(0)
+        handle = ta.MatchValueOp(
+            self.any_value_type,
+            owner_handle,
+            ref.number,
+            source_kind=source_kind,
+            ip=self.builder._ip,
+            loc=self.builder._loc,
+        ).result
         self._value_handles[ref.id] = handle
         return handle
 
@@ -89,23 +114,28 @@ class TransformScript:
         self._op_handles[ref.id] = handle
 
     def defining_op_handle(self, handle: ir.Value) -> ir.Value:
-        return tran_d.GetDefiningOp(self.builder, handle).get_result_at(0)
+        return t.GetDefiningOp(
+            self.any_op_type, handle, ip=self.builder._ip, loc=self.builder._loc
+        ).result
+
+    def _annotate(self, handle: ir.Value, name: str, value: str) -> None:
+        # Upstream `transform.annotate` only attaches a param's value, so wrap the
+        # static string in a `transform.param.constant` first.
+        param = t.ParamConstantOp(
+            self.any_param_type,
+            ir.StringAttr.get(value, self.context),
+            ip=self.builder._ip,
+            loc=self.builder._loc,
+        ).param
+        t.AnnotateOp(
+            handle, name, param=param, ip=self.builder._ip, loc=self.builder._loc
+        )
 
     def annotate_schedule_id(self, handle: ir.Value, schedule_id: str) -> None:
-        tran_d.AnnotateOp(
-            self.builder,
-            handle,
-            schedule_d.SCHEDULE_ID_ATTR_NAME,
-            self.builder.get_string_attr(schedule_id),
-        )
+        self._annotate(handle, SCHEDULE_ID_ATTR_NAME, schedule_id)
 
     def annotate_schedule_name(self, handle: ir.Value, schedule_name: str) -> None:
-        tran_d.AnnotateOp(
-            self.builder,
-            handle,
-            schedule_d.SCHEDULE_NAME_ATTR_NAME,
-            self.builder.get_string_attr(schedule_name),
-        )
+        self._annotate(handle, SCHEDULE_NAME_ATTR_NAME, schedule_name)
 
     def _owner_ref(self, ref: BufferRef) -> OpRef:
         node = self.schedule.snapshot.ops_by_id[ref.owner_id]

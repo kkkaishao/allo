@@ -8,6 +8,8 @@
 #include "mlir/Dialect/Linalg/Passes.h"
 #include "mlir/Dialect/MemRef/Transforms/Passes.h"
 #include "mlir/Pass/PassManager.h"
+#include "mlir/Pass/PassOptions.h"
+#include "mlir/Pass/PassRegistry.h"
 #include "mlir/Transforms/Passes.h"
 
 using namespace mlir;
@@ -58,4 +60,23 @@ void allo::populateLowerToLLVMPipeline(OpPassManager &pm, bool enableTensor) {
   pm.addPass(createReconcileUnrealizedCastsPass());
   pm.addPass(createCanonicalizerPass());
   pm.addPass(createCSEPass());
+}
+
+namespace {
+struct AlloLowerToLLVMPipelineOptions
+    : public PassPipelineOptions<AlloLowerToLLVMPipelineOptions> {
+  Option<bool> enableTensor{
+      *this, "enable-tensor",
+      llvm::cl::desc(
+          "Run tensor->linalg + one-shot bufferization before lowering"),
+      llvm::cl::init(true)};
+};
+} // namespace
+
+void allo::registerAlloLLVMLoweringPipeline() {
+  PassPipelineRegistration<AlloLowerToLLVMPipelineOptions>(
+      "allo-lower-to-llvm", "Lower allo/canonical-form IR to the LLVM dialect",
+      [](OpPassManager &pm, const AlloLowerToLLVMPipelineOptions &opts) {
+        populateLowerToLLVMPipeline(pm, opts.enableTensor);
+      });
 }

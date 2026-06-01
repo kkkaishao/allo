@@ -6,8 +6,7 @@ from dataclasses import dataclass
 from typing import Any, Literal
 
 from .errors import StaleRefError
-from .._C import schedule as schedule_d
-from .._C.schedule import ScheduleOpTrait
+from ..._mlir.schedule import ScheduleOpTrait
 
 
 @dataclass(frozen=True)
@@ -200,9 +199,7 @@ class ScheduleSnapshot:
 
     def loop_ref(self, op_id: str) -> LoopRef:
         node = self.ops_by_id[op_id]
-        assert node.has_trait(
-            ScheduleOpTrait.OP_TRAIT_LOOP_LIKE
-        ), "operation is not loop-like"
+        assert node.has_trait(ScheduleOpTrait.LOOP_LIKE), "operation is not loop-like"
         return LoopRef(
             id=node.id,
             epoch=self.epoch,

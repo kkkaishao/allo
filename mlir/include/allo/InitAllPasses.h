@@ -52,6 +52,7 @@ inline void registerAllPasses() {
 
   allo::registerConversionPasses();
   allo::registerTransformsPasses();
+  allo::registerAlloLLVMLoweringPipeline();
 
   // Dialect passes
   affine::registerAffinePasses();

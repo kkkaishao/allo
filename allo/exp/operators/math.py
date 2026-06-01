@@ -18,7 +18,7 @@ from .utils import (
     is_default_acc,
     operator_body_unreachable,
 )
-from .._C import linalg, math
+from ..._mlir.dialects import linalg, math
 
 
 def _is_const(value, expected):
@@ -61,7 +61,9 @@ def _emit_unary_math(
     operand = _materialize_unary_operand(builder, value, acc)
     result_dtype = builder.get_promoted_dtype_nary(op_name, [operand.dtype])
     operand = builder.cast_to_dtype(operand, result_dtype)
-    build_fn = lambda inner: op_cls(builder, inner.handle).get_result_at(0)
+    build_fn = lambda inner: op_cls(
+        inner.handle, ip=builder.save_insertion_point(), loc=builder.get_loc()
+    ).result
     if isinstance(operand.type, ShapedType) or not is_default_acc(acc):
         return emit_linalg_unary(
             builder,
@@ -86,8 +88,11 @@ def _emit_binary_math(
     linalg_op_cls=None,
 ):
     build_fn = lambda lhs_arg, rhs_arg: op_cls(
-        builder, lhs_arg.handle, rhs_arg.handle
-    ).get_result_at(0)
+        lhs_arg.handle,
+        rhs_arg.handle,
+        ip=builder.save_insertion_point(),
+        loc=builder.get_loc(),
+    ).result
     if (
         isinstance(lhs.type, ShapedType)
         or isinstance(rhs.type, ShapedType)
@@ -263,7 +268,9 @@ def _(builder: AlloOpBuilder, value, acc=ConstexprValue(None)):
 
     def build_fn(inner):
         op_cls = math.AbsFOp if inner.dtype.is_float() else math.AbsIOp
-        return op_cls(builder, inner.handle).get_result_at(0)
+        return op_cls(
+            inner.handle, ip=builder.save_insertion_point(), loc=builder.get_loc()
+        ).result
 
     if isinstance(operand.type, ShapedType) or not is_default_acc(acc):
         return emit_linalg_unary(

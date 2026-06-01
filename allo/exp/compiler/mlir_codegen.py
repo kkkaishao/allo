@@ -5,23 +5,39 @@ import copy
 from contextlib import contextmanager
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Type
+from typing import Type, cast
 from types import ModuleType
 
-from .._C.ir import Context, ModuleOp, Location, Value, FunctionType, Block
-from .._C import schedule as schedule_d
-from .._C.allo import ReturnOp, InvokeOp, KernelOp
-from .._C.cf import BranchOp, CondBranchOp
-from .._C.scf import (
+from ..._mlir import ir
+from ..._mlir.ir import (
+    Context,
+    Module as ModuleOp,
+    Location,
+    Value,
+    FunctionType,
+    Block,
+    TypeAttr,
+    DenseI32ArrayAttr,
+    InsertionPoint,
+    OpResult,
+    MLIRError,  # type: ignore
+)
+from ..._mlir import schedule as schedule_d
+from ..._mlir.passmanager import PassManager
+from ..._mlir._mlir_libs._allo import ir_ext
+from ..._mlir.dialects.allo import ReturnOp, InvokeOp, KernelOp, register_dialect
+from ..._mlir.dialects.cf import BranchOp, CondBranchOp
+from ..._mlir.dialects.scf import (
     IfOp,
     ForOp,
     YieldOp as SCFYieldOp,
     WhileOp,
     ConditionOp,
     ParallelOp,
+    ReduceOp,
 )
-from .._C.arith import SelectOp
-from .._C.ub import PoisonOp
+from ..._mlir.dialects.arith import SelectOp
+from ..._mlir.dialects.ub import PoisonOp
 from .builder import AlloOpBuilder
 from ..lang.kernel import ConstevalFunction, Kernel, KernelOptions
 from ..lang.kernel import kernel as kernel_decorator
@@ -45,6 +61,7 @@ from ..lang.core import (
 from ..lang.operator import Operator, BoundOperator, NO_FOLD
 from ..operators import arith as arith_ops, memory as mem_ops
 from .errors import CompilationError, StaticAssertionError
+from ..logging import log_fatal
 
 
 def generate_function_type(
@@ -66,6 +83,24 @@ def generate_function_type(
             continue
         mlir_res_types.append(ty.materialize(context))
     return FunctionType.get(mlir_arg_types, mlir_res_types, context)
+
+
+class _NamedModule:
+    """Proxy around an MLIR Module whose ``str()`` prints SSA values using their
+    source-name NameLocs (restoring the legacy ``printNameLocAsPrefix``
+    behaviour). All other attribute access delegates to the wrapped module."""
+
+    def __init__(self, module):
+        object.__setattr__(self, "_module", module)
+
+    def __str__(self) -> str:
+        return self._module.operation.get_asm(use_name_loc_as_prefix=True)
+
+    def __repr__(self) -> str:
+        return self.__str__()
+
+    def __getattr__(self, name):
+        return getattr(object.__getattribute__(self, "_module"), name)
 
 
 class ReturnPlacementChecker(ast.NodeVisitor):
@@ -304,18 +339,20 @@ class MLIRCodeGenerator(ast.NodeVisitor):
         self.lscope[name] = value
 
     def _maybe_set_loc_to_name(self, name, value):
+        # Attach a NameLoc to the defining op so the source name survives into the
+        # IR (used by name-prefixed printing and the schedule snapshot's value
+        # naming). Block arguments (kernel params, induction vars) already carry
+        # their own NameLocs and have no defining op to retag.
         if isinstance(value, ValueBase):
-            handle = value.handle
-            if handle is None:
+            if value.handle is None:
                 assert isinstance(value, AlloSymbolRef)
                 return
-            name_loc = Location(handle.get_loc(), name, self.context)
-            handle.set_loc(name_loc)
-        elif isinstance(value, Value):
-            name_loc = Location(value.get_loc(), name, self.context)
-            value.set_loc(name_loc)
-        else:
-            assert False, "invalid call to _maybe_set_loc_to_name"
+            handle = value.handle
+            if isinstance(handle, OpResult):
+                op = handle.owner
+                op.location = Location.name(name, op.location)
+            return
+        assert isinstance(value, Value), "invalid call to _maybe_set_loc_to_name"
 
     def visit(self, node: ast.AST):
         if node is None:
@@ -333,18 +370,14 @@ class MLIRCodeGenerator(ast.NodeVisitor):
         self.builder.begin_line = self.begin_line
         self.builder.curr_node = node
         if hasattr(node, "lineno") and hasattr(node, "col_offset"):
-            loc = Location(
+            loc = Location.file(
                 self.file_name,
                 node.lineno + self.begin_line - 1,  # type: ignore
                 node.col_offset,  # type: ignore
                 self.context,
             )
             if self.name_loc_prefix is not None:
-                loc = Location(
-                    loc,
-                    self.name_loc_prefix,
-                    self.context,
-                )
+                loc = Location.name(self.name_loc_prefix, loc)
             self.builder.set_loc(loc)
         try:
             return super().visit(node)
@@ -423,13 +456,30 @@ class MLIRCodeGenerator(ast.NodeVisitor):
         )
         visibility = "public" if self.is_top else "private"
         fn_op = KernelOp(
-            self.builder, self.func_name, fn_ty, visibility, self.mapping  # type: ignore
+            self.func_name,
+            TypeAttr.get(fn_ty),
+            DenseI32ArrayAttr.get(list(self.mapping)),  # type: ignore
+            sym_visibility=visibility,
+            ip=self.builder._ip,
+            loc=self.builder._loc,
         )
         self.curr_func = fn_op
         self.generated_func = fn_op
 
-        entry_block = fn_op.add_entry_block()
-        arg_handles = fn_op.get_args()
+        # Build the entry block with NameLoc-tagged arguments so the printed IR
+        # shows the source parameter names (e.g. %buf) when name-loc prefixing is
+        # enabled, matching the legacy behaviour.
+        non_constexpr_names = [
+            nm
+            for nm, ty in zip(arg_names, self.arg_types)
+            if not isinstance(ty, ConstexprType)
+        ]
+        arg_locs = [
+            Location.name(nm, Location.unknown(self.context))
+            for nm in non_constexpr_names
+        ]
+        entry_block = fn_op.regions[0].blocks.append(*fn_ty.inputs, arg_locs=arg_locs)
+        arg_handles = list(entry_block.arguments)
 
         arg_idx = 0
         for name, ty in zip(arg_names, self.arg_types):
@@ -458,9 +508,9 @@ class MLIRCodeGenerator(ast.NodeVisitor):
                     "Missing return statement for non-void function. Please add a top-level return statement matching the declared return type."
                 )
             ip, _ = self.builder.get_insertion_point_and_loc()
-            self.builder.set_insertion_point_to_end(ip.get_block())
-            ReturnOp(self.builder, [])
-        self.builder.set_insertion_point_after(fn_op.get_operation())
+            self.builder.set_insertion_point_to_end(ip.block)
+            ReturnOp([], ip=self.builder._ip, loc=self.builder._loc)
+        self.builder.set_insertion_point_after(fn_op.operation)
 
     def _resolve_kernel_decorator(self, decorator: ast.AST):
         if isinstance(decorator, ast.Name):
@@ -650,6 +700,7 @@ class MLIRCodeGenerator(ast.NodeVisitor):
             assert False, f"Unsupported direct binary operator: {op_name}"
 
         lhs, rhs = self._prepare_binary_operands(lhs, rhs, op_name)
+        assert isinstance(lhs.dtype, DType)
         floating = lhs.dtype.is_float()
         if op_name == "add":
             return self.builder.create_add(lhs, rhs, floating=floating)
@@ -934,7 +985,11 @@ class MLIRCodeGenerator(ast.NodeVisitor):
                 )
             coerced.append(self.builder.cast(value, dst_type))
 
-        ReturnOp(self.builder, [value.handle for value in coerced])
+        ReturnOp(
+            [value.handle for value in coerced],
+            ip=self.builder._ip,
+            loc=self.builder._loc,
+        )
         self.block_terminated = True
 
     def _visit_if_with_return_impl(
@@ -945,14 +1000,22 @@ class MLIRCodeGenerator(ast.NodeVisitor):
         if_terminated = False
         with EnterSubRegion(self):
             ip, last_loc = self.builder.get_insertion_point_and_loc()
-            parent_region = ip.get_block().get_parent_region()
+            parent_region = ip.block.region
             then_block = self.builder.create_block(parent_region)
             else_block = self.builder.create_block(parent_region)
             end_if = self.builder.create_block(parent_region)
 
             # branch out from current block to then/else
             self.builder.set_insertion_point_and_loc(ip, last_loc)
-            CondBranchOp(self.builder, cond.handle, then_block, else_block)
+            CondBranchOp(
+                cond.handle,
+                [],
+                [],
+                then_block,
+                else_block,
+                ip=self.builder._ip,
+                loc=self.builder._loc,
+            )
 
             liveins = self.lscope.copy()
 
@@ -978,18 +1041,18 @@ class MLIRCodeGenerator(ast.NodeVisitor):
             # if both branches return, there is no fallthrough path
             if then_terminated and else_terminated:
                 continue_vals = liveins
-                end_if.erase()
+                ir_ext.erase_block(end_if)
                 if_terminated = True
 
             # if exactly one branch returns, continue with the non-returning branch.
             elif then_terminated and not else_terminated:
                 self.builder.set_insertion_point_to_end(else_block)
-                BranchOp(self.builder, end_if, [])
+                BranchOp([], end_if, ip=self.builder._ip, loc=self.builder._loc)
                 continue_vals = else_vals
 
             elif not then_terminated and else_terminated:
                 self.builder.set_insertion_point_to_end(then_block)
-                BranchOp(self.builder, end_if, [])
+                BranchOp([], end_if, ip=self.builder._ip, loc=self.builder._loc)
                 continue_vals = then_vals
 
             else:
@@ -1007,7 +1070,7 @@ class MLIRCodeGenerator(ast.NodeVisitor):
         with EnterSubRegion(self):
             ip, last_loc = self.builder.get_insertion_point_and_loc()
 
-            parent_region = ip.get_block().get_parent_region()
+            parent_region = ip.block.region
             then_block = self.builder.create_block(parent_region)
             else_block = self.builder.create_block(parent_region)
 
@@ -1023,23 +1086,29 @@ class MLIRCodeGenerator(ast.NodeVisitor):
             # if we have phi arguments, we must create else region
             has_else = len(node.orelse) > 0 or len(phi_names) > 0
             phi_ir_types = [ty.materialize(self.context) for ty in phi_types]
-            if_op = IfOp(self.builder, phi_ir_types, cond.handle, has_else)
-            then_block.merge_before(if_op.get_then_block())
-            then_block = if_op.get_then_block()
-            then_block.remove_terminator()  # remove the default created
+            if_op = IfOp(
+                cond.handle,
+                phi_ir_types,
+                has_else=has_else,
+                ip=self.builder._ip,
+                loc=self.builder._loc,
+            )
+            ir_ext.merge_block_before(then_block, if_op.then_block)
+            then_block = if_op.then_block
+            assert then_block is not None
             self.builder.set_insertion_point_to_end(then_block)
-            SCFYieldOp(self.builder, then_handles)
+            SCFYieldOp(then_handles, ip=self.builder._ip, loc=self.builder._loc)
             if has_else:
-                else_block.merge_before(if_op.get_else_block())
-                else_block = if_op.get_else_block()
-                else_block.remove_terminator()  # remove the default created
+                ir_ext.merge_block_before(else_block, if_op.else_block)
+                else_block = if_op.else_block
+                assert else_block is not None
                 self.builder.set_insertion_point_to_end(else_block)
-                SCFYieldOp(self.builder, else_handles)
+                SCFYieldOp(else_handles, ip=self.builder._ip, loc=self.builder._loc)
             else:
-                else_block.erase()
+                ir_ext.erase_block(else_block)
 
         # update lscope with phi results
-        res_handles = if_op.get_results()
+        res_handles = list(if_op.results)
         phi_proxies = [
             AlloValue(handle, ty) for handle, ty in zip(res_handles, phi_types)
         ]
@@ -1137,9 +1206,13 @@ class MLIRCodeGenerator(ast.NodeVisitor):
             # create select op
             self.builder.set_insertion_point_and_loc(ip, last_loc)
             sel_op = SelectOp(
-                self.builder, cond.handle, then_val.handle, else_val.handle
+                cond.handle,
+                then_val.handle,
+                else_val.handle,
+                ip=self.builder._ip,
+                loc=self.builder._loc,
             )
-            return AlloValue(sel_op, res_type)
+            return AlloValue(sel_op.result, res_type)
         else:
             # constexpr path
             assert isinstance(cond, ConstexprValue)
@@ -1290,7 +1363,9 @@ class MLIRCodeGenerator(ast.NodeVisitor):
         assert ctx is None
         return tuple([self.visit(e) for e in node.elts])
 
-    def _flatten_list_initializer(self, node: ast.AST):
+    def _flatten_list_initializer(
+        self, node: ast.AST
+    ) -> tuple[tuple[int, ...], list[int | float]]:
         if isinstance(node, ast.List):
             values = []
             shapes = []
@@ -1312,7 +1387,7 @@ class MLIRCodeGenerator(ast.NodeVisitor):
             return self.compile_error(
                 f"List initializer elements must be compile-time int or float constants, got '{ast.unparse(node)}'."
             )
-        return (), [value]
+        return (), [value]  # type: ignore
 
     def _visit_shaped_list_initializer(
         self, node: ast.List, dst_type: ShapedType, name: str
@@ -1507,6 +1582,7 @@ class MLIRCodeGenerator(ast.NodeVisitor):
                 return self.compile_error(
                     f"Cannot reassign to variable '{target}' defined as a global symbol"
                 )
+            assert isinstance(proxy, AlloValue)
             if isinstance(value, ConstexprValue):
                 ret = self.builder.materialize_literal_like(value.value, proxy)
             elif isinstance(value, AlloValue):
@@ -1522,7 +1598,7 @@ class MLIRCodeGenerator(ast.NodeVisitor):
     def _test_loop_iter_args(self, node, liveins: dict, ignore: set[str]):
         ip, last_loc = self.builder.get_insertion_point_and_loc()
         # create dummy block
-        block = self.builder.create_block(ip.get_block().get_parent_region())
+        block = self.builder.create_block(ip.block.region)
         self.builder.set_insertion_point_to_start(block)
         self.lscope = liveins.copy()
         # dry visit
@@ -1553,6 +1629,7 @@ class MLIRCodeGenerator(ast.NodeVisitor):
                 continue
             assert isinstance(livein, AlloValue)
             loop_val = dry_run_scope[name]
+            assert isinstance(loop_val, AlloValue)
             if loop_val.handle == livein.handle:
                 continue  # variable is not assigned in the loop body
             # type check
@@ -1565,7 +1642,7 @@ class MLIRCodeGenerator(ast.NodeVisitor):
 
         # restore lscope
         self.lscope = liveins.copy()
-        block.erase()
+        ir_ext.erase_block(block)
         if error_msg is not None:
             return self.compile_error(error_msg)
         return names, init_handles, init_types
@@ -1582,14 +1659,14 @@ class MLIRCodeGenerator(ast.NodeVisitor):
             )
             # create while op
             init_ir_types = [ty.materialize(self.context) for ty in init_types]
-            while_op = WhileOp(self.builder, init_ir_types, init_handles)
+            while_op = WhileOp(
+                init_ir_types, init_handles, ip=self.builder._ip, loc=self.builder._loc
+            )
 
             # create before region
-            before_block = self.builder.create_block(
-                while_op.get_before(), init_ir_types
-            )
+            before_block = self.builder.create_block(while_op.before, init_ir_types)
             self.builder.set_insertion_point_to_start(before_block)
-            block_args = before_block.get_args()
+            block_args = list(before_block.arguments)
             for name, arg, ty in zip(names, block_args, init_types):
                 proxy = AlloValue(arg, ty)
                 self._set_value_with_loc(name, proxy)
@@ -1599,12 +1676,14 @@ class MLIRCodeGenerator(ast.NodeVisitor):
             self.builder.set_insertion_point_to_end(before_block)
             assert isinstance(cond, AlloValue)
             # create cond
-            ConditionOp(self.builder, cond.handle, block_args)
+            ConditionOp(
+                cond.handle, block_args, ip=self.builder._ip, loc=self.builder._loc
+            )
 
             # create after region
-            after_block = self.builder.create_block(while_op.get_after(), init_ir_types)
+            after_block = self.builder.create_block(while_op.after, init_ir_types)
             self.builder.set_insertion_point_to_start(after_block)
-            body_handles = after_block.get_args()
+            body_handles = list(after_block.arguments)
             for name, arg, ty in zip(names, body_handles, init_types):
                 proxy = AlloValue(arg, ty)
                 self._set_value_with_loc(name, proxy)
@@ -1615,14 +1694,14 @@ class MLIRCodeGenerator(ast.NodeVisitor):
             self.scf_stack.pop()
 
             # create yield
-            yield_handles = [self.lscope[name].handle for name in names]
+            yield_handles = [
+                cast(AlloValue, self.lscope[name]).handle for name in names
+            ]
             self.builder.set_insertion_point_to_end(after_block)
-            # remove the default terminator
-            after_block.remove_terminator()
-            SCFYieldOp(self.builder, yield_handles)
+            SCFYieldOp(yield_handles, ip=self.builder._ip, loc=self.builder._loc)
 
         # update lscope with iter args
-        res_handles = while_op.get_results()
+        res_handles = list(while_op.results)
         res_proxies = [
             AlloValue(handle, ty) for handle, ty in zip(res_handles, init_types)
         ]
@@ -1670,8 +1749,10 @@ class MLIRCodeGenerator(ast.NodeVisitor):
 
         with EnterSubRegion(self):
             index_ty = index.materialize(self.context)
-            iv_placeholder = PoisonOp(self.builder, index_ty)
-            self._set_value(node.target.id, AlloValue(iv_placeholder, index))
+            iv_placeholder = PoisonOp(
+                index_ty, ip=self.builder._ip, loc=self.builder._loc
+            )
+            self._set_value(node.target.id, AlloValue(iv_placeholder.result, index))
 
             liveins = self.lscope.copy()  # capture live-ins before visiting loop body
             names, init_handles, init_types = self._test_loop_iter_args(
@@ -1679,20 +1760,24 @@ class MLIRCodeGenerator(ast.NodeVisitor):
             )
             # create for op
             for_op = ForOp(
-                self.builder, lb.handle, ub.handle, step.handle, init_handles
+                lb.handle,
+                ub.handle,
+                step.handle,
+                init_handles,
+                ip=self.builder._ip,
+                loc=self.builder._loc,
             )
             if iterator.name:
                 assert isinstance(iterator.name, str)
-                for_op.set_attr(
-                    schedule_d.SCHEDULE_NAME_ATTR_NAME,
-                    self.builder.get_string_attr(iterator.name),
+                for_op.operation.attributes[schedule_d.SCHEDULE_NAME_ATTR_NAME] = (
+                    self.builder.get_string_attr(iterator.name)
                 )
             self.scf_stack.append(node)
-            for_op_body = for_op.get_body()
+            for_op_body = for_op.body
             self.builder.set_insertion_point_to_start(for_op_body)
             block_handles = [
                 # skip the first argument which is the induction variable
-                for_op_body.get_arg_at(i + 1)
+                for_op_body.arguments[i + 1]
                 for i in range(len(init_handles))
             ]
             block_args = [
@@ -1704,21 +1789,21 @@ class MLIRCodeGenerator(ast.NodeVisitor):
             self.visit_compound_stmts(node.body)
             self.scf_stack.pop()
             # create yield
-            yield_handles = [self.lscope[iter_name].handle for iter_name in names]
+            yield_handles = [
+                cast(AlloValue, self.lscope[iter_name]).handle for iter_name in names
+            ]
             self.builder.set_insertion_point_to_end(for_op_body)
-            # remove the default terminator
-            for_op_body.remove_terminator()
-            SCFYieldOp(self.builder, yield_handles)
-            assert for_op.get_num_regions() == 1
+            SCFYieldOp(yield_handles, ip=self.builder._ip, loc=self.builder._loc)
+            assert len(for_op.regions) == 1
 
             # update induction variable with the actual one
-            iv = for_op.get_induction_var()
-            iv_placeholder.get_result_at(0).replace_all_uses_with(iv)
-            iv_placeholder.erase()
+            iv = for_op.induction_variable
+            iv_placeholder.result.replace_all_uses_with(iv)
+            iv_placeholder.operation.erase()
             self._set_value_with_loc(node.target.id, AlloValue(iv, index))
 
         # update lscope with iter args
-        res_handles = for_op.get_results()
+        res_handles = list(for_op.results)
         for iter_name, handle, ty in zip(names, res_handles, init_types):
             proxy = AlloValue(handle, ty)
             self._set_value_with_loc(iter_name, proxy)
@@ -1752,14 +1837,17 @@ class MLIRCodeGenerator(ast.NodeVisitor):
 
         with EnterSubRegion(self):
             index_ty = index.materialize(self.context)
-            iv_placeholders = [PoisonOp(self.builder, index_ty) for _ in lbs]
+            iv_placeholders = [
+                PoisonOp(index_ty, ip=self.builder._ip, loc=self.builder._loc)
+                for _ in lbs
+            ]
             targets = set()
             for i, target in enumerate(node.target.elts):
                 if not isinstance(target, ast.Name):
                     return self.compile_error(
                         "loop target must be a single variable in 'for' loops over 'grid()'"
                     )
-                self._set_value(target.id, AlloValue(iv_placeholders[i], index))
+                self._set_value(target.id, AlloValue(iv_placeholders[i].result, index))
                 targets.add(target.id)
 
             liveins = self.lscope.copy()  # capture live-ins before visiting loop body
@@ -1772,38 +1860,42 @@ class MLIRCodeGenerator(ast.NodeVisitor):
                 )
             # create parallel op
             par_op = ParallelOp(
-                self.builder,
+                [],
                 [lb.handle for lb in lb_proxies],
                 [ub.handle for ub in ub_proxies],
                 [step.handle for step in step_proxies],
                 init_handles,
+                ip=self.builder._ip,
+                loc=self.builder._loc,
             )
             if iterator.name:
                 assert isinstance(iterator.name, str)
-                par_op.set_attr(
-                    schedule_d.SCHEDULE_NAME_ATTR_NAME,
-                    self.builder.get_string_attr(iterator.name),
+                par_op.operation.attributes[schedule_d.SCHEDULE_NAME_ATTR_NAME] = (
+                    self.builder.get_string_attr(iterator.name)
                 )
+            # scf.parallel has no auto-created body: build a block with one index
+            # induction variable per dimension and the scf.reduce terminator.
+            # see: https://mlir.llvm.org/docs/Dialects/SCFDialect/#scfparallel-scfparallelop
+            par_op_body = par_op.region.blocks.append(*([index_ty] * len(lbs)))
+            with InsertionPoint(par_op_body):
+                ReduceOp([], 0)
             self.scf_stack.append(node)
-            par_op_body = par_op.get_body()
             self.builder.set_insertion_point_to_start(par_op_body)
             # no iter args now, so no block arguments other than induction variables
             # visit loop body
             self.visit_compound_stmts(node.body)
             self.scf_stack.pop()
-            # parallel op use scf.reduce as terminator
-            # see: https://mlir.llvm.org/docs/Dialects/SCFDialect/#scfparallel-scfparallelop
 
-            ivs = par_op.get_induction_vars()
+            ivs = list(par_op_body.arguments)
             for iv, placeholder in zip(ivs, iv_placeholders):
-                placeholder.get_result_at(0).replace_all_uses_with(iv)
-                placeholder.erase()
+                placeholder.result.replace_all_uses_with(iv)
+                placeholder.operation.erase()
             for iv, target in zip(ivs, node.target.elts):
                 proxy = AlloValue(iv, index)
                 self._set_value_with_loc(target.id, proxy)  # type: ignore
 
         # update lscope with iter args
-        res_handles = par_op.get_results()
+        res_handles = list(par_op.results)
         for name, handle, ty in zip(names, res_handles, init_types):
             proxy = AlloValue(handle, ty)
             self._set_value_with_loc(name, proxy)
@@ -1962,13 +2054,12 @@ class MLIRCodeGenerator(ast.NodeVisitor):
             )
         if len(res_types) == 0:
             return None
-        if call_op.get_num_results() != len(res_types):
+        if len(call_op.results) != len(res_types):
             return self.compile_error(
-                f"Kernel call result count mismatch: expected {len(res_types)}, got {call_op.get_num_results()}."
+                f"Kernel call result count mismatch: expected {len(res_types)}, got {len(call_op.results)}."
             )
         results = [
-            AlloValue(handle, ty)
-            for handle, ty in zip(call_op.get_results(), res_types)
+            AlloValue(handle, ty) for handle, ty in zip(call_op.results, res_types)
         ]
         if len(results) == 1:
             return results[0]
@@ -1982,7 +2073,14 @@ class MLIRCodeGenerator(ast.NodeVisitor):
         if len(res_types) == 0:
             return None
         results = [
-            AlloValue(PoisonOp(self.builder, ty.materialize(self.context)), ty)
+            AlloValue(
+                PoisonOp(
+                    ty.materialize(self.context),
+                    ip=self.builder._ip,
+                    loc=self.builder._loc,
+                ).result,
+                ty,
+            )
             for ty in res_types
         ]
         if len(results) == 1:
@@ -2111,9 +2209,9 @@ class MLIRCodeGenerator(ast.NodeVisitor):
         sub_generator = None
         self._active_kernel_calls.append(key)
         try:
-            self.builder.set_insertion_point_to_end(self.module.get_body())
+            self.builder.set_insertion_point_to_end(self.module.body)
             self.builder.set_loc(
-                Location(
+                Location.file(
                     self.file_name,
                     self.begin_line + nested.node.lineno - 1,
                     1,
@@ -2162,7 +2260,13 @@ class MLIRCodeGenerator(ast.NodeVisitor):
             self.builder.set_insertion_point_and_loc(ip, last_loc)
 
         assert sub_generator is not None and sub_generator.generated_func is not None
-        call_op = InvokeOp(self.builder, sub_generator.generated_func, call_operands)
+        call_op = InvokeOp(
+            [ty.materialize(self.context) for ty in sub_res_types],
+            sub_generator.func_name,
+            call_operands,
+            ip=self.builder._ip,
+            loc=self.builder._loc,
+        )
         return self._decode_kernel_call_results(call_op, sub_res_types)
 
     def call_kernel(self, fn: Kernel, args, kws):
@@ -2198,8 +2302,10 @@ class MLIRCodeGenerator(ast.NodeVisitor):
         sub_generator = None
         self._active_kernel_calls.append(key)
         try:
-            self.builder.set_insertion_point_to_end(self.module.get_body())
-            self.builder.set_loc(Location(fn.file_name, fn.begin_line, 1, self.context))
+            self.builder.set_insertion_point_to_end(self.module.body)
+            self.builder.set_loc(
+                Location.file(fn.file_name, fn.begin_line, 1, self.context)
+            )
             self.builder.src = fn.src
             sub_generator = MLIRCodeGenerator(
                 self.context,
@@ -2238,7 +2344,13 @@ class MLIRCodeGenerator(ast.NodeVisitor):
             self.builder.set_insertion_point_and_loc(ip, last_loc)
 
         assert sub_generator is not None and sub_generator.generated_func is not None
-        call_op = InvokeOp(self.builder, sub_generator.generated_func, call_operands)
+        call_op = InvokeOp(
+            [ty.materialize(self.context) for ty in sub_res_types],
+            sub_generator.func_name,
+            call_operands,
+            ip=self.builder._ip,
+            loc=self.builder._loc,
+        )
         return self._decode_kernel_call_results(call_op, sub_res_types)
 
     def call_operator(self, fn: Operator | BoundOperator, args, kwargs={}):
@@ -2299,7 +2411,7 @@ class MLIRCodeGenerator(ast.NodeVisitor):
 
             raise StaticAssertionError(
                 self.kernel.src,
-                unwrap_if_constexpr(message),
+                str(unwrap_if_constexpr(message)),
                 self.builder.curr_node,  # type: ignore
                 file_name=self.file_name,
                 begin_line=self.begin_line,
@@ -2367,49 +2479,61 @@ def compile(
 
     try:
         context = Context()
-        context.load_dialects()
+        register_dialect(context)
 
-        # initialize builder
-        builder = AlloOpBuilder(context, typing_style=effective_options.typing_style)
-        builder.src = fn.src
-        builder.file_name = fn.file_name
-        builder.begin_line = fn.begin_line
-        builder.set_loc(Location(fn.file_name, fn.begin_line, 1, context))
-        builder.curr_node = None
-        module = ModuleOp(builder)
-        builder.module = module
-        builder.set_insertion_point_to_end(module.get_body())
-
-        # start codegen
-        generator = MLIRCodeGenerator(
-            context,
-            module,
-            builder,
-            kernel=fn,
-            func_name=fn.func_name,
-            file_name=fn.file_name,
-            begin_line=fn.begin_line,
-            gscope=fn.get_capture_scope(),
-            arg_types=arg_types,
-            res_types=res_types,
-            options=effective_options,
-            active_kernel_calls=[f"kernel:{fn.__module__}.{fn.__qualname__}"],
-            is_top=True,
-        )
-        generator.visit(fn.parse())
-
-        # verify
-        if not module.verify():
-            print(module)
-            raise RuntimeError(
-                f"In function: {fn.func_name}, module verification failed."
+        # Establish a default context + location so attribute/type construction
+        # (which the codegen does without an explicit context=) resolves them.
+        with context, Location.unknown(context):
+            # initialize builder
+            builder = AlloOpBuilder(
+                context, typing_style=effective_options.typing_style
             )
+            builder.src = fn.src
+            builder.file_name = fn.file_name
+            builder.begin_line = fn.begin_line
+            builder.set_loc(Location.file(fn.file_name, fn.begin_line, 1, context))
+            builder.curr_node = None
+            module = ModuleOp.create(builder.get_loc())
+            builder.module = module
+            builder.set_insertion_point_to_end(module.body)
 
-        module.run_canonicalize()
+            # start codegen
+            generator = MLIRCodeGenerator(
+                context,
+                module,
+                builder,
+                kernel=fn,
+                func_name=fn.func_name,
+                file_name=fn.file_name,
+                begin_line=fn.begin_line,
+                gscope=fn.get_capture_scope(),
+                arg_types=arg_types,
+                res_types=res_types,
+                options=effective_options,
+                active_kernel_calls=[f"kernel:{fn.__module__}.{fn.__qualname__}"],
+                is_top=True,
+            )
+            generator.visit(fn.parse())
+
+            # verify
+            try:
+                module.operation.verify()
+            except MLIRError as e:
+                log_fatal(
+                    "Generated MLIR module failed verification. This likely indicates a bug in the compiler. Please report this to the developers with the kernel code that triggered this error.\n"
+                    f"\n===Verification Error===\n"
+                    f"{e}\n"
+                    "\n===Internal MLIR===\n"
+                    f"{module}"
+                )
+
+            PassManager.parse("builtin.module(canonicalize,cse)", context).run(
+                module.operation
+            )
         fn.module = module
         # transfer the ownership of context to kernel
         fn.context = context
-        return module
+        return _NamedModule(module)
     except (StaticAssertionError, CompilationError) as exc:
         if show_traceback:
             raise

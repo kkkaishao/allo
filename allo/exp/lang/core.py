@@ -8,22 +8,10 @@ from collections.abc import Sequence
 
 
 from dataclasses import dataclass
-from .._C.ir import (
-    Context,
-    Type,
-    Value,
-    IntegerType,
-    F16Type,
-    F32Type,
-    F64Type,
-    BF16Type,
-    IndexType as MLIRIndexType,
-    RankedTensorType,
-    MemRefType,
-    AffineMap,
-    OpState,
-)
-from .._C import allo
+
+from ..._mlir import ir
+from ..._mlir.ir import Context, Type, Value
+from ..._mlir.dialects.allo import StreamType as MlirStreamType
 
 # ==========================================================================#
 # Frontend type system
@@ -159,7 +147,7 @@ class APInt(DType):
         self.signed = signed
 
     def materialize(self, context: Context, /) -> Type:
-        return IntegerType.get(self.primitive_width, context)
+        return ir.IntegerType.get_signless(self.primitive_width, context)
 
 
 apint = APInt  # name alias for easier usage
@@ -239,13 +227,13 @@ class APFloat(DType):
 
     def materialize(self, context: Context, /) -> Type:
         if self.name == "float16":
-            return F16Type.get(context)
+            return ir.F16Type.get(context)
         elif self.name == "float32":
-            return F32Type.get(context)
+            return ir.F32Type.get(context)
         elif self.name == "float64":
-            return F64Type.get(context)
+            return ir.F64Type.get(context)
         elif self.name == "bfloat16":
-            return BF16Type.get(context)
+            return ir.BF16Type.get(context)
         else:
             assert False, f"unsupported floating-point type: {self.name}"
 
@@ -271,7 +259,7 @@ class IndexType(DType):
         super().__init__("index", 2**32 - 1)
 
     def materialize(self, context: Context, /) -> Type:
-        return MLIRIndexType.get(context)
+        return ir.IndexType.get(context)
 
 
 index = IndexType()  # singleton instance for index type
@@ -306,7 +294,7 @@ class TensorType(ShapedType):
 
     def materialize(self, context: Context, /) -> Type:
         mlir_dtype = self.dtype.materialize(context)
-        return RankedTensorType.get(self.shape, mlir_dtype)
+        return ir.RankedTensorType.get(list(self.shape), mlir_dtype)
 
 
 class BufferType(ShapedType):
@@ -322,9 +310,11 @@ class BufferType(ShapedType):
         super().__init__(name, shape, dtype)
 
     def materialize(self, context: Context, /) -> Type:
-        identity_maps = AffineMap.get_identity(self.rank, context)
         mlir_dtype = self.dtype.materialize(context)
-        return MemRefType.get(self.shape, mlir_dtype, identity_maps)
+        # `loc` is only used for diagnostics during layout verification.
+        return ir.MemRefType.get(
+            list(self.shape), mlir_dtype, loc=ir.Location.unknown(context)
+        )
 
 
 DEFAULT_STREAM_DEPTH = 2
@@ -372,13 +362,9 @@ class StreamType(TypeBase):
             raise TypeError("Stream shape dimensions must be non-negative integers")
         return StreamType(self.base_type, self.depth, key, is_global=self.is_global)
 
-    def materialize(self, context: Context, /) -> allo.StreamType:
-        return allo.StreamType.get(
-            context,
-            self.base_type.materialize(context),
-            self.depth,
-            self.shape,
-        )
+    def materialize(self, context: Context, /) -> Type:
+        base = self.base_type.materialize(context)
+        return MlirStreamType.get(base, self.depth, list(self.shape))
 
 
 class _StreamFactory:
@@ -456,11 +442,7 @@ class AlloValue(ValueBase):
 
     def __init__(self, handle: Value, type: TypeBase):
         assert handle is not None, "handle cannot be None for AlloValue"
-        if isinstance(handle, OpState):
-            assert handle.get_num_results() == 1
-            self._handle = handle.get_result_at(0)
-        else:
-            self._handle = handle
+        self._handle = handle
         self.type = type
         self.dtype = type.dtype if isinstance(type, ShapedType) else type
         # wrap the shape to frontend values

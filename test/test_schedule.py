@@ -21,7 +21,7 @@ def test_schedule_from_string():
     s.pipeline(loop, ii=2).apply()
 
     assert "pipeline.ii = 2 : i64" in str(s.payload)
-    assert s.payload.verify()
+    assert s.payload.operation.verify()
 
 
 def test_pipeline_kernel_loop():
@@ -39,7 +39,7 @@ def test_pipeline_kernel_loop():
     assert "allo.kernel public @top" in text
     assert "scf.for" in text
     assert "pipeline.ii = 2 : i64" in text
-    assert s.payload.verify()
+    assert s.payload.operation.verify()
 
 
 def test_named_range_loop():
@@ -55,7 +55,7 @@ def test_named_range_loop():
 
     assert loop.name == "i"
     assert "pipeline.ii = 2 : i64" in str(s.payload)
-    assert s.payload.verify()
+    assert s.payload.operation.verify()
 
 
 def test_split_returns_live_loops():
@@ -75,7 +75,7 @@ def test_split_returns_live_loops():
     assert inner.id in s.snapshot.ops_by_id
     assert text.count("scf.for") == 2
     assert "pipeline.ii = 1 : i64" in text
-    assert s.payload.verify()
+    assert s.payload.operation.verify()
 
 
 def test_named_nested_range_loops():
@@ -94,7 +94,7 @@ def test_named_nested_range_loops():
     assert [loop.name for loop in (i, j)] == ["i", "j"]
     assert flat.id in s.snapshot.ops_by_id
     assert str(s.payload).count("affine.for") == 1
-    assert s.payload.verify()
+    assert s.payload.operation.verify()
 
 
 def test_flatten_nested_loops():
@@ -112,7 +112,7 @@ def test_flatten_nested_loops():
     assert flat.id in s.snapshot.ops_by_id
     assert text.count("affine.for") == 1
     assert "scf.for" not in text
-    assert s.payload.verify()
+    assert s.payload.operation.verify()
 
 
 def test_named_grid_loop_like_op():
@@ -147,7 +147,7 @@ def test_compute_at_kernel():
     assert loop.id in s.snapshot.ops_by_id
     assert text.count("affine.for") == 1
     assert text.count("affine.store") == 2
-    assert s.payload.verify()
+    assert s.payload.operation.verify()
 
 
 def test_buffer_at_single_level():
@@ -168,4 +168,4 @@ def test_buffer_at_single_level():
 
     assert local.id in s.snapshot.values_by_id
     assert "memref<1x4xi32>" in s.snapshot.values_by_id[local.id].type
-    assert s.payload.verify()
+    assert s.payload.operation.verify()

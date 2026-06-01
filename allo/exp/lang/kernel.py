@@ -21,7 +21,7 @@ from ..lang.core import (
 )
 from ..logging import log_fatal
 
-from .._C.ir import ModuleOp, Context
+from ..._mlir.ir import Module, Context
 from ..logging import log_fatal
 
 P = ParamSpec("P")
@@ -185,7 +185,7 @@ class Kernel(Generic[P, R]):
         self.definition_scope = (
             {} if definition_scope is None else definition_scope.copy()
         )
-        self.module: ModuleOp | None = None
+        self.module: Module | None = None
         self.context: Context | None = None
 
         try:
@@ -217,13 +217,7 @@ class Kernel(Generic[P, R]):
         self.capture_scope = self._build_capture_scope()
 
     def __call__(self, *args: P.args, **kwargs: P.kwargs) -> R:
-        """Run the kernel with the active backend context, or CPU by default."""
-        from ..backend.base import current_backend
-
-        backend = current_backend()
-        if backend is not None:
-            return backend.call_kernel(self, *args, **kwargs)
-
+        """Run the kernel with CPU"""
         from ..backend import CPU
 
         return CPU(self).run(*args, **kwargs)

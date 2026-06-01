@@ -11,8 +11,8 @@ from ..lang.core import (
     ShapedType,
     TensorType,
 )
-from .._C import linalg
-from .._C.ir import AffineMap
+from ..._mlir import ir
+from ..._mlir.dialects import linalg
 
 
 def shaped_type_with_dtype(src_type: ShapedType, dtype: DType) -> ShapedType:
@@ -69,10 +69,10 @@ def resolve_linalg_output(
 def linalg_op_result(op, output: AlloValue) -> AlloValue:
     assert isinstance(output.type, ShapedType)
     if isinstance(output.type, TensorType):
-        assert op.get_num_results() == 1
-        return AlloValue(op.get_result_at(0), output.type)
+        assert len(op.results) == 1
+        return AlloValue(op.results[0], output.type)
     assert isinstance(output.type, BufferType)
-    assert op.get_num_results() == 0
+    assert len(op.results) == 0
     return output
 
 
@@ -83,7 +83,17 @@ def emit_linalg_named_unary(
     op_cls,
 ) -> AlloValue:
     assert isinstance(output.type, ShapedType)
-    op = op_cls(builder, operand.handle, output.handle)
+    ip, loc = builder.get_insertion_point_and_loc()
+    op = op_cls(
+        _linalg_generic_result_types(builder, output.type),
+        [operand.handle],
+        [output.handle],
+        ip=ip,
+        loc=loc,
+    )
+    # Upstream named-linalg OpView constructors leave the body region empty;
+    # populate it from the op's registered region builder.
+    linalg.fill_builtin_region(op.operation)
     return linalg_op_result(op, output)
 
 
@@ -95,7 +105,17 @@ def emit_linalg_named_binary(
     op_cls,
 ) -> AlloValue:
     assert isinstance(output.type, ShapedType)
-    op = op_cls(builder, lhs.handle, rhs.handle, output.handle)
+    ip, loc = builder.get_insertion_point_and_loc()
+    op = op_cls(
+        _linalg_generic_result_types(builder, output.type),
+        [lhs.handle, rhs.handle],
+        [output.handle],
+        ip=ip,
+        loc=loc,
+    )
+    # Upstream named-linalg OpView constructors leave the body region empty;
+    # populate it from the op's registered region builder.
+    linalg.fill_builtin_region(op.operation)
     return linalg_op_result(op, output)
 
 
@@ -110,6 +130,16 @@ def _yield_value(value):
     return value.handle if isinstance(value, AlloValue) else value
 
 
+def _identity_maps(builder: AlloOpBuilder, rank: int, count: int):
+    ident = ir.AffineMapAttr.get(ir.AffineMap.get_identity(rank, builder.context))
+    return ir.ArrayAttr.get([ident] * count)
+
+
+def _iterator_types(builder: AlloOpBuilder, rank: int):
+    par = ir.Attribute.parse("#linalg.iterator_type<parallel>", builder.context)
+    return ir.ArrayAttr.get([par] * rank)
+
+
 def emit_linalg_generic_unary(
     builder: AlloOpBuilder,
     operand: AlloValue,
@@ -119,24 +149,27 @@ def emit_linalg_generic_unary(
     assert isinstance(operand.type, ShapedType)
     assert isinstance(output.type, ShapedType)
     result_type = output.type
-    maps = [AffineMap.get_identity(result_type.rank, builder.context)] * 2
-    iterators = [linalg.PAR] * result_type.rank
+    maps = _identity_maps(builder, result_type.rank, 2)
+    iters = _iterator_types(builder, result_type.rank)
+    ip, loc = builder.get_insertion_point_and_loc()
     op = linalg.GenericOp(
-        builder,
         _linalg_generic_result_types(builder, result_type),
         [operand.handle],
         [output.handle],
         maps,
-        iterators,
+        iters,
+        ip=ip,
+        loc=loc,
     )
-    body = op.add_entry_block()
-    region_arg = AlloValue(body.get_arg_at(0), operand.dtype)
-    ip = builder.save_insertion_point()
-    try:
-        builder.set_insertion_point_to_end(body)
-        linalg.YieldOp(builder, [_yield_value(build_fn(region_arg))])
-    finally:
-        builder.restore_insertion_point(ip)
+    body = op.regions[0].blocks.append(
+        operand.dtype.materialize(builder.context),
+        output.dtype.materialize(builder.context),
+    )
+    region_arg = AlloValue(body.arguments[0], operand.dtype)
+    with builder.at_block_end(body):
+        linalg.YieldOp(
+            [_yield_value(build_fn(region_arg))], ip=builder._ip, loc=builder._loc
+        )
     return linalg_op_result(op, output)
 
 
@@ -151,25 +184,29 @@ def emit_linalg_generic_binary(
     assert tuple(lhs.type.shape) == tuple(rhs.type.shape)
     assert isinstance(output.type, ShapedType)
     result_type = output.type
-    maps = [AffineMap.get_identity(result_type.rank, builder.context)] * 3
-    iterators = [linalg.PAR] * result_type.rank
+    maps = _identity_maps(builder, result_type.rank, 3)
+    iters = _iterator_types(builder, result_type.rank)
+    ip, loc = builder.get_insertion_point_and_loc()
     op = linalg.GenericOp(
-        builder,
         _linalg_generic_result_types(builder, result_type),
         [lhs.handle, rhs.handle],
         [output.handle],
         maps,
-        iterators,
+        iters,
+        ip=ip,
+        loc=loc,
     )
-    body = op.add_entry_block()
-    lhs_arg = AlloValue(body.get_arg_at(0), lhs.dtype)
-    rhs_arg = AlloValue(body.get_arg_at(1), rhs.dtype)
-    ip = builder.save_insertion_point()
-    try:
-        builder.set_insertion_point_to_end(body)
-        linalg.YieldOp(builder, [_yield_value(build_fn(lhs_arg, rhs_arg))])
-    finally:
-        builder.restore_insertion_point(ip)
+    body = op.regions[0].blocks.append(
+        lhs.dtype.materialize(builder.context),
+        rhs.dtype.materialize(builder.context),
+        output.dtype.materialize(builder.context),
+    )
+    lhs_arg = AlloValue(body.arguments[0], lhs.dtype)
+    rhs_arg = AlloValue(body.arguments[1], rhs.dtype)
+    with builder.at_block_end(body):
+        linalg.YieldOp(
+            [_yield_value(build_fn(lhs_arg, rhs_arg))], ip=builder._ip, loc=builder._loc
+        )
     return linalg_op_result(op, output)
 
 
@@ -309,7 +346,16 @@ def _broadcast_shaped_operand(
 ) -> AlloValue:
     result_type = shaped_type_like(value, shape, value.dtype)
     output = make_linalg_output(builder, result_type)
-    op = linalg.BroadcastOp(builder, value.handle, output.handle, indices)
+    ip, loc = builder.get_insertion_point_and_loc()
+    op = linalg.BroadcastOp(
+        _linalg_generic_result_types(builder, result_type),
+        value.handle,
+        output.handle,
+        indices,
+        ip=ip,
+        loc=loc,
+    )
+    linalg.fill_builtin_region(op.operation)
     return linalg_op_result(op, output)
 
 

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import atexit
 import hashlib
 import json
 import os
@@ -10,26 +9,49 @@ import os
 from abc import ABC, abstractmethod
 from collections.abc import Mapping, Sequence
 from contextvars import ContextVar
-from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, ClassVar
+from typing import Any, Callable, ClassVar, Generic, ParamSpec, TypeVar
 
-from .._C import ir
+from ..._mlir import ir
+from ..._mlir._mlir_libs._allo import ir_ext
+from ..._mlir.ir import SymbolTable, UnitAttr
+from ..._mlir.passmanager import PassManager
+from ..._mlir.dialects.allo import register_passes as _register_allo_passes
 from ..lang.kernel import Kernel
 
+# Allo passes live in the process-global MLIR pass registry; register them once
+# (std::call_once-guarded in C++) so backend pipelines (`allo-lower-to-llvm`,
+# `grid-mapping`, `convert-allo-to-func`, ...) resolve via upstream PassManager.
+_register_allo_passes()
+
+
+def lookup_kernel(module: ir.Module, name: str):
+    """Return the top-level kernel op named ``name`` (an OpView) or ``None``."""
+    try:
+        return SymbolTable(module.operation)[name]
+    except KeyError:
+        return None
+
+
+def set_top_llvm_c_wrapper(module: ir.Module, name: str):
+    op = lookup_kernel(module, name)
+    if op is None:
+        return False
+    op.operation.attributes["llvm.emit_c_interface"] = UnitAttr.get(module.context)
+    return True
+
+
+def run_pipeline(module: ir.Module, pipeline: str) -> None:
+    """Run a textual pass pipeline on ``module`` in its own context."""
+    PassManager.parse(pipeline, module.context).run(module.operation)
+
+
 _PROCESS_CACHE: dict[tuple[str, str], Any] = {}
-_CURRENT_BACKEND: ContextVar[Backend | None] = ContextVar(
-    "allo_curr_backend",
-    default=None,
-)
+_DEFAULT_CACHE_DIR = Path.home() / ".allo" / "cache"
 
 
 def clear_process_cache() -> None:
     _PROCESS_CACHE.clear()
-
-
-# avoid ModuleOp livetime issues
-atexit.register(clear_process_cache)
 
 
 def _normalize_cache_value(value: Any) -> Any:
@@ -76,30 +98,11 @@ def write_json_if_changed(path: str | os.PathLike[str], value: Any) -> bool:
     return write_text_if_changed(path, stable_cache_json(value) + "\n")
 
 
-def cache_root() -> Path:
-    return Path.home() / ".allo" / "cache"
+P = ParamSpec("P")
+R = TypeVar("R")
 
 
-def current_backend() -> "Backend | None":
-    return _CURRENT_BACKEND.get()
-
-
-@dataclass
-class ModuleCacheEntry:
-    context: ir.Context | None
-    module_owner: ir.OwningModuleOp | None
-    module: ir.ModuleOp | None
-
-    def close(self) -> None:
-        self.module = None
-        self.module_owner = None
-        self.context = None
-
-    def __del__(self) -> None:
-        self.close()
-
-
-class Backend(ABC):
+class Backend(ABC, Generic[P, R]):
     """Base class for experimental Allo backends.
 
     A backend owns backend-specific lowering, project scaffolding, tool
@@ -109,48 +112,12 @@ class Backend(ABC):
 
     name: ClassVar[str] = "backend"
 
-    def __init__(self, kernel: Kernel | None = None):
-        self._kernel = kernel
-        self.module: ir.ModuleOp | None = None
-        self._module_owner: ir.OwningModuleOp | None = None
-        self._context_keepalive: ir.Context | None = None
-        self._context_tokens: list[Any] = []
+    def __init__(self, kernel: Kernel[P, R]):
+        self.module: ir.Module = ir_ext.clone_module(kernel.compile())
+        self.kernel = kernel
+        self._kernel_cache = self._compute_kernel_cache()
 
-    @property
-    def kernel(self) -> Kernel:
-        if self._kernel is None:
-            raise RuntimeError(
-                f"{self.__class__.__name__} backend is not bound to a kernel. "
-                "Pass a kernel to the backend constructor or use the backend as "
-                "a context manager around kernel calls."
-            )
-        return self._kernel
-
-    @kernel.setter
-    def kernel(self, kernel: Kernel | None) -> None:
-        self._kernel = kernel
-
-    def __enter__(self):
-        self._context_tokens.append(_CURRENT_BACKEND.set(self))
-        return self
-
-    def __exit__(self, exc_type, exc, tb):
-        if self._context_tokens:
-            _CURRENT_BACKEND.reset(self._context_tokens.pop())
-        return False
-
-    def _get_working_module(self) -> ir.ModuleOp:
-        """Return a backend-owned module clone for backend-specific mutation."""
-        if self.module is None:
-            compiled = self.kernel.compile()
-            assert self.kernel.context is not None
-            self._context_keepalive = self.kernel.context
-            self._module_owner = compiled.clone()
-            self.module = self._module_owner.get()
-        return self.module
-
-    def _kernel_cache_payload(self) -> dict[str, Any]:
-        module_text = str(self.kernel.compile())
+    def _compute_kernel_cache(self) -> dict[str, Any]:
         return {
             "top": self.kernel.func_name,
             "arg_types": [str(arg) for arg in self.kernel.parse_argument_annotations()],
@@ -160,32 +127,38 @@ class Backend(ABC):
                 name: str(value)
                 for name, value in sorted(self.kernel.template_bindings.items())
             },
-            "module_sha256": text_hash(module_text),
+            "module_sha256": text_hash(str(self.module)),
         }
 
     def _cache_key(self, *parts: Any) -> str:
         return stable_cache_hash(
             {
-                "kernel": self._kernel_cache_payload(),
+                "kernel": self._compute_kernel_cache(),
                 "parts": parts,
             }
         )
 
-    def _cache_dir(self, *parts: str) -> Path:
-        return cache_root().joinpath(*parts)
+    def _cache_dir(self) -> Path:
+        return _DEFAULT_CACHE_DIR
 
-    def _process_cache_get(self, namespace: str, key: str) -> Any | None:
+    def _pcache_get(self, namespace: str, key: str) -> Any | None:
         return _PROCESS_CACHE.get((namespace, key))
 
-    def _process_cache_set(self, namespace: str, key: str, value: Any) -> None:
+    def _pcache_set(self, namespace: str, key: str, value: Any) -> None:
         _PROCESS_CACHE[(namespace, key)] = value
 
-    def _process_cache_pop(self, namespace: str, key: str) -> Any | None:
+    def _pcache_pop(self, namespace: str, key: str) -> Any | None:
         return _PROCESS_CACHE.pop((namespace, key), None)
 
-    @abstractmethod
-    def call_kernel(self, kernel: Kernel, *args, **kwargs) -> Any:
-        """Run a kernel through this backend context."""
+    def _process_cached(
+        self, namespace: str, key: str, factory: Callable[[], Any]
+    ) -> Any:
+        """Return the cached value for ``(namespace, key)`` or build it once."""
+        value = _PROCESS_CACHE.get((namespace, key))
+        if value is None:
+            value = factory()
+            _PROCESS_CACHE[(namespace, key)] = value
+        return value
 
     @abstractmethod
     def compile(self) -> Any:
@@ -193,13 +166,7 @@ class Backend(ABC):
 
     @abstractmethod
     def run(self, *args, **kwargs) -> Any:
-        """Run the backend and return the results.
-
-        For CPU backend, the behavior of this method is to execute the compiled kernel and return the output.
-
-        For hardware backend, the behavior of this method is to run the complete implementation flow, including
-        synthesis and implementation.
-        """
+        """Run the backend and return the results."""
 
     @abstractmethod
     def scaffold_project(

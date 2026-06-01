@@ -8,8 +8,9 @@ import tempfile
 import numpy as np
 import pytest
 
-from allo.exp._C import passes
-from allo.exp._C.passes import emit_vivado_hls
+from allo._mlir import ir
+from allo._mlir.passmanager import PassManager
+from allo._mlir.dialects.allo import emit_vivado_hls
 from allo.exp.backend.vitis.core import (
     DEFAULT_VITIS_SETTINGS,
     HLS_PREPARE_PIPELINE,
@@ -22,8 +23,9 @@ from allo.exp.lang.kernel import kernel
 
 
 def _emit_vitis_cpp(fn) -> str:
-    module = compile_kernel(fn)
-    passes.run(HLS_PREPARE_PIPELINE, module.get_operation())
+    named = compile_kernel(fn)
+    module = ir.Module.parse(str(named), fn.context)
+    PassManager.parse(HLS_PREPARE_PIPELINE, fn.context).run(module.operation)
     code = emit_vivado_hls(module)
     assert code is not None
     return code

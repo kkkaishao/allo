@@ -1,21 +1,27 @@
-#include "ir.h"
+/*
+ * Copyright Allo authors. All Rights Reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ */
 
-#include "nanobind/nanobind.h"
-#include "nanobind/stl/string.h"
+#include "allo-c/Schedule.h"
 
+#include "mlir/CAPI/IR.h"
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
-#include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/BuiltinTypes.h"
+#include "mlir/IR/Location.h"
 #include "mlir/IR/SymbolTable.h"
 #include "mlir/Interfaces/ControlFlowInterfaces.h"
 #include "mlir/Interfaces/FunctionInterfaces.h"
 #include "mlir/Interfaces/LoopLikeInterface.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
+
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/Twine.h"
+#include "llvm/Support/JSON.h"
+#include "llvm/Support/raw_ostream.h"
 
 #include <string>
 #include <unordered_set>
@@ -25,6 +31,7 @@ using namespace mlir;
 static constexpr llvm::StringLiteral kScheduleIdAttr = "allo.schedule.id";
 static constexpr llvm::StringLiteral kScheduleNameAttr = "allo.schedule.name";
 
+// Keep in sync with the ScheduleOpTrait IntFlag mirrored on the Python side.
 enum ScheduleOpTrait : uint64_t {
   ScheduleOpTraitLoopLike = 1ULL << 0,
   ScheduleOpTraitAffineLoop = 1ULL << 1,
@@ -48,13 +55,10 @@ static void collectScheduledOps(Operation *op,
   if (!isScheduled(op))
     return;
   out.push_back(op);
-  for (Region &region : op->getRegions()) {
-    for (Block &block : region) {
-      for (Operation &nested : block) {
+  for (Region &region : op->getRegions())
+    for (Block &block : region)
+      for (Operation &nested : block)
         collectScheduledOps(&nested, out);
-      }
-    }
-  }
 }
 
 static std::string freshScheduleId(uint64_t &counter,
@@ -106,23 +110,21 @@ static std::optional<FileLineColLoc> findFileLineCol(Location loc) {
     return findFileLineCol(callLoc.getCaller());
   }
   if (auto fusedLoc = dyn_cast<FusedLoc>(loc)) {
-    for (Location child : fusedLoc.getLocations()) {
+    for (Location child : fusedLoc.getLocations())
       if (auto childLoc = findFileLineCol(child))
         return childLoc;
-    }
   }
   return std::nullopt;
 }
 
-static nb::object locationDict(Location loc) {
+static llvm::json::Value locationJson(Location loc) {
   auto fileLoc = findFileLineCol(loc);
   if (!fileLoc)
-    return nb::none();
-
-  nb::dict out;
+    return nullptr;
+  llvm::json::Object out;
   out["file"] = fileLoc->getFilename().str();
-  out["line"] = fileLoc->getLine();
-  out["col"] = fileLoc->getColumn();
+  out["line"] = (int64_t)fileLoc->getLine();
+  out["col"] = (int64_t)fileLoc->getColumn();
   return out;
 }
 
@@ -134,8 +136,7 @@ static std::string typeString(Type type) {
 }
 
 static bool isBufferLike(Value value) {
-  Type type = value.getType();
-  return isa<BaseMemRefType, TensorType>(type);
+  return isa<BaseMemRefType, TensorType>(value.getType());
 }
 
 static std::string childSegment(Operation *op, unsigned loopIdx,
@@ -155,7 +156,6 @@ static uint64_t memoryEffectTraits(Operation *op) {
   auto effects = getEffectsRecursively(op);
   if (!effects)
     return traits;
-
   for (const MemoryEffects::EffectInstance &effect : *effects) {
     if (isa<MemoryEffects::Allocate>(effect.getEffect()))
       traits |= ScheduleOpTraitMemoryAllocate;
@@ -189,169 +189,149 @@ static uint64_t operationTraits(Operation *op) {
   return traits;
 }
 
-static nb::dict valueRecord(Value value, Operation *owner,
-                            llvm::StringRef ownerId, llvm::StringRef ownerPath,
-                            unsigned number, llvm::StringRef source) {
-  std::string id =
+static llvm::json::Object valueJson(Value value, Operation *owner,
+                                    llvm::StringRef ownerId,
+                                    llvm::StringRef ownerPath, unsigned number,
+                                    llvm::StringRef source) {
+  llvm::json::Object out;
+  out["id"] =
       (llvm::Twine(ownerId) + ":" + source + std::to_string(number)).str();
-  std::string path =
-      (llvm::Twine(ownerPath) + ":" + source + std::to_string(number)).str();
-
-  nb::dict out;
-  out["id"] = id;
   out["owner_id"] = ownerId.str();
   if (auto name = bestValueName(value, owner))
     out["name"] = *name;
   else
-    out["name"] = nb::none();
+    out["name"] = nullptr;
   out["type"] = typeString(value.getType());
-  out["number"] = number;
+  out["number"] = (int64_t)number;
   out["source"] = source.str();
-  out["path"] = path;
-  out["loc"] = locationDict(value.getLoc());
+  out["path"] =
+      (llvm::Twine(ownerPath) + ":" + source + std::to_string(number)).str();
+  out["loc"] = locationJson(value.getLoc());
   return out;
 }
 
 static void collectValues(Operation *op, llvm::StringRef opId,
-                          llvm::StringRef opPath, nb::list &values) {
+                          llvm::StringRef opPath, llvm::json::Array &values) {
   for (OpResult result : op->getResults()) {
     if (!isBufferLike(result))
       continue;
-    values.append(
-        valueRecord(result, op, opId, opPath, result.getResultNumber(), "res"));
+    values.push_back(
+        valueJson(result, op, opId, opPath, result.getResultNumber(), "res"));
   }
-
   auto func = dyn_cast<FunctionOpInterface>(op);
   if (!func)
     return;
-
   for (BlockArgument arg : func.getArguments()) {
     if (!isBufferLike(arg))
       continue;
-    values.append(
-        valueRecord(arg, op, opId, opPath, arg.getArgNumber(), "arg"));
+    values.push_back(
+        valueJson(arg, op, opId, opPath, arg.getArgNumber(), "arg"));
   }
 }
 
 static void collectSnapshotNode(Operation *op, llvm::StringRef parentId,
-                                llvm::StringRef path, nb::list &ops,
-                                nb::list &values) {
+                                llvm::StringRef path, llvm::json::Array &ops,
+                                llvm::json::Array &values) {
   std::string id = requireScheduleId(op);
-  nb::list childIds;
+  llvm::json::Array childIds;
   SmallVector<std::pair<Operation *, std::string>> children;
-  unsigned loopIdx = 0;
-  unsigned branchIdx = 0;
-  unsigned opIdx = 0;
+  unsigned loopIdx = 0, branchIdx = 0, opIdx = 0;
 
   for (Region &region : op->getRegions()) {
     for (Block &block : region) {
       for (Operation &nested : block) {
         if (!isScheduled(&nested))
           continue;
-        unsigned currentLoop = loopIdx;
-        unsigned currentBranch = branchIdx;
-        unsigned currentOp = opIdx;
+        unsigned currentLoop = loopIdx, currentBranch = branchIdx,
+                 currentOp = opIdx;
         if (isa<LoopLikeOpInterface>(nested))
           ++loopIdx;
         else if (isa<RegionBranchOpInterface>(nested))
           ++branchIdx;
         else
           ++opIdx;
-
         std::string segment =
             childSegment(&nested, currentLoop, currentBranch, currentOp);
         std::string childPath =
             path.empty() ? segment : (llvm::Twine(path) + "/" + segment).str();
-        childIds.append(requireScheduleId(&nested));
+        childIds.push_back(requireScheduleId(&nested));
         children.push_back({&nested, childPath});
       }
     }
   }
 
-  nb::dict record;
+  llvm::json::Object record;
   record["id"] = id;
   record["kind"] = op->getName().getStringRef().str();
   if (auto name = bestOperationName(op))
     record["name"] = *name;
   else
-    record["name"] = nb::none();
+    record["name"] = nullptr;
   record["path"] = path.str();
   if (parentId.empty())
-    record["parent_id"] = nb::none();
+    record["parent_id"] = nullptr;
   else
-    record["parent_id"] = nb::str(parentId.data(), parentId.size());
-  record["children"] = childIds;
-  record["loc"] = locationDict(op->getLoc());
-  record["traits"] = operationTraits(op);
-  ops.append(record);
+    record["parent_id"] = parentId.str();
+  record["children"] = std::move(childIds);
+  record["loc"] = locationJson(op->getLoc());
+  record["traits"] = (int64_t)operationTraits(op);
+  ops.push_back(std::move(record));
   collectValues(op, id, path, values);
 
   for (auto &[child, childPath] : children)
     collectSnapshotNode(child, id, childPath, ops, values);
 }
 
-void bindSchedule(nb::module_ &m) {
-  m.attr("SCHEDULE_ID_ATTR_NAME") = nb::str(kScheduleIdAttr.data());
-  m.attr("SCHEDULE_NAME_ATTR_NAME") = nb::str(kScheduleNameAttr.data());
-  nb::enum_<ScheduleOpTrait>(m, "ScheduleOpTrait", nb::is_arithmetic(),
-                             nb::is_flag())
-      .value("OP_TRAIT_LOOP_LIKE", ScheduleOpTraitLoopLike)
-      .value("OP_TRAIT_AFFINE_LOOP", ScheduleOpTraitAffineLoop)
-      .value("OP_TRAIT_SCF_LOOP", ScheduleOpTraitScfLoop)
-      .value("OP_TRAIT_REGION_BRANCH", ScheduleOpTraitRegionBranch)
-      .value("OP_TRAIT_FUNCTION_LIKE", ScheduleOpTraitFunctionLike)
-      .value("OP_TRAIT_SYMBOL", ScheduleOpTraitSymbol)
-      .value("OP_TRAIT_MEMORY_ALLOCATE", ScheduleOpTraitMemoryAllocate)
-      .value("OP_TRAIT_MEMORY_FREE", ScheduleOpTraitMemoryFree)
-      .value("OP_TRAIT_MEMORY_READ", ScheduleOpTraitMemoryRead)
-      .value("OP_TRAIT_MEMORY_WRITE", ScheduleOpTraitMemoryWrite)
-      .value("OP_TRAIT_AFFINE_FOR", ScheduleOpTraitAffineFor);
+void alloAnnotateScheduleIds(MlirModule module) {
+  ModuleOp mod = unwrap(module);
+  SmallVector<Operation *> ops;
+  collectScheduledOps(mod.getOperation(), ops);
 
-  m.def("annotate_schedule_ids", [](ModuleOp module) {
-    SmallVector<Operation *> ops;
-    collectScheduledOps(module.getOperation(), ops);
+  llvm::DenseMap<Attribute, unsigned> counts;
+  for (Operation *op : ops)
+    if (auto attr = op->getAttrOfType<StringAttr>(kScheduleIdAttr))
+      ++counts[attr];
 
-    llvm::DenseMap<Attribute, unsigned> counts;
-    for (Operation *op : ops) {
-      if (auto attr = op->getAttrOfType<StringAttr>(kScheduleIdAttr))
-        ++counts[attr];
-    }
+  std::unordered_set<std::string> used;
+  for (Operation *op : ops) {
+    auto attr = op->getAttrOfType<StringAttr>(kScheduleIdAttr);
+    if (attr && counts[attr] == 1)
+      used.insert(attr.str());
+  }
 
-    std::unordered_set<std::string> used;
-    for (Operation *op : ops) {
-      auto attr = op->getAttrOfType<StringAttr>(kScheduleIdAttr);
-      if (attr && counts[attr] == 1)
-        used.insert(attr.str());
-    }
+  uint64_t counter = 0;
+  MLIRContext *ctx = mod.getContext();
+  for (Operation *op : ops) {
+    auto attr = op->getAttrOfType<StringAttr>(kScheduleIdAttr);
+    if (attr && counts[attr] == 1)
+      continue;
+    op->setAttr(kScheduleIdAttr,
+                StringAttr::get(ctx, freshScheduleId(counter, used)));
+  }
+}
 
-    uint64_t counter = 0;
-    MLIRContext *ctx = module.getContext();
-    for (Operation *op : ops) {
-      auto attr = op->getAttrOfType<StringAttr>(kScheduleIdAttr);
-      if (attr && counts[attr] == 1)
-        continue;
-      op->setAttr(kScheduleIdAttr,
-                  StringAttr::get(ctx, freshScheduleId(counter, used)));
-    }
-  });
+void alloCleanupScheduleIds(MlirModule module) {
+  unwrap(module)->walk([](Operation *op) { op->removeAttr(kScheduleIdAttr); });
+}
 
-  m.def("cleanup_schedule_ids", [](ModuleOp module) {
-    module->walk([](Operation *op) { op->removeAttr(kScheduleIdAttr); });
-  });
+void alloCollectScheduleSnapshotJSON(MlirModule module,
+                                     MlirStringCallback callback,
+                                     void *userData) {
+  Operation *root = unwrap(module).getOperation();
+  assert(root->getAttrOfType<StringAttr>(kScheduleIdAttr) &&
+         "call alloAnnotateScheduleIds before collecting the snapshot");
 
-  m.def("collect_schedule_snapshot", [](ModuleOp module) {
-    Operation *root = module.getOperation();
-    assert(root->getAttrOfType<StringAttr>(kScheduleIdAttr) &&
-           "call annotate_schedule_ids before collect_schedule_snapshot");
+  llvm::json::Array ops, values;
+  collectSnapshotNode(root, "", "module", ops, values);
 
-    nb::list ops;
-    nb::list values;
-    collectSnapshotNode(root, "", "module", ops, values);
+  llvm::json::Object out;
+  out["root_id"] = requireScheduleId(root);
+  out["ops"] = std::move(ops);
+  out["values"] = std::move(values);
 
-    nb::dict out;
-    out["root_id"] = requireScheduleId(root);
-    out["ops"] = ops;
-    out["values"] = values;
-    return out;
-  });
+  std::string text;
+  llvm::raw_string_ostream os(text);
+  os << llvm::json::Value(std::move(out));
+  os.flush();
+  callback(MlirStringRef{text.data(), text.size()}, userData);
 }

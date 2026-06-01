@@ -4,12 +4,13 @@ from ..compiler.builder import AlloOpBuilder
 from ..lang.core import AlloValue, ConstexprValue, ShapedType
 from ..lang.operator import operator
 from .utils import (
+    _linalg_generic_result_types,
     linalg_op_result,
     operator_body_unreachable,
     resolve_linalg_output,
     shaped_type_like,
 )
-from .._C import linalg as linalg_d
+from ..._mlir.dialects import linalg as linalg_d
 
 
 def _expect_shaped(builder: AlloOpBuilder, value: AlloValue, op_name: str):
@@ -51,7 +52,15 @@ def _(builder: AlloOpBuilder, lhs: AlloValue, rhs: AlloValue, acc=ConstexprValue
         lhs, (lhs.type.shape[0], rhs.type.shape[1]), result_dtype
     )
     output = resolve_linalg_output(builder, result_type, acc, "matmul")
-    op = linalg_d.MatmulOp(builder, lhs.handle, rhs.handle, output.handle)
+    ip, loc = builder.get_insertion_point_and_loc()
+    op = linalg_d.MatmulOp(
+        _linalg_generic_result_types(builder, output.type),
+        [lhs.handle, rhs.handle],
+        [output.handle],
+        ip=ip,
+        loc=loc,
+    )
+    linalg_d.fill_builtin_region(op.operation)
     return linalg_op_result(op, output)
 
 
@@ -74,5 +83,13 @@ def _(builder: AlloOpBuilder, lhs: AlloValue, rhs: AlloValue, acc=ConstexprValue
     lhs, rhs, result_dtype = _promote_pair(builder, lhs, rhs)
     result_type = shaped_type_like(lhs, (), result_dtype)
     output = resolve_linalg_output(builder, result_type, acc, "dot")
-    op = linalg_d.DotOp(builder, lhs.handle, rhs.handle, output.handle)
+    ip, loc = builder.get_insertion_point_and_loc()
+    op = linalg_d.DotOp(
+        _linalg_generic_result_types(builder, output.type),
+        [lhs.handle, rhs.handle],
+        [output.handle],
+        ip=ip,
+        loc=loc,
+    )
+    linalg_d.fill_builtin_region(op.operation)
     return linalg_op_result(op, output)
