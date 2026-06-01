@@ -1,7 +1,7 @@
 <!--- Copyright Allo authors. All Rights Reserved. -->
 <!--- SPDX-License-Identifier: Apache-2.0  -->
 
-<img src="tutorials/allo-icon.png" width=128/> Accelerator Design and Programming Language
+<img src="icon.png" width=128/> Accelerator Design and Programming Language
 ==============================================================================
 
 [**Documentation**](https://cornell-zhang.github.io/allo) | [**Installation**](https://cornell-zhang.github.io/allo/setup/index.html) | [**Tutorials**](https://github.com/cornell-zhang/allo-tutorials)
