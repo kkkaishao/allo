@@ -21,3 +21,4 @@
 # Notes
 - Raise questions or concerns of unclear design decisions in the planning phase.
 - `drafts/` folder is for temporary code when exploring new ideas, so use it for prototyping freely.
+- Use `conda run -n allo` to execute commands in the `allo` environment.
