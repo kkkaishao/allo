@@ -37,9 +37,9 @@ from .utils import (
     _source_settings_env,
     _synth_log_path,
 )
-from allo._mlir import ir
-from allo._mlir.dialects.allo import emit_vivado_hls
-from allo._mlir._mlir_libs._allo import ir_ext
+from ...._mlir import ir
+from ...._mlir.dialects.allo import emit_vivado_hls
+from ...._mlir._mlir_libs._allo import ir_ext
 from ...lang.core import BufferType, ShapedType, TypeBase
 from ...lang.kernel import Kernel
 from ...logging import log_warning, run_command, stage, terminate_on_error

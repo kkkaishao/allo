@@ -2,68 +2,110 @@ from __future__ import annotations
 
 from typing import Protocol
 
-from ..._mlir import ir
+from ..._mlir.ir import (
+    Context,
+    Value,
+    StringAttr,
+    Module,
+    Location,
+    FlatSymbolRefAttr,
+    UnitAttr,
+    InsertionPoint,
+)
 from ..._mlir.dialects import transform as t
 from ..._mlir.dialects.transform import structured as ts
 from ..._mlir.dialects.transform import allo as ta
-from ..._mlir.schedule import SCHEDULE_ID_ATTR_NAME, SCHEDULE_NAME_ATTR_NAME
 
 from .errors import capture_schedule_location
-from .model import BufferRef, OpRef, ScheduleSnapshot
+from .keys import SCHEDULE_KEY_ATTR_NAME
+from ..._mlir.schedule import SCHEDULE_NAME_ATTR_NAME
 from ..compiler.builder import AlloOpBuilder
 
 
 class TransformHost(Protocol):
-    context: ir.Context
-    epoch: int
-    snapshot: ScheduleSnapshot
+    context: Context
 
 
 class TransformScript:
-    """Builds a ``__transform_main`` named sequence on upstream `allo._mlir`.
+    """Builds the schedule's reusable transform program as a set of leaf *body*
+    sequences plus an ordered include *plan*.
 
-    Ops are inserted *before* the sequence's terminating ``transform.yield`` so
-    they accumulate in forward (data-dependency) order across primitive calls.
+    Primitives append to the current per-apply **batch** body (``@__body_{n}``), matching
+    their targets by *bare* ``allo.schedule.key`` rooted at the body's ``%func`` argument,
+    so each body is a self-contained function of one function and can be re-run verbatim
+    on a renamed copy (this is what makes ``.compose()`` work). The ``_plan`` is the
+    ordered list of ``(match_key, body_sym)`` includes the program realizes; ``apply()``
+    runs only the tail past ``_applied`` (incremental), while ``.compose()`` re-prefixes
+    the whole plan. No entry sequence is kept resident — ``apply()`` builds a throwaway
+    one for the unapplied tail and erases it.
     """
 
-    def __init__(self, schedule: TransformHost):
-        self.schedule = schedule
-        self.context = schedule.context
+    def __init__(self, host: TransformHost, primary_key: str):
+        self.context = host.context
         self.builder = AlloOpBuilder(self.context)
         self.builder.set_unknown_loc()
+        self._primary_key = primary_key
+        self._body_counter = 0
+        # Ordered (match_key, body_sym) includes; the full transitive plan a parent
+        # re-prefixes when it composes this schedule.
+        self._plan: list[tuple[str, str]] = []
+        self._applied = 0
+        self._current_batch = None
+        self._current_root: Value | None = None
 
-        with self.context, ir.Location.unknown(self.context):
-            self.module = ir.Module.create()
+        with self.context, Location.unknown(self.context):
+            self.module = Module.create()
             self.module.operation.attributes["transform.with_named_sequence"] = (
-                ir.UnitAttr.get(self.context)
+                UnitAttr.get(self.context)
             )
             self.any_op_type = t.AnyOpType.get()
             self.any_value_type = t.AnyValueType.get()
             self.any_param_type = t.AnyParamType.get()
-            root_type = t.OperationType.get("builtin.module")
-
-            self.builder.set_insertion_point_to_end(self.module.body)
-            self.sequence = t.NamedSequenceOp(
-                "__transform_main",
-                [root_type],
-                [],
-                ip=self.builder._ip,
-                loc=self.builder._loc,
-            )
-
-        entry = self.sequence.body
-        self.root = self.sequence.bodyTarget
-        yield_op = t.YieldOp([], ip=ir.InsertionPoint(entry), loc=self.builder._loc)
-        # Subsequent primitives insert immediately before the terminator.
-        self.builder.restore_insertion_point(ir.InsertionPoint(yield_op.operation))
-
-        self._op_handles = {schedule.snapshot.root_id: self.root}
-        self._value_handles = {}
+            # Sequences only match/transform payload under their argument; they never
+            # consume the function/module handle, so it is readonly (required by
+            # `transform.include` to declare an effect on the callee's operand).
+            self._readonly = [{"transform.readonly": UnitAttr.get(self.context)}]
 
     @property
     def kw(self) -> dict:
-        """``ip``/``loc`` kwargs for upstream ODS op construction."""
+        """``ip``/``loc`` kwargs for body op construction (before the batch's yield)."""
         return {"ip": self.builder._ip, "loc": self.builder._loc}
+
+    @property
+    def includes(self) -> list[tuple[str, str]]:
+        """The full (match_key, body_sym) plan, in emission order."""
+        return list(self._plan)
+
+    @property
+    def root(self) -> Value:
+        """Transform handle for the function the current batch operates on; opens a new
+        batch body on first use after construction/apply."""
+        return self._open_batch()
+
+    def _open_batch(self) -> Value:
+        if self._current_batch is None:
+            saved_loc = self.builder._loc
+            unknown = Location.unknown(self.context)
+            with self.context, unknown:
+                self._body_counter += 1
+                sym = f"__body_{self._body_counter}"
+                batch = t.NamedSequenceOp(
+                    sym,
+                    [self.any_op_type],
+                    [],
+                    sym_visibility="private",
+                    arg_attrs=self._readonly,
+                    ip=InsertionPoint(self.module.body),
+                    loc=unknown,
+                )
+                yield_op = t.YieldOp([], ip=InsertionPoint(batch.body), loc=unknown)
+            self._current_batch = batch
+            self._current_root = batch.bodyTarget
+            self._plan.append((self._primary_key, sym))
+            self.builder.restore_insertion_point(InsertionPoint(yield_op.operation))
+            self.builder.set_loc(saved_loc)
+        assert self._current_root is not None
+        return self._current_root
 
     def set_callsite_loc(self) -> None:
         loc = capture_schedule_location()
@@ -71,78 +113,125 @@ class TransformScript:
             self.builder.set_unknown_loc()
             return
         self.builder.set_loc(
-            ir.Location.file(loc.file_name, loc.line, loc.col + 1, self.context)
+            Location.file(loc.file_name, loc.line, loc.col + 1, self.context)
         )
 
-    def op_handle(self, ref: OpRef) -> ir.Value:
-        handle = self._op_handles.get(ref.id)
-        if handle is not None:
-            return handle
+    # --- body handle matching (rooted at %func, fresh per use) ------------
 
-        node = self.schedule.snapshot.ops_by_id[ref.id]
-        handle = ts.MatchOp(
+    def match(self, key: str) -> Value:
+        return ts.MatchOp(
             self.any_op_type,
             self.root,
-            ops=[node.kind],
-            op_attrs={SCHEDULE_ID_ATTR_NAME: ir.StringAttr.get(ref.id, self.context)},
-            ip=self.builder._ip,
-            loc=self.builder._loc,
+            op_attrs={SCHEDULE_KEY_ATTR_NAME: StringAttr.get(key, self.context)},
+            **self.kw,
         ).results[0]
-        self._op_handles[ref.id] = handle
-        return handle
 
-    def value_handle(self, ref: BufferRef) -> ir.Value:
-        handle = self._value_handles.get(ref.id)
-        if handle is not None:
-            return handle
-
-        owner = self._owner_ref(ref)
-        owner_handle = self.op_handle(owner)
-        source_kind = {"arg": 1, "res": 2}[ref.source]
-        handle = ta.MatchValueOp(
+    def match_value(self, owner_key: str, number: int, source: str) -> Value:
+        owner_handle = self.match(owner_key)
+        source_kind = {"arg": 1, "res": 2}[source]
+        return ta.MatchValueOp(
             self.any_value_type,
             owner_handle,
-            ref.number,
+            number,
             source_kind=source_kind,
-            ip=self.builder._ip,
-            loc=self.builder._loc,
-        ).result
-        self._value_handles[ref.id] = handle
-        return handle
-
-    def set_op_handle(self, ref: OpRef, handle: ir.Value) -> None:
-        self._op_handles[ref.id] = handle
-
-    def defining_op_handle(self, handle: ir.Value) -> ir.Value:
-        return t.GetDefiningOp(
-            self.any_op_type, handle, ip=self.builder._ip, loc=self.builder._loc
+            **self.kw,
         ).result
 
-    def _annotate(self, handle: ir.Value, name: str, value: str) -> None:
+    def defining_op_handle(self, handle: Value) -> Value:
+        return t.GetDefiningOp(self.any_op_type, handle, **self.kw).result
+
+    # --- annotation -------------------------------------------------------
+
+    def _annotate(self, handle: Value, name: str, value: str) -> None:
         # Upstream `transform.annotate` only attaches a param's value, so wrap the
         # static string in a `transform.param.constant` first.
         param = t.ParamConstantOp(
-            self.any_param_type,
-            ir.StringAttr.get(value, self.context),
-            ip=self.builder._ip,
-            loc=self.builder._loc,
+            self.any_param_type, StringAttr.get(value, self.context), **self.kw
         ).param
-        t.AnnotateOp(
-            handle, name, param=param, ip=self.builder._ip, loc=self.builder._loc
-        )
+        t.AnnotateOp(handle, name, param=param, **self.kw)
 
-    def annotate_schedule_id(self, handle: ir.Value, schedule_id: str) -> None:
-        self._annotate(handle, SCHEDULE_ID_ATTR_NAME, schedule_id)
+    def annotate_key(self, handle: Value, key: str) -> None:
+        self._annotate(handle, SCHEDULE_KEY_ATTR_NAME, key)
 
-    def annotate_schedule_name(self, handle: ir.Value, schedule_name: str) -> None:
-        self._annotate(handle, SCHEDULE_NAME_ATTR_NAME, schedule_name)
+    def annotate_name(self, handle: Value, name: str) -> None:
+        self._annotate(handle, SCHEDULE_NAME_ATTR_NAME, name)
 
-    def _owner_ref(self, ref: BufferRef) -> OpRef:
-        node = self.schedule.snapshot.ops_by_id[ref.owner_id]
-        return OpRef(
-            id=node.id,
-            epoch=self.schedule.epoch,
-            kind=node.kind,
-            name=node.name,
-            path=node.path,
-        )
+    # --- compose ----------------------------------------------------------
+
+    def import_bodies(self, other: TransformScript) -> dict[str, str]:
+        """Copy every body sequence of ``other`` into this transform module under fresh
+        private symbols, returning ``{old_sym: new_sym}``. Round-trips through text so it
+        works even when the two schedules live in different MLIR contexts."""
+        parsed = Module.parse(str(other.module), self.context)
+        mapping: dict[str, str] = {}
+        for op in parsed.body.operations:
+            if op.operation.name != "transform.named_sequence":
+                continue
+            old = StringAttr(op.operation.attributes["sym_name"]).value
+            if not old.startswith("__body"):
+                continue
+            cloned = op.operation.clone(InsertionPoint(self.module.body))
+            self._body_counter += 1
+            fresh = f"__body_{self._body_counter}"
+            cloned.attributes["sym_name"] = StringAttr.get(fresh, self.context)
+            mapping[old] = fresh
+        return mapping
+
+    def compose_include(self, copy_key: str, body_sym: str) -> None:
+        self._plan.append((copy_key, body_sym))
+
+    # --- incremental application ------------------------------------------
+
+    def pending(self) -> list[tuple[str, str]]:
+        return self._plan[self._applied :]
+
+    def commit(self) -> None:
+        self._applied = len(self._plan)
+        self._current_batch = None
+
+    def build_entry(self, plan_slice: list[tuple[str, str]], name: str = "__apply"):
+        """Build a throwaway ``@name(%module)`` entry in this module that matches each
+        plan entry's function and includes its body. Caller runs then erases it."""
+        unknown = Location.unknown(self.context)
+        with self.context, unknown:
+            entry = t.NamedSequenceOp(
+                name,
+                [self.any_op_type],
+                [],
+                arg_attrs=self._readonly,
+                ip=InsertionPoint(self.module.body),
+                loc=unknown,
+            )
+            root = entry.bodyTarget
+            yield_op = t.YieldOp([], ip=InsertionPoint(entry.body), loc=unknown)
+            ip = InsertionPoint(yield_op.operation)
+            for match_key, body_sym in plan_slice:
+                handle = ts.MatchOp(
+                    self.any_op_type,
+                    root,
+                    op_attrs={
+                        SCHEDULE_KEY_ATTR_NAME: StringAttr.get(match_key, self.context)
+                    },
+                    ip=ip,
+                    loc=unknown,
+                ).results[0]
+                t.IncludeOp(
+                    [],
+                    FlatSymbolRefAttr.get(body_sym, self.context),
+                    t.FailurePropagationMode.Propagate,
+                    [handle],
+                    ip=ip,
+                    loc=unknown,
+                )
+        return entry
+
+    @staticmethod
+    def discard_entry(entry) -> None:
+        entry.operation.erase()
+
+    def dump_text(self) -> str:
+        """Full program text (all bodies + a representative entry over the whole plan)."""
+        entry = self.build_entry(self._plan, name="__transform_main")
+        text = str(self.module)
+        self.discard_entry(entry)
+        return text

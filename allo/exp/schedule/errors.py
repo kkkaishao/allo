@@ -147,15 +147,19 @@ class StaleRefError(ScheduleError):
     pass
 
 
+class ConsumedHandleError(StaleRefError):
+    pass
+
+
+class ScheduleStateError(ScheduleError):
+    pass
+
+
 class ScheduleTypeError(ScheduleError):
     pass
 
 
 class InvalidScheduleArgumentError(ScheduleError):
-    pass
-
-
-class UnsupportedScheduleOperationError(ScheduleError):
     pass
 
 

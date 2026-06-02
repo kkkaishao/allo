@@ -2,19 +2,28 @@ from __future__ import annotations
 
 import functools
 from collections.abc import Iterable, Sequence
-from typing import Any
+from typing import Literal
 
+from ..lang.kernel import Kernel
 from .errors import (
     InvalidScheduleArgumentError,
+    ScheduleError,
     ScheduleLookupError,
-    ScheduleTypeError,
+    ScheduleStateError,
     ScheduleTransformError,
+    ScheduleTypeError,
+)
+from .keys import (
+    annotate_schedule_keys,
+    derived_key,
+    read_schedule_keys,
 )
 from .model import (
     BufferRef,
-    Effect,
     LoopRef,
     OpRef,
+    PredictedOp,
+    PredictedSnapshot,
     Ref,
     ScheduleSnapshot,
     SingleTarget,
@@ -22,7 +31,7 @@ from .model import (
 )
 from .query import Query
 from .script import TransformScript
-from ..._mlir import ir
+from ..._mlir.ir import Context, Module, Value
 from ..._mlir import schedule as schedule_d
 from ..._mlir.schedule import ScheduleOpTrait
 from ..._mlir.dialects import allo as allo_d
@@ -45,44 +54,89 @@ def _within_context(method):
 
 
 class Schedule:
-    """Experimental schedule frontend backed by immutable IR snapshots."""
+    """Lazy schedule frontend: primitives accumulate a reusable transform program
+    (``@sched(%root)``) and a predicted snapshot; ``apply()`` runs the program once.
+
+    ``s.payload`` / ``s.snapshot`` expose the real IR and require ``apply()`` first
+    (they raise while transforms are pending). Handles and queries work lazily off
+    the predicted snapshot.
+    """
 
     Complete = 0
     Block = 1
     Cyclic = 2
 
-    payload: ir.Module
-    snapshot: ScheduleSnapshot
-    query: Query
-    script: TransformScript
-
-    def __init__(self, module: ir.Module, context: ir.Context | None = None):
-        self.payload = module
+    def __init__(
+        self,
+        module: Module | None = None,
+        context: Context | None = None,
+        *,
+        kernel: Kernel | None = None,
+        primary: str | None = None,
+    ):
+        assert not (kernel and module), "cannot specify both kernel and module"
+        if kernel is not None:
+            module = kernel.module
+        assert module is not None
+        self.kernel = kernel
         self.context = context if context is not None else module.context
         allo_d.register_extensions(self.context)
-        self.epoch = 0
         self.dirty = False
-        self.effects: list[Effect] = []
-        self._pending_effects: list[Effect] = []
-        self._effect_counter = 0
-        self._generated_ids: set[str] = set()
-        self.last_effect: str | None = None
-        schedule_d.annotate_schedule_ids(self.payload)
-        self.snapshot = self._collect_snapshot()
+
+        schedule_d.annotate_schedule_ids(module)
+        bootstrap = ScheduleSnapshot.from_raw(
+            schedule_d.collect_schedule_snapshot(module)
+        )
+        self._primary_name, self._primary_path = self._detect_primary(
+            bootstrap, primary
+        )
+        annotate_schedule_keys(module, bootstrap.relkey_by_id)
+        # `_payload` is the (keyed) module; apply() never mutates it structurally — it
+        # parses `str(_payload)` into a fresh working copy, runs the delta there, and
+        # rebinds `_payload` to it. The snapshot is collected from the named module so
+        # value names (e.g. buffer "B") are available before the first apply.
+        self._payload = module
+        self._real = ScheduleSnapshot.from_raw(
+            schedule_d.collect_schedule_snapshot(module),
+            primary_path=self._primary_path,
+        )
+        self.predicted = PredictedSnapshot.from_real(self._real)
+        self.script = TransformScript(self, self._primary_name)
         self.query = Query(self)
-        self.script = TransformScript(self)
+
+    @staticmethod
+    def _detect_primary(snap: ScheduleSnapshot, primary: str | None) -> tuple[str, str]:
+        """Return (name, path) of the function the schedule operates on: the named
+        kernel when given, else the single function child of the module root (the
+        one whose name has no ``.`` — nested-callee copies are ``parent.callee``)."""
+        funcs = [
+            node
+            for node in snap.ops
+            if node.parent_id == snap.root_id
+            and node.has_trait(ScheduleOpTrait.FUNCTION_LIKE)
+        ]
+        if primary is not None:
+            for node in funcs:
+                if node.name == primary:
+                    return primary, node.path
+            raise InvalidScheduleArgumentError(
+                f"primary function '{primary}' not found in module"
+            )
+        own = [node for node in funcs if node.name is None or "." not in node.name]
+        candidates = own or funcs
+        assert candidates, "module has no function to schedule"
+        node = candidates[0]
+        return (node.name or snap.relkey_of(node.id)), node.path
 
     @classmethod
-    def from_module(
-        cls, module: ir.Module, context: ir.Context | None = None
-    ) -> Schedule:
+    def from_module(cls, module: Module, context: Context | None = None) -> Schedule:
         return cls(module, context)
 
     @classmethod
     def from_string(cls, text: str) -> Schedule:
-        context = ir.Context()
+        context = Context()
         allo_d.register_dialect(context)
-        module = ir.Module.parse(text, context)
+        module = Module.parse(text, context)
         return cls(module, context)
 
     @classmethod
@@ -90,31 +144,42 @@ class Schedule:
         with open(path, "r", encoding="utf-8") as handle:
             return cls.from_string(handle.read())
 
-    def cleanup_schedule_ids(self) -> Schedule:
-        schedule_d.cleanup_schedule_ids(self.payload)
-        log_debug("removed schedule ids from payload IR")
-        return self
+    # --- export to backend ----------------------------------------------
+    def export(self, backend: Literal["cpu", "vitis"], **kwargs):
+        if not self.kernel:
+            raise ScheduleError("Cannot export to backends without a source kernel")
+        self.apply()
+        self.kernel.module = self._payload
+        if backend == "cpu":
+            from ..backend import CPU
 
-    def live(self, ref: Ref) -> Ref:
-        if not isinstance(ref, Ref):
-            raise InvalidScheduleArgumentError(
-                f"live expects a schedule ref, got {type(ref).__name__}"
+            return CPU(self.kernel, **kwargs)
+        elif backend == "vitis":
+            from ..backend.vitis import Vitis
+
+            return Vitis(self.kernel, **kwargs)
+
+        raise ScheduleError(f"unsupported backend '{backend}' for export()")
+
+    # --- gated real-IR access --------------------------------------------
+
+    @property
+    def payload(self) -> Module:
+        self._require_materialized("payload")
+        return self._payload
+
+    @property
+    def snapshot(self) -> ScheduleSnapshot:
+        self._require_materialized("snapshot")
+        return self._real
+
+    def _require_materialized(self, what: str) -> None:
+        if self.dirty:
+            raise ScheduleStateError(
+                f"{what} has pending transforms; call .apply() to materialize them"
             )
-        if isinstance(ref, BufferRef):
-            if ref.id not in self.snapshot.values_by_id:
-                raise ScheduleLookupError(f"buffer ref id '{ref.id}' is no longer live")
-            return self.snapshot.buffer_ref(ref.id)
-        if ref.id not in self.snapshot.ops_by_id:
-            raise ScheduleLookupError(f"operation ref id '{ref.id}' is no longer live")
-        if isinstance(ref, LoopRef):
-            return self.snapshot.loop_ref(ref.id)
-        assert isinstance(ref, OpRef), f"unsupported ref type: {type(ref)}"
-        return self.snapshot.op_ref(ref.id)
 
-    #####################################
-    # Alias methods for query operations
-    # To simplify the use of the schedule API
-    ####################################
+    # --- query aliases ----------------------------------------------------
 
     def op(
         self,
@@ -124,7 +189,9 @@ class Schedule:
         kind: str | None = None,
         path: str | None = None,
     ) -> OpRef:
-        return self.query.op(name, under=under, kind=kind, path=path).one()
+        ref = self.query.op(name, under=under, kind=kind, path=path).one()
+        assert isinstance(ref, OpRef)
+        return ref
 
     def loop(
         self,
@@ -133,7 +200,9 @@ class Schedule:
         under: OpRef | str | None = None,
         path: str | None = None,
     ) -> LoopRef:
-        return self.query.loop(name, under=under, path=path).one()
+        ref = self.query.loop(name, under=under, path=path).one()
+        assert isinstance(ref, LoopRef)
+        return ref
 
     def loops(
         self,
@@ -142,9 +211,8 @@ class Schedule:
         path: str | None = None,
     ) -> tuple[LoopRef, ...]:
         selection = self.query.loop(under=under, path=path)
-        if names:
-            return selection.names(*names)
-        return tuple(selection.all())
+        result = selection.names(*names) if names else tuple(selection.all())
+        return tuple(r for r in result if isinstance(r, LoopRef))
 
     def buffer(
         self,
@@ -153,71 +221,50 @@ class Schedule:
         under: OpRef | str | None = None,
         path: str | None = None,
     ) -> BufferRef:
-        return self.query.buffer(name, under=under, path=path).one()
+        ref = self.query.buffer(name, under=under, path=path).one()
+        assert isinstance(ref, BufferRef)
+        return ref
+
+    def live(self, ref: Ref) -> Ref:
+        self.predicted.require_live(ref)
+        return ref
+
+    # --- pattern / cleanup primitives (approximate) ----------------------
 
     @_within_context
     def cse(self, targets: Targets = None) -> Schedule:
-        ops = self._resolve_op_targets(targets, "cse")
-        self.script.set_callsite_loc()
-        for op in ops:
-            t.ApplyCommonSubexpressionEliminationOp(
-                self.script.op_handle(op), **self.script.kw
-            )
-
-        self._mark_dirty()
-        self._record_effect(
-            "cse",
-            topology=True,
-            targets=[op.path for op in ops],
+        return self._apply_op_pass(
+            targets, "cse", t.ApplyCommonSubexpressionEliminationOp
         )
-        return self
 
     @_within_context
     def dce(self, targets: Targets = None) -> Schedule:
-        ops = self._resolve_op_targets(targets, "dce")
-        self.script.set_callsite_loc()
-        for op in ops:
-            t.ApplyDeadCodeEliminationOp(self.script.op_handle(op), **self.script.kw)
-
-        self._mark_dirty()
-        self._record_effect(
-            "dce",
-            topology=True,
-            targets=[op.path for op in ops],
-        )
-        return self
+        return self._apply_op_pass(targets, "dce", t.ApplyDeadCodeEliminationOp)
 
     @_within_context
     def licm(self, targets: Targets = None) -> Schedule:
-        ops = self._resolve_op_targets(targets, "licm")
+        return self._apply_op_pass(targets, "licm", t.ApplyLoopInvariantCodeMotionOp)
+
+    def _apply_op_pass(self, targets: Targets, desc: str, op_cls) -> Schedule:
+        ops = self._resolve_op_targets(targets, desc)
         self.script.set_callsite_loc()
         for op in ops:
-            t.ApplyLoopInvariantCodeMotionOp(
-                self.script.op_handle(op), **self.script.kw
-            )
-
+            op_cls(self._op_handle(op), **self.script.kw)
+            self._predicted_mark_approx(op)
         self._mark_dirty()
-        self._record_effect(
-            "licm",
-            topology=True,
-            targets=[op.path for op in ops],
-        )
         return self
 
     @_within_context
     def apply_patterns(
-        self,
-        patterns: str | Iterable[str],
-        targets: Targets = None,
+        self, patterns: str | Iterable[str], targets: Targets = None
     ) -> Schedule:
         pattern_names = [patterns] if isinstance(patterns, str) else list(patterns)
         if not pattern_names:
             raise InvalidScheduleArgumentError("apply_patterns requires a pattern")
-
-        supported_patterns = {"canonicalize": t.ApplyCanonicalizationPatternsOp}
+        supported = {"canonicalize": t.ApplyCanonicalizationPatternsOp}
         pattern_ops = []
         for pattern in pattern_names:
-            op = supported_patterns.get(pattern)
+            op = supported.get(pattern)
             if op is None:
                 raise InvalidScheduleArgumentError(
                     f"unsupported pattern '{pattern}' in apply_patterns"
@@ -227,7 +274,7 @@ class Schedule:
         ops = self._resolve_op_targets(targets, "apply_patterns")
         self.script.set_callsite_loc()
         for op in ops:
-            apply_op = t.ApplyPatternsOp(self.script.op_handle(op), **self.script.kw)
+            apply_op = t.ApplyPatternsOp(self._op_handle(op), **self.script.kw)
             region = apply_op.regions[0]
             body = region.blocks[0] if len(region.blocks) else region.blocks.append()
             ip = self.script.builder.save_insertion_point()
@@ -235,18 +282,14 @@ class Schedule:
             for pattern_op in pattern_ops:
                 pattern_op(**self.script.kw)
             self.script.builder.restore_insertion_point(ip)
-
+            self._predicted_mark_approx(op)
         self._mark_dirty()
-        self._record_effect(
-            "apply_patterns",
-            topology=True,
-            targets=[op.path for op in ops],
-            patterns=pattern_names,
-        )
         return self
 
     def canonicalize(self, targets: Targets = None) -> Schedule:
         return self.apply_patterns("canonicalize", targets)
+
+    # --- tag primitives (no structural change) ---------------------------
 
     @_within_context
     def pipeline(self, targets: Targets = None, *, ii: int = 1) -> Schedule:
@@ -255,55 +298,34 @@ class Schedule:
             raise InvalidScheduleArgumentError(
                 f"pipeline ii must be positive, got {ii}"
             )
-
         loops = self._resolve_loop_targets(targets, "pipeline")
         self.script.set_callsite_loc()
         for loop in loops:
-            ta.TagPipelineOp(self.script.op_handle(loop), ii, **self.script.kw)
-
+            ta.TagPipelineOp(self.script.match(loop.key), ii, **self.script.kw)
         self._mark_dirty()
-        self._record_effect(
-            "pipeline",
-            topology=False,
-            targets=[loop.path for loop in loops],
-            ii=ii,
-        )
         return self
 
     @_within_context
     def unroll(
-        self,
-        targets: Targets = None,
-        *,
-        factor: int = 0,
-        tag_only: bool = True,
+        self, targets: Targets = None, *, factor: int = 0, tag_only: bool = True
     ) -> Schedule:
         self._require_int("unroll factor", factor)
         if factor < 0:
             raise InvalidScheduleArgumentError(
                 f"unroll factor must be non-negative, got {factor}"
             )
-
         loops = self._resolve_loop_targets(targets, "unroll")
         self.script.set_callsite_loc()
         for loop in loops:
             ta.AlloLoopUnrollOp(
-                self.script.op_handle(loop),
+                self.script.match(loop.key),
                 factor,
                 tag_only=tag_only,
                 **self.script.kw,
             )
-
+            if not tag_only:
+                self.predicted.mark_approx(self._pred(loop))
         self._mark_dirty()
-        self._record_effect(
-            "unroll",
-            topology=not tag_only,
-            targets=[loop.path for loop in loops],
-            factor=factor,
-            tag_only=tag_only,
-        )
-        if not tag_only:
-            self.apply()
         return self
 
     @_within_context
@@ -341,96 +363,179 @@ class Schedule:
         axis = allo_d.PartitionAxisAttr.get(kind, factor, dim, self.context)
         part = allo_d.PartitionAttr.get([axis], self.context)
         self.script.set_callsite_loc()
-        for buffer in buffers:
-            ta.PartitionOp(self.script.value_handle(buffer), part, **self.script.kw)
-
+        for buf in buffers:
+            handle = self.script.match_value(buf.owner_key, buf.number, buf.source)
+            ta.PartitionOp(handle, part, **self.script.kw)
         self._mark_dirty()
-        self._record_effect(
-            "partition",
-            topology=False,
-            targets=[buffer.path for buffer in buffers],
-            dim=dim,
-            kind=self._partition_kind_name(kind),
-            factor=factor,
-        )
         return self
+
+    # --- structural primitives -------------------------------------------
 
     @_within_context
     def affine(self, targets: Targets = None) -> list[LoopRef]:
         loops = self._resolve_loop_targets(targets, "affine")
         self.script.set_callsite_loc()
+        out: list[LoopRef] = []
         for loop in loops:
             raised = ta.RaiseToAffineOp(
-                self.script.any_op_type, self.script.op_handle(loop), **self.script.kw
+                self.script.any_op_type,
+                self.script.match(loop.key),
+                **self.script.kw,
             ).result
-            self.script.annotate_schedule_id(raised, loop.id)
+            self.script.annotate_key(raised, loop.key)
             if loop.name is not None:
-                self.script.annotate_schedule_name(raised, loop.name)
-            self.script.set_op_handle(loop, raised)
-
+                self.script.annotate_name(raised, loop.name)
+            node = self.predicted.flip_kind(self._pred(loop), "affine.for")
+            out.append(self.predicted.make_loop_ref(node))
         self._mark_dirty()
-        self._record_effect(
-            "affine",
-            topology=True,
-            targets=[loop.path for loop in loops],
+        return out
+
+    @_within_context
+    def split(
+        self, target: SingleTarget | None = None, *, factor: int = 1
+    ) -> tuple[LoopRef, LoopRef]:
+        self._require_int("split factor", factor)
+        if factor <= 0:
+            raise InvalidScheduleArgumentError(
+                f"split factor must be positive, got {factor}"
+            )
+        loop = self._resolve_single_loop_target(target, "split")
+        okey, ikey = derived_key(loop.key, "outer"), derived_key(loop.key, "inner")
+
+        self.script.set_callsite_loc()
+        out_h, in_h = ta.LoopSplitOp(
+            self.script.any_op_type,
+            self.script.any_op_type,
+            self.script.match(loop.key),
+            factor,
+            **self.script.kw,
+        ).results
+        self.script.annotate_key(out_h, okey)
+        self.script.annotate_key(in_h, ikey)
+
+        outer, inner = self.predicted.split(self._pred(loop), okey, ikey)
+        self._mark_dirty()
+        return self.predicted.make_loop_ref(outer), self.predicted.make_loop_ref(inner)
+
+    @_within_context
+    def reorder(self, targets: Targets) -> tuple[LoopRef, ...]:
+        desired = [
+            self._require_affine(loop)
+            for loop in self._resolve_loop_targets(targets, "reorder")
+        ]
+        if len(desired) < 2:
+            raise InvalidScheduleArgumentError("reorder requires at least two loops")
+        desired_keys = [(loop.scope, loop.key) for loop in desired]
+        if len(set(desired_keys)) != len(desired_keys):
+            raise InvalidScheduleArgumentError("reorder targets must be unique")
+
+        desired_pred = [self._pred(loop) for loop in desired]
+        current = sorted(desired_pred, key=lambda op: self.predicted.depth(op))
+        current_keys = [(op.scope, op.key) for op in current]
+        permutation = [current_keys.index((op.scope, op.key)) for op in desired_pred]
+
+        self.script.set_callsite_loc()
+        handles = [self.script.match(op.key) for op in current]
+        merged = t.MergeHandlesOp(handles, deduplicate=False, **self.script.kw).result
+        ta.LoopReorderOp(merged, permutation, **self.script.kw)
+
+        self.predicted.reorder(desired_pred)
+        self._mark_dirty()
+        return tuple(self.predicted.make_loop_ref(self._pred(loop)) for loop in desired)
+
+    @_within_context
+    def tile(
+        self, targets: Targets = None, *, factors: int | Iterable[int] = 1
+    ) -> tuple[list[LoopRef], list[LoopRef]]:
+        loops = self._resolve_loop_targets(targets, "tile")
+        factor_list = self._normalize_tile_factors(factors, len(loops))
+        band = sorted((self._pred(loop) for loop in loops), key=self.predicted.depth)
+        tile_keys = [derived_key(op.key, "tile") for op in band]
+        point_keys = [derived_key(op.key, "point") for op in band]
+
+        self.script.set_callsite_loc()
+        handles = [self.script.match(loop.key) for loop in loops]
+        merged = t.MergeHandlesOp(handles, deduplicate=True, **self.script.kw).result
+        tiled = ta.LoopTileOp(
+            self.script.any_op_type,
+            self.script.any_op_type,
+            merged,
+            factor_list,
+            **self.script.kw,
         )
-        self.apply()
-        return [self.snapshot.loop_ref(loop.id) for loop in loops]
+        self._split_and_annotate(tiled.results[0], tile_keys)
+        self._split_and_annotate(tiled.results[1], point_keys)
+
+        tiles, points = self.predicted.tile(band, tile_keys, point_keys)
+        self._mark_dirty()
+        return (
+            [self.predicted.make_loop_ref(op) for op in tiles],
+            [self.predicted.make_loop_ref(op) for op in points],
+        )
+
+    @_within_context
+    def flatten(self, targets: Targets) -> LoopRef:
+        loops = self._resolve_loop_targets(targets, "flatten")
+        if len(loops) < 2:
+            raise InvalidScheduleArgumentError(
+                "flatten requires at least two loop targets"
+            )
+        band = sorted((self._pred(loop) for loop in loops), key=self.predicted.depth)
+        flat_key = derived_key(band[0].key, "flat")
+
+        self.script.set_callsite_loc()
+        handles = [self.script.match(loop.key) for loop in loops]
+        merged = t.MergeHandlesOp(handles, deduplicate=True, **self.script.kw).result
+        flattened = ta.LoopFlattenOp(
+            self.script.any_op_type, merged, **self.script.kw
+        ).result
+        self.script.annotate_key(flattened, flat_key)
+
+        flat = self.predicted.flatten(band, flat_key)
+        self._mark_dirty()
+        return self.predicted.make_loop_ref(flat)
 
     @_within_context
     def compute_at(self, target: SingleTarget, axis: SingleTarget) -> LoopRef:
         producer = self._resolve_single_op_target(target, "compute_at target")
-        axis_loop = self._require_affine_for(
-            self._resolve_single_loop_target(axis, "compute_at axis"),
-            "compute_at axis",
+        axis_loop = self._require_affine(
+            self._resolve_single_loop_target(axis, "compute_at axis")
         )
-
         self.script.set_callsite_loc()
         ta.ComputeAtOp(
-            self.script.op_handle(producer),
-            self.script.op_handle(axis_loop),
+            self.script.match(producer.key),
+            self.script.match(axis_loop.key),
             **self.script.kw,
         )
-
+        self.predicted.reparent_approx(self._pred(producer), axis_loop.skey)
         self._mark_dirty()
-        self._record_effect(
-            "compute_at",
-            topology=True,
-            target=producer.path,
-            axis=axis_loop.path,
-        )
-        self.apply()
-        return self.snapshot.loop_ref(axis_loop.id)
+        return self.predicted.make_loop_ref(self._pred(axis_loop))
 
     @_within_context
     def buffer_at(self, target: SingleTarget, axis: SingleTarget) -> BufferRef:
-        buffer = self._resolve_single_buffer_target(target, "buffer_at target")
-        axis_loop = self._require_affine_for(
-            self._resolve_single_loop_target(axis, "buffer_at axis"),
-            "buffer_at axis",
+        buf = self._resolve_single_buffer_target(target, "buffer_at target")
+        axis_loop = self._require_affine(
+            self._resolve_single_loop_target(axis, "buffer_at axis")
         )
-        local_id = self._fresh_schedule_id(f"{buffer.id}.local")
+        base = buf.name or buf.owner_key
+        local_key = derived_key(base, "local")
 
         self.script.set_callsite_loc()
         local = ta.BufferAtOp(
             self.script.any_value_type,
-            self.script.value_handle(buffer),
-            self.script.op_handle(axis_loop),
+            self.script.match_value(buf.owner_key, buf.number, buf.source),
+            self.script.match(axis_loop.key),
             **self.script.kw,
         ).result
-        local_alloc = self.script.defining_op_handle(local)
-        self.script.annotate_schedule_id(local_alloc, local_id)
+        alloc = self.script.defining_op_handle(local)
+        self.script.annotate_key(alloc, local_key)
 
-        self._mark_dirty()
-        self._record_effect(
-            "buffer_at",
-            topology=True,
-            target=buffer.path,
-            axis=axis_loop.path,
-            result=local_id,
+        alloc_op = self.predicted.add_alloc(
+            buf.scope, local_key, "memref.alloc", axis_loop.skey
         )
-        self.apply()
-        return self.snapshot.buffer_ref(f"{local_id}:res0")
+        value = self.predicted.add_value(alloc_op.skey, 0, "res")
+        self._mark_dirty()
+        return self.predicted.make_buffer_ref(value)
 
     @_within_context
     def outline(
@@ -443,248 +548,150 @@ class Schedule:
         if not isinstance(func_name, str) or not func_name:
             raise InvalidScheduleArgumentError("outline requires a non-empty func_name")
         source = self._resolve_single_op_target(target, "outline target")
-        if source.id == self.snapshot.root_id:
+        if self._pred(source).parent is None:
             raise InvalidScheduleArgumentError("outline cannot target the payload root")
         mapping_values = self._normalize_mapping(mapping, "outline mapping")
-        kernel_id = self._fresh_schedule_id(func_name)
-        call_id = self._fresh_schedule_id(f"{source.id}.call")
+        call_key = derived_key(source.key, "call")
 
         self.script.set_callsite_loc()
         any_op = self.script.any_op_type
-        if mapping_values is None:
-            outlined = ta.OutlineOp(
-                any_op,
-                any_op,
-                self.script.op_handle(source),
-                func_name,
-                **self.script.kw,
-            )
-        else:
-            outlined = ta.OutlineOp(
-                any_op,
-                any_op,
-                self.script.op_handle(source),
-                func_name,
-                mapping=mapping_values,
-                **self.script.kw,
-            )
-        self.script.annotate_schedule_id(outlined.results[0], kernel_id)
-        self.script.annotate_schedule_id(outlined.results[1], call_id)
-
-        effect_data = {
-            "target": source.path,
-            "func_name": func_name,
-            "kernel": kernel_id,
-            "call": call_id,
-        }
+        kwargs = dict(self.script.kw)
         if mapping_values is not None:
-            effect_data["mapping"] = mapping_values
+            kwargs["mapping"] = mapping_values
+        outlined = ta.OutlineOp(
+            any_op, any_op, self.script.match(source.key), func_name, **kwargs
+        )
+        self.script.annotate_key(outlined.results[0], func_name)
+        self.script.annotate_key(outlined.results[1], call_key)
+
+        kernel_op = self.predicted.add_function(
+            self.predicted.root_scope, func_name, None
+        )
+        call_op = self.predicted._add_op(
+            source.scope,
+            call_key,
+            "func.call",
+            None,
+            self._pred(source).parent,
+            [],
+            ScheduleOpTrait(0),
+            exact=False,
+        )
         self._mark_dirty()
-        self._record_effect(
-            "outline",
-            topology=True,
-            **effect_data,
-        )
-        self.apply()
-        return self.snapshot.op_ref(kernel_id), self.snapshot.op_ref(call_id)
-
-    @_within_context
-    def split(
-        self,
-        target: SingleTarget | None = None,
-        *,
-        factor: int = 1,
-    ) -> tuple[LoopRef, LoopRef]:
-        self._require_int("split factor", factor)
-        if factor <= 0:
-            raise InvalidScheduleArgumentError(
-                f"split factor must be positive, got {factor}"
-            )
-
-        loops = self._resolve_loop_targets(target, "split")
-        if len(loops) != 1:
-            raise InvalidScheduleArgumentError("split requires exactly one loop target")
-        loop = loops[0]
-        outer_id = self._fresh_schedule_id(f"{loop.id}.outer")
-        inner_id = self._fresh_schedule_id(f"{loop.id}.inner")
-
-        self.script.set_callsite_loc()
-        any_op = self.script.any_op_type
-        split_op = ta.LoopSplitOp(
-            any_op, any_op, self.script.op_handle(loop), factor, **self.script.kw
-        )
-        outer = split_op.results[0]
-        inner = split_op.results[1]
-        self.script.annotate_schedule_id(outer, outer_id)
-        self.script.annotate_schedule_id(inner, inner_id)
-
-        self._mark_dirty()
-        self._record_effect(
-            "split",
-            topology=True,
-            target=loop.path,
-            factor=factor,
-            outer=outer_id,
-            inner=inner_id,
-        )
-        self.apply()
-        return self.snapshot.loop_ref(outer_id), self.snapshot.loop_ref(inner_id)
-
-    @_within_context
-    def reorder(self, targets: Targets) -> tuple[LoopRef, ...]:
-        desired = [
-            self._require_affine_for(loop, "reorder target")
-            for loop in self._resolve_loop_targets(targets, "reorder")
-        ]
-        if len(desired) < 2:
-            raise InvalidScheduleArgumentError("reorder requires at least two loops")
-        desired_ids = [loop.id for loop in desired]
-        if len(set(desired_ids)) != len(desired_ids):
-            raise InvalidScheduleArgumentError("reorder targets must be unique")
-
-        current = sorted(desired, key=lambda loop: self.snapshot.depth(loop.id))
-        current_ids = [loop.id for loop in current]
-        permutation = [current_ids.index(loop.id) for loop in desired]
-
-        self.script.set_callsite_loc()
-        handles = [self.script.op_handle(loop) for loop in current]
-        merged = t.MergeHandlesOp(handles, deduplicate=False, **self.script.kw).result
-        ta.LoopReorderOp(merged, permutation, **self.script.kw)
-
-        self._mark_dirty()
-        self._record_effect(
-            "reorder",
-            topology=True,
-            targets=[loop.path for loop in current],
-            order=[loop.path for loop in desired],
-        )
-        self.apply()
-        return tuple(self.snapshot.loop_ref(loop_id) for loop_id in desired_ids)
-
-    @_within_context
-    def tile(
-        self,
-        targets: Targets = None,
-        *,
-        factors: int | Iterable[int] = 1,
-    ) -> tuple[list[LoopRef], list[LoopRef]]:
-        loops = self._resolve_loop_targets(targets, "tile")
-        factor_list = self._normalize_tile_factors(factors, len(loops))
-        depth_ordered = sorted(loops, key=lambda loop: self.snapshot.depth(loop.id))
-        tile_ids = [
-            self._fresh_schedule_id(f"{loop.id}.tile") for loop in depth_ordered
-        ]
-        point_ids = [
-            self._fresh_schedule_id(f"{loop.id}.point") for loop in depth_ordered
-        ]
-
-        self.script.set_callsite_loc()
-        handles = [self.script.op_handle(loop) for loop in loops]
-        merged = t.MergeHandlesOp(handles, deduplicate=True, **self.script.kw).result
-        any_op = self.script.any_op_type
-        tiled = ta.LoopTileOp(any_op, any_op, merged, factor_list, **self.script.kw)
-        self._annotate_split_results(tiled.results[0], tile_ids)
-        self._annotate_split_results(tiled.results[1], point_ids)
-
-        self._mark_dirty()
-        self._record_effect(
-            "tile",
-            topology=True,
-            targets=[loop.path for loop in loops],
-            factors=factor_list,
-            tiles=tile_ids,
-            points=point_ids,
-        )
-        self.apply()
         return (
-            [self.snapshot.loop_ref(schedule_id) for schedule_id in tile_ids],
-            [self.snapshot.loop_ref(schedule_id) for schedule_id in point_ids],
+            self.predicted.make_op_ref(kernel_op),
+            self.predicted.make_op_ref(call_op),
         )
 
-    @_within_context
-    def flatten(self, targets: Targets) -> LoopRef:
-        loops = self._resolve_loop_targets(targets, "flatten")
-        if len(loops) < 2:
-            raise InvalidScheduleArgumentError(
-                "flatten requires at least two loop targets"
-            )
-        outermost = min(loops, key=lambda loop: self.snapshot.depth(loop.id))
-        flat_id = self._fresh_schedule_id(f"{outermost.id}.flat")
-
-        self.script.set_callsite_loc()
-        handles = [self.script.op_handle(loop) for loop in loops]
-        merged = t.MergeHandlesOp(handles, deduplicate=True, **self.script.kw).result
-        flattened = ta.LoopFlattenOp(
-            self.script.any_op_type, merged, **self.script.kw
-        ).result
-        self.script.annotate_schedule_id(flattened, flat_id)
-
-        self._mark_dirty()
-        self._record_effect(
-            "flatten",
-            topology=True,
-            targets=[loop.path for loop in loops],
-            result=flat_id,
-        )
-        self.apply()
-        return self.snapshot.loop_ref(flat_id)
+    # --- application ------------------------------------------------------
 
     def apply(self) -> Schedule:
         if not self.dirty:
             return self
-        assert self._pending_effects, "dirty schedule has no pending effects"
-        topology_changed = any(effect.topology for effect in self._pending_effects)
+        delta = self.script.pending()
+        if delta:
+            entry = self.script.build_entry(delta)
+            if not self.script.module.operation.verify():
+                self.script.discard_entry(entry)
+                raise ScheduleTransformError(
+                    "transform script verification failed",
+                    notes=self._transform_error_notes(),
+                )
+            # Run the unapplied tail on a clone of the current payload (already-applied
+            # transforms are not re-run); keep `_payload` as last-good on failure.
+            work = Module.parse(str(self._payload), self.context)
+            try:
+                interpreter.apply_named_sequence(
+                    work.operation,
+                    entry.operation,
+                    self.script.module.operation,
+                )
+            except Exception as exc:  # interpreter raises (no failed/err tuple)
+                self.script.discard_entry(entry)
+                raise ScheduleTransformError(
+                    "failed to apply transform script",
+                    notes=self._transform_error_notes(str(exc)),
+                ) from exc
+            self.script.discard_entry(entry)
+            if not work.operation.verify():
+                raise ScheduleTransformError(
+                    "payload module verification failed after scheduling",
+                    notes=self._transform_error_notes(str(work)),
+                )
 
-        if not self.script.module.operation.verify():
-            raise ScheduleTransformError(
-                "transform script verification failed",
-                notes=self._transform_error_notes(),
+            schedule_d.annotate_schedule_ids(work)
+            raw = schedule_d.collect_schedule_snapshot(work)
+            stamped = read_schedule_keys(work)
+            real = ScheduleSnapshot.from_raw(
+                raw, stamped, primary_path=self._primary_path
             )
-
-        try:
-            interpreter.apply_named_sequence(
-                self.payload.operation,
-                self.script.sequence.operation,
-                self.script.module.operation,
-            )
-        except Exception as exc:  # interpreter raises (no failed/err tuple)
-            raise ScheduleTransformError(
-                "failed to apply transform script",
-                notes=self._transform_error_notes(str(exc)),
-            ) from exc
-        if not self.payload.operation.verify():
-            raise ScheduleTransformError(
-                "payload module verification failed after scheduling",
-                notes=self._transform_error_notes(str(self.payload)),
-            )
-
-        self.refresh_snapshot(
-            effect=self._last_pending_topology_effect_id(),
-            topology=topology_changed,
-        )
-        self.script = TransformScript(self)
+            self.predicted.reconcile(real)
+            self._payload = work
+            self._real = real
+        self.script.commit()
         self.dirty = False
-        self._pending_effects.clear()
-        return self
-
-    def refresh_snapshot(
-        self,
-        *,
-        effect: str | None = None,
-        topology: bool = True,
-    ) -> Schedule:
-        if topology:
-            self.epoch += 1
-            self.last_effect = effect
-        else:
-            assert effect is None, "non-topology refresh cannot set last effect"
-        schedule_d.annotate_schedule_ids(self.payload)
-        self.snapshot = self._collect_snapshot()
         self.query = Query(self)
         return self
 
+    materialize = apply
+
+    def compose(self, callee: Schedule, *, id=None) -> Schedule:
+        """Apply ``callee``'s whole schedule to the specialized copy of that kernel
+        inside this kernel. The copy is the symbol ``"{primary}.{callee_primary}"``
+        (with an optional ``.{id}`` suffix for a specific specialized/repeat copy).
+        Generic callees are concrete by construction (templates are bound before
+        ``Kernel.schedule()``), so compose needs no instantiation.
+
+        ``callee`` may itself have composed sub-kernels: its include plan lists every
+        body it realizes, keyed by the callee-relative copy symbol. Re-prefixing those
+        keys onto this copy maps them to the transitive copies the compiler emits
+        (e.g. ``mid.inner`` -> ``top.mid.inner``), and every body is imported, so the
+        callee's full schedule runs verbatim on the matching copies."""
+        copy_key = f"{self._primary_name}.{callee._primary_name}"
+        if id is not None:
+            copy_key = f"{copy_key}.{id}"
+        # Resolve the top-level copy up front so a missing callee always reports, even
+        # when the callee schedule is empty (no includes to iterate below).
+        self._resolve_copy(copy_key)
+
+        callee_primary = callee._primary_name
+        body_map = self.script.import_bodies(callee.script)
+        for match_key, body_sym in callee.script.includes:
+            assert match_key == callee_primary or match_key.startswith(
+                callee_primary + "."
+            ), f"unexpected callee include key '{match_key}'"
+            new_key = copy_key + match_key[len(callee_primary) :]
+            copy_node = self._resolve_copy(new_key)
+            self.script.compose_include(new_key, body_map[body_sym])
+            self.predicted.mark_approx(copy_node)
+        self._mark_dirty()
+        return self
+
+    def _resolve_copy(self, copy_key: str) -> PredictedOp:
+        node = self.predicted.op(self.predicted.root_scope, copy_key)
+        if node is not None and node.has_trait(ScheduleOpTrait.FUNCTION_LIKE):
+            return node
+        available = sorted(
+            op.key
+            for op in self.predicted.ops
+            if op.scope == self.predicted.root_scope
+            and op.has_trait(ScheduleOpTrait.FUNCTION_LIKE)
+            and op.key != self._primary_name
+        )
+        raise ScheduleLookupError(
+            f"compose: callee copy '{copy_key}' not found in '{self._primary_name}'",
+            notes=[f"available callee symbols: {available}"] if available else [],
+        )
+
+    def cleanup_schedule_ids(self) -> Schedule:
+        schedule_d.cleanup_schedule_ids(self._payload)
+        log_debug("removed schedule ids from payload IR")
+        return self
+
+    # --- introspection ----------------------------------------------------
+
     def format_tree(self, *, include_values: bool = True) -> str:
-        return self.snapshot.format_tree(include_values=include_values)
+        return self._real.format_tree(include_values=include_values)
 
     def dump_tree(self, *, include_values: bool = True) -> str:
         text = self.format_tree(include_values=include_values)
@@ -692,29 +699,24 @@ class Schedule:
         return text
 
     def dump_transform_script(self) -> str:
-        return str(self.script.module)
+        return self.script.dump_text()
 
     def debug_dump(self, *, include_values: bool = True) -> Schedule:
         print("=== Schedule State ===")
-        print(f"epoch={self.epoch}")
         print(f"dirty={self.dirty}")
-        print(f"ops={len(self.snapshot.ops)}")
-        print(f"values={len(self.snapshot.values)}")
-        print(f"effects={len(self.effects)}")
-        print("--- tree ---")
+        print(f"ops={len(self._real.ops)}")
+        print(f"values={len(self._real.values)}")
+        print("--- last applied tree ---")
         print(self.format_tree(include_values=include_values))
-        if self.dirty:
-            print("--- transform_script ---")
-            print(self.dump_transform_script())
+        print("--- transform_script ---")
+        print(self.dump_transform_script())
         return self
 
-    def _collect_snapshot(self) -> ScheduleSnapshot:
-        raw = schedule_d.collect_schedule_snapshot(self.payload)
-        return ScheduleSnapshot.from_raw(raw, epoch=self.epoch)
+    # --- target resolution helpers ---------------------------------------
 
     def _resolve_op_targets(self, targets: Targets, desc: str) -> list[OpRef]:
         if targets is None:
-            return [self.snapshot.op_ref(self.snapshot.root_id)]
+            return [self.predicted.make_op_ref(self._primary_pred())]
         return [
             self.query.resolve_op(target, desc=desc)
             for target in self._targets(targets, desc)
@@ -722,7 +724,9 @@ class Schedule:
 
     def _resolve_loop_targets(self, targets: Targets, desc: str) -> list[LoopRef]:
         if targets is None:
-            return [self.query.loop().one()]
+            ref = self.query.loop().one()
+            assert isinstance(ref, LoopRef)
+            return [ref]
         return [
             self.query.resolve_loop(target) for target in self._targets(targets, desc)
         ]
@@ -764,12 +768,11 @@ class Schedule:
             raise InvalidScheduleArgumentError(f"{desc} requires exactly one buffer")
         return buffers[0]
 
-    def _require_affine_for(self, loop: LoopRef, desc: str) -> LoopRef:
-        node = self.snapshot.ops_by_id[loop.id]
+    def _require_affine(self, loop: LoopRef) -> LoopRef:
+        node = self._pred(loop)
         if not node.has_trait(ScheduleOpTrait.AFFINE_FOR):
             raise ScheduleTypeError(
-                f"{desc} must be an affine.for loop, got {loop.describe()} "
-                f"with kind '{loop.kind}'"
+                f"{loop.describe()} must be an affine.for loop, got kind '{loop.kind}'"
             )
         return loop
 
@@ -787,10 +790,47 @@ class Schedule:
         for target in out:
             if not isinstance(target, (Ref, str)):
                 raise InvalidScheduleArgumentError(
-                    f"{desc} target must be a ref or name, got "
-                    f"{type(target).__name__}"
+                    f"{desc} target must be a ref or name, got {type(target).__name__}"
                 )
         return out
+
+    # --- predicted helpers ------------------------------------------------
+
+    def _pred(self, ref: Ref) -> PredictedOp:
+        node = self.predicted.op(ref.scope, ref.key)
+        assert (
+            node is not None
+        ), f"{ref.describe()} is not live in the predicted snapshot"
+        return node
+
+    def _primary_pred(self) -> PredictedOp:
+        node = self.predicted.op(self.predicted.root_scope, self._primary_name)
+        assert node is not None, "primary function missing from predicted snapshot"
+        return node
+
+    def _op_handle(self, ref: OpRef) -> Value:
+        """Transform handle for an op target. The primary function is the body's
+        ``%func`` root; anything else is matched by its bare key within ``%func``."""
+        if ref.scope == self.predicted.root_scope and ref.key == self._primary_name:
+            return self.script.root
+        return self.script.match(ref.key)
+
+    def _predicted_mark_approx(self, ref: OpRef) -> None:
+        node = self.predicted.op(ref.scope, ref.key)
+        if node is not None:
+            self.predicted.mark_approx(node)
+
+    def _split_and_annotate(self, handle: Value, keys: list[str]) -> None:
+        split = t.SplitHandleOp(
+            [self.script.any_op_type] * len(keys), handle, **self.script.kw
+        )
+        for idx, key in enumerate(keys):
+            self.script.annotate_key(split.results[idx], key)
+
+    # --- misc helpers -----------------------------------------------------
+
+    def _mark_dirty(self) -> None:
+        self.dirty = True
 
     def _require_int(self, desc: str, value: int) -> None:
         if type(value) is not int:
@@ -798,49 +838,8 @@ class Schedule:
                 f"{desc} must be an int, got {type(value).__name__}"
             )
 
-    def _mark_dirty(self) -> None:
-        self.dirty = True
-
-    def _record_effect(
-        self,
-        op_name: str,
-        *,
-        topology: bool,
-        **data: Any,
-    ) -> Effect:
-        self._effect_counter += 1
-        effect_id = f"{op_name}:{self._effect_counter}"
-        effect = Effect(
-            id=effect_id,
-            name=op_name,
-            epoch=self.epoch,
-            topology=topology,
-            data=data,
-        )
-        self.effects.append(effect)
-        self._pending_effects.append(effect)
-        return effect
-
-    def _last_pending_topology_effect_id(self) -> str | None:
-        for effect in reversed(self._pending_effects):
-            if effect.topology:
-                return effect.id
-        return None
-
-    def _fresh_schedule_id(self, base: str) -> str:
-        used = set(self.snapshot.ops_by_id) | self._generated_ids
-        candidate = base
-        suffix = 0
-        while candidate in used:
-            suffix += 1
-            candidate = f"{base}.{suffix}"
-        self._generated_ids.add(candidate)
-        return candidate
-
     def _normalize_tile_factors(
-        self,
-        factors: int | Iterable[int],
-        expected: int,
+        self, factors: int | Iterable[int], expected: int
     ) -> list[int]:
         if type(factors) is int:
             out = [factors] * expected
@@ -864,9 +863,7 @@ class Schedule:
         return out
 
     def _normalize_mapping(
-        self,
-        mapping: Sequence[int] | int | None,
-        desc: str,
+        self, mapping: Sequence[int] | int | None, desc: str
     ) -> list[int] | None:
         if mapping is None:
             return None
@@ -887,15 +884,6 @@ class Schedule:
                 )
         return out
 
-    def _annotate_split_results(
-        self, handle: ir.Value, schedule_ids: list[str]
-    ) -> None:
-        split = t.SplitHandleOp(
-            [self.script.any_op_type] * len(schedule_ids), handle, **self.script.kw
-        )
-        for idx, schedule_id in enumerate(schedule_ids):
-            self.script.annotate_schedule_id(split.results[idx], schedule_id)
-
     def _transform_error_notes(self, detail: str = "") -> list[str]:
         notes = []
         detail = detail.strip()
@@ -905,4 +893,8 @@ class Schedule:
         return notes
 
     def _partition_kind_name(self, kind) -> str:
-        return getattr(kind, "name", str(kind).split(".")[-1])
+        return {
+            self.Complete: "complete",
+            self.Block: "block",
+            self.Cyclic: "cyclic",
+        }.get(kind, str(kind))

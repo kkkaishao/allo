@@ -444,8 +444,17 @@ class Kernel(Generic[P, R]):
     def schedule(self):
         from ..schedule import Schedule
 
-        module = self.compile()
-        return Schedule(module, self.context)
+        if self.template:
+            expected = {arg.name for arg in self.template}
+            missing = expected - set(self.template_bindings)
+            if missing:
+                raise TypeError(
+                    f"Cannot schedule templated kernel '{self.func_name}': specialize "
+                    f"it first (e.g. {self.func_name}[...]); missing "
+                    f"{', '.join(sorted(missing))}"
+                )
+        self.compile()
+        return Schedule(context=self.context, kernel=self, primary=self.func_name)
 
 
 @overload
