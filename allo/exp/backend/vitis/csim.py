@@ -35,8 +35,6 @@ _CSIM_MAKE_VAR_ALIASES = {
     "extra_ldflags": "EXTRA_LDFLAGS",
 }
 
-_CSIM_UNSET: Any = object()
-
 _DTYPE_TO_NP = {
     "float32": np.float32,
     "float64": np.float64,

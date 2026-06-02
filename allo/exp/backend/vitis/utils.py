@@ -163,11 +163,6 @@ def _extract_top_port_names(hls_code: str, top: str) -> list[str]:
     raise RuntimeError(f"Failed to find emitted definition for top function {top}")
 
 
-def _set_if_provided(options: dict[str, Any], name: str, value: object) -> None:
-    if value is not None:
-        options[name] = value
-
-
 def _validate_interface_option_name(name: str) -> None:
     if not _INTERFACE_OPTION_RE.match(name):
         raise ValueError(f"Invalid Vitis HLS interface option name '{name}'")

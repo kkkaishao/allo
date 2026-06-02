@@ -138,8 +138,8 @@ class Backend(ABC, Generic[P, R]):
             }
         )
 
-    def _cache_dir(self) -> Path:
-        return _DEFAULT_CACHE_DIR
+    def _cache_dir(self, *parts: str) -> Path:
+        return _DEFAULT_CACHE_DIR.joinpath(*parts)
 
     def _pcache_get(self, namespace: str, key: str) -> Any | None:
         return _PROCESS_CACHE.get((namespace, key))

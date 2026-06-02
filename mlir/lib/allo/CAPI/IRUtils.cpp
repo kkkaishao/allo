@@ -21,7 +21,5 @@ void alloBlockMergeBefore(MlirBlock src, MlirBlock dst) {
 }
 
 MlirModule alloCloneModuleOp(MlirModule module) {
-  ModuleOp m = unwrap(module);
-  m.clone();
-  return wrap(m);
+  return wrap(unwrap(module).clone());
 }

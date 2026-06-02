@@ -6,12 +6,18 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal, Mapping, Generic, TypeVar, ParamSpec
 
-from ..base import Backend, text_hash, write_json_if_changed, write_text_if_changed
+from ..base import (
+    Backend,
+    lookup_kernel,
+    run_pipeline,
+    text_hash,
+    write_json_if_changed,
+    write_text_if_changed,
+)
 from ..utils import make_project_path
 from .csim import (
     CSIM_MAKEFILE,
     PythonNativeCSimulator,
-    _CSIM_UNSET,
     _generate_csim_makefile,
     _normalize_csim_make_vars,
 )
@@ -28,12 +34,12 @@ from .utils import (
     _log_synth_failure,
     _log_synth_note,
     _normalize_interface_options,
-    _set_if_provided,
     _source_settings_env,
     _synth_log_path,
 )
+from allo._mlir import ir
 from allo._mlir.dialects.allo import emit_vivado_hls
-from ..base import run_pipeline, set_kernel_unit_attr
+from allo._mlir._mlir_libs._allo import ir_ext
 from ...lang.core import BufferType, ShapedType, TypeBase
 from ...lang.kernel import Kernel
 from ...logging import log_warning, run_command, stage, terminate_on_error
@@ -72,6 +78,18 @@ class InterfacePragma:
     options: Mapping[str, str | int | bool | None]
 
 
+def _collect_interface_options(
+    named: Mapping[str, str | int | bool | None],
+    extra: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Merge named interface options (dropping ``None``) with raw keyword options."""
+    options: dict[str, Any] = {
+        name: value for name, value in named.items() if value is not None
+    }
+    options.update(extra)
+    return options
+
+
 PART_NUMBERS = {
     # Embedded and Zynq.
     "ultra96v2": "xczu3eg-sbva484-1-i",
@@ -99,7 +117,7 @@ class Vitis(Backend, Generic[P, R]):
     @terminate_on_error
     def __init__(
         self,
-        kernel: Kernel[P, R] | None = None,
+        kernel: Kernel[P, R],
         vitis_home: str | None = None,
         project_path: str | None = None,
         *,
@@ -117,8 +135,8 @@ class Vitis(Backend, Generic[P, R]):
         self.tool: VitisTool | None = None
         # setup project related settings
         self._project_path = Path(project_path) if project_path else None
-        self._freq_mhz = freq_mhz
-        self._flow: FlowTarget = flow
+        self.freq_mhz = freq_mhz
+        self.flow: FlowTarget = flow
         self._csim_make_vars: dict[str, str] = {}
         self._init_part_and_device(part, device)
         # interface pragmas set by the user
@@ -128,94 +146,35 @@ class Vitis(Backend, Generic[P, R]):
         self.csimulator: PythonNativeCSimulator | None = None
 
     def _init_part_and_device(self, part: str | None, device: str | None) -> None:
-        if part and device:
-            if PART_NUMBERS.get(device) != part:
-                raise ValueError("Cannot specify both part number and device")
-            self._part = part
-            self._device = device
         if part is None and device is None:
             log_warning(
                 "Neither device nor part number is specified for Vitis backend. The backend can be only used for C simulation until the part number is set, which is required for synthesis and implementation."
             )
-            self._part = ""
-            self._device = ""
-        elif device is not None:
-            part = PART_NUMBERS.get(device)
-            if not part:
-                raise ValueError(
-                    f"Unknown device {device}. Please specify part number directly."
-                )
-            self._device = device
-            self._part = part
-        elif part is not None:
-            self._part = part
-            self._device = ""
+            self.part = ""
+            self.device = ""
+            return
+        if device is None:
+            self.part = part
+            self.device = ""
+            return
+        resolved = PART_NUMBERS.get(device)
+        if not resolved:
+            raise ValueError(
+                f"Unknown device {device}. Please specify part number directly."
+            )
+        if part is not None and part != resolved:
+            raise ValueError("Cannot specify both part number and device")
+        self.device = device
+        self.part = resolved
 
     def _require_vitis_tool(self):
         if self.tool is None:
             self.tool = detect_vitis_tool(self._settings64)
 
     @property
-    def part(self) -> str:
-        return self._part
-
-    @part.setter
-    def part(self, part: str) -> None:
-        if not part:
-            raise ValueError("Part number must be non-empty")
-        self._part = part
-        self._device = ""
-
-    @property
-    def device(self) -> str:
-        return self._device
-
-    @device.setter
-    def device(self, device: str) -> None:
-        part = PART_NUMBERS.get(device, "")
-        if not part:
-            raise ValueError(
-                f"Unknown device {device}. Please set part number manually."
-            )
-        self._device = device
-        self._part = part
-
-    @property
-    def freq_mhz(self) -> float:
-        return self._freq_mhz
-
-    @freq_mhz.setter
-    def freq_mhz(self, freq: float) -> None:
-        if freq <= 0:
-            raise ValueError("Frequency must be positive")
-        self._freq_mhz = float(freq)
-
-    @property
-    def flow(self) -> FlowTarget:
-        return self._flow
-
-    @flow.setter
-    def flow(self, flow: FlowTarget) -> None:
-        if flow not in ("vitis", "vivado"):
-            raise ValueError("Flow must be either 'vitis' or 'vivado'")
-        self._flow = flow
-
-    @property
-    def kernel_cpp(self) -> str:
+    def hls_code(self) -> str:
         artifacts = self._ensure_compiled()
         return artifacts.kernel_cpp
-
-    def call_kernel(self, kernel: Kernel, *args: P.args, **kwargs: P.kwargs) -> R:
-        backend = Vitis(
-            kernel,
-            os.fspath(self._vitis_home) if self._vitis_home is not None else None,
-        )
-        backend._csim_make_vars = self._csim_make_vars.copy()
-        backend.tool = self.tool
-        try:
-            return backend.csim(*args, **kwargs)
-        finally:
-            self.tool = backend.tool
 
     @terminate_on_error
     def __call__(self, *args: P.args, **kwargs: P.kwargs) -> R:
@@ -223,49 +182,14 @@ class Vitis(Backend, Generic[P, R]):
             raise RuntimeError("Vitis backend is not bound to a kernel")
         return self.csim(*args, **kwargs)
 
-    def set_csim_override(
-        self,
-        *,
-        vitis_root: str = _CSIM_UNSET,
-        cxx: str = _CSIM_UNSET,
-        gcc_toolchain: str = _CSIM_UNSET,
-        vitis_host_lib: str = _CSIM_UNSET,
-        mathhls_lib: str = _CSIM_UNSET,
-        fpo_lib: str = _CSIM_UNSET,
-        kernel_cpp: str = _CSIM_UNSET,
-        kernel_h: str = _CSIM_UNSET,
-        out: str = _CSIM_UNSET,
-        hls_includes: str = _CSIM_UNSET,
-        hls_defines: str = _CSIM_UNSET,
-        hls_cxxflags: str = _CSIM_UNSET,
-        hls_ldflags: str = _CSIM_UNSET,
-        extra_cxxflags: str = _CSIM_UNSET,
-        extra_ldflags: str = _CSIM_UNSET,
-        **kwargs: str,
-    ):
-        updates: dict[str, str] = {}
-        for key, value in {
-            "vitis_root": vitis_root,
-            "cxx": cxx,
-            "gcc_toolchain": gcc_toolchain,
-            "vitis_host_lib": vitis_host_lib,
-            "mathhls_lib": mathhls_lib,
-            "fpo_lib": fpo_lib,
-            "kernel_cpp": kernel_cpp,
-            "kernel_h": kernel_h,
-            "out": out,
-            "hls_includes": hls_includes,
-            "hls_defines": hls_defines,
-            "hls_cxxflags": hls_cxxflags,
-            "hls_ldflags": hls_ldflags,
-            "extra_cxxflags": extra_cxxflags,
-            "extra_ldflags": extra_ldflags,
-        }.items():
-            if value is not _CSIM_UNSET:
-                updates[key] = value
-        updates.update(kwargs)
+    def set_csim_override(self, **overrides: str | None):
+        """Override C simulation Makefile variables (e.g. ``cxx``, ``hls_cxxflags``).
 
-        for key, value in _normalize_csim_make_vars(updates).items():
+        Keys are matched case-insensitively against the Makefile variables in
+        ``csim.mk`` (``cxx`` -> ``CXX``, ``hls_cxxflags`` -> ``HLS_CXXFLAGS``,
+        ...). Pass ``None`` to drop a previously set override.
+        """
+        for key, value in _normalize_csim_make_vars(overrides).items():
             if value is None:
                 self._csim_make_vars.pop(key, None)
             else:
@@ -305,23 +229,23 @@ class Vitis(Backend, Generic[P, R]):
                 "Vitis m_axi interface can only be set on buffer arguments"
             )
 
-        options: dict[str, Any] = {}
-        for key, value in {
-            "bundle": bundle,
-            "depth": depth,
-            "offset": offset,
-            "channel": channel,
-            "latency": latency,
-            "num_read_outstanding": num_read_outstanding,
-            "num_write_outstanding": num_write_outstanding,
-            "max_read_burst_length": max_read_burst_length,
-            "max_write_burst_length": max_write_burst_length,
-            "max_widen_bitwidth": max_widen_bitwidth,
-            "alignment_byte_size": alignment_byte_size,
-            "name": name,
-        }.items():
-            _set_if_provided(options, key, value)
-        options.update(kwargs)
+        options = _collect_interface_options(
+            {
+                "bundle": bundle,
+                "depth": depth,
+                "offset": offset,
+                "channel": channel,
+                "latency": latency,
+                "num_read_outstanding": num_read_outstanding,
+                "num_write_outstanding": num_write_outstanding,
+                "max_read_burst_length": max_read_burst_length,
+                "max_write_burst_length": max_write_burst_length,
+                "max_widen_bitwidth": max_widen_bitwidth,
+                "alignment_byte_size": alignment_byte_size,
+                "name": name,
+            },
+            kwargs,
+        )
         self._set_interface_pragma(index, "m_axi", options)
 
     def set_axis(
@@ -336,28 +260,24 @@ class Vitis(Backend, Generic[P, R]):
         **kwargs: str | int | bool | None,
     ):
         """
-        Set the indexed argument to be an AXI stream interface with the given options. For details of the options, please refer to [Vitis HLS Interface Pragma](https://docs.amd.com/r/en-US/ug1399-vitis-hls/pragma-HLS-interface)
+        Set the indexed stream argument to be an AXI stream interface with the given options. For details of the options, please refer to [Vitis HLS Interface Pragma](https://docs.amd.com/r/en-US/ug1399-vitis-hls/pragma-HLS-interface)
 
-        The API cannot be used until frontend Stream type support is enabled, which is expected to be available in a future release.
+        In Vitis HLS, AXI stream interfaces can only be applied to ``Stream`` arguments.
         """
-        raise NotImplementedError(
-            "Vitis axis interface is not available until frontend Stream type "
-            "support is enabled."
-        )
         arg_type = self._validate_interface_index(index, allow_return=False)
         if not _is_stream_type(arg_type):
             raise ValueError("Vitis axis interface can only be set on stream arguments")
 
-        options: dict[str, Any] = {}
-        for key, value in {
-            "register": register,
-            "register_mode": register_mode,
-            "depth": depth,
-            "name": name,
-            "bundle": bundle,
-        }.items():
-            _set_if_provided(options, key, value)
-        options.update(kwargs)
+        options = _collect_interface_options(
+            {
+                "register": register,
+                "register_mode": register_mode,
+                "depth": depth,
+                "name": name,
+                "bundle": bundle,
+            },
+            kwargs,
+        )
         self._set_interface_pragma(index, "axis", options)
 
     def set_axilite(
@@ -383,17 +303,17 @@ class Vitis(Backend, Generic[P, R]):
                 "Vitis s_axilite return port does not support the register option"
             )
 
-        options: dict[str, Any] = {}
-        for key, value in {
-            "bundle": bundle,
-            "register": register,
-            "clock": clock,
-            "name": name,
-            "offset": offset,
-            "storage_impl": storage_impl,
-        }.items():
-            _set_if_provided(options, key, value)
-        options.update(kwargs)
+        options = _collect_interface_options(
+            {
+                "bundle": bundle,
+                "register": register,
+                "clock": clock,
+                "name": name,
+                "offset": offset,
+                "storage_impl": storage_impl,
+            },
+            kwargs,
+        )
         self._set_interface_pragma(index, "s_axilite", options)
 
     @terminate_on_error
@@ -423,7 +343,7 @@ class Vitis(Backend, Generic[P, R]):
         project_path, cache_key = self._materialize_csim_cache(exist_ok=exist_ok)
         if not exist_ok:
             self.csimulator = None
-            self._process_cache_pop("vitis.csim", cache_key)
+            self._pcache_pop("vitis.csim", cache_key)
         simulator = self._get_csimulator(project_path, cache_key)
         return simulator.run(*args, exist_ok=exist_ok)
 
@@ -516,6 +436,15 @@ class Vitis(Backend, Generic[P, R]):
     def _invalidate_compiled_artifacts(self) -> None:
         self.artifacts = None
         self.csimulator = None
+
+    def _get_working_module(self) -> ir.Module:
+        """Return a fresh clone of the kernel module for in-place lowering.
+
+        ``compile`` runs the HLS pipeline in place, so each invocation needs an
+        independent copy; ``self.module`` stays pristine and recompilable after
+        interface pragmas invalidate the cached artifacts.
+        """
+        return ir_ext.clone_module(self.module)
 
     @terminate_on_error
     def _validate_interface_index(
@@ -632,7 +561,7 @@ class Vitis(Backend, Generic[P, R]):
     ) -> PythonNativeCSimulator:
         if self.csimulator is not None and self.csimulator.project_path == project_path:
             return self.csimulator
-        cached = self._get_pcache("vitis.csim", cache_key)
+        cached = self._pcache_get("vitis.csim", cache_key)
         if cached:
             self.csimulator = cached
             return cached
@@ -645,7 +574,7 @@ class Vitis(Backend, Generic[P, R]):
             res_types=self.kernel.parse_return_annotation(),
             make_vars=self._csim_make_vars,
         )
-        self._process_cache_set("vitis.csim", cache_key, self.csimulator)
+        self._pcache_set("vitis.csim", cache_key, self.csimulator)
         return self.csimulator
 
     def _invoke_csyn(self, project_path: Path) -> None:
@@ -698,7 +627,7 @@ class Vitis(Backend, Generic[P, R]):
         # because the codegen is typically much faster than sim/synth/impl
         with stage("Compiling Vitis HLS Kernels"):
             module = self._get_working_module()
-            if not set_kernel_unit_attr(module, self.kernel.func_name, "top"):
+            if lookup_kernel(module, self.kernel.func_name) is None:
                 raise RuntimeError(
                     f"Kernel function {self.kernel.func_name} not found in the module"
                 )
