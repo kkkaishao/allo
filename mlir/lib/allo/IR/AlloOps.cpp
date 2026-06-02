@@ -342,20 +342,3 @@ LogicalResult StreamPutOp::verify() {
   }
   return success();
 }
-
-LogicalResult
-GlobalStreamGetOp::verifySymbolUses(SymbolTableCollection &symbolTable) {
-  auto globalStream = symbolTable.lookupNearestSymbolFrom<GlobalStreamCreateOp>(
-      *this, getStreamAttr());
-  if (!globalStream) {
-    return emitOpError() << "referenced global stream '" << getStream()
-                         << "' does not exist";
-  }
-  auto streamTy = globalStream.getStreamType();
-  auto handleTy = cast<StreamType>(getHandle().getType());
-  if (streamTy != handleTy) {
-    return emitOpError() << "result type " << handleTy
-                         << " does not match global stream type " << streamTy;
-  }
-  return success();
-}

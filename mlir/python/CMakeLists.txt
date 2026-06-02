@@ -45,7 +45,7 @@ declare_mlir_dialect_extension_python_bindings(
   SOURCES
     dialects/transform/allo.py
   DIALECT_NAME transform
-  EXTENSION_NAME transform_allo_extension
+  EXTENSION_NAME allo_transform
 )
 
 ################################################################################

@@ -334,21 +334,17 @@ class StreamType(TypeBase):
         base_type: DType | ShapedType,
         depth: int = DEFAULT_STREAM_DEPTH,
         shape: Sequence[int] = (),
-        *,
-        is_global: builtins.bool = False,
     ):
         assert isinstance(base_type, (DType, ShapedType))
         assert isinstance(depth, int) and depth > 0
         shape = tuple(shape)
         assert all(isinstance(dim, int) and dim >= 0 for dim in shape)
-        prefix = "GStream" if is_global else "Stream"
         shape_suffix = "[" + ",".join(str(dim) for dim in shape) + "]" if shape else ""
-        super().__init__(f"{prefix}[{base_type}]{shape_suffix}")
+        super().__init__(f"Stream[{base_type}]{shape_suffix}")
         self.base_type = base_type
         self.depth = depth
         self.shape = shape
         self.rank = len(shape)
-        self.is_global = is_global
 
     def __getitem__(self, key):
         if self.shape:
@@ -356,11 +352,10 @@ class StreamType(TypeBase):
         if not isinstance(key, tuple):
             key = (key,)
         if len(key) == 0:
-            prefix = "GStream" if self.is_global else "Stream"
-            raise TypeError(f"{prefix}[Ty][] is invalid; use {prefix}[Ty] instead")
+            raise TypeError("Stream[Ty][] is invalid; use Stream[Ty] instead")
         if not all(type(dim) is int and dim >= 0 for dim in key):
             raise TypeError("Stream shape dimensions must be non-negative integers")
-        return StreamType(self.base_type, self.depth, key, is_global=self.is_global)
+        return StreamType(self.base_type, self.depth, key)
 
     def materialize(self, context: Context, /) -> Type:
         base = self.base_type.materialize(context)
@@ -368,14 +363,13 @@ class StreamType(TypeBase):
 
 
 class _StreamFactory:
-    def __init__(self, prefix: str, *, is_global: builtins.bool):
+    def __init__(self, prefix: str):
         self.prefix = prefix
-        self.is_global = is_global
 
     def __getitem__(self, base_type):
         if not isinstance(base_type, (DType, ShapedType)):
             raise TypeError(f"{self.prefix} base type must be a scalar or buffer type")
-        return StreamType(base_type, DEFAULT_STREAM_DEPTH, (), is_global=self.is_global)
+        return StreamType(base_type, DEFAULT_STREAM_DEPTH, ())
 
     def __repr__(self) -> str:
         return self.prefix
@@ -383,8 +377,7 @@ class _StreamFactory:
     __str__ = __repr__
 
 
-Stream = _StreamFactory("Stream", is_global=False)
-GStream = _StreamFactory("GStream", is_global=True)
+Stream = _StreamFactory("Stream")
 
 
 # =========================================================================#
@@ -467,40 +460,6 @@ class AlloValue(ValueBase):
     @property
     def is_indexed(self) -> builtins.bool:
         return self.indices is not None
-
-
-class AlloSymbolRef(ValueBase):
-    """Frontend proxy for a global stream symbol, optionally with stream indices."""
-
-    def __init__(
-        self,
-        name: str,
-        type: StreamType,
-        indices: Sequence[AlloValue] | None = None,
-    ):
-        assert isinstance(name, str) and name
-        assert isinstance(type, StreamType)
-        assert type.is_global
-        assert indices is None or all(isinstance(idx, AlloValue) for idx in indices)
-        self.name = name
-        self.type = type
-        self.indices = None if indices is None else tuple(indices)
-        self.shape = [ConstexprValue(s) for s in type.shape]
-        self.rank = type.rank
-
-    @property
-    def is_indexed(self) -> builtins.bool:
-        return self.indices is not None
-
-    def __str__(self) -> str:
-        return f"AlloSymbolRef<{self.type}>(@{self.name})"
-
-    def __repr__(self) -> str:
-        return self.__str__()
-
-    @property
-    def handle(self):
-        return None
 
 
 # map from PyTorch dtype string to Allo DType, for easier interop with PyTorch/NumPy

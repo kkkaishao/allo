@@ -56,12 +56,10 @@ from ..lang.core import (
     unwrap_if_constexpr,
     index,
     bool,
-    AlloSymbolRef,
 )
 from ..lang.operator import Operator, BoundOperator, NO_FOLD
 from ..operators import arith as arith_ops, memory as mem_ops
-from .errors import CompilationError, StaticAssertionError
-from ..logging import log_fatal
+from .errors import CompilationError, StaticAssertionError, InternalCompilerError
 
 
 def generate_function_type(
@@ -69,16 +67,13 @@ def generate_function_type(
 ) -> FunctionType:
     mlir_arg_types = []
     for ty in arg_types:
-        if isinstance(ty, StreamType) and ty.is_global:
-            raise TypeError("GStream is not allowed as a kernel parameter.")
         if isinstance(ty, ConstexprType):
             continue
         mlir_arg_types.append(ty.materialize(context))
     mlir_res_types = []
     for ty in res_types:
         if isinstance(ty, StreamType):
-            prefix = "GStream" if ty.is_global else "Stream"
-            raise TypeError(f"{prefix} is not allowed as a kernel return type.")
+            raise TypeError("Stream is not allowed as a kernel return type.")
         if isinstance(ty, ConstexprType):
             continue
         mlir_res_types.append(ty.materialize(context))
@@ -162,6 +157,10 @@ class NestedKernelSymbol:
     mapping: tuple[int, ...]
 
 
+# Sentinel for "name not found" in the scope-lookup chain.
+_ABSENT = object()
+
+
 class MLIRCodeGenerator(ast.NodeVisitor):
     def __init__(
         self,
@@ -213,11 +212,8 @@ class MLIRCodeGenerator(ast.NodeVisitor):
         self._kernel_call_counter = 0
         self._kernel_base_names: set[str] = set()
         self._entry_function_visited = False
-        self.scf_stack = []  # control flow stack
-        self.curr_func = None
         self.generated_func = None
         self.name_loc_prefix = None
-        self.lookup = self._define_name_lookup()
         self.visiting_consteval_fn = False
         self.visiting_default_args = False
         self.dry_run_loop_analysis = False
@@ -232,62 +228,52 @@ class MLIRCodeGenerator(ast.NodeVisitor):
         "min": arith_ops.min,
     }
 
-    def _define_name_lookup(self):
-        def local_lookup(name: str, absent):
-            val = self.lscope.get(name, absent)
-            if val is not absent:
-                return val
-            val = self.fscope.get(name, absent)
-            if val is not absent:
-                return val
-            return absent
+    def _local_lookup(self, name: str, absent):
+        val = self.lscope.get(name, absent)
+        if val is not absent:
+            return val
+        return self.fscope.get(name, absent)
 
-        def closure_lookup(name: str, absent):
-            val = self.closure_scope.get(name, absent)
-            if val is not absent:
-                return val
-            val = self.fscope.get(name, absent)
-            if val is not absent:
-                return val
-            if name in self.forbidden_closure_scope:
-                captured = self.forbidden_closure_scope[name]
-                captured_ty = (
-                    captured.type
-                    if isinstance(captured, ValueBase)
-                    else type(captured).__name__
-                )
-                return self.compile_error(
-                    f"Invalid closure capture '{name}' in kernel '{self.func_name}'. "
-                    "Only constexpr values, kernels, types, consteval functions, operators, and modules can be captured from outer scope, "
-                    f"but got '{captured_ty}'."
-                )
-            return absent
-
-        def global_lookup(name: str, absent):
-            val = self.gscope.get(name, absent)
-            if self._is_allowed_global_var(name, val, absent):
-                if self._is_python_scalar_const(val):
-                    return ConstexprValue(val)
-                return val
-            return absent
-
-        absent = object()
-
-        def lookup(name: str):
-            for lookup_fn in (
-                local_lookup,
-                closure_lookup,
-                global_lookup,
-                self.builtin_namespace.get,
-            ):
-                val = lookup_fn(name, absent)
-                if val is not absent:
-                    return val
-            return self.compile_error(
-                f"Name '{name}' is not defined in the current scope"
+    def _closure_lookup(self, name: str, absent):
+        val = self.closure_scope.get(name, absent)
+        if val is not absent:
+            return val
+        val = self.fscope.get(name, absent)
+        if val is not absent:
+            return val
+        if name in self.forbidden_closure_scope:
+            captured = self.forbidden_closure_scope[name]
+            captured_ty = (
+                captured.type
+                if isinstance(captured, ValueBase)
+                else type(captured).__name__
             )
+            return self.compile_error(
+                f"Invalid closure capture '{name}' in kernel '{self.func_name}'. "
+                "Only constexpr values, kernels, types, consteval functions, operators, and modules can be captured from outer scope, "
+                f"but got '{captured_ty}'."
+            )
+        return absent
 
-        return lookup
+    def _global_lookup(self, name: str, absent):
+        val = self.gscope.get(name, absent)
+        if self._is_allowed_global_var(name, val, absent):
+            if self._is_python_scalar_const(val):
+                return ConstexprValue(val)
+            return val
+        return absent
+
+    def lookup(self, name: str):
+        for lookup_fn in (
+            self._local_lookup,
+            self._closure_lookup,
+            self._global_lookup,
+            self.builtin_namespace.get,
+        ):
+            val = lookup_fn(name, _ABSENT)
+            if val is not _ABSENT:
+                return val
+        return self.compile_error(f"Name '{name}' is not defined in the current scope")
 
     def _is_global_constexpr(self, name: str):
         marker = object()
@@ -310,7 +296,6 @@ class MLIRCodeGenerator(ast.NodeVisitor):
             or val in (Range, Grid)
             or isinstance(val, TypeBase)
             or isinstance(val, ConstexprValue)
-            or (isinstance(val, AlloSymbolRef) and not val.is_indexed)
             or isinstance(val, ConstevalFunction)
         )
 
@@ -345,7 +330,6 @@ class MLIRCodeGenerator(ast.NodeVisitor):
         # their own NameLocs and have no defining op to retag.
         if isinstance(value, ValueBase):
             if value.handle is None:
-                assert isinstance(value, AlloSymbolRef)
                 return
             handle = value.handle
             if isinstance(handle, OpResult):
@@ -463,7 +447,6 @@ class MLIRCodeGenerator(ast.NodeVisitor):
             ip=self.builder._ip,
             loc=self.builder._loc,
         )
-        self.curr_func = fn_op
         self.generated_func = fn_op
 
         # Build the entry block with NameLoc-tagged arguments so the printed IR
@@ -501,7 +484,6 @@ class MLIRCodeGenerator(ast.NodeVisitor):
         self.visit_compound_stmts(node.body, allow_nested_kernel_def=True)
 
         # restore the function context
-        self.curr_func = None
         if not self.block_terminated:
             if len(self.res_types) > 0:
                 return self.compile_error(
@@ -1075,11 +1057,9 @@ class MLIRCodeGenerator(ast.NodeVisitor):
             else_block = self.builder.create_block(parent_region)
 
             # compute phi arguments
-            self.scf_stack.append(node)
             phi_names, phi_types, then_handles, else_handles = (
                 self._visit_then_else_block(node, then_block, else_block)
             )
-            self.scf_stack.pop()
 
             # create if op
             self.builder.set_insertion_point_and_loc(ip, last_loc)
@@ -1195,7 +1175,6 @@ class MLIRCodeGenerator(ast.NodeVisitor):
                     return self.compile_error(
                         f"Type mismatch between then vs else branches of ternary expression: {then_val.type} vs {else_val.type}."
                     )
-                res_type = then_val.type
             # Case 3: exactly one branch is a constexpr, use the other branch's type as the result type
             res_type = then_val.type if not then_is_constexpr else else_val.type
             if then_is_constexpr:
@@ -1479,21 +1458,11 @@ class MLIRCodeGenerator(ast.NodeVisitor):
         parsed_type = self._parse_annotation(node.annotation, node.target.id)
         if isinstance(parsed_type, StreamType):
             if node.value is not None:
-                prefix = "Global stream" if parsed_type.is_global else "Stream"
                 return self.compile_error(
-                    f"{prefix} '{node.target.id}' must be declared without an initializer."
+                    f"Stream '{node.target.id}' must be declared without an initializer."
                 )
-            if not parsed_type.is_global:
-                self._set_value_with_loc(
-                    node.target.id, self.builder.create_stream(parsed_type)
-                )
-                return
-            symbol_name = (
-                node.target.id if self.is_top else f"{self.func_name}.{node.target.id}"
-            )
-            self._set_value(
-                node.target.id,
-                self.builder.create_global_stream(symbol_name, parsed_type),
+            self._set_value_with_loc(
+                node.target.id, self.builder.create_stream(parsed_type)
             )
             return
 
@@ -1559,12 +1528,6 @@ class MLIRCodeGenerator(ast.NodeVisitor):
             )
         if isinstance(target, ast.Name):
             target = self.visit(target)
-            # reject all symbol references on the rhs, since they are not SSA values and can lead to confusion.
-            # users can still use global symbols, but cannot assign global symbols to other variables.
-            if isinstance(value, AlloSymbolRef):
-                return self.compile_error(
-                    f"Cannot assign global symbol '{value.name}' to a new variable."
-                )
             # the first time we see a variable is considered its definition site, and its type if inferred from the assigned value. subsequent assignments to the same variable must be type-compatible with the first definition.
             if target not in self.lscope:
                 if isinstance(value, ConstexprValue):
@@ -1577,10 +1540,6 @@ class MLIRCodeGenerator(ast.NodeVisitor):
             if isinstance(proxy, ConstexprValue):
                 return self.compile_error(
                     f"Cannot reassign to variable '{target}' defined as a constexpr"
-                )
-            if isinstance(proxy, AlloSymbolRef):
-                return self.compile_error(
-                    f"Cannot reassign to variable '{target}' defined as a global symbol"
                 )
             assert isinstance(proxy, AlloValue)
             if isinstance(value, ConstexprValue):
@@ -1604,11 +1563,9 @@ class MLIRCodeGenerator(ast.NodeVisitor):
         # dry visit
         old_dry_run = self.dry_run_loop_analysis
         self.dry_run_loop_analysis = True
-        self.scf_stack.append(node)
         try:
             self.visit_compound_stmts(node.body)
         finally:
-            self.scf_stack.pop()
             self.dry_run_loop_analysis = old_dry_run
         dry_run_scope = self.lscope.copy()
         # restore insertion point before analyzing dry-run live-outs. Keep the
@@ -1689,9 +1646,7 @@ class MLIRCodeGenerator(ast.NodeVisitor):
                 self._set_value_with_loc(name, proxy)
 
             # visit loop body
-            self.scf_stack.append(node)
             self.visit_compound_stmts(node.body)
-            self.scf_stack.pop()
 
             # create yield
             yield_handles = [
@@ -1772,7 +1727,6 @@ class MLIRCodeGenerator(ast.NodeVisitor):
                 for_op.operation.attributes[schedule_d.SCHEDULE_NAME_ATTR_NAME] = (
                     self.builder.get_string_attr(iterator.name)
                 )
-            self.scf_stack.append(node)
             for_op_body = for_op.body
             self.builder.set_insertion_point_to_start(for_op_body)
             block_handles = [
@@ -1787,7 +1741,6 @@ class MLIRCodeGenerator(ast.NodeVisitor):
                 self._set_value_with_loc(iter_name, proxy)
             # visit loop body
             self.visit_compound_stmts(node.body)
-            self.scf_stack.pop()
             # create yield
             yield_handles = [
                 cast(AlloValue, self.lscope[iter_name]).handle for iter_name in names
@@ -1855,8 +1808,9 @@ class MLIRCodeGenerator(ast.NodeVisitor):
                 node, liveins, ignore=targets
             )
             if len(init_handles) > 0:
-                raise NotImplementedError(
-                    f"Non-trivial loop-carried dependencies are not supported in 'for' loops over 'grid()' at this moment."
+                return self.compile_error(
+                    "Non-trivial loop-carried dependencies are not supported in "
+                    "'for' loops over 'grid()' at this moment."
                 )
             # create parallel op
             par_op = ParallelOp(
@@ -1879,12 +1833,10 @@ class MLIRCodeGenerator(ast.NodeVisitor):
             par_op_body = par_op.region.blocks.append(*([index_ty] * len(lbs)))
             with InsertionPoint(par_op_body):
                 ReduceOp([], 0)
-            self.scf_stack.append(node)
             self.builder.set_insertion_point_to_start(par_op_body)
             # no iter args now, so no block arguments other than induction variables
             # visit loop body
             self.visit_compound_stmts(node.body)
-            self.scf_stack.pop()
 
             ivs = list(par_op_body.arguments)
             for iv, placeholder in zip(ivs, iv_placeholders):
@@ -2100,11 +2052,7 @@ class MLIRCodeGenerator(ast.NodeVisitor):
         else:
             res_types = [self._parse_annotation(node.returns, "return")]
         if any(isinstance(ty, StreamType) for ty in res_types):
-            ty = next(ty for ty in res_types if isinstance(ty, StreamType))
-            prefix = "GStream" if ty.is_global else "Stream"
-            return self.compile_error(
-                f"{prefix} is not allowed as a kernel return type."
-            )
+            return self.compile_error("Stream is not allowed as a kernel return type.")
         return res_types
 
     def _bind_nested_arguments(self, nested: NestedKernelSymbol, args, kws):
@@ -2172,11 +2120,6 @@ class MLIRCodeGenerator(ast.NodeVisitor):
                 arg_types.append(self._infer_nested_arg_type(param.arg, value))
             else:
                 arg_types.append(self._parse_annotation(param.annotation, param.arg))
-        for param, ty in zip(nested.node.args.args, arg_types):
-            if isinstance(ty, StreamType) and ty.is_global:
-                return self.compile_error(
-                    f"GStream is not allowed as nested kernel parameter '{param.arg}'."
-                )
         return arg_types, self._parse_return_types(nested.node)
 
     def _build_nested_capture_scopes(self):
@@ -2188,6 +2131,57 @@ class MLIRCodeGenerator(ast.NodeVisitor):
             else:
                 forbidden_scope[name] = value
         return closure_scope, self.fscope.copy(), forbidden_scope
+
+    def _lower_kernel_invocation(
+        self,
+        key,
+        callee_label,
+        error_src,
+        sub_res_types,
+        call_operands,
+        build_and_visit,
+    ):
+        """Shared plumbing for kernel/nested-kernel calls: emit the callee into the
+        module, build the ``InvokeOp`` and decode its results. ``build_and_visit``
+        owns the per-callee differences (location, source, sub-generator
+        construction and the visited node)."""
+        if self.dry_run_loop_analysis:
+            return self._make_dry_run_call_results(sub_res_types)
+
+        ip, last_loc = self.builder.get_insertion_point_and_loc()
+        sub_generator = None
+        self._active_kernel_calls.append(key)
+        try:
+            self.builder.set_insertion_point_to_end(self.module.body)
+            sub_generator = build_and_visit()
+            if sub_generator.generated_func is None:
+                return self.compile_error(
+                    f"Internal error: failed to materialize kernel '{callee_label}'."
+                )
+        except CompilationError as e:
+            raise CompilationError(
+                e.src if e.src is not None else error_src,
+                f"error when compiling kernel '{callee_label}' called from '{self.func_name}': {e.error_msg}",
+                e.node,
+                file_name=e.file_name,
+                begin_line=e.begin_line,
+            ) from e
+        finally:
+            self._active_kernel_calls.pop()
+            self.builder.src = self.kernel.src
+            self.builder.file_name = self.file_name
+            self.builder.begin_line = self.begin_line
+            self.builder.set_insertion_point_and_loc(ip, last_loc)
+
+        assert sub_generator is not None and sub_generator.generated_func is not None
+        call_op = InvokeOp(
+            [ty.materialize(self.context) for ty in sub_res_types],
+            sub_generator.func_name,
+            call_operands,
+            ip=self.builder._ip,
+            loc=self.builder._loc,
+        )
+        return self._decode_kernel_call_results(call_op, sub_res_types)
 
     def call_nested_kernel(self, nested: NestedKernelSymbol, args, kws):
         key = self._nested_call_key(nested)
@@ -2202,14 +2196,7 @@ class MLIRCodeGenerator(ast.NodeVisitor):
             self._build_nested_capture_scopes()
         )
 
-        if self.dry_run_loop_analysis:
-            return self._make_dry_run_call_results(sub_res_types)
-
-        ip, last_loc = self.builder.get_insertion_point_and_loc()
-        sub_generator = None
-        self._active_kernel_calls.append(key)
-        try:
-            self.builder.set_insertion_point_to_end(self.module.body)
+        def build_and_visit():
             self.builder.set_loc(
                 Location.file(
                     self.file_name,
@@ -2240,34 +2227,16 @@ class MLIRCodeGenerator(ast.NodeVisitor):
             # set the mapping for sub kernels
             sub_generator.mapping = nested.mapping
             sub_generator.visit(nested.node)
-            if sub_generator.generated_func is None:
-                return self.compile_error(
-                    f"Internal error: failed to materialize nested kernel '{nested.name}'."
-                )
-        except CompilationError as e:
-            raise CompilationError(
-                e.src if e.src is not None else self.kernel.src,
-                f"error when compiling kernel '{nested.name}' called from '{self.func_name}': {e.error_msg}",
-                e.node,
-                file_name=e.file_name,
-                begin_line=e.begin_line,
-            ) from e
-        finally:
-            self._active_kernel_calls.pop()
-            self.builder.src = self.kernel.src
-            self.builder.file_name = self.file_name
-            self.builder.begin_line = self.begin_line
-            self.builder.set_insertion_point_and_loc(ip, last_loc)
+            return sub_generator
 
-        assert sub_generator is not None and sub_generator.generated_func is not None
-        call_op = InvokeOp(
-            [ty.materialize(self.context) for ty in sub_res_types],
-            sub_generator.func_name,
+        return self._lower_kernel_invocation(
+            key,
+            nested.name,
+            self.kernel.src,
+            sub_res_types,
             call_operands,
-            ip=self.builder._ip,
-            loc=self.builder._loc,
+            build_and_visit,
         )
-        return self._decode_kernel_call_results(call_op, sub_res_types)
 
     def call_kernel(self, fn: Kernel, args, kws):
         """Lower/call a kernel specialization and decode structured return values."""
@@ -2295,14 +2264,7 @@ class MLIRCodeGenerator(ast.NodeVisitor):
             fn.func_name, bound.arguments.items(), sub_arg_types
         )
 
-        if self.dry_run_loop_analysis:
-            return self._make_dry_run_call_results(sub_res_types)
-
-        ip, last_loc = self.builder.get_insertion_point_and_loc()
-        sub_generator = None
-        self._active_kernel_calls.append(key)
-        try:
-            self.builder.set_insertion_point_to_end(self.module.body)
+        def build_and_visit():
             self.builder.set_loc(
                 Location.file(fn.file_name, fn.begin_line, 1, self.context)
             )
@@ -2324,34 +2286,11 @@ class MLIRCodeGenerator(ast.NodeVisitor):
                 is_top=False,
             )
             sub_generator.visit(fn.parse())
-            if sub_generator.generated_func is None:
-                return self.compile_error(
-                    f"Internal error: failed to materialize callee function for kernel '{fn.func_name}'."
-                )
-        except CompilationError as e:
-            raise CompilationError(
-                e.src if e.src is not None else fn.src,
-                f"error when compiling kernel '{fn.func_name}' called from '{self.func_name}': {e.error_msg}",
-                e.node,
-                file_name=e.file_name,
-                begin_line=e.begin_line,
-            ) from e
-        finally:
-            self._active_kernel_calls.pop()
-            self.builder.src = self.kernel.src
-            self.builder.file_name = self.file_name
-            self.builder.begin_line = self.begin_line
-            self.builder.set_insertion_point_and_loc(ip, last_loc)
+            return sub_generator
 
-        assert sub_generator is not None and sub_generator.generated_func is not None
-        call_op = InvokeOp(
-            [ty.materialize(self.context) for ty in sub_res_types],
-            sub_generator.func_name,
-            call_operands,
-            ip=self.builder._ip,
-            loc=self.builder._loc,
+        return self._lower_kernel_invocation(
+            key, fn.func_name, fn.src, sub_res_types, call_operands, build_and_visit
         )
-        return self._decode_kernel_call_results(call_op, sub_res_types)
 
     def call_operator(self, fn: Operator | BoundOperator, args, kwargs={}):
         if isinstance(fn, BoundOperator):
@@ -2461,8 +2400,6 @@ def compile(
         arg_types = fn.parse_argument_annotations()
     else:
         arg_types = [fn.parse_type_annotation(t) for t in arg_types]
-    if any(isinstance(ty, StreamType) and ty.is_global for ty in arg_types):
-        raise TypeError("GStream is not allowed as a kernel parameter.")
     if len(arg_types) != len(fn.signature.parameters):
         raise ValueError(
             f"The number of provided argument types ({len(arg_types)}) does not match the number of arguments in the kernel signature ({len(fn.signature.parameters)})."
@@ -2472,9 +2409,7 @@ def compile(
     else:
         res_types = [fn.parse_type_annotation(t) for t in res_types]
     if any(isinstance(ty, StreamType) for ty in res_types):
-        ty = next(ty for ty in res_types if isinstance(ty, StreamType))
-        prefix = "GStream" if ty.is_global else "Stream"
-        raise TypeError(f"{prefix} is not allowed as a kernel return type.")
+        raise TypeError("Stream is not allowed as a kernel return type.")
     effective_options = fn.options if options is None else options
 
     try:
@@ -2519,13 +2454,13 @@ def compile(
             try:
                 module.operation.verify()
             except MLIRError as e:
-                log_fatal(
+                raise InternalCompilerError(
                     "Generated MLIR module failed verification. This likely indicates a bug in the compiler. Please report this to the developers with the kernel code that triggered this error.\n"
                     f"\n===Verification Error===\n"
                     f"{e}\n"
                     "\n===Internal MLIR===\n"
                     f"{module}"
-                )
+                ) from e
 
             PassManager.parse("builtin.module(canonicalize,cse)", context).run(
                 module.operation
@@ -2534,7 +2469,7 @@ def compile(
         # transfer the ownership of context to kernel
         fn.context = context
         return _NamedModule(module)
-    except (StaticAssertionError, CompilationError) as exc:
+    except (StaticAssertionError, CompilationError, InternalCompilerError) as exc:
         if show_traceback:
             raise
         else:

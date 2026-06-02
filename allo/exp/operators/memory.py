@@ -9,7 +9,6 @@ from ..lang.core import (
     u1,
     ConstexprValue,
     AlloValue,
-    AlloSymbolRef,
 )
 from ..compiler.builder import AlloOpBuilder
 from .utils import operator_body_unreachable
@@ -45,20 +44,8 @@ def _normalize_stream_indices(
     )
 
 
-def _load_symbol_ref(builder: AlloOpBuilder, symbol: AlloSymbolRef, slices):
-    assert isinstance(symbol.type, StreamType)
-    if symbol.is_indexed:
-        return builder.compile_error(
-            "Cannot index a specific stream, Use get() or put(value) on the specific stream."
-        )
-    indices = _normalize_stream_indices(
-        builder, symbol.type, slices, f"Global stream '{symbol.name}'"
-    )
-    return AlloSymbolRef(symbol.name, symbol.type, indices)
-
-
 def _load_stream_value(builder: AlloOpBuilder, stream: AlloValue, slices):
-    assert isinstance(stream.type, StreamType) and not stream.type.is_global
+    assert isinstance(stream.type, StreamType)
     if stream.is_indexed:
         return builder.compile_error(
             "Cannot index a specific stream, Use get() or put(value) on the specific stream."
@@ -69,17 +56,6 @@ def _load_stream_value(builder: AlloOpBuilder, stream: AlloValue, slices):
     return ref
 
 
-def _store_symbol_ref(builder: AlloOpBuilder, symbol: AlloSymbolRef, slices, value):
-    assert isinstance(symbol.type, StreamType)
-    if symbol.is_indexed:
-        return builder.compile_error(
-            "Cannot assign to a stream reference. Use put(value) on the stream reference."
-        )
-    return builder.compile_error(
-        f"Cannot assign to global stream '{symbol.name}'. Use put(value) on a stream reference instead."
-    )
-
-
 @operator
 def load(lhs, slices):
     operator_body_unreachable()
@@ -87,8 +63,6 @@ def load(lhs, slices):
 
 @load.build
 def _(builder: AlloOpBuilder, lhs, slices: slice | tuple):
-    if isinstance(lhs, AlloSymbolRef):
-        return _load_symbol_ref(builder, lhs, slices)
     if isinstance(lhs, AlloValue) and isinstance(lhs.type, StreamType):
         return _load_stream_value(builder, lhs, slices)
 
@@ -122,8 +96,6 @@ def store(dst, slices, value):
 
 @store.build
 def _(builder: AlloOpBuilder, dst, slices: slice | tuple, value):
-    if isinstance(dst, AlloSymbolRef):
-        return _store_symbol_ref(builder, dst, slices, value)
     if isinstance(dst, AlloValue) and isinstance(dst.type, StreamType):
         return builder.compile_error(
             "Cannot assign to a stream. Use put(value) on the stream reference."

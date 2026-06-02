@@ -320,8 +320,6 @@ class Kernel(Generic[P, R]):
                 )
             return bound
         if isinstance(annotation, TypeBase):
-            if isinstance(annotation, StreamType) and annotation.is_global:
-                raise TypeError(f"Unsupported type annotation: {annotation}")
             return annotation
         if isinstance(annotation, str):
             annotation = annotation.strip()
@@ -402,7 +400,6 @@ class Kernel(Generic[P, R]):
                     f"Parameter '{param.name}' is missing a type annotation. Please provide an explicit type annotation for all parameters."
                 )
             ty = self.parse_type_annotation(annotation, scope=scope)
-            assert not (isinstance(ty, StreamType) and ty.is_global)
             arg_types.append(ty)
         return arg_types
 
@@ -429,7 +426,6 @@ class Kernel(Generic[P, R]):
         else:
             res_types = [self.parse_type_annotation(annotation, scope=scope)]
         for ty in res_types:
-            assert not (isinstance(ty, StreamType) and ty.is_global)
             if isinstance(ty, StreamType):
                 raise TypeError("Stream is not allowed as a kernel return type.")
         return res_types

@@ -25,7 +25,6 @@ from ..lang.core import (
     StreamType,
     ConstexprValue,
     TypeBase,
-    AlloSymbolRef,
 )
 from ..lang.rule import get_type_rules
 
@@ -68,7 +67,6 @@ class AlloOpBuilder:
         self.curr_node: ast.AST | None = None
         self.module: ir.Module | None = None
         self._global_initializer_counter = 0
-        self._global_stream_symbols: set[str] = set()
         # Cached attr for linalg parallel iterator type.
         self._par_iter = ir.Attribute.parse("#linalg.iterator_type<parallel>", context)
 
@@ -262,33 +260,12 @@ class AlloOpBuilder:
     # Stream Creation
     #####################
 
-    def create_global_stream(self, name: str, stream_type: StreamType) -> AlloSymbolRef:
-        assert isinstance(stream_type, StreamType) and stream_type.is_global
-        if name in self._global_stream_symbols:
-            return self.compile_error(f"Global stream '{name}' is already defined")
-        assert self.module is not None
-        ip, loc = self.get_insertion_point_and_loc()
-        self.set_insertion_point_to_end(self.module.body)
-        allo_d.GlobalStreamCreateOp(
-            name, self._materialize(stream_type), ip=self._ip, loc=self._loc
-        )
-        self.set_insertion_point_and_loc(ip, loc)
-        self._global_stream_symbols.add(name)
-        return AlloSymbolRef(name, stream_type)
-
     def create_stream(self, stream_type: StreamType) -> AlloValue:
-        assert isinstance(stream_type, StreamType) and not stream_type.is_global
+        assert isinstance(stream_type, StreamType)
         op = allo_d.StreamCreateOp(
             self._materialize(stream_type), ip=self._ip, loc=self._loc
         )
         return AlloValue(op.result, stream_type)
-
-    def get_global_stream_handle(self, symbol: AlloSymbolRef) -> ir.Value:
-        assert isinstance(symbol.type, StreamType)
-        op = allo_d.GlobalStreamGetOp(
-            self._materialize(symbol.type), symbol.name, ip=self._ip, loc=self._loc
-        )
-        return op.result
 
     #####################
     # Type Casting
@@ -951,12 +928,9 @@ class AlloOpBuilder:
         assert False, f"Unsupported shaped type: {buffer.type}"
 
     def _stream_handle_and_indices(self, stream):
-        assert isinstance(stream, (AlloSymbolRef, AlloValue))
+        assert isinstance(stream, AlloValue)
         assert isinstance(stream.type, StreamType)
         assert stream.indices is not None
-        if isinstance(stream, AlloSymbolRef):
-            return self.get_global_stream_handle(stream), stream.type, stream.indices
-        assert not stream.type.is_global
         return stream.handle, stream.type, stream.indices
 
     def create_stream_get(self, stream) -> AlloValue:

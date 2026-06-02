@@ -460,8 +460,7 @@ struct LowerDataflowPass
                  InvokeLowering>(converter, ctx);
 
     ConversionTarget target(*ctx);
-    target.addIllegalOp<StreamCreateOp, StreamPutOp, StreamGetOp,
-                        GlobalStreamCreateOp, GlobalStreamGetOp>();
+    target.addIllegalOp<StreamCreateOp, StreamPutOp, StreamGetOp>();
     target.addDynamicallyLegalOp<KernelOp>([&](KernelOp op) {
       return converter.isSignatureLegal(op.getFunctionType()) &&
              converter.isLegal(&op.getBody());

@@ -108,6 +108,13 @@ class StaticAssertionError(CompilationError):
     pass
 
 
+class InternalCompilerError(AlloError):
+    """Raised when the compiler produces invalid IR or hits an inconsistent
+    internal state. Signals a compiler bug, not a user error, so it is kept
+    distinct from ``CompilationError`` and carries a detailed diagnostic
+    message (typically including an IR dump)."""
+
+
 @dataclass(frozen=True)
 class DiagnosticLocation:
     file_name: str

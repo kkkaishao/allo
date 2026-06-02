@@ -2,7 +2,6 @@ from .utils import operator_body_unreachable
 from ..lang.core import (
     AlloValue,
     ConstexprValue,
-    AlloSymbolRef,
     StreamType,
     index,
 )
@@ -54,16 +53,7 @@ def _(builder: AlloOpBuilder, axis: ConstexprValue):
 
 
 def _materialize_stream(builder: AlloOpBuilder, stream):
-    if isinstance(stream, AlloSymbolRef):
-        if stream.is_indexed:
-            return stream
-        if stream.type.rank != 0:
-            return builder.compile_error(
-                f"Global stream '{stream.name}' has rank {stream.type.rank}; index it before calling get/put."
-            )
-        return AlloSymbolRef(stream.name, stream.type, ())
     if isinstance(stream, AlloValue) and isinstance(stream.type, StreamType):
-        assert not stream.type.is_global
         if stream.is_indexed:
             return stream
         if stream.type.rank != 0:
@@ -79,7 +69,7 @@ def _materialize_stream(builder: AlloOpBuilder, stream):
     )
 
 
-@operator(cls=(AlloSymbolRef, AlloValue))
+@operator(cls=AlloValue)
 def get(stream):
     operator_body_unreachable()
 
@@ -90,7 +80,7 @@ def _(builder: AlloOpBuilder, stream):
     return builder.create_stream_get(stream)
 
 
-@operator(cls=(AlloSymbolRef, AlloValue))
+@operator(cls=AlloValue)
 def put(stream, value):
     operator_body_unreachable()
 

@@ -251,31 +251,4 @@ def StreamCreateOp : Allo_Op<"stream.create", [MemoryEffects<[MemAlloc]>]> {
   }];
 }
 
-def GlobalStreamGetOp : Allo_Op<"stream.get_global", [
-  Pure,
-  DeclareOpInterfaceMethods<SymbolUserOpInterface>]> {
-  let summary = "get a local handle to a global stream";
-  let description = [{
-    This operation retrieves a local SSA handle to a global stream symbol.
-  }];
-  let arguments = (ins FlatSymbolRefAttr:$stream);
-  let results = (outs Stream:$handle);
-  let assemblyFormat = [{
-    $stream attr-dict `:` qualified(type($handle))
-  }];
-}
-
-def GlobalStreamCreateOp : Allo_Op<"stream.global", [
-  Symbol]> {
-  let summary = "create a global stream";
-  let description = [{
-    This operation creates a new global stream.
-  }];
-  let arguments = (ins SymbolNameAttr:$sym_name, TypeAttrOf<Stream>:$streamType);
-  let results = (outs);
-  let assemblyFormat = [{
-    $sym_name attr-dict `:` $streamType
-  }];
-}
-
 #endif // ALLO_OPS
