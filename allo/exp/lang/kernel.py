@@ -16,6 +16,9 @@ from ..lang.core import (
     DType,
     ShapedType,
     StreamType,
+    Stream,
+    ShapeExpr,
+    StreamExpr,
     DEFAULT_STREAM_DEPTH,
     unwrap_if_constexpr,
 )
@@ -27,121 +30,6 @@ from ..logging import log_fatal
 P = ParamSpec("P")
 R = TypeVar("R")
 T = TypeVar("T")
-
-
-def _eval_shape_dim(node: ast.AST, scope: dict[str, object]) -> int:
-    if isinstance(node, ast.Constant):
-        value = node.value
-    elif isinstance(node, ast.Name):
-        if node.id not in scope:
-            raise TypeError(f"Unknown shape variable '{node.id}'")
-        value = unwrap_if_constexpr(scope[node.id])
-    elif isinstance(node, ast.UnaryOp):
-        value = _eval_shape_dim(node.operand, scope)
-        if isinstance(node.op, ast.UAdd):
-            return value
-        if isinstance(node.op, ast.USub):
-            return -value
-        raise TypeError(f"Unsupported shape expression: {ast.unparse(node)}")
-    elif isinstance(node, ast.BinOp):
-        lhs = _eval_shape_dim(node.left, scope)
-        rhs = _eval_shape_dim(node.right, scope)
-        if isinstance(node.op, ast.Add):
-            return lhs + rhs
-        if isinstance(node.op, ast.Sub):
-            return lhs - rhs
-        if isinstance(node.op, ast.Mult):
-            return lhs * rhs
-        if isinstance(node.op, ast.FloorDiv):
-            return lhs // rhs
-        raise TypeError(f"Unsupported shape expression: {ast.unparse(node)}")
-    else:
-        raise TypeError(f"Unsupported shape expression: {ast.unparse(node)}")
-
-    if type(value) is not int:
-        raise TypeError(f"Shape expression '{ast.unparse(node)}' must be constexpr int")
-    return value
-
-
-def _parse_shape_dims(content: str, scope: dict[str, object]) -> list[int]:
-    raw = content.strip()
-    if raw == "":
-        return []
-    expr = ast.parse(raw, mode="eval").body
-    dim_exprs = expr.elts if isinstance(expr, ast.Tuple) else [expr]
-    dims = [_eval_shape_dim(dim, scope) for dim in dim_exprs]
-    if any(dim < 0 for dim in dims):
-        raise TypeError(f"Shape dimensions must be non-negative: [{content}]")
-    return dims
-
-
-def _split_annotation_groups(annotation: str) -> tuple[str, list[str]]:
-    text = annotation.strip()
-    match = re.match(r"[A-Za-z_]\w*", text)
-    if match is None:
-        raise TypeError(f"Unsupported type annotation: {annotation}")
-    head = match.group(0)
-    i = match.end()
-    groups = []
-    while i < len(text):
-        while i < len(text) and text[i].isspace():
-            i += 1
-        if i >= len(text):
-            break
-        if text[i] != "[":
-            raise TypeError(f"Unsupported type annotation: {annotation}")
-        start = i + 1
-        depth = 0
-        while i < len(text):
-            ch = text[i]
-            if ch == "[":
-                depth += 1
-            elif ch == "]":
-                depth -= 1
-                if depth == 0:
-                    groups.append(text[start:i].strip())
-                    i += 1
-                    break
-                if depth < 0:
-                    raise TypeError(f"Unsupported type annotation: {annotation}")
-            i += 1
-        if depth != 0:
-            raise TypeError(f"Unsupported type annotation: {annotation}")
-    return head, groups
-
-
-def _split_tuple_annotation(annotation: str) -> list[str] | None:
-    text = annotation.strip()
-    if not text.startswith("(") or not text.endswith(")"):
-        return None
-
-    inner = text[1:-1].strip()
-    if inner == "":
-        return []
-
-    parts = []
-    start = 0
-    bracket_depth = 0
-    paren_depth = 0
-    for i, ch in enumerate(inner):
-        if ch == "[":
-            bracket_depth += 1
-        elif ch == "]":
-            bracket_depth -= 1
-        elif ch == "(":
-            paren_depth += 1
-        elif ch == ")":
-            paren_depth -= 1
-        elif ch == "," and bracket_depth == 0 and paren_depth == 0:
-            part = inner[start:i].strip()
-            if part:
-                parts.append(part)
-            start = i + 1
-
-    part = inner[start:].strip()
-    if part:
-        parts.append(part)
-    return parts if parts else None
 
 
 @dataclass
@@ -308,86 +196,102 @@ class Kernel(Generic[P, R]):
         if scope is None:
             scope = self.get_capture_scope()
         annotation = unwrap_if_constexpr(annotation)
+        # Quoted or `from __future__ import annotations` annotations arrive as
+        # source text; evaluate them into the same descriptors that unquoted
+        # annotations (e.g. `i32[4]`, `Stream[i32][2,2]`) produce.
+        if isinstance(annotation, str):
+            annotation = unwrap_if_constexpr(self._eval_annotation(annotation, scope))
         if annotation is constexpr:
             return constexpr
         if isinstance(annotation, Template):
-            if annotation.name not in scope:
-                raise TypeError(f"Template '{annotation.name}' is not bound")
-            bound = unwrap_if_constexpr(scope[annotation.name])
-            if not isinstance(bound, TypeBase):
-                raise TypeError(
-                    f"Template '{annotation.name}' must bind to a type in type annotations"
-                )
-            return bound
+            return self._resolve_template_type(annotation, scope)
+        if isinstance(annotation, ShapeExpr):
+            return self._resolve_shape_expr(annotation, scope)
+        if isinstance(annotation, StreamExpr):
+            return self._resolve_stream_expr(annotation, scope)
         if isinstance(annotation, TypeBase):
             return annotation
-        if isinstance(annotation, str):
-            annotation = annotation.strip()
-            # Case 1: direct type name, e.g. "int32"
-            primitive_type = unwrap_if_constexpr(scope.get(annotation, None))
-            if primitive_type is not None and isinstance(primitive_type, TypeBase):
-                return primitive_type
-            head, groups = _split_annotation_groups(annotation)
-            if head == "Stream":
-                return self._parse_stream_annotation(annotation, groups, scope)
-            if head in scope:
-                # Case 2: shaped type, e.g. "int32[4, 8]"
-                head_value = unwrap_if_constexpr(scope[head])
-                if isinstance(head_value, DType) and len(groups) == 1:
-                    dtype = head_value
-                    shape = _parse_shape_dims(groups[0], scope)
-                    if self.options.enable_tensor:
-                        return TensorType(dtype=dtype, shape=shape)
-                    return BufferType(dtype=dtype, shape=shape)
-        raise TypeError(f"Unsupported type annotation: {annotation}")
+        raise TypeError(f"Unsupported type annotation: {annotation!r}")
 
-    def _parse_stream_base_type(
-        self, annotation: str, scope: dict[str, object], prefix: str
-    ) -> DType | ShapedType:
-        annotation = annotation.strip()
-        if not annotation:
-            raise TypeError(f"{prefix} base type cannot be empty")
-
-        scoped = unwrap_if_constexpr(scope.get(annotation, None))
-        if isinstance(scoped, (DType, ShapedType)):
-            return scoped
-
-        head, groups = _split_annotation_groups(annotation)
-        if head not in scope:
-            raise TypeError(f"Unknown {prefix} base type '{head}'")
-
-        head_value = unwrap_if_constexpr(scope[head])
-        if isinstance(head_value, DType) and len(groups) == 0:
-            return head_value
-        if isinstance(head_value, DType) and len(groups) == 1:
-            return BufferType(
-                dtype=head_value, shape=_parse_shape_dims(groups[0], scope)
-            )
-        if isinstance(head_value, ShapedType) and len(groups) == 0:
-            return head_value
-
-        raise TypeError(
-            f"{prefix} base type must be a scalar or buffer type, got '{annotation}'"
+    def _eval_annotation(self, text: str, scope: dict[str, object]) -> object:
+        # `dtype[]` (rank-0) is spelled `dtype[()]` as a Python expression.
+        text = re.sub(r"\[\s*\]", "[()]", text.strip())
+        # `Stream` and `constexpr` are annotation builtins available without an
+        # import; a name in the user's scope shadows them.
+        eval_scope = {"Stream": Stream, "constexpr": constexpr}
+        eval_scope.update(
+            {name: unwrap_if_constexpr(value) for name, value in scope.items()}
         )
+        try:
+            return eval(text, {"__builtins__": {}}, eval_scope)
+        except Exception as e:
+            raise TypeError(f"Unsupported type annotation '{text}': {e}") from e
 
-    def _parse_stream_annotation(
-        self,
-        annotation: str,
-        groups: list[str],
-        scope: dict[str, object],
+    def _resolve_template_type(
+        self, template: Template, scope: dict[str, object]
+    ) -> TypeBase:
+        if template.name not in scope:
+            raise TypeError(f"Template '{template.name}' is not bound")
+        bound = unwrap_if_constexpr(scope[template.name])
+        if not isinstance(bound, TypeBase):
+            raise TypeError(
+                f"Template '{template.name}' must bind to a type in type annotations"
+            )
+        return bound
+
+    def _resolve_dtype(self, dtype: object, scope: dict[str, object]) -> DType:
+        if isinstance(dtype, Template):
+            dtype = self._resolve_template_type(dtype, scope)
+        if not isinstance(dtype, DType):
+            raise TypeError(f"Expected a scalar dtype, got {dtype!r}")
+        return dtype
+
+    def _resolve_shape(self, shape: Sequence, scope: dict[str, object]) -> list[int]:
+        dims = []
+        for dim in shape:
+            dim = unwrap_if_constexpr(dim)
+            if isinstance(dim, Template):
+                if dim.name not in scope:
+                    raise TypeError(f"Template '{dim.name}' is not bound")
+                dim = unwrap_if_constexpr(scope[dim.name])
+            if type(dim) is not int:
+                raise TypeError(f"Shape dimension must be a constexpr int, got {dim!r}")
+            if dim < 0:
+                raise TypeError(f"Shape dimensions must be non-negative, got {dim}")
+            dims.append(dim)
+        return dims
+
+    def _resolve_shape_expr(
+        self, expr: ShapeExpr, scope: dict[str, object]
+    ) -> ShapedType:
+        dtype = self._resolve_dtype(expr.dtype, scope)
+        shape = self._resolve_shape(expr.shape, scope)
+        if self.options.enable_tensor:
+            return TensorType(shape=shape, dtype=dtype)
+        return BufferType(shape=shape, dtype=dtype)
+
+    def _resolve_stream_expr(
+        self, expr: StreamExpr, scope: dict[str, object]
     ) -> StreamType:
-        if len(groups) == 1:
-            shape = []
-        elif len(groups) == 2:
-            if groups[1].strip() == "":
-                raise TypeError("Stream[Ty][] is invalid; use Stream[Ty] instead")
-            shape = _parse_shape_dims(groups[1], scope)
+        base = unwrap_if_constexpr(expr.base)
+        if isinstance(base, ShapeExpr):
+            # A stream's transmission unit is always a buffer, never a tensor.
+            base_type: DType | ShapedType = BufferType(
+                shape=self._resolve_shape(base.shape, scope),
+                dtype=self._resolve_dtype(base.dtype, scope),
+            )
+        elif isinstance(base, Template):
+            resolved = self._resolve_template_type(base, scope)
+            if not isinstance(resolved, (DType, ShapedType)):
+                raise TypeError("Stream base type must be a scalar or buffer type")
+            base_type = resolved
+        elif isinstance(base, (DType, ShapedType)):
+            base_type = base
         else:
             raise TypeError(
-                f"Unsupported Stream annotation '{annotation}', expected Stream[Ty] or Stream[Ty][shape]"
+                f"Stream base type must be a scalar or buffer type, got {base!r}"
             )
-
-        base_type = self._parse_stream_base_type(groups[0], scope, "Stream")
+        shape = self._resolve_shape(expr.shape, scope)
         return StreamType(base_type, DEFAULT_STREAM_DEPTH, shape)
 
     def parse_argument_annotations(self) -> list[TypeBase]:
@@ -408,20 +312,16 @@ class Kernel(Generic[P, R]):
         annotation = unwrap_if_constexpr(annotation)
         if annotation is inspect.Signature.empty or annotation is None:
             return []
-        if isinstance(annotation, str) and annotation.strip() == "None":
-            return []
         scope = self.get_capture_scope()
+        # A tuple return (`-> (i32, f32)`) is a real tuple when unquoted, and
+        # evaluates to one when quoted; `None`/`"None"` means a void kernel.
+        if isinstance(annotation, str):
+            annotation = unwrap_if_constexpr(self._eval_annotation(annotation, scope))
+            if annotation is None:
+                return []
         if isinstance(annotation, tuple):
             res_types = [
                 self.parse_type_annotation(elt, scope=scope) for elt in annotation
-            ]
-        elif (
-            isinstance(annotation, str)
-            and (tuple_annotations := _split_tuple_annotation(annotation)) is not None
-        ):
-            res_types = [
-                self.parse_type_annotation(elt, scope=scope)
-                for elt in tuple_annotations
             ]
         else:
             res_types = [self.parse_type_annotation(annotation, scope=scope)]

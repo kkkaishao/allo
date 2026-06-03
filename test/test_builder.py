@@ -81,7 +81,7 @@ def test_error_diagnostic_source():
 
 def test_scalar_int_add():
     @kernel
-    def top(x: i32, y: i32, out: "i32[1]"):
+    def top(x: i32, y: i32, out: i32[1]):
         out[0] = x + y
 
     ir = _compile_ir(top)
@@ -96,7 +96,7 @@ def test_scalar_int_add():
 
 def test_hls_nary_add_sub():
     @kernel
-    def top(x: i32, y: i32, z: i32, out: "i32[1]"):
+    def top(x: i32, y: i32, z: i32, out: i32[1]):
         out[0] = x + y - z
 
     ir = _compile_ir(top)
@@ -112,7 +112,7 @@ def test_hls_nary_add_sub():
 
 def test_hls_nary_mul():
     @kernel
-    def top(x: i32, y: i32, z: i32, out: "i32[1]"):
+    def top(x: i32, y: i32, z: i32, out: i32[1]):
         out[0] = x * y * z
 
     ir = _compile_ir(top)
@@ -126,7 +126,7 @@ def test_hls_nary_mul():
 
 def test_mixed_int_float_add():
     @kernel
-    def top(x: i32, y: f32, out: "f32[1]"):
+    def top(x: i32, y: f32, out: f32[1]):
         out[0] = x + y
 
     ir = _compile_ir(top)
@@ -140,7 +140,7 @@ def test_mixed_int_float_add():
 
 def test_float_add():
     @kernel
-    def top(x: f32, y: f32, out: "f32[1]"):
+    def top(x: f32, y: f32, out: f32[1]):
         out[0] = x + y
 
     ir = _compile_ir(top)
@@ -149,7 +149,7 @@ def test_float_add():
 
 def test_unary_neg():
     @kernel
-    def top(x: i32, out: "i32[1]"):
+    def top(x: i32, out: i32[1]):
         out[0] = -x
 
     ir = _compile_ir(top)
@@ -164,7 +164,7 @@ def test_unary_neg():
 
 def test_bitwise_xor():
     @kernel
-    def top(x: u32, y: u32, out: "u32[1]"):
+    def top(x: u32, y: u32, out: u32[1]):
         out[0] = x ^ y
 
     ir = _compile_ir(top)
@@ -173,7 +173,7 @@ def test_bitwise_xor():
 
 def test_shift_by_range_index():
     @kernel
-    def top(x: i32, out: "i32[4]"):
+    def top(x: i32, out: i32[4]):
         for i in range(4):
             out[i] = x >> (i * 2)
 
@@ -187,7 +187,7 @@ def test_shift_by_range_index():
 
 def test_comparison_lt():
     @kernel
-    def top(x: i32, y: i32, out: "u1[1]"):
+    def top(x: i32, y: i32, out: u1[1]):
         out[0] = x < y
 
     ir = _compile_ir(top)
@@ -200,7 +200,7 @@ def test_comparison_lt():
 
 def test_bool_and_not():
     @kernel
-    def top(x: allo_bool, y: allo_bool, out: "u1[1]"):
+    def top(x: allo_bool, y: allo_bool, out: u1[1]):
         out[0] = x and not y
 
     ir = _compile_ir(top)
@@ -215,7 +215,7 @@ def test_bool_and_not():
 
 def test_if_statement_phi():
     @kernel
-    def top(cond: allo_bool, x: i32, y: i32, out: "i32[1]"):
+    def top(cond: allo_bool, x: i32, y: i32, out: i32[1]):
         v = x
         if cond:
             v = y
@@ -234,16 +234,16 @@ def test_if_statement_phi():
 
 def test_if_branch_local_buffers():
     @kernel
-    def top(out: "i32[8]"):
+    def top(out: i32[8]):
         for r in range(2):
             r_i32: i32 = r
             if r_i32 == 0:
-                then_buf: "i32[4]"
+                then_buf: i32[4]
                 for j in range(4):
                     then_buf[j] = j
                     out[j] = then_buf[j]
             else:
-                else_buf: "i32[4]"
+                else_buf: i32[4]
                 for j in range(4):
                     else_buf[j] = j + 1
                     out[j + 4] = else_buf[j]
@@ -259,7 +259,7 @@ def test_if_branch_local_buffers():
 
 def test_if_branch_local_loop_carried_value():
     @kernel
-    def top(cond: allo_bool, x: i32, out: "i32[1]"):
+    def top(cond: allo_bool, x: i32, out: i32[1]):
         if cond:
             out[0] = x
         else:
@@ -274,7 +274,7 @@ def test_if_branch_local_loop_carried_value():
 
 def test_ternary_expression():
     @kernel
-    def top(cond: allo_bool, x: i32, y: i32, out: "i32[1]"):
+    def top(cond: allo_bool, x: i32, y: i32, out: i32[1]):
         out[0] = x if cond else y
 
     ir = _compile_ir(top)
@@ -283,7 +283,7 @@ def test_ternary_expression():
 
 def test_memref_load_store():
     @kernel
-    def top(inp: "i32[4]", out: "i32[1]"):
+    def top(inp: i32[4], out: i32[1]):
         out[0] = inp[0]
 
     ir = _compile_ir(top)
@@ -298,7 +298,7 @@ def test_memref_load_store():
 
 def test_range_loop_store():
     @kernel
-    def top(out: "i32[4]"):
+    def top(out: i32[4]):
         for i in allo_range(4):
             out[i] = i
 
@@ -314,7 +314,7 @@ def test_range_loop_store():
 
 def test_index_runtime_arithmetic():
     @kernel
-    def top(stride: i32, out: "i32[8]"):
+    def top(stride: i32, out: i32[8]):
         offset: i32 = 2
         for i in range(4):
             out[offset + stride * i] = i
@@ -330,7 +330,7 @@ def test_index_runtime_arithmetic():
 
 def test_builtin_range_loop_store():
     @kernel
-    def top(out: "i32[4]"):
+    def top(out: i32[4]):
         for i in range(4):
             out[i] = i
 
@@ -344,7 +344,7 @@ def test_builtin_range_loop_store():
 
 def test_grid_loop_store():
     @kernel
-    def top(out: "i32[2, 2]"):
+    def top(out: i32[2, 2]):
         for i, j in allo_grid(2, 2):
             out[i, j] = i + j
 
@@ -361,7 +361,7 @@ def test_grid_loop_store():
 
 def test_direct_operator_invoke():
     @kernel
-    def top(x: i32, y: i32, out: "i32[1]"):
+    def top(x: i32, y: i32, out: i32[1]):
         out[0] = allo_max(x, y)
 
     ir = _compile_ir(top)
@@ -370,7 +370,7 @@ def test_direct_operator_invoke():
 
 def test_builtin_max_min():
     @kernel
-    def top(x: i32, y: i32, out: "i32[2]"):
+    def top(x: i32, y: i32, out: i32[2]):
         out[0] = max(x, y)
         out[1] = min(x, y)
 
@@ -384,7 +384,7 @@ def test_builtin_max_min():
 
 def test_global_scalar_constexpr():
     @kernel
-    def top(x: i32, y: f32, out: "f32[2]"):
+    def top(x: i32, y: f32, out: f32[2]):
         out[0] = x + _GLOBAL_INT_CONST
         out[1] = y + _GLOBAL_FLOAT_CONST
 
@@ -401,8 +401,8 @@ def test_global_scalar_constexpr():
 def test_global_shape_annotation():
     @kernel
     def top(
-        inp: "i32[_GLOBAL_SHAPE_M * _GLOBAL_SHAPE_N]",
-        out: "i32[_GLOBAL_SHAPE_M, _GLOBAL_SHAPE_N]",
+        inp: i32[_GLOBAL_SHAPE_M * _GLOBAL_SHAPE_N],
+        out: i32[_GLOBAL_SHAPE_M, _GLOBAL_SHAPE_N],
     ):
         for i in range(_GLOBAL_SHAPE_M):
             for j in range(_GLOBAL_SHAPE_N):
@@ -422,7 +422,7 @@ def test_scope_shape_annotation():
     cols = 2
 
     @kernel
-    def top(out: "i32[rows, cols]"):
+    def top(out: i32[rows, cols]):
         for i, j in allo_grid(2, 2):
             out[i, j] = i + j
 
@@ -439,7 +439,7 @@ def test_template_signature_shape():
     N = Template("N")
 
     @kernel(T, N)
-    def top(x: T, out: "T[N]"):
+    def top(x: T, out: T[N]):
         tmp: T = x
         for i in range(N):
             out[i] = tmp
@@ -461,7 +461,7 @@ def test_template_helper_specialization():
         return x
 
     @kernel(T)
-    def top(x: T, out: "T[1]"):
+    def top(x: T, out: T[1]):
         out[0] = worker[T](x)
 
     ir = _compile_ir(top[i32])
@@ -477,7 +477,7 @@ def test_template_specialization_object():
     T = Template("T")
 
     @kernel(T)
-    def top(x: T, out: "T[1]"):
+    def top(x: T, out: T[1]):
         out[0] = x
 
     specialized = top[f32]
@@ -487,9 +487,9 @@ def test_template_specialization_object():
 
 def test_local_memref_declaration():
     @kernel
-    def top(out: "i32[4]"):
+    def top(out: i32[4]):
         N: constexpr = 4
-        buf: "i32[N]"
+        buf: i32[N]
         for i in range(N):
             buf[i] = i
             out[i] = buf[i]
@@ -505,9 +505,9 @@ def test_local_memref_declaration():
 
 def test_local_tensor_declaration():
     @kernel(options=KernelOptions(enable_tensor=True))
-    def top() -> "f32[4]":
+    def top() -> f32[4]:
         N: constexpr = 4
-        buf: "f32[N]"
+        buf: f32[N]
         return buf
 
     ir = _compile_ir(top)
@@ -516,9 +516,9 @@ def test_local_tensor_declaration():
 
 def test_memref_list_initializer():
     @kernel
-    def top(out: "i32[2,2]"):
+    def top(out: i32[2, 2]):
         scale: constexpr = _GLOBAL_INT_CONST
-        buf: "i32[2,2]" = [[1, scale], [scale + 1, scale + 2]]
+        buf: i32[2, 2] = [[1, scale], [scale + 1, scale + 2]]
         for i, j in allo_grid(2, 2):
             out[i, j] = buf[i, j]
 
@@ -534,8 +534,8 @@ def test_memref_list_initializer():
 
 def test_tensor_list_initializer():
     @kernel(options=KernelOptions(enable_tensor=True))
-    def top() -> "i32[2,2]":
-        buf: "i32[2,2]" = [[1, 2], [3, 4]]
+    def top() -> i32[2, 2]:
+        buf: i32[2, 2] = [[1, 2], [3, 4]]
         return buf
 
     ir = _compile_ir(top)
@@ -544,8 +544,8 @@ def test_tensor_list_initializer():
 
 def test_stream_scalar_ir():
     @kernel
-    def top(x: i32, out: "i32[1]"):
-        fifo: "Stream[i32][2,2]"
+    def top(x: i32, out: i32[1]):
+        fifo: Stream[i32][2, 2]
         fifo[0, 1].put(x)
         out[0] = fifo[0, 1].get()
 
@@ -560,11 +560,11 @@ def test_stream_scalar_ir():
 
 def test_stream_nested_parameter_ir():
     @kernel
-    def top(x: i32, out: "i32[1]"):
-        fifo: "Stream[i32][2,2]"
+    def top(x: i32, out: i32[1]):
+        fifo: Stream[i32][2, 2]
 
         @kernel
-        def worker(s: "Stream[i32][2,2]", v: i32):
+        def worker(s: Stream[i32][2, 2], v: i32):
             s[0, 1].put(v)
 
         worker(fifo, x)
@@ -584,11 +584,11 @@ def test_stream_nested_parameter_ir():
 
 def test_nested_kernel_mapping_ir():
     @kernel
-    def top(out: "i32[1]"):
+    def top(out: i32[1]):
         workers: constexpr = 2
 
         @kernel(mapping=[workers])
-        def worker(buf: "i32[1]"):
+        def worker(buf: i32[1]):
             buf[0] = 1
 
         worker(out)
@@ -623,7 +623,7 @@ def test_bound_method_compile_errors():
 
 def test_for_loop_carried_values():
     @kernel
-    def top(out: "i32[1]"):
+    def top(out: i32[1]):
         acc: i32 = 0
         for i in range(4):
             i_i32: i32 = i
@@ -636,7 +636,7 @@ def test_for_loop_carried_values():
 
 def test_while_loop_carried_values():
     @kernel
-    def top(out: "i32[1]"):
+    def top(out: i32[1]):
         i: i32 = 0
         acc: i32 = 0
         while i < 4:
@@ -654,7 +654,7 @@ def test_consteval_expression():
         return 3
 
     @kernel
-    def top(x: i32, out: "i32[1]"):
+    def top(x: i32, out: i32[1]):
         out[0] = x + factor()
 
     ir = _compile_ir(top)
@@ -669,7 +669,7 @@ def test_consteval_expression():
 
 def test_nested_invoke_store():
     @kernel
-    def top(x: i32, out: "i32[1]"):
+    def top(x: i32, out: i32[1]):
         @kernel
         def worker(v: i32) -> i32:
             return v + 1
@@ -682,7 +682,7 @@ def test_nested_invoke_store():
 
 def test_nested_multiple_returns():
     @kernel
-    def top(x: i32, y: i32, out: "i32[1]"):
+    def top(x: i32, y: i32, out: i32[1]):
         @kernel
         def worker(a: i32, b: i32) -> (i32, i32):
             return a, b
@@ -702,7 +702,7 @@ def test_nested_multiple_returns():
 
 def test_nested_capture_constexpr():
     @kernel
-    def top(x: i32, out: "i32[1]"):
+    def top(x: i32, out: i32[1]):
         offset: constexpr = 3
 
         @kernel
@@ -717,7 +717,7 @@ def test_nested_capture_constexpr():
 
 def test_nested_capture_type_alias():
     @kernel
-    def top(out: "i32[1]"):
+    def top(out: i32[1]):
         T: constexpr = i32
 
         @kernel
@@ -741,7 +741,7 @@ def test_nested_capture_consteval():
         return 5
 
     @kernel
-    def top(x: i32, out: "i32[1]"):
+    def top(x: i32, out: i32[1]):
         @kernel
         def worker(v: i32) -> i32:
             return v + amount()
@@ -758,7 +758,7 @@ def test_nested_capture_kernel_alias():
         return v + 2
 
     @kernel
-    def top(x: i32, out: "i32[1]"):
+    def top(x: i32, out: i32[1]):
         invokeee: constexpr = callee
 
         @kernel
@@ -778,11 +778,11 @@ def test_nested_capture_kernel_alias():
 
 def test_nested_capture_module_alias():
     @kernel
-    def top(out: "i32[2]"):
+    def top(out: i32[2]):
         M: constexpr = allo_core
 
         @kernel
-        def worker(buf: "i32[2]"):
+        def worker(buf: i32[2]):
             for i in M.range(2):
                 buf[i] = i
 
@@ -794,7 +794,7 @@ def test_nested_capture_module_alias():
 
 def test_cpp_typing_compile():
     @kernel(options=KernelOptions(typing_style="cpp"))
-    def top(x: u32, y: i32, out: "u32[1]"):
+    def top(x: u32, y: i32, out: u32[1]):
         out[0] = x + y
 
     ir = _compile_ir(top)
@@ -896,7 +896,7 @@ def test_return_count_mismatch():
 
 def test_return_type_mismatch():
     @kernel
-    def top(x: "i32[2]") -> "i32[1]":
+    def top(x: i32[2]) -> i32[1]:
         return x
 
     _assert_compile_error(

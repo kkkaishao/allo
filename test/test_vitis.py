@@ -52,7 +52,7 @@ def _has_vitis() -> bool:
 
 def test_vitis_basic_kernel():
     @kernel
-    def top(x: i32, out: "i32[1]"):
+    def top(x: i32, out: i32[1]):
         out[0] = x + 1
 
     code = _emit_vitis_cpp(top)
@@ -68,7 +68,7 @@ def test_vitis_basic_kernel():
 
 def test_vitis_loop():
     @kernel
-    def top(x: "i32[4]", out: "i32[4]"):
+    def top(x: i32[4], out: i32[4]):
         for i in allo_range(4):
             out[i] = x[i] + 1
 
@@ -78,9 +78,9 @@ def test_vitis_loop():
 
 def test_vitis_nested_calls():
     @kernel
-    def top(x: i32, out: "i32[1]"):
+    def top(x: i32, out: i32[1]):
         @kernel
-        def worker(v: i32, dst: "i32[1]"):
+        def worker(v: i32, dst: i32[1]):
             dst[0] = v + 1
 
         worker(x, out)
@@ -92,8 +92,8 @@ def test_vitis_nested_calls():
 
 def test_vitis_scalar_stream():
     @kernel
-    def top(x: i32, out: "i32[1]"):
-        fifo: "Stream[i32][2,2]"
+    def top(x: i32, out: i32[1]):
+        fifo: Stream[i32][2, 2]
         fifo[0, 1].put(x)
         out[0] = fifo[0, 1].get()
 
@@ -108,11 +108,11 @@ def test_vitis_scalar_stream():
 
 def test_vitis_stream_parameter():
     @kernel
-    def top(x: i32, out: "i32[1]"):
-        fifo: "Stream[i32][2,2]"
+    def top(x: i32, out: i32[1]):
+        fifo: Stream[i32][2, 2]
 
         @kernel
-        def worker(s: "Stream[i32][2,2]", v: i32):
+        def worker(s: Stream[i32][2, 2], v: i32):
             s[0, 1].put(v)
 
         worker(fifo, x)
@@ -129,9 +129,9 @@ def test_vitis_stream_parameter():
 
 def test_vitis_block_stream():
     @kernel
-    def top(out: "i32[1]"):
-        fifo: "Stream[i32[2,2]]"
-        buf: "i32[2,2]"
+    def top(out: i32[1]):
+        fifo: Stream[i32[2, 2]]
+        buf: i32[2, 2]
         buf[0, 0] = 7
         fifo.put(buf)
         recv = fifo.get()
@@ -154,8 +154,8 @@ def test_vitis_csim_scalar_stream():
         pytest.skip("Vitis HLS toolchain is not available")
 
     @kernel
-    def top(x: i32, out: "i32[1]"):
-        fifo: "Stream[i32]"
+    def top(x: i32, out: i32[1]):
+        fifo: Stream[i32]
         fifo.put(x)
         out[0] = fifo.get()
 

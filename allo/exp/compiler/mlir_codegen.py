@@ -1390,18 +1390,6 @@ class MLIRCodeGenerator(ast.NodeVisitor):
                 setattr(assign, x, y)
         self.visit(assign)
 
-    def _resolve_annotation_symbol(self, annotation: ast.AST):
-        if isinstance(annotation, ast.Name):
-            return self.lookup(annotation.id)
-        if isinstance(annotation, ast.Attribute):
-            base = unwrap_if_constexpr(
-                self._resolve_annotation_symbol(annotation.value)
-            )
-            return getattr(base, annotation.attr)
-        return self.compile_error(
-            f"Unsupported annotation expression '{ast.unparse(annotation)}'."
-        )
-
     def _type_annotation_scope(self):
         scope = self.builtin_namespace.copy()
         scope.update(self.gscope)
@@ -1417,28 +1405,19 @@ class MLIRCodeGenerator(ast.NodeVisitor):
         scope = self._type_annotation_scope()
         if isinstance(annotation, ast.Constant) and annotation.value is None:
             return self.compile_error(f"Missing type annotation for '{name}'.")
+        # A quoted annotation is a string literal; use its contents. Any other
+        # expression is rendered back to source so it evaluates uniformly.
         if isinstance(annotation, ast.Constant) and isinstance(annotation.value, str):
-            try:
-                return self.kernel.parse_type_annotation(annotation.value, scope=scope)
-            except Exception as e:
-                return self.compile_error(
-                    f"Unsupported type annotation '{annotation.value}' for '{name}': {e}"
-                )
-        if isinstance(annotation, (ast.Name, ast.Attribute)):
-            resolved = self._resolve_annotation_symbol(annotation)
-            try:
-                return self.kernel.parse_type_annotation(resolved, scope=scope)
-            except Exception:
-                pass
-
-        annotation_text = ast.unparse(annotation)
-        if annotation_text in {"constexpr", "Constexpr"}:
+            text = annotation.value
+        else:
+            text = ast.unparse(annotation)
+        if text in {"constexpr", "Constexpr"}:
             return constexpr
         try:
-            return self.kernel.parse_type_annotation(annotation_text, scope=scope)
+            return self.kernel.parse_type_annotation(text, scope=scope)
         except Exception as e:
             return self.compile_error(
-                f"Unsupported type annotation '{annotation_text}' for '{name}': {e}"
+                f"Unsupported type annotation '{text}' for '{name}': {e}"
             )
 
     def visit_AnnAssign(self, node: ast.AnnAssign):

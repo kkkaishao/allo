@@ -26,7 +26,7 @@ def _assert_compile_error(fn, *patterns: str):
 
 def test_tensor_add_linalg():
     @kernel(options=KernelOptions(enable_tensor=True))
-    def top(x: "f32[4]", y: "f32[4]") -> "f32[4]":
+    def top(x: f32[4], y: f32[4]) -> f32[4]:
         return x + y
 
     ir = _compile_ir(top)
@@ -35,7 +35,7 @@ def test_tensor_add_linalg():
 
 def test_tensor_rank0_add_linalg():
     @kernel(options=KernelOptions(enable_tensor=True))
-    def top(x: "f32[]", y: "f32[]") -> "f32[]":
+    def top(x: f32[()], y: f32[()]) -> f32[()]:
         return x + y
 
     ir = _compile_ir(top)
@@ -44,7 +44,7 @@ def test_tensor_rank0_add_linalg():
 
 def test_tensor_add_scalar_broadcast():
     @kernel(options=KernelOptions(enable_tensor=True))
-    def top(x: "f32[4]") -> "f32[4]":
+    def top(x: f32[4]) -> f32[4]:
         return x + 1.0
 
     ir = _compile_ir(top)
@@ -53,8 +53,8 @@ def test_tensor_add_scalar_broadcast():
 
 def test_memref_add_requires_acc():
     @kernel
-    def top(x: "f32[4]", y: "f32[4]", out: "f32[1]"):
-        z: "f32[4]" = x + y
+    def top(x: f32[4], y: f32[4], out: f32[1]):
+        z: f32[4] = x + y
         out[0] = z[0]
 
     _assert_compile_error(top, "requires acc for memref output")
@@ -62,7 +62,7 @@ def test_memref_add_requires_acc():
 
 def test_memref_add_acc():
     @kernel
-    def top(x: "f32[4]", y: "f32[4]", out: "f32[4]"):
+    def top(x: f32[4], y: f32[4], out: f32[4]):
         allo_arith.add(x, y, acc=out)
 
     ir = _compile_ir(top)
@@ -71,7 +71,7 @@ def test_memref_add_acc():
 
 def test_memref_div_positional_acc():
     @kernel
-    def top(x: "u32[4]", y: "u32[4]", out: "u32[4]"):
+    def top(x: u32[4], y: u32[4], out: u32[4]):
         allo_arith.div(x, y, out, signed=False)
 
     ir = _compile_ir(top)
@@ -80,7 +80,7 @@ def test_memref_div_positional_acc():
 
 def test_tensor_lt_generic():
     @kernel(options=KernelOptions(enable_tensor=True))
-    def top(x: "f32[4]", y: "f32[4]") -> "u1[4]":
+    def top(x: f32[4], y: f32[4]) -> u1[4]:
         return x < y
 
     ir = _compile_ir(top)
@@ -89,7 +89,7 @@ def test_tensor_lt_generic():
 
 def test_tensor_lt_positional_acc():
     @kernel(options=KernelOptions(enable_tensor=True))
-    def top(x: "f32[4]", y: "f32[4]", out: "u1[4]") -> "u1[4]":
+    def top(x: f32[4], y: f32[4], out: u1[4]) -> u1[4]:
         return allo_arith.lt(x, y, out, ordered=True)
 
     ir = _compile_ir(top)
@@ -98,7 +98,7 @@ def test_tensor_lt_positional_acc():
 
 def test_tensor_max_positional_acc():
     @kernel(options=KernelOptions(enable_tensor=True))
-    def top(x: "f32[4]", y: "f32[4]", out: "f32[4]") -> "f32[4]":
+    def top(x: f32[4], y: f32[4], out: f32[4]) -> f32[4]:
         return allo_arith.max(x, y, out, propagate_nan=True)
 
     ir = _compile_ir(top)
@@ -107,7 +107,7 @@ def test_tensor_max_positional_acc():
 
 def test_scalar_add_acc_error():
     @kernel
-    def top(x: f32, y: f32, out: "f32[4]"):
+    def top(x: f32, y: f32, out: f32[4]):
         allo_arith.add(x, y, acc=out)
 
     _assert_compile_error(top, "acc requires at least one shaped operand")

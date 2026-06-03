@@ -9,16 +9,16 @@ from allo.exp.lang.kernel import kernel
 
 def test_simulator_scalar_stream():
     @kernel
-    def top(x: "i32[8]", out: "i32[8]"):
-        fifo: "Stream[i32]"
+    def top(x: i32[8], out: i32[8]):
+        fifo: Stream[i32]
 
         @kernel
-        def producer(src: "i32[8]", stream: "Stream[i32]"):
+        def producer(src: i32[8], stream: Stream[i32]):
             for i in range(8):
                 stream.put(src[i] + 1)
 
         @kernel
-        def consumer(stream: "Stream[i32]", dst: "i32[8]"):
+        def consumer(stream: Stream[i32], dst: i32[8]):
             for i in range(8):
                 dst[i] = stream.get() * 2
 
@@ -35,12 +35,12 @@ def test_simulator_scalar_stream():
 
 def test_simulator_block_stream():
     @kernel
-    def top(out: "i32[2,2,2]"):
-        fifo: "Stream[i32[2,2]]"
+    def top(out: i32[2, 2, 2]):
+        fifo: Stream[i32[2, 2]]
 
         @kernel
-        def producer(stream: "Stream[i32[2,2]]"):
-            buf: "i32[2,2]"
+        def producer(stream: Stream[i32[2, 2]]):
+            buf: i32[2, 2]
             buf[0, 0] = 1
             buf[0, 1] = 2
             buf[1, 0] = 3
@@ -53,7 +53,7 @@ def test_simulator_block_stream():
             stream.put(buf)
 
         @kernel
-        def consumer(stream: "Stream[i32[2,2]]", dst: "i32[2,2,2]"):
+        def consumer(stream: Stream[i32[2, 2]], dst: i32[2, 2, 2]):
             first = stream.get()
             second = stream.get()
             dst[0, 0, 0] = first[0, 0]

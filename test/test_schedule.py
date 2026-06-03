@@ -33,7 +33,7 @@ def test_schedule_from_string():
 
 def test_pipeline_kernel_loop():
     @kernel
-    def top(A: "i32[16]", B: "i32[16]"):
+    def top(A: i32[16], B: i32[16]):
         for i in range(16):
             B[i] = A[i] + 1
 
@@ -51,7 +51,7 @@ def test_pipeline_kernel_loop():
 
 def test_named_range_loop():
     @kernel
-    def top(A: "i32[16]", B: "i32[16]"):
+    def top(A: i32[16], B: i32[16]):
         for i in range(16, name="i"):
             B[i] = A[i] + 1
 
@@ -67,7 +67,7 @@ def test_named_range_loop():
 
 def test_split_returns_live_loops():
     @kernel
-    def top(A: "i32[16]", B: "i32[16]"):
+    def top(A: i32[16], B: i32[16]):
         for i in range(16):
             B[i] = A[i] + 1
 
@@ -87,7 +87,7 @@ def test_split_returns_live_loops():
 
 def test_named_nested_range_loops():
     @kernel
-    def top(A: "i32[4,4]", B: "i32[4,4]"):
+    def top(A: i32[4, 4], B: i32[4, 4]):
         for i in range(4, name="i"):
             for j in range(4, name="j"):
                 B[i, j] = A[i, j] + 1
@@ -107,7 +107,7 @@ def test_named_nested_range_loops():
 
 def test_flatten_nested_loops():
     @kernel
-    def top(A: "i32[4,4]", B: "i32[4,4]"):
+    def top(A: i32[4, 4], B: i32[4, 4]):
         for i in range(4):
             for j in range(4):
                 B[i, j] = A[i, j] + 1
@@ -126,7 +126,7 @@ def test_flatten_nested_loops():
 
 def test_named_grid_loop_like_op():
     @kernel
-    def top(A: "i32[4,4]", B: "i32[4,4]"):
+    def top(A: i32[4, 4], B: i32[4, 4]):
         for i, j in grid(4, 4, name="ij"):
             B[i, j] = A[i, j] + 1
 
@@ -140,8 +140,8 @@ def test_named_grid_loop_like_op():
 
 def test_compute_at_kernel():
     @kernel
-    def top(A: "i32[8]", C: "i32[8]"):
-        B: "i32[8]" = 0
+    def top(A: i32[8], C: i32[8]):
+        B: i32[8] = 0
         for i in range(8, name="i"):
             B[i] = A[i] * 2
         for j in range(8, name="j"):
@@ -162,8 +162,8 @@ def test_compute_at_kernel():
 
 def test_buffer_at_single_level():
     @kernel
-    def top(out: "i32[4,4]"):
-        B: "i32[4,4]" = 0
+    def top(out: i32[4, 4]):
+        B: i32[4, 4] = 0
         for i in range(4, name="i"):
             for j in range(4, name="j"):
                 B[i, j] = i + j
@@ -184,7 +184,7 @@ def test_buffer_at_single_level():
 
 def test_pending_transforms_gate_real_ir():
     @kernel
-    def top(A: "i32[16]", B: "i32[16]"):
+    def top(A: i32[16], B: i32[16]):
         for i in range(16):
             B[i] = A[i] + 1
 
@@ -208,7 +208,7 @@ def test_pending_transforms_gate_real_ir():
 
 def test_apply_is_idempotent():
     @kernel
-    def top(A: "i32[16]", B: "i32[16]"):
+    def top(A: i32[16], B: i32[16]):
         for i in range(16):
             B[i] = A[i] + 1
 
@@ -226,7 +226,7 @@ def test_apply_is_idempotent():
 
 def test_apply_incremental():
     @kernel
-    def top(A: "i32[16]", B: "i32[16]"):
+    def top(A: i32[16], B: i32[16]):
         for i in range(16):
             B[i] = A[i] + 1
 
@@ -247,7 +247,7 @@ def test_apply_incremental():
 def test_apply_incremental_matches_batched():
     def build():
         @kernel
-        def top(A: "i32[16]", B: "i32[16]"):
+        def top(A: i32[16], B: i32[16]):
             for i in range(16):
                 B[i] = A[i] + 1
 
@@ -269,7 +269,7 @@ def test_apply_incremental_matches_batched():
 
 def test_consumed_handle_raises():
     @kernel
-    def top(A: "i32[16]", B: "i32[16]"):
+    def top(A: i32[16], B: i32[16]):
         for i in range(16):
             B[i] = A[i] + 1
 
@@ -284,12 +284,12 @@ def test_consumed_handle_raises():
 
 def test_compose_applies_callee_schedule():
     @kernel
-    def worker(a: "i32[16]", b: "i32[16]"):
+    def worker(a: i32[16], b: i32[16]):
         for i in range(16, name="i"):
             b[i] = a[i] + 1
 
     @kernel
-    def top(A: "i32[16]", B: "i32[16]"):
+    def top(A: i32[16], B: i32[16]):
         worker(A, B)
 
     # Schedule the callee standalone (lazy), then compose it into the parent's copy.
@@ -308,12 +308,12 @@ def test_compose_applies_callee_schedule():
 
 def test_compose_targets_specific_copy_with_id():
     @kernel
-    def worker(a: "i32[16]", b: "i32[16]"):
+    def worker(a: i32[16], b: i32[16]):
         for i in range(16, name="i"):
             b[i] = a[i] + 1
 
     @kernel
-    def top(A: "i32[16]", B: "i32[16]"):
+    def top(A: i32[16], B: i32[16]):
         worker(A, B)
         worker(B, A)
 
@@ -331,12 +331,12 @@ def test_compose_targets_specific_copy_with_id():
 
 def test_compose_missing_callee_raises():
     @kernel
-    def worker(a: "i32[16]", b: "i32[16]"):
+    def worker(a: i32[16], b: i32[16]):
         for i in range(16, name="i"):
             b[i] = a[i] + 1
 
     @kernel
-    def top(A: "i32[16]", B: "i32[16]"):
+    def top(A: i32[16], B: i32[16]):
         for i in range(16):
             B[i] = A[i] + 1
 
@@ -350,7 +350,7 @@ def test_schedule_requires_bound_templates():
     N = Template("N")
 
     @kernel(N)
-    def top(A: "i32[N]", B: "i32[N]"):
+    def top(A: i32[N], B: i32[N]):
         for i in range(N, name="i"):
             B[i] = A[i] + 1
 
@@ -367,16 +367,16 @@ def test_schedule_requires_bound_templates():
 
 def test_compose_nested():
     @kernel
-    def inner(a: "i32[16]", b: "i32[16]"):
+    def inner(a: i32[16], b: i32[16]):
         for i in range(16, name="i"):
             b[i] = a[i] + 1
 
     @kernel
-    def mid(a: "i32[16]", b: "i32[16]"):
+    def mid(a: i32[16], b: i32[16]):
         inner(a, b)
 
     @kernel
-    def top(A: "i32[16]", B: "i32[16]"):
+    def top(A: i32[16], B: i32[16]):
         mid(A, B)
 
     # inner's schedule -> composed into mid -> composed into top, transitively.
@@ -399,18 +399,18 @@ def test_compose_nested():
 
 def test_compose_nested_with_own_primitive():
     @kernel
-    def inner(a: "i32[16]", b: "i32[16]"):
+    def inner(a: i32[16], b: i32[16]):
         for i in range(16, name="i"):
             b[i] = a[i] + 1
 
     @kernel
-    def mid(a: "i32[16]", b: "i32[16]"):
+    def mid(a: i32[16], b: i32[16]):
         inner(a, b)
         for k in range(16, name="k"):
             b[k] = b[k] + 1
 
     @kernel
-    def top(A: "i32[16]", B: "i32[16]"):
+    def top(A: i32[16], B: i32[16]):
         mid(A, B)
 
     inner_s = inner.schedule()

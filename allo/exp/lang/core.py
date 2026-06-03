@@ -60,6 +60,9 @@ class Template:
     def __repr__(self) -> str:
         return self.name
 
+    def __getitem__(self, shape) -> "ShapeExpr":
+        return ShapeExpr(self, shape)
+
 
 class ConstexprType(TypeBase):
     """
@@ -130,6 +133,9 @@ class DType(TypeBase):
 
     def is_index(self):
         return self.name == "index"
+
+    def __getitem__(self, shape) -> "ShapeExpr":
+        return ShapeExpr(self, shape)
 
 
 class APInt(DType):
@@ -346,30 +352,62 @@ class StreamType(TypeBase):
         self.shape = shape
         self.rank = len(shape)
 
-    def __getitem__(self, key):
-        if self.shape:
-            raise TypeError(f"Stream type '{self}' already has a shape")
-        if not isinstance(key, tuple):
-            key = (key,)
-        if len(key) == 0:
-            raise TypeError("Stream[Ty][] is invalid; use Stream[Ty] instead")
-        if not all(type(dim) is int and dim >= 0 for dim in key):
-            raise TypeError("Stream shape dimensions must be non-negative integers")
-        return StreamType(self.base_type, self.depth, key)
-
     def materialize(self, context: Context, /) -> Type:
         base = self.base_type.materialize(context)
         return MlirStreamType.get(base, self.depth, list(self.shape))
+
+
+# ==========================================================================#
+# Deferred type annotations
+#
+# `dtype[shape]`, `Template[shape]` and `Stream[base][shape]` evaluate to these
+# lightweight descriptors so that complex annotations can be written without
+# quotes (and without `from __future__ import annotations`). They are resolved
+# into concrete frontend types by `Kernel.parse_type_annotation`, which is the
+# only place that knows the kernel's options and template bindings.
+# ==========================================================================#
+
+
+def _as_shape(key) -> tuple:
+    return key if isinstance(key, tuple) else (key,)
+
+
+class ShapeExpr:
+    """A `dtype[shape]` annotation, unresolved. `dtype` is a `DType` or
+    `Template`; `shape` entries may be ints, `Template`s or `ConstexprValue`s."""
+
+    def __init__(self, dtype, shape):
+        self.dtype = dtype
+        self.shape = _as_shape(shape)
+
+    def __repr__(self) -> str:
+        return f"{self.dtype}[{', '.join(map(str, self.shape))}]"
+
+
+class StreamExpr:
+    """A `Stream[base][shape]` annotation, unresolved. `base` may be a `DType`,
+    `ShapedType`, `ShapeExpr` or `Template`; `shape` is the stream-array shape."""
+
+    def __init__(self, base, shape: Sequence = ()):
+        self.base = base
+        self.shape = tuple(shape)
+
+    def __getitem__(self, key) -> "StreamExpr":
+        if self.shape:
+            raise TypeError(f"Stream type '{self!r}' already has a shape")
+        return StreamExpr(self.base, _as_shape(key))
+
+    def __repr__(self) -> str:
+        suffix = f"[{','.join(map(str, self.shape))}]" if self.shape else ""
+        return f"Stream[{self.base!r}]{suffix}"
 
 
 class _StreamFactory:
     def __init__(self, prefix: str):
         self.prefix = prefix
 
-    def __getitem__(self, base_type):
-        if not isinstance(base_type, (DType, ShapedType)):
-            raise TypeError(f"{self.prefix} base type must be a scalar or buffer type")
-        return StreamType(base_type, DEFAULT_STREAM_DEPTH, ())
+    def __getitem__(self, base_type) -> StreamExpr:
+        return StreamExpr(base_type)
 
     def __repr__(self) -> str:
         return self.prefix

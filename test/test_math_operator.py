@@ -48,7 +48,7 @@ def _assert_compile_error(fn, *patterns: str):
 )
 def test_unary_math_mlir(op, pattern):
     @kernel
-    def top(x: f32, out: "f32[1]"):
+    def top(x: f32, out: f32[1]):
         out[0] = op(x)
 
     ir = _compile_ir(top)
@@ -57,7 +57,7 @@ def test_unary_math_mlir(op, pattern):
 
 def test_abs_float_mlir():
     @kernel
-    def top(x: f32, out: "f32[1]"):
+    def top(x: f32, out: f32[1]):
         out[0] = allo_math.abs(x)
 
     ir = _compile_ir(top)
@@ -66,7 +66,7 @@ def test_abs_float_mlir():
 
 def test_abs_int_mlir():
     @kernel
-    def top(x: i32, out: "i32[1]"):
+    def top(x: i32, out: i32[1]):
         out[0] = allo_math.abs(x)
 
     ir = _compile_ir(top)
@@ -75,7 +75,7 @@ def test_abs_int_mlir():
 
 def test_pow_float_float_mlir():
     @kernel
-    def top(x: f32, y: f32, out: "f32[1]"):
+    def top(x: f32, y: f32, out: f32[1]):
         out[0] = allo_math.pow(x, y)
 
     ir = _compile_ir(top)
@@ -84,7 +84,7 @@ def test_pow_float_float_mlir():
 
 def test_pow_float_int_mlir():
     @kernel
-    def top(x: f32, y: i32, out: "f32[1]"):
+    def top(x: f32, y: i32, out: f32[1]):
         out[0] = allo_math.pow(x, y)
 
     ir = _compile_ir(top)
@@ -93,7 +93,7 @@ def test_pow_float_int_mlir():
 
 def test_pow_int_int_mlir():
     @kernel
-    def top(x: i32, y: i32, out: "i32[1]"):
+    def top(x: i32, y: i32, out: i32[1]):
         out[0] = allo_math.pow(x, y)
 
     ir = _compile_ir(top)
@@ -102,7 +102,7 @@ def test_pow_int_int_mlir():
 
 def test_exp_zero_fold():
     @kernel
-    def top(out: "f32[1]"):
+    def top(out: f32[1]):
         out[0] = allo_math.exp(0)
 
     ir = _compile_ir(top)
@@ -112,7 +112,7 @@ def test_exp_zero_fold():
 
 def test_pow_zero_fold():
     @kernel
-    def top(x: f32, out: "f32[1]"):
+    def top(x: f32, out: f32[1]):
         out[0] = allo_math.pow(x, 0)
 
     ir = _compile_ir(top)
@@ -122,7 +122,7 @@ def test_pow_zero_fold():
 
 def test_tensor_exp_linalg():
     @kernel(options=KernelOptions(enable_tensor=True))
-    def top(x: "f32[4]") -> "f32[4]":
+    def top(x: f32[4]) -> f32[4]:
         return allo_math.exp(x)
 
     ir = _compile_ir(top)
@@ -131,7 +131,7 @@ def test_tensor_exp_linalg():
 
 def test_tensor_exp2_generic():
     @kernel(options=KernelOptions(enable_tensor=True))
-    def top(x: "f32[4]") -> "f32[4]":
+    def top(x: f32[4]) -> f32[4]:
         return allo_math.exp2(x)
 
     ir = _compile_ir(top)
@@ -140,7 +140,7 @@ def test_tensor_exp2_generic():
 
 def test_tensor_exp_acc():
     @kernel(options=KernelOptions(enable_tensor=True))
-    def top(x: "f32[4]", acc: "f32[4]") -> "f32[4]":
+    def top(x: f32[4], acc: f32[4]) -> f32[4]:
         return allo_math.exp(x, acc=acc)
 
     ir = _compile_ir(top)
@@ -149,8 +149,8 @@ def test_tensor_exp_acc():
 
 def test_memref_exp_requires_acc():
     @kernel
-    def top(x: "f32[4]", out: "f32[1]"):
-        y: "f32[4]" = allo_math.exp(x)
+    def top(x: f32[4], out: f32[1]):
+        y: f32[4] = allo_math.exp(x)
         out[0] = y[0]
 
     _assert_compile_error(top, "requires acc for memref output")
@@ -158,7 +158,7 @@ def test_memref_exp_requires_acc():
 
 def test_memref_exp_acc():
     @kernel
-    def top(x: "f32[4]", out: "f32[4]"):
+    def top(x: f32[4], out: f32[4]):
         allo_math.exp(x, acc=out)
 
     ir = _compile_ir(top)
@@ -167,7 +167,7 @@ def test_memref_exp_acc():
 
 def test_scalar_exp_acc_error():
     @kernel
-    def top(out: "f32[4]"):
+    def top(out: f32[4]):
         allo_math.exp(0, acc=out)
 
     _assert_compile_error(top, "acc requires at least one shaped operand")
@@ -175,7 +175,7 @@ def test_scalar_exp_acc_error():
 
 def test_scalar_pow_acc_error():
     @kernel
-    def top(x: f32, y: f32, out: "f32[4]"):
+    def top(x: f32, y: f32, out: f32[4]):
         allo_math.pow(x, y, acc=out)
 
     _assert_compile_error(top, "acc requires at least one shaped operand")
@@ -183,7 +183,7 @@ def test_scalar_pow_acc_error():
 
 def test_tensor_exp_acc_shape_error():
     @kernel(options=KernelOptions(enable_tensor=True))
-    def top(x: "f32[4]", acc: "f32[2]") -> "f32[2]":
+    def top(x: f32[4], acc: f32[2]) -> f32[2]:
         return allo_math.exp(x, acc=acc)
 
     _assert_compile_error(top, "not broadcastable")
@@ -191,7 +191,7 @@ def test_tensor_exp_acc_shape_error():
 
 def test_memref_exp2_generic():
     @kernel
-    def top(x: "f32[4]", out: "f32[4]"):
+    def top(x: f32[4], out: f32[4]):
         allo_math.exp2(x, acc=out)
 
     ir = _compile_ir(top)
@@ -200,7 +200,7 @@ def test_memref_exp2_generic():
 
 def test_tensor_pow_scalar_broadcast():
     @kernel(options=KernelOptions(enable_tensor=True))
-    def top(x: "f32[4]", acc: "f32[4]") -> "f32[4]":
+    def top(x: f32[4], acc: f32[4]) -> f32[4]:
         return allo_math.pow(x, 2, acc=acc)
 
     ir = _compile_ir(top)
