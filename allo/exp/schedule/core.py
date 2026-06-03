@@ -511,9 +511,23 @@ class Schedule(Generic[P, R]):
             self.script.match(axis_loop.key),
             **self.script.kw,
         )
-        self.predicted.reparent_approx(self._pred(producer), axis_loop.skey)
+        # compute_at fuses the whole producer loop nest into the consumer and
+        # erases the producer's outer loops, so the precise post-structure cannot
+        # be predicted: mark the entire producer nest approximate (reconcile
+        # rebuilds it from the real IR) instead of just reparenting the target.
+        self.predicted.mark_approx(self._loop_nest_root(self._pred(producer)))
         self._mark_dirty()
         return self.predicted.make_loop_ref(self._pred(axis_loop))
+
+    def _loop_nest_root(self, node: PredictedOp) -> PredictedOp:
+        """Outermost loop-like ancestor of ``node`` within its function."""
+        root = node
+        while root.parent is not None:
+            parent = self.predicted.op(*root.parent)
+            if parent is None or not parent.has_trait(ScheduleOpTrait.LOOP_LIKE):
+                break
+            root = parent
+        return root
 
     @_within_context
     def buffer_at(self, target: SingleTarget, axis: SingleTarget) -> BufferRef:

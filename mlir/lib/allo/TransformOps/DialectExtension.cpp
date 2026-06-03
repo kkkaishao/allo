@@ -15,6 +15,7 @@
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/Dialect/Vector/IR/VectorOps.h"
 #include "mlir/IR/SymbolTable.h"
+#include "mlir/Interfaces/FunctionInterfaces.h"
 
 #include "allo/TransformOps/AlloTransformOps.h"
 #include "allo/TransformOps/Utils.h"
@@ -191,11 +192,12 @@ transform::PartitionOp::apply(transform::TransformRewriter &rewriter,
     std::optional<unsigned> argNumber;
 
     if (auto arg = dyn_cast<BlockArgument>(root)) {
-      // Case 1: memref introduced as a block argument.
-      auto func = dyn_cast<func::FuncOp>(arg.getOwner()->getParentOp());
+      // Case 1: memref introduced as a block argument of a function-like op
+      // (func.func or allo.kernel).
+      auto func = dyn_cast<FunctionOpInterface>(arg.getOwner()->getParentOp());
       if (!func) {
         return emitSilenceableError() << "partition target root block argument "
-                                         "must belong to a kernel op";
+                                         "must belong to a function-like op";
       }
       attrOwner = func;
       argNumber = arg.getArgNumber();
@@ -236,7 +238,7 @@ transform::PartitionOp::apply(transform::TransformRewriter &rewriter,
     auto mergedPart = mergePartitionAttrs(oldPart, newPart);
 
     if (argNumber.has_value()) {
-      auto kernel = cast<func::FuncOp>(attrOwner);
+      auto kernel = cast<FunctionOpInterface>(attrOwner);
       rewriter.modifyOpInPlace(kernel, [&]() {
         kernel.setArgAttr(*argNumber, kPartitionAttrName, mergedPart);
       });

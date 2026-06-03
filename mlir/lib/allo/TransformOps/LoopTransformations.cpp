@@ -333,6 +333,31 @@ LogicalResult transform::LoopReorderOp::verify() {
 /// SplitOp implementation
 ///===----------------------------------------------------------------------===//
 
+/// Sink an index-reconstruction affine.apply as deep as possible: while a loop
+/// in its current block is a proper ancestor of *all* its uses, move it to that
+/// loop's body front. Splitting/tiling materializes such applies between band
+/// loops, which would break perfect nesting (reorder/tile/compute_at require
+/// single-op loop bodies between band loops); sinking them into the innermost
+/// using loop restores it without changing semantics (operands are enclosing
+/// IVs, which still dominate the deeper location).
+static void sinkAffineApply(affine::AffineApplyOp apply) {
+  while (!apply->use_empty()) {
+    affine::AffineForOp target;
+    for (Operation &op : *apply->getBlock()) {
+      auto loop = dyn_cast<affine::AffineForOp>(&op);
+      if (loop && llvm::all_of(apply->getUses(), [&](OpOperand &u) {
+            return loop->isProperAncestor(u.getOwner());
+          })) {
+        target = loop;
+        break;
+      }
+    }
+    if (!target)
+      break;
+    apply->moveBefore(&target.getBody()->front());
+  }
+}
+
 /// Checks if the given split factor is valid for the given loop.
 /// A valid split factor should be positive and smaller than the loop trip
 /// count. Only checks constant-bound loops.
@@ -429,16 +454,26 @@ transform::LoopSplitOp::applyToOne(transform::TransformRewriter &rewriter,
       inner.setUpperBound({}, rewriter.getConstantAffineMap(cstUb));
     }
 
-    // Sink affine.apply ops that are only used in the inner loop.
-    for (auto applyOp :
-         llvm::make_early_inc_range(outer.getOps<affine::AffineApplyOp>())) {
-      bool allUsesInInner = llvm::all_of(applyOp->getUses(), [&](OpOperand &u) {
-        return inner->isProperAncestor(u.getOwner());
+    // Keep the band perfectly nested for later reorder/tile/etc: erase index
+    // applies left dead by normalization, then sink the live ones to the
+    // innermost loop that uses them.
+    bool erased = true;
+    while (erased) {
+      erased = false;
+      SmallVector<affine::AffineApplyOp> dead;
+      outer.walk([&](affine::AffineApplyOp a) {
+        if (a->use_empty())
+          dead.push_back(a);
       });
-      if (allUsesInInner) {
-        applyOp->moveBefore(&inner.getBody()->front());
+      for (auto a : dead) {
+        rewriter.eraseOp(a);
+        erased = true;
       }
     }
+    SmallVector<affine::AffineApplyOp> applies;
+    outer.walk([&](affine::AffineApplyOp a) { applies.push_back(a); });
+    for (auto a : applies)
+      sinkAffineApply(a);
     // record results
     results.push_back(outer);
     results.push_back(inner);
@@ -1067,8 +1102,15 @@ static FailureOr<DependenceType> checkDependencies(affine::AffineForOp forOpA,
         continue; // we don't care about rar
       }
       SmallVector<affine::DependenceComponent, 2> deps;
+      // `checkMemrefAccessDependence` requires the probed loop depth to be in
+      // [1, numCommonSurroundingLoops + 1]. Producer and consumer are sibling
+      // nests, so clamp the caller's depth into the valid range (otherwise MLIR
+      // asserts when compute_at targets a non-outermost axis).
+      unsigned numCommon =
+          affine::getNumCommonSurroundingLoops(*a.opInst, *b.opInst);
+      unsigned probeDepth = std::min(depth, numCommon + 1);
       auto depResult =
-          affine::checkMemrefAccessDependence(a, b, depth, nullptr, &deps);
+          affine::checkMemrefAccessDependence(a, b, probeDepth, nullptr, &deps);
       if (depResult.value == affine::DependenceResult::Failure) {
         return failure();
       }
@@ -1460,8 +1502,11 @@ transform::ComputeAtOp::apply(transform::TransformRewriter &rewriter,
   if ((depType & DependenceType::RAW) != DependenceType::NONE) {
     // RAW dependence requires true producer-consumer fusion to preserve
     // semantics while changing loop placement.
+    // Producer-consumer fusion fuses the producer nest into the consumer's
+    // *root* (its sibling in the same block) at `consumerDepth`; the axis loop
+    // is reached via that depth, not by passing the inner loop as destination.
     auto reason = tryAffineLoopFusion(
-        analysis.producerRoot, analysis.consumerLoop, analysis.consumerDepth);
+        analysis.producerRoot, analysis.consumerRoot, analysis.consumerDepth);
     if (reason.has_value()) {
       return emitSilenceableError()
              << "cannot fuse producer and consumer loop nests: "

@@ -127,7 +127,12 @@ class TransformScript:
         ).results[0]
 
     def match_value(self, owner_key: str, number: int, source: str) -> Value:
-        owner_handle = self.match(owner_key)
+        # The primary function is the body's %func root; `structured.match` only
+        # sees ops *nested under* it, so the function's own block arguments are
+        # reached from the root handle, not by matching its key.
+        owner_handle = (
+            self.root if owner_key == self._primary_key else self.match(owner_key)
+        )
         source_kind = {"arg": 1, "res": 2}[source]
         return ta.MatchValueOp(
             self.any_value_type,

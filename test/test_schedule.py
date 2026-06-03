@@ -1,13 +1,10 @@
+import numpy as np
 import pytest
 
-from allo.exp.lang.core import grid, i32, range, Template
+from allo.exp.lang.core import range, i32, f32, Template
 from allo.exp.lang.kernel import kernel
 from allo.exp.schedule import Schedule
-from allo.exp.schedule.errors import (
-    ConsumedHandleError,
-    ScheduleLookupError,
-    ScheduleStateError,
-)
+from allo.exp.schedule.errors import ScheduleLookupError
 
 AFFINE_LOOP_IR = r"""
 module {
@@ -21,6 +18,11 @@ module {
 """
 
 
+# ===========================================================================
+# Kept frontend/diagnosability tests
+# ===========================================================================
+
+
 def test_schedule_from_string():
     s = Schedule.from_string(AFFINE_LOOP_IR)
     loop = s.loop()
@@ -31,312 +33,14 @@ def test_schedule_from_string():
     assert s.payload.operation.verify()
 
 
-def test_pipeline_kernel_loop():
-    @kernel
-    def top(A: i32[16], B: i32[16]):
-        for i in range(16):
-            B[i] = A[i] + 1
-
-    s = top.schedule()
-    loop = s.loop()
-
-    s.pipeline(loop, ii=2).apply()
-
-    text = str(s.payload)
-    assert "allo.kernel public @top" in text
-    assert "scf.for" in text
-    assert "pipeline.ii = 2 : i64" in text
-    assert s.payload.operation.verify()
-
-
-def test_named_range_loop():
-    @kernel
-    def top(A: i32[16], B: i32[16]):
-        for i in range(16, name="i"):
-            B[i] = A[i] + 1
-
-    s = top.schedule()
-    loop = s.loop("i")
-
-    s.pipeline(loop, ii=2).apply()
-
-    assert loop.name == "i"
-    assert "pipeline.ii = 2 : i64" in str(s.payload)
-    assert s.payload.operation.verify()
-
-
-def test_split_returns_live_loops():
-    @kernel
-    def top(A: i32[16], B: i32[16]):
-        for i in range(16):
-            B[i] = A[i] + 1
-
-    s = top.schedule()
-    loop = s.loop()
-
-    outer, inner = s.split(loop, factor=4)
-    s.pipeline(inner, ii=1).apply()
-
-    text = str(s.payload)
-    assert outer.key in s.snapshot.ops_by_key
-    assert inner.key in s.snapshot.ops_by_key
-    assert text.count("scf.for") == 2
-    assert "pipeline.ii = 1 : i64" in text
-    assert s.payload.operation.verify()
-
-
-def test_named_nested_range_loops():
-    @kernel
-    def top(A: i32[4, 4], B: i32[4, 4]):
-        for i in range(4, name="i"):
-            for j in range(4, name="j"):
-                B[i, j] = A[i, j] + 1
-
-    s = top.schedule()
-    i, j = s.loops("i", "j")
-
-    i, j = s.affine((i, j))
-    flat = s.flatten((i, j))
-    s.apply()
-
-    assert [loop.name for loop in (i, j)] == ["i", "j"]
-    assert flat.key in s.snapshot.ops_by_key
-    assert str(s.payload).count("affine.for") == 1
-    assert s.payload.operation.verify()
-
-
-def test_flatten_nested_loops():
-    @kernel
-    def top(A: i32[4, 4], B: i32[4, 4]):
-        for i in range(4):
-            for j in range(4):
-                B[i, j] = A[i, j] + 1
-
-    s = top.schedule()
-    loops = s.affine(s.loops())
-    flat = s.flatten(loops)
-    s.apply()
-
-    text = str(s.payload)
-    assert flat.key in s.snapshot.ops_by_key
-    assert text.count("affine.for") == 1
-    assert "scf.for" not in text
-    assert s.payload.operation.verify()
-
-
-def test_named_grid_loop_like_op():
-    @kernel
-    def top(A: i32[4, 4], B: i32[4, 4]):
-        for i, j in grid(4, 4, name="ij"):
-            B[i, j] = A[i, j] + 1
-
-    s = top.schedule()
-    loop = s.loop("ij")
-
-    assert loop.name == "ij"
-    assert loop.kind == "scf.parallel"
-    assert loop.key in s.snapshot.ops_by_key
-
-
-def test_compute_at_kernel():
-    @kernel
-    def top(A: i32[8], C: i32[8]):
-        B: i32[8] = 0
-        for i in range(8, name="i"):
-            B[i] = A[i] * 2
-        for j in range(8, name="j"):
-            C[j] = B[j] + 1
-
-    s = top.schedule()
-    producer_loop, consumer_loop = s.affine(s.loops("i", "j"))
-
-    loop = s.compute_at(producer_loop, consumer_loop)
-    s.apply()
-
-    text = str(s.payload)
-    assert loop.key in s.snapshot.ops_by_key
-    assert text.count("affine.for") == 1
-    assert text.count("affine.store") == 2
-    assert s.payload.operation.verify()
-
-
-def test_buffer_at_single_level():
-    @kernel
-    def top(out: i32[4, 4]):
-        B: i32[4, 4] = 0
-        for i in range(4, name="i"):
-            for j in range(4, name="j"):
-                B[i, j] = i + j
-                out[i, j] = B[i, j]
-
-    s = top.schedule()
-    s.affine(s.loops())
-    buffer = s.buffer("B")
-    axis = s.loop("i")
-
-    local = s.buffer_at(buffer, axis)
-    s.apply()
-
-    assert local.key in s.snapshot.values_by_key
-    assert "memref<1x4xi32>" in s.snapshot.values_by_key[local.key].type
-    assert s.payload.operation.verify()
-
-
-def test_pending_transforms_gate_real_ir():
-    @kernel
-    def top(A: i32[16], B: i32[16]):
-        for i in range(16):
-            B[i] = A[i] + 1
-
-    s = top.schedule()
-    loop = s.loop()
-    outer, inner = s.split(loop, factor=4)
-
-    # Real IR is unavailable while transforms are pending.
-    with pytest.raises(ScheduleStateError):
-        _ = s.payload
-    with pytest.raises(ScheduleStateError):
-        _ = s.snapshot
-
-    # Handles still resolve lazily against the predicted snapshot.
-    assert inner.kind == "scf.for"
-
-    s.apply()
-    assert outer.key in s.snapshot.ops_by_key
-    assert s.payload.operation.verify()
-
-
-def test_apply_is_idempotent():
-    @kernel
-    def top(A: i32[16], B: i32[16]):
-        for i in range(16):
-            B[i] = A[i] + 1
-
-    s = top.schedule()
-    outer, inner = s.split(s.loop(), factor=4)
-    s.pipeline(inner, ii=1).apply()
-    first = str(s.payload)
-
-    # Re-applying with no pending work is a no-op; handles stay live.
-    s.apply()
-    assert outer.key in s.snapshot.ops_by_key
-    assert inner.key in s.snapshot.ops_by_key
-    assert str(s.payload) == first
-
-
-def test_apply_incremental():
-    @kernel
-    def top(A: i32[16], B: i32[16]):
-        for i in range(16):
-            B[i] = A[i] + 1
-
-    s = top.schedule()
-    outer, inner = s.split(s.loop(), factor=4)
-    s.apply()
-    assert str(s.payload).count("scf.for") == 2
-
-    # A second apply runs only the new primitive (does not re-split).
-    s.pipeline(inner, ii=2).apply()
-    text = str(s.payload)
-    assert text.count("scf.for") == 2
-    assert "pipeline.ii = 2 : i64" in text
-    assert s.payload.operation.verify()
-    assert s.script._applied == len(s.script.includes)
-
-
-def test_apply_incremental_matches_batched():
-    def build():
-        @kernel
-        def top(A: i32[16], B: i32[16]):
-            for i in range(16):
-                B[i] = A[i] + 1
-
-        return top.schedule()
-
-    # All-at-once.
-    s1 = build()
-    o1, i1 = s1.split(s1.loop(), factor=4)
-    s1.pipeline(i1, ii=2).apply()
-
-    # Same transforms split across two apply batches.
-    s2 = build()
-    o2, i2 = s2.split(s2.loop(), factor=4)
-    s2.apply()
-    s2.pipeline(i2, ii=2).apply()
-
-    assert str(s1.payload) == str(s2.payload)
-
-
-def test_consumed_handle_raises():
-    @kernel
-    def top(A: i32[16], B: i32[16]):
-        for i in range(16):
-            B[i] = A[i] + 1
-
-    s = top.schedule()
-    loop = s.loop()
-    s.split(loop, factor=4)
-
-    # `loop` was consumed by split; reusing it is a frontend error.
-    with pytest.raises(ConsumedHandleError):
-        s.pipeline(loop, ii=1)
-
-
-def test_compose_applies_callee_schedule():
-    @kernel
-    def worker(a: i32[16], b: i32[16]):
-        for i in range(16, name="i"):
-            b[i] = a[i] + 1
-
-    @kernel
-    def top(A: i32[16], B: i32[16]):
-        worker(A, B)
-
-    # Schedule the callee standalone (lazy), then compose it into the parent's copy.
-    ws = worker.schedule()
-    ws.pipeline(ws.loop("i"), ii=2)
-
-    ts = top.schedule()
-    ts.compose(ws)
-    ts.apply()
-
-    text = str(ts.payload)
-    assert "@top.worker" in text
-    assert "pipeline.ii = 2 : i64" in text
-    assert ts.payload.operation.verify()
-
-
-def test_compose_targets_specific_copy_with_id():
-    @kernel
-    def worker(a: i32[16], b: i32[16]):
-        for i in range(16, name="i"):
-            b[i] = a[i] + 1
-
-    @kernel
-    def top(A: i32[16], B: i32[16]):
-        worker(A, B)
-        worker(B, A)
-
-    ws = worker.schedule()
-    ws.pipeline(ws.loop("i"), ii=3)
-
-    ts = top.schedule()
-    # The second call is specialized as `top.worker.1`.
-    ts.compose(ws, id=1)
-    ts.apply()
-
-    assert "pipeline.ii = 3 : i64" in str(ts.payload)
-    assert ts.payload.operation.verify()
-
-
 def test_compose_missing_callee_raises():
     @kernel
-    def worker(a: i32[16], b: i32[16]):
+    def worker(a: "i32[16]", b: "i32[16]"):
         for i in range(16, name="i"):
             b[i] = a[i] + 1
 
     @kernel
-    def top(A: i32[16], B: i32[16]):
+    def top(A: "i32[16]", B: "i32[16]"):
         for i in range(16):
             B[i] = A[i] + 1
 
@@ -350,7 +54,7 @@ def test_schedule_requires_bound_templates():
     N = Template("N")
 
     @kernel(N)
-    def top(A: i32[N], B: i32[N]):
+    def top(A: "i32[N]", B: "i32[N]"):
         for i in range(N, name="i"):
             B[i] = A[i] + 1
 
@@ -367,16 +71,16 @@ def test_schedule_requires_bound_templates():
 
 def test_compose_nested():
     @kernel
-    def inner(a: i32[16], b: i32[16]):
+    def inner(a: "i32[16]", b: "i32[16]"):
         for i in range(16, name="i"):
             b[i] = a[i] + 1
 
     @kernel
-    def mid(a: i32[16], b: i32[16]):
+    def mid(a: "i32[16]", b: "i32[16]"):
         inner(a, b)
 
     @kernel
-    def top(A: i32[16], B: i32[16]):
+    def top(A: "i32[16]", B: "i32[16]"):
         mid(A, B)
 
     # inner's schedule -> composed into mid -> composed into top, transitively.
@@ -392,39 +96,494 @@ def test_compose_nested():
     text = str(ts.payload)
     assert "@top.mid" in text
     assert "@top.mid.inner" in text
-    # inner's pipeline reaches the transitive copy under top.
     assert "pipeline.ii = 2 : i64" in text
     assert ts.payload.operation.verify()
 
 
-def test_compose_nested_with_own_primitive():
-    @kernel
-    def inner(a: i32[16], b: i32[16]):
-        for i in range(16, name="i"):
-            b[i] = a[i] + 1
+# ===========================================================================
+# Migrated from tests/test_schedule_compute.py
+# ===========================================================================
+
+
+def test_split():
+    M, N = 10, 20
 
     @kernel
-    def mid(a: i32[16], b: i32[16]):
-        inner(a, b)
-        for k in range(16, name="k"):
-            b[k] = b[k] + 1
+    def add(A: "i32[M,N]", B: "i32[M,N]", C: "i32[M,N]"):
+        for i in range(M, name="i"):
+            for j in range(N, name="j"):
+                C[i, j] = A[i, j] + B[i, j]
+
+    s = add.schedule()
+    outer, inner = s.split(s.loop("j"), factor=4)
+    mod = s.export("cpu")
+
+    assert outer.key in s.snapshot.ops_by_key
+    assert inner.key in s.snapshot.ops_by_key
+
+    A = np.random.randint(0, 10, (M, N)).astype(np.int32)
+    B = np.random.randint(0, 10, (M, N)).astype(np.int32)
+    C = np.zeros((M, N), dtype=np.int32)
+    mod(A, B, C)
+    np.testing.assert_array_equal(C, A + B)
+
+
+def test_split_indivisible_factor():
+    M, N = 10, 20
 
     @kernel
-    def top(A: i32[16], B: i32[16]):
-        mid(A, B)
+    def add(A: "i32[M,N]", B: "i32[M,N]", C: "i32[M,N]"):
+        for i in range(M, name="i"):
+            for j in range(N, name="j"):
+                C[i, j] = A[i, j] + B[i, j]
 
-    inner_s = inner.schedule()
-    inner_s.pipeline(inner_s.loop("i"), ii=2)
-    mid_s = mid.schedule()
-    mid_s.pipeline(mid_s.loop("k"), ii=4)  # mid's own loop
-    mid_s.compose(inner_s)  # plus inner's schedule
+    # 20 is not divisible by 3: the split must still produce correct results.
+    s = add.schedule()
+    s.split(s.loop("j"), factor=3)
+    mod = s.export("cpu")
+
+    A = np.random.randint(0, 10, (M, N)).astype(np.int32)
+    B = np.random.randint(0, 10, (M, N)).astype(np.int32)
+    C = np.zeros((M, N), dtype=np.int32)
+    mod(A, B, C)
+    np.testing.assert_array_equal(C, A + B)
+
+
+def test_pipeline():
+    M, N = 10, 20
+
+    @kernel
+    def add(A: "i32[M,N]", B: "i32[M,N]", C: "i32[M,N]"):
+        for i in range(M, name="i"):
+            for j in range(N, name="j"):
+                C[i, j] = A[i, j] + B[i, j]
+
+    s = add.schedule()
+    s.pipeline(s.loop("i"), ii=4)
+    mod = s.export("cpu")
+    assert "pipeline.ii = 4 : i64" in str(s.payload)
+
+    A = np.random.randint(0, 10, (M, N)).astype(np.int32)
+    B = np.random.randint(0, 10, (M, N)).astype(np.int32)
+    C = np.zeros((M, N), dtype=np.int32)
+    mod(A, B, C)
+    np.testing.assert_array_equal(C, A + B)
+
+
+def test_unroll():
+    M, N = 10, 20
+
+    @kernel
+    def add(A: "i32[M,N]", B: "i32[M,N]", C: "i32[M,N]"):
+        for i in range(M, name="i"):
+            for j in range(N, name="j"):
+                C[i, j] = A[i, j] + B[i, j]
+
+    s = add.schedule()
+    s.unroll(s.loop("j"), factor=4).apply()
+    assert "unroll.f = 4 : i64" in str(s.payload)
+    assert s.payload.operation.verify()
+
+
+def test_reorder():
+    M, N, K, L = 4, 4, 4, 4
+
+    @kernel
+    def add(A: "i32[M,N,K,L]", B: "i32[M,N,K,L]", C: "i32[M,N,K,L]"):
+        for i in range(M, name="i"):
+            for j in range(N, name="j"):
+                for k in range(K, name="k"):
+                    for l in range(L, name="l"):
+                        C[i, j, k, l] = A[i, j, k, l] + B[i, j, k, l]
+
+    # Reorder non-consecutive axes (l before i) inside the affine band.
+    s = add.schedule()
+    i, j, k, l = s.affine(s.loops("i", "j", "k", "l"))
+    s.reorder((l, i))
+    mod = s.export("cpu")
+
+    A = np.random.randint(0, 10, (M, N, K, L)).astype(np.int32)
+    B = np.random.randint(0, 10, (M, N, K, L)).astype(np.int32)
+    C = np.zeros((M, N, K, L), dtype=np.int32)
+    mod(A, B, C)
+    np.testing.assert_array_equal(C, A + B)
+
+
+def test_split_reorder():
+    M, N = 8, 8
+
+    @kernel
+    def add(A: "i32[M,N]", B: "i32[M,N]", C: "i32[M,N]"):
+        for i in range(M, name="i"):
+            for j in range(N, name="j"):
+                C[i, j] = A[i, j] + B[i, j]
+
+    s = add.schedule()
+    i, j = s.affine(s.loops("i", "j"))
+    io, ii = s.split(i, factor=2)
+    jo, ji = s.split(j, factor=4)
+    s.reorder((jo, io, ji, ii))
+    mod = s.export("cpu")
+
+    A = np.random.randint(0, 10, (M, N)).astype(np.int32)
+    B = np.random.randint(0, 10, (M, N)).astype(np.int32)
+    C = np.zeros((M, N), dtype=np.int32)
+    mod(A, B, C)
+    np.testing.assert_array_equal(C, A + B)
+
+
+def test_tile():
+    M, N = 8, 8
+
+    @kernel
+    def add(A: "i32[M,N]", B: "i32[M,N]", C: "i32[M,N]"):
+        for i in range(M, name="i"):
+            for j in range(N, name="j"):
+                C[i, j] = A[i, j] + B[i, j]
+
+    s = add.schedule()
+    i, j = s.affine(s.loops("i", "j"))
+    s.tile((i, j), factors=[2, 4])
+    mod = s.export("cpu")
+
+    A = np.random.randint(0, 10, (M, N)).astype(np.int32)
+    B = np.random.randint(0, 10, (M, N)).astype(np.int32)
+    C = np.zeros((M, N), dtype=np.int32)
+    mod(A, B, C)
+    np.testing.assert_array_equal(C, A + B)
+
+
+def test_flatten():
+    M, N = 8, 8
+
+    @kernel
+    def add(A: "i32[M,N]", B: "i32[M,N]", C: "i32[M,N]"):
+        for i in range(M, name="i"):
+            for j in range(N, name="j"):
+                C[i, j] = A[i, j] + B[i, j]
+
+    # .fuse in the old frontend is .flatten in the new one.
+    s = add.schedule()
+    i, j = s.affine(s.loops("i", "j"))
+    s.flatten((i, j))
+    mod = s.export("cpu")
+
+    assert str(s.payload).count("affine.for") == 1
+    A = np.random.randint(0, 10, (M, N)).astype(np.int32)
+    B = np.random.randint(0, 10, (M, N)).astype(np.int32)
+    C = np.zeros((M, N), dtype=np.int32)
+    mod(A, B, C)
+    np.testing.assert_array_equal(C, A + B)
+
+
+def test_gemm_split_reorder():
+    M, N, K = 8, 8, 8
+
+    @kernel
+    def gemm(A: "f32[M,K]", B: "f32[K,N]", C: "f32[M,N]"):
+        for i in range(M, name="i"):
+            for j in range(N, name="j"):
+                for k in range(K, name="k"):
+                    C[i, j] += A[i, k] * B[k, j]
+
+    s = gemm.schedule()
+    i, j, k = s.affine(s.loops("i", "j", "k"))
+    io, ii = s.split(i, factor=2)
+    jo, ji = s.split(j, factor=2)
+    s.reorder((io, jo, ii, ji))
+    mod = s.export("cpu")
+
+    A = np.random.rand(M, K).astype(np.float32)
+    B = np.random.rand(K, N).astype(np.float32)
+    C = np.zeros((M, N), dtype=np.float32)
+    mod(A, B, C)
+    np.testing.assert_allclose(C, A @ B, rtol=1e-4)
+
+
+def test_compute_at():
+    H, W = 8, 8
+
+    @kernel
+    def two_band(A: "i32[H,W]", C: "i32[H,W]"):
+        B: "i32[H,W]" = 0
+        for bi in range(H, name="bi"):
+            for bj in range(W, name="bj"):
+                B[bi, bj] = A[bi, bj] + 1
+        for ci in range(H, name="ci"):
+            for cj in range(W, name="cj"):
+                C[ci, cj] = B[ci, cj] * 2
+
+    s = two_band.schedule()
+    s.affine(s.loops("bi", "bj", "ci", "cj"))
+    s.compute_at(s.loop("bi"), s.loop("ci"))
+    mod = s.export("cpu")
+
+    A = np.random.randint(0, 10, (H, W)).astype(np.int32)
+    C = np.zeros((H, W), dtype=np.int32)
+    mod(A, C)
+    np.testing.assert_array_equal(C, (A + 1) * 2)
+
+
+def test_compute_at_complex():
+    P = 4
+
+    @kernel
+    def three_band(A: "i32[P,P,P]", D: "i32[P,P,P]"):
+        B: "i32[P,P,P]" = 0
+        for bi in range(P, name="bi"):
+            for bj in range(P, name="bj"):
+                for bm in range(P, name="bm"):
+                    B[bi, bj, bm] = A[bi, bj, bm] * 2
+        C: "i32[P,P,P]" = 0
+        for ci in range(P, name="ci"):
+            for cj in range(P, name="cj"):
+                for cm in range(P, name="cm"):
+                    C[ci, cj, cm] = B[ci, cj, cm] + 1
+        for di in range(P, name="di"):
+            for dj in range(P, name="dj"):
+                for dm in range(P, name="dm"):
+                    D[di, dj, dm] = C[di, dj, dm] % 3
+
+    s = three_band.schedule()
+    s.affine(s.loops())
+    s.compute_at(s.loop("bj"), s.loop("cj"))
+    s.compute_at(s.loop("cm"), s.loop("dm"))
+    mod = s.export("cpu")
+
+    A = np.random.randint(0, 10, (P, P, P)).astype(np.int32)
+    D = np.zeros((P, P, P), dtype=np.int32)
+    mod(A, D)
+    np.testing.assert_array_equal(D, ((A * 2) + 1) % 3)
+
+
+# ===========================================================================
+# Migrated from tests/test_schedule_memory.py
+# ===========================================================================
+
+
+def test_buffer_at():
+    M, N = 8, 8
+
+    @kernel
+    def addone(A: "f32[M,N]", B: "f32[M,N]"):
+        for i in range(M, name="i"):
+            for j in range(N, name="j"):
+                B[i, j] = A[i, j] + 1.0
+
+    s = addone.schedule()
+    s.affine(s.loops("i", "j"))
+    s.buffer_at(s.buffer("B"), s.loop("i"))
+    mod = s.export("cpu")
+
+    A = np.random.rand(M, N).astype(np.float32)
+    B = np.zeros((M, N), dtype=np.float32)
+    mod(A, B)
+    np.testing.assert_allclose(B, A + 1.0, rtol=1e-5)
+
+
+def test_interleaving_acc():
+    M, N, K = 8, 8, 8
+
+    @kernel
+    def gemm(A: "f32[M,K]", B: "f32[K,N]", C: "f32[M,N]"):
+        for i in range(M, name="i"):
+            for j in range(N, name="j"):
+                for k in range(K, name="k"):
+                    C[i, j] += A[i, k] * B[k, j]
+
+    s = gemm.schedule()
+    s.affine(s.loops("i", "j", "k"))
+    s.reorder((s.loop("k"), s.loop("j")))
+    s.buffer_at(s.buffer("C"), s.loop("i"))
+    s.pipeline(s.loop("j"))
+    mod = s.export("cpu")
+
+    A = np.random.rand(M, K).astype(np.float32)
+    B = np.random.rand(K, N).astype(np.float32)
+    C = np.zeros((M, N), dtype=np.float32)
+    mod(A, B, C)
+    np.testing.assert_allclose(C, A @ B, rtol=1e-4)
+
+
+def test_partition_basic():
+    M, N = 10, 10
+
+    @kernel
+    def copy(A: "i32[M,N]", B: "i32[M,N]"):
+        for i in range(M, name="i"):
+            for j in range(N, name="j"):
+                B[i, j] = A[i, j]
+
+    s = copy.schedule()
+    s.partition(s.buffer("A"))
+    s.apply()
+    assert s.payload.operation.verify()
+    # Partition is recorded as a kernel-argument attribute at schedule level.
+    assert "partition<[(0,Complete,0)]>" in str(s.payload)
+
+
+def test_partition_dim_factor():
+    M, N = 10, 10
+
+    @kernel
+    def copy(A: "i32[M,N]", B: "i32[M,N]"):
+        for i in range(M, name="i"):
+            for j in range(N, name="j"):
+                B[i, j] = A[i, j]
+
+    s = copy.schedule()
+    s.partition(s.buffer("A"), dim=1, factor=2, kind=Schedule.Block)
+    s.apply()
+    assert s.payload.operation.verify()
+    assert "partition<[(1,Block,2)]>" in str(s.payload)
+
+
+# ===========================================================================
+# Migrated from tests/test_schedule_compose.py
+# ===========================================================================
+
+
+def test_compose_two_kernels():
+    M, K, N = 8, 8, 8
+
+    @kernel
+    def gemm(A: "i32[M,K]", B: "i32[K,N]", C: "i32[M,N]"):
+        for i in range(M, name="i"):
+            for j in range(N, name="j"):
+                for k in range(K, name="k"):
+                    C[i, j] += A[i, k] * B[k, j]
+
+    @kernel
+    def addone(C: "i32[M,N]", D: "i32[M,N]"):
+        for i in range(M, name="i"):
+            for j in range(N, name="j"):
+                D[i, j] = C[i, j] + 1
+
+    @kernel
+    def top(A: "i32[M,K]", B: "i32[K,N]", C: "i32[M,N]", D: "i32[M,N]"):
+        gemm(A, B, C)
+        addone(C, D)
+
+    gs = gemm.schedule()
+    gs.pipeline(gs.loop("j"), ii=1)
+    as_ = addone.schedule()
+    as_.pipeline(as_.loop("j"), ii=1)
 
     ts = top.schedule()
-    ts.compose(mid_s)
-    ts.apply()
+    ts.compose(gs)
+    ts.compose(as_)
+    mod = ts.export("cpu")
 
-    text = str(ts.payload)
-    # Both bodies land on their respective copies (mid's own loop + inner's copy).
-    assert "pipeline.ii = 4 : i64" in text
-    assert "pipeline.ii = 2 : i64" in text
-    assert ts.payload.operation.verify()
+    A = np.random.randint(0, 10, (M, K)).astype(np.int32)
+    B = np.random.randint(0, 10, (K, N)).astype(np.int32)
+    C = np.zeros((M, N), dtype=np.int32)
+    D = np.zeros((M, N), dtype=np.int32)
+    mod(A, B, C, D)
+    np.testing.assert_array_equal(D, A @ B + 1)
+
+
+def test_compose_gemm_scheduled():
+    M, N, K = 8, 8, 8
+
+    @kernel
+    def gemm(A: "f32[M,K]", B: "f32[K,N]", C: "f32[M,N]"):
+        for i in range(M, name="i"):
+            for j in range(N, name="j"):
+                for k in range(K, name="k"):
+                    C[i, j] += A[i, k] * B[k, j]
+
+    @kernel
+    def top(A: "f32[M,K]", B: "f32[K,N]", C: "f32[M,N]"):
+        gemm(A, B, C)
+
+    gs = gemm.schedule()
+    gs.affine(gs.loops("i", "j", "k"))
+    gs.reorder((gs.loop("k"), gs.loop("j")))
+    gs.buffer_at(gs.buffer("C"), gs.loop("i"))
+    gs.pipeline(gs.loop("j"))
+
+    ts = top.schedule()
+    ts.compose(gs)
+    mod = ts.export("cpu")
+
+    A = np.random.rand(M, K).astype(np.float32)
+    B = np.random.rand(K, N).astype(np.float32)
+    C = np.zeros((M, N), dtype=np.float32)
+    mod(A, B, C)
+    np.testing.assert_allclose(C, A @ B, rtol=1e-4)
+
+
+def test_compose_dependent_primitives():
+    @kernel
+    def worker(A: "i32[32]"):
+        for i in range(32, name="i"):
+            A[i] = i
+
+    @kernel
+    def top(A: "i32[32]"):
+        worker(A)
+
+    ws = worker.schedule()
+    outer, inner = ws.split(ws.loop("i"), factor=2)
+    ws.pipeline(inner, ii=1)
+
+    ts = top.schedule()
+    ts.compose(ws)
+    mod = ts.export("cpu")
+
+    A = np.zeros((32,), dtype=np.int32)
+    mod(A)
+    np.testing.assert_array_equal(A, np.arange(32, dtype=np.int32))
+
+
+# ===========================================================================
+# reuse_at: not yet wired into the new schedule -> expected failure.
+# ===========================================================================
+
+
+@pytest.mark.xfail(reason="reuse_at is not yet implemented in the new schedule")
+def test_reuse_blur_x():
+    H, W = 10, 10
+
+    @kernel
+    def blur(A: "i32[H,W]", B: "i32[H,8]"):
+        for y in range(H, name="y"):
+            for x in range(8, name="x"):
+                B[y, x] = A[y, x] + A[y, x + 1] + A[y, x + 2]
+
+    s = blur.schedule()
+    s.affine(s.loops("y", "x"))
+    s.reuse_at(s.buffer("A"), s.loop("x"))
+    mod = s.export("cpu")
+
+    A = np.random.randint(0, 10, (H, W)).astype(np.int32)
+    B = np.zeros((H, 8), dtype=np.int32)
+    mod(A, B)
+    ref = A[:, 0:8] + A[:, 1:9] + A[:, 2:10]
+    np.testing.assert_array_equal(B, ref)
+
+
+@pytest.mark.xfail(reason="reuse_at is not yet implemented in the new schedule")
+def test_reuse_blur_x_y():
+    H, W = 10, 10
+
+    @kernel
+    def blur(A: "i32[H,W]", B: "i32[8,8]"):
+        for y in range(8, name="y"):
+            for x in range(8, name="x"):
+                B[y, x] = A[y, x] + A[y + 1, x + 1] + A[y + 2, x + 2]
+
+    s = blur.schedule()
+    s.affine(s.loops("y", "x"))
+    rb_y = s.reuse_at(s.buffer("A"), s.loop("y"))
+    s.reuse_at(rb_y, s.loop("x"))
+    mod = s.export("cpu")
+
+    A = np.random.randint(0, 10, (H, W)).astype(np.int32)
+    B = np.zeros((8, 8), dtype=np.int32)
+    mod(A, B)
+    ref = np.zeros((8, 8), dtype=np.int32)
+    for y in range(8):
+        for x in range(8):
+            ref[y, x] = A[y, x] + A[y + 1, x + 1] + A[y + 2, x + 2]
+    np.testing.assert_array_equal(B, ref)

@@ -142,11 +142,21 @@ class ScheduleSnapshot:
         self.values_by_key: dict[str, ValueNode] = {
             self._value_relkey(value): value
             for value in self.values
-            if self._in_primary(self.scope_of(value.owner_id))
+            if self._in_primary(self.value_scope(value))
         }
 
     def _in_primary(self, scope: str) -> bool:
         return self.primary_path is None or scope == self.primary_path
+
+    def value_scope(self, value: ValueNode) -> str:
+        """Enclosing-function scope a value belongs to: the function it is
+        defined in. An op result lives in the op's enclosing function; a
+        function's block argument belongs to the function itself (whereas
+        ``scope_of`` would place the function in *its* enclosing scope)."""
+        owner = self.ops_by_id[value.owner_id]
+        if owner.has_trait(ScheduleOpTrait.FUNCTION_LIKE):
+            return owner.path
+        return self.scope_of(value.owner_id)
 
     @classmethod
     def from_raw(
@@ -228,7 +238,7 @@ class ScheduleSnapshot:
         value = self.values_by_id[value_id]
         return BufferRef(
             key=self._value_relkey(value),
-            scope=self.scope_of(value.owner_id),
+            scope=self.value_scope(value),
             kind="buffer",
             name=value.name,
             owner_key=self.relkey_of(value.owner_id),
@@ -338,7 +348,7 @@ class PredictedSnapshot:
                 traits=node.traits,
             )
         for value in real.values:
-            scope = real.scope_of(value.owner_id)
+            scope = real.value_scope(value)
             relkey = real._value_relkey(value)
             pred._values[(scope, relkey)] = PredictedValue(
                 scope=scope,

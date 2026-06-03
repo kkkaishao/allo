@@ -1,0 +1,17 @@
+1.554064e+00 buffer_at.mlir
+-1.556022e+00 compute_at.mlir
+-1.549753e+00 flatten.mlir
+-1.553324e+00 outline.mlir
+-1.552205e+00 partition.mlir
+1.544250e+00 raise_to_affine.mlir
+1.539950e+00 reorder.mlir
+-1.639804e+00 reuse_at.mlir
+-1.549185e+00 split.mlir
+-1.557329e+00 tile.mlir
+1.512219e+00 allo/roundtrip.mlir
+1.519845e+00 allo/types.mlir
+1.519923e+00 allo/resources.mlir
+1.526042e+00 allo/instructions.mlir
+1.523282e+00 allo/oracle.mlir
+1.531210e+00 allo/oracle_controlflow.mlir
+1.539770e+00 allo/oracle_to_llvm.mlir
