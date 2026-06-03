@@ -35,12 +35,12 @@ def test_schedule_from_string():
 
 def test_compose_missing_callee_raises():
     @kernel
-    def worker(a: "i32[16]", b: "i32[16]"):
+    def worker(a: i32[16], b: i32[16]):
         for i in range(16, name="i"):
             b[i] = a[i] + 1
 
     @kernel
-    def top(A: "i32[16]", B: "i32[16]"):
+    def top(A: i32[16], B: i32[16]):
         for i in range(16):
             B[i] = A[i] + 1
 
@@ -54,7 +54,7 @@ def test_schedule_requires_bound_templates():
     N = Template("N")
 
     @kernel(N)
-    def top(A: "i32[N]", B: "i32[N]"):
+    def top(A: i32[N], B: i32[N]):
         for i in range(N, name="i"):
             B[i] = A[i] + 1
 
@@ -71,16 +71,16 @@ def test_schedule_requires_bound_templates():
 
 def test_compose_nested():
     @kernel
-    def inner(a: "i32[16]", b: "i32[16]"):
+    def inner(a: i32[16], b: i32[16]):
         for i in range(16, name="i"):
             b[i] = a[i] + 1
 
     @kernel
-    def mid(a: "i32[16]", b: "i32[16]"):
+    def mid(a: i32[16], b: i32[16]):
         inner(a, b)
 
     @kernel
-    def top(A: "i32[16]", B: "i32[16]"):
+    def top(A: i32[16], B: i32[16]):
         mid(A, B)
 
     # inner's schedule -> composed into mid -> composed into top, transitively.
@@ -109,7 +109,7 @@ def test_split():
     M, N = 10, 20
 
     @kernel
-    def add(A: "i32[M,N]", B: "i32[M,N]", C: "i32[M,N]"):
+    def add(A: i32[M, N], B: i32[M, N], C: i32[M, N]):
         for i in range(M, name="i"):
             for j in range(N, name="j"):
                 C[i, j] = A[i, j] + B[i, j]
@@ -132,7 +132,7 @@ def test_split_indivisible_factor():
     M, N = 10, 20
 
     @kernel
-    def add(A: "i32[M,N]", B: "i32[M,N]", C: "i32[M,N]"):
+    def add(A: i32[M, N], B: i32[M, N], C: i32[M, N]):
         for i in range(M, name="i"):
             for j in range(N, name="j"):
                 C[i, j] = A[i, j] + B[i, j]
@@ -153,7 +153,7 @@ def test_pipeline():
     M, N = 10, 20
 
     @kernel
-    def add(A: "i32[M,N]", B: "i32[M,N]", C: "i32[M,N]"):
+    def add(A: i32[M, N], B: i32[M, N], C: i32[M, N]):
         for i in range(M, name="i"):
             for j in range(N, name="j"):
                 C[i, j] = A[i, j] + B[i, j]
@@ -174,7 +174,7 @@ def test_unroll():
     M, N = 10, 20
 
     @kernel
-    def add(A: "i32[M,N]", B: "i32[M,N]", C: "i32[M,N]"):
+    def add(A: i32[M, N], B: i32[M, N], C: i32[M, N]):
         for i in range(M, name="i"):
             for j in range(N, name="j"):
                 C[i, j] = A[i, j] + B[i, j]
@@ -189,7 +189,7 @@ def test_reorder():
     M, N, K, L = 4, 4, 4, 4
 
     @kernel
-    def add(A: "i32[M,N,K,L]", B: "i32[M,N,K,L]", C: "i32[M,N,K,L]"):
+    def add(A: i32[M, N, K, L], B: i32[M, N, K, L], C: i32[M, N, K, L]):
         for i in range(M, name="i"):
             for j in range(N, name="j"):
                 for k in range(K, name="k"):
@@ -213,7 +213,7 @@ def test_split_reorder():
     M, N = 8, 8
 
     @kernel
-    def add(A: "i32[M,N]", B: "i32[M,N]", C: "i32[M,N]"):
+    def add(A: i32[M, N], B: i32[M, N], C: i32[M, N]):
         for i in range(M, name="i"):
             for j in range(N, name="j"):
                 C[i, j] = A[i, j] + B[i, j]
@@ -236,7 +236,7 @@ def test_tile():
     M, N = 8, 8
 
     @kernel
-    def add(A: "i32[M,N]", B: "i32[M,N]", C: "i32[M,N]"):
+    def add(A: i32[M, N], B: i32[M, N], C: i32[M, N]):
         for i in range(M, name="i"):
             for j in range(N, name="j"):
                 C[i, j] = A[i, j] + B[i, j]
@@ -257,7 +257,7 @@ def test_flatten():
     M, N = 8, 8
 
     @kernel
-    def add(A: "i32[M,N]", B: "i32[M,N]", C: "i32[M,N]"):
+    def add(A: i32[M, N], B: i32[M, N], C: i32[M, N]):
         for i in range(M, name="i"):
             for j in range(N, name="j"):
                 C[i, j] = A[i, j] + B[i, j]
@@ -280,7 +280,7 @@ def test_gemm_split_reorder():
     M, N, K = 8, 8, 8
 
     @kernel
-    def gemm(A: "f32[M,K]", B: "f32[K,N]", C: "f32[M,N]"):
+    def gemm(A: f32[M, K], B: f32[K, N], C: f32[M, N]):
         for i in range(M, name="i"):
             for j in range(N, name="j"):
                 for k in range(K, name="k"):
@@ -304,7 +304,7 @@ def test_compute_at():
     H, W = 8, 8
 
     @kernel
-    def two_band(A: "i32[H,W]", C: "i32[H,W]"):
+    def two_band(A: i32[H, W], C: i32[H, W]):
         B: "i32[H,W]" = 0
         for bi in range(H, name="bi"):
             for bj in range(W, name="bj"):
@@ -328,13 +328,13 @@ def test_compute_at_complex():
     P = 4
 
     @kernel
-    def three_band(A: "i32[P,P,P]", D: "i32[P,P,P]"):
-        B: "i32[P,P,P]" = 0
+    def three_band(A: i32[P, P, P], D: i32[P, P, P]):
+        B: i32[P, P, P] = 0
         for bi in range(P, name="bi"):
             for bj in range(P, name="bj"):
                 for bm in range(P, name="bm"):
                     B[bi, bj, bm] = A[bi, bj, bm] * 2
-        C: "i32[P,P,P]" = 0
+        C: i32[P, P, P] = 0
         for ci in range(P, name="ci"):
             for cj in range(P, name="cj"):
                 for cm in range(P, name="cm"):
@@ -365,7 +365,7 @@ def test_buffer_at():
     M, N = 8, 8
 
     @kernel
-    def addone(A: "f32[M,N]", B: "f32[M,N]"):
+    def addone(A: f32[M, N], B: f32[M, N]):
         for i in range(M, name="i"):
             for j in range(N, name="j"):
                 B[i, j] = A[i, j] + 1.0
@@ -385,7 +385,7 @@ def test_interleaving_acc():
     M, N, K = 8, 8, 8
 
     @kernel
-    def gemm(A: "f32[M,K]", B: "f32[K,N]", C: "f32[M,N]"):
+    def gemm(A: f32[M, K], B: f32[K, N], C: f32[M, N]):
         for i in range(M, name="i"):
             for j in range(N, name="j"):
                 for k in range(K, name="k"):
@@ -409,7 +409,7 @@ def test_partition_basic():
     M, N = 10, 10
 
     @kernel
-    def copy(A: "i32[M,N]", B: "i32[M,N]"):
+    def copy(A: i32[M, N], B: i32[M, N]):
         for i in range(M, name="i"):
             for j in range(N, name="j"):
                 B[i, j] = A[i, j]
@@ -426,7 +426,7 @@ def test_partition_dim_factor():
     M, N = 10, 10
 
     @kernel
-    def copy(A: "i32[M,N]", B: "i32[M,N]"):
+    def copy(A: i32[M, N], B: i32[M, N]):
         for i in range(M, name="i"):
             for j in range(N, name="j"):
                 B[i, j] = A[i, j]
@@ -447,20 +447,20 @@ def test_compose_two_kernels():
     M, K, N = 8, 8, 8
 
     @kernel
-    def gemm(A: "i32[M,K]", B: "i32[K,N]", C: "i32[M,N]"):
+    def gemm(A: i32[M, K], B: i32[K, N], C: i32[M, N]):
         for i in range(M, name="i"):
             for j in range(N, name="j"):
                 for k in range(K, name="k"):
                     C[i, j] += A[i, k] * B[k, j]
 
     @kernel
-    def addone(C: "i32[M,N]", D: "i32[M,N]"):
+    def addone(C: i32[M, N], D: i32[M, N]):
         for i in range(M, name="i"):
             for j in range(N, name="j"):
                 D[i, j] = C[i, j] + 1
 
     @kernel
-    def top(A: "i32[M,K]", B: "i32[K,N]", C: "i32[M,N]", D: "i32[M,N]"):
+    def top(A: i32[M, K], B: i32[K, N], C: i32[M, N], D: i32[M, N]):
         gemm(A, B, C)
         addone(C, D)
 
@@ -486,14 +486,14 @@ def test_compose_gemm_scheduled():
     M, N, K = 8, 8, 8
 
     @kernel
-    def gemm(A: "f32[M,K]", B: "f32[K,N]", C: "f32[M,N]"):
+    def gemm(A: f32[M, K], B: f32[K, N], C: f32[M, N]):
         for i in range(M, name="i"):
             for j in range(N, name="j"):
                 for k in range(K, name="k"):
                     C[i, j] += A[i, k] * B[k, j]
 
     @kernel
-    def top(A: "f32[M,K]", B: "f32[K,N]", C: "f32[M,N]"):
+    def top(A: f32[M, K], B: f32[K, N], C: f32[M, N]):
         gemm(A, B, C)
 
     gs = gemm.schedule()
@@ -515,12 +515,12 @@ def test_compose_gemm_scheduled():
 
 def test_compose_dependent_primitives():
     @kernel
-    def worker(A: "i32[32]"):
+    def worker(A: i32[32]):
         for i in range(32, name="i"):
             A[i] = i
 
     @kernel
-    def top(A: "i32[32]"):
+    def top(A: i32[32]):
         worker(A)
 
     ws = worker.schedule()
@@ -546,7 +546,7 @@ def test_reuse_blur_x():
     H, W = 10, 10
 
     @kernel
-    def blur(A: "i32[H,W]", B: "i32[H,8]"):
+    def blur(A: i32[H, W], B: i32[H, 8]):
         for y in range(H, name="y"):
             for x in range(8, name="x"):
                 B[y, x] = A[y, x] + A[y, x + 1] + A[y, x + 2]
@@ -568,7 +568,7 @@ def test_reuse_blur_x_y():
     H, W = 10, 10
 
     @kernel
-    def blur(A: "i32[H,W]", B: "i32[8,8]"):
+    def blur(A: i32[H, W], B: i32[8, 8]):
         for y in range(8, name="y"):
             for x in range(8, name="x"):
                 B[y, x] = A[y, x] + A[y + 1, x + 1] + A[y + 2, x + 2]
