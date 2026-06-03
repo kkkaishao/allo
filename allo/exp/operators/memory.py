@@ -3,6 +3,7 @@
 
 from ..lang.operator import operator
 from ..lang.core import (
+    APInt,
     DType,
     ShapedType,
     StreamType,
@@ -11,7 +12,7 @@ from ..lang.core import (
     AlloValue,
 )
 from ..compiler.builder import AlloOpBuilder
-from .utils import operator_body_unreachable
+from .utils import operator_body_unreachable, BitSlice
 
 
 def _normalize_stream_indices(
@@ -56,13 +57,37 @@ def _load_stream_value(builder: AlloOpBuilder, stream: AlloValue, slices):
     return ref
 
 
+def _bit_slice(builder: AlloOpBuilder, value: AlloValue, slc: BitSlice):
+    # The result width ``hi - lo`` must be statically known (the offset may be
+    # dynamic); the codegen infers it affinely and leaves ``width`` as ``None``
+    # when it is not a compile-time constant.
+    if not isinstance(value, AlloValue) or not isinstance(value.dtype, APInt):
+        return builder.compile_error(
+            "Bit slicing is only supported on signless integer scalars."
+        )
+    if slc.lo is None or slc.hi is None:
+        return builder.compile_error(
+            "Bit slice requires explicit lower and upper bounds, e.g. 'x[lo:hi]'."
+        )
+    if slc.width is None:
+        return builder.compile_error(
+            "Bit slice width 'hi - lo' must be a compile-time constant; "
+            "only the offset may be dynamic."
+        )
+    if slc.width <= 0:
+        return builder.compile_error(
+            "Bit slice upper bound must be greater than the lower bound."
+        )
+    return slc.lo, slc.hi, APInt(slc.width, signed=False)
+
+
 @operator
 def load(lhs, slices):
     operator_body_unreachable()
 
 
 @load.build
-def _(builder: AlloOpBuilder, lhs, slices: slice | tuple):
+def _(builder: AlloOpBuilder, lhs, slices: BitSlice | tuple):
     if isinstance(lhs, AlloValue) and isinstance(lhs.type, StreamType):
         return _load_stream_value(builder, lhs, slices)
 
@@ -81,8 +106,9 @@ def _(builder: AlloOpBuilder, lhs, slices: slice | tuple):
                 )
             return builder.create_bit_extract(lhs, indices[0])
 
-    elif isinstance(slices, slice):
-        raise NotImplementedError("Slice indices are not supported yet.")
+    elif isinstance(slices, BitSlice):
+        lo, hi, result_dtype = _bit_slice(builder, lhs, slices)
+        return builder.create_bit_get_slice(lhs, lo, hi, result_dtype)
 
     return builder.compile_error(
         f"Unsupported load operation: lhs of type {lhs.type} with indices of type {type(slices)}"
@@ -95,7 +121,7 @@ def store(dst, slices, value):
 
 
 @store.build
-def _(builder: AlloOpBuilder, dst, slices: slice | tuple, value):
+def _(builder: AlloOpBuilder, dst, slices: BitSlice | tuple, value):
     if isinstance(dst, AlloValue) and isinstance(dst.type, StreamType):
         return builder.compile_error(
             "Cannot assign to a stream. Use put(value) on the stream reference."
@@ -118,8 +144,10 @@ def _(builder: AlloOpBuilder, dst, slices: slice | tuple, value):
             val = builder.cast(value, u1)
             return builder.create_bit_insert(val, dst, indices[0])
 
-    elif isinstance(slices, slice):
-        raise NotImplementedError("Slice indices are not supported yet.")
+    elif isinstance(slices, BitSlice):
+        lo, hi, slice_dtype = _bit_slice(builder, dst, slices)
+        val = builder.cast(value, slice_dtype)
+        return builder.create_bit_set_slice(dst, lo, hi, val)
 
     raise builder.compile_error(
         f"Unsupported store operation: dst of type {dst.type} with indices of type {type(slices)}"

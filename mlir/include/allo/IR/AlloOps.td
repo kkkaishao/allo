@@ -251,4 +251,28 @@ def StreamCreateOp : Allo_Op<"stream.create", [MemoryEffects<[MemAlloc]>]> {
   }];
 }
 
+//===----------------------------------------------------------------------===//
+// Bit Operations
+//===----------------------------------------------------------------------===//
+
+def BitGetSliceOp : Allo_Op<"bit.get_slice", [Pure]> {
+  let summary = "get a slice of a integer";
+  let arguments = (ins SignlessIntegerLike:$src, Index:$lo, Index:$hi);
+  let results = (outs SignlessIntegerLike:$result);
+  let assemblyFormat = [{
+    $src `[` $lo `:` $hi `]` attr-dict `:` type($result) `from` type($src)
+  }];
+}
+
+def BitSetSliceOp : Allo_Op<"bit.set_slice", [
+  Pure, AllTypesMatch<["src", "result"]>
+  ]> {
+  let summary = "set a slice of a integer";
+  let arguments = (ins SignlessIntegerLike:$src, Index:$lo, Index:$hi, SignlessIntegerLike:$value);
+  let results = (outs SignlessIntegerLike:$result);
+  let assemblyFormat = [{
+    $src `[` $lo `:` $hi `]` `,` $value attr-dict `:` type($value) `into` type($src)
+  }];
+}
+
 #endif // ALLO_OPS

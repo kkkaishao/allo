@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import functools
 from collections.abc import Iterable, Sequence
-from typing import Literal
+from typing import Literal, Generic, TypeVar, ParamSpec
 
 from ..lang.kernel import Kernel
 from .errors import (
@@ -53,7 +53,11 @@ def _within_context(method):
     return wrapper
 
 
-class Schedule:
+P = ParamSpec("P")
+R = TypeVar("R")
+
+
+class Schedule(Generic[P, R]):
     """Lazy schedule frontend: primitives accumulate a reusable transform program
     (``@sched(%root)``) and a predicted snapshot; ``apply()`` runs the program once.
 
@@ -71,7 +75,7 @@ class Schedule:
         module: Module | None = None,
         context: Context | None = None,
         *,
-        kernel: Kernel | None = None,
+        kernel: Kernel[P, R] | None = None,
         primary: str | None = None,
     ):
         assert not (kernel and module), "cannot specify both kernel and module"

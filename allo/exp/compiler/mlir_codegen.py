@@ -59,6 +59,7 @@ from ..lang.core import (
 )
 from ..lang.operator import Operator, BoundOperator, NO_FOLD
 from ..operators import arith as arith_ops, memory as mem_ops
+from ..operators.utils import BitSlice
 from .errors import CompilationError, StaticAssertionError, InternalCompilerError
 
 
@@ -579,10 +580,78 @@ class MLIRCodeGenerator(ast.NodeVisitor):
         ast.NodeVisitor.generic_visit(self, node)
 
     def visit_Slice(self, node: ast.Slice):
-        lower = self.visit(node.lower) if node.lower else None
-        upper = self.visit(node.upper) if node.upper else None
-        step = self.visit(node.step) if node.step else None
-        return builtins.slice(lower, upper, step)
+        # Slices only appear as integer bit slices ``x[lo:hi]`` in this frontend.
+        # The width ``hi - lo`` must be statically known (the offset may be
+        # dynamic), so infer it affinely from the AST before lowering the bounds.
+        if node.step is not None:
+            return self.compile_error("Bit slice does not support a step.")
+        lo = self.visit(node.lower) if node.lower is not None else None
+        hi = self.visit(node.upper) if node.upper is not None else None
+        width = self._infer_bit_slice_width(node.lower, node.upper)
+        return BitSlice(lo, hi, width)
+
+    def _infer_bit_slice_width(self, lower, upper):
+        """Infer the constant bit width ``hi - lo`` of a slice, or ``None`` when
+        the difference is not a compile-time constant. The offset may still be
+        dynamic: ``x[i:i+2]`` has width 2 because the ``i`` terms cancel."""
+        if lower is None or upper is None:
+            return None
+        lo = self._affine_form(lower)
+        hi = self._affine_form(upper)
+        if lo is None or hi is None:
+            return None
+        terms = dict(hi[1])
+        for key, coeff in lo[1].items():
+            terms[key] = terms.get(key, 0) - coeff
+        if any(coeff != 0 for coeff in terms.values()):
+            return None
+        return hi[0] - lo[0]
+
+    def _affine_form(self, node):
+        """Decompose an integer expression into affine form
+        ``(const, {atom: coeff})``, or ``None`` if it is not integer-affine.
+        Identical sub-expressions share an atom key so they cancel on subtraction."""
+        if isinstance(node, ast.Constant):
+            return (node.value, {}) if type(node.value) is builtins.int else None
+        if isinstance(node, ast.UnaryOp):
+            if isinstance(node.op, ast.UAdd):
+                return self._affine_form(node.operand)
+            if isinstance(node.op, ast.USub):
+                sub = self._affine_form(node.operand)
+                if sub is None:
+                    return None
+                return (-sub[0], {k: -v for k, v in sub[1].items()})
+            return None
+        if isinstance(node, ast.BinOp):
+            lhs = self._affine_form(node.left)
+            rhs = self._affine_form(node.right)
+            if lhs is None or rhs is None:
+                return None
+            if isinstance(node.op, (ast.Add, ast.Sub)):
+                sign = 1 if isinstance(node.op, ast.Add) else -1
+                terms = dict(lhs[1])
+                for key, coeff in rhs[1].items():
+                    terms[key] = terms.get(key, 0) + sign * coeff
+                return (lhs[0] + sign * rhs[0], terms)
+            if isinstance(node.op, ast.Mult):
+                # Only ``const * affine`` stays affine.
+                if not lhs[1]:
+                    return (lhs[0] * rhs[0], {k: lhs[0] * v for k, v in rhs[1].items()})
+                if not rhs[1]:
+                    return (rhs[0] * lhs[0], {k: rhs[0] * v for k, v in lhs[1].items()})
+            return None
+        const = self._try_constexpr_int(node)
+        if const is not None:
+            return (const, {})
+        return (0, {ast.unparse(node): 1})
+
+    def _try_constexpr_int(self, node):
+        if isinstance(node, ast.Constant):
+            return node.value if type(node.value) is builtins.int else None
+        if isinstance(node, ast.Name):
+            val = unwrap_if_constexpr(self.lookup(node.id))
+            return val if isinstance(val, int) else None
+        return None
 
     def visit_Compare(self, node: ast.Compare):
         if not (len(node.ops) == 1 and len(node.comparators) == 1):
@@ -1282,7 +1351,18 @@ class MLIRCodeGenerator(ast.NodeVisitor):
             if isinstance(slices, (AlloValue, ConstexprValue))
             else slices
         )
-        return self.call_operator(mem_ops.store, [lhs, slices, value])
+        result = self.call_operator(mem_ops.store, [lhs, slices, value])
+        # Bit (slice) insertion on an integer scalar produces a new SSA value
+        # rather than mutating storage in place, so write it back to the source.
+        if (
+            isinstance(result, AlloValue)
+            and isinstance(lhs, AlloValue)
+            and isinstance(lhs.type, DType)
+        ):
+            writeback = copy.copy(node.value)
+            writeback.ctx = ast.Store()
+            self._do_assignment(writeback, result)
+        return result
 
     def visit_Subscript_Load(self, node):
         assert isinstance(node.ctx, ast.Load)

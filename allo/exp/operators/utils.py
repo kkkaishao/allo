@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from dataclasses import dataclass
 from typing import Callable, NoReturn, cast
 from ..compiler.builder import AlloOpBuilder
 from ..lang.core import (
@@ -13,6 +14,20 @@ from ..lang.core import (
 )
 from ..._mlir import ir
 from ..._mlir.dialects import linalg
+
+
+@dataclass
+class BitSlice:
+    """A lowered ``x[lo:hi]`` bit slice.
+
+    ``lo``/``hi`` are the (possibly dynamic) bound values; ``width`` is the
+    statically inferred bit count ``hi - lo``, or ``None`` when it is not a
+    compile-time constant (e.g. the offset is dynamic but the width is not).
+    """
+
+    lo: object
+    hi: object
+    width: int | None
 
 
 def shaped_type_with_dtype(src_type: ShapedType, dtype: DType) -> ShapedType:

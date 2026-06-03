@@ -17,6 +17,7 @@ from allo.exp.lang.core import (
     i32,
     range as allo_range,
     u1,
+    u8,
     u32,
 )
 from allo.exp.lang.kernel import KernelOptions, consteval, kernel
@@ -182,6 +183,120 @@ def test_shift_by_range_index():
         ir,
         "arith.index_cast",
         "arith.shrui",
+    )
+
+
+def test_bit_get_slice():
+    @kernel
+    def top(x: u32, out: u32[1]):
+        out[0] = x[4:8]
+
+    ir = _compile_ir(top)
+    _assert_contains(
+        ir,
+        "allo.bit.get_slice",
+        "[%c4 : %c8]",
+        "i4 from i32",
+    )
+
+
+def test_bit_get_single_bit():
+    @kernel
+    def top(x: u32, out: u32[1]):
+        out[0] = x[3]
+
+    ir = _compile_ir(top)
+    _assert_contains(
+        ir,
+        "allo.bit.get_slice",
+        "i1 from i32",
+    )
+
+
+def test_bit_get_slice_dynamic_offset_static_width():
+    # A dynamic offset with a statically-constant width: the `i` terms cancel in
+    # `(i + 2) - i`, so the result is exactly 2 bits (`i2`), not the full source.
+    @kernel
+    def top(x: u32, out: u32[2]):
+        for i in range(2):
+            out[i] = x[i : i + 2]
+
+    ir = _compile_ir(top)
+    _assert_contains(
+        ir,
+        "arith.addi",
+        "allo.bit.get_slice",
+        "i2 from i32",
+    )
+
+
+def test_bit_get_slice_constexpr_width():
+    @kernel
+    def top(x: u32, out: u32[2]):
+        W: constexpr = 3
+        for i in range(2):
+            out[i] = x[i : i + W]
+
+    ir = _compile_ir(top)
+    _assert_contains(
+        ir,
+        "arith.addi",
+        "allo.bit.get_slice",
+        "i3 from i32",
+    )
+
+
+def test_bit_get_slice_dynamic_width_error():
+    @kernel
+    def top(lo: i32, hi: i32, x: u32, out: u32[1]):
+        out[0] = x[lo:hi]
+
+    _assert_compile_error(
+        top,
+        "Bit slice width 'hi - lo' must be a compile-time constant",
+    )
+
+
+def test_bit_set_slice():
+    @kernel
+    def top(x: u32, out: u32[1]):
+        y: u32 = x
+        y[0:4] = 5
+        out[0] = y
+
+    ir = _compile_ir(top)
+    _assert_contains(
+        ir,
+        "arith.constant 5 : i4",
+        "allo.bit.set_slice",
+        "i4 into i32",
+    )
+
+
+def test_bit_set_slice_memref_writeback():
+    @kernel
+    def top(a: u8[4], b: u32[4]):
+        for i in range(4):
+            b[i][0:2] = a[i]
+
+    ir = _compile_ir(top)
+    _assert_contains(
+        ir,
+        "memref.load",
+        "allo.bit.set_slice",
+        "i2 into i32",
+        "memref.store",
+    )
+
+
+def test_bit_slice_requires_integer():
+    @kernel
+    def top(x: f32, out: f32[1]):
+        out[0] = x[0:4]
+
+    _assert_compile_error(
+        top,
+        "Bit slicing is only supported on signless integer scalars.",
     )
 
 

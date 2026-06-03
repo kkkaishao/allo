@@ -18,6 +18,7 @@ from ..lang.core import (
     AlloValue,
     IndexType,
     index,
+    u1,
     ShapedType,
     bool as AlloBool,
     TensorType,
@@ -777,6 +778,54 @@ class AlloOpBuilder:
             return arith.XOrIOp(ones, value.handle, ip=self._ip, loc=self._loc).result
 
         return self._emit_elementwise_unary(operand, operand.dtype, build_fn)
+
+    ##########################
+    # Bit slice operations
+    ##########################
+    # `x[lo:hi]` extracts the bits in the half-open range ``[lo, hi)`` (Python
+    # slice convention), so the slice holds ``hi - lo`` bits. A single index
+    # ``x[i]`` is the width-one slice ``x[i:i+1]``.
+
+    def _index_succ(self, idx: AlloValue) -> AlloValue:
+        one = self.create_const_index(1)
+        handle = arith.AddIOp(idx.handle, one.handle, ip=self._ip, loc=self._loc).result
+        return AlloValue(handle, index)
+
+    def create_bit_get_slice(self, src, lo, hi, result_dtype: DType) -> AlloValue:
+        assert isinstance(src.dtype, APInt)
+        lo = self.cast(lo, index)
+        hi = self.cast(hi, index)
+        op = allo_d.BitGetSliceOp(
+            self._materialize(result_dtype),
+            src.handle,
+            lo.handle,
+            hi.handle,
+            ip=self._ip,
+            loc=self._loc,
+        )
+        return AlloValue(op.result, result_dtype)
+
+    def create_bit_set_slice(self, src, lo, hi, value: AlloValue) -> AlloValue:
+        assert isinstance(src.dtype, APInt)
+        lo = self.cast(lo, index)
+        hi = self.cast(hi, index)
+        op = allo_d.BitSetSliceOp(
+            src.handle,
+            lo.handle,
+            hi.handle,
+            value.handle,
+            ip=self._ip,
+            loc=self._loc,
+        )
+        return AlloValue(op.result, src.dtype)
+
+    def create_bit_extract(self, src, idx) -> AlloValue:
+        idx = self.cast(idx, index)
+        return self.create_bit_get_slice(src, idx, self._index_succ(idx), u1)
+
+    def create_bit_insert(self, value: AlloValue, src, idx) -> AlloValue:
+        idx = self.cast(idx, index)
+        return self.create_bit_set_slice(src, idx, self._index_succ(idx), value)
 
     ###########################
     # Broadcasting
