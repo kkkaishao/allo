@@ -4,7 +4,7 @@ import pytest
 from allo.exp.lang.core import range, i32, f32, Template
 from allo.exp.lang.kernel import kernel
 from allo.exp.schedule import Schedule
-from allo.exp.schedule.errors import ScheduleLookupError
+from allo.exp.schedule.errors import ScheduleLookupError, ScheduleTransformError
 
 AFFINE_LOOP_IR = r"""
 module {
@@ -276,6 +276,100 @@ def test_flatten():
     np.testing.assert_array_equal(C, A + B)
 
 
+def test_tile_scf():
+    M, N = 8, 8
+
+    @kernel
+    def add(A: i32[M, N], B: i32[M, N], C: i32[M, N]):
+        for i in range(M, name="i"):
+            for j in range(N, name="j"):
+                C[i, j] = A[i, j] + B[i, j]
+
+    # Tile the scf.for nest directly (no affine() raise) to exercise the scf
+    # tiling path, which the other tests never hit.
+    s = add.schedule()
+    s.tile((s.loop("i"), s.loop("j")), factors=[2, 4])
+    mod = s.export("cpu")
+
+    A = np.random.randint(0, 10, (M, N)).astype(np.int32)
+    B = np.random.randint(0, 10, (M, N)).astype(np.int32)
+    C = np.zeros((M, N), dtype=np.int32)
+    mod(A, B, C)
+    np.testing.assert_array_equal(C, A + B)
+
+
+def test_tile_3d():
+    M, N, K = 8, 8, 8
+
+    @kernel
+    def add3(A: i32[M, N, K], B: i32[M, N, K], C: i32[M, N, K]):
+        for i in range(M, name="i"):
+            for j in range(N, name="j"):
+                for k in range(K, name="k"):
+                    C[i, j, k] = A[i, j, k] + B[i, j, k]
+
+    # Tile a 3-deep perfect band (only 2-deep tiling is covered elsewhere).
+    s = add3.schedule()
+    i, j, k = s.affine(s.loops("i", "j", "k"))
+    s.tile((i, j, k), factors=[2, 4, 2])
+    mod = s.export("cpu")
+
+    A = np.random.randint(0, 10, (M, N, K)).astype(np.int32)
+    B = np.random.randint(0, 10, (M, N, K)).astype(np.int32)
+    C = np.zeros((M, N, K), dtype=np.int32)
+    mod(A, B, C)
+    np.testing.assert_array_equal(C, A + B)
+
+
+def test_tile_indivisible_non_square():
+    # Non-square extents with factors that do not divide them exercise the
+    # point-loop min() upper-bound canonicalization (divisible tiles never hit
+    # it).
+    M, N = 6, 10
+
+    @kernel
+    def add(A: i32[M, N], B: i32[M, N], C: i32[M, N]):
+        for i in range(M, name="i"):
+            for j in range(N, name="j"):
+                C[i, j] = A[i, j] + B[i, j]
+
+    s = add.schedule()
+    i, j = s.affine(s.loops("i", "j"))
+    s.tile((i, j), factors=[4, 3])
+    mod = s.export("cpu")
+
+    A = np.random.randint(0, 10, (M, N)).astype(np.int32)
+    B = np.random.randint(0, 10, (M, N)).astype(np.int32)
+    C = np.zeros((M, N), dtype=np.int32)
+    mod(A, B, C)
+    np.testing.assert_array_equal(C, A + B)
+
+
+def test_flatten_three_non_square():
+    # Distinct non-square extents at three levels stress the floordiv/mod
+    # index reconstruction (a square nest can mask remap bugs).
+    M, N, K = 4, 5, 6
+
+    @kernel
+    def add3(A: i32[M, N, K], B: i32[M, N, K], C: i32[M, N, K]):
+        for i in range(M, name="i"):
+            for j in range(N, name="j"):
+                for k in range(K, name="k"):
+                    C[i, j, k] = A[i, j, k] + B[i, j, k]
+
+    s = add3.schedule()
+    i, j, k = s.affine(s.loops("i", "j", "k"))
+    s.flatten((i, j, k))
+    mod = s.export("cpu")
+
+    assert str(s.payload).count("affine.for") == 1
+    A = np.random.randint(0, 10, (M, N, K)).astype(np.int32)
+    B = np.random.randint(0, 10, (M, N, K)).astype(np.int32)
+    C = np.zeros((M, N, K), dtype=np.int32)
+    mod(A, B, C)
+    np.testing.assert_array_equal(C, A + B)
+
+
 def test_gemm_split_reorder():
     M, N, K = 8, 8, 8
 
@@ -305,7 +399,7 @@ def test_compute_at():
 
     @kernel
     def two_band(A: i32[H, W], C: i32[H, W]):
-        B: "i32[H,W]" = 0
+        B: i32[H, W] = 0
         for bi in range(H, name="bi"):
             for bj in range(W, name="bj"):
                 B[bi, bj] = A[bi, bj] + 1
@@ -356,6 +450,135 @@ def test_compute_at_complex():
     np.testing.assert_array_equal(D, ((A * 2) + 1) % 3)
 
 
+# ---------------------------------------------------------------------------
+# compute_at no-dependence path: the two cases above hit the RAW-fusion path;
+# these cover the independent-producer move/inline + IV-remap path.
+# ---------------------------------------------------------------------------
+
+
+def test_compute_at_no_dep():
+    # Producer (writes C from A) and consumer (writes D from B) share no buffer,
+    # so there is no dependence and compute_at moves the producer body into the
+    # consumer loop.
+    N = 8
+
+    @kernel
+    def two_independent(A: i32[N], B: i32[N], C: i32[N], D: i32[N]):
+        for pi in range(N, name="pi"):
+            C[pi] = A[pi] + 1
+        for ci in range(N, name="ci"):
+            D[ci] = B[ci] * 2
+
+    s = two_independent.schedule()
+    s.affine(s.loops("pi", "ci"))
+    s.compute_at(s.loop("pi"), s.loop("ci"))
+    mod = s.export("cpu")
+
+    A = np.random.randint(0, 10, (N,)).astype(np.int32)
+    B = np.random.randint(0, 10, (N,)).astype(np.int32)
+    C = np.zeros((N,), dtype=np.int32)
+    D = np.zeros((N,), dtype=np.int32)
+    mod(A, B, C, D)
+    np.testing.assert_array_equal(C, A + 1)
+    np.testing.assert_array_equal(D, B * 2)
+
+
+def test_compute_at_no_dep_inner_axis():
+    # No-dependence move at an inner axis of a 2-deep nest (prefix IV remap).
+    H, W = 6, 8
+
+    @kernel
+    def two_independent(A: i32[H, W], B: i32[H, W], C: i32[H, W], D: i32[H, W]):
+        for pi in range(H, name="pi"):
+            for pj in range(W, name="pj"):
+                C[pi, pj] = A[pi, pj] + 1
+        for ci in range(H, name="ci"):
+            for cj in range(W, name="cj"):
+                D[ci, cj] = B[ci, cj] * 2
+
+    s = two_independent.schedule()
+    s.affine(s.loops("pi", "pj", "ci", "cj"))
+    s.compute_at(s.loop("pj"), s.loop("cj"))
+    mod = s.export("cpu")
+
+    A = np.random.randint(0, 10, (H, W)).astype(np.int32)
+    B = np.random.randint(0, 10, (H, W)).astype(np.int32)
+    C = np.zeros((H, W), dtype=np.int32)
+    D = np.zeros((H, W), dtype=np.int32)
+    mod(A, B, C, D)
+    np.testing.assert_array_equal(C, A + 1)
+    np.testing.assert_array_equal(D, B * 2)
+
+
+def test_compute_at_no_dep_subset_bounds():
+    # Producer bounds (0..8) are a strict subset of consumer bounds (0..10):
+    # the move must wrap the producer body in an affine.if so it only runs on
+    # the producer domain.
+    @kernel
+    def f(A: i32[8], C: i32[8], D: i32[10]):
+        for pi in range(8, name="pi"):
+            C[pi] = A[pi] + 1
+        for ci in range(10, name="ci"):
+            D[ci] = ci * 2
+
+    s = f.schedule()
+    s.affine(s.loops("pi", "ci"))
+    s.compute_at(s.loop("pi"), s.loop("ci"))
+    mod = s.export("cpu")
+    assert "affine.if" in str(s.payload)
+
+    A = np.random.randint(0, 10, (8,)).astype(np.int32)
+    C = np.zeros((8,), dtype=np.int32)
+    D = np.zeros((10,), dtype=np.int32)
+    mod(A, C, D)
+    np.testing.assert_array_equal(C, A + 1)
+    np.testing.assert_array_equal(D, np.arange(10, dtype=np.int32) * 2)
+
+
+def test_compute_at_no_dep_deeper_producer():
+    # producerDepth (2) > consumerDepth (1): exercises the subtree move branch
+    # instead of body inlining.
+    H, W = 6, 8
+
+    @kernel
+    def f(A: i32[H, W], B: i32[H], C: i32[H, W], D: i32[H]):
+        for pi in range(H, name="pi"):
+            for pj in range(W, name="pj"):
+                C[pi, pj] = A[pi, pj] + 1
+        for ci in range(H, name="ci"):
+            D[ci] = B[ci] * 2
+
+    s = f.schedule()
+    s.affine(s.loops("pi", "pj", "ci"))
+    s.compute_at(s.loop("pj"), s.loop("ci"))
+    mod = s.export("cpu")
+
+    A = np.random.randint(0, 10, (H, W)).astype(np.int32)
+    B = np.random.randint(0, 10, (H,)).astype(np.int32)
+    C = np.zeros((H, W), dtype=np.int32)
+    D = np.zeros((H,), dtype=np.int32)
+    mod(A, B, C, D)
+    np.testing.assert_array_equal(C, A + 1)
+    np.testing.assert_array_equal(D, B * 2)
+
+
+def test_compute_at_war_only_unsupported():
+    # Producer reads X, consumer writes X: a WAR-only dependence, which
+    # compute_at deliberately refuses.
+    @kernel
+    def f(X: i32[8], C: i32[8], D: i32[8]):
+        for pi in range(8, name="pi"):
+            C[pi] = X[pi] + 1
+        for ci in range(8, name="ci"):
+            X[ci] = D[ci]
+
+    s = f.schedule()
+    s.affine(s.loops("pi", "ci"))
+    s.compute_at(s.loop("pi"), s.loop("ci"))
+    with pytest.raises(ScheduleTransformError):
+        s.apply()
+
+
 # ===========================================================================
 # Migrated from tests/test_schedule_memory.py
 # ===========================================================================
@@ -403,6 +626,104 @@ def test_interleaving_acc():
     C = np.zeros((M, N), dtype=np.float32)
     mod(A, B, C)
     np.testing.assert_allclose(C, A @ B, rtol=1e-4)
+
+
+def test_buffer_at_read_only():
+    # Buffering a read-only input produces a copy-in only (the two tests above
+    # buffer written outputs, exercising copy-out).
+    M, N = 8, 8
+
+    @kernel
+    def addone(A: i32[M, N], B: i32[M, N]):
+        for i in range(M, name="i"):
+            for j in range(N, name="j"):
+                B[i, j] = A[i, j] * 2
+
+    s = addone.schedule()
+    s.affine(s.loops("i", "j"))
+    s.buffer_at(s.buffer("A"), s.loop("i"))
+    mod = s.export("cpu")
+
+    A = np.random.randint(0, 10, (M, N)).astype(np.int32)
+    B = np.zeros((M, N), dtype=np.int32)
+    mod(A, B)
+    np.testing.assert_array_equal(B, A * 2)
+
+
+def test_buffer_at_middle_axis():
+    # Buffer at the middle axis of a 3-deep nest (multiple inner loops).
+    P = 4
+
+    @kernel
+    def f(A: i32[P, P, P], B: i32[P, P, P]):
+        for i in range(P, name="i"):
+            for j in range(P, name="j"):
+                for k in range(P, name="k"):
+                    B[i, j, k] = A[i, j, k] + 1
+
+    s = f.schedule()
+    s.affine(s.loops("i", "j", "k"))
+    s.buffer_at(s.buffer("B"), s.loop("j"))
+    mod = s.export("cpu")
+
+    A = np.random.randint(0, 10, (P, P, P)).astype(np.int32)
+    B = np.zeros((P, P, P), dtype=np.int32)
+    mod(A, B)
+    np.testing.assert_array_equal(B, A + 1)
+
+
+def test_buffer_at_strided_1d():
+    # 1D buffer whose footprint lower bound is an outer-symbol expression
+    # (io*4); also exercises the separating-stride == extent boundary.
+    @kernel
+    def f(A: i32[16], B: i32[16]):
+        for io in range(4, name="io"):
+            for ii in range(4, name="ii"):
+                B[io * 4 + ii] = A[io * 4 + ii] + 1
+
+    s = f.schedule()
+    s.affine(s.loops("io", "ii"))
+    s.buffer_at(s.buffer("B"), s.loop("io"))
+    mod = s.export("cpu")
+
+    A = np.random.randint(0, 10, (16,)).astype(np.int32)
+    B = np.zeros((16,), dtype=np.int32)
+    mod(A, B)
+    np.testing.assert_array_equal(B, A + 1)
+
+
+def test_buffer_at_innermost_axis_rejected():
+    M, N = 8, 8
+
+    @kernel
+    def f(A: i32[M, N], B: i32[M, N]):
+        for i in range(M, name="i"):
+            for j in range(N, name="j"):
+                B[i, j] = A[i, j] + 1
+
+    s = f.schedule()
+    s.affine(s.loops("i", "j"))
+    s.buffer_at(s.buffer("B"), s.loop("j"))  # innermost axis is illegal
+    with pytest.raises(ScheduleTransformError):
+        s.apply()
+
+
+def test_buffer_at_non_separable_rejected():
+    # The target buffer does not depend on the selected axis, so it cannot be
+    # made private to each iteration.
+    M, N = 8, 8
+
+    @kernel
+    def f(A: i32[N], B: i32[N]):
+        for i in range(M, name="i"):
+            for j in range(N, name="j"):
+                B[j] = A[j] + i
+
+    s = f.schedule()
+    s.affine(s.loops("i", "j"))
+    s.buffer_at(s.buffer("B"), s.loop("i"))
+    with pytest.raises(ScheduleTransformError):
+        s.apply()
 
 
 def test_partition_basic():
@@ -537,11 +858,10 @@ def test_compose_dependent_primitives():
 
 
 # ===========================================================================
-# reuse_at: not yet wired into the new schedule -> expected failure.
+# reuse_at
 # ===========================================================================
 
 
-@pytest.mark.xfail(reason="reuse_at is not yet implemented in the new schedule")
 def test_reuse_blur_x():
     H, W = 10, 10
 
@@ -563,7 +883,68 @@ def test_reuse_blur_x():
     np.testing.assert_array_equal(B, ref)
 
 
-@pytest.mark.xfail(reason="reuse_at is not yet implemented in the new schedule")
+def test_reuse_blur_y():
+    H, W = 10, 10
+
+    @kernel
+    def blur(A: i32[H, W], B: i32[8, W]):
+        for y in range(8, name="y"):
+            for x in range(W, name="x"):
+                B[y, x] = A[y, x] + A[y + 1, x] + A[y + 2, x]
+
+    s = blur.schedule()
+    s.affine(s.loops("y", "x"))
+    s.reuse_at(s.buffer("A"), s.loop("y"))  # reuse over the outer axis
+    mod = s.export("cpu")
+
+    A = np.random.randint(0, 10, (H, W)).astype(np.int32)
+    B = np.zeros((8, W), dtype=np.int32)
+    mod(A, B)
+    np.testing.assert_array_equal(B, A[0:8] + A[1:9] + A[2:10])
+
+
+def test_reuse_blur_x_3d():
+    P = 10
+
+    @kernel
+    def blur(A: i32[P, P, P], B: i32[P, P, 8]):
+        for i in range(P, name="i"):
+            for j in range(P, name="j"):
+                for k in range(8, name="k"):
+                    B[i, j, k] = A[i, j, k] + A[i, j, k + 1] + A[i, j, k + 2]
+
+    s = blur.schedule()
+    s.affine(s.loops("i", "j", "k"))
+    s.reuse_at(s.buffer("A"), s.loop("k"))
+    mod = s.export("cpu")
+
+    A = np.random.randint(0, 10, (P, P, P)).astype(np.int32)
+    B = np.zeros((P, P, 8), dtype=np.int32)
+    mod(A, B)
+    np.testing.assert_array_equal(B, A[:, :, 0:8] + A[:, :, 1:9] + A[:, :, 2:10])
+
+
+def test_reuse_blur_y_3d():
+    P = 10
+
+    @kernel
+    def blur(A: i32[P, P, P], B: i32[P, 8, P]):
+        for i in range(P, name="i"):
+            for j in range(8, name="j"):
+                for k in range(P, name="k"):
+                    B[i, j, k] = A[i, j, k] + A[i, j + 1, k] + A[i, j + 2, k]
+
+    s = blur.schedule()
+    s.affine(s.loops("i", "j", "k"))
+    s.reuse_at(s.buffer("A"), s.loop("j"))  # reuse over a middle axis
+    mod = s.export("cpu")
+
+    A = np.random.randint(0, 10, (P, P, P)).astype(np.int32)
+    B = np.zeros((P, 8, P), dtype=np.int32)
+    mod(A, B)
+    np.testing.assert_array_equal(B, A[:, 0:8] + A[:, 1:9] + A[:, 2:10])
+
+
 def test_reuse_blur_x_y():
     H, W = 10, 10
 
@@ -582,8 +963,104 @@ def test_reuse_blur_x_y():
     A = np.random.randint(0, 10, (H, W)).astype(np.int32)
     B = np.zeros((8, 8), dtype=np.int32)
     mod(A, B)
-    ref = np.zeros((8, 8), dtype=np.int32)
-    for y in range(8):
-        for x in range(8):
-            ref[y, x] = A[y, x] + A[y + 1, x + 1] + A[y + 2, x + 2]
+    # Note: `range` is shadowed by allo's kernel range in this module, so the
+    # reference is computed with numpy slicing rather than a Python loop.
+    ref = A[0:8, 0:8] + A[1:9, 1:9] + A[2:10, 2:10]
+    np.testing.assert_array_equal(B, ref)
+
+
+def test_reuse_blur_box_x_y():
+    # Chained reuse over a dense 2x2 box stencil: the x-window is fully covered
+    # by accesses (unlike the diagonal), exercising the dense-footprint path.
+    H, W = 10, 10
+
+    @kernel
+    def blur(A: i32[H, W], B: i32[8, 8]):
+        for y in range(8, name="y"):
+            for x in range(8, name="x"):
+                B[y, x] = A[y, x] + A[y, x + 1] + A[y + 1, x] + A[y + 1, x + 1]
+
+    s = blur.schedule()
+    s.affine(s.loops("y", "x"))
+    rb_y = s.reuse_at(s.buffer("A"), s.loop("y"))
+    s.reuse_at(rb_y, s.loop("x"))
+    mod = s.export("cpu")
+
+    A = np.random.randint(0, 10, (H, W)).astype(np.int32)
+    B = np.zeros((8, 8), dtype=np.int32)
+    mod(A, B)
+    ref = A[0:8, 0:8] + A[0:8, 1:9] + A[1:9, 0:8] + A[1:9, 1:9]
+    np.testing.assert_array_equal(B, ref)
+
+
+def test_reuse_blur_x_wide():
+    # A wider (5-tap) stencil exercises a larger sliding window.
+    H, W = 10, 12
+
+    @kernel
+    def blur(A: i32[H, W], B: i32[H, 8]):
+        for y in range(H, name="y"):
+            for x in range(8, name="x"):
+                B[y, x] = (
+                    A[y, x] + A[y, x + 1] + A[y, x + 2] + A[y, x + 3] + A[y, x + 4]
+                )
+
+    s = blur.schedule()
+    s.affine(s.loops("y", "x"))
+    s.reuse_at(s.buffer("A"), s.loop("x"))
+    mod = s.export("cpu")
+
+    A = np.random.randint(0, 10, (H, W)).astype(np.int32)
+    B = np.zeros((H, 8), dtype=np.int32)
+    mod(A, B)
+    ref = A[:, 0:8] + A[:, 1:9] + A[:, 2:10] + A[:, 3:11] + A[:, 4:12]
+    np.testing.assert_array_equal(B, ref)
+
+
+def test_reuse_blur_ring():
+    # Ring-buffer strategy (rotating head index) instead of physical shifting.
+    H, W = 10, 10
+
+    @kernel
+    def blur(A: i32[H, W], B: i32[H, 8]):
+        for y in range(H, name="y"):
+            for x in range(8, name="x"):
+                B[y, x] = A[y, x] + A[y, x + 1] + A[y, x + 2]
+
+    s = blur.schedule()
+    s.affine(s.loops("y", "x"))
+    s.reuse_at(s.buffer("A"), s.loop("x"), ring=True)
+    mod = s.export("cpu")
+
+    A = np.random.randint(0, 10, (H, W)).astype(np.int32)
+    B = np.zeros((H, 8), dtype=np.int32)
+    mod(A, B)
+    np.testing.assert_array_equal(B, A[:, 0:8] + A[:, 1:9] + A[:, 2:10])
+
+
+def test_reuse_blur_x_y_z_3d():
+    # Three-level chained reuse over a 3D diagonal stencil: each stage targets
+    # the previous stage's window and needs the full-window warmup fill.
+    P = 8
+
+    @kernel
+    def blur(A: i32[P, P, P], B: i32[6, 6, 6]):
+        for i in range(6, name="i"):
+            for j in range(6, name="j"):
+                for k in range(6, name="k"):
+                    B[i, j, k] = (
+                        A[i, j, k] + A[i + 1, j + 1, k + 1] + A[i + 2, j + 2, k + 2]
+                    )
+
+    s = blur.schedule()
+    s.affine(s.loops("i", "j", "k"))
+    ri = s.reuse_at(s.buffer("A"), s.loop("i"))
+    rj = s.reuse_at(ri, s.loop("j"))
+    s.reuse_at(rj, s.loop("k"))
+    mod = s.export("cpu")
+
+    A = np.random.randint(0, 10, (P, P, P)).astype(np.int32)
+    B = np.zeros((6, 6, 6), dtype=np.int32)
+    mod(A, B)
+    ref = A[0:6, 0:6, 0:6] + A[1:7, 1:7, 1:7] + A[2:8, 2:8, 2:8]
     np.testing.assert_array_equal(B, ref)

@@ -21,8 +21,6 @@
 #include "mlir/IR/IntegerSet.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
-#include "mlir/Transforms/CSE.h"
-#include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "llvm/ADT/DenseSet.h"
 #include <numeric>
 
@@ -258,6 +256,15 @@ transform::LoopReorderOp::apply(transform::TransformRewriter &rewriter,
            << "at least two loops are required for reordering";
   }
 
+  // The permutation is interpreted positionally over `loops`, so duplicate
+  // payloads would corrupt the permutation map below (non-bijective) and break
+  // `permuteLoops`.
+  DenseSet<Operation *> seenLoops;
+  for (auto loop : loops) {
+    if (!seenLoops.insert(loop).second)
+      return emitSilenceableError() << "reorder loops must be unique";
+  }
+
   auto outermostLoop = inSamePerfectlyNestedLoopBand(loops);
   if (!outermostLoop) {
     return emitSilenceableError()
@@ -448,8 +455,7 @@ transform::LoopSplitOp::applyToOne(transform::TransformRewriter &rewriter,
     AffineMap innerUb = inner.getUpperBoundMap();
     if (innerUb.isConstant() && innerUb.getNumInputs() != 0) {
       // simplify the upper bound if it's a constant map with unused symbols
-      auto cstUb =
-          dyn_cast<AffineConstantExpr>(innerUb.getResult(0)).getValue();
+      auto cstUb = cast<AffineConstantExpr>(innerUb.getResult(0)).getValue();
       rewriter.setInsertionPoint(inner);
       inner.setUpperBound({}, rewriter.getConstantAffineMap(cstUb));
     }
@@ -570,6 +576,39 @@ static FailureOr<SmallVector<uint64_t, 4>> parseTileFactors(ArrayAttr attr) {
   return factors;
 }
 
+/// Bind tile `factors` to `loops` by handle order, then depth-sort the pairs
+/// while validating they are unique and form one ancestor chain. On success,
+/// `sortedLoops`/`sortedFactors` receive the depth-ordered loops and their
+/// matching factors. Shared by the affine and scf tiling paths.
+template <typename ForOp>
+static DiagnosedSilenceableFailure
+bindAndSortTileLoops(Operation *op, ArrayRef<ForOp> loops,
+                     ArrayRef<uint64_t> factors,
+                     SmallVectorImpl<ForOp> &sortedLoops,
+                     SmallVectorImpl<uint64_t> &sortedFactors) {
+  if (factors.size() != loops.size())
+    return emitSilenceableFailure(op)
+           << "number of tile factors must match the number of loops";
+
+  SmallVector<LoopWithFactor<ForOp>, 4> loopFactors;
+  loopFactors.reserve(loops.size());
+  for (auto [loop, factor] : llvm::zip_equal(loops, factors))
+    loopFactors.push_back({loop, factor});
+
+  // Sorting pairs preserves loop-factor associations after reordering.
+  if (failed(sortAndCheckLoopFactorPairs(loopFactors)))
+    return emitSilenceableFailure(op)
+           << "tile loops must be unique and in the same loop nest";
+
+  sortedLoops.reserve(loopFactors.size());
+  sortedFactors.reserve(loopFactors.size());
+  for (const auto &it : loopFactors) {
+    sortedLoops.push_back(it.loop);
+    sortedFactors.push_back(it.factor);
+  }
+  return DiagnosedSilenceableFailure::success();
+}
+
 DiagnosedSilenceableFailure
 transform::LoopTileOp::apply(transform::TransformRewriter &rewriter,
                              transform::TransformResults &results,
@@ -603,38 +642,18 @@ transform::LoopTileOp::apply(transform::TransformRewriter &rewriter,
   auto maybeFactors = parseTileFactors(getFactors());
   if (failed(maybeFactors))
     return emitSilenceableError() << "tile factors must be positive";
-  SmallVector<uint64_t, 4> factors = *maybeFactors;
+  const SmallVector<uint64_t, 4> &factors = *maybeFactors;
 
   if (!affineLoops.empty()) {
-    // Factors must be provided one-for-one with input loop handles.
-    if (factors.size() != affineLoops.size()) {
-      return emitSilenceableError()
-             << "number of tile factors must match the number of loops";
-    }
-
-    // Semantic rule:
-    // bind factors to loops by input-handle order, then sort pairs by depth.
-    SmallVector<LoopWithFactor<affine::AffineForOp>, 4> loopFactors;
-    loopFactors.reserve(affineLoops.size());
-    for (auto [loop, factor] : llvm::zip_equal(affineLoops, factors))
-      loopFactors.push_back({loop, factor});
-
-    // Validate selected loops form a single nest and are not duplicated.
-    // Sorting pairs preserves loop-factor associations after reordering.
-    if (failed(sortAndCheckLoopFactorPairs(loopFactors))) {
-      return emitSilenceableError()
-             << "affine loops must be unique and in the same loop nest";
-    }
-
-    // Materialize depth-sorted loops/factors for downstream tiling APIs.
+    // Bind factors by handle order, depth-sort, and validate the nest.
     SmallVector<affine::AffineForOp, 4> sortedLoops;
     SmallVector<uint64_t, 4> sortedFactors;
-    sortedLoops.reserve(loopFactors.size());
-    sortedFactors.reserve(loopFactors.size());
-    for (const auto &it : loopFactors) {
-      sortedLoops.push_back(it.loop);
-      sortedFactors.push_back(it.factor);
-    }
+    if (DiagnosedSilenceableFailure diag =
+            bindAndSortTileLoops<affine::AffineForOp>(
+                getOperation(), affineLoops, factors, sortedLoops,
+                sortedFactors);
+        !diag.succeeded())
+      return diag;
 
     SmallVector<Operation *, 4> tileLoops;
     SmallVector<Operation *, 4> pointLoops;
@@ -748,35 +767,13 @@ transform::LoopTileOp::apply(transform::TransformRewriter &rewriter,
   }
 
   if (!scfLoops.empty()) {
-    // Factors must be provided one-for-one with input loop handles.
-    if (factors.size() != scfLoops.size()) {
-      return emitSilenceableError()
-             << "number of tile factors must match the number of loops";
-    }
-
-    // Semantic rule:
-    // bind factors to loops by input-handle order, then sort pairs by depth.
-    SmallVector<LoopWithFactor<scf::ForOp>, 4> loopFactors;
-    loopFactors.reserve(scfLoops.size());
-    for (auto [loop, factor] : llvm::zip_equal(scfLoops, factors))
-      loopFactors.push_back({loop, factor});
-
-    // Validate selected loops form a single nest and are not duplicated.
-    // Sorting pairs preserves loop-factor associations after reordering.
-    if (failed(sortAndCheckLoopFactorPairs(loopFactors))) {
-      return emitSilenceableError()
-             << "scf loops must be unique and in the same loop nest";
-    }
-
-    // Materialize depth-sorted loops/factors for downstream tiling APIs.
+    // Bind factors by handle order, depth-sort, and validate the nest.
     SmallVector<scf::ForOp, 4> sortedLoops;
     SmallVector<uint64_t, 4> sortedFactors;
-    sortedLoops.reserve(loopFactors.size());
-    sortedFactors.reserve(loopFactors.size());
-    for (const auto &it : loopFactors) {
-      sortedLoops.push_back(it.loop);
-      sortedFactors.push_back(it.factor);
-    }
+    if (DiagnosedSilenceableFailure diag = bindAndSortTileLoops<scf::ForOp>(
+            getOperation(), scfLoops, factors, sortedLoops, sortedFactors);
+        !diag.succeeded())
+      return diag;
 
     SmallVector<Operation *, 4> tileLoops;
     SmallVector<Operation *, 4> pointLoops;
@@ -871,9 +868,12 @@ static void coalesceLoops(MutableArrayRef<affine::AffineForOp> loops,
   for (unsigned idx = loops.size(); idx > 0; --idx) {
     int64_t currUb = ubs[idx - 1];
     if (idx != loops.size()) {
+      // Divide by the range of the loop processed in the previous (inner)
+      // iteration, i.e. the next-inner loop `ubs[idx]` — not this loop's own
+      // bound. (Equal for a square nest, which is why that case masks the bug.)
       auto quotientMap =
           AffineMap::get(/*dimCount=*/1, /*symbolCount=*/0,
-                         rewriter.getAffineDimExpr(0).floorDiv(currUb));
+                         rewriter.getAffineDimExpr(0).floorDiv(ubs[idx]));
       previous =
           affine::AffineApplyOp::create(rewriter, loc, quotientMap, previous);
       opToSink.push_back(previous.getDefiningOp());
@@ -983,6 +983,14 @@ transform::LoopFlattenOp::apply(transform::TransformRewriter &rewriter,
   // trip counts.
   int64_t flattenedTripCount = 1;
   for (auto loop : flattenBand) {
+    // The coalescing logic erases the inner terminator and rewrites induction
+    // variables; loop-carried values (iter_args) are not handled and would be
+    // left dangling, so reject them explicitly.
+    if (loop.getNumResults() != 0) {
+      return emitSilenceableError()
+             << "flatten does not support affine.for loops carrying iteration "
+                "arguments";
+    }
     if (loop.getStepAsInt() != 1 || !loop.hasConstantLowerBound() ||
         loop.getConstantLowerBound() != 0 || !loop.hasConstantUpperBound()) {
       return emitSilenceableError()
@@ -1467,8 +1475,6 @@ DiagnosedSilenceableFailure
 transform::ComputeAtOp::apply(transform::TransformRewriter &rewriter,
                               transform::TransformResults &results,
                               transform::TransformState &states) {
-  (void)results;
-
   auto consumerLoops = states.getPayloadOps(getConsumerLoop());
   auto producers = states.getPayloadOps(getProducer());
   if (!llvm::hasSingleElement(consumerLoops) ||
@@ -1524,7 +1530,6 @@ transform::ComputeAtOp::apply(transform::TransformRewriter &rewriter,
 
   runComputeAtPostCleanup(analysis.consumerLoop);
 
-  // results.set(cast<OpResult>(getResult()), {targetForOp});
   return DiagnosedSilenceableFailure::success();
 }
 
@@ -1676,6 +1681,48 @@ static FailureOr<int64_t> getConstantExprDelta(AffineExpr lhs, AffineExpr rhs,
 ///===----------------------------------------------------------------------===//
 /// ReuseAt implementation
 ///===----------------------------------------------------------------------===///
+///
+/// reuse_at(target, axis) exploits overlap between successive iterations of
+/// `axis`: instead of re-reading the sliding region of `target` every
+/// iteration, it keeps a small per-iteration "window" buffer and only loads the
+/// newly-entering elements.
+///
+/// Pipeline (see `ReuseAtOp::apply`):
+///   0. Preconditions: `target` is one memref defined outside `axis`; `axis` is
+///      one affine.for with constant bounds and positive constant step and is a
+///      *spatial* loop (it indexes stores), not a reduction loop.
+///   1. Collect accesses (`collectReuseAccesses`): every direct affine.load of
+///      `target` under `axis` becomes a `ReuseLogicalAccess` (its op + composed
+///      affine map). Non-affine loads / writes / aliasing views are rejected;
+///      writes carrying `allo.reuse.maintenance` (this op's own fill/shift) are
+///      ignored so the buffer reads as read-only.
+///   2. State plan (`analyzeReuseStatePlan`): from the set of access maps
+///   derive
+///      the window shape — the sliding dim (its index moves with `axis`), each
+///      dim's extent/anchor/stride — i.e. the reuse buffer's `MemRefType`.
+///   3. Validity plan (`analyzeReuseValidityPlan`): per-iteration schedule —
+///      which iterations are warm-up (must load from source) vs steady-state
+///      (may read the window), and the [updateStart, updateEnd] range over
+///      which per-iteration maintenance (shift/refill) runs.
+///   4. Reset boundary (`analyzeReuseResetBoundary`): whether the window can be
+///      allocated once above `axis` (hoisted) or must reset per outer
+///      iteration.
+///   5. Materialize: alloc the window; emit maintenance inside `axis`
+///      (`emitReuseStateMaintenance`). PhysicalShift shifts and refills the
+///      entering face each steady iteration; Ring rotates a head iter_arg
+///      instead of moving data. Each access is rewritten into a conditional
+///      load (`createConditionalReuseLoad`): warm-up reads source, steady-state
+///      reads the window. When the per-access stores do NOT tile the whole
+///      window (`!statePlan.accessesCoverWindow`, e.g. a diagonal access set in
+///      a 2D window) a full-window warm-up fill
+///      (`generateReuseStateWarmupFill`) is emitted so the shift never
+///      propagates stale slots; the common dense/separable case skips it. All
+///      window writes are tagged `allo.reuse.maintenance`.
+///
+/// Chaining is purely structural: `reuse_at(rb, axis2)` where `rb` is a
+/// previous stage's window simply finds `rb`'s loads as ordinary accesses (its
+/// fills are skipped via the attribute). There is no cross-call state — the IR
+/// is the only source of truth, so chained stages survive payload round-trips.
 namespace {
 struct LoopRoleInfo {
   DenseSet<Value> spatialIVs;
@@ -1702,6 +1749,11 @@ struct ReuseStatePlan {
   unsigned slidingDim = 0;
   int64_t slidingDelta = 1;
   int64_t slidingStepAbs = 1;
+  // Whether the per-access warm-up stores already cover every window slot. When
+  // false (e.g. a diagonal access set in a 2D window) an explicit full-window
+  // warm-up fill is required so the steady-state shift never reads a stale
+  // slot.
+  bool accessesCoverWindow = true;
 };
 
 struct LoopNormalizationInfo {
@@ -1784,81 +1836,13 @@ struct ReuseDimFootprint {
   int64_t innerMaxOffset = 0;
 };
 
+// One reuse candidate: a direct affine.load of the target buffer under the
+// selected axis. In the structural model there is no producer/consumer split,
+// so a single composed access fully describes it.
 struct ReuseLogicalAccess {
-  Operation *anchorOp = nullptr;
-  Value exposedValue;
-  Value missValue;
-  Value rootSourceBuffer;
-  ComposedBufferAccess stageAccess;
-  ComposedBufferAccess semanticAccess;
-  bool fromProvenanceWrapper = false;
-};
-
-struct ReuseValueProvenance {
-  // stageAccess stays in the producer stage's local buffer coordinates.
-  // semanticAccess keeps the projected source-space meaning for chaining.
-  Value stageBuffer;
-  Value rootSourceBuffer;
-  ComposedBufferAccess stageAccess;
-  ComposedBufferAccess semanticAccess;
-};
-
-struct ReuseBufferContext {
-  // Buffer-level context is keyed by the newly created reuse buffer so later
-  // stages can recover root-source and validity information from extension.
-  Value stageSourceBuffer;
-  Value rootSourceBuffer;
-  ReuseBufferStrategy strategy = ReuseBufferStrategy::PhysicalShift;
-  LoopNormalizationInfo axisInfo;
-  ReuseStatePlan statePlan;
-  ReuseValidityPlan validityPlan;
-};
-
-class ReuseAtTransformStateExtension
-    : public transform::TransformState::Extension {
-public:
-  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(ReuseAtTransformStateExtension)
-
-  explicit ReuseAtTransformStateExtension(transform::TransformState &state)
-      : Extension(state) {}
-
-  void registerBufferContext(Value buffer, ReuseBufferContext context) {
-    bufferContexts[buffer] = std::move(context);
-  }
-
-  const ReuseBufferContext *findBufferContext(Value buffer) const {
-    auto it = bufferContexts.find(buffer);
-    return it == bufferContexts.end() ? nullptr : &it->second;
-  }
-
-  bool hasBufferContext(Value buffer) const {
-    return bufferContexts.contains(buffer);
-  }
-
-  void registerValueProvenance(Value value, ReuseValueProvenance provenance) {
-    valueProvenances[value] = std::move(provenance);
-  }
-
-  const ReuseValueProvenance *findValueProvenance(Value value) const {
-    auto it = valueProvenances.find(value);
-    return it == valueProvenances.end() ? nullptr : &it->second;
-  }
-
-  void registerMaintenanceWrite(Value buffer, Operation *op) {
-    maintenanceWrites[buffer].insert(op);
-  }
-
-  bool isMaintenanceWrite(Value buffer, Operation *op) const {
-    auto it = maintenanceWrites.find(buffer);
-    return it != maintenanceWrites.end() && it->second.contains(op);
-  }
-
-private:
-  // Value provenance feeds chained legality/validity. Maintenance writes stay
-  // per-stage-buffer so unrelated stores are never silently ignored.
-  DenseMap<Value, ReuseBufferContext> bufferContexts;
-  DenseMap<Value, ReuseValueProvenance> valueProvenances;
-  DenseMap<Value, DenseSet<Operation *>> maintenanceWrites;
+  Operation *anchorOp = nullptr; // the original affine.load
+  Value exposedValue;            // its result value (uses are redirected)
+  ComposedBufferAccess composed; // composed/simplified affine access
 };
 
 struct RingAccessCluster {
@@ -1880,49 +1864,28 @@ struct ReuseAccessFamilyAnalysis {
   SmallVector<affine::AffineForOp, 8> innerLoops;
   ReuseExecutionPlan executionPlan;
   ReuseResetBoundaryPlan resetBoundaryPlan;
-  Value rootSourceBuffer;
 
   ReuseAccessFamilyAnalysis(SmallVector<ReuseLogicalAccess, 8> accesses,
                             SmallVector<affine::AffineForOp, 8> innerLoops,
                             ReuseExecutionPlan executionPlan,
-                            ReuseResetBoundaryPlan resetBoundaryPlan,
-                            Value rootSourceBuffer)
+                            ReuseResetBoundaryPlan resetBoundaryPlan)
       : accesses(std::move(accesses)), innerLoops(std::move(innerLoops)),
         executionPlan(std::move(executionPlan)),
-        resetBoundaryPlan(resetBoundaryPlan),
-        rootSourceBuffer(rootSourceBuffer) {}
+        resetBoundaryPlan(resetBoundaryPlan) {}
 };
 } // namespace
 
-static ReuseAtTransformStateExtension &
-getOrCreateReuseAtExtension(transform::TransformState &state) {
-  if (auto *extension = state.getExtension<ReuseAtTransformStateExtension>())
-    return *extension;
-  return state.addExtension<ReuseAtTransformStateExtension>();
-}
+// Attribute marking writes that the reuse_at pipeline itself emits into a reuse
+// buffer (warmup fill, shift, refill). A chained reuse_at targeting that buffer
+// skips these instead of rejecting them as user writes. Encoding this in the IR
+// (rather than a transform-state map keyed by Operation*) keeps the marker
+// valid across the post-cleanup rewrites and across separate transform
+// applications.
+static constexpr StringLiteral kReuseMaintenanceAttr = "allo.reuse.maintenance";
 
-static ReuseLogicalAccess makeDirectReuseLogicalAccess(Operation *op) {
+static ReuseLogicalAccess makeReuseLogicalAccess(Operation *op) {
   auto readOp = cast<affine::AffineReadOpInterface>(op);
-  ComposedBufferAccess access = composeBufferAccess(op);
-  return {op,
-          readOp.getValue(),
-          nullptr,
-          resolveMemRefValueRoot(readOp.getMemRef()),
-          access,
-          access,
-          /*fromProvenanceWrapper=*/false};
-}
-
-static ReuseLogicalAccess
-makeProvenanceReuseLogicalAccess(Operation *anchorOp, Value exposedValue,
-                                 const ReuseValueProvenance &provenance) {
-  return {anchorOp,
-          exposedValue,
-          exposedValue,
-          provenance.rootSourceBuffer,
-          provenance.stageAccess,
-          provenance.semanticAccess,
-          /*fromProvenanceWrapper=*/true};
+  return {op, readOp.getValue(), composeBufferAccess(op)};
 }
 
 static bool valueDependsOnTargetLoad(Value value, Value target,
@@ -2116,38 +2079,22 @@ collectReuseInnerLoops(affine::AffineForOp axisLoop,
 
 static LogicalResult
 collectReuseAccesses(affine::AffineForOp axisLoop, Value target,
-                     ReuseAtTransformStateExtension &extension,
                      SmallVectorImpl<ReuseLogicalAccess> &accesses,
                      SmallVectorImpl<affine::AffineForOp> &innerLoops) {
-  // Chained legality only trusts extension-registered provenance.
-  // Structural wrapper matching is intentionally not part of this path.
+  // Structural model: every reuse access is a direct affine.load of `target`.
+  // A chained reuse_at simply targets the previous stage's reuse buffer; its
+  // loads are ordinary affine.loads here (the previous stage's own internal
+  // fill/shift/refill writes are skipped via `kReuseMaintenanceAttr`).
   collectReuseInnerLoops(axisLoop, innerLoops);
 
   Value targetRoot = resolveMemRefValueRoot(target);
-  bool targetHasBufferContext = extension.hasBufferContext(target);
   WalkResult walk =
       axisLoop.walk<WalkOrder::PreOrder>([&](Operation *op) -> WalkResult {
-        bool collectedProvenance = false;
-        for (Value result : op->getResults()) {
-          auto *provenance = extension.findValueProvenance(result);
-          if (!provenance || provenance->stageBuffer != target)
-            continue;
-          accesses.push_back(
-              makeProvenanceReuseLogicalAccess(op, result, *provenance));
-          collectedProvenance = true;
-        }
-        if (collectedProvenance)
-          return WalkResult::skip();
-
         Value memref = nullptr;
         if (auto readOp = dyn_cast<affine::AffineReadOpInterface>(op)) {
           memref = readOp.getMemRef();
           if (memref == target) {
-            // Chained stages must consume explicit provenance only. Direct
-            // affine.loads from an intermediate reuse buffer are internal IR.
-            if (targetHasBufferContext)
-              return WalkResult::advance();
-            accesses.push_back(makeDirectReuseLogicalAccess(op));
+            accesses.push_back(makeReuseLogicalAccess(op));
             return WalkResult::advance();
           }
         }
@@ -2155,7 +2102,7 @@ collectReuseAccesses(affine::AffineForOp axisLoop, Value target,
         if (auto writeOp = dyn_cast<affine::AffineWriteOpInterface>(op)) {
           memref = writeOp.getMemRef();
           if (resolveMemRefValueRoot(memref) == targetRoot) {
-            if (extension.isMaintenanceWrite(target, op))
+            if (op->hasAttr(kReuseMaintenanceAttr))
               return WalkResult::advance();
             auto diag =
                 axisLoop.emitError()
@@ -2205,8 +2152,8 @@ collectReuseAccesses(affine::AffineForOp axisLoop, Value target,
     return failure();
   if (accesses.empty()) {
     auto diag = axisLoop.emitError()
-                << "no direct affine.load or registered chained reuse access "
-                   "to the target buffer found within the selected axis loop";
+                << "no affine.load of the target buffer found within the "
+                   "selected axis loop";
     return diag;
   }
   return success();
@@ -2421,7 +2368,7 @@ analyzeReuseStatePlan(ArrayRef<ReuseLogicalAccess> accesses,
   SmallVector<ComposedBufferAccess, 8> composedAccesses;
   composedAccesses.reserve(accesses.size());
   for (const ReuseLogicalAccess &access : accesses)
-    composedAccesses.push_back(access.semanticAccess);
+    composedAccesses.push_back(access.composed);
   collectFootprintOperands(composedAccesses, innerLoops,
                            ArrayRef<Value>{axisLoop.getInductionVar()},
                            prefixOperandPos, plan.prefixOperands);
@@ -2438,15 +2385,18 @@ analyzeReuseStatePlan(ArrayRef<ReuseLogicalAccess> accesses,
   SmallVector<SmallVector<ReuseDimFootprint, 4>, 8> rawFootprints(
       accesses.size());
   SmallVector<SmallVector<int64_t, 4>, 8> axisCoeffs(accesses.size());
+  // Per-access absolute slot range [lo, hi] in each buffer dim, used to test
+  // whether the accesses already tile the window box.
+  SmallVector<SmallVector<int64_t, 4>, 8> accessSlotLo(accesses.size());
+  SmallVector<SmallVector<int64_t, 4>, 8> accessSlotHi(accesses.size());
 
   for (auto [accessIdx, access] : llvm::enumerate(accesses)) {
-    if (access.semanticAccess.map.getNumResults() != bufferRank) {
+    if (access.composed.map.getNumResults() != bufferRank) {
       auto diag = access.anchorOp->emitError()
                   << "reuse_at requires candidate loads to match the target "
                      "buffer rank";
       diag.attachNote(access.anchorOp->getLoc())
-          << "candidate access has "
-          << access.semanticAccess.map.getNumResults()
+          << "candidate access has " << access.composed.map.getNumResults()
           << " indices, but the target buffer rank is " << bufferRank;
       return diag;
     }
@@ -2457,8 +2407,8 @@ analyzeReuseStatePlan(ArrayRef<ReuseLogicalAccess> accesses,
       // Derive a source-space footprint first; the common lattice stride is a
       // property of the whole access family, not of one access in isolation.
       auto footprintOr = computeRawReuseDimFootprint(
-          access.semanticAccess, d, innerLoops, axisInfo, loopInfos,
-          prefixOperandPos, plan.prefixOperands);
+          access.composed, d, innerLoops, axisInfo, loopInfos, prefixOperandPos,
+          plan.prefixOperands);
       if (failed(footprintOr)) {
         auto diag = access.anchorOp->emitError()
                     << "reuse_at requires buffer dimensions to have bounded "
@@ -2511,6 +2461,8 @@ analyzeReuseStatePlan(ArrayRef<ReuseLogicalAccess> accesses,
   std::optional<int64_t> detectedSlidingDelta;
   for (auto [accessIdx, access] : llvm::enumerate(accesses)) {
     axisCoeffs[accessIdx].resize(bufferRank, 0);
+    accessSlotLo[accessIdx].resize(bufferRank, 0);
+    accessSlotHi[accessIdx].resize(bufferRank, 0);
     for (unsigned d = 0; d < bufferRank; ++d) {
       auto slotFootprintOr = projectReuseDimFootprintToSlots(
           rawFootprints[accessIdx][d], layoutStrides[d]);
@@ -2526,6 +2478,8 @@ analyzeReuseStatePlan(ArrayRef<ReuseLogicalAccess> accesses,
       }
       const ReuseDimFootprint &footprint = *slotFootprintOr;
       int64_t slotOffset = lowerOffsets[accessIdx][d] / layoutStrides[d];
+      accessSlotLo[accessIdx][d] = slotOffset + footprint.innerMinOffset;
+      accessSlotHi[accessIdx][d] = slotOffset + footprint.innerMaxOffset;
       int64_t delta = footprint.axisCoeff;
       axisCoeffs[accessIdx][d] = delta;
 
@@ -2654,6 +2608,47 @@ analyzeReuseStatePlan(ArrayRef<ReuseLogicalAccess> accesses,
     }
   }
 
+  // Decide whether the per-access warm-up stores already tile the window box:
+  // enumerate the box over kept dims and mark each slot covered by some access.
+  // If every slot is covered, the explicit full-window warm-up fill is
+  // redundant (the common dense/separable case); otherwise it is required.
+  {
+    unsigned nKept = plan.keptDims.size();
+    int64_t totalSlots = 1;
+    for (int64_t e : plan.shape)
+      totalSlots *= e;
+    SmallVector<bool, 16> covered(totalSlots, false);
+    for (unsigned accessIdx = 0; accessIdx < accesses.size(); ++accessIdx) {
+      SmallVector<int64_t, 4> lo(nKept), hi(nKept);
+      bool inRange = true;
+      for (unsigned k = 0; k < nKept && inRange; ++k) {
+        unsigned d = plan.keptDims[k];
+        lo[k] = accessSlotLo[accessIdx][d] - minOffset[d];
+        hi[k] = accessSlotHi[accessIdx][d] - minOffset[d];
+        inRange = lo[k] >= 0 && hi[k] < plan.shape[k] && lo[k] <= hi[k];
+      }
+      if (!inRange)
+        continue;
+      // Odometer over the access's sub-box, marking each covered slot.
+      SmallVector<int64_t, 4> coord(lo);
+      while (true) {
+        int64_t linear = 0;
+        for (unsigned k = 0; k < nKept; ++k)
+          linear = linear * plan.shape[k] + coord[k];
+        covered[linear] = true;
+        int k = static_cast<int>(nKept) - 1;
+        for (; k >= 0; --k) {
+          if (++coord[k] <= hi[k])
+            break;
+          coord[k] = lo[k];
+        }
+        if (k < 0)
+          break;
+      }
+    }
+    plan.accessesCoverWindow = llvm::all_of(covered, [](bool c) { return c; });
+  }
+
   int64_t slidingExtent = plan.dims[plan.slidingDim].extent;
   // Reuse only helps when consecutive axis iterations still overlap.
   if (plan.slidingStepAbs >= slidingExtent) {
@@ -2698,7 +2693,7 @@ analyzeReuseValidityPlan(ArrayRef<ReuseLogicalAccess> accesses,
   validityPlan.accesses.reserve(accesses.size());
   for (const ReuseLogicalAccess &access : accesses) {
     auto footprintOr = computeRawReuseDimFootprint(
-        access.semanticAccess, plan.slidingDim, innerLoops, axisInfo, loopInfos,
+        access.composed, plan.slidingDim, innerLoops, axisInfo, loopInfos,
         prefixOperandPos, plan.prefixOperands);
     if (failed(footprintOr)) {
       auto diag = access.anchorOp->emitError()
@@ -2764,8 +2759,12 @@ analyzeReuseValidityPlan(ArrayRef<ReuseLogicalAccess> accesses,
                                        rhs.firstReusableIter;
                               })
                 ->firstReusableIter;
+  // State maintenance (shift+refill) runs before the read in the *same*
+  // iteration, so it must stay active through the last iteration that reads a
+  // slot. Using `maxLastUseIter - 1` leaves the final iteration reading a stale
+  // window (off-by-one at the high boundary of the axis).
   int64_t maxLastUseIter = *llvm::max_element(validityPlan.slotLastUseIters);
-  validityPlan.updateEndIter = maxLastUseIter - 1;
+  validityPlan.updateEndIter = maxLastUseIter;
 
   return validityPlan;
 }
@@ -2815,98 +2814,19 @@ analyzeReuseResetBoundary(affine::AffineForOp axisLoop,
   return plan;
 }
 
-static Value inferRootSourceBuffer(ArrayRef<ReuseLogicalAccess> accesses) {
-  for (const ReuseLogicalAccess &access : accesses) {
-    Value buffer = access.rootSourceBuffer;
-    if (buffer)
-      return buffer;
-  }
-  return {};
-}
-
-static Value resolveRootSourceBuffer(ReuseAtTransformStateExtension &extension,
-                                     Value target,
-                                     ArrayRef<ReuseLogicalAccess> accesses) {
-  // Reuse buffers registered by earlier stages already know their root source.
-  if (auto *context = extension.findBufferContext(target))
-    return context->rootSourceBuffer;
-  if (Value buffer = inferRootSourceBuffer(accesses))
-    return buffer;
-  return resolveMemRefValueRoot(target);
-}
-
-static void
-registerReuseMaintenanceWrites(ReuseAtTransformStateExtension &extension,
-                               Operation *scope, Value reuseBuffer) {
-  // Internal writes are tracked per stage buffer so later collectors only
-  // ignore stores emitted by the current reuse_at pipeline.
+static void markReuseMaintenanceWrites(Operation *scope, Value reuseBuffer) {
+  auto unit = UnitAttr::get(reuseBuffer.getContext());
   scope->walk([&](Operation *nestedOp) {
     if (auto writeOp = dyn_cast<affine::AffineWriteOpInterface>(nestedOp)) {
       if (writeOp.getMemRef() == reuseBuffer)
-        extension.registerMaintenanceWrite(reuseBuffer, nestedOp);
+        nestedOp->setAttr(kReuseMaintenanceAttr, unit);
       return;
     }
     if (auto storeOp = dyn_cast<memref::StoreOp>(nestedOp)) {
       if (storeOp.getMemRef() == reuseBuffer)
-        extension.registerMaintenanceWrite(reuseBuffer, nestedOp);
+        nestedOp->setAttr(kReuseMaintenanceAttr, unit);
     }
   });
-}
-
-static ComposedBufferAccess buildLocalReuseBufferAccess(MLIRContext *ctx,
-                                                        ValueRange indices) {
-  SmallVector<AffineExpr, 4> results;
-  results.reserve(indices.size());
-  for (unsigned i = 0; i < indices.size(); ++i)
-    results.push_back(getAffineDimExpr(i, ctx));
-  affine::AffineValueMap accessValueMap(
-      AffineMap::get(indices.size(), /*symbolCount=*/0, results, ctx), indices);
-  accessValueMap.composeSimplifyAndCanonicalize();
-  return {nullptr, accessValueMap.getAffineMap(),
-          llvm::to_vector(accessValueMap.getOperands())};
-}
-
-static ComposedBufferAccess
-projectSemanticAccessForChainedReuse(const ReuseLogicalAccess &access,
-                                     const ReuseStatePlan &statePlan) {
-  // Downstream stages keep reasoning in the current stage's local coordinate
-  // space, but preserve source-space dependence through the projected map.
-  SmallVector<AffineExpr, 4> projectedResults;
-  projectedResults.reserve(statePlan.keptDims.size());
-  for (unsigned dim : statePlan.keptDims)
-    projectedResults.push_back(access.semanticAccess.map.getResult(dim));
-  affine::AffineValueMap accessValueMap(
-      AffineMap::get(access.semanticAccess.map.getNumDims(),
-                     access.semanticAccess.map.getNumSymbols(),
-                     projectedResults, access.semanticAccess.map.getContext()),
-      access.semanticAccess.operands);
-  accessValueMap.composeSimplifyAndCanonicalize();
-  return {nullptr, accessValueMap.getAffineMap(),
-          llvm::to_vector(accessValueMap.getOperands())};
-}
-
-static void registerNoRingReuseValueProvenance(
-    ReuseAtTransformStateExtension &extension, Value reuseBuffer,
-    const ReuseLogicalAccess &access, const ReuseStatePlan &statePlan,
-    const ReuseConditionalLoadResult &result) {
-  // Provenance registration must use the just-built wrapper metadata instead
-  // of re-matching IR structure after rewriting.
-  extension.registerValueProvenance(
-      result.value,
-      ReuseValueProvenance{
-          reuseBuffer, access.rootSourceBuffer,
-          buildLocalReuseBufferAccess(reuseBuffer.getContext(),
-                                      result.logicalIndices),
-          projectSemanticAccessForChainedReuse(access, statePlan)});
-}
-
-static void replaceComposedAccessOperand(ComposedBufferAccess &access,
-                                         Value from, Value to) {
-  // Ring scalarization recreates the axis loop and its IV. Refresh any
-  // synthetic chained access that still references the old IV.
-  for (Value &operand : access.operands)
-    if (operand == from)
-      operand = to;
 }
 
 static Value materializeGlobalAccessIndex(OpBuilder &builder, Location loc,
@@ -3177,7 +3097,7 @@ precomputeRingAccessClusterIndices(OpBuilder &builder, Location loc,
       const ReuseLogicalAccess &access = accesses[accessIdx];
       RingAccessPrecomputedIndices indices;
       indices.logicalIndices = materializeLogicalReuseIndices(
-          builder, loc, plan, access.semanticAccess, stateOperands);
+          builder, loc, plan, access.composed, stateOperands);
       indices.physicalIndices = materializePhysicalReuseIndices(
           builder, loc, executionPlan, indices.logicalIndices,
           currentIterationRingHead);
@@ -3275,22 +3195,56 @@ static void generateReuseStateRefill(OpBuilder &builder, Location loc,
                                 logicalIndices);
 }
 
+// Warm-up fill: populate the ENTIRE reuse window from source before steady
+// state begins. Steady-state maintenance only refills the entering face and
+// relies on the rest of the window already being valid; the per-access loads,
+// however, only touch the points they read (e.g. the diagonal of a multi-dim
+// window), so without this the shift would propagate uninitialized slots.
+// (PhysicalShift only — the ring head fills lazily as it rotates.)
+static void generateReuseStateWarmupFill(
+    OpBuilder &builder, Location loc, Value sourceBuffer, Value reuseBuffer,
+    const ReuseExecutionPlan &executionPlan, ValueRange stateOperands) {
+  const ReuseStatePlan &plan = executionPlan.statePlan;
+  OpBuilder::InsertionGuard guard(builder);
+  SmallVector<Value, 4> logicalIndices(plan.keptDims.size());
+  for (auto [reusePos, dim] : llvm::enumerate(plan.keptDims)) {
+    affine::AffineForOp forOp = createConstantAffineFor(
+        builder, loc, /*lb=*/0, /*ub=*/plan.shape[reusePos]);
+    builder.setInsertionPoint(
+        forOp.getBody(), Block::iterator(forOp.getBody()->getTerminator()));
+    logicalIndices[reusePos] = forOp.getInductionVar();
+  }
+
+  SmallVector<Value, 4> globalIndices(plan.dims.size());
+  for (auto [resultDim, dimPlan] : llvm::enumerate(plan.dims)) {
+    Value anchor = buildAnchorValue(builder, loc, dimPlan, stateOperands);
+    int reusePos = plan.resultToReusePos[resultDim];
+    if (reusePos < 0) {
+      globalIndices[resultDim] = anchor;
+      continue;
+    }
+    globalIndices[resultDim] = buildStridedOffsetValue(
+        builder, loc, anchor, logicalIndices[reusePos], dimPlan.layoutStride);
+  }
+
+  Value loaded =
+      affine::AffineLoadOp::create(builder, loc, sourceBuffer, globalIndices);
+  affine::AffineStoreOp::create(builder, loc, loaded, reuseBuffer,
+                                logicalIndices);
+}
+
 static FailureOr<ReuseAccessFamilyAnalysis>
 analyzeReuseAccessFamily(affine::AffineForOp axisLoop,
                          affine::AffineForOp rootLoop, Value target,
                          unsigned rank, const LoopNormalizationInfo &axisInfo,
                          DenseMap<Value, LoopNormalizationInfo> &loopInfos,
-                         ReuseAtTransformStateExtension &reuseExtension,
                          MLIRContext *ctx, bool enableRing) {
   SmallVector<ReuseLogicalAccess, 8> accesses;
   SmallVector<affine::AffineForOp, 8> innerLoops;
-  if (failed(collectReuseAccesses(axisLoop, target, reuseExtension, accesses,
-                                  innerLoops))) {
+  if (failed(collectReuseAccesses(axisLoop, target, accesses, innerLoops))) {
     return failure();
   }
 
-  // Stage analysis always reasons in semantic slot-space. Direct accesses and
-  // chained provenance both arrive here through the same semantic view.
   auto stagePlanOr = analyzeReuseStatePlan(accesses, innerLoops, axisLoop,
                                            axisInfo, loopInfos, rank, ctx);
   if (failed(stagePlanOr))
@@ -3305,22 +3259,40 @@ analyzeReuseAccessFamily(affine::AffineForOp axisLoop,
                                    std::move(*validityOr), enableRing);
   ReuseResetBoundaryPlan resetBoundaryPlan =
       analyzeReuseResetBoundary(axisLoop, rootLoop, executionPlan);
-  Value rootSourceBuffer =
-      resolveRootSourceBuffer(reuseExtension, target, accesses);
   return ReuseAccessFamilyAnalysis(std::move(accesses), std::move(innerLoops),
-                                   std::move(executionPlan), resetBoundaryPlan,
-                                   rootSourceBuffer);
+                                   std::move(executionPlan), resetBoundaryPlan);
 }
 
 static Value
 emitReuseStateMaintenance(OpBuilder &builder, affine::AffineForOp axisLoop,
                           Location loc, Value target, Value reuseBuffer,
                           const ReuseExecutionPlan &executionPlan,
-                          ValueRange stateOperands, Value logicalAxisIV,
-                          ReuseAtTransformStateExtension &reuseExtension) {
+                          ValueRange stateOperands, Value logicalAxisIV) {
   auto updateActiveSet = buildReuseUpdateActiveSet(
       builder, executionPlan.updateStartIter, executionPlan.updateEndIter);
   if (executionPlan.strategy != ReuseBufferStrategy::Ring) {
+    // When the per-access warm-up stores do not tile the whole window (e.g. a
+    // diagonal access set in a 2D window), fill the entire window on warm-up
+    // iterations so the steady-state shift never propagates uninitialized
+    // slots. When they do tile it (the common dense/separable case) the
+    // per-access stores already cover the window and this is skipped.
+    if (!executionPlan.statePlan.accessesCoverWindow) {
+      IntegerSet warmupSet =
+          buildReuseWarmupMissSet(builder, executionPlan.steadyStateStart);
+      auto warmupIf =
+          affine::AffineIfOp::create(builder, loc, warmupSet, logicalAxisIV,
+                                     /*withElseRegion=*/false);
+      {
+        OpBuilder::InsertionGuard guard(builder);
+        builder.setInsertionPoint(
+            warmupIf.getThenBlock(),
+            Block::iterator(warmupIf.getThenBlock()->getTerminator()));
+        generateReuseStateWarmupFill(builder, loc, target, reuseBuffer,
+                                     executionPlan, stateOperands);
+      }
+      markReuseMaintenanceWrites(warmupIf, reuseBuffer);
+    }
+
     if (!updateActiveSet)
       return {};
     auto updateIf = affine::AffineIfOp::create(builder, loc, *updateActiveSet,
@@ -3333,7 +3305,7 @@ emitReuseStateMaintenance(OpBuilder &builder, affine::AffineForOp axisLoop,
     generateReuseStateShift(builder, loc, reuseBuffer, executionPlan);
     generateReuseStateRefill(builder, loc, target, reuseBuffer, executionPlan,
                              stateOperands);
-    registerReuseMaintenanceWrites(reuseExtension, updateIf, reuseBuffer);
+    markReuseMaintenanceWrites(updateIf, reuseBuffer);
     return {};
   }
 
@@ -3368,7 +3340,7 @@ emitReuseStateMaintenance(OpBuilder &builder, affine::AffineForOp axisLoop,
     generateReuseStateRefill(builder, loc, target, reuseBuffer, executionPlan,
                              stateOperands, nextHead);
   }
-  registerReuseMaintenanceWrites(reuseExtension, updateIf, reuseBuffer);
+  markReuseMaintenanceWrites(updateIf, reuseBuffer);
   return arith::SelectOp::create(builder, loc, isUpdateActive, nextHead,
                                  previousIterationRingHead);
 }
@@ -3378,17 +3350,13 @@ rewriteReuseAccesses(RewriterBase &builder,
                      ArrayRef<ReuseLogicalAccess> accesses, Value target,
                      Value reuseBuffer, const ReuseExecutionPlan &executionPlan,
                      ValueRange stateOperands, Value logicalAxisIV,
-                     Value currentIterationRingHead,
-                     ReuseAtTransformStateExtension &reuseExtension) {
+                     Value currentIterationRingHead) {
   auto ringPrecomputedIndices = precomputeRingAccessClusterIndices(
       builder, reuseBuffer.getLoc(), accesses, executionPlan, stateOperands,
       currentIterationRingHead);
 
   for (auto [accessIdx, access] : llvm::enumerate(accesses)) {
-    if (access.fromProvenanceWrapper)
-      builder.setInsertionPointAfter(access.anchorOp);
-    else
-      builder.setInsertionPoint(access.anchorOp);
+    builder.setInsertionPoint(access.anchorOp);
 
     ArrayRef<Value> precomputedLogicalIndices;
     ArrayRef<Value> precomputedPhysicalIndices;
@@ -3409,11 +3377,7 @@ rewriteReuseAccesses(RewriterBase &builder,
     exposedValue.replaceUsesWithIf(rewritten.value, [&](OpOperand &use) {
       return !rewrittenOp->isAncestor(use.getOwner());
     });
-    if (executionPlan.strategy != ReuseBufferStrategy::Ring) {
-      registerNoRingReuseValueProvenance(reuseExtension, reuseBuffer, access,
-                                         executionPlan.statePlan, rewritten);
-    }
-    if (!access.fromProvenanceWrapper && access.anchorOp->use_empty())
+    if (access.anchorOp->use_empty())
       builder.eraseOp(access.anchorOp);
   }
   return success();
@@ -3433,7 +3397,7 @@ static ReuseConditionalLoadResult createConditionalReuseLoad(
                                        precomputedLogicalIndices.end());
   if (logicalIndices.empty()) {
     logicalIndices = materializeLogicalReuseIndices(
-        builder, loc, plan, access.semanticAccess, stateOperands);
+        builder, loc, plan, access.composed, stateOperands);
   }
 
   bool coversTail = accessValidity.lastReusableIter >=
@@ -3478,12 +3442,10 @@ static ReuseConditionalLoadResult createConditionalReuseLoad(
   auto buildMiss = [&](Block *block) {
     OpBuilder::InsertionGuard guard(builder);
     builder.setInsertionPointToEnd(block);
-    Value loaded = access.missValue;
-    if (!loaded) {
-      loaded = affine::AffineLoadOp::create(builder, loc, sourceBuffer,
-                                            access.stageAccess.map,
-                                            access.stageAccess.operands);
-    }
+    // Warm-up / miss: load from the source buffer and capture into reuse state.
+    Value loaded = affine::AffineLoadOp::create(builder, loc, sourceBuffer,
+                                                access.composed.map,
+                                                access.composed.operands);
     affine::AffineStoreOp::create(builder, loc, loaded, reuseBuffer,
                                   logicalIndices);
     affine::AffineYieldOp::create(builder, loc, loaded);
@@ -3497,285 +3459,6 @@ static ReuseConditionalLoadResult createConditionalReuseLoad(
   buildReuseHit(ifOp.getThenBlock());
   buildMiss(ifOp.getElseBlock());
   return {ifOp.getResult(0), std::move(logicalIndices)};
-}
-
-namespace {
-struct MergeSameAffineIfsPattern
-    : public OpRewritePattern<affine::AffineForOp> {
-  using OpRewritePattern::OpRewritePattern;
-  using AdjacentIfList = SmallVector<affine::AffineIfOp, 4>;
-
-private:
-  static bool haveSameIfStructure(affine::AffineIfOp lhs,
-                                  affine::AffineIfOp rhs) {
-    return lhs.getIntegerSet() == rhs.getIntegerSet() &&
-           llvm::equal(lhs.getOperands(), rhs.getOperands()) &&
-           lhs.hasElse() == rhs.hasElse() &&
-           lhs->getNumResults() == rhs.getNumResults();
-  }
-
-  static SmallVector<AdjacentIfList, 4>
-  collectAdjacentIfLists(affine::AffineForOp forOp) {
-    SmallVector<AdjacentIfList, 4> ifLists;
-    AdjacentIfList currentList;
-    for (Operation &op : forOp.getBody()->getOperations()) {
-      if (auto ifOp = dyn_cast<affine::AffineIfOp>(op)) {
-        if (!currentList.empty() &&
-            !haveSameIfStructure(currentList.back(), ifOp)) {
-          if (currentList.size() > 1)
-            ifLists.push_back(std::move(currentList));
-          currentList.clear();
-        }
-        currentList.push_back(ifOp);
-      } else {
-        if (currentList.size() > 1)
-          ifLists.push_back(std::move(currentList));
-        currentList.clear();
-      }
-    }
-    if (currentList.size() > 1)
-      ifLists.push_back(std::move(currentList));
-    return ifLists;
-  }
-
-  void mergeAdjacentIfs(AdjacentIfList &ifOps, affine::AffineForOp parentOp,
-                        PatternRewriter &rewriter) const {
-    // ifs can not use each others results
-    for (auto ifOp : ifOps) {
-      for (auto result : ifOp.getResults()) {
-        for (Operation *user : result.getUsers()) {
-          if (llvm::is_contained(ifOps, user->getParentOp()))
-            return;
-        }
-      }
-    }
-
-    // merge the ifs
-    IRMapping mapping;
-    auto firstIf = ifOps.front();
-    if (!firstIf.hasElse() ||
-        firstIf->getNumResults() != 1) // we only merge reuse_at accesses
-      return;
-
-    rewriter.setInsertionPoint(firstIf);
-    Location loc = parentOp.getLoc();
-    // create a free block
-    Block *thenBlock = rewriter.createBlock(parentOp.getBody());
-    rewriter.setInsertionPointToStart(thenBlock);
-    SmallVector<Value, 4> thenResults;
-    SmallVector<Type, 4> resultTypes;
-    for (auto ifOp : ifOps) {
-      Block *thenBlock = ifOp.getThenBlock();
-      // clone without mapping since the ifs can not use each others results
-      for (Operation &op : thenBlock->without_terminator())
-        rewriter.clone(op, mapping);
-      auto yieldOp = cast<affine::AffineYieldOp>(thenBlock->getTerminator());
-      for (auto result : yieldOp.getOperands()) {
-        thenResults.push_back(mapping.lookupOrDefault(result));
-        resultTypes.push_back(result.getType());
-      }
-    }
-    // create a single yield op with all results
-    affine::AffineYieldOp::create(rewriter, loc, thenResults);
-
-    Block *elseBlock = rewriter.createBlock(parentOp.getBody());
-    rewriter.setInsertionPointToStart(elseBlock);
-    SmallVector<Value, 4> elseResults;
-    for (auto ifOp : ifOps) {
-      Block *elseBlock = ifOp.getElseBlock();
-      for (Operation &op : elseBlock->without_terminator())
-        rewriter.clone(op, mapping);
-      auto yieldOp = cast<affine::AffineYieldOp>(elseBlock->getTerminator());
-      for (auto result : yieldOp.getOperands())
-        elseResults.push_back(mapping.lookupOrDefault(result));
-    }
-    affine::AffineYieldOp::create(rewriter, loc, elseResults);
-    assert(thenResults.size() == elseResults.size() &&
-           "expected same number of results from then and else blocks");
-
-    rewriter.setInsertionPoint(firstIf);
-    auto mergedIf = affine::AffineIfOp::create(rewriter, loc, resultTypes,
-                                               firstIf.getCondition(),
-                                               firstIf.getOperands(), true);
-
-    rewriter.mergeBlocks(thenBlock, mergedIf.getThenBlock());
-    rewriter.mergeBlocks(elseBlock, mergedIf.getElseBlock());
-
-    // replace uses of original ifs
-    unsigned resultIdx = 0;
-    for (auto ifOp : ifOps) {
-      for (auto [idx, result] : llvm::enumerate(ifOp.getResults())) {
-        rewriter.replaceAllUsesWith(result,
-                                    mergedIf.getResult(resultIdx + idx));
-      }
-      resultIdx += ifOp.getNumResults();
-    }
-    // erase original ifs
-    for (auto ifOp : ifOps)
-      rewriter.eraseOp(ifOp);
-  }
-
-public:
-  LogicalResult matchAndRewrite(affine::AffineForOp forOp,
-                                PatternRewriter &rewriter) const override {
-    auto adjacentIfLists = collectAdjacentIfLists(forOp);
-    for (auto &list : adjacentIfLists) {
-      mergeAdjacentIfs(list, forOp, rewriter);
-    }
-    return success();
-  }
-};
-
-struct MergeStoreIntoAffineIfPattern : OpRewritePattern<affine::AffineIfOp> {
-  using OpRewritePattern<affine::AffineIfOp>::OpRewritePattern;
-
-private:
-  static FailureOr<affine::AffineStoreOp>
-  collectSingleStoreSlice(affine::AffineIfOp ifOp,
-                          SmallVectorImpl<Operation *> &intermediates) {
-    llvm::SmallDenseSet<Operation *, 4> visited;
-    SmallVector<Operation *, 8> worklist;
-    for (Value v : ifOp.getResults()) {
-      llvm::append_range(worklist, v.getUsers());
-    }
-    affine::AffineStoreOp foundStore = nullptr;
-
-    while (!worklist.empty()) {
-      Operation *op = worklist.pop_back_val();
-      if (!visited.insert(op).second)
-        continue;
-      if (op->getBlock() != ifOp->getBlock())
-        return failure(); // require in the same block
-
-      if (foundStore && foundStore->isBeforeInBlock(op))
-        return failure(); // reject if any uses after store
-
-      if (auto store = dyn_cast<affine::AffineStoreOp>(op)) {
-        if (foundStore && foundStore != store)
-          return failure(); // multiple sinks, ignore
-        foundStore = store;
-        intermediates.push_back(op);
-        continue;
-      }
-
-      if (!isMemoryEffectFree(op))
-        return failure(); // require no mem effects
-
-      intermediates.push_back(op);
-      for (Value res : op->getResults()) {
-        llvm::append_range(worklist, res.getUsers());
-      }
-    }
-    llvm::sort(intermediates, [](Operation *a, Operation *b) {
-      return a->isBeforeInBlock(b);
-    });
-    if (!foundStore)
-      return failure(); // require at least one store
-    return foundStore;
-  }
-
-  static bool
-  hasOnlyDominatingExternalOperands(affine::AffineIfOp ifOp,
-                                    ArrayRef<Operation *> intermediates) {
-    llvm::SmallDenseSet<Operation *, 8> sliceOps(intermediates.begin(),
-                                                 intermediates.end());
-    DominanceInfo dom(ifOp->getParentOp());
-    for (Operation *op : intermediates) {
-      for (Value operand : op->getOperands()) {
-        if (llvm::is_contained(ifOp.getResults(), operand))
-          continue;
-        Operation *defOp = operand.getDefiningOp();
-        if (!defOp || sliceOps.contains(defOp))
-          continue;
-        if (!dom.dominates(defOp, ifOp.getOperation()))
-          return false;
-      }
-    }
-    return true;
-  }
-
-  static void
-  cloneIntermediatesIntoBranch(SmallVectorImpl<Operation *> &intermediates,
-                               Block *src, Block *dst, affine::AffineIfOp ifOp,
-                               PatternRewriter &rewriter) {
-    IRMapping mapping;
-    rewriter.setInsertionPointToStart(dst);
-    for (Operation &op : src->without_terminator())
-      rewriter.clone(op, mapping);
-    // map yield operands
-    auto yield = cast<affine::AffineYieldOp>(src->getTerminator());
-    for (OpOperand &v : yield->getOpOperands())
-      mapping.map(ifOp->getResult(v.getOperandNumber()),
-                  mapping.lookupOrDefault(v.get()));
-    // clone intermediates to block
-    for (Operation *op : intermediates)
-      rewriter.clone(*op, mapping);
-  }
-
-public:
-  LogicalResult matchAndRewrite(affine::AffineIfOp ifOp,
-                                PatternRewriter &rewriter) const override {
-    if (ifOp.getNumResults() == 0)
-      return failure();
-
-    SmallVector<Operation *, 4> intermediates;
-    auto foundStoreOr = collectSingleStoreSlice(ifOp, intermediates);
-    if (failed(foundStoreOr))
-      return failure();
-    if (!hasOnlyDominatingExternalOperands(ifOp, intermediates))
-      return failure();
-
-    rewriter.setInsertionPoint(ifOp);
-    auto newIf = affine::AffineIfOp::create(
-        rewriter, ifOp->getLoc(), ifOp.getCondition(), ifOp.getOperands(),
-        /*withElseRegion=*/true);
-
-    // clone then region
-    cloneIntermediatesIntoBranch(intermediates, ifOp.getThenBlock(),
-                                 newIf.getThenBlock(), ifOp, rewriter);
-    // clone else region
-    cloneIntermediatesIntoBranch(intermediates, ifOp.getElseBlock(),
-                                 newIf.getElseBlock(), ifOp, rewriter);
-
-    // remove intermediates
-    for (Operation *op : llvm::reverse(intermediates))
-      rewriter.eraseOp(op);
-    rewriter.eraseOp(ifOp);
-
-    return success();
-  }
-};
-} // namespace
-
-static bool hasReuseAtUsers(OpResult handle) {
-  return llvm::any_of(handle.getUsers(), [](Operation *user) {
-    return isa<transform::ReuseAtOp>(user);
-  });
-}
-
-static void runReuseAtPostCleanup(RewriterBase &rewriter,
-                                  affine::AffineForOp axisLoop) {
-  // Final cleanup is purely local IR simplification: canonicalize/CSE first,
-  // then merge repeated affine.if wrappers and sink pure tails into branches.
-  DominanceInfo dom(axisLoop->getParentOp());
-  RewritePatternSet patterns(rewriter.getContext());
-  auto funcOp = axisLoop->getParentOfType<FunctionOpInterface>();
-  // cse + canonicalize
-  eliminateCommonSubExpressions(rewriter, dom, funcOp);
-  MLIRContext *context = rewriter.getContext();
-  for (auto *dialect : context->getLoadedDialects())
-    dialect->getCanonicalizationPatterns(patterns);
-  for (RegisteredOperationName op : context->getRegisteredOperations())
-    op.getCanonicalizationPatterns(patterns, context);
-  (void)applyPatternsGreedily(funcOp, std::move(patterns));
-  patterns.clear();
-  // merge same affine.ifs
-  patterns.add<MergeSameAffineIfsPattern>(rewriter.getContext());
-  (void)applyPatternsGreedily(funcOp, std::move(patterns));
-  patterns.clear();
-  // merge store
-  patterns.add<MergeStoreIntoAffineIfPattern>(rewriter.getContext());
-  (void)applyPatternsGreedily(funcOp, std::move(patterns));
 }
 
 static Value materializeGlobalAccessIndex(OpBuilder &builder, Location loc,
@@ -3794,8 +3477,6 @@ transform::ReuseAtOp::apply(transform::TransformRewriter &rewriter,
                             transform::TransformState &state) {
   // Stage 0: resolve payload handles and validate basic structural
   // preconditions.
-  ReuseAtTransformStateExtension &reuseExtension =
-      getOrCreateReuseAtExtension(state);
   auto targets = llvm::to_vector(state.getPayloadValues(getTarget()));
   if (targets.size() != 1) {
     return emitSilenceableError()
@@ -3854,7 +3535,7 @@ transform::ReuseAtOp::apply(transform::TransformRewriter &rewriter,
            << "selected axis loop is not classified as a spatial loop";
 
   auto analysisOr = analyzeReuseAccessFamily(
-      axisLoop, rootLoop, target, rank, axisInfo, loopInfos, reuseExtension,
+      axisLoop, rootLoop, target, rank, axisInfo, loopInfos,
       rewriter.getContext(), getUseRingBuffer());
   if (failed(analysisOr))
     return emitSilenceableError()
@@ -3863,7 +3544,6 @@ transform::ReuseAtOp::apply(transform::TransformRewriter &rewriter,
   SmallVector<ReuseLogicalAccess, 8> &accesses = analysis.accesses;
   const ReuseExecutionPlan &executionPlan = analysis.executionPlan;
   const ReuseResetBoundaryPlan &resetBoundaryPlan = analysis.resetBoundaryPlan;
-  Value rootSourceBuffer = analysis.rootSourceBuffer;
   const ReuseStatePlan &plan = executionPlan.statePlan;
 
   // Stage 2: materialize the reuse buffer and prepare any loop-carried state.
@@ -3872,6 +3552,12 @@ transform::ReuseAtOp::apply(transform::TransformRewriter &rewriter,
       rewriter, axisLoop.getLoc(),
       MemRefType::get(plan.shape, targetType.getElementType()));
   if (executionPlan.strategy == ReuseBufferStrategy::Ring) {
+    // `replaceWithAdditionalYields` builds a fresh affine.for; capture the
+    // schedule annotations (e.g. allo.schedule.key) so the recreated loop stays
+    // matchable by downstream primitives and the frontend snapshot.
+    SmallVector<NamedAttribute, 4> savedAttrs(
+        axisLoop->getDiscardableAttrs().begin(),
+        axisLoop->getDiscardableAttrs().end());
     Value zero = arith::ConstantIndexOp::create(rewriter, axisLoop.getLoc(), 0);
     auto newLoopOr = axisLoop.replaceWithAdditionalYields(
         rewriter, zero,
@@ -3881,20 +3567,14 @@ transform::ReuseAtOp::apply(transform::TransformRewriter &rewriter,
         });
     if (failed(newLoopOr))
       return emitDefiniteFailure();
-    Value oldAxisIV = axisIV;
     axisLoop = cast<affine::AffineForOp>(*newLoopOr);
+    for (NamedAttribute attr : savedAttrs)
+      axisLoop->setAttr(attr.getName(), attr.getValue());
     axisIV = axisLoop.getInductionVar();
-    // Direct accesses can be recomposed from their payload ops. Synthetic
-    // chained accesses instead need an explicit IV remap through extension.
-    for (ReuseLogicalAccess &access : accesses) {
-      if (access.stageAccess.op) {
-        access.stageAccess = composeBufferAccess(access.stageAccess.op);
-        access.semanticAccess = access.stageAccess;
-        continue;
-      }
-      replaceComposedAccessOperand(access.stageAccess, oldAxisIV, axisIV);
-      replaceComposedAccessOperand(access.semanticAccess, oldAxisIV, axisIV);
-    }
+    // Ring scalarization recreates the axis loop and its IV; recompose each
+    // (direct) access from its payload op so it references the new IV.
+    for (ReuseLogicalAccess &access : accesses)
+      access.composed = composeBufferAccess(access.anchorOp);
   }
 
   // Stage 3: emit per-iteration state maintenance for ring or shift mode.
@@ -3903,15 +3583,14 @@ transform::ReuseAtOp::apply(transform::TransformRewriter &rewriter,
       rewriter, axisLoop.getLoc(), axisInfo, axisIV);
   SmallVector<Value, 4> stateOperands =
       getReuseStateOperands(logicalAxisIV, plan.prefixOperands);
-  Value currentIterationRingHead;
-  currentIterationRingHead = emitReuseStateMaintenance(
+  Value currentIterationRingHead = emitReuseStateMaintenance(
       rewriter, axisLoop, axisLoop.getLoc(), target, reuseBuffer, executionPlan,
-      stateOperands, logicalAxisIV, reuseExtension);
+      stateOperands, logicalAxisIV);
 
   // Stage 4: rewrite each candidate load to the new reuse state.
   if (failed(rewriteReuseAccesses(rewriter, accesses, target, reuseBuffer,
                                   executionPlan, stateOperands, logicalAxisIV,
-                                  currentIterationRingHead, reuseExtension))) {
+                                  currentIterationRingHead))) {
     return emitSilenceableError() << "failed to rewrite reuse accesses";
   }
 
@@ -3924,15 +3603,19 @@ transform::ReuseAtOp::apply(transform::TransformRewriter &rewriter,
     });
   }
 
-  // Stage 5: run local cleanup patterns, then publish the new buffer handle.
-  if (!hasReuseAtUsers(cast<OpResult>(getResult())))
-    runReuseAtPostCleanup(rewriter, axisLoop);
+  // A freshly created reuse buffer has no user stores: every write into it is
+  // reuse machinery (warmup fill, shift, refill). Mark them all so a chained
+  // reuse_at targeting this buffer does not mistake an internal fill for a user
+  // write. (The per-`updateIf` marking above only covers shift/refill.)
+  markReuseMaintenanceWrites(axisLoop, reuseBuffer);
 
-  reuseExtension.registerBufferContext(
-      reuseBuffer,
-      ReuseBufferContext{target, rootSourceBuffer, executionPlan.strategy,
-                         axisInfo, executionPlan.statePlan,
-                         executionPlan.validityPlan});
+  // Stage 5: publish the new buffer handle.
+  //
+  // No cleanup is run here: it would reshape the conditional loads and strip
+  // the maintenance markers that a *chained* reuse_at targeting this buffer
+  // relies on. The redundant IR (duplicate affine.applys, mergeable per-access
+  // affine.ifs) is simplified once afterwards by the `allo-reuse-cleanup` pass,
+  // applied unconditionally during schedule export.
   results.setValues(cast<OpResult>(getResult()), {reuseBuffer});
   return DiagnosedSilenceableFailure::success();
 }
@@ -4042,7 +3725,7 @@ struct BufferAtFootprint {
 };
 } // namespace
 
-static LogicalResult
+static DiagnosedSilenceableFailure
 collectBufferAtAccesses(affine::AffineForOp axisLoop, Value buffer,
                         SmallVectorImpl<Operation *> &accessOps, bool &hasLoads,
                         bool &hasStores) {
@@ -4051,36 +3734,32 @@ collectBufferAtAccesses(affine::AffineForOp axisLoop, Value buffer,
   // accesses because the later remap step only understands direct affine
   // accesses to the chosen memref value.
   Value bufferRoot = resolveMemRefValueRoot(buffer);
+  Operation *offendingOp = nullptr;
+  StringRef reason;
 
   auto walkResult = axisLoop.walk([&](Operation *op) {
     if (auto readOp = dyn_cast<affine::AffineReadOpInterface>(op)) {
-      Value memref = readOp.getMemRef();
-      if (memref == buffer) {
+      if (readOp.getMemRef() == buffer) {
         accessOps.push_back(op);
         hasLoads = true;
       }
     } else if (auto writeOp = dyn_cast<affine::AffineWriteOpInterface>(op)) {
-      Value memref = writeOp.getMemRef();
-      if (memref == buffer) {
+      if (writeOp.getMemRef() == buffer) {
         accessOps.push_back(op);
         hasStores = true;
       }
     } else if (auto loadOp = dyn_cast<memref::LoadOp>(op)) {
-      Value memref = loadOp.getMemRef();
-      if (resolveMemRefValueRoot(memref) == bufferRoot) {
-        auto diag = axisLoop.emitError()
-                    << "buffer_at only supports affine.load/store accesses "
-                       "to the target buffer within the selected axis loop";
-        diag.attachNote(loadOp->getLoc()) << "see memref.load op here";
+      if (resolveMemRefValueRoot(loadOp.getMemRef()) == bufferRoot) {
+        offendingOp = op;
+        reason = "buffer_at only supports affine.load/store accesses to the "
+                 "target buffer within the selected axis loop";
         return WalkResult::interrupt();
       }
     } else if (auto storeOp = dyn_cast<memref::StoreOp>(op)) {
-      Value memref = storeOp.getMemRef();
-      if (resolveMemRefValueRoot(memref) == bufferRoot) {
-        auto diag = axisLoop.emitError()
-                    << "buffer_at only supports affine.load/store accesses "
-                       "to the target buffer within the selected axis loop";
-        diag.attachNote(storeOp->getLoc()) << "see memref.store op here";
+      if (resolveMemRefValueRoot(storeOp.getMemRef()) == bufferRoot) {
+        offendingOp = op;
+        reason = "buffer_at only supports affine.load/store accesses to the "
+                 "target buffer within the selected axis loop";
         return WalkResult::interrupt();
       }
     } else if (isMemRefCastOrViewLike(op)) {
@@ -4089,19 +3768,22 @@ collectBufferAtAccesses(affine::AffineForOp axisLoop, Value buffer,
                resolveMemRefValueRoot(result) == bufferRoot;
       });
       if (aliasesBuffer) {
-        auto diag = axisLoop.emitError()
-                    << "buffer_at does not support aliasing/view accesses to "
-                       "the target buffer within the selected axis loop";
-        diag.attachNote(op->getLoc()) << "see aliasing/view op here";
+        offendingOp = op;
+        reason = "buffer_at does not support aliasing/view accesses to the "
+                 "target buffer within the selected axis loop";
         return WalkResult::interrupt();
       }
     }
     return WalkResult::advance();
   });
 
-  if (walkResult.wasInterrupted())
-    return failure();
-  return success();
+  if (walkResult.wasInterrupted()) {
+    DiagnosedSilenceableFailure diag = emitSilenceableFailure(axisLoop);
+    diag << reason;
+    diag.attachNote(offendingOp->getLoc()) << "see offending access here";
+    return diag;
+  }
+  return DiagnosedSilenceableFailure::success();
 }
 
 static FailureOr<std::pair<AffineExpr, int64_t>>
@@ -4266,23 +3948,27 @@ static bool affineExprUsesDimPosition(AffineExpr expr, unsigned dimPos) {
   return used;
 }
 
-static LogicalResult
+static DiagnosedSilenceableFailure
 checkBufferAtFootprintSeparability(const BufferAtFootprint &footprint,
                                    affine::AffineForOp axisLoop) {
   // A legal buffer_at needs the selected axis to separate per-instance regions.
   // We approximate this by checking whether the axis moves some footprint bound
   // far enough that adjacent iterations do not overlap on that dimension.
-  Value axisIV = axisLoop.getInductionVar();
-  auto *it = llvm::find(footprint.symbols, axisIV);
-  if (it == footprint.symbols.end()) {
-    InFlightDiagnostic diag = axisLoop.emitError();
+  auto notPrivatizable = [&](StringRef note) {
+    DiagnosedSilenceableFailure diag = emitSilenceableFailure(axisLoop);
     diag << "cannot buffer_at on this axis because the target buffer cannot "
             "be made private to each iteration";
-    diag.attachNote(axisLoop.getLoc())
-        << "the target-buffer access pattern does not depend on the selected "
-           "axis, so every iteration would use the same region";
-    return failure();
-  }
+    diag.attachNote(axisLoop.getLoc()) << note;
+    return diag;
+  };
+  StringRef axisIndependent =
+      "the target-buffer access pattern does not depend on the selected axis, "
+      "so every iteration would use the same region";
+
+  Value axisIV = axisLoop.getInductionVar();
+  auto *it = llvm::find(footprint.symbols, axisIV);
+  if (it == footprint.symbols.end())
+    return notPrivatizable(axisIndependent);
 
   unsigned axisPos = std::distance(footprint.symbols.begin(), it);
   uint64_t axisStep = axisLoop.getStepAsInt();
@@ -4302,25 +3988,13 @@ checkBufferAtFootprintSeparability(const BufferAtFootprint &footprint,
     uint64_t separatingStride =
         static_cast<uint64_t>(std::abs(*axisCoeff)) * axisStep;
     if (separatingStride >= static_cast<uint64_t>(shape))
-      return success();
+      return DiagnosedSilenceableFailure::success();
   }
 
-  if (!foundAxisSensitiveDim) {
-    InFlightDiagnostic diag = axisLoop.emitError();
-    diag << "cannot buffer_at on this axis because the target buffer cannot "
-            "be made private to each iteration";
-    diag.attachNote(axisLoop.getLoc())
-        << "the target-buffer access pattern does not depend on the selected "
-           "axis, so every iteration would use the same region";
-    return failure();
-  }
-  InFlightDiagnostic diag = axisLoop.emitError();
-  diag << "cannot buffer_at on this axis because the target buffer cannot be "
-          "made private to each iteration";
-  diag.attachNote(axisLoop.getLoc())
-      << "different iterations of the selected axis access overlapping "
-         "regions of the target buffer";
-  return failure();
+  if (!foundAxisSensitiveDim)
+    return notPrivatizable(axisIndependent);
+  return notPrivatizable("different iterations of the selected axis access "
+                         "overlapping regions of the target buffer");
 }
 
 static void generateBufferAtCopy(OpBuilder &builder, Location loc,
@@ -4450,9 +4124,10 @@ transform::BufferAtOp::apply(transform::TransformRewriter &rewriter,
   SmallVector<Operation *, 8> localAccessOps;
   bool hasLoads = false;
   bool hasStores = false;
-  if (failed(collectBufferAtAccesses(axisLoop, buffer, localAccessOps, hasLoads,
-                                     hasStores)))
-    return emitSilenceableError() << "buffer_at failed";
+  if (DiagnosedSilenceableFailure diag = collectBufferAtAccesses(
+          axisLoop, buffer, localAccessOps, hasLoads, hasStores);
+      !diag.succeeded())
+    return diag;
   if (localAccessOps.empty()) {
     return emitSilenceableError()
            << "no load/store of the target buffer found within the selected "
@@ -4471,8 +4146,10 @@ transform::BufferAtOp::apply(transform::TransformRewriter &rewriter,
               "footprint for the target buffer";
   }
   BufferAtFootprint footprint = std::move(*footprintOr);
-  if (failed(checkBufferAtFootprintSeparability(footprint, axisLoop)))
-    return emitSilenceableError() << "buffer_at failed";
+  if (DiagnosedSilenceableFailure diag =
+          checkBufferAtFootprintSeparability(footprint, axisLoop);
+      !diag.succeeded())
+    return diag;
 
   // Finally allocate the local buffer, emit copy-in/copy-out around the axis
   // body, and rewrite each collected access through the synthesized local index

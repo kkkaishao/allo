@@ -153,6 +153,13 @@ class Schedule(Generic[P, R]):
         if not self.kernel:
             raise ScheduleError("Cannot export to backends without a source kernel")
         self.apply()
+        # Simplify the redundant IR that reuse_at leaves behind (merge per-access
+        # affine.ifs, CSE, drop dead index math). The pass is a no-op when the
+        # module contains no reuse_at output.
+        from ..backend.base import run_pipeline
+
+        with self.context:
+            run_pipeline(self._payload, "builtin.module(allo-reuse-cleanup)")
         self.kernel.module = self._payload
         if backend == "cpu":
             from ..backend import CPU
@@ -550,6 +557,35 @@ class Schedule(Generic[P, R]):
 
         alloc_op = self.predicted.add_alloc(
             buf.scope, local_key, "memref.alloc", axis_loop.skey
+        )
+        value = self.predicted.add_value(alloc_op.skey, 0, "res")
+        self._mark_dirty()
+        return self.predicted.make_buffer_ref(value)
+
+    @_within_context
+    def reuse_at(
+        self, target: SingleTarget, axis: SingleTarget, *, ring: bool = False
+    ) -> BufferRef:
+        buf = self._resolve_single_buffer_target(target, "reuse_at target")
+        axis_loop = self._require_affine(
+            self._resolve_single_loop_target(axis, "reuse_at axis")
+        )
+        base = buf.name or buf.owner_key
+        reuse_key = derived_key(base, "reuse")
+
+        self.script.set_callsite_loc()
+        reuse = ta.ReuseAtOp(
+            self.script.any_value_type,
+            self.script.match_value(buf.owner_key, buf.number, buf.source),
+            self.script.match(axis_loop.key),
+            use_ring_buffer=ring,
+            **self.script.kw,
+        ).result
+        alloc = self.script.defining_op_handle(reuse)
+        self.script.annotate_key(alloc, reuse_key)
+
+        alloc_op = self.predicted.add_alloc(
+            buf.scope, reuse_key, "memref.alloc", axis_loop.skey
         )
         value = self.predicted.add_value(alloc_op.skey, 0, "res")
         self._mark_dirty()
