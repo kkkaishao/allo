@@ -96,3 +96,5 @@ tests/xlscc_tests/**/test
 .idea
 .DS_Store
 *.pyi
+
+/allo/_mlir
