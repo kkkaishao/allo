@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import functools
 import os
 
 from dataclasses import dataclass
@@ -34,6 +35,7 @@ from .utils import (
     _log_synth_failure,
     _log_synth_note,
     _normalize_interface_options,
+    _probe_vitis_tool,
     _source_settings_env,
     _synth_log_path,
 )
@@ -42,7 +44,7 @@ from ...._mlir.dialects.allo import emit_vivado_hls
 from ...._mlir._mlir_libs._allo import ir_ext
 from ...lang.core import BufferType, ShapedType, TypeBase
 from ...lang.kernel import Kernel
-from ...logging import log_warning, run_command, stage, terminate_on_error
+from ...logging import run_command, stage, terminate_on_error
 
 VitisMode = Literal["csim", "csyn", "sw_emu", "hw_emu", "hw"]
 FlowTarget = Literal["vitis", "vivado"]
@@ -52,7 +54,7 @@ AxiliteStorageImpl = Literal["auto", "bram", "uram"]
 
 DEFAULT_DEVICE = "u280"
 DEFAULT_FREQ_MHZ = 300.0
-DEFAULT_VITIS_SETTINGS = Path("/opt/xilinx/2025.2/Vitis/settings64.sh")
+DEFAULT_VITIS_HOME = Path("/opt/xilinx/2025.2/Vitis")
 HLS_PREPARE_PIPELINE = """
 builtin.module(
 grid-mapping,
@@ -111,6 +113,29 @@ P = ParamSpec("P")
 R = TypeVar("R")
 
 
+def _detect_vitis_home(vitis_home: str | None) -> Path:
+    if vitis_home:
+        return Path(vitis_home)
+    vitis_env = os.environ.get("XILINX_HLS") or os.environ.get("XILINX_VITIS")
+    if vitis_env:
+        return Path(vitis_env)
+    return DEFAULT_VITIS_HOME
+
+
+@functools.cache
+def is_vitis_available(vitis_home: str | None = None) -> bool:
+    """Whether a Vitis HLS toolchain can be detected, as a plain cached bool.
+
+    Unlike ``detect_vitis_tool`` this never raises and emits no logs, so it is
+    safe to use directly in ``pytest.mark.skipif`` predicates."""
+    settings64 = _detect_vitis_home(vitis_home) / "settings64.sh"
+    try:
+        _probe_vitis_tool(settings64)
+        return True
+    except Exception:
+        return False
+
+
 class Vitis(Backend, Generic[P, R]):
     name = "vitis"
 
@@ -128,9 +153,7 @@ class Vitis(Backend, Generic[P, R]):
     ):
         super().__init__(kernel)
         # setup toolchain paths
-        self._settings64 = (
-            Path(vitis_home) / "settings64.sh" if vitis_home else DEFAULT_VITIS_SETTINGS
-        )
+        self._settings64 = _detect_vitis_home(vitis_home) / "settings64.sh"
         self._vitis_home = Path(vitis_home) if vitis_home else None
         self.tool: VitisTool | None = None
         # setup project related settings
@@ -146,10 +169,10 @@ class Vitis(Backend, Generic[P, R]):
         self.csimulator: PythonNativeCSimulator | None = None
 
     def _init_part_and_device(self, part: str | None, device: str | None) -> None:
+        # A part is only needed for synthesis/implementation; codegen and C
+        # simulation work without one. The missing-part diagnostic is therefore
+        # deferred to synth() rather than emitted at construction.
         if part is None and device is None:
-            log_warning(
-                "Neither device nor part number is specified for Vitis backend. The backend can be only used for C simulation until the part number is set, which is required for synthesis and implementation."
-            )
             self.part = ""
             self.device = ""
             return
@@ -350,6 +373,11 @@ class Vitis(Backend, Generic[P, R]):
     @terminate_on_error
     def synth(self, *, exist_ok: bool = True) -> VitisSynthReport:
         """Generate an HLS csyn project and invoke Vitis HLS."""
+        if not self.part:
+            raise ValueError(
+                "Vitis synthesis requires a part number; pass part=... (or "
+                "device=...) to export('vitis', ...)."
+            )
         self._require_vitis_tool()
         project_path = self.scaffold_project(exist_ok=exist_ok)
         self._invoke_csyn(project_path)

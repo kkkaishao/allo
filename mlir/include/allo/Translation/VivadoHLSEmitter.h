@@ -46,6 +46,9 @@ struct VivadoHLSEmitter {
   void emitStreamGet(allo::StreamGetOp op);
   void emitStreamPut(allo::StreamPutOp op);
 
+  void emitBitGetSlice(allo::BitGetSliceOp op);
+  void emitBitSetSlice(allo::BitSetSliceOp op);
+
   void emitFor(scf::ForOp op);
   void emitIf(scf::IfOp op);
   void emitWhile(scf::WhileOp op);
@@ -66,16 +69,18 @@ private:
   void emitValueRef(Value val);
   void emitFunctionArguments(func::FuncOp func);
   void emitFunctionReturnType(func::FuncOp func);
+  void emitFunctionSignature(func::FuncOp func);
   void emitFunctionDirectives(func::FuncOp func);
+  void emitTrailingLocation(Operation *op);
   void emitPartitionAttr(allo::PartitionAttr attr, Value value);
   void emitLoopDirectives(Operation *op);
   void emitArraySuffix(ArrayRef<int64_t> shape, Location loc);
   void emitArraySuffix(ShapedType type, Location loc);
   void emitIndexedValue(Value value, ValueRange indices);
-  void emitStreamReference(Value stream, ValueRange indices);
-  void emitBlockCopy(ShapedType type, llvm::StringRef dst, llvm::StringRef src);
-  void emitBlockCopyLoops(ShapedType type, ArrayRef<std::string> indices,
-                          llvm::StringRef dst, llvm::StringRef src);
+  void emitStreamTransferLoops(bool isPut, Value stream,
+                               ValueRange streamIndices, ShapedType blockType,
+                               ArrayRef<std::string> indices,
+                               llvm::StringRef valueName);
   void emitYieldAssignments(Operation *parent, OperandRange operands);
   void emitAffineMapReduction(AffineMap map, OperandRange operands,
                               llvm::StringLiteral functionName);
@@ -89,8 +94,7 @@ private:
   std::string getSymbolName(llvm::StringRef name);
   std::string getTemporaryName(llvm::StringRef prefix);
   std::string getPrimitiveTypeName(Type type, bool isSigned = false);
-  std::string getBlockTypeName(ShapedType type, Location loc);
-  std::string getStreamTypeName(StreamType type, Location loc);
+  std::string getStreamTypeName(StreamType type);
 
   void dispatch(Operation *op);
 
