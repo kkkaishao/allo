@@ -115,20 +115,24 @@ class Backend(ABC, Generic[P, R]):
     def __init__(self, kernel: Kernel[P, R]):
         self.module: ir.Module = ir_ext.clone_module(kernel.compile())
         self.kernel = kernel
-        self._kernel_cache = self._compute_kernel_cache()
+        self._kernel_cache: dict[str, Any] | None = None
 
     def _compute_kernel_cache(self) -> dict[str, Any]:
-        return {
-            "top": self.kernel.func_name,
-            "arg_types": [str(arg) for arg in self.kernel.parse_argument_annotations()],
-            "res_types": [str(res) for res in self.kernel.parse_return_annotation()],
-            "options": vars(self.kernel.options),
-            "template_bindings": {
-                name: str(value)
-                for name, value in sorted(self.kernel.template_bindings.items())
-            },
-            "module_sha256": text_hash(str(self.module)),
-        }
+        """The kernel's contribution to a cache key, computed once and reused.
+
+        The module text already encodes the top name, argument/result types and
+        template specialization, so those are not separate (redundant) key fields
+        -- ``module_sha256`` discriminates them. ``options`` is kept because it can
+        steer backend lowering without changing the IR. Computed lazily so a
+        backend used only for codegen (e.g. ``hls_code``) never serializes the
+        module for a key it doesn't need.
+        """
+        if self._kernel_cache is None:
+            self._kernel_cache = {
+                "module_sha256": text_hash(str(self.module)),
+                "options": vars(self.kernel.options),
+            }
+        return self._kernel_cache
 
     def _cache_key(self, *parts: Any) -> str:
         return stable_cache_hash(

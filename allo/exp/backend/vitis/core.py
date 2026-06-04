@@ -11,6 +11,7 @@ from ..base import (
     Backend,
     lookup_kernel,
     run_pipeline,
+    stable_cache_hash,
     text_hash,
     write_json_if_changed,
     write_text_if_changed,
@@ -18,8 +19,10 @@ from ..base import (
 from ..utils import make_project_path
 from .csim import (
     CSIM_MAKEFILE,
+    CsimToolchain,
     PythonNativeCSimulator,
     _generate_csim_makefile,
+    discover_csim,
 )
 from .report import VitisSynthReport
 from .utils import (
@@ -80,6 +83,8 @@ PART_NUMBERS = {
     "u250": "xcu250-figd2104-2L-e",
     "u280": "xcu280-fsvh2892-2L-e",
 }
+# default to pynq-z2
+DEFAULT_PART = "xc7z020clg400-1"
 
 
 @dataclass(frozen=True)
@@ -107,47 +112,21 @@ def _collect_interface_options(
     return options
 
 
-_CSIM_MAKE_VAR_ALIASES = {
-    "vitis_root": "VITIS_ROOT",
-    "cxx": "CXX",
-    "gcc_toolchain": "GCC_TOOLCHAIN",
-    "vitis_host_lib": "VITIS_HOST_LIB",
-    "mathhls_lib": "MATHHLS_LIB",
-    "fpo_lib": "FPO_LIB",
-    "kernel_cpp": "KERNEL_CPP",
-    "kernel_h": "KERNEL_H",
-    "out": "OUT",
-    "hls_includes": "HLS_INCLUDES",
-    "hls_defines": "HLS_DEFINES",
-    "hls_cxxflags": "HLS_CXXFLAGS",
-    "hls_ldflags": "HLS_LDFLAGS",
-    "extra_cxxflags": "EXTRA_CXXFLAGS",
-    "extra_ldflags": "EXTRA_LDFLAGS",
-}
-
-
-def _csim_make_var_name(name: str) -> str:
-    if not name:
-        raise ValueError("CSim override keys must be non-empty")
-    default = name if name.isupper() else name.upper()
-    return _CSIM_MAKE_VAR_ALIASES.get(name.lower(), default)
-
-
-def _csim_make_var_value(value: object) -> str:
-    if isinstance(value, os.PathLike):
-        return os.fspath(value)
-    return str(value)
-
-
 def _normalize_csim_make_vars(
     overrides: Mapping[str, object | None],
 ) -> dict[str, str | None]:
-    return {
-        _csim_make_var_name(key): (
-            None if value is None else _csim_make_var_value(value)
-        )
-        for key, value in overrides.items()
-    }
+    """Normalize ``set_csim_override`` keywords to Makefile assignments: the key
+    uppercases to the variable name (``cxx`` -> ``CXX``, ``hls_cxxflags`` ->
+    ``HLS_CXXFLAGS``), PathLike values become strings, and ``None`` is preserved
+    (it drops a previously set override)."""
+    normalized: dict[str, str | None] = {}
+    for key, value in overrides.items():
+        if not key:
+            raise ValueError("CSim override keys must be non-empty")
+        if isinstance(value, os.PathLike):
+            value = os.fspath(value)
+        normalized[key.upper()] = None if value is None else str(value)
+    return normalized
 
 
 P = ParamSpec("P")
@@ -179,6 +158,8 @@ def is_vitis_available(vitis_home: str | None = None) -> bool:
 
 class Vitis(Backend, Generic[P, R]):
     name = "vitis"
+    part: str
+    tool: VitisTool
 
     @terminate_on_error
     def __init__(
@@ -188,7 +169,7 @@ class Vitis(Backend, Generic[P, R]):
         project_path: str | None = None,
         *,
         device: str | None = None,
-        part: str | None = None,
+        part: str | None = DEFAULT_PART,
         freq_mhz: float = 300.0,
         flow: FlowTarget = "vitis",
     ):
@@ -196,7 +177,6 @@ class Vitis(Backend, Generic[P, R]):
         # setup toolchain paths
         self._settings64 = _detect_vitis_home(vitis_home) / "settings64.sh"
         self._vitis_home = Path(vitis_home) if vitis_home else None
-        self.tool: VitisTool | None = None
         # setup project related settings
         self._project_path = Path(project_path) if project_path else None
         self.freq_mhz = freq_mhz
@@ -208,31 +188,26 @@ class Vitis(Backend, Generic[P, R]):
         # intermediate stuffs
         self.artifacts: CompiledArtifacts | None = None
         self.csimulator: PythonNativeCSimulator | None = None
+        self._csim_toolchain: CsimToolchain | None = None
 
     def _init_part_and_device(self, part: str | None, device: str | None) -> None:
-        # A part is only needed for synthesis/implementation; codegen and C
-        # simulation work without one. The missing-part diagnostic is therefore
-        # deferred to synth() rather than emitted at construction.
-        if part is None and device is None:
-            self.part = ""
-            self.device = ""
-            return
-        if device is None:
-            self.part = part
-            self.device = ""
-            return
-        resolved = PART_NUMBERS.get(device)
-        if not resolved:
-            raise ValueError(
-                f"Unknown device {device}. Please specify part number directly."
-            )
-        if part is not None and part != resolved:
+        if part is not None and device is not None:
             raise ValueError("Cannot specify both part number and device")
-        self.device = device
-        self.part = resolved
+        if device is not None:
+            part = PART_NUMBERS.get(device)
+            if not part:
+                raise ValueError(
+                    f"Unknown device {device}. Please specify part number."
+                )
+            self.part = part
+            return
+        if part is not None:
+            self.part = part
+            return
+        self.part = DEFAULT_PART
 
     def _require_vitis_tool(self):
-        if self.tool is None:
+        if not hasattr(self, "tool") or self.tool is None:
             self.tool = detect_vitis_tool(self._settings64)
 
     @property
@@ -242,8 +217,6 @@ class Vitis(Backend, Generic[P, R]):
 
     @terminate_on_error
     def __call__(self, *args: P.args, **kwargs: P.kwargs) -> R:
-        if self.kernel is None:
-            raise RuntimeError("Vitis backend is not bound to a kernel")
         return self.csim(*args, **kwargs)
 
     def set_csim_override(self, **overrides: str | None):
@@ -463,9 +436,11 @@ class Vitis(Backend, Generic[P, R]):
     def _materialize_csim_cache(self, *, exist_ok: bool = True) -> tuple[Path, str]:
         artifacts = self._compile_for_csim()
         vitis_root = self._get_vitis_root()
-        makefile = _generate_csim_makefile(vitis_root)
+        makefile = _generate_csim_makefile(
+            vitis_root, self._get_csim_toolchain().template
+        )
         payload = self._csim_cache_payload(artifacts, makefile)
-        cache_key = self._cache_key(payload)
+        cache_key = stable_cache_hash(payload)
         project_path = self._cache_dir(
             "vitis",
             "csim",
@@ -593,15 +568,15 @@ class Vitis(Backend, Generic[P, R]):
             return self._settings64.parent
         if self.tool is not None and self.tool.executable.parent.name == "bin":
             return self.tool.executable.parent.parent
-        return DEFAULT_VITIS_SETTINGS.parent
+        return DEFAULT_VITIS_HOME
 
-    def _tool_cache_payload(self) -> dict[str, str]:
-        return {
-            "name": self.tool.name,
-            "executable": os.fspath(self.tool.executable),
-            "version": self.tool.version,
-            "settings64": os.fspath(self._settings64),
-        }
+    def _get_csim_toolchain(self) -> CsimToolchain:
+        """The probed C-simulation flavor (makefile template + version-discovered
+        make vars). Native AMD-clang flow on Vitis 2025.2+, else the legacy gcc
+        flow used by Vitis through 2024.2."""
+        if self._csim_toolchain is None:
+            self._csim_toolchain = discover_csim(self._get_vitis_root())
+        return self._csim_toolchain
 
     def _interface_cache_payload(self) -> dict[int, dict[str, Mapping[str, Any]]]:
         return {
@@ -615,14 +590,19 @@ class Vitis(Backend, Generic[P, R]):
     def _csim_cache_payload(
         self, artifacts: CompiledArtifacts, makefile: str
     ) -> dict[str, Any]:
+        # The compiled .so is fully determined by the emitted C++, the makefile
+        # recipe (incl. OPT_FLAGS) and flavor, and the probed clang/gcc toolchain.
+        # kernel_h is derived from kernel_cpp, and the upstream MLIR module is
+        # already captured by kernel_cpp, so neither is a separate field; the
+        # vitis_hls tool version is irrelevant to a compiler-built .so.
+        toolchain = self._get_csim_toolchain()
         return {
-            "backend": self.name,
             "phase": "python-native-csim",
-            "top": artifacts.top,
+            "flavor": toolchain.flavor,
             "kernel_cpp_sha256": text_hash(artifacts.kernel_cpp),
-            "kernel_h_sha256": text_hash(artifacts.kernel_h),
             "makefile_sha256": text_hash(makefile),
-            "tool": self._tool_cache_payload(),
+            "toolchain": dict(sorted(toolchain.make_vars.items())),
+            "overrides": dict(sorted(self._csim_make_vars.items())),
         }
 
     def _get_csimulator(
@@ -634,6 +614,7 @@ class Vitis(Backend, Generic[P, R]):
         if cached:
             self.csimulator = cached
             return cached
+        toolchain = self._get_csim_toolchain()
         self.csimulator = PythonNativeCSimulator(
             top=self.kernel.func_name,
             project_path=project_path,
@@ -641,7 +622,9 @@ class Vitis(Backend, Generic[P, R]):
             env=self._get_vitis_env(),
             arg_types=self.kernel.parse_argument_annotations(),
             res_types=self.kernel.parse_return_annotation(),
-            make_vars=self._csim_make_vars,
+            # Probed toolchain paths first; explicit user overrides win.
+            make_vars={**toolchain.make_vars, **self._csim_make_vars},
+            makefile_template=toolchain.template,
         )
         self._pcache_set("vitis.csim", cache_key, self.csimulator)
         return self.csimulator

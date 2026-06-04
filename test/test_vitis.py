@@ -23,6 +23,8 @@ import pytest
 from allo.exp.lang.core import range as arange, i32, f32, APInt, Stream, Template
 from allo.exp.lang.kernel import kernel
 from allo.exp.backend.vitis.core import is_vitis_available
+from allo.exp.backend.vitis.csim import discover_csim
+from pathlib import Path
 
 u32 = APInt(32, signed=False)
 u256 = APInt(256, signed=False)
@@ -30,6 +32,26 @@ u256 = APInt(256, signed=False)
 PART = "xcvu9p-flga2104-2-i"
 requires_vitis = pytest.mark.skipif(
     not is_vitis_available(), reason="Vitis HLS toolchain not detected"
+)
+
+
+def _find_legacy_vitis() -> str | None:
+    """A pre-2025.2 Vitis home whose csim routes to the legacy plain-g++ flow."""
+    candidates = sorted(Path("/tools/Xilinx/Vitis").glob("*")) + sorted(
+        Path("/opt/xilinx").glob("*/Vitis")
+    )
+    for home in candidates:
+        try:
+            if discover_csim(home).flavor == "legacy":
+                return str(home)
+        except Exception:
+            continue
+    return None
+
+
+_LEGACY_VITIS = _find_legacy_vitis()
+requires_legacy_vitis = pytest.mark.skipif(
+    _LEGACY_VITIS is None, reason="No pre-2025.2 Vitis install for legacy csim"
 )
 
 
@@ -229,20 +251,6 @@ def test_codegen_maxi_interface():
     )
 
 
-def test_synth_requires_part():
-    @kernel
-    def vadd(A: f32[16], B: f32[16], C: f32[16]):
-        for i in arange(16, name="i"):
-            C[i] = A[i] + B[i]
-
-    # Exporting without a part is fine for codegen, but synth must reject it.
-    # The backend funnels errors through terminate_on_error -> SystemExit.
-    backend = vadd.schedule().export("vitis")
-    assert backend.hls_code  # codegen works without a part
-    with pytest.raises(SystemExit):
-        backend.synth()
-
-
 # ===========================================================================
 # Synthesis / simulation tests (gated on a real Vitis HLS toolchain)
 # ===========================================================================
@@ -328,5 +336,30 @@ def test_csim_apint():
         backend = addsub.schedule().export("vitis", project_path=project)
         backend(a, b, c)
     # i5 result wraps modulo 2**5 with sign extension back to int8.
+    expected = ((a.astype(np.int16) + b + 16) % 32 - 16).astype(np.int8)
+    np.testing.assert_array_equal(c, expected)
+
+
+@requires_legacy_vitis
+def test_csim_legacy_apint():
+    """Pre-2025.2 installs lack the -fhls-csim clang, so csim falls back to the
+    legacy plain-g++ flow; the APInt std-width wrapper must still be bit-accurate."""
+    i5 = APInt(5, signed=True)
+    u5 = APInt(5, signed=False)
+
+    @kernel
+    def addsub(A: i5[8], B: u5[8], C: i5[8]):
+        for i in arange(8, name="i"):
+            C[i] = A[i] + B[i]
+
+    a = np.array([-4, -3, -2, -1, 0, 1, 2, 3], dtype=np.int8)
+    b = np.array([1, 2, 3, 4, 5, 6, 7, 8], dtype=np.uint8)
+    c = np.zeros(8, dtype=np.int8)
+    with tempfile.TemporaryDirectory() as project:
+        backend = addsub.schedule().export(
+            "vitis", project_path=project, vitis_home=_LEGACY_VITIS
+        )
+        assert backend._get_csim_toolchain().flavor == "legacy"
+        backend(a, b, c)
     expected = ((a.astype(np.int16) + b + 16) % 32 - 16).astype(np.int8)
     np.testing.assert_array_equal(c, expected)

@@ -1,7 +1,7 @@
 import ast
 import inspect
 import textwrap
-import warnings
+import functools
 import re
 from collections.abc import Sequence
 from typing import Literal, ParamSpec, Generic, TypeVar, Callable, overload
@@ -294,6 +294,7 @@ class Kernel(Generic[P, R]):
         shape = self._resolve_shape(expr.shape, scope)
         return StreamType(base_type, DEFAULT_STREAM_DEPTH, shape)
 
+    @functools.cache
     def parse_argument_annotations(self) -> list[TypeBase]:
         arg_types = []
         scope = self.get_capture_scope()
@@ -307,6 +308,7 @@ class Kernel(Generic[P, R]):
             arg_types.append(ty)
         return arg_types
 
+    @functools.cache
     def parse_return_annotation(self) -> list[TypeBase]:
         annotation = self.signature.return_annotation
         annotation = unwrap_if_constexpr(annotation)
