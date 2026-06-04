@@ -172,6 +172,12 @@ class Schedule(Generic[P, R]):
 
         raise ScheduleError(f"unsupported backend '{backend}' for export()")
 
+    def export_cpu(self, **kwargs):
+        return self.export("cpu", **kwargs)
+
+    def export_vitis(self, **kwargs):
+        return self.export("vitis", **kwargs)
+
     # --- gated real-IR access --------------------------------------------
 
     @property

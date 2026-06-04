@@ -158,6 +158,29 @@ class APInt(DType):
 
 apint = APInt  # name alias for easier usage
 
+
+def widen_apint_to_std(dtype: "DType") -> "DType":
+    """Round a non-standard-width ``APInt`` up to the next standard width
+    (8/16/32/64), preserving signedness; other dtypes are returned unchanged.
+
+    Host marshalling (numpy/ctypes) cannot represent arbitrary integer widths, so
+    the backends widen the boundary to a standard width. This mirrors the
+    ``materialize-apint-wrapper`` MLIR pass exactly so the host view matches the
+    wrapper's ABI. Widths > 64 are unsupported at the boundary.
+    """
+    if not isinstance(dtype, APInt):
+        return dtype
+    w = dtype.primitive_width
+    if w in (1, 8, 16, 32, 64):
+        return dtype
+    if w > 64:
+        raise TypeError(
+            f"APInt width {w} > 64 bits is not supported at the host boundary"
+        )
+    std = next(s for s in (8, 16, 32, 64) if w <= s)
+    return APInt(std, signed=dtype.signed)
+
+
 ### make some commonly used DType for easier usage
 # i1 = APInt(1, signed=True) # use u1 instead
 i2 = APInt(2, signed=True)

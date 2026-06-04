@@ -30,6 +30,17 @@ static std::string getIntegerTypeName(unsigned width, bool isSigned) {
   }
 }
 
+// The "allo.signed" marker carries one char per function operand then result:
+// 's' signed integer, 'u' unsigned integer, 'x' non-integer. A missing or short
+// marker falls back to unsigned, preserving prior behavior.
+static bool operandIsSigned(func::FuncOp func, unsigned idx) {
+  auto attr = func->getAttrOfType<StringAttr>("allo.signed");
+  if (!attr)
+    return false;
+  StringRef marker = attr.getValue();
+  return idx < marker.size() && marker[idx] == 's';
+}
+
 // A C++ literal for the low ``width`` set bits, e.g. ``0xfULL`` for width 4.
 // Used to mask out a bit slice; only widths up to 64 fit in a single literal.
 static std::string getBitMaskLiteral(unsigned width) {
@@ -158,7 +169,9 @@ void VivadoHLSEmitter::emitFunctionReturnType(func::FuncOp func) {
   if (nResults == 0)
     state.os << "void";
   else if (nResults == 1)
-    state.os << getPrimitiveTypeName(func.getResultTypes().front());
+    state.os << getPrimitiveTypeName(
+        func.getResultTypes().front(),
+        operandIsSigned(func, func.getNumArguments()));
   else {
     func->emitError()
         << "Multiple return values are not supported in Vivado HLS emitter.";
@@ -196,8 +209,9 @@ void VivadoHLSEmitter::emitFunctionArguments(func::FuncOp func) {
       emitArraySuffix(streamType.getShape(), arg.getLoc());
       continue;
     }
-    state.os << getPrimitiveTypeName(arg.getType()) << " "
-             << state.getOrAddName(arg);
+    state.os << getPrimitiveTypeName(arg.getType(),
+                                     operandIsSigned(func, arg.getArgNumber()))
+             << " " << state.getOrAddName(arg);
     if (auto shaped = dyn_cast<ShapedType>(arg.getType()))
       emitArraySuffix(shaped, arg.getLoc());
   }
@@ -468,7 +482,7 @@ void VivadoHLSEmitter::emitArraySuffix(ShapedType type, Location loc) {
   emitArraySuffix(type.getShape(), loc);
 }
 
-void VivadoHLSEmitter::emitValueDecl(Value val) {
+void VivadoHLSEmitter::emitValueDecl(Value val, bool isSigned) {
   if (state.hasName(val)) {
     state.os << state.getName(val);
     return;
@@ -480,7 +494,8 @@ void VivadoHLSEmitter::emitValueDecl(Value val) {
     return;
   }
 
-  state.os << getPrimitiveTypeName(val.getType()) << " " << state.addName(val);
+  state.os << getPrimitiveTypeName(val.getType(), isSigned) << " "
+           << state.addName(val);
   if (auto shaped = dyn_cast<ShapedType>(val.getType()))
     emitArraySuffix(shaped, val.getLoc());
 }
@@ -684,7 +699,13 @@ void VivadoHLSEmitter::emitAffineMapReduction(
 
 void VivadoHLSEmitter::emitMemrefAlloc(memref::AllocOp op) {
   llvm::raw_ostream &os = state.os;
-  emitValueDecl(op.getResult());
+  // A generated temporary may carry an `allo.signed` marker so its element type
+  // matches the signedness of the callee it feeds (see
+  // materialize-apint-wrapper).
+  bool isSigned = false;
+  if (auto attr = op->getAttrOfType<StringAttr>("allo.signed"))
+    isSigned = attr.getValue() == "s";
+  emitValueDecl(op.getResult(), isSigned);
   os << ";";
 }
 
@@ -802,8 +823,34 @@ void VivadoHLSEmitter::emitCastOp(Operation *op) {
   os << ");";
 }
 
+// Integer widening. MLIR integers are signless, so route the operand through
+// its correctly-signed C++ type to get sign- (extsi) or zero- (extui)
+// extension; a plain cast to the default-unsigned result type would always
+// zero-extend.
+void VivadoHLSEmitter::emitIntExtOp(Operation *op, bool isSigned) {
+  llvm::raw_ostream &os = state.os;
+  emitValueDecl(op->getResult(0), isSigned);
+  os << " = static_cast<"
+     << getPrimitiveTypeName(op->getResult(0).getType(), isSigned) << ">("
+     << "static_cast<"
+     << getPrimitiveTypeName(op->getOperand(0).getType(), isSigned) << ">(";
+  emitValueRef(op->getOperand(0));
+  os << "));";
+}
+
+// Native C++ scalar types have constexpr constructors; ap_int/ap_fixed/half do
+// not, so their constants must be `const` rather than `constexpr`.
+static bool hasConstexprCtor(Type t) {
+  if (auto it = dyn_cast<IntegerType>(t)) {
+    unsigned w = it.getWidth();
+    return w == 1 || w == 8 || w == 16 || w == 32 || w == 64;
+  }
+  return isa<IndexType, Float32Type, Float64Type>(t);
+}
+
 void VivadoHLSEmitter::emitConstant(arith::ConstantOp op) {
-  state.os << "constexpr ";
+  state.os << (hasConstexprCtor(op.getResult().getType()) ? "constexpr "
+                                                          : "const ");
   emitValueDecl(op.getResult());
   state.os << " = ";
   if (auto intAttr = dyn_cast<IntegerAttr>(op.getValue())) {
@@ -955,10 +1002,13 @@ void VivadoHLSEmitter::dispatch(Operation *op) {
       .Case<math::RoundOp>([&](auto op) { emitUnaryOp(op, "hls::round"); })
 
       // cast ops
+      .Case<arith::ExtSIOp>(
+          [&](auto op) { emitIntExtOp(op, /*isSigned=*/true); })
+      .Case<arith::ExtUIOp>(
+          [&](auto op) { emitIntExtOp(op, /*isSigned=*/false); })
       .Case<arith::IndexCastOp, arith::FPToSIOp, arith::FPToUIOp,
-            arith::SIToFPOp, arith::UIToFPOp, arith::ExtFOp, arith::ExtSIOp,
-            arith::ExtUIOp, arith::TruncIOp, arith::TruncFOp>(
-          [&](auto op) { emitCastOp(op); })
+            arith::SIToFPOp, arith::UIToFPOp, arith::ExtFOp, arith::TruncIOp,
+            arith::TruncFOp>([&](auto op) { emitCastOp(op); })
 
       // special ops
       .Case<affine::AffineForOp>([&](auto op) { emitAffineFor(op); })
@@ -974,6 +1024,8 @@ void VivadoHLSEmitter::dispatch(Operation *op) {
 
       .Case<memref::AllocOp>([&](auto op) { emitMemrefAlloc(op); })
       .Case<memref::AllocaOp>([&](auto op) { emitMemrefAlloca(op); })
+      // Local arrays free with their scope in C++; dealloc emits nothing.
+      .Case<memref::DeallocOp>([&](auto) {})
       .Case<memref::LoadOp>([&](auto op) { emitMemrefLoad(op); })
       .Case<memref::StoreOp>([&](auto op) { emitMemrefStore(op); })
       .Case<memref::GlobalOp>([&](auto op) { emitMemrefGlobal(op); })

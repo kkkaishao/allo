@@ -20,7 +20,6 @@ from .csim import (
     CSIM_MAKEFILE,
     PythonNativeCSimulator,
     _generate_csim_makefile,
-    _normalize_csim_make_vars,
 )
 from .report import VitisSynthReport
 from .utils import (
@@ -65,6 +64,22 @@ convert-allo-to-func,
 func.func(convert-linalg-to-affine-loops),canonicalize,cse)
 """
 CSIM_CACHE_DIR_KEY_LENGTH = 24
+PART_NUMBERS = {
+    # Embedded and Zynq.
+    "ultra96v2": "xczu3eg-sbva484-1-i",
+    "pynqz2": "xc7z020clg400-1",
+    "zedboard": "xc7z020clg484-1",
+    "zcu102": "xczu9eg-ffvb1156-2-e",
+    "zcu104": "xczu7ev-ffvc1156-2-e",
+    "zcu106": "xczu7ev-ffvc1156-2-e",
+    "zcu111": "xczu28dr-ffvg1517-2MP-e-S",
+    # Versal and Alveo.
+    "vck190": "xcvc1902-vsva2197-2MP-e-S",
+    "vhk158": "xcvh1582-vsva3697-2MP-e-S-es1",
+    "u200": "xcu200-fsgd2104-2-e",
+    "u250": "xcu250-figd2104-2L-e",
+    "u280": "xcu280-fsvh2892-2L-e",
+}
 
 
 @dataclass(frozen=True)
@@ -92,22 +107,48 @@ def _collect_interface_options(
     return options
 
 
-PART_NUMBERS = {
-    # Embedded and Zynq.
-    "ultra96v2": "xczu3eg-sbva484-1-i",
-    "pynqz2": "xc7z020clg400-1",
-    "zedboard": "xc7z020clg484-1",
-    "zcu102": "xczu9eg-ffvb1156-2-e",
-    "zcu104": "xczu7ev-ffvc1156-2-e",
-    "zcu106": "xczu7ev-ffvc1156-2-e",
-    "zcu111": "xczu28dr-ffvg1517-2MP-e-S",
-    # Versal and Alveo.
-    "vck190": "xcvc1902-vsva2197-2MP-e-S",
-    "vhk158": "xcvh1582-vsva3697-2MP-e-S-es1",
-    "u200": "xcu200-fsgd2104-2-e",
-    "u250": "xcu250-figd2104-2L-e",
-    "u280": "xcu280-fsvh2892-2L-e",
+_CSIM_MAKE_VAR_ALIASES = {
+    "vitis_root": "VITIS_ROOT",
+    "cxx": "CXX",
+    "gcc_toolchain": "GCC_TOOLCHAIN",
+    "vitis_host_lib": "VITIS_HOST_LIB",
+    "mathhls_lib": "MATHHLS_LIB",
+    "fpo_lib": "FPO_LIB",
+    "kernel_cpp": "KERNEL_CPP",
+    "kernel_h": "KERNEL_H",
+    "out": "OUT",
+    "hls_includes": "HLS_INCLUDES",
+    "hls_defines": "HLS_DEFINES",
+    "hls_cxxflags": "HLS_CXXFLAGS",
+    "hls_ldflags": "HLS_LDFLAGS",
+    "extra_cxxflags": "EXTRA_CXXFLAGS",
+    "extra_ldflags": "EXTRA_LDFLAGS",
 }
+
+
+def _csim_make_var_name(name: str) -> str:
+    if not name:
+        raise ValueError("CSim override keys must be non-empty")
+    default = name if name.isupper() else name.upper()
+    return _CSIM_MAKE_VAR_ALIASES.get(name.lower(), default)
+
+
+def _csim_make_var_value(value: object) -> str:
+    if isinstance(value, os.PathLike):
+        return os.fspath(value)
+    return str(value)
+
+
+def _normalize_csim_make_vars(
+    overrides: Mapping[str, object | None],
+) -> dict[str, str | None]:
+    return {
+        _csim_make_var_name(key): (
+            None if value is None else _csim_make_var_value(value)
+        )
+        for key, value in overrides.items()
+    }
+
 
 P = ParamSpec("P")
 R = TypeVar("R")
@@ -420,7 +461,7 @@ class Vitis(Backend, Generic[P, R]):
         return project_path
 
     def _materialize_csim_cache(self, *, exist_ok: bool = True) -> tuple[Path, str]:
-        artifacts = self._ensure_compiled()
+        artifacts = self._compile_for_csim()
         vitis_root = self._get_vitis_root()
         makefile = _generate_csim_makefile(vitis_root)
         payload = self._csim_cache_payload(artifacts, makefile)
@@ -654,24 +695,45 @@ class Vitis(Backend, Generic[P, R]):
         # No cached artifacts are used for HLS codegen now,
         # because the codegen is typically much faster than sim/synth/impl
         with stage("Compiling Vitis HLS Kernels"):
-            module = self._get_working_module()
-            if lookup_kernel(module, self.kernel.func_name) is None:
-                raise RuntimeError(
-                    f"Kernel function {self.kernel.func_name} not found in the module"
-                )
-            run_pipeline(module, HLS_PREPARE_PIPELINE)
-            hls_code = emit_vivado_hls(module)
-            if hls_code is None:
-                raise RuntimeError("Failed to emit Vitis HLS code")
-            hls_code = _add_extern_c_to_top(hls_code, self.kernel.func_name)
-            hls_code = _apply_interface_pragmas(
-                hls_code, self.kernel.func_name, self._interface_pragmas
-            )
-
-            artifacts = CompiledArtifacts(
-                kernel_cpp=hls_code,
-                kernel_h=generate_kernel_header(hls_code, self.kernel.func_name),
-                top=self.kernel.func_name,
-            )
+            artifacts = self._emit_artifacts(apint_wrapper=False)
             self.artifacts = artifacts
             return artifacts
+
+    def _compile_for_csim(self) -> CompiledArtifacts:
+        """Codegen for C simulation: wrap any non-standard-width APInt boundary
+        with a std-width interface so ctypes can call the top. The synthesizable
+        interface (``compile``/``hls_code``/``synth``) keeps the real ap_int."""
+        if self.kernel.func_name == "kernel":
+            raise ValueError(
+                "'kernel' is a reserved name for Vitis HLS. Please rename your kernel function."
+            )
+        self._validate_top_abi()
+        self._validate_interface_pragmas()
+        with stage("Compiling Vitis HLS Kernels (csim)"):
+            return self._emit_artifacts(apint_wrapper=True)
+
+    def _emit_artifacts(self, *, apint_wrapper: bool) -> CompiledArtifacts:
+        module = self._get_working_module()
+        if lookup_kernel(module, self.kernel.func_name) is None:
+            raise RuntimeError(
+                f"Kernel function {self.kernel.func_name} not found in the module"
+            )
+        if apint_wrapper:
+            run_pipeline(
+                module,
+                "builtin.module(materialize-apint-wrapper{"
+                f"top={self.kernel.func_name}}})",
+            )
+        run_pipeline(module, HLS_PREPARE_PIPELINE)
+        hls_code = emit_vivado_hls(module)
+        if hls_code is None:
+            raise RuntimeError("Failed to emit Vitis HLS code")
+        hls_code = _add_extern_c_to_top(hls_code, self.kernel.func_name)
+        hls_code = _apply_interface_pragmas(
+            hls_code, self.kernel.func_name, self._interface_pragmas
+        )
+        return CompiledArtifacts(
+            kernel_cpp=hls_code,
+            kernel_h=generate_kernel_header(hls_code, self.kernel.func_name),
+            top=self.kernel.func_name,
+        )

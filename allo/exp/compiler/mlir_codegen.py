@@ -17,6 +17,7 @@ from ..._mlir.ir import (
     FunctionType,
     Block,
     TypeAttr,
+    StringAttr,
     DenseI32ArrayAttr,
     InsertionPoint,
     OpResult,
@@ -79,6 +80,33 @@ def generate_function_type(
             continue
         mlir_res_types.append(ty.materialize(context))
     return FunctionType.get(mlir_arg_types, mlir_res_types, context)
+
+
+def generate_signedness_marker(
+    arg_types: Sequence[TypeBase], res_types: Sequence[TypeBase]
+) -> str:
+    """Build the ``allo.signed`` marker: one char per MLIR func operand then
+    result, in order. 's' = signed integer, 'u' = unsigned integer, 'x' =
+    non-integer. The filtering mirrors ``generate_function_type`` so the marker
+    length equals the function's operand + result count."""
+
+    def sign_char(ty: TypeBase) -> str:
+        if isinstance(ty, ShapedType):
+            ty = ty.dtype
+        if isinstance(ty, DType):
+            if ty.is_int():
+                return "s"
+            if ty.is_uint():
+                return "u"
+        return "x"
+
+    chars = [sign_char(ty) for ty in arg_types if not isinstance(ty, ConstexprType)]
+    chars += [
+        sign_char(ty)
+        for ty in res_types
+        if not isinstance(ty, (ConstexprType, StreamType))
+    ]
+    return "".join(chars)
 
 
 class _NamedModule:
@@ -449,6 +477,9 @@ class MLIRCodeGenerator(ast.NodeVisitor):
             loc=self.builder._loc,
         )
         self.generated_func = fn_op
+        fn_op.operation.attributes["allo.signed"] = StringAttr.get(
+            generate_signedness_marker(self.arg_types, self.res_types), self.context
+        )
 
         # Build the entry block with NameLoc-tagged arguments so the printed IR
         # shows the source parameter names (e.g. %buf) when name-loc prefixing is

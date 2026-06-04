@@ -10,30 +10,14 @@ from typing import Any, Mapping
 import numpy as np
 
 from .utils import _render_template
+from ..utils import numpy_to_ctype
 from ..base import write_text_if_changed
-from ...lang.core import BufferType, DType, TypeBase
+from ...lang.core import BufferType, DType, TypeBase, widen_apint_to_std
 from ...logging import completed_output, log_debug, log_detail, run_command, stage
 
 CSIM_MAKEFILE = "csim.mk"
 CSIM_SHARED_LIBRARY = "libkernel.so"
 
-_CSIM_MAKE_VAR_ALIASES = {
-    "vitis_root": "VITIS_ROOT",
-    "cxx": "CXX",
-    "gcc_toolchain": "GCC_TOOLCHAIN",
-    "vitis_host_lib": "VITIS_HOST_LIB",
-    "mathhls_lib": "MATHHLS_LIB",
-    "fpo_lib": "FPO_LIB",
-    "kernel_cpp": "KERNEL_CPP",
-    "kernel_h": "KERNEL_H",
-    "out": "OUT",
-    "hls_includes": "HLS_INCLUDES",
-    "hls_defines": "HLS_DEFINES",
-    "hls_cxxflags": "HLS_CXXFLAGS",
-    "hls_ldflags": "HLS_LDFLAGS",
-    "extra_cxxflags": "EXTRA_CXXFLAGS",
-    "extra_ldflags": "EXTRA_LDFLAGS",
-}
 
 _DTYPE_TO_NP = {
     "float32": np.float32,
@@ -50,21 +34,6 @@ _DTYPE_TO_NP = {
     "uint64": np.uint64,
 }
 
-_DTYPE_TO_CTYPE = {
-    "float32": ctypes.c_float,
-    "float64": ctypes.c_double,
-    "index": ctypes.c_int32,
-    "int8": ctypes.c_int8,
-    "int16": ctypes.c_int16,
-    "int32": ctypes.c_int32,
-    "int64": ctypes.c_int64,
-    "uint1": ctypes.c_bool,
-    "uint8": ctypes.c_uint8,
-    "uint16": ctypes.c_uint16,
-    "uint32": ctypes.c_uint32,
-    "uint64": ctypes.c_uint64,
-}
-
 
 def _generate_csim_makefile(vitis_root: Path) -> str:
     return _render_template(
@@ -74,45 +43,20 @@ def _generate_csim_makefile(vitis_root: Path) -> str:
     )
 
 
-def _csim_make_var_name(name: str) -> str:
-    if not name:
-        raise ValueError("CSim override keys must be non-empty")
-    default = name if name.isupper() else name.upper()
-    return _CSIM_MAKE_VAR_ALIASES.get(name.lower(), default)
-
-
-def _csim_make_var_value(value: object) -> str:
-    if isinstance(value, os.PathLike):
-        return os.fspath(value)
-    return str(value)
-
-
-def _normalize_csim_make_vars(
-    overrides: Mapping[str, object | None],
-) -> dict[str, str | None]:
-    return {
-        _csim_make_var_name(key): (
-            None if value is None else _csim_make_var_value(value)
-        )
-        for key, value in overrides.items()
-    }
-
-
 def _prepend_env_path(env: dict[str, str], name: str, path: Path) -> None:
     old = env.get(name, "")
     env[name] = os.fspath(path) + (os.pathsep + old if old else "")
 
 
 def _numpy_dtype_for_dtype(dtype: DType):
+    dtype = widen_apint_to_std(dtype)
     if dtype.name not in _DTYPE_TO_NP:
         raise TypeError(f"Unsupported Vitis Python-native csim dtype: {dtype}")
     return _DTYPE_TO_NP[dtype.name]
 
 
 def _ctype_for_dtype(dtype: DType):
-    if dtype.name not in _DTYPE_TO_CTYPE:
-        raise TypeError(f"Unsupported Vitis Python-native csim dtype: {dtype}")
-    return _DTYPE_TO_CTYPE[dtype.name]
+    return numpy_to_ctype(_numpy_dtype_for_dtype(dtype))
 
 
 def _as_csim_array(arg, buffer_type: BufferType):

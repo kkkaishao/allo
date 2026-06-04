@@ -65,7 +65,7 @@ struct VivadoHLSEmitter {
 
 private:
   void emitBlock(Block &block);
-  void emitValueDecl(Value val);
+  void emitValueDecl(Value val, bool isSigned = false);
   void emitValueRef(Value val);
   void emitFunctionArguments(func::FuncOp func);
   void emitFunctionReturnType(func::FuncOp func);
@@ -91,6 +91,7 @@ private:
                           bool isSigned);
   void emitUnaryOp(Operation *op, llvm::StringLiteral keyword);
   void emitCastOp(Operation *op);
+  void emitIntExtOp(Operation *op, bool isSigned);
   std::string getSymbolName(llvm::StringRef name);
   std::string getTemporaryName(llvm::StringRef prefix);
   std::string getPrimitiveTypeName(Type type, bool isSigned = false);

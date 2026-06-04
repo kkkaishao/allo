@@ -12,7 +12,7 @@ from typing import Any, Generic, ParamSpec, TypeVar
 import ml_dtypes
 import numpy as np
 
-from .utils import make_project_path
+from .utils import make_project_path, numpy_to_ctype
 
 from ..lang.core import (
     APFloat,
@@ -22,6 +22,7 @@ from ..lang.core import (
     IndexType,
     StreamType,
     TypeBase,
+    widen_apint_to_std,
 )
 from ..logging import stage, terminate_on_error
 from .base import Backend, run_pipeline, set_top_llvm_c_wrapper
@@ -59,23 +60,6 @@ _DTYPE_TO_NP = {
     "uint16": np.uint16,
     "uint32": np.uint32,
     "uint64": np.uint64,
-}
-
-_DTYPE_TO_CTYPE = {
-    "bfloat16": ctypes.c_int16,
-    "float16": ctypes.c_int16,
-    "float32": ctypes.c_float,
-    "float64": ctypes.c_double,
-    "index": ctypes.c_int64,
-    "int8": ctypes.c_int8,
-    "int16": ctypes.c_int16,
-    "int32": ctypes.c_int32,
-    "int64": ctypes.c_int64,
-    "uint1": ctypes.c_bool,
-    "uint8": ctypes.c_uint8,
-    "uint16": ctypes.c_uint16,
-    "uint32": ctypes.c_uint32,
-    "uint64": ctypes.c_uint64,
 }
 
 
@@ -279,15 +263,14 @@ def _make_scalar(value, dtype: DType):
 
 
 def _numpy_dtype_for_dtype(dtype: DType):
+    dtype = widen_apint_to_std(dtype)
     if dtype.name not in _DTYPE_TO_NP:
         _check_supported_dtype(dtype)
     return _DTYPE_TO_NP[dtype.name]
 
 
 def _ctype_for_dtype(dtype: DType):
-    if dtype.name not in _DTYPE_TO_CTYPE:
-        _check_supported_dtype(dtype)
-    return _DTYPE_TO_CTYPE[dtype.name]
+    return numpy_to_ctype(_numpy_dtype_for_dtype(dtype))
 
 
 def _check_supported_dtype(dtype: DType):
@@ -380,6 +363,14 @@ class CPU(Backend, Generic[P, R]):
                     "CPU backend does not support stream top-level arguments"
                 )
 
+            # Wrap a non-standard-width APInt boundary with a std-width interface
+            # so the LLVM memref ABI is numpy-representable. No-op otherwise. Runs
+            # before set_top_llvm_c_wrapper so the wrapper takes the public name.
+            run_pipeline(
+                self.module,
+                "builtin.module(materialize-apint-wrapper{"
+                f"top={self.kernel.func_name}}})",
+            )
             if not set_top_llvm_c_wrapper(self.module, self.kernel.func_name):
                 raise RuntimeError(
                     f"Cannot find top function '{self.kernel.func_name}'"

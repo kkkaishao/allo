@@ -140,6 +140,33 @@ def test_codegen_wide_integer():
     _contains(code, "void copy256(ap_uint<256> v0[8], ap_uint<256> v1[8])")
 
 
+def test_codegen_apint_csim_wrapper():
+    i5 = APInt(5, signed=True)
+    u5 = APInt(5, signed=False)
+
+    @kernel
+    def vadd5(A: i5[8], B: u5[8], C: i5[8]):
+        for i in arange(8, name="i"):
+            C[i] = A[i] + B[i]
+
+    backend = vadd5.schedule().export("vitis")
+    # The synthesizable interface keeps the real ap_int boundary.
+    _contains(
+        backend.hls_code,
+        "void vadd5(ap_int<5> v0[8], ap_uint<5> v1[8], ap_int<5> v2[8])",
+    )
+    # C simulation wraps it with a std-width interface around the renamed kernel,
+    # so ctypes can call it (signedness preserved per operand).
+    csim_cpp = backend._compile_for_csim().kernel_cpp
+    _contains(
+        csim_cpp,
+        'extern "C" void vadd5(int8_t v0[8], uint8_t v1[8], int8_t v2[8])',
+        "void vadd5__impl(ap_int<5>",
+        "ap_int<5> v",  # signed temp matches the callee parameter
+        "ap_uint<5> v",  # unsigned temp
+    )
+
+
 def test_codegen_bit_slice():
     @kernel
     def bits(x: u32, out: u32[1]):
@@ -282,3 +309,24 @@ def test_csim_vadd():
         backend = s.export("vitis", project_path=project)
         backend(a, b, c)
     np.testing.assert_allclose(c, a + b, rtol=1e-5)
+
+
+@requires_vitis
+def test_csim_apint():
+    i5 = APInt(5, signed=True)
+    u5 = APInt(5, signed=False)
+
+    @kernel
+    def addsub(A: i5[8], B: u5[8], C: i5[8]):
+        for i in arange(8, name="i"):
+            C[i] = A[i] + B[i]
+
+    a = np.array([-4, -3, -2, -1, 0, 1, 2, 3], dtype=np.int8)
+    b = np.array([1, 2, 3, 4, 5, 6, 7, 8], dtype=np.uint8)
+    c = np.zeros(8, dtype=np.int8)
+    with tempfile.TemporaryDirectory() as project:
+        backend = addsub.schedule().export("vitis", project_path=project)
+        backend(a, b, c)
+    # i5 result wraps modulo 2**5 with sign extension back to int8.
+    expected = ((a.astype(np.int16) + b + 16) % 32 - 16).astype(np.int8)
+    np.testing.assert_array_equal(c, expected)

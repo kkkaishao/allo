@@ -3,8 +3,40 @@
 
 import numpy as np
 
-from allo.exp.lang.core import i32
+from allo.exp.lang.core import APInt, i32, range as arange
 from allo.exp.lang.kernel import kernel
+
+
+def test_simulator_apint_buffers():
+    i5 = APInt(5, signed=True)
+    u5 = APInt(5, signed=False)
+
+    @kernel
+    def addsub(A: i5[8], B: u5[8], C: i5[8]):
+        for i in arange(8, name="i"):
+            C[i] = A[i] + B[i]
+
+    A = np.array([-4, -3, -2, -1, 0, 1, 2, 3], dtype=np.int8)
+    B = np.array([1, 2, 3, 4, 5, 6, 7, 8], dtype=np.uint8)
+    C = np.zeros(8, dtype=np.int8)
+    addsub(A, B, C)
+    expected = ((A.astype(np.int16) + B + 16) % 32 - 16).astype(np.int8)
+    np.testing.assert_array_equal(C, expected)
+
+
+def test_simulator_apint_scalar_return():
+    i13 = APInt(13, signed=True)
+
+    @kernel
+    def acc(A: i13[6]) -> i13:
+        s: i13 = 0
+        for i in arange(6, name="i"):
+            s = s + A[i]
+        return s
+
+    A = np.array([-4000, 4000, -100, 100, -1, 1], dtype=np.int16)
+    expected = int((int(A.sum()) + 4096) % 8192 - 4096)
+    assert int(acc(A)) == expected
 
 
 def test_simulator_scalar_stream():

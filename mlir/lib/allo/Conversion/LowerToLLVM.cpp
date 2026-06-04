@@ -4,7 +4,6 @@
 #include "mlir/Dialect/Bufferization/Pipelines/Passes.h"
 #include "mlir/Dialect/Bufferization/Transforms/Passes.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
-#include "mlir/Dialect/LLVMIR/Transforms/Passes.h"
 #include "mlir/Dialect/Linalg/Passes.h"
 #include "mlir/Dialect/MemRef/Transforms/Passes.h"
 #include "mlir/Pass/PassManager.h"
@@ -38,8 +37,12 @@ void allo::populateLowerToLLVMPipeline(OpPassManager &pm, bool enableTensor) {
   }
 
   pm.addPass(createConvertAlloToFuncPass());
+  // No global C-wrapper request: only the top kernel needs the C interface ABI,
+  // and the backend marks it explicitly with `llvm.emit_c_interface` (preserved
+  // through ConvertAlloToFunc). Requesting wrappers for every function would
+  // otherwise force the `_mlir_ciface_` prefix onto the dataflow runtime
+  // symbols.
   auto &nestedPM = pm.nest<func::FuncOp>();
-  nestedPM.addPass(LLVM::createLLVMRequestCWrappersPass());
   nestedPM.addPass(createConvertLinalgToAffineLoopsPass());
   nestedPM.addPass(affine::createAffineScalarReplacementPass());
   nestedPM.addPass(createLoopInvariantCodeMotionPass());

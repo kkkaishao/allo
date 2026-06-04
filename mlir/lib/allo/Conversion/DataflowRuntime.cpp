@@ -65,9 +65,8 @@ static void readBytes(Stream *stream, int64_t lane, void *data) {
 }
 } // namespace
 
-extern "C" uint64_t _mlir_ciface_allo_sim_stream_create(int64_t lanes,
-                                                        int64_t depth,
-                                                        int64_t itemBytes) {
+extern "C" uint64_t allo_sim_stream_create(int64_t lanes, int64_t depth,
+                                           int64_t itemBytes) {
   assert(lanes > 0 && "stream must have at least one lane");
   assert(depth > 0 && "stream depth must be positive");
   assert(itemBytes > 0 && "stream payload size must be positive");
@@ -81,17 +80,15 @@ extern "C" uint64_t _mlir_ciface_allo_sim_stream_create(int64_t lanes,
   return reinterpret_cast<uint64_t>(stream.release());
 }
 
-extern "C" void _mlir_ciface_allo_sim_stream_write(uint64_t handle,
-                                                   int64_t lane,
-                                                   uint64_t value) {
+extern "C" void allo_sim_stream_write(uint64_t handle, int64_t lane,
+                                      uint64_t value) {
   Stream *stream = asStream(handle);
   assert(stream->itemBytes <= static_cast<int64_t>(sizeof(value)) &&
          "scalar stream payload is too wide");
   writeBytes(stream, lane, &value);
 }
 
-extern "C" uint64_t _mlir_ciface_allo_sim_stream_read(uint64_t handle,
-                                                      int64_t lane) {
+extern "C" uint64_t allo_sim_stream_read(uint64_t handle, int64_t lane) {
   Stream *stream = asStream(handle);
   assert(stream->itemBytes <= static_cast<int64_t>(sizeof(uint64_t)) &&
          "scalar stream payload is too wide");
@@ -100,18 +97,16 @@ extern "C" uint64_t _mlir_ciface_allo_sim_stream_read(uint64_t handle,
   return value;
 }
 
-extern "C" void _mlir_ciface_allo_sim_stream_write_mem(uint64_t handle,
-                                                       int64_t lane,
-                                                       uint64_t ptr) {
+extern "C" void allo_sim_stream_write_mem(uint64_t handle, int64_t lane,
+                                          uint64_t ptr) {
   writeBytes(asStream(handle), lane, reinterpret_cast<const void *>(ptr));
 }
 
-extern "C" void _mlir_ciface_allo_sim_stream_read_mem(uint64_t handle,
-                                                      int64_t lane,
-                                                      uint64_t ptr) {
+extern "C" void allo_sim_stream_read_mem(uint64_t handle, int64_t lane,
+                                         uint64_t ptr) {
   readBytes(asStream(handle), lane, reinterpret_cast<void *>(ptr));
 }
 
-extern "C" void _mlir_ciface_allo_sim_stream_destroy(uint64_t handle) {
+extern "C" void allo_sim_stream_destroy(uint64_t handle) {
   delete asStream(handle);
 }
