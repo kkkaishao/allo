@@ -695,18 +695,30 @@ class Schedule(Generic[P, R]):
 
     materialize = apply
 
-    def compose(self, callee: Schedule, *, id=None) -> Schedule:
-        """Apply ``callee``'s whole schedule to the specialized copy of that kernel
-        inside this kernel. The copy is the symbol ``"{primary}.{callee_primary}"``
-        (with an optional ``.{id}`` suffix for a specific specialized/repeat copy).
-        Generic callees are concrete by construction (templates are bound before
-        ``Kernel.schedule()``), so compose needs no instantiation.
+    def compose(self, *callees: Schedule, id=None) -> Schedule:
+        """Apply each ``callee``'s whole schedule to the specialized copy of that kernel
+        inside this kernel. Pass several direct callees to compose them in one call:
+        ``s.compose(a, b)`` is exactly ``s.compose(a); s.compose(b)``, so every callee
+        must be a kernel ``self`` calls directly (a non-direct callee has no
+        ``"{primary}.{callee_primary}"`` copy and raises).
 
-        ``callee`` may itself have composed sub-kernels: its include plan lists every
+        The copy is the symbol ``"{primary}.{callee_primary}"`` (with an optional
+        ``.{id}`` suffix for a specific specialized/repeat copy). Generic callees are
+        concrete by construction (templates are bound before ``Kernel.schedule()``), so
+        compose needs no instantiation.
+
+        A ``callee`` may itself have composed sub-kernels: its include plan lists every
         body it realizes, keyed by the callee-relative copy symbol. Re-prefixing those
         keys onto this copy maps them to the transitive copies the compiler emits
         (e.g. ``mid.inner`` -> ``top.mid.inner``), and every body is imported, so the
         callee's full schedule runs verbatim on the matching copies."""
+        if not callees:
+            raise InvalidScheduleArgumentError("compose requires at least one callee")
+        for callee in callees:
+            self._compose(callee, id)
+        return self
+
+    def _compose(self, callee: Schedule, id) -> None:
         copy_key = f"{self._primary_name}.{callee._primary_name}"
         if id is not None:
             copy_key = f"{copy_key}.{id}"
@@ -725,7 +737,6 @@ class Schedule(Generic[P, R]):
             self.script.compose_include(new_key, body_map[body_sym])
             self.predicted.mark_approx(copy_node)
         self._mark_dirty()
-        return self
 
     def _resolve_copy(self, copy_key: str) -> PredictedOp:
         node = self.predicted.op(self.predicted.root_scope, copy_key)

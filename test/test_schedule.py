@@ -803,6 +803,45 @@ def test_compose_two_kernels():
     np.testing.assert_array_equal(D, A @ B + 1)
 
 
+def test_compose_variadic_siblings():
+    M, N, K = 4, 4, 4
+
+    @kernel
+    def gemm(A: i32[M, K], B: i32[K, N], C: i32[M, N]):
+        for i in range(M, name="i"):
+            for j in range(N, name="j"):
+                for k in range(K, name="k"):
+                    C[i, j] += A[i, k] * B[k, j]
+
+    @kernel
+    def addone(C: i32[M, N], D: i32[M, N]):
+        for i in range(M, name="i"):
+            for j in range(N, name="j"):
+                D[i, j] = C[i, j] + 1
+
+    @kernel
+    def top(A: i32[M, K], B: i32[K, N], C: i32[M, N], D: i32[M, N]):
+        gemm(A, B, C)
+        addone(C, D)
+
+    gs = gemm.schedule()
+    gs.pipeline(gs.loop("j"), ii=1)
+    as_ = addone.schedule()
+    as_.pipeline(as_.loop("j"), ii=1)
+
+    # One compose call over both direct callees == composing each in turn.
+    ts = top.schedule()
+    ts.compose(gs, as_)
+    mod = ts.export("cpu")
+
+    A = np.random.randint(0, 10, (M, K)).astype(np.int32)
+    B = np.random.randint(0, 10, (K, N)).astype(np.int32)
+    C = np.zeros((M, N), dtype=np.int32)
+    D = np.zeros((M, N), dtype=np.int32)
+    mod(A, B, C, D)
+    np.testing.assert_array_equal(D, A @ B + 1)
+
+
 def test_compose_gemm_scheduled():
     M, N, K = 8, 8, 8
 
