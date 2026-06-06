@@ -8,6 +8,7 @@ from typing import Sequence, cast, Literal, NoReturn
 
 from ..._mlir import ir
 from ..._mlir.dialects import arith, tensor, linalg, math, memref
+from ..._mlir.dialects import affine as affine_d
 from ..._mlir.dialects import allo as allo_d
 
 from .errors import CompilationError
@@ -975,6 +976,70 @@ class AlloOpBuilder:
             )
             return AlloValue(op.result, buffer.type)
         assert False, f"Unsupported shaped type: {buffer.type}"
+
+    def create_affine_load(
+        self, buffer: AlloValue, affine_map: ir.AffineMap, operands: Sequence[AlloValue]
+    ) -> AlloValue:
+        assert isinstance(buffer.type, BufferType)
+        op = affine_d.AffineLoadOp(
+            self._materialize(buffer.dtype),
+            buffer.handle,
+            [v.handle for v in operands],
+            ir.AffineMapAttr.get(affine_map),
+            ip=self._ip,
+            loc=self._loc,
+        )
+        return AlloValue(op.result, buffer.dtype)
+
+    def create_affine_store(
+        self,
+        value: AlloValue,
+        buffer: AlloValue,
+        affine_map: ir.AffineMap,
+        operands: Sequence[AlloValue],
+    ) -> None:
+        assert isinstance(buffer.type, BufferType)
+        affine_d.AffineStoreOp(
+            value.handle,
+            buffer.handle,
+            [v.handle for v in operands],
+            ir.AffineMapAttr.get(affine_map),
+            ip=self._ip,
+            loc=self._loc,
+        )
+        return None
+
+    def create_affine_parallel(
+        self,
+        lb_map: ir.AffineMap,
+        lb_operands: Sequence,
+        ub_map: ir.AffineMap,
+        ub_operands: Sequence,
+        steps: list[int],
+    ):
+        """Build an ``affine.parallel`` from multi-result lower/upper bound maps
+        (one result per dim) and their operands. ``mapOperands`` is the lower
+        operands followed by the upper operands. Returns the op and its body block
+        (one index IV per dim, terminated by an ``affine.yield``)."""
+        ndim = len(steps)
+        i64 = ir.IntegerType.get_signless(64)
+        groups = [1] * ndim  # one bound expression per induction variable
+        par = affine_d.AffineParallelOp(
+            [],
+            ir.ArrayAttr.get([]),  # no reductions
+            ir.AffineMapAttr.get(lb_map),
+            groups,
+            ir.AffineMapAttr.get(ub_map),
+            groups,
+            ir.ArrayAttr.get([ir.IntegerAttr.get(i64, s) for s in steps]),
+            list(lb_operands) + list(ub_operands),
+            ip=self._ip,
+            loc=self._loc,
+        )
+        body = par.regions[0].blocks.append(*([ir.IndexType.get()] * ndim))
+        with ir.InsertionPoint(body):
+            affine_d.AffineYieldOp([], loc=self._loc)
+        return par, body
 
     def _stream_handle_and_indices(self, stream):
         assert isinstance(stream, AlloValue)

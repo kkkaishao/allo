@@ -2,6 +2,7 @@ import ast
 
 import builtins
 import copy
+import operator
 from contextlib import contextmanager
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -37,6 +38,7 @@ from ..._mlir.dialects.scf import (
     ParallelOp,
     ReduceOp,
 )
+from ..._mlir.dialects.affine import AffineForOp, AffineYieldOp
 from ..._mlir.dialects.arith import SelectOp
 from ..._mlir.dialects.ub import PoisonOp
 from .builder import AlloOpBuilder
@@ -49,6 +51,7 @@ from ..lang.core import (
     TypeBase,
     DType,
     ShapedType,
+    BufferType,
     StreamType,
     Range,
     Grid,
@@ -109,24 +112,6 @@ def generate_signedness_marker(
     return "".join(chars)
 
 
-class _NamedModule:
-    """Proxy around an MLIR Module whose ``str()`` prints SSA values using their
-    source-name NameLocs (restoring the legacy ``printNameLocAsPrefix``
-    behaviour). All other attribute access delegates to the wrapped module."""
-
-    def __init__(self, module):
-        object.__setattr__(self, "_module", module)
-
-    def __str__(self) -> str:
-        return self._module.operation.get_asm(use_name_loc_as_prefix=True)
-
-    def __repr__(self) -> str:
-        return self.__str__()
-
-    def __getattr__(self, name):
-        return getattr(object.__getattribute__(self, "_module"), name)
-
-
 class ReturnPlacementChecker(ast.NodeVisitor):
     def __init__(self, src: str, file_name: str, begin_line: int):
         self.src = src
@@ -184,6 +169,30 @@ class NestedKernelSymbol:
     node: ast.FunctionDef
     owner_func_name: str
     mapping: tuple[int, ...]
+
+
+class _AffineOperands:
+    """Accumulates the dim (affine IV) and symbol operands of an ``AffineMap``,
+    preserving MLIR's dims-before-symbols operand order and deduplicating by SSA
+    handle. ``dim``/``symbol`` return the operand's position."""
+
+    def __init__(self):
+        self.dims: list = []
+        self.symbols: list = []
+
+    @staticmethod
+    def _position(store: list, value) -> int:
+        for pos, existing in enumerate(store):
+            if existing.handle == value.handle:
+                return pos
+        store.append(value)
+        return len(store) - 1
+
+    def dim(self, value) -> int:
+        return self._position(self.dims, value)
+
+    def symbol(self, value) -> int:
+        return self._position(self.symbols, value)
 
 
 # Sentinel for "name not found" in the scope-lookup chain.
@@ -246,6 +255,16 @@ class MLIRCodeGenerator(ast.NodeVisitor):
         self.visiting_consteval_fn = False
         self.visiting_default_args = False
         self.dry_run_loop_analysis = False
+        # AlloValues that are induction variables of enclosing affine loops
+        # (affine.for / affine.parallel). Only these are valid affine dimensions,
+        # so a memory access is affine iff every index atom is one of them, a
+        # compile-time constant, or a top-level symbol. Snapshotted/restored by
+        # EnterSubRegion.
+        self._affine_ivs: list[AlloValue] = []
+        # Kernel entry block + cache of hoisted index_cast'd symbol operands, so a
+        # symbol stays a valid (top-level) affine symbol at any nesting depth.
+        self._entry_block: Block | None = None
+        self._affine_symbol_casts: list[tuple[AlloValue, AlloValue]] = []
         self.block_terminated = False
         self.has_explicit_return_annotation = False
 
@@ -345,9 +364,12 @@ class MLIRCodeGenerator(ast.NodeVisitor):
 
     @contextmanager
     def _name_loc_prefix(self, prefix):
+        previous = self.name_loc_prefix
         self.name_loc_prefix = prefix
-        yield
-        self.name_loc_prefix = None
+        try:
+            yield
+        finally:
+            self.name_loc_prefix = previous
 
     def _set_value(self, name: str, value: object):
         self.lscope[name] = value
@@ -494,6 +516,7 @@ class MLIRCodeGenerator(ast.NodeVisitor):
             for nm in non_constexpr_names
         ]
         entry_block = fn_op.regions[0].blocks.append(*fn_ty.inputs, arg_locs=arg_locs)
+        self._entry_block = entry_block
         arg_handles = list(entry_block.arguments)
 
         arg_idx = 0
@@ -624,57 +647,38 @@ class MLIRCodeGenerator(ast.NodeVisitor):
     def _infer_bit_slice_width(self, lower, upper):
         """Infer the constant bit width ``hi - lo`` of a slice, or ``None`` when
         the difference is not a compile-time constant. The offset may still be
-        dynamic: ``x[i:i+2]`` has width 2 because the ``i`` terms cancel."""
+        dynamic: ``x[i:i+2]`` has width 2 because the ``i`` terms cancel.
+
+        Reuses the affine decomposer with a *symbolic* atom resolver: any
+        non-constant sub-expression becomes an opaque placeholder dimension keyed
+        by its source text, so identical offsets cancel under MLIR's affine
+        simplification and the residual difference is read off as a constant."""
         if lower is None or upper is None:
             return None
-        lo = self._affine_form(lower)
-        hi = self._affine_form(upper)
+        placeholders: dict[str, ir.AffineExpr] = {}
+
+        def symbolic_atom(node):
+            key = ast.unparse(node)
+            expr = placeholders.get(key)
+            if expr is None:
+                expr = ir.AffineExpr.get_dim(len(placeholders))
+                placeholders[key] = expr
+            return expr
+
+        lo = self._build_affine_expr(lower, symbolic_atom)
+        hi = self._build_affine_expr(upper, symbolic_atom)
         if lo is None or hi is None:
             return None
-        terms = dict(hi[1])
-        for key, coeff in lo[1].items():
-            terms[key] = terms.get(key, 0) - coeff
-        if any(coeff != 0 for coeff in terms.values()):
-            return None
-        return hi[0] - lo[0]
+        return self._affine_constant_value(hi - lo)
 
-    def _affine_form(self, node):
-        """Decompose an integer expression into affine form
-        ``(const, {atom: coeff})``, or ``None`` if it is not integer-affine.
-        Identical sub-expressions share an atom key so they cancel on subtraction."""
-        if isinstance(node, ast.Constant):
-            return (node.value, {}) if type(node.value) is builtins.int else None
-        if isinstance(node, ast.UnaryOp):
-            if isinstance(node.op, ast.UAdd):
-                return self._affine_form(node.operand)
-            if isinstance(node.op, ast.USub):
-                sub = self._affine_form(node.operand)
-                if sub is None:
-                    return None
-                return (-sub[0], {k: -v for k, v in sub[1].items()})
+    @staticmethod
+    def _affine_constant_value(expr: ir.AffineExpr):
+        """Return the integer value of a (possibly simplified) constant
+        ``AffineExpr``, or ``None`` if it is not constant."""
+        try:
+            return ir.AffineConstantExpr(expr).value
+        except ValueError:
             return None
-        if isinstance(node, ast.BinOp):
-            lhs = self._affine_form(node.left)
-            rhs = self._affine_form(node.right)
-            if lhs is None or rhs is None:
-                return None
-            if isinstance(node.op, (ast.Add, ast.Sub)):
-                sign = 1 if isinstance(node.op, ast.Add) else -1
-                terms = dict(lhs[1])
-                for key, coeff in rhs[1].items():
-                    terms[key] = terms.get(key, 0) + sign * coeff
-                return (lhs[0] + sign * rhs[0], terms)
-            if isinstance(node.op, ast.Mult):
-                # Only ``const * affine`` stays affine.
-                if not lhs[1]:
-                    return (lhs[0] * rhs[0], {k: lhs[0] * v for k, v in rhs[1].items()})
-                if not rhs[1]:
-                    return (rhs[0] * lhs[0], {k: rhs[0] * v for k, v in lhs[1].items()})
-            return None
-        const = self._try_constexpr_int(node)
-        if const is not None:
-            return (const, {})
-        return (0, {ast.unparse(node): 1})
 
     def _try_constexpr_int(self, node):
         if isinstance(node, ast.Constant):
@@ -683,6 +687,193 @@ class MLIRCodeGenerator(ast.NodeVisitor):
             val = unwrap_if_constexpr(self.lookup(node.id))
             return val if isinstance(val, int) else None
         return None
+
+    # ----------------------------------------------------------------------
+    # Affine analysis: recover an AffineExpr/AffineMap from an index/bound AST.
+    # `_build_affine_expr` is a pure recursive decomposer (`+ - *(const) // / %`)
+    # parameterised by an *atom* resolver for its leaves, shared by the affine
+    # map builder (dims = affine IVs, symbols = top-level params) and bit-slice
+    # width inference (opaque text placeholders). No `self.visit`; the only side
+    # effect is hoisting symbol casts, deferred until a map is known affine.
+    # ----------------------------------------------------------------------
+    def _build_affine_expr(self, node: ast.AST, atom):
+        """Lower an integer expression into an ``AffineExpr`` using ``atom(node)``
+        for non-constant leaves (returning an ``AffineExpr`` or ``None``), or
+        ``None`` if the expression is not integer-affine."""
+        const = self._try_constexpr_int(node)
+        if const is not None:
+            return ir.AffineExpr.get_constant(const)
+        if isinstance(node, ast.UnaryOp):
+            if isinstance(node.op, ast.UAdd):
+                return self._build_affine_expr(node.operand, atom)
+            if isinstance(node.op, ast.USub):
+                sub = self._build_affine_expr(node.operand, atom)
+                return None if sub is None else sub * (-1)
+            return None
+        if isinstance(node, ast.BinOp):
+            return self._build_affine_binop(node, atom)
+        return atom(node)
+
+    def _build_affine_binop(self, node: ast.BinOp, atom):
+        op = node.op
+        if isinstance(op, (ast.Add, ast.Sub)):
+            lhs = self._build_affine_expr(node.left, atom)
+            rhs = self._build_affine_expr(node.right, atom)
+            if lhs is None or rhs is None:
+                return None
+            return lhs + rhs if isinstance(op, ast.Add) else lhs - rhs
+        if isinstance(op, ast.Mult):
+            # Affine multiplication requires a compile-time constant factor.
+            lc = self._try_constexpr_int(node.left)
+            if lc is not None:
+                rhs = self._build_affine_expr(node.right, atom)
+                return None if rhs is None else rhs * lc
+            rc = self._try_constexpr_int(node.right)
+            if rc is not None:
+                lhs = self._build_affine_expr(node.left, atom)
+                return None if lhs is None else lhs * rc
+            return None
+        if isinstance(op, (ast.FloorDiv, ast.Div, ast.Mod)):
+            # The divisor/modulus must be a positive compile-time constant.
+            rc = self._try_constexpr_int(node.right)
+            if rc is None or rc <= 0:
+                return None
+            lhs = self._build_affine_expr(node.left, atom)
+            if lhs is None:
+                return None
+            if isinstance(op, ast.Mod):
+                return lhs % rc
+            return ir.AffineExpr.get_floor_div(lhs, rc)
+        return None
+
+    def _affine_symbol_value(self, value):
+        """A value is a valid affine symbol if it is a loop-invariant top-level
+        value of the kernel — here, an integer/index kernel parameter. Returns the
+        value when eligible (pure: the index cast, if any, is materialized later),
+        else ``None``."""
+        if not isinstance(value, AlloValue):
+            return None
+        owner = value.handle.owner  # Block for a block arg, Operation for a result
+        if not isinstance(owner, Block) or owner != self._entry_block:
+            return None
+        ty = value.type
+        if ty == index:
+            return value
+        if isinstance(ty, DType) and (ty.is_int() or ty.is_uint()):
+            return value
+        return None
+
+    def _materialize_affine_symbol(self, value: AlloValue) -> AlloValue:
+        """Return an ``index``-typed top-level operand for a symbol, hoisting an
+        ``index_cast`` to the start of the kernel entry block (cached) so it
+        remains a valid affine symbol regardless of loop nesting depth."""
+        if value.type == index:
+            return value
+        for src, casted in self._affine_symbol_casts:
+            if src.handle == value.handle:
+                return casted
+        assert self._entry_block is not None
+        saved_ip = self.builder.save_insertion_point()
+        self.builder.set_insertion_point_to_start(self._entry_block)
+        casted = self.builder.cast(value, index)
+        self.builder.restore_insertion_point(saved_ip)
+        self._affine_symbol_casts.append((value, casted))
+        return casted
+
+    def _affine_map_atom(self, acc: "_AffineOperands"):
+        """Atom resolver for real affine maps: a ``Name`` bound to an enclosing
+        affine IV becomes a dim, a top-level integer/index parameter a symbol;
+        anything else fails (``None``)."""
+
+        def atom(node):
+            if not isinstance(node, ast.Name):
+                return None
+            value = self.lookup(node.id)
+            if not isinstance(value, AlloValue):
+                return None
+            if any(iv.handle == value.handle for iv in self._affine_ivs):
+                return ir.AffineExpr.get_dim(acc.dim(value))
+            if self._affine_symbol_value(value) is not None:
+                return ir.AffineExpr.get_symbol(acc.symbol(value))
+            return None
+
+        return atom
+
+    def _build_affine_value_map(self, nodes):
+        """Build ``(AffineMap, operands)`` for index/bound expressions sharing one
+        operand list (dims then symbols), or ``None`` if any is non-affine.
+        Symbol casts are materialized only once the whole map is known affine."""
+        acc = _AffineOperands()
+        atom = self._affine_map_atom(acc)
+        exprs = []
+        for node in nodes:
+            expr = self._build_affine_expr(node, atom)
+            if expr is None:
+                return None
+            exprs.append(expr)
+        operands = list(acc.dims) + [
+            self._materialize_affine_symbol(sym) for sym in acc.symbols
+        ]
+        return ir.AffineMap.get(len(acc.dims), len(acc.symbols), exprs), operands
+
+    def _build_single_bound(self, node):
+        """Build ``(AffineMap, operands)`` for one loop bound (``None`` node means
+        the constant 0), or ``None`` if the bound is not affine."""
+        if node is None:
+            return ir.AffineMap.get(0, 0, [ir.AffineExpr.get_constant(0)]), []
+        return self._build_affine_value_map([node])
+
+    def _affine_index_nodes(self, node: ast.Subscript):
+        """Per-dimension index AST nodes of a subscript, or ``None`` if it is a
+        slice/partial access (handled by the eager subview path instead)."""
+        sl = node.slice
+        if isinstance(sl, ast.Slice):
+            return None
+        if isinstance(sl, ast.Tuple):
+            if any(isinstance(e, ast.Slice) for e in sl.elts):
+                return None
+            return list(sl.elts)
+        return [sl]
+
+    def _build_affine_access(self, buffer, node: ast.Subscript):
+        """Try to express a full-rank ``buffer[idx...]`` access affinely. Returns
+        ``(affine_map, operands)`` or ``None`` to signal an eager fallback."""
+        if not (isinstance(buffer, AlloValue) and isinstance(buffer.type, BufferType)):
+            return None
+        index_nodes = self._affine_index_nodes(node)
+        if index_nodes is None or len(index_nodes) != buffer.type.rank:
+            return None
+        return self._build_affine_value_map(index_nodes)
+
+    @staticmethod
+    def _range_bound_nodes(call: ast.Call):
+        """Map a ``range(...)`` call's AST to ``(lb_node, ub_node)``; a ``None``
+        node means the default lower bound 0."""
+        args = call.args
+        kw = {k.arg: k.value for k in call.keywords}
+        start = args[0] if len(args) >= 1 else kw.get("start")
+        stop = args[1] if len(args) >= 2 else kw.get("stop")
+        if stop is None:  # range(stop): lower bound defaults to 0
+            return None, start
+        return start, stop
+
+    @staticmethod
+    def _grid_bound_nodes(call: ast.Call):
+        """Per-dimension ``(lb_node, ub_node)`` for a ``grid(...)`` call's AST, or
+        ``None`` if a spec is malformed. A ``None`` lb node means default 0."""
+        specs = []
+        for arg in call.args:
+            if isinstance(arg, ast.Tuple):
+                elts = arg.elts
+                if len(elts) == 1:
+                    specs.append((None, elts[0]))
+                elif len(elts) in (2, 3):
+                    specs.append((elts[0], elts[1]))
+                else:
+                    return None
+            else:
+                specs.append((None, arg))
+        return specs
 
     def visit_Compare(self, node: ast.Compare):
         if not (len(node.ops) == 1 and len(node.comparators) == 1):
@@ -756,15 +947,20 @@ class MLIRCodeGenerator(ast.NodeVisitor):
         rhs = self.builder.cast_to_dtype(rhs, dst_ty)
         return self.builder.broadcast_pair(lhs, rhs)
 
+    # Direct (HLS) lowering for +/-/*: constexpr-fold function and the library
+    # operator used for shaped operands. Scalar operands dispatch to
+    # ``builder.create_{op_name}``.
+    _DIRECT_BINARY_OPS = {
+        "add": (operator.add, arith_ops.add),
+        "sub": (operator.sub, arith_ops.sub),
+        "mul": (operator.mul, arith_ops.mul),
+    }
+
     def _lower_direct_binary(self, op_name: str, lhs, rhs):
+        fold, library_op = self._DIRECT_BINARY_OPS[op_name]
+
         if isinstance(lhs, ConstexprValue) and isinstance(rhs, ConstexprValue):
-            if op_name == "add":
-                return ConstexprValue(lhs.value + rhs.value)
-            if op_name == "sub":
-                return ConstexprValue(lhs.value - rhs.value)
-            if op_name == "mul":
-                return ConstexprValue(lhs.value * rhs.value)
-            assert False, f"Unsupported direct binary operator: {op_name}"
+            return ConstexprValue(fold(lhs.value, rhs.value))
 
         lhs, rhs = self._materialize_constexpr_pair(lhs, rhs)
         if not (isinstance(lhs, AlloValue) and isinstance(rhs, AlloValue)):
@@ -773,24 +969,13 @@ class MLIRCodeGenerator(ast.NodeVisitor):
             )
 
         if isinstance(lhs.type, ShapedType) or isinstance(rhs.type, ShapedType):
-            if op_name == "add":
-                return self.call_operator(arith_ops.add, [lhs, rhs])
-            if op_name == "sub":
-                return self.call_operator(arith_ops.sub, [lhs, rhs])
-            if op_name == "mul":
-                return self.call_operator(arith_ops.mul, [lhs, rhs])
-            assert False, f"Unsupported direct binary operator: {op_name}"
+            return self.call_operator(library_op, [lhs, rhs])
 
         lhs, rhs = self._prepare_binary_operands(lhs, rhs, op_name)
         assert isinstance(lhs.dtype, DType)
-        floating = lhs.dtype.is_float()
-        if op_name == "add":
-            return self.builder.create_add(lhs, rhs, floating=floating)
-        if op_name == "sub":
-            return self.builder.create_sub(lhs, rhs, floating=floating)
-        if op_name == "mul":
-            return self.builder.create_mul(lhs, rhs, floating=floating)
-        assert False, f"Unsupported direct binary operator: {op_name}"
+        return getattr(self.builder, f"create_{op_name}")(
+            lhs, rhs, floating=lhs.dtype.is_float()
+        )
 
     def _lower_binary_values(self, op: ast.operator, lhs, rhs):
         if isinstance(op, ast.Add):
@@ -1294,15 +1479,7 @@ class MLIRCodeGenerator(ast.NodeVisitor):
             return AlloValue(sel_op.result, res_type)
         else:
             # constexpr path
-            assert isinstance(cond, ConstexprValue)
-            cond = unwrap_if_constexpr(cond)
-            if type(cond) not in self._condition_types:
-                return self.compile_error(
-                    "Ternary expression conditionals can only accept values of type {{{{}}}, not objects of type {}".format(
-                        ", ".join(_.__name__ for _ in self._condition_types),
-                        type(cond).__name__,
-                    ),
-                )
+            cond = self._unwrap_constexpr_condition(cond, "Ternary expression")
             selected = node.body if cond else node.orelse
             return self.visit(selected)
 
@@ -1311,6 +1488,19 @@ class MLIRCodeGenerator(ast.NodeVisitor):
         int,
         type(None),
     }
+
+    def _unwrap_constexpr_condition(self, cond, context: str):
+        """Unwrap a constexpr branch condition to a Python bool/int/None, or raise
+        a compile error naming the accepted condition types."""
+        assert isinstance(cond, ConstexprValue)
+        value = unwrap_if_constexpr(cond)
+        if type(value) not in self._condition_types:
+            allowed = ", ".join(t.__name__ for t in self._condition_types)
+            return self.compile_error(
+                f"{context} conditionals can only accept values of type "
+                f"{{{allowed}}}, not objects of type {type(value).__name__}."
+            )
+        return value
 
     def _branch_has_return(self, stmts):
         # TODO: maybe a better checking
@@ -1330,15 +1520,7 @@ class MLIRCodeGenerator(ast.NodeVisitor):
                 self.visit_if_impl(cond, node)
         else:
             # constexpr path
-            assert isinstance(cond, ConstexprValue)
-            cond = unwrap_if_constexpr(cond)
-            if type(cond) not in self._condition_types:
-                return self.compile_error(
-                    "`if` conditionals can only accept values of type {{{{}}}, not objects of type {}".format(
-                        ", ".join(_.__name__ for _ in self._condition_types),
-                        type(cond).__name__,
-                    ),
-                )
+            cond = self._unwrap_constexpr_condition(cond, "`if`")
             selected = node.body if cond else node.orelse
             self.visit_compound_stmts(selected)
 
@@ -1373,15 +1555,24 @@ class MLIRCodeGenerator(ast.NodeVisitor):
     def visit_Subscript(self, node: ast.Subscript):
         return self.visit_Subscript_Load(node)
 
+    @staticmethod
+    def _as_index_tuple(slices):
+        """Normalize parsed subscript slices to a tuple: a single scalar index
+        becomes a 1-tuple, an existing tuple is returned unchanged."""
+        if isinstance(slices, (AlloValue, ConstexprValue)):
+            return (slices,)
+        return slices
+
     def visit_Subscript_Store(self, node, value):
         assert isinstance(node.ctx, ast.Store)
         lhs = self.visit(node.value)
-        slices = self.visit(node.slice)
-        slices = (
-            tuple([slices])
-            if isinstance(slices, (AlloValue, ConstexprValue))
-            else slices
-        )
+        built = self._build_affine_access(lhs, node)
+        if built is not None:
+            affine_map, operands = built
+            val = self.builder.cast(value, lhs.dtype)
+            self.builder.create_affine_store(val, lhs, affine_map, operands)
+            return None
+        slices = self._as_index_tuple(self.visit(node.slice))
         result = self.call_operator(mem_ops.store, [lhs, slices, value])
         # Bit (slice) insertion on an integer scalar produces a new SSA value
         # rather than mutating storage in place, so write it back to the source.
@@ -1398,18 +1589,17 @@ class MLIRCodeGenerator(ast.NodeVisitor):
     def visit_Subscript_Load(self, node):
         assert isinstance(node.ctx, ast.Load)
         lhs = self.visit(node.value)
+        built = self._build_affine_access(lhs, node)
+        if built is not None:
+            affine_map, operands = built
+            return self.builder.create_affine_load(lhs, affine_map, operands)
         slices = self.visit(node.slice)
         if isinstance(lhs, Kernel):
             template_args = slices if isinstance(slices, tuple) else (slices,)
             return lhs[template_args]
         if isinstance(lhs, tuple) and isinstance(slices, ConstexprValue):
             return lhs[slices.value]
-        slices = (
-            tuple([slices])
-            if isinstance(slices, (AlloValue, ConstexprValue))
-            else slices
-        )
-        return self.call_operator(mem_ops.load, [lhs, slices])
+        return self.call_operator(mem_ops.load, [lhs, self._as_index_tuple(slices)])
 
     def visit_ListComp(self, node):
         if len(node.generators) != 1:
@@ -1433,15 +1623,8 @@ class MLIRCodeGenerator(ast.NodeVisitor):
             results.append(self.visit(node.elt))
         return tuple(results)
 
-    def visit_Store(self, node):
-        ast.NodeVisitor.generic_visit(self, node)
-
-    def visit_Load(self, node):
-        ast.NodeVisitor.generic_visit(self, node)
-
     def visit_Tuple(self, node):
-        elts = [self.visit(e) for e in node.elts]
-        return tuple(elts)
+        return tuple(self.visit(e) for e in node.elts)
 
     def visit_Name(self, node):
         if type(node.ctx) is ast.Store:
@@ -1449,9 +1632,7 @@ class MLIRCodeGenerator(ast.NodeVisitor):
         return self.lookup(node.id)
 
     def visit_List(self, node):
-        ctx = self.visit(node.ctx)
-        assert ctx is None
-        return tuple([self.visit(e) for e in node.elts])
+        return tuple(self.visit(e) for e in node.elts)
 
     def _flatten_list_initializer(
         self, node: ast.AST
@@ -1492,13 +1673,8 @@ class MLIRCodeGenerator(ast.NodeVisitor):
     def visit_AugAssign(self, node: ast.AugAssign):
         lhs = copy.deepcopy(node.target)
         lhs.ctx = ast.Load()
-        rhs = ast.BinOp(left=lhs, op=node.op, right=node.value)
-        assign = ast.Assign(targets=[node.target], value=rhs)
-        for x in ["lineno", "col_offset", "end_lineno", "end_col_offset"]:
-            if hasattr(node, x):
-                y = getattr(node, x)
-                setattr(rhs, x, y)
-                setattr(assign, x, y)
+        rhs = ast.copy_location(ast.BinOp(left=lhs, op=node.op, right=node.value), node)
+        assign = ast.copy_location(ast.Assign(targets=[node.target], value=rhs), node)
         self.visit(assign)
 
     def _type_annotation_scope(self):
@@ -1790,28 +1966,58 @@ class MLIRCodeGenerator(ast.NodeVisitor):
                 "loop step must be a positive integer in 'for' loops"
             )
 
-        lb, ub, step = self.builder.normalize_indices((lb, ub, step), expected_len=3)
+        # A loop lowers to affine.for (so its body can use affine.load/store) when
+        # the step is a positive constant and both bounds are affine expressions
+        # over enclosing affine IVs / top-level symbols / constants; else scf.for.
+        affine_bounds = None
+        if isinstance(step, ConstexprValue) and type(step.value) is builtins.int:
+            lb_node, ub_node = self._range_bound_nodes(node.iter)
+            lb_built = self._build_single_bound(lb_node)
+            ub_built = self._build_single_bound(ub_node)
+            if lb_built is not None and ub_built is not None:
+                affine_bounds = (lb_built, ub_built)
+        is_affine = affine_bounds is not None
+        if not is_affine:
+            lb, ub, step = self.builder.normalize_indices(
+                (lb, ub, step), expected_len=3
+            )
 
         with EnterSubRegion(self):
             index_ty = index.materialize(self.context)
             iv_placeholder = PoisonOp(
                 index_ty, ip=self.builder._ip, loc=self.builder._loc
             )
-            self._set_value(node.target.id, AlloValue(iv_placeholder.result, index))
+            iv_proxy = AlloValue(iv_placeholder.result, index)
+            self._set_value(node.target.id, iv_proxy)
+            if is_affine:
+                self._affine_ivs.append(iv_proxy)
 
             liveins = self.lscope.copy()  # capture live-ins before visiting loop body
             names, init_handles, init_types = self._test_loop_iter_args(
                 node, liveins, ignore={node.target.id}
             )
             # create for op
-            for_op = ForOp(
-                lb.handle,
-                ub.handle,
-                step.handle,
-                init_handles,
-                ip=self.builder._ip,
-                loc=self.builder._loc,
-            )
+            if is_affine:
+                (lb_map, lb_operands), (ub_map, ub_operands) = affine_bounds
+                for_op = AffineForOp(
+                    lb_map,
+                    ub_map,
+                    step.value,
+                    iter_args=init_handles,
+                    lower_bound_operands=[v.handle for v in lb_operands],
+                    upper_bound_operands=[v.handle for v in ub_operands],
+                    ip=self.builder._ip,
+                    loc=self.builder._loc,
+                )
+            else:
+                for_op = ForOp(
+                    lb.handle,
+                    ub.handle,
+                    step.handle,
+                    init_handles,
+                    ip=self.builder._ip,
+                    loc=self.builder._loc,
+                )
             if iterator.name:
                 assert isinstance(iterator.name, str)
                 for_op.operation.attributes[schedule_d.SCHEDULE_NAME_ATTR_NAME] = (
@@ -1836,7 +2042,8 @@ class MLIRCodeGenerator(ast.NodeVisitor):
                 cast(AlloValue, self.lscope[iter_name]).handle for iter_name in names
             ]
             self.builder.set_insertion_point_to_end(for_op_body)
-            SCFYieldOp(yield_handles, ip=self.builder._ip, loc=self.builder._loc)
+            yield_cls = AffineYieldOp if is_affine else SCFYieldOp
+            yield_cls(yield_handles, ip=self.builder._ip, loc=self.builder._loc)
             assert len(for_op.regions) == 1
 
             # update induction variable with the actual one
@@ -1874,9 +2081,26 @@ class MLIRCodeGenerator(ast.NodeVisitor):
                 "loop step must be a positive integer in 'for' loops"
             )
 
-        lb_proxies = self.builder.normalize_indices(lbs)
-        ub_proxies = self.builder.normalize_indices(ubs)
-        step_proxies = self.builder.normalize_indices(steps)
+        # A grid lowers to affine.parallel when every step is a positive constant
+        # and all bounds are affine (over enclosing IVs / symbols / constants);
+        # otherwise scf.parallel. Lower/upper maps share operands concatenated as
+        # lower-then-upper, as affine.parallel requires.
+        affine_bounds = None
+        if all(
+            isinstance(s, ConstexprValue) and type(s.value) is builtins.int
+            for s in steps
+        ):
+            specs = self._grid_bound_nodes(node.iter)
+            if specs is not None:
+                lb_nodes = [
+                    lb if lb is not None else ast.Constant(0) for lb, _ in specs
+                ]
+                ub_nodes = [ub for _, ub in specs]
+                lower = self._build_affine_value_map(lb_nodes)
+                upper = self._build_affine_value_map(ub_nodes)
+                if lower is not None and upper is not None:
+                    affine_bounds = (lower, upper)
+        is_affine = affine_bounds is not None
 
         with EnterSubRegion(self):
             index_ty = index.materialize(self.context)
@@ -1890,7 +2114,10 @@ class MLIRCodeGenerator(ast.NodeVisitor):
                     return self.compile_error(
                         "loop target must be a single variable in 'for' loops over 'grid()'"
                     )
-                self._set_value(target.id, AlloValue(iv_placeholders[i].result, index))
+                iv_proxy = AlloValue(iv_placeholders[i].result, index)
+                self._set_value(target.id, iv_proxy)
+                if is_affine:
+                    self._affine_ivs.append(iv_proxy)
                 targets.add(target.id)
 
             liveins = self.lscope.copy()  # capture live-ins before visiting loop body
@@ -1903,26 +2130,36 @@ class MLIRCodeGenerator(ast.NodeVisitor):
                     "'for' loops over 'grid()' at this moment."
                 )
             # create parallel op
-            par_op = ParallelOp(
-                [],
-                [lb.handle for lb in lb_proxies],
-                [ub.handle for ub in ub_proxies],
-                [step.handle for step in step_proxies],
-                init_handles,
-                ip=self.builder._ip,
-                loc=self.builder._loc,
-            )
+            if is_affine:
+                (lb_map, lb_operands), (ub_map, ub_operands) = affine_bounds
+                par_op, par_op_body = self.builder.create_affine_parallel(
+                    lb_map,
+                    [v.handle for v in lb_operands],
+                    ub_map,
+                    [v.handle for v in ub_operands],
+                    [step.value for step in steps],
+                )
+            else:
+                par_op = ParallelOp(
+                    [],
+                    [lb.handle for lb in self.builder.normalize_indices(lbs)],
+                    [ub.handle for ub in self.builder.normalize_indices(ubs)],
+                    [step.handle for step in self.builder.normalize_indices(steps)],
+                    init_handles,
+                    ip=self.builder._ip,
+                    loc=self.builder._loc,
+                )
+                # scf.parallel has no auto-created body: build a block with one
+                # index induction variable per dimension and the scf.reduce
+                # terminator. see: https://mlir.llvm.org/docs/Dialects/SCFDialect/#scfparallel-scfparallelop
+                par_op_body = par_op.region.blocks.append(*([index_ty] * len(lbs)))
+                with InsertionPoint(par_op_body):
+                    ReduceOp([], 0)
             if iterator.name:
                 assert isinstance(iterator.name, str)
                 par_op.operation.attributes[schedule_d.SCHEDULE_NAME_ATTR_NAME] = (
                     self.builder.get_string_attr(iterator.name)
                 )
-            # scf.parallel has no auto-created body: build a block with one index
-            # induction variable per dimension and the scf.reduce terminator.
-            # see: https://mlir.llvm.org/docs/Dialects/SCFDialect/#scfparallel-scfparallelop
-            par_op_body = par_op.region.blocks.append(*([index_ty] * len(lbs)))
-            with InsertionPoint(par_op_body):
-                ReduceOp([], 0)
             self.builder.set_insertion_point_to_start(par_op_body)
             # no iter args now, so no block arguments other than induction variables
             # visit loop body
@@ -2462,10 +2699,12 @@ class EnterSubRegion:
 
     def __enter__(self):
         self.lscope = self.generator.lscope.copy()
+        self.affine_ivs = self.generator._affine_ivs.copy()
         self.ip = self.generator.builder.save_insertion_point()
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         self.generator.lscope = self.lscope
+        self.generator._affine_ivs = self.affine_ivs
         self.generator.builder.restore_insertion_point(self.ip)
 
 
@@ -2558,7 +2797,7 @@ def compile(
         fn.module = module
         # transfer the ownership of context to kernel
         fn.context = context
-        return _NamedModule(module)
+        return module
     except (StaticAssertionError, CompilationError, InternalCompilerError) as exc:
         if show_traceback:
             raise

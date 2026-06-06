@@ -5,6 +5,7 @@ import ast
 
 import pytest
 
+import allo.exp as allo
 import allo.exp.lang.core as allo_core
 from allo.exp.compiler.errors import CompilationError
 from allo.exp.compiler.mlir_codegen import compile as compile_kernel
@@ -13,9 +14,8 @@ from allo.exp.lang.core import (
     bool as allo_bool,
     constexpr,
     f32,
-    grid as allo_grid,
     i32,
-    range as allo_range,
+    index,
     u1,
     u8,
     u32,
@@ -30,7 +30,11 @@ _GLOBAL_FLOAT_CONST = 1.5
 
 
 def _compile_ir(fn, *, options=None) -> str:
-    return str(compile_kernel(fn, options=options))
+    return str(
+        compile_kernel(fn, options=options).operation.get_asm(
+            use_name_loc_as_prefix=True
+        )
+    )
 
 
 def _assert_contains(ir: str, *patterns: str):
@@ -282,10 +286,10 @@ def test_bit_set_slice_memref_writeback():
     ir = _compile_ir(top)
     _assert_contains(
         ir,
-        "memref.load",
+        "affine.load",
         "allo.bit.set_slice",
         "i2 into i32",
-        "memref.store",
+        "affine.store",
     )
 
 
@@ -367,7 +371,7 @@ def test_if_branch_local_buffers():
     _assert_contains(
         ir,
         "scf.if",
-        "scf.for",
+        "affine.for",
         "memref.alloc",
     )
 
@@ -384,7 +388,7 @@ def test_if_branch_local_loop_carried_value():
             out[0] = c
 
     ir = _compile_ir(top)
-    _assert_contains(ir, "scf.if", "scf.for")
+    _assert_contains(ir, "scf.if", "affine.for")
 
 
 def test_ternary_expression():
@@ -404,9 +408,9 @@ def test_memref_load_store():
     ir = _compile_ir(top)
     _assert_contains(
         ir,
-        "memref.load",
+        "affine.load",
         "memref<4xi32>",
-        "memref.store",
+        "affine.store",
         "memref<1xi32>",
     )
 
@@ -414,14 +418,14 @@ def test_memref_load_store():
 def test_range_loop_store():
     @kernel
     def top(out: i32[4]):
-        for i in allo_range(4):
+        for i in allo.range(4):
             out[i] = i
 
     ir = _compile_ir(top)
     _assert_contains(
         ir,
-        "scf.for",
-        "to %c4 step %c1",
+        "affine.for",
+        "= 0 to 4",
         "arith.index_cast",
         "index to i32",
     )
@@ -452,26 +456,121 @@ def test_builtin_range_loop_store():
     ir = _compile_ir(top)
     _assert_contains(
         ir,
-        "scf.for",
-        "to %c4 step %c1",
+        "affine.for",
+        "= 0 to 4",
     )
 
 
 def test_grid_loop_store():
     @kernel
     def top(out: i32[2, 2]):
-        for i, j in allo_grid(2, 2):
+        for i, j in allo.grid(2, 2):
             out[i, j] = i + j
 
     ir = _compile_ir(top)
     _assert_contains(
         ir,
-        "scf.parallel",
-        "step (%c1, %c1)",
+        "affine.parallel",
+        "= (0, 0) to (2, 2)",
         "arith.addi",
         "arith.index_cast",
         "memref<2x2xi32>",
     )
+
+
+def test_affine_index_floordiv_mod_mul():
+    @kernel
+    def top(a: f32[16], b: f32[8]):
+        for i in range(8):
+            b[i] = a[i * 2] + a[i // 2] + a[i % 4]
+
+    ir = _compile_ir(top)
+    _assert_contains(
+        ir,
+        "affine.load %a[%arg2 * 2]",
+        "affine.load %a[%arg2 floordiv 2]",
+        "affine.load %a[%arg2 mod 4]",
+        "affine.store",
+    )
+
+
+def test_affine_per_access_fallback():
+    # Decoupled per-access affine: b[i] is affine, but the indirect a[k] access
+    # (k is not an affine induction variable) falls back to memref.load.
+    @kernel
+    def top(a: f32[16], idx: i32[16], b: f32[16]):
+        for i in range(16):
+            k: i32 = idx[i]
+            b[i] = a[k]
+
+    ir = _compile_ir(top)
+    _assert_contains(ir, "affine.for", "memref.load %a", "affine.store %1, %b")
+
+
+def test_affine_symbol_bound():
+    # A runtime upper bound that is a kernel parameter is a valid affine symbol:
+    # the loop stays affine.for, with an index_cast hoisted to the entry block.
+    @kernel
+    def top(n: i32, a: f32[64], b: f32[64]):
+        for i in range(n):
+            b[i] = a[i] + 1.0
+
+    ir = _compile_ir(top)
+    _assert_contains(
+        ir, "arith.index_cast %n", "affine.for %arg3 = 0 to %0", "affine.load"
+    )
+
+
+def test_affine_symbol_in_index():
+    # An index-typed parameter used inside an index expression becomes a symbol.
+    @kernel
+    def top(n: index, a: f32[64], b: f32[64]):
+        for i in range(n):
+            b[i] = a[i + n]
+
+    ir = _compile_ir(top)
+    _assert_contains(ir, "affine.load %a[%arg3 + symbol(%n)]")
+
+
+def test_affine_tiled_dim_bound():
+    # Bounds that are affine over an enclosing affine IV stay affine (no symbol,
+    # no scf): the inner loop ranges over `i` .. `i + 8`.
+    @kernel
+    def top(a: f32[64], b: f32[64]):
+        for i in range(0, 64, 8):
+            for j in range(i, i + 8):
+                b[j] = a[j] * 2.0
+
+    ir = _compile_ir(top)
+    assert ir.count("affine.for") == 2
+    _assert_contains(ir, "affine.for", "step 8")
+    assert "scf.for" not in ir
+
+
+def test_affine_dynamic_grid():
+    # grid() with runtime (symbol) bounds lowers to affine.parallel.
+    @kernel
+    def top(n: index, m: index, a: f32[16, 16], b: f32[16, 16]):
+        for i, j in allo.grid(n, m):
+            b[i, j] = a[i, j]
+
+    ir = _compile_ir(top)
+    _assert_contains(
+        ir, "affine.parallel", "to (symbol(%n), symbol(%m))", "affine.load"
+    )
+
+
+def test_non_affine_bound_falls_back_to_scf():
+    # A runtime bound that is a loaded value (not a top-level symbol) is not
+    # affine, so the loop stays scf.for and its accesses use memref.
+    @kernel
+    def top(bounds: i32[4], a: f32[64]):
+        k: i32 = bounds[0]
+        for i in range(k):
+            a[i] = 0.0
+
+    ir = _compile_ir(top)
+    _assert_contains(ir, "scf.for", "memref.store")
 
 
 def test_direct_operator_invoke():
@@ -528,7 +627,7 @@ def test_global_shape_annotation():
         ir,
         "memref<6xi32>",
         "memref<2x3xi32>",
-        "scf.for",
+        "affine.for",
     )
 
 
@@ -538,14 +637,14 @@ def test_scope_shape_annotation():
 
     @kernel
     def top(out: i32[rows, cols]):
-        for i, j in allo_grid(2, 2):
+        for i, j in allo.grid(2, 2):
             out[i, j] = i + j
 
     ir = _compile_ir(top)
     _assert_contains(
         ir,
         "memref<2x2xi32>",
-        "scf.parallel",
+        "affine.parallel",
     )
 
 
@@ -564,7 +663,7 @@ def test_template_signature_shape():
         ir,
         "f32",
         "memref<2xf32>",
-        "scf.for",
+        "affine.for",
     )
 
 
@@ -614,7 +713,7 @@ def test_local_memref_declaration():
         ir,
         "memref.alloc",
         "memref<4xi32>",
-        "memref.load",
+        "affine.load",
     )
 
 
@@ -634,7 +733,7 @@ def test_memref_list_initializer():
     def top(out: i32[2, 2]):
         scale: constexpr = _GLOBAL_INT_CONST
         buf: i32[2, 2] = [[1, scale], [scale + 1, scale + 2]]
-        for i, j in allo_grid(2, 2):
+        for i, j in allo.grid(2, 2):
             out[i, j] = buf[i, j]
 
     ir = _compile_ir(top)
@@ -643,7 +742,7 @@ def test_memref_list_initializer():
         'memref.global "private" @buf_initializer_0',
         "memref.get_global @buf_initializer_0",
         "dense<[[1, 3], [4, 5]]>",
-        "memref.load",
+        "affine.load",
     )
 
 
@@ -746,7 +845,7 @@ def test_for_loop_carried_values():
         out[0] = acc
 
     ir = _compile_ir(top)
-    _assert_contains(ir, "scf.for", "iter_args", "scf.yield")
+    _assert_contains(ir, "affine.for", "iter_args", "affine.yield")
 
 
 def test_while_loop_carried_values():
@@ -904,7 +1003,7 @@ def test_nested_capture_module_alias():
         worker(out)
 
     ir = _compile_ir(top)
-    _assert_contains(ir, "allo.kernel private @top.worker", "scf.for")
+    _assert_contains(ir, "allo.kernel private @top.worker", "affine.for")
 
 
 def test_cpp_typing_compile():
@@ -1023,7 +1122,7 @@ def test_return_type_mismatch():
 def test_return_inside_loop_error():
     @kernel
     def top(x: i32) -> i32:
-        for i in allo_range(4):
+        for i in allo.range(4):
             return x
         return x
 
