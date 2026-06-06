@@ -18,9 +18,6 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 add_compile_options("-w")
 
 find_package(MLIR CONFIG REQUIRED)
-find_package(Python COMPONENTS Interpreter Development REQUIRED)
-find_package(Python3 COMPONENTS Interpreter Development.Module REQUIRED)
-find_package(nanobind CONFIG REQUIRED)
 message(STATUS "Using MLIRConfig.cmake in: ${MLIR_DIR}")
 message(STATUS "Using LLVMConfig.cmake in: ${LLVM_DIR}")
 
@@ -39,6 +36,10 @@ include_directories(${MLIR_INCLUDE_DIRS})
 include_directories(${PROJECT_SOURCE_DIR}/include)
 include_directories(${PROJECT_BINARY_DIR}/include)
 add_definitions(${LLVM_DEFINITIONS})
+
+message(STATUS "Using Python binding")
+include(MLIRDetectPythonEnv)
+mlir_configure_python_dev_packages()
 
 add_subdirectory(include)
 add_subdirectory(lib)
