@@ -41,10 +41,6 @@ namespace {
 void appendToString(MlirStringRef chunk, void *userData) {
   static_cast<std::string *>(userData)->append(chunk.data, chunk.length);
 }
-
-MlirStringRef toStringRef(const std::string &s) {
-  return mlirStringRefCreate(s.data(), s.size());
-}
 } // namespace
 
 NB_MODULE(_allo, m) {

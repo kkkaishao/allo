@@ -407,7 +407,6 @@ public:
 } // namespace
 
 static void insertStreamDestroys(ModuleOp module) {
-  MLIRContext *ctx = module.getContext();
   module.walk([&](KernelOp kernel) {
     SmallVector<Value> handles;
     kernel.walk([&](func::CallOp call) {

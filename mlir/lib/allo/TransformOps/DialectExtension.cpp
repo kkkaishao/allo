@@ -123,10 +123,6 @@ transform::MatchValueOp::applyToOne(transform::TransformRewriter &rewriter,
     return tryPushBlockArg();
   case MatchValueSourceKind::Result:
     return tryPushResult();
-  default:
-    return emitSilenceableError()
-           << "invalid source_kind " << sourceKindValue
-           << " (expected 0:auto, 1:block_arg, 2:result)";
   }
 }
 

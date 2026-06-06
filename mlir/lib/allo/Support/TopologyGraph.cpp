@@ -117,7 +117,6 @@ LogicalResult TopologyGraph::addEndpoint(unsigned nodeId, InvokeOp invoke,
          "stream argument must be a valid argument of the callee");
 
   Value callerStream = invoke->getOperand(argNo);
-  auto streamType = cast<StreamType>(callerStream.getType());
 
   ValueRange indices;
   if (auto get = dyn_cast<StreamGetOp>(streamOp))

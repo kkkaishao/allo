@@ -1144,8 +1144,6 @@ static std::string getCmpIPredString(arith::CmpIPredicate pred) {
     return "<=";
   case arith::CmpIPredicate::uge:
     return ">=";
-  default:
-    llvm_unreachable("unsupported integer comparison predicate");
   }
 }
 

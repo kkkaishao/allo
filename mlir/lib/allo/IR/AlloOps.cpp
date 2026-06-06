@@ -136,7 +136,6 @@ ParseResult KernelOp::parse(OpAsmParser &p, OperationState &result) {
     return failure();
 
   // Parse the function signature
-  SMLoc signatureLocation = p.getCurrentLocation();
   bool isVariadic = false;
   if (function_interface_impl::parseFunctionSignatureWithArguments(
           p, false, entryArgs, isVariadic, resTypes, resAttrs))
@@ -158,7 +157,6 @@ ParseResult KernelOp::parse(OpAsmParser &p, OperationState &result) {
 
   // If function attributes are present, parse them.
   NamedAttrList parsedAttributes;
-  SMLoc attributeDictLocation = p.getCurrentLocation();
   if (p.parseOptionalAttrDictWithKeyword(parsedAttributes))
     return failure();
 

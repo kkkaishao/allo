@@ -12,8 +12,6 @@ add_compile_definitions("MLIR_PYTHON_PACKAGE_PREFIX=allo._mlir.")
 
 set(ALLO_MLIR_PYTHON_ROOT_DIR "${CMAKE_CURRENT_SOURCE_DIR}/allo")
 set(ALLO_MLIR_PYTHON_SOURCE_DIR "${PROJECT_SOURCE_DIR}/lib/allo/Bindings")
-# Assembled (symlinked in dev) into the source tree so `import allo._mlir` works
-# from an editable install, mirroring how ../python emits into allo/exp/_C.
 set(ALLO_MLIR_PYTHON_PACKAGE_DIR "${PROJECT_SOURCE_DIR}/../allo/_mlir")
 
 ################################################################################
@@ -96,7 +94,6 @@ add_mlir_python_common_capi_library(AlloMLIRAggregateCAPI
 add_mlir_python_modules(AlloMLIRPythonModules
   ROOT_PREFIX "${ALLO_MLIR_PYTHON_PACKAGE_DIR}"
   INSTALL_PREFIX "allo/_mlir"
-  MLIR_BINDINGS_PYTHON_NB_DOMAIN "allo"
   DECLARED_SOURCES ${_allo_declared_sources}
   COMMON_CAPI_LINK_LIBS
     AlloMLIRAggregateCAPI

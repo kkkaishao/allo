@@ -535,7 +535,7 @@ static LogicalResult finalizeKernelSignature(IRRewriter &rewriter,
   SmallVector<Type, 8> newInputs;
   SmallVector<Attribute> newArgAttrs;
   for (BlockArgument arg : entry.getArguments()) {
-    if (PortInfo *port = findNewPort(state.ports, arg)) {
+    if (findNewPort(state.ports, arg)) {
       newInputs.push_back(arg.getType());
       if (oldArgAttrs)
         newArgAttrs.push_back(rewriter.getDictionaryAttr({}));
