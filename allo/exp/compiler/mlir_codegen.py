@@ -53,6 +53,8 @@ from ..lang.core import (
     ShapedType,
     BufferType,
     StreamType,
+    StatefulType,
+    StatefulValue,
     Range,
     Grid,
     ConstexprType,
@@ -1629,7 +1631,10 @@ class MLIRCodeGenerator(ast.NodeVisitor):
     def visit_Name(self, node):
         if type(node.ctx) is ast.Store:
             return node.id
-        return self.lookup(node.id)
+        val = self.lookup(node.id)
+        if isinstance(val, StatefulValue):
+            return self._read_stateful(val)
+        return val
 
     def visit_List(self, node):
         return tuple(self.visit(e) for e in node.elts)
@@ -1660,15 +1665,15 @@ class MLIRCodeGenerator(ast.NodeVisitor):
             )
         return (), [value]  # type: ignore
 
-    def _visit_shaped_list_initializer(
-        self, node: ast.List, dst_type: ShapedType, name: str
-    ):
-        shape, values = self._flatten_list_initializer(node)
+    def _visit_shaped_list_initializer(self, node: ast.AnnAssign, dst_type: ShapedType):
+        name = node.target.id
+        shape, values = self._flatten_list_initializer(node.value)
         if tuple(shape) != tuple(dst_type.shape):
             return self.compile_error(
                 f"List initializer shape mismatch for '{name}': expected {tuple(dst_type.shape)}, got {shape}."
             )
-        return self.builder.make_shaped_constant(values, dst_type, name)
+        global_name = self._global_symbol(node, name, "const")
+        return self.builder.make_shaped_constant(values, dst_type, global_name)
 
     def visit_AugAssign(self, node: ast.AugAssign):
         lhs = copy.deepcopy(node.target)
@@ -1707,6 +1712,70 @@ class MLIRCodeGenerator(ast.NodeVisitor):
                 f"Unsupported type annotation '{text}' for '{name}': {e}"
             )
 
+    def _stateful_init_values(
+        self, node: ast.AnnAssign, inner: TypeBase
+    ) -> list[int | float]:
+        if node.value is None:
+            return self.compile_error(
+                f"Stateful variable '{node.target.id}' must be initialized with a "
+                "compile-time constant."
+            )
+        if isinstance(inner, BufferType):
+            if isinstance(node.value, ast.List):
+                shape, values = self._flatten_list_initializer(node.value)
+                if tuple(shape) != tuple(inner.shape):
+                    return self.compile_error(
+                        f"Stateful array '{node.target.id}' initializer shape "
+                        f"mismatch: expected {tuple(inner.shape)}, got {shape}."
+                    )
+                return values
+            num = 1
+            for dim in inner.shape:
+                num *= dim
+            return [self._const_init_scalar(node.value)] * num
+        return [self._const_init_scalar(node.value)]
+
+    def _const_init_scalar(self, node: ast.AST) -> int | float:
+        value = unwrap_if_constexpr(self.visit(node))
+        if type(value) not in (builtins.int, builtins.float):
+            return self.compile_error(
+                "Stateful variable initializer must be a compile-time int or float "
+                f"constant, got '{ast.unparse(node)}'."
+            )
+        return value
+
+    def _global_symbol(self, node: ast.AST, var_id: str, kind: str) -> str:
+        """Canonical name for a compiler-emitted module global, shared by stateful
+        variables (``kind="stateful"``) and list-initialized constants
+        (``kind="const"``). Keyed on the source declaration -- entry kernel,
+        variable, line and column -- so the name is stable and unique: repeated
+        kernel instantiations resolve to one global, while distinct declarations
+        never collide. The C++ emitter sanitizes it into a valid identifier."""
+        return (
+            f"_allo_{kind}_{self.kernel.func_name}_{var_id}"
+            f"_l{node.lineno}c{node.col_offset}"
+        )
+
+    def _visit_stateful_decl(self, node: ast.AnnAssign, parsed_type: StatefulType):
+        inner = parsed_type.inner
+        values = self._stateful_init_values(node, inner)
+        global_name = self._global_symbol(node, node.target.id, "stateful")
+        stateful = self.builder.make_stateful(global_name, inner, values)
+        self._set_value(node.target.id, stateful)
+
+    def _read_stateful(self, sv: StatefulValue):
+        # Scalars load their current value; arrays expose the backing buffer so
+        # subscripting and whole-array use go straight to persistent storage.
+        if sv.is_scalar:
+            return self.builder.create_load(sv.storage, [])
+        return sv.storage
+
+    def _write_stateful(self, sv: StatefulValue, value):
+        if sv.is_scalar:
+            self.builder.create_store(self.builder.cast(value, sv.type), sv.storage, [])
+        else:
+            self.builder.store_into_buffer(sv.storage, value)
+
     def visit_AnnAssign(self, node: ast.AnnAssign):
         if isinstance(node.target, ast.Attribute):
             return self.compile_error(
@@ -1722,6 +1791,8 @@ class MLIRCodeGenerator(ast.NodeVisitor):
             )
 
         parsed_type = self._parse_annotation(node.annotation, node.target.id)
+        if isinstance(parsed_type, StatefulType):
+            return self._visit_stateful_decl(node, parsed_type)
         if isinstance(parsed_type, StreamType):
             if node.value is not None:
                 return self.compile_error(
@@ -1744,9 +1815,7 @@ class MLIRCodeGenerator(ast.NodeVisitor):
 
         if isinstance(parsed_type, ShapedType) and isinstance(node.value, ast.List):
             with self._name_loc_prefix(node.target.id):
-                value = self._visit_shaped_list_initializer(
-                    node.value, parsed_type, node.target.id
-                )
+                value = self._visit_shaped_list_initializer(node, parsed_type)
             self._set_value_with_loc(node.target.id, value)
             return
 
@@ -1803,6 +1872,9 @@ class MLIRCodeGenerator(ast.NodeVisitor):
                 self._set_value_with_loc(target, value)
                 return
             proxy = self.lscope[target]
+            if isinstance(proxy, StatefulValue):
+                # Persistent storage: store into the global, keep the binding.
+                return self._write_stateful(proxy, value)
             if isinstance(proxy, ConstexprValue):
                 return self.compile_error(
                     f"Cannot reassign to variable '{target}' defined as a constexpr"
@@ -1849,6 +1921,9 @@ class MLIRCodeGenerator(ast.NodeVisitor):
             if name in ignore:
                 continue
             if isinstance(livein, ConstexprValue):
+                continue
+            if isinstance(livein, StatefulValue):
+                # Stateful vars live in memory; they carry no SSA loop value.
                 continue
             assert isinstance(livein, AlloValue)
             loop_val = dry_run_scope[name]
@@ -2380,6 +2455,10 @@ class MLIRCodeGenerator(ast.NodeVisitor):
             res_types = [self._parse_annotation(node.returns, "return")]
         if any(isinstance(ty, StreamType) for ty in res_types):
             return self.compile_error("Stream is not allowed as a kernel return type.")
+        if any(isinstance(ty, StatefulType) for ty in res_types):
+            return self.compile_error(
+                "Stateful is not allowed as a kernel return type."
+            )
         return res_types
 
     def _bind_nested_arguments(self, nested: NestedKernelSymbol, args, kws):
@@ -2446,7 +2525,13 @@ class MLIRCodeGenerator(ast.NodeVisitor):
             if param.annotation is None:
                 arg_types.append(self._infer_nested_arg_type(param.arg, value))
             else:
-                arg_types.append(self._parse_annotation(param.annotation, param.arg))
+                ty = self._parse_annotation(param.annotation, param.arg)
+                if isinstance(ty, StatefulType):
+                    return self.compile_error(
+                        f"Parameter '{param.arg}' of nested kernel '{nested.name}' "
+                        "cannot be Stateful; declare stateful variables locally."
+                    )
+                arg_types.append(ty)
         return arg_types, self._parse_return_types(nested.node)
 
     def _build_nested_capture_scopes(self):

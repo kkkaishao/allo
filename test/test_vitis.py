@@ -20,7 +20,15 @@ import tempfile
 import numpy as np
 import pytest
 
-from allo.exp.lang.core import range as arange, i32, f32, APInt, Stream, Template
+from allo.exp.lang.core import (
+    range as arange,
+    i32,
+    f32,
+    APInt,
+    Stream,
+    Stateful,
+    Template,
+)
 from allo.exp.lang.kernel import kernel
 from allo.exp.backend.vitis.core import is_vitis_available
 from allo.exp.backend.vitis.csim import discover_csim
@@ -363,3 +371,84 @@ def test_csim_legacy_apint():
         backend(a, b, c)
     expected = ((a.astype(np.int16) + b + 16) % 32 - 16).astype(np.int8)
     np.testing.assert_array_equal(c, expected)
+
+
+# ===========================================================================
+# Module-level globals: stateful variables + list-initialized constants
+#
+# Both lower to a mutable `memref.global` and must be emitted as a file-scope
+# *definition* (with initializer), not an `extern` declaration -- otherwise the
+# csim .so has an undefined symbol. The symbol name follows the unified
+# `_allo_<kind>_<func>_<var>_l<line>c<col>` convention.
+# ===========================================================================
+
+
+def test_codegen_stateful_global_definition():
+    @kernel
+    def counter() -> i32:
+        c: Stateful[i32] = 0
+        c = c + 1
+        return c
+
+    code = _hls(counter.schedule())
+    # A defined (not extern) file-scope global, carrying its initializer.
+    _regex(code, r"static \w+ _allo_stateful_counter_c_l\d+c\d+ = 0u?;")
+    assert "extern uint32_t _allo_stateful" not in code
+
+
+def test_codegen_list_initialized_buffer_definition():
+    @kernel
+    def lut(idx: i32) -> i32:
+        table: i32[4] = [10, 20, 30, 40]
+        return table[idx]
+
+    code = _hls(lut.schedule())
+    _regex(
+        code,
+        r"static \w+ _allo_const_lut_table_l\d+c\d+\[4\] = \{10u?, 20u?, 30u?, 40u?\};",
+    )
+
+
+@requires_vitis
+def test_csim_stateful_accumulator():
+    """A stateful scalar must persist across csim calls on the same backend (the
+    .so stays loaded), so the global accumulates rather than re-initializing."""
+
+    @kernel
+    def acc(x: i32) -> i32:
+        s: Stateful[i32] = 0
+        s = s + x
+        return s
+
+    with tempfile.TemporaryDirectory() as project:
+        backend = acc.schedule().export("vitis", project_path=project)
+        assert int(backend(5)) == 5
+        assert int(backend(10)) == 15
+        assert int(backend(3)) == 18
+
+
+@requires_vitis
+def test_csim_list_initialized_buffer():
+    @kernel
+    def lut(idx: i32) -> i32:
+        table: i32[4] = [10, 20, 30, 40]
+        return table[idx]
+
+    with tempfile.TemporaryDirectory() as project:
+        backend = lut.schedule().export("vitis", project_path=project)
+        assert [int(backend(i)) for i in range(4)] == [10, 20, 30, 40]
+
+
+@requires_vitis
+def test_synth_stateful_counter():
+    @kernel
+    def counter() -> i32:
+        c: Stateful[i32] = 0
+        c = c + 1
+        return c
+
+    with tempfile.TemporaryDirectory() as project:
+        report = (
+            counter.schedule().export("vitis", part=PART, project_path=project).synth()
+        )
+        assert report.xml_path.exists()

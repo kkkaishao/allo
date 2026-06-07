@@ -739,8 +739,8 @@ def test_memref_list_initializer():
     ir = _compile_ir(top)
     _assert_contains(
         ir,
-        'memref.global "private" @buf_initializer_0',
-        "memref.get_global @buf_initializer_0",
+        'memref.global "private" @_allo_const_top_buf_l3c4',
+        "memref.get_global @_allo_const_top_buf_l3c4",
         "dense<[[1, 3], [4, 5]]>",
         "affine.load",
     )

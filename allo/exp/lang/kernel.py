@@ -19,6 +19,9 @@ from ..lang.core import (
     Stream,
     ShapeExpr,
     StreamExpr,
+    Stateful,
+    StatefulExpr,
+    StatefulType,
     DEFAULT_STREAM_DEPTH,
     unwrap_if_constexpr,
 )
@@ -209,6 +212,8 @@ class Kernel(Generic[P, R]):
             return self._resolve_shape_expr(annotation, scope)
         if isinstance(annotation, StreamExpr):
             return self._resolve_stream_expr(annotation, scope)
+        if isinstance(annotation, StatefulExpr):
+            return self._resolve_stateful_expr(annotation, scope)
         if isinstance(annotation, TypeBase):
             return annotation
         raise TypeError(f"Unsupported type annotation: {annotation!r}")
@@ -218,7 +223,7 @@ class Kernel(Generic[P, R]):
         text = re.sub(r"\[\s*\]", "[()]", text.strip())
         # `Stream` and `constexpr` are annotation builtins available without an
         # import; a name in the user's scope shadows them.
-        eval_scope = {"Stream": Stream, "constexpr": constexpr}
+        eval_scope = {"Stream": Stream, "Stateful": Stateful, "constexpr": constexpr}
         eval_scope.update(
             {name: unwrap_if_constexpr(value) for name, value in scope.items()}
         )
@@ -294,6 +299,30 @@ class Kernel(Generic[P, R]):
         shape = self._resolve_shape(expr.shape, scope)
         return StreamType(base_type, DEFAULT_STREAM_DEPTH, shape)
 
+    def _resolve_stateful_expr(
+        self, expr: StatefulExpr, scope: dict[str, object]
+    ) -> StatefulType:
+        # A stateful variable must be backed by mutable storage, so an array
+        # state is always a buffer (never a tensor), regardless of `enable_tensor`.
+        base = unwrap_if_constexpr(expr.base)
+        if isinstance(base, ShapeExpr):
+            inner: DType | BufferType = BufferType(
+                shape=self._resolve_shape(base.shape, scope),
+                dtype=self._resolve_dtype(base.dtype, scope),
+            )
+        else:
+            if isinstance(base, Template):
+                base = self._resolve_template_type(base, scope)
+            if isinstance(base, DType):
+                inner = base
+            elif isinstance(base, ShapedType):
+                inner = BufferType(shape=base.shape, dtype=base.dtype)
+            else:
+                raise TypeError(
+                    f"Stateful base type must be a scalar or buffer type, got {base!r}"
+                )
+        return StatefulType(inner)
+
     @functools.cache
     def parse_argument_annotations(self) -> list[TypeBase]:
         arg_types = []
@@ -305,6 +334,11 @@ class Kernel(Generic[P, R]):
                     f"Parameter '{param.name}' is missing a type annotation. Please provide an explicit type annotation for all parameters."
                 )
             ty = self.parse_type_annotation(annotation, scope=scope)
+            if isinstance(ty, StatefulType):
+                raise TypeError(
+                    f"Parameter '{param.name}' cannot be Stateful; stateful "
+                    "variables can only be declared locally within a kernel."
+                )
             arg_types.append(ty)
         return arg_types
 
@@ -330,6 +364,8 @@ class Kernel(Generic[P, R]):
         for ty in res_types:
             if isinstance(ty, StreamType):
                 raise TypeError("Stream is not allowed as a kernel return type.")
+            if isinstance(ty, StatefulType):
+                raise TypeError("Stateful is not allowed as a kernel return type.")
         return res_types
 
     def compile(self):

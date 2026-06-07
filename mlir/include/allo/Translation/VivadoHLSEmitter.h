@@ -41,6 +41,7 @@ struct VivadoHLSEmitter {
   void emitMemrefStore(memref::StoreOp op);
   void emitMemrefGlobal(memref::GlobalOp op);
   void emitMemrefGetGlobal(memref::GetGlobalOp op);
+  void emitDenseInitializer(DenseElementsAttr dense, MemRefType type);
 
   void emitStreamCreate(allo::StreamCreateOp op);
   void emitStreamGet(allo::StreamGetOp op);

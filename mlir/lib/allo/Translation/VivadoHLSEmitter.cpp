@@ -733,13 +733,70 @@ void VivadoHLSEmitter::emitMemrefStore(memref::StoreOp op) {
 
 void VivadoHLSEmitter::emitMemrefGlobal(memref::GlobalOp op) {
   llvm::raw_ostream &os = state.os;
-  // it has a symbol name, we can use it directly
-  os << "extern ";
   auto type = cast<MemRefType>(op.getType());
-  os << getPrimitiveTypeName(type);
-  os << " " << getSymbolName(op.getSymName());
+  auto initValue = op.getInitialValue();
+  auto dense =
+      initValue ? dyn_cast<DenseElementsAttr>(*initValue) : DenseElementsAttr();
+  // A global with a constant initializer is defined at file scope (internal
+  // linkage) so its initial value -- and any state it accumulates across
+  // top-function calls -- survives into csim and synthesis. A global without an
+  // initializer stays an `extern` declaration defined in another translation
+  // unit. `emitModule` emits all globals before any function, so the definition
+  // is always in scope at the point of use.
+  if (!dense) {
+    os << "extern " << getPrimitiveTypeName(type) << " "
+       << getSymbolName(op.getSymName());
+    emitArraySuffix(type, op.getLoc());
+    os << ";";
+    return;
+  }
+  os << "static " << getPrimitiveTypeName(type) << " "
+     << getSymbolName(op.getSymName());
   emitArraySuffix(type, op.getLoc());
+  os << " = ";
+  emitDenseInitializer(dense, type);
   os << ";";
+}
+
+void VivadoHLSEmitter::emitDenseInitializer(DenseElementsAttr dense,
+                                            MemRefType type) {
+  llvm::raw_ostream &os = state.os;
+  // Rank-0 memrefs are scalars (`T x = v;`); ranked ones are C arrays whose
+  // aggregate initializer is a flat brace list (`T x[..] = {v0, v1, ...};`).
+  bool isArray = type.getRank() > 0;
+  Type elemType = type.getElementType();
+  if (isArray)
+    os << "{";
+  bool first = true;
+  if (isa<IntegerType, IndexType>(elemType)) {
+    unsigned width =
+        isa<IndexType>(elemType) ? 64 : cast<IntegerType>(elemType).getWidth();
+    if (width > 64) {
+      emitError(UnknownLoc::get(elemType.getContext()))
+          << "global initializer wider than 64 bits is not supported";
+      state.failed = true;
+      return;
+    }
+    // Globals print as unsigned C types (getPrimitiveTypeName default), so emit
+    // the zero-extended value with a matching unsigned suffix; signedness is
+    // recovered by the static_cast the emitter already inserts on each load.
+    const char *suffix = width <= 32 ? "u" : "ull";
+    for (const APInt &v : dense.getValues<APInt>()) {
+      os << (first ? "" : ", ") << v.getZExtValue() << suffix;
+      first = false;
+    }
+  } else if (isa<FloatType>(elemType)) {
+    for (const APFloat &v : dense.getValues<APFloat>()) {
+      os << (first ? "" : ", ") << v.convertToDouble();
+      first = false;
+    }
+  } else {
+    emitError(UnknownLoc::get(elemType.getContext()))
+        << "unsupported global initializer element type in Vivado HLS emitter";
+    state.failed = true;
+  }
+  if (isArray)
+    os << "}";
 }
 
 void VivadoHLSEmitter::emitMemrefGetGlobal(memref::GetGlobalOp op) {

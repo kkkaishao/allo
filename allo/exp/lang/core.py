@@ -380,6 +380,21 @@ class StreamType(TypeBase):
         return MlirStreamType.get(base, self.depth, list(self.shape))
 
 
+class StatefulType(TypeBase):
+    """`Stateful[T]`: marks a local declaration as persistent across kernel
+    invocations (C ``static`` semantics). ``inner`` is the concrete scalar
+    (``DType``) or buffer (``BufferType``) type the variable presents; the
+    stateful wrapper itself is a declaration-only marker and is never
+    materialized into MLIR (the backing storage is a module-level global)."""
+
+    def __init__(self, inner: DType | BufferType):
+        super().__init__(f"Stateful[{inner}]")
+        self.inner = inner
+
+    def materialize(self, context: Context, /) -> Type:
+        assert False, "StatefulType is declaration-only and is never materialized"
+
+
 # ==========================================================================#
 # Deferred type annotations
 #
@@ -439,6 +454,30 @@ class _StreamFactory:
 
 
 Stream = _StreamFactory("Stream")
+
+
+class StatefulExpr:
+    """A `Stateful[T]` annotation, unresolved (mirrors `StreamExpr`). `base` may
+    be a `DType`, `ShapedType`, `ShapeExpr` or `Template`."""
+
+    def __init__(self, base):
+        self.base = base
+
+    def __repr__(self) -> str:
+        return f"Stateful[{self.base!r}]"
+
+
+class _StatefulFactory:
+    def __getitem__(self, base) -> "StatefulExpr":
+        return StatefulExpr(base)
+
+    def __repr__(self) -> str:
+        return "Stateful"
+
+    __str__ = __repr__
+
+
+Stateful = _StatefulFactory()
 
 
 # =========================================================================#
@@ -521,6 +560,35 @@ class AlloValue(ValueBase):
     @property
     def is_indexed(self) -> builtins.bool:
         return self.indices is not None
+
+
+class StatefulValue(ValueBase):
+    """A persistent, memory-backed variable (C ``static`` semantics).
+
+    It exists only as a binding in the local scope: reading the name loads from
+    the backing global and writing the name stores into it, so a StatefulValue
+    never flows into expression evaluation as itself. This keeps it out of the
+    SSA phi / loop-iter-arg machinery, which only tracks `AlloValue`s.
+
+    `storage` is the rank-0 (scalar) or shaped (array) `AlloValue<BufferType>`
+    produced by `memref.get_global`; `type` is the logical type the user sees
+    (a `DType` for scalars, a `BufferType` for arrays).
+    """
+
+    def __init__(self, storage: AlloValue, value_type: TypeBase):
+        self.storage = storage
+        self.type = value_type
+
+    @property
+    def handle(self) -> Value:
+        return self.storage.handle
+
+    @property
+    def is_scalar(self) -> builtins.bool:
+        return isinstance(self.type, DType)
+
+    def __repr__(self) -> str:
+        return f"StatefulValue<{self.type}>"
 
 
 # map from PyTorch dtype string to Allo DType, for easier interop with PyTorch/NumPy

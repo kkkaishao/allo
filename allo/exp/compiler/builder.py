@@ -26,6 +26,7 @@ from ..lang.core import (
     BufferType,
     StreamType,
     ConstexprValue,
+    StatefulValue,
     TypeBase,
 )
 from ..lang.rule import get_type_rules
@@ -68,7 +69,10 @@ class AlloOpBuilder:
         self.begin_line: int = 1
         self.curr_node: ast.AST | None = None
         self.module: ir.Module | None = None
-        self._global_initializer_counter = 0
+        # symbol -> memref type of every compiler-emitted module global (stateful
+        # variables and list-initialized constants), so multiple instantiations
+        # of the same kernel share one global instead of redefining it.
+        self._module_globals: dict[str, ir.Type] = {}
         # Cached attr for linalg parallel iterator type.
         self._par_iter = ir.Attribute.parse("#linalg.iterator_type<parallel>", context)
 
@@ -213,50 +217,86 @@ class AlloOpBuilder:
             return ir.IntegerAttr.get(ir_ty, int(value))
         assert False, f"Unsupported dense element type: {dtype}"
 
-    def _next_initializer_name(self, name: str) -> str:
-        suffix = self._global_initializer_counter
-        self._global_initializer_counter += 1
-        return f"{name}_initializer_{suffix}"
+    def _dense_initializer(self, values: Sequence[int | float], dtype: DType, shape):
+        attr_type = self._materialize(TensorType(shape, dtype))
+        elements = [self._dense_element_attr(v, dtype) for v in values]
+        return ir.DenseElementsAttr.get(elements, type=attr_type)
+
+    def _define_module_global(self, global_name: str, memref_type, dense_attr):
+        """Emit (once) a mutable module-level `memref.global` initialized with
+        `dense_attr`, returning a `get_global` result. A name already defined
+        reuses its single definition, so kernels instantiated multiple times
+        share one global. See ``_global_symbol`` for the naming convention."""
+        assert self.module is not None
+        if global_name not in self._module_globals:
+            ip, loc = self.get_insertion_point_and_loc()
+            self.set_insertion_point_to_end(self.module.body)
+            memref.GlobalOp(
+                global_name,
+                ir.TypeAttr.get(memref_type),
+                sym_visibility=ir.StringAttr.get("private", self.context),
+                initial_value=dense_attr,
+                constant=False,
+                ip=self._ip,
+                loc=self._loc,
+            )
+            self.set_insertion_point_and_loc(ip, loc)
+            self._module_globals[global_name] = memref_type
+        return memref.GetGlobalOp(
+            memref_type, global_name, ip=self._ip, loc=self._loc
+        ).result
 
     def make_shaped_constant(
-        self, values: Sequence[int | float], dst_type: ShapedType, name: str
+        self, values: Sequence[int | float], dst_type: ShapedType, global_name: str
     ) -> AlloValue:
         num_elements = 1
         for dim in dst_type.shape:
             num_elements *= dim
         assert len(values) == num_elements
 
-        attr_type = self._materialize(TensorType(dst_type.shape, dst_type.dtype))
-        elements = [self._dense_element_attr(v, dst_type.dtype) for v in values]
-        dense_attr = ir.DenseElementsAttr.get(elements, type=attr_type)
+        dense_attr = self._dense_initializer(values, dst_type.dtype, dst_type.shape)
         if isinstance(dst_type, TensorType):
             return AlloValue(
                 # arith.ConstantOp accepts an Attribute value at runtime, but the
                 # upstream stub types `value` as int|float|array only.
                 arith.ConstantOp(
-                    attr_type, dense_attr, ip=self._ip, loc=self._loc  # type: ignore[arg-type]
+                    self._materialize(dst_type), dense_attr, ip=self._ip, loc=self._loc  # type: ignore[arg-type]
                 ).result,
                 dst_type,
             )
 
         assert isinstance(dst_type, BufferType)
-        assert self.module is not None
-        memref_type = self._materialize(dst_type)
-        global_name = self._next_initializer_name(name)
-        ip, loc = self.get_insertion_point_and_loc()
-        self.set_insertion_point_to_end(self.module.body)
-        memref.GlobalOp(
-            global_name,
-            ir.TypeAttr.get(memref_type),
-            sym_visibility=ir.StringAttr.get("private", self.context),
-            initial_value=dense_attr,
-            constant=False,
-            ip=self._ip,
-            loc=self._loc,
+        result = self._define_module_global(
+            global_name, self._materialize(dst_type), dense_attr
         )
-        self.set_insertion_point_and_loc(ip, loc)
-        get = memref.GetGlobalOp(memref_type, global_name, ip=self._ip, loc=self._loc)
-        return AlloValue(get.result, dst_type)
+        return AlloValue(result, dst_type)
+
+    def make_stateful(
+        self, global_name: str, inner: DType | BufferType, values: Sequence[int | float]
+    ) -> StatefulValue:
+        """Create a persistent variable backed by a mutable module-level global.
+
+        Scalars use a rank-0 `memref<dtype>`; arrays use the declared buffer type.
+        `global_name` is keyed on the source declaration, so repeated kernel
+        instantiations resolve to the same global (emitted once) and share state.
+        `values` is the flat compile-time initializer (one element for scalars).
+        """
+        dtype = inner if isinstance(inner, DType) else inner.dtype
+        shape = () if isinstance(inner, DType) else tuple(inner.shape)
+        storage_type = BufferType(shape, dtype)
+        dense_attr = self._dense_initializer(values, dtype, shape)
+        result = self._define_module_global(
+            global_name, self._materialize(storage_type), dense_attr
+        )
+        return StatefulValue(AlloValue(result, storage_type), inner)
+
+    def store_into_buffer(self, dst: AlloValue, value) -> None:
+        """Whole-buffer write: copy a source buffer, or splat a scalar/constexpr."""
+        assert isinstance(dst.type, BufferType)
+        if isinstance(value, AlloValue) and isinstance(value.type, BufferType):
+            memref.CopyOp(value.handle, dst.handle, ip=self._ip, loc=self._loc)
+            return
+        self._fill_shaped_value(self.cast(value, dst.dtype), dst)
 
     #####################
     # Stream Creation
