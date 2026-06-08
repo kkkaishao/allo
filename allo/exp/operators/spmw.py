@@ -11,11 +11,11 @@ from ..._mlir.dialects import allo
 
 
 @operator
-def get_worker_id(axis):
+def get_wid(axis):
     operator_body_unreachable()
 
 
-@get_worker_id.build
+@get_wid.build
 def _(builder: AlloOpBuilder, axis: ConstexprValue):
     if (
         not isinstance(axis, ConstexprValue)
@@ -32,11 +32,11 @@ def _(builder: AlloOpBuilder, axis: ConstexprValue):
 
 
 @operator
-def get_num_workers(axis):
+def get_nw(axis):
     operator_body_unreachable()
 
 
-@get_num_workers.build
+@get_nw.build
 def _(builder: AlloOpBuilder, axis: ConstexprValue):
     if (
         not isinstance(axis, ConstexprValue)
