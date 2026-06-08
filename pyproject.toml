@@ -5,9 +5,8 @@
 requires = [
     "nanobind>=2.10",
     "scikit-build-core>=0.10",
-    "setuptools",
 ]
-build-backend = "scikit_build_core.setuptools.build_meta"
+build-backend = "scikit_build_core.build"
 
 [project]
 name = "allo"
@@ -37,10 +36,19 @@ minimum-version = "build-system.requires"
 cmake.version = ">=3.20"
 ninja.version = ">=1.10"
 cmake.build-type = "Release"
-cmake.args = [
-    "-S mlir"
-]
+cmake.source-dir = "mlir"
+# Persistent build tree so the generated `allo/_mlir` symlinks always resolve.
 build-dir = "build"
+wheel.packages = ["allo"]
 
-[tool.setuptools]
-packages = ["allo"]
+[tool.scikit-build.cmake.define]
+# Build against the same LLVM toolchain the bundled MLIR was built with.
+CMAKE_C_COMPILER = "clang"
+CMAKE_CXX_COMPILER = "clang++"
+MLIR_BINDINGS_PYTHON_NB_DOMAIN = "allo"
+
+[tool.scikit-build.editable]
+# Rebuild the native bits on import so `pip install -e .` is one self-healing step.
+mode = "redirect"
+rebuild = true
+verbose = false
