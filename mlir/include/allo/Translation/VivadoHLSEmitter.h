@@ -93,6 +93,9 @@ private:
   void emitUnaryOp(Operation *op, llvm::StringLiteral keyword);
   void emitCastOp(Operation *op);
   void emitIntExtOp(Operation *op, bool isSigned);
+  void emitFPToIntOp(Operation *op, bool isSigned);
+  void emitIntToFPOp(Operation *op, bool isSigned);
+  void emitSignedOperand(Value value, bool isSigned);
   std::string getSymbolName(llvm::StringRef name);
   std::string getTemporaryName(llvm::StringRef prefix);
   std::string getPrimitiveTypeName(Type type, bool isSigned = false);

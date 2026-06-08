@@ -511,6 +511,17 @@ void VivadoHLSEmitter::emitValueRef(Value val) {
   state.os << state.getName(val);
 }
 
+// Emit ``static_cast<T>(value)`` where T is value's own type rendered with the
+// requested signedness. MLIR integers are signless and locals default to the
+// unsigned C++ type, so sign-sensitive ops route operands through this to read
+// them with the signedness their semantics dictate.
+void VivadoHLSEmitter::emitSignedOperand(Value value, bool isSigned) {
+  state.os << "static_cast<" << getPrimitiveTypeName(value.getType(), isSigned)
+           << ">(";
+  emitValueRef(value);
+  state.os << ")";
+}
+
 void VivadoHLSEmitter::emitIndexedValue(Value value, ValueRange indices) {
   emitValueRef(value);
   for (Value index : indices) {
@@ -888,11 +899,34 @@ void VivadoHLSEmitter::emitIntExtOp(Operation *op, bool isSigned) {
   llvm::raw_ostream &os = state.os;
   emitValueDecl(op->getResult(0), isSigned);
   os << " = static_cast<"
-     << getPrimitiveTypeName(op->getResult(0).getType(), isSigned) << ">("
-     << "static_cast<"
-     << getPrimitiveTypeName(op->getOperand(0).getType(), isSigned) << ">(";
+     << getPrimitiveTypeName(op->getResult(0).getType(), isSigned) << ">(";
+  emitSignedOperand(op->getOperand(0), isSigned);
+  os << ");";
+}
+
+// arith fp-to-int (fptosi/fptoui): the integer result's signedness is fixed by
+// the op. Route the result through that signed/unsigned type so a negative
+// float yields the right two's-complement bits rather than an unsigned
+// conversion, which is undefined for negatives.
+void VivadoHLSEmitter::emitFPToIntOp(Operation *op, bool isSigned) {
+  llvm::raw_ostream &os = state.os;
+  emitValueDecl(op->getResult(0), isSigned);
+  os << " = static_cast<"
+     << getPrimitiveTypeName(op->getResult(0).getType(), isSigned) << ">(";
   emitValueRef(op->getOperand(0));
-  os << "));";
+  os << ");";
+}
+
+// arith int-to-fp (sitofp/uitofp): the integer operand's signedness is fixed by
+// the op. Read the signless operand through that integer type before
+// converting, else a negative value would convert as a large unsigned one.
+void VivadoHLSEmitter::emitIntToFPOp(Operation *op, bool isSigned) {
+  llvm::raw_ostream &os = state.os;
+  emitValueDecl(op->getResult(0));
+  os << " = static_cast<" << getPrimitiveTypeName(op->getResult(0).getType())
+     << ">(";
+  emitSignedOperand(op->getOperand(0), isSigned);
+  os << ");";
 }
 
 // Native C++ scalar types have constexpr constructors; ap_int/ap_fixed/half do
@@ -1013,15 +1047,17 @@ void VivadoHLSEmitter::dispatch(Operation *op) {
       .Case<arith::ShRSIOp>([&](auto op) { emitBinaryOp(op, ">>", true); })
       // Vitis has no ceildiv/floordiv
 
-      // max/min ops
+      // max/min ops: signless integer values default to unsigned C++ types, so
+      // cast operands to match the op's signedness -- otherwise a signed maxsi
+      // on a negative value would compare as unsigned.
       .Case<arith::MaxSIOp>(
-          [&](auto op) { emitPrefixBinaryOp(op, "std::max"); })
+          [&](auto op) { emitPrefixBinaryOp(op, "std::max", true); })
       .Case<arith::MinSIOp>(
-          [&](auto op) { emitPrefixBinaryOp(op, "std::min"); })
+          [&](auto op) { emitPrefixBinaryOp(op, "std::min", true); })
       .Case<arith::MaxUIOp>(
-          [&](auto op) { emitPrefixBinaryOp(op, "std::max"); })
+          [&](auto op) { emitPrefixBinaryOp(op, "std::max", false); })
       .Case<arith::MinUIOp>(
-          [&](auto op) { emitPrefixBinaryOp(op, "std::min"); })
+          [&](auto op) { emitPrefixBinaryOp(op, "std::min", false); })
       .Case<arith::MaximumFOp>(
           [&](auto op) { emitPrefixBinaryOp(op, "hls::fmax"); })
       .Case<arith::MinimumFOp>(
@@ -1063,9 +1099,20 @@ void VivadoHLSEmitter::dispatch(Operation *op) {
           [&](auto op) { emitIntExtOp(op, /*isSigned=*/true); })
       .Case<arith::ExtUIOp>(
           [&](auto op) { emitIntExtOp(op, /*isSigned=*/false); })
-      .Case<arith::IndexCastOp, arith::FPToSIOp, arith::FPToUIOp,
-            arith::SIToFPOp, arith::UIToFPOp, arith::ExtFOp, arith::TruncIOp,
-            arith::TruncFOp>([&](auto op) { emitCastOp(op); })
+      // index_cast is the signed integer-resize variant, same shape as extsi.
+      .Case<arith::IndexCastOp>(
+          [&](auto op) { emitIntExtOp(op, /*isSigned=*/true); })
+      .Case<arith::FPToSIOp>(
+          [&](auto op) { emitFPToIntOp(op, /*isSigned=*/true); })
+      .Case<arith::FPToUIOp>(
+          [&](auto op) { emitFPToIntOp(op, /*isSigned=*/false); })
+      .Case<arith::SIToFPOp>(
+          [&](auto op) { emitIntToFPOp(op, /*isSigned=*/true); })
+      .Case<arith::UIToFPOp>(
+          [&](auto op) { emitIntToFPOp(op, /*isSigned=*/false); })
+      // sign-agnostic: float resize and integer truncation keep low bits.
+      .Case<arith::ExtFOp, arith::TruncIOp, arith::TruncFOp>(
+          [&](auto op) { emitCastOp(op); })
 
       // special ops
       .Case<affine::AffineForOp>([&](auto op) { emitAffineFor(op); })
@@ -1128,17 +1175,12 @@ void VivadoHLSEmitter::emitBinaryOp(Operation *op,
 void VivadoHLSEmitter::emitBinaryOp(Operation *op, llvm::StringLiteral keyword,
                                     bool isSigned) {
   llvm::raw_ostream &os = state.os;
-  Value result = op->getResult(0);
-  emitValueDecl(result);
+  emitValueDecl(op->getResult(0));
   os << " = ";
-  os << "static_cast<"
-     << getPrimitiveTypeName(op->getOperand(0).getType(), isSigned) << ">(";
-  emitValueRef(op->getOperand(0));
-  os << ") " << keyword << " ";
-  os << "static_cast<"
-     << getPrimitiveTypeName(op->getOperand(1).getType(), isSigned) << ">(";
-  emitValueRef(op->getOperand(1));
-  os << ");";
+  emitSignedOperand(op->getOperand(0), isSigned);
+  os << " " << keyword << " ";
+  emitSignedOperand(op->getOperand(1), isSigned);
+  os << ";";
 }
 
 void VivadoHLSEmitter::emitUnaryOp(Operation *op, llvm::StringLiteral keyword) {
@@ -1166,19 +1208,16 @@ void VivadoHLSEmitter::emitPrefixBinaryOp(Operation *op,
                                           llvm::StringLiteral keyword,
                                           bool isSigned) {
   llvm::raw_ostream &os = state.os;
-  Value result = op->getResult(0);
-  emitValueDecl(result);
+  emitValueDecl(op->getResult(0));
   os << " = " << keyword << "(";
-  os << "static_cast<"
-     << getPrimitiveTypeName(op->getOperand(0).getType(), isSigned) << ">(";
-  emitValueRef(op->getOperand(0));
-  os << "), ";
-  os << "static_cast<"
-     << getPrimitiveTypeName(op->getOperand(1).getType(), isSigned) << ">(";
-  emitValueRef(op->getOperand(1));
-  os << "));";
+  emitSignedOperand(op->getOperand(0), isSigned);
+  os << ", ";
+  emitSignedOperand(op->getOperand(1), isSigned);
+  os << ");";
 }
 
+// Only the operator; the signed/unsigned distinction is applied by casting the
+// operands in emitCmpI, so slt and ult share "<", etc.
 static std::string getCmpIPredString(arith::CmpIPredicate pred) {
   switch (pred) {
   case arith::CmpIPredicate::eq:
@@ -1186,21 +1225,32 @@ static std::string getCmpIPredString(arith::CmpIPredicate pred) {
   case arith::CmpIPredicate::ne:
     return "!=";
   case arith::CmpIPredicate::slt:
-    return "<";
-  case arith::CmpIPredicate::sgt:
-    return ">";
-  case arith::CmpIPredicate::sle:
-    return "<=";
-  case arith::CmpIPredicate::sge:
-    return ">=";
   case arith::CmpIPredicate::ult:
     return "<";
-  case arith::CmpIPredicate::ugt:
-    return ">";
+  case arith::CmpIPredicate::sle:
   case arith::CmpIPredicate::ule:
     return "<=";
+  case arith::CmpIPredicate::sgt:
+  case arith::CmpIPredicate::ugt:
+    return ">";
+  case arith::CmpIPredicate::sge:
   case arith::CmpIPredicate::uge:
     return ">=";
+  }
+  llvm_unreachable("unsupported integer comparison predicate");
+}
+
+// Ordered signed predicates, whose operands must be read as signed. eq/ne are
+// sign-agnostic and unsigned predicates need an unsigned read.
+static bool isSignedCmpIPredicate(arith::CmpIPredicate pred) {
+  switch (pred) {
+  case arith::CmpIPredicate::slt:
+  case arith::CmpIPredicate::sle:
+  case arith::CmpIPredicate::sgt:
+  case arith::CmpIPredicate::sge:
+    return true;
+  default:
+    return false;
   }
 }
 
@@ -1237,12 +1287,23 @@ static std::string getCmpFPredString(arith::CmpFPredicate pred) {
 
 void VivadoHLSEmitter::emitCmpI(arith::CmpIOp op) {
   llvm::raw_ostream &os = state.os;
-  Value result = op.getResult();
-  emitValueDecl(result);
+  arith::CmpIPredicate pred = op.getPredicate();
+  emitValueDecl(op.getResult());
   os << " = ";
-  emitValueRef(op.getLhs());
-  os << " " << getCmpIPredString(op.getPredicate()) << " ";
-  emitValueRef(op.getRhs());
+  // eq/ne give the same result for either signedness; ordered comparisons do
+  // not, so cast the signless operands to the predicate's signedness -- without
+  // it a signed slt on a negative (default-unsigned) value compares as
+  // unsigned.
+  if (pred == arith::CmpIPredicate::eq || pred == arith::CmpIPredicate::ne) {
+    emitValueRef(op.getLhs());
+    os << " " << getCmpIPredString(pred) << " ";
+    emitValueRef(op.getRhs());
+  } else {
+    bool isSigned = isSignedCmpIPredicate(pred);
+    emitSignedOperand(op.getLhs(), isSigned);
+    os << " " << getCmpIPredString(pred) << " ";
+    emitSignedOperand(op.getRhs(), isSigned);
+  }
   os << ";";
 }
 
