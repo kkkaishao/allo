@@ -22,7 +22,6 @@ from ..lang.core import (
     Stateful,
     StatefulExpr,
     StatefulType,
-    DEFAULT_STREAM_DEPTH,
     unwrap_if_constexpr,
 )
 from ..logging import log_fatal
@@ -297,7 +296,8 @@ class Kernel(Generic[P, R]):
                 f"Stream base type must be a scalar or buffer type, got {base!r}"
             )
         shape = self._resolve_shape(expr.shape, scope)
-        return StreamType(base_type, DEFAULT_STREAM_DEPTH, shape)
+        depth = self._resolve_shape((expr.depth,), scope)[0]
+        return StreamType(base_type, depth, shape)
 
     def _resolve_stateful_expr(
         self, expr: StatefulExpr, scope: dict[str, object]

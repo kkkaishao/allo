@@ -209,6 +209,31 @@ def test_codegen_bit_slice():
     _regex(code, r">> v\d+\) & 0xfULL")
 
 
+def test_codegen_signed_max_min():
+    # Signless i32 values default to unsigned C++ types, so a signed maxsi/minsi
+    # must cast its operands to signed before std::max/std::min -- otherwise a
+    # negative value compares as a huge unsigned and the result is wrong.
+    @kernel
+    def clamp(x: i32, out: i32[2]):
+        out[0] = max(0, x)
+        out[1] = min(0, x)
+
+    code = _hls(clamp.schedule())
+    _contains(code, "std::max(static_cast<int32_t>", "std::min(static_cast<int32_t>")
+
+
+@requires_vitis
+def test_csim_signed_max():
+    @kernel
+    def clamp(x: i32, out: i32[1]):
+        out[0] = max(0, x)
+
+    out = np.zeros(1, dtype=np.int32)
+    with tempfile.TemporaryDirectory() as project:
+        clamp.schedule().export("vitis", project_path=project)(-5, out)
+    assert int(out[0]) == 0
+
+
 def test_codegen_block_stream_datamover():
     @kernel
     def dmover(inp: i32[4, 4], out: i32[1]):

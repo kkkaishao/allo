@@ -423,21 +423,23 @@ class ShapeExpr:
 
 
 class StreamExpr:
-    """A `Stream[base][shape]` annotation, unresolved. `base` may be a `DType`,
-    `ShapedType`, `ShapeExpr` or `Template`; `shape` is the stream-array shape."""
+    """A `Stream[base, depth?][shape]` annotation, unresolved. `base` may be a
+    `DType`, `ShapedType`, `ShapeExpr` or `Template`; `depth` is the optional FIFO
+    depth; `shape` is the stream-array shape."""
 
-    def __init__(self, base, shape: Sequence = ()):
+    def __init__(self, base, depth=DEFAULT_STREAM_DEPTH, shape: Sequence = ()):
         self.base = base
+        self.depth = depth
         self.shape = tuple(shape)
 
     def __getitem__(self, key) -> "StreamExpr":
         if self.shape:
             raise TypeError(f"Stream type '{self!r}' already has a shape")
-        return StreamExpr(self.base, _as_shape(key))
+        return StreamExpr(self.base, self.depth, _as_shape(key))
 
     def __repr__(self) -> str:
         suffix = f"[{','.join(map(str, self.shape))}]" if self.shape else ""
-        return f"Stream[{self.base!r}]{suffix}"
+        return f"Stream[{self.base!r}, {self.depth}]{suffix}"
 
 
 class _StreamFactory:
@@ -445,6 +447,10 @@ class _StreamFactory:
         self.prefix = prefix
 
     def __getitem__(self, base_type) -> StreamExpr:
+        # `Stream[base, depth]` arrives as a tuple; `Stream[base]` uses the default.
+        if isinstance(base_type, tuple):
+            base, depth = base_type
+            return StreamExpr(base, depth)
         return StreamExpr(base_type)
 
     def __repr__(self) -> str:
