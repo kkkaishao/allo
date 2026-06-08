@@ -1452,9 +1452,11 @@ class MLIRCodeGenerator(ast.NodeVisitor):
             then_is_constexpr = isinstance(then_val, ConstexprValue)
             else_is_constexpr = isinstance(else_val, ConstexprValue)
             if then_is_constexpr and else_is_constexpr:
-                # TODO: support this case
                 return self.compile_error(
-                    f"Cannot deduce type of ternary expression because both branches are constexprs. Please use if statement instead of if expression in this case, or make sure at least one branch is non-constexpr so that the type can be deduced."
+                    "Cannot deduce the type of a ternary whose branches are both "
+                    "compile-time constants, as the bit-width would have to be guessed. "
+                    "Annotate one branch with its intended type (e.g. `cast(<value>, "
+                    "int32)`) or assign through a typed variable."
                 )
             # Case 2: both branches are AlloValues:
             if not then_is_constexpr and not else_is_constexpr:
