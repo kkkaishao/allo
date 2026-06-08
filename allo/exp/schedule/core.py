@@ -1,3 +1,6 @@
+# Copyright Allo authors. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 from __future__ import annotations
 
 import functools
@@ -182,7 +185,7 @@ class Schedule(Generic[P, R]):
 
     @property
     def payload(self) -> Module:
-        self._require_materialized("payload")
+        self.apply()  # auto-apply pending transforms for user convenience
         return self._payload
 
     @property

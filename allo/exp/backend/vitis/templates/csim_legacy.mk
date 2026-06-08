@@ -1,3 +1,6 @@
+# Copyright Allo authors. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 # Auto-generated Makefile for legacy (pre-2025.2) Vitis C simulation.
 #
 # Vitis HLS used gcc as the C-simulation compiler through 2024.2

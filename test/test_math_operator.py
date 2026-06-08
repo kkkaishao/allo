@@ -1,3 +1,6 @@
+# Copyright Allo authors. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import pytest
 
 from allo.exp.compiler.mlir_codegen import compile as compile_kernel

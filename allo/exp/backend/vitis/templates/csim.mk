@@ -1,3 +1,6 @@
+# Copyright Allo authors. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 # Auto-generated Makefile for Python-native Vitis C simulation.
 #
 # This is the native flow for Vitis 2025.2+, where the csim compiler is an AMD

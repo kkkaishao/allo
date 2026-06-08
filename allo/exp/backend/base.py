@@ -1,3 +1,6 @@
+# Copyright Allo authors. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Common backend interfaces for the frontend."""
 
 from __future__ import annotations

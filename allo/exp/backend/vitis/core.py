@@ -1,3 +1,6 @@
+# Copyright Allo authors. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 from __future__ import annotations
 
 import functools
@@ -397,8 +400,6 @@ class Vitis(Backend, Generic[P, R]):
         self._invoke_csyn(project_path)
         artifacts = self._ensure_compiled()
         rpt = VitisSynthReport(project_path=project_path, top=artifacts.top)
-        # automatically render
-        rpt.render()
         return rpt
 
     @terminate_on_error

@@ -1,3 +1,6 @@
+# Copyright Allo authors. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 # Auto-generated run.tcl for Vitis HLS
 
 open_project -reset hls_prj
