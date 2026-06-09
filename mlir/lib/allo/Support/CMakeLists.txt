@@ -1,3 +1,6 @@
+# Copyright Allo authors. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 add_mlir_library(MLIRAlloSupport
     TopologyGraph.cpp
     PARTIAL_SOURCES_INTENDED

@@ -1,3 +1,8 @@
+/*
+ * Copyright Allo authors. All Rights Reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 #include "allo/Conversion/Passes.h"
 #include "allo/IR/AlloOps.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
@@ -334,7 +339,8 @@ struct BitGetSliceLowering : public OpConversionPattern<BitGetSliceOp> {
     Value src = adaptor.getSrc();
     auto srcTy = cast<IntegerType>(src.getType());
     auto resultTy = cast<IntegerType>(op.getResult().getType());
-    Value lo = arith::IndexCastOp::create(rewriter, loc, srcTy, adaptor.getLo());
+    Value lo =
+        arith::IndexCastOp::create(rewriter, loc, srcTy, adaptor.getLo());
     Value shifted = arith::ShRUIOp::create(rewriter, loc, src, lo);
     Value result = shifted;
     if (resultTy.getWidth() < srcTy.getWidth())
@@ -374,14 +380,16 @@ struct BitSetSliceLowering : public OpConversionPattern<BitSetSliceOp> {
     };
     Value mask = constant(APInt::getLowBitsSet(srcW, std::min(valW, srcW)));
     Value allOnes = constant(APInt::getAllOnes(srcW));
-    Value lo = arith::IndexCastOp::create(rewriter, loc, srcTy, adaptor.getLo());
+    Value lo =
+        arith::IndexCastOp::create(rewriter, loc, srcTy, adaptor.getLo());
 
     Value maskAtLo = arith::ShLIOp::create(rewriter, loc, mask, lo);
     Value clearMask = arith::XOrIOp::create(rewriter, loc, maskAtLo, allOnes);
     Value cleared = arith::AndIOp::create(rewriter, loc, src, clearMask);
     Value masked = arith::AndIOp::create(rewriter, loc, value, mask);
     Value valAtLo = arith::ShLIOp::create(rewriter, loc, masked, lo);
-    rewriter.replaceOp(op, arith::OrIOp::create(rewriter, loc, cleared, valAtLo));
+    rewriter.replaceOp(op,
+                       arith::OrIOp::create(rewriter, loc, cleared, valAtLo));
     return success();
   }
 };
@@ -455,8 +463,8 @@ struct LowerDataflowPass
         converter, ctx);
 
     ConversionTarget target(*ctx);
-    target.addIllegalOp<StreamCreateOp, StreamPutOp, StreamGetOp,
-                        BitGetSliceOp, BitSetSliceOp>();
+    target.addIllegalOp<StreamCreateOp, StreamPutOp, StreamGetOp, BitGetSliceOp,
+                        BitSetSliceOp>();
     target.addDynamicallyLegalOp<KernelOp>([&](KernelOp op) {
       return converter.isSignatureLegal(op.getFunctionType()) &&
              converter.isLegal(&op.getBody());

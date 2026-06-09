@@ -1,3 +1,8 @@
+/*
+ * Copyright Allo authors. All Rights Reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 #include "allo/Support/TopologyGraph.h"
 
 #include "mlir/IR/BuiltinAttributes.h"

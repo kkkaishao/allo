@@ -1,3 +1,8 @@
+/*
+ * Copyright Allo authors. All Rights Reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 //===- MaterializeApintWrapper.cpp ----------------------------------------===//
 //
 // Wrap a top kernel whose boundary uses non-standard-width integers (e.g.
