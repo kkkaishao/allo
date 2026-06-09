@@ -321,6 +321,71 @@ struct StreamGetLowering : public OpConversionPattern<StreamGetOp> {
   }
 };
 
+// Extract bits [lo, lo+width) of an integer: result = trunc(src >> lo). The
+// result width fixes the slice width (matching the Vivado HLS emitter), so the
+// truncation implicitly applies the mask. `lo` is dynamic; `hi` is unused.
+struct BitGetSliceLowering : public OpConversionPattern<BitGetSliceOp> {
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(BitGetSliceOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    Location loc = op.getLoc();
+    Value src = adaptor.getSrc();
+    auto srcTy = cast<IntegerType>(src.getType());
+    auto resultTy = cast<IntegerType>(op.getResult().getType());
+    Value lo = arith::IndexCastOp::create(rewriter, loc, srcTy, adaptor.getLo());
+    Value shifted = arith::ShRUIOp::create(rewriter, loc, src, lo);
+    Value result = shifted;
+    if (resultTy.getWidth() < srcTy.getWidth())
+      result = arith::TruncIOp::create(rewriter, loc, resultTy, shifted);
+    else if (resultTy.getWidth() > srcTy.getWidth())
+      result = arith::ExtUIOp::create(rewriter, loc, resultTy, shifted);
+    rewriter.replaceOp(op, result);
+    return success();
+  }
+};
+
+// Splice `value` into bits [lo, lo+width) of `src`:
+//   result = (src & ~(mask << lo)) | ((value & mask) << lo)
+// with mask = low `width` bits set, width = value's bit width (matching the
+// Vivado HLS emitter). `lo` is dynamic; `hi` is unused.
+struct BitSetSliceLowering : public OpConversionPattern<BitSetSliceOp> {
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(BitSetSliceOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    Location loc = op.getLoc();
+    Value src = adaptor.getSrc();
+    auto srcTy = cast<IntegerType>(src.getType());
+    unsigned srcW = srcTy.getWidth();
+    unsigned valW = cast<IntegerType>(adaptor.getValue().getType()).getWidth();
+
+    Value value = adaptor.getValue();
+    if (valW < srcW)
+      value = arith::ExtUIOp::create(rewriter, loc, srcTy, value);
+    else if (valW > srcW)
+      value = arith::TruncIOp::create(rewriter, loc, srcTy, value);
+
+    auto constant = [&](const APInt &v) -> Value {
+      return arith::ConstantOp::create(rewriter, loc,
+                                       rewriter.getIntegerAttr(srcTy, v));
+    };
+    Value mask = constant(APInt::getLowBitsSet(srcW, std::min(valW, srcW)));
+    Value allOnes = constant(APInt::getAllOnes(srcW));
+    Value lo = arith::IndexCastOp::create(rewriter, loc, srcTy, adaptor.getLo());
+
+    Value maskAtLo = arith::ShLIOp::create(rewriter, loc, mask, lo);
+    Value clearMask = arith::XOrIOp::create(rewriter, loc, maskAtLo, allOnes);
+    Value cleared = arith::AndIOp::create(rewriter, loc, src, clearMask);
+    Value masked = arith::AndIOp::create(rewriter, loc, value, mask);
+    Value valAtLo = arith::ShLIOp::create(rewriter, loc, masked, lo);
+    rewriter.replaceOp(op, arith::OrIOp::create(rewriter, loc, cleared, valAtLo));
+    return success();
+  }
+};
+
 struct InvokeLowering : public OpConversionPattern<InvokeOp> {
 public:
   using OpConversionPattern::OpConversionPattern;
@@ -386,10 +451,12 @@ struct LowerDataflowPass
     populateFunctionOpInterfaceTypeConversionPattern<KernelOp>(patterns,
                                                                converter);
     patterns.add<StreamCreateLowering, StreamPutLowering, StreamGetLowering,
-                 InvokeLowering>(converter, ctx);
+                 BitGetSliceLowering, BitSetSliceLowering, InvokeLowering>(
+        converter, ctx);
 
     ConversionTarget target(*ctx);
-    target.addIllegalOp<StreamCreateOp, StreamPutOp, StreamGetOp>();
+    target.addIllegalOp<StreamCreateOp, StreamPutOp, StreamGetOp,
+                        BitGetSliceOp, BitSetSliceOp>();
     target.addDynamicallyLegalOp<KernelOp>([&](KernelOp op) {
       return converter.isSignatureLegal(op.getFunctionType()) &&
              converter.isLegal(&op.getBody());

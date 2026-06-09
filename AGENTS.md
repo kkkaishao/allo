@@ -3,6 +3,10 @@
 - Run `pip install -v -e .` to build the full project (includes MLIR/C++ backend)
 - Run `ninja -C build [target]` to build specific targets
 
+# Testing
+- Run `python -m pytest test/` to run all tests for the new frontend
+- Set `XILINX_VITIS` to any invalid path to skip tests for synthesis with Vitis to save time
+
 # Code style
 - Make small, targeted diffs rather than large refactors, and always be concise
 - Prefer general solutions instead of one-off `if/else` patches
