@@ -353,7 +353,7 @@ class AlloOpBuilder:
         if src_type.is_int_signless() and dst_type.is_int_signless():
             if src_type.primitive_width < dst_type.primitive_width:
                 return AlloValue(
-                    self.create_ext(value, dst_ir_type, signed=dst_type.is_int()),
+                    self.create_ext(value, dst_ir_type, signed=src_type.is_int()),
                     dst_type,
                 )
             if src_type.primitive_width > dst_type.primitive_width:

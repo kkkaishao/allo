@@ -109,3 +109,67 @@ def test_simulator_block_stream():
         dtype=np.int32,
     )
     np.testing.assert_array_equal(out, expected)
+
+
+def test_simulator_bit_get_slice():
+    """get_slice: unpack four bytes from each packed 32-bit word at a dynamic offset."""
+    u32 = APInt(32, signed=False)
+
+    @kernel
+    def unpack(packed: u32[6], out: i32[6, 4]):
+        for i in arange(6, name="i"):
+            for p in arange(4, name="p"):
+                out[i, p] = packed[i][p * 8 : p * 8 + 8]
+
+    lanes = np.random.randint(0, 256, (6, 4)).astype(np.uint32)
+    packed = np.zeros(6, dtype=np.uint32)
+    for p in range(4):
+        packed |= lanes[:, p] << (8 * p)
+
+    out = np.zeros((6, 4), dtype=np.int32)
+    unpack(packed, out)
+
+    np.testing.assert_array_equal(out, lanes.astype(np.int32))
+
+
+def test_simulator_bit_set_slice():
+    """set_slice: pack four bytes into a 32-bit word at a dynamic offset."""
+    u32 = APInt(32, signed=False)
+
+    @kernel
+    def pack(lanes: i32[6, 4], out: u32[6]):
+        for i in arange(6, name="i"):
+            word: u32 = 0
+            for p in arange(4, name="p"):
+                word[p * 8 : p * 8 + 8] = lanes[i, p]
+            out[i] = word
+
+    lanes = np.random.randint(0, 256, (6, 4)).astype(np.int32)
+    out = np.zeros(6, dtype=np.uint32)
+    pack(lanes, out)
+
+    expected = np.zeros(6, dtype=np.uint32)
+    for p in range(4):
+        expected |= lanes[:, p].astype(np.uint32) << (8 * p)
+
+    np.testing.assert_array_equal(out, expected)
+
+
+def test_simulator_bit_extract_insert():
+    """get_bit / set_bit: reverse the eight bits of each byte (width-1 slices)."""
+    u8 = APInt(8, signed=False)
+
+    @kernel
+    def rev(src: u8[8], out: u8[8]):
+        for i in arange(8, name="i"):
+            r: u8 = 0
+            for b in arange(8, name="b"):
+                r[7 - b] = src[i][b]
+            out[i] = r
+
+    src = np.random.randint(0, 256, 8).astype(np.uint8)
+    out = np.zeros(8, dtype=np.uint8)
+    rev(src, out)
+
+    expected = np.array([int(f"{int(v):08b}"[::-1], 2) for v in src], dtype=np.uint8)
+    np.testing.assert_array_equal(out, expected)
