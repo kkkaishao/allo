@@ -24,13 +24,10 @@ def LowerDataflowPass : Pass<"lower-dataflow", "ModuleOp"> {
   let summary = "Lower local scalar streams to the host dataflow simulator ABI";
   let description = [{
     Lower Allo local scalar stream operations to calls into the host dataflow
-    simulator runtime and wrap stream-connected kernel invocations with OpenMP
-    sections.
+    simulator runtime and tag stream-connected kernels as dataflow PEs, which the
+    late `allo-dataflow-spawn` pass launches as concurrent fibers on the marl
+    runtime.
   }];
-  let options = [
-    Option<"numThreads", "num-threads", "unsigned", "8",
-           "The number of threads to use for dataflow simulation.">
-  ];
 }
 
 #endif // ALLO_CONVERSION_PASSES_TD

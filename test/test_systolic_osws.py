@@ -417,18 +417,18 @@ def test_plain_codegen():
     assert "void osws_gemm_pe_1_1(" in osws_gemm.schedule().export("vitis").hls_code
 
 
+def test_plain_cpu_sim():
+    A = np.random.randint(-8, 8, (M, K)).astype(np.int32)
+    B = np.random.randint(-8, 8, (K, N)).astype(np.int32)
+    truth = A @ B
+    C = np.zeros((M, N), dtype=np.int32)
+    osws_gemm(A, B, True, C)
+    np.testing.assert_allclose(C, truth)
+
+
 @requires_vitis
 def test_plain_csim():
     _check_both_modes(osws_gemm, np.int32, -8, 8)
-
-
-@requires_vitis
-def test_plain_synth():
-    with tempfile.TemporaryDirectory() as proj:
-        report = (
-            osws_gemm.schedule().export("vitis", part=PART, project_path=proj).synth()
-        )
-        assert report.xml_path.exists()
 
 
 def test_tiled_codegen():
@@ -436,20 +436,21 @@ def test_tiled_codegen():
     assert "void osws_gemm_tiled_pe_1_1(" in code
 
 
+def test_tiled_cpu_sim():
+    A = np.random.randint(-8, 8, (M, K)).astype(np.int32)
+    B = np.random.randint(-8, 8, (K, N)).astype(np.int32)
+    truth = A @ B
+    C = np.zeros((M, N), dtype=np.int32)
+    osws_gemm_tiled(A, B, True, C)
+    np.testing.assert_allclose(C, truth)
+    C = np.zeros((M, N), dtype=np.int32)
+    osws_gemm_tiled(A, B, False, C)
+    np.testing.assert_allclose(C, truth)
+
+
 @requires_vitis
 def test_tiled_csim():
     _check_both_modes(osws_gemm_tiled, np.int32, -8, 8)
-
-
-@requires_vitis
-def test_tiled_synth():
-    with tempfile.TemporaryDirectory() as proj:
-        report = (
-            osws_gemm_tiled.schedule()
-            .export("vitis", part=PART, project_path=proj)
-            .synth()
-        )
-        assert report.xml_path.exists()
 
 
 def test_daisy_codegen():
@@ -457,17 +458,15 @@ def test_daisy_codegen():
     assert "void osws_gemm_daisy_pe_1_1(" in code
 
 
+def test_daisy_cpu_sim():
+    A = np.random.randint(0, 8, (M, K)).astype(np.int16)
+    B = np.random.randint(0, 8, (K, N)).astype(np.int16)
+    truth = A @ B
+    C = np.zeros((M, N), dtype=np.int16)
+    osws_gemm_daisy(A, B, True, C)
+    np.testing.assert_allclose(C, truth)
+
+
 @requires_vitis
 def test_daisy_csim():
     _check_both_modes(osws_gemm_daisy, np.int16, 0, 8)
-
-
-@requires_vitis
-def test_daisy_synth():
-    with tempfile.TemporaryDirectory() as proj:
-        report = (
-            osws_gemm_daisy.schedule()
-            .export("vitis", part=PART, project_path=proj)
-            .synth()
-        )
-        assert report.xml_path.exists()

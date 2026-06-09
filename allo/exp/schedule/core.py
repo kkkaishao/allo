@@ -162,7 +162,7 @@ class Schedule(Generic[P, R]):
         from ..backend.base import run_pipeline
 
         with self.context:
-            run_pipeline(self._payload, "builtin.module(allo-reuse-cleanup)")
+            run_pipeline(self._payload, "builtin.module(reuse-cleanup)")
         self.kernel.module = self._payload
         if backend == "cpu":
             from ..backend import CPU

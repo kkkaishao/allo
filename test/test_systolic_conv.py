@@ -5,8 +5,7 @@
 compile-time PE-role branches (``get_wid``) with a runtime ``if`` that maps the
 linear PE row back to an (output_row, output_col) coordinate.
 
-Functional checks run through Vitis csim; the CPU dataflow simulator currently
-deadlocks on multi-PE arrays.
+Functional checks run through both the CPU dataflow simulator and Vitis csim.
 """
 
 import tempfile
@@ -105,7 +104,6 @@ def test_codegen():
     assert "top_conv_0_0" not in code
 
 
-@pytest.mark.skip(reason="CPU sim deadlocks on multi-PE arrays; needs a fix")
 def test_cpu_sim():
     A = np.random.rand(IR, IC).astype(np.float32)
     B = np.random.rand(FR, FC).astype(np.float32)

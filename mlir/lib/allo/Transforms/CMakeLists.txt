@@ -1,6 +1,7 @@
 add_mlir_library(MLIRAlloTransforms
     MaterializeTopology.cpp
     GridMapping.cpp
+    DataflowSpawn.cpp
     ReuseCleanup.cpp
     MaterializeApintWrapper.cpp
 
@@ -12,6 +13,7 @@ add_mlir_library(MLIRAlloTransforms
     MLIRAffineDialect
     MLIRArithDialect
     MLIRFuncDialect
+    MLIRLLVMDialect
     MLIRMemRefDialect
     MLIRSCFDialect
     MLIRTransforms

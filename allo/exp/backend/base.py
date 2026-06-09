@@ -23,7 +23,7 @@ from ..._mlir.dialects.allo import register_passes as _register_allo_passes
 from ..lang.kernel import Kernel
 
 # Allo passes live in the process-global MLIR pass registry; register them once
-# (std::call_once-guarded in C++) so backend pipelines (`allo-lower-to-llvm`,
+# (std::call_once-guarded in C++) so backend pipelines (`lower-to-llvm`,
 # `grid-mapping`, `convert-allo-to-func`, ...) resolve via upstream PassManager.
 _register_allo_passes()
 

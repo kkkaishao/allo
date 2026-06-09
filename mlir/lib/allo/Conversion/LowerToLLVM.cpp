@@ -1,4 +1,5 @@
 #include "allo/Conversion/Passes.h"
+#include "allo/Transforms/Passes.h"
 #include "mlir/Conversion/Passes.h"
 #include "mlir/Dialect/Affine/Transforms/Passes.h"
 #include "mlir/Dialect/Bufferization/Pipelines/Passes.h"
@@ -17,6 +18,7 @@ using namespace mlir::allo;
 void allo::populateLowerToLLVMPipeline(OpPassManager &pm, bool enableTensor) {
   pm.addPass(createCanonicalizerPass());
   pm.addPass(createCSEPass());
+  pm.addPass(createGridMappingPass());
   pm.addPass(createLowerDataflowPass());
 
   if (enableTensor) {
@@ -59,8 +61,8 @@ void allo::populateLowerToLLVMPipeline(OpPassManager &pm, bool enableTensor) {
   pm.addPass(createFinalizeMemRefToLLVMConversionPass());
   pm.addPass(createConvertIndexToLLVMPass());
   pm.addPass(createArithToLLVMConversionPass());
-  pm.addPass(createConvertOpenMPToLLVMPass());
   pm.addPass(createReconcileUnrealizedCastsPass());
+  pm.addPass(createDataflowSpawnPass());
   pm.addPass(createCanonicalizerPass());
   pm.addPass(createCSEPass());
 }
@@ -78,7 +80,7 @@ struct AlloLowerToLLVMPipelineOptions
 
 void allo::registerAlloLLVMLoweringPipeline() {
   PassPipelineRegistration<AlloLowerToLLVMPipelineOptions>(
-      "allo-lower-to-llvm", "Lower allo/canonical-form IR to the LLVM dialect",
+      "lower-to-llvm", "Lower allo/canonical-form IR to the LLVM dialect",
       [](OpPassManager &pm, const AlloLowerToLLVMPipelineOptions &opts) {
         populateLowerToLLVMPipeline(pm, opts.enableTensor);
       });

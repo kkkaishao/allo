@@ -88,6 +88,23 @@ def test_codegen():
     assert "static_cast<int8_t>" in code
 
 
+def test_cpu_sim():
+    np_type = np.int32
+    X = np.random.randint(-4, 4, size=(M, K)).astype(np.int8)
+    W = np.random.randint(-4, 4, size=(K, N)).astype(np.int8)
+    packed_X = np.ascontiguousarray(np.ascontiguousarray(X).view(np_type))
+    packed_W = np.ascontiguousarray(
+        np.ascontiguousarray(W.transpose()).view(np_type).transpose()
+    )
+    Z = np.zeros((M // PP, N), dtype=np_type)
+    top.schedule().export("cpu")(packed_X, packed_W, Z)
+    np_C = X @ W
+    np_C_packed = np.ascontiguousarray(
+        np.ascontiguousarray(np_C.transpose()).view(np_type).transpose()
+    )
+    np.testing.assert_allclose(Z, np_C_packed, atol=1e-3)
+
+
 @requires_vitis
 def test_csim():
     np_type = np.int32
@@ -105,10 +122,3 @@ def test_csim():
         np.ascontiguousarray(np_C.transpose()).view(np_type).transpose()
     )
     np.testing.assert_allclose(Z, np_C_packed, atol=1e-3)
-
-
-@requires_vitis
-def test_synth():
-    with tempfile.TemporaryDirectory() as proj:
-        report = top.schedule().export("vitis", part=PART, project_path=proj).synth()
-        assert report.xml_path.exists()

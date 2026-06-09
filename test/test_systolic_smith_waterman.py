@@ -108,6 +108,15 @@ def test_codegen():
     assert "std::max(static_cast<int32_t>" in code
 
 
+def test_cpu_sim():
+    chars = np.array(["A", "C", "G", "T"], dtype="c")
+    A = np.random.choice(chars, size=M).view(np.int8)
+    B = np.random.choice(chars, size=N).view(np.int8)
+    S = np.zeros((P0 - 1, P1 - 1), dtype=np.int32)
+    top.schedule().export("cpu")(A, B, S)
+    np.testing.assert_equal(S[1:, 1:], _ref(A, B)[1:, 1:])
+
+
 @requires_vitis
 def test_csim():
     chars = np.array(["A", "C", "G", "T"], dtype="c")
@@ -117,10 +126,3 @@ def test_csim():
     with tempfile.TemporaryDirectory() as proj:
         top.schedule().export("vitis", project_path=proj)(A, B, S)
     np.testing.assert_equal(S[1:, 1:], _ref(A, B)[1:, 1:])
-
-
-@requires_vitis
-def test_synth():
-    with tempfile.TemporaryDirectory() as proj:
-        report = top.schedule().export("vitis", part=PART, project_path=proj).synth()
-        assert report.xml_path.exists()

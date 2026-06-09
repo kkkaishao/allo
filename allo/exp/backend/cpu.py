@@ -78,34 +78,10 @@ def _dataflow_runtime_lib() -> str:
         exp_dir.parent / "_mlir" / "_mlir_libs",
         exp_dir.parents[1] / "build" / "lib",
     ]
-    path = _find_first(candidates, "liballo_dataflow_runtime")
+    path = _find_first(candidates, "libAlloDataflowRuntime")
     if path is None:
         raise RuntimeError(
             "Cannot find liballo_dataflow_runtime. Rebuild Allo with `pip install -v -e .`."
-        )
-    return path
-
-
-def _libomp() -> str:
-    candidates = []
-    llvm_base_dir = os.environ.get("LLVM_BASE_DIR")
-    if llvm_base_dir:
-        llvm_base = Path(llvm_base_dir)
-        candidates.append(llvm_base / "lib")
-        candidates.append(
-            llvm_base / "runtimes" / "runtimes-bins" / "openmp" / "runtime" / "src"
-        )
-    default_llvm = (
-        Path(__file__).resolve().parents[3] / "externals" / "llvm-project" / "build"
-    )
-    candidates.append(default_llvm / "lib")
-    candidates.append(
-        default_llvm / "runtimes" / "runtimes-bins" / "openmp" / "runtime" / "src"
-    )
-    path = _find_first(candidates, "libomp")
-    if path is None:
-        raise RuntimeError(
-            "Cannot find libomp in LLVM_BASE_DIR or externals LLVM build"
         )
     return path
 
@@ -141,7 +117,7 @@ def _default_shared_libs() -> list[str]:
         if len(found) == 2:
             libs.extend(found)
             break
-    return [*libs, _libomp(), _dataflow_runtime_lib()]
+    return [*libs, _dataflow_runtime_lib()]
 
 
 def _make_output_struct(memref_descriptors):
@@ -375,7 +351,7 @@ class CPU(Backend, Generic[P, R]):
                 raise RuntimeError(
                     f"Cannot find top function '{self.kernel.func_name}'"
                 )
-            run_pipeline(self.module, "builtin.module(allo-lower-to-llvm)")
+            run_pipeline(self.module, "builtin.module(lower-to-llvm)")
             engine = ExecutionEngine(
                 self.module,
                 opt_level=self.opt_level,

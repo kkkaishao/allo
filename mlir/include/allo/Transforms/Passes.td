@@ -22,7 +22,20 @@ def GridMappingPass : Pass<"grid-mapping", "ModuleOp"> {
   }];
 }
 
-def ReuseCleanupPass : Pass<"allo-reuse-cleanup", "ModuleOp"> {
+def DataflowSpawnPass : Pass<"dataflow-spawn", "ModuleOp"> {
+  let summary = "Launch tagged dataflow PEs as fibers on the marl runtime.";
+  let description = [{
+    Rewrite the (already LLVM-lowered) sequential calls to dataflow PEs -- the
+    callees tagged `allo.dataflow.pe` by lower-dataflow -- into concurrent fiber
+    spawns onto the marl runtime: `allo_df_open` / `allo_df_spawn` per PE (with a
+    generated `void(ptr)` thunk that reloads the PE's operands from an alloca'd
+    context) / `allo_df_join` / `allo_df_close`. Run after the module is in the
+    LLVM dialect (operands are pure LLVM values, casts reconciled).
+  }];
+  let dependentDialects = ["mlir::LLVM::LLVMDialect"];
+}
+
+def ReuseCleanupPass : Pass<"reuse-cleanup", "ModuleOp"> {
   let summary = "Simplify the IR produced by reuse_at.";
   let description = [{
     Clean up the redundant IR left behind by `transform.allo.reuse_at`: run

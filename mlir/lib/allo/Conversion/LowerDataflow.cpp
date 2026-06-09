@@ -3,10 +3,8 @@
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
-#include "mlir/Dialect/OpenMP/OpenMPDialect.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinOps.h"
-#include "mlir/IR/SymbolTable.h"
 #include "mlir/Transforms/DialectConversion.h"
 
 namespace mlir::allo {
@@ -207,84 +205,22 @@ static bool isStreamInvoke(InvokeOp op) {
   });
 }
 
-static LogicalResult wrapDataflowInvokes(OpBuilder &builder, KernelOp kernel,
-                                         unsigned numThreads) {
-  if (kernel.getBody().empty())
-    return success();
-  if (!llvm::hasSingleElement(kernel.getBody()))
-    return kernel.emitError("lower-dataflow expects single-block kernels");
-
-  Block &block = kernel.getBody().front();
-  SmallVector<InvokeOp> invokes;
-  for (Operation &op : block) {
-    if (auto invoke = dyn_cast<InvokeOp>(op);
-        invoke && isStreamInvoke(invoke)) {
-      // TODO: can this limitation be lifted?
-      if (invoke.getNumResults() != 0)
-        return invoke.emitError(
-            "stream-connected dataflow invokes must not return values");
-      invokes.push_back(invoke);
-    }
-  }
-  if (invokes.size() < 2)
-    return success();
-
-  InvokeOp first = invokes.front();
-  InvokeOp last = invokes.back();
-  bool inGroup = false;
-  for (Operation &op : block) {
-    if (&op == first)
-      inGroup = true;
-    if (inGroup && &op != last && !isa<InvokeOp>(op))
-      return op.emitError(
-          "lower-dataflow expects stream-connected invokes to be contiguous");
-    if (inGroup && isa<InvokeOp>(op) && !isStreamInvoke(cast<InvokeOp>(op)))
-      return op.emitError("lower-dataflow does not mix stream and non-stream "
-                          "invokes in one group");
-    if (&op == last)
-      break;
-  }
-
-  builder.setInsertionPoint(first);
-  Location loc = first.getLoc();
-  Value numThreadsCst =
-      arith::ConstantIntOp::create(builder, loc, invokes.size(), 64);
-  auto parallel = omp::ParallelOp::create(
-      builder, loc, ValueRange{}, ValueRange{}, Value{}, numThreadsCst,
-      ValueRange{}, ArrayAttr(), UnitAttr(), omp::ClauseProcBindKindAttr(),
-      omp::ReductionModifierAttr(), ValueRange{}, DenseBoolArrayAttr(),
-      ArrayAttr());
-  Block &parallelBlock = parallel.getRegion().emplaceBlock();
-
-  builder.setInsertionPointToEnd(&parallelBlock);
-  auto sections = omp::SectionsOp::create(
-      builder, loc, ValueRange{}, ValueRange{}, UnitAttr(), ValueRange{},
-      ArrayAttr(), UnitAttr(), omp::ReductionModifierAttr(), ValueRange{},
-      DenseBoolArrayAttr(), ArrayAttr());
-  Block &sectionsBlock = sections.getRegion().emplaceBlock();
-
-  builder.setInsertionPointToEnd(&sectionsBlock);
-  for (InvokeOp invoke : invokes) {
-    OpBuilder::InsertionGuard guard(builder);
-    auto section = omp::SectionOp::create(builder, invoke.getLoc());
-    Block &sectionBlock = section.getRegion().emplaceBlock();
-    builder.setInsertionPointToEnd(&sectionBlock);
-    auto terminator = omp::TerminatorOp::create(builder, invoke.getLoc());
-    invoke->moveBefore(terminator);
-  }
-  omp::TerminatorOp::create(builder, loc);
-  builder.setInsertionPointAfter(sections);
-  omp::TerminatorOp::create(builder, loc);
-  return success();
-}
-
-static LogicalResult wrapDataflowInvokes(ModuleOp module, unsigned numThreads) {
-  OpBuilder builder(module);
-  for (auto kernel : module.getOps<KernelOp>()) {
-    if (failed(wrapDataflowInvokes(builder, kernel, numThreads)))
-      return failure();
-  }
-  return success();
+// Tag the callee of every stream-connected invoke as a dataflow PE. The CPU
+// pipeline's late `allo-dataflow-spawn` pass rewrites the (post-LLVM-lowering)
+// calls to these functions into fiber spawns onto the marl runtime, so that all
+// PEs of a dataflow region run concurrently as cooperatively-scheduled fibers.
+// We mark the *callees* rather than the call sites because a unit attribute on
+// a function definition survives the kernel -> func -> llvm.func lowering,
+// whereas call-site attributes are dropped by the conversion patterns.
+static void markDataflowPEs(ModuleOp module) {
+  auto marker = UnitAttr::get(module.getContext());
+  module.walk([&](InvokeOp invoke) {
+    if (!isStreamInvoke(invoke))
+      return;
+    if (auto callee =
+            module.lookupSymbol<KernelOp>(invoke.getCalleeAttr().getAttr()))
+      callee->setAttr("allo.dataflow.pe", marker);
+  });
 }
 
 namespace {
@@ -430,16 +366,10 @@ static void insertStreamDestroys(ModuleOp module) {
 namespace {
 struct LowerDataflowPass
     : public allo::impl::LowerDataflowPassBase<LowerDataflowPass> {
-  LowerDataflowPass() = default;
-  LowerDataflowPass(const LowerDataflowPassOptions &options)
-      : numThreads(options.numThreads) {}
   void runOnOperation() override {
     ModuleOp module = getOperation();
 
-    if (failed(wrapDataflowInvokes(module, numThreads))) {
-      signalPassFailure();
-      return;
-    }
+    markDataflowPEs(module);
 
     // inject runtime helper functions
     declareRuntimeFuncs(module);
@@ -478,10 +408,7 @@ struct LowerDataflowPass
 
   void getDependentDialects(DialectRegistry &registry) const override {
     registry.insert<arith::ArithDialect, func::FuncDialect,
-                    memref::MemRefDialect, omp::OpenMPDialect>();
+                    memref::MemRefDialect>();
   }
-
-private:
-  unsigned numThreads = 8;
 };
 } // namespace

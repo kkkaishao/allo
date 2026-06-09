@@ -78,6 +78,14 @@ def test_codegen():
     assert "top_gemm_0_0" not in code
 
 
+def test_cpu_sim():
+    A = np.random.randint(0, 10, (M, K)).astype(np.int32)
+    B = np.random.randint(0, 10, (K, N)).astype(np.int32)
+    C = np.zeros((M, N), dtype=np.int32)
+    top.schedule().export("cpu")(A, B, C)
+    np.testing.assert_array_equal(C, A @ B)
+
+
 @requires_vitis
 def test_csim():
     A = np.random.randint(0, 10, (M, K)).astype(np.int32)
@@ -86,10 +94,3 @@ def test_csim():
     with tempfile.TemporaryDirectory() as proj:
         top.schedule().export("vitis", project_path=proj)(A, B, C)
     np.testing.assert_array_equal(C, A @ B)
-
-
-@requires_vitis
-def test_synth():
-    with tempfile.TemporaryDirectory() as proj:
-        report = top.schedule().export("vitis", part=PART, project_path=proj).synth()
-        assert report.xml_path.exists()

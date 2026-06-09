@@ -3,8 +3,7 @@
 
 """Systolic GEMM arrays: a 2D output-stationary array and a 1D row array.
 
-Functional checks run through Vitis csim; the CPU dataflow simulator currently
-deadlocks on multi-PE arrays.
+Functional checks run through both the CPU dataflow simulator and Vitis csim.
 """
 
 import tempfile
@@ -166,7 +165,6 @@ def test_1d_codegen():
     assert "systolic_1d_pe_0_0" not in code
 
 
-@pytest.mark.skip(reason="CPU sim deadlocks on multi-PE arrays; needs a fix")
 def test_1d_cpu_sim():
     A = np.random.rand(M_1D, K_1D).astype(np.float32)
     B = np.random.rand(K_1D, N_1D).astype(np.float32)
