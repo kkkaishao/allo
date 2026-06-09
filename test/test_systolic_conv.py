@@ -105,6 +105,15 @@ def test_codegen():
     assert "top_conv_0_0" not in code
 
 
+@pytest.mark.skip(reason="CPU sim deadlocks on multi-PE arrays; needs a fix")
+def test_cpu_sim():
+    A = np.random.rand(IR, IC).astype(np.float32)
+    B = np.random.rand(FR, FC).astype(np.float32)
+    C = np.zeros((OR, OC), dtype=np.float32)
+    top.schedule().export("cpu")(A, B, C)
+    np.testing.assert_allclose(C, _ref(A, B), atol=1e-5)
+
+
 @requires_vitis
 def test_csim():
     A = np.random.rand(IR, IC).astype(np.float32)
@@ -120,9 +129,3 @@ def test_synth():
     with tempfile.TemporaryDirectory() as proj:
         report = top.schedule().export("vitis", part=PART, project_path=proj).synth()
         assert report.xml_path.exists()
-
-
-if __name__ == "__main__":
-    test_codegen()
-    test_csim()
-    test_synth()

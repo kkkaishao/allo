@@ -124,9 +124,3 @@ def test_synth():
     with tempfile.TemporaryDirectory() as proj:
         report = top.schedule().export("vitis", part=PART, project_path=proj).synth()
         assert report.xml_path.exists()
-
-
-if __name__ == "__main__":
-    test_codegen()
-    test_csim()
-    test_synth()

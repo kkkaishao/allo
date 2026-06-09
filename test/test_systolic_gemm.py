@@ -73,6 +73,14 @@ def systolic_2d(A: f32[M, K], B: f32[K, N], C: f32[M, N]):
     pe(A, B, C, fifo_A, fifo_B)
 
 
+def test_2d_cpu_sim():
+    A = np.random.rand(M, K).astype(np.float32)
+    B = np.random.rand(K, N).astype(np.float32)
+    C = np.zeros((M, N), dtype=np.float32)
+    systolic_2d.schedule().export("cpu")(A, B, C)
+    np.testing.assert_allclose(C, A @ B, atol=1e-5)
+
+
 def test_2d_codegen():
     code = systolic_2d.schedule().export("vitis").hls_code
     # Each PE is specialized into its own function; the inner compute PE keeps
@@ -158,6 +166,15 @@ def test_1d_codegen():
     assert "systolic_1d_pe_0_0" not in code
 
 
+@pytest.mark.skip(reason="CPU sim deadlocks on multi-PE arrays; needs a fix")
+def test_1d_cpu_sim():
+    A = np.random.rand(M_1D, K_1D).astype(np.float32)
+    B = np.random.rand(K_1D, N_1D).astype(np.float32)
+    C = np.zeros((M_1D, N_1D), dtype=np.float32)
+    systolic_1d.schedule().export("cpu")(A, B, C)
+    np.testing.assert_allclose(C, A @ B, atol=1e-3)
+
+
 @requires_vitis
 def test_1d_csim():
     A = np.random.rand(M_1D, K_1D).astype(np.float32)
@@ -175,12 +192,3 @@ def test_1d_synth():
             systolic_1d.schedule().export("vitis", part=PART, project_path=proj).synth()
         )
         assert report.xml_path.exists()
-
-
-if __name__ == "__main__":
-    test_2d_codegen()
-    test_2d_csim()
-    test_2d_synth()
-    test_1d_codegen()
-    test_1d_csim()
-    test_1d_synth()

@@ -471,18 +471,3 @@ def test_daisy_synth():
             .synth()
         )
         assert report.xml_path.exists()
-
-
-if __name__ == "__main__":
-    for fn in (
-        test_plain_codegen,
-        test_plain_csim,
-        test_plain_synth,
-        test_tiled_codegen,
-        test_tiled_csim,
-        test_tiled_synth,
-        test_daisy_codegen,
-        test_daisy_csim,
-        test_daisy_synth,
-    ):
-        fn()
