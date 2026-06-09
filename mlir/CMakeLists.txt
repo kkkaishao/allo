@@ -1,18 +1,6 @@
 # Copyright Allo authors. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-cmake_minimum_required(VERSION 3.20.0)
-cmake_policy(SET CMP0116 NEW)
-
-project(allo-dialect LANGUAGES CXX C)
-
-set(CMAKE_BUILD_WITH_INSTALL_NAME_DIR ON)
-
-set(CMAKE_CXX_STANDARD 17)
-set(CMAKE_CXX_STANDARD_REQUIRED ON)
-set(CMAKE_CXX_EXTENSIONS OFF)
-set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
-
 # Locate the bundled LLVM/MLIR build. Honor an explicit -DLLVM_DIR/-DMLIR_DIR,
 # else derive both from LLVM_BASE_DIR (the $LLVM_BASE_DIR env var, falling back
 # to the in-tree externals build).
@@ -21,7 +9,7 @@ if(NOT DEFINED LLVM_DIR OR NOT DEFINED MLIR_DIR)
     if(DEFINED ENV{LLVM_BASE_DIR})
       set(LLVM_BASE_DIR "$ENV{LLVM_BASE_DIR}")
     else()
-      set(LLVM_BASE_DIR "${PROJECT_SOURCE_DIR}/../externals/llvm-project/build")
+      set(LLVM_BASE_DIR "${PROJECT_SOURCE_DIR}/externals/llvm-project/build")
     endif()
   endif()
   if(NOT EXISTS "${LLVM_BASE_DIR}/lib/cmake/mlir")
@@ -48,8 +36,8 @@ include(HandleLLVMOptions)
 
 include_directories(${LLVM_INCLUDE_DIRS})
 include_directories(${MLIR_INCLUDE_DIRS})
-include_directories(${PROJECT_SOURCE_DIR}/include)
-include_directories(${PROJECT_BINARY_DIR}/include)
+include_directories(${CMAKE_CURRENT_BINARY_DIR}/include)
+include_directories(${CMAKE_CURRENT_SOURCE_DIR}/include)
 add_definitions(${LLVM_DEFINITIONS})
 
 message(STATUS "Using Python binding")

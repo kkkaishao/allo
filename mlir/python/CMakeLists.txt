@@ -11,8 +11,8 @@ include(AddMLIRPython)
 add_compile_definitions("MLIR_PYTHON_PACKAGE_PREFIX=allo._mlir.")
 
 set(ALLO_MLIR_PYTHON_ROOT_DIR "${CMAKE_CURRENT_SOURCE_DIR}/allo")
-set(ALLO_MLIR_PYTHON_SOURCE_DIR "${PROJECT_SOURCE_DIR}/lib/allo/Bindings")
-set(ALLO_MLIR_PYTHON_PACKAGE_DIR "${PROJECT_SOURCE_DIR}/../allo/_mlir")
+set(ALLO_MLIR_PYTHON_SOURCE_DIR "${PROJECT_SOURCE_DIR}/mlir/lib/allo/Bindings")
+set(ALLO_MLIR_PYTHON_PACKAGE_DIR "${PROJECT_SOURCE_DIR}/allo/_mlir")
 
 ################################################################################
 # Sources

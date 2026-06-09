@@ -5,3 +5,6 @@
 [submodule "externals/past-python-bindings"]
 	path = externals/past-python-bindings
 	url = https://github.com/cornell-zhang/past-python-bindings.git
+[submodule "externals/marl"]
+	path = externals/marl
+	url = https://github.com/google/marl
