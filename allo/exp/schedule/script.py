@@ -150,13 +150,14 @@ class TransformScript:
 
     # --- annotation -------------------------------------------------------
 
-    def _annotate(self, handle: Value, name: str, value: str) -> None:
+    def annotate_attr(self, handle: Value, name: str, attr) -> None:
         # Upstream `transform.annotate` only attaches a param's value, so wrap the
-        # static string in a `transform.param.constant` first.
-        param = t.ParamConstantOp(
-            self.any_param_type, StringAttr.get(value, self.context), **self.kw
-        ).param
+        # static attribute in a `transform.param.constant` first.
+        param = t.ParamConstantOp(self.any_param_type, attr, **self.kw).param
         t.AnnotateOp(handle, name, param=param, **self.kw)
+
+    def _annotate(self, handle: Value, name: str, value: str) -> None:
+        self.annotate_attr(handle, name, StringAttr.get(value, self.context))
 
     def annotate_key(self, handle: Value, key: str) -> None:
         self._annotate(handle, SCHEDULE_KEY_ATTR_NAME, key)

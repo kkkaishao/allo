@@ -34,7 +34,7 @@ from .model import (
 )
 from .query import Query
 from .script import TransformScript
-from ..._mlir.ir import Context, Module, Value
+from ..._mlir.ir import Context, Module, Value, IntegerAttr, IntegerType
 from ..._mlir import schedule as schedule_d
 from ..._mlir.schedule import ScheduleOpTrait
 from ..._mlir.dialects import allo as allo_d
@@ -320,14 +320,33 @@ class Schedule(Generic[P, R]):
             )
         loops = self._resolve_loop_targets(targets, "pipeline")
         self.script.set_callsite_loc()
+        ii_attr = IntegerAttr.get(IntegerType.get_signless(64), ii)
         for loop in loops:
-            ta.TagPipelineOp(self.script.match(loop.key), ii, **self.script.kw)
+            self.script.annotate_attr(
+                self.script.match(loop.key), "pipeline.ii", ii_attr
+            )
+        self._mark_dirty()
+        return self
+
+    @_within_context
+    def dataflow(self, targets: Targets = None) -> Schedule:
+        """Tag a function for task-level parallelism (``#pragma HLS dataflow``).
+
+        Defaults to the primary function. The Vitis HLS emitter turns the
+        ``dataflow`` attribute into the pragma, so the function's top-level
+        statements (e.g. the PE-grid invokes of a systolic array) run as a
+        concurrent dataflow network instead of sequentially.
+        """
+        ops = self._resolve_op_targets(targets, "dataflow")
+        self.script.set_callsite_loc()
+        for op in ops:
+            t.AnnotateOp(self._op_handle(op), "dataflow", **self.script.kw)
         self._mark_dirty()
         return self
 
     @_within_context
     def unroll(
-        self, targets: Targets = None, *, factor: int = 0, tag_only: bool = True
+        self, targets: Targets = None, *, factor: int = 0, tag_only: bool = False
     ) -> Schedule:
         self._require_int("unroll factor", factor)
         if factor < 0:
@@ -336,15 +355,18 @@ class Schedule(Generic[P, R]):
             )
         loops = self._resolve_loop_targets(targets, "unroll")
         self.script.set_callsite_loc()
+        factor_attr = IntegerAttr.get(IntegerType.get_signless(64), factor)
         for loop in loops:
-            ta.AlloLoopUnrollOp(
-                self.script.match(loop.key),
-                factor,
-                tag_only=tag_only,
-                **self.script.kw,
-            )
-            if not tag_only:
-                self.predicted.mark_approx(self._pred(loop))
+            if tag_only:
+                self.script.annotate_attr(
+                    self.script.match(loop.key), "unroll.f", factor_attr
+                )
+                continue
+            ta.AlloLoopUnrollOp(self.script.match(loop.key), factor, **self.script.kw)
+            self.predicted.mark_approx(self._pred(loop))
+            # add cleanups
+            self.canonicalize(targets=loop)
+            self.cse(targets=loop)
         self._mark_dirty()
         return self
 

@@ -183,7 +183,7 @@ def test_unroll():
                 C[i, j] = A[i, j] + B[i, j]
 
     s = add.schedule()
-    s.unroll(s.loop("j"), factor=4).apply()
+    s.unroll(s.loop("j"), factor=4, tag_only=True).apply()
     assert "unroll.f = 4 : i64" in str(s.payload)
     assert s.payload.operation.verify()
 

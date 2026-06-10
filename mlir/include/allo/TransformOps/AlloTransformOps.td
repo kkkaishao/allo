@@ -344,36 +344,6 @@ def Allo_BufferAtOp : Op<Transform_Dialect, "allo.buffer_at",
   ];
 }
 
-def Allo_TagPipelineOp : Op<Transform_Dialect, "allo.pipeline",
-  [DeclareOpInterfaceMethods<MemoryEffectsOpInterface>,
-   TransformOpInterface, TransformEachOpTrait,
-   ReportTrackingListenerFailuresOpTrait]> {
-  let summary = "Pipeline the given loop nest";
-  let description = [{
-    Input:
-      - `$loops` must resolve to loops only.
-      - `$ii` must be a positive integer.
-
-    Behavior:
-      - Tag the selected loops with the given initiation interval (II) for pipelining.
-
-    Output:
-      - No result handle; this op mutates payload IR in place.
-  }];
-  let arguments = (ins TransformHandleTypeInterface:$loop, I64Attr:$ii);
-  let results = (outs);
-  let assemblyFormat = [{
-    $loop `with` $ii attr-dict `:` type($loop)
-  }];
-  let extraClassDeclaration = [{
-    ::mlir::DiagnosedSilenceableFailure applyToOne(
-        ::mlir::transform::TransformRewriter &rewriter,
-        ::mlir::Operation *target,
-        ::mlir::transform::ApplyToEachResultList &results,
-        ::mlir::transform::TransformState &state);
-  }];
-}
-
 // name as AlloLoopUnrollOp to avoid naming conflict with existing LoopUnrollOp in other dialects
 def Allo_AlloLoopUnrollOp : Op<Transform_Dialect, "allo.unroll",
   [DeclareOpInterfaceMethods<MemoryEffectsOpInterface>,
@@ -386,18 +356,15 @@ def Allo_AlloLoopUnrollOp : Op<Transform_Dialect, "allo.unroll",
       - `$factor` must be a non-negative integer. 0 means full unroll.
 
     Behavior:
-      - With `$tag_only`, tag the selected loops with the given factor for HLS
-        unrolling.
-      - Otherwise, structurally unroll `scf.for` or `affine.for` loops.
+      - Structurally unroll `scf.for` or `affine.for` loops.
 
     Output:
       - No result handle; this op mutates payload IR in place.
   }];
-  let arguments = (ins TransformHandleTypeInterface:$loops, I64Attr:$factor,
-                   OptionalAttr<UnitAttr>:$tag_only);
+  let arguments = (ins TransformHandleTypeInterface:$loops, I64Attr:$factor);
   let results = (outs);
   let assemblyFormat = [{
-    $loops `with` $factor (`tag_only` $tag_only^)? attr-dict `:` type($loops)
+    $loops `with` $factor attr-dict `:` type($loops)
   }];
   let extraClassDeclaration = [{
     ::mlir::DiagnosedSilenceableFailure applyToOne(

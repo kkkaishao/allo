@@ -718,6 +718,14 @@ void VivadoHLSEmitter::emitMemrefAlloc(memref::AllocOp op) {
     isSigned = attr.getValue() == "s";
   emitValueDecl(op.getResult(), isSigned);
   os << ";";
+  // A local on-chip buffer may carry an `allo.part` attribute from a scheduled
+  // array_partition (e.g. reuse buffers that must feed a systolic array at full
+  // bandwidth). Emit the matching pragma -- the arg path above only covers
+  // function arguments.
+  if (auto partAttr = op->getAttrOfType<allo::PartitionAttr>("allo.part")) {
+    os << "\n";
+    emitPartitionAttr(partAttr, op.getResult());
+  }
 }
 
 void VivadoHLSEmitter::emitMemrefAlloca(memref::AllocaOp op) {

@@ -3632,32 +3632,6 @@ void transform::ReuseAtOp::getEffects(
 }
 
 ///===----------------------------------------------------------------------===///
-/// LoopPipeline implementation
-///===----------------------------------------------------------------------===///
-DiagnosedSilenceableFailure
-transform::TagPipelineOp::applyToOne(transform::TransformRewriter &rewriter,
-                                     Operation *target,
-                                     transform::ApplyToEachResultList &results,
-                                     transform::TransformState &state) {
-  if (!target || !isa<LoopLikeOpInterface>(target)) {
-    return emitSilenceableError()
-           << "expected target to resolve to exactly one loop-like operation";
-  }
-  auto ii = getIiAttr().getInt();
-  if (ii <= 0) {
-    return emitSilenceableError() << "expected ii to be a positive integer";
-  }
-  target->setAttr("pipeline.ii", getIiAttr());
-  return DiagnosedSilenceableFailure::success();
-}
-
-void transform::TagPipelineOp::getEffects(
-    SmallVectorImpl<MemoryEffects::EffectInstance> &effects) {
-  onlyReadsHandle(getLoopMutable(), effects);
-  modifiesPayload(effects);
-}
-
-///===----------------------------------------------------------------------===///
 /// LoopUnroll implementation
 ///===----------------------------------------------------------------------===///
 DiagnosedSilenceableFailure transform::AlloLoopUnrollOp::applyToOne(
@@ -3673,11 +3647,6 @@ DiagnosedSilenceableFailure transform::AlloLoopUnrollOp::applyToOne(
     return emitSilenceableError()
            << "expected unroll factor to be a non-negative "
            << "integer (0 for full unroll)";
-  }
-
-  if (getTagOnly()) {
-    target->setAttr("unroll.f", getFactorAttr());
-    return DiagnosedSilenceableFailure::success();
   }
 
   LogicalResult result = failure();
@@ -3702,10 +3671,7 @@ DiagnosedSilenceableFailure transform::AlloLoopUnrollOp::applyToOne(
 
 void transform::AlloLoopUnrollOp::getEffects(
     SmallVectorImpl<MemoryEffects::EffectInstance> &effects) {
-  if (getTagOnly())
-    onlyReadsHandle(getLoopsMutable(), effects);
-  else
-    consumesHandle(getLoopsMutable(), effects);
+  consumesHandle(getLoopsMutable(), effects);
   modifiesPayload(effects);
 }
 
