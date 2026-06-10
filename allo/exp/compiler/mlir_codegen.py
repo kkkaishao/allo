@@ -64,7 +64,7 @@ from ..lang.core import (
     constexpr,
     unwrap_if_constexpr,
     index,
-    bool,
+    bool as AlloBool,
 )
 from ..lang.operator import Operator, BoundOperator, NO_FOLD
 from ..operators import arith as arith_ops, memory as mem_ops
@@ -223,7 +223,7 @@ class MLIRCodeGenerator(ast.NodeVisitor):
         closure_scope: dict[str, object] | None = None,
         forbidden_closure_scope: dict[str, object] | None = None,
         active_kernel_calls: list[str] | None = None,
-        is_top: builtins.bool = False,
+        is_top: bool = False,
     ):
         # setup basic info
         self.context = context
@@ -337,7 +337,7 @@ class MLIRCodeGenerator(ast.NodeVisitor):
 
     @staticmethod
     def _is_python_scalar_const(val: object):
-        return isinstance(val, (builtins.int, builtins.float))
+        return isinstance(val, (builtins.int, builtins.float, builtins.bool))
 
     def _is_allowed_static_value(self, name: str, val: object):
         return (
@@ -432,9 +432,7 @@ class MLIRCodeGenerator(ast.NodeVisitor):
     def generic_visit(self, node: ast.AST):
         return self.compile_error(f"Unsupported syntax: {ast.unparse(node)}")
 
-    def visit_compound_stmts(
-        self, stmts, allow_nested_kernel_def: builtins.bool = False
-    ):
+    def visit_compound_stmts(self, stmts, allow_nested_kernel_def: bool = False):
         if not isinstance(stmts, list):
             stmts = [stmts]
         for stmt in stmts:
@@ -903,7 +901,7 @@ class MLIRCodeGenerator(ast.NodeVisitor):
         ast.GtE: arith_ops.ge,
     }
 
-    def _ast_expr_may_be_float(self, node: ast.AST) -> builtins.bool:
+    def _ast_expr_may_be_float(self, node: ast.AST) -> bool:
         if isinstance(node, ast.Constant):
             return isinstance(node.value, float)
 
@@ -1185,7 +1183,7 @@ class MLIRCodeGenerator(ast.NodeVisitor):
             value = self.visit(subnode)
             if isinstance(value, ConstexprValue):
                 # constant folding
-                bv = builtins.bool(unwrap_if_constexpr(value))
+                bv = bool(unwrap_if_constexpr(value))
                 if (bv is False) and (library_op is arith_ops.logical_and):
                     return ConstexprValue(False)
                 if (bv is True) and (library_op is arith_ops.logical_or):
@@ -1443,7 +1441,7 @@ class MLIRCodeGenerator(ast.NodeVisitor):
     def visit_IfExp(self, node: ast.IfExp):
         cond = self.visit(node.test)
         if isinstance(cond, AlloValue):
-            cond = self.builder.scalar_cast(cond, bool)
+            cond = self.builder.scalar_cast(cond, AlloBool)
             # if exp cannot define new variables
             ip, last_loc = self.builder.get_insertion_point_and_loc()
 
@@ -1516,7 +1514,7 @@ class MLIRCodeGenerator(ast.NodeVisitor):
     def visit_If(self, node: ast.If):
         cond = self.visit(node.test)
         if isinstance(cond, AlloValue):
-            cond = self.builder.scalar_cast(cond, bool)
+            cond = self.builder.scalar_cast(cond, AlloBool)
             then_has_return = self._branch_has_return(node.body)
             else_has_return = self._branch_has_return(node.orelse)
             if then_has_return or else_has_return:
@@ -2752,7 +2750,7 @@ class MLIRCodeGenerator(ast.NodeVisitor):
             )
 
         passed = unwrap_if_constexpr(self.visit(node.args[0]))
-        if not isinstance(passed, builtins.bool):
+        if not isinstance(passed, bool):
             raise NotImplementedError(
                 "Assertion condition could not be determined at compile-time. Make sure that it depends only on `constexpr` values"
             )

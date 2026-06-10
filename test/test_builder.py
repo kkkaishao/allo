@@ -391,6 +391,23 @@ def test_if_branch_local_loop_carried_value():
     _assert_contains(ir, "scf.if", "affine.for")
 
 
+def test_if_constexpr_branch():
+    dtype = f32
+
+    @kernel
+    def top(x: i32[1]):
+        if False:
+            x[0] = 1
+        elif dtype == i32:
+            x[0] = 2
+        else:
+            x[0] = 3
+
+    ir = _compile_ir(top)
+    _assert_contains(ir, "arith.constant 3")
+    assert "scf.if" not in ir
+
+
 def test_ternary_expression():
     @kernel
     def top(cond: allo_bool, x: i32, y: i32, out: i32[1]):
