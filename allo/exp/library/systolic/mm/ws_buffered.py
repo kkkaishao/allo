@@ -42,7 +42,7 @@ def make_buffered_weight_stationary_gemm(
     def load_A(A: Tin[M, K], fifo_A: Stream[Tin, depth][Kt, Nt]):
         bufA: Tin[Mc, K]  # activation block, read once and replayed across N-tiles
         for mb in range(MBLK):
-            for nt in range(NT, name="la_nt"):  # replay block across N-tiles
+            for nt in range(NT):  # replay block across N-tiles
                 for kt in range(KT):
                     for m in range(Mc, name="m"):
                         for kk in range(Kt, name="kk"):  # lane (west edge)

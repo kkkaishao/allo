@@ -29,6 +29,8 @@ Choices (all introspectable as module constants):
     - ``"direct"`` stream operands from DRAM (re-read); minimal on-chip memory.
     - ``"buffered"`` on-chip operand buffer, read-once; ``block`` bounds its size
       (``Nc`` columns for os / ``Mc`` rows for ws; defaults to the whole operand).
+    - ``"packed"`` low-bitwidth-int DSP packing (i8/i4 only): 2 columns share one
+      DSP multiply -> ~2x fewer DSPs for int8 (int4 maps to LUTs -> 0 DSP).
 * ``precision`` (:data:`PRECISIONS`): input->accumulate->output dtype combo.
 * ``config`` (:data:`CONFIGS`) or ``array=(rows, cols)``: PE-array shape. ``rows``
   tiles M (os) or K (ws); ``cols`` tiles N. So ``M % rows == 0`` (os) /
@@ -46,8 +48,10 @@ from typing import Literal
 from ....lang.core import i4, i8, i16, i32, f16, f32
 from .os_direct import make_direct_output_stationary_gemm
 from .os_buffered import make_buffered_output_stationary_gemm
+from .os_packed import make_packed_output_stationary_gemm
 from .ws_direct import make_direct_weight_stationary_gemm
 from .ws_buffered import make_buffered_weight_stationary_gemm
+from .ws_packed import make_packed_weight_stationary_gemm
 
 # PE-array presets: name -> (rows, cols). rows tiles M (os) / K (ws); cols tiles N.
 CONFIGS: dict[str, tuple] = {
@@ -56,7 +60,7 @@ CONFIGS: dict[str, tuple] = {
 }
 
 DATAFLOWS = ("os", "ws")
-VARIANTS = ("direct", "buffered")
+VARIANTS = ("direct", "buffered", "packed")
 
 # Operand-A layout each dataflow expects (B is [K,N], C is [M,N] for both).
 INPUT_LAYOUT = {
@@ -67,8 +71,10 @@ INPUT_LAYOUT = {
 _FACTORY = {
     ("os", "direct"): make_direct_output_stationary_gemm,
     ("os", "buffered"): make_buffered_output_stationary_gemm,
+    ("os", "packed"): make_packed_output_stationary_gemm,
     ("ws", "direct"): make_direct_weight_stationary_gemm,
     ("ws", "buffered"): make_buffered_weight_stationary_gemm,
+    ("ws", "packed"): make_packed_weight_stationary_gemm,
 }
 # The buffered block-size keyword each dataflow's factory takes.
 _BLOCK_KW = {"os": "Nc", "ws": "Mc"}
@@ -125,6 +131,16 @@ def make(
         if variant != "buffered":
             raise ValueError("`block` is only valid for variant='buffered'")
         kwargs[_BLOCK_KW[dataflow]] = block
+    if variant == "packed":
+        # DSP packing pairs 2 columns/DSP; only int8/int4 benefit (wider products
+        # exceed the 27-bit DSP port -> no saving). gap > product width: 2*w+2.
+        if not (Tin.is_int() and Tin.primitive_width <= 8):
+            raise ValueError(
+                "variant='packed' supports only low-bitwidth int (i8/i4); "
+                "use 'direct' for int16/float"
+            )
+        kwargs["P"] = 2
+        kwargs["G"] = 2 * Tin.primitive_width + 2
 
     _top, top_s = _FACTORY[(dataflow, variant)](
         Tin, Tacc, Tout, M, N, K, rows, cols, **kwargs
@@ -140,6 +156,8 @@ __all__ = [
     "make",
     "make_direct_output_stationary_gemm",
     "make_buffered_output_stationary_gemm",
+    "make_packed_output_stationary_gemm",
     "make_direct_weight_stationary_gemm",
     "make_buffered_weight_stationary_gemm",
+    "make_packed_weight_stationary_gemm",
 ]
