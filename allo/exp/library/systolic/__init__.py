@@ -4,5 +4,6 @@
 """Systolic-array design library."""
 
 from . import mm
+from . import conv
 
-__all__ = ["mm"]
+__all__ = ["mm", "conv"]
