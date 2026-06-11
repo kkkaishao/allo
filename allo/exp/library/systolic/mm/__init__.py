@@ -52,6 +52,7 @@ from .os_packed import make_packed_output_stationary_gemm
 from .ws_direct import make_direct_weight_stationary_gemm
 from .ws_buffered import make_buffered_weight_stationary_gemm
 from .ws_packed import make_packed_weight_stationary_gemm
+from .ws_streaming import make_weight_stationary_gemm_components
 
 # PE-array presets: name -> (rows, cols). rows tiles M (os) / K (ws); cols tiles N.
 CONFIGS: dict[str, tuple] = {
@@ -160,4 +161,5 @@ __all__ = [
     "make_direct_weight_stationary_gemm",
     "make_buffered_weight_stationary_gemm",
     "make_packed_weight_stationary_gemm",
+    "make_weight_stationary_gemm_components",
 ]
