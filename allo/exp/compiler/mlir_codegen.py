@@ -252,8 +252,7 @@ class MLIRCodeGenerator(ast.NodeVisitor):
         self._active_kernel_calls = (
             [] if active_kernel_calls is None else active_kernel_calls
         )
-        self._kernel_call_counter = 0
-        self._kernel_base_names: set[str] = set()
+        self._kernel_base_names: dict[str, int] = {}
         self._entry_function_visited = False
         self.generated_func = None
         self.name_loc_prefix = None
@@ -2334,12 +2333,13 @@ class MLIRCodeGenerator(ast.NodeVisitor):
         else:
             callee_name = fn
         base_name = f"{self.func_name}.{callee_name}"
-        call_id = self._kernel_call_counter
-        self._kernel_call_counter += 1
         if base_name in self._kernel_base_names:
-            return f"{base_name}.{call_id}"
-        self._kernel_base_names.add(base_name)
-        return base_name
+            name = f"{base_name}.{self._kernel_base_names[base_name]}"
+            self._kernel_base_names[base_name] += 1
+        else:
+            name = base_name
+            self._kernel_base_names[base_name] = 1
+        return name
 
     def _kernel_call_key(self, fn: Kernel) -> str:
         bindings = ",".join(
