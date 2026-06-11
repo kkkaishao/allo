@@ -1101,6 +1101,7 @@ void VivadoHLSEmitter::dispatch(Operation *op) {
       .Case<math::CeilOp>([&](auto op) { emitUnaryOp(op, "hls::ceil"); })
       .Case<math::TruncOp>([&](auto op) { emitUnaryOp(op, "hls::trunc"); })
       .Case<math::RoundOp>([&](auto op) { emitUnaryOp(op, "hls::round"); })
+      .Case<math::ErfOp>([&](auto op) { emitUnaryOp(op, "hls::erf"); })
 
       // cast ops
       .Case<arith::ExtSIOp>(

@@ -459,3 +459,55 @@ def _(value, acc=ConstexprValue(None)):
 @erf.build
 def _(builder: AlloOpBuilder, value, acc=ConstexprValue(None)):
     return _emit_unary_math(builder, value, acc, "erf", math.ErfOp)
+
+
+@operator
+def tanh(value, acc=ConstexprValue(None)):
+    operator_body_unreachable()
+
+
+@tanh.fold
+def _(value, acc=ConstexprValue(None)):
+    if not _fold_enabled(acc):
+        return NO_FOLD
+    if _is_const(value, 0):
+        return ConstexprValue(0)
+    return _fold_unary(value, py_math.tanh)
+
+
+@tanh.build
+def _(builder: AlloOpBuilder, value, acc=ConstexprValue(None)):
+    return _emit_unary_math(builder, value, acc, "tanh", math.TanhOp)
+
+
+@operator
+def sinh(value, acc=ConstexprValue(None)):
+    operator_body_unreachable()
+
+
+@sinh.fold
+def _(value, acc=ConstexprValue(None)):
+    if not _fold_enabled(acc):
+        return NO_FOLD
+    if _is_const(value, 0):
+        return ConstexprValue(0)
+    return _fold_unary(value, py_math.sinh)
+
+
+@sinh.build
+def _(builder: AlloOpBuilder, value, acc=ConstexprValue(None)):
+    return _emit_unary_math(builder, value, acc, "sinh", math.SinhOp)
+
+
+@operator
+def cosh(value, acc=ConstexprValue(None)):
+    operator_body_unreachable()
+
+
+@cosh.fold
+def _(value, acc=ConstexprValue(None)):
+    if not _fold_enabled(acc):
+        return NO_FOLD
+    if _is_const(value, 0):
+        return ConstexprValue(1)
+    return _fold_unary(value, py_math.cosh)
