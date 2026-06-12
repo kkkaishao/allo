@@ -35,7 +35,6 @@ from .emulation import (
     generate_impl_makefile,
     validate_impl_abi,
 )
-from .report import VitisSynthReport
 from .utils import (
     VitisTool,
     _INTERFACE_MODES,
@@ -96,6 +95,8 @@ PART_NUMBERS = {
 }
 # default to pynq-z2
 DEFAULT_PART = "xc7z020clg400-1"
+
+SYNTH_REPORT_DIR = Path("hls_prj") / "hls" / "syn" / "report"
 
 
 @dataclass(frozen=True)
@@ -407,8 +408,8 @@ class Vitis(Backend, Generic[P, R]):
         return simulator.run(*args, exist_ok=exist_ok)
 
     @terminate_on_error
-    def synth(self, *, exist_ok: bool = True) -> VitisSynthReport:
-        """Generate an HLS csyn project and invoke Vitis HLS."""
+    def synth(self, *, exist_ok: bool = True) -> Path:
+        """Generate an HLS csyn project and invoke Vitis HLS. Return the synthesis report path."""
         if not self.part:
             raise ValueError(
                 "Vitis synthesis requires a part number; pass part=... (or "
@@ -417,9 +418,7 @@ class Vitis(Backend, Generic[P, R]):
         self._require_vitis_tool()
         project_path = self.scaffold_project(exist_ok=exist_ok)
         self._invoke_csyn(project_path)
-        artifacts = self._ensure_compiled()
-        rpt = VitisSynthReport(project_path=project_path, top=artifacts.top)
-        return rpt
+        return project_path / SYNTH_REPORT_DIR
 
     @terminate_on_error
     def precheck(
