@@ -1106,3 +1106,526 @@ def test_reuse_blur_x_y_z_3d():
     mod(A, B)
     ref = A[0:6, 0:6, 0:6] + A[1:7, 1:7, 1:7] + A[2:8, 2:8, 2:8]
     np.testing.assert_array_equal(B, ref)
+
+
+# ===========================================================================
+# streamline: memory-boundary -> on-chip stream fusion
+# ===========================================================================
+
+
+def _kernel_chunk(ir, sym):
+    """The IR text of the allo.kernel @{sym} *definition* (up to the next kernel
+    def). Matches the signature line only, so an `invoke @{sym}` in another
+    kernel's body is not mistaken for the definition."""
+    for chunk in ir.split("allo.kernel"):
+        if f"@{sym}(" in chunk.split("\n", 1)[0]:
+            return chunk
+    return ""
+
+
+def _signature(chunk):
+    """The argument-list portion of a kernel chunk (before the first ')')."""
+    return chunk.split(")")[0]
+
+
+def test_streamline_passthrough():
+    # Producer writes row-major, consumer reads row-major: both sides choose
+    # PASSTHROUGH (put/get in place), so neither stage kernel allocates a buffer.
+    N = 16
+
+    @kernel
+    def src(X: f32[N, N], T: f32[N, N]):
+        for i in range(N, name="i"):
+            for j in range(N, name="j"):
+                T[i, j] = X[i, j] + 1.0
+
+    @kernel
+    def dbl(T: f32[N, N], O: f32[N, N]):
+        for i in range(N, name="i"):
+            for j in range(N, name="j"):
+                O[i, j] = T[i, j] * 2.0
+
+    @kernel
+    def top(X: f32[N, N], O: f32[N, N]):
+        T: f32[N, N]
+        src(X, T)
+        dbl(T, O)
+
+    ts = top.schedule()
+    ts.streamline("src", "dbl")
+    ts.dataflow()
+
+    ir = str(ts.payload)
+    assert "allo.stream" in ir  # the boundary was actually converted
+    assert "memref.alloc" not in _kernel_chunk(ir, "top.src")
+    assert "memref.alloc" not in _kernel_chunk(ir, "top.dbl")
+
+    mod = ts.export("cpu")
+    X = np.random.rand(N, N).astype(np.float32)
+    O = np.zeros((N, N), dtype=np.float32)
+    mod(X, O)
+    np.testing.assert_allclose(O, (X + 1.0) * 2.0, rtol=1e-4)
+
+
+def test_streamline_stage_transpose():
+    # Consumer reads T transposed -> not row-major -> it STAGES a buffer to
+    # reorder. The producer is still passthrough; the result must be correct.
+    N = 16
+
+    @kernel
+    def src(X: f32[N, N], T: f32[N, N]):
+        for i in range(N, name="i"):
+            for j in range(N, name="j"):
+                T[i, j] = X[i, j] + 1.0
+
+    @kernel
+    def trans(T: f32[N, N], O: f32[N, N]):
+        for i in range(N, name="i"):
+            for j in range(N, name="j"):
+                O[i, j] = T[j, i] * 2.0
+
+    @kernel
+    def top(X: f32[N, N], O: f32[N, N]):
+        T: f32[N, N]
+        src(X, T)
+        trans(T, O)
+
+    ts = top.schedule()
+    ts.streamline("src", "trans")
+    ts.dataflow()
+
+    ir = str(ts.payload)
+    assert "allo.stream" in ir
+    assert "memref.alloc" in _kernel_chunk(ir, "top.trans")  # staging buffer
+    assert "memref.alloc" not in _kernel_chunk(ir, "top.src")
+
+    mod = ts.export("cpu")
+    X = np.random.rand(N, N).astype(np.float32)
+    O = np.zeros((N, N), dtype=np.float32)
+    mod(X, O)
+    np.testing.assert_allclose(O, (X + 1.0).T * 2.0, rtol=1e-4)
+
+
+def test_streamline_lanes():
+    # lanes=L widens the boundary to L parallel FIFOs (!allo.stream<...,[L]>).
+    N, L = 16, 4
+
+    @kernel
+    def src(X: f32[N, N], T: f32[N, N]):
+        for i in range(N, name="i"):
+            for j in range(N, name="j"):
+                T[i, j] = X[i, j] + 1.0
+
+    @kernel
+    def dbl(T: f32[N, N], O: f32[N, N]):
+        for i in range(N, name="i"):
+            for j in range(N, name="j"):
+                O[i, j] = T[i, j] * 2.0
+
+    @kernel
+    def top(X: f32[N, N], O: f32[N, N]):
+        T: f32[N, N]
+        src(X, T)
+        dbl(T, O)
+
+    ts = top.schedule()
+    ts.streamline("src", "dbl", lanes=L)
+    ts.dataflow()
+
+    ir = str(ts.payload)
+    assert f",[{L}]>" in ir  # the stream type carries L lanes
+
+    mod = ts.export("cpu")
+    X = np.random.rand(N, N).astype(np.float32)
+    O = np.zeros((N, N), dtype=np.float32)
+    mod(X, O)
+    np.testing.assert_allclose(O, (X + 1.0) * 2.0, rtol=1e-4)
+
+
+def test_streamline_chain():
+    # 3-stage chain: streamline both boundaries; the middle kernel becomes
+    # stream-in AND stream-out (both DRAM intermediates removed).
+    N = 16
+
+    @kernel
+    def s1(X: f32[N, N], T1: f32[N, N]):
+        for i in range(N, name="i"):
+            for j in range(N, name="j"):
+                T1[i, j] = X[i, j] + 1.0
+
+    @kernel
+    def s2(T1: f32[N, N], T2: f32[N, N]):
+        for i in range(N, name="i"):
+            for j in range(N, name="j"):
+                T2[i, j] = T1[i, j] * 2.0
+
+    @kernel
+    def s3(T2: f32[N, N], O: f32[N, N]):
+        for i in range(N, name="i"):
+            for j in range(N, name="j"):
+                O[i, j] = T2[i, j] + 3.0
+
+    @kernel
+    def top(X: f32[N, N], O: f32[N, N]):
+        T1: f32[N, N]
+        T2: f32[N, N]
+        s1(X, T1)
+        s2(T1, T2)
+        s3(T2, O)
+
+    ts = top.schedule()
+    ts.streamline("s1", "s2")
+    ts.streamline("s2", "s3")
+    ts.dataflow()
+
+    ir = str(ts.payload)
+    assert _signature(_kernel_chunk(ir, "top.s2")).count("allo.stream") == 2
+
+    mod = ts.export("cpu")
+    X = np.random.rand(N, N).astype(np.float32)
+    O = np.zeros((N, N), dtype=np.float32)
+    mod(X, O)
+    np.testing.assert_allclose(O, (X + 1.0) * 2.0 + 3.0, rtol=1e-4)
+
+
+def test_streamline_fanout():
+    # One producer output T feeds TWO consumers (a residual/skip pattern). A
+    # stream can't be read twice, so a generated tee broadcasts the boundary.
+    N = 16
+
+    @kernel
+    def src(X: f32[N, N], T: f32[N, N]):
+        for i in range(N, name="i"):
+            for j in range(N, name="j"):
+                T[i, j] = X[i, j] + 1.0
+
+    @kernel
+    def c1(T: f32[N, N], O1: f32[N, N]):
+        for i in range(N, name="i"):
+            for j in range(N, name="j"):
+                O1[i, j] = T[i, j] * 2.0
+
+    @kernel
+    def c2(T: f32[N, N], O2: f32[N, N]):
+        for i in range(N, name="i"):
+            for j in range(N, name="j"):
+                O2[i, j] = T[i, j] + 3.0
+
+    @kernel
+    def top(X: f32[N, N], O1: f32[N, N], O2: f32[N, N]):
+        T: f32[N, N]
+        src(X, T)
+        c1(T, O1)
+        c2(T, O2)
+
+    ts = top.schedule()
+    ts.streamline("src", ["c1", "c2"])
+    ts.dataflow()
+
+    ir = str(ts.payload)
+    assert "streamline_tee" in ir
+    tee = _kernel_chunk(ir, "streamline_tee")
+    assert tee.count("stream.get") == 1
+    assert tee.count("stream.put") == 2  # broadcast to both consumers
+
+    mod = ts.export("cpu")
+    X = np.random.rand(N, N).astype(np.float32)
+    O1 = np.zeros((N, N), dtype=np.float32)
+    O2 = np.zeros((N, N), dtype=np.float32)
+    mod(X, O1, O2)
+    np.testing.assert_allclose(O1, (X + 1.0) * 2.0, rtol=1e-4)
+    np.testing.assert_allclose(O2, (X + 1.0) + 3.0, rtol=1e-4)
+
+
+def test_streamline_fanout_lanes():
+    # Fan-out composed with lanes: the tee broadcasts L lanes to each consumer.
+    N, L = 16, 4
+
+    @kernel
+    def src(X: f32[N, N], T: f32[N, N]):
+        for i in range(N, name="i"):
+            for j in range(N, name="j"):
+                T[i, j] = X[i, j] + 1.0
+
+    @kernel
+    def c1(T: f32[N, N], O1: f32[N, N]):
+        for i in range(N, name="i"):
+            for j in range(N, name="j"):
+                O1[i, j] = T[i, j] * 2.0
+
+    @kernel
+    def c2(T: f32[N, N], O2: f32[N, N]):
+        for i in range(N, name="i"):
+            for j in range(N, name="j"):
+                O2[i, j] = T[i, j] + 3.0
+
+    @kernel
+    def top(X: f32[N, N], O1: f32[N, N], O2: f32[N, N]):
+        T: f32[N, N]
+        src(X, T)
+        c1(T, O1)
+        c2(T, O2)
+
+    ts = top.schedule()
+    ts.streamline("src", ["c1", "c2"], lanes=L)
+    ts.dataflow()
+
+    ir = str(ts.payload)
+    assert "streamline_tee" in ir
+    assert f",[{L}]>" in ir
+    tee = _kernel_chunk(ir, "streamline_tee")
+    assert tee.count("stream.get") == L
+    assert tee.count("stream.put") == 2 * L
+
+    mod = ts.export("cpu")
+    X = np.random.rand(N, N).astype(np.float32)
+    O1 = np.zeros((N, N), dtype=np.float32)
+    O2 = np.zeros((N, N), dtype=np.float32)
+    mod(X, O1, O2)
+    np.testing.assert_allclose(O1, (X + 1.0) * 2.0, rtol=1e-4)
+    np.testing.assert_allclose(O2, (X + 1.0) + 3.0, rtol=1e-4)
+
+
+def test_streamline_depth():
+    # depth=D sets the FIFO depth of every stream the boundary creates.
+    N = 8
+
+    @kernel
+    def src(X: f32[N, N], T: f32[N, N]):
+        for i in range(N, name="i"):
+            for j in range(N, name="j"):
+                T[i, j] = X[i, j] + 1.0
+
+    @kernel
+    def dbl(T: f32[N, N], O: f32[N, N]):
+        for i in range(N, name="i"):
+            for j in range(N, name="j"):
+                O[i, j] = T[i, j] * 2.0
+
+    @kernel
+    def top(X: f32[N, N], O: f32[N, N]):
+        T: f32[N, N]
+        src(X, T)
+        dbl(T, O)
+
+    ts = top.schedule()
+    ts.streamline("src", "dbl", depth=8)
+    ts.dataflow()
+
+    ir = str(ts.payload)
+    assert "f32, 8, []" in ir or "f32,8,[]" in ir  # depth-8 FIFO type
+
+    mod = ts.export("cpu")
+    X = np.random.rand(N, N).astype(np.float32)
+    O = np.zeros((N, N), dtype=np.float32)
+    mod(X, O)
+    np.testing.assert_allclose(O, (X + 1.0) * 2.0, rtol=1e-4)
+
+
+def _build_residual(depth):
+    # A reconvergent diamond: T = src(X) fans out to `mid` and `jn`; `jn` also
+    # reads U = mid(T). So `jn` joins a short branch (T direct) and a long branch
+    # (T -> mid -> U) -- the residual/skip pattern.
+    N = 8
+
+    @kernel
+    def src(X: f32[N, N], T: f32[N, N]):
+        for i in range(N, name="i"):
+            for j in range(N, name="j"):
+                T[i, j] = X[i, j] + 1.0
+
+    @kernel
+    def mid(T: f32[N, N], U: f32[N, N]):
+        for i in range(N, name="i"):
+            for j in range(N, name="j"):
+                U[i, j] = T[i, j] * 2.0
+
+    @kernel
+    def jn(T: f32[N, N], U: f32[N, N], O: f32[N, N]):
+        for i in range(N, name="i"):
+            for j in range(N, name="j"):
+                O[i, j] = T[i, j] + U[i, j]
+
+    @kernel
+    def top(X: f32[N, N], O: f32[N, N]):
+        T: f32[N, N]
+        U: f32[N, N]
+        src(X, T)
+        mid(T, U)
+        jn(T, U, O)
+
+    ts = top.schedule()
+    ts.streamline("src", ["mid", "jn"], depth=depth)  # T fans out (tee)
+    ts.streamline("mid", "jn", depth=depth)  # U: mid -> jn, closes the diamond
+    ts.dataflow()
+    return ts, N
+
+
+def test_streamline_reconvergent_warns(capfd):
+    # A shallow FIFO on the reconvergent short branch may deadlock; streamline
+    # warns (naming the join) so the depth can be raised. Result still correct.
+    ts, N = _build_residual(depth=2)
+    ir = str(ts.payload)  # apply() runs the transform + the reconvergence check
+    text = "".join(capfd.readouterr())
+    assert "reconvergent" in text
+    assert "top.jn" in text
+
+    mod = ts.export("cpu")
+    X = np.random.rand(N, N).astype(np.float32)
+    O = np.zeros((N, N), dtype=np.float32)
+    mod(X, O)
+    np.testing.assert_allclose(O, (X + 1.0) + (X + 1.0) * 2.0, rtol=1e-4)
+
+
+def test_streamline_reconvergent_deep_no_warn(capfd):
+    # A depth >= the worst-case skew (the whole tensor) is deadlock-safe: no warn.
+    ts, N = _build_residual(depth=8 * 8)
+    ir = str(ts.payload)
+    text = "".join(capfd.readouterr())
+    assert "reconvergent" not in text
+
+    mod = ts.export("cpu")
+    X = np.random.rand(N, N).astype(np.float32)
+    O = np.zeros((N, N), dtype=np.float32)
+    mod(X, O)
+    np.testing.assert_allclose(O, (X + 1.0) + (X + 1.0) * 2.0, rtol=1e-4)
+
+
+def test_streamline_fanin():
+    # Two producers fill disjoint contiguous row-major blocks of T (top / bottom
+    # halves); one consumer reads the whole tensor. A generated `merge` kernel
+    # concatenates the blocks in order -- the fan-in pattern.
+    N = 8
+    H = N // 2
+
+    @kernel
+    def p0(X: f32[H, N], T: f32[N, N]):
+        for i in range(H, name="i"):
+            for j in range(N, name="j"):
+                T[i, j] = X[i, j] + 1.0
+
+    @kernel
+    def p1(Y: f32[H, N], T: f32[N, N]):
+        for i in range(H, name="i"):
+            for j in range(N, name="j"):
+                T[H + i, j] = Y[i, j] + 2.0
+
+    @kernel
+    def c(T: f32[N, N], O: f32[N, N]):
+        for i in range(N, name="i"):
+            for j in range(N, name="j"):
+                O[i, j] = T[i, j] * 3.0
+
+    @kernel
+    def top(X: f32[H, N], Y: f32[H, N], O: f32[N, N]):
+        T: f32[N, N]
+        p0(X, T)
+        p1(Y, T)
+        c(T, O)
+
+    ts = top.schedule()
+    ts.streamline(["p0", "p1"], "c")
+    ts.dataflow()
+
+    ir = str(ts.payload)
+    assert "streamline_merge" in ir
+    merge = _kernel_chunk(ir, "streamline_merge")
+    assert merge.count("stream.get") == 2  # one drain loop per block
+    assert merge.count("stream.put") == 2
+
+    mod = ts.export("cpu")
+    X = np.random.rand(H, N).astype(np.float32)
+    Y = np.random.rand(H, N).astype(np.float32)
+    O = np.zeros((N, N), dtype=np.float32)
+    mod(X, Y, O)
+    ref = np.empty((N, N), dtype=np.float32)
+    ref[:H] = (X + 1.0) * 3.0
+    ref[H:] = (Y + 2.0) * 3.0
+    np.testing.assert_allclose(O, ref, rtol=1e-4)
+
+
+def test_streamline_fanin_noncontiguous_errors():
+    # Column-split producers each write T[:, block] -- not contiguous in
+    # row-major order -- so fan-in cannot reconstruct the tensor by concatenating
+    # streams;
+    N = 8
+    H = N // 2
+
+    @kernel
+    def p0(X: f32[N, H], T: f32[N, N]):
+        for i in range(N, name="i"):
+            for j in range(H, name="j"):
+                T[i, j] = X[i, j] + 1.0
+
+    @kernel
+    def p1(Y: f32[N, H], T: f32[N, N]):
+        for i in range(N, name="i"):
+            for j in range(H, name="j"):
+                T[i, H + j] = Y[i, j] + 2.0
+
+    @kernel
+    def c(T: f32[N, N], O: f32[N, N]):
+        for i in range(N, name="i"):
+            for j in range(N, name="j"):
+                O[i, j] = T[i, j] * 3.0
+
+    @kernel
+    def top(X: f32[N, H], Y: f32[N, H], O: f32[N, N]):
+        T: f32[N, N]
+        p0(X, T)
+        p1(Y, T)
+        c(T, O)
+
+    ts = top.schedule()
+    ts.streamline(["p0", "p1"], "c")
+    ts.dataflow()
+
+    with pytest.raises(ScheduleTransformError):
+        ts.apply()
+
+
+def test_streamline_windowed_stencil():
+    # A 3-tap vertical stencil reads a sliding window of input rows. streamline
+    # stages only a K=3 row circular line buffer (not the full PxW tensor) and
+    # fills it just-in-time -- minimal/windowed staging for conv/stencil.
+    P, W = 16, 8
+    K = 3
+
+    @kernel
+    def src(X: f32[P, W], A: f32[P, W]):
+        for i in range(P, name="i"):
+            for j in range(W, name="j"):
+                A[i, j] = X[i, j] + 1.0
+
+    @kernel
+    def blur(A: f32[P, W], B: f32[P - 2, W]):
+        for i in range(P - 2, name="i"):
+            for j in range(W, name="j"):
+                B[i, j] = A[i, j] + A[i + 1, j] + A[i + 2, j]
+
+    @kernel
+    def top(X: f32[P, W], B: f32[P - 2, W]):
+        A: f32[P, W]
+        src(X, A)
+        blur(A, B)
+
+    ts = top.schedule()
+    ts.streamline("src", "blur")
+    ts.dataflow()
+
+    ir = str(ts.payload)
+    blur_chunk = _kernel_chunk(ir, "top.blur")
+    # the staged buffer is a K-row line buffer, not the full P rows
+    assert f"memref<{K}x{W}xf32>" in blur_chunk
+    assert f"memref<{P}x{W}xf32>" not in blur_chunk
+    assert f"mod {K}" in blur_chunk  # circular row indexing
+    # a purely vertical window fuses the fill into the compute loop: warmup
+    # (outer + inner) + one fused main (outer + inner) == 4 loops, not 5.
+    assert blur_chunk.count("affine.for") == 4
+
+    mod = ts.export("cpu")
+    X = np.random.rand(P, W).astype(np.float32)
+    B = np.zeros((P - 2, W), dtype=np.float32)
+    mod(X, B)
+    A = X + 1.0
+    np.testing.assert_allclose(B, A[: P - 2] + A[1 : P - 1] + A[2:P], rtol=1e-4)

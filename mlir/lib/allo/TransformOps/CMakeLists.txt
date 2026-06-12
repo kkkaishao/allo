@@ -5,6 +5,7 @@ add_mlir_library(MLIRAlloTransformOps
     DialectExtension.cpp
     RaiseToAffine.cpp
     LoopTransformations.cpp
+    Streamline.cpp
     Utils.cpp
 
     DEPENDS

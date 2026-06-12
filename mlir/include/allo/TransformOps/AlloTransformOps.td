@@ -437,4 +437,56 @@ def Allo_PartitionOp : Op<Transform_Dialect, "allo.partition", [
   }];
 }
 
+def Allo_StreamlineOp : Op<Transform_Dialect, "allo.streamline",
+  [AttrSizedOperandSegments,
+   DeclareOpInterfaceMethods<MemoryEffectsOpInterface>,
+   DeclareOpInterfaceMethods<TransformOpInterface>,
+   ReportTrackingListenerFailuresOpTrait]> {
+  let summary = "Convert the memory boundaries between kernels into streams";
+  let description = [{
+    Input:
+      - `$producers` and `$consumers` are `allo.invoke` handles in a common
+        parent region (a fused `top`). Each invoke's callee is resolved to its
+        (unique) kernel; pointing at the call sites rather than the kernels makes
+        the boundary -- the shared operand -- explicit.
+
+    Behavior:
+      - Discover every *memory boundary*: a memref the producer(s) only write and
+        the consumer(s) only read -- a DRAM intermediate handed between them.
+      - For each boundary, retype the matching argument on each side from
+        `memref` to `!allo.stream`, staging through an on-chip buffer only where a
+        side's access isn't whole-tensor row-major, and replace the shared memref
+        with a `stream.create` so the kernels hand off over a FIFO instead of DRAM:
+        * one producer, one consumer -- a direct hand-off;
+        * one producer, many consumers (fan-out) -- the producer writes one FIFO
+          and a generated `tee` kernel broadcasts it to one FIFO per consumer
+          (residual / skip connections);
+        * many producers, one consumer (fan-in) -- each producer writes a disjoint
+          contiguous row-major block to its own FIFO and a generated `merge`
+          kernel concatenates them in order into the consumer's FIFO.
+      - Boundaries that cannot be converted are skipped with a diagnostic
+        (argument unused, read-write aliasing, non-affine / non-load-store uses, a
+        non-static footprint, a fan-in producer that isn't a contiguous block, or
+        an unsupported many-to-many boundary). Other boundaries are still done.
+      - `$depth` sets the FIFO depth of every stream created (default 2). On a
+        *reconvergent* fork/join (e.g. a residual: one value reaching a join both
+        directly and through a longer path), the short path's FIFO must hold the
+        latency skew or the dataflow deadlocks; a too-shallow depth there is
+        flagged with a warning naming the fork and join so the depth can be set.
+
+    Output:
+      - No result handle; this op mutates payload IR in place. The `$producers`
+        and `$consumers` handles remain valid (still point at the same kernels).
+  }];
+  let arguments = (ins Variadic<TransformHandleTypeInterface>:$producers,
+                       Variadic<TransformHandleTypeInterface>:$consumers,
+                       DefaultValuedAttr<I64Attr, "1">:$lanes,
+                       DefaultValuedAttr<I64Attr, "2">:$depth);
+  let results = (outs);
+  let assemblyFormat = [{
+    `(` $producers `)` `(` $consumers `)` attr-dict
+    `:` `(` type($producers) `)` `(` type($consumers) `)`
+  }];
+}
+
 #endif // ALLO_TRANSFORM_OPS

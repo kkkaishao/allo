@@ -129,6 +129,17 @@ class TransformScript:
             **self.kw,
         ).results[0]
 
+    def match_invoke_by_callee(self, callee_symbol: str) -> Value:
+        """Match the unique ``allo.invoke`` under the primary whose callee is
+        ``callee_symbol`` (a kernel copy ``{primary}.{name}[.{id}]``)."""
+        return ts.MatchOp(
+            self.any_op_type,
+            self.root,
+            ops=["allo.invoke"],
+            op_attrs={"callee": FlatSymbolRefAttr.get(callee_symbol, self.context)},
+            **self.kw,
+        ).results[0]
+
     def match_value(self, owner_key: str, number: int, source: str) -> Value:
         # The primary function is the body's %func root; `structured.match` only
         # sees ops *nested under* it, so the function's own block arguments are

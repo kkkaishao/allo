@@ -725,6 +725,80 @@ class Schedule(Generic[P, R]):
 
     materialize = apply
 
+    def _copy_symbol(self, name: str, id=None) -> str:
+        """Callee-copy symbol for a stage kernel: ``{primary}.{name}[.{id}]``
+        (the same scheme ``compose`` uses for repeat copies)."""
+        sym = f"{self._primary_name}.{name}"
+        return sym if id is None else f"{sym}.{id}"
+
+    @_within_context
+    def streamline(
+        self,
+        producer,
+        consumer,
+        *,
+        producer_ids=None,
+        consumer_ids=None,
+        lanes: int = 1,
+        depth: int = 2,
+    ) -> Schedule:
+        """Convert the DRAM memory boundaries between stage kernels into on-chip
+        stream hand-offs (the ``to_stream`` fusion).
+
+        ``producer`` and ``consumer`` are stage kernel names (as composed), each a
+        single name or a list. One producer with several consumers fans the output
+        out through a generated ``tee`` (residual / skip connections); several
+        producers with one consumer fan in through a generated ``merge`` (each
+        producer must fill a disjoint contiguous row-major block). A ``*_ids`` list
+        (matching the names) selects specific repeat copies. Every memref the
+        producers only write and the consumers only read (a DRAM intermediate)
+        becomes a FIFO; un-convertible boundaries are skipped with a diagnostic.
+
+        ``lanes`` widens each boundary to ``L`` parallel FIFOs moving ``L``
+        elements/cycle (the bandwidth lever, for boundaries whose contiguous dim
+        ``L`` divides). ``lanes=1`` (default) uses a scalar FIFO.
+
+        ``depth`` sets the FIFO depth (default 2). On a reconvergent fork/join
+        (e.g. a residual) the short branch's FIFO must hold the latency skew or
+        the dataflow deadlocks; streamline warns and names the depth to set.
+        """
+        if not isinstance(lanes, int) or lanes <= 0:
+            raise InvalidScheduleArgumentError(
+                "streamline lanes must be a positive int"
+            )
+        if not isinstance(depth, int) or depth <= 0:
+            raise InvalidScheduleArgumentError(
+                "streamline depth must be a positive int"
+            )
+
+        def _handles(names, ids, which):
+            names = [names] if isinstance(names, str) else list(names)
+            ids = ids if isinstance(ids, (list, tuple)) else [ids] * len(names)
+            if len(ids) != len(names):
+                raise InvalidScheduleArgumentError(
+                    f"streamline {which}_ids must match the number of {which}s"
+                )
+            syms = [self._copy_symbol(n, i) for n, i in zip(names, ids)]
+            nodes = [self._resolve_copy(s) for s in syms]
+            return syms, nodes
+
+        p_syms, p_nodes = _handles(producer, producer_ids, "producer")
+        c_syms, c_nodes = _handles(consumer, consumer_ids, "consumer")
+        self.script.set_callsite_loc()
+        p_handles = [self.script.match_invoke_by_callee(s) for s in p_syms]
+        c_handles = [self.script.match_invoke_by_callee(s) for s in c_syms]
+        ta.StreamlineOp(
+            p_handles, c_handles, lanes=lanes, depth=depth, **self.script.kw
+        )
+        # streamline rewrites the callee signatures and the parent wiring, so the
+        # precise post-structure can't be predicted: mark them approximate and
+        # let reconcile rebuild from the real IR after apply().
+        for n in (*p_nodes, *c_nodes):
+            self.predicted.mark_approx(n)
+        self.predicted.mark_approx(self._primary_pred())
+        self._mark_dirty()
+        return self
+
     def compose(self, *callees: Schedule, id=None) -> Schedule:
         """Apply each ``callee``'s whole schedule to the specialized copy of that kernel
         inside this kernel. Pass several direct callees to compose them in one call:
@@ -749,9 +823,7 @@ class Schedule(Generic[P, R]):
         return self
 
     def _compose(self, callee: Schedule, id) -> None:
-        copy_key = f"{self._primary_name}.{callee._primary_name}"
-        if id is not None:
-            copy_key = f"{copy_key}.{id}"
+        copy_key = self._copy_symbol(callee._primary_name, id)
         # Resolve the top-level copy up front so a missing callee always reports, even
         # when the callee schedule is empty (no includes to iterate below).
         self._resolve_copy(copy_key)
