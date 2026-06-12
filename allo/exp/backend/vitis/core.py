@@ -705,7 +705,7 @@ class Vitis(Backend, Generic[P, R]):
         if apint_wrapper:
             run_pipeline(
                 module,
-                "builtin.module(materialize-apint-wrapper{"
+                "builtin.module(generate-apint-wrapper{"
                 f"top={self.kernel.func_name}}})",
             )
         run_pipeline(module, HLS_PREPARE_PIPELINE)

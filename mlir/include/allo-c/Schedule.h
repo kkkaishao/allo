@@ -27,6 +27,13 @@ MLIR_CAPI_EXPORTED void
 alloCollectScheduleSnapshotJSON(MlirModule module, MlirStringCallback callback,
                                 void *userData);
 
+MLIR_CAPI_EXPORTED constexpr const char *kScheduleIdAttr = "allo.schedule.id";
+MLIR_CAPI_EXPORTED constexpr const char *kScheduleNameAttr =
+    "allo.schedule.name";
+MLIR_CAPI_EXPORTED constexpr const char *kPipelineIIAttr = "allo.pipeline.ii";
+MLIR_CAPI_EXPORTED constexpr const char *kDataflowAttr = "allo.dataflow";
+MLIR_CAPI_EXPORTED constexpr const char *kUnrollFactorAttr = "allo.unroll.f";
+
 #ifdef __cplusplus
 }
 #endif

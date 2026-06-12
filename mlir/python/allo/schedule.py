@@ -13,8 +13,11 @@ from enum import IntFlag
 
 from ._mlir_libs._allo import schedule as _schedule
 
-SCHEDULE_ID_ATTR_NAME = "allo.schedule.id"
-SCHEDULE_NAME_ATTR_NAME = "allo.schedule.name"
+SCHEDULE_NAME_ATTR_NAME = _schedule.SCHEDULE_NAME_ATTR_NAME
+SCHEDULE_ID_ATTR_NAME = _schedule.SCHEDULE_ID_ATTR_NAME
+PIPELINE_II_ATTR_NAME = _schedule.PIPELINE_II_ATTR_NAME
+DATAFLOW_ATTR_NAME = _schedule.DATAFLOW_ATTR_NAME
+UNROLL_FACTOR_ATTR_NAME = _schedule.UNROLL_FACTOR_ATTR_NAME
 
 
 class ScheduleOpTrait(IntFlag):

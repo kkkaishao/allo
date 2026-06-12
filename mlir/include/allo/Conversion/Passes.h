@@ -17,6 +17,8 @@ namespace mlir::allo {
 void populateLowerToLLVMPipeline(OpPassManager &pm, bool enableTensor);
 void registerAlloLLVMLoweringPipeline();
 
+constexpr llvm::StringLiteral kAlloDataflowPEAttrName = "allo.dataflow.pe";
+
 } // namespace mlir::allo
 
 #endif // ALLO_CONVERSION_PASSES_H

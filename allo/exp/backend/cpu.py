@@ -344,7 +344,7 @@ class CPU(Backend, Generic[P, R]):
             # before set_top_llvm_c_wrapper so the wrapper takes the public name.
             run_pipeline(
                 self.module,
-                "builtin.module(materialize-apint-wrapper{"
+                "builtin.module(generate-apint-wrapper{"
                 f"top={self.kernel.func_name}}})",
             )
             if not set_top_llvm_c_wrapper(self.module, self.kernel.func_name):

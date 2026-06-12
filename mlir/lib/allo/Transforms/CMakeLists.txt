@@ -6,7 +6,7 @@ add_mlir_library(MLIRAlloTransforms
     GridMapping.cpp
     DataflowSpawn.cpp
     ReuseCleanup.cpp
-    MaterializeApintWrapper.cpp
+    GenerateApintWrapper.cpp
 
     DEPENDS
     MLIRAlloIncGen

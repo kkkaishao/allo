@@ -15,6 +15,8 @@ namespace mlir::allo {
 #define GEN_PASS_REGISTRATION
 #include "allo/Transforms/Passes.h.inc"
 
+constexpr llvm::StringLiteral kAlloSignedAttrName = "allo.signed";
+
 } // namespace mlir::allo
 
 #endif // ALLO_TRANSFORMS_PASSES_H

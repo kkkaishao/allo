@@ -114,9 +114,9 @@ static InvokeOp convertOutlinedCallToInvoke(RewriterBase &rewriter,
   auto invoke =
       InvokeOp::create(rewriter, call.getLoc(), kernel, call.getOperands());
   if (auto argAttrs = call.getArgAttrsAttr())
-    invoke->setAttr("arg_attrs", argAttrs);
+    invoke->setAttr(invoke.getArgAttrsAttrName(), argAttrs);
   if (auto resAttrs = call.getResAttrsAttr())
-    invoke->setAttr("res_attrs", resAttrs);
+    invoke->setAttr(invoke.getResAttrsAttrName(), resAttrs);
   rewriter.replaceOp(call, invoke.getResults());
   return invoke;
 }

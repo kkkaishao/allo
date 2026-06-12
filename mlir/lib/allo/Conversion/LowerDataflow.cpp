@@ -224,7 +224,7 @@ static void markDataflowPEs(ModuleOp module) {
       return;
     if (auto callee =
             module.lookupSymbol<KernelOp>(invoke.getCalleeAttr().getAttr()))
-      callee->setAttr("allo.dataflow.pe", marker);
+      callee->setAttr(kAlloDataflowPEAttrName, marker);
   });
 }
 

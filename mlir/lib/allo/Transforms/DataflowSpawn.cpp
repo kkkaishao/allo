@@ -3,6 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+#include "allo/Conversion/Passes.h"
 #include "allo/Transforms/Passes.h"
 
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
@@ -20,6 +21,10 @@ using namespace mlir;
 using namespace mlir::allo;
 
 namespace {
+constexpr llvm::StringLiteral kAlloDataflowSpawnFnName = "allo_df_spawn";
+constexpr llvm::StringLiteral kAlloDataflowJoinFnName = "allo_df_join";
+constexpr llvm::StringLiteral kAlloDataflowOpenFnName = "allo_df_open";
+constexpr llvm::StringLiteral kAlloDataflowCloseFnName = "allo_df_close";
 // Rewrites the (already LLVM-lowered) sequential calls to dataflow PEs into
 // concurrent fiber spawns onto the marl runtime:
 //
@@ -37,7 +42,6 @@ namespace {
 // alive until the fibers finish.
 struct DataflowSpawnPass
     : public allo::impl::DataflowSpawnPassBase<DataflowSpawnPass> {
-  static constexpr StringLiteral kPEAttr = "allo.dataflow.pe";
 
   void runOnOperation() override {
     ModuleOp module = getOperation();
@@ -52,14 +56,14 @@ struct DataflowSpawnPass
         if (!callee)
           return;
         auto fn = module.lookupSymbol<LLVM::LLVMFuncOp>(*callee);
-        if (fn && fn->hasAttr(kPEAttr))
+        if (fn && fn->hasAttr(kAlloDataflowPEAttrName))
           peCalls.push_back(call);
       });
       if (!peCalls.empty())
         lowerRegion(r, module, peCalls);
     }
     for (LLVM::LLVMFuncOp func : funcs)
-      func->removeAttr(kPEAttr);
+      func->removeAttr(kAlloDataflowPEAttrName);
   }
 
   LLVM::LLVMFuncOp getRuntimeFunc(ModuleOp module, StringRef name,
@@ -106,14 +110,14 @@ struct DataflowSpawnPass
     auto ptrTy = LLVM::LLVMPointerType::get(ctx);
     auto i64Ty = IntegerType::get(ctx, 64);
     auto voidTy = LLVM::LLVMVoidType::get(ctx);
-    auto openFn = getRuntimeFunc(module, "allo_df_open",
+    auto openFn = getRuntimeFunc(module, kAlloDataflowOpenFnName,
                                  LLVM::LLVMFunctionType::get(ptrTy, {i64Ty}));
     auto spawnFn = getRuntimeFunc(
-        module, "allo_df_spawn",
+        module, kAlloDataflowSpawnFnName,
         LLVM::LLVMFunctionType::get(voidTy, {ptrTy, ptrTy, ptrTy}));
-    auto joinFn = getRuntimeFunc(module, "allo_df_join",
+    auto joinFn = getRuntimeFunc(module, kAlloDataflowJoinFnName,
                                  LLVM::LLVMFunctionType::get(voidTy, {ptrTy}));
-    auto closeFn = getRuntimeFunc(module, "allo_df_close",
+    auto closeFn = getRuntimeFunc(module, kAlloDataflowCloseFnName,
                                   LLVM::LLVMFunctionType::get(voidTy, {ptrTy}));
 
     LLVM::CallOp first = peCalls.front();

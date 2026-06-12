@@ -36,7 +36,12 @@ from .query import Query
 from .script import TransformScript
 from ..._mlir.ir import Context, Module, Value, IntegerAttr, IntegerType
 from ..._mlir import schedule as schedule_d
-from ..._mlir.schedule import ScheduleOpTrait
+from ..._mlir.schedule import (
+    ScheduleOpTrait,
+    PIPELINE_II_ATTR_NAME,
+    UNROLL_FACTOR_ATTR_NAME,
+    DATAFLOW_ATTR_NAME,
+)
 from ..._mlir.dialects import allo as allo_d
 from ..._mlir.dialects import transform as t
 from ..._mlir.dialects.transform import allo as ta
@@ -323,7 +328,7 @@ class Schedule(Generic[P, R]):
         ii_attr = IntegerAttr.get(IntegerType.get_signless(64), ii)
         for loop in loops:
             self.script.annotate_attr(
-                self.script.match(loop.key), "pipeline.ii", ii_attr
+                self.script.match(loop.key), PIPELINE_II_ATTR_NAME, ii_attr
             )
         self._mark_dirty()
         return self
@@ -340,7 +345,7 @@ class Schedule(Generic[P, R]):
         ops = self._resolve_op_targets(targets, "dataflow")
         self.script.set_callsite_loc()
         for op in ops:
-            t.AnnotateOp(self._op_handle(op), "dataflow", **self.script.kw)
+            t.AnnotateOp(self._op_handle(op), DATAFLOW_ATTR_NAME, **self.script.kw)
         self._mark_dirty()
         return self
 
@@ -359,7 +364,7 @@ class Schedule(Generic[P, R]):
         for loop in loops:
             if tag_only:
                 self.script.annotate_attr(
-                    self.script.match(loop.key), "unroll.f", factor_attr
+                    self.script.match(loop.key), UNROLL_FACTOR_ATTR_NAME, factor_attr
                 )
                 continue
             ta.AlloLoopUnrollOp(self.script.match(loop.key), factor, **self.script.kw)

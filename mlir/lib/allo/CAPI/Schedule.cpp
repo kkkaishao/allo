@@ -28,9 +28,6 @@
 
 using namespace mlir;
 
-static constexpr llvm::StringLiteral kScheduleIdAttr = "allo.schedule.id";
-static constexpr llvm::StringLiteral kScheduleNameAttr = "allo.schedule.name";
-
 // Keep in sync with the ScheduleOpTrait IntFlag mirrored on the Python side.
 enum ScheduleOpTrait : uint64_t {
   ScheduleOpTraitLoopLike = 1ULL << 0,

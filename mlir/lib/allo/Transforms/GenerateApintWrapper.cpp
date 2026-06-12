@@ -25,7 +25,7 @@
 #include "mlir/IR/BuiltinTypes.h"
 
 namespace mlir::allo {
-#define GEN_PASS_DEF_MATERIALIZEAPINTWRAPPERPASS
+#define GEN_PASS_DEF_GENERATEAPINTWRAPPERPASS
 #include "allo/Transforms/Passes.h.inc"
 } // namespace mlir::allo
 
@@ -82,7 +82,7 @@ static Type boundaryType(Type t, bool &changed) {
 // signed, 'u' unsigned, 'x' non-integer. Missing/short markers default to
 // unsigned.
 static bool operandIsSigned(KernelOp kernel, unsigned idx) {
-  auto attr = kernel->getAttrOfType<StringAttr>("allo.signed");
+  auto attr = kernel->getAttrOfType<StringAttr>(kAlloSignedAttrName);
   if (!attr)
     return false;
   StringRef marker = attr.getValue();
@@ -115,9 +115,9 @@ static void buildCopyLoop(OpBuilder &b, Location loc, Value src, Value dst,
 }
 
 struct MaterializeApintWrapperPass
-    : public allo::impl::MaterializeApintWrapperPassBase<
+    : public allo::impl::GenerateApintWrapperPassBase<
           MaterializeApintWrapperPass> {
-  using MaterializeApintWrapperPassBase::MaterializeApintWrapperPassBase;
+  using GenerateApintWrapperPassBase::GenerateApintWrapperPassBase;
 
   void runOnOperation() override {
     ModuleOp module = getOperation();
@@ -164,8 +164,8 @@ struct MaterializeApintWrapperPass
         TypeAttr::get(FunctionType::get(ctx, stdInputs, stdResults)),
         b.getStringAttr("public"), /*arg_attrs=*/nullptr,
         /*res_attrs=*/nullptr, b.getDenseI32ArrayAttr({}));
-    if (auto marker = top->getAttrOfType<StringAttr>("allo.signed"))
-      wrapper->setAttr("allo.signed", marker);
+    if (auto marker = top->getAttrOfType<StringAttr>(kAlloSignedAttrName))
+      wrapper->setAttr(kAlloSignedAttrName, marker);
 
     SmallVector<Location> argLocs(stdInputs.size(), loc);
     Block *entry = b.createBlock(&wrapper.getBody(), wrapper.getBody().end(),
@@ -190,7 +190,7 @@ struct MaterializeApintWrapperPass
         auto alloc = memref::AllocOp::create(b, loc, mr);
         // Tag the temp so the emitter renders its element type with the same
         // signedness as the callee parameter it feeds.
-        alloc->setAttr("allo.signed", b.getStringAttr(sgn ? "s" : "u"));
+        alloc->setAttr(kAlloSignedAttrName, b.getStringAttr(sgn ? "s" : "u"));
         Value tmp = alloc.getResult();
         buildCopyLoop(b, loc, stdArg, tmp, /*toApint=*/true,
                       /*isSigned=*/false);

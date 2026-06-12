@@ -107,9 +107,15 @@ NB_MODULE(_allo, m) {
       nb::arg("module"),
       "Return the schedule snapshot as a JSON document (parse on the Python "
       "side).");
+  schedule.attr("SCHEDULE_ID_ATTR_NAME") = kScheduleIdAttr;
+  schedule.attr("SCHEDULE_NAME_ATTR_NAME") = kScheduleNameAttr;
+  schedule.attr("PIPELINE_II_ATTR_NAME") = kPipelineIIAttr;
+  schedule.attr("DATAFLOW_ATTR_NAME") = kDataflowAttr;
+  schedule.attr("UNROLL_FACTOR_ATTR_NAME") = kUnrollFactorAttr;
 
   //===--------------------------------------------------------------------===//
-  // ir_ext: block surgery + KernelOp helpers not exposed by upstream bindings
+  // ir_ext: block surgery + KernelOp helpers not exposed by upstream
+  // bindings
   //===--------------------------------------------------------------------===//
   auto ir_ext = m.def_submodule("ir_ext", "IR mutation helpers");
   ir_ext.def(

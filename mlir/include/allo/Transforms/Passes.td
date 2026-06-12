@@ -48,8 +48,8 @@ def ReuseCleanupPass : Pass<"reuse-cleanup", "ModuleOp"> {
   let dependentDialects = ["affine::AffineDialect"];
 }
 
-def MaterializeApintWrapperPass
-    : Pass<"materialize-apint-wrapper", "ModuleOp"> {
+def GenerateApintWrapperPass
+    : Pass<"generate-apint-wrapper", "ModuleOp"> {
   let summary = "Wrap an APInt-boundary top kernel with a std-width interface";
   let description = [{
     For a top kernel whose arguments/results use non-standard-width integers

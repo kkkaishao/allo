@@ -3,6 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+#include "allo-c/Schedule.h"
 #include "mlir/IR/IntegerSet.h"
 #include "mlir/Tools/mlir-translate/Translation.h"
 #include "llvm/ADT/StringExtras.h"
@@ -218,7 +219,7 @@ void VivadoHLSEmitter::emitFunctionArguments(func::FuncOp func) {
 }
 
 void VivadoHLSEmitter::emitFunctionDirectives(func::FuncOp func) {
-  if (func->hasAttr("dataflow")) {
+  if (func->hasAttr(kDataflowAttr)) {
     state.os.indent(state.currentIndent);
     state.os << "#pragma HLS dataflow\n";
   }
@@ -346,7 +347,7 @@ void VivadoHLSEmitter::emitAffineFor(affine::AffineForOp op) {
 }
 
 void VivadoHLSEmitter::emitLoopDirectives(Operation *op) {
-  if (auto unrollAttr = op->getAttrOfType<IntegerAttr>("unroll.f")) {
+  if (auto unrollAttr = op->getAttrOfType<IntegerAttr>(kUnrollFactorAttr)) {
     int64_t unrollFactor = unrollAttr.getInt();
     state.os.indent(state.currentIndent);
     if (unrollFactor == 0)
@@ -354,7 +355,7 @@ void VivadoHLSEmitter::emitLoopDirectives(Operation *op) {
     else
       state.os << "#pragma HLS unroll factor=" << unrollFactor << "\n";
   }
-  if (auto pipelineAttr = op->getAttrOfType<IntegerAttr>("pipeline.ii")) {
+  if (auto pipelineAttr = op->getAttrOfType<IntegerAttr>(kPipelineIIAttr)) {
     int64_t ii = pipelineAttr.getInt();
     state.os.indent(state.currentIndent);
     state.os << "#pragma HLS pipeline II=" << ii << "\n";

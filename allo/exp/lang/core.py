@@ -165,7 +165,7 @@ def widen_apint_to_std(dtype: "DType") -> "DType":
 
     Host marshalling (numpy/ctypes) cannot represent arbitrary integer widths, so
     the backends widen the boundary to a standard width. This mirrors the
-    ``materialize-apint-wrapper`` MLIR pass exactly so the host view matches the
+    ``generate-apint-wrapper`` MLIR pass exactly so the host view matches the
     wrapper's ABI. Widths > 64 are unsupported at the boundary.
     """
     if not isinstance(dtype, APInt):
