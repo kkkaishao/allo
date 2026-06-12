@@ -31,6 +31,11 @@ Choices (all introspectable as module constants):
       (``Nc`` columns for os / ``Mc`` rows for ws; defaults to the whole operand).
     - ``"packed"`` low-bitwidth-int DSP packing (i8/i4 only): 2 columns share one
       DSP multiply -> ~2x fewer DSPs for int8 (int4 maps to LUTs -> 0 DSP).
+    - ``"dequant"`` weight-only group quantization (W4A16 / W8A16, ws only): int
+      ``weight_dtype`` (i4/i8) weights grouped along K (``group_size``) with f16/f32
+      scale + zero-point; activations stay float. ``load_W`` dequantizes -> the
+      float ws array runs (dequant ~free), cutting weight DRAM 4x/2x -- the lever
+      for memory-bound decode. Takes extra args ``Sc[K/gs,N]``, ``Z[K/gs,N]``.
 * ``precision`` (:data:`PRECISIONS`): input->accumulate->output dtype combo.
 * ``config`` (:data:`CONFIGS`) or ``array=(rows, cols)``: PE-array shape. ``rows``
   tiles M (os) or K (ws); ``cols`` tiles N. So ``M % rows == 0`` (os) /
@@ -52,7 +57,11 @@ from .os_packed import make_packed_output_stationary_gemm
 from .ws_direct import make_direct_weight_stationary_gemm
 from .ws_buffered import make_buffered_weight_stationary_gemm
 from .ws_packed import make_packed_weight_stationary_gemm
-from .ws_streaming import make_weight_stationary_gemm_components
+from .ws_dequant import make_dequant_weight_stationary_gemm
+from .ws_streaming import (
+    make_weight_stationary_gemm_components,
+    make_dequant_weight_stationary_gemm_components,
+)
 
 # PE-array presets: name -> (rows, cols). rows tiles M (os) / K (ws); cols tiles N.
 CONFIGS: dict[str, tuple] = {
@@ -61,7 +70,7 @@ CONFIGS: dict[str, tuple] = {
 }
 
 DATAFLOWS = ("os", "ws")
-VARIANTS = ("direct", "buffered", "packed")
+VARIANTS = ("direct", "buffered", "packed", "dequant")
 
 # Operand-A layout each dataflow expects (B is [K,N], C is [M,N] for both).
 INPUT_LAYOUT = {
@@ -90,10 +99,12 @@ def make(
     K,
     *,
     dataflow: Literal["os", "ws"] = "os",
-    variant: Literal["direct", "buffered"] = "direct",
+    variant: Literal["direct", "buffered", "packed", "dequant"] = "direct",
     config: Literal["balanced", "performance"] = "performance",
     array: tuple[int, ...] | None = None,
     block: int | None = None,
+    weight_dtype=None,
+    group_size: int | None = None,
     depth=2,
     ii=1,
 ):
@@ -126,6 +137,30 @@ def make(
             raise ValueError(f"unknown config {config!r}; choose from {list(CONFIGS)}")
         array = CONFIGS[config]
     rows, cols = array
+
+    if variant == "dequant":
+        # weight-only group quant: distinct signature (Tw weights + Sc/Z groups), so
+        # route directly instead of through _FACTORY. Weight-stationary only.
+        if dataflow != "ws":
+            raise ValueError("variant='dequant' is weight-stationary only")
+        if weight_dtype is None or group_size is None:
+            raise ValueError(
+                "variant='dequant' requires weight_dtype (i4/i8) and group_size"
+            )
+        return make_dequant_weight_stationary_gemm(
+            Tin,
+            Tacc,
+            Tout,
+            weight_dtype,
+            M,
+            N,
+            K,
+            rows,
+            cols,
+            group_size,
+            depth=depth,
+            ii=ii,
+        )
 
     kwargs = {"depth": depth, "ii": ii}
     if block is not None:
@@ -161,5 +196,7 @@ __all__ = [
     "make_direct_weight_stationary_gemm",
     "make_buffered_weight_stationary_gemm",
     "make_packed_weight_stationary_gemm",
+    "make_dequant_weight_stationary_gemm",
     "make_weight_stationary_gemm_components",
+    "make_dequant_weight_stationary_gemm_components",
 ]
