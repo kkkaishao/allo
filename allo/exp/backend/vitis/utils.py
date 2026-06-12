@@ -70,13 +70,14 @@ def _render_template(name: str, **kwargs) -> str:
     return (TEMPLATE_DIR / name).read_text(encoding="utf-8").format(**kwargs)
 
 
-def generate_run_tcl(top: str, part: str, freq_mhz: float, flow_target: str) -> str:
+def generate_hls_cfg(top: str, part: str, freq_mhz: float, flow_target: str) -> str:
+    """Render the ``hls.cfg`` config consumed by ``v++ -c --mode hls`` for the
+    standalone C-synthesis (csynth) flow."""
     clock_period = 1000.0 / freq_mhz
     return _render_template(
-        "run.tcl",
+        "hls.cfg",
         top=top,
         part=part,
-        freq_mhz=freq_mhz,
         flow_target=flow_target,
         clock_period=clock_period,
     )

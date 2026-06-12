@@ -27,6 +27,14 @@ from .csim import (
     _generate_csim_makefile,
     discover_csim,
 )
+from .emulation import (
+    HOST_CPP,
+    IMPL_MAKEFILE,
+    VitisEmulator,
+    generate_impl_host,
+    generate_impl_makefile,
+    validate_impl_abi,
+)
 from .report import VitisSynthReport
 from .utils import (
     VitisTool,
@@ -34,8 +42,8 @@ from .utils import (
     _add_extern_c_to_top,
     _apply_interface_pragmas,
     detect_vitis_tool,
+    generate_hls_cfg,
     generate_kernel_header,
-    generate_run_tcl,
     _is_stream_type,
     _log_synth_failure,
     _log_synth_note,
@@ -49,7 +57,7 @@ from ...._mlir.dialects.allo import emit_vivado_hls
 from ...._mlir._mlir_libs._allo import ir_ext
 from ...lang.core import BufferType, ShapedType, TypeBase
 from ...lang.kernel import Kernel
-from ...logging import run_command, stage, terminate_on_error
+from ...logging import log_info, log_warning, run_command, stage, terminate_on_error
 
 VitisMode = Literal["csim", "csyn", "sw_emu", "hw_emu", "hw"]
 FlowTarget = Literal["vitis", "vivado"]
@@ -371,6 +379,17 @@ class Vitis(Backend, Generic[P, R]):
             )
         if mode == "csim":
             return self.csim(*args, exist_ok=exist_ok)
+        if mode == "sw_emu":
+            # sw_emu has no independent meaning (it runs the kernel C on x86,
+            # exactly like csim) and is removed in Vitis 2025.1+, so route it to
+            # the Python-native C simulation.
+            log_warning(
+                "Vitis sw_emu is deprecated (removed in 2025.1+); running C "
+                "simulation (csim) instead."
+            )
+            return self.csim(*args, exist_ok=exist_ok)
+        if mode in ("hw_emu", "hw"):
+            return self._run_impl(mode, args, exist_ok=exist_ok)
         if args:
             raise TypeError("Vitis csyn does not accept runtime arguments")
         if mode == "csyn":
@@ -403,6 +422,63 @@ class Vitis(Backend, Generic[P, R]):
         return rpt
 
     @terminate_on_error
+    def precheck(
+        self, mode: VitisMode, project: str | None = None, *, exist_ok: bool = True
+    ) -> Path:
+        """Scaffold and run the fast emulation/hardware pre-check (kernel ``.xo`` +
+        XRT host, plus emconfig for emulation) without the multi-hour, platform-
+        locked link step. Validates that the frontend produced a buildable
+        project; returns the project directory."""
+        if mode not in ("hw_emu", "hw"):
+            raise ValueError("Vitis precheck supports only 'hw_emu' and 'hw'")
+        self._validate_impl_abi()
+        self._require_vitis_tool()
+        project_path = self.scaffold_project(project, exist_ok=exist_ok)
+        self._get_emulator(project_path).precheck(mode)
+        log_info(f"Vitis {mode} pre-check passed")
+        return project_path
+
+    @terminate_on_error
+    def _run_impl(
+        self, mode: VitisMode, args: tuple, *, exist_ok: bool = True
+    ) -> Path | None:
+        self._validate_impl_abi()
+        self._require_vitis_tool()
+        project_path = self.scaffold_project(exist_ok=exist_ok)
+        emulator = self._get_emulator(project_path)
+        if mode == "hw":
+            if args:
+                raise TypeError(
+                    "Vitis hw mode does not execute on the host; pass no runtime "
+                    "arguments (use precheck()/build() instead)."
+                )
+            return emulator.build("hw")
+        emulator.run(mode, *args)
+        return None
+
+    def _get_emulator(self, project_path: Path) -> VitisEmulator:
+        return VitisEmulator(
+            top=self.kernel.func_name,
+            project_path=project_path,
+            env=self._get_vitis_env(),
+            arg_types=self.kernel.parse_argument_annotations(),
+            res_types=self.kernel.parse_return_annotation(),
+        )
+
+    def _validate_impl_abi(self) -> None:
+        validate_impl_abi(
+            self.kernel.parse_argument_annotations(),
+            self.kernel.parse_return_annotation(),
+        )
+
+    def _impl_abi_supported(self) -> bool:
+        try:
+            self._validate_impl_abi()
+            return True
+        except Exception:
+            return False
+
+    @terminate_on_error
     def scaffold_project(
         self, project: str | None = None, *, exist_ok: bool = True
     ) -> Path:
@@ -426,13 +502,35 @@ class Vitis(Backend, Generic[P, R]):
         with stage(f"Generating Vitis HLS Project to: {project_path.resolve()}"):
             write_text_if_changed(project_path / "kernel.cpp", artifacts.kernel_cpp)
             write_text_if_changed(project_path / "kernel.h", artifacts.kernel_h)
-            write_text_if_changed(
-                project_path / "run.tcl",
-                generate_run_tcl(artifacts.top, self.part, self.freq_mhz, self.flow),
-            )
+            self._write_build_files(project_path, artifacts)
 
         self._project_path = project_path
         return project_path
+
+    def _write_build_files(
+        self, project_path: Path, artifacts: CompiledArtifacts
+    ) -> None:
+        """Emit the unified ``Makefile`` plus its inputs. ``csynth`` (part-based
+        QoR) is driven by ``hls.cfg``; emu/hw (platform-based) additionally need
+        the XRT ``host.cpp`` -- skipped when the kernel boundary can't cross to
+        the host (csynth still works)."""
+        write_text_if_changed(
+            project_path / "hls.cfg",
+            generate_hls_cfg(artifacts.top, self.part, self.freq_mhz, self.flow),
+        )
+        write_text_if_changed(
+            project_path / IMPL_MAKEFILE,
+            generate_impl_makefile(
+                artifacts.top, self.freq_mhz, self._get_vitis_root()
+            ),
+        )
+        if self._impl_abi_supported():
+            write_text_if_changed(
+                project_path / HOST_CPP,
+                generate_impl_host(
+                    artifacts.top, self.kernel.parse_argument_annotations()
+                ),
+            )
 
     def _materialize_csim_cache(self, *, exist_ok: bool = True) -> tuple[Path, str]:
         artifacts = self._compile_for_csim()
@@ -632,21 +730,7 @@ class Vitis(Backend, Generic[P, R]):
 
     def _invoke_csyn(self, project_path: Path) -> None:
         log_path = _synth_log_path(project_path)
-        if self.tool.name == "vitis-run":
-            cmd = [
-                os.fspath(self.tool.executable),
-                "--mode",
-                "hls",
-                "--tcl",
-                "--work_dir",
-                ".",
-                "run.tcl",
-            ]
-        elif self.tool.name == "vitis_hls":
-            cmd = [os.fspath(self.tool.executable), "-f", "run.tcl"]
-        else:
-            assert False, "Unknown Vitis tool detected: " + self.tool.name
-
+        cmd = ["make", "-f", IMPL_MAKEFILE, "csynth"]
         with stage(
             "Running Vitis HLS Synthesis",
             on_error=lambda error: _log_synth_failure(log_path, error),

@@ -11,7 +11,7 @@ from pathlib import Path
 
 from ...logging import log_table, terminate_on_error
 
-CSYNTH_XML = Path("hls_prj") / "solution1" / "syn" / "report" / "csynth.xml"
+CSYNTH_XML = Path("hls_prj") / "hls" / "syn" / "report" / "csynth.xml"
 MISSING = "-"
 RESOURCE_FIELDS = ("BRAM_18K", "DSP", "FF", "LUT", "URAM")
 
