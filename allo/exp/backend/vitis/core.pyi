@@ -14,18 +14,56 @@ AxiliteStorageImpl = Literal["auto", "bram", "uram"]
 VitisMode = Literal["csim", "csyn", "sw_emu", "hw_emu", "hw"]
 
 class Vitis(Generic[P, R]):
-    def __init__(self, *args: Any, **kwargs: Any) -> None: ...
-    def __call__(self, *args: P.args, **kwargs: P.kwargs) -> R: ...
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        """Wrap a compiled kernel for the Vitis HLS backend.
+
+        Normally constructed via ``Schedule.export("vitis", ...)``. Keyword
+        options: ``vitis_home`` (Vitis install dir; falls back to
+        ``$XILINX_HLS``/``$XILINX_VITIS``), ``project_path`` (where projects are
+        scaffolded), ``device`` (board name, e.g. ``"u280"``) or ``part`` (FPGA
+        part number; mutually exclusive with ``device``), ``freq_mhz`` (target
+        clock, default 300), and ``flow`` (``"vitis"`` or ``"vivado"``).
+        """
+
+    def __call__(self, *args: P.args, **kwargs: P.kwargs) -> R:
+        """Run C simulation with the given runtime arguments and return its
+        result (shorthand for ``run("csim", ...)``)."""
+
     @property
-    def hls_code(self) -> str: ...
-    def run(self, mode: VitisMode, *args: Any, exist_ok: bool = ...) -> Any: ...
-    def synth(self, *, exist_ok: bool = ...): ...
+    def hls_code(self) -> str:
+        """The emitted Vitis HLS C++ source for the top kernel."""
+
+    def run(self, mode: VitisMode, *args: Any, exist_ok: bool = ...) -> Any:
+        """Build and/or run the kernel in the requested ``mode``:
+
+        - ``"csim"``: compile and run C simulation with ``*args`` (returns its result).
+        - ``"sw_emu"``: deprecated alias for ``"csim"``.
+        - ``"csyn"``: run Vitis HLS synthesis (no runtime args); returns the report path.
+        - ``"hw_emu"``: build and run hardware emulation with ``*args``.
+        - ``"hw"``: build the hardware bitstream (no host execution).
+
+        ``exist_ok=False`` rebuilds even when cached artifacts exist.
+        """
+
+    def synth(self, *, exist_ok: bool = ...):
+        """Scaffold an HLS project, invoke Vitis HLS C synthesis, and return the
+        synthesis report directory. Requires a part number."""
+
     def precheck(
         self, mode: VitisMode, project: str | None = ..., *, exist_ok: bool = ...
-    ) -> Path: ...
+    ) -> Path:
+        """Scaffold and run the fast ``hw_emu``/``hw`` pre-check (kernel ``.xo`` +
+        XRT host, plus emconfig for emulation) without the multi-hour, platform-
+        locked link step, validating that the project is buildable. Returns the
+        project directory."""
+
     def scaffold_project(
         self, project: str | None = ..., *, exist_ok: bool = ...
-    ) -> Path: ...
+    ) -> Path:
+        """Write the HLS project files (kernel sources, Makefile, config) to
+        ``project`` (or the configured path) without invoking Vitis HLS, and
+        return the project directory."""
+
     def set_axi(
         self,
         index: int,
@@ -43,7 +81,12 @@ class Vitis(Generic[P, R]):
         alignment_byte_size: int | None = None,
         name: str | None = None,
         **kwargs: str | int | bool | None,
-    ) -> None: ...
+    ) -> None:
+        """Bind argument ``index`` to an AXI master (``m_axi``) interface with the
+        given options (``bundle``, ``depth``, ``offset``, burst lengths, ...; see
+        the Vitis HLS interface pragma). Only valid on buffer (pointer)
+        arguments."""
+
     def set_axis(
         self,
         index: int,
@@ -54,7 +97,12 @@ class Vitis(Generic[P, R]):
         name: str | None = None,
         bundle: str | None = None,
         **kwargs: str | int | bool | None,
-    ) -> None: ...
+    ) -> None:
+        """Bind stream argument ``index`` to an AXI4-Stream (``axis``) interface
+        with the given options (``register``, ``register_mode``, ``depth``, ...;
+        see the Vitis HLS interface pragma). Only valid on ``Stream``
+        arguments."""
+
     def set_axilite(
         self,
         index: int,
@@ -66,6 +114,12 @@ class Vitis(Generic[P, R]):
         offset: str | None = None,
         storage_impl: AxiliteStorageImpl | None = None,
         **kwargs: str | int | bool | None,
-    ) -> None: ...
+    ) -> None:
+        """Bind argument ``index`` (or the return value with ``index=-1``) to an
+        AXI4-Lite (``s_axilite``) slave interface, typically for control/status,
+        with the given options (``bundle``, ``register``, ``offset``,
+        ``storage_impl``, ...; see the Vitis HLS interface pragma)."""
 
-def is_vitis_available() -> bool: ...
+def is_vitis_available() -> bool:
+    """Whether a Vitis HLS toolchain can be detected. Cached, never raises and
+    emits no logs, so it is safe in ``pytest.mark.skipif`` predicates."""

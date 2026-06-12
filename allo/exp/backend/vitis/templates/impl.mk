@@ -24,7 +24,7 @@ TEMP_DIR := _x.$(TARGET).$(XSA)
 
 KERNEL_XO := $(BUILD_DIR)/$(TOP).xo
 XCLBIN := $(BUILD_DIR)/$(TOP).xclbin
-HOST_EXE := host
+HOST_EXE := host.exe
 EMCONFIG := emconfig.json
 HLS_PRJ := hls_prj
 
