@@ -1,6 +1,7 @@
 ---
 title: Allo Compiler Infrastructure
 createdAt: 2026-05-09
+order: 6
 summary: Developer guide for the new frontend code generation stack.
 keywords: ["Allo", "Compiler", "Frontend", "MLIR", "Codegen", "Operator"]
 ---
@@ -8,26 +9,30 @@ keywords: ["Allo", "Compiler", "Frontend", "MLIR", "Codegen", "Operator"]
 %toc%
 # Compiler Infrastructure
 
-This document explains the new frontend code generation stack for developers.
-The implementation currently lives under `allo/exp`, with three main layers:
+This document explains the frontend code generation stack for developers. The
+implementation has three main layers:
 
-- `allo/exp/compiler/mlir_codegen.py`: AST traversal, scopes, dispatch, and
+- `allo/compiler/mlir_codegen.py`: AST traversal, scopes, dispatch, and
   high-level lowering control.
-- `allo/exp/compiler/builder.py`: typed MLIR construction helpers and
+- `allo/compiler/builder.py`: typed MLIR construction helpers and
   user-facing diagnostics.
-- `allo/exp/operators/`: reusable operation definitions implemented with
+- `allo/operators/`: reusable operation definitions implemented with
   `operator.fold` and `operator.build`.
 
+The frontend type and value system lives in `allo/lang/core.py`; the kernel
+object, options, and the `@kernel`/`@consteval` decorators in
+`allo/lang/kernel.py`; the operator declaration machinery in
+`allo/lang/operator.py`; and the type-promotion tables in `allo/lang/rule.py`.
+
 The most important design rule is that frontend lowering keeps compile-time
-values and runtime SSA values distinct: `ConstexprValue` and `AlloValue`.
-`AlloSymbolRef` still exists in the implementation as an internal symbol proxy
-from earlier global-stream experiments, but `GStream` is not part of the current
-public frontend surface. New user-visible stream work should use local
-`StreamType` values represented by `AlloValue`.
+values and runtime SSA values distinct: `ConstexprValue` and `AlloValue`. A
+third proxy, `StatefulValue`, represents a `Stateful[T]` variable whose backing
+storage is a module-level global; it is read and written by name and never
+flows through the SSA machinery as itself.
 
 ## Value Model
 
-The frontend value system is defined in `allo/exp/lang/core.py`.
+The frontend value system is defined in `allo/lang/core.py`.
 
 `ConstexprValue` is frontend-only. It wraps a Python value that is known during
 compilation and never materializes into MLIR by itself. Examples include Python
@@ -43,6 +48,13 @@ Local streams are also `AlloValue`s. The handle is an `allo.stream.create`
 result, the frontend type is `StreamType`, and stream-array indexing stores
 normalized indices on a shallow stream proxy before `get()` or `put()` emits
 the transfer operation.
+
+`StatefulValue` backs a `Stateful[T]` declaration. Its `storage` is the
+`AlloValue` returned by `memref.get_global`, and its `type` is the logical type
+the user sees (a `DType` for a scalar state, a `BufferType` for an array state).
+Reading the name loads from the backing global and writing the name stores into
+it, so a `StatefulValue` is deliberately kept out of the SSA phi / loop
+iter-arg machinery that only tracks `AlloValue`s.
 
 ```mermaid
 flowchart LR
@@ -233,8 +245,8 @@ or `allo.stream.put`.
 
 ## Operator Layer
 
-Operators are declared with `@operator` in `allo/exp/lang/operator.py` and
-implemented under `allo/exp/operators/`. The declaration function is a signature
+Operators are declared with `@operator` in `allo/lang/operator.py` and
+implemented under `allo/operators/`. The declaration function is a signature
 only; its body should not execute.
 
 ```python
@@ -330,12 +342,14 @@ Most production operators should reuse the existing helpers in
 `operators/utils.py` instead of open-coding broadcasting or output allocation.
 
 Stream indexing and transfer are split across two focused operator modules.
-`operators/memory.py` handles subscript load/store syntax; for stream values it
-turns `fifo[i, j]` into an indexed local stream proxy and rejects assignment to
-stream references. `operators/spmw.py` implements `get()` and `put(value)`,
-validates that rank-0 streams have been materialized with empty indices and that
-stream arrays were indexed first, then delegates to the builder's stream
-helpers.
+`operators/memory.py` handles subscript load/store syntax, including scalar
+bit-slice read/write (`x[lo:hi]`); for stream values it turns `fifo[i, j]` into
+an indexed local stream proxy and rejects assignment to stream references.
+`operators/spmw.py` (single-program-multiple-worker) implements the stream
+transfers `get()` and `put(value)` plus the spatial built-ins `get_wid(axis)`
+and `get_nw(axis)` used inside `mapping=` kernels. It validates that rank-0
+streams have been materialized with empty indices and that stream arrays were
+indexed first, then delegates to the builder's stream helpers.
 
 ## Extending Codegen
 
@@ -346,9 +360,9 @@ Use this decision order when adding frontend functionality:
    `MLIRCodeGenerator`.
 3. If the feature needs a new primitive IR construction pattern, add a builder
    helper.
-4. If the feature changes type promotion, update `allo/exp/lang/rule.py`.
+4. If the feature changes type promotion, update `allo/lang/rule.py`.
 5. If the feature changes frontend types or values, update
-   `allo/exp/lang/core.py`.
+   `allo/lang/core.py`.
 
 For features that introduce named global IR objects, keep the source-level
 symbol distinct from runtime SSA values, allow only deliberate static captures,
@@ -373,7 +387,7 @@ To add an operator:
 Minimal unary math operator pattern:
 
 ```python
-from allo.exp.lang.core import f32
+from allo.lang.core import f32
 
 
 @operator

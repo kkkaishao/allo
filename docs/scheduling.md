@@ -1,313 +1,487 @@
 ---
 title: Allo Scheduling
-createdAt: 2026-05-25
-summary: User and developer guide for the experimental Allo schedule frontend.
+createdAt: 2026-06-13
+order: 3
+summary: Reference for the Allo schedule API — selection, transform primitives, composition, streaming, and export.
 keywords: ["Allo", "Scheduling", "Schedule", "Transform", "MLIR"]
 ---
 
 %toc%
 # Scheduling
 
-This document describes the experimental schedule frontend under
-`allo.exp.schedule`. The scheduler works on MLIR modules and builds transform
-scripts against stable operation and value references. For normal frontend use,
-construct a schedule from a kernel with `kernel.schedule()`.
+A `Schedule` decouples the *algorithm* (what a kernel computes) from the
+*schedule* (how it is mapped to hardware). It operates on the MLIR module
+produced by a kernel and builds a transform-dialect script against stable
+operation and value references. Calling `kernel.schedule()` compiles the kernel
+and returns a `Schedule` bound to it.
 
 ```python
-from allo.exp.lang.core import i32, range
-from allo.exp.lang.kernel import kernel
-
+from allo.lang import i32, kernel, range
 
 @kernel
-def top(A: "i32[16]", B: "i32[16]"):
+def top(A: i32[16], B: i32[16]):
     for i in range(16, name="i"):
         B[i] = A[i] + 1
 
-
 s = top.schedule()
 i = s.loop("i")
-
-s.pipeline(i, ii=2).unroll(i, factor=4).apply()
+outer, inner = s.split(i, factor=4)
+s.pipeline(inner, ii=1).apply()
 
 print(s.payload)
 ```
 
-The current scheduler does not expose the older upstream `allo.customize`
-scheduling surface. Users select operations, loops, and buffers with typed refs,
-apply schedule primitives, and inspect the transformed payload module. The
-recommended selection APIs are the short aliases on `Schedule`, such as
-`s.loop("i")`, `s.loops("i", "j")`, `s.op("top")`, and `s.buffer("B")`.
+You select operations, loops, and buffers with typed refs, apply schedule
+primitives, then either inspect the transformed `payload` module or hand it to a
+backend with `s.export(...)`. The recommended selection entry points are the
+short aliases `s.loop(...)`, `s.loops(...)`, `s.op(...)`, and `s.buffer(...)`.
+
+Loop names come from the frontend iterator name. Write
+`for i in range(16, name="i")` to make a loop selectable as `s.loop("i")`. A
+`grid(..., name="ij")` names the whole loop-like operation, not the individual
+axes.
 
 ## Constructing a Schedule
 
-For frontend kernels, use `Kernel.schedule()`:
+For a frontend kernel, use `Kernel.schedule()`. A templated kernel must be
+specialized first (e.g. `gemm[i32, 32]`).
 
 ```python
 s = top.schedule()
 ```
 
-`Schedule` can also be constructed from an existing MLIR module, a text string,
-or a file:
+A `Schedule` can also be built from a standalone MLIR module, text, or file.
+These forms have no source kernel, so they support every transform and the
+inspection helpers but cannot be exported to a backend.
 
 ```python
+from allo.schedule import Schedule
+
 s = Schedule.from_module(module)
 s = Schedule.from_string(mlir_text)
 s = Schedule.from_file("kernel.mlir")
 ```
 
-The important public fields are:
+| Field      | Meaning                                                                           |
+| ---------- | --------------------------------------------------------------------------------- |
+| `payload`  | The MLIR module being scheduled. Reading it first applies any pending transforms. |
+| `snapshot` | Immutable view of operations and buffer values at the current state.              |
+| `query`    | Low-level query object used by the selection aliases.                             |
+| `dirty`    | Whether pending transforms have not been applied yet.                             |
+| `kernel`   | The source kernel, or `None` for module/string/file schedules.                    |
 
-| Field | Meaning |
-| --- | --- |
-| `payload` | The mutable MLIR module being scheduled. |
-| `snapshot` | Immutable view of operations and buffer values at the current schedule epoch. |
-| `query` | Low-level query object used by the convenience selection aliases. |
-| `epoch` | Integer version of the topology snapshot. |
-| `dirty` | Whether pending transform operations have not been applied yet. |
-| `effects` | Recorded schedule effects for diagnostics and debugging. |
+## The Schedule Model
 
-On construction, the scheduler annotates the payload with internal schedule IDs
-and collects a snapshot. These IDs are used to reconnect Python references to
-payload operations after transforms run.
+The scheduler has three cooperating pieces:
+
+1. **Payload** — the MLIR module being transformed.
+2. **Snapshot** — an immutable index of payload operations and buffer values,
+   keyed by a stable schedule ID, name, kind, and structural path. Selection
+   reads only from the snapshot.
+3. **Transform script** — a module of MLIR transform-dialect operations that is
+   accumulated by primitives and run against the payload by `apply()`.
+
+On construction the scheduler stamps internal schedule IDs onto the payload and
+collects a snapshot. Refs carry those IDs, which is how a Python ref reconnects
+to a payload operation after a transform runs.
+
+Primitives fall into two kinds:
+
+- **Tagging primitives** attach schedule attributes without changing IR
+  topology. They append to the transform script and return the schedule for
+  chaining, but defer execution until `apply()`. Existing refs stay valid.
+- **Structural primitives** change the loop nest or function structure. They
+  apply immediately, rebuild the snapshot, and return refs for the new topology.
+  Refs captured before the change become stale.
+
+`apply()` verifies the pending script, runs it on a clone of the payload,
+verifies the result, refreshes the snapshot, and starts a fresh script for the
+next batch. Reading `payload` or `snapshot` while `dirty` triggers `apply()`
+automatically.
+
+```python
+s.pipeline(loop, ii=2)   # queued, dirty == True
+s.unroll(loop2, factor=4)
+s.apply()                # runs the batch, dirty == False
+```
 
 ## Selecting Targets
 
-The user-facing selection methods on `Schedule` return refs directly:
+### Aliases
+
+The aliases on `Schedule` resolve to a single ref (or a tuple, for `loops()`)
+and raise a source-aware diagnostic if the name is missing or ambiguous.
+
+| Alias                                             | Result             | Equivalent query                          |
+| ------------------------------------------------- | ------------------ | ----------------------------------------- |
+| `s.op(name, *, under=None, kind=None, path=None)` | one `OpRef`        | `s.query.op(...).one()`                   |
+| `s.loop(name, *, under=None, path=None)`          | one `LoopRef`      | `s.query.loop(...).one()`                 |
+| `s.loops(*names, under=None, path=None)`          | tuple of `LoopRef` | `s.query.loop(...).names(...)` / `.all()` |
+| `s.buffer(name, *, under=None, path=None)`        | one `BufferRef`    | `s.query.buffer(...).one()`               |
+
+`s.loops()` with no names returns every loop in the primary function;
+`s.loops("i", "j")` returns exactly those named loops in that order.
 
 ```python
 i = s.loop("i")
 i, j = s.loops("i", "j")
 all_loops = s.loops()
 
-top = s.op("top")
+func = s.op("top")
 B = s.buffer("B")
 ```
 
-These methods are aliases over the lower-level `s.query` API:
+`under` scopes a lookup to operations nested under another op (by ref or name).
+`path` selects a specific snapshot path. `kind` matches the MLIR operation name,
+for example `affine.for` or `scf.for`; it is kept on `op`/`query.op` for
+advanced use.
 
-| Alias | Equivalent query |
-| --- | --- |
-| `s.op(name, under=None, kind=None, path=None)` | `s.query.op(...).one()` |
-| `s.loop(name, under=None, path=None)` | `s.query.loop(...).one()` |
-| `s.loops()` | `tuple(s.query.loop().all())` |
-| `s.loops("i", "j")` | `s.query.loop().names("i", "j")` |
-| `s.buffer(name, under=None, path=None)` | `s.query.buffer(...).one()` |
+### Low-level query
 
-The lower-level query methods return a `RefSelection`. Use them when you need
-`.first()`, `.all()`, `kind=...`, `path=...`, or other MLIR-oriented selection:
+The query methods return a `RefSelection`. Use them when you need `.first()`,
+`.all()`, `kind=`, or `path=`.
 
-| Method | Result |
-| --- | --- |
-| `query.op(name=None, under=None, kind=None, path=None)` | Select operations. |
-| `query.loop(name=None, under=None, path=None)` | Select loop-like operations. |
-| `query.loops(...)` | Alias for `query.loop(...)`. |
-| `query.buffer(name=None, under=None, path=None)` | Select buffer-like operation operands or results. |
+| Method                                                     | Result                                       |
+| ---------------------------------------------------------- | -------------------------------------------- |
+| `query.op(name=None, *, under=None, kind=None, path=None)` | Select operations.                           |
+| `query.loop(name=None, *, under=None, path=None)`          | Select loop-like operations.                 |
+| `query.buffer(name=None, *, under=None, path=None)`        | Select buffer values (arguments or results). |
 
-`under` scopes a query or alias to operations nested under another operation ref
-or name. `path` selects a specific snapshot path. `kind` matches the MLIR
-operation name, for example `affine.for` or `allo.kernel`; it is intentionally
-kept on `op`/`query.op` for advanced use.
+| `RefSelection` method | Result                                                |
+| --------------------- | ----------------------------------------------------- |
+| `.one()`              | Exactly one match, else raise (missing or ambiguous). |
+| `.first()`            | The first match, raise only if none.                  |
+| `.all()`              | All matches as a list (possibly empty).               |
+| `.names(*names)`      | One match per name, in order.                         |
 
-Loop names come from the frontend iterator names:
+### Refs
+
+Refs are lightweight immutable values:
+
+| Ref         | Meaning                                                           |
+| ----------- | ----------------------------------------------------------------- |
+| `OpRef`     | Any operation.                                                    |
+| `LoopRef`   | A loop-like operation (`scf.for`, `affine.for`, `scf.parallel`).  |
+| `BufferRef` | A buffer value (memref) owned by an operation argument or result. |
+
+Primitives accept refs, names, or iterables of refs/names where a multi-target
+operation is meaningful. A name must resolve unambiguously.
+
+## Generic Passes
+
+These primitives run an MLIR pass over op targets. With no target they default
+to the primary function. They are tagging primitives — chain them and call
+`.apply()`.
+
+| Primitive                                  | Optimization                                                                                                           |
+| ------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------- |
+| `s.cse(targets=None)`                      | Common subexpression elimination.                                                                                      |
+| `s.dce(targets=None)`                      | Dead code elimination.                                                                                                 |
+| `s.licm(targets=None)`                     | Loop-invariant code motion.                                                                                            |
+| `s.canonicalize(targets=None)`             | Canonicalization patterns.                                                                                             |
+| `s.apply_patterns(patterns, targets=None)` | Apply named rewrite patterns. `patterns` is a name or iterable of names; currently only `"canonicalize"` is supported. |
 
 ```python
-@kernel
-def top(A: "i32[4,4]", B: "i32[4,4]"):
-    for i in range(4, name="i"):
-        for j in range(4, name="j"):
-            B[i, j] = A[i, j] + 1
-
-
-s = top.schedule()
-i, j = s.loops("i", "j")
+s.cse().dce().canonicalize().apply()
 ```
 
-`grid(..., name="ij")` names the whole loop-like `scf.parallel` operation, not
-the individual axes.
+## Loop and Memory Tags
 
-Refs are lightweight immutable objects:
+Tagging primitives annotate the IR for the backend. They do not change topology,
+so refs captured beforehand remain valid.
 
-| Ref | Meaning |
-| --- | --- |
-| `OpRef` | Reference to any operation. |
-| `LoopRef` | Reference to a loop-like operation. |
-| `BufferRef` | Reference to a buffer value owned by an operation. |
+### `s.pipeline()`
 
-Schedule primitives accept refs, names, or iterables of refs/names where a
-multi-target operation is meaningful. A name must resolve unambiguously. If a
-name is missing or ambiguous, the scheduler reports a source-aware diagnostic.
+`s.pipeline(targets=None, *, ii=1)`
 
-## Schedule Primitives
-
-Most primitives append one or more transform operations to the pending transform
-script and return the schedule for chaining. Call `.apply()` to run pending
-transforms unless the primitive documents that it applies immediately.
-
-### Generic Passes
-
-These primitives operate on operation targets. If no target is provided, they
-default to the payload root.
-
-| API | Effect |
-| --- | --- |
-| `schedule.cse(targets=None)` | Apply common subexpression elimination. |
-| `schedule.dce(targets=None)` | Apply dead code elimination. |
-| `schedule.licm(targets=None)` | Apply loop-invariant code motion. |
-| `schedule.canonicalize(targets=None)` | Apply canonicalization patterns. |
-| `schedule.apply_patterns(patterns, targets=None)` | Apply named rewrite patterns. Currently supports `"canonicalize"`. |
-
-Example:
+Marks loop targets for pipelining with the given initiation interval — the
+backend overlaps successive iterations so a new iteration starts every `ii`
+cycles. `ii` must be a positive integer (default `1`). Returns the schedule.
 
 ```python
-schedule.cse().dce().canonicalize().apply()
+s.pipeline(s.loop("i"), ii=2)
 ```
 
-### Loop Tags and Memory Tags
+### `s.dataflow()`
 
-These primitives attach schedule attributes without changing IR topology, so
-existing refs stay live after `.apply()`.
+`s.dataflow(targets=None)`
 
-| API | Effect |
-| --- | --- |
-| `schedule.pipeline(targets=None, ii=1)` | Mark loop targets with a pipeline initiation interval. |
-| `schedule.unroll(targets=None, factor=0, tag_only=True)` | Mark loop targets for unrolling. `factor=0` means full unroll. |
-| `schedule.partition(targets, dim=0, kind=Schedule.Complete, factor=0)` | Attach an Allo partition attribute to buffer targets. |
+Tags a function for task-level parallelism (`#pragma HLS dataflow`). The Vitis
+emitter turns the attribute into the pragma, so the function's top-level
+statements — for example the PE invokes of a systolic array, or composed stage
+kernels connected by streams — run as a concurrent dataflow network instead of
+sequentially. Defaults to the primary function. Returns the schedule.
 
-Partition kind is one of `Schedule.Complete`, `Schedule.Block`, or
-`Schedule.Cyclic`. Complete partition uses `factor=0`; block and cyclic
-partitions require a positive factor.
+### `s.unroll()`
+
+`s.unroll(targets=None, *, factor=0, tag_only=False)`
+
+Unrolls loop targets to expose parallelism and reduce loop overhead. `factor` is
+a non-negative integer; `factor=0` means full unroll. By default
+(`tag_only=False`) the loop is **physically unrolled immediately**, followed by
+canonicalize/CSE cleanup. With `tag_only=True` it only attaches an unroll
+attribute and defers like the other tags. Returns the schedule.
 
 ```python
-loop = s.loop("i")
+s.unroll(s.loop("k"), factor=4)              # physical unroll now
+s.unroll(s.loop("k"), factor=4, tag_only=True).apply()  # attribute only
+```
+
+### `s.partition()`
+
+`s.partition(targets, *, dim=0, kind=Complete, factor=0)`
+
+Partitions a buffer across memory banks so multiple elements can be accessed in
+the same cycle. `targets` (required) are buffer refs. `dim` is the dimension to
+partition (`0` partitions all dimensions). `kind` is one of:
+
+| Kind         | Meaning                          | `factor`      |
+| ------------ | -------------------------------- | ------------- |
+| `s.Complete` | Split into individual registers. | must be `0`   |
+| `s.Block`    | Contiguous blocks.               | must be `> 0` |
+| `s.Cyclic`   | Round-robin across banks.        | must be `> 0` |
+
+Returns the schedule.
+
+```python
 A = s.buffer("A")
-
-s.pipeline(loop, ii=2)
-s.partition(A, dim=1, kind=Schedule.Cyclic, factor=4)
+s.partition(A, dim=1, kind=s.Cyclic, factor=4)
 s.apply()
 ```
 
-`unroll(..., tag_only=False)` performs physical unrolling and applies
-immediately because it changes IR topology.
+## Loop Restructuring
 
-### Loop Restructuring
+Structural primitives. Each applies immediately and returns refs for the new
+topology; refs from before the call go stale.
 
-These primitives change the loop nest. They apply immediately and return live
-refs for the new topology.
+### `s.affine()`
 
-| API | Effect |
-| --- | --- |
-| `schedule.split(target, factor=1)` | Split one loop and return `(outer, inner)`. |
-| `schedule.reorder(targets)` | Reorder affine loops and return refs in the requested order. |
-| `schedule.tile(targets, factors=1)` | Tile a loop nest and return `(tiles, points)`. |
-| `schedule.flatten(targets)` | Flatten two or more loops and return the new loop ref. |
+`s.affine(targets=None) -> list[LoopRef]`
+
+Raises loop targets to affine form (`scf.for` → `affine.for`), preserving names.
+Defaults to all loops in the primary function. Returns
+the raised loop refs.
+
+### `s.split()`
+
+`s.split(target=None, *, factor=1) -> (outer, inner)`
+
+Strip-mines one loop into an outer loop over tiles and an inner loop within a
+tile. `factor` is the inner trip count (positive, default `1`). Returns
+`(outer, inner)`.
 
 ```python
-i, j = s.loops("i", "j")
-
+i = s.loop("i")
 outer, inner = s.split(i, factor=4)
 s.pipeline(inner, ii=1).apply()
+```
 
-tiles, points = s.tile([outer, j], factors=[2, 4])
+### `s.reorder()`
+
+`s.reorder(targets) -> tuple[LoopRef, ...]`
+
+Permutes a perfectly nested band of affine loops into the requested order — used
+to change locality or move a reduction inward. Requires at least two **affine**,
+unique loop targets. Returns the loop refs in the requested order.
+
+### `s.tile()`
+
+`s.tile(targets=None, *, factors=1) -> (tiles, points)`
+
+Tiles a loop band, producing an outer *tile* loop and an inner *point* loop per
+axis — the combination of `split` across several loops with a `reorder`.
+`factors` is a single int (broadcast to all loops) or one factor per loop.
+Returns `(tile_loops, point_loops)` as two lists.
+
+```python
+tiles, points = s.tile(s.loops("i", "j"), factors=[2, 4])
 s.pipeline(points[-1], ii=1).apply()
 ```
 
-`reorder`, `tile`, and `flatten` expect affine loops. `tile` accepts either a
-single integer factor, broadcast to all target loops, or an iterable with one
-factor per loop.
+### `s.flatten()`
 
-### Data Movement and Outlining
+`s.flatten(targets) -> LoopRef`
 
-These primitives move computation, buffers, or regions. Primitives that return
-new refs apply immediately.
+Collapses two or more perfectly nested loops into a single loop, removing
+nested-loop boundaries (often to enable a longer pipeline). Requires at least two
+loop targets. Returns the flattened loop ref.
 
-| API | Effect |
-| --- | --- |
-| `schedule.affine(targets=None)` | Raise loop targets to affine form and return live loop refs. |
-| `schedule.compute_at(target, axis)` | Move a producer operation to the given affine loop axis and return the live axis ref. |
-| `schedule.buffer_at(target, axis)` | Create a localized buffer at an affine loop axis and return the new buffer ref. |
-| `schedule.outline(target, func_name, mapping=None)` | Outline an operation into a new function or Allo kernel and return `(kernel, call)`. |
+## Data Movement and Localization
 
-`outline` emits a normal `func.func`/`call` pair when `mapping` is `None`. When
-`mapping` is an integer or a sequence of positive integers, it emits an
-`allo.kernel` and `allo.invoke` with the mapping attached.
+Structural primitives that move computation or introduce on-chip buffers. They
+apply immediately and return live refs.
+
+### `s.compute_at()`
+
+`s.compute_at(target, axis) -> LoopRef`
+
+Fuses a producer operation into a consumer loop at the given affine `axis`,
+interleaving their computation to shorten the producer's live range. The
+producer loop nest is erased and its body moves under the axis loop. `axis` must
+be an affine loop. Returns the live axis ref.
+
+### `s.buffer_at()`
+
+`s.buffer_at(target, axis) -> BufferRef`
+
+Creates a localized buffer for `target` scoped to the affine loop `axis`,
+staging data on-chip at that level of the nest. Returns the new buffer ref (a
+`{base}.local` allocation).
+
+### `s.reuse_at()`
+
+`s.reuse_at(target, axis, *, ring=False) -> BufferRef`
+
+Creates a reuse buffer at the affine loop `axis` that captures data reused across
+iterations — the classic line/window buffer for stencils and convolutions. It is
+smaller than `buffer_at` in steady state because it only holds the live reuse
+window. Set `ring=True` to use a ring (circular) buffer. Returns the new buffer
+ref (a `{base}.reuse` allocation).
+
+## Outlining
+
+### `s.outline()`
+
+`s.outline(target, *, func_name, mapping=None) -> (kernel, call)`
+
+Extracts an operation into its own function so it can be reused or scheduled
+independently. With `mapping=None` it emits a `func.func` / `func.call` pair.
+When `mapping` is an integer or a sequence of positive integers, it emits an
+`allo.kernel` / `allo.invoke` pair with the spatial mapping attached — the same
+form an inline `@kernel(mapping=...)` produces. Applies immediately. Returns
+`(kernel_op_ref, call_op_ref)`.
 
 ```python
-producer_loop, consumer_loop = s.affine(s.loops("i", "j"))
-
-axis = s.compute_at(producer_loop, consumer_loop)
+producer, consumer = s.affine(s.loops("i", "j"))
+axis = s.compute_at(producer, consumer)
 outer, inner = s.split(axis, factor=4)
-
-kernel, call = s.outline(inner, func_name="stage0", mapping=[2, 1])
+stage, call = s.outline(inner, func_name="stage0", mapping=[2, 1])
 ```
 
-## Applying Transforms
+## Kernel Composition
 
-`apply()` verifies and runs the pending transform script against `payload`.
+### `s.compose()`
+
+`s.compose(*callees, id=None) -> Schedule`
+
+Allo schedules each kernel independently, then stitches them together. When a
+top-level kernel invokes a sub-kernel, the compiler specializes a private copy
+of the callee named `"{primary}.{callee_primary}"`. `compose` replays a callee's
+*entire* schedule onto that copy.
+
+Pass one or more **direct** callees: `s.compose(a, b)` is exactly
+`s.compose(a); s.compose(b)`. Each callee must be a kernel `self` calls directly
+(a non-direct callee has no copy and raises). `id` selects a specific
+specialized/repeat copy when the callee is invoked more than once. Composition is
+transitive: a callee that itself composed sub-kernels carries its full include
+plan, which is re-prefixed onto this copy. Returns the schedule.
 
 ```python
-s.pipeline(loop, ii=2)
-s.unroll(loop, factor=4)
-s.apply()
+gemm_s = gemm.schedule()
+gemm_s.tile(gemm_s.loops("i", "j"), factors=[4, 4])
+
+top_s = top.schedule()         # top invokes gemm
+top_s.compose(gemm_s)          # gemm's tiling now applies inside top
+top_s.export("vitis").hls_code
 ```
 
-The scheduler distinguishes topology-changing effects from attribute-only
-effects:
+## Streaming
 
-- Attribute-only effects such as `pipeline`, tag-only `unroll`, and `partition`
-  do not bump `epoch`; existing refs remain live.
-- Topology-changing effects rebuild the snapshot and increment `epoch`.
-  Existing refs from older epochs become stale.
-- Primitives that must return newly created refs, such as `split`, `tile`,
-  `flatten`, `outline`, `compute_at`, and `buffer_at`, call `apply()`
-  internally.
+### `s.streamline()`
 
-When a topology-changing transform invalidates an old ref, use the refs returned
-by the primitive, select again with an alias such as `s.loop("j")`, or call
+`s.streamline(producer, consumer, *, producer_ids=None, consumer_ids=None, lanes=1, depth=2) -> Schedule`
+
+Converts the DRAM memory boundary between two composed stage kernels into an
+on-chip stream hand-off (a `to_stream` fusion), so the stages run as a producer/
+consumer dataflow pair without round-tripping the intermediate through DRAM.
+
+`producer` and `consumer` are stage kernel names (each a single name or a list):
+
+- **One → one**: every memref the producer only writes and the consumer only
+  reads becomes a FIFO; un-convertible boundaries are skipped with a diagnostic.
+- **One → many**: the output fans out through a generated `tee` (residual / skip
+  connections).
+- **Many → one**: inputs fan in through a generated `merge`; each producer must
+  fill a disjoint contiguous row-major block.
+
+A `*_ids` list (matching the names) selects specific repeat copies. `lanes`
+widens each boundary to `L` parallel FIFOs moving `L` elements per cycle — the
+bandwidth lever, valid when the contiguous dimension divides by `L`; `lanes=1`
+(default) is a scalar FIFO. `depth` is the FIFO depth (default `2`); on a
+reconvergent fork/join the short branch's FIFO must hold the latency skew, or the
+dataflow deadlocks — `streamline` warns and names the depth to set. `lanes` and
+`depth` must be positive integers. Returns the schedule.
+
+```python
+s = top.schedule()
+s.compose(stage_a, stage_b, stage_c)
+s.streamline("stage_a", "stage_b")               # DRAM -> FIFO
+s.streamline("stage_b", "stage_c", lanes=4, depth=8)
+s.dataflow()                                     # run the stages concurrently
+s.export("vitis").hls_code
+```
+
+## Applying Transforms and Ref Lifetime
+
+`apply()` (alias `materialize()`) runs the pending transform script. Tagging
+primitives only become visible in `payload` after it runs; structural primitives
+apply on their own and need no explicit `apply()`.
+
+When a structural transform invalidates an old ref, recover a live ref one of
+three ways: use the refs the primitive returned, select again by name, or call
 `s.live(ref)` to rebind a ref whose schedule ID still exists.
 
 ```python
 i, j = s.loops("i", "j")
-outer, inner = s.split(i, factor=4)
+outer, inner = s.split(i, factor=4)   # `j` is now from a previous state
 
-# `j` came from the previous epoch. Rebind it before using it.
-j = s.live(j)
+j = s.live(j)                         # rebind before reuse
 s.pipeline(j, ii=1).apply()
 ```
 
-## Scheduler Model
+A ref consumed by a primitive (e.g. a loop that was split, flattened, or
+reordered away) raises `ConsumedHandleError` if reused.
 
-The scheduler has three layers:
+## Exporting to a Backend
 
-1. The payload module, which is the MLIR module being transformed.
-2. An immutable snapshot of payload operations and buffer values, indexed by
-   schedule ID, name, kind, and path.
-3. A transform script module that contains MLIR transform dialect operations.
+`s.export(backend, **kwargs)` applies pending transforms, runs a final cleanup
+pass, binds the scheduled module back onto the kernel, and returns a backend
+object. `backend` is `"cpu"` or `"vitis"`; keyword arguments are forwarded to the
+backend constructor. `export_cpu(**kwargs)` and `export_vitis(**kwargs)` are
+shorthands. A schedule with no source kernel (built from a module/string/file)
+cannot be exported.
 
-Queries read only from the snapshot, and the `s.loop`/`s.op`/`s.buffer` aliases
-are thin wrappers around those queries. Schedule primitives resolve refs against
-the current snapshot, append transform operations to the transform script, and
-record an `Effect`. `apply()` verifies the transform script, applies it to the
-payload, verifies the payload, refreshes the snapshot, and starts a fresh
-transform script for the next batch.
+```python
+# CPU functional simulation
+s.export("cpu")(A, B, C)
 
-This model makes scheduling refs explicit. A `LoopRef` or `BufferRef` is valid
-only for the epoch in which it was created. If a transform only annotates the IR,
-the epoch stays the same. If a transform changes topology, the epoch advances
-and the scheduler requires callers to use new refs.
+# Vitis HLS C++ codegen / csim / synthesis
+code = s.export("vitis").hls_code
+s.export("vitis", project_path="proj")(A, B, C)          # csim
+report = s.export("vitis", part=PART, project_path="proj").synth()
+```
+
+See [Simulation](simulation.md) for the backend objects these calls return.
 
 ## Debugging
 
-The scheduler exposes a few inspection helpers:
+| Helper                                  | Effect                                                        |
+| --------------------------------------- | ------------------------------------------------------------- |
+| `s.format_tree(*, include_values=True)` | Return a text tree of the current snapshot.                   |
+| `s.dump_tree(*, include_values=True)`   | Print and return that tree.                                   |
+| `s.dump_transform_script()`             | Return the pending transform script as MLIR text.             |
+| `s.debug_dump(*, include_values=True)`  | Print dirty state, op/value counts, the tree, and the script. |
+| `s.cleanup_schedule_ids()`              | Remove the internal schedule-ID attributes from the payload.  |
 
-| API | Effect |
-| --- | --- |
-| `schedule.format_tree(include_values=True)` | Return a text tree of the current snapshot. |
-| `schedule.dump_tree(include_values=True)` | Print and return the current snapshot tree. |
-| `schedule.dump_transform_script()` | Return the pending transform script as MLIR text. |
-| `schedule.debug_dump(include_values=True)` | Print epoch, dirty state, snapshot size, effects, and tree. |
-| `schedule.cleanup_schedule_ids()` | Remove internal schedule ID attributes from the payload. |
+Schedule errors use source-aware diagnostics that point at the Python call site.
+The error types live in `allo/schedule/errors.py`:
 
-Schedule errors use source-aware diagnostics when the Python call site is
-available. Lookup errors report missing or ambiguous targets. Stale ref errors
-include the ref epoch, current epoch, and the last topology-changing transform
-when available.
+| Error                          | Raised when                                                                      |
+| ------------------------------ | -------------------------------------------------------------------------------- |
+| `ScheduleLookupError`          | A target name or path does not resolve.                                          |
+| `AmbiguousLookupError`         | A single-target lookup matches more than one operation.                          |
+| `ConsumedHandleError`          | A ref consumed by an earlier transform is reused.                                |
+| `ScheduleStateError`           | `payload`/`snapshot` cannot be produced from the pending script.                 |
+| `ScheduleTypeError`            | A ref of the wrong kind is passed (e.g. an `OpRef` where a `LoopRef` is needed). |
+| `InvalidScheduleArgumentError` | An argument is out of range (e.g. `factor <= 0`).                                |
+| `ScheduleTransformError`       | The transform script or resulting payload fails verification.                    |
