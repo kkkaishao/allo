@@ -4,7 +4,7 @@
 - Run `ninja -C build [target]` to build specific targets
 
 # Testing
-- Run `python -m pytest test/` to run all tests
+- Run `python -m pytest tests/` to run all tests
 - Set `XILINX_VITIS` to any invalid path to skip tests for synthesis with Vitis to save time
 
 # Running
@@ -26,5 +26,5 @@
 # Repository structure
 - Place Python frontend code in `allo/`
 - Place MLIR dialects and passes code in `mlir/`
-- Tests for new frontend lie in `test/`
+- Tests lie in `tests/`
 - Use `drafts/` for temporary code when exploring new ideas
