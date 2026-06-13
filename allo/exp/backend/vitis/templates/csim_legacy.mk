@@ -15,6 +15,7 @@ HLS_ROOT ?= $(VITIS_ROOT)
 CXX ?= $(lastword $(sort $(wildcard $(HLS_ROOT)/tps/lnx64/gcc-*/bin/g++)))
 MATHHLS_LIB ?= $(HLS_ROOT)/lnx64/lib/csim
 FPO_LIB ?= $(firstword $(wildcard $(HLS_ROOT)/lnx64/tools/fpo_*))
+FPO_SO ?= $(patsubst lib%.so,%,$(notdir $(firstword $(wildcard $(FPO_LIB)/libIp_floating_point_*.so))))
 CRT_DIR ?=
 
 OPT_FLAGS ?= -O3 -march=native
@@ -33,7 +34,8 @@ CXXFLAGS ?= -std=gnu++17 -shared -fPIC -fpermissive \
 
 LDFLAGS ?= \
   -Wl,-rpath,$(MATHHLS_LIB) -L$(MATHHLS_LIB) -lhlsmc++-GCC46 -lhlsm-GCC46 \
-  -Wl,-rpath,$(FPO_LIB) -L$(FPO_LIB) -lgmp -lmpfr -lIp_floating_point_v7_1_bitacc_cmodel
+  -Wl,-rpath,$(FPO_LIB) -L$(FPO_LIB) -lgmp -lmpfr -l$(FPO_SO)
+
 EXTRA_CXXFLAGS ?=
 EXTRA_LDFLAGS ?=
 

@@ -17,6 +17,7 @@ GCC_TOOLCHAIN ?= $(lastword $(sort $(wildcard $(VITIS_ROOT)/tps/lnx64/gcc-*)))
 VITIS_HOST_LIB ?= $(VITIS_ROOT)/lib/lnx64.o
 MATHHLS_LIB ?= $(VITIS_ROOT)/lnx64/lib/csim
 FPO_LIB ?= $(firstword $(wildcard $(VITIS_ROOT)/lnx64/tools/fpo_*))
+FPO_SO ?= $(patsubst lib%.so,%,$(notdir $(firstword $(wildcard $(FPO_LIB)/libIp_floating_point_*.so))))
 
 HLS_INCLUDES ?= \
   -I$(VITIS_ROOT)/include \
@@ -36,7 +37,7 @@ HLS_CXXFLAGS ?= -std=gnu++17 -shared -fPIC -fpermissive \
   --gcc-toolchain=$(GCC_TOOLCHAIN)
 HLS_LDFLAGS ?= \
   -Wl,-rpath,$(MATHHLS_LIB) -L$(MATHHLS_LIB) -lhlsmc++-GCC46 -lhlsm-GCC46 \
-  -Wl,-rpath,$(FPO_LIB) -L$(FPO_LIB) -lgmp -lmpfr -lIp_floating_point_v7_1_bitacc_cmodel
+  -Wl,-rpath,$(FPO_LIB) -L$(FPO_LIB) -lgmp -lmpfr -l$(FPO_SO)
 
 EXTRA_CXXFLAGS ?=
 EXTRA_LDFLAGS ?=

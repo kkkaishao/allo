@@ -45,7 +45,7 @@ class Vitis(Generic[P, R]):
         ``exist_ok=False`` rebuilds even when cached artifacts exist.
         """
 
-    def synth(self, *, exist_ok: bool = ...):
+    def synth(self, *, exist_ok: bool = ...) -> Path:
         """Scaffold an HLS project, invoke Vitis HLS C synthesis, and return the
         synthesis report directory. Requires a part number."""
 
