@@ -55,7 +55,7 @@ def _version_key(path: Path) -> tuple[int, ...]:
     return tuple(int(n) for n in nums) if nums else (0,)
 
 
-@functools.lru_cache(maxsize=None)
+@functools.cache
 def _clang_supports_hls_csim(clang: str, host_lib: str) -> bool:
     """Whether ``clang`` accepts ``-fhls-csim`` (the AMD clang shipped since Vitis
     2025.2). Probed by compiling a trivial unit; cached per (clang, host_lib)."""
@@ -142,7 +142,7 @@ def _resolve_hls_root(vitis_root: Path) -> Path:
     )
 
 
-@functools.lru_cache(maxsize=None)
+@functools.cache
 def _detect_crt_dir() -> str:
     """Directory holding the system C-runtime startup objects (crti.o), queried
     from the system compiler. The bundled Vitis gcc needs ``-B`` to find them."""

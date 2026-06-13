@@ -104,7 +104,7 @@ def test_codegen_vadd2_tile():
                 C[i, j] = A[i, j] + B[i, j]
 
     s = vadd2.schedule()
-    i, j = s.affine(s.loops("i", "j"))
+    i, j = s.loops("i", "j")
     s.tile((i, j), factors=[4, 4])
     code = _hls(s)
     _contains(code, "void vadd2(float v0[8][8]")
@@ -124,7 +124,6 @@ def test_codegen_gemm_reorder_pipeline():
                     C[i, j] += A[i, k] * B[k, j]
 
     s = gemm[16, 16, 16].schedule()
-    s.affine(s.loops("i", "j", "k"))
     s.reorder((s.loop("k"), s.loop("j")))
     s.pipeline(s.loop("j"), ii=1)
     code = _hls(s)
@@ -301,7 +300,6 @@ def test_synth_gemm_tile_pipeline():
                     C[i, j] += A[i, k] * B[k, j]
 
     s = gemm.schedule()
-    i, j, k = s.affine(s.loops("i", "j", "k"))
     s.tile((i, j), factors=[4, 4])
     s.pipeline(s.loop("k"), ii=1)
     with tempfile.TemporaryDirectory() as project:

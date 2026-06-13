@@ -49,14 +49,6 @@ def _assert_compile_error(fn, *patterns: str):
         assert pattern in message
 
 
-def _assert_type_error(fn, *patterns: str):
-    with pytest.raises(TypeError) as exc_info:
-        _compile_ir(fn)
-    message = str(exc_info.value)
-    for pattern in patterns:
-        assert pattern in message
-
-
 def test_error_diagnostic_source():
     src = "def broken(x):\n    return x + y\n"
     module = ast.parse(src)

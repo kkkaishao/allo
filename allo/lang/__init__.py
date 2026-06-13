@@ -57,6 +57,7 @@ from .core import (
     grid,
     range,
     bool,
+    Stateful,
 )
 
 from .kernel import kernel, consteval, KernelOptions

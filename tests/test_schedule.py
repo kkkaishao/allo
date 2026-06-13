@@ -201,8 +201,7 @@ def test_reorder():
 
     # Reorder non-consecutive axes (l before i) inside the affine band.
     s = add.schedule()
-    i, j, k, l = s.affine(s.loops("i", "j", "k", "l"))
-    s.reorder((l, i))
+    s.reorder(("l", "i"))
     mod = s.export("cpu")
 
     A = np.random.randint(0, 10, (M, N, K, L)).astype(np.int32)
@@ -222,7 +221,7 @@ def test_split_reorder():
                 C[i, j] = A[i, j] + B[i, j]
 
     s = add.schedule()
-    i, j = s.affine(s.loops("i", "j"))
+    i, j = s.loops("i", "j")
     io, ii = s.split(i, factor=2)
     jo, ji = s.split(j, factor=4)
     s.reorder((jo, io, ji, ii))
@@ -245,7 +244,7 @@ def test_tile():
                 C[i, j] = A[i, j] + B[i, j]
 
     s = add.schedule()
-    i, j = s.affine(s.loops("i", "j"))
+    i, j = s.loops("i", "j")
     s.tile((i, j), factors=[2, 4])
     mod = s.export("cpu")
 
@@ -267,7 +266,7 @@ def test_flatten():
 
     # .fuse in the old frontend is .flatten in the new one.
     s = add.schedule()
-    i, j = s.affine(s.loops("i", "j"))
+    i, j = s.loops("i", "j")
     s.flatten((i, j))
     mod = s.export("cpu")
 
@@ -313,7 +312,7 @@ def test_tile_3d():
 
     # Tile a 3-deep perfect band (only 2-deep tiling is covered elsewhere).
     s = add3.schedule()
-    i, j, k = s.affine(s.loops("i", "j", "k"))
+    i, j, k = s.loops("i", "j", "k")
     s.tile((i, j, k), factors=[2, 4, 2])
     mod = s.export("cpu")
 
@@ -337,7 +336,7 @@ def test_tile_indivisible_non_square():
                 C[i, j] = A[i, j] + B[i, j]
 
     s = add.schedule()
-    i, j = s.affine(s.loops("i", "j"))
+    i, j = s.loops("i", "j")
     s.tile((i, j), factors=[4, 3])
     mod = s.export("cpu")
 
@@ -361,7 +360,7 @@ def test_flatten_three_non_square():
                     C[i, j, k] = A[i, j, k] + B[i, j, k]
 
     s = add3.schedule()
-    i, j, k = s.affine(s.loops("i", "j", "k"))
+    i, j, k = s.loops("i", "j", "k")
     s.flatten((i, j, k))
     mod = s.export("cpu")
 
@@ -384,7 +383,7 @@ def test_gemm_split_reorder():
                     C[i, j] += A[i, k] * B[k, j]
 
     s = gemm.schedule()
-    i, j, k = s.affine(s.loops("i", "j", "k"))
+    i, j = s.loops("i", "j")
     io, ii = s.split(i, factor=2)
     jo, ji = s.split(j, factor=2)
     s.reorder((io, jo, ii, ji))
@@ -411,7 +410,6 @@ def test_compute_at():
                 C[ci, cj] = B[ci, cj] * 2
 
     s = two_band.schedule()
-    s.affine(s.loops("bi", "bj", "ci", "cj"))
     s.compute_at(s.loop("bi"), s.loop("ci"))
     mod = s.export("cpu")
 
@@ -442,7 +440,6 @@ def test_compute_at_complex():
                     D[di, dj, dm] = C[di, dj, dm] % 3
 
     s = three_band.schedule()
-    s.affine(s.loops())
     s.compute_at(s.loop("bj"), s.loop("cj"))
     s.compute_at(s.loop("cm"), s.loop("dm"))
     mod = s.export("cpu")
@@ -473,7 +470,6 @@ def test_compute_at_no_dep():
             D[ci] = B[ci] * 2
 
     s = two_independent.schedule()
-    s.affine(s.loops("pi", "ci"))
     s.compute_at(s.loop("pi"), s.loop("ci"))
     mod = s.export("cpu")
 
@@ -500,7 +496,6 @@ def test_compute_at_no_dep_inner_axis():
                 D[ci, cj] = B[ci, cj] * 2
 
     s = two_independent.schedule()
-    s.affine(s.loops("pi", "pj", "ci", "cj"))
     s.compute_at(s.loop("pj"), s.loop("cj"))
     mod = s.export("cpu")
 
@@ -525,7 +520,6 @@ def test_compute_at_no_dep_subset_bounds():
             D[ci] = ci * 2
 
     s = f.schedule()
-    s.affine(s.loops("pi", "ci"))
     s.compute_at(s.loop("pi"), s.loop("ci"))
     mod = s.export("cpu")
     assert "affine.if" in str(s.payload)
@@ -552,7 +546,6 @@ def test_compute_at_no_dep_deeper_producer():
             D[ci] = B[ci] * 2
 
     s = f.schedule()
-    s.affine(s.loops("pi", "pj", "ci"))
     s.compute_at(s.loop("pj"), s.loop("ci"))
     mod = s.export("cpu")
 
@@ -576,7 +569,6 @@ def test_compute_at_war_only_unsupported():
             X[ci] = D[ci]
 
     s = f.schedule()
-    s.affine(s.loops("pi", "ci"))
     s.compute_at(s.loop("pi"), s.loop("ci"))
     with pytest.raises(ScheduleTransformError):
         s.apply()
@@ -597,7 +589,6 @@ def test_buffer_at():
                 B[i, j] = A[i, j] + 1.0
 
     s = addone.schedule()
-    s.affine(s.loops("i", "j"))
     s.buffer_at(s.buffer("B"), s.loop("i"))
     mod = s.export("cpu")
 
@@ -618,7 +609,6 @@ def test_interleaving_acc():
                     C[i, j] += A[i, k] * B[k, j]
 
     s = gemm.schedule()
-    s.affine(s.loops("i", "j", "k"))
     s.reorder((s.loop("k"), s.loop("j")))
     s.buffer_at(s.buffer("C"), s.loop("i"))
     s.pipeline(s.loop("j"))
@@ -643,7 +633,6 @@ def test_buffer_at_read_only():
                 B[i, j] = A[i, j] * 2
 
     s = addone.schedule()
-    s.affine(s.loops("i", "j"))
     s.buffer_at(s.buffer("A"), s.loop("i"))
     mod = s.export("cpu")
 
@@ -665,7 +654,6 @@ def test_buffer_at_middle_axis():
                     B[i, j, k] = A[i, j, k] + 1
 
     s = f.schedule()
-    s.affine(s.loops("i", "j", "k"))
     s.buffer_at(s.buffer("B"), s.loop("j"))
     mod = s.export("cpu")
 
@@ -685,7 +673,6 @@ def test_buffer_at_strided_1d():
                 B[io * 4 + ii] = A[io * 4 + ii] + 1
 
     s = f.schedule()
-    s.affine(s.loops("io", "ii"))
     s.buffer_at(s.buffer("B"), s.loop("io"))
     mod = s.export("cpu")
 
@@ -705,7 +692,6 @@ def test_buffer_at_innermost_axis_rejected():
                 B[i, j] = A[i, j] + 1
 
     s = f.schedule()
-    s.affine(s.loops("i", "j"))
     s.buffer_at(s.buffer("B"), s.loop("j"))  # innermost axis is illegal
     with pytest.raises(ScheduleTransformError):
         s.apply()
@@ -723,7 +709,6 @@ def test_buffer_at_non_separable_rejected():
                 B[j] = A[j] + i
 
     s = f.schedule()
-    s.affine(s.loops("i", "j"))
     s.buffer_at(s.buffer("B"), s.loop("i"))
     with pytest.raises(ScheduleTransformError):
         s.apply()
@@ -860,7 +845,6 @@ def test_compose_gemm_scheduled():
         gemm(A, B, C)
 
     gs = gemm.schedule()
-    gs.affine(gs.loops("i", "j", "k"))
     gs.reorder((gs.loop("k"), gs.loop("j")))
     gs.buffer_at(gs.buffer("C"), gs.loop("i"))
     gs.pipeline(gs.loop("j"))
@@ -914,7 +898,6 @@ def test_reuse_blur_x():
                 B[y, x] = A[y, x] + A[y, x + 1] + A[y, x + 2]
 
     s = blur.schedule()
-    s.affine(s.loops("y", "x"))
     s.reuse_at(s.buffer("A"), s.loop("x"))
     mod = s.export("cpu")
 
@@ -935,7 +918,6 @@ def test_reuse_blur_y():
                 B[y, x] = A[y, x] + A[y + 1, x] + A[y + 2, x]
 
     s = blur.schedule()
-    s.affine(s.loops("y", "x"))
     s.reuse_at(s.buffer("A"), s.loop("y"))  # reuse over the outer axis
     mod = s.export("cpu")
 
@@ -956,7 +938,6 @@ def test_reuse_blur_x_3d():
                     B[i, j, k] = A[i, j, k] + A[i, j, k + 1] + A[i, j, k + 2]
 
     s = blur.schedule()
-    s.affine(s.loops("i", "j", "k"))
     s.reuse_at(s.buffer("A"), s.loop("k"))
     mod = s.export("cpu")
 
@@ -977,7 +958,6 @@ def test_reuse_blur_y_3d():
                     B[i, j, k] = A[i, j, k] + A[i, j + 1, k] + A[i, j + 2, k]
 
     s = blur.schedule()
-    s.affine(s.loops("i", "j", "k"))
     s.reuse_at(s.buffer("A"), s.loop("j"))  # reuse over a middle axis
     mod = s.export("cpu")
 
@@ -997,7 +977,6 @@ def test_reuse_blur_x_y():
                 B[y, x] = A[y, x] + A[y + 1, x + 1] + A[y + 2, x + 2]
 
     s = blur.schedule()
-    s.affine(s.loops("y", "x"))
     rb_y = s.reuse_at(s.buffer("A"), s.loop("y"))
     s.reuse_at(rb_y, s.loop("x"))
     mod = s.export("cpu")
@@ -1023,7 +1002,6 @@ def test_reuse_blur_box_x_y():
                 B[y, x] = A[y, x] + A[y, x + 1] + A[y + 1, x] + A[y + 1, x + 1]
 
     s = blur.schedule()
-    s.affine(s.loops("y", "x"))
     rb_y = s.reuse_at(s.buffer("A"), s.loop("y"))
     s.reuse_at(rb_y, s.loop("x"))
     mod = s.export("cpu")
@@ -1048,7 +1026,6 @@ def test_reuse_blur_x_wide():
                 )
 
     s = blur.schedule()
-    s.affine(s.loops("y", "x"))
     s.reuse_at(s.buffer("A"), s.loop("x"))
     mod = s.export("cpu")
 
@@ -1070,7 +1047,6 @@ def test_reuse_blur_ring():
                 B[y, x] = A[y, x] + A[y, x + 1] + A[y, x + 2]
 
     s = blur.schedule()
-    s.affine(s.loops("y", "x"))
     s.reuse_at(s.buffer("A"), s.loop("x"), ring=True)
     mod = s.export("cpu")
 
@@ -1095,7 +1071,6 @@ def test_reuse_blur_x_y_z_3d():
                     )
 
     s = blur.schedule()
-    s.affine(s.loops("i", "j", "k"))
     ri = s.reuse_at(s.buffer("A"), s.loop("i"))
     rj = s.reuse_at(ri, s.loop("j"))
     s.reuse_at(rj, s.loop("k"))

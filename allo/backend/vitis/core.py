@@ -43,13 +43,12 @@ from .utils import (
     detect_vitis_tool,
     generate_hls_cfg,
     generate_kernel_header,
+    generate_run_tcl,
     _is_stream_type,
-    _log_synth_failure,
-    _log_synth_note,
+    log_failure_tail,
     _normalize_interface_options,
     _probe_vitis_tool,
     _source_settings_env,
-    _synth_log_path,
 )
 from ..._mlir import ir
 from ..._mlir.dialects.allo import emit_vivado_hls
@@ -501,35 +500,30 @@ class Vitis(Backend, Generic[P, R]):
         with stage(f"Generating Vitis HLS Project to: {project_path.resolve()}"):
             write_text_if_changed(project_path / "kernel.cpp", artifacts.kernel_cpp)
             write_text_if_changed(project_path / "kernel.h", artifacts.kernel_h)
-            self._write_build_files(project_path, artifacts)
+            write_text_if_changed(
+                project_path / "run.tcl",
+                generate_run_tcl(artifacts.top, self.part, self.freq_mhz, self.flow),
+            )
+            write_text_if_changed(
+                project_path / "hls.cfg",
+                generate_hls_cfg(artifacts.top, self.part, self.freq_mhz, self.flow),
+            )
+            write_text_if_changed(
+                project_path / IMPL_MAKEFILE,
+                generate_impl_makefile(
+                    artifacts.top, self.freq_mhz, self._get_vitis_root()
+                ),
+            )
+            if self._impl_abi_supported():
+                write_text_if_changed(
+                    project_path / HOST_CPP,
+                    generate_impl_host(
+                        artifacts.top, self.kernel.parse_argument_annotations()
+                    ),
+                )
 
         self._project_path = project_path
         return project_path
-
-    def _write_build_files(
-        self, project_path: Path, artifacts: CompiledArtifacts
-    ) -> None:
-        """Emit the unified ``Makefile`` plus its inputs. ``csynth`` (part-based
-        QoR) is driven by ``hls.cfg``; emu/hw (platform-based) additionally need
-        the XRT ``host.cpp`` -- skipped when the kernel boundary can't cross to
-        the host (csynth still works)."""
-        write_text_if_changed(
-            project_path / "hls.cfg",
-            generate_hls_cfg(artifacts.top, self.part, self.freq_mhz, self.flow),
-        )
-        write_text_if_changed(
-            project_path / IMPL_MAKEFILE,
-            generate_impl_makefile(
-                artifacts.top, self.freq_mhz, self._get_vitis_root()
-            ),
-        )
-        if self._impl_abi_supported():
-            write_text_if_changed(
-                project_path / HOST_CPP,
-                generate_impl_host(
-                    artifacts.top, self.kernel.parse_argument_annotations()
-                ),
-            )
 
     def _materialize_csim_cache(self, *, exist_ok: bool = True) -> tuple[Path, str]:
         artifacts = self._compile_for_csim()
@@ -652,7 +646,7 @@ class Vitis(Backend, Generic[P, R]):
 
     def _get_vitis_env(self) -> dict[str, str]:
         if self.tool is not None:
-            return dict(self.tool.env)
+            return self.tool.env
         with stage("Load Vitis environment"):
             sourced_env = _source_settings_env(self._settings64)
             if sourced_env is not None:
@@ -728,14 +722,19 @@ class Vitis(Backend, Generic[P, R]):
         return self.csimulator
 
     def _invoke_csyn(self, project_path: Path) -> None:
-        log_path = _synth_log_path(project_path)
-        cmd = ["make", "-f", IMPL_MAKEFILE, "csynth"]
+        log_path = project_path / "hls_csynth.log"
+        if self.tool.name == "vitis-run":
+            cmd = ["vitis-run", "--mode", "hls", "--tcl", "run.tcl"]
+        else:
+            cmd = ["vitis_hls", "-f", "run.tcl"]
         with stage(
             "Running Vitis HLS Synthesis",
-            on_error=lambda error: _log_synth_failure(log_path, error),
-            on_exit=lambda: _log_synth_note(log_path),
+            on_error=lambda error: log_failure_tail("Synthesis", log_path, error),
+            on_exit=lambda: log_info(
+                f"Vitis HLS synthesis log saved to: {log_path.resolve()}"
+            ),
         ):
-            run_command(cmd, cwd=project_path, env=dict(self.tool.env))
+            run_command(cmd, cwd=project_path, env=self.tool.env)
 
     def _validate_top_abi(self) -> None:
         ret_types = self.kernel.parse_return_annotation()

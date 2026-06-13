@@ -23,7 +23,7 @@ from ...logging import (
 )
 
 SYNTH_LOG = Path("logs") / "hls_run_tcl.log"
-SYNTH_LOG_TAIL_LINES = 100
+LOG_FAILURE_TAIL_LINES = 100
 TEMPLATE_DIR = Path(__file__).with_name("templates")
 
 _INTERFACE_MODES = ("m_axi", "axis", "s_axilite")
@@ -62,7 +62,7 @@ _VITIS_VERSION_RE = re.compile(r"\bv?(\d{4}\.\d+(?:\.\d+)?)\b")
 class VitisTool:
     name: str
     executable: Path
-    env: Mapping[str, str]
+    env: dict[str, str]
     version: str = "unknown"
 
 
@@ -80,6 +80,19 @@ def generate_hls_cfg(top: str, part: str, freq_mhz: float, flow_target: str) -> 
         part=part,
         flow_target=flow_target,
         clock_period=clock_period,
+    )
+
+
+def generate_run_tcl(top: str, part: str, freq_mhz: float, flow_target: str) -> str:
+    """Render the ``run.tcl`` script consumed by ``vitis-run --mode hls`` for
+    the emulation/hardware flow."""
+    period = 1000.0 / freq_mhz
+    return _render_template(
+        "run.tcl",
+        top=top,
+        part=part,
+        period=period,
+        flow_target=flow_target,
     )
 
 
@@ -341,19 +354,11 @@ def _apply_interface_pragmas(
     return "\n".join(lines) + ("\n" if hls_code.endswith("\n") else "")
 
 
-def _synth_log_path(project_path: Path) -> Path:
-    return project_path / SYNTH_LOG
-
-
-def _log_synth_note(log_path: Path) -> None:
-    log_info(f"Synthesis log exported to: {log_path}")
-
-
-def _log_synth_failure(log_path: Path, error: Exception) -> None:
-    tail = read_text_tail(log_path, max_lines=SYNTH_LOG_TAIL_LINES)
+def log_failure_tail(cmd_name: str, log_path: Path, error: Exception) -> None:
+    tail = read_text_tail(log_path, max_lines=LOG_FAILURE_TAIL_LINES)
     if not tail and isinstance(error, CommandError):
-        tail = error.output_tail(SYNTH_LOG_TAIL_LINES)
-    log_tail("Synthesis log tail", tail, max_lines=SYNTH_LOG_TAIL_LINES)
+        tail = error.output_tail(LOG_FAILURE_TAIL_LINES)
+    log_tail(f"{cmd_name} log tail", tail, max_lines=LOG_FAILURE_TAIL_LINES)
 
 
 def _source_settings_env(settings64: Path) -> dict[str, str] | None:
