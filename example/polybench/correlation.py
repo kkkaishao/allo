@@ -3,8 +3,8 @@
 
 import numpy as np
 
-from allo.exp.lang import f32, kernel
-from allo.exp.operators import math as amath
+from allo.lang import f32, kernel
+from allo.operators import math as amath
 
 M = 80
 N = 100

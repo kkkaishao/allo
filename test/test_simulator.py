@@ -3,8 +3,8 @@
 
 import numpy as np
 
-from allo.exp.lang.core import APInt, i32, range as arange
-from allo.exp.lang.kernel import kernel
+from allo.lang.core import APInt, i32, range as arange
+from allo.lang.kernel import kernel
 
 
 def test_simulator_apint_buffers():

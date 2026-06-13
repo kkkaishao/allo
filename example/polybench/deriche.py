@@ -5,7 +5,7 @@ import math
 
 import numpy as np
 
-from allo.exp.lang import f32, index, kernel
+from allo.lang import f32, index, kernel
 
 W = 192
 H = 128

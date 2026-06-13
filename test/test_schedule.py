@@ -4,10 +4,10 @@
 import numpy as np
 import pytest
 
-from allo.exp.lang.core import range, i32, f32, Template
-from allo.exp.lang.kernel import kernel
-from allo.exp.schedule import Schedule
-from allo.exp.schedule.errors import ScheduleLookupError, ScheduleTransformError
+from allo.lang.core import range, i32, f32, Template
+from allo.lang.kernel import kernel
+from allo.schedule import Schedule
+from allo.schedule.errors import ScheduleLookupError, ScheduleTransformError
 
 AFFINE_LOOP_IR = r"""
 module {

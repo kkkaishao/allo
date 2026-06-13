@@ -8,8 +8,8 @@ import math
 
 import numpy as np
 
-from allo.exp.lang.core import BufferType, DType
-from allo.exp.lang.kernel import Kernel
+from allo.lang.core import BufferType, DType
+from allo.lang.kernel import Kernel
 
 RTOL = 1e-5
 ATOL = 1e-5

@@ -3,11 +3,11 @@
 
 import pytest
 
-from allo.exp.compiler.mlir_codegen import compile as compile_kernel
-from allo.exp.compiler.errors import CompilationError
-from allo.exp.lang.core import f32, i32
-from allo.exp.lang.kernel import KernelOptions, kernel
-from allo.exp.operators import math as allo_math
+from allo.compiler.mlir_codegen import compile as compile_kernel
+from allo.compiler.errors import CompilationError
+from allo.lang.core import f32, i32
+from allo.lang.kernel import KernelOptions, kernel
+from allo.operators import math as allo_math
 
 
 def _compile_ir(fn) -> str:

@@ -3,7 +3,7 @@
 
 # strided_fft.py
 
-from allo.exp.lang import f64, i32, kernel
+from allo.lang import f64, i32, kernel
 from .. import run_machsuite_kernel
 
 FFT_SIZE = 128

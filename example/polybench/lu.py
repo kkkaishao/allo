@@ -1,7 +1,7 @@
 # Copyright Allo authors. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-from allo.exp.lang import f32, kernel
+from allo.lang import f32, kernel
 
 N = 120
 

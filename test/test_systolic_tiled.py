@@ -13,10 +13,10 @@ import tempfile
 import numpy as np
 import pytest
 
-import allo.exp as allo
-from allo.exp.lang.core import i32, Stream
-from allo.exp.lang.kernel import kernel
-from allo.exp.backend.vitis.core import is_vitis_available
+import allo
+from allo.lang.core import i32, Stream
+from allo.lang.kernel import kernel
+from allo.backend.vitis.core import is_vitis_available
 
 requires_vitis = pytest.mark.skipif(
     not is_vitis_available(), reason="Vitis HLS toolchain not detected"

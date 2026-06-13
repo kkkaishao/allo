@@ -3,11 +3,11 @@
 
 import pytest
 
-from allo.exp.compiler.errors import CompilationError
-from allo.exp.compiler.mlir_codegen import compile as compile_kernel
-from allo.exp.lang.core import f32, u1, u32
-from allo.exp.lang.kernel import KernelOptions, kernel
-from allo.exp.operators import arith as allo_arith
+from allo.compiler.errors import CompilationError
+from allo.compiler.mlir_codegen import compile as compile_kernel
+from allo.lang.core import f32, u1, u32
+from allo.lang.kernel import KernelOptions, kernel
+from allo.operators import arith as allo_arith
 
 
 def _compile_ir(fn) -> str:

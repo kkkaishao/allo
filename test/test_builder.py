@@ -5,11 +5,10 @@ import ast
 
 import pytest
 
-import allo.exp as allo
-import allo.exp.lang.core as allo_core
-from allo.exp.compiler.errors import CompilationError
-from allo.exp.compiler.mlir_codegen import compile as compile_kernel
-from allo.exp.lang.core import (
+import allo
+from allo.compiler.errors import CompilationError
+from allo.compiler.mlir_codegen import compile as compile_kernel
+from allo.lang.core import (
     Template,
     bool as allo_bool,
     constexpr,
@@ -20,8 +19,8 @@ from allo.exp.lang.core import (
     u8,
     u32,
 )
-from allo.exp.lang.kernel import KernelOptions, consteval, kernel
-from allo.exp.operators.arith import max as allo_max
+from allo.lang.kernel import KernelOptions, consteval, kernel
+from allo.operators.arith import max as allo_max
 
 _GLOBAL_SHAPE_M = 2
 _GLOBAL_SHAPE_N = 3
@@ -1010,7 +1009,7 @@ def test_nested_capture_kernel_alias():
 def test_nested_capture_module_alias():
     @kernel
     def top(out: i32[2]):
-        M: constexpr = allo_core
+        M: constexpr = allo.lang.core
 
         @kernel
         def worker(buf: i32[2]):

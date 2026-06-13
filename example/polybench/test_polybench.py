@@ -8,8 +8,8 @@ from pathlib import Path
 
 import numpy as np
 
-from allo.exp.lang.core import BufferType, DType
-from allo.exp.lang.kernel import Kernel
+from allo.lang.core import BufferType, DType
+from allo.lang.kernel import Kernel
 
 _DTYPE_TO_NP = {
     "float16": np.float16,

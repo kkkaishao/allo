@@ -20,7 +20,7 @@ import tempfile
 import numpy as np
 import pytest
 
-from allo.exp.lang.core import (
+from allo.lang.core import (
     range as arange,
     i32,
     f32,
@@ -29,9 +29,9 @@ from allo.exp.lang.core import (
     Stateful,
     Template,
 )
-from allo.exp.lang.kernel import kernel
-from allo.exp.backend.vitis.core import is_vitis_available
-from allo.exp.backend.vitis.csim import discover_csim
+from allo.lang.kernel import kernel
+from allo.backend.vitis.core import is_vitis_available
+from allo.backend.vitis.csim import discover_csim
 from pathlib import Path
 
 u32 = APInt(32, signed=False)

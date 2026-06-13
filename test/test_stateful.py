@@ -3,8 +3,8 @@
 
 import numpy as np
 
-from allo.exp.lang.core import i32, f32, u1, Stateful, range as arange
-from allo.exp.lang.kernel import kernel
+from allo.lang.core import i32, f32, u1, Stateful, range as arange
+from allo.lang.kernel import kernel
 
 
 def test_stateless_scalar():

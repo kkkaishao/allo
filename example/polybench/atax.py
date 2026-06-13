@@ -3,7 +3,7 @@
 
 import numpy as np
 
-from allo.exp.lang import f32, kernel
+from allo.lang import f32, kernel
 
 M = 116
 N = 124

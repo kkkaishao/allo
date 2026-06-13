@@ -3,8 +3,8 @@
 
 # transpose_fft.py
 
-from allo.exp.lang import f32, i32, index, kernel
-from allo.exp.operators import math as allo_math
+from allo.lang import f32, i32, index, kernel
+from allo.operators import math as allo_math
 from .. import run_machsuite_kernel
 import numpy as np
 

@@ -1,7 +1,7 @@
 # Copyright Allo authors. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-from allo.exp.lang import f64, i32, grid, kernel
+from allo.lang import f64, i32, grid, kernel
 from .. import run_machsuite_kernel
 import numpy as np
 
