@@ -158,6 +158,45 @@ static void collectBlockedStreams(ModuleOp module,
   });
 }
 
+// "Blocked" must be a property of the whole channel, not of a single accessor:
+// if any process accesses a stream-array channel with a dynamic lane, every
+// other accessor must keep the array too -- otherwise the dynamic-index process
+// retains the array while the static-index siblings get fresh scalar streams,
+// silently disconnecting the design. Propagate blocked-ness across each
+// `invoke` operand <-> callee argument edge (both directions) to a fixpoint so
+// the channel's `stream.create` and all bound arguments share one status.
+static void propagateBlockedStreams(ModuleOp module,
+                                    SymbolTableCollection &symbols,
+                                    BlockedStreamSet &blockedStreams) {
+  SmallVector<InvokeOp, 8> invokes;
+  module.walk([&](InvokeOp invoke) { invokes.push_back(invoke); });
+
+  bool changed = true;
+  while (changed) {
+    changed = false;
+    for (InvokeOp invoke : invokes) {
+      auto callee = symbols.lookupNearestSymbolFrom<KernelOp>(
+          invoke, invoke.getCalleeAttr());
+      if (!callee || callee.getBody().empty())
+        continue;
+      Block &entry = callee.getBody().front();
+      unsigned numEdges =
+          std::min<unsigned>(invoke->getNumOperands(), entry.getNumArguments());
+      for (unsigned i = 0; i < numEdges; ++i) {
+        Value operand = invoke->getOperand(i);
+        if (!isRankedStream(operand.getType()))
+          continue;
+        BlockArgument calleeArg = entry.getArgument(i);
+        if (!blockedStreams.contains(operand) &&
+            !blockedStreams.contains(calleeArg))
+          continue;
+        changed |= blockedStreams.insert(operand).second;
+        changed |= blockedStreams.insert(calleeArg).second;
+      }
+    }
+  }
+}
+
 static LogicalResult collectDirectPortDemands(KernelOp kernel,
                                               KernelPortPlanMap &plans,
                                               BlockedStreamSet &blockedStreams,
@@ -804,6 +843,7 @@ struct MaterializeTopologyPass
     SymbolTableCollection symbols;
     BlockedStreamSet blockedStreams;
     collectBlockedStreams(module, blockedStreams);
+    propagateBlockedStreams(module, symbols, blockedStreams);
 
     KernelPortPlanMap portPlans;
     if (failed(collectKernelPortPlans(module, symbols, portPlans,
