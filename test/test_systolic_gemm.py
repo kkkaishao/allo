@@ -105,7 +105,7 @@ def test_2d_synth():
         report = (
             systolic_2d.schedule().export("vitis", part=PART, project_path=proj).synth()
         )
-        assert report.xml_path.exists()
+        assert report.exists()
 
 
 # ===========================================================================
@@ -189,4 +189,4 @@ def test_1d_synth():
         report = (
             systolic_1d.schedule().export("vitis", part=PART, project_path=proj).synth()
         )
-        assert report.xml_path.exists()
+        assert report.exists()

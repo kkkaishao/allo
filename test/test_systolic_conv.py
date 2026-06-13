@@ -126,4 +126,4 @@ def test_csim():
 def test_synth():
     with tempfile.TemporaryDirectory() as proj:
         report = top.schedule().export("vitis", part=PART, project_path=proj).synth()
-        assert report.xml_path.exists()
+        assert report.exists()

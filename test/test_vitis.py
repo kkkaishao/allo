@@ -306,7 +306,7 @@ def test_synth_gemm_tile_pipeline():
     s.pipeline(s.loop("k"), ii=1)
     with tempfile.TemporaryDirectory() as project:
         report = s.export("vitis", part=PART, project_path=project).synth()
-        assert report.xml_path.exists()
+        assert report.exists()
 
 
 @requires_vitis
@@ -331,7 +331,7 @@ def test_synth_block_stream_datamover():
         report = (
             dmover.schedule().export("vitis", part=PART, project_path=project).synth()
         )
-        assert report.xml_path.exists()
+        assert report.exists()
 
 
 @requires_vitis
@@ -476,4 +476,4 @@ def test_synth_stateful_counter():
         report = (
             counter.schedule().export("vitis", part=PART, project_path=project).synth()
         )
-        assert report.xml_path.exists()
+        assert report.exists()
