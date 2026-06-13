@@ -1,389 +1,479 @@
 # Copyright Allo authors. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+"""Vitis HLS backend regression tests.
+
+Two layers:
+
+* **Codegen** tests drive a kernel through the schedule interface
+  (``kernel.schedule() -> s.<transform>() -> s.export("vitis").hls_code``) and
+  assert on the emitted C++. They need no toolchain and run everywhere.
+* **Synthesis / simulation** tests are gated on ``is_vitis_available()`` and
+  invoke real Vitis HLS via ``s.export("vitis", part=...).synth()`` / csim.
+
+Tests always go through the schedule interface, never a hand-built ``Vitis``.
+"""
+
+import re
 import tempfile
 
 import numpy as np
-import allo
-from allo.ir.types import uint64, uint256, int32, float32, int512, bool
-from allo.utils import get_np_struct_type
-import allo.dataflow as df
-from allo.backend import hls
+import pytest
+
+from allo.lang.core import (
+    range as arange,
+    i32,
+    f32,
+    APInt,
+    Stream,
+    Stateful,
+    Template,
+)
+from allo.lang.kernel import kernel
+from allo.backend.vitis.core import is_vitis_available
+from allo.backend.vitis.csim import discover_csim
+from pathlib import Path
+
+u32 = APInt(32, signed=False)
+u256 = APInt(256, signed=False)
+
+PART = "xcvu9p-flga2104-2-i"
+requires_vitis = pytest.mark.skipif(
+    not is_vitis_available(), reason="Vitis HLS toolchain not detected"
+)
 
 
-# ##############################################################
-# Test basic
-# ##############################################################
-def test_grid_for_gemm():
-    # from `test_builder.py`, with return value
-
-    # This test is to make sure the whole flow works properly.
-    def gemm(A: int32[32, 32], B: int32[32, 32]) -> int32[32, 32]:
-        C: int32[32, 32] = 0
-        # Use grid_for with name annotation
-        for i, j, k in allo.grid(32, 32, 32, name="C"):
-            C[i, j] += A[i, k] * B[k, j]
-        return C
-
-    # 1. Create customization
-    s = allo.customize(gemm)
-    print(s.module)
-
-    # 2. Apply transformations and make sure each step the module can be printed
-    s.split("i", 8)
-    print(s.module)
-    s.split("j", 8)
-    print(s.module)
-    s.reorder("i.outer", "j.outer", "i.inner", "j.inner")
-    print(s.module)
-    # Make sure the generated loops are correct and ordered
-    loops = s.get_loops()
-    expected = ["i.outer", "j.outer", "i.inner", "j.inner", "k"]
-    assert expected == list(loops.C.loops.keys())
-
-    # 5. HLS CSIM
-    if hls.is_available("vitis_hls"):
-        np_A = np.random.randint(0, 10, size=(32, 32)).astype(np.int32)
-        np_B = np.random.randint(0, 10, size=(32, 32)).astype(np.int32)
-        np_C = np.matmul(np_A, np_B)
-        with tempfile.TemporaryDirectory() as tmpdir:
-            hls_mod = s.build(
-                target="vitis_hls",
-                mode="sw_emu",
-                project=tmpdir,
-            )
-            sw_out = np.zeros((32, 32), dtype=np.int32)
-            hls_mod(np_A, np_B, sw_out)
-            np.testing.assert_allclose(sw_out, np_C, atol=1e-3)
-            print("Passed HLS test!")
+def _find_legacy_vitis() -> str | None:
+    """A pre-2025.2 Vitis home whose csim routes to the legacy plain-g++ flow."""
+    candidates = sorted(Path("/tools/Xilinx/Vitis").glob("*")) + sorted(
+        Path("/opt/xilinx").glob("*/Vitis")
+    )
+    for home in candidates:
+        try:
+            if discover_csim(home).flavor == "legacy":
+                return str(home)
+        except Exception:
+            continue
+    return None
 
 
-def test_vitis_gemm_template_int32():
-    # from `test_vhls.py`
-    def gemm[T, M, N, K](A: "T[M, K]", B: "T[K, N]") -> "T[M, N]":
-        C: T[M, N] = 0
-        for i, j, k in allo.grid(M, N, K, name="C"):
-            C[i, j] += A[i, k] * B[k, j]
-        return C
-
-    s = allo.customize(gemm, instantiate=[int32, 32, 32, 32])
-    if hls.is_available("vitis_hls"):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            mod = s.build(target="vitis_hls", mode="sw_emu", project=tmpdir)
-            np_A = np.random.randint(0, 10, size=(32, 32)).astype(np.int32)
-            np_B = np.random.randint(0, 10, size=(32, 32)).astype(np.int32)
-            np_C = np.matmul(np_A, np_B)
-            np_C_allo = np.zeros((32, 32), dtype=np.int32)
-            mod(np_A, np_B, np_C_allo)
-            np.testing.assert_allclose(np_C, np_C_allo, rtol=1e-4)
-            print("Passed!")
+_LEGACY_VITIS = _find_legacy_vitis()
+requires_legacy_vitis = pytest.mark.skipif(
+    _LEGACY_VITIS is None, reason="No pre-2025.2 Vitis install for legacy csim"
+)
 
 
-def test_vitis_gemm_template_float32():
-    # from `test_vhls.py`
-    def gemm[T, M, N, K](A: "T[M, K]", B: "T[K, N]") -> "T[M, N]":
-        C: T[M, N] = 0
-        for i, j, k in allo.grid(M, N, K, name="C"):
-            C[i, j] += A[i, k] * B[k, j]
-        return C
-
-    s = allo.customize(gemm, instantiate=[float32, 64, 64, 64])
-    if hls.is_available("vitis_hls"):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            mod = s.build(target="vitis_hls", mode="sw_emu", project=tmpdir)
-            np_A = np.random.random(size=(64, 64)).astype(np.float32)
-            np_B = np.random.random(size=(64, 64)).astype(np.float32)
-            np_C = np.matmul(np_A, np_B)
-            np_C_allo = np.zeros((64, 64), dtype=np.float32)
-            mod(np_A, np_B, np_C_allo)
-            np.testing.assert_allclose(np_C, np_C_allo, rtol=1e-4)
-            print("Passed!")
+def _hls(schedule, **export_kwargs) -> str:
+    """Emit the HLS C++ for a scheduled kernel (no toolchain required)."""
+    return schedule.export("vitis", **export_kwargs).hls_code
 
 
-def test_vitis_io_stream():
-    # from `test_vhls.py`
-    def foo(A: int32[32, 32], B: int32[32, 32]):
-        pass
-
-    def top(A: int32[32, 32]) -> int32[32, 32]:
-        B: int32[32, 32]
-        foo(A, B)
-        return B
-
-    s = allo.customize(top)
-    s.dataflow("top")
-    if hls.is_available("vitis_hls"):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            hls_mod = s.build(target="vitis_hls", mode="sw_emu", project=tmpdir)
-            print(s.module)
-            np_A = np.random.randint(0, 10, size=(32, 32)).astype(np.int32)
-            np_B = np.zeros((32, 32), dtype=np.int32)
-            hls_mod(np_A, np_B)
-            print("Passed!")
+def _contains(code: str, *needles: str):
+    for needle in needles:
+        assert needle in code, f"expected to find {needle!r} in:\n{code}"
 
 
-def test_scalar():
-    # from `test_vhls.py`, test scalar
-    def case1(C: int32) -> int32:
-        return C + 1
-
-    s = allo.customize(case1)
-    mod = s.build()
-    assert mod(1) == 2
-    print("Passed CPU simulation!")
-    with tempfile.TemporaryDirectory() as tmpdir:
-        mod = s.build(target="vitis_hls", mode="sw_emu", project=tmpdir)
-        if hls.is_available("vitis_hls"):
-            ret = np.zeros((1,), dtype=np.int32)
-            mod(1, ret)
-            assert ret == 2
-            print("Passed!")
+def _regex(code: str, *patterns: str):
+    for pattern in patterns:
+        assert re.search(pattern, code), f"no match for {pattern!r} in:\n{code}"
 
 
-def test_pointer_generation():
-    # from `test_vhls.py`, test bool and scalar
-    def top(inst: bool, C: int32[3]):
-        if inst:
-            C[0] = C[0] + 1
-
-    s = allo.customize(top)
-    with tempfile.TemporaryDirectory() as tmpdir:
-        mod = s.build(target="vitis_hls", mode="sw_emu", project=tmpdir)
-        assert "bool v" in mod.hls_code and ",," not in mod.hls_code
-        if hls.is_available("vitis_hls"):
-            inst = np.array([1], dtype=np.bool_)
-            C = np.array([1, 2, 3], dtype=np.int32)
-            mod(inst, C)
-            np.testing.assert_allclose(C, [2, 2, 3], rtol=1e-5)
-            print("Passed!")
-
-    if hls.is_available("vitis_hls"):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            mod = s.build(target="vitis_hls", mode="sw_emu", project=tmpdir)
-            inst = np.array([0], dtype=np.bool_)
-            C = np.array([1, 2, 3], dtype=np.int32)
-            mod(inst, C)
-            np.testing.assert_allclose(C, [1, 2, 3], rtol=1e-5)
-            print("Passed!")
+# ===========================================================================
+# Codegen-text tests (no toolchain)
+# ===========================================================================
 
 
-def test_bool_array():
-    # modified from `test_vhls.py`, test bool array
-    def top(inst: bool[3], C: int32[3]):
-        for i in range(3):
-            if inst[i]:
-                C[i] = C[i] + 1
+def test_codegen_vadd_pipeline():
+    @kernel
+    def vadd(A: f32[16], B: f32[16], C: f32[16]):
+        for i in arange(16, name="i"):
+            C[i] = A[i] + B[i]
 
-    s = allo.customize(top)
-    with tempfile.TemporaryDirectory() as tmpdir:
-        mod = s.build(target="vitis_hls", mode="sw_emu", project=tmpdir)
-        if hls.is_available("vitis_hls"):
-            inst = np.array([1, 0, 1], dtype=np.bool_)
-            C = np.array([1, 2, 3], dtype=np.int32)
-            mod(inst, C)
-            np.testing.assert_allclose(C, [2, 2, 4], rtol=1e-5)
-            print("Passed!")
+    s = vadd.schedule()
+    s.pipeline(s.loop("i"), ii=1)
+    code = _hls(s)
+    _contains(code, 'extern "C" void vadd(float ', "#pragma HLS pipeline II=1")
+    _regex(code, r"= v\d+ \+ v\d+;")
 
 
-# ##############################################################
-# Test large bitwidth
-# ##############################################################
-def test_vadd():
-    # test 256 bits
-    VLEN = 256
-    ELEN = 32
+def test_codegen_vadd2_tile():
+    @kernel
+    def vadd2(A: f32[8, 8], B: f32[8, 8], C: f32[8, 8]):
+        for i in arange(8, name="i"):
+            for j in arange(8, name="j"):
+                C[i, j] = A[i, j] + B[i, j]
 
-    np_256 = get_np_struct_type(VLEN)
-
-    @df.region()
-    def top(A: uint256[1], B: uint256[1], C: uint256[1]):
-        @df.kernel(mapping=[1], args=[A, B, C])
-        def VEC(
-            local_A: uint256[1],
-            local_B: uint256[1],
-            local_C: uint256[1],
-        ):
-            for i in allo.grid(VLEN // ELEN, name="vec_nest"):
-                local_C[0][i * ELEN : (i + 1) * ELEN] = (
-                    local_A[0][i * ELEN : (i + 1) * ELEN]
-                    + local_B[0][i * ELEN : (i + 1) * ELEN]
-                )
-
-    A = np.random.randint(0, 64, (VLEN // ELEN,)).astype(np.uint32)
-    B = np.random.randint(0, 64, (VLEN // ELEN,)).astype(np.uint32)
-    C = np.zeros(
-        VLEN // ELEN,
-    ).astype(np.uint32)
-    packed_A = np.ascontiguousarray(A).view(np_256)
-    packed_B = np.ascontiguousarray(B).view(np_256)
-    packed_C = np.ascontiguousarray(C).view(np_256)
-
-    mod = df.build(top, target="simulator")
-    mod(packed_A, packed_B, packed_C)
-    unpacked_C = packed_C.view(np.uint32)
-    np.testing.assert_allclose(A + B, unpacked_C, rtol=1e-5, atol=1e-5)
-    print("PASSED!")
-
-    s = df.customize(top)
-    # unroll the lanes
-    nest_loop_i = s.get_loops("VEC_0")["vec_nest"]["i"]
-    s.unroll(nest_loop_i)
-    print(s.module)
-
-    if hls.is_available("vitis_hls"):
-        print("Starting Test...")
-        with tempfile.TemporaryDirectory() as tmpdir:
-            mod = s.build(
-                target="vitis_hls",
-                mode="sw_emu",
-                project=tmpdir,
-                wrap_io=False,
-            )
-            mod(packed_A, packed_B, packed_C)
-            unpacked_C = packed_C.view(np.uint32)
-            np.testing.assert_allclose(A + B, unpacked_C, rtol=1e-5, atol=1e-5)
-            print(unpacked_C)
-            print("Passed Test!")
+    s = vadd2.schedule()
+    i, j = s.affine(s.loops("i", "j"))
+    s.tile((i, j), factors=[4, 4])
+    code = _hls(s)
+    _contains(code, "void vadd2(float v0[8][8]")
+    # 8 split by 4 -> a 2-iteration outer band over a 4-iteration inner band.
+    _regex(code, r"< 2;", r"< 4;")
+    assert code.count("for (") >= 4
 
 
-def test_packed_add():
-    # test 512 bits
-    np_512 = get_np_struct_type(512)
+def test_codegen_gemm_reorder_pipeline():
+    M, K, N = Template("M"), Template("K"), Template("N")
 
-    def packed_add(input_: int512[1], output_: int512[1]):
-        unpacked: int32[16]
-        packed: int512
+    @kernel(M, K, N)
+    def gemm(A: f32[M, K], B: f32[K, N], C: f32[M, N]):
+        for i in arange(M, name="i"):
+            for j in arange(N, name="j"):
+                for k in arange(K, name="k"):
+                    C[i, j] += A[i, k] * B[k, j]
 
-        for i in range(16):
-            unpacked[i] = input_[0][i * 32 : (i + 1) * 32]
-
-        for i in range(16):
-            unpacked[i] = unpacked[i] + 1
-
-        for i in range(16):
-            packed[i * 32 : (i + 1) * 32] = unpacked[i]
-
-        output_[0] = packed
-
-    A = np.random.randint(0, 64, (512 // 32,)).astype(np.int32)
-    B = np.zeros(512 // 32).astype(np.int32)
-    packed_A = np.ascontiguousarray(A).view(np_512)
-    packed_B = np.ascontiguousarray(B).view(np_512)
-    s = allo.customize(packed_add)
-    if hls.is_available("vitis_hls"):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            mod = s.build(target="vitis_hls", mode="sw_emu", project=tmpdir)
-            mod(packed_A, packed_B)
-            unpacked_B = packed_B.view(np.int32)
-            np.testing.assert_allclose(A + 1, unpacked_B, rtol=1e-5, atol=1e-5)
-            print(unpacked_B)
-            print("Passed Test!")
+    s = gemm[16, 16, 16].schedule()
+    s.affine(s.loops("i", "j", "k"))
+    s.reorder((s.loop("k"), s.loop("j")))
+    s.pipeline(s.loop("j"), ii=1)
+    code = _hls(s)
+    _contains(code, "void gemm(float v0[16][16]", "#pragma HLS pipeline II=1")
+    _regex(code, r"= v\d+ \* v\d+;")
+    assert code.count("for (") >= 3
 
 
-def test_hbm_mapping_config():
-    """Test that HBM mapping generates the correct configuration file."""
-    import os
+def test_codegen_reduction():
+    @kernel
+    def vsum(A: f32[16], out: f32[1]):
+        for i in arange(16, name="i"):
+            out[0] += A[i]
 
-    def gemm(A: int32[32, 32], B: int32[32, 32]) -> int32[32, 32]:
-        C: int32[32, 32] = 0
-        for i, j, k in allo.grid(32, 32, 32, name="C"):
-            C[i, j] += A[i, k] * B[k, j]
-        return C
+    s = vsum.schedule()
+    s.pipeline(s.loop("i"), ii=1)
+    code = _hls(s)
+    _contains(code, "void vsum(float v0[16], float v1[1])", "#pragma HLS pipeline II=1")
+    _regex(code, r"= v\d+ \+ v\d+;")
 
-    s = allo.customize(gemm)
 
-    # Test with HBM mapping configuration
-    # Use actual argument names from the function definition
-    # Return values are named "output_0", "output_1", etc.
-    hbm_mapping = {
-        "A": 0,  # HBM channel 0 (using int)
-        "B": "HBM[1]",  # HBM channel 1 (using string)
-        "output_0": "DDR[0]",  # Return value -> DDR bank 0
-    }
+def test_codegen_stencil():
+    @kernel
+    def stencil(A: f32[18], B: f32[16]):
+        for i in arange(16, name="i"):
+            B[i] = A[i] + A[i + 1] + A[i + 2]
 
-    with tempfile.TemporaryDirectory() as tmpdir:
-        # Build with HBM mapping
-        mod = s.build(
-            target="vitis_hls",
-            mode="csyn",  # Just use csyn to generate files without running HLS
-            project=tmpdir,
-            configs={"hbm_mapping": hbm_mapping},
+    s = stencil.schedule()
+    s.pipeline(s.loop("i"), ii=1)
+    code = _hls(s)
+    _contains(code, "void stencil(float v0[18], float v1[16])", "#pragma HLS pipeline")
+    # three taps summed -> at least two additions
+    assert len(re.findall(r"= v\d+ \+ v\d+;", code)) >= 2
+
+
+def test_codegen_wide_integer():
+    @kernel
+    def copy256(A: u256[8], B: u256[8]):
+        for i in arange(8, name="i"):
+            B[i] = A[i]
+
+    code = _hls(copy256.schedule())
+    _contains(code, "void copy256(ap_uint<256> v0[8], ap_uint<256> v1[8])")
+
+
+def test_codegen_apint_csim_wrapper():
+    i5 = APInt(5, signed=True)
+    u5 = APInt(5, signed=False)
+
+    @kernel
+    def vadd5(A: i5[8], B: u5[8], C: i5[8]):
+        for i in arange(8, name="i"):
+            C[i] = A[i] + B[i]
+
+    backend = vadd5.schedule().export("vitis")
+    # The synthesizable interface keeps the real ap_int boundary.
+    _contains(
+        backend.hls_code,
+        "void vadd5(ap_int<5> v0[8], ap_uint<5> v1[8], ap_int<5> v2[8])",
+    )
+    # C simulation wraps it with a std-width interface around the renamed kernel,
+    # so ctypes can call it (signedness preserved per operand).
+    csim_cpp = backend._compile_for_csim().kernel_cpp
+    _contains(
+        csim_cpp,
+        'extern "C" void vadd5(int8_t v0[8], uint8_t v1[8], int8_t v2[8])',
+        "void vadd5__impl(ap_int<5>",
+        "ap_int<5> v",  # signed temp matches the callee parameter
+        "ap_uint<5> v",  # unsigned temp
+    )
+
+
+def test_codegen_bit_slice():
+    @kernel
+    def bits(x: u32, out: u32[1]):
+        y: u32 = x
+        y[0:4] = 5
+        out[0] = y[4:8]
+
+    code = _hls(bits.schedule())
+    _contains(code, "& ~(0xfULL <<", "static_cast<uint32_t>", "ap_uint<4>")
+    _regex(code, r">> v\d+\) & 0xfULL")
+
+
+def test_codegen_signed_max_min():
+    # Signless i32 values default to unsigned C++ types, so a signed maxsi/minsi
+    # must cast its operands to signed before std::max/std::min -- otherwise a
+    # negative value compares as a huge unsigned and the result is wrong.
+    @kernel
+    def clamp(x: i32, out: i32[2]):
+        out[0] = max(0, x)
+        out[1] = min(0, x)
+
+    code = _hls(clamp.schedule())
+    _contains(code, "std::max(static_cast<int32_t>", "std::min(static_cast<int32_t>")
+
+
+@requires_vitis
+def test_csim_signed_max():
+    @kernel
+    def clamp(x: i32, out: i32[1]):
+        out[0] = max(0, x)
+
+    out = np.zeros(1, dtype=np.int32)
+    with tempfile.TemporaryDirectory() as project:
+        clamp.schedule().export("vitis", project_path=project)(-5, out)
+    assert int(out[0]) == 0
+
+
+def test_codegen_block_stream_datamover():
+    @kernel
+    def dmover(inp: i32[4, 4], out: i32[1]):
+        fifo: Stream[i32[4, 4]]
+
+        @kernel
+        def load(src: i32[4, 4], strm: Stream[i32[4, 4]]):
+            strm.put(src)
+
+        @kernel
+        def compute(strm: Stream[i32[4, 4]], dst: i32[1]):
+            blk = strm.get()
+            dst[0] = blk[0, 0]
+
+        load(inp, fifo)
+        compute(fifo, out)
+
+    code = _hls(dmover.schedule())
+    # Block payload streams element-by-element through a scalar FIFO whose depth
+    # is scaled by the block size (2 blocks x 4x4 = 32), not via stream_of_blocks.
+    _contains(
+        code,
+        "hls::stream<uint32_t>",
+        ".write(",
+        ".read()",
+        "dmover_load",
+        "dmover_compute",
+    )
+    _regex(code, r"#pragma HLS stream variable=v\d+ depth=32")
+    assert "stream_of_blocks" not in code
+    assert "read_lock" not in code
+
+
+def test_codegen_maxi_interface():
+    @kernel
+    def axicopy(A: i32[64], B: i32[64]):
+        for i in arange(64, name="i"):
+            B[i] = A[i] + 1
+
+    backend = axicopy.schedule().export("vitis", part=PART)
+    backend.set_axi(0, offset="slave", bundle="gmem")
+    backend.set_axi(1, offset="slave", bundle="gmem")
+    code = backend.hls_code
+    _contains(
+        code,
+        "#pragma HLS INTERFACE mode=m_axi port=v0 offset=slave bundle=gmem",
+        "#pragma HLS INTERFACE mode=m_axi port=v1 offset=slave bundle=gmem",
+    )
+
+
+# ===========================================================================
+# Synthesis / simulation tests (gated on a real Vitis HLS toolchain)
+# ===========================================================================
+
+
+@requires_vitis
+def test_synth_gemm_tile_pipeline():
+    M = N = K = 16
+
+    @kernel
+    def gemm(A: f32[M, K], B: f32[K, N], C: f32[M, N]):
+        for i in arange(M, name="i"):
+            for j in arange(N, name="j"):
+                for k in arange(K, name="k"):
+                    C[i, j] += A[i, k] * B[k, j]
+
+    s = gemm.schedule()
+    i, j, k = s.affine(s.loops("i", "j", "k"))
+    s.tile((i, j), factors=[4, 4])
+    s.pipeline(s.loop("k"), ii=1)
+    with tempfile.TemporaryDirectory() as project:
+        report = s.export("vitis", part=PART, project_path=project).synth()
+        assert report.exists()
+
+
+@requires_vitis
+def test_synth_block_stream_datamover():
+    @kernel
+    def dmover(inp: i32[4, 4], out: i32[1]):
+        fifo: Stream[i32[4, 4]]
+
+        @kernel
+        def load(src: i32[4, 4], strm: Stream[i32[4, 4]]):
+            strm.put(src)
+
+        @kernel
+        def compute(strm: Stream[i32[4, 4]], dst: i32[1]):
+            blk = strm.get()
+            dst[0] = blk[0, 0]
+
+        load(inp, fifo)
+        compute(fifo, out)
+
+    with tempfile.TemporaryDirectory() as project:
+        report = (
+            dmover.schedule().export("vitis", part=PART, project_path=project).synth()
         )
-
-        # Check that the configuration file was created
-        cfg_file = os.path.join(tmpdir, "gemm.cfg")
-        assert os.path.exists(
-            cfg_file
-        ), f"Configuration file {cfg_file} was not created"
-
-        # Read and verify the configuration file content
-        with open(cfg_file, "r") as f:
-            cfg_content = f.read()
-
-        print("Generated config file content:")
-        print(cfg_content)
-
-        # Verify the content - user names should be mapped to HLS argument names
-        # The generated HLS code uses names like v15, v16, v17
-        assert "[connectivity]" in cfg_content
-        assert ":HBM[0]" in cfg_content  # Check memory spec is present
-        assert ":HBM[1]" in cfg_content
-        assert ":DDR[0]" in cfg_content
-        # Verify HLS argument names are used (vXX format) with kernel instance suffix
-        assert (
-            "sp=gemm_1.v" in cfg_content
-        ), "Config should use kernel instance name with HLS argument names"
-
-        # Check that VPP_LDFLAGS in makefile includes the config file
-        makefile_us = os.path.join(tmpdir, "makefile_us_alveo.mk")
-        if os.path.exists(makefile_us):
-            with open(makefile_us, "r") as f:
-                makefile_content = f.read()
-            assert (
-                "--config gemm.cfg" in makefile_content
-            ), "Makefile should reference the config file"
-
-    print("HBM mapping test passed!")
+        assert report.exists()
 
 
-def test_hbm_mapping_function():
-    """Test the generate_hbm_config function directly."""
-    from allo.backend.vitis import generate_hbm_config
+@requires_vitis
+def test_csim_vadd():
+    @kernel
+    def vadd(A: f32[16], B: f32[16], C: f32[16]):
+        for i in arange(16, name="i"):
+            C[i] = A[i] + B[i]
 
-    # Test with mixed input types
-    hbm_mapping = {
-        "inp_addr_0": 0,
-        "inp_addr_1": "HBM[0]",
-        "wk_addr_0": 1,
-        "wv_addr_0": "DDR[0]",
-    }
-
-    cfg_content = generate_hbm_config("my_kernel", hbm_mapping)
-    print("Generated config content:")
-    print(cfg_content)
-
-    # Verify content
-    assert "[connectivity]" in cfg_content
-    assert "sp=my_kernel_1.inp_addr_0:HBM[0]" in cfg_content
-    assert "sp=my_kernel_1.inp_addr_1:HBM[0]" in cfg_content
-    assert "sp=my_kernel_1.wk_addr_0:HBM[1]" in cfg_content
-    assert "sp=my_kernel_1.wv_addr_0:DDR[0]" in cfg_content
-
-    print("generate_hbm_config test passed!")
+    s = vadd.schedule()
+    s.pipeline(s.loop("i"), ii=1)
+    a = np.random.rand(16).astype(np.float32)
+    b = np.random.rand(16).astype(np.float32)
+    c = np.zeros(16, dtype=np.float32)
+    with tempfile.TemporaryDirectory() as project:
+        backend = s.export("vitis", project_path=project)
+        backend(a, b, c)
+    np.testing.assert_allclose(c, a + b, rtol=1e-5)
 
 
-if __name__ == "__main__":
-    test_grid_for_gemm()
-    test_vitis_gemm_template_int32()
-    test_vitis_gemm_template_float32()
-    test_vitis_io_stream()
-    test_scalar()
-    test_pointer_generation()
-    test_bool_array()
+@requires_vitis
+def test_csim_apint():
+    i5 = APInt(5, signed=True)
+    u5 = APInt(5, signed=False)
 
-    test_vadd()
-    test_packed_add()
+    @kernel
+    def addsub(A: i5[8], B: u5[8], C: i5[8]):
+        for i in arange(8, name="i"):
+            C[i] = A[i] + B[i]
 
-    # Test HBM mapping
-    test_hbm_mapping_function()
-    test_hbm_mapping_config()
+    a = np.array([-4, -3, -2, -1, 0, 1, 2, 3], dtype=np.int8)
+    b = np.array([1, 2, 3, 4, 5, 6, 7, 8], dtype=np.uint8)
+    c = np.zeros(8, dtype=np.int8)
+    with tempfile.TemporaryDirectory() as project:
+        backend = addsub.schedule().export("vitis", project_path=project)
+        backend(a, b, c)
+    # i5 result wraps modulo 2**5 with sign extension back to int8.
+    expected = ((a.astype(np.int16) + b + 16) % 32 - 16).astype(np.int8)
+    np.testing.assert_array_equal(c, expected)
+
+
+@requires_legacy_vitis
+def test_csim_legacy_apint():
+    """Pre-2025.2 installs lack the -fhls-csim clang, so csim falls back to the
+    legacy plain-g++ flow; the APInt std-width wrapper must still be bit-accurate."""
+    i5 = APInt(5, signed=True)
+    u5 = APInt(5, signed=False)
+
+    @kernel
+    def addsub(A: i5[8], B: u5[8], C: i5[8]):
+        for i in arange(8, name="i"):
+            C[i] = A[i] + B[i]
+
+    a = np.array([-4, -3, -2, -1, 0, 1, 2, 3], dtype=np.int8)
+    b = np.array([1, 2, 3, 4, 5, 6, 7, 8], dtype=np.uint8)
+    c = np.zeros(8, dtype=np.int8)
+    with tempfile.TemporaryDirectory() as project:
+        backend = addsub.schedule().export(
+            "vitis", project_path=project, vitis_home=_LEGACY_VITIS
+        )
+        assert backend._get_csim_toolchain().flavor == "legacy"
+        backend(a, b, c)
+    expected = ((a.astype(np.int16) + b + 16) % 32 - 16).astype(np.int8)
+    np.testing.assert_array_equal(c, expected)
+
+
+# ===========================================================================
+# Module-level globals: stateful variables + list-initialized constants
+#
+# Both lower to a mutable `memref.global` and must be emitted as a file-scope
+# *definition* (with initializer), not an `extern` declaration -- otherwise the
+# csim .so has an undefined symbol. The symbol name follows the unified
+# `_allo_<kind>_<func>_<var>_l<line>c<col>` convention.
+# ===========================================================================
+
+
+def test_codegen_stateful_global_definition():
+    @kernel
+    def counter() -> i32:
+        c: Stateful[i32] = 0
+        c = c + 1
+        return c
+
+    code = _hls(counter.schedule())
+    # A defined (not extern) file-scope global, carrying its initializer.
+    _regex(code, r"static \w+ _allo_stateful_counter_c_l\d+c\d+ = 0u?;")
+    assert "extern uint32_t _allo_stateful" not in code
+
+
+def test_codegen_list_initialized_buffer_definition():
+    @kernel
+    def lut(idx: i32) -> i32:
+        table: i32[4] = [10, 20, 30, 40]
+        return table[idx]
+
+    code = _hls(lut.schedule())
+    _regex(
+        code,
+        r"static \w+ _allo_const_lut_table_l\d+c\d+\[4\] = \{10u?, 20u?, 30u?, 40u?\};",
+    )
+
+
+@requires_vitis
+def test_csim_stateful_accumulator():
+    """A stateful scalar must persist across csim calls on the same backend (the
+    .so stays loaded), so the global accumulates rather than re-initializing."""
+
+    @kernel
+    def acc(x: i32) -> i32:
+        s: Stateful[i32] = 0
+        s = s + x
+        return s
+
+    with tempfile.TemporaryDirectory() as project:
+        backend = acc.schedule().export("vitis", project_path=project)
+        assert int(backend(5)) == 5
+        assert int(backend(10)) == 15
+        assert int(backend(3)) == 18
+
+
+@requires_vitis
+def test_csim_list_initialized_buffer():
+    @kernel
+    def lut(idx: i32) -> i32:
+        table: i32[4] = [10, 20, 30, 40]
+        return table[idx]
+
+    with tempfile.TemporaryDirectory() as project:
+        backend = lut.schedule().export("vitis", project_path=project)
+        assert [int(backend(i)) for i in range(4)] == [10, 20, 30, 40]
+
+
+@requires_vitis
+def test_synth_stateful_counter():
+    @kernel
+    def counter() -> i32:
+        c: Stateful[i32] = 0
+        c = c + 1
+        return c
+
+    with tempfile.TemporaryDirectory() as project:
+        report = (
+            counter.schedule().export("vitis", part=PART, project_path=project).synth()
+        )
+        assert report.exists()

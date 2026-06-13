@@ -1,1471 +1,1162 @@
 # Copyright Allo authors. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-import tempfile
+import ast
 
-import numpy as np
 import pytest
+
 import allo
-from allo.ir.types import bool, int8, int32, uint32, float32, index, ConstExpr
-import allo.backend.hls as hls
-import io
-from contextlib import redirect_stdout
+from allo.compiler.errors import CompilationError
+from allo.compiler.mlir_codegen import compile as compile_kernel
+from allo.lang.core import (
+    Template,
+    bool as allo_bool,
+    constexpr,
+    f32,
+    i32,
+    index,
+    u1,
+    u8,
+    u32,
+)
+from allo.lang.kernel import KernelOptions, consteval, kernel
+from allo.operators.arith import max as allo_max
+
+_GLOBAL_SHAPE_M = 2
+_GLOBAL_SHAPE_N = 3
+_GLOBAL_INT_CONST = 3
+_GLOBAL_FLOAT_CONST = 1.5
 
 
-def test_grid_for_gemm():
-    # This test is to make sure the whole flow works properly.
-    def gemm(A: int32[32, 32], B: int32[32, 32]) -> int32[32, 32]:
-        C: int32[32, 32] = 0
-        # Use grid_for with name annotation
-        for i, j, k in allo.grid(32, 32, 32, name="C"):
-            C[i, j] += A[i, k] * B[k, j]
-        return C
-
-    # 1. Create customization
-    s = allo.customize(gemm)
-    print(s.module)
-
-    # 2. Apply transformations and make sure each step the module can be printed
-    s.split("i", 8)
-    print(s.module)
-    s.split("j", 8)
-    print(s.module)
-    s.reorder("i.outer", "j.outer", "i.inner", "j.inner")
-    print(s.module)
-    # Make sure the generated loops are correct and ordered
-    loops = s.get_loops()
-    expected = ["i.outer", "j.outer", "i.inner", "j.inner", "k"]
-    assert expected == list(loops.C.loops.keys())
-
-    # 3. Build and run
-    mod = s.build()
-    np_A = np.random.randint(0, 10, size=(32, 32)).astype(np.int32)
-    np_B = np.random.randint(0, 10, size=(32, 32)).astype(np.int32)
-    np_C = np.matmul(np_A, np_B)
-    np_C_allo = mod(np_A, np_B)
-    np.testing.assert_allclose(np_C, np_C_allo, rtol=1e-5)
-
-    # 4. Generate HLS module
-    mod = s.build(target="vhls")
-    hls_code = mod.hls_code
-    loop_labels = ["l_C_i_outer", "l_j_outer", "l_i_inner", "l_j_inner", "l_k"]
-    for label in loop_labels:
-        assert label in hls_code
-
-    # 5. HLS CSIM
-    if not hls.is_available("vitis_hls"):
-        print("Vitis HLS not found, skipping...")
-        return
-    with tempfile.TemporaryDirectory() as tmpdir:
-        hls_mod = s.build(
-            target="vitis_hls",
-            mode="csim",
-            project=tmpdir,
+def _compile_ir(fn, *, options=None) -> str:
+    return str(
+        compile_kernel(fn, options=options).operation.get_asm(
+            use_name_loc_as_prefix=True
         )
-        csim_out = np.zeros((32, 32), dtype=np.int32)
-        hls_mod(np_A, np_B, csim_out)
-        np.testing.assert_allclose(csim_out, np_C, atol=1e-3)
-        print("Passed HLS csim test!")
-
-
-def test_all_gemm():
-    def range_for_gemm(A: int32[32, 32], B: int32[32, 32]) -> int32[32, 32]:
-        C: int32[32, 32] = 0
-        for i in range(32):
-            for j in range(32):
-                for k in range(32):
-                    C[i, j] += A[i, k] * B[k, j]
-        return C
-
-    s = allo.customize(range_for_gemm)
-    print(s.module)
-
-    def float_gemm(A: float32[32, 32], B: float32[32, 32]) -> float32[32, 32]:
-        C: float32[32, 32] = 0.0
-        for i in range(32):
-            for j in range(32):
-                for k in range(32):
-                    C[i, j] += A[i, k] * B[k, j]
-        return C
-
-    s = allo.customize(float_gemm)
-    print(s.module)
-
-    def reduction_gemm(A: int32[32, 32], B: int32[32, 32]) -> int32[32, 32]:
-        C: int32[32, 32] = 0
-        for i, j in allo.grid(32, 32):
-            v: int32 = 0
-            for k in range(32):
-                v += A[i, k] * B[k, j]
-            C[i, j] = v
-        return C
-
-    s = allo.customize(reduction_gemm)
-    print(s.module)
-
-
-def test_range_for():
-    def kernel(A: int32[20]):
-        for i in range(10):
-            A[i] = i
-        for i in range(10, 20):
-            A[i] = i
-        for i in range(0, 20, 2):
-            A[i] = i * 2
-
-    s = allo.customize(kernel)
-    print(s.module)
-    mod = s.build()
-    np_A = np.zeros((20,), dtype=np.int32)
-    kernel(np_A)
-    np_B = np.zeros((20,), dtype=np.int32)
-    mod(np_B)
-    np.testing.assert_allclose(np_A, np_B)
-
-
-def test_variable_bound_for():
-    def kernel(A: int32[10]):
-        for i in range(10):
-            for j in range(i + 1, 10):
-                for k in range(j * 2, 10):
-                    A[k] += i - j
-
-    s = allo.customize(kernel)
-    print(s.module)
-    mod = s.build()
-    np_A = np.zeros((10,), dtype=np.int32)
-    kernel(np_A)
-    np_B = np.zeros((10,), dtype=np.int32)
-    mod(np_B)
-    np.testing.assert_allclose(np_A, np_B)
-
-
-def test_variable_bound_for_2():
-    def kernel() -> int32[10]:
-        B: int32[10] = 0
-        for i in range(10):
-            for j in range(i, i + 1):
-                B[i] += j
-        return B
-
-    s = allo.customize(kernel)
-    print(s.module)
-
-
-def test_scf_for():
-    def kernel(A: int32[10], B: int32[10]):
-        for i in range(10):
-            for j in range(A[i], 10, A[i]):
-                for k in range(A[i] - 1, A[i] + 2):
-                    B[k] += i - j
-
-    s = allo.customize(kernel, verbose=True)
-    print(s.module)
-    mod = s.build()
-    np_A = np.zeros((10,), dtype=np.int32) + 1
-    np_B = np.zeros((10,), dtype=np.int32)
-    kernel(np_A, np_B)
-    np_C = np.zeros((10,), dtype=np.int32) + 1
-    np_D = np.zeros((10,), dtype=np.int32)
-    mod(np_C, np_D)
-    np.testing.assert_allclose(np_B, np_D)
-
-
-def test_negative_step_for():
-    N = 256
-
-    def kernel(x: int32[N], y: int32[N]):
-        for i in range(N - 1, -1, -1):
-            y[i] = x[i]
-
-    with pytest.raises(SystemExit):
-        s = allo.customize(kernel)
-
-
-def test_nested_if():
-    def kernel(a: int32, b: int32) -> int32:
-        r: int32 = 0
-        if a == 0:
-            r = 1
-        elif a == 1:
-            r = 2
-            if b == 2:
-                r = 3
-        else:
-            r = 4
-        return r
-
-    s = allo.customize(kernel)
-    print(s.module)
-    mod = s.build()
-    assert mod(0, 0) == kernel(0, 0)
-    assert mod(1, 1) == kernel(1, 1)
-    assert mod(1, 2) == kernel(1, 2)
-
-
-def test_logic_and_or():
-    def kernel(A: int32[3], b: int32) -> int32:
-        r: int32 = 0
-        if A[0] > 0 and b < 0:
-            r = 1
-        elif A[1] * 2 <= 1 or b + 1 >= 1:
-            r = 2
-        elif A[2] != 3:
-            r = 3
-        return r
-
-    s = allo.customize(kernel, verbose=True)
-    print(s.module)
-    np_A = np.array([0, 1, 2], dtype=np.int32)
-    mod = s.build()
-    assert mod(np_A, 0) == kernel(np_A, 0)
-    assert mod(np_A, 1) == kernel(np_A, 1)
-    assert mod(np_A, 2) == kernel(np_A, 2)
-
-
-def test_multiple_conditions():
-    def multiple_conditions(A: int32[3], b: int32, c: int32) -> int32:
-        r: int32 = 0
-        if A[0] > 0 and A[1] > 0 and A[2] > 0 and b > 0 and c > 0:
-            r = 1
-        return r
-
-    s = allo.customize(multiple_conditions)
-    print(s.module)
-    np_A = np.array([1, 1, -1], dtype=np.int32)
-    mod = s.build()
-    assert mod(np_A, 1, 1) == multiple_conditions(np_A, 1, 1)
-    assert mod(np_A, 1, -1) == multiple_conditions(np_A, 1, -1)
-    assert mod(np_A, -1, 1) == multiple_conditions(np_A, -1, 1)
-    assert mod(np_A, -1, -1) == multiple_conditions(np_A, -1, -1)
-
-
-def test_assign_logic():
-    def kernel1(A: int32) -> int32:
-        B: int32 = 0
-        if A > B:
-            B = A
-        return B
-
-    s = allo.customize(kernel1, verbose=True)
-    print(s.module)
-    mod = s.build()
-    assert mod(2) == kernel1(2)
-
-    a = 3
-
-    def kernel2() -> int32:
-        # declaration
-        a_: int32 = a
-        # assign
-        a_: int32 = 1
-        a_ = 2
-        a_ = a
-        return a_
-
-    s = allo.customize(kernel2)
-    mod = s.build()
-    assert mod() == a
-    # [NOTE]:expected to fail for now
-    # s = allo.customize(kernel2, enable_tensor=True)
-    # mod = s.build()
-    # print(s.module)
-    # assert mod() == a
-
-    def kernel3() -> int32:
-        # declaration
-        a_: int32 = a
-        # assign type mismatch
-        a_: int32[2] = [2, 2]
-        a_ = a
-        return a_
-
-    with pytest.raises(SystemExit):
-        s = allo.customize(kernel3)
-
-
-def test_while_basic():
-    def kernel(A: int32[10]):
-        i: index = 0
-        while i < 10:
-            A[i] = i
-            i += 1
-
-    s = allo.customize(kernel, verbose=True)
-    print(s.module)
-    mod = s.build()
-
-    np_A = np.random.randint(10, size=(10,))
-    np_A_copy = np_A.copy()
-    kernel(np_A)
-    mod(np_A_copy)
-    assert np.array_equal(np_A, np_A_copy)
-
-
-def test_select():
-    def kernel(A: int32[32]) -> int32[32]:
-        B: int32[32] = 0
-        for i in range(32):
-            B[i] = 1 if A[i] % 2 == 0 else 0
-        return B
-
-    s = allo.customize(kernel)
-    print(s.module)
-    mod = s.build()
-    np_A = np.random.randint(0, 10, size=(32,)).astype(np.int32)
-    np_B = mod(np_A)
-    np.testing.assert_allclose(np_B, np_A % 2 == 0)
-
-
-def test_select_cast():
-    def kernel(A: int32[32], B: int32[32]):
-        for i in range(32):
-            B[i] = (i * 2) if A[i] % 2 == 0 else 0
-
-    s = allo.customize(kernel)
-    print(s.module)
-    mod = s.build()
-    np_A = np.random.randint(0, 10, size=(32,)).astype(np.int32)
-    np_B = np.zeros((32,), dtype=np.int32)
-    kernel(np_A, np_B)
-    np_C = np.zeros((32,), dtype=np.int32)
-    mod(np_A, np_C)
-    np.testing.assert_allclose(np_B, np_C)
-
-
-def test_unary():
-    def kernel() -> int32:
-        v: int32 = 5
-        vi: int32 = -(v + 1)
-        vf: float32 = -(v + 1.0)
-        return +(vi + vf)
-
-    s = allo.customize(kernel)
-    print(s.module)
-    mod = s.build()
-    np.testing.assert_allclose(mod(), kernel())
-
-
-def test_not():
-    def kernel[Ty](flag: bool) -> "Ty":
-        X: Ty
-        if not flag:
-            X = 1
-        else:
-            X = 0
-        return X
-
-    s = allo.customize(kernel, instantiate=[int8])
-    print(s.module)
-    mod = s.build()
-    assert mod(True) == 0
-    assert mod(False) == 1
-
-
-def test_complex_not():
-    def kernel[Ty](inp: Ty) -> "Ty":
-        return 3 if not (inp + 1 > 5) else 4
-
-    s = allo.customize(kernel, instantiate=[int8])
-    print(s.module)
-    mod = s.build()
-    assert mod(4) == 3
-    assert mod(5) == 4
-
-
-def test_rhs_binaryop():
-    def kernel() -> int32[11]:
-        v: int32 = 5
-        res: int32[11] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
-        res[0] = 1 + v
-        res[1] = 1 - v
-        res[2] = v * 3
-        # One tricky thing is that Python does not require all
-        # the elements in the list to be the same type,
-        # so the following result becomes 10.4 (float);
-        # while in Allo, the array can only have one type,
-        # so the result is 10 (int).
-        # res[3] = 52 / v
-        res[4] = 6 // v
-        res[5] = 6 % v
-        res[6] = 1 << v
-        res[7] = 64 >> v
-        res[8] = 1 & v
-        res[9] = 1 | v
-        res[10] = res[9]
-        return res
-
-    s = allo.customize(kernel)
-    print(s.module)
-    mod = s.build()
-    np.testing.assert_allclose(mod(), kernel())
-
-
-def test_index_shift():
-    def kernel(v: index) -> index[9]:
-        res: index[9] = [0, 0, 0, 0, 0, 0, 0, 0, 0]
-        v1: int32 = 2
-        v2: uint32 = 2
-        v3: index = 2
-        # Shift rules
-        res[0] = v << v1
-        res[1] = v << v2
-        res[2] = v << v3
-        # In Allo, RShift is also supported for index
-        res[3] = v >> v1
-        res[4] = v >> v2
-        res[5] = v >> v3
-        # Bitwise rules
-        res[6] = v & v3
-        res[7] = v | v3
-        res[8] = v ^ v3
-        return res
-
-    s = allo.customize(kernel)
-    print(s.module)
-    mod = s.build()
-    np_v = 8
-    np.testing.assert_allclose(mod(np_v), kernel(np_v))
-
-
-def test_nested_func_def():
-    def kernel(A: int32[10]) -> int32[10]:
-        B: int32[10] = 0
-
-        def foo(x: int32) -> int32:
-            return x + 1
-
-        for i in range(10):
-            B[i] = foo(A[i])
-        return B
-
-    s = allo.customize(kernel)
-    print(s.module)
-    mod = s.build()
-    np_A = np.random.randint(0, 10, size=(10,)).astype(np.int32)
-    np_C = np_A + 1
-    np_B = mod(np_A)
-    assert np.array_equal(np_B, np_C)
-
-
-def test_index_arg():
-    def kernel(A: int32[10]) -> int32[10]:
-        B: int32[10] = 0
-
-        def foo(A_: int32[10], x: index) -> int32:
-            y: int32 = 0
-            C: int32[10] = 0
-            for i in range(10):
-                C[i] = A_[i] + 1
-            y = C[x]
-            return y
-
-        for i in range(10):
-            B[i] = foo(A, i)
-        return B
-
-    s = allo.customize(kernel)
-    print(s.module)
-    mod = s.build()
-    np_A = np.random.randint(0, 10, size=(10,)).astype(np.int32)
-    np_C = np_A + 1
-    np_B = mod(np_A)
-    assert np.array_equal(np_B, np_C)
-
-
-def test_llvm_scalar_arg():
-    def kernel(A: float32[10], B: int32, C: float32) -> float32:
-        v: float32 = 0.0
-        v = A[0] + float(B) + C
-        return v
-
-    s = allo.customize(kernel)
-    print(s.module)
-    mod = s.build()
-    np_A = np.random.random((10,)).astype(np.float32)
-    B = 1
-    C = 2.0
-    allo_B = mod(np_A, B, C)
-    np.testing.assert_allclose(allo_B, kernel(np_A, B, C))
-
-
-def test_no_init_scalar():
-    def kernel() -> int32:
-        v: int32
-        return v
-
-    s = allo.customize(kernel)
-    print(s.module)
-
-
-def test_copy_memref():
-    M, N = 2, 2
-
-    def kernel() -> int32[M, N]:
-        temp: int32[M, N] = 0
-        outp: int32[M, N] = temp
-        return outp
-
-    s = allo.customize(kernel)
-    print(s.module)
-    f = s.build(target="vhls")
-    print(f)
-
-
-def test_copy_scalar():
-    def kernel() -> int32:
-        temp: int32 = 0
-        outp: int32 = temp
-        return outp
-
-    s = allo.customize(kernel)
-    print(s.module)
-    f = s.build(target="vhls")
-    print(f)
-
-
-def test_copy_arg():
-    M, N = 2, 2
-
-    def kernel(inp: int32[M, N]) -> int32[M, N]:
-        outp: int32[M, N] = inp
-        return outp
-
-    s = allo.customize(kernel)
-    print(s.module)
-    f = s.build(target="vhls")
-    print(f)
-
-    mod = s.build()
-    np_inp = np.random.randint(0, 10, size=(M, N)).astype(np.int32)
-    np_outp = mod(np_inp)
-    assert np.array_equal(np_inp, np_outp)
-
-
-def test_copy_arg_scalar():
-    def kernel(inp: int32) -> int32:
-        temp: int32 = inp
-        outp: int32
-        outp = temp * temp
-        return outp
-
-    s = allo.customize(kernel)
-    print(s.module)
-    f = s.build(target="vhls")
-    print(f)
-
-    mod = s.build()
-    assert np.array_equal(kernel(5), mod(5))
-
-
-def test_constexpr():
-    M = 10
-
-    def kernel(A: int32[((M + 1) * 2) // 2]) -> float32[M + 1]:
-        res: float32[M + 1] = 0
-        for i in range(M + 1):
-            res[i] = A[i] + 1
-        return res
-
-    s = allo.customize(kernel)
-    mod = s.build()
-    np_A = np.random.randint(0, 10, size=((M + 1) * 2) // 2).astype(np.int32)
-    np_res = mod(np_A)
-    np.testing.assert_allclose(np_res, np_A + 1)
-
-
-def test_multiple_returns_1D():
-    M = 10
-
-    def kernel(A: int32[M], B: int32[M]) -> (int32[M], int32[M]):
-        res0: int32[M] = 0
-        res1: int32[M] = 0
-        for i in range(M):
-            res0[i] = A[i] + 1
-            res1[i] = B[i] + 1
-        return res0, res1
-
-    s = allo.customize(kernel)
-    mod = s.build()
-    np_A = np.random.randint(0, 10, size=(M,)).astype(np.int32)
-    np_B = np.random.randint(0, 10, size=(M,)).astype(np.int32)
-    np_res0, np_res1 = mod(np_A, np_B)
-    np.testing.assert_allclose(np_res0, np_A + 1)
-    np.testing.assert_allclose(np_res1, np_B + 1)
-
-
-def test_multiple_returns_4D():
-    M = 10
-
-    def kernel(
-        A: float32[M, M, M, M], B: float32[M, M, M, M], C: float32[M, M]
-    ) -> (float32[M, M, M, M], float32[M, M, M, M], float32[M, M]):
-        res0: float32[M, M, M, M] = 0
-        res1: float32[M, M, M, M] = 0
-        for i, j, k, l in allo.grid(M, M, M, M):
-            res0[i, j, k, l] = A[i, j, k, l] + 1
-            res1[i, j, k, l] = B[i, j, k, l] + 1
-        res2: float32[M, M] = 0
-        for i, j in allo.grid(M, M):
-            res2[i, j] = C[i, j] + 1
-        return res0, res1, res2
-
-    s = allo.customize(kernel)
-    mod = s.build()
-    np_A = np.random.random((M, M, M, M)).astype(np.float32)
-    np_B = np.random.random((M, M, M, M)).astype(np.float32)
-    np_C = np.random.random((M, M)).astype(np.float32)
-    np_res0, np_res1, np_res2 = mod(np_A, np_B, np_C)
-    np.testing.assert_allclose(np_res0, np_A + 1)
-    np.testing.assert_allclose(np_res1, np_B + 1)
-    np.testing.assert_allclose(np_res2, np_C + 1)
-
-
-def test_subview():
-    def kernel(A: int32[10, 10]) -> int32[10]:
-        return A[5]
-
-    s = allo.customize(kernel)
-    print(s.module)
-    np_A = np.random.randint(0, 10, size=(10, 10)).astype(np.int32)
-    mod = s.build()
-    assert np.array_equal(mod(np_A), kernel(np_A))
-
-    def kernel(A: float32[5, 10, 15]) -> float32[15]:
-        return A[3, 2]
-
-    s = allo.customize(kernel)
-    print(s.module)
-    np_A = np.random.random((5, 10, 15)).astype(np.float32)
-    mod = s.build()
-    np.testing.assert_allclose(mod(np_A), kernel(np_A))
-
-    def kernel(A: float32[5, 10, 15]) -> float32[10, 15]:
-        return A[3]
-
-    s = allo.customize(kernel)
-    print(s.module)
-    np_A = np.random.random((5, 10, 15)).astype(np.float32)
-    mod = s.build()
-    np.testing.assert_allclose(mod(np_A), kernel(np_A))
-
-
-def test_dynamic_subview():
-    def kernel(A: float32[5, 10, 15], i: index, j: index) -> float32[15]:
-        return A[i, j]
-
-    s = allo.customize(kernel)
-    print(s.module)
-    np_A = np.random.random((5, 10, 15)).astype(np.float32)
-    mod = s.build()
-    np.testing.assert_allclose(mod(np_A, 3, 3), kernel(np_A, 3, 3))
-
-
-def test_dynamic_shape():
-    def kernel(A: float32[...], B: float32[...], size: int32):
-        for i in range(size):
-            B[i] = A[i]
-
-    s = allo.customize(kernel)
-    print(s.module)
-    np_A = np.random.random((256,)).astype(np.float32)
-    allo_A = np.zeros((256,)).astype(np.float32)
-    mod = s.build()
-    mod(np_A, allo_A, 256)
-    np.testing.assert_allclose(np_A, allo_A)
-    code = s.build(target="vhls")
-    print(code)
-
-
-def test_build_none_return():
-    def kernel0(A: int32[32]):
-        return None
-
-    s0 = allo.customize(kernel0)
-
-    def kernel1(A: int32[32]) -> None:
-        return None
-
-    s1 = allo.customize(kernel1)
-
-    def kernel2(A: int32[32]):
-        return
-
-    s2 = allo.customize(kernel2)
-
-    def kernel3(A: int32[32]) -> None:
-        return
-
-    s3 = allo.customize(kernel3)
-
-    def kernel4(A: int32[32]):
-        pass
-
-    s4 = allo.customize(kernel4)
-
-    def kernel5(A: int32[32]) -> None:
-        pass
-
-    s5 = allo.customize(kernel5)
-
-    def kernel6(A: int32[32]) -> int32:
-        return
-
-    with pytest.raises(SystemExit):
-        s6 = allo.customize(kernel6)
-
-    def kernel7(A: int32[32]) -> int32:
-        pass
-
-    with pytest.raises(SystemExit):
-        s7 = allo.customize(kernel7)
-
-
-def test_comments():
-    def top(x_in: "int8[1]") -> "int8":
-        """Test text"""
-        return x_in[0]
-
-    print(allo.customize(top, verbose=True).build()(np.array([5], dtype=np.int8)))
-
-
-def test_size1_array():
-    def kernel[Ty](X: "Ty[1]"):
-        a: Ty
-
-    def top[Ty](X_buf: "Ty[2, 2, 1]"):
-        kernel[Ty](X_buf[0, 0])
-
-    s = allo.customize(top, instantiate=[int8], verbose=True)
-    print(s.module)
-
-
-def test_tuple():
-    def callee(a: float32, b: float32) -> (float32, float32):
-        c: float32 = a + b
-        d: float32 = a - b
-        return c, d
-
-    def kernel(A: float32[10], B: float32[10]) -> (float32[10], float32[10]):
-        C: float32[10] = 0
-        D: float32[10] = 0
-        for i in range(10):
-            C[i], D[i] = callee(A[i], B[i])
-        return C, D
-
-    s = allo.customize(kernel)
-    print(s.module)
-    mod = s.build()
-    np_A = np.random.random((10,)).astype(np.float32)
-    np_B = np.random.random((10,)).astype(np.float32)
-    np_C, np_D = mod(np_A, np_B)
-    np_C_ref = np.zeros((10,), dtype=np.float32)
-    np_D_ref = np.zeros((10,), dtype=np.float32)
-    for i in range(10):
-        np_C_ref[i], np_D_ref[i] = callee(np_A[i], np_B[i])
-    np.testing.assert_allclose(np_C, np_C_ref)
-    np.testing.assert_allclose(np_D, np_D_ref)
-
-    def kernel2(A: float32[1], B: float32[1]) -> float32:
-        C: float32
-        D: float32
-        # assign with func call results (a tuple)
-        C, D = callee(A[0], B[0])
-        return C + D
-
-    s = allo.customize(kernel2)
-    print(s.module)
-    mod = s.build()
-    np_A = np.random.random((1,)).astype(np.float32)
-    np_B = np.random.random((1,)).astype(np.float32)
-    np_C = mod(np_A, np_B)
-    np_C_ref, np_D_ref = callee(np_A[0], np_B[0])
-    np.testing.assert_allclose(np_C, np_C_ref + np_D_ref)
-
-    def kernel3(A: float32[1], B: float32[1]) -> float32:
-        # define with func call results (a tuple)
-        C, D = callee(
-            A[0], B[0]
-        )  # valid (as the type can be inferred) but not suggested
-        return C + D
-
-    s = allo.customize(kernel3)
-    print(s.module)
-    mod = s.build()
-    np_A = np.random.random((1,)).astype(np.float32)
-    np_B = np.random.random((1,)).astype(np.float32)
-    np_C = mod(np_A, np_B)
-    np_C_ref, np_D_ref = callee(np_A[0], np_B[0])
-    np.testing.assert_allclose(np_C, np_C_ref + np_D_ref)
-
-    def kernel4(A: float32[1], B: float32[1]) -> float32:
-        C, _ = callee(
-            A[0], B[0]
-        )  # valid (as the type can be inferred) but not suggested
-        return C
-
-    s = allo.customize(kernel4)
-    print(s.module)
-    mod = s.build()
-    np_A = np.random.random((1,)).astype(np.float32)
-    np_B = np.random.random((1,)).astype(np.float32)
-    np_C = mod(np_A, np_B)
-    np_C_ref, np_D_ref = callee(np_A[0], np_B[0])
-    np.testing.assert_allclose(np_C, np_C_ref)
-
-
-@pytest.mark.parametrize("T", [int8, int32, float32])
-def test_minmax(T):
-    def kernel(A: T[10]) -> (T[2], T[2]):
-        min_val: T[2] = 0x3F3F3F3F
-        max_val: T[2] = -0x3F3F3F3F
-        for i in range(10):
-            min_val[0] = min(min_val[0], A[i])
-            max_val[0] = max(max_val[0], A[i])
-        return min_val, max_val
-
-    s = allo.customize(kernel)
-    print(s.module)
-    mod = s.build()
-    if T == int8:
-        np_A = np.random.randint(-64, 64, size=(10,)).astype(np.int8)
-    elif T == int32:
-        np_A = np.random.randint(-1000, 1000, size=(10,)).astype(np.int32)
-    elif T == float32:
-        np_A = np.random.random((10,)).astype(np.float32)
-    allo_min, allo_max = mod(np_A)
-    assert allo_min[0] == np.min(np_A)
-    assert allo_max[0] == np.max(np_A)
-    mod = s.build(target="vhls")
-    assert "min" in mod.hls_code
-    assert "max" in mod.hls_code
-
-
-def test_minmax_cast():
-    def kernel(A: int8[2]) -> int32[2]:
-        res: int32[2] = 0
-        res[0] = min(A[0], 0)
-        res[1] = max(A[1], 0.0)
-        return res
-
-    s = allo.customize(kernel)
-    print(s.module)
-    mod = s.build()
-    np_A = np.random.randint(-64, 64, size=(2,)).astype(np.int8)
-    allo_B = mod(np_A)
-    assert allo_B[0] == min(np_A[0], 0)
-    assert allo_B[1] == max(np_A[1], 0.0)
-    mod = s.build(target="vhls")
-    print(mod)
-    assert "min" in mod.hls_code
-    assert "max" in mod.hls_code
-    assert "(float)" in mod.hls_code
-
-
-def test_scalar():
-    def kernel1() -> int32:
-        a: int32 = 0
-        b: int32 = a + 1
-        return b
-
-    s = allo.customize(kernel1)
-    print(s.module)
-    assert "%alloc[]" in str(s.module)
-    mod = s.build()
-    assert mod() == 1
-    mod = s.build(target="vhls")
-    assert "," not in mod.hls_code
-
-    a = 1
-
-    def kernel2() -> int32:
-        a_: int32 = a
-        b_: int32 = a + 1
-        a_, b_ = a + 1, a + 2
-        return a_
-
-    s = allo.customize(kernel2)
-    mod = s.build()
-    assert mod() == a + 1
-
-    def kernel3() -> int32:
-        a_: int32 = a
-        b_: int32 = a + 1
-        a_, b_ = a + 1, a + 2
-        return a_ + b_
-
-    s = allo.customize(kernel3)
-    mod = s.build()
-    assert mod() == a * 2 + 3
-
-
-def test_line_trace():
-    def gemm(A: int32[32, 32], B: int32[32, 32]) -> int32[32, 32]:
-        C: int32[32, 32] = 0
-        for i, j, k in allo.grid(32, 32, 32):
-            C[i, j] += A[i, k] * B[k, j]
-        return C
-
-    def get_mlir_string(schedule):
-        buffer = io.StringIO()
-        with redirect_stdout(buffer):
-            schedule.module.operation.print(
-                large_elements_limit=2,
-                enable_debug_info=True,
-                use_local_scope=True,
-            )
-        return buffer.getvalue()
-
-    s = allo.customize(gemm)
-    mlir_string = get_mlir_string(s)
-    assert 'loc("' in mlir_string
-    s.split("i", factor=8)
-    mlir_string = get_mlir_string(s)
-    assert 'loc("' in mlir_string
-
-
-def test_dsl_broadcast_binary_ops():
-    def kernel1(A: int32[10]) -> int32[10]:
-        return allo.div(allo.mul(allo.sub(allo.add(A, 3), 1), 2), 2)
-
-    def kernel2(A: int32[10]) -> int32[10]:
-        return allo.sub(50, allo.mul(2, allo.add(3, allo.div(10, A))))
-
-    s1 = allo.customize(kernel1)
-    s2 = allo.customize(kernel2)
-    mod1 = s1.build()
-    mod2 = s2.build()
-    np_A = np.random.randint(1, 10, size=(10,)).astype(np.int32)
-    np_B_1 = mod1(np_A)
-    np_B_2 = mod2(np_A)
-    np.testing.assert_allclose(np_B_1, ((np_A + 3) - 1) * 2 // 2)
-    np.testing.assert_allclose(np_B_2, 50 - 2 * (3 + 10 // np_A))
-
-
-def test_scope():
-    # kernel1: declare local variable r outside the if/else
-    def kernel1(a: int32) -> int32:
-        r: int32 = 0
-        if a == 0:
-            r = 1
-        else:
-            r = 4
-        return r
-
-    s = allo.customize(kernel1)
-    mod = s.build()
-    assert mod(0) == kernel1(0)
-    assert mod(1) == kernel1(1)
-
-    # kernel2: declare r inside each branch -> invalid scope
-    def kernel2(a: int32) -> int32:
-        if a == 0:
-            r: int32 = 1
-        else:
-            r: int32 = 4
-        return r
-
-    with pytest.raises(SystemExit):
-        s = allo.customize(kernel2)
-
-    def kernel3(a: int32) -> int32:
-        r: int32 = 0
-        if a > 0:
-            t: int32 = 1  # t is local to the if-branch
-            r = r + t
-        return r
-
-    s = allo.customize(kernel3)
-    mod = s.build()
-    assert mod(0) == kernel3(0)
-    assert mod(1) == kernel3(1)
-
-    # kernel4: declare tmp inside loop and used outside the loop-> invalid scope
-    def kernel4(n: int32) -> int32:
-        for i in range(n):
-            tmp: int32 = i
-        return tmp
-
-    with pytest.raises(SystemExit):
-        s = allo.customize(kernel4)
-
-    # case 5: nested loops
-    def kernel5(n: int32) -> int32:
-        s: int32 = 0
-        for i in range(n):
-            for j in range(n):
-                s = s + j
-            s = s + i
-        return s
-
-    s = allo.customize(kernel5)
-    mod = s.build()
-    assert mod(4) == kernel5(4)
-    assert mod(8) == kernel5(8)
-
-    def kernel6(n: int32) -> int32:
-        s: int32 = 0
-        for i in range(n):
-            # invalid: redefine `i`
-            for i in range(n):
-                s = s + i
-            s = s + i
-        return s
-
-    with pytest.raises(SystemExit):
-        s = allo.customize(kernel6)
-
-
-def test_np_array():
-    a = 1
-    arr = np.array([[1, 2], [3, 4]])
-
-    def kernel1() -> int32:
-        # rhs must be a compile time constant
-        tmp: int32[2, 2] = [[a, 2], [3, 4]]
-        return tmp[0, 0]
-
-    s = allo.customize(kernel1)
-    mod = s.build()
-    assert mod() == a
-    s = allo.customize(kernel1, enable_tensor=True)
-    mod = s.build()
-    assert mod() == a
-
-    def kernel2() -> int32:
-        # rhs can be a global constant np.array
-        tmp: int32[2, 2] = arr
-        return tmp[0, 0]
-
-    s = allo.customize(kernel2)
-    mod = s.build()
-    assert mod() == arr[0][0]
-    s = allo.customize(kernel2, enable_tensor=True)
-    mod = s.build()
-    assert mod() == arr[0][0]
-
-    def kernel3() -> int32:
-        # declaration: type annotation required
-        tmp: int32[2, 2] = [[1, 2], [3, 4]]
-        # assignment
-        tmp: int32[2, 2] = [[a, 2], [3, 4]]
-        return tmp[0, 0]
-
-    s = allo.customize(kernel3)
-    mod = s.build()
-    assert mod() == a
-    # [NOTE]:expected to fail for now
-    # s = allo.customize(kernel3, enable_tensor=True)
-    # mod = s.build()
-    # assert mod() == a
-
-    def kernel4() -> int32:
-        # declaration: type annotation required
-        tmp: int32[1] = [1]
-        # assignment
-        tmp: int32[1] = [a]
-        return tmp[0]
-
-    s = allo.customize(kernel4)
-    mod = s.build()
-    assert mod() == a
-    # [NOTE]:expected to fail for now
-    # s = allo.customize(kernel4, enable_tensor=True)
-    # mod = s.build()
-    # assert mod() == a
-
-    def kernel5() -> int32:
-        a_: int32 = a
-        tmp: int32[2, 2] = a_
-        # x, y = 1, 1
-        # declaration: type annotation required
-        tmp: int32[2, 2] = [[1, 2], [3, 4]]
-        # assignment
-        tmp = [[a, 2], [3, 4]]
-        return tmp[0, 0]
-
-    s = allo.customize(kernel5)
-    mod = s.build()
-    assert mod() == a
-    # [NOTE]:expected to fail for now
-    # s = allo.customize(kernel5, enable_tensor=True)
-    # mod = s.build()
-    # assert mod() == a
-
-    def kernel6() -> int32:
-        # declaration: type annotation required
-        tmp: int32[1] = [1]
-        # assignment
-        tmp = [a]
-        return tmp[0]
-
-    s = allo.customize(kernel6)
-    mod = s.build()
-    assert mod() == a
-    # [NOTE]:expected to fail for now
-    # s = allo.customize(kernel6, enable_tensor=True)
-    # mod = s.build()
-    # assert mod() == a
-
-    def kernel7() -> int32:
-        a_: int32 = a
-        tmp: int32[2, 2] = a_
-        return tmp[0, 0]
-
-    s = allo.customize(kernel7)
-    mod = s.build()
-    assert mod() == a
-    # [NOTE]:expected to fail for now
-    # s = allo.customize(kernel7, enable_tensor=True)
-    # mod = s.build()
-    # assert mod() == a
-
-
-def test_slice():
-    def slice(A: int32[6, 6]) -> int32[6, 6]:
-        B: int32[2, 3] = 0
-        B[0, 0] = 1
-        A[0:2, 0:3] = B
-        return A
-
-    s = allo.customize(slice)
-    print(s.module)
-
-    np_A = np.random.randint(0, 10, size=(6, 6)).astype(np.int32)
-    np_A_slice = np_A.copy()
-    np_B = np.zeros((2, 3)).astype(np.int32)
-    np_B[0, 0] = 1
-    np_A_slice[0:2, 0:3] = np_B
-    mod = s.build()
-    np.testing.assert_allclose(np_A_slice, mod(np_A), rtol=1e-5)
-
-
-def test_symbol_table():
-    def kernel1(A: int32[10]) -> int32[10]:
-        B: int32[10] = 0
-
-        # invalid: argument name conflict
-        def foo(A: int32[10], x: index) -> int32:
-            y: int32 = 0
-            C: int32[10] = 0
-            for i in range(10):
-                C[i] = A[i] + 1
-            y = C[x]
-            return y
-
-        for i in range(10):
-            B[i] = foo(A, i)
-        return B
-
-    with pytest.raises(SystemExit):
-        s = allo.customize(kernel1)
-
-    def kernel2(A: int32[10]) -> int32[10]:
-        # invalid: argument name conflict
-        def foo(x: index) -> int32:
-            y: int32 = 0
-            C: int32[10] = 0
-            y = C[x]
-            return y
-
-        for i in range(10):
-            A[i] = foo(i)
-        return A
-
-    s = allo.customize(kernel2)
-    print(s.module)
-    mod = s.build()
-    np_A = np.random.randint(0, 10, size=(10,)).astype(np.int32)
-    np_B = mod(np_A)
-    assert np.array_equal(np_B, np.zeros((10,)))
-
-    def kernel3(A: int32[10]) -> int32[10]:
-        # invalid: function name conflict
-        def A(x: index) -> int32:
-            y: int32 = 0
-            C: int32[10] = 0
-            y = C[x]
-            return y
-
-        for i in range(10):
-            A[i] = A(i)
-        return A
-
-    with pytest.raises(SystemExit):
-        s = allo.customize(kernel3)
-
-
-def test_bit_operations_in_meta_for():
-    """Test that bit operations work correctly inside meta_for loops.
-
-    This is a regression test for a bug where bit operations would crash
-    when used inside meta_for loops due to AST node mutation during unrolling.
-    """
-    from allo.ir.types import uint2
-
-    # Test 1: Regular for loop with bit slice assignment (baseline)
-    def kernel_regular_for(A: uint2[10], B: int32[10]):
-        for i in range(10):
-            B[i][0:2] = A[i]
-
-    s1 = allo.customize(kernel_regular_for)
-    print("Test 1 passed: regular for loop with bit slice works")
-    print(s1.module)
-
-    # Test 2: meta_for loop with bit slice assignment (previously crashed)
-    def kernel_meta_for(A: uint2[10], B: int32[10]):
-        with allo.meta_for(10) as i:
-            B[i][0:2] = A[i]
-
-    s2 = allo.customize(kernel_meta_for)
-    print("Test 2 passed: meta_for loop with bit slice works")
-    print(s2.module)
-
-    # Test 3: Verify both produce similar module structure
-    # Both should work without errors
-    mod1 = s1.build()
-    mod2 = s2.build()
-
-    # Test execution correctness
-    np_A = np.array([0, 1, 2, 3, 0, 1, 2, 3, 0, 1], dtype=np.uint8)
-    np_B1 = np.zeros((10,), dtype=np.int32)
-    np_B2 = np.zeros((10,), dtype=np.int32)
-
-    mod1(np_A, np_B1)
-    mod2(np_A, np_B2)
-
-    # Both should produce the same result
-    np.testing.assert_array_equal(np_B1, np_B2)
-    # Values should match the input (lower 2 bits)
-    np.testing.assert_array_equal(np_B1, np_A & 0x3)
-
-    # Test 4: Single bit access in meta_for
-    def kernel_single_bit(A: int32[10], B: int32[10]):
-        with allo.meta_for(10) as i:
-            B[i] = A[i][0]
-
-    s4 = allo.customize(kernel_single_bit)
-    print("Test 4 passed: meta_for loop with single bit access works")
-
-    # Test 5: Multiple iterations to ensure AST reuse works correctly
-    def kernel_multi_iter(A: uint2[5], B: int32[5]):
-        with allo.meta_for(5) as i:
-            B[i][0:2] = A[i]
-
-    s5 = allo.customize(kernel_multi_iter)
-    mod5 = s5.build()
-    np_A5 = np.array([0, 1, 2, 3, 0], dtype=np.uint8)
-    np_B5 = np.zeros((5,), dtype=np.int32)
-    mod5(np_A5, np_B5)
-    np.testing.assert_array_equal(np_B5, np_A5 & 0x3)
-    print("Test 5 passed: multiple iterations work correctly")
-
-
-def test_augmented_assign_in_meta_for():
-    """Test that augmented assignments work correctly inside meta_for loops.
-
-    This is a regression test for a similar bug where augmented assignments
-    would crash when used inside meta_for loops due to AST node mutation.
-    """
-
-    # Test 1: Regular for loop with augmented assignment (baseline)
-    def kernel_regular_for(A: int32[10], B: int32[10]):
-        for i in range(10):
-            B[i] += A[i]
-
-    s1 = allo.customize(kernel_regular_for)
-    print("Test 1 passed: regular for loop with augmented assignment works")
-
-    # Test 2: meta_for loop with augmented assignment
-    def kernel_meta_for(A: int32[10], B: int32[10]):
-        with allo.meta_for(10) as i:
-            B[i] += A[i]
-
-    s2 = allo.customize(kernel_meta_for)
-    print("Test 2 passed: meta_for loop with augmented assignment works")
-
-    # Test execution correctness
-    mod1 = s1.build()
-    mod2 = s2.build()
-
-    np_A = np.array([1, 2, 3, 4, 5, 6, 7, 8, 9, 10], dtype=np.int32)
-    np_B1 = np.array([10, 9, 8, 7, 6, 5, 4, 3, 2, 1], dtype=np.int32)
-    np_B2 = np.array([10, 9, 8, 7, 6, 5, 4, 3, 2, 1], dtype=np.int32)
-
-    mod1(np_A, np_B1)
-    mod2(np_A, np_B2)
-
-    # Both should produce the same result
-    np.testing.assert_array_equal(np_B1, np_B2)
-    # Result should be original B + A
-    np.testing.assert_array_equal(
-        np_B1, np.array([11, 11, 11, 11, 11, 11, 11, 11, 11, 11], dtype=np.int32)
     )
 
-    # Test 3: Multiple augmented operations in meta_for
-    def kernel_multi_ops(A: int32[5]):
-        with allo.meta_for(5) as i:
-            A[i] *= 2
-            A[i] += 1
 
-    s3 = allo.customize(kernel_multi_ops)
-    mod3 = s3.build()
-    np_A3 = np.array([1, 2, 3, 4, 5], dtype=np.int32)
-    mod3(np_A3)
-    # Result should be (A * 2) + 1
-    np.testing.assert_array_equal(np_A3, np.array([3, 5, 7, 9, 11], dtype=np.int32))
-    print("Test 3 passed: multiple augmented operations work correctly")
+def _assert_contains(ir: str, *patterns: str):
+    for pattern in patterns:
+        assert pattern in ir
 
 
-def test_constexpr_loop_bound():
-    M = 10
-
-    def kernel(A: int32[10]) -> int32[10]:
-        limit: ConstExpr[int32] = M // 2
-        B: int32[10]
-        # limit is 5
-        for i in range(limit):
-            B[i] = A[i] + 1
-        for i in range(limit, 10):
-            B[i] = A[i]
-        return B
-
-    s = allo.customize(kernel)
-    mod = s.build()
-    np_A = np.arange(10, dtype=np.int32)
-    np_B = mod(np_A)
-    expected = np.copy(np_A)
-    expected[:5] += 1
-    np.testing.assert_array_equal(np_B, expected)
-
-    # Check IR for constant loop bounds
-    src = str(s.module)
-    print(src)
-    assert "to 5" in src
-    assert "scf.for" not in src
+def _assert_compile_error(fn, *patterns: str):
+    with pytest.raises(CompilationError) as exc_info:
+        _compile_ir(fn)
+    message = exc_info.value.error_msg
+    for pattern in patterns:
+        assert pattern in message
 
 
-def test_constexpr_arithmetic():
-    def kernel(A: int32[10]) -> int32[10]:
-        base: ConstExpr[int32] = 2
-        mult: ConstExpr[int32] = 3
-        # offset should be 6
-        offset: ConstExpr[int32] = base * mult
-        B: int32[10]
-        for i in range(10):
-            B[i] = A[i] + offset
-        return B
-
-    s = allo.customize(kernel)
-    mod = s.build()
-    np_A = np.arange(10, dtype=np.int32)
-    np_B = mod(np_A)
-    np.testing.assert_array_equal(np_B, np_A + 6)
-
-    # Check IR to ensure '6' is used as a constant or folded
-    src = str(s.module)
-    print(src)
-    # It might appear as constant 6 or used in map
-    assert "constant 6" in src or "c6_i32" in src
+def _assert_type_error(fn, *patterns: str):
+    with pytest.raises(TypeError) as exc_info:
+        _compile_ir(fn)
+    message = str(exc_info.value)
+    for pattern in patterns:
+        assert pattern in message
 
 
-def test_constexpr_dependence():
-    def kernel(A: int32[10]) -> int32[10]:
-        N: ConstExpr[int32] = 4
-        M: ConstExpr[int32] = N + 2  # 6
-        K: ConstExpr[int32] = M + 2  # 8
-        B: int32[10]
-        for i in range(K):
-            B[i] = A[i] * 2
-        for i in range(K, 10):
-            B[i] = A[i]
-        return B
+def test_error_diagnostic_source():
+    src = "def broken(x):\n    return x + y\n"
+    module = ast.parse(src)
+    fn = module.body[0]
+    assert isinstance(fn, ast.FunctionDef)
+    ret = fn.body[0]
+    assert isinstance(ret, ast.Return)
+    expr = ret.value
+    assert isinstance(expr, ast.BinOp)
 
-    s = allo.customize(kernel)
-    print(s.module)
-    mod = s.build()
-    np_A = np.arange(10, dtype=np.int32)
-    np_B = mod(np_A)
-    expected = np.copy(np_A)
-    expected[:8] *= 2
-    np.testing.assert_array_equal(np_B, expected)
+    err = CompilationError(
+        src,
+        "Name 'y' is not defined",
+        expr.right,
+        file_name="broken.py",
+        begin_line=10,
+    )
+    message = err.render(color=False)
 
-
-def test_constexpr_error_uninitialized():
-    def kernel():
-        a: ConstExpr[int32]
-        pass
-
-    with pytest.raises(SystemExit):
-        allo.customize(kernel)
+    assert "broken.py:11:16: error: Name 'y' is not defined" in message
+    assert "11 |     return x + y" in message
+    assert "^" in message
+    assert "\x1b[" not in message
+    assert str(err).startswith("\n")
 
 
-def test_constexpr_with_helper_functions():
-    """Test ConstExpr with Python helper functions evaluated at compile time."""
-    import math
+def test_scalar_int_add():
+    @kernel
+    def top(x: i32, y: i32, out: i32[1]):
+        out[0] = x + y
 
-    # Python helper functions - evaluated at compile time
-    def compute_coefficient(i):
-        return math.cos(2.0 * math.pi * i / 8)
-
-    def compute_index(i, offset):
-        return (i + offset) % 8
-
-    def kernel(A: float32[8], B: float32[8]):
-        with allo.meta_for(8) as i:
-            # ConstExpr values are computed at Python level during compilation
-            coef: ConstExpr[float32] = compute_coefficient(i)
-            idx: ConstExpr[int32] = compute_index(i, 3)
-            B[i] = A[idx] * coef
-
-    s = allo.customize(kernel)
-    print(s.module)
-    mod = s.build()
-
-    # Verify correctness
-    np_A = np.array([1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0], dtype=np.float32)
-    np_B = np.zeros(8, dtype=np.float32)
-    mod(np_A, np_B)
-
-    # Compute expected result
-    expected = np.zeros(8, dtype=np.float32)
-    for i in range(8):
-        idx = compute_index(i, 3)
-        coef = compute_coefficient(i)
-        expected[i] = np_A[idx] * coef
-
-    np.testing.assert_allclose(np_B, expected, rtol=1e-5)
+    ir = _compile_ir(top)
+    _assert_contains(
+        ir,
+        "arith.extsi",
+        "to i33",
+        "arith.addi",
+        "i33 to i32",
+    )
 
 
-def test_constant_tensor_slice():
-    """Test loading a slice of a constant numpy array."""
-    np_A = np.array([[1, 2, 3, 4], [5, 6, 7, 8]], dtype=np.int32)
+def test_hls_nary_add_sub():
+    @kernel
+    def top(x: i32, y: i32, z: i32, out: i32[1]):
+        out[0] = x + y - z
 
-    def kernel() -> int32[4]:
-        A: int32[4] = np_A[1]  # Load second row as constant
-        return A
-
-    s = allo.customize(kernel)
-    print(s.module)
-    mod = s.build()
-    result = mod()
-    np.testing.assert_array_equal(result, np_A[1])
-
-
-def test_constant_tensor_slice_2d():
-    """Test loading a 2D slice of a constant numpy 3D array."""
-    np_A = np.arange(24, dtype=np.float32).reshape(2, 3, 4)
-
-    def kernel() -> float32[3, 4]:
-        A: float32[3, 4] = np_A[1]  # Load second 2D slice
-        return A
-
-    s = allo.customize(kernel)
-    print(s.module)
-    mod = s.build()
-    result = mod()
-    np.testing.assert_allclose(result, np_A[1], rtol=1e-5)
+    ir = _compile_ir(top)
+    _assert_contains(
+        ir,
+        "arith.constant 0 : i34",
+        "to i34",
+        "arith.subi",
+        "arith.addi",
+        "i34 to i32",
+    )
 
 
-if __name__ == "__main__":
-    pytest.main([__file__])
+def test_hls_nary_mul():
+    @kernel
+    def top(x: i32, y: i32, z: i32, out: i32[1]):
+        out[0] = x * y * z
+
+    ir = _compile_ir(top)
+    _assert_contains(
+        ir,
+        "to i96",
+        "arith.muli",
+        "i96 to i32",
+    )
+
+
+def test_mixed_int_float_add():
+    @kernel
+    def top(x: i32, y: f32, out: f32[1]):
+        out[0] = x + y
+
+    ir = _compile_ir(top)
+    _assert_contains(
+        ir,
+        "arith.sitofp",
+        "i32 to f32",
+        "arith.addf",
+    )
+
+
+def test_float_add():
+    @kernel
+    def top(x: f32, y: f32, out: f32[1]):
+        out[0] = x + y
+
+    ir = _compile_ir(top)
+    _assert_contains(ir, "arith.addf")
+
+
+def test_unary_neg():
+    @kernel
+    def top(x: i32, out: i32[1]):
+        out[0] = -x
+
+    ir = _compile_ir(top)
+    _assert_contains(
+        ir,
+        "arith.constant 0 : i33",
+        "arith.extsi",
+        "arith.subi",
+        "i33 to i32",
+    )
+
+
+def test_bitwise_xor():
+    @kernel
+    def top(x: u32, y: u32, out: u32[1]):
+        out[0] = x ^ y
+
+    ir = _compile_ir(top)
+    _assert_contains(ir, "arith.xori")
+
+
+def test_shift_by_range_index():
+    @kernel
+    def top(x: i32, out: i32[4]):
+        for i in range(4):
+            out[i] = x >> (i * 2)
+
+    ir = _compile_ir(top)
+    _assert_contains(
+        ir,
+        "arith.index_cast",
+        "arith.shrui",
+    )
+
+
+def test_bit_get_slice():
+    @kernel
+    def top(x: u32, out: u32[1]):
+        out[0] = x[4:8]
+
+    ir = _compile_ir(top)
+    _assert_contains(
+        ir,
+        "allo.bit.get_slice",
+        "[%c4 : %c8]",
+        "i4 from i32",
+    )
+
+
+def test_bit_get_single_bit():
+    @kernel
+    def top(x: u32, out: u32[1]):
+        out[0] = x[3]
+
+    ir = _compile_ir(top)
+    _assert_contains(
+        ir,
+        "allo.bit.get_slice",
+        "i1 from i32",
+    )
+
+
+def test_bit_get_slice_dynamic_offset_static_width():
+    # A dynamic offset with a statically-constant width: the `i` terms cancel in
+    # `(i + 2) - i`, so the result is exactly 2 bits (`i2`), not the full source.
+    @kernel
+    def top(x: u32, out: u32[2]):
+        for i in range(2):
+            out[i] = x[i : i + 2]
+
+    ir = _compile_ir(top)
+    _assert_contains(
+        ir,
+        "arith.addi",
+        "allo.bit.get_slice",
+        "i2 from i32",
+    )
+
+
+def test_bit_get_slice_constexpr_width():
+    @kernel
+    def top(x: u32, out: u32[2]):
+        W: constexpr = 3
+        for i in range(2):
+            out[i] = x[i : i + W]
+
+    ir = _compile_ir(top)
+    _assert_contains(
+        ir,
+        "arith.addi",
+        "allo.bit.get_slice",
+        "i3 from i32",
+    )
+
+
+def test_bit_get_slice_dynamic_width_error():
+    @kernel
+    def top(lo: i32, hi: i32, x: u32, out: u32[1]):
+        out[0] = x[lo:hi]
+
+    _assert_compile_error(
+        top,
+        "Bit slice width 'hi - lo' must be a compile-time constant",
+    )
+
+
+def test_bit_set_slice():
+    @kernel
+    def top(x: u32, out: u32[1]):
+        y: u32 = x
+        y[0:4] = 5
+        out[0] = y
+
+    ir = _compile_ir(top)
+    _assert_contains(
+        ir,
+        "arith.constant 5 : i4",
+        "allo.bit.set_slice",
+        "i4 into i32",
+    )
+
+
+def test_bit_set_slice_memref_writeback():
+    @kernel
+    def top(a: u8[4], b: u32[4]):
+        for i in range(4):
+            b[i][0:2] = a[i]
+
+    ir = _compile_ir(top)
+    _assert_contains(
+        ir,
+        "affine.load",
+        "allo.bit.set_slice",
+        "i2 into i32",
+        "affine.store",
+    )
+
+
+def test_bit_slice_requires_integer():
+    @kernel
+    def top(x: f32, out: f32[1]):
+        out[0] = x[0:4]
+
+    _assert_compile_error(
+        top,
+        "Bit slicing is only supported on signless integer scalars.",
+    )
+
+
+def test_comparison_lt():
+    @kernel
+    def top(x: i32, y: i32, out: u1[1]):
+        out[0] = x < y
+
+    ir = _compile_ir(top)
+    _assert_contains(
+        ir,
+        "arith.cmpi slt",
+        "memref<1xi1>",
+    )
+
+
+def test_bool_and_not():
+    @kernel
+    def top(x: allo_bool, y: allo_bool, out: u1[1]):
+        out[0] = x and not y
+
+    ir = _compile_ir(top)
+    _assert_contains(
+        ir,
+        "arith.constant true",
+        "arith.xori",
+        "arith.andi",
+        "memref<1xi1>",
+    )
+
+
+def test_if_statement_phi():
+    @kernel
+    def top(cond: allo_bool, x: i32, y: i32, out: i32[1]):
+        v = x
+        if cond:
+            v = y
+        else:
+            v = x + y
+        out[0] = v
+
+    ir = _compile_ir(top)
+    _assert_contains(
+        ir,
+        "scf.if",
+        "-> (i32)",
+        "scf.yield",
+    )
+
+
+def test_if_branch_local_buffers():
+    @kernel
+    def top(out: i32[8]):
+        for r in range(2):
+            r_i32: i32 = r
+            if r_i32 == 0:
+                then_buf: i32[4]
+                for j in range(4):
+                    then_buf[j] = j
+                    out[j] = then_buf[j]
+            else:
+                else_buf: i32[4]
+                for j in range(4):
+                    else_buf[j] = j + 1
+                    out[j + 4] = else_buf[j]
+
+    ir = _compile_ir(top)
+    _assert_contains(
+        ir,
+        "scf.if",
+        "affine.for",
+        "memref.alloc",
+    )
+
+
+def test_if_branch_local_loop_carried_value():
+    @kernel
+    def top(cond: allo_bool, x: i32, out: i32[1]):
+        if cond:
+            out[0] = x
+        else:
+            c: i32 = 0
+            for _ in range(2):
+                c += x
+            out[0] = c
+
+    ir = _compile_ir(top)
+    _assert_contains(ir, "scf.if", "affine.for")
+
+
+def test_if_constexpr_branch():
+    dtype = f32
+
+    @kernel
+    def top(x: i32[1]):
+        if False:
+            x[0] = 1
+        elif dtype == i32:
+            x[0] = 2
+        else:
+            x[0] = 3
+
+    ir = _compile_ir(top)
+    _assert_contains(ir, "arith.constant 3")
+    assert "scf.if" not in ir
+
+
+def test_ternary_expression():
+    @kernel
+    def top(cond: allo_bool, x: i32, y: i32, out: i32[1]):
+        out[0] = x if cond else y
+
+    ir = _compile_ir(top)
+    _assert_contains(ir, "arith.select")
+
+
+def test_memref_load_store():
+    @kernel
+    def top(inp: i32[4], out: i32[1]):
+        out[0] = inp[0]
+
+    ir = _compile_ir(top)
+    _assert_contains(
+        ir,
+        "affine.load",
+        "memref<4xi32>",
+        "affine.store",
+        "memref<1xi32>",
+    )
+
+
+def test_range_loop_store():
+    @kernel
+    def top(out: i32[4]):
+        for i in allo.range(4):
+            out[i] = i
+
+    ir = _compile_ir(top)
+    _assert_contains(
+        ir,
+        "affine.for",
+        "= 0 to 4",
+        "arith.index_cast",
+        "index to i32",
+    )
+
+
+def test_index_runtime_arithmetic():
+    @kernel
+    def top(stride: i32, out: i32[8]):
+        offset: i32 = 2
+        for i in range(4):
+            out[offset + stride * i] = i
+
+    ir = _compile_ir(top)
+    _assert_contains(
+        ir,
+        "arith.index_cast",
+        "arith.addi",
+        "arith.muli",
+    )
+
+
+def test_builtin_range_loop_store():
+    @kernel
+    def top(out: i32[4]):
+        for i in range(4):
+            out[i] = i
+
+    ir = _compile_ir(top)
+    _assert_contains(
+        ir,
+        "affine.for",
+        "= 0 to 4",
+    )
+
+
+def test_grid_loop_store():
+    @kernel
+    def top(out: i32[2, 2]):
+        for i, j in allo.grid(2, 2):
+            out[i, j] = i + j
+
+    ir = _compile_ir(top)
+    _assert_contains(
+        ir,
+        "affine.parallel",
+        "= (0, 0) to (2, 2)",
+        "arith.addi",
+        "arith.index_cast",
+        "memref<2x2xi32>",
+    )
+
+
+def test_affine_index_floordiv_mod_mul():
+    @kernel
+    def top(a: f32[16], b: f32[8]):
+        for i in range(8):
+            b[i] = a[i * 2] + a[i // 2] + a[i % 4]
+
+    ir = _compile_ir(top)
+    _assert_contains(
+        ir,
+        "affine.load %a[%arg2 * 2]",
+        "affine.load %a[%arg2 floordiv 2]",
+        "affine.load %a[%arg2 mod 4]",
+        "affine.store",
+    )
+
+
+def test_affine_per_access_fallback():
+    # Decoupled per-access affine: b[i] is affine, but the indirect a[k] access
+    # (k is not an affine induction variable) falls back to memref.load.
+    @kernel
+    def top(a: f32[16], idx: i32[16], b: f32[16]):
+        for i in range(16):
+            k: i32 = idx[i]
+            b[i] = a[k]
+
+    ir = _compile_ir(top)
+    _assert_contains(ir, "affine.for", "memref.load %a", "affine.store %1, %b")
+
+
+def test_affine_symbol_bound():
+    # A runtime upper bound that is a kernel parameter is a valid affine symbol:
+    # the loop stays affine.for, with an index_cast hoisted to the entry block.
+    @kernel
+    def top(n: i32, a: f32[64], b: f32[64]):
+        for i in range(n):
+            b[i] = a[i] + 1.0
+
+    ir = _compile_ir(top)
+    _assert_contains(
+        ir, "arith.index_cast %n", "affine.for %arg3 = 0 to %0", "affine.load"
+    )
+
+
+def test_affine_symbol_in_index():
+    # An index-typed parameter used inside an index expression becomes a symbol.
+    @kernel
+    def top(n: index, a: f32[64], b: f32[64]):
+        for i in range(n):
+            b[i] = a[i + n]
+
+    ir = _compile_ir(top)
+    _assert_contains(ir, "affine.load %a[%arg3 + symbol(%n)]")
+
+
+def test_affine_tiled_dim_bound():
+    # Bounds that are affine over an enclosing affine IV stay affine (no symbol,
+    # no scf): the inner loop ranges over `i` .. `i + 8`.
+    @kernel
+    def top(a: f32[64], b: f32[64]):
+        for i in range(0, 64, 8):
+            for j in range(i, i + 8):
+                b[j] = a[j] * 2.0
+
+    ir = _compile_ir(top)
+    assert ir.count("affine.for") == 2
+    _assert_contains(ir, "affine.for", "step 8")
+    assert "scf.for" not in ir
+
+
+def test_affine_dynamic_grid():
+    # grid() with runtime (symbol) bounds lowers to affine.parallel.
+    @kernel
+    def top(n: index, m: index, a: f32[16, 16], b: f32[16, 16]):
+        for i, j in allo.grid(n, m):
+            b[i, j] = a[i, j]
+
+    ir = _compile_ir(top)
+    _assert_contains(
+        ir, "affine.parallel", "to (symbol(%n), symbol(%m))", "affine.load"
+    )
+
+
+def test_non_affine_bound_falls_back_to_scf():
+    # A runtime bound that is a loaded value (not a top-level symbol) is not
+    # affine, so the loop stays scf.for and its accesses use memref.
+    @kernel
+    def top(bounds: i32[4], a: f32[64]):
+        k: i32 = bounds[0]
+        for i in range(k):
+            a[i] = 0.0
+
+    ir = _compile_ir(top)
+    _assert_contains(ir, "scf.for", "memref.store")
+
+
+def test_direct_operator_invoke():
+    @kernel
+    def top(x: i32, y: i32, out: i32[1]):
+        out[0] = allo_max(x, y)
+
+    ir = _compile_ir(top)
+    _assert_contains(ir, "arith.maxsi")
+
+
+def test_builtin_max_min():
+    @kernel
+    def top(x: i32, y: i32, out: i32[2]):
+        out[0] = max(x, y)
+        out[1] = min(x, y)
+
+    ir = _compile_ir(top)
+    _assert_contains(
+        ir,
+        "arith.maxsi",
+        "arith.minsi",
+    )
+
+
+def test_global_scalar_constexpr():
+    @kernel
+    def top(x: i32, y: f32, out: f32[2]):
+        out[0] = x + _GLOBAL_INT_CONST
+        out[1] = y + _GLOBAL_FLOAT_CONST
+
+    ir = _compile_ir(top)
+    _assert_contains(
+        ir,
+        "arith.constant 3",
+        "arith.constant 1.500000e+00",
+        "arith.addi",
+        "arith.addf",
+    )
+
+
+def test_global_shape_annotation():
+    @kernel
+    def top(
+        inp: i32[_GLOBAL_SHAPE_M * _GLOBAL_SHAPE_N],
+        out: i32[_GLOBAL_SHAPE_M, _GLOBAL_SHAPE_N],
+    ):
+        for i in range(_GLOBAL_SHAPE_M):
+            for j in range(_GLOBAL_SHAPE_N):
+                out[i, j] = inp[i * _GLOBAL_SHAPE_N + j]
+
+    ir = _compile_ir(top)
+    _assert_contains(
+        ir,
+        "memref<6xi32>",
+        "memref<2x3xi32>",
+        "affine.for",
+    )
+
+
+def test_scope_shape_annotation():
+    rows = 2
+    cols = 2
+
+    @kernel
+    def top(out: i32[rows, cols]):
+        for i, j in allo.grid(2, 2):
+            out[i, j] = i + j
+
+    ir = _compile_ir(top)
+    _assert_contains(
+        ir,
+        "memref<2x2xi32>",
+        "affine.parallel",
+    )
+
+
+def test_template_signature_shape():
+    T = Template("T")
+    N = Template("N")
+
+    @kernel(T, N)
+    def top(x: T, out: T[N]):
+        tmp: T = x
+        for i in range(N):
+            out[i] = tmp
+
+    ir = _compile_ir(top[f32, 2])
+    _assert_contains(
+        ir,
+        "f32",
+        "memref<2xf32>",
+        "affine.for",
+    )
+
+
+def test_template_helper_specialization():
+    T = Template("T")
+
+    @kernel(T)
+    def worker(x: T) -> T:
+        return x
+
+    @kernel(T)
+    def top(x: T, out: T[1]):
+        out[0] = worker[T](x)
+
+    ir = _compile_ir(top[i32])
+    _assert_contains(
+        ir,
+        "allo.kernel private @top.worker",
+        "invoke @top.worker",
+        "i32",
+    )
+
+
+def test_template_specialization_object():
+    T = Template("T")
+
+    @kernel(T)
+    def top(x: T, out: T[1]):
+        out[0] = x
+
+    specialized = top[f32]
+    ir = _compile_ir(specialized)
+    _assert_contains(ir, "f32", "memref<1xf32>")
+
+
+def test_local_memref_declaration():
+    @kernel
+    def top(out: i32[4]):
+        N: constexpr = 4
+        buf: i32[N]
+        for i in range(N):
+            buf[i] = i
+            out[i] = buf[i]
+
+    ir = _compile_ir(top)
+    _assert_contains(
+        ir,
+        "memref.alloc",
+        "memref<4xi32>",
+        "affine.load",
+    )
+
+
+def test_local_tensor_declaration():
+    @kernel(options=KernelOptions(enable_tensor=True))
+    def top() -> f32[4]:
+        N: constexpr = 4
+        buf: f32[N]
+        return buf
+
+    ir = _compile_ir(top)
+    _assert_contains(ir, "tensor.empty", "tensor<4xf32>")
+
+
+def test_memref_list_initializer():
+    @kernel
+    def top(out: i32[2, 2]):
+        scale: constexpr = _GLOBAL_INT_CONST
+        buf: i32[2, 2] = [[1, scale], [scale + 1, scale + 2]]
+        for i, j in allo.grid(2, 2):
+            out[i, j] = buf[i, j]
+
+    ir = _compile_ir(top)
+    _assert_contains(
+        ir,
+        'memref.global "private" @_allo_const_top_buf_l3c4',
+        "memref.get_global @_allo_const_top_buf_l3c4",
+        "dense<[[1, 3], [4, 5]]>",
+        "affine.load",
+    )
+
+
+def test_tensor_list_initializer():
+    @kernel(options=KernelOptions(enable_tensor=True))
+    def top() -> i32[2, 2]:
+        buf: i32[2, 2] = [[1, 2], [3, 4]]
+        return buf
+
+    ir = _compile_ir(top)
+    _assert_contains(ir, "arith.constant dense<[[1, 2], [3, 4]]> : tensor<2x2xi32>")
+
+
+def test_stream_scalar_ir():
+    @kernel
+    def top(x: i32, out: i32[1]):
+        fifo: Stream[i32][2, 2]
+        fifo[0, 1].put(x)
+        out[0] = fifo[0, 1].get()
+
+    ir = _compile_ir(top)
+    _assert_contains(
+        ir,
+        "allo.stream.create : !allo.stream<i32,2,[2,2]>",
+        "allo.stream.put",
+        "allo.stream.get",
+    )
+
+
+def test_stream_nested_parameter_ir():
+    @kernel
+    def top(x: i32, out: i32[1]):
+        fifo: Stream[i32][2, 2]
+
+        @kernel
+        def worker(s: Stream[i32][2, 2], v: i32):
+            s[0, 1].put(v)
+
+        worker(fifo, x)
+        out[0] = fifo[0, 1].get()
+
+    ir = _compile_ir(top)
+    _assert_contains(
+        ir,
+        "allo.stream.create : !allo.stream<i32,2,[2,2]>",
+        "allo.kernel private @top.worker",
+        "(%s: !allo.stream<i32,2,[2,2]>",
+        "invoke @top.worker",
+        "allo.stream.put",
+        "allo.stream.get",
+    )
+
+
+def test_nested_kernel_mapping_ir():
+    @kernel
+    def top(out: i32[1]):
+        workers: constexpr = 2
+
+        @kernel(mapping=[workers])
+        def worker(buf: i32[1]):
+            buf[0] = 1
+
+        worker(out)
+
+    ir = _compile_ir(top)
+    _assert_contains(
+        ir,
+        "allo.kernel private @top.worker(%buf: memref<1xi32>) mapping=[2]",
+        "invoke @top.worker",
+    )
+
+
+def test_bound_method_compile_errors():
+    @kernel
+    def top(x: i32):
+        x.put(1)
+
+    @kernel
+    def worker():
+        x: constexpr = 1
+        x.put(1)
+
+    _assert_compile_error(
+        top,
+        "Stream get/put expects a stream value, got 'int32'.",
+    )
+    _assert_compile_error(
+        worker,
+        "constexpr value '1' has no attribute 'put'.",
+    )
+
+
+def test_for_loop_carried_values():
+    @kernel
+    def top(out: i32[1]):
+        acc: i32 = 0
+        for i in range(4):
+            i_i32: i32 = i
+            acc += i_i32
+        out[0] = acc
+
+    ir = _compile_ir(top)
+    _assert_contains(ir, "affine.for", "iter_args", "affine.yield")
+
+
+def test_while_loop_carried_values():
+    @kernel
+    def top(out: i32[1]):
+        i: i32 = 0
+        acc: i32 = 0
+        while i < 4:
+            acc += i
+            i += 1
+        out[0] = acc
+
+    ir = _compile_ir(top)
+    _assert_contains(ir, "scf.while", "scf.condition", "scf.yield")
+
+
+def test_consteval_expression():
+    @consteval
+    def factor():
+        return 3
+
+    @kernel
+    def top(x: i32, out: i32[1]):
+        out[0] = x + factor()
+
+    ir = _compile_ir(top)
+    _assert_contains(
+        ir,
+        "arith.constant 3 : i33",
+        "arith.extsi",
+        "arith.addi",
+        "i33 to i32",
+    )
+
+
+def test_nested_invoke_store():
+    @kernel
+    def top(x: i32, out: i32[1]):
+        @kernel
+        def worker(v: i32) -> i32:
+            return v + 1
+
+        out[0] = worker(x)
+
+    ir = _compile_ir(top)
+    _assert_contains(ir, "allo.kernel private @top.worker", "invoke @top.worker")
+
+
+def test_nested_multiple_returns():
+    @kernel
+    def top(x: i32, y: i32, out: i32[1]):
+        @kernel
+        def worker(a: i32, b: i32) -> (i32, i32):
+            return a, b
+
+        lhs, rhs = worker(x, y)
+        out[0] = lhs + rhs
+
+    ir = _compile_ir(top)
+    _assert_contains(
+        ir,
+        "allo.kernel private @top.worker",
+        "-> (i32, i32)",
+        "invoke @top.worker",
+        "arith.addi",
+    )
+
+
+def test_nested_capture_constexpr():
+    @kernel
+    def top(x: i32, out: i32[1]):
+        offset: constexpr = 3
+
+        @kernel
+        def worker(v: i32) -> i32:
+            return v + offset
+
+        out[0] = worker(x)
+
+    ir = _compile_ir(top)
+    _assert_contains(ir, "allo.kernel private @top.worker", "arith.constant 3")
+
+
+def test_nested_capture_type_alias():
+    @kernel
+    def top(out: i32[1]):
+        T: constexpr = i32
+
+        @kernel
+        def worker() -> T:
+            return 7
+
+        out[0] = worker()
+
+    ir = _compile_ir(top)
+    _assert_contains(
+        ir,
+        "allo.kernel private @top.worker",
+        "-> i32",
+        "arith.constant 7 : i32",
+    )
+
+
+def test_nested_capture_consteval():
+    @consteval
+    def amount():
+        return 5
+
+    @kernel
+    def top(x: i32, out: i32[1]):
+        @kernel
+        def worker(v: i32) -> i32:
+            return v + amount()
+
+        out[0] = worker(x)
+
+    ir = _compile_ir(top)
+    _assert_contains(ir, "allo.kernel private @top.worker", "arith.constant 5")
+
+
+def test_nested_capture_kernel_alias():
+    @kernel
+    def callee(v: i32) -> i32:
+        return v + 2
+
+    @kernel
+    def top(x: i32, out: i32[1]):
+        invokeee: constexpr = callee
+
+        @kernel
+        def worker(v: i32) -> i32:
+            return invokeee(v)
+
+        out[0] = worker(x)
+
+    ir = _compile_ir(top)
+    _assert_contains(
+        ir,
+        "allo.kernel private @top.worker.callee",
+        "invoke @top.worker.callee",
+        "invoke @top.worker",
+    )
+
+
+def test_nested_capture_module_alias():
+    @kernel
+    def top(out: i32[2]):
+        M: constexpr = allo.lang.core
+
+        @kernel
+        def worker(buf: i32[2]):
+            for i in M.range(2):
+                buf[i] = i
+
+        worker(out)
+
+    ir = _compile_ir(top)
+    _assert_contains(ir, "allo.kernel private @top.worker", "affine.for")
+
+
+def test_cpp_typing_compile():
+    @kernel(options=KernelOptions(typing_style="cpp"))
+    def top(x: u32, y: i32, out: u32[1]):
+        out[0] = x + y
+
+    ir = _compile_ir(top)
+    _assert_contains(ir, "arith.addi", ": i32")
+
+
+def test_return_scalar_value():
+    @kernel
+    def top(x: i32, y: i32) -> i32:
+        return x + y
+
+    ir = _compile_ir(top)
+    _assert_contains(
+        ir,
+        "-> i32",
+        "arith.addi",
+        "i33 to i32",
+    )
+
+
+def test_return_constexpr_literal():
+    @kernel
+    def top() -> i32:
+        return 3
+
+    ir = _compile_ir(top)
+    _assert_contains(ir, "-> i32", "arith.constant 3 : i32")
+
+
+def test_return_multiple_values():
+    @kernel
+    def top(x: i32, y: f32) -> (i32, f32):
+        return x, y
+
+    ir = _compile_ir(top)
+    _assert_contains(
+        ir,
+        "-> (i32, f32)",
+        "return",
+        ": i32, f32",
+    )
+
+
+def test_return_if_else():
+    @kernel
+    def top(cond: allo_bool, x: i32, y: i32) -> i32:
+        if cond:
+            return x
+        else:
+            return y
+
+    ir = _compile_ir(top)
+    _assert_contains(ir, "cf.cond_br", "return", ": i32")
+
+
+def test_return_if_fallthrough():
+    @kernel
+    def top(cond: allo_bool, x: i32, y: i32) -> i32:
+        if cond:
+            return x
+        return y
+
+    ir = _compile_ir(top)
+    _assert_contains(ir, "cf.cond_br", "return", ": i32")
+
+
+def test_return_requires_annotation():
+    @kernel
+    def top(x: i32):
+        return x
+
+    _assert_compile_error(
+        top,
+        "Return values require an explicit return annotation.",
+    )
+
+
+def test_return_missing_non_void():
+    @kernel
+    def top(x: i32) -> i32:
+        y = x + x
+
+    _assert_compile_error(
+        top,
+        "Missing return statement for non-void function",
+    )
+
+
+def test_return_count_mismatch():
+    @kernel
+    def top(x: i32, y: i32) -> (i32, i32):
+        return x
+
+    _assert_compile_error(
+        top,
+        "Return value count mismatch: expected 2, got 1.",
+    )
+
+
+def test_return_type_mismatch():
+    @kernel
+    def top(x: i32[2]) -> i32[1]:
+        return x
+
+    _assert_compile_error(
+        top,
+        "Cannot cast from memref<2xint32> to memref<1xint32>",
+    )
+
+
+def test_return_inside_loop_error():
+    @kernel
+    def top(x: i32) -> i32:
+        for i in allo.range(4):
+            return x
+        return x
+
+    _assert_compile_error(
+        top,
+        "'return' is not supported inside loops",
+    )
+
+
+def test_return_nested_if_error():
+    @kernel
+    def top(cond: allo_bool, inner: allo_bool, x: i32) -> i32:
+        if cond:
+            if inner:
+                return x
+        return x
+
+    _assert_compile_error(
+        top,
+        "'return' is not supported inside nested 'if' statements.",
+    )
