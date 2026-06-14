@@ -399,6 +399,82 @@ def test_if_constexpr_branch():
     assert "scf.if" not in ir
 
 
+def test_if_affine_iv_condition():
+    @kernel
+    def top(out: i32[16]):
+        for i in range(16):
+            if i < 8:
+                out[i] = 1
+            else:
+                out[i] = 2
+
+    ir = _compile_ir(top)
+    _assert_contains(ir, "affine.if", "affine_set", "affine.for")
+    assert "scf.if" not in ir
+
+
+def test_if_affine_mod_condition():
+    @kernel
+    def top(out: i32[16]):
+        for i in range(16):
+            if i % 2 == 0:
+                out[i] = 1
+
+    ir = _compile_ir(top)
+    _assert_contains(ir, "affine.if", "mod 2")
+    assert "scf.if" not in ir
+
+
+def test_if_affine_conjunction_with_symbol():
+    @kernel
+    def top(n: i32, out: i32[16]):
+        for i in range(16):
+            if i >= 2 and i < n:
+                out[i] = 1
+
+    ir = _compile_ir(top)
+    # two constraints from the `and`, plus a symbol operand from `n`.
+    _assert_contains(ir, "affine.if", "affine_set")
+    assert "scf.if" not in ir
+
+
+def test_if_affine_phi_result():
+    @kernel
+    def top(out: i32[16]):
+        for i in range(16):
+            v: i32 = 0
+            if i < 4:
+                v = 5
+            else:
+                v = 7
+            out[i] = v
+
+    ir = _compile_ir(top)
+    _assert_contains(ir, "affine.if", "-> i32", "affine.yield")
+    assert "scf.if" not in ir
+
+
+def test_if_non_affine_falls_back_to_scf():
+    # `!=` is a disjunction with no integer-set form, and a data-dependent
+    # comparison is not affine: both must keep using scf.if.
+    @kernel
+    def neq(out: i32[16]):
+        for i in range(16):
+            if i != 3:
+                out[i] = 1
+
+    @kernel
+    def data_dependent(inp: i32[16], out: i32[16]):
+        for i in range(16):
+            if inp[i] > 0:
+                out[i] = 1
+
+    for fn in (neq, data_dependent):
+        ir = _compile_ir(fn)
+        _assert_contains(ir, "scf.if")
+        assert "affine.if" not in ir
+
+
 def test_ternary_expression():
     @kernel
     def top(cond: allo_bool, x: i32, y: i32, out: i32[1]):

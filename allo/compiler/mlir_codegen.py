@@ -41,7 +41,7 @@ from .._mlir.dialects.scf import (
     ParallelOp,
     ReduceOp,
 )
-from .._mlir.dialects.affine import AffineForOp, AffineYieldOp
+from .._mlir.dialects.affine import AffineForOp, AffineIfOp, AffineYieldOp
 from .._mlir.dialects.arith import SelectOp
 from .._mlir.dialects.ub import PoisonOp
 from .builder import AlloOpBuilder
@@ -877,6 +877,81 @@ class MLIRCodeGenerator(ast.NodeVisitor):
                 specs.append((None, arg))
         return specs
 
+    # Comparison operators expressible as a single affine integer-set constraint,
+    # mapped to ``(make_residual, is_equality)`` where the residual is constrained
+    # ``>= 0`` (inequality) or ``== 0`` (equality). ``!=`` is a disjunction with no
+    # single-constraint form and is intentionally absent (so it forces scf.if).
+    _AFFINE_CONSTRAINT_OPS: dict[Type[ast.cmpop], tuple] = {
+        ast.Eq: (lambda lhs, rhs: lhs - rhs, True),
+        ast.LtE: (lambda lhs, rhs: rhs - lhs, False),
+        ast.Lt: (lambda lhs, rhs: rhs - lhs - 1, False),
+        ast.GtE: (lambda lhs, rhs: lhs - rhs, False),
+        ast.Gt: (lambda lhs, rhs: lhs - rhs - 1, False),
+    }
+
+    @staticmethod
+    def _flatten_affine_and(node: ast.AST):
+        """Flatten an ``if`` test into the comparison nodes joined by ``and`` (an
+        integer set is a conjunction of constraints), or ``None`` if it contains
+        anything else (``or``, a bare value, a call, ...)."""
+        if isinstance(node, ast.Compare):
+            return [node]
+        if isinstance(node, ast.BoolOp) and isinstance(node.op, ast.And):
+            out = []
+            for value in node.values:
+                sub = MLIRCodeGenerator._flatten_affine_and(value)
+                if sub is None:
+                    return None
+                out.extend(sub)
+            return out
+        return None
+
+    def _build_affine_constraint(self, node: ast.Compare, atom):
+        """Lower a single comparison into an integer-set constraint
+        ``(residual_expr, is_equality)``, or ``None`` if its operator or operands
+        are not affine."""
+        if len(node.ops) != 1 or len(node.comparators) != 1:
+            return None
+        spec = self._AFFINE_CONSTRAINT_OPS.get(type(node.ops[0]))
+        if spec is None:
+            return None
+        lhs = self._build_affine_expr(node.left, atom)
+        rhs = self._build_affine_expr(node.comparators[0], atom)
+        if lhs is None or rhs is None:
+            return None
+        make_residual, is_equality = spec
+        return make_residual(lhs, rhs), is_equality
+
+    def _build_affine_condition(self, test: ast.AST):
+        """Try to express an ``if`` test as ``(IntegerSet, operands)`` so it can
+        lower to ``affine.if``. Returns ``None`` (falling back to ``scf.if``) when
+        the test is not a conjunction of affine comparisons, or has no runtime
+        operand -- a constant condition must keep the constexpr branch semantics
+        (compile-time branch selection)."""
+        comparisons = self._flatten_affine_and(test)
+        if comparisons is None:
+            return None
+        acc = _AffineOperands()
+        atom = self._affine_map_atom(acc)
+        exprs = []
+        eq_flags = []
+        for comparison in comparisons:
+            built = self._build_affine_constraint(comparison, atom)
+            if built is None:
+                return None
+            residual, is_equality = built
+            exprs.append(residual)
+            eq_flags.append(is_equality)
+        if len(acc.dims) + len(acc.symbols) == 0:
+            return None
+        operands = list(acc.dims) + [
+            self._materialize_affine_symbol(sym) for sym in acc.symbols
+        ]
+        integer_set = ir.IntegerSet.get(
+            len(acc.dims), len(acc.symbols), exprs, eq_flags
+        )
+        return integer_set, operands
+
     def visit_Compare(self, node: ast.Compare):
         if not (len(node.ops) == 1 and len(node.comparators) == 1):
             return self.compile_error(
@@ -1335,7 +1410,11 @@ class MLIRCodeGenerator(ast.NodeVisitor):
         self.builder.set_insertion_point_to_start(end_if)
         self.lscope = continue_vals.copy()
 
-    def visit_if_impl(self, cond: AlloValue, node: ast.If):
+    def visit_if_impl(self, cond, node: ast.If, affine_cond=None):
+        """Lower a non-returning ``if`` to ``scf.if`` (runtime ``cond`` value) or,
+        when ``affine_cond`` is an ``(IntegerSet, operands)`` pair, to
+        ``affine.if``. Branch visiting and phi handling are identical; only the op
+        and its yield terminator differ."""
         with EnterSubRegion(self):
             ip, last_loc = self.builder.get_insertion_point_and_loc()
 
@@ -1353,24 +1432,37 @@ class MLIRCodeGenerator(ast.NodeVisitor):
             # if we have phi arguments, we must create else region
             has_else = len(node.orelse) > 0 or len(phi_names) > 0
             phi_ir_types = [ty.materialize(self.context) for ty in phi_types]
-            if_op = IfOp(
-                cond.handle,
-                phi_ir_types,
-                has_else=has_else,
-                ip=self.builder._ip,
-                loc=self.builder._loc,
-            )
+            if affine_cond is not None:
+                integer_set, operands = affine_cond
+                if_op = AffineIfOp(
+                    integer_set,
+                    phi_ir_types,
+                    cond_operands=[v.handle for v in operands],
+                    has_else=has_else,
+                    ip=self.builder._ip,
+                    loc=self.builder._loc,
+                )
+                yield_cls = AffineYieldOp
+            else:
+                if_op = IfOp(
+                    cond.handle,
+                    phi_ir_types,
+                    has_else=has_else,
+                    ip=self.builder._ip,
+                    loc=self.builder._loc,
+                )
+                yield_cls = SCFYieldOp
             ir_ext.merge_block_before(then_block, if_op.then_block)
             then_block = if_op.then_block
             assert then_block is not None
             self.builder.set_insertion_point_to_end(then_block)
-            SCFYieldOp(then_handles, ip=self.builder._ip, loc=self.builder._loc)
+            yield_cls(then_handles, ip=self.builder._ip, loc=self.builder._loc)
             if has_else:
                 ir_ext.merge_block_before(else_block, if_op.else_block)
                 else_block = if_op.else_block
                 assert else_block is not None
                 self.builder.set_insertion_point_to_end(else_block)
-                SCFYieldOp(else_handles, ip=self.builder._ip, loc=self.builder._loc)
+                yield_cls(else_handles, ip=self.builder._ip, loc=self.builder._loc)
             else:
                 ir_ext.erase_block(else_block)
 
@@ -1511,11 +1603,19 @@ class MLIRCodeGenerator(ast.NodeVisitor):
         return any(isinstance(stmt, ast.Return) for stmt in stmts)
 
     def visit_If(self, node: ast.If):
+        then_has_return = self._branch_has_return(node.body)
+        else_has_return = self._branch_has_return(node.orelse)
+        # A runtime condition that is a conjunction of affine relations over
+        # enclosing loop IVs / top-level symbols lowers to affine.if, keeping the
+        # branch bodies in the affine domain. Returning branches need the cf-based
+        # path, so they are excluded.
+        if not (then_has_return or else_has_return):
+            affine_cond = self._build_affine_condition(node.test)
+            if affine_cond is not None:
+                return self.visit_if_impl(None, node, affine_cond=affine_cond)
         cond = self.visit(node.test)
         if isinstance(cond, AlloValue):
             cond = self.builder.scalar_cast(cond, AlloBool)
-            then_has_return = self._branch_has_return(node.body)
-            else_has_return = self._branch_has_return(node.orelse)
             if then_has_return or else_has_return:
                 self._visit_if_with_return_impl(
                     cond, node, then_has_return, else_has_return
