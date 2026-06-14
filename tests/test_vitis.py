@@ -233,6 +233,56 @@ def test_csim_signed_max():
     assert int(out[0]) == 0
 
 
+def test_codegen_while_loop():
+    @kernel
+    def count(A: i32[1]):
+        i: i32 = 0
+        while i < 10:
+            i = i + 1
+        A[0] = i
+
+    code = _hls(count.schedule())
+    _contains(code, "while (true) {", "break;")
+    # Loop-carried var declared and initialized before the loop...
+    m = re.search(r"\w+ (v\d+) = v\d+;\n\s*while \(true\) \{", code)
+    assert m, f"loop var not declared before while in:\n{code}"
+    loop_var = m.group(1)
+    # ...the after-region yield assigns the next value back into it...
+    _regex(code, r"if \(!\(", rf"{loop_var} = v\d+;")
+    # ...and the while result feeding the store aliases that same variable.
+    _contains(code, f"v0[0] = {loop_var};")
+
+
+@requires_vitis
+def test_csim_while_loop():
+    @kernel
+    def count(A: i32[1]):
+        i: i32 = 0
+        while i < 10:
+            i = i + 1
+        A[0] = i
+
+    @kernel
+    def fib(out: i32[1]):
+        a: i32 = 0
+        b: i32 = 1
+        n: i32 = 0
+        while n < 10:
+            t: i32 = a + b
+            a = b
+            b = t
+            n = n + 1
+        out[0] = a
+
+    out = np.zeros(1, dtype=np.int32)
+    with tempfile.TemporaryDirectory() as project:
+        count.schedule().export("vitis", project_path=project)(out)
+    assert int(out[0]) == 10
+    with tempfile.TemporaryDirectory() as project:
+        fib.schedule().export("vitis", project_path=project)(out)
+    assert int(out[0]) == 55
+
+
 def test_codegen_block_stream_datamover():
     @kernel
     def dmover(inp: i32[4, 4], out: i32[1]):

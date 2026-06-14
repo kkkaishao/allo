@@ -981,26 +981,37 @@ void VivadoHLSEmitter::emitSelect(arith::SelectOp op) {
 
 void VivadoHLSEmitter::emitWhile(scf::WhileOp op) {
   llvm::raw_ostream &os = state.os;
-  // emit results
-  // declare variables for iter args
-  bool emittedIterInit = false;
-  for (auto [iter, init] : llvm::zip(op.getResults(), op.getInits())) {
-    emitValueDecl(iter);
+  scf::ConditionOp condOp = op.getConditionOp();
+  // Declare one persistent C variable per before-region iter arg, initialized
+  // from the while inits. These hold the loop-carried state across iterations;
+  // the before region's condition reads them, so they must be named here.
+  for (auto [beforeArg, init] :
+       llvm::zip(op.getBeforeArguments(), op.getInits())) {
+    emitValueDecl(beforeArg);
     os << " = ";
     emitValueRef(init);
     os << ";\n";
-    emittedIterInit = true;
-  }
-  if (emittedIterInit)
     os.indent(state.currentIndent);
+  }
   os << "while (true) {\n";
   state.addIndent();
-  // construct before block
+  // before region: computes the loop condition (and the values scf.condition
+  // forwards to the after region / while results).
   emitBlock(*op.getBeforeBody());
+  // scf.condition forwards its operands to the after-region arguments and to
+  // the while results; alias both to the names produced in the before region.
+  // The after region's scf.yield then writes the next state back into the
+  // loop-carried variables via emitSCFYield (whose parent results are these
+  // aliases).
+  for (auto [afterArg, condArg] :
+       llvm::zip(op.getAfterArguments(), condOp.getArgs()))
+    state.nameTable[afterArg] = state.getName(condArg);
+  for (auto [result, condArg] : llvm::zip(op.getResults(), condOp.getArgs()))
+    state.nameTable[result] = state.getName(condArg);
   // evaluate condition
   os.indent(state.currentIndent);
   os << "if (!(";
-  emitValueRef(op.getConditionOp().getCondition());
+  emitValueRef(condOp.getCondition());
   os << "))\n";
   os.indent(state.currentIndent + state.indentSize);
   os << "break;\n";
