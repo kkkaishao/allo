@@ -58,11 +58,12 @@ class Vitis(Generic[P, R]):
         project directory."""
 
     def scaffold_project(
-        self, project: str | None = ..., *, exist_ok: bool = ...
+        self, project: str | None = ..., *args, exist_ok: bool = ...
     ) -> Path:
         """Write the HLS project files (kernel sources, Makefile, config) to
         ``project`` (or the configured path) without invoking Vitis HLS, and
-        return the project directory."""
+        return the project directory. ``args`` are the runtime arguments used
+        to generate input examples used in hw_emu."""
 
     def set_axi(
         self,

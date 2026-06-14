@@ -34,6 +34,7 @@ from .emulation import (
     generate_impl_host,
     generate_impl_makefile,
     validate_impl_abi,
+    write_impl_inputs,
 )
 from .utils import (
     VitisTool,
@@ -389,7 +390,7 @@ class Vitis(Backend, Generic[P, R]):
             )
             return self.csim(*args, exist_ok=exist_ok)
         if mode in ("hw_emu", "hw"):
-            return self._run_impl(mode, args, exist_ok=exist_ok)
+            return self._run_impl(mode, *args, exist_ok=exist_ok)
         if args:
             raise TypeError("Vitis csyn does not accept runtime arguments")
         if mode == "csyn":
@@ -437,13 +438,19 @@ class Vitis(Backend, Generic[P, R]):
         return project_path
 
     @terminate_on_error
-    def _run_impl(
-        self, mode: VitisMode, args: tuple, *, exist_ok: bool = True
-    ) -> Path | None:
+    def _run_impl(self, mode: VitisMode, *args, exist_ok: bool = True) -> Path | None:
         self._validate_impl_abi()
         self._require_vitis_tool()
         project_path = self.scaffold_project(exist_ok=exist_ok)
         emulator = self._get_emulator(project_path)
+        if emulator.env.get("XILINX_XRT") is None:
+            raise EnvironmentError(
+                "XILINX_XRT environment variable is not set. Required for Vitis hw_emu/hw builds."
+            )
+        if emulator.env.get("PLATFORM") is None:
+            raise EnvironmentError(
+                "PLATFORM environment variable is not set. A .xpfm file is required for Vitis hw_emu/hw builds."
+            )
         if mode == "hw":
             if args:
                 raise TypeError(
@@ -478,7 +485,7 @@ class Vitis(Backend, Generic[P, R]):
 
     @terminate_on_error
     def scaffold_project(
-        self, project: str | None = None, *, exist_ok: bool = True
+        self, project: str | None = None, *args, exist_ok: bool = True
     ) -> Path:
         """
         Generate the HLS project files without invoking Vitis HLS.
@@ -486,11 +493,13 @@ class Vitis(Backend, Generic[P, R]):
         If the project argument is provided, the project will be generated to the specified path
         """
         if project is None and self._project_path is not None:
-            return self._materialize_project(self._project_path, exist_ok=exist_ok)
-        return self._materialize_project(project, exist_ok=exist_ok)
+            return self._materialize_project(
+                self._project_path, args, exist_ok=exist_ok
+            )
+        return self._materialize_project(project, args, exist_ok=exist_ok)
 
     def _materialize_project(
-        self, project: Path | str | None = None, *, exist_ok: bool = True
+        self, project: Path | str | None = None, *args, exist_ok: bool = True
     ) -> Path:
         project_path = make_project_path(
             project, f"allo-vitis-prj-{self.kernel.func_name}", exist_ok=exist_ok
@@ -515,12 +524,13 @@ class Vitis(Backend, Generic[P, R]):
                 ),
             )
             if self._impl_abi_supported():
+                arg_types = self.kernel.parse_argument_annotations()
                 write_text_if_changed(
                     project_path / HOST_CPP,
-                    generate_impl_host(
-                        artifacts.top, self.kernel.parse_argument_annotations()
-                    ),
+                    generate_impl_host(artifacts.top, arg_types=arg_types),
                 )
+                if len(args) > 0:
+                    write_impl_inputs(project_path, arg_types, *args)
 
         self._project_path = project_path
         return project_path

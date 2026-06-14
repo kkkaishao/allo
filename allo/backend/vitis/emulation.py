@@ -20,9 +20,9 @@ from typing import Any, Mapping
 import numpy as np
 
 from .csim import _numpy_dtype_for_dtype
-from .utils import _render_template
+from .utils import _render_template, log_failure_tail
 from ...lang.core import APInt, BufferType, DType, TypeBase
-from ...logging import run_command, stage
+from ...logging import run_command, stage, log_info
 
 IMPL_MAKEFILE = "Makefile"
 HOST_CPP = "host.cpp"
@@ -215,9 +215,12 @@ class VitisEmulator:
 
     def build(self, mode: str) -> Path:
         """Full build to an ``.xclbin`` (emulation link or hw synth+impl)."""
-        with stage(f"Vitis {mode} build"):
-            self._make(["all"], mode)
+        self._run(["all"], mode)
         return self.xclbin_path
+
+    def _run(self, targets: list[str], mode: str) -> None:
+        with stage(f"Vitis {mode} build/run"):
+            self._make(targets, mode)
 
     def run(self, mode: str, *args) -> None:
         if len(args) != len(self.arg_types):
@@ -225,8 +228,7 @@ class VitisEmulator:
                 f"Expected {len(self.arg_types)} arguments, got {len(args)}"
             )
         write_impl_inputs(self.project_path, self.arg_types, args)
-        with stage(f"Vitis {mode} build + run"):
-            self._make(["run"], mode)
+        self._run(["run"], mode)
         read_impl_outputs(self.project_path, self.arg_types, args)
 
     def _make(self, targets: list[str], mode: str):
