@@ -17,6 +17,7 @@
 #include "mlir/IR/SymbolTable.h"
 #include "mlir/Interfaces/FunctionInterfaces.h"
 
+#include "allo-c/Schedule.h"
 #include "allo/TransformOps/AlloTransformOps.h"
 #include "allo/TransformOps/Utils.h"
 
@@ -130,7 +131,6 @@ transform::MatchValueOp::applyToOne(transform::TransformRewriter &rewriter,
 /// PartitionOp implementation
 ///===----------------------------------------------------------------------===//
 namespace {
-constexpr StringLiteral kPartitionAttrName = "allo.part";
 
 // merge two partition attributes. `b` will override `a` if there is a conflict.
 PartitionAttr mergePartitionAttrs(PartitionAttr a, PartitionAttr b) {
@@ -197,7 +197,7 @@ transform::PartitionOp::apply(transform::TransformRewriter &rewriter,
       }
       attrOwner = func;
       argNumber = arg.getArgNumber();
-      oldAttr = func.getArgAttr(*argNumber, kPartitionAttrName);
+      oldAttr = func.getArgAttr(*argNumber, kPartitionAttr);
     } else {
       // Case 2: memref introduced by an alloc-like op.
       Operation *defOp = root.getDefiningOp();
@@ -221,12 +221,12 @@ transform::PartitionOp::apply(transform::TransformRewriter &rewriter,
         }
         attrOwner = defOp;
       }
-      oldAttr = attrOwner->getAttr(kPartitionAttrName);
+      oldAttr = attrOwner->getAttr(kPartitionAttr);
     }
 
     if (oldAttr && !isa<PartitionAttr>(oldAttr)) {
       return emitSilenceableError()
-             << "existing " << kPartitionAttrName
+             << "existing " << kPartitionAttr
              << " attribute is not a partition attribute";
     }
 
@@ -236,12 +236,11 @@ transform::PartitionOp::apply(transform::TransformRewriter &rewriter,
     if (argNumber.has_value()) {
       auto kernel = cast<FunctionOpInterface>(attrOwner);
       rewriter.modifyOpInPlace(kernel, [&]() {
-        kernel.setArgAttr(*argNumber, kPartitionAttrName, mergedPart);
+        kernel.setArgAttr(*argNumber, kPartitionAttr, mergedPart);
       });
     } else {
-      rewriter.modifyOpInPlace(attrOwner, [&]() {
-        attrOwner->setAttr(kPartitionAttrName, mergedPart);
-      });
+      rewriter.modifyOpInPlace(
+          attrOwner, [&]() { attrOwner->setAttr(kPartitionAttr, mergedPart); });
     }
   }
 

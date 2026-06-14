@@ -37,4 +37,8 @@
 #define GET_OP_CLASSES
 #include "allo/IR/AlloISAOps.h.inc"
 
+namespace mlir::allo {
+constexpr llvm::StringLiteral kAlloSignedAttr = "allo.signed";
+} // namespace mlir::allo
+
 #endif // ALLO_OPS_H

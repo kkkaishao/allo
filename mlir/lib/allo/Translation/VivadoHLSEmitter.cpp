@@ -35,7 +35,7 @@ static std::string getIntegerTypeName(unsigned width, bool isSigned) {
 // 's' signed integer, 'u' unsigned integer, 'x' non-integer. A missing or short
 // marker falls back to unsigned, preserving prior behavior.
 static bool operandIsSigned(func::FuncOp func, unsigned idx) {
-  auto attr = func->getAttrOfType<StringAttr>("allo.signed");
+  auto attr = func->getAttrOfType<StringAttr>(allo::kAlloSignedAttr);
   if (!attr)
     return false;
   StringRef marker = attr.getValue();
@@ -247,7 +247,7 @@ void VivadoHLSEmitter::emitFunctionDirectives(func::FuncOp func) {
   // emit partition directives for arguments
   for (auto [arg, attr] : llvm::zip(func.getArguments(), *argAttrs)) {
     auto dict = cast<DictionaryAttr>(attr);
-    auto partOr = dict.getNamed("allo.part");
+    auto partOr = dict.getNamed(kPartitionAttr);
     if (!partOr)
       continue;
     auto partAttr = cast<allo::PartitionAttr>(partOr->getValue());
@@ -284,16 +284,18 @@ void VivadoHLSEmitter::emitPartitionAttr(allo::PartitionAttr attr,
     state.os.indent(state.currentIndent);
     state.os << "#pragma HLS array_partition variable=" << state.getName(value);
     state.os << " dim=" << axiAttr.getDim();
-    state.os << " factor=" << axiAttr.getFactor();
     switch (axiAttr.getKind()) {
     case allo::PartitionKindEnum::CyclicPartition:
       state.os << " cyclic";
+      state.os << " factor=" << axiAttr.getFactor();
       break;
     case allo::PartitionKindEnum::BlockPartition:
       state.os << " block";
+      state.os << " factor=" << axiAttr.getFactor();
       break;
     case allo::PartitionKindEnum::CompletePartition:
       state.os << " complete";
+      // ignore factor for complete partition since it is not needed
       break;
     }
     state.os << "\n";
@@ -715,7 +717,7 @@ void VivadoHLSEmitter::emitMemrefAlloc(memref::AllocOp op) {
   // matches the signedness of the callee it feeds (see
   // materialize-apint-wrapper).
   bool isSigned = false;
-  if (auto attr = op->getAttrOfType<StringAttr>("allo.signed"))
+  if (auto attr = op->getAttrOfType<StringAttr>(allo::kAlloSignedAttr))
     isSigned = attr.getValue() == "s";
   emitValueDecl(op.getResult(), isSigned);
   os << ";";
@@ -723,7 +725,7 @@ void VivadoHLSEmitter::emitMemrefAlloc(memref::AllocOp op) {
   // array_partition (e.g. reuse buffers that must feed a systolic array at full
   // bandwidth). Emit the matching pragma -- the arg path above only covers
   // function arguments.
-  if (auto partAttr = op->getAttrOfType<allo::PartitionAttr>("allo.part")) {
+  if (auto partAttr = op->getAttrOfType<allo::PartitionAttr>(kPartitionAttr)) {
     os << "\n";
     emitPartitionAttr(partAttr, op.getResult());
   }

@@ -82,7 +82,7 @@ static Type boundaryType(Type t, bool &changed) {
 // signed, 'u' unsigned, 'x' non-integer. Missing/short markers default to
 // unsigned.
 static bool operandIsSigned(KernelOp kernel, unsigned idx) {
-  auto attr = kernel->getAttrOfType<StringAttr>(kAlloSignedAttrName);
+  auto attr = kernel->getAttrOfType<StringAttr>(kAlloSignedAttr);
   if (!attr)
     return false;
   StringRef marker = attr.getValue();
@@ -164,8 +164,8 @@ struct MaterializeApintWrapperPass
         TypeAttr::get(FunctionType::get(ctx, stdInputs, stdResults)),
         b.getStringAttr("public"), /*arg_attrs=*/nullptr,
         /*res_attrs=*/nullptr, b.getDenseI32ArrayAttr({}));
-    if (auto marker = top->getAttrOfType<StringAttr>(kAlloSignedAttrName))
-      wrapper->setAttr(kAlloSignedAttrName, marker);
+    if (auto marker = top->getAttrOfType<StringAttr>(kAlloSignedAttr))
+      wrapper->setAttr(kAlloSignedAttr, marker);
 
     SmallVector<Location> argLocs(stdInputs.size(), loc);
     Block *entry = b.createBlock(&wrapper.getBody(), wrapper.getBody().end(),
@@ -190,7 +190,7 @@ struct MaterializeApintWrapperPass
         auto alloc = memref::AllocOp::create(b, loc, mr);
         // Tag the temp so the emitter renders its element type with the same
         // signedness as the callee parameter it feeds.
-        alloc->setAttr(kAlloSignedAttrName, b.getStringAttr(sgn ? "s" : "u"));
+        alloc->setAttr(kAlloSignedAttr, b.getStringAttr(sgn ? "s" : "u"));
         Value tmp = alloc.getResult();
         buildCopyLoop(b, loc, stdArg, tmp, /*toApint=*/true,
                       /*isSigned=*/false);

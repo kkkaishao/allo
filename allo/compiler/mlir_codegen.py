@@ -30,7 +30,13 @@ from .._mlir.ir import (
 from .._mlir import schedule as schedule_d
 from .._mlir.passmanager import PassManager
 from .._mlir._mlir_libs._allo import ir_ext
-from .._mlir.dialects.allo import ReturnOp, InvokeOp, KernelOp, register_dialect
+from .._mlir.dialects.allo import (
+    ReturnOp,
+    InvokeOp,
+    KernelOp,
+    SIGNED_ATTR_NAME,
+    register_dialect,
+)
 from .._mlir.dialects.cf import BranchOp, CondBranchOp
 from .._mlir.dialects.scf import (
     IfOp,
@@ -501,7 +507,7 @@ class MLIRCodeGenerator(ast.NodeVisitor):
             loc=self.builder._loc,
         )
         self.generated_func = fn_op
-        fn_op.operation.attributes["allo.signed"] = StringAttr.get(
+        fn_op.operation.attributes[SIGNED_ATTR_NAME] = StringAttr.get(
             generate_signedness_marker(self.arg_types, self.res_types), self.context
         )
 

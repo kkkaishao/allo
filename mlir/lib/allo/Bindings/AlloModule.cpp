@@ -65,6 +65,7 @@ NB_MODULE(_allo, m) {
   allo.def(
       "register_passes", []() { alloMlirRegisterAllPasses(); },
       "Register all Allo passes with the global pass registry.");
+  allo.attr("SIGNED_ATTR_NAME") = kAlloSignedAttr;
 
   //===--------------------------------------------------------------------===//
   // emit: Vivado HLS translation. General/Allo pass pipelines (incl. the
@@ -112,6 +113,7 @@ NB_MODULE(_allo, m) {
   schedule.attr("PIPELINE_II_ATTR_NAME") = kPipelineIIAttr;
   schedule.attr("DATAFLOW_ATTR_NAME") = kDataflowAttr;
   schedule.attr("UNROLL_FACTOR_ATTR_NAME") = kUnrollFactorAttr;
+  schedule.attr("PARTITION_ATTR_NAME") = kPartitionAttr;
 
   //===--------------------------------------------------------------------===//
   // ir_ext: block surgery + KernelOp helpers not exposed by upstream
