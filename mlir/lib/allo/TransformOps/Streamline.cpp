@@ -90,7 +90,7 @@ static void partitionDimCyclic(Operation *alloc, int64_t factor, unsigned dim) {
   MLIRContext *ctx = alloc->getContext();
   auto axis = PartitionAxisAttr::get(ctx, PartitionKindEnum::CyclicPartition,
                                      factor, /*dim=*/dim);
-  alloc->setAttr("allo.part", PartitionAttr::get(ctx, {axis}));
+  alloc->setAttr(kPartitionAttr, PartitionAttr::get(ctx, {axis}));
 }
 
 // Build an L-lane row-major copy nest over `shape` (last dim must be a multiple
@@ -542,7 +542,8 @@ static void windowedConsumerArg(OpBuilder &b, KernelOp kernel, unsigned c,
   auto alloc = memref::AllocOp::create(
       b, loc, MemRefType::get(cshape, mt.getElementType()));
   Value cbuf = alloc.getResult();
-  partitionDimCyclic(alloc, K, /*dim=*/1); // separate the K window rows
+  if (K > 1)
+    partitionDimCyclic(alloc, K, /*dim=*/1); // separate the K window rows
   arg.setType(streamTy);
 
   // Redirect every read arg[i0+d, inner...] -> cbuf[(i0+d) mod K, inner...].
