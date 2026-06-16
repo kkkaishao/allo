@@ -92,6 +92,7 @@ PART_NUMBERS = {
     "u200": "xcu200-fsgd2104-2-e",
     "u250": "xcu250-figd2104-2L-e",
     "u280": "xcu280-fsvh2892-2L-e",
+    "u55c": "xcu55c-fsvh2892-2L-e",
 }
 # default to pynq-z2
 DEFAULT_PART = "xc7z020clg400-1"
@@ -181,7 +182,7 @@ class Vitis(Backend, Generic[P, R]):
         project_path: str | None = None,
         *,
         device: str | None = None,
-        part: str | None = DEFAULT_PART,
+        part: str | None = None,
         freq_mhz: float = 300.0,
         flow: FlowTarget = "vitis",
     ):
