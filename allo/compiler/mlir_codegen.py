@@ -73,6 +73,7 @@ from ..lang.core import (
     bool as AlloBool,
 )
 from ..lang.operator import Operator, BoundOperator, NO_FOLD
+from ..lang.module import Module as AlloModule
 from ..operators import arith as arith_ops, memory as mem_ops
 from ..operators.utils import BitSlice
 from .errors import CompilationError, StaticAssertionError, InternalCompilerError
@@ -2412,6 +2413,8 @@ class MLIRCodeGenerator(ast.NodeVisitor):
             return self.call_nested_kernel(fn, args, kws)
         if isinstance(fn, Kernel):
             return self.call_kernel(fn, args, kws)
+        if isinstance(fn, AlloModule):
+            return self.call_kernel(fn.module, args, kws)
         if isinstance(fn, (Operator, BoundOperator)):
             return self.call_operator(fn, args, kws)
         if isinstance(fn, ConstevalFunction):

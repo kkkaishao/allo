@@ -1,6 +1,7 @@
 # Copyright Allo authors. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 """Typing stubs for the kernel decorator and its handle."""
+from inspect import Signature
 from typing import (
     Any,
     Callable,
@@ -33,7 +34,9 @@ class KernelOptions:
     ) -> None: ...
 
 class Kernel(Generic[P, R]):
+    fn: Callable[P, R]
     func_name: str
+    signature: Signature
     options: KernelOptions
     module: Module | None
     def __call__(self, *args: P.args, **kwargs: P.kwargs) -> R: ...

@@ -61,3 +61,4 @@ from .core import (
 )
 
 from .kernel import kernel, consteval, KernelOptions
+from .module import Module
