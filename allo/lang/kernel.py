@@ -30,7 +30,6 @@ from ..lang.core import (
 from ..logging import log_fatal
 
 from .._mlir.ir import Module, Context
-from ..logging import log_fatal
 
 P = ParamSpec("P")
 R = TypeVar("R")
@@ -88,7 +87,6 @@ class Kernel(Generic[P, R]):
                 f"Could not retrieve source code for function {fn.__name__}. "
                 "This may be due to the function being defined in an interactive environment or a dynamically generated function. "
             )
-            raise SystemExit(1) from None
 
         src = textwrap.dedent("".join(raw_src))
         match = re.search(r"^def\s+\w+\s*\(", src, re.MULTILINE)

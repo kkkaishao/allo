@@ -2,18 +2,12 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import ast
-import inspect
-import io
-from dataclasses import dataclass
-from typing import Callable
 
-from rich.console import Console
-from rich.text import Text
-
+from ..diagnostics import DiagnosticError, DiagnosticLocation
 from ..errors import AlloError
 
 
-class CompilationError(AlloError):
+class CompilationError(DiagnosticError):
     def __init__(
         self,
         src: str,
@@ -29,9 +23,6 @@ class CompilationError(AlloError):
         self.file_name = file_name
         self.begin_line = begin_line
 
-    def __str__(self):
-        return "\n" + self.render()
-
     def _source_line(self):
         if self.node is None or not hasattr(self.node, "lineno"):
             return None
@@ -41,69 +32,25 @@ class CompilationError(AlloError):
             return None
         return lines[line_index]
 
-    def _location(self):
+    def _location(self) -> DiagnosticLocation | None:
         if self.node is None or not hasattr(self.node, "lineno"):
             return None
         lineno = getattr(self.node, "lineno")
         col = getattr(self.node, "col_offset", 0)
         end_lineno = getattr(self.node, "end_lineno", lineno)
         end_col = getattr(self.node, "end_col_offset", col + 1)
-        return self.begin_line + lineno - 1, col, end_lineno == lineno, end_col
-
-    def _use_color(self):
-        return Console(stderr=True).is_terminal
-
-    def render(self, *, color: bool | None = None) -> str:
-        if color is None:
-            color = self._use_color()
-
-        console = Console(
-            file=io.StringIO(),
-            record=True,
-            force_terminal=color,
-            color_system="auto" if color else None,
-            width=120,
-        )
-        location = self._location()
-        if location is None:
-            console.print(
-                Text.assemble(("error", "bold red"), ": ", str(self.error_msg))
-            )
-            return console.export_text(styles=color).rstrip()
-
-        abs_lineno, col, same_line, end_col = location
-        file_name = self.file_name or "<unknown>"
-        header = f"{file_name}:{abs_lineno}:{col + 1}"
-        console.print(
-            Text.assemble(
-                (header, "bold"),
-                ": ",
-                ("error", "bold red"),
-                ": ",
-                str(self.error_msg),
-            )
+        same_line = end_lineno == lineno
+        span = end_col - col if same_line and end_col > col else 1
+        return DiagnosticLocation(
+            file_name=self.file_name or "<unknown>",
+            line=self.begin_line + lineno - 1,
+            col=col,
+            source_line=self._source_line(),
+            span=span,
         )
 
-        source_line = self._source_line()
-        if source_line is not None:
-            line_no_width = len(str(abs_lineno))
-            console.print(
-                Text.assemble(
-                    (f"{abs_lineno:>{line_no_width}}", "bold cyan"),
-                    " | ",
-                    source_line,
-                )
-            )
-            span = end_col - col if same_line and end_col > col else 1
-            console.print(
-                Text.assemble(
-                    " " * line_no_width,
-                    " | ",
-                    " " * col,
-                    ("^" * max(1, span), "bold green"),
-                )
-            )
-        return console.export_text(styles=color).rstrip()
+    def _diagnostic(self):
+        return self.error_msg, self._location(), ()
 
 
 class StaticAssertionError(CompilationError):
@@ -115,46 +62,3 @@ class InternalCompilerError(AlloError):
     internal state. Signals a compiler bug, not a user error, so it is kept
     distinct from ``CompilationError`` and carries a detailed diagnostic
     message (typically including an IR dump)."""
-
-
-@dataclass(frozen=True)
-class DiagnosticLocation:
-    file_name: str
-    line: int
-    col: int = 0
-    source_line: str | None = None
-    span: int = 1
-
-
-def _first_code_col(source_line: str | None) -> int:
-    if source_line is None:
-        return 0
-    return len(source_line) - len(source_line.lstrip())
-
-
-def callable_diagnostic_location(
-    fn: Callable, *, marker: str | None = None
-) -> DiagnosticLocation | None:
-    try:
-        lines, begin_line = inspect.getsourcelines(fn)
-    except (OSError, TypeError):
-        return None
-
-    file_name = inspect.getsourcefile(fn) or fn.__code__.co_filename
-    line_index = 0
-    if marker is not None:
-        for i, line in enumerate(lines):
-            if marker in line:
-                line_index = i
-                break
-    else:
-        for i, line in enumerate(lines):
-            if line.lstrip().startswith("def "):
-                line_index = i
-                break
-
-    source_line = lines[line_index].rstrip("\n")
-    col = _first_code_col(source_line)
-    if marker is not None and marker in source_line:
-        col = source_line.index(marker)
-    return DiagnosticLocation(file_name, begin_line + line_index, col, source_line)

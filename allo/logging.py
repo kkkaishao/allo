@@ -1,6 +1,18 @@
 # Copyright Allo authors. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+"""Runtime logging and subprocess helpers.
+
+All user-facing status, warnings and fatal errors funnel through this module
+so the style and the process-exit behavior stay consistent across the backends.
+
+Notebook mode (auto-detected under Jupyter, overridable via the
+``ALLO_NOTEBOOK`` environment variable or :func:`set_notebook_mode`) renders to
+stdout, replaces the live ``rich`` spinner -- which flickers as a widget in
+notebooks -- with a static status line, and raises :class:`AlloFatalError`
+instead of calling ``SystemExit`` so a stray failure does not stop the kernel.
+"""
+
 from __future__ import annotations
 
 import os
@@ -12,21 +24,79 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import wraps
 from pathlib import Path
-from typing import Any, Callable, Iterator, NoReturn, TypeVar, cast
+from typing import Any, Callable, Generator, NoReturn, TypeVar, cast
 
 from rich.console import Console
 from rich.markup import escape
-from rich.table import Table
-from rich.text import Text
 
-console = Console(stderr=True)
+from .errors import AlloFatalError
+
 F = TypeVar("F", bound=Callable[..., Any])
 ErrorCallback = Callable[[Exception], None]
 ExitCallback = Callable[[], None]
 
+_FALSEY = frozenset({"", "0", "false", "no", "off"})
 
-def captured_output(stdout: str, stderr: str) -> str:
+# ---------------------------------------------------------------------------
+# Output destination (notebook-aware)
+# ---------------------------------------------------------------------------
+
+_notebook_override: bool | None = None
+
+
+def in_notebook() -> bool:
+    """Resolve whether Jupyter-friendly output is active.
+
+    Precedence: an explicit :func:`set_notebook_mode` override, then the
+    ``ALLO_NOTEBOOK`` environment variable, then ``rich``'s auto-detection.
+    """
+    if _notebook_override is not None:
+        return _notebook_override
+    env = os.getenv("ALLO_NOTEBOOK")
+    if env is not None:
+        return env.strip().lower() not in _FALSEY
+    return Console().is_jupyter
+
+
+def _make_console() -> Console:
+    # Jupyter renders stderr as a red error block, so target stdout there.
+    return Console() if in_notebook() else Console(stderr=True)
+
+
+console = _make_console()
+
+
+def set_notebook_mode(enabled: bool | None) -> None:
+    """Force notebook output on/off; pass ``None`` to restore auto-detection."""
+    global _notebook_override, console
+    _notebook_override = enabled
+    console = _make_console()
+
+
+def _print(markup: str, **kwargs: Any) -> None:
+    console.print(markup, **kwargs)
+
+
+def _message(label: str, style: str, message: str, *, dim_body: bool = False) -> None:
+    """Emit one ``Label body`` line, the single sink for all leveled logs."""
+    text = message.rstrip()
+    if not text:
+        return
+    body = f"[dim]{escape(text)}[/dim]" if dim_body else escape(text)
+    _print(f"[{style}]{label}[/] {body}" if label else body)
+
+
+# ---------------------------------------------------------------------------
+# Text utilities
+# ---------------------------------------------------------------------------
+
+
+def _captured_output(stdout: str, stderr: str) -> str:
     return "\n".join(stream.rstrip() for stream in (stdout, stderr) if stream.strip())
+
+
+def completed_output(result: subprocess.CompletedProcess[str]) -> str:
+    return _captured_output(result.stdout or "", result.stderr or "")
 
 
 def text_tail(text: str, max_lines: int) -> str:
@@ -34,6 +104,21 @@ def text_tail(text: str, max_lines: int) -> str:
         return ""
     lines = text.splitlines()
     return "\n".join(lines[-max_lines:])
+
+
+def read_text_tail(path: str | os.PathLike[str], *, max_lines: int = 100) -> str:
+    try:
+        return text_tail(
+            Path(path).read_text(encoding="utf-8", errors="replace"),
+            max_lines,
+        )
+    except OSError:
+        return ""
+
+
+# ---------------------------------------------------------------------------
+# Errors and process exit
+# ---------------------------------------------------------------------------
 
 
 @dataclass
@@ -46,7 +131,7 @@ class CommandError(RuntimeError):
 
     @property
     def output(self) -> str:
-        return captured_output(self.stdout, self.stderr)
+        return _captured_output(self.stdout, self.stderr)
 
     def output_tail(self, max_lines: int) -> str:
         return text_tail(self.output, max_lines)
@@ -61,75 +146,22 @@ class CommandError(RuntimeError):
         return message
 
 
-def terminate(error: Exception, *, exit_code: int = 1) -> NoReturn:
-    reason = str(error)
-    reason = reason if reason else error.__class__.__name__
-    console.print(f"[red]Error[/] {escape(reason)}")
+def _abort(label: str, message: str, *, exit_code: int = 1) -> NoReturn:
+    """The single fatal-exit path shared by :func:`terminate`/:func:`log_fatal`."""
+    text = message.strip() or label
+    if in_notebook():
+        raise AlloFatalError(text, exit_code=exit_code) from None
+    _print(f"[red]{label}[/] {escape(text)}")
     raise SystemExit(exit_code) from None
 
 
-def log_detail(message: str) -> None:
-    text = message.rstrip()
-    if text:
-        console.print(escape(text), style="dim")
+def terminate(error: Exception, *, exit_code: int = 1) -> NoReturn:
+    reason = str(error) or error.__class__.__name__
+    _abort("Error", reason, exit_code=exit_code)
 
 
-def log_info(message: str) -> None:
-    text = message.rstrip()
-    if text:
-        log_detail(f"INFO {text}")
-
-
-def log_tail(title: str, text: str, *, max_lines: int = 100) -> None:
-    tail = text_tail(text, max_lines)
-    if tail:
-        log_detail(f"{title} (last {max_lines} lines):\n{tail}")
-
-
-def log_debug(message: str) -> None:
-    if os.getenv("ALLO_DEBUG") is not None:
-        text = message.rstrip()
-        if text:
-            log_detail(f"DEBUG {text}")
-
-
-def log_warning(message: str) -> None:
-    text = message.rstrip()
-    if text:
-        console.print(f"[yellow]Warning[/] {escape(text)}")
-
-
-def log_fatal(message: str) -> None:
-    text = message.strip()
-    console.print(f"[red]Fatal[/] {escape(text)}")
-    raise SystemExit(1) from None
-
-
-def log_table(
-    title: str,
-    columns: Sequence[str],
-    rows: Sequence[Sequence[object]],
-) -> None:
-    table = Table(title=title, title_style="cyan", show_lines=False)
-    for column in columns:
-        table.add_column(column)
-    for row in rows:
-        table.add_row(*(Text(str(value)) for value in row))
-    console.print(table)
-
-
-def read_text_tail(path: str | os.PathLike[str], *, max_lines: int = 100) -> str:
-    try:
-        return text_tail(
-            Path(path).read_text(encoding="utf-8", errors="replace"),
-            max_lines,
-        )
-    except OSError:
-        return ""
-
-
-def completed_output(result: subprocess.CompletedProcess[str]) -> str:
-    return captured_output(result.stdout or "", result.stderr or "")
+def log_fatal(message: str) -> NoReturn:
+    _abort("Fatal", message)
 
 
 def terminate_on_error(func: F) -> F:
@@ -143,25 +175,70 @@ def terminate_on_error(func: F) -> F:
     return cast(F, wrapper)
 
 
+# ---------------------------------------------------------------------------
+# Leveled logging
+# ---------------------------------------------------------------------------
+
+
+def log_detail(message: str) -> None:
+    _message("", "", message, dim_body=True)
+
+
+def log_info(message: str) -> None:
+    _message("Info", "dim", message, dim_body=True)
+
+
+def log_warning(message: str) -> None:
+    _message("Warning", "yellow", message)
+
+
+def log_debug(message: str) -> None:
+    if os.getenv("ALLO_DEBUG") is not None:
+        _message("Debug", "dim", message, dim_body=True)
+
+
+def log_tail(title: str, text: str, *, max_lines: int = 100) -> None:
+    tail = text_tail(text, max_lines)
+    if tail:
+        log_detail(f"{title} (last {max_lines} lines):\n{tail}")
+
+
+# ---------------------------------------------------------------------------
+# Staged execution
+# ---------------------------------------------------------------------------
+
+
+@contextmanager
+def _status(name: str) -> Generator[None, None, None]:
+    # The live spinner is a flickering widget under Jupyter; fall back to a
+    # plain status line there.
+    if in_notebook():
+        _message("Running", "cyan", name)
+        yield
+    else:
+        with console.status(f"[cyan]{escape(name)}[/]", spinner="dots"):
+            yield
+
+
 @contextmanager
 def stage(
     name: str,
     *,
     on_error: ErrorCallback | None = None,
     on_exit: ExitCallback | None = None,
-) -> Iterator[None]:
+) -> Generator[None, None, None]:
     try:
-        with console.status(f"[cyan]{name}[/]", spinner="dots"):
+        with _status(name):
             yield
     except Exception as error:
-        console.print(f"[red]Fail[/] {name}")
+        _print(f"[red]Fail[/] {escape(name)}")
         if on_error is not None:
             on_error(error)
         if on_exit is not None:
             on_exit()
         terminate(error)
     else:
-        console.print(f"[green]Success[/] {name}")
+        _print(f"[green]Success[/] {escape(name)}")
         if on_exit is not None:
             on_exit()
 
