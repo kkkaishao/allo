@@ -2,7 +2,3 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """Reusable hardware design library for the Allo frontend."""
-
-from . import systolic
-
-__all__ = ["systolic"]
