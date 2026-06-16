@@ -93,6 +93,12 @@ std::string VivadoHLSEmitter::getPrimitiveTypeName(Type type, bool isSigned) {
     return "float";
   if (isa<Float64Type>(type))
     return "double";
+  // use ap_float for bf16 and tf32 since C++ doesn't natively support them
+  if (isa<BFloat16Type>(type))
+    return "ap_float<16,8>";
+  if (isa<FloatTF32Type>(type))
+    return "ap_float<19,8>";
+  // add mxfp4/mxfp8 support if needed
 
   if (auto intType = dyn_cast<IntegerType>(type)) {
     unsigned width = intType.getWidth();

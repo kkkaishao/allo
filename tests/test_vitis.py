@@ -24,6 +24,7 @@ from allo.lang.core import (
     range as arange,
     i32,
     f32,
+    bf16,
     APInt,
     Stream,
     Stateful,
@@ -81,6 +82,21 @@ def _regex(code: str, *patterns: str):
 # ===========================================================================
 # Codegen-text tests (no toolchain)
 # ===========================================================================
+
+
+def test_codegen_bf16():
+    @kernel
+    def add_bf16(A: bf16[16], B: bf16[16], C: bf16[16]):
+        for i in arange(16, name="i"):
+            C[i] = A[i] + B[i]
+
+    code = _hls(add_bf16.schedule())
+    _contains(
+        code,
+        "ap_float<16,8> v0[16]",
+        "ap_float<16,8> v1[16]",
+        "ap_float<16,8> v2[16]",
+    )
 
 
 def test_codegen_vadd_pipeline():
