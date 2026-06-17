@@ -28,3 +28,6 @@
 - Place MLIR dialects and passes code in `mlir/`
 - Tests lie in `tests/`
 - Use `drafts/` for temporary code when exploring new ideas
+
+# Environment setup
+- Follow instructions in [ENVIRONMENT.md](ENVIRONMENT.md) for setting up the Vivado/Vitis environment
