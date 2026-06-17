@@ -62,7 +62,7 @@ def _make(Tin, Tacc, Tout, S, D, L=16, SB=8, eps=1e-5, ii=1):
 
 
 class RMSNorm(Module):
-    """RMSNorm over the hidden dimension (LLaMA pre-norm).
+    """**RMSNorm over the hidden dimension (LLaMA pre-norm)**
 
     Signature: ``rmsnorm(x: Tin[S, D], g: Tin[D], y: Tout[S, D])``.
 

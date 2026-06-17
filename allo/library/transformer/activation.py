@@ -1,32 +1,6 @@
 # Copyright Allo authors. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Elementwise activations and binary ops for the FFN / residual path.
-
-All are embarrassingly parallel (no reduction): ``L`` lanes per cycle, one
-flattened II=1 pipeline, latency == element count / ``L``. ``kind`` selects the
-op; because the kernel tracer resolves only global names (not factory-local
-closure vars), the op is chosen by branching the kernel *definition* at the
-factory level. Tensors are row-major ``[M, N]`` (e.g. ``[S, D]``).
-
-Notes
------
-Unary (:data:`UNARY`):
-
-* ``silu``      -- ``x * sigmoid(x)`` (LLaMA / SwiGLU gate); ~1 exp/lane.
-* ``gelu``      -- exact ``0.5 x (1 + erf(x/sqrt2))``; accurate but erf is
-  DSP-heavy (~7x the tanh form when unrolled), use for parity not throughput.
-* ``gelu_tanh`` -- tanh approximation ``0.5 x (1 + tanh(...))``; ~7x fewer DSP
-  than exact (erf) gelu.
-* ``relu``      -- ``max(x, 0)``; no DSP.
-
-Binary (:data:`BINARY`):
-
-* ``add``    -- residual add ``a + b``.
-* ``mul``    -- elementwise ``a * b``.
-* ``swiglu`` -- ``silu(a) * b`` (the SwiGLU gate*up fuse, one pass).
-"""
-
 from typing import Literal
 import allo
 from allo import kernel
@@ -158,7 +132,7 @@ def _make_binary(Tin, Tout, M, N, kind, L):
 
 
 class Activation(Module):
-    """Elementwise activation / binary op for the FFN / residual path.
+    """**Elementwise activation / binary op for the FFN / residual path**
 
     Signature: ``activation(Tin[M, N], Tout[M, N])`` for unary ops (e.g. SiLU,
     GELU); ``activation(Tin[M, N], Tin[M, N], Tout[M, N])`` for binary ops (e.g.

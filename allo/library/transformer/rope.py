@@ -58,7 +58,7 @@ def _make(Tin, Tout, S, H, dh, L=16, ii=1):
 
 
 class RoPE(Module):
-    """Rotary position embedding (rotate-half).
+    """**Rotary position embedding (rotate-half)**
 
     Signature: ``rope(Tin[S, H*dh], cos[S, dh/2], sin[S, dh/2], Tout[S, H*dh])``.
 

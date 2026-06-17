@@ -512,7 +512,7 @@ def _flash_int8kv(Tin, Tacc, Tout, H, Hkv, dh, Lmax, HB=8, ii=1):
 
 
 class GQAKVCache(Module):
-    """Single-query **KV-cache decode attention** (causal GQA over a cached K/V history).
+    """**Single-query KV-cache decode attention (causal GQA over a cached K/V history)**
 
     Signature -- for quantitized version::
 

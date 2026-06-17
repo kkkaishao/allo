@@ -81,7 +81,7 @@ def _make(Tin, Tacc, Tout, R, Cn, L, SB, ii):
 
 
 class Softmax(Module):
-    """Row-wise softmax.
+    """**Row-wise softmax**
 
     Signature: ``softmax(Tin[R, Cn], Tout[R, Cn])``.
 
