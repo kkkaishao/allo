@@ -3,6 +3,7 @@
 
 import ast
 
+import numpy as np
 import pytest
 
 import allo
@@ -26,6 +27,10 @@ _GLOBAL_SHAPE_M = 2
 _GLOBAL_SHAPE_N = 3
 _GLOBAL_INT_CONST = 3
 _GLOBAL_FLOAT_CONST = 1.5
+
+_GLOBAL_NP_INT = np.array([[1, 2], [3, 4]], dtype=np.int32)
+_GLOBAL_NP_FLOAT = np.array([1.5, 2.5], dtype=np.float32)
+_GLOBAL_NP_BOOL = np.array([True, False])
 
 
 def _compile_ir(fn, *, options=None) -> str:
@@ -838,6 +843,73 @@ def test_tensor_list_initializer():
 
     ir = _compile_ir(top)
     _assert_contains(ir, "arith.constant dense<[[1, 2], [3, 4]]> : tensor<2x2xi32>")
+
+
+def test_memref_numpy_initializer():
+    # A captured NumPy array becomes a module-global constant buffer, just like a
+    # nested-list literal initializer.
+    @kernel
+    def top(out: i32[2, 2]):
+        buf: i32[2, 2] = _GLOBAL_NP_INT
+        for i, j in allo.grid(2, 2):
+            out[i, j] = buf[i, j]
+
+    ir = _compile_ir(top)
+    _assert_contains(
+        ir,
+        'memref.global "private" @_allo_const_top_buf',
+        "memref.get_global @_allo_const_top_buf",
+        "dense<[[1, 2], [3, 4]]>",
+        "affine.load",
+    )
+
+
+def test_tensor_numpy_initializer():
+    @kernel(options=KernelOptions(enable_tensor=True))
+    def top() -> i32[2, 2]:
+        buf: i32[2, 2] = _GLOBAL_NP_INT
+        return buf
+
+    ir = _compile_ir(top, options=KernelOptions(enable_tensor=True))
+    _assert_contains(ir, "arith.constant dense<[[1, 2], [3, 4]]> : tensor<2x2xi32>")
+
+
+def test_numpy_initializer_float():
+    @kernel
+    def top(out: f32[2]):
+        buf: f32[2] = _GLOBAL_NP_FLOAT
+        out[0] = buf[0]
+        out[1] = buf[1]
+
+    ir = _compile_ir(top)
+    _assert_contains(ir, "dense<[1.500000e+00, 2.500000e+00]>")
+
+
+def test_numpy_initializer_shape_mismatch():
+    @kernel
+    def top(out: i32[2, 3]):
+        buf: i32[2, 3] = _GLOBAL_NP_INT
+        out[0, 0] = buf[0, 0]
+
+    _assert_compile_error(top, "shape mismatch", "expected (2, 3), got (2, 2)")
+
+
+def test_numpy_initializer_unsupported_dtype():
+    @kernel
+    def top(out: i32[2]):
+        buf: i32[2] = _GLOBAL_NP_BOOL
+        out[0] = buf[0]
+
+    _assert_compile_error(top, "integer or floating-point dtype")
+
+
+def test_numpy_initializer_requires_shaped_type():
+    @kernel
+    def top() -> i32:
+        x: i32 = _GLOBAL_NP_INT
+        return x
+
+    _assert_compile_error(top, "can only initialize a shaped variable")
 
 
 def test_stream_scalar_ir():

@@ -6,6 +6,8 @@ import ast
 import builtins
 import copy
 import operator
+
+import numpy as np
 from contextlib import contextmanager
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -352,10 +354,13 @@ class MLIRCodeGenerator(ast.NodeVisitor):
             or isinstance(val, Kernel)
             or isinstance(val, NestedKernelSymbol)
             or isinstance(val, (Operator, BoundOperator))
-            or val in (Range, Grid)
+            or val is Range
+            or val is Grid
             or isinstance(val, TypeBase)
             or isinstance(val, ConstexprValue)
             or isinstance(val, ConstevalFunction)
+            # A captured NumPy array is a compile-time constant array initializer.
+            or isinstance(val, np.ndarray)
         )
 
     def _is_allowed_global_var(self, name: str, val: object, absent):
@@ -1784,6 +1789,31 @@ class MLIRCodeGenerator(ast.NodeVisitor):
         global_name = self._global_symbol(node, name, "const")
         return self.builder.make_shaped_constant(values, dst_type, global_name)
 
+    def _visit_numpy_array_initializer(
+        self, node: ast.AnnAssign, dst_type: ShapedType, array: np.ndarray
+    ):
+        """Lower a captured NumPy array into a shaped constant, mirroring the list
+        initializer path: the row-major elements feed ``make_shaped_constant`` and
+        are coerced to ``dst_type.dtype`` there."""
+        name = node.target.id
+        if not (
+            np.issubdtype(array.dtype, np.integer)
+            or np.issubdtype(array.dtype, np.floating)
+        ):
+            return self.compile_error(
+                f"NumPy array initializer for '{name}' must have an integer or "
+                f"floating-point dtype, got '{array.dtype}'."
+            )
+        if tuple(array.shape) != tuple(dst_type.shape):
+            return self.compile_error(
+                f"NumPy array initializer shape mismatch for '{name}': "
+                f"expected {tuple(dst_type.shape)}, got {tuple(array.shape)}."
+            )
+        global_name = self._global_symbol(node, name, "const")
+        return self.builder.make_shaped_constant(
+            array.reshape(-1).tolist(), dst_type, global_name
+        )
+
     def visit_AugAssign(self, node: ast.AugAssign):
         lhs = copy.deepcopy(node.target)
         lhs.ctx = ast.Load()
@@ -1930,6 +1960,18 @@ class MLIRCodeGenerator(ast.NodeVisitor):
 
         with self._name_loc_prefix(node.target.id):
             value = self.visit(node.value)
+
+        if isinstance(value, np.ndarray):
+            if not isinstance(parsed_type, ShapedType):
+                return self.compile_error(
+                    f"NumPy array can only initialize a shaped variable, but "
+                    f"'{node.target.id}' is annotated as "
+                    f"'{ast.unparse(node.annotation)}'."
+                )
+            with self._name_loc_prefix(node.target.id):
+                const = self._visit_numpy_array_initializer(node, parsed_type, value)
+            self._set_value_with_loc(node.target.id, const)
+            return
 
         if isinstance(parsed_type, ConstexprType):
             if isinstance(value, AlloValue):

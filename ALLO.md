@@ -126,6 +126,17 @@ def reshape_like(inp: i32[M * N], out: i32[M, N]):
   declaration, never reassigned: `N: constexpr = 4`.
 - **List initializers** for shaped values when every element is a compile-time
   `int`/`float`, with matching shape: `table: i32[2, 2] = [[1, 2], [3, 4]]`.
+- **NumPy array initializers**: a captured NumPy array (a module global or
+  closure variable) initializes a shaped local, equivalent to spelling out the
+  list literal. The array's shape must match the annotation and its dtype must be
+  integer or floating-point; elements are coerced to the declared element type.
+  ```python
+  W = np.array([[1, 2], [3, 4]], dtype=np.int32)   # captured from outer scope
+
+  @kernel
+  def top(out: i32[2, 2]):
+      buf: i32[2, 2] = W       # constant buffer, baked into the module
+  ```
 - **Block scope**: variables declared inside `if`/`for`/`grid`/`while` are local to
   that block; declare before the block to use afterward. A name cannot be
   redeclared in the same scope; later assignments are cast to the original type.

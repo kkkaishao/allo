@@ -38,6 +38,8 @@ from pathlib import Path
 u32 = APInt(32, signed=False)
 u256 = APInt(256, signed=False)
 
+_NP_LUT = np.array([10, 20, 30, 40], dtype=np.int32)
+
 PART = "xcvu9p-flga2104-2-i"
 requires_vitis = pytest.mark.skipif(
     not is_vitis_available(), reason="Vitis HLS toolchain not detected"
@@ -498,6 +500,21 @@ def test_codegen_list_initialized_buffer_definition():
     )
 
 
+def test_codegen_numpy_initialized_buffer_definition():
+    # A captured NumPy array lowers to the same file-scope constant array as a
+    # list initializer.
+    @kernel
+    def lut(idx: i32) -> i32:
+        table: i32[4] = _NP_LUT
+        return table[idx]
+
+    code = _hls(lut.schedule())
+    _regex(
+        code,
+        r"static \w+ _allo_const_lut_table_l\d+c\d+\[4\] = \{10u?, 20u?, 30u?, 40u?\};",
+    )
+
+
 @requires_vitis
 def test_csim_stateful_accumulator():
     """A stateful scalar must persist across csim calls on the same backend (the
@@ -521,6 +538,18 @@ def test_csim_list_initialized_buffer():
     @kernel
     def lut(idx: i32) -> i32:
         table: i32[4] = [10, 20, 30, 40]
+        return table[idx]
+
+    with tempfile.TemporaryDirectory() as project:
+        backend = lut.schedule().export("vitis", project_path=project)
+        assert [int(backend(i)) for i in range(4)] == [10, 20, 30, 40]
+
+
+@requires_vitis
+def test_csim_numpy_initialized_buffer():
+    @kernel
+    def lut(idx: i32) -> i32:
+        table: i32[4] = _NP_LUT
         return table[idx]
 
     with tempfile.TemporaryDirectory() as project:
