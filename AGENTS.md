@@ -29,5 +29,8 @@
 - Tests lie in `tests/`
 - Use `drafts/` for temporary code when exploring new ideas
 
+# Allo Usage
+- See [ALLO.md](ALLO.md) for a concise reference on writing Allo kernels and schedules
+
 # Environment setup
 - Follow instructions in [ENVIRONMENT.md](ENVIRONMENT.md) for setting up the Vivado/Vitis environment
