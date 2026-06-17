@@ -529,13 +529,24 @@ backend(A, B, C)                            # == backend.run(A, B, C)
 ### Vitis backend (HLS codegen / csim / synth / emu)
 
 ```python
-b = s.export("vitis", project_path=proj, part="xcvu9p-flga2104-2-i")
-code   = b.hls_code        # generated C++ string, no toolchain needed
-b(A, B, C)                 # csim (Python-native): == b.csim(A, B, C)
-report = b.synth()         # C-to-RTL synthesis; needs part=/device=
-b.run(mode, *args)         # mode ∈ csim | csyn | hw_emu | hw | sw_emu(=csim, deprecated)
+b = s.export("vitis", part="xcvu9p-flga2104-2-i")
+code = b.hls_code        # generated C++ string, no toolchain needed
+b(A, B, C)               # csim (Python-native): == b.csim(A, B, C)
+b.synth()                # C-to-RTL synthesis
+# generate sample input for emulation
+A = np.arange(N, dtype=np.float32); B = np.arange(N, dtype=np.float32)
+# scaffold the project
+b.scaffold_project("/path/to/proj", A, B) # A, B will be packed into binary files
 ```
 
+```bash
+cd /path/to/proj
+make target
+```
+
+- See [ENVIRONMENT.md](ENVIRONMENT.md) for available make targets and env setup.
+- Prefer to do C-simulation with Python API (convenient enough),
+  but run cosimulation and hardware in shell with `make`.
 - Target by `part="<full-part>"` **or** `device="<shorthand>"` (e.g. `pynqz2`,
   `u280`, `zcu102`) — not both. Constructor knobs: `freq_mhz=300.0`,
   `flow="vitis"|"vivado"`.
