@@ -94,6 +94,13 @@ std::string VivadoHLSEmitter::getPrimitiveTypeName(Type type, bool isSigned) {
   if (isa<Float64Type>(type))
     return "double";
   // use ap_float for bf16 and tf32 since C++ doesn't natively support them
+  if (isa<BFloat16Type, FloatTF32Type>(type) && !state.enabledApFloat) {
+    emitError(UnknownLoc::get(type.getContext()))
+        << "bf16 and tf32 types require ap_float support in Vitis 2023+ "
+           "(inclusive)";
+    state.failed = true;
+    return "/*unsupported_float_type*/";
+  }
   if (isa<BFloat16Type>(type))
     return "ap_float<16,8>";
   if (isa<FloatTF32Type>(type))
@@ -1361,14 +1368,17 @@ constexpr llvm::StringLiteral deviceHeader = R"XXX(
 #include <hls_stream.h>
 #include <math.h>
 #include <stdint.h>
-using namespace std;
 )XXX";
 
 void VivadoHLSEmitter::emitModule(ModuleOp mod) {
   // TODO: add host-side codegen
   llvm::raw_ostream &os = state.os;
 
-  os << deviceHeader << "\n";
+  os << deviceHeader;
+  if (state.enabledApFloat) {
+    os << "#include <ap_float.h>\n";
+  }
+  os << "using namespace std;\n\n";
   // Step 1: emit top-level declarations other than functions.
   for (Operation &op : mod.getBody()->without_terminator()) {
     if (isa<func::FuncOp>(&op))
@@ -1396,36 +1406,38 @@ static llvm::cl::opt<unsigned>
                llvm::cl::desc("Bit width to use for index types (default: 32)"),
                llvm::cl::init(32));
 
-static llvm::cl::opt<unsigned>
-    indent("indent",
-           llvm::cl::desc("Indent width for code generation (default: 2)"),
-           llvm::cl::init(2));
-
 static llvm::cl::opt<bool>
     withLocation("with-location",
                  llvm::cl::desc("Include location info as comments in the "
                                 "generated code"),
                  llvm::cl::init(false));
 
-static LogicalResult emitVivadoHLS(ModuleOp mod, llvm::raw_ostream &os) {
-  return emitVivadoHLS(mod, os, indexWidth, indent, withLocation);
-}
+static llvm::cl::opt<bool> enableApFloat(
+    "enable-apfloat",
+    llvm::cl::desc("Use ap_fixed/ap_float types for floating-point values; "
+                   "disabled by default since these types are not supported in "
+                   "Vitis HLS."),
+    llvm::cl::init(false));
 
 LogicalResult allo::emitVivadoHLS(ModuleOp mod, llvm::raw_ostream &os,
-                                  unsigned indexWidth, unsigned indentSize,
+                                  bool enableApFloat, unsigned indexWidth,
                                   bool withLocation) {
   VivadoHLSEmitter emitter(os);
   emitter.state.indexWidth = indexWidth;
-  emitter.state.indentSize = indentSize;
   emitter.state.withLocation = withLocation;
+  emitter.state.enabledApFloat = enableApFloat;
   emitter.emitModule(mod);
   return failure(emitter.state.failed);
+}
+
+static LogicalResult emitVivadoHLSWrapper(ModuleOp mod, llvm::raw_ostream &os) {
+  return emitVivadoHLS(mod, os, enableApFloat, indexWidth, withLocation);
 }
 
 void allo::registerVivadoHLSTranslation() {
   static TranslateFromMLIRRegistration reg(
       "emit-vitis-hls", "Translate MLIR to C++ code for Vivado HLS",
-      ::emitVivadoHLS, [&](DialectRegistry &registry) {
+      emitVivadoHLSWrapper, [&](DialectRegistry &registry) {
         registry
             .insert<affine::AffineDialect, arith::ArithDialect,
                     math::MathDialect, memref::MemRefDialect, scf::SCFDialect,

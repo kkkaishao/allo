@@ -22,7 +22,7 @@ extern "C" {
 /// Emits Vivado HLS C++ for `module`, streaming the result through `callback`.
 /// Returns failure if emission fails (in which case `callback` is not invoked).
 MLIR_CAPI_EXPORTED MlirLogicalResult alloEmitVivadoHLS(
-    MlirModule module, unsigned indexWidth, unsigned indentSize,
+    MlirModule module, bool enableApFloat, unsigned indexWidth,
     bool withLocation, MlirStringCallback callback, void *userData);
 
 #ifdef __cplusplus

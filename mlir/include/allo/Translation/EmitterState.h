@@ -20,6 +20,7 @@ struct EmitterState {
   unsigned indexWidth = 32;
   bool withLocation = false;
   bool failed = false;
+  bool enabledApFloat = false;
 
   explicit EmitterState(llvm::raw_ostream &os) : os(os) {}
 

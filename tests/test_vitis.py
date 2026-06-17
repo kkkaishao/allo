@@ -19,6 +19,7 @@ import tempfile
 
 import numpy as np
 import pytest
+import os
 
 from allo.lang.core import (
     range as arange,
@@ -92,6 +93,8 @@ def test_codegen_bf16():
         for i in arange(16, name="i"):
             C[i] = A[i] + B[i]
 
+    # force enable ap_float support to test codegen
+    os.environ["ALLO_ENABLE_VITIS_APFLOAT"] = "1"
     code = _hls(add_bf16.schedule())
     _contains(
         code,
@@ -99,6 +102,7 @@ def test_codegen_bf16():
         "ap_float<16,8> v1[16]",
         "ap_float<16,8> v2[16]",
     )
+    os.environ.pop("ALLO_ENABLE_VITIS_APFLOAT")
 
 
 def test_codegen_vadd_pipeline():

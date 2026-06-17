@@ -14,11 +14,11 @@
 
 using namespace mlir;
 
-MlirLogicalResult alloEmitVivadoHLS(MlirModule module, unsigned indexWidth,
-                                    unsigned indentSize, bool withLocation,
+MlirLogicalResult alloEmitVivadoHLS(MlirModule module, bool enableApFloat,
+                                    unsigned indexWidth, bool withLocation,
                                     MlirStringCallback callback,
                                     void *userData) {
   mlir::detail::CallbackOstream stream(callback, userData);
-  return wrap(allo::emitVivadoHLS(unwrap(module), stream, indexWidth,
-                                  indentSize, withLocation));
+  return wrap(allo::emitVivadoHLS(unwrap(module), stream, enableApFloat,
+                                  indexWidth, withLocation));
 }

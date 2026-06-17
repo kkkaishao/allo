@@ -544,6 +544,8 @@ b.run(mode, *args)         # mode ∈ csim | csyn | hw_emu | hw | sw_emu(=csim, 
 - Interface pragmas: `b.set_axi(idx, ...)` (m_axi buffer), `b.set_axis(idx, ...)`
   (axis stream), `b.set_axilite(idx, ...)` (`-1` = return value).
 - All run/csim/synth accept `exist_ok=True` (default; `False` forces rebuild).
+- Set `ALLO_VITIS_ENABLE_APFLOAT=1` to force enable `ap_float` support
+  (legacy Vitis versions before 2022.2 (inclusive) don't support that).
 
 ### Calling convention
 

@@ -8,6 +8,7 @@ import re
 import shlex
 import shutil
 import subprocess
+import functools
 
 from dataclasses import dataclass
 from pathlib import Path
@@ -428,6 +429,7 @@ def _find_tool_in_env(env: Mapping[str, str]) -> VitisTool | None:
     return None
 
 
+@functools.cache
 def _probe_vitis_tool(settings64: Path) -> VitisTool:
     sourced_env = _source_settings_env(settings64)
     if sourced_env is not None:
