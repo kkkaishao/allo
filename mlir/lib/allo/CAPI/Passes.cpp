@@ -16,9 +16,10 @@ using namespace mlir;
 
 MlirLogicalResult alloEmitVivadoHLS(MlirModule module, bool enableApFloat,
                                     unsigned indexWidth, bool withLocation,
+                                    MlirStringRef top,
                                     MlirStringCallback callback,
                                     void *userData) {
   mlir::detail::CallbackOstream stream(callback, userData);
   return wrap(allo::emitVivadoHLS(unwrap(module), stream, enableApFloat,
-                                  indexWidth, withLocation));
+                                  indexWidth, withLocation, unwrap(top)));
 }

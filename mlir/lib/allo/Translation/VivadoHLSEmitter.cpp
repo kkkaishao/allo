@@ -193,7 +193,14 @@ void VivadoHLSEmitter::emitFunctionReturnType(func::FuncOp func) {
   }
 }
 
+bool VivadoHLSEmitter::isTopFunc(func::FuncOp func) {
+  return !state.topName.empty() && func.getSymName() == state.topName;
+}
+
 void VivadoHLSEmitter::emitFunctionSignature(func::FuncOp func) {
+  // The top function is the C ABI boundary csim/synth call into
+  if (isTopFunc(func))
+    state.os << "extern \"C\" ";
   emitFunctionReturnType(func);
   state.os << " " << getSymbolName(func.getSymName()) << "(";
   emitFunctionArguments(func);
@@ -251,6 +258,19 @@ void VivadoHLSEmitter::emitFunctionDirectives(func::FuncOp func) {
              << " depth=" << streamFifoDepth(streamType) << "\n";
   }
 
+  // Globals (stateful variables / list-initialized constants) lower to
+  // file-scope statics; a scheduled array_partition on such a global is
+  // recorded on its `memref.global` op (see transform::PartitionOp). The pragma
+  // is function-scoped but a static is visible everywhere, so emit every
+  // global's pragma once, in the top function.
+  if (isTopFunc(func)) {
+    for (auto global :
+         func->getParentOfType<ModuleOp>().getOps<memref::GlobalOp>())
+      if (auto partAttr =
+              global->getAttrOfType<allo::PartitionAttr>(kPartitionAttr))
+        emitPartitionPragma(partAttr, getSymbolName(global.getSymName()));
+  }
+
   auto argAttrs = func.getArgAttrs();
   if (!argAttrs) {
     state.os << "\n";
@@ -264,7 +284,7 @@ void VivadoHLSEmitter::emitFunctionDirectives(func::FuncOp func) {
     if (!partOr)
       continue;
     auto partAttr = cast<allo::PartitionAttr>(partOr->getValue());
-    emitPartitionAttr(partAttr, arg);
+    emitPartitionPragma(partAttr, state.getName(arg));
   }
   state.os << "\n";
 }
@@ -291,11 +311,11 @@ void VivadoHLSEmitter::emitCall(func::CallOp op) {
   os << ");";
 }
 
-void VivadoHLSEmitter::emitPartitionAttr(allo::PartitionAttr attr,
-                                         Value value) {
+void VivadoHLSEmitter::emitPartitionPragma(allo::PartitionAttr attr,
+                                           llvm::StringRef varName) {
   for (auto axiAttr : attr.getPartitions()) {
     state.os.indent(state.currentIndent);
-    state.os << "#pragma HLS array_partition variable=" << state.getName(value);
+    state.os << "#pragma HLS array_partition variable=" << varName;
     state.os << " dim=" << axiAttr.getDim();
     switch (axiAttr.getKind()) {
     case allo::PartitionKindEnum::CyclicPartition:
@@ -740,7 +760,7 @@ void VivadoHLSEmitter::emitMemrefAlloc(memref::AllocOp op) {
   // function arguments.
   if (auto partAttr = op->getAttrOfType<allo::PartitionAttr>(kPartitionAttr)) {
     os << "\n";
-    emitPartitionAttr(partAttr, op.getResult());
+    emitPartitionPragma(partAttr, state.getName(op.getResult()));
   }
 }
 
@@ -1419,19 +1439,28 @@ static llvm::cl::opt<bool> enableApFloat(
                    "Vitis HLS."),
     llvm::cl::init(false));
 
+static llvm::cl::opt<std::string>
+    topName("top",
+            llvm::cl::desc("Name of the top function; it is emitted with "
+                           "`extern \"C\"` linkage and carries the global "
+                           "array_partition pragmas."),
+            llvm::cl::init(""));
+
 LogicalResult allo::emitVivadoHLS(ModuleOp mod, llvm::raw_ostream &os,
                                   bool enableApFloat, unsigned indexWidth,
-                                  bool withLocation) {
+                                  bool withLocation, StringRef topName) {
   VivadoHLSEmitter emitter(os);
   emitter.state.indexWidth = indexWidth;
   emitter.state.withLocation = withLocation;
   emitter.state.enabledApFloat = enableApFloat;
+  emitter.state.topName = topName.str();
   emitter.emitModule(mod);
   return failure(emitter.state.failed);
 }
 
 static LogicalResult emitVivadoHLSWrapper(ModuleOp mod, llvm::raw_ostream &os) {
-  return emitVivadoHLS(mod, os, enableApFloat, indexWidth, withLocation);
+  return emitVivadoHLS(mod, os, enableApFloat, indexWidth, withLocation,
+                       topName);
 }
 
 void allo::registerVivadoHLSTranslation() {

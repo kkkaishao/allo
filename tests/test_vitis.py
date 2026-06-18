@@ -519,6 +519,64 @@ def test_codegen_numpy_initialized_buffer_definition():
     )
 
 
+# A scheduled `partition` on a global-backed buffer (stateful variable / list
+# initializer) records the attribute on the file-scope `memref.global`. The
+# `array_partition` pragma is function-scoped, so the emitter must re-emit it at
+# the top of every function that reads the global -- not next to the file-scope
+# static definition.
+
+
+def test_codegen_partition_list_initialized_global():
+    @kernel
+    def lut(idx: i32) -> i32:
+        table: i32[4] = [10, 20, 30, 40]
+        return table[idx]
+
+    s = lut.schedule()
+    s.partition(s.buffer("table"), kind=s.Complete)
+    code = _hls(s)
+    _regex(
+        code,
+        r"#pragma HLS array_partition variable=_allo_const_lut_table_l\d+c\d+ "
+        r"dim=0 complete",
+    )
+    # The pragma must sit inside the function body, after the inline pragma.
+    body = code.split('extern "C" int32_t lut(int32_t v0) {', 1)[1]
+    assert "array_partition" in body
+
+
+def test_codegen_partition_stateful_array():
+    @kernel
+    def accbuf(idx: i32, x: i32) -> i32:
+        st: Stateful[i32[8]] = 0
+        st[idx] = st[idx] + x
+        return st[idx]
+
+    s = accbuf.schedule()
+    s.partition(s.buffer("st"), dim=1, factor=4, kind=s.Block)
+    code = _hls(s)
+    _regex(
+        code,
+        r"#pragma HLS array_partition variable=_allo_stateful_accbuf_st_l\d+c\d+ "
+        r"dim=1 block factor=4",
+    )
+
+
+@requires_vitis
+def test_csim_partitioned_list_initialized_buffer():
+    # Partitioning a global-backed buffer must not change its functional result.
+    @kernel
+    def lut(idx: i32) -> i32:
+        table: i32[4] = [10, 20, 30, 40]
+        return table[idx]
+
+    s = lut.schedule()
+    s.partition(s.buffer("table"), kind=s.Complete)
+    with tempfile.TemporaryDirectory() as project:
+        backend = s.export("vitis", project_path=project)
+        assert [int(backend(i)) for i in range(4)] == [10, 20, 30, 40]
+
+
 @requires_vitis
 def test_csim_stateful_accumulator():
     """A stateful scalar must persist across csim calls on the same backend (the

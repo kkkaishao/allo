@@ -39,7 +39,6 @@ from .emulation import (
 from .utils import (
     VitisTool,
     _INTERFACE_MODES,
-    _add_extern_c_to_top,
     _apply_interface_pragmas,
     detect_vitis_tool,
     generate_hls_cfg,
@@ -815,10 +814,9 @@ class Vitis(Backend, Generic[P, R]):
                 log_warning(
                     "No Vitis HLS tool detected; ap_float support (bf16/tf32) will be disabled by default, and may cause compilation failure if the kernel uses bf16/tf32. If you have Vitis HLS installed, please set the XILINX_HLS or XILINX_VITIS environment variable to the Vitis installation path, or set ALLO_ENABLE_VITIS_APFLOAT=1 to force-enable ap_float support."
                 )
-        hls_code = emit_vivado_hls(module, enable_apfloat)
+        hls_code = emit_vivado_hls(module, enable_apfloat, top=self.kernel.func_name)
         if hls_code is None:
             raise RuntimeError("Failed to emit Vitis HLS code")
-        hls_code = _add_extern_c_to_top(hls_code, self.kernel.func_name)
         hls_code = _apply_interface_pragmas(
             hls_code, self.kernel.func_name, self._interface_pragmas
         )

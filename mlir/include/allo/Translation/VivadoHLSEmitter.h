@@ -73,7 +73,8 @@ private:
   void emitFunctionSignature(func::FuncOp func);
   void emitFunctionDirectives(func::FuncOp func);
   void emitTrailingLocation(Operation *op);
-  void emitPartitionAttr(allo::PartitionAttr attr, Value value);
+  void emitPartitionPragma(allo::PartitionAttr attr, llvm::StringRef varName);
+  bool isTopFunc(func::FuncOp func);
   void emitLoopDirectives(Operation *op);
   void emitArraySuffix(ArrayRef<int64_t> shape, Location loc);
   void emitArraySuffix(ShapedType type, Location loc);
@@ -162,7 +163,7 @@ void registerVivadoHLSTranslation();
 
 LogicalResult emitVivadoHLS(ModuleOp mod, llvm::raw_ostream &os,
                             bool enableApFloat, unsigned indexWidth,
-                            bool withLocation);
+                            bool withLocation, StringRef topName = "");
 
 } // namespace mlir::allo
 

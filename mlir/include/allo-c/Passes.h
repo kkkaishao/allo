@@ -21,9 +21,12 @@ extern "C" {
 
 /// Emits Vivado HLS C++ for `module`, streaming the result through `callback`.
 /// Returns failure if emission fails (in which case `callback` is not invoked).
-MLIR_CAPI_EXPORTED MlirLogicalResult alloEmitVivadoHLS(
-    MlirModule module, bool enableApFloat, unsigned indexWidth,
-    bool withLocation, MlirStringCallback callback, void *userData);
+/// `top` names the top function (emitted with `extern "C"` linkage and carrying
+/// the global array_partition pragmas); pass an empty string for none.
+MLIR_CAPI_EXPORTED MlirLogicalResult
+alloEmitVivadoHLS(MlirModule module, bool enableApFloat, unsigned indexWidth,
+                  bool withLocation, MlirStringRef top,
+                  MlirStringCallback callback, void *userData);
 
 #ifdef __cplusplus
 }

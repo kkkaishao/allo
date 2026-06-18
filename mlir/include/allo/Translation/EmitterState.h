@@ -21,6 +21,7 @@ struct EmitterState {
   bool withLocation = false;
   bool failed = false;
   bool enabledApFloat = false;
+  std::string topName;
 
   explicit EmitterState(llvm::raw_ostream &os) : os(os) {}
 

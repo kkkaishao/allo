@@ -1900,7 +1900,7 @@ class MLIRCodeGenerator(ast.NodeVisitor):
         values = self._stateful_init_values(node, inner)
         global_name = self._global_symbol(node, node.target.id, "stateful")
         stateful = self.builder.make_stateful(global_name, inner, values)
-        self._set_value(node.target.id, stateful)
+        self._set_value_with_loc(node.target.id, stateful)
 
     def _read_stateful(self, sv: StatefulValue):
         # Scalars load their current value; arrays expose the backing buffer so

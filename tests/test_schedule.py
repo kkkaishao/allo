@@ -4,7 +4,7 @@
 import numpy as np
 import pytest
 
-from allo.lang.core import range, i32, f32, Template
+from allo.lang.core import range, i32, f32, Template, Stateful
 from allo.lang.kernel import kernel
 from allo.schedule import Schedule
 from allo.schedule.errors import ScheduleLookupError, ScheduleTransformError
@@ -745,6 +745,42 @@ def test_partition_dim_factor():
     s.apply()
     assert s.payload.operation.verify()
     assert "partition<[(1,Block,2)]>" in str(s.payload)
+
+
+def _memref_global_line(ir: str) -> str:
+    return next(line for line in ir.splitlines() if "memref.global" in line)
+
+
+def test_partition_list_initialized_global():
+    # A buffer backed by a list initializer lowers to memref.get_global; the
+    # partition attribute must land on the backing memref.global, not a kernel
+    # argument.
+    @kernel
+    def lut(idx: i32) -> i32:
+        table: i32[4] = [10, 20, 30, 40]
+        return table[idx]
+
+    s = lut.schedule()
+    s.partition(s.buffer("table"), kind=Schedule.Complete)
+    s.apply()
+    assert s.payload.operation.verify()
+    assert "partition<[(0,Complete,0)]>" in _memref_global_line(str(s.payload))
+
+
+def test_partition_stateful_array_by_name():
+    # Stateful arrays are addressable by their source variable name, and the
+    # attribute lands on the backing memref.global.
+    @kernel
+    def accbuf(idx: i32, x: i32) -> i32:
+        st: Stateful[i32[8]] = 0
+        st[idx] = st[idx] + x
+        return st[idx]
+
+    s = accbuf.schedule()
+    s.partition(s.buffer("st"), dim=1, factor=4, kind=Schedule.Cyclic)
+    s.apply()
+    assert s.payload.operation.verify()
+    assert "partition<[(1,Cyclic,4)]>" in _memref_global_line(str(s.payload))
 
 
 # ===========================================================================

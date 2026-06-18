@@ -101,22 +101,6 @@ def _top_signature_marker(top: str) -> str:
     return f" {top}("
 
 
-def _add_extern_c_to_top(hls_code: str, top: str) -> str:
-    marker = _top_signature_marker(top)
-    lines = []
-    for line in hls_code.splitlines():
-        stripped = line.lstrip()
-        if (
-            marker in stripped
-            and (stripped.endswith(";") or stripped.endswith("{"))
-            and not stripped.startswith('extern "C" ')
-        ):
-            indent = line[: len(line) - len(stripped)]
-            line = f'{indent}extern "C" {stripped}'
-        lines.append(line)
-    return "\n".join(lines) + ("\n" if hls_code.endswith("\n") else "")
-
-
 def _extract_top_declaration(hls_code: str, top: str) -> str:
     marker = _top_signature_marker(top)
     for line in hls_code.splitlines():

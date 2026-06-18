@@ -74,17 +74,18 @@ NB_MODULE(_allo, m) {
   //===--------------------------------------------------------------------===//
   allo.def(
       "emit_vivado_hls",
-      [](MlirModule module, bool enableApFloat, unsigned indexWidth,
-         bool withLocation) -> std::optional<std::string> {
+      [](MlirModule module, bool enableApFloat, const std::string &top,
+         unsigned indexWidth, bool withLocation) -> std::optional<std::string> {
         std::string out;
-        if (mlirLogicalResultIsFailure(
-                alloEmitVivadoHLS(module, enableApFloat, indexWidth,
-                                  withLocation, appendToString, &out)))
+        if (mlirLogicalResultIsFailure(alloEmitVivadoHLS(
+                module, enableApFloat, indexWidth, withLocation,
+                mlirStringRefCreate(top.data(), top.size()), appendToString,
+                &out)))
           return std::nullopt;
         return out;
       },
-      nb::arg("module"), nb::arg("enable_apfloat"), nb::arg("index_width") = 32,
-      nb::arg("with_location") = false);
+      nb::arg("module"), nb::arg("enable_apfloat"), nb::arg("top") = "",
+      nb::arg("index_width") = 32, nb::arg("with_location") = false);
 
   //===--------------------------------------------------------------------===//
   // schedule
