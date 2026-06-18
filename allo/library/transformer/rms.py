@@ -14,7 +14,7 @@ def _make(Tin, Tacc, Tout, S, D, L=16, SB=8, eps=1e-5, ii=1):
     invD = 1.0 / D
 
     @kernel
-    def top(x: Tin[S, D], g: Tin[D], y: Tout[S, D]):
+    def rmsnorm(x: Tin[S, D], g: Tin[D], y: Tout[S, D]):
         """RMSNorm ``y = x * rsqrt(mean(x^2)+eps) * g`` row-wise.
 
         Two passes over an on-chip row buffer (sum-of-squares, then normalize),
@@ -45,7 +45,7 @@ def _make(Tin, Tacc, Tout, S, D, L=16, SB=8, eps=1e-5, ii=1):
                         o: Tacc = buf[s3, dt * L + l] * inv[s3] * g[dt * L + l]
                         y[sb * SB + s3, dt * L + l] = o
 
-    s = top.schedule()
+    s = rmsnorm.schedule()
     s.partition(s.buffer("buf"), dim=2, kind=s.Cyclic, factor=L)
     s.partition(s.buffer("ss"), dim=1, kind=s.Complete)
     s.partition(s.buffer("inv"), dim=1, kind=s.Complete)
@@ -58,7 +58,7 @@ def _make(Tin, Tacc, Tout, S, D, L=16, SB=8, eps=1e-5, ii=1):
     s.unroll("nl")
     s.pipeline(s.flatten(("ns", "ndt")), ii=ii)
 
-    return top, s
+    return rmsnorm, s
 
 
 class RMSNorm(Module):

@@ -14,7 +14,7 @@ def _make(Tin, Tout, S, H, dh, L=16, ii=1):
     HT = HD // L
 
     @kernel
-    def top(x: Tin[S, HD], cos: Tin[S, dh2], sin: Tin[S, dh2], y: Tout[S, HD]):
+    def rope(x: Tin[S, HD], cos: Tin[S, dh2], sin: Tin[S, dh2], y: Tout[S, HD]):
         """RoPE rotate-half.
 
         Each row staged on-chip, head-dim pairs ``(i,i+dh/2)`` rotated by the
@@ -41,7 +41,7 @@ def _make(Tin, Tout, S, H, dh, L=16, ii=1):
                 for l in range(L, name="sl"):  # unrolled -> contiguous burst
                     y[s, it * L + l] = ob[it * L + l]
 
-    sch = top.schedule()
+    sch = rope.schedule()
     sch.partition(sch.buffer("ib"), dim=1, kind=sch.Cyclic, factor=L)
     sch.partition(sch.buffer("ob"), dim=1, kind=sch.Cyclic, factor=L)
 
@@ -54,7 +54,7 @@ def _make(Tin, Tout, S, H, dh, L=16, ii=1):
     sch.unroll("sl")
     sch.pipeline("si", ii=ii)
 
-    return top, sch
+    return rope, sch
 
 
 class RoPE(Module):

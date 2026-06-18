@@ -16,7 +16,7 @@ def _make(Tin, Tacc, Tout, R, Cn, L, SB, ii):
     RBN = R // SB
 
     @kernel
-    def top(x: Tin[R, Cn], y: Tout[R, Cn]):
+    def softmax(x: Tin[R, Cn], y: Tout[R, Cn]):
         """Row softmax ``y[r,:] = softmax(x[r,:])``.
 
         Three passes over an on-chip row buffer (max, exp-sum, normalize);
@@ -59,7 +59,7 @@ def _make(Tin, Tacc, Tout, R, Cn, L, SB, ii):
                         o: Tacc = buf[s3, ct * L + l] * inv[s3]
                         y[rb * SB + s3, ct * L + l] = o
 
-    s = top.schedule()
+    s = softmax.schedule()
     s.partition(s.buffer("buf"), dim=2, kind=s.Cyclic, factor=L)
     s.partition(s.buffer("mx"), dim=1, kind=s.Complete)
     s.partition(s.buffer("ss"), dim=1, kind=s.Complete)
@@ -77,7 +77,7 @@ def _make(Tin, Tacc, Tout, R, Cn, L, SB, ii):
     s.unroll("dl")
     s.pipeline(s.flatten(("ns", "dct")), ii=ii)
 
-    return top, s
+    return softmax, s
 
 
 class Softmax(Module):

@@ -78,7 +78,7 @@ def make_buffered_output_stationary_gemm(
                             ].get()
 
     @kernel
-    def top(At: Tin[K, M], B: Tin[K, N], C: Tout[M, N]):
+    def gemm(At: Tin[K, M], B: Tin[K, N], C: Tout[M, N]):
         """Output-stationary systolic GEMM, **N-blocked on-chip-buffered** loaders.
 
         Computes ``C[M,N] = AT^T @ B`` where ``AT`` is the **pre-transposed** ``A``
@@ -143,8 +143,8 @@ def make_buffered_output_stationary_gemm(
     st_s.unroll("c")
     st_s.pipeline("noi", ii=ii)
 
-    top_s = top.schedule()
+    top_s = gemm.schedule()
     top_s.dataflow()
     top_s.compose(pe_s, la_s, lb_s, st_s)
 
-    return top, top_s
+    return gemm, top_s

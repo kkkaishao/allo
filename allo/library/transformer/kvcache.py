@@ -43,7 +43,7 @@ def _vanilla(Tin, Tacc, Tout, H, Hkv, dh, Lmax, ii=1):
     scale = 1.0 / math.sqrt(dh)
 
     @kernel
-    def top(
+    def kvcache(
         q: Tin[H, dh],
         k_new: Tin[Hkv, dh],
         v_new: Tin[Hkv, dh],
@@ -89,7 +89,7 @@ def _vanilla(Tin, Tacc, Tout, H, Hkv, dh, Lmax, ii=1):
             for d in range(dh, name="ow"):  # unrolled
                 O[h, d] = outr[d]
 
-    s = top.schedule()
+    s = kvcache.schedule()
     s.partition(s.buffer("qh"), dim=1, kind=s.Complete)
     s.partition(s.buffer("outr"), dim=1, kind=s.Complete)
 
@@ -104,7 +104,7 @@ def _vanilla(Tin, Tacc, Tout, H, Hkv, dh, Lmax, ii=1):
     s.pipeline("pj", ii=ii)
     s.unroll("ow")
 
-    return top, s
+    return kvcache, s
 
 
 def _grouped(Tin, Tacc, Tout, H, Hkv, dh, Lmax, HB=8, ii=1):
@@ -115,7 +115,7 @@ def _grouped(Tin, Tacc, Tout, H, Hkv, dh, Lmax, HB=8, ii=1):
     scale = 1.0 / math.sqrt(dh)
 
     @kernel
-    def top(
+    def kvcache(
         q: Tin[H, dh],
         k_new: Tin[Hkv, dh],
         v_new: Tin[Hkv, dh],
@@ -203,7 +203,7 @@ def _grouped(Tin, Tacc, Tout, H, Hkv, dh, Lmax, HB=8, ii=1):
                 for d in range(dh, name="wd"):  # unrolled
                     O[b * HB + t, d] = outr[t, d]
 
-    s = top.schedule()
+    s = kvcache.schedule()
     s.partition(s.buffer("qh"), dim=1, kind=s.Complete)
     s.partition(s.buffer("qh"), dim=2, kind=s.Complete)
     s.partition(s.buffer("kj"), dim=1, kind=s.Complete)
@@ -241,7 +241,7 @@ def _grouped(Tin, Tacc, Tout, H, Hkv, dh, Lmax, HB=8, ii=1):
     s.unroll("wt")
     s.unroll("wd")
 
-    return top, s
+    return kvcache, s
 
 
 def _flash(Tin, Tacc, Tout, H, Hkv, dh, Lmax, HB=8, ii=1):
@@ -252,7 +252,7 @@ def _flash(Tin, Tacc, Tout, H, Hkv, dh, Lmax, HB=8, ii=1):
     scale = 1.0 / math.sqrt(dh)
 
     @kernel
-    def top(
+    def kvcache(
         q: Tin[H, dh],
         k_new: Tin[Hkv, dh],
         v_new: Tin[Hkv, dh],
@@ -316,7 +316,7 @@ def _flash(Tin, Tacc, Tout, H, Hkv, dh, Lmax, HB=8, ii=1):
                 for d in range(dh, name="wd"):  # unrolled
                     O[b * HB + t, d] = acc[t, d] * inv
 
-    s = top.schedule()
+    s = kvcache.schedule()
     s.partition(s.buffer("qh"), dim=1, kind=s.Complete)
     s.partition(s.buffer("qh"), dim=2, kind=s.Complete)
     s.partition(s.buffer("kj"), dim=1, kind=s.Complete)
@@ -343,7 +343,7 @@ def _flash(Tin, Tacc, Tout, H, Hkv, dh, Lmax, HB=8, ii=1):
     s.unroll("wt")
     s.unroll("wd")
 
-    return top, s
+    return kvcache, s
 
 
 def _flash_int8kv(Tin, Tacc, Tout, H, Hkv, dh, Lmax, HB=8, ii=1):
@@ -354,7 +354,7 @@ def _flash_int8kv(Tin, Tacc, Tout, H, Hkv, dh, Lmax, HB=8, ii=1):
     scale = 1.0 / math.sqrt(dh)
 
     @kernel
-    def top(
+    def kvcache(
         q: Tin[H, dh],
         k_new: Tin[Hkv, dh],
         v_new: Tin[Hkv, dh],
@@ -470,7 +470,7 @@ def _flash_int8kv(Tin, Tacc, Tout, H, Hkv, dh, Lmax, HB=8, ii=1):
                 for d in range(dh, name="wd"):  # unrolled
                     O[b * HB + t, d] = acc[t, d] * inv
 
-    s = top.schedule()
+    s = kvcache.schedule()
     s.partition(s.buffer("qh"), dim=1, kind=s.Complete)
     s.partition(s.buffer("qh"), dim=2, kind=s.Complete)
     s.partition(s.buffer("kj"), dim=1, kind=s.Complete)
@@ -500,7 +500,7 @@ def _flash_int8kv(Tin, Tacc, Tout, H, Hkv, dh, Lmax, HB=8, ii=1):
     s.unroll("wt")
     s.unroll("wd")
 
-    return top, s
+    return kvcache, s
 
 
 class GQAKVCache(Module):

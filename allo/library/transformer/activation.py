@@ -46,7 +46,7 @@ def _make_unary(Tin, Tout, M, N, kind, L):
     if kind == "silu":
 
         @kernel
-        def top(x: Tin[M, N], y: Tout[M, N]):
+        def silu(x: Tin[M, N], y: Tout[M, N]):
             """SiLU ``y = x * sigmoid(x)``, ``L`` lanes/cycle, one II=1 pass."""
             for r in range(M, name="r"):
                 for ct in range(CT, name="ct"):
@@ -54,10 +54,12 @@ def _make_unary(Tin, Tout, M, N, kind, L):
                         v: Tin = x[r, ct * L + l]
                         y[r, ct * L + l] = v * (1.0 / (1.0 + m.exp(-v)))
 
+        return silu
+
     elif kind == "gelu":  # exact erf
 
         @kernel
-        def top(x: Tin[M, N], y: Tout[M, N]):
+        def gelu(x: Tin[M, N], y: Tout[M, N]):
             """Exact GELU ``y = 0.5 x (1 + erf(x/sqrt2))`` (erf is DSP-heavy; use
             the ``gelu_tanh`` variant for ~7x fewer DSP)."""
             for r in range(M, name="r"):
@@ -66,10 +68,12 @@ def _make_unary(Tin, Tout, M, N, kind, L):
                         v: Tin = x[r, ct * L + l]
                         y[r, ct * L + l] = 0.5 * v * (1.0 + m.erf(v * INV_SQRT2))
 
+        return gelu
+
     elif kind == "gelu_tanh":  # tanh approximation (cheaper than exact erf)
 
         @kernel
-        def top(x: Tin[M, N], y: Tout[M, N]):
+        def gelu_tanh(x: Tin[M, N], y: Tout[M, N]):
             """Tanh-approx GELU ``y = 0.5 x (1 + tanh(c(x+0.044715 x^3)))`` -- the
             cheap GELU (~7x fewer DSP than the exact ``gelu`` variant)."""
             for r in range(M, name="r"):
@@ -79,10 +83,12 @@ def _make_unary(Tin, Tout, M, N, kind, L):
                         u: Tin = GELU_C * (v + 0.044715 * v * v * v)
                         y[r, ct * L + l] = 0.5 * v * (1.0 + m.tanh(u))
 
+        return gelu_tanh
+
     else:  # relu
 
         @kernel
-        def top(x: Tin[M, N], y: Tout[M, N]):
+        def relu(x: Tin[M, N], y: Tout[M, N]):
             """ReLU ``y = max(x, 0)`` (no DSP)."""
             for r in range(M, name="r"):
                 for ct in range(CT, name="ct"):
@@ -90,7 +96,7 @@ def _make_unary(Tin, Tout, M, N, kind, L):
                         v: Tin = x[r, ct * L + l]
                         y[r, ct * L + l] = allo.max(v, 0.0)
 
-    return top
+        return relu
 
 
 def _make_binary(Tin, Tout, M, N, kind, L):
@@ -98,27 +104,31 @@ def _make_binary(Tin, Tout, M, N, kind, L):
     if kind == "add":
 
         @kernel
-        def top(a: Tin[M, N], b: Tin[M, N], y: Tout[M, N]):
+        def add(a: Tin[M, N], b: Tin[M, N], y: Tout[M, N]):
             """Residual add ``y = a + b``, ``L`` lanes/cycle, one II=1 pass."""
             for r in range(M, name="r"):
                 for ct in range(CT, name="ct"):
                     for l in range(L, name="l"):  # unrolled
                         y[r, ct * L + l] = a[r, ct * L + l] + b[r, ct * L + l]
 
+        return add
+
     elif kind == "mul":
 
         @kernel
-        def top(a: Tin[M, N], b: Tin[M, N], y: Tout[M, N]):
+        def mul(a: Tin[M, N], b: Tin[M, N], y: Tout[M, N]):
             """Elementwise multiply ``y = a * b``, ``L`` lanes/cycle, II=1."""
             for r in range(M, name="r"):
                 for ct in range(CT, name="ct"):
                     for l in range(L, name="l"):  # unrolled
                         y[r, ct * L + l] = a[r, ct * L + l] * b[r, ct * L + l]
 
+        return mul
+
     else:  # swiglu: silu(a) * b
 
         @kernel
-        def top(a: Tin[M, N], b: Tin[M, N], y: Tout[M, N]):
+        def swiglu(a: Tin[M, N], b: Tin[M, N], y: Tout[M, N]):
             """SwiGLU gate*up fuse ``y = silu(a) * b`` in one pass (the gate and
             up projections feed ``a`` and ``b``)."""
             for r in range(M, name="r"):
@@ -128,7 +138,7 @@ def _make_binary(Tin, Tout, M, N, kind, L):
                         sa: Tin = av * (1.0 / (1.0 + m.exp(-av)))
                         y[r, ct * L + l] = sa * b[r, ct * L + l]
 
-    return top
+        return swiglu
 
 
 class Activation(Module):

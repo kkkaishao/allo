@@ -53,7 +53,7 @@ def _dense(Tin, Tacc, Tout, S, H, Hkv, dh, SB=8, depth=2, ii=1):
     scale = 1.0 / math.sqrt(dh)
 
     @kernel
-    def top(
+    def gqa(
         Q: Tin[S, H, dh], K: Tin[S, Hkv, dh], V: Tin[S, Hkv, dh], O: Tout[S, H, dh]
     ):
         """**prefill multi-head attention** (causal, GQA).
@@ -133,7 +133,7 @@ def _dense(Tin, Tacc, Tout, S, H, Hkv, dh, SB=8, depth=2, ii=1):
                     for d in range(dh, name="pw"):
                         O[ib * SB + s, h, d] = outr[s, d]
 
-    s = top.schedule()
+    s = gqa.schedule()
     s.partition(s.buffer("mx"), dim=1, kind=s.Complete)
     s.partition(s.buffer("ssm"), dim=1, kind=s.Complete)
     s.partition(s.buffer("inv"), dim=1, kind=s.Complete)
@@ -165,7 +165,7 @@ def _dense(Tin, Tacc, Tout, S, H, Hkv, dh, SB=8, depth=2, ii=1):
     s.unroll("pws")
     s.unroll("pw")
 
-    return top, s
+    return gqa, s
 
 
 def _flash(Tin, Tacc, Tout, S, H, Hkv, dh, Br=8, depth=2, ii=1):
@@ -175,7 +175,7 @@ def _flash(Tin, Tacc, Tout, S, H, Hkv, dh, Br=8, depth=2, ii=1):
     scale = 1.0 / math.sqrt(dh)
 
     @kernel
-    def top(
+    def gqa(
         Q: Tin[S, H, dh], K: Tin[S, Hkv, dh], V: Tin[S, Hkv, dh], O: Tout[S, H, dh]
     ):
         """**Flash** prefill attention (causal, GQA): tiled online-softmax; no ``[S,S]``
@@ -249,7 +249,7 @@ def _flash(Tin, Tacc, Tout, S, H, Hkv, dh, Br=8, depth=2, ii=1):
                     for d in range(dh, name="wd"):  # unrolled
                         O[i0 * Br + r, h, d] = acc[r, d] * inv
 
-    s = top.schedule()
+    s = gqa.schedule()
     s.partition(s.buffer("Qi"), dim=1, kind=s.Complete)
     s.partition(s.buffer("Qi"), dim=2, kind=s.Complete)
     s.partition(s.buffer("kj"), dim=1, kind=s.Complete)
@@ -275,7 +275,7 @@ def _flash(Tin, Tacc, Tout, S, H, Hkv, dh, Br=8, depth=2, ii=1):
     s.unroll("wr")
     s.unroll("wd")
 
-    return top, s
+    return gqa, s
 
 
 def _flash_dataflow(Tin, Tacc, Tout, S, H, Hkv, dh, Br=8, depth=2, ii=1):
@@ -380,7 +380,7 @@ def _flash_dataflow(Tin, Tacc, Tout, S, H, Hkv, dh, Br=8, depth=2, ii=1):
                         O[it * Br + r, h, d] = acc[r, d] * invb[r]
 
     @kernel
-    def top(
+    def gqa(
         Q: Tin[S, H, dh], K: Tin[S, Hkv, dh], V: Tin[S, Hkv, dh], O: Tout[S, H, dh]
     ):
         """**Dual-array flash** attention as a 3-stage dataflow pipeline (the
@@ -455,11 +455,11 @@ def _flash_dataflow(Tin, Tacc, Tout, S, H, Hkv, dh, Br=8, depth=2, ii=1):
     pv_s.unroll("pwr")
     pv_s.unroll("pwd")
 
-    ts = top.schedule()
+    ts = gqa.schedule()
     ts.dataflow()
     ts.compose(qk_s, sm_s, pv_s)
 
-    return top, ts
+    return gqa, ts
 
 
 # def _systolic(Tin, Tacc, Tout, S, dh, Kt=16, Nt=16, L=16, depth=2, ii=1):
@@ -575,7 +575,7 @@ def _flash_dataflow(Tin, Tacc, Tout, S, H, Hkv, dh, Br=8, depth=2, ii=1):
 #                     O[i, c * L + l] = Cbuf[i, c * L + l] * inv
 
 #     @kernel
-#     def top(Q: Tin[S, dh], Kt_in: Tin[dh, S], V: Tin[S, dh], O: Tout[S, dh]):
+#     def gqa(Q: Tin[S, dh], Kt_in: Tin[dh, S], V: Tin[S, dh], O: Tout[S, dh]):
 #         """**Systolic** dual-array attention (single head), 3-stage dataflow with a
 #         *folded* streaming softmax: QK^T and PV are both ``ws`` systolic GEMM arrays
 #         (spatial reduction, II=1 -- no PV fadd recurrence) and the softmax is split

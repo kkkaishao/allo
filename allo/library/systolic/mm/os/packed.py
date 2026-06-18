@@ -88,7 +88,7 @@ def make_packed_output_stationary_gemm(
                         C[mo * Mt + r, no * Nt + c] = fifo_C[r, c].get()
 
     @kernel
-    def top(At: Tin[K, M], B: Tin[K, N], C: Tout[M, N]):
+    def gemm(At: Tin[K, M], B: Tin[K, N], C: Tout[M, N]):
         """Output-stationary systolic GEMM with **low-bitwidth DSP packing**.
 
         Computes ``C[M,N] = AT^T @ B`` (``AT`` pre-transposed ``[K,M]``). Same OS
@@ -129,8 +129,8 @@ def make_packed_output_stationary_gemm(
     st_s.unroll("c")
     st_s.pipeline("no", ii=ii)
 
-    top_s = top.schedule()
+    top_s = gemm.schedule()
     top_s.dataflow()
     top_s.compose(pe_s, la_s, lb_s, st_s)
 
-    return top, top_s
+    return gemm, top_s
