@@ -92,8 +92,6 @@ def _vanilla(Tin, Tacc, Tout, H, Hkv, dh, Lmax, ii=1):
     s = top.schedule()
     s.partition(s.buffer("qh"), dim=1, kind=s.Complete)
     s.partition(s.buffer("outr"), dim=1, kind=s.Complete)
-    s.partition(s.buffer("Kc"), dim=3, kind=s.Complete)
-    s.partition(s.buffer("Vc"), dim=3, kind=s.Complete)
 
     s.unroll("ad")
     s.pipeline("ak", ii=ii)
@@ -218,8 +216,6 @@ def _grouped(Tin, Tacc, Tout, H, Hkv, dh, Lmax, HB=8, ii=1):
     s.partition(s.buffer("inv"), dim=1, kind=s.Complete)
     s.partition(s.buffer("outr"), dim=1, kind=s.Complete)
     s.partition(s.buffer("outr"), dim=2, kind=s.Complete)
-    s.partition(s.buffer("Kc"), dim=3, kind=s.Complete)
-    s.partition(s.buffer("Vc"), dim=3, kind=s.Complete)
 
     s.unroll("ad")
     s.pipeline("ak", ii=ii)
@@ -331,8 +327,6 @@ def _flash(Tin, Tacc, Tout, H, Hkv, dh, Lmax, HB=8, ii=1):
     s.partition(s.buffer("rsm"), dim=1, kind=s.Complete)
     s.partition(s.buffer("acc"), dim=1, kind=s.Complete)
     s.partition(s.buffer("acc"), dim=2, kind=s.Complete)
-    s.partition(s.buffer("Kc"), dim=3, kind=s.Complete)
-    s.partition(s.buffer("Vc"), dim=3, kind=s.Complete)
 
     s.unroll("ad")
     s.pipeline("ak", ii=ii)
@@ -489,8 +483,6 @@ def _flash_int8kv(Tin, Tacc, Tout, H, Hkv, dh, Lmax, HB=8, ii=1):
     s.partition(s.buffer("rsm"), dim=1, kind=s.Complete)
     s.partition(s.buffer("acc"), dim=1, kind=s.Complete)
     s.partition(s.buffer("acc"), dim=2, kind=s.Complete)
-    s.partition(s.buffer("Kc"), dim=3, kind=s.Complete)
-    s.partition(s.buffer("Vc"), dim=3, kind=s.Complete)
 
     s.unroll("am")
     s.unroll("aw")
