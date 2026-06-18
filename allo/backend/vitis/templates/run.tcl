@@ -1,7 +1,7 @@
 # Copyright Allo authors. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-set cosim $::env(COSIM)
+set cosim [expr {{[info exists env(COSIM)] ? $env(COSIM) : "0"}}]
 
 open_project hls_prj
 set_top {top}
