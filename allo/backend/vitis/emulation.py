@@ -138,11 +138,13 @@ def generate_impl_makefile(top: str, freq_mhz: float, vitis_root: Path) -> str:
     """Render ``impl.mk`` (the emulation/hardware Makefile) for ``top``."""
     # v++ --kernel_frequency expects an integer MHz.
     freq = int(freq_mhz) if float(freq_mhz).is_integer() else freq_mhz
+    n_jobs = int(os.getenv("VIVADO_IMPL_JOBS", 4))
     return _render_template(
         "impl.mk",
         top=top,
         freq_mhz=freq,
         vitis_root=os.fspath(vitis_root),
+        vivado_impl_jobs=n_jobs,
     )
 
 

@@ -35,11 +35,12 @@ HOST_EXE := host.exe
 EMCONFIG := emconfig.json
 HLS_PRJ := hls_prj
 
+VIVADO_IMPL_JOBS ?= {vivado_impl_jobs}
 VPP_FLAGS += -t $(TARGET) --platform $(PLATFORM) --save-temps --temp_dir $(TEMP_DIR)
 ifneq ($(TARGET),hw)
 VPP_FLAGS += -g
 endif
-VPP_LDFLAGS += --kernel_frequency $(FREQ_MHZ) --optimize 2
+VPP_LDFLAGS += --kernel_frequency $(FREQ_MHZ) --optimize 2 --vivado.impl.jobs $(VIVADO_IMPL_JOBS)
 
 CXXFLAGS += -std=c++17 -Wall -O2 -I$(XILINX_XRT)/include
 LDFLAGS += -L$(XILINX_XRT)/lib -pthread -lxrt_coreutil -luuid
