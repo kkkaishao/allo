@@ -531,6 +531,16 @@ class Vitis(Backend, Generic[P, R]):
                 )
                 if len(args) > 0:
                     write_impl_inputs(project_path, arg_types, *args)
+            else:
+                log_warning(
+                    "Unsupported kernel ABI are used "
+                    "(likely due to non-native C++ types in the top-level kernel arguments or return);"
+                    "skipping generation of host code and emulation inputs."
+                )
+                write_text_if_changed(
+                    project_path / HOST_CPP,
+                    "// Unsupported kernel ABI; no host code generated.\n",
+                )
 
         self._project_path = project_path
         return project_path
