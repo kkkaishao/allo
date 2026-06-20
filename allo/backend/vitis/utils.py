@@ -304,7 +304,7 @@ def _render_interface_pragma(pragma: Any, port: str) -> str:
         pragma.options, _interface_option_order(pragma.mode)
     )
     suffix = " " + " ".join(options) if options else ""
-    return f"#pragma HLS INTERFACE mode={pragma.mode} port={port}{suffix}"
+    return f"#pragma HLS interface mode={pragma.mode} port={port}{suffix}"
 
 
 def _apply_interface_pragmas(
