@@ -120,7 +120,3 @@ class Vitis(Generic[P, R]):
         AXI4-Lite (``s_axilite``) slave interface, typically for control/status,
         with the given options (``bundle``, ``register``, ``offset``,
         ``storage_impl``, ...; see the Vitis HLS interface pragma)."""
-
-def is_vitis_available() -> bool:
-    """Whether a Vitis HLS toolchain can be detected. Cached, never raises and
-    emits no logs, so it is safe in ``pytest.mark.skipif`` predicates."""

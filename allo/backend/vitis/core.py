@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import functools
 import os
 
 from dataclasses import dataclass
@@ -38,22 +37,23 @@ from .emulation import (
 )
 from .utils import (
     VitisTool,
-    _INTERFACE_MODES,
-    _apply_interface_pragmas,
+    INTERFACE_MODES,
+    apply_interface_pragmas,
+    detect_vitis_home,
     detect_vitis_tool,
     generate_hls_cfg,
     generate_kernel_header,
     generate_run_tcl,
-    _is_stream_type,
     log_failure_tail,
-    _normalize_interface_options,
-    _probe_vitis_tool,
-    _source_settings_env,
+    normalize_interface_options,
+    probe_vitis_tool,
+    source_settings_env,
+    vitis_supports_apfloat,
 )
 from ..._mlir import ir
 from ..._mlir.dialects.allo import emit_vivado_hls
 from ..._mlir._mlir_libs._allo import ir_ext
-from ...lang.core import BufferType, ShapedType, TypeBase
+from ...lang.core import BufferType, ShapedType, TypeBase, StreamType
 from ...lang.kernel import Kernel
 from ...logging import log_info, log_warning, run_command, stage, terminate_on_error
 
@@ -65,7 +65,6 @@ AxiliteStorageImpl = Literal["auto", "bram", "uram"]
 
 DEFAULT_DEVICE = "u280"
 DEFAULT_FREQ_MHZ = 300.0
-DEFAULT_VITIS_HOME = Path("/opt/xilinx/2025.2/Vitis")
 HLS_PREPARE_PIPELINE = """
 builtin.module(
 grid-mapping,
@@ -145,33 +144,9 @@ P = ParamSpec("P")
 R = TypeVar("R")
 
 
-def _detect_vitis_home(vitis_home: str | None) -> Path:
-    if vitis_home:
-        return Path(vitis_home)
-    vitis_env = os.environ.get("XILINX_HLS") or os.environ.get("XILINX_VITIS")
-    if vitis_env:
-        return Path(vitis_env)
-    return DEFAULT_VITIS_HOME
-
-
-@functools.cache
-def is_vitis_available(vitis_home: str | None = None) -> bool:
-    """Whether a Vitis HLS toolchain can be detected, as a plain cached bool.
-
-    Unlike ``detect_vitis_tool`` this never raises and emits no logs, so it is
-    safe to use directly in ``pytest.mark.skipif`` predicates."""
-    settings64 = _detect_vitis_home(vitis_home) / "settings64.sh"
-    try:
-        _probe_vitis_tool(settings64)
-        return True
-    except Exception:
-        return False
-
-
 class Vitis(Backend, Generic[P, R]):
     name = "vitis"
     part: str
-    tool: VitisTool
 
     @terminate_on_error
     def __init__(
@@ -187,8 +162,9 @@ class Vitis(Backend, Generic[P, R]):
     ):
         super().__init__(kernel)
         # setup toolchain paths
-        self._settings64 = _detect_vitis_home(vitis_home) / "settings64.sh"
-        self._vitis_home = Path(vitis_home) if vitis_home else None
+        self._vitis_home = detect_vitis_home(vitis_home)
+        self._settings64 = self._vitis_home / "settings64.sh"
+        self.tool: VitisTool | None = None
         # setup project related settings
         self._project_path = Path(project_path) if project_path else None
         self.freq_mhz = freq_mhz
@@ -219,7 +195,7 @@ class Vitis(Backend, Generic[P, R]):
         self.part = DEFAULT_PART
 
     def _require_vitis_tool(self):
-        if not hasattr(self, "tool") or self.tool is None:
+        if self.tool is None:
             self.tool = detect_vitis_tool(self._settings64)
 
     @property
@@ -314,7 +290,7 @@ class Vitis(Backend, Generic[P, R]):
         In Vitis HLS, AXI stream interfaces can only be applied to ``Stream`` arguments.
         """
         arg_type = self._validate_interface_index(index, allow_return=False)
-        if not _is_stream_type(arg_type):
+        if not isinstance(arg_type, StreamType):
             raise ValueError("Vitis axis interface can only be set on stream arguments")
 
         options = _collect_interface_options(
@@ -640,11 +616,11 @@ class Vitis(Backend, Generic[P, R]):
         mode: str,
         options: Mapping[str, Any],
     ) -> None:
-        if mode not in _INTERFACE_MODES:
+        if mode not in INTERFACE_MODES:
             raise ValueError(f"Unsupported Vitis HLS interface mode '{mode}'")
         self._interface_pragmas.setdefault(index, {})[mode] = InterfacePragma(
             mode=mode,
-            options=_normalize_interface_options(mode, options),
+            options=normalize_interface_options(mode, options),
         )
         self._invalidate_compiled_artifacts()
 
@@ -658,7 +634,7 @@ class Vitis(Backend, Generic[P, R]):
                     "Vitis m_axi interface can only be set on buffer arguments"
                 )
             if "axis" in pragmas and (
-                arg_type is None or not _is_stream_type(arg_type)
+                arg_type is None or not isinstance(arg_type, StreamType)
             ):
                 raise ValueError(
                     "Vitis axis interface can only be set on stream arguments"
@@ -668,19 +644,31 @@ class Vitis(Backend, Generic[P, R]):
         if self.tool is not None:
             return self.tool.env
         with stage("Load Vitis environment"):
-            sourced_env = _source_settings_env(self._settings64)
+            sourced_env = source_settings_env(self._settings64)
             if sourced_env is not None:
                 return sourced_env
         return dict(os.environ)
 
     def _get_vitis_root(self) -> Path:
-        if self._vitis_home is not None:
-            return self._vitis_home
-        if self._settings64.name == "settings64.sh":
-            return self._settings64.parent
+        # Prefer the probed tool's actual root (``.../bin/<exe>`` -> root), which
+        # reflects what will really run; fall back to the detected install home.
         if self.tool is not None and self.tool.executable.parent.name == "bin":
             return self.tool.executable.parent.parent
-        return DEFAULT_VITIS_HOME
+        return self._vitis_home
+
+    def _apfloat_enabled(self) -> bool:
+        """Whether to emit ap_float (bf16/tf32) types. Forced on by
+        ``ALLO_ENABLE_VITIS_APFLOAT=1``; otherwise enabled when a tool that
+        supports it (the 2023.1+ ``vitis-run``) is detected."""
+        if os.getenv("ALLO_ENABLE_VITIS_APFLOAT", "0") == "1":
+            return True
+        try:
+            return vitis_supports_apfloat(probe_vitis_tool(self._settings64))
+        except RuntimeError:
+            log_warning(
+                "No Vitis HLS tool detected; ap_float support (bf16/tf32) will be disabled by default, and may cause compilation failure if the kernel uses bf16/tf32. If you have Vitis HLS installed, please set the XILINX_HLS or XILINX_VITIS environment variable to the Vitis installation path, or set ALLO_ENABLE_VITIS_APFLOAT=1 to force-enable ap_float support."
+            )
+            return False
 
     def _get_csim_toolchain(self) -> CsimToolchain:
         """The probed C-simulation flavor (makefile template + version-discovered
@@ -811,23 +799,12 @@ class Vitis(Backend, Generic[P, R]):
                 f"top={self.kernel.func_name}}})",
             )
         run_pipeline(module, HLS_PREPARE_PIPELINE)
-        enable_apfloat = False
-        if os.getenv("ALLO_ENABLE_VITIS_APFLOAT", "0") == "1":
-            enable_apfloat = True
-        else:
-            try:
-                tool = _probe_vitis_tool(self._settings64)
-                if tool.executable == "vitis-run":
-                    # Vitis 2023+
-                    enable_apfloat = True
-            except RuntimeError:
-                log_warning(
-                    "No Vitis HLS tool detected; ap_float support (bf16/tf32) will be disabled by default, and may cause compilation failure if the kernel uses bf16/tf32. If you have Vitis HLS installed, please set the XILINX_HLS or XILINX_VITIS environment variable to the Vitis installation path, or set ALLO_ENABLE_VITIS_APFLOAT=1 to force-enable ap_float support."
-                )
-        hls_code = emit_vivado_hls(module, enable_apfloat, top=self.kernel.func_name)
+        hls_code = emit_vivado_hls(
+            module, self._apfloat_enabled(), top=self.kernel.func_name
+        )
         if hls_code is None:
             raise RuntimeError("Failed to emit Vitis HLS code")
-        hls_code = _apply_interface_pragmas(
+        hls_code = apply_interface_pragmas(
             hls_code, self.kernel.func_name, self._interface_pragmas
         )
         return CompiledArtifacts(

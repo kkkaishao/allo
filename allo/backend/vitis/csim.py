@@ -207,6 +207,7 @@ class CsimToolchain:
     make_vars: dict[str, str] = field(default_factory=dict)
 
 
+@functools.cache
 def discover_csim(vitis_root: Path) -> CsimToolchain:
     """Pick the C-simulation flavor for a Vitis install. Vitis HLS used gcc as the
     csim compiler through 2024.2; 2025.2 switched to an AMD clang fork (driven by

@@ -32,7 +32,7 @@ from allo.lang.core import (
     Template,
 )
 from allo.lang.kernel import kernel
-from allo.backend.vitis.core import is_vitis_available
+from allo.backend.vitis.utils import is_vitis_available
 from allo.backend.vitis.csim import discover_csim
 from pathlib import Path
 
@@ -350,8 +350,8 @@ def test_codegen_maxi_interface():
     code = backend.hls_code
     _contains(
         code,
-        "#pragma HLS INTERFACE mode=m_axi port=v0 offset=slave bundle=gmem",
-        "#pragma HLS INTERFACE mode=m_axi port=v1 offset=slave bundle=gmem",
+        "#pragma HLS interface mode=m_axi port=v0 offset=slave bundle=gmem",
+        "#pragma HLS interface mode=m_axi port=v1 offset=slave bundle=gmem",
     )
 
 

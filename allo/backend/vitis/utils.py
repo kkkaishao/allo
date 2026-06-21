@@ -26,8 +26,9 @@ from ...logging import (
 SYNTH_LOG = Path("logs") / "hls_run_tcl.log"
 LOG_FAILURE_TAIL_LINES = 100
 TEMPLATE_DIR = Path(__file__).with_name("templates")
+DEFAULT_VITIS_HOME = Path("/opt/xilinx/2025.2/Vitis")
 
-_INTERFACE_MODES = ("m_axi", "axis", "s_axilite")
+INTERFACE_MODES = ("m_axi", "axis", "s_axilite")
 _AXI_OFFSET_VALUES = {"off", "direct", "slave"}
 _AXIS_REGISTER_MODE_VALUES = {"forward", "reverse", "both", "off"}
 _AXILITE_STORAGE_IMPL_VALUES = {"auto", "bram", "uram"}
@@ -187,11 +188,7 @@ def _validate_optional_bool(name: str, value: object) -> None:
         raise ValueError(f"Vitis HLS interface option '{name}' must be a boolean")
 
 
-def _is_stream_type(arg_type: object) -> bool:
-    return arg_type.__class__.__name__ == "StreamType"
-
-
-def _normalize_interface_options(
+def normalize_interface_options(
     mode: str,
     options: Mapping[str, Any],
 ) -> dict[str, str | int | bool | None]:
@@ -307,7 +304,7 @@ def _render_interface_pragma(pragma: Any, port: str) -> str:
     return f"#pragma HLS interface mode={pragma.mode} port={port}{suffix}"
 
 
-def _apply_interface_pragmas(
+def apply_interface_pragmas(
     hls_code: str,
     top: str,
     pragmas: Mapping[int, Mapping[str, Any]],
@@ -319,7 +316,7 @@ def _apply_interface_pragmas(
     lines = []
     inserted = False
     marker = _top_signature_marker(top)
-    mode_order = {mode: i for i, mode in enumerate(_INTERFACE_MODES)}
+    mode_order = {mode: i for i, mode in enumerate(INTERFACE_MODES)}
     index_order = sorted(pragmas, key=lambda index: (index == -1, index))
     for line in hls_code.splitlines():
         lines.append(line)
@@ -346,7 +343,7 @@ def log_failure_tail(cmd_name: str, log_path: Path, error: Exception) -> None:
     log_tail(f"{cmd_name} log tail", tail, max_lines=LOG_FAILURE_TAIL_LINES)
 
 
-def _source_settings_env(settings64: Path) -> dict[str, str] | None:
+def source_settings_env(settings64: Path) -> dict[str, str] | None:
     if not settings64.exists():
         return None
     command = f"source {shlex.quote(str(settings64))} >/dev/null 2>&1 && env"
@@ -373,11 +370,6 @@ def _version_commands(tool_name: str) -> tuple[str, ...]:
     return ("-version", "--version")
 
 
-def _parse_vitis_version(output: str) -> str:
-    match = _VITIS_VERSION_RE.search(output)
-    return match.group(1) if match is not None else "unknown"
-
-
 def _probe_vitis_version(
     executable: Path, tool_name: str, env: Mapping[str, str]
 ) -> str:
@@ -392,10 +384,12 @@ def _probe_vitis_version(
         )
         output = completed_output(result)
         if output:
-            version = _parse_vitis_version(output)
-            if version != "unknown":
-                return version
-    return "unknown"
+            match = _VITIS_VERSION_RE.search(output)
+            # return match.group(1) if match is not None else "unknown"
+            assert match is not None, f"invalid Vitis version output: {output}"
+            version = match.group(1)
+            return version
+    assert False, f"Failed to detect Vitis version from output: {output}"
 
 
 def _find_tool_in_env(env: Mapping[str, str]) -> VitisTool | None:
@@ -414,8 +408,8 @@ def _find_tool_in_env(env: Mapping[str, str]) -> VitisTool | None:
 
 
 @functools.cache
-def _probe_vitis_tool(settings64: Path) -> VitisTool:
-    sourced_env = _source_settings_env(settings64)
+def probe_vitis_tool(settings64: Path) -> VitisTool:
+    sourced_env = source_settings_env(settings64)
     if sourced_env is not None:
         tool = _find_tool_in_env(sourced_env)
         if tool is not None:
@@ -429,6 +423,37 @@ def _probe_vitis_tool(settings64: Path) -> VitisTool:
 
 def detect_vitis_tool(settings64: Path) -> VitisTool:
     with stage("Detecting Vitis HLS Toolchain"):
-        tool = _probe_vitis_tool(settings64)
+        tool = probe_vitis_tool(settings64)
     log_info(f"Using Vitis {tool.executable}, Version: {tool.version}")
     return tool
+
+
+def detect_vitis_home(vitis_home: str | None) -> Path:
+    """Best guess of the Vitis install root: explicit argument, then
+    ``$XILINX_HLS``/``$XILINX_VITIS``, then the packaged default."""
+    if vitis_home:
+        return Path(vitis_home)
+    vitis_env = os.environ.get("XILINX_HLS") or os.environ.get("XILINX_VITIS")
+    if vitis_env:
+        return Path(vitis_env)
+    return DEFAULT_VITIS_HOME
+
+
+@functools.cache
+def is_vitis_available(vitis_home: str | None = None) -> bool:
+    """Whether a Vitis HLS toolchain can be detected, as a plain cached bool.
+
+    Unlike ``detect_vitis_tool`` this never raises and emits no logs, so it is
+    safe to use directly in ``pytest.mark.skipif`` predicates."""
+    settings64 = detect_vitis_home(vitis_home) / "settings64.sh"
+    try:
+        probe_vitis_tool(settings64)
+        return True
+    except Exception:
+        return False
+
+
+def vitis_supports_apfloat(tool: VitisTool) -> bool:
+    """Whether the detected tool can emit ap_float (bf16/tf32) types. Supported
+    by the 2023.1+ ``vitis-run`` launcher; the legacy ``vitis_hls`` is not."""
+    return tool.name == "vitis-run"

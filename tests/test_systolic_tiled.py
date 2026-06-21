@@ -16,7 +16,7 @@ import pytest
 import allo
 from allo.lang.core import i32, Stream
 from allo.lang.kernel import kernel
-from allo.backend.vitis.core import is_vitis_available
+from allo.backend.vitis.utils import is_vitis_available
 
 requires_vitis = pytest.mark.skipif(
     not is_vitis_available(), reason="Vitis HLS toolchain not detected"
