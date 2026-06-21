@@ -1,12 +1,6 @@
----
-title: Allo Scheduling
-createdAt: 2026-06-13
-order: 3
-summary: Reference for the Allo schedule API — selection, transform primitives, composition, streaming, and export.
-keywords: ["Allo", "Scheduling", "Schedule", "Transform", "MLIR"]
----
+<!--- Copyright Allo authors. All Rights Reserved. -->
+<!--- SPDX-License-Identifier: Apache-2.0  -->
 
-%toc%
 # Scheduling
 
 A `Schedule` decouples the *algorithm* (what a kernel computes) from the

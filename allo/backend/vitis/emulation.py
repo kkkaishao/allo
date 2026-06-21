@@ -20,9 +20,9 @@ from typing import Any, Mapping
 import numpy as np
 
 from .csim import _numpy_dtype_for_dtype
-from .utils import _render_template, log_failure_tail
+from .utils import _render_template
 from ...lang.core import APInt, BufferType, DType, TypeBase
-from ...logging import run_command, stage, log_info
+from ...logging import run_command, stage
 
 IMPL_MAKEFILE = "Makefile"
 HOST_CPP = "host.cpp"

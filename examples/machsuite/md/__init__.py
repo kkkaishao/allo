@@ -1,3 +1,6 @@
+# Copyright Allo authors. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 from .grid import md_x as grid_md_x
 from .grid import md_y as grid_md_y
 from .grid import md_z as grid_md_z

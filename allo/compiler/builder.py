@@ -4,7 +4,8 @@
 import ast
 from contextlib import contextmanager
 from enum import Enum
-from typing import Sequence, cast, Literal, NoReturn
+from typing import cast, Literal, NoReturn
+from collections.abc import Sequence
 
 from .._mlir import ir
 from .._mlir.dialects import arith, tensor, linalg, math, memref

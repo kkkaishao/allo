@@ -19,12 +19,12 @@ import os
 import shlex
 import subprocess
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Mapping, Sequence, Generator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import wraps
 from pathlib import Path
-from typing import Any, Callable, Generator, NoReturn, TypeVar, cast
+from typing import Any, Callable, NoReturn, TypeVar, cast
 
 from rich.console import Console
 from rich.markup import escape

@@ -3,9 +3,9 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Sequence, Callable
 from dataclasses import dataclass
-from typing import Callable, NoReturn, cast
+from typing import NoReturn, cast
 from ..compiler.builder import AlloOpBuilder
 from ..lang.core import (
     AlloValue,

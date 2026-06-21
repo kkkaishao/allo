@@ -10,10 +10,9 @@ import json
 import os
 
 from abc import ABC, abstractmethod
-from collections.abc import Mapping, Sequence
-from contextvars import ContextVar
+from collections.abc import Mapping, Sequence, Callable
 from pathlib import Path
-from typing import Any, Callable, ClassVar, Generic, ParamSpec, TypeVar
+from typing import Any, ClassVar, Generic, ParamSpec, TypeVar
 
 from .._mlir import ir
 from .._mlir._mlir_libs._allo import ir_ext

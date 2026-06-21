@@ -1,12 +1,6 @@
----
-title: Allo Frontend Syntax
-createdAt: 2026-06-13
-order: 2
-summary: Syntax reference for the Allo Python frontend.
-keywords: ["Allo", "Frontend", "Syntax", "Kernel", "DSL"]
----
+<!--- Copyright Allo authors. All Rights Reserved. -->
+<!--- SPDX-License-Identifier: Apache-2.0  -->
 
-%toc%
 # Frontend Syntax
 
 The Allo frontend is a restricted Python-embedded DSL (eDSL). It reuses Python

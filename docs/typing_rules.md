@@ -1,12 +1,6 @@
----
-title: Allo Typing Rules
-createdAt: 2026-05-09
-order: 4
-summary: Type promotion rules for the new Allo frontend.
-keywords: ["Allo", "Typing", "Type Promotion", "HLS", "C++"]
----
+<!--- Copyright Allo authors. All Rights Reserved. -->
+<!--- SPDX-License-Identifier: Apache-2.0  -->
 
-%toc%
 # Typing Rules
 
 Allo uses explicit type-promotion tables when lowering frontend expressions.

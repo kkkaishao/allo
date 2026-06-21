@@ -1,5 +1,6 @@
 # Copyright Allo authors. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
+# pylint: disable=unused-argument
 
 from ..lang.operator import operator
 from ..lang.core import (

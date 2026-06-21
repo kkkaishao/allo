@@ -7,7 +7,8 @@ import os
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Literal, Mapping, Generic, TypeVar, ParamSpec
+from typing import Any, Literal, Generic, TypeVar, ParamSpec
+from collections.abc import Mapping
 
 from ..base import (
     Backend,

@@ -2,7 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import inspect
-from typing import Generic, TypeVar, ParamSpec, Callable, Any, overload
+from typing import Generic, TypeVar, ParamSpec, Any, overload
+from collections.abc import Callable
 
 P = ParamSpec("P")
 R = TypeVar("R")

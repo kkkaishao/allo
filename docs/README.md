@@ -1,12 +1,5 @@
----
-title: "Allo: An Accelerator Design Language and Compiler"
-createdAt: 2026-05-09
-order: 1
-summary: Project overview, fork notes, documentation index, and build instructions.
-keywords: ["Allo", "Hardware Accelerator", "ADL", "Compiler", "Composable Design"]
----
-
-%toc%
+<!--- Copyright Allo authors. All Rights Reserved. -->
+<!--- SPDX-License-Identifier: Apache-2.0  -->
 
 # Allo: An Accelerator Design Language and Compiler
 
@@ -178,7 +171,7 @@ cmake -S externals/llvm-project/llvm -B externals/llvm-project/build -G Ninja \
   -DLLVM_ENABLE_ASSERTIONS=ON \
   -DLLVM_ENABLE_PROJECTS="mlir" \
   -DLLVM_USE_CCACHE=ON
-  
+
 ninja -C externals/llvm-project/build
 ```
 

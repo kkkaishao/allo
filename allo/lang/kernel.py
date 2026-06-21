@@ -7,7 +7,8 @@ import textwrap
 import functools
 import re
 from collections.abc import Sequence
-from typing import Literal, ParamSpec, Generic, TypeVar, Callable, overload
+from typing import Literal, ParamSpec, Generic, TypeVar, overload
+from collections.abc import Callable
 from dataclasses import dataclass
 
 from ..lang.core import (

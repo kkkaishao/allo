@@ -1,12 +1,6 @@
----
-title: Allo Compiler Infrastructure
-createdAt: 2026-05-09
-order: 6
-summary: Developer guide for the new frontend code generation stack.
-keywords: ["Allo", "Compiler", "Frontend", "MLIR", "Codegen", "Operator"]
----
+<!--- Copyright Allo authors. All Rights Reserved. -->
+<!--- SPDX-License-Identifier: Apache-2.0  -->
 
-%toc%
 # Compiler Infrastructure
 
 This document explains the frontend code generation stack for developers. The

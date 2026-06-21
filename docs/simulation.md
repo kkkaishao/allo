@@ -1,12 +1,6 @@
----
-title: Allo Simulation
-createdAt: 2026-06-13
-order: 5
-summary: How Allo kernels run on the CPU and Vitis backends — execution, dataflow streams, calling convention, and caching.
-keywords: ["Allo", "Simulation", "CPU", "Vitis", "JIT", "CSim", "HLS"]
----
+<!--- Copyright Allo authors. All Rights Reserved. -->
+<!--- SPDX-License-Identifier: Apache-2.0  -->
 
-%toc%
 # Simulation
 
 An Allo kernel is a callable Python object. Calling it runs the kernel, so a

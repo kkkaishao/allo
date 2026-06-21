@@ -7,12 +7,13 @@ import builtins
 import copy
 import operator
 
-import numpy as np
 from contextlib import contextmanager
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Type, cast
 from types import ModuleType
+
+import numpy as np
 
 from .._mlir import ir
 from .._mlir.ir import (
@@ -696,7 +697,7 @@ class MLIRCodeGenerator(ast.NodeVisitor):
 
     def _try_constexpr_int(self, node):
         if isinstance(node, ast.Constant):
-            return node.value if type(node.value) is builtins.int else None
+            return node.value if isinstance(node.value, int) else None
         if isinstance(node, ast.Name):
             val = unwrap_if_constexpr(self.lookup(node.id))
             return val if isinstance(val, int) else None
