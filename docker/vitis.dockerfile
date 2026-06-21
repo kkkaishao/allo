@@ -1,4 +1,4 @@
-FROM xilinx/xilinx_runtime_base:alveo-2022.1-ubuntu-20.04
+FROM xilinx/xilinx_runtime_base:alveo-2023.2-ubuntu-22.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV TZ=UTC
@@ -36,8 +36,7 @@ RUN apt-get install -y --no-install-recommends \
   autoconf \
   libtool \
   texinfo \
-  zlib1g-dev \
-  && rm -rf /var/lib/apt/lists/*
+  zlib1g-dev
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
   iproute2 \
@@ -55,8 +54,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
   tofrodos \
   lsb-release \
   libftdi1 \
-  libftdi1-2 \
-  && rm -rf /var/lib/apt/lists/*
+  libftdi1-2
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
   lib32stdc++6 \
@@ -66,8 +64,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
   libxext6:i386 \
   libxrender1:i386 \
   libsm6:i386 \
-  openssh-client \
-  && rm -rf /var/lib/apt/lists/*
+  openssh-client
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
   debianutils \
@@ -79,8 +76,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
   gnupg \
   zlib1g:i386 \
   perl \
-  xvfb \
-  && rm -rf /var/lib/apt/lists/*
+  xvfb
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
   gcc-multilib \
@@ -92,8 +88,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
   xz-utils \
   python3-git \
   python3-jinja2 \
-  python3-pexpect \
-  && rm -rf /var/lib/apt/lists/*
+  python3-pexpect
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
   liberror-perl \
@@ -102,16 +97,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
   libxcb-xtest0-dev \
   libxcb-xinerama0-dev \
   libxcb-shape0-dev \
-  libxcb-xkb-dev \
-  && rm -rf /var/lib/apt/lists/*
+  libxcb-xkb-dev
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
   util-linux \
   sysvinit-utils \
   ocl-icd-libopencl1 \
   opencl-headers \
-  ocl-icd-opencl-dev \
-  && rm -rf /var/lib/apt/lists/*
+  ocl-icd-opencl-dev
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
   libncurses5 \

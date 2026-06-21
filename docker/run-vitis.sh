@@ -11,8 +11,8 @@
 
 set -euo pipefail
 
-IMAGE=${IMAGE:-vitis_runtime:2022.1}
-XILINX_VITIS=${VITIS:-/tools/Xilinx/Vitis/2022.1}
+IMAGE=${IMAGE:-vitis_runtime:2023.2}
+XILINX_VITIS=${VITIS:-/tools/Xilinx/Vitis/2023.2}
 XILINX_XRT=${XRT:-/opt/xilinx/xrt}
 PLATFORM=${PLATFORM:-/opt/xilinx/platforms/xilinx_u55c_gen3x16_xdma_3_202210_1/xilinx_u55c_gen3x16_xdma_3_202210_1.xpfm}
 
