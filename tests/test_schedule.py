@@ -1119,6 +1119,48 @@ def test_reuse_blur_x_y_z_3d():
     np.testing.assert_array_equal(B, ref)
 
 
+def test_reuse_conv2d_reduction_axis():
+    # The reused load feeds the output store *through* an inner reduction loop
+    # (acc += ...), so the store value is a loop-carried `affine.for` result
+    # rather than a flat expression. The spatial-axis classifier must trace the
+    # dependence through the reduction's yield to keep `oh` a spatial axis;
+    # otherwise it is misread as reduction-only and reuse_at is rejected.
+    IH, IW, OC, K = 12, 12, 4, 3
+    OH, OW = IH - K + 1, IW - K + 1
+
+    @kernel
+    def conv2d(
+        inp: f32[IH, IW],
+        Wc: f32[OC, K, K],
+        Wb: f32[OC, OH, OW],
+        out: f32[OC, OH, OW],
+    ):
+        for oc in range(OC):
+            for oh in range(OH, name="oh"):
+                for ow in range(OW, name="ow"):
+                    acc: f32 = Wb[oc, oh, ow]
+                    for kh in range(K, name="kh"):
+                        for kw in range(K, name="kw"):
+                            acc += inp[oh + kh, ow + kw] * Wc[oc, kh, kw]
+                    out[oc, oh, ow] = acc
+
+    s = conv2d.schedule()
+    s.reuse_at(s.buffer("inp"), s.loop("oh"))  # row line-buffer reuse
+    mod = s.export("cpu")
+
+    inp = np.random.randn(IH, IW).astype(np.float32)
+    Wc = np.random.randn(OC, K, K).astype(np.float32)
+    Wb = np.random.randn(OC, OH, OW).astype(np.float32)
+    out = np.zeros((OC, OH, OW), dtype=np.float32)
+    mod(inp, Wc, Wb, out)
+
+    # `range` is shadowed by allo's kernel range here, so the reference avoids
+    # Python loops: slide a KxK window over `inp` and contract against `Wc`.
+    windows = np.lib.stride_tricks.sliding_window_view(inp, (K, K))
+    ref = Wb + np.einsum("hwij,oij->ohw", windows, Wc)
+    np.testing.assert_allclose(out, ref, rtol=1e-5, atol=1e-4)
+
+
 # ===========================================================================
 # streamline: memory-boundary -> on-chip stream fusion
 # ===========================================================================

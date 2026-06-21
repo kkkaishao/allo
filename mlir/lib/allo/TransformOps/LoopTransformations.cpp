@@ -1915,6 +1915,21 @@ static bool valueDependsOnTargetLoad(Value value, Value target,
       };
       depends = yieldedDependsOnTarget(ifOp.getThenBlock()) ||
                 yieldedDependsOnTarget(ifOp.getElseBlock());
+    } else if (auto forOp = dyn_cast<affine::AffineForOp>(result.getOwner())) {
+      // A loop-carried result (reduction via iter_args) depends on the target
+      // when the matching yielded value does. The yielded value lives in the
+      // loop body and is not reachable through the for-op's own operands, so
+      // trace it explicitly; also keep the operand walk for the init/bounds.
+      unsigned resultNumber = result.getResultNumber();
+      auto yieldOp =
+          dyn_cast<affine::AffineYieldOp>(forOp.getBody()->getTerminator());
+      depends =
+          (yieldOp && resultNumber < yieldOp.getNumOperands() &&
+           valueDependsOnTargetLoad(yieldOp.getOperand(resultNumber), target,
+                                    cache, visiting)) ||
+          llvm::any_of(forOp.getOperands(), [&](Value operand) {
+            return valueDependsOnTargetLoad(operand, target, cache, visiting);
+          });
     } else {
       depends =
           llvm::any_of(result.getOwner()->getOperands(), [&](Value operand) {
