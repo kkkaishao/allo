@@ -1,11 +1,15 @@
 # Vitis/Alveo U55C Environment
 
-**Default version:** Vitis 2022.1 (best Alveo U55C compatibility).
+**Default version:** Vitis 2023.2 (best Alveo U55C compatibility).
 **Always use Docker** for Vitis commands to avoid host library conflicts:
 ```bash
 cd /path/to/project && /path/to/docker/run-vitis.sh command
 ```
-Docker auto-configures Vitis 2022.1, XRT, and Alveo U55C. Platform files at `/opt/xilinx/platforms`.
+Docker auto-configures Vitis 2023.2, XRT, and Alveo U55C. Platform files at `/opt/xilinx/platforms`.
+
+Pull with `docker pull kkaish/vitis-runtime:2023.2` if the image is not locally available.
+
+See `docker/run-vitis.sh` for environment variable overrides.
 
 Direct host sourcing (non-Docker): `/tools/Xilinx/Vitis/{2022.1,2023.2,2024.2}/settings64.sh`.
 
@@ -21,7 +25,7 @@ Direct host sourcing (non-Docker): `/tools/Xilinx/Vitis/{2022.1,2023.2,2024.2}/s
 | `make run`    | run host + xclbin  - log at `emu_run.log`            |
 | `make clean`  | purge artifacts                                      |
 
-`TARGET`: defaults to `hw`. **Prefer `hw_emu`** unless explicitly requested — `hw` bitstream takes hours.
+`TARGET`: defaults to `hw_emu`. **Prefer `hw_emu`** unless explicitly requested — `hw` bitstream takes hours.
 
 # Typical Workflow
 
@@ -29,8 +33,12 @@ Direct host sourcing (non-Docker): `/tools/Xilinx/Vitis/{2022.1,2023.2,2024.2}/s
 # In Allo (Python)
 mod = s.export("vitis", device="u55c")
 # 1. configure axi interfaces, etc.
+mod.set_axi(0, bundle="gmem0", offset="slave") # configure m_axi for interface 0
+mod.set_axilite(1) # configure s_axilite for interface 1
 # 2. generate sample input with numpy for cosim (if cosim needed)
-mod.scaffold_project("/path/to/prj/", *samples)
+A = np.random.rand(16, 16).astype(np.float32)
+B = 1024 # scalar input is also supported
+mod.scaffold_project("/path/to/prj/", A, B)
 ```
 
 ```bash
