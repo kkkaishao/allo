@@ -7,6 +7,8 @@
 #include "mlir/Dialect/Affine/IR/AffineValueMap.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
+#include "mlir/IR/SymbolTable.h"
+#include "mlir/Interfaces/FunctionInterfaces.h"
 
 using namespace mlir;
 using namespace mlir::allo;
@@ -104,6 +106,45 @@ Value resolveMemRefValueRoot(Value value) {
     return value;
   }
   return value;
+}
+
+LogicalResult resolveBufferAttrCarrier(Value value, Operation *&owner,
+                                       std::optional<unsigned> &argNumber) {
+  owner = nullptr;
+  argNumber = std::nullopt;
+  if (!isa<MemRefType>(value.getType()))
+    return failure();
+
+  Value root = resolveMemRefValueRoot(value);
+  if (!isa<MemRefType>(root.getType()))
+    return failure();
+
+  if (auto arg = dyn_cast<BlockArgument>(root)) {
+    // Memref introduced as a block argument of a function-like op.
+    auto func = dyn_cast<FunctionOpInterface>(arg.getOwner()->getParentOp());
+    if (!func)
+      return failure();
+    owner = func;
+    argNumber = arg.getArgNumber();
+    return success();
+  }
+
+  // Memref introduced by an alloc-like op or a global.
+  Operation *defOp = root.getDefiningOp();
+  if (!defOp)
+    return failure();
+  if (auto getGlobal = dyn_cast<memref::GetGlobalOp>(defOp)) {
+    auto global = SymbolTable::lookupNearestSymbolFrom<memref::GlobalOp>(
+        getGlobal, getGlobal.getNameAttr());
+    if (!global)
+      return failure();
+    owner = global;
+    return success();
+  }
+  if (!isa<memref::AllocOp, memref::AllocaOp>(defOp))
+    return failure();
+  owner = defOp;
+  return success();
 }
 
 Value stripCast(Value value) {

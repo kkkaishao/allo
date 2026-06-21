@@ -35,6 +35,7 @@ MLIR_CAPI_EXPORTED constexpr const char *kPipelineIIAttr = "allo.pipeline.ii";
 MLIR_CAPI_EXPORTED constexpr const char *kDataflowAttr = "allo.dataflow";
 MLIR_CAPI_EXPORTED constexpr const char *kUnrollFactorAttr = "allo.unroll.f";
 MLIR_CAPI_EXPORTED constexpr const char *kPartitionAttr = "allo.part";
+MLIR_CAPI_EXPORTED constexpr const char *kBindStorageAttr = "allo.bind.storage";
 MLIR_CAPI_EXPORTED constexpr const char *kAlloSignedAttr =
     mlir::allo::kAlloSignedAttr.data();
 

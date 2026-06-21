@@ -32,6 +32,7 @@ from allo.lang.core import (
     Template,
 )
 from allo.lang.kernel import kernel
+from allo.schedule.errors import InvalidScheduleArgumentError
 from allo.backend.vitis.utils import is_vitis_available
 from allo.backend.vitis.csim import discover_csim
 from pathlib import Path
@@ -559,6 +560,54 @@ def test_codegen_partition_stateful_array():
         code,
         r"#pragma HLS array_partition variable=_allo_stateful_accbuf_st_l\d+c\d+ "
         r"dim=1 block factor=4",
+    )
+
+
+# `bind_storage` mirrors `partition`: it stamps an `allo.bind.storage` attribute
+# on a buffer's root carrier (function arg / local alloc / global), and the
+# emitter turns it into a `#pragma HLS bind_storage`.
+
+
+def test_codegen_bind_storage_local_buffer():
+    @kernel
+    def bufk(A: f32[16], C: f32[16]):
+        buf: f32[16] = 0.0
+        for i in arange(16, name="i0"):
+            buf[i] = A[i] * 2.0
+        for i in arange(16, name="i1"):
+            C[i] = buf[i]
+
+    s = bufk.schedule()
+    s.bind_storage(s.buffer("buf"), impl=s.URAM, mem_type=s.RAM_2P)
+    code = _hls(s)
+    _regex(code, r"#pragma HLS bind_storage variable=v\d+ type=ram_2p impl=uram")
+
+
+def test_codegen_bind_storage_argument():
+    @kernel
+    def vadd(A: f32[16], B: f32[16], C: f32[16]):
+        for i in arange(16, name="i"):
+            C[i] = A[i] + B[i]
+
+    s = vadd.schedule()
+    s.bind_storage(s.buffer("A"), impl=s.LUTRAM, mem_type=s.RAM_1P)
+    code = _hls(s)
+    _contains(code, "#pragma HLS bind_storage variable=v0 type=ram_1p impl=lutram")
+
+
+def test_codegen_bind_storage_global():
+    @kernel
+    def lut(idx: i32) -> i32:
+        table: i32[4] = [10, 20, 30, 40]
+        return table[idx]
+
+    s = lut.schedule()
+    s.bind_storage(s.buffer("table"), impl=s.BRAM, mem_type=s.ROM_1P)
+    code = _hls(s)
+    _regex(
+        code,
+        r"#pragma HLS bind_storage variable=_allo_const_lut_table_l\d+c\d+ "
+        r"type=rom_1p impl=bram",
     )
 
 

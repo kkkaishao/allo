@@ -172,57 +172,16 @@ transform::PartitionOp::apply(transform::TransformRewriter &rewriter,
   auto newPart = getPartition();
 
   for (Value value : state.getPayloadValues(getTarget())) {
-    auto memrefType = dyn_cast<MemRefType>(value.getType());
-    if (!memrefType)
-      return emitSilenceableError()
-             << "partition target value must be of memref type";
-
-    Value root = resolveMemRefValueRoot(value);
-    auto rootMemrefType = dyn_cast<MemRefType>(root.getType());
-    if (!rootMemrefType)
-      return emitSilenceableError()
-             << "cannot resolve allocation point for the memref value";
-
-    Attribute oldAttr;
     Operation *attrOwner = nullptr;
     std::optional<unsigned> argNumber;
+    if (failed(resolveBufferAttrCarrier(value, attrOwner, argNumber)))
+      return emitSilenceableError()
+             << "partition target must resolve to a valid memref value";
 
-    if (auto arg = dyn_cast<BlockArgument>(root)) {
-      // Case 1: memref introduced as a block argument of a function-like op
-      // (func.func or allo.kernel).
-      auto func = dyn_cast<FunctionOpInterface>(arg.getOwner()->getParentOp());
-      if (!func) {
-        return emitSilenceableError() << "partition target root block argument "
-                                         "must belong to a function-like op";
-      }
-      attrOwner = func;
-      argNumber = arg.getArgNumber();
-      oldAttr = func.getArgAttr(*argNumber, kPartitionAttr);
-    } else {
-      // Case 2: memref introduced by an alloc-like op.
-      Operation *defOp = root.getDefiningOp();
-      if (!defOp)
-        return emitSilenceableError()
-               << "cannot resolve partition root for value";
-
-      if (auto getGlobal = dyn_cast<memref::GetGlobalOp>(defOp)) {
-        auto global = SymbolTable::lookupNearestSymbolFrom<memref::GlobalOp>(
-            getGlobal, getGlobal.getNameAttr());
-        if (!global) {
-          return emitSilenceableError()
-                 << "failed to find memref.global @" << getGlobal.getName();
-        }
-        attrOwner = global;
-      } else {
-        if (!isa<memref::AllocOp, memref::AllocaOp>(defOp)) {
-          return emitSilenceableError()
-                 << "partition target root must resolve to memref.alloc, "
-                    "memref.alloca, memref.get_global, or function argument";
-        }
-        attrOwner = defOp;
-      }
-      oldAttr = attrOwner->getAttr(kPartitionAttr);
-    }
+    Attribute oldAttr = argNumber.has_value()
+                            ? cast<FunctionOpInterface>(attrOwner).getArgAttr(
+                                  *argNumber, kPartitionAttr)
+                            : attrOwner->getAttr(kPartitionAttr);
 
     if (oldAttr && !isa<PartitionAttr>(oldAttr)) {
       return emitSilenceableError()
@@ -248,6 +207,46 @@ transform::PartitionOp::apply(transform::TransformRewriter &rewriter,
 }
 
 void transform::PartitionOp::getEffects(
+    SmallVectorImpl<MemoryEffects::EffectInstance> &effects) {
+  transform::onlyReadsHandle(getTargetMutable(), effects);
+  transform::modifiesPayload(effects);
+}
+
+///===----------------------------------------------------------------------===//
+/// BindStorageOp implementation
+///===----------------------------------------------------------------------===//
+DiagnosedSilenceableFailure
+transform::BindStorageOp::apply(transform::TransformRewriter &rewriter,
+                                transform::TransformResults &results,
+                                transform::TransformState &state) {
+  MLIRContext *ctx = getContext();
+  // The Vivado HLS emitter reads `type`/`impl` back from this dictionary.
+  auto bindAttr = DictionaryAttr::get(
+      ctx, {NamedAttribute(StringAttr::get(ctx, "type"), getMemTypeAttr()),
+            NamedAttribute(StringAttr::get(ctx, "impl"), getImplAttr())});
+
+  for (Value value : state.getPayloadValues(getTarget())) {
+    Operation *attrOwner = nullptr;
+    std::optional<unsigned> argNumber;
+    if (failed(resolveBufferAttrCarrier(value, attrOwner, argNumber)))
+      return emitSilenceableError()
+             << "bind_storage target must resolve to a valid memref value";
+
+    if (argNumber.has_value()) {
+      auto kernel = cast<FunctionOpInterface>(attrOwner);
+      rewriter.modifyOpInPlace(kernel, [&]() {
+        kernel.setArgAttr(*argNumber, kBindStorageAttr, bindAttr);
+      });
+    } else {
+      rewriter.modifyOpInPlace(
+          attrOwner, [&]() { attrOwner->setAttr(kBindStorageAttr, bindAttr); });
+    }
+  }
+
+  return DiagnosedSilenceableFailure::success();
+}
+
+void transform::BindStorageOp::getEffects(
     SmallVectorImpl<MemoryEffects::EffectInstance> &effects) {
   transform::onlyReadsHandle(getTargetMutable(), effects);
   transform::modifiesPayload(effects);

@@ -12,11 +12,20 @@
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/PatternMatch.h"
 
+#include <optional>
+
 namespace mlir::allo {
 bool affineExprUsesValue(AffineExpr expr, ValueRange mapOperands,
                          unsigned numDims, Value needle);
 int findMemRefAxisFromIVs(affine::AffineStoreOp storeOp, Value iv);
 Value resolveMemRefValueRoot(Value value);
+// Resolve `value` to the operation (and, for a function argument, its index)
+// that should carry a per-buffer HLS attribute (array_partition /
+// bind_storage). Follows view-like aliases to the root buffer, then dispatches
+// to its defining function argument, memref.alloc/alloca, or memref.global.
+// Returns failure if `value` is not a memref or its root is none of these.
+LogicalResult resolveBufferAttrCarrier(Value value, Operation *&owner,
+                                       std::optional<unsigned> &argNumber);
 // strip away index casts, extension/truncation ops,
 // which do not affect the value as an affine expression
 Value stripCast(Value value);

@@ -265,10 +265,15 @@ void VivadoHLSEmitter::emitFunctionDirectives(func::FuncOp func) {
   // global's pragma once, in the top function.
   if (isTopFunc(func)) {
     for (auto global :
-         func->getParentOfType<ModuleOp>().getOps<memref::GlobalOp>())
+         func->getParentOfType<ModuleOp>().getOps<memref::GlobalOp>()) {
+      auto varName = getSymbolName(global.getSymName());
       if (auto partAttr =
               global->getAttrOfType<allo::PartitionAttr>(kPartitionAttr))
-        emitPartitionPragma(partAttr, getSymbolName(global.getSymName()));
+        emitPartitionPragma(partAttr, varName);
+      if (auto bindAttr =
+              global->getAttrOfType<DictionaryAttr>(kBindStorageAttr))
+        emitBindStoragePragma(bindAttr, varName);
+    }
   }
 
   auto argAttrs = func.getArgAttrs();
@@ -277,14 +282,15 @@ void VivadoHLSEmitter::emitFunctionDirectives(func::FuncOp func) {
     return;
   }
 
-  // emit partition directives for arguments
+  // emit partition / bind_storage directives for arguments
   for (auto [arg, attr] : llvm::zip(func.getArguments(), *argAttrs)) {
     auto dict = cast<DictionaryAttr>(attr);
-    auto partOr = dict.getNamed(kPartitionAttr);
-    if (!partOr)
-      continue;
-    auto partAttr = cast<allo::PartitionAttr>(partOr->getValue());
-    emitPartitionPragma(partAttr, state.getName(arg));
+    if (auto partOr = dict.getNamed(kPartitionAttr))
+      emitPartitionPragma(cast<allo::PartitionAttr>(partOr->getValue()),
+                          state.getName(arg));
+    if (auto bindOr = dict.getNamed(kBindStorageAttr))
+      emitBindStoragePragma(cast<DictionaryAttr>(bindOr->getValue()),
+                            state.getName(arg));
   }
   state.os << "\n";
 }
@@ -333,6 +339,15 @@ void VivadoHLSEmitter::emitPartitionPragma(allo::PartitionAttr attr,
     }
     state.os << "\n";
   }
+}
+
+void VivadoHLSEmitter::emitBindStoragePragma(DictionaryAttr attr,
+                                             llvm::StringRef varName) {
+  auto memType = cast<StringAttr>(attr.get("type")).getValue();
+  auto impl = cast<StringAttr>(attr.get("impl")).getValue();
+  state.os.indent(state.currentIndent);
+  state.os << "#pragma HLS bind_storage variable=" << varName
+           << " type=" << memType << " impl=" << impl << "\n";
 }
 
 void VivadoHLSEmitter::emitAffineFor(affine::AffineForOp op) {
@@ -761,6 +776,12 @@ void VivadoHLSEmitter::emitMemrefAlloc(memref::AllocOp op) {
   if (auto partAttr = op->getAttrOfType<allo::PartitionAttr>(kPartitionAttr)) {
     os << "\n";
     emitPartitionPragma(partAttr, state.getName(op.getResult()));
+  }
+  // A local on-chip buffer may also carry an `allo.bind.storage` attribute from
+  // a scheduled bind_storage (e.g. force a reuse buffer onto URAM).
+  if (auto bindAttr = op->getAttrOfType<DictionaryAttr>(kBindStorageAttr)) {
+    os << "\n";
+    emitBindStoragePragma(bindAttr, state.getName(op.getResult()));
   }
 }
 

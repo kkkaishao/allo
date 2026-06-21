@@ -74,6 +74,7 @@ private:
   void emitFunctionDirectives(func::FuncOp func);
   void emitTrailingLocation(Operation *op);
   void emitPartitionPragma(allo::PartitionAttr attr, llvm::StringRef varName);
+  void emitBindStoragePragma(DictionaryAttr attr, llvm::StringRef varName);
   bool isTopFunc(func::FuncOp func);
   void emitLoopDirectives(Operation *op);
   void emitArraySuffix(ArrayRef<int64_t> shape, Location loc);

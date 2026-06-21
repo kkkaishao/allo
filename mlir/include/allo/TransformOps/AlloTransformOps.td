@@ -430,10 +430,35 @@ def Allo_PartitionOp : Op<Transform_Dialect, "allo.partition", [
     Behavior:
       - Attach the given partitioning attribute to the target value
   }];
-  let arguments = (ins TransformValueHandleTypeInterface:$target, Partition:$partition);
+  let arguments = (ins TransformValueHandleTypeInterface:$target, PartitionAttr:$partition);
   let results = (outs);
   let assemblyFormat = [{
     $target `with` $partition attr-dict `:` type($target)
+  }];
+}
+
+def Allo_BindStorageOp : Op<Transform_Dialect, "allo.bind_storage", [
+  DeclareOpInterfaceMethods<MemoryEffectsOpInterface>,
+  DeclareOpInterfaceMethods<TransformOpInterface>,
+  ReportTrackingListenerFailuresOpTrait]> {
+  let summary = "Bind the given array to a specific memory resource";
+  let description = [{
+    Input:
+      - `$target` must resolve to exactly one memref value, or one op with a
+        single memref result.
+      - `$mem_type` is the Vitis storage type (e.g. `RAM_2P`, `ROM_1P`).
+      - `$impl` is the storage implementation (e.g. `BRAM`, `URAM`, `LUTRAM`).
+
+    Behavior:
+      - Attach an `allo.bind.storage` dictionary attribute (`type`/`impl`) to the
+        target buffer's root carrier (function argument, alloc, or global). The
+        Vivado HLS emitter turns it into `#pragma HLS bind_storage`.
+  }];
+  let arguments = (ins TransformValueHandleTypeInterface:$target,
+                       StrAttr:$mem_type, StrAttr:$impl);
+  let results = (outs);
+  let assemblyFormat = [{
+    $target `type` $mem_type `impl` $impl attr-dict `:` type($target)
   }];
 }
 

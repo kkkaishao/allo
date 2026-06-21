@@ -26,6 +26,22 @@ class Schedule(Generic[P, R]):
     Block: int
     Cyclic: int
 
+    # bind_storage enums
+    BRAM = ...
+    LUTRAM = ...
+    URAM = ...
+    SRL = ...
+
+    RAM_1P = ...
+    RAM_1WNR = ...
+    RAM_2P = ...
+    RAM_S2P = ...
+    RAM_T2P = ...
+    ROM_1P = ...
+    ROM_2P = ...
+    ROM_NP = ...
+    FIFO = ...
+
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         """Build a schedule over a kernel or MLIR ``module`` (usually obtained
         from ``Kernel.schedule()``). An optional ``primary`` selects which
@@ -122,6 +138,20 @@ class Schedule(Generic[P, R]):
         ``kind`` is ``Complete``/``Block``/``Cyclic``; ``dim`` selects the
         dimension (0 = all dims); ``factor`` is the block/cyclic factor (must stay
         0 for ``Complete``)."""
+
+    def bind_storage(
+        self,
+        targets: Iterable[Ref | str] | Ref | str,
+        *,
+        impl,
+        mem_type,
+    ) -> Schedule[P, R]:
+        """Bind the target buffers to a memory resource
+        (``transform.allo.bind_storage`` -> ``#pragma HLS bind_storage``).
+        ``impl`` is the resource (``s.BRAM``/``s.URAM``/``s.LUTRAM``/...) and
+        ``mem_type`` the port configuration (``s.RAM_2P``/``s.ROM_1P``/...).
+
+        Vitis-only scheduling primitive; other backends ignore it."""
 
     def streamline(
         self,

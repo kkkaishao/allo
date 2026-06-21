@@ -6,6 +6,7 @@ from __future__ import annotations
 import functools
 from collections.abc import Iterable, Sequence
 from typing import Literal, Generic, TypeVar, ParamSpec
+from enum import Enum
 
 from ..lang.kernel import Kernel
 from .errors import (
@@ -65,6 +66,25 @@ P = ParamSpec("P")
 R = TypeVar("R")
 
 
+class BindStorageImpl(Enum):
+    BRAM = "bram"
+    LUTRAM = "lutram"
+    URAM = "uram"
+    SRL = "srl"
+
+
+class BindStorageType(Enum):
+    RAM_1P = "ram_1p"
+    RAM_1WNR = "ram_1wnr"
+    RAM_2P = "ram_2p"
+    RAM_S2P = "ram_s2p"
+    RAM_T2P = "ram_t2p"
+    ROM_1P = "rom_1p"
+    ROM_2P = "rom_2p"
+    ROM_NP = "rom_np"
+    FIFO = "fifo"
+
+
 class Schedule(Generic[P, R]):
     """Lazy schedule frontend: primitives accumulate a reusable transform program
     (``@sched(%root)``) and a predicted snapshot; ``apply()`` runs the program once.
@@ -74,9 +94,26 @@ class Schedule(Generic[P, R]):
     the predicted snapshot.
     """
 
+    # --- partition enums ---
     Complete = 0
     Block = 1
     Cyclic = 2
+
+    # --- bind_storage enums ---
+    BRAM = BindStorageImpl.BRAM
+    LUTRAM = BindStorageImpl.LUTRAM
+    URAM = BindStorageImpl.URAM
+    SRL = BindStorageImpl.SRL
+
+    RAM_1P = BindStorageType.RAM_1P
+    RAM_1WNR = BindStorageType.RAM_1WNR
+    RAM_2P = BindStorageType.RAM_2P
+    RAM_S2P = BindStorageType.RAM_S2P
+    RAM_T2P = BindStorageType.RAM_T2P
+    ROM_1P = BindStorageType.ROM_1P
+    ROM_2P = BindStorageType.ROM_2P
+    ROM_NP = BindStorageType.ROM_NP
+    FIFO = BindStorageType.FIFO
 
     def __init__(
         self,
@@ -413,6 +450,30 @@ class Schedule(Generic[P, R]):
         for buf in buffers:
             handle = self.script.match_value(buf.owner_key, buf.number, buf.source)
             ta.PartitionOp(handle, part, **self.script.kw)
+        self._mark_dirty()
+        return self
+
+    @_within_context
+    def bind_storage(
+        self,
+        targets: Targets,
+        *,
+        impl: BindStorageImpl,
+        mem_type: BindStorageType,
+    ) -> Schedule:
+        if not isinstance(impl, BindStorageImpl):
+            raise InvalidScheduleArgumentError(
+                f"bind_storage impl must be one of {', '.join(e.name for e in BindStorageImpl)}, "
+            )
+        if not isinstance(mem_type, BindStorageType):
+            raise InvalidScheduleArgumentError(
+                f"bind_storage mem_type must be one of {', '.join(e.name for e in BindStorageType)}, "
+            )
+        buffers = self._resolve_buffer_targets(targets, "bind_storage")
+        self.script.set_callsite_loc()
+        for buf in buffers:
+            handle = self.script.match_value(buf.owner_key, buf.number, buf.source)
+            ta.BindStorageOp(handle, mem_type.value, impl.value, **self.script.kw)
         self._mark_dirty()
         return self
 
