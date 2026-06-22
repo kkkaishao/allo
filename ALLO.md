@@ -1,3 +1,6 @@
+<!--- Copyright Allo authors. All Rights Reserved. -->
+<!--- SPDX-License-Identifier: Apache-2.0  -->
+
 # Allo DSL Reference
 
 A concise usage reference for writing **Allo** kernels and schedules. Allo is a
@@ -210,7 +213,7 @@ else:
 - **Typing style** (default `"hls"`): set via
   `@kernel(options=KernelOptions(typing_style="cpp"))`.
   - `hls`: hardware bit-growth — integer `+ - *` widen to preserve full
-    intermediate precision and lower as balanced trees (e.g. `i32 + i32 -> i33`,
+    intermediate precision and lower as **balanced trees** (e.g. `i32 + i32 -> i33`,
     `i32 * i32 -> i64`).
   - `cpp`: C++-style pairwise promotion to a common type (e.g. `i32 + i32 -> i32`).
   - See `docs/typing_rules.md` for full tables. Widen explicitly before
@@ -284,13 +287,14 @@ out[0] = arr[0, 1].get()
 blk: Stream[i32[4, 4]]           # block payload: transfers a whole 4x4 buffer
 ```
 
-- Streams are **declaration-only**: no initializer, **cannot** be top-level kernel
-  params or return values. They are passed **explicitly to nested kernels** to
-  connect stages.
+- Streams are **declaration-only**: no initializer, **cannot** be return values.
+  They are passed **explicitly to nested kernels** to connect stages.
 - A stream array must be indexed with exactly one scalar index per dimension
   before `get()`/`put()`. Stream refs are not assignable.
 - Vitis emission: scalar payload → `hls::stream<T>`; shaped payload →
-  `hls::stream_of_blocks<T[...], depth>`.
+  scalarized to `hls::stream<T>`
+- Allo cannot auto generate testbench/host code if the top-level kernel has stream args,
+  but the kernel code is still valid.
 
 ```python
 @kernel
@@ -432,16 +436,20 @@ returns a `RefSelection` with `.one()` / `.first()` / `.all()` / `.names(*names)
 
 ### Tagging primitives (deferred — chain then `.apply()`)
 
-| Primitive                                         | Effect                                                         |
-| ------------------------------------------------- | -------------------------------------------------------------- |
-| `s.pipeline(targets=None, *, ii=1)`               | Pipeline a loop with initiation interval `ii`.                 |
-| `s.dataflow(targets=None)`                        | `#pragma HLS dataflow` — run top-level stmts concurrently.     |
-| `s.unroll(targets, *, factor=0, tag_only=False)`  | Unroll (`factor=0` = full). Physical unroll unless `tag_only`. |
-| `s.partition(targets, *, dim=0, kind=, factor=0)` | Bank a buffer. `kind` ∈ `s.Complete`/`s.Block`/`s.Cyclic`.     |
-| `s.cse/dce/licm/canonicalize(targets=None)`       | Generic MLIR cleanup passes.                                   |
+| Primitive                                                    | Effect                                                          |
+| ------------------------------------------------------------ | --------------------------------------------------------------- |
+| `s.pipeline(targets=None, *, ii=1)`                          | Pipeline a loop with initiation interval `ii`.                  |
+| `s.dataflow(targets=None)`                                   | `#pragma HLS dataflow` — run top-level stmts concurrently.      |
+| `s.unroll(targets, *, factor=0, tag_only=False)`             | Unroll (`factor=0` = full). Physical unroll unless `tag_only`.  |
+| `s.partition(targets, *, dim=0, kind=, factor=0)`            | Bank a buffer. `kind` ∈ `s.Complete`/`s.Block`/`s.Cyclic`.      |
+| `s.bind_storage(targets, *, impl=s.BRAM, mem_type=s.RAM_2P)` | `#pragma HLS bind_storage` — pin a buffer to a memory resource. |
+| `s.cse/dce/licm/canonicalize(targets=None)`                  | Generic MLIR cleanup passes.                                    |
 
 `partition`: `dim=0` = all dims; `s.Complete` needs `factor=0`, `s.Block`/`s.Cyclic`
 need `factor>0`.
+
+`bind_storage`: `impl` ∈ `s.BRAM`/`s.URAM`/`s.LUTRAM`/`s.SRL`/`s.AUTO`/…; `mem_type` ∈
+`s.RAM_1P`/`s.RAM_2P`/`s.RAM_S2P`/`s.RAM_T2P`/`s.ROM_*`/…. Vitis-only hint (CPU ignores it).
 
 ### Structural primitives (apply immediately; return live refs — old refs go stale)
 
@@ -494,12 +502,13 @@ s.dataflow()                                     # run stages concurrently
 ### Apply & export
 
 ```python
-s.apply()                       # alias materialize(); runs queued tagging script
+s.apply() # mannually apply pending tags; auto-applied by export
 code   = s.export("vitis").hls_code
 report = s.export("vitis", part=PART, project_path=proj).synth()
 s.export("cpu")(A, B, C)        # functional run
 ```
 
+- **`s.export()` will mutate the original module in `Kernel`**.
 - Reading `s.payload` / `s.snapshot` while `dirty` auto-applies pending tags.
 - `s.export(backend, **kwargs)` (`"cpu"`/`"vitis"`) applies transforms, binds the
   module back to the kernel, returns a backend object. Schedules built from a raw
@@ -509,7 +518,7 @@ s.export("cpu")(A, B, C)        # functional run
 
 ---
 
-## 16. Simulation & running
+## 16. Simulation & Building
 
 An Allo kernel is a callable. A **direct call runs the CPU backend** with default
 options; mixing NumPy and kernel calls is free.
@@ -526,17 +535,31 @@ backend = s.export("cpu", opt_level=3)      # or default opt_level=2
 backend(A, B, C)                            # == backend.run(A, B, C)
 ```
 
+**CPU backend may deadlock**. Its functionality is not fully verified; it serves
+as a convenient reference for expected behavior when Vitis is not available.
+**Use Vitis C-simulation for reliable CPU validation** (no need to build an full project).
+
+
 ### Vitis backend (HLS codegen / csim / synth / emu)
 
 ```python
-b = s.export("vitis", part="xcvu9p-flga2104-2-i")
-code = b.hls_code        # generated C++ string, no toolchain needed
-b(A, B, C)               # csim (Python-native): == b.csim(A, B, C)
-b.synth()                # C-to-RTL synthesis
+mod = s.export("vitis", device="u55c") # or specify part="..."
+ret = mod(A, B, C)              # csim (Python-native): == mod.csim(A, B, C)
+rpt = mod.synth()         # C-to-RTL synthesis;
+
 # generate sample input for emulation
 A = np.arange(N, dtype=np.float32); B = np.arange(N, dtype=np.float32)
-# scaffold the project
-b.scaffold_project("/path/to/proj", A, B) # A, B will be packed into binary files
+C = 1024 # a scalar input (e.g. a control flag) is also accepted
+
+# set top-level interfaces
+mod.set_axi(0, bundle="gmem0")
+mod.set_axi(1, bundle="gmem1")
+mod.set_axilite(2)
+mod.set_axilite(-1) # return
+
+# generate Vitis project
+mod.scaffold_project("/path/to/proj", A, B, C) # A, B, C packed into binary files
+# then go to shell to run emulation/implementation
 ```
 
 ```bash
@@ -546,7 +569,7 @@ make target
 
 - See [ENVIRONMENT.md](ENVIRONMENT.md) for available make targets and env setup.
 - Prefer to do C-simulation with Python API (convenient enough),
-  but run cosimulation and hardware in shell with `make`.
+  but run cosimulation and hardware implementation in shell with `make`.
 - Target by `part="<full-part>"` **or** `device="<shorthand>"` (e.g. `pynqz2`,
   `u280`, `zcu102`) — not both. Constructor knobs: `freq_mhz=300.0`,
   `flow="vitis"|"vivado"`.
@@ -555,8 +578,58 @@ make target
 - Interface pragmas: `b.set_axi(idx, ...)` (m_axi buffer), `b.set_axis(idx, ...)`
   (axis stream), `b.set_axilite(idx, ...)` (`-1` = return value).
 - All run/csim/synth accept `exist_ok=True` (default; `False` forces rebuild).
-- Set `ALLO_VITIS_ENABLE_APFLOAT=1` to force enable `ap_float` support
-  (legacy Vitis versions before 2022.2 (inclusive) don't support that).
+
+#### Synthesis report parsing
+
+Synthesis and report inspection are **decoupled**: synthesize once, then parse
+`mod.synth_report` (the path to `csynth.xml`) as often as you like — no re-synth.
+
+```python
+from allo.backend.vitis import parse_report
+
+mod = s.export("vitis", device="u280", project_path="prj")
+mod.scaffold_project()              # writes prj/ (or pass mod.synth() to build)
+
+if sys.argv[1] == "synth":
+    mod.synth()                     # slow: invokes Vitis HLS once
+elif sys.argv[1] == "report":
+    r = parse_report(mod.synth_report)   # fast: just parses the XML
+    print(r)                      # readable overall + per-module summary
+```
+
+`parse_report(path)` accepts the `csynth.xml` file or its directory and returns
+a `SynthReport`. **Fixed-schema fields use attribute access** (typed,
+discoverable); **open-ended collections are a dict / list**:
+
+```python
+r.version                  # Vitis tool version, e.g. "2023.2"
+r.part                     # FPGA part number; r.product_family, r.top
+r.fmax                     # achievable clock (MHz) = 1000 / estimated period
+r.timing.estimated_clock_ns, r.timing.target_clock_ns
+r.latency.worst_cycles     # total cycles (None if data-dependent / "undef")
+r.latency.worst_time       # equivalent wall-clock time, e.g. "61.730 us"
+r.latency.interval_min     # initiation interval (II); .pipeline_type, ...
+r.resources.lut            # whole-design usage: .lut/.ff/.dsp/.bram/.uram
+r.available.lut            # device capacity (same fields)
+r.utilization["lut"]       # % of device per resource
+
+for itf in r.interfaces:   # grouped per bundle (m_axi/s_axi/axis/ap_ctrl)
+    itf.name, itf.protocol, itf.data_bits
+
+m = r.modules["top"]       # per-module breakdown (incl. the top module)
+m.resources.dsp, m.latency.pipeline_ii, m.timing.fmax_mhz
+```
+
+`BRAM` counts are in 18K-block units (matching the report). Loop-level detail is
+not parsed — module granularity only.
+
+#### Vitis-specific environment variables
+- `XILINX_VITIS` points to the Vitis install path;
+  no need to source the full Vitis setup scripts before running Allo code.
+- `VIVADO_IMPL_JOBS` (default `4`) controls parallelism in the Vivado implementation
+- `ALLO_VITIS_ENABLE_APFLOAT=1` (default "0") to force `ap_float` Vitis codegen support;
+  `ap_float` is required for `bf16/tf32` support but needs Vitis 2023.1+ (inclusive) to build.
+  If unset, Allo auto-detects Vitis version and enables `ap_float` when supported.
 
 ### Calling convention
 
@@ -593,18 +666,13 @@ def _make(Tin, Tacc, Tout, S, D, L=16, ...):
 
 class RMSNorm(Module):
     def __init__(self, Tin, Tacc, Tout, S, D, L=16, ...):
-        # validate args with assert/raise, build a stable name
+        # validate args with raise, build a stable name
         top, s = _make(Tin, Tacc, Tout, S, D, L, ...)
         super().__init__(f"RMSNorm_S{S}_D{D}_L{L}", top, s)
 ```
 
 `Module(name, module, schedule)` exposes `.module` (the `Kernel`), `.schedule`,
-and is itself callable (`__call__` forwards to the kernel). See
-`allo/library/transformer/{rms,softmax,ffn,fused}.py` for kernel-level idioms:
-read a row-block on-chip once, interleave `SB` rows to hide float-reduction
-recurrences, unroll inner lanes into adder/max trees, and `flatten`+`pipeline` the
-outer nest. Compose multi-stage accelerators with `compose` + `streamline` +
-`dataflow` (see `fused.py`).
+and is itself callable (`__call__` forwards to the kernel).
 
 ---
 

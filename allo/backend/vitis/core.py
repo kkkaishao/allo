@@ -96,7 +96,7 @@ PART_NUMBERS = {
 # default to pynq-z2
 DEFAULT_PART = "xc7z020clg400-1"
 
-SYNTH_REPORT_DIR = Path("hls_prj") / "hls" / "syn" / "report"
+SYNTH_REPORT_PATH = Path("hls_prj") / "hls" / "syn" / "report" / "csynth.xml"
 
 
 @dataclass(frozen=True)
@@ -203,6 +203,13 @@ class Vitis(Backend, Generic[P, R]):
     def hls_code(self) -> str:
         artifacts = self._ensure_compiled()
         return artifacts.kernel_cpp
+
+    @property
+    def synth_report(self) -> Path:
+        if self._project_path is None:
+            raise ValueError("Project path is not set; cannot locate synthesis report")
+        report_path = self._project_path / SYNTH_REPORT_PATH
+        return report_path
 
     @terminate_on_error
     def __call__(self, *args: P.args, **kwargs: P.kwargs) -> R:
@@ -385,8 +392,8 @@ class Vitis(Backend, Generic[P, R]):
         return simulator.run(*args, exist_ok=exist_ok)
 
     @terminate_on_error
-    def synth(self, *, exist_ok: bool = True) -> Path:
-        """Generate an HLS csyn project and invoke Vitis HLS. Return the synthesis report path."""
+    def synth(self, *, exist_ok: bool = True):
+        """Generate an HLS csyn project and invoke Vitis HLS"""
         if not self.part:
             raise ValueError(
                 "Vitis synthesis requires a part number; pass part=... (or "
@@ -395,7 +402,6 @@ class Vitis(Backend, Generic[P, R]):
         self._require_vitis_tool()
         project_path = self.scaffold_project(exist_ok=exist_ok)
         self._invoke_csyn(project_path)
-        return project_path / SYNTH_REPORT_DIR
 
     @terminate_on_error
     def precheck(

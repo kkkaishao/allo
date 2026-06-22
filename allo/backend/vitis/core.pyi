@@ -33,6 +33,13 @@ class Vitis(Generic[P, R]):
     def hls_code(self) -> str:
         """The emitted Vitis HLS C++ source for the top kernel."""
 
+    @property
+    def synth_report(self) -> Path:
+        """Path to the Vitis HLS C-synthesis report (``csynth.xml``) for the
+        configured project. Pass it to ``allo.backend.vitis.parse_report`` to
+        inspect synthesis results without re-synthesizing. Requires a project
+        path (set via ``project_path=`` or a prior ``scaffold_project``)."""
+
     def run(self, mode: VitisMode, *args: Any, exist_ok: bool = ...) -> Any:
         """Build and/or run the kernel in the requested ``mode``:
 
@@ -45,9 +52,8 @@ class Vitis(Generic[P, R]):
         ``exist_ok=False`` rebuilds even when cached artifacts exist.
         """
 
-    def synth(self, *, exist_ok: bool = ...) -> Path:
-        """Scaffold an HLS project, invoke Vitis HLS C synthesis, and return the
-        synthesis report directory. Requires a part number."""
+    def synth(self, *, exist_ok: bool = ...):
+        """Scaffold an HLS project, invoke Vitis HLS C synthesis. Requires a part number."""
 
     def precheck(
         self, mode: VitisMode, project: str | None = ..., *, exist_ok: bool = ...
