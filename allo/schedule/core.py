@@ -437,10 +437,10 @@ class Schedule(Generic[P, R]):
                 raise InvalidScheduleArgumentError(
                     "complete partition cannot have non-zero factor"
                 )
-        elif factor <= 0:
+        elif factor <= 1:
             raise InvalidScheduleArgumentError(
                 f"{self._partition_kind_name(kind)} partition factor must be "
-                f"positive, got {factor}"
+                f"greater than 1, got {factor}"
             )
 
         buffers = self._resolve_buffer_targets(targets, "partition")
