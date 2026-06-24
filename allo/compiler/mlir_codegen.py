@@ -2123,8 +2123,8 @@ class MLIRCodeGenerator(ast.NodeVisitor):
 
             # visit condition
             cond = self.visit(node.test)
+            cond = self.builder.cast(cond, AlloBool)
             self.builder.set_insertion_point_to_end(before_block)
-            assert isinstance(cond, AlloValue)
             # create cond
             ConditionOp(
                 cond.handle, block_args, ip=self.builder._ip, loc=self.builder._loc
