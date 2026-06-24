@@ -1098,3 +1098,14 @@ def cast(x, dst_type):
 def _(builder: AlloOpBuilder, x: AlloValue | ConstexprValue, dst_type: TypeBase):
     assert isinstance(dst_type, TypeBase)
     return builder.cast(x, dst_type)
+
+
+@operator
+def bitcast(x, dst_type):
+    operator_body_unreachable()
+
+
+@bitcast.build
+def _(builder: AlloOpBuilder, x: AlloValue, dst_type: TypeBase):
+    assert isinstance(dst_type, DType), "bitcast destination must be a dtype"
+    return builder.bitcast(x, dst_type)

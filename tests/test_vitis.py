@@ -32,6 +32,7 @@ from allo.lang.core import (
     Template,
 )
 from allo.lang.kernel import kernel
+from allo.operators.arith import bitcast as allo_bitcast
 from allo.schedule.errors import InvalidScheduleArgumentError
 from allo.backend.vitis.utils import is_vitis_available
 from allo.backend.vitis.csim import discover_csim
@@ -254,6 +255,19 @@ def test_csim_signed_max():
     with tempfile.TemporaryDirectory() as project:
         clamp.schedule().export("vitis", project_path=project)(-5, out)
     assert int(out[0]) == 0
+
+
+def test_codegen_bitcast():
+    @kernel
+    def reinterpret(x: f32, out: u32[1]):
+        out[0] = allo_bitcast(x, u32)
+
+    code = _hls(reinterpret.schedule())
+    _contains(
+        code,
+        "template <typename To, typename From> inline To allo_bitcast",
+        "allo_bitcast<uint32_t, float>(",
+    )
 
 
 def test_codegen_while_loop():
@@ -509,6 +523,25 @@ def test_csim_vadd():
         backend = s.export("vitis", project_path=project)
         backend(a, b, c)
     np.testing.assert_allclose(c, a + b, rtol=1e-5)
+
+
+@requires_vitis
+def test_csim_bitcast():
+    # Reinterpret bits between float and int in both directions; bitcast copies
+    # the bit pattern verbatim rather than performing a numeric conversion.
+    @kernel
+    def reinterpret(x: f32, bits_out: u32[1], raw: u32, val_out: f32[1]):
+        bits_out[0] = allo_bitcast(x, u32)
+        val_out[0] = allo_bitcast(raw, f32)
+
+    bits_out = np.zeros(1, dtype=np.uint32)
+    val_out = np.zeros(1, dtype=np.float32)
+    raw = np.uint32(0x40490FDB)  # IEEE-754 bits of 3.14159265f
+    with tempfile.TemporaryDirectory() as project:
+        backend = reinterpret.schedule().export("vitis", project_path=project)
+        backend(np.float32(1.0), bits_out, raw, val_out)
+    assert int(bits_out[0]) == 0x3F800000  # IEEE-754 bits of 1.0f
+    assert val_out[0].view(np.uint32) == raw
 
 
 @requires_vitis

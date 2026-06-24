@@ -95,6 +95,7 @@ private:
                           bool isSigned);
   void emitUnaryOp(Operation *op, llvm::StringLiteral keyword);
   void emitCastOp(Operation *op);
+  void emitBitcastOp(arith::BitcastOp op);
   void emitIntExtOp(Operation *op, bool isSigned);
   void emitFPToIntOp(Operation *op, bool isSigned);
   void emitIntToFPOp(Operation *op, bool isSigned);

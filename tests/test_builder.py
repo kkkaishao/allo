@@ -21,7 +21,7 @@ from allo.lang.core import (
     u32,
 )
 from allo.lang.kernel import KernelOptions, consteval, kernel
-from allo.operators.arith import max as allo_max
+from allo.operators.arith import bitcast as allo_bitcast, max as allo_max
 
 _GLOBAL_SHAPE_M = 2
 _GLOBAL_SHAPE_N = 3
@@ -146,6 +146,43 @@ def test_float_add():
 
     ir = _compile_ir(top)
     _assert_contains(ir, "arith.addf")
+
+
+def test_scalar_bitcast_float_to_int():
+    @kernel
+    def top(x: f32, out: i32[1]):
+        out[0] = allo_bitcast(x, i32)
+
+    ir = _compile_ir(top)
+    _assert_contains(ir, "arith.bitcast", "f32 to i32")
+
+
+def test_scalar_bitcast_int_to_float():
+    @kernel
+    def top(x: u32, out: f32[1]):
+        out[0] = allo_bitcast(x, f32)
+
+    ir = _compile_ir(top)
+    _assert_contains(ir, "arith.bitcast", "i32 to f32")
+
+
+def test_bitcast_roundtrip_folds_to_identity():
+    @kernel
+    def top(x: f32, out: f32[1]):
+        bits: i32 = allo_bitcast(x, i32)
+        out[0] = allo_bitcast(bits, f32)
+
+    # bitcast(bitcast(x)) is the identity, so canonicalization removes both.
+    ir = _compile_ir(top)
+    assert "arith.bitcast" not in ir
+
+
+def test_bitcast_width_mismatch_error():
+    @kernel
+    def top(x: f32, out: u8[1]):
+        out[0] = allo_bitcast(x, u8)
+
+    _assert_compile_error(top, "Cannot bitcast", "bit widths 32 and 8 differ")
 
 
 def test_unary_neg():

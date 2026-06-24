@@ -1030,6 +1030,18 @@ void VivadoHLSEmitter::emitIntToFPOp(Operation *op, bool isSigned) {
   os << ");";
 }
 
+// arith.bitcast: reinterpret the operand's bits as the result type without
+// numeric conversion. Routed through the `allo_bitcast` union helper rather
+// than a static_cast, which would round/convert instead of copying the bits.
+void VivadoHLSEmitter::emitBitcastOp(arith::BitcastOp op) {
+  llvm::raw_ostream &os = state.os;
+  emitValueDecl(op.getResult());
+  os << " = allo_bitcast<" << getPrimitiveTypeName(op.getResult().getType())
+     << ", " << getPrimitiveTypeName(op.getOperand().getType()) << ">(";
+  emitValueRef(op.getOperand());
+  os << ");";
+}
+
 // Native C++ scalar types have constexpr constructors; ap_int/ap_fixed/half do
 // not, so their constants must be `const` rather than `constexpr`.
 static bool hasConstexprCtor(Type t) {
@@ -1226,6 +1238,8 @@ void VivadoHLSEmitter::dispatch(Operation *op) {
       // sign-agnostic: float resize and integer truncation keep low bits.
       .Case<arith::ExtFOp, arith::TruncIOp, arith::TruncFOp>(
           [&](auto op) { emitCastOp(op); })
+      // bit-reinterpret between equal-width int/float types.
+      .Case<arith::BitcastOp>([&](auto op) { emitBitcastOp(op); })
 
       // special ops
       .Case<affine::AffineForOp>([&](auto op) { emitAffineFor(op); })
@@ -1446,6 +1460,16 @@ constexpr llvm::StringLiteral deviceHeader = R"XXX(
 #include <hls_stream.h>
 #include <math.h>
 #include <stdint.h>
+
+template <typename To, typename From> inline To allo_bitcast(From src) {
+#pragma HLS inline
+  union {
+    From from;
+    To to;
+  } u;
+  u.from = src;
+  return u.to;
+}
 )XXX";
 
 void VivadoHLSEmitter::emitModule(ModuleOp mod) {

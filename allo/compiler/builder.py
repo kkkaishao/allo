@@ -342,6 +342,16 @@ class AlloOpBuilder:
             return arith.FPToSIOp(dst_type, value, ip=self._ip, loc=self._loc).result
         return arith.FPToUIOp(dst_type, value, ip=self._ip, loc=self._loc).result
 
+    def create_bitcast(self, operand: AlloValue, dst_dtype: DType) -> AlloValue:
+        dst_ir_type = self._materialize(dst_dtype)
+        return self._emit_elementwise_unary(
+            operand,
+            dst_dtype,
+            lambda value: arith.BitcastOp(
+                dst_ir_type, value.handle, ip=self._ip, loc=self._loc
+            ).result,
+        )
+
     def scalar_cast(self, src: AlloValue, dst_type: DType) -> AlloValue:
         assert isinstance(src.type, DType)
         src_type = src.type
@@ -465,6 +475,20 @@ class AlloOpBuilder:
             f"Cannot cast from {src.type} to {dst_type}, unsupported type "
             "combination or value is not broadcastable"
         )
+
+    def bitcast(self, src: AlloValue, dst_dtype: DType) -> AlloValue:
+        # Reinterpret the bits of `src` as `dst_dtype` without conversion; the
+        # two dtypes must share the same bit width.
+        assert isinstance(src, AlloValue), "bitcast requires a materialized value"
+        assert isinstance(dst_dtype, DType), "bitcast destination must be a dtype"
+        if src.dtype.primitive_width != dst_dtype.primitive_width:
+            return self.compile_error(
+                f"Cannot bitcast from {src.dtype} to {dst_dtype}: bit widths "
+                f"{src.dtype.primitive_width} and {dst_dtype.primitive_width} differ"
+            )
+        if src.dtype == dst_dtype:
+            return src
+        return self.create_bitcast(src, dst_dtype)
 
     def normalize_indices(self, indices, *, expected_len=None, context=None):
         out = []
