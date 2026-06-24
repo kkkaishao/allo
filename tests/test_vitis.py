@@ -306,6 +306,94 @@ def test_csim_while_loop():
     assert int(out[0]) == 55
 
 
+def test_codegen_match_case():
+    @kernel
+    def pick(sel: i32, out: i32[1]):
+        match sel:
+            case 0:
+                out[0] = 10
+            case 1:
+                out[0] = 20
+            case _:
+                out[0] = 99
+
+    code = _hls(pick.schedule())
+    _contains(
+        code,
+        "switch (",
+        "case 0: {",
+        "case 1: {",
+        "default: {",
+        "break;",
+    )
+    # Each case body is brace-delimited and terminated by a break (no
+    # fall-through), and the default arm is emitted exactly once.
+    assert code.count("break;") == 3
+    assert code.count("default: {") == 1
+
+
+def test_codegen_match_case_phi():
+    # A scalar reassigned across cases becomes an index_switch result: declared
+    # once before the switch, assigned inside each arm, and read afterwards.
+    @kernel
+    def pick(sel: i32, out: i32[1]):
+        acc: i32 = 0
+        match sel:
+            case 0:
+                acc = 5
+            case 1:
+                acc = 7
+            case _:
+                acc = acc + 100
+        out[0] = acc
+
+    code = _hls(pick.schedule())
+    _contains(code, "switch (", "case 0: {", "default: {")
+    # The phi result is declared before the switch and assigned in each arm.
+    m = re.search(r"\w+ (v\d+);\n\s*switch \(", code)
+    assert m, f"phi result not declared before switch in:\n{code}"
+    acc_var = m.group(1)
+    assert code.count(f"{acc_var} = ") == 3, f"expected one assign per arm:\n{code}"
+    _contains(code, f"v1[0] = {acc_var};")
+
+
+@requires_vitis
+def test_csim_match_case():
+    @kernel
+    def pick(sel: i32, out: i32[1]):
+        match sel:
+            case 0:
+                out[0] = 10
+            case 1:
+                out[0] = 20
+            case _:
+                out[0] = 99
+
+    @kernel
+    def pick_phi(sel: i32, out: i32[1]):
+        acc: i32 = 0
+        match sel:
+            case 0:
+                acc = 5
+            case 1:
+                acc = 7
+            case _:
+                acc = acc + 100
+        out[0] = acc
+
+    out = np.zeros(1, dtype=np.int32)
+    for sel, expected in ((0, 10), (1, 20), (7, 99)):
+        with tempfile.TemporaryDirectory() as project:
+            pick.schedule().export("vitis", project_path=project)(np.int32(sel), out)
+        assert int(out[0]) == expected
+    for sel, expected in ((0, 5), (1, 7), (9, 100)):
+        with tempfile.TemporaryDirectory() as project:
+            pick_phi.schedule().export("vitis", project_path=project)(
+                np.int32(sel), out
+            )
+        assert int(out[0]) == expected
+
+
 def test_codegen_block_stream_datamover():
     @kernel
     def dmover(inp: i32[4, 4], out: i32[1]):

@@ -52,6 +52,7 @@ struct VivadoHLSEmitter {
 
   void emitFor(scf::ForOp op);
   void emitIf(scf::IfOp op);
+  void emitIndexSwitch(scf::IndexSwitchOp op);
   void emitWhile(scf::WhileOp op);
   void emitSCFYield(scf::YieldOp op);
 

@@ -941,6 +941,42 @@ void VivadoHLSEmitter::emitIf(scf::IfOp op) {
   }
 }
 
+void VivadoHLSEmitter::emitIndexSwitch(scf::IndexSwitchOp op) {
+  llvm::raw_ostream &os = state.os;
+  // Pre-declare results; case/default regions assign them via scf.yield.
+  for (auto result : op.getResults()) {
+    emitValueDecl(result);
+    os << ";\n";
+  }
+  if (op.getNumResults())
+    os.indent(state.currentIndent);
+  os << "switch (";
+  emitValueRef(op.getArg());
+  os << ") {\n";
+
+  auto emitCaseBody = [&](Block &block) {
+    state.addIndent();
+    emitBlock(block);
+    os.indent(state.currentIndent);
+    os << "break;\n"; // Python `match` has no fall-through.
+    state.reduceIndent();
+    os.indent(state.currentIndent);
+    os << "}\n";
+  };
+
+  for (auto [value, region] : llvm::zip(op.getCases(), op.getCaseRegions())) {
+    os.indent(state.currentIndent);
+    os << "case " << value << ": {\n";
+    emitCaseBody(region.front());
+  }
+  os.indent(state.currentIndent);
+  os << "default: {\n";
+  emitCaseBody(op.getDefaultRegion().front());
+
+  os.indent(state.currentIndent);
+  os << "}";
+}
+
 void VivadoHLSEmitter::emitSCFYield(scf::YieldOp op) {
   if (op->getNumOperands() == 0)
     return;
@@ -1225,6 +1261,7 @@ void VivadoHLSEmitter::dispatch(Operation *op) {
 
       .Case<scf::ForOp>([&](auto op) { emitFor(op); })
       .Case<scf::IfOp>([&](auto op) { emitIf(op); })
+      .Case<scf::IndexSwitchOp>([&](auto op) { emitIndexSwitch(op); })
       .Case<scf::YieldOp>([&](auto op) { emitSCFYield(op); })
       .Case<scf::WhileOp>([&](auto op) { emitWhile(op); })
 

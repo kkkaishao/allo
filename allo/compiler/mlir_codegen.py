@@ -44,6 +44,7 @@ from .._mlir.dialects.cf import BranchOp, CondBranchOp
 from .._mlir.dialects.scf import (
     IfOp,
     ForOp,
+    IndexSwitchOp,
     YieldOp as SCFYieldOp,
     WhileOp,
     ConditionOp,
@@ -1640,6 +1641,143 @@ class MLIRCodeGenerator(ast.NodeVisitor):
             cond = self._unwrap_constexpr_condition(cond, "`if`")
             selected = node.body if cond else node.orelse
             self.visit_compound_stmts(selected)
+
+    @staticmethod
+    def _is_wildcard_pattern(pattern) -> bool:
+        # `case _:` parses to a capture-less, name-less MatchAs.
+        return (
+            isinstance(pattern, ast.MatchAs)
+            and pattern.pattern is None
+            and pattern.name is None
+        )
+
+    def _match_case_value(self, pattern) -> int:
+        """Fold an integer-literal `case <int>:` pattern to a Python int."""
+        if not isinstance(pattern, ast.MatchValue):
+            return self.compile_error(
+                "Only integer-literal patterns (`case <int>:`) and the wildcard "
+                "(`case _:`) are supported in match statements."
+            )
+        value = unwrap_if_constexpr(self.visit(pattern.value))
+        if isinstance(value, bool) or not isinstance(value, int):
+            return self.compile_error(
+                "match case patterns must be compile-time integer constants."
+            )
+        return value
+
+    def visit_Match(self, node: ast.Match):
+        subject = self.visit(node.subject)
+        if not isinstance(subject, AlloValue) or not isinstance(subject.type, DType):
+            return self.compile_error("match subject must be a runtime value.")
+        if not (subject.type.is_int_signless() or subject.type.is_index()):
+            return self.compile_error("match is only supported on integer subjects.")
+        # scf.index_switch requires an `index`-typed argument.
+        arg = self.builder.scalar_cast(subject, index)
+
+        case_values: list[int] = []
+        case_bodies: list = []
+        default_body: list | None = None
+        for case in node.cases:
+            if case.guard is not None:
+                return self.compile_error(
+                    "guards (`case ... if ...:`) are not supported in match statements."
+                )
+            if self._branch_has_return(case.body):
+                return self.compile_error(
+                    "'return' is not supported inside match cases."
+                )
+            if self._is_wildcard_pattern(case.pattern):
+                if default_body is not None:
+                    return self.compile_error(
+                        "match can only have a single wildcard `case _:`."
+                    )
+                default_body = case.body
+            else:
+                value = self._match_case_value(case.pattern)
+                if value in case_values:
+                    return self.compile_error(f"duplicate match case value {value}.")
+                case_values.append(value)
+                case_bodies.append(case.body)
+
+        # Visit each region body once in a temporary block (default first, then
+        # the case regions aligned with case_values). Scalar live-ins reassigned
+        # in any region are threaded out as scf.index_switch results (phi); the
+        # result types must be known at op creation, so the op is built only
+        # after visiting the bodies and each temp block is then spliced in.
+        region_bodies = [default_body or []] + case_bodies
+        saved_terminated = self.block_terminated
+        with EnterSubRegion(self):
+            ip, last_loc = self.builder.get_insertion_point_and_loc()
+            parent_region = ip.block.region
+            liveins = self.lscope.copy()
+
+            temp_blocks = []
+            region_scopes = []
+            for body in region_bodies:
+                self.lscope = liveins.copy()
+                block = self.builder.create_block(parent_region)
+                self.builder.set_insertion_point_to_start(block)
+                self.block_terminated = False
+                self.visit_compound_stmts(body)
+                temp_blocks.append(block)
+                region_scopes.append(self.lscope.copy())
+
+            phi_names, phi_types, region_handles = self._compute_match_phi(
+                liveins, region_scopes
+            )
+
+            self.builder.set_insertion_point_and_loc(ip, last_loc)
+            phi_ir_types = [ty.materialize(self.context) for ty in phi_types]
+            # The wrapper creates one (empty) block per region: regions[0] is the
+            # default region, the rest are the case regions aligned with cases.
+            switch_op = IndexSwitchOp(
+                phi_ir_types,
+                arg.handle,
+                case_values,
+                ip=self.builder._ip,
+                loc=self.builder._loc,
+            )
+            region_blocks = [switch_op.default_block] + [
+                switch_op.case_block(i) for i in range(len(case_values))
+            ]
+            for temp_block, region_block, handles in zip(
+                temp_blocks, region_blocks, region_handles
+            ):
+                ir_ext.merge_block_before(temp_block, region_block)
+                self.builder.set_insertion_point_to_end(region_block)
+                SCFYieldOp(handles, ip=self.builder._ip, loc=self.builder._loc)
+        self.block_terminated = saved_terminated
+
+        # bind phi results in the enclosing scope
+        for name, handle, ty in zip(phi_names, switch_op.results, phi_types):
+            self._set_value_with_loc(name, AlloValue(handle, ty))
+
+    def _compute_match_phi(self, liveins, region_scopes):
+        """Find scalar live-ins reassigned in any region and the value each
+        region carries for them, mirroring the then/else phi logic of ``if``. A
+        region that does not redefine a name yields the (dominating) live-in."""
+        phi_names: list[str] = []
+        phi_types: list[TypeBase] = []
+        region_handles: list[list] = [[] for _ in region_scopes]
+        for name, value in liveins.items():
+            if not isinstance(value, AlloValue):
+                continue
+            proxies = [scope.get(name, value) for scope in region_scopes]
+            if any(not isinstance(p, AlloValue) for p in proxies):
+                continue
+            if all(p.handle == value.handle for p in proxies):
+                continue  # not redefined in any region
+            for proxy in proxies:
+                if proxy.type != value.type:
+                    return self.compile_error(
+                        f"Variable '{name}' has incompatible types across match "
+                        f"cases: {value.type} vs {proxy.type}."
+                    )
+            phi_names.append(name)
+            phi_types.append(value.type)
+            for handles, proxy in zip(region_handles, proxies):
+                handles.append(proxy.handle)
+        return phi_names, phi_types, region_handles
 
     def visit_Attribute(self, node):
         lhs = self.visit(node.value)

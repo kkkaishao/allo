@@ -30,6 +30,9 @@
 - Use `drafts/` for temporary code when exploring new ideas
 
 # Allo Usage
+- This is not the upstream version of Allo.
+- DO NOT assume the project structure, APIs, or compiler behavior is
+  the same as the upstream Allo project.
 - See [ALLO.md](ALLO.md) for a concise reference on writing Allo kernels and schedules
 
 # Environment setup

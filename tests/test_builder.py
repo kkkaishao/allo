@@ -480,6 +480,146 @@ def test_if_non_affine_falls_back_to_scf():
         assert "affine.if" not in ir
 
 
+def test_match_case_index_switch():
+    @kernel
+    def top(sel: i32, out: i32[1]):
+        match sel:
+            case 0:
+                out[0] = 10
+            case 1:
+                out[0] = 20
+            case _:
+                out[0] = 99
+
+    ir = _compile_ir(top)
+    # The subject is index-cast and carried by scf.index_switch; the wildcard
+    # becomes the default region.
+    _assert_contains(
+        ir,
+        "arith.index_cast",
+        "to index",
+        "scf.index_switch",
+        "case 0 {",
+        "case 1 {",
+        "default {",
+    )
+
+
+def test_match_case_negative_and_buffer_subject():
+    @kernel
+    def top(a: i32[1], out: i32[1]):
+        match a[0]:
+            case -1:
+                out[0] = 5
+            case _:
+                out[0] = 6
+
+    ir = _compile_ir(top)
+    _assert_contains(ir, "scf.index_switch", "case -1 {", "default {")
+
+
+def test_match_case_without_wildcard_has_empty_default():
+    @kernel
+    def top(sel: i32, out: i32[1]):
+        match sel:
+            case 0:
+                out[0] = 1
+            case 2:
+                out[0] = 2
+
+    ir = _compile_ir(top)
+    # scf.index_switch always carries a default region even with no `case _`.
+    _assert_contains(ir, "scf.index_switch", "case 0 {", "case 2 {", "default {")
+
+
+def test_match_case_guard_error():
+    @kernel
+    def top(sel: i32, out: i32[1]):
+        match sel:
+            case x if x > 0:
+                out[0] = 1
+            case _:
+                out[0] = 2
+
+    _assert_compile_error(top, "guards (`case ... if ...:`) are not supported")
+
+
+def test_match_case_capture_pattern_error():
+    @kernel
+    def top(sel: i32, out: i32[1]):
+        match sel:
+            case 0:
+                out[0] = 1
+            case y:
+                out[0] = y
+
+    _assert_compile_error(
+        top, "Only integer-literal patterns (`case <int>:`) and the wildcard"
+    )
+
+
+def test_match_case_float_subject_error():
+    @kernel
+    def top(sel: f32, out: i32[1]):
+        match sel:
+            case 0:
+                out[0] = 1
+            case _:
+                out[0] = 2
+
+    _assert_compile_error(top, "match is only supported on integer subjects.")
+
+
+def test_match_case_phi_scalar():
+    @kernel
+    def top(sel: i32, out: i32[1]):
+        acc: i32 = 0
+        match sel:
+            case 0:
+                acc = 5
+            case 1:
+                acc = 7
+            case _:
+                acc = acc + 100
+        out[0] = acc
+
+    ir = _compile_ir(top)
+    # A scalar reassigned across cases is threaded out as an index_switch result
+    # (phi), and each region yields its value.
+    _assert_contains(ir, "scf.index_switch", "-> i32", "scf.yield")
+
+
+def test_match_case_phi_partial_redefine():
+    # `acc` is redefined only in `case 0`; the other regions must yield the
+    # dominating live-in value rather than dropping it.
+    @kernel
+    def top(sel: i32, out: i32[1]):
+        acc: i32 = 3
+        match sel:
+            case 0:
+                acc = 10
+            case _:
+                out[0] = 0
+        out[0] = acc
+
+    ir = _compile_ir(top)
+    _assert_contains(ir, "scf.index_switch", "-> i32")
+
+
+def test_match_case_duplicate_value_error():
+    @kernel
+    def top(sel: i32, out: i32[1]):
+        match sel:
+            case 0:
+                out[0] = 1
+            case 0:
+                out[0] = 2
+            case _:
+                out[0] = 3
+
+    _assert_compile_error(top, "duplicate match case value 0.")
+
+
 def test_ternary_expression():
     @kernel
     def top(cond: allo_bool, x: i32, y: i32, out: i32[1]):

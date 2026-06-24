@@ -193,6 +193,31 @@ else:
 - A `constexpr` condition is evaluated at compile time; only the taken branch is
   emitted.
 
+### `match` / `case`
+
+```python
+match sel:          # sel must be a runtime integer (int or index)
+    case 0:
+        acc = 10
+    case 1:
+        acc = acc + 5
+    case _:         # optional wildcard -> the default arm
+        acc = 0
+out[0] = acc
+```
+
+- Lowers to `scf.index_switch` and emits a C++ `switch` (one `case` per arm,
+  each with an implicit `break` — **no fall-through**). The subject is
+  index-cast before the switch.
+- **Only integer-literal patterns** (`case 0:`, `case -1:`, or a `constexpr`
+  that folds to an int) and the **wildcard** `case _:` are supported.
+- The wildcard is optional; with no `case _:` the default arm is empty and an
+  unmatched subject falls through to the code after the `match`.
+- Scalars reassigned inside arms propagate out (phi): a value is threaded as a
+  switch result, and an arm that does not redefine it keeps the incoming value.
+- **Not supported:** OR-patterns (`case 0 | 1:`), guards (`case x if ...:`),
+  capture/class/sequence/mapping patterns, and `return` inside an arm.
+
 ---
 
 ## 7. Operators & typing styles
