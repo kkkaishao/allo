@@ -9,9 +9,6 @@ from typing import Literal
 from allo.lang.core import DType, i32
 from allo.operators import math as m
 
-# from ..systolic.mm import make_weight_stationary_gemm_components
-# from .utils import compose_stages
-
 NEG = -1e30  # causal mask additive "-inf"
 
 
@@ -27,7 +24,7 @@ def _make(
     variant: Literal["dense", "flash", "flash_dataflow", "systolic_dataflow"] = "flash",
     SB=8,
     Br=8,
-    Kt=16,
+    Mt=16,
     Nt=16,
     L=16,
     depth=2,
@@ -39,8 +36,8 @@ def _make(
         return _flash(Tin, Tacc, Tout, S, H, Hkv, dh, Br, depth, ii)
     if variant == "flash_dataflow":
         return _flash_dataflow(Tin, Tacc, Tout, S, H, Hkv, dh, Br, depth, ii)
-    # if variant == "systolic_dataflow":
-    #     return _systolic(Tin, Tacc, Tout, S, dh, Kt, Nt, L, depth, ii)
+    if variant == "systolic_dataflow":
+        return _systolic(Tin, Tacc, Tout, S, dh, Mt, Nt, L, depth, ii)
     raise ValueError(
         f"unknown variant {variant!r}; choose dense/flash/flash_dataflow/systolic_dataflow"
     )
@@ -462,222 +459,300 @@ def _flash_dataflow(Tin, Tacc, Tout, S, H, Hkv, dh, Br=8, depth=2, ii=1):
     return gqa, ts
 
 
-# def _systolic(Tin, Tacc, Tout, S, dh, Kt=16, Nt=16, L=16, depth=2, ii=1):
-#     """Internal: ``variant='systolic'`` impl (routed by :func:`make`). The
-#     architecture / trade-offs are documented on the returned ``top``."""
-#     scale = 1.0 / math.sqrt(dh)
-#     DL = dh // L
-#     SL = S // L
+def _systolic(Tin, Tacc, Tout, S, dh, Mt=16, Nt=16, L=16, depth=2, ii=1):
+    """Internal: ``variant='systolic_dataflow'`` impl (routed by :func:`make`). The
+    architecture / trade-offs are documented on the returned ``gqa``."""
+    scale = 1.0 / math.sqrt(dh)
+    DL = dh // L
+    SL = S // L
+    # QK: C[S,S] = Q[S,dh] @ Kt[dh,S]   (M=S, N=S, K=dh)
+    MTq, NTq = S // Mt, S // Nt
+    # PV: O[S,dh] = P[S,S] @ V[S,dh]     (M=S, N=dh, K=S)
+    MTp, NTp = S // Mt, dh // Nt
 
-#     mk = make_weight_stationary_gemm_components
-#     # QK: M=S, N=S, K=dh   (A=Q streamed, B=Kt[dh,S] DRAM); collect folds the row max.
-#     (qfa, qfa_s), (qlw, qlw_s), (qpe, qpe_s), _ = mk(
-#         Tin, Tacc, S, S, dh, Kt, Nt, L, depth, ii
-#     )
-#     # PV: M=S, N=dh, K=S   (A=P streamed, B=V[S,dh] DRAM); collect folds the 1/sum.
-#     (pfa, pfa_s), (plw, plw_s), (ppe, ppe_s), _ = mk(
-#         Tin, Tacc, S, dh, S, Kt, Nt, L, depth, ii
-#     )
-#     NTq, KTq = S // Nt, dh // Kt
-#     NTp, KTp = dh // Nt, S // Kt
+    # ---- QK array (output-stationary): A=Q (west), B=Kt (north) ----------------
+    @kernel
+    def load_QA(Q: Tin[S, dh], fifo_A: Stream[Tin, depth][Mt, Nt]):
+        Qbuf: Tin[S, dh]  # stage Q once (contiguous), then re-read per N-tile
+        for m in range(S, name="qa_m"):
+            for k in range(dh, name="qa_k"):
+                Qbuf[m, k] = Q[m, k]
+        for mo in range(MTq, name="qa_mo"):
+            for no in range(NTq, name="qa_no"):  # re-read A per col-tile
+                for k in range(dh, name="qa_fk"):
+                    for r in range(Mt, name="qa_r"):  # unrolled lane -> west edge
+                        fifo_A[r, 0].put(Qbuf[mo * Mt + r, k])
 
-#     @kernel
-#     def q_feed(Q: Tin[S, dh], s_Q: Stream[Tin, depth][L]):
-#         for s in range(S, name="f0"):
-#             for dt in range(DL, name="f1"):
-#                 for l in range(L, name="f2"):  # unrolled
-#                     s_Q[l].put(Q[s, dt * L + l])
+    @kernel
+    def load_K(Kt_in: Tin[dh, S], fifo_W: Stream[Tin, depth][Mt, Nt]):
+        for mo in range(MTq, name="k_mo"):  # re-read B per row-tile
+            for no in range(NTq, name="k_no"):
+                for k in range(dh, name="k_k"):
+                    for c in range(Nt, name="k_c"):  # unrolled lane -> north edge
+                        fifo_W[0, c].put(Kt_in[k, no * Nt + c])
 
-#     # QK collector: accumulate scores, apply scale + causal mask, emit the row max
-#     # (s_M) then the row (s_S) -- folds the softmax max-reduction into this stage.
-#     @kernel
-#     def qk_collect(
-#         fifo_O: Stream[Tacc, depth][Kt, Nt],
-#         s_M: Stream[Tacc, depth][1],
-#         s_S: Stream[Tacc, depth][L],
-#     ):
-#         Cbuf: Tacc[S, S]
-#         for nt in range(NTq, name="qkn"):
-#             for kt in range(KTq, name="qkk"):
-#                 for mm in range(S, name="cm"):
-#                     for nn in range(Nt, name="cn"):  # unrolled
-#                         p: Tacc = fifo_O[Kt - 1, nn].get()
-#                         av: Tacc = p
-#                         if kt > 0:
-#                             av = Cbuf[mm, nt * Nt + nn] + p
-#                         Cbuf[mm, nt * Nt + nn] = av
-#         for i in range(S, name="qci"):
-#             row: Tacc[S]
-#             mx: Tacc = NEG
-#             for c in range(SL, name="qmc"):
-#                 for l in range(L, name="qml"):  # unrolled
-#                     v: Tacc = Cbuf[i, c * L + l] * scale
-#                     if c * L + l > i:  # causal mask, once
-#                         v = NEG
-#                     row[c * L + l] = v
-#                     mx = allo.max(mx, v)
-#             s_M[0].put(mx)
-#             for c in range(SL, name="qec"):
-#                 for l in range(L, name="qel"):  # unrolled
-#                     s_S[l].put(row[c * L + l])
+    @kernel(mapping=[Mt, Nt])
+    def qk_pe(
+        fifo_W: Stream[Tin, depth][Mt, Nt],
+        fifo_A: Stream[Tin, depth][Mt, Nt],
+        fifo_O: Stream[Tacc, depth][Mt, Nt],
+    ):
+        r = allo.get_wid(0)
+        c = allo.get_wid(1)
+        for mo in range(MTq):
+            for no in range(NTq):
+                acc: Tacc = 0
+                for k in range(dh, name="k"):
+                    a: Tin = fifo_A[r, c].get()
+                    b: Tin = fifo_W[r, c].get()
+                    acc += a * b
+                    if c < Nt - 1:
+                        fifo_A[r, c + 1].put(a)
+                    if r < Mt - 1:
+                        fifo_W[r + 1, c].put(b)
+                fifo_O[r, c].put(acc)
 
-#     # softmax: ONE streaming pass -- exp(score - max), partial row-sum, emit
-#     # unnormalized P. The 3-pass (max / exp+sum / normalize) row-serial softmax was
-#     # the single-head bottleneck; folding max into qk_collect and 1/sum into
-#     # pv_collect leaves this single pass (measured ~3.4x faster, no extra resources).
-#     @kernel
-#     def softmax_fold(
-#         s_M: Stream[Tacc, depth][1],
-#         s_S: Stream[Tacc, depth][L],
-#         s_P: Stream[Tin, depth][L],
-#         s_L: Stream[Tacc, depth][1],
-#     ):
-#         for i in range(S, name="si"):
-#             mx: Tacc = s_M[0].get()
-#             smv: Tacc[L]
-#             for l0 in range(L, name="sz"):  # unrolled init
-#                 smv[l0] = 0.0
-#             for c in range(SL, name="sc"):
-#                 for l in range(L, name="sl"):  # unrolled
-#                     e: Tacc = m.exp(s_S[l].get() - mx)
-#                     smv[l] = smv[l] + e
-#                     s_P[l].put(e)
-#             tot: Tacc = 0.0
-#             for l1 in range(L, name="sr"):  # unrolled tree reduce
-#                 tot = tot + smv[l1]
-#             s_L[0].put(tot)
+    # QK collector: buffer scores, apply scale + causal mask, emit the row max
+    # (s_M) then the row (s_S) -- folds the softmax max-reduction into this stage.
+    @kernel
+    def qk_collect(
+        fifo_O: Stream[Tacc, depth][Mt, Nt],
+        s_M: Stream[Tacc, depth][1],
+        s_S: Stream[Tacc, depth][L],
+    ):
+        Cbuf: Tacc[S, S]
+        for mo in range(MTq, name="cmo"):
+            for no in range(NTq, name="cno"):
+                for r in range(Mt, name="cr"):  # unrolled
+                    for c in range(Nt, name="cc"):  # unrolled
+                        Cbuf[mo * Mt + r, no * Nt + c] = fifo_O[r, c].get()
+        for i in range(S, name="qci"):
+            row: Tacc[S]
+            mxv: Tacc[L]  # per-lane running max -> L independent recurrences
+            for l2 in range(L, name="qmi"):  # unrolled init
+                mxv[l2] = NEG
+            for cm in range(SL, name="qmc"):
+                for l in range(L, name="qml"):  # unrolled
+                    v: Tacc = Cbuf[i, cm * L + l] * scale
+                    if cm * L + l > i:  # causal mask, once
+                        v = NEG
+                    row[cm * L + l] = v
+                    mxv[l] = allo.max(mxv[l], v)
+            mx: Tacc = NEG
+            for l3 in range(L, name="qmr"):  # tree reduce (outside the II=1 loop)
+                mx = allo.max(mx, mxv[l3])
+            s_M[0].put(mx)
+            for ce in range(SL, name="qec"):
+                for l in range(L, name="qel"):  # unrolled
+                    s_S[l].put(row[ce * L + l])
 
-#     # PV collector: accumulate unnormalized O = P @ V, then divide each row by its
-#     # softmax sum (drained first -- feed_A has already buffered all of P).
-#     @kernel
-#     def pv_collect(
-#         fifo_O: Stream[Tacc, depth][Kt, Nt],
-#         s_L: Stream[Tacc, depth][1],
-#         O: Tout[S, dh],
-#     ):
-#         Lsum: Tacc[S]
-#         for i in range(S, name="pli"):
-#             Lsum[i] = s_L[0].get()
-#         Cbuf: Tacc[S, dh]
-#         for nt in range(NTp, name="pvn"):
-#             for kt in range(KTp, name="pvk"):
-#                 for mm in range(S, name="pcm"):
-#                     for nn in range(Nt, name="pcn"):  # unrolled
-#                         p: Tacc = fifo_O[Kt - 1, nn].get()
-#                         av: Tacc = p
-#                         if kt > 0:
-#                             av = Cbuf[mm, nt * Nt + nn] + p
-#                         Cbuf[mm, nt * Nt + nn] = av
-#         for i in range(S, name="pwi"):
-#             inv: Tacc = 1.0 / Lsum[i]
-#             for c in range(DL, name="pwc"):
-#                 for l in range(L, name="pwl"):  # unrolled
-#                     O[i, c * L + l] = Cbuf[i, c * L + l] * inv
+    # softmax: ONE streaming pass -- exp(score - max), partial row-sum, emit
+    # unnormalized P. Folding max into qk_collect and 1/sum into pv_collect leaves
+    # this single pass (the 3-pass row-serial softmax was the single-head bottleneck).
+    @kernel
+    def softmax_fold(
+        s_M: Stream[Tacc, depth][1],
+        s_S: Stream[Tacc, depth][L],
+        s_P: Stream[Tin, depth][L],
+        s_L: Stream[Tacc, depth][1],
+    ):
+        for i in range(S, name="si"):
+            mx: Tacc = s_M[0].get()
+            smv: Tacc[L]
+            for l0 in range(L, name="sz"):  # unrolled init
+                smv[l0] = 0.0
+            for cs in range(SL, name="sc"):
+                for l in range(L, name="sl"):  # unrolled
+                    e: Tacc = m.exp(s_S[l].get() - mx)
+                    smv[l] = smv[l] + e
+                    s_P[l].put(e)
+            tot: Tacc = 0.0
+            for l1 in range(L, name="sr"):  # unrolled tree reduce
+                tot = tot + smv[l1]
+            s_L[0].put(tot)
 
-#     @kernel
-#     def gqa(Q: Tin[S, dh], Kt_in: Tin[dh, S], V: Tin[S, dh], O: Tout[S, dh]):
-#         """**Systolic** dual-array attention (single head), 3-stage dataflow with a
-#         *folded* streaming softmax: QK^T and PV are both ``ws`` systolic GEMM arrays
-#         (spatial reduction, II=1 -- no PV fadd recurrence) and the softmax is split
-#         across the array collectors so it stays a single streaming pass.
+    # ---- PV array (output-stationary): A=P (west), B=V (north) -----------------
+    @kernel
+    def feed_P(s_P: Stream[Tin, depth][L], fifo_A: Stream[Tin, depth][Mt, Nt]):
+        Pbuf: Tin[S, S]  # buffer the streamed P[S,S], then re-read per N-tile
+        for m in range(S, name="p_m"):
+            for kl in range(SL, name="p_kl"):
+                for l in range(L, name="p_ll"):  # unrolled
+                    Pbuf[m, kl * L + l] = s_P[l].get()
+        for mo in range(MTp, name="p_mo"):
+            for no in range(NTp, name="p_no"):  # re-read A per col-tile
+                for k in range(S, name="p_fk"):
+                    for r in range(Mt, name="p_r"):  # unrolled lane -> west edge
+                        fifo_A[r, 0].put(Pbuf[mo * Mt + r, k])
 
-#         QK runs the systolic core as ``Q[S,dh] @ Kt[dh,S] -> scores[S,S]`` (pass K
-#         pre-transposed to ``[dh,S]``); PV as ``P[S,S] @ V[S,dh] -> O[S,dh]``. The
-#         softmax is folded: the QK collector emits each row's **max** alongside the
-#         scaled, causally-masked scores, the softmax stage does one ``exp(score-max) +
-#         row-sum`` pass emitting unnormalized ``P``, and the PV collector divides by
-#         the row sum at write-out. (Folding the max/normalize out of the softmax was
-#         ~3.4x faster than a 3-pass row-serial softmax at no extra resources -- that
-#         3-pass softmax, not the GEMMs, was the single-head bottleneck.)
+    @kernel
+    def load_V(V: Tin[S, dh], fifo_W: Stream[Tin, depth][Mt, Nt]):
+        for mo in range(MTp, name="v_mo"):  # re-read B per row-tile
+            for no in range(NTp, name="v_no"):
+                for k in range(S, name="v_k"):
+                    for c in range(Nt, name="v_c"):  # unrolled lane -> north edge
+                        fifo_W[0, c].put(V[k, no * Nt + c])
 
-#         Notes
-#         -----
-#         The PE array is ``Kt x Nt`` -- the DSP knob: ``~Kt*Nt*5`` DSP per array for
-#         f32 (8x8 ~ 320 DSP, far less than the fully-unrolled dot-tree dataflow). Both
-#         arrays use the same ``Nt``; widening only the PV array (``Nt=dh``, one N-tile,
-#         so ``P[S,S]`` streams once) was measured to give *zero* speedup at ~4x DSP --
-#         the PV stage is fully hidden behind QK, so it is not done. Likewise batching
-#         heads into the array M-dim gives no speedup: the collectors materialize the
-#         full ``[S,S]`` score/prob matrix, a per-head barrier that serializes across
-#         heads. Beating either needs a truly tiled (flash) systolic form -- the
-#         dot-tree ``flash_dataflow`` variant already streams without an ``[S,S]``
-#         buffer and is the latency-best form at its DSP point.
+    @kernel(mapping=[Mt, Nt])
+    def pv_pe(
+        fifo_W: Stream[Tin, depth][Mt, Nt],
+        fifo_A: Stream[Tin, depth][Mt, Nt],
+        fifo_O: Stream[Tacc, depth][Mt, Nt],
+    ):
+        r = allo.get_wid(0)
+        c = allo.get_wid(1)
+        for mo in range(MTp):
+            for no in range(NTp):
+                acc: Tacc = 0
+                for k in range(S, name="k"):
+                    a: Tin = fifo_A[r, c].get()
+                    b: Tin = fifo_W[r, c].get()
+                    acc += a * b
+                    if c < Nt - 1:
+                        fifo_A[r, c + 1].put(a)
+                    if r < Mt - 1:
+                        fifo_W[r + 1, c].put(b)
+                fifo_O[r, c].put(acc)
 
-#         ``dh % L == 0``, ``S % L == 0``, ``dh % Kt == 0``, ``S % Kt == 0``,
-#         ``S % Nt == 0``, ``dh % Nt == 0``. Single head; wrap a head loop for MHA/GQA."""
-#         s_Q: Stream[Tin, depth][L]
-#         qA: Stream[Tin, depth][Kt, Nt]
-#         qW: Stream[Tin, depth][Kt, Nt]
-#         qP: Stream[Tacc, depth][Kt, Nt]
-#         qO: Stream[Tacc, depth][Kt, Nt]
-#         s_M: Stream[Tacc, depth][1]
-#         s_S: Stream[Tacc, depth][L]
-#         s_P: Stream[Tin, depth][L]
-#         s_L: Stream[Tacc, depth][1]
-#         pA: Stream[Tin, depth][Kt, Nt]
-#         pW: Stream[Tin, depth][Kt, Nt]
-#         pP: Stream[Tacc, depth][Kt, Nt]
-#         pO: Stream[Tacc, depth][Kt, Nt]
-#         q_feed(Q, s_Q)
-#         qfa(s_Q, qA)
-#         qlw(Kt_in, qW)
-#         qpe(qW, qA, qP, qO)
-#         qk_collect(qO, s_M, s_S)
-#         softmax_fold(s_M, s_S, s_P, s_L)
-#         pfa(s_P, pA)
-#         plw(V, pW)
-#         ppe(pW, pA, pP, pO)
-#         pv_collect(pO, s_L, O)
+    # PV collector: buffer unnormalized O = P @ V, then divide each row by its
+    # softmax sum (drained first -- feed_P has already buffered all of P).
+    @kernel
+    def pv_collect(
+        fifo_O: Stream[Tacc, depth][Mt, Nt],
+        s_L: Stream[Tacc, depth][1],
+        O: Tout[S, dh],
+    ):
+        Lsum: Tacc[S]
+        for i in range(S, name="pli"):
+            Lsum[i] = s_L[0].get()
+        Cbuf: Tacc[S, dh]
+        for mo in range(MTp, name="pmo"):
+            for no in range(NTp, name="pno"):
+                for r in range(Mt, name="pr"):  # unrolled
+                    for c in range(Nt, name="pc"):  # unrolled
+                        Cbuf[mo * Mt + r, no * Nt + c] = fifo_O[r, c].get()
+        for i in range(S, name="pwi"):
+            inv: Tacc = 1.0 / Lsum[i]
+            for cw in range(DL, name="pwc"):
+                for l in range(L, name="pwl"):  # unrolled
+                    O[i, cw * L + l] = Cbuf[i, cw * L + l] * inv
 
-#     qf_s = q_feed.schedule()
-#     qf_s.unroll("f2")
-#     qf_s.pipeline("f1", ii=ii)
+    @kernel
+    def gqa(Q: Tin[S, dh], Kt_in: Tin[dh, S], V: Tin[S, dh], O: Tout[S, dh]):
+        """**Systolic** dual-array attention (single head), 3-stage dataflow with a
+        *folded* streaming softmax: QK^T and PV are both **output-stationary** (``os``)
+        systolic GEMM arrays and the softmax is split across the array collectors so it
+        stays a single streaming pass.
 
-#     qc_s = qk_collect.schedule()
-#     qc_s.partition(qc_s.buffer("Cbuf"), dim=2, kind=qc_s.Cyclic, factor=L)
-#     qc_s.partition(qc_s.buffer("row"), dim=1, kind=qc_s.Cyclic, factor=L)
-#     qc_s.unroll("cn")
-#     qc_s.pipeline("cm", ii=ii)
-#     qc_s.unroll("qml")
-#     qc_s.pipeline("qmc", ii=ii)
-#     qc_s.unroll("qel")
-#     qc_s.pipeline("qec", ii=ii)
+        QK runs the systolic core as ``Q[S,dh] @ Kt[dh,S] -> scores[S,S]`` (pass K
+        pre-transposed to ``[dh,S]``); PV as ``P[S,S] @ V[S,dh] -> O[S,dh]``. The
+        softmax is folded: the QK collector emits each row's **max** alongside the
+        scaled, causally-masked scores, the softmax stage does one ``exp(score-max) +
+        row-sum`` pass emitting unnormalized ``P``, and the PV collector divides by the
+        row sum at write-out.
 
-#     sf_s = softmax_fold.schedule()
-#     sf_s.partition(sf_s.buffer("smv"), dim=1, kind=sf_s.Complete)
-#     sf_s.unroll("sz")
-#     sf_s.unroll("sl")
-#     sf_s.unroll("sr")
-#     sf_s.pipeline("sc", ii=ii)
+        Notes
+        -----
+        The PE array is ``Mt x Nt`` -- the DSP knob: ``~Mt*Nt*5`` DSP per array for f32
+        (so ~``2*Mt*Nt*5`` for the two arrays), far less than the fully-unrolled
+        dot-tree dataflow. Each output-stationary PE accumulates its dot product across
+        the contraction ``K`` in a single register, so the f32 accumulate is a
+        loop-carried ``fadd`` (~``II=4`` recurrence -- the hardware floor); this is the
+        deliberate trade for the **weight-stationary** form, whose spatial reduction
+        ran at ``II=1`` but deadlocked in cosim. Both collectors materialize the full
+        ``[S,S]`` score / prob matrix (a per-head barrier), so for MHA/GQA heads run
+        serially; the dot-tree ``flash_dataflow`` variant streams without an ``[S,S]``
+        buffer and is the latency-best form at its DSP point.
 
-#     pc_s = pv_collect.schedule()
-#     pc_s.partition(pc_s.buffer("Cbuf"), dim=2, kind=pc_s.Cyclic, factor=L)
-#     pc_s.unroll("pcn")
-#     pc_s.pipeline("pcm", ii=ii)
-#     pc_s.pipeline("pli", ii=ii)
-#     pc_s.unroll("pwl")
-#     pc_s.pipeline("pwc", ii=ii)
+        ``dh % L == 0``, ``S % L == 0``, ``S % Mt == 0``, ``S % Nt == 0``,
+        ``dh % Nt == 0``, ``Nt <= L``. Single head; wrap a head loop for MHA/GQA."""
+        qA: Stream[Tin, depth][Mt, Nt]
+        qW: Stream[Tin, depth][Mt, Nt]
+        qO: Stream[Tacc, depth][Mt, Nt]
+        s_M: Stream[Tacc, depth][1]
+        s_S: Stream[Tacc, depth][L]
+        s_P: Stream[Tin, depth][L]
+        s_L: Stream[Tacc, depth][1]
+        pA: Stream[Tin, depth][Mt, Nt]
+        pW: Stream[Tin, depth][Mt, Nt]
+        pO: Stream[Tacc, depth][Mt, Nt]
+        load_QA(Q, qA)
+        load_K(Kt_in, qW)
+        qk_pe(qW, qA, qO)
+        qk_collect(qO, s_M, s_S)
+        softmax_fold(s_M, s_S, s_P, s_L)
+        feed_P(s_P, pA)
+        load_V(V, pW)
+        pv_pe(pW, pA, pO)
+        pv_collect(pO, s_L, O)
 
-#     ts = top.schedule()
-#     ts.dataflow()
-#     # QK and PV reuse the SAME mkg component names (feed_A/load_W/pe), so the 2nd
-#     # occurrence of each composes with its repeat-copy id. The folded collectors
-#     # (qk_collect/pv_collect) and q_feed/softmax_fold are unique.
-#     stages = [
-#         (qf_s, "q_feed"),
-#         (qfa_s, "feed_A"),
-#         (qlw_s, "load_W"),
-#         (qpe_s, "pe"),
-#         (qc_s, "qk_collect"),
-#         (sf_s, "softmax_fold"),
-#         (pfa_s, "feed_A"),
-#         (plw_s, "load_W"),
-#         (ppe_s, "pe"),
-#         (pc_s, "pv_collect"),
-#     ]
-#     compose_stages(ts, stages)
+    qa_s = load_QA.schedule()
+    qa_s.partition(qa_s.buffer("Qbuf"), dim=1, kind=qa_s.Cyclic, factor=Mt)
+    qa_s.pipeline(qa_s.flatten(("qa_m", "qa_k")), ii=ii)
+    qa_s.unroll("qa_r")
+    qa_s.pipeline("qa_fk", ii=ii)
 
-#     return top, ts
+    lk_s = load_K.schedule()
+    lk_s.unroll("k_c")
+    lk_s.pipeline("k_k", ii=ii)
+
+    qpe_s = qk_pe.schedule()
+    qpe_s.pipeline("k", ii=ii)
+
+    qc_s = qk_collect.schedule()
+    qc_s.partition(qc_s.buffer("Cbuf"), dim=2, kind=qc_s.Cyclic, factor=L)
+    qc_s.partition(qc_s.buffer("Cbuf"), dim=1, kind=qc_s.Cyclic, factor=Mt)
+    qc_s.bind_storage(qc_s.buffer("Cbuf"), impl=qc_s.BRAM, mem_type=qc_s.RAM_T2P)
+    qc_s.partition(qc_s.buffer("row"), dim=1, kind=qc_s.Cyclic, factor=L)
+    qc_s.partition(qc_s.buffer("mxv"), dim=1, kind=qc_s.Complete)
+    qc_s.unroll("cr")
+    qc_s.unroll("cc")
+    qc_s.pipeline("cno", ii=ii)
+    qc_s.unroll("qmi")
+    qc_s.unroll("qml")
+    qc_s.pipeline("qmc", ii=ii)
+    qc_s.unroll("qmr")  # tree reduce, multicycle -> off the critical path
+    qc_s.unroll("qel")
+    qc_s.pipeline("qec", ii=ii)
+
+    sf_s = softmax_fold.schedule()
+    sf_s.partition(sf_s.buffer("smv"), dim=1, kind=sf_s.Complete)
+    sf_s.unroll("sz")
+    sf_s.unroll("sl")
+    sf_s.unroll("sr")
+    sf_s.pipeline("sc", ii=ii)
+
+    fp_s = feed_P.schedule()
+    fp_s.partition(fp_s.buffer("Pbuf"), dim=2, kind=fp_s.Cyclic, factor=L)
+    fp_s.partition(fp_s.buffer("Pbuf"), dim=1, kind=fp_s.Cyclic, factor=Mt)
+    fp_s.bind_storage(fp_s.buffer("Pbuf"), impl=fp_s.BRAM, mem_type=fp_s.RAM_T2P)
+    fp_s.unroll("p_ll")
+    fp_s.pipeline(fp_s.flatten(("p_m", "p_kl")), ii=ii)
+    fp_s.unroll("p_r")
+    fp_s.pipeline("p_fk", ii=ii)
+
+    lv_s = load_V.schedule()
+    lv_s.unroll("v_c")
+    lv_s.pipeline("v_k", ii=ii)
+
+    ppe_s = pv_pe.schedule()
+    ppe_s.pipeline("k", ii=ii)
+
+    pc_s = pv_collect.schedule()
+    pc_s.partition(pc_s.buffer("Cbuf"), dim=2, kind=pc_s.Cyclic, factor=L)
+    pc_s.partition(pc_s.buffer("Cbuf"), dim=1, kind=pc_s.Cyclic, factor=Mt)
+    pc_s.pipeline("pli", ii=ii)
+    pc_s.unroll("pr")
+    pc_s.unroll("pc")
+    pc_s.pipeline("pno", ii=ii)
+    pc_s.unroll("pwl")
+    pc_s.pipeline("pwc", ii=ii)
+
+    ts = gqa.schedule()
+    ts.dataflow()
+    ts.compose(qa_s, lk_s, qpe_s, qc_s, sf_s, fp_s, lv_s, ppe_s, pc_s)
+
+    return gqa, ts
 
 
 class GQA(Module):
@@ -703,10 +778,12 @@ class GQA(Module):
           (29 ms, 10.6x). ``Br`` = query-row tile. **The default.**
         * ``flash_dataflow``   -- the same flash math split into a ``qk -> softmax ->
           pv`` dataflow pipeline (folded stats); fastest dot-tree form (15 ms).
-        * ``systolic_dataflow``-- ``qk``/``pv`` as **ws systolic arrays** (``Kt``/``Nt``/
-          ``L`` size them; DSP ~= Kt*Nt*5) with a *folded* streaming softmax. **Single
-          head** (``H``/``Hkv`` ignored); DSP-light + tunable, QK-array-bound -- see the
-          docstring (still materializes ``[S,S]``, so slower than ``flash_dataflow``).
+        * ``systolic_dataflow``-- ``qk``/``pv`` as **os systolic arrays** (``Mt``/``Nt``/
+          ``L`` size them; DSP ~= 2*Mt*Nt*5) with a *folded* streaming softmax. **Single
+          head** (``H``/``Hkv`` ignored), signature ``gqa(Q[S,dh], Kt[dh,S], V[S,dh],
+          O[S,dh])`` (pass K pre-transposed). DSP-light + tunable; the f32 PE accumulate
+          is a loop-carried fadd (~II=4 -- the os trade for the ws form that deadlocked).
+          Still materializes ``[S,S]``, so slower than ``flash_dataflow``.
 
     Notes
     -----
@@ -737,7 +814,7 @@ class GQA(Module):
         ] = "flash",
         SB=8,
         Br=8,
-        Kt=16,
+        Mt=16,
         Nt=16,
         L=16,
         depth=2,
@@ -772,11 +849,16 @@ class GQA(Module):
                 raise ValueError(
                     f"S must be divisible by Br for flash variants, got S={S}, Br={Br}"
                 )
-        else:
-            raise NotImplementedError(
-                "Currently deadlocks when using the `systolic_dataflow` variant; "
-                "A known issue caused by the systolic gemm components."
-            )
+        else:  # systolic_dataflow: single head; os arrays tile S (M) and S/dh (N)
+            for name, val in (("S", S), ("dh", dh)):
+                if val % L != 0:
+                    raise ValueError(f"{name}={val} must be divisible by L={L}")
+            if S % Mt != 0:
+                raise ValueError(f"S={S} must be divisible by Mt={Mt}")
+            if S % Nt != 0 or dh % Nt != 0:
+                raise ValueError(f"S={S} and dh={dh} must be divisible by Nt={Nt}")
+            if Nt > L:
+                raise ValueError(f"Nt={Nt} must be <= L={L} for the score collectors")
 
         top, s = _make(
             Tin,
@@ -789,7 +871,7 @@ class GQA(Module):
             variant=variant,
             SB=SB,
             Br=Br,
-            Kt=Kt,
+            Mt=Mt,
             Nt=Nt,
             L=L,
             depth=depth,
