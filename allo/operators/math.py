@@ -512,3 +512,56 @@ def _(value, acc=ConstexprValue(None)):
     if _is_const(value, 0):
         return ConstexprValue(1)
     return _fold_unary(value, py_math.cosh)
+
+
+@operator
+def fma(a, b, c):
+    operator_body_unreachable()
+
+
+@fma.fold
+def _(a, b, c):
+    if not _fold_enabled(c):
+        return NO_FOLD
+    if _is_const(a, 0) or _is_const(b, 0):
+        return c
+    if _is_const(c, 0):
+        return ConstexprValue(a.value * b.value)
+    if _is_const(a, 1):
+        return ConstexprValue(b.value + c.value)
+    if _is_const(b, 1):
+        return ConstexprValue(a.value + c.value)
+    if (
+        isinstance(a, ConstexprValue)
+        and isinstance(b, ConstexprValue)
+        and isinstance(c, ConstexprValue)
+    ):
+        return ConstexprValue(a.value * b.value + c.value)
+    return NO_FOLD
+
+
+@fma.build
+def _(builder: AlloOpBuilder, a, b, c):
+    def is_const_or_float(value):
+        return isinstance(value, ConstexprValue) or (
+            isinstance(value, AlloValue) and value.dtype.is_float()
+        )
+
+    if any(not is_const_or_float(v) for v in (a, b, c)):
+        return builder.compile_error("fma operands must be float or constexpr")
+
+    # all AlloValue must be the same float type
+    float_types = {v.dtype for v in (a, b, c) if isinstance(v, AlloValue)}
+    if len(float_types) > 1:
+        return builder.compile_error("fma operands must have the same float type")
+    # if len(float_types) == 0:
+    # all operands are constexpr, should be folded
+    result_dtype = float_types.pop()
+    handle = math.FmaOp(
+        builder.cast_to_dtype(a, result_dtype).handle,
+        builder.cast_to_dtype(b, result_dtype).handle,
+        builder.cast_to_dtype(c, result_dtype).handle,
+        ip=builder.save_insertion_point(),
+        loc=builder.get_loc(),
+    ).result
+    return AlloValue(handle, result_dtype)

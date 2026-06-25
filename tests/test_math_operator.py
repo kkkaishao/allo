@@ -123,6 +123,15 @@ def test_pow_zero_fold():
     _assert_not_contains(ir, "math.powf", "math.fpowi", "math.ipowi")
 
 
+def test_fma_mlir():
+    @kernel
+    def top(a: f32, b: f32, c: f32, out: f32[1]):
+        out[0] = allo_math.fma(a, b, c)
+
+    ir = _compile_ir(top)
+    _assert_contains(ir, "math.fma")
+
+
 def test_tensor_exp_linalg():
     @kernel(options=KernelOptions(enable_tensor=True))
     def top(x: f32[4]) -> f32[4]:

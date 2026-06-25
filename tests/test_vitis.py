@@ -21,6 +21,7 @@ import numpy as np
 import pytest
 import os
 
+from allo.operators import math as m
 from allo.lang.core import (
     range as arange,
     i32,
@@ -456,6 +457,16 @@ def test_codegen_maxi_interface():
         "#pragma HLS interface mode=m_axi port=v0 offset=slave bundle=gmem",
         "#pragma HLS interface mode=m_axi port=v1 offset=slave bundle=gmem",
     )
+
+
+def test_codegen_fma():
+    @kernel
+    def fma(a: f32, b: f32, c: f32, d: f32[1]):
+        d[0] = m.fma(a, b, c)
+
+    backend = fma.schedule().export("vitis", part=PART)
+    code = backend.hls_code
+    _contains(code, "hls::fma(")
 
 
 # ===========================================================================
