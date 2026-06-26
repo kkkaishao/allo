@@ -291,8 +291,7 @@ def _shift_rule() -> TypingRule:
         (_UnsignedInt, _SignedInt): lambda lhs, rhs: lhs,
         (_UnsignedInt, IndexType): lambda lhs, rhs: lhs,
     }
-    index_rules = {(IndexType, IndexType): lambda lhs, rhs: index}
-    return TypingRule(int_rules, uint_rules, index_rules)
+    return TypingRule(int_rules, uint_rules)
 
 
 def _bitwise_rule(common_int: Callable[[DType, DType], DType]) -> TypingRule:
@@ -311,8 +310,7 @@ def _bitwise_rule(common_int: Callable[[DType, DType], DType]) -> TypingRule:
 def _unary_invert_rule() -> TypingRule:
     int_rules = {(_SignedInt,): lambda dtype: dtype}
     uint_rules = {(_UnsignedInt,): lambda dtype: dtype}
-    index_rules = {(IndexType,): lambda dtype: dtype}
-    return TypingRule(int_rules, uint_rules, index_rules)
+    return TypingRule(int_rules, uint_rules)
 
 
 def _hls_unary_neg_rule() -> TypingRule:
