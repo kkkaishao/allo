@@ -489,8 +489,9 @@ def test_synth_gemm_tile_pipeline():
     s.tile(("i", "j"), factors=[4, 4])
     s.pipeline(s.loop("k"), ii=1)
     with tempfile.TemporaryDirectory() as project:
-        report = s.export("vitis", part=PART, project_path=project).synth()
-        assert report.exists()
+        mod = s.export("vitis", part=PART, project_path=project)
+        mod.synth()
+        assert mod.synth_report.exists()
 
 
 @requires_vitis
