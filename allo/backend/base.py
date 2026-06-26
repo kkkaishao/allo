@@ -15,11 +15,13 @@ from pathlib import Path
 from typing import Any, ClassVar, Generic, ParamSpec, TypeVar
 
 from .._mlir import ir
+from .._mlir.ir import MLIRError, DiagnosticInfo
 from .._mlir._mlir_libs._allo import ir_ext
 from .._mlir.ir import SymbolTable, UnitAttr
 from .._mlir.passmanager import PassManager
 from .._mlir.dialects.allo import register_passes as _register_allo_passes
 from ..lang.kernel import Kernel
+from ..diagnostics import render_diagnostic, DiagnosticLocation
 
 # Allo passes live in the process-global MLIR pass registry; register them once
 # (std::call_once-guarded in C++) so backend pipelines (`lower-to-llvm`,
@@ -45,7 +47,34 @@ def set_top_llvm_c_wrapper(module: ir.Module, name: str):
 
 def run_pipeline(module: ir.Module, pipeline: str) -> None:
     """Run a textual pass pipeline on ``module`` in its own context."""
-    PassManager.parse(pipeline, module.context).run(module.operation)
+    try:
+        PassManager.parse(pipeline, module.context).run(module.operation)
+    except MLIRError as e:
+        for diag in e.error_diagnostics:
+            if diag.location.is_a_file:
+                diag: DiagnosticInfo
+                import linecache
+
+                line = linecache.getline(
+                    diag.location.filename, diag.location.start_line
+                )
+                msg = render_diagnostic(
+                    diag.message,
+                    DiagnosticLocation(
+                        diag.location.filename,
+                        diag.location.start_line,
+                        diag.location.start_col,
+                        source_line=line.rstrip("\n") if line else None,
+                    ),
+                    width=4096,
+                )
+                raise RuntimeError(
+                    f"An error occurred during code generation process:\n{msg}"
+                ) from None
+            else:
+                raise RuntimeError(
+                    f"An error occurred during code generation process:\n{diag.message}"
+                ) from None
 
 
 _PROCESS_CACHE: dict[tuple[str, str], Any] = {}

@@ -6,6 +6,7 @@ add_mlir_library(MLIRAlloTransforms
     GridMapping.cpp
     DataflowSpawn.cpp
     ReuseCleanup.cpp
+    FoldConstantCalls.cpp
     GenerateApintWrapper.cpp
 
     DEPENDS
@@ -13,12 +14,15 @@ add_mlir_library(MLIRAlloTransforms
 
     LINK_LIBS PUBLIC
     MLIRAlloSupport
+    MLIRAnalysis
     MLIRAffineDialect
+    MLIRAffineUtils
     MLIRArithDialect
     MLIRFuncDialect
     MLIRLLVMDialect
     MLIRMemRefDialect
     MLIRSCFDialect
+    MLIRSCFUtils
     MLIRTransforms
     MLIRTransformUtils
     MLIRPass

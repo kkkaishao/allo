@@ -35,6 +35,28 @@ def DataflowSpawnPass : Pass<"dataflow-spawn", "ModuleOp"> {
   let dependentDialects = ["mlir::LLVM::LLVMDialect"];
 }
 
+def FoldConstantCallsPass : Pass<"fold-constant-calls", "ModuleOp"> {
+  let summary = "Evaluate lazy-consteval kernel invokes with constant arguments.";
+  let description = [{
+    Lowers the "lazy consteval" feature. A `@consteval(lazy=True)` function
+    enters the IR as an `allo.kernel` tagged `allo.lazy` (fast filter) and is
+    called via `allo.invoke`. Once grid-mapping has specialized the call sites so
+    every invoke argument is constant, this pass evaluates each invoke at compile
+    time, replaces it with the constant result, and deletes the now-unused lazy
+    kernels -- so they never reach codegen. Evaluation clones the kernel body
+    into a throwaway func.func, substitutes the constant arguments, and folds it
+    to a constant via a fixpoint of canonicalize + CSE + affine store-to-load
+    forwarding (so local scratch arrays fold) + full unrolling of constant-trip
+    affine.for and scf.for loops. Because `@consteval(lazy=True)` is an explicit
+    request to fold the function away, an invoke that cannot be reduced to a
+    constant (non-constant arguments or a body that does not evaluate) is a hard
+    error. Run between grid-mapping and materialize-topology.
+  }];
+  let dependentDialects = [
+    "mlir::arith::ArithDialect", "mlir::affine::AffineDialect"
+  ];
+}
+
 def ReuseCleanupPass : Pass<"reuse-cleanup", "ModuleOp"> {
   let summary = "Simplify the IR produced by reuse_at.";
   let description = [{

@@ -39,6 +39,7 @@
 
 namespace mlir::allo {
 constexpr llvm::StringLiteral kAlloSignedAttr = "allo.signed";
+constexpr llvm::StringLiteral kAlloLazyAttr = "allo.lazy";
 } // namespace mlir::allo
 
 #endif // ALLO_OPS_H

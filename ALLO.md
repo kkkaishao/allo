@@ -398,6 +398,30 @@ def factor():
     return 3
 ```
 
+- **`@consteval(lazy=True)`** is a *lazy* variant: the helper is written in Allo
+  kernel syntax (not plain Python) and lowered into the IR, then evaluated at
+  compile time and folded to a constant before codegen — it never reaches the
+  hardware. Use it when the computation needs kernel semantics (typed arithmetic,
+  bit ops, loops, local arrays) but every call argument is a compile-time
+  constant.
+
+```python
+@consteval(lazy=True)
+def reverse_bits(data: i32, bit_range: i32) -> i32:
+    mask = (1 << bit_range) - 1
+    rev: i32 = 0
+    for i in range(0, bit_range):
+        i_32: i32 = i
+        if data & (1 << i_32):
+            rev |= 1 << (bit_range - 1 - i_32)
+    return (data & ~mask) | rev
+```
+
+  Every call site must pass compile-time-constant arguments; each call is then
+  replaced by the computed constant and the function is deleted. A non-constant
+  argument, or a body that does not reduce to a constant (e.g. a `while` loop or
+  a data-dependent trip count), is a compile error.
+
 - **Templates** parameterize over compile-time types/values. A templated kernel is
   not concrete until specialized with `kernel[...]`.
 

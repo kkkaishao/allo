@@ -69,6 +69,7 @@ DEFAULT_FREQ_MHZ = 300.0
 HLS_PREPARE_PIPELINE = """
 builtin.module(
 grid-mapping,
+fold-constant-calls,
 materialize-topology,
 canonicalize,
 cse,

@@ -1263,6 +1263,92 @@ def test_consteval_expression():
     )
 
 
+def test_lazy_consteval_kernel_folds_to_constant():
+    # `@consteval(lazy=True)` does NOT run at trace time: it enters the IR as an
+    # `allo.kernel` tagged `allo.lazy`, called via `allo.invoke`. The
+    # `fold-constant-calls` pass then evaluates the invoke at compile time and
+    # deletes the lazy kernel, so it never reaches codegen.
+    from allo.backend.base import run_pipeline
+
+    @consteval(lazy=True)
+    def reverse_low_bits(data: i32, bit_range: i32) -> i32:
+        mask = (1 << bit_range) - 1
+        rev: i32 = 0
+        for i in range(0, bit_range):
+            i_32: i32 = i
+            if data & (1 << i_32):
+                rev |= 1 << (bit_range - 1 - i_32)
+        return (data & ~mask) | rev
+
+    @kernel
+    def top(out: i32[1]):
+        out[0] = reverse_low_bits(1, 3)  # reverse 0b001 over 3 bits -> 0b100 = 4
+
+    # Frontend keeps it lazy: an `allo.lazy` kernel reached through an invoke.
+    ir = _compile_ir(top)
+    _assert_contains(ir, "allo.lazy", "invoke @")
+
+    # The pass evaluates the invoke and removes the lazy kernel entirely.
+    module = compile_kernel(top)
+    run_pipeline(module, "builtin.module(fold-constant-calls)")
+    folded = str(module)
+    assert "allo.lazy" not in folded
+    assert "invoke @" not in folded
+    _assert_contains(folded, "arith.constant 4 : i32")
+
+    # Left unfolded (e.g. the CPU/JIT path), it still runs as a normal kernel.
+    out = np.zeros(1, dtype=np.int32)
+    top(out)
+    assert out[0] == 4
+
+
+def test_lazy_consteval_folds_local_scratch_array():
+    # The evaluator is not limited to scalar arithmetic: a lazy consteval that
+    # builds a local scratch array (memref) over a loop still folds to a constant
+    # (loop unroll + affine store-to-load forwarding).
+    from allo.backend.base import run_pipeline
+
+    @consteval(lazy=True)
+    def square_table(sel: i32) -> i32:
+        tbl: i32[4]
+        for t in range(0, 4):
+            tbl[t] = t * t
+        return tbl[sel]
+
+    @kernel
+    def top(out: i32[1]):
+        out[0] = square_table(3)  # [0, 1, 4, 9][3] = 9
+
+    module = compile_kernel(top)
+    run_pipeline(module, "builtin.module(fold-constant-calls)")
+    folded = str(module)
+    assert "allo.lazy" not in folded
+    assert "invoke @" not in folded
+    _assert_contains(folded, "arith.constant 9 : i32")
+
+    out = np.zeros(1, dtype=np.int32)
+    top(out)
+    assert out[0] == 9
+
+
+def test_lazy_consteval_requires_constant_args():
+    # `@consteval(lazy=True)` is an explicit request to fold the call away, so an
+    # invoke whose arguments are not compile-time constants is a hard error.
+    from allo.backend.base import run_pipeline
+
+    @consteval(lazy=True)
+    def add(a: i32, b: i32) -> i32:
+        return a + b
+
+    @kernel
+    def top(r: i32, out: i32[1]):
+        out[0] = add(r, 3)  # r is a runtime value -> cannot be folded
+
+    module = compile_kernel(top)
+    with pytest.raises(Exception, match="lazy consteval"):
+        run_pipeline(module, "builtin.module(fold-constant-calls)")
+
+
 def test_nested_invoke_store():
     @kernel
     def top(x: i32, out: i32[1]):

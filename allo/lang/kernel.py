@@ -110,6 +110,9 @@ class Kernel(Generic[P, R]):
         self.module: Module | None = None
         self.context: Context | None = None
 
+        # record whether this kernel is a lazy consteval kernel
+        self._is_lazy_consteval = False
+
         try:
             raw_src, begin_line = inspect.getsourcelines(fn)
         except OSError:
@@ -478,8 +481,9 @@ def kernel(
 
 
 class ConstevalFunction(Generic[P, R]):
-    def __init__(self, fn: Callable[P, R]):
+    def __init__(self, fn: Callable[P, R], lazy: bool):
         self.fn = fn
+        self.lazy = lazy
         self.__name__ = fn.__name__
         self.__doc__ = fn.__doc__
         self.__globals__ = fn.__globals__
@@ -494,8 +498,23 @@ class ConstevalFunction(Generic[P, R]):
         return self.fn(*args, **kwargs)
 
 
-def consteval(fn: Callable[P, R]) -> ConstevalFunction[P, R]:
-    assert callable(
-        fn
-    ), "The @consteval decorator can only be applied to callable objects"
-    return ConstevalFunction(fn)
+@overload
+def consteval(fn: Callable[P, R]) -> ConstevalFunction[P, R]: ...
+
+
+@overload
+def consteval(
+    *, lazy: bool = False
+) -> Callable[[Callable[P, R]], ConstevalFunction[P, R]]: ...
+
+
+def consteval(
+    fn=None, *, lazy: bool = False
+) -> ConstevalFunction[P, R] | Callable[[Callable[P, R]], ConstevalFunction[P, R]]:
+    if fn is not None:
+        return ConstevalFunction(fn, lazy=lazy)
+
+    def decorator(fn: Callable[P, R]) -> ConstevalFunction[P, R]:
+        return ConstevalFunction(fn, lazy=lazy)
+
+    return decorator

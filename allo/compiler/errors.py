@@ -8,6 +8,8 @@ from ..errors import AlloError
 
 
 class CompilationError(DiagnosticError):
+    render_width = 4096
+
     def __init__(
         self,
         src: str,

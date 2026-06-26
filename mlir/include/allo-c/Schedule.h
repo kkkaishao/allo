@@ -38,6 +38,8 @@ MLIR_CAPI_EXPORTED constexpr const char *kPartitionAttr = "allo.part";
 MLIR_CAPI_EXPORTED constexpr const char *kBindStorageAttr = "allo.bind.storage";
 MLIR_CAPI_EXPORTED constexpr const char *kAlloSignedAttr =
     mlir::allo::kAlloSignedAttr.data();
+MLIR_CAPI_EXPORTED constexpr const char *kAlloLazyAttr =
+    mlir::allo::kAlloLazyAttr.data();
 
 #ifdef __cplusplus
 }

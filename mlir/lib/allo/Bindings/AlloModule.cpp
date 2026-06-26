@@ -66,6 +66,7 @@ NB_MODULE(_allo, m) {
       "register_passes", []() { alloMlirRegisterAllPasses(); },
       "Register all Allo passes with the global pass registry.");
   allo.attr("SIGNED_ATTR_NAME") = kAlloSignedAttr;
+  allo.attr("LAZY_ATTR_NAME") = kAlloLazyAttr;
 
   //===--------------------------------------------------------------------===//
   // emit: Vivado HLS translation. General/Allo pass pipelines (incl. the

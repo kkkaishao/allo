@@ -28,6 +28,7 @@ from .._mlir.ir import (
     DenseI32ArrayAttr,
     InsertionPoint,
     OpResult,
+    UnitAttr,
     MLIRError,  # type: ignore
 )
 from .._mlir import schedule as schedule_d
@@ -38,6 +39,7 @@ from .._mlir.dialects.allo import (
     InvokeOp,
     KernelOp,
     SIGNED_ATTR_NAME,
+    LAZY_ATTR_NAME,
     register_dialect,
 )
 from .._mlir.dialects.cf import BranchOp, CondBranchOp
@@ -518,6 +520,8 @@ class MLIRCodeGenerator(ast.NodeVisitor):
         fn_op.operation.attributes[SIGNED_ATTR_NAME] = StringAttr.get(
             generate_signedness_marker(self.arg_types, self.res_types), self.context
         )
+        if self.kernel._is_lazy_consteval:
+            fn_op.operation.attributes[LAZY_ATTR_NAME] = UnitAttr.get(self.context)
 
         # Build the entry block with NameLoc-tagged arguments so the printed IR
         # shows the source parameter names (e.g. %buf) when name-loc prefixing is
@@ -2604,16 +2608,21 @@ class MLIRCodeGenerator(ast.NodeVisitor):
         if isinstance(fn, (Operator, BoundOperator)):
             return self.call_operator(fn, args, kws)
         if isinstance(fn, ConstevalFunction):
-            try:
-                ret = fn(*args, **kws)
-                # TODO: check if returned value is valid
-                return ConstexprValue(ret)
-            except CompilationError:
-                raise
-            except Exception as e:
-                return self.compile_error(
-                    f"error when calling consteval function '{fn.__name__}': {e}"
-                )
+            if fn.lazy:
+                k = Kernel(fn.fn, mapping=(), options=KernelOptions())
+                k._is_lazy_consteval = True
+                return self.call_kernel(k, args, kws, is_lazy=True)
+            else:
+                try:
+                    ret = fn(*args, **kws)
+                    # TODO: check if returned value is valid
+                    return ConstexprValue(ret)
+                except CompilationError:
+                    raise
+                except Exception as e:
+                    return self.compile_error(
+                        f"error when calling consteval function '{fn.__name__}': {e}"
+                    )
         fn_mod = getattr(fn, "__module__", type(fn).__module__)
         fn_name = getattr(fn, "__name__", type(fn).__name__)
         return self.compile_error(
@@ -2948,7 +2957,7 @@ class MLIRCodeGenerator(ast.NodeVisitor):
             build_and_visit,
         )
 
-    def call_kernel(self, fn: Kernel, args, kws):
+    def call_kernel(self, fn: Kernel, args, kws, is_lazy=False):
         """Lower/call a kernel specialization and decode structured return values."""
 
         key = self._kernel_call_key(fn)
