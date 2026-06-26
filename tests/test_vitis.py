@@ -486,7 +486,7 @@ def test_synth_gemm_tile_pipeline():
                     C[i, j] += A[i, k] * B[k, j]
 
     s = gemm.schedule()
-    s.tile((i, j), factors=[4, 4])
+    s.tile(("i", "j"), factors=[4, 4])
     s.pipeline(s.loop("k"), ii=1)
     with tempfile.TemporaryDirectory() as project:
         report = s.export("vitis", part=PART, project_path=project).synth()
@@ -512,10 +512,9 @@ def test_synth_block_stream_datamover():
         compute(fifo, out)
 
     with tempfile.TemporaryDirectory() as project:
-        report = (
-            dmover.schedule().export("vitis", part=PART, project_path=project).synth()
-        )
-        assert report.exists()
+        mod = dmover.schedule().export("vitis", part=PART, project_path=project)
+        mod.synth()
+        assert mod.synth_report.exists()
 
 
 @requires_vitis
@@ -809,7 +808,6 @@ def test_synth_stateful_counter():
         return c
 
     with tempfile.TemporaryDirectory() as project:
-        report = (
-            counter.schedule().export("vitis", part=PART, project_path=project).synth()
-        )
-        assert report.exists()
+        mod = counter.schedule().export("vitis", part=PART, project_path=project)
+        mod.synth()
+        assert mod.synth_report.exists()
