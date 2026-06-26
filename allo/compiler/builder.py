@@ -792,6 +792,17 @@ class AlloOpBuilder:
 
         return self._emit_elementwise_binary(lhs, rhs, AlloBool, build_fn)
 
+    def to_condition(self, cond: AlloValue) -> AlloValue:
+        """Convert a scalar used in a boolean context (the test of an ``if`` /
+        ``while`` / ternary) to ``i1`` with *truthiness* semantics: ``cond != 0``."""
+        assert isinstance(cond.type, DType), "a boolean condition must be a scalar"
+        if cond.type == AlloBool:
+            return cond
+        zero = self.make_scalar(0, cond.type)
+        if cond.type.is_float():
+            return self.create_cmpf(cond, zero, CmpPred.NE)
+        return self.create_cmpi(cond, zero, CmpPred.NE)
+
     def create_max(self, lhs, rhs, *, signed=True, floating=False, propagate_nan=True):
         assert not (signed and floating)
         if floating:

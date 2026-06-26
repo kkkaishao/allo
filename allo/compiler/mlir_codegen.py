@@ -1546,7 +1546,7 @@ class MLIRCodeGenerator(ast.NodeVisitor):
     def visit_IfExp(self, node: ast.IfExp):
         cond = self.visit(node.test)
         if isinstance(cond, AlloValue):
-            cond = self.builder.scalar_cast(cond, AlloBool)
+            cond = self.builder.to_condition(cond)
             # if exp cannot define new variables
             ip, last_loc = self.builder.get_insertion_point_and_loc()
 
@@ -1629,7 +1629,7 @@ class MLIRCodeGenerator(ast.NodeVisitor):
                 return self.visit_if_impl(None, node, affine_cond=affine_cond)
         cond = self.visit(node.test)
         if isinstance(cond, AlloValue):
-            cond = self.builder.scalar_cast(cond, AlloBool)
+            cond = self.builder.to_condition(cond)
             if then_has_return or else_has_return:
                 self._visit_if_with_return_impl(
                     cond, node, then_has_return, else_has_return
@@ -2261,7 +2261,10 @@ class MLIRCodeGenerator(ast.NodeVisitor):
 
             # visit condition
             cond = self.visit(node.test)
-            cond = self.builder.cast(cond, AlloBool)
+            if isinstance(cond, AlloValue):
+                cond = self.builder.to_condition(cond)
+            else:
+                cond = self.builder.cast(cond, AlloBool)
             self.builder.set_insertion_point_to_end(before_block)
             # create cond
             ConditionOp(

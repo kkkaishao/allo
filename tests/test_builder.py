@@ -384,6 +384,55 @@ def test_if_statement_phi():
     )
 
 
+def test_int_condition_is_nonzero_test_not_low_bit():
+    # A non-bool integer used in a boolean context (the test of an
+    # `if` / `while` / ternary) must lower to a `!= 0` truthiness test, NOT a
+    # `trunci` that keeps only the low bit. Otherwise `if x & (1 << k):` is
+    # silently wrong for every k > 0 (e.g. the butterfly routing in
+    # `reverse_bits`, which only ever reversed bit 0).
+    @kernel
+    def top(data: i32, out: i32[1]):
+        out[0] = 0
+        if data & 2:  # truth lives in bit 1, not bit 0
+            out[0] = 7
+
+    ir = _compile_ir(top)
+    _assert_contains(ir, "arith.cmpi ne")
+    assert "arith.trunci" not in ir  # a low-bit truncation would be the bug
+
+    # Runtime truthiness must hold across if / while / ternary.
+    @kernel
+    def cond_if(data: i32, out: i32[1]):
+        out[0] = 0
+        if data & 2:
+            out[0] = 7
+
+    @kernel
+    def cond_while(n: i32, out: i32[1]):
+        acc: i32 = 0
+        x: i32 = n
+        while x & 4:  # bit 2 set -> enter; the bug would skip every iteration
+            acc = acc + 1
+            x = x - 4
+        out[0] = acc
+
+    @kernel
+    def cond_tern(data: i32, a: i32, b: i32) -> i32:
+        return a if (data & 2) else b
+
+    out = np.zeros(1, dtype=np.int32)
+    cond_if(np.int32(2), out)  # bit 1 set -> taken
+    assert out[0] == 7
+    cond_if(np.int32(4), out)  # bit 1 clear -> not taken
+    assert out[0] == 0
+
+    cond_while(np.int32(12), out)  # 0b1100: one pass (12&4 set, then 8&4 clear)
+    assert out[0] == 1
+
+    assert int(cond_tern(np.int32(2), np.int32(5), np.int32(9))) == 5
+    assert int(cond_tern(np.int32(1), np.int32(5), np.int32(9))) == 9
+
+
 def test_if_branch_local_buffers():
     @kernel
     def top(out: i32[8]):
