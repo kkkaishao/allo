@@ -131,6 +131,33 @@ def test_split():
     np.testing.assert_array_equal(C, A + B)
 
 
+def test_loop_query_by_induction_var():
+    # Loops are queryable by their induction-variable name even without an
+    # explicit `range(..., name=...)`.
+    M, N = 10, 20
+
+    @kernel
+    def add(A: i32[M, N], B: i32[M, N], C: i32[M, N]):
+        for i in range(M):
+            for j in range(N):
+                C[i, j] = A[i, j] + B[i, j]
+
+    s = add.schedule()
+    s.pipeline(s.loop("i"), ii=2)
+    outer, inner = s.split(s.loop("j"), factor=4)
+    mod = s.export("cpu")
+
+    assert outer.key in s.snapshot.ops_by_key
+    assert inner.key in s.snapshot.ops_by_key
+    assert "pipeline.ii = 2 : i64" in str(s.payload)
+
+    A = np.random.randint(0, 10, (M, N)).astype(np.int32)
+    B = np.random.randint(0, 10, (M, N)).astype(np.int32)
+    C = np.zeros((M, N), dtype=np.int32)
+    mod(A, B, C)
+    np.testing.assert_array_equal(C, A + B)
+
+
 def test_split_indivisible_factor():
     M, N = 10, 20
 

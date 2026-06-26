@@ -2383,11 +2383,13 @@ class MLIRCodeGenerator(ast.NodeVisitor):
                     ip=self.builder._ip,
                     loc=self.builder._loc,
                 )
-            if iterator.name:
-                assert isinstance(iterator.name, str)
-                for_op.operation.attributes[schedule_d.SCHEDULE_NAME_ATTR_NAME] = (
-                    self.builder.get_string_attr(iterator.name)
-                )
+            # Default the loop's schedule name to its induction variable, so an
+            # unnamed `for i in range(N)` is queryable as `s.loop("i")`. An
+            # explicit `range(N, name=...)` still wins.
+            loop_name = iterator.name or node.target.id
+            for_op.operation.attributes[schedule_d.SCHEDULE_NAME_ATTR_NAME] = (
+                self.builder.get_string_attr(loop_name)
+            )
             for_op_body = for_op.body
             self.builder.set_insertion_point_to_start(for_op_body)
             block_handles = [
