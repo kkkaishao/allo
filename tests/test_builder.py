@@ -1477,3 +1477,28 @@ def test_return_nested_if_error():
         top,
         "'return' is not supported inside nested 'if' statements.",
     )
+
+
+def test_kernel_defined_via_python_dash_c():
+    """A kernel defined through ``python -c`` must be compilable."""
+    import subprocess
+    import sys
+
+    code = (
+        "from __future__ import annotations\n"
+        "from allo.lang import kernel\n"
+        "from allo.lang.core import i32\n"
+        "@kernel\n"
+        "def top(x: i32, y: i32, out: i32[1]):\n"
+        "    out[0] = x + y\n"
+        "top.schedule()\n"
+        "print(str(top.module))\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", code, "extra_arg"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    _assert_contains(result.stdout, "allo.kernel public @top", "arith.addi")

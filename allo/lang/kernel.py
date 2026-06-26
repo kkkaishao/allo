@@ -44,6 +44,35 @@ class KernelOptions:
     fast_math: bool = False
 
 
+def _register_cmdline_source(fn: Callable) -> None:
+    """Make ``python -c`` kernel sources visible to :mod:`inspect`.
+
+    Under ``python -c "<code>"`` CPython < 3.13 compiles the code with
+    ``co_filename == "<string>"`` but never stores it where ``linecache`` can
+    find it, so :func:`inspect.getsourcelines` raises ``OSError``. The original
+    text is still available in :data:`sys.orig_argv`; register it in
+    ``linecache`` so inspect's normal lookup resolves it. (Python 3.13+ does
+    this natively; notebooks rely on IPython's own ``linecache`` hooks.)
+    """
+    import linecache
+    import sys
+
+    filename = fn.__code__.co_filename
+    if filename != "<string>" or filename in linecache.cache:
+        return
+    # ``sys.argv[0] == "-c"`` is CPython's reliable marker for command mode.
+    if not (sys.argv and sys.argv[0] == "-c"):
+        return
+    # The code string sits right before the script args in ``orig_argv``; the
+    # length difference locates it regardless of preceding/combined flags.
+    source = sys.orig_argv[len(sys.orig_argv) - len(sys.argv)]
+    lines = source.splitlines(keepends=True)
+    if lines and not lines[-1].endswith("\n"):
+        lines[-1] += "\n"
+    # ``mtime=None`` keeps ``linecache.checkcache`` from evicting the entry.
+    linecache.cache[filename] = (len(source), None, lines, filename)
+
+
 class Kernel(Generic[P, R]):
     def __init__(
         self,
@@ -84,10 +113,16 @@ class Kernel(Generic[P, R]):
         try:
             raw_src, begin_line = inspect.getsourcelines(fn)
         except OSError:
-            log_fatal(
-                f"Could not retrieve source code for function {fn.__name__}. "
-                "This may be due to the function being defined in an interactive environment or a dynamically generated function. "
-            )
+            _register_cmdline_source(fn)
+            try:
+                raw_src, begin_line = inspect.getsourcelines(fn)
+            except OSError:
+                log_fatal(
+                    f"Could not retrieve source code for kernel '{fn.__name__}'. "
+                    "Kernels must be defined in a source file, a notebook cell, or "
+                    "via 'python -c'; sources from the interactive REPL, piped stdin, "
+                    "or dynamically generated functions (e.g. exec/eval) cannot be recovered."
+                )
 
         src = textwrap.dedent("".join(raw_src))
         match = re.search(r"^def\s+\w+\s*\(", src, re.MULTILINE)
