@@ -74,6 +74,8 @@ def _register_cmdline_source(fn: Callable) -> None:
 
 
 class Kernel(Generic[P, R]):
+    module: Module
+
     def __init__(
         self,
         fn: Callable[P, R],
@@ -151,6 +153,9 @@ class Kernel(Generic[P, R]):
         from ..backend import CPU
 
         return CPU(self).run(*args, **kwargs)
+
+    def __str__(self) -> str:
+        return str(self.compile())
 
     def __getitem__(self, bindings):
         if not self.template:

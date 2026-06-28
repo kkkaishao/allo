@@ -47,6 +47,9 @@ class Schedule(Generic[P, R]):
         from ``Kernel.schedule()``). An optional ``primary`` selects which
         function the primitives target by default."""
 
+    def __str__(self) -> str:
+        """Return the payload IR as a string (auto-applies any pending transforms)."""
+
     @classmethod
     def from_module(cls, module: Any, context: Any = ...) -> Schedule[Any, Any]:
         """Build a schedule from an in-memory MLIR ``module``."""

@@ -153,6 +153,9 @@ class Schedule(Generic[P, R]):
         self.script = TransformScript(self, self._primary_name)
         self.query = Query(self)
 
+    def __str__(self) -> str:
+        return str(self.payload)
+
     @staticmethod
     def _detect_primary(snap: ScheduleSnapshot, primary: str | None) -> tuple[str, str]:
         """Return (name, path) of the function the schedule operates on: the named

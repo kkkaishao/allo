@@ -13,6 +13,8 @@ AxisRegisterMode = Literal["forward", "reverse", "both", "off"]
 AxiliteStorageImpl = Literal["auto", "bram", "uram"]
 VitisMode = Literal["csim", "csyn", "sw_emu", "hw_emu", "hw"]
 
+HLS_PREPARE_PIPELINE: str = ...
+
 class Vitis(Generic[P, R]):
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         """Wrap a compiled kernel for the Vitis HLS backend.
