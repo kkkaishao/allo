@@ -344,8 +344,12 @@ void VivadoHLSEmitter::emitBindStoragePragma(DictionaryAttr attr,
 void VivadoHLSEmitter::emitAffineFor(affine::AffineForOp op) {
   llvm::raw_ostream &os = state.os;
   // declare variables for iter args
+  bool firstIter = true;
   for (auto [result, iter, init] :
        llvm::zip(op.getResults(), op.getRegionIterArgs(), op.getInits())) {
+    if (!firstIter)
+      os.indent(state.currentIndent);
+    firstIter = false;
     emitValueDecl(iter);
     os << " = ";
     emitValueRef(init);
@@ -439,7 +443,9 @@ void VivadoHLSEmitter::emitAffineStore(affine::AffineStoreOp op) {
 void VivadoHLSEmitter::emitAffineIf(affine::AffineIfOp op) {
   llvm::raw_ostream &os = state.os;
   // emit results
-  for (auto result : op.getResults()) {
+  for (auto [idx, result] : llvm::enumerate(op.getResults())) {
+    if (idx)
+      os.indent(state.currentIndent);
     emitValueDecl(result);
     os << ";\n"; // leave it uninitialized for now, will be assigned in the
                  // then/else blocks
@@ -883,8 +889,12 @@ void VivadoHLSEmitter::emitMemrefGetGlobal(memref::GetGlobalOp op) {
 void VivadoHLSEmitter::emitFor(scf::ForOp op) {
   llvm::raw_ostream &os = state.os;
   // declare variables for iter args
+  bool firstIter = true;
   for (auto [result, iter, init] :
        llvm::zip(op.getResults(), op.getRegionIterArgs(), op.getInits())) {
+    if (!firstIter)
+      os.indent(state.currentIndent);
+    firstIter = false;
     emitValueDecl(iter);
     os << " = ";
     emitValueRef(init);
@@ -915,7 +925,9 @@ void VivadoHLSEmitter::emitFor(scf::ForOp op) {
 void VivadoHLSEmitter::emitIf(scf::IfOp op) {
   llvm::raw_ostream &os = state.os;
   // emit results
-  for (auto result : op.getResults()) {
+  for (auto [idx, result] : llvm::enumerate(op.getResults())) {
+    if (idx)
+      os.indent(state.currentIndent);
     emitValueDecl(result);
     os << ";\n"; // leave it unintialized for now, will be assigned in the
                  // then/else blocks
@@ -944,7 +956,10 @@ void VivadoHLSEmitter::emitIf(scf::IfOp op) {
 void VivadoHLSEmitter::emitIndexSwitch(scf::IndexSwitchOp op) {
   llvm::raw_ostream &os = state.os;
   // Pre-declare results; case/default regions assign them via scf.yield.
-  for (auto result : op.getResults()) {
+  for (auto [idx, result] : llvm::enumerate(op.getResults())) {
+    // dispatch() indents the first line; later decls start on fresh lines.
+    if (idx)
+      os.indent(state.currentIndent);
     emitValueDecl(result);
     os << ";\n";
   }
