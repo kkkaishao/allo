@@ -39,6 +39,17 @@ namespace {
 
 enum class ArgKind { Unused, ReadOnly, WriteOnly, ReadWrite, NonAnalyzable };
 
+// Read operand `idx` of a kernel's positional `allo.signed` marker ('s' =>
+// signed). MLIR integers are signless, so this is how a boundary memref's
+// element signedness is recovered to render the matching FIFO element type.
+static bool operandIsSigned(KernelOp kernel, unsigned idx) {
+  auto attr = kernel->getAttrOfType<StringAttr>(allo::kAlloSignedAttr);
+  if (!attr)
+    return false;
+  StringRef marker = attr.getValue();
+  return idx < marker.size() && marker[idx] == 's';
+}
+
 // Classify a kernel block argument by walking its direct uses. Any use that is
 // not a direct affine/memref load or store (a view, a nested invoke, ...) makes
 // the argument non-analyzable for v1.
@@ -658,6 +669,7 @@ static void buildBroadcastBody(OpBuilder &b, Location loc,
 static KernelOp buildStreamKernel(OpBuilder &b, Operation *moduleOp,
                                   Location loc, StringRef name,
                                   StreamType streamTy, unsigned numStreams,
+                                  bool isSigned,
                                   function_ref<void(Block *)> buildBody) {
   MLIRContext *ctx = b.getContext();
   SmallVector<Type, 8> inputs(numStreams, streamTy);
@@ -668,6 +680,12 @@ static KernelOp buildStreamKernel(OpBuilder &b, Operation *moduleOp,
       TypeAttr::get(FunctionType::get(ctx, inputs, {})),
       b.getStringAttr("private"),
       /*arg_attrs=*/nullptr, /*res_attrs=*/nullptr, b.getDenseI32ArrayAttr({}));
+  // All args share the boundary payload, so the marker is a uniform run of one
+  // char -- the emitter renders the FIFO element type with the right
+  // signedness.
+  kernel->setAttr(
+      allo::kAlloSignedAttr,
+      b.getStringAttr(std::string(numStreams, isSigned ? 's' : 'u')));
   SymbolTable(moduleOp).insert(kernel); // uniquify name among existing kernels
   SmallVector<Location, 8> argLocs(numStreams, loc);
   Block *entry =
@@ -682,13 +700,14 @@ static KernelOp buildStreamKernel(OpBuilder &b, Operation *moduleOp,
 // boundary, insert it into the module with a uniquified name, and return it.
 static KernelOp buildTeeKernel(OpBuilder &b, Operation *moduleOp, Location loc,
                                ArrayRef<int64_t> shape, StreamType streamTy,
-                               unsigned n, int64_t L) {
-  return buildStreamKernel(
-      b, moduleOp, loc, "streamline_tee", streamTy, n + 1, [&](Block *entry) {
-        b.setInsertionPointToStart(entry);
-        buildBroadcastBody(b, loc, shape, L, entry->getArgument(0),
-                           entry->getArguments().drop_front());
-      });
+                               unsigned n, int64_t L, bool isSigned) {
+  return buildStreamKernel(b, moduleOp, loc, "streamline_tee", streamTy, n + 1,
+                           isSigned, [&](Block *entry) {
+                             b.setInsertionPointToStart(entry);
+                             buildBroadcastBody(
+                                 b, loc, shape, L, entry->getArgument(0),
+                                 entry->getArguments().drop_front());
+                           });
 }
 
 //===--------------------------------------------------------------------===//
@@ -756,10 +775,11 @@ contiguousOuterBlock(Operation *store, MemRefType mt) {
 // uniquified name.
 static KernelOp buildMergeKernel(OpBuilder &b, Operation *moduleOp,
                                  Location loc, StreamType streamTy,
-                                 ArrayRef<int64_t> lens) {
+                                 ArrayRef<int64_t> lens, bool isSigned) {
   unsigned n = lens.size();
   return buildStreamKernel(
-      b, moduleOp, loc, "streamline_merge", streamTy, n + 1, [&](Block *entry) {
+      b, moduleOp, loc, "streamline_merge", streamTy, n + 1, isSigned,
+      [&](Block *entry) {
         Value out = entry->getArgument(n);
         b.setInsertionPointToStart(entry);
         for (unsigned k = 0; k < n; ++k) {
@@ -894,10 +914,14 @@ transform::StreamlineOp::apply(transform::TransformRewriter &rewriter,
 
   // Tag each boundary stream with its element count so the reconvergence check
   // below can recommend a deadlock-safe depth (worst-case skew = whole tensor).
-  auto makeStream = [&](StreamType ty, int64_t elems) {
+  auto makeStream = [&](StreamType ty, int64_t elems, bool isSigned) {
     rewriter.setInsertionPointToStart(parent);
     auto op = StreamCreateOp::create(rewriter, loc, ty);
     op->setAttr("allo.fifo.elems", rewriter.getI64IntegerAttr(elems));
+    // Carry the boundary payload's signedness so the emitter renders the FIFO
+    // element type to match the converted producer/consumer parameters.
+    op->setAttr(allo::kAlloSignedAttr,
+                rewriter.getStringAttr(isSigned ? "s" : "u"));
     return op.getResult();
   };
 
@@ -912,6 +936,10 @@ transform::StreamlineOp::apply(transform::TransformRewriter &rewriter,
     if (!mt.hasStaticShape())
       return emitSilenceableError()
              << "streamline boundary has a non-static footprint";
+    // The boundary's element signedness (signless in MLIR) is read from the
+    // producer kernel's marker; every stream/kernel derived from it inherits
+    // it.
+    bool sgn = operandIsSigned(producers[w[0].first].kernel, w[0].second);
 
     // lanes=L widens the boundary to L parallel FIFOs (a !allo.stream<...,[L]>)
     // moving L elements/cycle -- the bandwidth lever. It requires L to divide
@@ -934,7 +962,7 @@ transform::StreamlineOp::apply(transform::TransformRewriter &rewriter,
       // Direct hand-off: producer streams straight into the consumer's FIFO.
       auto [pi, pa] = w[0];
       auto [ci, ca] = r[0];
-      Value s = makeStream(streamTy, elems);
+      Value s = makeStream(streamTy, elems, sgn);
       convertProducerSide(rewriter, producers[pi].kernel, pa, mt, streamTy, L);
       convertConsumerSide(rewriter, consumers[ci].kernel, ca, mt, streamTy, L);
       producers[pi].invoke.setOperand(pa, s);
@@ -945,17 +973,17 @@ transform::StreamlineOp::apply(transform::TransformRewriter &rewriter,
       auto [pi, pa] = w[0];
       SmallVector<Value, 4> consumerStreams;
       for (auto [ci, ca] : r) {
-        Value s = makeStream(streamTy, elems);
+        Value s = makeStream(streamTy, elems, sgn);
         convertConsumerSide(rewriter, consumers[ci].kernel, ca, mt, streamTy,
                             L);
         consumers[ci].invoke.setOperand(ca, s);
         consumerStreams.push_back(s);
       }
-      Value prodStream = makeStream(streamTy, elems);
+      Value prodStream = makeStream(streamTy, elems, sgn);
       convertProducerSide(rewriter, producers[pi].kernel, pa, mt, streamTy, L);
       producers[pi].invoke.setOperand(pa, prodStream);
       auto tee = buildTeeKernel(rewriter, moduleOp, loc, mt.getShape(),
-                                streamTy, r.size(), L);
+                                streamTy, r.size(), L, sgn);
       rewriter.setInsertionPointAfter(producers[pi].invoke);
       SmallVector<Value, 5> teeOps{prodStream};
       teeOps.append(consumerStreams.begin(), consumerStreams.end());
@@ -1001,7 +1029,7 @@ transform::StreamlineOp::apply(transform::TransformRewriter &rewriter,
       SmallVector<Value, 4> blockStreams;
       SmallVector<int64_t, 4> lens;
       for (Blk &bk : blks) {
-        Value s = makeStream(streamTy, bk.len);
+        Value s = makeStream(streamTy, bk.len, sgn);
         BlockArgument arg =
             producers[bk.pi].kernel.getBody().front().getArgument(bk.pa);
         passthroughProducerArg(rewriter, arg, bk.store, streamTy, /*L=*/1);
@@ -1009,8 +1037,9 @@ transform::StreamlineOp::apply(transform::TransformRewriter &rewriter,
         blockStreams.push_back(s);
         lens.push_back(bk.len);
       }
-      Value merged = makeStream(streamTy, elems);
-      auto merge = buildMergeKernel(rewriter, moduleOp, loc, streamTy, lens);
+      Value merged = makeStream(streamTy, elems, sgn);
+      auto merge =
+          buildMergeKernel(rewriter, moduleOp, loc, streamTy, lens, sgn);
       rewriter.setInsertionPoint(consumers[ci].invoke);
       SmallVector<Value, 5> mergeOps(blockStreams.begin(), blockStreams.end());
       mergeOps.push_back(merged);

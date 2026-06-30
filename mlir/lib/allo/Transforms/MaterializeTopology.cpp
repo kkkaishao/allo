@@ -575,25 +575,36 @@ static LogicalResult finalizeKernelSignature(IRRewriter &rewriter,
                                              KernelMaterialization &state) {
   Block &entry = kernel.getBody().front();
   ArrayAttr oldArgAttrs = kernel.getArgAttrsAttr();
+  // rebuild the operand signess in lockstep with the new argument list
+  auto markerAttr = kernel->getAttrOfType<StringAttr>(kAlloSignedAttr);
+  StringRef oldMarker = markerAttr ? markerAttr.getValue() : StringRef();
+  unsigned numOldInputs = kernel.getFunctionType().getNumInputs();
+  auto markerCharAt = [&](unsigned i) {
+    return i < oldMarker.size() ? oldMarker[i] : 'x';
+  };
+  std::string newMarker;
+
   BitVector toErase(entry.getNumArguments());
   SmallVector<Type, 8> newInputs;
   SmallVector<Attribute> newArgAttrs;
   for (BlockArgument arg : entry.getArguments()) {
-    if (findNewPort(state.ports, arg)) {
+    if (PortInfo *port = findNewPort(state.ports, arg)) {
       newInputs.push_back(arg.getType());
       if (oldArgAttrs)
         newArgAttrs.push_back(rewriter.getDictionaryAttr({}));
+      newMarker.push_back(markerCharAt(port->sourceArgNo));
       continue;
     }
 
     if (isKeptOriginalArg(state, arg)) {
       newInputs.push_back(arg.getType());
+      unsigned sourceArgNo = getOriginalArgNo(state, arg);
       if (oldArgAttrs) {
-        unsigned sourceArgNo = getOriginalArgNo(state, arg);
         assert(sourceArgNo < oldArgAttrs.size() &&
                "arg_attrs must match the old function type");
         newArgAttrs.push_back(oldArgAttrs[sourceArgNo]);
       }
+      newMarker.push_back(markerCharAt(sourceArgNo));
       continue;
     }
 
@@ -614,6 +625,11 @@ static LogicalResult finalizeKernelSignature(IRRewriter &rewriter,
   if (oldArgAttrs)
     kernel->setAttr(kernel.getArgAttrsAttrName(),
                     rewriter.getArrayAttr(newArgAttrs));
+  if (markerAttr) {
+    if (numOldInputs <= oldMarker.size())
+      newMarker.append(oldMarker.substr(numOldInputs).str());
+    kernel->setAttr(kAlloSignedAttr, rewriter.getStringAttr(newMarker));
+  }
   return success();
 }
 
@@ -641,12 +657,18 @@ static Value getOrCreateScalarStream(
       invoke.getContext(), rankedType.getBaseType(), rankedType.getDepth(), {});
 
   OpBuilder::InsertionGuard guard(rewriter);
-  if (auto create = rankedStream.getDefiningOp<StreamCreateOp>())
-    rewriter.setInsertionPointAfter(create);
+  auto sourceCreate = rankedStream.getDefiningOp<StreamCreateOp>();
+  if (sourceCreate)
+    rewriter.setInsertionPointAfter(sourceCreate);
   else
     rewriter.setInsertionPoint(invoke);
-  Value scalarStream =
+  auto scalarCreate =
       StreamCreateOp::create(rewriter, invoke.getLoc(), scalarType);
+  // The scalar lane carries the ranked stream's payload, hence its signedness.
+  if (sourceCreate)
+    if (auto sgn = sourceCreate->getAttrOfType<StringAttr>(kAlloSignedAttr))
+      scalarCreate->setAttr(kAlloSignedAttr, sgn);
+  Value scalarStream = scalarCreate.getResult();
   streamsByLane.insert({key, scalarStream});
   return scalarStream;
 }

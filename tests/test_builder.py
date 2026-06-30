@@ -19,6 +19,7 @@ from allo.lang.core import (
     u1,
     u8,
     u32,
+    Stream,
 )
 from allo.lang.kernel import KernelOptions, consteval, kernel
 from allo.operators.arith import bitcast as allo_bitcast, max as allo_max
@@ -1148,7 +1149,8 @@ def test_stream_scalar_ir():
     ir = _compile_ir(top)
     _assert_contains(
         ir,
-        "allo.stream.create : !allo.stream<i32,2,[2,2]>",
+        "allo.stream.create",
+        "!allo.stream<i32,2,[2,2]>",
         "allo.stream.put",
         "allo.stream.get",
     )
@@ -1169,7 +1171,8 @@ def test_stream_nested_parameter_ir():
     ir = _compile_ir(top)
     _assert_contains(
         ir,
-        "allo.stream.create : !allo.stream<i32,2,[2,2]>",
+        "allo.stream.create",
+        "!allo.stream<i32,2,[2,2]>",
         "allo.kernel private @top.worker",
         "(%s: !allo.stream<i32,2,[2,2]>",
         "invoke @top.worker",

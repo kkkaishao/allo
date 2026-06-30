@@ -308,6 +308,13 @@ class AlloOpBuilder:
         op = allo_d.StreamCreateOp(
             self._materialize(stream_type), ip=self._ip, loc=self._loc
         )
+        # tag the signess for backend codegen
+        base = stream_type.base_type
+        elem = base.dtype if isinstance(base, ShapedType) else base
+        signed = isinstance(elem, DType) and elem.is_int()
+        op.operation.attributes[allo_d.SIGNED_ATTR_NAME] = self.get_string_attr(
+            "s" if signed else "u"
+        )
         return AlloValue(op.result, stream_type)
 
     #####################

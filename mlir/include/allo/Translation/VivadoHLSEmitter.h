@@ -102,8 +102,7 @@ private:
   void emitSignedOperand(Value value, bool isSigned);
   std::string getSymbolName(llvm::StringRef name);
   std::string getTemporaryName(llvm::StringRef prefix);
-  std::string getPrimitiveTypeName(Type type, bool isSigned = false);
-  std::string getStreamTypeName(StreamType type);
+  std::string getTypeName(Type type, bool isSigned = false);
 
   void dispatch(Operation *op);
 

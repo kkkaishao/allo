@@ -431,15 +431,103 @@ def test_codegen_block_stream_datamover():
     # is scaled by the block size (2 blocks x 4x4 = 32), not via stream_of_blocks.
     _contains(
         code,
-        "hls::stream<uint32_t>",
+        "hls::stream<int32_t> &",  # callee parameters
+        "hls::stream<int32_t> v",  # local stream.create
         ".write(",
         ".read()",
         "dmover_load",
         "dmover_compute",
     )
+    assert "hls::stream<uint32_t>" not in code
     _regex(code, r"#pragma HLS stream variable=v\d+ depth=32")
     assert "stream_of_blocks" not in code
     assert "read_lock" not in code
+
+
+def test_codegen_stream_signed_payload():
+    @kernel
+    def top(s_in: i32[8], u_in: u32[8], s_out: i32[8], u_out: u32[8]):
+        s_fifo: Stream[i32]
+        u_fifo: Stream[u32]
+
+        @kernel
+        def prod(
+            s_src: i32[8],
+            u_src: u32[8],
+            s_strm: Stream[i32],
+            u_strm: Stream[u32],
+        ):
+            for i in arange(8, name="i"):
+                s_strm.put(s_src[i])
+                u_strm.put(u_src[i])
+
+        @kernel
+        def cons(
+            s_strm: Stream[i32],
+            u_strm: Stream[u32],
+            s_dst: i32[8],
+            u_dst: u32[8],
+        ):
+            for i in arange(8, name="i"):
+                s_dst[i] = s_strm.get()
+                u_dst[i] = u_strm.get()
+
+        prod(s_in, u_in, s_fifo, u_fifo)
+        cons(s_fifo, u_fifo, s_out, u_out)
+
+    code = _hls(top.schedule())
+    _contains(
+        code,
+        "hls::stream<int32_t> &",  # signed callee parameter
+        "hls::stream<int32_t> v",  # signed local stream.create
+        "hls::stream<uint32_t> &",  # unsigned callee parameter
+        "hls::stream<uint32_t> v",  # unsigned local stream.create
+    )
+
+
+def test_codegen_streamline_signed_boundary():
+    # `streamline` converts a signed-int memref boundary into on-chip FIFOs and
+    # generates a `tee` for the fan-out. The boundary's signedness must reach
+    # every derived site: the local stream.create, the in-place converted
+    # producer/consumer parameters, and the generated tee kernel's parameters --
+    # all int32_t, or the dataflow wiring fails to compile.
+    N = 8
+
+    @kernel
+    def src(X: i32[N, N], T: i32[N, N]):
+        for i in arange(N, name="i"):
+            for j in arange(N, name="j"):
+                T[i, j] = X[i, j] + 1
+
+    @kernel
+    def c1(T: i32[N, N], O1: i32[N, N]):
+        for i in arange(N, name="i"):
+            for j in arange(N, name="j"):
+                O1[i, j] = T[i, j] * 2
+
+    @kernel
+    def c2(T: i32[N, N], O2: i32[N, N]):
+        for i in arange(N, name="i"):
+            for j in arange(N, name="j"):
+                O2[i, j] = T[i, j] + 3
+
+    @kernel
+    def top(X: i32[N, N], O1: i32[N, N], O2: i32[N, N]):
+        T: i32[N, N]
+        src(X, T)
+        c1(T, O1)
+        c2(T, O2)
+
+    ts = top.schedule()
+    ts.streamline("src", ["c1", "c2"])
+    ts.dataflow()
+    code = ts.export("vitis").hls_code
+    _contains(
+        code,
+        "void streamline_tee(hls::stream<int32_t> &",  # generated tee kernel
+        "hls::stream<int32_t> v",  # local stream.create boundaries
+    )
+    assert "hls::stream<uint32_t>" not in code
 
 
 def test_codegen_maxi_interface():

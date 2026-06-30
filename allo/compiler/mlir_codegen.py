@@ -119,6 +119,8 @@ def generate_signedness_marker(
                 return "s"
             if ty.is_uint():
                 return "u"
+        if isinstance(ty, StreamType):
+            return sign_char(ty.base_type)
         return "x"
 
     chars = [sign_char(ty) for ty in arg_types if not isinstance(ty, ConstexprType)]

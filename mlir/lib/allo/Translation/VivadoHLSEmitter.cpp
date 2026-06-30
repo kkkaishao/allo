@@ -83,7 +83,10 @@ std::string VivadoHLSEmitter::getTemporaryName(llvm::StringRef prefix) {
   return (prefix + std::to_string(temporaryNameCounter++)).str();
 }
 
-std::string VivadoHLSEmitter::getPrimitiveTypeName(Type type, bool isSigned) {
+std::string VivadoHLSEmitter::getTypeName(Type type, bool isSigned) {
+  if (auto streamType = dyn_cast<StreamType>(type))
+    return "hls::stream<" + getTypeName(streamType.getBaseType(), isSigned) +
+           ">";
   if (auto shapedType = dyn_cast<ShapedType>(type))
     type = shapedType.getElementType();
   /// Primitive types
@@ -138,15 +141,6 @@ std::string VivadoHLSEmitter::getPrimitiveTypeName(Type type, bool isSigned) {
   return "/*unsupported_type*/";
 }
 
-// A block payload (a shaped base type) is streamed element-by-element through a
-// scalar FIFO of its element type, rather than via hls::stream_of_blocks. A
-// plain FIFO synthesizes anywhere (stream_of_blocks is restricted to dataflow
-// regions and forbids multiple put/get in the same region) and, since the block
-// is materialized as a local array either way, costs no more hardware.
-std::string VivadoHLSEmitter::getStreamTypeName(StreamType type) {
-  return "hls::stream<" + getPrimitiveTypeName(type.getBaseType()) + ">";
-}
-
 // FIFO depth in elements: a block payload needs depth-many blocks buffered,
 // each of which is `product(blockShape)` scalar elements.
 static std::size_t streamFifoDepth(StreamType type) {
@@ -183,9 +177,8 @@ void VivadoHLSEmitter::emitFunctionReturnType(func::FuncOp func) {
   if (nResults == 0)
     state.os << "void";
   else if (nResults == 1)
-    state.os << getPrimitiveTypeName(
-        func.getResultTypes().front(),
-        operandIsSigned(func, func.getNumArguments()));
+    state.os << getTypeName(func.getResultTypes().front(),
+                            operandIsSigned(func, func.getNumArguments()));
   else {
     func->emitError()
         << "Multiple return values are not supported in Vivado HLS emitter.";
@@ -220,20 +213,18 @@ void VivadoHLSEmitter::emitFunctionArguments(func::FuncOp func) {
   for (auto arg : func.getArguments()) {
     if (arg != func.getArguments().front())
       state.os << ", ";
-    if (auto streamType = dyn_cast<StreamType>(arg.getType())) {
-      state.os << getStreamTypeName(streamType);
-      if (streamType.getShape().empty())
-        state.os << " &";
-      else
-        state.os << " ";
-      state.os << state.getOrAddName(arg);
+    state.os << getTypeName(arg.getType(),
+                            operandIsSigned(func, arg.getArgNumber()))
+             << " ";
+    auto streamType = dyn_cast<StreamType>(arg.getType());
+    // A rank-0 stream is passed by reference (hls::stream is non-copyable); a
+    // stream-array decays like any array.
+    if (streamType && streamType.getShape().empty())
+      state.os << "&";
+    state.os << state.getOrAddName(arg);
+    if (streamType)
       emitArraySuffix(streamType.getShape(), arg.getLoc());
-      continue;
-    }
-    state.os << getPrimitiveTypeName(arg.getType(),
-                                     operandIsSigned(func, arg.getArgNumber()))
-             << " " << state.getOrAddName(arg);
-    if (auto shaped = dyn_cast<ShapedType>(arg.getType()))
+    else if (auto shaped = dyn_cast<ShapedType>(arg.getType()))
       emitArraySuffix(shaped, arg.getLoc());
   }
 }
@@ -539,15 +530,10 @@ void VivadoHLSEmitter::emitValueDecl(Value val, bool isSigned) {
     return;
   }
 
-  if (auto streamType = dyn_cast<StreamType>(val.getType())) {
-    state.os << getStreamTypeName(streamType) << " " << state.addName(val);
+  state.os << getTypeName(val.getType(), isSigned) << " " << state.addName(val);
+  if (auto streamType = dyn_cast<StreamType>(val.getType()))
     emitArraySuffix(streamType.getShape(), val.getLoc());
-    return;
-  }
-
-  state.os << getPrimitiveTypeName(val.getType(), isSigned) << " "
-           << state.addName(val);
-  if (auto shaped = dyn_cast<ShapedType>(val.getType()))
+  else if (auto shaped = dyn_cast<ShapedType>(val.getType()))
     emitArraySuffix(shaped, val.getLoc());
 }
 
@@ -567,8 +553,7 @@ void VivadoHLSEmitter::emitValueRef(Value val) {
 // unsigned C++ type, so sign-sensitive ops route operands through this to read
 // them with the signedness their semantics dictate.
 void VivadoHLSEmitter::emitSignedOperand(Value value, bool isSigned) {
-  state.os << "static_cast<" << getPrimitiveTypeName(value.getType(), isSigned)
-           << ">(";
+  state.os << "static_cast<" << getTypeName(value.getType(), isSigned) << ">(";
   emitValueRef(value);
   state.os << ")";
 }
@@ -629,7 +614,12 @@ void VivadoHLSEmitter::emitStreamTransferLoops(bool isPut, Value stream,
 void VivadoHLSEmitter::emitStreamCreate(allo::StreamCreateOp op) {
   llvm::raw_ostream &os = state.os;
   auto streamType = cast<StreamType>(op.getStream().getType());
-  emitValueDecl(op.getStream());
+  // The signless payload's signedness is carried per-op (like memref.alloc) so
+  // the FIFO element type matches the callee parameters this stream feeds.
+  bool isSigned = false;
+  if (auto attr = op->getAttrOfType<StringAttr>(allo::kAlloSignedAttr))
+    isSigned = attr.getValue() == "s";
+  emitValueDecl(op.getStream(), isSigned);
   os << ";\n";
   os.indent(state.currentIndent);
   os << "#pragma HLS stream variable=" << state.getName(op.getStream())
@@ -710,7 +700,7 @@ void VivadoHLSEmitter::emitBitSetSlice(allo::BitSetSliceOp op) {
   // window in `src`, then splice in the masked value at the (possibly dynamic)
   // offset `lo`.
   std::string mask = getBitMaskLiteral(width);
-  std::string srcType = getPrimitiveTypeName(op.getSrc().getType());
+  std::string srcType = getTypeName(op.getSrc().getType());
   llvm::raw_ostream &os = state.os;
   emitValueDecl(op.getResult());
   os << " = (";
@@ -820,14 +810,13 @@ void VivadoHLSEmitter::emitMemrefGlobal(memref::GlobalOp op) {
   // unit. `emitModule` emits all globals before any function, so the definition
   // is always in scope at the point of use.
   if (!dense) {
-    os << "extern " << getPrimitiveTypeName(type) << " "
+    os << "extern " << getTypeName(type) << " "
        << getSymbolName(op.getSymName());
     emitArraySuffix(type, op.getLoc());
     os << ";";
     return;
   }
-  os << "static " << getPrimitiveTypeName(type) << " "
-     << getSymbolName(op.getSymName());
+  os << "static " << getTypeName(type) << " " << getSymbolName(op.getSymName());
   emitArraySuffix(type, op.getLoc());
   os << " = ";
   emitDenseInitializer(dense, type);
@@ -986,8 +975,7 @@ void VivadoHLSEmitter::emitSCFYield(scf::YieldOp op) {
 void VivadoHLSEmitter::emitCastOp(Operation *op) {
   llvm::raw_ostream &os = state.os;
   emitValueDecl(op->getResult(0));
-  os << " = static_cast<" << getPrimitiveTypeName(op->getResult(0).getType())
-     << ">(";
+  os << " = static_cast<" << getTypeName(op->getResult(0).getType()) << ">(";
   emitValueRef(op->getOperand(0));
   os << ");";
 }
@@ -999,8 +987,8 @@ void VivadoHLSEmitter::emitCastOp(Operation *op) {
 void VivadoHLSEmitter::emitIntExtOp(Operation *op, bool isSigned) {
   llvm::raw_ostream &os = state.os;
   emitValueDecl(op->getResult(0), isSigned);
-  os << " = static_cast<"
-     << getPrimitiveTypeName(op->getResult(0).getType(), isSigned) << ">(";
+  os << " = static_cast<" << getTypeName(op->getResult(0).getType(), isSigned)
+     << ">(";
   emitSignedOperand(op->getOperand(0), isSigned);
   os << ");";
 }
@@ -1012,8 +1000,8 @@ void VivadoHLSEmitter::emitIntExtOp(Operation *op, bool isSigned) {
 void VivadoHLSEmitter::emitFPToIntOp(Operation *op, bool isSigned) {
   llvm::raw_ostream &os = state.os;
   emitValueDecl(op->getResult(0), isSigned);
-  os << " = static_cast<"
-     << getPrimitiveTypeName(op->getResult(0).getType(), isSigned) << ">(";
+  os << " = static_cast<" << getTypeName(op->getResult(0).getType(), isSigned)
+     << ">(";
   emitValueRef(op->getOperand(0));
   os << ");";
 }
@@ -1024,8 +1012,7 @@ void VivadoHLSEmitter::emitFPToIntOp(Operation *op, bool isSigned) {
 void VivadoHLSEmitter::emitIntToFPOp(Operation *op, bool isSigned) {
   llvm::raw_ostream &os = state.os;
   emitValueDecl(op->getResult(0));
-  os << " = static_cast<" << getPrimitiveTypeName(op->getResult(0).getType())
-     << ">(";
+  os << " = static_cast<" << getTypeName(op->getResult(0).getType()) << ">(";
   emitSignedOperand(op->getOperand(0), isSigned);
   os << ");";
 }
@@ -1036,8 +1023,8 @@ void VivadoHLSEmitter::emitIntToFPOp(Operation *op, bool isSigned) {
 void VivadoHLSEmitter::emitBitcastOp(arith::BitcastOp op) {
   llvm::raw_ostream &os = state.os;
   emitValueDecl(op.getResult());
-  os << " = allo_bitcast<" << getPrimitiveTypeName(op.getResult().getType())
-     << ", " << getPrimitiveTypeName(op.getOperand().getType()) << ">(";
+  os << " = allo_bitcast<" << getTypeName(op.getResult().getType()) << ", "
+     << getTypeName(op.getOperand().getType()) << ">(";
   emitValueRef(op.getOperand());
   os << ");";
 }
