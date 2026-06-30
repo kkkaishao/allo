@@ -213,9 +213,9 @@ void VivadoHLSEmitter::emitFunctionArguments(func::FuncOp func) {
   for (auto arg : func.getArguments()) {
     if (arg != func.getArguments().front())
       state.os << ", ";
-    state.os << getTypeName(arg.getType(),
-                            operandIsSigned(func, arg.getArgNumber()))
-             << " ";
+    bool isSigned = operandIsSigned(func, arg.getArgNumber());
+    state.setSigned(arg, isSigned);
+    state.os << getTypeName(arg.getType(), isSigned) << " ";
     auto streamType = dyn_cast<StreamType>(arg.getType());
     // A rank-0 stream is passed by reference (hls::stream is non-copyable); a
     // stream-array decays like any array.
@@ -530,6 +530,7 @@ void VivadoHLSEmitter::emitValueDecl(Value val, bool isSigned) {
     return;
   }
 
+  state.setSigned(val, isSigned);
   state.os << getTypeName(val.getType(), isSigned) << " " << state.addName(val);
   if (auto streamType = dyn_cast<StreamType>(val.getType()))
     emitArraySuffix(streamType.getShape(), val.getLoc());
@@ -553,6 +554,15 @@ void VivadoHLSEmitter::emitValueRef(Value val) {
 // unsigned C++ type, so sign-sensitive ops route operands through this to read
 // them with the signedness their semantics dictate.
 void VivadoHLSEmitter::emitSignedOperand(Value value, bool isSigned) {
+  // The local's declared C++ type already fixes its signedness, so only cast
+  // when the consumer wants the other one. A same-rendered-type cast is a
+  // textual no-op -- e.g. index always renders signed, or the value was already
+  // declared with the wanted signedness.
+  if (getTypeName(value.getType(), state.signednessOf(value)) ==
+      getTypeName(value.getType(), isSigned)) {
+    emitValueRef(value);
+    return;
+  }
   state.os << "static_cast<" << getTypeName(value.getType(), isSigned) << ">(";
   emitValueRef(value);
   state.os << ")";
@@ -974,10 +984,19 @@ void VivadoHLSEmitter::emitSCFYield(scf::YieldOp op) {
 
 void VivadoHLSEmitter::emitCastOp(Operation *op) {
   llvm::raw_ostream &os = state.os;
-  emitValueDecl(op->getResult(0));
-  os << " = static_cast<" << getTypeName(op->getResult(0).getType()) << ">(";
-  emitValueRef(op->getOperand(0));
-  os << ");";
+  Value result = op->getResult(0);
+  Value operand = op->getOperand(0);
+  emitValueDecl(result);
+  os << " = ";
+  // skip cast if same rendered type
+  bool identity =
+      getTypeName(result.getType()) == getTypeName(operand.getType());
+  if (!identity)
+    os << "static_cast<" << getTypeName(result.getType()) << ">(";
+  emitValueRef(operand);
+  if (!identity)
+    os << ")";
+  os << ";";
 }
 
 // Integer widening. MLIR integers are signless, so route the operand through
@@ -986,11 +1005,19 @@ void VivadoHLSEmitter::emitCastOp(Operation *op) {
 // zero-extend.
 void VivadoHLSEmitter::emitIntExtOp(Operation *op, bool isSigned) {
   llvm::raw_ostream &os = state.os;
-  emitValueDecl(op->getResult(0), isSigned);
-  os << " = static_cast<" << getTypeName(op->getResult(0).getType(), isSigned)
-     << ">(";
-  emitSignedOperand(op->getOperand(0), isSigned);
-  os << ");";
+  Value result = op->getResult(0);
+  Value operand = op->getOperand(0);
+  emitValueDecl(result, isSigned);
+  os << " = ";
+  // skip cast if same rendered type
+  bool identity = getTypeName(result.getType(), isSigned) ==
+                  getTypeName(operand.getType(), isSigned);
+  if (!identity)
+    os << "static_cast<" << getTypeName(result.getType(), isSigned) << ">(";
+  emitSignedOperand(operand, isSigned);
+  if (!identity)
+    os << ")";
+  os << ";";
 }
 
 // arith fp-to-int (fptosi/fptoui): the integer result's signedness is fixed by

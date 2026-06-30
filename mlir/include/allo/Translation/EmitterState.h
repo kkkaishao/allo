@@ -17,6 +17,11 @@ struct EmitterState {
   std::size_t currentIndent = 0;
   std::size_t indentSize = 2;
   DenseMap<Value, std::string> nameTable;
+  // The C++ signedness each named integer value was declared with. Sign-
+  // sensitive uses consult this so they only cast when the wanted signedness
+  // differs from the declared one; a missing entry means unsigned (the
+  // default).
+  DenseMap<Value, bool> signedness;
   unsigned indexWidth = 32;
   bool withLocation = false;
   bool failed = false;
@@ -51,6 +56,13 @@ struct EmitterState {
   }
 
   bool hasName(Value v) const { return nameTable.contains(v); }
+
+  void setSigned(Value v, bool isSigned) { signedness[v] = isSigned; }
+
+  bool signednessOf(Value v) const {
+    auto it = signedness.find(v);
+    return it != signedness.end() && it->second;
+  }
 };
 } // namespace mlir::allo
 

@@ -594,7 +594,7 @@ as a convenient reference for expected behavior when Vitis is not available.
 ```python
 mod = s.export("vitis", device="u55c") # or specify part="..."
 ret = mod(A, B, C)              # csim (Python-native): == mod.csim(A, B, C)
-rpt = mod.synth()         # C-to-RTL synthesis;
+mod.synth()         # C-to-RTL synthesis;
 
 # generate sample input for emulation
 A = np.arange(N, dtype=np.float32); B = np.arange(N, dtype=np.float32)
