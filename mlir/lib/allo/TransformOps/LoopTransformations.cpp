@@ -3486,6 +3486,22 @@ static Value materializeGlobalAccessIndex(OpBuilder &builder, Location loc,
   return affine::makeComposedAffineApply(builder, loc, singleResultMap, ofrs);
 }
 
+// Resolve the single-char `allo.signed` marker ('s'/'u') for a memref value so
+// a buffer derived from it.
+static StringAttr resolveMemRefSignedMarker(Value memref) {
+  if (Operation *def = memref.getDefiningOp())
+    return def->getAttrOfType<StringAttr>(kAlloSignedAttr);
+  auto arg = dyn_cast<BlockArgument>(memref);
+  if (!arg)
+    return nullptr;
+  auto marker =
+      arg.getOwner()->getParentOp()->getAttrOfType<StringAttr>(kAlloSignedAttr);
+  if (!marker || arg.getArgNumber() >= marker.getValue().size())
+    return nullptr;
+  return StringAttr::get(memref.getContext(),
+                         marker.getValue().substr(arg.getArgNumber(), 1));
+}
+
 DiagnosedSilenceableFailure
 transform::ReuseAtOp::apply(transform::TransformRewriter &rewriter,
                             transform::TransformResults &results,
@@ -3566,6 +3582,8 @@ transform::ReuseAtOp::apply(transform::TransformRewriter &rewriter,
   auto reuseBuffer = memref::AllocOp::create(
       rewriter, axisLoop.getLoc(),
       MemRefType::get(plan.shape, targetType.getElementType()));
+  if (auto sgn = resolveMemRefSignedMarker(target))
+    reuseBuffer->setAttr(kAlloSignedAttr, sgn);
   if (executionPlan.strategy == ReuseBufferStrategy::Ring) {
     // `replaceWithAdditionalYields` builds a fresh affine.for; capture the
     // schedule annotations (e.g. allo.schedule.key) so the recreated loop stays
@@ -4140,6 +4158,8 @@ transform::BufferAtOp::apply(transform::TransformRewriter &rewriter,
   auto localBuffer = memref::AllocOp::create(
       rewriter, loc,
       MemRefType::get(footprint.shape, bufferType.getElementType()));
+  if (auto sgn = resolveMemRefSignedMarker(buffer))
+    localBuffer->setAttr(kAlloSignedAttr, sgn);
 
   if (hasLoads)
     generateBufferAtCopy(rewriter, loc, buffer, localBuffer, footprint,

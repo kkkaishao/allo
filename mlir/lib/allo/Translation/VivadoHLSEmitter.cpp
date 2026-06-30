@@ -405,7 +405,8 @@ void VivadoHLSEmitter::emitLoopDirectives(Operation *op) {
 
 void VivadoHLSEmitter::emitAffineLoad(affine::AffineLoadOp op) {
   llvm::raw_ostream &os = state.os;
-  emitValueDecl(op.getResult());
+  // The loaded scalar inherits the source buffer's element signedness.
+  emitValueDecl(op.getResult(), state.signednessOf(op.getMemref()));
   os << " = ";
   AffineMap indexMap = op.getAffineMap();
   AffineExprEmitter indexEmitter(state, op.getMapOperands(),
@@ -793,7 +794,7 @@ void VivadoHLSEmitter::emitMemrefAlloca(memref::AllocaOp op) {
 
 void VivadoHLSEmitter::emitMemrefLoad(memref::LoadOp op) {
   llvm::raw_ostream &os = state.os;
-  emitValueDecl(op.getResult());
+  emitValueDecl(op.getResult(), state.signednessOf(op.getMemref()));
   os << " = ";
   emitIndexedValue(op.getMemref(), op.getIndices());
   os << ";";

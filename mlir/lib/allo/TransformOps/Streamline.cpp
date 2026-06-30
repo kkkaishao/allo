@@ -161,6 +161,9 @@ static void streamifyProducerArg(OpBuilder &rewriter, KernelOp kernel,
 
   rewriter.setInsertionPointToStart(&entry);
   auto alloc = memref::AllocOp::create(rewriter, loc, mt);
+  alloc->setAttr(
+      allo::kAlloSignedAttr,
+      rewriter.getStringAttr(operandIsSigned(kernel, p) ? "s" : "u"));
   Value buf = alloc.getResult();
   arg.replaceAllUsesWith(buf); // existing stores now write the buffer
   arg.setType(streamTy);
@@ -197,6 +200,9 @@ static void streamifyConsumerArg(OpBuilder &rewriter, KernelOp kernel,
 
   rewriter.setInsertionPointToStart(&entry);
   auto alloc = memref::AllocOp::create(rewriter, loc, mt);
+  alloc->setAttr(
+      allo::kAlloSignedAttr,
+      rewriter.getStringAttr(operandIsSigned(kernel, c) ? "s" : "u"));
   Value buf = alloc.getResult();
   arg.replaceAllUsesWith(buf); // existing loads now read the buffer
   arg.setType(streamTy);
@@ -552,6 +558,8 @@ static void windowedConsumerArg(OpBuilder &b, KernelOp kernel, unsigned c,
   b.setInsertionPointToStart(&entry);
   auto alloc = memref::AllocOp::create(
       b, loc, MemRefType::get(cshape, mt.getElementType()));
+  alloc->setAttr(allo::kAlloSignedAttr,
+                 b.getStringAttr(operandIsSigned(kernel, c) ? "s" : "u"));
   Value cbuf = alloc.getResult();
   if (K > 1)
     partitionDimCyclic(alloc, K, /*dim=*/1); // separate the K window rows

@@ -1013,6 +1013,12 @@ class AlloOpBuilder:
             op = memref.AllocOp(
                 self._materialize(type), [], [], ip=self._ip, loc=self._loc
             )
+            # Tag element signedness for backend codegen (mirrors create_stream);
+            # MLIR integers are signless, so this marker is the only record of
+            # whether a body-local buffer holds signed data.
+            op.operation.attributes[allo_d.SIGNED_ATTR_NAME] = self.get_string_attr(
+                "s" if type.dtype.is_int() else "u"
+            )
             return AlloValue(op.result, type)
         if isinstance(type, TensorType):
             op = tensor.EmptyOp(
