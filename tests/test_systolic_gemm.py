@@ -102,10 +102,9 @@ def test_2d_csim():
 @requires_vitis
 def test_2d_synth():
     with tempfile.TemporaryDirectory() as proj:
-        report = (
-            systolic_2d.schedule().export("vitis", part=PART, project_path=proj).synth()
-        )
-        assert report.exists()
+        mod = systolic_2d.schedule().export("vitis", part=PART, project_path=proj)
+        mod.synth()
+        assert mod.synth_report.exists()
 
 
 # ===========================================================================
@@ -186,7 +185,6 @@ def test_1d_csim():
 @requires_vitis
 def test_1d_synth():
     with tempfile.TemporaryDirectory() as proj:
-        report = (
-            systolic_1d.schedule().export("vitis", part=PART, project_path=proj).synth()
-        )
-        assert report.exists()
+        mod = systolic_1d.schedule().export("vitis", part=PART, project_path=proj)
+        mod.synth()
+        assert mod.synth_report.exists()

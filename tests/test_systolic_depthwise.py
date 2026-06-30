@@ -167,4 +167,5 @@ def test_synth(variant):
         mod.set_axi(0, bundle="gmem0")
         mod.set_axi(1, bundle="gmem1")
         mod.set_axi(2, bundle="gmem2")
-        assert mod.synth().exists()
+        mod.synth()
+        assert mod.synth_report.exists()
