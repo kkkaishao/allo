@@ -70,6 +70,8 @@ HLS_PREPARE_PIPELINE = """
 builtin.module(
 grid-mapping,
 fold-constant-calls,
+canonicalize,
+cse,
 materialize-topology,
 canonicalize,
 cse,
