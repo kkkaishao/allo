@@ -101,9 +101,9 @@ def test_codegen_bf16():
     code = _hls(add_bf16.schedule())
     _contains(
         code,
-        "ap_float<16,8> v0[16]",
-        "ap_float<16,8> v1[16]",
-        "ap_float<16,8> v2[16]",
+        "ap_float<16,8> A[16]",
+        "ap_float<16,8> B[16]",
+        "ap_float<16,8> C[16]",
     )
     os.environ.pop("ALLO_ENABLE_VITIS_APFLOAT")
 
@@ -132,7 +132,7 @@ def test_codegen_vadd2_tile():
     i, j = s.loops("i", "j")
     s.tile((i, j), factors=[4, 4])
     code = _hls(s)
-    _contains(code, "void vadd2(float v0[8][8]")
+    _contains(code, "void vadd2(float A[8][8]")
     # 8 split by 4 -> a 2-iteration outer band over a 4-iteration inner band.
     _regex(code, r"< 2;", r"< 4;")
     assert code.count("for (") >= 4
@@ -152,7 +152,7 @@ def test_codegen_gemm_reorder_pipeline():
     s.reorder((s.loop("k"), s.loop("j")))
     s.pipeline(s.loop("j"), ii=1)
     code = _hls(s)
-    _contains(code, "void gemm(float v0[16][16]", "#pragma HLS pipeline II=1")
+    _contains(code, "void gemm(float A[16][16]", "#pragma HLS pipeline II=1")
     _regex(code, r"= v\d+ \* v\d+;")
     assert code.count("for (") >= 3
 
@@ -166,7 +166,7 @@ def test_codegen_reduction():
     s = vsum.schedule()
     s.pipeline(s.loop("i"), ii=1)
     code = _hls(s)
-    _contains(code, "void vsum(float v0[16], float v1[1])", "#pragma HLS pipeline II=1")
+    _contains(code, "void vsum(float A[16], float out[1])", "#pragma HLS pipeline II=1")
     _regex(code, r"= v\d+ \+ v\d+;")
 
 
@@ -179,7 +179,7 @@ def test_codegen_stencil():
     s = stencil.schedule()
     s.pipeline(s.loop("i"), ii=1)
     code = _hls(s)
-    _contains(code, "void stencil(float v0[18], float v1[16])", "#pragma HLS pipeline")
+    _contains(code, "void stencil(float A[18], float B[16])", "#pragma HLS pipeline")
     # three taps summed -> at least two additions
     assert len(re.findall(r"= v\d+ \+ v\d+;", code)) >= 2
 
@@ -191,7 +191,7 @@ def test_codegen_wide_integer():
             B[i] = A[i]
 
     code = _hls(copy256.schedule())
-    _contains(code, "void copy256(ap_uint<256> v0[8], ap_uint<256> v1[8])")
+    _contains(code, "void copy256(ap_uint<256> A[8], ap_uint<256> B[8])")
 
 
 def test_codegen_apint_csim_wrapper():
@@ -207,7 +207,7 @@ def test_codegen_apint_csim_wrapper():
     # The synthesizable interface keeps the real ap_int boundary.
     _contains(
         backend.hls_code,
-        "void vadd5(ap_int<5> v0[8], ap_uint<5> v1[8], ap_int<5> v2[8])",
+        "void vadd5(ap_int<5> A[8], ap_uint<5> B[8], ap_int<5> C[8])",
     )
     # C simulation wraps it with a std-width interface around the renamed kernel,
     # so ctypes can call it (signedness preserved per operand).
@@ -286,13 +286,13 @@ def test_codegen_while_loop():
     code = _hls(count.schedule())
     _contains(code, "while (true) {", "break;")
     # Loop-carried var declared and initialized before the loop...
-    m = re.search(r"\w+ (v\d+) = v\d+;\n\s*while \(true\) \{", code)
+    m = re.search(r"\w+ (v\d+) = \w+;\n\s*while \(true\) \{", code)
     assert m, f"loop var not declared before while in:\n{code}"
     loop_var = m.group(1)
     # ...the after-region yield assigns the next value back into it...
-    _regex(code, r"if \(!\(", rf"{loop_var} = v\d+;")
+    _regex(code, r"if \(!\(", rf"{loop_var} = \w+;")
     # ...and the while result feeding the store aliases that same variable.
-    _contains(code, f"v0[0] = {loop_var};")
+    _contains(code, f"A[0] = {loop_var};")
 
 
 @requires_vitis
@@ -369,11 +369,11 @@ def test_codegen_match_case_phi():
     code = _hls(pick.schedule())
     _contains(code, "switch (", "case 0: {", "default: {")
     # The phi result is declared before the switch and assigned in each arm.
-    m = re.search(r"\w+ (v\d+);\n\s*switch \(", code)
+    m = re.search(r"\w+ (\w+);\n\s*switch \(", code)
     assert m, f"phi result not declared before switch in:\n{code}"
     acc_var = m.group(1)
     assert code.count(f"{acc_var} = ") == 3, f"expected one assign per arm:\n{code}"
-    _contains(code, f"v1[0] = {acc_var};")
+    _contains(code, f"out[0] = {acc_var};")
 
 
 @requires_vitis
@@ -436,14 +436,14 @@ def test_codegen_block_stream_datamover():
     _contains(
         code,
         "hls::stream<int32_t> &",  # callee parameters
-        "hls::stream<int32_t> v",  # local stream.create
+        "hls::stream<int32_t> fifo",  # local stream.create (named after `fifo`)
         ".write(",
         ".read()",
         "dmover_load",
         "dmover_compute",
     )
     assert "hls::stream<uint32_t>" not in code
-    _regex(code, r"#pragma HLS stream variable=v\d+ depth=32")
+    _regex(code, r"#pragma HLS stream variable=fifo depth=32")
     assert "stream_of_blocks" not in code
     assert "read_lock" not in code
 
@@ -483,9 +483,9 @@ def test_codegen_stream_signed_payload():
     _contains(
         code,
         "hls::stream<int32_t> &",  # signed callee parameter
-        "hls::stream<int32_t> v",  # signed local stream.create
+        "hls::stream<int32_t> s_fifo",  # signed local stream.create
         "hls::stream<uint32_t> &",  # unsigned callee parameter
-        "hls::stream<uint32_t> v",  # unsigned local stream.create
+        "hls::stream<uint32_t> u_fifo",  # unsigned local stream.create
     )
 
 
@@ -546,8 +546,8 @@ def test_codegen_maxi_interface():
     code = backend.hls_code
     _contains(
         code,
-        "#pragma HLS interface mode=m_axi port=v0 offset=slave bundle=gmem",
-        "#pragma HLS interface mode=m_axi port=v1 offset=slave bundle=gmem",
+        "#pragma HLS interface mode=m_axi port=A offset=slave bundle=gmem",
+        "#pragma HLS interface mode=m_axi port=B offset=slave bundle=gmem",
     )
 
 
@@ -766,7 +766,7 @@ def test_codegen_partition_list_initialized_global():
         r"dim=0 complete",
     )
     # The pragma must sit inside the function body, after the inline pragma.
-    body = code.split('extern "C" int32_t lut(int32_t v0) {', 1)[1]
+    body = code.split('extern "C" int32_t lut(int32_t idx) {', 1)[1]
     assert "array_partition" in body
 
 
@@ -804,7 +804,7 @@ def test_codegen_bind_storage_local_buffer():
     s = bufk.schedule()
     s.bind_storage(s.buffer("buf"), impl=s.URAM, mem_type=s.RAM_2P)
     code = _hls(s)
-    _regex(code, r"#pragma HLS bind_storage variable=v\d+ type=ram_2p impl=uram")
+    _regex(code, r"#pragma HLS bind_storage variable=buf type=ram_2p impl=uram")
 
 
 def test_codegen_bind_storage_argument():
@@ -816,7 +816,7 @@ def test_codegen_bind_storage_argument():
     s = vadd.schedule()
     s.bind_storage(s.buffer("A"), impl=s.LUTRAM, mem_type=s.RAM_1P)
     code = _hls(s)
-    _contains(code, "#pragma HLS bind_storage variable=v0 type=ram_1p impl=lutram")
+    _contains(code, "#pragma HLS bind_storage variable=A type=ram_1p impl=lutram")
 
 
 def test_codegen_bind_storage_global():

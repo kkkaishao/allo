@@ -45,6 +45,8 @@ from .._mlir.schedule import (
 )
 from .._mlir.dialects import allo as allo_d
 from .._mlir.dialects import transform as t
+from .._mlir._mlir_libs._allo import ir_ext
+
 from .._mlir.dialects.transform import allo as ta
 from .._mlir.dialects.transform import interpreter
 from ..logging import log_debug, text_tail
@@ -753,7 +755,7 @@ class Schedule(Generic[P, R]):
                 )
             # Run the unapplied tail on a clone of the current payload (already-applied
             # transforms are not re-run); keep `_payload` as last-good on failure.
-            work = Module.parse(str(self._payload), self.context)
+            work = ir_ext.clone_module(self._payload)
             try:
                 interpreter.apply_named_sequence(
                     work.operation,
