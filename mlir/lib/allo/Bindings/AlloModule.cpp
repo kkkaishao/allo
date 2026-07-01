@@ -86,7 +86,7 @@ NB_MODULE(_allo, m) {
         return out;
       },
       nb::arg("module"), nb::arg("enable_apfloat"), nb::arg("top") = "",
-      nb::arg("index_width") = 32, nb::arg("with_location") = false);
+      nb::arg("index_width") = 32, nb::arg("with_location") = true);
 
   //===--------------------------------------------------------------------===//
   // schedule

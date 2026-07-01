@@ -190,9 +190,11 @@ void VivadoHLSEmitter::emitFunctionSignature(func::FuncOp func) {
 
 void VivadoHLSEmitter::emitTrailingLocation(Operation *op) {
   if (state.withLocation) {
-    if (auto loc = dyn_cast<FileLineColLoc>(op->getLoc()))
-      state.os << "\t// " << loc.getFilename() << ":" << loc.getLine() << ":"
-               << loc.getColumn();
+    if (auto loc = dyn_cast<FileLineColLoc>(op->getLoc())) {
+      state.os.indent(2 * state.indentSize);
+      state.os << "// " << loc.getFilename().data() << ":" << loc.getLine()
+               << ":" << loc.getColumn();
+    }
   }
   state.os << "\n";
 }
