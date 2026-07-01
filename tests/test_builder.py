@@ -803,9 +803,9 @@ def test_affine_index_floordiv_mod_mul():
     ir = _compile_ir(top)
     _assert_contains(
         ir,
-        "affine.load %a[%arg2 * 2]",
-        "affine.load %a[%arg2 floordiv 2]",
-        "affine.load %a[%arg2 mod 4]",
+        "affine.load %a[%i * 2]",
+        "affine.load %a[%i floordiv 2]",
+        "affine.load %a[%i mod 4]",
         "affine.store",
     )
 
@@ -833,7 +833,7 @@ def test_affine_symbol_bound():
 
     ir = _compile_ir(top)
     _assert_contains(
-        ir, "arith.index_cast %n", "affine.for %arg3 = 0 to %0", "affine.load"
+        ir, "arith.index_cast %n", "affine.for %i = 0 to %0", "affine.load"
     )
 
 
@@ -845,7 +845,7 @@ def test_affine_symbol_in_index():
             b[i] = a[i + n]
 
     ir = _compile_ir(top)
-    _assert_contains(ir, "affine.load %a[%arg3 + symbol(%n)]")
+    _assert_contains(ir, "affine.load %a[%i + symbol(%n)]")
 
 
 def test_affine_tiled_dim_bound():

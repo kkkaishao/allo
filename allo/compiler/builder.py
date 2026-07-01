@@ -1105,11 +1105,13 @@ class AlloOpBuilder:
         ub_map: ir.AffineMap,
         ub_operands: Sequence,
         steps: list[int],
+        arg_locs: Sequence[ir.Location] | None = None,
     ):
         """Build an ``affine.parallel`` from multi-result lower/upper bound maps
         (one result per dim) and their operands. ``mapOperands`` is the lower
-        operands followed by the upper operands. Returns the op and its body block
-        (one index IV per dim, terminated by an ``affine.yield``)."""
+        operands followed by the upper operands. ``arg_locs`` optionally names the
+        per-dim induction-variable block arguments. Returns the op and its body
+        block (one index IV per dim, terminated by an ``affine.yield``)."""
         ndim = len(steps)
         i64 = ir.IntegerType.get_signless(64)
         groups = [1] * ndim  # one bound expression per induction variable
@@ -1125,7 +1127,9 @@ class AlloOpBuilder:
             ip=self._ip,
             loc=self._loc,
         )
-        body = par.regions[0].blocks.append(*([ir.IndexType.get()] * ndim))
+        body = par.regions[0].blocks.append(
+            *([ir.IndexType.get()] * ndim), arg_locs=arg_locs
+        )
         with ir.InsertionPoint(body):
             affine_d.AffineYieldOp([], loc=self._loc)
         return par, body
