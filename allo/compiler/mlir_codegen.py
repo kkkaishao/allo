@@ -45,7 +45,6 @@ from .._mlir.dialects.allo import (
 from .._mlir.dialects.cf import BranchOp, CondBranchOp
 from .._mlir.dialects.scf import (
     IfOp,
-    ForOp,
     IndexSwitchOp,
     YieldOp as SCFYieldOp,
     WhileOp,
@@ -53,7 +52,7 @@ from .._mlir.dialects.scf import (
     ParallelOp,
     ReduceOp,
 )
-from .._mlir.dialects.affine import AffineForOp, AffineIfOp, AffineYieldOp
+from .._mlir.dialects.affine import AffineIfOp, AffineYieldOp
 from .._mlir.dialects.arith import SelectOp
 from .._mlir.dialects.ub import PoisonOp
 from .builder import AlloOpBuilder
@@ -2370,28 +2369,28 @@ class MLIRCodeGenerator(ast.NodeVisitor):
             names, init_handles, init_types = self._test_loop_iter_args(
                 node, liveins, ignore={node.target.id}
             )
-            with Location.name(node.target.id, self.builder._loc):
-                if is_affine:
-                    (lb_map, lb_operands), (ub_map, ub_operands) = affine_bounds
-                    for_op = AffineForOp(
-                        lb_map,
-                        ub_map,
-                        step.value,
-                        iter_args=init_handles,
-                        lower_bound_operands=[v.handle for v in lb_operands],
-                        upper_bound_operands=[v.handle for v in ub_operands],
-                        ip=self.builder._ip,
-                        loc=self.builder._loc,
-                    )
-                else:
-                    for_op = ForOp(
-                        lb.handle,
-                        ub.handle,
-                        step.handle,
-                        init_handles,
-                        ip=self.builder._ip,
-                        loc=self.builder._loc,
-                    )
+            arg_locs = [Location.name(node.target.id, self.builder._loc)] + [
+                Location.name(nm, self.builder._loc) for nm in names
+            ]
+            if is_affine:
+                (lb_map, lb_operands), (ub_map, ub_operands) = affine_bounds
+                for_op = self.builder.create_affine_for(
+                    lb_map,
+                    [v.handle for v in lb_operands],
+                    ub_map,
+                    [v.handle for v in ub_operands],
+                    step.value,
+                    init_handles,
+                    arg_locs=arg_locs,
+                )
+            else:
+                for_op = self.builder.create_scf_for(
+                    lb.handle,
+                    ub.handle,
+                    step.handle,
+                    init_handles,
+                    arg_locs=arg_locs,
+                )
             # Default the loop's schedule name to its induction variable, so an
             # unnamed `for i in range(N)` is queryable as `s.loop("i")`. An
             # explicit `range(N, name=...)` still wins.

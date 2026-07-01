@@ -11,8 +11,6 @@
 
 #include "allo/Translation/VivadoHLSEmitter.h"
 
-#include <cctype>
-
 using namespace mlir;
 using namespace mlir::allo;
 
@@ -48,19 +46,6 @@ static std::string getBitMaskLiteral(unsigned width) {
   assert(width >= 1 && width <= 64 && "bit slice width out of range");
   uint64_t mask = width == 64 ? ~uint64_t(0) : (uint64_t(1) << width) - 1;
   return "0x" + llvm::utohexstr(mask, /*LowerCase=*/true) + "ULL";
-}
-
-static std::string sanitizeCppIdentifier(llvm::StringRef name) {
-  std::string result;
-  result.reserve(name.size());
-  for (char c : name) {
-    unsigned char uc = static_cast<unsigned char>(c);
-    result.push_back(std::isalnum(uc) || c == '_' ? c : '_');
-  }
-  if (result.empty() ||
-      std::isdigit(static_cast<unsigned char>(result.front())))
-    result.insert(result.begin(), '_');
-  return result;
 }
 
 std::string VivadoHLSEmitter::getSymbolName(llvm::StringRef name) {
@@ -162,6 +147,9 @@ void VivadoHLSEmitter::emitFunction(func::FuncOp func) {
     return;
   }
 
+  // Fresh value-name scope, seeded with the argument names already assigned in
+  // the declaration pass so body locals never collide with a parameter.
+  state.beginValueScope(func.getArguments());
   emitFunctionSignature(func);
   state.os << " {\n";
   state.addIndent();
@@ -1518,8 +1506,10 @@ void VivadoHLSEmitter::emitModule(ModuleOp mod) {
     dispatch(&op);
   }
 
-  // Step 2: generate all function declarations
+  // Step 2: generate all function declarations. Each gets a fresh value-name
+  // scope so per-function argument names are uniquified within the function.
   for (auto func : mod.getOps<func::FuncOp>()) {
+    state.beginValueScope(func.getArguments());
     emitFunctionSignature(func);
     os << ";";
     emitTrailingLocation(func);

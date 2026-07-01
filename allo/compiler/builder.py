@@ -11,6 +11,8 @@ from .._mlir import ir
 from .._mlir.dialects import arith, tensor, linalg, math, memref
 from .._mlir.dialects import affine as affine_d
 from .._mlir.dialects import allo as allo_d
+from .._mlir.dialects._affine_ops_gen import AffineForOp
+from .._mlir.dialects._scf_ops_gen import ForOp
 
 from .errors import CompilationError
 from ..lang.core import (
@@ -1133,6 +1135,50 @@ class AlloOpBuilder:
         with ir.InsertionPoint(body):
             affine_d.AffineYieldOp([], loc=self._loc)
         return par, body
+
+    def create_affine_for(
+        self,
+        lb_map: ir.AffineMap,
+        lb_operands: Sequence,
+        ub_map: ir.AffineMap,
+        ub_operands: Sequence,
+        step: int,
+        iter_args: Sequence,
+        arg_locs: Sequence[ir.Location] | None = None,
+    ):
+        """Build an ``affine.for`` whose body block carries ``arg_locs`` on its
+        induction variable and loop-carried arguments. ``arg_locs`` is ordered
+        ``[iv, *iter_args]``. Returns the specialized op view."""
+        results = [v.type for v in iter_args]
+        op = AffineForOp(
+            results,
+            list(lb_operands),
+            list(ub_operands),
+            list(iter_args),
+            ir.AffineMapAttr.get(lb_map),
+            ir.AffineMapAttr.get(ub_map),
+            step,
+            ip=self._ip,
+            loc=self._loc,
+        )
+        op.regions[0].blocks.append(ir.IndexType.get(), *results, arg_locs=arg_locs)
+        return op.operation.opview
+
+    def create_scf_for(
+        self,
+        lb,
+        ub,
+        step,
+        iter_args: Sequence,
+        arg_locs: Sequence[ir.Location] | None = None,
+    ):
+        """Build an ``scf.for`` whose body block carries ``arg_locs`` on its
+        induction variable and loop-carried arguments. ``arg_locs`` is ordered
+        ``[iv, *iter_args]``. Returns the specialized op view."""
+        results = [v.type for v in iter_args]
+        op = ForOp(results, lb, ub, step, list(iter_args), ip=self._ip, loc=self._loc)
+        op.regions[0].blocks.append(op.operands[0].type, *results, arg_locs=arg_locs)
+        return op.operation.opview
 
     def _stream_handle_and_indices(self, stream):
         assert isinstance(stream, AlloValue)
