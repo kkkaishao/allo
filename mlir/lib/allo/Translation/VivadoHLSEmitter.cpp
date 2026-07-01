@@ -347,7 +347,7 @@ void VivadoHLSEmitter::emitAffineFor(affine::AffineForOp op) {
 
   if (op.getNumResults())
     os.indent(state.currentIndent);
-  os << "for (";
+  os << state.uniqueLoopLabel(op.getInductionVar()) << ": for (";
   emitValueDecl(op.getInductionVar());
   os << " = ";
   std::string ivName = state.getName(op.getInductionVar());
@@ -892,7 +892,7 @@ void VivadoHLSEmitter::emitFor(scf::ForOp op) {
 
   if (op.getNumResults())
     os.indent(state.currentIndent);
-  os << "for (";
+  os << state.uniqueLoopLabel(op.getInductionVar()) << ": for (";
   emitValueDecl(op.getInductionVar());
   os << " = ";
   emitValueRef(op.getLowerBound());
