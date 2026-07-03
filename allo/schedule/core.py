@@ -159,6 +159,15 @@ class Schedule(Generic[P, R]):
     def __str__(self) -> str:
         return self.payload.__str__()
 
+    def __call__(self, backend: str = "cpu", *args: P.args, **kwargs: P.kwargs) -> R:
+        if self.kernel is None:
+            raise ScheduleError("Cannot call a schedule without a source kernel")
+        if backend == "vitis":
+            return self.export_vitis()(*args, **kwargs)
+        if backend == "cpu":
+            return self.export_cpu()(*args, **kwargs)
+        raise ScheduleError(f"unsupported backend '{backend}' for execution")
+
     @staticmethod
     def _detect_primary(snap: ScheduleSnapshot, primary: str | None) -> tuple[str, str]:
         """Return (name, path) of the function the schedule operates on: the named

@@ -50,6 +50,15 @@ class Schedule(Generic[P, R]):
     def __str__(self) -> str:
         """Return the payload IR as a string (auto-applies any pending transforms)."""
 
+    def __call__(
+        self,
+        backend: Literal["cpu", "vitis"] = "cpu",
+        *args: P.args,
+        **kwargs: P.kwargs,
+    ) -> R:
+        """Call the scheduled kernel with ``*args``/``**kwargs`` (auto-applies any
+        pending transforms) on specified ``backend`` (default: CPU JIT)."""
+
     @classmethod
     def from_module(cls, module: Any, context: Any = ...) -> Schedule[Any, Any]:
         """Build a schedule from an in-memory MLIR ``module``."""
