@@ -674,7 +674,7 @@ not parsed — module granularity only.
 - `XILINX_VITIS` points to the Vitis install path;
   no need to source the full Vitis setup scripts before running Allo code.
 - `VIVADO_IMPL_JOBS` (default `4`) controls parallelism in the Vivado implementation
-- `ALLO_VITIS_ENABLE_APFLOAT=1` (default "0") to force `ap_float` Vitis codegen support;
+- `ALLO_ENABLE_VITIS_APFLOAT=1` (default "0") to force `ap_float` Vitis codegen support;
   `ap_float` is required for `bf16/tf32` support but needs Vitis 2023.1+ (inclusive) to build.
   If unset, Allo auto-detects Vitis version and enables `ap_float` when supported.
 
