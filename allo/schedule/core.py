@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import functools
+import copy
 from collections.abc import Iterable, Sequence
 from typing import Literal, Generic, TypeVar, ParamSpec
 from enum import Enum
@@ -146,7 +147,7 @@ class Schedule(Generic[P, R]):
         # parses `str(_payload)` into a fresh working copy, runs the delta there, and
         # rebinds `_payload` to it. The snapshot is collected from the named module so
         # value names (e.g. buffer "B") are available before the first apply.
-        self._payload = module
+        self._payload: Module = ir_ext.clone_module(module)
         self._real = ScheduleSnapshot.from_raw(
             schedule_d.collect_schedule_snapshot(module),
             primary_path=self._primary_path,
@@ -156,7 +157,7 @@ class Schedule(Generic[P, R]):
         self.query = Query(self)
 
     def __str__(self) -> str:
-        return str(self.payload)
+        return self.payload.__str__()
 
     @staticmethod
     def _detect_primary(snap: ScheduleSnapshot, primary: str | None) -> tuple[str, str]:
@@ -210,15 +211,18 @@ class Schedule(Generic[P, R]):
 
         with self.context:
             run_pipeline(self._payload, "builtin.module(reuse-cleanup)")
-        self.kernel.module = self._payload
+        # shallow copy, not modifying the original kernel
+        kernel = copy.copy(self.kernel)
+        kernel.module = self._payload
+
         if backend == "cpu":
             from ..backend import CPU
 
-            return CPU(self.kernel, **kwargs)
+            return CPU(kernel, **kwargs)
         elif backend == "vitis":
             from ..backend.vitis import Vitis
 
-            return Vitis(self.kernel, **kwargs)
+            return Vitis(kernel, **kwargs)
 
         raise ScheduleError(f"unsupported backend '{backend}' for export()")
 
