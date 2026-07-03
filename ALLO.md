@@ -30,8 +30,6 @@ from allo.operators import arith, math, linalg   # explicit operator calls
   `Stream`, `grid`, `range`, `Stateful`, `Module` come from `allo.lang`.
 - Top-level `allo` namespace also provides `allo.grid`, `allo.range`, `allo.max`,
   `allo.min`, and the spatial built-ins `allo.get_wid(axis)` / `allo.get_nw(axis)`.
-- **Always** start kernel files with `from __future__ import annotations` so
-  shaped annotations can be written as `f32[16]` instead of the quoted `"f32[16]"`.
 
 ---
 
