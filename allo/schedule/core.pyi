@@ -219,7 +219,9 @@ class Schedule(Generic[P, R]):
         (``transform.allo.reorder``); unselected loops keep their positions.
         Returns the loop handles in the requested order."""
 
-    def split(self, target: LoopRef, *, factor: int = 1) -> tuple[LoopRef, LoopRef]:
+    def split(
+        self, target: LoopRef | str, *, factor: int = 1
+    ) -> tuple[LoopRef, LoopRef]:
         """Split ``target`` loop into ``(outer, inner)`` with tiling ``factor``
         (``transform.allo.split``). ``factor`` must be positive."""
 
