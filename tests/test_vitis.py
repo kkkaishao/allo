@@ -744,6 +744,27 @@ def test_codegen_numpy_initialized_buffer_definition():
     )
 
 
+def test_codegen_bufferize_strided_slice():
+    # `bufferize` emits a module-level private copy kernel (a plain function with
+    # an affine.for) that is declared, defined and invoked from the caller.
+    @kernel
+    def slicecopy(A: i32[8], out: i32[4]):
+        new = A.bufferize([1], [4], [2])
+        for i in arange(4, name="i"):
+            out[i] = new[i]
+
+    code = _hls(slicecopy.schedule())
+    _regex(
+        code,
+        r"void _allo_bufferize_slicecopy_A_l\d+c\d+\(int32_t dst\[4\], int32_t src\[8\]\)",
+    )
+    _contains(
+        code,
+        "int32_t new_1 = src[((i0 * 2) + 1)];",
+        "dst[i0] = new_1;",
+    )
+
+
 # A scheduled `partition` on a global-backed buffer (stateful variable / list
 # initializer) records the attribute on the file-scope `memref.global`. The
 # `array_partition` pragma is function-scoped, so the emitter must re-emit it at

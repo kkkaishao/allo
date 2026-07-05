@@ -131,6 +131,17 @@ def generate_signedness_marker(
     return "".join(chars)
 
 
+def _global_symbol(func_name: str, var_id: str, kind: str, node: ast.AST) -> str:
+    """Canonical name for a compiler-emitted module global or helper kernel,
+    shared by stateful variables (``kind="stateful"``), list/NumPy-initialized
+    constants (``kind="const"``) and bufferize copy kernels (``kind="bufferize"``).
+    Keyed on the source declaration -- enclosing kernel, variable, line and column
+    -- so the name is stable and unique: repeated kernel instantiations resolve to
+    one symbol, while distinct declarations never collide. The C++ emitter
+    sanitizes it into a valid identifier."""
+    return f"_allo_{kind}_{func_name}_{var_id}_l{node.lineno}c{node.col_offset}"
+
+
 class ReturnPlacementChecker(ast.NodeVisitor):
     def __init__(self, src: str, file_name: str, begin_line: int):
         self.src = src
@@ -2028,16 +2039,9 @@ class MLIRCodeGenerator(ast.NodeVisitor):
         return value
 
     def _global_symbol(self, node: ast.AST, var_id: str, kind: str) -> str:
-        """Canonical name for a compiler-emitted module global, shared by stateful
-        variables (``kind="stateful"``) and list-initialized constants
-        (``kind="const"``). Keyed on the source declaration -- entry kernel,
-        variable, line and column -- so the name is stable and unique: repeated
-        kernel instantiations resolve to one global, while distinct declarations
-        never collide. The C++ emitter sanitizes it into a valid identifier."""
-        return (
-            f"_allo_{kind}_{self.kernel.func_name}_{var_id}"
-            f"_l{node.lineno}c{node.col_offset}"
-        )
+        """Instance-scoped wrapper over the module-level ``_global_symbol``, keyed
+        on this generator's entry kernel."""
+        return _global_symbol(self.kernel.func_name, var_id, kind, node)
 
     def _visit_stateful_decl(self, node: ast.AnnAssign, parsed_type: StatefulType):
         inner = parsed_type.inner

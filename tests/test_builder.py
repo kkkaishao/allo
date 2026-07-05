@@ -1139,6 +1139,47 @@ def test_numpy_initializer_requires_shaped_type():
     _assert_compile_error(top, "can only initialize a shaped variable")
 
 
+def test_bufferize_bound_static_slice():
+    # Bounded call `src.bufferize(...)`: a strided slice lowers to a module-level
+    # private copy kernel whose affine.for reads `src[offset + i*stride]`.
+    @kernel
+    def top(A: i32[8], out: i32[4]):
+        new = A.bufferize([1], [4], [2])
+        for i in range(4):
+            out[i] = new[i]
+
+    ir = _compile_ir(top)
+    _assert_contains(
+        ir,
+        "invoke @_allo_bufferize_top_A",
+        "allo.kernel private @_allo_bufferize_top_A",
+        "(%dst: memref<4xi32>, %src: memref<8xi32>)",
+        "affine.load %src[%i0 * 2 + 1]",
+        "affine.store %new, %dst[%i0]",
+    )
+
+
+def test_bufferize_free_numpy_dynamic_offset():
+    # Free-function call `allo.bufferize(np_array, ...)`: the NumPy constant becomes
+    # a module global and a dynamic offset is threaded through as an affine symbol
+    # (extra `%off0` kernel parameter).
+    @kernel
+    def top(r: index, out: i32[2, 2]):
+        new = allo.bufferize(_GLOBAL_NP_INT, [r, 0], [2, 2], [1, 1])
+        for i in range(2):
+            for j in range(2):
+                out[i, j] = new[i, j]
+
+    ir = _compile_ir(top)
+    _assert_contains(
+        ir,
+        'memref.global "private" @_allo_const_top__GLOBAL_NP_INT',
+        "allo.kernel private @_allo_bufferize_top__GLOBAL_NP_INT",
+        "(%dst: memref<2x2xi32>, %src: memref<2x2xi32>, %off0: index)",
+        "affine.load %src[%i0 + symbol(%off0), %i1]",
+    )
+
+
 def test_stream_scalar_ir():
     @kernel
     def top(x: i32, out: i32[1]):
