@@ -1151,8 +1151,8 @@ def test_bufferize_bound_static_slice():
     ir = _compile_ir(top)
     _assert_contains(
         ir,
-        "invoke @_allo_bufferize_top_A",
-        "allo.kernel private @_allo_bufferize_top_A",
+        "invoke @allo_bufferize_top_A",
+        "allo.kernel private @allo_bufferize_top_A",
         "(%dst: memref<4xi32>, %src: memref<8xi32>)",
         "affine.load %src[%i0 * 2 + 1]",
         "affine.store %new, %dst[%i0]",
@@ -1174,7 +1174,7 @@ def test_bufferize_free_numpy_dynamic_offset():
     _assert_contains(
         ir,
         'memref.global "private" @_allo_const_top__GLOBAL_NP_INT',
-        "allo.kernel private @_allo_bufferize_top__GLOBAL_NP_INT",
+        "allo.kernel private @allo_bufferize_top__GLOBAL_NP_INT",
         "(%dst: memref<2x2xi32>, %src: memref<2x2xi32>, %off0: index)",
         "affine.load %src[%i0 + symbol(%off0), %i1]",
     )

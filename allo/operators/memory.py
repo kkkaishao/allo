@@ -351,7 +351,10 @@ def _(builder: AlloOpBuilder, src, offsets=None, sizes=None, strides=None):
 
     kernel_name = _global_symbol(
         _enclosing_kernel_name(builder), _bufferize_var_id(node), "bufferize", node
-    )
+    )[
+        1:
+    ]  # remove the leading '_' for the kernel name
+
     call_ip, call_loc = builder.get_insertion_point_and_loc()
 
     # Destination buffer, allocated at the call site.

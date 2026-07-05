@@ -182,6 +182,8 @@ void VivadoHLSEmitter::emitFunctionSignature(func::FuncOp func) {
   // The top function is the C ABI boundary csim/synth call into
   if (isTopFunc(func))
     state.os << "extern \"C\" ";
+  else
+    state.os << "static ";
   emitFunctionReturnType(func);
   state.os << " " << getSymbolName(func.getSymName()) << "(";
   emitFunctionArguments(func);
@@ -300,6 +302,8 @@ void VivadoHLSEmitter::emitCall(func::CallOp op) {
 
 void VivadoHLSEmitter::emitPartitionPragma(allo::PartitionAttr attr,
                                            llvm::StringRef varName) {
+  unsigned i = 0;
+  unsigned n = attr.getPartitions().size();
   for (auto axiAttr : attr.getPartitions()) {
     state.os.indent(state.currentIndent);
     state.os << "#pragma HLS array_partition variable=" << varName;
@@ -318,7 +322,8 @@ void VivadoHLSEmitter::emitPartitionPragma(allo::PartitionAttr attr,
       // ignore factor for complete partition since it is not needed
       break;
     }
-    state.os << "\n";
+    if (i + 1 != n)
+      state.os << "\n";
   }
 }
 
@@ -394,7 +399,7 @@ void VivadoHLSEmitter::emitLoopDirectives(Operation *op) {
     int64_t ii = pipelineAttr.getInt();
     state.os.indent(state.currentIndent);
     if (auto rewindAttr = op->getAttrOfType<UnitAttr>(kPipelineRewindAttr)) {
-      state.os << "#pragma HLS flatten\n";
+      state.os << "#pragma HLS loop_flatten\n";
       state.os.indent(state.currentIndent);
       state.os << "#pragma HLS pipeline II=" << ii << " rewind\n";
     } else {

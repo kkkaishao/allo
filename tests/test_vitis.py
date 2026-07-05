@@ -756,7 +756,7 @@ def test_codegen_bufferize_strided_slice():
     code = _hls(slicecopy.schedule())
     _regex(
         code,
-        r"void _allo_bufferize_slicecopy_A_l\d+c\d+\(int32_t dst\[4\], int32_t src\[8\]\)",
+        r"void allo_bufferize_slicecopy_A_l\d+c\d+\(int32_t dst\[4\], int32_t src\[8\]\)",
     )
     _contains(
         code,
