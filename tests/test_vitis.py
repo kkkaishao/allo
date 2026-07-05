@@ -762,6 +762,7 @@ def test_codegen_bufferize_strided_slice():
         code,
         "int32_t new_1 = src[((i0 * 2) + 1)];",
         "dst[i0] = new_1;",
+        "#pragma HLS pipeline II=1 rewind",
     )
 
 

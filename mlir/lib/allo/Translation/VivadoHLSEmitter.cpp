@@ -393,7 +393,13 @@ void VivadoHLSEmitter::emitLoopDirectives(Operation *op) {
   if (auto pipelineAttr = op->getAttrOfType<IntegerAttr>(kPipelineIIAttr)) {
     int64_t ii = pipelineAttr.getInt();
     state.os.indent(state.currentIndent);
-    state.os << "#pragma HLS pipeline II=" << ii << "\n";
+    if (auto rewindAttr = op->getAttrOfType<UnitAttr>(kPipelineRewindAttr)) {
+      state.os << "#pragma HLS flatten\n";
+      state.os.indent(state.currentIndent);
+      state.os << "#pragma HLS pipeline II=" << ii << " rewind\n";
+    } else {
+      state.os << "#pragma HLS pipeline II=" << ii << "\n";
+    }
   }
 }
 
