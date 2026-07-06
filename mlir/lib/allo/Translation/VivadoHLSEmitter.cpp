@@ -1509,8 +1509,8 @@ void VivadoHLSEmitter::emitCmpF(arith::CmpFOp op) {
   os << ";";
 }
 
-constexpr llvm::StringLiteral deviceHeader = R"XXX(
-//===------------------------------------------------------------*- C++ -*-===//
+constexpr llvm::StringLiteral deviceHeader =
+    R"XXX(//===------------------------------------------------------------*- C++ -*-===//
 //
 // Automatically generated file for High-level Synthesis (HLS).
 //
@@ -1523,7 +1523,9 @@ constexpr llvm::StringLiteral deviceHeader = R"XXX(
 #include <hls_stream.h>
 #include <math.h>
 #include <stdint.h>
+)XXX";
 
+constexpr llvm::StringLiteral bitCastHeader = R"XXX(
 template <typename To, typename From> inline To allo_bitcast(From src) {
 #pragma HLS inline
   union {
@@ -1543,7 +1545,8 @@ void VivadoHLSEmitter::emitModule(ModuleOp mod) {
   if (state.enabledApFloat) {
     os << "#include <ap_float.h>\n";
   }
-  os << "using namespace std;\n\n";
+  os << "using namespace std;\n";
+  os << bitCastHeader << "\n";
   // Step 1: emit top-level declarations other than functions.
   for (Operation &op : mod.getBody()->without_terminator()) {
     if (isa<func::FuncOp>(&op))
