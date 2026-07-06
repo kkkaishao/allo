@@ -149,6 +149,26 @@ def test_float_add():
     _assert_contains(ir, "arith.addf")
 
 
+def test_out_of_int64_const_reports_error():
+    # int(-1e30) exceeds C int64_t, which IntegerAttr.get's nanobind binding
+    # rejects with an opaque TypeError; a readable compile error is raised first.
+    @kernel
+    def top(out: i32[1]):
+        out[0] = -1e30
+
+    _assert_compile_error(top, "is out of range")
+
+
+def test_large_unsigned_const_wraps():
+    @kernel
+    def top(out: u8[1]):
+        out[0] = 200
+
+    ir = _compile_ir(top)
+    # 200 fits int64, so it materializes as its two's-complement i8 value -56.
+    _assert_contains(ir, "arith.constant", "-56 : i8")
+
+
 def test_scalar_bitcast_float_to_int():
     @kernel
     def top(x: f32, out: i32[1]):

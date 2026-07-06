@@ -162,11 +162,26 @@ class AlloOpBuilder:
             dtype,
         )
 
+    def _checked_int_const(self, value, dtype: DType) -> int:
+        """Coerce a numeric literal to the ``int64_t`` that ``IntegerAttr``'s
+        nanobind binding accepts, raising a readable error when it overflows.
+
+        The binding wraps modulo the type width internally, but only takes a C
+        ``int64_t``, so a value outside ``[-2**63, 2**63)`` -- e.g. ``int(-1e30)``
+        from casting a large float constant to ``i32`` -- would otherwise surface
+        as an opaque nanobind ``TypeError``."""
+        ival = int(value)
+        if not -(1 << 63) <= ival < (1 << 63):
+            self.compile_error(f"Integer constant {ival} is out of range for '{dtype}'")
+        return ival
+
     def create_const_int(self, value: int, dtype: DType) -> AlloValue:
         assert dtype.is_int_signless()
         ir_ty = dtype.materialize(self.context)
         return AlloValue(
-            arith.ConstantOp(ir_ty, int(value), ip=self._ip, loc=self._loc).result,
+            arith.ConstantOp(
+                ir_ty, self._checked_int_const(value, dtype), ip=self._ip, loc=self._loc
+            ).result,
             dtype,
         )
 
@@ -217,7 +232,7 @@ class AlloOpBuilder:
         if dtype.is_float():
             return ir.FloatAttr.get(ir_ty, float(value))
         if dtype.is_int_signless() or dtype.is_index():
-            return ir.IntegerAttr.get(ir_ty, int(value))
+            return ir.IntegerAttr.get(ir_ty, self._checked_int_const(value, dtype))
         assert False, f"Unsupported dense element type: {dtype}"
 
     def _dense_initializer(self, values: Sequence[int | float], dtype: DType, shape):
