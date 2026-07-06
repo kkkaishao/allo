@@ -442,7 +442,7 @@ def detect_vitis_home(vitis_home: str | None) -> Path:
     ``$XILINX_HLS``/``$XILINX_VITIS``, then the packaged default."""
     if vitis_home:
         return Path(vitis_home)
-    vitis_env = os.environ.get("XILINX_HLS") or os.environ.get("XILINX_VITIS")
+    vitis_env = os.environ.get("XILINX_VITIS") or os.environ.get("XILINX_HLS")
     if vitis_env:
         return Path(vitis_env)
     return DEFAULT_VITIS_HOME
