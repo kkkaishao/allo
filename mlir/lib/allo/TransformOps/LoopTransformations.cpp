@@ -3139,6 +3139,7 @@ precomputeRingAccessClusterIndices(OpBuilder &builder, Location loc,
   const ReuseStatePlan &plan = executionPlan.statePlan;
   int slidingReusePos = plan.resultToReusePos[plan.slidingDim];
   assert(slidingReusePos >= 0 && "expected sliding dimension to be kept");
+  (void)slidingReusePos;
 
   for (const RingAccessCluster &cluster : collectRingAccessClusters(accesses)) {
     OpBuilder::InsertionGuard guard(builder);
