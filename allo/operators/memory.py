@@ -399,11 +399,10 @@ def _(builder: AlloOpBuilder, src, offsets=None, sizes=None, strides=None):
             [],
             arg_locs=[Location.name(f"i{d}", Location.unknown(ctx))],
         )
-        # auto rewind the innermost loop
+        # auto pipeline the innermost loop
         if d == rank - 1:
             i64_ty = IntegerType.get(64, context=ctx)
             for_op.operation.attributes["allo.pipeline.ii"] = IntegerAttr.get(i64_ty, 1)
-            for_op.operation.attributes["allo.pipeline.rewind"] = UnitAttr.get(ctx)
         for_ops.append(for_op)
         ivs.append(AlloValue(for_op.induction_variable, index))
         builder.set_insertion_point_to_start(for_op.body)

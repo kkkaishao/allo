@@ -136,6 +136,34 @@ static std::size_t streamFifoDepth(StreamType type) {
   return depth;
 }
 
+/// Return the outermost loop with `allo.pipeline.ii` if there is only
+/// a single loop nest in the block, otherwise return nullptr.
+/// This is used to determine if we can apply a rewind pragma to the loop.
+static LoopLikeOpInterface hasSingleLoopNest(Block &block) {
+  LoopLikeOpInterface ret = nullptr;
+  Block *currBlock = &block;
+  while (true) {
+    auto loopOps = llvm::to_vector<2>(currBlock->getOps<LoopLikeOpInterface>());
+    if (loopOps.size() != 1)
+      break; // has sibling loops or no loops
+    auto currLoop = loopOps.front();
+    // stop at while loops, they are not supported for rewind
+    if (isa<scf::WhileOp>(currLoop))
+      break;
+    if (currLoop->hasAttr(kPipelineIIAttr) && !ret)
+      ret = currLoop;
+
+    Block &body = currLoop->getRegion(0).front();
+    unsigned numOps = body.getOperations().size();
+    if (body.mightHaveTerminator())
+      --numOps;
+    if (numOps != 1)
+      break; // imperfect loop nest, has sibling ops in the body
+    currBlock = &body;
+  }
+  return ret;
+}
+
 void VivadoHLSEmitter::emitFunction(func::FuncOp func) {
   if (func.getBlocks().empty())
     return;
@@ -145,6 +173,10 @@ void VivadoHLSEmitter::emitFunction(func::FuncOp func) {
                          "Vivado HLS emitter.";
     state.failed = true;
     return;
+  }
+  // preprocess: auto rewind single-loop processes
+  if (auto loop = hasSingleLoopNest(func.getBlocks().front())) {
+    loop->setAttr(kPipelineRewindAttr, UnitAttr::get(func.getContext()));
   }
 
   // Fresh value-name scope, seeded with the argument names already assigned in

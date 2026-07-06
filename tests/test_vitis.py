@@ -766,6 +766,38 @@ def test_codegen_bufferize_strided_slice():
     )
 
 
+def test_codegen_auto_rewind():
+    @kernel
+    def copy(A: i32[8, 8], B: i32[8, 8]):
+        for i in range(8):
+            for j in range(8):
+                B[i, j] = A[i, j]
+
+    s = copy.schedule()
+    s.pipeline("j", ii=1)
+    code = _hls(s)
+    _contains(code, "#pragma HLS pipeline II=1 rewind")
+
+    @kernel
+    def imperfect(A: i32[8, 8], B: i32[8, 8], out: i32[1]):
+        for i in range(8):
+            acc: i32 = 0
+            for j in range(8):
+                B[i, j] = A[i, j]
+                acc += B[i, j]
+            out[0] += acc
+
+    s = imperfect.schedule()
+    s.pipeline("i", ii=1)
+    code = _hls(s)
+    _contains(code, "#pragma HLS pipeline II=1 rewind")
+
+    s = imperfect.schedule()
+    s.pipeline("j", ii=1)
+    code = _hls(s)
+    assert "#pragma HLS pipeline II=1 rewind" not in code
+
+
 # A scheduled `partition` on a global-backed buffer (stateful variable / list
 # initializer) records the attribute on the file-scope `memref.global`. The
 # `array_partition` pragma is function-scoped, so the emitter must re-emit it at
