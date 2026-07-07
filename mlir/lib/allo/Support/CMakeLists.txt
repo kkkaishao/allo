@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 add_mlir_library(MLIRAlloSupport
+    AffineValueMapBuilder.cpp
     TopologyGraph.cpp
     PARTIAL_SOURCES_INTENDED
 
@@ -11,6 +12,8 @@ add_mlir_library(MLIRAlloSupport
     LINK_LIBS PUBLIC
     MLIRAllo
     MLIRIR
+    MLIRAffineDialect
+    MLIRArithDialect
 )
 
 add_mlir_library(AlloDataflowRuntime SHARED
