@@ -30,4 +30,20 @@ def LowerDataflowPass : Pass<"lower-dataflow", "ModuleOp"> {
   }];
 }
 
+def ConvertLoopToSchedulePass : Pass<"convert-loop-to-schedule", "func::FuncOp"> {
+  let summary = "Schedule affine loops into loopschedule pipelines";
+  let description = [{
+    Analyze memory and stream dependences in affine loops, solve a modulo
+    scheduling problem for each innermost loop, and emit a
+    `loopschedule.pipeline` capturing the schedule.
+  }];
+  let dependentDialects = [
+    "circt::loopschedule::LoopScheduleDialect",
+    "mlir::affine::AffineDialect",
+    "mlir::arith::ArithDialect",
+    "mlir::memref::MemRefDialect",
+    "mlir::scf::SCFDialect"
+  ];
+}
+
 #endif // ALLO_CONVERSION_PASSES_TD

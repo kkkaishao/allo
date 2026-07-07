@@ -23,6 +23,8 @@
 #include "mlir/Dialect/Transform/IR/TransformOps.h"
 #include "mlir/Dialect/Vector/IR/VectorOps.h"
 
+#include "circt/Dialect/LoopSchedule/LoopScheduleDialect.h"
+
 #include "allo/IR/AlloOps.h"
 
 namespace mlir::allo {
@@ -45,6 +47,7 @@ inline void registerAllDialects(DialectRegistry &registry) {
     tosa::TosaDialect,
     vector::VectorDialect,
     transform::TransformDialect,
+    circt::loopschedule::LoopScheduleDialect,
     allo::AlloDialect
   >();
   // clang-format on

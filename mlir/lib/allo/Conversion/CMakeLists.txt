@@ -3,6 +3,7 @@
 
 add_mlir_conversion_library(MLIRAlloConversion
     ConvertAlloToFunc.cpp
+    ConvertLoopToSchedule.cpp
     LowerInstructions.cpp
     LowerDataflow.cpp
     LowerToLLVM.cpp
@@ -11,7 +12,10 @@ add_mlir_conversion_library(MLIRAlloConversion
     MLIRAlloIncGen
 
     LINK_LIBS PUBLIC
+    CIRCTLoopSchedule
+    CIRCTScheduling
     MLIRAllo
+    MLIRAlloSupport
     MLIRArithDialect
     MLIRBufferizationDialect
     MLIRFuncDialect
