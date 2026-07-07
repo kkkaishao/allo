@@ -5,37 +5,44 @@
 # else derive both from LLVM_BASE_DIR (the $LLVM_BASE_DIR env var, falling back
 # to the in-tree externals build).
 if(NOT DEFINED LLVM_DIR OR NOT DEFINED MLIR_DIR)
-  if(NOT DEFINED LLVM_BASE_DIR)
-    if(DEFINED ENV{LLVM_BASE_DIR})
-      set(LLVM_BASE_DIR "$ENV{LLVM_BASE_DIR}")
-    else()
-      set(LLVM_BASE_DIR "${PROJECT_SOURCE_DIR}/externals/llvm-project/build")
-    endif()
-  endif()
+  set(LLVM_BASE_DIR "${PROJECT_SOURCE_DIR}/externals/llvm-project/build")
   if(NOT EXISTS "${LLVM_BASE_DIR}/lib/cmake/mlir")
     message(FATAL_ERROR "MLIR cmake package not found under '${LLVM_BASE_DIR}'. "
-                        "Build externals/llvm-project or set -DLLVM_BASE_DIR / $LLVM_BASE_DIR.")
+                        "Build externals/llvm-project or set -DLLVM_DIR/-DMLIR_DIR to the cmake package locations.")
   endif()
   set(LLVM_DIR "${LLVM_BASE_DIR}/lib/cmake/llvm")
   set(MLIR_DIR "${LLVM_BASE_DIR}/lib/cmake/mlir")
 endif()
 
+if(NOT DEFINED CIRCT_DIR)
+  set(CIRCT_DIR "${PROJECT_SOURCE_DIR}/externals/circt/build/lib/cmake/circt")
+  if(NOT EXISTS ${CIRCT_DIR})
+    message(FATAL_ERROR "CIRCT not found under '${CIRCT_DIR}'. "
+                        "Build externals/circt or set -DCIRCT_DIR / $CIRCT_DIR.")
+  endif()
+endif()
+
 find_package(MLIR CONFIG REQUIRED)
+find_package(CIRCT CONFIG REQUIRED)
 message(STATUS "Using MLIRConfig.cmake in: ${MLIR_DIR}")
 message(STATUS "Using LLVMConfig.cmake in: ${LLVM_DIR}")
+message(STATUS "Using CIRCTConfig.cmake in: ${CIRCT_DIR}")
 
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${PROJECT_BINARY_DIR}/bin)
 set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${PROJECT_BINARY_DIR}/lib)
 
 list(APPEND CMAKE_MODULE_PATH "${MLIR_CMAKE_DIR}")
 list(APPEND CMAKE_MODULE_PATH "${LLVM_CMAKE_DIR}")
+list(APPEND CMAKE_MODULE_PATH "${CIRCT_CMAKE_DIR}")
 include(TableGen)
 include(AddLLVM)
 include(AddMLIR)
+include(AddCIRCT)
 include(HandleLLVMOptions)
 
 include_directories(${LLVM_INCLUDE_DIRS})
 include_directories(${MLIR_INCLUDE_DIRS})
+include_directories(${CIRCT_INCLUDE_DIRS})
 include_directories(${CMAKE_CURRENT_BINARY_DIR}/include)
 include_directories(${CMAKE_CURRENT_SOURCE_DIR}/include)
 add_definitions(${LLVM_DEFINITIONS})
