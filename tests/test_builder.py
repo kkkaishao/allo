@@ -240,7 +240,7 @@ def test_shift_by_range_index():
     _assert_contains(
         ir,
         "arith.index_cast",
-        "arith.shrui",
+        "arith.shrsi",
     )
 
 
