@@ -3,15 +3,17 @@
 
 add_mlir_library(MLIRAlloScheduling
     DependenceAnalysis.cpp
-    OperatorModel.cpp
+    Footprint.cpp
+    HierarchicalDependence.cpp
+    MemoryAccess.cpp
+    MemoryModel.cpp
+    OperatorLibrary.cpp
     ProblemBuilder.cpp
     RegionGraph.cpp
-    ScheduleResult.cpp
-    AlloSchedulePass.cpp
+    Scheduler.cpp
 
     DEPENDS
     MLIRAlloIncGen
-    MLIRAlloSchedulingPassIncGen
 
     LINK_LIBS PUBLIC
     CIRCTScheduling

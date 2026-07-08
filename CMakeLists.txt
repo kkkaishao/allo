@@ -23,4 +23,13 @@ set(MARL_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 set(MARL_BUILD_BENCHMARKS OFF CACHE BOOL "" FORCE)
 add_subdirectory(externals/marl EXCLUDE_FROM_ALL)
 
+# spdlog: use header-only mode to avoid rtti, exceptions, and shared lib dependencies
+if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/externals/spdlog/CMakeLists.txt")
+  message(FATAL_ERROR
+    "externals/spdlog is missing. Run: git submodule update --init externals/spdlog")
+endif()
+set(SPDLOG_NO_EXCEPTIONS ON CACHE BOOL "" FORCE)
+set(SPDLOG_BUILD_SHARED OFF CACHE BOOL "" FORCE)
+add_subdirectory(externals/spdlog EXCLUDE_FROM_ALL)
+
 add_subdirectory(mlir)

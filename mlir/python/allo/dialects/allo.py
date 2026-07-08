@@ -12,4 +12,6 @@ from .._mlir_libs._allo import (
     StreamType,
     PartitionAxisAttr,
     PartitionAttr,
+    AssumeDepTypeAttr,
+    AssumeDepDirAttr,
 )

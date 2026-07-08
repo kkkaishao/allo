@@ -1,0 +1,31 @@
+# Built-in default operator library. Mirrors the compiled-in C++ default: a
+# coarse, delay-free model (integer/float mul/div/rem and float add/sub are
+# multi-cycle; memory/stream accesses take one cycle; everything else is
+# zero-latency combinational). Use it as a template for a real device
+# characterization -- fill in delays (ns) and a frequency to drive chaining.
+device: builtin
+cycle_time_ns: 5.0
+operators:
+  - op: mul
+    latency: 3
+  - op: div
+    latency: 3
+  - op: rem
+    latency: 3
+  - op: add
+    dtype: float
+    latency: 3
+  - op: sub
+    dtype: float
+    latency: 3
+  - op: mem_read
+    latency: 1
+  - op: mem_write
+    latency: 1
+  - op: stream_read
+    latency: 1
+  - op: stream_write
+    latency: 1
+default:
+  latency: 0
+  delay_ns: 0.0

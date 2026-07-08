@@ -1119,42 +1119,6 @@ class AlloOpBuilder:
         )
         return None
 
-    def create_affine_parallel(
-        self,
-        lb_map: ir.AffineMap,
-        lb_operands: Sequence,
-        ub_map: ir.AffineMap,
-        ub_operands: Sequence,
-        steps: list[int],
-        arg_locs: Sequence[ir.Location] | None = None,
-    ):
-        """Build an ``affine.parallel`` from multi-result lower/upper bound maps
-        (one result per dim) and their operands. ``mapOperands`` is the lower
-        operands followed by the upper operands. ``arg_locs`` optionally names the
-        per-dim induction-variable block arguments. Returns the op and its body
-        block (one index IV per dim, terminated by an ``affine.yield``)."""
-        ndim = len(steps)
-        i64 = ir.IntegerType.get_signless(64)
-        groups = [1] * ndim  # one bound expression per induction variable
-        par = affine_d.AffineParallelOp(
-            [],
-            ir.ArrayAttr.get([]),  # no reductions
-            ir.AffineMapAttr.get(lb_map),
-            groups,
-            ir.AffineMapAttr.get(ub_map),
-            groups,
-            ir.ArrayAttr.get([ir.IntegerAttr.get(i64, s) for s in steps]),
-            list(lb_operands) + list(ub_operands),
-            ip=self._ip,
-            loc=self._loc,
-        )
-        body = par.regions[0].blocks.append(
-            *([ir.IndexType.get()] * ndim), arg_locs=arg_locs
-        )
-        with ir.InsertionPoint(body):
-            affine_d.AffineYieldOp([], loc=self._loc)
-        return par, body
-
     def create_affine_for(
         self,
         lb_map: ir.AffineMap,

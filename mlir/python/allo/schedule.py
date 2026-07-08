@@ -49,11 +49,3 @@ def cleanup_schedule_ids(module):
 def collect_schedule_snapshot(module):
     """Return the schedule snapshot as a nested dict (ops/values/root_id)."""
     return json.loads(_schedule.collect_schedule_snapshot_json(module))
-
-
-def collect_schedule_result(module):
-    """Return the SDC schedule result (from the `allo-schedule` pass) as a dict:
-    ``{"funcs": [{"name", "regions": [{"id","kind","ii?","length","order",
-    "ops": [{"name","t","id?"}]}], "region_edges": [{"src","dst","kind"}],
-    "concurrency": [[i, j]]}]}``."""
-    return json.loads(_schedule.collect_schedule_result_json(module))

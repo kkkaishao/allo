@@ -7,6 +7,7 @@ from typing import Any, Generic, Literal, ParamSpec, TypeVar, overload
 
 from ..backend.cpu import CPU
 from ..backend.vitis.core import Vitis
+from ..backend.rtl.core import RTL
 from .model import Ref, LoopRef, OpRef, BufferRef
 from .query import Query
 
@@ -82,6 +83,13 @@ class Schedule(Generic[P, R]):
     def export(self, backend: Literal["cpu"], **kwargs: Any) -> CPU[P, R]:
         """Apply pending transforms and hand the scheduled kernel to the CPU
         (LLVM JIT) backend, returning a ``CPU`` handle."""
+
+    @overload
+    def export(self, backend: Literal["rtl"], **kwargs: Any) -> RTL[P, R]:
+        """Apply pending transforms and hand the scheduled kernel to the RTL
+        backend (open-source, cocotb-first), returning an ``RTL`` handle
+        (``csim`` / ``cosim`` / ``synth``). ``kwargs`` are forwarded
+        (``device``/``library``, ``freq_mhz``, ``simulator``, ...)."""
 
     def export_cpu(self, **kwargs: Any) -> CPU[P, R]:
         """Shorthand for ``export("cpu", **kwargs)``."""

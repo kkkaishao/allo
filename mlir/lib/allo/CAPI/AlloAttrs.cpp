@@ -63,3 +63,39 @@ intptr_t alloPartitionAttrGetNumAxes(MlirAttribute attr) {
 MlirAttribute alloPartitionAttrGetAxis(MlirAttribute attr, intptr_t pos) {
   return wrap(cast<allo::PartitionAttr>(unwrap(attr)).getPartitions()[pos]);
 }
+
+//===----------------------------------------------------------------------===//
+// AssumeDepTypeAttr
+//===----------------------------------------------------------------------===//
+
+bool alloAttributeIsAAssumeDepType(MlirAttribute attr) {
+  return isa<allo::AssumeDepTypeEnumAttr>(unwrap(attr));
+}
+
+MlirAttribute alloAssumeDepTypeAttrGet(MlirContext ctx, uint32_t value) {
+  return wrap(allo::AssumeDepTypeEnumAttr::get(
+      unwrap(ctx), static_cast<allo::AssumeDepTypeEnum>(value)));
+}
+
+uint32_t alloAssumeDepTypeAttrGetValue(MlirAttribute attr) {
+  return static_cast<uint32_t>(
+      cast<allo::AssumeDepTypeEnumAttr>(unwrap(attr)).getValue());
+}
+
+//===----------------------------------------------------------------------===//
+// AssumeDepDirAttr
+//===----------------------------------------------------------------------===//
+
+bool alloAttributeIsAAssumeDepDir(MlirAttribute attr) {
+  return isa<allo::AssumeDepDirEnumAttr>(unwrap(attr));
+}
+
+MlirAttribute alloAssumeDepDirAttrGet(MlirContext ctx, uint32_t value) {
+  return wrap(allo::AssumeDepDirEnumAttr::get(
+      unwrap(ctx), static_cast<allo::AssumeDepDirEnum>(value)));
+}
+
+uint32_t alloAssumeDepDirAttrGetValue(MlirAttribute attr) {
+  return static_cast<uint32_t>(
+      cast<allo::AssumeDepDirEnumAttr>(unwrap(attr)).getValue());
+}

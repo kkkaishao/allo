@@ -3,128 +3,172 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-//===----------------------------------------------------------------------===//
-// Memory + stream dependence analysis. Mirrors CIRCT's MemoryDependenceAnalysis
-// for affine memref accesses and additionally understands Allo stream get/put
-// operations (see checkStreamDependence). Lifted verbatim from the old
-// convert-loop-to-schedule pass.
-//===----------------------------------------------------------------------===//
-
 #include "allo/Scheduling/DependenceAnalysis.h"
 
 #include "allo/IR/AlloOps.h"
+#include "allo/Scheduling/MemoryAccess.h"
 #include "allo/Support/AffineValueMapBuilder.h"
+#include "allo/Support/Logging.h"
 
 #include "mlir/Dialect/Affine/Analysis/AffineAnalysis.h"
 #include "mlir/Dialect/Affine/Analysis/Utils.h"
 #include "mlir/Dialect/Affine/IR/AffineMemoryOpInterfaces.h"
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Affine/LoopUtils.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/MemRef/IR/MemRef.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/Dialect/Utils/StaticValueUtils.h"
+#include "llvm/ADT/STLExtras.h"
+#include "llvm/Support/MathExtras.h"
 
 using namespace mlir;
 using namespace mlir::affine;
 using namespace mlir::allo;
+using namespace mlir::allo::logging;
 using namespace circt::analysis;
+
+//===----------------------------------------------------------------------===//
+// assume.ssa value facts
+//
+// Parse an `allo.assume.ssa` predicate into constant ranges on the SSA values
+// it constrains: each comparison of one value against a constant becomes a
+// bound, AND-ed predicates contribute independently, and the tightest bound
+// wins.
+//===----------------------------------------------------------------------===//
+
+namespace {
+// A single-variable linear fact `c*v + k (>= | ==) 0` from one comparison.
+struct Assumption {
+  Value v;
+  int64_t c, k;
+  bool isEq; // true: == 0, false: >= 0
+};
+} // namespace
+
+// Parse a comparison of one SSA value against a constant into `c*v + k (>=|==)
+// 0`. Returns nullopt for shapes we do not model (a `ne`, or both operands
+// constant or both symbolic).
+static std::optional<Assumption> parseComparison(arith::CmpIOp cmp) {
+  std::optional<int64_t> cL = getConstantIntValue(cmp.getLhs());
+  std::optional<int64_t> cR = getConstantIntValue(cmp.getRhs());
+  if (cL.has_value() == cR.has_value())
+    return std::nullopt; // need exactly one constant operand
+
+  bool isEq = false, swap = false;
+  int strict = 0;
+  using P = arith::CmpIPredicate;
+  switch (cmp.getPredicate()) {
+  case P::sge:
+  case P::uge:
+    break; // L - R >= 0
+  case P::sgt:
+  case P::ugt:
+    strict = 1;
+    break; // L - R - 1 >= 0
+  case P::sle:
+  case P::ule:
+    swap = true;
+    break; // R - L >= 0
+  case P::slt:
+  case P::ult:
+    swap = true;
+    strict = 1;
+    break; // R - L - 1 >= 0
+  case P::eq:
+    isEq = true;
+    break; // L - R == 0
+  default:
+    return std::nullopt; // ne
+  }
+
+  // Normalize to `x - y - strict`, where exactly one of x, y is the value.
+  Value x = swap ? cmp.getRhs() : cmp.getLhs();
+  Value y = swap ? cmp.getLhs() : cmp.getRhs();
+  if (std::optional<int64_t> cx = swap ? cR : cL)
+    return Assumption{y, -1, *cx - strict,
+                      isEq}; // x constant: -y + (cx - strict)
+  std::optional<int64_t> cy = swap ? cL : cR;
+  return Assumption{x, 1, -*cy - strict,
+                    isEq}; // y constant: x + (-cy - strict)
+}
+
+// Distill the parsed facts into a per-value constant range, keeping the
+// tightest bound when a value is constrained more than once.
+static void buildAssumedRanges(ArrayRef<Assumption> assumptions,
+                               llvm::DenseMap<Value, AssumedRange> &ranges) {
+  auto tighten = [&](Value v, std::optional<int64_t> lb,
+                     std::optional<int64_t> ub) {
+    AssumedRange &r = ranges[v];
+    if (lb)
+      r.lb = r.lb ? std::max(*r.lb, *lb) : lb;
+    if (ub)
+      r.ub = r.ub ? std::min(*r.ub, *ub) : ub;
+  };
+  for (const Assumption &as : assumptions) {
+    // `c*v + k (>=|==) 0`  ==>  `c*v (>=|==) -k` (c is +/-1).
+    if (as.isEq) {
+      if ((-as.k) % as.c == 0) // exact integer solution, else vacuous
+        tighten(as.v, (-as.k) / as.c, (-as.k) / as.c);
+    } else if (as.c > 0) // v >= ceil(-k / c)
+      tighten(as.v, llvm::divideCeilSigned(-as.k, as.c), std::nullopt);
+    else // c < 0: v <= floor(-k / c)
+      tighten(as.v, std::nullopt, llvm::divideFloorSigned(-as.k, as.c));
+  }
+}
+
+// Collect the facts implied by an assume.ssa predicate (an `and`-tree of
+// comparisons). Unrecognized shapes are simply not collected.
+static void collectAssumptions(Value cond, SmallVectorImpl<Assumption> &out) {
+  Operation *def = cond.getDefiningOp();
+  if (!def)
+    return;
+  if (auto andOp = dyn_cast<arith::AndIOp>(def)) {
+    collectAssumptions(andOp.getLhs(), out);
+    collectAssumptions(andOp.getRhs(), out);
+  } else if (auto cmp = dyn_cast<arith::CmpIOp>(def)) {
+    if (auto as = parseComparison(cmp))
+      out.push_back(*as);
+  }
+}
 
 //===----------------------------------------------------------------------===//
 // Memref dependences
 //===----------------------------------------------------------------------===//
 
+// Record the affine memref dependences of every ordered pair of accesses.
+// `checkMemrefAccessDependence` is queried at each loop depth from 1 to
+// numCommonLoops (a dependence carried by the d-th common surrounding loop) and
+// at numCommonLoops + 1 -- the loop-independent (intra-iteration) case, all
+// common loops pinned to the same iteration. The polyhedral test handles that
+// top depth natively: with `allowRAR = false` it also orients the otherwise-
+// symmetric dist-0 dependence by program order (reporting it only when the
+// source ancestor precedes the destination ancestor in their common block) and
+// drops read-read pairs, which never conflict. This also catches same-iteration
+// conflicts between DIFFERENT subscripts that can alias (e.g. `A[i][j]` vs
+// `A[j][i]` on the diagonal, or `A[2*i]` vs `A[i]` at i == 0). Aliasing between
+// distinct memrefs is not modeled (distinct SSA memrefs are assumed disjoint).
 static void checkMemrefDependence(SmallVectorImpl<Operation *> &memoryOps,
-                                  unsigned depth,
                                   MemoryDependenceResult &results) {
-  for (auto *source : memoryOps) {
-    for (auto *destination : memoryOps) {
-      if (source == destination)
+  for (Operation *dst : memoryOps) {
+    results.try_emplace(dst); // every access gets a (possibly empty) entry
+    affine::MemRefAccess dstAccess(dst);
+    for (Operation *src : memoryOps) {
+      if (src == dst)
         continue;
-
-      // Initialize the dependence list for this destination.
-      if (results.count(destination) == 0)
-        results[destination] = SmallVector<MemoryDependence>();
-
-      // Look for inter-iteration dependences on the same memory location.
-      affine::MemRefAccess src(source);
-      affine::MemRefAccess dst(destination);
-      affine::FlatAffineValueConstraints dependenceConstraints;
-      SmallVector<affine::DependenceComponent, 2> depComps;
-
-      // Requested depth might not be a valid comparison if they do not belong
-      // to the same loop nest
-      if (depth > affine::getInnermostCommonLoopDepth({source, destination}))
-        continue;
-
-      auto result = affine::checkMemrefAccessDependence(
-          src, dst, depth, &dependenceConstraints, &depComps, true);
-
-      results[destination].emplace_back(source, result.value, depComps);
-
-      // Also consider intra-iteration dependences on the same memory location.
-      // This currently does not consider aliasing.
-      if (src != dst)
-        continue;
-
-      // Collect surrounding loops to use in dependence components. Only proceed
-      // if we are in the innermost loop.
-      SmallVector<affine::AffineForOp> enclosingLoops;
-      affine::getAffineForIVs(*destination, &enclosingLoops);
-      if (enclosingLoops.size() != depth)
-        continue;
-
-      // Look for the common parent that src and dst share. If there is none,
-      // there is nothing more to do.
-      SmallVector<Operation *> srcParents;
-      affine::getEnclosingAffineOps(*source, &srcParents);
-      SmallVector<Operation *> dstParents;
-      affine::getEnclosingAffineOps(*destination, &dstParents);
-
-      Operation *commonParent = nullptr;
-      for (auto *srcParent : llvm::reverse(srcParents)) {
-        for (auto *dstParent : llvm::reverse(dstParents)) {
-          if (srcParent == dstParent)
-            commonParent = srcParent;
-          if (commonParent != nullptr)
-            break;
-        }
-        if (commonParent != nullptr)
-          break;
-      }
-
-      if (commonParent == nullptr)
-        continue;
-
-      // Check the common parent's regions.
-      for (auto &commonRegion : commonParent->getRegions()) {
-        if (commonRegion.empty())
-          continue;
-
-        // Only support structured constructs with single-block regions for now.
-        assert(commonRegion.hasOneBlock() &&
-               "only single-block regions are supported");
-
-        Block &commonBlock = commonRegion.front();
-
-        // Find the src and dst ancestor in the common block, if any.
-        Operation *srcOrAncestor = commonBlock.findAncestorOpInBlock(*source);
-        Operation *dstOrAncestor =
-            commonBlock.findAncestorOpInBlock(*destination);
-        if (srcOrAncestor == nullptr || dstOrAncestor == nullptr)
-          continue;
-
-        // Check if the src or its ancestor is before the dst or its ancestor.
-        if (srcOrAncestor->isBeforeInBlock(dstOrAncestor)) {
-          // Build dependence components for each loop depth.
-          SmallVector<affine::DependenceComponent> intraDeps;
-          for (size_t i = 0; i < depth; ++i) {
-            affine::DependenceComponent depComp;
-            depComp.op = enclosingLoops[i];
-            depComp.lb = 0;
-            depComp.ub = 0;
-            intraDeps.push_back(depComp);
-          }
-
-          results[destination].emplace_back(
-              source, affine::DependenceResult::HasDependence, intraDeps);
-        }
+      affine::MemRefAccess srcAccess(src);
+      unsigned numCommon = affine::getInnermostCommonLoopDepth({src, dst});
+      for (unsigned depth = 1; depth <= numCommon + 1; ++depth) {
+        // Carried depths keep read-after-read reuse edges (allowRAR = true);
+        // the loop-independent depth uses allowRAR = false so the dist-0 edge
+        // is oriented by program order and read-read pairs get none.
+        bool allowRAR = depth <= numCommon;
+        affine::FlatAffineValueConstraints constraints;
+        SmallVector<affine::DependenceComponent, 2> comps;
+        affine::DependenceResult result = affine::checkMemrefAccessDependence(
+            srcAccess, dstAccess, depth, &constraints, &comps, allowRAR);
+        if (hasDependence(result.value))
+          results[dst].emplace_back(src, result.value, comps);
       }
     }
   }
@@ -134,29 +178,35 @@ static void checkMemrefDependence(SmallVectorImpl<Operation *> &memoryOps,
 // Stream dependences
 //===----------------------------------------------------------------------===//
 
-// Returns the base stream SSA value a stream get/put operates on. Two accesses
-// on different bases are always independent (SSA identity is a precise
-// disambiguation for streams, which are not reassigned through aliases).
-static Value getStreamBase(Operation *op) {
-  if (auto get = dyn_cast<StreamGetOp>(op))
-    return get.getStream();
-  return cast<StreamPutOp>(op).getStream();
+// The base stream SSA value a stream get/put operates on (views peeled). Two
+// accesses on different bases are always independent (SSA identity is a precise
+// disambiguation for streams, not reassigned through aliases).
+static Value getStreamBase(Operation *op) { return asMemAccess(op)->root; }
+
+// The FIFO-selecting indices of a stream get/put operation.
+static SmallVector<Value, 4> getStreamIndices(Operation *op) {
+  return asMemAccess(op)->indices;
 }
 
-// Returns the FIFO-selecting indices of a stream get/put operation.
-static OperandRange getStreamIndices(Operation *op) {
-  if (auto get = dyn_cast<StreamGetOp>(op))
-    return get.getIndices();
-  return cast<StreamPutOp>(op).getIndices();
-}
-
-// Nearest enclosing affine.for, skipping non-loop parents (e.g. affine.if).
-static affine::AffineForOp getNearestAffineFor(Operation *op) {
+// Nearest enclosing counted loop (affine.for or scf.for), skipping non-loop
+// parents (e.g. affine.if / scf.if). Null if the op is not inside a loop.
+static Operation *getNearestLoop(Operation *op) {
   for (Operation *parent = op->getParentOp(); parent;
        parent = parent->getParentOp())
-    if (auto forOp = dyn_cast<affine::AffineForOp>(parent))
-      return forOp;
+    if (isa<affine::AffineForOp, scf::ForOp, scf::WhileOp>(parent))
+      return parent;
   return nullptr;
+}
+
+// Enclosing counted loops (affine.for or scf.for) of `op`, ordered outermost ->
+// innermost (matching getAffineForIVs), for building dependence components.
+static SmallVector<Operation *> getEnclosingLoops(Operation *op) {
+  SmallVector<Operation *> inner; // innermost -> outermost as collected
+  for (Operation *parent = op->getParentOp(); parent;
+       parent = parent->getParentOp())
+    if (isa<affine::AffineForOp, scf::ForOp, scf::WhileOp>(parent))
+      inner.push_back(parent);
+  return llvm::to_vector(llvm::reverse(inner));
 }
 
 // Whether two same-base stream accesses may touch the same FIFO. A stream value
@@ -203,10 +253,8 @@ static FifoAlias compareFifo(AffineValueMapBuilder &builder, Operation *a,
 // `distance` on the innermost loop (the only component the scheduler reads).
 static SmallVector<affine::DependenceComponent>
 streamDepComponents(Operation *op, int64_t distance) {
-  SmallVector<affine::AffineForOp> loops;
-  affine::getAffineForIVs(*op, &loops);
   SmallVector<affine::DependenceComponent> comps;
-  for (auto loop : loops) {
+  for (Operation *loop : getEnclosingLoops(op)) {
     affine::DependenceComponent comp;
     comp.op = loop;
     comp.lb = 0;
@@ -222,7 +270,14 @@ streamDepComponents(Operation *op, int64_t distance) {
 // program+iteration order, regardless of direction (unlike memory, get-get is
 // ordered and there is no RAW/WAR/WAW distinction). Each may-aliasing pair is
 // serialized with a distance-0 intra-iteration edge plus a distance-1
-// loop-carried back edge, closing the recurrence that bounds the II.
+// loop-carried back edge, closing the recurrence that bounds the II. With the
+// latency-1 stream operators the back edge yields exactly the FIFO issue-order
+// bound (II >= 1 + (t_later - t_earlier)), so this is precise, not
+// conservative. The all-pairs serialization is deliberate: within a
+// mutually-aliasing group the extra edges are implied by transitivity (a chain
+// would suffice) and leave the SDC optimum unchanged, while the per-pair
+// `Distinct` pruning keeps provably-separate FIFOs independent -- a plain
+// program-order chain could not, since FIFO may-aliasing is non-transitive.
 static void checkStreamDependence(SmallVectorImpl<Operation *> &streamOps,
                                   AffineValueMapBuilder &builder,
                                   MemoryDependenceResult &results) {
@@ -238,8 +293,8 @@ static void checkStreamDependence(SmallVectorImpl<Operation *> &streamOps,
 
       // Only serialize accesses sharing the same innermost loop, so both ends
       // of the edge land in a single scheduling problem.
-      affine::AffineForOp loop = getNearestAffineFor(earlier);
-      if (!loop || loop != getNearestAffineFor(later))
+      Operation *loop = getNearestLoop(earlier);
+      if (!loop || loop != getNearestLoop(later))
         continue;
 
       // Provably-distinct FIFOs are independent; same or unknown are ordered.
@@ -257,31 +312,272 @@ static void checkStreamDependence(SmallVectorImpl<Operation *> &streamOps,
 }
 
 //===----------------------------------------------------------------------===//
+// Non-affine memref dependences
+//===----------------------------------------------------------------------===//
+
+// The array root a load/store accesses, affine or not (views peeled). No alias
+// analysis beyond that: distinct roots are distinct arrays (the Allo frontend
+// has no pointers).
+static Value accessedMemRef(Operation *op) { return asMemAccess(op)->root; }
+
+static bool accessIsWrite(Operation *op) { return asMemAccess(op)->isWrite; }
+
+// Dependence components mirroring the op's enclosing loop nest, `distance` on
+// the innermost loop. Empty (loop-independent, distance 0) when the op is not
+// in any loop -- unlike streamDepComponents, a non-affine access may be
+// straight-line.
+static SmallVector<affine::DependenceComponent>
+memDepComponents(Operation *op, int64_t distance) {
+  SmallVector<affine::DependenceComponent> comps;
+  for (Operation *loop : getEnclosingLoops(op)) {
+    affine::DependenceComponent comp;
+    comp.op = loop;
+    comp.lb = 0;
+    comp.ub = 0;
+    comps.push_back(comp);
+  }
+  if (!comps.empty())
+    comps.back().lb = distance;
+  return comps;
+}
+
+// Conservative memory dependences for pairs where at least one access is
+// non-affine (plain memref.load/store -- indirect A[idx[i]], histogram/scatter,
+// scf-lowered tiles). The polyhedral test cannot reason about them, so --
+// following Vitis's "assumed dependent unless proven disjoint" rule -- any two
+// accesses to the same array with at least one write are serialized in program
+// order (a distance-0 forward edge), plus a distance-1 loop-carried back edge
+// when they share an innermost loop (closing the recurrence that bounds II).
+// Read-read pairs commute and are left independent. This is the correctness
+// backstop that keeps non-affine accesses from being silently reordered; an
+// `allo.assume.nodep` hint can prune a proven-false edge to recover II.
+static void
+checkNonAffineDependence(ArrayRef<Operation *> accessOps,
+                         const llvm::SmallDenseSet<Operation *> &nonAffine,
+                         MemoryDependenceResult &results) {
+  for (unsigned i = 0, e = accessOps.size(); i < e; ++i) {
+    for (unsigned j = i + 1; j < e; ++j) {
+      Operation *earlier = accessOps[i];
+      Operation *later = accessOps[j];
+
+      // Affine-affine pairs are handled precisely by the polyhedral test.
+      if (!nonAffine.contains(earlier) && !nonAffine.contains(later))
+        continue;
+      // Different arrays never conflict; read-read pairs commute.
+      if (accessedMemRef(earlier) != accessedMemRef(later))
+        continue;
+      if (!accessIsWrite(earlier) && !accessIsWrite(later))
+        continue;
+
+      // Forward intra-iteration edge (preserve program order).
+      results[later].emplace_back(earlier,
+                                  affine::DependenceResult::HasDependence,
+                                  memDepComponents(later, /*distance=*/0));
+      // Loop-carried back edge when both share an innermost loop, so the pair
+      // lands in one cyclic problem and the recurrence bounds II. An
+      // `allo.assume.nodep` hint (e.g. from a lowered grid()) can later prune
+      // this conservative edge to recover II.
+      Operation *loop = getNearestLoop(earlier);
+      if (loop && loop == getNearestLoop(later))
+        results[earlier].emplace_back(
+            later, affine::DependenceResult::HasDependence,
+            memDepComponents(earlier, /*distance=*/1));
+    }
+  }
+}
+
+//===----------------------------------------------------------------------===//
+// assume.nodep hint consumption
+//===----------------------------------------------------------------------===//
+
+// Direction of a dependence edge source -> dst by the read/write nature of its
+// endpoints. In both the forward and back-edge orientations `source` is the
+// producer (scheduled first) and `dst` the consumer, so this is orientation-
+// independent: read-after-write is a write source + read dst, etc.
+static AssumeDepDirEnum edgeDirection(Operation *source, Operation *dst) {
+  bool sw = accessIsWrite(source), dw = accessIsWrite(dst);
+  if (sw && dw)
+    return AssumeDepDirEnum::WAW;
+  return sw ? AssumeDepDirEnum::RAW : AssumeDepDirEnum::WAR;
+}
+
+// The body block of the counted loop (affine.for or scf.for) whose induction
+// variable is `iv`, or null if `iv` is not a counted-loop induction variable.
+static Block *loopBodyForIV(Value iv) {
+  if (affine::AffineForOp loop = affine::getForInductionVarOwner(iv))
+    return loop.getBody();
+  if (scf::ForOp loop = scf::getForInductionVarOwner(iv))
+    return loop.getBody();
+  // `flatten-perfect-loops` coalesces a nest by rewriting each original iv to
+  // an `affine.apply` (floordiv/mod) of the surviving iv; trace back through it
+  // so a nodep scoped to a pre-coalescing iv still resolves to the coalesced
+  // loop.
+  if (auto apply = iv.getDefiningOp<affine::AffineApplyOp>())
+    for (Value operand : apply.getOperands())
+      if (Block *body = loopBodyForIV(operand))
+        return body;
+  return nullptr;
+}
+
+// Prune the conservative (non-affine) dependence edges that an
+// `allo.assume.nodep` (dependent = false) declares absent, matching by array,
+// enclosing loop, inter/intra class, and -- when given -- direction and
+// distance. Only conservative edges are removed: a proven affine dependence is
+// never dropped, so a hint that merely restates something the analysis already
+// inferred (an affine-provable independence leaves no edge; an affine-provable
+// dependence is not a conservative edge) is a no-op.
+static void applyNoDepHints(ArrayRef<AssumeNoDepOp> hints,
+                            const llvm::SmallDenseSet<Operation *> &nonAffine,
+                            MemoryDependenceResult &results) {
+  for (AssumeNoDepOp hint : hints) {
+    if (hint.getDependent())
+      // Only "no dependence" assertions prune. `dependent = true` (assert-add)
+      // is intentionally a no-op: the analysis is already conservative, so it
+      // never misses a real dependence to re-add. Implement only if a real need
+      // arises.
+      continue;
+    // Resolve through views so it compares equal to accessedMemRef's roots.
+    Value array = resolveRoot(hint.getVariable());
+    Block *body = loopBodyForIV(hint.getIv());
+    if (!body)
+      continue;
+    bool inter = hint.getDepType() == AssumeDepTypeEnum::Inter;
+    std::optional<AssumeDepDirEnum> dir = hint.getDirection();
+    IntegerAttr distAttr = hint.getDistanceAttr();
+
+    auto matches = [&](Operation *source, Operation *dst,
+                       const MemoryDependence &dep) {
+      // Same array, at least one non-affine endpoint (a conservative edge),
+      // both accesses inside the hinted loop.
+      if (accessedMemRef(source) != array || accessedMemRef(dst) != array)
+        return false;
+      if (!nonAffine.contains(source) && !nonAffine.contains(dst))
+        return false;
+      if (!body->findAncestorOpInBlock(*source) ||
+          !body->findAncestorOpInBlock(*dst))
+        return false;
+      // inter- vs intra-iteration by the innermost distance component.
+      int64_t d = dep.dependenceComponents.empty()
+                      ? 0
+                      : dep.dependenceComponents.back().lb.value_or(0);
+      if (inter ? d < 1 : d != 0)
+        return false;
+      if (dir && edgeDirection(source, dst) != *dir)
+        return false;
+      if (distAttr && d != distAttr.getInt())
+        return false;
+      return true;
+    };
+
+    size_t pruned = 0;
+    for (auto &entry : results)
+      llvm::erase_if(entry.second, [&](const MemoryDependence &dep) {
+        bool match = matches(dep.source, entry.first, dep);
+        pruned += match;
+        return match;
+      });
+
+    // Report the outcome as an info-level analysis fact, the way the scheduler
+    // surfaces its other derived facts: how many conservative edges this hint
+    // retired, and the claim (inter/intra, optional direction/distance) that
+    // authorized it. A count of zero flags a hint that matched nothing -- the
+    // dependence was already inferred absent, so the hint is a no-op.
+    logging::Diagnostic note = info(Stage::Sched, hint.getOperation());
+    note << "Applied dependence hint: pruned " << pruned << " conservative "
+         << (inter ? "loop-carried" : "intra-iteration") << " dependence edge"
+         << (pruned == 1 ? "" : "s");
+    if (dir)
+      note << " direction="
+           << (*dir == AssumeDepDirEnum::RAW   ? "RAW"
+               : *dir == AssumeDepDirEnum::WAR ? "WAR"
+                                               : "WAW");
+    if (distAttr)
+      note << " distance=" << distAttr.getInt();
+  }
+}
+
+//===----------------------------------------------------------------------===//
 // DependenceAnalysis
 //===----------------------------------------------------------------------===//
 
 namespace mlir::allo {
 
-DependenceAnalysis::DependenceAnalysis(func::FuncOp funcOp) : func(funcOp) {
-  std::vector<SmallVector<affine::AffineForOp, 2>> depthToLoops;
-  affine::gatherLoops(funcOp, depthToLoops);
+int64_t carriedDistanceAtLevel(ArrayRef<affine::DependenceComponent> comps,
+                               unsigned level, bool &drop, bool &valid) {
+  drop = false;
+  valid = true;
+  if (comps.empty())
+    return 0; // loop-independent: same iteration at every level
+  if (comps.size() < level) {
+    valid = false;
+    return 0;
+  }
+  for (unsigned k = 0; k + 1 < level; ++k) // components outer to the level
+    if (comps[k].lb.value_or(0) > 0) {
+      drop = true;
+      return 0;
+    }
+  return comps[level - 1].lb.value_or(0);
+}
 
+DependenceAnalysis::DependenceAnalysis(func::FuncOp funcOp) : func(funcOp) {
   SmallVector<Operation *> memoryOps;
   SmallVector<Operation *> streamOps;
+  // All memref accesses in program (walk) order, plus the subset that is
+  // non-affine, for the conservative fallback below.
+  SmallVector<Operation *> accessOps;
+  llvm::SmallDenseSet<Operation *> nonAffineAccesses;
+  SmallVector<AssumeNoDepOp> noDepHints;
+  SmallVector<Assumption> assumptions;
   funcOp->walk([&](Operation *op) {
     if (isa<affine::AffineReadOpInterface, affine::AffineWriteOpInterface>(
             op)) {
       memoryOps.push_back(op);
+      accessOps.push_back(op);
+    } else if (isa<memref::LoadOp, memref::StoreOp>(op)) {
+      nonAffineAccesses.insert(op);
+      accessOps.push_back(op);
     } else if (isa<StreamGetOp, StreamPutOp>(op)) {
       streamOps.push_back(op);
+    } else if (auto hint = dyn_cast<AssumeNoDepOp>(op)) {
+      noDepHints.push_back(hint);
+    } else if (auto hint = dyn_cast<AssumeSSAOp>(op)) {
+      collectAssumptions(hint.getCondition(), assumptions);
     }
   });
 
-  for (unsigned d = 0; d < depthToLoops.size(); ++d)
-    checkMemrefDependence(memoryOps, d, results);
+  // Affine memref dependences: each ordered pair over all carried depths plus
+  // the loop-independent (intra-iteration) depth (see checkMemrefDependence).
+  checkMemrefDependence(memoryOps, results);
+
+  // Conservative ordering for non-affine accesses the polyhedral test skips.
+  checkNonAffineDependence(accessOps, nonAffineAccesses, results);
 
   AffineValueMapBuilder builder(funcOp.getContext());
   checkStreamDependence(streamOps, builder, results);
+
+  // User hints: prune conservative edges the programmer proves absent. Applied
+  // last, over the fully-built edge set, so pruning a non-existent edge (the
+  // fact was already inferred) is naturally a no-op.
+  applyNoDepHints(noDepHints, nonAffineAccesses, results);
+
+  // Distill the assume.ssa value facts into per-value constant ranges (the seed
+  // a value-range consumer reads; does not affect dependence edges).
+  buildAssumedRanges(assumptions, assumedRanges);
+
+  // Surface the distilled ranges as an info-level analysis fact, one line per
+  // constrained value, mirroring how the scheduler reports its other facts.
+  if (!assumedRanges.empty()) {
+    info(Stage::Sched) << "Applied value hints: distilled "
+                       << assumedRanges.size() << " value range"
+                       << (assumedRanges.size() == 1 ? "" : "s");
+    for (const auto &[v, r] : assumedRanges) {
+      std::string lb = r.lb ? std::to_string(*r.lb) : "-inf";
+      std::string ub = r.ub ? std::to_string(*r.ub) : "+inf";
+      info(Stage::Sched) << "  " << logging::detail::describe(v.getLoc())
+                         << " in [" << lb << ", " << ub << "]";
+    }
+  }
 }
 
 void DependenceAnalysis::replaceOp(Operation *oldOp, Operation *newOp) {

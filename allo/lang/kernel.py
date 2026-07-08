@@ -109,7 +109,7 @@ class Kernel(Generic[P, R]):
         self.definition_scope = (
             {} if definition_scope is None else definition_scope.copy()
         )
-        self._module: Module | None = None
+        self._module = None
         self.context: Context | None = None
 
         # record whether this kernel is a lazy consteval kernel
@@ -130,7 +130,11 @@ class Kernel(Generic[P, R]):
                 )
 
         src = textwrap.dedent("".join(raw_src))
-        match = re.search(r"^def\s+\w+\s*\(", src, re.MULTILINE)
+        match = re.search(r"^(async\s+)?def\s+\w+\s*\(", src, re.MULTILINE)
+        # `async def` marks a kernel as awaitable (a dataflow process): only an
+        # async kernel may be `await`-called (a concurrent spawn); the keyword
+        # is a frontend contract and is not itself carried into the IR.
+        self.is_async = bool(match and match.group(1))
         if match:
             start_pos = match.start()
             offset = src[:start_pos].count("\n")
@@ -228,7 +232,9 @@ class Kernel(Generic[P, R]):
         tree = ast.parse(self.src)
         assert isinstance(tree, ast.Module)
         assert len(tree.body) == 1
-        assert isinstance(tree.body[0], ast.FunctionDef)
+        # An `async def` kernel (a dataflow process/region) parses to an
+        # AsyncFunctionDef; the codegen handles both the same way.
+        assert isinstance(tree.body[0], (ast.FunctionDef, ast.AsyncFunctionDef))
         return tree.body[0]
 
     def _build_capture_scope(self):

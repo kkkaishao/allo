@@ -4,16 +4,18 @@
 add_mlir_library(MLIRAlloSupport
     AffineValueMapBuilder.cpp
     TopologyGraph.cpp
+    Logging.cpp
     PARTIAL_SOURCES_INTENDED
 
     DEPENDS
     MLIRAlloIncGen
 
-    LINK_LIBS PUBLIC
+    LINK_LIBS PRIVATE
     MLIRAllo
     MLIRIR
     MLIRAffineDialect
     MLIRArithDialect
+    spdlog::spdlog_header_only
 )
 
 add_mlir_library(AlloDataflowRuntime SHARED

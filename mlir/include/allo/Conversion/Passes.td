@@ -30,19 +30,17 @@ def LowerDataflowPass : Pass<"lower-dataflow", "ModuleOp"> {
   }];
 }
 
-def ConvertLoopToSchedulePass : Pass<"convert-loop-to-schedule", "func::FuncOp"> {
-  let summary = "Schedule affine loops into loopschedule pipelines";
+def ConvertScheduleToDCPPass : Pass<"convert-schedule-to-dcp", "ModuleOp"> {
+  let summary = "Reify the schedule carrier into allo.dcp.* ops (standalone)";
   let description = [{
-    Analyze memory and stream dependences in affine loops, solve a modulo
-    scheduling problem for each innermost loop, and emit a
-    `loopschedule.pipeline` capturing the schedule.
+    Standalone wrapper around the scheduler's reification step: convert a module
+    whose funcs carry `allo.sched.*` schedule attributes into `allo.dcp.*` ops and
+    strip the carrier. `allo-schedule` runs this automatically as its final phase;
+    this pass exposes it for inspecting the carrier->dcp conversion in isolation.
   }];
-  let dependentDialects = [
-    "circt::loopschedule::LoopScheduleDialect",
-    "mlir::affine::AffineDialect",
-    "mlir::arith::ArithDialect",
-    "mlir::memref::MemRefDialect",
-    "mlir::scf::SCFDialect"
+  let options = [
+    Option<"operatorLibrary", "operator-library", "std::string", "\"\"",
+           "Path to a YAML operator library; empty uses the built-in default">
   ];
 }
 

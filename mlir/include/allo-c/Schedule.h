@@ -28,14 +28,6 @@ MLIR_CAPI_EXPORTED void
 alloCollectScheduleSnapshotJSON(MlirModule module, MlirStringCallback callback,
                                 void *userData);
 
-/// Collects the SDC schedule result produced by the `allo-schedule` pass --
-/// per-func regions (kind/II/length/order), each region's ops with their start
-/// times, plus the coarse cross-region dependence edges and concurrency pairs --
-/// and streams it as a JSON document through `callback`.
-MLIR_CAPI_EXPORTED void
-alloCollectScheduleResultJSON(MlirModule module, MlirStringCallback callback,
-                              void *userData);
-
 MLIR_CAPI_EXPORTED constexpr const char *kScheduleIdAttr = "allo.schedule.id";
 MLIR_CAPI_EXPORTED constexpr const char *kScheduleNameAttr =
     "allo.schedule.name";

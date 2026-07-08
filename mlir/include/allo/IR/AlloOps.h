@@ -31,6 +31,10 @@
 // which is pulled in via AlloTypes.h above).
 #include "allo/IR/AlloOpInterfaces.h.inc"
 
+// Op interfaces defined in AlloOps.td (e.g. ScheduledOpInterface); must precede
+// the op classes that implement them.
+#include "allo/IR/AlloOpsInterfaces.h.inc"
+
 #define GET_OP_CLASSES
 #include "allo/IR/AlloOps.h.inc"
 
@@ -40,6 +44,11 @@
 namespace mlir::allo {
 constexpr llvm::StringLiteral kAlloSignedAttr = "allo.signed";
 constexpr llvm::StringLiteral kAlloLazyAttr = "allo.lazy";
+// A concurrent-spawn (`await`) marker carried onto the `func.call` that
+// `convert-allo-to-func` produces from an `allo.invoke {async}` (func.call has
+// no `async` field). Written by ConvertAlloToFunc and read by the dataflow
+// composition lowering -- keep the two in sync through this one constant.
+constexpr llvm::StringLiteral kAlloAsyncAttr = "allo.async";
 } // namespace mlir::allo
 
 #endif // ALLO_OPS_H

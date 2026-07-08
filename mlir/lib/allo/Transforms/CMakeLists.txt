@@ -8,6 +8,16 @@ add_mlir_library(MLIRAlloTransforms
     ReuseCleanup.cpp
     FoldConstantCalls.cpp
     GenerateApintWrapper.cpp
+    FoldIfStatements.cpp
+    FlattenPerfectLoops.cpp
+    FlattenDcpMemref.cpp
+    ResolveBanking.cpp
+    PerfectizeLoopNest.cpp
+    RaiseCountedWhile.cpp
+    UnrollUnderPipeline.cpp
+    ReassociateReductions.cpp
+    RotateReductions.cpp
+    SdcScheduling.cpp
 
     DEPENDS
     MLIRAlloIncGen
@@ -15,6 +25,7 @@ add_mlir_library(MLIRAlloTransforms
     LINK_LIBS PUBLIC
     MLIRAlloSupport
     MLIRAnalysis
+    MLIRAffineAnalysis
     MLIRAffineDialect
     MLIRAffineUtils
     MLIRArithDialect

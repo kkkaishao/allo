@@ -26,7 +26,6 @@ from .._mlir.ir import (
     TypeAttr,
     StringAttr,
     DenseI32ArrayAttr,
-    InsertionPoint,
     OpResult,
     UnitAttr,
     MLIRError,  # type: ignore
@@ -38,6 +37,8 @@ from .._mlir.dialects.allo import (
     ReturnOp,
     InvokeOp,
     KernelOp,
+    AssumeNoDepOp,
+    AssumeDepTypeAttr,
     SIGNED_ATTR_NAME,
     LAZY_ATTR_NAME,
     register_dialect,
@@ -49,8 +50,6 @@ from .._mlir.dialects.scf import (
     YieldOp as SCFYieldOp,
     WhileOp,
     ConditionOp,
-    ParallelOp,
-    ReduceOp,
 )
 from .._mlir.dialects.affine import AffineIfOp, AffineYieldOp
 from .._mlir.dialects.arith import SelectOp
@@ -199,6 +198,7 @@ class NestedKernelSymbol:
     node: ast.FunctionDef
     owner_func_name: str
     mapping: tuple[int, ...]
+    is_async: bool = False  # `async def`: awaitable (a dataflow process)
 
 
 class _AffineOperands:
@@ -480,6 +480,28 @@ class MLIRCodeGenerator(ast.NodeVisitor):
     def visit_Pass(self, node):
         pass
 
+    def visit_Await(self, node: ast.Await):
+        # `await foo(...)` is a concurrent spawn: it lowers to an `allo.invoke`
+        # with the `async` attr set (a dataflow process fork), gated by the
+        # contract that `foo` is an `async def` kernel. Only a kernel call may be
+        # awaited; the invoke is built by visit_Call, which tags exactly this
+        # awaited call (by node identity, so an inner call in the args is not
+        # mistaken for the spawn).
+        if not isinstance(node.value, ast.Call):
+            return self.compile_error(
+                "'await' may only be applied to an async kernel call."
+            )
+        self._awaited_call = node.value
+        return self.visit(node.value)
+
+    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef):
+        # An `async def` kernel is dispatched exactly like a `def` (entry vs
+        # nested); its async-ness is a contract recorded on the symbol
+        # (Kernel.is_async / NestedKernelSymbol.is_async) and enforced at the
+        # `await` call site, not carried into the IR here. ast.AsyncFunctionDef
+        # shares FunctionDef's fields, so the same handler applies.
+        return self.visit_FunctionDef(node)
+
     def visit_FunctionDef(self, node: ast.FunctionDef):
         if not self._entry_function_visited:
             self._entry_function_visited = True
@@ -641,6 +663,7 @@ class MLIRCodeGenerator(ast.NodeVisitor):
             node=node,
             owner_func_name=self.func_name,
             mapping=self._parse_nested_kernel_mapping(mapping_node, node.name),
+            is_async=isinstance(node, ast.AsyncFunctionDef),
         )
 
     def _precheck_return_placement(self, node: ast.FunctionDef):
@@ -2454,32 +2477,40 @@ class MLIRCodeGenerator(ast.NodeVisitor):
         lbs = iterator.starts
         ubs = iterator.stops
         steps = iterator.steps
+        ndim = len(lbs)
 
         if any(isinstance(step, ConstexprValue) and step.value <= 0 for step in steps):
             return self.compile_error(
                 "loop step must be a positive integer in 'for' loops"
             )
 
-        # A grid lowers to affine.parallel when every step is a positive constant
-        # and all bounds are affine (over enclosing IVs / symbols / constants);
-        # otherwise scf.parallel. Lower/upper maps share operands concatenated as
-        # lower-then-upper, as affine.parallel requires.
-        affine_bounds = None
+        # A grid is an unordered/parallel iteration space, but the scheduler works
+        # on ordered loops, so it lowers to a *nest of `affine.for`* (when every
+        # step is a positive constant and every bound is affine over enclosing IVs
+        # / symbols / constants) or `scf.for` (otherwise). The parallel guarantee
+        # is not carried as a distinct op; it is re-expressed as `assume.nodep`
+        # on the body's arrays after the nest is built (see below).
+        per_dim_affine = None
         if all(
             isinstance(s, ConstexprValue) and type(s.value) is builtins.int
             for s in steps
         ):
             specs = self._grid_bound_nodes(node.iter)
             if specs is not None:
-                lb_nodes = [
-                    lb if lb is not None else ast.Constant(0) for lb, _ in specs
-                ]
-                ub_nodes = [ub for _, ub in specs]
-                lower = self._build_affine_value_map(lb_nodes)
-                upper = self._build_affine_value_map(ub_nodes)
-                if lower is not None and upper is not None:
-                    affine_bounds = (lower, upper)
-        is_affine = affine_bounds is not None
+                built = []
+                for lb_node, ub_node in specs:
+                    lo = self._build_single_bound(lb_node)
+                    hi = self._build_single_bound(ub_node)
+                    if lo is None or hi is None:
+                        built = None
+                        break
+                    built.append((lo, hi))
+                per_dim_affine = built
+        is_affine = per_dim_affine is not None
+        if not is_affine:
+            norm_lbs = self.builder.normalize_indices(lbs)
+            norm_ubs = self.builder.normalize_indices(ubs)
+            norm_steps = self.builder.normalize_indices(steps)
 
         with EnterSubRegion(self):
             index_ty = index.materialize(self.context)
@@ -2487,7 +2518,7 @@ class MLIRCodeGenerator(ast.NodeVisitor):
                 PoisonOp(index_ty, ip=self.builder._ip, loc=self.builder._loc)
                 for _ in lbs
             ]
-            targets = set()
+            targets = []
             for i, target in enumerate(node.target.elts):
                 if not isinstance(target, ast.Name):
                     return self.compile_error(
@@ -2497,74 +2528,111 @@ class MLIRCodeGenerator(ast.NodeVisitor):
                 self._set_value(target.id, iv_proxy)
                 if is_affine:
                     self._affine_ivs.append(iv_proxy)
-                targets.add(target.id)
+                targets.append(target.id)
 
             liveins = self.lscope.copy()  # capture live-ins before visiting loop body
-            names, init_handles, init_types = self._test_loop_iter_args(
-                node, liveins, ignore=targets
+            _, init_handles, _ = self._test_loop_iter_args(
+                node, liveins, ignore=set(targets)
             )
             if len(init_handles) > 0:
                 return self.compile_error(
                     "Non-trivial loop-carried dependencies are not supported in "
                     "'for' loops over 'grid()' at this moment."
                 )
-            # create parallel op
-            if is_affine:
-                (lb_map, lb_operands), (ub_map, ub_operands) = affine_bounds
-                par_op, par_op_body = self.builder.create_affine_parallel(
-                    lb_map,
-                    [v.handle for v in lb_operands],
-                    ub_map,
-                    [v.handle for v in ub_operands],
-                    [step.value for step in steps],
-                    arg_locs=[
-                        Location.name(t.id, self.builder._loc) for t in node.target.elts
-                    ],
+
+            # Build the loop nest outermost -> innermost, descending into each body.
+            for_ops = []
+            for d in range(ndim):
+                arg_locs = [Location.name(targets[d], self.builder._loc)]
+                if is_affine:
+                    (lb_map, lb_operands), (ub_map, ub_operands) = per_dim_affine[d]
+                    for_op = self.builder.create_affine_for(
+                        lb_map,
+                        [v.handle for v in lb_operands],
+                        ub_map,
+                        [v.handle for v in ub_operands],
+                        steps[d].value,
+                        [],
+                        arg_locs=arg_locs,
+                    )
+                else:
+                    for_op = self.builder.create_scf_for(
+                        norm_lbs[d].handle,
+                        norm_ubs[d].handle,
+                        norm_steps[d].handle,
+                        [],
+                        arg_locs=arg_locs,
+                    )
+                # Each axis is a first-class named loop (so `s.loop("i")` matches);
+                # the grid's own name, if any, titles the outermost level.
+                loop_name = iterator.name if (d == 0 and iterator.name) else targets[d]
+                for_op.operation.attributes[schedule_d.SCHEDULE_NAME_ATTR_NAME] = (
+                    self.builder.get_string_attr(loop_name)
                 )
-            else:
-                par_op = ParallelOp(
-                    [],
-                    [lb.handle for lb in self.builder.normalize_indices(lbs)],
-                    [ub.handle for ub in self.builder.normalize_indices(ubs)],
-                    [step.handle for step in self.builder.normalize_indices(steps)],
-                    init_handles,
-                    ip=self.builder._ip,
-                    loc=self.builder._loc,
-                )
-                # scf.parallel has no auto-created body: build a block with one
-                # index induction variable per dimension and the scf.reduce
-                # terminator. see: https://mlir.llvm.org/docs/Dialects/SCFDialect/#scfparallel-scfparallelop
-                par_op_body = par_op.region.blocks.append(
-                    *([index_ty] * len(lbs)),
-                    arg_locs=[
-                        Location.name(t.id, self.builder._loc) for t in node.target.elts
-                    ],
-                )
-                with InsertionPoint(par_op_body):
-                    ReduceOp([], 0)
-            if iterator.name:
-                assert isinstance(iterator.name, str)
-                par_op.operation.attributes[schedule_d.SCHEDULE_NAME_ATTR_NAME] = (
-                    self.builder.get_string_attr(iterator.name)
-                )
-            self.builder.set_insertion_point_to_start(par_op_body)
-            # no iter args now, so no block arguments other than induction variables
-            # visit loop body
+                for_ops.append(for_op)
+                self.builder.set_insertion_point_to_start(for_op.body)
+
+            # visit the loop body inside the innermost loop
             self.visit_compound_stmts(node.body)
 
-            ivs = list(par_op_body.arguments)
-            for iv, placeholder in zip(ivs, iv_placeholders):
+            # swap the induction-variable placeholders for the real ones
+            ivs = [f.induction_variable for f in for_ops]
+            for placeholder, iv, target in zip(iv_placeholders, ivs, targets):
                 placeholder.result.replace_all_uses_with(iv)
                 placeholder.operation.erase()
-            for iv, target in zip(ivs, node.target.elts):
-                proxy = AlloValue(iv, index)
-                self._set_value_with_loc(target.id, proxy)  # type: ignore
+                self._set_value_with_loc(target, AlloValue(iv, index))
 
-        # update lscope with iter args
-        res_handles = list(par_op.results)
-        for name, handle, ty in zip(names, res_handles, init_types):
-            proxy = AlloValue(handle, ty)
-            self._set_value_with_loc(name, proxy)
+            # A grid promises independent iterations. Re-express that as
+            # `assume.nodep` (inter-iteration, all directions) on every array
+            # written in the body: the scheduler then drops the conservative
+            # non-affine recurrence and pipelines at II=1. Unchecked -- a real
+            # inter-iteration dependence is undefined behavior, like `llvm.assume`.
+            # Scope it to the OUTERMOST axis: `flatten-perfect-loops` coalesces
+            # the nest into that loop (keeping its IV) while the inner IVs are
+            # rewritten to `affine.apply`, which are not loop induction variables.
+            self._emit_grid_nodep(for_ops[-1], ivs[0])
+
+            # terminate every level's body
+            yield_cls = AffineYieldOp if is_affine else SCFYieldOp
+            for for_op in for_ops:
+                self.builder.set_insertion_point_to_end(for_op.body)
+                yield_cls([], ip=self.builder._ip, loc=self.builder._loc)
+
+    def _emit_grid_nodep(self, innermost_for, iv):
+        """Emit an `allo.assume.nodep` (inter-iteration, all directions) for every
+        array written in a lowered grid body (walked from `innermost_for`), scoped
+        to the grid's outermost axis `iv` so it survives loop coalescing."""
+        seen = set()
+        arrays = []
+
+        def collect(op):
+            if op.name in ("affine.store", "memref.store"):
+                mref = op.operands[1]  # store operands: [value, memref, indices...]
+                if mref not in seen:
+                    seen.add(mref)
+                    arrays.append(mref)
+            for region in op.regions:
+                for block in region.blocks:
+                    for inner in block.operations:
+                        collect(inner)
+
+        for op in innermost_for.body.operations:
+            collect(op)
+        if not arrays:
+            return
+        self.builder.set_insertion_point_to_start(innermost_for.body)
+        dep_type_attr = AssumeDepTypeAttr.get(0, self.context)  # 0 = inter
+        for mref in arrays:
+            AssumeNoDepOp(
+                mref,
+                iv,
+                dep_type_attr,
+                dependent=False,
+                direction=None,
+                distance=None,
+                ip=self.builder._ip,
+                loc=self.builder._loc,
+            )
 
     def visit_JoinedStr(self, node):
         values = list(node.values)
@@ -2587,9 +2655,17 @@ class MLIRCodeGenerator(ast.NodeVisitor):
         return "".join(values)  # type: ignore
 
     def visit_Call(self, node):
+        # This call is an `await` spawn iff visit_Await tagged this exact node.
+        is_async = node is getattr(self, "_awaited_call", None)
+        if is_async:
+            self._awaited_call = None
         fn = unwrap_if_constexpr(self.visit(node.func))
         static_fn = self.statically_implemented_functions.get(fn, None)
         if static_fn is not None:
+            if is_async:
+                return self.compile_error(
+                    "'await' may only be applied to an async kernel call."
+                )
             return static_fn(self, node)
 
         self.visiting_consteval_fn = isinstance(fn, ConstevalFunction)
@@ -2607,17 +2683,23 @@ class MLIRCodeGenerator(ast.NodeVisitor):
                     args.append(ret)
         finally:
             self.visiting_consteval_fn = False
-        return self.call_function(fn, args, kws)
+        return self.call_function(fn, args, kws, is_async=is_async)
 
-    def call_function(self, fn, args, kws):
+    def call_function(self, fn, args, kws, is_async=False):
         """Dispatch callable targets across kernel/op/type/consteval frontends."""
 
+        # Contract: only an `async def` kernel may be `await`-called (a spawn).
+        if is_async and not getattr(fn, "is_async", False):
+            name = getattr(fn, "func_name", getattr(fn, "name", fn))
+            return self.compile_error(
+                f"'await' requires an 'async def' kernel, but '{name}' is not async."
+            )
         if isinstance(fn, NestedKernelSymbol):
-            return self.call_nested_kernel(fn, args, kws)
+            return self.call_nested_kernel(fn, args, kws, is_async=is_async)
         if isinstance(fn, Kernel):
-            return self.call_kernel(fn, args, kws)
+            return self.call_kernel(fn, args, kws, is_async=is_async)
         if isinstance(fn, AlloModule):
-            return self.call_kernel(fn.module, args, kws)
+            return self.call_kernel(fn.module, args, kws, is_async=is_async)
         if isinstance(fn, (Operator, BoundOperator)):
             return self.call_operator(fn, args, kws)
         if isinstance(fn, ConstevalFunction):
@@ -2872,6 +2954,7 @@ class MLIRCodeGenerator(ast.NodeVisitor):
         sub_res_types,
         call_operands,
         build_and_visit,
+        is_async=False,
     ):
         """Shared plumbing for kernel/nested-kernel calls: emit the callee into the
         module, build the ``InvokeOp`` and decode its results. ``build_and_visit``
@@ -2910,12 +2993,13 @@ class MLIRCodeGenerator(ast.NodeVisitor):
             [ty.materialize(self.context) for ty in sub_res_types],
             sub_generator.func_name,
             call_operands,
+            async_=is_async,
             ip=self.builder._ip,
             loc=self.builder._loc,
         )
         return self._decode_kernel_call_results(call_op, sub_res_types)
 
-    def call_nested_kernel(self, nested: NestedKernelSymbol, args, kws):
+    def call_nested_kernel(self, nested: NestedKernelSymbol, args, kws, is_async=False):
         key = self._nested_call_key(nested)
         self._check_recursive_call(key)
 
@@ -2968,9 +3052,10 @@ class MLIRCodeGenerator(ast.NodeVisitor):
             sub_res_types,
             call_operands,
             build_and_visit,
+            is_async=is_async,
         )
 
-    def call_kernel(self, fn: Kernel, args, kws, is_lazy=False):
+    def call_kernel(self, fn: Kernel, args, kws, is_lazy=False, is_async=False):
         """Lower/call a kernel specialization and decode structured return values."""
 
         key = self._kernel_call_key(fn)
@@ -3021,7 +3106,13 @@ class MLIRCodeGenerator(ast.NodeVisitor):
             return sub_generator
 
         return self._lower_kernel_invocation(
-            key, fn.func_name, fn.src, sub_res_types, call_operands, build_and_visit
+            key,
+            fn.func_name,
+            fn.src,
+            sub_res_types,
+            call_operands,
+            build_and_visit,
+            is_async=is_async,
         )
 
     def call_operator(self, fn: Operator | BoundOperator, args, kwargs={}):

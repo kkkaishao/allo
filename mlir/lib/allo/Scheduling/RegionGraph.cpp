@@ -3,22 +3,13 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-//===----------------------------------------------------------------------===//
-// Coarse cross-region dependence analysis (§6b of the design doc). Region
-// footprints are summarized at memref/stream *root* granularity; a conflict
-// between two sibling regions on a shared root (not both read-only) yields an
-// edge. SSA def-use across regions yields an exact edge. Analysis only.
-//===----------------------------------------------------------------------===//
-
 #include "allo/Scheduling/RegionGraph.h"
 #include "allo/Scheduling/DependenceAnalysis.h"
+#include "allo/Scheduling/Footprint.h"
+#include "allo/Scheduling/Utils.h"
 
-#include "allo/IR/AlloOps.h"
-#include "allo/IR/AlloTypes.h"
-
-#include "mlir/Dialect/Affine/IR/AffineMemoryOpInterfaces.h"
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
-#include "mlir/Dialect/MemRef/IR/MemRef.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/AsmState.h"
 #include "llvm/ADT/DenseSet.h"
 
@@ -26,89 +17,11 @@ using namespace mlir;
 using namespace mlir::allo;
 
 //===----------------------------------------------------------------------===//
-// Root resolution + region footprints
-//===----------------------------------------------------------------------===//
-
-// Walk view-like ops to the underlying alloc/arg/global root (A1). Distinct
-// roots are assumed non-aliasing (A2); an unresolved root stays itself (A3,
-// handled by conservative equality on the root value).
-static Value resolveRoot(Value v) {
-  while (Operation *def = v.getDefiningOp()) {
-    if (auto op = dyn_cast<memref::SubViewOp>(def)) {
-      v = op.getSource();
-    } else if (auto op = dyn_cast<memref::CastOp>(def)) {
-      v = op.getSource();
-    } else if (auto op = dyn_cast<memref::ReinterpretCastOp>(def)) {
-      v = op.getSource();
-    } else if (auto op = dyn_cast<memref::ViewOp>(def)) {
-      v = op.getSource();
-    } else {
-      break;
-    }
-  }
-  return v;
-}
-
-static Value streamBaseOf(Operation *op) {
-  if (auto get = dyn_cast<StreamGetOp>(op))
-    return get.getStream();
-  return cast<StreamPutOp>(op).getStream();
-}
-
-namespace {
-struct Access {
-  bool reads = false;
-  bool writes = false;
-};
-struct Summary {
-  DenseMap<Value, Access> mem; // memref root -> access
-  DenseSet<Value> streams;     // stream roots touched (get or put)
-};
-} // namespace
-
-static void summarizeOp(Operation *op, Summary &s) {
-  if (auto rd = dyn_cast<affine::AffineReadOpInterface>(op)) {
-    s.mem[resolveRoot(rd.getMemRef())].reads = true;
-    return;
-  }
-  if (auto wr = dyn_cast<affine::AffineWriteOpInterface>(op)) {
-    s.mem[resolveRoot(wr.getMemRef())].writes = true;
-    return;
-  }
-  if (auto ld = dyn_cast<memref::LoadOp>(op)) {
-    s.mem[resolveRoot(ld.getMemRef())].reads = true;
-    return;
-  }
-  if (auto st = dyn_cast<memref::StoreOp>(op)) {
-    s.mem[resolveRoot(st.getMemRef())].writes = true;
-    return;
-  }
-  if (isa<StreamGetOp, StreamPutOp>(op)) {
-    s.streams.insert(resolveRoot(streamBaseOf(op)));
-    return;
-  }
-  // Opaque call: conservatively read+write every memref/stream operand root.
-  if (isa<func::CallOp>(op)) {
-    for (Value operand : op->getOperands()) {
-      Type t = operand.getType();
-      if (isa<MemRefType>(t)) {
-        Access &a = s.mem[resolveRoot(operand)];
-        a.reads = a.writes = true;
-      } else if (isa<allo::StreamType>(t)) {
-        s.streams.insert(resolveRoot(operand));
-      }
-    }
-  }
-}
-
-//===----------------------------------------------------------------------===//
 // Region enumeration
 //===----------------------------------------------------------------------===//
 
-SmallVector<SchedRegion> mlir::allo::enumerateRegions(func::FuncOp func) {
+SmallVector<SchedRegion> mlir::allo::enumerateRegions(Block &block) {
   SmallVector<SchedRegion> regions;
-  if (func.getFunctionBody().empty())
-    return regions;
 
   SmallVector<Operation *> pending; // accumulating straight-line run
   auto flush = [&]() {
@@ -119,19 +32,29 @@ SmallVector<SchedRegion> mlir::allo::enumerateRegions(func::FuncOp func) {
     pending.clear();
   };
 
-  for (Operation &op : func.getFunctionBody().front()) {
+  for (Operation &op : block) {
     if (op.hasTrait<OpTrait::IsTerminator>())
       continue;
-    if (isa<affine::AffineForOp>(&op)) {
+    // A loop, or an `if` that survived if-conversion (one guarding a loop /
+    // stream / call, left opaque), is its own region: a single region-bearing
+    // op the scheduler recurses into. A conditional cannot be flattened into a
+    // straight-line span (its body would be materialized as flat leaf ops).
+    if (isa<affine::AffineForOp, scf::ForOp, scf::WhileOp, affine::AffineIfOp,
+            scf::IfOp>(&op)) {
       flush();
-      regions.push_back(
-          {(unsigned)regions.size(), RegionKind::Loop, {&op}});
+      regions.push_back({(unsigned)regions.size(), RegionKind::Loop, {&op}});
     } else {
       pending.push_back(&op);
     }
   }
   flush();
   return regions;
+}
+
+SmallVector<SchedRegion> mlir::allo::enumerateRegions(func::FuncOp func) {
+  if (func.getFunctionBody().empty())
+    return {};
+  return enumerateRegions(func.getFunctionBody().front());
 }
 
 //===----------------------------------------------------------------------===//
@@ -164,13 +87,14 @@ const RegionGraph &DependenceAnalysis::getRegionGraph() {
         auto it = sums[j].mem.find(kv.first);
         if (it == sums[j].mem.end())
           continue;
-        bool wi = kv.second.writes, wj = it->second.writes;
-        bool ti = kv.second.reads || wi, tj = it->second.reads || wj;
-        if (!((wi && tj) || (ti && wj)))
-          continue; // both read-only: no conflict
-        XEdgeKind kind = (wi && wj) ? XEdgeKind::WAW
-                         : wi       ? XEdgeKind::RAW
-                                    : XEdgeKind::WAR;
+        // A shared-root conflict is a real ordering edge only when the regions'
+        // footprints actually intersect (sub-range refinement inside).
+        Conflict c = footprintConflict(kv.second, it->second);
+        if (c == Conflict::None)
+          continue;
+        XEdgeKind kind = c == Conflict::WAW   ? XEdgeKind::WAW
+                         : c == Conflict::RAW ? XEdgeKind::RAW
+                                              : XEdgeKind::WAR;
         g.edges.push_back({i, j, kind, kv.first});
       }
       for (Value s : sums[i].streams)
@@ -231,7 +155,7 @@ bool RegionGraph::concurrent(unsigned a, unsigned b) const {
 // DOT dump
 //===----------------------------------------------------------------------===//
 
-StringRef mlir::allo::toString(XEdgeKind kind) {
+StringRef allo::toString(XEdgeKind kind) {
   switch (kind) {
   case XEdgeKind::RAW:
     return "RAW";
@@ -247,8 +171,8 @@ StringRef mlir::allo::toString(XEdgeKind kind) {
   return "?";
 }
 
-void mlir::allo::printRegionGraphDot(const RegionGraph &g, func::FuncOp func,
-                                     raw_ostream &os) {
+void allo::printRegionGraphDot(const RegionGraph &g, func::FuncOp func,
+                               raw_ostream &os) {
   AsmState asmState(func);
   os << "digraph \"" << func.getSymName() << "\" {\n";
   for (const SchedRegion &r : g.regions) {
@@ -256,7 +180,8 @@ void mlir::allo::printRegionGraphDot(const RegionGraph &g, func::FuncOp func,
     os << "  r" << r.id << " [label=\"r" << r.id << " " << kind << "\"];\n";
   }
   for (const XEdge &e : g.edges) {
-    os << "  r" << e.src << " -> r" << e.dst << " [label=\"" << toString(e.kind);
+    os << "  r" << e.src << " -> r" << e.dst << " [label=\""
+       << toString(e.kind);
     if (e.root) {
       os << " ";
       e.root.printAsOperand(os, asmState);
@@ -268,4 +193,20 @@ void mlir::allo::printRegionGraphDot(const RegionGraph &g, func::FuncOp func,
       if (g.concurrent(i, j))
         os << "  // concurrent: r" << i << " r" << j << "\n";
   os << "}\n";
+}
+
+FailureOr<std::string>
+allo::dumpRegionDependenceAnaysis(ModuleOp module,
+                                  const std::string &funcName) {
+  if (funcName.empty()) {
+    return failure();
+  }
+  std::string s;
+  llvm::raw_string_ostream os(s);
+  for (func::FuncOp func : module.getOps<func::FuncOp>())
+    if (funcName.empty() || func.getSymName() == funcName)
+      printRegionGraphDot(DependenceAnalysis(func).getRegionGraph(), func, os);
+  if (s.empty())
+    return failure();
+  return os.str();
 }

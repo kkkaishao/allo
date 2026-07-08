@@ -66,4 +66,34 @@ void allo::populateAlloAttrs(nb::module_ &m) {
             return alloPartitionAttrGetAxis(self, pos);
           },
           nb::arg("pos"));
+
+  //===--------------------------------------------------------------------===//
+  // AssumeDepTypeAttr: #allo<dep_type inter|intra>
+  //   value: 0 = Inter, 1 = Intra.
+  //===--------------------------------------------------------------------===//
+  mlir_attribute_subclass(m, "AssumeDepTypeAttr", alloAttributeIsAAssumeDepType)
+      .def_classmethod(
+          "get",
+          [](nb::object cls, uint32_t value, MlirContext ctx) {
+            return cls(alloAssumeDepTypeAttrGet(ctx, value));
+          },
+          nb::arg("cls"), nb::arg("value"), nb::arg("context"))
+      .def_property_readonly("value", [](MlirAttribute self) {
+        return alloAssumeDepTypeAttrGetValue(self);
+      });
+
+  //===--------------------------------------------------------------------===//
+  // AssumeDepDirAttr: #allo<dep_dir raw|war|waw>
+  //   value: 0 = RAW, 1 = WAR, 2 = WAW.
+  //===--------------------------------------------------------------------===//
+  mlir_attribute_subclass(m, "AssumeDepDirAttr", alloAttributeIsAAssumeDepDir)
+      .def_classmethod(
+          "get",
+          [](nb::object cls, uint32_t value, MlirContext ctx) {
+            return cls(alloAssumeDepDirAttrGet(ctx, value));
+          },
+          nb::arg("cls"), nb::arg("value"), nb::arg("context"))
+      .def_property_readonly("value", [](MlirAttribute self) {
+        return alloAssumeDepDirAttrGetValue(self);
+      });
 }

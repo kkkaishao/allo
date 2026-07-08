@@ -209,7 +209,7 @@ class Schedule(Generic[P, R]):
             return cls.from_string(handle.read())
 
     # --- export to backend ----------------------------------------------
-    def export(self, backend: Literal["cpu", "vitis"], **kwargs):
+    def export(self, backend: Literal["cpu", "vitis", "rtl"], **kwargs):
         if not self.kernel:
             raise ScheduleError("Cannot export to backends without a source kernel")
         self.apply()
@@ -232,6 +232,10 @@ class Schedule(Generic[P, R]):
             from ..backend.vitis import Vitis
 
             return Vitis(kernel, **kwargs)
+        elif backend == "rtl":
+            from ..backend.rtl import RTL
+
+            return RTL(kernel, **kwargs)
 
         raise ScheduleError(f"unsupported backend '{backend}' for export()")
 

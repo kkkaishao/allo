@@ -87,6 +87,49 @@ NB_MODULE(_allo, m) {
       },
       nb::arg("module"), nb::arg("enable_apfloat"), nb::arg("top") = "",
       nb::arg("index_width") = 32, nb::arg("with_location") = true);
+  allo.def(
+      "emit_verilog",
+      [](MlirModule module) -> std::optional<std::string> {
+        std::string out;
+        if (mlirLogicalResultIsFailure(
+                alloEmitVerilog(module, appendToString, &out)))
+          return std::nullopt;
+        return out;
+      },
+      nb::arg("module"));
+  allo.def(
+      "emit_datapath_to_hw",
+      [](MlirModule module,
+         const std::string &binding) -> std::optional<std::string> {
+        std::string out;
+        if (mlirLogicalResultIsFailure(alloEmitDatapathToHW(
+                module, mlirStringRefCreate(binding.data(), binding.size()),
+                appendToString, &out)))
+          return std::nullopt;
+        return out;
+      },
+      nb::arg("module"), nb::arg("binding"),
+      "Lower scheduled functions to hw.modules in place; return a JSON object "
+      "mapping each emitted module name to its port-interface manifest.");
+  allo.def(
+      "emit_split_verilog",
+      [](MlirModule module, const std::string &directory) -> bool {
+        return mlirLogicalResultIsSuccess(alloEmitSplitVerilog(
+            module, mlirStringRefCreate(directory.data(), directory.size())));
+      },
+      nb::arg("module"), nb::arg("directory"));
+  allo.def(
+      "dump_region_dependence_analysis",
+      [](MlirModule module, const std::string &funcName) {
+        std::string out;
+        MlirStringRef ref =
+            mlirStringRefCreate(funcName.data(), funcName.length());
+        alloDumpRegionDependenceAnalysis(module, ref, appendToString, &out);
+        return out;
+      },
+      nb::arg("module"), nb::arg("func_name"),
+      "Dump a coarse cross-region dependence graph (analysis only) to a DOT "
+      "file (for visualization in Graphviz).");
 
   //===--------------------------------------------------------------------===//
   // schedule
@@ -110,16 +153,6 @@ NB_MODULE(_allo, m) {
       nb::arg("module"),
       "Return the schedule snapshot as a JSON document (parse on the Python "
       "side).");
-  schedule.def(
-      "collect_schedule_result_json",
-      [](MlirModule module) {
-        std::string out;
-        alloCollectScheduleResultJSON(module, appendToString, &out);
-        return out;
-      },
-      nb::arg("module"),
-      "Return the SDC schedule result (regions/ops/edges/concurrency) as a JSON "
-      "document (parse on the Python side).");
   schedule.attr("SCHEDULE_ID_ATTR_NAME") = kScheduleIdAttr;
   schedule.attr("SCHEDULE_NAME_ATTR_NAME") = kScheduleNameAttr;
   schedule.attr("PIPELINE_II_ATTR_NAME") = kPipelineIIAttr;

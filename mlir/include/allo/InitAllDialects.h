@@ -23,7 +23,10 @@
 #include "mlir/Dialect/Transform/IR/TransformOps.h"
 #include "mlir/Dialect/Vector/IR/VectorOps.h"
 
-#include "circt/Dialect/LoopSchedule/LoopScheduleDialect.h"
+#include "circt/Dialect/Comb/CombDialect.h"
+#include "circt/Dialect/FSM/FSMDialect.h"
+#include "circt/Dialect/HW/HWDialect.h"
+#include "circt/Dialect/Seq/SeqDialect.h"
 
 #include "allo/IR/AlloOps.h"
 
@@ -47,7 +50,10 @@ inline void registerAllDialects(DialectRegistry &registry) {
     tosa::TosaDialect,
     vector::VectorDialect,
     transform::TransformDialect,
-    circt::loopschedule::LoopScheduleDialect,
+    circt::comb::CombDialect,
+    circt::fsm::FSMDialect,
+    circt::hw::HWDialect,
+    circt::seq::SeqDialect,
     allo::AlloDialect
   >();
   // clang-format on

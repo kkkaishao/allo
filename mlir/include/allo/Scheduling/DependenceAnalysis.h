@@ -10,17 +10,40 @@
 
 #include "circt/Analysis/DependenceAnalysis.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/IR/Value.h"
+#include "llvm/ADT/ArrayRef.h"
+#include "llvm/ADT/DenseMap.h"
 
 #include <optional>
 
 namespace mlir::allo {
+
+/// A constant range `[lb, ub]` (inclusive) on an SSA value, with either
+/// endpoint open when unknown. Distilled from the `allo.assume.ssa` value
+/// facts.
+struct AssumedRange {
+  std::optional<int64_t> lb;
+  std::optional<int64_t> ub;
+};
+
+/// The dependence distance carried by the counted loop at 1-based nesting depth
+/// \p level among a dependence's shared enclosing loops, projected from its
+/// components (outermost -> innermost). Sets \p drop when an OUTER loop carries
+/// the dependence -- satisfied by that loop's sequential execution, so it does
+/// not constrain \p level's modulo schedule -- and \p valid = false when \p
+/// level is deeper than the shared loop nest. A loop-independent
+/// (intra-iteration) dependence has no components and maps to distance 0.
+/// Passing `level = comps.size()` projects onto the innermost shared loop.
+int64_t
+carriedDistanceAtLevel(llvm::ArrayRef<affine::DependenceComponent> comps,
+                       unsigned level, bool &drop, bool &valid);
 
 /// Memory + stream dependence analysis over a `func.func`. Mirrors CIRCT's
 /// MemoryDependenceAnalysis for affine memref accesses and additionally
 /// understands Allo stream get/put ops (streams are FIFOs; same-FIFO accesses
 /// are serialized by a recurrence). Both flavors are recorded into one
 /// MemoryDependenceResult that scheduling problem construction consumes
-/// uniformly. Lifted out of the old convert-loop-to-schedule pass.
+/// uniformly.
 class DependenceAnalysis {
 public:
   explicit DependenceAnalysis(func::FuncOp funcOp);
@@ -39,10 +62,24 @@ public:
   /// cached on first use). Analysis only -- does not affect scheduling.
   const RegionGraph &getRegionGraph();
 
+  /// The constant range a value is known to lie in, distilled from the
+  /// `allo.assume.ssa` facts (`n >= 0`, `n < 128`, `n == 64`), or nullopt when
+  /// no such fact constrains it.
+  std::optional<AssumedRange> getAssumedRange(Value v) const {
+    auto it = assumedRanges.find(v);
+    return it == assumedRanges.end() ? std::nullopt : std::optional(it->second);
+  }
+
+  /// All distilled value ranges, keyed by SSA value.
+  const llvm::DenseMap<Value, AssumedRange> &getAssumedRanges() const {
+    return assumedRanges;
+  }
+
 private:
   func::FuncOp func;
   circt::analysis::MemoryDependenceResult results;
   std::optional<RegionGraph> regionGraph;
+  llvm::DenseMap<Value, AssumedRange> assumedRanges;
 };
 
 } // namespace mlir::allo

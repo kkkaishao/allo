@@ -47,6 +47,28 @@ MLIR_CAPI_EXPORTED intptr_t alloPartitionAttrGetNumAxes(MlirAttribute attr);
 MLIR_CAPI_EXPORTED MlirAttribute alloPartitionAttrGetAxis(MlirAttribute attr,
                                                           intptr_t pos);
 
+//===----------------------------------------------------------------------===//
+// AssumeDepTypeAttr  (#allo<dep_type inter|intra>)
+//
+// `value` mirrors `allo::AssumeDepTypeEnum`: 0 = Inter, 1 = Intra.
+//===----------------------------------------------------------------------===//
+
+MLIR_CAPI_EXPORTED bool alloAttributeIsAAssumeDepType(MlirAttribute attr);
+MLIR_CAPI_EXPORTED MlirAttribute alloAssumeDepTypeAttrGet(MlirContext ctx,
+                                                          uint32_t value);
+MLIR_CAPI_EXPORTED uint32_t alloAssumeDepTypeAttrGetValue(MlirAttribute attr);
+
+//===----------------------------------------------------------------------===//
+// AssumeDepDirAttr  (#allo<dep_dir raw|war|waw>)
+//
+// `value` mirrors `allo::AssumeDepDirEnum`: 0 = RAW, 1 = WAR, 2 = WAW.
+//===----------------------------------------------------------------------===//
+
+MLIR_CAPI_EXPORTED bool alloAttributeIsAAssumeDepDir(MlirAttribute attr);
+MLIR_CAPI_EXPORTED MlirAttribute alloAssumeDepDirAttrGet(MlirContext ctx,
+                                                         uint32_t value);
+MLIR_CAPI_EXPORTED uint32_t alloAssumeDepDirAttrGetValue(MlirAttribute attr);
+
 #ifdef __cplusplus
 }
 #endif

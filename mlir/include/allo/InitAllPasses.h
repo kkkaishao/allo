@@ -26,7 +26,7 @@
 #include "mlir/Transforms/Passes.h"
 
 #include "allo/Conversion/Passes.h"
-#include "allo/Scheduling/Passes.h"
+#include "allo/Microarch/Passes.h"
 #include "allo/Transforms/Passes.h"
 
 namespace mlir::allo {
@@ -51,7 +51,7 @@ inline void registerAllPasses() {
 
   allo::registerConversionPasses();
   allo::registerTransformsPasses();
-  allo::registerSchedulingPasses();
+  allo::registerMicroarchPasses();
   allo::registerAlloLLVMLoweringPipeline();
 
   // Dialect passes

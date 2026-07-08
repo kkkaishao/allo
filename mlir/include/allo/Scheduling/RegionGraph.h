@@ -9,8 +9,7 @@
 // root-level memory/stream/SSA dependences between sibling regions. This is the
 // second tier of the analysis (the first being the per-region affine/stream
 // precision used to build each SDC problem). It drives concurrency reporting
-// and, later, cross-region composition -- it does NOT reorder anything.
-// See drafts/S1.md and drafts/sdc-scheduling-design.md (section 6b).
+// and cross-region composition -- it does NOT reorder anything.
 //===----------------------------------------------------------------------===//
 
 #ifndef ALLO_SCHEDULING_REGIONGRAPH_H
@@ -27,8 +26,8 @@ namespace mlir::allo {
 enum class RegionKind { Loop, StraightLine };
 
 /// Coarse dependence kind between two regions. Memory edges distinguish
-/// RAW/WAR/WAW; streams are elastic (any same-FIFO access is ordered, but a FIFO
-/// decouples timing); SSA is an exact def-use edge.
+/// RAW/WAR/WAW; streams are elastic (any same-FIFO access is ordered, but a
+/// FIFO decouples timing); SSA is an exact def-use edge.
 enum class XEdgeKind { RAW, WAR, WAW, StreamElastic, SSA };
 
 /// A scheduling region: a single affine loop, or a maximal run of non-loop ops.
@@ -58,6 +57,10 @@ struct RegionGraph {
   /// Two regions are concurrent iff neither reaches the other.
   bool concurrent(unsigned a, unsigned b) const;
 };
+
+/// Partition a block into scheduling regions (loops + maximal straight-line
+/// runs). The scheduler recurses this into imperfect-nest bodies.
+SmallVector<SchedRegion> enumerateRegions(Block &block);
 
 /// Partition `func`'s entry block into scheduling regions (loops + maximal
 /// straight-line runs). Reused by the scheduler in S2.

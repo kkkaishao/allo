@@ -925,6 +925,25 @@ void VivadoHLSEmitter::emitMemrefGetGlobal(memref::GetGlobalOp op) {
   state.nameTable[op.getResult()] = getSymbolName(op.getName());
 }
 
+// `allo.assume.nodep` is the direct analogue of `#pragma HLS dependence`: emit
+// it on the enclosing loop the hint sits in. `dependent = false` (the common
+// case, e.g. from a lowered grid()) tells Vitis a dependence is absent so it
+// can pipeline; the optional direction/distance narrow the claim.
+void VivadoHLSEmitter::emitAssumeNoDep(allo::AssumeNoDepOp op) {
+  llvm::raw_ostream &os = state.os;
+  os << "#pragma HLS dependence variable=" << state.getName(op.getVariable());
+  os << " type="
+     << (op.getDepType() == allo::AssumeDepTypeEnum::Inter ? "inter" : "intra");
+  if (std::optional<allo::AssumeDepDirEnum> dir = op.getDirection())
+    os << " direction="
+       << (*dir == allo::AssumeDepDirEnum::RAW   ? "RAW"
+           : *dir == allo::AssumeDepDirEnum::WAR ? "WAR"
+                                                 : "WAW");
+  if (IntegerAttr dist = op.getDistanceAttr())
+    os << " distance=" << dist.getInt();
+  os << " dependent=" << (op.getDependent() ? "true" : "false");
+}
+
 void VivadoHLSEmitter::emitFor(scf::ForOp op) {
   llvm::raw_ostream &os = state.os;
   // declare variables for iter args
@@ -1336,6 +1355,9 @@ void VivadoHLSEmitter::dispatch(Operation *op) {
       .Case<allo::StreamPutOp>([&](auto op) { emitStreamPut(op); })
       .Case<allo::BitGetSliceOp>([&](auto op) { emitBitGetSlice(op); })
       .Case<allo::BitSetSliceOp>([&](auto op) { emitBitSetSlice(op); })
+      .Case<allo::AssumeNoDepOp>([&](auto op) { emitAssumeNoDep(op); })
+      .Case<allo::AssumeSSAOp>(
+          [](auto op) {}) // no Vivado HLS analogue, so emit nothing
 
       .Case<arith::ConstantOp>([&](auto op) { emitConstant(op); })
       .Case<arith::SelectOp>([&](auto op) { emitSelect(op); })

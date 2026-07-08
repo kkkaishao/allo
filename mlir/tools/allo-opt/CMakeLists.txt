@@ -17,7 +17,12 @@ target_link_libraries(allo-opt
     MLIRIR
     MLIROptLib
     MLIRAllo
+    MLIRAlloMicroarch
     MLIRAlloScheduling
     MLIRAlloTransforms
     MLIRAlloTransformOps
+    CIRCTHW
+    CIRCTComb
+    CIRCTSeq
+    CIRCTFSM
 )

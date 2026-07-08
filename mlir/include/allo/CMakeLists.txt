@@ -3,6 +3,5 @@
 
 add_subdirectory(IR)
 add_subdirectory(Conversion)
-add_subdirectory(Scheduling)
 add_subdirectory(Transforms)
 add_subdirectory(TransformOps)

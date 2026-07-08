@@ -5,10 +5,6 @@
 
 #include "allo-c/Schedule.h"
 
-#include "allo/Scheduling/DependenceAnalysis.h"
-#include "allo/Scheduling/RegionGraph.h"
-#include "allo/Scheduling/ScheduleAttrs.h"
-
 #include "mlir/CAPI/IR.h"
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
@@ -330,91 +326,6 @@ void alloCollectScheduleSnapshotJSON(MlirModule module,
   out["root_id"] = requireScheduleId(root);
   out["ops"] = std::move(ops);
   out["values"] = std::move(values);
-
-  std::string text;
-  llvm::raw_string_ostream os(text);
-  os << llvm::json::Value(std::move(out));
-  os.flush();
-  callback(MlirStringRef{text.data(), text.size()}, userData);
-}
-
-void alloCollectScheduleResultJSON(MlirModule module,
-                                   MlirStringCallback callback, void *userData) {
-  ModuleOp mod = unwrap(module);
-  llvm::json::Array funcs;
-
-  mod.walk([&](func::FuncOp fn) {
-    auto regionsAttr =
-        fn->getAttrOfType<ArrayAttr>(allo::sched::kRegionsAttr);
-    if (!regionsAttr)
-      return; // func was not scheduled
-
-    // Region descriptors (from the solved carrier attributes).
-    llvm::json::Array regionsJson;
-    DenseMap<int64_t, unsigned> idToIdx;
-    for (Attribute a : regionsAttr) {
-      auto d = cast<DictionaryAttr>(a);
-      int64_t id = cast<IntegerAttr>(d.get(allo::sched::kRegionKeyId)).getInt();
-      llvm::json::Object r;
-      r["id"] = id;
-      r["kind"] = cast<StringAttr>(d.get(allo::sched::kRegionKeyKind)).str();
-      if (auto ii = d.get(allo::sched::kRegionKeyII))
-        r["ii"] = cast<IntegerAttr>(ii).getInt();
-      r["length"] =
-          cast<IntegerAttr>(d.get(allo::sched::kRegionKeyLength)).getInt();
-      r["order"] =
-          cast<IntegerAttr>(d.get(allo::sched::kRegionKeyOrder)).getInt();
-      r["ops"] = llvm::json::Array();
-      idToIdx[id] = regionsJson.size();
-      regionsJson.push_back(std::move(r));
-    }
-
-    // Per-op start times, grouped into their region.
-    fn.walk([&](Operation *op) {
-      auto rAttr = op->getAttrOfType<IntegerAttr>(allo::sched::kRegionIdAttr);
-      auto tAttr = op->getAttrOfType<IntegerAttr>(allo::sched::kStartTimeAttr);
-      if (!rAttr || !tAttr)
-        return;
-      auto it = idToIdx.find(rAttr.getInt());
-      if (it == idToIdx.end())
-        return;
-      llvm::json::Object o;
-      o["name"] = op->getName().getStringRef().str();
-      o["t"] = tAttr.getInt();
-      if (auto sid = op->getAttrOfType<StringAttr>(kScheduleIdAttr))
-        o["id"] = sid.str();
-      regionsJson[it->second].getAsObject()->getArray("ops")->push_back(
-          std::move(o));
-    });
-
-    // Coarse cross-region dependence graph (recomputed; deterministic).
-    allo::DependenceAnalysis deps(fn);
-    const allo::RegionGraph &graph = deps.getRegionGraph();
-    llvm::json::Array edges;
-    for (const allo::XEdge &e : graph.edges) {
-      llvm::json::Object eo;
-      eo["src"] = static_cast<int64_t>(e.src);
-      eo["dst"] = static_cast<int64_t>(e.dst);
-      eo["kind"] = allo::toString(e.kind).str();
-      edges.push_back(std::move(eo));
-    }
-    llvm::json::Array concurrency;
-    for (unsigned i = 0, n = graph.regions.size(); i < n; ++i)
-      for (unsigned j = i + 1; j < n; ++j)
-        if (graph.concurrent(i, j))
-          concurrency.push_back(llvm::json::Array{static_cast<int64_t>(i),
-                                                  static_cast<int64_t>(j)});
-
-    llvm::json::Object f;
-    f["name"] = fn.getSymName().str();
-    f["regions"] = std::move(regionsJson);
-    f["region_edges"] = std::move(edges);
-    f["concurrency"] = std::move(concurrency);
-    funcs.push_back(std::move(f));
-  });
-
-  llvm::json::Object out;
-  out["funcs"] = std::move(funcs);
 
   std::string text;
   llvm::raw_string_ostream os(text);

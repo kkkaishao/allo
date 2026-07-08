@@ -4,6 +4,8 @@
 set(LLVM_TARGET_DEFINITIONS AlloOps.td)
 mlir_tablegen(AlloOps.h.inc -gen-op-decls)
 mlir_tablegen(AlloOps.cpp.inc -gen-op-defs)
+mlir_tablegen(AlloOpsInterfaces.h.inc -gen-op-interface-decls)
+mlir_tablegen(AlloOpsInterfaces.cpp.inc -gen-op-interface-defs)
 mlir_tablegen(AlloDialect.h.inc -gen-dialect-decls -dialect=allo)
 mlir_tablegen(AlloDialect.cpp.inc -gen-dialect-defs -dialect=allo)
 add_public_tablegen_target(MLIRAlloOpsIncGen)
