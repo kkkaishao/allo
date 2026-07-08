@@ -72,6 +72,14 @@ def _fold_mod(lhs, rhs):
     return -remainder if lhs < 0 else remainder
 
 
+def _fold_floordiv(lhs, rhs):
+    """Constant ``//`` matching codegen: integers truncate toward zero like ``/``
+    (``divsi``/``divui``); floats keep Python's floor (``divf`` + ``math.floor``)."""
+    if isinstance(lhs, float) or isinstance(rhs, float):
+        return lhs // rhs
+    return _fold_div(lhs, rhs)
+
+
 def _fold_enabled(acc) -> bool:
     return is_default_acc(acc)
 
@@ -460,7 +468,7 @@ def floordiv(x, y, acc=ConstexprValue(None)):
 def _(x, y, acc=ConstexprValue(None)):
     if not _fold_enabled(acc):
         return NO_FOLD
-    return _fold_binary(x, y, lambda lhs, rhs: lhs // rhs)
+    return _fold_binary(x, y, _fold_floordiv)
 
 
 @floordiv.build

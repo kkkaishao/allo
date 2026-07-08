@@ -704,12 +704,16 @@ class AlloOpBuilder:
 
         def build_fn(l, r):
             if floating:
+                # Floats keep Python floor semantics (there is no HLS QoR concern).
                 divf = arith.DivFOp(
                     l.handle, r.handle, ip=self._ip, loc=self._loc
                 ).result
                 return math.FloorOp(divf, ip=self._ip, loc=self._loc).result
+            # Integer ``//`` truncates toward zero, like ``/`` and ``%``: a single
+            # HLS-native divide that Vitis recognizes for addressing, and it keeps
+            # the div/mod identity intact against ``remsi``/``remui``.
             if signed:
-                return arith.FloorDivSIOp(
+                return arith.DivSIOp(
                     l.handle, r.handle, ip=self._ip, loc=self._loc
                 ).result
             return arith.DivUIOp(l.handle, r.handle, ip=self._ip, loc=self._loc).result
