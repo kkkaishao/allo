@@ -19,6 +19,7 @@ add_mlir_public_c_api_library(MLIRAlloCAPI
     MLIRSupport
     MLIRAllo
     MLIRAlloConversion
+    MLIRAlloScheduling
     MLIRAlloTransforms
     MLIRAlloTransformOps
     MLIRAlloTranslation

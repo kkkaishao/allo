@@ -110,6 +110,16 @@ NB_MODULE(_allo, m) {
       nb::arg("module"),
       "Return the schedule snapshot as a JSON document (parse on the Python "
       "side).");
+  schedule.def(
+      "collect_schedule_result_json",
+      [](MlirModule module) {
+        std::string out;
+        alloCollectScheduleResultJSON(module, appendToString, &out);
+        return out;
+      },
+      nb::arg("module"),
+      "Return the SDC schedule result (regions/ops/edges/concurrency) as a JSON "
+      "document (parse on the Python side).");
   schedule.attr("SCHEDULE_ID_ATTR_NAME") = kScheduleIdAttr;
   schedule.attr("SCHEDULE_NAME_ATTR_NAME") = kScheduleNameAttr;
   schedule.attr("PIPELINE_II_ATTR_NAME") = kPipelineIIAttr;

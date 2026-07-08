@@ -15,6 +15,7 @@
 
 #include "allo/Conversion/Passes.h"
 #include "allo/IR/AlloOps.h"
+#include "allo/Scheduling/Passes.h"
 #include "allo/TransformOps/AlloTransformOps.h"
 #include "allo/Transforms/Passes.h"
 
@@ -48,6 +49,7 @@ void alloMlirRegisterAllPasses() {
   std::call_once(once, [] {
     allo::registerConversionPasses();
     allo::registerTransformsPasses();
+    allo::registerSchedulingPasses();
     allo::registerAlloLLVMLoweringPipeline();
   });
 }

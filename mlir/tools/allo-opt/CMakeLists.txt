@@ -17,6 +17,7 @@ target_link_libraries(allo-opt
     MLIRIR
     MLIROptLib
     MLIRAllo
+    MLIRAlloScheduling
     MLIRAlloTransforms
     MLIRAlloTransformOps
 )
