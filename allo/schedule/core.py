@@ -374,9 +374,9 @@ class Schedule(Generic[P, R]):
     @_within_context
     def pipeline(self, targets: Targets = None, *, ii: int = 1) -> Schedule:
         self._require_int("pipeline ii", ii)
-        if ii <= 0:
+        if ii < -1:
             raise InvalidScheduleArgumentError(
-                f"pipeline ii must be positive, got {ii}"
+                f"pipeline ii must be -1 (disable) or non-negative (0 = auto), got {ii}"
             )
         loops = self._resolve_loop_targets(targets, "pipeline")
         self.script.set_callsite_loc()

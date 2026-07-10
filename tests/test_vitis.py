@@ -121,6 +121,31 @@ def test_codegen_vadd_pipeline():
     _regex(code, r"= v\d+ \+ v\d+;")
 
 
+def test_codegen_disable_pipeline():
+    @kernel
+    def vadd(A: f32[16], B: f32[16], C: f32[16]):
+        for i in arange(16, name="i"):
+            C[i] = A[i] + B[i]
+
+    s = vadd.schedule()
+    s.pipeline(s.loop("i"), ii=-1)
+    code = _hls(s)
+    _contains(code, 'extern "C" void vadd(float ')
+    _contains(code, "#pragma HLS pipeline off")
+
+
+def test_codegen_auto_pipeline_ii():
+    @kernel
+    def vadd(A: f32[16], B: f32[16], C: f32[16]):
+        for i in arange(16, name="i"):
+            C[i] = A[i] + B[i]
+
+    s = vadd.schedule()
+    s.pipeline(s.loop("i"), ii=0)
+    code = _hls(s)
+    assert "II" not in code
+
+
 def test_codegen_vadd2_tile():
     @kernel
     def vadd2(A: f32[8, 8], B: f32[8, 8], C: f32[8, 8]):
