@@ -41,9 +41,9 @@ alloEmitVerilog(MlirModule module, MlirStringCallback callback, void *userData);
 /// emitted module's name to its port-interface JSON (the cosim manifest, with
 /// concrete field names). `binding` names the resource-binding policy. Returns
 /// failure (callback not invoked) if emission fails.
-MLIR_CAPI_EXPORTED MlirLogicalResult
-alloEmitDatapathToHW(MlirModule module, MlirStringRef binding,
-                     MlirStringCallback callback, void *userData);
+MLIR_CAPI_EXPORTED MlirLogicalResult alloEmitDatapathToHW(
+    MlirModule module, MlirStringRef binding, MlirStringRef top,
+    MlirStringCallback callback, void *userData);
 
 MLIR_CAPI_EXPORTED MlirLogicalResult
 alloEmitSplitVerilog(MlirModule module, MlirStringRef directory);

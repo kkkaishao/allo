@@ -105,9 +105,12 @@ def FoldIfStatementsPass
       (materialized from the `affine.if` integer set, or taken directly from
       `scf.if`); both branches are speculated -- side-effect-free ops and loads
       hoisted unconditionally, value results become `arith.select`, each guarded
-      store a predicated read-modify-write (`store select(cond, v, load)`). An
-      `if` whose body holds an un-maskable side effect (stream get/put), a nested
-      region (loop / inner if), or any other effecting op is not predicated.
+      store a predicated read-modify-write (`store select(cond, v, load)`), and
+      each guarded stream `get`/`put` gated on the condition via its i1 predicate
+      operand (the token is consumed/produced only where the branch is taken,
+      keeping the access in the pipelined region). An `if` whose body holds an
+      un-maskable side effect (a nested region -- loop / inner if -- a call, or
+      any other effecting op) is not predicated.
     * **Guard-to-bound (affine index-set splitting).** When an `affine.if` guards
       the *entire* body of its enclosing `affine.for` with a single inequality
       that is affine in the loop's induction variable, fold the guard into the
@@ -323,8 +326,42 @@ def SdcSchedulingPass : Pass<"sdc-scheduling", "ModuleOp"> {
            "Target clock period (ns); <=0 falls back to the operator library's "
            "cycle_time_ns, else 5.0">,
     Option<"operatorLibrary", "operator-library", "std::string", "\"\"",
-           "Path to a YAML operator library; empty uses the built-in default">
+           "Path to a YAML operator library; empty uses the built-in default">,
+    Option<"top", "top", "std::string", "\"top\"",
+           "Name of the top kernel of the design (for scheduling)">
   ];
 }
+
+def PropagatePartitionPass
+    : Pass<"propagate-partition", "ModuleOp"> {
+  let summary = "Push a partitioned array's `allo.part` onto every callee "
+                "parameter it is passed to";
+  let description = [{
+    A partition is a property of the ARRAY, stated once where the array lives (a
+    container's `memref.alloc`, or a kernel argument). A sub-kernel sees that
+    array only through its own parameter -- a different memref in a different
+    function -- so without this pass the callee is scheduled and emitted against
+    an unbanked parameter and the partition is silently dropped.
+
+    Runs before `sdc-scheduling`, so a callee is scheduled knowing its banks:
+    banking a composed array pays off only if the *callee* issues N accesses per
+    cycle, which needs its per-bank ResII and per-bank port groups. (Routing one
+    unbanked callee port to N banks through a caller-side crossbar would add
+    hardware and buy nothing.) After this, the existing leaf banking handles a
+    partitioned parameter unchanged, and a container merely materializes the
+    banks its children already agree on.
+
+    Propagation is top-down and monotone (it only adds an attribute). Two
+    callsites passing differently-partitioned arrays to one callee is reported as
+    an error, not reconciled: the callee has one body and one schedule, and
+    cloning it per partition is a schedule-layer decision, not a lowering one.
+  }];
+  let options = [
+    Option<"top", "top", "std::string", "\"top\"",
+           "Name of the top kernel of the design">
+  ];
+  let dependentDialects = ["mlir::func::FuncDialect"];
+}
+
 
 #endif // ALLO_TRANSFORMS_PASSES_TD

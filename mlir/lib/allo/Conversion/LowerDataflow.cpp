@@ -23,6 +23,7 @@ using namespace mlir::allo;
 namespace {
 constexpr StringLiteral kCreate = "allo_sim_stream_create";
 constexpr StringLiteral kWrite = "allo_sim_stream_write";
+constexpr StringLiteral kSeed = "allo_sim_stream_seed";
 constexpr StringLiteral kRead = "allo_sim_stream_read";
 constexpr StringLiteral kWriteMem = "allo_sim_stream_write_mem";
 constexpr StringLiteral kReadMem = "allo_sim_stream_read_mem";
@@ -95,6 +96,8 @@ static void declareRuntimeFuncs(ModuleOp module) {
   declareRuntimeFunc(module, kCreate,
                      FunctionType::get(ctx, {i64, i64, i64}, {i64}));
   declareRuntimeFunc(module, kWrite,
+                     FunctionType::get(ctx, {i64, i64, i64}, {}));
+  declareRuntimeFunc(module, kSeed,
                      FunctionType::get(ctx, {i64, i64, i64}, {}));
   declareRuntimeFunc(module, kRead, FunctionType::get(ctx, {i64, i64}, {i64}));
   declareRuntimeFunc(module, kWriteMem,
@@ -254,6 +257,26 @@ struct StreamCreateLowering : public OpConversionPattern<StreamCreateOp> {
         func::CallOp::create(rewriter, loc, rewriter.getStringAttr(kCreate),
                              TypeRange{i64}, operands);
     call->setAttr(kCreateAttr, rewriter.getUnitAttr());
+
+    // Initial tokens (feedback seeding): preload each into lane 0 in order, so
+    // they become the earliest tokens in the channel history. The create + seed
+    // calls run before any PE fiber is spawned (they precede the invokes in the
+    // top region), so the FIFO is seeded single-threaded before first use.
+    if (ArrayAttr init = op.getInitAttr()) {
+      Value handle = call.getResult(0);
+      Value lane0 = makeI64Constant(rewriter, loc, 0);
+      for (Attribute token : init) {
+        Value cst =
+            arith::ConstantOp::create(rewriter, loc, cast<TypedAttr>(token));
+        FailureOr<Value> bits = packScalar(rewriter, loc, cst);
+        if (failed(bits))
+          return op.emitOpError(
+              "stream initial token must be a scalar payload");
+        func::CallOp::create(rewriter, loc, rewriter.getStringAttr(kSeed),
+                             TypeRange{}, ValueRange{handle, lane0, *bits});
+      }
+    }
+
     rewriter.replaceOp(op, call.getResults());
     return success();
   }

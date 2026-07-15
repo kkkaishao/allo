@@ -253,6 +253,11 @@ class Schedule(Generic[P, R]):
         return self._payload
 
     @property
+    def module(self) -> Module:
+        """Alias for payload"""
+        return self.payload
+
+    @property
     def snapshot(self) -> ScheduleSnapshot:
         self._require_materialized("snapshot")
         return self._real

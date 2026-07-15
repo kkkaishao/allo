@@ -37,7 +37,7 @@ Reservation reservationOf(const RegionBlock &region, const FuncUnit &unit,
 
 bool reservationsDisjoint(const Reservation &a, const Reservation &b) {
   if (a.region != b.region)
-    return false; // cross-region sharing not modelled yet: conservatively
+    return false; // cross-region sharing not modelled: conservatively
                   // conflict
   llvm::SmallDenseSet<unsigned, 8> cyclesA(a.cycles.begin(), a.cycles.end());
   return llvm::none_of(b.cycles,

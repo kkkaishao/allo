@@ -147,6 +147,7 @@ class Backend(ABC, Generic[P, R]):
         self.module: ir.Module = ir_ext.clone_module(kernel.compile())
         self.kernel = kernel
         self._kernel_cache: dict[str, Any] | None = None
+        self.__name__ = self.kernel.func_name
 
     def _compute_kernel_cache(self) -> dict[str, Any]:
         """The kernel's contribution to a cache key, computed once and reused.

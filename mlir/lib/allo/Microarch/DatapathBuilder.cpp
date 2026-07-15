@@ -41,29 +41,6 @@ namespace {
 // Pure DCP structural readers.
 //===----------------------------------------------------------------------===//
 
-// Start cycle (region-relative) carried by a dcp compute/load/store op.
-int64_t dcpStart(Operation *op) {
-  return cast<IntegerAttr>(op->getAttr("start")).getInt();
-}
-
-// The dcp.operator characterizing a compute/load op, or null.
-dcp::DCPathOperatorOp dcpOperator(Operation *op) {
-  FlatSymbolRefAttr sym;
-  if (auto c = dyn_cast<dcp::DCPathComputeOp>(op))
-    sym = c.getOpTypeAttr();
-  else if (auto l = dyn_cast<dcp::DCPathLoadOp>(op))
-    sym = l.getOpTypeAttr();
-  if (!sym)
-    return {};
-  return SymbolTable::lookupNearestSymbolFrom<dcp::DCPathOperatorOp>(op, sym);
-}
-
-// Result latency of a producing dcp op (0 if uncharacterized).
-unsigned dcpLatency(Operation *op) {
-  dcp::DCPathOperatorOp opr = dcpOperator(op);
-  return opr ? static_cast<unsigned>(opr.getLatency()) : 0;
-}
-
 Value dcpMemref(Operation *op) {
   if (auto l = dyn_cast<dcp::DCPathLoadOp>(op))
     return l.getMemref();
@@ -85,7 +62,7 @@ void dcpAddressing(Operation *op, AffineMap &map,
 }
 
 // The body block of a dcp region op. A guard (dcp.select) has no `else` here
-// (result-mux guards are not yet lowered), so its body is the `then` branch --
+// (result-mux guards are unsupported), so its body is the `then` branch --
 // which holds the guarded sub-schedule (child regions), gated by the predicate.
 Block *regionBody(Operation *regionOp) {
   if (auto pipe = dyn_cast<dcp::DCPathPipelineOp>(regionOp))
@@ -286,7 +263,7 @@ void DatapathBuilder::bindResource(Operation *op, RegionBlock &rb) {
     return;
 
   if (auto comp = dyn_cast<dcp::DCPathComputeOp>(op)) {
-    dcp::DCPathOperatorOp opr = dcpOperator(op);
+    auto opr = dyn_cast_or_null<dcp::DCPathOperatorOp>(dcpOperatorOp(op));
     FuncUnit u;
     u.id = dp.units.size();
     u.opType = opr ? opr.getKind().str() : op->getName().stripDialect().str();
@@ -377,10 +354,10 @@ void DatapathBuilder::recordGuards(ArrayRef<Operation *> regionOps) {
     if (!sel)
       continue;
     // A result-mux guard (both branches yield a value, muxed by the predicate)
-    // needs the else branch + result-mux, not yet lowered -- a pure guard (its
-    // stores live inside the then branch) has neither.
+    // needs the else branch + result-mux, which is unsupported -- a pure guard
+    // (its stores live inside the then branch) has neither.
     assert(sel.getResults().empty() && sel.getElseRegion().empty() &&
-           "result-mux dcp.select (else branch) not yet lowered");
+           "result-mux dcp.select (else branch) is unsupported");
     // The predicate is the select's i1 condition operand. If it is a scheduled
     // value (a preceding condition region's survivor) `boundSource` resolves
     // it; otherwise it is a raw arith tree over the enclosing counter,
@@ -470,10 +447,14 @@ Resolved DatapathBuilder::resolveOperand(Value v, Operation *consumer,
   int64_t tY = dcpStart(consumer);
   Operation *regionOp = consumer->getParentOp();
 
-  auto edge = [&](Source base, Value key, int64_t tX, unsigned lat,
+  // Register depth for an edge whose producer's result is ready at `ready`
+  // (cycles after its issuing pulse): distance-many II turns, plus the
+  // consumer's cycle, minus the producer's ready cycle. `readyCycleOf` is the
+  // one definition of that ready cycle (shared with the emitter).
+  auto edge = [&](Source base, Value key, unsigned ready,
                   unsigned distance) -> Resolved {
-    int64_t depth = static_cast<int64_t>(distance) * ii + (tY - tX) -
-                    static_cast<int64_t>(lat);
+    int64_t depth =
+        static_cast<int64_t>(distance) * ii + tY - static_cast<int64_t>(ready);
     assert(depth >= 0 && "infeasible negative register depth");
     return {base, key, static_cast<unsigned>(depth), true};
   };
@@ -490,7 +471,7 @@ Resolved DatapathBuilder::resolveOperand(Value v, Operation *consumer,
       // emitter reads that region's counter.
       if (barg.getArgNumber() == 0)
         return edge(Source{Source::Kind::Counter, regionIdxOf.lookup(pipe), 0},
-                    v, /*tX=*/0, /*lat=*/0, /*distance=*/0);
+                    v, /*ready=*/0, /*distance=*/0);
       // An iter_arg of an *enclosing* container (this consumer is nested inside
       // a sequential-wrapper while): the container's frozen survivor register,
       // read across the region boundary (depth 0, no chain). Symmetric to the
@@ -515,9 +496,15 @@ Resolved DatapathBuilder::resolveOperand(Value v, Operation *consumer,
       // input port -- the register carrying the recurrence may sit elsewhere in
       // the cycle (the widened idiom reads acc through a bare wire, not the
       // register).
-      Resolved r = edge(it->second, def->getResult(0), dcpStart(def),
-                        dcpLatency(def), distance);
+      Resolved r =
+          edge(it->second, def->getResult(0), readyCycleOf(def), distance);
       r.init = initSource(pipe.getInits()[iterArg]);
+      // An unresolvable init would be silently dropped by the emitter (the
+      // re-injection mux is keyed on the init being non-None), leaving the
+      // recurrence to read only its own backedge: the accumulator would keep
+      // its reset value on the first iteration and free-run from there. Fail
+      // the way the container path does (HWEmitter::setupCarriedIterArgs).
+      assert(r.init && "a recurrence input has no resolvable init");
       return r;
     }
     return {};
@@ -540,17 +527,15 @@ Resolved DatapathBuilder::resolveOperand(Value v, Operation *consumer,
   if (it->second.kind == Source::Kind::Const)
     return {it->second, Value(), 0, true};
   if (def->getParentOp() != regionOp)
-    return {}; // cross-region hand-off deferred
-  return edge(it->second, v, dcpStart(def), dcpLatency(def), /*distance=*/0);
+    return {}; // cross-region hand-off unsupported
+  return edge(it->second, v, readyCycleOf(def), /*distance=*/0);
 }
 
 Source DatapathBuilder::initSource(Value v) {
   // A nested region's iter-arg init that reads an enclosing container's
   // iter-arg (a nested while's `%argN = %outerIterArg`): the container's frozen
   // survivor register. Safe to inject at the nested region's start -- the outer
-  // register is stable for the whole nested run (unlike a sibling's data
-  // survivor, which the region-result branch below re-injects only when it is a
-  // constant).
+  // register is stable for the whole nested run.
   if (auto barg = dyn_cast<BlockArgument>(v))
     if (auto pipe =
             dyn_cast<dcp::DCPathPipelineOp>(barg.getOwner()->getParentOp());
@@ -560,23 +545,21 @@ Source DatapathBuilder::initSource(Value v) {
   if (Operation *def = v.getDefiningOp()) {
     if (auto it = producerOf.find(def); it != producerOf.end())
       return it->second; // typically a hoisted Const (the reduction identity)
-    // An init fused into a prologue region (read as one of its `uncondition`
-    // results): look through to that result's own Source, so a reduction
-    // identity bundled into a multi-result survivor region still re-injects
-    // (e.g. `acc = 0` alongside a loop-invariant load). Only a constant
-    // identity is safe to re-inject -- it is available everywhere; a data
-    // survivor lives in another region's port, so leave it to the reset value.
+    // An init produced by a sibling region (read as one of its results, e.g.
+    // `acc = x[i]` fused into a prologue alongside the identity of a second
+    // reduction): its survivor register -- resolved exactly as `resolveOperand`
+    // resolves the same value read as a data operand. The emitter latches every
+    // region result into a survivor that outlives the producing region, so the
+    // init is stable for the whole consuming run; the producing Source itself
+    // is not, being a port a free-running datapath overwrites once that region
+    // ends.
     if (isa<dcp::DCPathPipelineOp, dcp::DCPathSequentialOp>(def))
-      if (auto it = dp.regionResult.find(regionIdxOf.lookup(def));
-          it != dp.regionResult.end()) {
-        unsigned k = cast<OpResult>(v).getResultNumber();
-        if (k < it->second.size() && it->second[k].kind == Source::Kind::Const)
-          return it->second[k];
-      }
+      return Source{Source::Kind::Survivor, regionIdxOf.lookup(def),
+                    cast<OpResult>(v).getResultNumber()};
   }
   if (auto it = ioOf.find(v); it != ioOf.end())
     return it->second;
-  return {}; // None: an unmodelled init -- no re-injection (reset value stands)
+  return {}; // None: an unmodelled init (the callers reject it)
 }
 
 RegId DatapathBuilder::insertRegister(Value key, ArrayRef<unsigned> depths,
@@ -593,7 +576,6 @@ RegId DatapathBuilder::insertRegister(Value key, ArrayRef<unsigned> depths,
   reg.depth = maxDepth;
   reg.input = input;
   reg.taps.assign(taps.begin(), taps.end());
-  reg.needsEnable = true;
   dp.valueToReg[key] = reg.id;
   dp.regions[region].regs.push_back(reg.id);
   dp.regs.push_back(std::move(reg));
@@ -601,6 +583,13 @@ RegId DatapathBuilder::insertRegister(Value key, ArrayRef<unsigned> depths,
 }
 
 void DatapathBuilder::deriveInterconnect() {
+  allocateInputSlots();
+  resolveUnitInputs();
+  resolveAccessOperands();
+  insertRegisters();
+}
+
+void DatapathBuilder::allocateInputSlots() {
   for (FuncUnit &u : dp.units) {
     if (u.boundOps.empty())
       continue; // merged-away (dead) unit: dropped from its region
@@ -615,42 +604,22 @@ void DatapathBuilder::deriveInterconnect() {
       dcpAddressing(acc.op, acc.addrMap, operands);
       acc.addr.assign(operands.size(), Source{});
     }
+}
 
-  llvm::MapVector<Value, SmallVector<unsigned>> depthsByKey;
-  llvm::DenseMap<Value, Source> baseByKey;
-  llvm::DenseMap<Value, unsigned> regionOfKey; // key -> region vector index
-  struct Pending {
-    Source *slot;
-    Value key;
-    unsigned depth;
-  };
-  SmallVector<Pending> pending;
+void DatapathBuilder::record(Resolved r, Source &slot, unsigned regionIdx) {
+  if (!r.ok)
+    return;
+  if (r.depth == 0) {
+    slot = r.base;
+    return;
+  }
+  depthsByKey[r.key].push_back(r.depth);
+  baseByKey[r.key] = r.base;
+  regionOfKey[r.key] = regionIdx;
+  pending.push_back({&slot, r.key, r.depth});
+}
 
-  auto record = [&](Resolved r, Source &slot, unsigned regionIdx) {
-    if (!r.ok)
-      return;
-    if (r.depth == 0) {
-      slot = r.base;
-      return;
-    }
-    depthsByKey[r.key].push_back(r.depth);
-    baseByKey[r.key] = r.base;
-    regionOfKey[r.key] = regionIdx;
-    pending.push_back({&slot, r.key, r.depth});
-  };
-
-  // A shared unit's per-port drivers: one Source per bound op, resolved through
-  // the same reg-depth path, then muxed once registers exist. A deque so
-  // `record`'s pending slot pointers into `sources` survive later pushes.
-  struct MuxBuild {
-    UnitId unit;
-    unsigned port;
-    RegionId region;
-    llvm::SmallVector<Operation *, 2> ops;
-    llvm::SmallVector<Source, 2> sources; // parallel to ops; filled by record
-  };
-  std::deque<MuxBuild> muxBuilds;
-
+void DatapathBuilder::resolveUnitInputs() {
   for (FuncUnit &u : dp.units) {
     if (u.boundOps.empty())
       continue;
@@ -676,13 +645,15 @@ void DatapathBuilder::deriveInterconnect() {
         Operation *opj = u.boundOps[j].first;
         Resolved r = resolveOperand(opj->getOperand(k), opj, ii);
         assert(r.init.kind == Source::Kind::None &&
-               "sharing a recurrence (reduction) unit is not modelled yet");
+               "sharing a recurrence (reduction) unit is not modelled");
         mb.ops.push_back(opj);
         record(r, mb.sources[j], ridx);
       }
     }
   }
+}
 
+void DatapathBuilder::resolveAccessOperands() {
   for (MemUnit &m : dp.mems)
     for (MemUnit::Access &acc : m.accesses) {
       unsigned ridx = regionIdxOf.lookup(acc.op->getParentOp());
@@ -699,21 +670,30 @@ void DatapathBuilder::deriveInterconnect() {
     }
 
   // A stream put's data driver, resolved through the same reg-depth path as a
-  // store's (the token value is presented at the put's stage).
+  // store's (the token value is presented at the put's stage); and, for a
+  // predicated get/put, its i1 predicate, delayed to the access stage the same
+  // way so it gates the handshake in emitStreamAccesses.
   for (StreamChannel &s : dp.streams)
-    for (StreamChannel::Access &acc : s.accesses)
-      if (acc.isPut) {
-        unsigned ridx = regionIdxOf.lookup(acc.op->getParentOp());
-        unsigned ii = dp.regions[ridx].ii.value_or(1);
+    for (StreamChannel::Access &acc : s.accesses) {
+      unsigned ridx = regionIdxOf.lookup(acc.op->getParentOp());
+      unsigned ii = dp.regions[ridx].ii.value_or(1);
+      if (acc.isPut)
         record(resolveOperand(cast<StreamPutOp>(acc.op).getValue(), acc.op, ii),
                acc.data, ridx);
-      }
+      Value pred = isa<StreamGetOp>(acc.op)
+                       ? cast<StreamGetOp>(acc.op).getPred()
+                       : cast<StreamPutOp>(acc.op).getPred();
+      if (pred)
+        record(resolveOperand(pred, acc.op, ii), acc.when, ridx);
+    }
+}
 
+void DatapathBuilder::insertRegisters() {
   for (auto &kv : depthsByKey)
     insertRegister(kv.first, kv.second, baseByKey[kv.first],
                    regionOfKey[kv.first]);
 
-  for (const Pending &p : pending)
+  for (const RegDepth &p : pending)
     *p.slot = Source{Source::Kind::Reg, dp.valueToReg[p.key], p.depth};
 
   // Materialize sharing muxes: sources are final now (registers built, pending

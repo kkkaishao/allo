@@ -6,10 +6,12 @@
 #include "allo/Scheduling/ProblemBuilder.h"
 
 #include "allo/IR/AlloOps.h"
+#include "allo/Scheduling/Footprint.h"
 #include "allo/Scheduling/Scheduler.h"
 
 #include "mlir/Dialect/Affine/Analysis/AffineAnalysis.h"
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
+#include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "llvm/ADT/DenseSet.h"
@@ -73,6 +75,8 @@ traceIterArgSource(Block *body, Operation *yield, unsigned iterArg) {
   return definer ? std::make_pair(definer, distance + 1)
                  : std::make_pair<Operation *, unsigned>(nullptr, 0);
 }
+
+static bool isSyncCall(Operation *op); // a plain (non-async) sub-kernel call
 
 template <class ProblemT>
 ProblemT buildCyclicProblem(LoopLikeOpInterface loop,
@@ -150,11 +154,14 @@ ProblemT buildCyclicProblem(LoopLikeOpInterface loop,
     return WalkResult::advance();
   });
 
-  // Anchor: side-effecting ops (stores and stream accesses) must be scheduled
-  // before the loop terminator.
+  // Anchor: side-effecting ops (stores, stream accesses, and a sync sub-kernel
+  // call -- an opaque node touching whole memrefs) must be scheduled before the
+  // loop terminator, so the terminator is the problem's unique sink (a call in
+  // the body would otherwise be a second, unordered sink).
   auto *anchor = body->getTerminator();
   body->walk([&](Operation *op) {
-    if (!isa<AffineStoreOp, memref::StoreOp, StreamGetOp, StreamPutOp>(op))
+    if (!isa<AffineStoreOp, memref::StoreOp, StreamGetOp, StreamPutOp>(op) &&
+        !isSyncCall(op))
       return;
     Problem::Dependence dep(op, anchor);
     auto depInserted = problem.insertDependence(dep);
@@ -288,6 +295,14 @@ ProblemT buildWhileProblem(scf::WhileOp w, DependenceAnalysis &deps) {
   return problem;
 }
 
+// A synchronous sub-kernel call: a plain (non-async) func.call, which the
+// parent schedules as an opaque fixed-latency node in program order. An async
+// call is composed structurally as dataflow (ordered by its streams, not the
+// SDC schedule), so it is not treated as a sync call here.
+static bool isSyncCall(Operation *op) {
+  return isa<func::CallOp>(op) && !op->hasAttr(kAlloAsyncAttr);
+}
+
 template <class ProblemT>
 ProblemT buildAcyclicProblem(ArrayRef<Operation *> ops,
                              DependenceAnalysis &deps) {
@@ -326,11 +341,55 @@ ProblemT buildAcyclicProblem(ArrayRef<Operation *> ops,
       }
     });
 
+  // Op-level DependenceAnalysis tracks only load/store/stream accesses, so a
+  // func.call -- an opaque sub-kernel touching whole memrefs -- carries no
+  // memory edge. Order a sync call against another call (or a raw access) in
+  // the same span by their memory footprints, at op granularity. A shared-array
+  // producer/consumer serializes; two calls that are data-independent, share
+  // only reads, or write provably DISJOINT elements get no edge (they overlap).
+  // Only pairs with at least one sync call need this -- the rest are already
+  // modeled above.
+  //
+  // A sync call contributes its CALLEE's per-argument footprint (direction plus
+  // the callee's own affine accesses, in the caller's terms): the conservative
+  // `summarizeOp` cannot see through a call, so it marks every memref operand
+  // read+write, which would falsely serialize even two readers of one input. A
+  // callee the summary cannot see through falls back to that conservative
+  // record, which subsumes any partial one, so the pair stays ordered.
+  auto summarize = [](Operation *top, Summary &s) {
+    top->walk([&](Operation *op) {
+      if (isSyncCall(op) && summarizeCall(cast<func::CallOp>(op), s))
+        return;
+      summarizeOp(op, s);
+    });
+  };
+  for (unsigned i = 0, e = ops.size(); i < e; ++i)
+    for (unsigned j = i + 1; j < e; ++j) {
+      if (!isSyncCall(ops[i]) && !isSyncCall(ops[j]))
+        continue;
+      Summary si, sj;
+      summarize(ops[i], si);
+      summarize(ops[j], sj);
+      for (const auto &kv : si.mem) {
+        auto it = sj.mem.find(kv.first);
+        if (it != sj.mem.end() &&
+            callFootprintConflict(kv.second, it->second) != Conflict::None)
+          (void)problem.insertDependence(Problem::Dependence(ops[i], ops[j]));
+      }
+    }
+
   // Make the last program-order op a unique sink via auxiliary dependences, so
   // that minimizing its start time yields an ASAP schedule for the whole span.
   Operation *sink = ops.back();
   for (Operation *op : problem.getOperations()) {
     if (op == sink)
+      continue;
+    // Two sync calls are ordered exactly by the footprint edges above; a
+    // blanket auxiliary edge between them would falsely serialize
+    // data-independent calls (the sink call's start forced past the other's
+    // whole latency). Every other pair keeps the ASAP-sink edge (a zero-latency
+    // sink serializes nothing).
+    if (isSyncCall(op) && isSyncCall(sink))
       continue;
     (void)problem.insertDependence(Problem::Dependence(op, sink));
   }

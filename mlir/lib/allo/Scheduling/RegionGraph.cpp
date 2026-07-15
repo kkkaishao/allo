@@ -7,6 +7,7 @@
 #include "allo/Scheduling/DependenceAnalysis.h"
 #include "allo/Scheduling/Footprint.h"
 #include "allo/Scheduling/Utils.h"
+#include "allo/Support/Logging.h"
 
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
@@ -209,4 +210,80 @@ allo::dumpRegionDependenceAnaysis(ModuleOp module,
   if (s.empty())
     return failure();
   return os.str();
+}
+
+static void buildDepsRec(func::FuncOp fn, SymbolTableCollection &syms,
+                         DenseMap<Operation *, SmallVector<Operation *>> &deps,
+                         DenseSet<Operation *> &builtFns) {
+  if (!builtFns.insert(fn).second)
+    return; // already built this function's callsite deps
+  fn.walk([&](func::CallOp call) {
+    auto callee =
+        syms.lookupNearestSymbolFrom<func::FuncOp>(call, call.getCalleeAttr());
+    if (callee && !callee.isExternal()) {
+      deps[call];
+      buildDepsRec(callee, syms, deps, builtFns);
+      callee.walk([&](func::CallOp inner) { deps[call].push_back(inner); });
+    }
+  });
+}
+
+// Topological sort of the synchronous call graph (callsites as nodes, edges to
+// the callee's callsites). Returns false on a cycle, with a diagnostic on the
+// first callsite in the cycle. The graph is a DAG if the program has no
+// recursive synchronous calls (checked by `checkNoRecursiveCalls`).
+static bool dfs(Operation *op,
+                DenseMap<Operation *, SmallVector<Operation *>> &deps,
+                llvm::SmallPtrSet<Operation *, 32> &visited,
+                llvm::SmallPtrSet<Operation *, 32> &onStack,
+                SmallVectorImpl<Operation *> &path,
+                SmallVectorImpl<Operation *> &sorted) {
+  if (visited.contains(op))
+    return true;
+  if (!onStack.insert(op).second) {
+    auto *it = llvm::find(path, op);
+    auto &diag = logging::error(logging::Stage::Prep, op)
+                 << "Invalid cyclic call graph detected:";
+    for (Operation *p : llvm::make_range(it, path.end()))
+      diag << "\n  -> " << p->getLoc();
+    diag << "\n  -> "
+         << op->getLoc(); // repeat the first node to close the cycle
+    return false;
+  }
+  path.push_back(op);
+  for (Operation *dep : deps.lookup(op))
+    if (!dfs(dep, deps, visited, onStack, path, sorted))
+      return false;
+  path.pop_back();
+  onStack.erase(op);
+  visited.insert(op);
+  sorted.push_back(op);
+  return true;
+}
+
+llvm::FailureOr<SmallVector<Operation *>>
+allo::buildAndSortCallsiteGraph(func::FuncOp root) {
+  SymbolTableCollection syms;
+  DenseMap<Operation *, SmallVector<Operation *>> deps;
+  DenseSet<Operation *> builtFns;
+  SmallVector<Operation *> allCallsites;
+
+  root->walk([&](func::CallOp call) {
+    auto callee =
+        syms.lookupNearestSymbolFrom<func::FuncOp>(call, call.getCalleeAttr());
+    if (callee && !callee.isExternal()) {
+      allCallsites.push_back(call);
+      deps[call];
+      buildDepsRec(callee, syms, deps, builtFns);
+      callee.walk([&](func::CallOp inner) { deps[call].push_back(inner); });
+    }
+  });
+
+  llvm::SmallPtrSet<Operation *, 32> visited, onStack;
+  SmallVector<Operation *> path;
+  SmallVector<Operation *> sorted;
+  for (Operation *call : allCallsites)
+    if (!dfs(call, deps, visited, onStack, path, sorted))
+      return failure();
+  return sorted;
 }

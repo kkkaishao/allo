@@ -11,8 +11,8 @@
 //   the
 //     trivial resource binding (every compute op its own `FuncUnit`, every
 //     memref its own `MemUnit`, each literal a `ConstCell`, scalar args
-//     `IOPort`s). `bindResource` is the seam where non-trivial binding (sharing
-//     + muxes) will grow.
+//     `IOPort`s). `bindResource` is the seam for non-trivial binding (sharing
+//     + muxes).
 //   * Step B -- interconnect derivation: `resolveOperand` applies the register-
 //     depth rule `d*II + (tY - tX) - lat`, and `insertRegister` materializes
 //     the shift-register chains.
@@ -27,6 +27,10 @@
 
 #include "allo/Microarch/BindingPolicy.h"
 #include "allo/Microarch/Datapath.h"
+
+#include "llvm/ADT/MapVector.h"
+
+#include <deque>
 
 namespace mlir::allo::uarch {
 
@@ -55,6 +59,26 @@ struct DatapathBuilder {
   llvm::DenseMap<Value, Source> ioOf;
   llvm::DenseMap<Operation *, unsigned> regionIdxOf;
 
+  // Step B interconnect-derivation scratch (transient; see deriveInterconnect).
+  struct RegDepth { // a register-fed input slot, patched once its chain exists
+    Source *slot;
+    Value key;
+    unsigned depth;
+  };
+  struct MuxBuild { // a shared unit port's per-op drivers, muxed after chains
+    UnitId unit;
+    unsigned port;
+    RegionId region;
+    llvm::SmallVector<Operation *, 2> ops;
+    llvm::SmallVector<Source, 2> sources; // parallel to ops
+  };
+  llvm::MapVector<Value, llvm::SmallVector<unsigned>> depthsByKey;
+  llvm::DenseMap<Value, Source> baseByKey;
+  llvm::DenseMap<Value, unsigned> regionOfKey;
+  llvm::SmallVector<RegDepth> pending;
+  std::deque<MuxBuild> muxBuilds; // a deque so `record`'s slot pointers into
+                                  // `sources` survive later pushes
+
   const BindingPolicy &policy; // decides resource sharing (Step A)
 
   DatapathBuilder(Datapath &dp, func::FuncOp func, const BindingPolicy &policy)
@@ -77,7 +101,7 @@ struct DatapathBuilder {
   /// argument).
   MemId getOrCreateMem(Value memref);
   /// Allocate (or reuse) a StreamChannel for the `!allo.stream` value \p stream
-  /// (a func block arg in P0). \p isInput sets the channel direction on first
+  /// (a func block arg). \p isInput sets the channel direction on first
   /// touch (a get => input, a put => output).
   StreamId getOrCreateStream(Value stream, bool isInput);
   /// Record region \p rb's result (its `uncondition` operand's producing
@@ -98,7 +122,7 @@ struct DatapathBuilder {
   /// Record each guard (dcp.select) region's i1 predicate Source in
   /// `dp.guardCond` (its `$condition` operand, a preceding condition region's
   /// survivor). Runs after region recording so the survivor resolves. A
-  /// result-mux guard (else branch) is asserted out -- not yet lowered.
+  /// result-mux guard (else branch) is asserted out -- unsupported.
   void recordGuards(llvm::ArrayRef<Operation *> regionOps);
   /// The Source driving a pipeline's runtime bound value \p v (a region-result
   /// survivor, a hoisted producer, or a scalar IOPort); None if unmodelled.
@@ -131,9 +155,22 @@ struct DatapathBuilder {
   /// largest of \p depths, with a tap at each distinct depth. Returns its id.
   RegId insertRegister(Value key, ArrayRef<unsigned> depths, Source input,
                        RegionId region);
-  /// Resolve every unit input / memory address / store-data driver, threading
-  /// non-zero-depth edges through inserted register chains.
+  /// Resolve every unit input / memory address / store-data / stream driver,
+  /// threading non-zero-depth edges through inserted register chains. Drives
+  /// the four phases below.
   void deriveInterconnect();
+  /// Size the (empty) input-slot vectors every resolve phase fills.
+  void allocateInputSlots();
+  /// Record a resolved edge into \p slot: a depth-0 edge ties directly, a
+  /// deeper one is deferred (its register chain is built in insertRegisters).
+  void record(Resolved r, Source &slot, unsigned regionIdx);
+  /// Resolve every unit input (single, or shared-then-muxed).
+  void resolveUnitInputs();
+  /// Resolve every memory address / store data and stream data + predicate.
+  void resolveAccessOperands();
+  /// Build the register chains the deferred edges need, patch their slots, and
+  /// materialize the shared-unit muxes.
+  void insertRegisters();
 };
 
 } // namespace mlir::allo::uarch

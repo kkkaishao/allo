@@ -531,6 +531,45 @@ scheduleAcyclic(ArrayRef<Operation *> ops, DependenceAnalysis &deps,
 // program order, no overlap). Set the func attribute only when every region has
 // a known latency; flag it as a bound if any region's latency was assumed.
 static void annotateKernelLatency(func::FuncOp funcOp) {
+  Builder b(funcOp.getContext());
+
+  // A sequential-composition container's latency is its LAST child's completion
+  // -- max over its (non-async) calls of (the call's scheduled `start` + the
+  // callee's whole-kernel latency) -- not the straight-line region sum, which
+  // counts only to a call's start and so undercounts a call node by its own
+  // latency. Callees are scheduled first (bottom-up), so their
+  // `allo.sched.latency` is already set; this is what a nested parent's
+  // operator characterization reads for the call node, so it must be exact here
+  // (before reify's `dcp.latency`). Async calls compose as dataflow, not a
+  // static node, and are left to the region path. Mirrors the reify's
+  // `setDcpLatencies`.
+  {
+    bool container = false, allKnown = true;
+    int64_t composed = 0;
+    funcOp.walk([&](func::CallOp call) {
+      if (call->hasAttr(kAlloAsyncAttr))
+        return;
+      container = true;
+      int64_t start = 0;
+      if (auto s = call->getAttrOfType<IntegerAttr>(sched::kStartTimeAttr))
+        start = s.getInt();
+      auto callee = dyn_cast_or_null<func::FuncOp>(
+          SymbolTable::lookupNearestSymbolFrom(call, call.getCalleeAttr()));
+      auto lat = callee
+                     ? callee->getAttrOfType<IntegerAttr>(sched::kLatencyAttr)
+                     : nullptr;
+      if (!lat)
+        allKnown = false;
+      else
+        composed = std::max(composed, start + lat.getInt());
+    });
+    if (container) {
+      if (allKnown)
+        funcOp->setAttr(sched::kLatencyAttr, b.getI64IntegerAttr(composed));
+      return;
+    }
+  }
+
   auto regionsAttr = funcOp->getAttrOfType<ArrayAttr>(sched::kRegionsAttr);
   if (!regionsAttr)
     return;
@@ -548,7 +587,6 @@ static void annotateKernelLatency(func::FuncOp funcOp) {
     total += lat.getInt();
     isBound |= d.get(sched::kRegionKeyLatencyBound) != nullptr;
   }
-  Builder b(funcOp.getContext());
   funcOp->setAttr(sched::kLatencyAttr, b.getI64IntegerAttr(total));
   if (isBound)
     funcOp->setAttr(sched::kLatencyBoundAttr, b.getUnitAttr());
@@ -834,15 +872,38 @@ struct SdcSchedulingPass
     float cycleTimeNs =
         cycleTime > 0.0f ? cycleTime : loadedLib.cycleTime().value_or(5.0f);
 
-    SmallVector<func::FuncOp> funcs(module.getOps<func::FuncOp>());
-    IRRewriter r(&getContext());
-    for (auto funcOp : funcs)
-      if (!funcOp.isExternal())
-        if (failed(scheduleFunc(r, funcOp, loadedLib, cycleTimeNs)))
-          return signalPassFailure();
+    // Schedule bottom-up over the call graph
+    // The call graph should be a DAG, so a post-order traversal schedules
+    // callees before callers
+    auto topFunc = module.lookupSymbol<func::FuncOp>(top);
+    if (!topFunc) {
+      error(Stage::Prep, module) << "Top function '" << top << "' not found";
+      return signalPassFailure();
+    }
+    auto orderedFnsOr = buildAndSortCallsiteGraph(topFunc);
+    if (failed(orderedFnsOr))
+      return signalPassFailure();
 
-    // The schedule is emitted as the `allo.sched.*` carrier only; the pipeline
-    // chains `convert-schedule-to-dcp` to reify it into `allo.dcp.*` ops.
+    IRRewriter rewriter(module.getContext());
+    SymbolTableCollection syms;
+    llvm::SmallPtrSet<Operation *, 32> scheduled;
+
+    for (Operation *callOp : *orderedFnsOr) {
+      auto call = cast<func::CallOp>(callOp);
+      auto callee = syms.lookupNearestSymbolFrom<func::FuncOp>(
+          call, call.getCalleeAttr());
+      assert(callee && "callee must exist in the call graph");
+      if (!scheduled.insert(callee).second)
+        continue; // already scheduled this callee (multiple callsites)
+      if (failed(scheduleFunc(rewriter, callee, loadedLib, cycleTimeNs)))
+        return signalPassFailure();
+    }
+
+    // root function is scheduled last
+    if (scheduled.insert(topFunc).second) {
+      if (failed(scheduleFunc(rewriter, topFunc, loadedLib, cycleTimeNs)))
+        return signalPassFailure();
+    }
   }
 
   void getDependentDialects(DialectRegistry &registry) const override {

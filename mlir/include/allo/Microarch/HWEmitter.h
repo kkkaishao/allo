@@ -36,6 +36,8 @@
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringMap.h"
 
+#include <utility>
+
 namespace mlir::allo::iface {
 struct ModuleInterface; // the port model threaded to the dataflow-top emitter
 } // namespace mlir::allo::iface
@@ -58,6 +60,10 @@ unsigned memReadLatency(MemoryImplEnum impl);
 unsigned schedT(Operation *op);
 /// Whether a native integer/logic mnemonic has an `emitCompute` comb lowering.
 bool combEmitted(StringRef kind);
+/// Evaluate an affine index expression to an i32 hw value, emitting comb ops.
+/// \p idx holds the resolved value of each map operand (dims then symbols).
+Value evalAffine(OpBuilder &b, Location loc, AffineExpr e, ValueRange idx,
+                 unsigned numDims);
 /// The comb op realizing a combinational integer compute unit (pre-checked by
 /// `combEmitted`), reading as many of \p operands as the mnemonic's arity
 /// needs.
@@ -108,29 +114,57 @@ void nameValue(Value v, StringRef name);
 /// The sanitized NameLoc name of \p loc, or \p fallback when it has none.
 std::string cellName(Location loc, StringRef fallback);
 
+/// Declare a module's boundary ports from its port model, in the canonical ABI
+/// order: clk/rst/start, then scalar + stream-input + read-data *inputs*, done,
+/// then stream-output + read-addr + write + result *outputs* (all module inputs
+/// contiguous at the front, as HWModulePortAccessor requires). The single ABI
+/// definition shared by the leaf datapath emitter and the structural (dataflow
+/// / sequential) top, both of which own an `iface::ModuleInterface`.
+llvm::SmallVector<circt::hw::PortInfo>
+declareModulePorts(const iface::ModuleInterface &model, OpBuilder &b);
+
 //===----------------------------------------------------------------------===//
-// Dataflow composition (Route S): a container function whose scheduled body
-// spawns concurrent processes (`func.call` with the `allo.async` carrier) is
-// lowered to a *structural* top -- not a datapath -- that instantiates each
-// callee's `hw.module`, allocates a `seq.fifo` per internal channel, broadcasts
+// Dataflow composition: a container function whose scheduled body spawns
+// concurrent processes (`func.call` with the `allo.async` carrier) is lowered
+// to a *structural* top -- not a datapath -- that instantiates each callee's
+// `hw.module`, allocates a `seq.fifo` per internal channel, broadcasts
 // `start`, and AND-reduces the child `done`s. Defined in DataflowTop.cpp.
 //===----------------------------------------------------------------------===//
 
 /// Whether \p func is a dataflow container (its body contains a `func.call`, a
 /// concurrent-spawn edge) rather than a leaf compute kernel.
 bool isDataflowContainer(func::FuncOp func);
-/// Emit the structural top for a dataflow container, wiring the already-emitted
-/// callee leaf modules (\p leaves, keyed by symbol name) through FIFO channels
-/// and fork/join. \p leafInterfaces gives each callee's port model in memory
-/// (arg <-> concrete port names), read to classify boundaries and channels.
-/// Inserts the top module at \p b's insertion point; the caller erases
-/// \p container afterward. On success \p jsonOut (if non-null) receives the
-/// composed top's port-interface JSON (the cosim manifest).
+/// Whether \p func is a sequential container: its body contains a plain
+/// (non-async) `func.call` -- an ordered sub-kernel composition (Route B),
+/// distinct from a dataflow container's concurrent `await` spawns. Both are
+/// structural tops (not datapaths).
+bool isSequentialContainer(func::FuncOp func);
+/// Emit the one structural top for a container (dataflow, sequential, or
+/// mixed), wiring the already-emitted callee modules (\p modules, keyed by
+/// symbol name) into a thin `hw.module`. \p ifaceModels gives each callee's
+/// port model in memory (arg <-> concrete port names), read to classify
+/// boundaries/channels and each child's start policy. The per-child wiring --
+/// broadcast start, static offset, or a `done` handshake; FIFO channel or
+/// shared boundary -- is derived from the schedule and the callees'
+/// determinacy, not a container-wide mode, so df and seq compose in one
+/// construction. A callee may be a leaf kernel or an inner container already
+/// emitted this pass -- the two are indistinguishable here, which is what lets
+/// composition nest. Inserts the top module at \p b's insertion point; the
+/// caller erases \p container afterward. On success fills \p modOut with the
+/// emitted top module and \p ifaceOut with its port model (whose toJSON() is
+/// the cosim manifest), so the caller can register them for an enclosing
+/// container to consume.
+/// \p scheduledFuncs maps every scheduled func to its (still un-erased) source
+/// `func.func`, which is where a callee's determinacy is read from: an emitted
+/// `hw.module` takes its callee's symbol name, so a symbol lookup from a
+/// callsite is ambiguous while both live in the module.
 LogicalResult
-emitDataflowTop(func::FuncOp container,
-                const llvm::StringMap<circt::hw::HWModuleOp> &leaves,
-                const llvm::StringMap<iface::ModuleInterface> &leafInterfaces,
-                OpBuilder &b, std::string *jsonOut = nullptr);
+emitStructuralTop(func::FuncOp container,
+                  const llvm::StringMap<circt::hw::HWModuleOp> &modules,
+                  const llvm::StringMap<iface::ModuleInterface> &ifaceModels,
+                  const llvm::StringMap<func::FuncOp> &scheduledFuncs,
+                  OpBuilder &b, circt::hw::HWModuleOp &modOut,
+                  iface::ModuleInterface &ifaceOut);
 
 //===----------------------------------------------------------------------===//
 // Memory-banking crossbar: the reusable primitives that route an access to one
@@ -285,6 +319,16 @@ struct EmitContext {
   /// ~(level delayed one cycle); 0 added latency). The delay reg resets to 0,
   /// so a level held high straight out of reset pulses on cycle 0.
   Value risingEdge(Value level);
+  /// A completion-latch level: set to 1 by \p setPulse, cleared to 0 by
+  /// \p start (so a retriggered region re-edges each pass). out[t+1] = start ?
+  /// 0 : (setPulse ? 1 : out[t]). The shared done-latch of the container
+  /// regimes.
+  Value holdDone(Value setPulse, Value start);
+  /// Split a one-cycle \p when pulse by predicate \p cond into {taken,
+  /// notTaken} = {when & cond, when & ~cond}. The predicated fork a run-once /
+  /// per- iteration container uses: `taken` (re)starts the children, `notTaken`
+  /// completes the region without issuing them.
+  std::pair<Value, Value> branchPulse(Value when, Value cond);
   /// Materialize the shared literals (0/1 as i32, false/true as i1).
   void initLiterals();
 };
@@ -361,8 +405,7 @@ struct RegionControl {
 //===----------------------------------------------------------------------===//
 // DatapathFeedback (F -> G): the store timing a control regime consumes to
 // compute completion. The typed counterpart of RegionControl, so a new regime
-// signal (a future stallable pipeline's stall / pipeline-empty) is a field add,
-// not one more parameter on `emitDone`.
+// signal is a field add, not one more parameter on `emitDone`.
 //===----------------------------------------------------------------------===//
 struct DatapathFeedback {
   // The deepest store's schedule stage (max schedT over the region's stores);
@@ -437,11 +480,11 @@ struct DatapathEmitter {
   ArrayRef<AccRef> reads, writes;
   const DenseMap<unsigned, Operation *> &unitModule;
 
-  DenseMap<unsigned, Value> counterOf; // region id -> its counter
-  DenseMap<unsigned, Value> issueOf;   // region id -> its issue pulse
-  DenseMap<unsigned, Value>
-      wantIssueOf; // region id -> its UNgated issue (stall
-                   // shell hazards a stage-0 access on it)
+  // A region's controller outputs (RegionControl: issue / counter / ungated
+  // wantIssue), the G->F seam. `counter` is null for an acyclic region;
+  // `wantIssue` is null when the region has no stall shell (a stage-0 stream
+  // access hazards on it).
+  DenseMap<unsigned, RegionControl> controlOf;
   DenseMap<uint64_t, Value> streamReadData; // (channel id, access idx) -> the
                                             // input-stream data port value
   DenseMap<uint64_t, Value> survivorOf; // (region id, result idx) -> latched
@@ -474,8 +517,6 @@ struct DatapathEmitter {
   /// constant. The single definition of result-landing timing -- survivor
   /// capture today, the seam a multi-stage flush / port arbitration reuses.
   unsigned readyCycle(const uarch::Source &s) const;
-  /// Evaluate an affine index expression to an i32 hw value.
-  Value evalAffine(AffineExpr e, ArrayRef<Value> idx, unsigned numDims);
   /// The linear element address of a memory access (affine map + row-major
   /// linearization over the delayed index sources).
   Value computeAddr(const uarch::MemUnit &m, const uarch::MemUnit::Access &acc);
@@ -486,21 +527,24 @@ struct DatapathEmitter {
   void bindReadPorts();
   /// Instantiate seq.hlmem storage for each internal (non-argument) memory.
   void createInternalMemories();
-  /// Record a region's iteration counter (from its controller) for
-  /// Source::Counter.
-  void setCounter(unsigned region, Value iv) { counterOf[region] = iv; }
+  /// Record a region's iteration counter (from its controller, or a container's
+  /// materialized outer counter) for Source::Counter.
+  void setCounter(unsigned region, Value iv) { controlOf[region].counter = iv; }
   /// Record a region's issue pulse (from its controller), used to time a fused
   /// accumulator's init injection (iteration-0 issue, delayed to the op's
   /// stage).
-  void setIssue(unsigned region, Value issue) { issueOf[region] = issue; }
-  /// Wire a region's controller output (counter + issue) into the datapath in
-  /// one call -- the G->F seam; the counter is absent for an acyclic region.
+  void setIssue(unsigned region, Value issue) {
+    controlOf[region].issue = issue;
+  }
+  /// Wire a region's controller output (counter + issue + ungated wantIssue)
+  /// into the datapath in one call -- the G->F seam; the counter is absent for
+  /// an acyclic region.
   void setControl(unsigned region, const RegionControl &rc) {
     if (rc.counter)
       setCounter(region, rc.counter);
     setIssue(region, rc.issue);
     if (rc.wantIssue)
-      wantIssueOf[region] = rc.wantIssue;
+      controlOf[region].wantIssue = rc.wantIssue;
   }
   /// Record a region's latched result \p port (from the orchestrator's survivor
   /// capture) so a sibling reading Source::Survivor{region, port} resolves to
@@ -565,9 +609,9 @@ struct HWEmitter {
   /// resolved condition.
   Terminator terminatorOf(const uarch::RegionBlock &rb);
   /// Emit one region and return its `done`. A leaf runs one imperative path for
-  /// every regime (counted / dynamic-trip / while): P1 control -> P2 datapath
-  /// -> P3 (resolve the F->G condition, capture results, done). A container
-  /// runs its children once per outer iteration.
+  /// every regime (counted / dynamic-trip / while): control -> datapath ->
+  /// resolve the F->G condition, capture results, done. A container runs its
+  /// children once per outer iteration.
   Value emitRegion(const uarch::RegionBlock &rb, Value start, bool retrig);
   /// The final iteration's issue pulse: a counted region's last iteration
   /// (counter+1 reaches the bound) or a while's condition-false exit; the issue
@@ -575,7 +619,7 @@ struct HWEmitter {
   /// pulse the `done` (emitDone) and the survivor captures (captureResults)
   /// both key off.
   Value lastIssuePulse(const RegionControl &rc, const Terminator &term);
-  /// P3b: capture region \p rb's results into the survivor registers a sibling
+  /// Capture region \p rb's results into the survivor registers a sibling
   /// reads, and return the region's result-drain stage (the latest-landing
   /// result's ready cycle, folded into the region's `drainStage`). Dispatches
   /// the two survivor mechanisms by regime.
@@ -596,6 +640,15 @@ struct HWEmitter {
   /// container's children (emitContainer) alike.
   Value sequence(llvm::ArrayRef<uarch::RegionId> regions, Value start,
                  bool retrig);
+  /// Set up a container's loop-carried iter-args as frozen survivor registers
+  /// (latch each `inits[k]` at \p start, advance on \p advance), record each as
+  /// Source::Survivor{rb, k}, and return the per-arg next-value backedges (set
+  /// to `src(nexts[k])` after the children emit). Shared by the counted and
+  /// conditional container regimes.
+  llvm::SmallVector<circt::Backedge>
+  setupCarriedIterArgs(const uarch::RegionBlock &rb,
+                       llvm::ArrayRef<uarch::Source> inits, Value start,
+                       Value advance);
   /// A counted container: sequence its children within each outer iteration,
   /// advancing the outer counter when the last child drains. A cross-region
   /// result crosses child-to-child as a survivor register (captured in the
@@ -625,13 +678,16 @@ struct HWEmitter {
   void emit();
 };
 
-/// Lower every scheduled `func.func` in \p module to structural `hw.module`s
-/// (leaf datapaths + dataflow tops), erasing the source funcs -- the free
-/// function behind the `allo-datapath-to-hw` pass. \p binding names the
-/// resource-binding policy. On success \p interfaces maps each emitted module's
-/// symbol name to its port-interface JSON (the cosim manifest), so a caller
-/// gets the boundary directly without reading any IR attribute.
+/// Lower the scheduled `func.func`s reachable from \p top to structural
+/// `hw.module`s (leaf datapaths + dataflow/sequential tops), erasing the source
+/// funcs -- the free function behind the `allo-datapath-to-hw` pass. Emission
+/// is rooted at \p top and runs bottom-up over the call DAG (callees before
+/// callers), mirroring the scheduler. \p binding names the resource-binding
+/// policy. On success \p interfaces maps each emitted module's symbol name to
+/// its port-interface JSON (the cosim manifest), so a caller gets the boundary
+/// directly without reading any IR attribute.
 LogicalResult emitDatapathToHW(ModuleOp module, StringRef binding,
+                               StringRef top,
                                llvm::StringMap<std::string> &interfaces);
 
 } // namespace mlir::allo::uarch

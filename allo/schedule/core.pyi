@@ -8,6 +8,7 @@ from typing import Any, Generic, Literal, ParamSpec, TypeVar, overload
 from ..backend.cpu import CPU
 from ..backend.vitis.core import Vitis
 from ..backend.rtl.core import RTL
+from .._mlir.ir import Module
 from .model import Ref, LoopRef, OpRef, BufferRef
 from .query import Query
 
@@ -98,8 +99,12 @@ class Schedule(Generic[P, R]):
         """Shorthand for ``export("vitis", **kwargs)``."""
     # --- gated real-IR access -------------------------------------------
     @property
-    def payload(self) -> Any:
+    def payload(self) -> Module:
         """The materialized MLIR module; auto-applies any pending transforms."""
+
+    @property
+    def module(self) -> Module:
+        """Alias for payload"""
 
     @property
     def snapshot(self) -> Any:

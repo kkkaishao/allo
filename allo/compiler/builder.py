@@ -320,7 +320,9 @@ class AlloOpBuilder:
     # Stream Creation
     #####################
 
-    def create_stream(self, stream_type: StreamType) -> AlloValue:
+    def create_stream(
+        self, stream_type: StreamType, init: Sequence[int | float] | None = None
+    ) -> AlloValue:
         assert isinstance(stream_type, StreamType)
         op = allo_d.StreamCreateOp(
             self._materialize(stream_type), ip=self._ip, loc=self._loc
@@ -332,6 +334,15 @@ class AlloOpBuilder:
         op.operation.attributes[allo_d.SIGNED_ATTR_NAME] = self.get_string_attr(
             "s" if signed else "u"
         )
+        # Initial tokens (feedback cycles): an ArrayAttr of typed scalar attrs of
+        # the base type, the earliest tokens in the channel history.
+        if init:
+            if not isinstance(base, DType):
+                self.compile_error(
+                    "stream initial tokens are only supported for a scalar base type"
+                )
+            elements = [self._dense_element_attr(v, base) for v in init]
+            op.operation.attributes["init"] = ir.ArrayAttr.get(elements)
         return AlloValue(op.result, stream_type)
 
     #####################

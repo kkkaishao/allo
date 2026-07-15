@@ -19,6 +19,7 @@
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Utils/StaticValueUtils.h"
+#include "mlir/Interfaces/LoopLikeInterface.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/Support/MathExtras.h"
 
@@ -148,13 +149,22 @@ static void collectAssumptions(Value cond, SmallVectorImpl<Assumption> &out) {
 // conflicts between DIFFERENT subscripts that can alias (e.g. `A[i][j]` vs
 // `A[j][i]` on the diagonal, or `A[2*i]` vs `A[i]` at i == 0). Aliasing between
 // distinct memrefs is not modeled (distinct SSA memrefs are assumed disjoint).
-static void checkMemrefDependence(SmallVectorImpl<Operation *> &memoryOps,
-                                  MemoryDependenceResult &results) {
+//
+// A pair either endpoint of which the test cannot model (`nonPolyhedral`) is
+// skipped entirely and left to the conservative path, so each pair is owned by
+// exactly one analysis -- and so an `assume.nodep` hint, which prunes only
+// conservative edges, retires all of a pair's edges or none.
+static void
+checkMemrefDependence(ArrayRef<Operation *> memoryOps,
+                      const llvm::SmallDenseSet<Operation *> &nonPolyhedral,
+                      MemoryDependenceResult &results) {
   for (Operation *dst : memoryOps) {
     results.try_emplace(dst); // every access gets a (possibly empty) entry
+    if (nonPolyhedral.contains(dst))
+      continue;
     affine::MemRefAccess dstAccess(dst);
     for (Operation *src : memoryOps) {
-      if (src == dst)
+      if (src == dst || nonPolyhedral.contains(src))
         continue;
       affine::MemRefAccess srcAccess(src);
       unsigned numCommon = affine::getInnermostCommonLoopDepth({src, dst});
@@ -312,8 +322,30 @@ static void checkStreamDependence(SmallVectorImpl<Operation *> &streamOps,
 }
 
 //===----------------------------------------------------------------------===//
-// Non-affine memref dependences
+// Conservative memref dependences
 //===----------------------------------------------------------------------===//
+
+// Whether the polyhedral test can model where `op` sits: every loop enclosing
+// it must be an affine.for. `getAffineForIVs` -- and through it
+// `getInnermostCommonLoopDepth` -- collects affine.for ancestors while silently
+// SKIPPING every other loop form, so an affine access under an
+// scf.for/scf.while is outside the test's domain even though `MemRefAccess`
+// accepts it: the depth ladder never names that loop, so a dependence it
+// carries is never queried and the pair is reported loop-independent. Left to
+// the polyhedral path, a memory-carried accumulate in a dynamic-trip loop (`for
+// j in range(n): out[i]
+// += ...`) would lose its recurrence and pipeline at II = 1. Such accesses go
+// to the conservative path with the non-affine ones.
+//
+// Note this costs no precision on the subscripts themselves: an scf.for IV is
+// neither a valid affine dim nor a valid symbol, so an access whose loop nest
+// is not all-affine cannot have used those IVs in its subscripts anyway.
+static bool inAffineNest(Operation *op) {
+  for (Operation *p = op->getParentOp(); p; p = p->getParentOp())
+    if (isa<LoopLikeOpInterface>(p) && !isa<affine::AffineForOp>(p))
+      return false;
+  return true;
+}
 
 // The array root a load/store accesses, affine or not (views peeled). No alias
 // analysis beyond that: distinct roots are distinct arrays (the Allo frontend
@@ -341,27 +373,28 @@ memDepComponents(Operation *op, int64_t distance) {
   return comps;
 }
 
-// Conservative memory dependences for pairs where at least one access is
-// non-affine (plain memref.load/store -- indirect A[idx[i]], histogram/scatter,
-// scf-lowered tiles). The polyhedral test cannot reason about them, so --
-// following Vitis's "assumed dependent unless proven disjoint" rule -- any two
-// accesses to the same array with at least one write are serialized in program
-// order (a distance-0 forward edge), plus a distance-1 loop-carried back edge
-// when they share an innermost loop (closing the recurrence that bounds II).
-// Read-read pairs commute and are left independent. This is the correctness
-// backstop that keeps non-affine accesses from being silently reordered; an
-// `allo.assume.nodep` hint can prune a proven-false edge to recover II.
-static void
-checkNonAffineDependence(ArrayRef<Operation *> accessOps,
-                         const llvm::SmallDenseSet<Operation *> &nonAffine,
-                         MemoryDependenceResult &results) {
+// Conservative memory dependences for pairs the polyhedral test cannot model
+// (`nonPolyhedral`: a plain memref.load/store -- indirect A[idx[i]],
+// histogram/scatter, scf-lowered tiles -- or an affine access whose loop nest
+// is not all-affine; see inAffineNest). Following Vitis's "assumed dependent
+// unless proven disjoint" rule, any two accesses to the same array with at
+// least one write are serialized in program order (a distance-0 forward edge),
+// plus a distance-1 loop-carried back edge when they share an innermost loop
+// (closing the recurrence that bounds II). Read-read pairs commute and are left
+// independent. This is the correctness backstop that keeps such accesses from
+// being silently reordered; an `allo.assume.nodep` hint can prune a
+// proven-false edge to recover II.
+static void checkConservativeDependence(
+    ArrayRef<Operation *> accessOps,
+    const llvm::SmallDenseSet<Operation *> &nonPolyhedral,
+    MemoryDependenceResult &results) {
   for (unsigned i = 0, e = accessOps.size(); i < e; ++i) {
     for (unsigned j = i + 1; j < e; ++j) {
       Operation *earlier = accessOps[i];
       Operation *later = accessOps[j];
 
-      // Affine-affine pairs are handled precisely by the polyhedral test.
-      if (!nonAffine.contains(earlier) && !nonAffine.contains(later))
+      // Pairs the polyhedral test models are handled precisely there.
+      if (!nonPolyhedral.contains(earlier) && !nonPolyhedral.contains(later))
         continue;
       // Different arrays never conflict; read-read pairs commute.
       if (accessedMemRef(earlier) != accessedMemRef(later))
@@ -419,16 +452,17 @@ static Block *loopBodyForIV(Value iv) {
   return nullptr;
 }
 
-// Prune the conservative (non-affine) dependence edges that an
-// `allo.assume.nodep` (dependent = false) declares absent, matching by array,
-// enclosing loop, inter/intra class, and -- when given -- direction and
-// distance. Only conservative edges are removed: a proven affine dependence is
-// never dropped, so a hint that merely restates something the analysis already
-// inferred (an affine-provable independence leaves no edge; an affine-provable
-// dependence is not a conservative edge) is a no-op.
-static void applyNoDepHints(ArrayRef<AssumeNoDepOp> hints,
-                            const llvm::SmallDenseSet<Operation *> &nonAffine,
-                            MemoryDependenceResult &results) {
+// Prune the conservative dependence edges that an `allo.assume.nodep`
+// (dependent = false) declares absent, matching by array, enclosing loop,
+// inter/intra class, and -- when given -- direction and distance. Only
+// conservative edges are removed: a proven affine dependence is never dropped,
+// so a hint that merely restates something the analysis already inferred (an
+// affine-provable independence leaves no edge; an affine-provable dependence is
+// not a conservative edge) is a no-op.
+static void
+applyNoDepHints(ArrayRef<AssumeNoDepOp> hints,
+                const llvm::SmallDenseSet<Operation *> &nonPolyhedral,
+                MemoryDependenceResult &results) {
   for (AssumeNoDepOp hint : hints) {
     if (hint.getDependent())
       // Only "no dependence" assertions prune. `dependent = true` (assert-add)
@@ -447,11 +481,11 @@ static void applyNoDepHints(ArrayRef<AssumeNoDepOp> hints,
 
     auto matches = [&](Operation *source, Operation *dst,
                        const MemoryDependence &dep) {
-      // Same array, at least one non-affine endpoint (a conservative edge),
-      // both accesses inside the hinted loop.
+      // Same array, at least one endpoint outside the polyhedral test (so this
+      // is a conservative edge), both accesses inside the hinted loop.
       if (accessedMemRef(source) != array || accessedMemRef(dst) != array)
         return false;
-      if (!nonAffine.contains(source) && !nonAffine.contains(dst))
+      if (!nonPolyhedral.contains(source) && !nonPolyhedral.contains(dst))
         return false;
       if (!body->findAncestorOpInBlock(*source) ||
           !body->findAncestorOpInBlock(*dst))
@@ -523,10 +557,12 @@ int64_t carriedDistanceAtLevel(ArrayRef<affine::DependenceComponent> comps,
 DependenceAnalysis::DependenceAnalysis(func::FuncOp funcOp) : func(funcOp) {
   SmallVector<Operation *> memoryOps;
   SmallVector<Operation *> streamOps;
-  // All memref accesses in program (walk) order, plus the subset that is
-  // non-affine, for the conservative fallback below.
+  // All memref accesses in program (walk) order, plus the subset the polyhedral
+  // test cannot model, for the conservative fallback below. An access is
+  // outside that test either because the op itself is non-affine or because its
+  // loop nest is not all-affine (inAffineNest).
   SmallVector<Operation *> accessOps;
-  llvm::SmallDenseSet<Operation *> nonAffineAccesses;
+  llvm::SmallDenseSet<Operation *> nonPolyhedral;
   SmallVector<AssumeNoDepOp> noDepHints;
   SmallVector<Assumption> assumptions;
   funcOp->walk([&](Operation *op) {
@@ -534,8 +570,10 @@ DependenceAnalysis::DependenceAnalysis(func::FuncOp funcOp) : func(funcOp) {
             op)) {
       memoryOps.push_back(op);
       accessOps.push_back(op);
+      if (!inAffineNest(op))
+        nonPolyhedral.insert(op);
     } else if (isa<memref::LoadOp, memref::StoreOp>(op)) {
-      nonAffineAccesses.insert(op);
+      nonPolyhedral.insert(op);
       accessOps.push_back(op);
     } else if (isa<StreamGetOp, StreamPutOp>(op)) {
       streamOps.push_back(op);
@@ -548,10 +586,10 @@ DependenceAnalysis::DependenceAnalysis(func::FuncOp funcOp) : func(funcOp) {
 
   // Affine memref dependences: each ordered pair over all carried depths plus
   // the loop-independent (intra-iteration) depth (see checkMemrefDependence).
-  checkMemrefDependence(memoryOps, results);
+  checkMemrefDependence(memoryOps, nonPolyhedral, results);
 
-  // Conservative ordering for non-affine accesses the polyhedral test skips.
-  checkNonAffineDependence(accessOps, nonAffineAccesses, results);
+  // Conservative ordering for the pairs the polyhedral test skips.
+  checkConservativeDependence(accessOps, nonPolyhedral, results);
 
   AffineValueMapBuilder builder(funcOp.getContext());
   checkStreamDependence(streamOps, builder, results);
@@ -559,7 +597,7 @@ DependenceAnalysis::DependenceAnalysis(func::FuncOp funcOp) : func(funcOp) {
   // User hints: prune conservative edges the programmer proves absent. Applied
   // last, over the fully-built edge set, so pruning a non-existent edge (the
   // fact was already inferred) is naturally a no-op.
-  applyNoDepHints(noDepHints, nonAffineAccesses, results);
+  applyNoDepHints(noDepHints, nonPolyhedral, results);
 
   // Distill the assume.ssa value facts into per-value constant ranges (the seed
   // a value-range consumer reads; does not affect dependence edges).

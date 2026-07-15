@@ -90,11 +90,14 @@ void readBytes(Stream *stream, int64_t laneId, void *data) {
   lane.notFull.notify_one();
 }
 
-// Owns a marl scheduler bound to the launcher thread plus a WaitGroup that
-// tracks the live PE fibers.
+// A marl scheduler plus a WaitGroup tracking this region's live PE fibers.
+// `owning` is false for a nested container, which reuses the enclosing region's
+// already-bound scheduler (marl binds one scheduler per thread), so close()
+// must not tear it down.
 struct DataflowScheduler {
   marl::Scheduler *scheduler;
   marl::WaitGroup pending;
+  bool owning;
 };
 
 } // namespace
@@ -127,6 +130,30 @@ allo_sim_stream_write(uint64_t handle, int64_t lane, uint64_t value) {
   writeBytes(stream, lane, &value);
 }
 
+// Preload one initial token into `lane`, seeding a feedback cycle so it does
+// not deadlock (§ initial tokens). The token sits in FRONT of the FIFO: we grow
+// the bound (and every lane's ring) so seeding never consumes the declared
+// steady-state depth and never blocks -- mirroring the RTL init-prepend shim,
+// and a larger bound is always deadlock-safe (Kahn: correctness is
+// depth-independent). Called once per token at construction, before any PE
+// fiber exists, so the ring is empty and resize preserves the contiguous (head
+// == 0) layout.
+extern "C" ALLO_RUNTIME_EXPORT void
+allo_sim_stream_seed(uint64_t handle, int64_t lane, uint64_t value) {
+  Stream *stream = asStream(handle);
+  assert(stream->itemBytes <= static_cast<int64_t>(sizeof(value)) &&
+         "scalar stream payload is too wide");
+  Lane &l = getLane(stream, lane);
+  marl::lock lock(l.mutex);
+  ++stream->depth;
+  for (auto &lp : stream->lanes)
+    lp->ring.resize(static_cast<size_t>(stream->depth) * stream->itemBytes);
+  std::memcpy(&l.ring[l.tail * stream->itemBytes], &value, stream->itemBytes);
+  l.tail = (l.tail + 1) % stream->depth;
+  ++l.count;
+  l.notEmpty.notify_one();
+}
+
 extern "C" ALLO_RUNTIME_EXPORT uint64_t allo_sim_stream_read(uint64_t handle,
                                                              int64_t lane) {
   Stream *stream = asStream(handle);
@@ -153,17 +180,23 @@ extern "C" ALLO_RUNTIME_EXPORT void allo_sim_stream_destroy(uint64_t handle) {
 
 // ---- dataflow scheduler ABI (called from the launcher thread) ---------------
 
-// Create a marl scheduler and bind it to the calling thread so that subsequent
-// allo_df_spawn calls (and the join) run against it. `numWorkers <= 0` requests
-// one worker per logical core.
+// Open a dataflow region. At the top level this creates a marl scheduler and
+// binds it to the calling thread so that subsequent allo_df_spawn calls (and
+// the join) run against it; `numWorkers <= 0` requests one worker per logical
+// core. A nested container -- opened from within a fiber whose thread already
+// has a scheduler bound -- reuses that scheduler (one scheduler drives the
+// whole nested network; nesting adds fibers, not schedulers). Each region gets
+// its own WaitGroup so join blocks only for the fibers spawned at this level.
 extern "C" ALLO_RUNTIME_EXPORT void *allo_df_open(int64_t numWorkers) {
+  if (marl::Scheduler *cur = marl::Scheduler::get())
+    return new DataflowScheduler{cur, marl::WaitGroup{}, /*owning=*/false};
   marl::Scheduler::Config cfg =
       numWorkers > 0 ? marl::Scheduler::Config().setWorkerThreadCount(
                            static_cast<int>(numWorkers))
                      : marl::Scheduler::Config::allCores();
   auto *scheduler = new marl::Scheduler(cfg);
   scheduler->bind();
-  return new DataflowScheduler{scheduler, marl::WaitGroup{}};
+  return new DataflowScheduler{scheduler, marl::WaitGroup{}, /*owning=*/true};
 }
 
 // Launch `fn(ctx)` as a fiber. The shared `ctx` (the PE operands) stays valid
@@ -185,7 +218,10 @@ extern "C" ALLO_RUNTIME_EXPORT void allo_df_join(void *handle) {
 
 extern "C" ALLO_RUNTIME_EXPORT void allo_df_close(void *handle) {
   auto *df = static_cast<DataflowScheduler *>(handle);
-  df->scheduler->unbind();
-  delete df->scheduler;
+  // A nested region reuses the enclosing scheduler -- leave it bound and alive.
+  if (df->owning) {
+    df->scheduler->unbind();
+    delete df->scheduler;
+  }
   delete df;
 }

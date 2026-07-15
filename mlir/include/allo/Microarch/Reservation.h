@@ -40,16 +40,15 @@ Reservation reservationOf(const RegionBlock &region, const FuncUnit &unit,
 
 /// Whether two reservations may coexist on one shared unit: their occupied
 /// cycles must not intersect. Different regions conservatively conflict --
-/// binding is within a region only; cross-region (sequential, non-overlapping)
-/// sharing is a later extension. Combined with an operator-type match, this is
-/// the full share-compatibility predicate a policy tests before merging two ops
-/// onto one unit.
+/// binding is within a region only (cross-region sharing is unsupported).
+/// Combined with an operator-type match, this is the full share-compatibility
+/// predicate a policy tests before merging two ops onto one unit.
 bool reservationsDisjoint(const Reservation &a, const Reservation &b);
 
 /// Whether two units realize the SAME operator type, a precondition for merging
 /// their ops onto one physical unit: identical mnemonic + realization + result
-/// type (an exact match; a covering ALU that realizes a superset is a later
-/// extension). Combined with `reservationsDisjoint`, this is the full
+/// type (an exact match; a covering ALU that realizes a superset is not
+/// shared). Combined with `reservationsDisjoint`, this is the full
 /// share-compatibility test.
 bool sameOperatorType(const FuncUnit &a, const FuncUnit &b);
 

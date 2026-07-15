@@ -88,7 +88,7 @@ Value DatapathEmitter::src(const uarch::Source &s) {
   case uarch::Source::Kind::Counter: {
     // The iteration counter of Source's region (an outer container's counter is
     // live while its nested region emits).
-    Value cv = counterOf.lookup(s.id);
+    Value cv = controlOf.lookup(s.id).counter;
     assert(cv && "counter source with no emitted region counter");
     return cv;
   }
@@ -115,7 +115,7 @@ Value DatapathEmitter::src(const uarch::Source &s) {
     if (Value v = muxVal.lookup(s.id))
       return v;
     const uarch::Mux &mx = dp.muxes[s.id];
-    Value issue = issueOf.lookup(mx.region);
+    Value issue = controlOf.lookup(mx.region).issue;
     assert(issue && "mux in a region with no controller");
     Value v = src(mx.sources[0]);
     for (unsigned i = 1; i < mx.sources.size(); ++i) {
@@ -140,67 +140,68 @@ Value DatapathEmitter::src(const uarch::Source &s) {
 }
 
 unsigned DatapathEmitter::readyCycle(const uarch::Source &s) const {
-  if (s.kind == uarch::Source::Kind::Unit) {
-    const uarch::FuncUnit &u = dp.units[s.id];
-    return schedT(u.boundOps.front().first) + u.latency;
+  // Map the Source to its producing op, then defer to the one ready-cycle
+  // definition (readyCycleOf). A Const is at-issue (no op, cycle 0).
+  switch (s.kind) {
+  case uarch::Source::Kind::Unit:
+    return readyCycleOf(dp.units[s.id].boundOps.front().first);
+  case uarch::Source::Kind::Mem:
+    return readyCycleOf(dp.mems[s.id].accesses[s.outPort].op);
+  case uarch::Source::Kind::Stream:
+    return readyCycleOf(dp.streams[s.id].accesses[s.outPort].op);
+  case uarch::Source::Kind::Const:
+    return 0;
+  default:
+    assert(false && "readyCycle only modelled for a Unit / memory read / "
+                    "stream get / constant result");
+    return 0;
   }
-  if (s.kind == uarch::Source::Kind::Mem) {
-    const uarch::MemUnit &m = dp.mems[s.id];
-    return schedT(m.accesses[s.outPort].op) + memReadLatency(m.impl);
-  }
-  if (s.kind == uarch::Source::Kind::Stream)
-    // A stream get is a combinational FIFO-front read: the token is ready at
-    // the get's stage (read latency 0).
-    return dp.streams[s.id].accesses[s.outPort].stage;
-  // A Reg result lands elsewhere; only Unit/Mem/Const ready cycles are modelled
-  // (a constant is at-issue, cycle 0).
-  assert(s.kind == uarch::Source::Kind::Const &&
-         "readyCycle only modelled for a Unit (schedT+lat), a memory read "
-         "(schedT+read-lat), or a constant (at-issue)");
-  return 0;
 }
 
 // Evaluate an affine index expression to an i32 hw value, emitting comb ops.
-// `idx` holds the resolved value of each map operand (dims then symbols). Fork
-// (3) address-value: affine addressing degenerates to adds and multiply-by-
-// constant; a genuine multiplier survives only a non-reducible map, and
-// identity addressing emits nothing.
-Value DatapathEmitter::evalAffine(AffineExpr e, ArrayRef<Value> idx,
-                                  unsigned numDims) {
+// `idx` holds the resolved value of each map operand (dims then symbols).
+// Affine index arithmetic degenerates to adds and multiply-by-constant; a
+// genuine multiplier survives only a non-reducible map, and identity addressing
+// emits nothing. Shared by the two places a map reaches the datapath: a memory
+// access's address (computeAddr) and a standalone affine.apply (emitCompute).
+Value evalAffine(OpBuilder &b, Location loc, AffineExpr e, ValueRange idx,
+                 unsigned numDims) {
+  auto konst = [&](int64_t v) {
+    return hw::ConstantOp::create(b, loc, b.getIntegerType(32), v).getResult();
+  };
   if (auto cst = dyn_cast<AffineConstantExpr>(e))
-    return c.konst(c.i32, cst.getValue());
+    return konst(cst.getValue());
   if (auto d = dyn_cast<AffineDimExpr>(e))
     return idx[d.getPosition()];
   if (auto sym = dyn_cast<AffineSymbolExpr>(e))
     return idx[numDims + sym.getPosition()];
   auto bin = cast<AffineBinaryOpExpr>(e);
-  Value lhs = evalAffine(bin.getLHS(), idx, numDims);
-  Value rhs = evalAffine(bin.getRHS(), idx, numDims);
+  Value lhs = evalAffine(b, loc, bin.getLHS(), idx, numDims);
+  Value rhs = evalAffine(b, loc, bin.getRHS(), idx, numDims);
   if (e.getKind() == AffineExprKind::Add)
-    return c.R(comb::AddOp::create(c.b, c.loc, lhs, rhs, false));
+    return comb::AddOp::create(b, loc, lhs, rhs, false).getResult();
   if (e.getKind() == AffineExprKind::Mul)
-    return c.R(comb::MulOp::create(c.b, c.loc, lhs, rhs, false));
+    return comb::MulOp::create(b, loc, lhs, rhs, false).getResult();
   // floordiv / mod by a constant are the delinearization a coalesced nest
-  // leaves in an address (`iv floordiv N`, `iv mod N`) over a non-negative
-  // index. A power-of-two divisor is a shift / bit-mask (no divider); any other
-  // constant is a general unsigned divide / remainder -- synthesis folds a
-  // constant divisor to a multiply-shift, so no runtime divider is
-  // instantiated.
+  // leaves behind (`iv floordiv N`, `iv mod N`) over a non-negative index. A
+  // power-of-two divisor is a shift / bit-mask (no divider); any other constant
+  // is a general unsigned divide / remainder -- synthesis folds a constant
+  // divisor to a multiply-shift, so no runtime divider is instantiated.
   auto rc = dyn_cast<AffineConstantExpr>(bin.getRHS());
   assert(rc && rc.getValue() > 0 &&
-         "affine div/mod by a non-constant or non-positive divisor in address");
+         "affine div/mod by a non-constant or non-positive divisor");
   int64_t f = rc.getValue();
-  Value fv = c.konst(c.i32, f);
   bool pow2 = llvm::isPowerOf2_64(f);
   if (e.getKind() == AffineExprKind::FloorDiv)
-    return pow2 ? c.R(comb::ShrUOp::create(
-                      c.b, c.loc, lhs, c.konst(c.i32, llvm::Log2_64(f)), false))
-                : c.R(comb::DivUOp::create(c.b, c.loc, lhs, fv, false));
-  assert(e.getKind() == AffineExprKind::Mod &&
-         "unexpected affine op in address");
-  return pow2 ? c.R(comb::AndOp::create(c.b, c.loc, lhs, c.konst(c.i32, f - 1),
-                                        false))
-              : c.R(comb::ModUOp::create(c.b, c.loc, lhs, fv, false));
+    return pow2
+               ? comb::ShrUOp::create(b, loc, lhs, konst(llvm::Log2_64(f)),
+                                      false)
+                     .getResult()
+               : comb::DivUOp::create(b, loc, lhs, konst(f), false).getResult();
+  assert(e.getKind() == AffineExprKind::Mod && "unexpected affine op");
+  return pow2
+             ? comb::AndOp::create(b, loc, lhs, konst(f - 1), false).getResult()
+             : comb::ModUOp::create(b, loc, lhs, konst(f), false).getResult();
 }
 
 // The linear element address of a memory access: evaluate its affine map over
@@ -220,7 +221,8 @@ Value DatapathEmitter::computeAddr(const uarch::MemUnit &m,
     stride[k] = stride[k + 1] * shape[k + 1];
   Value addr;
   for (unsigned k = 0; k < rank; ++k) {
-    Value term = evalAffine(map.getResult(k), idx, map.getNumDims());
+    Value term =
+        evalAffine(c.b, c.loc, map.getResult(k), idx, map.getNumDims());
     if (stride[k] != 1)
       term = c.R(comb::MulOp::create(c.b, c.loc, term,
                                      c.konst(c.i32, stride[k]), false));
@@ -266,7 +268,7 @@ void DatapathEmitter::createInternalMemories() {
       continue;
     if (m.numBanks > 1) {
       // The emitter crossbar handles a 1-D power-of-two cyclic partition; block
-      // / multi-dim / external banking are not lowered yet.
+      // / multi-dim / external banking are not lowered.
       PartitionInfo p = partitionOf(m.memref);
       assert(
           p.cyclicAxes.size() == 1 && !p.hasBlock &&
@@ -401,7 +403,8 @@ void DatapathEmitter::emitUnits(const uarch::RegionBlock &rb) {
       // is a plain delay -- the init rides the input, since the widened idiom
       // reads acc through a bare wire, not a tap.
       if (u.inputInits[k].kind != uarch::Source::Kind::None) {
-        Value iv = counterOf.lookup(rb.id), issue = issueOf.lookup(rb.id);
+        const RegionControl rc = controlOf.lookup(rb.id);
+        Value iv = rc.counter, issue = rc.issue;
         assert(iv && issue &&
                "recurrence input in a region with no controller");
         // The first iteration is `iv == lb`; the lb is a runtime Source (a
@@ -424,8 +427,7 @@ void DatapathEmitter::emitUnits(const uarch::RegionBlock &rb) {
       // (for a clock-enabled contract) a `ce` freeze bit. `ce` rides the
       // region's clock-enable so the IP pipeline freezes in lockstep with the
       // shell's shift chains under back-pressure; outside a stream region
-      // `regionEnable` is null, so `ce` is a constant 1 (free-running,
-      // identical to before).
+      // `regionEnable` is null, so `ce` is a constant 1 (free-running).
       operands.push_back(c.clkRaw);
       if (allo::stallContract(u.impl) == allo::StallContract::ClockEnable)
         operands.push_back(c.regionEnable ? c.regionEnable : c.t1);
@@ -541,13 +543,16 @@ void DatapathEmitter::bindStreamReads(const uarch::RegionBlock &rb) {
 }
 
 // The latency-insensitive shell's port drives + control signals for region
-// \p rb (Approach 2 -- freeze only on output back-pressure). A put drives
+// \p rb (freeze only on output back-pressure). A put drives
 // `_data`/`_valid`; a get drives `_ready`. Only a full output freezes the
 // pipeline (`chainEnable = ~outputFull`); an empty input injects a bubble by
 // dropping `issueEnable`, never a freeze -- freezing on starvation would hold a
 // mid-flight `valid` high and let a ready consumer double-capture the token. A
 // stage-0 access keys on the UNgated `wantIssue` so the signals stay
 // combinationally acyclic, a deeper access on the (registered) delayed issue.
+// A predicated access (`acc.when` set) additionally gates its handshake on
+// the predicate so a token is consumed/produced only where it holds; the
+// predicate is a datapath value (no FIFO status), so acyclicity is preserved.
 void DatapathEmitter::emitStreamAccesses(const uarch::RegionBlock &rb,
                                          Value issue, DatapathFeedback &fb) {
   // LI-shell scope invariants -- checked only for a region that actually runs
@@ -562,28 +567,31 @@ void DatapathEmitter::emitStreamAccesses(const uarch::RegionBlock &rb,
   //  * one access per channel: each channel drives exactly one
   //  {data,valid,ready}
   //    bundle, so two get/put on one channel would silently overwrite its port.
-  //  * at most one input get per region: a multi-input join needs each `_ready`
-  //    gated on the OTHER inputs' valids (else a leading input pops a token
-  //    while `issueEnable` is low and it is lost); not implemented (topology
-  //    has no merge yet).
+  //  * a multi-input region fires only when every input it needs this firing is
+  //    present. Stage-0 gets (read at issue) pop together and gate the issue;
+  //    an empty stage-0 input injects a bubble (drop `issueEnable`), never a
+  //    freeze. A mid-pipeline get (stage > 0 -- e.g. a merge whose selector is
+  //    a stream token read at stage 0, so the selected `get` lands a cycle
+  //    later) cannot bubble: its in-flight iteration is already past issue, so
+  //    a needed-but- empty deeper input FREEZES the whole pipeline
+  //    (`chainEnable`) until the token arrives, preserving tap alignment. A
+  //    predicated get counts as needed only where its predicate holds -- which
+  //    makes a data-selected merge (one of N inputs popped per firing) a
+  //    special case of this.
   bool hasStream = false;
-  unsigned inGets = 0;
   for (const uarch::StreamChannel &s : dp.streams) {
     bool here = false;
     for (const uarch::StreamChannel::Access &acc : s.accesses)
-      if (acc.region == rb.id) {
+      if (acc.region == rb.id)
         here = hasStream = true;
-        inGets += !acc.isPut;
-      }
     assert((!here || s.accesses.size() <= 1) &&
-           "one access per stream channel (P0)");
+           "one access per stream channel");
   }
-  if (hasStream) {
+  if (hasStream)
     assert(rb.ii.value_or(1) == 1 && "stream LI shell assumes II == 1");
-    assert(inGets <= 1 && "multi-input stream join not implemented");
-  }
 
-  Value atIssue = wantIssueOf.lookup(rb.id); // ungated stage-0 activation
+  Value atIssue =
+      controlOf.lookup(rb.id).wantIssue; // ungated stage-0 activation
   if (!atIssue)
     atIssue = issue; // acyclic region: no separate wantIssue
   // Outputs: drive data + valid, accumulate the output-full hazard (the sole
@@ -594,34 +602,91 @@ void DatapathEmitter::emitStreamAccesses(const uarch::RegionBlock &rb,
       if (!acc.isPut || acc.region != rb.id)
         continue;
       std::string base = streamPortBase(s);
+      // A predicated put produces a token only where its predicate holds:
+      // gate `valid`, and suppress the output-full hazard when it is low (do
+      // not freeze the pipeline waiting for space we will not write this
+      // firing).
+      Value pred = acc.when ? src(acc.when) : Value();
       Value valid = c.activationPulse(issue, acc.op);
+      if (pred)
+        valid = c.andBits(valid, pred);
       pa.setOutput(iface::data_(base), src(acc.data));
       pa.setOutput(iface::valid(base), valid);
-      // A stage-0 put keys its hazard on wantIssue (ungated); a stage>=1 put's
-      // valid is already registered (delayed), so it is safe to key on.
+      // A stage-0 put keys its hazard on wantIssue (ungated) & pred; a stage>=1
+      // put's valid is already registered (delayed) and predicate-gated.
       Value active = acc.stage == 0 ? atIssue : valid;
+      if (pred && acc.stage == 0)
+        active = c.andBits(active, pred);
       Value hz = c.andBits(active, c.notBit(pa.getInput(iface::ready(base))));
       outHazard = outHazard ? c.orBits(outHazard, hz) : hz;
       fb.storeDrain = std::max<unsigned>(fb.storeDrain, acc.stage);
     }
-  Value chainEnable = outHazard ? c.notBit(outHazard) : c.t1;
-  // Inputs: drive `_ready` (accept a token when we want to issue and are not
-  // output-blocked -- independent of the input's own valid, per the handshake
-  // contract), and AND every input valid into the issue gate (an empty input
-  // yields a bubble, not a freeze).
-  Value allValid;
+  // Mid-pipeline freeze: a get at stage > 0 whose input is needed-but-empty
+  // freezes the whole pipeline -- its in-flight iteration cannot bubble past a
+  // token it has not received -- so fold each such stall into `chainEnable`
+  // alongside the output-full freeze. `active` and the predicate are registered
+  // (delayed to the get's stage), so this reads only stored state -- no cycle.
+  Value midStall;
+  unsigned stage0Gets = 0;
   for (const uarch::StreamChannel &s : dp.streams)
     for (const uarch::StreamChannel::Access &acc : s.accesses) {
       if (acc.isPut || acc.region != rb.id)
         continue;
-      std::string base = streamPortBase(s);
+      if (acc.stage == 0) {
+        ++stage0Gets;
+        continue;
+      }
+      Value active = c.delayValid(issue, acc.stage);
+      Value want = acc.when ? c.andBits(active, src(acc.when)) : active;
+      Value miss = c.andBits(
+          want, c.notBit(pa.getInput(iface::valid(streamPortBase(s)))));
+      midStall = midStall ? c.orBits(midStall, miss) : miss;
+    }
+  Value chainEnable = outHazard ? c.notBit(outHazard) : c.t1;
+  if (midStall)
+    chainEnable = c.andBits(chainEnable, c.notBit(midStall));
+
+  // Stage-0 inputs (read at issue): fold each effective valid into
+  // `stage0Valid`, the issue gate. A predicated get treats a non-needed input
+  // as available
+  // (`valid | ~pred`), so a skipped input never blocks. With >1 stage-0 get
+  // they must pop together (an elastic join), so their readies are gated on it
+  // too.
+  Value stage0Valid;
+  for (const uarch::StreamChannel &s : dp.streams)
+    for (const uarch::StreamChannel::Access &acc : s.accesses) {
+      if (acc.isPut || acc.region != rb.id || acc.stage != 0)
+        continue;
+      Value valid = pa.getInput(iface::valid(streamPortBase(s)));
+      if (acc.when)
+        valid = c.orBits(valid, c.notBit(src(acc.when)));
+      stage0Valid = stage0Valid ? c.andBits(stage0Valid, valid) : valid;
+    }
+  bool join0 = stage0Gets > 1;
+
+  // Drive each `_ready`. A stage-0 get accepts when we want to issue and are
+  // not frozen (independent of its OWN valid, per the handshake contract; a
+  // join additionally waits for all stage-0 inputs). A deeper get accepts when
+  // the chain advances -- `chainEnable` already withholds that if this get's
+  // own input is the missing one. A predicated get pops only where its
+  // predicate holds, so a data-selected merge consumes exactly the chosen
+  // input.
+  for (const uarch::StreamChannel &s : dp.streams)
+    for (const uarch::StreamChannel::Access &acc : s.accesses) {
+      if (acc.isPut || acc.region != rb.id)
+        continue;
+      Value pred = acc.when ? src(acc.when) : Value();
       Value active = acc.stage == 0 ? atIssue : c.delayValid(issue, acc.stage);
-      pa.setOutput(iface::ready(base), c.andBits(active, chainEnable));
-      Value valid = pa.getInput(iface::valid(base));
-      allValid = allValid ? c.andBits(allValid, valid) : valid;
+      Value ready = c.andBits(active, chainEnable);
+      if (acc.stage == 0 && join0)
+        ready = c.andBits(ready, stage0Valid);
+      if (pred)
+        ready = c.andBits(ready, pred);
+      pa.setOutput(iface::ready(streamPortBase(s)), ready);
     }
   fb.chainEnable = chainEnable;
-  fb.issueEnable = allValid ? c.andBits(chainEnable, allValid) : chainEnable;
+  fb.issueEnable =
+      stage0Valid ? c.andBits(chainEnable, stage0Valid) : chainEnable;
 }
 
 // Emit region \p rb's whole datapath given the controller's \p issue; returns

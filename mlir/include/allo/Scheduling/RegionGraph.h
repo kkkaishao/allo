@@ -72,6 +72,8 @@ StringRef toString(XEdgeKind kind);
 void printRegionGraphDot(const RegionGraph &graph, func::FuncOp func,
                          raw_ostream &os);
 
+llvm::FailureOr<SmallVector<Operation *>>
+buildAndSortCallsiteGraph(func::FuncOp root);
 } // namespace mlir::allo
 
 #endif // ALLO_SCHEDULING_REGIONGRAPH_H

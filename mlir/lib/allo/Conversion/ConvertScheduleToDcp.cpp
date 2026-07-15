@@ -47,6 +47,7 @@
 #include "mlir/Dialect/Utils/StaticValueUtils.h"
 #include "mlir/IR/IRMapping.h"
 #include "mlir/IR/IntegerSet.h"
+#include "mlir/IR/SymbolTable.h"
 #include "mlir/Interfaces/LoopLikeInterface.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/StringMap.h"
@@ -644,6 +645,20 @@ static void materializeSequential(const RegionInfo &r,
 // for a synthesized wrapper), so this is idempotent for wrappers and un-folds
 // only the leaf/level regions whose descriptor latency folded the enclosing
 // trips.
+// Extra cycles the emitter spends at a region boundary that `perInvocation
+// Latency` (a pure datapath depth) does not count. A top-level region whose SSA
+// results escape to a later region -- a cross-region *survivor* -- hands each
+// value off through one capture register (the emitter's `enabledReg` in
+// `captureCountedResults`), a cycle `perInvocationLatency` omits. A store-
+// terminated region hands off through memory with no such register, so it adds
+// nothing. Hence the whole-kernel latency gains exactly one cycle per survivor-
+// yielding top-level region -- "the cross-region survivor values are registered
+// in the middle". Independent of the survivor's datapath depth (all of a
+// region's survivors latch at its one `done` edge).
+static int64_t regionBoundaryCost(Operation *regionOp) {
+  return regionOp->getNumResults() > 0 ? 1 : 0;
+}
+
 static void setDcpLatencies(func::FuncOp func) {
   Builder b(func.getContext());
   func.walk([&](Operation *op) {
@@ -651,6 +666,45 @@ static void setDcpLatencies(func::FuncOp func) {
       if (std::optional<int64_t> sr = perInvocationLatency(op))
         op->setAttr("latency", b.getI64IntegerAttr(*sr));
   });
+
+  // A structural container composes sub-kernels via `func.call`: its
+  // whole-kernel latency is its LAST child's completion -- max over calls of
+  // (the call's scheduled `start` + the callee's whole-kernel latency) -- not
+  // the straight-line region depth (`perInvocationLatency` counts only to a
+  // call's start, so a call node undercounts by its own latency). The scheduled
+  // `start` offsets encode the composition: a serial chain's staggered starts
+  // give the last completion (= the sum of child latencies); concurrent
+  // dataflow's all-zero starts give the max child -- one rule covers both. The
+  // callee latency is its corrected `dcp.latency` when already reified, else
+  // `allo.sched.latency` (still present -- the carrier is stripped per-func and
+  // a callee is processed after its caller). Unknown if any child is
+  // data-dependent (no static latency).
+  {
+    bool container = false, allKnown = true;
+    int64_t composed = 0;
+    func.walk([&](func::CallOp call) {
+      container = true;
+      int64_t start = optI64(call, "start").value_or(0);
+      auto callee = dyn_cast_or_null<func::FuncOp>(
+          SymbolTable::lookupNearestSymbolFrom(call, call.getCalleeAttr()));
+      std::optional<int64_t> cl;
+      if (callee) {
+        cl = optI64(callee, "dcp.latency");
+        if (!cl)
+          cl = optI64(callee, sched::kLatencyAttr);
+      }
+      if (!cl)
+        allKnown = false;
+      else
+        composed = std::max(composed, start + *cl);
+    });
+    if (container) {
+      if (allKnown)
+        func->setAttr("dcp.latency", b.getI64IntegerAttr(composed));
+      return;
+    }
+  }
+
   int64_t total = 0;
   bool known = true, bounded = false;
   for (Operation &op : func.getBody().front()) {
@@ -661,7 +715,7 @@ static void setDcpLatencies(func::FuncOp func) {
       known = false; // a data-dependent region leaves the kernel total unknown
       break;
     }
-    total += lat.getInt();
+    total += lat.getInt() + regionBoundaryCost(&op);
     bounded |= op.hasAttr("latency_bound");
   }
   if (known) {

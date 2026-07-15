@@ -5,9 +5,14 @@
 
 #include "allo/Scheduling/OperatorLibrary.h"
 
+#include "allo/IR/AlloOps.h"       // kAlloAsyncAttr
+#include "allo/Scheduling/Utils.h" // sched::kLatencyAttr
+
+#include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/MLIRContext.h"
+#include "mlir/IR/SymbolTable.h"
 #include "llvm/ADT/StringSwitch.h"
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/YAMLTraits.h"
@@ -671,6 +676,27 @@ OperatorChar OperatorLibrary::resolveEntry(const OperatorEntry &e,
 }
 
 OperatorChar OperatorLibrary::lookup(Operation *op) const {
+  // A plain (non-async) call to an already-scheduled callee is a fixed-latency
+  // opaque node (Route-B sequential composition): the callee's whole-kernel
+  // latency -- annotated bottom-up as `allo.sched.latency` (callees schedule
+  // before callers) -- becomes this call's latency, with registered-boundary
+  // delays (zero in/out), so the parent's SDC schedule places a dependent call
+  // at `predecessor.start + callee_latency`. A distinct operator type per
+  // callee keeps their latencies separate. An async call (dataflow, composed
+  // structurally) or a callee with no static latency (data-dependent) falls
+  // through to the normal characterization.
+  if (auto call = dyn_cast<func::CallOp>(op))
+    if (!op->hasAttr(kAlloAsyncAttr))
+      if (auto callee = SymbolTable::lookupNearestSymbolFrom<func::FuncOp>(
+              op, call.getCalleeAttr()))
+        if (auto lat =
+                callee->getAttrOfType<IntegerAttr>(sched::kLatencyAttr)) {
+          OperatorChar c;
+          c.typeName = ("call." + call.getCallee()).str();
+          c.latency = static_cast<uint32_t>(lat.getInt());
+          return c; // inDelay/outDelay default 0.0 = registered boundary
+        }
+
   // Advanced (raw MLIR op name) rows match first.
   llvm::StringRef name = op->getName().getStringRef();
   OpSignature sig = classify(op);

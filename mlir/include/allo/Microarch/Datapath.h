@@ -7,8 +7,8 @@
 // The L2 microarchitecture layer: an in-memory, value-typed, technology-
 // independent bound-datapath model that sits between the materialized schedule
 // (`allo.dcp.*` ops) and structural RTL (hw/seq/comb). It is deliberately not
-// an MLIR dialect yet: while it has a single consumer (the emitter) and no
-// transforms, C++ structs are cheaper to evolve than TableGen ops.
+// an MLIR dialect: with a single consumer (the emitter) and no transforms, C++
+// structs are cheaper to evolve than TableGen ops.
 //
 // Design invariant: the binder writes only the decision maps (op->unit,
 // value->reg, access->port); the structural cells (units/regs/muxes) and their
@@ -16,10 +16,8 @@
 // is therefore "edit the maps, re-derive", and the emitter depends only on the
 // derived structure, never on which binding policy produced it.
 //
-// Scope of the first cut (locked): constant-trip `affine.for` only (no dynamic
-// / `while` loops), pure-sequential region composition (no region overlap), no
-// AXI (memref arguments are bare external memory interfaces), and register
-// chains modelled as one shift register with taps.
+// Register chains are modelled as one shift register with taps; memref
+// arguments are bare external memory interfaces (no AXI).
 //===----------------------------------------------------------------------===//
 
 #ifndef ALLO_MICROARCH_DATAPATH_H
@@ -64,7 +62,7 @@ using StreamId = unsigned;
 // Control: semi-abstract. A cell/mux-select/port access is active when an
 // (abstract) per-region counter lands on one of `states`. Cyclic regions count
 // modulo II; acyclic regions count a plain 0..length-1 sequence. Materializing
-// this into a counter + decode logic is L3's job, not L2's.
+// this into a counter + decode logic is the emitter's job, not this model's.
 //===----------------------------------------------------------------------===//
 
 struct ControlPredicate {
@@ -156,12 +154,12 @@ struct Register {
   unsigned depth = 0; // chain length in cycles (>= 1 for a real register)
   Source input;       // driver of the chain head (the producing cell output)
   llvm::SmallVector<unsigned, 2> taps; // distinct tap levels actually read
-  bool needsEnable = false;            // gated fill/drain (cyclic); trivial: on
 };
 
 /// A memref-backed memory with banks and ports. The storage primitive (register
-/// / LUTRAM / BRAM / URAM) is resolved by the memory model; L2 records it but
-/// physical selection (address decode, per-primitive ports) is deferred to L3.
+/// / LUTRAM / BRAM / URAM) is resolved by the memory model; this model records
+/// it, but physical selection (address decode, per-primitive ports) is left to
+/// lowering.
 struct MemUnit {
   MemId id = 0;
   Value memref;
@@ -193,11 +191,11 @@ struct MemUnit {
 /// `allo.stream.get`) or an *output* (writes it via `allo.stream.put`); its
 /// payload type and depth come from the stream type. A get's loaded token is
 /// referenced by Source{Stream, id, <index of the get access>}; a put consumes
-/// `data`. First cut (P0): a channel carries exactly one access (canonical
-/// SPSC); fan-out / multiple accesses per channel is a later phase.
+/// `data`. A channel carries exactly one access (single-producer /
+/// single-consumer).
 struct StreamChannel {
   StreamId id = 0;
-  Value stream;         // the !allo.stream SSA value (a func block arg in P0)
+  Value stream;         // the !allo.stream SSA value (a func block arg)
   Type payload;         // element type carried through the FIFO
   unsigned depth = 2;   // FIFO depth (from the stream type)
   bool isInput = false; // input (get) vs output (put)
@@ -208,6 +206,10 @@ struct StreamChannel {
     unsigned region = 0; // the RegionBlock this access is scheduled in
     unsigned stage = 0;  // scheduled cycle within the region (dcpStart)
     Source data;         // put: the token's data driver (puts only)
+    // A predicated access (an i1 `pred` operand from a masked `if`) fires --
+    // consumes / produces a token -- only where this holds. Delayed to `stage`
+    // like `data`; None for an unconditional access.
+    Source when;
   };
   llvm::SmallVector<Access, 1> accesses;
 };
@@ -385,6 +387,25 @@ struct Datapath {
 
   void dump(llvm::raw_ostream &os) const;
 };
+
+//===----------------------------------------------------------------------===//
+// Timing readers over the scheduled dcp IR. `readyCycleOf` is the single
+// authority for "the cycle a producing op's result lands, relative to its
+// issuing pulse": both the builder (register-depth derivation) and the emitter
+// (result capture) consult it, so the latency model has one definition.
+//===----------------------------------------------------------------------===//
+
+/// The `dcp.operator` op characterizing a compute/load (null if none); returned
+/// as a generic Operation to keep this header free of the dcp op headers.
+Operation *dcpOperatorOp(Operation *op);
+/// Region-relative schedule cycle of a dcp compute/load/store op (its `start`).
+unsigned dcpStart(Operation *op);
+/// Result latency of a producing dcp op (0 if uncharacterized).
+unsigned dcpLatency(Operation *op);
+/// The cycle a producing op's result is ready: `dcpStart + dcpLatency` (a
+/// stream get is a combinational front-read, latency 0). Zero for an at-issue
+/// value with no producing op (a constant, the iteration counter).
+unsigned readyCycleOf(Operation *op);
 
 } // namespace mlir::allo::uarch
 

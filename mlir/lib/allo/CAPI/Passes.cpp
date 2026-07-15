@@ -52,11 +52,12 @@ MlirLogicalResult alloEmitSplitVerilog(MlirModule module,
 }
 
 MlirLogicalResult alloEmitDatapathToHW(MlirModule module, MlirStringRef binding,
+                                       MlirStringRef top,
                                        MlirStringCallback callback,
                                        void *userData) {
   llvm::StringMap<std::string> interfaces;
   if (failed(allo::uarch::emitDatapathToHW(unwrap(module), unwrap(binding),
-                                           interfaces)))
+                                           unwrap(top), interfaces)))
     return mlirLogicalResultFailure();
   // Combine the per-module interface JSON into one object keyed by module name.
   // Each value is already valid JSON, so it is embedded verbatim; module names

@@ -205,37 +205,57 @@ def GetNumWorkersOp : Allo_Op<"get_nw", [Pure]> {
   }];
 }
 
-def StreamGetOp : Allo_Op<"stream.get", [MemoryEffects<[MemRead, MemWrite]>]> {
+def StreamGetOp : Allo_Op<"stream.get",
+    [MemoryEffects<[MemRead, MemWrite]>, AttrSizedOperandSegments]> {
   let summary = "get a value from a stream";
   let description = [{
     This operation retrieves a value from a stream, and destroys the value in the stream.
-    The operation has both read and write memory effects
+    The operation has both read and write memory effects.
+
+    The optional `pred` is an i1 predicate: the token is consumed (the FIFO is
+    popped) only on a firing where it holds. A null (statically-true) predicate is
+    the canonical unconditional get. The predicate must be a function of data /
+    induction variables, never of channel status (that would leave KPN). See
+    drafts/dataflow-predicated-access.md.
   }];
-  let arguments = (ins Stream:$stream, Variadic<Index>:$indices);
+  let arguments = (ins Stream:$stream, Variadic<Index>:$indices, Optional<I1>:$pred);
   let results = (outs AnyType:$value);
   let assemblyFormat = [{
-    $stream `[` $indices `]` attr-dict `:` qualified(type($stream)) `,` type($value)
+    $stream `[` $indices `]` (`if` $pred^)? attr-dict `:` qualified(type($stream)) `,` type($value)
   }];
   let builders = [
-    OpBuilder<(ins "Value":$stream, "ArrayRef<Value>":$indices), [{
+    OpBuilder<(ins "Value":$stream, "ValueRange":$indices), [{
       auto streamType = cast<allo::StreamType>(stream.getType());
-      build($_builder, $_state, streamType.getBaseType(), stream, indices);
+      build($_builder, $_state, streamType.getBaseType(), stream, indices,
+            /*pred=*/::mlir::Value());
     }]>
   ];
   let hasVerifier = 1;
 }
 
-def StreamPutOp : Allo_Op<"stream.put", [MemoryEffects<[MemWrite]>]> {
+def StreamPutOp : Allo_Op<"stream.put",
+    [MemoryEffects<[MemWrite]>, AttrSizedOperandSegments]> {
   let summary = "put a value into a stream";
   let description = [{
     This operation puts a value into a stream, and the value in the stream is consumed by the next `stream.get` operation.
     The operation has write memory effects.
+
+    The optional `pred` is an i1 predicate: the token is produced only on a firing
+    where it holds. A null (statically-true) predicate is the canonical
+    unconditional put. The predicate must be a function of data / induction
+    variables, never of channel status. See drafts/dataflow-predicated-access.md.
   }];
-  let arguments = (ins Stream:$stream, Variadic<Index>:$indices, AnyType:$value);
+  let arguments = (ins Stream:$stream, Variadic<Index>:$indices, AnyType:$value,
+                       Optional<I1>:$pred);
   let results = (outs);
   let assemblyFormat = [{
-    $value `,` $stream `[` $indices `]` attr-dict `:` type($value) `,` qualified(type($stream))
+    $value `,` $stream `[` $indices `]` (`if` $pred^)? attr-dict `:` type($value) `,` qualified(type($stream))
   }];
+  let builders = [
+    OpBuilder<(ins "Value":$stream, "ValueRange":$indices, "Value":$value), [{
+      build($_builder, $_state, stream, indices, value, /*pred=*/::mlir::Value());
+    }]>
+  ];
   let hasVerifier = 1;
 }
 
@@ -243,12 +263,22 @@ def StreamCreateOp : Allo_Op<"stream.create", [MemoryEffects<[MemAlloc]>]> {
   let summary = "create a stream";
   let description = [{
     This operation creates a new local stream.
+
+    The optional `init` attribute preloads the channel with initial tokens (for
+    feedback cycles): an ordered list of typed scalar attributes of the stream's
+    base type. Its k elements become the earliest tokens in the channel history
+    (`[init] ++ [produced]`), breaking a cycle's start dependence.
   }];
-  let arguments = (ins);
+  let arguments = (ins OptionalAttr<ArrayAttr>:$init);
   let results = (outs Stream:$stream);
   let assemblyFormat = [{
-    attr-dict `:` qualified(type($stream))
+    (`init` $init^)? attr-dict `:` qualified(type($stream))
   }];
+  let builders = [
+    OpBuilder<(ins "::mlir::Type":$stream), [{
+      build($_builder, $_state, stream, /*init=*/::mlir::ArrayAttr());
+    }]>
+  ];
 }
 
 //===----------------------------------------------------------------------===//

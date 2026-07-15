@@ -148,7 +148,7 @@ P = ParamSpec("P")
 R = TypeVar("R")
 
 
-class Vitis(Backend, Generic[P, R]):
+class Vitis(Backend[P, R]):
     name = "vitis"
     part: str
 

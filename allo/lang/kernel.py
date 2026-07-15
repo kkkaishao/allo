@@ -81,7 +81,7 @@ class Kernel(Generic[P, R]):
         fn: Callable[P, R],
         *,
         mapping: Sequence[int | Template],
-        options: KernelOptions,
+        options: KernelOptions = KernelOptions(),
         template: Sequence[Template] = (),
         template_bindings: dict[str, object] | None = None,
         definition_scope: dict[str, object] | None = None,

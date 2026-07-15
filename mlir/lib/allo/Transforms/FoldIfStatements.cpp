@@ -3,6 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+#include "allo/IR/AlloOps.h" // StreamGetOp / StreamPutOp
 #include "allo/Support/Logging.h"
 #include "allo/Transforms/Passes.h"
 
@@ -34,13 +35,25 @@ namespace {
 // datapath so the scheduler sees no control flow.
 //===----------------------------------------------------------------------===//
 
+// A stream get/put fires (consumes / produces a token) only where its i1
+// predicate holds; masking it means ANDing the branch condition into that
+// predicate instead of speculating the side effect. This keeps a conditional
+// stream access inside the single pipelined region (II preserved) rather than
+// serializing it as a guard region. See drafts/dataflow-predicated-access.md.
+bool isMaskableStream(Operation *op) {
+  return isa<StreamGetOp, StreamPutOp>(op);
+}
+
 // An op inside an if body may be speculated (hoisted unconditionally) iff it is
-// a load/store (loads are safe on FPGA; stores are predicated) or a region-free
-// pure op. Anything else -- stream get/put, a nested loop/if, a call, any other
-// side effect -- cannot be masked, so the enclosing if is left alone.
+// a load/store (loads are safe on FPGA; stores are predicated), a stream
+// get/put (masked by its predicate), or a region-free pure op. Anything else --
+// a nested loop/if, a call, any other side effect -- cannot be masked, so the
+// enclosing if is left alone.
 bool speculatable(Operation *op) {
   if (isa<affine::AffineLoadOp, affine::AffineStoreOp, memref::LoadOp,
           memref::StoreOp>(op))
+    return true;
+  if (isMaskableStream(op))
     return true;
   if (op->getNumRegions() != 0)
     return false;
@@ -72,18 +85,54 @@ bool insideLoop(Operation *op) {
   return false;
 }
 
-bool hasStore(Block *block) {
-  return llvm::any_of(*block, [](Operation &op) {
-    return isa<affine::AffineStoreOp, memref::StoreOp>(op);
-  });
+// A branch op that consumes the predicate when speculated: a store (predicated
+// read-modify-write) or a maskable stream op (predicate operand). A branch with
+// one needs its condition materialized (affine) / negated (else); a pure branch
+// does not.
+bool consumesPredicate(Operation *op) {
+  return isa<affine::AffineStoreOp, memref::StoreOp>(op) ||
+         isMaskableStream(op);
+}
+
+bool needsPredicate(Block *block) {
+  return llvm::any_of(*block,
+                      [](Operation &op) { return consumesPredicate(&op); });
+}
+
+// Hoist a stream get/put out of the branch and gate it on `pred` (ANDed with
+// any predicate it already carries from an enclosing masked if), so it fires
+// only where the branch is taken. A get's result is forwarded to its uses
+// (garbage when it does not fire, but every such use is itself predicated /
+// selected).
+void maskStreamOp(Operation *op, Operation *ifOp, Value pred, RewriterBase &b) {
+  b.setInsertionPoint(ifOp);
+  Value existing = isa<StreamGetOp>(op) ? cast<StreamGetOp>(op).getPred()
+                                        : cast<StreamPutOp>(op).getPred();
+  Value gated =
+      existing
+          ? arith::AndIOp::create(b, op->getLoc(), existing, pred).getResult()
+          : pred;
+  if (auto get = dyn_cast<StreamGetOp>(op)) {
+    auto nw = StreamGetOp::create(b, get.getLoc(), get.getValue().getType(),
+                                  get.getStream(), get.getIndices(), gated);
+    b.replaceOp(op, nw.getResult());
+  } else {
+    auto put = cast<StreamPutOp>(op);
+    StreamPutOp::create(b, put.getLoc(), put.getStream(), put.getIndices(),
+                        put.getValue(), gated);
+    b.eraseOp(op);
+  }
 }
 
 // Hoist a branch body before `ifOp`, predicating each store under `pred`
-// (`store select(pred, storedValue, load)`); every other op is speculated.
+// (`store select(pred, storedValue, load)`) and gating each stream get/put on
+// `pred`; every other op is speculated.
 void predicateBranch(Block *body, Operation *ifOp, Value pred,
                      RewriterBase &b) {
   for (Operation &op : llvm::make_early_inc_range(body->without_terminator())) {
-    if (auto store = dyn_cast<affine::AffineStoreOp>(&op)) {
+    if (isMaskableStream(&op)) {
+      maskStreamOp(&op, ifOp, pred, b);
+    } else if (auto store = dyn_cast<affine::AffineStoreOp>(&op)) {
       b.setInsertionPoint(ifOp);
       Value old = affine::AffineLoadOp::create(
           b, store.getLoc(), store.getMemRef(), store.getAffineMap(),
@@ -118,19 +167,23 @@ void convertCore(Operation *ifOp, Block *thenBlock, Block *elseBlock,
   auto yieldOperands = [](Block *block) {
     return SmallVector<Value>(block->getTerminator()->getOperands());
   };
+
+  // Capture each branch's yielded values *after* predicating it: masking a
+  // stream get replaces the op and RAUWs the yield operand, so a copy taken
+  // beforehand would dangle (a speculated pure op only moves, but a masked get
+  // is rebuilt).
+  predicateBranch(thenBlock, ifOp, cond, b);
   SmallVector<Value> thenYield = yieldOperands(thenBlock);
   SmallVector<Value> elseYield;
-
-  predicateBranch(thenBlock, ifOp, cond, b);
   if (elseBlock) {
-    elseYield = yieldOperands(elseBlock);
-    Value notCond; // only the else stores need it
-    if (hasStore(elseBlock)) {
+    Value notCond; // only the else stores / stream ops need it
+    if (needsPredicate(elseBlock)) {
       b.setInsertionPoint(ifOp);
       Value one = arith::ConstantIntOp::create(b, loc, 1, /*width=*/1);
       notCond = arith::XOrIOp::create(b, loc, cond, one);
     }
     predicateBranch(elseBlock, ifOp, notCond, b);
+    elseYield = yieldOperands(elseBlock);
   }
 
   // Value results: select between the two speculated branches.
@@ -173,8 +226,8 @@ void convert(RewriterBase &b, affine::AffineIfOp ifOp) {
   OpBuilder::InsertionGuard g(b);
   Block *thenBlock = ifOp.getThenBlock();
   Block *elseBlock = ifOp.hasElse() ? ifOp.getElseBlock() : nullptr;
-  bool needCond = ifOp.getNumResults() > 0 || hasStore(thenBlock) ||
-                  (elseBlock && hasStore(elseBlock));
+  bool needCond = ifOp.getNumResults() > 0 || needsPredicate(thenBlock) ||
+                  (elseBlock && needsPredicate(elseBlock));
   b.setInsertionPoint(ifOp);
   Value cond =
       needCond ? materializeCondition(b, ifOp.getLoc(), ifOp) : Value();
@@ -224,6 +277,25 @@ void combineBounds(AffineMap a, ValueRange aOps, AffineMap b, ValueRange bOps,
   outOps.append(bOps.begin() + ndb, bOps.end());   // b symbols
 }
 
+// Whether `e` is affine in dim `pos`: degree 1 with a constant coefficient, so
+// that `e` decomposes exactly as `coeff * d_pos + residual` with `residual`
+// independent of the dim. The dim may be added, subtracted or scaled; feeding
+// it to `mod`/`floordiv`/`ceildiv` makes `e` quasi-affine in it, and no such
+// decomposition exists. (A `mul`'s other side is a constant or a symbol -- an
+// AffineExpr cannot multiply two dims -- so degree stays 1 there.)
+static bool isAffineInDim(AffineExpr e, unsigned pos) {
+  auto bin = dyn_cast<AffineBinaryOpExpr>(e);
+  if (!bin)
+    return true; // a leaf: this dim, another dim/symbol, or a constant
+  switch (e.getKind()) {
+  case AffineExprKind::Add:
+  case AffineExprKind::Mul:
+    return isAffineInDim(bin.getLHS(), pos) && isAffineInDim(bin.getRHS(), pos);
+  default: // Mod / FloorDiv / CeilDiv
+    return !e.isFunctionOfDim(pos);
+  }
+}
+
 struct FoldGuardIntoLoopBound : OpRewritePattern<affine::AffineIfOp> {
   using OpRewritePattern::OpRewritePattern;
 
@@ -262,6 +334,17 @@ struct FoldGuardIntoLoopBound : OpRewritePattern<affine::AffineIfOp> {
     MLIRContext *ctx = rewriter.getContext();
     AffineExpr c = set.getConstraint(0);
     AffineExpr ivDim = getAffineDimExpr(*ivPos, ctx);
+    // That decomposition exists only if the constraint is affine in the IV. The
+    // two-point probe below cannot tell: on a quasi-affine constraint it reads
+    // some finite difference as the coefficient and folds away a guard no loop
+    // bound can express. `flatten-perfect-loops` produces exactly that shape --
+    // coalescing a nest rewrites each original IV as a floordiv/mod of the
+    // surviving one, and canonicalization composes those into the guard's set,
+    // leaving e.g. `d0 mod 4 - (d0 floordiv 4) floordiv 5 - 1 >= 0`, whose
+    // c(1) - c(0) is 1. Two IVs of the coalesced nest are then both functions
+    // of the one remaining IV, so the guard is not a bound on it at all.
+    if (!isAffineInDim(c, *ivPos))
+      return failure();
     AffineExpr residual = simplifyAffineExpr(
         c.replace(ivDim, getAffineConstantExpr(0, ctx)), numDims, numSyms);
     AffineExpr coeffExpr = simplifyAffineExpr(

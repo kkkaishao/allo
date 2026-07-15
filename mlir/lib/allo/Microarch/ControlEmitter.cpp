@@ -104,18 +104,13 @@ RegionControl ControlEmitter::emitAcyclic(Value start) {
 // while, acyclic). It rises when the last iteration's deepest output has
 // drained -- `lastIssue` (the final iteration's issue pulse) delayed
 // `drainStage` cycles -- or immediately on `emptyDone` (an empty region, when
-// reachable). The latch's register cycle IS the store/result commit cycle, so a
+// reachable). The latch's register cycle is the store/result commit cycle, so a
 // sibling starting on this done's edge reads every committed store and
-// survivor.
-//
-// This subsumes the old three-way split: a store-less region's `drainStage` is
-// its result's ready cycle (was the capture pulse), a cyclic store-ful region's
-// is its deepest store's stage (was a `wrCount == bound` retire count, which
-// under-counts when two stores retire in one cycle -- the multi-store bug), and
-// an acyclic region's `lastIssue` is its lone issue. Keying on `lastIssue` (an
-// actual issue pulse) rather than a counter comparison also removes the dynamic
-// bound's "has-run" reset guard. A `retrig` region (re-run by an enclosing
-// container) resets its completion state on `start`.
+// survivor. `drainStage` is the deepest output's stage: a store-less region's
+// result ready cycle, else its deepest store's stage. Keying on `lastIssue` (an
+// actual issue pulse) rather than a store-retire count keeps a region that
+// retires several stores in one cycle from completing early. A `retrig` region
+// (re-run by an enclosing container) resets its completion state on `start`.
 Value ControlEmitter::emitDone(unsigned drainStage, Value lastIssue,
                                Value emptyDone, Value start, bool retrig) {
   Value fire = c.delayValid(lastIssue, drainStage);
@@ -131,10 +126,13 @@ Value ControlEmitter::emitDone(unsigned drainStage, Value lastIssue,
     fire = c.orBits(emptyDone, fire);
   Backedge dNext = c.bb.get(c.i1);
   Value done = c.reg(dNext, c.f1);
-  Value set = c.mux(fire, c.t1, done);
-  if (retrig)
-    set = c.mux(start, c.f1, set);
-  dNext.setValue(set);
+  // `retrig` clears the held `done` on `start` so the region is re-invocable:
+  // the level drops to 0 for the run, giving the consumer a fresh 0->1 edge
+  // when it completes. Callers must therefore keep `fire` off the `start` cycle
+  // (see emptyDone) -- it wins over the clear here, so the two coinciding would
+  // hold the level at 1 across a restart and the consumer would see no edge.
+  Value held = retrig ? c.mux(start, c.f1, done) : done;
+  dNext.setValue(c.mux(fire, c.t1, held));
   return done;
 }
 

@@ -18,5 +18,9 @@ target_link_libraries(allo-lsp-server
     MLIRLspServerLib
     MLIRAllo
     MLIRAlloTransformOps
+    CIRCTHW
+    CIRCTComb
+    CIRCTSeq
+    CIRCTFSM
 )
 

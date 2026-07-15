@@ -99,18 +99,20 @@ NB_MODULE(_allo, m) {
       nb::arg("module"));
   allo.def(
       "emit_datapath_to_hw",
-      [](MlirModule module,
-         const std::string &binding) -> std::optional<std::string> {
+      [](MlirModule module, const std::string &binding,
+         const std::string &top) -> std::optional<std::string> {
         std::string out;
         if (mlirLogicalResultIsFailure(alloEmitDatapathToHW(
                 module, mlirStringRefCreate(binding.data(), binding.size()),
-                appendToString, &out)))
+                mlirStringRefCreate(top.data(), top.size()), appendToString,
+                &out)))
           return std::nullopt;
         return out;
       },
-      nb::arg("module"), nb::arg("binding"),
-      "Lower scheduled functions to hw.modules in place; return a JSON object "
-      "mapping each emitted module name to its port-interface manifest.");
+      nb::arg("module"), nb::arg("binding"), nb::arg("top"),
+      "Lower the functions reachable from `top` to hw.modules in place, rooted "
+      "at `top`; return a JSON object mapping each emitted module name to its "
+      "port-interface manifest.");
   allo.def(
       "emit_split_verilog",
       [](MlirModule module, const std::string &directory) -> bool {

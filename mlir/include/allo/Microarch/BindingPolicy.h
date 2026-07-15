@@ -40,9 +40,8 @@ struct TrivialBinding : BindingPolicy {
 
 /// Greedy within-region sharing: fold same-operator-type units whose MRT
 /// reservations are disjoint onto one unit (left-edge over the reservation
-/// table). A provisional policy pending a cost-driven one;
-/// interconnect-agnostic and shares every compatible op regardless of operator
-/// area.
+/// table). Interconnect-agnostic: it shares every compatible op regardless of
+/// operator area. A cost-driven policy can replace it.
 struct GreedyShareBinding : BindingPolicy {
   std::vector<llvm::SmallVector<UnitId, 2>>
   plan(const Datapath &dp) const override;

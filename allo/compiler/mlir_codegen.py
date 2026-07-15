@@ -2061,6 +2061,32 @@ class MLIRCodeGenerator(ast.NodeVisitor):
             )
         return value
 
+    def _parse_stream_init(self, node: ast.AnnAssign) -> list[int | float]:
+        """Interpret `s: Stream[T, depth] = <init>` as the channel's initial
+        tokens -- a flat list literal `[1, 2, ...]` or a captured 1-D NumPy array
+        -- whose elements become the earliest tokens in the channel history,
+        seeding a feedback cycle."""
+        name = node.target.id
+        if isinstance(node.value, ast.List):
+            shape, values = self._flatten_list_initializer(node.value)
+            if len(shape) != 1:
+                return self.compile_error(
+                    f"Stream '{name}' initial tokens must be a flat list, got shape {shape}."
+                )
+            return values
+        value = self.visit(node.value)
+        if isinstance(value, np.ndarray):
+            if value.ndim != 1:
+                return self.compile_error(
+                    f"Stream '{name}' initial-token array must be 1-D, got shape "
+                    f"{value.shape}."
+                )
+            return value.tolist()
+        return self.compile_error(
+            f"Stream '{name}' initializer must be a list of initial tokens or a "
+            f"1-D array, e.g. `{name}: Stream[...] = [1, 2]`."
+        )
+
     def _global_symbol(self, node: ast.AST, var_id: str, kind: str) -> str:
         """Instance-scoped wrapper over the module-level ``_global_symbol``, keyed
         on this generator's entry kernel."""
@@ -2104,12 +2130,9 @@ class MLIRCodeGenerator(ast.NodeVisitor):
         if isinstance(parsed_type, StatefulType):
             return self._visit_stateful_decl(node, parsed_type)
         if isinstance(parsed_type, StreamType):
-            if node.value is not None:
-                return self.compile_error(
-                    f"Stream '{node.target.id}' must be declared without an initializer."
-                )
+            init = self._parse_stream_init(node) if node.value is not None else None
             self._set_value_with_loc(
-                node.target.id, self.builder.create_stream(parsed_type)
+                node.target.id, self.builder.create_stream(parsed_type, init)
             )
             return
 

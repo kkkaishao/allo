@@ -369,7 +369,7 @@ class StreamType(TypeBase):
         shape = tuple(shape)
         assert all(isinstance(dim, int) and dim >= 0 for dim in shape)
         shape_suffix = "[" + ",".join(str(dim) for dim in shape) + "]" if shape else ""
-        super().__init__(f"Stream[{base_type}]{shape_suffix}")
+        super().__init__(f"Stream[{base_type},{depth}]{shape_suffix}")
         self.base_type = base_type
         self.depth = depth
         self.shape = shape

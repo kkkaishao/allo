@@ -5,14 +5,14 @@
 
 A library describes, for one device at one target frequency, the timing every
 operator presents to the scheduler: ``latency`` (cycles), ``delay`` (ns, for
-chaining/clock closure), and ``pipelined``. It is authored by someone who reads
-FPGA timing reports -- no knowledge of the compiler IR is required. Operators are
-named by an abstract ``(kind, dtype, width)`` signature; the C++ backend maps
-concrete IR ops onto it. Rare ops we do not predefine (e.g. ``math.rsqrt``) are
-characterized through :meth:`OperatorLibrary.advanced` by their MLIR name.
+chaining/clock closure), and ``pipelined``. Rows are written from FPGA timing
+reports; no knowledge of the compiler IR is required. Operators are named by an
+abstract ``(kind, dtype, width)`` signature that the C++ backend maps concrete IR
+ops onto. An op with no predefined kind (e.g. ``math.rsqrt``) is characterized
+through :meth:`OperatorLibrary.advanced` by its MLIR name.
 
 This mirrors ``mlir/.../OperatorLibrary.{h,cpp}``; it serializes to the YAML that
-the ``allo-schedule`` pass consumes via its ``operator-library`` option.
+the ``sdc-scheduling`` pass consumes via its ``operator-library`` option.
 """
 
 from __future__ import annotations
@@ -53,6 +53,17 @@ OP_KINDS = frozenset(
 # matches unsigned ops; ``uint`` matches only ops the IR marks unsigned.
 OP_DTYPES = frozenset({"int", "uint", "half", "bfloat16", "float", "double", "any"})
 
+# Memory/stream kinds map to the `memory:` section rather than an operators row:
+# an array access characterizes the *default* storage primitive, a stream access
+# the FIFO. Maps kind -> (is_stream, direction); per-implementation timing goes
+# through `.primitive(...)`.
+_MEM_STREAM = {
+    "mem_read": (False, "read"),
+    "mem_write": (False, "write"),
+    "stream_read": (True, "read"),
+    "stream_write": (True, "write"),
+}
+
 _OPLIB_DIR = Path(__file__).parent / "oplib"
 
 
@@ -62,17 +73,21 @@ def _row(
     mlir_op=None,
     dtype=None,
     width=None,
-    width_ge=None,
-    width_le=None,
+    width_min=None,
+    width_max=None,
     latency=0,
     delay_ns=None,
-    in_delay_ns=None,
-    out_delay_ns=None,
+    delay_in_ns=None,
+    delay_out_ns=None,
     pipelined=None,
     unit=None,
+    impl=None,
 ):
-    """Build a YAML row dict, omitting unset optionals so the C++ parser's
-    ``mapOptional`` sees only present keys."""
+    """Build a YAML row dict in the layered schema, omitting unset optionals so
+    the C++ parser's ``mapOptional`` sees only present keys. ``width`` is a
+    ``{min, max}`` map (exact ``width`` sets both bounds); ``delay_ns`` is a
+    scalar (symmetric) or ``{in, out}``; ``impl`` is the realization (a native
+    keyword or an IP name)."""
     row = {}
     if op is not None:
         row["op"] = op
@@ -80,19 +95,23 @@ def _row(
         row["mlir_op"] = mlir_op
     if dtype is not None:
         row["dtype"] = dtype
-    if width is not None:
-        row["width"] = int(width)
-    if width_ge is not None:
-        row["width_ge"] = int(width_ge)
-    if width_le is not None:
-        row["width_le"] = int(width_le)
+    wmin = width if width is not None else width_min
+    wmax = width if width is not None else width_max
+    if wmin is not None or wmax is not None:
+        w = {}
+        if wmin is not None:
+            w["min"] = int(wmin)
+        if wmax is not None:
+            w["max"] = int(wmax)
+        row["width"] = w
     row["latency"] = int(latency)
-    if delay_ns is not None:
+    if delay_in_ns is not None or delay_out_ns is not None:
+        row["delay_ns"] = {
+            "in": float(delay_in_ns or 0.0),
+            "out": float(delay_out_ns or 0.0),
+        }
+    elif delay_ns is not None:
         row["delay_ns"] = float(delay_ns)
-    if in_delay_ns is not None:
-        row["in_delay_ns"] = float(in_delay_ns)
-    if out_delay_ns is not None:
-        row["out_delay_ns"] = float(out_delay_ns)
     if pipelined is not None:
         row["pipelined"] = bool(pipelined)
     if unit is not None:
@@ -102,6 +121,8 @@ def _row(
                 "(a combinational unit is not allocation-limited)"
             )
         row["unit"] = unit
+    if impl is not None:
+        row["impl"] = impl
     return row
 
 
@@ -131,6 +152,11 @@ class OperatorLibrary:
         self._operators = []
         self._advanced = []
         self._default = {"latency": 0, "delay_ns": 0.0}
+        # The `memory:` (storage) section: the default implementation unbound
+        # arrays use, a per-implementation timing table, and the FIFO timing.
+        self._mem_default = "lutram"
+        self._primitives = {}  # impl name -> {"latency": {...}, "delay_ns": {...}}
+        self._fifo = {}  # {"latency": {read, write}, "delay_ns": {read, write}}
 
     # -- building -----------------------------------------------------------
 
@@ -147,33 +173,50 @@ class OperatorLibrary:
         *,
         dtype=None,
         width=None,
-        width_ge=None,
-        width_le=None,
+        width_min=None,
+        width_max=None,
         latency=0,
         delay_ns=None,
-        in_delay_ns=None,
-        out_delay_ns=None,
+        delay_in_ns=None,
+        delay_out_ns=None,
         pipelined=None,
         unit=None,
+        impl=None,
     ):
         """Characterize an abstract operator ``kind`` (optionally gated by
-        ``dtype`` and a width predicate). ``unit`` joins an allocation pool.
-        Returns ``self`` for chaining."""
+        ``dtype`` and a ``width`` / ``width_min`` / ``width_max`` predicate).
+        ``unit`` joins an allocation pool; ``impl`` is the realization (a native
+        keyword ``comb``/``hwarith``/``builtin`` or an IP name). Returns ``self``
+        for chaining."""
         _check_kind(kind)
+        # Memory / stream kinds take latency + delay only; dtype/width/unit/impl
+        # do not apply to them.
+        if kind in _MEM_STREAM:
+            is_stream, direction = _MEM_STREAM[kind]
+            target = (
+                self._fifo
+                if is_stream
+                else self._primitives.setdefault(self._mem_default, {})
+            )
+            target.setdefault("latency", {})[direction] = int(latency)
+            if delay_ns is not None:
+                target.setdefault("delay_ns", {})[direction] = float(delay_ns)
+            return self
         _check_dtype(dtype)
         self._operators.append(
             _row(
                 op=kind,
                 dtype=dtype,
                 width=width,
-                width_ge=width_ge,
-                width_le=width_le,
+                width_min=width_min,
+                width_max=width_max,
                 latency=latency,
                 delay_ns=delay_ns,
-                in_delay_ns=in_delay_ns,
-                out_delay_ns=out_delay_ns,
+                delay_in_ns=delay_in_ns,
+                delay_out_ns=delay_out_ns,
                 pipelined=pipelined,
                 unit=unit,
+                impl=impl,
             )
         )
         return self
@@ -184,14 +227,15 @@ class OperatorLibrary:
         *,
         dtype=None,
         width=None,
-        width_ge=None,
-        width_le=None,
+        width_min=None,
+        width_max=None,
         latency=0,
         delay_ns=None,
-        in_delay_ns=None,
-        out_delay_ns=None,
+        delay_in_ns=None,
+        delay_out_ns=None,
         pipelined=None,
         unit=None,
+        impl=None,
     ):
         """Escape hatch: characterize a raw MLIR op (e.g. ``"math.rsqrt"``) that
         has no abstract kind. Matched before abstract rows; the name is validated
@@ -202,14 +246,15 @@ class OperatorLibrary:
                 mlir_op=mlir_op,
                 dtype=dtype,
                 width=width,
-                width_ge=width_ge,
-                width_le=width_le,
+                width_min=width_min,
+                width_max=width_max,
                 latency=latency,
                 delay_ns=delay_ns,
-                in_delay_ns=in_delay_ns,
-                out_delay_ns=out_delay_ns,
+                delay_in_ns=delay_in_ns,
+                delay_out_ns=delay_out_ns,
                 pipelined=pipelined,
                 unit=unit,
+                impl=impl,
             )
         )
         return self
@@ -219,18 +264,69 @@ class OperatorLibrary:
         *,
         latency=0,
         delay_ns=None,
-        in_delay_ns=None,
-        out_delay_ns=None,
+        delay_in_ns=None,
+        delay_out_ns=None,
         pipelined=None,
+        impl=None,
     ):
         """Set the catch-all row applied to any op no other row matches."""
         self._default = _row(
             latency=latency,
             delay_ns=delay_ns,
-            in_delay_ns=in_delay_ns,
-            out_delay_ns=out_delay_ns,
+            delay_in_ns=delay_in_ns,
+            delay_out_ns=delay_out_ns,
             pipelined=pipelined,
+            impl=impl,
         )
+        return self
+
+    # -- storage (the `memory:` section) ------------------------------------
+
+    def memory_default(self, impl):
+        """Set the storage implementation unbound on-chip arrays default to
+        (Vitis, no AXI: ``lutram``). A complete partition always resolves to
+        ``register``; ``bind_storage`` overrides per array. Returns ``self``."""
+        self._mem_default = str(impl)
+        return self
+
+    def primitive(
+        self,
+        name,
+        *,
+        read_latency=0,
+        write_latency=0,
+        read_delay_ns=None,
+        write_delay_ns=None,
+    ):
+        """Characterize a storage primitive (``register``/``lutram``/``bram``/
+        ``uram``): the read/write latency (cycles) and delay (ns) an access to an
+        array bound to it presents to the scheduler. Returns ``self``."""
+        p = self._primitives.setdefault(str(name), {})
+        p.setdefault("latency", {}).update(
+            read=int(read_latency), write=int(write_latency)
+        )
+        if read_delay_ns is not None or write_delay_ns is not None:
+            p.setdefault("delay_ns", {}).update(
+                read=float(read_delay_ns or 0.0), write=float(write_delay_ns or 0.0)
+            )
+        return self
+
+    def fifo(
+        self,
+        *,
+        read_latency=1,
+        write_latency=1,
+        read_delay_ns=None,
+        write_delay_ns=None,
+    ):
+        """Characterize stream (FIFO) get/put timing. Returns ``self``."""
+        self._fifo.setdefault("latency", {}).update(
+            read=int(read_latency), write=int(write_latency)
+        )
+        if read_delay_ns is not None or write_delay_ns is not None:
+            self._fifo.setdefault("delay_ns", {}).update(
+                read=float(read_delay_ns or 0.0), write=float(write_delay_ns or 0.0)
+            )
         return self
 
     # -- construction -------------------------------------------------------
@@ -254,6 +350,13 @@ class OperatorLibrary:
             lib._advanced.append(dict(r))
         if "default" in data:
             lib._default = dict(data["default"])
+        mem = data.get("memory", {}) or {}
+        lib._mem_default = mem.get("default", "lutram")
+        lib._primitives = {
+            p["name"]: {k: dict(v) for k, v in p.items() if k != "name"}
+            for p in mem.get("primitives", [])
+        }
+        lib._fifo = {k: dict(v) for k, v in (mem.get("fifo", {}) or {}).items()}
         return lib
 
     @classmethod
@@ -299,6 +402,15 @@ class OperatorLibrary:
         if self._advanced:
             d["advanced_operators"] = self._advanced
         d["default"] = self._default
+        if self._primitives or self._fifo or self._mem_default != "lutram":
+            mem: dict = {"default": self._mem_default}
+            if self._primitives:
+                mem["primitives"] = [
+                    {"name": n, **p} for n, p in self._primitives.items()
+                ]
+            if self._fifo:
+                mem["fifo"] = self._fifo
+            d["memory"] = mem
         return d
 
     def _validate_units(self):
