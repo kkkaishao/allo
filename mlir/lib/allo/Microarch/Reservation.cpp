@@ -3,11 +3,6 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-//===----------------------------------------------------------------------===//
-// MRT oracle + binding verifier. Occupancy is a compile-time constant of the
-// schedule, so compatibility is exact set intersection. See Reservation.h.
-//===----------------------------------------------------------------------===//
-
 #include "allo/Microarch/Reservation.h"
 
 #include "llvm/ADT/DenseSet.h"

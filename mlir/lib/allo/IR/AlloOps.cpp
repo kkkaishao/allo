@@ -404,6 +404,21 @@ LogicalResult DCPathComputeOp::verify() {
   return success();
 }
 
+LogicalResult
+DCPathInvokeOp::verifySymbolUses(SymbolTableCollection &symbolTable) {
+  // The callee is a scheduled `func.func` at reify time (an `hw.module` after
+  // emit); accept any symbol so the verifier survives both stages.
+  if (!symbolTable.lookupNearestSymbolFrom(*this, getCalleeAttr()))
+    return emitOpError("references unknown callee '") << getCallee() << "'";
+  return success();
+}
+
+LogicalResult DCPathInvokeOp::verify() {
+  if (getStart() < 0)
+    return emitOpError("start cycle must be non-negative");
+  return success();
+}
+
 LogicalResult DCPathPipelineOp::verify() {
   // `ii` is optional (absent for a data-dependent sequential wrapper); when
   // present it must be a positive initiation interval.

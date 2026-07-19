@@ -9,7 +9,7 @@ add_mlir_library(MLIRAlloMicroarch
     DatapathEmitter.cpp
     HWEmitter.cpp
     Reservation.cpp
-    DataflowTop.cpp
+    ConcurrentEmitter.cpp
     Interface.cpp
 
     DEPENDS

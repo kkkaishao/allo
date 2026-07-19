@@ -14,7 +14,7 @@
 // `out_wr_addr`/`_data`/`_we`, ...). The names are built here, once, from a
 // base name plus the field-suffix vocabulary below -- so the emitter (port
 // declaration + body access), the dataflow-composition wiring, and the cosim
-// harness never re-append suffixes independently and drift.
+// harness never re-append suffixes independently and diverge.
 //
 // The structs carry only strings + ints (arg index, bank, factor, depth, bit
 // width), so the whole model serializes to JSON and crosses the C++/Python seam

@@ -504,7 +504,8 @@ def DCPathPipelineOp : DCPath_Op<"dcp.pipeline",
     OptionalAttr<I64Attr>:$start,
     OptionalAttr<I64Attr>:$length,
     OptionalAttr<I64Attr>:$latency,
-    UnitAttr:$latency_bound);
+    UnitAttr:$latency_bound,
+    OptionalAttr<DeterminacyAttr>:$determinacy);
   let results = (outs Variadic<AnyType>:$results);
   let regions = (region SizedRegion<1>:$body);
   let hasCustomAssemblyFormat = 1;
@@ -537,7 +538,8 @@ def DCPathSequentialOp : DCPath_Op<"dcp.sequential",
     OptionalAttr<I64Attr>:$start,
     OptionalAttr<I64Attr>:$length,
     OptionalAttr<I64Attr>:$latency,
-    UnitAttr:$latency_bound);
+    UnitAttr:$latency_bound,
+    OptionalAttr<DeterminacyAttr>:$determinacy);
   let results = (outs Variadic<AnyType>:$results);
   let regions = (region SizedRegion<1>:$body);
   let hasCustomAssemblyFormat = 1;
@@ -566,7 +568,8 @@ def DCPathSelectOp : DCPath_Op<"dcp.select",
     I1:$condition,
     OptionalAttr<I64Attr>:$start,
     OptionalAttr<I64Attr>:$latency,
-    UnitAttr:$latency_bound);
+    UnitAttr:$latency_bound,
+    OptionalAttr<DeterminacyAttr>:$determinacy);
   let results = (outs Variadic<AnyType>:$results);
   let regions = (region SizedRegion<1>:$then_region,
                         MaxSizedRegion<1>:$else_region);
@@ -593,6 +596,34 @@ def DCPathComputeOp : DCPath_Op<"dcp.compute",
   let assemblyFormat = [{
     $op_type `(` $inputs `)` `at` $start (`on` $unit^)? attr-dict
     `:` functional-type($inputs, $result)
+  }];
+  let hasVerifier = 1;
+}
+
+def DCPathInvokeOp : DCPath_Op<"dcp.invoke",
+    [DeclareOpInterfaceMethods<SymbolUserOpInterface>, ScheduledOpInterface]> {
+  let summary = "A scheduled sub-kernel call (a leaf-datapath CallUnit node)";
+  let description = [{
+    Invokes `callee` at cycle `start` within its region, consuming `inputs` (in
+    callee-argument order: the memref inputs are arrays the child masters -- it drives
+    their addr/data/we -- and the scalar inputs are values it reads) and producing
+    scalar `results` at `start + latency`. References the callee's timing contract
+    (`latency`/`determinacy`) exactly as `dcp.compute` references its
+    `dcp.operator`: a determinate invoke is a fixed-latency node in the datapath F (a
+    pipelined multiplier that also masters ports); an indeterminate one completes on
+    the child's real `done`. `latency` is absent for an indeterminate callee (a
+    `while`/data-dependent child). See drafts/phase-D-implementation-plan.md.
+  }];
+  let arguments = (ins
+    Variadic<AnyType>:$inputs,
+    FlatSymbolRefAttr:$callee,
+    I64Attr:$start,
+    OptionalAttr<I64Attr>:$latency,
+    DeterminacyAttr:$determinacy);
+  let results = (outs Variadic<AnyType>:$results);
+  let assemblyFormat = [{
+    $callee `(` $inputs `)` `at` $start attr-dict
+    `:` functional-type($inputs, $results)
   }];
   let hasVerifier = 1;
 }

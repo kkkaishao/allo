@@ -3,13 +3,6 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-//===----------------------------------------------------------------------===//
-// Control (G): the per-region control regime and its completion signal. Each
-// regime returns a `RegionControl {issue, counter}` and never touches a
-// datapath Source; the datapath's store drain (the deepest store's stage) and
-// the `start` pulse arrive as arguments. See HWEmit.h.
-//===----------------------------------------------------------------------===//
-
 #include "allo/Microarch/HWEmitter.h"
 #include "circt/Dialect/Comb/CombOps.h"
 
@@ -23,7 +16,7 @@ RegionControl ControlEmitter::emitPipelineControl(const uarch::RegionBlock &rb,
                                                   const Terminator &term,
                                                   Value start, Value enable) {
   if (rb.kind == uarch::RegionBlock::Kind::Acyclic)
-    return emitAcyclic(start);
+    return emitAcyclic(start, /*topLevel=*/!rb.parent);
   RegionControl rc = emitPipelined(*rb.ii, term, start, enable);
   // Label the iteration-counter register after the source loop variable (i).
   nameValue(rc.counter, rb.counterName);
@@ -87,17 +80,19 @@ RegionControl ControlEmitter::emitPipelined(int64_t ii, const Terminator &term,
   return {/*issue=*/issue, /*counter=*/iv, /*wantIssue=*/wantIssue};
 }
 
-// Acyclic (straight-line) region: a single pass. The issue is `start` delayed
-// one cycle -- a registered pulse, matching the cyclic regimes' registered
-// `running`. This is what lets an acyclic *child* of a container read the outer
-// counter correctly: the container advances its counter on the child's start
-// pulse, so the new index only settles the next cycle (register semantics),
-// exactly when this registered issue (and a cyclic child's `running`) rises. A
-// top-level acyclic region just runs one cycle later. There is no iteration
-// index of its own.
-RegionControl ControlEmitter::emitAcyclic(Value start) {
-  return {/*issue=*/c.reg(start, c.f1), /*counter=*/Value(),
-          /*wantIssue=*/Value()};
+// Acyclic (straight-line) region: a single pass. A NESTED acyclic child issues
+// `start` delayed one cycle -- a registered pulse, matching the cyclic regimes'
+// registered `running`. This is what lets it read the outer counter correctly:
+// the container advances its counter on the child's start pulse, so the new
+// index only settles the next cycle (register semantics), exactly when this
+// registered issue (and a cyclic child's `running`) rises. A TOP-LEVEL acyclic
+// region has no outer counter, so that register would be pure latency -- it
+// issues on `start` directly, so a pure-seq call container's latency equals its
+// reported schedule depth (no spurious +1). There is no iteration index of its
+// own.
+RegionControl ControlEmitter::emitAcyclic(Value start, bool topLevel) {
+  return {/*issue=*/topLevel ? start : c.reg(start, c.f1),
+          /*counter=*/Value(), /*wantIssue=*/Value()};
 }
 
 // The region's completion signal: one latched level for every regime (cyclic,

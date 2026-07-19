@@ -39,7 +39,7 @@
 #include <utility>
 
 namespace mlir::allo::iface {
-struct ModuleInterface; // the port model threaded to the dataflow-top emitter
+struct ModuleInterface; // the port model threaded to the structural-top emitter
 } // namespace mlir::allo::iface
 
 namespace mlir::allo::uarch {
@@ -92,6 +92,12 @@ struct AccRef {
 /// legality and any residual collision.
 std::string memPortBase(const uarch::Datapath &dp, ArrayRef<AccRef> ports,
                         unsigned i, StringRef role);
+/// The boundary port base for a memref a CallUnit masters: the same
+/// `<name>_<role>` a normal single-access boundary port gets (unindexed -- a
+/// child-mastered arg has no parent access to disambiguate against), so the
+/// interface declaration + emitCalls pass-through + cosim manifest agree.
+std::string memBoundaryPortBase(const uarch::Datapath &dp, uarch::MemId mem,
+                                llvm::StringRef role);
 /// Deterministic name for a scalar-argument port, from its NameLoc (fallback
 /// s<id>).
 std::string scalarPortName(const uarch::IOPort &io);
@@ -118,36 +124,38 @@ std::string cellName(Location loc, StringRef fallback);
 /// order: clk/rst/start, then scalar + stream-input + read-data *inputs*, done,
 /// then stream-output + read-addr + write + result *outputs* (all module inputs
 /// contiguous at the front, as HWModulePortAccessor requires). The single ABI
-/// definition shared by the leaf datapath emitter and the structural (dataflow
-/// / sequential) top, both of which own an `iface::ModuleInterface`.
+/// definition shared by the leaf datapath emitter and the structural top, both
+/// of which own an `iface::ModuleInterface`.
 llvm::SmallVector<circt::hw::PortInfo>
 declareModulePorts(const iface::ModuleInterface &model, OpBuilder &b);
 
+/// Instantiate module \p mod (as instance \p name), wiring its input ports by
+/// name from \p ins and returning its output ports by name. The instance-wiring
+/// substrate shared by the leaf datapath emitter (`emitCalls`) and the
+/// structural top (`instantiateProcesses`): both build the positional operand
+/// vector in port order and collect the results by output-port name.
+llvm::StringMap<Value> instantiateChild(OpBuilder &b, Location loc,
+                                        circt::hw::HWModuleOp mod,
+                                        llvm::StringRef name,
+                                        llvm::StringMap<Value> &ins);
+
 //===----------------------------------------------------------------------===//
-// Dataflow composition: a container function whose scheduled body spawns
-// concurrent processes (`func.call` with the `allo.async` carrier) is lowered
-// to a *structural* top -- not a datapath -- that instantiates each callee's
-// `hw.module`, allocates a `seq.fifo` per internal channel, broadcasts
-// `start`, and AND-reduces the child `done`s. Defined in DataflowTop.cpp.
+// Concurrent composition: a container whose scheduled body spawns concurrent
+// processes (`func.call` with the `allo.async` carrier, or stream-wired calls)
+// is lowered to a *structural* top -- not a datapath -- that instantiates each
+// callee's `hw.module`, allocates a `seq.fifo` per internal channel, broadcasts
+// `start`, and AND-reduces the child `done`s. Defined in ConcurrentTop.cpp.
 //===----------------------------------------------------------------------===//
 
-/// Whether \p func is a dataflow container (its body contains a `func.call`, a
-/// concurrent-spawn edge) rather than a leaf compute kernel.
-bool isDataflowContainer(func::FuncOp func);
-/// Whether \p func is a sequential container: its body contains a plain
-/// (non-async) `func.call` -- an ordered sub-kernel composition (Route B),
-/// distinct from a dataflow container's concurrent `await` spawns. Both are
-/// structural tops (not datapaths).
-bool isSequentialContainer(func::FuncOp func);
-/// Emit the one structural top for a container (dataflow, sequential, or
-/// mixed), wiring the already-emitted callee modules (\p modules, keyed by
+/// Emit the structural top for a concurrent container, wiring the already-
+/// emitted callee modules (\p modules, keyed by
 /// symbol name) into a thin `hw.module`. \p ifaceModels gives each callee's
 /// port model in memory (arg <-> concrete port names), read to classify
 /// boundaries/channels and each child's start policy. The per-child wiring --
 /// broadcast start, static offset, or a `done` handshake; FIFO channel or
 /// shared boundary -- is derived from the schedule and the callees'
-/// determinacy, not a container-wide mode, so df and seq compose in one
-/// construction. A callee may be a leaf kernel or an inner container already
+/// determinacy, not a container-wide mode. A callee may be a leaf kernel or an
+/// inner container already
 /// emitted this pass -- the two are indistinguishable here, which is what lets
 /// composition nest. Inserts the top module at \p b's insertion point; the
 /// caller erases \p container afterward. On success fills \p modOut with the
@@ -159,7 +167,7 @@ bool isSequentialContainer(func::FuncOp func);
 /// `hw.module` takes its callee's symbol name, so a symbol lookup from a
 /// callsite is ambiguous while both live in the module.
 LogicalResult
-emitStructuralTop(func::FuncOp container,
+emitConcurrentTop(func::FuncOp container,
                   const llvm::StringMap<circt::hw::HWModuleOp> &modules,
                   const llvm::StringMap<iface::ModuleInterface> &ifaceModels,
                   const llvm::StringMap<func::FuncOp> &scheduledFuncs,
@@ -254,7 +262,7 @@ struct EmitContext {
   // (`shiftChain`, hence `delayValid` / `activationPulse` / the done drain)
   // advances only while it is high, so the whole datapath freezes coherently on
   // a stream stall and tap alignment is preserved. Null (the default) => an
-  // unconditional pipeline, byte-identical to a stall-free region. Set/cleared
+  // unconditional pipeline, identical to a stall-free region. Set/cleared
   // by the orchestrator around a stream-touching region.
   Value regionEnable;
 
@@ -319,6 +327,13 @@ struct EmitContext {
   /// ~(level delayed one cycle); 0 added latency). The delay reg resets to 0,
   /// so a level held high straight out of reset pulses on cycle 0.
   Value risingEdge(Value level);
+  /// The start pulse of a schedulable node: its region-entry `regionStart` when
+  /// it has no predecessors (independent -- runs with the kernel / container),
+  /// else the rising edge of its predecessors' joined `done` (a handshake; the
+  /// node waits for ALL predecessors). The ONE start policy the region composer
+  /// (composeSiblings), the sequencer (sequence), and the leaf call chain
+  /// (emitCalls) share.
+  Value startFor(Value regionStart, ArrayRef<Value> predDones);
   /// A completion-latch level: set to 1 by \p setPulse, cleared to 0 by
   /// \p start (so a retriggered region re-edges each pass). out[t+1] = start ?
   /// 0 : (setPulse ? 1 : out[t]). The shared done-latch of the container
@@ -426,6 +441,11 @@ struct DatapathFeedback {
   //                 iteration on an available token, else a bubble.
   Value chainEnable;
   Value issueEnable;
+  // The `done` of a CallUnit region's child instance. When set, it IS
+  // the region's completion (a call region completes on the child's real done,
+  // determinate or not), bypassing the store-drain `emitDone`. Null for a
+  // call-free region.
+  Value callDone;
 };
 
 struct ControlEmitter {
@@ -454,7 +474,7 @@ struct ControlEmitter {
   /// stall-free region.
   RegionControl emitPipelined(int64_t ii, const Terminator &term, Value start,
                               Value enable);
-  RegionControl emitAcyclic(Value start);
+  RegionControl emitAcyclic(Value start, bool topLevel);
 
   /// The region's completion signal: one latched level for every regime. It
   /// rises when the last issued iteration's outputs have drained -- \p
@@ -487,8 +507,11 @@ struct DatapathEmitter {
   DenseMap<unsigned, RegionControl> controlOf;
   DenseMap<uint64_t, Value> streamReadData; // (channel id, access idx) -> the
                                             // input-stream data port value
-  DenseMap<uint64_t, Value> survivorOf; // (region id, result idx) -> latched
-                                        // result (accKey-packed)
+  DenseMap<uint64_t, Value> survivorOf;    // (region id, result idx) -> latched
+                                           // result (accKey-packed)
+  DenseMap<uint64_t, Value> callResultVal; // (call id, result idx) -> the child
+                                           // instance's scalar result output
+                                           // (populated by emitCalls)
   DenseMap<unsigned, SmallVector<Value>>
       memBanks; // internal mem id -> its bank hlmem handle(s) (one unless
                 // banked)
@@ -498,24 +521,29 @@ struct DatapathEmitter {
   DenseMap<unsigned, Value> unitVal;             // unit id -> result
   DenseMap<unsigned, Value> muxVal;              // mux id -> resolved output
 
+  // The child modules a `dcp.invoke`'s CallUnit instantiates (null for
+  // a plain leaf with no calls).
+  const uarch::CalleeCtx *callees = nullptr;
+
   DatapathEmitter(EmitContext &c, uarch::Datapath &dp,
                   circt::hw::HWModulePortAccessor &pa, ArrayRef<AccRef> reads,
                   ArrayRef<AccRef> writes,
-                  const DenseMap<unsigned, Operation *> &unitModule)
+                  const DenseMap<unsigned, Operation *> &unitModule,
+                  const uarch::CalleeCtx *callees = nullptr)
       : c(c), dp(dp), pa(pa), reads(reads), writes(writes),
-        unitModule(unitModule) {}
+        unitModule(unitModule), callees(callees) {}
 
   static uint64_t accKey(unsigned m, unsigned a) {
     return (uint64_t(m) << 32) | a;
   }
 
   /// Resolve a datapath Source to the SSA value driving it.
-  Value src(const uarch::Source &s);
+  Value resolveSource(const uarch::Source &s);
   /// The cycle a freshly-produced Source's value lands, relative to the issuing
   /// pulse of the iteration that produced it: a compute unit's op slot + its
   /// latency, a memory read's slot + read latency, or 0 for an at-issue
-  /// constant. The single definition of result-landing timing -- survivor
-  /// capture today, the seam a multi-stage flush / port arbitration reuses.
+  /// constant. The single definition of result-landing timing, used by survivor
+  /// capture.
   unsigned readyCycle(const uarch::Source &s) const;
   /// The linear element address of a memory access (affine map + row-major
   /// linearization over the delayed index sources).
@@ -561,11 +589,34 @@ struct DatapathEmitter {
   /// emitUnits consumes it, like emitInternalReads).
   void emitExternalReads(const uarch::RegionBlock &rb);
   void emitUnits(const uarch::RegionBlock &rb);
+  /// Emit region \p rb's own *combinational* units (start-0 computes with no
+  /// recurrence init): a container's continue-condition or a guard predicate
+  /// reified by the reifier. A restricted `emitUnits` with no
+  /// reduction-identity re-injection (a container has no issue pulse) -- called
+  /// after the counter
+  /// + iter-arg survivors are set and before the children are sequenced, so a
+  /// child guard reads its parent's predicate as a Source::Unit.
+  void emitCombUnits(const uarch::RegionBlock &rb);
   void resolveRegHeads(const uarch::RegionBlock &rb);
   /// External read addresses + all writes (external ports / internal
   /// seq.write), gated by \p issue. Returns the region's store feedback (the
   /// deepest store's stage, `storeDrain`).
   DatapathFeedback emitAccesses(const uarch::RegionBlock &rb, Value issue);
+
+  /// Instantiate each CallUnit (dcp.invoke) in region \p rb as a child
+  /// `hw.instance`: wire clk/rst/`start`; drive/read each mastered
+  /// buffer's hlmem via the child's addr/data/we ports; fold the child's `done`
+  /// into \p fb.callDone (the region's completion). Runs after emitAccesses so
+  /// the buffers' hlmems (createInternalMemories) and the region's own accesses
+  /// are already emitted.
+  void emitCalls(const uarch::RegionBlock &rb, Value issue,
+                 DatapathFeedback &fb);
+
+  /// The child induction-variable scalar port's type for a loop-over-call
+  /// region: the counter must be built to this exact width so
+  /// `resolveSource(Counter)` drives the port with no cast. The IV scalar
+  /// operand is the one whose Source is this region's `Counter`.
+  Type loopIndexPortType(const uarch::RegionBlock &rb);
 
   /// Bind each input stream's `_data` module port into `streamReadData` (once,
   /// before any consumer), so a Source::Stream resolves like a memory read.
@@ -598,9 +649,11 @@ struct HWEmitter {
             circt::hw::HWModulePortAccessor &pa, ArrayRef<AccRef> reads,
             ArrayRef<AccRef> writes,
             const DenseMap<unsigned, Operation *> &unitModule,
-            circt::BackedgeBuilder &bb, Type i1, Type i32)
+            circt::BackedgeBuilder &bb, Type i1, Type i32,
+            const uarch::CalleeCtx *callees = nullptr)
       : ctx(b, loc, bb, i1, i32), control(ctx),
-        datapath(ctx, dp, pa, reads, writes, unitModule), dp(dp), pa(pa) {}
+        datapath(ctx, dp, pa, reads, writes, unitModule, callees), dp(dp),
+        pa(pa) {}
 
   /// The counted terminator of region \p rb: each bound resolved from its
   /// runtime Source (a dynamic trip) or the constant fast path
@@ -613,6 +666,14 @@ struct HWEmitter {
   /// resolve the F->G condition, capture results, done. A container runs its
   /// children once per outer iteration.
   Value emitRegion(const uarch::RegionBlock &rb, Value start, bool retrig);
+  /// A loop-over-call region: a counted `dcp.pipeline` wrapping one
+  /// `dcp.invoke`. One child instance is fired \p tripCount times, a counter
+  /// driving its index and each invocation advancing on the child's real `done`
+  /// (throughput = one iteration per child latency, not the pipeline cadence).
+  /// The counter is the region's `rc.counter` (so `emitCalls` wires the child's
+  /// index port to it) and the child start is `rc.issue`; `done` latches the
+  /// last iteration.
+  Value emitLoopCall(const uarch::RegionBlock &rb, Value start);
   /// The final iteration's issue pulse: a counted region's last iteration
   /// (counter+1 reaches the bound) or a while's condition-false exit; the issue
   /// pulse itself for an acyclic region (a single pass, no counter). The one
@@ -634,17 +695,25 @@ struct HWEmitter {
   /// stage.
   unsigned captureWhileResults(const uarch::RegionBlock &rb,
                                const RegionControl &rc, Value start);
-  /// Run \p regions in program order, each starting on its predecessor's done
-  /// edge (the first on \p start); returns the last region's done (a level).
-  /// The shared done-based sequencer for func-scope siblings (emit) and a
-  /// container's children (emitContainer) alike.
+  /// Run \p regions in program order, each region starting when its predecessor
+  /// drains (the first on \p start); returns the last region's done (a level).
+  /// The shared sequencer for func-scope siblings and a container's children.
   Value sequence(llvm::ArrayRef<uarch::RegionId> regions, Value start,
                  bool retrig);
+  /// Compose the func-scope sibling regions by their dependence DAG
+  /// (`rb.predecessors`): a predecessor-free region starts with the kernel
+  /// \p start (independent siblings run concurrently), the rest on the rising
+  /// edge of their predecessors' joined `done`. Regions emit in program order
+  /// (SSA dominance), and the returned kernel `done` is the conjunction of
+  /// every region's `done` -- it completes when the last region does, whichever
+  /// that is. Degenerates to `sequence` when every region depends on its
+  /// predecessor.
+  Value composeSiblings(llvm::ArrayRef<uarch::RegionId> regions, Value start);
   /// Set up a container's loop-carried iter-args as frozen survivor registers
   /// (latch each `inits[k]` at \p start, advance on \p advance), record each as
   /// Source::Survivor{rb, k}, and return the per-arg next-value backedges (set
-  /// to `src(nexts[k])` after the children emit). Shared by the counted and
-  /// conditional container regimes.
+  /// to `resolveSource(nexts[k])` after the children emit). Shared by the
+  /// counted and conditional container regimes.
   llvm::SmallVector<circt::Backedge>
   setupCarriedIterArgs(const uarch::RegionBlock &rb,
                        llvm::ArrayRef<uarch::Source> inits, Value start,
@@ -669,11 +738,6 @@ struct HWEmitter {
   /// emitConditionalContainer: no iteration / iter-args (the predicate does not
   /// depend on the children).
   Value emitGuard(const uarch::RegionBlock &rb, Value start);
-  /// Lower the unscheduled combinational arith tree \p v of a conditional
-  /// container's continue-condition to comb, mapping the container's iter-arg
-  /// block-args to their survivor registers and reusing emitCompute for each
-  /// op.
-  Value evalRawArith(Value v, const uarch::RegionBlock &container);
   /// Emit the whole module body: preamble + each top-level region in order.
   void emit();
 };

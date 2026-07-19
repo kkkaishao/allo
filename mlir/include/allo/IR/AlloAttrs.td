@@ -116,4 +116,28 @@ def MemoryKindEnum : I32EnumAttr<"MemoryKindEnum",
 }
 def MemoryKindAttr : EnumAttr<Allo_Dialect, MemoryKindEnum, "mem_kind">;
 
+//===----------------------------------------------------------------------===//
+// Determinacy: the scheduling-determinacy class of a dcp region / kernel -- the
+// discriminant that selects the controller regime (drafts/dcp-to-microarch-
+// theory.md) and the composition wiring (time-triggered vs handshake vs
+// broadcast). Declared in the IR (set by the reifier) rather than re-derived at
+// every consumer (drafts/emitter-systematization-guideline.md, Phase B).
+//   * counted_static -- exact compile-time latency (static trip / length);
+//   * conditional    -- a while loop / data-dependent guard (flushing exit);
+//   * indeterminate  -- dynamic-trip / bounded / unknown-length (no exact span);
+//   * concurrent     -- a dataflow container (async spawns; self-timed).
+//===----------------------------------------------------------------------===//
+
+def DetCountedStatic : I32EnumAttrCase<"CountedStatic", 0, "counted_static">;
+def DetConditional   : I32EnumAttrCase<"Conditional",   1, "conditional">;
+def DetIndeterminate : I32EnumAttrCase<"Indeterminate", 2, "indeterminate">;
+def DetConcurrent    : I32EnumAttrCase<"Concurrent",    3, "concurrent">;
+def DeterminacyEnum : I32EnumAttr<"DeterminacyEnum",
+    "Scheduling-determinacy class of a dcp region / kernel",
+    [DetCountedStatic, DetConditional, DetIndeterminate, DetConcurrent]> {
+  let cppNamespace = "mlir::allo";
+  let genSpecializedAttr = 0;
+}
+def DeterminacyAttr : EnumAttr<Allo_Dialect, DeterminacyEnum, "determinacy">;
+
 #endif // ALLO_ATTRS

@@ -3,38 +3,6 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-//===----------------------------------------------------------------------===//
-// Kernel composition: the one structural top (dataflow, sequential, mixed).
-//
-// A container function whose scheduled body calls sub-kernels -- an `await
-// callee(...)` (a `func.call` with `allo.async`, a concurrent spawn) or a plain
-// `callee(...)` (an ordered sub-kernel) -- is not a datapath. It lowers to a
-// thin *structural* `hw.module` that instantiates each callee's already-emitted
-// `hw.module` (leaves and inner containers, emitted first; this file wires
-// them) and drives their `start`/`done`. Dataflow and sequential composition
-// are the same construction; they differ only in per-child wiring, derived from
-// the schedule and the callees' determinacy rather than a container-wide mode:
-//
-//   * channel -- an internal `allo.stream.create` becomes a `seq.fifo` carrying
-//     a {data,valid,ready} handshake (the FIFO's `full`/`empty` drive the LI
-//     leaves' back-pressure/starvation); a shared boundary array is passed to a
-//     writer child and a reader child, accessed serially (distinct port roles);
-//   * start -- an async spawn broadcasts the region `start` (self-timed); a
-//     child ordered after a DETERMINATE producer fires at its scheduled offset
-//     (a static fixed-latency node, Route B); a child ordered after an
-//     INDETERMINATE producer (async / data-dependent) fires on the rising edge
-//     of that producer's `done` (a handshake, Route A -- `sequence()`'s
-//     region hand-off lifted to `hw.instance`s);
-//   * done -- AND-reduce every child `done` into the region `done` (join).
-//
-// The container's own memref/scalar arguments are boundaries: each is forwarded
-// to its using child(ren) and mirrored as a top port, so cosim drives the
-// composed design exactly as a single kernel. Stream channels are
-// single-producer / single-consumer, and may carry initial tokens (feedback
-// seeding). A shared boundary array must be ordered (one child gated on the
-// other), never touched by two concurrent unordered children.
-//===----------------------------------------------------------------------===//
-
 #include "allo/IR/AlloOps.h" // StreamCreateOp, kAlloAsyncAttr
 #include "allo/Microarch/HWEmitter.h"
 #include "allo/Microarch/Interface.h" // iface field-name suffixes / helpers
@@ -46,7 +14,6 @@
 #include "circt/Support/BackedgeBuilder.h"
 
 #include "mlir/Dialect/Func/IR/FuncOps.h"
-#include "mlir/Dialect/MemRef/IR/MemRef.h" // AllocOp (internal shared buffer)
 #include "llvm/ADT/MapVector.h"
 #include "llvm/ADT/STLExtras.h" // is_contained
 
@@ -58,35 +25,11 @@ using namespace circt;
 
 namespace mlir::allo::uarch {
 
-bool isDataflowContainer(func::FuncOp func) {
-  // A dataflow container spawns concurrent processes: a `func.call` carrying
-  // the `allo.async` attribute (an `await` in the frontend). A leaf compute
-  // kernel has none; a plain (non-async) call is a sequential compose left on
-  // the datapath path.
-  bool found = false;
-  func.walk([&](func::CallOp call) {
-    if (call->hasAttr(kAlloAsyncAttr))
-      found = true;
-  });
-  return found;
-}
-
-bool isSequentialContainer(func::FuncOp func) {
-  // A sequential container composes ordered sub-kernels via plain (non-async)
-  // `func.call`s -- the Route-B dual of a dataflow container's `await` spawns.
-  bool found = false;
-  func.walk([&](func::CallOp call) {
-    if (!call->hasAttr(kAlloAsyncAttr))
-      found = true;
-  });
-  return found;
-}
-
 // A loop-over-calls container: a single sync sub-kernel call inside one counted
 // `dcp.pipeline` (the reified loop) directly in the container body -- one child
 // instance invoked N times, driven by a loop counter (vs. a flat call graph).
-// Returns the loop, or null if `func` is not this shape. First cut: exactly one
-// call, one counted loop.
+// Returns the loop, or null if `func` is not this shape (exactly one call, one
+// counted loop).
 static dcp::DCPathPipelineOp loopOverCall(func::FuncOp func) {
   SmallVector<func::CallOp> calls;
   func.walk([&](func::CallOp c) {
@@ -144,40 +87,6 @@ struct Chan {
   ArrayAttr init; // initial tokens (feedback seeding), null when unseeded
 };
 
-// One child access to a container-internal buffer (a shared `memref.alloc`, not
-// a boundary argument): which instance, the callee's own port names, and -- for
-// a read -- the data-input backedge, resolved once the hlmem read port exists
-// (the port needs the child's own address output, which the instance produces).
-struct IMemAccess {
-  unsigned inst;
-  std::string addr, data, we; // callee port names (`we` empty for a read)
-  bool isWrite;
-  unsigned bank; // which bank of the buffer this port serves (0 unbanked)
-  Backedge rdData;
-};
-
-// A container-internal buffer shared across children -> on-chip `seq.hlmem` in
-// the top (vs. a boundary argument, which mirrors to top ports and is
-// cosim-backed). A partitioned buffer becomes ONE hlmem PER BANK: the children
-// were compiled against the same `allo.part` (propagate-partition pushes it
-// onto every callee parameter before scheduling), so each drives a port group
-// per bank, already addressed in that bank's own index space -- bank k wires
-// straight to hlmem k, with no crossbar.
-struct InternalMem {
-  Type elemType;
-  int64_t total = 0;          // elements in the whole buffer
-  unsigned factor = 1;        // banks (1 = unpartitioned)
-  SmallVector<Value> handles; // one hlmem per bank, created in buildBody
-  SmallVector<IMemAccess> accs;
-};
-
-// Elements in cyclic bank \p bank, which holds bank, bank+F, bank+2F, ... --
-// the same slice the cosim harness gives a banked argument (`Mem.slice_in`), so
-// an internal buffer and a boundary array bank identically.
-static int64_t bankDepth(int64_t total, unsigned factor, unsigned bank) {
-  return (total - int64_t(bank) + factor - 1) / factor;
-}
-
 // One container-boundary port mirrored onto the top: the top-side name (derived
 // from the container argument, so distinct arguments never collide) and the
 // instance-side name (the callee's own port), plus type/direction/owner.
@@ -206,12 +115,12 @@ struct ChanWires {
 };
 
 //===----------------------------------------------------------------------===//
-// Builds the structural top for one dataflow container, in phases: discover the
+// Builds the structural top for one concurrent container, in phases: discover
 // process instances and their channels, check feedback seeding, plan the
 // boundary ports, then emit the module body (channel wires, instances, FIFOs,
 // fork/join).
 //===----------------------------------------------------------------------===//
-struct DataflowTopBuilder {
+struct ConcurrentTopBuilder {
   func::FuncOp container;
   // Callee module + port model tables, holding leaf kernels *and* inner
   // containers already emitted this pass (a container is composed exactly like
@@ -229,24 +138,16 @@ struct DataflowTopBuilder {
 
   SmallVector<Inst> insts;
   llvm::MapVector<Value, Chan> chans; // keyed by the stream.create result
-  llvm::MapVector<Value, InternalMem> imems; // keyed by the memref.alloc result
   SmallVector<Mirror> mirrors;
   iface::ModuleInterface topIface; // the composed top's port model
-
-  // Set iff the container is a loop-over-calls (one child invoked N times by a
-  // loop counter); null for a flat call-graph container. Its induction variable
-  // (block argument 0) drives the child's index input (not a boundary port) and
-  // its trip count sets the loop controller (buildLoopCallBody).
-  dcp::DCPathPipelineOp loopOp;
 
   // Body-scope wires, valid only while emitting the module body.
   Value clkRaw, clk, rst, start, tru;
 
-  DataflowTopBuilder(func::FuncOp container,
-                     const llvm::StringMap<hw::HWModuleOp> &modules,
-                     const llvm::StringMap<iface::ModuleInterface> &ifaceModels,
-                     const llvm::StringMap<func::FuncOp> &scheduledFuncs,
-                     OpBuilder &b)
+  ConcurrentTopBuilder(
+      func::FuncOp container, const llvm::StringMap<hw::HWModuleOp> &modules,
+      const llvm::StringMap<iface::ModuleInterface> &ifaceModels,
+      const llvm::StringMap<func::FuncOp> &scheduledFuncs, OpBuilder &b)
       : container(container), modules(modules), ifaceModels(ifaceModels),
         scheduledFuncs(scheduledFuncs), b(b), ctx(b.getContext()),
         loc(container.getLoc()), i1(b.getI1Type()) {}
@@ -254,23 +155,19 @@ struct DataflowTopBuilder {
   LogicalResult run(hw::HWModuleOp &modOut, iface::ModuleInterface &ifaceOut);
 
   void collectInstances();
-  void computeGates();
-  void discoverInternalMems();
+  void computeStartGates();
   LogicalResult discoverChannels();
   LogicalResult checkFeedbackSeeding();
   void planBoundaryPorts();
   void buildBody(OpBuilder &ib, hw::HWModulePortAccessor &pa);
-  void buildLoopCallBody(OpBuilder &ib, hw::HWModulePortAccessor &pa);
   llvm::MapVector<Value, ChanWires> buildChannelWires(OpBuilder &ib,
                                                       BackedgeBuilder &bb);
-  void createInternalMems(OpBuilder &ib, BackedgeBuilder &bb);
   void instantiateProcesses(OpBuilder &ib, hw::HWModulePortAccessor &pa,
                             llvm::MapVector<Value, ChanWires> &cw);
   void wireFifos(OpBuilder &ib, llvm::MapVector<Value, ChanWires> &cw);
-  void wireInternalMems(OpBuilder &ib);
   void forkJoin(OpBuilder &ib, hw::HWModulePortAccessor &pa);
 
-  Value notv(OpBuilder &ib, Value x) {
+  Value notBit(OpBuilder &ib, Value x) {
     return comb::XorOp::create(ib, loc, x, tru, false).getResult();
   }
 
@@ -282,7 +179,7 @@ struct DataflowTopBuilder {
     Value zero = hw::ConstantOp::create(ib, loc, i1, 0);
     Value prev =
         seq::CompRegOp::create(ib, loc, level, clk, rst, zero, "done_edge");
-    return comb::AndOp::create(ib, loc, level, notv(ib, prev), false)
+    return comb::AndOp::create(ib, loc, level, notBit(ib, prev), false)
         .getResult();
   }
 
@@ -299,27 +196,8 @@ struct DataflowTopBuilder {
   }
 };
 
-// A callee whose start->done span is a compile-time constant: a leaf (or nested
-// sequential container) carrying an exact `dcp.latency`. As a producer it
-// releases a consumer at a static offset (Route B). An async spawn, a
-// data-dependent (`while`) leaf with no latency, a bounded (dynamic-trip)
-// latency, or a dataflow sub-network are all INDETERMINATE -- a consumer must
-// wait on the real `done` (Route A), not a static offset.
-//
-// The callee is resolved through \p funcs, not a symbol lookup: its `hw.module`
-// is emitted before this container and takes the same symbol name, so a lookup
-// from the callsite may land on the module rather than the source `func.func`.
-static bool calleeDeterminate(func::CallOp call,
-                              const llvm::StringMap<func::FuncOp> &funcs) {
-  if (call->hasAttr(kAlloAsyncAttr))
-    return false;
-  func::FuncOp callee = funcs.lookup(call.getCallee());
-  return callee && callee->hasAttr("dcp.latency") &&
-         !callee->hasAttr("dcp.latency_bound") && !isDataflowContainer(callee);
-}
-
 // Collect the spawned process instances, in program order.
-void DataflowTopBuilder::collectInstances() {
+void ConcurrentTopBuilder::collectInstances() {
   container.walk([&](func::CallOp call) {
     hw::HWModuleOp mod = modules.lookup(call.getCallee());
     auto it = ifaceModels.find(call.getCallee());
@@ -329,6 +207,21 @@ void DataflowTopBuilder::collectInstances() {
     int64_t off = 0;
     if (auto s = call->getAttrOfType<IntegerAttr>("start"))
       off = s.getInt();
+    // Determinate (Route B): a non-async callee whose whole-kernel span is
+    // exact (`counted_static`), so it releases a consumer at a static offset
+    // rather than on its real `done`. Read the reifier-stamped
+    // `dcp.determinacy` instead of re-deriving it. The callee is resolved
+    // through `scheduledFuncs`, not a symbol lookup: its `hw.module` shares the
+    // symbol name, so a callsite lookup may land on the module, not the
+    // `func.func`.
+    bool determinate = false;
+    if (!call->hasAttr(kAlloAsyncAttr)) {
+      func::FuncOp callee = scheduledFuncs.lookup(call.getCallee());
+      auto det =
+          callee ? callee->getAttrOfType<DeterminacyEnumAttr>("dcp.determinacy")
+                 : DeterminacyEnumAttr();
+      determinate = det && det.getValue() == DeterminacyEnum::CountedStatic;
+    }
     insts.push_back({call,
                      mod,
                      &it->second,
@@ -336,7 +229,7 @@ void DataflowTopBuilder::collectInstances() {
                      {},
                      off,
                      call->hasAttr(kAlloAsyncAttr),
-                     calleeDeterminate(call, scheduledFuncs),
+                     determinate,
                      {}});
   });
 }
@@ -358,7 +251,7 @@ void DataflowTopBuilder::collectInstances() {
 // still fires at its own scheduled offset, concurrently -- and only forgoes
 // overlap against an indeterminate producer, whose completion the emitter
 // cannot place statically anyway.
-void DataflowTopBuilder::computeGates() {
+void ConcurrentTopBuilder::computeStartGates() {
   auto memOperands = [](Inst &in, bool write) {
     SmallVector<Value> vs;
     for (const auto &grp : write ? in.mi->writes : in.mi->reads)
@@ -384,55 +277,13 @@ void DataflowTopBuilder::computeGates() {
   }
 }
 
-// A child memref operand that is a local `memref.alloc` (not a container
-// argument) is a shared internal buffer: it lowers to on-chip `seq.hlmem` in
-// the top rather than a boundary port -- one hlmem per bank. Record each
-// child's access to it. Each access becomes its own hlmem port
-// (`wireInternalMems`), so several writers need no arbitration for the same
-// reason several boundary writers need no mux: the scheduler orders any pair
-// that may hazard, and leaves unordered only pairs that are read-only or write
-// provably disjoint elements.
-void DataflowTopBuilder::discoverInternalMems() {
-  for (unsigned ii = 0; ii < insts.size(); ++ii) {
-    Inst &in = insts[ii];
-    auto scan = [&](const std::vector<std::vector<iface::Memory>> &accs,
-                    bool write) {
-      for (const auto &grp : accs)
-        for (const iface::Memory &cm : grp) {
-          Value v = in.call.getOperand(cm.arg);
-          if (isa<BlockArgument>(v))
-            continue; // a boundary argument -> planBoundaryPorts
-          assert(v.getDefiningOp<memref::AllocOp>() &&
-                 "an internal shared memref must be a local memref.alloc");
-          InternalMem &im = imems[v];
-          im.elemType = in.ports[cm.data].type;
-          // Every child is compiled against the buffer's own `allo.part`
-          // (propagate-partition), so they agree on the bank count.
-          assert((im.accs.empty() || im.factor == (unsigned)cm.factor) &&
-                 "children disagree on a shared buffer's partition factor");
-          im.factor = cm.factor;
-          im.total = cast<MemRefType>(v.getType()).getNumElements();
-          im.accs.push_back({ii,
-                             cm.addr,
-                             cm.data,
-                             write ? cm.we : std::string(),
-                             write,
-                             (unsigned)cm.bank,
-                             {}});
-        }
-    };
-    scan(in.mi->reads, /*write=*/false);
-    scan(in.mi->writes, /*write=*/true);
-  }
-}
-
 // Discover channels from each `stream.create` and its producer/consumer.
 // Channels are single-producer / single-consumer. A stream read by two
 // processes (SPMC broadcast) or written by two (MPSC merge) is reported as a
 // user-facing error rather than an internal assert -- broadcast is not inserted
 // automatically (write one channel per consumer), and deterministic merge is
-// not supported yet.
-LogicalResult DataflowTopBuilder::discoverChannels() {
+// not supported.
+LogicalResult ConcurrentTopBuilder::discoverChannels() {
   for (unsigned ii = 0; ii < insts.size(); ++ii) {
     Inst &in = insts[ii];
     for (const iface::FIFO &f : in.mi->streams) {
@@ -508,7 +359,7 @@ LogicalResult DataflowTopBuilder::discoverChannels() {
 // through the logger, with the container as the error subject (which marks the
 // failure for the Python caller to raise). Insufficient seeding -- fewer tokens
 // than the recurrence distance -- is not caught here; it surfaces as a hang.
-LogicalResult DataflowTopBuilder::checkFeedbackSeeding() {
+LogicalResult ConcurrentTopBuilder::checkFeedbackSeeding() {
   unsigned n = insts.size();
   SmallVector<SmallVector<unsigned>> adj(n); // producer -> consumer, unseeded
   for (auto &kv : chans) {
@@ -567,7 +418,7 @@ LogicalResult DataflowTopBuilder::checkFeedbackSeeding() {
 // top-side port name derives from the container argument (via its NameLoc) so
 // two arguments never collide even when callees name their params the same;
 // direction and width come straight from the callee port.
-void DataflowTopBuilder::planBoundaryPorts() {
+void ConcurrentTopBuilder::planBoundaryPorts() {
   // A boundary argument may be shared by SEVERAL children, and what that costs
   // depends on the kind of boundary:
   //
@@ -617,9 +468,6 @@ void DataflowTopBuilder::planBoundaryPorts() {
   for (unsigned ii = 0; ii < insts.size(); ++ii) {
     Inst &in = insts[ii];
     for (const iface::Scalar &sc : in.mi->scalars) {
-      if (loopOp &&
-          in.call.getOperand(sc.arg) == loopOp.getBody().front().getArgument(0))
-        continue; // the loop IV -> driven by the loop counter, not a boundary
       // One top port per scalar argument, fanned out: children sharing an
       // argument bind the same port (a value costs nothing to share).
       int64_t arg = topArg(in, sc.arg);
@@ -695,7 +543,7 @@ void DataflowTopBuilder::planBoundaryPorts() {
 // One ChanWires per channel: FIFO status/output backedges (resolved in
 // wireFifos) plus, for a seeded channel, the consumer-side init-prepend shim.
 llvm::MapVector<Value, ChanWires>
-DataflowTopBuilder::buildChannelWires(OpBuilder &ib, BackedgeBuilder &bb) {
+ConcurrentTopBuilder::buildChannelWires(OpBuilder &ib, BackedgeBuilder &bb) {
   llvm::MapVector<Value, ChanWires> cw;
   for (auto &kv : chans) {
     Chan &c = kv.second;
@@ -703,8 +551,8 @@ DataflowTopBuilder::buildChannelWires(OpBuilder &ib, BackedgeBuilder &bb) {
     w.full = bb.get(i1);
     w.empty = bb.get(i1);
     w.dataOut = bb.get(c.payload);
-    w.notFull = notv(ib, w.full);
-    w.notEmpty = notv(ib, w.empty);
+    w.notFull = notBit(ib, w.full);
+    w.notEmpty = notBit(ib, w.empty);
     if (c.init && !c.init.empty()) {
       unsigned k = c.init.size();
       unsigned remW = 1;
@@ -747,35 +595,10 @@ DataflowTopBuilder::buildChannelWires(OpBuilder &ib, BackedgeBuilder &bb) {
   return cw;
 }
 
-// One `seq.hlmem` per shared internal buffer, plus a read-data backedge per
-// read access (resolved in wireInternalMems, once the reading instance's
-// address output exists). Built before the instances so a reader's data input
-// can bind to the backedge.
-void DataflowTopBuilder::createInternalMems(OpBuilder &ib,
-                                            BackedgeBuilder &bb) {
-  for (auto &kv : imems) {
-    InternalMem &im = kv.second;
-    std::string base = cellName(kv.first.getLoc(), "buf");
-    // One hlmem per bank: a partitioned buffer is N independent memories, which
-    // is the whole point (each child drives a port group per bank, so the banks
-    // are accessed in the same cycle).
-    for (unsigned b = 0; b < im.factor; ++b) {
-      std::string name = im.factor > 1 ? base + std::to_string(b) : base;
-      auto mem = seq::HLMemOp::create(
-          ib, loc, clk, rst, name,
-          ArrayRef<int64_t>{bankDepth(im.total, im.factor, b)}, im.elemType);
-      im.handles.push_back(mem.getHandle());
-    }
-    for (IMemAccess &a : im.accs)
-      if (!a.isWrite)
-        a.rdData = bb.get(im.elemType);
-  }
-}
-
 // Instantiate each process: wire clk/rst/start, its stream ports (through the
 // channel wires / init shim), and its mirrored boundary inputs; collect the
 // instance's outputs by port name.
-void DataflowTopBuilder::instantiateProcesses(
+void ConcurrentTopBuilder::instantiateProcesses(
     OpBuilder &ib, hw::HWModulePortAccessor &pa,
     llvm::MapVector<Value, ChanWires> &cw) {
   for (unsigned ii = 0; ii < insts.size(); ++ii) {
@@ -823,33 +646,16 @@ void DataflowTopBuilder::instantiateProcesses(
     for (const Mirror &m : mirrors)
       if (m.inst == ii && m.isInput)
         ins[m.calleeName] = pa.getInput(m.topName);
-    // Internal-buffer read data: bound to this child's hlmem read-port backedge
-    // (resolved in wireInternalMems from the child's own address output).
-    for (auto &kv : imems)
-      for (IMemAccess &a : kv.second.accs)
-        if (a.inst == ii && !a.isWrite)
-          ins[a.data] = a.rdData;
 
-    SmallVector<Value> operands(in.mod.getNumInputPorts());
-    for (const hw::PortInfo &p : in.mod.getPortList())
-      if (p.dir == Dir::Input) {
-        auto it = ins.find(p.name.getValue());
-        assert(it != ins.end() && "unwired process input port");
-        operands[p.argNum] = it->second;
-      }
-    auto inst =
-        hw::InstanceOp::create(ib, loc, in.mod, in.call.getCallee(), operands);
-    for (const hw::PortInfo &p : in.mod.getPortList())
-      if (p.dir == Dir::Output)
-        in.outs[p.name.getValue()] = inst.getResult(p.argNum);
+    in.outs = instantiateChild(ib, loc, in.mod, in.call.getCallee(), ins);
   }
 }
 
 // A `seq.fifo` per channel, wired to the producer/consumer handshakes; resolve
 // the channel backedges. A seeded channel pops the FIFO only once its init
 // tokens drain and advances the shim's down-counter on each init-served read.
-void DataflowTopBuilder::wireFifos(OpBuilder &ib,
-                                   llvm::MapVector<Value, ChanWires> &cw) {
+void ConcurrentTopBuilder::wireFifos(OpBuilder &ib,
+                                     llvm::MapVector<Value, ChanWires> &cw) {
   for (auto &kv : chans) {
     Chan &c = kv.second;
     ChanWires &w = cw[kv.first];
@@ -859,7 +665,8 @@ void DataflowTopBuilder::wireFifos(OpBuilder &ib,
     Value wrEn = comb::AndOp::create(ib, loc, pValid, w.notFull, false);
     Value rdEn = comb::AndOp::create(ib, loc, cReady, w.notEmpty, false);
     if (w.rem) {
-      rdEn = comb::AndOp::create(ib, loc, rdEn, notv(ib, w.servingInit), false);
+      rdEn =
+          comb::AndOp::create(ib, loc, rdEn, notBit(ib, w.servingInit), false);
       Value doInit = comb::AndOp::create(ib, loc, w.servingInit, cReady, false);
       Value one = hw::ConstantOp::create(ib, loc, w.rem.getType(), 1);
       Value dec = comb::SubOp::create(ib, loc, w.rem, one);
@@ -875,43 +682,10 @@ void DataflowTopBuilder::wireFifos(OpBuilder &ib,
   }
 }
 
-// Wire each shared internal buffer's ports to its hlmem(s): a writer's
-// {addr,data,we} instance outputs drive a seq.write; a reader's address output
-// drives a seq.read (1-cycle -- the registered-RAM latency the reader was
-// compiled against, matching the cosim boundary contract) whose data resolves
-// the reader's data-input backedge. A banked buffer routes each port group to
-// its own bank's hlmem -- the child already addresses that bank's index space
-// (the same slice the cosim harness gives a banked argument), so no crossbar.
-// The child drives a full-width flat address; an hlmem port takes the
-// clog2(depth)-bit index, so narrow it.
-void DataflowTopBuilder::wireInternalMems(OpBuilder &ib) {
-  for (auto &kv : imems) {
-    InternalMem &im = kv.second;
-    for (IMemAccess &a : im.accs) {
-      unsigned w = llvm::Log2_64_Ceil(bankDepth(im.total, im.factor, a.bank));
-      assert(w > 0 && "a shared single-element internal buffer bank is "
-                      "unsupported");
-      Inst &in = insts[a.inst];
-      Value addr = comb::ExtractOp::create(ib, loc, ib.getIntegerType(w),
-                                           in.outs[a.addr], 0)
-                       .getResult();
-      Value mem = im.handles[a.bank];
-      if (a.isWrite)
-        seq::WritePortOp::create(ib, loc, mem, ValueRange{addr},
-                                 in.outs[a.data], in.outs[a.we],
-                                 ib.getI64IntegerAttr(1));
-      else
-        a.rdData.setValue(
-            seq::ReadPortOp::create(ib, loc, mem, ValueRange{addr},
-                                    /*rdEn=*/Value(), /*latency=*/1)
-                .getReadData());
-    }
-  }
-}
-
 // Join: done = AND of every process `done` (each a latched level); drive the
 // mirrored boundary outputs from their owning instance.
-void DataflowTopBuilder::forkJoin(OpBuilder &ib, hw::HWModulePortAccessor &pa) {
+void ConcurrentTopBuilder::forkJoin(OpBuilder &ib,
+                                    hw::HWModulePortAccessor &pa) {
   Value done;
   for (Inst &in : insts) {
     Value d = in.outs["done"];
@@ -923,122 +697,57 @@ void DataflowTopBuilder::forkJoin(OpBuilder &ib, hw::HWModulePortAccessor &pa) {
       pa.setOutput(m.topName, insts[m.inst].outs[m.calleeName]);
 }
 
-void DataflowTopBuilder::buildBody(OpBuilder &ib,
-                                   hw::HWModulePortAccessor &pa) {
+void ConcurrentTopBuilder::buildBody(OpBuilder &ib,
+                                     hw::HWModulePortAccessor &pa) {
   BackedgeBuilder bb(ib, loc);
   clkRaw = pa.getInput("clk");
   rst = pa.getInput("rst");
   start = pa.getInput("start");
   clk = seq::ToClockOp::create(ib, loc, clkRaw);
   tru = hw::ConstantOp::create(ib, loc, i1, 1);
-  if (loopOp) {
-    buildLoopCallBody(ib, pa);
-    return;
-  }
   llvm::MapVector<Value, ChanWires> cw = buildChannelWires(ib, bb);
-  createInternalMems(ib, bb);
   instantiateProcesses(ib, pa, cw);
   wireFifos(ib, cw);
-  wireInternalMems(ib);
   forkJoin(ib, pa);
 }
 
-// The loop-over-calls controller: one child instance invoked N times (`for i in
-// range(N): child(..., i)`). A counter drives the child's index input; the
-// child is re-fired on each `done` rising edge -- its own `start` clears and
-// re-raises `done`, so every invocation yields a fresh edge. The container's
-// memref/scalar boundaries mirror to the top exactly once (one instance is live
-// at a time, so no per-iteration muxing -- the child computes A[i]/B[i] from
-// its index input). `done` latches after the last iteration. First cut: a
-// constant `0 to N step 1` trip; general affine bounds and pipelining (call
-// overlap) are follow-ons.
-void DataflowTopBuilder::buildLoopCallBody(OpBuilder &ib,
-                                           hw::HWModulePortAccessor &pa) {
-  int64_t N = loopOp.getTrip().value_or(0);
-  assert(N >= 1 && loopOp.getLb().value_or(0) == 0 &&
-         loopOp.getStep().value_or(1) == 1 &&
-         "loop-over-calls first cut supports a `0 to N step 1` trip");
+LogicalResult ConcurrentTopBuilder::run(hw::HWModuleOp &modOut,
+                                        iface::ModuleInterface &ifaceOut) {
+  // The router sends only a CONCURRENT container here (the structural top wires
+  // already-emitted callee instances + channels + shared memory; it emits no
+  // datapath of its own). A concurrent container with its OWN loose
+  // `dcp.load`/`store`/`compute` at the top level (datapath work beside the
+  // `await` network, not inside a spawned child) is unmodellable here -- it
+  // would silently drop the loose region or mis-wire a cross-region survivor.
+  // Reject it loudly rather than miscompile. (A non-concurrent container's
+  // loose ops lower on the leaf; async processes and the mixed container's sync
+  // child carry their datapath inside their own callee, so a concurrent
+  // container's top-level body is loose-free in practice.)
+  bool looseDatapath = false;
+  container.walk([&](Operation *op) {
+    if (isa<dcp::DCPathLoadOp, dcp::DCPathStoreOp, dcp::DCPathComputeOp>(op))
+      looseDatapath = true;
+  });
+  if (looseDatapath)
+    return container.emitError(
+        "allo-datapath-to-hw: a concurrent (dataflow) container with its own "
+        "top-level datapath ops (loose load/store/compute beside the process "
+        "network) is not supported; the structural top composes child "
+        "instances "
+        "+ channels only");
 
-  Inst &in = insts[0];
-  Value iv = loopOp.getBody().front().getArgument(0);
-  // The child scalar port fed by the loop induction variable.
-  const iface::Scalar *ivSc = nullptr;
-  for (const iface::Scalar &sc : in.mi->scalars)
-    if (in.call.getOperand(sc.arg) == iv) {
-      ivSc = &sc;
-      break;
-    }
-  assert(ivSc && "loop-over-calls: the induction variable is not a child arg");
-  Type ivType = in.ports[ivSc->name].type;
+  // A loop-over-calls container lowers to the leaf CallUnit path; reaching the
+  // structural top means its callee is not leaf-eligible (a banked buffer, an
+  // indeterminate child). Reject loudly rather than mis-wire it as a flat call
+  // graph (the child would fire once, not once per iteration).
+  if (loopOverCall(container))
+    return container.emitError("allo-datapath-to-hw: a loop-over-calls "
+                               "container must lower to the leaf CallUnit "
+                               "path; its callee is not leaf-eligible (a "
+                               "banked or indeterminate callee)");
 
-  BackedgeBuilder bb(ib, loc);
-  Value f1 = hw::ConstantOp::create(ib, loc, i1, 0);
-  auto kconst = [&](int64_t v) -> Value {
-    return hw::ConstantOp::create(ib, loc, ivType, v);
-  };
-
-  // Loop counter + control. The child `done` is a held level that clears on its
-  // `start`, so its rising edge marks each invocation's completion.
-  Backedge doneBE = bb.get(i1);
-  Value doneEdge = risingEdge(ib, doneBE);
-  Backedge kNextBE = bb.get(ivType);
-  Value k =
-      seq::CompRegOp::create(ib, loc, kNextBE, clk, rst, kconst(0), "loop_iv");
-  Value more = comb::ICmpOp::create(ib, loc, comb::ICmpPredicate::ult, k,
-                                    kconst(N - 1)); // more iterations after k
-  Value advance = comb::AndOp::create(ib, loc, doneEdge, more, false);
-  Value kInc = comb::AddOp::create(ib, loc, k, kconst(1), false);
-  Value kAdv = comb::MuxOp::create(ib, loc, advance, kInc, k);
-  kNextBE.setValue(comb::MuxOp::create(ib, loc, start, kconst(0), kAdv));
-  // Fire the next iteration one cycle after the done edge, when k has updated.
-  Value fireNext =
-      seq::CompRegOp::create(ib, loc, advance, clk, rst, f1, "loop_fire");
-  Value childStart = comb::OrOp::create(ib, loc, start, fireNext, false);
-
-  // Instantiate the single child: start = the loop controller, index = k,
-  // boundary inputs from the mirrored top ports.
-  llvm::StringMap<Value> ins;
-  ins["clk"] = clkRaw;
-  ins["rst"] = rst;
-  ins["start"] = childStart;
-  ins[ivSc->name] = k;
-  for (const Mirror &m : mirrors)
-    if (m.isInput)
-      ins[m.calleeName] = pa.getInput(m.topName);
-  SmallVector<Value> operands(in.mod.getNumInputPorts());
-  for (const hw::PortInfo &p : in.mod.getPortList())
-    if (p.dir == Dir::Input) {
-      auto it = ins.find(p.name.getValue());
-      assert(it != ins.end() && "unwired loop-child input port");
-      operands[p.argNum] = it->second;
-    }
-  auto inst =
-      hw::InstanceOp::create(ib, loc, in.mod, in.call.getCallee(), operands);
-  for (const hw::PortInfo &p : in.mod.getPortList())
-    if (p.dir == Dir::Output)
-      in.outs[p.name.getValue()] = inst.getResult(p.argNum);
-  doneBE.setValue(in.outs["done"]);
-
-  // Drive the mirrored boundary outputs from the child.
-  for (const Mirror &m : mirrors)
-    if (!m.isInput)
-      pa.setOutput(m.topName, in.outs[m.calleeName]);
-  // done: latch the last iteration's completion (a done edge with none left).
-  Value last = comb::AndOp::create(ib, loc, doneEdge, notv(ib, more), false);
-  Backedge doneHeldBE = bb.get(i1);
-  Value doneHeld =
-      seq::CompRegOp::create(ib, loc, doneHeldBE, clk, rst, f1, "loop_done");
-  doneHeldBE.setValue(comb::MuxOp::create(
-      ib, loc, start, f1, comb::MuxOp::create(ib, loc, last, tru, doneHeld)));
-  pa.setOutput("done", doneHeld);
-}
-
-LogicalResult DataflowTopBuilder::run(hw::HWModuleOp &modOut,
-                                      iface::ModuleInterface &ifaceOut) {
-  loopOp = loopOverCall(container);
   collectInstances();
-  computeGates();
-  discoverInternalMems();
+  computeStartGates();
   if (failed(discoverChannels()))
     return failure();
   if (failed(checkFeedbackSeeding()))
@@ -1061,18 +770,18 @@ LogicalResult DataflowTopBuilder::run(hw::HWModuleOp &modOut,
 }
 } // namespace
 
-// The one structural-top emitter for both dataflow and sequential composition:
-// the wiring (broadcast / static offset / `done` handshake) and the channel
-// (FIFO / shared boundary) are derived per child from the schedule and the
-// callees' determinacy, not a container-wide mode. df and seq are points in one
-// space (see the file header / gateOns / the start policy in
+// The structural-top emitter for a concurrent container: the per-child wiring
+// (broadcast / static offset / `done` handshake) and the channel (FIFO /
+// shared boundary) are derived from the schedule and the callees' determinacy,
+// not a container-wide mode (see gateOns / the start policy in
 // instantiateProcesses).
-LogicalResult emitStructuralTop(
+LogicalResult emitConcurrentTop(
     func::FuncOp container, const llvm::StringMap<hw::HWModuleOp> &modules,
     const llvm::StringMap<iface::ModuleInterface> &ifaceModels,
     const llvm::StringMap<func::FuncOp> &scheduledFuncs, OpBuilder &b,
     hw::HWModuleOp &modOut, iface::ModuleInterface &ifaceOut) {
-  return DataflowTopBuilder(container, modules, ifaceModels, scheduledFuncs, b)
+  return ConcurrentTopBuilder(container, modules, ifaceModels, scheduledFuncs,
+                              b)
       .run(modOut, ifaceOut);
 }
 

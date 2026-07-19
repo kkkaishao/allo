@@ -33,15 +33,36 @@
 #include "mlir/IR/Value.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/StringMap.h"
 
 #include <cstdint>
 #include <optional>
 #include <string>
 #include <vector>
 
+// Callee context types (for CallUnits): forward-declared so this header
+// stays free of the CIRCT / interface-model includes; the .cpp consumers
+// include them.
+namespace circt::hw {
+class HWModuleOp;
+} // namespace circt::hw
+namespace mlir::allo::iface {
+struct ModuleInterface;
+} // namespace mlir::allo::iface
+
 namespace mlir::allo::uarch {
 
 struct BindingPolicy;
+
+/// The already-emitted callees a rerouted container's leaf datapath needs to
+/// lower a `dcp.invoke` to a CallUnit: the child `hw.module`s to
+/// instantiate + their port models (callee arg <-> addr/data/we names, read vs
+/// write direction). Null for a plain leaf (no calls). Both maps are populated
+/// bottom-up by the emit driver, so a callee is present before its caller.
+struct CalleeCtx {
+  const llvm::StringMap<circt::hw::HWModuleOp> &modules;
+  const llvm::StringMap<iface::ModuleInterface> &ifaces;
+};
 
 //===----------------------------------------------------------------------===//
 // Identifiers. Cells are referenced by small integer ids (indices into the
@@ -57,6 +78,7 @@ using IOId = unsigned;
 using ConstId = unsigned;
 using RegionId = unsigned;
 using StreamId = unsigned;
+using CallId = unsigned;
 
 //===----------------------------------------------------------------------===//
 // Control: semi-abstract. A cell/mux-select/port access is active when an
@@ -85,6 +107,8 @@ struct ControlPredicate {
 //               latched when that region completes and read by a sibling region
 //   Stream   -> index of the get access whose loaded token this is
 //               (id = the StreamChannel)
+//   Call     -> which scalar result of a sub-kernel call (id = the CallUnit):
+//               the child instance's result output, landing at start+latency
 //===----------------------------------------------------------------------===//
 
 struct Source {
@@ -98,7 +122,8 @@ struct Source {
     Const,
     Counter,
     Survivor,
-    Stream
+    Stream,
+    Call
   };
   Kind kind = Kind::None;
   unsigned id = 0;
@@ -186,6 +211,55 @@ struct MemUnit {
   llvm::SmallVector<Access, 2> accesses;
 };
 
+/// A sub-kernel call as a multi-cycle datapath node. Built from a
+/// `dcp.invoke` and owned by the `RegionBlock` it sits in (a `dcp.sequential`
+/// wrapping the call). The child instance *masters* the memory ports of its
+/// memref operands (it drives their addr/data/we; the parent's `MemUnit`
+/// supplies the storage), so a shared internal buffer becomes a
+/// `seq.read`/`seq.write` the child addresses. Its scalar result lands at
+/// `start + latency` as a survivor.
+struct CallUnit {
+  CallId id = 0;
+  Operation *invoke = nullptr; // the dcp::DCPathInvokeOp
+  RegionId region = 0;         // the RegionBlock (a dcp.sequential) it sits in
+  std::string callee;          // callee symbol (key into CalleeCtx maps)
+  std::optional<int64_t>
+      latency; // the invoke's `latency` (nullopt = indeterminate)
+  DeterminacyEnum determinacy = DeterminacyEnum::Indeterminate;
+  unsigned start = 0; // region-relative issue cycle (the invoke `start`)
+
+  /// One memory *port* the child drives for a mastered memref operand. A callee
+  /// arg accessed at several points exposes several ports (a read-twice arg:
+  /// two read ports; a read-modify-write accumulator: a read AND a write port),
+  /// so there is one MemArg per child port, not per operand.
+  struct MemArg {
+    unsigned calleeArg;         // operand position == callee argument index
+    MemId mem;                  // caller MemUnit backing this array
+    bool isBoundary;            // a func BlockArgument vs an internal alloc
+    bool isWrite;               // this port writes (vs reads)
+    unsigned bank = 0;          // cyclic bank this port serves (0 unbanked)
+    unsigned factor = 1;        // partition factor (1 unbanked)
+    std::string addr, data, we; // child port names; `we` empty for a read
+    std::string topBase; // top boundary port base (indexed); empty = internal
+  };
+  llvm::SmallVector<MemArg, 2> memArgs;
+
+  /// A scalar operand the child consumes: its driver (resolved by boundSource
+  /// -- an IO port, a sibling survivor, a same-region unit, or a constant) plus
+  /// the child scalar-input port it feeds.
+  struct ScalarArg {
+    Source src;
+    std::string port; // child scalar-input port name
+  };
+  llvm::SmallVector<ScalarArg, 1> scalarIns;
+
+  /// The child result-output port per scalar result. The
+  /// result's datapath Source is Source::Call{id, k} (registered in
+  /// producerOf), captured into this region's survivor exactly like a compute
+  /// result: a sibling reads it as Source::Survivor{region, k}.
+  llvm::SmallVector<std::string, 1> resultPorts;
+};
+
 /// A FIFO channel: a `!allo.stream` value, handshaked (valid/ready) rather than
 /// addressed. A channel is either an *input* (the kernel reads it via
 /// `allo.stream.get`) or an *output* (writes it via `allo.stream.put`); its
@@ -263,9 +337,8 @@ struct Result {
 //===----------------------------------------------------------------------===//
 // Regions. One RegionBlock per dcp region op (dcp.pipeline / dcp.sequential).
 // Cyclic blocks are pipelined loops (constant trip, II-paced); acyclic blocks
-// are straight-line. Blocks run
-// in program order with no overlap (locked decision), so a single sequential
-// hand-off chains them.
+// are straight-line. Blocks run in program order with no overlap, so a single
+// sequential hand-off chains them.
 //===----------------------------------------------------------------------===//
 
 struct RegionBlock {
@@ -296,6 +369,34 @@ struct RegionBlock {
                             // readable iteration-counter wire; empty if
   // the loop's IV carried no name (best-effort)
 
+  // Declared composition class + single-run latency, read off the region op's
+  // `determinacy` / `latency` (reifier `setDcpLatencies`) attrs. The region
+  // composer reads these to pick the hand-off policy: a predecessor with a
+  // `staticLatency` may be time-triggered from that static offset; everything
+  // else must handshake on the predecessor's `done`. `staticLatency` is the
+  // single-run start->done depth (a pipeline's `length + (trip-1)*ii`, a
+  // sequential's `length`); the time-triggered offset adds one cycle per
+  // survivor-yielding region (the reifier's `regionBoundaryCost`).
+  // Invariant (asserted in `addRegion`): a present `staticLatency` implies
+  // `determinacy == counted_static`. The converse fails -- a `dcp.select`
+  // guard is `counted_static` but has no `latency` (its run-once completion is
+  // data-dependent), so `staticLatency` (not `determinacy`) is the time-trigger
+  // gate.
+  DeterminacyEnum determinacy = DeterminacyEnum::Indeterminate;
+  std::optional<int64_t> staticLatency;
+
+  // Composition predecessors: the earlier top-level sibling regions this one
+  // must start after (populated only for top-level regions -- container
+  // children stay serial). A region depends on an earlier sibling iff they
+  // touch a shared memref (a data hazard or a read-port conflict -- functional
+  // units are auto-disjoint under per-region binding, so shared *memory* is
+  // the only cross-region resource) or a cross-region SSA edge (a scalar
+  // survivor). A region with no predecessors starts concurrently with the
+  // kernel; one with predecessors starts on their joined `done`. Producers
+  // precede consumers in program order, so the relation is a DAG. Set by
+  // `recordSiblingDeps`.
+  llvm::SmallVector<RegionId, 2> predecessors;
+
   // Region nesting. A container region drives its `children` in its body; each
   // child's `parent` is the enclosing container. Top-level regions (no parent)
   // are the func-scope siblings chained by the sequencer; a container runs its
@@ -308,6 +409,7 @@ struct RegionBlock {
   llvm::SmallVector<UnitId, 4> units;
   llvm::SmallVector<RegId, 4> regs;
   llvm::SmallVector<MuxId, 2> muxes;
+  llvm::SmallVector<CallId, 1> callUnits; // sub-kernel calls
 };
 
 //===----------------------------------------------------------------------===//
@@ -326,6 +428,7 @@ struct Datapath {
   std::vector<IOPort> ios;
   std::vector<ConstCell> consts;
   std::vector<Result> results;      // scalar func results, in return order
+  std::vector<CallUnit> calls;      // sub-kernel calls
   std::vector<RegionBlock> regions; // program order
 
   // L1 binding decisions the policy writes; the structure above is derived from
@@ -343,19 +446,16 @@ struct Datapath {
   // it).
   llvm::DenseMap<RegionId, llvm::SmallVector<Source>> regionResult;
 
-  // The i1 predicate of a guard region (a dcp.select). The guard's children run
-  // once iff it holds (emitGuard start-gates them); otherwise they never issue,
-  // so their stores never fire -- the predicate reaches the store write-enable
-  // structurally, not by a per-store gate. Like a while's condition, it is
-  // either a scheduled value -- a preceding condition region's survivor, so
-  // `condition` is set (a data-dependent guard, e.g. `flag[j] > 0`) -- or an
-  // unscheduled raw combinational arith tree over the enclosing container's
-  // counter, so `condition` is None and `condValue` is the root (an affine
-  // guard `i > j` over a flattened nest, evaluated by evalRawArith). Present
-  // only for a guard (RegionBlock::guard) region.
+  // The i1 predicate of a guard region (a dcp.select), as a resolved Source.
+  // The guard's children run once iff it holds (emitGuard start-gates them);
+  // otherwise they never issue, so their stores never fire -- the predicate
+  // reaches the store write-enable structurally, not by a per-store gate. It is
+  // either a scheduled prologue region's survivor (a data-dependent scf guard,
+  // e.g. `flag[j] > 0`) or the enclosing container's combinational predicate
+  // unit (an affine guard `i > j` over the counter, reified to a start-0
+  // `dcp.compute`). Present only for a guard (RegionBlock::guard).
   struct GuardInfo {
     Source condition;
-    Value condValue;
   };
   llvm::DenseMap<RegionId, GuardInfo> guardCond;
 
@@ -367,23 +467,21 @@ struct Datapath {
   // for both regimes that need it -- a counted container carrying an
   // accumulator into an inner reduction, and a while (conditional) container /
   // leaf whose flushing controller also gates `running` on `condition`. The
-  // `condition`/`condValue` fields are set only for a while (else None): a leaf
-  // while's condition is a scheduled compute unit (`condition` is its Source);
-  // a conditional container's is an unscheduled raw arith tree over the
-  // iter-args
-  // (`condValue` is its root, `condition` None). Such a region records no
-  // `regionResult` (its results are these survivors).
+  // `condition` Source is set only for a while (else None): a leaf while's is
+  // its scheduled compute unit, and a sequential-wrapper while's is its
+  // continue-condition compute over the iter-arg survivors -- both reified to a
+  // `dcp.compute`, so both resolve as a Source::Unit. Such a region
+  // records no `regionResult` (its results are these survivors).
   struct CarryInfo {
     Source condition;
-    Value condValue;
     llvm::SmallVector<Source> inits;
     llvm::SmallVector<Source> nexts;
   };
   llvm::DenseMap<RegionId, CarryInfo> carryInfo;
 
   Datapath() = default;
-  explicit Datapath(func::FuncOp f);
-  Datapath(func::FuncOp func, const BindingPolicy &policy);
+  Datapath(func::FuncOp func, const BindingPolicy &policy,
+           const CalleeCtx *callees = nullptr);
 
   void dump(llvm::raw_ostream &os) const;
 };

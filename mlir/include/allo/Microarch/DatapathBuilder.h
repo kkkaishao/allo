@@ -7,15 +7,13 @@
 // DatapathBuilder: constructs the L2 `Datapath` model from a function carrying
 // materialized `allo.dcp.*` ops, in two composable phases:
 //
-//   * Step A -- allocation & binding: a `RegionBlock` per dcp region op, and
-//   the
-//     trivial resource binding (every compute op its own `FuncUnit`, every
-//     memref its own `MemUnit`, each literal a `ConstCell`, scalar args
-//     `IOPort`s). `bindResource` is the seam for non-trivial binding (sharing
-//     + muxes).
-//   * Step B -- interconnect derivation: `resolveOperand` applies the register-
-//     depth rule `d*II + (tY - tX) - lat`, and `insertRegister` materializes
-//     the shift-register chains.
+//   * Allocation & binding: a `RegionBlock` per dcp region op, and the trivial
+//     resource binding (every compute op its own `FuncUnit`, every memref its
+//     own `MemUnit`, each literal a `ConstCell`, scalar args `IOPort`s).
+//     `bindResource` is the seam for non-trivial binding (sharing + muxes).
+//   * Interconnect derivation: `resolveOperand` applies the register-depth rule
+//     `d*II + (tY - tX) - lat`, and `insertRegister` materializes the
+//     shift-register chains.
 //
 // The build-time scratch maps (producerOf / ioOf / regionIdxOf / memOf) are
 // MEMBERS, not threaded arguments -- so a new piece of build state (e.g. the
@@ -58,8 +56,10 @@ struct DatapathBuilder {
   llvm::DenseMap<Operation *, Source> producerOf;
   llvm::DenseMap<Value, Source> ioOf;
   llvm::DenseMap<Operation *, unsigned> regionIdxOf;
+  llvm::StringMap<unsigned> boundaryBaseSeq; // CallUnit boundary port groups:
+                                             // running accessor index per base
 
-  // Step B interconnect-derivation scratch (transient; see deriveInterconnect).
+  // Interconnect-derivation scratch (transient; see deriveInterconnect).
   struct RegDepth { // a register-fed input slot, patched once its chain exists
     Source *slot;
     Value key;
@@ -79,15 +79,18 @@ struct DatapathBuilder {
   std::deque<MuxBuild> muxBuilds; // a deque so `record`'s slot pointers into
                                   // `sources` survive later pushes
 
-  const BindingPolicy &policy; // decides resource sharing (Step A)
+  const BindingPolicy &policy; // decides resource sharing
+  const CalleeCtx *callees;    // child modules/ifaces for a dcp.invoke
+                               // (null for a plain leaf, no calls)
 
-  DatapathBuilder(Datapath &dp, func::FuncOp func, const BindingPolicy &policy)
-      : dp(dp), func(func), policy(policy) {}
+  DatapathBuilder(Datapath &dp, func::FuncOp func, const BindingPolicy &policy,
+                  const CalleeCtx *callees = nullptr)
+      : dp(dp), func(func), policy(policy), callees(callees) {}
 
   /// build the datapath model
   void build();
 
-  // -- Step A: allocation & binding --------------------------------------
+  // -- Allocation & binding --------------------------------------
   /// Register every literal as a tie-off ConstCell (func-wide, so a hoisted
   /// constant resolves the same as an in-body one).
   void collectConstants();
@@ -124,6 +127,14 @@ struct DatapathBuilder {
   /// survivor). Runs after region recording so the survivor resolves. A
   /// result-mux guard (else branch) is asserted out -- unsupported.
   void recordGuards(llvm::ArrayRef<Operation *> regionOps);
+  /// Record each top-level region's composition predecessors
+  /// (`rb.predecessors`): the earlier top-level siblings it must start after,
+  /// from a shared memref (any access -- hazard or read-port conflict) or a
+  /// cross-region SSA edge (a scalar survivor). The emitter starts a
+  /// predecessor-free region concurrently and gates the rest on their
+  /// producers' `done`. Runs last (needs the final memref accesses + region
+  /// tree).
+  void recordSiblingDeps(llvm::ArrayRef<Operation *> regionOps);
   /// The Source driving a pipeline's runtime bound value \p v (a region-result
   /// survivor, a hoisted producer, or a scalar IOPort); None if unmodelled.
   Source boundSource(Value v);
@@ -139,12 +150,12 @@ struct DatapathBuilder {
 
   /// Apply the policy's sharing decision: fold each group's units onto its
   /// first (moving their bound ops + rebinding `opToUnit`/`producerOf`), then
-  /// drop the emptied units from their region. Runs after Step A trivial
+  /// drop the emptied units from their region. Runs after the trivial
   /// allocation and before interconnect derivation, which then grows the
   /// sharing muxes.
   void applyBinding(llvm::ArrayRef<llvm::SmallVector<UnitId, 2>> groups);
 
-  // -- Step B: interconnect derivation -----------------------------------
+  // -- Interconnect derivation -----------------------------------
   /// Resolve an operand \p v consumed by \p consumer (in a region with
   /// initiation interval \p ii) to its producing Source + register depth.
   Resolved resolveOperand(Value v, Operation *consumer, unsigned ii);
@@ -163,7 +174,7 @@ struct DatapathBuilder {
   void allocateInputSlots();
   /// Record a resolved edge into \p slot: a depth-0 edge ties directly, a
   /// deeper one is deferred (its register chain is built in insertRegisters).
-  void record(Resolved r, Source &slot, unsigned regionIdx);
+  void recordEdge(Resolved r, Source &slot, unsigned regionIdx);
   /// Resolve every unit input (single, or shared-then-muxed).
   void resolveUnitInputs();
   /// Resolve every memory address / store data and stream data + predicate.

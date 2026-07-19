@@ -65,6 +65,36 @@ ModuleInterface::ModuleInterface(const uarch::Datapath &dp,
   for (unsigned i = 0; i < writes.size(); ++i)
     this->writes.push_back(group(writes, i, /*write=*/true));
 
+  // A CallUnit-mastered *boundary* argument has no MemUnit::Access (the child
+  // instance drives the port), so it is absent from the AccRef arrays above.
+  // Declare its interface here -- the same `<name>_<role>` a normal
+  // single-access boundary port gets -- so the top declares the port and the
+  // cosim harness drives it; the leaf's own access loops still skip it (they
+  // iterate the AccRefs), and emitCalls passes the child's ports through.
+  for (const uarch::CallUnit &cu : dp.calls)
+    for (const uarch::CallUnit::MemArg &ma : cu.memArgs) {
+      if (!ma.isBoundary)
+        continue;
+      // One port group PER ACCESSOR: the builder gave each a distinct `topBase`
+      // (a running index per base), so several children accessing one argument
+      // get separate concurrent groups -- the cosim harness backs every group
+      // of the argument against its one array (no mux). A serial pair uses two
+      // groups too (each drives in its own phase; the schedule keeps them
+      // ordered). A cyclically partitioned argument exposes one group per
+      // bank, each carrying its own `bank`/`factor` -- how the cosim harness
+      // knows to back it with the argument's cyclic slice rather than a whole
+      // copy.
+      const uarch::MemUnit &mu = dp.mems[ma.mem];
+      unsigned w =
+          bitWidth(cast<MemRefType>(mu.memref.getType()).getElementType());
+      const std::string &base = ma.topBase; // indexed per role by the builder
+      Memory m{
+          argOf(mu.memref), ma.isWrite,  (int)ma.bank,
+          (int)ma.factor,   w,           base,
+          addr(base),       data_(base), ma.isWrite ? we(base) : std::string()};
+      (ma.isWrite ? this->writes : this->reads).push_back({m});
+    }
+
   for (const uarch::Result &r : dp.results)
     results.push_back({bitWidth(r.type), r.name});
 }

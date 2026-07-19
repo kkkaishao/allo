@@ -3,12 +3,6 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-//===----------------------------------------------------------------------===//
-// Public face of the L2 microarchitecture model: the `build` entry (a thin
-// wrapper over DatapathBuilder), `hasDCPRegions` detection, and the textual
-// `dump`. The construction itself lives in DatapathBuilder.{h,cpp}.
-//===----------------------------------------------------------------------===//
-
 #include "allo/Microarch/BindingPolicy.h"
 #include "allo/Microarch/DatapathBuilder.h"
 
@@ -50,13 +44,9 @@ unsigned dcpLatency(Operation *op) {
 
 unsigned readyCycleOf(Operation *op) { return dcpStart(op) + dcpLatency(op); }
 
-Datapath::Datapath(func::FuncOp func) {
-  DatapathBuilder builder(*this, func, TrivialBinding{});
-  builder.build();
-}
-
-Datapath::Datapath(func::FuncOp func, const BindingPolicy &policy) {
-  DatapathBuilder builder(*this, func, policy);
+Datapath::Datapath(func::FuncOp func, const BindingPolicy &policy,
+                   const CalleeCtx *callees) {
+  DatapathBuilder builder(*this, func, policy, callees);
   builder.build();
 }
 
@@ -106,6 +96,9 @@ void printSource(const Source &s, raw_ostream &os) {
     break;
   case Source::Kind::Stream:
     os << "st" << s.id << "#" << s.outPort;
+    break;
+  case Source::Kind::Call:
+    os << "call" << s.id << "#" << s.outPort;
     break;
   }
 }
