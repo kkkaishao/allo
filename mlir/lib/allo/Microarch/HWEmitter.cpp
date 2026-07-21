@@ -66,7 +66,7 @@ bool combEmitted(StringRef kind) {
       .Cases({"cmpi", "select", "shli", "shrsi", "shrui"}, true)
       .Cases({"divsi", "divui", "remsi", "remui"}, true)
       .Cases({"minsi", "maxsi", "minui", "maxui"}, true)
-      .Case("apply", true)
+      .Cases({"apply", "negf"}, true)
       .Default(false);
 }
 
@@ -111,6 +111,8 @@ Value emitCompute(OpBuilder &b, Location loc, StringRef kind,
   // constant divisors, so a power-of-two delinearization stays a shift and a
   // mask rather than the signed correction a generic affine expansion emits.
   if (kind == "apply") {
+    assert(srcOp->getAttr("map") &&
+           "dcp.compute<apply> must carry the original affine map");
     AffineMap map = cast<AffineMapAttr>(srcOp->getAttr("map")).getValue();
     assert(map.getNumResults() == 1 && "affine.apply yields one result");
     return evalAffine(b, loc, map.getResult(0), operands, map.getNumDims());
@@ -138,6 +140,15 @@ Value emitCompute(OpBuilder &b, Location loc, StringRef kind,
     return dst > src ? comb::createOrFoldSExt(b, loc, lhs, resultType)
                      : comb::ExtractOp::create(b, loc, resultType, lhs, 0)
                            .getResult();
+  }
+  // Float negate: arith.negf flips the sign bit of the float, which rides as
+  // its integer bit pattern here -- a single XOR, no IP. Unary, so it precedes
+  // the `rhs = operands[1]` read below.
+  if (kind == "negf") {
+    unsigned w = cast<IntegerType>(resultType).getWidth();
+    Value signBit = hw::ConstantOp::create(b, loc, resultType,
+                                           static_cast<int64_t>(1) << (w - 1));
+    return comb::XorOp::create(b, loc, lhs, signBit, false)->getResult(0);
   }
   // 3-input value mux: arith.select(cond, t, f) == comb.mux (cond ? t : f). The
   // if-conversion of a guarded store lowers to this over the two speculated
@@ -571,7 +582,7 @@ unsigned HWEmitter::captureResults(const uarch::RegionBlock &rb,
                                    const RegionControl &rc, Value lastIssue,
                                    Value start) {
   return rb.conditional ? captureWhileResults(rb, rc, start)
-                        : captureCountedResults(rb, lastIssue);
+                        : captureCountedResults(rb, lastIssue, start);
 }
 
 // Capture each of a result-yielding region's results into its own survivor
@@ -583,10 +594,11 @@ unsigned HWEmitter::captureResults(const uarch::RegionBlock &rb,
 // A store-ful region yields no result and returns stage 0 (its store drain
 // governs).
 unsigned HWEmitter::captureCountedResults(const uarch::RegionBlock &rb,
-                                          Value lastIssue) {
+                                          Value lastIssue, Value start) {
   auto it = dp.regionResult.find(rb.id);
   if (it == dp.regionResult.end())
     return 0;
+  auto initIt = dp.regionResultInit.find(rb.id);
   unsigned maxStage = 0;
   for (auto [k, rs] : llvm::enumerate(it->second)) {
     if (rs.kind == uarch::Source::Kind::None)
@@ -599,8 +611,21 @@ unsigned HWEmitter::captureCountedResults(const uarch::RegionBlock &rb,
     unsigned stage = datapath.readyCycle(rs);
     Value cap = ctx.delayValid(lastIssue, stage);
     Value res = datapath.resolveSource(rs);
-    datapath.setSurvivor(rb.id, k,
-                         ctx.enabledReg(res, cap, ctx.konst(res.getType(), 0)));
+    // A loop-carried result (a reduction accumulator) preloads its init on the
+    // region `start`, then latches the final value when it lands: a zero-trip
+    // run issues nothing, so `cap` never fires and the survivor holds the init
+    // (the reduction identity) rather than a stale accumulator from a prior
+    // invocation. A result with no init (an acyclic once-computed survivor)
+    // always lands, so a plain capture-when-ready suffices.
+    uarch::Source initSrc =
+        initIt != dp.regionResultInit.end() && k < initIt->second.size()
+            ? initIt->second[k]
+            : uarch::Source{};
+    Value survivor =
+        initSrc.kind == uarch::Source::Kind::None
+            ? ctx.enabledReg(res, cap, ctx.konst(res.getType(), 0))
+            : ctx.latchReg(datapath.resolveSource(initSrc), res, start, cap);
+    datapath.setSurvivor(rb.id, k, survivor);
     maxStage = std::max(maxStage, stage);
   }
   return maxStage;
@@ -776,17 +801,23 @@ Value HWEmitter::emitLoopCall(const uarch::RegionBlock &rb, Value start) {
 // survivor register (captured in the producer, read in the consumer). Returns a
 // latched completion level.
 Value HWEmitter::emitContainer(const uarch::RegionBlock &rb, Value start) {
-  int64_t trip = *rb.tripCount;
-  // A container has a compile-time trip, so its lb/step are compile-time too (a
-  // runtime range start/stride yields no static trip); the constant counter
-  // path below is exhaustive.
-  assert(!rb.lbSource && !rb.stepSource &&
-         "container with a runtime lb/step (no constant trip)");
+  // Induction bounds: compile-time constants (the common counted container) or
+  // runtime Sources -- a variable-trip container, whose bound is an enclosing
+  // loop's counter (Source::Counter, a triangular/tile `for ii in range(i,
+  // ...)`) or a prologue survivor. `terminatorOf` resolves both; a runtime
+  // bound carries no static trip, so termination is `iv+step >= ub` (`isLast`)
+  // and a zero-trip
+  // (`lb >= ub`) container runs no child at all (`isEmpty`/`gateStart`).
+  Terminator term = terminatorOf(rb);
   // The outer counter is the source IV: init `lb`, advance by `step`, so the
-  // children read the real outer index (Source::Counter).
-  Value lbV = ctx.konst(ctx.i32, rb.lb), stepV = ctx.konst(ctx.i32, rb.step);
+  // children read the real outer index (Source::Counter). The counter register
+  // updates the cycle AFTER an iteration's start/advance pulse, and the child
+  // starts one cycle after that same pulse (child0Start is registered below),
+  // so by the time a child samples the counter for its bound (isEmpty / its own
+  // counter init) the register already holds the iteration it is starting --
+  // not the one it just left.
   Backedge ivNext = ctx.bb.get(ctx.i32);
-  Value iv = ctx.reg(ivNext, lbV);
+  Value iv = ctx.reg(ivNext, term.lb);
   datapath.setCounter(rb.id,
                       iv); // live while the children emit (their outer index)
 
@@ -816,20 +847,30 @@ Value HWEmitter::emitContainer(const uarch::RegionBlock &rb, Value start) {
   advanceEdge.setValue(lastEdge); // advance the iter-args on each outer drain
   for (auto [k, nb] : llvm::enumerate(nextBE))
     nb.setValue(datapath.resolveSource(ci->second.nexts[k]));
-  Value last = ctx.icmpEq(iv, rb.lb + (trip - 1) * rb.step);
+  Value ivStep =
+      ctx.R(comb::AddOp::create(ctx.b, ctx.loc, iv, term.step, false));
+  Value last = term.isLast(ctx, ivStep); // this outer iteration is the last
   Value advance = ctx.andBits(lastEdge, ctx.notBit(last));
-  // Restart child 0 on the outer start pulse, then on each outer-iteration
-  // drain.
-  child0Start.setValue(ctx.mux(start, ctx.t1, advance));
-  Value ivp1 = ctx.R(comb::AddOp::create(ctx.b, ctx.loc, iv, stepV, false));
-  Value ivAdv = ctx.mux(advance, ivp1, iv);
-  ivNext.setValue(ctx.mux(start, lbV, ivAdv));
+  // Restart child 0 one cycle after the (non-empty) outer start pulse, then one
+  // cycle after each outer-iteration drain -- registered so the counter has
+  // settled to the iteration being started before a child samples it as a bound
+  // (a child whose bound is this container's own counter, e.g. `for k in
+  // range(i, j)` under `for j`). `gateStart` masks the start of a zero-trip
+  // container so no child issues.
+  child0Start.setValue(
+      ctx.reg(ctx.mux(term.gateStart(ctx, start), ctx.t1, advance), ctx.f1));
+  Value ivAdv = ctx.mux(advance, ivStep, iv);
+  ivNext.setValue(ctx.mux(start, term.lb, ivAdv));
   // Latch done when the last child of the last outer iteration drains, and
   // clear it on `start` -- so a *retriggered* container (an inner nest re-run
   // by an enclosing container) presents a fresh 0->1 edge each pass. (Harmless
   // for a top-level container: its `start` pulses once, when done is already
-  // 0.)
-  return ctx.holdDone(ctx.andBits(lastEdge, last), start);
+  // 0.) A zero-trip container drains no child, so it completes one cycle after
+  // `start` instead (delayed so the pulse follows the start-reset, the same
+  // empty-region done pattern the leaf uses).
+  Value emptyDone = ctx.reg(ctx.andBits(start, term.isEmpty(ctx)), ctx.f1);
+  return ctx.holdDone(ctx.orBits(emptyDone, ctx.andBits(lastEdge, last)),
+                      start);
 }
 
 // A conditional container -- a sequential-wrapper while whose body nests child
@@ -1093,13 +1134,14 @@ static LogicalResult validateDatapath(func::FuncOp func,
 
 // Declare an extern operator module for each IP-realized compute unit, named by
 // `ipModuleName` and deduplicated across the whole module (`opModules`). Native
-// (comb) units emit inline, no extern. Inputs are the operand width and the
-// output the result width -- equal for a binary op, but a compare takes two
-// operands and yields i1. The interface follows the realization's stall
-// contract: `(a, b, clk) -> y` free-running, or `(a, b, clk, ce) -> y` when
-// clock-enabled (`ce == 0` freezes the pipe in lockstep with the shell). The
-// contract is a function of `impl`, so every instance of a given module name
-// shares one port shape (dedup-safe). Returns unit id -> its extern module.
+// (comb) units emit inline, no extern. One input port per operand (named `a`,
+// `b`, `c`, ... at each operand's width -- a unary cast/`sqrt` gets `a` only, a
+// binary op `a`+`b`, a compare two operands yielding i1) then the output at the
+// result width. The interface follows the realization's stall contract:
+// `(a.., clk) -> y` free-running, or `(a.., clk, ce) -> y` when clock-enabled
+// (`ce == 0` freezes the pipe in lockstep with the shell). Signature + contract
+// are a function of `impl`, so every instance of a given module name shares one
+// port shape (dedup-safe). Returns unit id -> its extern module.
 static DenseMap<unsigned, Operation *>
 declareOperatorModules(func::FuncOp func, const uarch::Datapath &dp,
                        OpBuilder &b, llvm::StringMap<Operation *> &opModules) {
@@ -1111,16 +1153,20 @@ declareOperatorModules(func::FuncOp func, const uarch::Datapath &dp,
   for (const uarch::FuncUnit &u : dp.units) {
     if (u.comb || u.boundOps.empty())
       continue;
-    IntegerType inW =
-        hwType(u.boundOps.front().first->getOperand(0).getType(), b);
+    Operation *srcOp = u.boundOps.front().first;
+    assert(u.inputs.size() == srcOp->getNumOperands() &&
+           "IP unit input count must match its bound op's operand count");
     IntegerType outW = hwType(u.resultType, b);
     std::string modName = ipModuleName(u);
     Operation *&mod = opModules[modName];
     if (!mod) {
-      SmallVector<PortInfo> ep{
-          PortInfo{{StringAttr::get(ctx, "a"), inW, Dir::Input}},
-          PortInfo{{StringAttr::get(ctx, "b"), inW, Dir::Input}},
-          PortInfo{{StringAttr::get(ctx, "clk"), b.getI1Type(), Dir::Input}}};
+      SmallVector<PortInfo> ep;
+      for (unsigned k = 0; k < u.inputs.size(); ++k) {
+        IntegerType w = hwType(srcOp->getOperand(k).getType(), b);
+        std::string pn(1, static_cast<char>('a' + k));
+        ep.push_back({{StringAttr::get(ctx, pn), w, Dir::Input}});
+      }
+      ep.push_back({{StringAttr::get(ctx, "clk"), b.getI1Type(), Dir::Input}});
       if (u.stall == allo::StallContractEnum::Ce)
         ep.push_back({{StringAttr::get(ctx, "ce"), b.getI1Type(), Dir::Input}});
       ep.push_back({{StringAttr::get(ctx, "y"), outW, Dir::Output}});

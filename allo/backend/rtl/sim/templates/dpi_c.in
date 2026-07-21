@@ -1,0 +1,7 @@
+// Auto-generated DPI-C behavioral models for the extern IP operators.
+
+#include <cstring>
+#include <cstdint>
+#include <cmath>
+
+{functions}

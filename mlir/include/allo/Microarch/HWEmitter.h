@@ -519,6 +519,7 @@ struct DatapathEmitter {
   DenseMap<unsigned, ShiftChain> regStages;      // reg id -> its tap chain
   DenseMap<uint64_t, Value> readData;            // (mem,access) -> read data
   DenseMap<unsigned, Value> unitVal;             // unit id -> result
+  DenseMap<unsigned, circt::Backedge> unitBE;    // unit id -> result backedge
   DenseMap<unsigned, Value> muxVal;              // mux id -> resolved output
 
   // The child modules a `dcp.instance`'s CallUnit instantiates (null for
@@ -582,6 +583,10 @@ struct DatapathEmitter {
   }
 
   void emitRegisters(const uarch::RegionBlock &rb);
+  /// Backedge every unit output before any consumer resolves it, so a read
+  /// address (emitInternalReads) or another unit input may reference a unit
+  /// emitted later; emitUnits fills each backedge in when it wires the unit.
+  void declareUnits(const uarch::RegionBlock &rb);
   void emitInternalReads(const uarch::RegionBlock &rb);
   /// Read crossbar for each data-dependent external (argument) read in region
   /// \p rb: drive every bank interface's address with the offset, read each
@@ -689,7 +694,8 @@ struct HWEmitter {
   /// A counted / acyclic region's results, captured into a survivor register at
   /// each result's ready cycle (relative to \p lastIssue); returns the
   /// latest-landing (max) stage.
-  unsigned captureCountedResults(const uarch::RegionBlock &rb, Value lastIssue);
+  unsigned captureCountedResults(const uarch::RegionBlock &rb, Value lastIssue,
+                                 Value start);
   /// A while region's loop-carried results, each frozen into a latch (init at
   /// \p start, advanced while continuing); returns the deepest carried-value
   /// stage.

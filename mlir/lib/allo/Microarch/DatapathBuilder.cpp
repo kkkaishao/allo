@@ -88,6 +88,41 @@ std::pair<Operation *, unsigned> traceIterArgSource(dcp::DCPathPipelineOp pipe,
              : std::make_pair<Operation *, unsigned>(nullptr, 0);
 }
 
+// Is \p v a transient FIFO-din value -- one that changes while the region is
+// back-pressured (`valid & ~ready`), so it must be captured into a
+// chain-enable- frozen register before it drives a FIFO write? It is transient
+// iff it is, or is a purely combinational function of, one of the two sources
+// that move under back-pressure:
+//   * a memory load -- a live counter-addressed read (an external port or an
+//     always-enabled seq.read), re-addressed as the counter advances/resets;
+//   * the loop counter (pipeline block arg 0) -- reset to `lb` in the drain.
+// A value built only from FIFO heads (held while their get is not popped),
+// survivors / call results (latched for the producing region's life),
+// constants, io, or *registered* (latency>=1) units is frozen with the datapath
+// while back-pressured, so it needs no extra register. Combinational
+// (latency-0) ops propagate transient-ness from their operands; the SSA din
+// tree is acyclic (iter-args are stable block args), so the recursion
+// terminates.
+bool isTransientDin(Value v) {
+  if (auto barg = dyn_cast<BlockArgument>(v))
+    return isa_and_nonnull<dcp::DCPathPipelineOp>(
+               barg.getOwner()->getParentOp()) &&
+           barg.getArgNumber() == 0;
+  Operation *def = v.getDefiningOp();
+  if (!def)
+    return false;
+  if (isa<dcp::DCPathLoadOp>(def))
+    return true;
+  // Stable producers: a FIFO head, a nested region's survivor, a constant.
+  if (isa<StreamGetOp, dcp::DCPathPipelineOp, dcp::DCPathSequentialOp,
+          arith::ConstantOp>(def))
+    return false;
+  if (dcpLatency(def) == 0)
+    return llvm::any_of(def->getOperands(),
+                        [](Value o) { return isTransientDin(o); });
+  return false; // a registered (latency>=1) unit's output is frozen under stall
+}
+
 } // namespace
 
 //===----------------------------------------------------------------------===//
@@ -455,6 +490,19 @@ void DatapathBuilder::recordRegionResult(const RegionBlock &rb,
     results.push_back(it != producerOf.end() ? it->second : Source{});
   }
   dp.regionResult[rb.id] = std::move(results);
+
+  // A counted loop yields one result per iter-arg (its `uncondition` operands
+  // align 1:1 with `inits`), so record each result's init: a leaf reduction's
+  // identity, which the emitter preloads into the survivor so an empty (zero-
+  // trip) run yields the identity, not a stale accumulator. A sequential
+  // (acyclic) region has no iter-args -> no inits recorded (results always
+  // land).
+  if (auto pipe = dyn_cast<dcp::DCPathPipelineOp>(regionOp)) {
+    SmallVector<Source> inits;
+    for (Value init : pipe.getInits())
+      inits.push_back(initSource(init));
+    dp.regionResultInit[rb.id] = std::move(inits);
+  }
 }
 
 void DatapathBuilder::recordCarryInfo(ArrayRef<Operation *> regionOps) {
@@ -526,6 +574,16 @@ Source DatapathBuilder::boundSource(Value v) {
     if (auto it = producerOf.find(def); it != producerOf.end())
       return it->second; // a hoisted producer (e.g. a constant bound)
   }
+  // An enclosing loop's induction counter (arg 0 of a `dcp.pipeline`): a bound
+  // that is a raw outer IV, e.g. the `i` in `for ii in range(i, i_max)`. It
+  // resolves to that region's counter register -- held stable while this nested
+  // region runs (nested containment) -- the same channel a body address reads
+  // the outer index through (Source::Counter).
+  if (auto barg = dyn_cast<BlockArgument>(v))
+    if (auto pipe =
+            dyn_cast<dcp::DCPathPipelineOp>(barg.getOwner()->getParentOp());
+        pipe && barg.getArgNumber() == 0)
+      return Source{Source::Kind::Counter, regionIdxOf.lookup(pipe), 0};
   if (auto it = ioOf.find(v); it != ioOf.end())
     return it->second; // a scalar-argument bound
   return {};
@@ -656,6 +714,7 @@ Resolved DatapathBuilder::resolveOperand(Value v, Operation *consumer,
       Resolved r =
           edge(it->second, def->getResult(0), readyCycleOf(def), distance);
       r.init = initSource(pipe.getInits()[iterArg]);
+      r.initDist = distance; // re-inject the init for the first `distance` runs
       // An unresolvable init would be silently dropped by the emitter (the
       // re-injection mux is keyed on the init being non-None), leaving the
       // recurrence to read only its own backedge: the accumulator would keep
@@ -733,7 +792,6 @@ RegId DatapathBuilder::insertRegister(Value key, ArrayRef<unsigned> depths,
   reg.depth = maxDepth;
   reg.input = input;
   reg.taps.assign(taps.begin(), taps.end());
-  dp.valueToReg[key] = reg.id;
   dp.regions[region].regs.push_back(reg.id);
   dp.regs.push_back(std::move(reg));
   return reg.id;
@@ -754,6 +812,7 @@ void DatapathBuilder::allocateInputSlots() {
     u.inputs.assign(n, Source{});
     u.inputInits.assign(n,
                         Source{}); // parallel; set for recurrence inputs below
+    u.inputInitDist.assign(n, 1);
   }
   for (MemUnit &m : dp.mems)
     for (MemUnit::Access &acc : m.accesses) {
@@ -770,10 +829,10 @@ void DatapathBuilder::recordEdge(Resolved r, Source &slot, unsigned regionIdx) {
     slot = r.base;
     return;
   }
-  depthsByKey[r.key].push_back(r.depth);
-  baseByKey[r.key] = r.base;
-  regionOfKey[r.key] = regionIdx;
-  pending.push_back({&slot, r.key, r.depth});
+  RegKey key{r.key, regionIdx};
+  depthsByKey[key].push_back(r.depth);
+  baseByKey[key] = r.base;
+  pending.push_back({&slot, key, r.depth});
 }
 
 void DatapathBuilder::resolveUnitInputs() {
@@ -789,6 +848,7 @@ void DatapathBuilder::resolveUnitInputs() {
         Resolved r = resolveOperand(op0->getOperand(k), op0, ii);
         recordEdge(r, u.inputs[k], ridx);
         u.inputInits[k] = r.init; // None unless k reads a loop-carried iter_arg
+        u.inputInitDist[k] = r.initDist;
       }
       continue;
     }
@@ -834,10 +894,37 @@ void DatapathBuilder::resolveAccessOperands() {
     for (StreamChannel::Access &acc : s.accesses) {
       unsigned ridx = regionIdxOf.lookup(acc.op->getParentOp());
       unsigned ii = dp.regions[ridx].ii.value_or(1);
-      if (acc.isPut)
-        recordEdge(
-            resolveOperand(cast<StreamPutOp>(acc.op).getValue(), acc.op, ii),
-            acc.data, ridx);
+      if (acc.isPut) {
+        Value token = cast<StreamPutOp>(acc.op).getValue();
+        Resolved r = resolveOperand(token, acc.op, ii);
+        // AXI-S data stability: a FIFO din must be a chain-enable-frozen
+        // register, held while `valid & ~ready`. This bites only a STAGE>=1
+        // put: its valid is a delayed shift-chain pulse (riding regionEnable),
+        // so back-pressure holds it past the issue -- into the loop's drain,
+        // where the counter resets. If its depth-0 din is transient (a live
+        // counter-addressed read or a combinational function of one), the held
+        // valid then commits a token the din no longer holds. A STAGE-0 put's
+        // valid IS the issue pulse (combinationally gated by chainEnable), so
+        // it drops under back-pressure and the whole datapath -- counter and
+        // din -- freezes atomically; it can never outlive the counter, so a
+        // stage-0 transient din (a counter or a combinational function of it)
+        // needs no register. Route the stage>=1 case through one frozen
+        // reg-depth stage (Vitis's `v3_reg`: the FIFO write lands one stage
+        // after the read) by bumping the put's schedule stage. `start` feeds
+        // valid (activationPulse), reg-depth (tY), and drain (acc.stage) alike,
+        // so one bump moves them together; re-resolving yields depth 1.
+        if (r.ok && r.depth == 0 && dcpStart(acc.op) >= 1 &&
+            isTransientDin(token)) {
+          acc.op->setAttr(
+              "start",
+              IntegerAttr::get(
+                  cast<IntegerAttr>(acc.op->getAttr("start")).getType(),
+                  dcpStart(acc.op) + 1));
+          acc.stage = static_cast<unsigned>(dcpStart(acc.op));
+          r = resolveOperand(token, acc.op, ii);
+        }
+        recordEdge(r, acc.data, ridx);
+      }
       Value pred = isa<StreamGetOp>(acc.op)
                        ? cast<StreamGetOp>(acc.op).getPred()
                        : cast<StreamPutOp>(acc.op).getPred();
@@ -847,12 +934,15 @@ void DatapathBuilder::resolveAccessOperands() {
 }
 
 void DatapathBuilder::insertRegisters() {
+  // One register per (value, region) key -- its RegId, to patch the pending
+  // slots that read it (each in the same region the register lives in).
+  llvm::DenseMap<RegKey, RegId> keyToReg;
   for (auto &kv : depthsByKey)
-    insertRegister(kv.first, kv.second, baseByKey[kv.first],
-                   regionOfKey[kv.first]);
+    keyToReg[kv.first] = insertRegister(kv.first.first, kv.second,
+                                        baseByKey[kv.first], kv.first.second);
 
   for (const RegDepth &p : pending)
-    *p.slot = Source{Source::Kind::Reg, dp.valueToReg[p.key], p.depth};
+    *p.slot = Source{Source::Kind::Reg, keyToReg[p.key], p.depth};
 
   // Materialize sharing muxes: sources are final now (registers built, pending
   // resolved). A port whose bound ops all read one driver needs no mux.

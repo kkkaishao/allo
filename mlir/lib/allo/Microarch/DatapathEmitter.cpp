@@ -383,18 +383,22 @@ void DatapathEmitter::emitExternalReads(const uarch::RegionBlock &rb) {
 
 // Compute units of region \p rb: native -> comb; IP -> an instance of the
 // extern operator module (internally pipelined by its latency).
-void DatapathEmitter::emitUnits(const uarch::RegionBlock &rb) {
-  // Backedge every unit output before wiring, so an input may reference a unit
-  // emitted later: the widened-reduction idiom reads the accumulator as a
-  // depth-0 loop-carry from a later unit, and a fused recurrence reads its own
-  // output. A register elsewhere in the recurrence cycle keeps the hardware
-  // acyclic -- the backedges only free emission from topological order.
-  DenseMap<unsigned, Backedge> outBE;
+// Backedge every unit output before wiring, so an input may reference a unit
+// emitted later: the widened-reduction idiom reads the accumulator as a depth-0
+// loop-carry from a later unit, a fused recurrence reads its own output, and a
+// data-dependent read address (emitInternalReads, which runs before emitUnits)
+// reads a unit that computes it. A register elsewhere in the recurrence cycle
+// keeps the hardware acyclic -- the backedges only free emission from
+// topological order.
+void DatapathEmitter::declareUnits(const uarch::RegionBlock &rb) {
   for (uarch::UnitId uid : rb.units) {
     Backedge b = c.bb.get(hwType(dp.units[uid].resultType, c.b));
-    outBE[uid] = b;
+    unitBE[uid] = b;
     unitVal[uid] = b;
   }
+}
+
+void DatapathEmitter::emitUnits(const uarch::RegionBlock &rb) {
   for (uarch::UnitId uid : rb.units) {
     const uarch::FuncUnit &u = dp.units[uid];
     SmallVector<Value> operands;
@@ -402,27 +406,45 @@ void DatapathEmitter::emitUnits(const uarch::RegionBlock &rb) {
       Value v =
           resolveSource(u.inputs[k]); // a self-reference reads its own backedge
       // Re-inject the reduction identity at a recurrence input -- the port
-      // reading a loop-carried iter_arg -- on the first iteration, so a
+      // reading a loop-carried iter_arg -- on the first `dist` iterations, so a
       // retriggered reduction restarts from the identity. Gate = the
-      // first-iteration issue pulse (`issue & counter == lb`) delayed to this
-      // op's stage, the cycle it consumes the first iteration. The counter
-      // holds the real IV, so the first iteration is `iv == lb` (== 0 for a
-      // lb=0 loop). One gate for both regimes: free-running (counter = cycle)
-      // and modulo (counter advances at the issue cycle, so `counter == lb`
-      // alone is stale by the op's stage). The recurrence's register, if any,
-      // is a plain delay -- the init rides the input, since the widened idiom
-      // reads acc through a bare wire, not a tap.
+      // first-iterations issue pulse delayed to this op's stage, the cycle it
+      // consumes that iteration. The counter holds the real IV, so a distance-1
+      // recurrence's first iteration is `iv == lb` (== 0 for a lb=0 loop); a
+      // distance-d chained carry (a 2nd-order shift register `ym2 = ym1`, dist
+      // 2) reads d undefined past values before its own outputs, so the init
+      // must hold for `iv` in `[lb, lb + d*step)` -- otherwise later runs read
+      // the previous run's stale tail through the chain. One gate for both
+      // regimes: free-running (counter = cycle) and modulo (counter advances at
+      // the issue cycle). The recurrence's register, if any, is a plain delay
+      // -- the init rides the input, since the widened idiom reads acc through
+      // a bare wire, not a tap.
       if (u.inputInits[k].kind != uarch::Source::Kind::None) {
         const RegionControl rc = controlOf.lookup(rb.id);
         Value iv = rc.counter, issue = rc.issue;
         assert(iv && issue &&
                "recurrence input in a region with no controller");
-        // The first iteration is `iv == lb`; the lb is a runtime Source (a
-        // data-dependent range start) or the constant fast path.
+        // lb is a runtime Source (a data-dependent range start) or the constant
+        // fast path.
         Value lb =
             rb.lbSource ? resolveSource(rb.lbSource) : c.konst(c.i32, rb.lb);
-        Value iter0 = c.R(
-            comb::AndOp::create(c.b, c.loc, issue, c.icmpEqV(iv, lb), false));
+        unsigned dist = u.inputInitDist[k];
+        Value cond;
+        if (dist <= 1) {
+          cond = c.icmpEqV(iv, lb); // iv == lb
+        } else {
+          // iv < lb + dist*step  ==  !(iv >= lb + dist*step)
+          Value distStep =
+              rb.stepSource.kind != uarch::Source::Kind::None
+                  ? c.R(comb::MulOp::create(
+                        c.b, c.loc, c.konst(c.i32, static_cast<int64_t>(dist)),
+                        resolveSource(rb.stepSource), false))
+                  : c.konst(c.i32, static_cast<int64_t>(dist) * rb.step);
+          Value bound =
+              c.R(comb::AddOp::create(c.b, c.loc, lb, distStep, false));
+          cond = c.notBit(c.icmpUgeV(iv, bound));
+        }
+        Value iter0 = c.R(comb::AndOp::create(c.b, c.loc, issue, cond, false));
         Value gate = c.activationPulse(iter0, u.boundOps.front().first);
         v = c.mux(gate, resolveSource(u.inputInits[k]), v);
       }
@@ -442,11 +464,20 @@ void DatapathEmitter::emitUnits(const uarch::RegionBlock &rb) {
       operands.push_back(c.clkRaw);
       if (u.stall == allo::StallContractEnum::Ce)
         operands.push_back(c.regionEnable ? c.regionEnable : c.t1);
+      else
+        // A free-running / elastic IP has no `ce`, so it cannot be frozen. In a
+        // back-pressured (stream) region -- where `regionEnable` gates the
+        // shell's shift chains -- its pipeline would advance while the shell is
+        // stalled, folding a stale/misaligned result. Reject that pairing
+        // loudly; a stallable region needs a clock-enabled (Ce) operator.
+        assert(!c.regionEnable &&
+               "a free-running/elastic IP operator cannot participate in a "
+               "back-pressured region; use a clock-enabled (ce) operator");
       result = hw::InstanceOp::create(c.b, c.loc, unitModule.lookup(u.id),
                                       ("u" + Twine(u.id)).str(), operands)
                    ->getResult(0);
     }
-    outBE[uid].setValue(result);
+    unitBE[uid].setValue(result);
     unitVal[u.id] = result;
     // Name the result wire after the frontend variable this op computes (the
     // dcp op carries the assignment-target NameLoc, e.g. "acc").
@@ -921,6 +952,7 @@ DatapathFeedback DatapathEmitter::emit(const uarch::RegionBlock &rb,
                                        Value issue) {
   bindStreamReads(rb);
   emitRegisters(rb);
+  declareUnits(rb); // unit backedges must exist before a read address resolves
   emitInternalReads(rb);
   emitExternalReads(rb);
   emitUnits(rb);

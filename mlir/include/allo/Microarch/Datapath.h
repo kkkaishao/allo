@@ -170,6 +170,13 @@ struct FuncUnit {
   // register) because the widened idiom trunc(add(ext(acc),ext(x))) reads acc
   // through a bare wire, not a tap.
   llvm::SmallVector<Source, 2> inputInits;
+
+  // Per-input recurrence distance in iterations (parallel to `inputInits`); the
+  // emitter re-injects `inputInits[k]` for the first `inputInitDist[k]` runs. 1
+  // for an ordinary distance-1 recurrence; >1 for a chained carry (a 2nd-order
+  // shift register `ym2 = ym1; ym1 = y` gives ym2 distance 2, so its init must
+  // hold for the first two iterations, not just the first).
+  llvm::SmallVector<unsigned, 2> inputInitDist;
 };
 
 /// A shift-register chain carrying one SSA value across cycle boundaries. Its
@@ -439,7 +446,6 @@ struct Datapath {
   // these plus the schedule. (Memory port binding lives in MemUnit::accesses,
   // co-located with its memref.)
   llvm::DenseMap<Operation *, UnitId> opToUnit;
-  llvm::DenseMap<Value, RegId> valueToReg;
 
   // The Source of each of a region's results (its `uncondition` operands'
   // producers), for regions that yield one or more values, indexed by result
@@ -449,6 +455,14 @@ struct Datapath {
   // `None` entry marks an untracked result (asserts only if a sibling reads
   // it).
   llvm::DenseMap<RegionId, llvm::SmallVector<Source>> regionResult;
+
+  // The init (loop-carried identity) of each counted result, aligned with
+  // `regionResult`: a leaf reduction's iter-arg init, so an EMPTY (zero-trip)
+  // run yields the identity rather than a stale accumulator (captureCounted
+  // Results preloads the survivor with it on `start`). `None` when the result
+  // is not a loop-carried recurrence (an acyclic once-computed survivor, which
+  // always lands). Only set for pipeline regions.
+  llvm::DenseMap<RegionId, llvm::SmallVector<Source>> regionResultInit;
 
   // The i1 predicate of a guard region (a dcp.select), as a resolved Source.
   // The guard's children run once iff it holds (emitGuard start-gates them);

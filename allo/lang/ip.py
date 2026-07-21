@@ -1,11 +1,9 @@
-import ast
 from enum import Enum
 from dataclasses import dataclass
 from typing import TypeVar, ParamSpec, overload, Literal
-from collections.abc import Callable, Sequence
+from collections.abc import Callable
 
 from .kernel import Kernel
-from .core import TypeBase
 from .._mlir.ir import Module
 
 P = ParamSpec("P")
@@ -93,6 +91,10 @@ class IP(Kernel[P, R]):
             style=style,
         )
         self.optype = optype
+        # An optional user behavioral model for cosim: a C expression over the
+        # operands `a`, `b`, ... computing the result (see `add_c_model`). None
+        # falls back to the built-in expression for the operator's kind.
+        self.c_model: str | None = None
         verify_timing(self.timing)
 
     def __call__(self, *args: P.args, **kwargs: P.kwargs) -> R:
@@ -113,6 +115,21 @@ class IP(Kernel[P, R]):
         raise NotImplementedError(
             "External IPs do not have a module. They must be used within a kernel."
         )
+
+    def add_c_model(self, expr: str) -> "IP[P, R]":
+        """Attach a cosim behavioral model: a C expression over the operands
+        ``a``, ``b``, ... (positional) computing the result -- e.g.
+        ``add_c_model("a + b")`` or ``add_c_model("std::erf(a)")``. It overrides
+        the built-in expression the operator's ``optype`` would otherwise use, so
+        it is how a user characterizes an operator kind the backend has no
+        built-in model for. Returns ``self`` for chaining."""
+        if not isinstance(expr, str):
+            raise TypeError(f"add_c_model expects a C expression string, got {expr!r}")
+        self.c_model = expr
+        return self
+
+    def add_rtl_model(self, *arg, **kwargs):
+        raise NotImplementedError("add_rtl_model is not implemented yet")
 
 
 @overload

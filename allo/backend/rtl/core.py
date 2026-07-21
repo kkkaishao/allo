@@ -29,7 +29,13 @@ from ..cpu import CPU
 from ..._mlir.ir import Module
 from ..._mlir._mlir_libs._allo import ir_ext
 from ..._mlir.dialects.allo import emit_verilog, emit_datapath_to_hw
-from .device import builtin_device, Device, inject_operators, inject_device
+from .device import (
+    builtin_device,
+    Device,
+    inject_operators,
+    inject_device,
+    operator_descs,
+)
 from .schedule import run_schedule, ScheduleResult
 from .sim import shell
 from ...lang.core import ShapedType
@@ -249,6 +255,7 @@ class RTL(Backend[P, R]):
             self.arg_types,
             list(args),
             result_types=self.res_types,
+            operators=operator_descs(self._device.operators),
             simulator=simulator or self.simulator,
             freq_mhz=self.freq_mhz,
             timeout=timeout,

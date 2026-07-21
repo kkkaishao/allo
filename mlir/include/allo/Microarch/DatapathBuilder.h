@@ -40,6 +40,11 @@ struct Resolved {
   bool ok = false;  // false => producer outside this region / not modelled
   Source init = {}; // reduction identity iff this edge reads a loop-carried
                     // iter_arg (a recurrence input); None otherwise
+  unsigned initDist =
+      1; // recurrence distance (iterations) for `init`: the init
+         // must be re-injected for the first `initDist` runs (a
+         // distance-d carry, e.g. a 2nd-order shift register,
+         // reads d undefined past values before its own outputs)
 };
 
 //===----------------------------------------------------------------------===//
@@ -60,9 +65,15 @@ struct DatapathBuilder {
                                              // running accessor index per base
 
   // Interconnect-derivation scratch (transient; see deriveInterconnect).
+  // A register is keyed by (held value, consuming region): the SAME value (an
+  // enclosing loop's counter, delayed to a later stage) is read in several
+  // nested regions, and each needs its OWN delay chain built in its own region
+  // -- a single shared register would be emitted in one region and tapped,
+  // unbuilt, from a sibling emitted earlier.
+  using RegKey = std::pair<::mlir::Value, unsigned>;
   struct RegDepth { // a register-fed input slot, patched once its chain exists
     Source *slot;
-    Value key;
+    RegKey key;
     unsigned depth;
   };
   struct MuxBuild { // a shared unit port's per-op drivers, muxed after chains
@@ -72,9 +83,8 @@ struct DatapathBuilder {
     llvm::SmallVector<Operation *, 2> ops;
     llvm::SmallVector<Source, 2> sources; // parallel to ops
   };
-  llvm::MapVector<Value, llvm::SmallVector<unsigned>> depthsByKey;
-  llvm::DenseMap<Value, Source> baseByKey;
-  llvm::DenseMap<Value, unsigned> regionOfKey;
+  llvm::MapVector<RegKey, llvm::SmallVector<unsigned>> depthsByKey;
+  llvm::DenseMap<RegKey, Source> baseByKey;
   llvm::SmallVector<RegDepth> pending;
   std::deque<MuxBuild> muxBuilds; // a deque so `record`'s slot pointers into
                                   // `sources` survive later pushes

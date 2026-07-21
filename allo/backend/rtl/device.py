@@ -11,6 +11,7 @@ from enum import Enum
 
 from ...lang import f32, f64, bf16, i32, bool as _bool
 from ...lang.ip import ip, IP, OperatorType
+from .sim.ip_models import OpDesc, Ty
 
 
 class MemoryKind(Enum):
@@ -142,6 +143,45 @@ class Device:
         d.operators = list(self.operators)
         d.default_freq_mhz = self.default_freq_mhz
         return d
+
+
+# --- operator behavioral descriptors (for cosim) ---------------------------
+
+
+def _ty(dtype) -> Ty:
+    """A behavioral-model :class:`Ty` from an allo scalar dtype."""
+    return Ty(
+        name=dtype.name,
+        width=dtype.primitive_width,
+        is_float=dtype.is_float(),
+        signed=getattr(dtype, "signed", False),
+    )
+
+
+def operator_descs(operators: Sequence[IP]) -> list[OpDesc]:
+    """The device operators as behavioral :class:`OpDesc` descriptors -- the
+    cosim source of truth for each extern IP's kind/latency/dtypes (the emitted
+    hw IR supplies only the realized port shape). Non-operator IPs are skipped."""
+    out = []
+    for op in operators:
+        if op.optype is None:
+            continue
+        kind = (
+            op.optype.value if isinstance(op.optype, OperatorType) else str(op.optype)
+        )
+        rets = op.parse_return_annotation()
+        assert len(rets) == 1, f"operator IP {op.func_name!r} must return one scalar"
+        out.append(
+            OpDesc(
+                name=op.func_name,
+                kind=kind,
+                latency=op.timing.latency,
+                arg_types=tuple(_ty(a) for a in op.parse_argument_annotations()),
+                ret_type=_ty(rets[0]),
+                c_expr=op.c_model,
+            )
+        )
+    return out
 
 
 # --- injection into the scheduled module -----------------------------------

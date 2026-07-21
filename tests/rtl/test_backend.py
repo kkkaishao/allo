@@ -2109,6 +2109,126 @@ def test_dataflow_deterministic_merge():
         assert np.array_equal(out, golden), f"gap={gap}: {list(out)}"
 
 
+def test_transient_din_stability_under_backpressure():
+    """FIFO-din stability under back-pressure (regression for the transient-din
+    register). A stream producer whose token is a STAGE>=1 transient value -- a
+    combinational function of a memory load, `f(load) = B[k]*3` -- has a delayed
+    (shift-chain) valid, so output back-pressure holds it into the loop's drain
+    where the counter resets. Unless the din is captured into a chain-enable-
+    frozen register (bump the put one stage = Vitis's `v3_reg`), the held valid
+    re-addresses the live read and commits a corrupted FINAL token. A STAGE-0
+    counter-fed put (`put(k)`) instead freezes atomically with the issue pulse and
+    must stay correct WITHOUT being over-registered (the `dcpStart(put)>=1` guard).
+
+    A depth<K systolic column drives both deterministically: the interior PE
+    can't keep up, so it back-pressures the border producer's last token onto the
+    counter reset. M=1 keeps the flow a chain (back-pressure, no depth<K deadlock),
+    so the value bug -- not a hang -- is what the assert catches."""
+    M, N, K, DEPTH = 1, 2, 3, 2  # depth < K => the last put is held into the drain
+    P0, P1 = M + 2, N + 2
+
+    @kernel
+    def sa_fload(A: i32[M, K], B: i32[K, N], C: i32[M, N]):
+        fifo_A: Stream[i32, DEPTH][P0, P1]
+        fifo_B: Stream[i32, DEPTH][P0, P1]
+
+        @kernel(mapping=[P0, P1])
+        def pe(
+            A: i32[M, K],
+            B: i32[K, N],
+            C: i32[M, N],
+            fifo_A: Stream[i32, DEPTH][P0, P1],
+            fifo_B: Stream[i32, DEPTH][P0, P1],
+        ):
+            i = allo.get_wid(0)
+            j = allo.get_wid(1)
+            if (i == 0 or i == M + 1) and (j == 0 or j == N + 1):
+                pass
+            elif j == 0:
+                for k in range(K):
+                    fifo_A[i, j + 1].put(A[i - 1, k])
+            elif i == 0:
+                for k in range(K):
+                    fifo_B[i + 1, j].put(B[k, j - 1] * 3)  # f(load): stage>=1
+            elif i == M + 1:
+                for k in range(K):
+                    b: i32 = fifo_B[i, j].get()
+            elif j == N + 1:
+                for k in range(K):
+                    a: i32 = fifo_A[i, j].get()
+            else:
+                c: i32 = 0
+                for k in range(K):
+                    a: i32 = fifo_A[i, j].get()
+                    b: i32 = fifo_B[i, j].get()
+                    c += a * b
+                    fifo_A[i, j + 1].put(a)
+                    fifo_B[i + 1, j].put(b)
+                C[i - 1, j - 1] = c
+
+        pe(A, B, C, fifo_A, fifo_B)
+
+    @kernel
+    def sa_counter(A: i32[M, K], B: i32[K, N], C: i32[M, N]):
+        fifo_A: Stream[i32, DEPTH][P0, P1]
+        fifo_B: Stream[i32, DEPTH][P0, P1]
+
+        @kernel(mapping=[P0, P1])
+        def pe(
+            A: i32[M, K],
+            B: i32[K, N],
+            C: i32[M, N],
+            fifo_A: Stream[i32, DEPTH][P0, P1],
+            fifo_B: Stream[i32, DEPTH][P0, P1],
+        ):
+            i = allo.get_wid(0)
+            j = allo.get_wid(1)
+            if (i == 0 or i == M + 1) and (j == 0 or j == N + 1):
+                pass
+            elif j == 0:
+                for k in range(K):
+                    fifo_A[i, j + 1].put(A[i - 1, k])
+            elif i == 0:
+                for k in range(K):
+                    fifo_B[i + 1, j].put(k)  # counter: stage-0, atomically frozen
+            elif i == M + 1:
+                for k in range(K):
+                    b: i32 = fifo_B[i, j].get()
+            elif j == N + 1:
+                for k in range(K):
+                    a: i32 = fifo_A[i, j].get()
+            else:
+                c: i32 = 0
+                for k in range(K):
+                    a: i32 = fifo_A[i, j].get()
+                    b: i32 = fifo_B[i, j].get()
+                    c += a * b
+                    fifo_A[i, j + 1].put(a)
+                    fifo_B[i + 1, j].put(b)
+                C[i - 1, j - 1] = c
+
+        pe(A, B, C, fifo_A, fifo_B)
+
+    A = np.array([[4, 3, 2]], dtype=np.int32)
+    B = np.array([[1, 1], [2, 0], [1, 3]], dtype=np.int32)
+
+    # f(load): the forwarded b-token is 3*B[k], so C = A @ (3*B). The final put is
+    # held onto the counter reset -- without the din register it commits 3*B[0].
+    mod = _to_rtl(sa_fload)
+    out = np.zeros((M, N), np.int32)
+    mod.cosim(A, B, out)
+    exp = A @ (3 * B)
+    assert np.array_equal(out, exp), (list(out.ravel()), list(exp.ravel()))
+
+    # counter: the forwarded b-token is k (every column), so C[i,j] = sum_k A[i,k]*k.
+    # The stage-0 put must be correct WITHOUT the extra register.
+    mod = _to_rtl(sa_counter)
+    out = np.zeros((M, N), np.int32)
+    mod.cosim(A, B, out)
+    exp = A @ np.repeat(np.arange(K, dtype=np.int32)[:, None], N, axis=1)
+    assert np.array_equal(out, exp), (list(out.ravel()), list(exp.ravel()))
+
+
 def test_dataflow_nested_containers():
     """A process that is itself a container: the CPU golden across two and three
     nesting levels, then RTL emit of a container-as-callee and of a container

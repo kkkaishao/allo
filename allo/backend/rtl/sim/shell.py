@@ -46,15 +46,16 @@ class CosimResult:
 
 
 def _write_sources(
-    hw_ir: str, verilog: str, top: str, workdir: Path
+    hw_ir: str, verilog: str, top: str, workdir: Path, operators
 ) -> tuple[list[Path], list[str]]:
     """Write the DUT Verilog (+ extern-IP behavioral models) and DPI C. Returns
     (verilog_sources, build_args) for the runner. The extern-IP models and DPI are
-    derived from the hw IR, which names the operator instances."""
+    generated from the device ``operators`` (kind/latency/dtypes) joined to the
+    extern instances the hw IR declares (realized port shape)."""
     dut = workdir / f"{top}.sv"
-    dut.write_text(verilog + "\n" + ip_models.sv_models(hw_ir))
+    dut.write_text(verilog + "\n" + ip_models.sv_models(hw_ir, operators))
     build_args: list[str] = []
-    dpi = ip_models.dpi_c(hw_ir)
+    dpi = ip_models.dpi_c(hw_ir, operators)
     if dpi:
         cpp = workdir / "dpi.cpp"
         cpp.write_text(dpi)
@@ -149,6 +150,7 @@ def cosim(
     args,
     *,
     result_types=(),
+    operators=(),
     simulator: str = "verilator",
     freq_mhz: float = 300.0,
     timeout: int = 40000,
@@ -172,7 +174,7 @@ def cosim(
     wd = Path(tempfile.mkdtemp(prefix="allo_cosim_")) if tmp else Path(workdir)
     wd.mkdir(parents=True, exist_ok=True)
     try:
-        verilog_sources, build_args = _write_sources(hw_ir, verilog, top, wd)
+        verilog_sources, build_args = _write_sources(hw_ir, verilog, top, wd, operators)
         if simulator == "verilator":
             # The extern-IP behavioral models are width-approximate -- a fixed
             # 64-bit DPI backs a possibly-wider operator (e.g. a chained widened

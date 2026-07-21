@@ -2,34 +2,138 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """Behavioral (simulation-only) models for the extern IP operators the datapath
-emitter instantiates -- a float/double core, the widened integer multiply/divide,
-or a floating-point compare, none of which has a comb lowering.
+emitter instantiates -- a float/double arithmetic core, a floating-point compare,
+a float<->float resize, an int<->float cast, or an advanced ``math.*`` op, none of
+which has a comb lowering.
 
-The module name encodes op + latency and a leading kind letter ``f``/``d``/``i``
-for single-float / double / integer: a binary op is ``<k><op>_l<lat>``
-(``fadd_l7`` / ``dadd_l14`` / ``imul_l3``); a float compare is
-``<k>cmp_l<lat>_<pred>`` (``fcmp_l1_ogt``), one module per predicate, taking two
-operand-width inputs and yielding i1.
+The behavior is NOT inferred from the module name (that was a bootstrap harness).
+The device's operator table -- the same ``@ip`` records the scheduler was
+characterized from -- is threaded in as :class:`OpDesc` descriptors; the emitted
+hw IR supplies only the *structural* facts a descriptor cannot: which operators
+were actually instantiated, their realized port widths, whether they carry a
+``ce`` freeze bit, and (for a float compare) the per-instance predicate the
+emitter encoded as a name suffix.
 
-Each model is a ``latency``-deep shift of the result, gated by a ``ce``
-clock-enable when the IP carries one: ``ce == 0`` freezes the pipe, so it stays
-aligned with the shell's frozen shift chains under back-pressure. Float math goes
-through DPI-C because Verilator's ``$shortrealtobits`` returns 0, leaving no float
-bitcast; a C function reinterprets the raw bits at the port width (4 bytes for
-``f``, 8 for ``d``). An integer IP computes natively at its (<=64-bit,
-sign-extended) port width.
+An operator's behavior is a single **C expression** over its operands, bound as
+the positional typed C variables ``a``, ``b``, ``c``, ... . A built-in operator's
+expression comes from its abstract ``kind`` (:data:`_KIND_EXPR`); a user IP may
+override it with ``@ip.add_c_model("<expr>")`` (``OpDesc.c_expr``). Both feed one
+renderer: the operands are reinterpreted from raw bits at their dtype (so one
+``"a + b"`` covers f32/f64/bf16 -- the binding is per-operator, the expression is
+type-generic), the expression is evaluated, and the result's bits are returned.
+The SystemVerilog shell and the DPI-C function are rendered from the templates in
+``templates/`` (str.format), mirroring the Vitis backend.
 """
 
 from __future__ import annotations
 
 import re
 
-from collections import namedtuple
+from dataclasses import dataclass
+from pathlib import Path
 
-_OPS = {"add": "+", "sub": "-", "mul": "*", "div": "/", "rem": "%"}
+
+# --- descriptors (from the device operator table) --------------------------
+
+
+@dataclass(frozen=True)
+class Ty:
+    """One operand/result dtype, as the behavioral model needs to see it."""
+
+    name: str  # allo dtype name: float32 / float64 / bfloat16 / int32 / uint32 ...
+    width: int  # bit width
+    is_float: bool
+    signed: bool  # meaningful for integers only
+
+
+@dataclass(frozen=True)
+class OpDesc:
+    """One device operator IP, the behavioral source of truth. ``name`` is the
+    operator's ``sym_name`` -- the extern module's base name (the emitter may
+    append a ``_<predicate>`` suffix per compare instance). ``c_expr`` is a user
+    ``add_c_model`` C expression over the operands ``a``, ``b``, ...; ``None``
+    falls back to the built-in :data:`_KIND_EXPR` for ``kind``."""
+
+    name: str
+    kind: str  # abstract kind: add/sub/mul/div/rem/cmp/ifcast/fcast/<math mnemonic>
+    latency: int
+    arg_types: tuple[Ty, ...]
+    ret_type: Ty
+    c_expr: str | None = None
+
+
+# --- structural read of the emitted externs --------------------------------
+
+
+@dataclass(frozen=True)
+class _Extern:
+    """An instantiated extern operator module: the descriptor plus the realized
+    port shape read from the IR (names preserved so the behavioral module matches
+    the extern's ports exactly)."""
+
+    name: str  # full module name (base + optional predicate suffix)
+    ports: tuple[tuple[str, str, int], ...]  # (dir 'in'/'out', name, width) in order
+    pred: str  # compare predicate (or other name-encoded discriminant); "" if none
+    desc: OpDesc
+
+    def data_inputs(self) -> list[tuple[str, int]]:
+        return [
+            (n, w) for d, n, w in self.ports if d == "in" and n not in ("clk", "ce")
+        ]
+
+    @property
+    def has_ce(self) -> bool:
+        return any(d == "in" and n == "ce" for d, n, _ in self.ports)
+
+    @property
+    def clk(self) -> str:
+        return next((n for d, n, _ in self.ports if d == "in" and n == "clk"), "clk")
+
+    @property
+    def out(self) -> tuple[str, int]:
+        for d, n, w in self.ports:
+            if d == "out":
+                return n, w
+        raise AssertionError(f"extern {self.name} has no output port")
+
+
+# One `hw.module.extern @name(<ports>)`. `[^)]*` is safe because the operator
+# port types are all `iN` (bit-blasted) -- no nested parens -- and it spans
+# newlines (a char class matches `\n`), so a wrapped port list still parses.
+_EXTERN = re.compile(r"hw\.module\.extern @(\w+)\(([^)]*)\)")
+# One port `in %a : i32` / `out y : i32` (anchored at the token start; the `%` is
+# present on inputs, absent on the result). Matched per comma-split token so an
+# unrecognized port fails loudly rather than being silently dropped.
+_PORT = re.compile(r"(in|out)\s+%?(\w+)\s*:\s*i(\d+)")
+
+
+def _parse_ports(portstr: str) -> tuple[tuple[str, str, int], ...]:
+    """The ordered (dir, name, width) ports of an extern. Every comma-separated
+    token must parse -- a port shape the emitter produced that this does not
+    understand is a bug, not something to skip silently."""
+    ports = []
+    for tok in portstr.split(","):
+        tok = tok.strip()
+        if not tok:
+            continue
+        m = _PORT.match(tok)
+        assert m, f"ip_models: unrecognized extern operator port {tok!r}"
+        ports.append((m.group(1), m.group(2), int(m.group(3))))
+    return tuple(ports)
+
+
+_TEMPLATE_DIR = Path(__file__).with_name("templates")
+
+
+def _render(template: str, **kw: object) -> str:
+    return (_TEMPLATE_DIR / template).read_text(encoding="utf-8").format(**kw)
+
+
+# --- built-in behavior: abstract kind -> a C expression over `a`, `b` -------
+
 # Float-compare predicate -> C comparison operator. Ordered (o*) and unordered
 # (u*) map to the same operator: cosim inputs are NaN-free, so the only place they
-# differ (a NaN operand) does not arise.
+# would differ (a NaN operand) does not arise.
 _CMP = {
     "oeq": "==",
     "one": "!=",
@@ -44,100 +148,195 @@ _CMP = {
     "ult": "<",
     "ule": "<=",
 }
+_ARITH = {"add": "a + b", "sub": "a - b", "mul": "a * b", "div": "a / b"}
+# Advanced math mnemonic -> C++ <cmath> function (overloaded on float/double).
+_LIBM = {
+    "sqrt": "std::sqrt",
+    "exp": "std::exp",
+    "log": "std::log",
+    "sin": "std::sin",
+    "cos": "std::cos",
+    "tan": "std::tan",
+    "tanh": "std::tanh",
+    "abs": "std::fabs",
+    "absf": "std::fabs",
+    "floor": "std::floor",
+    "ceil": "std::ceil",
+}
 
-# One extern IP operator. `dpi` is the DPI function suffix (arith op for a binary,
-# predicate for a compare); `cexpr` its C operator; `is_cmp` picks the DPI body
-# (a compare returns 0/1, a binary reinterprets the arithmetic result); `has_ce`
-# is the clock-enable freeze bit (present when the IP's stall contract is
-# clock-enabled, i.e. `(a, b, clk, ce) -> y`).
-Extern = namedtuple("Extern", "name in_w out_w kind dpi cexpr latency is_cmp has_ce")
+
+def _kind_expr(desc: OpDesc, pred: str) -> str:
+    """The built-in C expression for ``desc.kind`` over operands ``a``, ``b``."""
+    k = desc.kind
+    if k in _ARITH:
+        return _ARITH[k]
+    if k == "rem":
+        return "std::fmod(a, b)"
+    if k == "cmp":
+        assert pred in _CMP, f"unsupported float-compare predicate '{pred}'"
+        return f"a {_CMP[pred]} b"
+    if k in _LIBM:  # advanced unary math
+        return f"{_LIBM[k]}(a)"
+    if k in ("ifcast", "fcast"):  # unary conversion: value cast src -> dst
+        return f"({_cscalar(desc.ret_type)})a"
+    raise NotImplementedError(
+        f"no cosim behavioral model for operator kind '{k}' (operator "
+        f"'{desc.name}'); attach one with @ip.add_c_model(\"<C expression>\")"
+    )
 
 
-def externs(ir: str):
-    """The extern IP operators the emitter declared, as :class:`Extern` records."""
-    out = []
-    for m in re.finditer(
-        r"hw\.module\.extern @(\w+)\(in %a : i(\d+), in %b : i\d+, "
-        r"in %clk : i1(, in %ce : i1)?, out \w+ : i(\d+)\)",
-        ir,
-    ):
-        name, in_w = m.group(1), int(m.group(2))
-        has_ce, out_w = m.group(3) is not None, int(m.group(4))
-        binary = re.match(r"([fdi])(add|sub|mul|div|rem)_l(\d+)$", name)
-        compare = re.match(r"([fd])cmp_l(\d+)_(\w+)$", name)
-        if binary:
-            k, op, lat = binary.group(1), binary.group(2), int(binary.group(3))
-            out.append(Extern(name, in_w, out_w, k, op, _OPS[op], lat, False, has_ce))
-        elif compare:
-            k, lat, pred = compare.group(1), int(compare.group(2)), compare.group(3)
-            assert pred in _CMP, f"unsupported float-compare predicate '{pred}'"
-            out.append(
-                Extern(name, in_w, out_w, k, pred, _CMP[pred], lat, True, has_ce)
+def _compute_expr(e: _Extern) -> str:
+    """The operator's C expression: a user ``add_c_model`` override, else the
+    built-in expression for its kind."""
+    return e.desc.c_expr if e.desc.c_expr is not None else _kind_expr(e.desc, e.pred)
+
+
+# --- operand / result bit-pattern ABI --------------------------------------
+
+
+def _cscalar(ty: Ty) -> str:
+    """The C scalar type a value of ``ty`` is computed in."""
+    if ty.is_float:
+        return "double" if ty.name == "float64" else "float"  # bf16 computes in float
+    return f"int{ty.width}_t" if ty.signed else f"uint{ty.width}_t"
+
+
+def _load(ty: Ty, raw: str, name: str) -> str:
+    """C statement(s) binding operand ``name`` to a typed value from raw bits ``raw``."""
+    if ty.is_float:
+        if ty.name == "bfloat16":
+            return (
+                f"float {name}; {{ unsigned int _u = "
+                f"((unsigned int)({raw} & 0xFFFFu)) << 16; memcpy(&{name}, &_u, 4); }}"
             )
-        else:
-            assert False, f"no behavioral model for extern operator '{name}'"
+        cty, n = ("double", 8) if ty.name == "float64" else ("float", 4)
+        return f"{cty} {name}; memcpy(&{name}, &{raw}, {n});"
+    assert ty.width in (1, 8, 16, 32, 64), f"unsupported int width {ty.width}"
+    ity = f"int{ty.width}_t" if ty.signed else f"uint{ty.width}_t"
+    return f"{ity} {name} = ({ity}){raw};"
+
+
+def _store(ty: Ty, val: str) -> str:
+    """C expression producing the ``long long`` raw bits of typed value ``val``."""
+    if ty.is_float:
+        if ty.name == "bfloat16":
+            return f"({{ unsigned int _u; memcpy(&_u, &{val}, 4); (long long)(_u >> 16); }})"
+        n = 8 if ty.name == "float64" else 4
+        return f"({{ long long _o = 0; memcpy(&_o, &{val}, {n}); _o; }})"
+    return f"(long long)({val})"
+
+
+# --- join externs to descriptors -------------------------------------------
+
+
+def _split_name(name: str, by_name: dict[str, OpDesc]) -> tuple[OpDesc, str]:
+    """Join an extern module name to its descriptor: an exact match, else the
+    longest descriptor whose name is a ``<name>_`` prefix (the emitter's compare
+    suffix). The trailing part is the predicate/discriminant."""
+    if name in by_name:
+        return by_name[name], ""
+    cands = [b for b in by_name if name.startswith(b + "_")]
+    assert cands, f"extern operator '{name}' has no matching device operator"
+    base = max(cands, key=len)
+    return by_name[base], name[len(base) + 1 :]
+
+
+def _plan(ir: str, descs) -> list[_Extern]:
+    """The instantiated extern operators, each joined to its descriptor."""
+    by_name = {d.name: d for d in descs}
+    out = []
+    for m in _EXTERN.finditer(ir):
+        name, portstr = m.group(1), m.group(2)
+        desc, pred = _split_name(name, by_name)
+        out.append(_Extern(name, _parse_ports(portstr), pred, desc))
     return out
 
 
-def sv_models(ir: str) -> str:
-    """SystemVerilog behavioral models + DPI import decls for the extern IP ops."""
-    ext = externs(ir)
-    if not ext:
-        return ""
-    used = sorted({(e.kind, e.dpi) for e in ext})
-    ctype = lambda k: "int" if k == "f" else "longint"  # f=32-bit, d/i=64-bit
-    imports = "".join(
-        f'import "DPI-C" function {ctype(k)} {k}_{op}'
-        f"(input {ctype(k)} a, input {ctype(k)} b);\n"
-        for k, op in used
+# --- rendering -------------------------------------------------------------
+
+
+def _dpi_name(e: _Extern) -> str:
+    """A DPI function name unique per behavior (the operator + its predicate)."""
+    return f"allo_op_{e.desc.name}" + (f"_{e.pred}" if e.pred else "")
+
+
+def _dpi_slots(e: _Extern) -> tuple[str, str]:
+    """The rendered ``binds`` and ``body`` for one operator's DPI function."""
+    d = e.desc
+    binds = "".join(
+        f"  {_load(t, f'p{k}', chr(ord('a') + k))}\n" for k, t in enumerate(d.arg_types)
     )
-    out = [imports]
-    for e in ext:
-        # A clock-enabled IP guards its shift on `ce`, so a low `ce` freezes the
-        # whole pipe.
-        ce_port = ", input ce" if e.has_ce else ""
-        guard = "if (ce) " if e.has_ce else ""
-        out.append(
-            f"module {e.name}(input [{e.in_w - 1}:0] a, input [{e.in_w - 1}:0] b, "
-            f"input clk{ce_port}, output [{e.out_w - 1}:0] y);\n"
-            f"  reg [{e.out_w - 1}:0] p [0:{e.latency - 1}];\n  integer i;\n"
-            f"  always @(posedge clk) {guard}begin\n"
-            f"    p[0] <= {e.kind}_{e.dpi}(a, b);\n"
-            f"    for (i = 1; i < {e.latency}; i = i + 1) p[i] <= p[i - 1];\n"
-            f"  end\n"
-            f"  assign y = p[{e.latency - 1}];\n"
-            f"endmodule\n"
-        )
-    return "\n".join(out)
+    expr = _compute_expr(e)
+    if d.ret_type.is_float:
+        body = f"  {_cscalar(d.ret_type)} _r = ({expr});\n  return {_store(d.ret_type, '_r')};"
+    else:  # int / bool result (a compare, a float->int cast): no reinterpret
+        body = f"  return {_store(d.ret_type, f'({expr})')};"
+    return binds, body
 
 
-def dpi_c(ir: str) -> str:
-    """C implementations of the DPI operators used: a float op reinterprets the
-    raw bits, computes, and reinterprets back; a float compare returns 0/1; an
-    integer op computes natively (64-bit, operands pre-extended)."""
-    used = sorted({(e.kind, e.dpi, e.cexpr, e.is_cmp) for e in externs(ir)})
-    if not used:
+def dpi_c(ir: str, descs) -> str:
+    """C implementations of the DPI operators the instantiated externs need."""
+    plan = _plan(ir, descs)
+    if not plan:
         return ""
-    lines = []
-    for k, op, cexpr, is_cmp in used:
-        if k == "i":
-            lines.append(
-                f'extern "C" long long i_{op}(long long a, long long b) '
-                f"{{ return a {cexpr} b; }}"
-            )
+    fns: dict[str, str] = {}
+    for e in plan:
+        name = _dpi_name(e)
+        if name in fns:
             continue
-        # f: 32-bit float; d: 64-bit double. Reinterpret the raw integer bits at
-        # the port width.
-        cty, fty, n = ("int", "float", 4) if k == "f" else ("long long", "double", 8)
-        if is_cmp:
-            lines.append(
-                f'extern "C" {cty} {k}_{op}({cty} a, {cty} b) {{ {fty} x, y; '
-                f"memcpy(&x,&a,{n}); memcpy(&y,&b,{n}); return x {cexpr} y; }}"
+        params = ", ".join(f"long long p{k}" for k in range(len(e.desc.arg_types)))
+        binds, body = _dpi_slots(e)
+        fns[name] = _render(
+            "dpi_op.c.in", name=name, params=params, binds=binds, body=body
+        )
+    return _render("dpi_c.in", functions="\n".join(fns.values()))
+
+
+def sv_models(ir: str, descs) -> str:
+    """SystemVerilog behavioral models + DPI import decls for the instantiated
+    extern IP operators."""
+    plan = _plan(ir, descs)
+    if not plan:
+        return ""
+    imports: dict[str, str] = {}
+    modules = []
+    for e in plan:
+        dpi = _dpi_name(e)
+        params = ", ".join(f"input longint p{k}" for k in range(len(e.desc.arg_types)))
+        imports[dpi] = f'import "DPI-C" function longint {dpi}({params});'
+
+        lat = e.desc.latency
+        assert (
+            lat >= 1
+        ), f"operator '{e.desc.name}' needs latency >= 1 for a shift model"
+        ins = e.data_inputs()
+        assert len(ins) == len(e.desc.arg_types), (
+            f"operator '{e.desc.name}': extern has {len(ins)} data ports but the "
+            f"descriptor declares {len(e.desc.arg_types)} operands"
+        )
+        out_name, outw = e.out
+        ports = ", ".join(f"input [{w - 1}:0] {n}" for n, w in ins)
+        ports += f", input {e.clk}"
+        if e.has_ce:
+            ports += ", input ce"
+        ports += f", output [{outw - 1}:0] {out_name}"
+        call = f"{dpi}(" + ", ".join(n for n, _ in ins) + ")"
+        modules.append(
+            _render(
+                "sv_op.sv.in",
+                name=e.name,
+                ports=ports,
+                msb=outw - 1,
+                last=lat - 1,
+                clk=e.clk,
+                guard="if (ce) " if e.has_ce else "",
+                call=call,
+                latency=lat,
+                out_name=out_name,
             )
-        else:
-            lines.append(
-                f'extern "C" {cty} {k}_{op}({cty} a, {cty} b) {{ {fty} x, y, r; '
-                f"memcpy(&x,&a,{n}); memcpy(&y,&b,{n}); r = x {cexpr} y; "
-                f"{cty} o; memcpy(&o,&r,{n}); return o; }}"
-            )
-    return "#include <cstring>\n" + "\n".join(lines) + "\n"
+        )
+    return _render(
+        "sv_models.in",
+        imports="\n".join(imports.values()),
+        modules="\n".join(modules),
+    )
