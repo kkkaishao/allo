@@ -20,6 +20,8 @@ import pytest  # noqa: E402
 from allo import kernel  # noqa: E402
 from allo.lang import f32, index  # noqa: E402
 from allo.operators import math as amath  # noqa: E402
+from allo.lang.ip import ip  # noqa: E402
+from allo.backend.rtl.device import builtin_device  # noqa: E402
 from _common import (  # noqa: E402
     _sched,
     _to_rtl,
@@ -500,6 +502,11 @@ def test_data_dependent_bounds_leave_latency_unknown():
     whole-function latency is left undetermined rather than fabricated."""
     N = 120
 
+    # sqrt is non-combinational with no built-in characterization (design doc
+    # SS5.4): declare it as an operator IP so the kernel is fully characterized.
+    @ip(optype="sqrt", latency=7, pipelined=True, style="ce")
+    def fsqrt(a: f32) -> f32: ...
+
     @kernel
     def cholesky(A: f32[N, N]):
         for i in range(N):
@@ -511,7 +518,9 @@ def test_data_dependent_bounds_leave_latency_unknown():
                 A[i, i] = A[i, i] - A[i, k] * A[i, k]
             A[i, i] = amath.sqrt(A[i, i] * 1.0)
 
-    res = _sched(cholesky)
+    dev = builtin_device.copy()
+    dev.add_operator(fsqrt)
+    res = _sched(cholesky, device=dev)
     assert res.func("cholesky").latency is None
     assert any(r.ii > 1 for r in res.cyclic())
 

@@ -521,7 +521,7 @@ struct DatapathEmitter {
   DenseMap<unsigned, Value> unitVal;             // unit id -> result
   DenseMap<unsigned, Value> muxVal;              // mux id -> resolved output
 
-  // The child modules a `dcp.invoke`'s CallUnit instantiates (null for
+  // The child modules a `dcp.instance`'s CallUnit instantiates (null for
   // a plain leaf with no calls).
   const uarch::CalleeCtx *callees = nullptr;
 
@@ -603,7 +603,7 @@ struct DatapathEmitter {
   /// deepest store's stage, `storeDrain`).
   DatapathFeedback emitAccesses(const uarch::RegionBlock &rb, Value issue);
 
-  /// Instantiate each CallUnit (dcp.invoke) in region \p rb as a child
+  /// Instantiate each CallUnit (dcp.instance) in region \p rb as a child
   /// `hw.instance`: wire clk/rst/`start`; drive/read each mastered
   /// buffer's hlmem via the child's addr/data/we ports; fold the child's `done`
   /// into \p fb.callDone (the region's completion). Runs after emitAccesses so
@@ -667,7 +667,7 @@ struct HWEmitter {
   /// children once per outer iteration.
   Value emitRegion(const uarch::RegionBlock &rb, Value start, bool retrig);
   /// A loop-over-call region: a counted `dcp.pipeline` wrapping one
-  /// `dcp.invoke`. One child instance is fired \p tripCount times, a counter
+  /// `dcp.instance`. One child instance is fired \p tripCount times, a counter
   /// driving its index and each invocation advancing on the child's real `done`
   /// (throughput = one iteration per child latency, not the pipeline cadence).
   /// The counter is the region's `rc.counter` (so `emitCalls` wires the child's

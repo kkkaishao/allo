@@ -37,11 +37,8 @@ def ConvertScheduleToDCPPass : Pass<"convert-schedule-to-dcp", "ModuleOp"> {
     whose funcs carry `allo.sched.*` schedule attributes into `allo.dcp.*` ops and
     strip the carrier. `allo-schedule` runs this automatically as its final phase;
     this pass exposes it for inspecting the carrier->dcp conversion in isolation.
+    Operator/device timing is read from the injected dcp.device / dcp.operator IR.
   }];
-  let options = [
-    Option<"operatorLibrary", "operator-library", "std::string", "\"\"",
-           "Path to a YAML operator library; empty uses the built-in default">
-  ];
 }
 
 #endif // ALLO_CONVERSION_PASSES_TD

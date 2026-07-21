@@ -57,6 +57,7 @@ from .._mlir.dialects.ub import PoisonOp
 from .builder import AlloOpBuilder
 from ..lang.kernel import ConstevalFunction, Kernel, KernelOptions
 from ..lang.kernel import kernel as kernel_decorator
+from ..lang.ip import ip as ip_decorator, IP
 from ..lang.core import (
     ConstexprValue,
     AlloValue,
@@ -81,64 +82,7 @@ from ..lang.module import Module as AlloModule
 from ..operators import arith as arith_ops, memory as mem_ops
 from ..operators.utils import BitSlice
 from .errors import CompilationError, StaticAssertionError, InternalCompilerError
-
-
-def generate_function_type(
-    context: Context, arg_types: Sequence[TypeBase], res_types: Sequence[TypeBase]
-) -> FunctionType:
-    mlir_arg_types = []
-    for ty in arg_types:
-        if isinstance(ty, ConstexprType):
-            continue
-        mlir_arg_types.append(ty.materialize(context))
-    mlir_res_types = []
-    for ty in res_types:
-        if isinstance(ty, StreamType):
-            raise TypeError("Stream is not allowed as a kernel return type.")
-        if isinstance(ty, ConstexprType):
-            continue
-        mlir_res_types.append(ty.materialize(context))
-    return FunctionType.get(mlir_arg_types, mlir_res_types, context)
-
-
-def generate_signedness_marker(
-    arg_types: Sequence[TypeBase], res_types: Sequence[TypeBase]
-) -> str:
-    """Build the ``allo.signed`` marker: one char per MLIR func operand then
-    result, in order. 's' = signed integer, 'u' = unsigned integer, 'x' =
-    non-integer. The filtering mirrors ``generate_function_type`` so the marker
-    length equals the function's operand + result count."""
-
-    def sign_char(ty: TypeBase) -> str:
-        if isinstance(ty, ShapedType):
-            ty = ty.dtype
-        if isinstance(ty, DType):
-            if ty.is_int():
-                return "s"
-            if ty.is_uint():
-                return "u"
-        if isinstance(ty, StreamType):
-            return sign_char(ty.base_type)
-        return "x"
-
-    chars = [sign_char(ty) for ty in arg_types if not isinstance(ty, ConstexprType)]
-    chars += [
-        sign_char(ty)
-        for ty in res_types
-        if not isinstance(ty, (ConstexprType, StreamType))
-    ]
-    return "".join(chars)
-
-
-def _global_symbol(func_name: str, var_id: str, kind: str, node: ast.AST) -> str:
-    """Canonical name for a compiler-emitted module global or helper kernel,
-    shared by stateful variables (``kind="stateful"``), list/NumPy-initialized
-    constants (``kind="const"``) and bufferize copy kernels (``kind="bufferize"``).
-    Keyed on the source declaration -- enclosing kernel, variable, line and column
-    -- so the name is stable and unique: repeated kernel instantiations resolve to
-    one symbol, while distinct declarations never collide. The C++ emitter
-    sanitizes it into a valid identifier."""
-    return f"_allo_{kind}_{func_name}_{var_id}_l{node.lineno}c{node.col_offset}"
+from .utils import generate_function_type, global_symbol, generate_signedness_marker
 
 
 class ReturnPlacementChecker(ast.NodeVisitor):
@@ -649,7 +593,14 @@ class MLIRCodeGenerator(ast.NodeVisitor):
                 mapping_node = kw.value
             decorator = decorator.func
 
-        if self._resolve_kernel_decorator(decorator) is not kernel_decorator:
+        decorator = self._resolve_kernel_decorator(decorator)
+
+        if decorator is ip_decorator:
+            return self.compile_error(
+                f"External IPs are not allowed to be defined as nested functions. Use a top-level '@ip' definition instead."
+            )
+
+        if decorator is not kernel_decorator:
             return self.compile_error(
                 f"Nested function '{node.name}' is not allowed. Only allo kernels are supported for nested definitions."
             )
@@ -2090,7 +2041,7 @@ class MLIRCodeGenerator(ast.NodeVisitor):
     def _global_symbol(self, node: ast.AST, var_id: str, kind: str) -> str:
         """Instance-scoped wrapper over the module-level ``_global_symbol``, keyed
         on this generator's entry kernel."""
-        return _global_symbol(self.kernel.func_name, var_id, kind, node)
+        return global_symbol(self.kernel.func_name, var_id, kind, node)
 
     def _visit_stateful_decl(self, node: ast.AnnAssign, parsed_type: StatefulType):
         inner = parsed_type.inner

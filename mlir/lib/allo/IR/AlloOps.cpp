@@ -10,6 +10,8 @@
 // The generated ISA op parsers (custom<DynamicIndexList>) need these helpers.
 #include "mlir/Interfaces/ViewLikeInterface.h"
 
+#include "llvm/Support/Format.h"
+
 #include "allo/IR/AlloDialect.cpp.inc"
 
 #include "allo/IR/AlloEnums.cpp.inc"
@@ -368,44 +370,31 @@ DCPathUnitOp::verifySymbolUses(SymbolTableCollection &symbolTable) {
 
 LogicalResult
 DCPathComputeOp::verifySymbolUses(SymbolTableCollection &symbolTable) {
-  if (!symbolTable.lookupNearestSymbolFrom<DCPathOperatorOp>(*this,
-                                                             getOpTypeAttr()))
-    return emitOpError("references unknown operator type '")
-           << getOpType() << "'";
+  if (FlatSymbolRefAttr opType = getOpTypeAttr())
+    if (!symbolTable.lookupNearestSymbolFrom<DCPathOperatorOp>(*this, opType))
+      return emitOpError("references unknown operator type '")
+             << opType.getValue() << "'";
   if (FlatSymbolRefAttr unit = getUnitAttr())
     if (!symbolTable.lookupNearestSymbolFrom<DCPathUnitOp>(*this, unit))
       return emitOpError("references unknown unit '") << unit.getValue() << "'";
   return success();
 }
 
-// A memory op's operator type is optional; verify it when present.
-static LogicalResult verifyOptionalOperator(Operation *op,
-                                            SymbolTableCollection &symbolTable,
-                                            FlatSymbolRefAttr opr) {
-  if (opr && !symbolTable.lookupNearestSymbolFrom<DCPathOperatorOp>(op, opr))
-    return op->emitOpError("references unknown operator type '")
-           << opr.getValue() << "'";
-  return success();
-}
-
-LogicalResult
-DCPathLoadOp::verifySymbolUses(SymbolTableCollection &symbolTable) {
-  return verifyOptionalOperator(*this, symbolTable, getOpTypeAttr());
-}
-
-LogicalResult
-DCPathStoreOp::verifySymbolUses(SymbolTableCollection &symbolTable) {
-  return verifyOptionalOperator(*this, symbolTable, getOpTypeAttr());
-}
-
 LogicalResult DCPathComputeOp::verify() {
   if (getStart() < 0)
     return emitOpError("start cycle must be non-negative");
+  // Exactly one realization path: a combinational kind or an IP operator
+  // symbol.
+  if (getCombKindAttr() && getOpTypeAttr())
+    return emitOpError("has both 'comb_kind' and 'op_type'; set exactly one");
+  if (!getCombKindAttr() && !getOpTypeAttr())
+    return emitOpError(
+        "has neither 'comb_kind' nor 'op_type'; set exactly one");
   return success();
 }
 
 LogicalResult
-DCPathInvokeOp::verifySymbolUses(SymbolTableCollection &symbolTable) {
+DCPathInstanceOp::verifySymbolUses(SymbolTableCollection &symbolTable) {
   // The callee is a scheduled `func.func` at reify time (an `hw.module` after
   // emit); accept any symbol so the verifier survives both stages.
   if (!symbolTable.lookupNearestSymbolFrom(*this, getCalleeAttr()))
@@ -413,7 +402,7 @@ DCPathInvokeOp::verifySymbolUses(SymbolTableCollection &symbolTable) {
   return success();
 }
 
-LogicalResult DCPathInvokeOp::verify() {
+LogicalResult DCPathInstanceOp::verify() {
   if (getStart() < 0)
     return emitOpError("start cycle must be non-negative");
   return success();
@@ -488,6 +477,229 @@ OperandRange DCPathPipelineOp::getCarriedValues() {
 }
 
 //===----------------------------------------------------------------------===//
+// dcp.operator / dcp.device custom assembly
+//===----------------------------------------------------------------------===//
+
+// Print a delay as a compact decimal (e.g. `0.5`, `1.2`), instead of the
+// exponent form MLIR uses for float attributes (`5.000000e-01`).
+static void printNum(OpAsmPrinter &p, double v) { p << llvm::format("%g", v); }
+
+// Parse a delay, accepting both a float literal and a whole number (which the
+// compact printer above emits without a trailing dot, e.g. `0` or `2`).
+static ParseResult parseNum(OpAsmParser &p, double &v) {
+  APInt whole;
+  if (OptionalParseResult r = p.parseOptionalInteger(whole); r.has_value()) {
+    if (failed(*r))
+      return failure();
+    v = whole.getSExtValue();
+    return success();
+  }
+  return p.parseFloat(v);
+}
+
+// A storage-timing record `{rd_lat = N, wr_lat = N, rd_delay = F, wr_delay =
+// F}` (ints kept as ints, delays as compact decimals). Printing is generic over
+// the record's fields; parsing keys the two latency fields to integer type.
+static void printTiming(OpAsmPrinter &p, DictionaryAttr d) {
+  p << '{';
+  llvm::interleaveComma(d, p, [&](NamedAttribute e) {
+    p << e.getName().strref() << " = ";
+    if (auto i = dyn_cast<IntegerAttr>(e.getValue()))
+      p << i.getInt();
+    else
+      printNum(p, cast<FloatAttr>(e.getValue()).getValueAsDouble());
+  });
+  p << '}';
+}
+
+static ParseResult parseTiming(OpAsmParser &p, Attribute &out) {
+  Builder &b = p.getBuilder();
+  SmallVector<NamedAttribute> fields;
+  StringRef key;
+  auto field = [&]() -> ParseResult {
+    if (p.parseKeyword(&key) || p.parseEqual())
+      return failure();
+    if (key == "rd_lat" || key == "wr_lat") {
+      int64_t n;
+      if (p.parseInteger(n))
+        return failure();
+      fields.push_back(b.getNamedAttr(key, b.getI64IntegerAttr(n)));
+    } else {
+      double f;
+      if (parseNum(p, f))
+        return failure();
+      fields.push_back(b.getNamedAttr(key, b.getF32FloatAttr(f)));
+    }
+    return success();
+  };
+  if (p.parseLBrace() || field())
+    return failure();
+  while (succeeded(p.parseOptionalComma()))
+    if (field())
+      return failure();
+  if (p.parseRBrace())
+    return failure();
+  out = b.getDictionaryAttr(fields);
+  return success();
+}
+
+// Parse the optional determinacy keyword a scheduling region prints just before
+// its attr-dict (e.g. `concurrent`). Any bare keyword in that position is a
+// determinacy class -- an unknown one is an error.
+static ParseResult parseOptionalDeterminacy(OpAsmParser &p,
+                                            OperationState &result,
+                                            StringAttr attrName) {
+  StringRef kw;
+  if (failed(p.parseOptionalKeyword(&kw)))
+    return success();
+  std::optional<DeterminacyEnum> d = symbolizeDeterminacyEnum(kw);
+  if (!d)
+    return p.emitError(p.getNameLoc(), "unknown determinacy '") << kw << "'";
+  result.addAttribute(attrName,
+                      DeterminacyEnumAttr::get(result.getContext(), *d));
+  return success();
+}
+
+void DCPathOperatorOp::print(OpAsmPrinter &p) {
+  p << ' ';
+  p.printSymbolName(getSymName());
+  p << getSignature();
+  p << " kind=" << getKind();
+  p << " latency " << getLatency();
+  p << " in_delay ";
+  printNum(p, getInDelayAttr().getValueAsDouble());
+  p << " out_delay ";
+  printNum(p, getOutDelayAttr().getValueAsDouble());
+  if (getPipelined())
+    p << " pipelined";
+  p << ' ' << stringifyStallContractEnum(getStall());
+}
+
+ParseResult DCPathOperatorOp::parse(OpAsmParser &p, OperationState &result) {
+  Builder &b = p.getBuilder();
+  StringAttr symName;
+  StringRef kind, stall;
+  Type sig;
+  int64_t latency;
+  double inDelay, outDelay;
+  if (p.parseSymbolName(symName, getSymNameAttrName(result.name),
+                        result.attributes) ||
+      p.parseType(sig) || p.parseKeyword("kind") || p.parseEqual() ||
+      p.parseKeyword(&kind) || p.parseKeyword("latency") ||
+      p.parseInteger(latency) || p.parseKeyword("in_delay") ||
+      parseNum(p, inDelay) || p.parseKeyword("out_delay") ||
+      parseNum(p, outDelay))
+    return failure();
+  auto fnTy = dyn_cast<FunctionType>(sig);
+  if (!fnTy)
+    return p.emitError(p.getNameLoc(), "expected a function-type signature");
+  bool pipelined = succeeded(p.parseOptionalKeyword("pipelined"));
+  if (p.parseKeyword(&stall))
+    return failure();
+  std::optional<StallContractEnum> s = symbolizeStallContractEnum(stall);
+  if (!s)
+    return p.emitError(p.getNameLoc(), "unknown stall contract '")
+           << stall << "'";
+  result.addAttribute(getKindAttrName(result.name), b.getStringAttr(kind));
+  result.addAttribute(getSignatureAttrName(result.name), TypeAttr::get(fnTy));
+  result.addAttribute(getLatencyAttrName(result.name),
+                      b.getI64IntegerAttr(latency));
+  result.addAttribute(getInDelayAttrName(result.name),
+                      b.getF32FloatAttr(inDelay));
+  result.addAttribute(getOutDelayAttrName(result.name),
+                      b.getF32FloatAttr(outDelay));
+  result.addAttribute(getPipelinedAttrName(result.name),
+                      b.getBoolAttr(pipelined));
+  result.addAttribute(getStallAttrName(result.name),
+                      StallContractEnumAttr::get(b.getContext(), *s));
+  return success();
+}
+
+void DCPathDeviceOp::print(OpAsmPrinter &p) {
+  p << " {";
+  p.increaseIndent();
+  // comb: one `kind = delay` per line.
+  p.printNewline();
+  p << "comb {";
+  p.increaseIndent();
+  for (NamedAttribute e : getComb()) {
+    p.printNewline();
+    p << e.getName().strref() << " = ";
+    printNum(p, cast<FloatAttr>(e.getValue()).getValueAsDouble());
+  }
+  p.decreaseIndent();
+  p.printNewline();
+  p << '}';
+  // memory: one storage primitive per line.
+  p.printNewline();
+  p << "memory {";
+  p.increaseIndent();
+  for (NamedAttribute e : getMemory()) {
+    p.printNewline();
+    p << e.getName().strref() << " = ";
+    printTiming(p, cast<DictionaryAttr>(e.getValue()));
+  }
+  p.decreaseIndent();
+  p.printNewline();
+  p << '}';
+  if (DictionaryAttr fifo = getFifoAttr()) {
+    p.printNewline();
+    p << "fifo = ";
+    printTiming(p, fifo);
+  }
+  if (StringAttr def = getDefaultMemoryAttr()) {
+    p.printNewline();
+    p << "default_memory = " << def.strref();
+  }
+  p.decreaseIndent();
+  p.printNewline();
+  p << '}';
+}
+
+ParseResult DCPathDeviceOp::parse(OpAsmParser &p, OperationState &result) {
+  Builder &b = p.getBuilder();
+  SmallVector<NamedAttribute> comb, memory;
+  StringRef k;
+  if (p.parseLBrace() || p.parseKeyword("comb") || p.parseLBrace())
+    return failure();
+  while (succeeded(p.parseOptionalKeyword(&k))) {
+    double v;
+    if (p.parseEqual() || parseNum(p, v))
+      return failure();
+    comb.push_back(b.getNamedAttr(k, b.getF32FloatAttr(v)));
+  }
+  if (p.parseRBrace() || p.parseKeyword("memory") || p.parseLBrace())
+    return failure();
+  while (succeeded(p.parseOptionalKeyword(&k))) {
+    Attribute timing;
+    if (p.parseEqual() || parseTiming(p, timing))
+      return failure();
+    memory.push_back(b.getNamedAttr(k, timing));
+  }
+  if (p.parseRBrace())
+    return failure();
+  result.addAttribute(getCombAttrName(result.name), b.getDictionaryAttr(comb));
+  result.addAttribute(getMemoryAttrName(result.name),
+                      b.getDictionaryAttr(memory));
+  if (succeeded(p.parseOptionalKeyword("fifo"))) {
+    Attribute timing;
+    if (p.parseEqual() || parseTiming(p, timing))
+      return failure();
+    result.addAttribute(getFifoAttrName(result.name), timing);
+  }
+  if (succeeded(p.parseOptionalKeyword("default_memory"))) {
+    StringRef def;
+    if (p.parseEqual() || p.parseKeyword(&def))
+      return failure();
+    result.addAttribute(getDefaultMemoryAttrName(result.name),
+                        b.getStringAttr(def));
+  }
+  if (p.parseRBrace())
+    return failure();
+  return success();
+}
+
+//===----------------------------------------------------------------------===//
 // dcp.pipeline / dcp.sequential custom assembly
 //===----------------------------------------------------------------------===//
 
@@ -542,11 +754,14 @@ void DCPathPipelineOp::print(OpAsmPrinter &p) {
   p << ' ';
   p.printRegion(getBody(), /*printEntryBlockArgs=*/false,
                 /*printBlockTerminators=*/true);
+  if (std::optional<DeterminacyEnum> d = getDeterminacy())
+    p << ' ' << stringifyDeterminacyEnum(*d);
   p.printOptionalAttrDict(
       (*this)->getAttrs(),
       /*elidedAttrs=*/{getTripAttrName(), getLbAttrName(), getStepAttrName(),
                        getIiAttrName(), getStartAttrName(), getLengthAttrName(),
                        getLatencyAttrName(), getLatencyBoundAttrName(),
+                       getDeterminacyAttrName(),
                        getOperandSegmentSizesAttrName()});
 }
 
@@ -689,6 +904,8 @@ ParseResult DCPathPipelineOp::parse(OpAsmParser &p, OperationState &result) {
 
   Region *region = result.addRegion();
   if (p.parseRegion(*region, regionArgs) ||
+      parseOptionalDeterminacy(p, result,
+                               getDeterminacyAttrName(result.name)) ||
       p.parseOptionalAttrDict(result.attributes))
     return failure();
   // Default to an unconditional terminator when the body has none; a while
@@ -730,10 +947,13 @@ void DCPathSequentialOp::print(OpAsmPrinter &p) {
   p << ' ';
   p.printRegion(getBody(), /*printEntryBlockArgs=*/false,
                 /*printBlockTerminators=*/true);
+  if (std::optional<DeterminacyEnum> d = getDeterminacy())
+    p << ' ' << stringifyDeterminacyEnum(*d);
   p.printOptionalAttrDict(
       (*this)->getAttrs(),
       /*elidedAttrs=*/{getStartAttrName(), getLengthAttrName(),
-                       getLatencyAttrName(), getLatencyBoundAttrName()});
+                       getLatencyAttrName(), getLatencyBoundAttrName(),
+                       getDeterminacyAttrName()});
 }
 
 ParseResult DCPathSequentialOp::parse(OpAsmParser &p, OperationState &result) {
@@ -767,7 +987,10 @@ ParseResult DCPathSequentialOp::parse(OpAsmParser &p, OperationState &result) {
       return failure();
   result.addTypes(resultTypes);
   Region *region = result.addRegion();
-  if (p.parseRegion(*region) || p.parseOptionalAttrDict(result.attributes))
+  if (p.parseRegion(*region) ||
+      parseOptionalDeterminacy(p, result,
+                               getDeterminacyAttrName(result.name)) ||
+      p.parseOptionalAttrDict(result.attributes))
     return failure();
   ensureTerminator(*region, b, result.location);
   return success();
@@ -837,10 +1060,12 @@ void DCPathSelectOp::print(OpAsmPrinter &p) {
     p.printRegion(getElseRegion(), /*printEntryBlockArgs=*/false,
                   /*printBlockTerminators=*/true);
   }
-  p.printOptionalAttrDict((*this)->getAttrs(),
-                          /*elidedAttrs=*/{getStartAttrName(),
-                                           getLatencyAttrName(),
-                                           getLatencyBoundAttrName()});
+  if (std::optional<DeterminacyEnum> d = getDeterminacy())
+    p << ' ' << stringifyDeterminacyEnum(*d);
+  p.printOptionalAttrDict(
+      (*this)->getAttrs(),
+      /*elidedAttrs=*/{getStartAttrName(), getLatencyAttrName(),
+                       getLatencyBoundAttrName(), getDeterminacyAttrName()});
 }
 
 ParseResult DCPathSelectOp::parse(OpAsmParser &p, OperationState &result) {
@@ -878,6 +1103,8 @@ ParseResult DCPathSelectOp::parse(OpAsmParser &p, OperationState &result) {
   if (succeeded(p.parseOptionalKeyword("else")))
     if (p.parseRegion(*elseRegion))
       return failure();
+  if (parseOptionalDeterminacy(p, result, getDeterminacyAttrName(result.name)))
+    return failure();
   return p.parseOptionalAttrDict(result.attributes);
 }
 

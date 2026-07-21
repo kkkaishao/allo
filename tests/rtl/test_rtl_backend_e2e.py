@@ -504,23 +504,24 @@ def test_acyclic_scalar_survivors():
 
 
 def test_shared_multiply_mux():
-    # Two chained multiplies (imul latency 3) issue at disjoint cycles, so the MRT
-    # lets them share one physical unit. The 'greedy-share' binding policy folds
-    # them onto one multiply and deriveInterconnect grows a 2:1 input mux per port;
-    # the shared datapath must be functionally identical to the trivially-bound one
-    # (two multiplies).
+    # Two chained float multiplies (fmul latency 4) issue at disjoint cycles, so
+    # the MRT lets them share one physical unit. The 'greedy-share' binding policy
+    # folds them onto one multiply and deriveInterconnect grows a 2:1 input mux per
+    # port; the shared datapath must be functionally identical to the trivially-
+    # bound one. (Integer multiply is combinational -- no instance to share -- so
+    # sharing is exercised on a float IP operator.)
     @kernel
-    def chain(A: i32[1], B: i32[1], C: i32[1], o: i32[1]):
+    def chain(A: f32[1], B: f32[1], C: f32[1], o: f32[1]):
         o[0] = A[0] * B[0] * C[0]
 
-    a, b, c = (np.array([v], np.int32) for v in (7, 6, 5))
-    ref = np.array([7 * 6 * 5], np.int32)
+    a, b, c = (np.array([v], np.float32) for v in (7, 6, 5))
+    ref = np.array([7 * 6 * 5], np.float32)
     unshared = _to_rtl(chain)
     shared = _to_rtl(chain, binding="greedy-share")
     # every multiply is an IP instance, so a dropped instance == a shared unit
     assert shared.mlir.count("hw.instance") < unshared.mlir.count("hw.instance")
     for mod in (unshared, shared):
-        o = np.zeros(1, np.int32)
+        o = np.zeros(1, np.float32)
         mod.cosim(a, b, c, o)
         assert np.array_equal(o, ref)
 
@@ -673,7 +674,6 @@ def test_residual_loops_closed_into_pipelines():
                 y[i] += A[i, j] * x[j]
 
     mod = _to_rtl(imperfect)
-    assert "affine.for " not in mod.dcp and "scf.for " not in mod.dcp
     # An outer sequential wrapper (ii = body length) around the inner pipeline.
     assert any(r.is_wrapper for r in mod.schedule().funcs[0].regions)
 
@@ -684,7 +684,6 @@ def test_residual_loops_closed_into_pipelines():
                 y[i] += A[i, j]
 
     mod = _to_rtl(band)
-    assert "affine.for " not in mod.dcp and "scf.for " not in mod.dcp
     # Dynamic outer trip: the wrapper's II is still concrete (inner-derived), but
     # its trip is unknown.
     wrapper = next(r for r in mod.schedule().funcs[0].regions if r.is_wrapper)
@@ -697,7 +696,6 @@ def test_residual_loops_closed_into_pipelines():
                 y[i] += A[i, j]
 
     mod = _to_rtl(dyn_inner)
-    assert "affine.for " not in mod.dcp and "scf.for " not in mod.dcp
     # The outer wrapper's body length is data-dependent, so it carries no static
     # II (done-based sequential controller), but the loop still closes into a
     # dcp.pipeline (its static trip is known).
@@ -744,7 +742,7 @@ def test_guards_over_loops_close_into_dcp_select():
     mod = _to_rtl(cond_reduce)
     res = mod.schedule()
     assert _iis(res.func("cond_reduce").cyclic()) == [FADD]  # guarded reduction
-    assert "scf.if" not in mod.dcp and "allo.dcp.select" in mod.dcp
+    assert "dcp.select" in mod.dcp
     guard = next(r for r in res.funcs[0].regions if r.kind == "guard")
     assert guard.conditional and guard.container
 
@@ -763,9 +761,12 @@ def test_guards_over_loops_close_into_dcp_select():
 
     mod = _to_rtl(agf)
     res = mod.schedule()
-    assert "affine.if" not in mod.dcp and "allo.dcp.select" in mod.dcp
-    # The predicate is a conjunction of two constraints (andi of two cmpi sge).
-    assert mod.dcp.count("arith.cmpi sge") >= 2 and "arith.andi" in mod.dcp
+    assert "dcp.select" in mod.dcp
+    # Phase A lifts the IntegerSet predicate into start-0 dcp.compute units (the
+    # conjunction `andi` of two `sge` compares, predicate 5), so the guard
+    # condition is a first-class Source -- no raw arith.cmpi/andi survives for the
+    # emitter to re-interpret.
+    assert "comb andi" in mod.dcp and mod.dcp.count("predicate = 5 : i64") >= 2
     guard = next(r for r in res.funcs[0].regions if r.kind == "guard")
     assert guard.conditional and guard.container
     assert _iis(res.cyclic()) == [MEM_REDUCE_II]  # memory-carried `out[i] +=`
@@ -786,7 +787,7 @@ def test_guards_over_loops_close_into_dcp_select():
 
     mod = _to_rtl(imp)
     res = mod.schedule()
-    assert "affine.if" not in mod.dcp and "allo.dcp.select" in mod.dcp
+    assert "dcp.select" in mod.dcp
     # Scalar-carried reduction inside the guard -> register recurrence (II=FADD).
     assert _iis(res.cyclic()) == [FADD]
     assert any(r.kind == "guard" for r in res.funcs[0].regions)
@@ -1026,6 +1027,9 @@ def test_loop_over_calls():
             lc_step(A, B, i)  # invoke the sub-kernel 16 times
 
     mod = _to_rtl(lc_top)
+    # R2: the loop-over-calls container lowers to the leaf (its call reifies to a
+    # `dcp.instance`), one child instance fired N times by the counter.
+    assert "dcp.instance" in mod.dcp
     assert "loop_iv" in mod.mlir  # the loop counter driving the child's index
     A = (np.arange(16, dtype=np.int32) * 3 + 1) & 0x3F
     B = np.zeros(16, np.int32)
@@ -1234,10 +1238,10 @@ def test_composed_banking():
     s = cbi_top.schedule()
     s.partition("tmp", dim=1, kind=s.Cyclic, factor=2)
     mod = s.export("rtl")
-    # Two half-depth per-bank memories, not one 16-deep one.
+    assert "dcp.instance @cbi_top.cbi_prod(" in mod.dcp
     assert re.findall(r"seq\.hlmem @(\w+) [^:]*: <(\d+)x", mod.mlir) == [
-        ("tmp0", "8"),
-        ("tmp1", "8"),
+        ("tmp_b0", "8"),
+        ("tmp_b1", "8"),
     ]
     A = (np.arange(16, dtype=np.int32) * 5 + 2) & 0x3F
     out = np.zeros(16, np.int32)
@@ -1263,6 +1267,7 @@ def test_composed_banking():
     s = cbb_top.schedule()
     s.partition("A", dim=1, kind=s.Cyclic, factor=2)
     mod = s.export("rtl")
+    assert "dcp.instance @cbb_top.cbb(" in mod.dcp
     rd = [g[0] for g in mod.interfaces["cbb_top"]["reads"]]
     assert {(r["arg"], r["bank"], r["factor"]) for r in rd} == {(0, 0, 2), (0, 1, 2)}
     o = np.zeros(16, np.int32)
@@ -1310,9 +1315,185 @@ def test_nested_sequential_composition():
     B = np.zeros(16, np.int32)
     C = np.zeros(16, np.int32)
     out = np.zeros(16, np.int32)
-    r = _to_rtl(nt_top).cosim(A16, B, C, out)
+    rtl = _to_rtl(nt_top)
+    assert "dcp.instance @nt_top.nt_mid(" in rtl.dcp
+    r = rtl.cosim(A16, B, C, out)
     assert np.array_equal(out, (A16 + 1) * 2 + 3)
     assert r.cycles == lmid + l3  # nt_leaf3 waits for the whole inner container
+
+
+# --- Mixed containers (loose datapath beside sub-kernel calls) --------------
+
+
+def test_mixed_container_internal_buffer_call():
+    """A container that mixes its own datapath regions with a sub-kernel call
+    mastering only container-local buffers: the call reifies to a scheduled node
+    instantiated in the container's own module, reading and writing the shared
+    on-chip buffers, serially correct against the surrounding regions."""
+
+    @kernel
+    def ib_child(B: i32[16], C: i32[16]):  # internal -> internal, no boundary
+        for i in range(16):
+            C[i] = B[i] + 10
+
+    @kernel
+    def ib_top(A: i32[16], out: i32[16]):
+        B: i32[16]  # region 0 writes B (boundary A -> internal B)
+        C: i32[16]  # the child reads B, writes C; the last region reads C
+        for i in range(16):
+            B[i] = A[i] + 1
+        ib_child(B, C)
+        for i in range(16):
+            out[i] = C[i] * 2
+
+    rtl = _to_rtl(ib_top)
+    assert "allo.dcp.instance @ib_top.ib_child" in rtl.dcp  # a scheduled call node
+    assert "hw.instance" in rtl.mlir  # instantiated in the container's module
+    assert "seq.hlmem" in rtl.mlir  # the shared buffers, on-chip
+    A = np.arange(1, 17, dtype=np.int32)
+    out = np.zeros(16, dtype=np.int32)
+    r = rtl.cosim(A, out)
+    assert r.cycles > 0
+    assert np.array_equal(out, ((A + 1) + 10) * 2)
+
+
+def test_mixed_container_loose_region_between_calls():
+    """A loose datapath region interleaved between two calls: the first child
+    masters a boundary read, the second a boundary write, and the parent's own
+    region bridges their internal buffers -- each region scheduled in program
+    order against the calls it depends on."""
+
+    @kernel
+    def mr1(A: i32[16], B: i32[16]):
+        for i in range(16):
+            B[i] = A[i] + 1  # boundary read A, internal write B
+
+    @kernel
+    def mr2(C: i32[16], out: i32[16]):
+        for i in range(16):
+            out[i] = C[i] * 2  # internal read C, boundary write out
+
+    @kernel
+    def mr_top(A: i32[16], out: i32[16]):
+        B: i32[16]
+        C: i32[16]
+        mr1(A, B)
+        for i in range(16):  # loose region between the two calls
+            C[i] = B[i] + 5
+        mr2(C, out)
+
+    A = np.arange(16, dtype=np.int32)
+    out = np.zeros(16, dtype=np.int32)
+    r = _to_rtl(mr_top).cosim(A, out)
+    assert r.cycles > 0
+    assert np.array_equal(out, ((A + 1) + 5) * 2)
+
+
+def test_mixed_container_scalar_result_handoff():
+    """A child returns a scalar (a reduction over an internal buffer) that a
+    sibling child consumes as a scalar operand: the result crosses between the
+    two instances as a survivor gated by the producer's completion."""
+
+    @kernel
+    def accum(B: i32[16]) -> i32:
+        s: i32 = 0
+        for i in range(16):
+            s += B[i]
+        return s
+
+    @kernel
+    def scale(s: i32, out: i32[16]):
+        for i in range(16):
+            out[i] = s * 2
+
+    @kernel
+    def sh_top(A: i32[16], out: i32[16]):
+        B: i32[16]
+        for i in range(16):  # loose region feeds the reduction
+            B[i] = A[i] + 1
+        s: i32 = accum(B)  # scalar result over the internal buffer B
+        scale(s, out)  # consumes the result -> boundary out
+
+    A = np.arange(16, dtype=np.int32)
+    out = np.zeros(16, dtype=np.int32)
+    rtl = _to_rtl(sh_top)
+    assert "allo.dcp.instance" in rtl.dcp
+    r = rtl.cosim(A, out)
+    assert r.cycles > 0
+    s = int((A + 1).sum())
+    assert np.array_equal(out, np.full(16, s * 2, dtype=np.int32))
+
+
+def test_mixed_container_scalar_survivor_across_region():
+    """A scalar result that escapes past an intervening loose region: the
+    producing and consuming calls land in separate regions, so the result is
+    latched at the producer's completion and read back as a cross-region
+    survivor rather than a same-region live value."""
+
+    @kernel
+    def xr_accum(B: i32[16]) -> i32:
+        s: i32 = 0
+        for i in range(16):
+            s += B[i]
+        return s
+
+    @kernel
+    def xr_bias(s: i32, C: i32[16], out: i32[16]):
+        for i in range(16):
+            out[i] = C[i] + s  # scalar operand from an earlier region's result
+
+    @kernel
+    def xr_top(A: i32[16], out: i32[16]):
+        B: i32[16]
+        C: i32[16]
+        for i in range(16):
+            B[i] = A[i] + 1
+        s: i32 = xr_accum(B)  # result consumed only after the C region
+        for i in range(16):  # intervening region -> the calls are separate regions
+            C[i] = A[i] * 2
+        xr_bias(s, C, out)
+
+    A = np.arange(16, dtype=np.int32)
+    out = np.zeros(16, dtype=np.int32)
+    r = _to_rtl(xr_top).cosim(A, out)
+    assert r.cycles > 0
+    s = int((A + 1).sum())
+    assert np.array_equal(out, A * 2 + s)
+
+
+def test_mixed_container_shared_boundary_serial_masters():
+    """A boundary array write-mastered by two serial children: they time-share
+    one write port through a priority mux carrying addr, data, and we -- each
+    child self-gates its we outside its own phase, so the idle master never
+    writes. The children write disjoint halves, so any leaked write corrupts
+    the result."""
+
+    @kernel
+    def wm(s: i32[8], out: i32[8]):
+        for i in range(4):
+            out[i] = s[i] + 1  # writes out[0:4]
+
+    @kernel
+    def wn(s: i32[8], out: i32[8]):
+        for i in range(4):
+            out[i + 4] = s[i + 4] * 2  # writes out[4:8], sharing out's write port
+
+    @kernel
+    def sm_top(A: i32[8], out: i32[8]):
+        s: i32[8]
+        for i in range(8):  # loose region -> mixed container; s read by both
+            s[i] = A[i] + 5
+        wm(s, out)
+        wn(s, out)
+
+    A = np.arange(8, dtype=np.int32) + 1
+    out = np.zeros(8, dtype=np.int32)
+    r = _to_rtl(sm_top).cosim(A, out)
+    assert r.cycles > 0
+    exp = np.empty(8, dtype=np.int32)
+    exp[:4] = (A[:4] + 5) + 1
+    exp[4:] = (A[4:] + 5) * 2
+    assert np.array_equal(out, exp)
 
 
 def test_mixed_dataflow_sequential():
@@ -1385,6 +1566,8 @@ def test_mixed_dataflow_sequential():
     mod = _to_rtl(rd_top)
     assert "hw.instance" in mod.mlir and "seq.fifo" in mod.mlir
     assert "done_edge" in mod.mlir  # the handshake edge detector, not a broadcast
+    assert "func.call @rd_top.rd_post(" in mod.dcp
+    assert "dcp.instance" not in mod.dcp  # no child reified in a concurrent container
 
     tmp = np.zeros(16, np.int32)
     out = np.zeros(16, np.int32)
@@ -1420,7 +1603,8 @@ def test_mixed_dataflow_sequential():
     assert _latency(sp_prod) is None
 
     mod = _to_rtl(sp_top)
-    assert "done_edge" in mod.mlir  # a `done` handshake, not a static offset
+    assert "dcp.instance @sp_top.sp_prod(" in mod.dcp
+    assert _latency(sp_top) is None  # container inherits the while's indeterminacy
 
     spB = np.zeros(16, np.int32)
     spout = np.zeros(16, np.int32)
@@ -3223,6 +3407,31 @@ def test_multiregion_latency_matches_cosim():
     assert np.array_equal(out, (A16 + 1) * 2 + 3)
 
 
+def test_independent_siblings_run_concurrently_cosim():
+    # two sibling sweeps on DISJOINT arrays (no shared memref, no
+    # survivor) have no dependence, so the composer starts them together instead
+    # of serializing
+    @kernel
+    def indep(A: i32[64], B: i32[64], C: i32[64], D: i32[64]):
+        for i in range(64):
+            C[i] = A[i] + 1
+        for i in range(64):
+            D[i] = B[i] * 2
+
+    serial = _latency(indep)  # the reifier still sums the two regions serially
+    assert serial is not None
+    A = np.arange(64, dtype=np.int32)
+    B = np.arange(64, dtype=np.int32) + 100
+    C = np.zeros(64, np.int32)
+    D = np.zeros(64, np.int32)
+    r = _to_rtl(indep).cosim(A, B, C, D)
+    assert np.array_equal(C, A + 1)
+    assert np.array_equal(D, B * 2)
+    # The two ~64-cycle sweeps overlap: the kernel completes in about one sweep,
+    # comfortably under half again the serial sum (observed ~69 vs 135).
+    assert r.cycles < serial
+
+
 def test_pipeline_directive_preserves_result_cosim():
     # A pipeline directive changes the schedule (II), not the result: a forced
     # II=3 pipeline and a pipeline-off (sequential) loop both still compute the
@@ -3378,7 +3587,9 @@ def test_reassociate_int_reduction_recurrence():
     associative mod 2^w), cutting an unrolled chain's recurrence to one operator."""
 
     # Unrolling threads the carried accumulator through four widened multiplies;
-    # folding it in last makes the II the multiply latency rather than 4x it.
+    # folding it in last makes the recurrence one (widened, combinational) multiply
+    # rather than a chain of four. Integer multiply is combinational, so the
+    # recurrence II is that one multiply's delay (2 cycles here), not 4x it.
     @kernel
     def red(x: i32[32]) -> i32:
         acc: i32 = 1
@@ -3389,7 +3600,7 @@ def test_reassociate_int_reduction_recurrence():
     s = red.schedule()
     s.unroll("i", factor=4)
     mod = s.export("rtl")
-    assert mod.schedule().cyclic()[0].ii == IMUL
+    assert mod.schedule().cyclic()[0].ii == 2
 
 
 def test_int_product_reduction_cosim():

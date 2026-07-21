@@ -841,36 +841,30 @@ struct SdcSchedulingPass
   void runOnOperation() override {
     ModuleOp module = getOperation();
 
-    // Timing characterization for every op (latency + delays): a YAML library
-    // from the `operator-library` option, else the built-in default. Loaded
-    // once and shared by scheduling and reification.
-    OperatorLibrary loadedLib;
-    if (!operatorLibrary.empty()) {
-      auto parsed = OperatorLibrary::loadFile(operatorLibrary);
-      if (!parsed) {
-        error(Stage::Sched, module) << llvm::toString(parsed.takeError());
-        return signalPassFailure();
-      }
-      loadedLib = std::move(*parsed);
-    } else {
-      loadedLib = OperatorLibrary::defaultLibrary();
-    }
+    // Timing characterization for every op (latency + delays): built from the
+    // injected `dcp.device` + `dcp.operator` IR. Built once and shared by
+    // scheduling and reification.
+    auto loadedLib = OperatorLibrary::fromModule(module);
 
-    // Fail loudly if an advanced (raw-name) row names an op we cannot express
-    // (a typo, or a dialect this pass does not load) rather than silently
-    // ignoring the row.
-    if (std::vector<std::string> bad =
-            loadedLib.unregisteredAdvancedOps(*module.getContext());
-        !bad.empty()) {
-      error(Stage::Sched, module) << "operator library names unregistered "
-                                     "op(s): "
-                                  << llvm::join(bad, ", ");
+    // Fail loudly on an uncharacterized non-combinational op (a float/cast/math
+    // op with no matching operator IP): reject it rather than fabricate a
+    // zero-latency schedule.
+    if (module
+            .walk([&](Operation *op) {
+              if (loadedLib.requiresUnmatchedIP(op)) {
+                error(Stage::Sched, op)
+                    << "no operator characterization for '" << op->getName()
+                    << "'; provide an @ip for it on the device";
+                return WalkResult::interrupt();
+              }
+              return WalkResult::advance();
+            })
+            .wasInterrupted())
       return signalPassFailure();
-    }
 
-    // Target clock period: the option overrides the library, else 5.0 ns.
-    float cycleTimeNs =
-        cycleTime > 0.0f ? cycleTime : loadedLib.cycleTime().value_or(5.0f);
+    // Target clock period: the option overrides the device default, else 5.0
+    // ns.
+    float cycleTimeNs = cycleTime > 0.0f ? cycleTime : 5.0f;
 
     // Schedule bottom-up over the call graph
     // The call graph should be a DAG, so a post-order traversal schedules

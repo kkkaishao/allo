@@ -22,24 +22,18 @@ namespace mlir::allo::uarch {
 // the schedule cycle, the operator latency, and the derived result-ready cycle.
 //===----------------------------------------------------------------------===//
 
-Operation *dcpOperatorOp(Operation *op) {
-  FlatSymbolRefAttr sym;
-  if (auto c = dyn_cast<dcp::DCPathComputeOp>(op))
-    sym = c.getOpTypeAttr();
-  else if (auto l = dyn_cast<dcp::DCPathLoadOp>(op))
-    sym = l.getOpTypeAttr();
-  if (!sym)
-    return nullptr;
-  return SymbolTable::lookupNearestSymbolFrom<dcp::DCPathOperatorOp>(op, sym);
-}
-
 unsigned dcpStart(Operation *op) {
   return cast<IntegerAttr>(op->getAttr("start")).getInt();
 }
 
 unsigned dcpLatency(Operation *op) {
-  auto opr = dyn_cast_or_null<dcp::DCPathOperatorOp>(dcpOperatorOp(op));
-  return opr ? static_cast<unsigned>(opr.getLatency()) : 0;
+  if (auto l = dyn_cast<dcp::DCPathLoadOp>(op))
+    return static_cast<unsigned>(l.getLatency());
+  // An IP compute carries its operator's `latency`, stamped onto it at emit
+  // (see `stampOperatorTiming`); a combinational compute has none (latency 0).
+  if (auto lat = op->getAttrOfType<IntegerAttr>("latency"))
+    return static_cast<unsigned>(lat.getInt());
+  return 0;
 }
 
 unsigned readyCycleOf(Operation *op) { return dcpStart(op) + dcpLatency(op); }

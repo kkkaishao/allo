@@ -7,7 +7,7 @@
 #include "allo/IR/AlloOps.h"
 #include "allo/Microarch/BindingPolicy.h"
 #include "allo/Microarch/Interface.h"
-#include "allo/Scheduling/OperatorLibrary.h" // isNativeImpl
+#include "allo/Scheduling/OperatorLibrary.h" // stallContract
 #include "allo/Support/Logging.h"
 #include "allo/Translation/EmitterState.h" // nameFromLoc, sanitizeCppIdentifier
 
@@ -62,9 +62,10 @@ unsigned schedT(Operation *op) { return uarch::dcpStart(op); }
 bool combEmitted(StringRef kind) {
   return llvm::StringSwitch<bool>(kind)
       .Cases({"addi", "subi", "muli", "andi", "ori", "xori"}, true)
-      .Cases({"extsi", "extui", "trunci", "index_cast"}, true)
+      .Cases({"extsi", "extui", "trunci", "index_cast", "index_castui"}, true)
       .Cases({"cmpi", "select", "shli", "shrsi", "shrui"}, true)
-      .Cases({"divsi", "divui"}, true)
+      .Cases({"divsi", "divui", "remsi", "remui"}, true)
+      .Cases({"minsi", "maxsi", "minui", "maxui"}, true)
       .Case("apply", true)
       .Default(false);
 }
@@ -172,6 +173,26 @@ Value emitCompute(OpBuilder &b, Location loc, StringRef kind,
     return comb::DivSOp::create(b, loc, lhs, rhs, false)->getResult(0);
   if (kind == "divui")
     return comb::DivUOp::create(b, loc, lhs, rhs, false)->getResult(0);
+  // Signed / unsigned remainder (int rem is combinational under the operator
+  // model). Both operands share the result width.
+  if (kind == "remsi")
+    return comb::ModSOp::create(b, loc, lhs, rhs, false)->getResult(0);
+  if (kind == "remui")
+    return comb::ModUOp::create(b, loc, lhs, rhs, false)->getResult(0);
+  // Integer min/max: a compare feeds a mux (canonicalize folds a
+  // `select(a<b,a,b)` idiom into arith.minsi/maxsi/minui/maxui).
+  auto minmax = [&](comb::ICmpPredicate p) -> Value {
+    Value c = comb::ICmpOp::create(b, loc, p, lhs, rhs, false)->getResult(0);
+    return comb::MuxOp::create(b, loc, c, lhs, rhs)->getResult(0);
+  };
+  if (kind == "minsi")
+    return minmax(comb::ICmpPredicate::slt);
+  if (kind == "maxsi")
+    return minmax(comb::ICmpPredicate::sgt);
+  if (kind == "minui")
+    return minmax(comb::ICmpPredicate::ult);
+  if (kind == "maxui")
+    return minmax(comb::ICmpPredicate::ugt);
   // Integer compare -> comb.icmp with the predicate carried from arith.cmpi
   // (preserved onto the compute op by convert-schedule-to-dcp).
   if (kind == "cmpi") {
@@ -923,17 +944,18 @@ void HWEmitter::emit() {
 // emitModule: interface (ports, extern operator modules) + validation.
 //===----------------------------------------------------------------------===//
 
-// The extern operator-module name for an IP-realized unit: usually its `impl`,
-// but a floating-point compare additionally encodes its predicate (one
-// behavioral module per predicate), since `impl` alone (`fcmp_l1`) does not say
-// which comparison. The predicate is preserved onto the op by the reifier.
+// The extern operator-module name for an IP-realized unit: its `impl` (the
+// operator's RTL module name), but a floating-point compare additionally
+// encodes its predicate (one behavioral module per predicate), since `impl`
+// alone
+// (`fcmp_l1`) does not say which comparison. A compare is the only IP carrying
+// a `predicate` attr (copied onto the op by the reifier); integer compare is
+// combinational, so an IP compare is always floating-point.
 static std::string ipModuleName(const uarch::FuncUnit &u) {
-  if (u.opType == "cmpf") {
-    auto pred = cast<arith::CmpFPredicateAttr>(
-                    u.boundOps.front().first->getAttr("predicate"))
-                    .getValue();
-    return u.impl + "_" + arith::stringifyCmpFPredicate(pred).str();
-  }
+  if (auto pred =
+          u.boundOps.front().first->getAttrOfType<arith::CmpFPredicateAttr>(
+              "predicate"))
+    return u.impl + "_" + arith::stringifyCmpFPredicate(pred.getValue()).str();
   return u.impl;
 }
 
@@ -1020,25 +1042,21 @@ static LogicalResult validateDatapath(func::FuncOp func,
             "not yet supported");
 
   // Realizability: every compute unit must have an emittable realization. A
-  // native keyword (`comb`/`builtin`) needs an EmitHW comb lowering
-  // (`combEmitted`); otherwise `impl` is an IP module name, instantiated below.
-  // Fail by op name rather than asserting deep in emission.
+  // combinational unit needs an EmitHW comb lowering (`combEmitted`); an IP
+  // unit needs a non-empty module name (instantiated below). Fail by op name
+  // rather than asserting deep in emission.
   for (const uarch::FuncUnit &u : dp.units) {
-    if (u.impl.empty())
+    if (u.comb) {
+      if (!combEmitted(u.opType))
+        return func.emitError("allo-datapath-to-hw: combinational operator '")
+               << u.opType
+               << "' has no native EmitHW lowering; provide an IP or add "
+                  "native "
+                  "support";
+    } else if (u.impl.empty()) {
       return func.emitError("allo-datapath-to-hw: operator '")
-             << u.opType
-             << "' has no realization; set 'impl' (a native keyword or an IP "
-                "module name) on its operator library row";
-    if (u.impl == "hwarith")
-      return func.emitError(
-                 "allo-datapath-to-hw: 'impl: hwarith' emission is not yet "
-                 "implemented (operator '")
-             << u.opType << "')";
-    if (allo::isNativeImpl(u.impl) && !combEmitted(u.opType))
-      return func.emitError("allo-datapath-to-hw: operator '")
-             << u.opType
-             << "' has no native EmitHW lowering; provide an IP (set 'impl' to "
-                "an IP module name) or add native support";
+             << u.opType << "' has no IP module realization";
+    }
   }
   // Reject a CallUnit shape the leaf cannot lower, loudly, rather than
   // mis-emitting it.
@@ -1091,7 +1109,7 @@ declareOperatorModules(func::FuncOp func, const uarch::Datapath &dp,
   using Dir = hw::ModulePort::Direction;
   DenseMap<unsigned, Operation *> unitModule;
   for (const uarch::FuncUnit &u : dp.units) {
-    if (allo::isNativeImpl(u.impl) || u.boundOps.empty())
+    if (u.comb || u.boundOps.empty())
       continue;
     IntegerType inW =
         hwType(u.boundOps.front().first->getOperand(0).getType(), b);
@@ -1103,7 +1121,7 @@ declareOperatorModules(func::FuncOp func, const uarch::Datapath &dp,
           PortInfo{{StringAttr::get(ctx, "a"), inW, Dir::Input}},
           PortInfo{{StringAttr::get(ctx, "b"), inW, Dir::Input}},
           PortInfo{{StringAttr::get(ctx, "clk"), b.getI1Type(), Dir::Input}}};
-      if (allo::stallContract(u.impl) == allo::StallContract::ClockEnable)
+      if (u.stall == allo::StallContractEnum::Ce)
         ep.push_back({{StringAttr::get(ctx, "ce"), b.getI1Type(), Dir::Input}});
       ep.push_back({{StringAttr::get(ctx, "y"), outW, Dir::Output}});
       mod = hw::HWModuleExternOp::create(b, loc, StringAttr::get(ctx, modName),
@@ -1270,6 +1288,36 @@ static bool hasDCPRegions(func::FuncOp func) {
   return found;
 }
 
+// The IP operators' timing lives on module-level `dcp.operator` symbols. Fold
+// each onto its referencing `dcp.compute` (its `latency` + `pipelined`) so the
+// datapath reads timing locally, then drop the now-spent `dcp.operator` /
+// `dcp.device` declarations. This lets each extern operator module share the
+// operator's `sym_name` (the RTL module name) with no symbol clash -- there is
+// no live same-named symbol once the declarations are gone. Runs on the emit
+// clone, so the canonical scheduled module keeps the normalized form.
+static void stampOperatorTiming(ModuleOp module) {
+  Builder bd(module.getContext());
+  module.walk([&](dcp::DCPathComputeOp comp) {
+    FlatSymbolRefAttr sym = comp.getOpTypeAttr();
+    if (!sym)
+      return; // a combinational compute (comb_kind); no operator timing
+    auto opr =
+        SymbolTable::lookupNearestSymbolFrom<dcp::DCPathOperatorOp>(comp, sym);
+    assert(opr && "a dcp.compute op_type must reference a live dcp.operator");
+    comp->setAttr("latency", bd.getI64IntegerAttr(opr.getLatency()));
+    comp->setAttr("pipelined", bd.getBoolAttr(opr.getPipelined()));
+    comp->setAttr("stall",
+                  StallContractEnumAttr::get(bd.getContext(), opr.getStall()));
+  });
+  SmallVector<Operation *> spent;
+  module.walk([&](Operation *op) {
+    if (isa<dcp::DCPathOperatorOp, dcp::DCPathDeviceOp>(op))
+      spent.push_back(op);
+  });
+  for (Operation *op : spent)
+    op->erase();
+}
+
 LogicalResult emitDatapathToHW(ModuleOp module, StringRef binding,
                                StringRef top,
                                llvm::StringMap<std::string> &interfaces) {
@@ -1279,6 +1327,10 @@ LogicalResult emitDatapathToHW(ModuleOp module, StringRef binding,
   ctx->getOrLoadDialect<hw::HWDialect>();
   ctx->getOrLoadDialect<comb::CombDialect>();
   ctx->getOrLoadDialect<seq::SeqDialect>();
+
+  // Fold operator timing onto the compute ops and drop the declarations, before
+  // any datapath is built or an extern operator module is named.
+  stampOperatorTiming(module);
 
   SmallVector<func::FuncOp> scheduled;
   module.walk([&](func::FuncOp f) {
@@ -1343,13 +1395,13 @@ LogicalResult emitDatapathToHW(ModuleOp module, StringRef binding,
       return success(); // a shared callee already emitted
     // Children first: emit every scheduled callee (a leaf call misses
     // `byName`). A callee is referenced by a `func.call` (async spawn /
-    // structural-top compose) or a `dcp.invoke` (a leaf CallUnit) --
+    // structural-top compose) or a `dcp.instance` (a leaf CallUnit) --
     // both must recurse so the child is emitted + registered before its caller.
     WalkResult wr = f.walk([&](Operation *op) -> WalkResult {
       StringRef callee;
       if (auto call = dyn_cast<func::CallOp>(op))
         callee = call.getCallee();
-      else if (auto inv = dyn_cast<dcp::DCPathInvokeOp>(op))
+      else if (auto inv = dyn_cast<dcp::DCPathInstanceOp>(op))
         callee = inv.getCallee();
       else
         return WalkResult::advance();
@@ -1367,7 +1419,7 @@ LogicalResult emitDatapathToHW(ModuleOp module, StringRef binding,
     // read: a CONCURRENT container (a dataflow network of `await` spawns,
     // stamped `dcp.determinacy = concurrent` by the reifier) wires a structural
     // top; every other kernel -- a leaf, or a non-concurrent container whose
-    // sync calls reified to `dcp.invoke`s (so it holds no `func.call`) --
+    // sync calls reified to `dcp.instance`s (so it holds no `func.call`) --
     // lowers as a leaf datapath below.
     auto det = f->getAttrOfType<DeterminacyEnumAttr>("dcp.determinacy");
     if (det && det.getValue() == DeterminacyEnum::Concurrent) {
@@ -1380,10 +1432,10 @@ LogicalResult emitDatapathToHW(ModuleOp module, StringRef binding,
       registerModule(f.getSymName(), topMod, std::move(topModel));
     } else {
       // A plain leaf, or a rerouted mixed container whose sync calls are
-      // `dcp.invoke`s. The latter needs its already-emitted callees' modules +
-      // port models to build/emit each CallUnit; a plain leaf passes null.
+      // `dcp.instance`s. The latter needs its already-emitted callees' modules
+      // + port models to build/emit each CallUnit; a plain leaf passes null.
       bool hasInvoke = false;
-      f.walk([&](dcp::DCPathInvokeOp) { hasInvoke = true; });
+      f.walk([&](dcp::DCPathInstanceOp) { hasInvoke = true; });
       uarch::CalleeCtx cc{modules, ifaceModels};
       const uarch::CalleeCtx *callees = hasInvoke ? &cc : nullptr;
       Datapath dp(f, *policy, callees);
@@ -1405,13 +1457,6 @@ LogicalResult emitDatapathToHW(ModuleOp module, StringRef binding,
 
   for (func::FuncOp f : scheduled)
     f.erase();
-
-  // Drop the now-consumed dcp.operator declarations so the module holds only hw
-  // ops for CIRCT's Verilog export.
-  SmallVector<Operation *> spent;
-  module.walk([&](dcp::DCPathOperatorOp op) { spent.push_back(op); });
-  for (Operation *op : spent)
-    op->erase();
   return success();
 }
 

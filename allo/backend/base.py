@@ -19,14 +19,12 @@ from .._mlir.ir import MLIRError, DiagnosticInfo
 from .._mlir._mlir_libs._allo import ir_ext
 from .._mlir.ir import SymbolTable, UnitAttr, FileLineColLoc
 from .._mlir.passmanager import PassManager
-from .._mlir.dialects.allo import register_passes as _register_allo_passes
 from ..lang.kernel import Kernel
 from ..diagnostics import render_diagnostic, DiagnosticLocation
 
 # Allo passes live in the process-global MLIR pass registry; register them once
 # (std::call_once-guarded in C++) so backend pipelines (`lower-to-llvm`,
 # `grid-mapping`, `convert-allo-to-func`, ...) resolve via upstream PassManager.
-_register_allo_passes()
 
 
 def lookup_kernel(module: ir.Module, name: str):

@@ -17,12 +17,8 @@ entry point (``export("rtl", ...).schedule()``).
 
 from __future__ import annotations
 
-import os
-import tempfile
-
 from dataclasses import dataclass, field
 from enum import Enum
-from pathlib import Path
 
 from ..base import run_pipeline
 from ..._mlir.ir import (
@@ -33,7 +29,6 @@ from ..._mlir.ir import (
     BlockArgument,
     OpResult,
 )
-from .operator_library import OperatorLibrary
 
 # --- schedule result data model --------------------------------------------
 
@@ -234,21 +229,49 @@ def _latency_map(mod_op):
 
 
 def _impl_map(mod_op):
-    """symbol -> realization (`impl`) for every ``dcp.operator`` that has one."""
+    """symbol -> RTL module name for every ``dcp.operator``; the ``sym_name`` IS
+    the module name (an IP realization)."""
     return {
-        _str(o.operation, "sym_name"): _str(o.operation, "impl")
+        _str(o.operation, "sym_name"): _str(o.operation, "sym_name")
         for o in _body(mod_op).operations
-        if o.operation.name == _OPERATOR and "impl" in o.operation.attributes
+        if o.operation.name == _OPERATOR
     }
 
 
+# IP operators carry their abstract kind (`add`/`div`/...); reconstruct the
+# arith mnemonic (IP compute is always floating-point) so a schedule op reads as
+# the source op it came from, uniform with combinational and memory ops.
+_IP_MNEMONIC = {
+    "add": "addf",
+    "sub": "subf",
+    "mul": "mulf",
+    "div": "divf",
+    "rem": "remf",
+    "cmp": "cmpf",
+    "neg": "negf",
+}
+
+
+def _comb_kw(op):
+    """The CombOpKind mnemonic of a combinational ``dcp.compute`` (e.g. ``addi``),
+    parsed from its ``comb_kind`` enum attribute."""
+    s = str(op.attributes["comb_kind"])
+    inner = s[s.index("<") + 1 : s.rindex(">")] if "<" in s else s
+    return inner.split()[-1]
+
+
 def _op_kind(op, kinds):
-    """The operator kind of a scheduled op: the referenced ``dcp.operator``'s
-    kind for compute/load/store, else the op's dialect-stripped mnemonic."""
-    if op.name in _TIMED:
-        sym = FlatSymbolRefAttr(op.attributes["op_type"]).value
-        if sym in kinds:
-            return kinds[sym]
+    """The operator kind of a scheduled op, as an arith/affine mnemonic: an IP
+    compute's reconstructed mnemonic (from its ``dcp.operator`` kind), a
+    combinational compute's ``comb_kind``, a load/store's mnemonic, else the op's
+    dialect-stripped name."""
+    if op.name == _COMPUTE:
+        if "op_type" in op.attributes:
+            k = kinds.get(FlatSymbolRefAttr(op.attributes["op_type"]).value, "")
+            return _IP_MNEMONIC.get(k, k)
+        return _comb_kw(op)
+    if op.name in (_LOAD, _STORE):
+        return op.name.rsplit(".", 1)[1]
     return op.name.split(".", 1)[1]
 
 
@@ -262,7 +285,7 @@ def _region_ops(body, kinds, impls) -> list[ScheduledOp]:
         if "start" not in op.attributes:
             continue
         impl = None
-        if op.name in _TIMED and "op_type" in op.attributes:
+        if op.name == _COMPUTE and "op_type" in op.attributes:
             sym = FlatSymbolRefAttr(op.attributes["op_type"]).value
             impl = impls.get(sym)
         z = FloatAttr(op.attributes["z"]).value if "z" in op.attributes else None
@@ -432,24 +455,10 @@ def verify_schedule(module) -> list[str]:
 # --- driver ----------------------------------------------------------------
 
 
-def _resolve_library(library):
-    """Return ``(path_or_none, tmp_to_delete_or_none)`` for ``library``, which
-    may be an :class:`OperatorLibrary`, a path-like, or ``None``."""
-    if library is None:
-        return None, None
-    if isinstance(library, OperatorLibrary):
-        fd, path = tempfile.mkstemp(suffix=".yaml", prefix="allo_oplib_")
-        os.close(fd)
-        library.to_yaml(path)
-        return path, path
-    return str(Path(library)), None  # a path-like, passed through as-is
-
-
 def run_schedule(
     top,
     module,
     *,
-    library=None,
     cycle_time=None,
     prepare=True,
     float_reassoc=True,
@@ -460,15 +469,13 @@ def run_schedule(
 ) -> ScheduleResult:
     """Schedule ``top`` and return the :class:`ScheduleResult`; ``module`` is
     rewritten in place, left holding the ``allo.dcp.*`` ops the schedule reifies
-    into.
+    into. Operator/device timing is read from the ``dcp.device`` / ``dcp.operator``
+    ops injected into ``module`` before this call.
 
     Args:
         top: the name of the function to schedule.
         module: the MLIR module holding it.
-        library: an :class:`OperatorLibrary`, a path to a YAML library, or
-            ``None`` for the built-in default.
-        cycle_time: target clock period (ns); overrides the library's declared
-            frequency.
+        cycle_time: target clock period (ns); ``None`` falls back to 5.0.
         prepare: run the HLS preparation pipeline first (``False`` if the module
             is already lowered to affine form).
         float_reassoc: rebalance float reduction chains into logarithmic trees.
@@ -488,55 +495,44 @@ def run_schedule(
 
         run_pipeline(module, HLS_PREPARE_PIPELINE)
 
-    if cycle_time is None and isinstance(library, OperatorLibrary):
-        cycle_time = library.cycle_time()
-
-    lib_path, tmp = _resolve_library(library)
-    try:
-        sched_opts = [f"top={top}"]
-        if cycle_time is not None:
-            sched_opts.append(f"cycle-time={cycle_time}")
-        if lib_path is not None:
-            sched_opts.append(f"operator-library={lib_path}")
-        sdc = "sdc-scheduling{" + " ".join(sched_opts) + "}"
-        # convert-schedule-to-dcp re-reads the operator library to characterize
-        # the dcp.operator symbols (latencies/delays); give it the same library.
-        conv_opt = f"operator-library={lib_path}" if lib_path is not None else ""
-        convert = "convert-schedule-to-dcp{" + conv_opt + "}"
-        # Scheduling-path normalizations before the SDC solve, kept out of
-        # HLS_PREPARE_PIPELINE since the Vitis path does its own:
-        #   * fold-if-statements -- predicate affine.if / scf.if, or fold an
-        #     affine.if guard into the enclosing loop bounds, so as little
-        #     control flow as possible remains inside a loop body;
-        #   * cse -- fold the redundant loads/ops speculation introduces so they
-        #     do not inflate the resource-bound II;
-        #   * reassociate-reductions -- rebalance unrolled reduction chains so a
-        #     loop-carried accumulator's recurrence spans one operator, not the
-        #     whole unrolled chain.
-        reassoc = (
-            "reassociate-reductions{float-reassoc="
-            f"{'true' if float_reassoc else 'false'}}}"
-        )
-        rotate = f"rotate-reductions{{accumulators={int(accumulators)}}}"
-        perf = "perfectize-loop-nest," if perfectize else ""
-        uup = "unroll-under-pipeline," if unroll_under_pipeline else ""
-        flat = "flatten-perfect-loops," if flatten else ""
-        # propagate-partition pushes `allo.part` from an array onto every callee
-        # parameter it is passed to. Must precede sdc-scheduling: the callee is
-        # scheduled against its per-bank ResII. RTL-path only -- Vitis reads
-        # `allo.part` as a pragma and does its own interprocedural handling.
-        part = "propagate-partition{" + f"top={top}" + "}"
-        # sdc-scheduling emits the schedule as the allo.sched.* carrier;
-        # convert-schedule-to-dcp reifies it into module-scoped allo.dcp.* ops
-        # and strips the carrier.
-        pipeline = (
-            f"builtin.module(func.func(raise-counted-while,{uup}"
-            f"{perf}{flat}"
-            f"canonicalize,fold-if-statements,cse,{reassoc},{rotate}),"
-            f"{part},{sdc},{convert})"
-        )
-        run_pipeline(module, pipeline)
-        return export_schedule_result(module)
-    finally:
-        if tmp is not None:
-            os.unlink(tmp)
+    sched_opts = [f"top={top}"]
+    if cycle_time is not None:
+        sched_opts.append(f"cycle-time={cycle_time}")
+    sdc = "sdc-scheduling{" + " ".join(sched_opts) + "}"
+    # convert-schedule-to-dcp characterizes the dcp.operator symbols from the
+    # same injected dcp.device / dcp.operator IR the scheduler read.
+    convert = "convert-schedule-to-dcp"
+    # Scheduling-path normalizations before the SDC solve, kept out of
+    # HLS_PREPARE_PIPELINE since the Vitis path does its own:
+    #   * fold-if-statements -- predicate affine.if / scf.if, or fold an
+    #     affine.if guard into the enclosing loop bounds, so as little
+    #     control flow as possible remains inside a loop body;
+    #   * cse -- fold the redundant loads/ops speculation introduces so they
+    #     do not inflate the resource-bound II;
+    #   * reassociate-reductions -- rebalance unrolled reduction chains so a
+    #     loop-carried accumulator's recurrence spans one operator, not the
+    #     whole unrolled chain.
+    reassoc = (
+        "reassociate-reductions{float-reassoc="
+        f"{'true' if float_reassoc else 'false'}}}"
+    )
+    rotate = f"rotate-reductions{{accumulators={int(accumulators)}}}"
+    perf = "perfectize-loop-nest," if perfectize else ""
+    uup = "unroll-under-pipeline," if unroll_under_pipeline else ""
+    flat = "flatten-perfect-loops," if flatten else ""
+    # propagate-partition pushes `allo.part` from an array onto every callee
+    # parameter it is passed to. Must precede sdc-scheduling: the callee is
+    # scheduled against its per-bank ResII. RTL-path only -- Vitis reads
+    # `allo.part` as a pragma and does its own interprocedural handling.
+    part = "propagate-partition{" + f"top={top}" + "}"
+    # sdc-scheduling emits the schedule as the allo.sched.* carrier;
+    # convert-schedule-to-dcp reifies it into module-scoped allo.dcp.* ops
+    # and strips the carrier.
+    pipeline = (
+        f"builtin.module(func.func(raise-counted-while,{uup}"
+        f"{perf}{flat}"
+        f"canonicalize,fold-if-statements,cse,{reassoc},{rotate}),"
+        f"{part},{sdc},{convert})"
+    )
+    run_pipeline(module, pipeline)
+    return export_schedule_result(module)

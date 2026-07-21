@@ -1,13 +1,41 @@
 import ast
+from enum import Enum
 from dataclasses import dataclass
 from typing import TypeVar, ParamSpec, overload, Literal
 from collections.abc import Callable, Sequence
 
 from .kernel import Kernel
 from .core import TypeBase
+from .._mlir.ir import Module
 
 P = ParamSpec("P")
 R = TypeVar("R")
+
+
+class OperatorType(Enum):
+    """The abstract operator kinds an IP can characterize (mirrors ``OpKind`` in
+    ``OperatorLibrary.h``). The value is the abstract ``kind`` string the injected
+    ``dcp.operator`` carries; ``classify`` maps concrete ``arith.*`` ops onto these
+    (int vs float split by the signature dtype). An *advanced* operator
+    (``math.sqrt``/``sin``/``cos``/...) has no member here — pass its MLIR op name
+    as a bare string for ``optype`` instead."""
+
+    ADD = "add"
+    SUB = "sub"
+    MUL = "mul"
+    DIV = "div"
+    REM = "rem"
+    NEG = "neg"
+    CMP = "cmp"
+    AND = "and"
+    OR = "or"
+    XOR = "xor"
+    SHL = "shl"
+    SHR = "shr"
+    SELECT = "select"
+    INT_CAST = "icast"  # sext / zext / trunc / index_cast
+    INT_FLOAT_CAST = "ifcast"  # si/ui-to-fp, fp-to-si/ui
+    FLOAT_CAST = "fcast"  # extf / truncf
 
 
 @dataclass
@@ -51,6 +79,7 @@ class IP(Kernel[P, R]):
         out_delay_ns: float = 0.0,
         pipelined: bool = False,
         style: Literal["free", "elastic", "ce"] | None = None,
+        optype: OperatorType | str | None = None,
     ):
         super().__init__(fn, mapping=())
         if self.is_async:
@@ -63,6 +92,7 @@ class IP(Kernel[P, R]):
             pipelined=pipelined,
             style=style,
         )
+        self.optype = optype
         verify_timing(self.timing)
 
     def __call__(self, *args: P.args, **kwargs: P.kwargs) -> R:
@@ -95,6 +125,7 @@ def ip(
     out_delay_ns: float = 0.0,
     pipelined: bool = False,
     style: Literal["free", "elastic", "ce"] | None = None,
+    optype: OperatorType | str | None = None,
 ) -> IP[P, R]: ...
 
 
@@ -107,6 +138,7 @@ def ip(
     out_delay_ns: float = 0.0,
     pipelined: bool = False,
     style: Literal["free", "elastic", "ce"] | None = None,
+    optype: OperatorType | str | None = None,
 ) -> Callable[[Callable[P, R]], IP[P, R]]: ...
 
 
@@ -119,6 +151,7 @@ def ip(
     out_delay_ns: float = 0.0,
     pipelined: bool = False,
     style: Literal["free", "elastic", "ce"] | None = None,
+    optype: OperatorType | str | None = None,
 ) -> IP[P, R] | Callable[[Callable[P, R]], IP[P, R]]:
     if fn is not None:
         assert callable(fn), "The first argument must be a callable function."
@@ -130,6 +163,7 @@ def ip(
             out_delay_ns=out_delay_ns,
             pipelined=pipelined,
             style=style,
+            optype=optype,
         )
     else:
 
@@ -142,45 +176,7 @@ def ip(
                 out_delay_ns=out_delay_ns,
                 pipelined=pipelined,
                 style=style,
+                optype=optype,
             )
 
         return decorator
-
-
-OPERATOR_MAP: dict[type[ast.AST], Sequence[IP] | None] = {
-    ast.Add: None,
-    ast.Sub: None,
-    ast.Mult: None,
-    ast.Div: None,
-    ast.Mod: None,
-    ast.Pow: None,
-    ast.LShift: None,
-    ast.RShift: None,
-    ast.LShift: None,
-    ast.RShift: None,
-    ast.BitAnd: None,
-    ast.BitOr: None,
-    ast.BitXor: None,
-}
-
-
-def match_operator_ip(
-    map, op: ast.AST, arg_types: list[TypeBase], dst_types: list[TypeBase]
-) -> IP | None:
-    l = map.get(type(op), None)
-    if l is None:
-        return None
-    for ip in l:
-        if (
-            ip.parse_argument_annotations(arg_types, dst_types) == arg_types
-            and ip.parse_return_annotation(arg_types, dst_types) == dst_types
-        ):
-            return ip
-    return None
-
-
-def update_operator_map(
-    d: dict[type[ast.AST], Sequence[IP] | None],
-):
-    copy = OPERATOR_MAP.copy()
-    return copy.update(d)

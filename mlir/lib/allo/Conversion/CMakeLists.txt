@@ -14,15 +14,19 @@ add_mlir_conversion_library(MLIRAlloConversion
     LINK_LIBS PUBLIC
     CIRCTLoopSchedule
     CIRCTScheduling
+    MLIRIR
     MLIRAllo
     MLIRAlloSupport
-    MLIRArithDialect
-    MLIRBufferizationDialect
-    MLIRFuncDialect
-    MLIRIR
-    MLIRLinalgDialect
-    MLIRMathDialect
-    MLIRMemRefDialect
-    MLIRTensorDialect
-    MLIRTransformUtils
+    MLIRBufferizationPipelines
+    MLIRAffineToStandard
+    MLIRSCFToControlFlow
+    MLIRFuncToLLVM
+    MLIRMathToLLVM
+    MLIRMemRefToLLVM
+    MLIRIndexToLLVM
+    MLIRArithToLLVM
+    MLIRTensorToLinalg
+    MLIRControlFlowToLLVM
+    MLIRBufferizationToMemRef
+    MLIRReconcileUnrealizedCasts
 )

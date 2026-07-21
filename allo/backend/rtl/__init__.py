@@ -4,11 +4,11 @@
 """RTL backend: SDC scheduling and hw/Verilog emission.
 
 ``kernel.schedule().export("rtl")`` returns an :class:`RTL` handle, the entry
-point to the flow; the rest of this package is the operator timing library and
-the schedule-result model that handle returns.
+point to the flow; the rest of this package is the device model and the
+schedule-result model that handle returns.
 """
 
-from .operator_library import OperatorLibrary, OP_KINDS, OP_DTYPES
+from .device import Device, MemoryKind, builtin_device
 from .schedule import (
     ScheduleResult,
     FuncSchedule,
@@ -20,9 +20,9 @@ from .core import RTL
 from .sim.shell import CosimResult
 
 __all__ = [
-    "OperatorLibrary",
-    "OP_KINDS",
-    "OP_DTYPES",
+    "Device",
+    "MemoryKind",
+    "builtin_device",
     "ScheduleResult",
     "FuncSchedule",
     "RegionSchedule",

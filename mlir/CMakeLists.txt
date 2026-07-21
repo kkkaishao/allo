@@ -51,6 +51,16 @@ message(STATUS "Using Python binding")
 include(MLIRDetectPythonEnv)
 mlir_configure_python_dev_packages()
 
+# Python type stubs (.pyi) aid editor/IDE completion but add build time.
+# TEMPORARILY DISABLED: bare-name stubgen of the `_allo` extension re-imports
+# the core `_mlir` under its FQN and double-registers its enums. Re-enable once
+# the CRTP-migration/stubgen interaction is resolved (was: default ON under
+# Debug / RelWithDebInfo). Honors an explicit -DMLIR_PYTHON_STUBGEN_ENABLED.
+if(NOT DEFINED MLIR_PYTHON_STUBGEN_ENABLED)
+  set(MLIR_PYTHON_STUBGEN_ENABLED OFF)
+endif()
+message(STATUS "MLIR_PYTHON_STUBGEN_ENABLED: ${MLIR_PYTHON_STUBGEN_ENABLED}")
+
 option(ALLO_STRIP_RELEASE_LIBS "Strip symbol tables from Release shared libs" ON)
 if(ALLO_STRIP_RELEASE_LIBS AND
    (CMAKE_BUILD_TYPE STREQUAL "Release" OR CMAKE_BUILD_TYPE STREQUAL "MinSizeRel"))

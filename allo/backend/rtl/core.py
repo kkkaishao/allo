@@ -29,7 +29,7 @@ from ..cpu import CPU
 from ..._mlir.ir import Module
 from ..._mlir._mlir_libs._allo import ir_ext
 from ..._mlir.dialects.allo import emit_verilog, emit_datapath_to_hw
-from .operator_library import OperatorLibrary
+from .device import builtin_device, Device, inject_operators, inject_device
 from .schedule import run_schedule, ScheduleResult
 from .sim import shell
 from ...lang.core import ShapedType
@@ -37,10 +37,6 @@ from ...lang.kernel import Kernel
 
 P = ParamSpec("P")
 R = TypeVar("R")
-
-# Clock used for cosim when neither `freq_mhz` nor the library declares a target.
-# It only scales simulated time, not the reported cycle count.
-_DEFAULT_FREQ_MHZ = 300.0
 
 # DCP normalization before emit: dcp-resolve-banking splits a statically-banked
 # partitioned array into per-bank memrefs (reusing the scheduler's staticBank),
@@ -58,8 +54,7 @@ class RTL(Backend[P, R]):
         self,
         kernel: Kernel[P, R],
         *,
-        device: str | None = None,
-        library: OperatorLibrary | str | None = None,
+        device: Device | None = None,
         freq_mhz: float | None = None,
         simulator: str = "verilator",
         binding: str = "trivial",
@@ -71,11 +66,11 @@ class RTL(Backend[P, R]):
         """Build an RTL handle for one hardware configuration.
 
         Args:
-            device: selects a shipped operator library by name.
-            library: an :class:`OperatorLibrary` or a path to a YAML library;
-                defaults to the built-in one (``oplib/builtin.yaml``).
+            device: the hardware platform (:class:`Device`) -- storage
+                primitives, native chaining delays, operator IPs, and a default
+                clock. Defaults to ``builtin_device``.
             freq_mhz: target frequency, driving both the SDC cycle time and the
-                cosim clock. Defaults to the library's declared frequency.
+                cosim clock. Overrides the device's ``default_freq_mhz``.
             simulator: the engine cocotb drives for ``cosim``.
             binding: operator-sharing policy.
             accumulators: rotate float reductions across this many accumulators,
@@ -93,21 +88,13 @@ class RTL(Backend[P, R]):
                 alternative -- the scheduler handles imperfect nests without it.
         """
         super().__init__(kernel)
-        if library is None:
-            library = OperatorLibrary.builtin(device or "builtin")
-        self.library = library
-        # One target frequency drives both the SDC cycle time and the cosim
-        # clock; the library's declared target is the default. A library given
-        # as a path declares its frequency to the scheduler directly.
-        if freq_mhz is not None:
-            self._cycle_time = 1000.0 / freq_mhz
-        elif isinstance(library, OperatorLibrary):
-            self._cycle_time = library.cycle_time()
-        else:
-            self._cycle_time = None
+        self._device = device if device is not None else builtin_device
+        # Frequency is a per-run parameter: the explicit override, else the
+        # device default. It drives both the SDC cycle time and the cosim clock.
         self.freq_mhz = (
-            1000.0 / self._cycle_time if self._cycle_time else _DEFAULT_FREQ_MHZ
+            freq_mhz if freq_mhz is not None else self._device.default_freq_mhz
         )
+        self._cycle_time = 1000.0 / self.freq_mhz
         self.simulator = simulator
         self.binding = binding
         self._sched_opts = {
@@ -144,10 +131,15 @@ class RTL(Backend[P, R]):
             # Schedule a copy: the driver reifies the schedule into the module in
             # place, and `self.module` stays the pristine snapshot.
             self._dcp_ir = ir_ext.clone_module(self.module)
+            # Inject the device operators + technology tables into the scheduled
+            # copy only, so the CPU functional path (on the pristine self.module)
+            # never sees them. The scheduler and reifier read this IR for all
+            # operator/device timing; frequency stays a per-run parameter.
+            inject_operators(self._dcp_ir, self._device.operators)
+            inject_device(self._dcp_ir, self._device)
             self._schedule_result = run_schedule(
                 self.top,
                 self._dcp_ir,
-                library=self.library,
                 cycle_time=self._cycle_time,
                 **self._sched_opts,
             )
@@ -171,6 +163,7 @@ class RTL(Backend[P, R]):
                     "RTL does not support returning arrays; use an out-parameter "
                     "instead"
                 )
+            # operator IPs are injected into the scheduled copy inside schedule()
             self.schedule()
             # Normalize and emit on a copy, so `dcp` keeps reading the scheduled
             # module rather than this pipeline's lowered remains.

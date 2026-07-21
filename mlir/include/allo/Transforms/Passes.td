@@ -323,10 +323,8 @@ def SdcSchedulingPass : Pass<"sdc-scheduling", "ModuleOp"> {
   }];
   let options = [
     Option<"cycleTime", "cycle-time", "float", "0.0",
-           "Target clock period (ns); <=0 falls back to the operator library's "
-           "cycle_time_ns, else 5.0">,
-    Option<"operatorLibrary", "operator-library", "std::string", "\"\"",
-           "Path to a YAML operator library; empty uses the built-in default">,
+           "Target clock period (ns); <=0 falls back to 5.0. Operator/device "
+           "timing is read from the injected dcp.device / dcp.operator IR">,
     Option<"top", "top", "std::string", "\"top\"",
            "Name of the top kernel of the design (for scheduling)">
   ];

@@ -380,11 +380,6 @@ def AssumeNoDepOp : Allo_Op<"assume.nodep"> {
 //===----------------------------------------------------------------------===//
 // Data & Control Path (dcp) Operations
 //===----------------------------------------------------------------------===//
-// The post-scheduling, pre-RTL microarchitecture IR. The schedule (start/ii/trip)
-// and binding (unit/port) live *on* these ops; registers, muxes, and the
-// controller are NOT ops -- they are derived when lowering to hw/seq/comb.
-// See drafts/dialect-design.md.
-
 
 def ScheduledOpInterface : OpInterface<"ScheduledOpInterface"> {
   let description = [{
@@ -422,26 +417,54 @@ class DCPath_Op<string mnemonic, list<Trait> traits = []> : Allo_Op<mnemonic, tr
 }
 
 def DCPathOperatorOp : DCPath_Op<"dcp.operator", [Symbol]> {
-  let summary = "An operator-type characterization (a symbol compute/memory ops reference)";
+  let summary = "An IP operator characterization (a symbol dcp.compute references)";
   let description = [{
-    Declares the timing of an operator kind at a width, sourced from the operator
-    library. Referenced by `dcpath.compute`/`dcpath.load`/`dcpath.store` so that
-    schedule legality and register depths are self-contained and verifiable.
+    Declares the timing of one instanced (multi-cycle) IP operator: a
+    fixed-signature float/cast core the device provides. Injected from the device
+    model (Python) before scheduling, and referenced by a `dcp.compute` on the IP
+    path (its `op_type`) so schedule legality and register depths are
+    self-contained and verifiable.
 
-    `impl` is the realization (from the library): a native keyword
-    (`comb`/`hwarith`/`builtin`) or an IP module name. EmitHW dispatches on it;
-    absent means no realization was declared (scheduling-only).
+    `sym_name` is BOTH the referenced symbol and the RTL module name the emitter
+    instantiates. `kind` is the abstract operator kind
+    (`add`/`mul`/`cmp`/`int_float_cast`/...); `signature` is the concrete
+    realized type (e.g. `(f32, f32) -> f32`), matched by exact element types.
+    `stall` is the port/back-pressure contract the emitter instantiates it with
+    (clock-enable today). Combinational ops do NOT get a `dcp.operator` -- they
+    take the `dcp.compute` `comb_kind` path, with their chaining delay in
+    `dcp.device`.
   }];
   let arguments = (ins
     SymbolNameAttr:$sym_name,
     StrAttr:$kind,
-    I32Attr:$width,
+    TypeAttrOf<FunctionType>:$signature,
     I64Attr:$latency,
+    F32Attr:$in_delay,
+    F32Attr:$out_delay,
     DefaultValuedAttr<BoolAttr, "true">:$pipelined,
-    OptionalAttr<F32Attr>:$in_delay,
-    OptionalAttr<F32Attr>:$out_delay,
-    OptionalAttr<StrAttr>:$impl);
-  let assemblyFormat = "$sym_name attr-dict";
+    DefaultValuedAttr<StallContractAttr, "::mlir::allo::StallContractEnum::Ce">:$stall);
+  let hasCustomAssemblyFormat = 1;
+}
+
+def DCPathDeviceOp : DCPath_Op<"dcp.device"> {
+  let summary = "The device technology tables (combinational + storage timing)";
+  let description = [{
+    The device model injected from Python before scheduling: the native
+    (combinational) operator chaining delays and the storage timing. The
+    scheduler and reifier read it instead of a YAML library.
+
+    `comb` maps an abstract operator kind (`add`/`sub`/`cmp`/...) to its
+    combinational chaining delay (ns). `memory` maps a storage implementation
+    (`register`/`lutram`/`bram`/`uram`) to its `{read_latency, write_latency,
+    read_delay_ns, write_delay_ns}`; `fifo` is the stream get/put timing;
+    `default_memory` is the implementation unbound on-chip arrays use.
+  }];
+  let arguments = (ins
+    DictionaryAttr:$comb,
+    DictionaryAttr:$memory,
+    OptionalAttr<DictionaryAttr>:$fifo,
+    OptionalAttr<StrAttr>:$default_memory);
+  let hasCustomAssemblyFormat = 1;
 }
 
 def DCPathUnitOp : DCPath_Op<"dcp.unit",
@@ -471,8 +494,7 @@ def DCPathPipelineOp : DCPath_Op<"dcp.pipeline",
     per-iteration continue condition and which carries no `trip`. `isWhileLoop()`
     distinguishes the two; `getCarriedValues()` returns the loop-carried next-values
     for either. Recurrence, accumulator init, and the loop result are all loop-carried
-    SSA (see drafts/dialect-design.md section 9, drafts/C2.2-dcp-while-design.md).
-    Registers/muxes/counter/flushing-control are derived at lowering.
+    SSA. Registers/muxes/counter/flushing-control are derived at lowering.
 
     The counter runs the source loop's induction: `lb`, `lb+step`, ... The lower
     bound and stride are each either compile-time (the `lb`/`step` attributes,
@@ -483,14 +505,12 @@ def DCPathPipelineOp : DCPath_Op<"dcp.pipeline",
     upper bound `ub` is symmetrically the compile-time `lb + trip*step` when `trip`
     is known, else the runtime `dynamicBound` operand; `trip` is the derived
     iteration count kept for latency / modulo-unroll math. A while loop carries none
-    of these (`dcp.condition` gates termination; its counter free-runs from 0). See
-    drafts/dcp-pipeline-generalization-design.md.
+    of these (`dcp.condition` gates termination; its counter free-runs from 0).
 
     `ii` is optional: it is absent only for a residual *sequential* wrapper whose
     body length is data-dependent (an enclosed loop with a dynamic trip), which has
     no static initiation interval -- its hardware is a done-based sequential
-    controller (start iteration i+1 when iteration i finishes). A pipelined region
-    (leaf or Phase-B level) and a while pipeline always carry an `ii`.
+    controller (start iteration i+1 when iteration i finishes).
   }];
   let arguments = (ins
     Optional<Index>:$lbBound,
@@ -561,8 +581,7 @@ def DCPathSelectOp : DCPath_Op<"dcp.select",
     `else` is optional, and present iff there are results (a mux needs both
     sources). Enable / registers / result-mux are derived at lowering. Latency is
     optional: absent for a data-dependent guard (unknown), present when an affine
-    active-count is known (if-scheduling-analysis Tier 2). Contrast `arith.select`,
-    which selects a *value* (a plain data mux, kept as mixed-IR).
+    active-count is known.
   }];
   let arguments = (ins
     I1:$condition,
@@ -582,25 +601,28 @@ def DCPathComputeOp : DCPath_Op<"dcp.compute",
      ScheduledOpInterface]> {
   let summary = "A scheduled, bound compute operation";
   let description = [{
-    Computes `result` from `inputs` using operator type `operator` (which gives its
-    latency/kind), issued at cycle `start` within its region, optionally bound to
-    functional unit `unit`. Latency>0 lowers to an operator-module instance;
-    latency 0 to combinational logic.
+    Computes `result` from `inputs`, issued at cycle `start` within its region,
+    optionally bound to functional unit `unit`. Exactly one of two realization
+    paths is set: `comb_kind` (a `CombOpKind`) is a combinational op emitted
+    inline as a CIRCT `comb` primitive (latency 0, chained); `op_type` references
+    a `dcp.operator` and lowers to that IP module instance (its latency). The
+    verifier enforces the exclusivity.
   }];
   let arguments = (ins
     Variadic<AnyType>:$inputs,
-    FlatSymbolRefAttr:$op_type,
+    OptionalAttr<CombOpKindAttr>:$comb_kind,
+    OptionalAttr<FlatSymbolRefAttr>:$op_type,
     I64Attr:$start,
     OptionalAttr<FlatSymbolRefAttr>:$unit);
   let results = (outs AnyType:$result);
   let assemblyFormat = [{
-    $op_type `(` $inputs `)` `at` $start (`on` $unit^)? attr-dict
-    `:` functional-type($inputs, $result)
+    (`comb` $comb_kind^)? ($op_type^)? `(` $inputs `)` `at` $start
+    (`on` $unit^)? attr-dict `:` functional-type($inputs, $result)
   }];
   let hasVerifier = 1;
 }
 
-def DCPathInvokeOp : DCPath_Op<"dcp.invoke",
+def DCPathInstanceOp : DCPath_Op<"dcp.instance",
     [DeclareOpInterfaceMethods<SymbolUserOpInterface>, ScheduledOpInterface]> {
   let summary = "A scheduled sub-kernel call (a leaf-datapath CallUnit node)";
   let description = [{
@@ -612,7 +634,7 @@ def DCPathInvokeOp : DCPath_Op<"dcp.invoke",
     `dcp.operator`: a determinate invoke is a fixed-latency node in the datapath F (a
     pipelined multiplier that also masters ports); an indeterminate one completes on
     the child's real `done`. `latency` is absent for an indeterminate callee (a
-    `while`/data-dependent child). See drafts/phase-D-implementation-plan.md.
+    `while`/data-dependent child).
   }];
   let arguments = (ins
     Variadic<AnyType>:$inputs,
@@ -622,40 +644,39 @@ def DCPathInvokeOp : DCPath_Op<"dcp.invoke",
     DeterminacyAttr:$determinacy);
   let results = (outs Variadic<AnyType>:$results);
   let assemblyFormat = [{
-    $callee `(` $inputs `)` `at` $start attr-dict
+    $callee `(` $inputs `)` `at` $start $determinacy attr-dict
     `:` functional-type($inputs, $results)
   }];
   let hasVerifier = 1;
 }
 
 def DCPathLoadOp : DCPath_Op<"dcp.load",
-    [DeclareOpInterfaceMethods<SymbolUserOpInterface>, MemoryEffects<[MemRead]>,
-     ScheduledOpInterface]> {
+    [MemoryEffects<[MemRead]>, ScheduledOpInterface]> {
   let summary = "A scheduled, port-bound memory read";
   let description = [{
     Reads `memref` at the address `map(indices)`; the induction variable among the
     indices makes the address timing fall out of the same register-depth rule as
-    data. Bound to a `(bank, port)` of the memref.
+    data. Bound to a `(bank, port)` of the memref. `latency` is the read latency
+    of the memref's storage, resolved from the device memory model at reify time.
   }];
   let arguments = (ins
     AnyMemRef:$memref,
     Variadic<Index>:$indices,
     AffineMapAttr:$map,
     I64Attr:$start,
-    OptionalAttr<FlatSymbolRefAttr>:$op_type,
+    I64Attr:$latency,
     OptionalAttr<I64Attr>:$bank,
     OptionalAttr<I64Attr>:$port);
   let results = (outs AnyType:$result);
   let assemblyFormat = [{
-    $memref `[` $indices `]` `map` $map `at` $start
-    (`op` $op_type^)? (`bank` $bank^)? (`port` $port^)? attr-dict
+    $memref `[` $indices `]` `map` $map `at` $start `lat` $latency
+    (`bank` $bank^)? (`port` $port^)? attr-dict
     `:` type($memref) `->` type($result)
   }];
 }
 
 def DCPathStoreOp : DCPath_Op<"dcp.store",
-    [DeclareOpInterfaceMethods<SymbolUserOpInterface>, MemoryEffects<[MemWrite]>,
-     ScheduledOpInterface]> {
+    [MemoryEffects<[MemWrite]>, ScheduledOpInterface]> {
   let summary = "A scheduled, port-bound memory write";
   let arguments = (ins
     AnyType:$value,
@@ -663,12 +684,12 @@ def DCPathStoreOp : DCPath_Op<"dcp.store",
     Variadic<Index>:$indices,
     AffineMapAttr:$map,
     I64Attr:$start,
-    OptionalAttr<FlatSymbolRefAttr>:$op_type,
+    I64Attr:$latency,
     OptionalAttr<I64Attr>:$bank,
     OptionalAttr<I64Attr>:$port);
   let assemblyFormat = [{
-    $value `,` $memref `[` $indices `]` `map` $map `at` $start
-    (`op` $op_type^)? (`bank` $bank^)? (`port` $port^)? attr-dict
+    $value `,` $memref `[` $indices `]` `map` $map `at` $start `lat` $latency
+    (`bank` $bank^)? (`port` $port^)? attr-dict
     `:` type($value) `,` type($memref)
   }];
 }
@@ -695,8 +716,7 @@ def DCPathConditionOp : DCPath_Op<"dcp.condition",
     The terminator of a while `dcp.pipeline`: `$condition` (an `i1`) is the
     per-iteration continue condition the derived flushing controller reads, and
     `$carried` are the loop-carried next-values (the `dcp.uncondition` operands of a
-    counted loop). The mandatory `i1` makes "first result is the condition, at least
-    one result" structural. See drafts/C2.2-dcp-while-design.md.
+    counted loop).
   }];
   let arguments = (ins I1:$condition, Variadic<AnyType>:$carried);
   let assemblyFormat = [{

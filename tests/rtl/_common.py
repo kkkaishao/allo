@@ -4,26 +4,29 @@
 """Shared helpers for the RTL tests.
 
 The named latencies (``FADD``, ``FMUL``, ...) are read from the shipped built-in
-operator library -- the one the RTL backend uses by default -- so the II
-assertions read as the recurrence arithmetic they check while tracking the
-library's real numbers.
+device -- the one the RTL backend uses by default -- so the II assertions read as
+the recurrence arithmetic they check while tracking the device's real numbers.
 """
 
 from __future__ import annotations
 
-from allo.backend.rtl import OperatorLibrary, RTL, ScheduleResult
+from allo.backend.rtl import RTL, ScheduleResult, MemoryKind, builtin_device
 
-LIB = OperatorLibrary.builtin("builtin")
 
-_DICT = LIB.to_dict()
-_LAT = {(r.get("op"), r.get("dtype")): r["latency"] for r in _DICT["operators"]}
-_PRIM = {p["name"]: p["latency"] for p in _DICT["memory"]["primitives"]}
+# Operator latencies keyed by (kind, arg bit width), read off the built-in
+# operator IPs (each an `@ip(optype=...)`).
+def _key(op):
+    dt = op.parse_argument_annotations()[0]
+    return (op.optype.value, int(dt.primitive_width))
 
-FADD = FSUB = _LAT[("add", "float")]  # floating-point add/sub latency (cycles)
-FMUL = _LAT[("mul", "float")]  # floating-point multiply latency
-FDIV = _LAT[("div", "float")]  # floating-point divide latency
-IMUL = _LAT[("mul", "int")]  # integer multiply latency
-MEM = _PRIM["lutram"]["read"]  # default (LUTRAM) read / write latency
+
+_LAT = {_key(o): o.timing.latency for o in builtin_device.operators}
+
+FADD = FSUB = _LAT[("add", 32)]  # floating-point add/sub latency (cycles)
+FMUL = _LAT[("mul", 32)]  # floating-point multiply latency
+FDIV = _LAT[("div", 32)]  # floating-point divide latency
+IMUL = 0  # integer multiply is combinational (latency 0)
+MEM = builtin_device.memory[MemoryKind.LUTRAM].read_latency  # default read/write
 
 # A memory-carried accumulate (`M[x] += ...`) closes a distance-1 recurrence
 # read -> add -> write, so its II is the sum; a scalar-carried accumulate keeps

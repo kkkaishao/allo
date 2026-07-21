@@ -80,7 +80,7 @@ struct DatapathBuilder {
                                   // `sources` survive later pushes
 
   const BindingPolicy &policy; // decides resource sharing
-  const CalleeCtx *callees;    // child modules/ifaces for a dcp.invoke
+  const CalleeCtx *callees;    // child modules/ifaces for a dcp.instance
                                // (null for a plain leaf, no calls)
 
   DatapathBuilder(Datapath &dp, func::FuncOp func, const BindingPolicy &policy,

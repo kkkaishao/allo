@@ -253,9 +253,9 @@ void DatapathBuilder::bindResource(Operation *op, RegionBlock &rb) {
   // A sub-kernel call: a CallUnit owned by this region. The child instance
   // masters its memref operands' memory ports; a scalar operand is a Source
   // input and a scalar result a survivor (guarded in validateDatapath). Modeled
-  // from the declared `dcp.invoke` + the callee port model.
-  if (auto inv = dyn_cast<dcp::DCPathInvokeOp>(op)) {
-    assert(callees && "a dcp.invoke in a leaf datapath needs callee context "
+  // from the declared `dcp.instance` + the callee port model.
+  if (auto inv = dyn_cast<dcp::DCPathInstanceOp>(op)) {
+    assert(callees && "a dcp.instance in a leaf datapath needs callee context "
                       "(a rerouted container)");
     auto it = callees->ifaces.find(inv.getCallee());
     assert(it != callees->ifaces.end() &&
@@ -399,14 +399,24 @@ void DatapathBuilder::bindResource(Operation *op, RegionBlock &rb) {
     return;
 
   if (auto comp = dyn_cast<dcp::DCPathComputeOp>(op)) {
-    auto opr = dyn_cast_or_null<dcp::DCPathOperatorOp>(dcpOperatorOp(op));
     FuncUnit u;
     u.id = dp.units.size();
-    u.opType = opr ? opr.getKind().str() : op->getName().stripDialect().str();
-    if (opr && opr.getImpl())
-      u.impl = opr.getImpl()->str();
-    u.latency = opr ? static_cast<unsigned>(opr.getLatency()) : 0;
-    u.pipelined = opr ? opr.getPipelined() : true;
+    if (std::optional<CombOpKindEnum> ck = comp.getCombKind()) {
+      // Combinational: emitted inline as a `comb` primitive (latency 0).
+      u.opType = stringifyCombOpKindEnum(*ck).str();
+      u.comb = true;
+      u.latency = 0;
+      u.pipelined = true;
+    } else {
+      // IP: `op_type` is the operator's sym_name = the RTL module name; its
+      // timing + stall contract are stamped onto the compute at emit
+      // (`stampOperatorTiming`).
+      u.impl = comp.getOpTypeAttr().getValue().str();
+      u.opType = u.impl;
+      u.latency = dcpLatency(op);
+      u.pipelined = comp->getAttrOfType<BoolAttr>("pipelined").getValue();
+      u.stall = comp->getAttrOfType<StallContractEnumAttr>("stall").getValue();
+    }
     u.resultType = comp.getResult().getType();
     int64_t t = dcpStart(op);
     unsigned ii = rb.ii.value_or(1);

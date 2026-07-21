@@ -5,720 +5,355 @@
 
 #include "allo/Scheduling/OperatorLibrary.h"
 
-#include "allo/IR/AlloOps.h"       // kAlloAsyncAttr
-#include "allo/Scheduling/Utils.h" // sched::kLatencyAttr
+#include "allo/IR/AlloOps.h"
 
-#include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/Dialect/Affine/IR/AffineOps.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/Math/IR/Math.h"
+#include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinTypes.h"
-#include "mlir/IR/MLIRContext.h"
-#include "mlir/IR/SymbolTable.h"
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/StringSwitch.h"
-#include "llvm/Support/MemoryBuffer.h"
-#include "llvm/Support/YAMLTraits.h"
-
-#include <algorithm>
+#include "llvm/ADT/TypeSwitch.h"
 
 using namespace mlir;
 using namespace mlir::allo;
 
 //===----------------------------------------------------------------------===//
-// YAML traits
+// Abstract-kind <-> string
 //===----------------------------------------------------------------------===//
 
-LLVM_YAML_IS_SEQUENCE_VECTOR(OperatorEntry)
-LLVM_YAML_IS_SEQUENCE_VECTOR(MemPrimitive)
-
-namespace llvm::yaml {
-
-template <> struct ScalarEnumerationTraits<OpKind> {
-  static void enumeration(IO &io, OpKind &k) {
-    io.enumCase(k, "add", OpKind::Add);
-    io.enumCase(k, "sub", OpKind::Sub);
-    io.enumCase(k, "mul", OpKind::Mul);
-    io.enumCase(k, "div", OpKind::Div);
-    io.enumCase(k, "rem", OpKind::Rem);
-    io.enumCase(k, "neg", OpKind::Neg);
-    io.enumCase(k, "cmp", OpKind::Cmp);
-    io.enumCase(k, "and", OpKind::And);
-    io.enumCase(k, "or", OpKind::Or);
-    io.enumCase(k, "xor", OpKind::Xor);
-    io.enumCase(k, "shl", OpKind::Shl);
-    io.enumCase(k, "shr", OpKind::Shr);
-    io.enumCase(k, "select", OpKind::Select);
-    io.enumCase(k, "int_cast", OpKind::ICastI);
-    io.enumCase(k, "int_float_cast", OpKind::FCastI);
-    io.enumCase(k, "float_cast", OpKind::FCastF);
-    io.enumCase(k, "mem_read", OpKind::MemRead);
-    io.enumCase(k, "mem_write", OpKind::MemWrite);
-    io.enumCase(k, "stream_read", OpKind::StreamRead);
-    io.enumCase(k, "stream_write", OpKind::StreamWrite);
+llvm::StringRef mlir::allo::opKindString(OpKind kind) {
+  switch (kind) {
+  case OpKind::Add:
+    return "add";
+  case OpKind::Sub:
+    return "sub";
+  case OpKind::Mul:
+    return "mul";
+  case OpKind::Div:
+    return "div";
+  case OpKind::Rem:
+    return "rem";
+  case OpKind::Neg:
+    return "neg";
+  case OpKind::Cmp:
+    return "cmp";
+  case OpKind::And:
+    return "and";
+  case OpKind::Or:
+    return "or";
+  case OpKind::Xor:
+    return "xor";
+  case OpKind::Shl:
+    return "shl";
+  case OpKind::Shr:
+    return "shr";
+  case OpKind::Select:
+    return "select";
+  case OpKind::ICastI:
+    return "icast";
+  case OpKind::FCastI:
+    return "ifcast";
+  case OpKind::FCastF:
+    return "fcast";
+  default:
+    return "";
   }
-};
-
-template <> struct ScalarEnumerationTraits<OpDType> {
-  static void enumeration(IO &io, OpDType &d) {
-    io.enumCase(d, "int", OpDType::Int);
-    io.enumCase(d, "uint", OpDType::UInt);
-    io.enumCase(d, "half", OpDType::Half);
-    io.enumCase(d, "bfloat16", OpDType::BFloat16);
-    io.enumCase(d, "float", OpDType::Float);
-    io.enumCase(d, "double", OpDType::Double);
-    io.enumCase(d, "any", OpDType::None);
-  }
-};
-
-// `units:` is a dynamic map of pool-name -> unit count.
-template <> struct CustomMappingTraits<std::map<std::string, uint32_t>> {
-  static void inputOne(IO &io, StringRef key,
-                       std::map<std::string, uint32_t> &v) {
-    io.mapRequired(key.str().c_str(), v[key.str()]);
-  }
-  static void output(IO &io, std::map<std::string, uint32_t> &v) {
-    for (auto &kv : v)
-      io.mapRequired(kv.first.c_str(), kv.second);
-  }
-};
-
-// `width: {min, max}` -- either bound optional.
-template <> struct MappingTraits<WidthRange> {
-  static void mapping(IO &io, WidthRange &w) {
-    io.mapOptional("min", w.min);
-    io.mapOptional("max", w.max);
-  }
-};
-
-// `delay_ns:` is polymorphic: a scalar (symmetric, in == out) or a `{in, out}`
-// map. `DelaySpec` carries ONLY PolymorphicTraits; the scalar view is a plain
-// `double` and the map view a distinct `DelayMap` (distinct traits avoid the
-// yamlize ambiguity). On input, the YAML node kind selects which optional is
-// engaged; on output, `getKind` picks scalar iff the scalar form was used.
-template <> struct MappingTraits<DelayMap> {
-  static void mapping(IO &io, DelayMap &d) {
-    io.mapOptional("in", d.in);
-    io.mapOptional("out", d.out);
-  }
-};
-template <> struct PolymorphicTraits<DelaySpec> {
-  static NodeKind getKind(const DelaySpec &d) {
-    return d.scalar ? NodeKind::Scalar : NodeKind::Map;
-  }
-  static double &getAsScalar(DelaySpec &d) {
-    if (!d.scalar)
-      d.scalar = 0.0;
-    return *d.scalar;
-  }
-  static DelayMap &getAsMap(DelaySpec &d) {
-    if (!d.map)
-      d.map.emplace();
-    return *d.map;
-  }
-  static DelayMap &getAsSequence(DelaySpec &d) { return getAsMap(d); } // unused
-};
-
-template <> struct MappingTraits<OperatorEntry> {
-  static void mapping(IO &io, OperatorEntry &e) {
-    io.mapOptional("op", e.kind);
-    io.mapOptional("dtype", e.dtype);
-    io.mapOptional("mlir_op", e.mlirOp);
-    io.mapOptional("width", e.width);
-    io.mapOptional("latency", e.latency);
-    io.mapOptional("delay_ns", e.delay);
-    io.mapOptional("pipelined", e.pipelined);
-    io.mapOptional("unit", e.unit);
-    io.mapOptional("impl", e.impl);
-  }
-};
-
-// `memory:` section -- the storage-timing library. `default:` is the storage
-// implementation unbound arrays use; `primitives:` characterizes each
-// implementation's read/write timing; `fifo:` is stream get/put timing. Latency
-// and delay are each split by direction (`read`/`write`).
-template <> struct ScalarEnumerationTraits<MemoryImplEnum> {
-  static void enumeration(IO &io, MemoryImplEnum &v) {
-    io.enumCase(v, "auto", MemoryImplEnum::Auto);
-    io.enumCase(v, "register", MemoryImplEnum::Register);
-    io.enumCase(v, "lutram", MemoryImplEnum::LUTRAM);
-    io.enumCase(v, "bram", MemoryImplEnum::BRAM);
-    io.enumCase(v, "uram", MemoryImplEnum::URAM);
-  }
-};
-template <> struct MappingTraits<RWLatency> {
-  static void mapping(IO &io, RWLatency &v) {
-    io.mapOptional("read", v.read);
-    io.mapOptional("write", v.write);
-  }
-};
-template <> struct MappingTraits<RWDelay> {
-  static void mapping(IO &io, RWDelay &v) {
-    io.mapOptional("read", v.read);
-    io.mapOptional("write", v.write);
-  }
-};
-template <> struct MappingTraits<MemKindTiming> {
-  static void mapping(IO &io, MemKindTiming &m) {
-    io.mapOptional("latency", m.latency);
-    io.mapOptional("delay_ns", m.delay);
-  }
-};
-template <> struct MappingTraits<MemPrimitive> {
-  static void mapping(IO &io, MemPrimitive &p) {
-    io.mapRequired("name", p.impl);
-    io.mapOptional("latency", p.timing.latency);
-    io.mapOptional("delay_ns", p.timing.delay);
-  }
-};
-template <> struct MappingTraits<MemoryLibrary> {
-  static void mapping(IO &io, MemoryLibrary &m) {
-    io.mapOptional("default", m.defaultImpl);
-    io.mapOptional("primitives", m.primitives);
-    io.mapOptional("fifo", m.fifo);
-  }
-};
-
-template <> struct MappingTraits<OperatorLibrary> {
-  static void mapping(IO &io, OperatorLibrary &lib) {
-    io.mapOptional("device", lib.device);
-    io.mapOptional("frequency_mhz", lib.frequencyMhz);
-    io.mapOptional("cycle_time_ns", lib.cycleTimeNs);
-    io.mapOptional("units", lib.units);
-    io.mapOptional("operators", lib.entries);
-    io.mapOptional("advanced_operators", lib.advancedEntries);
-    io.mapOptional("default", lib.defaultEntry);
-    io.mapOptional("memory", lib.memory);
-  }
-};
-
-} // namespace llvm::yaml
-
-//===----------------------------------------------------------------------===//
-// Default library
-//===----------------------------------------------------------------------===//
-
-llvm::StringRef mlir::allo::defaultLibraryYAML() {
-  // The complete built-in library -- MUST stay in sync with the Python mirror
-  // allo/backend/rtl/oplib/builtin.yaml (see its header). Every abstract kind
-  // carries a timing and a realization (`impl`: `comb` or an IP module name
-  // `<f|d|i><op>_l<lat>`). Single-precision float latencies are measured on
-  // U55C at 300 MHz; double is ~2x; integer mul/div/rem and delays are
-  // placeholders. Integer add/sub stay combinational (a real gate delay);
-  // compare/select/ shift/bitwise/int-resize are combinational; float/double
-  // cores and int<-> float conversions are multi-cycle IP.
-  return R"yaml(
-device: builtin
-frequency_mhz: 300.0
-operators:
-  - op: add
-    dtype: int
-    latency: 0
-    delay_ns: 1.2
-    impl: comb
-  - op: sub
-    dtype: int
-    latency: 0
-    delay_ns: 1.2
-    impl: comb
-  - op: mul
-    dtype: int
-    latency: 3
-    impl: imul_l3
-  - op: div
-    dtype: int
-    latency: 20
-    impl: idiv_l20
-  - op: rem
-    dtype: int
-    latency: 20
-    impl: irem_l20
-  - op: neg
-    dtype: int
-    latency: 0
-    delay_ns: 1.0
-    impl: comb
-  - op: cmp
-    dtype: int
-    latency: 0
-    delay_ns: 1.0
-    impl: comb
-  - op: and
-    dtype: int
-    latency: 0
-    delay_ns: 0.4
-    impl: comb
-  - op: or
-    dtype: int
-    latency: 0
-    delay_ns: 0.4
-    impl: comb
-  - op: xor
-    dtype: int
-    latency: 0
-    delay_ns: 0.4
-    impl: comb
-  - op: shl
-    dtype: int
-    latency: 0
-    delay_ns: 0.5
-    impl: comb
-  - op: shr
-    dtype: int
-    latency: 0
-    delay_ns: 0.5
-    impl: comb
-  - op: select
-    dtype: int
-    latency: 0
-    delay_ns: 0.5
-    impl: comb
-  - op: int_cast
-    dtype: int
-    latency: 0
-    delay_ns: 0.3
-    impl: comb
-  - op: add
-    dtype: float
-    latency: 7
-    delay_ns: 0.5
-    impl: fadd_l7
-  - op: sub
-    dtype: float
-    latency: 7
-    delay_ns: 0.5
-    impl: fsub_l7
-  - op: mul
-    dtype: float
-    latency: 4
-    delay_ns: 0.5
-    impl: fmul_l4
-  - op: div
-    dtype: float
-    latency: 12
-    delay_ns: 0.5
-    impl: fdiv_l12
-  - op: cmp
-    dtype: float
-    latency: 1
-    delay_ns: 0.5
-    impl: fcmp_l1
-  - op: select
-    dtype: float
-    latency: 0
-    delay_ns: 0.5
-    impl: comb
-  - op: neg
-    dtype: float
-    latency: 0
-    delay_ns: 0.3
-    impl: comb
-  - op: add
-    dtype: double
-    latency: 14
-    delay_ns: 0.5
-    impl: dadd_l14
-  - op: sub
-    dtype: double
-    latency: 14
-    delay_ns: 0.5
-    impl: dsub_l14
-  - op: mul
-    dtype: double
-    latency: 9
-    delay_ns: 0.5
-    impl: dmul_l9
-  - op: div
-    dtype: double
-    latency: 24
-    delay_ns: 0.5
-    impl: ddiv_l24
-  - op: cmp
-    dtype: double
-    latency: 1
-    delay_ns: 0.5
-    impl: dcmp_l1
-  - op: select
-    dtype: double
-    latency: 0
-    delay_ns: 0.5
-    impl: comb
-  - op: neg
-    dtype: double
-    latency: 0
-    delay_ns: 0.3
-    impl: comb
-  - op: add
-    dtype: bfloat16
-    latency: 4
-    delay_ns: 0.5
-    impl: bfadd_l4
-  - op: sub
-    dtype: bfloat16
-    latency: 4
-    delay_ns: 0.5
-    impl: bfsub_l4
-  - op: mul
-    dtype: bfloat16
-    latency: 2
-    delay_ns: 0.5
-    impl: bfmul_l2
-  - op: int_float_cast
-    latency: 3
-    delay_ns: 0.5
-    impl: i2f_l3
-  - op: float_cast
-    latency: 2
-    delay_ns: 0.5
-    impl: fcvt_l2
-default:
-  latency: 0
-  delay_ns: 0.1
-  impl: builtin
-memory:
-  default: lutram
-  primitives:
-    - name: register
-      latency: {read: 0, write: 1}
-      delay_ns: {read: 0.1, write: 0.1}
-    - name: lutram
-      latency: {read: 1, write: 1}
-      delay_ns: {read: 0.5, write: 0.5}
-    - name: bram
-      latency: {read: 1, write: 1}
-      delay_ns: {read: 0.7, write: 0.7}
-    - name: uram
-      latency: {read: 2, write: 1}
-      delay_ns: {read: 0.9, write: 0.9}
-  fifo:
-    latency: {read: 1, write: 1}
-    delay_ns: {read: 0.5, write: 0.5}
-)yaml";
 }
 
-const OperatorLibrary &OperatorLibrary::defaultLibrary() {
-  static OperatorLibrary lib = llvm::cantFail(parse(defaultLibraryYAML()));
-  return lib;
+std::optional<OpKind> mlir::allo::parseOpKind(llvm::StringRef s) {
+  return llvm::StringSwitch<std::optional<OpKind>>(s)
+      .Case("add", OpKind::Add)
+      .Case("sub", OpKind::Sub)
+      .Case("mul", OpKind::Mul)
+      .Case("div", OpKind::Div)
+      .Case("rem", OpKind::Rem)
+      .Case("neg", OpKind::Neg)
+      .Case("cmp", OpKind::Cmp)
+      .Case("and", OpKind::And)
+      .Case("or", OpKind::Or)
+      .Case("xor", OpKind::Xor)
+      .Case("shl", OpKind::Shl)
+      .Case("shr", OpKind::Shr)
+      .Case("select", OpKind::Select)
+      .Case("icast", OpKind::ICastI)
+      .Case("ifcast", OpKind::FCastI)
+      .Case("fcast", OpKind::FCastF)
+      .Default(std::nullopt);
+}
+
+std::optional<CombOpKindEnum> mlir::allo::combKindOf(Operation *op) {
+  using E = CombOpKindEnum;
+  return llvm::TypeSwitch<Operation *, std::optional<E>>(op)
+      .Case<arith::AddIOp>([](auto) { return E::Addi; })
+      .Case<arith::SubIOp>([](auto) { return E::Subi; })
+      .Case<arith::MulIOp>([](auto) { return E::Muli; })
+      .Case<arith::DivSIOp>([](auto) { return E::Divsi; })
+      .Case<arith::DivUIOp>([](auto) { return E::Divui; })
+      .Case<arith::RemSIOp>([](auto) { return E::Remsi; })
+      .Case<arith::RemUIOp>([](auto) { return E::Remui; })
+      .Case<arith::AndIOp>([](auto) { return E::Andi; })
+      .Case<arith::OrIOp>([](auto) { return E::Ori; })
+      .Case<arith::XOrIOp>([](auto) { return E::Xori; })
+      .Case<arith::ShLIOp>([](auto) { return E::Shli; })
+      .Case<arith::ShRSIOp>([](auto) { return E::Shrsi; })
+      .Case<arith::ShRUIOp>([](auto) { return E::Shrui; })
+      .Case<arith::CmpIOp>([](auto) { return E::Cmpi; })
+      .Case<arith::SelectOp>([](auto) { return E::Select; })
+      .Case<arith::ExtSIOp>([](auto) { return E::Extsi; })
+      .Case<arith::ExtUIOp>([](auto) { return E::Extui; })
+      .Case<arith::TruncIOp>([](auto) { return E::Trunci; })
+      .Case<arith::IndexCastOp, arith::IndexCastUIOp>(
+          [](auto) { return E::IndexCast; })
+      .Case<affine::AffineApplyOp>([](auto) { return E::Apply; })
+      .Case<arith::NegFOp>([](auto) { return E::Negf; })
+      .Case<arith::MinSIOp>([](auto) { return E::Minsi; })
+      .Case<arith::MaxSIOp>([](auto) { return E::Maxsi; })
+      .Case<arith::MinUIOp>([](auto) { return E::Minui; })
+      .Case<arith::MaxUIOp>([](auto) { return E::Maxui; })
+      .Default([](auto) { return std::nullopt; });
 }
 
 //===----------------------------------------------------------------------===//
-// Parsing
+// Classification: concrete IR op -> abstract kind
 //===----------------------------------------------------------------------===//
 
-llvm::Expected<OperatorLibrary> OperatorLibrary::parse(llvm::StringRef yaml) {
-  OperatorLibrary lib;
-  llvm::yaml::Input in(yaml);
-  in >> lib;
-  if (std::error_code ec = in.error())
-    return llvm::createStringError(ec, "failed to parse operator library YAML");
-
-  // Validate allocation-pool references: a `unit` must be declared in `units`
-  // and sit on a non-zero-latency op (a combinational unit is not limited).
-  auto validate = [&](const std::vector<OperatorEntry> &es) -> llvm::Error {
-    for (const OperatorEntry &e : es) {
-      if (!e.unit)
-        continue;
-      if (!lib.units.count(*e.unit))
-        return llvm::createStringError(llvm::inconvertibleErrorCode(),
-                                       "unit '%s' is not declared in `units`",
-                                       e.unit->c_str());
-      if (e.latency == 0)
-        return llvm::createStringError(
-            llvm::inconvertibleErrorCode(),
-            "unit '%s' on a zero-latency (combinational) operator",
-            e.unit->c_str());
-    }
-    return llvm::Error::success();
-  };
-  if (llvm::Error err = validate(lib.entries))
-    return std::move(err);
-  if (llvm::Error err = validate(lib.advancedEntries))
-    return std::move(err);
-
-  // Validate realization (`impl`) for internal consistency. `impl` is optional
-  // here: it is only consumed on the HW-emission path (where a compute op
-  // lacking a realization errors by name), so a scheduling-only library may
-  // omit it. What we do reject: `impl` on a mem/stream row (it does not apply),
-  // and a native keyword on a multi-cycle operator (native is combinational; a
-  // multi-cycle op must name an IP).
-  auto isComputeKind = [](OpKind k) {
-    return k != OpKind::MemRead && k != OpKind::MemWrite &&
-           k != OpKind::StreamRead && k != OpKind::StreamWrite;
-  };
-  auto checkImpl = [](const OperatorEntry &e, const char *what,
-                      bool compute) -> llvm::Error {
-    if (e.impl.empty())
-      return llvm::Error::success();
-    if (!compute)
-      return llvm::createStringError(
-          llvm::inconvertibleErrorCode(),
-          "%s: memory/stream operators take no 'impl'", what);
-    if (isNativeImpl(e.impl) && e.latency != 0)
-      return llvm::createStringError(
-          llvm::inconvertibleErrorCode(),
-          "%s: native 'impl: %s' requires latency 0; a multi-cycle operator "
-          "needs an IP name",
-          what, e.impl.c_str());
-    return llvm::Error::success();
-  };
-  for (const OperatorEntry &e : lib.entries)
-    if (e.kind)
-      if (llvm::Error err =
-              checkImpl(e, "operators row", isComputeKind(*e.kind)))
-        return std::move(err);
-  for (const OperatorEntry &e : lib.advancedEntries)
-    if (llvm::Error err = checkImpl(e, "advanced_operators row", true))
-      return std::move(err);
-  if (llvm::Error err = checkImpl(lib.defaultEntry, "default row", true))
-    return std::move(err);
-  return lib;
-}
-
-llvm::Expected<OperatorLibrary>
-OperatorLibrary::loadFile(llvm::StringRef path) {
-  llvm::ErrorOr<std::unique_ptr<llvm::MemoryBuffer>> buf =
-      llvm::MemoryBuffer::getFile(path);
-  if (std::error_code ec = buf.getError())
-    return llvm::createStringError(ec, "cannot open operator library '%s'",
-                                   path.str().c_str());
-  return parse((*buf)->getBuffer());
-}
-
-std::optional<double> OperatorLibrary::cycleTime() const {
-  if (cycleTimeNs)
-    return cycleTimeNs;
-  if (frequencyMhz && *frequencyMhz > 0.0)
-    return 1000.0 / *frequencyMhz;
-  return std::nullopt;
+OpKind mlir::allo::classify(Operation *op) {
+  return llvm::TypeSwitch<Operation *, OpKind>(op)
+      .Case<arith::AddIOp, arith::AddFOp>([](auto) { return OpKind::Add; })
+      .Case<arith::SubIOp, arith::SubFOp>([](auto) { return OpKind::Sub; })
+      .Case<arith::MulIOp, arith::MulFOp>([](auto) { return OpKind::Mul; })
+      .Case<arith::DivSIOp, arith::DivUIOp, arith::DivFOp>(
+          [](auto) { return OpKind::Div; })
+      .Case<arith::RemSIOp, arith::RemUIOp, arith::RemFOp>(
+          [](auto) { return OpKind::Rem; })
+      .Case<arith::NegFOp>([](auto) { return OpKind::Neg; })
+      .Case<arith::CmpIOp, arith::CmpFOp>([](auto) { return OpKind::Cmp; })
+      .Case<arith::AndIOp>([](auto) { return OpKind::And; })
+      .Case<arith::OrIOp>([](auto) { return OpKind::Or; })
+      .Case<arith::XOrIOp>([](auto) { return OpKind::Xor; })
+      .Case<arith::ShLIOp>([](auto) { return OpKind::Shl; })
+      .Case<arith::ShRSIOp, arith::ShRUIOp>([](auto) { return OpKind::Shr; })
+      .Case<arith::SelectOp>([](auto) { return OpKind::Select; })
+      .Case<arith::ExtSIOp, arith::ExtUIOp, arith::TruncIOp, arith::IndexCastOp,
+            arith::IndexCastUIOp>([](auto) { return OpKind::ICastI; })
+      .Case<arith::SIToFPOp, arith::UIToFPOp, arith::FPToSIOp, arith::FPToUIOp>(
+          [](auto) { return OpKind::FCastI; })
+      .Case<arith::ExtFOp, arith::TruncFOp>([](auto) { return OpKind::FCastF; })
+      .Case<affine::AffineLoadOp, memref::LoadOp>(
+          [](auto) { return OpKind::MemRead; })
+      .Case<affine::AffineStoreOp, memref::StoreOp>(
+          [](auto) { return OpKind::MemWrite; })
+      .Case<StreamGetOp>([](auto) { return OpKind::StreamRead; })
+      .Case<StreamPutOp>([](auto) { return OpKind::StreamWrite; })
+      .Default([](auto) { return OpKind::Unknown; });
 }
 
 //===----------------------------------------------------------------------===//
-// Classification: concrete IR op -> abstract signature
+// Matching helpers
 //===----------------------------------------------------------------------===//
 
 namespace {
 
-// The numeric (int/float) type characterizing `op`: result(0)'s type (element
-// type if shaped), else operand(0)'s; null if neither is numeric.
-Type numericType(Operation *op) {
-  auto asNumeric = [](Type t) -> Type {
-    if (auto shaped = dyn_cast<ShapedType>(t))
-      t = shaped.getElementType();
-    return t.isIntOrFloat() ? t : Type();
+// The element types of `types` (element type of a shaped type, else the type
+// itself) -- the concrete operand/result types an IP row is matched against.
+llvm::SmallVector<Type> elementTypes(TypeRange types) {
+  llvm::SmallVector<Type> out;
+  for (Type t : types) {
+    if (auto sh = dyn_cast<ShapedType>(t))
+      t = sh.getElementType();
+    out.push_back(t);
+  }
+  return out;
+}
+
+// A comb row of this kind matches any operand type (no int-only restriction):
+// `select` is a mux over any datatype and `neg` is a float sign flip, neither
+// with an IP counterpart. Every other comb kind is integer arithmetic.
+bool combMatchesAnyType(OpKind k) {
+  return k == OpKind::Select || k == OpKind::Neg;
+}
+
+// Whether every data operand of `op` is an integer (element type) -- the
+// predicate an integer-arithmetic comb row matches on.
+bool allIntegerOperands(Operation *op) {
+  llvm::SmallVector<Type> ts = elementTypes(op->getOperandTypes());
+  return !ts.empty() &&
+         llvm::all_of(ts, [](Type t) { return isa<IntegerType>(t); });
+}
+
+// The library row matching \p op, or null. Advanced (raw-mnemonic) rows match
+// first (exact type list); abstract rows match last-wins, so a later-injected
+// operator overrides an earlier one of the same signature (user @ip > built-in
+// IP > comb fallback). An IP row matches by kind + exact operand/result element
+// types; a comb row by kind + integer operands (or any type for select/neg).
+const OperatorEntry *matchEntry(const std::vector<OperatorEntry> &advanced,
+                                const std::vector<OperatorEntry> &entries,
+                                Operation *op) {
+  OpKind kind = classify(op);
+  StringRef mnem = op->getName().stripDialect();
+  llvm::SmallVector<Type> aTys = elementTypes(op->getOperandTypes());
+  llvm::SmallVector<Type> rTys = elementTypes(op->getResultTypes());
+  ArrayRef<Type> a = aTys, r = rTys;
+  for (const OperatorEntry &e : advanced)
+    if (e.mlirOp == mnem && ArrayRef<Type>(e.argTypes) == a &&
+        ArrayRef<Type>(e.resTypes) == r)
+      return &e;
+  for (const OperatorEntry &e : llvm::reverse(entries)) {
+    if (e.kind != kind)
+      continue;
+    if (e.comb) {
+      if (combMatchesAnyType(kind) || allIntegerOperands(op))
+        return &e;
+    } else if (ArrayRef<Type>(e.argTypes) == a &&
+               ArrayRef<Type>(e.resTypes) == r) {
+      return &e;
+    }
+  }
+  return nullptr;
+}
+
+// Whether \p op needs an IP realization: a float arithmetic/compare, any cast
+// to or from float, or a math.* advanced op. Integer arithmetic, integer
+// resize, and memory/stream accesses are combinational or storage, and never
+// require an IP.
+bool needsIP(Operation *op) {
+  auto isFloat = [](Type t) { return isa<FloatType>(t); };
+  bool floaty = llvm::any_of(elementTypes(op->getOperandTypes()), isFloat) ||
+                llvm::any_of(elementTypes(op->getResultTypes()), isFloat);
+  switch (classify(op)) {
+  case OpKind::Add:
+  case OpKind::Sub:
+  case OpKind::Mul:
+  case OpKind::Div:
+  case OpKind::Rem:
+  case OpKind::Cmp:
+    return floaty;
+  case OpKind::FCastI:
+  case OpKind::FCastF:
+    return true;
+  case OpKind::Unknown:
+    return isa<math::MathDialect>(op->getDialect());
+  default:
+    return false;
+  }
+}
+
+MemoryLibrary memoryFromDevice(dcp::DCPathDeviceOp device) {
+  MemoryLibrary m;
+  auto i64 = [](DictionaryAttr d, StringRef k) {
+    return (unsigned)cast<IntegerAttr>(d.get(k)).getInt();
   };
-  if (op->getNumResults() > 0)
-    if (Type t = asNumeric(op->getResult(0).getType()))
-      return t;
-  if (op->getNumOperands() > 0)
-    if (Type t = asNumeric(op->getOperand(0).getType()))
-      return t;
-  return Type();
-}
-
-// The type that characterizes `op` of kind `kind`. For int<->float conversions
-// the float format drives converter timing, so we key on the float side (making
-// both directions -- e.g. sitofp and fptosi -- match one row); otherwise the
-// generic numeric type is used.
-Type characteristicType(Operation *op, OpKind kind) {
-  if (kind == OpKind::FCastI) {
-    for (Type t : op->getResultTypes())
-      if (isa<FloatType>(t))
-        return t;
-    for (Value v : op->getOperands())
-      if (isa<FloatType>(v.getType()))
-        return v.getType();
+  auto f = [](DictionaryAttr d, StringRef k) {
+    return cast<FloatAttr>(d.get(k)).getValueAsDouble();
+  };
+  auto timing = [&](DictionaryAttr d) {
+    MemKindTiming t;
+    t.latency.read = i64(d, "rd_lat");
+    t.latency.write = i64(d, "wr_lat");
+    t.delay.read = f(d, "rd_delay");
+    t.delay.write = f(d, "wr_delay");
+    return t;
+  };
+  for (NamedAttribute na : device.getMemory()) {
+    auto impl = symbolizeMemoryImplEnum(na.getName().strref());
+    if (!impl)
+      continue;
+    MemPrimitive p;
+    p.impl = *impl;
+    p.timing = timing(cast<DictionaryAttr>(na.getValue()));
+    m.primitives.push_back(p);
   }
-  // A compare's result is i1; its realization (an integer vs floating-point
-  // comparator) is set by the OPERANDS it compares, so key on the operand type,
-  // not the i1 result -- else arith.cmpf would match a `cmp dtype: int` row.
-  if (kind == OpKind::Cmp && op->getNumOperands() > 0) {
-    Type t = op->getOperand(0).getType();
-    if (auto shaped = dyn_cast<ShapedType>(t))
-      t = shaped.getElementType();
-    if (t.isIntOrFloat())
-      return t;
-  }
-  return numericType(op);
-}
-
-OpDType floatDType(Type t) {
-  if (t.isF16())
-    return OpDType::Half;
-  if (t.isBF16())
-    return OpDType::BFloat16;
-  if (t.isF64())
-    return OpDType::Double;
-  return OpDType::Float; // f32 and other float widths -> generic float family.
-}
-
-// Ops the IR marks as operating on unsigned integers.
-bool isUnsignedOp(llvm::StringRef name) {
-  return name == "arith.divui" || name == "arith.remui" ||
-         name == "arith.shrui" || name == "arith.extui" ||
-         name == "arith.uitofp" || name == "arith.fptoui";
+  if (DictionaryAttr fifo = device.getFifoAttr())
+    m.fifo = timing(fifo);
+  if (StringAttr def = device.getDefaultMemoryAttr())
+    if (auto impl = symbolizeMemoryImplEnum(def.strref()))
+      m.defaultImpl = *impl;
+  return m;
 }
 
 } // namespace
 
-OpSignature mlir::allo::classify(Operation *op) {
-  llvm::StringRef name = op->getName().getStringRef();
-  OpKind kind =
-      llvm::StringSwitch<OpKind>(name)
-          .Cases({"arith.addi", "arith.addf"}, OpKind::Add)
-          .Cases({"arith.subi", "arith.subf"}, OpKind::Sub)
-          .Cases({"arith.muli", "arith.mulf"}, OpKind::Mul)
-          .Cases({"arith.divsi", "arith.divui", "arith.divf"}, OpKind::Div)
-          .Cases({"arith.remsi", "arith.remui", "arith.remf"}, OpKind::Rem)
-          .Case("arith.negf", OpKind::Neg)
-          .Cases({"arith.cmpi", "arith.cmpf"}, OpKind::Cmp)
-          .Case("arith.andi", OpKind::And)
-          .Case("arith.ori", OpKind::Or)
-          .Case("arith.xori", OpKind::Xor)
-          .Case("arith.shli", OpKind::Shl)
-          .Cases({"arith.shrsi", "arith.shrui"}, OpKind::Shr)
-          .Case("arith.select", OpKind::Select)
-          .Cases({"arith.extsi", "arith.extui", "arith.trunci"}, OpKind::ICastI)
-          .Cases({"arith.index_cast", "arith.index_castui"}, OpKind::ICastI)
-          .Cases({"arith.sitofp", "arith.uitofp"}, OpKind::FCastI)
-          .Cases({"arith.fptosi", "arith.fptoui"}, OpKind::FCastI)
-          .Cases({"arith.extf", "arith.truncf"}, OpKind::FCastF)
-          .Cases({"affine.load", "memref.load"}, OpKind::MemRead)
-          .Cases({"affine.store", "memref.store"}, OpKind::MemWrite)
-          .Case("allo.stream.get", OpKind::StreamRead)
-          .Case("allo.stream.put", OpKind::StreamWrite)
-          .Default(OpKind::Unknown);
+//===----------------------------------------------------------------------===//
+// Building the library from injected `dcp.device` / `dcp.operator` IR
+//===----------------------------------------------------------------------===//
 
-  OpDType dtype = OpDType::None;
-  unsigned width = 0;
-  if (Type t = characteristicType(op, kind)) {
-    width = t.getIntOrFloatBitWidth();
-    if (isa<FloatType>(t))
-      dtype = floatDType(t);
-    else
-      dtype = isUnsignedOp(name) ? OpDType::UInt : OpDType::Int;
+OperatorLibrary OperatorLibrary::fromModule(ModuleOp module) {
+  OperatorLibrary lib;
+  // The default row: ops that match nothing (constants, address arithmetic) are
+  // 0-latency combinational.
+  lib.defaultEntry.latency = 0;
+  lib.defaultEntry.inDelay = lib.defaultEntry.outDelay = 0.1;
+
+  dcp::DCPathDeviceOp device;
+  module.walk([&](dcp::DCPathDeviceOp d) { device = d; });
+
+  // Comb rows first: `entries` is matched last-wins (see `matchEntry`), so
+  // combinational integer arithmetic is the lowest-priority fallback -- an
+  // injected IP of the same kind (built-in or user) overrides it.
+  if (device) {
+    for (NamedAttribute na : device.getComb()) {
+      std::optional<OpKind> kind = parseOpKind(na.getName().strref());
+      if (!kind)
+        continue;
+      OperatorEntry e;
+      e.kind = *kind;
+      e.comb = true;
+      e.latency = 0;
+      e.inDelay = e.outDelay =
+          cast<FloatAttr>(na.getValue()).getValueAsDouble();
+      lib.entries.push_back(std::move(e));
+    }
+    lib.memory = memoryFromDevice(device);
   }
-  return {kind, dtype, width};
-}
 
-//===----------------------------------------------------------------------===//
-// Realization predicate (shared by the parser and EmitHW). Whether an op's
-// native EmitHW lowering exists is EmitHW's own concern (see `combEmitted`).
-//===----------------------------------------------------------------------===//
-
-bool mlir::allo::isNativeImpl(llvm::StringRef impl) {
-  return impl == "comb" || impl == "hwarith" || impl == "builtin";
-}
-
-StallContract mlir::allo::stallContract(llvm::StringRef impl) {
-  assert(!isNativeImpl(impl) &&
-         "native impl is stateless -- no stall contract");
-  // Every IP in the library today is a fixed-latency pipeline exposing a
-  // clock-enable. The `stall:` YAML override (FreeRunning / Elastic) plugs in
-  // here when a specific operator needs it.
-  return StallContract::ClockEnable;
+  // IP rows in injection order (built-in, then user). Matched last-wins, so a
+  // user `@ip` appended after the built-ins overrides a built-in of the same
+  // signature (a faster fadd wins over the default). The match types are the
+  // operator's declared signature element types (an exact-type match).
+  module.walk([&](dcp::DCPathOperatorOp op) {
+    OperatorEntry e;
+    e.latency = (uint32_t)op.getLatency();
+    e.inDelay = op.getInDelay().convertToDouble();
+    e.outDelay = op.getOutDelay().convertToDouble();
+    e.pipelined = op.getPipelined();
+    e.symbol = op.getSymName().str();
+    FunctionType sig = op.getSignature();
+    e.argTypes = elementTypes(sig.getInputs());
+    e.resTypes = elementTypes(sig.getResults());
+    if (std::optional<OpKind> kind = parseOpKind(op.getKind())) {
+      e.kind = *kind;
+      lib.entries.push_back(std::move(e));
+    } else {
+      e.mlirOp = op.getKind().str(); // advanced: matched by stripped mnemonic
+      lib.advancedEntries.push_back(std::move(e));
+    }
+  });
+  return lib;
 }
 
 //===----------------------------------------------------------------------===//
 // Lookup
 //===----------------------------------------------------------------------===//
 
-namespace {
-
-// `int` is the umbrella datatype: a row wanting `int` also matches unsigned
-// ops.
-bool dtypeMatches(OpDType want, OpDType actual) {
-  return want == actual || (want == OpDType::Int && actual == OpDType::UInt);
-}
-
-// A row's width predicate holds. An op with no numeric width (0) can never
-// satisfy a width predicate, but matches a row that declares none.
-bool widthMatches(const OperatorEntry &e, unsigned width) {
-  if (!e.width)
-    return true;
-  if (width == 0)
-    return false;
-  if (e.width->min && width < *e.width->min)
-    return false;
-  if (e.width->max && width > *e.width->max)
-    return false;
-  return true;
-}
-
-} // namespace
-
-// `typeName` must be stable and unique per entry so that ops matching the same
-// entry share one operator type.
-OperatorChar OperatorLibrary::resolveEntry(const OperatorEntry &e,
-                                           llvm::StringRef typeName) const {
-  OperatorChar c;
-  c.typeName = typeName.str();
-  c.latency = e.latency;
-  c.pipelined = e.pipelined;
-  c.impl = e.impl;
-  if (e.delay) {
-    c.inDelay = e.delay->inNs();
-    c.outDelay = e.delay->outNs();
-    // A multi-cycle operator registers its output (a pipelined IP / hard
-    // block): nothing combinational follows its final stage, so its outgoing
-    // delay is 0 and it terminates a chain. The scalar `delay_ns` shorthand is
-    // then the setup delay into the first stage. An explicit `{in, out}` map
-    // overrides this -- authored for a unit whose last cycle is combinational
-    // (a nonzero tail that chains into a same-cycle successor).
-    if (e.latency > 0 && e.delay->scalar)
-      c.outDelay = 0.0;
-  }
-  // A zero-latency (combinational) operator must have equal in/out delays.
-  if (e.latency == 0 && c.inDelay != c.outDelay)
-    c.inDelay = c.outDelay = std::max(c.inDelay, c.outDelay);
-  if (e.unit) {
-    c.unit = *e.unit;
-    auto it = units.find(*e.unit);
-    c.unitLimit = it != units.end() ? it->second : 0;
-  }
-  return c;
-}
-
 OperatorChar OperatorLibrary::lookup(Operation *op) const {
-  // A plain (non-async) call to an already-scheduled callee is a fixed-latency
-  // opaque node (Route-B sequential composition): the callee's whole-kernel
-  // latency -- annotated bottom-up as `allo.sched.latency` (callees schedule
-  // before callers) -- becomes this call's latency, with registered-boundary
-  // delays (zero in/out), so the parent's SDC schedule places a dependent call
-  // at `predecessor.start + callee_latency`. A distinct operator type per
-  // callee keeps their latencies separate. An async call (dataflow, composed
-  // structurally) or a callee with no static latency (data-dependent) falls
-  // through to the normal characterization.
-  if (auto call = dyn_cast<func::CallOp>(op))
-    if (!op->hasAttr(kAlloAsyncAttr))
-      if (auto callee = SymbolTable::lookupNearestSymbolFrom<func::FuncOp>(
-              op, call.getCalleeAttr()))
-        if (auto lat =
-                callee->getAttrOfType<IntegerAttr>(sched::kLatencyAttr)) {
-          OperatorChar c;
-          c.typeName = ("call." + call.getCallee()).str();
-          c.latency = static_cast<uint32_t>(lat.getInt());
-          return c; // inDelay/outDelay default 0.0 = registered boundary
-        }
+  OpKind kind = classify(op);
 
-  // Advanced (raw MLIR op name) rows match first.
-  llvm::StringRef name = op->getName().getStringRef();
-  OpSignature sig = classify(op);
-
-  // Memory / stream accesses are the storage dimension: characterized by the
-  // memory library (`memory:`), not the compute operator table. All accesses of
-  // one direction share a stable operator type.
-  switch (sig.kind) {
+  // Memory / stream accesses are the storage dimension.
+  switch (kind) {
   case OpKind::MemRead:
   case OpKind::MemWrite:
   case OpKind::StreamRead:
   case OpKind::StreamWrite: {
     MemoryLibrary::Timing t = memory.timing(op);
     OperatorChar c;
-    // Array accesses key the operator type on their storage implementation:
-    // loads of a 0-cycle register and a 2-cycle URAM must be *distinct*
-    // operator types, or they collapse onto one shared latency.
-    c.typeName = (sig.kind == OpKind::MemRead      ? "mem.read."
-                  : sig.kind == OpKind::MemWrite   ? "mem.write."
-                  : sig.kind == OpKind::StreamRead ? "stream.read"
-                                                   : "stream.write");
-    if (sig.kind == OpKind::MemRead || sig.kind == OpKind::MemWrite)
+    c.typeName = (kind == OpKind::MemRead      ? "mem.rd"
+                  : kind == OpKind::MemWrite   ? "mem.wr"
+                  : kind == OpKind::StreamRead ? "srm.rd"
+                                               : "srm.wr");
+    if (kind == OpKind::MemRead || kind == OpKind::MemWrite)
       c.typeName += stringifyMemoryImplEnum(t.impl).str();
     c.latency = t.latency;
     c.inDelay = c.outDelay = t.delay;
@@ -729,38 +364,25 @@ OperatorChar OperatorLibrary::lookup(Operation *op) const {
     break;
   }
 
-  for (const auto &[idx, e] : llvm::enumerate(advancedEntries)) {
-    if (e.mlirOp != name)
-      continue;
-    if (e.dtype && !dtypeMatches(*e.dtype, sig.dtype))
-      continue;
-    if (!widthMatches(e, sig.width))
-      continue;
-    return resolveEntry(e, ("adv#" + llvm::Twine(idx)).str());
-  }
+  const OperatorEntry *e = matchEntry(advancedEntries, entries, op);
+  if (!e)
+    e = &defaultEntry;
 
-  for (const auto &[idx, e] : llvm::enumerate(entries)) {
-    if (!e.kind || *e.kind != sig.kind)
-      continue;
-    if (e.dtype && !dtypeMatches(*e.dtype, sig.dtype))
-      continue;
-    if (!widthMatches(e, sig.width))
-      continue;
-    return resolveEntry(e, ("op#" + llvm::Twine(idx)).str());
-  }
-
-  return resolveEntry(defaultEntry, "default");
+  // The stable Problem::OperatorType key: an IP row's symbol, a comb row's
+  // `comb.<kind>`, else `default`. A non-empty `symbol` denotes the IP
+  // realization path (`op_type`); an empty one, the combinational path.
+  OperatorChar c;
+  c.typeName = !e->symbol.empty() ? e->symbol
+               : e->comb          ? ("comb." + opKindString(e->kind)).str()
+                                  : std::string("default");
+  c.latency = e->latency;
+  c.inDelay = e->inDelay;
+  c.outDelay = e->outDelay;
+  c.pipelined = e->pipelined;
+  c.symbol = e->symbol;
+  return c;
 }
 
-std::vector<std::string>
-OperatorLibrary::unregisteredAdvancedOps(MLIRContext &ctx) const {
-  std::vector<std::string> unknown;
-  for (const OperatorEntry &e : advancedEntries)
-    if (!e.mlirOp.empty() && !ctx.isOperationRegistered(e.mlirOp))
-      unknown.push_back(e.mlirOp);
-  return unknown;
+bool OperatorLibrary::requiresUnmatchedIP(Operation *op) const {
+  return needsIP(op) && matchEntry(advancedEntries, entries, op) == nullptr;
 }
-
-// The per-memref memory-port/banking model moved to MemoryModel.{h,cpp} (the
-// storage dimension). `populateOperatorTypesImpl` still drives it via
-// `detail::MemoryBankModel`.

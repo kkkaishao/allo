@@ -32,6 +32,7 @@ MLIR_CAPI_EXPORTED uint64_t alloStreamTypeGetDepth(MlirType type);
 MLIR_CAPI_EXPORTED intptr_t alloStreamTypeGetRank(MlirType type);
 MLIR_CAPI_EXPORTED int64_t alloStreamTypeGetDimSize(MlirType type,
                                                     intptr_t pos);
+MLIR_CAPI_EXPORTED MlirTypeID alloStreamTypeGetTypeID(void);
 
 #ifdef __cplusplus
 }

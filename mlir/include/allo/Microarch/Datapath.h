@@ -55,7 +55,7 @@ namespace mlir::allo::uarch {
 struct BindingPolicy;
 
 /// The already-emitted callees a rerouted container's leaf datapath needs to
-/// lower a `dcp.invoke` to a CallUnit: the child `hw.module`s to
+/// lower a `dcp.instance` to a CallUnit: the child `hw.module`s to
 /// instantiate + their port models (callee arg <-> addr/data/we names, read vs
 /// write direction). Null for a plain leaf (no calls). Both maps are populated
 /// bottom-up by the emit driver, so a callee is present before its caller.
@@ -141,11 +141,15 @@ struct Source {
 /// holds a single entry and no input needs a mux.
 struct FuncUnit {
   UnitId id = 0;
-  std::string opType;    // the operator mnemonic (e.g. "addi", "mulf")
-  std::string impl;      // realization: native keyword or IP module name
-  unsigned latency = 0;  // result available `latency` cycles after issue
+  std::string opType;   // the operator mnemonic (comb: "addi"; IP: module name)
+  std::string impl;     // IP module name (empty when combinational)
+  bool comb = false;    // combinational (a `comb` primitive), not an IP module
+  unsigned latency = 0; // result available `latency` cycles after issue
   bool pipelined = true; // accepts a new input every cycle
-  Type resultType;       // value-typed (e.g. f32), not bit-blasted
+  // The IP's port/back-pressure contract (from its `dcp.operator`); unused for
+  // a combinational unit. Clock-enable is the only contract emitted today.
+  StallContractEnum stall = StallContractEnum::Ce;
+  Type resultType; // value-typed (e.g. f32), not bit-blasted
 
   // Ops bound here, each with its issue cycle (residue mod II in a cyclic
   // region). Sharing puts several non-conflicting ops in this list.
@@ -212,7 +216,7 @@ struct MemUnit {
 };
 
 /// A sub-kernel call as a multi-cycle datapath node. Built from a
-/// `dcp.invoke` and owned by the `RegionBlock` it sits in (a `dcp.sequential`
+/// `dcp.instance` and owned by the `RegionBlock` it sits in (a `dcp.sequential`
 /// wrapping the call). The child instance *masters* the memory ports of its
 /// memref operands (it drives their addr/data/we; the parent's `MemUnit`
 /// supplies the storage), so a shared internal buffer becomes a
@@ -220,7 +224,7 @@ struct MemUnit {
 /// `start + latency` as a survivor.
 struct CallUnit {
   CallId id = 0;
-  Operation *invoke = nullptr; // the dcp::DCPathInvokeOp
+  Operation *invoke = nullptr; // the dcp::DCPathInstanceOp
   RegionId region = 0;         // the RegionBlock (a dcp.sequential) it sits in
   std::string callee;          // callee symbol (key into CalleeCtx maps)
   std::optional<int64_t>
@@ -493,12 +497,10 @@ struct Datapath {
 // (result capture) consult it, so the latency model has one definition.
 //===----------------------------------------------------------------------===//
 
-/// The `dcp.operator` op characterizing a compute/load (null if none); returned
-/// as a generic Operation to keep this header free of the dcp op headers.
-Operation *dcpOperatorOp(Operation *op);
 /// Region-relative schedule cycle of a dcp compute/load/store op (its `start`).
 unsigned dcpStart(Operation *op);
-/// Result latency of a producing dcp op (0 if uncharacterized).
+/// Result latency of a producing dcp op (0 if uncharacterized): a load's own
+/// `latency`, or an IP compute's `latency` (stamped at emit from its operator).
 unsigned dcpLatency(Operation *op);
 /// The cycle a producing op's result is ready: `dcpStart + dcpLatency` (a
 /// stream get is a combinational front-read, latency 0). Zero for an at-issue

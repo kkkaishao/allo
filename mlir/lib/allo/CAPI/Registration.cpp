@@ -13,10 +13,10 @@
 
 #include "allo-c/Registration.h"
 
-#include "allo/Conversion/Passes.h"
 #include "allo/IR/AlloOps.h"
-#include "allo/TransformOps/AlloTransformOps.h"
-#include "allo/Transforms/Passes.h"
+#include "allo/InitAllDialects.h"
+#include "allo/InitAllExtensions.h"
+#include "allo/InitAllPasses.h"
 
 #include "mlir/CAPI/IR.h"
 #include "mlir/CAPI/Registration.h"
@@ -31,23 +31,19 @@ MLIR_DEFINE_CAPI_DIALECT_REGISTRATION(Allo, allo, ::mlir::allo::AlloDialect)
 
 void alloMlirRegisterAllDialects(MlirContext context) {
   DialectRegistry registry;
-  registry.insert<allo::AlloDialect>();
+  allo::registerAllDialects(registry);
   unwrap(context)->appendDialectRegistry(registry);
-  unwrap(context)->getOrLoadDialect<allo::AlloDialect>();
+  unwrap(context)->loadAllAvailableDialects();
 }
 
 void alloMlirRegisterAllExtensions(MlirContext context) {
   DialectRegistry registry;
-  allo::registerTransformDialectExtension(registry);
+  allo::registerAllExtensions(registry);
   unwrap(context)->appendDialectRegistry(registry);
   unwrap(context)->loadAllAvailableDialects();
 }
 
 void alloMlirRegisterAllPasses() {
   static std::once_flag once;
-  std::call_once(once, [] {
-    allo::registerConversionPasses();
-    allo::registerTransformsPasses();
-    allo::registerAlloLLVMLoweringPipeline();
-  });
+  std::call_once(once, [] { allo::registerAllPasses(); });
 }

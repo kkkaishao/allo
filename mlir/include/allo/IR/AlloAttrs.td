@@ -140,4 +140,65 @@ def DeterminacyEnum : I32EnumAttr<"DeterminacyEnum",
 }
 def DeterminacyAttr : EnumAttr<Allo_Dialect, DeterminacyEnum, "determinacy">;
 
+//===----------------------------------------------------------------------===//
+// CombOpKind: the combinational op a `dcp.compute` realizes when it takes the
+// comb (not IP) path.
+//===----------------------------------------------------------------------===//
+
+def CombAddi      : I32EnumAttrCase<"Addi",      0,  "addi">;
+def CombSubi      : I32EnumAttrCase<"Subi",      1,  "subi">;
+def CombMuli      : I32EnumAttrCase<"Muli",      2,  "muli">;
+def CombDivsi     : I32EnumAttrCase<"Divsi",     3,  "divsi">;
+def CombDivui     : I32EnumAttrCase<"Divui",     4,  "divui">;
+def CombRemsi     : I32EnumAttrCase<"Remsi",     5,  "remsi">;
+def CombRemui     : I32EnumAttrCase<"Remui",     6,  "remui">;
+def CombAndi      : I32EnumAttrCase<"Andi",      7,  "andi">;
+def CombOri       : I32EnumAttrCase<"Ori",       8,  "ori">;
+def CombXori      : I32EnumAttrCase<"Xori",      9,  "xori">;
+def CombShli      : I32EnumAttrCase<"Shli",      10, "shli">;
+def CombShrsi     : I32EnumAttrCase<"Shrsi",     11, "shrsi">;
+def CombShrui     : I32EnumAttrCase<"Shrui",     12, "shrui">;
+def CombCmpi      : I32EnumAttrCase<"Cmpi",      13, "cmpi">;
+def CombSelect    : I32EnumAttrCase<"Select",    14, "select">;
+def CombExtsi     : I32EnumAttrCase<"Extsi",     15, "extsi">;
+def CombExtui     : I32EnumAttrCase<"Extui",     16, "extui">;
+def CombTrunci    : I32EnumAttrCase<"Trunci",    17, "trunci">;
+def CombIndexCast : I32EnumAttrCase<"IndexCast", 18, "index_cast">;
+def CombApply     : I32EnumAttrCase<"Apply",     19, "apply">;
+def CombNegf      : I32EnumAttrCase<"Negf",      20, "negf">;
+def CombMinsi     : I32EnumAttrCase<"Minsi",     21, "minsi">;
+def CombMaxsi     : I32EnumAttrCase<"Maxsi",     22, "maxsi">;
+def CombMinui     : I32EnumAttrCase<"Minui",     23, "minui">;
+def CombMaxui     : I32EnumAttrCase<"Maxui",     24, "maxui">;
+
+def CombOpKindEnum : I32EnumAttr<"CombOpKindEnum",
+    "The combinational op a comb-path dcp.compute realizes",
+    [CombAddi, CombSubi, CombMuli, CombDivsi, CombDivui, CombRemsi, CombRemui,
+     CombAndi, CombOri, CombXori, CombShli, CombShrsi, CombShrui, CombCmpi,
+     CombSelect, CombExtsi, CombExtui, CombTrunci, CombIndexCast, CombApply,
+     CombNegf, CombMinsi, CombMaxsi, CombMinui, CombMaxui]> {
+  let cppNamespace = "mlir::allo";
+  let genSpecializedAttr = 0;
+}
+def CombOpKindAttr : EnumAttr<Allo_Dialect, CombOpKindEnum, "comb_kind">;
+
+//===----------------------------------------------------------------------===//
+// StallContract: how a realized IP operator participates in the datapath's
+// stall protocol
+//===----------------------------------------------------------------------===//
+
+// (data.., clk, ce) -> data   the FPGA hard-IP default (ce freezes the pipe)
+def StallCe   : I32EnumAttrCase<"Ce",   0, "ce">;
+// (data.., clk) -> data        no enable; the pipeline always advances
+def StallFree : I32EnumAttrCase<"Free", 1, "free">;
+// (s_*, m_*, clk) -> ...        a valid/ready handshake (variable latency)
+def StallElastic : I32EnumAttrCase<"Elastic", 2, "elastic">;
+def StallContractEnum : I32EnumAttr<"StallContractEnum",
+    "How a realized IP operator participates in the stall protocol",
+    [StallCe, StallFree, StallElastic]> {
+  let cppNamespace = "mlir::allo";
+  let genSpecializedAttr = 0;
+}
+def StallContractAttr : EnumAttr<Allo_Dialect, StallContractEnum, "stall">;
+
 #endif // ALLO_ATTRS

@@ -7,7 +7,7 @@
 #include "allo/Microarch/Interface.h" // iface field-name helpers
 
 #include "allo/Scheduling/MemoryModel.h" // partitionOf (crossbar shape check)
-#include "allo/Scheduling/OperatorLibrary.h" // isNativeImpl
+#include "allo/Scheduling/OperatorLibrary.h" // stallContract
 
 #include "circt/Dialect/Comb/CombOps.h"
 #include "circt/Dialect/Seq/SeqOps.h"
@@ -430,7 +430,7 @@ void DatapathEmitter::emitUnits(const uarch::RegionBlock &rb) {
     }
 
     Value result;
-    if (allo::isNativeImpl(u.impl)) {
+    if (u.comb) {
       result = emitCompute(c.b, c.loc, u.opType, operands,
                            hwType(u.resultType, c.b), u.boundOps.front().first);
     } else {
@@ -440,7 +440,7 @@ void DatapathEmitter::emitUnits(const uarch::RegionBlock &rb) {
       // shell's shift chains under back-pressure; outside a stream region
       // `regionEnable` is null, so `ce` is a constant 1 (free-running).
       operands.push_back(c.clkRaw);
-      if (allo::stallContract(u.impl) == allo::StallContract::ClockEnable)
+      if (u.stall == allo::StallContractEnum::Ce)
         operands.push_back(c.regionEnable ? c.regionEnable : c.t1);
       result = hw::InstanceOp::create(c.b, c.loc, unitModule.lookup(u.id),
                                       ("u" + Twine(u.id)).str(), operands)
@@ -477,7 +477,7 @@ void DatapathEmitter::emitCombUnits(const uarch::RegionBlock &rb) {
                           return s.kind == uarch::Source::Kind::None;
                         }) &&
            "a container's combinational unit carries no recurrence init");
-    assert(allo::isNativeImpl(u.impl) &&
+    assert(u.comb &&
            "a container condition/predicate must be a native (comb) unit");
     SmallVector<Value> operands;
     for (const uarch::Source &in : u.inputs)
@@ -738,7 +738,7 @@ void DatapathEmitter::emitStreamAccesses(const uarch::RegionBlock &rb,
       stage0Valid ? c.andBits(chainEnable, stage0Valid) : chainEnable;
 }
 
-// Instantiate each CallUnit (dcp.invoke) in region \p rb as a child
+// Instantiate each CallUnit (dcp.instance) in region \p rb as a child
 // hw.instance. The child masters each memref operand's memory: it drives the
 // addr/data/we, so the leaf wires those instance-output ports to the buffer's
 // hlmem (a seq.read whose data feeds back to the child, a seq.write). The

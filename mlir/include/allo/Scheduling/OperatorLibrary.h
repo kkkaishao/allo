@@ -6,42 +6,38 @@
 #ifndef ALLO_SCHEDULING_OPERATORLIBRARY_H
 #define ALLO_SCHEDULING_OPERATORLIBRARY_H
 
+#include "allo/IR/AlloOps.h"             // kAlloAsyncAttr, dcp ops
 #include "allo/Scheduling/MemoryModel.h" // MemoryLibrary + populateMemoryResources
 #include "allo/Scheduling/Scheduler.h"
-#include "allo/Scheduling/Utils.h"
+#include "allo/Scheduling/Utils.h" // sched::kLatencyAttr
 
 #include "circt/Scheduling/Problems.h"
+#include "mlir/Dialect/Func/IR/FuncOps.h" // func::CallOp (scheduled-call latency)
 #include "mlir/IR/Block.h"
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/Operation.h"
+#include "mlir/IR/SymbolTable.h"
 #include "mlir/Support/LogicalResult.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringRef.h"
-#include "llvm/Support/Error.h"
 
 #include <cstdint>
-#include <map>
 #include <optional>
 #include <string>
-#include <utility>
 #include <vector>
-
-namespace llvm::yaml {
-template <typename T> struct MappingTraits;
-} // namespace llvm::yaml
 
 namespace mlir::allo {
 
 //===----------------------------------------------------------------------===//
-// Abstract operator vocabulary (hardware-facing, no MLIR op names).
+// Abstract operator vocabulary (hardware-facing, independent of MLIR op names).
 //===----------------------------------------------------------------------===//
 
-/// The abstract operator kind a hardware engineer characterizes. `classify`
-/// maps concrete IR ops onto these; the YAML library keys on them. The three
-/// cast kinds are split because int-resize, int<->float conversion, and
-/// float-resize have distinct hardware timing.
+/// The abstract operator kind timing is characterized against; `classify` maps
+/// concrete IR ops onto these. The three cast kinds are separate because
+/// integer resize, integer/float conversion, and float resize have distinct
+/// hardware timing.
 enum class OpKind {
   Add,
   Sub,
@@ -63,123 +59,49 @@ enum class OpKind {
   MemWrite,
   StreamRead,
   StreamWrite,
-  Unknown // op the classifier does not recognize -> falls to `default`.
+  Unknown // op the classifier does not recognize (e.g. math.sqrt).
 };
 
-/// The abstract datatype family. Integers use `Int` as an umbrella that also
-/// covers `UInt`; only ops the IR marks unsigned resolve to `UInt`.
-enum class OpDType { Int, UInt, Half, BFloat16, Float, Double, None };
+/// Classify \p op into its abstract kind -- the mapping from a concrete IR op
+/// to the abstract vocabulary. Matching then compares the op's concrete operand
+/// and result types against a library row's types.
+OpKind classify(Operation *op);
 
-/// The abstract signature of a concrete operation: what a library row matches.
-struct OpSignature {
-  OpKind kind = OpKind::Unknown;
-  OpDType dtype = OpDType::None;
-  unsigned width = 0; // datapath width in the IR (0 = no numeric type).
-};
+/// The abstract-kind string a device/operator uses (`add`/`sub`/.../`select`),
+/// and its inverse; `parseOpKind` returns nullopt for a non-abstract name (an
+/// advanced mnemonic such as `sqrt`).
+llvm::StringRef opKindString(OpKind kind);
+std::optional<OpKind> parseOpKind(llvm::StringRef s);
 
-/// Classify \p op into its abstract signature. This is the only place that
-/// knows MLIR op names; everything above the C++ boundary speaks the
-/// vocabulary.
-OpSignature classify(Operation *op);
+/// The combinational realization kind of \p op. This enumerates the emitter's
+/// native `comb` coverage: every case has an `emitCompute` lowering. Nullopt
+/// for an op with no comb lowering (a float/cast IP, a memory access, or an
+/// unrelated op).
+std::optional<CombOpKindEnum> combKindOf(Operation *op);
 
 //===----------------------------------------------------------------------===//
-// Realization (`impl`): how a characterized operator becomes RTL.
-//
-// `impl` is a single string: a reserved native keyword, or an IP module name.
+// Library entries (built from the injected `dcp.operator` / `dcp.device` IR).
 //===----------------------------------------------------------------------===//
 
-/// The reserved native-realization keywords. Any `impl` value that is NOT one
-/// of these is an IP module name (instantiated as an `hw.module.extern`).
-///   `comb`    — emit a CIRCT `comb` primitive directly.
-///   `hwarith` — emit CIRCT `hwarith` (reserved; emission not yet implemented).
-///   `builtin` — native, backend picks the dialect (= `comb` today).
-bool isNativeImpl(llvm::StringRef impl);
-
-/// How a realized IP operator participates in the datapath's stall protocol --
-/// an axis orthogonal to latency (a scheduling property) and to which module
-/// realizes it (`impl`). Any pipelined IP, whatever the vendor, presents one of
-/// these interface classes; the datapath emitter builds the instance's ports
-/// and connections from the contract instead of hardcoding a single shape.
-enum class StallContract {
-  /// `(data.., clk) -> data`: fixed latency, no external freeze -- the pipeline
-  /// free-runs. Correct only where nothing stalls it (a stall-free region).
-  FreeRunning,
-  /// `(data.., clk, ce) -> data`: fixed latency; `ce == 0` freezes the internal
-  /// pipeline in lockstep with the shell's shift chains. The canonical FPGA
-  /// hard-IP contract (e.g. a float-operator `aclken`) and the default for IP.
-  ClockEnable,
-  /// `(s_data,s_valid,s_ready,clk) -> (m_data,m_valid,m_ready)`:
-  /// self-backpressuring,
-  /// *dynamic* latency (AXI-Stream-like). Reserved -- needs variable-latency
-  /// scheduling, not yet supported.
-  Elastic,
-};
-
-/// The stall contract of realization `impl`. Native impls are combinational and
-/// stateless, so they have none (asserted). Every IP defaults to `ClockEnable`;
-/// a future oplib `stall:` field would let a specific operator override this.
-StallContract stallContract(llvm::StringRef impl);
-
-//===----------------------------------------------------------------------===//
-// Library entries
-//===----------------------------------------------------------------------===//
-
-/// A width predicate `{min, max}` on an op's datapath width (either bound
-/// optional; an exact width is `min == max`). Omitted for float rows, whose
-/// width is fixed by `dtype`.
-struct WidthRange {
-  std::optional<uint32_t> min;
-  std::optional<uint32_t> max;
-};
-
-/// The `{in, out}` map form of a `delay_ns`.
-struct DelayMap {
-  double in = 0.0;
-  double out = 0.0;
-};
-
-/// A datapath delay (ns). In YAML a scalar is the symmetric shorthand
-/// (`in == out`); a `{in, out}` map gives the two independently. Exactly one of
-/// `scalar`/`map` is engaged, per the YAML node shape (see PolymorphicTraits).
-struct DelaySpec {
-  std::optional<double> scalar;
-  std::optional<DelayMap> map;
-  double inNs() const { return scalar ? *scalar : (map ? map->in : 0.0); }
-  double outNs() const { return scalar ? *scalar : (map ? map->out : 0.0); }
-};
-
-/// One row of the operator library. A primary (`operators:`) row matches an
-/// abstract `(kind, dtype, width)` signature; an advanced
-/// (`advanced_operators:`) row matches a raw MLIR op name (an escape hatch for
-/// power users). Either way it carries the timing characterization to apply.
+/// One row of the operator library. A comb row (`comb == true`) matches by
+/// `kind` + all-integer operands (integer arithmetic is uniformly
+/// combinational, any width); an IP row matches by `kind` + an exact operand /
+/// result element-type list (`argTypes`/`resTypes`), carrying its injected
+/// `dcp.operator` symbol; an advanced row additionally keys on the raw MLIR
+/// mnemonic (`mlirOp`). Comb rows come from `dcp.device.comb`, IP/advanced rows
+/// from injected `dcp.operator` symbols.
 struct OperatorEntry {
-  // Primary match predicate (abstract).
-  std::optional<OpKind> kind;   // `op:`   — the operator kind.
-  std::optional<OpDType> dtype; // `dtype:`— absent means "any datatype".
+  OpKind kind = OpKind::Unknown; // abstract kind (Unknown on an advanced row).
+  std::string mlirOp;            // advanced: raw MLIR op name (else empty).
+  bool comb = false;             // a synthesized combinational row.
+  llvm::SmallVector<Type> argTypes; // IP/advanced: exact operand element types.
+  llvm::SmallVector<Type> resTypes; // IP/advanced: exact result element types.
 
-  // Advanced match predicate (raw MLIR op name, e.g. "allo.stream.get").
-  std::string mlirOp; // `mlir_op:` — empty unless this is an advanced row.
-
-  // Optional width predicate on the op's datapath width (see `classify`).
-  std::optional<WidthRange> width; // `width: {min, max}`
-
-  uint32_t latency = 0; // in cycles
-
-  // Datapath delay in ns (`delay_ns:`, a scalar or `{in, out}`).
-  std::optional<DelaySpec> delay;
-
-  // Whether the operator is fully pipelined (accepts a new input every cycle).
-  // A non-pipelined operator occupies its resource unit for its whole latency.
-  // Default true (matches typical HLS units, e.g. a pipelined multiplier).
+  uint32_t latency = 0; // cycles
+  double inDelay = 0.0; // ns
+  double outDelay = 0.0;
   bool pipelined = true;
-
-  // Allocation pool this operator draws from (a key in OperatorLibrary::units).
-  // Ops sharing a pool contend for a limited number of units -> a ResII bound.
-  std::optional<std::string> unit;
-
-  // Realization (`impl:`): a native keyword (`comb`/`hwarith`/`builtin`) or an
-  // IP module name. Required on every compute row; absent on mem/stream rows.
-  std::string impl;
+  std::string symbol; // the injected `dcp.operator` sym_name (IP rows only).
 };
 
 /// The timing characterization resolved for a specific operation.
@@ -189,91 +111,86 @@ struct OperatorChar {
   double inDelay = 0.0;
   double outDelay = 0.0;
   bool pipelined = true;
-  std::string unit;       // allocation pool name (empty = unlimited)
-  uint32_t unitLimit = 0; // number of units in that pool
-  std::string impl;       // realization: native keyword or IP module name
+  std::string symbol; // the matched `dcp.operator` sym_name (IP), else empty
 };
 
-/// A parsed operator library: advanced (raw-name) rows, then abstract rows,
-/// plus a mandatory default. `lookup` returns the first matching row's
-/// characterization (advanced rows first), else the default, guaranteeing every
-/// op is characterized.
+/// The operator library, built from the injected device IR: comb rows from
+/// `dcp.device.comb`, IP rows from `dcp.operator` symbols, storage timing from
+/// `dcp.device.memory`. `lookup` returns the matching row's characterization
+/// (advanced first, then abstract last-wins, else the default).
 class OperatorLibrary {
 public:
-  /// Parse a library from YAML text / a file. The built-in default reproduces
-  /// the pre-timing fixed model (comb=0, mul/div/rem/fp=3, mem/stream=1).
-  static llvm::Expected<OperatorLibrary> parse(llvm::StringRef yaml);
-  static llvm::Expected<OperatorLibrary> loadFile(llvm::StringRef path);
-  static const OperatorLibrary &defaultLibrary();
+  /// Build the library from a module's injected `dcp.device` + `dcp.operator`
+  /// ops. A module with no `dcp.device` yields an empty (all-default) library.
+  static OperatorLibrary fromModule(ModuleOp module);
 
-  /// The library-declared cycle time (ns), if any: `cycle_time_ns` directly, or
-  /// derived from `frequency_mhz`. A pass option overrides this.
-  std::optional<double> cycleTime() const;
-
-  /// Resolve the characterization for \p op: first matching row, else default.
+  /// Resolve the characterization for \p op: the matching row, else default.
   OperatorChar lookup(Operation *op) const;
 
-  /// The `advanced_operators` `mlir_op` names that are not registered
-  /// operations in \p ctx. A non-empty result means the library names an op we
-  /// cannot express (a typo, or a dialect the pass does not load) -- the caller
-  /// should fail loudly rather than silently ignore the row.
-  std::vector<std::string> unregisteredAdvancedOps(MLIRContext &ctx) const;
+  /// Whether \p op needs an IP realization (a float or advanced compute op) but
+  /// no library row matched, so the caller can report an error instead of
+  /// scheduling it at the default zero latency.
+  bool requiresUnmatchedIP(Operation *op) const;
 
-  /// The storage-timing (`memory:`) view of the same device file. `lookup`
-  /// characterizes memory/stream accesses through it, not the operator table.
+  /// The storage-timing view of the device.
   const MemoryLibrary &memoryLibrary() const { return memory; }
 
 private:
-  friend struct llvm::yaml::MappingTraits<OperatorLibrary>;
-
-  /// Resolve \p e to a characterization, filling the allocation pool from
-  /// `units`.
-  OperatorChar resolveEntry(const OperatorEntry &e,
-                            llvm::StringRef typeName) const;
-
-  std::string device;                 // informational (the FPGA part).
-  std::optional<double> frequencyMhz; // target clock; -> cycle time.
-  std::optional<double> cycleTimeNs;  // explicit cycle time (overrides freq).
-  std::map<std::string, uint32_t>
-      units; // `units:` allocation pools (name->count).
-  std::vector<OperatorEntry>
-      advancedEntries;                // `advanced_operators:` (matched first).
-  std::vector<OperatorEntry> entries; // `operators:` (abstract).
+  std::vector<OperatorEntry> advancedEntries; // matched first (raw name)
+  std::vector<OperatorEntry> entries;         // abstract rows
   OperatorEntry defaultEntry;
-  MemoryLibrary
-      memory; // `memory:` -- the storage dimension of the device file.
+  MemoryLibrary memory;
 };
 
-/// The compiled-in default library YAML (informational; parsed by
-/// OperatorLibrary::defaultLibrary).
-llvm::StringRef defaultLibraryYAML();
+//===----------------------------------------------------------------------===//
+// Scheduled-call latency: a scheduling helper, separate from operator
+// characterization. A plain (non-async) call to an already-scheduled callee is
+// a fixed-latency node in the enclosing problem -- the callee's whole-kernel
+// latency (its `sched.latency`, annotated bottom-up) with registered
+// boundaries. Returns {latency, stable operator-type name} for such a call,
+// else nullopt.
+//===----------------------------------------------------------------------===//
+inline std::optional<std::pair<int64_t, std::string>>
+scheduledCallLatency(Operation *op) {
+  auto call = dyn_cast<func::CallOp>(op);
+  if (!call || op->hasAttr(kAlloAsyncAttr))
+    return std::nullopt;
+  auto callee = SymbolTable::lookupNearestSymbolFrom<func::FuncOp>(
+      op, call.getCalleeAttr());
+  if (!callee)
+    return std::nullopt;
+  auto lat = callee->getAttrOfType<IntegerAttr>(sched::kLatencyAttr);
+  if (!lat)
+    return std::nullopt;
+  return std::make_pair(lat.getInt(), ("call." + call.getCallee()).str());
+}
 
 //===----------------------------------------------------------------------===//
 // Operator model: apply a library to a scheduling problem.
-//
-// Beyond per-op latency/delay, this attaches the resources the resource-aware
-// schedulers bind against: a per-memref memory-port resource (count from the
-// array's partition/storage attributes) and a per-pool compute-allocation
-// resource. It is the seam between the library (characterization) and CIRCT's
-// Problem data model.
 //===----------------------------------------------------------------------===//
 
 /// Assign an operator type (latency + delays) to every op reached by \p walkFn,
-/// sourced from \p lib. The problem type selects what extra properties apply:
-///   - a `ChainingProblem` also receives per-type incoming/outgoing delays;
-///   - a `SharedOperatorsProblem` also receives a limited resource: a
-///   per-memref
-///     port resource on memory accesses, or a named allocation-pool resource on
-///     compute ops.
-/// These branches are compiled only for problem types that support them.
+/// sourced from \p lib. A `ChainingProblem` also receives incoming/outgoing
+/// delays. A scheduled sync call is a fixed-latency node (see
+/// `scheduledCallLatency`); everything else is characterized by the library.
 template <class ProblemT, class WalkFn>
 LogicalResult populateOperatorTypesImpl(ProblemT &problem, WalkFn walkFn,
                                         const OperatorLibrary &lib) {
   using namespace circt::scheduling;
   constexpr bool isChaining = std::is_base_of_v<ChainingProblem, ProblemT>;
-  constexpr bool isShared = std::is_base_of_v<SharedOperatorsProblem, ProblemT>;
 
   walkFn([&](Operation *op) {
+    if (std::optional<std::pair<int64_t, std::string>> cl =
+            scheduledCallLatency(op)) {
+      Problem::OperatorType opr = problem.getOrInsertOperatorType(cl->second);
+      problem.setLatency(opr, static_cast<unsigned>(cl->first));
+      if constexpr (isChaining) {
+        problem.setIncomingDelay(opr, 0.0); // registered boundary
+        problem.setOutgoingDelay(opr, 0.0);
+      }
+      problem.setLinkedOperatorType(op, opr);
+      return;
+    }
     OperatorChar c = lib.lookup(op);
     Problem::OperatorType opr = problem.getOrInsertOperatorType(c.typeName);
     problem.setLatency(opr, c.latency);
@@ -282,27 +199,6 @@ LogicalResult populateOperatorTypesImpl(ProblemT &problem, WalkFn walkFn,
       problem.setOutgoingDelay(opr, c.outDelay);
     }
     problem.setLinkedOperatorType(op, opr);
-
-    if constexpr (isShared) {
-      // A compute op contends for its named allocation pool. A limited resource
-      // requires a non-zero-latency op (CIRCT invariant): a combinational op
-      // cannot contend for a cycle-long slot. (Memory-port resources are the
-      // storage dimension, assigned separately by populateMemoryResources.)
-      if (c.latency > 0 && !c.unit.empty() && c.unitLimit > 0) {
-        Problem::ResourceType rsrc =
-            problem.getOrInsertResourceType("unit_" + c.unit);
-        problem.setLimit(rsrc, c.unitLimit);
-        problem.setLinkedResourceTypes(
-            op, SmallVector<Problem::ResourceType>{rsrc});
-        // A non-pipelined multi-cycle unit holds its resource for its whole
-        // latency; record that occupancy for the resource-aware schedulers.
-        unsigned occ = (c.pipelined || c.latency <= 1) ? 1u : c.latency;
-        if (occ > 1)
-          op->setAttr(
-              sched::kResourceCyclesAttr,
-              IntegerAttr::get(IntegerType::get(op->getContext(), 64), occ));
-      }
-    }
   });
   return success();
 }

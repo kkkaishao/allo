@@ -62,9 +62,7 @@ NB_MODULE(_allo, m) {
       [](MlirContext context) { alloMlirRegisterAllExtensions(context); },
       nb::arg("context"),
       "Register and load the transform dialect + Allo transform extensions.");
-  allo.def(
-      "register_passes", []() { alloMlirRegisterAllPasses(); },
-      "Register all Allo passes with the global pass registry.");
+  alloMlirRegisterAllPasses();
   allo.attr("SIGNED_ATTR_NAME") = kAlloSignedAttr;
   allo.attr("LAZY_ATTR_NAME") = kAlloLazyAttr;
 
@@ -181,7 +179,7 @@ NB_MODULE(_allo, m) {
       nb::arg("module"), "Return a clone of the given module.");
 
   //===--------------------------------------------------------------------===//
-  // Allo dialect types / attributes (subclasses of
+  // Allo dialect types / attributes (CRTP subclasses of
   // allo._mlir.ir.Type/Attribute)
   //===--------------------------------------------------------------------===//
   allo::populateAlloTypes(m);
