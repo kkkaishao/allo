@@ -98,7 +98,12 @@ static bool isPureCombCondition(Value v) {
     return false;
   if (isa<arith::ConstantOp>(def))
     return true;
-  if (def->getName().getDialectNamespace() != "arith" ||
+  // A dcp region result is a settled survivor -- latched when the region
+  // completes, stable at the guard's start -- so it is a valid leaf of the tree
+  // (the DFS stops here), exactly like a block argument.
+  if (isa<DCPathPipelineOp, DCPathSequentialOp, DCPathSelectOp>(def))
+    return true;
+  if (!isa<arith::ArithDialect>(def->getDialect()) ||
       def->hasAttr(sched::kStartTimeAttr))
     return false;
   return llvm::all_of(def->getOperands(), isPureCombCondition);
@@ -110,8 +115,9 @@ static bool isPureCombCondition(Value v) {
 static void tagConditionStartZero(Builder &b, Value v) {
   Operation *def = v.getDefiningOp();
   if (!def || isa<arith::ConstantOp>(def) ||
+      isa<DCPathPipelineOp, DCPathSequentialOp, DCPathSelectOp>(def) ||
       def->hasAttr(sched::kStartTimeAttr))
-    return;
+    return; // stop at a settled survivor (a region result) -- do not tag it
   def->setAttr(sched::kStartTimeAttr, b.getI64IntegerAttr(0));
   for (Value o : def->getOperands())
     tagConditionStartZero(b, o);

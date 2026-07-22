@@ -414,6 +414,12 @@ struct RegionBlock {
   // child `tripCount` times (hierarchical control, II_outer >= L_inner).
   std::optional<RegionId> parent;
   llvm::SmallVector<RegionId, 2> children;
+  // A guard (dcp.select) with a non-empty `else` branch is a *dual* guard: its
+  // `children` are the then-branch sub-schedule (run iff the predicate holds)
+  // and `elseChildren` are the else-branch sub-schedule (run iff it does not).
+  // Empty for a container loop and for a then-only guard (the supported shape
+  // before M13); the two child lists are the two mutually-exclusive arms.
+  llvm::SmallVector<RegionId, 2> elseChildren;
 
   // Cells owned by this region (ids are Datapath-global; these record
   // membership and thus which counter drives them).
@@ -463,6 +469,14 @@ struct Datapath {
   // is not a loop-carried recurrence (an acyclic once-computed survivor, which
   // always lands). Only set for pipeline regions.
   llvm::DenseMap<RegionId, llvm::SmallVector<Source>> regionResultInit;
+
+  // A result-mux guard (a dcp.select yielding values): the *else* branch's
+  // yielded Sources, index-aligned with the *then* branch's (which are in
+  // `regionResult`). The survivor a consumer reads for result k is
+  // `cond ? then : else` -- emitGuard latches each branch's value when that arm
+  // drains and muxes them by the (held) predicate. Present only for a guard
+  // that yields results; a result-less dual guard sets neither.
+  llvm::DenseMap<RegionId, llvm::SmallVector<Source>> selectElseResult;
 
   // The i1 predicate of a guard region (a dcp.select), as a resolved Source.
   // The guard's children run once iff it holds (emitGuard start-gates them);

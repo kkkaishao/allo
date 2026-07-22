@@ -799,3 +799,152 @@ def test_port_bound_ii_read_write_same_array():
     r = rtl.cosim(weights, dweights)
     assert np.array_equal(weights, exp_w)
     assert r.result == exp_norm
+
+
+def test_radix_sort():
+    """radixsort's LSD ping-pong: each pass histograms one 2-bit radix, prefix-
+    scans the buckets, then scatters into the other buffer -- `if valid_buffer==0:
+    read a,write b else: read b,write a`, an if/else whose both arms hold store
+    loops and whose data-dependent predicate flips a carried flag. It closes into a
+    result-mux dcp.select (a dual guard yielding `valid_buffer`). Sized to 16 i8-
+    range keys over 4 passes so the result lands back in `a`."""
+    EPB, SIZE, RADIX = 4, 16, 4
+    NBLK = SIZE // EPB
+    BKT = NBLK * RADIX + 1
+    SCAN_BLK = 4
+    SCAN_R = (BKT - 1) // SCAN_BLK
+    PASSES = 4  # 2 bits/pass -> low 8 bits; even, so the sorted result ends in `a`
+
+    @kernel
+    def ss_sort(a: i32[SIZE]):
+        b: i32[SIZE] = 0
+        bucket: i32[BKT] = 0
+        sm: i32[SCAN_R] = 0
+        bucket_indx: i32 = 0
+        a_indx: i32 = 0
+        valid_buffer: i32 = 0
+        for exp in range(PASSES):
+            for i_init in range(BKT):
+                bucket[i_init] = 0
+            if valid_buffer == 0:
+                for blockID in range(NBLK):
+                    for i_h in range(4):
+                        a_indx = blockID * EPB + i_h
+                        bucket_indx = (
+                            ((a[a_indx] >> (exp * 2)) & 0x3) * NBLK + blockID + 1
+                        )
+                        bucket[bucket_indx] = bucket[bucket_indx] + 1
+            else:
+                for blockID in range(NBLK):
+                    for i_h in range(4):
+                        a_indx = blockID * EPB + i_h
+                        bucket_indx = (
+                            ((b[a_indx] >> (exp * 2)) & 0x3) * NBLK + blockID + 1
+                        )
+                        bucket[bucket_indx] = bucket[bucket_indx] + 1
+            for radixID in range(SCAN_R):
+                for i_ls in range(1, SCAN_BLK):
+                    bucket_indx = radixID * SCAN_BLK + i_ls
+                    bucket[bucket_indx] = bucket[bucket_indx] + bucket[bucket_indx - 1]
+            sm[0] = 0
+            for radixID_s in range(1, SCAN_R):
+                bucket_indx = radixID_s * SCAN_BLK - 1
+                sm[radixID_s] = sm[radixID_s - 1] + bucket[bucket_indx]
+            for radixID_l in range(SCAN_R):
+                for i_lss in range(SCAN_BLK):
+                    bucket_indx = radixID_l * SCAN_BLK + i_lss
+                    bucket[bucket_indx] = bucket[bucket_indx] + sm[radixID_l]
+            if valid_buffer == 0:
+                for blockID_u in range(NBLK):
+                    for i_u in range(4):
+                        bucket_indx = (
+                            (a[blockID_u * EPB + i_u] >> (exp * 2)) & 0x3
+                        ) * NBLK + blockID_u
+                        a_indx = blockID_u * EPB + i_u
+                        b[bucket[bucket_indx]] = a[a_indx]
+                        bucket[bucket_indx] = bucket[bucket_indx] + 1
+                valid_buffer = 1
+            else:
+                for blockID_u in range(NBLK):
+                    for i_u in range(4):
+                        bucket_indx = (
+                            (b[blockID_u * EPB + i_u] >> (exp * 2)) & 0x3
+                        ) * NBLK + blockID_u
+                        a_indx = blockID_u * EPB + i_u
+                        a[bucket[bucket_indx]] = b[a_indx]
+                        bucket[bucket_indx] = bucket[bucket_indx] + 1
+                valid_buffer = 0
+
+    rtl = _to_rtl(ss_sort)
+    assert "dcp.select" in rtl.dcp  # the ping-pong closes into a result-mux guard
+
+    a = np.random.default_rng(0).integers(0, 256, SIZE).astype(np.int32)
+    gold = np.sort(a)
+    rtl.cosim(a)
+    assert np.array_equal(a, gold)
+
+
+def test_bfs_bulk():
+    """bfs_bulk sweeps the frontier level by level: `if level[n]==horizon:` visits a
+    node, and for each edge `if level[dst]==MAX:` marks the neighbour and bumps a
+    carried `cnt`. The nested data-dependent guards wrap loops and update `cnt`, so
+    they close into result-mux dcp.selects; `if cnt!=0:` records the level size.
+    A small star graph (node 0 -> the rest) is one frontier hop."""
+    N_NODES, N_EDGES, N_LEVELS, MAX = 8, 8, 4, 999999
+
+    @kernel
+    def bfs_bulk(
+        nodes: i32[N_NODES * 2],
+        edges: i32[N_EDGES],
+        starting_node: i32,
+        level: i32[N_NODES],
+        level_counts: i32[N_LEVELS],
+    ):
+        for n in range(N_NODES):
+            level[n] = MAX
+        for l in range(N_LEVELS):
+            level_counts[l] = 0
+        level[starting_node] = 0
+        level_counts[0] = 1
+        for horizon in range(N_LEVELS):
+            cnt: i32 = 0
+            horizon_i32: i32 = horizon
+            for n in range(N_NODES):
+                if level[n] == horizon_i32:
+                    tmp_begin: i32 = nodes[2 * n]
+                    tmp_end: i32 = nodes[2 * n + 1]
+                    for e in range(tmp_begin, tmp_end):
+                        tmp_dst: i32 = edges[e]
+                        tmp_level: i32 = level[tmp_dst]
+                        if tmp_level == MAX:
+                            level[tmp_dst] = horizon_i32 + 1
+                            cnt += 1
+            if cnt != 0:
+                level_counts[horizon + 1] = cnt
+
+    rtl = _to_rtl(bfs_bulk)
+    assert "dcp.select" in rtl.dcp
+
+    nodes = np.zeros(N_NODES * 2, np.int32)
+    nodes[0], nodes[1] = 0, 7  # node 0 owns edges[0:7]
+    edges = np.array([1, 2, 3, 4, 5, 6, 7, 0], np.int32)  # -> nodes 1..7
+    level = np.zeros(N_NODES, np.int32)
+    counts = np.zeros(N_LEVELS, np.int32)
+
+    gl = np.full(N_NODES, MAX, np.int32)
+    gc = np.zeros(N_LEVELS, np.int32)
+    gl[0], gc[0] = 0, 1
+    for horizon in range(N_LEVELS):
+        cnt = 0
+        for n in range(N_NODES):
+            if gl[n] == horizon:
+                for e in range(nodes[2 * n], nodes[2 * n + 1]):
+                    if gl[edges[e]] == MAX:
+                        gl[edges[e]] = horizon + 1
+                        cnt += 1
+        if cnt != 0:
+            gc[horizon + 1] = cnt
+
+    rtl.cosim(nodes, edges, np.int32(0), level, counts)
+    assert np.array_equal(level, gl)
+    assert np.array_equal(counts, gc)

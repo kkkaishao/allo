@@ -925,16 +925,20 @@ Value HWEmitter::emitConditionalContainer(const uarch::RegionBlock &rb,
   return ctx.holdDone(donePulse, start);
 }
 
-// A guard region (a dcp.select): its children run once iff the predicate holds.
-// The predicate is a held value (the condition region's survivor, captured
-// before the guard emits, valid at `start`). When it holds, child 0 starts and
-// the region drains on the last child; when it does not, the region completes
-// in one cycle and the children never issue -- so their stores never fire (the
-// predicate reaches every store write-enable structurally, via the missing
-// issue pulse, not a per-store gate). Either way the region produces a done
-// edge, so an enclosing container advances past it in both branches. Run-once:
-// no iteration / iter-args (unlike emitConditionalContainer -- the predicate is
-// independent of the children).
+// A guard region (a dcp.select): its two arms run mutually-exclusively under
+// the predicate. The then-arm (`children`) runs iff the predicate holds; the
+// else-arm
+// (`elseChildren`) runs iff it does not (a *dual* guard). The predicate is a
+// held value (the condition region's survivor, captured before the guard emits,
+// valid at `start`). The not-taken arm's children never issue -- so their
+// stores never fire (the predicate reaches every store write-enable
+// structurally, via the missing issue pulse, not a per-store gate). An empty
+// arm (a then-only guard's absent else, or a pass-through else that yields a
+// value but runs no schedule) completes in one cycle: its start pulse IS its
+// drain. Either way the region produces a done edge, so an enclosing container
+// advances past it in both branches. Run-once: no iteration / iter-args (unlike
+// emitConditionalContainer
+// -- the predicate is independent of the children).
 Value HWEmitter::emitGuard(const uarch::RegionBlock &rb, Value start) {
   const uarch::Datapath::GuardInfo &gi = dp.guardCond.find(rb.id)->second;
   // The predicate as a Source: a scheduled condition region's survivor (a
@@ -947,14 +951,42 @@ Value HWEmitter::emitGuard(const uarch::RegionBlock &rb, Value start) {
   // guard's done pulse would otherwise coincide with `start` and be masked by
   // the clear.
   Value checkTime = ctx.reg(start, ctx.f1);
-  // predicate true -> start child 0; false -> a one-shot `skip` done pulse.
-  auto [child0Start, skip] = ctx.branchPulse(checkTime, cond);
-  // Children run once (retrig so a re-entered guard presents fresh edges each
-  // enclosing pass); `drained` is the last child's completion edge.
-  Value drained =
-      ctx.risingEdge(sequence(rb.children, child0Start, /*retrig=*/true));
-  // Latch done (a level); clear on start so a retriggered guard re-edges.
-  return ctx.holdDone(ctx.orBits(skip, drained), start);
+  // Two mutually-exclusive arm pulses (the else-arm is the old one-shot
+  // `skip`).
+  auto [thenStart, elseStart] = ctx.branchPulse(checkTime, cond);
+  // Each arm runs its children once (retrig so a re-entered guard presents
+  // fresh edges each enclosing pass); an empty arm drains on its own start
+  // pulse.
+  Value thenDrained =
+      rb.children.empty()
+          ? thenStart
+          : ctx.risingEdge(sequence(rb.children, thenStart, /*retrig=*/true));
+  Value elseDrained = rb.elseChildren.empty()
+                          ? elseStart
+                          : ctx.risingEdge(sequence(rb.elseChildren, elseStart,
+                                                    /*retrig=*/true));
+  // Result-mux: each yielded result is `cond ? then-value : else-value`. Latch
+  // each branch's value when that arm drains (only the taken arm fires, so its
+  // survivor is fresh and the other holds a stale value the mux ignores), then
+  // select by the held predicate. Resolvable now: sequence() above has set
+  // every child survivor a then/else value reads. A result-less dual guard has
+  // no regionResult entry and skips this.
+  auto rit = dp.regionResult.find(rb.id);
+  if (rit != dp.regionResult.end()) {
+    const auto &elseR = dp.selectElseResult.find(rb.id)->second;
+    for (auto [k, thenSrc] : llvm::enumerate(rit->second)) {
+      Value tv = datapath.resolveSource(thenSrc);
+      Value ev = datapath.resolveSource(elseR[k]);
+      Value thenSurv =
+          ctx.enabledReg(tv, thenDrained, ctx.konst(tv.getType(), 0));
+      Value elseSurv =
+          ctx.enabledReg(ev, elseDrained, ctx.konst(ev.getType(), 0));
+      datapath.setSurvivor(rb.id, k, ctx.mux(cond, thenSurv, elseSurv));
+    }
+  }
+  // Exactly one arm runs, so the region completes on whichever drains. Latch
+  // done (a level); clear on start so a retriggered guard re-edges.
+  return ctx.holdDone(ctx.orBits(thenDrained, elseDrained), start);
 }
 
 // Emit the whole module body: preamble (literals + read ports + internal

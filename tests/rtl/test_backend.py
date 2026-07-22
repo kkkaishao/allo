@@ -876,6 +876,68 @@ def test_imperfect_wrapper_guard_cosim():
     assert np.allclose(C, np.ones((N, N), np.float32))
 
 
+def test_result_mux_select():
+    # A dcp.select with a non-empty else / yielded results: both arms run
+    # mutually-exclusively under the predicate, and a yielded value is muxed
+    # `cond ? then : else`. Covers a dual guard (a store loop in each arm) and a
+    # result-mux (a guarded reduction yielding an accumulator).
+    N = 16
+
+    # Dual guard, affine predicate: the taken arm's store loop fires, the other's
+    # never issues.
+    @kernel
+    def dual_affine(a: i32[4, N], b: i32[4, N], out: i32[4, N]):
+        for g in range(4):
+            if g < 2:
+                for i in range(N):
+                    out[g, i] = a[g, i] + 1
+            else:
+                for i in range(N):
+                    out[g, i] = b[g, i] * 2
+
+    mod = _to_rtl(dual_affine)
+    assert "dcp.select" in mod.dcp
+    a = np.arange(4 * N, dtype=np.int32).reshape(4, N)
+    b = a + 1000
+    out = np.zeros((4, N), np.int32)
+    mod.cosim(a.copy(), b.copy(), out)
+    assert np.array_equal(out, np.where(np.arange(4).reshape(4, 1) < 2, a + 1, b * 2))
+
+    # Dual guard, data-dependent predicate (a ping-pong `if sel[g]==0: ... else`):
+    # the predicate reads memory, lifting to a settled-survivor dcp.compute.
+    @kernel
+    def dual_ddep(sel: i32[4], a: i32[4, N], b: i32[4, N], out: i32[4, N]):
+        for g in range(4):
+            if sel[g] == 0:
+                for i in range(N):
+                    out[g, i] = a[g, i] + 1
+            else:
+                for i in range(N):
+                    out[g, i] = b[g, i] * 2
+
+    sel = np.array([0, 1, 0, 1], dtype=np.int32)
+    out = np.zeros((4, N), np.int32)
+    _to_rtl(dual_ddep).cosim(sel, a.copy(), b.copy(), out)
+    assert np.array_equal(out, np.where(sel.reshape(4, 1) == 0, a + 1, b * 2))
+
+    # Result-mux: the guard wraps a reduction loop and yields the accumulator; the
+    # empty else passes the initial value through -> `cond ? sum : 0`.
+    @kernel
+    def rmux(a: i32[4, N], out: i32[4]):
+        for g in range(4):
+            acc: i32 = 0
+            if g < 2:
+                for i in range(N):
+                    acc += a[g, i]
+            out[g] = acc
+
+    mod = _to_rtl(rmux)
+    assert "dcp.select" in mod.dcp
+    out = np.zeros(4, np.int32)
+    mod.cosim(a.copy(), out)
+    assert np.array_equal(out, np.where(np.arange(4) < 2, a.sum(1), 0).astype(np.int32))
+
+
 # --- Streams (dataflow through FIFOs) --------------------------------------
 
 

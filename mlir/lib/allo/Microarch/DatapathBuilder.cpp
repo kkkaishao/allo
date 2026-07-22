@@ -203,7 +203,19 @@ RegionBlock DatapathBuilder::addRegion(Operation *regionOp, RegionId ridx) {
     unsigned pidx = regionIdxOf.lookup(p);
     rb.parent = pidx;
     dp.regions[pidx].container = true;
-    dp.regions[pidx].children.push_back(ridx);
+    // A guard (dcp.select) splits its children by branch: a region nested in
+    // the else body is an else-child (run iff the predicate is false),
+    // everything else a then-child. Find which branch of the select `regionOp`
+    // sits in by walking up to the child whose parent op is the select.
+    bool isElse = false;
+    if (auto sel = dyn_cast<dcp::DCPathSelectOp>(p)) {
+      Operation *o = regionOp;
+      while (o->getParentOp() != p)
+        o = o->getParentOp();
+      isElse = o->getParentRegion() == &sel.getElseRegion();
+    }
+    (isElse ? dp.regions[pidx].elseChildren : dp.regions[pidx].children)
+        .push_back(ridx);
   }
 
   if (isa<dcp::DCPathSelectOp>(regionOp)) {
@@ -476,6 +488,11 @@ void DatapathBuilder::recordRegionResult(const RegionBlock &rb,
   // dcp.condition whose leading operand is the condition, not a result.
   if (rb.conditional)
     return;
+  // A guard (dcp.select) yields from child regions, which are added AFTER this
+  // (pre-order), so `regionIdxOf` is not yet complete here -- its results are
+  // resolved in recordGuards, which runs once every region exists.
+  if (isa<dcp::DCPathSelectOp>(regionOp))
+    return;
   Operation *term = regionBody(regionOp)->getTerminator();
   if (term->getNumOperands() == 0)
     return; // a result-less region yields nothing to a sibling
@@ -547,20 +564,35 @@ void DatapathBuilder::recordGuards(ArrayRef<Operation *> regionOps) {
     auto sel = dyn_cast<dcp::DCPathSelectOp>(op);
     if (!sel)
       continue;
-    // A result-mux guard (both branches yield a value, muxed by the predicate)
-    // needs the else branch + result-mux, which is unsupported -- a pure guard
-    // (its stores live inside the then branch) has neither.
-    assert(sel.getResults().empty() && sel.getElseRegion().empty() &&
-           "result-mux dcp.select (else branch) is unsupported");
     // The predicate is the select's i1 condition operand, resolved to a Source:
     // a scheduled prologue region's survivor (a data-dependent scf guard), or
     // the enclosing container's combinational predicate unit (an affine guard
     // over the counter, reified to a start-0 compute). A memory-/IP-
     // dependent predicate the reifier left raw resolves to None (rejected in
     // validateDatapath).
+    RegionId rid = regionIdxOf.lookup(op);
     Datapath::GuardInfo gi;
     gi.condition = boundSource(sel.getCondition());
-    dp.guardCond[regionIdxOf.lookup(op)] = gi;
+    dp.guardCond[rid] = gi;
+
+    // A result-mux guard (the select yields values): resolve each branch's
+    // yielded Sources (a branch result is typically a child-region survivor or
+    // a pass-through iter-arg -- initSource handles both, and every region now
+    // exists so region-result survivors resolve). The then values go in
+    // `regionResult`, the else in `selectElseResult`, index-aligned; emitGuard
+    // muxes them by the predicate. A result-less dual guard sets neither.
+    auto resolveBranch = [&](Region &br) {
+      SmallVector<Source> rs;
+      if (!br.empty())
+        for (Value v : br.front().getTerminator()->getOperands())
+          rs.push_back(initSource(v));
+      return rs;
+    };
+    SmallVector<Source> thenR = resolveBranch(sel.getThenRegion());
+    if (!thenR.empty()) {
+      dp.regionResult[rid] = std::move(thenR);
+      dp.selectElseResult[rid] = resolveBranch(sel.getElseRegion());
+    }
   }
 }
 
@@ -568,7 +600,8 @@ Source DatapathBuilder::boundSource(Value v) {
   if (Operation *def = v.getDefiningOp()) {
     // A prologue region result: the runtime bound is one of its survivors
     // (result number selects which), the same channel a data survivor crosses.
-    if (isa<dcp::DCPathPipelineOp, dcp::DCPathSequentialOp>(def))
+    if (isa<dcp::DCPathPipelineOp, dcp::DCPathSequentialOp,
+            dcp::DCPathSelectOp>(def))
       return Source{Source::Kind::Survivor, regionIdxOf.lookup(def),
                     cast<OpResult>(v).getResultNumber()};
     if (auto it = producerOf.find(def); it != producerOf.end())
@@ -733,7 +766,8 @@ Resolved DatapathBuilder::resolveOperand(Value v, Operation *consumer,
   // cross-region survivor, held until the producing region completes (the
   // emitter latches it; see dp.regionResult). The result number selects which
   // survivor. No register chain: depth 0.
-  if (isa<dcp::DCPathPipelineOp, dcp::DCPathSequentialOp>(def))
+  if (isa<dcp::DCPathPipelineOp, dcp::DCPathSequentialOp, dcp::DCPathSelectOp>(
+          def))
     return {Source{Source::Kind::Survivor, regionIdxOf.lookup(def),
                    cast<OpResult>(v).getResultNumber()},
             Value(), 0, true};
@@ -769,7 +803,8 @@ Source DatapathBuilder::initSource(Value v) {
     // init is stable for the whole consuming run; the producing Source itself
     // is not, being a port a free-running datapath overwrites once that region
     // ends.
-    if (isa<dcp::DCPathPipelineOp, dcp::DCPathSequentialOp>(def))
+    if (isa<dcp::DCPathPipelineOp, dcp::DCPathSequentialOp,
+            dcp::DCPathSelectOp>(def))
       return Source{Source::Kind::Survivor, regionIdxOf.lookup(def),
                     cast<OpResult>(v).getResultNumber()};
   }
@@ -1104,6 +1139,14 @@ void DatapathBuilder::build() {
     RegionBlock rb = addRegion(regionOp, ridx);
     for (Operation &opRef : regionBody(regionOp)->without_terminator())
       bindResource(&opRef, rb);
+    // A dual guard (dcp.select with a non-empty else) binds its else-branch
+    // loose ops too -- regionBody returns only the then block. Nested regions
+    // in either branch bind nothing here (walked in their own iteration).
+    if (auto sel = dyn_cast<dcp::DCPathSelectOp>(regionOp))
+      if (!sel.getElseRegion().empty())
+        for (Operation &opRef :
+             sel.getElseRegion().front().without_terminator())
+          bindResource(&opRef, rb);
     recordRegionResult(rb, regionOp);
     dp.regions.push_back(std::move(rb));
   }
