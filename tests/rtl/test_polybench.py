@@ -17,15 +17,15 @@ import sys
 
 sys.path.insert(0, os.path.dirname(__file__))
 
-import numpy as np  # noqa: E402
-import pytest  # noqa: E402
+import numpy as np
+import pytest
 
-from allo import kernel  # noqa: E402
-from allo.lang import f32, index  # noqa: E402
-from allo.operators import math as amath  # noqa: E402
-from allo.lang.ip import ip  # noqa: E402
-from allo.backend.rtl.device import builtin_device  # noqa: E402
-from _common import (  # noqa: E402
+from allo import kernel
+from allo.lang import f32, index
+from allo.operators import math as amath
+from allo.lang.ip import ip
+from allo.backend.rtl.device import builtin_device
+from _common import (
     _sched,
     _to_rtl,
     _iis,

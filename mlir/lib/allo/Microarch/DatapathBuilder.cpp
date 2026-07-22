@@ -14,6 +14,7 @@
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/Dialect/MemRef/IR/MemRef.h" // memref::GetGlobalOp/GlobalOp (ROM)
 #include "mlir/IR/BuiltinAttributes.h"
 #include "llvm/ADT/MapVector.h"
 #include "llvm/ADT/STLExtras.h"
@@ -150,6 +151,18 @@ MemId DatapathBuilder::getOrCreateMem(Value memref) {
   m.external = isa<BlockArgument>(memref);
   auto mt = cast<MemRefType>(memref.getType());
   m.width = mt.getElementTypeBitWidth();
+  // A `memref.get_global` names a module-level constant table: resolve the
+  // global's initializer so the emitter can build a ROM (read-only, no writable
+  // hlmem). An uninitialized global stays a plain internal memory.
+  if (auto gg = memref.getDefiningOp<memref::GetGlobalOp>()) {
+    auto global = SymbolTable::lookupNearestSymbolFrom<memref::GlobalOp>(
+        gg, gg.getNameAttr());
+    assert(global && "get_global references an undefined memref.global");
+    if (std::optional<Attribute> init = global.getInitialValue()) {
+      m.romInit = *init;
+      m.isRom = true;
+    }
+  }
   // Banking / ports from the same storage model the scheduler binds against
   // (allo.part / allo.bind.storage); depthWords is per-bank so that
   // numBanks * depthWords covers the array.

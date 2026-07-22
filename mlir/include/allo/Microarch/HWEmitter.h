@@ -515,6 +515,8 @@ struct DatapathEmitter {
   DenseMap<unsigned, SmallVector<Value>>
       memBanks; // internal mem id -> its bank hlmem handle(s) (one unless
                 // banked)
+  DenseMap<unsigned, Value>
+      romArray; // ROM mem id -> its hw.aggregate_constant array value
   DenseMap<unsigned, circt::Backedge> regHeadBE; // reg id -> chain head input
   DenseMap<unsigned, ShiftChain> regStages;      // reg id -> its tap chain
   DenseMap<uint64_t, Value> readData;            // (mem,access) -> read data
@@ -602,6 +604,19 @@ struct DatapathEmitter {
   /// + iter-arg survivors are set and before the children are sequenced, so a
   /// child guard reads its parent's predicate as a Source::Unit.
   void emitCombUnits(const uarch::RegionBlock &rb);
+  /// Emit a sequential (CHECK/RUN) while's condition cone -- the container's
+  /// OWN condition memory reads (address over the frozen iter-arg survivors)
+  /// plus its combinational compute (emitCombUnits) -- and return the settled
+  /// condition value together with its ready latency `t_cond` (the cycles after
+  /// CHECK-start the condition is valid). A generalisation of emitCombUnits
+  /// that also emits the container's own reads; a combinational condition has
+  /// no read
+  /// (`t_cond == 0`), reducing to emitCombUnits exactly. The read address is
+  /// the frozen iter-arg survivor, so the loaded value is a stable wire across
+  /// the CHECK window; the caller samples it at `delayValid(checkStart,
+  /// t_cond)`.
+  std::pair<Value, unsigned> emitConditionRegion(const uarch::RegionBlock &rb,
+                                                 const uarch::Source &condSrc);
   void resolveRegHeads(const uarch::RegionBlock &rb);
   /// External read addresses + all writes (external ports / internal
   /// seq.write), gated by \p issue. Returns the region's store feedback (the

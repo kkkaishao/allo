@@ -206,6 +206,13 @@ struct MemUnit {
   unsigned portsPerBank = 2;
   MemoryImplEnum impl = MemoryImplEnum::LUTRAM; // resolved storage primitive
 
+  // A read-only constant table (a `memref.get_global` of a `memref.global`):
+  // the emitter realizes it as a combinational `hw.aggregate_constant` indexed
+  // by `hw.array_get` (registered to the read latency), not a writable hlmem.
+  // `romInit` is the global's `initial_value` (a DenseElementsAttr).
+  bool isRom = false;
+  Attribute romInit;
+
   /// One bound access. A read's loaded data is referenced by
   /// Source{Mem, id, <index of this access>}; a write consumes `data`.
   struct Access {

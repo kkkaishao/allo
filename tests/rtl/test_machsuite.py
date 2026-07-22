@@ -9,8 +9,7 @@ then drives the emitted RTL against a NumPy golden with cosim. Problem sizes are
 kept small so cosim stays fast; the scheduling properties do not depend on the
 size, only the total latency does -- which is left unpinned. An array return has
 no hardware meaning, so a kernel that returns one is re-stated with an explicit
-out-parameter. `kmp` is schedule-only: its while condition reads memory, which
-the datapath emitter does not yet lower.
+out-parameter. `kmp`'s while conditions read memory and drive end to end.
 """
 
 import os
@@ -19,13 +18,13 @@ import sys
 
 sys.path.insert(0, os.path.dirname(__file__))
 
-import numpy as np  # noqa: E402
-import pytest  # noqa: E402
+import numpy as np
+import pytest
 
-import allo  # noqa: E402
-from allo import kernel  # noqa: E402
-from allo.lang import i32, f32, f64, u8, index  # noqa: E402
-from tests.rtl._common import (  # noqa: E402
+import allo
+from allo import kernel
+from allo.lang import i32, f32, f64, u8, index
+from tests.rtl._common import (
     _sched,
     _to_rtl,
     _iis,
@@ -473,15 +472,15 @@ def test_dynamic_programming():
 def test_while_loops():
     """A data-dependent `while` schedules as a conditional (flushing) pipeline and
     leaves the latency unknown; no raw scf.while survives into the DCP IR. kmp
-    (schedule-only) nests two backtracking whiles whose conditions read memory --
-    not yet emittable. bfs_queue's uncounted `while front != rear` over a modulo
-    ring buffer scatters into `level`/`level_counts`/`queue` at data-dependent
-    addresses and drives correctly end to end."""
+    nests two backtracking whiles whose conditions read memory, and drives end to
+    end. bfs_queue's uncounted `while front != rear` over a modulo ring buffer
+    scatters into `level`/`level_counts`/`queue` at data-dependent addresses and
+    drives correctly end to end."""
     P, S = 4, 8
 
     # kmp: two data-dependent while loops (failure-function backtracking) nested in
     # counted for loops. The while conditions read `pattern[k]`/`pattern[q]` at a
-    # data-dependent index, so this schedules but does not emit.
+    # data-dependent index (a memory-dependent continue-test).
     @kernel
     def kmp(pattern: u8[P], input_str: u8[S], kmp_next: u8[P], matches: u8[1]):
         k: index = 0
@@ -506,6 +505,39 @@ def test_while_loops():
     res = _sched(kmp)
     assert res.func("kmp").latency is None  # data-dependent while trips
     assert len([r for r in res.cyclic() if r.conditional]) == 2  # both whiles
+
+    # A small-alphabet input with a repeated prefix makes the failure-function
+    # backtracking whiles actually iterate (k/q backtrack through kmp_next) rather
+    # than exiting immediately.
+    def kmp_golden(pattern, input_str):
+        kmp_next = np.zeros(P, np.uint8)
+        k = 0
+        for x in range(1, P):
+            while k > 0 and pattern[k] != pattern[x]:
+                k = int(kmp_next[k - 1])
+            if pattern[k] == pattern[x]:
+                k += 1
+            kmp_next[x] = k
+        q = matches = 0
+        for i in range(S):
+            while q > 0 and pattern[q] != input_str[i]:
+                q = int(kmp_next[q - 1])
+            if pattern[q] == input_str[i]:
+                q += 1
+            if q >= P:
+                matches += 1
+                q = int(kmp_next[q - 1])
+        return kmp_next, matches
+
+    pat = np.array([0, 0, 1, 0], np.uint8)  # failure fn [0,1,0,1]; while backtracks
+    inp = np.array([0, 0, 1, 0, 0, 0, 1, 0], np.uint8)
+    gnext, gmatch = kmp_golden(pat, inp)
+    assert (gnext > 0).any()  # the mem-condition while actually ran
+    knext = np.zeros(P, np.uint8)
+    matches = np.zeros(1, np.uint8)
+    _to_rtl(kmp).cosim(pat.copy(), inp.copy(), knext, matches)
+    assert np.array_equal(knext, gnext)
+    assert int(matches[0]) == gmatch
 
     # bfs_queue: an uncounted `while front != rear` whose body holds a nested
     # data-dependent `for e` carrying the queue tail as an iter-arg. The scatter
@@ -597,6 +629,90 @@ def test_while_loops():
     rtl.cosim(nodes, edges, np.int32(0), level, level_counts)
     assert np.array_equal(level, gl)
     assert np.array_equal(level_counts, gc)
+
+
+def test_fft_strided():
+    """A radix-2 strided FFT over a power-of-two transform: an outer `while` over
+    the stage span and an inner `while` over the butterfly index, a
+    double-precision butterfly, and a twiddle-factor guard. Both while conditions
+    are loop-carried scalar comparisons, so the whole-kernel latency is not
+    statically known. Driven against a NumPy reference."""
+    N = 8
+    H = N // 2
+
+    @kernel
+    def fft(real: f64[N], img: f64[N], real_twid: f64[H], img_twid: f64[H]):
+        span: i32 = N >> 1
+        log: i32 = 0
+        even: i32 = 0
+        odd: i32 = 0
+        rootindex: i32 = 0
+        temp: f64 = 0.0
+        while span > 0:
+            odd = span
+            while odd < N:
+                odd |= span
+                even = odd ^ span
+                temp = real[even] + real[odd]
+                real[odd] = real[even] - real[odd]
+                real[even] = temp
+                temp = img[even] + img[odd]
+                img[odd] = img[even] - img[odd]
+                img[even] = temp
+                rootindex = (even << log) & (N - 1)
+                if rootindex > 0:
+                    temp = (
+                        real_twid[rootindex] * real[odd]
+                        - img_twid[rootindex] * img[odd]
+                    )
+                    img[odd] = (
+                        real_twid[rootindex] * img[odd]
+                        + img_twid[rootindex] * real[odd]
+                    )
+                    real[odd] = temp
+                odd += 1
+            span >>= 1
+            log += 1
+
+    res = _sched(fft)
+    assert res.func("fft").latency is None  # data-dependent while trips
+    assert any(r.conditional for r in res.cyclic())  # the while regions
+
+    def fft_golden(real, img, rt, it):
+        span = N >> 1
+        log = 0
+        while span > 0:
+            odd = span
+            while odd < N:
+                odd |= span
+                even = odd ^ span
+                temp = real[even] + real[odd]
+                real[odd] = real[even] - real[odd]
+                real[even] = temp
+                temp = img[even] + img[odd]
+                img[odd] = img[even] - img[odd]
+                img[even] = temp
+                ri = (even << log) & (N - 1)
+                if ri > 0:
+                    temp = rt[ri] * real[odd] - it[ri] * img[odd]
+                    img[odd] = rt[ri] * img[odd] + it[ri] * real[odd]
+                    real[odd] = temp
+                odd += 1
+            span >>= 1
+            log += 1
+
+    rng = np.random.default_rng(1)
+    real = rng.standard_normal(N)
+    img = rng.standard_normal(N)
+    idx = np.arange(H)
+    rt = np.cos(2.0 * np.pi * idx / N)
+    it = np.sin(2.0 * np.pi * idx / N)
+    gr, gi = real.copy(), img.copy()
+    fft_golden(gr, gi, rt, it)
+    cr, ci = real.copy(), img.copy()
+    _to_rtl(fft).cosim(cr, ci, rt.copy(), it.copy())
+    assert np.allclose(cr, gr, rtol=1e-9, atol=1e-9)
+    assert np.allclose(ci, gi, rtol=1e-9, atol=1e-9)
 
 
 def test_grid_parallel():

@@ -7,6 +7,7 @@
 
 #include "allo/IR/AlloOps.h"
 #include "allo/Scheduling/Footprint.h"
+#include "allo/Scheduling/OperatorLibrary.h"
 #include "allo/Scheduling/Scheduler.h"
 
 #include "mlir/Dialect/Affine/Analysis/AffineAnalysis.h"
@@ -207,6 +208,25 @@ bool whileHasIdentityForwarding(scf::WhileOp w) {
     if (arg != before.getArgument(i))
       return false;
   return true;
+}
+
+bool conditionIsCombinational(scf::WhileOp w, const OperatorLibrary &lib) {
+  // The continue-test is settled the cycle the loop issues iff every op in its
+  // cone is 0-latency: no multi-cycle memory read and no latency IP (a float
+  // compare / float arithmetic). A single non-zero-latency op makes it wait, so
+  // the while must run the sequential CHECK/RUN controller instead of a
+  // flushing pipeline. The before region is the cone (identity forwarding
+  // leaves it computing only the condition); its `scf.condition` terminator is
+  // a pure wire.
+  bool comb = true;
+  Operation *term = w.getConditionOp().getOperation();
+  w.getBefore().walk([&](Operation *op) {
+    if (op == term || lib.lookup(op).latency == 0)
+      return WalkResult::advance();
+    comb = false;
+    return WalkResult::interrupt();
+  });
+  return comb;
 }
 
 template <class ProblemT>

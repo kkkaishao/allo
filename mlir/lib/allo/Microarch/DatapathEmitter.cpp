@@ -275,6 +275,27 @@ void DatapathEmitter::createInternalMemories() {
   for (const uarch::MemUnit &m : dp.mems) {
     if (m.external)
       continue;
+    if (m.isRom) {
+      // A constant table: one hw.aggregate_constant holding the global's
+      // initializer, read combinationally by hw.array_get (registered to the
+      // read latency in emitInternalReads). No writable hlmem, no write ports.
+      assert(m.numBanks == 1 && "a banked ROM is not supported");
+      auto data = cast<ElementsAttr>(m.romInit);
+      IntegerType elemTy = memElemType(m, c.b);
+      SmallVector<Attribute> fields;
+      fields.reserve(m.depthWords);
+      for (const APInt &v : data.getValues<APInt>())
+        fields.push_back(
+            IntegerAttr::get(elemTy, v.zextOrTrunc(elemTy.getWidth())));
+      // A hw.array indexes element 0 as the LAST aggregate_constant field, so
+      // the natural-order initializer is reversed to make array_get(i) ==
+      // data[i].
+      std::reverse(fields.begin(), fields.end());
+      auto arrTy = hw::ArrayType::get(elemTy, m.depthWords);
+      romArray[m.id] = hw::AggregateConstantOp::create(
+          c.b, c.loc, arrTy, c.b.getArrayAttr(fields));
+      continue;
+    }
     if (m.numBanks > 1) {
       // The emitter crossbar handles a 1-D power-of-two cyclic partition; block
       // / multi-dim / external banking are not supported.
@@ -327,8 +348,22 @@ void DatapathEmitter::emitInternalReads(const uarch::RegionBlock &rb) {
   for (const uarch::MemUnit &m : dp.mems) {
     if (m.external)
       continue;
-    ArrayRef<Value> banks = memBanks[m.id];
     unsigned lat = memReadLatency(m.impl);
+    if (m.isRom) {
+      // A constant table read: index the aggregate_constant combinationally,
+      // then register to the (scheduled) read latency so timing matches a RAM.
+      Value arr = romArray[m.id];
+      for (unsigned a = 0; a < m.accesses.size(); ++a) {
+        const uarch::MemUnit::Access &acc = m.accesses[a];
+        if (acc.isWrite || acc.region != rb.id)
+          continue; // (a ROM carries no writes)
+        Value idx = memAddr(m, computeAddr(m, acc));
+        Value elem = c.R(hw::ArrayGetOp::create(c.b, c.loc, arr, idx));
+        readData[accKey(m.id, a)] = lat ? c.shiftChain(elem, lat).last() : elem;
+      }
+      continue;
+    }
+    ArrayRef<Value> banks = memBanks[m.id];
     for (unsigned a = 0; a < m.accesses.size(); ++a) {
       const uarch::MemUnit::Access &acc = m.accesses[a];
       if (acc.isWrite || acc.region != rb.id)
@@ -522,6 +557,58 @@ void DatapathEmitter::emitCombUnits(const uarch::RegionBlock &rb) {
   }
 }
 
+// The condition cone of a sequential (CHECK/RUN) while: emit the container's
+// OWN condition memory reads plus its combinational compute, and return the
+// settled condition value + its ready latency t_cond. Unlike a leaf region's
+// `emit`, there is no per-iteration issue pulse -- the read address is the
+// frozen iter-arg survivor, so the load is a continuous read of a stable
+// element and its data is a stable wire from `checkStart + t_cond` onward (the
+// survivors do not advance until after the body drains, which is after CHECK
+// decides). A combinational condition has no read, so this reduces to
+// `emitCombUnits` with t_cond == 0.
+std::pair<Value, unsigned>
+DatapathEmitter::emitConditionRegion(const uarch::RegionBlock &rb,
+                                     const uarch::Source &condSrc) {
+  // Same ordering as a leaf region's `emit`: shift-register chains first (a
+  // compound condition delays an earlier-stage value into a later-stage
+  // consumer, e.g. `k>0` at stage 0 feeding an `and` at stage 1), then unit
+  // output backedges (a load address may reference an index_cast unit; a
+  // compare references its input read), the internal reads (their seq.read
+  // address may reference a unit/reg -- RAUW-safe, a real IR operand), the
+  // units (filling the backedges; they may tap the register chains), the
+  // register-chain heads, and finally the *external* read addresses. A
+  // container has no per-iteration recurrence in its condition cone, so
+  // `emitUnits`' reduction-identity re-injection is inert (every inputInit is
+  // None) -- it never touches the (absent) counter.
+  emitRegisters(rb);
+  declareUnits(rb);
+  emitInternalReads(rb);
+  emitExternalReads(rb);
+  emitUnits(rb);
+  resolveRegHeads(rb);
+  // Unbanked / statically-banked external (argument-array) condition reads:
+  // drive the read-address port with the survivor-addressed element (its data
+  // port is bound module-scope by bindReadPorts). Driven AFTER emitUnits --
+  // like emitAccesses' read half -- so the address resolves to the filled unit
+  // value, not a backedge placeholder: `pa.setOutput` records the value in the
+  // port accessor's side table, which a later backedge RAUW (an IR-operand
+  // rewrite) would not update, so an unfilled backedge here would dangle into
+  // hw.output.
+  for (unsigned i = 0; i < reads.size(); ++i) {
+    const uarch::MemUnit &m = dp.mems[reads[i].mem];
+    const uarch::MemUnit::Access &acc = m.accesses[reads[i].idx];
+    if (acc.region != rb.id)
+      continue;
+    ExternalBanking eb = externalBank(m, acc);
+    if (eb.factor > 1 && !eb.bank)
+      continue; // data-dependent: emitExternalReads drove it
+    Value flat = computeAddr(m, acc);
+    Value off = eb.factor > 1 ? splitBank(c, flat, eb.factor).offset : flat;
+    pa.setOutput(iface::addr(memPortBase(dp, reads, i, "rd")), off);
+  }
+  return {resolveSource(condSrc), readyCycle(condSrc)};
+}
+
 // Resolve region \p rb's register head inputs now that its units exist.
 void DatapathEmitter::resolveRegHeads(const uarch::RegionBlock &rb) {
   for (uarch::RegId rid : rb.regs)
@@ -556,12 +643,29 @@ DatapathFeedback DatapathEmitter::emitAccesses(const uarch::RegionBlock &rb,
                    extAddr(m, acc));
   }
   DatapathFeedback fb;
+  // A store's write-enable is the issue pulse delayed to the store's stage. In
+  // a leaf `while` (flushing pipeline) the doomed exit iteration is still
+  // issued, so its store must be suppressed: gate the enable by the
+  // combinational continue-condition -- `issue & cond`, the same commit pulse
+  // captureWhileResults advances the loop-carried registers with. (Container /
+  // guard stores live in child regions gated structurally by not-issuing, so
+  // this only touches a leaf while; the condition is combinational here,
+  // checked before emit.) Lazy: a store-less while adds no logic.
+  Value gatedIssue;
+  auto commitPulse = [&]() -> Value {
+    if (!rb.conditional)
+      return issue;
+    if (!gatedIssue)
+      gatedIssue = c.andBits(
+          issue, resolveSource(dp.carryInfo.find(rb.id)->second.condition));
+    return gatedIssue;
+  };
   for (unsigned i = 0; i < writes.size(); ++i) {
     const uarch::MemUnit &m = dp.mems[writes[i].mem];
     const uarch::MemUnit::Access &acc = m.accesses[writes[i].idx];
     if (acc.region != ridx)
       continue;
-    Value we = c.activationPulse(issue, acc.op);
+    Value we = c.activationPulse(commitPulse(), acc.op);
     Value addr = extAddr(m, acc), data = resolveSource(acc.data);
     ExternalBanking eb = externalBank(m, acc);
     // A data-dependent write drives every bank interface; its runtime bank
@@ -589,7 +693,7 @@ DatapathFeedback DatapathEmitter::emitAccesses(const uarch::RegionBlock &rb,
       const uarch::MemUnit::Access &acc = m.accesses[a];
       if (!acc.isWrite || acc.region != ridx)
         continue;
-      Value we = c.activationPulse(issue, acc.op);
+      Value we = c.activationPulse(commitPulse(), acc.op);
       Value flat = computeAddr(m, acc), data = resolveSource(acc.data);
       auto wlat = c.b.getI64IntegerAttr(1);
       if (banks.size() == 1) {

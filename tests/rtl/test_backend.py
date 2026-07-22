@@ -19,9 +19,9 @@ import pytest
 
 import allo
 from allo import kernel
-from allo.lang import i32, f32, bf16, index, Stream
+from allo.lang import i32, f32, bf16, u8, index, Stream
 from allo.schedule import Schedule
-from _common import (  # noqa: E402
+from _common import (
     _sched,
     _to_rtl,
     _latency,
@@ -167,6 +167,44 @@ def test_scalar_recurrences():
 
 
 A8 = (np.arange(8, dtype=np.int32) * 7 + 13) & 0xFF
+
+
+def test_constant_rom_cosim():
+    """A constant-initialized local array lowers to a read-only ROM -- a
+    module-level `memref.global` referenced by `memref.get_global` -- realized as
+    an indexed constant table rather than a writable on-chip buffer. Covers a byte
+    table read in a loop under a data-dependent index, and a wider (i32) table of
+    non-power-of-two length read by a scalar index."""
+
+    TBL = [10, 20, 30, 40, 50, 60, 70, 80]
+
+    @kernel
+    def table_lookup(A: u8[16], out: u8[16]):
+        tbl: u8[8] = [10, 20, 30, 40, 50, 60, 70, 80]
+        for i in range(16):
+            idx: index = A[i] % 8
+            out[i] = tbl[idx]
+
+    m = _to_rtl(table_lookup)
+    assert "hw.aggregate_constant" in m.mlir  # a ROM, not a writable hlmem
+    A = np.arange(16, dtype=np.uint8) * 5 + 1
+    out = np.zeros(16, np.uint8)
+    m.cosim(A, out)
+    assert np.array_equal(out, np.array(TBL, np.uint8)[A % 8])
+
+    SQ = [i * i for i in range(12)]
+
+    @kernel
+    def square_table(x: i32, out: i32[1]):
+        sq: i32[12] = [0, 1, 4, 9, 16, 25, 36, 49, 64, 81, 100, 121]
+        idx: index = x
+        out[0] = sq[idx]
+
+    m = _to_rtl(square_table)
+    out = np.zeros(1, np.int32)
+    for x in (0, 3, 7, 11):
+        m.cosim(np.int32(x), out)
+        assert out[0] == SQ[x]
 
 
 def test_banked_internal_buffer():
@@ -1409,7 +1447,7 @@ def test_mixed_container_internal_buffer_call():
             out[i] = C[i] * 2
 
     rtl = _to_rtl(ib_top)
-    assert "allo.dcp.instance @ib_top.ib_child" in rtl.dcp  # a scheduled call node
+    assert "dcp.instance @ib_top.ib_child" in rtl.dcp  # a scheduled call node
     assert "hw.instance" in rtl.mlir  # instantiated in the container's module
     assert "seq.hlmem" in rtl.mlir  # the shared buffers, on-chip
     A = np.arange(1, 17, dtype=np.int32)
@@ -1479,7 +1517,7 @@ def test_mixed_container_scalar_result_handoff():
     A = np.arange(16, dtype=np.int32)
     out = np.zeros(16, dtype=np.int32)
     rtl = _to_rtl(sh_top)
-    assert "allo.dcp.instance" in rtl.dcp
+    assert "dcp.instance" in rtl.dcp
     r = rtl.cosim(A, out)
     assert r.cycles > 0
     s = int((A + 1).sum())
@@ -2642,7 +2680,7 @@ def test_dataflow_predicated_stream_access():
     # The put carries a predicate (`... if %c`), the loop pipelines at II=1, and
     # no guard (dcp.select) / raw scf.if is left.
     assert "allo.stream.put" in mod.dcp and "if %" in mod.dcp
-    assert "scf.if" not in mod.dcp and "allo.dcp.select" not in mod.dcp
+    assert "scf.if" not in mod.dcp and "dcp.select" not in mod.dcp
     assert _iis(res.func("pp_prod").cyclic()) == [1]
     assert not any(r.kind == "guard" for r in res.funcs[0].regions)
 
@@ -3243,7 +3281,7 @@ def test_while_scheduling():
     loop = mod.schedule().cyclic()[0]
     assert loop.conditional is True
     assert loop.latency is None
-    assert "allo.dcp.condition" in mod.dcp  # reified while terminator
+    assert "dcp.condition" in mod.dcp  # reified while terminator
 
 
 def test_while_flushing_pipeline_cosim():
@@ -3312,13 +3350,93 @@ def test_while_multistage_flush_cosim():
         assert out[0] == int(A[:n0].sum())
 
 
-def test_while_unsupported_shapes_reject_cleanly():
-    # A combinational-condition while (leaf or a nested sequential wrapper) lowers;
-    # a *memory-dependent* condition still lands at a later stage (the gate would
-    # sample it stale), so it is deferred -- and must surface a clean emit error,
-    # not a crash / silent miscompile.
+def test_while_in_loop_store_cosim():
+    # A leaf flushing-while that writes memory in its body. The doomed exit
+    # iteration is issued but must commit nothing: emitAccesses gates each store's
+    # write-enable by the continue-condition (`issue & cond`), the same rule the
+    # loop-carried survivors follow. Covers a single-stage store, a multi-stage
+    # store fed by an in-loop carried scalar (deeper drain), and the zero-trip
+    # case (no write). Unwritten output elements read back as the memory init (0).
+    N = 32
+
     @kernel
-    def wmem(A: i32[16], out: i32[1]):  # memory-dependent condition (schedT > 0)
+    def wstore(A: i32[N], B: i32[N], n0: i32):  # write-once per iteration
+        x: i32 = n0
+        while x > 0:
+            B[x - 1] = A[x - 1] * 2
+            x = x - 1
+
+    @kernel
+    def wscan(A: i32[N], B: i32[N], n0: i32):  # store the running prefix sum
+        x: i32 = n0
+        acc: i32 = 0
+        while x > 0:
+            acc = acc + A[x - 1]
+            B[x - 1] = acc
+            x = x - 1
+
+    ma, mb = _to_rtl(wstore), _to_rtl(wscan)
+    assert ma.schedule().cyclic()[0].conditional and "dcp.condition" in ma.dcp
+    A = (np.arange(N, dtype=np.int32) * 3 + 1) & 0xFF
+    for n0 in (0, 1, 7, N):
+        B = np.zeros(N, np.int32)
+        ma.cosim(A, B, np.int32(n0))
+        gold = np.zeros(N, np.int32)
+        gold[:n0] = A[:n0] * 2
+        assert np.array_equal(B, gold)
+
+        B = np.zeros(N, np.int32)
+        mb.cosim(A, B, np.int32(n0))
+        gold = np.zeros(N, np.int32)
+        gold[:n0] = np.cumsum(A[:n0][::-1])[::-1]  # acc counts x down from n0
+        assert np.array_equal(B, gold)
+
+
+def test_while_mem_condition_cosim():
+    """A `while` loop whose continue-condition reads memory (`A[i] != key`): the
+    loop index advances until the searched element is found, and the loop-carried
+    value is read after the loop. Covers a single-value carry, a two-value carry
+    (the index and a step counter), and a zero-iteration exit (the condition false
+    on entry)."""
+    A = np.arange(16, dtype=np.int32)  # A[i] == i, so the found index equals key
+
+    @kernel
+    def linsearch(A: i32[16], key: i32, out: i32[1]):
+        i: i32 = 0
+        while A[i] != key:
+            i = i + 1
+        out[0] = i
+
+    out = np.zeros(1, np.int32)
+    _to_rtl(linsearch).cosim(A, np.int32(11), out)
+    assert out[0] == 11
+
+    @kernel
+    def search_steps(A: i32[16], key: i32, out: i32[1]):
+        i: i32 = 0
+        c: i32 = 0
+        while A[i] != key:
+            i = i + 1
+            c = c + 1
+        out[0] = c
+
+    out = np.zeros(1, np.int32)
+    _to_rtl(search_steps).cosim(A, np.int32(9), out)
+    assert out[0] == 9
+
+    # A[0] == key: the condition is false on entry, so the body never runs and the
+    # carried index holds its initial value.
+    out = np.full(1, 999, np.int32)
+    _to_rtl(linsearch).cosim(A, np.int32(0), out)
+    assert out[0] == 0
+
+
+def test_while_mem_condition_shared_array_cosim():
+    # A while loop that reads the same array in BOTH its continue-condition
+    # (`A[i] > 0`) and its body (`s += A[i]`). Each access is a distinct memory
+    # read, so the condition and the body do not contend for a port.
+    @kernel
+    def wmem(A: i32[16], out: i32[1]):
         i: index = 0
         s: i32 = 0
         while A[i] > 0:
@@ -3326,8 +3444,63 @@ def test_while_unsupported_shapes_reject_cleanly():
             i = i + 1
         out[0] = s
 
-    with pytest.raises(Exception, match="not yet lowered"):
-        _to_rtl(wmem).compile()
+    A = np.array([5, 3, 8, 2, 0] + [9] * 11, dtype=np.int32)  # sentinel 0 at idx 4
+    out = np.zeros(1, np.int32)
+    _to_rtl(wmem).cosim(A, out)
+    assert out[0] == 5 + 3 + 8 + 2  # sum until A[4] == 0 stops the loop
+
+
+def test_while_ip_condition_cosim():
+    """A `while` whose continue-condition is a multi-cycle floating-point
+    operation rather than a memory read. The loop iterates until the float
+    condition settles false; the body advances a float-carried value. Covers a
+    single float comparison (`r > tol`) and a float subtraction feeding a
+    comparison (`x - b > 0`), the latter a multi-stage condition cone. The
+    condition is not settled in the issue cycle, so the loop runs sequentially
+    (a conditional region) rather than as a flushing pipeline."""
+
+    @kernel
+    def fconverge(x: f32, tol: f32, out: f32[1]):
+        r: f32 = x
+        while r > tol:
+            r = r * 0.5
+        out[0] = r
+
+    mod = _to_rtl(fconverge)
+    assert mod.schedule().cyclic()[0].conditional
+    assert "hw.module.extern @fcmp" in mod.mlir
+
+    def gold_halve(x, tol):
+        r = np.float32(x)
+        while r > np.float32(tol):
+            r = np.float32(r * np.float32(0.5))
+        return r
+
+    for x, tol in [(100.0, 1.0), (7.0, 1.0), (0.5, 1.0)]:  # last exits on entry
+        out = np.zeros(1, np.float32)
+        mod.cosim(np.float32(x), np.float32(tol), out)
+        assert out[0] == gold_halve(x, tol)
+
+    @kernel
+    def fcountdown(a: f32, b: f32, out: f32[1]):
+        x: f32 = a
+        while x - b > 0.0:
+            x = x - 1.0
+        out[0] = x
+
+    mod = _to_rtl(fcountdown)
+    assert mod.schedule().cyclic()[0].conditional
+
+    def gold_count(a, b):
+        x = np.float32(a)
+        while np.float32(x - np.float32(b)) > np.float32(0.0):
+            x = np.float32(x - np.float32(1.0))
+        return x
+
+    for a, b in [(10.0, 2.5), (5.0, 5.0), (3.0, 0.0)]:  # middle exits on entry
+        out = np.zeros(1, np.float32)
+        mod.cosim(np.float32(a), np.float32(b), out)
+        assert out[0] == gold_count(a, b)
 
 
 def test_nested_while_cosim():
@@ -3436,7 +3609,7 @@ def test_while_with_nested_while():
     # Both whiles close: the inner -> flushing pipeline, the outer -> sequential
     # while dcp.pipeline wrapping it. No raw scf.while; two dcp.condition ends.
     assert "scf.while" not in mod.dcp
-    assert mod.dcp.count("allo.dcp.condition") == 2
+    assert mod.dcp.count("dcp.condition") == 2
 
 
 # --- allo.assume hints -----------------------------------------------------

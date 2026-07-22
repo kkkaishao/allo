@@ -18,6 +18,7 @@
 
 #include "mlir/Dialect/Arith/IR/Arith.h" // arith::CmpIPredicate (cmpi predicate)
 #include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/Dialect/MemRef/IR/MemRef.h" // memref::GlobalOp (constant ROM)
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "llvm/ADT/StringMap.h"
@@ -26,6 +27,7 @@
 
 using namespace mlir;
 using namespace mlir::allo;
+using namespace mlir::allo::logging;
 using namespace circt;
 
 #define DEBUG_TYPE "hw-emitter"
@@ -898,18 +900,23 @@ Value HWEmitter::emitConditionalContainer(const uarch::RegionBlock &rb,
   SmallVector<Backedge> nextBE =
       setupCarriedIterArgs(rb, wi.inits, start, advanceEdge);
 
-  // Emit the container's own combinational units -- the continue-condition tree
-  // over the iter-arg survivors just set up -- so it resolves as a
-  // Source::Unit.
-  datapath.emitCombUnits(rb);
-  // The combinational continue-condition over the iter-arg registers.
-  Value cond = datapath.resolveSource(wi.condition);
-
-  // CHECK pulse: one cycle after `start` or after each outer-iteration drain,
-  // when the iter-arg registers have settled. Start the children only if the
-  // condition holds; otherwise the container completes this cycle.
-  Value checkTime = ctx.reg(ctx.orBits(start, advanceEdge), ctx.f1);
-  auto [child0Start, donePulse] = ctx.branchPulse(checkTime, cond);
+  // CHECK-start pulse: one cycle after `start` or after each outer-iteration
+  // drain, when the iter-arg survivor registers have settled. The condition
+  // cone reads those (frozen) survivors, so it launches here.
+  Value checkStart = ctx.reg(ctx.orBits(start, advanceEdge), ctx.f1);
+  // Emit the condition cone (the container's own reads + combinational compute)
+  // and get the continue-condition value + its ready latency t_cond. A
+  // combinational condition has t_cond == 0 (the CHECK decides in-cycle, as
+  // before); a memory-/IP-dependent condition lands t_cond cycles after
+  // CHECK-start, so the decision WAITS for it -- the whole point of the
+  // sequential CHECK/RUN regime. The survivors do not advance until the body
+  // drains (after `child0Start`), so the cone's inputs are stable across the
+  // wait.
+  auto [cond, tCond] = datapath.emitConditionRegion(rb, wi.condition);
+  Value condValid = ctx.delayValid(checkStart, tCond);
+  // Start the children only if the condition holds when it settles; otherwise
+  // the container completes this cycle.
+  auto [child0Start, donePulse] = ctx.branchPulse(condValid, cond);
 
   // Sequence the children within one outer iteration; the last child's drain
   // edge advances the iter-args (resolving the survivor next-values) and drives
@@ -1052,48 +1059,47 @@ static LogicalResult validateDatapath(func::FuncOp func,
         !rb.tripCount && !rb.ubSource)
       return func.emitError("allo-datapath-to-hw: cyclic region needs a "
                             "constant or dynamic trip");
-  // A while / guard condition is read the cycle the region issues (a while's
-  // flushing controller / the container CHECK-RUN FSM) or when a guard is
-  // CHECKed, so it must be settled in-cycle. The reifier reifies every liftable
-  // condition into a start-0 `dcp.compute` (a leaf while / sequential-wrapper
-  // while over the iter-args, an affine guard over the counter), and an scf
-  // guard's predicate is a scheduled prologue survivor (valid at the region
-  // start); one rule covers all three. A memory-/IP-dependent condition either
-  // lands at a later stage (a Unit with schedT > 0) or was left raw (None --
-  // the reifier declines to lift an impure tree), so the gate would sample a
-  // stale value -- rejected. A leaf while's multi-*stage body* is still fine (a
-  // load pushes a carried next-value to stage 1; captureWhileResults drains
-  // it); only the condition itself must be combinational.
-  auto combinationalCond = [&](const uarch::Source &s) {
+  // When and how the condition is read decides how settled it must be:
+  //   * a flushing leaf while (rb.children empty) samples it the cycle it
+  //   issues,
+  //     and a guard samples it the cycle it is CHECKed -- both in-cycle, so the
+  //     condition must be a stage-0 Unit or a settled prologue Survivor;
+  //   * a sequential CHECK/RUN while (rb.children non-empty -- a container or a
+  //     wrapped-body leaf) WAITS `t_cond` cycles for the condition
+  //     (emitConditionRegion + delayValid) before deciding, so a multi-stage
+  //     (memory-/IP-dependent) Unit condition is fine there.
+  // A None condition (the reifier left an unschedulable tree raw) is always
+  // rejected. A leaf while's multi-*stage body* is independently fine (a load
+  // pushes a carried next-value to a later stage; captureWhileResults drains
+  // it).
+  auto conditionOk = [&](const uarch::Source &s, bool sequential) {
     switch (s.kind) {
     case uarch::Source::Kind::Survivor:
       return true; // a scheduled prologue predicate, valid at the region start
     case uarch::Source::Kind::Unit:
-      return schedT(dp.units[s.id].boundOps.front().first) == 0;
+      return sequential || schedT(dp.units[s.id].boundOps.front().first) == 0;
     default:
-      return false; // None (raw / unliftable) or a memory-/IP-dependent
-                    // producer
+      return false; // None (raw / unliftable)
     }
   };
   for (const uarch::RegionBlock &rb : dp.regions) {
     if (rb.conditional &&
-        !combinationalCond(dp.carryInfo.find(rb.id)->second.condition))
+        !conditionOk(dp.carryInfo.find(rb.id)->second.condition,
+                     /*sequential=*/!rb.children.empty()))
       return func.emitError("allo-datapath-to-hw: a while loop with a non-"
                             "combinational (memory-/IP-dependent) condition is "
                             "not yet lowered");
-    if (rb.guard &&
-        !combinationalCond(dp.guardCond.find(rb.id)->second.condition))
+    if (rb.guard && !conditionOk(dp.guardCond.find(rb.id)->second.condition,
+                                 /*sequential=*/false))
       return func.emitError("allo-datapath-to-hw: a guard with a "
                             "non-combinational predicate is not yet lowered");
   }
-  // A while region's loop-carried results become frozen survivor registers; an
-  // in-loop store would commit at the exit iteration too (the store-enable is
-  // not condition-gated), so reject one.
-  for (const uarch::MemUnit &m : dp.mems)
-    for (const uarch::MemUnit::Access &acc : m.accesses)
-      if (acc.isWrite && dp.regions[acc.region].conditional)
-        return func.emitError("allo-datapath-to-hw: a while loop with an "
-                              "in-loop store is not yet lowered");
+  // A leaf `while` with an in-loop store lowers: emitAccesses gates each
+  // store's write-enable by the continue-condition (`issue & cond`), so the
+  // doomed exit iteration commits nothing -- the same non-speculative rule the
+  // loop-carried survivors already follow. (Reaching here, every conditional
+  // region has a combinational condition, checked just above, so the gate is a
+  // valid stage-0 pulse.)
 
   // An unresolved (None) input is a cross-region SSA value hand-off (a scalar
   // produced in one region and consumed in another): build leaves the slot
@@ -1120,15 +1126,20 @@ static LogicalResult validateDatapath(func::FuncOp func,
   // rather than asserting deep in emission.
   for (const uarch::FuncUnit &u : dp.units) {
     if (u.comb) {
-      if (!combEmitted(u.opType))
-        return func.emitError("allo-datapath-to-hw: combinational operator '")
-               << u.opType
-               << "' has no native EmitHW lowering; provide an IP or add "
-                  "native "
-                  "support";
+      if (!combEmitted(u.opType)) {
+        error(Stage::Emit, u.boundOps.back().first)
+            << "Combinational operator '" << u.opType
+            << "' has no native EmitHW "
+               "lowering; provide an IP "
+               "or add native support";
+        return failure();
+      }
     } else if (u.impl.empty()) {
-      return func.emitError("allo-datapath-to-hw: operator '")
-             << u.opType << "' has no IP module realization";
+      error(Stage::Emit, u.boundOps.back().first)
+          << "Operator '" << u.opType
+          << "' has no IP module realization; provide an IP for this operator "
+             "or add native support";
+      return failure();
     }
   }
   // Reject a CallUnit shape the leaf cannot lower, loudly, rather than
@@ -1533,8 +1544,12 @@ LogicalResult emitDatapathToHW(ModuleOp module, StringRef binding,
   if (failed(emitOne(emitOne, topFunc)))
     return failure();
 
+  // cleanup non-hw ops to avoid Verilog export errors
   for (func::FuncOp f : scheduled)
     f.erase();
+  for (memref::GlobalOp g :
+       llvm::make_early_inc_range(module.getOps<memref::GlobalOp>()))
+    g.erase();
   return success();
 }
 

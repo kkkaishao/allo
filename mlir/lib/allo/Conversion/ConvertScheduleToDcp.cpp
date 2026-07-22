@@ -136,6 +136,87 @@ static void scheduleConditionTree(Builder &b, Value cond) {
     tagConditionStartZero(b, cond);
 }
 
+// The ASAP ready cycle of a while continue-condition \p v -- the cycle its
+// settled value is available -- over the cone of loads + arith feeding it. A
+// leaf (block arg / constant / a settled dcp region result) is ready at 0; an
+// already-scheduled op (a flushing leaf while's in-body condition) is trusted
+// verbatim; a load's ready cycle is its indices' ready max + the memref's read
+// latency; an arith op's is its operands' ready max + its op latency. Returns
+// nullopt when the cone holds a shape the sequential CHECK region cannot emit
+// (a store / call / other), so the caller leaves the condition raw for a clean
+// reject. Pure query -- tags nothing.
+static std::optional<int64_t> conditionReadyCycle(Value v,
+                                                  const OperatorLibrary &lib) {
+  if (isa<BlockArgument>(v))
+    return 0;
+  Operation *def = v.getDefiningOp();
+  if (!def)
+    return std::nullopt;
+  if (isa<arith::ConstantOp>(def))
+    return 0;
+  if (isa<DCPathPipelineOp, DCPathSequentialOp, DCPathSelectOp>(def))
+    return 0; // a settled survivor (a preceding region result)
+  if (def->hasAttr(sched::kStartTimeAttr))
+    return i64Attr(def, sched::kStartTimeAttr) +
+           static_cast<int64_t>(lib.lookup(def).latency);
+  if (!isa<AffineLoadOp, memref::LoadOp>(def) &&
+      !isa<arith::ArithDialect>(def->getDialect()))
+    return std::nullopt; // store / call / other -> leave raw (clean reject)
+  int64_t start = 0;
+  for (Value o : def->getOperands()) {
+    if (isa<MemRefType>(o.getType()))
+      continue; // the memref declaration carries no schedule
+    std::optional<int64_t> r = conditionReadyCycle(o, lib);
+    if (!r)
+      return std::nullopt;
+    start = std::max(start, *r);
+  }
+  return start + static_cast<int64_t>(lib.lookup(def).latency);
+}
+
+// Tag each op of the (schedulable) condition cone \p v with an ASAP
+// `kStartTimeAttr` = max(operand ready cycles). So `convertOp` reifies the load
+// at start 0 (its data landing `latency` cycles later) and the compare at start
+// >= that ready cycle: the datapath then derives a non-negative -- here exactly
+// zero -- register depth for the load->compare edge (the emitter reads the
+// stable readData combinationally). Precondition: conditionReadyCycle(v) is
+// non-null. An already-scheduled op is left untouched.
+static int64_t tagConditionCone(Builder &b, Value v,
+                                const OperatorLibrary &lib) {
+  if (isa<BlockArgument>(v))
+    return 0;
+  Operation *def = v.getDefiningOp();
+  if (isa<arith::ConstantOp>(def) ||
+      isa<DCPathPipelineOp, DCPathSequentialOp, DCPathSelectOp>(def))
+    return 0;
+  if (def->hasAttr(sched::kStartTimeAttr))
+    return i64Attr(def, sched::kStartTimeAttr) +
+           static_cast<int64_t>(lib.lookup(def).latency);
+  int64_t start = 0;
+  for (Value o : def->getOperands())
+    if (!isa<MemRefType>(o.getType()))
+      start = std::max(start, tagConditionCone(b, o, lib));
+  def->setAttr(sched::kStartTimeAttr, b.getI64IntegerAttr(start));
+  return start + static_cast<int64_t>(lib.lookup(def).latency);
+}
+
+// Schedule a while's continue-condition so it becomes a resolvable Source, by
+// ASAP-scheduling its cone (each op at the max of its operands' ready cycles):
+// a pure comb tree collapses to all-start-0 (every latency is 0, e.g. a
+// nested-loop / sequential-wrapper while over the iter-args); a memory-/IP-
+// dependent tree gets real per-op starts (a load / float op before the compare)
+// so the sequential CHECK/RUN controller can wait `t_cond` for it -- and a
+// multi-latency cone (`a - b > tol`) then derives non-negative register depths
+// rather than the negative edge a flat start-0 tag would. An unschedulable tree
+// (a store / call / math IP with no library row) stays raw for a clean reject;
+// a flushing leaf while's in-body condition is already scheduled and passes
+// through unchanged.
+static void scheduleWhileCondition(Builder &b, Value cond,
+                                   const OperatorLibrary &lib) {
+  if (conditionReadyCycle(cond, lib))
+    tagConditionCone(b, cond, lib);
+}
+
 //===----------------------------------------------------------------------===//
 // Per-op conversion. The `dcp.operator` symbols are already injected (from the
 // device model), so the reifier only *references* them (the compute IP path) or
@@ -263,8 +344,12 @@ static void convertOp(Operation &op, OpBuilder &b, IRMapping &map,
     cloneKept();
     return;
   }
-  // An internal-buffer allocation is a declaration
-  if (isa<memref::AllocOp, memref::AllocaOp, StreamCreateOp>(&op)) {
+  // An internal-buffer allocation is a declaration; a `memref.get_global` is a
+  // reference to a module-level constant table (a ROM the datapath builder
+  // materializes from the global's initializer), kept verbatim so the loads
+  // that read it still resolve their memref.
+  if (isa<memref::AllocOp, memref::AllocaOp, memref::GetGlobalOp,
+          StreamCreateOp>(&op)) {
     cloneKept();
     return;
   }
@@ -619,11 +704,13 @@ static void materializeWhilePipeline(const RegionInfo &r, scf::WhileOp w,
   }
 
   // A sequential-wrapper while's before-block condition is unscheduled (only
-  // its after-block children were materialized): lift its arith tree to start-0
-  // computes so it becomes a Source::Unit like a leaf while's
-  // (already-scheduled) condition. A leaf while's before-block ops carry real
-  // starts and are skipped.
-  scheduleConditionTree(b, w.getConditionOp().getCondition());
+  // its after-block children were materialized): schedule its cone so it
+  // becomes a Source::Unit. A pure comb condition (over the iter-args) lifts to
+  // start-0 computes; a memory-/IP-dependent condition is ASAP-scheduled (load
+  // before compare) so the sequential CHECK/RUN controller can wait `t_cond`
+  // for it. A leaf while's before-block ops carry real starts and pass through
+  // unchanged.
+  scheduleWhileCondition(b, w.getConditionOp().getCondition(), lib);
 
   b.setInsertionPointToEnd(blk);
   for (Operation &op : before.without_terminator())
@@ -740,7 +827,7 @@ static void materializeSequential(const RegionInfo &r,
                                   const OperatorLibrary &lib, bool container) {
   auto isDecl = [](Operation *op) {
     return isa<arith::ConstantOp, memref::AllocOp, memref::AllocaOp,
-               StreamCreateOp>(op);
+               memref::GetGlobalOp, StreamCreateOp>(op);
   };
   SmallVector<Operation *> body;
   for (Operation *op : ops)
@@ -974,19 +1061,23 @@ struct Reifier {
     if (isa<AffineForOp, scf::ForOp>(anchor)) {
       materializeCountedLoop(cast<LoopLikeOpInterface>(anchor));
     } else if (auto w = dyn_cast<scf::WhileOp>(anchor)) {
-      if (hasNestedLoop(w)) {
-        // A while with a nested loop cannot flush-pipeline (the recurrence
-        // threads the inner loop, so its per-iteration length is
-        // data-dependent): materialize the after-block into dcp regions, then
-        // close the while into a SEQUENTIAL while dcp.pipeline -- the same
-        // merged-body reify, with `ii` unset (no static II). The merge needs
-        // identity forwarding; a non-identity while is left raw (rare).
+      if (hasNestedLoop(w) || !conditionIsCombinational(w, lib)) {
+        // A while that cannot flush-pipeline -- it nests a loop (per-iteration
+        // length data-dependent) or its continue-condition is not combinational
+        // (a memory read or a latency IP, not settled at issue) -- is lowered
+        // to the sequential CHECK/RUN controller: materialize the after-block
+        // (the body) into dcp child regions, then close the while into a
+        // SEQUENTIAL while dcp.pipeline (`ii` unset). A straight-line body
+        // becomes one acyclic dcp.sequential child. The merge needs identity
+        // forwarding; a non-identity while is left raw (rare). The
+        // `conditionIsCombinational` predicate matches the scheduler's routing
+        // site.
         materializeBlock(w.getAfter().front());
         if (whileHasIdentityForwarding(w))
           materializeWhilePipeline(RegionInfo{}, w, lib);
       } else {
-        // A straight-line while became a flushing pipeline (ii from
-        // descriptor).
+        // A straight-line while with a combinational condition
+        // flushing-pipelines (ii from its descriptor).
         materializeWhilePipeline(infoFor(firstRegionId(anchor)), w, lib);
       }
     } else if (isa<scf::IfOp, AffineIfOp>(anchor)) {

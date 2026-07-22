@@ -1072,18 +1072,23 @@ struct SdcSchedulingPass
     // A while with an all-straight-line body schedules as a flushing pipeline
     // (before + after as one iteration). A while whose body contains a nested
     // loop cannot: a flat problem would flatten the inner loop's ops into the
-    // outer iteration space. Instead decompose the body Phase-A-style -- the
-    // nested loop schedules as its own region, the surrounding ops as acyclic
-    // spans -- and leave the outer `scf.while` raw: it runs sequentially, which
-    // is correct because its data-dependent trip already leaves the latency
-    // unknown and the carried state typically threads the inner loop. (A
-    // counted while was raised to scf.for by `raise-counted-while`.)
+    // outer iteration space. The nested loop schedules as its own region, the
+    // surrounding ops as acyclic  spans, and leave the outer `scf.while` raw
+    // (A counted while was raised to scf.for by `raise-counted-while`.)
     if (auto whileOp = dyn_cast<scf::WhileOp>(region.anchor())) {
-      if (hasNestedLoop(whileOp)) {
-        info(Stage::Sched, whileOp.getOperation())
-            << "Detected while loop with a nested loop; decomposing its body "
-               "into sub-regions scheduled in program order (the outer while "
-               "runs sequentially, latency data-dependent)";
+      // A while cannot flushing-pipeline -- so its body is decomposed into
+      // sub-regions scheduled in program order and the outer while runs the
+      // sequential CHECK/RUN controller -- when it nests a loop (its
+      // per-iteration length is data-dependent) OR its continue-condition is
+      // not combinational (a memory read or a latency IP, not settled at
+      // issue). `conditionIsCombinational` is the predicate the reifier's
+      // routing site shares, so the two stay in lockstep.
+      if (hasNestedLoop(whileOp) || !conditionIsCombinational(whileOp, lib)) {
+        info(Stage::Sched, whileOp)
+            << "While loop cannot flushing-pipeline (nested loop or "
+               "non-combinational condition); decomposing its body into "
+               "sub-regions scheduled in program order (the outer while runs "
+               "sequentially, latency data-dependent)";
         return scheduleBlock(whileOp.getAfter().front(), nextId, deps, lib,
                              funcOp, cycleTimeNs);
       }
