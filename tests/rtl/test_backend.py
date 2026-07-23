@@ -1049,6 +1049,44 @@ def test_stream_li_shell():
         assert np.allclose(fy, fexp), f"gap={gap}: {list(fy)} != {list(fexp)}"
 
 
+def test_stream_ii_gt1_with_memory_read_producer():
+    """A slow (II>1) f32-accumulate stream consumer draining a memory-read-fed
+    producer"""
+
+    def build(K):
+        @kernel
+        def top(A: f32[K], out: f32[1]):
+            fifo: Stream[f32]
+
+            @kernel(mapping=[2])
+            def pe(A: f32[K], out: f32[1], fifo: Stream[f32]):
+                p = allo.get_wid(0)
+                if p == 0:
+                    for k in range(K):  # memory-read-fed put (II=1 producer)
+                        fifo.put(A[k])
+                else:
+                    c: f32 = 0.0
+                    for k in range(K):  # recurrence -> II == FADD (slow drain)
+                        c += fifo.get()
+                    out[0] = c
+
+            pe(A, out, fifo)
+
+        return top
+
+    # The consumer's inner loop is recurrence-bound: the shell runs the modulo
+    # (II>1) regime, not the II==1 fast path.
+    iis = [r.ii for f in _sched(build(8)).funcs for r in f.regions if r.ii is not None]
+    assert max(iis) == FADD and FADD > 1
+
+    for K in (8, 16):
+        A = (2.0 ** np.arange(K)).astype(np.float32)  # 1, 2, 4, ... 2**(K-1)
+        exp = float(A.sum())  # == 2**K - 1
+        out = np.zeros(1, dtype=np.float32)
+        _to_rtl(build(K)).cosim(A, out)
+        assert abs(out[0] - exp) < 0.5, f"K={K}: {out[0]} != {exp} (dropped a token)"
+
+
 def test_sequential_two_kernel_shared_array():
     """Two plain sub-kernels chained through a shared boundary array: the parent
     schedules child2 as a fixed-latency node after child1, so the composed

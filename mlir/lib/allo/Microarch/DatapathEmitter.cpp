@@ -238,7 +238,14 @@ Value DatapathEmitter::computeAddr(const uarch::MemUnit &m,
     addr =
         k == 0 ? term : c.R(comb::AddOp::create(c.b, c.loc, addr, term, false));
   }
-  return addr;
+  // A read in a back-pressured (stream) region must freeze its address on
+  // stall: else the counter over-runs while the pipeline is frozen and the
+  // in-flight read (its data landing on the freeze cycle) is lost -- a dropped
+  // token, violating blocking-stream (KPN) semantics. Stall-holding the address
+  // keeps the stalled memory presenting the un-consumed element, so it is
+  // captured on resume. A write needs no hold: its write-enable is gated, so a
+  // stalled cycle simply does not commit.
+  return acc.isWrite ? addr : c.stallHold(addr);
 }
 
 // Narrow a linear element address to a memory's clog2(depth)-bit index, the
@@ -742,18 +749,21 @@ void DatapathEmitter::emitStreamAccesses(const uarch::RegionBlock &rb,
   // the shell (emit() calls this for every region; it is a no-op for a
   // stream-free one). Fail loudly rather than silently miscompile an
   // out-of-scope topology:
-  //  * II == 1: the shell freezes every shift chain as one (chainEnable); a
-  //    modulo (II>1) phase counter rides `issueEnable` instead, so on an input
-  //    bubble it would diverge from the still-advancing chains -> broken tap
-  //    alignment. The global-stall shell is defined only for the II==1
-  //    invariant.
   //  * one access per channel: each channel drives exactly one
   //  {data,valid,ready}
   //    bundle, so two get/put on one channel would silently overwrite its port.
   //  * a multi-input region fires only when every input it needs this firing is
   //    present. Stage-0 gets (read at issue) pop together and gate the issue;
-  //    an empty stage-0 input injects a bubble (drop `issueEnable`), never a
-  //    freeze. A mid-pipeline get (stage > 0 -- e.g. a merge whose selector is
+  //    an empty stage-0 input injects a bubble at II==1 (drop `issueEnable`,
+  //    chains keep advancing -- a legal issue-skip since every cycle is an
+  //    issue slot), but a FREEZE at II>1: the modulo phase counter rides
+  //    `issueEnable` while the chains ride `chainEnable`, so a diverging skip
+  //    would desync the fixed-II tap alignment. So under a modulo (II>1) shell
+  //    a starved issue slot folds into `chainEnable` and `issueEnable ==
+  //    chainEnable` (see below), freezing phase + chains + the Ce operators as
+  //    one -- Vitis's ap_fifo behavior (an empty input stalls the whole
+  //    region).
+  //  * a mid-pipeline get (stage > 0 -- e.g. a merge whose selector is
   //    a stream token read at stage 0, so the selected `get` lands a cycle
   //    later) cannot bubble: its in-flight iteration is already past issue, so
   //    a needed-but- empty deeper input FREEZES the whole pipeline
@@ -770,8 +780,7 @@ void DatapathEmitter::emitStreamAccesses(const uarch::RegionBlock &rb,
     assert((!here || s.accesses.size() <= 1) &&
            "one access per stream channel");
   }
-  if (hasStream)
-    assert(rb.ii.value_or(1) == 1 && "stream LI shell assumes II == 1");
+  (void)hasStream;
 
   Value atIssue =
       controlOf.lookup(rb.id).wantIssue; // ungated stage-0 activation
@@ -848,6 +857,19 @@ void DatapathEmitter::emitStreamAccesses(const uarch::RegionBlock &rb,
     }
   bool join0 = stage0Gets > 1;
 
+  // Modulo (II>1) cadence: a starved stage-0 slot cannot be a mere issue-skip
+  // (the II==1 bubble) -- the modulo phase counter and the shift chains must
+  // freeze as one, or the fixed-II tap alignment (depth = distance*II + ...)
+  // desyncs against a still-advancing chain. Fold a starved issue slot into
+  // `chainEnable` (the global freeze), gated by `atIssue` so only the phase-0
+  // slot cares and the post-last-issue drain never freezes on an empty input.
+  // `issueEnable` then equals `chainEnable`, gating phase + counter + chains +
+  // Ce operators + the done drain by one signal.
+  bool modulo = rb.ii.value_or(1) > 1;
+  if (modulo && stage0Valid)
+    chainEnable = c.andBits(
+        chainEnable, c.notBit(c.andBits(atIssue, c.notBit(stage0Valid))));
+
   // Drive each `_ready`. A stage-0 get accepts when we want to issue and are
   // not frozen (independent of its OWN valid, per the handshake contract; a
   // join additionally waits for all stage-0 inputs). A deeper get accepts when
@@ -869,8 +891,9 @@ void DatapathEmitter::emitStreamAccesses(const uarch::RegionBlock &rb,
       pa.setOutput(iface::ready(streamPortBase(s)), ready);
     }
   fb.chainEnable = chainEnable;
-  fb.issueEnable =
-      stage0Valid ? c.andBits(chainEnable, stage0Valid) : chainEnable;
+  fb.issueEnable = modulo ? chainEnable
+                          : (stage0Valid ? c.andBits(chainEnable, stage0Valid)
+                                         : chainEnable);
 }
 
 // Instantiate each CallUnit (dcp.instance) in region \p rb as a child

@@ -319,6 +319,16 @@ Value EmitContext::enabledReg(Value in, Value ce, Value rstVal) {
   return self;
 }
 
+Value EmitContext::stallHold(Value in) {
+  if (!regionEnable)
+    return in; // no stall shell: the address is just the live index
+  Backedge heldNext = bb.get(in.getType());
+  Value held = reg(heldNext, konst(in.getType(), 0));
+  Value out = mux(regionEnable, in, held);
+  heldNext.setValue(out);
+  return out;
+}
+
 Value EmitContext::latchReg(Value init, Value next, Value load, Value advance) {
   Backedge selfNext = bb.get(init.getType());
   Value self = reg(selfNext, konst(init.getType(), 0));

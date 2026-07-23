@@ -283,6 +283,14 @@ struct EmitContext {
   /// holds; out = `rstVal` while in reset. Edge-triggered, NOT a
   /// level-sensitive latch.
   Value enabledReg(Value in, Value ce, Value rstVal);
+  /// Stall-hold: transparent (combinational passthrough) while `regionEnable`
+  /// is high, holds its last enabled value while low. out = regionEnable ? in :
+  /// held; held[t+1] = out[t]. Unlike `enabledReg` (which delays by a cycle),
+  /// this adds NO latency when enabled -- so a read address stays == the
+  /// counter in steady state, but freezes on back-pressure so a stalled memory
+  /// keeps presenting the un-consumed element (the in-flight read is not lost
+  /// when the pipeline freezes). A no-op (returns `in`) outside a stall shell.
+  Value stallHold(Value in);
   /// A while iter-arg's frozen result register: out[t+1] = load ? init :
   /// (advance ? next : out[t]). Loaded with `init` on `load` (the region
   /// start), advanced to `next` while the loop continues (`advance`), held
