@@ -1,10 +1,7 @@
 # Copyright Allo authors. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""End-to-end tests for Allo's RTL backend.
 
-The whole file needs a simulator: cosim drives the emitted RTL under cocotb +
-verilator, and the schedule-only cases share its kernels.
-"""
+"""End-to-end tests for Allo's RTL backend."""
 
 import math
 import os
@@ -2899,6 +2896,95 @@ def test_nonzero_lb_stencil_cosim():
     exp = np.zeros(8, np.float32)
     exp[1:7] = (A[:-2] + A[1:-1] + A[2:]) * 0.5  # B[0], B[7] stay 0 (untouched)
     assert np.allclose(B, exp, rtol=1e-4, atol=1e-5)
+
+
+def test_runtime_lb_fixed_window_cosim():
+    # The fixed-window idiom `for j in range(i, i+K)`: a RUNTIME lower bound (the
+    # enclosing counter i) with a COMPILE-TIME trip K. The reifier keeps trip=K
+    # and wires i as a runtime lbBound (no dynamicBound), so the loop's upper
+    # bound must be computed as `lb + K*step` from the resolved runtime lb/step,
+    # NOT the lb/step attributes (which default to 0/1 here). The i>=K iteration
+    # is the telltale: an attribute-derived ub=K makes it spuriously empty.
+    A = np.arange(16, dtype=np.int32)
+
+    # (1) leaf window, step 1. i runs 0..3 with K=3, so i=3 is exactly the old
+    #     spurious-empty edge (ub would have been konst(3), and lb=3 >= 3).
+    @kernel
+    def win(A: i32[16], out: i32[4]):
+        for i in range(4):
+            s: i32 = 0
+            for j in range(i, i + 3):
+                s = s + A[j]
+            out[i] = s
+
+    out = np.zeros(4, np.int32)
+    _to_rtl(win).cosim(A, out)
+    assert np.array_equal(out, [A[i] + A[i + 1] + A[i + 2] for i in range(4)])
+
+    # (2) non-unit step: the span is trip*step (=3*2), still anchored at runtime i.
+    @kernel
+    def stride(A: i32[16], out: i32[4]):
+        for i in range(4):
+            s: i32 = 0
+            for j in range(i, i + 6, 2):  # j = i, i+2, i+4
+                s = s + A[j]
+            out[i] = s
+
+    out = np.zeros(4, np.int32)
+    _to_rtl(stride).cosim(A, out)
+    assert np.array_equal(out, [A[i] + A[i + 2] + A[i + 4] for i in range(4)])
+
+    # (3) the window loop is a CONTAINER (its body nests a k loop), exercising the
+    #     emitContainer terminatorOf path, not just the leaf pipeline.
+    @kernel
+    def wcont(A: i32[8, 4], out: i32[4]):
+        for i in range(4):
+            s: i32 = 0
+            for j in range(i, i + 3):
+                for k in range(4):
+                    s = s + A[j, k]
+            out[i] = s
+
+    A2 = np.arange(32, dtype=np.int32).reshape(8, 4)
+    out = np.zeros(4, np.int32)
+    _to_rtl(wcont).cosim(A2, out)
+    assert np.array_equal(
+        out,
+        [
+            sum(int(A2[j, k]) for j in range(i, i + 3) for k in range(4))
+            for i in range(4)
+        ],
+    )
+
+
+def test_negative_lb_signed_counter_cosim():
+    # A compile-time NEGATIVE lower bound: the induction counter runs through
+    # negative values (-4..3), so the bound tests (isLast/isEmpty) must be SIGNED.
+    # An unsigned compare reads lb=-4 as ~4.3e9 >= ub, so `isEmpty` fires and the
+    # whole loop is dropped; the all-8-outputs result proves it is not. `i` is
+    # used both as a shifted address (A[i+4]) and a signed compute operand (+ i).
+    @kernel
+    def neglb(A: i32[8], out: i32[8]):
+        for i in range(-4, 4):
+            out[i + 4] = A[i + 4] + i
+
+    A = np.arange(8, dtype=np.int32) * 10
+    out = np.zeros(8, np.int32)
+    _to_rtl(neglb).cosim(A, out)
+    assert np.array_equal(out, [A[i + 4] + i for i in range(-4, 4)])
+
+    # Negative lb on a reduction (II is the memory-carried recurrence): the
+    # counter still seeds -4 and the signed bound test bounds the trip at 8.
+    @kernel
+    def neg_reduce(A: i32[8], out: i32[1]):
+        acc: i32 = 0
+        for i in range(-4, 4):
+            acc = acc + A[i + 4] * i
+        out[0] = acc
+
+    out = np.zeros(1, np.int32)
+    _to_rtl(neg_reduce).cosim(A, out)
+    assert out[0] == sum(int(A[i + 4]) * i for i in range(-4, 4))
 
 
 def test_heat_3d_stencil_cosim():

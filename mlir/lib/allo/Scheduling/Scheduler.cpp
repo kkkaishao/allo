@@ -262,7 +262,10 @@ private:
   struct MRT {
     ModuloSimplexScheduler &sched;
 
-    using TableType = SmallDenseMap<unsigned, DenseSet<Operation *>>;
+    // Modulo slot -> number of resource instances occupied there. A count (not
+    // a set of ops) so a non-pipelined window wider than the II, which wraps
+    // and lands in a slot more than once, contributes its true multiplicity.
+    using TableType = SmallDenseMap<unsigned, unsigned>;
     using ReverseTableType = SmallDenseMap<Operation *, unsigned>;
     SmallDenseMap<Problem::ResourceType, TableType> tables;
     SmallDenseMap<Problem::ResourceType, ReverseTableType> reverseTables;
@@ -1177,17 +1180,23 @@ LogicalResult ModuloSimplexScheduler::MRT::enter(Operation *op,
   auto &revTab = reverseTables[rsrc];
   assert(!revTab.count(op));
 
-  // A non-pipelined op holds its unit for `occ` consecutive modulo slots. All
-  // of them must have room before any is reserved (occ == 1 is the pipelined
-  // case).
+  // A non-pipelined op holds its unit for `occ` consecutive modulo slots (occ
+  // == 1 is pipelined). Tally per-slot demand: a window wider than the II
+  // wraps, claiming a slot more than once (consecutive iterations coinciding --
+  // genuine contention a per-slot set would hide). A slot admits `lim`
+  // instances, so the reservation succeeds only if every touched slot fits the
+  // op's full demand.
   unsigned occ = resourceCycles(op);
   unsigned base = timeStep % sched.parameterT;
   auto &table = tables[rsrc];
+  SmallDenseMap<unsigned, unsigned> want;
   for (unsigned i = 0; i < occ; ++i)
-    if (table[(base + i) % sched.parameterT].size() >= lim)
+    ++want[(base + i) % sched.parameterT];
+  for (const auto &[slot, cnt] : want)
+    if (table.lookup(slot) + cnt > lim)
       return failure();
-  for (unsigned i = 0; i < occ; ++i)
-    table[(base + i) % sched.parameterT].insert(op);
+  for (const auto &[slot, cnt] : want)
+    table[slot] += cnt;
   revTab[op] = base;
   return success();
 }
@@ -1206,8 +1215,13 @@ void ModuloSimplexScheduler::MRT::release(Operation *op) {
   assert(it != revTab.end());
   unsigned occ = resourceCycles(op);
   auto &table = tables[rsrc];
-  for (unsigned i = 0; i < occ; ++i)
-    table[(it->second + i) % sched.parameterT].erase(op);
+  // Undo enter's per-slot increments (recomputed from the stored base + occ, so
+  // a wrapped slot is decremented once per lap -- symmetric with `want` above).
+  for (unsigned i = 0; i < occ; ++i) {
+    unsigned &cnt = table[(it->second + i) % sched.parameterT];
+    assert(cnt > 0 && "releasing an MRT slot that was never reserved");
+    --cnt;
+  }
   revTab.erase(it);
 }
 
@@ -1424,9 +1438,13 @@ unsigned ModuloSimplexScheduler::computeResMinII() {
     }
   }
 
-  for (auto pair : uses)
-    resMinII = std::max(
-        resMinII, (unsigned)ceil(pair.second / *prob.getLimit(pair.first)));
+  // Integer ceil: enough parallel units to cover total occupancy in one II.
+  // (unsigned `a / b` floors, so an explicit integer ceil is needed once
+  // limit >= 2.)
+  for (auto pair : uses) {
+    unsigned limit = *prob.getLimit(pair.first);
+    resMinII = std::max(resMinII, (pair.second + limit - 1) / limit);
+  }
 
   return resMinII;
 }

@@ -18,6 +18,7 @@ add_mlir_library(MLIRAlloTransforms
     UnrollUnderPipeline.cpp
     ReassociateReductions.cpp
     RotateReductions.cpp
+    LegalizeArith.cpp
     SdcScheduling.cpp
 
     DEPENDS
@@ -30,6 +31,7 @@ add_mlir_library(MLIRAlloTransforms
     MLIRAffineDialect
     MLIRAffineUtils
     MLIRArithDialect
+    MLIRArithTransforms
     MLIRFuncDialect
     MLIRLLVMDialect
     MLIRMemRefDialect

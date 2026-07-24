@@ -20,6 +20,7 @@
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Utils/StaticValueUtils.h"
 #include "mlir/Interfaces/LoopLikeInterface.h"
+#include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/Support/MathExtras.h"
 
@@ -188,16 +189,6 @@ checkMemrefDependence(ArrayRef<Operation *> memoryOps,
 // Stream dependences
 //===----------------------------------------------------------------------===//
 
-// The base stream SSA value a stream get/put operates on (views peeled). Two
-// accesses on different bases are always independent (SSA identity is a precise
-// disambiguation for streams, not reassigned through aliases).
-static Value getStreamBase(Operation *op) { return asMemAccess(op)->root; }
-
-// The FIFO-selecting indices of a stream get/put operation.
-static SmallVector<Value, 4> getStreamIndices(Operation *op) {
-  return asMemAccess(op)->indices;
-}
-
 // Nearest enclosing counted loop (affine.for or scf.for), skipping non-loop
 // parents (e.g. affine.if / scf.if). Null if the op is not inside a loop.
 static Operation *getNearestLoop(Operation *op) {
@@ -226,16 +217,32 @@ namespace {
 enum class FifoAlias { Same, Distinct, Unknown };
 } // namespace
 
+// Whether result `k` of `m` is a function of an enclosing loop IV. The builder
+// classifies loop IVs as affine DIMS and loop-invariant values (function args,
+// worker-ids) as SYMBOLS, so "uses a dim" is exactly "varies across loop
+// iterations". A constant inter-access offset on such a coordinate means the
+// two accesses sweep OVERLAPPING FIFO-index ranges over the iteration space, so
+// they may alias cross-iteration (a fixed offset on a spatial/worker-id index
+// does not -- those select genuinely distinct FIFOs).
+static bool coordDependsOnIV(const affine::AffineValueMap &m, unsigned k) {
+  bool usesDim = false;
+  m.getAffineMap().getResult(k).walk([&](AffineExpr e) {
+    if (isa<AffineDimExpr>(e))
+      usesDim = true;
+  });
+  return usesDim;
+}
+
 static FifoAlias compareFifo(AffineValueMapBuilder &builder, Operation *a,
                              Operation *b) {
   builder.reset();
-  for (Value idx : getStreamIndices(a))
+  for (Value idx : asMemAccess(a)->indices)
     if (failed(builder.importValue(idx)))
       return FifoAlias::Unknown;
   affine::AffineValueMap ma = builder.compose();
 
   builder.reset();
-  for (Value idx : getStreamIndices(b))
+  for (Value idx : asMemAccess(b)->indices)
     if (failed(builder.importValue(idx)))
       return FifoAlias::Unknown;
   affine::AffineValueMap mb = builder.compose();
@@ -246,15 +253,25 @@ static FifoAlias compareFifo(AffineValueMapBuilder &builder, Operation *a,
   affine::AffineValueMap diff;
   affine::AffineValueMap::difference(ma, mb, &diff);
   bool allZero = true;
-  for (AffineExpr e : diff.getAffineMap().getResults()) {
-    auto cst = dyn_cast<AffineConstantExpr>(e);
+  for (unsigned k = 0, e = diff.getAffineMap().getNumResults(); k < e; ++k) {
+    auto cst = dyn_cast<AffineConstantExpr>(diff.getAffineMap().getResult(k));
     if (!cst) {
       // Symbolic offset: cannot prove same or distinct FIFO.
       allZero = false;
       continue;
     }
-    if (cst.getValue() != 0)
-      return FifoAlias::Distinct; // some coordinate differs by a constant
+    if (cst.getValue() != 0) {
+      // This coordinate differs by a nonzero constant. If it is a function of
+      // an enclosing loop IV (e.g. `put fifo[i+1]` / `get fifo[i]`), the two
+      // accesses sweep overlapping FIFO ranges across iterations -- a
+      // loop-carried recurrence, NOT provably-distinct FIFOs; be conservative
+      // (Unknown) so the pair is serialized. An IV-independent offset
+      // (`fifo[0]`/`fifo[1]`, or a worker-id-selected PE FIFO) is genuinely a
+      // different fixed FIFO.
+      if (coordDependsOnIV(ma, k))
+        return FifoAlias::Unknown;
+      return FifoAlias::Distinct;
+    }
   }
   return allZero ? FifoAlias::Same : FifoAlias::Unknown;
 }
@@ -298,7 +315,9 @@ static void checkStreamDependence(SmallVectorImpl<Operation *> &streamOps,
       Operation *earlier = streamOps[i];
       Operation *later = streamOps[j];
 
-      if (getStreamBase(earlier) != getStreamBase(later))
+      // Different stream base SSA values (views peeled) are always independent
+      // -- SSA identity is a precise disambiguation for streams.
+      if (asMemAccess(earlier)->root != asMemAccess(later)->root)
         continue;
 
       // Only serialize accesses sharing the same innermost loop, so both ends
@@ -347,13 +366,6 @@ static bool inAffineNest(Operation *op) {
   return true;
 }
 
-// The array root a load/store accesses, affine or not (views peeled). No alias
-// analysis beyond that: distinct roots are distinct arrays (the Allo frontend
-// has no pointers).
-static Value accessedMemRef(Operation *op) { return asMemAccess(op)->root; }
-
-static bool accessIsWrite(Operation *op) { return asMemAccess(op)->isWrite; }
-
 // Dependence components mirroring the op's enclosing loop nest, `distance` on
 // the innermost loop. Empty (loop-independent, distance 0) when the op is not
 // in any loop -- unlike streamDepComponents, a non-affine access may be
@@ -396,10 +408,13 @@ static void checkConservativeDependence(
       // Pairs the polyhedral test models are handled precisely there.
       if (!nonPolyhedral.contains(earlier) && !nonPolyhedral.contains(later))
         continue;
-      // Different arrays never conflict; read-read pairs commute.
-      if (accessedMemRef(earlier) != accessedMemRef(later))
+      // Different arrays never conflict (distinct roots are distinct arrays --
+      // the Allo frontend has no pointers); read-read pairs commute.
+      auto ea = asMemAccess(earlier);
+      auto la = asMemAccess(later);
+      if (ea->root != la->root)
         continue;
-      if (!accessIsWrite(earlier) && !accessIsWrite(later))
+      if (!ea->isWrite && !la->isWrite)
         continue;
 
       // Forward intra-iteration edge (preserve program order).
@@ -428,7 +443,7 @@ static void checkConservativeDependence(
 // producer (scheduled first) and `dst` the consumer, so this is orientation-
 // independent: read-after-write is a write source + read dst, etc.
 static AssumeDepDirEnum edgeDirection(Operation *source, Operation *dst) {
-  bool sw = accessIsWrite(source), dw = accessIsWrite(dst);
+  bool sw = asMemAccess(source)->isWrite, dw = asMemAccess(dst)->isWrite;
   if (sw && dw)
     return AssumeDepDirEnum::WAW;
   return sw ? AssumeDepDirEnum::RAW : AssumeDepDirEnum::WAR;
@@ -470,7 +485,7 @@ applyNoDepHints(ArrayRef<AssumeNoDepOp> hints,
       // never misses a real dependence to re-add. Implement only if a real need
       // arises.
       continue;
-    // Resolve through views so it compares equal to accessedMemRef's roots.
+    // Resolve through views so it compares equal to the access roots.
     Value array = resolveRoot(hint.getVariable());
     Block *body = loopBodyForIV(hint.getIv());
     if (!body)
@@ -483,7 +498,7 @@ applyNoDepHints(ArrayRef<AssumeNoDepOp> hints,
                        const MemoryDependence &dep) {
       // Same array, at least one endpoint outside the polyhedral test (so this
       // is a conservative edge), both accesses inside the hinted loop.
-      if (accessedMemRef(source) != array || accessedMemRef(dst) != array)
+      if (asMemAccess(source)->root != array || asMemAccess(dst)->root != array)
         return false;
       if (!nonPolyhedral.contains(source) && !nonPolyhedral.contains(dst))
         return false;
@@ -546,12 +561,24 @@ int64_t carriedDistanceAtLevel(ArrayRef<affine::DependenceComponent> comps,
     valid = false;
     return 0;
   }
+  // A `*`-direction component (lb == nullopt) is an UNKNOWN, unbounded carried
+  // distance -- not 0 -- handled conservatively in both roles. (Defensive:
+  // MLIR's affine test returns a bounded distance for every subscript the
+  // frontend emits.)
+  //  * An OUTER level drops the edge only when it PROVABLY carries the
+  //    dependence (a known positive distance); an unknown one cannot, so
+  //    `value_or(0)` keeps the inner constraint (0 is not > 0).
+  //  * At THIS level, fall back to the tightest carried distance, 1 (a smaller
+  //    distance forces a larger II), so the modulo solver never under-bounds
+  //    the II. Coercing to 0 would make a spurious 0-distance combinational
+  //    cycle.
   for (unsigned k = 0; k + 1 < level; ++k) // components outer to the level
     if (comps[k].lb.value_or(0) > 0) {
       drop = true;
       return 0;
     }
-  return comps[level - 1].lb.value_or(0);
+  std::optional<int64_t> d = comps[level - 1].lb;
+  return d.has_value() ? *d : 1;
 }
 
 DependenceAnalysis::DependenceAnalysis(func::FuncOp funcOp) : func(funcOp) {
@@ -581,6 +608,18 @@ DependenceAnalysis::DependenceAnalysis(func::FuncOp funcOp) : func(funcOp) {
       noDepHints.push_back(hint);
     } else if (auto hint = dyn_cast<AssumeSSAOp>(op)) {
       collectAssumptions(hint.getCondition(), assumptions);
+    } else if (auto mem = dyn_cast<MemoryEffectOpInterface>(op)) {
+      // A memory read/write op none of the branches above model (memref.copy,
+      // memref.atomic_rmw, memref.dma_*) is added to no access list, so
+      // getDependences() returns empty for it and it is never ordered against
+      // the accesses it conflicts with -- a silently dropped dependence, free
+      // to reorder. The Allo frontend emits none of these into a scheduled
+      // region today; this fires when one appears.
+      assert((!mem.hasEffect<MemoryEffects::Read>() &&
+              !mem.hasEffect<MemoryEffects::Write>()) &&
+             "memory read/write op not modeled by dependence analysis "
+             "(e.g. memref.copy/atomic_rmw/dma); its dependence is dropped");
+      (void)mem;
     }
   });
 

@@ -1,16 +1,7 @@
 # Copyright Allo authors. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""End-to-end tests for kernels transcribed from examples/machsuite.
-
-Each test schedules a kernel, asserts the scheduling properties that must hold
-(initiation intervals, region kinds, whether the latency is statically known),
-then drives the emitted RTL against a NumPy golden with cosim. Problem sizes are
-kept small so cosim stays fast; the scheduling properties do not depend on the
-size, only the total latency does -- which is left unpinned. An array return has
-no hardware meaning, so a kernel that returns one is re-stated with an explicit
-out-parameter. `kmp`'s while conditions read memory and drive end to end.
-"""
+"""End-to-end tests for MachSuite kernels"""
 
 import os
 import shutil

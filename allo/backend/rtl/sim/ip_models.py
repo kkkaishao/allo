@@ -32,7 +32,6 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
-
 # --- descriptors (from the device operator table) --------------------------
 
 
@@ -131,9 +130,9 @@ def _render(template: str, **kw: object) -> str:
 
 # --- built-in behavior: abstract kind -> a C expression over `a`, `b` -------
 
-# Float-compare predicate -> C comparison operator. Ordered (o*) and unordered
-# (u*) map to the same operator: cosim inputs are NaN-free, so the only place they
-# would differ (a NaN operand) does not arise.
+# Float-compare predicate -> C comparison operator. The ordered (o*) and unordered
+# (u*) RELATIONAL predicates map to the same operator: cosim inputs are NaN-free,
+# so the only place they would differ (a NaN operand) does not arise.
 _CMP = {
     "oeq": "==",
     "one": "!=",
@@ -147,6 +146,16 @@ _CMP = {
     "uge": ">=",
     "ult": "<",
     "ule": "<=",
+}
+# The non-relational predicates, which are not `a <op> b`: the NaN tests `uno`
+# (either operand is NaN) / `ord` (neither is) -- modeled exactly via std::isnan,
+# so the max/min expansion's `cmpf uno` NaN guard cosims -- and the two constant
+# predicates.
+_CMP_NONREL = {
+    "uno": "std::isnan(a) || std::isnan(b)",
+    "ord": "!std::isnan(a) && !std::isnan(b)",
+    "true": "true",
+    "false": "false",
 }
 _ARITH = {"add": "a + b", "sub": "a - b", "mul": "a * b", "div": "a / b"}
 # Advanced math mnemonic -> C++ <cmath> function (overloaded on float/double).
@@ -173,8 +182,11 @@ def _kind_expr(desc: OpDesc, pred: str) -> str:
     if k == "rem":
         return "std::fmod(a, b)"
     if k == "cmp":
-        assert pred in _CMP, f"unsupported float-compare predicate '{pred}'"
-        return f"a {_CMP[pred]} b"
+        if pred in _CMP:
+            return f"a {_CMP[pred]} b"
+        expr = _CMP_NONREL.get(pred)
+        assert expr is not None, f"unsupported float-compare predicate '{pred}'"
+        return expr
     if k in _LIBM:  # advanced unary math
         return f"{_LIBM[k]}(a)"
     if k in ("ifcast", "fcast"):  # unary conversion: value cast src -> dst

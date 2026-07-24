@@ -174,6 +174,12 @@ MemId DatapathBuilder::getOrCreateMem(Value memref) {
   // argument (external -> per-bank boundary interfaces).
   m.portsPerBank = mc.portsPerBank;
   m.impl = mc.impl;
+  // A dynamic-shape memref would silently fall to total == 0 -> depthWords == 0
+  // -> a zero-depth internal hlmem / zero-width external address interface,
+  // with no diagnostic. Allo arrays are statically shaped by this stage.
+  assert(mt.hasStaticShape() &&
+         "datapath memory requires a static shape (a dynamic memref sizes to "
+         "depthWords 0)");
   unsigned total = mt.hasStaticShape() ? mt.getNumElements() : 0;
   m.depthWords = total ? (total + m.numBanks - 1) / m.numBanks : 0;
   dp.mems.push_back(std::move(m));
@@ -443,6 +449,13 @@ void DatapathBuilder::bindResource(Operation *op, RegionBlock &rb) {
   if (Value mr = dcpMemref(op)) {
     bool isWrite = isa<dcp::DCPathStoreOp>(op);
     MemId mid = getOrCreateMem(mr);
+    // A read-only ROM (a `memref.get_global` constant table) lowers to a
+    // combinational `hw.aggregate_constant`, which has no write path; a store
+    // bound to it would be silently ignored at emit (its data never lands).
+    assert(
+        !(isWrite && dp.mems[mid].isRom) &&
+        "store to a read-only ROM (memref.get_global); the constant table has "
+        "no write port");
     unsigned aidx = dp.mems[mid].accesses.size();
     MemUnit::Access acc;
     acc.op = op;
@@ -976,8 +989,17 @@ void DatapathBuilder::resolveAccessOperands() {
       Value pred = isa<StreamGetOp>(acc.op)
                        ? cast<StreamGetOp>(acc.op).getPred()
                        : cast<StreamPutOp>(acc.op).getPred();
-      if (pred)
-        recordEdge(resolveOperand(pred, acc.op, ii), acc.when, ridx);
+      if (pred) {
+        // Unlike `acc.data` (a None Source trips resolveSource's assert), a
+        // None `acc.when` is read as "unconditional" everywhere in the emitter
+        // -- so a predicate that fails to resolve would silently turn a masked
+        // get/put into an every-cycle one (wrong token stream / deadlock).
+        Resolved pr = resolveOperand(pred, acc.op, ii);
+        assert(pr.ok &&
+               "predicated stream access: predicate did not resolve (a "
+               "None `when` emits an unconditional access)");
+        recordEdge(pr, acc.when, ridx);
+      }
     }
 }
 

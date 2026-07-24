@@ -40,14 +40,45 @@ bool reservationsDisjoint(const Reservation &a, const Reservation &b) {
 }
 
 bool sameOperatorType(const FuncUnit &a, const FuncUnit &b) {
-  return a.opType == b.opType && a.impl == b.impl &&
-         a.resultType == b.resultType;
+  if (a.opType != b.opType || a.impl != b.impl || a.resultType != b.resultType)
+    return false;
+  // opType/impl/resultType alone under-specify the physical operator:
+  // same-keyed ops can still differ in operand widths (i8 vs i16, both
+  // cmpi/i1), compare `predicate`, or apply `map`. The emitter builds the unit
+  // from boundOps.front(), so merging ops that differ here makes the others
+  // compute with the front op's semantics. Compare the representative op to
+  // reject such a merge up front; verifyBinding backstops the same invariant
+  // post-merge.
+  Operation *oa = a.boundOps.front().first;
+  Operation *ob = b.boundOps.front().first;
+  return std::equal(oa->getOperandTypes().begin(), oa->getOperandTypes().end(),
+                    ob->getOperandTypes().begin(),
+                    ob->getOperandTypes().end()) &&
+         oa->getAttr("predicate") == ob->getAttr("predicate") &&
+         oa->getAttr("map") == ob->getAttr("map");
 }
 
 void verifyBinding(const Datapath &dp) {
   for (const RegionBlock &rb : dp.regions)
     for (UnitId uid : rb.units) {
       const FuncUnit &u = dp.units[uid];
+      // The emitter builds one physical unit from boundOps.front() (operand
+      // widths, compare `predicate`, apply `map`). A policy that merges ops
+      // differing in these would miscompile the non-front ops; this backstops
+      // that. Vacuous under trivial binding (one op per unit).
+      if (Operation *f =
+              u.boundOps.empty() ? nullptr : u.boundOps.front().first)
+        for (const auto &bo : u.boundOps)
+          assert(
+              std::equal(bo.first->getOperandTypes().begin(),
+                         bo.first->getOperandTypes().end(),
+                         f->getOperandTypes().begin(),
+                         f->getOperandTypes().end()) &&
+              bo.first->getAttr("predicate") == f->getAttr("predicate") &&
+              bo.first->getAttr("map") == f->getAttr("map") &&
+              "shared unit binds semantically divergent ops (operand widths / "
+              "compare predicate / apply map differ); emit uses "
+              "boundOps.front() and miscompiles the others");
       for (unsigned i = 0, e = u.boundOps.size(); i < e; ++i) {
         Reservation ri = reservationOf(rb, u, u.boundOps[i].second);
         for (unsigned j = i + 1; j < e; ++j) {

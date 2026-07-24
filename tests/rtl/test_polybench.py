@@ -1,14 +1,7 @@
 # Copyright Allo authors. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""End-to-end tests for kernels transcribed from examples/polybench.
-
-Each test schedules a kernel, asserts the scheduling properties that must hold
-(initiation intervals, reduction structure, region kinds), then drives the
-emitted RTL against a NumPy golden with cosim. Problem sizes are kept small so
-cosim stays fast; the scheduling properties (II, reductions, determinacy) do not
-depend on the size, only the total latency does -- which is left unpinned.
-"""
+"""End-to-end tests for PolyBench kernels"""
 
 import math
 import os
@@ -26,7 +19,6 @@ from allo.operators import math as amath
 from allo.lang.ip import ip
 from allo.backend.rtl.device import builtin_device
 from _common import (
-    _sched,
     _to_rtl,
     _iis,
     FADD,

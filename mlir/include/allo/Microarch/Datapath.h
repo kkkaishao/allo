@@ -317,10 +317,10 @@ struct Mux {
       selects; // abstract predicate per source
   // The op whose issue selects each source (parallel to `sources`): the source
   // is driven onto the shared unit's input on the cycle that op consumes it, so
-  // the select is `delayValid(issue, schedT(op))` -- the same per-op activation
-  // pulse a store's write-enable uses. The MRT guarantees these are mutually
-  // exclusive (disjoint residues), so the derived mux is a plain priority
-  // chain.
+  // the select is `delayValid(issue, dcpStart(op))` -- the same per-op
+  // activation pulse a store's write-enable uses. The MRT guarantees these are
+  // mutually exclusive (disjoint residues), so the derived mux is a plain
+  // priority chain.
   llvm::SmallVector<Operation *, 2> selectOps;
   RegionId region = 0; // region whose issue pulse times the selects
 };

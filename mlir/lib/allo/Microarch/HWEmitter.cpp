@@ -54,10 +54,6 @@ unsigned memReadLatency(MemoryImplEnum impl) {
   return impl == MemoryImplEnum::Register ? 0 : 1;
 }
 
-// The schedule cycle at which `op` fires (its `start`); the emit-side spelling
-// of the shared reader.
-unsigned schedT(Operation *op) { return uarch::dcpStart(op); }
-
 // Integer/logic mnemonics EmitHW lowers to a native `comb` primitive. The
 // single source of truth for `emitCompute`'s coverage; a native op outside this
 // set has no EmitHW lowering (realizability errors, see `emitModule`).
@@ -148,6 +144,12 @@ Value emitCompute(OpBuilder &b, Location loc, StringRef kind,
   // the `rhs = operands[1]` read below.
   if (kind == "negf") {
     unsigned w = cast<IntegerType>(resultType).getWidth();
+    // The sign-bit mask is built as an int64 (`1 << (w-1)`), so a float wider
+    // than 64 bits (f80/f128) would shift by >= 64 (UB) and cannot carry the
+    // pattern; such a type needs an APInt mask.
+    assert(w <= 64 &&
+           "negf sign-bit mask uses int64 (1 << (w-1)); a float wider "
+           "than 64 bits needs an APInt bit pattern");
     Value signBit = hw::ConstantOp::create(b, loc, resultType,
                                            static_cast<int64_t>(1) << (w - 1));
     return comb::XorOp::create(b, loc, lhs, signBit, false)->getResult(0);
@@ -360,7 +362,7 @@ Value EmitContext::delayValid(Value sig, unsigned n) {
 }
 
 Value EmitContext::activationPulse(Value pulse, Operation *op) {
-  return delayValid(pulse, schedT(op));
+  return delayValid(pulse, dcpStart(op));
 }
 
 Value EmitContext::icmpEq(Value a, int64_t cst) {
@@ -376,6 +378,10 @@ Value EmitContext::icmpEqV(Value lhs, Value rhs) {
 Value EmitContext::icmpUgeV(Value lhs, Value rhs) {
   return R(
       comb::ICmpOp::create(b, loc, comb::ICmpPredicate::uge, lhs, rhs, false));
+}
+Value EmitContext::icmpSgeV(Value lhs, Value rhs) {
+  return R(
+      comb::ICmpOp::create(b, loc, comb::ICmpPredicate::sge, lhs, rhs, false));
 }
 
 Value EmitContext::isNonZero(Value v) {
@@ -433,12 +439,22 @@ void EmitContext::initLiterals() {
 //===----------------------------------------------------------------------===//
 
 // The counted induction bounds (lb/ub/step) of region \p rb: the IV runs
-// `lb, lb+step, ...` and terminates on `iv+step >= ub`. Each bound is a
-// resolved runtime Source (a data-dependent range start/count/stride) or the
-// constant fast path (the `lb`/`step` integers, `ub = lb + trip*step`). Empty
-// (default) for an acyclic region (no counter) or a while (which builds its own
-// Terminator::conditional from the resolved condition).
+// `lb, lb+step, ...` and terminates on `iv+step >= ub`. Each of lb/step is a
+// resolved runtime Source (a data-dependent range start/stride) or a constant.
+// ub is a resolved runtime count (`ubSource`, a dynamic trip) or, for a
+// constant trip K, `lb + K*step` -- a konst when lb/step are compile-time, else
+// a datapath Value tracking the runtime lb/step (the `range(i, i+K)` window).
+// Empty (default) for an acyclic region (no counter) or a while (which builds
+// its own Terminator::conditional from the resolved condition).
 Terminator HWEmitter::terminatorOf(const uarch::RegionBlock &rb) {
+  // The counter counts up, tested by SIGNED compares (icmpSgeV in
+  // isLast/isEmpty), so a negative lower bound (`affine.for %i = -4 to 4`) is
+  // fine. A non-positive/decreasing step is unsupported; the frontend rejects
+  // it, so this is a dormant backstop. A runtime step's sign is unchecked here
+  // and assumed positive.
+  assert((rb.stepSource || rb.step > 0) &&
+         "counted-loop counter is up-counting; a non-positive/decreasing step "
+         "is unsupported (the frontend rejects it)");
   auto bound = [&](const uarch::Source &s, int64_t c) {
     return s ? datapath.resolveSource(s) : ctx.konst(ctx.i32, c);
   };
@@ -446,10 +462,29 @@ Terminator HWEmitter::terminatorOf(const uarch::RegionBlock &rb) {
   if (rb.ubSource)
     return Terminator::counted(lb, datapath.resolveSource(rb.ubSource), step,
                                /*dynamic=*/true);
-  if (rb.tripCount)
-    return Terminator::counted(
-        lb, ctx.konst(ctx.i32, rb.lb + *rb.tripCount * rb.step), step,
-        /*dynamic=*/false);
+  if (rb.tripCount) {
+    // A constant trip K gives upper bound `lb + K*step`. A compile-time lb and
+    // step fold to a constant. A runtime lb/step -- the fixed-window idiom
+    // `for j in range(i, i+K)`, where the lb/step attributes default to 0/1 and
+    // the real start/stride ride Sources -- computes the bound from the same
+    // resolved lb/step that seed the counter, as a datapath Value tracking the
+    // runtime start. lb/step are region-entry-stable, so `ub` is a stable
+    // combinational value read by isLast/isEmpty like a resolved ubSource.
+    int64_t trip = *rb.tripCount;
+    Value ub;
+    if (!rb.lbSource && !rb.stepSource) {
+      ub = ctx.konst(ctx.i32, rb.lb + trip * rb.step);
+    } else {
+      Value span = rb.stepSource
+                       ? ctx.R(comb::MulOp::create(ctx.b, ctx.loc, step,
+                                                   ctx.konst(ctx.i32, trip),
+                                                   /*twoState=*/false))
+                       : ctx.konst(ctx.i32, trip * rb.step);
+      ub = ctx.R(
+          comb::AddOp::create(ctx.b, ctx.loc, lb, span, /*twoState=*/false));
+    }
+    return Terminator::counted(lb, ub, step, /*dynamic=*/false);
+  }
   return {};
 }
 
@@ -1087,7 +1122,7 @@ static LogicalResult validateDatapath(func::FuncOp func,
     case uarch::Source::Kind::Survivor:
       return true; // a scheduled prologue predicate, valid at the region start
     case uarch::Source::Kind::Unit:
-      return sequential || schedT(dp.units[s.id].boundOps.front().first) == 0;
+      return sequential || dcpStart(dp.units[s.id].boundOps.front().first) == 0;
     default:
       return false; // None (raw / unliftable)
     }
@@ -1248,8 +1283,17 @@ declareModulePorts(const iface::ModuleInterface &model, OpBuilder &b) {
   port("rst", i1, Dir::Input);
   port("start", i1, Dir::Input);
   // Scalar kernel arguments (memref args become memory ports instead).
-  for (const iface::Scalar &s : model.scalars)
+  for (const iface::Scalar &s : model.scalars) {
+    // A scalar arg named after a control port (or a Verilog keyword) collides
+    // with the hard-coded ports here / gets renamed by CIRCT's LegalizeNames,
+    // but the JSON manifest is serialized from these pre-legalization names --
+    // so the cosim harness would drive a port name that no longer exists.
+    assert(s.name != "clk" && s.name != "rst" && s.name != "start" &&
+           s.name != "done" &&
+           "scalar argument port name collides with a reserved control port; "
+           "the JSON manifest would desync from the emitted Verilog");
     port(s.name, iType(s.width), Dir::Input);
+  }
   // Stream FIFO ports, input side. All module inputs must stay contiguous at
   // the front of the port list (HWModulePortAccessor maps body args to the
   // first `numInputs` ports positionally), so an input stream's {data, valid}

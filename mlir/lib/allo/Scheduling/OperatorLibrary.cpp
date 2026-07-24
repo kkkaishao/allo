@@ -36,6 +36,18 @@ llvm::StringRef mlir::allo::opKindString(OpKind kind) {
     return "div";
   case OpKind::Rem:
     return "rem";
+  case OpKind::Max:
+    return "max";
+  case OpKind::Min:
+    return "min";
+  case OpKind::MaxNum:
+    return "maxnum";
+  case OpKind::MinNum:
+    return "minnum";
+  case OpKind::CeilDiv:
+    return "ceildiv";
+  case OpKind::FloorDiv:
+    return "floordiv";
   case OpKind::Neg:
     return "neg";
   case OpKind::Cmp:
@@ -70,6 +82,12 @@ std::optional<OpKind> mlir::allo::parseOpKind(llvm::StringRef s) {
       .Case("mul", OpKind::Mul)
       .Case("div", OpKind::Div)
       .Case("rem", OpKind::Rem)
+      .Case("max", OpKind::Max)
+      .Case("min", OpKind::Min)
+      .Case("maxnum", OpKind::MaxNum)
+      .Case("minnum", OpKind::MinNum)
+      .Case("ceildiv", OpKind::CeilDiv)
+      .Case("floordiv", OpKind::FloorDiv)
       .Case("neg", OpKind::Neg)
       .Case("cmp", OpKind::Cmp)
       .Case("and", OpKind::And)
@@ -129,6 +147,15 @@ OpKind mlir::allo::classify(Operation *op) {
           [](auto) { return OpKind::Div; })
       .Case<arith::RemSIOp, arith::RemUIOp, arith::RemFOp>(
           [](auto) { return OpKind::Rem; })
+      .Case<arith::MaximumFOp, arith::MaxSIOp, arith::MaxUIOp>(
+          [](auto) { return OpKind::Max; })
+      .Case<arith::MinimumFOp, arith::MinSIOp, arith::MinUIOp>(
+          [](auto) { return OpKind::Min; })
+      .Case<arith::MaxNumFOp>([](auto) { return OpKind::MaxNum; })
+      .Case<arith::MinNumFOp>([](auto) { return OpKind::MinNum; })
+      .Case<arith::CeilDivSIOp, arith::CeilDivUIOp>(
+          [](auto) { return OpKind::CeilDiv; })
+      .Case<arith::FloorDivSIOp>([](auto) { return OpKind::FloorDiv; })
       .Case<arith::NegFOp>([](auto) { return OpKind::Neg; })
       .Case<arith::CmpIOp, arith::CmpFOp>([](auto) { return OpKind::Cmp; })
       .Case<arith::AndIOp>([](auto) { return OpKind::And; })
@@ -169,13 +196,6 @@ llvm::SmallVector<Type> elementTypes(TypeRange types) {
   return out;
 }
 
-// A comb row of this kind matches any operand type (no int-only restriction):
-// `select` is a mux over any datatype and `neg` is a float sign flip, neither
-// with an IP counterpart. Every other comb kind is integer arithmetic.
-bool combMatchesAnyType(OpKind k) {
-  return k == OpKind::Select || k == OpKind::Neg;
-}
-
 // Whether every data operand of `op` is an integer (element type) -- the
 // predicate an integer-arithmetic comb row matches on.
 bool allIntegerOperands(Operation *op) {
@@ -205,7 +225,11 @@ const OperatorEntry *matchEntry(const std::vector<OperatorEntry> &advanced,
     if (e.kind != kind)
       continue;
     if (e.comb) {
-      if (combMatchesAnyType(kind) || allIntegerOperands(op))
+      // `select`/`neg` comb rows match any operand type (a mux over any
+      // datatype / a float sign flip, neither with an IP counterpart); every
+      // other comb kind is integer arithmetic.
+      if (kind == OpKind::Select || kind == OpKind::Neg ||
+          allIntegerOperands(op))
         return &e;
     } else if (ArrayRef<Type>(e.argTypes) == a &&
                ArrayRef<Type>(e.resTypes) == r) {
@@ -229,8 +253,17 @@ bool needsIP(Operation *op) {
   case OpKind::Mul:
   case OpKind::Div:
   case OpKind::Rem:
+  case OpKind::Max:
+  case OpKind::Min:
+  case OpKind::MaxNum:
+  case OpKind::MinNum:
   case OpKind::Cmp:
     return floaty;
+  case OpKind::CeilDiv:
+  case OpKind::FloorDiv:
+    // No native comb realization; `legalize-arith` expands these unless the
+    // device provides an IP, so one reaching the scheduler must be an IP.
+    return true;
   case OpKind::FCastI:
   case OpKind::FCastF:
     return true;
@@ -365,8 +398,26 @@ OperatorChar OperatorLibrary::lookup(Operation *op) const {
   }
 
   const OperatorEntry *e = matchEntry(advancedEntries, entries, op);
-  if (!e)
+  if (!e) {
+    // The default row is the 0-latency combinational fallback. A float->float
+    // arith op reaching it is fine when genuinely combinational (`combKindOf`
+    // gives a comb lowering -- float select / negf) or when `needsIP` owns it
+    // (the scheduler's requiresUnmatchedIP guard already rejected the
+    // schedule). It is a wrong-latency MISCOMPILE only when NEITHER: an arith
+    // float->float op that classify()/needsIP() miss AND that has no comb
+    // lowering, scheduled at latency 0. Requiring both a float operand and
+    // result restricts the check to arithmetic (a terminator or constant
+    // carrying a float correctly takes the default). Fix: add the op to
+    // classify()/needsIP().
+    auto isFloat = [](Type t) { return isa<FloatType>(t); };
+    bool floatIn = llvm::any_of(elementTypes(op->getOperandTypes()), isFloat);
+    bool floatOut = llvm::any_of(elementTypes(op->getResultTypes()), isFloat);
+    assert((needsIP(op) || combKindOf(op) || !(floatIn && floatOut)) &&
+           "unrecognized arith float->float op fell through to the latency-0 "
+           "default row (no IP requirement, no comb lowering); add it to "
+           "classify()/needsIP()");
     e = &defaultEntry;
+  }
 
   // The stable Problem::OperatorType key: an IP row's symbol, a comb row's
   // `comb.<kind>`, else `default`. A non-empty `symbol` denotes the IP
@@ -385,4 +436,8 @@ OperatorChar OperatorLibrary::lookup(Operation *op) const {
 
 bool OperatorLibrary::requiresUnmatchedIP(Operation *op) const {
   return needsIP(op) && matchEntry(advancedEntries, entries, op) == nullptr;
+}
+
+bool OperatorLibrary::hasDirectRealization(Operation *op) const {
+  return matchEntry(advancedEntries, entries, op) != nullptr;
 }

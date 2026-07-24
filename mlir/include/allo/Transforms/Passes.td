@@ -313,6 +313,26 @@ def RotateReductionsPass
   ];
 }
 
+def LegalizeArithPass : Pass<"legalize-arith", "ModuleOp"> {
+  let summary = "Device-IP-aware expansion of composite arith ops (RTL path)";
+  let description = [{
+    The RTL-path replacement for MLIR's device-blind `arith-expand`. A composite
+    arith op that the device provides a dedicated operator IP for -- a
+    `max`/`min`/`maxnum`/`minnum`/`ceildiv`/`floordiv` `dcp.operator` matching the
+    op's kind and signature -- is KEPT, so the scheduler binds it to that IP and
+    the emitter instantiates it as one unit. Otherwise the op is EXPANDED into
+    primitive arith via the upstream arith-expand patterns (a float max becomes
+    `cmpf`+`select`, a ceildiv becomes div/mul/cmp/select), so a device that
+    provides only the primitives (e.g. a float compare IP) still schedules.
+
+    Integer `maxsi`/`maxui`/`minsi`/`minui` are left untouched -- they lower to a
+    native combinational op and need no IP. The keep/expand decision reads the
+    injected `dcp.operator` / `dcp.device` IR, so this pass must run after operator
+    injection and before scheduling.
+  }];
+  let dependentDialects = ["mlir::arith::ArithDialect"];
+}
+
 def SdcSchedulingPass : Pass<"sdc-scheduling", "ModuleOp"> {
   let summary = "Run SDC-based scheduling";
   let description = [{

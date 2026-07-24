@@ -44,6 +44,12 @@ enum class OpKind {
   Mul,
   Div,
   Rem,
+  Max,      // maximumf / maxsi / maxui (NaN-propagating or integer maximum)
+  Min,      // minimumf / minsi / minui
+  MaxNum,   // maxnumf (maxNum: returns the non-NaN operand)
+  MinNum,   // minnumf
+  CeilDiv,  // ceildivsi / ceildivui
+  FloorDiv, // floordivsi
   Neg,
   Cmp,
   And,
@@ -131,6 +137,12 @@ public:
   /// no library row matched, so the caller can report an error instead of
   /// scheduling it at the default zero latency.
   bool requiresUnmatchedIP(Operation *op) const;
+
+  /// Whether the device provides a DIRECT realization for \p op -- a matching
+  /// IP operator (or comb row). `legalize-arith` keeps a composite arith op
+  /// (max/min/maxnum/minnum/ceildiv/floordiv) when this holds, and expands it
+  /// into primitive arith otherwise.
+  bool hasDirectRealization(Operation *op) const;
 
   /// The storage-timing view of the device.
   const MemoryLibrary &memoryLibrary() const { return memory; }

@@ -30,6 +30,19 @@ from ..._mlir.ir import (
     OpResult,
 )
 
+RTL_PREPARE_PIPELINE = """
+builtin.module(
+grid-mapping,
+fold-constant-calls,
+canonicalize,
+cse,
+materialize-topology,
+canonicalize,
+cse,
+convert-allo-to-func,
+func.func(convert-linalg-to-affine-loops),legalize-arith,canonicalize,cse)
+"""
+
 # --- schedule result data model --------------------------------------------
 
 
@@ -460,7 +473,6 @@ def run_schedule(
     module,
     *,
     cycle_time=None,
-    prepare=True,
     float_reassoc=True,
     accumulators=0,
     perfectize=False,
@@ -489,11 +501,7 @@ def run_schedule(
             at one II. Delinearizes the address map (``floordiv``/``mod``), which
             the codegen path folds back in dcp-flatten-memref.
     """
-    if prepare:
-        # Shared HLS preparation (lowers allo IR to schedulable affine form).
-        from ..vitis.core import HLS_PREPARE_PIPELINE
-
-        run_pipeline(module, HLS_PREPARE_PIPELINE)
+    run_pipeline(module, RTL_PREPARE_PIPELINE)
 
     sched_opts = [f"top={top}"]
     if cycle_time is not None:

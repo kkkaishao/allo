@@ -40,10 +40,6 @@ Value readCrossbar(EmitContext &c, ArrayRef<Value> bankValues, Value bank) {
   return out;
 }
 
-Value bankWe(EmitContext &c, Value we, Value bank, unsigned k) {
-  return c.R(comb::AndOp::create(c.b, c.loc, we, c.icmpEq(bank, k), false));
-}
-
 ExternalBanking externalBank(const uarch::MemUnit &m,
                              const uarch::MemUnit::Access &acc) {
   if (m.numBanks == 1)
@@ -226,8 +222,15 @@ Value DatapathEmitter::computeAddr(const uarch::MemUnit &m,
   ArrayRef<int64_t> shape = cast<MemRefType>(m.memref.getType()).getShape();
   unsigned rank = map.getNumResults();
   SmallVector<int64_t> stride(rank, 1);
-  for (int k = static_cast<int>(rank) - 2; k >= 0; --k)
+  for (int k = static_cast<int>(rank) - 2; k >= 0; --k) {
+    // Row-major strides are a product of the trailing static extents. A dynamic
+    // non-leading dim (`memref<4x?xf32>`, shape[k+1] == kDynamic) would poison
+    // the stride with a garbage constant, mis-addressing every multi-dim access
+    // to this array. (A leading dynamic dim is safe: shape[0] is never read.)
+    assert(!ShapedType::isDynamic(shape[k + 1]) &&
+           "row-major linearization needs static non-leading memref dims");
     stride[k] = stride[k + 1] * shape[k + 1];
+  }
   Value addr;
   for (unsigned k = 0; k < rank; ++k) {
     Value term =
@@ -276,7 +279,7 @@ void DatapathEmitter::bindReadPorts() {
 // Instantiate on-chip storage for each internal (non-argument) memory: one
 // seq.hlmem, or -- when the array reached emit still partitioned (a
 // data-dependent bank dcp-resolve-banking could not split statically) -- one
-// per bank, addressed through the crossbar (splitBank/readCrossbar/bankWe). The
+// per bank, addressed through the crossbar (splitBank/readCrossbar). The
 // handles are module-scope so writes and reads in different regions share them.
 void DatapathEmitter::createInternalMemories() {
   for (const uarch::MemUnit &m : dp.mems) {
@@ -624,8 +627,8 @@ void DatapathEmitter::resolveRegHeads(const uarch::RegionBlock &rb) {
 
 // Read/write address + data outputs of the accesses scheduled in region \p rb,
 // driven by that region's controller (counter / \p issue). Returns the region's
-// store feedback: `storeDrain`, the deepest store's schedule stage (max schedT
-// over its stores), which the region's `done` waits on.
+// store feedback: `storeDrain`, the deepest store's schedule stage (max
+// dcpStart over its stores), which the region's `done` waits on.
 DatapathFeedback DatapathEmitter::emitAccesses(const uarch::RegionBlock &rb,
                                                Value issue) {
   unsigned ridx = rb.id;
@@ -662,9 +665,13 @@ DatapathFeedback DatapathEmitter::emitAccesses(const uarch::RegionBlock &rb,
   auto commitPulse = [&]() -> Value {
     if (!rb.conditional)
       return issue;
-    if (!gatedIssue)
-      gatedIssue = c.andBits(
-          issue, resolveSource(dp.carryInfo.find(rb.id)->second.condition));
+    if (!gatedIssue) {
+      auto ci = dp.carryInfo.find(rb.id);
+      assert(ci != dp.carryInfo.end() &&
+             "conditional (while) region has no carryInfo entry; its continue "
+             "condition is required to gate in-loop store commits");
+      gatedIssue = c.andBits(issue, resolveSource(ci->second.condition));
+    }
     return gatedIssue;
   };
   for (unsigned i = 0; i < writes.size(); ++i) {
@@ -684,13 +691,13 @@ DatapathFeedback DatapathEmitter::emitAccesses(const uarch::RegionBlock &rb,
       pa.setOutput(iface::addr(base), addr);
       pa.setOutput(iface::data_(base), data);
       pa.setOutput(iface::we(base),
-                   dynBank ? bankWe(c, we, dynBank, bank) : we);
+                   dynBank ? c.andBits(we, c.icmpEq(dynBank, bank)) : we);
     }
-    fb.storeDrain = std::max<unsigned>(fb.storeDrain, schedT(acc.op));
+    fb.storeDrain = std::max<unsigned>(fb.storeDrain, dcpStart(acc.op));
   }
   // Internal-memory writes drive seq.write (registered, latency 1) instead of
-  // module ports. They still contribute to the region's store drain (schedT) so
-  // its done waits for them -- a region storing only to an internal buffer
+  // module ports. They still contribute to the region's store drain (dcpStart)
+  // so its done waits for them -- a region storing only to an internal buffer
   // completes after that buffer's deepest write commits.
   for (const uarch::MemUnit &m : dp.mems) {
     if (m.external)
@@ -713,9 +720,9 @@ DatapathFeedback DatapathEmitter::emitAccesses(const uarch::RegionBlock &rb,
         Value addr = memAddr(m, bs.offset);
         for (unsigned k = 0; k < banks.size(); ++k)
           seq::WritePortOp::create(c.b, c.loc, banks[k], ValueRange{addr}, data,
-                                   bankWe(c, we, bs.bank, k), wlat);
+                                   c.andBits(we, c.icmpEq(bs.bank, k)), wlat);
       }
-      fb.storeDrain = std::max<unsigned>(fb.storeDrain, schedT(acc.op));
+      fb.storeDrain = std::max<unsigned>(fb.storeDrain, dcpStart(acc.op));
     }
   }
   return fb;
@@ -779,6 +786,7 @@ void DatapathEmitter::emitStreamAccesses(const uarch::RegionBlock &rb,
         here = hasStream = true;
     assert((!here || s.accesses.size() <= 1) &&
            "one access per stream channel");
+    (void)here;
   }
   (void)hasStream;
 

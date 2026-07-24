@@ -56,8 +56,6 @@ IntegerType memElemType(const uarch::MemUnit &m, OpBuilder &b);
 /// On-chip read latency of an internal memory's storage primitive (register: 0,
 /// LUTRAM/BRAM/URAM: 1 -- the model the scheduler used for external memory).
 unsigned memReadLatency(MemoryImplEnum impl);
-/// A scheduled dcp op's pipeline stage (its start cycle within the region).
-unsigned schedT(Operation *op);
 /// Whether a native integer/logic mnemonic has an `emitCompute` comb lowering.
 bool combEmitted(StringRef kind);
 /// Evaluate an affine index expression to an i32 hw value, emitting comb ops.
@@ -196,9 +194,6 @@ BankSplit splitBank(EmitContext &c, Value addr, unsigned factor);
 /// [0,N) -- bank 0 falls through). Values are pre-read from every bank; the
 /// caller aligns \p bank with the read latency.
 Value readCrossbar(EmitContext &c, ArrayRef<Value> bankValues, Value bank);
-/// The write-enable for bank \p k: `we` gated by `bank == k`, so a write
-/// reaches exactly the selected bank (an N-way demux over the banks).
-Value bankWe(EmitContext &c, Value we, Value bank, unsigned k);
 
 /// The banking of an *external* (argument) memory access on a
 /// cyclic-partitioned array, so the boundary presents one interface per bank.
@@ -311,7 +306,7 @@ struct EmitContext {
   /// last tap of an `n`-deep `shiftChain`. Resets to 0, so no spurious valid.
   Value delayValid(Value sig, unsigned n);
   /// A scheduled op's activation pulse: \p pulse delayed to the op's pipeline
-  /// stage (its `schedT`). The one name for "this op fires now" -- a store's
+  /// stage (its `dcpStart`). The one name for "this op fires now" -- a store's
   /// write-enable, a shared-unit input's mux select, and a fused accumulator's
   /// iteration-0 init gate are all this pulse at the op's stage.
   Value activationPulse(Value pulse, Operation *op);
@@ -320,9 +315,13 @@ struct EmitContext {
   /// Combinational (0-cycle) equality of two same-width values (a runtime
   /// compare, e.g. a counter against a data-dependent trip bound).
   Value icmpEqV(Value lhs, Value rhs);
-  /// Combinational (0-cycle) unsigned `lhs >= rhs` of two same-width values
-  /// (the induction bound test `iv+step >= ub` / empty test `lb >= ub`).
+  /// Combinational (0-cycle) unsigned `lhs >= rhs` of two same-width values.
   Value icmpUgeV(Value lhs, Value rhs);
+  /// Combinational (0-cycle) SIGNED `lhs >= rhs` of two same-width values (the
+  /// induction bound test `iv+step >= ub` / empty test `lb >= ub`): signed so a
+  /// negative compile-time lower bound (`affine.for %i = -4 to 4`) compares
+  /// correctly. Identical to the unsigned test for a non-negative counter.
+  Value icmpSgeV(Value lhs, Value rhs);
   /// Combinational (0-cycle) `v != 0` (a runtime non-empty / zero-trip test).
   Value isNonZero(Value v);
   /// Combinational (0-cycle) logical NOT of an i1 (`v XOR 1`).
@@ -391,13 +390,13 @@ struct Terminator {
   /// false
   /// (~cond). \p ivStep is `iv + step`.
   Value isLast(EmitContext &c, Value ivStep) const {
-    return kind == Kind::Conditional ? c.notBit(cond) : c.icmpUgeV(ivStep, ub);
+    return kind == Kind::Conditional ? c.notBit(cond) : c.icmpSgeV(ivStep, ub);
   }
   /// The region is empty (issues nothing): the lower bound already meets the
   /// upper (lb >= ub). A while is never "empty" here -- its zero-iteration case
   /// is the condition false on iteration 0, handled by the normal exit pulse.
   Value isEmpty(EmitContext &c) const {
-    return kind == Kind::Conditional ? c.f1 : c.icmpUgeV(lb, ub);
+    return kind == Kind::Conditional ? c.f1 : c.icmpSgeV(lb, ub);
   }
   /// The start pulse gated so an empty region issues nothing (an empty counted
   /// loop -- a runtime zero-trip or a static lb >= ub -- and a while, which
@@ -431,7 +430,7 @@ struct RegionControl {
 // signal is a field add, not one more parameter on `emitDone`.
 //===----------------------------------------------------------------------===//
 struct DatapathFeedback {
-  // The deepest store's schedule stage (max schedT over the region's stores);
+  // The deepest store's schedule stage (max dcpStart over the region's stores);
   // 0 if it stores nothing. The region's `done` waits until the last
   // iteration's last store has been presented + committed (the latch adds the
   // commit cycle), which is what fixes a multi-store region's premature

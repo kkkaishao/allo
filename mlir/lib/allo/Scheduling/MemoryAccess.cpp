@@ -11,6 +11,8 @@
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "llvm/ADT/STLExtras.h"
 
+#include <cassert>
+
 using namespace mlir;
 using namespace mlir::allo;
 
@@ -31,8 +33,20 @@ Value mlir::allo::resolveRoot(Value v) {
       v = op.getSource();
     else if (auto op = dyn_cast<memref::ViewOp>(def))
       v = op.getSource();
-    else
+    else {
+      // Any other defining op is assumed to define a fresh, non-aliasing root.
+      // A transpose / collapse_shape / expand_shape / reshape is actually an
+      // aliasing view of the same buffer; stopping here keys the access on a
+      // distinct root, so every dependence / footprint / region comparison
+      // against the real buffer is silently dropped (a missed hazard, free to
+      // reorder). The sibling resolveMemRefValueRoot in TransformOps already
+      // peels these -- this list is knowingly narrower.
+      assert((!isa<memref::TransposeOp, memref::CollapseShapeOp,
+                   memref::ExpandShapeOp, memref::ReshapeOp>(def)) &&
+             "resolveRoot: aliasing view not peeled; the distinct-root "
+             "assumption would drop a real dependence");
       break;
+    }
   }
   return v;
 }

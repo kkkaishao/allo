@@ -39,12 +39,6 @@ static AttrT carrierAttr(Value memRef, StringRef name) {
   return {};
 }
 
-// Whether a memory access is a write (store).
-static bool accessIsWrite(Operation *op) {
-  std::optional<MemAccess> a = asMemAccess(op);
-  return a && a->isWrite;
-}
-
 // The three orthogonal axes of an `allo.bind.storage` directive, mapped from
 // its `type` string (port topology + RAM/ROM) and `impl` string (storage
 // primitive). Absent/unknown `type` -> the dual-port RAM default;
@@ -213,7 +207,8 @@ MemoryBankModel::resource(Operation *op) const {
   // The pool this access draws from, and its ports per bank. Split (S2P) ->
   // dedicated read/write pools that never contend; shared -> one `_rw` pool for
   // both directions.
-  bool isWrite = accessIsWrite(op);
+  std::optional<MemAccess> a = asMemAccess(op);
+  bool isWrite = a && a->isWrite;
   StringRef dir;
   unsigned portsPerBank;
   if (info.splitRW) {
@@ -261,7 +256,14 @@ const MemKindTiming &MemoryLibrary::forImpl(MemoryImplEnum impl) const {
     if (p.impl == impl)
       return p.timing;
   // An undeclared primitive is a zero (combinational) timing -- the same
-  // "absent -> zero" convention the whole `memory:` section uses.
+  // "absent -> zero" convention the whole `memory:` section uses. Reaching here
+  // with a concrete (non-Auto) impl means an array resolved to a storage kind
+  // the device declares no timing for (a `bind.storage impl=` /
+  // `default_memory` naming an undeclared primitive): its multi-cycle access
+  // would be scheduled at latency 0 -- read before valid. Auto (a stream, timed
+  // via `fifo`) is the only legitimate zero.
+  assert(impl == MemoryImplEnum::Auto &&
+         "storage impl not declared by the device -> silent latency-0 access");
   static const MemKindTiming zero;
   return zero;
 }

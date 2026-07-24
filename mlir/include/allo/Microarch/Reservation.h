@@ -45,11 +45,12 @@ Reservation reservationOf(const RegionBlock &region, const FuncUnit &unit,
 /// predicate a policy tests before merging two ops onto one unit.
 bool reservationsDisjoint(const Reservation &a, const Reservation &b);
 
-/// Whether two units realize the SAME operator type, a precondition for merging
-/// their ops onto one physical unit: identical mnemonic + realization + result
-/// type (an exact match; a covering ALU that realizes a superset is not
-/// shared). Combined with `reservationsDisjoint`, this is the full
-/// share-compatibility test.
+/// Whether two units realize the SAME physical operator, a precondition for
+/// merging their ops onto one unit: identical mnemonic + realization + result
+/// type, and representative ops agreeing on what the emitter reads from
+/// boundOps.front() -- operand widths, compare `predicate`, apply `map`. An
+/// exact match (a covering ALU realizing a superset is not shared). With
+/// `reservationsDisjoint`, the full share-compatibility test.
 bool sameOperatorType(const FuncUnit &a, const FuncUnit &b);
 
 /// Assert the binding is legal: no two ops bound to the same unit contend for

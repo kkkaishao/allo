@@ -24,6 +24,14 @@ LevelAnalysis mlir::allo::analyzeLevel(LoopLikeOpInterface level,
   LevelAnalysis result;
   Block &body = level.getLoopRegions().front()->front();
   Operation *levelOp = level.getOperation();
+  // getLoopRegions().front() is a for-loop's sole body region. An scf.while has
+  // two regions (before = condition, after = body); .front() would pick the
+  // condition, so the body's ops / footprints / recurrences would silently
+  // vanish from the level analysis. Callers gate on AffineForOp/scf.ForOp, so a
+  // while level never reaches here today.
+  assert(!isa<scf::WhileOp>(levelOp) &&
+         "analyzeLevel: getLoopRegions().front() is the scf.while condition "
+         "region, not its body");
 
   // Nodes = immediate children of the level body; map every op in a node's
   // subtree to that node and accumulate the node's footprint.
