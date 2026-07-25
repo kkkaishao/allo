@@ -5,8 +5,8 @@
 
 //===----------------------------------------------------------------------===//
 // Binding policies (pure decision). Compatibility is the exact MRT test from
-// Reservation.h -- bind-after-schedule makes it a set intersection, not a
-// lifetime heuristic. See BindingPolicy.h.
+// Reservation.h, since bind-after-schedule makes it a set intersection rather
+// than a lifetime heuristic. See BindingPolicy.h.
 //===----------------------------------------------------------------------===//
 
 #include "allo/Microarch/BindingPolicy.h"
@@ -31,7 +31,7 @@ GreedyShareBinding::plan(const Datapath &dp) const {
     llvm::SmallVector<llvm::SmallVector<UnitId, 2>> bins;
     for (UnitId uid : rb.units) {
       const FuncUnit &u = dp.units[uid];
-      Reservation ru = reservationOf(rb, u, u.boundOps.front().second);
+      auto ru = reservationOf(rb, u, u.boundOps.front().second);
       llvm::SmallVectorImpl<UnitId> *dest = nullptr;
       for (auto &bin : bins) {
         if (!sameOperatorType(dp.units[bin.front()], u))

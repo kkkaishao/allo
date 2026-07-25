@@ -22,22 +22,29 @@ from ...vitis.csim import _numpy_dtype_for_dtype
 _UINT = {8: np.uint8, 16: np.uint16, 32: np.uint32, 64: np.uint64}
 
 
-# The port-interface manifest arrives as JSON, one object per emitted module. Every
-# port name in it is a concrete field name (`out_wr_addr`, `s_data`, ...), so the
-# harness never re-derives one. The shape of a module's interface:
+# The port-interface manifest arrives as JSON, one object per emitted module, keyed
+# by the RTL module name. Every port name in it is a concrete field name
+# (`out_wr0_addr`, `s_st_data`, ...), so the harness never re-derives one. The shape
+# of a module's interface:
+#   module / symbol: the emitted RTL module name and the MLIR symbol it came from
+#   control: {clk, rst, start, done}, the fixed control ABI
 #   scalars: [{arg, width, name}]
 #   streams: [{arg, input, depth, width, base, data, valid, ready}]
-#   reads / writes: [[{arg, bank, factor, width, base, addr, data, [we]}]]
+#   reads / writes: [[{arg, bank, factor, width, latency, base, addr, data, [we]}]]
 #   results: [{width, name}]
+#   operators: [{module, impl, predicate, ports: [{name, width, role, input}]}]
 
 
 @dataclass
 class Mem:
     """One backing array behind an external kernel argument -- one *bank* of it
     when the argument is partitioned (a cyclic ``bank::factor`` slice) -- with the
-    ports that read from / write to it. ``readers`` are ``{addr, data}`` port-name
-    dicts, ``writers`` are ``{addr, data, we}`` (the concrete field names the
-    emitter chose). ``writeback`` marks an argument the kernel writes."""
+    ports that read from / write to it. ``readers`` are ``{addr, data, latency}``
+    port-name dicts, ``writers`` are ``{addr, data, we, latency}`` (the concrete
+    field names the emitter chose). ``latency`` is the device access latency the
+    schedule was solved against, and the driver must honor it (see
+    ``_serve_mem``).
+    ``writeback`` marks an argument the kernel writes."""
 
     arg: int
     np_dtype: type
@@ -93,11 +100,18 @@ def plan_mems(interface: dict, arg_types) -> list[Mem]:
 
     for acc in interface["reads"]:
         for r in acc:
-            entry(r).readers.append({"addr": r["addr"], "data": r["data"]})
+            entry(r).readers.append(
+                {"addr": r["addr"], "data": r["data"], "latency": r["latency"]}
+            )
     for acc in interface["writes"]:
         for w in acc:
             entry(w).writers.append(
-                {"addr": w["addr"], "data": w["data"], "we": w["we"]}
+                {
+                    "addr": w["addr"],
+                    "data": w["data"],
+                    "we": w["we"],
+                    "latency": w["latency"],
+                }
             )
     return list(mems.values())
 

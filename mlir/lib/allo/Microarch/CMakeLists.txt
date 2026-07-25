@@ -8,6 +8,7 @@ add_mlir_library(MLIRAlloMicroarch
     ControlEmitter.cpp
     DatapathEmitter.cpp
     HWEmitter.cpp
+    Naming.cpp
     Reservation.cpp
     ConcurrentEmitter.cpp
     Interface.cpp
@@ -26,6 +27,7 @@ add_mlir_library(MLIRAlloMicroarch
     MLIRIR
     CIRCTHW
     CIRCTComb
+    CIRCTSV
     CIRCTSeq
     CIRCTSupport
 )

@@ -862,6 +862,27 @@ struct SdcSchedulingPass
             .wasInterrupted())
       return signalPassFailure();
 
+    // The storage twin: an array resolving to a primitive the device declares
+    // no timing for (a `bind.storage impl=` or a `default_memory` naming an
+    // undeclared row) would fall to the zero-timing default and be scheduled
+    // combinationally -- read before valid. Reject it here rather than emit a
+    // design whose memory timing is fiction.
+    const MemoryLibrary &memLib = loadedLib.memoryLibrary();
+    if (module
+            .walk([&](Operation *op) {
+              MemoryImplEnum impl = memLib.resolvedImpl(op);
+              if (impl != MemoryImplEnum::Auto && !memLib.declares(impl)) {
+                error(Stage::Sched, op)
+                    << "no memory characterization for storage impl '"
+                    << stringifyMemoryImplEnum(impl)
+                    << "'; declare it in the device `memory` table";
+                return WalkResult::interrupt();
+              }
+              return WalkResult::advance();
+            })
+            .wasInterrupted())
+      return signalPassFailure();
+
     // Target clock period: the option overrides the device default, else 5.0
     // ns.
     float cycleTimeNs = cycleTime > 0.0f ? cycleTime : 5.0f;

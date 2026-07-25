@@ -6,13 +6,17 @@ emitter instantiates -- a float/double arithmetic core, a floating-point compare
 a float<->float resize, an int<->float cast, or an advanced ``math.*`` op, none of
 which has a comb lowering.
 
-The behavior is NOT inferred from the module name (that was a bootstrap harness).
-The device's operator table -- the same ``@ip`` records the scheduler was
-characterized from -- is threaded in as :class:`OpDesc` descriptors; the emitted
-hw IR supplies only the *structural* facts a descriptor cannot: which operators
-were actually instantiated, their realized port widths, whether they carry a
-``ce`` freeze bit, and (for a float compare) the per-instance predicate the
-emitter encoded as a name suffix.
+The behavior is not inferred from the module name. The device's operator table,
+the same ``@ip`` records the scheduler was characterized from, is threaded in as
+:class:`OpDesc` descriptors, and the port manifest supplies the *structural*
+facts a descriptor cannot:
+
+* which operators were actually instantiated;
+* their realized port names, widths and roles;
+* the per-instance predicate of a float compare.
+
+Every one of those is authored by the emitter and read here verbatim, so this
+module never parses IR or re-derives a name.
 
 An operator's behavior is a single **C expression** over its operands, bound as
 the positional typed C variables ``a``, ``b``, ``c``, ... . A built-in operator's
@@ -26,8 +30,6 @@ The SystemVerilog shell and the DPI-C function are rendered from the templates i
 """
 
 from __future__ import annotations
-
-import re
 
 from dataclasses import dataclass
 from pathlib import Path
@@ -61,64 +63,43 @@ class OpDesc:
     c_expr: str | None = None
 
 
-# --- structural read of the emitted externs --------------------------------
+# --- the externs, as the port manifest declares them ------------------------
 
 
 @dataclass(frozen=True)
 class _Extern:
     """An instantiated extern operator module: the descriptor plus the realized
-    port shape read from the IR (names preserved so the behavioral module matches
-    the extern's ports exactly)."""
+    port shape from the manifest, with names preserved so the behavioral module
+    matches the extern's ports exactly. Each port carries its role, so the clock,
+    the optional clock-enable and the result are found structurally; renaming one
+    in the emitter cannot silently turn it into a data operand."""
 
-    name: str  # full module name (base + optional predicate suffix)
-    ports: tuple[tuple[str, str, int], ...]  # (dir 'in'/'out', name, width) in order
-    pred: str  # compare predicate (or other name-encoded discriminant); "" if none
+    name: str  # the extern module's RTL name
+    ports: tuple[tuple[str, int, str], ...]  # (name, width, role) in order
+    pred: str  # compare predicate; "" if none
     desc: OpDesc
 
+    def _of_role(self, role: str) -> list[tuple[str, int]]:
+        return [(n, w) for n, w, r in self.ports if r == role]
+
     def data_inputs(self) -> list[tuple[str, int]]:
-        return [
-            (n, w) for d, n, w in self.ports if d == "in" and n not in ("clk", "ce")
-        ]
+        return self._of_role("data")
 
     @property
     def has_ce(self) -> bool:
-        return any(d == "in" and n == "ce" for d, n, _ in self.ports)
+        return bool(self._of_role("ce"))
 
     @property
     def clk(self) -> str:
-        return next((n for d, n, _ in self.ports if d == "in" and n == "clk"), "clk")
+        clks = self._of_role("clk")
+        assert clks, f"extern {self.name} has no clock port"
+        return clks[0][0]
 
     @property
     def out(self) -> tuple[str, int]:
-        for d, n, w in self.ports:
-            if d == "out":
-                return n, w
-        raise AssertionError(f"extern {self.name} has no output port")
-
-
-# One `hw.module.extern @name(<ports>)`. `[^)]*` is safe because the operator
-# port types are all `iN` (bit-blasted) -- no nested parens -- and it spans
-# newlines (a char class matches `\n`), so a wrapped port list still parses.
-_EXTERN = re.compile(r"hw\.module\.extern @(\w+)\(([^)]*)\)")
-# One port `in %a : i32` / `out y : i32` (anchored at the token start; the `%` is
-# present on inputs, absent on the result). Matched per comma-split token so an
-# unrecognized port fails loudly rather than being silently dropped.
-_PORT = re.compile(r"(in|out)\s+%?(\w+)\s*:\s*i(\d+)")
-
-
-def _parse_ports(portstr: str) -> tuple[tuple[str, str, int], ...]:
-    """The ordered (dir, name, width) ports of an extern. Every comma-separated
-    token must parse -- a port shape the emitter produced that this does not
-    understand is a bug, not something to skip silently."""
-    ports = []
-    for tok in portstr.split(","):
-        tok = tok.strip()
-        if not tok:
-            continue
-        m = _PORT.match(tok)
-        assert m, f"ip_models: unrecognized extern operator port {tok!r}"
-        ports.append((m.group(1), m.group(2), int(m.group(3))))
-    return tuple(ports)
+        outs = self._of_role("out")
+        assert outs, f"extern {self.name} has no output port"
+        return outs[0]
 
 
 _TEMPLATE_DIR = Path(__file__).with_name("templates")
@@ -241,27 +222,23 @@ def _store(ty: Ty, val: str) -> str:
 # --- join externs to descriptors -------------------------------------------
 
 
-def _split_name(name: str, by_name: dict[str, OpDesc]) -> tuple[OpDesc, str]:
-    """Join an extern module name to its descriptor: an exact match, else the
-    longest descriptor whose name is a ``<name>_`` prefix (the emitter's compare
-    suffix). The trailing part is the predicate/discriminant."""
-    if name in by_name:
-        return by_name[name], ""
-    cands = [b for b in by_name if name.startswith(b + "_")]
-    assert cands, f"extern operator '{name}' has no matching device operator"
-    base = max(cands, key=len)
-    return by_name[base], name[len(base) + 1 :]
-
-
-def _plan(ir: str, descs) -> list[_Extern]:
-    """The instantiated extern operators, each joined to its descriptor."""
+def _plan(interfaces: dict, descs) -> list[_Extern]:
+    """The extern operators instantiated across every emitted module, each joined
+    to its device descriptor. The manifest names the descriptor (``impl``) and the
+    per-instance predicate outright, so the join is a plain lookup. One entry per
+    module, since several kernels may instantiate the same operator and share one
+    behavioral model."""
     by_name = {d.name: d for d in descs}
-    out = []
-    for m in _EXTERN.finditer(ir):
-        name, portstr = m.group(1), m.group(2)
-        desc, pred = _split_name(name, by_name)
-        out.append(_Extern(name, _parse_ports(portstr), pred, desc))
-    return out
+    seen: dict[str, _Extern] = {}
+    for iface in interfaces.values():
+        for op in iface["operators"]:
+            if op["module"] in seen:
+                continue
+            desc = by_name.get(op["impl"])
+            assert desc, f"extern operator '{op['impl']}' has no device operator"
+            ports = tuple((p["name"], p["width"], p["role"]) for p in op["ports"])
+            seen[op["module"]] = _Extern(op["module"], ports, op["predicate"], desc)
+    return list(seen.values())
 
 
 # --- rendering -------------------------------------------------------------
@@ -286,9 +263,9 @@ def _dpi_slots(e: _Extern) -> tuple[str, str]:
     return binds, body
 
 
-def dpi_c(ir: str, descs) -> str:
+def dpi_c(interfaces: dict, descs) -> str:
     """C implementations of the DPI operators the instantiated externs need."""
-    plan = _plan(ir, descs)
+    plan = _plan(interfaces, descs)
     if not plan:
         return ""
     fns: dict[str, str] = {}
@@ -304,10 +281,10 @@ def dpi_c(ir: str, descs) -> str:
     return _render("dpi_c.in", functions="\n".join(fns.values()))
 
 
-def sv_models(ir: str, descs) -> str:
+def sv_models(interfaces: dict, descs) -> str:
     """SystemVerilog behavioral models + DPI import decls for the instantiated
     extern IP operators."""
-    plan = _plan(ir, descs)
+    plan = _plan(interfaces, descs)
     if not plan:
         return ""
     imports: dict[str, str] = {}

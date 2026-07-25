@@ -62,7 +62,8 @@ struct DatapathBuilder {
   llvm::DenseMap<Value, Source> ioOf;
   llvm::DenseMap<Operation *, unsigned> regionIdxOf;
   llvm::StringMap<unsigned> boundaryBaseSeq; // CallUnit boundary port groups:
-                                             // running accessor index per base
+                                             // running accessor index per
+                                             // (memory, role)
 
   // Interconnect-derivation scratch (transient; see deriveInterconnect).
   // A register is keyed by (held value, consuming region): the SAME value (an
@@ -90,12 +91,14 @@ struct DatapathBuilder {
                                   // `sources` survive later pushes
 
   const BindingPolicy &policy; // decides resource sharing
+  const MemoryLibrary &memLib; // device storage timing (impl + access latency)
   const CalleeCtx *callees;    // child modules/ifaces for a dcp.instance
                                // (null for a plain leaf, no calls)
 
   DatapathBuilder(Datapath &dp, func::FuncOp func, const BindingPolicy &policy,
+                  const MemoryLibrary &memLib,
                   const CalleeCtx *callees = nullptr)
-      : dp(dp), func(func), policy(policy), callees(callees) {}
+      : dp(dp), func(func), policy(policy), memLib(memLib), callees(callees) {}
 
   /// build the datapath model
   void build();

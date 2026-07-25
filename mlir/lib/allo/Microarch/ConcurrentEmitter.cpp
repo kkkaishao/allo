@@ -25,11 +25,11 @@ using namespace circt;
 
 namespace mlir::allo::uarch {
 
-// A loop-over-calls container: a single sync sub-kernel call inside one counted
-// `dcp.pipeline` (the reified loop) directly in the container body -- one child
-// instance invoked N times, driven by a loop counter (vs. a flat call graph).
-// Returns the loop, or null if `func` is not this shape (exactly one call, one
-// counted loop).
+// A loop-over-calls container: a single sync sub-kernel call inside one
+// counted `dcp.pipeline` (the reified loop) directly in the container body:
+// one child instance invoked N times, driven by a loop counter, rather than
+// a flat call graph. Returns the loop, or null if `func` is not this shape
+// (exactly one call, one counted loop).
 static dcp::DCPathPipelineOp loopOverCall(func::FuncOp func) {
   SmallVector<func::CallOp> calls;
   func.walk([&](func::CallOp c) {
@@ -173,7 +173,7 @@ struct ConcurrentTopBuilder {
 
   // Rising-edge pulse of a held level (high the one cycle it goes 0->1). A
   // child `done` is a held level; gating a Route-A successor's `start` (a
-  // 1-cycle pulse) on it needs the edge -- the same hand-off sequence() uses to
+  // 1-cycle pulse) on it needs the edge, the same hand-off sequence() uses to
   // chain a kernel's regions, lifted to `hw.instance`s.
   Value risingEdge(OpBuilder &ib, Value level) {
     Value zero = hw::ConstantOp::create(ib, loc, i1, 0);
@@ -185,8 +185,9 @@ struct ConcurrentTopBuilder {
 
   // A start pulse delayed \p n cycles: an n-deep 1-bit shift register (each
   // stage resets to 0, so no spurious start out of reset). Used to fire a
-  // sequential child's `start` at its scheduled offset. (n is small -- a region
-  // depth; a counter+compare would scale better for very large offsets.)
+  // sequential child's `start` at its scheduled offset (n is small, bounded
+  // by a region's depth; a counter+compare would scale better for very large
+  // offsets).
   Value delayPulse(OpBuilder &ib, Value sig, int64_t n) {
     Value zero = hw::ConstantOp::create(ib, loc, i1, 0);
     Value d = sig;
@@ -199,7 +200,7 @@ struct ConcurrentTopBuilder {
 // Collect the spawned process instances, in program order.
 void ConcurrentTopBuilder::collectInstances() {
   container.walk([&](func::CallOp call) {
-    hw::HWModuleOp mod = modules.lookup(call.getCallee());
+    auto mod = modules.lookup(call.getCallee());
     auto it = ifaceModels.find(call.getCallee());
     assert(mod && it != ifaceModels.end() &&
            "spawned callee has no emitted module / interface (a nested "
@@ -207,16 +208,12 @@ void ConcurrentTopBuilder::collectInstances() {
     int64_t off = 0;
     if (auto s = call->getAttrOfType<IntegerAttr>("start"))
       off = s.getInt();
-    // Determinate (Route B): a non-async callee whose whole-kernel span is
-    // exact (`counted_static`), so it releases a consumer at a static offset
-    // rather than on its real `done`. Read the reifier-stamped
-    // `dcp.determinacy` instead of re-deriving it. The callee is resolved
-    // through `scheduledFuncs`, not a symbol lookup: its `hw.module` shares the
-    // symbol name, so a callsite lookup may land on the module, not the
-    // `func.func`.
+    // Determinate (Route B): a non-async callee with an exact whole-kernel
+    // latency (`dcp.determinacy` == counted_static) releases the consumer at
+    // a static offset instead of its real `done`; resolved via scheduledFuncs.
     bool determinate = false;
     if (!call->hasAttr(kAlloAsyncAttr)) {
-      func::FuncOp callee = scheduledFuncs.lookup(call.getCallee());
+      auto callee = scheduledFuncs.lookup(call.getCallee());
       auto det =
           callee ? callee->getAttrOfType<DeterminacyEnumAttr>("dcp.determinacy")
                  : DeterminacyEnumAttr();
@@ -239,18 +236,18 @@ void ConcurrentTopBuilder::collectInstances() {
 // callees' own read/write direction (`mi->reads`/`writes`) and SSA-operand
 // identity (two calls share an array iff passed the same value). The gate
 // drives the start policy: a determinate producer releases the consumer by a
-// static offset (Route B), an indeterminate one (async / data-dependent) by its
-// real `done` (Route A) -- an unknown span cannot be expressed as an offset.
-// Pure-dataflow children hand off through FIFOs, never a shared array, so they
-// stay ungated. Producers precede consumers in program order, so the gates form
-// a DAG.
+// static offset (Route B); an indeterminate one (async / data-dependent)
+// releases it by its real `done` (Route A), since an unknown span cannot be
+// expressed as an offset. Pure-dataflow children hand off through FIFOs,
+// never a shared array, so they stay ungated. Producers precede consumers in
+// program order, so the gates form a DAG.
 //
-// This is a COARSER test than the scheduler's (whole-array, no element ranges),
-// so a pair the scheduler proved disjoint may still be gated. That costs
-// nothing when both children are determinate -- the gate is inert and each
-// still fires at its own scheduled offset, concurrently -- and only forgoes
-// overlap against an indeterminate producer, whose completion the emitter
-// cannot place statically anyway.
+// This is a COARSER test than the scheduler's (whole-array, no element
+// ranges), so a pair the scheduler proved disjoint may still be gated. That
+// costs nothing when both children are determinate (the gate is inert and
+// each still fires at its own scheduled offset, concurrently), and only
+// forgoes overlap against an indeterminate producer, whose completion the
+// emitter cannot place statically anyway.
 void ConcurrentTopBuilder::computeStartGates() {
   auto memOperands = [](Inst &in, bool write) {
     SmallVector<Value> vs;
@@ -263,11 +260,11 @@ void ConcurrentTopBuilder::computeStartGates() {
     return llvm::any_of(a, [&](Value v) { return llvm::is_contained(b, v); });
   };
   for (unsigned j = 0; j < insts.size(); ++j) {
-    SmallVector<Value> reads = memOperands(insts[j], /*write=*/false);
-    SmallVector<Value> writes = memOperands(insts[j], /*write=*/true);
+    auto reads = memOperands(insts[j], /*write=*/false);
+    auto writes = memOperands(insts[j], /*write=*/true);
     for (unsigned i = 0; i < j; ++i) {
-      SmallVector<Value> pReads = memOperands(insts[i], /*write=*/false);
-      SmallVector<Value> pWrites = memOperands(insts[i], /*write=*/true);
+      auto pReads = memOperands(insts[i], /*write=*/false);
+      auto pWrites = memOperands(insts[i], /*write=*/true);
       // This child reads or writes an array the earlier one wrote (RAW / WAW),
       // or writes one it read (WAR).
       if (shares(pWrites, reads) || shares(pWrites, writes) ||
@@ -280,18 +277,17 @@ void ConcurrentTopBuilder::computeStartGates() {
 // Discover channels from each `stream.create` and its producer/consumer.
 // Channels are single-producer / single-consumer. A stream read by two
 // processes (SPMC broadcast) or written by two (MPSC merge) is reported as a
-// user-facing error rather than an internal assert -- broadcast is not inserted
-// automatically (write one channel per consumer), and deterministic merge is
-// not supported.
+// user-facing error rather than an internal assert: broadcast is not
+// inserted automatically (write one channel per consumer), and deterministic
+// merge is not supported.
 LogicalResult ConcurrentTopBuilder::discoverChannels() {
   for (unsigned ii = 0; ii < insts.size(); ++ii) {
     Inst &in = insts[ii];
     for (const iface::FIFO &f : in.mi->streams) {
       Value stream = in.call.getOperand(f.arg);
-      // A stream arg is either an internal channel (a local `stream.create`) or
-      // a container boundary (a block argument forwarded from the enclosing
-      // container). Boundaries carry no FIFO here -- they are top stream ports
-      // wired to the parent's FIFO -- and are planned in planBoundaryPorts.
+      // A stream arg is either an internal channel (a local `stream.create`)
+      // or a container boundary forwarded from the enclosing container;
+      // boundaries get a top stream port instead, planned in planBoundaryPorts.
       if (isa<BlockArgument>(stream))
         continue;
       assert(stream.getDefiningOp<StreamCreateOp>() &&
@@ -352,13 +348,14 @@ LogicalResult ConcurrentTopBuilder::discoverChannels() {
   return success();
 }
 
-// Liveness: a directed cycle carrying no initial tokens deadlocks -- every
-// process on it blocks reading an empty channel, so the composed design would
-// hang. A seeded channel breaks a cycle's start dependence, so it suffices that
-// the graph of unseeded channels is acyclic. Report the first zero-token cycle
-// through the logger, with the container as the error subject (which marks the
-// failure for the Python caller to raise). Insufficient seeding -- fewer tokens
-// than the recurrence distance -- is not caught here; it surfaces as a hang.
+// Liveness: a directed cycle carrying no initial tokens deadlocks, since
+// every process on it blocks reading an empty channel and the composed
+// design would hang. A seeded channel breaks a cycle's start dependence, so
+// it suffices that the graph of unseeded channels is acyclic. Report the
+// first zero-token cycle through the logger, with the container as the error
+// subject (which marks the failure for the Python caller to raise).
+// Insufficient seeding (fewer tokens than the recurrence distance) is not
+// caught here; it surfaces as a hang.
 LogicalResult ConcurrentTopBuilder::checkFeedbackSeeding() {
   unsigned n = insts.size();
   SmallVector<SmallVector<unsigned>> adj(n); // producer -> consumer, unseeded
@@ -419,39 +416,33 @@ LogicalResult ConcurrentTopBuilder::checkFeedbackSeeding() {
 // two arguments never collide even when callees name their params the same;
 // direction and width come straight from the callee port.
 void ConcurrentTopBuilder::planBoundaryPorts() {
-  // A boundary argument may be shared by SEVERAL children, and what that costs
-  // depends on the kind of boundary:
+  // A boundary argument shared by several children costs differently by
+  // kind: MEMORY = one port group per access (bound to one backing array);
+  // SCALAR = one port fanned to all users; STREAM = single-producer/consumer,
+  // rejected if shared.
   //
-  //   * a MEMORY is a port resource -- each access gets its own port group on
-  //     the top (bases disambiguated below), because two children accessing one
-  //     array concurrently genuinely need two ports. The cosim harness binds
-  //     every group of an argument to the one backing array (it groups by
-  //     argument index and services each group), so N groups need no top-side
-  //     storage or mux;
-  //   * a SCALAR is a value -- one top port fans out to every user;
-  //   * a STREAM is a channel -- single-producer / single-consumer, so a shared
-  //     boundary stream is rejected (as an internal channel is).
-  //
-  // Whether two children may share an array at all is the SCHEDULE's call, not
-  // the emitter's: a real hazard makes the scheduler order the pair, and the
-  // emitter realizes that order (each child fires at its scheduled offset, or
-  // on its producer's `done`). A pair the scheduler leaves unordered shares
-  // only reads or provably disjoint elements, so its port groups are concurrent
-  // by design.
-  llvm::StringMap<unsigned> baseSeq; // port base -> accessors seen
+  // Whether two children may share an array is the SCHEDULE's call, not the
+  // emitter's: a hazard makes the scheduler order the pair, which the
+  // emitter realizes via start offset or `done`; an unordered pair is
+  // concurrent by design.
+
+  // Accessor groups seen per (top argument, role): the group index the top's
+  // port base carries, so several children accessing one argument never
+  // collide. Keyed on the argument's own owner token, not on a port position.
+  llvm::StringMap<unsigned> groupSeq;
   llvm::DenseMap<int64_t, std::pair<std::string, Type>>
       scalarPort;                                // arg -> its one top port
   llvm::DenseMap<int64_t, unsigned> streamOwner; // arg -> owning instance
-  auto boundaryBase = [&](Inst &in, unsigned calleeArg,
-                          StringRef role) -> std::string {
-    auto arg = cast<BlockArgument>(in.call.getOperand(calleeArg));
-    std::string base =
-        cellName(arg.getLoc(), ("arg" + Twine(arg.getArgNumber())).str()) +
-        "_" + role.str();
-    // The first accessor keeps the plain `<arg>_<role>` name; a further one is
-    // suffixed, so several children accessing one argument never collide.
-    unsigned n = baseSeq[base]++;
-    return n ? base + "_" + std::to_string(n) : base;
+  // A boundary operand is always a container block argument, asserted in
+  // `topArg`, so `ownerOf` resolves to a source name or `a<argNo>` and the
+  // fallback is unreachable.
+  auto owner = [&](Inst &in, unsigned calleeArg) {
+    return ownerOf(in.call.getOperand(calleeArg), "");
+  };
+  auto boundaryMemBase = [&](Inst &in, unsigned calleeArg,
+                             bool write) -> std::string {
+    std::string own = owner(in, calleeArg);
+    return memBase(own, write, groupSeq[own + (write ? "w" : "r")]++);
   };
   auto topArg = [&](Inst &in, unsigned calleeArg) -> int64_t {
     auto arg = cast<BlockArgument>(in.call.getOperand(calleeArg));
@@ -474,8 +465,7 @@ void ConcurrentTopBuilder::planBoundaryPorts() {
       Type ty = in.ports[sc.name].type;
       auto it = scalarPort.find(arg);
       if (it == scalarPort.end()) {
-        std::string tn = cellName(
-            cast<BlockArgument>(in.call.getOperand(sc.arg)).getLoc(), sc.name);
+        auto tn = scalarBase(owner(in, sc.arg));
         topIface.scalars.push_back({(int)arg, sc.width, tn});
         it = scalarPort.insert({arg, {tn, ty}}).first;
       }
@@ -484,38 +474,36 @@ void ConcurrentTopBuilder::planBoundaryPorts() {
       mirror(in, sc.name, it->second.first, ii);
     }
     auto memPorts = [&](const std::vector<std::vector<iface::Memory>> &accs,
-                        StringRef role, bool write) {
+                        bool write) {
       for (const auto &grp : accs)
         for (const iface::Memory &cm : grp) {
           if (!isa<BlockArgument>(in.call.getOperand(cm.arg)))
             continue; // an internal buffer -> hlmem in the top, not a port
-          std::string tbase = boundaryBase(in, cm.arg, role);
-          mirror(in, cm.addr, iface::addr(tbase), ii);
-          mirror(in, cm.data, iface::data_(tbase), ii);
+          auto tbase = boundaryMemBase(in, cm.arg, write);
+          mirror(in, cm.addr, portAddr(tbase), ii);
+          mirror(in, cm.data, portData(tbase), ii);
           if (write)
-            mirror(in, cm.we, iface::we(tbase), ii);
+            mirror(in, cm.we, portWe(tbase), ii);
           iface::Memory mem{(int)topArg(in, cm.arg),
                             write,
                             cm.bank,
                             cm.factor,
                             cm.width,
+                            cm.latency,
                             tbase,
-                            iface::addr(tbase),
-                            iface::data_(tbase),
-                            write ? iface::we(tbase) : std::string()};
+                            portAddr(tbase),
+                            portData(tbase),
+                            write ? portWe(tbase) : std::string()};
           (write ? topIface.writes : topIface.reads)
               .push_back({std::move(mem)});
         }
     };
-    memPorts(in.mi->reads, "rd", /*write=*/false);
-    memPorts(in.mi->writes, "wr", /*write=*/true);
-    // Stream boundaries: a stream arg bound to a container block argument is
-    // forwarded as a top stream port -- the enclosing container connects its
-    // FIFO here. Internal channels (a local `stream.create`) are skipped; they
-    // get a FIFO in discoverChannels/wireFifos. The three field ports mirror
-    // with their own callee directions, so an input stream (a `get`) exposes
-    // data/valid in + ready out, and an output stream (a `put`) the reverse --
-    // exactly a leaf's stream port, so the parent wires it like any callee.
+    memPorts(in.mi->reads, /*write=*/false);
+    memPorts(in.mi->writes, /*write=*/true);
+    // Stream boundaries: a stream arg bound to a container block argument
+    // forwards as a top stream port, mirrored with the callee's own
+    // directions (internal channels get a FIFO instead, in
+    // discoverChannels/wireFifos).
     for (const iface::FIFO &f : in.mi->streams) {
       if (!isa<BlockArgument>(in.call.getOperand(f.arg)))
         continue;
@@ -527,13 +515,14 @@ void ConcurrentTopBuilder::planBoundaryPorts() {
                       "unsupported (a channel is single-producer / "
                       "single-consumer)");
       (void)fresh;
-      std::string tbase = boundaryBase(in, f.arg, "strm");
-      mirror(in, f.data, iface::data_(tbase), ii);
-      mirror(in, f.valid, iface::valid(tbase), ii);
-      mirror(in, f.ready, iface::ready(tbase), ii);
+      // Single-owner, so no group index: the same `<arg>_st` a leaf presents.
+      auto tbase = streamBase(owner(in, f.arg));
+      mirror(in, f.data, portData(tbase), ii);
+      mirror(in, f.valid, portValid(tbase), ii);
+      mirror(in, f.ready, portReady(tbase), ii);
       topIface.streams.push_back({(int)topArg(in, f.arg), f.isInput, f.depth,
-                                  f.width, tbase, iface::data_(tbase),
-                                  iface::valid(tbase), iface::ready(tbase)});
+                                  f.width, tbase, portData(tbase),
+                                  portValid(tbase), portReady(tbase)});
     }
     assert(in.mi->results.empty() &&
            "a process returning a scalar result is unsupported");
@@ -545,7 +534,7 @@ void ConcurrentTopBuilder::planBoundaryPorts() {
 llvm::MapVector<Value, ChanWires>
 ConcurrentTopBuilder::buildChannelWires(OpBuilder &ib, BackedgeBuilder &bb) {
   llvm::MapVector<Value, ChanWires> cw;
-  for (auto &kv : chans) {
+  for (auto [idx, kv] : llvm::enumerate(chans)) {
     Chan &c = kv.second;
     ChanWires w{};
     w.full = bb.get(i1);
@@ -563,8 +552,9 @@ ConcurrentTopBuilder::buildChannelWires(OpBuilder &ib, BackedgeBuilder &bb) {
         return hw::ConstantOp::create(ib, loc, remTy, v);
       };
       w.remNext = bb.get(remTy);
-      w.rem = seq::CompRegOp::create(ib, loc, w.remNext, clk, rst, rc(k),
-                                     "fifo_init_rem");
+      w.rem = seq::CompRegOp::create(
+          ib, loc, w.remNext, clk, rst, rc(k),
+          channelSignal(ownerOf(kv.first, chanOwner(idx)), "init_rem"));
       w.servingInit =
           comb::ICmpOp::create(ib, loc, comb::ICmpPredicate::ne, w.rem, rc(0));
       // Data from the init ROM by the running index (idx = k-rem, served in
@@ -604,32 +594,27 @@ void ConcurrentTopBuilder::instantiateProcesses(
   for (unsigned ii = 0; ii < insts.size(); ++ii) {
     Inst &in = insts[ii];
     llvm::StringMap<Value> ins;
-    ins["clk"] = clkRaw;
-    ins["rst"] = rst;
-    // Start policy, schedule-driven and per child -- one map, no container-wide
-    // mode. A child gated on any INDETERMINATE producer takes Route A: the
-    // rising edge of its producers' joined `done` (a data-dependent hand-off,
-    // the last producer to finish releases it -- covers df->seq and a
-    // `while`-leaf producer). An async spawn broadcasts with the region `start`
-    // (self-timed; FIFO backpressure orders the rest). Everything else fires at
-    // its scheduled offset (Route B static node; an independent child has
-    // offset 0 = the region start). Producers precede this child, so their
-    // `done`s are already wired.
+    ins[kClk] = clkRaw;
+    ins[kRst] = rst;
+    // Start policy, schedule-driven per child: a child gated on any
+    // INDETERMINATE producer takes Route A (rising edge of joined `done`);
+    // an async spawn broadcasts `start`; everything else fires at its Route B
+    // scheduled offset.
     bool routeA = llvm::any_of(
         in.gateOns, [&](unsigned p) { return !insts[p].determinate; });
     if (routeA) {
       Value ready;
       for (unsigned p : in.gateOns) {
-        Value d = insts[p].outs["done"];
+        Value d = insts[p].outs[kDone];
         ready = ready
                     ? comb::AndOp::create(ib, loc, ready, d, false).getResult()
                     : d;
       }
-      ins["start"] = risingEdge(ib, ready);
+      ins[kStart] = risingEdge(ib, ready);
     } else if (in.isAsync)
-      ins["start"] = start;
+      ins[kStart] = start;
     else
-      ins["start"] = delayPulse(ib, start, in.startOffset);
+      ins[kStart] = delayPulse(ib, start, in.startOffset);
     for (const iface::FIFO &f : in.mi->streams) {
       // A boundary stream is a top stream port, wired through the mirror loop
       // below; only internal channels connect to a FIFO's status wires here.
@@ -647,7 +632,8 @@ void ConcurrentTopBuilder::instantiateProcesses(
       if (m.inst == ii && m.isInput)
         ins[m.calleeName] = pa.getInput(m.topName);
 
-    in.outs = instantiateChild(ib, loc, in.mod, in.call.getCallee(), ins);
+    in.outs = instantiateChild(ib, loc, in.mod,
+                               childInstanceName(in.call.getCallee(), ii), ins);
   }
 }
 
@@ -659,9 +645,9 @@ void ConcurrentTopBuilder::wireFifos(OpBuilder &ib,
   for (auto &kv : chans) {
     Chan &c = kv.second;
     ChanWires &w = cw[kv.first];
-    Value pData = insts[c.prod].outs[iface::data_(c.prodBase)];
-    Value pValid = insts[c.prod].outs[iface::valid(c.prodBase)];
-    Value cReady = insts[c.cons].outs[iface::ready(c.consBase)];
+    Value pData = insts[c.prod].outs[portData(c.prodBase)];
+    Value pValid = insts[c.prod].outs[portValid(c.prodBase)];
+    Value cReady = insts[c.cons].outs[portReady(c.consBase)];
     Value wrEn = comb::AndOp::create(ib, loc, pValid, w.notFull, false);
     Value rdEn = comb::AndOp::create(ib, loc, cReady, w.notEmpty, false);
     if (w.rem) {
@@ -688,10 +674,10 @@ void ConcurrentTopBuilder::forkJoin(OpBuilder &ib,
                                     hw::HWModulePortAccessor &pa) {
   Value done;
   for (Inst &in : insts) {
-    Value d = in.outs["done"];
+    Value d = in.outs[kDone];
     done = done ? comb::AndOp::create(ib, loc, done, d, false).getResult() : d;
   }
-  pa.setOutput("done", done ? done : tru);
+  pa.setOutput(kDone, done ? done : tru);
   for (const Mirror &m : mirrors)
     if (!m.isInput)
       pa.setOutput(m.topName, insts[m.inst].outs[m.calleeName]);
@@ -700,12 +686,12 @@ void ConcurrentTopBuilder::forkJoin(OpBuilder &ib,
 void ConcurrentTopBuilder::buildBody(OpBuilder &ib,
                                      hw::HWModulePortAccessor &pa) {
   BackedgeBuilder bb(ib, loc);
-  clkRaw = pa.getInput("clk");
-  rst = pa.getInput("rst");
-  start = pa.getInput("start");
+  clkRaw = pa.getInput(kClk);
+  rst = pa.getInput(kRst);
+  start = pa.getInput(kStart);
   clk = seq::ToClockOp::create(ib, loc, clkRaw);
   tru = hw::ConstantOp::create(ib, loc, i1, 1);
-  llvm::MapVector<Value, ChanWires> cw = buildChannelWires(ib, bb);
+  auto cw = buildChannelWires(ib, bb);
   instantiateProcesses(ib, pa, cw);
   wireFifos(ib, cw);
   forkJoin(ib, pa);
@@ -713,16 +699,10 @@ void ConcurrentTopBuilder::buildBody(OpBuilder &ib,
 
 LogicalResult ConcurrentTopBuilder::run(hw::HWModuleOp &modOut,
                                         iface::ModuleInterface &ifaceOut) {
-  // The router sends only a CONCURRENT container here (the structural top wires
-  // already-emitted callee instances + channels + shared memory; it emits no
-  // datapath of its own). A concurrent container with its OWN loose
-  // `dcp.load`/`store`/`compute` at the top level (datapath work beside the
-  // `await` network, not inside a spawned child) is unmodellable here -- it
-  // would silently drop the loose region or mis-wire a cross-region survivor.
-  // Reject it loudly rather than miscompile. (A non-concurrent container's
-  // loose ops lower on the leaf; async processes and the mixed container's sync
-  // child carry their datapath inside their own callee, so a concurrent
-  // container's top-level body is loose-free in practice.)
+  // The router sends only a CONCURRENT container here: the structural top
+  // wires already-emitted callee instances, channels, and shared memory,
+  // with no datapath of its own; loose top-level datapath ops are rejected
+  // below rather than silently mis-wired.
   bool looseDatapath = false;
   container.walk([&](Operation *op) {
     if (isa<dcp::DCPathLoadOp, dcp::DCPathStoreOp, dcp::DCPathComputeOp>(op))
@@ -736,10 +716,9 @@ LogicalResult ConcurrentTopBuilder::run(hw::HWModuleOp &modOut,
         "instances "
         "+ channels only");
 
-  // A loop-over-calls container lowers to the leaf CallUnit path; reaching the
-  // structural top means its callee is not leaf-eligible (a banked buffer, an
-  // indeterminate child). Reject loudly rather than mis-wire it as a flat call
-  // graph (the child would fire once, not once per iteration).
+  // A loop-over-calls container lowers to the leaf CallUnit path; reaching
+  // the structural top means its callee is not leaf-eligible (a banked or
+  // indeterminate child), which would fire once instead of once per iteration.
   if (loopOverCall(container))
     return container.emitError("allo-datapath-to-hw: a loop-over-calls "
                                "container must lower to the leaf CallUnit "
@@ -753,17 +732,18 @@ LogicalResult ConcurrentTopBuilder::run(hw::HWModuleOp &modOut,
   if (failed(checkFeedbackSeeding()))
     return failure();
   planBoundaryPorts();
-  // Declare the top's ports from its composed port model -- the same canonical
+  // Declare the top's ports from its composed port model, the same canonical
   // ABI declaration a leaf uses (declareModulePorts); `mirrors` still drives
   // the by-name body wiring below.
-  SmallVector<hw::PortInfo> ports = declareModulePorts(topIface, b);
-  // Hand back the emitted module and its port model so the caller can register
-  // them -- an enclosing container consumes this top exactly like a leaf. The
-  // model is the single representation (its toJSON() is the cosim manifest), so
-  // no IR attribute is attached.
+  auto ports = declareModulePorts(topIface, b);
+  // Hand back the emitted module and its port model so the caller can
+  // register them, since an enclosing container consumes this top exactly
+  // like a leaf; the model (its toJSON() is the cosim manifest) needs no IR
+  // attribute.
+  topIface.symbol = container.getSymName().str();
+  topIface.module = verilogName(topIface.symbol);
   modOut = hw::HWModuleOp::create(
-      b, loc, StringAttr::get(ctx, container.getSymName()),
-      hw::ModulePortInfo(ports),
+      b, loc, StringAttr::get(ctx, topIface.module), hw::ModulePortInfo(ports),
       [&](OpBuilder &ib, hw::HWModulePortAccessor &pa) { buildBody(ib, pa); });
   ifaceOut = std::move(topIface);
   return success();

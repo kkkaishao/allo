@@ -393,6 +393,50 @@ LogicalResult DCPathComputeOp::verify() {
   return success();
 }
 
+LogicalResult DCPathDeviceOp::verify() {
+  // The storage tables are read by name, so a row this dialect cannot symbolize
+  // -- or one missing a timing field -- would be silently skipped by
+  // `memoryFromDevice` and leave every array of that implementation timed at
+  // zero (scheduled combinationally, read before valid). Reject it here, where
+  // the offending device op is at hand.
+  auto verifyTiming = [&](Attribute v, const Twine &what) -> LogicalResult {
+    auto d = dyn_cast<DictionaryAttr>(v);
+    if (!d)
+      return emitOpError(what) << " timing must be a dictionary";
+    for (StringRef k : {"rd_lat", "wr_lat"})
+      if (!d.getAs<IntegerAttr>(k))
+        return emitOpError(what)
+               << " timing is missing an integer '" << k << "'";
+    for (StringRef k : {"rd_delay", "wr_delay"})
+      if (!d.getAs<FloatAttr>(k))
+        return emitOpError(what) << " timing is missing a float '" << k << "'";
+    return success();
+  };
+  for (NamedAttribute na : getMemory()) {
+    StringRef name = na.getName().strref();
+    if (!symbolizeMemoryImplEnum(name))
+      return emitOpError("unknown storage implementation '")
+             << name << "' in the memory table";
+    if (failed(verifyTiming(na.getValue(), "storage '" + name + "'")))
+      return failure();
+  }
+  if (Attribute fifo = getFifoAttr())
+    if (failed(verifyTiming(fifo, "fifo")))
+      return failure();
+  // An unsymbolizable `default_memory` would be dropped, silently leaving every
+  // unbound array on the library's built-in default rather than the requested
+  // implementation.
+  if (StringAttr def = getDefaultMemoryAttr()) {
+    std::optional<MemoryImplEnum> impl = symbolizeMemoryImplEnum(def.strref());
+    if (!impl)
+      return emitOpError("unknown default_memory '") << def.strref() << "'";
+    if (!getMemory().getAs<DictionaryAttr>(def.strref()))
+      return emitOpError("default_memory '")
+             << def.strref() << "' is not declared in the memory table";
+  }
+  return success();
+}
+
 LogicalResult
 DCPathInstanceOp::verifySymbolUses(SymbolTableCollection &symbolTable) {
   // The callee is a scheduled `func.func` at reify time (an `hw.module` after

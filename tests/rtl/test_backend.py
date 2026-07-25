@@ -307,12 +307,203 @@ def test_banked_boundary_argument():
     iface = mod.interfaces[mod.top]
     rbases = {r["base"] for acc in iface["reads"] for r in acc}
     wbases = {w["base"] for acc in iface["writes"] for w in acc}
-    assert {"A_rd_b0", "A_rd_b1"} <= rbases
-    assert {"out_wr_b0", "out_wr_b1"} <= wbases
+    assert {"A_rd0_b0", "A_rd0_b1"} <= rbases
+    assert {"out_wr0_b0", "out_wr0_b1"} <= wbases
 
     out = np.zeros(16, np.int32)
     mod.cosim(A16, out)
     assert np.array_equal(out, A16 + 1)
+
+
+def test_port_name_grammar():
+    """The port-name grammar (`Naming.h`), pinned on its two guarantees.
+
+    Legality: the manifest is authored before CIRCT legalizes names, so a name
+    ExportVerilog would rewrite desyncs the cosim harness from the DUT, which
+    then binds a port that does not exist. Two sources of a rewrite are covered:
+    a source identifier that is a SystemVerilog keyword, and two stream
+    arguments of one module sharing a source name, which would otherwise
+    collapse onto one set of handshake ports and be uniquified apart.
+
+    Stability: a memory port group carries its index unconditionally, because
+    the emitter decides how many groups an argument gets and a second access
+    appearing must not rename the first. Ports whose count the source signature
+    fixes (a scalar, a stream, a result) carry a role but no index."""
+
+    @kernel
+    def kw(input: i32, wire: i32[16], reg: i32[16]):
+        for i in range(16):
+            reg[i] = wire[i] + input
+
+    mod = _to_rtl(kw)
+    iface = mod.interfaces[mod.top]
+    # Every port carries a role suffix, so a keyword owner is already legal
+    # once composed: `input_in`, not an escaped `input__in`.
+    assert [s["name"] for s in iface["scalars"]] == ["input_in"]
+    assert [r["base"] for acc in iface["reads"] for r in acc] == ["wire_rd0"]
+    assert [w["base"] for acc in iface["writes"] for w in acc] == ["reg_wr0"]
+    # Every manifest name appears verbatim in the emitted module header (a
+    # rewritten `input_0` would not match `\binput_in\b`).
+    head = mod.verilog.split(");", 1)[0]
+    for name in ["input_in", "wire_rd0_addr", "wire_rd0_data", "reg_wr0_we"]:
+        assert re.search(rf"\b{name}\b", head), f"{name} absent from {head}"
+    out = np.zeros(16, np.int32)
+    mod.cosim(3, A16, out)  # the harness binds `input_in` by manifest name
+    assert np.array_equal(out, A16 + 3)
+
+    # A bare owner that is a keyword still needs the escape: an on-chip buffer
+    # named `buf` carries no role suffix and collides with the gate primitive.
+    @kernel
+    def kwbuf(A: i32[16], out: i32[16]):
+        buf: i32[16] = 0
+        for i in range(16):
+            buf[i] = A[i] * 2
+        for j in range(16):
+            out[j] = buf[j] + 1
+
+    assert re.search(r"\bbuf_\b", _to_rtl(kwbuf).verilog)
+
+    # Stability: `A` reaches one read group above (`wire_rd0`) and two here.
+    # The first group keeps index 0 either way, so growing the port set never
+    # renames a port that already existed. A result carries a role, no index.
+    @kernel
+    def two_reads(A: i32[16]) -> i32:
+        acc: i32 = 0
+        for i in range(15):
+            acc += A[i] * A[i + 1]
+        return acc
+
+    iface = _to_rtl(two_reads).interfaces["two_reads"]
+    assert [r["base"] for acc in iface["reads"] for r in acc] == ["A_rd0", "A_rd1"]
+    assert [r["name"] for r in iface["results"]] == ["ret_out"]
+
+    # A relay chain: the middle process gets `fifo[p]` and puts `fifo[p+1]`, so
+    # both stream arguments carry the source name `fifo`. The colliding pair is
+    # split by direction; a process with a single stream keeps the plain name.
+    N, P = 16, 3
+
+    @kernel
+    def chain(A: i32[N], out: i32[N]):
+        fifo: Stream[i32, 2][P]
+
+        @kernel(mapping=[P])
+        def pe(A: i32[N], out: i32[N], fifo: Stream[i32, 2][P]):
+            p = allo.get_wid(0)
+            if p == 0:
+                for i in range(N):
+                    fifo[p + 1].put(A[i])
+            elif p == P - 1:
+                for i in range(N):
+                    out[i] = fifo[p].get() + 1
+            else:
+                for i in range(N):
+                    fifo[p + 1].put(fifo[p].get() * 2)
+
+        pe(A, out, fifo)
+
+    mod = _to_rtl(chain)
+    bases = {k: [s["base"] for s in v["streams"]] for k, v in mod.interfaces.items()}
+    assert sorted(bases["chain_pe_1"]) == ["fifo_st_in", "fifo_st_out"], bases
+    assert bases["chain_pe_0"] == ["fifo_st"], bases
+    assert bases["chain_pe_2"] == ["fifo_st"], bases
+
+    out = np.zeros(N, np.int32)
+    mod.cosim(A16, out)
+    assert np.array_equal(out, A16 * 2 + 1)
+
+
+def test_manifest_is_the_whole_binding_contract():
+    """Everything a simulator needs to bind the design is in the port manifest:
+    the RTL module name (which differs from the MLIR symbol whenever the symbol
+    needed legalizing), the fixed control ABI, and each extern operator module
+    with its realized port roles. Pinning this is what lets the cosim harness
+    hold no hardware name of its own and read no IR."""
+
+    @kernel
+    def mk(A: f32[8], out: f32[8]):
+        for i in range(8):
+            out[i] = A[i] * 2.0
+
+    iface = _to_rtl(mk).interfaces["mk"]
+    assert iface["module"] == "mk" and iface["symbol"] == "mk"
+    assert iface["control"] == {
+        "clk": "clk",
+        "rst": "rst",
+        "start": "start",
+        "done": "done",
+    }
+    # The f32 multiply is an IP: the manifest names its module, the device
+    # operator it joins to, and each port's role (so `clk`/`ce`/the result are
+    # found structurally, not by matching their names back out).
+    ops = iface["operators"]
+    assert ops, "an f32 multiply must instantiate an extern operator"
+    roles = [p["role"] for p in ops[0]["ports"]]
+    assert roles.count("data") >= 1 and roles.count("clk") == 1
+    assert roles[-1] == "out" and ops[0]["impl"]
+
+    # A nested callee's symbol carries a dot; the module name is the legalized
+    # form, and the manifest is keyed by (and reports) that.
+    N = 16
+
+    @kernel
+    async def mp(a: i32[N], s: Stream[i32]):
+        for i in range(N):
+            s.put(a[i] + 1)
+
+    @kernel
+    async def mc(s: Stream[i32], out: i32[N]):
+        for i in range(N):
+            out[i] = s.get() * 2
+
+    @kernel
+    async def mtop(a: i32[N], out: i32[N]):
+        fifo: Stream[i32]
+        await mp(a, fifo)
+        await mc(fifo, out)
+
+    ifaces = _to_rtl(mtop).interfaces
+    by_symbol = {i["symbol"]: i for i in ifaces.values()}
+    assert by_symbol["mtop.mp"]["module"] == "mtop_mp"
+    assert all(k == i["module"] for k, i in ifaces.items()), "keyed by module name"
+
+
+def test_internal_signal_names():
+    """Internal cells carry names, so a waveform is readable. These names reach
+    no manifest, so CIRCT is free to uniquify them, but an unnamed value becomes
+    `_GEN_37`, which is what this pins against.
+
+    Covered: the control plane is region-scoped (`r<N>_run`/`_done`/`_v<k>`), a
+    container loop keeps its source IV (materialized outside the ControlEmitter,
+    so it used to be the one anonymous counter), a delay tap says how late it is
+    (`buf_d1`), and an IP unit folds its source variable into the INSTANCE name
+    (ExportVerilog names instance results `_<inst>_<port>` and ignores a namehint
+    on the instance, so this is the only channel that reaches the wire)."""
+
+    @kernel
+    def sx(a: i32, X: i32[16], Y: i32[16], Z: i32[16]):
+        for i in range(16):
+            buf: i32 = X[i] * a
+            Z[i] = buf + Y[i]
+
+    v = _to_rtl(sx).verilog
+    assert re.search(r"\bbuf_d1\b", v), "a delay tap keeps its value + delay"
+    assert re.search(r"\br\d+_run\b", v) and re.search(r"\br\d+_done\b", v)
+    assert re.search(r"\br\d+_v\d+\b", v), "the valid chain is region-tagged"
+
+    @kernel
+    def gv(A: f32[8, 8], x: f32[8], out: f32[8]):
+        for i in range(8):
+            acc: f32 = 0.0
+            for j in range(8):
+                acc += A[i, j] * x[j]
+            out[i] = acc
+
+    v = _to_rtl(gv).verilog
+    # Both loop counters, including the outer (container) one.
+    assert re.search(r"\breg\s+\[31:0\]\s+i;", v), "container counter lost its IV"
+    assert re.search(r"\breg\s+\[31:0\]\s+j;", v)
+    assert re.search(r"\br\d+_sv\d+\b", v), "the survivor latch is named"
+    assert re.search(r"_acc_u\d+_y", v), "an IP result reaches the wire as `acc`"
 
 
 def test_nested_banked_static_split():
@@ -693,6 +884,94 @@ def test_storage_impl_shifts_recurrence_ii():
     reg_ii = _matvec_recurrence_ii(complete=True)
     assert reg_ii == FADD + 1
     assert reg_ii < lutram_ii
+
+
+def _uram_buffer_rtl(impl):
+    """A producer/consumer pair through an internal buffer, optionally bound to
+    a storage impl. The consumer reads `buf` inside an II=1 pipeline, so a read
+    port built at the wrong latency shifts the result by one iteration."""
+
+    @kernel
+    def urambuf(A: i32[16], out: i32[16]):
+        buf: i32[16] = 0
+        for i in range(16):
+            buf[i] = A[i] * 3
+        for i in range(16):
+            out[i] = buf[i] + 1
+
+    s = urambuf.schedule()
+    if impl is not None:
+        s.bind_storage("buf", impl=impl, mem_type=s.RAM_T2P)
+    return s.export("rtl")
+
+
+def test_multicycle_storage_read_cosim():
+    """The emitted read port must be built at the memory's DEVICE read latency,
+    not a hardcoded 1. URAM reads in 2 cycles, and the scheduler places the
+    consumer accordingly; a 1-cycle port lands the datum a cycle early, so under
+    II=1 iteration i consumes iteration i+1's element (verified: the output came
+    back shifted by one). The extra read cycle is visible in the latency."""
+    exp = A16 * 3 + 1
+    out_default = np.zeros(16, np.int32)
+    r = _uram_buffer_rtl(None)
+    lat_default = r.schedule().func("urambuf").latency
+    r.cosim(A16, out_default)
+    np.testing.assert_array_equal(out_default, exp)
+
+    out_uram = np.zeros(16, np.int32)
+    r = _uram_buffer_rtl(Schedule.URAM)
+    lat_uram = r.schedule().func("urambuf").latency
+    r.cosim(A16, out_uram)
+    np.testing.assert_array_equal(out_uram, exp)
+    # The 2-cycle URAM read costs exactly one cycle more than the 1-cycle default.
+    assert lat_uram == lat_default + 1
+
+
+def test_multicycle_storage_on_argument_cosim():
+    """A boundary array's port latency is a contract with the DRIVER -- the
+    emitted RTL binds its read-data input with no delay elements, so it simply
+    expects the datum `latency` cycles after the address. That number now rides
+    the interface manifest (`iface::Memory::latency`) and the cosim harness
+    honors it, so a multi-cycle ARGUMENT is emittable rather than rejected.
+
+    This is the case cosim used to actively conceal: the harness served every
+    port in 1 cycle regardless, so a URAM argument scheduled at 2 read a cycle
+    early and cosim still passed while the hardware was wrong. The 2-cycle read
+    must show up as exactly one extra cycle of whole-kernel latency."""
+
+    def argmem_rtl(impl):
+        @kernel
+        def argmem(A: i32[16], out: i32[16]):
+            for i in range(16):
+                out[i] = A[i] + 1
+
+        s = argmem.schedule()
+        if impl is not None:
+            s.bind_storage("A", impl=impl, mem_type=s.RAM_T2P)
+        return s.export("rtl")
+
+    exp = A16 + 1
+    out_default = np.zeros(16, np.int32)
+    r = argmem_rtl(None)
+    lat_default = r.schedule().func("argmem").latency
+    r.cosim(A16, out_default)
+    np.testing.assert_array_equal(out_default, exp)
+
+    out_uram = np.zeros(16, np.int32)
+    r = argmem_rtl(Schedule.URAM)
+    lat_uram = r.schedule().func("argmem").latency
+    r.cosim(A16, out_uram)
+    np.testing.assert_array_equal(out_uram, exp)
+    assert lat_uram == lat_default + 1
+
+    # The contract must be stated in the manifest, not just honored by luck:
+    # the URAM argument's read ports declare 2 cycles, the 1-cycle default 1.
+    def read_latencies(rtl):
+        iface = rtl.interfaces["argmem"]
+        return {p["latency"] for acc in iface["reads"] for p in acc}
+
+    assert read_latencies(argmem_rtl(Schedule.URAM)) == {2}
+    assert read_latencies(argmem_rtl(None)) == {1}
 
 
 def test_residual_loops_closed_into_pipelines():
@@ -1165,13 +1444,39 @@ def test_loop_over_calls():
     # R2: the loop-over-calls container lowers to the leaf (its call reifies to a
     # `dcp.instance`), one child instance fired N times by the counter.
     assert "dcp.instance" in mod.dcp
-    assert "loop_iv" in mod.mlir  # the loop counter driving the child's index
+    # The loop counter driving the child's index, labelled with the source IV.
+    assert "%i = seq.compreg" in mod.mlir
     A = (np.arange(16, dtype=np.int32) * 3 + 1) & 0x3F
     B = np.zeros(16, np.int32)
     # One instance is live at a time, so its memory ports mirror to the
     # boundaries directly -- serial, no muxing.
     mod.cosim(A, B)
     assert np.array_equal(B, A * 2 + 1)
+
+
+def test_zero_trip_loop_over_calls():
+    """A zero-trip loop over a sub-kernel call must complete without firing the
+    child. The test should not hang (the child never fires)"""
+
+    @kernel
+    def zlc_step(A: i32[16], B: i32[16], i: index):
+        B[i] = A[i] * 2 + 1
+
+    @kernel
+    def zlc_top(A: i32[16], B: i32[16]):
+        for i in range(0):
+            zlc_step(A, B, i)
+
+    A = (np.arange(16, dtype=np.int32) * 3 + 1) & 0x3F
+    B = np.full(16, 9, np.int32)
+    # Reaching the assertions at all is most of the point: before the fix this
+    # never completed and cosim failed on its watchdog.
+    _to_rtl(zlc_top).cosim(A, B)
+    # A write-only argument is not preloaded (see shell.py `_write_cfg`), so the
+    # backing array starts at zero; the child never fired, so it stays there --
+    # and in particular is not the `A * 2 + 1` a single invocation would write.
+    assert np.array_equal(B, np.zeros(16, np.int32))
+    assert not np.array_equal(B, A * 2 + 1)
 
 
 def test_sequential_independent_kernels():
@@ -1237,7 +1542,7 @@ def test_concurrent_shared_array_access():
     # time-share one; the harness services every group of an argument against
     # its one backing array.
     wr = [w[0] for w in mod.interfaces["cw_top"]["writes"]]
-    assert [w["base"] for w in wr] == ["B_wr", "B_wr_1"]
+    assert [w["base"] for w in wr] == ["B_wr0", "B_wr1"]
     assert {w["arg"] for w in wr} == {1}
     B = np.zeros(16, np.int32)
     r = mod.cosim(A16, B)
@@ -2494,10 +2799,13 @@ def test_dataflow_nested_containers():
         await cc_mid(a, out)
 
     mod = _to_rtl(cc_top)
+    # An emitted module takes its func symbol legalized as a SystemVerilog
+    # identifier (`cc_top.cc_mid` -> `cc_top_cc_mid`), so the symbol, the port
+    # manifest's key, and the Verilog module name are one name.
     mods = re.findall(r"hw\.module @([\w.]+)", mod.mlir)
     assert mods[0] == "cc_top", mods
-    assert "cc_top.cc_mid" in mods, mods
-    assert mods.index("cc_top.cc_mid") > mods.index("cc_top"), mods
+    assert "cc_top_cc_mid" in mods, mods
+    assert mods.index("cc_top_cc_mid") > mods.index("cc_top"), mods
 
     golden = np.zeros(N, np.int32)
     mod.csim(a_cc, golden)
@@ -2550,7 +2858,7 @@ def test_dataflow_nested_containers():
     mod = _to_rtl(sb_top)
     ir = mod.mlir
     assert re.findall(r"hw\.module @([\w.]+)", ir)[0] == "sb_top"
-    assert "_strm_data" in ir and "_strm_valid" in ir and "_strm_ready" in ir
+    assert "_st_data" in ir and "_st_valid" in ir and "_st_ready" in ir
     assert ir.count("seq.fifo") >= 3, ir.count("seq.fifo")  # s, t, and mid's y
 
     golden = np.zeros(N, np.int32)
@@ -2596,7 +2904,7 @@ def test_dataflow_channel_init_and_rejections():
     ir = mod.mlir
     # The seeded channel keeps the plain `seq.fifo` and adds the init-prepend
     # shim (its down-counter) on the consumer side.
-    assert "hw.instance" in ir and "seq.fifo" in ir and "fifo_init_rem" in ir
+    assert "hw.instance" in ir and "seq.fifo" in ir and "_init_rem" in ir
 
     golden = np.zeros(N, np.int32)
     mod.csim(golden)  # CPU dataflow-runtime golden: seeded, no deadlock
@@ -4120,3 +4428,71 @@ def test_chaining_inserts_register():
     tight = _sched(chain()).cyclic()[0]
     loose = _sched(chain(), freq_mhz=1.0).cyclic()[0]  # a 1000ns cycle
     assert tight.last_t() > loose.last_t()
+
+
+def test_container_and_guard_regions_own_no_loose_datapath():
+    """Container / guard regions must not own loose datapath ops (B2).
+
+    Each container path emits only part of the datapath -- ``emitContainer``
+    just its comb units, ``emitConditionalContainer`` just its condition cone,
+    ``emitGuard`` nothing at all -- so a store bound into one of those regions
+    would be silently dropped: no ``seq.write``, no diagnostic. What keeps them
+    empty is upstream, in the scheduler's imperfect-nest and branch
+    decomposition, which wraps every straight-line span in its own child
+    region. These are the shapes that would otherwise leave an epilogue store
+    loose in the enclosing region; the emitter now asserts the contract, so a
+    decomposition regression aborts here instead of silently losing a store.
+
+    Each kernel is cosimmed rather than merely compiled: a dropped store is
+    invisible in the schedule and shows up only as a wrong array.
+    """
+
+    # An epilogue store after an inner reduction -- loose in the `i` container
+    # unless the imperfect-nest decomposition wraps it.
+    @kernel
+    def b2_epilogue(A: i32[4, 4], B: i32[4]):
+        for i in range(4):
+            s: i32 = 0
+            for j in range(4):
+                s += A[i, j]
+            B[i] = s
+
+    A2d = (np.arange(16, dtype=np.int32) * 3 + 1).reshape(4, 4) & 0x3F
+    B = np.zeros(4, np.int32)
+    _to_rtl(b2_epilogue).cosim(A2d, B)
+    assert np.array_equal(B, A2d.sum(axis=1))
+
+    # A store loose in a `while` body: emitConditionalContainer emits only the
+    # condition cone, so this store lives or dies by the while-body
+    # decomposition.
+    @kernel
+    def b2_while_store(A: i32[8], B: i32[8]):
+        i: i32 = 0
+        while i < 8:
+            B[i] = A[i] * 2
+            i += 1
+
+    A8 = (np.arange(8, dtype=np.int32) * 5 + 2) & 0x3F
+    Bw = np.zeros(8, np.int32)
+    _to_rtl(b2_while_store).cosim(A8, Bw)
+    assert np.array_equal(Bw, A8 * 2)
+
+    # A dual guard whose arms each mix a loop with a loose store -- emitGuard
+    # emits no datapath, so both must decompose into child regions.
+    @kernel
+    def b2_guard(A: i32[8], B: i32[8], C: i32[8]):
+        for i in range(8):
+            if A[i] > 0:
+                for j in range(2):
+                    C[j] = A[i]
+                B[i] = 1
+            else:
+                for j in range(2):
+                    C[j] = 0
+                B[i] = 2
+
+    Ag = np.array([1, 0, 3, 0, 5, 0, 7, 0], np.int32)
+    Bg = np.zeros(8, np.int32)
+    Cg = np.zeros(8, np.int32)
+    _to_rtl(b2_guard).cosim(Ag, Bg, Cg)
+    assert np.array_equal(Bg, np.where(Ag > 0, 1, 2))

@@ -98,7 +98,18 @@ public:
 
   /// The timing of storage implementation \p impl, or a zero (combinational)
   /// timing if the library declares no such primitive.
-  const MemKindTiming &forImpl(MemoryImplEnum impl) const;
+  MemKindTiming timing(MemoryImplEnum impl) const;
+
+  /// The storage implementation an array access resolves to -- `Auto` for a
+  /// stream (timed by `fifo`) or a non-access. Unlike `timing`, this does NOT
+  /// consult the primitive table, so a caller can diagnose an implementation
+  /// the device never declared *before* `forImpl` would fall to zero timing.
+  MemoryImplEnum resolvedImpl(Operation *op) const;
+
+  /// Whether the device declares timing for \p impl. The storage twin of
+  /// `requiresUnmatchedIP`: an array resolving to an undeclared primitive would
+  /// otherwise be scheduled at latency 0 -- read before valid.
+  bool declares(MemoryImplEnum impl) const;
 
   MemoryImplEnum defaultImpl = MemoryImplEnum::LUTRAM; // unbound on-chip arrays
   std::vector<MemPrimitive>
@@ -123,7 +134,12 @@ struct MemoryChar {
 
 /// Characterize a memref's storage shape from its partition/storage attributes
 /// (independent of any scheduling region -- a pure function of the attributes).
-MemoryChar characterize(Value memref);
+/// \p defaultImpl resolves an array with no explicit `allo.bind.storage impl=`;
+/// pass the device's `MemoryLibrary::defaultImpl` so this agrees with the
+/// implementation `MemoryLibrary::timing` resolved when it stamped the access
+/// latencies (a hardcoded default here would silently disagree with the
+/// schedule on any device whose `default_memory` is not that constant).
+MemoryChar characterize(Value memref, MemoryImplEnum defaultImpl);
 
 //===----------------------------------------------------------------------===//
 // Partition / static-bank queries -- the banking facts a DCP banking pass
@@ -155,7 +171,7 @@ std::optional<int64_t> staticBank(Operation *op, unsigned dim, int64_t factor);
 
 } // namespace mlir::allo
 
-namespace mlir::allo::detail {
+namespace mlir::allo {
 
 /// Per-bank memory-port model. `observe` every memory access in a scheduling
 /// region, `finalize` the per-memref banking decision, then `resource` gives
@@ -190,7 +206,7 @@ private:
   llvm::DenseMap<Value, MemInfo> byMemref;
 };
 
-} // namespace mlir::allo::detail
+} // namespace mlir::allo
 
 namespace mlir::allo {
 
@@ -213,7 +229,7 @@ LogicalResult populateMemoryResourcesImpl(ProblemT &problem, WalkFn walkFn,
   if constexpr (!std::is_base_of_v<SharedOperatorsProblem, ProblemT>) {
     return success();
   } else {
-    detail::MemoryBankModel banks;
+    MemoryBankModel banks;
     walkFn([&](Operation *op) { banks.observe(op); });
     banks.finalize();
     walkFn([&](Operation *op) {

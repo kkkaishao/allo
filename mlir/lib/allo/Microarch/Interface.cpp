@@ -10,6 +10,7 @@
 
 using namespace mlir;
 using namespace mlir::allo;
+using namespace mlir::allo::uarch; // the naming vocabulary, unqualified
 
 namespace mlir::allo::iface {
 
@@ -36,28 +37,29 @@ ModuleInterface::ModuleInterface(const uarch::Datapath &dp,
   for (const uarch::IOPort &io : dp.ios)
     if (io.isInput)
       scalars.push_back(
-          {argOf(io.value), bitWidth(io.type), uarch::scalarPortName(io)});
+          {argOf(io.value), bitWidth(io.type), scalarPortName(dp, io)});
 
   for (const uarch::StreamChannel &s : dp.streams) {
-    std::string base = uarch::streamPortBase(s);
+    auto base = streamPortBase(dp, s);
     streams.push_back({argOf(s.stream), s.isInput, (int)s.depth,
-                       bitWidth(s.payload), base, data_(base), valid(base),
-                       ready(base)});
+                       bitWidth(s.payload), base, portData(base),
+                       portValid(base), portReady(base)});
   }
 
   // Each external access expands to one interface per boundary bank (one when
   // unbanked / statically routed, N for a data-dependent access spanning
   // banks).
   auto group = [&](ArrayRef<uarch::AccRef> ports, unsigned i, bool write) {
-    const uarch::MemUnit &mu = dp.mems[ports[i].mem];
+    const auto &mu = dp.mems[ports[i].mem];
     unsigned w =
         bitWidth(cast<MemRefType>(mu.memref.getType()).getElementType());
-    int factor = uarch::externalBank(mu, mu.accesses[ports[i].idx]).factor;
+    int factor = externalBank(mu, mu.accesses[ports[i].idx]).factor;
+    unsigned lat = write ? mu.writeLatency : mu.readLatency;
     std::vector<Memory> g;
-    for (const auto &[bank, base] :
-         uarch::extPorts(dp, ports, i, write ? "wr" : "rd"))
-      g.push_back({argOf(mu.memref), write, (int)bank, factor, w, base,
-                   addr(base), data_(base), write ? we(base) : std::string()});
+    for (const auto &[bank, base] : extPorts(dp, ports, i, write))
+      g.push_back({argOf(mu.memref), write, (int)bank, factor, w, lat, base,
+                   portAddr(base), portData(base),
+                   write ? portWe(base) : std::string()});
     return g;
   };
   for (unsigned i = 0; i < reads.size(); ++i)
@@ -66,32 +68,29 @@ ModuleInterface::ModuleInterface(const uarch::Datapath &dp,
     this->writes.push_back(group(writes, i, /*write=*/true));
 
   // A CallUnit-mastered *boundary* argument has no MemUnit::Access (the child
-  // instance drives the port), so it is absent from the AccRef arrays above.
-  // Declare its interface here -- the same `<name>_<role>` a normal
-  // single-access boundary port gets -- so the top declares the port and the
-  // cosim harness drives it; the leaf's own access loops still skip it (they
-  // iterate the AccRefs), and emitCalls passes the child's ports through.
+  // drives the port), so it's declared here with the same `<name>_<role><i>`
+  // naming as a normal port; emitCalls passes the child's ports through.
   for (const uarch::CallUnit &cu : dp.calls)
     for (const uarch::CallUnit::MemArg &ma : cu.memArgs) {
       if (!ma.isBoundary)
         continue;
-      // One port group PER ACCESSOR: the builder gave each a distinct `topBase`
-      // (a running index per base), so several children accessing one argument
-      // get separate concurrent groups -- the cosim harness backs every group
-      // of the argument against its one array (no mux). A serial pair uses two
-      // groups too (each drives in its own phase; the schedule keeps them
-      // ordered). A cyclically partitioned argument exposes one group per
-      // bank, each carrying its own `bank`/`factor` -- how the cosim harness
-      // knows to back it with the argument's cyclic slice rather than a whole
-      // copy.
-      const uarch::MemUnit &mu = dp.mems[ma.mem];
+      // One port group per accessor, so concurrent or serial accessors of one
+      // argument get separate groups backed by the same array. A cyclic
+      // argument gets one group per bank.
+      const auto &mu = dp.mems[ma.mem];
       unsigned w =
           bitWidth(cast<MemRefType>(mu.memref.getType()).getElementType());
-      const std::string &base = ma.topBase; // indexed per role by the builder
-      Memory m{
-          argOf(mu.memref), ma.isWrite,  (int)ma.bank,
-          (int)ma.factor,   w,           base,
-          addr(base),       data_(base), ma.isWrite ? we(base) : std::string()};
+      const auto &base = ma.topBase; // indexed per role by the builder
+      Memory m{argOf(mu.memref),
+               ma.isWrite,
+               (int)ma.bank,
+               (int)ma.factor,
+               w,
+               ma.isWrite ? mu.writeLatency : mu.readLatency,
+               base,
+               portAddr(base),
+               portData(base),
+               ma.isWrite ? portWe(base) : std::string()};
       (ma.isWrite ? this->writes : this->reads).push_back({m});
     }
 
@@ -109,9 +108,13 @@ std::string ModuleInterface::toJSON() const {
     for (const auto &acc : accs) {
       Array banks;
       for (const Memory &p : acc) {
-        Object o{{"arg", p.arg},       {"bank", p.bank},
-                 {"factor", p.factor}, {"width", (int64_t)p.width},
-                 {"base", p.base},     {"addr", p.addr},
+        Object o{{"arg", p.arg},
+                 {"bank", p.bank},
+                 {"factor", p.factor},
+                 {"width", (int64_t)p.width},
+                 {"latency", (int64_t)p.latency},
+                 {"base", p.base},
+                 {"addr", p.addr},
                  {"data", p.data}};
         if (!p.we.empty())
           o["we"] = p.we;
@@ -139,12 +142,39 @@ std::string ModuleInterface::toJSON() const {
   Array results;
   for (const Result &r : this->results)
     results.push_back(Object{{"width", (int64_t)r.width}, {"name", r.name}});
+  Array operators;
+  for (const Operator &o : this->operators) {
+    Array ports;
+    for (const Operator::Port &p : o.ports) {
+      llvm::StringRef role = p.role == Operator::Role::Data  ? "data"
+                             : p.role == Operator::Role::Clk ? "clk"
+                             : p.role == Operator::Role::Ce  ? "ce"
+                                                             : "out";
+      ports.push_back(Object{{"name", p.name},
+                             {"width", (int64_t)p.width},
+                             {"role", role},
+                             {"input", p.isInput()}});
+    }
+    operators.push_back(Object{{"module", o.module},
+                               {"impl", o.impl},
+                               {"predicate", o.predicate},
+                               {"ports", std::move(ports)}});
+  }
 
-  Value root = Object{{"scalars", std::move(scalars)},
+  Value root = Object{{"module", module},
+                      {"symbol", symbol},
+                      // The fixed control ABI, published so no consumer has to
+                      // hard-code it on its own side.
+                      {"control", Object{{"clk", uarch::kClk},
+                                         {"rst", uarch::kRst},
+                                         {"start", uarch::kStart},
+                                         {"done", uarch::kDone}}},
+                      {"scalars", std::move(scalars)},
                       {"streams", std::move(streams)},
                       {"reads", mems(reads)},
                       {"writes", mems(writes)},
-                      {"results", std::move(results)}};
+                      {"results", std::move(results)},
+                      {"operators", std::move(operators)}};
   std::string s;
   llvm::raw_string_ostream os(s);
   os << root;

@@ -36,10 +36,9 @@ SmallVector<SchedRegion> mlir::allo::enumerateRegions(Block &block) {
   for (Operation &op : block) {
     if (op.hasTrait<OpTrait::IsTerminator>())
       continue;
-    // A loop, or an `if` that survived if-conversion (one guarding a loop /
-    // stream / call, left opaque), is its own region: a single region-bearing
-    // op the scheduler recurses into. A conditional cannot be flattened into a
-    // straight-line span (its body would be materialized as flat leaf ops).
+    // A loop, or an `if` that survived if-conversion (guarding a loop/stream/
+    // call, left opaque), is its own region: a single region-bearing op the
+    // scheduler recurses into, not flattened into a straight-line span.
     if (isa<affine::AffineForOp, scf::ForOp, scf::WhileOp, affine::AffineIfOp,
             scf::IfOp>(&op)) {
       flush();
@@ -90,7 +89,7 @@ const RegionGraph &DependenceAnalysis::getRegionGraph() {
           continue;
         // A shared-root conflict is a real ordering edge only when the regions'
         // footprints actually intersect (sub-range refinement inside).
-        Conflict c = footprintConflict(kv.second, it->second);
+        auto c = footprintConflict(kv.second, it->second);
         if (c == Conflict::None)
           continue;
         XEdgeKind kind = c == Conflict::WAW   ? XEdgeKind::WAW
@@ -110,7 +109,7 @@ const RegionGraph &DependenceAnalysis::getRegionGraph() {
     for (Operation *top : r.ops)
       top->walk([&](Operation *op) {
         for (Value operand : op->getOperands()) {
-          Operation *def = operand.getDefiningOp();
+          auto *def = operand.getDefiningOp();
           if (!def)
             continue;
           auto it = opRegion.find(def);

@@ -13,6 +13,7 @@
 
 #include "circt/Dialect/Comb/CombOps.h"
 #include "circt/Dialect/HW/HWOps.h"
+#include "circt/Dialect/SV/SVDialect.h" // sv::isNameValid (the SV keyword set)
 #include "circt/Dialect/Seq/SeqOps.h"
 #include "circt/Support/BackedgeBuilder.h"
 
@@ -50,10 +51,6 @@ IntegerType memElemType(const uarch::MemUnit &m, OpBuilder &b) {
   return hwType(cast<MemRefType>(m.memref.getType()).getElementType(), b);
 }
 
-unsigned memReadLatency(MemoryImplEnum impl) {
-  return impl == MemoryImplEnum::Register ? 0 : 1;
-}
-
 // Integer/logic mnemonics EmitHW lowers to a native `comb` primitive. The
 // single source of truth for `emitCompute`'s coverage; a native op outside this
 // set has no EmitHW lowering (realizability errors, see `emitModule`).
@@ -69,7 +66,7 @@ bool combEmitted(StringRef kind) {
 }
 
 // arith and comb name the same ten integer-compare predicates; map across the
-// two enums (comb adds 4-state predicates we never produce).
+// two enums (comb adds 4-state predicates that are never produced here).
 static comb::ICmpPredicate combICmpPredicate(arith::CmpIPredicate p) {
   using A = arith::CmpIPredicate;
   using C = comb::ICmpPredicate;
@@ -100,14 +97,9 @@ static comb::ICmpPredicate combICmpPredicate(arith::CmpIPredicate p) {
 
 Value emitCompute(OpBuilder &b, Location loc, StringRef kind,
                   ValueRange operands, Type resultType, Operation *srcOp) {
-  // An affine.apply: index arithmetic parameterized by a map (carried on the op
-  // the way arith.cmpi carries its predicate) rather than by arity. This is the
-  // delinearization `flatten-perfect-loops` leaves behind when a coalesced
-  // nest's body reads an original IV outside an address -- a guard's condition,
-  // materialized by the if-conversion over the surviving IV. The same map
-  // evaluator the address path uses (evalAffine): same non-negative index, same
-  // constant divisors, so a power-of-two delinearization stays a shift and a
-  // mask rather than the signed correction a generic affine expansion emits.
+  // affine.apply: a map carried on the op (like arith.cmpi's predicate),
+  // left by flatten-perfect-loops when reading an IV outside an address.
+  // Uses evalAffine, so a power-of-two divisor stays shift+mask.
   if (kind == "apply") {
     assert(srcOp->getAttr("map") &&
            "dcp.compute<apply> must carry the original affine map");
@@ -117,9 +109,8 @@ Value emitCompute(OpBuilder &b, Location loc, StringRef kind,
   }
   Value lhs = operands[0];
   // Width-changing unary casts (the widened-reduction idiom
-  // trunc(add(ext,ext))) resize operand[0] to the unit's result width: comb
-  // sign/zero-extend and a low-bit extract. All 0-latency, so they slot into
-  // the schedule like any comb.
+  // trunc(add(ext,ext))) resize operand[0] via comb sign/zero-extend or a
+  // low-bit extract; 0-latency, so they slot into the schedule like any comb.
   if (kind == "extsi")
     return comb::createOrFoldSExt(b, loc, lhs, resultType);
   if (kind == "extui")
@@ -129,8 +120,8 @@ Value emitCompute(OpBuilder &b, Location loc, StringRef kind,
     return comb::ExtractOp::create(b, loc, resultType, lhs, 0).getResult();
   if (kind == "index_cast") {
     // index <-> integer: both carried at their hw integer width (hwType maps
-    // index to i32), so a signed resize to the result width -- sExt / low-bit
-    // extract / identity when the widths already match.
+    // index to i32), so this is a signed resize to the result width: sExt,
+    // low-bit extract, or identity when the widths already match.
     unsigned dst = cast<IntegerType>(resultType).getWidth();
     unsigned src = cast<IntegerType>(lhs.getType()).getWidth();
     if (dst == src)
@@ -140,8 +131,8 @@ Value emitCompute(OpBuilder &b, Location loc, StringRef kind,
                            .getResult();
   }
   // Float negate: arith.negf flips the sign bit of the float, which rides as
-  // its integer bit pattern here -- a single XOR, no IP. Unary, so it precedes
-  // the `rhs = operands[1]` read below.
+  // its integer bit pattern here, so this is a single XOR, no IP. Unary, so
+  // it precedes the `rhs = operands[1]` read below.
   if (kind == "negf") {
     unsigned w = cast<IntegerType>(resultType).getWidth();
     // The sign-bit mask is built as an int64 (`1 << (w-1)`), so a float wider
@@ -180,10 +171,9 @@ Value emitCompute(OpBuilder &b, Location loc, StringRef kind,
     return comb::ShrSOp::create(b, loc, lhs, rhs, false)->getResult(0);
   if (kind == "shrui")
     return comb::ShrUOp::create(b, loc, lhs, rhs, false)->getResult(0);
-  // Signed / unsigned divide. Emitted for a flattened guard's delinearization
-  // (an affine `i floordiv N` in the predicate lowers to the signed-divide
-  // idiom over the coalesced counter); a scheduled data divide is a multi-cycle
-  // IP, not this comb path.
+  // Signed / unsigned divide, emitted for a flattened guard's delinearization
+  // (an affine `i floordiv N` in the predicate lowers to signed-divide over
+  // the coalesced counter); a scheduled data divide is multi-cycle IP instead.
   if (kind == "divsi")
     return comb::DivSOp::create(b, loc, lhs, rhs, false)->getResult(0);
   if (kind == "divui")
@@ -219,87 +209,6 @@ Value emitCompute(OpBuilder &b, Location loc, StringRef kind,
   }
   assert(false && "combEmitted mnemonic without an emitCompute case");
   return {};
-}
-
-std::string memPortBase(const uarch::Datapath &dp, ArrayRef<AccRef> ports,
-                        unsigned i, StringRef role) {
-  Value memref = dp.mems[ports[i].mem].memref;
-  auto name = nameFromLoc(memref.getLoc());
-  if (!name)
-    return (role + Twine(i)).str(); // unnamed argument: positional fallback
-  std::string base = sanitizeCppIdentifier(*name) + "_" + role.str();
-  // Index only when this argument backs more than one port of the same role.
-  unsigned total = 0, index = 0;
-  for (unsigned j = 0; j < ports.size(); ++j)
-    if (ports[j].mem == ports[i].mem) {
-      if (j < i)
-        ++index;
-      ++total;
-    }
-  if (total > 1)
-    base += std::to_string(index);
-  return base;
-}
-
-std::string scalarPortName(const uarch::IOPort &io) {
-  if (auto name = nameFromLoc(io.value.getLoc()))
-    return sanitizeCppIdentifier(*name);
-  return ("s" + Twine(io.id)).str();
-}
-
-std::string memBoundaryPortBase(const uarch::Datapath &dp, uarch::MemId mem,
-                                StringRef role) {
-  Value memref = dp.mems[mem].memref;
-  if (auto name = nameFromLoc(memref.getLoc()))
-    return sanitizeCppIdentifier(*name) + "_" + role.str();
-  return (role + Twine(mem)).str(); // unnamed argument: stable fallback
-}
-
-llvm::SmallVector<std::pair<unsigned, std::string>>
-extPorts(const uarch::Datapath &dp, ArrayRef<AccRef> ports, unsigned i,
-         StringRef role) {
-  const uarch::MemUnit &m = dp.mems[ports[i].mem];
-  ExternalBanking eb = externalBank(m, m.accesses[ports[i].idx]);
-  std::string base = memPortBase(dp, ports, i, role);
-  if (eb.factor == 1)
-    return {{0u, base}};
-  if (eb.bank)
-    return {{*eb.bank, base}}; // statically routed to one interface
-  // Data-dependent: one interface per bank (the crossbar drives every bank).
-  llvm::SmallVector<std::pair<unsigned, std::string>> all;
-  for (unsigned k = 0; k < eb.factor; ++k)
-    all.push_back({k, base + "_b" + std::to_string(k)});
-  return all;
-}
-
-void nameValue(Value v, StringRef name) {
-  if (name.empty())
-    return;
-  Operation *op = v.getDefiningOp();
-  if (!op) // a block argument / unresolved backedge is named elsewhere
-    return;
-  // Pick the channel ExportVerilog reads: a register names from its own `name`
-  // attr (sv.namehint is ignored on a reg), any other value from `sv.namehint`.
-  if (auto reg = dyn_cast<seq::CompRegOp>(op))
-    reg.setNameAttr(StringAttr::get(op->getContext(), name));
-  else
-    op->setAttr("sv.namehint", StringAttr::get(op->getContext(), name));
-}
-
-void nameValue(Value v, Location loc) {
-  if (auto name = nameFromLoc(loc))
-    nameValue(v, sanitizeCppIdentifier(*name));
-}
-
-std::string cellName(Location loc, StringRef fallback) {
-  if (auto name = nameFromLoc(loc))
-    return sanitizeCppIdentifier(*name);
-  return fallback.str();
-}
-
-std::string streamPortBase(const uarch::StreamChannel &s) {
-  std::string fallback = "stream" + std::to_string(s.id);
-  return cellName(s.stream.getLoc(), fallback);
 }
 
 //===----------------------------------------------------------------------===//
@@ -358,7 +267,14 @@ ShiftChain EmitContext::shiftChain(Value in, unsigned depth) {
 }
 
 Value EmitContext::delayValid(Value sig, unsigned n) {
-  return shiftChain(sig, n).last();
+  ShiftChain chain = shiftChain(sig, n);
+  // The densest cluster of otherwise-anonymous state in a pipelined region.
+  // Label each stage with the cycle it is valid at, so a waveform reads
+  // `r1_v3`: region 1, three cycles after issue.
+  for (auto [k, stage] : llvm::enumerate(chain.stages))
+    if (k && !regionTag.empty())
+      nameValue(stage, regionSignal(regionTag, "v" + std::to_string(k)));
+  return chain.last();
 }
 
 Value EmitContext::activationPulse(Value pulse, Operation *op) {
@@ -442,16 +358,14 @@ void EmitContext::initLiterals() {
 // `lb, lb+step, ...` and terminates on `iv+step >= ub`. Each of lb/step is a
 // resolved runtime Source (a data-dependent range start/stride) or a constant.
 // ub is a resolved runtime count (`ubSource`, a dynamic trip) or, for a
-// constant trip K, `lb + K*step` -- a konst when lb/step are compile-time, else
+// constant trip K, `lb + K*step`: a konst when lb/step are compile-time, else
 // a datapath Value tracking the runtime lb/step (the `range(i, i+K)` window).
 // Empty (default) for an acyclic region (no counter) or a while (which builds
 // its own Terminator::conditional from the resolved condition).
 Terminator HWEmitter::terminatorOf(const uarch::RegionBlock &rb) {
-  // The counter counts up, tested by SIGNED compares (icmpSgeV in
-  // isLast/isEmpty), so a negative lower bound (`affine.for %i = -4 to 4`) is
-  // fine. A non-positive/decreasing step is unsupported; the frontend rejects
-  // it, so this is a dormant backstop. A runtime step's sign is unchecked here
-  // and assumed positive.
+  // Counts up via SIGNED compares (isLast/isEmpty), so a negative lower bound
+  // is fine; a non-positive/decreasing step is unsupported (frontend-rejected,
+  // so this is a dormant backstop) and a runtime step's sign goes unchecked.
   assert((rb.stepSource || rb.step > 0) &&
          "counted-loop counter is up-counting; a non-positive/decreasing step "
          "is unsupported (the frontend rejects it)");
@@ -463,13 +377,9 @@ Terminator HWEmitter::terminatorOf(const uarch::RegionBlock &rb) {
     return Terminator::counted(lb, datapath.resolveSource(rb.ubSource), step,
                                /*dynamic=*/true);
   if (rb.tripCount) {
-    // A constant trip K gives upper bound `lb + K*step`. A compile-time lb and
-    // step fold to a constant. A runtime lb/step -- the fixed-window idiom
-    // `for j in range(i, i+K)`, where the lb/step attributes default to 0/1 and
-    // the real start/stride ride Sources -- computes the bound from the same
-    // resolved lb/step that seed the counter, as a datapath Value tracking the
-    // runtime start. lb/step are region-entry-stable, so `ub` is a stable
-    // combinational value read by isLast/isEmpty like a resolved ubSource.
+    // Constant trip K: ub = lb + K*step. Compile-time lb/step fold to a
+    // constant; runtime lb/step (the fixed-window idiom `for j in
+    // range(i, i+K)`) resolve it the same way, giving a stable `ub`.
     int64_t trip = *rb.tripCount;
     Value ub;
     if (!rb.lbSource && !rb.stepSource) {
@@ -494,6 +404,7 @@ Terminator HWEmitter::terminatorOf(const uarch::RegionBlock &rb) {
 // captureResults); the shared skeleton reads as a linear sequence.
 Value HWEmitter::emitRegion(const uarch::RegionBlock &rb, Value start,
                             bool retrig) {
+  RegionTag tag(ctx, rb.id); // naming scope for this region's pipeline cells
   if (!rb.children.empty()) {
     if (rb.guard)
       return emitGuard(rb, start);
@@ -520,14 +431,9 @@ Value HWEmitter::emitRegion(const uarch::RegionBlock &rb, Value start,
     term = terminatorOf(rb);
   }
 
-  // Latency-insensitive shell: a region with stream accesses gets two signals
-  // (both F->G datapath values, resolved after the datapath, so they ride
-  // backedges) --
-  // `chainEnable` (~output-full) drives ctx.regionEnable so every shift chain +
-  // the done drain freeze coherently on back-pressure (preserving tap
-  // alignment), and `issueEnable` (~output-full & inputs-available) gates issue
-  // so an empty input is a bubble, not a freeze. A stream-free region keeps
-  // enable == true and regionEnable null -- identical to a stream-free region.
+  // A region with stream accesses gets two backedges resolved after the
+  // datapath: `chainEnable` freezes shift chains/done-drain on back-pressure;
+  // `issueEnable` also requires inputs-available, so empty input bubbles.
   bool hasStream = false;
   for (const uarch::StreamChannel &s : dp.streams)
     for (const uarch::StreamChannel::Access &acc : s.accesses)
@@ -541,19 +447,17 @@ Value HWEmitter::emitRegion(const uarch::RegionBlock &rb, Value start,
     enable = issueEnableBE;
   }
 
-  RegionControl rc = control.emitPipelineControl(rb, term, start, enable);
+  auto rc = control.emitPipelineControl(rb, term, start, enable);
   datapath.setControl(rb.id, rc); // seam G -> F (counter + issue)
 
-  // Datapath: -> feedback (the store drain + shell signals; a while's condition
-  // + its next-value producers are now emitted). The shell backedges are
-  // resolved at the very end (after the done drain, which also reads
-  // ctx.regionEnable) -- a setValue before that last use would not RAUW it.
-  DatapathFeedback fb = datapath.emit(rb, rc.issue);
+  // Datapath -> feedback (store drain + shell signals; a while's condition
+  // and next-value producers are now emitted). Shell backedges resolve last,
+  // after the done drain reads ctx.regionEnable, so setValue still RAUWs it.
+  auto fb = datapath.emit(rb, rc.issue);
 
   // Resolve the F->G condition backedge now the datapath has emitted it, and
-  // re-point the terminator at the resolved value -- `setValue` RAUWs and
-  // erases the placeholder, so a *later* read of `term.cond` (lastIssuePulse's
-  // exit test) must use the real condition, not the dead backedge handle.
+  // re-point the terminator: `setValue` RAUWs and erases the placeholder, so
+  // a later `term.cond` read (lastIssuePulse's exit test) needs the real value.
   if (rb.conditional) {
     Value cond =
         datapath.resolveSource(dp.carryInfo.find(rb.id)->second.condition);
@@ -562,43 +466,26 @@ Value HWEmitter::emitRegion(const uarch::RegionBlock &rb, Value start,
   }
 
   // Survivors: capture the region's results (returning their drain stage) and
-  // pin the last iteration's issue pulse -- the one pulse the done and the
+  // pin the last iteration's issue pulse, the one pulse both done and the
   // captures share.
   Value lastIssue = lastIssuePulse(rc, term);
   unsigned resultDrain = captureResults(rb, rc, lastIssue, start);
   unsigned drainStage = std::max(fb.storeDrain, resultDrain);
 
-  // Completion: the region's done signal. A counted leaf that is empty (lb >=
-  // ub
-  // -- a static `range(1,1)` or a runtime zero-trip) issues nothing, so it
-  // completes on `start` via `emptyDone` (else its store-drain done never fires
-  // -> deadlock). Folds away for a statically non-empty loop. A while / acyclic
-  // never reports empty here (null).
-  //
-  // Delayed one cycle so the pulse cannot land on `start` itself: `done` is a
-  // latched LEVEL that consumers complete on the rising edge of, so it has to
-  // read 0 for at least one cycle between two runs of a retriggered region --
-  // which is exactly what emitDone's start-clear provides, and what a `fire` on
-  // the same cycle would defeat. Firing on `start` a region whose done is still
-  // held from the previous outer iteration would hold the level at 1 across the
-  // restart, and the enclosing container would wait forever for an edge that
-  // never comes. Every other `fire` path is already at least one cycle past
-  // `start` (a store drains at stage >= 1; emitAcyclic registers its issue).
+  // A counted leaf that is empty (lb >= ub) issues nothing, so it completes
+  // on `start` via `emptyDone`, delayed one cycle so the pulse doesn't land
+  // on `start` itself (`done` is a level; retrigger needs a real 0->1 edge).
   Value emptyDone =
       (rb.kind == uarch::RegionBlock::Kind::Cyclic && !rb.conditional)
           ? ctx.delayValid(ctx.andBits(start, term.isEmpty(ctx)), 1)
           : Value();
   // emitDone's drain chain must still see the shell's enable; leave it after.
-  // A CallUnit region completes on the child instance's real `done`
-  // (fb.callDone) -- correct for a determinate child and the only option for an
-  // indeterminate one -- bypassing the store-drain done (a call region has no
-  // parent-issued stores of its own). A scalar result the child holds on its
-  // output port until `done` is the region's survivor
-  // *directly* (emitCalls set it), so the child's `done` handshake gates a
-  // consumer on the valid result without a separate statically-timed capture.
+  // A CallUnit region completes on the child's real `done` (fb.callDone):
+  // correct for a determinate child and the only option for an indeterminate
+  // one, since a call region has no parent-issued stores to drain.
   Value done = fb.callDone ? fb.callDone
-                           : control.emitDone(drainStage, lastIssue, emptyDone,
-                                              start, retrig);
+                           : control.emitDone(rb.id, drainStage, lastIssue,
+                                              emptyDone, start, retrig);
   // Every use of the shell signals (datapath + done drain) is now emitted, so
   // resolving the backedges here RAUWs them all.
   if (hasStream) {
@@ -633,7 +520,7 @@ unsigned HWEmitter::captureResults(const uarch::RegionBlock &rb,
 }
 
 // Capture each of a result-yielding region's results into its own survivor
-// register, on the cycle it lands -- while the result is still on its Source (a
+// register, on the cycle it lands, while the result is still on its Source (a
 // free-running datapath overwrites it once the run ends). Returns the
 // LATEST-landing result's stage (its ready cycle after \p lastIssue), which the
 // region folds into its `drainStage`: the done then rises with the deepest
@@ -658,12 +545,10 @@ unsigned HWEmitter::captureCountedResults(const uarch::RegionBlock &rb,
     unsigned stage = datapath.readyCycle(rs);
     Value cap = ctx.delayValid(lastIssue, stage);
     Value res = datapath.resolveSource(rs);
-    // A loop-carried result (a reduction accumulator) preloads its init on the
-    // region `start`, then latches the final value when it lands: a zero-trip
-    // run issues nothing, so `cap` never fires and the survivor holds the init
-    // (the reduction identity) rather than a stale accumulator from a prior
-    // invocation. A result with no init (an acyclic once-computed survivor)
-    // always lands, so a plain capture-when-ready suffices.
+    // A loop-carried result preloads its init at `start`, then latches the
+    // final value when it lands, so a zero-trip run (cap never fires) keeps
+    // the init instead of a stale prior value; an init-less result always
+    // lands.
     uarch::Source initSrc =
         initIt != dp.regionResultInit.end() && k < initIt->second.size()
             ? initIt->second[k]
@@ -672,6 +557,7 @@ unsigned HWEmitter::captureCountedResults(const uarch::RegionBlock &rb,
         initSrc.kind == uarch::Source::Kind::None
             ? ctx.enabledReg(res, cap, ctx.konst(res.getType(), 0))
             : ctx.latchReg(datapath.resolveSource(initSrc), res, start, cap);
+    nameValue(survivor, survivorName(rb.id, k));
     datapath.setSurvivor(rb.id, k, survivor);
     maxStage = std::max(maxStage, stage);
   }
@@ -687,15 +573,12 @@ unsigned HWEmitter::captureCountedResults(const uarch::RegionBlock &rb,
 // done keys off is the while's `lastIssuePulse` (issue & ~cond).
 unsigned HWEmitter::captureWhileResults(const uarch::RegionBlock &rb,
                                         const RegionControl &rc, Value start) {
-  const uarch::Datapath::CarryInfo &wi = dp.carryInfo.find(rb.id)->second;
+  const auto &wi = dp.carryInfo.find(rb.id)->second;
   Value cond = datapath.resolveSource(
       wi.condition); // memoized (the resolved continue-condition)
-  // A while continues (advances its recurrences) on each issued iteration whose
-  // condition is true. A carried next-value produced at a later stage lands
-  // that many cycles after the issue, so its advance pulse is delayed to match
-  // -- multi-stage flush (a load in the body pushes `next` to stage 1). A
-  // combinational body (every next at stage 0) reduces to the one shared pulse
-  // (a single-stage body: delayValid by 0 is the identity).
+  // A while continues (advances recurrences) on each issued iteration whose
+  // condition is true; a next-value produced at a later stage delays its
+  // advance pulse to match, reducing to one shared pulse for a stage-0 body.
   Value cont = ctx.andBits(rc.issue, cond);
   unsigned maxStage = 0;
   for (auto [k, nextS] : llvm::enumerate(wi.nexts)) {
@@ -707,7 +590,9 @@ unsigned HWEmitter::captureWhileResults(const uarch::RegionBlock &rb,
     Value init = wi.inits[k].kind == uarch::Source::Kind::None
                      ? ctx.konst(next.getType(), 0)
                      : datapath.resolveSource(wi.inits[k]);
-    datapath.setSurvivor(rb.id, k, ctx.latchReg(init, next, start, advance));
+    Value survivor = ctx.latchReg(init, next, start, advance);
+    nameValue(survivor, survivorName(rb.id, k));
+    datapath.setSurvivor(rb.id, k, survivor);
     maxStage = std::max(maxStage, stage);
   }
   return maxStage;
@@ -715,14 +600,14 @@ unsigned HWEmitter::captureWhileResults(const uarch::RegionBlock &rb,
 
 // Run `regions` in program order, each region starting when its predecessor
 // drains (the first on `start`); returns the last region's done. The shared
-// sequencer -- func-scope siblings (a single pass) and a container's children
-// (once per outer iteration) are the same "start k+1 when k drains" pattern.
+// sequencer: func-scope siblings (a single pass) and a container's children
+// (once per outer iteration) follow the same "start k+1 when k drains" pattern.
 Value HWEmitter::sequence(llvm::ArrayRef<uarch::RegionId> regions, Value start,
                           bool retrig) {
   Value done;
   Value startK = start;
   for (auto [i, rid] : llvm::enumerate(regions)) {
-    const uarch::RegionBlock &rb = dp.regions[rid];
+    const auto &rb = dp.regions[rid];
     done = emitRegion(rb, startK, retrig);
     if (i + 1 < regions.size())
       startK = ctx.startFor(/*regionStart=*/Value(), done);
@@ -738,18 +623,17 @@ Value HWEmitter::sequence(llvm::ArrayRef<uarch::RegionId> regions, Value start,
 // conjunction of every region's `done`: it rises when the last region
 // completes, which under concurrency need not be the last in program order. A
 // pure chain (every region depends on the previous) reproduces `sequence`
-// exactly -- each start is the rising edge of the prior `done` and the
+// exactly: each start is the rising edge of the prior `done` and the
 // conjunction equals the final `done`.
 Value HWEmitter::composeSiblings(llvm::ArrayRef<uarch::RegionId> regions,
                                  Value start) {
   llvm::DenseMap<uarch::RegionId, Value> doneOf;
   Value allDone;
   for (uarch::RegionId rid : regions) {
-    const uarch::RegionBlock &rb = dp.regions[rid];
-    // No predecessors: run concurrently with the kernel `start`. Else start on
-    // the rising edge of the predecessors' joined `done` -- the join waits for
-    // the last producer to complete. (A determinate predecessor's `done` edge
-    // is its static offset, reused as a time-trigger.)
+    const auto &rb = dp.regions[rid];
+    // No predecessors: run concurrently with the kernel `start`. Otherwise
+    // start on the rising edge of the predecessors' joined `done`, which
+    // waits for the last producer to complete.
     llvm::SmallVector<Value, 2> predDones;
     for (uarch::RegionId p : rb.predecessors) {
       Value d = doneOf.lookup(p);
@@ -767,8 +651,8 @@ Value HWEmitter::composeSiblings(llvm::ArrayRef<uarch::RegionId> regions,
 // Set up a container's loop-carried iter-args as frozen survivor registers:
 // each latches its `inits[k]` at `start` and advances to a next-value on
 // `advance` (a Backedge resolved after the children emit). Records each as
-// Source::Survivor{rb, k} -- read by the children's init reads and, for the
-// final value, a sibling -- and returns the per-arg next-value backedges the
+// Source::Survivor{rb, k}, read by the children's init reads and, for the
+// final value, a sibling; returns the per-arg next-value backedges the
 // caller sets to `resolveSource(nexts[k])` once the children have produced
 // them. Shared by the counted (emitContainer) and conditional
 // (emitConditionalContainer) regimes.
@@ -782,23 +666,31 @@ HWEmitter::setupCarriedIterArgs(const uarch::RegionBlock &rb,
     Value init = datapath.resolveSource(initS);
     circt::Backedge nb = ctx.bb.get(init.getType());
     nextBE.push_back(nb);
-    datapath.setSurvivor(rb.id, k, ctx.latchReg(init, nb, start, advance));
+    Value carried = ctx.latchReg(init, nb, start, advance);
+    nameValue(carried, survivorName(rb.id, k));
+    datapath.setSurvivor(rb.id, k, carried);
   }
   return nextBE;
 }
 
-// A loop-over-call region: see the header. The counter is `rc.counter` (so
-// emitCalls wires the child's index port to it via Source::Counter) and the
-// child start is `rc.issue` (the loop-fire pulse); the region completes when
-// the last iteration's `done` latches. One child instance fires N times, each
-// invocation advancing on its real `done` -- a held level cleared on its start,
-// so its rising edge marks each completion.
+// A loop-over-call region (a counted `dcp.pipeline` wrapping one CallUnit):
+// the counter is `rc.counter` (so emitCalls wires the child's index port to
+// it via Source::Counter) and the child start is `rc.issue` (the loop-fire
+// pulse); the region completes when the last iteration's `done` latches. One
+// child instance fires N times, each invocation advancing on its real
+// `done`, a held level cleared on its start, so its rising edge marks each
+// completion.
 Value HWEmitter::emitLoopCall(const uarch::RegionBlock &rb, Value start) {
+  RegionTag tag(ctx, rb.id);
   assert(rb.callUnits.size() == 1 && rb.units.empty() && rb.regs.empty() &&
          "a loop-over-call region is one child with no loose datapath");
   assert(rb.tripCount && rb.lb == 0 && rb.step == 1 &&
          "loop-over-call first cut supports a `0 to N step 1` trip");
-  int64_t N = *rb.tripCount;
+  int64_t n = *rb.tripCount;
+  // A zero-trip loop (`dcp.pipeline 0 to 0`) issues nothing, so it needs the
+  // same escape as the leaf/container paths: `N - 1` wraps to all-ones, so
+  // the unsigned `more` test never fires. Complete one cycle after `start`.
+  const bool empty = n <= 0;
   auto ivType = cast<IntegerType>(datapath.loopIndexPortType(rb));
   auto kconst = [&](int64_t v) { return ctx.konst(ivType, v); };
 
@@ -810,30 +702,37 @@ Value HWEmitter::emitLoopCall(const uarch::RegionBlock &rb, Value start) {
   // iterations still left.
   Backedge kNextBE = ctx.bb.get(ivType);
   Value k = ctx.reg(kNextBE, kconst(0));
-  nameValue(k, "loop_iv");
-  Value more = ctx.notBit(ctx.icmpUgeV(k, kconst(N - 1))); // iterations after k
+  nameValue(k, rb.counterName.empty() ? regionSignal(rb.id, "iv")
+                                      : rb.counterName);
+  // iterations after k (never, for an empty loop, so `advance` stays low and
+  // the counter never leaves 0)
+  Value more = empty ? ctx.f1 : ctx.notBit(ctx.icmpUgeV(k, kconst(n - 1)));
   Value advance = ctx.andBits(doneEdge, more);
   Value kInc = ctx.R(comb::AddOp::create(ctx.b, ctx.loc, k, kconst(1), false));
   kNextBE.setValue(ctx.mux(start, kconst(0), ctx.mux(advance, kInc, k)));
   // Fire the next iteration one cycle after the done edge, once k has settled.
   Value fireNext = ctx.reg(advance, ctx.f1);
-  Value childStart = ctx.orBits(start, fireNext);
+  nameValue(fireNext, regionSignal(rb.id, "fire"));
+  // An empty loop never fires the child at all (it is still instantiated; its
+  // own run gating keeps every write-enable low, so the arrays stay untouched).
+  Value childStart = empty ? ctx.f1 : ctx.orBits(start, fireNext);
 
-  // Datapath: emitCalls wires the single child -- start = rc.issue =
-  // childStart, index port = resolveSource(Counter) = k, boundary/internal mems
-  // mastered as usual.
+  // Datapath: emitCalls wires the single child: start = rc.issue = childStart,
+  // index port = resolveSource(Counter) = k, boundary/internal mems mastered
+  // as usual.
   RegionControl rc{/*issue=*/childStart, /*counter=*/k, /*wantIssue=*/Value()};
   datapath.setControl(rb.id, rc);
-  DatapathFeedback fb = datapath.emit(rb, rc.issue);
+  auto fb = datapath.emit(rb, rc.issue);
   assert(fb.callDone && "a loop-over-call region produced no child done");
   doneBE.setValue(fb.callDone);
 
   // done: latch the last iteration's completion (a done edge with none left),
   // cleared on `start` so a re-invocation re-arms.
-  Value last = ctx.andBits(doneEdge, ctx.notBit(more));
+  Value last = empty ? ctx.delayValid(start, 1)
+                     : ctx.andBits(doneEdge, ctx.notBit(more));
   Backedge doneHeldBE = ctx.bb.get(ctx.i1);
   Value doneHeld = ctx.reg(doneHeldBE, ctx.f1);
-  nameValue(doneHeld, "loop_done");
+  nameValue(doneHeld, regionSignal(rb.id, "done"));
   doneHeldBE.setValue(ctx.mux(start, ctx.f1, ctx.mux(last, ctx.t1, doneHeld)));
   return doneHeld;
 }
@@ -848,33 +747,27 @@ Value HWEmitter::emitLoopCall(const uarch::RegionBlock &rb, Value start) {
 // survivor register (captured in the producer, read in the consumer). Returns a
 // latched completion level.
 Value HWEmitter::emitContainer(const uarch::RegionBlock &rb, Value start) {
-  // Induction bounds: compile-time constants (the common counted container) or
-  // runtime Sources -- a variable-trip container, whose bound is an enclosing
-  // loop's counter (Source::Counter, a triangular/tile `for ii in range(i,
-  // ...)`) or a prologue survivor. `terminatorOf` resolves both; a runtime
-  // bound carries no static trip, so termination is `iv+step >= ub` (`isLast`)
-  // and a zero-trip
-  // (`lb >= ub`) container runs no child at all (`isEmpty`/`gateStart`).
-  Terminator term = terminatorOf(rb);
-  // The outer counter is the source IV: init `lb`, advance by `step`, so the
-  // children read the real outer index (Source::Counter). The counter register
-  // updates the cycle AFTER an iteration's start/advance pulse, and the child
-  // starts one cycle after that same pulse (child0Start is registered below),
-  // so by the time a child samples the counter for its bound (isEmpty / its own
-  // counter init) the register already holds the iteration it is starting --
-  // not the one it just left.
+  RegionTag tag(ctx, rb.id);
+  // Induction bounds: compile-time constants, or runtime Sources for a
+  // variable-trip container (bound = an enclosing loop's counter or a
+  // prologue survivor); a runtime bound terminates on `iv+step >= ub`.
+  auto term = terminatorOf(rb);
+  // The outer counter is the source IV (init `lb`, advance by `step`); both
+  // it and the child start lag the iteration pulse by one cycle, so a child
+  // sampling the counter sees the iteration it's starting, not the one just
+  // left.
   Backedge ivNext = ctx.bb.get(ctx.i32);
   Value iv = ctx.reg(ivNext, term.lb);
+  // A container's counter is materialized here, not by the ControlEmitter, so
+  // it needs the same source-IV label its leaf counterpart gets.
+  nameValue(iv, rb.counterName.empty() ? regionSignal(rb.id, "iv")
+                                       : rb.counterName);
   datapath.setCounter(rb.id,
                       iv); // live while the children emit (their outer index)
 
-  // Loop-carried iter-args (a counted reduction container: an outer loop
-  // carrying an accumulator into an inner reduction, e.g. `for m: for n: temp
-  // += …`). Each latches its init at `start` and advances to the child's
-  // next-value when an outer iteration drains (`advanceEdge`, resolved once the
-  // children have emitted). Placed before the children so their init reads
-  // (Source::Survivor{rb, k}) resolve; the final value is this region's
-  // survivor (a sibling store reads it).
+  // Loop-carried iter-args (e.g. an outer loop carrying an accumulator into
+  // an inner reduction): each latches its init at `start`, advances on each
+  // outer-iteration drain, and its final value is this region's survivor.
   Backedge advanceEdge = ctx.bb.get(ctx.i1);
   auto ci = dp.carryInfo.find(rb.id);
   SmallVector<Backedge> nextBE;
@@ -887,7 +780,7 @@ Value HWEmitter::emitContainer(const uarch::RegionBlock &rb, Value start) {
   datapath.emitCombUnits(rb);
 
   // Child 0 starts on `child0Start` (resolved below); `lastEdge` is the last
-  // child's done edge -- the outer iteration's completion.
+  // child's done edge, the outer iteration's completion.
   Backedge child0Start = ctx.bb.get(ctx.i1);
   Value lastEdge = ctx.risingEdge(sequence(rb.children, child0Start,
                                            /*retrig=*/true));
@@ -898,49 +791,43 @@ Value HWEmitter::emitContainer(const uarch::RegionBlock &rb, Value start) {
       ctx.R(comb::AddOp::create(ctx.b, ctx.loc, iv, term.step, false));
   Value last = term.isLast(ctx, ivStep); // this outer iteration is the last
   Value advance = ctx.andBits(lastEdge, ctx.notBit(last));
-  // Restart child 0 one cycle after the (non-empty) outer start pulse, then one
-  // cycle after each outer-iteration drain -- registered so the counter has
-  // settled to the iteration being started before a child samples it as a bound
-  // (a child whose bound is this container's own counter, e.g. `for k in
-  // range(i, j)` under `for j`). `gateStart` masks the start of a zero-trip
-  // container so no child issues.
+  // Restart child 0 one cycle after the outer start pulse or each
+  // outer-iteration drain, registered so the counter has settled before a
+  // child samples it as its own bound; `gateStart` masks a zero-trip start.
   child0Start.setValue(
       ctx.reg(ctx.mux(term.gateStart(ctx, start), ctx.t1, advance), ctx.f1));
   Value ivAdv = ctx.mux(advance, ivStep, iv);
   ivNext.setValue(ctx.mux(start, term.lb, ivAdv));
   // Latch done when the last child of the last outer iteration drains, and
-  // clear it on `start` -- so a *retriggered* container (an inner nest re-run
-  // by an enclosing container) presents a fresh 0->1 edge each pass. (Harmless
-  // for a top-level container: its `start` pulses once, when done is already
-  // 0.) A zero-trip container drains no child, so it completes one cycle after
-  // `start` instead (delayed so the pulse follows the start-reset, the same
-  // empty-region done pattern the leaf uses).
+  // clear it on `start` so a retriggered container gives a fresh edge each
+  // pass. A zero-trip container completes one cycle after `start` instead.
   Value emptyDone = ctx.reg(ctx.andBits(start, term.isEmpty(ctx)), ctx.f1);
-  return ctx.holdDone(ctx.orBits(emptyDone, ctx.andBits(lastEdge, last)),
-                      start);
+  Value done =
+      ctx.holdDone(ctx.orBits(emptyDone, ctx.andBits(lastEdge, last)), start);
+  nameValue(done, regionSignal(rb.id, "done"));
+  return done;
 }
 
-// A conditional container -- a sequential-wrapper while whose body nests child
+// A conditional container: a sequential-wrapper while whose body nests child
 // regions (an outer while enclosing an inner while). Each outer iteration
 // runs the children once (as emitContainer), but the loop is data-dependent:
 // the outer iter-args are frozen survivor registers advanced by the children's
 // results, and the loop ends when the combinational continue-condition (a raw
-// arith tree over those registers) goes false. A done-based CHECK/RUN FSM times
-// it -- one cycle after `start`, and after each outer-iteration drain, the
-// condition is re-checked on the settled iter-args; if it holds the children
-// (re)start, else the container is done and the iter-args hold their final
-// values (a sibling reads them as this region's survivors). No squash / stall:
-// the same non-speculative flushing family as a leaf while.
+// arith tree over those registers) goes false. A done-based CHECK/RUN FSM
+// times it: one cycle after `start`, and after each outer-iteration drain,
+// the condition is re-checked on the settled iter-args; if it holds the
+// children (re)start, else the container is done and the iter-args hold
+// their final values (a sibling reads them as this region's survivors). No
+// squash or stall: the same non-speculative flushing family as a leaf while.
 Value HWEmitter::emitConditionalContainer(const uarch::RegionBlock &rb,
                                           Value start) {
-  const uarch::Datapath::CarryInfo &wi = dp.carryInfo.find(rb.id)->second;
+  RegionTag tag(ctx, rb.id);
+  const auto &wi = dp.carryInfo.find(rb.id)->second;
   unsigned nArgs = wi.inits.size();
 
-  // Outer iter-arg registers = this region's survivors. Each latches its init
-  // at `start`, then advances to a child survivor's value when an outer
-  // iteration drains (`advanceEdge`, resolved once the children have emitted).
-  // Placed before the children so their init reads (Source::Survivor{rb, k})
-  // resolve.
+  // Outer iter-arg registers = this region's survivors: each latches its
+  // init at `start`, then advances to a child survivor's value when an
+  // outer iteration drains (`advanceEdge`, resolved after the children emit).
   Backedge advanceEdge = ctx.bb.get(ctx.i1);
   SmallVector<Backedge> nextBE =
       setupCarriedIterArgs(rb, wi.inits, start, advanceEdge);
@@ -949,14 +836,10 @@ Value HWEmitter::emitConditionalContainer(const uarch::RegionBlock &rb,
   // drain, when the iter-arg survivor registers have settled. The condition
   // cone reads those (frozen) survivors, so it launches here.
   Value checkStart = ctx.reg(ctx.orBits(start, advanceEdge), ctx.f1);
-  // Emit the condition cone (the container's own reads + combinational compute)
-  // and get the continue-condition value + its ready latency t_cond. A
-  // combinational condition has t_cond == 0 (the CHECK decides in-cycle, as
-  // before); a memory-/IP-dependent condition lands t_cond cycles after
-  // CHECK-start, so the decision WAITS for it -- the whole point of the
-  // sequential CHECK/RUN regime. The survivors do not advance until the body
-  // drains (after `child0Start`), so the cone's inputs are stable across the
-  // wait.
+  nameValue(checkStart, regionSignal(rb.id, "check"));
+  // Emit the condition cone and get the continue-condition plus its ready
+  // latency t_cond: 0 for a combinational condition, or several cycles for a
+  // memory-/IP-dependent one, which the CHECK/RUN regime waits for.
   auto [cond, tCond] = datapath.emitConditionRegion(rb, wi.condition);
   Value condValid = ctx.delayValid(checkStart, tCond);
   // Start the children only if the condition holds when it settles; otherwise
@@ -974,37 +857,37 @@ Value HWEmitter::emitConditionalContainer(const uarch::RegionBlock &rb,
 
   // Latch done (a level) when the condition first fails; clear on `start` so a
   // retriggered container presents a fresh edge each pass (harmless top-level).
-  return ctx.holdDone(donePulse, start);
+  Value done = ctx.holdDone(donePulse, start);
+  nameValue(done, regionSignal(rb.id, "done"));
+  return done;
 }
 
 // A guard region (a dcp.select): its two arms run mutually-exclusively under
 // the predicate. The then-arm (`children`) runs iff the predicate holds; the
-// else-arm
-// (`elseChildren`) runs iff it does not (a *dual* guard). The predicate is a
-// held value (the condition region's survivor, captured before the guard emits,
-// valid at `start`). The not-taken arm's children never issue -- so their
-// stores never fire (the predicate reaches every store write-enable
-// structurally, via the missing issue pulse, not a per-store gate). An empty
-// arm (a then-only guard's absent else, or a pass-through else that yields a
-// value but runs no schedule) completes in one cycle: its start pulse IS its
-// drain. Either way the region produces a done edge, so an enclosing container
-// advances past it in both branches. Run-once: no iteration / iter-args (unlike
-// emitConditionalContainer
-// -- the predicate is independent of the children).
+// else-arm (`elseChildren`) runs iff it does not (a *dual* guard). The
+// predicate is a held value (the condition region's survivor, captured before
+// the guard emits, valid at `start`). The not-taken arm's children never
+// issue, so their stores never fire: the predicate reaches every store
+// write-enable structurally, via the missing issue pulse, not a per-store
+// gate. An empty arm (a then-only guard's absent else, or a pass-through else
+// that yields a value but runs no schedule) completes in one cycle: its start
+// pulse IS its drain. Either way the region produces a done edge, so an
+// enclosing container advances past it in both branches. Run-once: no
+// iteration or iter-args, unlike emitConditionalContainer, since the
+// predicate is independent of the children.
 Value HWEmitter::emitGuard(const uarch::RegionBlock &rb, Value start) {
-  const uarch::Datapath::GuardInfo &gi = dp.guardCond.find(rb.id)->second;
+  RegionTag tag(ctx, rb.id);
+  const auto &gi = dp.guardCond.find(rb.id)->second;
   // The predicate as a Source: a scheduled condition region's survivor (a
   // data-dependent scf guard), or the parent container's combinational
-  // predicate unit (an affine guard over the counter, reified + emitted by
-  // emitCombUnits before this child sequences).
+  // predicate unit (an affine guard, emitted by emitCombUnits beforehand).
   Value cond = datapath.resolveSource(gi.condition);
   // CHECK one cycle after start (as in emitConditionalContainer): this
-  // decouples the completion pulse from the start-clear below -- a skipped
-  // guard's done pulse would otherwise coincide with `start` and be masked by
-  // the clear.
+  // decouples the completion pulse from the start-clear below, since a
+  // skipped guard's done would otherwise coincide with `start` and be masked.
   Value checkTime = ctx.reg(start, ctx.f1);
-  // Two mutually-exclusive arm pulses (the else-arm is the old one-shot
-  // `skip`).
+  nameValue(checkTime, regionSignal(rb.id, "check"));
+  // Two mutually-exclusive arm pulses: thenStart and elseStart.
   auto [thenStart, elseStart] = ctx.branchPulse(checkTime, cond);
   // Each arm runs its children once (retrig so a re-entered guard presents
   // fresh edges each enclosing pass); an empty arm drains on its own start
@@ -1017,12 +900,9 @@ Value HWEmitter::emitGuard(const uarch::RegionBlock &rb, Value start) {
                           ? elseStart
                           : ctx.risingEdge(sequence(rb.elseChildren, elseStart,
                                                     /*retrig=*/true));
-  // Result-mux: each yielded result is `cond ? then-value : else-value`. Latch
-  // each branch's value when that arm drains (only the taken arm fires, so its
-  // survivor is fresh and the other holds a stale value the mux ignores), then
-  // select by the held predicate. Resolvable now: sequence() above has set
-  // every child survivor a then/else value reads. A result-less dual guard has
-  // no regionResult entry and skips this.
+  // Result-mux: each yielded result is `cond ? then-value : else-value`.
+  // Latch each branch's value when that arm drains (only the taken arm
+  // fires, so the mux ignores the other's stale survivor) and select by cond.
   auto rit = dp.regionResult.find(rb.id);
   if (rit != dp.regionResult.end()) {
     const auto &elseR = dp.selectElseResult.find(rb.id)->second;
@@ -1033,12 +913,16 @@ Value HWEmitter::emitGuard(const uarch::RegionBlock &rb, Value start) {
           ctx.enabledReg(tv, thenDrained, ctx.konst(tv.getType(), 0));
       Value elseSurv =
           ctx.enabledReg(ev, elseDrained, ctx.konst(ev.getType(), 0));
+      nameValue(thenSurv, survivorName(rb.id, k));
+      nameValue(elseSurv, survivorName(rb.id, k));
       datapath.setSurvivor(rb.id, k, ctx.mux(cond, thenSurv, elseSurv));
     }
   }
   // Exactly one arm runs, so the region completes on whichever drains. Latch
   // done (a level); clear on start so a retriggered guard re-edges.
-  return ctx.holdDone(ctx.orBits(thenDrained, elseDrained), start);
+  Value done = ctx.holdDone(ctx.orBits(thenDrained, elseDrained), start);
+  nameValue(done, regionSignal(rb.id, "done"));
+  return done;
 }
 
 // Emit the whole module body: preamble (literals + read ports + internal
@@ -1052,15 +936,12 @@ void HWEmitter::emit() {
   for (const uarch::RegionBlock &rb : dp.regions)
     if (!rb.parent) // a child region emits inside its container
       top.push_back(rb.id);
-  // Compose the top-level siblings by their dependence DAG: independent regions
-  // start together (concurrent), the rest gate on their producers' `done`.
-  // `emitRegion`'s `retrig` (clear `done` on `start`) keeps the module re-
-  // invocable -- a parent that drives it more than once (a loop-over-calls
-  // controller) gets a fresh `done` edge per invocation. Harmless for a single
-  // invocation: each `done` still rises at drain and holds.
-  pa.setOutput("done", composeSiblings(top, pa.getInput("start")));
-  // Scalar results: the returning region's survivor register, stable once its
-  // region (and thus `done`) has risen -- the cosim samples it at `done`.
+  // Compose the top-level siblings by their dependence DAG: independent
+  // regions start together, the rest gate on their producers' `done`; retrig
+  // keeps the module re-invocable with a fresh `done` edge each drive.
+  pa.setOutput(kDone, composeSiblings(top, pa.getInput(kStart)));
+  // Scalar results: the returning region's survivor register, stable once
+  // its region (and thus `done`) has risen; the cosim samples it at `done`.
   for (const uarch::Result &r : dp.results)
     pa.setOutput(r.name, datapath.resolveSource(r.source));
 }
@@ -1069,21 +950,6 @@ void HWEmitter::emit() {
 // emitModule: interface (ports, extern operator modules) + validation.
 //===----------------------------------------------------------------------===//
 
-// The extern operator-module name for an IP-realized unit: its `impl` (the
-// operator's RTL module name), but a floating-point compare additionally
-// encodes its predicate (one behavioral module per predicate), since `impl`
-// alone
-// (`fcmp_l1`) does not say which comparison. A compare is the only IP carrying
-// a `predicate` attr (copied onto the op by the reifier); integer compare is
-// combinational, so an IP compare is always floating-point.
-static std::string ipModuleName(const uarch::FuncUnit &u) {
-  if (auto pred =
-          u.boundOps.front().first->getAttrOfType<arith::CmpFPredicateAttr>(
-              "predicate"))
-    return u.impl + "_" + arith::stringifyCmpFPredicate(pred.getValue()).str();
-  return u.impl;
-}
-
 // Reject a datapath outside the emittable subset, with a source diagnostic. The
 // preconditions the leaf lowering relies on: a schedulable region set, a trip
 // for every cyclic region, a combinational while/guard condition, no in-loop
@@ -1091,32 +957,45 @@ static std::string ipModuleName(const uarch::FuncUnit &u) {
 // emittable realization for every compute unit.
 static LogicalResult validateDatapath(func::FuncOp func,
                                       const uarch::Datapath &dp) {
-  // Supported subset: top-level sibling regions in program order (composed by
-  // sequential hand-off) and container loops whose children are sequenced
-  // within one outer iteration (a cross-region result crosses child-to-child as
-  // a survivor register). A counted cyclic region needs a trip -- a constant
-  // (`tripCount`) or a runtime upper bound (`ubSource`, a dynamic trip); a
-  // while (`conditional`) region flushing-pipelines instead.
+  // Supported subset: top-level siblings in program order, plus container
+  // loops whose children sequence within one outer iteration (crossing as a
+  // survivor register); a counted cyclic region needs a trip, a while flushes.
   if (dp.regions.empty())
     return func.emitError("allo-datapath-to-hw: no schedulable region");
+  // The builder already reported the offending edge; fail before any
+  // hardware is built from the placeholder depths it left.
+  if (dp.infeasible)
+    return failure();
+  // Access latencies the emitted structure cannot realize. Both are device
+  // rows the SCHEDULER honors, so silently emitting a 1-cycle port instead
+  // would place every consumer of that array on the wrong cycle.
+  for (const uarch::MemUnit &m : dp.mems) {
+    // An internal array is a `seq.hlmem`: CIRCT realizes read latency > 1 (it
+    // delays the address and registers the data) but only a 1-cycle write.
+    if (!m.external && !m.isRom && m.writeLatency != 1)
+      return func.emitError("allo-datapath-to-hw: on-chip array with a ")
+             << m.writeLatency
+             << "-cycle write is unsupported (seq.hlmem realizes only a "
+                "1-cycle write); declare wr_lat 1 for this storage impl";
+    // A boundary array's port latency is a contract with the driver, not
+    // enforced by the emitted RTL; the interface manifest carries it, so any
+    // latency >= 1 works, but 0 is rejected (an edge-triggered port can't).
+    if (m.external && (m.readLatency < 1 || m.writeLatency < 1))
+      return func.emitError("allo-datapath-to-hw: argument array with a ")
+             << m.readLatency << "-cycle read / " << m.writeLatency
+             << "-cycle write is unsupported; a boundary port is "
+                "edge-triggered "
+                "and needs at least 1 cycle. Use an internal buffer, or bind "
+                "this argument to a storage impl with a >= 1 cycle access";
+  }
   for (const uarch::RegionBlock &rb : dp.regions)
     if (rb.kind == uarch::RegionBlock::Kind::Cyclic && !rb.conditional &&
         !rb.tripCount && !rb.ubSource)
       return func.emitError("allo-datapath-to-hw: cyclic region needs a "
                             "constant or dynamic trip");
-  // When and how the condition is read decides how settled it must be:
-  //   * a flushing leaf while (rb.children empty) samples it the cycle it
-  //   issues,
-  //     and a guard samples it the cycle it is CHECKed -- both in-cycle, so the
-  //     condition must be a stage-0 Unit or a settled prologue Survivor;
-  //   * a sequential CHECK/RUN while (rb.children non-empty -- a container or a
-  //     wrapped-body leaf) WAITS `t_cond` cycles for the condition
-  //     (emitConditionRegion + delayValid) before deciding, so a multi-stage
-  //     (memory-/IP-dependent) Unit condition is fine there.
-  // A None condition (the reifier left an unschedulable tree raw) is always
-  // rejected. A leaf while's multi-*stage body* is independently fine (a load
-  // pushes a carried next-value to a later stage; captureWhileResults drains
-  // it).
+  // Condition timing: a flushing leaf while or guard samples it in-cycle,
+  // needing a stage-0 Unit or settled Survivor; a sequential CHECK/RUN while
+  // instead waits t_cond cycles, so a multi-stage condition works there.
   auto conditionOk = [&](const uarch::Source &s, bool sequential) {
     switch (s.kind) {
     case uarch::Source::Kind::Survivor:
@@ -1140,17 +1019,12 @@ static LogicalResult validateDatapath(func::FuncOp func,
                             "non-combinational predicate is not yet lowered");
   }
   // A leaf `while` with an in-loop store lowers: emitAccesses gates each
-  // store's write-enable by the continue-condition (`issue & cond`), so the
-  // doomed exit iteration commits nothing -- the same non-speculative rule the
-  // loop-carried survivors already follow. (Reaching here, every conditional
-  // region has a combinational condition, checked just above, so the gate is a
-  // valid stage-0 pulse.)
+  // store's write-enable by `issue & cond`, so a doomed exit iteration
+  // commits nothing, matching the non-speculative loop-carried-survivor rule.
 
-  // An unresolved (None) input is a cross-region SSA value hand-off (a scalar
-  // produced in one region and consumed in another): build leaves the slot
-  // empty (see resolveOperand). Reject it cleanly rather than asserting deep in
-  // `src` -- spilling is unsupported. Memory-coupled regions (the common case)
-  // resolve fully and pass this check.
+  // An unresolved (None) input is a cross-region SSA value hand-off (a
+  // scalar produced in one region, consumed in another); reject it cleanly
+  // here rather than asserting deep in `src`, since spilling is unsupported.
   auto none = [](const uarch::Source &s) {
     return s.kind == uarch::Source::Kind::None;
   };
@@ -1165,10 +1039,9 @@ static LogicalResult validateDatapath(func::FuncOp func,
             "allo-datapath-to-hw: cross-region value hand-off "
             "not yet supported");
 
-  // Realizability: every compute unit must have an emittable realization. A
+  // Realizability: every compute unit needs an emittable realization. A
   // combinational unit needs an EmitHW comb lowering (`combEmitted`); an IP
-  // unit needs a non-empty module name (instantiated below). Fail by op name
-  // rather than asserting deep in emission.
+  // unit needs a non-empty module name. Fail by op name, not deep in emission.
   for (const uarch::FuncUnit &u : dp.units) {
     if (u.comb) {
       if (!combEmitted(u.opType)) {
@@ -1191,27 +1064,24 @@ static LogicalResult validateDatapath(func::FuncOp func,
   // mis-emitting it.
   for (const uarch::CallUnit &cu : dp.calls) {
     // A multi-scalar-result call yields several survivors from one op, but
-    // producerOf (and thus regionResult) is keyed per op -- only result 0 is
-    // tracked. Reject more than one: per-result tracking is unsupported.
+    // producerOf (and thus regionResult) is keyed per op, so only result 0
+    // is tracked. Reject more than one: per-result tracking is unsupported.
     if (cu.resultPorts.size() > 1)
       return func.emitError("allo-datapath-to-hw: a sub-kernel call returning "
                             "more than one scalar is not yet lowered");
     for (const uarch::CallUnit::MemArg &ma : cu.memArgs) {
-      // Several serial calls mastering one boundary arg time-share the top port
-      // via emitCalls' master mux. A call sharing a boundary arg with a
-      // *parent* access still needs that access routed through the same mux (a
-      // separate code path, emitAccesses) -- unsupported, so reject it loudly.
+      // Several serial calls mastering one boundary arg time-share the top
+      // port via emitCalls' master mux. A call sharing that arg with a
+      // *parent* access needs the same mux via emitAccesses; unsupported.
       if (ma.isBoundary && !dp.mems[ma.mem].accesses.empty())
         return func.emitError(
             "allo-datapath-to-hw: a boundary argument mastered by a sub-kernel "
             "call and a parent access needs a port-sharing mux -- not yet "
             "lowered");
     }
-    // A void indeterminate call (a `while` leaf, no static latency) lowers on
-    // the leaf: the region completes on the child's real `done` (fb.callDone),
-    // needing no latency. Only a SCALAR-returning indeterminate call stays
-    // rejected -- its result lands at a data-dependent cycle readyCycleOf
-    // cannot place (a valid-signal result handshake is unsupported).
+    // A void indeterminate call (no static latency) lowers fine: the region
+    // completes on the child's real `done`. Only a scalar-returning
+    // indeterminate call is rejected: its result timing is data-dependent.
     if (!cu.latency && !cu.resultPorts.empty())
       return func.emitError(
           "allo-datapath-to-hw: an indeterminate sub-kernel call returning a "
@@ -1221,23 +1091,26 @@ static LogicalResult validateDatapath(func::FuncOp func,
 }
 
 // Declare an extern operator module for each IP-realized compute unit, named by
-// `ipModuleName` and deduplicated across the whole module (`opModules`). Native
-// (comb) units emit inline, no extern. One input port per operand (named `a`,
-// `b`, `c`, ... at each operand's width -- a unary cast/`sqrt` gets `a` only, a
-// binary op `a`+`b`, a compare two operands yielding i1) then the output at the
-// result width. The interface follows the realization's stall contract:
+// `operatorModuleName` and deduplicated across the whole module (`opModules`).
+// Native (comb) units emit inline, no extern. One input port per operand (named
+// `a`, `b`, `c`, ... at each operand's width: a unary cast/`sqrt` gets `a`
+// only, a binary op `a`+`b`, a compare two operands yielding i1) then the
+// output at the result width. The interface follows the realization's stall
+// contract:
 // `(a.., clk) -> y` free-running, or `(a.., clk, ce) -> y` when clock-enabled
-// (`ce == 0` freezes the pipe in lockstep with the shell). Signature + contract
-// are a function of `impl`, so every instance of a given module name shares one
-// port shape (dedup-safe). Returns unit id -> its extern module.
+// (`ce == 0` freezes the pipe in lockstep with the shell). Both are a function
+// of `impl`, so every instance of a module name shares one port shape, which is
+// what makes the dedup safe. Returns unit id -> its extern module.
 static DenseMap<unsigned, Operation *>
 declareOperatorModules(func::FuncOp func, const uarch::Datapath &dp,
-                       OpBuilder &b, llvm::StringMap<Operation *> &opModules) {
-  MLIRContext *ctx = b.getContext();
+                       OpBuilder &b, llvm::StringMap<Operation *> &opModules,
+                       std::vector<iface::Operator> &declared) {
+  auto *ctx = b.getContext();
   Location loc = func.getLoc();
   using PortInfo = hw::PortInfo;
   using Dir = hw::ModulePort::Direction;
   DenseMap<unsigned, Operation *> unitModule;
+  llvm::StringSet<> listed; // one manifest entry per module, not per unit
   for (const uarch::FuncUnit &u : dp.units) {
     if (u.comb || u.boundOps.empty())
       continue;
@@ -1245,22 +1118,33 @@ declareOperatorModules(func::FuncOp func, const uarch::Datapath &dp,
     assert(u.inputs.size() == srcOp->getNumOperands() &&
            "IP unit input count must match its bound op's operand count");
     IntegerType outW = hwType(u.resultType, b);
-    std::string modName = ipModuleName(u);
+    std::string modName = operatorModuleName(u);
+    // The port shape is a function of the realization, so every instance of a
+    // module name shares it: build the manifest entry alongside the ports.
+    iface::Operator entry{modName, u.impl, operatorPredicate(u), {}};
+    SmallVector<PortInfo> ep;
+    for (unsigned k = 0; k < u.inputs.size(); ++k) {
+      IntegerType w = hwType(srcOp->getOperand(k).getType(), b);
+      std::string pn(1, static_cast<char>('a' + k));
+      ep.push_back({{StringAttr::get(ctx, pn), w, Dir::Input}});
+      entry.ports.push_back({pn, w.getWidth(), iface::Operator::Role::Data});
+    }
+    ep.push_back({{StringAttr::get(ctx, kClk), b.getI1Type(), Dir::Input}});
+    entry.ports.push_back({kClk.str(), 1, iface::Operator::Role::Clk});
+    if (u.stall == allo::StallContractEnum::Ce) {
+      ep.push_back({{StringAttr::get(ctx, kCe), b.getI1Type(), Dir::Input}});
+      entry.ports.push_back({kCe.str(), 1, iface::Operator::Role::Ce});
+    }
+    ep.push_back({{StringAttr::get(ctx, kOpOut), outW, Dir::Output}});
+    entry.ports.push_back(
+        {kOpOut.str(), outW.getWidth(), iface::Operator::Role::Out});
+
     Operation *&mod = opModules[modName];
-    if (!mod) {
-      SmallVector<PortInfo> ep;
-      for (unsigned k = 0; k < u.inputs.size(); ++k) {
-        IntegerType w = hwType(srcOp->getOperand(k).getType(), b);
-        std::string pn(1, static_cast<char>('a' + k));
-        ep.push_back({{StringAttr::get(ctx, pn), w, Dir::Input}});
-      }
-      ep.push_back({{StringAttr::get(ctx, "clk"), b.getI1Type(), Dir::Input}});
-      if (u.stall == allo::StallContractEnum::Ce)
-        ep.push_back({{StringAttr::get(ctx, "ce"), b.getI1Type(), Dir::Input}});
-      ep.push_back({{StringAttr::get(ctx, "y"), outW, Dir::Output}});
+    if (!mod)
       mod = hw::HWModuleExternOp::create(b, loc, StringAttr::get(ctx, modName),
                                          hw::ModulePortInfo(ep));
-    }
+    if (listed.insert(modName).second)
+      declared.push_back(std::move(entry));
     unitModule[u.id] = mod;
   }
   return unitModule;
@@ -1270,35 +1154,38 @@ llvm::SmallVector<hw::PortInfo>
 declareModulePorts(const iface::ModuleInterface &model, OpBuilder &b) {
   using PortInfo = hw::PortInfo;
   using Dir = hw::ModulePort::Direction;
-  MLIRContext *ctx = b.getContext();
+  auto *ctx = b.getContext();
   Type i1 = b.getI1Type(), i32 = b.getIntegerType(32);
   // A data port's hw width is its field bit width, so `iType(w)` reproduces
   // `hwType`/`memElemType` for the data ports.
   auto iType = [&](unsigned w) -> Type { return b.getIntegerType(w); };
   SmallVector<PortInfo> ports;
+  // The port names are the manifest, authored before CIRCT's LegalizeNames
+  // runs, so a name ExportVerilog would rewrite or uniquify desyncs cosim from
+  // the Verilog. `verilogName` prevents that; these check the composed result.
+  llvm::StringSet<> seen;
   auto port = [&](const Twine &n, Type t, Dir d) {
-    ports.push_back(PortInfo{{StringAttr::get(ctx, n.str()), t, d}});
+    std::string s = n.str();
+    assert(sv::isNameValid(s, /*caseInsensitiveKeywords=*/false) &&
+           "module port name is not a legal SystemVerilog identifier; the JSON "
+           "manifest would desync from the emitted Verilog");
+    bool fresh = seen.insert(s).second;
+    assert(fresh && "duplicate module port name; the JSON manifest would "
+                    "desync from the emitted Verilog");
+    (void)fresh;
+    ports.push_back(PortInfo{{StringAttr::get(ctx, s), t, d}});
   };
-  port("clk", i1, Dir::Input);
-  port("rst", i1, Dir::Input);
-  port("start", i1, Dir::Input);
-  // Scalar kernel arguments (memref args become memory ports instead).
-  for (const iface::Scalar &s : model.scalars) {
-    // A scalar arg named after a control port (or a Verilog keyword) collides
-    // with the hard-coded ports here / gets renamed by CIRCT's LegalizeNames,
-    // but the JSON manifest is serialized from these pre-legalization names --
-    // so the cosim harness would drive a port name that no longer exists.
-    assert(s.name != "clk" && s.name != "rst" && s.name != "start" &&
-           s.name != "done" &&
-           "scalar argument port name collides with a reserved control port; "
-           "the JSON manifest would desync from the emitted Verilog");
+  port(kClk, i1, Dir::Input);
+  port(kRst, i1, Dir::Input);
+  port(kStart, i1, Dir::Input);
+  // Scalar kernel arguments; memref args become memory ports instead. One
+  // named after a control port trips the duplicate check above.
+  for (const iface::Scalar &s : model.scalars)
     port(s.name, iType(s.width), Dir::Input);
-  }
-  // Stream FIFO ports, input side. All module inputs must stay contiguous at
-  // the front of the port list (HWModulePortAccessor maps body args to the
-  // first `numInputs` ports positionally), so an input stream's {data, valid}
-  // and an output stream's back-pressure {ready} go here; the output side is
-  // declared after `done`.
+  // Stream FIFO ports, input side: module inputs must stay contiguous at the
+  // front (HWModulePortAccessor maps body args to the first `numInputs`
+  // ports positionally), so {data, valid} / {ready} go here; outputs follow
+  // `done`.
   for (const iface::FIFO &s : model.streams) {
     if (s.isInput) {
       port(s.data, iType(s.width), Dir::Input);
@@ -1313,7 +1200,7 @@ declareModulePorts(const iface::ModuleInterface &model, OpBuilder &b) {
   for (const auto &acc : model.reads)
     for (const iface::Memory &r : acc)
       port(r.data, iType(r.width), Dir::Input);
-  port("done", i1, Dir::Output);
+  port(kDone, i1, Dir::Output);
   // Stream FIFO ports, output side (after `done`, among the module outputs): an
   // input stream's back-pressure {ready}; an output stream's {data, valid}.
   for (const iface::FIFO &s : model.streams) {
@@ -1369,7 +1256,7 @@ static FailureOr<std::pair<hw::HWModuleOp, iface::ModuleInterface>>
 emitModule(func::FuncOp func, uarch::Datapath &dp, OpBuilder &b,
            llvm::StringMap<Operation *> &opModules,
            const uarch::CalleeCtx *callees = nullptr) {
-  MLIRContext *ctx = b.getContext();
+  auto *ctx = b.getContext();
   Location loc = func.getLoc();
   if (failed(validateDatapath(func, dp)))
     return failure();
@@ -1386,17 +1273,21 @@ emitModule(func::FuncOp func, uarch::Datapath &dp, OpBuilder &b,
       for (unsigned a = 0; a < m.accesses.size(); ++a)
         (m.accesses[a].isWrite ? writes : reads).push_back({m.id, a});
 
-  DenseMap<unsigned, Operation *> unitModule =
-      declareOperatorModules(func, dp, b, opModules);
-
-  // The port-name model: the single source for every boundary port name, shared
-  // by the declaration (declareModulePorts), the manifest, and the cosim
-  // harness.
+  // The single source for every boundary port name, shared by the declaration
+  // (declareModulePorts), the manifest and the cosim harness. It also carries
+  // the extern operator modules this kernel instantiates.
   iface::ModuleInterface model(dp, reads, writes);
-  SmallVector<hw::PortInfo> ports = declareModulePorts(model, b);
+  auto unitModule =
+      declareOperatorModules(func, dp, b, opModules, model.operators);
+  auto ports = declareModulePorts(model, b);
 
   hw::ModulePortInfo portInfo(ports);
-  StringAttr modName = StringAttr::get(ctx, func.getSymName());
+  // Legalized here rather than left to ExportVerilog, so the key the manifest
+  // uses is the emitted Verilog module name. A nested callee `top.child` would
+  // otherwise be rewritten downstream.
+  model.symbol = func.getSymName().str();
+  model.module = verilogName(model.symbol);
+  StringAttr modName = StringAttr::get(ctx, model.module);
 
   auto hwMod = hw::HWModuleOp::create(
       b, loc, modName, portInfo,
@@ -1404,18 +1295,15 @@ emitModule(func::FuncOp func, uarch::Datapath &dp, OpBuilder &b,
         BackedgeBuilder bb(ib, loc);
         HWEmitter e(ib, loc, dp, pa, reads, writes, unitModule, bb, i1, i32,
                     callees);
-        e.ctx.clk =
-            e.ctx.R(seq::ToClockOp::create(ib, loc, pa.getInput("clk")));
-        e.ctx.clkRaw = pa.getInput("clk");
-        e.ctx.rst = pa.getInput("rst");
+        e.ctx.clk = e.ctx.R(seq::ToClockOp::create(ib, loc, pa.getInput(kClk)));
+        e.ctx.clkRaw = pa.getInput(kClk);
+        e.ctx.rst = pa.getInput(kRst);
         e.emit();
       });
 
-  // Hand the port model back to the caller (the pass): it derives the cosim
-  // manifest JSON from it and, for a dataflow container, threads the leaf
-  // models to the structural-top emitter -- so the model is the single
-  // in-memory port representation, with no IR-attribute manifest to keep in
-  // sync.
+  // Hand the port model back to the caller: it derives the cosim manifest
+  // JSON and, for a dataflow container, threads the leaf models into the
+  // structural-top emitter, keeping one in-memory port representation.
   return std::make_pair(hwMod, std::move(model));
 }
 
@@ -1435,7 +1323,7 @@ static bool hasDCPRegions(func::FuncOp func) {
 // each onto its referencing `dcp.compute` (its `latency` + `pipelined`) so the
 // datapath reads timing locally, then drop the now-spent `dcp.operator` /
 // `dcp.device` declarations. This lets each extern operator module share the
-// operator's `sym_name` (the RTL module name) with no symbol clash -- there is
+// operator's `sym_name` (the RTL module name) with no symbol clash: there is
 // no live same-named symbol once the declarations are gone. Runs on the emit
 // clone, so the canonical scheduled module keeps the normalized form.
 static void stampOperatorTiming(ModuleOp module) {
@@ -1465,11 +1353,16 @@ LogicalResult emitDatapathToHW(ModuleOp module, StringRef binding,
                                StringRef top,
                                llvm::StringMap<std::string> &interfaces) {
   // Called directly (not via the pass manager), so load the dialects this
-  // emits -- the ones the pass declares as dependent -- into the context.
-  MLIRContext *ctx = module.getContext();
+  // emits, the ones the pass declares as dependent, into the context.
+  auto *ctx = module.getContext();
   ctx->getOrLoadDialect<hw::HWDialect>();
   ctx->getOrLoadDialect<comb::CombDialect>();
   ctx->getOrLoadDialect<seq::SeqDialect>();
+
+  // The device's storage timing is read BEFORE `stampOperatorTiming` drops
+  // `dcp.device`. Compute timing folds onto each `dcp.compute`, but memory
+  // latency has no such carrier, so it threads into the datapath builder.
+  MemoryLibrary memLib = OperatorLibrary::fromModule(module).memoryLibrary();
 
   // Fold operator timing onto the compute ops and drop the declarations, before
   // any datapath is built or an extern operator module is named.
@@ -1481,12 +1374,10 @@ LogicalResult emitDatapathToHW(ModuleOp module, StringRef binding,
       scheduled.push_back(f);
   });
 
-  // A memref/array function result is unsupported: hardware writes an output
-  // through a memory port, not a returned value (the upstream
-  // buffer-results-to-out-params prepass that would rewrite it is deliberately
-  // not run). Reject cleanly here rather than asserting deep in the datapath
-  // builder (recordResults), which runs while the Datapath is constructed
-  // below.
+  // A memref/array function result is unsupported: hardware writes output
+  // through a memory port, not a returned value, and the prepass that would
+  // rewrite it is deliberately not run. Reject cleanly here, not deep in the
+  // builder.
   for (func::FuncOp f : scheduled)
     if (auto ret = dyn_cast<func::ReturnOp>(f.front().getTerminator()))
       for (Value v : ret.getOperands())
@@ -1497,17 +1388,14 @@ LogicalResult emitDatapathToHW(ModuleOp module, StringRef binding,
           return failure();
         }
 
-  std::unique_ptr<BindingPolicy> policy = bindingPolicyFor(binding);
+  auto policy = bindingPolicyFor(binding);
   if (!policy)
     return module.emitError("allo-datapath-to-hw: unknown binding policy '")
            << binding << "'";
 
   // Emission is rooted at the top function and runs bottom-up over the call
-  // DAG: recurse into each callee before emitting `f`, so a container always
-  // finds its children already emitted and registered. A leaf (no scheduled
-  // callees) emits its own datapath; a container (dataflow or sequential) wires
-  // its already-emitted children into a structural top. Mirrors the scheduler,
-  // which also roots at `top` and schedules callees first.
+  // DAG: each callee emits before its caller, so a container always finds
+  // its children already registered. Mirrors the scheduler's traversal order.
   llvm::StringMap<func::FuncOp> byName;
   for (func::FuncOp f : scheduled)
     byName[f.getSymName()] = f;
@@ -1518,28 +1406,30 @@ LogicalResult emitDatapathToHW(ModuleOp module, StringRef binding,
 
   OpBuilder b(module.getBodyRegion());
   llvm::StringMap<Operation *> opModules;
-  // Callee tables, keyed by symbol name -- leaf kernels plus containers emitted
-  // so far. A container is composed exactly like a leaf, so both live here.
+  // Callee tables, keyed by symbol name: leaf kernels plus containers
+  // emitted so far. A container composes exactly like a leaf, so both
+  // live here.
   llvm::StringMap<hw::HWModuleOp> modules;
   llvm::StringMap<iface::ModuleInterface> ifaceModels;
   llvm::StringSet<> visited;
 
   auto registerModule = [&](StringRef name, hw::HWModuleOp mod,
                             iface::ModuleInterface model) {
-    interfaces[name] = model.toJSON();
+    // The callee tables key on the func symbol, which a callsite names; the
+    // manifest keys on the emitted module name, which the simulator names.
+    interfaces[mod.getModuleName()] = model.toJSON();
     modules[name] = mod;
     ifaceModels[name] = std::move(model);
   };
 
-  // Post-order over the call DAG (acyclic -- the frontend rejects recursion). A
-  // self-parameter recursive lambda (`self(self, ...)`) keeps the traversal
+  // Post-order over the call DAG (acyclic; the frontend rejects recursion),
+  // via a self-parameter recursive lambda (`self(self, ...)`).
   auto emitOne = [&](auto &self, func::FuncOp f) -> LogicalResult {
     if (!visited.insert(f.getSymName()).second)
       return success(); // a shared callee already emitted
     // Children first: emit every scheduled callee (a leaf call misses
-    // `byName`). A callee is referenced by a `func.call` (async spawn /
-    // structural-top compose) or a `dcp.instance` (a leaf CallUnit) --
-    // both must recurse so the child is emitted + registered before its caller.
+    // `byName`). A callee is referenced by a `func.call` or a `dcp.instance`
+    // (a leaf CallUnit); both must recurse before their caller emits.
     WalkResult wr = f.walk([&](Operation *op) -> WalkResult {
       StringRef callee;
       if (auto call = dyn_cast<func::CallOp>(op))
@@ -1556,14 +1446,9 @@ LogicalResult emitDatapathToHW(ModuleOp module, StringRef binding,
     if (wr.wasInterrupted())
       return failure();
 
-    // A container wires its children into a structural top, inserted at the
-    // module-body start so the outermost -- emitted last -- lands at position
-    // 0. A leaf emits its own datapath before its source func. The one router
-    // read: a CONCURRENT container (a dataflow network of `await` spawns,
-    // stamped `dcp.determinacy = concurrent` by the reifier) wires a structural
-    // top; every other kernel -- a leaf, or a non-concurrent container whose
-    // sync calls reified to `dcp.instance`s (so it holds no `func.call`) --
-    // lowers as a leaf datapath below.
+    // A container wires its children into a structural top (inserted at the
+    // module-body start, so the outermost lands at position 0). Only a
+    // CONCURRENT container takes this path; everything else emits as a leaf.
     auto det = f->getAttrOfType<DeterminacyEnumAttr>("dcp.determinacy");
     if (det && det.getValue() == DeterminacyEnum::Concurrent) {
       b.setInsertionPointToStart(module.getBody());
@@ -1581,7 +1466,7 @@ LogicalResult emitDatapathToHW(ModuleOp module, StringRef binding,
       f.walk([&](dcp::DCPathInstanceOp) { hasInvoke = true; });
       uarch::CalleeCtx cc{modules, ifaceModels};
       const uarch::CalleeCtx *callees = hasInvoke ? &cc : nullptr;
-      Datapath dp(f, *policy, callees);
+      Datapath dp(f, *policy, memLib, callees);
       LLVM_DEBUG({
         llvm::dbgs() << "// datapath for @" << f.getSymName() << "\n";
         dp.dump(llvm::dbgs());

@@ -45,17 +45,28 @@ class CosimResult:
     result: object = None
 
 
+def interface_of(interfaces: dict, symbol: str) -> dict:
+    """The port manifest of the module emitted for the MLIR symbol ``symbol``.
+    The manifest is keyed by the RTL module name, which differs from the symbol
+    whenever the symbol needed legalizing (``top.child`` -> ``top_child``), so
+    the lookup goes through the manifest's own ``symbol`` field."""
+    for iface in interfaces.values():
+        if iface["symbol"] == symbol:
+            return iface
+    raise KeyError(f"no emitted module for symbol '{symbol}'")
+
+
 def _write_sources(
-    hw_ir: str, verilog: str, top: str, workdir: Path, operators
+    verilog: str, module: str, workdir: Path, operators, interfaces: dict
 ) -> tuple[list[Path], list[str]]:
     """Write the DUT Verilog (+ extern-IP behavioral models) and DPI C. Returns
     (verilog_sources, build_args) for the runner. The extern-IP models and DPI are
     generated from the device ``operators`` (kind/latency/dtypes) joined to the
-    extern instances the hw IR declares (realized port shape)."""
-    dut = workdir / f"{top}.sv"
-    dut.write_text(verilog + "\n" + ip_models.sv_models(hw_ir, operators))
+    extern instances the port manifest declares (realized port shape)."""
+    dut = workdir / f"{module}.sv"
+    dut.write_text(verilog + "\n" + ip_models.sv_models(interfaces, operators))
     build_args: list[str] = []
-    dpi = ip_models.dpi_c(hw_ir, operators)
+    dpi = ip_models.dpi_c(interfaces, operators)
     if dpi:
         cpp = workdir / "dpi.cpp"
         cpp.write_text(dpi)
@@ -65,7 +76,6 @@ def _write_sources(
 
 def _build_config(
     interface,
-    top,
     mems,
     streams,
     arg_types,
@@ -126,7 +136,9 @@ def _build_config(
             cfg["file_out"] = str(workdir / f"out_stream{s.arg}.npy")
         stream_cfgs.append(cfg)
     return {
-        "top": top,
+        "top": interface["module"],
+        # The fixed control ports, read from the manifest like any other port.
+        "control": interface["control"],
         "clock_ps": clock_ps,
         "timeout": timeout,
         "reset_cycles": 3,
@@ -142,9 +154,8 @@ def _build_config(
 
 
 def cosim(
-    hw_ir: str,
     verilog: str,
-    interface: dict,
+    interfaces: dict,
     top: str,
     arg_types,
     args,
@@ -158,15 +169,19 @@ def cosim(
     waves: bool = False,
     stall_prob: float = 0.0,
 ) -> CosimResult:
-    """Drive the emitted module (``verilog``, named ``top``, with ``hw_ir`` for the
-    extern-IP models) under cocotb + ``simulator`` with the numpy ``args``, bound
-    to ports by the ``interface`` port manifest. Writes each output argument back
-    in place; returns the cycle count."""
+    """Drive the emitted RTL under cocotb + ``simulator`` with the numpy ``args``,
+    bound to ports by the port manifest of the module ``top`` (an MLIR symbol; the
+    manifest names the RTL module it became). ``interfaces`` is the whole
+    {module -> manifest} map, since the extern-IP models cover every emitted
+    module, not just the top. Writes each output argument back in place; returns
+    the cycle count."""
     from cocotb_tools.runner import get_runner
 
     assert len(args) == len(
         arg_types
     ), f"cosim expected {len(arg_types)} kernel arguments, got {len(args)}"
+    interface = interface_of(interfaces, top)
+    module = interface["module"]
     mems = _ports.plan_mems(interface, arg_types)
     streams = _ports.plan_streams(interface, arg_types)
 
@@ -174,7 +189,9 @@ def cosim(
     wd = Path(tempfile.mkdtemp(prefix="allo_cosim_")) if tmp else Path(workdir)
     wd.mkdir(parents=True, exist_ok=True)
     try:
-        verilog_sources, build_args = _write_sources(hw_ir, verilog, top, wd, operators)
+        verilog_sources, build_args = _write_sources(
+            verilog, module, wd, operators, interfaces
+        )
         if simulator == "verilator":
             # The extern-IP behavioral models are width-approximate -- a fixed
             # 64-bit DPI backs a possibly-wider operator (e.g. a chained widened
@@ -188,7 +205,6 @@ def cosim(
         clock_ps += clock_ps & 1
         cfg = _build_config(
             interface,
-            top,
             mems,
             streams,
             arg_types,
@@ -205,7 +221,7 @@ def cosim(
         runner.build(
             sources=verilog_sources,
             build_args=build_args,
-            hdl_toplevel=top,
+            hdl_toplevel=module,
             build_dir=str(wd / "sim_build"),
             always=True,
             waves=waves,
@@ -213,7 +229,7 @@ def cosim(
         from cocotb_tools.runner import get_results
 
         xml = runner.test(
-            hdl_toplevel=top,
+            hdl_toplevel=module,
             test_module=_TB_MODULE,
             test_dir=str(wd),
             extra_env={"ALLO_COSIM_CFG": str(cfg_path)},

@@ -20,9 +20,9 @@ Reservation reservationOf(const RegionBlock &region, const FuncUnit &unit,
   // distinct data), so it is contended for one cycle regardless of latency; a
   // non-pipelined unit stays busy for its whole latency.
   unsigned len = unit.pipelined ? 1 : std::max(1u, unit.latency);
-  // Cyclic regions wrap the occupancy mod II (a window that crosses the II
-  // boundary self-overlaps when latency > II -- correctly marking the unit busy
-  // every cycle); acyclic regions run once on a straight timeline, no wrap.
+  // Cyclic regions wrap the occupancy mod II: a window that crosses the II
+  // boundary self-overlaps when latency > II, correctly marking the unit busy
+  // every cycle. Acyclic regions run once on a straight timeline, with no wrap.
   unsigned mod =
       region.kind == RegionBlock::Kind::Cyclic ? region.ii.value_or(1) : 0;
   for (unsigned i = 0; i < len; ++i)
@@ -32,7 +32,7 @@ Reservation reservationOf(const RegionBlock &region, const FuncUnit &unit,
 
 bool reservationsDisjoint(const Reservation &a, const Reservation &b) {
   if (a.region != b.region)
-    return false; // cross-region sharing not modelled: conservatively
+    return false; // cross-region sharing isn't modelled; treated as a
                   // conflict
   llvm::SmallDenseSet<unsigned, 8> cyclesA(a.cycles.begin(), a.cycles.end());
   return llvm::none_of(b.cycles,
@@ -42,13 +42,9 @@ bool reservationsDisjoint(const Reservation &a, const Reservation &b) {
 bool sameOperatorType(const FuncUnit &a, const FuncUnit &b) {
   if (a.opType != b.opType || a.impl != b.impl || a.resultType != b.resultType)
     return false;
-  // opType/impl/resultType alone under-specify the physical operator:
-  // same-keyed ops can still differ in operand widths (i8 vs i16, both
-  // cmpi/i1), compare `predicate`, or apply `map`. The emitter builds the unit
-  // from boundOps.front(), so merging ops that differ here makes the others
-  // compute with the front op's semantics. Compare the representative op to
-  // reject such a merge up front; verifyBinding backstops the same invariant
-  // post-merge.
+  // opType/impl/resultType alone under-specify the operator (operand widths,
+  // predicate, or map can differ). The emitter builds from boundOps.front(),
+  // so reject divergent merges here; verifyBinding backstops it post-merge.
   Operation *oa = a.boundOps.front().first;
   Operation *ob = b.boundOps.front().first;
   return std::equal(oa->getOperandTypes().begin(), oa->getOperandTypes().end(),
@@ -63,9 +59,8 @@ void verifyBinding(const Datapath &dp) {
     for (UnitId uid : rb.units) {
       const FuncUnit &u = dp.units[uid];
       // The emitter builds one physical unit from boundOps.front() (operand
-      // widths, compare `predicate`, apply `map`). A policy that merges ops
-      // differing in these would miscompile the non-front ops; this backstops
-      // that. Vacuous under trivial binding (one op per unit).
+      // widths, predicate, map). A merge that differs in these would miscompile
+      // the non-front ops; this backstops that (vacuous under trivial binding).
       if (Operation *f =
               u.boundOps.empty() ? nullptr : u.boundOps.front().first)
         for (const auto &bo : u.boundOps)
@@ -80,9 +75,9 @@ void verifyBinding(const Datapath &dp) {
               "compare predicate / apply map differ); emit uses "
               "boundOps.front() and miscompiles the others");
       for (unsigned i = 0, e = u.boundOps.size(); i < e; ++i) {
-        Reservation ri = reservationOf(rb, u, u.boundOps[i].second);
+        auto ri = reservationOf(rb, u, u.boundOps[i].second);
         for (unsigned j = i + 1; j < e; ++j) {
-          Reservation rj = reservationOf(rb, u, u.boundOps[j].second);
+          auto rj = reservationOf(rb, u, u.boundOps[j].second);
           (void)ri;
           (void)rj;
           assert(reservationsDisjoint(ri, rj) &&

@@ -26,6 +26,7 @@
 #define ALLO_MICROARCH_HWEMIT_H
 
 #include "allo/Microarch/Datapath.h"
+#include "allo/Microarch/Naming.h" // every emitted identifier is composed there
 #include "circt/Dialect/HW/HWOps.h"
 #include "circt/Support/BackedgeBuilder.h"
 
@@ -53,9 +54,6 @@ namespace mlir::allo::uarch {
 IntegerType hwType(Type t, OpBuilder &b);
 /// The element type of a memory's memref.
 IntegerType memElemType(const uarch::MemUnit &m, OpBuilder &b);
-/// On-chip read latency of an internal memory's storage primitive (register: 0,
-/// LUTRAM/BRAM/URAM: 1 -- the model the scheduler used for external memory).
-unsigned memReadLatency(MemoryImplEnum impl);
 /// Whether a native integer/logic mnemonic has an `emitCompute` comb lowering.
 bool combEmitted(StringRef kind);
 /// Evaluate an affine index expression to an i32 hw value, emitting comb ops.
@@ -72,51 +70,6 @@ Value evalAffine(OpBuilder &b, Location loc, AffineExpr e, ValueRange idx,
 /// reifier).
 Value emitCompute(OpBuilder &b, Location loc, StringRef kind,
                   ValueRange operands, Type resultType, Operation *srcOp);
-
-/// A memory access referenced as (mem id, access index) -- enumerated into the
-/// module's read / write port lists.
-struct AccRef {
-  unsigned mem, idx;
-};
-
-/// Deterministic module-port base name for the kernel argument behind a memory
-/// port, from the memref argument's NameLoc, so cosim/waveforms read in source
-/// terms. \p role is "rd"/"wr"; a per-argument index is appended only when the
-/// argument backs more than one port of that role (two reads of A ->
-/// A_rd0/A_rd1), so single-port args stay clean (A_rd). Falls back to the
-/// positional form (`<role><i>`) for an argument with no name. Both the port
-/// declaration (EmitHW) and the port access (DatapathEmitter) call this, so the
-/// name is defined once; CIRCT's LegalizeNames handles Verilog charset/keyword
-/// legality and any residual collision.
-std::string memPortBase(const uarch::Datapath &dp, ArrayRef<AccRef> ports,
-                        unsigned i, StringRef role);
-/// The boundary port base for a memref a CallUnit masters: the same
-/// `<name>_<role>` a normal single-access boundary port gets (unindexed -- a
-/// child-mastered arg has no parent access to disambiguate against), so the
-/// interface declaration + emitCalls pass-through + cosim manifest agree.
-std::string memBoundaryPortBase(const uarch::Datapath &dp, uarch::MemId mem,
-                                llvm::StringRef role);
-/// Deterministic name for a scalar-argument port, from its NameLoc (fallback
-/// s<id>).
-std::string scalarPortName(const uarch::IOPort &io);
-/// Deterministic base name for a stream channel's FIFO ports, from the stream
-/// argument's NameLoc (fallback stream<id>); the `_data`/`_valid`/`_ready`
-/// suffixes are appended by the port declaration and access emitters alike.
-std::string streamPortBase(const uarch::StreamChannel &s);
-
-/// Attach a readable Verilog name to \p v, derived from \p loc's NameLoc, so a
-/// frontend variable (acc, buf, i, ...) keeps its source name instead of
-/// CIRCT's `_GEN` fallback. Picks the channel ExportVerilog reads: a register
-/// (`seq.compreg`) names from its `name` attr, any other value from
-/// `sv.namehint`. Best-effort: a no-op when \p loc carries no name (a
-/// transform-generated value stays `_GEN`) or \p v is a block argument (named
-/// by the port interface). CIRCT's LegalizeNames uniquifies any collision.
-void nameValue(Value v, Location loc);
-/// Attach \p name directly (no-op if empty or \p v is not an op result). For a
-/// name held as a string (e.g. a region's counter name) not on a Location.
-void nameValue(Value v, StringRef name);
-/// The sanitized NameLoc name of \p loc, or \p fallback when it has none.
-std::string cellName(Location loc, StringRef fallback);
 
 /// Declare a module's boundary ports from its port model, in the canonical ABI
 /// order: clk/rst/start, then scalar + stream-input + read-data *inputs*, done,
@@ -207,14 +160,7 @@ struct ExternalBanking {
 };
 ExternalBanking externalBank(const uarch::MemUnit &m,
                              const uarch::MemUnit::Access &acc);
-
-/// The boundary interfaces of one external memory access, as (bank, port base
-/// name): one entry for an unbanked or statically-banked access, and one per
-/// bank
-/// (`<base>_b<k>`) for a data-dependent one (its crossbar drives every bank).
-llvm::SmallVector<std::pair<unsigned, std::string>>
-extPorts(const uarch::Datapath &dp, ArrayRef<AccRef> ports, unsigned i,
-         StringRef role);
+// (`extPorts` in Naming.h names the resulting per-bank interfaces.)
 
 //===----------------------------------------------------------------------===//
 // ShiftChain: the taps of one shift-register chain. The index carries timing --
@@ -260,6 +206,11 @@ struct EmitContext {
   // unconditional pipeline, identical to a stall-free region. Set/cleared
   // by the orchestrator around a stream-touching region.
   Value regionEnable;
+
+  // The region being emitted, as a naming prefix (`r3`). Naming only: no
+  // semantics ride on it. It exists so the anonymous cells these helpers build
+  // (valid chains, activation pulses) read as `r3_v2` rather than `_GEN_41`.
+  std::string regionTag;
 
   EmitContext(OpBuilder &b, Location loc, circt::BackedgeBuilder &bb, Type i1,
               Type i32)
@@ -353,6 +304,17 @@ struct EmitContext {
   std::pair<Value, Value> branchPulse(Value when, Value cond);
   /// Materialize the shared literals (0/1 as i32, false/true as i1).
   void initLiterals();
+};
+
+/// Scoped setter for `EmitContext::regionTag`, restoring the enclosing
+/// container's tag on exit so a nested region's cells carry its own prefix.
+struct RegionTag {
+  EmitContext &c;
+  std::string saved;
+  RegionTag(EmitContext &c, unsigned region) : c(c), saved(c.regionTag) {
+    c.regionTag = "r" + std::to_string(region);
+  }
+  ~RegionTag() { c.regionTag = saved; }
 };
 
 //===----------------------------------------------------------------------===//
@@ -465,7 +427,7 @@ struct ControlEmitter {
   /// Returns {issue, counter}.
   RegionControl emitPipelineControl(const uarch::RegionBlock &rb,
                                     const Terminator &term, Value start,
-                                    Value enable);
+                                    Value enable) const;
   /// The one pipelined control skeleton for the free-running (II==1), modulo
   /// (II>1), and while (flushing) regimes: they share a `running` flag + an
   /// iteration counter and differ only in \p term (a counter reaching a bound
@@ -479,9 +441,12 @@ struct ControlEmitter {
   /// `wantIssue & enable`, so a stalled cycle issues nothing and (with the
   /// enabled shift chains) the whole region freezes. Pass a constant true for a
   /// stall-free region.
-  RegionControl emitPipelined(int64_t ii, const Terminator &term, Value start,
-                              Value enable);
-  RegionControl emitAcyclic(Value start, bool topLevel);
+  /// \p region names the emitted state cells (`r<id>_run` / `_iv` / `_phase`),
+  /// so a waveform reads as one loop's controller instead of `_GEN_11`.
+  RegionControl emitPipelined(unsigned region, int64_t ii,
+                              const Terminator &term, Value start,
+                              Value enable) const;
+  RegionControl emitAcyclic(unsigned region, Value start, bool topLevel) const;
 
   /// The region's completion signal: one latched level for every regime. It
   /// rises when the last issued iteration's outputs have drained -- \p
@@ -491,8 +456,8 @@ struct ControlEmitter {
   /// register cycle is the store/result commit cycle, so a sibling starting on
   /// this done reads every committed store and every survivor. A \p retrig
   /// region resets its completion state on \p start.
-  Value emitDone(unsigned drainStage, Value lastIssue, Value emptyDone,
-                 Value start, bool retrig);
+  Value emitDone(unsigned region, unsigned drainStage, Value lastIssue,
+                 Value emptyDone, Value start, bool retrig) const;
 };
 
 //===----------------------------------------------------------------------===//

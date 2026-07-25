@@ -25,12 +25,12 @@ using namespace circt::scheduling;
 
 namespace mlir::allo {
 
-// Project a memory dependence's components onto the innermost scheduled loop --
-// its deepest (last) component -- setting `drop` when an ENCLOSING loop carries
-// the dependence (satisfied by that loop's sequential execution, so it does not
-// constrain the innermost modulo schedule). A thin wrapper over the shared
-// `carriedDistanceAtLevel`: for the innermost loop the target level is exactly
-// the number of components.
+// Project a memory dependence's components onto the innermost scheduled
+// loop (its deepest, last component), setting `drop` when an ENCLOSING loop
+// carries the dependence (satisfied by that loop's sequential execution, so
+// it does not constrain the innermost modulo schedule). A thin wrapper over
+// the shared `carriedDistanceAtLevel`: for the innermost loop the target
+// level is exactly the number of components.
 static unsigned
 innermostCarriedDistance(ArrayRef<affine::DependenceComponent> comps,
                          bool &drop) {
@@ -39,12 +39,13 @@ innermostCarriedDistance(ArrayRef<affine::DependenceComponent> comps,
       carriedDistanceAtLevel(comps, comps.size(), drop, valid));
 }
 
-// A dependence carried by an enclosing loop (a positive distance at some level)
-// is satisfied by that loop's sequential execution, so it does not order two
-// ops within a single straight-line instance. Unlike a modulo-scheduled loop,
-// an acyclic span has no scheduled loop of its own -- so, whereas the cyclic
-// builder keeps innermost-carried edges (with their distance), a span must drop
-// every carried edge and keep only loop-independent (all-zero) ones.
+// A dependence carried by an enclosing loop (a positive distance at some
+// level) is satisfied by that loop's sequential execution, so it does not
+// order two ops within a single straight-line instance. Unlike a
+// modulo-scheduled loop, an acyclic span has no scheduled loop of its own,
+// so while the cyclic builder keeps innermost-carried edges (with their
+// distance), a span must drop every carried edge and keep only
+// loop-independent (all-zero) ones.
 static bool
 isLoopCarriedDependence(ArrayRef<affine::DependenceComponent> comps) {
   for (const affine::DependenceComponent &c : comps)
@@ -61,7 +62,7 @@ isLoopCarriedDependence(ArrayRef<affine::DependenceComponent> comps) {
 // value defined outside the loop.
 static std::pair<Operation *, unsigned>
 traceIterArgSource(Block *body, Operation *yield, unsigned iterArg) {
-  Value v = yield->getOperand(iterArg);
+  auto v = yield->getOperand(iterArg);
   unsigned distance = 0;
   llvm::SmallDenseSet<unsigned> seen;
   while (auto arg = dyn_cast<BlockArgument>(v)) {
@@ -72,7 +73,7 @@ traceIterArgSource(Block *body, Operation *yield, unsigned iterArg) {
     ++distance;
     v = yield->getOperand(arg.getArgNumber() - 1);
   }
-  Operation *definer = v.getDefiningOp();
+  auto *definer = v.getDefiningOp();
   return definer ? std::make_pair(definer, distance + 1)
                  : std::make_pair<Operation *, unsigned>(nullptr, 0);
 }
@@ -93,11 +94,10 @@ ProblemT buildCyclicProblem(LoopLikeOpInterface loop,
       if (!hasDependence(memoryDep.dependenceType))
         continue;
 
-      // Only model dependences whose source is also inside this loop.
-      // Whole-func analysis may surface cross-region dependences whose source
-      // is not part of this loop's scheduling problem (its endpoints are
-      // scheduled elsewhere); those are handled by cross-region analysis, not
-      // here.
+      // Only model dependences whose source is inside this loop. Whole-func
+      // analysis may surface cross-region dependences whose endpoints are
+      // scheduled elsewhere; those are handled by cross-region analysis
+      // instead.
       if (!body->findAncestorOpInBlock(*memoryDep.source))
         continue;
 
@@ -155,10 +155,9 @@ ProblemT buildCyclicProblem(LoopLikeOpInterface loop,
     return WalkResult::advance();
   });
 
-  // Anchor: side-effecting ops (stores, stream accesses, and a sync sub-kernel
-  // call -- an opaque node touching whole memrefs) must be scheduled before the
-  // loop terminator, so the terminator is the problem's unique sink (a call in
-  // the body would otherwise be a second, unordered sink).
+  // Anchor: side-effecting ops (stores, streams, a sync sub-kernel call) must
+  // be scheduled before the loop terminator, making it the problem's unique
+  // sink; a call in the body would otherwise be a second, unordered sink.
   auto *anchor = body->getTerminator();
   body->walk([&](Operation *op) {
     if (!isa<AffineStoreOp, memref::StoreOp, StreamGetOp, StreamPutOp>(op) &&
@@ -197,9 +196,9 @@ ProblemT buildCyclicProblem(LoopLikeOpInterface loop,
 }
 
 bool whileHasIdentityForwarding(scf::WhileOp w) {
-  Block &before = w.getBefore().front();
-  Block &after = w.getAfter().front();
-  scf::ConditionOp cond = w.getConditionOp();
+  auto &before = w.getBefore().front();
+  auto &after = w.getAfter().front();
+  auto cond = w.getConditionOp();
   unsigned n = before.getNumArguments();
   if (cond.getArgs().size() != n || after.getNumArguments() != n ||
       w.getYieldOp().getNumOperands() != n)
@@ -211,15 +210,11 @@ bool whileHasIdentityForwarding(scf::WhileOp w) {
 }
 
 bool conditionIsCombinational(scf::WhileOp w, const OperatorLibrary &lib) {
-  // The continue-test is settled the cycle the loop issues iff every op in its
-  // cone is 0-latency: no multi-cycle memory read and no latency IP (a float
-  // compare / float arithmetic). A single non-zero-latency op makes it wait, so
-  // the while must run the sequential CHECK/RUN controller instead of a
-  // flushing pipeline. The before region is the cone (identity forwarding
-  // leaves it computing only the condition); its `scf.condition` terminator is
-  // a pure wire.
+  // The continue-test settles the cycle the loop issues iff every op in its
+  // cone (the before region; `scf.condition` is a pure wire) is 0-latency,
+  // else the while needs a sequential CHECK/RUN controller, not a pipeline.
   bool comb = true;
-  Operation *term = w.getConditionOp().getOperation();
+  auto *term = w.getConditionOp().getOperation();
   w.getBefore().walk([&](Operation *op) {
     if (op == term || lib.lookup(op).latency == 0)
       return WalkResult::advance();
@@ -233,16 +228,15 @@ template <class ProblemT>
 ProblemT buildWhileProblem(scf::WhileOp w, DependenceAnalysis &deps) {
   assert(whileHasIdentityForwarding(w) && "while must forward args 1:1");
   ProblemT problem(w.getOperation());
-  Block &before = w.getBefore().front();
-  Block &after = w.getAfter().front();
-  scf::ConditionOp condOp = w.getConditionOp();
-  scf::YieldOp yieldOp = w.getYieldOp();
-  Operation *condProducer = condOp.getCondition().getDefiningOp();
+  auto &before = w.getBefore().front();
+  auto &after = w.getAfter().front();
+  auto condOp = w.getConditionOp();
+  auto yieldOp = w.getYieldOp();
+  auto *condProducer = condOp.getCondition().getDefiningOp();
 
-  // Register every op in both regions first (so a loop-carried back-edge whose
-  // source is walked later still resolves). The before terminator
-  // (`scf.condition`) is a pure forwarding wire; leaving it out keeps
-  // `scf.yield` the problem's unique sink.
+  // Register every op in both regions first, so a later-walked back-edge
+  // source still resolves. The before terminator (`scf.condition`) is a pure
+  // forwarding wire; excluding it keeps `scf.yield` the unique sink.
   before.walk([&](Operation *op) {
     if (op != condOp.getOperation())
       problem.insertOperation(op);
@@ -283,12 +277,11 @@ ProblemT buildWhileProblem(scf::WhileOp w, DependenceAnalysis &deps) {
       (void)problem.insertDependence(Problem::Dependence(condProducer, op));
     });
 
-  // Loop-carried state recurrence: the next value of slot `j` (yield operand j,
-  // if an after op defines it) feeds back to the readers of that slot's state
-  // -- the users of before-arg[j] and after-arg[j], excluding the forwarding
-  // terminators -- one iteration later.
+  // Loop-carried state recurrence: the next value of slot `j` (yield operand
+  // j) feeds back one iteration later to that slot's readers: the users of
+  // before-arg[j] and after-arg[j], excluding the forwarding terminators.
   for (unsigned j = 0, n = before.getNumArguments(); j < n; ++j) {
-    Operation *definer = yieldOp.getOperand(j).getDefiningOp();
+    auto *definer = yieldOp.getOperand(j).getDefiningOp();
     if (!definer)
       continue; // block-arg / invariant: no recurrence
     SmallVector<Operation *> readers;
@@ -306,7 +299,7 @@ ProblemT buildWhileProblem(scf::WhileOp w, DependenceAnalysis &deps) {
   }
 
   // Side-effect anchor: stores / streams in the body precede the yield.
-  Operation *anchor = yieldOp.getOperation();
+  auto *anchor = yieldOp.getOperation();
   after.walk([&](Operation *op) {
     if (isa<AffineStoreOp, memref::StoreOp, StreamGetOp, StreamPutOp>(op))
       (void)problem.insertDependence(Problem::Dependence(op, anchor));
@@ -334,12 +327,9 @@ ProblemT buildAcyclicProblem(ArrayRef<Operation *> ops,
   for (Operation *top : ops)
     top->walk([&](Operation *op) { spanOps.insert(op); });
 
-  // Insert ops + intra-span memory/stream dependences. A span is one straight-
-  // line instance, so it models only loop-INDEPENDENT (distance-0) dependences:
-  // a carried edge is dropped, not added distance-less (which would miscast it
-  // as a same-cycle constraint and, together with the intra-iteration forward
-  // edge on the same pair, close a false positive cycle -> spurious
-  // infeasibility).
+  // Insert ops + intra-span memory/stream dependences. Only loop-INDEPENDENT
+  // (distance-0) edges are modeled; adding a carried edge distance-less
+  // would falsely close a cycle with the forward edge (spurious infeasibility).
   for (Operation *top : ops)
     top->walk([&](Operation *op) {
       problem.insertOperation(op);
@@ -351,7 +341,7 @@ ProblemT buildAcyclicProblem(ArrayRef<Operation *> ops,
         if (!spanOps.contains(memoryDep.source))
           continue;
         // A loop-carried dependence is satisfied across iterations of the
-        // enclosing loop, not within this single instance -- drop it.
+        // enclosing loop, not within this single instance; drop it.
         if (isLoopCarriedDependence(memoryDep.dependenceComponents))
           continue;
         Problem::Dependence dep(memoryDep.source, op);
@@ -361,21 +351,9 @@ ProblemT buildAcyclicProblem(ArrayRef<Operation *> ops,
       }
     });
 
-  // Op-level DependenceAnalysis tracks only load/store/stream accesses, so a
-  // func.call -- an opaque sub-kernel touching whole memrefs -- carries no
-  // memory edge. Order a sync call against another call (or a raw access) in
-  // the same span by their memory footprints, at op granularity. A shared-array
-  // producer/consumer serializes; two calls that are data-independent, share
-  // only reads, or write provably DISJOINT elements get no edge (they overlap).
-  // Only pairs with at least one sync call need this -- the rest are already
-  // modeled above.
-  //
-  // A sync call contributes its CALLEE's per-argument footprint (direction plus
-  // the callee's own affine accesses, in the caller's terms): the conservative
-  // `summarizeOp` cannot see through a call, so it marks every memref operand
-  // read+write, which would falsely serialize even two readers of one input. A
-  // callee the summary cannot see through falls back to that conservative
-  // record, which subsumes any partial one, so the pair stays ordered.
+  // DependenceAnalysis misses call ops; sync calls are instead ordered by
+  // memory footprint: a shared write serializes, disjoint/read-only don't,
+  // and an opaque callee falls back to a conservative (safe) record.
   auto summarize = [](Operation *top, Summary &s) {
     top->walk([&](Operation *op) {
       if (isSyncCall(op) && summarizeCall(cast<func::CallOp>(op), s))
@@ -400,15 +378,13 @@ ProblemT buildAcyclicProblem(ArrayRef<Operation *> ops,
 
   // Make the last program-order op a unique sink via auxiliary dependences, so
   // that minimizing its start time yields an ASAP schedule for the whole span.
-  Operation *sink = ops.back();
+  auto *sink = ops.back();
   for (Operation *op : problem.getOperations()) {
     if (op == sink)
       continue;
-    // Two sync calls are ordered exactly by the footprint edges above; a
-    // blanket auxiliary edge between them would falsely serialize
-    // data-independent calls (the sink call's start forced past the other's
-    // whole latency). Every other pair keeps the ASAP-sink edge (a zero-latency
-    // sink serializes nothing).
+    // Two sync calls are already ordered by the footprint edges above; a
+    // blanket edge here would falsely serialize data-independent calls.
+    // Every other pair keeps the ASAP-sink edge (zero latency, no ordering).
     if (isSyncCall(op) && isSyncCall(sink))
       continue;
     (void)problem.insertDependence(Problem::Dependence(op, sink));
@@ -418,7 +394,7 @@ ProblemT buildAcyclicProblem(ArrayRef<Operation *> ops,
 }
 
 // Explicit instantiations: the resource-aware chaining problems are the only
-// problem types the scheduler pass builds -- loops as `ChainingModuloProblem`,
+// problem types the scheduler pass builds: loops as `ChainingModuloProblem`,
 // straight-line spans as `ChainingSharedOperatorsProblem`.
 template ChainingModuloProblem
 buildCyclicProblem<ChainingModuloProblem>(LoopLikeOpInterface,

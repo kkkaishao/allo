@@ -153,7 +153,7 @@ protected:
   /// All other rows encode linear constraints.
   unsigned &firstConstraintRow = nObjectives;
 
-  // Number of parameters (fixed for now).
+  // Number of parameters.
   static constexpr unsigned nParameters = 3;
   /// The first column corresponds to the always-one "parameter" in u = (1,S,T).
   static constexpr unsigned parameter1Column = 0;
@@ -291,8 +291,8 @@ private:
   // de Dinechin II-increment assumes fully-pipelined (1-slot) reservations, so
   // a problem with blocking ops uses a conservative II-growth path instead.
   bool hasBlockingOps = false;
-  // Sum of occupancies over limited ops -- an upper bound the conservative
-  // II-growth must converge within (all ops fit in disjoint windows by then).
+  // Sum of occupancies over limited ops; the conservative II-growth path
+  // must converge within this bound (all ops fit in disjoint windows by then).
   unsigned totalResourceCycles = 0;
 
 protected:
@@ -398,10 +398,10 @@ public:
 // This class solves the resource-constrained, acyclic, chaining-enabled
 // `ChainingSharedOperatorsProblem` by reusing the
 // `SharedOperatorsSimplexScheduler` (per-cycle resource reservation) and
-// layering the orthogonal chaining constraints around it -- the acyclic mirror
-// of `ChainingModuloSimplexScheduler`. A pre-pass fills the chain-breaking
-// dependences (consumed by `buildTableau`), and a post-pass fills the sub-cycle
-// start times.
+// layering the orthogonal chaining constraints around it. It is the acyclic
+// mirror of `ChainingModuloSimplexScheduler`: a pre-pass fills the
+// chain-breaking dependences (consumed by `buildTableau`), and a post-pass
+// fills the sub-cycle start times.
 class ChainingSharedOperatorsSimplexScheduler
     : public SharedOperatorsSimplexScheduler {
 private:
@@ -465,11 +465,11 @@ bool SimplexSchedulerBase::fillObjectiveRow(SmallVector<int> &row,
 void SimplexSchedulerBase::fillConstraintRow(SmallVector<int> &row,
                                              Problem::Dependence dep) {
   auto &prob = getProblem();
-  Operation *src = dep.getSource();
-  Operation *dst = dep.getDestination();
+  auto *src = dep.getSource();
+  auto *dst = dep.getDestination();
   unsigned latency = *prob.getLatency(*prob.getLinkedOperatorType(src));
   row[parameter1Column] = -latency; // note the negation
-  if (src != dst) { // note that these coefficients just zero out in self-arcs.
+  if (src != dst) {                 // coefficients zero out for self-arcs.
     row[startTimeLocations[startTimeVariables[src]]] = 1;
     row[startTimeLocations[startTimeVariables[dst]]] = -1;
   }
@@ -567,10 +567,9 @@ SimplexSchedulerBase::findDualPivotColumn(unsigned pivotRow,
   SmallVector<int> maxQuot(nObjectives, std::numeric_limits<int>::min());
   std::optional<unsigned> pivotCol;
 
-  // Look for non-zero entries in the constraint matrix (~A part of the
-  // tableau). If multiple candidates exist, take the one corresponding to the
-  // lexicographical maximum (over the objective rows) of the quotients:
-  //   tableau[<objective row>][col] / pivotCand
+  // Among nonzero entries in the constraint matrix (~A part of the tableau),
+  // pick the one with the lexicographical maximum (over objective rows) of
+  // the quotient tableau[<objective row>][col] / pivotCand.
   for (unsigned col = firstNonBasicVariableColumn; col < nColumns; ++col) {
     if (frozenVariables.count(
             nonBasicVariables[col - firstNonBasicVariableColumn]))
@@ -607,7 +606,7 @@ std::optional<unsigned> SimplexSchedulerBase::findPrimalPivotColumn() {
             nonBasicVariables[col - firstNonBasicVariableColumn]))
       continue;
 
-    SmallVector<int> objVec = getObjectiveVector(col);
+    auto objVec = getObjectiveVector(col);
     if (std::lexicographical_compare(objVec.begin(), objVec.end(),
                                      zeroVec.begin(), zeroVec.end()))
       return col;
@@ -621,10 +620,8 @@ SimplexSchedulerBase::findPrimalPivotRow(unsigned pivotColumn) {
   int minQuot = std::numeric_limits<int>::max();
   std::optional<unsigned> pivotRow;
 
-  // Look for positive entries in the constraint matrix (~A part of the
-  // tableau). If multiple candidates exist, take the one corresponding to the
-  // minimum of the quotient:
-  //   parametricConstant(row) / pivotCand
+  // Among positive entries in the constraint matrix (~A part of the tableau),
+  // pick the one minimizing the quotient parametricConstant(row) / pivotCand.
   for (unsigned row = firstConstraintRow; row < nRows; ++row) {
     int pivotCand = tableau[row][pivotColumn];
     if (pivotCand > 0) {
@@ -720,27 +717,16 @@ LogicalResult SimplexSchedulerBase::solveTableau() {
       continue;
     }
 
-    // If we did not find a pivot column, then the entire row contained only
-    // positive entries, and the problem is in principle infeasible. However, if
-    // the entry in the `parameterTColumn` is positive, we can try to make the
-    // LP feasible again by increasing the II.
-    //
-    // This rescue is only valid during the parameter-free solve (initial
-    // feasibility / margin updates), where `parameterS == 0` and the row's
-    // negativity stems solely from `entry1Col + entryTCol*parameterT`, so
-    // `entry1Col` is guaranteed negative. Inside `scheduleAt`, `parameterS` is
-    // temporarily set to a frozen op's fixed start time, and a row can go
-    // negative through that S term with `entry1Col >= 0`; growing the II there
-    // would silently desync the driver's modulo reservation table. So we skip
-    // the rescue and fall through to a graceful failure, which `scheduleAt`
-    // rolls back before the driver runs its own II-increment protocol.
+    // No pivot column: infeasible unless the parameterT entry is positive,
+    // which lets growing II rescue it, but only when parameterS == 0 (initial
+    // solves). scheduleAt sets parameterS != 0 and instead fails, rolling back.
     int entry1Col = tableau[*pivotRow][parameter1Column];
     int entryTCol = tableau[*pivotRow][parameterTColumn];
     if (parameterS == 0 && entryTCol > 0) {
-      // The negation of `entry1Col` is not in the paper. I think this is an
-      // oversight, because `entry1Col` certainly is negative (otherwise the row
-      // would not have been a valid pivot row), and without the negation, the
-      // new II would be negative.
+      // The negation of `entry1Col` is not in the paper, likely an oversight:
+      // `entry1Col` is always negative here (otherwise this would not be a
+      // valid pivot row), so omitting the negation would make the new II
+      // negative.
       assert(entry1Col < 0);
       int newParameterT = (-entry1Col - 1) / entryTCol + 1;
       if (newParameterT > parameterT) {
@@ -847,8 +833,8 @@ LogicalResult SimplexSchedulerBase::scheduleAt(unsigned startTimeVariable,
   parameterS = 0;
 
   if (failed(solved)) {
-    // The LP is infeasible with the new constraint. We could try other values
-    // for S, but for now, we just roll back and signal failure to the driver.
+    // The LP is infeasible with the new constraint. Other values of S could
+    // be tried, but instead this rolls back and signals failure to the driver.
     translate(frozenCol, /* factor1= */ 0, /* factorS= */ -1, /* factorT= */ 0);
     frozenVariables.erase(startTimeVariable);
     auto solvedAfterRollback = solveTableau();
@@ -857,24 +843,9 @@ LogicalResult SimplexSchedulerBase::scheduleAt(unsigned startTimeVariable,
     return failure();
   }
 
-  // Translate S by the other parameter(s). This means setting `factor1` to
-  // `timeStep`.
-  //
-  // This translation does not change the values of the parametric constants,
-  // hence we do not need to solve the tableau again.
-  //
-  // Note: I added a negation of the factors here, which is not mentioned in the
-  // paper's text, but apparently used in the example. Without it, the intended
-  // effect, i.e. making the S-column all-zero again, is not achieved.
-  //
-  // Note 2: For cyclic problems, the paper suggested to perform a modulo
-  // decomposition: S = `factor1` + `factorT` * T, with `factor1` < T.
-  // However, this makes the value baked into the tableau dependent on
-  // `parameterT`, and it is unclear to me how to update it correctly when
-  // changing the II. I found it much more robust to fix the operations to
-  // absolute time steps, and manually shift them by the appropriate amount
-  // whenever the II is incremented (cf. adding `phiJ`, `phiN` in the modulo
-  // scheduler's `scheduleOperation` method).
+  // Zero the S-column again via factor1=timeStep, factorS=1 (negating the
+  // factors, which isn't in the paper's text but is implied by its example).
+  // This doesn't change the parametric constants, so no re-solve is needed.
   translate(parameterSColumn, /* factor1= */ -timeStep, /* factorS= */ 1,
             /* factorT= */ 0);
 
@@ -1042,13 +1013,10 @@ LogicalResult SharedOperatorsSimplexScheduler::schedule() {
 
   LLVM_DEBUG(dbgs() << "After solving resource-free problem:\n"; dumpTableau());
 
-  // The *heuristic* part of this scheduler starts here:
-  // We will now *choose* start times for operations using a shared operator
-  // type, in a way that respects the allocation limits, and consecutively solve
-  // the LP with these added constraints. The individual LPs are still solved to
-  // optimality (meaning: the start times of the "last" operation is still
-  // optimal w.r.t. the already fixed operations), however the heuristic choice
-  // means we cannot guarantee the optimality for the overall problem.
+  // Heuristic phase: greedily fix start times for shared-operator ops within
+  // allocation limits, re-solving the LP with each added constraint. Each
+  // solve is optimal given prior fixes, but overall optimality isn't
+  // guaranteed.
 
   // Determine which operations are subject to resource constraints.
   auto &ops = prob.getOperations();
@@ -1057,16 +1025,9 @@ LogicalResult SharedOperatorsSimplexScheduler::schedule() {
     if (isLimited(op, prob))
       limitedOps.push_back(op);
 
-  // Build a priority list of the limited operations.
-  //
-  // We sort by the resource-free start times to produce a topological order of
-  // the operations. Better priority functions are known, but require computing
-  // additional properties, e.g. ASAP and ALAP times for mobility, or graph
-  // analysis for height. Assigning operators (=resources) in this order at
-  // least ensures that the (acyclic!) problem remains feasible throughout the
-  // process.
-  //
-  // TODO: Implement more sophisticated priority function.
+  // Build a priority list of limited ops (sorted by resource-free start
+  // time, a topological order); fixing operators in this order keeps the
+  // acyclic problem feasible. TODO: use a better priority (ASAP/ALAP, height).
   std::stable_sort(limitedOps.begin(), limitedOps.end(),
                    [&](Operation *a, Operation *b) {
                      return getStartTime(startTimeVariables[a]) <
@@ -1090,10 +1051,9 @@ LogicalResult SharedOperatorsSimplexScheduler::schedule() {
     unsigned limit = prob.getLimit(rsrc).value_or(0);
     assert(limit > 0);
 
-    // Find the first time step (beginning at the current start time in the
-    // partial schedule) in which an operator instance is available for the
-    // whole occupancy window (occ consecutive cycles for a non-pipelined unit;
-    // occ == 1 is the pipelined case).
+    // Find the first time step (from the current start time) where an
+    // operator instance is free for the whole occupancy window (occ
+    // consecutive cycles; occ == 1 when pipelined).
     unsigned occ = resourceCycles(op);
     unsigned startTimeVar = startTimeVariables[op];
     unsigned candTime = getStartTime(startTimeVar);
@@ -1180,12 +1140,9 @@ LogicalResult ModuloSimplexScheduler::MRT::enter(Operation *op,
   auto &revTab = reverseTables[rsrc];
   assert(!revTab.count(op));
 
-  // A non-pipelined op holds its unit for `occ` consecutive modulo slots (occ
-  // == 1 is pipelined). Tally per-slot demand: a window wider than the II
-  // wraps, claiming a slot more than once (consecutive iterations coinciding --
-  // genuine contention a per-slot set would hide). A slot admits `lim`
-  // instances, so the reservation succeeds only if every touched slot fits the
-  // op's full demand.
+  // A non-pipelined op occupies `occ` consecutive modulo slots (occ == 1
+  // when pipelined); a window wider than II wraps, hitting one slot twice,
+  // which a per-slot set would hide. Admit only if every touched slot fits.
   unsigned occ = resourceCycles(op);
   unsigned base = timeStep % sched.parameterT;
   auto &table = tables[rsrc];
@@ -1215,8 +1172,8 @@ void ModuloSimplexScheduler::MRT::release(Operation *op) {
   assert(it != revTab.end());
   unsigned occ = resourceCycles(op);
   auto &table = tables[rsrc];
-  // Undo enter's per-slot increments (recomputed from the stored base + occ, so
-  // a wrapped slot is decremented once per lap -- symmetric with `want` above).
+  // Undo enter's per-slot increments (recomputed from stored base + occ, so a
+  // wrapped slot is decremented once per lap, symmetric with `want` above).
   for (unsigned i = 0; i < occ; ++i) {
     unsigned &cnt = table[(it->second + i) % sched.parameterT];
     assert(cnt > 0 && "releasing an MRT slot that was never reserved");
@@ -1263,9 +1220,9 @@ void ModuloSimplexScheduler::updateMargins() {
 }
 
 void ModuloSimplexScheduler::scheduleOperation(Operation *n) {
-  // `n` contends for a single physical resource (its memref port or unit pool);
-  // that resource -- not the operator type -- is what the reservation table
-  // arbitrates. Every op reaching here is limited, so it has exactly one.
+  // `n` contends for a single physical resource (its memref port or unit
+  // pool); the reservation table arbitrates that resource, not the operator
+  // type. Every op reaching here is limited, so it has exactly one.
   auto rsrcN = (*prob.getLinkedResourceTypes(n))[0];
   unsigned stvN = startTimeVariables[n];
 
@@ -1294,10 +1251,9 @@ void ModuloSimplexScheduler::scheduleOperation(Operation *n) {
       break;
     }
 
-  // Non-pipelined (blocking) ops reserve multiple slots, which the single-slot
-  // move logic below does not handle. Instead grow the II by the base transform
-  // -- each scheduled op keeps its modulo slot, which stays valid as the
-  // modulus grows -- rebuild the (multi-slot) MRT, and retry until `n` fits.
+  // Non-pipelined ops reserve multiple slots, which the single-slot move
+  // logic can't handle. Instead grow II via the base transform (each op
+  // keeps its valid modulo slot), rebuild the MRT, and retry until `n` fits.
   if (hasBlockingOps) {
     while (true) {
       SmallVector<std::pair<unsigned, unsigned>> phis;
@@ -1350,16 +1306,15 @@ void ModuloSimplexScheduler::scheduleOperation(Operation *n) {
   info(Stage::Sched) << "Incrementing II to " << (parameterT + 1)
                      << " to resolve resource conflict for " << *n;
 
-  // Note that the approach below is much simpler than in the paper
-  // because of the fully-pipelined operators. In our case, it's always
-  // sufficient to increment the II by one.
+  // This is simpler than the paper's general approach because operators
+  // here are fully pipelined, so incrementing the II by one always suffices.
 
   // Decompose start time.
   unsigned phiN = stN / parameterT;
   unsigned tauN = stN % parameterT;
 
-  // Keep track whether the following moves free at least one operator
-  // instance in the slot desired by the current op - then it can stay there.
+  // Track whether the following moves free an operator instance in the slot
+  // the current op wants, so it can stay there.
   unsigned deltaN = 1;
 
   // We're going to revisit the current partial schedule.
@@ -1373,10 +1328,9 @@ void ModuloSimplexScheduler::scheduleOperation(Operation *n) {
     unsigned deltaJ = 0;
 
     if (rsrcN == rsrcJ) {
-      // To actually resolve the resource conflicts, we will move operations
-      // that contend for the *same resource* as `n` (a load and a store of one
-      // array share a memref port despite being distinct operator types) and
-      // are "preceded" (cf. de Dinechin's ≺ relation) one slot to the right.
+      // Resolve conflicts by moving ops contending for `n`'s *same resource*
+      // (e.g. a load/store pair shares a memref port despite distinct
+      // operator types) that are "preceded" (de Dinechin's ≺ relation) right.
       if (tauN < tauJ || (tauN == tauJ && phiN > phiJ) ||
           (tauN == tauJ && phiN == phiJ && stvN < stvJ)) {
         // TODO: Replace the last condition with a proper graph analysis.
@@ -1388,16 +1342,9 @@ void ModuloSimplexScheduler::scheduleOperation(Operation *n) {
       }
     }
 
-    // Move operation.
-    //
-    // In order to keep the op in its current MRT slot `tauJ` after incrementing
-    // the II, we add `phiJ`:
-    //   stJ + phiJ = (phiJ * parameterT + tauJ) + phiJ
-    //              = phiJ * (parameterT + 1) + tauJ
-    //
-    // Shifting an additional `deltaJ` time steps then moves the op to a
-    // different MRT slot, in order to make room for the operation that caused
-    // the resource conflict.
+    // Move: add `phiJ` to keep `j` in its modulo slot `tauJ` after II grows
+    // (stJ + phiJ = phiJ*(parameterT+1) + tauJ), plus `deltaJ` to shift it to
+    // a different slot when it conflicts with the op that triggered growth.
     moveBy(stvJ, phiJ + deltaJ);
   }
 
@@ -1530,8 +1477,8 @@ LogicalResult ModuloSimplexScheduler::schedule() {
 void ChainingSimplexScheduler::fillAdditionalConstraintRow(
     SmallVector<int> &row, Problem::Dependence dep) {
   fillConstraintRow(row, dep);
-  // One _extra_ time step breaks the chain (note that the latency is negative
-  // in the tableau).
+  // One _extra_ time step breaks the chain (the latency is negative in the
+  // tableau).
   row[parameter1Column] -= 1;
 }
 
@@ -1581,8 +1528,8 @@ void ChainingCyclicSimplexScheduler::fillConstraintRow(
 void ChainingCyclicSimplexScheduler::fillAdditionalConstraintRow(
     SmallVector<int> &row, Problem::Dependence dep) {
   fillConstraintRow(row, dep);
-  // One _extra_ time step breaks the chain (note that the latency is negative
-  // in the tableau).
+  // One _extra_ time step breaks the chain (the latency is negative in the
+  // tableau).
   row[parameter1Column] -= 1;
 }
 

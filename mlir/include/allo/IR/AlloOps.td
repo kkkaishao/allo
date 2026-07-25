@@ -465,6 +465,7 @@ def DCPathDeviceOp : DCPath_Op<"dcp.device"> {
     OptionalAttr<DictionaryAttr>:$fifo,
     OptionalAttr<StrAttr>:$default_memory);
   let hasCustomAssemblyFormat = 1;
+  let hasVerifier = 1;
 }
 
 def DCPathUnitOp : DCPath_Op<"dcp.unit",

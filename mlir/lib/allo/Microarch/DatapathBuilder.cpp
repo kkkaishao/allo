@@ -27,13 +27,11 @@ using namespace mlir::allo;
 
 namespace mlir::allo::uarch {
 
-namespace {
-
 //===----------------------------------------------------------------------===//
 // Pure DCP structural readers.
 //===----------------------------------------------------------------------===//
 
-Value dcpMemref(Operation *op) {
+static Value dcpMemref(Operation *op) {
   if (auto l = dyn_cast<dcp::DCPathLoadOp>(op))
     return l.getMemref();
   if (auto s = dyn_cast<dcp::DCPathStoreOp>(op))
@@ -42,8 +40,8 @@ Value dcpMemref(Operation *op) {
 }
 
 // The addressing of a dcp memory access: its affine map plus index operands.
-void dcpAddressing(Operation *op, AffineMap &map,
-                   SmallVector<Value> &operands) {
+static void dcpAddressing(Operation *op, AffineMap &map,
+                          SmallVector<Value> &operands) {
   if (auto l = dyn_cast<dcp::DCPathLoadOp>(op)) {
     map = l.getMap();
     operands.assign(l.getIndices().begin(), l.getIndices().end());
@@ -54,9 +52,9 @@ void dcpAddressing(Operation *op, AffineMap &map,
 }
 
 // The body block of a dcp region op. A guard (dcp.select) has no `else` here
-// (result-mux guards are unsupported), so its body is the `then` branch --
+// (result-mux guards are unsupported), so its body is the `then` branch,
 // which holds the guarded sub-schedule (child regions), gated by the predicate.
-Block *regionBody(Operation *regionOp) {
+static Block *regionBody(Operation *regionOp) {
   if (auto pipe = dyn_cast<dcp::DCPathPipelineOp>(regionOp))
     return &pipe.getBody().front();
   if (auto sel = dyn_cast<dcp::DCPathSelectOp>(regionOp))
@@ -68,12 +66,12 @@ Block *regionBody(Operation *regionOp) {
 // counting one loop-carried distance per iter_arg-to-iter_arg shift. This is
 // the recurrence distance the scheduler solved against. Reads the loop-carried
 // next-values through `getCarriedValues()` (the `dcp.uncondition` operands of a
-// counted loop, or the `dcp.condition`'s carried operands of a while -- which
+// counted loop, or the `dcp.condition`'s carried operands of a while, which
 // skip its leading condition), so iter-arg k always maps to carried[k].
-std::pair<Operation *, unsigned> traceIterArgSource(dcp::DCPathPipelineOp pipe,
-                                                    unsigned iterArg) {
+static std::pair<Operation *, unsigned>
+traceIterArgSource(dcp::DCPathPipelineOp pipe, unsigned iterArg) {
   Block &body = pipe.getBody().front();
-  OperandRange carried = pipe.getCarriedValues();
+  auto carried = pipe.getCarriedValues();
   Value v = carried[iterArg];
   unsigned distance = 0;
   llvm::SmallDenseSet<unsigned> seen;
@@ -84,19 +82,19 @@ std::pair<Operation *, unsigned> traceIterArgSource(dcp::DCPathPipelineOp pipe,
     ++distance;
     v = carried[arg.getArgNumber() - 1]; // block arg (k+1) -> carried[k]
   }
-  Operation *def = v.getDefiningOp();
+  auto *def = v.getDefiningOp();
   return def ? std::make_pair(def, distance + 1)
              : std::make_pair<Operation *, unsigned>(nullptr, 0);
 }
 
-// Is \p v a transient FIFO-din value -- one that changes while the region is
+// Is \p v a transient FIFO-din value, one that changes while the region is
 // back-pressured (`valid & ~ready`), so it must be captured into a
-// chain-enable- frozen register before it drives a FIFO write? It is transient
+// chain-enable-frozen register before it drives a FIFO write? It is transient
 // iff it is, or is a purely combinational function of, one of the two sources
 // that move under back-pressure:
-//   * a memory load -- a live counter-addressed read (an external port or an
+//   * a memory load: a live counter-addressed read (an external port or an
 //     always-enabled seq.read), re-addressed as the counter advances/resets;
-//   * the loop counter (pipeline block arg 0) -- reset to `lb` in the drain.
+//   * the loop counter (pipeline block arg 0), reset to `lb` in the drain.
 // A value built only from FIFO heads (held while their get is not popped),
 // survivors / call results (latched for the producing region's life),
 // constants, io, or *registered* (latency>=1) units is frozen with the datapath
@@ -104,12 +102,12 @@ std::pair<Operation *, unsigned> traceIterArgSource(dcp::DCPathPipelineOp pipe,
 // (latency-0) ops propagate transient-ness from their operands; the SSA din
 // tree is acyclic (iter-args are stable block args), so the recursion
 // terminates.
-bool isTransientDin(Value v) {
+static bool isTransientDin(Value v) {
   if (auto barg = dyn_cast<BlockArgument>(v))
     return isa_and_nonnull<dcp::DCPathPipelineOp>(
                barg.getOwner()->getParentOp()) &&
            barg.getArgNumber() == 0;
-  Operation *def = v.getDefiningOp();
+  auto *def = v.getDefiningOp();
   if (!def)
     return false;
   if (isa<dcp::DCPathLoadOp>(def))
@@ -124,8 +122,6 @@ bool isTransientDin(Value v) {
   return false; // a registered (latency>=1) unit's output is frozen under stall
 }
 
-} // namespace
-
 //===----------------------------------------------------------------------===//
 // Allocation & binding.
 //===----------------------------------------------------------------------===//
@@ -134,7 +130,7 @@ void DatapathBuilder::collectConstants() {
   func.walk([&](arith::ConstantOp cst) {
     ConstCell c;
     c.id = dp.consts.size();
-    c.value = cst.getValue();
+    c.value = static_cast<Attribute>(cst.getValue());
     c.type = cst.getType();
     producerOf[cst] = Source{Source::Kind::Const, c.id, 0};
     dp.consts.push_back(c);
@@ -158,7 +154,7 @@ MemId DatapathBuilder::getOrCreateMem(Value memref) {
     auto global = SymbolTable::lookupNearestSymbolFrom<memref::GlobalOp>(
         gg, gg.getNameAttr());
     assert(global && "get_global references an undefined memref.global");
-    if (std::optional<Attribute> init = global.getInitialValue()) {
+    if (auto init = global.getInitialValue()) {
       m.romInit = *init;
       m.isRom = true;
     }
@@ -166,14 +162,20 @@ MemId DatapathBuilder::getOrCreateMem(Value memref) {
   // Banking / ports from the same storage model the scheduler binds against
   // (allo.part / allo.bind.storage); depthWords is per-bank so that
   // numBanks * depthWords covers the array.
-  allo::MemoryChar mc = allo::characterize(memref);
+  auto mc = allo::characterize(memref, memLib.defaultImpl);
   m.numBanks = std::max(1u, mc.numBanks);
   // dcp-resolve-banking splits every *statically* banked internal array into
-  // plain per-bank memrefs (numBanks == 1) before emit; a memref still banked
-  // here has a data-dependent bank (internal -> crossbar) or is a partitioned
-  // argument (external -> per-bank boundary interfaces).
+  // plain per-bank memrefs before emit; a memref still banked here is either
+  // data-dependent (internal -> crossbar) or a partitioned argument (external
+  // -> per-bank).
   m.portsPerBank = mc.portsPerBank;
   m.impl = mc.impl;
+  // Access latency of the resolved primitive, from the same device table the
+  // scheduler timed this memref's accesses against (`MemoryLibrary::timing`).
+  // The emitter builds ports at these latencies; do not re-derive from `impl`.
+  auto mkt = memLib.timing(m.impl);
+  m.readLatency = mkt.latency.read;
+  m.writeLatency = mkt.latency.write;
   // A dynamic-shape memref would silently fall to total == 0 -> depthWords == 0
   // -> a zero-depth internal hlmem / zero-width external address interface,
   // with no diagnostic. Allo arrays are statically shaped by this stage.
@@ -208,10 +210,9 @@ RegionBlock DatapathBuilder::addRegion(Operation *regionOp, RegionId ridx) {
 
   RegionBlock rb;
   rb.id = ridx;
-  // A container region nests another dcp region in its body (a loop wrapping an
-  // inner loop). The nearest enclosing region op is the parent (already
-  // processed -- pre-order walk), so it runs its children via hierarchical
-  // control.
+  // A container region nests another dcp region in its body (a loop wrapping
+  // an inner loop). The nearest enclosing region op is the parent, already
+  // processed by this pre-order walk, so it runs its children hierarchically.
   Operation *p = regionOp->getParentOp();
   while (
       p &&
@@ -222,10 +223,10 @@ RegionBlock DatapathBuilder::addRegion(Operation *regionOp, RegionId ridx) {
     unsigned pidx = regionIdxOf.lookup(p);
     rb.parent = pidx;
     dp.regions[pidx].container = true;
-    // A guard (dcp.select) splits its children by branch: a region nested in
-    // the else body is an else-child (run iff the predicate is false),
-    // everything else a then-child. Find which branch of the select `regionOp`
-    // sits in by walking up to the child whose parent op is the select.
+    // A guard (dcp.select) splits its children by branch: one nested in the
+    // else body is an else-child (runs iff the predicate is false), otherwise
+    // a then-child, found by walking up to the child whose parent is the
+    // select.
     bool isElse = false;
     if (auto sel = dyn_cast<dcp::DCPathSelectOp>(p)) {
       Operation *o = regionOp;
@@ -238,9 +239,9 @@ RegionBlock DatapathBuilder::addRegion(Operation *regionOp, RegionId ridx) {
   }
 
   if (isa<dcp::DCPathSelectOp>(regionOp)) {
-    // A guard (dcp.select): a predicated container. It has no counter / trip of
-    // its own -- it runs its children once iff the predicate holds -- so it
-    // stays Acyclic; `container` is set when its children link below.
+    // A guard (dcp.select): a predicated container. It has no counter or trip
+    // of its own; it runs its children once iff the predicate holds, so it
+    // stays Acyclic. `container` is set when its children link below.
     rb.guard = true;
   } else if (auto pipe = dyn_cast<dcp::DCPathPipelineOp>(regionOp)) {
     rb.kind = RegionBlock::Kind::Cyclic;
@@ -249,31 +250,28 @@ RegionBlock DatapathBuilder::addRegion(Operation *regionOp, RegionId ridx) {
     // reifier); carry its name so the emitter labels the iteration counter (i).
     if (auto n = nameFromLoc(pipe.getBody().front().getArgument(0).getLoc()))
       rb.counterName = sanitizeCppIdentifier(*n);
-    // `ii` is absent for a data-dependent sequential wrapper; leave rb.ii unset
-    // (downstream reg-depth uses `.value_or(1)`, EmitHW gates on II==1).
+    // `ii` is absent for a data-dependent sequential wrapper (rb.ii stays
+    // unset); such a region has children, so `emitRegion` routes it to a
+    // container path that never reads `ii`; reg-depth paths use `.value_or(1)`.
     if (std::optional<int64_t> ii = pipe.getIi())
       rb.ii = static_cast<unsigned>(*ii);
-    if (IntegerAttr len = pipe.getLengthAttr())
+    if (auto len = pipe.getLengthAttr())
       rb.length = len.getInt();
-    if (IntegerAttr t = pipe.getTripAttr())
+    if (auto t = pipe.getTripAttr())
       rb.tripCount = t.getInt();
     rb.lb = pipe.getLb().value_or(0);
     rb.step = pipe.getStep().value_or(1);
   } else {
     rb.kind = RegionBlock::Kind::Acyclic;
     auto seq = cast<dcp::DCPathSequentialOp>(regionOp);
-    if (IntegerAttr len = seq.getLengthAttr())
+    if (auto len = seq.getLengthAttr())
       rb.length = len.getInt();
   }
 
-  // Declared composition class + single-run latency, read here so the composer
-  // dispatches on a declared model property rather than re-deriving the region
-  // shape. A present `latency` implies the region is `counted_static`
-  // (asserted) -- the composer trusts the static offset only for a
-  // statically-timed region. The converse does NOT hold: a `dcp.select` guard
-  // is `counted_static` yet carries no `latency` (`perInvocationLatency` skips
-  // it -- its run-once completion is data-dependent and folded by the enclosing
-  // container), so it hands off via handshake, not a static offset.
+  // Declared composition class + single-run latency, so the composer
+  // dispatches on a declared property rather than re-deriving region shape.
+  // A `counted_static` guard (dcp.select) may carry no `latency`, handing off
+  // via handshake instead of a static offset.
   if (auto d = regionOp->getAttrOfType<DeterminacyEnumAttr>("determinacy"))
     rb.determinacy = d.getValue();
   if (auto lat = regionOp->getAttrOfType<IntegerAttr>("latency"))
@@ -317,16 +315,15 @@ static const iface::Scalar *ifaceScalarForArg(const iface::ModuleInterface &mi,
 
 void DatapathBuilder::bindResource(Operation *op, RegionBlock &rb) {
   // A sub-kernel call: a CallUnit owned by this region. The child instance
-  // masters its memref operands' memory ports; a scalar operand is a Source
-  // input and a scalar result a survivor (guarded in validateDatapath). Modeled
-  // from the declared `dcp.instance` + the callee port model.
+  // masters its memref operands' memory ports; a scalar operand becomes a
+  // Source input, a scalar result a survivor (checked in validateDatapath).
   if (auto inv = dyn_cast<dcp::DCPathInstanceOp>(op)) {
     assert(callees && "a dcp.instance in a leaf datapath needs callee context "
                       "(a rerouted container)");
     auto it = callees->ifaces.find(inv.getCallee());
     assert(it != callees->ifaces.end() &&
            "the callee interface must be registered (emitted bottom-up first)");
-    const iface::ModuleInterface &mi = it->second;
+    const auto &mi = it->second;
 
     CallUnit cu;
     cu.id = dp.calls.size();
@@ -337,19 +334,17 @@ void DatapathBuilder::bindResource(Operation *op, RegionBlock &rb) {
     cu.determinacy = inv.getDeterminacy();
     cu.start = static_cast<unsigned>(dcpStart(op));
 
-    // Operands are in callee-argument order, so operand k is callee arg k. Each
-    // memref operand contributes one MemArg per child port; a boundary port's
-    // top name is `<name>_<role>` indexed per role when the arg has several of
-    // that role (matching memPortBase), paired to the child port by order.
+    // Operands are in callee-argument order, so operand k is callee arg k.
+    // Each memref operand contributes one MemArg per child port; a boundary
+    // port's top name is `<name>_<role>`, indexed per role, paired to the child
+    // port by order.
     for (auto [k, operand] : llvm::enumerate(inv.getInputs())) {
       if (!isa<MemRefType>(operand.getType())) {
-        // A scalar operand: its driver feeds the child's scalar-input port for
-        // this arg. The loop induction counter (a pipeline's block-arg 0, the
-        // loop-over-call index) resolves to this region's Counter --
-        // boundSource handles only defined values / IO, not the loop IV; every
-        // other scalar (an IO port, a sibling survivor, a same-region unit, or
-        // a constant) resolves via boundSource.
-        const iface::Scalar *sc = ifaceScalarForArg(mi, static_cast<int>(k));
+        // A scalar operand's driver feeds the child's scalar-input port. The
+        // loop induction counter (pipeline block-arg 0) resolves to this
+        // region's Counter directly; every other scalar resolves via
+        // boundSource.
+        const auto *sc = ifaceScalarForArg(mi, static_cast<int>(k));
         assert(sc && "a scalar operand with no matching callee scalar port");
         Source scalarSrc;
         if (auto barg = dyn_cast<BlockArgument>(operand))
@@ -363,10 +358,9 @@ void DatapathBuilder::bindResource(Operation *op, RegionBlock &rb) {
         cu.scalarIns.push_back({scalarSrc, sc->name});
         continue;
       }
-      MemId mem = getOrCreateMem(operand);
+      auto mem = getOrCreateMem(operand);
       bool isBoundary = isa<BlockArgument>(operand);
-      llvm::SmallVector<const iface::Memory *, 2> ports =
-          ifaceMemsForArg(mi, static_cast<int>(k));
+      auto ports = ifaceMemsForArg(mi, static_cast<int>(k));
       for (const iface::Memory *m : ports) {
         CallUnit::MemArg ma;
         ma.calleeArg = static_cast<unsigned>(k);
@@ -374,37 +368,28 @@ void DatapathBuilder::bindResource(Operation *op, RegionBlock &rb) {
         ma.isBoundary = isBoundary;
         ma.isWrite = m->write;
         // The bank this child port serves: a cyclically partitioned arg
-        // exposes one static-bank port group per bank (ifaceMemsForArg returns
-        // them all), each addressing its own bank's index space. emitCalls
-        // routes an internal buffer to memBanks[mem][bank]; Interface.cpp
-        // declares a boundary group with (bank, factor) so the cosim backs it
-        // with the argument's cyclic slice.
+        // exposes one port group per bank (ifaceMemsForArg returns them all).
+        // emitCalls routes an internal buffer via memBanks[mem][bank]; a
+        // boundary group carries (bank, factor) for the cosim harness.
         ma.bank = static_cast<unsigned>(m->bank);
         ma.factor = static_cast<unsigned>(m->factor);
         ma.addr = m->addr;
         ma.data = m->data;
         ma.we = m->we;
         if (isBoundary) {
-          // One boundary port group PER ACCESSOR: a running index per base, so
-          // the first keeps `<name>_<role>` and a further one (another child,
-          // or one child's repeated access) is suffixed `_<n>` -- distinct
-          // concurrent groups, no mux. Same scheme as the structural top's
-          // `baseSeq`, so leaf and top name a shared boundary
-          // identically and the cosim harness backs every group of an argument
-          // against its one array.
-          std::string base =
-              memBoundaryPortBase(dp, mem, m->write ? "wr" : "rd");
-          unsigned n = boundaryBaseSeq[base]++;
-          ma.topBase = n ? base + "_" + std::to_string(n) : base;
+          // One boundary port group per accessor: a running index per
+          // (argument, role) numbers the groups, concurrent and un-muxed,
+          // matching the structural top's own numbering.
+          auto key = std::to_string(mem) + (m->write ? "w" : "r");
+          ma.topBase =
+              memBoundaryPortBase(dp, mem, m->write, boundaryBaseSeq[key]++);
         }
         cu.memArgs.push_back(std::move(ma));
       }
     }
     // A scalar result is a Source::Call this region yields: register
-    // producerOf so recordRegionResult picks it up (-> a survivor captured at
-    // start+latency), and record the child's result-output port for emitCalls.
-    // Multi-result is guarded in validateDatapath (producerOf is keyed per op),
-    // so a single result 0 covers the modelled case.
+    // producerOf so recordRegionResult latches it as a survivor at
+    // start+latency, and record the child's result-output port for emitCalls.
     for (const iface::Result &r : mi.results)
       cu.resultPorts.push_back(r.name);
     if (inv.getNumResults() >= 1)
@@ -424,7 +409,7 @@ void DatapathBuilder::bindResource(Operation *op, RegionBlock &rb) {
   // produces a token, a put consumes one (its data driver is resolved in
   // deriveInterconnect, like a store's).
   if (auto get = dyn_cast<StreamGetOp>(op)) {
-    StreamId sid = getOrCreateStream(get.getStream(), /*isInput=*/true);
+    auto sid = getOrCreateStream(get.getStream(), /*isInput=*/true);
     unsigned aidx = dp.streams[sid].accesses.size();
     StreamChannel::Access acc;
     acc.op = op;
@@ -435,7 +420,7 @@ void DatapathBuilder::bindResource(Operation *op, RegionBlock &rb) {
     return;
   }
   if (auto put = dyn_cast<StreamPutOp>(op)) {
-    StreamId sid = getOrCreateStream(put.getStream(), /*isInput=*/false);
+    auto sid = getOrCreateStream(put.getStream(), /*isInput=*/false);
     StreamChannel::Access acc;
     acc.op = op;
     acc.isPut = true;
@@ -446,9 +431,9 @@ void DatapathBuilder::bindResource(Operation *op, RegionBlock &rb) {
   }
 
   // A memory access binds to a MemUnit port; a read produces a value.
-  if (Value mr = dcpMemref(op)) {
+  if (auto mr = dcpMemref(op)) {
     bool isWrite = isa<dcp::DCPathStoreOp>(op);
-    MemId mid = getOrCreateMem(mr);
+    auto mid = getOrCreateMem(mr);
     // A read-only ROM (a `memref.get_global` constant table) lowers to a
     // combinational `hw.aggregate_constant`, which has no write path; a store
     // bound to it would be silently ignored at emit (its data never lands).
@@ -456,6 +441,13 @@ void DatapathBuilder::bindResource(Operation *op, RegionBlock &rb) {
         !(isWrite && dp.mems[mid].isRom) &&
         "store to a read-only ROM (memref.get_global); the constant table has "
         "no write port");
+    // The MemUnit's device-resolved latency IS the latency the scheduler
+    // stamped on this access; a mismatch would build a port timed against a
+    // cycle the consumer's register depth was not solved for. Both sides read
+    // the same device table, so this is an equality, not an approximation.
+    assert(dcpLatency(op) == (isWrite ? dp.mems[mid].writeLatency
+                                      : dp.mems[mid].readLatency) &&
+           "scheduled access latency disagrees with the device memory model");
     unsigned aidx = dp.mems[mid].accesses.size();
     MemUnit::Access acc;
     acc.op = op;
@@ -474,7 +466,7 @@ void DatapathBuilder::bindResource(Operation *op, RegionBlock &rb) {
   if (auto comp = dyn_cast<dcp::DCPathComputeOp>(op)) {
     FuncUnit u;
     u.id = dp.units.size();
-    if (std::optional<CombOpKindEnum> ck = comp.getCombKind()) {
+    if (auto ck = comp.getCombKind()) {
       // Combinational: emitted inline as a `comb` primitive (latency 0).
       u.opType = stringifyCombOpKindEnum(*ck).str();
       u.comb = true;
@@ -510,36 +502,34 @@ void DatapathBuilder::bindResource(Operation *op, RegionBlock &rb) {
 void DatapathBuilder::recordRegionResult(const RegionBlock &rb,
                                          Operation *regionOp) {
   // A while (conditional) region's results are its frozen survivor registers,
-  // recorded in `carryInfo` (recordCarryInfo) instead -- its terminator is a
-  // dcp.condition whose leading operand is the condition, not a result.
+  // recorded in `carryInfo` (recordCarryInfo) instead, since its terminator is
+  // a dcp.condition whose leading operand is the condition, not a result.
   if (rb.conditional)
     return;
   // A guard (dcp.select) yields from child regions, which are added AFTER this
-  // (pre-order), so `regionIdxOf` is not yet complete here -- its results are
+  // (pre-order), so `regionIdxOf` is not yet complete here; its results are
   // resolved in recordGuards, which runs once every region exists.
   if (isa<dcp::DCPathSelectOp>(regionOp))
     return;
-  Operation *term = regionBody(regionOp)->getTerminator();
+  auto *term = regionBody(regionOp)->getTerminator();
   if (term->getNumOperands() == 0)
     return; // a result-less region yields nothing to a sibling
-  // Each `uncondition` operand is a distinct survivor (indexed by result
-  // number). An untracked result (a bare iter-arg, or a producer not modelled)
-  // leaves a None placeholder so the vector stays aligned with the result
-  // numbering a consumer resolves against.
+  // Each `uncondition` operand is a distinct survivor, indexed by result
+  // number. An untracked result (a bare iter-arg or unmodelled producer)
+  // leaves a None placeholder so the vector stays aligned with that numbering.
   SmallVector<Source> results;
   for (Value res : term->getOperands()) {
-    Operation *def = res.getDefiningOp();
+    auto *def = res.getDefiningOp();
     auto it = def ? producerOf.find(def) : producerOf.end();
     results.push_back(it != producerOf.end() ? it->second : Source{});
   }
   dp.regionResult[rb.id] = std::move(results);
 
-  // A counted loop yields one result per iter-arg (its `uncondition` operands
-  // align 1:1 with `inits`), so record each result's init: a leaf reduction's
-  // identity, which the emitter preloads into the survivor so an empty (zero-
-  // trip) run yields the identity, not a stale accumulator. A sequential
-  // (acyclic) region has no iter-args -> no inits recorded (results always
-  // land).
+  // A counted loop yields one result per iter-arg (`uncondition` operands
+  // align 1:1 with `inits`), so record each result's init: the emitter
+  // preloads it into the survivor so a zero-trip run yields the identity, not a
+  // stale accumulator; a sequential region has no iter-args, so none are
+  // recorded.
   if (auto pipe = dyn_cast<dcp::DCPathPipelineOp>(regionOp)) {
     SmallVector<Source> inits;
     for (Value init : pipe.getInits())
@@ -554,29 +544,24 @@ void DatapathBuilder::recordCarryInfo(ArrayRef<Operation *> regionOps) {
     if (!pipe || pipe.getInits().empty())
       continue;
     RegionBlock &rb = dp.regions[regionIdxOf.lookup(op)];
-    // A leaf counted reduction carries its iter-arg in a fused accumulator (the
-    // captureCountedResults path); only a container (children run per outer
-    // iteration) or a while needs its iter-args latched into survivor
-    // registers.
+    // A leaf counted reduction carries its iter-arg in a fused accumulator
+    // (captureCountedResults); only a container (children run per outer
+    // iteration) or a while needs iter-args latched into survivor registers.
     if (!rb.conditional && !rb.container)
       continue;
     Datapath::CarryInfo wi;
-    // A while's continue condition is a scheduled compute producer (a
-    // cmpi/cmpf): a leaf while's is solved in-body, a sequential-wrapper
-    // while's is reified to a start-0 compute over the iter-args.
-    // Both land in `producerOf` as a Source::Unit; a memory-/IP-dependent
-    // condition the reifier left raw resolves to None (rejected in
-    // validateDatapath). A counted container has no condition.
+    // A while's continue condition is a scheduled compute producer (cmpi/cmpf,
+    // landing in `producerOf` as a Source::Unit): solved in-body for a leaf
+    // while, reified to a start-0 compute for a sequential wrapper; a counted
+    // container has no condition.
     if (rb.conditional) {
-      Operation *cdef = pipe.getConditionValue().getDefiningOp();
+      auto *cdef = pipe.getConditionValue().getDefiningOp();
       wi.condition = cdef ? producerOf.lookup(cdef) : Source{};
     }
     // Per loop-carried value: its init (loaded at start) and its next-value
-    // producer (advanced into the survivor when an outer iteration drains). A
-    // next may be a nested region's result (a container's iter-arg is fed by a
-    // child survivor) or an in-region compute producer. An untracked next (a
-    // bare iter_arg / unmodelled producer) leaves a None placeholder, so no
-    // survivor is built (asserts only if a sibling reads it).
+    // producer (advanced into the survivor when an outer iteration drains,
+    // either a nested region's result or an in-region compute). An untracked
+    // next leaves a None placeholder, asserting only if a sibling reads it.
     for (Value init : pipe.getInits())
       wi.inits.push_back(initSource(init));
     for (Value next : pipe.getCarriedValues())
@@ -590,23 +575,19 @@ void DatapathBuilder::recordGuards(ArrayRef<Operation *> regionOps) {
     auto sel = dyn_cast<dcp::DCPathSelectOp>(op);
     if (!sel)
       continue;
-    // The predicate is the select's i1 condition operand, resolved to a Source:
-    // a scheduled prologue region's survivor (a data-dependent scf guard), or
-    // the enclosing container's combinational predicate unit (an affine guard
-    // over the counter, reified to a start-0 compute). A memory-/IP-
-    // dependent predicate the reifier left raw resolves to None (rejected in
-    // validateDatapath).
+    // The predicate is the select's i1 condition operand, resolved to a
+    // Source: a prologue region's survivor (data-dependent guard) or the
+    // enclosing container's combinational predicate unit (an affine guard
+    // reified to a start-0 compute).
     RegionId rid = regionIdxOf.lookup(op);
     Datapath::GuardInfo gi;
     gi.condition = boundSource(sel.getCondition());
     dp.guardCond[rid] = gi;
 
-    // A result-mux guard (the select yields values): resolve each branch's
-    // yielded Sources (a branch result is typically a child-region survivor or
-    // a pass-through iter-arg -- initSource handles both, and every region now
-    // exists so region-result survivors resolve). The then values go in
-    // `regionResult`, the else in `selectElseResult`, index-aligned; emitGuard
-    // muxes them by the predicate. A result-less dual guard sets neither.
+    // A result-mux guard resolves each branch's yielded Sources via
+    // initSource (a child-region survivor or pass-through iter-arg): then
+    // values go in `regionResult`, else in `selectElseResult`, muxed by the
+    // predicate in emitGuard.
     auto resolveBranch = [&](Region &br) {
       SmallVector<Source> rs;
       if (!br.empty())
@@ -618,12 +599,14 @@ void DatapathBuilder::recordGuards(ArrayRef<Operation *> regionOps) {
     if (!thenR.empty()) {
       dp.regionResult[rid] = std::move(thenR);
       dp.selectElseResult[rid] = resolveBranch(sel.getElseRegion());
+      assert(dp.selectElseResult[rid].size() == dp.regionResult[rid].size() &&
+             "a result-yielding dcp.select needs an else arm of equal arity");
     }
   }
 }
 
 Source DatapathBuilder::boundSource(Value v) {
-  if (Operation *def = v.getDefiningOp()) {
+  if (auto *def = v.getDefiningOp()) {
     // A prologue region result: the runtime bound is one of its survivors
     // (result number selects which), the same channel a data survivor crosses.
     if (isa<dcp::DCPathPipelineOp, dcp::DCPathSequentialOp,
@@ -633,11 +616,10 @@ Source DatapathBuilder::boundSource(Value v) {
     if (auto it = producerOf.find(def); it != producerOf.end())
       return it->second; // a hoisted producer (e.g. a constant bound)
   }
-  // An enclosing loop's induction counter (arg 0 of a `dcp.pipeline`): a bound
-  // that is a raw outer IV, e.g. the `i` in `for ii in range(i, i_max)`. It
-  // resolves to that region's counter register -- held stable while this nested
-  // region runs (nested containment) -- the same channel a body address reads
-  // the outer index through (Source::Counter).
+  // An enclosing loop's induction counter (arg 0 of a `dcp.pipeline`), e.g.
+  // the `i` in `for ii in range(i, i_max)`: resolves to that region's counter
+  // register, held stable for the nested run, the same channel a body address
+  // reads it through (Source::Counter).
   if (auto barg = dyn_cast<BlockArgument>(v))
     if (auto pipe =
             dyn_cast<dcp::DCPathPipelineOp>(barg.getOwner()->getParentOp());
@@ -695,8 +677,7 @@ void DatapathBuilder::recordResults() {
     assert(r.source.kind != Source::Kind::None &&
            "function result with no resolvable Source");
     r.type = v.getType();
-    r.name =
-        ret.getNumOperands() == 1 ? "result" : ("result" + std::to_string(i));
+    r.name = resultPortName(i, ret.getNumOperands());
     dp.results.push_back(std::move(r));
   }
 }
@@ -711,14 +692,27 @@ Resolved DatapathBuilder::resolveOperand(Value v, Operation *consumer,
   Operation *regionOp = consumer->getParentOp();
 
   // Register depth for an edge whose producer's result is ready at `ready`
-  // (cycles after its issuing pulse): distance-many II turns, plus the
-  // consumer's cycle, minus the producer's ready cycle. `readyCycleOf` is the
-  // one definition of that ready cycle (shared with the emitter).
+  // (cycles after its issuing pulse): distance-many II turns plus the
+  // consumer's cycle, minus the ready cycle (`readyCycleOf`, shared with the
+  // emitter).
   auto edge = [&](Source base, Value key, unsigned ready,
                   unsigned distance) -> Resolved {
     int64_t depth =
         static_cast<int64_t>(distance) * ii + tY - static_cast<int64_t>(ready);
-    assert(depth >= 0 && "infeasible negative register depth");
+    // A negative depth means the schedule reads this operand before its
+    // producer exists; report rather than assert, since the `unsigned` cast
+    // would wrap to ~4e9 registers. Depth 0 keeps the build bounded;
+    // `validateDatapath` fails on `infeasible` before emission.
+    if (depth < 0) {
+      consumer->emitError("allo-datapath-to-hw: infeasible schedule -- operand "
+                          "is not ready until cycle ")
+          << (static_cast<int64_t>(ready) - static_cast<int64_t>(distance) * ii)
+          << " but its consumer is scheduled at cycle " << tY
+          << " (producer ready " << ready << ", dependence distance "
+          << distance << ", II " << ii << ")";
+      dp.infeasible = true;
+      depth = 0;
+    }
     return {base, key, static_cast<unsigned>(depth), true};
   };
 
@@ -727,30 +721,25 @@ Resolved DatapathBuilder::resolveOperand(Value v, Operation *consumer,
       return {it->second, Value(), 0, true};
     if (auto pipe =
             dyn_cast<dcp::DCPathPipelineOp>(barg.getOwner()->getParentOp())) {
-      // The iteration counter produces the index at cycle 0. The counter
-      // belongs to the region that *owns* this block argument, which for an
-      // enclosing loop's index (consumed inside a nested region) is an outer
-      // region -- not the consumer's. Attribute it to the owning region so the
-      // emitter reads that region's counter.
+      // The iteration counter produces the index at cycle 0, and belongs to
+      // the region that *owns* this block argument, which for an enclosing
+      // loop's index consumed inside a nested region is the outer region, not
+      // the consumer's.
       if (barg.getArgNumber() == 0)
         return edge(Source{Source::Kind::Counter, regionIdxOf.lookup(pipe), 0},
                     v, /*ready=*/0, /*distance=*/0);
-      // An iter_arg of an *enclosing* container (this consumer is nested inside
-      // a sequential-wrapper while): the container's frozen survivor register,
-      // read across the region boundary (depth 0, no chain). Symmetric to the
-      // outer counter above -- attributed to the owning region. The consumer's
-      // OWN iter_arg (pipe == its region) is the loop recurrence handled below.
+      // An iter_arg of an *enclosing* container (this consumer is nested in a
+      // sequential-wrapper while): reads the container's frozen survivor
+      // register directly (depth 0). The consumer's OWN iter_arg (pipe == its
+      // region) is the loop recurrence, handled below.
       if (pipe != regionOp)
         return {Source{Source::Kind::Survivor, regionIdxOf.lookup(pipe),
                        barg.getArgNumber() - 1},
                 Value(), 0, true};
-      // A container's OWN in-body iter_arg read (pipe == this region, and it
-      // nests children): the iter_arg is a latched survivor register
-      // (setupCarriedIterArgs), not a leaf-reduction recurrence -- so read it
-      // as this region's survivor (depth 0), the same channel the enclosing-
-      // container case above uses. The recurrence path below is only for a leaf
-      // reduction (no children). This is what lets a container's own condition
-      // / predicate compute read its settled iter-args.
+      // A container's OWN in-body iter_arg (pipe == this region, with
+      // children) is a latched survivor register (setupCarriedIterArgs), not
+      // a leaf-reduction recurrence, read here at depth 0; the recurrence path
+      // below is only for a childless leaf reduction.
       if (dp.regions[regionIdxOf.lookup(pipe)].container)
         return {Source{Source::Kind::Survivor, regionIdxOf.lookup(pipe),
                        barg.getArgNumber() - 1},
@@ -765,33 +754,28 @@ Resolved DatapathBuilder::resolveOperand(Value v, Operation *consumer,
         return {};
       // This operand reads the loop-carried iter_arg: the emitter re-injects
       // its init (reduction identity) on THIS consumer input at the first
-      // iteration, so a retriggered reduction restarts from the identity. Ride
-      // it on the Resolved so deriveInterconnect tags the consuming unit's
-      // input port -- the register carrying the recurrence may sit elsewhere in
-      // the cycle (the widened idiom reads acc through a bare wire, not the
-      // register).
-      Resolved r =
-          edge(it->second, def->getResult(0), readyCycleOf(def), distance);
+      // iteration. Ride it on the Resolved, since the recurrence register may
+      // sit elsewhere in the cycle (the widened idiom reads acc through a bare
+      // wire).
+      auto r = edge(it->second, def->getResult(0), readyCycleOf(def), distance);
       r.init = initSource(pipe.getInits()[iterArg]);
       r.initDist = distance; // re-inject the init for the first `distance` runs
-      // An unresolvable init would be silently dropped by the emitter (the
-      // re-injection mux is keyed on the init being non-None), leaving the
-      // recurrence to read only its own backedge: the accumulator would keep
-      // its reset value on the first iteration and free-run from there. Fail
-      // the way the container path does (HWEmitter::setupCarriedIterArgs).
+      // An unresolvable init would be silently dropped (the re-injection mux
+      // is keyed on non-None), leaving the accumulator to free-run from its
+      // reset value instead of the identity. Fail here as
+      // HWEmitter::setupCarriedIterArgs does.
       assert(r.init && "a recurrence input has no resolvable init");
       return r;
     }
     return {};
   }
 
-  Operation *def = v.getDefiningOp();
+  auto *def = v.getDefiningOp();
   if (!def)
     return {};
-  // A value defined by a nested region op is one of that region's results -- a
-  // cross-region survivor, held until the producing region completes (the
-  // emitter latches it; see dp.regionResult). The result number selects which
-  // survivor. No register chain: depth 0.
+  // A value defined by a nested region op is one of that region's results: a
+  // cross-region survivor, held until the producing region completes and
+  // latched by the emitter (dp.regionResult). No register chain: depth 0.
   if (isa<dcp::DCPathPipelineOp, dcp::DCPathSequentialOp, dcp::DCPathSelectOp>(
           def))
     return {Source{Source::Kind::Survivor, regionIdxOf.lookup(def),
@@ -809,26 +793,22 @@ Resolved DatapathBuilder::resolveOperand(Value v, Operation *consumer,
 
 Source DatapathBuilder::initSource(Value v) {
   // A nested region's iter-arg init that reads an enclosing container's
-  // iter-arg (a nested while's `%argN = %outerIterArg`): the container's frozen
-  // survivor register. Safe to inject at the nested region's start -- the outer
-  // register is stable for the whole nested run.
+  // iter-arg (`%argN = %outerIterArg`) resolves to that container's frozen
+  // survivor register, safe to inject since it is stable for the whole nested
+  // run.
   if (auto barg = dyn_cast<BlockArgument>(v))
     if (auto pipe =
             dyn_cast<dcp::DCPathPipelineOp>(barg.getOwner()->getParentOp());
         pipe && barg.getArgNumber() >= 1)
       return Source{Source::Kind::Survivor, regionIdxOf.lookup(pipe),
                     barg.getArgNumber() - 1};
-  if (Operation *def = v.getDefiningOp()) {
+  if (auto *def = v.getDefiningOp()) {
     if (auto it = producerOf.find(def); it != producerOf.end())
       return it->second; // typically a hoisted Const (the reduction identity)
-    // An init produced by a sibling region (read as one of its results, e.g.
-    // `acc = x[i]` fused into a prologue alongside the identity of a second
-    // reduction): its survivor register -- resolved exactly as `resolveOperand`
-    // resolves the same value read as a data operand. The emitter latches every
-    // region result into a survivor that outlives the producing region, so the
-    // init is stable for the whole consuming run; the producing Source itself
-    // is not, being a port a free-running datapath overwrites once that region
-    // ends.
+    // An init produced by a sibling region (e.g. `acc = x[i]` fused into a
+    // prologue) resolves to its survivor register, the same way
+    // `resolveOperand` resolves it as a data operand; the survivor stays stable
+    // for the consuming run, unlike the producing Source's raw port.
     if (isa<dcp::DCPathPipelineOp, dcp::DCPathSequentialOp,
             dcp::DCPathSelectOp>(def))
       return Source{Source::Kind::Survivor, regionIdxOf.lookup(def),
@@ -844,7 +824,7 @@ RegId DatapathBuilder::insertRegister(Value key, ArrayRef<unsigned> depths,
   unsigned maxDepth = *llvm::max_element(depths);
   SmallVector<unsigned> taps(depths.begin(), depths.end());
   llvm::sort(taps);
-  taps.erase(std::unique(taps.begin(), taps.end()), taps.end());
+  taps.erase(llvm::unique(taps), taps.end());
 
   Register reg;
   reg.id = dp.regs.size();
@@ -906,7 +886,7 @@ void DatapathBuilder::resolveUnitInputs() {
     unsigned nPorts = op0->getNumOperands();
     if (u.boundOps.size() == 1) {
       for (unsigned k = 0; k < nPorts; ++k) {
-        Resolved r = resolveOperand(op0->getOperand(k), op0, ii);
+        auto r = resolveOperand(op0->getOperand(k), op0, ii);
         recordEdge(r, u.inputs[k], ridx);
         u.inputInits[k] = r.init; // None unless k reads a loop-carried iter_arg
         u.inputInitDist[k] = r.initDist;
@@ -921,7 +901,7 @@ void DatapathBuilder::resolveUnitInputs() {
       mb.sources.resize(u.boundOps.size());
       for (unsigned j = 0; j < u.boundOps.size(); ++j) {
         Operation *opj = u.boundOps[j].first;
-        Resolved r = resolveOperand(opj->getOperand(k), opj, ii);
+        auto r = resolveOperand(opj->getOperand(k), opj, ii);
         assert(r.init.kind == Source::Kind::None &&
                "sharing a recurrence (reduction) unit is not modelled");
         mb.ops.push_back(opj);
@@ -947,33 +927,22 @@ void DatapathBuilder::resolveAccessOperands() {
                    acc.data, ridx);
     }
 
-  // A stream put's data driver, resolved through the same reg-depth path as a
-  // store's (the token value is presented at the put's stage); and, for a
-  // predicated get/put, its i1 predicate, delayed to the access stage the same
-  // way so it gates the handshake in emitStreamAccesses.
+  // A stream put's data driver resolves through the same reg-depth path as a
+  // store's; a predicated get/put's i1 predicate is likewise delayed to the
+  // access stage, so it gates the handshake in emitStreamAccesses.
   for (StreamChannel &s : dp.streams)
     for (StreamChannel::Access &acc : s.accesses) {
       unsigned ridx = regionIdxOf.lookup(acc.op->getParentOp());
       unsigned ii = dp.regions[ridx].ii.value_or(1);
       if (acc.isPut) {
-        Value token = cast<StreamPutOp>(acc.op).getValue();
-        Resolved r = resolveOperand(token, acc.op, ii);
-        // AXI-S data stability: a FIFO din must be a chain-enable-frozen
-        // register, held while `valid & ~ready`. This bites only a STAGE>=1
-        // put: its valid is a delayed shift-chain pulse (riding regionEnable),
-        // so back-pressure holds it past the issue -- into the loop's drain,
-        // where the counter resets. If its depth-0 din is transient (a live
-        // counter-addressed read or a combinational function of one), the held
-        // valid then commits a token the din no longer holds. A STAGE-0 put's
-        // valid IS the issue pulse (combinationally gated by chainEnable), so
-        // it drops under back-pressure and the whole datapath -- counter and
-        // din -- freezes atomically; it can never outlive the counter, so a
-        // stage-0 transient din (a counter or a combinational function of it)
-        // needs no register. Route the stage>=1 case through one frozen
-        // reg-depth stage (Vitis's `v3_reg`: the FIFO write lands one stage
-        // after the read) by bumping the put's schedule stage. `start` feeds
-        // valid (activationPulse), reg-depth (tY), and drain (acc.stage) alike,
-        // so one bump moves them together; re-resolving yields depth 1.
+        auto token = cast<StreamPutOp>(acc.op).getValue();
+        auto r = resolveOperand(token, acc.op, ii);
+        // AXI-S data stability: a STAGE>=1 put's valid pulse persists into the
+        // drain under back-pressure, so a transient din (tracking a live
+        // counter/read) could commit stale data; bump the put's schedule stage
+        // by one to route it through an extra frozen register instead (a
+        // stage-0 put's valid freezes atomically with its din, so needs no
+        // fix).
         if (r.ok && r.depth == 0 && dcpStart(acc.op) >= 1 &&
             isTransientDin(token)) {
           acc.op->setAttr(
@@ -986,15 +955,15 @@ void DatapathBuilder::resolveAccessOperands() {
         }
         recordEdge(r, acc.data, ridx);
       }
-      Value pred = isa<StreamGetOp>(acc.op)
-                       ? cast<StreamGetOp>(acc.op).getPred()
-                       : cast<StreamPutOp>(acc.op).getPred();
+      auto pred = isa<StreamGetOp>(acc.op)
+                      ? cast<StreamGetOp>(acc.op).getPred()
+                      : cast<StreamPutOp>(acc.op).getPred();
       if (pred) {
-        // Unlike `acc.data` (a None Source trips resolveSource's assert), a
-        // None `acc.when` is read as "unconditional" everywhere in the emitter
-        // -- so a predicate that fails to resolve would silently turn a masked
-        // get/put into an every-cycle one (wrong token stream / deadlock).
-        Resolved pr = resolveOperand(pred, acc.op, ii);
+        // Unlike `acc.data` (a None Source trips an assert), a None
+        // `acc.when` reads as "unconditional" everywhere in the emitter, so a
+        // failed-to-resolve predicate would silently turn a masked get/put into
+        // an every-cycle one (wrong token stream or deadlock).
+        auto pr = resolveOperand(pred, acc.op, ii);
         assert(pr.ok &&
                "predicated stream access: predicate did not resolve (a "
                "None `when` emits an unconditional access)");
@@ -1004,8 +973,8 @@ void DatapathBuilder::resolveAccessOperands() {
 }
 
 void DatapathBuilder::insertRegisters() {
-  // One register per (value, region) key -- its RegId, to patch the pending
-  // slots that read it (each in the same region the register lives in).
+  // One register per (value, region) key, keyed by its RegId, to patch the
+  // pending slots that read it (each in the same region the register lives in).
   llvm::DenseMap<RegKey, RegId> keyToReg;
   for (auto &kv : depthsByKey)
     keyToReg[kv.first] = insertRegister(kv.first.first, kv.second,
@@ -1066,11 +1035,11 @@ void DatapathBuilder::applyBinding(ArrayRef<SmallVector<UnitId, 2>> groups) {
 
 // Composition predecessors of each top-level region (`rb.predecessors`): the
 // earlier top-level siblings it must start after. Two signals, both attributed
-// to the top-level ancestor: (1) a shared memref -- any two regions touching
+// to the top-level ancestor: (1) a shared memref: any two regions touching
 // the same `MemUnit` are ordered (a RAW/WAR/WAW hazard, or, for two readers, a
 // read-port conflict; functional units never conflict across regions under
 // per-region binding, so shared *memory* is the only cross-region resource);
-// (2) a cross-region SSA edge -- an op in a later region uses a value produced
+// (2) a cross-region SSA edge: an op in a later region uses a value produced
 // in an earlier one (a scalar survivor handed between siblings). The emitter
 // starts a predecessor-free region concurrently with the kernel `start` and
 // gates the rest on their producers' joined `done`.
@@ -1082,10 +1051,10 @@ void DatapathBuilder::recordSiblingDeps(ArrayRef<Operation *> regionOps) {
     return r;
   };
 
-  // Every op inside a top-level region maps to that region's id (a nested child
-  // region + its body fold into the enclosing top-level id -- deps are tracked
-  // at top-level granularity). A value defined outside any region (a func arg,
-  // an alloc, a module constant) has no entry and is skipped by the SSA scan.
+  // Every op inside a top-level region maps to that region's id (a nested
+  // child region folds into the enclosing top-level id, since deps track at
+  // top-level granularity). A value defined outside any region has no entry and
+  // is skipped by the SSA scan.
   DenseMap<Operation *, RegionId> opTop;
   for (Operation *regionOp : regionOps) {
     RegionId rid = regionIdxOf.lookup(regionOp);
@@ -1103,12 +1072,9 @@ void DatapathBuilder::recordSiblingDeps(ArrayRef<Operation *> regionOps) {
   };
 
   // (1) Shared-memref order: each region depends on the previous top-level
-  // region touching that memref (consecutive edges chain transitively, so a
-  // third sharer need not name the first). A CallUnit masters its memref
-  // operands without a MemUnit::Access (the child drives the port), so its
-  // region is counted as a sharer here too -- otherwise a child reading a
-  // buffer an earlier loose region writes would start concurrently and read
-  // stale data.
+  // region touching that memref (edges chain transitively). A CallUnit
+  // masters memref operands without a MemUnit::Access, so it counts as a sharer
+  // too, or a child could read a buffer concurrently with an earlier writer.
   for (const MemUnit &m : dp.mems) {
     SmallVector<RegionId, 4> tops;
     auto addSharer = [&](RegionId region) {
@@ -1136,7 +1102,7 @@ void DatapathBuilder::recordSiblingDeps(ArrayRef<Operation *> regionOps) {
       return;
     RegionId consumer = uit->second;
     for (Value v : o->getOperands())
-      if (Operation *def = v.getDefiningOp()) {
+      if (auto *def = v.getDefiningOp()) {
         auto dit = opTop.find(def);
         if (dit != opTop.end() && dit->second != consumer)
           addPred(dit->second, consumer);
@@ -1164,19 +1130,20 @@ void DatapathBuilder::build() {
   });
 
   // Scalar-argument IO ports first: bindResource resolves an invoke's scalar
-  // operand via boundSource, which reads `ioOf` -- a scalar func argument
-  // passed straight to a child is an IO source, so `ioOf` must be populated
-  // before the region walk, not after.
+  // operand via boundSource, which reads `ioOf`, so it must be populated
+  // before the region walk, since a scalar func arg passed straight to a child
+  // is an IO source.
   bindIOArgs();
 
   for (unsigned ridx = 0, e = regionOps.size(); ridx < e; ++ridx) {
     Operation *regionOp = regionOps[ridx];
-    RegionBlock rb = addRegion(regionOp, ridx);
+    auto rb = addRegion(regionOp, ridx);
     for (Operation &opRef : regionBody(regionOp)->without_terminator())
       bindResource(&opRef, rb);
     // A dual guard (dcp.select with a non-empty else) binds its else-branch
-    // loose ops too -- regionBody returns only the then block. Nested regions
-    // in either branch bind nothing here (walked in their own iteration).
+    // loose ops too, since regionBody returns only the then block. Nested
+    // regions in either branch bind nothing here (walked in their own
+    // iteration).
     if (auto sel = dyn_cast<dcp::DCPathSelectOp>(regionOp))
       if (!sel.getElseRegion().empty())
         for (Operation &opRef :

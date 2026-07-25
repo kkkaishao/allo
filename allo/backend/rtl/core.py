@@ -248,9 +248,8 @@ class RTL(Backend[P, R]):
         """
         self.compile()  # fills self._interfaces
         return shell.cosim(
-            self.mlir,
             self.verilog,
-            self.interfaces[self.top],
+            self.interfaces,
             self.top,
             self.arg_types,
             list(args),

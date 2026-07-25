@@ -23,7 +23,8 @@
 #ifndef ALLO_MICROARCH_DATAPATH_H
 #define ALLO_MICROARCH_DATAPATH_H
 
-#include "allo/IR/AlloAttrs.h" // MemoryImplEnum (storage primitive)
+#include "allo/IR/AlloAttrs.h"           // MemoryImplEnum (storage primitive)
+#include "allo/Scheduling/MemoryModel.h" // MemoryLibrary (device access timing)
 
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/AffineMap.h"
@@ -206,6 +207,17 @@ struct MemUnit {
   unsigned portsPerBank = 2;
   MemoryImplEnum impl = MemoryImplEnum::LUTRAM; // resolved storage primitive
 
+  // Access latency of `impl`, read from the device memory model -- the SAME
+  // numbers the scheduler stamped onto this memref's `dcp.load`/`dcp.store`
+  // (asserted per access in `bindResource`). The emitter must build its read /
+  // write ports at exactly these latencies: the consumer's register depth was
+  // solved as `tY - (start + readLatency)`, so a port built at any other
+  // latency samples the wrong cycle. A call-mastered buffer the parent never
+  // touches has no access to read them off, which is why they live here rather
+  // than being re-derived per site.
+  unsigned readLatency = 0;
+  unsigned writeLatency = 1;
+
   // A read-only constant table (a `memref.get_global` of a `memref.global`):
   // the emitter realizes it as a combinational `hw.aggregate_constant` indexed
   // by `hw.array_get` (registered to the read latency), not a writable hlmem.
@@ -227,6 +239,12 @@ struct MemUnit {
     Source data;                       // write data driver (writes only)
   };
   llvm::SmallVector<Access, 2> accesses;
+};
+
+/// A memory access referenced as (mem id, access index), enumerated into the
+/// module's read / write port lists.
+struct AccRef {
+  unsigned mem, idx;
 };
 
 /// A sub-kernel call as a multi-cycle datapath node. Built from a
@@ -518,9 +536,19 @@ struct Datapath {
   };
   llvm::DenseMap<RegionId, CarryInfo> carryInfo;
 
+  /// Set when the builder hit a schedule it cannot realize and ALREADY emitted
+  /// a diagnostic (a consumer placed before its producer's result is ready --
+  /// see `resolveOperand`). The build finishes with placeholder values so it
+  /// stays bounded; `validateDatapath` turns this into a failure before any
+  /// hardware is emitted.
+  bool infeasible = false;
+
   Datapath() = default;
+  /// \p memLib is the device's storage-timing view (the `dcp.device` `memory:`
+  /// table the scheduler timed every access against); it resolves each
+  /// MemUnit's implementation and access latency.
   Datapath(func::FuncOp func, const BindingPolicy &policy,
-           const CalleeCtx *callees = nullptr);
+           const MemoryLibrary &memLib, const CalleeCtx *callees = nullptr);
 
   void dump(llvm::raw_ostream &os) const;
 };

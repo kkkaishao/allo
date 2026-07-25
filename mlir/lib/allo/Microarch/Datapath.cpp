@@ -18,8 +18,8 @@ using namespace mlir::allo;
 namespace mlir::allo::uarch {
 
 //===----------------------------------------------------------------------===//
-// Timing readers over the scheduled dcp IR (see Datapath.h). One definition of
-// the schedule cycle, the operator latency, and the derived result-ready cycle.
+// Timing readers over the scheduled dcp IR. One definition of the schedule
+// cycle, the operator latency, and the derived result-ready cycle.
 //===----------------------------------------------------------------------===//
 
 unsigned dcpStart(Operation *op) {
@@ -39,8 +39,8 @@ unsigned dcpLatency(Operation *op) {
 unsigned readyCycleOf(Operation *op) { return dcpStart(op) + dcpLatency(op); }
 
 Datapath::Datapath(func::FuncOp func, const BindingPolicy &policy,
-                   const CalleeCtx *callees) {
-  DatapathBuilder builder(*this, func, policy, callees);
+                   const MemoryLibrary &memLib, const CalleeCtx *callees) {
+  DatapathBuilder builder(*this, func, policy, memLib, callees);
   builder.build();
 }
 
@@ -48,9 +48,7 @@ Datapath::Datapath(func::FuncOp func, const BindingPolicy &policy,
 // Textual dump.
 //===----------------------------------------------------------------------===//
 
-namespace {
-
-void printValueName(Value v, raw_ostream &os) {
+static void printValueName(Value v, raw_ostream &os) {
   if (auto arg = dyn_cast<BlockArgument>(v))
     os << "#arg" << arg.getArgNumber();
   else if (Operation *def = v.getDefiningOp())
@@ -59,7 +57,7 @@ void printValueName(Value v, raw_ostream &os) {
     os << "<?>";
 }
 
-void printSource(const Source &s, raw_ostream &os) {
+static void printSource(const Source &s, raw_ostream &os) {
   switch (s.kind) {
   case Source::Kind::None:
     os << "-";
@@ -97,16 +95,14 @@ void printSource(const Source &s, raw_ostream &os) {
   }
 }
 
-void printSourceList(ArrayRef<Source> ss, raw_ostream &os) {
+static void printSourceList(ArrayRef<Source> ss, raw_ostream &os) {
   os << "[";
   llvm::interleaveComma(ss, os, [&](const Source &s) { printSource(s, os); });
   os << "]";
 }
 
-} // namespace
-
 void Datapath::dump(llvm::raw_ostream &os) const {
-  func::FuncOp func = this->func;
+  auto func = this->func;
   os << "datapath @" << func.getSymName() << " {\n";
 
   for (const RegionBlock &rb : this->regions) {
