@@ -23,7 +23,7 @@ include "mlir/Interfaces/SideEffectInterfaces.td"
 //===----------------------------------------------------------------------===//
 // Basic Operations
 //===----------------------------------------------------------------------===//
-// Copied and modified from FuncOps.td
+// Modeled on upstream FuncOps.td.
 def KernelOp : Allo_Op<"kernel", [
   AffineScope, AutomaticAllocationScope,
   FunctionOpInterface, IsolatedFromAbove, OpAsmOpInterface
@@ -182,8 +182,9 @@ def InvokeOp : Allo_Op<"invoke",
 def GetWorkerIdOp : Allo_Op<"get_wid", [Pure]> {
   let summary = "get the worker id";
   let description = [{
-    This operation returns the worker ID of the current worker in an SPMW execution context.
-    The worker ID is typically used to identify and differentiate between multiple workers executing in parallel.
+    Returns the worker ID of the current worker in an SPMW execution context.
+    The worker ID identifies and differentiates the workers running in
+    parallel.
   }];
   let arguments = (ins I32Attr:$axis);
   let results = (outs Index:$worker_id);
@@ -195,8 +196,9 @@ def GetWorkerIdOp : Allo_Op<"get_wid", [Pure]> {
 def GetNumWorkersOp : Allo_Op<"get_nw", [Pure]> {
   let summary = "get the number of workers";
   let description = [{
-    This operation returns the total number of workers in an SPMW execution context.
-    This information is crucial for coordinating parallel execution and ensuring that work is distributed appropriately among the workers.
+    Returns the total number of workers in an SPMW execution context. It
+    coordinates parallel execution and distributes work appropriately among
+    the workers.
   }];
   let arguments = (ins I32Attr:$axis);
   let results = (outs Index:$num_workers);
@@ -209,14 +211,13 @@ def StreamGetOp : Allo_Op<"stream.get",
     [MemoryEffects<[MemRead, MemWrite]>, AttrSizedOperandSegments]> {
   let summary = "get a value from a stream";
   let description = [{
-    This operation retrieves a value from a stream, and destroys the value in the stream.
-    The operation has both read and write memory effects.
+    Retrieves a value from a stream and destroys the value in the stream. The
+    operation has both read and write memory effects.
 
     The optional `pred` is an i1 predicate: the token is consumed (the FIFO is
-    popped) only on a firing where it holds. A null (statically-true) predicate is
-    the canonical unconditional get. The predicate must be a function of data /
-    induction variables, never of channel status (that would leave KPN). See
-    drafts/dataflow-predicated-access.md.
+    popped) only on a firing where it holds. A null (statically-true) predicate
+    is the canonical unconditional get. The predicate must be a function of data
+    or induction variables, never of channel status, which would leave KPN.
   }];
   let arguments = (ins Stream:$stream, Variadic<Index>:$indices, Optional<I1>:$pred);
   let results = (outs AnyType:$value);
@@ -237,13 +238,13 @@ def StreamPutOp : Allo_Op<"stream.put",
     [MemoryEffects<[MemWrite]>, AttrSizedOperandSegments]> {
   let summary = "put a value into a stream";
   let description = [{
-    This operation puts a value into a stream, and the value in the stream is consumed by the next `stream.get` operation.
-    The operation has write memory effects.
+    Puts a value into a stream; the value is consumed by the next `stream.get`
+    operation. The operation has write memory effects.
 
-    The optional `pred` is an i1 predicate: the token is produced only on a firing
-    where it holds. A null (statically-true) predicate is the canonical
-    unconditional put. The predicate must be a function of data / induction
-    variables, never of channel status. See drafts/dataflow-predicated-access.md.
+    The optional `pred` is an i1 predicate: the token is produced only on a
+    firing where it holds. A null (statically-true) predicate is the canonical
+    unconditional put. The predicate must be a function of data or induction
+    variables, never of channel status, which would leave KPN.
   }];
   let arguments = (ins Stream:$stream, Variadic<Index>:$indices, AnyType:$value,
                        Optional<I1>:$pred);
@@ -315,7 +316,7 @@ def BitSetSliceOp : Allo_Op<"bit.set_slice", [
 //===----------------------------------------------------------------------===//
 
 def AssumeSSAOp : Allo_Op<"assume.ssa"> {
-  let summary = "Assume an SSA predicate holds (analysis hint, like llvm.assume)";
+  let summary = "Assume an SSA predicate holds (an llvm.assume-style hint)";
   let description = [{
     Asserts that `$condition` is true at this program point, seeding the value
     analyses the scheduler relies on (integer ranges / affine constraints on
@@ -339,27 +340,28 @@ def AssumeNoDepOp : Allo_Op<"assume.nodep"> {
     The `#pragma HLS dependence` analogue. Asserts the presence or absence of a
     memory dependence on array `$variable`, scoped to the loop identified by its
     induction variable `$iv`. `dependent = false` (the default) prunes a
-    dependence the conservative analysis would otherwise add -- recovering II
-    when the programmer knows two accesses never collide (e.g. a permutation
+    dependence the conservative analysis would otherwise add, recovering II when
+    the programmer knows two accesses never collide (e.g. a permutation
     scatter); `dependent = true` asserts one exists.
 
-    Note: `dependent = true` is currently a no-op (accepted for Vitis-signature
-    fidelity, but not consumed). Our analysis is already conservative -- affine
-    accesses are tested exactly and non-affine ones are serialized -- so it never
-    misses a real dependence for an assertion to re-add. Support will only be
-    added if a concrete need arises (e.g. relaxing a conservative edge to a
-    user-known distance > 1, which is better expressed on `distance` than here).
+    Note: `dependent = true` is a no-op, accepted for Vitis-signature fidelity
+    but not consumed. The analysis is already conservative, testing affine
+    accesses exactly and serializing non-affine ones, so it never misses a real
+    dependence for an assertion to re-add. A user-known distance > 1 is better
+    expressed on `distance` than here.
 
     Mirrors Vitis's fields: `dep_type` is inter- (across iterations) vs. intra-
-    (within one iteration); the optional `direction` (raw/war/waw) and `distance`
-    narrow the claim -- omitting them applies it to the whole array / all
-    directions. Unchecked (undefined behavior if false); stripped before codegen.
+    (within one iteration); the optional `direction` (raw/war/waw) and
+    `distance` narrow the claim, and omitting them applies it to the whole array
+    and all directions. Unchecked (undefined behavior if false); stripped before
+    codegen.
 
-    Example: the histogram index set is a permutation, so no inter-iteration RAW.
+    Example: a histogram index set is a permutation, so no inter-iteration RAW.
     ```mlir
     affine.for %i = 0 to 128 {
-      allo.assume.nodep %hist[%i] {dep_type = #allo<dep_type inter>,
-                                   direction = #allo<dep_dir raw>} : memref<64xi32>
+      allo.assume.nodep %hist[%i]
+          {dep_type = #allo<dep_type inter>, direction = #allo<dep_dir raw>}
+          : memref<64xi32>
       ...
     }
     ```
@@ -383,9 +385,9 @@ def AssumeNoDepOp : Allo_Op<"assume.nodep"> {
 
 def ScheduledOpInterface : OpInterface<"ScheduledOpInterface"> {
   let description = [{
-    An op that participates in the dcp schedule. The default implementations read
-    and write the generic `start` (cycle) and `unit` (resource binding) attributes,
-    so an op that lacks them (e.g. a region op) transparently reports `nullopt`.
+    An op that participates in the dcp schedule. The default implementations
+    read and write the generic `start` (cycle) and `unit` (resource binding)
+    attributes, so an op that lacks them (e.g. a region op) reports `nullopt`.
   }];
   let methods = [
     InterfaceMethod<"Get the start cycle of this operation",
@@ -417,22 +419,21 @@ class DCPath_Op<string mnemonic, list<Trait> traits = []> : Allo_Op<mnemonic, tr
 }
 
 def DCPathOperatorOp : DCPath_Op<"dcp.operator", [Symbol]> {
-  let summary = "An IP operator characterization (a symbol dcp.compute references)";
+  let summary = "An IP operator characterization referenced by dcp.compute";
   let description = [{
     Declares the timing of one instanced (multi-cycle) IP operator: a
-    fixed-signature float/cast core the device provides. Injected from the device
-    model (Python) before scheduling, and referenced by a `dcp.compute` on the IP
-    path (its `op_type`) so schedule legality and register depths are
+    fixed-signature float/cast core the device provides. Injected from the
+    device model (Python) before scheduling, and referenced by a `dcp.compute`
+    on the IP path (its `op_type`) so schedule legality and register depths are
     self-contained and verifiable.
 
     `sym_name` is BOTH the referenced symbol and the RTL module name the emitter
     instantiates. `kind` is the abstract operator kind
     (`add`/`mul`/`cmp`/`int_float_cast`/...); `signature` is the concrete
     realized type (e.g. `(f32, f32) -> f32`), matched by exact element types.
-    `stall` is the port/back-pressure contract the emitter instantiates it with
-    (clock-enable today). Combinational ops do NOT get a `dcp.operator` -- they
-    take the `dcp.compute` `comb_kind` path, with their chaining delay in
-    `dcp.device`.
+    `stall` is the port/back-pressure contract the emitter instantiates it
+    with. Combinational ops do NOT get a `dcp.operator`; they take the
+    `dcp.compute` `comb_kind` path, with their chaining delay in `dcp.device`.
   }];
   let arguments = (ins
     SymbolNameAttr:$sym_name,
@@ -451,7 +452,7 @@ def DCPathDeviceOp : DCPath_Op<"dcp.device"> {
   let description = [{
     The device model injected from Python before scheduling: the native
     (combinational) operator chaining delays and the storage timing. The
-    scheduler and reifier read it instead of a YAML library.
+    scheduler and reifier read it directly.
 
     `comb` maps an abstract operator kind (`add`/`sub`/`cmp`/...) to its
     combinational chaining delay (ns). `memory` maps a storage implementation
@@ -473,8 +474,8 @@ def DCPathUnitOp : DCPath_Op<"dcp.unit",
   let summary = "An allocated functional-unit instance of an operator type";
   let description = [{
     A single physical instance of `operator`. The allocation is the set of unit
-    declarations; binding is `dcpath.compute` ops referencing a unit, and two ops
-    on the same unit at different times imply a (derived) mux.
+    declarations; binding is `dcpath.compute` ops referencing a unit, and two
+    ops on the same unit at different times imply a (derived) mux.
   }];
   let arguments = (ins
     SymbolNameAttr:$sym_name,
@@ -487,31 +488,34 @@ def DCPathPipelineOp : DCPath_Op<"dcp.pipeline",
      AttrSizedOperandSegments, ScheduledOpInterface]> {
   let summary = "An II-scheduled loop carrying iter-args (counted or while)";
   let description = [{
-    A cyclic scheduling region at initiation interval `ii`. The single block's first
-    argument is the iteration counter (the region's control value); the remaining
-    arguments are the iter-args (recurrences), initialized by `inits` and updated by
-    the terminator. The terminator is `dcp.uncondition` for a counted loop (`trip`
-    iterations) or `dcp.condition` for a while loop -- whose leading `i1` is the
-    per-iteration continue condition and which carries no `trip`. `isWhileLoop()`
-    distinguishes the two; `getCarriedValues()` returns the loop-carried next-values
-    for either. Recurrence, accumulator init, and the loop result are all loop-carried
-    SSA. Registers/muxes/counter/flushing-control are derived at lowering.
+    A cyclic scheduling region at initiation interval `ii`. The single block's
+    first argument is the iteration counter (the region's control value); the
+    remaining arguments are the iter-args (recurrences), initialized by `inits`
+    and updated by the terminator. The terminator is `dcp.uncondition` for a
+    counted loop (`trip` iterations) or `dcp.condition` for a while loop, whose
+    leading `i1` is the per-iteration continue condition and which carries no
+    `trip`. `isWhileLoop()` distinguishes the two; `getCarriedValues()` returns
+    the loop-carried next-values for either. Recurrence, accumulator init, and
+    the loop result are all loop-carried SSA. Registers, muxes, counter and
+    flushing control are derived at lowering.
 
     The counter runs the source loop's induction: `lb`, `lb+step`, ... The lower
     bound and stride are each either compile-time (the `lb`/`step` attributes,
-    default 0/1) or a runtime `index` value (the `lbBound`/`stepBound` operands, for
-    a data-dependent `for i in range(m, n)`); the induction register holds the real
-    IV (so the body's address maps -- identity-relative to the IV -- index correctly
-    for a `lb != 0` loop), and termination is a bound compare (`iv+step >= ub`). The
-    upper bound `ub` is symmetrically the compile-time `lb + trip*step` when `trip`
-    is known, else the runtime `dynamicBound` operand; `trip` is the derived
-    iteration count kept for latency / modulo-unroll math. A while loop carries none
-    of these (`dcp.condition` gates termination; its counter free-runs from 0).
+    default 0/1) or a runtime `index` value (the `lbBound`/`stepBound` operands,
+    for a data-dependent `for i in range(m, n)`). The induction register holds
+    the real IV, so the body's address maps, identity-relative to the IV, index
+    correctly for a `lb != 0` loop, and termination is a bound compare
+    (`iv+step >= ub`). The upper bound `ub` is symmetrically the compile-time
+    `lb + trip*step` when `trip` is known, else the runtime `dynamicBound`
+    operand; `trip` is the derived iteration count kept for latency and
+    modulo-unroll math. A while loop carries none of these: `dcp.condition`
+    gates termination, and its counter free-runs from 0.
 
-    `ii` is optional: it is absent only for a residual *sequential* wrapper whose
-    body length is data-dependent (an enclosed loop with a dynamic trip), which has
-    no static initiation interval -- its hardware is a done-based sequential
-    controller (start iteration i+1 when iteration i finishes).
+    `ii` is optional. It is absent only for a residual *sequential* wrapper
+    whose body length is data-dependent (an enclosed loop with a dynamic trip)
+    and therefore has no static initiation interval. Its hardware is a
+    done-based sequential controller: start iteration i+1 when iteration i
+    finishes.
   }];
   let arguments = (ins
     Optional<Index>:$lbBound,
@@ -552,7 +556,7 @@ def DCPathSequentialOp : DCPath_Op<"dcp.sequential",
   let description = [{
     A non-loop region whose ops carry `start` relative to the region. Produces
     `results` consumed by later regions; regions compose in program order. The
-    region is not isolated -- its ops may reference values from earlier regions
+    region is not isolated: its ops may reference values from earlier regions
     directly.
   }];
   let arguments = (ins
@@ -571,18 +575,18 @@ def DCPathSelectOp : DCPath_Op<"dcp.select",
     [RecursiveMemoryEffects, ScheduledOpInterface]> {
   let summary = "A control-path guard: selects the active data path";
   let description = [{
-    The DCP `if`. `$condition` (an `i1`, the explicit control input -- like a
-    while pipeline's `dcp.condition`) selects which data path is active: `then` or
-    `else`. Selecting an *active path* means one branch executes and the other is
-    gated off -- the branch bodies (which hold whole `dcp` sub-schedules: a
-    guarded loop / store / stream that cannot be speculated) are enable-gated by
-    the predicate, NOT computed-both-and-muxed. When `$results` are yielded, both
-    branches supply one value each and the derived hardware includes a result-mux
-    (`cond ? then : else`) on those values -- but the bodies are still gated.
-    `else` is optional, and present iff there are results (a mux needs both
-    sources). Enable / registers / result-mux are derived at lowering. Latency is
-    optional: absent for a data-dependent guard (unknown), present when an affine
-    active-count is known.
+    The DCP `if`. `$condition` (an `i1`, the explicit control input, like a
+    while pipeline's `dcp.condition`) selects which data path is active: `then`
+    or `else`. Selecting an *active path* means one branch executes and the
+    other is gated off. The branch bodies hold whole `dcp` sub-schedules (a
+    guarded loop, store or stream that cannot be speculated) and are
+    enable-gated by the predicate, NOT computed-both-and-muxed. When `$results`
+    are yielded, both branches supply one value each and the derived hardware
+    includes a result-mux (`cond ? then : else`) on those values, but the bodies
+    are still gated. `else` is optional, and present iff there are results (a
+    mux needs both sources). Enable, registers and result-mux are derived at
+    lowering. Latency is optional: absent for a data-dependent guard (unknown),
+    present when an affine active-count is known.
   }];
   let arguments = (ins
     I1:$condition,
@@ -605,9 +609,9 @@ def DCPathComputeOp : DCPath_Op<"dcp.compute",
     Computes `result` from `inputs`, issued at cycle `start` within its region,
     optionally bound to functional unit `unit`. Exactly one of two realization
     paths is set: `comb_kind` (a `CombOpKind`) is a combinational op emitted
-    inline as a CIRCT `comb` primitive (latency 0, chained); `op_type` references
-    a `dcp.operator` and lowers to that IP module instance (its latency). The
-    verifier enforces the exclusivity.
+    inline as a CIRCT `comb` primitive (latency 0, chained); `op_type`
+    references a `dcp.operator` and lowers to that IP module instance (its
+    latency). The verifier enforces the exclusivity.
   }];
   let arguments = (ins
     Variadic<AnyType>:$inputs,
@@ -627,15 +631,19 @@ def DCPathInstanceOp : DCPath_Op<"dcp.instance",
     [DeclareOpInterfaceMethods<SymbolUserOpInterface>, ScheduledOpInterface]> {
   let summary = "A scheduled sub-kernel call (a leaf-datapath CallUnit node)";
   let description = [{
-    Invokes `callee` at cycle `start` within its region, consuming `inputs` (in
-    callee-argument order: the memref inputs are arrays the child masters -- it drives
-    their addr/data/we -- and the scalar inputs are values it reads) and producing
-    scalar `results` at `start + latency`. References the callee's timing contract
-    (`latency`/`determinacy`) exactly as `dcp.compute` references its
-    `dcp.operator`: a determinate invoke is a fixed-latency node in the datapath F (a
-    pipelined multiplier that also masters ports); an indeterminate one completes on
-    the child's real `done`. `latency` is absent for an indeterminate callee (a
-    `while`/data-dependent child).
+    Invokes `callee` at cycle `start` within its region, consuming `inputs` in
+    callee-argument order: the memref inputs are arrays the child masters,
+    driving their addr/data/we, the stream inputs are channel ends it handshakes
+    on, and the scalar inputs are values it reads. It produces scalar `results`
+    at `start + latency`. An `allo.async` carrier marks an `await` SPAWN: it
+    starts with its container and is ordered thereafter only by FIFO
+    back-pressure, which is a start policy rather than a different kind of node.
+
+    The op references the callee's timing contract (`latency`, `determinacy`)
+    exactly as `dcp.compute` references its `dcp.operator`: a determinate invoke
+    is a fixed-latency datapath node (a pipelined multiplier that also masters
+    ports); an indeterminate one completes on the child's real `done`. `latency`
+    is absent for an indeterminate callee (a `while` or data-dependent child).
   }];
   let arguments = (ins
     Variadic<AnyType>:$inputs,
@@ -655,10 +663,11 @@ def DCPathLoadOp : DCPath_Op<"dcp.load",
     [MemoryEffects<[MemRead]>, ScheduledOpInterface]> {
   let summary = "A scheduled, port-bound memory read";
   let description = [{
-    Reads `memref` at the address `map(indices)`; the induction variable among the
-    indices makes the address timing fall out of the same register-depth rule as
-    data. Bound to a `(bank, port)` of the memref. `latency` is the read latency
-    of the memref's storage, resolved from the device memory model at reify time.
+    Reads `memref` at the address `map(indices)`; the induction variable among
+    the indices makes the address timing fall out of the same register-depth
+    rule as data. Bound to a `(bank, port)` of the memref. `latency` is the read
+    latency of the memref's storage, resolved from the device memory model at
+    reify time.
   }];
   let arguments = (ins
     AnyMemRef:$memref,
@@ -698,12 +707,12 @@ def DCPathStoreOp : DCPath_Op<"dcp.store",
 def DCPathUnconditionOp : DCPath_Op<"dcp.uncondition",
     [Pure, ReturnLike, Terminator,
      ParentOneOf<["DCPathPipelineOp", "DCPathSequentialOp", "DCPathSelectOp"]>]> {
-  let summary = "Unconditional terminator: a counted dcp.pipeline / dcp.sequential / dcp.select branch";
+  let summary = "Unconditional terminator of a counted pipeline or branch";
   let description = [{
-    The terminator of a counted `dcp.pipeline` (termination by `trip`/counter), a
-    `dcp.sequential`, or a `dcp.select` branch. Its operands are the loop-carried
-    next-values / region outputs / per-branch yielded values. Paired with
-    `dcp.condition`, the while-pipeline terminator.
+    The terminator of a counted `dcp.pipeline` (termination by `trip` and
+    counter), a `dcp.sequential`, or a `dcp.select` branch. Its operands are the
+    loop-carried next-values, the region outputs, or the per-branch yielded
+    values. Paired with `dcp.condition`, the while-pipeline terminator.
   }];
   let arguments = (ins Variadic<AnyType>:$operands);
   let builders = [OpBuilder<(ins), [{ /* no operands */ }]>];
@@ -716,8 +725,8 @@ def DCPathConditionOp : DCPath_Op<"dcp.condition",
   let description = [{
     The terminator of a while `dcp.pipeline`: `$condition` (an `i1`) is the
     per-iteration continue condition the derived flushing controller reads, and
-    `$carried` are the loop-carried next-values (the `dcp.uncondition` operands of a
-    counted loop).
+    `$carried` are the loop-carried next-values (the `dcp.uncondition` operands
+    of a counted loop).
   }];
   let arguments = (ins I1:$condition, Variadic<AnyType>:$carried);
   let assemblyFormat = [{

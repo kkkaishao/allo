@@ -28,12 +28,9 @@ static void copyInvokeAttrs(InvokeOp invoke, func::CallOp call) {
     call.setArgAttrsAttr(argAttrs);
   if (auto resAttrs = invoke.getResAttrsAttr())
     call.setResAttrsAttr(resAttrs);
-  // `func.call` has no `async` field, so carry a concurrent-spawn (`await`)
-  // invoke's async bit forward as a namespaced discardable attr. It survives
-  // canonicalize/cse (distinct callees never CSE-merge; a call has side
-  // effects) and is what the dataflow-composition lowering keys on to route a
-  // fork/join top and classify each call as a spawn. The `allo.` prefix keeps
-  // it a legal discardable attr on a non-allo op.
+  // `func.call` has no `async` field, so an `await` invoke's async bit rides a
+  // namespaced discardable attr, which survives canonicalize/cse. The dataflow
+  // composition lowering keys on it to classify each call as a spawn.
   if (invoke.getAsync())
     call->setAttr(kAlloAsyncAttr, UnitAttr::get(call.getContext()));
 }

@@ -170,7 +170,7 @@ struct RaiseCountedWhile : OpRewritePattern<scf::WhileOp> {
 
     // Move the after-region body into the for body, mapping the IV to the for's
     // induction var and the carried args to its iter-args. The IV self-update
-    // clones as dead code (no longer yielded) and is cleaned by canonicalize.
+    // clones as dead code (nothing yields it) and canonicalize removes it.
     auto build = [&](OpBuilder &b, Location l, Value iv, ValueRange iterArgs) {
       IRMapping map;
       map.map(after.getArgument(m->ivIndex), iv);

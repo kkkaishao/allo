@@ -34,10 +34,9 @@ Value mlir::allo::resolveRoot(Value v) {
     else if (auto op = dyn_cast<memref::ViewOp>(def))
       v = op.getSource();
     else {
-      // Any other defining op is assumed to define a fresh, non-aliasing
-      // root, but a transpose/collapse_shape/expand_shape/reshape is really
-      // an aliasing view; keying it as distinct would silently drop a real
-      // dependence (a missed hazard, free to reorder).
+      // Any other defining op defines a fresh, non-aliasing root. A
+      // transpose/collapse_shape/expand_shape/reshape is really an aliasing
+      // view; keying it as distinct would silently drop a real dependence.
       assert((!isa<memref::TransposeOp, memref::CollapseShapeOp,
                    memref::ExpandShapeOp, memref::ReshapeOp>(def)) &&
              "resolveRoot: aliasing view not peeled; the distinct-root "

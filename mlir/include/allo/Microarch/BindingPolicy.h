@@ -5,7 +5,7 @@
 
 //===----------------------------------------------------------------------===//
 // BindingPolicy: the seam where resource sharing decisions are made. Following
-// "store decisions, derive structure", a policy is a PURE decision -- given the
+// "store decisions, derive structure", a policy is a PURE decision. Given the
 // trivially-allocated datapath (one FuncUnit per op) plus the MRT, it returns
 // which units to fold onto one physical unit. The builder applies the decision
 // (updating the binding maps) and re-derives the interconnect (the sharing
@@ -25,7 +25,7 @@ namespace mlir::allo::uarch {
 /// A resource-binding policy. `plan` inspects the trivially-bound datapath and
 /// returns unit groups to merge; each group's units fold onto its first, units
 /// not named keep their own unit. An empty result is the trivial binding (no
-/// sharing). The policy only decides -- it must not mutate `dp`.
+/// sharing). A policy only decides. It must not mutate `dp`.
 struct BindingPolicy {
   virtual ~BindingPolicy() = default;
   virtual std::vector<llvm::SmallVector<UnitId, 2>>

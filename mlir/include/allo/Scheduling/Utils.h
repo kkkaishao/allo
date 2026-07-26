@@ -8,7 +8,7 @@ namespace mlir::allo {
 /// Dump a coarse cross-region dependence graph (analysis only) to a DOT file
 /// (for visualization in Graphviz). The graph is keyed by region ID, with
 /// edges labeled by dependence kind (RAW/WAR/WAW/SSA). The `funcName` argument
-/// selects a single function to dump
+/// selects a single function to dump.
 FailureOr<std::string> dumpRegionDependenceAnaysis(ModuleOp module,
                                                    const std::string &funcName);
 
@@ -34,8 +34,8 @@ constexpr llvm::StringLiteral kLatencyBoundAttr = "allo.sched.latency_is_bound";
 /// operator model; consumed by the resource-aware schedulers.
 constexpr llvm::StringLiteral kResourceCyclesAttr = "allo.sched.rsrc_cycles";
 
-/// Per-loop-op: this counted loop is a Phase B pipelined *level* -- its body's
-/// child loops appear as nodes in one modulo problem. The value is the level's
+/// Per-loop-op: this counted loop is a pipelined *level*, so its body's child
+/// loops appear as nodes in one modulo problem. The value is the level's
 /// scheduling region id. Set on the loop op itself (not its body ops), so the
 /// reify can find and materialize the level loop into a `dcp.pipeline` even
 /// when the level has no leaf ops of its own (all its children are loops).
@@ -52,7 +52,7 @@ constexpr llvm::StringLiteral kRegionKeyLatency =
 constexpr llvm::StringLiteral kRegionKeyLatencyBound =
     "latency_is_bound"; // latency is a worst-case bound (assume-derived trip)
 constexpr llvm::StringLiteral kRegionKeyParent =
-    "parent"; // absorbed into a Phase B level (the level's region id); its
+    "parent"; // absorbed into a pipelined level (the level's region id); its
               // latency is already folded into the level, so it is excluded
               // from the top-level (program-order) latency composition
 constexpr llvm::StringLiteral kRegionKeyParentStart =

@@ -15,8 +15,8 @@
 
 namespace mlir::allo {
 
-/// A node in a level's problem: an immediate child of the level body -- a child
-/// loop (aggregated over its subtree) or a leaf op -- with its footprint.
+/// A node in a level's problem: an immediate child of the level body with its
+/// footprint. Either a child loop, aggregated over its subtree, or a leaf op.
 struct LevelNode {
   Operation *anchor;
   bool isLoop;

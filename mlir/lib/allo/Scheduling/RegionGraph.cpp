@@ -4,9 +4,10 @@
  */
 
 #include "allo/Scheduling/RegionGraph.h"
+#include "allo/IR/AlloOps.h" // kAlloAsyncAttr
 #include "allo/Scheduling/DependenceAnalysis.h"
 #include "allo/Scheduling/Footprint.h"
-#include "allo/Scheduling/Utils.h"
+#include "allo/Scheduling/Utils.h" // sched::kLatencyAttr
 #include "allo/Support/Logging.h"
 
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
@@ -21,8 +22,75 @@ using namespace mlir::allo;
 // Region enumeration
 //===----------------------------------------------------------------------===//
 
+bool mlir::allo::isSyncSubKernelCall(Operation *op) {
+  return isa<func::CallOp>(op) && !op->hasAttr(kAlloAsyncAttr);
+}
+
+// Whether a call node's operand/result types are the ones a leaf CallUnit can
+// carry: memrefs the child masters and scalars it reads / returns. The one
+// definition, asked of a `func.call` before reification and of a
+// `dcp.instance` after (`spawnsConcurrently`).
+static bool lowerableSignature(TypeRange operands, TypeRange results) {
+  return llvm::all_of(operands,
+                      [](Type t) {
+                        return isa<MemRefType, IndexType>(t) ||
+                               t.isIntOrFloat();
+                      }) &&
+         llvm::all_of(results, [](Type t) { return t.isIntOrFloat(); });
+}
+
+bool mlir::allo::callLowerable(func::CallOp call) {
+  return lowerableSignature(call.getOperandTypes(), call.getResultTypes());
+}
+
+std::optional<int64_t> mlir::allo::calleeStaticLatency(func::FuncOp callee) {
+  auto read = [&](llvm::StringRef name) -> std::optional<int64_t> {
+    if (auto a = callee->getAttrOfType<IntegerAttr>(name))
+      return a.getInt();
+    return std::nullopt;
+  };
+  if (std::optional<int64_t> l = read("dcp.latency"))
+    return l;
+  return read(sched::kLatencyAttr);
+}
+
+bool mlir::allo::isIndeterminateCall(Operation *op) {
+  if (!isSyncSubKernelCall(op))
+    return false;
+  auto callee = SymbolTable::lookupNearestSymbolFrom<func::FuncOp>(
+      op, cast<func::CallOp>(op).getCalleeAttr());
+  return !callee || !calleeStaticLatency(callee);
+}
+
+bool mlir::allo::composesOnStructuralTop(func::FuncOp func) {
+  bool structural = false;
+  func.walk([&](func::CallOp c) {
+    if (c->hasAttr(kAlloAsyncAttr) || !callLowerable(c))
+      structural = true;
+  });
+  return structural;
+}
+
+bool mlir::allo::spawnsConcurrently(Operation *invoke) {
+  // `await` (broadcast start), or the same "not leaf-lowerable" signature test
+  // `composesOnStructuralTop` applies pre-reification. In practice that is a
+  // `Stream` operand, a back-pressured hand-off no schedule can time.
+  return invoke->hasAttr(kAlloAsyncAttr) ||
+         !lowerableSignature(invoke->getOperandTypes(),
+                             invoke->getResultTypes());
+}
+
 SmallVector<SchedRegion> mlir::allo::enumerateRegions(Block &block) {
   SmallVector<SchedRegion> regions;
+  // A DETERMINATE call is isolated only in a nested block; see the header for
+  // why the function's own entry block keeps such calls inside their span.
+  Operation *parent = block.getParentOp();
+  bool isolateCalls = !isa_and_nonnull<func::FuncOp>(parent);
+  // An INDETERMINATE one is isolated in the entry block too, but only where it
+  // becomes a leaf CallUnit, the node other ops are scheduled against. `||`
+  // short-circuits, so the cast runs only for a func's own block.
+  bool isolateIndeterminate =
+      isolateCalls || !composesOnStructuralTop(cast<func::FuncOp>(parent));
 
   SmallVector<Operation *> pending; // accumulating straight-line run
   auto flush = [&]() {
@@ -43,12 +111,41 @@ SmallVector<SchedRegion> mlir::allo::enumerateRegions(Block &block) {
             scf::IfOp>(&op)) {
       flush();
       regions.push_back({(unsigned)regions.size(), RegionKind::Loop, {&op}});
+    } else if (isSyncSubKernelCall(&op) &&
+               (isolateCalls ||
+                (isolateIndeterminate && isIndeterminateCall(&op)))) {
+      flush();
+      regions.push_back(
+          {(unsigned)regions.size(), RegionKind::StraightLine, {&op}});
     } else {
       pending.push_back(&op);
     }
   }
   flush();
   return regions;
+}
+
+bool mlir::allo::blockHasSyncCall(Block &block) {
+  return block
+      .walk([](Operation *op) {
+        return isSyncSubKernelCall(op) ? WalkResult::interrupt()
+                                       : WalkResult::advance();
+      })
+      .wasInterrupted();
+}
+
+bool mlir::allo::loopBodyDecomposes(LoopLikeOpInterface loop) {
+  // A nested loop anywhere under the body (not just at its top level): an
+  // `if` guarding a loop keeps that loop off the body's own op list, and an
+  // affine.for enclosing an scf.for must not be treated as innermost either.
+  for (Region *r : loop.getLoopRegions())
+    if (r->walk([](Operation *op) {
+           return isa<affine::AffineForOp, scf::ForOp, scf::WhileOp>(op)
+                      ? WalkResult::interrupt()
+                      : WalkResult::advance();
+         }).wasInterrupted())
+      return true;
+  return enumerateRegions(loop.getLoopRegions().front()->front()).size() > 1;
 }
 
 SmallVector<SchedRegion> mlir::allo::enumerateRegions(func::FuncOp func) {

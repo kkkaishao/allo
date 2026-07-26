@@ -54,6 +54,29 @@ static unsigned resourceCycles(Operation *op) {
   return 1;
 }
 
+/// A dependence circuit that binds the initiation interval: the ops around it,
+/// plus the sums the II bound is read off. `latency` counts each edge's source
+/// latency (and the extra cycle a chain-breaking constraint adds); `distance`
+/// counts the iterations each edge spans.
+struct Recurrence {
+  SmallVector<Operation *> ops; // the circuit, in dependence order
+  int64_t latency = 0;
+  int64_t distance = 0;
+  explicit operator bool() const { return !ops.empty(); }
+};
+
+/// One-line rendering: the circuit as an arrow chain closing on itself,
+/// followed by its two sums. The II it forces is `ceil(latency / distance)`.
+static std::string render(const Recurrence &rec) {
+  std::string s;
+  llvm::raw_string_ostream os(s);
+  for (Operation *op : rec.ops)
+    os << op->getName().getStringRef() << " -> ";
+  os << rec.ops.front()->getName().getStringRef() << " (total latency "
+     << rec.latency << " over distance " << rec.distance << ")";
+  return s;
+}
+
 /// This class provides a framework to model certain scheduling problems as
 /// lexico-parametric linear programs (LP), which are then solved with an
 /// extended version of the dual simplex algorithm.
@@ -169,6 +192,22 @@ protected:
   SmallVector<Problem::Dependence> additionalConstraints;
 
   virtual Problem &getProblem() = 0;
+  /// Iteration distance a dependence spans. Only a cyclic problem carries one;
+  /// an acyclic problem is the `distance == 0` special case, so the base
+  /// answers 0 and the cyclic subclasses override, mirroring how
+  /// `fillConstraintRow` adds the parameter-T term.
+  virtual unsigned distanceOf(Problem::Dependence dep);
+  /// The dependence circuit that binds the II at \p ii: the constraints are
+  /// `t_dst - t_src >= latency(src) + extra - ii*distance`, so a schedule
+  /// exists iff no circuit's weights sum positive. A positive circuit forces
+  /// `ii >= ceil(latency / distance)`, and one with `distance == 0` can never
+  /// be satisfied, which is exactly what "the problem is infeasible" means
+  /// here. Empty when no circuit binds. O(|ops| * |deps|) Bellman-Ford.
+  Recurrence bindingRecurrence(unsigned ii);
+  /// Report a failed initial solve, naming the recurrence responsible. Shared
+  /// by every scheduler's `schedule()`; the message is the only thing a user
+  /// sees when their kernel has an unsatisfiable dependence cycle.
+  void reportInfeasible();
   virtual LogicalResult checkLastOp();
   virtual bool fillObjectiveRow(SmallVector<int> &row, unsigned obj);
   virtual void fillConstraintRow(SmallVector<int> &row,
@@ -230,6 +269,9 @@ private:
 
 protected:
   Problem &getProblem() override { return prob; }
+  unsigned distanceOf(Problem::Dependence dep) override {
+    return prob.getDistance(dep).value_or(0);
+  }
   void fillConstraintRow(SmallVector<int> &row,
                          Problem::Dependence dep) override;
 
@@ -343,6 +385,9 @@ private:
 
 protected:
   Problem &getProblem() override { return prob; }
+  unsigned distanceOf(Problem::Dependence dep) override {
+    return prob.getDistance(dep).value_or(0);
+  }
   void fillConstraintRow(SmallVector<int> &row,
                          Problem::Dependence dep) override;
   void fillAdditionalConstraintRow(SmallVector<int> &row,
@@ -443,6 +488,110 @@ public:
 //===----------------------------------------------------------------------===//
 // SimplexSchedulerBase
 //===----------------------------------------------------------------------===//
+
+unsigned SimplexSchedulerBase::distanceOf(Problem::Dependence) { return 0; }
+
+Recurrence SimplexSchedulerBase::bindingRecurrence(unsigned ii) {
+  auto &prob = getProblem();
+  DenseMap<Operation *, unsigned> index;
+  SmallVector<Operation *> nodes;
+  for (auto *op : prob.getOperations()) {
+    index[op] = nodes.size();
+    nodes.push_back(op);
+  }
+
+  // One edge per constraint row `buildTableau` would emit, carrying the same
+  // latency / distance / chain-break terms.
+  struct Edge {
+    unsigned src, dst;
+    int64_t latency, distance;
+  };
+  SmallVector<Edge> edges;
+  auto weightOf = [&](const Edge &e) {
+    return e.latency - static_cast<int64_t>(ii) * e.distance;
+  };
+  auto addEdge = [&](Problem::Dependence dep, int extra) {
+    auto srcIt = index.find(dep.getSource());
+    auto dstIt = index.find(dep.getDestination());
+    if (srcIt == index.end() || dstIt == index.end())
+      return;
+    int64_t latency =
+        *prob.getLatency(*prob.getLinkedOperatorType(dep.getSource())) + extra;
+    edges.push_back({srcIt->second, dstIt->second, latency, distanceOf(dep)});
+  };
+  for (auto *op : prob.getOperations())
+    for (auto &dep : prob.getDependences(op))
+      addEdge(dep, /*extra=*/0);
+  // A chain-breaking constraint costs one extra time step (see the
+  // `fillAdditionalConstraintRow` overrides).
+  for (auto &dep : additionalConstraints)
+    addEdge(dep, /*extra=*/1);
+
+  // Bellman-Ford for a positive circuit, every node a source (`dist` starts at
+  // zero) so a circuit anywhere in the graph is found. Settling early means
+  // there is none.
+  SmallVector<int64_t> dist(nodes.size(), 0);
+  SmallVector<int> pred(nodes.size(), -1), predEdge(nodes.size(), -1);
+  int relaxed = -1;
+  for (unsigned round = 0; round < nodes.size(); ++round) {
+    relaxed = -1;
+    for (auto [e, edge] : llvm::enumerate(edges))
+      if (dist[edge.src] + weightOf(edge) > dist[edge.dst]) {
+        dist[edge.dst] = dist[edge.src] + weightOf(edge);
+        pred[edge.dst] = edge.src;
+        predEdge[edge.dst] = e;
+        relaxed = edge.dst;
+      }
+    if (relaxed < 0)
+      return {}; // settled: every circuit's weights sum non-positive
+  }
+
+  // A node still relaxing after |ops| rounds is reachable from a positive
+  // circuit; |ops| predecessor steps land inside the circuit itself.
+  unsigned v = relaxed;
+  for (unsigned i = 0; i < nodes.size(); ++i) {
+    if (pred[v] < 0)
+      return {};
+    v = pred[v];
+  }
+  Recurrence rec;
+  for (unsigned u = v;;) {
+    rec.ops.push_back(nodes[u]);
+    const Edge &in = edges[predEdge[u]];
+    rec.latency += in.latency;
+    rec.distance += in.distance;
+    u = pred[u];
+    if (u == v)
+      break;
+  }
+  std::reverse(rec.ops.begin(), rec.ops.end());
+  return rec;
+}
+
+void SimplexSchedulerBase::reportInfeasible() {
+  auto &prob = getProblem();
+  // The initial solve grows the II freely, so failing it means no II works:
+  // some circuit carries positive latency over zero distance. Search at an II
+  // large enough that any distance-carrying circuit is comfortably negative.
+  unsigned bigII = 1 + additionalConstraints.size();
+  for (auto *op : prob.getOperations())
+    if (auto opr = prob.getLinkedOperatorType(op))
+      bigII += prob.getLatency(*opr).value_or(0);
+  Recurrence rec = bindingRecurrence(bigII);
+  auto diag = error(Stage::Sched, prob.getContainingOp());
+  if (!rec) {
+    // No circuit binds, so the infeasibility comes from the constraints layered
+    // on top of the dependences (a fixed start time, a resource reservation).
+    diag << "problem is infeasible: no dependence recurrence explains it, so a "
+            "fixed start time or a resource reservation does";
+    return;
+  }
+  diag << "problem is infeasible: the dependence cycle " << render(rec)
+       << " must complete within one iteration, but takes " << rec.latency
+       << " cycle(s); break it with a loop-carried value (an iter-arg), a "
+          "faster operator, or an allo.assume.nodep hint if the dependence is "
+          "spurious";
+}
 
 LogicalResult SimplexSchedulerBase::checkLastOp() {
   auto &prob = getProblem();
@@ -724,16 +873,20 @@ LogicalResult SimplexSchedulerBase::solveTableau() {
     int entryTCol = tableau[*pivotRow][parameterTColumn];
     if (parameterS == 0 && entryTCol > 0) {
       // The negation of `entry1Col` is not in the paper, likely an oversight:
-      // `entry1Col` is always negative here (otherwise this would not be a
-      // valid pivot row), so omitting the negation would make the new II
-      // negative.
+      // it is always negative here (else this would not be a valid pivot row),
+      // so omitting the negation would make the new II negative.
       assert(entry1Col < 0);
       int newParameterT = (-entry1Col - 1) / entryTCol + 1;
       if (newParameterT > parameterT) {
-        info(Stage::Sched, getProblem().getContainingOp())
-            << "II=" << parameterT
-            << " is not achievable: a loop-carried recurrence requires II>="
-            << newParameterT << ", increasing II to " << newParameterT << '\n';
+        // Name the circuit that forces the bump; it is what a user would have
+        // to shorten to get the II back. The search is O(|ops| * |deps|), so
+        // only run it when the message will actually be printed.
+        auto diag = info(Stage::Sched, getProblem().getContainingOp());
+        diag << "II=" << parameterT
+             << " is not achievable: a loop-carried recurrence requires II>="
+             << newParameterT << ", increasing II to " << newParameterT;
+        if (Recurrence rec = bindingRecurrence(parameterT))
+          diag << "; the binding recurrence is " << render(rec);
         parameterT = newParameterT;
         continue;
       }
@@ -748,10 +901,9 @@ LogicalResult SimplexSchedulerBase::solveTableau() {
 }
 
 LogicalResult SimplexSchedulerBase::restoreDualFeasibility() {
-  // Dual feasibility requires that all columns in the cost matrix are
-  // non-lexico-negative. This property may be violated after changing the order
-  // of the objective rows, and can be restored by performing primal pivot
-  // steps.
+  // Dual feasibility requires all columns in the cost matrix to be
+  // non-lexico-negative. Changing the order of the objective rows can violate
+  // that; primal pivot steps restore it.
   while (auto pivotCol = findPrimalPivotColumn()) {
     // Look for pivot elements.
     if (auto pivotRow = findPrimalPivotRow(*pivotCol)) {
@@ -800,7 +952,7 @@ unsigned SimplexSchedulerBase::freeze(unsigned startTimeVariable,
   // Perform the exchange.
   pivot(pivotRow, *pivotCol);
 
-  // `startTimeVariable` is now represented by `pivotCol`.
+  // After the exchange, `startTimeVariable` is represented by `pivotCol`.
   return *pivotCol;
 }
 
@@ -929,7 +1081,7 @@ LogicalResult SimplexScheduler::schedule() {
   LLVM_DEBUG(dbgs() << "Initial tableau:\n"; dumpTableau());
 
   if (failed(solveTableau())) {
-    error(Stage::Sched, prob.getContainingOp()) << "problem is infeasible";
+    reportInfeasible();
     return failure();
   }
 
@@ -967,7 +1119,7 @@ LogicalResult CyclicSimplexScheduler::schedule() {
   LLVM_DEBUG(dbgs() << "Initial tableau:\n"; dumpTableau());
 
   if (failed(solveTableau())) {
-    error(Stage::Sched, prob.getContainingOp()) << "problem is infeasible";
+    reportInfeasible();
     return failure();
   }
 
@@ -1007,16 +1159,15 @@ LogicalResult SharedOperatorsSimplexScheduler::schedule() {
   LLVM_DEBUG(dbgs() << "Initial tableau:\n"; dumpTableau());
 
   if (failed(solveTableau())) {
-    error(Stage::Sched, prob.getContainingOp()) << "problem is infeasible";
+    reportInfeasible();
     return failure();
   }
 
   LLVM_DEBUG(dbgs() << "After solving resource-free problem:\n"; dumpTableau());
 
   // Heuristic phase: greedily fix start times for shared-operator ops within
-  // allocation limits, re-solving the LP with each added constraint. Each
-  // solve is optimal given prior fixes, but overall optimality isn't
-  // guaranteed.
+  // allocation limits, re-solving the LP with each added constraint. Each solve
+  // is optimal given prior fixes; overall optimality is not guaranteed.
 
   // Determine which operations are subject to resource constraints.
   auto &ops = prob.getOperations();
@@ -1201,11 +1352,9 @@ bool ModuloSimplexScheduler::fillObjectiveRow(SmallVector<int> &row,
 }
 
 void ModuloSimplexScheduler::updateMargins() {
-  // Assumption: current secondary objective is "ASAP".
-  // Negate the objective row once to effectively maximize the sum of start
-  // times, which yields the "ALAP" times after solving the tableau. Then,
-  // negate it again to restore the "ASAP" objective, and store these times as
-  // well.
+  // Assumes the current secondary objective is "ASAP". Negating the objective
+  // row maximizes the sum of start times, yielding the "ALAP" times; negating
+  // again restores "ASAP". Both sets of times are stored.
   for (auto *axapTimes : {&alapTimes, &asapTimes}) {
     multiplyRow(OBJ_AXAP, -1);
     // This should not fail for a feasible tableau.
@@ -1226,11 +1375,9 @@ void ModuloSimplexScheduler::scheduleOperation(Operation *n) {
   auto rsrcN = (*prob.getLinkedResourceTypes(n))[0];
   unsigned stvN = startTimeVariables[n];
 
-  // Get current state of the LP. We'll try to schedule at its current time step
-  // in the partial solution, and the II-1 following time steps. Scheduling the
-  // op to a later time step may increase the overall latency, however, as long
-  // as the solution is still feasible, we prefer that over incrementing the II
-  // to resolve resource conflicts.
+  // Try the op's current time step in the partial solution and the II-1
+  // following ones. A later step may increase the overall latency, but that is
+  // preferred over incrementing the II to resolve resource conflicts.
   unsigned stN = getStartTime(stvN);
   unsigned ubN = stN + parameterT - 1;
 
@@ -1419,7 +1566,7 @@ LogicalResult ModuloSimplexScheduler::schedule() {
   LLVM_DEBUG(dbgs() << "Initial tableau:\n"; dumpTableau());
 
   if (failed(solveTableau())) {
-    error(Stage::Sched, prob.getContainingOp()) << "problem is infeasible";
+    reportInfeasible();
     return failure();
   }
 
@@ -1494,7 +1641,7 @@ LogicalResult ChainingSimplexScheduler::schedule() {
   LLVM_DEBUG(dbgs() << "Initial tableau:\n"; dumpTableau());
 
   if (failed(solveTableau())) {
-    error(Stage::Sched, prob.getContainingOp()) << "problem is infeasible";
+    reportInfeasible();
     return failure();
   }
 
@@ -1545,7 +1692,7 @@ LogicalResult ChainingCyclicSimplexScheduler::schedule() {
   LLVM_DEBUG(dbgs() << "Initial tableau:\n"; dumpTableau());
 
   if (failed(solveTableau())) {
-    error(Stage::Sched, prob.getContainingOp()) << "problem is infeasible";
+    reportInfeasible();
     return failure();
   }
 

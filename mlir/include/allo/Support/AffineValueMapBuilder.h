@@ -33,7 +33,7 @@ struct AffineValueMapBuilder {
 
   explicit AffineValueMapBuilder(MLIRContext *ctx) : ctx(ctx) {}
 
-  // used to import a single value as an affine expression
+  // Import a single value as an affine expression.
   LogicalResult importValue(Value v) {
     auto result = importValueInternal(v);
     if (failed(result))
@@ -41,20 +41,19 @@ struct AffineValueMapBuilder {
     exprs.push_back(*result);
     return success();
   }
-  // used to import an affine map and its operands
-  // if allowMultiResults is false, the map must have exactly one result
+  // Import an affine map and its operands. If allowMultiResults is false, the
+  // map must have exactly one result.
   LogicalResult importMapAndOperands(AffineMap map, ValueRange dims,
                                      ValueRange syms,
                                      bool allowMultiResults = false);
-  // compose the imported expressions and simplify the resulting map
+  // Compose the imported expressions and simplify the resulting map.
   affine::AffineValueMap compose() const;
-  // reset internal state to reuse the builder for another map
-  // it does not clear the failure cache,
-  // since it's used to accelerate repeated failed import attempts on the same
-  // values.
+  // Reset internal state to reuse the builder for another map. The failure
+  // cache is kept, since it accelerates repeated failed import attempts on the
+  // same values.
   void reset();
-  // add results to the final value map
-  // optional if only cares about how to compose the results.
+  // Add results to the final value map. Optional when only the composition of
+  // the results matters.
   void addResults(ArrayRef<Value> results) {
     llvm::append_range(this->results, results);
   }

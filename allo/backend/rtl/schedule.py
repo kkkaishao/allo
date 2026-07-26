@@ -40,7 +40,8 @@ materialize-topology,
 canonicalize,
 cse,
 convert-allo-to-func,
-func.func(convert-linalg-to-affine-loops),legalize-arith,canonicalize,cse)
+func.func(convert-linalg-to-affine-loops),legalize-arith,canonicalize,cse,
+outline-loose-processes)
 """
 
 # --- schedule result data model --------------------------------------------

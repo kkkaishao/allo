@@ -6,7 +6,7 @@
  * RegisterEverything bundled in the same package: it touches only the `allo`
  * dialect, the Allo transform-dialect extension, and Allo-specific passes.
  * Re-registering the upstream dialects/passes would collide with
- * RegisterEverything (single shared MLIR / global registries) -- in particular
+ * RegisterEverything, which shares one set of MLIR global registries:
  * re-running the upstream pass/pipeline registration aborts with
  * "<pipeline> registered multiple times".
  */

@@ -6,13 +6,13 @@
 #ifndef ALLO_SCHEDULING_OPERATORLIBRARY_H
 #define ALLO_SCHEDULING_OPERATORLIBRARY_H
 
-#include "allo/IR/AlloOps.h"             // kAlloAsyncAttr, dcp ops
-#include "allo/Scheduling/MemoryModel.h" // MemoryLibrary + populateMemoryResources
+#include "allo/IR/AlloOps.h"             // kAlloAsyncAttr
+#include "allo/Scheduling/MemoryModel.h" // MemoryLibrary
 #include "allo/Scheduling/Scheduler.h"
 #include "allo/Scheduling/Utils.h" // sched::kLatencyAttr
 
 #include "circt/Scheduling/Problems.h"
-#include "mlir/Dialect/Func/IR/FuncOps.h" // func::CallOp (scheduled-call latency)
+#include "mlir/Dialect/Func/IR/FuncOps.h" // func::CallOp
 #include "mlir/IR/Block.h"
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinTypes.h"
@@ -68,9 +68,9 @@ enum class OpKind {
   Unknown // op the classifier does not recognize (e.g. math.sqrt).
 };
 
-/// Classify \p op into its abstract kind -- the mapping from a concrete IR op
-/// to the abstract vocabulary. Matching then compares the op's concrete operand
-/// and result types against a library row's types.
+/// Classify \p op into its abstract kind. This is the mapping from a concrete
+/// IR op onto the abstract vocabulary. Matching then compares the op's concrete
+/// operand and result types against a library row's types.
 OpKind classify(Operation *op);
 
 /// The abstract-kind string a device/operator uses (`add`/`sub`/.../`select`),
@@ -138,10 +138,10 @@ public:
   /// scheduling it at the default zero latency.
   bool requiresUnmatchedIP(Operation *op) const;
 
-  /// Whether the device provides a DIRECT realization for \p op -- a matching
-  /// IP operator (or comb row). `legalize-arith` keeps a composite arith op
-  /// (max/min/maxnum/minnum/ceildiv/floordiv) when this holds, and expands it
-  /// into primitive arith otherwise.
+  /// Whether the device provides a DIRECT realization for \p op, i.e. a
+  /// matching IP operator or comb row. `legalize-arith` keeps a composite
+  /// arith op (max/min/maxnum/minnum/ceildiv/floordiv) when this holds, and
+  /// expands it into primitive arith otherwise.
   bool hasDirectRealization(Operation *op) const;
 
   /// The storage-timing view of the device.
@@ -157,10 +157,10 @@ private:
 //===----------------------------------------------------------------------===//
 // Scheduled-call latency: a scheduling helper, separate from operator
 // characterization. A plain (non-async) call to an already-scheduled callee is
-// a fixed-latency node in the enclosing problem -- the callee's whole-kernel
-// latency (its `sched.latency`, annotated bottom-up) with registered
-// boundaries. Returns {latency, stable operator-type name} for such a call,
-// else nullopt.
+// a fixed-latency node in the enclosing problem. Its latency is the callee's
+// whole-kernel latency (its `sched.latency`, annotated bottom-up), with
+// registered boundaries. Returns {latency, stable operator-type name} for such
+// a call, else nullopt.
 //===----------------------------------------------------------------------===//
 inline std::optional<std::pair<int64_t, std::string>>
 scheduledCallLatency(Operation *op) {

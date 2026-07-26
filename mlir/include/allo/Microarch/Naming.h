@@ -30,6 +30,12 @@
 // ExportVerilog would rewrite, so the manifest, authored before LegalizeNames
 // runs, equals the emitted Verilog.
 //
+// The one thing stability does not cover: inserting an access BEFORE an
+// existing access to the same argument still shifts its group index, so `A_rd0`
+// and `A_rd1` swap. Keying the group on source line and column would fix it and
+// cost more readability than it buys, and the manifest already shields every
+// automated consumer.
+//
 // Emitters call these functions and never concatenate a name themselves. That
 // invariant is what keeps the port declaration, the body's port accesses, the
 // dataflow wiring and the cosim manifest on one string.
@@ -116,21 +122,13 @@ std::string resultBase(llvm::StringRef owner);
 /// `<base>_b<k>`: one bank of a partitioned array, port group or storage cell.
 std::string bankBase(llvm::StringRef base, unsigned bank);
 
-/// The port base of external access \p i in \p ports (all reads or all writes),
-/// indexed by which access of ITS OWN argument it is.
-std::string memPortBase(const Datapath &dp, llvm::ArrayRef<AccRef> ports,
-                        unsigned i, bool write);
-/// The boundary port base for a memref a CallUnit masters. The child drives the
-/// port, so there is no parent access to index by; the builder passes the
-/// running per-(argument, role) \p group instead.
-std::string memBoundaryPortBase(const Datapath &dp, MemId mem, bool write,
-                                unsigned group);
 /// The boundary interfaces of one external access, as (bank, base): one entry
 /// for an unbanked or statically-routed access, one per bank for a
-/// data-dependent one, whose crossbar drives every bank.
+/// data-dependent one, whose crossbar drives every bank. The base itself is
+/// `acc.portBase`, composed once by `enumerateBoundaryPorts`; this only expands
+/// it across the banks the access reaches.
 llvm::SmallVector<std::pair<unsigned, std::string>>
-extPorts(const Datapath &dp, llvm::ArrayRef<AccRef> ports, unsigned i,
-         bool write);
+extPorts(const MemUnit &m, const MemUnit::Access &acc);
 /// A stream channel's port base. Takes the whole \p dp because two stream
 /// arguments of one module can share a source name (a systolic PE gets
 /// `fifo[i,j]` and puts `fifo[i,j+1]`); a colliding group splits by direction,
@@ -147,7 +145,11 @@ std::string resultPortName(unsigned i, unsigned n);
 // becomes `_GEN_37`, which is why every state cell below gets a name.
 //===----------------------------------------------------------------------===//
 
-/// On-chip storage for memory \p m, bank \p bank when partitioned.
+/// On-chip storage for the buffer named \p owner: bank \p bank when it is one
+/// of \p numBanks. The Datapath overload resolves a MemUnit's owner name first;
+/// a caller that owns a buffer outside its own `Datapath` passes its own.
+std::string memCellName(llvm::StringRef owner, unsigned numBanks,
+                        unsigned bank);
 std::string memCellName(const Datapath &dp, const MemUnit &m, unsigned bank);
 /// `r<region>_<sig>`: a region's control-plane signal (`run`, `issue`, `iv`,
 /// `phase`, `done`, `ce`). Region-scoped, so a waveform search for `r2_` pulls
@@ -169,7 +171,7 @@ std::string unitInstanceName(const FuncUnit &u);
 /// `<callee>_i<n>`: a child-kernel instance, indexed so two invocations of one
 /// callee stay distinct instead of being uniquified apart by CIRCT.
 std::string childInstanceName(llvm::StringRef callee, unsigned n);
-/// `<chan>_<sig>`: a structural top's per-channel signal. Covers only the shim
+/// `<chan>_<sig>`: a composed channel's own signal. Covers only the shim
 /// built here; a `seq.fifo`'s own internals are named by CIRCT's lowering
 /// (`fifo_mem`, `fifo_count`) with no name attribute to steer them.
 std::string channelSignal(llvm::StringRef chan, llvm::StringRef sig);

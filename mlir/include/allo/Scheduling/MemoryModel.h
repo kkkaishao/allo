@@ -17,7 +17,7 @@
 #ifndef ALLO_SCHEDULING_MEMORYMODEL_H
 #define ALLO_SCHEDULING_MEMORYMODEL_H
 
-#include "allo/IR/AlloAttrs.h"     // MemoryImplEnum (storage vocabulary)
+#include "allo/IR/AlloAttrs.h"     // MemoryImplEnum
 #include "allo/Scheduling/Utils.h" // sched::kResourceCyclesAttr
 
 #include "circt/Scheduling/Problems.h"
@@ -42,12 +42,12 @@
 namespace mlir::allo {
 
 //===----------------------------------------------------------------------===//
-// Memory timing library: the `memory:` section of the device file -- read/write
-// latency + delay per storage *implementation* (register/LUTRAM/BRAM/URAM) for
-// array accesses, plus one FIFO (stream) timing; the storage analog of the
-// operator library. Access timing is a function of the accessed memref's
-// implementation, so the scheduler distinguishes a 0-cycle register from a
-// 1-cycle BRAM from a multi-cycle URAM.
+// Memory timing library: the `memory:` section of the device file. It holds
+// read/write latency + delay per storage *implementation*
+// (register/LUTRAM/BRAM/URAM) for array accesses, plus one FIFO (stream)
+// timing. This is the storage analog of the operator library. Access timing is
+// a function of the accessed memref's implementation, so the scheduler
+// distinguishes a 0-cycle register from a 1-cycle BRAM from a multi-cycle URAM.
 //===----------------------------------------------------------------------===//
 
 /// Read/write latencies (cycles) of one storage kind.
@@ -88,27 +88,27 @@ public:
     bool pipelined = true;
     // The accessed array's resolved storage implementation (Auto for a stream).
     // Accesses of different implementations must map to *different* operator
-    // types -- otherwise they collapse onto one latency -- so it keys the type.
+    // types, or they collapse onto one latency, so this keys the type.
     MemoryImplEnum impl = MemoryImplEnum::Auto;
   };
   /// Timing for a memory/stream access op (load/store/stream get/put); a
   /// zero-latency, zero-delay result if \p op is not a memory access. An array
-  /// access is timed by its memref's implementation (see `resolveImpl`).
+  /// access is timed by its memref's implementation.
   Timing timing(Operation *op) const;
 
   /// The timing of storage implementation \p impl, or a zero (combinational)
   /// timing if the library declares no such primitive.
   MemKindTiming timing(MemoryImplEnum impl) const;
 
-  /// The storage implementation an array access resolves to -- `Auto` for a
-  /// stream (timed by `fifo`) or a non-access. Unlike `timing`, this does NOT
-  /// consult the primitive table, so a caller can diagnose an implementation
-  /// the device never declared *before* `forImpl` would fall to zero timing.
+  /// The storage implementation an array access resolves to. A stream (timed
+  /// by `fifo`) and a non-access both give `Auto`. Unlike `timing`, this does
+  /// NOT consult the primitive table, so a caller can diagnose an
+  /// implementation the device never declared *before* it falls to zero timing.
   MemoryImplEnum resolvedImpl(Operation *op) const;
 
   /// Whether the device declares timing for \p impl. The storage twin of
   /// `requiresUnmatchedIP`: an array resolving to an undeclared primitive would
-  /// otherwise be scheduled at latency 0 -- read before valid.
+  /// otherwise be scheduled at latency 0 and read before its data is valid.
   bool declares(MemoryImplEnum impl) const;
 
   MemoryImplEnum defaultImpl = MemoryImplEnum::LUTRAM; // unbound on-chip arrays
@@ -119,21 +119,47 @@ public:
 
 //===----------------------------------------------------------------------===//
 // Per-memref storage shape, derived from the array's `allo.part` /
-// `allo.bind.storage` attributes -- the same partition/topology facts the
-// resource-aware scheduler binds against (see MemoryBankModel), re-exposed for
+// `allo.bind.storage` attributes. These are the same partition/topology facts
+// MemoryBankModel binds the resource-aware scheduler against, re-exposed for
 // the microarch datapath (MemUnit) so both come from one model.
 //===----------------------------------------------------------------------===//
 
 struct MemoryChar {
-  unsigned numBanks = 1;     // physical banks (block/cyclic partition factor)
-  unsigned portsPerBank = 2; // concurrent ports per bank (from bind.storage)
-  bool readOnly = false;     // ROM
-  bool registers = false;    // complete partition -> scattered to registers
+  unsigned numBanks = 1;      // physical banks (block/cyclic partition factor)
+  unsigned portsPerBank = 2;  // concurrent ports per bank (from bind.storage)
+  bool readOnly = false;      // no write port needed (declared ROM, or by use)
+  bool constantTable = false; // realized as a combinational constant array
+  bool registers = false;     // complete partition -> scattered to registers
   MemoryImplEnum impl = MemoryImplEnum::LUTRAM; // resolved storage primitive
 };
 
+/// The `memref.global` initializer behind \p memRef, i.e. a constant table's
+/// declared contents, or nullopt when it has none.
+std::optional<Attribute> globalInitOf(Value memRef);
+
+/// Whether \p memRef is a CONSTANT TABLE: it has a `memref.global` initializer
+/// and nothing writes it. Read-only is a property of the USE, not of the
+/// declaration, so an initialized array that is stored to even once is a real
+/// memory that merely starts with contents, not a constant table.
+///
+/// This is the ONE definition the scheduler's port model and the emitter's ROM
+/// realization must share. A constant table lowers to `hw.aggregate_constant`
+/// read by one `hw.array_get` per access: combinational, no handshake, so
+/// genuinely UNLIMITED-port. Billing it a 2-port RAM budget (which is what
+/// deriving read-only from `allo.bind.storage` alone did) inflates II for free.
+/// Note this is narrower than `MemoryChar::readOnly`: an explicit
+/// `bind.storage type="rom_1p"` is a real memory whose ports the user chose.
+///
+/// Handing the array to a SUB-KERNEL also disqualifies it, whichever way the
+/// child accesses it. A child MASTERS PORTS, driving addr/data/we into storage
+/// the parent owns, and a constant table has none to master: it is a
+/// combinational constant array, not a memory. Such an array therefore needs
+/// real storage, keeping its declared values as power-on contents, and the port
+/// model has to bill it.
+bool isConstantTable(Value memRef);
+
 /// Characterize a memref's storage shape from its partition/storage attributes
-/// (independent of any scheduling region -- a pure function of the attributes).
+/// (a pure function of the attributes, independent of any scheduling region).
 /// \p defaultImpl resolves an array with no explicit `allo.bind.storage impl=`;
 /// pass the device's `MemoryLibrary::defaultImpl` so this agrees with the
 /// implementation `MemoryLibrary::timing` resolved when it stamped the access
@@ -142,11 +168,57 @@ struct MemoryChar {
 MemoryChar characterize(Value memref, MemoryImplEnum defaultImpl);
 
 //===----------------------------------------------------------------------===//
-// Partition / static-bank queries -- the banking facts a DCP banking pass
-// reuses so it materializes the *same* banks the scheduler bound ResII against.
+// Partition and static-bank queries. A DCP banking pass reuses these facts so
+// it materializes the *same* banks the scheduler bound its ResII against.
 //===----------------------------------------------------------------------===//
 
-/// A memref's `allo.part` partitioning, decoded.
+/// The bank decomposition of a partitioned memref, in ELEMENT space: which bank
+/// holds element `(i_0 .. i_{r-1})`, and where inside that bank it sits. This
+/// is the single definition of "which bank", shared by the static split
+/// (`dcp-resolve-banking`), the runtime crossbar (the emitter), and the
+/// host-side layout (the interface manifest -> cosim), so all three materialize
+/// the same banks the scheduler bound its ResII against.
+///
+/// A CYCLIC axis of factor F puts element `i_d` in bank `i_d mod F` at local
+/// coordinate `i_d floordiv F`. A BLOCK axis puts it in bank
+/// `i_d floordiv extent` at `i_d mod extent`, with `extent = ceil(S_d / F)`.
+/// Several axes compose in mixed radix, in `allo.part` order, so the bank index
+/// is `((b_1 * F_2) + b_2) * F_3 + ...`, exactly the fold the static split
+/// performs. An axis with `dim == 0` in the attribute means *every* dimension,
+/// which contributes one `Axis` each (so `numBanks` is `F^rank`, not `F`).
+struct BankLayout {
+  struct Axis {
+    unsigned dim;   // 0-based memref dimension
+    int64_t factor; // banks along this dimension
+    bool block;     // block (contiguous chunks) vs cyclic (interleaved)
+    int64_t extent; // per-bank extent of `dim` == ceil(shape[dim] / factor)
+  };
+  llvm::SmallVector<Axis, 2> axes; // mixed-radix order, most significant first
+  llvm::SmallVector<int64_t, 4> bankShape; // per-bank extents, full memref rank
+  unsigned numBanks = 1;                   // product of the axis factors
+  bool registers = false;                  // complete partition: no banks
+
+  /// Elements in one bank (the product of `bankShape`).
+  int64_t bankWords() const;
+};
+
+/// Decode a memref's `allo.part` attribute into its element-space bank
+/// decomposition (a single unpartitioned bank when there is no attribute).
+BankLayout bankLayoutOf(Value memRef);
+
+/// The compile-time bank of an access whose address map is \p map over a memref
+/// of \p shape, or nullopt when the bank varies at runtime (a roaming access,
+/// or any block axis whose subscript is not a constant). Generalizes
+/// `staticBank` over every axis and both partition kinds; \p map may be in
+/// element space (one result per dimension) or already linearized by
+/// `dcp-flatten-memref` (one result), which is delinearized row-major before
+/// the per-axis test.
+std::optional<int64_t> staticBankOf(const BankLayout &layout, AffineMap map,
+                                    llvm::ArrayRef<int64_t> shape);
+
+/// A memref's `allo.part` partitioning, decoded. A projection of `BankLayout`
+/// kept for the consumers that only need the aggregate facts (`factor` is
+/// `BankLayout::numBanks`).
 struct PartitionInfo {
   unsigned factor = 1;    // product of block/cyclic factors (physical banks)
   bool unlimited = false; // complete partition -> registers
@@ -178,10 +250,11 @@ namespace mlir::allo {
 /// the port resource (key + limit) for an access. Base ports (2, or 1 for a
 /// single-port `allo.bind.storage`) come from the array; block/cyclic
 /// `allo.part` factors scale the aggregate. When a partitioned array's accesses
-/// are all *statically banked* -- their cyclic-partition subscripts are
-/// iteration-invariant modulo the factor, so each hits a fixed bank -- every
-/// bank is a separate limited resource; otherwise the array falls back to one
-/// aggregate-port resource, so the refinement never under-counts.
+/// are all *statically banked*, every bank is a separate limited resource.
+/// Statically banked means the cyclic-partition subscripts are
+/// iteration-invariant modulo the factor, so each access hits a fixed bank.
+/// Otherwise the array falls back to one aggregate-port resource, so the
+/// refinement never under-counts.
 class MemoryBankModel {
 public:
   void observe(Operation *op);
@@ -212,7 +285,7 @@ namespace mlir::allo {
 
 //===----------------------------------------------------------------------===//
 // Memory resource model: apply the per-memref port/bank model to a scheduling
-// problem. The storage twin of `populateOperatorTypes` -- it attaches the
+// problem. The storage twin of `populateOperatorTypes`. It attaches the
 // limited port resources (and multi-cycle occupancy) that memory accesses bind
 // against. Occupancy comes from the `MemoryLibrary`; the port key + limit come
 // from the array's `allo.part` / `allo.bind.storage` attributes. Only a

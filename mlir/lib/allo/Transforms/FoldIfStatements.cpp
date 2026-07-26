@@ -31,7 +31,7 @@ using namespace mlir::allo::logging;
 namespace {
 
 //===----------------------------------------------------------------------===//
-// Hyperblock predication -- speculate both branches into a select/masked-store
+// Hyperblock predication: speculate both branches into a select/masked-store
 // datapath so the scheduler sees no control flow.
 //===----------------------------------------------------------------------===//
 
@@ -39,15 +39,15 @@ namespace {
 // predicate holds; masking it means ANDing the branch condition into that
 // predicate instead of speculating the side effect. This keeps a conditional
 // stream access inside the single pipelined region (II preserved) rather than
-// serializing it as a guard region. See drafts/dataflow-predicated-access.md.
+// serializing it as a guard region.
 bool isMaskableStream(Operation *op) {
   return isa<StreamGetOp, StreamPutOp>(op);
 }
 
 // An op inside an if body may be speculated (hoisted unconditionally) iff it is
 // a load/store (loads are safe on FPGA; stores are predicated), a stream
-// get/put (masked by its predicate), or a region-free pure op. Anything else --
-// a nested loop/if, a call, any other side effect -- cannot be masked, so the
+// get/put (masked by its predicate), or a region-free pure op. Anything else
+// (a nested loop/if, a call, any other side effect) cannot be masked, so the
 // enclosing if is left alone.
 bool speculatable(Operation *op) {
   if (isa<affine::AffineLoadOp, affine::AffineStoreOp, memref::LoadOp,
@@ -168,10 +168,9 @@ void convertCore(Operation *ifOp, Block *thenBlock, Block *elseBlock,
     return SmallVector<Value>(block->getTerminator()->getOperands());
   };
 
-  // Capture each branch's yielded values *after* predicating it: masking a
-  // stream get replaces the op and RAUWs the yield operand, so a copy taken
-  // beforehand would dangle (a speculated pure op only moves, but a masked get
-  // is rebuilt).
+  // Capture each branch's yields *after* predicating it: masking a stream get
+  // replaces the op and RAUWs the yield operand, so a copy taken beforehand
+  // would dangle.
   predicateBranch(thenBlock, ifOp, cond, b);
   SmallVector<Value> thenYield = yieldOperands(thenBlock);
   SmallVector<Value> elseYield;
@@ -219,8 +218,8 @@ Value materializeCondition(RewriterBase &b, Location loc,
   return cond;
 }
 
-// affine.if: the condition is an integer set, so materialize it -- but only
-// when a value result or a predicated store consumes it, so a value-only guard
+// affine.if: the condition is an integer set, so materialize it, but only when
+// a value result or a predicated store consumes it, so a value-only guard
 // leaves behind no unused condition ops.
 void convert(RewriterBase &b, affine::AffineIfOp ifOp) {
   OpBuilder::InsertionGuard g(b);
@@ -234,7 +233,7 @@ void convert(RewriterBase &b, affine::AffineIfOp ifOp) {
   convertCore(ifOp, thenBlock, elseBlock, cond, b);
 }
 
-// scf.if: the condition is already an i1 value -- use it directly
+// scf.if: the condition is already an i1 value, used directly
 void convert(RewriterBase &b, scf::IfOp ifOp) {
   OpBuilder::InsertionGuard g(b);
   convertCore(ifOp, ifOp.thenBlock(), ifOp.elseBlock(), ifOp.getCondition(), b);
@@ -255,11 +254,11 @@ struct HyperblockPredication : OpRewritePattern<IfOpTy> {
 };
 
 //===----------------------------------------------------------------------===//
-// Guard-to-bound -- fold an affine.if that guards a whole loop body into the
+// Guard-to-bound: fold an affine.if that guards a whole loop body into the
 // loop's bounds (index-set splitting), eliminating the conditional.
 //===----------------------------------------------------------------------===//
 
-// Concatenate `b`'s single result onto `a` over a merged operand list -- a
+// Concatenate `b`'s single result onto `a` over a merged operand list. A
 // multi-result affine.for lower bound is a `max`, an upper bound a `min`, so
 // appending a result tightens the bound. Operand order is (a dims, b dims, a
 // symbols, b symbols) to match AffineMap's dim-then-symbol layout.
@@ -281,8 +280,8 @@ void combineBounds(AffineMap a, ValueRange aOps, AffineMap b, ValueRange bOps,
 // that `e` decomposes exactly as `coeff * d_pos + residual` with `residual`
 // independent of the dim. The dim may be added, subtracted or scaled; feeding
 // it to `mod`/`floordiv`/`ceildiv` makes `e` quasi-affine in it, and no such
-// decomposition exists. (A `mul`'s other side is a constant or a symbol -- an
-// AffineExpr cannot multiply two dims -- so degree stays 1 there.)
+// decomposition exists. (A `mul`'s other side is a constant or a symbol, since
+// an AffineExpr cannot multiply two dims, so degree stays 1 there.)
 static bool isAffineInDim(AffineExpr e, unsigned pos) {
   auto bin = dyn_cast<AffineBinaryOpExpr>(e);
   if (!bin)
@@ -334,15 +333,9 @@ struct FoldGuardIntoLoopBound : OpRewritePattern<affine::AffineIfOp> {
     MLIRContext *ctx = rewriter.getContext();
     AffineExpr c = set.getConstraint(0);
     AffineExpr ivDim = getAffineDimExpr(*ivPos, ctx);
-    // That decomposition exists only if the constraint is affine in the IV. The
-    // two-point probe below cannot tell: on a quasi-affine constraint it reads
-    // some finite difference as the coefficient and folds away a guard no loop
-    // bound can express. `flatten-perfect-loops` produces exactly that shape --
-    // coalescing a nest rewrites each original IV as a floordiv/mod of the
-    // surviving one, and canonicalization composes those into the guard's set,
-    // leaving e.g. `d0 mod 4 - (d0 floordiv 4) floordiv 5 - 1 >= 0`, whose
-    // c(1) - c(0) is 1. Two IVs of the coalesced nest are then both functions
-    // of the one remaining IV, so the guard is not a bound on it at all.
+    // The two-point probe below is only valid when the constraint is affine in
+    // the IV: on a quasi-affine one (a floordiv/mod of a coalesced nest's IV)
+    // it reads a finite difference as the coefficient and drops a real guard.
     if (!isAffineInDim(c, *ivPos))
       return failure();
     AffineExpr residual = simplifyAffineExpr(

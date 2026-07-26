@@ -24,9 +24,9 @@ def LowerDataflowPass : Pass<"lower-dataflow", "ModuleOp"> {
   let summary = "Lower local scalar streams to the host dataflow simulator ABI";
   let description = [{
     Lower Allo local scalar stream operations to calls into the host dataflow
-    simulator runtime and tag stream-connected kernels as dataflow PEs, which the
-    late `allo-dataflow-spawn` pass launches as concurrent fibers on the marl
-    runtime.
+    simulator runtime and tag stream-connected kernels as dataflow PEs, which
+    the late `allo-dataflow-spawn` pass launches as concurrent fibers on the
+    marl runtime.
   }];
 }
 
@@ -34,10 +34,11 @@ def ConvertScheduleToDCPPass : Pass<"convert-schedule-to-dcp", "ModuleOp"> {
   let summary = "Reify the schedule carrier into allo.dcp.* ops (standalone)";
   let description = [{
     Standalone wrapper around the scheduler's reification step: convert a module
-    whose funcs carry `allo.sched.*` schedule attributes into `allo.dcp.*` ops and
-    strip the carrier. `allo-schedule` runs this automatically as its final phase;
-    this pass exposes it for inspecting the carrier->dcp conversion in isolation.
-    Operator/device timing is read from the injected dcp.device / dcp.operator IR.
+    whose funcs carry `allo.sched.*` schedule attributes into `allo.dcp.*` ops
+    and strip the carrier. `allo-schedule` runs this automatically at the end of
+    scheduling; this pass exposes it for inspecting the carrier->dcp conversion
+    in isolation. Operator and device timing is read from the injected
+    dcp.device / dcp.operator IR.
   }];
 }
 

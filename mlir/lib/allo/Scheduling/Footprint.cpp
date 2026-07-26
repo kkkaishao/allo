@@ -22,10 +22,9 @@ using namespace mlir;
 using namespace mlir::allo;
 
 void mlir::allo::summarizeOp(Operation *op, Summary &s) {
-  // A recognized load/store/stream access (root resolved through views): a
-  // stream touches a FIFO root, while an array access records its direction
-  // and whether it is affine (polyhedral disjointness applies) or non-affine
-  // (which defeats sub-range refinement).
+  // A recognized load/store/stream access, root resolved through views. A
+  // stream touches a FIFO root; an array access records its direction and
+  // whether it is affine (non-affine defeats sub-range refinement).
   if (auto a = asMemAccess(op)) {
     if (a->kind == AccessKind::Stream) {
       s.streams.insert(a->root);
@@ -40,9 +39,8 @@ void mlir::allo::summarizeOp(Operation *op, Summary &s) {
     return;
   }
   // Any op not provably side-effect-free (an opaque call, memref.copy, an
-  // unregistered op) may touch memory: conservatively read+write every
-  // memref operand root and mark every stream operand; pure ops (arith/math,
-  // constants) are skipped.
+  // unregistered op) may touch memory: conservatively read+write every memref
+  // operand root and mark every stream operand.
   if (isMemoryEffectFree(op))
     return;
   for (Value operand : op->getOperands()) {
@@ -68,10 +66,9 @@ bool mlir::allo::footprintsDisjoint(const Access &ai, const Access &aj) {
       if (accA.memref != accB.memref)
         return false; // different memref (e.g. subview): cannot prove
                       // disjoint
-      // The two accesses may touch the same element if a dependence exists
-      // at ANY depth: carried by a common enclosing loop (1..n), or
-      // loop-independent (n+1, same iteration of every common loop); checking
-      // only depth 1 would miss same-iteration conflicts.
+      // A dependence at ANY depth means the two may touch one element: carried
+      // by a common enclosing loop (1..n), or loop-independent (n+1, the same
+      // iteration of every common loop). Depth 1 alone misses the latter.
       unsigned n = affine::getNumCommonSurroundingLoops(*a, *b);
       for (unsigned d = 1; d <= n + 1; ++d) {
         affine::FlatAffineValueConstraints cst;
@@ -193,8 +190,7 @@ bool mlir::allo::summarizeCall(func::CallOp call, Summary &s) {
   for (Value o : call.getArgOperands()) {
     // Bail on a view operand rather than key by its root: the callee indexes
     // the view, whose index space is offset from the root's. Every other
-    // operand is its own root, matching `summarizeOp`'s `resolveRoot`-keyed
-    // accesses.
+    // operand is its own root, matching `summarizeOp`'s keying.
     if (isa<MemRefType>(o.getType()) && resolveRoot(o) != o)
       return false;
     actuals.push_back(o);

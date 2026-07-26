@@ -394,11 +394,9 @@ LogicalResult DCPathComputeOp::verify() {
 }
 
 LogicalResult DCPathDeviceOp::verify() {
-  // The storage tables are read by name, so a row this dialect cannot symbolize
-  // -- or one missing a timing field -- would be silently skipped by
-  // `memoryFromDevice` and leave every array of that implementation timed at
-  // zero (scheduled combinationally, read before valid). Reject it here, where
-  // the offending device op is at hand.
+  // A row this dialect cannot symbolize, or one missing a timing field, would
+  // be silently skipped by `memoryFromDevice`, leaving every array of that
+  // implementation timed at zero: scheduled combinationally, read before valid.
   auto verifyTiming = [&](Attribute v, const Twine &what) -> LogicalResult {
     auto d = dyn_cast<DictionaryAttr>(v);
     if (!d)
@@ -458,7 +456,7 @@ LogicalResult DCPathPipelineOp::verify() {
   if (std::optional<int64_t> ii = getIi(); ii && *ii < 1)
     return emitOpError("ii must be >= 1");
   if (std::optional<int64_t> s = getStep(); s && *s <= 0)
-    return emitOpError("step must be > 0"); // A+ terminates on iv+step >= ub
+    return emitOpError("step must be > 0"); // termination is iv+step >= ub
   // A bound is either compile-time (attribute) or runtime (operand), never
   // both.
   if (getLbBound() && getLbAttr())
@@ -589,7 +587,7 @@ static ParseResult parseTiming(OpAsmParser &p, Attribute &out) {
 
 // Parse the optional determinacy keyword a scheduling region prints just before
 // its attr-dict (e.g. `concurrent`). Any bare keyword in that position is a
-// determinacy class -- an unknown one is an error.
+// determinacy class, so an unknown one is an error.
 static ParseResult parseOptionalDeterminacy(OpAsmParser &p,
                                             OperationState &result,
                                             StringAttr attrName) {
@@ -816,10 +814,9 @@ ParseResult DCPathPipelineOp::parse(OpAsmParser &p, OperationState &result) {
   int64_t lb = 0, ii;
   if (p.parseArgument(iv) || p.parseEqual())
     return failure();
-  // Lower bound after `=`: an SSA `%operand` (a runtime lb -- the `lbBound`
-  // operand, resolved first so it leads the operand segments, matching the
-  // declared order lbBound, dynamicBound, stepBound) or an integer (a
-  // compile-time `lb`, default 0).
+  // Lower bound after `=`: an SSA `%operand` (the runtime `lbBound`, resolved
+  // first so it leads the operand segments in the declared order lbBound,
+  // dynamicBound, stepBound) or an integer (a compile-time `lb`, default 0).
   bool hasLb = false;
   {
     OpAsmParser::UnresolvedOperand lbOp;
@@ -835,10 +832,9 @@ ParseResult DCPathPipelineOp::parse(OpAsmParser &p, OperationState &result) {
   }
   if (p.parseKeyword("to"))
     return failure();
-  // Termination bound after `to`, three forms: `?` (a while loop, terminated by
-  // dcp.condition -- no trip, no bound); an SSA `%operand` (a runtime upper
-  // bound -- the `dynamicBound` operand); or an integer (a compile-time upper
-  // bound `ub`, from which the derived `trip` count is computed below).
+  // Termination bound after `to`: `?` for a while loop (no trip, no bound), an
+  // SSA `%operand` for a runtime upper bound (`dynamicBound`), or an integer
+  // upper bound `ub` from which the `trip` count below is derived.
   bool hasBound = false, hasUb = false;
   int64_t ub = 0;
   if (succeeded(p.parseOptionalQuestion())) {
@@ -858,9 +854,8 @@ ParseResult DCPathPipelineOp::parse(OpAsmParser &p, OperationState &result) {
     }
   }
   // Optional `step` (default 1): an SSA `%operand` (a runtime `stepBound`) or
-  // an integer. Recorded (with `lb`) as an attribute only when a compile-time
-  // non-default, so the common `lb=0`/`step=1` form round-trips to today's
-  // syntax.
+  // an integer. Recorded with `lb` as an attribute only when compile-time and
+  // non-default, so the common `lb=0`/`step=1` form round-trips unchanged.
   int64_t step = 1;
   bool hasStep = false;
   if (succeeded(p.parseOptionalKeyword("step"))) {
@@ -939,8 +934,8 @@ ParseResult DCPathPipelineOp::parse(OpAsmParser &p, OperationState &result) {
                         result.operands))
     return failure();
   // AttrSizedOperandSegments: the three optional bound operands (lbBound,
-  // dynamicBound, stepBound -- each 0 or 1) precede the inits in
-  // result.operands, resolved above in that declared order.
+  // dynamicBound, stepBound, each 0 or 1) precede the inits in result.operands,
+  // resolved above in that declared order.
   result.addAttribute(
       getOperandSegmentSizesAttrName(result.name),
       b.getDenseI32ArrayAttr({hasLb ? 1 : 0, hasBound ? 1 : 0, hasStep ? 1 : 0,
@@ -953,8 +948,8 @@ ParseResult DCPathPipelineOp::parse(OpAsmParser &p, OperationState &result) {
       p.parseOptionalAttrDict(result.attributes))
     return failure();
   // Default to an unconditional terminator when the body has none; a while
-  // pipeline prints its dcp.condition explicitly (the terminator is no longer
-  // implicit, so this replaces the SingleBlockImplicitTerminator hook).
+  // pipeline prints its dcp.condition explicitly. The terminator is not
+  // implicit, so this stands in for the SingleBlockImplicitTerminator hook.
   Block &blk = region->front();
   if (blk.empty() || !blk.back().hasTrait<OpTrait::IsTerminator>()) {
     OpBuilder tb = OpBuilder::atBlockEnd(&blk);
@@ -1046,7 +1041,7 @@ ParseResult DCPathSequentialOp::parse(OpAsmParser &p, OperationState &result) {
 
 // One branch of a dcp.select must end with a dcp.uncondition yielding one value
 // per select result. \p required rejects an empty branch (the then branch, and
-// the else branch when there are results -- a mux needs both sources).
+// the else branch when there are results, since a mux needs both sources).
 static LogicalResult verifySelectBranch(DCPathSelectOp op, Region &r,
                                         bool required, StringRef which) {
   if (r.empty()) {

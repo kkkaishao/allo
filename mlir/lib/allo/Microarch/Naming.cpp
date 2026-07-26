@@ -4,13 +4,13 @@
  */
 
 #include "allo/Microarch/Naming.h"
-#include "allo/Microarch/HWEmitter.h"      // externalBank (banked port set)
+#include "allo/Microarch/Datapath.h"       // externalBank
 #include "allo/Translation/EmitterState.h" // nameFromLoc, sanitizeCppIdentifier
 
-#include "circt/Dialect/SV/SVDialect.h" // sv::isNameValid (the SV keyword set)
-#include "circt/Dialect/Seq/SeqOps.h"   // seq::CompRegOp (the reg name channel)
+#include "circt/Dialect/SV/SVDialect.h" // sv::isNameValid
+#include "circt/Dialect/Seq/SeqOps.h"   // seq::CompRegOp
 
-#include "mlir/Dialect/Arith/IR/Arith.h" // arith::CmpFPredicate (IP module name)
+#include "mlir/Dialect/Arith/IR/Arith.h" // arith::CmpFPredicate
 
 using namespace mlir;
 using namespace mlir::allo;
@@ -117,61 +117,34 @@ std::string bankBase(llvm::StringRef base, unsigned bank) {
   return verilogName(join(base, kBank) + std::to_string(bank));
 }
 
-// The memory owners of a datapath, for the same-source-name tie-break.
-static llvm::SmallVector<Value> memRefs(const Datapath &dp) {
-  llvm::SmallVector<Value> vs;
-  for (const MemUnit &m : dp.mems)
-    vs.push_back(m.memref);
-  return vs;
-}
-
-std::string memPortBase(const Datapath &dp, llvm::ArrayRef<AccRef> ports,
-                        unsigned i, bool write) {
-  const MemUnit &mu = dp.mems[ports[i].mem];
-  // Which access of this argument this is: the group index is per (argument,
-  // role), so adding an access to another argument never renumbers it.
-  unsigned group = 0;
-  for (unsigned j = 0; j < i; ++j)
-    group += ports[j].mem == ports[i].mem;
-  return memBase(uniqueOwnerOf(mu.memref, memRefs(dp), memOwner(mu.id)), write,
-                 group);
-}
-
-std::string memBoundaryPortBase(const Datapath &dp, MemId mem, bool write,
-                                unsigned group) {
-  const MemUnit &mu = dp.mems[mem];
-  return memBase(uniqueOwnerOf(mu.memref, memRefs(dp), memOwner(mu.id)), write,
-                 group);
-}
-
 llvm::SmallVector<std::pair<unsigned, std::string>>
-extPorts(const Datapath &dp, llvm::ArrayRef<AccRef> ports, unsigned i,
-         bool write) {
-  const MemUnit &m = dp.mems[ports[i].mem];
-  ExternalBanking eb = externalBank(m, m.accesses[ports[i].idx]);
-  std::string base = memPortBase(dp, ports, i, write);
+extPorts(const MemUnit &m, const MemUnit::Access &acc) {
+  assert(!acc.portBase.empty() &&
+         "an access with no port base is not on the module boundary");
+  ExternalBanking eb = externalBank(m, acc);
   if (eb.factor == 1)
-    return {{0u, base}};
+    return {{0u, acc.portBase}};
   if (eb.bank)
-    return {{*eb.bank, base}}; // statically routed to one interface
+    return {{*eb.bank, acc.portBase}}; // statically routed to one interface
   // Data-dependent: one interface per bank (the crossbar drives every bank).
   llvm::SmallVector<std::pair<unsigned, std::string>> all;
   for (unsigned k = 0; k < eb.factor; ++k)
-    all.push_back({k, bankBase(base, k)});
+    all.push_back({k, bankBase(acc.portBase, k)});
   return all;
 }
 
 std::string streamPortBase(const Datapath &dp, const StreamChannel &s) {
+  assert(!s.internal && "a kernel-local channel has no boundary port to name");
   auto own = [](const StreamChannel &c) {
     return streamBase(ownerOf(c.stream, chanOwner(c.id)));
   };
   std::string base = own(s);
   // Count the siblings this name ties with. A tie gives two handshakes one set
   // of port names, which ExportVerilog uniquifies, desyncing the manifest and
-  // collapsing the by-name instance wiring.
+  // collapsing the by-name instance wiring. Only ported channels can tie.
   unsigned sameBase = 0, sameDir = 0;
   for (const StreamChannel &o : dp.streams) {
-    if (own(o) != base)
+    if (o.internal || own(o) != base)
       continue;
     ++sameBase;
     sameDir += o.isInput == s.isInput;
@@ -185,8 +158,7 @@ std::string streamPortBase(const Datapath &dp, const StreamChannel &s) {
 std::string scalarPortName(const Datapath &dp, const IOPort &io) {
   llvm::SmallVector<Value> siblings;
   for (const IOPort &o : dp.ios)
-    if (o.isInput)
-      siblings.push_back(o.value);
+    siblings.push_back(o.value); // every IOPort is a scalar input
   return scalarBase(
       uniqueOwnerOf(io.value, siblings, "s" + std::to_string(io.id)));
 }
@@ -201,11 +173,22 @@ std::string resultPortName(unsigned i, unsigned n) {
 // Internal cells.
 //===----------------------------------------------------------------------===//
 
-std::string memCellName(const Datapath &dp, const MemUnit &m, unsigned bank) {
+std::string memCellName(llvm::StringRef owner, unsigned numBanks,
+                        unsigned bank) {
   // The only name with no role suffix, so it escapes itself: a buffer named
   // `buf` collides with the Verilog gate primitive.
-  std::string base = uniqueOwnerOf(m.memref, memRefs(dp), memOwner(m.id));
-  return m.numBanks > 1 ? bankBase(base, bank) : verilogName(base);
+  return numBanks > 1 ? bankBase(owner, bank) : verilogName(owner);
+}
+
+std::string memCellName(const Datapath &dp, const MemUnit &m, unsigned bank) {
+  // The memrefs of the module are the sibling namespace the tie-break runs in;
+  // the boundary PORT names resolve the same owner once, in
+  // `enumerateBoundaryPorts`, but an internal memory has no port to carry it.
+  llvm::SmallVector<Value> siblings;
+  for (const MemUnit &o : dp.mems)
+    siblings.push_back(o.memref);
+  return memCellName(uniqueOwnerOf(m.memref, siblings, memOwner(m.id)),
+                     m.numBanks, bank);
 }
 
 std::string regionSignal(llvm::StringRef tag, llvm::StringRef sig) {
@@ -225,7 +208,7 @@ std::string survivorName(unsigned region, unsigned k) {
 }
 
 std::string unitInstanceName(const FuncUnit &u) {
-  std::string own = ownerOf(u.boundOps.front().first->getLoc(), "");
+  std::string own = ownerOf(u.repOp()->getLoc(), "");
   return verilogName(own.empty() ? unitOwner(u.id)
                                  : own + "_" + unitOwner(u.id));
 }
@@ -243,8 +226,7 @@ std::string operatorPredicate(const FuncUnit &u) {
   // by the reifier. Integer compare is combinational, so an IP compare is
   // always floating-point.
   if (auto pred =
-          u.boundOps.front().first->getAttrOfType<arith::CmpFPredicateAttr>(
-              "predicate"))
+          u.repOp()->getAttrOfType<arith::CmpFPredicateAttr>("predicate"))
     return arith::stringifyCmpFPredicate(pred.getValue()).str();
   return "";
 }

@@ -262,10 +262,9 @@ static FifoAlias compareFifo(AffineValueMapBuilder &builder, Operation *a,
       continue;
     }
     if (cst.getValue() != 0) {
-      // A nonzero constant offset that depends on an enclosing loop IV (e.g.
-      // `put fifo[i+1]` / `get fifo[i]`) means overlapping FIFO ranges across
-      // iterations: conservatively Unknown, so the pair is serialized (an
-      // IV-independent offset is a genuinely distinct fixed FIFO).
+      // A nonzero constant offset on an IV-dependent coordinate (`put
+      // fifo[i+1]` / `get fifo[i]`) overlaps FIFO ranges across iterations, so
+      // serialize. An IV-independent offset selects a genuinely distinct FIFO.
       if (coordDependsOnIV(ma, k))
         return FifoAlias::Unknown;
       return FifoAlias::Distinct;
@@ -276,6 +275,8 @@ static FifoAlias compareFifo(AffineValueMapBuilder &builder, Operation *a,
 
 // Build dependence components mirroring the op's enclosing loop nest, placing
 // `distance` on the innermost loop (the only component the scheduler reads).
+// Empty when no loop encloses `op`, and so unable to carry any distance: a
+// func-scope access runs once, in the straight-line span.
 static SmallVector<affine::DependenceComponent>
 streamDepComponents(Operation *op, int64_t distance) {
   SmallVector<affine::DependenceComponent> comps;
@@ -286,8 +287,8 @@ streamDepComponents(Operation *op, int64_t distance) {
     comp.ub = 0;
     comps.push_back(comp);
   }
-  assert(!comps.empty() && "stream op must be enclosed by a loop");
-  comps.back().lb = distance;
+  if (!comps.empty())
+    comps.back().lb = distance;
   return comps;
 }
 
@@ -298,12 +299,20 @@ streamDepComponents(Operation *op, int64_t distance) {
 // a distance-1 loop-carried back edge, closing the recurrence that bounds the
 // II. With the latency-1 stream operators the back edge yields exactly the
 // FIFO issue-order bound (II >= 1 + (t_later - t_earlier)), so this is
-// precise, not conservative. The all-pairs serialization is deliberate:
-// within a mutually-aliasing group the extra edges are implied by
-// transitivity (a chain would suffice) and leave the SDC optimum unchanged,
-// while the per-pair `Distinct` pruning keeps provably-separate FIFOs
-// independent: a plain program-order chain could not, since FIFO
-// may-aliasing is non-transitive.
+// precise, not conservative.
+//
+// This pair of edges is also what makes several accesses to one channel
+// emittable: they force distinct start cycles, spanning less than one II, in
+// program order. That is exactly the disjointness the emitter needs to
+// time-multiplex the channel's single {data,valid,ready} port across them, so
+// the k-access case needs no stream-port resource. The edges are strictly
+// stronger than a port limit, which would bound concurrency but not order.
+//
+// The all-pairs serialization is deliberate. Within a mutually-aliasing group
+// the extra edges are implied by transitivity (a chain would suffice) and leave
+// the SDC optimum unchanged, while the per-pair `Distinct` pruning keeps
+// provably-separate FIFOs independent. A plain program-order chain could not,
+// since FIFO may-aliasing is non-transitive.
 static void checkStreamDependence(SmallVectorImpl<Operation *> &streamOps,
                                   AffineValueMapBuilder &builder,
                                   MemoryDependenceResult &results) {
@@ -320,9 +329,10 @@ static void checkStreamDependence(SmallVectorImpl<Operation *> &streamOps,
         continue;
 
       // Only serialize accesses sharing the same innermost loop, so both ends
-      // of the edge land in a single scheduling problem.
+      // land in one scheduling problem. Two accesses with no enclosing loop
+      // share the function's straight-line span, which is one problem too.
       Operation *loop = getNearestLoop(earlier);
-      if (!loop || loop != getNearestLoop(later))
+      if (loop != getNearestLoop(later))
         continue;
 
       // Provably-distinct FIFOs are independent; same or unknown are ordered.
@@ -332,9 +342,13 @@ static void checkStreamDependence(SmallVectorImpl<Operation *> &streamOps,
       results[later].emplace_back(earlier,
                                   affine::DependenceResult::HasDependence,
                                   streamDepComponents(later, /*distance=*/0));
-      results[earlier].emplace_back(
-          later, affine::DependenceResult::HasDependence,
-          streamDepComponents(earlier, /*distance=*/1));
+      // The back edge needs a loop level to carry its distance. Outside any
+      // loop there are no iterations to overtake, so the forward edge alone is
+      // already exact.
+      if (loop)
+        results[earlier].emplace_back(
+            later, affine::DependenceResult::HasDependence,
+            streamDepComponents(earlier, /*distance=*/1));
     }
   }
 }
@@ -420,10 +434,9 @@ static void checkConservativeDependence(
       results[later].emplace_back(earlier,
                                   affine::DependenceResult::HasDependence,
                                   memDepComponents(later, /*distance=*/0));
-      // Loop-carried back edge when both share an innermost loop, closing a
-      // cyclic problem the recurrence bounds II on. An `allo.assume.nodep`
-      // hint (e.g. from a lowered grid()) can later prune this edge to recover
-      // II.
+      // Loop-carried back edge when both share an innermost loop, closing the
+      // recurrence that bounds II. An `allo.assume.nodep` hint can prune this
+      // edge to recover II.
       Operation *loop = getNearestLoop(earlier);
       if (loop && loop == getNearestLoop(later))
         results[earlier].emplace_back(
@@ -455,10 +468,9 @@ static Block *loopBodyForIV(Value iv) {
     return loop.getBody();
   if (auto loop = scf::getForInductionVarOwner(iv))
     return loop.getBody();
-  // `flatten-perfect-loops` coalesces a nest by rewriting each original iv to
-  // an `affine.apply` (floordiv/mod) of the surviving iv; trace back through it
-  // so a nodep scoped to a pre-coalescing iv still resolves to the coalesced
-  // loop.
+  // `flatten-perfect-loops` rewrites each original iv to an `affine.apply`
+  // (floordiv/mod) of the surviving iv. Trace back through it so a nodep scoped
+  // to a pre-coalescing iv still resolves to the coalesced loop.
   if (auto apply = iv.getDefiningOp<affine::AffineApplyOp>())
     for (Value operand : apply.getOperands())
       if (Block *body = loopBodyForIV(operand))
@@ -557,10 +569,9 @@ int64_t carriedDistanceAtLevel(ArrayRef<affine::DependenceComponent> comps,
     valid = false;
     return 0;
   }
-  // A `*`-direction component (lb == nullopt) is an UNKNOWN, unbounded
-  // distance, not 0, handled conservatively: an OUTER level drops the edge
-  // only on a PROVEN positive distance; THIS level falls back to 1 so the
-  // modulo solver never under-bounds II.
+  // A `*`-direction component (lb == nullopt) is an UNKNOWN distance, not 0.
+  // An OUTER level drops the edge only on a PROVEN positive distance; THIS
+  // level falls back to 1 so the modulo solver never under-bounds II.
   for (unsigned k = 0; k + 1 < level; ++k) // components outer to the level
     if (comps[k].lb.value_or(0) > 0) {
       drop = true;
@@ -573,10 +584,9 @@ int64_t carriedDistanceAtLevel(ArrayRef<affine::DependenceComponent> comps,
 DependenceAnalysis::DependenceAnalysis(func::FuncOp funcOp) : func(funcOp) {
   SmallVector<Operation *> memoryOps;
   SmallVector<Operation *> streamOps;
-  // All memref accesses in program (walk) order, plus the subset the
-  // polyhedral test cannot model (for the conservative fallback below): an
-  // access is outside that test if the op itself is non-affine or its loop nest
-  // is not all-affine (inAffineNest).
+  // All memref accesses in program (walk) order, plus the subset outside the
+  // polyhedral test: the op itself is non-affine, or its loop nest is not
+  // all-affine. That subset takes the conservative fallback below.
   SmallVector<Operation *> accessOps;
   llvm::SmallDenseSet<Operation *> nonPolyhedral;
   SmallVector<AssumeNoDepOp> noDepHints;
@@ -599,10 +609,8 @@ DependenceAnalysis::DependenceAnalysis(func::FuncOp funcOp) : func(funcOp) {
       collectAssumptions(hint.getCondition(), assumptions);
     } else if (auto mem = dyn_cast<MemoryEffectOpInterface>(op)) {
       // A memory read/write op none of the branches above model (memref.copy,
-      // memref.atomic_rmw, memref.dma_*) is added to no access list, so its
-      // dependence is silently dropped, free to reorder; the Allo frontend
-      // emits none of these into a scheduled region, so this fires only if one
-      // appears.
+      // atomic_rmw, dma_*) joins no access list, so its dependence would be
+      // silently dropped. The Allo frontend emits none into a scheduled region.
       assert((!mem.hasEffect<MemoryEffects::Read>() &&
               !mem.hasEffect<MemoryEffects::Write>()) &&
              "memory read/write op not modeled by dependence analysis "

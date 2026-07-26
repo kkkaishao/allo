@@ -78,8 +78,8 @@ resolve(Operation *op, ArrayRef<std::pair<unsigned, int64_t>> axes) {
 bool splitAlloc(Operation *alloc) {
   Value memref = alloc->getResult(0);
   PartitionInfo p = partitionOf(memref);
-  // Cyclic-only, refinable partition (block/complete fall back to the aggregate
-  // model in the scheduler too -- see MemoryBankModel::finalize).
+  // Cyclic-only, refinable partition; block/complete fall back to the
+  // aggregate model in the scheduler too (`MemoryBankModel::finalize`).
   if (p.unlimited || p.cyclicAxes.empty() || p.hasBlock)
     return false;
 
@@ -116,8 +116,8 @@ bool splitAlloc(Operation *alloc) {
                   .getOperation()
             : memref::AllocOp::create(b, alloc->getLoc(), bankType)
                   .getOperation();
-    // Carry every attribute except the partition (the bank *is* one physical
-    // memory now); keeps bind.storage / the buffer NameLoc for emit naming.
+    // Carry every attribute except the partition (a bank *is* one physical
+    // memory); keeps bind.storage / the buffer NameLoc for emit naming.
     for (NamedAttribute attr : alloc->getAttrs())
       if (attr.getName() != kPartitionAttr)
         bankAlloc->setAttr(attr.getName(), attr.getValue());

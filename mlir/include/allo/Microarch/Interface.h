@@ -7,7 +7,7 @@
 // The port-interface model: the single source of truth for a module's boundary
 // port *names*.
 //
-// Every hardware boundary of a kernel is one typed interface -- a `Stream`
+// Every hardware boundary of a kernel is one typed interface: a `Stream`
 // (FIFO handshake), a `Memory` (a read/write access to an argument array), a
 // `Scalar` input, or a `Result` output. Each interface owns the *concrete*
 // port-name strings the rest of the flow uses (`s_st_data`/`_valid`/`_ready`,
@@ -26,7 +26,7 @@
 #ifndef ALLO_MICROARCH_INTERFACE_H
 #define ALLO_MICROARCH_INTERFACE_H
 
-#include "allo/Microarch/HWEmitter.h" // uarch::Datapath + the naming vocabulary
+#include "allo/Microarch/Naming.h" // uarch::Datapath + the naming vocabulary
 
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/StringRef.h"
@@ -51,12 +51,24 @@ struct FIFO {
 /// argument is cyclically partitioned). A read exposes `{addr(out), data(in)}`;
 /// a write `{addr, data, we}` (all out, `we` empty for a read).
 struct Memory {
+  /// One partitioned axis of the argument, mirroring `allo::BankLayout::Axis`:
+  /// the host needs the same element-space decomposition the RTL addresses
+  /// with, which `bank`/`factor` alone cannot express (they give the bank's
+  /// identity and the total count, not how elements map onto it).
+  struct Axis {
+    int dim;
+    int64_t factor;
+    bool block;
+  };
   int arg;
   bool write;
-  int bank, factor; // cyclic bank this interface serves / the partition factor
+  int bank, factor; // the bank this interface serves / total physical banks
   unsigned width;   // element bit width
   unsigned latency; // access latency
   std::string base, addr, data, we;
+  std::vector<int64_t> shape; // the argument's element shape
+  std::vector<Axis> axes;     // partitioned axes, mixed-radix order (empty when
+                              // unbanked)
 };
 
 /// A scalar input argument (one port, no suffix).
@@ -110,9 +122,23 @@ struct ModuleInterface {
   std::vector<Operator> operators;
 
   ModuleInterface() = default;
-  ModuleInterface(const uarch::Datapath &dp,
-                  llvm::ArrayRef<uarch::AccRef> reads,
-                  llvm::ArrayRef<uarch::AccRef> writes);
+  /// Build the boundary from \p dp, whose `readPorts` / `writePorts` are the
+  /// one enumeration of its external memory accesses.
+  explicit ModuleInterface(const uarch::Datapath &dp);
+
+  /// Every memory interface of argument \p arg, reads before writes and flat
+  /// across access groups. An argument accessed at several points has several
+  /// port groups (read-twice -> two reads; an accumulator -> a read and a
+  /// write), and a cyclically partitioned access has one interface per bank
+  /// within its group; a caller wiring the argument needs all of them, which is
+  /// why this flattens rather than preserving the grouping.
+  llvm::SmallVector<const Memory *, 2> portsForArg(int arg) const;
+  /// The scalar input port of argument \p arg, or null if \p arg is not one.
+  const Scalar *scalarForArg(int arg) const;
+  /// The stream interface of argument \p arg, or null if \p arg is not one. A
+  /// stream argument is single-ended within a module (one `get` side or one
+  /// `put` side), so unlike a memory it has exactly one interface.
+  const FIFO *streamForArg(int arg) const;
 
   /// Serialize the model to a compact JSON object.
   std::string toJSON() const;

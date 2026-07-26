@@ -4,27 +4,27 @@
  */
 
 //===----------------------------------------------------------------------===//
-// The scheduler's reification step: lower the solved schedule -- carried
-// transiently as `allo.sched.*` attributes -- into `allo.dcp.*` ops, so the
-// post-schedule IR is closed over the dcp dialect (no affine/scf control flow
-// survives; only `arith` constant/index glue stays as intended mixed-IR).
+// The scheduler's reification step. It lowers the solved schedule, carried
+// transiently as `allo.sched.*` attributes, into `allo.dcp.*` ops, so the
+// post-schedule IR is closed over the dcp dialect: no affine/scf control flow
+// survives, and only `arith` constant/index glue stays as intended mixed-IR.
 //
-// `Reifier` walks a function's loop/region tree as ONE post-order recursion --
+// `Reifier` walks a function's loop/region tree as ONE post-order recursion,
 // the structural twin of the scheduler's `scheduleBlock` / `scheduleRegion`
-// descent (`materializeBlock` shares the same `enumerateRegions` partitioner,
+// descent. `materializeBlock` shares the same `enumerateRegions` partitioner,
 // and a region is materialized only after its body, so deepest-first ordering
-// falls out for free). Every control construct becomes a dcp region:
+// falls out for free. Every control construct becomes a dcp region:
 //   * counted `for`         -> `dcp.pipeline` (`dcp.uncondition` terminator)
 //   * `scf.while`           -> `dcp.pipeline` (`dcp.condition` terminator)
 //   * `affine.if` / `scf.if`-> `dcp.select`
 //   * straight-line span    -> `dcp.sequential`
 // `ii` present vs absent distinguishes pipelined (leaf / co-scheduled level /
 // flushing while) from sequential (imperfect wrapper / data-dependent while).
-// Registers / muxes / control are NOT ops -- they are derived at hw lowering.
+// Registers, muxes and control are NOT ops; they are derived at hw lowering.
 //
-// `materializeModuleToDCP` is the callable `allo-schedule` runs as its final
-// phase (module scope: `dcp.operator` declarations are module-level symbols);
-// the `allo-materialize-dcpath` pass is a thin standalone wrapper.
+// `materializeModuleToDCP` is the callable `allo-schedule` runs last, at module
+// scope because `dcp.operator` declarations are module-level symbols; the
+// `allo-materialize-dcpath` pass is a thin standalone wrapper.
 //===----------------------------------------------------------------------===//
 
 #include "allo/Scheduling/MaterializeDCPath.h"
@@ -70,26 +70,26 @@ static int64_t i64Attr(Operation *op, StringRef name) {
 }
 
 // An `i64` attribute for an optional value, or a null attribute (elided) when
-// absent -- the shape every optional dcp schedule attr
-// (`ii`/`length`/`latency`/ `start`/`trip`) is built with.
+// absent. Every optional dcp schedule attr (`ii`, `length`, `latency`,
+// `start`, `trip`) is built with this shape.
 static IntegerAttr optI64Attr(Builder &b, std::optional<int64_t> v) {
   return v ? b.getI64IntegerAttr(*v) : IntegerAttr();
 }
 
-// A `#allo.determinacy<...>` attribute -- the declared controller-regime
-// discriminant a region / kernel carries so consumers read it instead of
+// A `#allo.determinacy<...>` attribute: the declared controller-regime
+// discriminant a region or kernel carries so consumers read it instead of
 // re-deriving it.
 static DeterminacyEnumAttr determinacyAttr(Builder &b, DeterminacyEnum d) {
   return DeterminacyEnumAttr::get(b.getContext(), d);
 }
 
 // Whether \p v is a *pure* combinational arith tree over block args (the region
-// counter / iter-args) and constants -- the shape that can be lifted into
+// counter and iter-args) and constants, the shape that can be lifted into
 // start-0 `dcp.compute`s. A leaf that is a memory load, an IP result, or an
-// already-scheduled op (a stage-carrying producer) makes the tree impure: a
-// memory-/IP-dependent condition, which is left raw so the datapath builder
-// never derives a (negative-depth) edge for it and `validateDatapath` rejects
-// it cleanly.
+// already-scheduled op (a stage-carrying producer) makes the tree impure. Such
+// a memory- or IP-dependent condition is left raw so the datapath builder never
+// derives a negative-depth edge for it and `validateDatapath` rejects it
+// cleanly.
 static bool isPureCombCondition(Value v) {
   if (isa<BlockArgument>(v))
     return true;
@@ -98,9 +98,9 @@ static bool isPureCombCondition(Value v) {
     return false;
   if (isa<arith::ConstantOp>(def))
     return true;
-  // A dcp region result is a settled survivor -- latched when the region
-  // completes, stable at the guard's start -- so it is a valid leaf of the tree
-  // (the DFS stops here), exactly like a block argument.
+  // A dcp region result is a settled survivor, latched when the region
+  // completes and stable at the guard's start, so the DFS stops here: it is a
+  // valid tree leaf exactly like a block argument.
   if (isa<DCPathPipelineOp, DCPathSequentialOp, DCPathSelectOp>(def))
     return true;
   if (!isa<arith::ArithDialect>(def->getDialect()) ||
@@ -117,34 +117,34 @@ static void tagConditionStartZero(Builder &b, Value v) {
   if (!def || isa<arith::ConstantOp>(def) ||
       isa<DCPathPipelineOp, DCPathSequentialOp, DCPathSelectOp>(def) ||
       def->hasAttr(sched::kStartTimeAttr))
-    return; // stop at a settled survivor (a region result) -- do not tag it
+    return; // stop at a settled survivor (a region result); do not tag it
   def->setAttr(sched::kStartTimeAttr, b.getI64IntegerAttr(0));
   for (Value o : def->getOperands())
     tagConditionStartZero(b, o);
 }
 
-// Lift the predicate / continue-condition \p cond into start-0 `dcp.compute`s
+// Lift the predicate or continue-condition \p cond into start-0 `dcp.compute`s
 // (via `convertOp`), so it becomes a combinational unit the datapath `src`
 // resolves rather than a raw arith tree the emitter re-interprets. Only a
 // *pure* comb tree is lifted: a straight-line leaf while (already solved as one
-// cyclic problem) keeps its real starts, and a memory-/IP-dependent condition
-// stays raw for a clean reject. So only the two unscheduled pure shapes -- an
-// affine.if guard predicate over the counter, a sequential-wrapper while
-// condition over the iter-args -- become first-class Sources.
+// cyclic problem) keeps its real starts, and a memory- or IP-dependent
+// condition stays raw for a clean reject. Only the two unscheduled pure shapes
+// become first-class Sources: an affine.if guard predicate over the counter,
+// and a sequential-wrapper while condition over the iter-args.
 static void scheduleConditionTree(Builder &b, Value cond) {
   if (isPureCombCondition(cond))
     tagConditionStartZero(b, cond);
 }
 
-// The ASAP ready cycle of a while continue-condition \p v -- the cycle its
-// settled value is available -- over the cone of loads + arith feeding it. A
-// leaf (block arg / constant / a settled dcp region result) is ready at 0; an
+// The ASAP ready cycle of a while continue-condition \p v, the cycle its
+// settled value is available, over the cone of loads and arith feeding it. A
+// leaf (block arg, constant, or a settled dcp region result) is ready at 0; an
 // already-scheduled op (a flushing leaf while's in-body condition) is trusted
-// verbatim; a load's ready cycle is its indices' ready max + the memref's read
-// latency; an arith op's is its operands' ready max + its op latency. Returns
-// nullopt when the cone holds a shape the sequential CHECK region cannot emit
-// (a store / call / other), so the caller leaves the condition raw for a clean
-// reject. Pure query -- tags nothing.
+// verbatim; a load's ready cycle is its indices' ready max plus the memref's
+// read latency; an arith op's is its operands' ready max plus its op latency.
+// Returns nullopt when the cone holds a shape the sequential CHECK region
+// cannot emit (a store, a call, anything else), so the caller leaves the
+// condition raw for a clean reject. This is a pure query and tags nothing.
 static std::optional<int64_t> conditionReadyCycle(Value v,
                                                   const OperatorLibrary &lib) {
   if (isa<BlockArgument>(v))
@@ -177,9 +177,9 @@ static std::optional<int64_t> conditionReadyCycle(Value v,
 // Tag each op of the (schedulable) condition cone \p v with an ASAP
 // `kStartTimeAttr` = max(operand ready cycles). So `convertOp` reifies the load
 // at start 0 (its data landing `latency` cycles later) and the compare at start
-// >= that ready cycle: the datapath then derives a non-negative -- here exactly
-// zero -- register depth for the load->compare edge (the emitter reads the
-// stable readData combinationally). Precondition: conditionReadyCycle(v) is
+// >= that ready cycle: the datapath then derives a non-negative register depth,
+// here exactly zero, for the load->compare edge, because the emitter reads the
+// stable readData combinationally. Precondition: conditionReadyCycle(v) is
 // non-null. An already-scheduled op is left untouched.
 static int64_t tagConditionCone(Builder &b, Value v,
                                 const OperatorLibrary &lib) {
@@ -201,16 +201,16 @@ static int64_t tagConditionCone(Builder &b, Value v,
 }
 
 // Schedule a while's continue-condition so it becomes a resolvable Source, by
-// ASAP-scheduling its cone (each op at the max of its operands' ready cycles):
-// a pure comb tree collapses to all-start-0 (every latency is 0, e.g. a
-// nested-loop / sequential-wrapper while over the iter-args); a memory-/IP-
-// dependent tree gets real per-op starts (a load / float op before the compare)
-// so the sequential CHECK/RUN controller can wait `t_cond` for it -- and a
-// multi-latency cone (`a - b > tol`) then derives non-negative register depths
-// rather than the negative edge a flat start-0 tag would. An unschedulable tree
-// (a store / call / math IP with no library row) stays raw for a clean reject;
-// a flushing leaf while's in-body condition is already scheduled and passes
-// through unchanged.
+// ASAP-scheduling its cone (each op at the max of its operands' ready cycles).
+// A pure comb tree collapses to all-start-0 (every latency is 0, e.g. a
+// nested-loop or sequential-wrapper while over the iter-args). A memory- or
+// IP-dependent tree gets real per-op starts (a load or float op before the
+// compare) so the sequential CHECK/RUN controller can wait `t_cond` for it, and
+// a multi-latency cone (`a - b > tol`) then derives non-negative register
+// depths rather than the negative edge a flat start-0 tag would. An
+// unschedulable tree (a store, a call, a math IP with no library row) stays raw
+// for a clean reject; a flushing leaf while's in-body condition is already
+// scheduled and passes through unchanged.
 static void scheduleWhileCondition(Builder &b, Value cond,
                                    const OperatorLibrary &lib) {
   if (conditionReadyCycle(cond, lib))
@@ -218,54 +218,18 @@ static void scheduleWhileCondition(Builder &b, Value cond,
 }
 
 //===----------------------------------------------------------------------===//
-// Per-op conversion. The `dcp.operator` symbols are already injected (from the
-// device model), so the reifier only *references* them (the compute IP path) or
-// characterizes an op as combinational / a memory access via the passed-in
-// `OperatorLibrary` -- it never materializes an operator.
+// Per-op conversion. The `dcp.operator` symbols are already injected from the
+// device model, so the reifier only *references* them (the compute IP path) or
+// characterizes an op as combinational or as a memory access via the passed-in
+// `OperatorLibrary`. It never materializes an operator.
 //===----------------------------------------------------------------------===//
 
-// Forward decls: `convertOp` reifies a sync call straight to a `dcp.instance`;
-// the invoke builder + operand-legality check are defined further down with the
-// rest of the call machinery.
+// Forward decl: `convertOp` reifies EVERY call to a `dcp.instance`; the invoke
+// builder is defined further down with the rest of the call machinery.
 static DCPathInstanceOp makeInvoke(OpBuilder &b, Location loc,
                                    TypeRange resultTypes, ValueRange operands,
                                    FlatSymbolRefAttr calleeAttr, Operation *at,
                                    int64_t start);
-static bool callLowerable(func::CallOp call);
-
-// Whether \p func composes its children on the STRUCTURAL TOP rather than the
-// leaf: it has an `await` spawn (async), OR it wires children through a stream
-// -- a plain KPN-style `func.call` whose operand is a `Stream` (a latency-
-// insensitive prod/cons pair, concurrent even without `await`; `callLowerable`
-// is false for the un-modellable stream operand). Such a container keeps ALL
-// its calls as `func.call`s for the structural top's FIFO / process
-// composition; a pure memref/scalar sync composition reifies each call to a
-// leaf CallUnit. A call the leaf cannot model (the `callLowerable` gate) thus
-// routes its whole container to the structural top rather than the leaf.
-static bool composesOnStructuralTop(func::FuncOp func) {
-  bool structural = false;
-  func.walk([&](func::CallOp c) {
-    if (c->hasAttr(kAlloAsyncAttr) || !callLowerable(c))
-      structural = true;
-  });
-  return structural;
-}
-
-// Whether a sync (non-async) call reifies to a `dcp.instance` -- a
-// leaf-datapath CallUnit node -- rather than staying a `func.call`. A call
-// becomes an invoke exactly when its container does NOT compose on the
-// structural top: such a container lowers to the leaf, which models every call
-// as a CallUnit. In a structural container (async `await` spawns and/or
-// stream-wired KPN calls) every child stays a `func.call` for the structural
-// top -- the async spawns, the occasional disjoint sync child (a plain kernel
-// reading a dataflow network's output), and the stream-composed calls alike.
-// This is a per-container decision, keyed off the same `determinacy !=
-// Concurrent` discriminant the emitter's router uses.
-static bool syncCallReifiesToInvoke(func::CallOp call) {
-  if (call->hasAttr(kAlloAsyncAttr))
-    return false;
-  return !composesOnStructuralTop(call->getParentOfType<func::FuncOp>());
-}
 
 // Convert \p op (an op of the scheduled loop body) into its `dcp` equivalent in
 // the pipeline block \p b is inserting into, mapping its results in \p map. Ops
@@ -344,39 +308,30 @@ static void convertOp(Operation &op, OpBuilder &b, IRMapping &map,
     cloneKept();
     return;
   }
-  // An internal-buffer allocation is a declaration; a `memref.get_global` is a
-  // reference to a module-level constant table (a ROM the datapath builder
-  // materializes from the global's initializer), kept verbatim so the loads
-  // that read it still resolve their memref.
+  // A buffer allocation is a declaration; a `memref.get_global` references a
+  // module-level constant table (a ROM built from the global's initializer).
+  // Both stay verbatim so loads that read them still resolve their memref.
   if (isa<memref::AllocOp, memref::AllocaOp, memref::GetGlobalOp,
           StreamCreateOp>(&op)) {
     cloneKept();
     return;
   }
-  // A sync sub-kernel call in a non-concurrent container reifies straight to a
-  // `dcp.instance` (the leaf CallUnit node), preempting the generic
-  // single-result arm below so a scalar-returning call is an invoke too. An
-  // async spawn / a concurrent container's sync child stays a `func.call`
-  // (cloneKept) for the structural top.
+  // EVERY sub-kernel call reifies to a `dcp.instance`, the call node the
+  // datapath models as a `CallUnit`, so a scalar-returning call is an invoke
+  // too. An `await` spawn differs only in start policy and rides `allo.async`.
   if (auto call = dyn_cast<func::CallOp>(&op)) {
-    if (syncCallReifiesToInvoke(call)) {
-      assert(callLowerable(call) &&
-             "a leaf-bound sync call must take only memref/scalar operands and "
-             "return scalars (a stream / other operand is not a CallUnit)");
-      auto inv =
-          makeInvoke(b, loc, call.getResultTypes(), remap(call.getOperands()),
-                     call.getCalleeAttr(), &op, start);
-      for (auto [old, nw] : llvm::zip(call.getResults(), inv.getResults()))
-        map.map(old, nw);
-      return;
-    }
-    cloneKept();
+    auto inv =
+        makeInvoke(b, loc, call.getResultTypes(), remap(call.getOperands()),
+                   call.getCalleeAttr(), &op, start);
+    if (call->hasAttr(kAlloAsyncAttr))
+      inv->setAttr(kAlloAsyncAttr, b.getUnitAttr());
+    for (auto [old, nw] : llvm::zip(call.getResults(), inv.getResults()))
+      map.map(old, nw);
     return;
   }
-  // A scheduled single-result op (not a constant) is a compute op. Its
-  // realization is one of two exclusive paths: a combinational op (native comb
-  // lowering) carries a `comb_kind`; an IP op references its injected
-  // `dcp.operator` via `op_type`.
+  // A scheduled single-result op (not a constant) is a compute op, realized on
+  // one of two exclusive paths: a combinational op carries a `comb_kind`; an IP
+  // op references its injected `dcp.operator` via `op_type`.
   if (op.getNumResults() == 1 && op.hasAttr(sched::kStartTimeAttr) &&
       !isa<arith::ConstantOp>(op)) {
     OperatorChar c = lib.lookup(&op);
@@ -413,9 +368,10 @@ static void convertOp(Operation &op, OpBuilder &b, IRMapping &map,
 
 namespace {
 // The schedule numbers of one region, read from its `allo.sched.regions`
-// descriptor (all optional -- absent = "data-dependent / not applicable"). The
-// reifier reads these onto the dcp op; the region *kind* is not stored (the
-// recursion dispatches on the anchor op type, not on the descriptor).
+// descriptor. All are optional, and absent means data-dependent or not
+// applicable. The reifier reads these onto the dcp op; the region *kind* is not
+// stored, since the recursion dispatches on the anchor op type rather than on
+// the descriptor.
 struct RegionInfo {
   std::optional<int64_t> ii;
   std::optional<int64_t> length;
@@ -505,9 +461,9 @@ static std::optional<int64_t> optI64(Operation *op, StringRef name) {
 // One full run of an already-materialized child region (its per-invocation
 // latency), used to size a sequential wrapper's II. A `dcp.sequential` runs
 // once (its `length`); a counted `dcp.pipeline` runs `length + (trip-1)*ii`; a
-// while pipeline or a `dcp.select` guard is data-dependent (nullopt -- so a
-// wrapper enclosing one has no static II); anything else (arith glue) is
-// latency 0. nullopt if a child's own trip/length is unknown.
+// while pipeline or a `dcp.select` guard is data-dependent and returns nullopt,
+// so a wrapper enclosing one has no static II; anything else (arith glue) is
+// latency 0. Also nullopt if a child's own trip or length is unknown.
 static std::optional<int64_t> perInvocationLatency(Operation *op) {
   if (isa<DCPathSelectOp>(op))
     return std::nullopt;
@@ -583,9 +539,9 @@ static std::optional<int64_t> constantIndexThroughRegions(Value v) {
 // The lower bound and step of a counted loop, carried onto the dcp.pipeline so
 // the induction register holds the real IV (`lb`, `lb+step`, ...). Each is a
 // compile-time constant when statically known (folded through any prologue
-// region), else the runtime SSA `index` value (an scf.for data-dependent
-// bound) -- e.g. a constant `lb` with a dynamic ub (`for i in range(1, n)`), or
-// a genuinely runtime lb/step (`for i in range(m, n)` with `m` loaded). An
+// region), else the runtime SSA `index` value of an scf.for data-dependent
+// bound: a constant `lb` with a dynamic ub (`for i in range(1, n)`), or a
+// genuinely runtime lb/step (`for i in range(m, n)` with `m` loaded). An
 // affine.for with a non-constant (symbolic) lb defaults to 0 (unhandled).
 namespace {
 struct LoopBounds {
@@ -620,16 +576,16 @@ static Value dynamicTripBound(LoopLikeOpInterface loop) {
   return scfLoop ? scfLoop.getUpperBound() : Value();
 }
 
-// Materialize an affine.for bound -- the max of the lower-bound map's results,
-// the min of the upper-bound map's -- as an `index` value at `b`'s insertion
-// point (before the loop), reading the enclosing IVs. An identity map yields
-// the enclosing IV directly (no op) -- it resolves as that loop's
-// Source::Counter once the enclosing loop is reified; a non-trivial expression
-// synthesizes arith ops tagged `start=0`, so `convertOp` lifts them to
-// combinational `dcp.compute` units (also resolvable bound Sources, their IV
-// reads remapped to the enclosing counter). The affine counterpart of an
-// scf.for's runtime bound operand, for a symbolic (IV-relative) triangular/tile
-// bound (`for j in range(i+1, n)`).
+// Materialize an affine.for bound as an `index` value at `b`'s insertion point
+// (before the loop), reading the enclosing IVs: the max of the lower-bound
+// map's results, the min of the upper-bound map's. An identity map yields the
+// enclosing IV directly with no op, resolving as that loop's Source::Counter
+// once the enclosing loop is reified. A non-trivial expression synthesizes
+// arith ops tagged `start=0`, so `convertOp` lifts them to combinational
+// `dcp.compute` units, also resolvable bound Sources with their IV reads
+// remapped to the enclosing counter. This is the affine counterpart of an
+// scf.for's runtime bound operand, for a symbolic (IV-relative) triangular or
+// tile bound (`for j in range(i+1, n)`).
 static Value materializeAffineBound(OpBuilder &b, Location loc, AffineForOp af,
                                     bool isLower) {
   AffineMap map = isLower ? af.getLowerBoundMap() : af.getUpperBoundMap();
@@ -668,13 +624,13 @@ static Block *createCounterBlock(OpBuilder &b, DCPathPipelineOp pipe,
   return b.createBlock(&pipe.getBody(), {}, argTypes, argLocs);
 }
 
-// Rewrite an `scf.while` into a while `dcp.pipeline` -- `trip` unset,
-// terminated by `dcp.condition` (the condition value + the loop-carried
-// next-values). A straight-line while flushing-pipelines (`ii` from its
-// descriptor); a nested-loop while runs sequentially (empty descriptor -> `ii`
-// unset), its after-block already materialized so its dcp children clone in
-// verbatim. Both the before-arg and after-arg of a slot map to the same
-// iter-arg (identity forwarding, required); the counter block-arg is a
+// Rewrite an `scf.while` into a while `dcp.pipeline`: `trip` unset, terminated
+// by `dcp.condition` carrying the condition value plus the loop-carried
+// next-values. A straight-line while flushing-pipelines with `ii` from its
+// descriptor; a nested-loop while runs sequentially (empty descriptor leaves
+// `ii` unset), its after-block already materialized so its dcp children clone
+// in verbatim. Both the before-arg and after-arg of a slot map to the same
+// iter-arg (identity forwarding is required); the counter block-arg is a
 // free-running index.
 static void materializeWhilePipeline(const RegionInfo &r, scf::WhileOp w,
                                      const OperatorLibrary &lib) {
@@ -703,13 +659,9 @@ static void materializeWhilePipeline(const RegionInfo &r, scf::WhileOp w,
     map.map(after.getArgument(j), blk->getArgument(j + 1));
   }
 
-  // A sequential-wrapper while's before-block condition is unscheduled (only
-  // its after-block children were materialized): schedule its cone so it
-  // becomes a Source::Unit. A pure comb condition (over the iter-args) lifts to
-  // start-0 computes; a memory-/IP-dependent condition is ASAP-scheduled (load
-  // before compare) so the sequential CHECK/RUN controller can wait `t_cond`
-  // for it. A leaf while's before-block ops carry real starts and pass through
-  // unchanged.
+  // A sequential-wrapper while's before-block condition is unscheduled, so
+  // schedule its cone into a Source::Unit; a leaf while's before-block ops
+  // already carry real starts and pass through unchanged.
   scheduleWhileCondition(b, w.getConditionOp().getCondition(), lib);
 
   b.setInsertionPointToEnd(blk);
@@ -729,10 +681,10 @@ static void materializeWhilePipeline(const RegionInfo &r, scf::WhileOp w,
   w.erase();
 }
 
-// Rewrite one counted loop (affine.for or scf.for) into a dcp.pipeline: convert
-// its body ops (an already-materialized child `dcp.pipeline`/`dcp.sequential`
-// -- of a co-scheduled level, or of an imperfect wrapper -- is cloned
-// verbatim). The trip count is recorded only when it is a compile-time
+// Rewrite one counted loop (affine.for or scf.for) into a dcp.pipeline by
+// converting its body ops. An already-materialized child `dcp.pipeline` or
+// `dcp.sequential`, from a co-scheduled level or an imperfect wrapper, is
+// cloned verbatim. The trip count is recorded only when it is a compile-time
 // constant.
 static void materializeLoopToPipeline(const RegionInfo &r,
                                       LoopLikeOpInterface loop,
@@ -741,22 +693,17 @@ static void materializeLoopToPipeline(const RegionInfo &r,
   OpBuilder b(loopOp);
   Location loc = loop.getLoc();
 
-  // A child of a co-scheduled level starts at its scheduled offset within the
-  // level's II (`parentStart`). Otherwise the absolute start cycle is
-  // meaningful only at the top level, where regions compose in program order; a
-  // plain loop-nested pipeline starts at a different cycle each outer iteration
-  // (left unset).
+  // A child of a co-scheduled level starts at its offset within the level's II
+  // (`parentStart`). Otherwise an absolute start is meaningful only at the top
+  // level; a loop-nested pipeline starts at a different cycle each iteration.
   IntegerAttr startA = optI64Attr(b, r.parentStart);
   if (!startA && isa<func::FuncOp>(loopOp->getParentOp()))
     startA = optI64Attr(b, r.absStart);
 
   ValueRange inits = loop.getInits();
-  // A runtime (data-dependent) trip: the count is not a compile-time constant,
-  // so wire the loop's upper bound as the `dynamicBound` operand (the 0-based
-  // iteration count for the reifier's `lb=0`/`step=1` counter). Only an scf.for
-  // has a runtime bound (a memory-loaded / non-affine ub); affine bounds are
-  // constant/affine-symbol. Restricted to the lb=0/step=1 form the 0-based
-  // counter assumes; a general dynamic lb/step is left for the enclosing pass.
+  // A trip that is not a compile-time constant wires the loop's upper bound as
+  // the `dynamicBound` operand. Only an scf.for has a runtime (memory-loaded,
+  // non-affine) ub; affine bounds are constant or affine-symbol.
   Value dynamicBound;
   if (!constantTripOf(loop)) {
     if (auto af = dyn_cast<AffineForOp>(loopOp))
@@ -764,14 +711,13 @@ static void materializeLoopToPipeline(const RegionInfo &r,
     else
       dynamicBound = dynamicTripBound(loop);
   }
-  // Carry the source loop's lb/step so the emitter's induction register runs
-  // the real IV -- correct for a `lb != 0` / `step != 1` loop even when the ub
-  // is a runtime bound. Each rides an attribute (elided when the default 0/1)
-  // if compile-time, else an operand (a runtime range start / stride).
+  // Carry the source loop's lb/step so the induction register runs the real IV,
+  // correct for `lb != 0` or `step != 1` even under a runtime ub. Each rides an
+  // attribute when compile-time (elided at the default 0/1), else an operand.
   LoopBounds bounds = lbStepOf(loop);
-  // An affine.for with a symbolic (IV-relative) lower bound -- e.g. `for j in
-  // range(i+1, n)` after a guard folds into the bound -- materializes as a
-  // runtime lb operand (lbStepOf defaulted the symbolic lb to 0).
+  // An affine.for with a symbolic (IV-relative) lower bound, e.g. `for j in
+  // range(i+1, n)` after a guard folds into it, materializes as a runtime lb
+  // operand; lbStepOf defaulted that symbolic lb to 0.
   if (auto af = dyn_cast<AffineForOp>(loopOp))
     if (!af.hasConstantLowerBound())
       bounds.lbVal = materializeAffineBound(b, loc, af, /*isLower=*/true);
@@ -818,8 +764,8 @@ static void materializeLoopToPipeline(const RegionInfo &r,
 }
 
 // Rewrite a straight-line (acyclic) region into a dcp.sequential. A region of
-// only declarations is left in place (sourced directly by identity, like a
-// loop-invariant tie-off / func-arg memref), so it forms no region and threads
+// only declarations is left in place, sourced directly by identity like a
+// loop-invariant tie-off or func-arg memref, so it forms no region and threads
 // no cross-region SSA result; anything else is wrapped, with values used after
 // the region yielded as sequential results.
 static void materializeSequential(const RegionInfo &r,
@@ -834,16 +780,9 @@ static void materializeSequential(const RegionInfo &r,
     if (!op->hasTrait<OpTrait::IsTerminator>())
       body.push_back(op);
 
-  // In a container (a func with sub-kernel calls), a static `memref.alloc` a
-  // *later* region reads -- most importantly a buffer a downstream call takes
-  // -- must not be wrapped into this dcp.sequential, or it becomes a
-  // cross-region *survivor* (a `dcp` result) the consumer's operand then points
-  // at: a memref is not a datapath value to latch, and the leaf CallUnit path
-  // needs the shared buffer to stay an identity-sourced func-level value (a
-  // plain MemUnit), exactly as the all-declarations span below is left in
-  // place. So hoist an escaping alloc to func level and wrap only the real
-  // work. (Leaves are unaffected -- their allocs already sit in all-declaration
-  // spans left in place.)
+  // In a container, a static `memref.alloc` that a later region reads must stay
+  // at func level: a memref is not a datapath value to latch, and the CallUnit
+  // path needs the shared buffer identity-sourced. Hoist it out of the wrap.
   llvm::SmallPtrSet<Operation *, 8> inBody(body.begin(), body.end());
   auto escapesBody = [&](Operation *op) {
     return llvm::any_of(op->getResults(), [&](Value res) {
@@ -855,7 +794,7 @@ static void materializeSequential(const RegionInfo &r,
   for (Operation *op : body) {
     if (container && isa<memref::AllocOp, memref::AllocaOp>(op) &&
         op->getNumOperands() == 0 && escapesBody(op))
-      hoisted.push_back(op); // leave at func level -- do not wrap or erase
+      hoisted.push_back(op); // leave at func level, do not wrap or erase
     else
       work.push_back(op);
   }
@@ -910,6 +849,24 @@ static int64_t regionBoundaryCost(Operation *regionOp) {
   return regionOp->getNumResults() > 0 ? 1 : 0;
 }
 
+// Stamp `latency` on every reified region, then the whole-kernel `dcp.latency`.
+//
+// The kernel's span is the MAX of two numbers. The first is the sum of the
+// top-level regions, which run in program order. The second is a FLOOR set by
+// the sub-kernels a container composes: the last child's completion, i.e. the
+// max over calls of (the call's scheduled `start` + the callee's whole-kernel
+// latency). Those `start` offsets encode the composition, so one rule covers
+// both shapes: a serial chain's staggered starts give the sum of child
+// latencies, concurrent dataflow's all-zero starts the max.
+//
+// The call floor is only a floor, because the walk sees a call once however
+// deeply it is nested: a call inside a loop counts one invocation, and a plain
+// loop region beside the calls is invisible to it. A caller places its own ops
+// at static offsets off this number, so an undercount is a miscompile.
+//
+// Every child is a `dcp.instance` carrying its own `start` and `latency`,
+// whichever way its container composes; what makes a container CONCURRENT is
+// asked of the invokes directly via `spawnsConcurrently`.
 static void setDcpLatencies(func::FuncOp func) {
   Builder b(func.getContext());
   func.walk([&](Operation *op) {
@@ -918,63 +875,8 @@ static void setDcpLatencies(func::FuncOp func) {
         op->setAttr("latency", b.getI64IntegerAttr(*sr));
   });
 
-  // A container that composes sub-kernels has whole-kernel latency = its LAST
-  // child's completion: max over calls of (the call's scheduled `start` + the
-  // callee's whole-kernel latency), not the straight-line region depth
-  // (`perInvocationLatency` counts only to a call's start). The `start` offsets
-  // encode the composition -- a serial chain's staggered starts give the sum of
-  // child latencies, concurrent dataflow's all-zero starts give the max child
-  // -- so one rule covers both. A leaf-composed sync child is a `dcp.instance`
-  // carrying its own `start` + `latency`; a structural child stays a
-  // `func.call` (async spawn or stream-wired KPN call) whose latency is read
-  // off the callee
-  // (`dcp.latency` when already reified, else the `allo.sched.latency`
-  // carrier). A surviving `func.call` therefore marks a structural (concurrent)
-  // container. Unknown latency if any child is data-dependent.
-  {
-    bool container = false, allKnown = true, structural = false;
-    int64_t composed = 0;
-    auto account = [&](int64_t start, std::optional<int64_t> cl,
-                       bool isStructural) {
-      container = true;
-      structural |= isStructural;
-      if (!cl)
-        allKnown = false;
-      else
-        composed = std::max(composed, start + *cl);
-    };
-    func.walk([&](DCPathInstanceOp inv) {
-      account(optI64(inv, "start").value_or(0), optI64(inv, "latency"),
-              /*isStructural=*/false);
-    });
-    func.walk([&](func::CallOp call) {
-      auto callee = dyn_cast_or_null<func::FuncOp>(
-          SymbolTable::lookupNearestSymbolFrom(call, call.getCalleeAttr()));
-      std::optional<int64_t> cl;
-      if (callee) {
-        cl = optI64(callee, "dcp.latency");
-        if (!cl)
-          cl = optI64(callee, sched::kLatencyAttr);
-      }
-      account(optI64(call, "start").value_or(0), cl, /*isStructural=*/true);
-    });
-    if (container) {
-      if (allKnown)
-        func->setAttr("dcp.latency", b.getI64IntegerAttr(composed));
-      // A structural container (an `await` spawn or a stream-wired plain call
-      // survived as a `func.call`) is `concurrent` -> structural top; an
-      // all-`dcp.instance` sequential composition is `counted_static` (exact)
-      // or `indeterminate` (a data-dependent child) -> leaf. This is the
-      // composition-layer determinacy the caller and the emitter's router read.
-      func->setAttr("dcp.determinacy",
-                    determinacyAttr(b, structural ? DeterminacyEnum::Concurrent
-                                       : allKnown
-                                           ? DeterminacyEnum::CountedStatic
-                                           : DeterminacyEnum::Indeterminate));
-      return;
-    }
-  }
-
+  // Top-level regions run in program order, each handing off through a boundary
+  // register when it yields, so the kernel's span is their sum.
   int64_t total = 0;
   bool known = true, bounded = false;
   for (Operation &op : func.getBody().front()) {
@@ -988,23 +890,67 @@ static void setDcpLatencies(func::FuncOp func) {
     total += lat.getInt() + regionBoundaryCost(&op);
     bounded |= op.hasAttr("latency_bound");
   }
+
+  // The call floor: unknown if any child is data-dependent.
+  {
+    bool container = false, allKnown = true, structural = false;
+    int64_t composed = 0;
+    func.walk([&](DCPathInstanceOp inv) {
+      container = true;
+      structural |= spawnsConcurrently(inv);
+      std::optional<int64_t> cl = optI64(inv, "latency");
+      if (!cl)
+        allKnown = false;
+      else
+        composed = std::max(composed, optI64(inv, "start").value_or(0) + *cl);
+    });
+    if (container) {
+      if (allKnown)
+        func->setAttr(
+            "dcp.latency",
+            b.getI64IntegerAttr(known ? std::max(composed, total) : composed));
+      // A container holding an `await` spawn or a stream-wired child is
+      // `concurrent` and gets a structural top; a purely scheduled composition
+      // is `counted_static` or `indeterminate` and stays a leaf.
+      func->setAttr("dcp.determinacy",
+                    determinacyAttr(b, structural ? DeterminacyEnum::Concurrent
+                                       : allKnown
+                                           ? DeterminacyEnum::CountedStatic
+                                           : DeterminacyEnum::Indeterminate));
+      // The REGION holding the children carries the same class, because it is
+      // the region, not the function, that the emitter selects a start policy
+      // for. `Concurrent` is a policy on the composition operator.
+      if (structural)
+        func.walk([&](DCPathInstanceOp inv) {
+          Operation *p = inv->getParentOp();
+          while (p &&
+                 !isa<DCPathPipelineOp, DCPathSequentialOp, DCPathSelectOp>(p))
+            p = p->getParentOp();
+          if (p)
+            p->setAttr("determinacy",
+                       determinacyAttr(b, DeterminacyEnum::Concurrent));
+        });
+      return;
+    }
+  }
+
   if (known) {
     func->setAttr("dcp.latency", b.getI64IntegerAttr(total));
     if (bounded)
       func->setAttr("dcp.latency_bound", b.getUnitAttr());
   }
   // Whole-kernel determinacy: an exact static latency is `counted_static`; a
-  // bounded (dynamic-trip) or unknown-length kernel is `indeterminate` -- the
-  // (dcp.latency && !latency_bound) test.
+  // bounded (dynamic-trip) or unknown-length kernel is `indeterminate`. That is
+  // the (dcp.latency && !latency_bound) test.
   func->setAttr("dcp.determinacy",
                 determinacyAttr(b, known && !bounded
                                        ? DeterminacyEnum::CountedStatic
                                        : DeterminacyEnum::Indeterminate));
 }
 
-// Remove the `allo.sched.*` schedule carrier now that the schedule lives in the
-// dcp ops. The derived whole-kernel latency is set separately by
-// `setDcpLatencies` from the materialized region tree.
+// Remove the `allo.sched.*` schedule carrier once the schedule lives in the dcp
+// ops. The derived whole-kernel latency is set separately by `setDcpLatencies`
+// from the materialized region tree.
 static void stripScheduleCarrier(func::FuncOp func) {
   auto stripFrom = [](Operation *op) {
     SmallVector<StringRef> names;
@@ -1023,10 +969,10 @@ namespace {
 // scheduler's `scheduleBlock` / `scheduleRegion` descent, materializing each
 // region bottom-up (a loop is wrapped only after its body is materialized, so
 // deepest-first ordering falls out of the recursion). A counted for-loop always
-// becomes a `dcp.pipeline` -- leaf, co-scheduled pipelined level, or sequential
-// wrapper, the three differing only in where the II comes from; a straight-line
-// span becomes a `dcp.sequential`; a while / opaque `if` is left raw wrapping
-// its materialized children.
+// becomes a `dcp.pipeline`, whether leaf, co-scheduled pipelined level, or
+// sequential wrapper: the three differ only in where the II comes from. A
+// straight-line span becomes a `dcp.sequential`, and a while or opaque `if` is
+// left raw wrapping its materialized children.
 struct Reifier {
   func::FuncOp func;
   const llvm::DenseMap<int64_t, RegionInfo> &regions;
@@ -1036,8 +982,8 @@ struct Reifier {
   // cross-region survivor (materializeSequential).
   bool container = false;
 
-  // The descriptor for a region id (empty when the id is unknown -- an
-  // all-constant span, or a synthesized wrapper handled separately).
+  // The descriptor for a region id, empty when the id is unknown: an
+  // all-constant span, or a synthesized wrapper handled separately.
   const RegionInfo &infoFor(std::optional<int64_t> id) {
     static const RegionInfo empty{};
     if (id)
@@ -1051,6 +997,15 @@ struct Reifier {
       materializeRegion(region);
   }
 
+  // One region of a block, by anchor kind. The `while` case splits on whether
+  // the loop can flushing-pipeline. It cannot when it nests a loop (the
+  // per-iteration length is then data-dependent), when it calls a sub-kernel
+  // (one child instance is fired and awaited per iteration, which no
+  // iteration-per-cycle schedule can follow), or when its continue-condition is
+  // not combinational (a memory read or a latency IP is not settled in-cycle).
+  // `conditionIsCombinational` is the predicate the scheduler routes on, read
+  // here so the two descents stay in lockstep. Closing a sequential while needs
+  // identity forwarding; a non-identity one is rare and left raw.
   void materializeRegion(const SchedRegion &region) {
     if (region.kind == allo::RegionKind::StraightLine) {
       materializeSequential(infoFor(firstRegionId(region.ops)), region.ops, lib,
@@ -1061,17 +1016,11 @@ struct Reifier {
     if (isa<AffineForOp, scf::ForOp>(anchor)) {
       materializeCountedLoop(cast<LoopLikeOpInterface>(anchor));
     } else if (auto w = dyn_cast<scf::WhileOp>(anchor)) {
-      if (hasNestedLoop(w) || !conditionIsCombinational(w, lib)) {
-        // A while that cannot flush-pipeline -- it nests a loop (per-iteration
-        // length data-dependent) or its continue-condition is not combinational
-        // (a memory read or a latency IP, not settled at issue) -- is lowered
-        // to the sequential CHECK/RUN controller: materialize the after-block
-        // (the body) into dcp child regions, then close the while into a
-        // SEQUENTIAL while dcp.pipeline (`ii` unset). A straight-line body
-        // becomes one acyclic dcp.sequential child. The merge needs identity
-        // forwarding; a non-identity while is left raw (rare). The
-        // `conditionIsCombinational` predicate matches the scheduler's routing
-        // site.
+      if (hasNestedLoop(w) || !conditionIsCombinational(w, lib) ||
+          blockHasSyncCall(w.getAfter().front())) {
+        // A while that cannot flush-pipeline takes the sequential CHECK/RUN
+        // controller: materialize the body into dcp child regions, then close
+        // the while into a sequential dcp.pipeline (`ii` unset).
         materializeBlock(w.getAfter().front());
         if (whileHasIdentityForwarding(w))
           materializeWhilePipeline(RegionInfo{}, w, lib);
@@ -1081,10 +1030,9 @@ struct Reifier {
         materializeWhilePipeline(infoFor(firstRegionId(anchor)), w, lib);
       }
     } else if (isa<scf::IfOp, AffineIfOp>(anchor)) {
-      // An opaque guard left by if-conversion (a branch holds a loop / stream /
-      // call it could not speculate): materialize each branch, then close the
-      // `if` into a dcp.select. An scf.if already has an i1 condition; an
-      // affine.if's IntegerSet is materialized into one (`affineIfCondition`).
+      // An opaque guard left by if-conversion: materialize each branch, then
+      // close the `if` into a dcp.select. An affine.if's IntegerSet becomes an
+      // i1 via `affineIfCondition`; an scf.if already has one.
       for (Region &branch : anchor->getRegions())
         if (!branch.empty())
           materializeBlock(branch.front());
@@ -1092,11 +1040,9 @@ struct Reifier {
       Value cond = isa<AffineIfOp>(anchor)
                        ? affineIfCondition(b, cast<AffineIfOp>(anchor))
                        : cast<scf::IfOp>(anchor).getCondition();
-      // Lift a raw predicate tree (an affine.if's materialized IntegerSet over
-      // the enclosing counter) to start-0 computes so the guard's condition is
-      // a Source::Unit; an scf.if whose condition is already a scheduled
-      // survivor is left untouched (the DFS stops at the non-arith region
-      // result).
+      // Lift a raw predicate tree to start-0 computes so the guard's condition
+      // is a Source::Unit; an scf.if condition that is already a scheduled
+      // survivor is left untouched.
       scheduleConditionTree(b, cond);
       closeIntoDcpSelect(b, anchor, cond);
     }
@@ -1105,9 +1051,9 @@ struct Reifier {
   // Materialize an affine.if's IntegerSet predicate into an i1: the conjunction
   // of its constraints (each `expr >= 0`, or `== 0` for an equality), built
   // with `expandAffineExpr` + `cmpi` + `andi`. Mirrors upstream
-  // AffineIfLowering. The ops are inserted before `b`'s point (ahead of the
-  // dcp.select) and reference the loop IVs -- which the enclosing wrapper later
-  // rewires to its counter.
+  // AffineIfLowering. The ops are inserted before `b`'s point, ahead of the
+  // dcp.select, and reference the loop IVs, which the enclosing wrapper rewires
+  // to its counter.
   Value affineIfCondition(OpBuilder &b, AffineIfOp ifOp) {
     Location loc = ifOp.getLoc();
     IntegerSet set = ifOp.getIntegerSet();
@@ -1130,11 +1076,11 @@ struct Reifier {
     return cond;
   }
 
-  // Close a scheduled if (scf.if / affine.if, branches already materialized
+  // Close a scheduled if (scf.if or affine.if, branches already materialized
   // into dcp regions) into a dcp.select with condition \p cond: move each
   // branch body verbatim, rewrite its yield to a dcp.uncondition, and forward
-  // the results. Latency is left unset (a data-dependent guard has no static
-  // count -- an affine active-count could fill it later).
+  // the results. Latency is left unset, since a data-dependent guard has no
+  // static count.
   void closeIntoDcpSelect(OpBuilder &b, Operation *ifOp, Value cond) {
     auto sel = DCPathSelectOp::create(
         b, ifOp->getLoc(), ifOp->getResultTypes(), cond,
@@ -1162,8 +1108,8 @@ struct Reifier {
   // BEFORE the body is materialized (so nested loops are still raw affine/scf
   // ops):
   //   * co-scheduled level (iterations overlap): materialize only the child
-  //     loops, then wrap -- the level's loose leaf ops convert in place;
-  //   * sequential wrapper (imperfect / non-flattened band): materialize every
+  //     loops, then wrap; the level's loose leaf ops convert in place;
+  //   * sequential wrapper (imperfect or non-flattened band): materialize every
   //     sub-region, then wrap with ii = Σ child invocation latency;
   //   * leaf innermost: wrap directly, ii from the solved descriptor.
   void materializeCountedLoop(LoopLikeOpInterface loop) {
@@ -1175,7 +1121,7 @@ struct Reifier {
             isa<AffineForOp, scf::ForOp>(sub.anchor()))
           materializeCountedLoop(cast<LoopLikeOpInterface>(sub.anchor()));
       materializeLoopToPipeline(infoFor(level.getInt()), loop, lib);
-    } else if (hasNestedLoop(loop)) {
+    } else if (loopBodyDecomposes(loop)) {
       materializeBlock(body);
       materializeLoopToPipeline(sequentialWrapperInfo(loop), loop, lib);
     } else {
@@ -1184,12 +1130,11 @@ struct Reifier {
   }
 
   // The synthesized descriptor of a residual sequential wrapper, derived from
-  // its now-materialized children. Iterations do not overlap, so its II =
-  // single body length = Σ perInvocationLatency(child). If any child's
-  // invocation latency is data-dependent (a dynamic inner trip), the body
-  // length -- hence the II and latency -- has no static value: leave
-  // `ii`/`length`/`latency` unset (the wrapper is a done-based sequential
-  // controller, not pipelined).
+  // its materialized children. Iterations do not overlap, so its II = single
+  // body length = Σ perInvocationLatency(child). If any child's invocation
+  // latency is data-dependent (a dynamic inner trip), the body length and with
+  // it the II and latency have no static value, so `ii`, `length` and `latency`
+  // are left unset and the wrapper becomes a done-based sequential controller.
   RegionInfo sequentialWrapperInfo(LoopLikeOpInterface loop) {
     int64_t bodyLen = 0;
     bool known = true, bounded = false;
@@ -1228,58 +1173,36 @@ struct Reifier {
 
 // Post-condition: after reification every loop and conditional is a `dcp.*`
 // region, so no affine/scf control-flow op may survive. Walk the whole function
-// and warn on any that did -- a reifier bug, or a rare deliberately-unclosed
-// fallback (a non-identity-forwarding while, see `materializeRegion`). Silent
+// and warn on any that did, which signals either a reifier bug or the rare
+// deliberately-unclosed fallback of a non-identity-forwarding while. Silence
 // means the IR is fully closed over the dcp dialect. Non-fatal by design.
 static void verifyControlFlowEliminated(func::FuncOp func) {
   func.walk([&](Operation *op) {
     if (isa<AffineForOp, scf::ForOp, scf::WhileOp, AffineIfOp, scf::IfOp>(op))
       warn(Stage::Dcp, op)
           << "control-flow op '" << op->getName().getStringRef()
-          << "' survived reification -- the post-schedule IR should hold only "
-             "dcp.* regions (every loop/conditional closed)";
+          << "' survived reification; the post-schedule IR should hold only "
+             "dcp.* regions, with every loop and conditional closed";
   });
 }
 
 //===----------------------------------------------------------------------===//
-// Call machinery: rewrite a leaf-bound sync `func.call` into a `dcp.instance`
-// -- the call node the leaf datapath models as a CallUnit.
+// Call machinery: rewrite a leaf-bound sync `func.call` into a `dcp.instance`,
+// the call node the leaf datapath models as a CallUnit.
 //===----------------------------------------------------------------------===//
-
-// The callee's whole-kernel latency for a dcp.instance: its reified
-// `dcp.latency` when present (a callee processed first), else the still-present
-// schedule carrier (a callee processed after its caller).
-static std::optional<int64_t> calleeLatency(func::FuncOp callee) {
-  if (std::optional<int64_t> l = optI64(callee, "dcp.latency"))
-    return l;
-  return optI64(callee, sched::kLatencyAttr);
-}
 
 // The callee's determinacy class for a dcp.instance: its declared
 // `dcp.determinacy` when reified, else derived from the schedule carrier (an
 // exact static latency with no bound flag is counted_static). Async callees
-// never reach here.
+// never reach here. `calleeStaticLatency` is the same stage-agnostic read the
+// region partitioner uses, so the two cannot disagree about a callee.
 static DeterminacyEnum calleeDeterminacy(func::FuncOp callee) {
   if (auto d = callee->getAttrOfType<DeterminacyEnumAttr>("dcp.determinacy"))
     return d.getValue();
   bool bounded = callee->hasAttr(sched::kLatencyBoundAttr);
-  return (calleeLatency(callee) && !bounded) ? DeterminacyEnum::CountedStatic
-                                             : DeterminacyEnum::Indeterminate;
-}
-
-// Whether the leaf CallUnit path can lower a sync call: every operand is a
-// memref (an internal buffer or a boundary argument the child masters) or a
-// scalar (int/float/index, handed off between children / a loose region / a
-// loop counter), and every result is a scalar (an array result became a
-// trailing out-param before emit). A stream operand (or any other type) is not
-// modelled as a CallUnit, so such a call stays on the structural top.
-static bool callLowerable(func::CallOp call) {
-  auto memrefOrScalar = [](Type t) {
-    return isa<MemRefType, IndexType>(t) || t.isIntOrFloat();
-  };
-  return llvm::all_of(call.getOperandTypes(), memrefOrScalar) &&
-         llvm::all_of(call.getResultTypes(),
-                      [](Type t) { return t.isIntOrFloat(); });
+  return (calleeStaticLatency(callee) && !bounded)
+             ? DeterminacyEnum::CountedStatic
+             : DeterminacyEnum::Indeterminate;
 }
 
 // A dcp.instance referencing \p calleeAttr, copying the callee's timing
@@ -1293,7 +1216,7 @@ static DCPathInstanceOp makeInvoke(OpBuilder &b, Location loc,
       SymbolTable::lookupNearestSymbolFrom(at, calleeAttr));
   return DCPathInstanceOp::create(
       b, loc, resultTypes, operands, calleeAttr, b.getI64IntegerAttr(start),
-      optI64Attr(b, callee ? calleeLatency(callee) : std::nullopt),
+      optI64Attr(b, callee ? calleeStaticLatency(callee) : std::nullopt),
       determinacyAttr(b, callee ? calleeDeterminacy(callee)
                                 : DeterminacyEnum::Indeterminate));
 }

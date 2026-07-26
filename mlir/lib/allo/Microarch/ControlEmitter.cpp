@@ -15,11 +15,11 @@ namespace mlir::allo::uarch {
 RegionControl ControlEmitter::emitPipelineControl(const uarch::RegionBlock &rb,
                                                   const Terminator &term,
                                                   Value start,
-                                                  Value enable) const {
+                                                  const StallShell &sh) const {
   if (rb.kind == uarch::RegionBlock::Kind::Acyclic)
     return emitAcyclic(rb.id, start, /*topLevel=*/!rb.parent);
   assert(rb.ii && "a pipelined region reached control emission with no II");
-  auto rc = emitPipelined(rb.id, *rb.ii, term, start, enable);
+  auto rc = emitPipelined(rb.id, *rb.ii, term, start, sh);
   // Label the counter register after the source loop variable. A loop whose
   // IV lost its name still reads as this region's counter.
   nameValue(rc.counter, rb.counterName.empty() ? regionSignal(rb.id, "iv")
@@ -42,7 +42,9 @@ RegionControl ControlEmitter::emitPipelineControl(const uarch::RegionBlock &rb,
 // and stall-free (fixed-latency memory, no FIFO).
 RegionControl ControlEmitter::emitPipelined(unsigned region, int64_t ii,
                                             const Terminator &term, Value start,
-                                            Value enable) const {
+                                            const StallShell &sh) const {
+  // G's half of H: a rigid region issues unconditionally.
+  Value enable = sh ? sh.issueEnable : c.t1;
   auto runNext = c.bb.get(c.i1);
   Value running = c.reg(runNext, c.f1);
   nameValue(running, regionSignal(region, "run"));
@@ -59,8 +61,7 @@ RegionControl ControlEmitter::emitPipelined(unsigned region, int64_t ii,
     Value phasep1 = c.R(comb::AddOp::create(c.b, c.loc, phase, c.one32, false));
     Value phaseAdv = c.mux(c.icmpEq(phase, ii - 1), c.zero32, phasep1);
     // Freeze the phase while stalled (enable low) so the II cadence resumes
-    // where it paused; unchanged (advances every cycle) for a stall-free
-    // region.
+    // where it paused; a stall-free region advances it every cycle.
     phaseNext.setValue(
         c.mux(running, c.mux(enable, phaseAdv, phase), c.zero32));
   }
@@ -68,10 +69,9 @@ RegionControl ControlEmitter::emitPipelined(unsigned region, int64_t ii,
   // `running`, and (with the enabled shift chains) the whole datapath hold.
   Value issue = c.andBits(wantIssue, enable);
   nameValue(issue, regionSignal(region, "issue"));
-  // Induction register: the counter IS the source IV, holding `lb` at start
-  // and advancing by `step` on each (gated) issue, so Source::Counter reads
-  // the real loop variable and a `lb != 0`/`step != 1` loop needs no body
-  // rewriting.
+  // Induction register: the counter IS the source IV, holding `lb` at start and
+  // advancing by `step` on each gated issue, so Source::Counter reads the real
+  // loop variable and a `lb != 0` / `step != 1` loop needs no body rewriting.
   auto iterNext = c.bb.get(c.i32);
   Value iv = c.reg(iterNext, term.lb);
   Value ivStep = c.R(comb::AddOp::create(c.b, c.loc, iv, term.step, false));
@@ -83,6 +83,84 @@ RegionControl ControlEmitter::emitPipelined(unsigned region, int64_t ii,
   Value runAfterLast = c.mux(terminate, c.f1, running);
   runNext.setValue(c.mux(term.gateStart(c, start), c.t1, runAfterLast));
   return {/*issue=*/issue, /*counter=*/iv, /*wantIssue=*/wantIssue};
+}
+
+// The one counted done-driven skeleton, covering the two cells whose iterations
+// are paced by the body draining rather than by a schedule:
+//   * Container: the body is a sequence of child regions;
+//   * CallNode: the body is one instantiated sub-kernel.
+// Both keep the same four cells: an induction register advancing on `advance`,
+// the `isLast` test against the bound, the launch pulse, and a done latch
+// cleared on `start`. The single difference is when the FIRST pass launches:
+//   * a Container launches one cycle after `start`, off the settled counter
+//     register, because its children read that counter as their own bound and
+//     sample it at their own start;
+//   * a CallNode launches on `start` itself, reading the counter through a
+//     `start`-cycle bypass, because a call region's start->done latency is the
+//     scheduled figure a caller composes against and a register there would add
+//     a cycle to it.
+// Either way the ADVANCE launch is registered, since the counter it feeds only
+// settles the cycle after `advance`.
+IterationControl
+ControlEmitter::emitCountedIteration(const uarch::RegionBlock &rb,
+                                     const Terminator &term, Value start,
+                                     Value complete) const {
+  assert(term.lb && "a counted iteration controller needs induction bounds");
+  bool launchAtStart = rb.shape == uarch::RegionBlock::Shape::CallNode;
+
+  Backedge ivNext = c.bb.get(term.lb.getType());
+  Value ivReg = c.reg(ivNext, term.lb);
+  nameValue(ivReg, rb.counterName.empty() ? regionSignal(rb.id, "iv")
+                                          : rb.counterName);
+  Value iv = launchAtStart ? c.mux(start, term.lb, ivReg) : ivReg;
+  Value ivStep = c.R(comb::AddOp::create(c.b, c.loc, iv, term.step, false));
+  // This pass is the last one; iterations remain otherwise (never for an empty
+  // region, whose body never runs at all, so `advance` stays low and the
+  // counter holds `lb`).
+  Value last = term.isLast(c, ivStep);
+  Value advance = c.andBits(complete, c.notBit(last));
+  ivNext.setValue(c.mux(start, term.lb, c.mux(advance, ivStep, iv)));
+
+  // `gateStart` masks the start launch of an empty region (a runtime zero trip
+  // or a static lb >= ub), which completes through `empty` below instead.
+  Value first = term.gateStart(c, start);
+  Value launch = launchAtStart ? c.orBits(first, c.reg(advance, c.f1))
+                               : c.reg(c.orBits(first, advance), c.f1);
+  nameValue(launch, regionSignal(rb.id, "fire"));
+  // An empty region completes one cycle after `start`, not on it: `done` is a
+  // level cleared by `start`, so a pulse landing there would leave it high with
+  // no 0->1 edge for the next node to start on.
+  Value empty = c.reg(c.andBits(start, term.isEmpty(c)), c.f1);
+  Value done = c.holdDone(c.orBits(empty, c.andBits(complete, last)), start);
+  nameValue(done, regionSignal(rb.id, "done"));
+  return {{/*issue=*/launch, /*counter=*/iv, /*wantIssue=*/Value()}, done};
+}
+
+// The conditional done-driven skeleton: a sequential-wrapper while. Same
+// boundary/continue/launch/done shape as the counted one, but the continue test
+// is not available AT the boundary. The condition reads the iter-arg survivor
+// registers, which only settle the cycle after a body pass drains, and may
+// itself take `tCond` cycles (a memory- or IP-dependent condition). So the
+// decision is a delayed CHECK pulse rather than a combinational test, and it
+// forks directly into launch / finish. The zero-iteration case needs no
+// separate empty term: the first CHECK already answers it, and it is a cycle
+// after `start`, which is exactly the edge hygiene `done` needs.
+IterationControl ControlEmitter::emitCheckedIteration(unsigned region,
+                                                      Value cond,
+                                                      unsigned tCond,
+                                                      Value start,
+                                                      Value complete) const {
+  Value check = c.reg(c.orBits(start, complete), c.f1);
+  nameValue(check, regionSignal(region, "check"));
+  // A container derives no stall shell of its own, since its stream-touching
+  // work sits in a child leaf under that leaf's shell, so the CHECK window is
+  // rigid.
+  Value settled = c.delayValid(check, tCond, StallShell{});
+  auto [launch, finish] = c.branchPulse(settled, cond);
+  nameValue(launch, regionSignal(region, "fire"));
+  Value done = c.holdDone(finish, start);
+  nameValue(done, regionSignal(region, "done"));
+  return {{/*issue=*/launch, /*counter=*/Value(), /*wantIssue=*/Value()}, done};
 }
 
 // Acyclic (straight-line) region: a single pass. A NESTED acyclic child issues
@@ -117,23 +195,21 @@ RegionControl ControlEmitter::emitAcyclic(unsigned region, Value start,
 // state on `start`.
 Value ControlEmitter::emitDone(unsigned region, unsigned drainStage,
                                Value lastIssue, Value emptyDone, Value start,
-                               bool retrig) const {
-  Value fire = c.delayValid(lastIssue, drainStage);
-  // A stream region freezes on output back-pressure, and the final put isn't
-  // committed until accepted, so gate the completion pulse on the region's
-  // clock-enable: `done` holds through back-pressure on the last token (no-op
-  // for a stall-free region).
-  if (c.regionEnable)
-    fire = c.andBits(fire, c.regionEnable);
+                               bool retrig, const StallShell &sh) const {
+  Value fire = c.delayValid(lastIssue, drainStage, sh);
+  // The final put is not committed until accepted, so gate the completion pulse
+  // on the region's clock-enable: `done` holds through back-pressure on the
+  // last token. A no-op under a rigid shell.
+  if (sh)
+    fire = c.andBits(fire, sh.chainEnable);
   if (emptyDone)
     fire = c.orBits(emptyDone, fire);
   auto dNext = c.bb.get(c.i1);
   Value done = c.reg(dNext, c.f1);
   nameValue(done, regionSignal(region, "done"));
-  // `retrig` clears the held `done` on `start` so the region is re-invocable,
-  // giving a fresh 0->1 edge on completion; callers must keep `fire` off the
-  // `start` cycle, since it wins over this clear and would hold the level at 1
-  // with no edge.
+  // `retrig` clears the held `done` on `start`, giving a fresh 0->1 edge each
+  // pass. Callers must keep `fire` off the `start` cycle: it wins over this
+  // clear and would hold the level at 1 with no edge.
   Value held = retrig ? c.mux(start, c.f1, done) : done;
   dNext.setValue(c.mux(fire, c.t1, held));
   return done;

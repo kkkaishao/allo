@@ -94,19 +94,33 @@ static SmallVector<LoopLikeOpInterface> perfectNest(LoopLikeOpInterface root) {
 }
 
 // The schedule length (single-iteration pipeline depth) of a solved problem:
-// the last op's start cycle plus one.
+// the last op's start cycle plus one, except for a synchronous sub-kernel call,
+// which is not finished when it is issued. Its child runs for the callee's
+// whole-kernel latency, so the region is only complete at `start + latency`;
+// counting it as `start + 1` would report a call-only span as one cycle deep.
+// That number is load-bearing, not cosmetic: a caller places its own ops at
+// static offsets off the callee's latency, so an undercount fires a dependent
+// op before the child has written. A cyclic body already gets this via its
+// terminator anchor, which every side-effecting op including a call is ordered
+// before; a straight-line span has no such sink.
 static int64_t scheduleDepth(circt::scheduling::Problem &problem) {
-  int64_t maxStart = 0;
-  for (Operation *op : problem.getOperations())
-    if (std::optional<unsigned> start = problem.getStartTime(op))
-      maxStart = std::max<int64_t>(maxStart, static_cast<int64_t>(*start));
-  return maxStart + 1;
+  int64_t depth = 1;
+  for (Operation *op : problem.getOperations()) {
+    std::optional<unsigned> start = problem.getStartTime(op);
+    if (!start)
+      continue;
+    int64_t end = static_cast<int64_t>(*start) + 1;
+    if (std::optional<std::pair<int64_t, std::string>> cl =
+            scheduledCallLatency(op))
+      end = std::max(end, static_cast<int64_t>(*start) + cl->first);
+    depth = std::max(depth, end);
+  }
+  return depth;
 }
 
-// Whether the problem carries a loop-carried recurrence -- a dependence
-// spanning
-// >= 1 iteration. Its presence is why a modulo II can exceed the pure resource
-// bound; reported in the schedule narrative.
+// Whether the problem carries a loop-carried recurrence, i.e. a dependence
+// spanning >= 1 iteration. Its presence is why a modulo II can exceed the pure
+// resource bound; reported in the schedule narrative.
 static bool hasCarriedRecurrence(circt::scheduling::CyclicProblem &problem) {
   for (Operation *op : problem.getOperations())
     for (auto dep : problem.getDependences(op))
@@ -268,8 +282,8 @@ enclosingTripProduct(Operation *op, DependenceAnalysis &deps, bool &isBound) {
 }
 
 // Whole-region latency in cycles: the innermost body is pipelined
-// (`depth + (trip - 1) * II`), and every surrounding loop -- the perfect band
-// plus any imperfectly-nested enclosing loops -- multiplies it by its trip
+// (`depth + (trip - 1) * II`), and every surrounding loop (the perfect band
+// plus any imperfectly-nested enclosing loops) multiplies it by its trip
 // count. Handles affine.for and scf.for uniformly (perfect band via
 // `perfectNest`, trips via `loopTrip`). Returns nullopt if a trip is unknown.
 static std::optional<int64_t> regionLatency(Operation *anchor, unsigned ii,
@@ -308,22 +322,23 @@ static void annotateRegion(circt::scheduling::Problem &problem,
                            bool latencyIsBound) {
   Builder b(func.getContext());
 
-  int64_t maxStart = 0;
   for (Operation *op : problem.getOperations()) {
     std::optional<unsigned> start = problem.getStartTime(op);
     if (!start)
       continue;
-    maxStart = std::max<int64_t>(maxStart, static_cast<int64_t>(*start));
-    // A child-loop node (Phase B level problem) is scheduled as its own region,
-    // and a loop terminator carries no schedulable compute -- neither is tagged
-    // here (they still count toward the region length).
+    // A child-loop node of a level problem is scheduled as its own region, and
+    // a loop terminator carries no schedulable compute. Neither is tagged here,
+    // though both still count toward the region length.
     if (isa<AffineForOp, scf::ForOp, scf::WhileOp>(op) ||
         op->hasTrait<OpTrait::IsTerminator>())
       continue;
     op->setAttr(sched::kStartTimeAttr, b.getI64IntegerAttr(*start));
     op->setAttr(sched::kRegionIdAttr, b.getI64IntegerAttr(regionId));
   }
-  int64_t length = maxStart + 1;
+  // The one span the region occupies. `length` is what the reify propagates, so
+  // it reads the same depth the latency above came from; recomputing
+  // "last start + 1" here would drop a sub-kernel call's own run.
+  int64_t length = scheduleDepth(problem);
 
   // Build the per-region descriptor.
   SmallVector<NamedAttribute> fields;
@@ -379,6 +394,31 @@ static int64_t pipelineDirective(Operation *loop, Operation *anchor) {
   }
 }
 
+// A synchronous sub-kernel call in a loop body is ONE child instance re-fired
+// per iteration, not a pipelined operator: the loop controller starts the next
+// invocation on the previous one's `done` (the callee's latency) plus the cycle
+// it takes to re-arm. Reserve that as a limit-1 resource held for `latency + 1`
+// cycles, so the II the scheduler solves and reports is the interval the
+// emitted loop really runs at rather than the 1 a zero-occupancy latency node
+// would allow. Keyed per callsite: distinct calls are distinct instances.
+static void populateCallOccupancy(Block &body, ChainingModuloProblem &problem) {
+  using P = circt::scheduling::Problem;
+  Builder b(body.getParentOp()->getContext());
+  unsigned idx = 0;
+  for (Operation &op : body) {
+    std::optional<std::pair<int64_t, std::string>> cl =
+        scheduledCallLatency(&op);
+    if (!cl)
+      continue;
+    P::ResourceType rsrc =
+        problem.getOrInsertResourceType(cl->second + "#" + std::to_string(idx));
+    problem.setLimit(rsrc, 1);
+    problem.setLinkedResourceTypes(&op, SmallVector<P::ResourceType>{rsrc});
+    op.setAttr(sched::kResourceCyclesAttr, b.getI64IntegerAttr(cl->first + 1));
+    ++idx;
+  }
+}
+
 // Schedule one counted loop body (affine.for or scf.for) as a
 // `ChainingModuloProblem` (resource-aware, timing-aware) and annotate the
 // result (start times, II, sub-cycle times). \p minII lower-bounds the II.
@@ -398,6 +438,7 @@ static LogicalResult scheduleCyclic(LoopLikeOpInterface body,
     return failure();
   if (failed(populateMemoryResources(*bodyBlock, problem, lib.memoryLibrary())))
     return failure();
+  populateCallOccupancy(*bodyBlock, problem);
   Operation *anchor = bodyBlock->getTerminator();
   if (failed(solveSchedulingProblem(problem, anchor, cycleTime, minII)))
     return failure();
@@ -452,7 +493,7 @@ static LogicalResult scheduleCyclic(LoopLikeOpInterface body,
 }
 
 // Schedule an uncounted `scf.while` (before + after as one iteration) as a
-// `ChainingModuloProblem` -- the flushing-pipeline scheduling view. The trip
+// `ChainingModuloProblem`, the flushing-pipeline scheduling view. The trip
 // count is data-dependent, so latency is omitted (like a dynamic counted loop).
 static LogicalResult scheduleWhile(scf::WhileOp w, DependenceAnalysis &deps,
                                    const OperatorLibrary &lib,
@@ -527,48 +568,48 @@ scheduleAcyclic(ArrayRef<Operation *> ops, DependenceAnalysis &deps,
   return success();
 }
 
-// Whole-kernel latency: sum the per-region latencies (regions compose by
-// program order, no overlap). Set the func attribute only when every region has
-// a known latency; flag it as a bound if any region's latency was assumed.
+// Whole-kernel latency: the larger of two numbers. The first is the sum of the
+// per-region latencies, which compose by program order with no overlap. The
+// second is a FLOOR set by the sub-kernels a container composes, namely the
+// last child's completion. Those `start` offsets encode the composition, so one
+// rule covers both shapes: a serial chain's staggered starts give the sum of
+// child latencies, concurrent children's all-zero starts the max. Async calls
+// compose as dataflow rather than as a static node and contribute nothing.
+//
+// It is only a floor, because a call nested inside a loop repeats once per
+// iteration and a call beside a plain loop region says nothing about that
+// region. A nested parent's operator characterization reads this number for the
+// call node and places its own ops at static offsets off it, so an undercount
+// fires a dependent op before the child has written. Mirrors the reify's
+// `setDcpLatencies`.
+//
+// Set the func attribute only when every region has a known latency; flag it as
+// a bound if any region's latency was assumed.
 static void annotateKernelLatency(func::FuncOp funcOp) {
   Builder b(funcOp.getContext());
 
-  // A sequential-composition container's latency is its LAST child's completion
-  // -- max over its (non-async) calls of (the call's scheduled `start` + the
-  // callee's whole-kernel latency) -- not the straight-line region sum, which
-  // counts only to a call's start and so undercounts a call node by its own
-  // latency. Callees are scheduled first (bottom-up), so their
-  // `allo.sched.latency` is already set; this is what a nested parent's
-  // operator characterization reads for the call node, so it must be exact here
-  // (before reify's `dcp.latency`). Async calls compose as dataflow, not a
-  // static node, and are left to the region path. Mirrors the reify's
-  // `setDcpLatencies`.
-  {
-    bool container = false, allKnown = true;
-    int64_t composed = 0;
-    funcOp.walk([&](func::CallOp call) {
-      if (call->hasAttr(kAlloAsyncAttr))
-        return;
-      container = true;
-      int64_t start = 0;
-      if (auto s = call->getAttrOfType<IntegerAttr>(sched::kStartTimeAttr))
-        start = s.getInt();
-      auto callee = dyn_cast_or_null<func::FuncOp>(
-          SymbolTable::lookupNearestSymbolFrom(call, call.getCalleeAttr()));
-      auto lat = callee
-                     ? callee->getAttrOfType<IntegerAttr>(sched::kLatencyAttr)
-                     : nullptr;
-      if (!lat)
-        allKnown = false;
-      else
-        composed = std::max(composed, start + lat.getInt());
-    });
-    if (container) {
-      if (allKnown)
-        funcOp->setAttr(sched::kLatencyAttr, b.getI64IntegerAttr(composed));
+  // The call floor: the last child's completion, max over the non-async calls
+  // of (scheduled `start` + the callee's whole-kernel latency). Callees are
+  // scheduled bottom-up, so `allo.sched.latency` is already set.
+  bool callsKnown = true;
+  int64_t composed = 0;
+  funcOp.walk([&](func::CallOp call) {
+    if (call->hasAttr(kAlloAsyncAttr))
       return;
-    }
-  }
+    int64_t start = 0;
+    if (auto s = call->getAttrOfType<IntegerAttr>(sched::kStartTimeAttr))
+      start = s.getInt();
+    auto callee = dyn_cast_or_null<func::FuncOp>(
+        SymbolTable::lookupNearestSymbolFrom(call, call.getCalleeAttr()));
+    auto lat = callee ? callee->getAttrOfType<IntegerAttr>(sched::kLatencyAttr)
+                      : nullptr;
+    if (!lat)
+      callsKnown = false;
+    else
+      composed = std::max(composed, start + lat.getInt());
+  });
+  if (!callsKnown)
+    return; // an unknown callee latency leaves the kernel total unknown
 
   auto regionsAttr = funcOp->getAttrOfType<ArrayAttr>(sched::kRegionsAttr);
   if (!regionsAttr)
@@ -577,7 +618,7 @@ static void annotateKernelLatency(func::FuncOp funcOp) {
   bool isBound = false;
   for (Attribute a : regionsAttr) {
     auto d = cast<DictionaryAttr>(a);
-    // A region absorbed into a Phase B level is folded into that level's
+    // A region absorbed into a fused level is folded into that level's
     // latency; counting it here would double-count.
     if (d.get(sched::kRegionKeyParent))
       continue;
@@ -587,12 +628,13 @@ static void annotateKernelLatency(func::FuncOp funcOp) {
     total += lat.getInt();
     isBound |= d.get(sched::kRegionKeyLatencyBound) != nullptr;
   }
-  funcOp->setAttr(sched::kLatencyAttr, b.getI64IntegerAttr(total));
+  funcOp->setAttr(sched::kLatencyAttr,
+                  b.getI64IntegerAttr(std::max(total, composed)));
   if (isBound)
     funcOp->setAttr(sched::kLatencyBoundAttr, b.getUnitAttr());
 }
 
-// Per-invocation latency of an already-scheduled child loop -- one run of the
+// Per-invocation latency of an already-scheduled child loop: one run of the
 // loop, the occupancy the level's modulo problem reserves for the loop node.
 // Every scheduled region nested under the loop has a descriptor latency that
 // already folds in all enclosing trips; their sum is the loop's whole
@@ -631,8 +673,8 @@ static std::optional<int64_t> childInvocationLatency(Operation *childLoop,
 }
 
 // After a level is solved: mark every sub-region nested under `level` (a child
-// loop's own region(s)) as absorbed into the level -- stamp `parent = levelId`
-// on its descriptor so the whole-kernel / reify latency composition skips it
+// loop's own region(s)) as absorbed into the level by stamping
+// `parent = levelId` on its descriptor, so the latency composition skips it
 // (its latency is already folded into the level's). Additionally record each
 // child-loop node's start within the level's II (`parent_start`) on that
 // child's primary region, so the reify offsets the nested `dcp.pipeline`.
@@ -695,9 +737,9 @@ static void absorbLevelChildren(func::FuncOp funcOp, LoopLikeOpInterface level,
 // The problem is timing-aware (`ChainingModuloProblem`): leaf ops carry their
 // library in/out delays so a combinational chain among level ops is cut at the
 // cycle boundary, exactly as in the leaf body. A child-loop node is a
-// registered boundary -- its inputs are latched at entry and its result drained
-// into a register -- so it terminates any combinational chain (zero in/out
-// delay); no per-region delay characterization is needed.
+// registered boundary: its inputs are latched at entry and its result drained
+// into a register, so it terminates any combinational chain (zero in/out
+// delay) and needs no per-region delay characterization.
 static bool buildLevelProblem(ChainingModuloProblem &problem,
                               const LevelAnalysis &a, LoopLikeOpInterface level,
                               DependenceAnalysis &deps,
@@ -761,8 +803,8 @@ static bool buildLevelProblem(ChainingModuloProblem &problem,
   return true;
 }
 
-// Phase B (analysis only): build+solve the level problem and DEBUG-log the
-// achieved II. No annotate/reify; transient occupancy attrs are removed.
+// Analysis only: build and solve the level problem and DEBUG-log the achieved
+// II. No annotate/reify; transient occupancy attrs are removed.
 static void logLevelII(const LevelAnalysis &a, LoopLikeOpInterface level,
                        DependenceAnalysis &deps, const OperatorLibrary &lib,
                        func::FuncOp funcOp, float cycleTimeNs) {
@@ -789,33 +831,37 @@ static void logLevelII(const LevelAnalysis &a, LoopLikeOpInterface level,
 }
 
 // Whether a pipelined imperfect level can be fused into ONE outer pipeline and
-// reified as Phase B. Otherwise the level falls back to Phase A (sequential
-// sub-regions), which is always correct. Requires:
-//   * no loop-carried iter_args on the level itself -- their cross-iteration
-//     recurrence is not modeled by the level problem (Phase A runs the level as
-//     a sequential loop, so its iter_args are correct);
+// reified as such. This is the regime the diagnostics call "Phase B".
+// Otherwise the level falls back to sequential sub-regions, which is always
+// correct. Requires:
+//   * no loop-carried iter_args on the level itself, whose cross-iteration
+//     recurrence the level problem does not model (the sequential fallback
+//     runs the level as a plain loop, so its iter_args stay correct);
 //   * every child region that is a loop is a SINGLE counted loop (affine.for /
-//     scf.for, no further nested loop) whose trip and enclosing trips are known
-//     -- so it characterizes as one fixed-latency node `L_child` and
+//     scf.for, no further nested loop) whose trip and enclosing trips are
+//     known, so it characterizes as one fixed-latency node `L_child` and
 //     materializes to exactly one nested dcp.pipeline (a nested/while/perfect-
 //     band child would leave a wrapper loop inside the level pipeline).
 // This gate runs BEFORE any child is scheduled, so the fallback stays a clean
-// Phase A schedule with no double-scheduling.
+// sequential schedule with no double-scheduling.
 static bool levelIsPhaseBReifiable(LoopLikeOpInterface level,
                                    DependenceAnalysis &deps) {
   if (!level.getInits().empty())
     return false;
   Block &body = level.getLoopRegions().front()->front();
-  // A non-affine access (memref.load/store, opaque effectful op) could hide a
-  // level-carried recurrence whose carried distance the affine analysis cannot
-  // bound -- but only on a WRITTEN root. A root that is read-only across the
-  // level (e.g. a gather `W[idx[j]]` from a weight/lookup table) carries no
-  // dependence at all (RAR only), so a non-affine read of it is safe. Only a
-  // non-affine access on a written root forces the (always-correct) Phase A.
+  // A non-affine access on a WRITTEN root could hide a level-carried
+  // recurrence the affine analysis cannot bound, so it forces the sequential
+  // fallback; a root read-only across the level carries RAR only and is safe.
   Summary footprint;
   body.walk([&](Operation *o) { summarizeOp(o, footprint); });
   for (const auto &kv : footprint.mem)
     if (kv.second.nonAffine && kv.second.writes)
+      return false;
+  // A sub-kernel call is not a loop child, so the level problem would fold it
+  // back into the fused pipeline as a leaf op. Keep such a level sequential,
+  // with each call its own sub-region.
+  for (Operation &o : body)
+    if (isSyncSubKernelCall(&o))
       return false;
   for (const SchedRegion &sub : enumerateRegions(body)) {
     if (sub.kind != allo::RegionKind::Loop)
@@ -862,11 +908,9 @@ struct SdcSchedulingPass
             .wasInterrupted())
       return signalPassFailure();
 
-    // The storage twin: an array resolving to a primitive the device declares
-    // no timing for (a `bind.storage impl=` or a `default_memory` naming an
-    // undeclared row) would fall to the zero-timing default and be scheduled
-    // combinationally -- read before valid. Reject it here rather than emit a
-    // design whose memory timing is fiction.
+    // The storage twin: an array whose primitive the device declares no timing
+    // for would fall to the zero-timing default and schedule combinationally,
+    // reading before valid. Reject it rather than emit fictional memory timing.
     const MemoryLibrary &memLib = loadedLib.memoryLibrary();
     if (module
             .walk([&](Operation *op) {
@@ -883,13 +927,11 @@ struct SdcSchedulingPass
             .wasInterrupted())
       return signalPassFailure();
 
-    // Target clock period: the option overrides the device default, else 5.0
-    // ns.
+    // Target clock period: the option, else a 5.0 ns default.
     float cycleTimeNs = cycleTime > 0.0f ? cycleTime : 5.0f;
 
-    // Schedule bottom-up over the call graph
-    // The call graph should be a DAG, so a post-order traversal schedules
-    // callees before callers
+    // Schedule bottom-up over the call graph: it is a DAG, so a post-order
+    // traversal schedules callees before callers
     auto topFunc = module.lookupSymbol<func::FuncOp>(top);
     if (!topFunc) {
       error(Stage::Prep, module) << "Top function '" << top << "' not found";
@@ -927,12 +969,12 @@ struct SdcSchedulingPass
                     memref::MemRefDialect>();
   }
 
-  // Phase B: pipeline an imperfect level over its children. Schedule the child
-  // loops (only -- the leaf ops go into the level problem), then solve the
-  // level as one modulo problem (each child loop a non-pipelined resource node)
-  // so the outer loop pipelines at II_outer = max(child occupancy, recurrence
-  // II), overlapping the leaf ops and consecutive iterations. The leaf ops and
-  // the level descriptor are annotated; the child loops keep their own regions
+  // Pipeline an imperfect level over its children. Schedule the child loops
+  // only, since the leaf ops go into the level problem, then solve the level as
+  // one modulo problem (each child loop a non-pipelined resource node) so the
+  // outer loop pipelines at II_outer = max(child occupancy, recurrence II),
+  // overlapping the leaf ops and consecutive iterations. The leaf ops and the
+  // level descriptor are annotated; the child loops keep their own regions
   // (materialized as nested dcp.pipelines). Precondition: the caller entered
   // only after `levelIsPhaseBReifiable`, so every child is a single counted
   // loop with a known latency and the level problem is guaranteed
@@ -1012,14 +1054,14 @@ struct SdcSchedulingPass
   }
 
   // Schedule one region: a straight-line span as an acyclic problem, a counted
-  // loop as a cyclic problem. An imperfect counted nest -- whose innermost band
-  // body still holds loops (sibling loops, or ops surrounding an inner loop) --
-  // is either pipelined over its children (Phase B, when the outer loop carries
-  // an explicit pipeline directive) or decomposed into per-body sub-regions
-  // (Phase A), the band loops staying as wrapper loops whose trips fold into
-  // each sub-region's latency via `enclosingTripProduct`. `nextId` hands out
-  // region ids in program order so the reify's prefix-sum composition stays
-  // correct. Cross-region composition is by program order / SSA only.
+  // loop as a cyclic problem. An imperfect counted nest, whose innermost band
+  // body still holds loops (sibling loops, or ops surrounding an inner loop),
+  // is either pipelined over its children (when the outer loop carries an
+  // explicit pipeline directive) or decomposed into per-body sub-regions, the
+  // band loops staying as wrapper loops whose trips fold into each sub-region's
+  // latency via `enclosingTripProduct`. `nextId` hands out region ids in
+  // program order so the reify's prefix-sum composition stays correct.
+  // Cross-region composition is by program order / SSA only.
   LogicalResult scheduleRegion(SchedRegion region, unsigned &nextId,
                                DependenceAnalysis &deps,
                                const OperatorLibrary &lib, func::FuncOp funcOp,
@@ -1044,7 +1086,7 @@ struct SdcSchedulingPass
           perfectNest(cast<LoopLikeOpInterface>(region.anchor())).back();
       int64_t dir =
           pipelineDirective(innermost.getOperation(), region.anchor());
-      if (hasNestedLoop(innermost)) {
+      if (loopBodyDecomposes(innermost)) {
         if (dir >= 1 && levelIsPhaseBReifiable(innermost, deps)) {
           info(Stage::Sched, innermost.getOperation())
               << "Detected imperfect nest with pipeline directives, "
@@ -1090,32 +1132,30 @@ struct SdcSchedulingPass
                             dir >= 1 ? static_cast<unsigned>(dir) : 1,
                             /*pipelined=*/dir != -1);
     }
-    // A while with an all-straight-line body schedules as a flushing pipeline
-    // (before + after as one iteration). A while whose body contains a nested
-    // loop cannot: a flat problem would flatten the inner loop's ops into the
-    // outer iteration space. The nested loop schedules as its own region, the
-    // surrounding ops as acyclic  spans, and leave the outer `scf.while` raw
-    // (A counted while was raised to scf.for by `raise-counted-while`.)
+    // An uncounted while (counted ones are already scf.for) with a
+    // straight-line body schedules as a flushing pipeline over before+after;
+    // one nesting a loop cannot, as the inner ops would flatten into it.
     if (auto whileOp = dyn_cast<scf::WhileOp>(region.anchor())) {
-      // A while cannot flushing-pipeline -- so its body is decomposed into
-      // sub-regions scheduled in program order and the outer while runs the
-      // sequential CHECK/RUN controller -- when it nests a loop (its
-      // per-iteration length is data-dependent) OR its continue-condition is
-      // not combinational (a memory read or a latency IP, not settled at
-      // issue). `conditionIsCombinational` is the predicate the reifier's
-      // routing site shares, so the two stay in lockstep.
-      if (hasNestedLoop(whileOp) || !conditionIsCombinational(whileOp, lib)) {
+      // A nested loop (data-dependent per-iteration length) or a condition not
+      // settled at issue forces the sequential CHECK/RUN controller. The
+      // reifier's routing shares `conditionIsCombinational`, so the two agree.
+      if (hasNestedLoop(whileOp) || !conditionIsCombinational(whileOp, lib) ||
+          blockHasSyncCall(whileOp.getAfter().front())) {
         info(Stage::Sched, whileOp)
-            << "While loop cannot flushing-pipeline (nested loop or "
-               "non-combinational condition); decomposing its body into "
-               "sub-regions scheduled in program order (the outer while runs "
-               "sequentially, latency data-dependent)";
+            << "While loop cannot flushing-pipeline (nested loop, sub-kernel "
+               "call, or non-combinational condition); decomposing its body "
+               "into sub-regions scheduled in program order (the outer while "
+               "runs sequentially, latency data-dependent)";
         return scheduleBlock(whileOp.getAfter().front(), nextId, deps, lib,
                              funcOp, cycleTimeNs);
       }
       if (!whileHasIdentityForwarding(whileOp)) {
         error(Stage::Sched, whileOp.getOperation())
-            << "scf.while not scheduled";
+            << "while loop not scheduled: its loop-carried values are not "
+               "forwarded 1:1 from the before-region through `scf.condition` "
+               "into the after-region (they are reordered, dropped, or "
+               "recombined), which the flushing-pipeline schedule requires; "
+               "carry each value through unchanged";
         signalPassFailure();
         return failure();
       }
@@ -1125,13 +1165,9 @@ struct SdcSchedulingPass
           << " detected as a while-loop, using flushing-pipeline schedule";
       return scheduleWhile(whileOp, deps, lib, funcOp, region, cycleTimeNs);
     }
-    // A surviving `if` -- one that `fold-if-statements` could not predicate
-    // because a branch holds a loop / stream / call -- is kept as a control
-    // construct: decompose each branch body Phase-A-style (a guarded loop
-    // becomes its own region, surrounding ops acyclic spans) and leave the `if`
-    // raw, wrapping the materialized branch regions. Same
-    // decompose-and-leave-raw shape as the nested-loop while above; the reifier
-    // leaves the untagged `if` in place around its materialized children.
+    // An `if` that `fold-if-statements` could not predicate stays a control
+    // construct: decompose each branch into sub-regions and leave the `if` raw
+    // around them, as for the nested-loop while above.
     if (isa<AffineIfOp, scf::IfOp>(region.anchor())) {
       Operation *ifOp = region.anchor();
       info(Stage::Sched, ifOp)

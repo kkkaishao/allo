@@ -29,8 +29,8 @@ struct AssumedRange {
 /// The dependence distance carried by the counted loop at 1-based nesting depth
 /// \p level among a dependence's shared enclosing loops, projected from its
 /// components (outermost -> innermost). Sets \p drop when an OUTER loop carries
-/// the dependence -- satisfied by that loop's sequential execution, so it does
-/// not constrain \p level's modulo schedule -- and \p valid = false when \p
+/// the dependence. That loop's sequential execution already satisfies it, so it
+/// does not constrain \p level's modulo schedule. Sets \p valid = false when \p
 /// level is deeper than the shared loop nest. A loop-independent
 /// (intra-iteration) dependence has no components and maps to distance 0.
 /// Passing `level = comps.size()` projects onto the innermost shared loop.
@@ -58,8 +58,8 @@ public:
   /// structures are lowered to their memref/std equivalents).
   void replaceOp(Operation *oldOp, Operation *newOp);
 
-  /// The coarse cross-region dependence graph over the whole func (built and
-  /// cached on first use). Analysis only -- does not affect scheduling.
+  /// The coarse cross-region dependence graph over the whole func, built and
+  /// cached on first use. Analysis only. It does not affect scheduling.
   const RegionGraph &getRegionGraph();
 
   /// The constant range a value is known to lie in, distilled from the

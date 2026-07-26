@@ -4,10 +4,10 @@
  */
 
 //===----------------------------------------------------------------------===//
-// Perfectize an imperfect loop nest so the existing perfect-nest scheduler can
-// pipeline it, instead of the driver skipping it. An outer loop (affine.for /
-// scf.for) whose body is `{ prologue..., inner loop, epilogue... }` is made
-// perfect by sinking the surrounding ops into the inner loop:
+// Perfectize an imperfect loop nest so the perfect-nest scheduler can pipeline
+// it, instead of the driver skipping it. An outer loop (affine.for / scf.for)
+// whose body is `{ prologue..., inner loop, epilogue... }` is made perfect by
+// sinking the surrounding ops into the inner loop:
 //   * epilogue (after the inner loop) -> guarded by the last iteration,
 //     remapping uses of the inner loop's results to its final (yielded) values;
 //   * prologue (before it), always loop-invariant w.r.t. the inner loop:
@@ -19,8 +19,8 @@
 // `affine.if (iv == const)` (its trip is constant); an scf.for inner uses
 // `scf.if` on a runtime `cmpi` (`iv == lb` first, `iv + step >= ub` last).
 // `fold-if-statements` then predicates the guards. Bail (leave the nest
-// untouched, so the driver skips it as before) on anything not covered: sibling
-// inner loops, an scf.while, escaping/aliasing values, other side effects.
+// untouched, so the driver skips it) on anything not covered: sibling inner
+// loops, an scf.while, escaping/aliasing values, other side effects.
 //===----------------------------------------------------------------------===//
 
 #include "allo/Support/Logging.h"
@@ -115,7 +115,7 @@ static std::optional<Match> matchImperfect(Operation *outer,
     (m.lin ? m.epilogue : m.prologue).push_back(&op);
   }
   // Not an imperfect nest at all (no counted inner loop, or nothing to sink):
-  // stay silent -- there is nothing the pass was meant to handle here.
+  // stay silent, since there is nothing this pass was meant to handle here.
   if (!m.lin || (m.prologue.empty() && m.epilogue.empty()))
     return std::nullopt;
 
@@ -186,7 +186,7 @@ static std::optional<Match> matchImperfect(Operation *outer,
 }
 
 // Sink `ops` into a guard inserted at `insertPt` inside `lin`'s body that fires
-// only at the first (or last) iteration -- an `affine.if` (constant IV) for an
+// only at the first (or last) iteration: an `affine.if` (constant IV) for an
 // affine.for inner, an `scf.if` (runtime `cmpi`) for an scf.for inner.
 static void sinkGuarded(Operation *lin, ArrayRef<Operation *> ops, bool first,
                         Operation *insertPt) {

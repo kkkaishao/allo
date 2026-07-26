@@ -131,13 +131,12 @@ allo_sim_stream_write(uint64_t handle, int64_t lane, uint64_t value) {
 }
 
 // Preload one initial token into `lane`, seeding a feedback cycle so it does
-// not deadlock (§ initial tokens). The token sits in FRONT of the FIFO: we grow
-// the bound (and every lane's ring) so seeding never consumes the declared
-// steady-state depth and never blocks -- mirroring the RTL init-prepend shim,
-// and a larger bound is always deadlock-safe (Kahn: correctness is
-// depth-independent). Called once per token at construction, before any PE
-// fiber exists, so the ring is empty and resize preserves the contiguous (head
-// == 0) layout.
+// not deadlock. The token sits in FRONT of the FIFO: the bound (and every
+// lane's ring) grows so seeding never consumes the declared steady-state depth
+// and never blocks, mirroring the RTL init-prepend shim. A larger bound is
+// always deadlock-safe (Kahn: correctness is depth-independent). Called once
+// per token at construction, before any PE fiber exists, so the ring is empty
+// and resize preserves the contiguous (head == 0) layout.
 extern "C" ALLO_RUNTIME_EXPORT void
 allo_sim_stream_seed(uint64_t handle, int64_t lane, uint64_t value) {
   Stream *stream = asStream(handle);
@@ -183,9 +182,9 @@ extern "C" ALLO_RUNTIME_EXPORT void allo_sim_stream_destroy(uint64_t handle) {
 // Open a dataflow region. At the top level this creates a marl scheduler and
 // binds it to the calling thread so that subsequent allo_df_spawn calls (and
 // the join) run against it; `numWorkers <= 0` requests one worker per logical
-// core. A nested container -- opened from within a fiber whose thread already
-// has a scheduler bound -- reuses that scheduler (one scheduler drives the
-// whole nested network; nesting adds fibers, not schedulers). Each region gets
+// core. A nested container, opened from within a fiber whose thread already
+// has a scheduler bound, reuses that scheduler (one scheduler drives the whole
+// nested network; nesting adds fibers, not schedulers). Each region gets
 // its own WaitGroup so join blocks only for the fibers spawned at this level.
 extern "C" ALLO_RUNTIME_EXPORT void *allo_df_open(int64_t numWorkers) {
   if (marl::Scheduler *cur = marl::Scheduler::get())
@@ -218,7 +217,7 @@ extern "C" ALLO_RUNTIME_EXPORT void allo_df_join(void *handle) {
 
 extern "C" ALLO_RUNTIME_EXPORT void allo_df_close(void *handle) {
   auto *df = static_cast<DataflowScheduler *>(handle);
-  // A nested region reuses the enclosing scheduler -- leave it bound and alive.
+  // A nested region reuses the enclosing scheduler; leave it bound and alive.
   if (df->owning) {
     df->scheduler->unbind();
     delete df->scheduler;

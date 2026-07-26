@@ -80,6 +80,43 @@ traceIterArgSource(Block *body, Operation *yield, unsigned iterArg) {
 
 static bool isSyncCall(Operation *op); // a plain (non-async) sub-kernel call
 
+// Anchor every remaining dependence-DAG sink to \p anchor with a
+// loop-independent (distance-0) edge, making the anchor the problem's unique
+// sink. The modulo scheduler requires that: it minimizes the anchor's start
+// time, and `ModuloSimplexScheduler::checkLastOp` rejects a problem outright
+// if any other operation has no distance-0 successor.
+//
+// The explicit side-effect anchoring in the builders covers the common case
+// (a store / stream access / sync call has no results at all, so nothing can
+// depend on it), but it enumerates op kinds and so cannot be complete. A sink
+// is a graph property: any op whose consumers are all loop-carried, or a
+// nested region's result-less terminator, is one too. Computing the set is
+// exact and makes the rejection structurally unreachable rather than a
+// user-facing limit. The same shape appears in the pipelined-level problem,
+// which anchors every level node to the terminator.
+//
+// Anchoring is sound: the anchor is the loop body's terminator, so an edge
+// `sink -> anchor` only states that the iteration is not complete until the
+// sink has produced its result, which is exactly the region's own semantics.
+template <class ProblemT>
+static void anchorSinks(ProblemT &problem, Operation *anchor) {
+  DenseSet<Operation *> sinks(problem.getOperations().begin(),
+                              problem.getOperations().end());
+  for (Operation *op : problem.getOperations())
+    for (auto &dep : problem.getDependences(op))
+      if (problem.getDistance(dep).value_or(0) == 0)
+        sinks.erase(dep.getSource());
+  // Collect in the problem's insertion order, not the hash set's, so the edges
+  // and the solved schedule are deterministic. Snapshot before inserting:
+  // `insertDependence` registers its endpoints into the set being iterated.
+  SmallVector<Operation *> unanchored;
+  for (Operation *op : problem.getOperations())
+    if (op != anchor && sinks.contains(op))
+      unanchored.push_back(op);
+  for (Operation *op : unanchored)
+    (void)problem.insertDependence(Problem::Dependence(op, anchor));
+}
+
 template <class ProblemT>
 ProblemT buildCyclicProblem(LoopLikeOpInterface loop,
                             DependenceAnalysis &deps) {
@@ -96,8 +133,7 @@ ProblemT buildCyclicProblem(LoopLikeOpInterface loop,
 
       // Only model dependences whose source is inside this loop. Whole-func
       // analysis may surface cross-region dependences whose endpoints are
-      // scheduled elsewhere; those are handled by cross-region analysis
-      // instead.
+      // scheduled elsewhere; cross-region analysis handles those.
       if (!body->findAncestorOpInBlock(*memoryDep.source))
         continue;
 
@@ -191,6 +227,10 @@ ProblemT buildCyclicProblem(LoopLikeOpInterface loop,
       }
     }
   }
+
+  // Every other sink joins the terminator too. Run last, so the sink set is
+  // computed over the finished graph.
+  anchorSinks(problem, anchor);
 
   return problem;
 }
@@ -305,6 +345,11 @@ ProblemT buildWhileProblem(scf::WhileOp w, DependenceAnalysis &deps) {
       (void)problem.insertDependence(Problem::Dependence(op, anchor));
   });
 
+  // Every other sink joins the yield too. The `before` region normally reaches
+  // the anchor through the condition gate above, which is empty when the
+  // condition is a block argument or the after region is bare.
+  anchorSinks(problem, anchor);
+
   return problem;
 }
 
@@ -393,9 +438,9 @@ ProblemT buildAcyclicProblem(ArrayRef<Operation *> ops,
   return problem;
 }
 
-// Explicit instantiations: the resource-aware chaining problems are the only
-// problem types the scheduler pass builds: loops as `ChainingModuloProblem`,
-// straight-line spans as `ChainingSharedOperatorsProblem`.
+// Explicit instantiations. The scheduler pass builds only the resource-aware
+// chaining problems: loops as `ChainingModuloProblem`, straight-line spans as
+// `ChainingSharedOperatorsProblem`.
 template ChainingModuloProblem
 buildCyclicProblem<ChainingModuloProblem>(LoopLikeOpInterface,
                                           DependenceAnalysis &);

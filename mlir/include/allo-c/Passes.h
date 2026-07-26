@@ -37,7 +37,7 @@ alloEmitVerilog(MlirModule module, MlirStringCallback callback, void *userData);
 
 /// Lowers every scheduled function in `module` to structural `hw.module`s (the
 /// free-function form of `allo-datapath-to-hw`, mutating `module` in place),
-/// and streams back -- through `callback` -- a single JSON object mapping each
+/// and streams back through `callback` a single JSON object mapping each
 /// emitted module's name to its port-interface JSON (the cosim manifest, with
 /// concrete field names). `binding` names the resource-binding policy. Returns
 /// failure (callback not invoked) if emission fails.

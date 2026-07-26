@@ -7,22 +7,29 @@
 
 #include "allo-c/Schedule.h" // kPartitionAttr, kBindStorageAttr
 #include "allo/IR/AlloAttrs.h"
+#include "allo/IR/AlloOps.h" // dcp::DCPathStoreOp (post-reification)
 #include "allo/Scheduling/MemoryAccess.h" // asMemAccess (the access substrate)
 
 #include "mlir/Analysis/FlatLinearValueConstraints.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/Dialect/MemRef/IR/MemRef.h" // memref::GlobalOp / GetGlobalOp
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinTypes.h"
+#include "mlir/IR/SymbolTable.h"
 #include "llvm/ADT/STLExtras.h"
 
 using namespace mlir;
 using namespace mlir::allo;
 
-// The array root a load/store accesses (views peeled), or null. Streams are not
-// array accesses -> null (the bank model is array-only).
-static Value memRefOf(Operation *op) {
+// The storage root an access operates on (views peeled), or null for a non-
+// access. Arrays and streams are BOTH port-limited storage, an array by its
+// memory ports and a stream by its handshake, so both belong to the model. A
+// FIFO carries exactly one transfer per end per cycle; without a resource for
+// it, several accesses to one channel are free to land on the SAME cycle, which
+// the emitter can only reject (their token order would be lost).
+static Value storageOf(Operation *op) {
   auto a = asMemAccess(op);
-  return a && a->kind == AccessKind::Array ? a->root : Value();
+  return a ? a->root : Value();
 }
 
 // Look up attribute \p name on \p memRef's carrier: its defining op, else the
@@ -94,6 +101,32 @@ static unsigned portCount(MemoryPortEnum p) {
   return p == MemoryPortEnum::SinglePort ? 1u : 2u;
 }
 
+std::optional<Attribute> mlir::allo::globalInitOf(Value memRef) {
+  auto gg = memRef.getDefiningOp<memref::GetGlobalOp>();
+  if (!gg)
+    return std::nullopt;
+  auto global = SymbolTable::lookupNearestSymbolFrom<memref::GlobalOp>(
+      gg, gg.getNameAttr());
+  assert(global && "get_global references an undefined memref.global");
+  if (auto init = global.getInitialValue())
+    return *init;
+  return std::nullopt;
+}
+
+bool mlir::allo::isConstantTable(Value memRef) {
+  if (!globalInitOf(memRef))
+    return false;
+  // A write is an `affine`/`memref` store before reification and a `dcp.store`
+  // after, so cover both. Handing the array to a sub-kernel also disqualifies
+  // it, whichever way the child accesses it (see the header).
+  return llvm::none_of(memRef.getUsers(), [](Operation *u) {
+    if (isa<dcp::DCPathStoreOp, func::CallOp, dcp::DCPathInstanceOp>(u))
+      return true;
+    auto a = asMemAccess(u);
+    return a && a->isWrite;
+  });
+}
+
 // The storage implementation a memref resolves to: a complete partition
 // scatters into registers (regardless of any bind.storage impl); else an
 // explicit `bind.storage impl`; else the library's default (unbound on-chip
@@ -108,20 +141,30 @@ static MemoryImplEnum resolveImpl(Value memRef, MemoryImplEnum defaultImpl) {
 }
 
 void MemoryBankModel::observe(Operation *op) {
-  if (Value memRef = memRefOf(op))
-    byMemref[memRef].accesses.push_back(op);
+  if (Value root = storageOf(op))
+    byMemref[root].accesses.push_back(op);
 }
 
 void MemoryBankModel::finalize() {
   for (auto &entry : byMemref) {
     Value memRef = entry.first;
     MemInfo &info = entry.second;
+    // A stream channel is a FIFO, not an array: one transfer per end per cycle,
+    // no banking or storage-impl axis, and two independent ends, i.e. `splitRW`
+    // at one port each. `partitionOf` below would cast its type to MemRefType.
+    if (isa<StreamType>(memRef.getType())) {
+      info.splitRW = true;
+      info.readPorts = 1;
+      info.writePorts = 1;
+      continue;
+    }
     // Port topology from `allo.bind.storage`. A SimpleDualPort (S2P) RAM has a
     // dedicated read and write port; every other topology shares its ports for
     // reads and writes. A ROM has no write port, so it uses shared ports.
     auto bs =
         parseBindStorage(carrierAttr<DictionaryAttr>(memRef, kBindStorageAttr));
-    bool readOnly = bs.kind == MemoryKindEnum::ROM;
+    bool constTable = isConstantTable(memRef);
+    bool readOnly = bs.kind == MemoryKindEnum::ROM || constTable;
     if (bs.port == MemoryPortEnum::SimpleDualPort && !readOnly) {
       info.splitRW = true;
       info.readPorts = 1;
@@ -130,7 +173,10 @@ void MemoryBankModel::finalize() {
       info.sharedPorts = portCount(bs.port);
     }
     auto part = partitionOf(memRef);
-    info.unlimited = part.unlimited;
+    // A constant table has no port to contend for (see `isConstantTable`); a
+    // complete partition scattered the array into registers. Either way there
+    // is nothing to bind against.
+    info.unlimited = part.unlimited || constTable;
     info.partitionFactor = part.factor;
     info.cyclicAxes = std::move(part.cyclicAxes);
     bool hasBlock = part.hasBlock;
@@ -149,7 +195,7 @@ void MemoryBankModel::finalize() {
 
 std::optional<std::pair<std::string, unsigned>>
 MemoryBankModel::resource(Operation *op) const {
-  auto memRef = memRefOf(op);
+  auto memRef = storageOf(op);
   if (!memRef)
     return std::nullopt;
   auto it = byMemref.find(memRef);
@@ -187,34 +233,111 @@ MemoryBankModel::resource(Operation *op) const {
 
 namespace mlir::allo {
 
-// The banking a memref's `allo.part` implies: block/cyclic axes multiply the
-// bank count; a complete partition scatters into registers (no banks). Shared
-// by the scheduler's per-bank ResII model and the microarch's MemUnit shape.
-PartitionInfo partitionOf(Value memRef) {
-  PartitionInfo p;
+int64_t BankLayout::bankWords() const {
+  int64_t n = 1;
+  for (int64_t e : bankShape)
+    n *= e;
+  return n;
+}
+
+// The banking a memref's `allo.part` implies, in element space: each block or
+// cyclic axis splits its dimension into `factor` banks of
+// `ceil(extent/factor)`, and the axes compose in mixed radix; a complete
+// partition scatters into registers (no banks at all). See BankLayout for the
+// single definition this implements.
+BankLayout bankLayoutOf(Value memRef) {
+  BankLayout l;
+  auto mt = cast<MemRefType>(memRef.getType());
+  ArrayRef<int64_t> shape = mt.getShape();
+  l.bankShape.assign(shape.begin(), shape.end());
   auto part = carrierAttr<PartitionAttr>(memRef, kPartitionAttr);
   if (!part)
-    return p;
-  unsigned rank = cast<MemRefType>(memRef.getType()).getRank();
+    return l;
   for (PartitionAxisAttr axis : part.getPartitions()) {
-    // A complete partition scatters the array into registers -> unlimited.
+    // A complete partition scatters the array into registers: no banked
+    // storage to describe, so drop any axis seen so far.
     if (axis.getKind() == PartitionKindEnum::CompletePartition) {
-      p.unlimited = true;
-      break;
+      l.axes.clear();
+      l.bankShape.assign(shape.begin(), shape.end());
+      l.numBanks = 1;
+      l.registers = true;
+      return l;
     }
-    // Block/cyclic partitioning into `factor` banks multiplies the count.
-    p.factor *= static_cast<unsigned>(axis.getFactor());
-    if (axis.getKind() == PartitionKindEnum::CyclicPartition) {
-      // `dim == 0` partitions every dimension by this factor.
-      if (axis.getDim() == 0)
-        for (unsigned d = 0; d < rank; ++d)
-          p.cyclicAxes.push_back({d, axis.getFactor()});
-      else
-        p.cyclicAxes.push_back(
-            {static_cast<unsigned>(axis.getDim() - 1), axis.getFactor()});
+    int64_t f = axis.getFactor();
+    bool block = axis.getKind() == PartitionKindEnum::BlockPartition;
+    auto addAxis = [&](unsigned d) {
+      int64_t extent = (l.bankShape[d] + f - 1) / f;
+      l.axes.push_back({d, f, block, extent});
+      l.bankShape[d] = extent;
+      l.numBanks *= static_cast<unsigned>(f);
+    };
+    // `dim == 0` partitions every dimension by this factor.
+    if (axis.getDim() == 0)
+      for (unsigned d = 0, e = mt.getRank(); d < e; ++d)
+        addAxis(d);
+    else
+      addAxis(static_cast<unsigned>(axis.getDim() - 1));
+  }
+  return l;
+}
+
+// The coordinate expression of dimension \p k for an address map that is either
+// in element space (one result per dimension) or already linearized by
+// `dcp-flatten-memref` (one result), delinearized row-major in the latter case.
+// Dimension 0 needs no `mod`: a linear index is always below the total size.
+static AffineExpr coordExpr(AffineMap map, ArrayRef<int64_t> shape,
+                            unsigned k) {
+  unsigned rank = shape.size();
+  if (map.getNumResults() == rank)
+    return map.getResult(k);
+  AffineExpr e = map.getResult(0);
+  int64_t stride = 1;
+  for (unsigned d = k + 1; d < rank; ++d)
+    stride *= shape[d];
+  if (stride != 1)
+    e = e.floorDiv(stride);
+  return k == 0 ? e : e % shape[k];
+}
+
+std::optional<int64_t> staticBankOf(const BankLayout &layout, AffineMap map,
+                                    ArrayRef<int64_t> shape) {
+  if (!map)
+    return std::nullopt;
+  int64_t bank = 0;
+  for (const BankLayout::Axis &a : layout.axes) {
+    AffineExpr e = coordExpr(map, shape, a.dim);
+    auto one = AffineMap::get(map.getNumDims(), map.getNumSymbols(), e,
+                              map.getContext());
+    std::optional<int64_t> digit;
+    if (a.block) {
+      // A block bank is `i floordiv extent`, which is fixed only when the
+      // subscript itself is: unlike a cyclic residue, no coefficient condition
+      // pins it (a varying `i` walks from one chunk into the next).
+      if (auto cst = dyn_cast<AffineConstantExpr>(
+              simplifyAffineExpr(e, map.getNumDims(), map.getNumSymbols())))
+        digit = cst.getValue() / a.extent;
     } else {
-      p.hasBlock = true;
+      digit = staticBank(one, 0, a.factor);
     }
+    if (!digit)
+      return std::nullopt;
+    bank = bank * a.factor + *digit;
+  }
+  return bank;
+}
+
+// The aggregate projection of `bankLayoutOf`, for consumers that only need the
+// bank count / kind rather than the full decomposition.
+PartitionInfo partitionOf(Value memRef) {
+  BankLayout l = bankLayoutOf(memRef);
+  PartitionInfo p;
+  p.unlimited = l.registers;
+  p.factor = l.numBanks;
+  for (const BankLayout::Axis &a : l.axes) {
+    if (a.block)
+      p.hasBlock = true;
+    else
+      p.cyclicAxes.push_back({a.dim, a.factor});
   }
   return p;
 }
@@ -290,7 +413,8 @@ MemoryChar allo::characterize(Value memref, MemoryImplEnum defaultImpl) {
   MemoryChar c;
   auto bs =
       parseBindStorage(carrierAttr<DictionaryAttr>(memref, kBindStorageAttr));
-  c.readOnly = bs.kind == MemoryKindEnum::ROM;
+  c.constantTable = isConstantTable(memref);
+  c.readOnly = bs.kind == MemoryKindEnum::ROM || c.constantTable;
   c.portsPerBank = portCount(bs.port);
   auto part = partitionOf(memref);
   c.numBanks = part.factor;

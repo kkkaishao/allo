@@ -273,11 +273,9 @@ void VivadoHLSEmitter::emitFunctionDirectives(func::FuncOp func) {
              << " depth=" << streamFifoDepth(streamType) << "\n";
   }
 
-  // Globals (stateful variables / list-initialized constants) lower to
-  // file-scope statics; a scheduled array_partition on such a global is
-  // recorded on its `memref.global` op (see transform::PartitionOp). The pragma
-  // is function-scoped but a static is visible everywhere, so emit every
-  // global's pragma once, in the top function.
+  // Globals lower to file-scope statics, and a scheduled array_partition on
+  // one is recorded on its `memref.global`. The pragma is function-scoped but a
+  // static is visible everywhere, so emit each global's pragma in the top.
   if (isTopFunc(func)) {
     for (auto global :
          func->getParentOfType<ModuleOp>().getOps<memref::GlobalOp>()) {
@@ -486,8 +484,7 @@ void VivadoHLSEmitter::emitAffineIf(affine::AffineIfOp op) {
     if (idx)
       os.indent(state.currentIndent);
     emitValueDecl(result);
-    os << ";\n"; // leave it uninitialized for now, will be assigned in the
-                 // then/else blocks
+    os << ";\n"; // uninitialized here; the then/else blocks assign it
   }
   if (op.getNumResults())
     os.indent(state.currentIndent);
@@ -602,8 +599,7 @@ void VivadoHLSEmitter::emitValueRef(Value val) {
 void VivadoHLSEmitter::emitSignedOperand(Value value, bool isSigned) {
   // The local's declared C++ type already fixes its signedness, so only cast
   // when the consumer wants the other one. A same-rendered-type cast is a
-  // textual no-op -- e.g. index always renders signed, or the value was already
-  // declared with the wanted signedness.
+  // textual no-op: index, for instance, always renders signed.
   if (getTypeName(value.getType(), state.signednessOf(value)) ==
       getTypeName(value.getType(), isSigned)) {
     emitValueRef(value);
@@ -816,9 +812,8 @@ void VivadoHLSEmitter::emitMemrefAlloc(memref::AllocOp op) {
   emitValueDecl(op.getResult(), isSigned);
   os << ";";
   // A local on-chip buffer may carry an `allo.part` attribute from a scheduled
-  // array_partition (e.g. reuse buffers that must feed a systolic array at full
-  // bandwidth). Emit the matching pragma -- the arg path above only covers
-  // function arguments.
+  // array_partition (e.g. a reuse buffer feeding a systolic array at full
+  // bandwidth); the arg path above only covers function arguments.
   if (auto partAttr = op->getAttrOfType<allo::PartitionAttr>(kPartitionAttr)) {
     os << "\n";
     emitPartitionPragma(partAttr, state.getName(op.getResult()));
@@ -860,11 +855,8 @@ void VivadoHLSEmitter::emitMemrefGlobal(memref::GlobalOp op) {
   auto dense =
       initValue ? dyn_cast<DenseElementsAttr>(*initValue) : DenseElementsAttr();
   // A global with a constant initializer is defined at file scope (internal
-  // linkage) so its initial value -- and any state it accumulates across
-  // top-function calls -- survives into csim and synthesis. A global without an
-  // initializer stays an `extern` declaration defined in another translation
-  // unit. `emitModule` emits all globals before any function, so the definition
-  // is always in scope at the point of use.
+  // linkage) so its value survives across top-function calls into csim and
+  // synthesis; otherwise it is an `extern` decl. All globals precede functions.
   if (!dense) {
     os << "extern " << getTypeName(type) << " "
        << getSymbolName(op.getSymName());
@@ -987,8 +979,7 @@ void VivadoHLSEmitter::emitIf(scf::IfOp op) {
     if (idx)
       os.indent(state.currentIndent);
     emitValueDecl(result);
-    os << ";\n"; // leave it unintialized for now, will be assigned in the
-                 // then/else blocks
+    os << ";\n"; // uninitialized here; the then/else blocks assign it
   }
   if (op.getNumResults())
     os.indent(state.currentIndent);
@@ -1190,9 +1181,7 @@ void VivadoHLSEmitter::emitWhile(scf::WhileOp op) {
   emitBlock(*op.getBeforeBody());
   // scf.condition forwards its operands to the after-region arguments and to
   // the while results; alias both to the names produced in the before region.
-  // The after region's scf.yield then writes the next state back into the
-  // loop-carried variables via emitSCFYield (whose parent results are these
-  // aliases).
+  // The after region's scf.yield then writes the next state back through those.
   for (auto [afterArg, condArg] :
        llvm::zip(op.getAfterArguments(), condOp.getArgs()))
     state.nameTable[afterArg] = state.getName(condArg);
@@ -1260,8 +1249,8 @@ void VivadoHLSEmitter::dispatch(Operation *op) {
       // Vitis has no ceildiv/floordiv
 
       // max/min ops: signless integer values default to unsigned C++ types, so
-      // cast operands to match the op's signedness -- otherwise a signed maxsi
-      // on a negative value would compare as unsigned.
+      // cast operands to match the op's signedness; otherwise a signed maxsi on
+      // a negative value would compare as unsigned.
       .Case<arith::MaxSIOp>(
           [&](auto op) { emitPrefixBinaryOp(op, "std::max", true); })
       .Case<arith::MinSIOp>(
@@ -1510,9 +1499,8 @@ void VivadoHLSEmitter::emitCmpI(arith::CmpIOp op) {
   emitValueDecl(op.getResult());
   os << " = ";
   // eq/ne give the same result for either signedness; ordered comparisons do
-  // not, so cast the signless operands to the predicate's signedness -- without
-  // it a signed slt on a negative (default-unsigned) value compares as
-  // unsigned.
+  // not, so cast the signless operands to the predicate's signedness. Without
+  // it a signed slt on a negative (default-unsigned) value compares unsigned.
   if (pred == arith::CmpIPredicate::eq || pred == arith::CmpIPredicate::ne) {
     emitValueRef(op.getLhs());
     os << " " << getCmpIPredString(pred) << " ";

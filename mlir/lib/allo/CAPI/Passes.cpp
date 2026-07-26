@@ -4,7 +4,7 @@
  */
 
 #include "allo-c/Passes.h"
-#include "allo/Microarch/HWEmitter.h"
+#include "allo/Microarch/EmitDriver.h"
 #include "allo/Scheduling/Utils.h"
 
 #include "allo/Translation/VerilogEmitter.h"

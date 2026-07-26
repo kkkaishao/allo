@@ -100,8 +100,8 @@ FailureOr<AffineExpr> AffineValueMapBuilder::importValueInternal(Value v) {
     auto rhs = importValueInternal(mulOp.getRhs());
     if (failed(lhs) || failed(rhs))
       return cacheFailure(v);
-    // multiplication of affine exprs is not affine unless one of them is a
-    // symbol d0 * d1 is not affine, but s0 * d0 or s0 * s1 is affine.
+    // Multiplication is affine only when one side is a symbol: d0 * d1 is not
+    // affine, but s0 * d0 and s0 * s1 are.
     auto result = *lhs * *rhs;
     if (!result.isPureAffine())
       return cacheFailure(v);
@@ -112,8 +112,7 @@ FailureOr<AffineExpr> AffineValueMapBuilder::importValueInternal(Value v) {
     auto rhs = importValueInternal(defOp->getOperand(1));
     if (failed(lhs) || failed(rhs))
       return cacheFailure(v);
-    // division of affine exprs is not affine unless the divisor is a symbol or
-    // constant
+    // Division is affine only when the divisor is a symbol or a constant.
     auto result = lhs->floorDiv(*rhs);
     if (!result.isPureAffine())
       return cacheFailure(v);
@@ -124,8 +123,7 @@ FailureOr<AffineExpr> AffineValueMapBuilder::importValueInternal(Value v) {
     auto rhs = importValueInternal(defOp->getOperand(1));
     if (failed(lhs) || failed(rhs))
       return cacheFailure(v);
-    // remainder of affine exprs is not affine unless the divisor is a symbol or
-    // constant
+    // Remainder is affine only when the divisor is a symbol or a constant.
     auto result = *lhs % *rhs;
     if (!result.isPureAffine())
       return cacheFailure(v);

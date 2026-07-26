@@ -30,28 +30,73 @@ _UINT = {8: np.uint8, 16: np.uint16, 32: np.uint32, 64: np.uint64}
 #   control: {clk, rst, start, done}, the fixed control ABI
 #   scalars: [{arg, width, name}]
 #   streams: [{arg, input, depth, width, base, data, valid, ready}]
-#   reads / writes: [[{arg, bank, factor, width, latency, base, addr, data, [we]}]]
+#   reads / writes: [[{arg, bank, factor, width, latency, base, addr, data, [we],
+#                      [shape], [axes: [{dim, factor, block}]]}]]
+#     `shape`/`axes` appear only for a partitioned argument: they are the
+#     emitter's element-space bank decomposition (``allo::BankLayout``), which
+#     the host replays to shard the argument across its bank interfaces.
 #   results: [{width, name}]
 #   operators: [{module, impl, predicate, ports: [{name, width, role, input}]}]
 
 
+def bank_elements(shape, axes, bank: int) -> np.ndarray:
+    """The flat element indices bank ``bank`` holds, in in-bank offset order.
+
+    The host-side mirror of the emitter's element-space bank decomposition
+    (``allo::BankLayout``): a cyclic axis of factor ``F`` puts element ``i`` in
+    bank ``i % F`` at local ``i // F``; a block axis puts it in bank
+    ``i // extent`` at ``i % extent``, ``extent = ceil(dim / F)``. Axes compose
+    in mixed radix, in the order the emitter applied them, so the inverse walks
+    them in reverse. ``-1`` marks a padding word, i.e. a bank slot with no
+    element behind it, left over when a factor does not divide its dimension.
+    """
+    bank_shape = list(shape)
+    peeled = []  # (dim, factor, block, extent), in the order the emitter applied
+    for a in axes:
+        dim, factor = a["dim"], a["factor"]
+        extent = -(-bank_shape[dim] // factor)
+        peeled.append((dim, factor, bool(a["block"]), extent))
+        bank_shape[dim] = extent
+    # `bank` in mixed radix over the axis factors, most significant first.
+    digits, rest = [], bank
+    for _, factor, _, _ in reversed(peeled):
+        digits.append(rest % factor)
+        rest //= factor
+    digits.reverse()
+    # Rebuild each original coordinate from this bank's local coordinate grid,
+    # undoing the axes in reverse (a later axis split what an earlier one left).
+    coord = list(np.indices(bank_shape))
+    for (dim, factor, block, extent), digit in zip(reversed(peeled), reversed(digits)):
+        coord[dim] = (
+            coord[dim] + digit * extent if block else coord[dim] * factor + digit
+        )
+    flat, stride, valid = 0, 1, True
+    for k in reversed(range(len(shape))):
+        flat = flat + coord[k] * stride
+        valid = valid & (coord[k] < shape[k])
+        stride *= shape[k]
+    return np.where(valid, flat, -1).reshape(-1)
+
+
 @dataclass
 class Mem:
-    """One backing array behind an external kernel argument -- one *bank* of it
-    when the argument is partitioned (a cyclic ``bank::factor`` slice) -- with the
-    ports that read from / write to it. ``readers`` are ``{addr, data, latency}``
-    port-name dicts, ``writers`` are ``{addr, data, we, latency}`` (the concrete
-    field names the emitter chose). ``latency`` is the device access latency the
-    schedule was solved against, and the driver must honor it (see
-    ``_serve_mem``).
-    ``writeback`` marks an argument the kernel writes."""
+    """One backing array behind an external kernel argument (one *bank* of it
+    when the argument is partitioned), with the ports that read from / write to
+    it. ``readers`` are ``{addr, data, latency}`` port-name dicts, ``writers``
+    are ``{addr, data, we, latency}`` (the concrete field names the emitter
+    chose). ``latency`` is the device access latency the schedule was solved
+    against, and the driver must honor it (see ``_serve_mem``).
+    ``writeback`` marks an argument the kernel writes. ``elements`` is this
+    bank's flat index per in-bank offset (see :func:`bank_elements`), the one
+    place the host's layout meets the RTL's address arithmetic."""
 
     arg: int
     np_dtype: type
     width: int  # element bit width
     size: int  # elements in this bank (== the flattened argument when unbanked)
-    bank: int = 0  # which cyclic bank of the argument (0 when unbanked)
-    factor: int = 1  # the argument's partition factor (1 when unbanked)
+    bank: int = 0  # which bank of the argument (0 when unbanked)
+    factor: int = 1  # the argument's total bank count (1 when unbanked)
+    elements: np.ndarray | None = None  # flat index per offset (None = unbanked)
     readers: list[dict] = field(default_factory=list)
     writers: list[dict] = field(default_factory=list)
 
@@ -60,17 +105,22 @@ class Mem:
         return bool(self.writers)
 
     def slice_in(self, array: np.ndarray, width: int) -> np.ndarray:
-        """This bank's flat uint bit pattern of ``array`` (a ``bank::factor``
-        cyclic slice for a partitioned argument, the whole array otherwise)."""
+        """This bank's flat uint bit pattern of ``array`` (its own elements for a
+        partitioned argument, the whole array otherwise). A padding slot reads 0.
+        """
         bits = bit_pattern(array, self.np_dtype, width)
-        return bits[self.bank :: self.factor] if self.factor > 1 else bits
+        if self.elements is None:
+            return bits
+        return np.where(self.elements >= 0, bits[np.maximum(self.elements, 0)], 0)
 
     def scatter_out(self, array: np.ndarray, values: np.ndarray) -> None:
-        """Write this bank's ``values`` back into ``array`` at its cyclic slice."""
-        if self.factor > 1:
-            array.reshape(-1)[self.bank :: self.factor] = values
-        else:
+        """Write this bank's ``values`` back into ``array`` at its own elements,
+        skipping padding slots."""
+        if self.elements is None:
             array[...] = values.reshape(array.shape)
+            return
+        live = self.elements >= 0
+        array.reshape(-1)[self.elements[live]] = values[live]
 
 
 def _elem(arg_type) -> tuple[type, int, int]:
@@ -93,9 +143,16 @@ def plan_mems(interface: dict, arg_types) -> list[Mem]:
         key = (arg, bank)
         if key not in mems:
             np_dt, width, total = _elem(arg_types[arg])
-            # Cyclic bank `bank` holds elements bank, bank+factor, ...
-            size = (total - bank + factor - 1) // factor if factor > 1 else total
-            mems[key] = Mem(arg, np_dt, width, size, bank=bank, factor=factor)
+            elements = None
+            if factor > 1:
+                # The emitter published this argument's bank decomposition; the
+                # bank's depth is one slot per in-bank offset, padding included,
+                # which is exactly the RTL bank's address space.
+                elements = bank_elements(port["shape"], port["axes"], bank)
+                total = int(elements.size)
+            mems[key] = Mem(
+                arg, np_dt, width, total, bank=bank, factor=factor, elements=elements
+            )
         return mems[key]
 
     for acc in interface["reads"]:

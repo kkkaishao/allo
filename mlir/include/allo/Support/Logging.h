@@ -28,12 +28,12 @@ enum class Stage { Prep, Sched, Dcp, Emit };
 namespace detail {
 // Format `[LEVEL][STAGE] message[ (at where)]` and route to the backend. For
 // `Level::Error` with a non-null `subject`, additionally emit an MLIR error
-// diagnostic on it, so a fatal error both logs and propagates (fails the pass /
-// surfaces to the caller) -- the logger augments MLIR error reporting, it does
-// not replace it.
+// diagnostic on it, so a fatal error both logs and propagates: it fails the
+// pass and surfaces to the caller. The logger augments MLIR error reporting
+// rather than replacing it.
 void emit(Level level, Stage stage, llvm::StringRef where,
           llvm::StringRef message, mlir::Operation *subject);
-// Whether `level` currently passes the threshold (skip building dropped lines).
+// Whether `level` passes the threshold (skip building dropped lines).
 // `Level::Error` is never filtered.
 bool enabled(Level level);
 // Concise source anchor for an op / location (symbolic name + file:line:col).

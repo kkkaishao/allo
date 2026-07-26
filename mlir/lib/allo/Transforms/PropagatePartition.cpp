@@ -49,10 +49,9 @@ struct PropagatePartitionPass
       error(Stage::Prep, module) << "Top function '" << top << "' not found";
       return signalPassFailure();
     }
-    // Callsites, callees-before-callers (the scheduler's own order). Reversed,
-    // that is callers-before-callees: a callee's parameters carry their final
-    // partition before the calls *inside* it are visited, so a partition
-    // propagates the whole depth of the call graph in one pass.
+    // Callsites in callee-before-caller order; reversed, a callee's parameters
+    // carry their final partition before the calls inside it are visited, so a
+    // partition propagates the whole depth of the call graph in one pass.
     auto orderOr = buildAndSortCallsiteGraph(topFunc);
     if (failed(orderOr))
       return signalPassFailure();

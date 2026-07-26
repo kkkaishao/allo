@@ -30,7 +30,7 @@ static bool isCounted(Operation *op) {
   return isa<affine::AffineForOp, scf::ForOp>(op);
 }
 
-// A loop pipelined by `s.pipeline(ii != -1)` -- its body must become loop-free.
+// A loop pipelined by `s.pipeline(ii != -1)`; its body must become loop-free.
 static bool isPipelined(Operation *op) {
   auto attr = op->getAttrOfType<IntegerAttr>(kPipelineIIAttr);
   return attr && attr.getInt() != -1;
@@ -105,7 +105,7 @@ struct UnrollUnderPipelinePass
 
     for (Operation *loop : targets) {
       if (!innermostNestedLoop(loop))
-        continue; // already a single loop -- nothing to unroll
+        continue; // already a single loop, nothing to unroll
       if (!innerLoopsUnrollable(loop)) {
         logging::warn(logging::Stage::Prep, loop)
             << "pipelined loop has a dynamic or uncounted inner loop; not "

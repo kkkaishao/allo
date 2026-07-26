@@ -5,6 +5,7 @@
 
 #include "allo/Scheduling/MemoryAccess.h" // asMemAccess (array subscripts)
 #include "allo/Scheduling/MemoryModel.h"  // partitionOf (cyclic axes)
+#include "allo/Scheduling/RegionGraph.h"  // isSyncSubKernelCall
 #include "allo/Support/Logging.h"
 #include "allo/Transforms/Passes.h"
 
@@ -27,10 +28,10 @@ using namespace mlir::allo::logging;
 namespace {
 
 // A loop may be coalesced iff it is normalized (lower bound 0, step 1) with a
-// constant trip count -- the form that keeps the coalesced body pure-affine --
-// and carries no iter_args: `coalesceLoops` merges the induction spaces but
-// drops loop-carried values, so coalescing a nest with an inner accumulator
-// silently rewrites it to the init constant (wrong code). Leave such nests be.
+// constant trip count, the form that keeps the coalesced body pure-affine, and
+// carries no iter_args. `coalesceLoops` merges the induction spaces but drops
+// loop-carried values, so coalescing a nest with an inner accumulator silently
+// rewrites it to the init constant. Leave such nests be.
 bool isFlattenable(affine::AffineForOp loop) {
   return loop.getInits().empty() && loop.hasConstantLowerBound() &&
          loop.getConstantLowerBound() == 0 && loop.getStepAsInt() == 1 &&
@@ -38,8 +39,8 @@ bool isFlattenable(affine::AffineForOp loop) {
 }
 
 // Whether the affine map's \p dim-th result (a subscript) is a function of the
-// value \p v -- i.e. \p v feeds that subscript, over \p operands (dims then
-// symbols, as an affine access carries them).
+// value \p v, i.e. whether \p v feeds that subscript over \p operands (dims
+// then symbols, as an affine access carries them).
 bool resultUsesValue(AffineMap map, ValueRange operands, unsigned dim,
                      Value v) {
   bool used = false;
@@ -60,8 +61,8 @@ bool resultUsesValue(AffineMap map, ValueRange operands, unsigned dim,
 // Whether \p loop's induction variable indexes a *cyclic-partitioned* dimension
 // of any array accessed in its body. Coalescing such a loop delinearizes the IV
 // (`iv floordiv N`), which turns the partition-dim subscript into a
-// non-iteration-invariant expression -- defeating `MemoryModel::staticBank`, so
-// the array falls back to a runtime crossbar instead of a static per-bank
+// non-iteration-invariant expression. That defeats `MemoryModel::staticBank`,
+// so the array falls back to a runtime crossbar instead of a static per-bank
 // split. Leave the loop uncoalesced so banking stays static.
 bool carriesPartition(affine::AffineForOp loop) {
   Value iv = loop.getInductionVar();
@@ -76,6 +77,21 @@ bool carriesPartition(affine::AffineForOp loop) {
         carries = true;
   });
   return carries;
+}
+
+// Whether \p loop's body holds a synchronous sub-kernel call. Coalescing such a
+// nest delinearizes the induction variables into `iv floordiv N` / `iv mod N`
+// address arithmetic, which lands in the body *beside* the call and forces the
+// merged loop to decompose into an arithmetic sub-region plus a call
+// sub-region, run serially per iteration. Left uncoalesced, the inner loop
+// stays a lone call the loop-over-calls controller fires directly.
+bool callsSubKernel(affine::AffineForOp loop) {
+  return loop
+      .walk([](Operation *op) {
+        return isSyncSubKernelCall(op) ? WalkResult::interrupt()
+                                       : WalkResult::advance();
+      })
+      .wasInterrupted();
 }
 
 // A loop is the root of a perfect nest unless its parent is an affine.for that
@@ -107,9 +123,9 @@ struct FlattenPerfectLoopsPass
       affine::getPerfectlyNestedLoops(nest, root);
       unsigned n = 0;
       // Stop the coalescable band at a partition-carrying loop, so its IV stays
-      // a bare index and the array banks statically (banking-design.md).
+      // a bare index and the array banks statically.
       while (n < nest.size() && isFlattenable(nest[n]) &&
-             !carriesPartition(nest[n]))
+             !carriesPartition(nest[n]) && !callsSubKernel(nest[n]))
         ++n;
       if (n >= 2) {
         auto loops = MutableArrayRef<affine::AffineForOp>(nest).take_front(n);

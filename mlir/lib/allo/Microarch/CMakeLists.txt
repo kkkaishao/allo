@@ -8,10 +8,12 @@ add_mlir_library(MLIRAlloMicroarch
     ControlEmitter.cpp
     DatapathEmitter.cpp
     HWEmitter.cpp
+    EmitDriver.cpp
+    Primitives.cpp
     Naming.cpp
     Reservation.cpp
-    ConcurrentEmitter.cpp
     Interface.cpp
+    Verify.cpp
 
     DEPENDS
     MLIRAlloIncGen

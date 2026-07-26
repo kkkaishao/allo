@@ -258,10 +258,9 @@ struct StreamCreateLowering : public OpConversionPattern<StreamCreateOp> {
                              TypeRange{i64}, operands);
     call->setAttr(kCreateAttr, rewriter.getUnitAttr());
 
-    // Initial tokens (feedback seeding): preload each into lane 0 in order, so
-    // they become the earliest tokens in the channel history. The create + seed
-    // calls run before any PE fiber is spawned (they precede the invokes in the
-    // top region), so the FIFO is seeded single-threaded before first use.
+    // Initial tokens (feedback seeding): preload each into lane 0 in order so
+    // they lead the channel history. The create and seed calls precede the
+    // invokes, so the FIFO is seeded single-threaded before any fiber spawns.
     if (ArrayAttr init = op.getInitAttr()) {
       Value handle = call.getResult(0);
       Value lane0 = makeI64Constant(rewriter, loc, 0);

@@ -10,6 +10,7 @@ add_mlir_library(MLIRAlloTranslation
 
   LINK_LIBS PUBLIC
   MLIRAllo
+  CIRCTSV
   CIRCTSeqTransforms
   CIRCTSeqToSV
   CIRCTHWToSV

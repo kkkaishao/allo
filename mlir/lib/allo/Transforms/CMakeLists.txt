@@ -13,6 +13,7 @@ add_mlir_library(MLIRAlloTransforms
     FlattenDcpMemref.cpp
     ResolveBanking.cpp
     PropagatePartition.cpp
+    OutlineLooseProcesses.cpp
     PerfectizeLoopNest.cpp
     RaiseCountedWhile.cpp
     UnrollUnderPipeline.cpp

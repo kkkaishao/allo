@@ -46,7 +46,7 @@ def PartitionAttr : Allo_Attr<"Partition"> {
 }
 
 //===----------------------------------------------------------------------===//
-// Dependence-hint enums (mirror `#pragma HLS dependence`; see allo.assume.nodep)
+// Dependence-hint enums (`#pragma HLS dependence`) for allo.assume.nodep
 //===----------------------------------------------------------------------===//
 
 def AssumeDepInter : I32EnumAttrCase<"Inter", 0, "inter">;
@@ -72,9 +72,8 @@ def AssumeDepDirAttr : EnumAttr<Allo_Dialect, AssumeDepDirEnum, "dep_dir">;
 
 //===----------------------------------------------------------------------===//
 // Memory-model enums: the RTL backend's own storage vocabulary, decoupled from
-// the Vitis `bind_storage` pragma strings. A bridge util maps the legacy strings
-// (bram / ram_s2p / rom_1p / ...) onto these; the frontend will eventually attach
-// them directly (see drafts/memory-model-design.md). The three axes are
+// the Vitis `bind_storage` pragma strings. A bridge util maps those pragma
+// strings (bram / ram_s2p / rom_1p / ...) onto these. The three axes are
 // orthogonal: implementation primitive, port topology, and read-only-ness.
 //===----------------------------------------------------------------------===//
 
@@ -117,15 +116,14 @@ def MemoryKindEnum : I32EnumAttr<"MemoryKindEnum",
 def MemoryKindAttr : EnumAttr<Allo_Dialect, MemoryKindEnum, "mem_kind">;
 
 //===----------------------------------------------------------------------===//
-// Determinacy: the scheduling-determinacy class of a dcp region / kernel -- the
-// discriminant that selects the controller regime (drafts/dcp-to-microarch-
-// theory.md) and the composition wiring (time-triggered vs handshake vs
-// broadcast). Declared in the IR (set by the reifier) rather than re-derived at
-// every consumer (drafts/emitter-systematization-guideline.md, Phase B).
-//   * counted_static -- exact compile-time latency (static trip / length);
-//   * conditional    -- a while loop / data-dependent guard (flushing exit);
-//   * indeterminate  -- dynamic-trip / bounded / unknown-length (no exact span);
-//   * concurrent     -- a dataflow container (async spawns; self-timed).
+// Determinacy: the scheduling-determinacy class of a dcp region or kernel. It
+// is the discriminant that selects the controller regime and the composition
+// wiring (time-triggered vs handshake vs broadcast). The reifier declares it in
+// the IR so that no consumer has to re-derive it.
+//   * counted_static: exact compile-time latency (static trip / length);
+//   * conditional:    a while loop or data-dependent guard (flushing exit);
+//   * indeterminate:  dynamic-trip, bounded or unknown-length (no exact span);
+//   * concurrent:     a dataflow container (async spawns; self-timed).
 //===----------------------------------------------------------------------===//
 
 def DetCountedStatic : I32EnumAttrCase<"CountedStatic", 0, "counted_static">;

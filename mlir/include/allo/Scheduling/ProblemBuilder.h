@@ -29,14 +29,14 @@ ProblemT buildCyclicProblem(LoopLikeOpInterface loop, DependenceAnalysis &deps);
 /// aligning inits/before-args/after-args/yield/results by one slot index.
 bool whileHasIdentityForwarding(scf::WhileOp w);
 
-/// Whether an `scf.while`'s continue-condition is combinational -- settled the
-/// cycle the loop issues, so the while can flushing-pipeline. False when the
-/// condition cone (the before region, which under identity forwarding only
+/// Whether an `scf.while`'s continue-condition is combinational, i.e. settled
+/// the cycle the loop issues, so the while can flushing-pipeline. False when
+/// the condition cone (the before region, which under identity forwarding only
 /// computes the condition) holds a multi-cycle op per \p lib: a memory read
 /// (`while (A[i] != key)`) or a latency IP (a float compare, `while (r >
-/// tol)`). A non-combinational condition routes -- in lockstep at the scheduler
-/// and the reifier, the two sites sharing this one predicate -- to the
-/// sequential CHECK/RUN controller, which waits for the condition to settle.
+/// tol)`). A non-combinational condition routes to the sequential CHECK/RUN
+/// controller, which waits for the condition to settle. The scheduler and the
+/// reifier share this one predicate, so they route in lockstep.
 bool conditionIsCombinational(scf::WhileOp w, const OperatorLibrary &lib);
 
 /// Build a cyclic scheduling problem for an uncounted `scf.while` (its before +

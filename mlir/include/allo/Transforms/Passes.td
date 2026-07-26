@@ -25,8 +25,8 @@ def GridMappingPass : Pass<"grid-mapping", "ModuleOp"> {
 def DataflowSpawnPass : Pass<"dataflow-spawn", "ModuleOp"> {
   let summary = "Launch tagged dataflow PEs as fibers on the marl runtime.";
   let description = [{
-    Rewrite the (already LLVM-lowered) sequential calls to dataflow PEs -- the
-    callees tagged `allo.dataflow.pe` by lower-dataflow -- into concurrent fiber
+    Rewrite the (already LLVM-lowered) sequential calls to dataflow PEs, the
+    callees tagged `allo.dataflow.pe` by lower-dataflow, into concurrent fiber
     spawns onto the marl runtime: `allo_df_open` / `allo_df_spawn` per PE (with a
     generated `void(ptr)` thunk that reloads the PE's operands from an alloca'd
     context) / `allo_df_join` / `allo_df_close`. Run after the module is in the
@@ -42,8 +42,8 @@ def FoldConstantCallsPass : Pass<"fold-constant-calls", "ModuleOp"> {
     enters the IR as an `allo.kernel` tagged `allo.lazy` (fast filter) and is
     called via `allo.invoke`. Once grid-mapping has specialized the call sites so
     every invoke argument is constant, this pass evaluates each invoke at compile
-    time, replaces it with the constant result, and deletes the now-unused lazy
-    kernels -- so they never reach codegen. Evaluation clones the kernel body
+    time, replaces it with the constant result, and deletes the unused lazy
+    kernels so they never reach codegen. Evaluation clones the kernel body
     into a throwaway func.func, substitutes the constant arguments, and folds it
     to a constant via a fixpoint of canonicalize + CSE + affine store-to-load
     forwarding (so local scratch arrays fold) + full unrolling of constant-trip
@@ -98,25 +98,26 @@ def FoldIfStatementsPass
   let description = [{
     A collection of rewrites that remove or simplify `if` control flow so the SDC
     scheduler sees as little of it as possible inside a loop body. Greedily
-    applied; the home for all `if`-oriented transforms. Currently:
+    applied; the home for all `if`-oriented transforms:
 
     * **Hyperblock predication.** Flatten an `affine.if`/`scf.if` into a single
       predicated (hyperblock) datapath. The branch condition is an `i1`
       (materialized from the `affine.if` integer set, or taken directly from
-      `scf.if`); both branches are speculated -- side-effect-free ops and loads
-      hoisted unconditionally, value results become `arith.select`, each guarded
-      store a predicated read-modify-write (`store select(cond, v, load)`), and
-      each guarded stream `get`/`put` gated on the condition via its i1 predicate
-      operand (the token is consumed/produced only where the branch is taken,
-      keeping the access in the pipelined region). An `if` whose body holds an
-      un-maskable side effect (a nested region -- loop / inner if -- a call, or
-      any other effecting op) is not predicated.
+      `scf.if`); both branches are speculated, with side-effect-free ops and
+      loads hoisted unconditionally, value results becoming `arith.select`, each
+      guarded store a predicated read-modify-write (`store select(cond, v,
+      load)`), and each guarded stream `get`/`put` gated on the condition via
+      its i1 predicate operand (the token is consumed/produced only where the
+      branch is taken, keeping the access in the pipelined region). An `if`
+      whose body holds an un-maskable side effect (a nested region such as a
+      loop or an inner if, a call, or any other effecting op) is not
+      predicated.
     * **Guard-to-bound (affine index-set splitting).** When an `affine.if` guards
       the *entire* body of its enclosing `affine.for` with a single inequality
       that is affine in the loop's induction variable, fold the guard into the
       loop's bounds (`for j in [0,N): if j > i` -> `for j in [i+1,N)`) and drop
-      the `if`. This eliminates the control construct entirely -- the dead
-      iterations are skipped, not just masked -- and only applies to `affine.if`
+      the `if`. This eliminates the control construct entirely, skipping the
+      dead iterations rather than masking them, and only applies to `affine.if`
       (its predicate is a static function of the IVs; a data-dependent `scf.if`
       cannot be folded this way).
 
@@ -180,7 +181,7 @@ def FlattenDcpMemrefPass
     `floordiv`/`mod` address map the datapath emitter cannot lower. Since the
     backend's memories are already flat, row-major storage, this pass composes the
     memref's row-major linearization into each access map, folding the
-    `floordiv`/`mod` back into the plain linear index (`A_flat[iv]`) -- the
+    `floordiv`/`mod` back into the plain linear index (`A_flat[iv]`). The
     delinearize/linearize pair cancels, so the emitted address is the bare
     counter, matching Vitis's flat-array addressing. Only maps that actually carry
     a `floordiv`/`mod` are touched; a plain multi-dim map is already linearized by
@@ -199,16 +200,17 @@ def ResolveBankingPass
     A DCP-normalization pass (runs after `convert-schedule-to-dcp`, before
     `dcp-flatten-memref`). An `allo.part` cyclic partition asks for N physical
     banks; this pass materializes them for an **internal** array (a
-    `memref.alloc`/`alloca`) whose every access is *statically banked* -- the
+    `memref.alloc`/`alloca`) whose every access is *statically banked*: the
     partition-dim subscript is iteration-invariant modulo the factor, so each
     access hits a compile-time-constant bank (`MemoryModel::staticBank`, the same
     predicate the scheduler bound its per-bank ResII against). It creates one
     per-bank alloc (bank-shaped, no partition attribute) and routes each access to
     its bank with the in-bank offset (`i_d floordiv F`), reusing the scheduler's
     static-bank decision so the physical banks match. The emitter then sees N
-    plain (`numBanks == 1`) memories -- no banking logic. A partitioned array with
-    a data-dependent bank (or an external/argument array) is left untouched, so it
-    reaches the emitter still `numBanks > 1` -- the crossbar fallback.
+    plain (`numBanks == 1`) memories with no banking logic. A partitioned array
+    with a data-dependent bank (or an external/argument array) is left
+    untouched, so it reaches the emitter still `numBanks > 1`, the crossbar
+    fallback.
   }];
   let dependentDialects = [
     "mlir::affine::AffineDialect", "mlir::memref::MemRefDialect"
@@ -221,14 +223,15 @@ def UnrollUnderPipelinePass
   let description = [{
     Pipelining a loop implies its body is a single straight-line datapath
     clocked at one II, so every loop nested inside a pipelined loop
-    (`allo.pipeline.ii` != -1) must be fully unrolled into it -- matching Vitis,
+    (`allo.pipeline.ii` != -1) must be fully unrolled into it, matching Vitis,
     where `#pragma HLS pipeline` on an outer loop auto-unrolls the inner loops.
-    The now-single pipelined loop is then scheduled by the existing
+    The resulting single pipelined loop is then scheduled by the
     innermost-pipeline path at its target II.
 
     A nested loop that is not a constant-trip counted loop (a dynamic bound, or
-    an `scf.while`) cannot be unrolled -- the pipeline cannot be formed -- so the
-    loop is left unchanged with a remark (falls back to scheduling the innermost).
+    an `scf.while`) cannot be unrolled, so the pipeline cannot be formed and the
+    loop is left unchanged with a remark (falls back to scheduling the
+    innermost).
   }];
   let dependentDialects = [
     "mlir::affine::AffineDialect", "mlir::scf::SCFDialect"
@@ -239,11 +242,11 @@ def PerfectizeLoopNestPass
     : Pass<"perfectize-loop-nest", "func::FuncOp"> {
   let summary = "Perfectize an imperfect loop nest by sinking prologue/epilogue";
   let description = [{
-    Turn an imperfect loop nest -- an outer counted loop (`affine.for`/`scf.for`)
-    whose body is `{ prologue ops..., inner loop, epilogue ops... }` -- into a
-    perfect one so the existing perfect-nest scheduler pipelines it (otherwise the
-    driver skips the whole nest, losing even the inner loop). The surrounding ops
-    are sunk into the inner loop: the epilogue under a last-iteration guard
+    Turn an imperfect loop nest, an outer counted loop (`affine.for`/`scf.for`)
+    whose body is `{ prologue ops..., inner loop, epilogue ops... }`, into a
+    perfect one so the perfect-nest scheduler pipelines it (otherwise the driver
+    skips the whole nest, losing even the inner loop). The surrounding ops are
+    sunk into the inner loop: the epilogue under a last-iteration guard
     (remapping the inner loop's results to its yielded values); a prologue store
     under a first-iteration guard (runs once, e.g. an accumulator init); a pure
     prologue op / a load of a memref not written in the nest unguarded
@@ -274,10 +277,11 @@ def ReassociateReductionsPass
     recurrence spans a single operator, and balances a straight-line (fully
     unrolled) chain to cut its datapath depth from linear to logarithmic.
 
-    Floating-point reassociation is not bit-exact, so the pass is gated behind
-    the `float-reassoc` option (mirroring Vitis's fp-relaxed) and is a no-op
-    without it. Integer reductions are exactly reassociable but bit-growth wraps
-    their accumulator in `extsi`/`trunc`, so this pass leaves them unchanged.
+    Integer reductions are exactly reassociable and are always rebalanced,
+    including the widened `extsi`/`trunc` idiom bit-growth produces.
+    Floating-point reassociation is not bit-exact, so a bare float step is
+    rebalanced only under the `float-reassoc` option, mirroring Vitis's
+    fp-relaxed.
   }];
   let options = [
     Option<"floatReassoc", "float-reassoc", "bool", "false",
@@ -296,7 +300,7 @@ def RotateReductionsPass
     accumulators in a shift register, so a given partial sum is updated once
     every N iterations. This turns the distance-1 recurrence (which bounds the
     modulo II at the operator latency L) into a distance-N recurrence over one
-    pipelined operator, i.e. `RecII = ceil(L / N)` -- which is 1 once `N >= L`.
+    pipelined operator, i.e. `RecII = ceil(L / N)`, which is 1 once `N >= L`.
     The N partial sums are combined by a balanced tree after the loop.
 
     Only float `add`/`mul` reductions are rotated (reassociation is inexact); the
@@ -317,15 +321,15 @@ def LegalizeArithPass : Pass<"legalize-arith", "ModuleOp"> {
   let summary = "Device-IP-aware expansion of composite arith ops (RTL path)";
   let description = [{
     The RTL-path replacement for MLIR's device-blind `arith-expand`. A composite
-    arith op that the device provides a dedicated operator IP for -- a
+    arith op that the device provides a dedicated operator IP for (a
     `max`/`min`/`maxnum`/`minnum`/`ceildiv`/`floordiv` `dcp.operator` matching the
-    op's kind and signature -- is KEPT, so the scheduler binds it to that IP and
+    op's kind and signature) is KEPT, so the scheduler binds it to that IP and
     the emitter instantiates it as one unit. Otherwise the op is EXPANDED into
     primitive arith via the upstream arith-expand patterns (a float max becomes
     `cmpf`+`select`, a ceildiv becomes div/mul/cmp/select), so a device that
     provides only the primitives (e.g. a float compare IP) still schedules.
 
-    Integer `maxsi`/`maxui`/`minsi`/`minui` are left untouched -- they lower to a
+    Integer `maxsi`/`maxui`/`minsi`/`minui` are left untouched: they lower to a
     native combinational op and need no IP. The keep/expand decision reads the
     injected `dcp.operator` / `dcp.device` IR, so this pass must run after operator
     injection and before scheduling.
@@ -357,17 +361,17 @@ def PropagatePartitionPass
   let description = [{
     A partition is a property of the ARRAY, stated once where the array lives (a
     container's `memref.alloc`, or a kernel argument). A sub-kernel sees that
-    array only through its own parameter -- a different memref in a different
-    function -- so without this pass the callee is scheduled and emitted against
+    array only through its own parameter, a different memref in a different
+    function, so without this pass the callee is scheduled and emitted against
     an unbanked parameter and the partition is silently dropped.
 
     Runs before `sdc-scheduling`, so a callee is scheduled knowing its banks:
     banking a composed array pays off only if the *callee* issues N accesses per
     cycle, which needs its per-bank ResII and per-bank port groups. (Routing one
     unbanked callee port to N banks through a caller-side crossbar would add
-    hardware and buy nothing.) After this, the existing leaf banking handles a
-    partitioned parameter unchanged, and a container merely materializes the
-    banks its children already agree on.
+    hardware and buy nothing.) After this, leaf banking handles a partitioned
+    parameter unchanged, and a container merely materializes the banks its
+    children already agree on.
 
     Propagation is top-down and monotone (it only adds an attribute). Two
     callsites passing differently-partitioned arrays to one callee is reported as
@@ -381,5 +385,38 @@ def PropagatePartitionPass
   let dependentDialects = ["mlir::func::FuncDialect"];
 }
 
+def OutlineLooseProcessesPass
+    : Pass<"outline-loose-processes", "ModuleOp"> {
+  let summary = "Make a dataflow container's own datapath one more process";
+  let description = [{
+    A concurrent (dataflow) container composes child instances, channels and
+    shared memory; it has no datapath of its own, and the structural top has no
+    way to grow one, since "the top computes nothing" is the invariant its whole
+    composition rests on. Compute written directly in such a container
+    (`aux[0] = x[0] * 2` beside the process network, a scalar computed for a
+    process to consume, a post-pass over what the network produced) therefore
+    has nowhere to go.
+
+    This pass normalizes the IR into the shape the backend already handles
+    rather than teaching the backend a second shape: each maximal run of loose
+    datapath ops is outlined into a private function and replaced by a call to
+    it, so the container satisfies the no-datapath invariant by construction and
+    the outlined work is scheduled, emitted and composed exactly like any other
+    child. The same move `perfectize-loop-nest` makes for an imperfect nest.
+
+    The outlined call is deliberately NOT marked `allo.async`: a spawn is
+    broadcast the container's `start`, whereas a plain child fires at its
+    scheduled offset, which is what orders it against the work it reads from or
+    writes for. Runs are split by the calls between them, so program order is
+    preserved, and with it the scheduler's ordering and the emitter's start
+    gates.
+
+    Best effort by design: a run whose captured values or results cannot cross a
+    module boundary is left alone, and the emitter's own check reports it. That
+    keeps this pass free of its own error paths and the diagnostic in the one
+    place that knows what a structural top can wire.
+  }];
+  let dependentDialects = ["mlir::func::FuncDialect"];
+}
 
 #endif // ALLO_TRANSFORMS_PASSES_TD

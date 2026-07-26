@@ -74,11 +74,9 @@ struct ReassociateReductionsPass
   using ReassociateReductionsPassBase::ReassociateReductionsPassBase;
 
   void runOnOperation() override {
-    // Collect reduction-step results, then process tails first (reverse program
-    // order) so each chain is rebalanced from its outermost step inward and its
-    // absorbed links are skipped. Integer reductions are the width-extension
-    // idiom (exactly associative); float reductions are bare and only rebalance
-    // with permission (reassociating floating point is inexact).
+    // Process tails first (reverse program order) so each chain is rebalanced
+    // from its outermost step inward and its absorbed links are skipped. Only
+    // the integer widening idiom is exactly associative; float needs opt-in.
     SmallVector<Operation *> candidates;
     getOperation().walk([&](Operation *op) {
       if (op->getNumResults() == 1 && matchReductionStep(op->getResult(0)))

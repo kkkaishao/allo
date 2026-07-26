@@ -43,10 +43,10 @@ bool sameOperatorType(const FuncUnit &a, const FuncUnit &b) {
   if (a.opType != b.opType || a.impl != b.impl || a.resultType != b.resultType)
     return false;
   // opType/impl/resultType alone under-specify the operator (operand widths,
-  // predicate, or map can differ). The emitter builds from boundOps.front(),
-  // so reject divergent merges here; verifyBinding backstops it post-merge.
-  Operation *oa = a.boundOps.front().first;
-  Operation *ob = b.boundOps.front().first;
+  // predicate, or map can differ). The emitter builds from `repOp()`, so
+  // reject divergent merges here; verifyBinding backstops it post-merge.
+  Operation *oa = a.repOp();
+  Operation *ob = b.repOp();
   return std::equal(oa->getOperandTypes().begin(), oa->getOperandTypes().end(),
                     ob->getOperandTypes().begin(),
                     ob->getOperandTypes().end()) &&
@@ -61,8 +61,7 @@ void verifyBinding(const Datapath &dp) {
       // The emitter builds one physical unit from boundOps.front() (operand
       // widths, predicate, map). A merge that differs in these would miscompile
       // the non-front ops; this backstops that (vacuous under trivial binding).
-      if (Operation *f =
-              u.boundOps.empty() ? nullptr : u.boundOps.front().first)
+      if (Operation *f = u.boundOps.empty() ? nullptr : u.repOp())
         for (const auto &bo : u.boundOps)
           assert(
               std::equal(bo.first->getOperandTypes().begin(),
@@ -73,7 +72,7 @@ void verifyBinding(const Datapath &dp) {
               bo.first->getAttr("map") == f->getAttr("map") &&
               "shared unit binds semantically divergent ops (operand widths / "
               "compare predicate / apply map differ); emit uses "
-              "boundOps.front() and miscompiles the others");
+              "repOp() and miscompiles the others");
       for (unsigned i = 0, e = u.boundOps.size(); i < e; ++i) {
         auto ri = reservationOf(rb, u, u.boundOps[i].second);
         for (unsigned j = i + 1; j < e; ++j) {

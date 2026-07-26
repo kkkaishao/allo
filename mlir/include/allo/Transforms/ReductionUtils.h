@@ -15,16 +15,16 @@
 // as balanced trees / rotated accumulators.
 //
 // Two operator shapes are recognized:
-//   * float     -- a bare `arith.addf` / `arith.mulf`;
-//   * integer   -- the frontend's width-extension idiom
-//                    trunc_w( core( ext(x), ext(y) ) )
-//                  (`core` = arith.addi/muli, `ext` = extsi/extui) emitted so
-//                  the intermediate never overflows. Since
-//                    trunc(ext a `core` ext b) == (a `core` b) mod 2^w,
-//                  the reduction is exactly associative; rebalancing only
-//                  re-groups it, and we rebuild the same idiom so operand
-//                  widths are unchanged. Keying integers on this idiom (never a
-//                  bare addi) also keeps index/address arithmetic untouched.
+//   * float: a bare `arith.addf` / `arith.mulf`;
+//   * integer: the frontend's width-extension idiom
+//       trunc_w( core( ext(x), ext(y) ) )
+//     (`core` = arith.addi/muli, `ext` = extsi/extui) emitted so the
+//     intermediate never overflows. Since
+//       trunc(ext a `core` ext b) == (a `core` b) mod 2^w,
+//     the reduction is exactly associative; rebalancing only re-groups it, and
+//     the same idiom is rebuilt so operand widths are unchanged. Keying
+//     integers on this idiom (never a bare addi) also keeps index/address
+//     arithmetic untouched.
 namespace mlir::allo {
 
 inline bool isFloatReductionOp(Operation *op) {
@@ -58,8 +58,8 @@ struct ReductionStep {
 };
 
 // Classify `v` as the result of a reduction step, or an invalid step if `v` is
-// not produced by one (a bare integer add/mul is intentionally *not* matched --
-// only the widened idiom is).
+// not produced by one. A bare integer add/mul is intentionally *not* matched;
+// only the widened idiom is.
 inline ReductionStep matchReductionStep(Value v) {
   ReductionStep step;
   Operation *d = v.getDefiningOp();
@@ -123,7 +123,7 @@ inline Value cloneBinaryOp(OpBuilder &b, Operation *proto, Value x, Value y) {
 }
 
 // Rebuild one reduction step combining narrow values (x, y) with `proto`'s
-// operator/idiom -- for the idiom, re-extend, combine wide, then re-truncate.
+// operator/idiom. For the idiom, re-extend, combine wide, then re-truncate.
 inline Value buildReductionStep(OpBuilder &b, const ReductionStep &proto,
                                 Value x, Value y) {
   if (!proto.widened())

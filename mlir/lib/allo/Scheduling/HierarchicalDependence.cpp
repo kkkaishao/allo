@@ -24,9 +24,8 @@ LevelAnalysis mlir::allo::analyzeLevel(LoopLikeOpInterface level,
   LevelAnalysis result;
   Block &body = level.getLoopRegions().front()->front();
   Operation *levelOp = level.getOperation();
-  // getLoopRegions().front() is a for-loop's sole body region; for scf.while
-  // (before=condition, after=body) it would pick the condition, silently
-  // dropping the body's ops/footprints/recurrences; callers gate on
+  // getLoopRegions().front() is a for-loop's sole body region. For scf.while it
+  // would pick the condition region and silently drop the body. Callers gate on
   // AffineForOp/scf.ForOp so this never fires.
   assert(!isa<scf::WhileOp>(levelOp) &&
          "analyzeLevel: getLoopRegions().front() is the scf.while condition "
@@ -59,10 +58,9 @@ LevelAnalysis mlir::allo::analyzeLevel(LoopLikeOpInterface level,
       best[{s, d}] = e;
   };
 
-  // (1) Same-iteration ordering (dist 0): the per-op affine analysis omits
-  // the loop-independent edge for a cross-nesting-depth pair, so program-order
-  // footprint conflicts supply it, ordering the earlier node before a shared,
-  // non-read-only, non-disjoint root.
+  // (1) Same-iteration ordering (dist 0): the per-op affine analysis omits the
+  // loop-independent edge for a cross-nesting-depth pair, so a footprint
+  // conflict on a shared root orders the program-order-earlier node first.
   for (unsigned i = 0, e = nodes.size(); i < e; ++i)
     for (unsigned j = i + 1; j < e; ++j) {
       for (const auto &kv : nodes[i].footprint.mem) {
@@ -98,10 +96,9 @@ LevelAnalysis mlir::allo::analyzeLevel(LoopLikeOpInterface level,
     }
   });
 
-  // (3) Recurrences carried by this level (dist >= 1): each dependence
-  // component's loop is matched by IDENTITY, not positional nesting depth,
-  // since an interleaved scf.for is absent from the *affine* components
-  // (misread otherwise when affine and scf loops mix).
+  // (3) Recurrences carried by this level (dist >= 1). Match each dependence
+  // component's loop by IDENTITY, not positional depth: an interleaved scf.for
+  // is absent from the *affine* components, so depth misreads when they mix.
   body.walk([&](Operation *v) {
     auto vIt = owner.find(v);
     if (vIt == owner.end())
@@ -127,10 +124,9 @@ LevelAnalysis mlir::allo::analyzeLevel(LoopLikeOpInterface level,
           add(sIt->second, vIt->second, dist, "rec");
         continue;
       }
-      // The level is absent from the components for an scf.for level, whose
-      // iterations the affine test can't model: an access under it has a
-      // level-invariant address, so two aliasing accesses conflict every
-      // iteration (distance-1), unless an enclosing loop already carries it.
+      // An scf.for level is absent from the components, its iterations being
+      // unmodelled: accesses under it have a level-invariant address, so two
+      // aliasing ones conflict every iteration unless an outer loop carries it.
       if (llvm::all_of(comps, [](const affine::DependenceComponent &c) {
             return c.lb.value_or(0) == 0;
           }))
