@@ -82,6 +82,14 @@ private:
   llvm::DenseMap<Value, AssumedRange> assumedRanges;
 };
 
+/// Whether \p op carries a memory effect this analysis does not model
+/// (`memref.copy`, `atomic_rmw`, `dma_*`). Such an op joins no access list, so
+/// its dependences would be DROPPED and anything scheduled around it may race.
+/// `verify-rtl-legality` rejects one before scheduling; the exclusion list here
+/// is the complement of the access kinds the constructor's walk collects, so
+/// the two must be edited together.
+bool isUnmodeledMemoryAccess(Operation *op);
+
 } // namespace mlir::allo
 
 #endif // ALLO_SCHEDULING_DEPENDENCEANALYSIS_H

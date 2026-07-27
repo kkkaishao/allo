@@ -39,6 +39,15 @@ bool whileHasIdentityForwarding(scf::WhileOp w);
 /// reifier share this one predicate, so they route in lockstep.
 bool conditionIsCombinational(scf::WhileOp w, const OperatorLibrary &lib);
 
+/// Whether \p w takes the flushing-pipeline schedule rather than decomposing
+/// into sub-regions run in program order. It does when it nests no loop (whose
+/// per-iteration length is data-dependent, so the inner ops cannot flatten into
+/// one issue cadence), its condition is combinational, and its body holds no
+/// sub-kernel call (no re-fired child instance can follow a one-cycle issue).
+/// Only a while on this path must forward its loop-carried values 1:1, so the
+/// scheduler and the pre-scheduling verifier route on this one predicate.
+bool whileFlushingPipelines(scf::WhileOp w, const OperatorLibrary &lib);
+
 /// Build a cyclic scheduling problem for an uncounted `scf.while` (its before +
 /// after regions scheduled as one iteration): registers both regions' ops +
 /// memory/stream deps, the non-speculative condition gate (`cond -> after`,

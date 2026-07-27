@@ -581,6 +581,17 @@ int64_t carriedDistanceAtLevel(ArrayRef<affine::DependenceComponent> comps,
   return d.has_value() ? *d : 1;
 }
 
+bool isUnmodeledMemoryAccess(Operation *op) {
+  // The complement of the access kinds the constructor's walk below collects.
+  if (isa<affine::AffineReadOpInterface, affine::AffineWriteOpInterface,
+          memref::LoadOp, memref::StoreOp, StreamGetOp, StreamPutOp,
+          AssumeNoDepOp, AssumeSSAOp>(op))
+    return false;
+  auto mem = dyn_cast<MemoryEffectOpInterface>(op);
+  return mem && (mem.hasEffect<MemoryEffects::Read>() ||
+                 mem.hasEffect<MemoryEffects::Write>());
+}
+
 DependenceAnalysis::DependenceAnalysis(func::FuncOp funcOp) : func(funcOp) {
   SmallVector<Operation *> memoryOps;
   SmallVector<Operation *> streamOps;
@@ -607,15 +618,6 @@ DependenceAnalysis::DependenceAnalysis(func::FuncOp funcOp) : func(funcOp) {
       noDepHints.push_back(hint);
     } else if (auto hint = dyn_cast<AssumeSSAOp>(op)) {
       collectAssumptions(hint.getCondition(), assumptions);
-    } else if (auto mem = dyn_cast<MemoryEffectOpInterface>(op)) {
-      // A memory read/write op none of the branches above model (memref.copy,
-      // atomic_rmw, dma_*) joins no access list, so its dependence would be
-      // silently dropped. The Allo frontend emits none into a scheduled region.
-      assert((!mem.hasEffect<MemoryEffects::Read>() &&
-              !mem.hasEffect<MemoryEffects::Write>()) &&
-             "memory read/write op not modeled by dependence analysis "
-             "(e.g. memref.copy/atomic_rmw/dma); its dependence is dropped");
-      (void)mem;
     }
   });
 

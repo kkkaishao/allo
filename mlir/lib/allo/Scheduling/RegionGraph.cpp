@@ -11,12 +11,14 @@
 #include "allo/Support/Logging.h"
 
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
+#include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/AsmState.h"
 #include "llvm/ADT/DenseSet.h"
 
 using namespace mlir;
 using namespace mlir::allo;
+using namespace mlir::allo::logging;
 
 //===----------------------------------------------------------------------===//
 // Region enumeration
@@ -69,6 +71,16 @@ bool mlir::allo::composesOnStructuralTop(func::FuncOp func) {
       structural = true;
   });
   return structural;
+}
+
+bool mlir::allo::isContainerStructure(Operation &op) {
+  // Every one of these is operand-free (or a call), which is what lets
+  // `outlineRun` place an outlined call at its run's last op without ever
+  // using a value defined after it.
+  return op.hasTrait<OpTrait::ConstantLike>() ||
+         isa<func::CallOp, memref::AllocOp, memref::AllocaOp,
+             memref::GetGlobalOp, StreamCreateOp>(op) ||
+         op.hasTrait<OpTrait::IsTerminator>();
 }
 
 bool mlir::allo::spawnsConcurrently(Operation *invoke) {
@@ -338,7 +350,7 @@ static bool dfs(Operation *op,
     return true;
   if (!onStack.insert(op).second) {
     auto *it = llvm::find(path, op);
-    auto &diag = logging::error(logging::Stage::Prep, op)
+    auto &diag = error(Stage::Prep, op)
                  << "Invalid cyclic call graph detected:";
     for (Operation *p : llvm::make_range(it, path.end()))
       diag << "\n  -> " << p->getLoc();

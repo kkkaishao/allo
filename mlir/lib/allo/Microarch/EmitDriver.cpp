@@ -312,23 +312,13 @@ LogicalResult emitDatapathToHW(ModuleOp module, StringRef binding,
       scheduled.push_back(f);
   });
 
-  // A memref result is unsupported: hardware writes output through a memory
-  // port, and the prepass that would rewrite it is deliberately not run.
-  // Reject cleanly here rather than deep in the builder.
-  for (func::FuncOp f : scheduled)
-    if (auto ret = dyn_cast<func::ReturnOp>(f.front().getTerminator()))
-      for (Value v : ret.getOperands())
-        if (isa<MemRefType>(v.getType())) {
-          logging::error(logging::Stage::Emit, f)
-              << "Returning a memref is unsupported; write the result through "
-                 "an output argument (out-parameter) instead";
-          return failure();
-        }
-
   auto policy = bindingPolicyFor(binding);
-  if (!policy)
-    return module.emitError("allo-datapath-to-hw: unknown binding policy '")
-           << binding << "'";
+  if (!policy) {
+    error(Stage::Emit, module)
+        << "Unknown binding policy '" << binding
+        << "'; the policies are 'trivial' and 'greedy-share'";
+    return failure();
+  }
 
   // Emission is rooted at the top function and runs bottom-up over the call
   // DAG: each callee emits before its caller, so a container always finds
@@ -337,9 +327,11 @@ LogicalResult emitDatapathToHW(ModuleOp module, StringRef binding,
   for (func::FuncOp f : scheduled)
     byName[f.getSymName()] = f;
   func::FuncOp topFunc = byName.lookup(top);
-  if (!topFunc)
-    return module.emitError("allo-datapath-to-hw: top function '")
-           << top << "' is not a scheduled function";
+  if (!topFunc) {
+    error(Stage::Emit, module)
+        << "Top function '" << top << "' is not a scheduled function";
+    return failure();
+  }
 
   OpBuilder b(module.getBodyRegion());
   llvm::StringMap<Operation *> opModules;

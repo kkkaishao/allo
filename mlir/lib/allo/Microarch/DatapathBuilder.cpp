@@ -25,6 +25,7 @@
 
 using namespace mlir;
 using namespace mlir::allo;
+using namespace mlir::allo::logging;
 
 namespace mlir::allo::uarch {
 
@@ -244,8 +245,7 @@ MemId DatapathBuilder::getOrCreateMem(Value memref) {
   // Per-bank depth from the same element-space decomposition the emitter's
   // crossbar and the host-side layout use, so a bank's address space is exactly
   // the elements it holds (`ceil` per partitioned dim, not of the total).
-  m.depthWords =
-      mt.hasStaticShape() ? static_cast<unsigned>(m.layout.bankWords()) : 0;
+  m.depthWords = static_cast<unsigned>(m.layout.bankWords());
   dp.mems.push_back(std::move(m));
   memOf[memref] = id;
   return id;
@@ -282,6 +282,7 @@ RegionBlock DatapathBuilder::addRegion(Operation *regionOp, RegionId ridx) {
 
   RegionBlock rb;
   rb.id = ridx;
+  rb.op = regionOp;
   // A container region nests another dcp region in its body (a loop wrapping
   // an inner loop). The nearest enclosing region op is the parent, already
   // processed by this pre-order walk, so it runs its children hierarchically.
@@ -580,9 +581,9 @@ void DatapathBuilder::bindResource(Operation *op, RegionBlock &rb) {
           StreamCreateOp>(op))
     return;
 
-  logging::error(logging::Stage::Emit, op)
+  unsupported(Stage::Emit, op)
       << "Operation '" << op->getName()
-      << "' is not modelled by the datapath and would be dropped from the "
+      << "' is not modelled by the datapath, so it would be dropped from the "
          "emitted hardware";
   dp.infeasible = true;
 }
@@ -823,9 +824,9 @@ void DatapathBuilder::recordRegionBounds(ArrayRef<Operation *> regionOps) {
       return;
     into = resolveValue(b);
     if (!into) {
-      logging::error(logging::Stage::Emit, pipe)
-          << "Loop bound is produced by a value this region cannot read (a "
-             "cross-region scalar hand-off); not yet supported";
+      unsupported(Stage::Emit, pipe)
+          << "Loop bound is produced by a value this region cannot read; such "
+             "a cross-region value hand-off is not lowered yet";
       dp.infeasible = true;
     }
   };
@@ -899,12 +900,14 @@ Resolved DatapathBuilder::resolveOperand(Value v, Operation *consumer,
                   unsigned distance) -> Resolved {
     int64_t depth =
         static_cast<int64_t>(distance) * ii + tY - static_cast<int64_t>(ready);
-    // A negative depth means the schedule reads this operand before its
-    // producer exists; report rather than assert, since the `unsigned` cast
-    // would wrap. Depth 0 keeps the build bounded until `validateDatapath`.
+    // The scheduler must never place a consumer before its operand is ready.
+    // Asserting alone is not enough: the `unsigned` cast below would wrap, so a
+    // release build reports, clamps to 0, and fails in `validateDatapath`.
     if (depth < 0) {
-      consumer->emitError("allo-datapath-to-hw: infeasible schedule; the "
-                          "operand is not ready until cycle ")
+      assert(false && "the scheduler placed a consumer before its operand is "
+                      "ready; the register depth would wrap");
+      error(Stage::Emit, consumer)
+          << "Infeasible schedule; the operand is not ready until cycle "
           << (static_cast<int64_t>(ready) - static_cast<int64_t>(distance) * ii)
           << " but its consumer is scheduled at cycle " << tY
           << " (producer ready " << ready << ", dependence distance "
@@ -940,10 +943,10 @@ Resolved DatapathBuilder::resolveOperand(Value v, Operation *consumer,
       // leaving the accumulator to free-run from reset. Only this site knows an
       // init was expected; None is normal elsewhere.
       if (!r.init) {
-        logging::error(logging::Stage::Emit, def)
+        unsupported(Stage::Emit, def)
             << "Loop-carried accumulator has an initial value this region "
-               "cannot read (a cross-region scalar hand-off); not yet "
-               "supported";
+               "cannot read; such a cross-region value hand-off is not "
+               "lowered yet";
         dp.infeasible = true;
       }
       return r;
@@ -1065,8 +1068,17 @@ void DatapathBuilder::resolveUnitInputs() {
       for (unsigned j = 0; j < u.boundOps.size(); ++j) {
         Operation *opj = u.boundOps[j].first;
         auto r = resolveOperand(opj->getOperand(k), opj, ii);
-        assert(r.init.kind == Source::Kind::None &&
-               "sharing a recurrence (reduction) unit is not modelled");
+        // A shared unit reaches its input through the mux below, leaving
+        // nowhere to time the reduction identity's re-injection against.
+        // Vacuous under trivial binding; a sharing policy reaches it.
+        if (r.init.kind != Source::Kind::None) {
+          unsupported(Stage::Emit, opj)
+              << "Binding policy shares one operator unit between a "
+                 "loop-carried reduction and another op; re-injecting the "
+                 "reduction identity through the shared input mux is not "
+                 "modelled. Use binding='trivial' for this kernel";
+          dp.infeasible = true;
+        }
         mb.ops.push_back(opj);
         recordEdge(r, mb.sources[j], ridx);
       }
@@ -1138,10 +1150,11 @@ void DatapathBuilder::resolveAccessOperands() {
         // turn a masked get/put into an every-cycle one.
         auto pr = resolveOperand(pred, acc.op, ii);
         if (!pr.ok) {
-          logging::error(logging::Stage::Emit, acc.op)
+          unsupported(Stage::Emit, acc.op)
               << "Predicate of this stream access is produced by a value the "
-                 "region cannot read (a cross-region scalar hand-off); the "
-                 "access would fire unconditionally, so it is rejected";
+                 "region cannot read; such a cross-region value hand-off is "
+                 "not lowered yet, and the access would otherwise fire "
+                 "unconditionally";
           dp.infeasible = true;
         }
         recordEdge(pr, acc.when, ridx);

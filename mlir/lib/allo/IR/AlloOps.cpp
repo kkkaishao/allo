@@ -489,6 +489,12 @@ LogicalResult DCPathPipelineOp::verify() {
   } else if (auto y = dyn_cast<DCPathUnconditionOp>(term)) {
     if (y.getOperands().size() != getInits().size())
       return emitOpError("dcp.uncondition must yield one value per iter-arg");
+    // A counted loop terminates on its bound, so it must carry one: the `trip`
+    // attribute or the runtime `dynamicBound`. With neither, the lowering has
+    // no upper bound to compare against and the counter free-runs.
+    if (!getTripAttr() && !getDynamicBound())
+      return emitOpError("a counted pipeline (dcp.uncondition terminator) "
+                         "needs a trip attribute or a dynamicBound operand");
   } else {
     return emitOpError("body must end with dcp.uncondition or dcp.condition");
   }

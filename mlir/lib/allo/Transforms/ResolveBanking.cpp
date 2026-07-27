@@ -91,7 +91,7 @@ bool splitAlloc(Operation *alloc) {
       return false;
     std::optional<BankedAccess> b = resolve(user, p.cyclicAxes);
     if (!b) {
-      warn(Stage::Dcp, alloc) << "partitioned array has a data-dependent bank; "
+      warn(Stage::Dcp, alloc) << "Partitioned array has a data-dependent bank; "
                                  "left for the emitter "
                                  "crossbar";
       return false;

@@ -10,6 +10,3 @@
 [submodule "externals/circt"]
 	path = externals/circt
 	url = https://github.com/llvm/circt.git
-[submodule "externals/spdlog"]
-	path = externals/spdlog
-	url = https://github.com/gabime/spdlog.git

@@ -419,4 +419,36 @@ def OutlineLooseProcessesPass
   let dependentDialects = ["mlir::func::FuncDialect"];
 }
 
+def VerifyRtlLegalityPass
+    : Pass<"verify-rtl-legality", "ModuleOp"> {
+  let summary = "Reject a program the RTL backend cannot lower, before any "
+                "region is scheduled";
+  let description = [{
+    A legality check whose answer is already settled in the pre-scheduling IR
+    belongs here rather than in the scheduler or the emitter. Both of those walk
+    the call DAG bottom up, so a violation in the TOP function is paid for with
+    a full schedule plus a full emission of everything underneath it, and the
+    checks that suffer most are exactly the ones about top-level composition
+    (the process network, the channels, the call boundary), because the
+    structural top is validated last.
+
+    Nothing here re-derives a fact: every check reads the same predicate its
+    late counterpart read (`OperatorLibrary`, `MemoryLibrary`, `bankLayoutOf`,
+    `whileFlushingPipelines`, `composesOnStructuralTop`), so hoisting cannot
+    disagree with the backend about what is legal.
+
+    Scoped to the call-graph closure of `top`, because that is what the emit
+    driver visits; verifying a dead function would reject programs that compile.
+
+    What does NOT belong here: anything reading an output of the solver, the
+    region partitioner or the binder. Those have no pre-scheduling form and stay
+    in `validateDatapath`.
+  }];
+  let options = [
+    Option<"top", "top", "std::string", "\"top\"",
+           "Name of the top kernel of the design">
+  ];
+  let dependentDialects = ["mlir::func::FuncDialect"];
+}
+
 #endif // ALLO_TRANSFORMS_PASSES_TD

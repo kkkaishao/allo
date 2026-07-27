@@ -36,6 +36,13 @@ std::atomic<bool> gMuted{false};
 
 std::shared_ptr<spdlog::sinks::stderr_color_sink_mt> gSink;
 
+// A level that fails the compilation: it is never filtered, and it raises an
+// MLIR diagnostic on its subject. The two call sites below read this rather
+// than each spelling the set out, so they cannot drift.
+bool isFatal(Level level) {
+  return level == Level::Error || level == Level::Unsupported;
+}
+
 spdlog::level::level_enum toSpdlog(Level level) {
   switch (level) {
   case Level::Debug:
@@ -45,6 +52,7 @@ spdlog::level::level_enum toSpdlog(Level level) {
   case Level::Warn:
     return spdlog::level::warn;
   case Level::Error:
+  case Level::Unsupported:
     return spdlog::level::err;
   }
   return spdlog::level::info;
@@ -60,6 +68,8 @@ const char *levelTag(Level level) {
     return "WARN";
   case Level::Error:
     return "ERROR";
+  case Level::Unsupported:
+    return "NYI";
   }
   return "INFO";
 }
@@ -176,16 +186,16 @@ void detail::emit(Level level, Stage stage, StringRef where, StringRef message,
   // the message (attributes, types) are treated as data.
   logger().log(toSpdlog(level), "{}", line);
 
-  // A fatal error also emits an MLIR diagnostic so the pass fails and the
+  // A fatal message also emits an MLIR diagnostic so the pass fails and the
   // message surfaces to the caller; the plain message (the op's location is
   // attached by the diagnostic) is captured, not printed, on the binding path.
-  if (level == Level::Error && subject)
+  if (isFatal(level) && subject)
     subject->emitError(message);
 }
 
 bool detail::enabled(Level level) {
-  if (level == Level::Error)
-    return true; // fatal errors are never filtered
+  if (isFatal(level))
+    return true; // a fatal message is never filtered
   initFromEnv();
   return !gMuted.load(std::memory_order_relaxed) &&
          static_cast<int>(level) >= gThreshold.load(std::memory_order_relaxed);

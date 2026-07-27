@@ -113,7 +113,7 @@ struct RotateReductionsPass
       std::optional<uint64_t> trip = affine::getConstantTripCount(loop);
       if (trip && *trip < accumulators) {
         warn(Stage::Prep, loop)
-            << "reduction not rotated because its trip count " << *trip
+            << "Reduction not rotated because its trip count " << *trip
             << " is below the requested " << accumulators << " accumulators";
         return;
       }

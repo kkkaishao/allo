@@ -626,13 +626,16 @@ def test_initialized_array_handed_to_a_sub_kernel(child):
 def _matvec_recurrence_ii(bind=None, complete=False):
     """Schedule a memory-carried matvec accumulate (`y[i] += A[i,k]*x[k]`) with
     the accumulator `y` optionally bound to a storage impl or complete-partitioned
-    (-> registers); return the inner loop II (the read->add->write recurrence)."""
+    (-> registers)"""
 
     @kernel
-    def mv(A: f32[8, 8], x: f32[8], y: f32[8]):
+    def mv(A: f32[8, 8], x: f32[8], out: f32[8]):
+        y: f32[8] = 0
         for i in range(8):
             for k in range(8):
                 y[i] += A[i, k] * x[k]
+        for i in range(8):
+            out[i] = y[i]
 
     s = mv.schedule()
     if complete:
@@ -640,7 +643,7 @@ def _matvec_recurrence_ii(bind=None, complete=False):
     elif bind is not None:
         s.bind_storage("y", impl=bind, mem_type=s.RAM_T2P)
     res = s.export("rtl").schedule()
-    return min(r.ii for r in res.cyclic())
+    return max(r.ii for r in res.cyclic())
 
 
 def test_storage_impl_shifts_recurrence_ii():

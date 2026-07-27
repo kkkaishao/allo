@@ -24,15 +24,25 @@ namespace mlir::allo::uarch {
 // place the bounds are assembled, so also the one place their width is settled.
 // Empty (default) for an acyclic region (no counter) or a while (which builds
 // its own Terminator::conditional from the resolved condition).
+//
+// The counter counts up through SIGNED compares, so a negative lb is fine but
+// the step must be positive. Three cases cover the step:
+//   1. A literal non-positive step: rejected by the frontend, "loop step must
+//      be a positive integer".
+//   2. A constant-folded SSA step: rejected by `DCPathPipelineOp::verify`,
+//      "step must be > 0".
+//   3. A genuinely runtime step (`for i in range(0, n, s)` over a loaded `s`):
+//      a supported shape whose sign no static check settles, so positivity is
+//      a contract with the caller. At step <= 0 the counter never reaches `ub`,
+//      so the loop hangs and writes out of bounds on the way. Closing that
+//      needs a guard in the emitted hardware, not a check here.
 Terminator HWEmitter::terminatorOf(const uarch::RegionBlock &rb) {
   if (!rb.lbSource)
     return {}; // acyclic: no counter, hence no bounds
-  // Counts up via SIGNED compares (isLast/isEmpty), so a negative lower bound
-  // is fine; a non-positive/decreasing step is unsupported (frontend-rejected,
-  // so this is a dormant backstop) and a runtime step's sign goes unchecked.
+  // Backstop for cases 1 and 2 above.
   assert(dp.constantOf(rb.stepSource).value_or(1) > 0 &&
-         "counted-loop counter is up-counting; a non-positive/decreasing step "
-         "is unsupported (the frontend rejects it)");
+         "counted-loop counter is up-counting; a statically non-positive step "
+         "must have been rejected by the frontend or the op verifier");
   auto ivType = cast<IntegerType>(rb.counterType);
   // A bound resolved to the counter's width. Identity for every bound the
   // frontend produces (an i32 index); the resize lets a loop-over-call whose

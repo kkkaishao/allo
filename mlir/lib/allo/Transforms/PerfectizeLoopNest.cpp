@@ -264,7 +264,7 @@ struct PerfectizeLoopNestPass
         work.push_back(std::move(*m));
       else if (!reason.empty())
         warn(Stage::Prep, outer)
-            << "imperfect loop nest not perfectized because " << reason
+            << "Imperfect loop nest not perfectized because " << reason
             << "; the scheduler schedules its body as sequential sub-regions "
                "instead of one fused pipeline";
     });

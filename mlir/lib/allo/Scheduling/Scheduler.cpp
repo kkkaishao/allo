@@ -582,11 +582,11 @@ void SimplexSchedulerBase::reportInfeasible() {
   if (!rec) {
     // No circuit binds, so the infeasibility comes from the constraints layered
     // on top of the dependences (a fixed start time, a resource reservation).
-    diag << "problem is infeasible: no dependence recurrence explains it, so a "
+    diag << "Problem is infeasible: no dependence recurrence explains it, so a "
             "fixed start time or a resource reservation does";
     return;
   }
-  diag << "problem is infeasible: the dependence cycle " << render(rec)
+  diag << "Problem is infeasible: the dependence cycle " << render(rec)
        << " must complete within one iteration, but takes " << rec.latency
        << " cycle(s); break it with a loop-carried value (an iter-arg), a "
           "faster operator, or an allo.assume.nodep hint if the dependence is "
@@ -596,8 +596,9 @@ void SimplexSchedulerBase::reportInfeasible() {
 LogicalResult SimplexSchedulerBase::checkLastOp() {
   auto &prob = getProblem();
   if (!prob.hasOperation(lastOp)) {
-    error(Stage::Sched, prob.getContainingOp())
-        << "problem does not include last operation";
+    assert(false && "the scheduling problem does not include its last "
+                    "operation; ProblemBuilder constructs both, so no input "
+                    "can reach this");
     return failure();
   }
   return success();
@@ -1196,7 +1197,8 @@ LogicalResult SharedOperatorsSimplexScheduler::schedule() {
 
     auto &rsrcs = *maybeRsrcs;
     assert(rsrcs.size() == 1 &&
-           "Multi-resource operations are not yet supported by this scheduler");
+           "an operation is linked to several resource types; ProblemBuilder "
+           "links exactly one, and the scheduler indexes by that one");
 
     auto rsrc = rsrcs[0];
     unsigned limit = prob.getLimit(rsrc).value_or(0);
@@ -1249,9 +1251,10 @@ LogicalResult SharedOperatorsSimplexScheduler::schedule() {
 //===----------------------------------------------------------------------===//
 
 LogicalResult ModuloSimplexScheduler::checkLastOp() {
-  auto *contOp = prob.getContainingOp();
   if (!prob.hasOperation(lastOp)) {
-    error(Stage::Sched, contOp) << "problem does not include last operation";
+    assert(false && "the scheduling problem does not include its last "
+                    "operation; ProblemBuilder constructs both, so no input "
+                    "can reach this");
     return failure();
   }
 
@@ -1264,11 +1267,13 @@ LogicalResult ModuloSimplexScheduler::checkLastOp() {
         sinks.erase(dep.getSource());
 
   if (!sinks.contains(lastOp)) {
-    error(Stage::Sched, contOp) << "last operation is not a sink";
+    assert(false && "the problem's last operation is not a sink; "
+                    "ProblemBuilder anchors it, so no input can reach this");
     return failure();
   }
   if (sinks.size() > 1) {
-    error(Stage::Sched, contOp) << "multiple sinks detected";
+    assert(false && "the problem has several sinks; ProblemBuilder anchors "
+                    "exactly one, so no input can reach this");
     return failure();
   }
 
@@ -1282,7 +1287,8 @@ LogicalResult ModuloSimplexScheduler::MRT::enter(Operation *op,
 
   auto &rsrcs = *maybeRsrcs;
   assert(rsrcs.size() == 1 &&
-         "Multi-resource operations are not yet supported by MRT");
+         "an operation is linked to several resource types; ProblemBuilder "
+         "links exactly one, and the scheduler indexes by that one");
 
   auto rsrc = rsrcs[0];
   auto lim = *sched.prob.getLimit(rsrc);
@@ -1315,7 +1321,8 @@ void ModuloSimplexScheduler::MRT::release(Operation *op) {
 
   auto &rsrcs = *maybeRsrcs;
   assert(rsrcs.size() == 1 &&
-         "Multi-resource operations are not yet supported by MRT");
+         "an operation is linked to several resource types; ProblemBuilder "
+         "links exactly one, and the scheduler indexes by that one");
 
   auto rsrc = rsrcs[0];
   auto &revTab = reverseTables[rsrc];
@@ -1721,8 +1728,8 @@ namespace mlir::allo {
 
 LogicalResult ChainingModuloProblem::checkDefUse(Dependence dep) {
   if (!dep.isAuxiliary() && (getDistance(dep).value_or(0) != 0)) {
-    error(Stage::Sched, dep.getDestination())
-        << "def-use dependence cannot have non-zero distance";
+    assert(false && "a def-use dependence carries a non-zero distance; the "
+                    "edges are ours to insert, so no input can reach this");
     return failure();
   }
   return success();

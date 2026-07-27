@@ -143,15 +143,15 @@ void mlir::allo::logLevelAnalysis(const LevelAnalysis &analysis,
                                   LoopLikeOpInterface level) {
   if (!logging::detail::enabled(logging::Level::Debug))
     return;
-  debug(Stage::Sched) << "hier-level "
+  debug(Stage::Sched) << "Hier-level "
                       << logging::detail::describe(level.getOperation()) << ": "
                       << analysis.nodes.size() << " nodes";
   for (auto [idx, n] : llvm::enumerate(analysis.nodes))
-    debug(Stage::Sched) << "  node " << idx
+    debug(Stage::Sched) << "  Node " << idx
                         << (n.isLoop ? " [loop] " : " [op] ")
                         << logging::detail::describe(n.anchor);
   for (const LevelEdge &e : analysis.edges)
-    debug(Stage::Sched) << "  edge " << e.src << " -> " << e.dst << "  dist "
+    debug(Stage::Sched) << "  Edge " << e.src << " -> " << e.dst << "  dist "
                         << e.distance << "  [" << e.kind
                         << (e.src == e.dst ? " self]" : "]");
 }

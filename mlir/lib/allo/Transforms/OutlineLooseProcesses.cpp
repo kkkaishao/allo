@@ -22,20 +22,9 @@ namespace mlir::allo {
 
 using namespace mlir;
 using namespace mlir::allo;
+using namespace mlir::allo::logging;
 
 namespace {
-
-// A concurrent container's own STRUCTURE, which stays in it: the calls it
-// composes, the channels / buffers / constant tables it declares, and the
-// constants feeding them. Every one of these is operand-free (or a call), which
-// is what lets `outlineRun` place the outlined call at the run's last op
-// without ever using a value defined after it.
-bool isStructure(Operation &op) {
-  return op.hasTrait<OpTrait::ConstantLike>() ||
-         isa<func::CallOp, memref::AllocOp, memref::AllocaOp,
-             memref::GetGlobalOp, StreamCreateOp>(op) ||
-         op.hasTrait<OpTrait::IsTerminator>();
-}
 
 // A type an outlined process can take as a parameter. Mirrors what the
 // structural top can wire: arrays and streams by reference, scalars by value.
@@ -69,7 +58,7 @@ struct OutlineLooseProcessesPass
         if (!cur.empty())
           runs.push_back(std::move(cur));
         cur.clear();
-      } else if (!isStructure(op))
+      } else if (!isContainerStructure(op))
         cur.push_back(&op);
     }
     if (!cur.empty())
@@ -173,7 +162,7 @@ struct OutlineLooseProcessesPass
     b.setInsertionPointToEnd(entry);
     func::ReturnOp::create(b, loc, outputs.getArrayRef());
 
-    logging::info(logging::Stage::Prep, container)
+    info(Stage::Prep, container)
         << "Outlined a loose datapath span of " << run.size()
         << " op(s) into process '" << name
         << "': a dataflow container composes processes, so its own compute "

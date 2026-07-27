@@ -425,7 +425,7 @@ struct FoldIfStatementsPass
       Operation *blocker = firstBlocker(op);
       assert(blocker && "a convertible if should have been converted");
       warn(Stage::Prep, op)
-          << "conditional left as an opaque scheduling unit because '"
+          << "Conditional left as an opaque scheduling unit because '"
           << blocker->getName().getStringRef()
           << "' cannot be predicated; the enclosing loop cannot pipeline "
              "across it";

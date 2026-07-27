@@ -156,8 +156,10 @@ Value DatapathEmitter::resolveSource(const uarch::Source &s) {
     return cv;
   }
   case uarch::Source::Kind::None:
-    assert(false && "unresolved (None) source");
-    return {};
+    // `validateDatapath` sweeps every required slot for a None Source and
+    // rejects there. Not an `assert`: under NDEBUG that would fall through and
+    // hand the caller a null Value.
+    llvm_unreachable("unresolved (None) source reached emission");
   }
   llvm_unreachable("unhandled Source::Kind");
 }
@@ -643,7 +645,8 @@ void DatapathEmitter::resolveRegHeads(const uarch::RegionBlock &rb) {
 static unsigned storeDrainOf(const uarch::MemUnit &m,
                              const uarch::MemUnit::Access &acc) {
   assert(m.writeLatency >= 1 &&
-         "a zero-cycle write has no commit edge for the done latch to ride");
+         "a zero-cycle write has no commit edge for the done latch to ride; "
+         "checkDeviceCapability must have rejected the device row");
   return dcpStart(acc.op) + m.writeLatency - 1;
 }
 
@@ -1303,10 +1306,11 @@ void DatapathEmitter::emitCalls(const uarch::RegionBlock &rb, Value issue,
       }
       // One hlmem per bank: the child masters bank `ma.bank`, already indexed
       // in that bank's own space via `allo.part`, so route straight to it with
-      // no crossbar. Parent and child bank counts agree by construction.
+      // no crossbar. `validateDatapath` rejects a caller/callee partition
+      // mismatch, so the bank counts agree by the time this runs.
       assert(ma.bank < memBanks[m.id].size() &&
-             "child bank index exceeds the buffer's bank count (parent/callee "
-             "partition-factor disagreement)");
+             "child bank index exceeds the buffer's bank count; "
+             "validateDatapath must have rejected the partition mismatch");
       Value hlmem = memBanks[m.id][ma.bank];
       Value addr = memAddr(m, outs[ma.addr]);
       // The child was compiled against this buffer's device latency, read here

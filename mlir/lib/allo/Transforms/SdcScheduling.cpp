@@ -526,7 +526,7 @@ static LogicalResult scheduleWhile(scf::WhileOp w, DependenceAnalysis &deps,
     return failure();
   std::optional<unsigned> ii = problem.getInitiationInterval();
   info(Stage::Sched, w.getOperation())
-      << "  -> while loop scheduled as a flushing pipeline: II="
+      << "  -> While loop scheduled as a flushing pipeline: II="
       << ii.value_or(0)
       << " (trip is data-dependent, so whole-loop latency is unknown)";
   annotateRegion(problem, funcOp, region.id, "cyclic", ii, std::nullopt,
@@ -815,17 +815,17 @@ static void logLevelII(const LevelAnalysis &a, LoopLikeOpInterface level,
   SmallVector<Operation *> tagged;
   if (!buildLevelProblem(problem, a, level, deps, lib, funcOp, resourceBound,
                          tagged)) {
-    debug(Stage::Sched) << "  level II_outer = (child latency unknown)";
+    debug(Stage::Sched) << "  Level II_outer = (child latency unknown)";
     return;
   }
   Operation *anchor = level.getLoopRegions().front()->front().getTerminator();
   if (succeeded(
           solveSchedulingProblem(problem, anchor, cycleTimeNs, /*minII=*/1)))
-    debug(Stage::Sched) << "  level II_outer = "
+    debug(Stage::Sched) << "  Level II_outer = "
                         << problem.getInitiationInterval().value_or(0)
                         << " (resource bound " << resourceBound << ")";
   else
-    debug(Stage::Sched) << "  level II_outer = (solve failed)";
+    debug(Stage::Sched) << "  Level II_outer = (solve failed)";
   for (Operation *op : tagged)
     op->removeAttr(sched::kResourceCyclesAttr);
 }
@@ -891,41 +891,6 @@ struct SdcSchedulingPass
     // injected `dcp.device` + `dcp.operator` IR. Built once and shared by
     // scheduling and reification.
     auto loadedLib = OperatorLibrary::fromModule(module);
-
-    // Fail loudly on an uncharacterized non-combinational op (a float/cast/math
-    // op with no matching operator IP): reject it rather than fabricate a
-    // zero-latency schedule.
-    if (module
-            .walk([&](Operation *op) {
-              if (loadedLib.requiresUnmatchedIP(op)) {
-                error(Stage::Sched, op)
-                    << "no operator characterization for '" << op->getName()
-                    << "'; provide an @ip for it on the device";
-                return WalkResult::interrupt();
-              }
-              return WalkResult::advance();
-            })
-            .wasInterrupted())
-      return signalPassFailure();
-
-    // The storage twin: an array whose primitive the device declares no timing
-    // for would fall to the zero-timing default and schedule combinationally,
-    // reading before valid. Reject it rather than emit fictional memory timing.
-    const MemoryLibrary &memLib = loadedLib.memoryLibrary();
-    if (module
-            .walk([&](Operation *op) {
-              MemoryImplEnum impl = memLib.resolvedImpl(op);
-              if (impl != MemoryImplEnum::Auto && !memLib.declares(impl)) {
-                error(Stage::Sched, op)
-                    << "no memory characterization for storage impl '"
-                    << stringifyMemoryImplEnum(impl)
-                    << "'; declare it in the device `memory` table";
-                return WalkResult::interrupt();
-              }
-              return WalkResult::advance();
-            })
-            .wasInterrupted())
-      return signalPassFailure();
 
     // Target clock period: the option, else a 5.0 ns default.
     float cycleTimeNs = cycleTime > 0.0f ? cycleTime : 5.0f;
@@ -997,7 +962,7 @@ struct SdcSchedulingPass
       for (const LevelNode &n : a.nodes)
         loops += n.isLoop;
       info(Stage::Sched, level.getOperation())
-          << "  level analysis: " << a.nodes.size() << " node(s) ("
+          << "  Level analysis: " << a.nodes.size() << " node(s) ("
           << (a.nodes.size() - loops) << " leaf op(s) + " << loops
           << " inner loop(s)), " << a.edges.size()
           << " dependence edge(s) constrain their overlap";
@@ -1046,7 +1011,7 @@ struct SdcSchedulingPass
       op->removeAttr(sched::kResourceCyclesAttr);
     if (failed(solved)) {
       error(Stage::Sched, level.getOperation())
-          << "pipelined nest not scheduled";
+          << "Pipelined nest not scheduled";
       signalPassFailure();
       return failure();
     }
@@ -1139,8 +1104,7 @@ struct SdcSchedulingPass
       // A nested loop (data-dependent per-iteration length) or a condition not
       // settled at issue forces the sequential CHECK/RUN controller. The
       // reifier's routing shares `conditionIsCombinational`, so the two agree.
-      if (hasNestedLoop(whileOp) || !conditionIsCombinational(whileOp, lib) ||
-          blockHasSyncCall(whileOp.getAfter().front())) {
+      if (!whileFlushingPipelines(whileOp, lib)) {
         info(Stage::Sched, whileOp)
             << "While loop cannot flushing-pipeline (nested loop, sub-kernel "
                "call, or non-combinational condition); decomposing its body "
@@ -1149,16 +1113,10 @@ struct SdcSchedulingPass
         return scheduleBlock(whileOp.getAfter().front(), nextId, deps, lib,
                              funcOp, cycleTimeNs);
       }
-      if (!whileHasIdentityForwarding(whileOp)) {
-        error(Stage::Sched, whileOp.getOperation())
-            << "while loop not scheduled: its loop-carried values are not "
-               "forwarded 1:1 from the before-region through `scf.condition` "
-               "into the after-region (they are reordered, dropped, or "
-               "recombined), which the flushing-pipeline schedule requires; "
-               "carry each value through unchanged";
-        signalPassFailure();
-        return failure();
-      }
+      // `verify-rtl-legality` rejects a flushing while that does not forward
+      // 1:1, so `buildWhileProblem`'s slot alignment holds here.
+      assert(whileHasIdentityForwarding(whileOp) &&
+             "a flushing while reached scheduling without identity forwarding");
       region.id = nextId++;
       info(Stage::Sched, whileOp.getOperation())
           << "Region " << region.id
@@ -1180,7 +1138,7 @@ struct SdcSchedulingPass
             return failure();
       return success();
     }
-    error(Stage::Sched, region.anchor()) << "loop not scheduled";
+    error(Stage::Sched, region.anchor()) << "Loop not scheduled";
     signalPassFailure();
     return failure();
   }
@@ -1208,6 +1166,15 @@ struct SdcSchedulingPass
     // Whole-func memory + stream dependence analysis, refined by the
     // `allo.assume.*` hints.
     DependenceAnalysis deps(funcOp);
+#ifndef NDEBUG
+    // `verify-rtl-legality` rejects an access the analysis does not model, so
+    // reaching here means the two disagree and this op's dependences were
+    // dropped; scheduling would freely reorder it against what it aliases.
+    funcOp.walk([](Operation *op) {
+      assert(!isUnmodeledMemoryAccess(op) &&
+             "an unmodeled memory access reached scheduling");
+    });
+#endif
 
     // Erase the consumed hint ops: they carry no schedulable computation and
     // would otherwise perturb the problem.

@@ -133,6 +133,13 @@ bool composesOnStructuralTop(func::FuncOp func);
 /// and the latency model the other.
 bool spawnsConcurrently(Operation *invoke);
 
+/// Whether \p op is part of a concurrent container's own STRUCTURE: the calls
+/// it composes, the channels / buffers / constant tables it declares, and the
+/// constants feeding them. Everything else in such a container is loose
+/// datapath, which `outline-loose-processes` lifts into a process of its own
+/// and `verify-rtl-legality` rejects whatever the outliner had to leave behind.
+bool isContainerStructure(Operation &op);
+
 /// Whether a counted loop's body is decomposed into sub-regions, so the loop
 /// becomes a sequential wrapper that runs its children in program order rather
 /// than one flat modulo problem. True when the body nests a loop, and (via the

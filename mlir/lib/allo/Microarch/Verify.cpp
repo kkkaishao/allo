@@ -27,9 +27,12 @@ namespace mlir::allo::uarch {
 LogicalResult verifyDatapath(func::FuncOp func, const Datapath &dp) {
   // Supported subset: top-level siblings in program order, plus container
   // loops whose children sequence within one outer iteration (crossing as a
-  // survivor register).
-  if (dp.regions.empty())
-    return func.emitError("allo-datapath-to-hw: no schedulable region");
+  // survivor register). Emission only visits a function `hasDCPRegions`
+  // accepted, and the builder's region walk collects a superset of that
+  // predicate, so a reachable datapath always holds a region.
+  assert(!dp.regions.empty() && "a scheduled function has no schedulable "
+                                "region; the builder's region walk and "
+                                "hasDCPRegions disagree");
   // The builder already reported the offending edge; fail before any
   // hardware is built from the placeholder depths it left.
   if (dp.infeasible)
@@ -48,12 +51,12 @@ LogicalResult verifyDatapath(func::FuncOp func, const Datapath &dp) {
   });
   if (found) {
     // The "cross-region value hand-off" phrase is the stable part (tests and
-    // the frontend match on it); the slot is the part that says WHERE.
-    InFlightDiagnostic diag =
-        badSite.op ? badSite.op->emitError() : func.emitError();
-    return diag << "allo-datapath-to-hw: cross-region value hand-off not yet "
-                   "supported: "
-                << badSite.describe() << " is unresolved";
+    // the frontend match on it); the slot is the part that says WHERE. The
+    // builder's three hand-off rejects use the same phrase.
+    unsupported(Stage::Emit, badSite.op ? badSite.op : func.getOperation())
+        << "A cross-region value hand-off is not lowered yet: "
+        << badSite.describe() << " is unresolved";
+    return failure();
   }
   return success();
 }
@@ -84,21 +87,15 @@ LogicalResult checkDeviceCapability(func::FuncOp func, const Datapath &dp) {
             << "' is ignored: an array declared with compile-time contents is "
                "realized as a single bank";
     }
-    // A boundary array's port latency is a contract with the driver, not
-    // enforced by the emitted RTL; the interface manifest carries it, so any
-    // latency >= 1 works, but 0 is rejected (an edge-triggered port can't).
-    if (m.external && (m.readLatency < 1 || m.writeLatency < 1))
-      return func.emitError("allo-datapath-to-hw: argument array with a ")
-             << m.readLatency << "-cycle read / " << m.writeLatency
-             << "-cycle write is unsupported; a boundary port is "
-                "edge-triggered "
-                "and needs at least 1 cycle. Use an internal buffer, or bind "
-                "this argument to a storage impl with a >= 1 cycle access";
+    // `verify-rtl-legality` rejects an access latency the emitted structure
+    // cannot realize, before the scheduler honors the device row.
+    assert(m.writeLatency >= 1 && (!m.external || m.readLatency >= 1) &&
+           "a 0-cycle port reached emission");
   }
 
   // `ce` is the only IP port ABI the emitter realizes. `free` has no enable, so
   // in a back-pressured region it keeps clocking and desynchronizes, but is
-  // fine elsewhere; `elastic` is variable-latency, which nothing here honors.
+  // fine elsewhere; the `elastic` contract is rejected before scheduling.
   llvm::SmallDenseSet<unsigned> backPressured;
   for (const StreamChannel &s : dp.streams)
     for (const StreamChannel::Access &acc : s.accesses)
@@ -110,15 +107,8 @@ LogicalResult checkDeviceCapability(func::FuncOp func, const Datapath &dp) {
   for (const FuncUnit &u : dp.units) {
     if (u.comb || u.stall == allo::StallContractEnum::Ce)
       continue;
-    if (u.stall == allo::StallContractEnum::Elastic) {
-      error(Stage::Emit, u.repOp())
-          << "Operator IP '" << operatorModuleName(u)
-          << "' declares the elastic (valid/ready, variable-latency) stall "
-             "contract, which is not realized: its consumers are scheduled at "
-             "the operator's fixed latency and the emitted instance has the "
-             "free-running port shape. Declare style='ce'";
-      return failure();
-    }
+    assert(u.stall != allo::StallContractEnum::Elastic &&
+           "an elastic IP reached emission");
     if (backPressured.count(unitRegion.lookup(u.id))) {
       error(Stage::Emit, u.repOp())
           << "Operator IP '" << operatorModuleName(u)
@@ -139,87 +129,36 @@ LogicalResult checkEmitterSubset(func::FuncOp func, const Datapath &dp) {
   // Region shapes. Mirrors `emitRegion`'s dispatch, reading the same stored
   // discriminant rather than re-deriving it.
   for (const RegionBlock &rb : dp.regions) {
-    if (rb.kind == RegionBlock::Kind::Cyclic && !rb.conditional &&
-        !rb.tripCount && !rb.ubSource)
-      return func.emitError("allo-datapath-to-hw: cyclic region needs a "
-                            "constant or dynamic trip");
+    // A counted `dcp.pipeline` carries its trip either as the `trip` attribute
+    // or as the `dynamicBound` operand; the op verifier enforces that, so a
+    // cyclic non-while region always has one of the two by the time it is here.
+    assert((rb.kind != RegionBlock::Kind::Cyclic || rb.conditional ||
+            rb.tripCount || rb.ubSource) &&
+           "a counted cyclic region reached emission with neither a constant "
+           "nor a dynamic trip; the reifier owns that");
     // `emitLoopCall` advances on the child's `done`, so it would silently drop
     // a second child or any loose datapath. Keyed on the stored shape, so it
     // constrains exactly the regions that reach that controller.
-    if (rb.shape == RegionBlock::Shape::CallNode &&
-        (rb.callUnits.size() > 1 || !rb.units.empty() || !rb.regs.empty()))
-      return func.emitError(
-          "allo-datapath-to-hw: a loop body holding a sub-kernel call "
-          "alongside other work reached the leaf loop-over-calls controller; "
-          "the scheduler should have decomposed it into sub-regions");
+    assert(
+        (rb.shape != RegionBlock::Shape::CallNode ||
+         (rb.callUnits.size() <= 1 && rb.units.empty() && rb.regs.empty())) &&
+        "a loop body holding a sub-kernel call alongside other work reached "
+        "the leaf loop-over-calls controller; the scheduler must decompose "
+        "it into sub-regions");
   }
 
-  // The shapes a CONCURRENT container admits. A structural composition has no
-  // datapath of its own ("the top computes nothing", delivered by
-  // `outline-loose-processes`) and instantiates each process exactly once.
-  for (const RegionBlock &rb : dp.regions) {
-    if (rb.determinacy != DeterminacyEnum::Concurrent)
-      continue;
-    if (!rb.units.empty() || !rb.memAccesses.empty() ||
-        !rb.streamAccesses.empty())
-      return func.emitError(
-          "allo-datapath-to-hw: a concurrent (dataflow) container with its own "
-          "datapath (loose load/store/compute beside the process network) is "
-          "not supported; it composes child instances + channels only");
-    if (rb.kind == RegionBlock::Kind::Cyclic)
-      return func.emitError(
-          "allo-datapath-to-hw: a dataflow process is spawned inside a loop; a "
-          "process is instantiated once and runs concurrently, so spawn it "
-          "once "
-          "and let it iterate internally (move the loop into the process)");
-  }
+  // `verify-rtl-legality` owns the shapes a CONCURRENT container admits (no
+  // datapath of its own, each process instantiated once) and the caller/callee
+  // partition agreement, both settled before scheduling.
 
   // Stream protocol. A channel is one {data,valid,ready} triple time-shared by
   // every access to it, which two properties make sound. Both are the
   // scheduler's to deliver, but a violation would mis-order tokens silently.
+  // The channel's ENDS are checked before scheduling; what is left here is the
+  // timing the schedule assigns them.
   for (const StreamChannel &s : dp.streams) {
-    // (a) One direction, but only where a boundary port forces it: a port is an
-    // input or an output, so a channel both read and written has nothing to
-    // lower to. Counted over this module's accesses and composed child ports.
-    bool anyPut = false, anyGet = false;
-    unsigned producers = 0;
-    for (const StreamChannel::Access &acc : s.accesses) {
-      anyPut |= acc.isPut;
-      anyGet |= !acc.isPut;
-    }
-    for (const StreamChannel::CallEnd &e : s.callEnds) {
-      bool reads = dp.calls[e.call].streamArgs[e.arg].isInput;
-      anyPut |= !reads;
-      anyGet |= reads;
-      producers += !reads;
-    }
-    // Several READERS are a fan-out the emitter inserts (one FIFO each);
-    // several WRITERS are a merge, whose token interleaving is not
-    // deterministic.
-    if (producers > 1)
-      return func.emitError(
-          "allo-datapath-to-hw: a stream channel is written by more than one "
-          "process; a channel is single-producer and deterministic merge is "
-          "not "
-          "supported yet");
-    if (anyPut && anyGet && !s.internal)
-      return func.emitError(
-          "allo-datapath-to-hw: a stream ARGUMENT both read and written inside "
-          "one kernel is not yet lowered (a boundary channel lowers to one "
-          "directional port); route the feedback through a second channel, or "
-          "declare the channel inside the kernel");
-    // A local channel with one end only is a stall by construction: the puts
-    // fill it and block, or the first get waits on a token nothing produces.
-    if (s.internal && !(anyPut && anyGet))
-      return func.emitError("allo-datapath-to-hw: the kernel-local stream is ")
-             << (anyPut ? "never read" : "never written")
-             << "; a channel needs both ends inside the kernel that owns it";
-    // A boundary argument nothing touches would leave a port undriven.
-    if (!s.internal && !anyPut && !anyGet)
-      return func.emitError("allo-datapath-to-hw: the stream argument is "
-                            "neither read nor written");
-    // (b) Distinct cycles in program order within a region, spanning under one
-    // II. Per DIRECTION, since that is what shares a wire: a put drives
+    // Distinct cycles in program order within a region, spanning under one II.
+    // Per DIRECTION, since that is what shares a wire: a put drives
     // {data, valid} and a get {ready}, so a local channel's ends may coincide.
     for (const RegionBlock &rb : dp.regions)
       for (bool put : {false, true}) {
@@ -230,80 +169,18 @@ LogicalResult checkEmitterSubset(func::FuncOp func, const Datapath &dp) {
           const StreamChannel::Access &acc = s.accesses[r.idx];
           if (acc.isPut != put)
             continue;
-          if (prev && acc.stage <= prev->stage)
-            return func.emitError(
-                "allo-datapath-to-hw: two accesses to one stream are scheduled "
-                "on the same cycle, or out of program order; they share a "
-                "single handshake, so their token order would be lost");
+          assert((!prev || acc.stage > prev->stage) &&
+                 "two accesses to one stream are scheduled on the same cycle, "
+                 "or out of program order; they share a single handshake, so "
+                 "their token order is lost. The scheduler owns this");
           prev = &acc;
           first = first ? first : &acc;
         }
-        if (prev && rb.ii && prev->stage - first->stage >= *rb.ii)
-          return func.emitError(
-              "allo-datapath-to-hw: accesses to one stream "
-              "span a whole initiation interval, so successive "
-              "iterations would overlap on its handshake");
+        assert((!prev || !rb.ii || prev->stage - first->stage < *rb.ii) &&
+               "accesses to one stream span a whole initiation interval, so "
+               "successive iterations overlap on its handshake. The scheduler "
+               "owns this");
       }
-  }
-
-  // Liveness. A directed cycle of channels with no initial tokens deadlocks, so
-  // it suffices that the graph of UNSEEDED channels is acyclic. Insufficient
-  // seeding (fewer tokens than the recurrence distance) surfaces as a hang.
-  {
-    llvm::DenseMap<CallId, SmallVector<CallId>> adj; // producer -> consumers
-    for (const StreamChannel &s : dp.streams) {
-      auto init = dyn_cast_or_null<ArrayAttr>(s.init);
-      if (init && !init.empty())
-        continue;
-      std::optional<CallId> prod;
-      for (const StreamChannel::CallEnd &e : s.callEnds)
-        if (!dp.calls[e.call].streamArgs[e.arg].isInput)
-          prod = e.call;
-      if (!prod)
-        continue; // fed from a boundary port: not part of a cycle
-      for (const StreamChannel::CallEnd &e : s.callEnds)
-        if (dp.calls[e.call].streamArgs[e.arg].isInput)
-          adj[*prod].push_back(e.call);
-    }
-    llvm::DenseMap<CallId, int> color; // 0 white / 1 gray / 2 black
-    SmallVector<CallId> cycle;
-    // Self-parameter recursive lambda (`self(self, ...)`): a local DFS with no
-    // std::function type-erasure.
-    llvm::DenseMap<CallId, CallId> parent;
-    auto visit = [&](auto &self, CallId u) -> bool {
-      color[u] = 1;
-      for (CallId v : adj[u]) {
-        if (color[v] == 1) { // back edge -> the cycle v .. u -> v
-          for (CallId x = u; x != v; x = parent[x])
-            cycle.push_back(x);
-          cycle.push_back(v);
-          return true;
-        }
-        if (color[v] == 0) {
-          parent[v] = u;
-          if (self(self, v))
-            return true;
-        }
-      }
-      color[u] = 2;
-      return false;
-    };
-    for (const CallUnit &cu : dp.calls)
-      if (cycle.empty() && color[cu.id] == 0)
-        visit(visit, cu.id);
-    if (!cycle.empty()) {
-      std::reverse(cycle.begin(), cycle.end()); // producer order
-      std::string path;
-      llvm::raw_string_ostream os(path);
-      for (CallId x : cycle)
-        os << dp.calls[x].callee << " -> ";
-      os << dp.calls[cycle.front()].callee; // close the loop
-      error(Stage::Emit, func)
-          << "Dataflow feedback cycle [" << path
-          << "] has no initial tokens and will deadlock; seed a channel on the "
-             "cycle with an initializer, e.g. `s: Stream[T, depth] = [<init>]`";
-      return failure();
-    }
   }
 
   // Condition timing: a flushing leaf while or guard samples it in-cycle,
@@ -323,40 +200,30 @@ LogicalResult checkEmitterSubset(func::FuncOp func, const Datapath &dp) {
     // Which of the two while controllers runs is the stored shape: a Container
     // while is the sequential CHECK/RUN one (it may wait `t_cond`), a Leaf
     // while the flushing one (it samples the condition in-cycle).
-    if (rb.conditional &&
-        !conditionOk(rb.condition,
-                     /*sequential=*/rb.shape == RegionBlock::Shape::Container))
-      return func.emitError("allo-datapath-to-hw: a while loop with a non-"
-                            "combinational (memory-/IP-dependent) condition is "
-                            "not yet lowered");
+    if (rb.conditional && !conditionOk(rb.condition,
+                                       /*sequential=*/rb.shape ==
+                                           RegionBlock::Shape::Container)) {
+      unsupported(Stage::Emit, rb.op)
+          << "A while loop with a non-combinational (memory-/IP-dependent) "
+             "condition is not lowered yet";
+      return failure();
+    }
     if (rb.shape == RegionBlock::Shape::Guard &&
-        !conditionOk(rb.condition, /*sequential=*/false))
-      return func.emitError("allo-datapath-to-hw: a guard with a "
-                            "non-combinational predicate is not yet lowered");
+        !conditionOk(rb.condition, /*sequential=*/false)) {
+      unsupported(Stage::Emit, rb.op)
+          << "A guard with a non-combinational predicate is not lowered yet";
+      return failure();
+    }
   }
   // A leaf `while` with an in-loop store lowers: emitAccesses gates each
   // store's write-enable by `issue & cond`, so a doomed exit iteration
   // commits nothing, matching the non-speculative loop-carried-survivor rule.
 
-  // Operator realizability: a combinational unit needs an EmitHW comb lowering,
-  // an IP unit a non-empty module name. Fail by op name, not deep in emission.
-  for (const FuncUnit &u : dp.units) {
-    if (u.comb) {
-      if (!combEmitted(u.opType)) {
-        error(Stage::Emit, u.repOp())
-            << "Combinational operator '" << u.opType
-            << "' has no native EmitHW lowering; provide an IP or add native "
-               "support";
-        return failure();
-      }
-    } else if (u.impl.empty()) {
-      error(Stage::Emit, u.repOp())
-          << "Operator '" << u.opType
-          << "' has no IP module realization; provide an IP for this operator "
-             "or add native support";
-      return failure();
-    }
-  }
+  // Operator realizability is settled before scheduling: an op with neither an
+  // IP row nor a `combKindOf` lowering never becomes a `dcp.compute`.
+  for (const FuncUnit &u : dp.units)
+    assert((u.comb ? combEmitted(u.opType) : !u.impl.empty()) &&
+           "an unrealizable operator reached emission");
   return success();
 }
 

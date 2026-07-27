@@ -20,6 +20,7 @@ add_mlir_library(MLIRAlloTransforms
     ReassociateReductions.cpp
     RotateReductions.cpp
     LegalizeArith.cpp
+    VerifyRtlLegality.cpp
     SdcScheduling.cpp
 
     DEPENDS

@@ -143,14 +143,11 @@ Value emitCompute(OpBuilder &b, Location loc, StringRef kind,
   // it precedes the `rhs = operands[1]` read below.
   if (kind == "negf") {
     unsigned w = cast<IntegerType>(resultType).getWidth();
-    // The sign-bit mask is built as an int64 (`1 << (w-1)`), so a float wider
-    // than 64 bits (f80/f128) would shift by >= 64 (UB) and cannot carry the
-    // pattern; such a type needs an APInt mask.
-    assert(w <= 64 &&
-           "negf sign-bit mask uses int64 (1 << (w-1)); a float wider "
-           "than 64 bits needs an APInt bit pattern");
-    Value signBit = hw::ConstantOp::create(b, loc, resultType,
-                                           static_cast<int64_t>(1) << (w - 1));
+    // The mask is the width's signed minimum: exactly the top bit set, at any
+    // width. Built as an APInt rather than `1 << (w-1)`, which shifts into the
+    // sign bit of an int64 at w == 64 (UB before C++20) and past it beyond.
+    Value signBit = hw::ConstantOp::create(
+        b, loc, IntegerAttr::get(resultType, APInt::getSignedMinValue(w)));
     return comb::XorOp::create(b, loc, lhs, signBit, false)->getResult(0);
   }
   // 3-input value mux: arith.select(cond, t, f) == comb.mux (cond ? t : f). The
@@ -215,8 +212,9 @@ Value emitCompute(OpBuilder &b, Location loc, StringRef kind,
                                 false)
         ->getResult(0);
   }
-  assert(false && "combEmitted mnemonic without an emitCompute case");
-  return {};
+  // Not an `assert`: under NDEBUG that would fall through and hand the caller a
+  // null Value to wire into the datapath.
+  llvm_unreachable("combEmitted mnemonic without an emitCompute case");
 }
 
 //===----------------------------------------------------------------------===//

@@ -107,8 +107,8 @@ struct UnrollUnderPipelinePass
       if (!innermostNestedLoop(loop))
         continue; // already a single loop, nothing to unroll
       if (!innerLoopsUnrollable(loop)) {
-        logging::warn(logging::Stage::Prep, loop)
-            << "pipelined loop has a dynamic or uncounted inner loop; not "
+        warn(Stage::Prep, loop)
+            << "Pipelined loop has a dynamic or uncounted inner loop; not "
                "unrolled, so it falls back to pipelining the innermost loop "
                "only";
         continue;

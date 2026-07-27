@@ -510,6 +510,11 @@ struct RegionResult {
 struct RegionBlock {
   RegionId id = 0;
 
+  /// The `dcp.pipeline` / `dcp.sequential` / `dcp.select` this block models.
+  /// Kept so a diagnostic about the region anchors on the loop the user wrote
+  /// rather than on the enclosing function.
+  Operation *op = nullptr;
+
   /// STRUCTURAL SHAPE, axis 1 of the controller discriminant. Which controller
   /// lowers a region is a function of (shape x termination class), and this is
   /// the axis the model must store. The termination axis is declared in the IR

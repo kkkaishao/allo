@@ -741,8 +741,7 @@ def test_grid_parallel():
     ROW, COL, F = 32, 32, 9
 
     @kernel
-    def stencil2d(orig: i32[ROW, COL], filt: i32[F]) -> i32[ROW, COL]:
-        sol: i32[ROW, COL] = 0
+    def stencil2d(orig: i32[ROW, COL], filt: i32[F], sol: i32[ROW, COL]):
         for i, j in allo.grid(ROW - 2, COL - 2):
             temp: i32 = 0
             for m in range(3):
@@ -750,7 +749,6 @@ def test_grid_parallel():
                     mul: i32 = filt[m * 3 + n] * orig[i + m, j + n]
                     temp += mul
             sol[i, j] = temp
-        return sol
 
     res = _sched(stencil2d)
     assert res.func("stencil2d").latency is not None
@@ -761,8 +759,7 @@ def test_grid_parallel():
     R, C, H = 8, 16, 16
 
     @kernel
-    def stencil3d(coeff: i32[2], orig: i32[R, C, H]) -> i32[R, C, H]:
-        sol: i32[R, C, H] = 0
+    def stencil3d(coeff: i32[2], orig: i32[R, C, H], sol: i32[R, C, H]):
         for j, k in allo.grid(C, R):
             sol[k, j, 0] = orig[k, j, 0]
             sol[k, j, H - 1] = orig[k, j, H - 1]
@@ -783,7 +780,6 @@ def test_grid_parallel():
                 + orig[k, j + 1, i + 1]
             )
             sol[k + 1, j + 1, i + 1] = sum0 * coeff[0] + sum1 * coeff[1]
-        return sol
 
     res = _sched(stencil3d)
     assert res.func("stencil3d").latency is not None

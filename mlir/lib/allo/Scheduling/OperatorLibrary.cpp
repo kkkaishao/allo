@@ -407,7 +407,9 @@ OperatorChar OperatorLibrary::lookup(Operation *op) const {
     assert((needsIP(op) || combKindOf(op) || !(floatIn && floatOut)) &&
            "unrecognized arith float->float op fell through to the latency-0 "
            "default row (no IP requirement, no comb lowering); add it to "
-           "classify()/needsIP()");
+           "classify()/needsIP(). This is an early duplicate of the operator "
+           "realizability check in validateDatapath, which is where a release "
+           "build reports it");
     e = &defaultEntry;
   }
 

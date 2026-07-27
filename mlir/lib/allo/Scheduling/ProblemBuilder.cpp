@@ -8,6 +8,7 @@
 #include "allo/IR/AlloOps.h"
 #include "allo/Scheduling/Footprint.h"
 #include "allo/Scheduling/OperatorLibrary.h"
+#include "allo/Scheduling/RegionGraph.h" // blockHasSyncCall
 #include "allo/Scheduling/Scheduler.h"
 
 #include "mlir/Dialect/Affine/Analysis/AffineAnalysis.h"
@@ -262,6 +263,18 @@ bool conditionIsCombinational(scf::WhileOp w, const OperatorLibrary &lib) {
     return WalkResult::interrupt();
   });
   return comb;
+}
+
+bool whileFlushingPipelines(scf::WhileOp w, const OperatorLibrary &lib) {
+  for (Region &r : w->getRegions())
+    if (r.walk([](Operation *op) {
+           return isa<affine::AffineForOp, scf::ForOp, scf::WhileOp>(op)
+                      ? WalkResult::interrupt()
+                      : WalkResult::advance();
+         }).wasInterrupted())
+      return false;
+  return conditionIsCombinational(w, lib) &&
+         !blockHasSyncCall(w.getAfter().front());
 }
 
 template <class ProblemT>

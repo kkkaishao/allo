@@ -1180,7 +1180,7 @@ static void verifyControlFlowEliminated(func::FuncOp func) {
   func.walk([&](Operation *op) {
     if (isa<AffineForOp, scf::ForOp, scf::WhileOp, AffineIfOp, scf::IfOp>(op))
       warn(Stage::Dcp, op)
-          << "control-flow op '" << op->getName().getStringRef()
+          << "Control-flow op '" << op->getName().getStringRef()
           << "' survived reification; the post-schedule IR should hold only "
              "dcp.* regions, with every loop and conditional closed";
   });
