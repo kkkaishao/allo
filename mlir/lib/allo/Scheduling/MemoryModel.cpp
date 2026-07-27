@@ -326,6 +326,35 @@ std::optional<int64_t> staticBankOf(const BankLayout &layout, AffineMap map,
   return bank;
 }
 
+AffineMap linearizeAccessMap(AffineMap map, ArrayRef<int64_t> shape) {
+  // Already linear (dcp-flatten-memref's form): the same discriminant
+  // `coordExpr` reads, so the two directions agree on which form they see.
+  unsigned rank = shape.size();
+  if (map.getNumResults() != rank) {
+    assert(map.getNumResults() == 1 &&
+           "an address map is either in element space (one result per memref "
+           "dimension) or already linearized (exactly one result)");
+    return map;
+  }
+  // Row-major strides are a product of the TRAILING extents, so a dynamic
+  // non-leading dim poisons every stride; shape[0] is never read, which is why
+  // a leading dynamic dim is safe. A rank-0 memref (a `Stateful` scalar's
+  // backing storage) has no trailing dim and no stride to poison.
+  assert((shape.empty() ||
+          llvm::none_of(shape.drop_front(),
+                        [](int64_t d) { return ShapedType::isDynamic(d); })) &&
+         "row-major linearization needs static non-leading memref dims");
+  SmallVector<int64_t> stride(rank, 1);
+  for (int k = static_cast<int>(rank) - 2; k >= 0; --k)
+    stride[k] = stride[k + 1] * shape[k + 1];
+  AffineExpr lin = getAffineConstantExpr(0, map.getContext());
+  for (unsigned k = 0; k < rank; ++k)
+    lin = lin + map.getResult(k) * stride[k];
+  lin = simplifyAffineExpr(lin, map.getNumDims(), map.getNumSymbols());
+  return AffineMap::get(map.getNumDims(), map.getNumSymbols(), lin,
+                        map.getContext());
+}
+
 // The aggregate projection of `bankLayoutOf`, for consumers that only need the
 // bank count / kind rather than the full decomposition.
 PartitionInfo partitionOf(Value memRef) {

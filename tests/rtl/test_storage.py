@@ -380,6 +380,53 @@ def test_a_partitioned_container_local_buffer():
     assert np.array_equal(out, exp), list(out)
 
 
+# --- address linearization -------------------------------------------------
+
+
+@pytest.mark.parametrize("cols", [24, 16])
+def test_a_coalesced_nest_addresses_with_the_bare_counter(cols):
+    # `flatten-perfect-loops` coalesces the nest and delinearizes the subscripts
+    # against the single counter (`A[iv floordiv N, iv mod N]`); the memref's
+    # row-major linearization composes straight back to `iv`. That cancellation
+    # must happen on the affine EXPRESSION: rebuilding it out of comb ops costs
+    # a divider, a modulo and a multiplier per port (a shift pair when N is a
+    # power of two) to recompute an index the counter already holds, and nothing
+    # downstream can fold them away.
+    @kernel
+    def flat(A: i32[6, cols], out: i32[6, cols]):
+        for i in range(6):
+            for j in range(cols):
+                out[i, j] = A[i, j] + 1
+
+    mod = _to_rtl(flat)
+    for op in ("comb.divu", "comb.modu", "comb.mul", "comb.shru"):
+        assert op not in mod.mlir, f"{op} in the address path of a flat nest"
+
+    A = (np.arange(6 * cols, dtype=np.int32) % 251).reshape(6, cols)
+    out = np.zeros((6, cols), np.int32)
+    mod.cosim(A, out)
+    assert np.array_equal(out, A + 1)
+
+
+def test_a_partial_coalesced_subscript_keeps_its_address_arithmetic():
+    # The counterpart: an inner loop the coalescing does not absorb leaves the
+    # map with two live dims, so the row-major fold is a real shift/add rather
+    # than the identity. It must still be emitted, and correctly.
+    @kernel
+    def part(A: i32[4, 8], out: i32[4]):
+        for i in range(4):
+            acc: i32 = 0
+            for k in range(8):
+                acc += A[i, k]
+            out[i] = acc
+
+    mod = _to_rtl(part)
+    A = (np.arange(32, dtype=np.int32) % 13).reshape(4, 8)
+    out = np.zeros(4, np.int32)
+    mod.cosim(A, out)
+    assert np.array_equal(out, A.sum(axis=1))
+
+
 # --- ROM vs RAM classification -------------------------------------------
 
 

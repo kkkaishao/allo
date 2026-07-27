@@ -534,6 +534,12 @@ def run_schedule(
     # scheduled against its per-bank ResII. RTL-path only -- Vitis reads
     # `allo.part` as a pragma and does its own interprocedural handling.
     part = "propagate-partition{" + f"top={top}" + "}"
+    # verify-rtl-legality rejects what the backend cannot lower while the facts
+    # are still cheap to read. It runs LAST of the normalizations: after
+    # raise-counted-while (some whiles are for loops by then) and after
+    # propagate-partition (which is what makes a caller/callee partition
+    # comparison meaningful).
+    verify = "verify-rtl-legality{" + f"top={top}" + "}"
     # sdc-scheduling emits the schedule as the allo.sched.* carrier;
     # convert-schedule-to-dcp reifies it into module-scoped allo.dcp.* ops
     # and strips the carrier.
@@ -541,7 +547,7 @@ def run_schedule(
         f"builtin.module(func.func(raise-counted-while,{uup}"
         f"{perf}{flat}"
         f"canonicalize,fold-if-statements,cse,{reassoc},{rotate}),"
-        f"{part},{sdc},{convert})"
+        f"{part},{verify},{sdc},{convert})"
     )
     run_pipeline(module, pipeline)
     return export_schedule_result(module)

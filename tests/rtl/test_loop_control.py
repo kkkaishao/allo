@@ -1319,3 +1319,29 @@ def test_outer_level_scheduling_is_timing_aware():
 
     assert level_add_cycles(1000 / 3.0) == 2  # 3.6ns chain cut by a 3.0ns clock
     assert level_add_cycles(1000 / 6.0) == 1  # fits in one 6.0ns cycle -> not cut
+
+
+def test_a_level_pipelined_container_of_pure_loops_emits():
+    # The complement: a level whose body holds ONLY child loops owns no datapath,
+    # so Phase B reaches hardware. It runs one outer iteration at a time (the
+    # container advances on the last child's drain), so the schedule's II is a
+    # floor the emitted controller does not yet reach -- correct, not fast.
+    @kernel
+    def two(A: i32[16, 4], out: i32[16, 4]):
+        buf: i32[16, 4]
+        for i in range(16, name="i"):
+            for k in range(4):
+                buf[i, k] = A[i, k] + 1
+            for k in range(4):
+                out[i, k] = buf[i, k] * 2
+
+    s = two.schedule()
+    s.pipeline("i")
+    mod = s.export("rtl", unroll_under_pipeline=False)
+    A = (np.arange(64, dtype=np.int32) % 7).reshape(16, 4)
+    out = np.zeros((16, 4), np.int32)
+    cycles = mod.cosim(A, out).cycles
+    assert np.array_equal(out, (A + 1) * 2)
+    # The gap the WARN reports: the container serializes the children, so it
+    # runs at the body length rather than the solved II.
+    assert cycles > mod.schedule().func("two").latency

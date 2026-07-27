@@ -11,6 +11,7 @@
 #include "allo/Support/Logging.h"
 
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/AsmState.h"
@@ -26,6 +27,11 @@ using namespace mlir::allo::logging;
 
 bool mlir::allo::isSyncSubKernelCall(Operation *op) {
   return isa<func::CallOp>(op) && !op->hasAttr(kAlloAsyncAttr);
+}
+
+bool mlir::allo::isDeclarationOp(Operation *op) {
+  return isa<arith::ConstantOp, memref::AllocOp, memref::AllocaOp,
+             memref::GetGlobalOp, StreamCreateOp>(op);
 }
 
 // Whether a call node's operand/result types are the ones a leaf CallUnit can

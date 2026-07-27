@@ -346,13 +346,18 @@ struct DatapathEmitter {
   /// constant. The single definition of result-landing timing, used by survivor
   /// capture.
   unsigned readyCycle(const uarch::Source &s) const;
+  /// The resolved (already stage-delayed) index sources an access's affine map
+  /// is evaluated over, dims then symbols.
+  llvm::SmallVector<Value> addrSources(const uarch::MemUnit::Access &acc);
   /// The element subscripts of a memory access: its affine map evaluated over
-  /// the (already stage-delayed) index sources, delinearized when
-  /// `dcp-flatten-memref` has collapsed the map to a single linear result.
+  /// the index sources, delinearized when `dcp-flatten-memref` has collapsed
+  /// the map to a single linear result. For the BANKED path only, which is the
+  /// one that needs element space; a flat address goes through `computeAddr`,
+  /// which never delinearizes.
   llvm::SmallVector<Value> elementCoords(const uarch::MemUnit &m,
                                          const uarch::MemUnit::Access &acc);
-  /// The linear element address of a memory access (affine map + row-major
-  /// linearization over the delayed index sources).
+  /// The linear element address of a memory access: its affine map composed
+  /// with the memref's row-major strides symbolically, then evaluated once.
   Value computeAddr(const uarch::MemUnit &m, const uarch::MemUnit::Access &acc);
   /// The bank + in-bank offset of a banked access, derived in element space
   /// from the memref's `BankLayout`: each partitioned axis contributes its bank

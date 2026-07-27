@@ -125,6 +125,58 @@ LogicalResult checkDeviceCapability(func::FuncOp func, const Datapath &dp) {
 // 3. What this emitter lowers.
 //===----------------------------------------------------------------------===//
 
+// A COUNTED container (`emitContainer`) drives child regions and has no
+// per-iteration issue pulse to time work of its own against. The one thing it
+// emits is a child guard's predicate, before the children run, which is why the
+// unit test below is what a unit READS rather than whether units exist.
+//
+// Only the level-pipelined (Phase B) schedule produces a counted container with
+// datapath: it fuses the level's leaf ops INTO the outer pipeline, at their own
+// cycles between the children. The sequential decomposition wraps each of those
+// runs in its own child region instead, which is why every other path lands a
+// container whose body is nothing but declarations.
+//
+// Without this the failure is silent or a crash: an external store leaves its
+// boundary port undriven (a null operand reaching `Operation::create`), and a
+// compute over a child's result reads that child's survivor before the child
+// has emitted.
+//
+// A CONDITIONAL container is a different controller: `emitConditionalContainer`
+// emits its own condition cone (`emitConditionRegion`), so its reads and units
+// are expected. Its writes and stream accesses are not emitted, but no frontend
+// shape puts one in a while condition, so that stays a gap rather than a check.
+static LogicalResult checkContainerOwnsNoDatapath(const RegionBlock &rb,
+                                                  const Datapath &dp) {
+  auto reject = [&](Operation *op, StringRef what) {
+    unsupported(Stage::Emit, op ? op : rb.op)
+        << "A loop that both nests inner loops and carries " << what
+        << " of its own is not lowered yet: the container controller sequences "
+           "its children and runs no schedule, so this work has no cycle to "
+           "issue on. Leave `unroll_under_pipeline` at its default, which "
+           "unrolls the inner loops into the pipelined level instead";
+    return failure();
+  };
+  if (!rb.memAccesses.empty())
+    return reject(dp.mems[rb.memAccesses.front().id]
+                      .accesses[rb.memAccesses.front().idx]
+                      .op,
+                  "a memory access");
+  if (!rb.streamAccesses.empty())
+    return reject(dp.streams[rb.streamAccesses.front().id]
+                      .accesses[rb.streamAccesses.front().idx]
+                      .op,
+                  "a stream access");
+  if (!rb.callUnits.empty())
+    return reject(dp.calls[rb.callUnits.front()].invoke, "a sub-kernel call");
+  for (UnitId uid : rb.units)
+    for (const Source &s : dp.units[uid].inputs)
+      if (s.kind == Source::Kind::Survivor &&
+          llvm::is_contained(rb.children, s.id))
+        return reject(dp.units[uid].repOp(), "a computation over an inner "
+                                             "loop's result");
+  return success();
+}
+
 LogicalResult checkEmitterSubset(func::FuncOp func, const Datapath &dp) {
   // Region shapes. Mirrors `emitRegion`'s dispatch, reading the same stored
   // discriminant rather than re-deriving it.
@@ -145,6 +197,9 @@ LogicalResult checkEmitterSubset(func::FuncOp func, const Datapath &dp) {
         "a loop body holding a sub-kernel call alongside other work reached "
         "the leaf loop-over-calls controller; the scheduler must decompose "
         "it into sub-regions");
+    if (rb.shape == RegionBlock::Shape::Container && !rb.conditional &&
+        failed(checkContainerOwnsNoDatapath(rb, dp)))
+      return failure();
   }
 
   // `verify-rtl-legality` owns the shapes a CONCURRENT container admits (no

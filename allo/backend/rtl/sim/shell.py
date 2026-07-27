@@ -199,6 +199,17 @@ def cosim(
             # benign here. Keep them non-fatal; the golden comparison still
             # catches any real value corruption.
             build_args = ["-Wno-fatal", *build_args]
+            # Every DUT is built in a fresh directory, so each one recompiles the
+            # same verilator runtime translation units from scratch. Verilator's
+            # makefile prefixes each compile with OBJCACHE, so pointing that at a
+            # compiler cache turns all but the first build into a hit. An explicit
+            # setting wins, including an empty one that opts out.
+            if "OBJCACHE" not in os.environ:
+                cache = next(
+                    (c for c in ("ccache", "sccache") if shutil.which(c)), None
+                )
+                if cache:
+                    os.environ["OBJCACHE"] = cache
         # Clock period as an even integer ps (cocotb splits it into two half
         # periods); it only affects sim time, not the reported cycle count.
         clock_ps = round(1.0e6 / freq_mhz)

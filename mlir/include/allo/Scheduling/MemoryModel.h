@@ -216,6 +216,22 @@ BankLayout bankLayoutOf(Value memRef);
 std::optional<int64_t> staticBankOf(const BankLayout &layout, AffineMap map,
                                     llvm::ArrayRef<int64_t> shape);
 
+/// \p map rewritten as the single row-major linear element index it addresses,
+/// simplified. The counterpart to `coordExpr`, which goes the other way, and
+/// the ONE definition of the linear direction: `dcp-flatten-memref` rewrites an
+/// access map with it, and the emitter evaluates the same expression to
+/// hardware.
+///
+/// Doing this on the EXPRESSION rather than on emitted values is what makes the
+/// delinearize/linearize pair of a coalesced nest cancel: `iv -> (iv floordiv
+/// N, iv mod N)` composed with `(r, c) -> r*N + c` simplifies back to `iv`,
+/// where the same round trip built out of `comb` ops is a divider, a modulo and
+/// a multiplier that no later pass can fold.
+///
+/// A map that is already linear (one result over a rank>1 memref) is returned
+/// unchanged, so this is total over both address-map forms.
+AffineMap linearizeAccessMap(AffineMap map, llvm::ArrayRef<int64_t> shape);
+
 /// A memref's `allo.part` partitioning, decoded. A projection of `BankLayout`
 /// kept for the consumers that only need the aggregate facts (`factor` is
 /// `BankLayout::numBanks`).

@@ -86,6 +86,12 @@ SmallVector<SchedRegion> enumerateRegions(Block &block);
 /// straight-line runs).
 SmallVector<SchedRegion> enumerateRegions(func::FuncOp func);
 
+/// A DECLARATION: an op that names storage or a literal and binds no hardware.
+/// A straight-line region of nothing but these carries no datapath, so the
+/// reifier leaves it in place rather than wrapping it, and a level whose body
+/// holds only these plus child loops has no work of its own to schedule.
+bool isDeclarationOp(Operation *op);
+
 /// A synchronous sub-kernel call: a plain (non-async) `func.call`, scheduled as
 /// an opaque fixed-latency node. An async call composes structurally as
 /// dataflow, ordered by its streams rather than by the schedule.

@@ -1,11 +1,14 @@
 # Building
-- Always run `conda activate allo` before building or running tests
-- Run `pip install -v -e .` to build the full project (includes MLIR/C++ backend)
-- Run `ninja -C build [target]` to build specific targets
+- Always run `conda activate allo-rtlgen` before building or running tests
+- Run `ninja -C build [target]` to build specific targets when only using C++ side tools (e.g. `allo-opt`)
+- Run `pip install -e .` to synchronize python packages when modifying both Python side and C++ side
+  (it also rebuilds C++ side automatically)
 
 # Testing
 - Run `python -m pytest tests/` to run all tests
 - Set `XILINX_VITIS` to any invalid path to skip tests for synthesis with Vitis to save time
+- Install the developer toolchain with `pip install -e '.[dev]'`
+- Run the RTL cosim tests in parallel with `pytest tests/rtl -n [jobs]` (pytest-xdist).
 
 # Running
 - Use `conda run -n allo` to execute commands in the `allo` environment.
@@ -14,10 +17,15 @@
 
 # Code style
 - Make small, targeted diffs rather than large refactors, and always be concise
-- Prefer general solutions instead of one-off `if/else` patches
+- If user explicitly requests a refactor, then larger diffs are acceptable,
+  prefer cleaner code structure for future maintainability at this time.
 - Use Modern C++ features and best practices in C++ code
 - Use `assert` to enforce invariants and assumptions that should always hold by the design,
   and fail loudly during development instead of being silently tolerated.
+- Always prefer systematic solutions over ad-hoc fixes when developing a new feature,
+  even though it may take more effort and break some regression tests in the short term.
+- Don't over encapsulate code in helper functions, e.g. encapsulating one or two lines
+  of logic in a free function, which can make the code harder to read and understand.
 
 # Don'ts
 - Do not modify repository structure without approval
@@ -26,7 +34,6 @@
 # Repository structure
 - Place Python frontend code in `allo/`
 - Place MLIR dialects and passes code in `mlir/`
-- Tests lie in `tests/`
 - Use `drafts/` for temporary code when exploring new ideas
 
 # Allo Usage

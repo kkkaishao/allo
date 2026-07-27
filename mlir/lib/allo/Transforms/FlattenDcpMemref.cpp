@@ -4,6 +4,7 @@
  */
 
 #include "allo/IR/AlloOps.h"
+#include "allo/Scheduling/MemoryModel.h" // linearizeAccessMap
 #include "allo/Transforms/Passes.h"
 
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
@@ -37,24 +38,6 @@ bool hasDivMod(AffineExpr e) {
   return found;
 }
 
-// Compose the memref's row-major linearization into the (possibly delinearized)
-// access map, yielding a single linear index. For a coalesced nest the map is
-// `iv -> (iv floordiv N, iv mod N)`; the linearization `(r, c) -> r*N + c`
-// composes to `(iv floordiv N)*N + iv mod N`, which `simplifyAffineExpr` folds
-// back to `iv` (mod expands to `iv - (iv floordiv N)*N`, so the terms cancel).
-AffineMap linearize(AffineMap map, ArrayRef<int64_t> shape) {
-  unsigned rank = map.getNumResults();
-  SmallVector<int64_t> stride(rank, 1);
-  for (int k = static_cast<int>(rank) - 2; k >= 0; --k)
-    stride[k] = stride[k + 1] * shape[k + 1];
-  AffineExpr lin = getAffineConstantExpr(0, map.getContext());
-  for (unsigned k = 0; k < rank; ++k)
-    lin = lin + map.getResult(k) * stride[k];
-  lin = simplifyAffineExpr(lin, map.getNumDims(), map.getNumSymbols());
-  return AffineMap::get(map.getNumDims(), map.getNumSymbols(), lin,
-                        map.getContext());
-}
-
 // Linearize one dcp memory access whose address map carries a floordiv/mod.
 // The delinearize/linearize pair cancels to a plain index when the access spans
 // the whole coalesced range (`A[iv floordiv N, iv mod N]` -> `A[iv]`); when it
@@ -67,7 +50,7 @@ template <class OpT> void flattenAccess(OpT op) {
   if (llvm::none_of(map.getResults(), hasDivMod))
     return;
   auto shape = cast<MemRefType>(op.getMemref().getType()).getShape();
-  op.setMapAttr(AffineMapAttr::get(linearize(map, shape)));
+  op.setMapAttr(AffineMapAttr::get(linearizeAccessMap(map, shape)));
 }
 
 struct FlattenDcpMemrefPass

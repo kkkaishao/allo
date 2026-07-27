@@ -844,10 +844,18 @@ static void logLevelII(const LevelAnalysis &a, LoopLikeOpInterface level,
 //     band child would leave a wrapper loop inside the level pipeline).
 // This gate runs BEFORE any child is scheduled, so the fallback stays a clean
 // sequential schedule with no double-scheduling.
+//
+// \p why receives the failing condition, which is what the fallback warning
+// reports. One gate, several unrelated reasons: naming the one that fired is
+// the difference between an actionable message and a list the reader has to
+// re-derive against their kernel.
 static bool levelIsPhaseBReifiable(LoopLikeOpInterface level,
-                                   DependenceAnalysis &deps) {
-  if (!level.getInits().empty())
+                                   DependenceAnalysis &deps, std::string &why) {
+  if (!level.getInits().empty()) {
+    why = "the level carries loop-carried values, whose cross-iteration "
+          "recurrence the level problem does not model";
     return false;
+  }
   Block &body = level.getLoopRegions().front()->front();
   // A non-affine access on a WRITTEN root could hide a level-carried
   // recurrence the affine analysis cannot bound, so it forces the sequential
@@ -855,26 +863,36 @@ static bool levelIsPhaseBReifiable(LoopLikeOpInterface level,
   Summary footprint;
   body.walk([&](Operation *o) { summarizeOp(o, footprint); });
   for (const auto &kv : footprint.mem)
-    if (kv.second.nonAffine && kv.second.writes)
+    if (kv.second.nonAffine && kv.second.writes) {
+      why = "an array is written through a non-affine index, which can hide a "
+            "level-carried recurrence the analysis cannot bound";
       return false;
+    }
   // A sub-kernel call is not a loop child, so the level problem would fold it
   // back into the fused pipeline as a leaf op. Keep such a level sequential,
   // with each call its own sub-region.
   for (Operation &o : body)
-    if (isSyncSubKernelCall(&o))
+    if (isSyncSubKernelCall(&o)) {
+      why = "the level body holds a sub-kernel call, which is not a loop child";
       return false;
+    }
   for (const SchedRegion &sub : enumerateRegions(body)) {
     if (sub.kind != allo::RegionKind::Loop)
       continue;
     Operation *child = sub.anchor();
     auto childLoop = dyn_cast<LoopLikeOpInterface>(child);
     if (!childLoop || !isa<AffineForOp, scf::ForOp>(child) ||
-        hasNestedLoop(childLoop))
+        hasNestedLoop(childLoop)) {
+      why = "an inner loop is itself a nest, so it does not characterize as "
+            "one fixed-latency node";
       return false;
+    }
     bool isBound = false;
     if (!loopTrip(child, deps, isBound) ||
-        !enclosingTripProduct(child, deps, isBound))
+        !enclosingTripProduct(child, deps, isBound)) {
+      why = "an inner loop's trip count is not statically known";
       return false;
+    }
   }
   return true;
 }
@@ -1004,8 +1022,20 @@ struct SdcSchedulingPass
           d << "above the " << resourceBound
             << "-cycle inner-loop occupancy, raised by a level-carried "
                "recurrence";
-        d << "); surrounding ops and consecutive outer iterations overlap";
+        d << ")";
       }
+      // The container controller starts each child on the previous one's done
+      // and advances the outer counter on the last drain, so it runs exactly
+      // one outer iteration at a time. A solved II below the body length asks
+      // for an overlap it does not perform: the hardware is correct, but slower
+      // than the latency solved against that II.
+      if (int64_t length = scheduleDepth(problem); ii < length)
+        warn(Stage::Sched, level.getOperation())
+            << "Outer-iteration overlap is not emitted yet (II=" << ii
+            << " under a " << length
+            << "-cycle body): the container runs its inner loops one outer "
+               "iteration at a time, so the hardware is correct but slower "
+               "than the reported latency";
     }
     for (Operation *op : tagged)
       op->removeAttr(sched::kResourceCyclesAttr);
@@ -1052,7 +1082,8 @@ struct SdcSchedulingPass
       int64_t dir =
           pipelineDirective(innermost.getOperation(), region.anchor());
       if (loopBodyDecomposes(innermost)) {
-        if (dir >= 1 && levelIsPhaseBReifiable(innermost, deps)) {
+        std::string why;
+        if (dir >= 1 && levelIsPhaseBReifiable(innermost, deps, why)) {
           info(Stage::Sched, innermost.getOperation())
               << "Detected imperfect nest with pipeline directives, "
                  "fusing the outer loop over its inner loop(s) as one modulo "
@@ -1062,10 +1093,8 @@ struct SdcSchedulingPass
         }
         if (dir >= 1)
           warn(Stage::Sched, innermost.getOperation())
-              << "Pipelined imperfect nest not fused into one pipeline. "
-                 "Requires single counted inner loops with known trips and no "
-                 "outer iter_args); scheduling its body as sequential "
-                 "sub-regions";
+              << "Pipelined imperfect nest not fused into one pipeline (" << why
+              << "); scheduling its body as sequential sub-regions";
         info(Stage::Sched, innermost.getOperation())
             << "Detected imperfect nest, decomposing into sub-regions "
                "scheduled in program order.";

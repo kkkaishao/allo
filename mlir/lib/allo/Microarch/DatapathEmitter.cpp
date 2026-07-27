@@ -89,8 +89,16 @@ Value writeDemux(EmitContext &c, Value we, Value bank, unsigned k) {
 // (muxes in the binding phase).
 Value DatapathEmitter::resolveSource(const uarch::Source &s) {
   switch (s.kind) {
-  case uarch::Source::Kind::Unit:
-    return unitVal.lookup(s.id);
+  case uarch::Source::Kind::Unit: {
+    // A same-region operator result. Its backedge is declared for the whole
+    // region before any read resolves (`declareUnits`), so a miss means the
+    // consumer is not in the region that owns the unit. Guarded like every
+    // other kind: `lookup` would otherwise hand back a null Value and crash in
+    // `Operation::create` with no indication of what went wrong.
+    Value v = unitVal.lookup(s.id);
+    assert(v && "unit source read outside the region that declared it");
+    return v;
+  }
   case uarch::Source::Kind::Reg:
     return regStages[s.id].tap(s.outPort);
   case uarch::Source::Kind::Mem:
@@ -224,17 +232,28 @@ Value evalAffine(OpBuilder &b, Location loc, AffineExpr e, ValueRange idx,
   return modConst(b, loc, lhs, f);
 }
 
-// The element subscripts of a memory access: its affine map evaluated over the
-// (already stage-delayed) index sources. The map is either in element space
-// (one result per memref dimension) or already linearized by
-// `dcp-flatten-memref` (one result over a rank>1 memref), which is delinearized
-// row-major here so the banking below always works in element space.
+// The resolved (already stage-delayed) index sources of an access: the operands
+// its affine map is evaluated over, dims then symbols.
 SmallVector<Value>
-DatapathEmitter::elementCoords(const uarch::MemUnit &m,
-                               const uarch::MemUnit::Access &acc) {
+DatapathEmitter::addrSources(const uarch::MemUnit::Access &acc) {
   SmallVector<Value> idx;
   for (const uarch::Source &s : acc.addr)
     idx.push_back(resolveSource(s));
+  return idx;
+}
+
+// The element subscripts of a memory access: its affine map evaluated over the
+// index sources. The map is either in element space (one result per memref
+// dimension) or already linearized by `dcp-flatten-memref` (one result over a
+// rank>1 memref), which is delinearized row-major here.
+//
+// Only the BANKED path needs this. Delinearizing a linear map costs a divider
+// and a modulo per dimension, so a flat address must not come back through
+// here: it linearizes symbolically in `computeAddr` instead.
+SmallVector<Value>
+DatapathEmitter::elementCoords(const uarch::MemUnit &m,
+                               const uarch::MemUnit::Access &acc) {
+  SmallVector<Value> idx = addrSources(acc);
   AffineMap map = acc.addrMap;
   assert(map && "dcp memory access without an affine map");
   ArrayRef<int64_t> shape = cast<MemRefType>(m.memref.getType()).getShape();
@@ -267,13 +286,21 @@ DatapathEmitter::elementCoords(const uarch::MemUnit &m,
   return coord;
 }
 
-// The linear element address of a memory access: its element subscripts
-// linearized by the memref's row-major strides. Single-index identity
+// The linear element address of a memory access: its affine map composed with
+// the memref's row-major strides, SYMBOLICALLY, and only then evaluated.
+//
+// The composition has to happen on the expression. `dcp-flatten-memref` already
+// folds a coalesced nest's delinearization into a plain index, and going back
+// through element space would re-emit that round trip as a divider, a modulo
+// and a multiplier computing the index the counter already holds. Identity
 // addressing emits no ops.
 Value DatapathEmitter::computeAddr(const uarch::MemUnit &m,
                                    const uarch::MemUnit::Access &acc) {
   ArrayRef<int64_t> shape = cast<MemRefType>(m.memref.getType()).getShape();
-  Value addr = linearize(c, elementCoords(m, acc), shape);
+  assert(acc.addrMap && "dcp memory access without an affine map");
+  AffineMap lin = linearizeAccessMap(acc.addrMap, shape);
+  SmallVector<Value> idx = addrSources(acc);
+  Value addr = evalAffine(c.b, c.loc, lin.getResult(0), idx, lin.getNumDims());
   // A stream-region read must freeze its address on stall, or the counter
   // over-runs and the in-flight read is lost, violating KPN semantics; a
   // write needs no hold since its gated write-enable simply skips a stall.

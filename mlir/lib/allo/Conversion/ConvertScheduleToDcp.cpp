@@ -771,10 +771,6 @@ static void materializeLoopToPipeline(const RegionInfo &r,
 static void materializeSequential(const RegionInfo &r,
                                   ArrayRef<Operation *> ops,
                                   const OperatorLibrary &lib, bool container) {
-  auto isDecl = [](Operation *op) {
-    return isa<arith::ConstantOp, memref::AllocOp, memref::AllocaOp,
-               memref::GetGlobalOp, StreamCreateOp>(op);
-  };
   SmallVector<Operation *> body;
   for (Operation *op : ops)
     if (!op->hasTrait<OpTrait::IsTerminator>())
@@ -799,7 +795,7 @@ static void materializeSequential(const RegionInfo &r,
       work.push_back(op);
   }
 
-  if (work.empty() || llvm::all_of(work, isDecl))
+  if (work.empty() || llvm::all_of(work, isDeclarationOp))
     return;
 
   // Move the hoisted allocs above the region so they dominate the wrapped uses.

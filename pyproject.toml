@@ -33,6 +33,19 @@ classifiers = [
     "Operating System :: OS Independent"
 ]
 
+# The developer toolchain, installed with `pip install -e '.[dev]'`.
+[project.optional-dependencies]
+dev = [
+    "nanobind",
+    "pytest",
+    "pytest-xdist",
+    "cocotb",
+    "sccache",
+    "clang-format",
+    "black==24.8.0",
+    "pylint==3.0.2",
+]
+
 [tool.scikit-build]
 minimum-version = "build-system.requires"
 cmake.version = ">=3.20"
@@ -56,7 +69,6 @@ MLIR_BINDINGS_PYTHON_NB_DOMAIN = "allo"
 LLVM_ENABLE_ZSTD = "OFF"
 
 [tool.scikit-build.editable]
-# Rebuild the native bits on import so `pip install -e .` is one self-healing step.
 mode = "redirect"
-rebuild = true
+rebuild = false
 verbose = false
