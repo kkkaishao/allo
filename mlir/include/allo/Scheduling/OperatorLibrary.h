@@ -147,6 +147,12 @@ public:
   /// The storage-timing view of the device.
   const MemoryLibrary &memoryLibrary() const { return memory; }
 
+  /// The chaining delay of the device's combinational row for \p kind, or 0.0
+  /// when the device declares none. For a caller pricing hardware it builds
+  /// itself out of native operators rather than characterizing an existing op
+  /// (`addressDelaysOf`), which has no `Operation *` to hand `lookup`.
+  double combDelay(OpKind kind) const;
+
 private:
   std::vector<OperatorEntry> advancedEntries; // matched first (raw name)
   std::vector<OperatorEntry> entries;         // abstract rows

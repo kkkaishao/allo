@@ -1,0 +1,54 @@
+# Copyright Allo authors. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+name: "CI"
+
+on:
+  push:
+    branches:
+      - allov2
+  pull_request:
+    branches:
+      - allov2
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint-and-test:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake ninja-build clang lld ccache verilator
+
+      - name: Build MLIR and CIRCT
+        uses: ./.github/actions/build-mlir-circt
+
+      - name: Install Allo
+        run: pip install -v -e '.[dev]'
+
+      - name: Format and lint
+        run: bash scripts/lint/task_lint.sh
+
+      - name: Run Allo tests
+        env:
+          # Force an invalid path so Vitis-dependent tests are skipped
+          # on runners that don't have Vitis installed.
+          XILINX_VITIS: /nonexistent
+        run: python -m pytest tests/ --ignore=tests/rtl -v
+
+      - name: Run Allo HLS backend tests
+        run: python -m pytest tests/rtl/ -v

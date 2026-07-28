@@ -4,10 +4,10 @@
 from __future__ import annotations
 
 import ctypes
-import os
+import platform
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Generic, ParamSpec, TypeVar
+from typing import Generic, ParamSpec, TypeVar
 
 import ml_dtypes
 import numpy as np
@@ -63,61 +63,21 @@ _DTYPE_TO_NP = {
 }
 
 
-def _find_first(paths: list[Path], stem: str) -> str | None:
-    for lib_dir in paths:
-        for suffix in (".dylib", ".so"):
-            path = lib_dir / f"{stem}{suffix}"
-            if path.exists():
-                return str(path)
-    return None
-
-
 def _dataflow_runtime_lib() -> str:
-    cur_dir = Path(__file__).resolve().parent
-    candidates = [
-        cur_dir.parent / "_mlir" / "_mlir_libs",
-        cur_dir.parents[1] / "build" / "lib",
-    ]
-    path = _find_first(candidates, "libAlloDataflowRuntime")
-    if path is None:
+    lib_dir = Path(__file__).resolve().parent.parent / "_mlir" / "_mlir_libs"
+    lib_name = "libAlloDataflowRuntime"
+    if platform.system() == "Darwin":
+        lib_name += ".dylib"
+    elif platform.system() == "Linux":
+        lib_name += ".so"
+    else:
+        raise RuntimeError(f"Unsupported platform: {platform.system()}")
+    lib_path = lib_dir / lib_name
+    if not lib_path.exists():
         raise RuntimeError(
-            "Cannot find libAlloDataflowRuntime. Rebuild Allo with `pip install -v -e .`."
+            f"Cannot find Allo dataflow runtime library at {lib_path}. Installation may be broken."
         )
-    return path
-
-
-def _default_shared_libs() -> list[str]:
-    llvm_base_dir = os.environ.get("LLVM_BASE_DIR")
-    candidates = []
-    if llvm_base_dir:
-        candidates.append(Path(llvm_base_dir) / "lib")
-    candidates.append(
-        Path(__file__).resolve().parents[3]
-        / "externals"
-        / "llvm-project"
-        / "build"
-        / "lib"
-    )
-
-    libs = []
-    for lib_dir in candidates:
-        found = []
-        for stem in ("libmlir_runner_utils", "libmlir_c_runner_utils"):
-            match = next(
-                (
-                    lib_dir / f"{stem}{suffix}"
-                    for suffix in (".dylib", ".so")
-                    if (lib_dir / f"{stem}{suffix}").exists()
-                ),
-                None,
-            )
-            if match is None:
-                break
-            found.append(str(match))
-        if len(found) == 2:
-            libs.extend(found)
-            break
-    return [*libs, _dataflow_runtime_lib()]
+    return str(lib_path)
 
 
 def _make_output_struct(memref_descriptors):
@@ -271,7 +231,7 @@ P = ParamSpec("P")
 R = TypeVar("R")
 
 
-class CPU(Backend, Generic[P, R]):
+class CPU(Backend[P, R]):
     """
     Backend for executing kernels on the CPU using LLVM's JIT compilation.
 
@@ -293,7 +253,7 @@ class CPU(Backend, Generic[P, R]):
     ):
         super().__init__(kernel)
         self.opt_level = opt_level
-        self.shared_libs = _default_shared_libs()
+        self.shared_libs = [_dataflow_runtime_lib()]
         self.shared_libs.extend(shared_libs)
         self.engine: ExecutionEngine | None = None
         self.arg_types: list[TypeBase] = []

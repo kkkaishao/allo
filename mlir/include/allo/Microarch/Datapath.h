@@ -209,6 +209,39 @@ struct MemUnit {
   // consumer needs an "is it banked" guard before reading it.
   BankLayout layout;
   unsigned numBanks = 1; // == layout.numBanks (1 = unbanked or registers)
+  /// This memory's banks are SKEWED and its accesses carry slots rather than
+  /// banks (`Access::staticBank`), so they are read through lane-shared ports
+  /// instead of routed. `layout.skew()` states the layout fact; this states
+  /// that the slots were actually assigned, which `assign-banks` declines for
+  /// an argument array and for one whose accesses do not share a bank class.
+  /// False on a skewed memory that fell back, which then crossbars like any
+  /// other.
+  bool skewed = false;
+  /// This argument crosses the TOP boundary completely partitioned, so it
+  /// arrives as one port per ELEMENT rather than as an addressed interface.
+  /// The one expression is `external && dp.atTop && layout.registers`, applied
+  /// once by the builder.
+  ///
+  /// A complete partition commits the scheduler to unlimited combinational
+  /// ports (`MemoryBankModel` bills none), and at a boundary the only structure
+  /// that delivers that is every element present at once: an addressed port
+  /// serves one element per cycle, which is exactly the resource the schedule
+  /// was solved without. Below the top the question does not arise, because
+  /// whoever owns the storage (a `seq.hlmem`, or a scattered argument's own
+  /// input ports) serves an ordinary addressed port from it.
+  bool scattered = false;
+  /// The module ports holding one element of a `scattered` argument: the input
+  /// it arrives on, and the output + write-enable it leaves on. A direction the
+  /// kernel does not use has no port, so exactly the unused ones are empty, and
+  /// the DIRECTION is what decides the names (`A_k` when only one is live,
+  /// `A_k_in` / `A_k_out` when both are, which is the rule Vitis follows).
+  struct ElemPort {
+    std::string in, out, we;
+  };
+  /// One per element, flat row-major, when `scattered`. Composed once by
+  /// `enumerateBoundaryPorts`, which is where the whole boundary naming lives;
+  /// empty for every other memory.
+  llvm::SmallVector<ElemPort> elemPorts;
   MemoryImplEnum impl = MemoryImplEnum::LUTRAM; // resolved storage primitive
 
   // Access latency of `impl`, read from the device memory model. These are the
@@ -256,16 +289,83 @@ struct MemUnit {
     /// memory's access, which takes no module port.
     std::string portBase;
     /// Which bank this access routes to, when its memref is partitioned
-    /// (`numBanks > 1`): a static index for an affine address the bank of which
-    /// is known at compile time, or empty for a data-dependent one, which
-    /// crossbars over all `numBanks` interfaces. Always 0 for an unbanked
-    /// memref. Resolved once (`allocateInputSlots`, beside `addrMap`, which it
-    /// reads) rather than re-parsing `allo.part` at each consumer;
+    /// (`numBanks > 1`): the index `assign-banks` assigned it, or empty when it
+    /// assigned none, in which case the access crossbars over all `numBanks`
+    /// banks (boundary interfaces for an argument, `seq.hlmem`s for an internal
+    /// buffer). 0 for an unbanked memref, which is the one bank there is.
     /// `externalBank` pairs it with the memref's bank count.
-    std::optional<unsigned> staticBank = 0;
-    AffineMap addrMap; // index map over `addr` operands (null: plain indices)
+    ///
+    /// READ, not derived (`assignedBankOf` in `allocateInputSlots`), which
+    /// writes every access including the unbanked ones. It is the same recorded
+    /// decision the scheduler's port model was billed against before the solve,
+    /// so an access charged one bank's port cannot end up taking one on every
+    /// bank here. The default is the CONSERVATIVE end: an `Access` built on
+    /// some future path that never reaches that write crossbars, which is
+    /// wasteful, where defaulting to bank 0 would silently route it to the
+    /// wrong storage.
+    ///
+    /// Under a SKEWED layout it holds a SLOT, not a bank: the physical bank is
+    /// the slot rotated by a runtime value shared with the array's other
+    /// accesses, so it is billable (distinct slots are distinct banks at every
+    /// rotation) but not routable. `MemUnit::skewed` is the flag that says
+    /// which of the two readings applies, and every consumer that ROUTES must
+    /// check it. The port model, which only counts, need not.
+    std::optional<unsigned> staticBank;
+    /// Which of a skewed memory's parallel port sets this access uses. Accesses
+    /// of one lane hold distinct slots, so they reach distinct banks and can
+    /// SHARE one port on each: the lane is read once per bank and its accesses
+    /// select among those reads. Two accesses of the same slot always collide,
+    /// so they land in different lanes and get a port each, which is exactly
+    /// what the port model billed them. Always 0 off the skewed path.
+    unsigned lane = 0;
+    AffineMap addrMap; // index map over `addr` operands (identity when the
+                       // subscript was not affine)
     llvm::SmallVector<Source, 2> addr; // address operand drivers (delayed IVs)
     Source data;                       // write data driver (writes only)
+    /// One strength-reduced term of the address: a scaled counter its region
+    /// carries (`RegionBlock::addrStrides`).
+    struct ScaledTerm {
+      unsigned region;
+      unsigned slot; // index into that RegionBlock's `addrStrides`
+    };
+    /// ADDRESS STRENGTH REDUCTION. One expression this access's address
+    /// hardware computes: `base` plus one register per term (a scaled counter
+    /// or a digit of one that the controller advances, instead of arithmetic
+    /// the datapath rebuilds every cycle) plus `residual` evaluated over
+    /// `addr`. `planAddressGenerators` decides them together (`splitAddress`)
+    /// and `buildAddr` builds exactly them.
+    ///
+    /// PARTIAL: a term reduces or does not on its own, so a data-dependent
+    /// subscript does not cost the reduction to the row stride beside it. With
+    /// nothing reduced `terms` is empty and the residual holds the whole
+    /// expression, which is the arithmetic an unreduced address builds.
+    struct Reduced {
+      llvm::SmallVector<ScaledTerm, 3> terms;
+      /// The expression's constant, and ZERO whenever a term exists: a register
+      /// loads a constant at start anyway, so the first one that does not wrap
+      /// absorbs it (`AddrStride::init`) rather than an adder carrying it.
+      int64_t base = 0;
+      AffineExpr residual; // null when the whole expression reduced
+      /// Registers the RESIDUAL reads (`SplitAddress::reads`), in the order it
+      /// names them: a digit the address does not sum but an operator on top of
+      /// it wants cheap. Appended to the operand list `buildAddr` evaluates the
+      /// residual over, so they land on the symbol positions it named.
+      llvm::SmallVector<ScaledTerm, 2> reads;
+    };
+    /// The element index within the bank, and the bank digit when one is
+    /// decoded at run time. Two cones off the same operands
+    /// (`addressExprsOf`), reduced by the one definition and built by the one
+    /// builder: a bank digit is `(counter floordiv D) mod F`, which is a
+    /// register as much as a row stride is.
+    Reduced offset;
+    Reduced bank;
+    /// How many cycles late this access needs the SCALED COUNTERS, i.e. the
+    /// delay its counter operands would otherwise be tapped at. They run live,
+    /// so their sum is delayed once rather than each operand separately, which
+    /// is equivalent and costs less register. The residual's operands arrive
+    /// already delayed, so it is added after the chain and this does not apply
+    /// to it.
+    unsigned addrDelay = 0;
   };
   llvm::SmallVector<Access, 2> accesses;
 };
@@ -601,6 +701,53 @@ struct RegionBlock {
   std::string counterName; // source loop IV name (its NameLoc), for a readable
                            // iteration-counter wire; empty if the loop's IV
                            // carried no name (best-effort)
+  /// A REGISTER this region carries beside its own counter, holding
+  /// `coeff * digit` of it for a coefficient and a digit an access's address
+  /// needs, tracked incrementally rather than rebuilt.
+  ///
+  /// This is address strength reduction. The constant multiply is the
+  /// arithmetic that dominates an address (a row stride of 400 is a
+  /// three-digit signed-digit network; the sum that follows it is one adder),
+  /// and it is the part an induction variable makes unnecessary: consecutive
+  /// iterations differ by a constant.
+  ///
+  /// A DIGIT of the counter rides the same register with two more constants.
+  /// `(x floordiv D) mod K` advances by nothing on most iterations and by one
+  /// on the ones where `x` crosses a multiple of `D`, so it is maintained by a
+  /// carry from a companion register holding `x mod D` (itself a stride with
+  /// `wrap = D`), and it wraps at `K` by subtracting once. A `floordiv` or a
+  /// `mod` on the ADDRESS path pays every cycle, where this pays a comparator
+  /// off it.
+  ///
+  /// So one update rule covers both:
+  ///
+  ///     raw  = cur + step + (carry fired ? bump : 0)
+  ///     next = wrap && raw >= wrap ? raw - wrap : raw
+  ///
+  /// with a plain scaled counter at `bump = wrap = 0`. `step + bump <= wrap`
+  /// holds by construction (`asDigit` refuses a step that could wrap twice), so
+  /// the single subtract is exact.
+  ///
+  /// A DECREASING digit (`A[N-1-i]`) mirrors it: `step` and `bump` go negative
+  /// and the wrap ADDS on borrow rather than subtracting on overflow. The
+  /// borrow is `raw > cur` unsigned, since subtracting a positive amount can
+  /// only raise the value by wrapping around zero.
+  struct AddrStride {
+    int64_t init;       // `coeff * lb`, the value the register loads at start
+    int64_t step;       // `coeff * step`, added wherever the counter advances
+    int64_t bump = 0;   // added when `carry`'s register wraps
+    int64_t wrap = 0;   // subtracted on reaching it (0: a plain accumulator)
+    unsigned carry = 0; // slot whose wrap gates `bump`; self means none
+    bool hasCarry = false; // whether `carry` names one
+    bool down = false;     // counts down, so `wrap` is added on borrow
+  };
+  /// Deduplicated, since two accesses down the same row share a stride. Some
+  /// slots exist only to carry another (the `x mod D` companion of a quotient
+  /// digit) and no access names them; a carry always precedes its consumer, so
+  /// one pass emits them. Empty when no address follows this counter, or when
+  /// its bounds are not constant, which is what makes the fields compile-time
+  /// values at all.
+  llvm::SmallVector<AddrStride> addrStrides;
 
   // Declared composition class + single-run latency, read off the region op's
   // `determinacy` / `latency` (reifier `setDcpLatencies`) attrs.
@@ -692,6 +839,11 @@ struct RegionBlock {
 
 struct Datapath {
   func::FuncOp func;
+  /// Whether this function is the TOP of the emitted design, i.e. whether its
+  /// arguments name storage nobody in the design owns. A callee's array
+  /// argument is a port it masters on its caller's storage, which is why the
+  /// two answer `MemUnit::scattered` differently.
+  bool atTop = false;
 
   // Derived structural cells.
   std::vector<FuncUnit> units;
@@ -731,7 +883,8 @@ struct Datapath {
   /// table the scheduler timed every access against); it resolves each
   /// MemUnit's implementation and access latency.
   Datapath(func::FuncOp func, const BindingPolicy &policy,
-           const MemoryLibrary &memLib, const CalleeCtx *callees = nullptr);
+           const MemoryLibrary &memLib, const CalleeCtx *callees = nullptr,
+           bool isTop = false);
 
   /// The dcp op whose execution produces \p s's value, or null when the Source
   /// has no producing op: a literal, the iteration counter, a kernel input

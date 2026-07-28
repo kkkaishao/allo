@@ -84,10 +84,11 @@ std::string ownerOf(Value v, llvm::StringRef fallback);
 std::string ownerOf(Location loc, llvm::StringRef fallback);
 /// `ownerOf` disambiguated against \p siblings, the values whose owner tokens
 /// share a namespace (every memref of a module, every scalar argument). Two
-/// arguments carrying one source name would give their port groups one set of
-/// names; the colliding group takes its argument position instead.
-/// \p fallback only fires for a value that is neither named nor an argument,
-/// which no boundary port is.
+/// values carrying one source name would give their cells or port groups one
+/// set of names; each colliding value takes a token that is unique by
+/// construction, its argument position for an argument and \p fallback
+/// otherwise. Unrolling a body that declares an array is the second case: the
+/// copies share a source name by design.
 std::string uniqueOwnerOf(Value v, llvm::ArrayRef<Value> siblings,
                           llvm::StringRef fallback);
 std::string argOwner(unsigned argNo); // a2
@@ -121,6 +122,22 @@ std::string scalarBase(llvm::StringRef owner);
 std::string resultBase(llvm::StringRef owner);
 /// `<base>_b<k>`: one bank of a partitioned array, port group or storage cell.
 std::string bankBase(llvm::StringRef base, unsigned bank);
+/// Which direction of a scattered element port a name is for. `Only` is the
+/// unambiguous case, an argument the kernel just reads or just writes, and it
+/// takes the bare name; an argument used BOTH ways needs its two ports told
+/// apart. Vitis draws the same distinction (`b_0` vs `a_0_i` / `a_0_o`).
+enum class ElemDir { Only, In, Out };
+
+/// `<owner>_<k>`, plus `_in` / `_out` for a read-write argument: element \p k
+/// of a scattered argument (`MemUnit::scattered`). A whole port on its own for
+/// a read; the group base a write's `_we` hangs off for a write.
+///
+/// A BARE index, unlike every other qualifier here, and rule 1 above is why:
+/// the count is fixed by the argument's TYPE, the way a scalar's or a stream's
+/// is, not chosen by the emitter, so there is no scheduling decision that could
+/// renumber it. It is also the name Vitis gives the same port.
+std::string elemBase(llvm::StringRef owner, unsigned index,
+                     ElemDir dir = ElemDir::Only);
 
 /// The boundary interfaces of one external access, as (bank, base): one entry
 /// for an unbanked or statically-routed access, one per bank for a

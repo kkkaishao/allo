@@ -5,7 +5,7 @@
 
 #include "allo-c/Schedule.h" // kPartitionAttr
 #include "allo/IR/AlloOps.h"
-#include "allo/Scheduling/MemoryModel.h" // partitionOf, staticBank
+#include "allo/Scheduling/MemoryModel.h" // assignedBankOf, bankSplitOf
 #include "allo/Support/Logging.h"
 #include "allo/Transforms/Passes.h"
 
@@ -34,82 +34,71 @@ AffineMap accessMap(Operation *op) {
   return cast<dcp::DCPathStoreOp>(op).getMap();
 }
 
+// Route \p op to its own bank's memref at the in-bank address. The recorded
+// bank is dropped with the same edit: the access now names an unbanked memref,
+// and leaving it would have the emitter route bank 3 of a one-bank memory.
 void rewriteAccess(Operation *op, Value bank, AffineMap localMap) {
   if (auto l = dyn_cast<dcp::DCPathLoadOp>(op)) {
     l.getMemrefMutable().assign(bank);
     l.setMapAttr(AffineMapAttr::get(localMap));
+    l.removeBankAttr();
   } else {
     auto s = cast<dcp::DCPathStoreOp>(op);
     s.getMemrefMutable().assign(bank);
     s.setMapAttr(AffineMapAttr::get(localMap));
+    s.removeBankAttr();
   }
 }
 
-// The static bank id (mixed-radix over the partition axes) of \p op, and its
-// in-bank address map (each partitioned dim's subscript floordiv its factor).
-// nullopt if any axis is not statically banked.
-struct BankedAccess {
-  unsigned bank;
-  AffineMap localMap;
-};
-std::optional<BankedAccess>
-resolve(Operation *op, ArrayRef<std::pair<unsigned, int64_t>> axes) {
-  AffineMap map = accessMap(op);
-  SmallVector<AffineExpr> results(map.getResults());
-  unsigned bank = 0;
-  for (auto [dim, factor] : axes) {
-    std::optional<int64_t> b = staticBank(map, dim, factor);
-    if (!b)
-      return std::nullopt;
-    bank = bank * factor + static_cast<unsigned>(*b);
-    AffineExpr div =
-        getAffineBinaryOpExpr(AffineExprKind::FloorDiv, results[dim],
-                              getAffineConstantExpr(factor, map.getContext()));
-    results[dim] =
-        simplifyAffineExpr(div, map.getNumDims(), map.getNumSymbols());
-  }
-  return BankedAccess{bank,
-                      AffineMap::get(map.getNumDims(), map.getNumSymbols(),
-                                     results, map.getContext())};
-}
-
-// Split one internal partitioned alloc into per-bank allocs if all its accesses
-// are static; return true if it was split.
+// Split one internal partitioned alloc into per-bank allocs if every access was
+// assigned a bank; return true if it was split.
 bool splitAlloc(Operation *alloc) {
   Value memref = alloc->getResult(0);
-  PartitionInfo p = partitionOf(memref);
-  // Cyclic-only, refinable partition; block/complete fall back to the
-  // aggregate model in the scheduler too (`MemoryBankModel::finalize`).
-  if (p.unlimited || p.cyclicAxes.empty() || p.hasBlock)
+  BankLayout layout = bankLayoutOf(memref);
+  // A complete partition scattered the array into registers, and an unbanked
+  // array has nothing to split.
+  if (layout.numBanks == 1)
+    return false;
+  // A skewed access records a SLOT, not a bank: its physical bank is that slot
+  // rotated at run time, so routing it to one alloc would reach the wrong
+  // storage at every rotation but zero. The emitter selects among the banks.
+  if (layout.skew())
     return false;
 
-  SmallVector<Operation *> accesses;
-  SmallVector<BankedAccess> banked;
+  auto mt = cast<MemRefType>(memref.getType());
+  ArrayRef<int64_t> shape = mt.getShape();
+  struct Routed {
+    Operation *op;
+    unsigned bank;
+    AffineMap localMap;
+  };
+  SmallVector<Routed> routed;
   for (Operation *user : memref.getUsers()) {
     // A non-load/store use (e.g. the memref escaping) cannot be split safely.
     if (!isa<dcp::DCPathLoadOp, dcp::DCPathStoreOp>(user))
       return false;
-    std::optional<BankedAccess> b = resolve(user, p.cyclicAxes);
-    if (!b) {
+    std::optional<unsigned> bank = assignedBankOf(user);
+    if (!bank) {
       warn(Stage::Dcp, alloc) << "Partitioned array has a data-dependent bank; "
                                  "left for the emitter "
                                  "crossbar";
       return false;
     }
-    accesses.push_back(user);
-    banked.push_back(*b);
+    // The in-bank coordinates of the very split the decision came from, so the
+    // element this access lands on inside its bank is the one the crossbar
+    // would have reached.
+    AffineMap map = accessMap(user);
+    routed.push_back({user, *bank,
+                      AffineMap::get(map.getNumDims(), map.getNumSymbols(),
+                                     bankSplitOf(layout, map, shape).coords,
+                                     map.getContext())});
   }
 
-  auto mt = cast<MemRefType>(memref.getType());
-  ArrayRef<int64_t> shape = mt.getShape();
-  SmallVector<int64_t> bankShape(shape);
-  for (auto [dim, factor] : p.cyclicAxes)
-    bankShape[dim] = (shape[dim] + factor - 1) / factor; // ceil per bank
-  auto bankType = MemRefType::get(bankShape, mt.getElementType());
+  auto bankType = MemRefType::get(layout.bankShape, mt.getElementType());
 
   OpBuilder b(alloc);
-  SmallVector<Value> banks;
-  for (unsigned k = 0; k < p.factor; ++k) {
+  SmallVector<Value> bankMemrefs;
+  for (unsigned k = 0; k < layout.numBanks; ++k) {
     Operation *bankAlloc =
         isa<memref::AllocaOp>(alloc)
             ? memref::AllocaOp::create(b, alloc->getLoc(), bankType)
@@ -121,11 +110,11 @@ bool splitAlloc(Operation *alloc) {
     for (NamedAttribute attr : alloc->getAttrs())
       if (attr.getName() != kPartitionAttr)
         bankAlloc->setAttr(attr.getName(), attr.getValue());
-    banks.push_back(bankAlloc->getResult(0));
+    bankMemrefs.push_back(bankAlloc->getResult(0));
   }
 
-  for (auto [op, ba] : llvm::zip_equal(accesses, banked))
-    rewriteAccess(op, banks[ba.bank], ba.localMap);
+  for (const Routed &r : routed)
+    rewriteAccess(r.op, bankMemrefs[r.bank], r.localMap);
   alloc->erase();
   return true;
 }

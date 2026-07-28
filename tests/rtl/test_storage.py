@@ -14,10 +14,12 @@ import pytest
 from allo import kernel
 from allo.lang import f32, i32, u8, index, Stateful, Stream
 from allo.schedule import Schedule
+from allo.backend.base import run_pipeline
 from allo.backend.rtl.device import builtin_device, MemoryKind
+from allo.backend.rtl.schedule import RTL_PREPARE_PIPELINE
 
 sys.path.insert(0, os.path.dirname(__file__))
-from _common import _sched, _to_rtl, _iis, FADD  # noqa: E402
+from _common import _sched, _to_rtl, _iis, FADD, MEM, MEM_URAM  # noqa: E402
 
 pytestmark = pytest.mark.skipif(
     shutil.which("verilator") is None, reason="verilator not available"
@@ -110,6 +112,12 @@ def test_banked_boundary_argument():
     # The boundary carries per-port bank info (both banks reached).
     iface = mod.interfaces[mod.top]
     assert {r["bank"] for acc in iface["reads"] for r in acc} == {0, 1}
+    # Both halves of the split are derived on the affine expression, so both
+    # fold: bank `(2i) mod 2` is a constant and offset `(2i) floordiv 2` is the
+    # counter itself. A statically banked access therefore emits NO address
+    # arithmetic at all. Deriving it on emitted values instead costs a multiply
+    # and a shift per port, which nothing downstream can fold away.
+    assert "comb.mul" not in mod.mlir and "comb.shru" not in mod.mlir
 
     out = np.zeros(16, np.int32)
     mod.cosim(A16, out)
@@ -174,7 +182,7 @@ def test_banking_beyond_1d_pow2_cyclic():
     s.partition("A", dim=1, kind=s.Block, factor=2)
     mod = s.export("rtl")
     rd = [r for acc in mod.interfaces[mod.top]["reads"] for r in acc]
-    assert rd[0]["axes"] == [{"dim": 0, "factor": 2, "block": True}]
+    assert rd[0]["axes"] == [{"dim": 0, "factor": 2, "kind": "block"}]
     assert rd[0]["shape"] == [16]
     out = np.zeros(16, np.int32)
     mod.cosim(A16, out)
@@ -239,7 +247,7 @@ def test_banking_beyond_1d_pow2_cyclic():
 
 def test_nested_banked_static_split():
     # A 2D nest accessing a cyclic-partitioned buffer on its inner (partitioned)
-    # dim. `flatten-perfect-loops` must not coalesce the inner loop -- coalescing
+    # dim. `loop-canonicalization` must not coalesce the inner loop -- coalescing
     # would delinearize j and defeat static bank resolution, falling back to a
     # runtime crossbar. With the skip, buf banks statically (two per-bank
     # memories, no `_b<k>` crossbar).
@@ -268,6 +276,206 @@ def test_nested_banked_static_split():
     ref[:, 0::2] = (A[:, 0::2] + 1) & 255
     ref[:, 1::2] = (A[:, 1::2] + 100) & 255
     assert np.array_equal(out, ref)
+
+
+def test_a_dynamic_bank_costs_a_port_on_every_bank():
+    # The crossbar a data-dependent bank falls back to READS EVERY BANK, so one
+    # logical access holds one port on each: a partitioned array's concurrent
+    # capacity is `portsPerBank`, not `portsPerBank * factor`. Three reads per
+    # iteration therefore cannot all issue in one cycle on a 2-port RAM, and the
+    # port model has to say so rather than bill them against a lumped pool.
+    @kernel
+    def stencil(A: i32[18], out: i32[16]):
+        buf: i32[18]
+        for i in range(18):
+            buf[i] = A[i] & 255
+        for i in range(16):
+            out[i] = (buf[i] + buf[i + 1] + buf[i + 2]) & 255
+
+    s = stencil.schedule()
+    s.partition("buf", dim=1, kind=s.Cyclic, factor=2)
+    mod = s.export("rtl")
+    assert mod.mlir.count("= seq.hlmem") == 2
+    # Two banks, three crossbarred reads: six read ports, three on each bank.
+    assert len(re.findall(r"\bseq\.read\b", mod.mlir)) == 6
+    # ... which is one more than the two banks hold, so the read loop runs at
+    # II=2 while the copy loop stays fully pipelined.
+    assert _iis(mod.schedule().cyclic()) == [1, 2]
+
+    A18 = (np.arange(18, dtype=np.int32) * 7 + 13) & 0xFF
+    out = np.zeros(16, np.int32)
+    mod.cosim(A18, out)
+    ref = A18 & 255
+    assert np.array_equal(out, (ref[:16] + ref[1:17] + ref[2:18]) & 255)
+
+
+def test_a_static_bank_skips_the_crossbar():
+    # `resolve-banking` bails on the whole alloc because ONE access has a
+    # data-dependent bank, so the buffer reaches emit still partitioned. The
+    # accesses whose bank IS a compile-time constant must still route straight
+    # to their own memory, the way the boundary path already does, rather than
+    # be dragged into the crossbar by their sibling.
+    @kernel
+    def mixed(A: i32[16], out: i32[16]):
+        buf: i32[16]
+        for i in range(16):
+            buf[i] = A[i] + 1  # data-dependent bank: no static split
+        for i in range(8):
+            out[2 * i] = buf[2 * i] & 255  # bank 0
+            out[2 * i + 1] = buf[2 * i + 1] & 255  # bank 1
+
+    s = mixed.schedule()
+    s.partition("buf", dim=1, kind=s.Cyclic, factor=2)
+    mod = s.export("rtl")
+    assert mod.mlir.count("= seq.hlmem") == 2
+    # The dynamic write drives both banks (a write-enable demux); each static
+    # read touches only its own.
+    assert len(re.findall(r"\bseq\.write\b", mod.mlir)) == 2
+    assert len(re.findall(r"\bseq\.read\b", mod.mlir)) == 2
+
+    out = np.zeros(16, np.int32)
+    mod.cosim(A16, out)
+    assert np.array_equal(out, (A16 + 1) & 255)
+
+    # The same on a BLOCK axis, which is statically banked only at a constant
+    # subscript and so never reaches a split. `loop-canonicalization` coalesces
+    # both nests here, so the read's map is `(iv) -> (iv floordiv 6, 3)`: the
+    # constant has to survive the row-major round trip for the bank to resolve.
+    @kernel
+    def blk2(A: i32[4, 6], out: i32[4, 6]):
+        buf: i32[4, 6]
+        for i in range(4):
+            for j in range(6):
+                buf[i, j] = A[i, j] + 1
+        for i in range(4):
+            for j in range(6):
+                out[i, j] = buf[i, 3] & 255
+
+    s = blk2.schedule()
+    s.partition("buf", dim=2, kind=s.Block, factor=2)
+    mod = s.export("rtl")
+    assert mod.mlir.count("= seq.hlmem") == 2
+    assert len(re.findall(r"\bseq\.write\b", mod.mlir)) == 2  # roaming write
+    assert len(re.findall(r"\bseq\.read\b", mod.mlir)) == 1  # bank 1 only
+
+    A46 = ((np.arange(24, dtype=np.int32) * 7 + 13) & 0xFF).reshape(4, 6)
+    out = np.zeros((4, 6), np.int32)
+    mod.cosim(A46, out)
+    col = ((A46[:, 3] + 1) & 255)[:, None]
+    assert np.array_equal(out, np.broadcast_to(col, (4, 6)))
+
+
+def test_a_block_partition_resolves_a_loop_per_chunk():
+    # The standard block idiom: partition an array into chunks and give each a
+    # loop of its own. Every access provably lies in ONE block, but the digit
+    # `i floordiv 8` folds for no `i`, so the bank resolves only if the fold is
+    # given the loop's TRIP COUNT and not just its lower bound and step.
+    # Without that, all four accesses crossbar over both banks.
+    @kernel
+    def perchunk(A: i32[16], out: i32[16]):
+        buf: i32[16]
+        for i in range(8):
+            buf[i] = A[i] + 1  # block 0, whatever i is
+        for i in range(8, 16):
+            buf[i] = A[i] + 2  # block 1, whatever i is
+        for i in range(8):
+            out[i] = buf[i] & 255
+            out[i + 8] = buf[i + 8] & 255
+
+    s = perchunk.schedule()
+    s.partition("buf", dim=1, kind=s.Block, factor=2)
+    mod = s.export("rtl")
+    assert mod.mlir.count("= seq.hlmem") == 2
+    # One port per access on its own bank, not one on every bank: two writes and
+    # two reads total, where a crossbar would take four of each.
+    assert len(re.findall(r"\bseq\.write\b", mod.mlir)) == 2
+    assert len(re.findall(r"\bseq\.read\b", mod.mlir)) == 2
+
+    out = np.zeros(16, np.int32)
+    mod.cosim(A16, out)
+    exp = np.concatenate([A16[:8] + 1, A16[8:] + 2]) & 255
+    assert np.array_equal(out, exp)
+
+
+def test_a_reversed_index_carries_its_digits_in_down_counters():
+    # `buf[N-1-k*i]` runs every digit of the address BACKWARDS. A digit is still
+    # a register, counting down and wrapping by ADDING the modulus on borrow
+    # rather than subtracting it on overflow, so the residue and the quotient
+    # cost the same as they do forwards. Non-power-of-two factors, so the wrap
+    # is real arithmetic and not a mask, and a stride so the decrement is > 1.
+    @kernel
+    def revstep(A: i32[24], out: i32[12]):
+        buf: i32[24]
+        for i in range(24):
+            buf[i] = A[i] + 1
+        for i in range(12):
+            out[i] = buf[22 - 2 * i] & 255
+
+    A24 = (np.arange(24, dtype=np.int32) * 11 + 5) & 0xFF
+    for kind in (Schedule.Cyclic, Schedule.Block):
+        s = revstep.schedule()
+        s.partition("buf", dim=1, kind=kind, factor=3)
+        mod = s.export("rtl")
+        assert mod.mlir.count("= seq.hlmem") == 3
+        # Nothing divides: every digit of a decreasing address is a register.
+        assert "comb.divu" not in mod.mlir and "comb.modu" not in mod.mlir
+        out = np.zeros(12, np.int32)
+        mod.cosim(A24, out)
+        assert np.array_equal(out, (A24[22::-2] + 1) & 255)
+
+
+def test_the_bank_an_access_reaches_is_decided_once():
+    # The bank is DECIDED before the scheduler (`assign-banks`) and recorded on
+    # the access, so the port model, the static split and the emitter's routing
+    # read one fact instead of each re-deriving it on the map form its own layer
+    # sees. It is visible in the reified IR: an assigned bank on the two static
+    # reads, and none on the write, which reaches every bank.
+    @kernel
+    def mixed(A: i32[16], out: i32[16]):
+        buf: i32[16]
+        for i in range(16):
+            buf[i] = A[i] + 1  # roaming: no bank
+        for i in range(8):
+            out[2 * i] = buf[2 * i] & 255  # bank 0
+            out[2 * i + 1] = buf[2 * i + 1] & 255  # bank 1
+
+    s = mixed.schedule()
+    s.partition("buf", dim=1, kind=s.Cyclic, factor=2)
+    mod = s.export("rtl")
+    banked = [ln for ln in mod.dcp.splitlines() if "%alloc[" in ln]
+    assert [re.search(r"bank (\d+)", ln).group(1) for ln in banked if "bank" in ln] == [
+        "0",
+        "1",
+    ]
+    assert sum("bank" not in ln for ln in banked) == 1  # the roaming write
+
+    # A BLOCK partition now splits, which it never could while the split ran its
+    # own cyclic-only predicate: a block axis is statically banked at a constant
+    # subscript, so an array every access of which was assigned a bank is
+    # materializable whatever the axis kind. `@buf_b<k>` is the crossbar naming
+    # a still-partitioned memref keeps.
+    @kernel
+    def blk(A: i32[4, 6], out: i32[4, 6]):
+        buf: i32[4, 6]
+        for i in range(4):
+            for j in range(6):
+                buf[i, 1] = A[i, j] + 1  # bank 0 (columns 0..2)
+                buf[i, 4] = A[i, j] + 100  # bank 1 (columns 3..5)
+        for i in range(4):
+            for j in range(6):
+                out[i, j] = (buf[i, 1] + buf[i, 4]) & 255
+
+    s = blk.schedule()
+    s.partition("buf", dim=2, kind=s.Block, factor=2)
+    mod = s.export("rtl")
+    assert mod.mlir.count("= seq.hlmem") == 2
+    assert "@buf_b" not in mod.mlir  # split into two memrefs, not crossbarred
+
+    A46 = ((np.arange(24, dtype=np.int32) * 7 + 13) & 0xFF).reshape(4, 6)
+    out = np.zeros((4, 6), np.int32)
+    mod.cosim(A46, out)
+    row = ((2 * A46[:, 5] + 101) & 255)[:, None]  # the last `j` wins both slots
+    assert np.array_equal(out, np.broadcast_to(row, (4, 6)))
 
 
 def test_composed_banking():
@@ -332,6 +540,345 @@ def test_composed_banking():
     assert np.array_equal(o, np.where(np.arange(16) % 2 == 0, A16 + 1, A16 + 100))
 
 
+def test_a_partition_stated_on_a_leaf_reaches_its_container():
+    # A sub-kernel MASTERS PORTS on its caller's array rather than receiving a
+    # copy, so which end the directive is written on is not a property of the
+    # array. Stated on the leaf's own parameter it has to reach the container
+    # that allocates the buffer, and through it the leaf's sibling, or the
+    # container would materialize one memory for banks its children address.
+    @kernel
+    def upw_prod(A: i32[16], tmp: i32[16]):
+        for i in range(8):
+            tmp[2 * i] = A[2 * i] + 1
+            tmp[2 * i + 1] = A[2 * i + 1] + 100
+
+    @kernel
+    def upw_cons(tmp: i32[16], out: i32[16]):
+        for i in range(8):
+            out[2 * i] = tmp[2 * i] & 255
+            out[2 * i + 1] = tmp[2 * i + 1] & 255
+
+    @kernel
+    def upw_top(A: i32[16], out: i32[16]):
+        tmp: i32[16]
+        upw_prod(A, tmp)
+        upw_cons(tmp, out)
+
+    ps = upw_prod.schedule()
+    ps.partition("tmp", dim=1, kind=ps.Cyclic, factor=2)
+    s = upw_top.schedule()
+    s.compose(ps)
+    mod = s.export("rtl")
+    assert re.findall(r"seq\.hlmem @(\w+) [^:]*: <(\d+)x", mod.mlir) == [
+        ("tmp_b0", "8"),
+        ("tmp_b1", "8"),
+    ]
+    A = (np.arange(16, dtype=np.int32) * 5 + 2) & 0x3F
+    out = np.zeros(16, np.int32)
+    mod.cosim(A, out)
+    assert np.array_equal(out, np.where(np.arange(16) % 2 == 0, A + 1, A + 100) & 255)
+
+
+def test_partitions_of_two_kernels_compose_across_dimensions():
+    # Two kernels asking for different axes of one array is not a conflict: a
+    # directive is a LOWER BOUND on the banks its kernel needs, and splitting
+    # both ways refines both, so each still gets the conflict-free groups it
+    # asked for. Four banks of a 2x2 tile, and both children address them.
+    @kernel
+    def xd_prod(A: i32[4, 4], buf: i32[4, 4]):
+        for i in range(2):
+            for j in range(2):
+                buf[2 * i, 2 * j] = A[2 * i, 2 * j] + 1
+                buf[2 * i, 2 * j + 1] = A[2 * i, 2 * j + 1] + 2
+                buf[2 * i + 1, 2 * j] = A[2 * i + 1, 2 * j] + 3
+                buf[2 * i + 1, 2 * j + 1] = A[2 * i + 1, 2 * j + 1] + 4
+
+    @kernel
+    def xd_cons(buf: i32[4, 4], out: i32[4, 4]):
+        for i in range(2):
+            for j in range(2):
+                out[2 * i, 2 * j] = buf[2 * i, 2 * j] & 255
+                out[2 * i, 2 * j + 1] = buf[2 * i, 2 * j + 1] & 255
+                out[2 * i + 1, 2 * j] = buf[2 * i + 1, 2 * j] & 255
+                out[2 * i + 1, 2 * j + 1] = buf[2 * i + 1, 2 * j + 1] & 255
+
+    @kernel
+    def xd_top(A: i32[4, 4], out: i32[4, 4]):
+        buf: i32[4, 4]
+        xd_prod(A, buf)
+        xd_cons(buf, out)
+
+    ps = xd_prod.schedule()
+    ps.partition("buf", dim=1, kind=ps.Cyclic, factor=2)  # rows
+    cs = xd_cons.schedule()
+    cs.partition("buf", dim=2, kind=cs.Cyclic, factor=2)  # columns
+    s = xd_top.schedule()
+    s.compose(ps, cs)
+    mod = s.export("rtl")
+    # Both axes, one attribute, on the buffer and on both children alike.
+    assert mod.dcp.count("#allo.partition<[(1,Cyclic,2), (2,Cyclic,2)]>") == 3
+    assert re.findall(r"seq\.hlmem @(\w+) [^:]*: <(\d+)x", mod.mlir) == [
+        ("buf_b0", "4"),
+        ("buf_b1", "4"),
+        ("buf_b2", "4"),
+        ("buf_b3", "4"),
+    ]
+    A44 = ((np.arange(16, dtype=np.int32) * 7 + 3) & 0x3F).reshape(4, 4)
+    out = np.zeros((4, 4), np.int32)
+    mod.cosim(A44, out)
+    # A swapped bank route on either side lands the wrong element in the tile.
+    r, c = np.indices((4, 4))
+    assert np.array_equal(out, (A44 + 1 + (r % 2) * 2 + (c % 2)) & 255)
+
+
+def test_partition_factors_join_to_the_finer_one():
+    # On ONE dimension the join has to stay a SINGLE axis, so it exists exactly
+    # when one factor divides the other: cyclic-4 keeps apart every pair
+    # cyclic-2 did (residues mod 2 are unions of residues mod 4), so the
+    # consumer that asked for two banks is served by four.
+    @kernel
+    def fj_prod(A: i32[16], tmp: i32[16]):
+        for i in range(4):
+            tmp[4 * i] = A[4 * i] + 1
+            tmp[4 * i + 1] = A[4 * i + 1] + 2
+            tmp[4 * i + 2] = A[4 * i + 2] + 3
+            tmp[4 * i + 3] = A[4 * i + 3] + 4
+
+    @kernel
+    def fj_cons(tmp: i32[16], out: i32[16]):
+        for i in range(8):
+            out[2 * i] = tmp[2 * i] & 255
+            out[2 * i + 1] = tmp[2 * i + 1] & 255
+
+    @kernel
+    def fj_top(A: i32[16], out: i32[16]):
+        tmp: i32[16]
+        fj_prod(A, tmp)
+        fj_cons(tmp, out)
+
+    ps = fj_prod.schedule()
+    ps.partition("tmp", dim=1, kind=ps.Cyclic, factor=4)
+    cs = fj_cons.schedule()
+    cs.partition("tmp", dim=1, kind=cs.Cyclic, factor=2)
+    s = fj_top.schedule()
+    s.compose(ps, cs)
+    mod = s.export("rtl")
+    assert re.findall(r"seq\.hlmem @(\w+) [^:]*: <(\d+)x", mod.mlir) == [
+        ("tmp_b0", "4"),
+        ("tmp_b1", "4"),
+        ("tmp_b2", "4"),
+        ("tmp_b3", "4"),
+    ]
+    A = (np.arange(16, dtype=np.int32) * 5 + 2) & 0x3F
+    out = np.zeros(16, np.int32)
+    mod.cosim(A, out)
+    assert np.array_equal(out, (A + 1 + np.arange(16) % 4) & 255)
+
+
+def test_a_block_and_a_cyclic_axis_on_one_dimension_are_reported(capfd):
+    # The one pair with no join: block chunks a dimension and cyclic
+    # interleaves it, so the two send the same element to different banks and no
+    # single banking serves both. Reported rather than silently picking a side,
+    # since the loser would address the wrong elements.
+    @kernel
+    def bc_prod(A: i32[16], tmp: i32[16]):
+        for i in range(16):
+            tmp[i] = A[i] + 1
+
+    @kernel
+    def bc_cons(tmp: i32[16], out: i32[16]):
+        for i in range(16):
+            out[i] = tmp[i] & 255
+
+    @kernel
+    def bc_top(A: i32[16], out: i32[16]):
+        tmp: i32[16]
+        bc_prod(A, tmp)
+        bc_cons(tmp, out)
+
+    ps = bc_prod.schedule()
+    ps.partition("tmp", dim=1, kind=ps.Block, factor=2)
+    cs = bc_cons.schedule()
+    cs.partition("tmp", dim=1, kind=cs.Cyclic, factor=2)
+    s = bc_top.schedule()
+    s.compose(ps, cs)
+    with pytest.raises(Exception):
+        s.export("rtl").schedule()
+    text = "".join(capfd.readouterr())
+    assert "partitioning conflict" in text, text
+    assert "Skew" in text, text
+
+
+def test_a_partition_stated_on_a_process_reaches_its_container():
+    # The dual of `test_a_partitioned_container_local_buffer`: an async spawn is
+    # a call like any other, so a directive on the PROCESS's own parameter joins
+    # the same storage class as the container's buffer, and the sibling process
+    # reading it learns the banking through that class.
+    @kernel
+    async def pp_src(s: Stream[i32]):
+        s.put(42)
+
+    @kernel
+    async def pp_side(s: Stream[i32], o0: i32[1]):
+        o0[0] = s.get()
+
+    @kernel
+    async def pp_prod(x: i32[16], tmp: i32[16]):
+        for i in range(8):
+            tmp[2 * i] = x[2 * i] + 1
+            tmp[2 * i + 1] = x[2 * i + 1] + 100
+
+    @kernel
+    def pp_cons(tmp: i32[16], out: i32[16]):
+        for i in range(16):
+            out[i] = tmp[i] & 255
+
+    @kernel
+    async def pp_top(x: i32[16], out: i32[16], o0: i32[1]):
+        f: Stream[i32]
+        tmp: i32[16]
+        await pp_src(f)
+        await pp_side(f, o0)
+        await pp_prod(x, tmp)
+        pp_cons(tmp, out)
+
+    ps = pp_prod.schedule()
+    ps.partition("tmp", dim=1, kind=ps.Cyclic, factor=2)
+    s = pp_top.schedule()
+    s.compose(ps)
+    mod = s.export("rtl")
+    m = mod.mlir
+    assert "seq.hlmem @tmp_b0" in m and "seq.hlmem @tmp_b1" in m
+    x = (np.arange(16, dtype=np.int32) * 5 + 2) & 0x3F
+    out = np.zeros(16, np.int32)
+    o0 = np.zeros(1, np.int32)
+    mod.cosim(x, out, o0)
+    exp = np.where(np.arange(16) % 2 == 0, x + 1, x + 100) & 255
+    assert np.array_equal(out, exp), list(out)
+
+
+def _transpose_pair(part, factor=4):
+    """`out[i,j] = buf[i,j] + buf[j,i]` over an internal 8x8 tile, unrolled by
+    4 on `j`, with `out`/`Ain` cyclic so `buf` is the only port bottleneck."""
+
+    @kernel
+    def sym(Ain: i32[8, 8], out: i32[8, 8]):
+        buf: i32[8, 8]
+        for i in range(8, name="ci"):
+            for j in range(8, name="cj"):
+                buf[i, j] = Ain[i, j]
+        for i in range(8, name="i"):
+            for j in range(8, name="j"):
+                out[i, j] = buf[i, j] + buf[j, i]
+
+    s = sym.schedule()
+    s.unroll("j", factor=4)
+    s.partition("out", dim=2, kind=s.Cyclic, factor=4)
+    s.partition("Ain", dim=2, kind=s.Cyclic, factor=4)
+    if part:
+        s.partition("buf", dim=part[0], kind=part[1], factor=factor)
+    return s.export("rtl")
+
+
+A88 = ((np.arange(64, dtype=np.int32) * 7 + 3) & 255).reshape(8, 8)
+
+
+def test_a_skewed_partition_serves_a_row_and_a_column():
+    # Block and cyclic are each a function of ONE subscript, so no choice of
+    # axis serves an array read as both `buf[i,j]` and `buf[j,i]`: whichever
+    # axis is partitioned, the other pattern walks a single bank. A SKEW banks
+    # on the sum of the subscripts, and the four unrolled copies of each access
+    # then reach four distinct banks. Not a compile-time bank each, but a
+    # distinct one, which is what a port is billed against.
+    cyc = _transpose_pair((2, Schedule.Cyclic))
+    skew = _transpose_pair((2, Schedule.Skew))
+
+    # Same four memories either way; what differs is the ports into them. Under
+    # cyclic the four row reads bank statically (one port each) and the four
+    # column reads crossbar (a port on every bank): 4 + 4*4 = 20. Under the skew
+    # the eight reads fall into two LANES of four distinct slots, and a lane
+    # shares one port per bank: 2 * 4 = 8.
+    assert cyc.mlir.count("= seq.hlmem") == skew.mlir.count("= seq.hlmem") == 4
+    assert len(re.findall(r"\bseq\.read\b", cyc.mlir)) == 20
+    assert len(re.findall(r"\bseq\.read\b", skew.mlir)) == 8
+
+    # ... so the read loop closes at II=1 where cyclic bottoms out at 3.
+    assert _iis(cyc.schedule().cyclic()) == [1, 3]
+    assert _iis(skew.schedule().cyclic()) == [1, 1]
+
+    # The rotation, the lane muxes and the host's copy of the layout all have to
+    # agree or the sum is of the wrong two elements.
+    for mod in (cyc, skew):
+        out = np.zeros((8, 8), np.int32)
+        mod.cosim(A88, out)
+        assert np.array_equal(out, A88 + A88.T)
+
+
+def test_a_skewed_argument_keeps_the_conservative_billing():
+    # An argument's banks are boundary interfaces the manifest published, one
+    # set per access, so there is no shared port for a lane to economize and no
+    # slot to bill. The LAYOUT still applies end to end: the host reproduces the
+    # skew to shard the array, so a disagreement between it and the emitted
+    # address arithmetic shows up as scrambled data.
+    @kernel
+    def ext(Ain: i32[8, 8], out: i32[8, 8]):
+        for i in range(8, name="i"):
+            for j in range(8, name="j"):
+                out[i, j] = Ain[i, j] + 1
+
+    s = ext.schedule()
+    s.partition("Ain", dim=2, kind=s.Skew, factor=4)
+    mod = s.export("rtl")
+    rd = [r for acc in mod.interfaces[mod.top]["reads"] for r in acc]
+    assert rd[0]["axes"] == [{"dim": 1, "factor": 4, "kind": "skew"}]
+    out = np.zeros((8, 8), np.int32)
+    mod.cosim(A88, out)
+    assert np.array_equal(out, A88 + 1)
+
+
+def test_a_skew_whose_accesses_disagree_resolves_nothing(capfd):
+    # A slot is billable only because the array's contending accesses share one
+    # bank expression up to a constant: then a distinct slot IS a distinct bank
+    # at every rotation. `buf[i,j]` and `buf[i,2*j]` do not, so they can collide
+    # and the array falls back to the crossbar, which it must SAY, since a
+    # partition that resolves nothing is pure area.
+    @kernel
+    def bad(Ain: i32[8, 8], out: i32[8, 8]):
+        buf: i32[8, 8]
+        for i in range(8, name="ci"):
+            for j in range(8, name="cj"):
+                buf[i, j] = Ain[i, j]
+        for i in range(8, name="i"):
+            for j in range(4, name="j"):
+                out[i, j] = buf[i, j] + buf[i, 2 * j]
+
+    s = bad.schedule()
+    s.partition("buf", dim=2, kind=s.Skew, factor=4)
+    mod = s.export("rtl")
+    mod.schedule()
+    assert "Skew partition into 4 banks resolves no slot" in "".join(capfd.readouterr())
+    out = np.zeros((8, 8), np.int32)
+    mod.cosim(A88, out)
+    ref = np.zeros((8, 8), np.int32)
+    ref[:, :4] = A88[:, :4] + A88[:, 0:8:2]
+    assert np.array_equal(out, ref)
+
+
+def test_a_skew_must_name_its_distribution_dimension():
+    # `dim=0` means "every dimension" for block and cyclic. A skew's bank
+    # already reads every subscript, so the flag has no meaning for it: `dim`
+    # names the one dimension divided down to make room for the banks.
+    @kernel
+    def k(A: i32[8, 8], out: i32[8, 8]):
+        for i in range(8):
+            for j in range(8):
+                out[i, j] = A[i, j]
+
+    s = k.schedule()
+    with pytest.raises(Exception, match="distribution dimension"):
+        s.partition("A", dim=0, kind=s.Skew, factor=4)
+
+
 def test_a_partitioned_container_local_buffer():
     # `propagate-partition` gives every child the same `allo.part`, so the
     # container just materializes the banks they already agree on: `bk_prod`
@@ -385,7 +932,7 @@ def test_a_partitioned_container_local_buffer():
 
 @pytest.mark.parametrize("cols", [24, 16])
 def test_a_coalesced_nest_addresses_with_the_bare_counter(cols):
-    # `flatten-perfect-loops` coalesces the nest and delinearizes the subscripts
+    # `loop-canonicalization` coalesces the nest and delinearizes the subscripts
     # against the single counter (`A[iv floordiv N, iv mod N]`); the memref's
     # row-major linearization composes straight back to `iv`. That cancellation
     # must happen on the affine EXPRESSION: rebuilding it out of comb ops costs
@@ -406,6 +953,58 @@ def test_a_coalesced_nest_addresses_with_the_bare_counter(cols):
     out = np.zeros((6, cols), np.int32)
     mod.cosim(A, out)
     assert np.array_equal(out, A + 1)
+
+
+def test_a_nest_whose_address_would_need_a_divider_is_not_coalesced():
+    # The cancellation above holds only for an access that walks the nest's own
+    # iteration space in order. Offset one subscript and the row-major fold no
+    # longer composes back to the counter, so coalescing would leave a real
+    # `floordiv 9` on the address of every port, at the full datapath width and
+    # priced by nothing. `loop-canonicalization` gives the band back a level
+    # instead: two counters, and an address that is affine in both.
+    @kernel
+    def offset(A: i32[6, 10], out: i32[6, 10]):
+        for i in range(5):
+            for j in range(9):
+                out[i + 1, j + 1] = A[i, j]
+
+    mod = _to_rtl(offset)
+    for op in ("comb.divu", "comb.modu"):
+        assert op not in mod.mlir, f"{op} in the address path of an offset nest"
+
+    A = (np.arange(60, dtype=np.int32) % 251).reshape(6, 10)
+    out = np.zeros((6, 10), np.int32)
+    mod.cosim(A, out)
+    exp = np.zeros((6, 10), np.int32)
+    exp[1:6, 1:10] = A[0:5, 0:9]
+    assert np.array_equal(out, exp)
+
+
+def test_a_normalized_subscript_is_read_before_the_band_is_measured():
+    # The same refusal, reached through a normalized loop. `s.unroll` leaves a
+    # strided loop, and normalizing it moves the stride out of the bound and
+    # into an `affine.apply` the subscript then names INSTEAD of the counter.
+    # Until that is composed back into the map, the band is measured on an
+    # expression its own induction variable is missing from: the recovered
+    # `mod 5` never appears, the divider check clears the nest, and coalescing
+    # puts a runtime `mod 5` on every port. Nine trips, so the divisor is not a
+    # power of two and the mask that would hide it does not exist.
+    @kernel
+    def strided_gap(A: i32[18], out: i32[18]):
+        for i in range(4):
+            for j in range(0, 18, 2):
+                out[j] = A[j] + i
+
+    mod = _to_rtl(strided_gap)
+    for op in ("comb.divu", "comb.modu"):
+        assert op not in mod.mlir, f"{op} in the address path of a strided nest"
+
+    A = (np.arange(18, dtype=np.int32) * 5 + 3) & 0xFF
+    out = np.zeros(18, np.int32)
+    mod.cosim(A, out)
+    exp = np.zeros(18, np.int32)
+    exp[0::2] = A[0::2] + 3
+    assert np.array_equal(out, exp)
 
 
 def test_a_partial_coalesced_subscript_keeps_its_address_arithmetic():
@@ -519,7 +1118,9 @@ def test_written_array_keeps_its_port_limit():
         for i in range(8):
             B[i] = t[A[i] % 8] + t[(A[i] + 1) % 8] + t[(A[i] + 2) % 8]
 
-    iis = _iis(_sched(ram3).func("ram3").regions)
+    # Ports are only a limit while the array is a memory, so the automatic
+    # partition that would scatter this one into registers is off.
+    iis = _iis(_sched(ram3, scalarize_threshold=0).func("ram3").regions)
     assert iis == [1, 2], f"a written array must keep its port limit, got {iis}"
 
 
@@ -689,7 +1290,10 @@ def _matvec_recurrence_ii(bind=None, complete=False):
         s.partition("y", kind=s.Complete)
     elif bind is not None:
         s.bind_storage("y", impl=bind, mem_type=s.RAM_T2P)
-    res = s.export("rtl").schedule()
+    # The subject is what the DEVICE memory model times an access at, so the
+    # automatic partition that would bypass it for a small array is off by
+    # default here; the `complete=True` case asks for the same thing explicitly.
+    res = s.export("rtl", scalarize_threshold=0).schedule()
     return max(r.ii for r in res.cyclic())
 
 
@@ -705,9 +1309,7 @@ def test_storage_impl_shifts_recurrence_ii():
     # A complete partition scatters `y` into FFs: the read is combinational (0),
     # but the FF write still costs a cycle, so the recurrence is FADD + 1 -- one
     # below LUTRAM, not a full collapse to the bare add latency.
-    reg_ii = _matvec_recurrence_ii(complete=True)
-    assert reg_ii == FADD + 1
-    assert reg_ii < lutram_ii
+    assert _matvec_recurrence_ii(complete=True) == FADD + 1
 
 
 def _uram_buffer_rtl(impl):
@@ -726,7 +1328,9 @@ def _uram_buffer_rtl(impl):
     s = urambuf.schedule()
     if impl is not None:
         s.bind_storage("buf", impl=impl, mem_type=s.RAM_T2P)
-    return s.export("rtl")
+    # `buf` is small enough to be complete-partitioned by default, which would
+    # replace the read port whose latency is the subject here.
+    return s.export("rtl", scalarize_threshold=0)
 
 
 def test_multicycle_storage_read_cosim():
@@ -746,8 +1350,9 @@ def test_multicycle_storage_read_cosim():
     lat_uram = r.schedule().func("urambuf").latency
     r.cosim(A16, out_uram)
     np.testing.assert_array_equal(out_uram, exp)
-    # The 2-cycle URAM read costs exactly one cycle more than the 1-cycle default.
-    assert lat_uram == lat_default + 1
+    # One read sits in the span, so the whole-kernel latency moves by exactly the
+    # difference between the two device read latencies.
+    assert lat_uram - lat_default == MEM_URAM - MEM
 
 
 def test_multicycle_storage_on_argument_cosim():
@@ -769,17 +1374,12 @@ def test_multicycle_storage_on_argument_cosim():
 
     exp = A16 + 1
     out_default = np.zeros(16, np.int32)
-    r = argmem_rtl(None)
-    lat_default = r.schedule().func("argmem").latency
-    r.cosim(A16, out_default)
+    argmem_rtl(None).cosim(A16, out_default)
     np.testing.assert_array_equal(out_default, exp)
 
     out_uram = np.zeros(16, np.int32)
-    r = argmem_rtl(Schedule.URAM)
-    lat_uram = r.schedule().func("argmem").latency
-    r.cosim(A16, out_uram)
+    argmem_rtl(Schedule.URAM).cosim(A16, out_uram)
     np.testing.assert_array_equal(out_uram, exp)
-    assert lat_uram == lat_default + 1
 
     # The contract must be stated in the manifest, not just honored by luck:
     # the URAM argument's read ports declare 2 cycles, the 1-cycle default 1.
@@ -1114,6 +1714,12 @@ def test_buffer_threaded_across_regions_is_one_memory(depth):
     # (acyclic) region, so the buffer crosses a region boundary as a region
     # result. Every depth is covered because the split has nothing to do with
     # depth: it must remain ONE memory, not one per accessing region.
+    #
+    # The loop accumulates INTO the element it reads, which is what keeps the
+    # buffer storage at all: `scalarize-memory` forwards a store to a later load
+    # only when nothing writes in between, and the loop's own store does. With a
+    # plain read the value would travel as dataflow and there would be no memory
+    # to be identical about.
     if depth == 1:
 
         @kernel
@@ -1121,7 +1727,8 @@ def test_buffer_threaded_across_regions_is_one_memory(depth):
             t: i32[1]
             t[0] = A[0]
             for i in range(8):
-                B[i] = t[0] + A[i]
+                t[0] = t[0] + A[i]
+                B[i] = t[0]
 
     elif depth == 2:
 
@@ -1130,7 +1737,8 @@ def test_buffer_threaded_across_regions_is_one_memory(depth):
             t: i32[2]
             t[0] = A[0]
             for i in range(8):
-                B[i] = t[0] + A[i]
+                t[0] = t[0] + A[i]
+                B[i] = t[0]
 
     else:
 
@@ -1139,28 +1747,959 @@ def test_buffer_threaded_across_regions_is_one_memory(depth):
             t: i32[4]
             t[0] = A[0]
             for i in range(8):
-                B[i] = t[0] + A[i]
+                t[0] = t[0] + A[i]
+                B[i] = t[0]
 
     mod = _to_rtl(cross)
     assert len(re.findall(r"= seq\.hlmem", mod.mlir)) == 1, mod.mlir
     B = np.zeros(8, np.int32)
     mod.cosim(A8, B)
-    assert np.array_equal(B, A8[0] + A8)
+    assert np.array_equal(B, A8[0] + np.cumsum(A8))
 
 
 def test_two_stores_threaded_across_regions():
     # Two straight-line stores feeding one downstream loop: both must reach the
-    # reader's memory (a split loses both, so the reads come back zero).
+    # reader's memory (a split loses both, so the reads come back zero). Both are
+    # accumulated into in the loop, so neither seed is forwarded away and both
+    # genuinely travel through the memory.
     @kernel
     def cross2(A: i32[8], B: i32[8]):
         t: i32[4]
         t[0] = A[0]
         t[1] = A[1]
         for i in range(8):
-            B[i] = t[0] + t[1] + A[i]
+            t[0] = t[0] + A[i]
+            t[1] = t[1] + 2 * A[i]
+            B[i] = t[0] + t[1]
 
     mod = _to_rtl(cross2)
     assert len(re.findall(r"= seq\.hlmem", mod.mlir)) == 1, mod.mlir
     B = np.zeros(8, np.int32)
     mod.cosim(A8, B)
+    c = np.cumsum(A8)
+    assert np.array_equal(B, (A8[0] + c) + (A8[1] + 2 * c))
+
+
+def test_a_forwarded_buffer_costs_no_storage():
+    # The complement of the two tests above, and the point of `scalarize-memory`:
+    # when every read of a local buffer has a unique reaching store, the value is
+    # dataflow and the buffer must not be built at all. This is the shape the
+    # region-crossing tests used to have.
+    @kernel
+    def fwd(A: i32[8], B: i32[8]):
+        t: i32[4]
+        t[0] = A[0]
+        t[1] = A[1]
+        for i in range(8):
+            B[i] = t[0] + t[1] + A[i]
+
+    mod = _to_rtl(fwd)
+    assert "seq.hlmem" not in mod.mlir, mod.mlir
+    B = np.zeros(8, np.int32)
+    mod.cosim(A8, B)
     assert np.array_equal(B, A8[0] + A8[1] + A8)
+
+
+# --- dead-initializer elision -----------------------------------------------
+
+_STORE = re.compile(r"\b(?:affine|memref)\.store\b")
+_NO_ELIDE = RTL_PREPARE_PIPELINE.replace("elide-dead-init,\n", "")
+
+MIXED = np.array([3, -1, 7, -4, 0, 5, -9, 2], np.int32)
+
+
+def _stores(kernel_fn):
+    """Store sites the prepare pipeline leaves with ``elide-dead-init`` disabled
+    and enabled."""
+    counts = []
+    for pipeline in (_NO_ELIDE, RTL_PREPARE_PIPELINE):
+        module = kernel_fn.schedule().module
+        run_pipeline(module, pipeline)
+        counts.append(len(_STORE.findall(str(module))))
+    return tuple(counts)
+
+
+def test_dead_init_is_elided():
+    # The shape the pass exists for. Every element is overwritten before anything
+    # reads one, so the fill is dead and the cosim pins that dropping it leaves no
+    # element reading as uninitialized.
+    @kernel
+    def dead_init(A: i32[8], out: i32[8]):
+        buf: i32[8] = 0
+        for i in range(8):
+            buf[i] = A[i] + 1
+        for i in range(8):
+            out[i] = buf[i]
+
+    assert _stores(dead_init) == (3, 2)
+
+    out = np.zeros(8, np.int32)
+    _to_rtl(dead_init).cosim(A8, out)
+    assert np.array_equal(out, A8 + 1)
+
+
+def test_dead_init_is_elided_inside_an_enclosing_loop():
+    # The array is declared in a loop body, so the fill costs a full pass over it
+    # on every trip. Its regions stay symbolic in the trip counter rather than
+    # being folded into a hull.
+    @kernel
+    def dead_init_inner(A: i32[16], out: i32[16]):
+        for t in range(2):
+            buf: i32[8] = 0
+            for i in range(8):
+                buf[i] = A[t * 8 + i] + 1
+            for i in range(8):
+                out[t * 8 + i] = buf[i]
+
+    assert _stores(dead_init_inner) == (3, 2)
+
+
+def test_dead_init_is_elided_when_the_overwrite_is_reordered_or_tiled():
+    # Coverage is a property of the written SET, so neither the loop order nor a
+    # strip-mined subscript changes it. Both defeat any match on nest shape.
+    @kernel
+    def permuted_init(A: i32[4, 4], out: i32[4, 4]):
+        buf: i32[4, 4] = 0
+        for j in range(4):
+            for i in range(4):
+                buf[i, j] = A[i, j] + 1
+        for i in range(4):
+            for j in range(4):
+                out[i, j] = buf[i, j]
+
+    @kernel
+    def tiled_init(A: i32[16], out: i32[16]):
+        buf: i32[16] = 0
+        for o in range(4):
+            for t in range(4):
+                buf[o * 4 + t] = A[o * 4 + t] + 1
+        for i in range(16):
+            out[i] = buf[i]
+
+    assert _stores(permuted_init) == (3, 2)
+    assert _stores(tiled_init) == (3, 2)
+
+
+def test_dead_init_is_elided_across_a_call():
+    # The sub-kernel writes every element and reads none, which its per-parameter
+    # summary carries back to the caller.
+    @kernel
+    def overwrite_all(dst: i32[8], A: i32[8]):
+        for i in range(8):
+            dst[i] = A[i] + 1
+
+    @kernel
+    def call_init(A: i32[8], out: i32[8]):
+        buf: i32[8] = 0
+        overwrite_all(buf, A)
+        for i in range(8):
+            out[i] = buf[i]
+
+    assert _stores(call_init) == (3, 2)
+
+    out = np.zeros(8, np.int32)
+    _to_rtl(call_init).cosim(A8, out)
+    assert np.array_equal(out, A8 + 1)
+
+
+def test_dead_init_is_elided_when_every_branch_writes_it():
+    # One of the two blocks runs whatever the condition does, so an access both
+    # make is unconditional. Regions carry no guard, so this has to be settled on
+    # the accesses rather than by intersecting their footprints.
+    @kernel
+    def branch_init(A: i32[8], out: i32[8]):
+        buf: i32[8] = 0
+        for i in range(8):
+            if A[i] > 0:
+                buf[i] = A[i] + 1
+            else:
+                buf[i] = 0
+        for i in range(8):
+            out[i] = buf[i]
+
+    assert _stores(branch_init) == (4, 3)
+
+    out = np.zeros(8, np.int32)
+    _to_rtl(branch_init).cosim(MIXED, out)
+    assert np.array_equal(out, np.where(MIXED > 0, MIXED + 1, 0))
+
+
+def test_dead_init_is_elided_when_only_a_prefix_is_touched():
+    # Written and read regions are both `0..k`, so no element is ever read at its
+    # initial value even though the declared shape is never covered. Both regions
+    # keep `k` as a symbol, which is what makes them comparable.
+    @kernel
+    def prefix_init(A: i32[8], out: i32[8]):
+        for k in range(8):
+            buf: i32[8] = 0
+            for i in range(k):
+                buf[i] = A[i] + 1
+            for i in range(k):
+                out[i] = buf[i]
+
+    assert _stores(prefix_init) == (3, 2)
+
+    out = np.zeros(8, np.int32)
+    _to_rtl(prefix_init).cosim(A8, out)
+    ref = np.zeros(8, np.int32)
+    for k in range(8):
+        for i in range(k):
+            ref[i] = A8[i] + 1
+    assert np.array_equal(out, ref)
+
+
+def test_init_is_live_when_the_overwriting_nest_reads():
+    # The covering nest reads the element it is about to write, so the initial
+    # value reaches that read: eliding here would change the result, not just the
+    # schedule. This is what keeps a `+=` accumulator correct.
+    @kernel
+    def acc_init(A: i32[8], out: i32[8]):
+        buf: i32[8] = 0
+        for i in range(8):
+            buf[i] = buf[i] + A[i]
+        for i in range(8):
+            out[i] = buf[i]
+
+    assert _stores(acc_init) == (3, 3)
+
+    out = np.zeros(8, np.int32)
+    _to_rtl(acc_init).cosim(A8, out)
+    assert np.array_equal(out, A8)
+
+
+def test_init_is_live_when_the_callee_reads_first():
+    # Same call shape as the elided case, opposite answer: the summary says the
+    # parameter is read before it is written, so the fill feeds the accumulation.
+    @kernel
+    def accumulate_into(dst: i32[8], A: i32[8]):
+        for i in range(8):
+            dst[i] = dst[i] + A[i]
+
+    @kernel
+    def call_acc_init(A: i32[8], out: i32[8]):
+        buf: i32[8] = 0
+        accumulate_into(buf, A)
+        for i in range(8):
+            out[i] = buf[i]
+
+    assert _stores(call_acc_init) == (3, 3)
+
+    out = np.zeros(8, np.int32)
+    _to_rtl(call_acc_init).cosim(A8, out)
+    assert np.array_equal(out, A8)
+
+
+def test_init_is_live_when_only_one_branch_writes_it():
+    # With no else block the store is genuinely conditional, so the elements the
+    # condition skips are read at their initial value.
+    @kernel
+    def half_branch_init(A: i32[8], out: i32[8]):
+        buf: i32[8] = 0
+        for i in range(8):
+            if A[i] > 0:
+                buf[i] = A[i] + 1
+        for i in range(8):
+            out[i] = buf[i]
+
+    assert _stores(half_branch_init) == (3, 3)
+
+
+def test_init_is_live_when_a_read_sits_between_the_writes():
+    # One element is read before the overwrite, so the fill has to stay.
+    @kernel
+    def probe_init(A: i32[8], out: i32[8], probe: i32[1]):
+        buf: i32[8] = 0
+        probe[0] = buf[3]
+        for i in range(8):
+            buf[i] = A[i] + 1
+        for i in range(8):
+            out[i] = buf[i]
+
+    assert _stores(probe_init) == (4, 4)
+
+
+def test_init_is_live_when_a_read_reaches_past_the_written_set():
+    # The prefix shape with the read widened to the whole array: `0..k` written,
+    # `0..8` read, so the tail is read at its initial value.
+    @kernel
+    def prefix_overread(A: i32[8], out: i32[8]):
+        for k in range(8):
+            buf: i32[8] = 0
+            for i in range(k):
+                buf[i] = A[i] + 1
+            for i in range(8):
+                out[i] = buf[i]
+
+    assert _stores(prefix_overread) == (3, 3)
+
+
+def test_init_is_live_when_a_write_sits_under_a_loop_that_may_not_run():
+    # The subscript ignores the inner induction variable, so a region carries
+    # nothing about the trip count: at `k == 0` the store never runs and `buf[0]`
+    # is still read at its initial value. The fill is non-zero because an
+    # uninitialized read gives 0 here and would hide a wrong answer.
+    @kernel
+    def invariant_store(A: i32[8], out: i32[8]):
+        for k in range(8):
+            buf: i32[8] = 99
+            for i in range(k):
+                buf[0] = A[i]
+            out[k] = buf[0]
+
+    assert _stores(invariant_store) == (3, 3)
+
+    out = np.zeros(8, np.int32)
+    _to_rtl(invariant_store).cosim(A8, out)
+    ref = np.zeros(8, np.int32)
+    for k in range(8):
+        value = 99
+        for i in range(k):
+            value = A8[i]
+        ref[k] = value
+    assert np.array_equal(out, ref)
+
+
+def test_init_is_live_when_the_overwrite_is_partial():
+    # The second nest covers half the array, so the other half is still read at
+    # its initial value.
+    @kernel
+    def partial_init(A: i32[8], out: i32[8]):
+        buf: i32[8] = 0
+        for i in range(4):
+            buf[i] = A[i] + 1
+        for i in range(8):
+            out[i] = buf[i]
+
+    assert _stores(partial_init) == (3, 3)
+
+
+# --- coverage by an earlier write of the same access -------------------------
+
+
+def test_dead_init_is_elided_when_the_writer_reads_back_what_it_wrote():
+    # The callee writes `dst[i]` and reads it back in the same iteration, so the
+    # read is loop-independent on that write and never reaches the fill. Nothing
+    # orders them at the call site: the whole callee is one step there.
+    @kernel
+    def clamp_all(dst: i32[8], A: i32[8]):
+        for i in range(8):
+            dst[i] = A[i] + 1
+            if dst[i] > 4:
+                dst[i] = 4
+
+    @kernel
+    def call_clamp_init(A: i32[8], out: i32[8]):
+        buf: i32[8] = 77
+        clamp_all(buf, A)
+        for i in range(8):
+            out[i] = buf[i]
+
+    assert _stores(call_clamp_init) == (4, 3)
+
+    out = np.zeros(8, np.int32)
+    _to_rtl(call_clamp_init).cosim(A8, out)
+    assert np.array_equal(out, np.minimum(A8 + 1, 4))
+
+
+def test_dead_init_is_elided_for_a_scan():
+    # Iteration i reads what i-1 wrote and element 0 comes from a sibling store.
+    # No step covers the array, so this needs the carried dependence.
+    @kernel
+    def scan_init(A: i32[8], out: i32[8]):
+        total: i32[8] = 77
+        total[0] = A[0]
+        for i in range(1, 8):
+            total[i] = total[i - 1] + A[i]
+        for i in range(8):
+            out[i] = total[i]
+
+    assert _stores(scan_init) == (4, 3)
+
+    out = np.zeros(8, np.int32)
+    _to_rtl(scan_init).cosim(A8, out)
+    assert np.array_equal(out, np.cumsum(A8))
+
+
+def test_dead_init_is_elided_for_a_wavefront():
+    # The interior reads three neighbours the earlier iterations produced, and the
+    # first row and column come from sibling loops, so coverage is split across
+    # both sources.
+    @kernel
+    def wavefront_init(A: i32[4, 4], out: i32[4, 4]):
+        M: i32[4, 4] = 77
+        for i in range(4):
+            M[0, i] = A[0, i]
+        for j in range(4):
+            M[j, 0] = A[j, 0]
+        for bi in range(1, 4):
+            for ai in range(1, 4):
+                M[bi, ai] = M[bi - 1, ai - 1] + M[bi - 1, ai] + M[bi, ai - 1]
+        for i in range(4):
+            for j in range(4):
+                out[i, j] = M[i, j]
+
+    assert _stores(wavefront_init) == (5, 4)
+
+    A = np.arange(1, 17, dtype=np.int32).reshape(4, 4)
+    ref = np.zeros((4, 4), np.int32)
+    ref[0, :] = A[0, :]
+    ref[:, 0] = A[:, 0]
+    for bi in range(1, 4):
+        for ai in range(1, 4):
+            ref[bi, ai] = ref[bi - 1, ai - 1] + ref[bi - 1, ai] + ref[bi, ai - 1]
+
+    out = np.zeros((4, 4), np.int32)
+    _to_rtl(wavefront_init).cosim(A, out)
+    assert np.array_equal(out, ref)
+
+
+def test_init_is_live_when_the_read_sits_in_an_else_region():
+    # `getEnclosingAffineOps` collects the guard whichever region an access is
+    # in, and the index set then gets the THEN condition, so this read's
+    # iteration domain comes back as `j < 4` while it really runs on `j >= 4`.
+    # Coverage argued over that domain would say the `0..3` writes reach it.
+    @kernel
+    def else_read(A: i32[8], out: i32[8]):
+        buf: i32[8] = 77
+        for i in range(4):
+            buf[i] = A[i]
+        for j in range(8):
+            if j < 4:
+                out[j] = 0
+            else:
+                out[j] = buf[j]
+
+    assert _stores(else_read) == (4, 4)
+
+    out = np.zeros(8, np.int32)
+    _to_rtl(else_read).cosim(A8, out)
+    assert np.array_equal(out, np.where(np.arange(8) < 4, 0, 77))
+
+
+def test_init_is_live_for_a_sliding_window():
+    # A shift register reads the taps the fill left, so the fill IS the filter's
+    # startup state. The window shape does not make an initializer dead, and the
+    # golden here depends on the fill value.
+    @kernel
+    def shift_init(A: i32[8], out: i32[8]):
+        delay: i32[4] = 77
+        for j in range(8):
+            for i in range(3):
+                delay[3 - i] = delay[2 - i]
+            delay[0] = A[j]
+            out[j] = delay[0] + delay[3]
+
+    assert _stores(shift_init) == (4, 4)
+
+    ref = np.zeros(8, np.int32)
+    delay = [77, 77, 77, 77]
+    for j in range(8):
+        for i in range(3):
+            delay[3 - i] = delay[2 - i]
+        delay[0] = int(A8[j])
+        ref[j] = delay[0] + delay[3]
+
+    out = np.zeros(8, np.int32)
+    _to_rtl(shift_init).cosim(A8, out)
+    assert np.array_equal(out, ref)
+
+
+# --- composing effects inside a nested region --------------------------------
+#
+# The walk carries what has definitely been written into a loop body and a
+# branch, so the ops inside one are ordered against each other rather than
+# lumped into a single step. A loop body starts from what was written BEFORE the
+# loop and nothing else: an element the body writes at one trip is not there yet
+# at the first one.
+
+
+def test_init_is_dead_when_two_callees_hand_over_inside_a_loop():
+    # Every trip of `t` writes the whole array before reading it. Dependence
+    # analysis cannot pair a call with anything, so this rests entirely on the
+    # body's own ordering.
+    @kernel
+    def fill_stage(dst: i32[8], A: i32[8], t: i32):
+        for i in range(8):
+            dst[i] = A[i] + t
+
+    @kernel
+    def read_stage(src: i32[8], out: i32[8], t: i32):
+        for i in range(8):
+            out[i] = src[i] + t
+
+    @kernel
+    def staged_init(A: i32[8], out: i32[8]):
+        buf: i32[8] = 77
+        for t in range(2):
+            fill_stage(buf, A, t)
+            read_stage(buf, out, t)
+
+    assert _stores(staged_init) == (3, 2)
+
+    out = np.zeros(8, np.int32)
+    _to_rtl(staged_init).cosim(A8, out)
+    assert np.array_equal(out, A8 + 2)
+
+
+def test_init_is_live_when_a_loop_body_reads_what_an_earlier_trip_wrote():
+    # `buf` is written at trip `t` and read at trip `t + 1`, so the first trip
+    # reads the fill. Seeding the body with what was written before the loop is
+    # what keeps this one live.
+    @kernel
+    def carry_init(A: i32[8], out: i32[8]):
+        buf: i32[8] = 77
+        for t in range(4):
+            for i in range(8):
+                out[i] = buf[i]
+            for i in range(8):
+                buf[i] = A[i] + t
+
+    assert _stores(carry_init) == (3, 3)
+
+    out = np.zeros(8, np.int32)
+    _to_rtl(carry_init).cosim(A8, out)
+    assert np.array_equal(out, A8 + 2)
+
+
+def test_init_is_dead_when_the_branches_of_an_affine_guard_add_up():
+    # Neither arm writes the whole array, and neither is the same access as the
+    # other, so nothing survives an intersection. Their guards partition the
+    # iteration space, which is what makes the union total.
+    @kernel
+    def split_init(A: i32[8], out: i32[8]):
+        buf: i32[8] = 77
+        for i in range(8):
+            if i < 3:
+                buf[i] = A[i]
+            else:
+                buf[10 - i] = A[i] * 2
+        for i in range(8):
+            out[i] = buf[i]
+
+    assert _stores(split_init) == (4, 3)
+
+    ref = np.array([A8[j] if j < 3 else A8[10 - j] * 2 for j in range(8)], np.int32)
+    out = np.zeros(8, np.int32)
+    _to_rtl(split_init).cosim(A8, out)
+    assert np.array_equal(out, ref)
+
+
+def test_init_is_dead_when_a_guarded_write_covers_the_array_alone():
+    # One store below a guard with no else at all. Its footprint over the
+    # iterations the guard admits is the whole array.
+    @kernel
+    def guarded_init(A: i32[8], out: i32[8]):
+        buf: i32[8] = 77
+        for i in range(10):
+            if i >= 2:
+                buf[i - 2] = A[i - 2]
+        for i in range(8):
+            out[i] = buf[i]
+
+    assert _stores(guarded_init) == (3, 2)
+
+    out = np.zeros(8, np.int32)
+    _to_rtl(guarded_init).cosim(A8, out)
+    assert np.array_equal(out, A8)
+
+
+def test_init_is_live_when_a_data_dependent_branch_writes_it():
+    # An `scf.if` on a runtime value leaves no condition to fold, so only what
+    # both arms write is certain, and here one arm writes nothing.
+    @kernel
+    def maybe_init(A: i32[8], out: i32[8]):
+        buf: i32[8] = 77
+        for i in range(8):
+            if A[i] > 0:
+                buf[i] = A[i]
+        for i in range(8):
+            out[i] = buf[i]
+
+    assert _stores(maybe_init) == (3, 3)
+
+    ref = np.where(MIXED > 0, MIXED, 77)
+    out = np.zeros(8, np.int32)
+    _to_rtl(maybe_init).cosim(MIXED, out)
+    assert np.array_equal(out, ref)
+
+
+# --- scalarization of forwardable arrays ------------------------------------
+
+
+def test_a_small_local_buffer_under_a_pipeline_costs_no_storage(capfd):
+    # The shape `scalarize-memory` exists for. Unrolling under the pipeline makes
+    # every subscript of `buf` a constant, so each read has a unique reaching
+    # store and the buffer is pure dataflow. It used to be a 1-port LUTRAM whose
+    # ports set the resource-min II: II 4 and latency 69 against II 2 here.
+    @kernel
+    def small(A: i32[16, 4], out: i32[16]):
+        for i in range(16):
+            buf: i32[4]
+            for j in range(4):
+                buf[j] = A[i, j] * 2
+            acc: i32 = 0
+            for j in range(4):
+                acc += buf[j]
+            out[i] = acc
+
+    s = small.schedule()
+    s.pipeline("i")
+    mod = s.export("rtl")
+    res = mod.schedule()
+    text = "".join(capfd.readouterr())
+    # The residual II is `A` at 4 reads over its 2 ports, not `buf`.
+    assert _iis(res.cyclic()) == [2]
+    assert "seq.hlmem" not in mod.mlir, mod.mlir
+    # Deleting an array changes the storage decision, so it has to be announced.
+    assert "needs no storage" in text
+
+    A = (np.arange(64, dtype=np.int32) % 11).reshape(16, 4)
+    out = np.zeros(16, np.int32)
+    mod.cosim(A, out)
+    assert np.array_equal(out, (A * 2).sum(1))
+
+
+def test_a_data_dependent_subscript_keeps_its_storage(capfd):
+    # The complement, and the boundary `scalarize-memory` must not cross: a
+    # subscript that is not a constant has no unique reaching store, so the
+    # buffer stays storage. What `auto-complete-partition` then decides is the
+    # KIND of storage: small enough, so registers rather than a ported memory.
+    @kernel
+    def roam(A: i32[16, 4], out: i32[16]):
+        for i in range(16):
+            buf: i32[4]
+            for j in range(4):
+                buf[j] = A[i, j] * 2
+            out[i] = buf[A[i, 0] & 3]
+
+    s = roam.schedule()
+    s.pipeline("i")
+    mod = s.export("rtl")
+    assert len(re.findall(r"= seq\.hlmem", mod.mlir)) == 1, mod.mlir
+    mod.schedule()
+    assert "Complete-partitioned" in "".join(capfd.readouterr())
+
+    # Threshold 0 disqualifies every array, so the same buffer stays on ports.
+    s2 = roam.schedule()
+    s2.pipeline("i")
+    on_ports = s2.export("rtl", scalarize_threshold=0)
+    on_ports.schedule()
+    assert "Complete-partitioned" not in "".join(capfd.readouterr())
+
+    A = (np.arange(64, dtype=np.int32) % 11).reshape(16, 4)
+    out = np.zeros(16, np.int32)
+    mod.cosim(A, out)
+    assert np.array_equal(out, (A * 2)[np.arange(16), A[:, 0] & 3])
+
+
+@pytest.mark.parametrize("depth", [16, 32])
+def test_the_auto_partition_threshold_is_a_boundary(depth, capfd):
+    # A register file with a runtime subscript costs a mux per read and a demux
+    # per write, so the element-count threshold is what bounds the area the
+    # automatic partition can spend. It has to be a real boundary.
+    if depth == 16:
+
+        @kernel
+        def sized(A: i32[16], out: i32[16]):
+            buf: i32[16]
+            for i in range(16):
+                buf[i] = A[i] * 2
+            for i in range(16):
+                out[i] = buf[A[i] & 15]
+
+    else:
+
+        @kernel
+        def sized(A: i32[16], out: i32[16]):
+            buf: i32[32]
+            for i in range(16):
+                buf[i] = A[i] * 2
+            for i in range(16):
+                out[i] = buf[A[i] & 15]
+
+    mod = _to_rtl(sized)
+    mod.schedule()
+    text = "".join(capfd.readouterr())
+    assert ("Complete-partitioned" in text) == (depth == 16), text
+
+    out = np.zeros(16, np.int32)
+    mod.cosim(A16, out)
+    assert np.array_equal(out, (A16 * 2)[A16 & 15])
+
+
+def test_an_array_handed_to_a_sub_kernel_is_not_partitioned(capfd):
+    # A child masters ports on storage the parent owns, and a Complete partition
+    # across that boundary has never been tried, so any use that is not a direct
+    # access disqualifies the array.
+    @kernel
+    def bump(b: i32[8]):
+        for j in range(8):
+            b[j] = b[j] + 100
+
+    @kernel
+    def outer(A: i32[8], out: i32[8]):
+        buf: i32[8]
+        for i in range(8):
+            buf[i] = A[i] * 2
+        bump(buf)
+        for i in range(8):
+            out[i] = buf[i]
+
+    mod = _to_rtl(outer)
+    mod.schedule()
+    text = "".join(capfd.readouterr())
+    assert "Complete-partitioned" not in text, text
+
+    out = np.zeros(8, np.int32)
+    mod.cosim(A8, out)
+    assert np.array_equal(out, A8 * 2 + 100)
+
+
+def test_a_sub_kernel_masters_a_complete_partitioned_buffer():
+    # Asking for the partition explicitly is a different thing from the
+    # automatic one declined above: it makes the parent's buffer a 0-cycle
+    # (combinational) read, which the child then masters ports on. The child's
+    # parameter is a BlockArgument but NOT a boundary port -- the storage is the
+    # parent's `seq.hlmem`, not a driver's memory on the far side of the top
+    # module -- so the >= 1 cycle boundary contract does not apply to it.
+    @kernel
+    def bump(b: i32[8]):
+        for j in range(8):
+            b[j] = b[j] + 100
+
+    @kernel
+    def outer(A: i32[8], out: i32[8]):
+        buf: i32[8]
+        for i in range(8):
+            buf[i] = A[i] * 2
+        bump(buf)
+        for i in range(8):
+            out[i] = buf[i]
+
+    s = outer.schedule()
+    s.partition("buf", kind=s.Complete)
+    mod = s.export("rtl")
+
+    out = np.zeros(8, np.int32)
+    mod.cosim(A8, out)
+    assert np.array_equal(out, A8 * 2 + 100)
+
+
+# --- completely-partitioned arguments (one boundary port per element) --------
+
+
+def _scattered():
+    """A kernel reading a complete-partitioned argument at a runtime subscript."""
+
+    @kernel
+    def scatter(A: i32[8], out: i32[8]):
+        for i in range(8):
+            out[i] = A[i] * 2
+
+    s = scatter.schedule()
+    s.partition("A", kind=s.Complete)
+    return s.export("rtl")
+
+
+def test_a_complete_partitioned_argument_becomes_element_ports():
+    # An argument's storage lives outside the module, so "scatter it into
+    # registers" can only mean every element arrives at once: N input ports, no
+    # address and no access latency. This is what Vitis emits for the same
+    # directive (`a_0 .. a_7`), and it is the only shape that delivers the
+    # unlimited combinational ports a Complete partition bills the scheduler for.
+    mod = _scattered()
+    iface = mod.interfaces["scatter"]
+    (rf,) = iface["registers"]
+    # Read-only, so the bare name and no output side at all.
+    assert rf["elements"] == [{"in": f"A_{k}"} for k in range(8)], rf
+    assert rf["width"] == 32 and rf["shape"] == [8]
+    # It is a register file, NOT an addressed port group: `A` appears in neither
+    # read nor write interfaces, and takes no address port.
+    assert all(p["arg"] != 0 for acc in iface["reads"] for p in acc), iface["reads"]
+    assert "A_rd0_addr" not in mod.verilog
+
+    out = np.zeros(8, np.int32)
+    mod.cosim(A8, out)
+    assert np.array_equal(out, A8 * 2)
+
+
+def test_a_scattered_argument_read_folds_at_a_constant_index():
+    # A constant subscript selects one input port, so the N:1 read mux folds away
+    # entirely in CIRCT and costs no hardware. Nothing special-cases it -- the
+    # crossbar is emitted and the folder collapses it.
+    @kernel
+    def konst(A: i32[8], out: i32[8]):
+        for i in range(8):
+            out[i] = A[3] * 2
+
+    s = konst.schedule()
+    s.partition("A", kind=s.Complete)
+    mod = s.export("rtl")
+    out = np.zeros(8, np.int32)
+    mod.cosim(A8, out)
+    assert np.array_equal(out, np.full(8, A8[3] * 2))
+
+
+def _four_read_ii(complete):
+    """II of a body reading one argument four times, with and without the
+    Complete partition."""
+
+    @kernel
+    def dot4(A: i32[8], out: i32[8]):
+        for i in range(8):
+            out[i] = A[0] + A[1] + A[2] + A[3]
+
+    s = dot4.schedule()
+    if complete:
+        s.partition("A", kind=s.Complete)
+    return _iis(s.export("rtl").schedule().func("dot4").regions)
+
+
+def test_a_scattered_argument_has_no_port_pressure():
+    # What the feature BUYS. Four reads of one argument in one iteration need
+    # four ports, and an addressed argument has 2, so its II is 2. Scattered,
+    # every element is already on the boundary, so the reads contend for no port
+    # at all (`MemoryBankModel` bills none) and the loop pipelines at II=1.
+    assert _four_read_ii(complete=False) == [2]
+    assert _four_read_ii(complete=True) == [1]
+
+
+def test_a_read_write_scattered_argument_splits_its_directions():
+    # An argument used BOTH ways needs its two ports told apart, so the bare name
+    # gives way to `_in` / `_out` (+ its write enable). This is the one case that
+    # renames, and it is the rule Vitis follows (`a_0_i` / `a_0_o`).
+    @kernel
+    def rmw(A: i32[8]):
+        for i in range(8):
+            A[i] = A[i] * 2
+
+    s = rmw.schedule()
+    s.partition("A", kind=s.Complete)
+    mod = s.export("rtl")
+    (rf,) = mod.interfaces["rmw"]["registers"]
+    assert rf["elements"][0] == {
+        "in": "A_0_in",
+        "out": "A_0_out",
+        "we": "A_0_out_we",
+    }, rf
+
+    a = A8.copy()
+    mod.cosim(a)
+    assert np.array_equal(a, A8 * 2)
+
+
+def test_a_write_only_scattered_argument_keeps_the_bare_name():
+    # Only one direction is live, so no disambiguation: `out` takes the bare
+    # name and there is no input port at all. Elements the kernel never stores
+    # to are never enabled, so they pass the driver's value through.
+    @kernel
+    def wo(A: i32[8]):
+        for i in range(4):
+            A[i] = 7
+
+    s = wo.schedule()
+    s.partition("A", kind=s.Complete)
+    mod = s.export("rtl")
+    (rf,) = mod.interfaces["wo"]["registers"]
+    assert rf["elements"][0] == {"out": "A_0", "we": "A_0_we"}, rf
+
+    a = A8.copy()
+    mod.cosim(a)
+    assert np.array_equal(a, np.concatenate([np.full(4, 7), A8[4:]]))
+
+
+def test_scattered_writes_share_their_element_ports():
+    # The reason the port drivers are built after every region rather than at
+    # each store: N element ports serve ALL of an argument's writes, where an
+    # addressed argument gets a port group per access. Two stores in one region
+    # and a third in another would each drive them.
+    @kernel
+    def multi(A: i32[8], b: i32[8]):
+        for i in range(4):
+            A[2 * i] = b[2 * i] + 1
+            A[2 * i + 1] = b[2 * i + 1] + 2
+        for i in range(8):
+            A[i] = A[i] * 10
+
+    s = multi.schedule()
+    s.partition("A", kind=s.Complete)
+    mod = s.export("rtl")
+
+    a, b = np.zeros(8, np.int32), A8.copy()
+    mod.cosim(a, b)
+    expect = np.array([b[k] + (1 if k % 2 == 0 else 2) for k in range(8)]) * 10
+    assert np.array_equal(a, expect)
+
+
+def test_a_scattered_argument_carries_a_recurrence_through_the_boundary():
+    # The registers sit OUTSIDE the module, so a RAW closes through the boundary:
+    # a store presents at its cycle and the driver commits on that edge, and the
+    # combinational read sees it the next cycle. Write 1 / read 0 is the same
+    # model an internal complete-partitioned array runs, just relocated, so the
+    # II is the recurrence and nothing else.
+    @kernel
+    def acc(A: i32[8]):
+        for i in range(1, 8):
+            A[i] = A[i - 1] + A[i]
+
+    s = acc.schedule()
+    s.partition("A", kind=s.Complete)
+    mod = s.export("rtl")
+
+    a = A8.copy()
+    mod.cosim(a)
+    assert np.array_equal(a, np.cumsum(A8))
+
+
+def test_passing_a_scattered_argument_to_a_sub_kernel_is_unsupported(capfd):
+    # The top holds the elements as input wires, so there is no addressed port to
+    # hand a child. Distinct from a caller-OWNED complete-partitioned buffer,
+    # which a child masters fine (see above).
+    @kernel
+    def use(b: i32[8], out: i32[8]):
+        for j in range(8):
+            out[j] = b[j] * 2
+
+    @kernel
+    def top(A: i32[8], out: i32[8]):
+        use(A, out)
+
+    s = top.schedule()
+    s.partition("A", kind=s.Complete)
+    with pytest.raises(Exception):
+        s.export("rtl").schedule()
+    text = "".join(capfd.readouterr())
+    assert "to a sub-kernel is not lowered yet" in text, text
+
+
+# --- internal memory names --------------------------------------------------
+
+
+def test_unrolled_copies_of_one_array_get_distinct_symbols():
+    # Unrolling a body that declares an array gives every copy the same source
+    # name, so the tie-break has to fire on an internal memory too. CIRCT would
+    # rename the duplicate downstream, which is exactly the desync `Naming.h`
+    # exists to prevent.
+    @kernel
+    def dup(A: i32[8], out: i32[8]):
+        for i in range(4):
+            buf: i32[32]
+            for k in range(32):
+                buf[k] = A[i] + k
+            out[i] = buf[A[i] & 31]
+            out[i + 4] = buf[(A[i] + 3) & 31]
+
+    s = dup.schedule()
+    s.unroll(s.loop("i"), factor=2)
+    mod = s.export("rtl")
+    syms = re.findall(r"seq\.hlmem @(\S+)", mod.mlir)
+    assert len(syms) == 2 and len(set(syms)) == 2, syms
+
+    A8x = np.arange(8, dtype=np.int32)
+    out = np.zeros(8, np.int32)
+    mod.cosim(A8x, out)
+    exp = np.zeros(8, np.int32)
+    for i in range(4):
+        exp[i] = A8x[i] + (A8x[i] & 31)
+        exp[i + 4] = A8x[i] + ((A8x[i] + 3) & 31)
+    assert np.array_equal(out, exp)

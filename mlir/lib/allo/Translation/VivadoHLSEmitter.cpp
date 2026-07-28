@@ -332,8 +332,6 @@ void VivadoHLSEmitter::emitCall(func::CallOp op) {
 
 void VivadoHLSEmitter::emitPartitionPragma(allo::PartitionAttr attr,
                                            llvm::StringRef varName) {
-  unsigned i = 0;
-  unsigned n = attr.getPartitions().size();
   for (auto axiAttr : attr.getPartitions()) {
     state.os.indent(state.currentIndent);
     state.os << "#pragma HLS array_partition variable=" << varName;
@@ -351,9 +349,15 @@ void VivadoHLSEmitter::emitPartitionPragma(allo::PartitionAttr attr,
       state.os << " complete";
       // ignore factor for complete partition since it is not needed
       break;
+    case allo::PartitionKindEnum::SkewPartition:
+      // No `array_partition` spells a skew: its bank is a function of every
+      // subscript, where the pragma's kinds each read one. Emitting the nearest
+      // cyclic would silently place the elements somewhere else.
+      state.os << " /*unsupported: skew partition has no HLS pragma*/";
+      state.failed = true;
+      break;
     }
-    if (i + 1 != n)
-      state.os << "\n";
+    state.os << "\n";
   }
 }
 

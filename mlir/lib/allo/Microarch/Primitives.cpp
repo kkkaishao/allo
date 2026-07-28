@@ -106,7 +106,7 @@ static comb::ICmpPredicate combICmpPredicate(arith::CmpIPredicate p) {
 Value emitCompute(OpBuilder &b, Location loc, StringRef kind,
                   ValueRange operands, Type resultType, Operation *srcOp) {
   // affine.apply: a map carried on the op (like arith.cmpi's predicate),
-  // left by flatten-perfect-loops when reading an IV outside an address.
+  // left by loop-canonicalization when reading an IV outside an address.
   // Uses evalAffine, so a power-of-two divisor stays shift+mask.
   if (kind == "apply") {
     assert(srcOp->getAttr("map") &&

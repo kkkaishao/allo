@@ -267,6 +267,9 @@ struct DatapathBuilder {
   void deriveInterconnect();
   /// Size the (empty) input-slot vectors every resolve phase fills.
   void allocateInputSlots();
+  /// Group a skewed memory's accesses into lanes that can share one port per
+  /// bank, or leave it crossbarring when they cannot.
+  void assignLanes(MemUnit &m);
   /// Record a resolved edge into \p slot: a depth-0 edge ties directly, a
   /// deeper one is deferred (its register chain is built in insertRegisters).
   void recordEdge(Resolved r, Source &slot, unsigned regionIdx);
@@ -274,6 +277,9 @@ struct DatapathBuilder {
   void resolveUnitInputs();
   /// Resolve every memory address / store data and stream data + predicate.
   void resolveAccessOperands();
+  /// Decide which accesses carry their address in a register that advances
+  /// with the loop counters, and record the scaled counters that needs.
+  void planAddressGenerators();
   /// Build the register chains the deferred edges need, patch their slots, and
   /// materialize the shared-unit muxes.
   void insertRegisters();

@@ -1,15 +1,6 @@
 /*
  * Copyright Allo authors. All Rights Reserved.
  * SPDX-License-Identifier: Apache-2.0
- *
- * Thin nanobind extension for the upstream-bindings migration. It exposes only
- * the Allo-specific drivers that cannot be auto-generated from ODS, and reaches
- * every C++ entry point through MLIRAlloCAPI so that the extension links no
- * MLIR C++ statically (a single MLIR instance lives in the aggregate CAPI
- * dylib).
- *
- * Operation/type construction is provided by ODS-generated Python
- * (`allo._mlir.dialects.allo`) on top of upstream `mlir.ir`, not here.
  */
 
 #include "AlloBindings.h"
@@ -118,6 +109,20 @@ NB_MODULE(_allo, m) {
             module, mlirStringRefCreate(directory.data(), directory.size())));
       },
       nb::arg("module"), nb::arg("directory"));
+
+  allo.def(
+      "run_sdc_scheduling",
+      [](MlirModule module, const std::string &top, float cycleTime,
+         const std::string &scheduler) -> bool {
+        return mlirLogicalResultIsSuccess(alloRunSDCSchedulingPipeline(
+            module, mlirStringRefCreate(top.data(), top.size()), cycleTime,
+            mlirStringRefCreate(scheduler.data(), scheduler.size())));
+      },
+      nb::arg("module"), nb::arg("top"), nb::arg("cycle_time"),
+      nb::arg("scheduler") = "heuristic");
+  allo.def("has_exact_scheduler", &alloHasExactScheduler,
+           "Whether this build accepts `scheduler=\"exact\"`, i.e. links "
+           "OR-Tools.");
   allo.def(
       "dump_region_dependence_analysis",
       [](MlirModule module, const std::string &funcName) {

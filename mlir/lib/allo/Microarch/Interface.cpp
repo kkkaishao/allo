@@ -33,7 +33,7 @@ layoutOf(const uarch::MemUnit &mu) {
   auto shape = cast<MemRefType>(mu.memref.getType()).getShape();
   std::vector<Memory::Axis> axes;
   for (const BankLayout::Axis &a : mu.layout.axes) // decoded by the builder
-    axes.push_back({(int)a.dim, a.factor, a.block});
+    axes.push_back({(int)a.dim, a.factor, bankKindName(a.kind).str()});
   return {{shape.begin(), shape.end()}, std::move(axes)};
 }
 } // namespace
@@ -53,6 +53,23 @@ ModuleInterface::ModuleInterface(const uarch::Datapath &dp) {
     streams.push_back({argOf(s.stream), s.isInput, (int)s.depth,
                        hwWidth(s.payload), base, portData(base),
                        portValid(base), portReady(base)});
+  }
+
+  // A scattered argument is declared per element, off the memory rather than
+  // off its accesses, so it appears here and in neither `reads` nor `writes`
+  // (its accesses take no port group at all).
+  for (const uarch::MemUnit &mu : dp.mems) {
+    if (!mu.scattered)
+      continue;
+    auto mt = cast<MemRefType>(mu.memref.getType());
+    auto shape = mt.getShape();
+    std::vector<RegisterFile::Element> elems;
+    for (const uarch::MemUnit::ElemPort &p : mu.elemPorts)
+      elems.push_back({p.in, p.out, p.we});
+    registers.push_back({argOf(mu.memref),
+                         hwWidth(mt.getElementType()),
+                         {shape.begin(), shape.end()},
+                         std::move(elems)});
   }
 
   // Each external access expands to one interface per boundary bank (one when
@@ -166,8 +183,8 @@ std::string ModuleInterface::toJSON() const {
           o["shape"] = std::move(shape);
           Array axes;
           for (const Memory::Axis &a : p.axes)
-            axes.push_back(Object{
-                {"dim", a.dim}, {"factor", a.factor}, {"block", a.block}});
+            axes.push_back(
+                Object{{"dim", a.dim}, {"factor", a.factor}, {"kind", a.kind}});
           o["axes"] = std::move(axes);
         }
         banks.push_back(std::move(o));
@@ -191,6 +208,28 @@ std::string ModuleInterface::toJSON() const {
                              {"data", s.data},
                              {"valid", s.valid},
                              {"ready", s.ready}});
+  Array registers;
+  for (const RegisterFile &rf : this->registers) {
+    Array shape, elements;
+    for (int64_t d : rf.shape)
+      shape.push_back(d);
+    // An unused direction has no port, so its key is absent rather than empty:
+    // a consumer tests for the port it needs instead of for a sentinel.
+    for (const RegisterFile::Element &e : rf.elements) {
+      Object o;
+      if (!e.in.empty())
+        o["in"] = e.in;
+      if (!e.out.empty()) {
+        o["out"] = e.out;
+        o["we"] = e.we;
+      }
+      elements.push_back(std::move(o));
+    }
+    registers.push_back(Object{{"arg", rf.arg},
+                               {"width", (int64_t)rf.width},
+                               {"shape", std::move(shape)},
+                               {"elements", std::move(elements)}});
+  }
   Array results;
   for (const Result &r : this->results)
     results.push_back(Object{{"width", (int64_t)r.width}, {"name", r.name}});
@@ -225,6 +264,7 @@ std::string ModuleInterface::toJSON() const {
                       {"streams", std::move(streams)},
                       {"reads", mems(reads)},
                       {"writes", mems(writes)},
+                      {"registers", std::move(registers)},
                       {"results", std::move(results)},
                       {"operators", std::move(operators)}};
   std::string s;

@@ -101,6 +101,11 @@ class Schedule(Generic[P, R]):
     Complete = 0
     Block = 1
     Cyclic = 2
+    # Skew: the bank is the SUM of every subscript modulo the factor, where
+    # block and cyclic each read one. `dim` names the distribution dimension,
+    # the one divided down to make room. It is the layout for an array read
+    # both by row and by column, which no per-axis one can serve.
+    Skew = 3
 
     # --- bind_storage enums ---
     BRAM = BindStorageImpl.BRAM
@@ -454,10 +459,10 @@ class Schedule(Generic[P, R]):
             raise InvalidScheduleArgumentError(
                 f"partition dim must be non-negative, got {dim}"
             )
-        if kind not in (self.Complete, self.Block, self.Cyclic):
+        if kind not in (self.Complete, self.Block, self.Cyclic, self.Skew):
             raise InvalidScheduleArgumentError(
                 "partition kind must be Schedule.Complete, Schedule.Block, "
-                "or Schedule.Cyclic"
+                "Schedule.Cyclic, or Schedule.Skew"
             )
         if kind == self.Complete:
             if factor != 0:
@@ -468,6 +473,13 @@ class Schedule(Generic[P, R]):
             raise InvalidScheduleArgumentError(
                 f"{self._partition_kind_name(kind)} partition factor must be "
                 f"greater than 1, got {factor}"
+            )
+        # A skew's bank already reads every subscript, so `dim` cannot mean
+        # "every dimension" the way it does for block and cyclic: it names the
+        # one dimension divided down to make room for the banks.
+        if kind == self.Skew and dim == 0:
+            raise InvalidScheduleArgumentError(
+                "skew partition needs dim to name its distribution dimension"
             )
 
         buffers = self._resolve_buffer_targets(targets, "partition")
@@ -1158,4 +1170,5 @@ class Schedule(Generic[P, R]):
             self.Complete: "complete",
             self.Block: "block",
             self.Cyclic: "cyclic",
+            self.Skew: "skew",
         }.get(kind, str(kind))

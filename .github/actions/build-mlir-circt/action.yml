@@ -1,0 +1,78 @@
+# Copyright Allo authors. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+name: "Build MLIR and CIRCT"
+description: >
+  Builds externals/llvm-project (MLIR) and externals/circt in Release mode,
+  or restores them from cache. The cache key is derived from the pinned
+  submodule commits, so it is invalidated automatically whenever either
+  submodule is bumped.
+
+runs:
+  using: composite
+  steps:
+    - name: Resolve submodule commits
+      id: submodules
+      shell: bash
+      run: |
+        llvm_sha=$(git -C externals/llvm-project rev-parse HEAD)
+        circt_sha=$(git -C externals/circt rev-parse HEAD)
+        echo "llvm-sha=${llvm_sha}" >> "$GITHUB_OUTPUT"
+        echo "circt-sha=${circt_sha}" >> "$GITHUB_OUTPUT"
+
+    - name: Restore MLIR/CIRCT build cache
+      id: cache
+      uses: actions/cache@v4
+      with:
+        path: |
+          externals/llvm-project/build
+          externals/circt/build
+        key: mlir-circt-${{ runner.os }}-${{ runner.arch }}-llvm-${{ steps.submodules.outputs.llvm-sha }}-circt-${{ steps.submodules.outputs.circt-sha }}
+
+    - name: Build LLVM/MLIR
+      if: steps.cache.outputs.cache-hit != 'true'
+      shell: bash
+      run: |
+        pip install -r externals/llvm-project/mlir/python/requirements.txt
+        LINKER_FLAG=""
+        if [ "${{ runner.os }}" = "Linux" ]; then
+          LINKER_FLAG="-DLLVM_USE_LINKER=lld"
+        fi
+        cmake -G Ninja -S externals/llvm-project/llvm -B externals/llvm-project/build \
+          -DCMAKE_C_COMPILER=clang \
+          -DCMAKE_CXX_COMPILER=clang++ \
+          -DCMAKE_BUILD_TYPE=Release \
+          -DLLVM_ENABLE_PROJECTS="mlir" \
+          -DLLVM_TARGETS_TO_BUILD="Native" \
+          $LINKER_FLAG \
+          -DMLIR_ENABLE_BINDINGS_PYTHON=ON \
+          -DPython3_EXECUTABLE="$(which python3)" \
+          -DLLVM_INCLUDE_TESTS=OFF \
+          -DMLIR_INCLUDE_TESTS=OFF \
+          -DLLVM_INCLUDE_BENCHMARKS=OFF \
+          -DLLVM_INCLUDE_EXAMPLES=OFF \
+          -DLLVM_INCLUDE_DOCS=OFF \
+          -DMLIR_INCLUDE_DOCS=OFF \
+          -DLLVM_ENABLE_BINDINGS=OFF
+        ninja -C externals/llvm-project/build
+
+    - name: Build CIRCT
+      if: steps.cache.outputs.cache-hit != 'true'
+      shell: bash
+      run: |
+        LINKER_FLAG=""
+        if [ "${{ runner.os }}" = "Linux" ]; then
+          LINKER_FLAG="-DLLVM_USE_LINKER=lld"
+        fi
+        cmake -G Ninja -S externals/circt -B externals/circt/build \
+          -DCMAKE_C_COMPILER=clang \
+          -DCMAKE_CXX_COMPILER=clang++ \
+          -DCMAKE_BUILD_TYPE=Release \
+          -DLLVM_DIR="$PWD/externals/llvm-project/build/lib/cmake/llvm" \
+          -DMLIR_DIR="$PWD/externals/llvm-project/build/lib/cmake/mlir" \
+          $LINKER_FLAG \
+          -DCIRCT_INCLUDE_TESTS=OFF \
+          -DCIRCT_INCLUDE_DOCS=OFF \
+          -DCIRCT_INCLUDE_INTEGRATION_TESTS=OFF \
+          -DCIRCT_BINDINGS_PYTHON_ENABLED=OFF
+        ninja -C externals/circt/build

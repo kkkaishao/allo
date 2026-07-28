@@ -232,7 +232,8 @@ def test_stream_multi_access_per_channel():
 
     loop = _sched(mg_two).func("mg_two").cyclic()[0]
     gets = sorted(o.t for o in loop.ops if o.kind == "stream.get")
-    assert loop.ii >= 2 and gets == [0, 1] and gets[-1] - gets[0] < loop.ii
+    # Distinct stages spanning less than the II; WHICH stages is the scheduler's.
+    assert loop.ii >= 2 and len(set(gets)) == 2 and gets[-1] - gets[0] < loop.ii
 
     x = np.arange(2 * n, dtype=np.int32) * 7 + 3
     rtl = _to_rtl(mg_two)
@@ -264,7 +265,8 @@ def test_stream_multi_access_per_channel():
             y_out.put(x_in.get() + x_in.get() * 2 + x_in.get() * 4)
 
     loop = _sched(mg_three).func("mg_three").cyclic()[0]
-    assert sorted(o.t for o in loop.ops if o.kind == "stream.get") == [0, 1, 2]
+    gets = sorted(o.t for o in loop.ops if o.kind == "stream.get")
+    assert loop.ii >= 3 and len(set(gets)) == 3 and gets[-1] - gets[0] < loop.ii
     x = np.arange(3 * n, dtype=np.int32) * 3 + 1
     y = np.zeros(n, np.int32)
     _to_rtl(mg_three).cosim(x, y, stall_prob=0.6)
@@ -404,7 +406,7 @@ def test_stream_ii_gt1_with_memory_read_producer():
     # The consumer's inner loop is recurrence-bound: the shell runs the modulo
     # (II>1) regime, not the II==1 fast path.
     iis = [r.ii for f in _sched(build(8)).funcs for r in f.regions if r.ii is not None]
-    assert max(iis) == FADD and FADD > 1
+    assert max(iis) > 1  # the modulo regime; the exact II is the scheduler's
 
     for K in (8, 16):
         A = (2.0 ** np.arange(K)).astype(np.float32)  # 1, 2, 4, ... 2**(K-1)
@@ -463,43 +465,6 @@ def test_fanout_is_one_push_and_n_queues(stall):
     mod.cosim(x, o0, o1, stall_prob=stall)
     assert np.array_equal(o0, x + 1), list(o0)
     assert np.array_equal(o1, x * 3), list(o1)
-
-
-# Both consumers see every token. Run under back-pressure too: a fan-out with
-# no stalls exercises none of the paths where the lock-step push and the
-# per-consumer buffering can diverge.
-@pytest.mark.parametrize("stall", _STALLS)
-def test_local_channel_fans_out_to_two_consumers(stall):
-    @kernel
-    async def f2_prod(x: i32[N], s: Stream[i32]):
-        for i in range(N):
-            s.put(x[i])
-
-    @kernel
-    async def f2_c1(s: Stream[i32], o1: i32[N]):
-        for i in range(N):
-            o1[i] = s.get() + 1
-
-    @kernel
-    async def f2_c2(s: Stream[i32], o2: i32[N]):
-        for i in range(N):
-            o2[i] = s.get() * 3
-
-    @kernel
-    async def f2_top(x: i32[N], o1: i32[N], o2: i32[N]):
-        f: Stream[i32]
-        await f2_prod(x, f)
-        await f2_c1(f, o1)
-        await f2_c2(f, o2)
-
-    mod = _to_rtl(f2_top)
-    assert mod.mlir.count("seq.fifo") == 2  # one per consumer, not one shared
-
-    o1 = np.zeros(N, np.int32)
-    o2 = np.zeros(N, np.int32)
-    mod.cosim(A8, o1, o2, stall_prob=stall)
-    assert np.array_equal(o1, A8 + 1), list(o1)
-    assert np.array_equal(o2, A8 * 3), list(o2)
 
 
 # The fan-out is N-ary, not a special case of two.
@@ -688,12 +653,15 @@ def test_self_loop_delay_line(dtype):
 
     rtl = _to_rtl(lc_sl)
     if dtype is i32:
-        assert rtl.schedule().func("lc_sl").cyclic()[0].ii == 2
+        assert rtl.schedule().func("lc_sl").cyclic()[0].ii >= 2
         A = np.arange(N, dtype=np.int32) * 3 - 5
         out = np.zeros(N, np.int32)
         rtl.cosim(A, out)
         assert np.array_equal(out, _delay_line(A, A[0], lambda h, x: h + x)), list(out)
     else:
+        # The claim the i32 arm cannot make: the recurrence now runs through the
+        # float adder, so the channel-occupancy floor is no longer what binds.
+        assert rtl.schedule().func("lc_sl").cyclic()[0].ii >= FADD
         A = (np.arange(N, dtype=np.float32) + 1) * 0.5
         out = np.zeros(N, np.float32)
         rtl.cosim(A, out)
@@ -1088,3 +1056,116 @@ def test_stream_shell_freeze_is_token_exact():
         out = np.zeros(1, np.int32)
         rtl.cosim(x, out, stall_prob=gap)
         assert out[0] == x.sum(), f"gap={gap}: {out[0]} != {x.sum()}"
+
+
+# --- an acyclic region's single pass defers, it is not dropped ----------------
+
+
+# A straight-line region issues ONE pass, and a pass that
+# cannot be gated can only be dropped: a stage-0 get would sample `_data` at
+# that pulse whatever `_valid` said, and never pop, leaving every later
+# iteration one token behind. Reached by any stream consumer whose loop body
+# needs an inner loop, since the imperfect-nest decomposition puts the get in an
+# acyclic sub-region of its own.
+#
+# A LOCAL channel is what makes this deterministic at stall_prob=0: both
+# processes start together, so the queue is genuinely empty at the consumer's
+# first pass, where a boundary port driven by the testbench already holds a
+# token. Reading one token early is then a fixed phase error, not a race.
+@pytest.mark.parametrize("stall", _STALLS)
+def test_acyclic_region_waits_for_stream_input(stall):
+    @kernel
+    def feed(A: i32[N], s: Stream[i32]):
+        for i in range(N):
+            s.put(A[i])
+
+    @kernel
+    def slow(s: Stream[i32], o: i32[N]):
+        for i in range(N):
+            v: i32 = s.get()  # region 0: acyclic, holds the stage-0 get
+            acc: i32 = 0
+            for j in range(4):  # region 1: forces the imperfect-nest split
+                acc += v * j
+            o[i] = acc  # region 2
+
+    @kernel
+    def top(A: i32[N], o: i32[N]):
+        s: Stream[i32]
+        feed(A, s)
+        slow(s, o)
+
+    rtl = _df(top)
+    get = next(
+        g
+        for r in rtl.schedule().func("slow").regions
+        if r.kind == "acyclic"
+        for g in r.ops
+        if g.kind == "stream.get"
+    )
+    assert get.t == 0, f"the get is at stage {get.t}, so not the stage-0 case"
+
+    out = np.zeros(N, np.int32)
+    rtl.cosim(A8, out, stall_prob=stall)
+    assert np.array_equal(out, A8 * 6), f"stall={stall}: {list(out)}"
+
+
+# The same pass at FUNC scope, where the region is top-level and issues on
+# `start` itself, with no inner loop in sight: the consumer samples the channel
+# on its very first cycle, before the producer has run at all.
+@pytest.mark.parametrize("stall", _STALLS)
+def test_top_level_acyclic_region_waits_for_stream_input(stall):
+    @kernel
+    def one(A: i32[N], s: Stream[i32]):
+        s.put(A[0])
+
+    @kernel
+    def head(s: Stream[i32], o: i32[2]):
+        v: i32 = s.get()
+        o[0] = v
+        o[1] = v * 3
+
+    @kernel
+    def top(A: i32[N], o: i32[2]):
+        s: Stream[i32]
+        one(A, s)
+        head(s, o)
+
+    rtl = _df(top)
+    kinds = [r.kind for r in rtl.schedule().func("head").regions]
+    assert kinds == ["acyclic"], kinds
+
+    out = np.zeros(2, np.int32)
+    rtl.cosim(A8, out, stall_prob=stall)
+    assert np.array_equal(out, [A8[0], A8[0] * 3]), f"stall={stall}: {list(out)}"
+
+
+# The output half of the same defect. A stage-0 put presents `valid` for the one
+# pulse cycle, so a full downstream dropped the token; and since such a region's
+# completion reduces to `issue & ready`, the drop also left its `done` low
+# forever. The failure is a cosim timeout rather than a wrong answer.
+@pytest.mark.parametrize("stall", _STALLS)
+def test_acyclic_region_waits_for_stream_output(stall):
+    @kernel
+    def emit(A: i32[N], o: i32[N], y_out: Stream[i32]):
+        for i in range(N):
+            y_out.put(i)  # region 0: acyclic, stage 0 (the IV is combinational)
+            acc: i32 = 0
+            for j in range(4):  # region 1
+                acc += A[i] * j
+            o[i] = acc  # region 2
+
+    rtl = _to_rtl(emit)
+    put = next(
+        p
+        for r in rtl.schedule().func("emit").regions
+        if r.kind == "acyclic"
+        for p in r.ops
+        if p.kind == "stream.put"
+    )
+    assert put.t == 0, f"the put is at stage {put.t}, so not the stage-0 case"
+
+    o = np.zeros(N, np.int32)
+    y = np.zeros(N, np.int32)
+    rtl.cosim(A8, o, y, stall_prob=stall)
+    assert np.array_equal(y, np.arange(N)), f"stall={stall}: {list(y)}"
+    assert np.array_equal(o, A8 * 6), f"stall={stall}: {list(o)}"

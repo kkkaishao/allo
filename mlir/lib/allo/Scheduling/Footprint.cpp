@@ -32,7 +32,10 @@ void mlir::allo::summarizeOp(Operation *op, Summary &s) {
     }
     Access &acc = s.mem[a->root];
     (a->isWrite ? acc.writes : acc.reads) = true;
-    if (a->map)
+    // `footprintsDisjoint` runs the polyhedral test over an
+    // `affine::MemRefAccess`, so what it needs is an affine-dialect op. Every
+    // array access carries a map, so the map cannot answer this.
+    if (isa<affine::AffineReadOpInterface, affine::AffineWriteOpInterface>(op))
       acc.affine.push_back(op);
     else
       acc.nonAffine = true;
@@ -64,11 +67,10 @@ bool mlir::allo::footprintsDisjoint(const Access &ai, const Access &aj) {
         continue; // read-read pairs never conflict
       affine::MemRefAccess accA(a), accB(b);
       if (accA.memref != accB.memref)
-        return false; // different memref (e.g. subview): cannot prove
-                      // disjoint
-      // A dependence at ANY depth means the two may touch one element: carried
-      // by a common enclosing loop (1..n), or loop-independent (n+1, the same
-      // iteration of every common loop). Depth 1 alone misses the latter.
+        return false; // different memref (e.g. subview): cannot prove disjoint
+      // A dependence at any depth means the two may touch one element:
+      // carried by a common enclosing loop (1..n), or loop-independent
+      // (n+1, same iteration of every common loop). Depth 1 alone misses it.
       unsigned n = affine::getNumCommonSurroundingLoops(*a, *b);
       for (unsigned d = 1; d <= n + 1; ++d) {
         affine::FlatAffineValueConstraints cst;
@@ -155,7 +157,9 @@ static bool summarizeFuncInto(func::FuncOp fn, ArrayRef<Value> actuals,
       // Only an affine access naming the parameter DIRECTLY has indices in
       // the array's own index space (the space the caller shares with it),
       // so only then is its region comparable across the call.
-      if (a->map && affine::MemRefAccess(op).memref == a->root)
+      if (isa<affine::AffineReadOpInterface, affine::AffineWriteOpInterface>(
+              op) &&
+          affine::MemRefAccess(op).memref == a->root)
         acc.affine.push_back(op);
       else
         acc.nonAffine = true;

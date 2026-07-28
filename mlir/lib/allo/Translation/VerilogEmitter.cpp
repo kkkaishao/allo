@@ -116,6 +116,8 @@ static void addLowerToSV(PassManager &pm) {
   hwPM.addPass(std::make_unique<InitializeMemoriesPass>());
   hwPM.addPass(circt::seq::createLowerSeqShiftReg());
   hwPM.addPass(circt::seq::createLowerSeqCompRegCE());
+  pm.addPass(createCanonicalizerPass());
+  pm.addPass(createCSEPass());
   // FIFO lowering also emits verif over/underflow assertions; lower them to SV
   // (sim-only assertions ExportVerilog understands).
   hwPM.addPass(circt::createLowerVerifToSVPass());

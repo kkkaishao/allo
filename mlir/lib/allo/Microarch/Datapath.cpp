@@ -76,7 +76,9 @@ std::optional<int64_t> Datapath::constantOf(const Source &s) const {
 }
 
 Datapath::Datapath(func::FuncOp func, const BindingPolicy &policy,
-                   const MemoryLibrary &memLib, const CalleeCtx *callees) {
+                   const MemoryLibrary &memLib, const CalleeCtx *callees,
+                   bool isTop) {
+  atTop = isTop;
   DatapathBuilder builder(*this, func, policy, memLib, callees);
   builder.build();
 }
@@ -128,8 +130,8 @@ void forEachSource(
     const Datapath &dp,
     llvm::function_ref<void(const Source &, const SourceSite &)> fn) {
   using Slot = SourceSite::Slot;
-  // Every visit is one call; `required` is the model's own statement of where a
-  // None means "absent" rather than "unresolved", so no consumer re-decides it.
+  // Every visit is one call; `required` states whether a None source there
+  // means "absent" or "unresolved", so no consumer re-decides it.
   auto visit = [&](const Source &s, Slot slot, unsigned index, Operation *op,
                    bool required) {
     fn(s, SourceSite{slot, index, op, required});

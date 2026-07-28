@@ -1,3 +1,8 @@
+/*
+ * Copyright Allo authors. All Rights Reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 #ifndef ALLO_CONVERSION_PASSES_TD
 #define ALLO_CONVERSION_PASSES_TD
 
@@ -27,18 +32,6 @@ def LowerDataflowPass : Pass<"lower-dataflow", "ModuleOp"> {
     simulator runtime and tag stream-connected kernels as dataflow PEs, which
     the late `allo-dataflow-spawn` pass launches as concurrent fibers on the
     marl runtime.
-  }];
-}
-
-def ConvertScheduleToDCPPass : Pass<"convert-schedule-to-dcp", "ModuleOp"> {
-  let summary = "Reify the schedule carrier into allo.dcp.* ops (standalone)";
-  let description = [{
-    Standalone wrapper around the scheduler's reification step: convert a module
-    whose funcs carry `allo.sched.*` schedule attributes into `allo.dcp.*` ops
-    and strip the carrier. `allo-schedule` runs this automatically at the end of
-    scheduling; this pass exposes it for inspecting the carrier->dcp conversion
-    in isolation. Operator and device timing is read from the injected
-    dcp.device / dcp.operator IR.
   }];
 }
 

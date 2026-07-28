@@ -17,14 +17,74 @@ RegionControl ControlEmitter::emitPipelineControl(const uarch::RegionBlock &rb,
                                                   Value start,
                                                   const StallShell &sh) const {
   if (rb.kind == uarch::RegionBlock::Kind::Acyclic)
-    return emitAcyclic(rb.id, start, /*topLevel=*/!rb.parent);
+    return emitAcyclic(rb.id, start, /*topLevel=*/!rb.parent, sh);
   assert(rb.ii && "a pipelined region reached control emission with no II");
   auto rc = emitPipelined(rb.id, *rb.ii, term, start, sh);
   // Label the counter register after the source loop variable. A loop whose
   // IV lost its name still reads as this region's counter.
   nameValue(rc.counter, rb.counterName.empty() ? regionSignal(rb.id, "iv")
                                                : rb.counterName);
+  rc.scaledCounters = emitScaledCounters(
+      rb, term, /*bypassStart=*/Value(),
+      [&](Value cur, Value stepped, Value init) {
+        // Exactly `iterNext` above, with `lb` and `step` scaled.
+        return c.mux(rc.running, c.mux(rc.issue, stepped, cur), init);
+      });
   return rc;
+}
+
+// \p update is passed rather than re-derived so that each family's scaled
+// counters are written beside the counter they have to track. Drifting from
+// that counter is the only way these can be wrong.
+llvm::SmallVector<Value> ControlEmitter::emitScaledCounters(
+    const uarch::RegionBlock &rb, const Terminator &term, Value bypassStart,
+    llvm::function_ref<Value(Value, Value, Value)> update) const {
+  llvm::SmallVector<Value> scaled;
+  if (rb.addrStrides.empty())
+    return scaled;
+  auto ty = cast<IntegerType>(term.lb.getType());
+  // Whether each slot's register wraps THIS advance, which is what a digit
+  // above it advances on. A carry slot always precedes its consumer, so the
+  // signal exists by the time it is read.
+  llvm::SmallVector<Value> wrapped(rb.addrStrides.size());
+  for (auto [slot, s] : llvm::enumerate(rb.addrStrides)) {
+    Backedge next = c.bb.get(ty);
+    Value init = c.konst(ty, s.init);
+    Value reg = c.reg(next, init);
+    nameValue(reg, regionSignal(rb.id, "addr" + std::to_string(slot)));
+    // The same start-cycle bypass the counter takes, for the same reason: a
+    // call region's first pass reads its index on `start` itself.
+    Value cur = bypassStart ? c.mux(bypassStart, init, reg) : reg;
+    Value raw = cur;
+    if (s.step)
+      raw =
+          c.R(comb::AddOp::create(c.b, c.loc, raw, c.konst(ty, s.step), false));
+    if (s.hasCarry) {
+      assert(wrapped[s.carry] &&
+             "a digit's carry slot is not emitted before it");
+      raw = c.R(comb::AddOp::create(
+          c.b, c.loc, raw,
+          c.mux(wrapped[s.carry], c.konst(ty, s.bump), c.konst(ty, 0)), false));
+    }
+    Value stepped = raw;
+    if (s.wrap) {
+      // Unsigned throughout: a stride register holds an index, and a digit is a
+      // residue, so neither is ever negative. Counting DOWN, the register goes
+      // out of range by wrapping around zero, which is exactly `raw > cur`.
+      Value wrapKonst = c.konst(ty, s.wrap);
+      wrapped[slot] = c.R(comb::ICmpOp::create(
+          c.b, c.loc,
+          s.down ? comb::ICmpPredicate::ugt : comb::ICmpPredicate::uge, raw,
+          s.down ? cur : wrapKonst, false));
+      Value fixed =
+          s.down ? c.R(comb::AddOp::create(c.b, c.loc, raw, wrapKonst, false))
+                 : c.R(comb::SubOp::create(c.b, c.loc, raw, wrapKonst, false));
+      stepped = c.mux(wrapped[slot], fixed, raw);
+    }
+    next.setValue(update(cur, stepped, init));
+    scaled.push_back(cur);
+  }
+  return scaled;
 }
 
 // The one pipelined control skeleton, covering three regimes that differ only
@@ -82,7 +142,8 @@ RegionControl ControlEmitter::emitPipelined(unsigned region, int64_t ii,
       comb::AndOp::create(c.b, c.loc, issue, term.isLast(c, ivStep), false));
   Value runAfterLast = c.mux(terminate, c.f1, running);
   runNext.setValue(c.mux(term.gateStart(c, start), c.t1, runAfterLast));
-  return {/*issue=*/issue, /*counter=*/iv, /*wantIssue=*/wantIssue};
+  return {/*issue=*/issue, /*counter=*/iv, /*wantIssue=*/wantIssue,
+          /*running=*/running, /*scaledCounters=*/{}};
 }
 
 // The one counted done-driven skeleton, covering the two cells whose iterations
@@ -120,6 +181,12 @@ ControlEmitter::emitCountedIteration(const uarch::RegionBlock &rb,
   Value last = term.isLast(c, ivStep);
   Value advance = c.andBits(complete, c.notBit(last));
   ivNext.setValue(c.mux(start, term.lb, c.mux(advance, ivStep, iv)));
+  llvm::SmallVector<Value> scaled = emitScaledCounters(
+      rb, term, /*bypassStart=*/launchAtStart ? start : Value(),
+      [&](Value cur, Value stepped, Value init) {
+        // Exactly `ivNext` above, with `lb` and `step` scaled.
+        return c.mux(start, init, c.mux(advance, stepped, cur));
+      });
 
   // `gateStart` masks the start launch of an empty region (a runtime zero trip
   // or a static lb >= ub), which completes through `empty` below instead.
@@ -133,7 +200,9 @@ ControlEmitter::emitCountedIteration(const uarch::RegionBlock &rb,
   Value empty = c.reg(c.andBits(start, term.isEmpty(c)), c.f1);
   Value done = c.holdDone(c.orBits(empty, c.andBits(complete, last)), start);
   nameValue(done, regionSignal(rb.id, "done"));
-  return {{/*issue=*/launch, /*counter=*/iv, /*wantIssue=*/Value()}, done};
+  return {{/*issue=*/launch, /*counter=*/iv, /*wantIssue=*/Value(),
+           /*running=*/Value(), /*scaledCounters=*/std::move(scaled)},
+          done};
 }
 
 // The conditional done-driven skeleton: a sequential-wrapper while. Same
@@ -160,24 +229,53 @@ IterationControl ControlEmitter::emitCheckedIteration(unsigned region,
   nameValue(launch, regionSignal(region, "fire"));
   Value done = c.holdDone(finish, start);
   nameValue(done, regionSignal(region, "done"));
-  return {{/*issue=*/launch, /*counter=*/Value(), /*wantIssue=*/Value()}, done};
+  return {{/*issue=*/launch, /*counter=*/Value(), /*wantIssue=*/Value(),
+           /*running=*/Value(), /*scaledCounters=*/{}},
+          done};
 }
 
-// Acyclic (straight-line) region: a single pass. A NESTED acyclic child issues
+// Acyclic (straight-line) region: a single pass. A NESTED acyclic child arms
 // `start` delayed one cycle, a registered pulse matching the cyclic regimes'
 // registered `running`. This is what lets it read the outer counter correctly:
 // the container advances its counter on the child's start pulse, so the new
 // index only settles the next cycle (register semantics), exactly when this
-// registered issue (and a cyclic child's `running`) rises. A TOP-LEVEL acyclic
-// region has no outer counter, so that register would be pure latency: it
-// issues on `start` directly, so a pure-seq call container's latency equals its
+// registered arming (and a cyclic child's `running`) rises. A TOP-LEVEL acyclic
+// region has no outer counter, so that register would be pure latency: it arms
+// on `start` directly, so a pure-seq call container's latency equals its
 // reported schedule depth (no spurious +1). There is no iteration index of its
 // own.
+//
+// Under an elastic shell the arming pulse is LATCHED into `pend`, the acyclic
+// counterpart of the pipelined regime's `running`: a single one-shot pulse
+// cannot be gated, only dropped, so a stage-0 stream access would sample its
+// `_data` at the arming cycle whatever `_valid` said (and a stage-0 put would
+// drop its token and never complete). The latch turns "issue now" into "issue
+// as soon as the shell allows", which the whole region's timeline already
+// follows, since every chain below it rides that same shell. `pend` is
+// combinationally ORed with the arming pulse rather than replacing it, so an
+// available token still issues at the arming cycle and the top-level latency
+// above is unchanged. A rigid region has nothing to defer and stays a bare
+// pulse.
 RegionControl ControlEmitter::emitAcyclic(unsigned region, Value start,
-                                          bool topLevel) const {
-  Value issue = topLevel ? start : c.reg(start, c.f1);
+                                          bool topLevel,
+                                          const StallShell &sh) const {
+  Value armed = topLevel ? start : c.reg(start, c.f1);
+  if (!sh) {
+    nameValue(armed, regionSignal(region, "issue"));
+    return {armed, /*counter=*/Value(), /*wantIssue=*/Value(),
+            /*running=*/Value(), /*scaledCounters=*/{}};
+  }
+  auto pendNext = c.bb.get(c.i1);
+  Value pending = c.reg(pendNext, c.f1);
+  nameValue(pending, regionSignal(region, "pend"));
+  Value wantIssue = c.orBits(armed, pending);
+  Value issue = c.andBits(wantIssue, sh.issueEnable);
   nameValue(issue, regionSignal(region, "issue"));
-  return {issue, /*counter=*/Value(), /*wantIssue=*/Value()};
+  // Hold the pass pending until it actually issues; the pass is a single one,
+  // so `wantIssue` falls the cycle after and the latch stays down.
+  pendNext.setValue(c.andBits(wantIssue, c.notBit(sh.issueEnable)));
+  return {issue, /*counter=*/Value(), /*wantIssue=*/wantIssue,
+          /*running=*/Value(), /*scaledCounters=*/{}};
 }
 
 // The region's completion signal: one latched level for every regime (cyclic,

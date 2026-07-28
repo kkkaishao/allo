@@ -14,13 +14,10 @@
 //===----------------------------------------------------------------------===//
 
 #include "allo/Scheduling/Scheduler.h"
-#include "allo/Scheduling/Utils.h"
 #include "allo/Support/Logging.h"
 
 #include "circt/Scheduling/Utilities.h"
 
-#include "mlir/IR/Builders.h"
-#include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/Operation.h"
 
 #include "llvm/ADT/DenseMap.h"
@@ -38,21 +35,13 @@ using namespace circt::scheduling;
 using namespace mlir::allo::logging;
 using mlir::allo::ChainingModuloProblem;
 using mlir::allo::ChainingSharedOperatorsProblem;
+using mlir::allo::ModuloOccupancyProblem;
+using mlir::allo::OccupancyProblem;
 
 using llvm::dbgs;
 using llvm::format;
 
 namespace {
-
-/// Number of consecutive cycles \p op occupies its resource unit: its latency
-/// for a non-pipelined multi-cycle unit (stamped by the operator model), else 1
-/// (fully pipelined). Governs how many reservation-table slots it holds.
-static unsigned resourceCycles(Operation *op) {
-  using mlir::allo::sched::kResourceCyclesAttr;
-  if (auto a = op->getAttrOfType<IntegerAttr>(kResourceCyclesAttr))
-    return static_cast<unsigned>(a.getInt());
-  return 1;
-}
 
 /// A dependence circuit that binds the initiation interval: the ops around it,
 /// plus the sums the II bound is read off. `latency` counts each edge's source
@@ -235,6 +224,24 @@ protected:
   void moveBy(unsigned startTimeVariable, unsigned amount);
   unsigned getStartTime(unsigned startTimeVariable);
 
+  /// A restorable copy of the linear program's mutable state. A transform that
+  /// moves several variables and only then re-solves cannot be undone by
+  /// inverting the moves: a failed `solveTableau` leaves them applied on a
+  /// primal-infeasible tableau, and re-solving to get back is exactly what just
+  /// failed. Attempting such a transform speculatively therefore means keeping
+  /// a copy. Holds everything a pivot, a `translate` or a `moveBy` touches;
+  /// `implicitBasicVariableColumnVector` is pivot scratch and the tableau's
+  /// dimensions never change, so neither is saved.
+  struct LPState {
+    SmallVector<SmallVector<int>> tableau;
+    SmallVector<unsigned> nonBasicVariables, basicVariables;
+    SmallVector<int> startTimeLocations;
+    DenseMap<unsigned, unsigned> frozenVariables;
+    int parameterS, parameterT;
+  };
+  LPState saveLP();
+  void restoreLP(LPState &saved);
+
   void dumpTableau();
 
 public:
@@ -281,24 +288,23 @@ public:
   LogicalResult schedule() override;
 };
 
-// This class solves acyclic, resource-constrained `SharedOperatorsProblem` with
-// a simplified version of the iterative heuristic presented in [2].
+// This class solves acyclic, resource-constrained `OccupancyProblem` with a
+// simplified version of the iterative heuristic presented in [2].
 class SharedOperatorsSimplexScheduler : public SimplexSchedulerBase {
 private:
-  SharedOperatorsProblem &prob;
+  OccupancyProblem &prob;
 
 protected:
   Problem &getProblem() override { return prob; }
 
 public:
-  SharedOperatorsSimplexScheduler(SharedOperatorsProblem &prob,
-                                  Operation *lastOp)
+  SharedOperatorsSimplexScheduler(OccupancyProblem &prob, Operation *lastOp)
       : SimplexSchedulerBase(lastOp), prob(prob) {}
   LogicalResult schedule() override;
 };
 
-// This class solves the `ModuloProblem` using the iterative heuristic presented
-// in [2].
+// This class solves the `ModuloOccupancyProblem` using the iterative heuristic
+// presented in [2].
 class ModuloSimplexScheduler : public CyclicSimplexScheduler {
 private:
   struct MRT {
@@ -321,7 +327,7 @@ private:
     }
   };
 
-  ModuloProblem &prob;
+  ModuloOccupancyProblem &prob;
   SmallVector<unsigned> asapTimes, alapTimes;
   SmallVector<Operation *> unscheduled, scheduled;
   MRT mrt;
@@ -336,6 +342,17 @@ private:
   // Sum of occupancies over limited ops; the conservative II-growth path
   // must converge within this bound (all ops fit in disjoint windows by then).
   unsigned totalResourceCycles = 0;
+  // The largest II any bound justifies before resources are placed: the
+  // resource-min II, a loop-carried recurrence, and the pipeline directive's
+  // floor, whichever is largest. The greedy placement can only grow the II
+  // beyond it, so `parameterT - lowerBoundII` is what the heuristic cost.
+  unsigned lowerBoundII = 1;
+  // Whether the resource-free solve that settles `lowerBoundII` got that far.
+  bool boundSettled = false;
+  // Whether a caller is going to place this region itself if the greedy cannot
+  // (see `SimplexWarmStart`). It changes only what a placement failure is
+  // reported AS, never what the placement does.
+  bool placementAdvisory = false;
 
 protected:
   Problem &getProblem() override { return prob; }
@@ -343,15 +360,23 @@ protected:
   enum { OBJ_LATENCY = 0, OBJ_AXAP /* i.e. either ASAP or ALAP */ };
   bool fillObjectiveRow(SmallVector<int> &row, unsigned obj) override;
   void updateMargins();
-  void scheduleOperation(Operation *n);
+  LogicalResult scheduleOperation(Operation *n);
+  LogicalResult growIIByDeDinechin(Operation *n);
+  LogicalResult growIIUniformly(Operation *n);
   unsigned computeResMinII();
 
 public:
-  ModuloSimplexScheduler(ModuloProblem &prob, Operation *lastOp,
+  ModuloSimplexScheduler(ModuloOccupancyProblem &prob, Operation *lastOp,
                          unsigned minII = 1)
       : CyclicSimplexScheduler(prob, lastOp), prob(prob), mrt(*this),
         minII(minII) {}
   LogicalResult schedule() override;
+  /// See `lowerBoundII`. Settled before placement, so it is meaningful even
+  /// after `schedule` fails, but only once `hasLowerBound` holds: a
+  /// resource-free solve that itself failed never got as far as settling it.
+  unsigned getLowerBoundII() const { return lowerBoundII; }
+  bool hasLowerBound() const { return boundSettled; }
+  void setPlacementAdvisory() { placementAdvisory = true; }
 };
 
 // This class solves the `ChainingProblem` by relying on pre-computed
@@ -857,7 +882,7 @@ void SimplexSchedulerBase::pivot(unsigned pivotRow, unsigned pivotColumn) {
 }
 
 LogicalResult SimplexSchedulerBase::solveTableau() {
-  // "Solving" technically means perfoming dual pivot steps until primal
+  // "Solving" technically means performing dual pivot steps until primal
   // feasibility is reached, i.e. the parametric constants in all constraint
   // rows are non-negative.
   while (auto pivotRow = findDualPivotRow()) {
@@ -935,7 +960,6 @@ unsigned SimplexSchedulerBase::freeze(unsigned startTimeVariable,
   assert(startTimeVariable < startTimeLocations.size());
   assert(!frozenVariables.count(startTimeVariable));
 
-  // Mark variable.
   frozenVariables[startTimeVariable] = timeStep;
 
   if (!isInBasis(startTimeVariable))
@@ -1009,7 +1033,6 @@ void SimplexSchedulerBase::moveBy(unsigned startTimeVariable, unsigned amount) {
   assert(startTimeVariable < startTimeLocations.size());
   assert(frozenVariables.count(startTimeVariable));
 
-  // Bookkeeping.
   frozenVariables[startTimeVariable] += amount;
 
   // Moving an already frozen variable means translating it by the desired
@@ -1022,6 +1045,22 @@ void SimplexSchedulerBase::moveBy(unsigned startTimeVariable, unsigned amount) {
   // solving to the caller.
 }
 
+SimplexSchedulerBase::LPState SimplexSchedulerBase::saveLP() {
+  return {
+      tableau,         nonBasicVariables, basicVariables, startTimeLocations,
+      frozenVariables, parameterS,        parameterT};
+}
+
+void SimplexSchedulerBase::restoreLP(LPState &saved) {
+  tableau = std::move(saved.tableau);
+  nonBasicVariables = std::move(saved.nonBasicVariables);
+  basicVariables = std::move(saved.basicVariables);
+  startTimeLocations = std::move(saved.startTimeLocations);
+  frozenVariables = std::move(saved.frozenVariables);
+  parameterS = saved.parameterS;
+  parameterT = saved.parameterT;
+}
+
 unsigned SimplexSchedulerBase::getStartTime(unsigned startTimeVariable) {
   assert(startTimeVariable < startTimeLocations.size());
 
@@ -1030,8 +1069,7 @@ unsigned SimplexSchedulerBase::getStartTime(unsigned startTimeVariable) {
     // are 0 at the end of the simplex algorithm.
     return frozenVariables.lookup(startTimeVariable);
 
-  // For the variables currently in basis, we look up the solution in the
-  // tableau.
+  // For a variable in basis, look up the solution in the tableau.
   return getParametricConstant(-startTimeLocations[startTimeVariable]);
 }
 
@@ -1149,6 +1187,22 @@ static bool isLimited(Operation *op, SharedOperatorsProblem &prob) {
   });
 }
 
+/// The limited units \p op holds, in link order. An operation may hold several
+/// at once (a memory port and a shared functional unit, say), and it takes them
+/// all at its start time and releases them together, so a cycle is feasible for
+/// it only if every one of them has room. An unlimited link is dropped here:
+/// it constrains nothing, so no reservation table tracks it.
+static SmallVector<Problem::ResourceType>
+limitedUnits(SharedOperatorsProblem &prob, Operation *op) {
+  auto maybeRsrcs = prob.getLinkedResourceTypes(op);
+  assert(maybeRsrcs && "operation must have linked resource types");
+  SmallVector<Problem::ResourceType> units;
+  for (Problem::ResourceType rsrc : *maybeRsrcs)
+    if (prob.getLimit(rsrc).value_or(0) > 0)
+      units.push_back(rsrc);
+  return units;
+}
+
 LogicalResult SharedOperatorsSimplexScheduler::schedule() {
   if (failed(checkLastOp()))
     return failure();
@@ -1192,28 +1246,22 @@ LogicalResult SharedOperatorsSimplexScheduler::schedule() {
       reservationTable;
 
   for (auto *op : limitedOps) {
-    auto maybeRsrcs = prob.getLinkedResourceTypes(op);
-    assert(maybeRsrcs && "Limited operation must have linked resource types");
+    SmallVector<Problem::ResourceType> units = limitedUnits(prob, op);
+    assert(!units.empty() && "a limited operation holds a limited unit");
 
-    auto &rsrcs = *maybeRsrcs;
-    assert(rsrcs.size() == 1 &&
-           "an operation is linked to several resource types; ProblemBuilder "
-           "links exactly one, and the scheduler indexes by that one");
-
-    auto rsrc = rsrcs[0];
-    unsigned limit = prob.getLimit(rsrc).value_or(0);
-    assert(limit > 0);
-
-    // Find the first time step (from the current start time) where an
-    // operator instance is free for the whole occupancy window (occ
-    // consecutive cycles; occ == 1 when pipelined).
-    unsigned occ = resourceCycles(op);
+    // Find the first time step (from the current start time) where every unit
+    // the op holds is free for its whole occupancy window (occ consecutive
+    // cycles; occ == 1 when pipelined).
+    unsigned occ = prob.getResourceCycles(op);
     unsigned startTimeVar = startTimeVariables[op];
     unsigned candTime = getStartTime(startTimeVar);
     auto hasRoom = [&](unsigned t) {
-      for (unsigned i = 0; i < occ; ++i)
-        if (reservationTable[rsrc].lookup(t + i) == limit)
-          return false;
+      for (Problem::ResourceType rsrc : units) {
+        unsigned limit = *prob.getLimit(rsrc);
+        for (unsigned i = 0; i < occ; ++i)
+          if (reservationTable[rsrc].lookup(t + i) >= limit)
+            return false;
+      }
       return true;
     };
     while (!hasRoom(candTime))
@@ -1225,9 +1273,10 @@ LogicalResult SharedOperatorsSimplexScheduler::schedule() {
     assert(succeeded(fixed));
     (void)fixed;
 
-    // Record the operator use across the occupancy window.
-    for (unsigned i = 0; i < occ; ++i)
-      ++reservationTable[rsrc][candTime + i];
+    // Record the use of every unit across the occupancy window.
+    for (Problem::ResourceType rsrc : units)
+      for (unsigned i = 0; i < occ; ++i)
+        ++reservationTable[rsrc][candTime + i];
 
     LLVM_DEBUG(dbgs() << "After scheduling " << startTimeVar
                       << " to t=" << candTime << ":\n";
@@ -1282,62 +1331,59 @@ LogicalResult ModuloSimplexScheduler::checkLastOp() {
 
 LogicalResult ModuloSimplexScheduler::MRT::enter(Operation *op,
                                                  unsigned timeStep) {
-  auto maybeRsrcs = sched.prob.getLinkedResourceTypes(op);
-  assert(maybeRsrcs && "Operation must have linked resource types");
+  SmallVector<Problem::ResourceType> units = limitedUnits(sched.prob, op);
+  assert(!units.empty() && "a limited operation holds a limited unit");
 
-  auto &rsrcs = *maybeRsrcs;
-  assert(rsrcs.size() == 1 &&
-         "an operation is linked to several resource types; ProblemBuilder "
-         "links exactly one, and the scheduler indexes by that one");
-
-  auto rsrc = rsrcs[0];
-  auto lim = *sched.prob.getLimit(rsrc);
-  assert(lim > 0);
-
-  auto &revTab = reverseTables[rsrc];
-  assert(!revTab.count(op));
-
-  // A non-pipelined op occupies `occ` consecutive modulo slots (occ == 1
-  // when pipelined); a window wider than II wraps, hitting one slot twice,
-  // which a per-slot set would hide. Admit only if every touched slot fits.
-  unsigned occ = resourceCycles(op);
+  // A non-pipelined op occupies `occ` consecutive modulo slots; a window wider
+  // than II wraps, hitting one slot twice, which a per-slot set would hide. The
+  // window is the same on every unit, all taken at the op's start time.
+  unsigned occ = sched.prob.getResourceCycles(op);
   unsigned base = timeStep % sched.parameterT;
-  auto &table = tables[rsrc];
   SmallDenseMap<unsigned, unsigned> want;
   for (unsigned i = 0; i < occ; ++i)
     ++want[(base + i) % sched.parameterT];
-  for (const auto &[slot, cnt] : want)
-    if (table.lookup(slot) + cnt > lim)
-      return failure();
-  for (const auto &[slot, cnt] : want)
-    table[slot] += cnt;
-  revTab[op] = base;
+
+  // Admit only if every touched slot of every unit fits, then commit to all of
+  // them: an op that fits in one unit but not another must leave no partial
+  // reservation behind.
+  for (Problem::ResourceType rsrc : units) {
+    auto &table = tables[rsrc];
+    for (const auto &[slot, cnt] : want)
+      if (table.lookup(slot) + cnt > *sched.prob.getLimit(rsrc))
+        return failure();
+  }
+  for (Problem::ResourceType rsrc : units) {
+    auto &table = tables[rsrc];
+    for (const auto &[slot, cnt] : want)
+      table[slot] += cnt;
+    auto &revTab = reverseTables[rsrc];
+    assert(!revTab.count(op));
+    revTab[op] = base;
+  }
   return success();
 }
 
 void ModuloSimplexScheduler::MRT::release(Operation *op) {
-  auto maybeRsrcs = sched.prob.getLinkedResourceTypes(op);
-  assert(maybeRsrcs && "Operation must have linked resource types");
-
-  auto &rsrcs = *maybeRsrcs;
-  assert(rsrcs.size() == 1 &&
-         "an operation is linked to several resource types; ProblemBuilder "
-         "links exactly one, and the scheduler indexes by that one");
-
-  auto rsrc = rsrcs[0];
-  auto &revTab = reverseTables[rsrc];
-  auto it = revTab.find(op);
-  assert(it != revTab.end());
-  unsigned occ = resourceCycles(op);
-  auto &table = tables[rsrc];
-  // Undo enter's per-slot increments (recomputed from stored base + occ, so a
-  // wrapped slot is decremented once per lap, symmetric with `want` above).
-  for (unsigned i = 0; i < occ; ++i) {
-    unsigned &cnt = table[(it->second + i) % sched.parameterT];
-    assert(cnt > 0 && "releasing an MRT slot that was never reserved");
-    --cnt;
+  unsigned occ = sched.prob.getResourceCycles(op);
+  // Undo enter's per-slot increments on every unit it reserved, recomputed from
+  // the stored base + occ so a wrapped slot is decremented once per lap. The
+  // reverse tables record exactly the units entered, unlimited links skipped.
+  bool held = false;
+  for (auto &[rsrc, revTab] : reverseTables) {
+    auto it = revTab.find(op);
+    if (it == revTab.end())
+      continue;
+    auto &table = tables[rsrc];
+    for (unsigned i = 0; i < occ; ++i) {
+      unsigned &cnt = table[(it->second + i) % sched.parameterT];
+      assert(cnt > 0 && "releasing an MRT slot that was never reserved");
+      --cnt;
+    }
+    revTab.erase(it);
+    held = true;
   }
-  revTab.erase(it);
+  assert(held && "releasing an operation that holds no unit");
+  (void)held;
 }
 
 bool ModuloSimplexScheduler::fillObjectiveRow(SmallVector<int> &row,
@@ -1375,11 +1421,17 @@ void ModuloSimplexScheduler::updateMargins() {
   }
 }
 
-void ModuloSimplexScheduler::scheduleOperation(Operation *n) {
-  // `n` contends for a single physical resource (its memref port or unit
-  // pool); the reservation table arbitrates that resource, not the operator
-  // type. Every op reaching here is limited, so it has exactly one.
-  auto rsrcN = (*prob.getLinkedResourceTypes(n))[0];
+/// Tries `n` at its current time step and the II-1 slots after it, then grows
+/// the II if none admit it (`growIIByDeDinechin` first, `growIIUniformly` as
+/// fallback). The de Dinechin move is tried first since it grows the schedule
+/// less, but only SPECULATIVELY: it assumes fully-pipelined reservations
+/// (`hasBlockingOps` bypasses it) and that the partial schedule absorbs its
+/// moves, neither of which is checked ahead of time. Upstream asserts on
+/// failure instead; here a failed re-solve is a statement about the solver's
+/// behavior under this heuristic, not an invariant of the datapath model, and
+/// asserting under NDEBUG would let an inconsistent tableau silently produce a
+/// wrong schedule.
+LogicalResult ModuloSimplexScheduler::scheduleOperation(Operation *n) {
   unsigned stvN = startTimeVariables[n];
 
   // Try the op's current time step in the partial solution and the II-1
@@ -1396,7 +1448,7 @@ void ModuloSimplexScheduler::scheduleOperation(Operation *n) {
       auto fixedN = scheduleAt(stvN, ct);
       if (succeeded(fixedN)) {
         LLVM_DEBUG(dbgs() << "Success at t=" << ct << " " << *n << '\n');
-        return;
+        return success();
       }
       // Problem became infeasible with `n` at `ct`, roll back the MRT
       // assignment. Also, no later time can be feasible, so stop the search
@@ -1405,53 +1457,105 @@ void ModuloSimplexScheduler::scheduleOperation(Operation *n) {
       break;
     }
 
-  // Non-pipelined ops reserve multiple slots, which the single-slot move
-  // logic can't handle. Instead grow II via the base transform (each op
-  // keeps its valid modulo slot), rebuild the MRT, and retry until `n` fits.
-  if (hasBlockingOps) {
-    while (true) {
-      SmallVector<std::pair<unsigned, unsigned>> phis;
-      for (Operation *j : scheduled) {
-        unsigned stvJ = startTimeVariables[j];
-        phis.push_back({stvJ, getStartTime(stvJ) / parameterT});
-      }
-      for (auto [stvJ, phiJ] : phis)
-        moveBy(stvJ, phiJ);
-      info(Stage::Sched, n)
-          << "II=" << parameterT
-          << " is not achievable: a non-pipelined operator ("
-          << n->getName().getStringRef()
-          << ") cannot fit its occupancy window, trying II=" << parameterT + 1;
-      ++parameterT;
-      // Every op fits in a disjoint occupancy window by II =
-      // totalResourceCycles; 2x + 2 leaves slack for consecutive-window
-      // fragmentation.
-      assert(parameterT <= 2 * static_cast<int>(totalResourceCycles) + 2 &&
-             "non-pipelined II growth did not converge");
-      auto solved = solveTableau();
-      assert(succeeded(solved));
-      (void)solved;
-
-      mrt.clear();
-      for (Operation *j : scheduled) {
-        auto entered = mrt.enter(j, getStartTime(startTimeVariables[j]));
-        assert(succeeded(entered) && "re-entry after II growth must succeed");
-        (void)entered;
-      }
-
-      unsigned lo = getStartTime(stvN);
-      for (unsigned ct = lo; ct <= lo + parameterT - 1; ++ct)
-        if (succeeded(mrt.enter(n, ct))) {
-          if (succeeded(scheduleAt(stvN, ct)))
-            return;
-          mrt.release(n);
-        }
-    }
+  // `n` does not fit at this II, so the II has to grow (see the doc comment
+  // above for why the targeted move is tried first and why it can fail).
+  if (!hasBlockingOps) {
+    LPState savedLP = saveLP();
+    auto savedTables = mrt.tables;
+    auto savedReverseTables = mrt.reverseTables;
+    if (succeeded(growIIByDeDinechin(n)))
+      return success();
+    restoreLP(savedLP);
+    mrt.tables = std::move(savedTables);
+    mrt.reverseTables = std::move(savedReverseTables);
+    info(Stage::Sched, n) << "The targeted II increment did not carry the "
+                             "partial schedule over; growing the II uniformly "
+                             "instead, which may cost more than one cycle";
   }
+  return growIIUniformly(n);
+}
 
-  // As a last resort, increase II to make room for the op. De Dinechin's
-  // Theorem 1 lays out conditions/guidelines to transform the current partial
-  // schedule for II to a valid one for a larger II'.
+// Grow the II without assuming anything about the partial schedule: every
+// scheduled op is shifted by its own `phi`, which keeps it in its modulo slot
+// once the II is one larger, then the reservation table is rebuilt and `n` is
+// retried. This is both the path for non-pipelined ops (whose multi-slot
+// reservations the targeted move cannot express) and the fallback when the
+// targeted move fails.
+LogicalResult ModuloSimplexScheduler::growIIUniformly(Operation *n) {
+  unsigned stvN = startTimeVariables[n];
+  // One line for the whole search rather than one per attempt: a non-converging
+  // search runs to the bound below, and the II it settles at is reported by the
+  // caller either way.
+  info(Stage::Sched, n) << "II=" << parameterT << " is not achievable for "
+                        << n->getName().getStringRef()
+                        << ", growing the II uniformly until it fits";
+  // Where the compile stops on the default path, and only advice when an exact
+  // solver is going to place the region itself.
+  auto placementFailed = [&](Operation *at) {
+    return placementAdvisory ? warn(Stage::Sched, at)
+                             : unsupported(Stage::Sched, at);
+  };
+  while (true) {
+    SmallVector<std::pair<unsigned, unsigned>> phis;
+    for (Operation *j : scheduled) {
+      unsigned stvJ = startTimeVariables[j];
+      phis.push_back({stvJ, getStartTime(stvJ) / parameterT});
+    }
+    for (auto [stvJ, phiJ] : phis)
+      moveBy(stvJ, phiJ);
+    ++parameterT;
+    // Every op fits in a disjoint window by II=totalResourceCycles; 2x+2
+    // leaves slack for cross-window fragmentation. Past that, growth is not
+    // converging: a scheduler limit, not a fact about the kernel.
+    if (parameterT > 2 * static_cast<int>(totalResourceCycles) + 2 ||
+        failed(solveTableau())) {
+      auto d = placementFailed(n);
+      d << "The modulo scheduler could not place "
+        << n->getName().getStringRef()
+        << ": resource placement is greedy, and the operations it already "
+           "pinned leave this one no feasible cycle, which growing the "
+           "initiation interval (tried up to II="
+        << parameterT << ") does not undo";
+      if (placementAdvisory)
+        d << "; the exact scheduler places the region instead";
+      else
+        d << ". Partitioning the array it contends for, or reducing how many "
+             "times one iteration accesses that array, gives the placement "
+             "room";
+      return failure();
+    }
+
+    mrt.clear();
+    for (Operation *j : scheduled)
+      if (failed(mrt.enter(j, getStartTime(startTimeVariables[j])))) {
+        placementFailed(n)
+            << "The modulo scheduler could not rebuild its reservation table "
+               "after growing the initiation interval to II="
+            << parameterT;
+        return failure();
+      }
+
+    unsigned lo = getStartTime(stvN);
+    for (unsigned ct = lo; ct <= lo + parameterT - 1; ++ct)
+      if (succeeded(mrt.enter(n, ct))) {
+        if (succeeded(scheduleAt(stvN, ct)))
+          return success();
+        mrt.release(n);
+      }
+  }
+}
+
+// De Dinechin's Theorem 1: move the ops that precede `n` on its own resource
+// one modulo slot right, grow the II by one, and place `n` in the slot they
+// vacate. Fails, leaving the caller to roll back, when the partial schedule
+// does not survive the moves.
+LogicalResult ModuloSimplexScheduler::growIIByDeDinechin(Operation *n) {
+  // `n` contends for the physical units it holds (a memref port, a unit pool);
+  // the reservation table arbitrates those, not the operator type. Every op
+  // reaching here is limited, so it holds at least one.
+  SmallVector<Problem::ResourceType> unitsN = limitedUnits(prob, n);
+  unsigned stvN = startTimeVariables[n];
+  unsigned stN = getStartTime(stvN);
 
   info(Stage::Sched, n) << "II=" << parameterT
                         << " is not achievable: a shared-resource conflict for "
@@ -1474,15 +1578,17 @@ void ModuloSimplexScheduler::scheduleOperation(Operation *n) {
   // We're going to revisit the current partial schedule.
   SmallVector<Operation *> moved;
   for (Operation *j : scheduled) {
-    auto rsrcJ = (*prob.getLinkedResourceTypes(j))[0];
     unsigned stvJ = startTimeVariables[j];
     unsigned stJ = getStartTime(stvJ);
     unsigned phiJ = stJ / parameterT;
     unsigned tauJ = stJ % parameterT;
     unsigned deltaJ = 0;
 
-    if (rsrcN == rsrcJ) {
-      // Resolve conflicts by moving ops contending for `n`'s *same resource*
+    // `j` stands in `n`'s way only where they hold a unit in common.
+    if (llvm::any_of(limitedUnits(prob, j), [&](Problem::ResourceType rsrc) {
+          return llvm::is_contained(unitsN, rsrc);
+        })) {
+      // Resolve conflicts by moving ops contending for a unit `n` also needs
       // (e.g. a load/store pair shares a memref port despite distinct
       // operator types) that are "preceded" (de Dinechin's ≺ relation) right.
       if (tauN < tauJ || (tauN == tauJ && phiN > phiJ) ||
@@ -1504,25 +1610,21 @@ void ModuloSimplexScheduler::scheduleOperation(Operation *n) {
 
   // Finally, increment the II and solve to apply the moves.
   ++parameterT;
-  auto solved = solveTableau();
-  assert(succeeded(solved));
-  (void)solved;
+  if (failed(solveTableau()))
+    return failure();
 
   // Re-enter moved operations into their new slots.
   for (auto *m : moved)
     mrt.release(m);
-  for (auto *m : moved) {
-    auto enteredM = mrt.enter(m, getStartTime(startTimeVariables[m]));
-    assert(succeeded(enteredM));
-    (void)enteredM;
-  }
+  for (auto *m : moved)
+    if (failed(mrt.enter(m, getStartTime(startTimeVariables[m]))))
+      return failure();
 
   // Finally, schedule the operation. Again, adding `phiN` accounts for the
   // implicit shift caused by incrementing the II.
-  auto fixedN = scheduleAt(stvN, stN + phiN + deltaN);
-  auto enteredN = mrt.enter(n, tauN + deltaN);
-  assert(succeeded(fixedN) && succeeded(enteredN));
-  (void)fixedN, (void)enteredN;
+  if (failed(scheduleAt(stvN, stN + phiN + deltaN)))
+    return failure();
+  return mrt.enter(n, tauN + deltaN);
 }
 
 unsigned ModuloSimplexScheduler::computeResMinII() {
@@ -1535,7 +1637,8 @@ unsigned ModuloSimplexScheduler::computeResMinII() {
 
     for (auto rsrc : *maybeRsrcs) {
       if (prob.getLimit(rsrc).value_or(0) > 0)
-        uses[rsrc] += resourceCycles(op); // occupancy: latency if non-pipelined
+        // occupancy: the whole window a non-pipelined unit is held for
+        uses[rsrc] += prob.getResourceCycles(op);
     }
   }
 
@@ -1550,6 +1653,14 @@ unsigned ModuloSimplexScheduler::computeResMinII() {
   return resMinII;
 }
 
+/// Seeds the II at the larger of the resource-min II and the pipeline
+/// directive's floor, then iteratively fixes limited operations to time steps
+/// in earliest-first, least-slack-breaks-ties order. That order matters:
+/// pinning a consumer caps how late its operands may issue, and once a
+/// resource saturates at this II there is no cycle left for the last of them.
+/// Ordering by slack alone gets this backwards, since a sink is exactly what
+/// has none, costing a whole cycle of II on a loop whose accesses fill their
+/// ports exactly (`test_exact_scheduler.py`'s ten- and eight-read reductions).
 LogicalResult ModuloSimplexScheduler::schedule() {
   if (failed(checkLastOp()))
     return failure();
@@ -1576,6 +1687,11 @@ LogicalResult ModuloSimplexScheduler::schedule() {
     reportInfeasible();
     return failure();
   }
+  // The resource-free solve already raises the II to any loop-carried
+  // recurrence's minimum, so `parameterT` here is the best lower bound
+  // anything downstream can justify; everything past this point only grows it.
+  lowerBoundII = parameterT;
+  boundSettled = true;
 
   // Determine which operations are subject to resource constraints, and whether
   // any of them is non-pipelined (occupies its unit for more than one cycle).
@@ -1583,34 +1699,45 @@ LogicalResult ModuloSimplexScheduler::schedule() {
   for (auto *op : ops)
     if (isLimited(op, prob)) {
       unscheduled.push_back(op);
-      unsigned occ = resourceCycles(op);
+      unsigned occ = prob.getResourceCycles(op);
       totalResourceCycles += occ;
       if (occ > 1)
         hasBlockingOps = true;
     }
 
-  // Main loop: Iteratively fix limited operations to time steps.
+  // Main loop: iteratively fix limited operations to time steps.
   while (!unscheduled.empty()) {
-    // Update ASAP/ALAP times.
+    // ASAP/ALAP margins, refreshed against the operations pinned so far.
     updateMargins();
 
-    // Heuristically (here: least amount of slack) pick the next operation to
-    // schedule.
-    auto *opIt =
-        std::min_element(unscheduled.begin(), unscheduled.end(),
-                         [&](Operation *opA, Operation *opB) {
-                           auto stvA = startTimeVariables[opA];
-                           auto stvB = startTimeVariables[opB];
-                           auto slackA = alapTimes[stvA] - asapTimes[stvA];
-                           auto slackB = alapTimes[stvB] - asapTimes[stvB];
-                           return slackA < slackB;
-                         });
+    // Earliest-first, least slack breaking the tie (see the doc comment above
+    // for why this order, not slack alone, is what keeps the II tight).
+    auto priority = [&](Operation *op) {
+      unsigned stv = startTimeVariables[op];
+      return std::make_pair(asapTimes[stv], alapTimes[stv] - asapTimes[stv]);
+    };
+    auto *opIt = std::min_element(unscheduled.begin(), unscheduled.end(),
+                                  [&](Operation *opA, Operation *opB) {
+                                    return priority(opA) < priority(opB);
+                                  });
     Operation *op = *opIt;
     unscheduled.erase(opIt);
 
-    scheduleOperation(op);
+    if (failed(scheduleOperation(op)))
+      return failure();
     scheduled.push_back(op);
   }
+
+  // Resource placement is greedy, so an II above the LP's bound may be the
+  // problem's real minimum or just what the heuristic cost; nothing here can
+  // tell the two apart, so say so rather than report the II as optimal.
+  if (parameterT > static_cast<int>(lowerBoundII))
+    warn(Stage::Sched, prob.getContainingOp())
+        << "Scheduled at II=" << parameterT
+        << " against a lower bound of II=" << lowerBoundII
+        << " (resource-min II=" << resMinII
+        << "): resource placement is a greedy heuristic, so this gap is not "
+           "known to be necessary";
 
   LLVM_DEBUG(dbgs() << "Final tableau:\n"; dumpTableau();
              dbgs() << "Solution found with II = " << parameterT
@@ -1722,8 +1849,56 @@ LogicalResult ChainingCyclicSimplexScheduler::schedule() {
 namespace mlir::allo {
 
 //===----------------------------------------------------------------------===//
+// OccupancyProblem / ModuloOccupancyProblem (declared in Scheduler.h): CIRCT's
+// resource problems with a per-operation occupancy window.
+//===----------------------------------------------------------------------===//
+
+LogicalResult OccupancyProblem::checkLatency(Operation *op) {
+  // Deliberately NOT SharedOperatorsProblem::checkLatency, which rejects a
+  // zero-latency operation on a limited resource. A combinational access holds
+  // its port for the cycle it issues in and contends like any other.
+  return Problem::checkLatency(op);
+}
+
+LogicalResult OccupancyProblem::verifyOccupancy(unsigned ii) {
+  for (ResourceType rsrc : getResourceTypes()) {
+    unsigned limit = getLimit(rsrc).value_or(0);
+    if (limit == 0)
+      continue;
+    // Cycle (or congruence class, when cyclic) -> instances in use there. A
+    // window wider than the II wraps and lands in one class more than once, so
+    // this counts uses rather than operations.
+    SmallDenseMap<unsigned, unsigned> used;
+    for (Operation *op : getOperations()) {
+      auto rsrcs = getLinkedResourceTypes(op);
+      if (!rsrcs || !llvm::is_contained(*rsrcs, rsrc))
+        continue;
+      unsigned start = *getStartTime(op);
+      for (unsigned k = 0, occ = getResourceCycles(op); k < occ; ++k)
+        ++used[ii ? (start + k) % ii : start + k];
+    }
+    for (auto [slot, count] : used)
+      if (count > limit) {
+        assert(false && "a resource is oversubscribed across its occupancy "
+                        "windows; the reservation table admits an operation "
+                        "only when every slot it touches fits, so a solved "
+                        "schedule cannot reach this");
+        return failure();
+      }
+  }
+  return success();
+}
+
+LogicalResult ModuloOccupancyProblem::verify() {
+  if (failed(ModuloProblem::verify()))
+    return failure();
+  return verifyOccupancy(*getInitiationInterval());
+}
+
+//===----------------------------------------------------------------------===//
 // ChainingModuloProblem (declared in Scheduler.h): the composition of CIRCT's
-// ChainingProblem and ModuloProblem. Mirrors CIRCT's ChainingCyclicProblem.
+// ChainingProblem and ModuloOccupancyProblem. Mirrors CIRCT's
+// ChainingCyclicProblem.
 //===----------------------------------------------------------------------===//
 
 LogicalResult ChainingModuloProblem::checkDefUse(Dependence dep) {
@@ -1749,14 +1924,14 @@ LogicalResult ChainingModuloProblem::check() {
 
 LogicalResult ChainingModuloProblem::verify() {
   if (ChainingProblem::verify().succeeded() &&
-      ModuloProblem::verify().succeeded())
+      ModuloOccupancyProblem::verify().succeeded())
     return success();
   return failure();
 }
 
 //===----------------------------------------------------------------------===//
 // ChainingSharedOperatorsProblem (declared in Scheduler.h): the composition of
-// CIRCT's ChainingProblem and SharedOperatorsProblem. The acyclic twin of
+// CIRCT's ChainingProblem and OccupancyProblem. The acyclic twin of
 // ChainingModuloProblem (no distance, so no def-use distance check).
 //===----------------------------------------------------------------------===//
 
@@ -1769,7 +1944,8 @@ LogicalResult ChainingSharedOperatorsProblem::check() {
 
 LogicalResult ChainingSharedOperatorsProblem::verify() {
   if (ChainingProblem::verify().succeeded() &&
-      SharedOperatorsProblem::verify().succeeded())
+      SharedOperatorsProblem::verify().succeeded() &&
+      verifyOccupancy(/*ii=*/0).succeeded())
     return success();
   return failure();
 }
@@ -1788,12 +1964,12 @@ LogicalResult scheduleSimplex(CyclicProblem &prob, Operation *lastOp) {
   return simplex.schedule();
 }
 
-LogicalResult scheduleSimplex(SharedOperatorsProblem &prob, Operation *lastOp) {
+LogicalResult scheduleSimplex(OccupancyProblem &prob, Operation *lastOp) {
   SharedOperatorsSimplexScheduler simplex(prob, lastOp);
   return simplex.schedule();
 }
 
-LogicalResult scheduleSimplex(ModuloProblem &prob, Operation *lastOp) {
+LogicalResult scheduleSimplex(ModuloOccupancyProblem &prob, Operation *lastOp) {
   ModuloSimplexScheduler simplex(prob, lastOp);
   return simplex.schedule();
 }
@@ -1811,9 +1987,19 @@ LogicalResult scheduleSimplex(ChainingCyclicProblem &prob, Operation *lastOp,
 }
 
 LogicalResult scheduleSimplex(ChainingModuloProblem &prob, Operation *lastOp,
-                              float cycleTime, unsigned minII) {
+                              float cycleTime, unsigned minII,
+                              SimplexWarmStart *warm) {
   ChainingModuloSimplexScheduler simplex(prob, lastOp, cycleTime, minII);
-  return simplex.schedule();
+  if (warm)
+    simplex.setPlacementAdvisory();
+  LogicalResult scheduled = simplex.schedule();
+  if (!warm)
+    return scheduled;
+  warm->lowerBoundII = simplex.getLowerBoundII();
+  warm->placed = succeeded(scheduled);
+  // A placement failure is the caller's to recover from; a resource-free one
+  // means no II admits a schedule, and nothing downstream can repair that.
+  return success(simplex.hasLowerBound());
 }
 
 LogicalResult scheduleSimplex(ChainingSharedOperatorsProblem &prob,

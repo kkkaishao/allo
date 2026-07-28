@@ -3,37 +3,14 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-//===----------------------------------------------------------------------===//
-// The scheduler's reification step. It lowers the solved schedule, carried
-// transiently as `allo.sched.*` attributes, into `allo.dcp.*` ops, so the
-// post-schedule IR is closed over the dcp dialect: no affine/scf control flow
-// survives, and only `arith` constant/index glue stays as intended mixed-IR.
-//
-// `Reifier` walks a function's loop/region tree as ONE post-order recursion,
-// the structural twin of the scheduler's `scheduleBlock` / `scheduleRegion`
-// descent. `materializeBlock` shares the same `enumerateRegions` partitioner,
-// and a region is materialized only after its body, so deepest-first ordering
-// falls out for free. Every control construct becomes a dcp region:
-//   * counted `for`         -> `dcp.pipeline` (`dcp.uncondition` terminator)
-//   * `scf.while`           -> `dcp.pipeline` (`dcp.condition` terminator)
-//   * `affine.if` / `scf.if`-> `dcp.select`
-//   * straight-line span    -> `dcp.sequential`
-// `ii` present vs absent distinguishes pipelined (leaf / co-scheduled level /
-// flushing while) from sequential (imperfect wrapper / data-dependent while).
-// Registers, muxes and control are NOT ops; they are derived at hw lowering.
-//
-// `materializeModuleToDCP` is the callable `allo-schedule` runs last, at module
-// scope because `dcp.operator` declarations are module-level symbols; the
-// `allo-materialize-dcpath` pass is a thin standalone wrapper.
-//===----------------------------------------------------------------------===//
-
 #include "allo/Scheduling/MaterializeDCPath.h"
+#include "allo/Scheduling/MemoryAccess.h" // asMemAccess (the one address map)
+#include "allo/Scheduling/MemoryModel.h"  // kBankAttr
 #include "allo/Scheduling/OperatorLibrary.h"
 #include "allo/Scheduling/ProblemBuilder.h"
 #include "allo/Scheduling/RegionGraph.h"
 #include "allo/Scheduling/Utils.h"
 
-#include "allo/Conversion/Passes.h"
 #include "allo/IR/AlloOps.h"
 #include "allo/Support/Logging.h"
 
@@ -50,14 +27,7 @@
 #include "mlir/IR/SymbolTable.h"
 #include "mlir/Interfaces/LoopLikeInterface.h"
 #include "llvm/ADT/DenseMap.h"
-#include "llvm/ADT/StringMap.h"
-#include "llvm/Support/Error.h"
 #include "llvm/Support/MathExtras.h"
-
-namespace mlir::allo {
-#define GEN_PASS_DEF_CONVERTSCHEDULETODCPPASS
-#include "allo/Conversion/Passes.h.inc"
-} // namespace mlir::allo
 
 using namespace mlir;
 using namespace mlir::affine;
@@ -266,21 +236,26 @@ static void convertOp(Operation &op, OpBuilder &b, IRMapping &map,
   // A memory access's latency is the accessed memref's read/write latency
   // (from the device memory model), resolved here and carried on the dcp op.
   auto memLatency = [&]() -> uint64_t { return lib.lookup(&op).latency; };
+  // The bank `assign-banks` decided, moved off the discardable attribute onto
+  // the dcp op's own, so no later rewrite can drop the decision the schedule
+  // was already billed against. Absent means the access reaches every bank.
+  IntegerAttr bank = op.getAttrOfType<IntegerAttr>(kBankAttr);
+  // The address map of an array access, from `asMemAccess`, the one place that
+  // decides it: an affine op's own map, and for a non-affine one the identity
+  // map over its indices.
+  auto addrMap = [&]() { return asMemAccess(&op)->map; };
   if (auto l = dyn_cast<AffineLoadOp>(&op)) {
-    auto nw = DCPathLoadOp::create(b, loc, l.getType(), rm(l.getMemRef()),
-                                   remap(l.getMapOperands()), l.getAffineMap(),
-                                   (uint64_t)start, memLatency(), IntegerAttr(),
-                                   IntegerAttr());
+    auto nw = DCPathLoadOp::create(
+        b, loc, l.getType(), rm(l.getMemRef()), remap(l.getMapOperands()),
+        addrMap(), (uint64_t)start, memLatency(), bank, IntegerAttr());
     setZ(nw);
     map.map(l.getResult(), nw.getResult());
     return;
   }
   if (auto l = dyn_cast<memref::LoadOp>(&op)) {
-    AffineMap id = AffineMap::getMultiDimIdentityMap(l.getIndices().size(),
-                                                     b.getContext());
-    auto nw = DCPathLoadOp::create(b, loc, l.getType(), rm(l.getMemRef()),
-                                   remap(l.getIndices()), id, (uint64_t)start,
-                                   memLatency(), IntegerAttr(), IntegerAttr());
+    auto nw = DCPathLoadOp::create(
+        b, loc, l.getType(), rm(l.getMemRef()), remap(l.getIndices()),
+        addrMap(), (uint64_t)start, memLatency(), bank, IntegerAttr());
     setZ(nw);
     map.map(l.getResult(), nw.getResult());
     return;
@@ -288,18 +263,16 @@ static void convertOp(Operation &op, OpBuilder &b, IRMapping &map,
   if (auto s = dyn_cast<AffineStoreOp>(&op)) {
     auto nw = DCPathStoreOp::create(
         b, loc, rm(s.getValueToStore()), rm(s.getMemRef()),
-        remap(s.getMapOperands()), s.getAffineMap(), (uint64_t)start,
-        memLatency(), IntegerAttr(), IntegerAttr());
+        remap(s.getMapOperands()), addrMap(), (uint64_t)start, memLatency(),
+        bank, IntegerAttr());
     setZ(nw);
     return;
   }
   if (auto s = dyn_cast<memref::StoreOp>(&op)) {
-    AffineMap id = AffineMap::getMultiDimIdentityMap(s.getIndices().size(),
-                                                     b.getContext());
     auto nw = DCPathStoreOp::create(b, loc, rm(s.getValueToStore()),
                                     rm(s.getMemRef()), remap(s.getIndices()),
-                                    id, (uint64_t)start, memLatency(),
-                                    IntegerAttr(), IntegerAttr());
+                                    addrMap(), (uint64_t)start, memLatency(),
+                                    bank, IntegerAttr());
     setZ(nw);
     return;
   }
@@ -1243,35 +1216,20 @@ static void materializeFunc(func::FuncOp func, const OperatorLibrary &lib) {
   }
 }
 
-namespace mlir::allo {
+static void loadDependentDialects(MLIRContext &ctx) {
+  ctx.getOrLoadDialect<allo::AlloDialect>();
+  ctx.getOrLoadDialect<scf::SCFDialect>();
+  ctx.getOrLoadDialect<AffineDialect>();
+  ctx.getOrLoadDialect<arith::ArithDialect>();
+  ctx.getOrLoadDialect<func::FuncDialect>();
+  ctx.getOrLoadDialect<memref::MemRefDialect>();
+}
 
-void materializeModuleToDCP(ModuleOp module, const OperatorLibrary &lib) {
+void mlir::allo::runPostScheduleConversion(ModuleOp module) {
+  loadDependentDialects(*module->getContext());
+  auto lib = OperatorLibrary::fromModule(module);
   SmallVector<func::FuncOp> funcs(module.getOps<func::FuncOp>());
   for (func::FuncOp func : funcs)
     materializeFunc(func, lib);
-}
 
 } // namespace mlir::allo
-
-namespace {
-
-struct ConvertScheduleToDCPPass
-    : public allo::impl::ConvertScheduleToDCPPassBase<
-          ConvertScheduleToDCPPass> {
-  using Base::Base;
-
-  void getDependentDialects(DialectRegistry &registry) const override {
-    registry.insert<allo::AlloDialect, arith::ArithDialect, func::FuncDialect,
-                    affine::AffineDialect, memref::MemRefDialect>();
-  }
-
-  void runOnOperation() override {
-    ModuleOp module = getOperation();
-    // The library is rebuilt from the same injected `dcp.device` /
-    // `dcp.operator` IR the scheduler read, so reification references the
-    // identical operators.
-    allo::materializeModuleToDCP(module, OperatorLibrary::fromModule(module));
-  }
-};
-
-} // namespace

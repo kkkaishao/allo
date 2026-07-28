@@ -1,0 +1,643 @@
+/*
+ * Copyright Allo authors. All Rights Reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+#include "allo/Scheduling/AddressCost.h"
+
+#include "allo/Scheduling/MemoryAccess.h" // asMemAccess
+#include "allo/Scheduling/MemoryModel.h"  // linearizeAccessMap
+
+#include "mlir/Dialect/Affine/IR/AffineOps.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/Dialect/Utils/StaticValueUtils.h" // getConstantIntValue
+#include "mlir/IR/BuiltinTypes.h"
+#include "llvm/Support/MathExtras.h"
+
+#include <algorithm>
+#include <cmath>
+#include <cstdlib>
+
+using namespace mlir;
+using namespace mlir::allo;
+
+AddressDelays mlir::allo::addressDelaysOf(const OperatorLibrary &lib) {
+  AddressDelays d;
+  d.add = lib.combDelay(OpKind::Add);
+  d.mul = lib.combDelay(OpKind::Mul);
+  d.div = lib.combDelay(OpKind::Div);
+  return d;
+}
+
+// A carry chain's delay tracks its width, so a cone narrowed from the
+// characterization width scales with it. Wiring-only forms (a shift by a
+// constant, a mask, a constant term) never come through here: they cost no
+// logic at any width.
+static double scaled(double base, unsigned width) {
+  return base * width / AddressDelays::refWidth;
+}
+
+// Nonzero digits of the non-adjacent form of \p v: the fewest signed powers of
+// two that sum to it. This is how synthesis recodes a constant multiply, and it
+// beats a naive binary decomposition wherever a run of set bits appears (`x*15`
+// is `(x << 4) - x`, one adder, where the binary form needs three). Pricing the
+// binary form would overstate exactly the coefficients that recode best.
+static unsigned nafWeight(uint64_t v) {
+  unsigned w = 0;
+  while (v) {
+    if (v & 1) {
+      // Choose the digit's sign so the next digit is forced to zero.
+      v = (v & 2) ? v + 1 : v - 1;
+      ++w;
+    }
+    v >>= 1;
+  }
+  return w;
+}
+
+AddressCost mlir::allo::addressCost(AffineExpr e, const AddressDelays &delays,
+                                    unsigned width) {
+  // A leaf costs nothing. A constant is wiring, and a dim / symbol is an
+  // operand that arrives from elsewhere: a loop counter, or a value the
+  // scheduler already priced as compute.
+  if (isa<AffineConstantExpr, AffineDimExpr, AffineSymbolExpr>(e))
+    return {};
+
+  auto bin = cast<AffineBinaryOpExpr>(e);
+  auto konst = dyn_cast<AffineConstantExpr>(bin.getRHS());
+  // A divider is not a homomorphism modulo 2^width, so it and everything
+  // feeding it are carried at the full datapath width whatever the address
+  // needs; only its result may be truncated, and that is free.
+  bool isDiv = e.getKind() == AffineExprKind::FloorDiv ||
+               e.getKind() == AffineExprKind::CeilDiv ||
+               e.getKind() == AffineExprKind::Mod;
+  unsigned below = isDiv ? AddressDelays::refWidth : width;
+  // With one exception: `x mod 2^k` IS the low k bits, and `+`, `-` and
+  // constant `*` under it are congruent modulo 2^k too, so that subtree is
+  // carried at k bits however wide the cone is.
+  if (e.getKind() == AffineExprKind::Mod && konst && konst.getValue() > 1 &&
+      llvm::isPowerOf2_64(static_cast<uint64_t>(konst.getValue())))
+    below = std::min<unsigned>(
+        width, llvm::Log2_64(static_cast<uint64_t>(konst.getValue())));
+  AddressCost lhs = addressCost(bin.getLHS(), delays, below);
+  AddressCost rhs = addressCost(bin.getRHS(), delays, below);
+  AddressCost c;
+  c.adders = lhs.adders + rhs.adders;
+  c.multipliers = lhs.multipliers + rhs.multipliers;
+  c.dividers = lhs.dividers + rhs.dividers;
+  // Two operands converge here, so the path through this node is the LONGER of
+  // them plus this node's own delay. A sum of k terms is therefore an adder
+  // network of depth k-1, not k-1 delays added to one another.
+  double in = std::max(lhs.delay, rhs.delay);
+
+  switch (e.getKind()) {
+  case AffineExprKind::Add:
+    ++c.adders;
+    c.delay = in + scaled(delays.add, width);
+    return c;
+
+  case AffineExprKind::Mul: {
+    // A non-constant coefficient is a genuine multiplier. Unreachable from an
+    // affine.load's map, but a semi-affine map is representable, and an
+    // instrument that crashes on one is worse than one that prices it.
+    if (!konst) {
+      ++c.multipliers;
+      c.delay = in + scaled(delays.mul, width);
+      return c;
+    }
+    int64_t k = konst.getValue();
+    if (k == 0)
+      return {}; // the term vanishes
+    // Signed-digit shift-add: the shifts are wiring, so only the summing
+    // network costs. A lone digit is a bare wire, unless it is negative, which
+    // still needs the two's-complement subtract.
+    unsigned terms = nafWeight(static_cast<uint64_t>(std::abs(k)));
+    unsigned adds = std::max(terms - 1, k < 0 ? 1u : 0u);
+    c.adders += adds;
+    c.delay = in + (adds ? std::max(1u, llvm::Log2_64_Ceil(terms)) : 0u) *
+                       scaled(delays.add, width);
+    return c;
+  }
+
+  case AffineExprKind::FloorDiv:
+  case AffineExprKind::CeilDiv:
+  case AffineExprKind::Mod:
+    // A power-of-two divisor is a shift or a mask, which is wiring (`divConst`
+    // and `modConst` lower it that way). Anything else is a real divider,
+    // whatever the affine kind.
+    if (konst && konst.getValue() > 0 &&
+        llvm::isPowerOf2_64(static_cast<uint64_t>(konst.getValue()))) {
+      c.delay = in;
+      return c;
+    }
+    ++c.dividers;
+    c.delay = in + scaled(delays.div, AddressDelays::refWidth);
+    return c;
+
+  default:
+    break;
+  }
+  assert(false && "an affine leaf kind reached the binary-operator switch");
+  return c;
+}
+
+AddressCost mlir::allo::addressCost(AffineMap map, ArrayRef<int64_t> shape,
+                                    const AddressDelays &delays,
+                                    unsigned width) {
+  if (!map)
+    return {};
+  return addressCost(linearizeAccessMap(map, shape).getResult(0), delays,
+                     width);
+}
+
+// The operand \p e names, in the dims-then-symbols numbering, or nullopt when
+// it names none.
+static std::optional<unsigned> operandOf(AffineExpr e, unsigned numDims) {
+  if (auto d = dyn_cast<AffineDimExpr>(e))
+    return d.getPosition();
+  if (auto s = dyn_cast<AffineSymbolExpr>(e))
+    return numDims + s.getPosition();
+  return std::nullopt;
+}
+
+// Flatten \p e into `sum(coeff * term) + constant`, accumulating into \p out
+// and \p konst. Anything that is not a sum or a constant multiple is a term,
+// `floordiv` and `mod` included: they are opaque here, never descended into.
+static void sumTerms(AffineExpr e, int64_t scale,
+                     SmallVectorImpl<std::pair<AffineExpr, int64_t>> &out,
+                     int64_t &konst) {
+  if (auto c = dyn_cast<AffineConstantExpr>(e)) {
+    konst += scale * c.getValue();
+    return;
+  }
+  if (auto bin = dyn_cast<AffineBinaryOpExpr>(e)) {
+    if (bin.getKind() == AffineExprKind::Add) {
+      sumTerms(bin.getLHS(), scale, out, konst);
+      sumTerms(bin.getRHS(), scale, out, konst);
+      return;
+    }
+    if (auto k = dyn_cast<AffineConstantExpr>(bin.getRHS());
+        k && bin.getKind() == AffineExprKind::Mul) {
+      sumTerms(bin.getLHS(), scale * k.getValue(), out, konst);
+      return;
+    }
+  }
+  out.push_back({e, scale});
+}
+
+// \p e as `scale * operand + offset` over exactly ONE carried operand, which is
+// the argument a digit is taken of. The scale may be NEGATIVE: `A[N-1-i]` runs
+// its digits backwards, and a register counts down as cheaply as it counts up.
+static std::optional<SplitAddress::Term>
+asLinearCounter(AffineExpr e, unsigned numDims, CarriedFn carried) {
+  SmallVector<std::pair<AffineExpr, int64_t>> terms;
+  int64_t konst = 0;
+  sumTerms(e, 1, terms, konst);
+  if (terms.size() != 1 || !terms[0].second)
+    return std::nullopt;
+  std::optional<unsigned> p = operandOf(terms[0].first, numDims);
+  if (!p || !carried(*p))
+    return std::nullopt;
+  SplitAddress::Term t;
+  t.operand = *p;
+  t.coeff = 1;
+  t.scale = terms[0].second;
+  t.offset = konst;
+  return t;
+}
+
+static std::optional<SplitAddress::Term> asDigit(AffineExpr e, unsigned numDims,
+                                                 CarriedFn carried);
+
+// \p e as `digit + c`, where the digit is a QUOTIENT with no residue over it.
+// Adding to a quotient is adding `c * divisor` to its dividend, since
+// `(x floordiv D) + c` is `(x + c*D) floordiv D`, so the constant rides in the
+// digit's own offset and needs no second register. A digit that already carries
+// a residue cannot absorb one: adding after a wrap is not adding before it.
+static std::optional<SplitAddress::Term>
+asShiftedDigit(AffineExpr e, unsigned numDims, CarriedFn carried) {
+  SmallVector<std::pair<AffineExpr, int64_t>> terms;
+  int64_t konst = 0;
+  sumTerms(e, 1, terms, konst);
+  if (terms.size() != 1 || terms[0].second != 1)
+    return std::nullopt;
+  std::optional<SplitAddress::Term> t =
+      asDigit(terms[0].first, numDims, carried);
+  if (!t || t->modulus)
+    return std::nullopt;
+  t->offset += konst * t->divisor;
+  return t;
+}
+
+// \p e as one PERIODIC term, `(scale*operand + offset) floordiv divisor mod
+// modulus`, folding the nesting a delinearized nest arrives in:
+//
+//   `(x floordiv a) floordiv b`      is `x floordiv (a*b)`
+//   `((x floordiv a) mod m) floordiv b` is `(x floordiv (a*b)) mod (m/b)`, b |
+//   m
+//   `((x floordiv a) mod m) mod k`   is `(x floordiv a) mod k`, k | m
+//   `(x floordiv a) + c`             is `(x + c*a) floordiv a`
+//
+// so an arbitrarily deep chain comes out as one (divisor, modulus) pair and
+// costs one register. A step that could cross two multiples of the divisor in
+// one iteration is refused, since the register wraps by subtracting once; that
+// test lives here rather than in either caller so the price and the build agree
+// on which terms reduce.
+static std::optional<SplitAddress::Term> asDigit(AffineExpr e, unsigned numDims,
+                                                 CarriedFn carried) {
+  auto bin = dyn_cast<AffineBinaryOpExpr>(e);
+  if (!bin)
+    return std::nullopt;
+  bool isDiv = bin.getKind() == AffineExprKind::FloorDiv;
+  if (!isDiv && bin.getKind() != AffineExprKind::Mod)
+    return std::nullopt;
+  auto k = dyn_cast<AffineConstantExpr>(bin.getRHS());
+  if (!k || k.getValue() <= 0)
+    return std::nullopt;
+  int64_t v = k.getValue();
+  std::optional<SplitAddress::Term> t = asDigit(bin.getLHS(), numDims, carried);
+  if (!t)
+    t = asLinearCounter(bin.getLHS(), numDims, carried);
+  if (!t)
+    t = asShiftedDigit(bin.getLHS(), numDims, carried);
+  if (!t)
+    return std::nullopt;
+  if (t->modulus && t->modulus % v)
+    return std::nullopt; // neither identity above applies
+  if (isDiv) {
+    t->divisor *= v;
+    t->modulus /= v; // 0 stays 0: a quotient with no residue over it
+  } else {
+    t->modulus = v;
+  }
+  // The register wraps ONCE per advance, in whichever direction, so what is
+  // bounded is the magnitude: with a divisor the QUOTIENT must advance by at
+  // most one, so the divisor bounds it; with none, the modulus does.
+  int64_t bound = t->divisor > 1 ? t->divisor : t->modulus;
+  if (std::abs(t->scale * *carried(t->operand)) > bound)
+    return std::nullopt;
+  return t;
+}
+
+// Whether a register can carry any part of \p e: a carried operand reached
+// through sums and constant multiples alone, which are the two things a
+// constant per-iteration difference distributes over, or a DIGIT of one, whose
+// value advances by no constant but whose register is no more expensive for
+// that (`asDigit`).
+static bool reducible(AffineExpr e, unsigned numDims, CarriedFn carried) {
+  if (std::optional<unsigned> p = operandOf(e, numDims))
+    return carried(*p).has_value();
+  auto bin = dyn_cast<AffineBinaryOpExpr>(e);
+  if (!bin)
+    return false;
+  if (bin.getKind() == AffineExprKind::Add)
+    return reducible(bin.getLHS(), numDims, carried) ||
+           reducible(bin.getRHS(), numDims, carried);
+  if (bin.getKind() == AffineExprKind::Mul)
+    return isa<AffineConstantExpr>(bin.getRHS()) &&
+           reducible(bin.getLHS(), numDims, carried);
+  return asDigit(e, numDims, carried).has_value();
+}
+
+// Replace each maximal DIGIT inside \p e with a symbol standing for the
+// register that holds it, recording them in `out.reads`. Pre-order, so the
+// largest reducible subtree wins and nothing inside it is pulled out twice.
+//
+// This is what makes a cheap operator over an expensive digit cheap. Evaluated
+// whole, `(x mod 5) floordiv 2` is two real dividers; over a register it is a
+// shift over a wire. The same reaches the skew's `(x floordiv 8 + x mod 8) mod
+// 4`, which is no single register but is one adder and a mask over two.
+static AffineExpr substituteDigits(AffineExpr e, unsigned numDims,
+                                   unsigned numSymbols, CarriedFn carried,
+                                   SplitAddress &out) {
+  if (std::optional<SplitAddress::Term> d = asDigit(e, numDims, carried)) {
+    d->coeff = 1;
+    out.reads.push_back(*d);
+    return getAffineSymbolExpr(numSymbols + out.reads.size() - 1,
+                               e.getContext());
+  }
+  auto bin = dyn_cast<AffineBinaryOpExpr>(e);
+  if (!bin)
+    return e;
+  return getAffineBinaryOpExpr(
+      bin.getKind(),
+      substituteDigits(bin.getLHS(), numDims, numSymbols, carried, out),
+      substituteDigits(bin.getRHS(), numDims, numSymbols, carried, out));
+}
+
+// Accumulate `scale * e` into \p out. Descend only where something reduces, so
+// a subtree that reduces nothing keeps its own shape instead of being
+// distributed into a form that costs the same and reads differently.
+static void collectSplit(AffineExpr e, int64_t scale, unsigned numDims,
+                         unsigned numSymbols, CarriedFn carried,
+                         SplitAddress &out) {
+  auto toResidual = [&](AffineExpr sub) {
+    AffineExpr r =
+        substituteDigits(sub * scale, numDims, numSymbols, carried, out);
+    out.residual = out.residual ? out.residual + r : r;
+  };
+  if (auto c = dyn_cast<AffineConstantExpr>(e)) {
+    out.base += scale * c.getValue();
+    return;
+  }
+  if (!reducible(e, numDims, carried))
+    return toResidual(e);
+  if (std::optional<unsigned> p = operandOf(e, numDims)) {
+    out.terms.push_back({*p, scale});
+    return;
+  }
+  // A digit is a leaf, so there is nothing under it to distribute the scale
+  // into. A NEGATIVE multiple is READ instead of summed (costs a negate) to
+  // keep the divider off the path: the register can't hold a signed residue.
+  if (std::optional<SplitAddress::Term> d = asDigit(e, numDims, carried)) {
+    if (scale <= 0)
+      return toResidual(e);
+    d->coeff = scale;
+    out.terms.push_back(*d);
+    return;
+  }
+  auto bin = cast<AffineBinaryOpExpr>(e);
+  if (bin.getKind() == AffineExprKind::Add) {
+    collectSplit(bin.getLHS(), scale, numDims, numSymbols, carried, out);
+    collectSplit(bin.getRHS(), scale, numDims, numSymbols, carried, out);
+    return;
+  }
+  collectSplit(bin.getLHS(),
+               scale * cast<AffineConstantExpr>(bin.getRHS()).getValue(),
+               numDims, numSymbols, carried, out);
+}
+
+SplitAddress mlir::allo::splitAddress(AffineExpr e, unsigned numDims,
+                                      unsigned numSymbols, CarriedFn carried) {
+  SplitAddress addr;
+  if (e)
+    collectSplit(e, 1, numDims, numSymbols, carried, addr);
+  return addr;
+}
+
+// Mixed-radix digit extraction, rewritten to divide before it masks:
+// `(x mod (a*b)) floordiv b` and `(x floordiv b) mod a` are the same digit, and
+// the second is the one a bank decomposition wants, because `a` is a partition
+// factor and so usually a power of two, which turns the outer division into a
+// mask. The first form is what a coalesced nest hands the split, since its
+// subscript is already `iv mod extent`, so without this a block-partitioned
+// array under `loop-canonicalization` chains two real divisions.
+// `simplifyAffineExpr` knows neither direction.
+static AffineExpr divideBeforeMasking(AffineExpr e) {
+  auto bin = dyn_cast<AffineBinaryOpExpr>(e);
+  if (!bin)
+    return e;
+  e = getAffineBinaryOpExpr(bin.getKind(), divideBeforeMasking(bin.getLHS()),
+                            divideBeforeMasking(bin.getRHS()));
+  bin = dyn_cast<AffineBinaryOpExpr>(e);
+  if (!bin || bin.getKind() != AffineExprKind::FloorDiv)
+    return e;
+  auto inner = dyn_cast<AffineBinaryOpExpr>(bin.getLHS());
+  auto b = dyn_cast<AffineConstantExpr>(bin.getRHS());
+  if (!inner || inner.getKind() != AffineExprKind::Mod || !b ||
+      b.getValue() <= 0)
+    return e;
+  auto m = dyn_cast<AffineConstantExpr>(inner.getRHS());
+  if (!m || m.getValue() <= 0 || m.getValue() % b.getValue() != 0)
+    return e;
+  return inner.getLHS().floorDiv(b.getValue()) % (m.getValue() / b.getValue());
+}
+
+// A residue reads its operand's coefficients modulo the divisor:
+// `(a*x + c) mod k` is `((a mod k)*x + c) mod k`, so a term whose coefficient
+// is a multiple of `k` contributes nothing and is dropped outright.
+//
+// This is the one rewrite that has to exist here rather than upstream, because
+// what it undoes is not ours. Affine map composition (`canonicalize` folding an
+// `affine.apply` into a load, which is how a coalesced or normalized nest's
+// index reaches the map) flattens `x mod 2` into `x - (x floordiv 2)*2` BEFORE
+// this file sees anything, so every candidate starts from the flattened form
+// and no amount of re-simplifying recovers the mask. Under a skewed layout that
+// difference lands inside the bank digit, where the coefficients are multiples
+// of the factor and the whole term is worth nothing: a coalesced 8x8 skew reads
+// `(d0 floordiv 2 + d0*4 - (d0 floordiv 2)*8 + 1) mod 4`, four chained
+// operators, where `(d0 floordiv 2 + 1) mod 4` is one.
+static AffineExpr reduceModCoefficients(AffineExpr e) {
+  auto bin = dyn_cast<AffineBinaryOpExpr>(e);
+  if (!bin)
+    return e;
+  e = getAffineBinaryOpExpr(bin.getKind(), reduceModCoefficients(bin.getLHS()),
+                            reduceModCoefficients(bin.getRHS()));
+  bin = dyn_cast<AffineBinaryOpExpr>(e);
+  auto k = bin ? dyn_cast<AffineConstantExpr>(bin.getRHS()) : nullptr;
+  if (!bin || bin.getKind() != AffineExprKind::Mod || !k || k.getValue() <= 0)
+    return e;
+  SmallVector<std::pair<AffineExpr, int64_t>> terms;
+  int64_t konst = 0;
+  sumTerms(bin.getLHS(), 1, terms, konst);
+  int64_t f = k.getValue();
+  auto residue = [f](int64_t v) { return ((v % f) + f) % f; };
+  AffineExpr sum = getAffineConstantExpr(residue(konst), e.getContext());
+  for (auto &[t, coeff] : terms)
+    if (int64_t r = residue(coeff))
+      sum = sum + t * r;
+  return sum % f;
+}
+
+// `x - (x floordiv k)*k` is `x mod k`, re-folded.
+//
+// `simplifyAffineExpr` FLATTENS a residue into that difference, so a coalesced
+// or normalized subscript arrives already flattened and no amount of
+// re-simplifying recovers the mask. The flattened form is a subtract and a
+// shift that nothing can carry, where `x mod k` is a digit of a counter and so
+// a register (`asDigit`).
+static AffineExpr refoldResidues(AffineExpr e) {
+  auto bin = dyn_cast<AffineBinaryOpExpr>(e);
+  if (!bin)
+    return e;
+  e = getAffineBinaryOpExpr(bin.getKind(), refoldResidues(bin.getLHS()),
+                            refoldResidues(bin.getRHS()));
+  bin = dyn_cast<AffineBinaryOpExpr>(e);
+  if (!bin || bin.getKind() != AffineExprKind::Add)
+    return e;
+  SmallVector<std::pair<AffineExpr, int64_t>> terms;
+  int64_t konst = 0;
+  sumTerms(e, 1, terms, konst);
+  bool folded = false;
+  for (auto &[dividend, c] : terms) {
+    if (!c)
+      continue;
+    for (auto &[quotient, q] : terms) {
+      auto d = dyn_cast<AffineBinaryOpExpr>(quotient);
+      if (!q || !d || d.getKind() != AffineExprKind::FloorDiv ||
+          d.getLHS() != dividend)
+        continue;
+      auto k = dyn_cast<AffineConstantExpr>(d.getRHS());
+      if (!k || k.getValue() <= 0 || q != -c * k.getValue())
+        continue;
+      dividend = dividend % k.getValue();
+      q = 0;
+      folded = true;
+      break;
+    }
+  }
+  if (!folded)
+    return e;
+  AffineExpr sum = getAffineConstantExpr(konst, e.getContext());
+  for (auto &[t, c] : terms)
+    if (c)
+      sum = sum + t * c;
+  return sum;
+}
+
+AffineExpr mlir::allo::simplifiedForHardware(AffineExpr e, unsigned numDims,
+                                             unsigned numSymbols) {
+  // Ratios, not nanoseconds: every layer has to be handed the same form and
+  // only `addressCostOf` holds a device. See the header on why they are inert.
+  static constexpr AddressDelays kRank{/*add=*/1.0, /*mul=*/4.0, /*div=*/16.0};
+  AffineExpr best = e;
+  double bestRank = addressCost(e, kRank, AddressDelays::refWidth).delay;
+  for (AffineExpr cand :
+       {simplifyAffineExpr(e, numDims, numSymbols), divideBeforeMasking(e),
+        reduceModCoefficients(e), refoldResidues(e)}) {
+    double rank = addressCost(cand, kRank, AddressDelays::refWidth).delay;
+    if (rank < bestRank) {
+      best = cand;
+      bestRank = rank;
+    }
+  }
+  return best;
+}
+
+AddressExprs mlir::allo::addressExprsOf(const BankLayout &layout, AffineMap map,
+                                        ArrayRef<int64_t> shape,
+                                        std::optional<unsigned> assignedBank) {
+  // One path for both cases: with no partitioned axis the split's `offset` IS
+  // the row-major linear index and its `bank` is the constant 0, so an
+  // unbanked memref needs no branch of its own.
+  BankSplitExpr split = bankSplitOf(layout, map, shape);
+  AddressExprs e;
+  e.offset = split.offset;
+  // A compile-time bank routes straight to its own memory and never reads the
+  // digit. A skewed access holds a SLOT, whose physical bank is that slot
+  // rotated at run time, so it builds the digit whether assigned or not.
+  if (layout.numBanks > 1 && (!assignedBank || layout.skew()))
+    e.bank = split.bank;
+  e.width = addressWidthOf(layout.bankShape);
+  return e;
+}
+
+AddressCost mlir::allo::splitAddressCost(const SplitAddress &addr,
+                                         const AddressDelays &delays,
+                                         unsigned width) {
+  // One bare register per term, then the residual: each input past the first
+  // costs one adder.
+  AddressCost c;
+  unsigned chain = addr.terms.size();
+  unsigned inputs = chain + (addr.residual ? 1 : 0);
+  c.adders = inputs ? inputs - 1 : 0;
+  c.delay = chain ? (chain - 1) * scaled(delays.add, width) : 0.0;
+  if (!addr.residual)
+    return c;
+  AddressCost r = addressCost(addr.residual, delays, width);
+  c.adders += r.adders;
+  c.multipliers += r.multipliers;
+  c.dividers += r.dividers;
+  c.delay =
+      chain ? std::max(c.delay, r.delay) + scaled(delays.add, width) : r.delay;
+  return c;
+}
+
+unsigned mlir::allo::addressWidthOf(ArrayRef<int64_t> shape) {
+  int64_t elements = 1;
+  for (int64_t d : shape)
+    elements *= d;
+  // The two spare-word rule `declaredDepth` states, so a single-element memory
+  // still has a 1-bit address rather than a width `hw` cannot carry, and so
+  // this and `DatapathEmitter::addrWidth` are the same number.
+  return llvm::Log2_64_Ceil(
+      static_cast<uint64_t>(std::max<int64_t>(elements, 2)));
+}
+
+// The step of \p v when it is the induction variable of a counted loop with
+// constant bounds, the one shape whose consecutive values differ by a
+// compile-time constant and so the one a register can track. The register loads
+// `coeff * lb` at start and adds `coeff * step`, so both have to be constants;
+// an `affine.for` step always is, an `scf.for` step is an operand.
+//
+// Read off the loop IR here; the emitter asks the same question of the region
+// model it lowered to (`planAddressGenerators`), which is dialect-agnostic and
+// so answers yes for an `scf.for` too. Both have to agree on which loops carry.
+static std::optional<int64_t> constantStepOf(Value v) {
+  auto barg = dyn_cast<BlockArgument>(v);
+  if (!barg)
+    return std::nullopt;
+  Operation *parent = barg.getOwner()->getParentOp();
+  if (auto loop = dyn_cast<affine::AffineForOp>(parent)) {
+    if (barg == loop.getInductionVar() && loop.hasConstantLowerBound())
+      return loop.getStepAsInt();
+    return std::nullopt;
+  }
+  if (auto loop = dyn_cast<scf::ForOp>(parent)) {
+    std::optional<int64_t> step = getConstantIntValue(loop.getStep());
+    if (barg == loop.getInductionVar() &&
+        getConstantIntValue(loop.getLowerBound()))
+      return step;
+  }
+  return std::nullopt;
+}
+
+// Merge the terms naming the same DIGIT of the same counter, \p indices giving
+// each operand position the value it names. Two positions can hold one
+// induction variable, and the builder combines them the same way by region, so
+// pricing them apart would charge an adder nobody builds. Two digits of one
+// counter are two registers and do not combine.
+static void mergeTermsByDigit(SplitAddress &sp, ArrayRef<Value> indices) {
+  using Digit = std::tuple<Value, int64_t, int64_t, int64_t, int64_t>;
+  llvm::MapVector<Digit, unsigned> group;
+  SmallVector<SplitAddress::Term, 4> merged;
+  for (const SplitAddress::Term &t : sp.terms) {
+    Digit d{indices[t.operand], t.scale, t.offset, t.divisor, t.modulus};
+    auto [it, isNew] = group.try_emplace(d, merged.size());
+    if (isNew)
+      merged.push_back(t);
+    else
+      merged[it->second].coeff += t.coeff;
+  }
+  llvm::erase_if(merged, [](const SplitAddress::Term &t) { return !t.coeff; });
+  sp.terms = std::move(merged);
+}
+
+AddressCost mlir::allo::addressCostOf(Operation *op,
+                                      const OperatorLibrary &lib) {
+  std::optional<MemAccess> a = asMemAccess(op);
+  if (!a || a->kind != AccessKind::Array)
+    return {};
+  assert(a->map && "an array access carries a map, the identity one when its "
+                   "subscript is not affine");
+  auto shape = cast<MemRefType>(a->root.getType()).getShape();
+  AddressDelays delays = addressDelaysOf(lib);
+  AddressExprs e =
+      addressExprsOf(bankLayoutOf(a->root), a->map, shape, assignedBankOf(op));
+
+  // One cone, priced as the emitter will build it.
+  auto reduce = [&](AffineExpr expr, unsigned width) {
+    SplitAddress sp =
+        splitAddress(expr, a->map.getNumDims(), a->map.getNumSymbols(),
+                     [&](unsigned p) { return constantStepOf(a->indices[p]); });
+    mergeTermsByDigit(sp, a->indices);
+    return splitAddressCost(sp, delays, width);
+  };
+
+  AddressCost c = reduce(e.offset, e.width);
+  if (!e.bank)
+    return c;
+  // A second cone off the same operands, runs BESIDE the offset: delay is the
+  // max, operators add. Carried at the datapath width (compared against
+  // literal bank numbers, not used as an address) and reduced the same way.
+  AddressCost b = reduce(e.bank, AddressDelays::refWidth);
+  c.adders += b.adders;
+  c.multipliers += b.multipliers;
+  c.dividers += b.dividers;
+  c.delay = std::max(c.delay, b.delay);
+  return c;
+}
+
+double mlir::allo::addressDelayOf(Operation *op, const OperatorLibrary &lib) {
+  return std::round(addressCostOf(op, lib).delay * 100.0) / 100.0;
+}

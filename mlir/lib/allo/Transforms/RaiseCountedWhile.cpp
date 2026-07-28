@@ -25,12 +25,20 @@ using namespace mlir::allo::logging;
 
 namespace {
 
-// A matched counted-while: which iter-arg is the induction variable, the tested
-// bound and step, and whether the test was inclusive (`<=`, so ub = bound + 1).
-struct CountedWhileMatch {
+// The direction the exit test expects the induction variable to move.
+enum class Dir { Increasing, Decreasing };
+
+// A matched affine while: the IV iter-arg, its init and tested bound, the
+// signed constant step, and whether the ordered test was inclusive. The IV
+// evolves as `init + k*delta` and the loop exits when the test against `bound`
+// first fails. `delta`'s sign is the direction; its magnitude is the step. This
+// is the whole model the rewrite consumes, independent of the loop's surface
+// shape.
+struct AffineWhile {
   unsigned ivIndex;
+  Value init;
   Value bound;
-  Value step;
+  int64_t delta;
   bool inclusive;
 };
 
@@ -40,10 +48,74 @@ static bool isInvariant(Value v, scf::WhileOp w) {
   return !def || !w->isProperAncestor(def);
 }
 
-// Match an increasing counted-while: a pure ordered test of one monotonically
-// increasing induction variable against a loop-invariant bound. Returns nullopt
-// (leave the loop alone) on any deviation.
-static std::optional<CountedWhileMatch> matchCountedWhile(scf::WhileOp w) {
+// Look through the width-adjusting integer casts the frontend wraps integer
+// arithmetic in for overflow semantics: trunci(addi(extsi(iv), c)) is iv + c in
+// the IV's own width, so the recurrence underneath is what counts.
+static Value peelCast(Value v) {
+  while (Operation *def = v.getDefiningOp()) {
+    if (!isa<arith::ExtSIOp, arith::ExtUIOp, arith::TruncIOp>(def))
+      break;
+    v = def->getOperand(0);
+  }
+  return v;
+}
+
+// The predicate for the same comparison with its operands swapped, used to
+// normalize a `bound <pred> iv` test to `iv <pred> bound`. eq/ne are symmetric.
+static arith::CmpIPredicate swapOperands(arith::CmpIPredicate p) {
+  using P = arith::CmpIPredicate;
+  switch (p) {
+  case P::slt:
+    return P::sgt;
+  case P::sle:
+    return P::sge;
+  case P::sgt:
+    return P::slt;
+  case P::sge:
+    return P::sle;
+  case P::ult:
+    return P::ugt;
+  case P::ule:
+    return P::uge;
+  case P::ugt:
+    return P::ult;
+  case P::uge:
+    return P::ule;
+  case P::eq:
+  case P::ne:
+    return p;
+  }
+  llvm_unreachable("unhandled CmpIPredicate");
+}
+
+// Read an IV-on-lhs ordered predicate as (direction, inclusive). eq/ne are not
+// a monotone counted exit, so they yield nullopt.
+static std::optional<std::pair<Dir, bool>>
+classifyPredicate(arith::CmpIPredicate p) {
+  using P = arith::CmpIPredicate;
+  switch (p) {
+  case P::ult:
+  case P::slt:
+    return std::make_pair(Dir::Increasing, false);
+  case P::ule:
+  case P::sle:
+    return std::make_pair(Dir::Increasing, true);
+  case P::ugt:
+  case P::sgt:
+    return std::make_pair(Dir::Decreasing, false);
+  case P::uge:
+  case P::sge:
+    return std::make_pair(Dir::Decreasing, true);
+  default:
+    return std::nullopt;
+  }
+}
+
+// Match a counted while as an affine-IV model: a pure ordered test of one IV
+// against a loop-invariant bound, with a constant-step self-update whose sign
+// agrees with the test. Returns nullopt (leave the loop alone) on any
+// deviation.
+static std::optional<AffineWhile> matchCountedWhile(scf::WhileOp w) {
   if (!w.getBefore().hasOneBlock() || !w.getAfter().hasOneBlock())
     return std::nullopt;
   Block &before = w.getBefore().front();
@@ -59,6 +131,8 @@ static std::optional<CountedWhileMatch> matchCountedWhile(scf::WhileOp w) {
       return std::nullopt;
 
   // `before` is pure and holds only the comparison + the condition terminator.
+  // This is the fence that keeps a data-dependent exit (a load or a multi-cycle
+  // IP op in `before`) on the flushing path.
   auto cmp = cond.getCondition().getDefiningOp<arith::CmpIOp>();
   if (!cmp || cmp->getBlock() != &before)
     return std::nullopt;
@@ -78,63 +152,54 @@ static std::optional<CountedWhileMatch> matchCountedWhile(scf::WhileOp w) {
   if (!ivArg || ivArg.getOwner() != &before || !isInvariant(bound, w))
     return std::nullopt;
 
-  // Terminating, ordered predicate; normalize the IV to the "less-than" side.
-  using P = arith::CmpIPredicate;
-  P pred = cmp.getPredicate();
-  if (!ivOnLhs) {
-    switch (pred) { // bound <pred> iv  ==  iv <flipped> bound
-    case P::ugt:
-      pred = P::ult;
-      break;
-    case P::sgt:
-      pred = P::slt;
-      break;
-    case P::uge:
-      pred = P::ule;
-      break;
-    case P::sge:
-      pred = P::sle;
-      break;
-    default:
-      return std::nullopt;
-    }
-  }
-  bool inclusive;
-  switch (pred) {
-  case P::ult:
-  case P::slt:
-    inclusive = false;
-    break;
-  case P::ule:
-  case P::sle:
-    inclusive = true;
-    break;
-  default:
-    return std::nullopt; // eq/ne or decreasing: not a counted increasing loop
-  }
+  // Normalize the test to IV-on-lhs, then read its direction and inclusivity.
+  arith::CmpIPredicate pred =
+      ivOnLhs ? cmp.getPredicate() : swapOperands(cmp.getPredicate());
+  std::optional<std::pair<Dir, bool>> cls = classifyPredicate(pred);
+  if (!cls)
+    return std::nullopt;
+  auto [dir, inclusive] = *cls;
 
-  // IV self-update: yield[k] = addi(after.arg[k], constant step > 0).
+  // IV self-update: yield[k] is `addi(iv, c)` or `subi(iv, c)` with a constant
+  // c, giving the signed step, read through the overflow casts. `subi(c, iv)`
+  // reflects the IV rather than stepping it, so it is not a counted recurrence.
   unsigned k = ivArg.getArgNumber();
-  auto add = yield.getOperand(k).getDefiningOp<arith::AddIOp>();
-  if (!add)
-    return std::nullopt;
   Value ivAfter = w.getAfterArguments()[k];
-  Value step;
-  if (add.getLhs() == ivAfter)
-    step = add.getRhs();
-  else if (add.getRhs() == ivAfter)
-    step = add.getLhs();
-  else
+  Operation *upd = peelCast(yield.getOperand(k)).getDefiningOp();
+  int64_t delta;
+  if (auto add = dyn_cast_or_null<arith::AddIOp>(upd)) {
+    Value l = peelCast(add.getLhs()), r = peelCast(add.getRhs());
+    Value stepV = l == ivAfter ? r : r == ivAfter ? l : Value();
+    std::optional<int64_t> c =
+        stepV ? getConstantIntValue(stepV) : std::nullopt;
+    if (!c)
+      return std::nullopt;
+    delta = *c;
+  } else if (auto sub = dyn_cast_or_null<arith::SubIOp>(upd)) {
+    if (peelCast(sub.getLhs()) != ivAfter)
+      return std::nullopt;
+    std::optional<int64_t> c = getConstantIntValue(peelCast(sub.getRhs()));
+    if (!c)
+      return std::nullopt;
+    delta = -*c;
+  } else {
     return std::nullopt;
-  std::optional<int64_t> stepC = getConstantIntValue(step);
-  if (!stepC || *stepC <= 0)
+  }
+  if (delta == 0)
     return std::nullopt;
 
-  // Restricted to an index-typed IV whose result is unused.
-  if (!ivArg.getType().isIndex() || !w.getResult(k).use_empty())
+  // Direction agreement: the step's sign must match the exit test, else the
+  // loop is non-terminating rather than counted.
+  if ((dir == Dir::Increasing) != (delta > 0))
     return std::nullopt;
 
-  return CountedWhileMatch{k, bound, step, inclusive};
+  // Raise any integer or index IV. The rewrite reconstructs the IV from an
+  // index counter and casts through the IV's type, so both directions and a
+  // used result need no special handling in the match.
+  if (!ivArg.getType().isIntOrIndex())
+    return std::nullopt;
+
+  return AffineWhile{k, w.getInits()[k], bound, delta, inclusive};
 }
 
 struct RaiseCountedWhile : OpRewritePattern<scf::WhileOp> {
@@ -142,19 +207,60 @@ struct RaiseCountedWhile : OpRewritePattern<scf::WhileOp> {
 
   LogicalResult matchAndRewrite(scf::WhileOp w,
                                 PatternRewriter &rewriter) const override {
-    std::optional<CountedWhileMatch> m = matchCountedWhile(w);
+    std::optional<AffineWhile> m = matchCountedWhile(w);
     if (!m)
       return failure();
 
     Location loc = w.getLoc();
     rewriter.setInsertionPoint(w);
 
-    Value lb = w.getInits()[m->ivIndex];
-    Value ub = m->bound;
-    if (m->inclusive) {
-      Value one = arith::ConstantIndexOp::create(rewriter, loc, 1);
-      ub = arith::AddIOp::create(rewriter, loc, m->bound, one);
-    }
+    Value init = m->init;
+    Type ivType = init.getType();
+    bool increasing = m->delta > 0;
+    int64_t absDelta = increasing ? m->delta : -m->delta;
+
+    // A constant in the IV's own type (index or a fixed-width integer).
+    auto constIv = [ivType](OpBuilder &b, Location l, int64_t v) -> Value {
+      if (ivType.isIndex())
+        return arith::ConstantIndexOp::create(b, l, v);
+      return arith::ConstantIntOp::create(b, l, ivType, v);
+    };
+
+    // The IV value at counter position `count` (in the IV type): init +
+    // count*delta. A unit-step zero-based increasing loop folds this back to
+    // `count` itself.
+    auto ivAt = [&](OpBuilder &b, Location l, Value count) -> Value {
+      Value scaled =
+          b.createOrFold<arith::MulIOp>(l, count, constIv(b, l, m->delta));
+      return b.createOrFold<arith::AddIOp>(l, scaled, init);
+    };
+
+    // Trip count of init + k*delta: fold the inclusive test into an excluded
+    // boundary so all four predicates share one span, then ceil-divide by
+    // |delta|. createOrFold keeps a constant trip constant for the scheduler.
+    Value boundExcl = m->bound;
+    if (m->inclusive)
+      boundExcl = increasing ? rewriter.createOrFold<arith::AddIOp>(
+                                   loc, m->bound, constIv(rewriter, loc, 1))
+                             : rewriter.createOrFold<arith::SubIOp>(
+                                   loc, m->bound, constIv(rewriter, loc, 1));
+    Value span =
+        increasing ? rewriter.createOrFold<arith::SubIOp>(loc, boundExcl, init)
+                   : rewriter.createOrFold<arith::SubIOp>(loc, init, boundExcl);
+    Value numer = rewriter.createOrFold<arith::AddIOp>(
+        loc, span, constIv(rewriter, loc, absDelta - 1));
+    Value trip = rewriter.createOrFold<arith::DivSIOp>(
+        loc, numer, constIv(rewriter, loc, absDelta));
+    // Clamp a zero-trip loop (init already past the bound) to 0, so the bound
+    // is empty and the exit IV below is the untouched init.
+    trip = rewriter.createOrFold<arith::MaxSIOp>(loc, trip,
+                                                 constIv(rewriter, loc, 0));
+
+    Value lb = arith::ConstantIndexOp::create(rewriter, loc, 0);
+    Value ub = ivType.isIndex() ? trip
+                                : rewriter.createOrFold<arith::IndexCastOp>(
+                                      loc, rewriter.getIndexType(), trip);
+    Value step = arith::ConstantIndexOp::create(rewriter, loc, 1);
 
     // Carried (non-IV) iter-args, in order.
     SmallVector<Value> carriedInits;
@@ -168,12 +274,15 @@ struct RaiseCountedWhile : OpRewritePattern<scf::WhileOp> {
     scf::YieldOp whileYield = w.getYieldOp();
     Block &after = w.getAfter().front();
 
-    // Move the after-region body into the for body, mapping the IV to the for's
-    // induction var and the carried args to its iter-args. The IV self-update
-    // clones as dead code (nothing yields it) and canonicalize removes it.
+    // Move the after-region body into the for body: the IV maps to its rebuilt
+    // value and the carried args to the iter-args. The IV self-update clones as
+    // dead code and canonicalize removes it.
     auto build = [&](OpBuilder &b, Location l, Value iv, ValueRange iterArgs) {
+      Value count = ivType.isIndex()
+                        ? iv
+                        : b.createOrFold<arith::IndexCastOp>(l, ivType, iv);
       IRMapping map;
-      map.map(after.getArgument(m->ivIndex), iv);
+      map.map(after.getArgument(m->ivIndex), ivAt(b, l, count));
       for (auto [r, idx] : llvm::enumerate(carriedIdx))
         map.map(after.getArgument(idx), iterArgs[r]);
       for (Operation &op : after.without_terminator())
@@ -185,13 +294,20 @@ struct RaiseCountedWhile : OpRewritePattern<scf::WhileOp> {
     };
 
     auto forOp =
-        scf::ForOp::create(rewriter, loc, lb, ub, m->step, carriedInits, build);
+        scf::ForOp::create(rewriter, loc, lb, ub, step, carriedInits, build);
 
     info(Stage::Prep, forOp)
         << "Raising counted while loop into a counted for loop";
 
     for (auto [r, idx] : llvm::enumerate(carriedIdx))
       rewriter.replaceAllUsesWith(w.getResult(idx), forOp.getResult(r));
+
+    // The IV result is the first value failing the test: init + trip*delta.
+    if (!w.getResult(m->ivIndex).use_empty()) {
+      rewriter.setInsertionPointAfter(forOp);
+      rewriter.replaceAllUsesWith(w.getResult(m->ivIndex),
+                                  ivAt(rewriter, loc, trip));
+    }
     rewriter.eraseOp(w);
     return success();
   }

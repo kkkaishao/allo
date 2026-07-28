@@ -13,11 +13,11 @@ import pytest
 
 import allo
 from allo import kernel
-from allo.lang import i32, f32, Stream
+from allo.lang import i32, f32, index, Stream
 from allo.backend.rtl.device import builtin_device, MemoryKind
 
 sys.path.insert(0, os.path.dirname(__file__))
-from _common import Mod, _sched, _to_rtl  # noqa: E402
+from _common import Mod, _sched, _to_rtl, _iis, COMB, PERIOD_NS  # noqa: E402
 
 pytestmark = pytest.mark.skipif(
     shutil.which("verilator") is None, reason="verilator not available"
@@ -185,9 +185,13 @@ def test_multi_cycle_write_costs_scheduled_cycles():
         for i in range(8):
             B[i] = s[0]
 
+    # The device's write latency is the subject, so `s` has to stay a memory:
+    # the automatic complete partition would give it registers and time the
+    # write at zero.
     iis = []
     for wr in (1, 2, 3):
-        regions = _to_rtl(accumulate, device=_dev(wr)).schedule().func("accumulate")
+        rtl = _to_rtl(accumulate, device=_dev(wr), scalarize_threshold=0)
+        regions = rtl.schedule().func("accumulate")
         iis.append(max(r.ii for r in regions.cyclic()))
     assert iis == [iis[0], iis[0] + 1, iis[0] + 2], iis
 
@@ -241,9 +245,153 @@ def test_chaining_inserts_register():
 
         return c
 
-    # Four combinational int adds (1.2 ns each) cannot fit one 3.33 ns cycle, so
-    # the chaining scheduler splits the chain across cycles -- more register
+    # The premise, stated against the device rather than assumed: four
+    # combinational int adds do not fit one default cycle. A device whose adds
+    # got faster would leave the test passing for the wrong reason.
+    assert 4 * COMB["add"] > PERIOD_NS
+    # So the chaining scheduler splits the chain across cycles -- more register
     # stages than under a huge cycle time, where the whole chain settles in one.
     tight = _sched(chain()).cyclic()[0]
     loose = _sched(chain(), freq_mhz=1.0).cyclic()[0]  # a 1000ns cycle
     assert tight.last_t() > loose.last_t()
+
+
+def test_an_address_cone_is_charged_to_the_port_it_feeds():
+    # An address never becomes an operation: it is folded into the access's
+    # affine map, so no dependence carries its delay and only the access's own
+    # operator type can account for it. These two kernels run the same four adds
+    # over the same trip count and differ only in what it costs to reach the
+    # element -- `flat` addresses with the bare counter, `cone` sums three
+    # shifted terms. At 2 ns the compute alone fits and only the cone does not.
+    @kernel
+    def flat(A: i32[512], B: i32[512], out: i32[512]):
+        for i in range(64):
+            out[i] = A[i] + B[i] + A[i] + B[i]
+
+    @kernel
+    def cone(A: i32[8, 8, 8], B: i32[8, 8, 8], out: i32[8, 8, 8]):
+        for i in range(4):
+            for j in range(4):
+                for k in range(4):
+                    out[i + 1, j + 1, k + 1] = (
+                        A[i, j, k] + B[i, j, k] + A[i, j, k] + B[i, j, k]
+                    )
+
+    at500 = {
+        n: _sched(k, freq_mhz=500).cyclic()[0]
+        for n, k in (("flat", flat), ("cone", cone))
+    }
+    assert at500["cone"].length > at500["flat"].length
+
+
+def test_an_address_that_follows_the_counters_is_carried_in_a_register():
+    # Address strength reduction. Every term of `i*400 + j*20 + k + c` is a
+    # constant multiple of an enclosing counter, so consecutive iterations
+    # differ by a constant: each term becomes a register the controller
+    # advances beside the counter it follows, and the address is their sum. The
+    # constant multiplies -- the arithmetic that dominates an address, and the
+    # reason it was the widest cone in the datapath -- are gone entirely.
+    @kernel
+    def stencil(A: i32[20, 20, 20], out: i32[20, 20, 20]):
+        for i in range(18):
+            for j in range(18):
+                for k in range(18):
+                    out[i + 1, j + 1, k + 1] = A[i, j, k] + 1
+
+    mod = _to_rtl(stencil)
+    m = mod.mlir
+    assert "comb.mul" not in m, "a constant stride survived on the address path"
+    # One scaled counter per level, shared by the two accesses, except at the
+    # outermost, where `out`'s own constant 421 rides in the register's reset
+    # value instead of an adder on the address path. That fourth register is
+    # what buys the adder off the memory port's setup, and a register is the
+    # cheap side of that trade.
+    assert sorted(set(re.findall(r"r\d+_addr\d+", m))) == [
+        "r0_addr0",
+        "r0_addr1",
+        "r1_addr0",
+        "r2_addr0",
+    ]
+    inits = dict(
+        re.findall(r"%(r\d+_addr\d+) = seq\.compreg [^\n]*reset %rst, %(\w+)", m)
+    )
+    consts = dict(re.findall(r"%(\w+) = hw\.constant (-?\d+)", m))
+    assert sorted(consts[inits[r]] for r in ("r0_addr0", "r0_addr1")) == ["0", "421"]
+
+    A = (np.arange(8000, dtype=np.int32) % 251).reshape(20, 20, 20)
+    out = np.zeros((20, 20, 20), np.int32)
+    mod.cosim(A, out)
+    exp = np.zeros((20, 20, 20), np.int32)
+    exp[1:19, 1:19, 1:19] = A[0:18, 0:18, 0:18] + 1
+    assert np.array_equal(out, exp)
+
+
+def test_a_subscript_that_cannot_be_carried_keeps_the_row_its_register():
+    # PARTIAL strength reduction. An address is not one decision. `A[i, c]` has a
+    # row that follows a counter and a column that never can: `c` is a boundary
+    # scalar, so no register advances with it. Taking the address as one decision
+    # would cost the row its register as well, rebuilding `i*20` every cycle to
+    # add `c` to it. The row reduces on its own.
+    @kernel
+    def colsum(A: i32[12, 20], c: index, out: i32[12]):
+        for i in range(12):
+            out[i] = A[i, c]
+
+    mod = _to_rtl(colsum)
+    m = mod.mlir
+    # The row stride is a register the controller advances by 20, not a multiply
+    # on the address path: 20 is no power of two, so one left there would be a
+    # visible `comb.mul` by it (`mulConst` leaves the recoding to synthesis).
+    # Asked of that constant rather than of `comb.mul` at large, since a runtime
+    # loop bound negates with one too and that is control, not address.
+    twenty = set(re.findall(r"(%c20_i32\w*) = hw\.constant 20", m))
+    assert twenty, "no stride of 20 anywhere: the test measures nothing"
+    assert any(
+        re.search(rf"comb\.add %r0_addr\d+, {c}\b", m) for c in twenty
+    ), "the row stride is not carried in a register"
+    assert not any(
+        re.search(rf"comb\.mul [^\n]*{c}\b", m) for c in twenty
+    ), "a row stride survived beside a column that did"
+    A = (np.arange(240, dtype=np.int32) % 251).reshape(12, 20)
+    out = np.zeros(12, np.int32)
+    mod.cosim(A, 7, out)
+    assert np.array_equal(out, A[:, 7])
+
+
+def test_normalizing_a_strided_loop_lets_its_nest_coalesce():
+    # Loop normalization, and what it is FOR. Coalescing states a precondition
+    # nothing else establishes (lower bound 0, step 1), so a nest `s.unroll`
+    # left stepping by 2 would be refused for a property nothing fixes.
+    # Normalized, the step moves into the subscript and the band coalesces into
+    # one region running at II=1.
+    #
+    # The stride is on the INNER loop in the first kernel and on the OUTER loop
+    # in the second, and the two are not the same case. Normalizing leaves the
+    # original induction variable behind as an `affine.apply`; on an outer level
+    # that op stands between the two loops, so the nest stops being perfect and
+    # the normalization meant to open the band is what closes it. It only
+    # coalesces because the leftover is sunk into the innermost body.
+    @kernel
+    def inner_stride(A: i32[8, 8], out: i32[8, 8]):
+        for i in range(8):
+            for j in range(0, 8, 2):
+                out[i, j] = A[i, j] + 1
+                out[i, j + 1] = A[i, j + 1] + 1
+
+    @kernel
+    def outer_stride(A: i32[8, 8], out: i32[8, 8]):
+        for i in range(0, 8, 2):
+            for j in range(8):
+                out[i, j] = A[i, j] + 1
+                out[i + 1, j] = A[i + 1, j] + 1
+
+    A = (np.arange(64, dtype=np.int32) % 251).reshape(8, 8)
+    for k in (inner_stride, outer_stride):
+        mod = _to_rtl(k)
+        assert (
+            mod.dcp.count("allo.dcp.pipeline") == 1
+        ), f"{k.__name__}: the strided band did not coalesce into one region"
+        assert _iis(mod.schedule().func(k.__name__).regions) == [1]
+        out = np.zeros((8, 8), np.int32)
+        mod.cosim(A, out)
+        assert np.array_equal(out, A + 1)

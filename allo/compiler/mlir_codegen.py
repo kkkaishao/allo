@@ -2561,9 +2561,6 @@ class MLIRCodeGenerator(ast.NodeVisitor):
             # written in the body: the scheduler then drops the conservative
             # non-affine recurrence and pipelines at II=1. Unchecked -- a real
             # inter-iteration dependence is undefined behavior, like `llvm.assume`.
-            # Scope it to the OUTERMOST axis: `flatten-perfect-loops` coalesces
-            # the nest into that loop (keeping its IV) while the inner IVs are
-            # rewritten to `affine.apply`, which are not loop induction variables.
             self._emit_grid_nodep(for_ops[-1], ivs[0])
 
             # terminate every level's body
@@ -2578,23 +2575,27 @@ class MLIRCodeGenerator(ast.NodeVisitor):
         to the grid's outermost axis `iv` so it survives loop coalescing."""
         seen = set()
         arrays = []
+        nested = set()
 
-        def collect(op):
+        def collect(op, is_nested):
             if op.name in ("affine.store", "memref.store"):
                 mref = op.operands[1]  # store operands: [value, memref, indices...]
                 if mref not in seen:
                     seen.add(mref)
                     arrays.append(mref)
+            if is_nested:
+                nested.update(op.results)
             for region in op.regions:
                 for block in region.blocks:
                     for inner in block.operations:
-                        collect(inner)
+                        collect(inner, True)
 
         for op in innermost_for.body.operations:
-            collect(op)
+            collect(op, False)
+        arrays = [mref for mref in arrays if mref not in nested]
         if not arrays:
             return
-        self.builder.set_insertion_point_to_start(innermost_for.body)
+        self.builder.set_insertion_point_to_end(innermost_for.body)
         dep_type_attr = AssumeDepTypeAttr.get(0, self.context)  # 0 = inter
         for mref in arrays:
             AssumeNoDepOp(

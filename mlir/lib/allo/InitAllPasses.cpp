@@ -1,3 +1,8 @@
+/*
+ * Copyright Allo authors. All Rights Reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 #include "allo/InitAllPasses.h"
 
 #include "mlir/Conversion/Passes.h"

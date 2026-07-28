@@ -6,6 +6,7 @@
 #include "allo/Scheduling/OperatorLibrary.h"
 
 #include "allo/IR/AlloOps.h"
+#include "allo/Scheduling/AddressCost.h" // addressDelayOf (per-site address)
 
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
@@ -16,6 +17,7 @@
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/StringSwitch.h"
 #include "llvm/ADT/TypeSwitch.h"
+#include "llvm/Support/FormatVariadic.h"
 
 using namespace mlir;
 using namespace mlir::allo;
@@ -370,6 +372,16 @@ OperatorLibrary OperatorLibrary::fromModule(ModuleOp module) {
 // Lookup
 //===----------------------------------------------------------------------===//
 
+double OperatorLibrary::combDelay(OpKind kind) const {
+  // Last wins, like `matchEntry`. `dcp.device.comb` is a dictionary, so there
+  // is at most one row per kind in practice.
+  double delay = 0.0;
+  for (const OperatorEntry &e : entries)
+    if (e.comb && e.kind == kind)
+      delay = e.outDelay;
+  return delay;
+}
+
 OperatorChar OperatorLibrary::lookup(Operation *op) const {
   auto kind = classify(op);
 
@@ -390,6 +402,18 @@ OperatorChar OperatorLibrary::lookup(Operation *op) const {
     c.latency = t.latency;
     c.inDelay = c.outDelay = t.delay;
     c.pipelined = t.pipelined;
+    // The address cone is no operation of its own, so no dependence carries its
+    // delay: charge it to the port it feeds. The type NAME carries it too, or
+    // two sites costing differently would share one characterization.
+    if (double addr = addressDelayOf(op, *this)) {
+      // A registered port takes the cone on its input side alone, ending at its
+      // own address register. A zero-latency port has none, and CIRCT requires
+      // its two delays to agree, so there the cone lands on both.
+      c.inDelay += addr;
+      if (c.latency == 0)
+        c.outDelay += addr;
+      c.typeName += "@" + llvm::formatv("{0:F2}", addr).str();
+    }
     return c;
   }
   default:

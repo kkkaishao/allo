@@ -31,7 +31,7 @@ _UINT = {8: np.uint8, 16: np.uint16, 32: np.uint32, 64: np.uint64}
 #   scalars: [{arg, width, name}]
 #   streams: [{arg, input, depth, width, base, data, valid, ready}]
 #   reads / writes: [[{arg, bank, factor, width, latency, base, addr, data, [we],
-#                      [shape], [axes: [{dim, factor, block}]]}]]
+#                      [shape], [axes: [{dim, factor, kind}]]}]]
 #     `shape`/`axes` appear only for a partitioned argument: they are the
 #     emitter's element-space bank decomposition (``allo::BankLayout``), which
 #     the host replays to shard the argument across its bank interfaces.
@@ -45,17 +45,19 @@ def bank_elements(shape, axes, bank: int) -> np.ndarray:
     The host-side mirror of the emitter's element-space bank decomposition
     (``allo::BankLayout``): a cyclic axis of factor ``F`` puts element ``i`` in
     bank ``i % F`` at local ``i // F``; a block axis puts it in bank
-    ``i // extent`` at ``i % extent``, ``extent = ceil(dim / F)``. Axes compose
-    in mixed radix, in the order the emitter applied them, so the inverse walks
-    them in reverse. ``-1`` marks a padding word, i.e. a bank slot with no
-    element behind it, left over when a factor does not divide its dimension.
+    ``i // extent`` at ``i % extent``, ``extent = ceil(dim / F)``; a skew axis
+    puts it in bank ``(sum of all subscripts) % F``, keeping ``i_d // F`` on its
+    distribution dimension ``d``. Axes compose in mixed radix, in the order the
+    emitter applied them, so the inverse walks them in reverse. ``-1`` marks a
+    padding word, i.e. a bank slot with no element behind it, left over when a
+    factor does not divide its dimension.
     """
     bank_shape = list(shape)
-    peeled = []  # (dim, factor, block, extent), in the order the emitter applied
+    peeled = []  # (dim, factor, kind, extent), in the order the emitter applied
     for a in axes:
         dim, factor = a["dim"], a["factor"]
         extent = -(-bank_shape[dim] // factor)
-        peeled.append((dim, factor, bool(a["block"]), extent))
+        peeled.append((dim, factor, a["kind"], extent))
         bank_shape[dim] = extent
     # `bank` in mixed radix over the axis factors, most significant first.
     digits, rest = [], bank
@@ -66,10 +68,17 @@ def bank_elements(shape, axes, bank: int) -> np.ndarray:
     # Rebuild each original coordinate from this bank's local coordinate grid,
     # undoing the axes in reverse (a later axis split what an earlier one left).
     coord = list(np.indices(bank_shape))
-    for (dim, factor, block, extent), digit in zip(reversed(peeled), reversed(digits)):
-        coord[dim] = (
-            coord[dim] + digit * extent if block else coord[dim] * factor + digit
-        )
+    for (dim, factor, kind, extent), digit in zip(reversed(peeled), reversed(digits)):
+        if kind == "block":
+            coord[dim] = coord[dim] + digit * extent
+        elif kind == "cyclic":
+            coord[dim] = coord[dim] * factor + digit
+        else:
+            # Skew: `i_d` is the one subscript in [q*F, q*F+F) whose total sum
+            # lands on this bank, and the others are already whole, so the
+            # residue is what the digit less their sum leaves.
+            others = sum(coord[k] for k in range(len(shape)) if k != dim)
+            coord[dim] = coord[dim] * factor + (digit - others) % factor
     flat, stride, valid = 0, 1, True
     for k in reversed(range(len(shape))):
         flat = flat + coord[k] * stride

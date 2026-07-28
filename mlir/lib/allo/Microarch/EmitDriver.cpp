@@ -148,6 +148,13 @@ declareModulePorts(const iface::ModuleInterface &model, OpBuilder &b) {
   for (const auto &acc : model.reads)
     for (const iface::Memory &r : acc)
       port(r.data, iType(r.width), Dir::Input);
+  // A fully-partitioned argument gets one input per element, no address or
+  // latency, read combinationally in any number at once. A write-only
+  // argument has no input side; its output follows `done`.
+  for (const iface::RegisterFile &rf : model.registers)
+    for (const iface::RegisterFile::Element &e : rf.elements)
+      if (!e.in.empty())
+        port(e.in, iType(rf.width), Dir::Input);
   port(kDone, i1, Dir::Output);
   // Stream FIFO ports, output side (after `done`, among the module outputs): an
   // input stream's back-pressure {ready}; an output stream's {data, valid}.
@@ -168,6 +175,15 @@ declareModulePorts(const iface::ModuleInterface &model, OpBuilder &b) {
       port(w.data, iType(w.width), Dir::Output);
       port(w.we, i1, Dir::Output);
     }
+  // A written scattered argument leaves on one data + write-enable pair per
+  // element: the storage is the driver's, so an element commits only where the
+  // module says it did.
+  for (const iface::RegisterFile &rf : model.registers)
+    for (const iface::RegisterFile::Element &e : rf.elements)
+      if (!e.out.empty()) {
+        port(e.out, iType(rf.width), Dir::Output);
+        port(e.we, i1, Dir::Output);
+      }
   // Scalar function results: one output port each, driven by the returning
   // region's survivor and valid when `done` rises (emit()).
   for (const iface::Result &r : model.results)
@@ -385,7 +401,7 @@ LogicalResult emitDatapathToHW(ModuleOp module, StringRef binding,
     });
     uarch::CalleeCtx cc{modules, ifaceModels};
     const uarch::CalleeCtx *callees = hasInvoke ? &cc : nullptr;
-    Datapath dp(f, *policy, memLib, callees);
+    Datapath dp(f, *policy, memLib, callees, /*isTop=*/f == topFunc);
     LLVM_DEBUG({
       llvm::dbgs() << "// datapath for @" << f.getSymName() << "\n";
       dp.dump(llvm::dbgs());

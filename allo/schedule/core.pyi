@@ -27,6 +27,7 @@ class Schedule(Generic[P, R]):
     Complete: int
     Block: int
     Cyclic: int
+    Skew: int
 
     # bind_storage enums
     BRAM = ...
@@ -160,9 +161,10 @@ class Schedule(Generic[P, R]):
         factor: int = 0,
     ) -> Schedule[P, R]:
         """Array-partition the target buffers (``transform.allo.partition``).
-        ``kind`` is ``Complete``/``Block``/``Cyclic``; ``dim`` selects the
-        dimension (0 = all dims); ``factor`` is the block/cyclic factor (must stay
-        0 for ``Complete``)."""
+        ``kind`` is ``Complete``/``Block``/``Cyclic``/``Skew``; ``dim`` selects
+        the dimension (0 = all dims, but a ``Skew`` must name its distribution
+        dimension); ``factor`` is the bank count (must stay 0 for
+        ``Complete``)."""
 
     def bind_storage(
         self,

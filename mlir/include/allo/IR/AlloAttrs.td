@@ -13,10 +13,16 @@ include "mlir/IR/EnumAttr.td"
 def CompletePartition: I32EnumAttrCase<"CompletePartition", 0, "Complete">;
 def BlockPartition: I32EnumAttrCase<"BlockPartition", 1, "Block">;
 def CyclicPartition: I32EnumAttrCase<"CyclicPartition", 2, "Cyclic">;
+// A SKEWED partition: the bank is the sum of ALL subscripts modulo the factor,
+// where block and cyclic each read one subscript. `dim` names the distribution
+// dimension, the one divided down by the factor to make room. No HLS pragma
+// spells this; it is the standard answer to an array read both by row and by
+// column, where no per-axis layout can serve both.
+def SkewPartition: I32EnumAttrCase<"SkewPartition", 3, "Skew">;
 
 def PartitionKindEnum: I32EnumAttr<"PartitionKindEnum",
         "An example partition enum",
-        [CompletePartition,BlockPartition,CyclicPartition]> {
+        [CompletePartition,BlockPartition,CyclicPartition,SkewPartition]> {
     let cppNamespace = "mlir::allo";
     let stringToSymbolFnName = "ConvertToPartitionEnum";
     let symbolToStringFnName = "ConvertToPartitionString";

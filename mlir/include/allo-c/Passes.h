@@ -13,12 +13,6 @@
 extern "C" {
 #endif
 
-// NOTE: canonicalize / lower-to-llvm are intentionally NOT exposed here.
-// General pass pipelines (incl. the registered `allo-lower-to-llvm` pipeline)
-// run through upstream `mlir.passmanager.PassManager`, so no downstream wrapper
-// is maintained. Vivado HLS emission stays because it is a translation, not a
-// pass.
-
 /// Emits Vivado HLS C++ for `module`, streaming the result through `callback`.
 /// Returns failure if emission fails (in which case `callback` is not invoked).
 /// `top` names the top function (emitted with `extern "C"` linkage and carrying
@@ -47,6 +41,18 @@ MLIR_CAPI_EXPORTED MlirLogicalResult alloEmitDatapathToHW(
 
 MLIR_CAPI_EXPORTED MlirLogicalResult
 alloEmitSplitVerilog(MlirModule module, MlirStringRef directory);
+
+/// `scheduler` names the solver that settles the resource half of every
+/// scheduling problem: "heuristic" (the SDC simplex plus greedy placement) or
+/// "exact" (CP-SAT, only in a build with OR-Tools).
+MLIR_CAPI_EXPORTED MlirLogicalResult
+alloRunSDCSchedulingPipeline(MlirModule module, MlirStringRef top,
+                             float cycleTime, MlirStringRef scheduler);
+
+/// Whether this build accepts `scheduler = "exact"`, i.e. links OR-Tools. The
+/// option exists in both distributions, so this is what tells them apart.
+MLIR_CAPI_EXPORTED bool alloHasExactScheduler(void);
+
 #ifdef __cplusplus
 }
 #endif

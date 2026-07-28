@@ -58,7 +58,10 @@ struct Memory {
   struct Axis {
     int dim;
     int64_t factor;
-    bool block;
+    /// `BankLayout::Kind` as the manifest spells it: "cyclic", "block" or
+    /// "skew". A name rather than a flag because the host reproduces the
+    /// decomposition, and a third kind is what a second bool would have hidden.
+    std::string kind;
   };
   int arg;
   bool write;
@@ -69,6 +72,28 @@ struct Memory {
   std::vector<int64_t> shape; // the argument's element shape
   std::vector<Axis> axes;     // partitioned axes, mixed-radix order (empty when
                               // unbanked)
+};
+
+/// A completely-partitioned argument array, which crosses the boundary as one
+/// port per ELEMENT rather than as an addressed interface (`MemUnit::scattered`
+/// says why). `elements` holds the port names flat in row-major order, so the
+/// host drives element k of the flattened argument onto `elements[k]`.
+///
+/// Not a `Memory`: there is no address, no bank and no access latency to
+/// publish, and the count is the argument's element count rather than its
+/// access count.
+struct RegisterFile {
+  /// One element's ports. `in` is where it arrives, `out`/`we` where it leaves,
+  /// and a direction the kernel does not use is empty: an argument it only
+  /// reads has no `out`, one it only writes no `in`. The names differ by that
+  /// too (`A_k` when one direction is live, `A_k_in`/`A_k_out` when both are).
+  struct Element {
+    std::string in, out, we;
+  };
+  int arg;
+  unsigned width;             // element bit width
+  std::vector<int64_t> shape; // the argument's element shape
+  std::vector<Element> elements;
 };
 
 /// A scalar input argument (one port, no suffix).
@@ -118,6 +143,7 @@ struct ModuleInterface {
   std::vector<FIFO> streams;
   std::vector<std::vector<Memory>> reads;
   std::vector<std::vector<Memory>> writes;
+  std::vector<RegisterFile> registers;
   std::vector<Result> results;
   std::vector<Operator> operators;
 

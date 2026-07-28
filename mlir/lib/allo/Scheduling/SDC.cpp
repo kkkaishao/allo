@@ -3,12 +3,12 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-#include "allo/Transforms/Passes.h"
-
 #include "allo-c/Schedule.h" // kPipelineIIAttr
 #include "allo/IR/AlloOps.h"
+#include "allo/Scheduling/AddressCost.h"
 #include "allo/Scheduling/DependenceAnalysis.h"
 #include "allo/Scheduling/HierarchicalDependence.h"
+#include "allo/Scheduling/MemoryAccess.h"
 #include "allo/Scheduling/OperatorLibrary.h"
 #include "allo/Scheduling/ProblemBuilder.h"
 #include "allo/Scheduling/RegionGraph.h"
@@ -29,13 +29,8 @@
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/StringExtras.h"
-#include "llvm/Support/Error.h"
+#include "llvm/Support/Format.h"
 #include "llvm/Support/MathExtras.h"
-
-namespace mlir::allo {
-#define GEN_PASS_DEF_SDCSCHEDULINGPASS
-#include "allo/Transforms/Passes.h.inc"
-} // namespace mlir::allo
 
 using namespace mlir;
 using namespace mlir::affine;
@@ -403,7 +398,6 @@ static int64_t pipelineDirective(Operation *loop, Operation *anchor) {
 // would allow. Keyed per callsite: distinct calls are distinct instances.
 static void populateCallOccupancy(Block &body, ChainingModuloProblem &problem) {
   using P = circt::scheduling::Problem;
-  Builder b(body.getParentOp()->getContext());
   unsigned idx = 0;
   for (Operation &op : body) {
     std::optional<std::pair<int64_t, std::string>> cl =
@@ -414,7 +408,7 @@ static void populateCallOccupancy(Block &body, ChainingModuloProblem &problem) {
         problem.getOrInsertResourceType(cl->second + "#" + std::to_string(idx));
     problem.setLimit(rsrc, 1);
     problem.setLinkedResourceTypes(&op, SmallVector<P::ResourceType>{rsrc});
-    op.setAttr(sched::kResourceCyclesAttr, b.getI64IntegerAttr(cl->first + 1));
+    problem.setResourceCycles(&op, cl->first + 1);
     ++idx;
   }
 }
@@ -426,12 +420,11 @@ static void populateCallOccupancy(Block &body, ChainingModuloProblem &problem) {
 // the II is reported as the body length, so the region latency folds to
 // `trip * depth`. Both cases reify to a dcp.pipeline (a non-pipelined loop is
 // just a pipeline whose II equals its own depth).
-static LogicalResult scheduleCyclic(LoopLikeOpInterface body,
-                                    DependenceAnalysis &deps,
-                                    const OperatorLibrary &lib,
-                                    func::FuncOp funcOp,
-                                    const SchedRegion &region, float cycleTime,
-                                    unsigned minII, bool pipelined) {
+static LogicalResult
+scheduleCyclic(LoopLikeOpInterface body, DependenceAnalysis &deps,
+               const OperatorLibrary &lib, func::FuncOp funcOp,
+               const SchedRegion &region, float cycleTime, unsigned minII,
+               bool pipelined, SchedulerKind kind) {
   auto problem = buildCyclicProblem<ChainingModuloProblem>(body, deps);
   Block *bodyBlock = &body.getLoopRegions().front()->front();
   if (failed(populateOperatorTypes(*bodyBlock, problem, lib)))
@@ -440,7 +433,7 @@ static LogicalResult scheduleCyclic(LoopLikeOpInterface body,
     return failure();
   populateCallOccupancy(*bodyBlock, problem);
   Operation *anchor = bodyBlock->getTerminator();
-  if (failed(solveSchedulingProblem(problem, anchor, cycleTime, minII)))
+  if (failed(solveSchedulingProblem(problem, anchor, cycleTime, minII, kind)))
     return failure();
   int64_t depth = scheduleDepth(problem);
   unsigned ii = pipelined ? problem.getInitiationInterval().value_or(depth)
@@ -467,19 +460,17 @@ static LogicalResult scheduleCyclic(LoopLikeOpInterface body,
       d << ", latency dynamic (trip not statically known)";
   }
 
-  // A non-pipelined multi-cycle operator holds its unit for its whole latency
-  // (occupancy stamped as kResourceCyclesAttr), so it caps iteration overlap.
-  // Name the dominant one as a QoR explanation for II > 1.
+  // A non-pipelined multi-cycle operator holds its unit for its whole latency,
+  // so it caps iteration overlap. Name the dominant one as a QoR explanation
+  // for II > 1.
   if (pipelined && ii > 1) {
     Operation *blocking = nullptr;
-    int64_t maxOcc = 1;
-    bodyBlock->walk([&](Operation *op) {
-      if (auto a = op->getAttrOfType<IntegerAttr>(sched::kResourceCyclesAttr))
-        if (a.getInt() > maxOcc) {
-          maxOcc = a.getInt();
-          blocking = op;
-        }
-    });
+    unsigned maxOcc = 1;
+    for (Operation *op : problem.getOperations())
+      if (unsigned occ = problem.getResourceCycles(op); occ > maxOcc) {
+        maxOcc = occ;
+        blocking = op;
+      }
     if (blocking)
       info(Stage::Sched, blocking)
           << "Operator " << blocking->getName().getStringRef()
@@ -498,7 +489,8 @@ static LogicalResult scheduleCyclic(LoopLikeOpInterface body,
 static LogicalResult scheduleWhile(scf::WhileOp w, DependenceAnalysis &deps,
                                    const OperatorLibrary &lib,
                                    func::FuncOp funcOp,
-                                   const SchedRegion &region, float cycleTime) {
+                                   const SchedRegion &region, float cycleTime,
+                                   SchedulerKind kind) {
   auto problem = buildWhileProblem<ChainingModuloProblem>(w, deps);
   // Operator types over both regions in one memory-bank analysis.
   if (failed(populateOperatorTypesImpl(
@@ -522,7 +514,7 @@ static LogicalResult scheduleWhile(scf::WhileOp w, DependenceAnalysis &deps,
   // as a lower bound. `ii=-1` (pipelining off) is not modeled for while loops.
   int64_t dir = pipelineDirective(w, region.anchor());
   unsigned minII = dir >= 1 ? static_cast<unsigned>(dir) : 1;
-  if (failed(solveSchedulingProblem(problem, anchor, cycleTime, minII)))
+  if (failed(solveSchedulingProblem(problem, anchor, cycleTime, minII, kind)))
     return failure();
   std::optional<unsigned> ii = problem.getInitiationInterval();
   info(Stage::Sched, w.getOperation())
@@ -537,17 +529,19 @@ static LogicalResult scheduleWhile(scf::WhileOp w, DependenceAnalysis &deps,
 
 // Schedule one straight-line region as a `ChainingSharedOperatorsProblem` (the
 // acyclic twin: resource-aware, timing-aware) and annotate the result.
-static LogicalResult
-scheduleAcyclic(ArrayRef<Operation *> ops, DependenceAnalysis &deps,
-                const OperatorLibrary &lib, func::FuncOp funcOp,
-                const SchedRegion &region, float cycleTime) {
+static LogicalResult scheduleAcyclic(ArrayRef<Operation *> ops,
+                                     DependenceAnalysis &deps,
+                                     const OperatorLibrary &lib,
+                                     func::FuncOp funcOp,
+                                     const SchedRegion &region, float cycleTime,
+                                     SchedulerKind kind) {
   ChainingSharedOperatorsProblem problem =
       buildAcyclicProblem<ChainingSharedOperatorsProblem>(ops, deps);
   if (failed(populateOperatorTypes(ops, problem, lib)))
     return failure();
   if (failed(populateMemoryResources(ops, problem, lib.memoryLibrary())))
     return failure();
-  if (failed(solveSchedulingProblem(problem, ops.back(), cycleTime)))
+  if (failed(solveSchedulingProblem(problem, ops.back(), cycleTime, kind)))
     return failure();
   // A straight-line region runs once per enclosing-loop iteration.
   bool isBound = false;
@@ -731,8 +725,7 @@ static void absorbLevelChildren(func::FuncOp funcOp, LoopLikeOpInterface level,
 // operators, child loops as non-pipelined unit-limit-1 resources (occupancy =
 // per-invocation latency), the `analyzeLevel` edges with their distances, all
 // nodes ordered before the loop terminator. Returns false when a child's
-// per-invocation latency is unknown; on success `tagged` holds the loop nodes
-// carrying a transient occupancy attr the caller must remove after solving.
+// per-invocation latency is unknown.
 //
 // The problem is timing-aware (`ChainingModuloProblem`): leaf ops carry their
 // library in/out delays so a combinational chain among level ops is cut at the
@@ -744,10 +737,8 @@ static bool buildLevelProblem(ChainingModuloProblem &problem,
                               const LevelAnalysis &a, LoopLikeOpInterface level,
                               DependenceAnalysis &deps,
                               const OperatorLibrary &lib, func::FuncOp funcOp,
-                              int64_t &resourceBound,
-                              SmallVectorImpl<Operation *> &tagged) {
+                              int64_t &resourceBound) {
   using P = circt::scheduling::Problem;
-  Builder b(level.getContext());
   Operation *anchor = level.getLoopRegions().front()->front().getTerminator();
   resourceBound = 0;
   for (const LevelNode &n : a.nodes)
@@ -758,12 +749,8 @@ static bool buildLevelProblem(ChainingModuloProblem &problem,
     if (n.isLoop) {
       std::optional<int64_t> lat =
           childInvocationLatency(n.anchor, funcOp, deps);
-      if (!lat) {
-        for (Operation *op : tagged)
-          op->removeAttr(sched::kResourceCyclesAttr);
-        tagged.clear();
+      if (!lat)
         return false;
-      }
       resourceBound = std::max(resourceBound, *lat);
       P::OperatorType opr =
           problem.getOrInsertOperatorType("loop" + std::to_string(idx));
@@ -777,8 +764,7 @@ static bool buildLevelProblem(ChainingModuloProblem &problem,
       problem.setLimit(rsrc, 1);
       problem.setLinkedResourceTypes(n.anchor,
                                      SmallVector<P::ResourceType>{rsrc});
-      n.anchor->setAttr(sched::kResourceCyclesAttr, b.getI64IntegerAttr(*lat));
-      tagged.push_back(n.anchor);
+      problem.setResourceCycles(n.anchor, *lat);
     } else {
       OperatorChar c = lib.lookup(n.anchor);
       P::OperatorType opr = problem.getOrInsertOperatorType(c.typeName);
@@ -812,22 +798,21 @@ static void logLevelII(const LevelAnalysis &a, LoopLikeOpInterface level,
     return;
   ChainingModuloProblem problem(level.getOperation());
   int64_t resourceBound = 0;
-  SmallVector<Operation *> tagged;
-  if (!buildLevelProblem(problem, a, level, deps, lib, funcOp, resourceBound,
-                         tagged)) {
+  if (!buildLevelProblem(problem, a, level, deps, lib, funcOp, resourceBound)) {
     debug(Stage::Sched) << "  Level II_outer = (child latency unknown)";
     return;
   }
   Operation *anchor = level.getLoopRegions().front()->front().getTerminator();
-  if (succeeded(
-          solveSchedulingProblem(problem, anchor, cycleTimeNs, /*minII=*/1)))
+  // Always the heuristic: this solve is a debug print of what a level's II
+  // would be, not a schedule anything reifies, so it should not spend an exact
+  // solve or fail the compile when one is unavailable.
+  if (succeeded(solveSchedulingProblem(problem, anchor, cycleTimeNs,
+                                       /*minII=*/1, SchedulerKind::Heuristic)))
     debug(Stage::Sched) << "  Level II_outer = "
                         << problem.getInitiationInterval().value_or(0)
                         << " (resource bound " << resourceBound << ")";
   else
     debug(Stage::Sched) << "  Level II_outer = (solve failed)";
-  for (Operation *op : tagged)
-    op->removeAttr(sched::kResourceCyclesAttr);
 }
 
 // Whether a pipelined imperfect level can be fused into ONE outer pipeline and
@@ -897,334 +882,454 @@ static bool levelIsPhaseBReifiable(LoopLikeOpInterface level,
   return true;
 }
 
-namespace {
-struct SdcSchedulingPass
-    : public allo::impl::SdcSchedulingPassBase<SdcSchedulingPass> {
-  using SdcSchedulingPassBase::SdcSchedulingPassBase;
+//===----------------------------------------------------------------------===//
+// Address cost: the check, and the report behind it.
+//
+// `OperatorLibrary::lookup` charges an access's address cone to the port it
+// feeds. What it cannot do is SPLIT one: an address is folded into the access's
+// affine map rather than standing as its own operation, so there is nowhere to
+// put a register and chaining can only accept or reject. CIRCT rejects it by
+// `emitError`-ing on the whole containing op (`ChainingSupport.cpp:34`), which
+// names neither the access nor the expression, so the same condition is tested
+// here first and reported against the address that caused it.
+//
+// The number is the cost of the address the emitter ACTUALLY builds
+// (`addressExprsOf`): the in-bank offset rather than the flat index, plus the
+// bank digit when one is decoded at runtime, carried at the addressed bank's
+// own width, with constant coefficients as signed-digit shift-adds and only
+// the dividers pinned to the full datapath width (they are the one thing that
+// cannot be narrowed). So the price, the report and the netlist agree, and
+// nothing here has to assume a synthesis tool will clean up after us.
+//
+// EVERY array access is priced, the non-affine ones included. Their subscript
+// is timed compute, but the row-major linearization over it and the bank digit
+// off it are address arithmetic like any other, and the emitter builds both.
+//
+// The per-access lines are `debug` level, so a normal compile sees only the
+// rejection; `ALLO_LOG_LEVEL=debug` shows every priced address.
+//===----------------------------------------------------------------------===//
+static LogicalResult checkAddressCost(func::FuncOp funcOp,
+                                      const OperatorLibrary &lib,
+                                      float cycleTimeNs) {
+  bool fits = true;
+  unsigned total = 0, nonTrivial = 0, overCycle = 0, banked = 0,
+           withDivider = 0;
+  double worstNow = 0.0;
 
-  void runOnOperation() override {
-    ModuleOp module = getOperation();
-
-    // Timing characterization for every op (latency + delays): built from the
-    // injected `dcp.device` + `dcp.operator` IR. Built once and shared by
-    // scheduling and reification.
-    auto loadedLib = OperatorLibrary::fromModule(module);
-
-    // Target clock period: the option, else a 5.0 ns default.
-    float cycleTimeNs = cycleTime > 0.0f ? cycleTime : 5.0f;
-
-    // Schedule bottom-up over the call graph: it is a DAG, so a post-order
-    // traversal schedules callees before callers
-    auto topFunc = module.lookupSymbol<func::FuncOp>(top);
-    if (!topFunc) {
-      error(Stage::Prep, module) << "Top function '" << top << "' not found";
-      return signalPassFailure();
+  funcOp.walk([&](Operation *op) {
+    std::optional<MemAccess> a = asMemAccess(op);
+    if (!a || a->kind != AccessKind::Array)
+      return;
+    ++total;
+    // The expressions the emitter evaluates, priced the way it will build them
+    // (strength-reduced where they can be), so the number printed and the
+    // number charged are the same number.
+    auto shape = cast<MemRefType>(a->root.getType()).getShape();
+    AddressExprs e = addressExprsOf(bankLayoutOf(a->root), a->map, shape,
+                                    assignedBankOf(op));
+    if (e.bank)
+      ++banked;
+    AddressCost cost = addressCostOf(op, lib);
+    if (cost.trivial())
+      return;
+    ++nonTrivial;
+    worstNow = std::max(worstNow, cost.delay);
+    if (cost.dividers)
+      ++withDivider;
+    // Name both cones, since either can be the one that does not fit.
+    std::string addr;
+    llvm::raw_string_ostream os(addr);
+    os << e.offset;
+    if (e.bank)
+      os << " (bank " << e.bank << ")";
+    // Test what the solver will see rather than the cone alone: the port's own
+    // setup rides on the same combinational path, and `lookup` is the one place
+    // that adds them, so asking it is what keeps this from drifting.
+    double charged = lib.lookup(op).inDelay;
+    bool over = charged > cycleTimeNs;
+    if (over) {
+      ++overCycle;
+      fits = false;
+      unsupported(Stage::Sched, op)
+          << "computing the address " << addr << " takes "
+          << llvm::format("%.2f", cost.delay)
+          << " ns, which with the storage port's own setup is "
+          << llvm::format("%.2f", charged) << " ns against a "
+          << llvm::format("%.2f", cycleTimeNs)
+          << " ns clock period. The backend cannot pipeline an address: it is "
+             "folded into the access's address map rather than scheduled as an "
+             "operation of its own, so there is nowhere to place a register. "
+             "Compute the subscript into a variable so it becomes a "
+             "schedulable value, partition by a power of two so the bank digit "
+             "is a mask rather than a divider, or lower the target frequency";
     }
-    auto orderedFnsOr = buildAndSortCallsiteGraph(topFunc);
-    if (failed(orderedFnsOr))
-      return signalPassFailure();
+    // A real divider is a narrow case worth naming (a loop-counter digit is a
+    // register, a power-of-two divisor a mask); speaks only when the address
+    // still fits, since the rejection above already covers the failing case.
+    if (cost.dividers && !over)
+      warn(Stage::Sched, op)
+          << "The address " << addr << " costs "
+          << llvm::format("%.2f", cost.delay)
+          << " ns because it divides at "
+             "runtime. A divisor that is a power of two is a mask, and a "
+             "dividend that advances with a loop counter is a register the "
+             "controller maintains; a divider is what is left when the "
+             "subscript is neither. Choose a power-of-two partition factor, or "
+             "index the array by a loop counter";
+    debug(Stage::Sched, op)
+        << "Address " << addr << ": " << llvm::format("%.2f", cost.delay)
+        << " ns" << (over ? " (OVER the clock period)" : "") << " at "
+        << e.width << "b [" << cost.adders << " add, " << cost.dividers
+        << " div, " << cost.multipliers << " mul]";
+  });
 
-    IRRewriter rewriter(module.getContext());
-    SymbolTableCollection syms;
-    llvm::SmallPtrSet<Operation *, 32> scheduled;
+  if (!total)
+    return success(fits);
+  debug(Stage::Sched) << "Address arithmetic in " << funcOp.getSymName().str()
+                      << ": " << nonTrivial << "/" << total
+                      << " array accesses cost logic, worst "
+                      << llvm::format("%.2f", worstNow) << " ns (" << overCycle
+                      << " over the " << llvm::format("%.2f", cycleTimeNs)
+                      << " ns period, " << withDivider
+                      << " carrying a divider, " << banked
+                      << " decoding a bank at runtime)";
+  return success(fits);
+}
 
-    for (Operation *callOp : *orderedFnsOr) {
-      auto call = cast<func::CallOp>(callOp);
-      auto callee = syms.lookupNearestSymbolFrom<func::FuncOp>(
-          call, call.getCalleeAttr());
-      assert(callee && "callee must exist in the call graph");
-      if (!scheduled.insert(callee).second)
-        continue; // already scheduled this callee (multiple callsites)
-      if (failed(scheduleFunc(rewriter, callee, loadedLib, cycleTimeNs)))
-        return signalPassFailure();
-    }
+// forward declarations for the recursive scheduling functions
+static LogicalResult scheduleBlock(Block &block, unsigned &nextId,
+                                   DependenceAnalysis &deps,
+                                   const OperatorLibrary &lib,
+                                   func::FuncOp funcOp, float cycleTimeNs,
+                                   SchedulerKind kind);
 
-    // root function is scheduled last
-    if (scheduled.insert(topFunc).second) {
-      if (failed(scheduleFunc(rewriter, topFunc, loadedLib, cycleTimeNs)))
-        return signalPassFailure();
-    }
+static LogicalResult
+scheduleLevelPipelined(LoopLikeOpInterface level, unsigned &nextId,
+                       DependenceAnalysis &deps, const OperatorLibrary &lib,
+                       func::FuncOp funcOp, float cycleTimeNs,
+                       SchedulerKind kind);
+
+// Schedule one region: a straight-line span as an acyclic problem, a
+// counted loop as a cyclic problem. An imperfect counted nest, whose
+// innermost band body still holds loops (sibling loops, or ops surrounding
+// an inner loop), is either pipelined over its children (when the outer
+// loop carries an explicit pipeline directive) or decomposed into per-body
+// sub-regions, the band loops staying as wrapper loops whose trips fold
+// into each sub-region's latency via `enclosingTripProduct`. `nextId` hands
+// out region ids in program order so the reify's prefix-sum composition
+// stays correct. Cross-region composition is by program order / SSA only.
+static LogicalResult scheduleRegion(SchedRegion region, unsigned &nextId,
+                                    DependenceAnalysis &deps,
+                                    const OperatorLibrary &lib,
+                                    func::FuncOp funcOp, float cycleTimeNs,
+                                    SchedulerKind kind) {
+  if (region.kind != allo::RegionKind::Loop) {
+    // An all-constant span is a tie-off the reify leaves in place (no
+    // latency, no materialized region); scheduling it would cost a spurious
+    // region and desync the whole-kernel latency.
+    if (llvm::all_of(region.ops,
+                     [](Operation *op) { return isa<arith::ConstantOp>(op); }))
+      return success();
+    region.id = nextId++;
+    info(Stage::Sched, region.anchor())
+        << "Region " << region.id << " is a straight-line span of "
+        << region.ops.size() << " op(s), using acyclic scheduling";
+    return scheduleAcyclic(region.ops, deps, lib, funcOp, region, cycleTimeNs,
+                           kind);
   }
-
-  void getDependentDialects(DialectRegistry &registry) const override {
-    registry.insert<allo::AlloDialect, arith::ArithDialect, func::FuncDialect,
-                    math::MathDialect, affine::AffineDialect, scf::SCFDialect,
-                    memref::MemRefDialect>();
-  }
-
-  // Pipeline an imperfect level over its children. Schedule the child loops
-  // only, since the leaf ops go into the level problem, then solve the level as
-  // one modulo problem (each child loop a non-pipelined resource node) so the
-  // outer loop pipelines at II_outer = max(child occupancy, recurrence II),
-  // overlapping the leaf ops and consecutive iterations. The leaf ops and the
-  // level descriptor are annotated; the child loops keep their own regions
-  // (materialized as nested dcp.pipelines). Precondition: the caller entered
-  // only after `levelIsPhaseBReifiable`, so every child is a single counted
-  // loop with a known latency and the level problem is guaranteed
-  // constructible.
-  LogicalResult scheduleLevelPipelined(LoopLikeOpInterface level,
-                                       unsigned &nextId,
-                                       DependenceAnalysis &deps,
-                                       const OperatorLibrary &lib,
-                                       func::FuncOp funcOp, float cycleTimeNs) {
-    Block &body = level.getLoopRegions().front()->front();
-    for (const SchedRegion &sub : enumerateRegions(body))
-      if (sub.kind == allo::RegionKind::Loop)
-        if (failed(scheduleRegion(sub, nextId, deps, lib, funcOp, cycleTimeNs)))
-          return failure();
-
-    LevelAnalysis a = analyzeLevel(level, deps);
-    logLevelAnalysis(a, level);
-    {
-      unsigned loops = 0;
-      for (const LevelNode &n : a.nodes)
-        loops += n.isLoop;
-      info(Stage::Sched, level.getOperation())
-          << "  Level analysis: " << a.nodes.size() << " node(s) ("
-          << (a.nodes.size() - loops) << " leaf op(s) + " << loops
-          << " inner loop(s)), " << a.edges.size()
-          << " dependence edge(s) constrain their overlap";
-    }
-    ChainingModuloProblem problem(level.getOperation());
-    int64_t resourceBound = 0;
-    SmallVector<Operation *> tagged;
-    if (!buildLevelProblem(problem, a, level, deps, lib, funcOp, resourceBound,
-                           tagged)) {
-      error(Stage::Sched, level.getOperation())
-          << "Phase B level problem construction failed unexpectedly";
-      signalPassFailure();
-      return failure();
-    }
-
-    Operation *anchor = body.getTerminator();
-    LogicalResult solved =
-        solveSchedulingProblem(problem, anchor, cycleTimeNs, /*minII=*/1);
-    if (succeeded(solved)) {
-      unsigned ii = problem.getInitiationInterval().value_or(1);
-      bool isBound = false;
-      std::optional<int64_t> latency = regionLatency(
-          level.getOperation(), ii, scheduleDepth(problem), deps, isBound);
-      int64_t levelId = nextId++;
-      // Tag the level loop so the reify materializes it into the outer
-      // dcp.pipeline (its children are materialized first as nested pipelines).
-      level->setAttr(sched::kLevelAttr,
-                     Builder(level.getContext()).getI64IntegerAttr(levelId));
-      annotateRegion(problem, funcOp, levelId, "cyclic", ii, latency, isBound);
-      annotateStartTimeInCycle(problem);
-      absorbLevelChildren(funcOp, level, levelId, problem, a);
-      {
-        auto d = info(Stage::Sched, level.getOperation());
-        d << "Phase B: outer loop pipelined at II=" << ii << " (";
-        if (ii == static_cast<unsigned>(resourceBound))
-          d << "the busiest inner loop's occupancy, " << resourceBound
-            << " cycles";
-        else
-          d << "above the " << resourceBound
-            << "-cycle inner-loop occupancy, raised by a level-carried "
-               "recurrence";
-        d << ")";
-      }
-      // The container controller starts each child on the previous one's done
-      // and advances the outer counter on the last drain, so it runs exactly
-      // one outer iteration at a time. A solved II below the body length asks
-      // for an overlap it does not perform: the hardware is correct, but slower
-      // than the latency solved against that II.
-      if (int64_t length = scheduleDepth(problem); ii < length)
-        warn(Stage::Sched, level.getOperation())
-            << "Outer-iteration overlap is not emitted yet (II=" << ii
-            << " under a " << length
-            << "-cycle body): the container runs its inner loops one outer "
-               "iteration at a time, so the hardware is correct but slower "
-               "than the reported latency";
-    }
-    for (Operation *op : tagged)
-      op->removeAttr(sched::kResourceCyclesAttr);
-    if (failed(solved)) {
-      error(Stage::Sched, level.getOperation())
-          << "Pipelined nest not scheduled";
-      signalPassFailure();
-      return failure();
-    }
-    return success();
-  }
-
-  // Schedule one region: a straight-line span as an acyclic problem, a counted
-  // loop as a cyclic problem. An imperfect counted nest, whose innermost band
-  // body still holds loops (sibling loops, or ops surrounding an inner loop),
-  // is either pipelined over its children (when the outer loop carries an
-  // explicit pipeline directive) or decomposed into per-body sub-regions, the
-  // band loops staying as wrapper loops whose trips fold into each sub-region's
-  // latency via `enclosingTripProduct`. `nextId` hands out region ids in
-  // program order so the reify's prefix-sum composition stays correct.
-  // Cross-region composition is by program order / SSA only.
-  LogicalResult scheduleRegion(SchedRegion region, unsigned &nextId,
-                               DependenceAnalysis &deps,
-                               const OperatorLibrary &lib, func::FuncOp funcOp,
-                               float cycleTimeNs) {
-    if (region.kind != allo::RegionKind::Loop) {
-      // An all-constant span is a tie-off the reify leaves in place (no
-      // latency, no materialized region); scheduling it would cost a spurious
-      // region and desync the whole-kernel latency.
-      if (llvm::all_of(region.ops, [](Operation *op) {
-            return isa<arith::ConstantOp>(op);
-          }))
-        return success();
-      region.id = nextId++;
-      info(Stage::Sched, region.anchor())
-          << "Region " << region.id << " is a straight-line span of "
-          << region.ops.size() << " op(s), using acyclic scheduling";
-      return scheduleAcyclic(region.ops, deps, lib, funcOp, region,
-                             cycleTimeNs);
-    }
-    if (isa<AffineForOp, scf::ForOp>(region.anchor())) {
-      LoopLikeOpInterface innermost =
-          perfectNest(cast<LoopLikeOpInterface>(region.anchor())).back();
-      int64_t dir =
-          pipelineDirective(innermost.getOperation(), region.anchor());
-      if (loopBodyDecomposes(innermost)) {
-        std::string why;
-        if (dir >= 1 && levelIsPhaseBReifiable(innermost, deps, why)) {
-          info(Stage::Sched, innermost.getOperation())
-              << "Detected imperfect nest with pipeline directives, "
-                 "fusing the outer loop over its inner loop(s) as one modulo "
-                 "problem (each inner loop as a fixed-latency resource node)";
-          return scheduleLevelPipelined(innermost, nextId, deps, lib, funcOp,
-                                        cycleTimeNs);
-        }
-        if (dir >= 1)
-          warn(Stage::Sched, innermost.getOperation())
-              << "Pipelined imperfect nest not fused into one pipeline (" << why
-              << "); scheduling its body as sequential sub-regions";
+  if (isa<AffineForOp, scf::ForOp>(region.anchor())) {
+    LoopLikeOpInterface innermost =
+        perfectNest(cast<LoopLikeOpInterface>(region.anchor())).back();
+    int64_t dir = pipelineDirective(innermost.getOperation(), region.anchor());
+    if (loopBodyDecomposes(innermost)) {
+      std::string why;
+      if (dir >= 1 && levelIsPhaseBReifiable(innermost, deps, why)) {
         info(Stage::Sched, innermost.getOperation())
-            << "Detected imperfect nest, decomposing into sub-regions "
-               "scheduled in program order.";
-        Block &body = innermost.getLoopRegions().front()->front();
-        if (failed(scheduleBlock(body, nextId, deps, lib, funcOp, cycleTimeNs)))
-          return failure();
-        if (logging::detail::enabled(logging::Level::Debug)) {
-          LevelAnalysis la = analyzeLevel(innermost, deps);
-          logLevelAnalysis(la, innermost);
-          logLevelII(la, innermost, deps, lib, funcOp, cycleTimeNs);
-        }
-        return success();
+            << "Detected imperfect nest with pipeline directives, "
+               "fusing the outer loop over its inner loop(s) as one modulo "
+               "problem (each inner loop as a fixed-latency resource node)";
+        return scheduleLevelPipelined(innermost, nextId, deps, lib, funcOp,
+                                      cycleTimeNs, kind);
       }
-      region.id = nextId++;
-      {
-        auto d = info(Stage::Sched, innermost.getOperation());
-        d << "Region " << region.id << " detected as a for-loop";
-        if (unsigned band =
-                perfectNest(cast<LoopLikeOpInterface>(region.anchor())).size();
-            band > 1)
-          d << " (perfect band of " << band << " levels)";
-        if (dir == -1)
-          d << ", pipelining disabled";
-        else if (dir >= 1)
-          d << ", target II=" << dir;
-        d << ", using modulo-scheduling in the innermost body";
+      if (dir >= 1)
+        warn(Stage::Sched, innermost.getOperation())
+            << "Pipelined imperfect nest not fused into one pipeline (" << why
+            << "); scheduling its body as sequential sub-regions";
+      info(Stage::Sched, innermost.getOperation())
+          << "Detected imperfect nest, decomposing into sub-regions "
+             "scheduled in program order.";
+      Block &body = innermost.getLoopRegions().front()->front();
+      if (failed(scheduleBlock(body, nextId, deps, lib, funcOp, cycleTimeNs,
+                               kind)))
+        return failure();
+      if (logging::detail::enabled(logging::Level::Debug)) {
+        LevelAnalysis la = analyzeLevel(innermost, deps);
+        logLevelAnalysis(la, innermost);
+        logLevelII(la, innermost, deps, lib, funcOp, cycleTimeNs);
       }
-      return scheduleCyclic(innermost, deps, lib, funcOp, region, cycleTimeNs,
-                            dir >= 1 ? static_cast<unsigned>(dir) : 1,
-                            /*pipelined=*/dir != -1);
-    }
-    // An uncounted while (counted ones are already scf.for) with a
-    // straight-line body schedules as a flushing pipeline over before+after;
-    // one nesting a loop cannot, as the inner ops would flatten into it.
-    if (auto whileOp = dyn_cast<scf::WhileOp>(region.anchor())) {
-      // A nested loop (data-dependent per-iteration length) or a condition not
-      // settled at issue forces the sequential CHECK/RUN controller. The
-      // reifier's routing shares `conditionIsCombinational`, so the two agree.
-      if (!whileFlushingPipelines(whileOp, lib)) {
-        info(Stage::Sched, whileOp)
-            << "While loop cannot flushing-pipeline (nested loop, sub-kernel "
-               "call, or non-combinational condition); decomposing its body "
-               "into sub-regions scheduled in program order (the outer while "
-               "runs sequentially, latency data-dependent)";
-        return scheduleBlock(whileOp.getAfter().front(), nextId, deps, lib,
-                             funcOp, cycleTimeNs);
-      }
-      // `verify-rtl-legality` rejects a flushing while that does not forward
-      // 1:1, so `buildWhileProblem`'s slot alignment holds here.
-      assert(whileHasIdentityForwarding(whileOp) &&
-             "a flushing while reached scheduling without identity forwarding");
-      region.id = nextId++;
-      info(Stage::Sched, whileOp.getOperation())
-          << "Region " << region.id
-          << " detected as a while-loop, using flushing-pipeline schedule";
-      return scheduleWhile(whileOp, deps, lib, funcOp, region, cycleTimeNs);
-    }
-    // An `if` that `fold-if-statements` could not predicate stays a control
-    // construct: decompose each branch into sub-regions and leave the `if` raw
-    // around them, as for the nested-loop while above.
-    if (isa<AffineIfOp, scf::IfOp>(region.anchor())) {
-      Operation *ifOp = region.anchor();
-      info(Stage::Sched, ifOp)
-          << "Detected a conditional left opaque by if-conversion; decomposing "
-             "each branch into sub-regions and keeping the `if` as a guard";
-      for (Region &branch : ifOp->getRegions())
-        if (!branch.empty())
-          if (failed(scheduleBlock(branch.front(), nextId, deps, lib, funcOp,
-                                   cycleTimeNs)))
-            return failure();
       return success();
     }
-    error(Stage::Sched, region.anchor()) << "Loop not scheduled";
-    signalPassFailure();
+    region.id = nextId++;
+    {
+      auto d = info(Stage::Sched, innermost.getOperation());
+      d << "Region " << region.id << " detected as a for-loop";
+      if (unsigned band =
+              perfectNest(cast<LoopLikeOpInterface>(region.anchor())).size();
+          band > 1)
+        d << " (perfect band of " << band << " levels)";
+      if (dir == -1)
+        d << ", pipelining disabled";
+      else if (dir >= 1)
+        d << ", target II=" << dir;
+      d << ", using modulo-scheduling in the innermost body";
+    }
+    return scheduleCyclic(innermost, deps, lib, funcOp, region, cycleTimeNs,
+                          dir >= 1 ? static_cast<unsigned>(dir) : 1,
+                          /*pipelined=*/dir != -1, kind);
+  }
+  // An uncounted while (counted ones are already scf.for) with a
+  // straight-line body schedules as a flushing pipeline over before+after;
+  // one nesting a loop cannot, as the inner ops would flatten into it.
+  if (auto whileOp = dyn_cast<scf::WhileOp>(region.anchor())) {
+    // A nested loop (data-dependent per-iteration length) or a condition not
+    // settled at issue forces the sequential CHECK/RUN controller. The
+    // reifier's routing shares `conditionIsCombinational`, so the two agree.
+    if (!whileFlushingPipelines(whileOp, lib)) {
+      info(Stage::Sched, whileOp)
+          << "While loop cannot flushing-pipeline (nested loop, sub-kernel "
+             "call, or non-combinational condition); decomposing its body "
+             "into sub-regions scheduled in program order (the outer while "
+             "runs sequentially, latency data-dependent)";
+      return scheduleBlock(whileOp.getAfter().front(), nextId, deps, lib,
+                           funcOp, cycleTimeNs, kind);
+    }
+    // `verify-rtl-legality` rejects a flushing while that does not forward
+    // 1:1, so `buildWhileProblem`'s slot alignment holds here.
+    assert(whileHasIdentityForwarding(whileOp) &&
+           "a flushing while reached scheduling without identity forwarding");
+    region.id = nextId++;
+    info(Stage::Sched, whileOp.getOperation())
+        << "Region " << region.id
+        << " detected as a while-loop, using flushing-pipeline schedule";
+    return scheduleWhile(whileOp, deps, lib, funcOp, region, cycleTimeNs, kind);
+  }
+  // An `if` that `fold-if-statements` could not predicate stays a control
+  // construct: decompose each branch into sub-regions and leave the `if` raw
+  // around them, as for the nested-loop while above.
+  if (isa<AffineIfOp, scf::IfOp>(region.anchor())) {
+    Operation *ifOp = region.anchor();
+    info(Stage::Sched, ifOp)
+        << "Detected a conditional left opaque by if-conversion; decomposing "
+           "each branch into sub-regions and keeping the `if` as a guard";
+    for (Region &branch : ifOp->getRegions())
+      if (!branch.empty())
+        if (failed(scheduleBlock(branch.front(), nextId, deps, lib, funcOp,
+                                 cycleTimeNs, kind)))
+          return failure();
+    return success();
+  }
+  error(Stage::Sched, region.anchor()) << "Loop not scheduled";
+  return failure();
+}
+
+static LogicalResult scheduleBlock(Block &block, unsigned &nextId,
+                                   DependenceAnalysis &deps,
+                                   const OperatorLibrary &lib,
+                                   func::FuncOp funcOp, float cycleTimeNs,
+                                   SchedulerKind kind) {
+  for (const SchedRegion &region : enumerateRegions(block))
+    if (failed(scheduleRegion(region, nextId, deps, lib, funcOp, cycleTimeNs,
+                              kind)))
+      return failure();
+  return success();
+}
+
+// Solve and annotate the schedule of one function.
+static LogicalResult scheduleFunc(RewriterBase &b, func::FuncOp funcOp,
+                                  const OperatorLibrary &lib, float cycleTimeNs,
+                                  SchedulerKind kind) {
+  std::string infoStr = "-- Start scheduling for " + funcOp.getSymName().str();
+  info(Stage::Sched) << std::string(infoStr.size() * 2, '-');
+  info(Stage::Sched) << infoStr;
+  info(Stage::Sched) << std::string(infoStr.size() * 2, '-');
+
+  if (failed(checkAddressCost(funcOp, lib, cycleTimeNs)))
+    return failure();
+
+  // Whole-func memory + stream dependence analysis, refined by the
+  // `allo.assume.*` hints.
+  DependenceAnalysis deps(funcOp);
+#ifndef NDEBUG
+  // `verify-rtl-legality` rejects an access the analysis does not model, so
+  // reaching here means the two disagree and this op's dependences were
+  // dropped; scheduling would freely reorder it against what it aliases.
+  funcOp.walk([](Operation *op) {
+    assert(!isUnmodeledMemoryAccess(op) &&
+           "an unmodeled memory access reached scheduling");
+  });
+#endif
+
+  // Erase the consumed hint ops: they carry no schedulable computation and
+  // would otherwise perturb the problem.
+  SmallVector<Operation *, 4> hints;
+  funcOp.walk([&](Operation *op) {
+    if (isa<AssumeNoDepOp, AssumeSSAOp>(op))
+      hints.push_back(op);
+  });
+  for (Operation *op : hints)
+    eraseHintAndDeadInputs(b, op);
+
+  // Schedule the function body's regions, recursing into imperfect nests.
+  // Region ids are handed out in program order for the reify's latency
+  // prefix sum.
+  unsigned nextId = 0;
+  if (failed(scheduleBlock(funcOp.getBody().front(), nextId, deps, lib, funcOp,
+                           cycleTimeNs, kind)))
+    return failure();
+
+  annotateKernelLatency(funcOp);
+  return success();
+}
+
+static LogicalResult
+scheduleLevelPipelined(LoopLikeOpInterface level, unsigned &nextId,
+                       DependenceAnalysis &deps, const OperatorLibrary &lib,
+                       func::FuncOp funcOp, float cycleTimeNs,
+                       SchedulerKind kind) {
+  Block &body = level.getLoopRegions().front()->front();
+  for (const SchedRegion &sub : enumerateRegions(body))
+    if (sub.kind == allo::RegionKind::Loop)
+      if (failed(scheduleRegion(sub, nextId, deps, lib, funcOp, cycleTimeNs,
+                                kind)))
+        return failure();
+
+  LevelAnalysis a = analyzeLevel(level, deps);
+  logLevelAnalysis(a, level);
+  {
+    unsigned loops = 0;
+    for (const LevelNode &n : a.nodes)
+      loops += n.isLoop;
+    info(Stage::Sched, level.getOperation())
+        << "  Level analysis: " << a.nodes.size() << " node(s) ("
+        << (a.nodes.size() - loops) << " leaf op(s) + " << loops
+        << " inner loop(s)), " << a.edges.size()
+        << " dependence edge(s) constrain their overlap";
+  }
+  ChainingModuloProblem problem(level.getOperation());
+  int64_t resourceBound = 0;
+  if (!buildLevelProblem(problem, a, level, deps, lib, funcOp, resourceBound)) {
+    error(Stage::Sched, level.getOperation())
+        << "Phase B level problem construction failed unexpectedly";
     return failure();
   }
 
-  LogicalResult scheduleBlock(Block &block, unsigned &nextId,
-                              DependenceAnalysis &deps,
-                              const OperatorLibrary &lib, func::FuncOp funcOp,
-                              float cycleTimeNs) {
-    for (const SchedRegion &region : enumerateRegions(block))
-      if (failed(
-              scheduleRegion(region, nextId, deps, lib, funcOp, cycleTimeNs)))
-        return failure();
-    return success();
+  Operation *anchor = body.getTerminator();
+  LogicalResult solved =
+      solveSchedulingProblem(problem, anchor, cycleTimeNs, /*minII=*/1, kind);
+  if (succeeded(solved)) {
+    unsigned ii = problem.getInitiationInterval().value_or(1);
+    bool isBound = false;
+    std::optional<int64_t> latency = regionLatency(
+        level.getOperation(), ii, scheduleDepth(problem), deps, isBound);
+    int64_t levelId = nextId++;
+    // Tag the level loop so the reify materializes it into the outer
+    // dcp.pipeline (its children are materialized first as nested pipelines).
+    level->setAttr(sched::kLevelAttr,
+                   Builder(level.getContext()).getI64IntegerAttr(levelId));
+    annotateRegion(problem, funcOp, levelId, "cyclic", ii, latency, isBound);
+    annotateStartTimeInCycle(problem);
+    absorbLevelChildren(funcOp, level, levelId, problem, a);
+    {
+      auto d = info(Stage::Sched, level.getOperation());
+      d << "Phase B: outer loop pipelined at II=" << ii << " (";
+      if (ii == static_cast<unsigned>(resourceBound))
+        d << "the busiest inner loop's occupancy, " << resourceBound
+          << " cycles";
+      else
+        d << "above the " << resourceBound
+          << "-cycle inner-loop occupancy, raised by a level-carried "
+             "recurrence";
+      d << ")";
+    }
+    // The container starts each child on the previous one's done, running one
+    // outer iteration at a time; a solved II below the body length asks for
+    // overlap that is not implemented.
+    if (int64_t length = scheduleDepth(problem); ii < length)
+      warn(Stage::Sched, level.getOperation())
+          << "Outer-iteration overlap is not emitted yet (II=" << ii
+          << " under a " << length
+          << "-cycle body): the container runs its inner loops one outer "
+             "iteration at a time, so the hardware is correct but slower "
+             "than the reported latency";
   }
+  if (failed(solved)) {
+    error(Stage::Sched, level.getOperation()) << "Pipelined nest not scheduled";
+    return failure();
+  }
+  return success();
+}
 
-  // Solve and annotate the schedule of one function.
-  LogicalResult scheduleFunc(RewriterBase &b, func::FuncOp funcOp,
-                             const OperatorLibrary &lib, float cycleTimeNs) {
-    std::string infoStr =
-        "-- Start scheduling for " + funcOp.getSymName().str();
-    info(Stage::Sched) << std::string(infoStr.size() * 2, '-');
-    info(Stage::Sched) << infoStr;
-    info(Stage::Sched) << std::string(infoStr.size() * 2, '-');
+static void loadDependentDialects(MLIRContext &context) {
+  context.getOrLoadDialect<allo::AlloDialect>();
+  context.getOrLoadDialect<arith::ArithDialect>();
+  context.getOrLoadDialect<func::FuncDialect>();
+  context.getOrLoadDialect<math::MathDialect>();
+  context.getOrLoadDialect<affine::AffineDialect>();
+  context.getOrLoadDialect<scf::SCFDialect>();
+  context.getOrLoadDialect<memref::MemRefDialect>();
+}
 
-    // Whole-func memory + stream dependence analysis, refined by the
-    // `allo.assume.*` hints.
-    DependenceAnalysis deps(funcOp);
-#ifndef NDEBUG
-    // `verify-rtl-legality` rejects an access the analysis does not model, so
-    // reaching here means the two disagree and this op's dependences were
-    // dropped; scheduling would freely reorder it against what it aliases.
-    funcOp.walk([](Operation *op) {
-      assert(!isUnmodeledMemoryAccess(op) &&
-             "an unmodeled memory access reached scheduling");
-    });
-#endif
+LogicalResult mlir::allo::runSDCScheduler(ModuleOp module, StringRef top,
+                                          float cycleTime, SchedulerKind kind) {
+  // Fail before any work when the exact scheduler was asked for and this build
+  // has none: the whole compile would fail region by region otherwise, and the
+  // fix is to the build rather than to the kernel.
+  if (kind == SchedulerKind::Exact && !hasExactScheduler()) {
+    unsupported(Stage::Sched, module)
+        << "scheduler=\"exact\" was requested but this build was configured "
+           "without OR-Tools. Rebuild with -DALLO_ENABLE_ORTOOLS=ON, or use "
+           "the default scheduler=\"heuristic\"";
+    return failure();
+  }
+  loadDependentDialects(*module->getContext());
+  // Timing characterization for every op (latency + delays): built from the
+  // injected `dcp.device` + `dcp.operator` IR. Built once and shared by
+  // scheduling and reification.
+  auto loadedLib = OperatorLibrary::fromModule(module);
 
-    // Erase the consumed hint ops: they carry no schedulable computation and
-    // would otherwise perturb the problem.
-    SmallVector<Operation *, 4> hints;
-    funcOp.walk([&](Operation *op) {
-      if (isa<AssumeNoDepOp, AssumeSSAOp>(op))
-        hints.push_back(op);
-    });
-    for (Operation *op : hints)
-      eraseHintAndDeadInputs(b, op);
+  // Target clock period: the option, else a 5.0 ns default.
+  float cycleTimeNs = cycleTime > 0.0f ? cycleTime : 5.0f;
 
-    // Schedule the function body's regions, recursing into imperfect nests.
-    // Region ids are handed out in program order for the reify's latency
-    // prefix sum.
-    unsigned nextId = 0;
-    if (failed(scheduleBlock(funcOp.getBody().front(), nextId, deps, lib,
-                             funcOp, cycleTimeNs)))
+  // Schedule bottom-up over the call graph: it is a DAG, so a post-order
+  // traversal schedules callees before callers
+  auto topFunc = module.lookupSymbol<func::FuncOp>(top);
+  if (!topFunc) {
+    error(Stage::Prep, module) << "Top function '" << top << "' not found";
+    return failure();
+  }
+  auto orderedFnsOr = buildAndSortCallsiteGraph(topFunc);
+  if (failed(orderedFnsOr))
+    return failure();
+
+  IRRewriter rewriter(module.getContext());
+  SymbolTableCollection syms;
+  llvm::SmallPtrSet<Operation *, 32> scheduled;
+
+  for (Operation *callOp : *orderedFnsOr) {
+    auto call = cast<func::CallOp>(callOp);
+    auto callee =
+        syms.lookupNearestSymbolFrom<func::FuncOp>(call, call.getCalleeAttr());
+    assert(callee && "callee must exist in the call graph");
+    if (!scheduled.insert(callee).second)
+      continue; // already scheduled this callee (multiple callsites)
+    if (failed(scheduleFunc(rewriter, callee, loadedLib, cycleTimeNs, kind)))
       return failure();
-
-    annotateKernelLatency(funcOp);
-    return success();
   }
-};
-} // namespace
+
+  // root function is scheduled last
+  if (scheduled.insert(topFunc).second) {
+    if (failed(scheduleFunc(rewriter, topFunc, loadedLib, cycleTimeNs, kind)))
+      return failure();
+  }
+  return success();
+}

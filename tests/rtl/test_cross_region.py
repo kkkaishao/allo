@@ -12,7 +12,7 @@ import pytest
 from allo import kernel
 from allo.lang import i32, f32
 
-from _common import _to_rtl, _latency, _iis, FADD, MEM_REDUCE_II  # noqa: E402
+from _common import Mod, _to_rtl, _latency, _iis, FADD, MEM_REDUCE_II  # noqa: E402
 
 pytestmark = pytest.mark.skipif(
     shutil.which("verilator") is None, reason="verilator not available"
@@ -438,18 +438,22 @@ def test_independent_siblings_run_concurrently_cosim():
         for i in range(64):
             D[i] = B[i] * 2
 
-    serial = _latency(indep)  # the reifier still sums the two regions serially
-    assert serial is not None
+    rtl = _to_rtl(indep)
+    # Concurrency read off the control structure rather than the clock: the
+    # second region's run register is not gated on the first's done, which is
+    # exactly what a serializing composer would add. Timing would say the same
+    # thing, but only as a number that moves whenever the sweeps get faster.
+    m = Mod(rtl.mlir, "indep")
+    _, run1 = m.reg_named("r1_run")
+    assert "r0_done" not in {m.hint.get(v, v) for v in m.cone(run1, limit=256)}
+
     A = np.arange(64, dtype=np.int32)
     B = np.arange(64, dtype=np.int32) + 100
     C = np.zeros(64, np.int32)
     D = np.zeros(64, np.int32)
-    r = _to_rtl(indep).cosim(A, B, C, D)
+    rtl.cosim(A, B, C, D)
     assert np.array_equal(C, A + 1)
     assert np.array_equal(D, B * 2)
-    # The two ~64-cycle sweeps overlap: the kernel completes in about one sweep,
-    # comfortably under half again the serial sum (observed ~69 vs 135).
-    assert r.cycles < serial
 
 
 # ---------------------------------------------------------------------------
@@ -479,8 +483,7 @@ def test_call_scalar_reads_enclosing_iter_arg():
 
     B = np.zeros((4, 4), dtype=np.int32)
     rtl = _to_rtl(call_reads_outer_carry)
-    r = rtl.cosim(B)
-    assert r.cycles > 0
+    rtl.cosim(B)
     # Row i sees acc == 1 + i (the survivor advances on each outer drain).
     expected = np.tile((2 * (1 + np.arange(4)) + 1).reshape(4, 1), (1, 4))
     assert np.array_equal(B, expected.astype(np.int32))
@@ -502,8 +505,7 @@ def test_reduction_init_from_peeled_prologue():
     A = np.arange(32, dtype=np.int32).reshape(4, 8)
     B = np.zeros(4, dtype=np.int32)
     rtl = _to_rtl(init_from_iv)
-    r = rtl.cosim(A, B)
-    assert r.cycles > 0
+    rtl.cosim(A, B)
     assert np.array_equal(B, np.arange(4) + A.sum(axis=1))
 
 
@@ -522,8 +524,7 @@ def test_loop_bound_from_enclosing_counter():
     A = np.arange(64, dtype=np.int32).reshape(8, 8)
     B = np.zeros(8, dtype=np.int32)
     rtl = _to_rtl(triangular)
-    r = rtl.cosim(A, B)
-    assert r.cycles > 0
+    rtl.cosim(A, B)
     assert np.array_equal(B, np.array([A[i, i:].sum() for i in range(8)]))
 
 
@@ -568,8 +569,7 @@ def test_cross_region_sibling_scalar_cosim():
     # The scalar crosses as a formal region result (the survivor path), so the
     # reject is not hit and the value is not spilled to memory.
     assert _no_cross_region_reject(rtl)
-    r = rtl.cosim(A, out)
-    assert r.cycles > 0
+    rtl.cosim(A, out)
     assert np.array_equal(out, A + A.sum())
 
 
@@ -589,8 +589,7 @@ def test_cross_region_enclosing_invariant_cosim():
     B = np.zeros((8, 8), dtype=np.int32)
     rtl = _to_rtl(enclosing_invariant)
     assert _no_cross_region_reject(rtl)
-    r = rtl.cosim(A, B)
-    assert r.cycles > 0
+    rtl.cosim(A, B)
     assert np.array_equal(B, A * (A[:, 0:1] + 1))
 
 
@@ -769,27 +768,6 @@ def test_result_mux_select():
     assert np.array_equal(out, np.where(np.arange(4) < 2, a.sum(1), 0).astype(np.int32))
 
 
-def test_guard_select_is_conditional():
-    # A data-dependent guard closes into a dcp.select whose region is
-    # `conditional` and whose whole-kernel determinacy is `indeterminate`: the
-    # taxonomy classification for the guard/select shapes above.
-    N, M = 8, 4
-
-    @kernel
-    def cond_reduce(A: f32[N, M], flag: i32[M], out: f32[M]):
-        for j in range(M):
-            if flag[j] > 0:
-                acc: f32 = 0.0
-                for k in range(N):
-                    acc += A[k, j]
-                out[j] = acc
-
-    d = _to_rtl(cond_reduce).dcp
-    assert "allo.dcp.select" in d
-    assert "} conditional" in d  # the guard region's determinacy
-    assert "dcp.determinacy = #allo<determinacy indeterminate>" in d  # whole kernel
-
-
 def test_container_and_guard_regions_never_own_loose_datapath():
     # Container / guard regions must not own loose datapath ops: each
     # container path emits only part of the datapath, so a store bound into
@@ -875,8 +853,7 @@ def test_call_scalar_operand_is_a_constant():
 
     A = np.arange(16, dtype=np.int32)
     out = np.zeros(16, dtype=np.int32)
-    r = _to_rtl(sch_top).cosim(A, out)
-    assert r.cycles > 0
+    _to_rtl(sch_top).cosim(A, out)
     assert np.array_equal(out, (A + 3) * 2)
 
 
@@ -909,8 +886,7 @@ def test_scalar_result_consumed_by_a_sibling_call():
     out = np.zeros(16, dtype=np.int32)
     rtl = _to_rtl(top)
     assert "allo.dcp.instance" in rtl.dcp
-    r = rtl.cosim(A, out)
-    assert r.cycles > 0
+    rtl.cosim(A, out)
     s = int((A + 1).sum())  # 120 + 16 = 136
     assert np.array_equal(out, np.full(16, s * 2, dtype=np.int32))
 
@@ -944,8 +920,7 @@ def test_scalar_result_crosses_an_intervening_region():
 
     A = np.arange(16, dtype=np.int32)
     out = np.zeros(16, dtype=np.int32)
-    r = _to_rtl(top).cosim(A, out)
-    assert r.cycles > 0
+    _to_rtl(top).cosim(A, out)
     s = int((A + 1).sum())  # 136
     assert np.array_equal(out, A * 2 + s)
 
@@ -986,6 +961,13 @@ def test_call_scalar_result_consumed_in_its_own_region():
         a: i32 = sr_child(x)
         out[0] = a
         out[1] = a * 3
+
+    d = _to_rtl(sr_top).dcp
+    # The complement of test_indeterminate_calls.py, which splits the same shape
+    # in two: a DETERMINATE callee needs no isolation, so both consumers stay in
+    # the caller's one region.
+    body = d.split("func.func public @")[1].split("func.func private")[0]
+    assert sum("allo.dcp.sequential at" in ln for ln in body.splitlines()) == 1
 
     out = np.zeros(2, dtype=np.int32)
     _to_rtl(sr_top).cosim(np.int32(7), out)

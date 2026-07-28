@@ -1,3 +1,8 @@
+/*
+ * Copyright Allo authors. All Rights Reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 #ifndef ALLO_SCHEDULING_UTILS_H
 #define ALLO_SCHEDULING_UTILS_H
 
@@ -27,12 +32,6 @@ constexpr llvm::StringLiteral kLatencyAttr = "allo.sched.latency";
 /// Func-level unit marker: the kLatencyAttr total is a worst-case bound (some
 /// trip count came from an `allo.assume.ssa` range, not a constant).
 constexpr llvm::StringLiteral kLatencyBoundAttr = "allo.sched.latency_is_bound";
-
-/// Per-op scheduling *input* (not carrier output): the number of cycles a
-/// non-pipelined limited op occupies its resource unit (= its latency). Absent
-/// means fully pipelined (occupies its unit for a single cycle). Stamped by the
-/// operator model; consumed by the resource-aware schedulers.
-constexpr llvm::StringLiteral kResourceCyclesAttr = "allo.sched.rsrc_cycles";
 
 /// Per-loop-op: this counted loop is a pipelined *level*, so its body's child
 /// loops appear as nodes in one modulo problem. The value is the level's

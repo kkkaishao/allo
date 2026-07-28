@@ -294,6 +294,12 @@ PartitionAxisAttr::verify(llvm::function_ref<InFlightDiagnostic()> emitError,
   if (dims < 0) {
     return emitError() << "dimension index must be non-negative";
   }
+  // `dim == 0` means "every dimension" for block and cyclic, which a skew
+  // cannot mean: its bank already reads every subscript, and `dim` names the
+  // single one it divides down to make room.
+  if (kind == PartitionKindEnum::SkewPartition && dims == 0) {
+    return emitError() << "skew partition must name its distribution dimension";
+  }
   return success();
 }
 
@@ -306,6 +312,15 @@ PartitionAttr::verify(llvm::function_ref<InFlightDiagnostic()> emitError,
   }
   if (seen.size() < partitions.size()) {
     return emitError() << "duplicate partition axis detected";
+  }
+  // A skew reads every subscript, so composing it with another axis would ask
+  // one subscript to serve two digits. Keeping it alone is also what lets the
+  // slot analysis read the bank's linear form off the access map directly.
+  if (partitions.size() > 1 &&
+      llvm::any_of(partitions, [](PartitionAxisAttr a) {
+        return a.getKind() == PartitionKindEnum::SkewPartition;
+      })) {
+    return emitError() << "a skew partition must be an array's only axis";
   }
   return success();
 }

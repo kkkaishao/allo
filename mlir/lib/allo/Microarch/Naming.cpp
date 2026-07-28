@@ -83,11 +83,11 @@ std::string uniqueOwnerOf(Value v, llvm::ArrayRef<Value> siblings,
     ties += ownerOf(s, fallback) == own;
   if (ties <= 1)
     return own;
-  // Two arguments carry the same source name, which would give their port
-  // groups one set of names. The colliding group falls back to its own
-  // argument position.
+  // Two values sharing a source name would collide in port/cell naming (the
+  // case here is unrolling a body that declares an array). Each tied value
+  // falls back to its argument position, else the caller's per-cell fallback.
   auto ba = dyn_cast<BlockArgument>(v);
-  return ba ? own + "_" + argOwner(ba.getArgNumber()) : own;
+  return own + "_" + (ba ? argOwner(ba.getArgNumber()) : fallback.str());
 }
 
 //===----------------------------------------------------------------------===//
@@ -115,6 +115,14 @@ std::string resultBase(llvm::StringRef owner) {
 }
 std::string bankBase(llvm::StringRef base, unsigned bank) {
   return verilogName(join(base, kBank) + std::to_string(bank));
+}
+std::string elemBase(llvm::StringRef owner, unsigned index, ElemDir dir) {
+  std::string base = owner.str() + "_" + std::to_string(index);
+  if (dir == ElemDir::In)
+    base += kIn.str();
+  else if (dir == ElemDir::Out)
+    base += kOut.str();
+  return verilogName(base);
 }
 
 llvm::SmallVector<std::pair<unsigned, std::string>>

@@ -3,15 +3,19 @@
 - Run `ninja -C build [target]` to build specific targets when only using C++ side tools (e.g. `allo-opt`)
 - Run `pip install -e .` to synchronize python packages when modifying both Python side and C++ side
   (it also rebuilds C++ side automatically)
+- Set `ALLO_ENABLE_ORTOOLS=1` to enable OR-Tools support in Allo
+  Set `CMAKE_PREFIX_PATH=$HOME/.local/share` to provide a path for CMake to find OR-Tools packages.
 
 # Testing
 - Run `python -m pytest tests/` to run all tests
+- Only run incremental cosim tests in `tests/rtl` to save time when developing.
+  Avoid full suite run as far as possible.
 - Set `XILINX_VITIS` to any invalid path to skip tests for synthesis with Vitis to save time
-- Install the developer toolchain with `pip install -e '.[dev]'`
-- Run the RTL cosim tests in parallel with `pytest tests/rtl -n [jobs]` (pytest-xdist).
+- Install the developer toolchain with `pip install -e .[dev]` to run the RTL cosim tests
+- Run the RTL cosim tests in parallel with `pytest tests/rtl -n [jobs]` (pytest-xdist)
 
 # Running
-- Use `conda run -n allo` to execute commands in the `allo` environment.
+- Use `conda run -n allo-rtlgen <command>` to run commands in the conda environment
 - When the host system is not compatible with a specific Vitis version,
   use `docker/run-vitis.sh <command>` to run commands in a docker container.
 

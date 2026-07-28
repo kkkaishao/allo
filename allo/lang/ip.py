@@ -1,3 +1,6 @@
+# Copyright Allo authors. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 from enum import Enum
 from dataclasses import dataclass
 from typing import TypeVar, ParamSpec, overload, Literal

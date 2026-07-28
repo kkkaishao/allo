@@ -44,13 +44,11 @@ from ...lang.kernel import Kernel
 P = ParamSpec("P")
 R = TypeVar("R")
 
-# DCP normalization before emit: dcp-resolve-banking splits a statically-banked
-# partitioned array into per-bank memrefs (reusing the scheduler's staticBank),
-# then dcp-flatten-memref linearizes each per-bank address map, which the
-# datapath emitter cannot lower on its own.
-_NORMALIZE_PIPELINE = (
-    "builtin.module(func.func(dcp-resolve-banking,dcp-flatten-memref))"
-)
+# DCP normalization before emit: dcp-resolve-banking materializes the per-bank
+# memrefs for a partitioned array whose every access assign-banks resolved. It
+# is the only one; the address map stays in element space all the way to the
+# emitter, which linearizes it symbolically at the point of use.
+_NORMALIZE_PIPELINE = "builtin.module(func.func(dcp-resolve-banking))"
 
 
 class RTL(Backend[P, R]):
@@ -68,6 +66,8 @@ class RTL(Backend[P, R]):
         float_reassoc: bool = True,
         unroll_under_pipeline: bool = True,
         perfectize: bool = False,
+        scalarize_threshold: int = 16,
+        scheduler: str = "heuristic",
     ):
         """Build an RTL handle for one hardware configuration.
 
@@ -92,6 +92,15 @@ class RTL(Backend[P, R]):
             perfectize: sink an imperfect nest's prologue/epilogue into the inner
                 loop under a guard, fusing it into one pipeline. A QoR
                 alternative -- the scheduler handles imperfect nests without it.
+            scheduler: the solver that settles the resource half of each
+                scheduling problem. ``"heuristic"`` is the SDC simplex plus
+                greedy placement; ``"exact"`` is CP-SAT, exact under the same
+                model and available only in a build with OR-Tools.
+            auto_partition: complete-partition a small local array so it lowers
+                to registers rather than a memory whose ports and access latency
+                bound the II. ``False`` leaves every unbound array on the
+                device's default storage, which is what a measurement OF that
+                storage model wants.
         """
         super().__init__(kernel)
         self._device = device if device is not None else builtin_device
@@ -108,6 +117,8 @@ class RTL(Backend[P, R]):
             "float_reassoc": float_reassoc,
             "unroll_under_pipeline": unroll_under_pipeline,
             "perfectize": perfectize,
+            "scalarize_threshold": scalarize_threshold,
+            "scheduler": scheduler,
         }
         self.arg_types = kernel.parse_argument_annotations()
         self.res_types = kernel.parse_return_annotation()

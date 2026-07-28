@@ -82,10 +82,21 @@ void recordMemoryInit(circt::seq::HLMemOp mem,
                       llvm::ArrayRef<llvm::APInt> words);
 /// Whether a native integer/logic mnemonic has an `emitCompute` comb lowering.
 bool combEmitted(StringRef kind);
-/// Evaluate an affine index expression to an i32 hw value, emitting comb ops.
-/// \p idx holds the resolved value of each map operand (dims then symbols).
+/// The datapath's width for an index value (`uarch::hwWidth` of an `index`).
+/// An address expression may be carried narrower than this (see `evalAffine`),
+/// but its operands arrive at this width and a divider is computed at it.
+inline constexpr unsigned kDatapathAddressWidth = 32;
+
+/// Evaluate an affine index expression to a \p width -bit hw value, emitting
+/// comb ops. \p idx holds the resolved value of each map operand (dims then
+/// symbols), each `kDatapathAddressWidth` wide.
+///
+/// Carrying an address at the `clog2(depth)` bits it actually needs is exact,
+/// not an approximation: truncation is reduction modulo 2^width and `+`, `-`,
+/// `*` commute with it. `floordiv` / `mod` do not, so they are computed at
+/// `kDatapathAddressWidth` and their result narrowed.
 Value evalAffine(OpBuilder &b, Location loc, AffineExpr e, ValueRange idx,
-                 unsigned numDims);
+                 unsigned numDims, unsigned width = kDatapathAddressWidth);
 /// The comb op realizing a combinational integer compute unit (pre-checked by
 /// `combEmitted`), reading as many of \p operands as the mnemonic's arity
 /// needs.
@@ -129,7 +140,8 @@ struct EmitContext;
 /// An element address split into its bank index and in-bank offset, per the
 /// memref's `BankLayout` (see `DatapathEmitter::bankAddress`).
 struct BankSplit {
-  Value bank;   // which of the layout's banks holds the element
+  Value bank;   // which of the layout's banks holds the element; null when the
+                // access is statically banked and the caller routes it itself
   Value offset; // its linear index inside that bank (over `bankShape`)
 };
 /// N:1 result mux: select `bankValues[bank]` (a priority chain, bank in [0,N),
@@ -176,9 +188,12 @@ struct ShiftChain {
 //   chainEnable is F's half. Every shift-register stage, every held read
 //     address, and every clock-enabled IP's `ce` advances only while it is
 //     high, so the whole datapath freezes together.
-//   issueEnable is G's half. The controller issues only while it is high; it
-//     additionally requires inputs-available, so a starved input injects a
-//     bubble instead of freezing the pipeline.
+//   issueEnable is G's half. The controller issues only while it is high, and
+//     DEFERS the denied pass (a latched `running` / `pend`) rather than
+//     dropping it, which is what lets a stage-0 access wait for its handshake.
+//     It coincides with `chainEnable` today, since a starved stage-0 input
+//     freezes the whole region rather than injecting a bubble; the two stay
+//     separate fields because a bubbling regime is the one E1 would add.
 //
 // Both null is a RIGID shell, the identity: every primitive below reduces to
 // its unconditional form, which is exactly what a region with no stream

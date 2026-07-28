@@ -214,10 +214,12 @@ std::string detail::describe(Operation *op) {
   return render(name, isLoop, pos);
 }
 
-std::string detail::describe(const Location &loc) {
+std::string detail::describe(const Location &loc, bool withFile) {
   std::string name, pos;
   walkLocation(loc, name, pos);
-  return render(name, /*isLoop=*/false, pos);
+  if (withFile)
+    return render(name, /*isLoop=*/false, pos);
+  return name;
 }
 
 void setLevel(Level level) {

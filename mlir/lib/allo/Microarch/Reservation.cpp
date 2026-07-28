@@ -16,13 +16,13 @@ Reservation reservationOf(const RegionBlock &region, const FuncUnit &unit,
                           unsigned residue) {
   Reservation r;
   r.region = region.id;
-  // A fully-pipelined unit only holds the issue slot (its internal stages carry
-  // distinct data), so it is contended for one cycle regardless of latency; a
-  // non-pipelined unit stays busy for its whole latency.
+  // A pipelined unit holds only the issue slot for one cycle regardless of
+  // latency (its stages carry distinct data); a non-pipelined unit stays
+  // busy for its whole latency.
   unsigned len = unit.pipelined ? 1 : std::max(1u, unit.latency);
-  // Cyclic regions wrap the occupancy mod II: a window that crosses the II
-  // boundary self-overlaps when latency > II, correctly marking the unit busy
-  // every cycle. Acyclic regions run once on a straight timeline, with no wrap.
+  // Cyclic regions wrap occupancy mod II, so a window crossing the II
+  // boundary self-overlaps when latency > II, marking the unit busy every
+  // cycle. Acyclic regions run once on a straight timeline.
   unsigned mod =
       region.kind == RegionBlock::Kind::Cyclic ? region.ii.value_or(1) : 0;
   for (unsigned i = 0; i < len; ++i)
@@ -32,8 +32,7 @@ Reservation reservationOf(const RegionBlock &region, const FuncUnit &unit,
 
 bool reservationsDisjoint(const Reservation &a, const Reservation &b) {
   if (a.region != b.region)
-    return false; // cross-region sharing isn't modelled; treated as a
-                  // conflict
+    return false; // cross-region sharing isn't modelled; treated as a conflict
   llvm::SmallDenseSet<unsigned, 8> cyclesA(a.cycles.begin(), a.cycles.end());
   return llvm::none_of(b.cycles,
                        [&](unsigned c) { return cyclesA.contains(c); });

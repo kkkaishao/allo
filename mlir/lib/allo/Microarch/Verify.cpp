@@ -24,12 +24,13 @@ namespace mlir::allo::uarch {
 // 1. Model well-formedness.
 //===----------------------------------------------------------------------===//
 
+// A scheduled datapath always holds at least one region: emission only visits
+// functions `hasDCPRegions` accepted, and the builder's region walk collects a
+// superset of that predicate.
 LogicalResult verifyDatapath(func::FuncOp func, const Datapath &dp) {
   // Supported subset: top-level siblings in program order, plus container
   // loops whose children sequence within one outer iteration (crossing as a
-  // survivor register). Emission only visits a function `hasDCPRegions`
-  // accepted, and the builder's region walk collects a superset of that
-  // predicate, so a reachable datapath always holds a region.
+  // survivor register).
   assert(!dp.regions.empty() && "a scheduled function has no schedulable "
                                 "region; the builder's region walk and "
                                 "hasDCPRegions disagree");
@@ -87,10 +88,7 @@ LogicalResult checkDeviceCapability(func::FuncOp func, const Datapath &dp) {
             << "' is ignored: an array declared with compile-time contents is "
                "realized as a single bank";
     }
-    // `verify-rtl-legality` rejects an access latency the emitted structure
-    // cannot realize, before the scheduler honors the device row.
-    assert(m.writeLatency >= 1 && (!m.external || m.readLatency >= 1) &&
-           "a 0-cycle port reached emission");
+    assert(m.writeLatency >= 1 && "a 0-cycle write port reached emission");
   }
 
   // `ce` is the only IP port ABI the emitter realizes. `free` has no enable, so
@@ -126,25 +124,26 @@ LogicalResult checkDeviceCapability(func::FuncOp func, const Datapath &dp) {
 //===----------------------------------------------------------------------===//
 
 // A COUNTED container (`emitContainer`) drives child regions and has no
-// per-iteration issue pulse to time work of its own against. The one thing it
-// emits is a child guard's predicate, before the children run, which is why the
-// unit test below is what a unit READS rather than whether units exist.
+// per-iteration issue pulse to time work of its own against; the only thing it
+// emits is a child guard's predicate before the children run. That is why the
+// check below is what a unit READS rather than whether units exist.
 //
-// Only the level-pipelined (Phase B) schedule produces a counted container with
-// datapath: it fuses the level's leaf ops INTO the outer pipeline, at their own
-// cycles between the children. The sequential decomposition wraps each of those
-// runs in its own child region instead, which is why every other path lands a
-// container whose body is nothing but declarations.
+// Only the level-pipelined (Phase B) schedule produces a counted container
+// with datapath: it fuses the level's leaf ops into the outer pipeline, at
+// their own cycles between the children. The sequential decomposition wraps
+// each of those runs in its own child region instead, so every other path
+// lands a container whose body is nothing but declarations.
 //
-// Without this the failure is silent or a crash: an external store leaves its
-// boundary port undriven (a null operand reaching `Operation::create`), and a
-// compute over a child's result reads that child's survivor before the child
-// has emitted.
+// Without this check the failure is silent or a crash: an external store
+// leaves its boundary port undriven (a null operand reaching
+// `Operation::create`), and a compute over a child's result reads that
+// child's survivor before the child has emitted.
 //
 // A CONDITIONAL container is a different controller: `emitConditionalContainer`
 // emits its own condition cone (`emitConditionRegion`), so its reads and units
-// are expected. Its writes and stream accesses are not emitted, but no frontend
-// shape puts one in a while condition, so that stays a gap rather than a check.
+// are expected. Its writes and stream accesses are not emitted, but no
+// frontend shape puts one in a while condition, so that stays a gap rather
+// than a check.
 static LogicalResult checkContainerOwnsNoDatapath(const RegionBlock &rb,
                                                   const Datapath &dp) {
   auto reject = [&](Operation *op, StringRef what) {
@@ -206,11 +205,9 @@ LogicalResult checkEmitterSubset(func::FuncOp func, const Datapath &dp) {
   // datapath of its own, each process instantiated once) and the caller/callee
   // partition agreement, both settled before scheduling.
 
-  // Stream protocol. A channel is one {data,valid,ready} triple time-shared by
-  // every access to it, which two properties make sound. Both are the
-  // scheduler's to deliver, but a violation would mis-order tokens silently.
-  // The channel's ENDS are checked before scheduling; what is left here is the
-  // timing the schedule assigns them.
+  // Stream protocol: a channel's {data,valid,ready} triple is time-shared by
+  // all its accesses, sound only if the scheduler keeps them ordered and
+  // non-overlapping. Ends are checked pre-schedule; timing is checked here.
   for (const StreamChannel &s : dp.streams) {
     // Distinct cycles in program order within a region, spanning under one II.
     // Per DIRECTION, since that is what shares a wire: a put drives
@@ -299,17 +296,24 @@ static void assertStructuralInvariants(const Datapath &dp) {
       assert(dp.mems[r.id].accesses[r.idx].region == rb.id &&
              "a region lists an access another region issues");
   }
-  for (const MemUnit &m : dp.mems)
+  for (const MemUnit &m : dp.mems) {
+    // A scattered argument's ports are per ELEMENT, so its accesses hold no
+    // port slot: each of them reads every element port and selects.
+    assert(m.elemPorts.size() == (m.scattered ? m.depthWords : 0) &&
+           "element ports belong to exactly the scattered memories, one per "
+           "element");
     for (const MemUnit::Access &acc : m.accesses) {
       --listed;
       bool hasPort = acc.portIdx != MemUnit::Access::kNoPort;
-      assert(hasPort == m.external &&
-             "a boundary port slot is held by exactly the external accesses");
+      assert(hasPort == (m.external && !m.scattered) &&
+             "a boundary port slot is held by exactly the addressed external "
+             "accesses");
       assert((!hasPort || (acc.isWrite ? dp.writePorts : dp.readPorts).size() >
                               acc.portIdx) &&
              "an access's port slot is out of its boundary port list");
       (void)hasPort;
     }
+  }
   assert(listed == 0 && "every memory access belongs to exactly one region");
   // An indeterminate call finishes at a data-dependent cycle, so nothing
   // statically scheduled may share its region; `enumerateRegions` isolates it.

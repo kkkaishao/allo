@@ -1,7 +1,7 @@
 # Copyright Allo authors. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Sequential (non-dataflow) sub-kernel call composition: chaining through shared arrays, mixed containers, concurrency inference, and nested composition."""
+"""Sequential (non-dataflow) sub-kernel call composition"""
 
 import os
 import shutil
@@ -49,9 +49,15 @@ def test_sequential_two_kernel_shared_array():
     assert l1 is not None and l2 is not None
     assert _latency(seq_top) == l1 + l2
 
+    rtl = _to_rtl(seq_top)
+    # A pure serial call graph with no loose datapath still lowers via the leaf
+    # CallUnit path, both children instantiated in the container's own module.
+    assert "allo.dcp.instance" in rtl.dcp
+    assert rtl.mlir.count("hw.instance") >= 2
+
     B = np.zeros(16, np.int32)
     out = np.zeros(16, np.int32)
-    r = _to_rtl(seq_top).cosim(A16, B, out)
+    r = rtl.cosim(A16, B, out)
     assert np.array_equal(out, (A16 + 1) * 2)  # out = child2(child1(A))
     assert r.cycles == l1 + l2  # serial: the children do not overlap
 
@@ -83,32 +89,9 @@ def test_sequential_internal_buffer_shared():
     assert np.array_equal(out, A * 3 - 7)
 
 
-# A container whose body is a loop over a sub-kernel call: one child instance
-# is instantiated once and fired N times, a counter driving its index.
-def test_loop_over_calls():
-    @kernel
-    def lc_step(A: i32[16], B: i32[16], i: index):
-        B[i] = A[i] * 2 + 1
-
-    @kernel
-    def lc_top(A: i32[16], B: i32[16]):
-        for i in range(16):
-            lc_step(A, B, i)  # invoke the sub-kernel 16 times
-
-    mod = _to_rtl(lc_top)
-    # The loop-over-calls container lowers to the leaf (its call reifies to a
-    # dcp.instance), one child instance fired N times by the counter.
-    assert "dcp.instance" in mod.dcp
-    # The loop counter driving the child's index, labelled with the source IV.
-    assert "%i = seq.compreg" in mod.mlir
-    A = (np.arange(16, dtype=np.int32) * 3 + 1) & 0x3F
-    B = np.zeros(16, np.int32)
-    mod.cosim(A, B)
-    assert np.array_equal(B, A * 2 + 1)
-
-
 # A zero-trip loop over a sub-kernel call must complete without firing the
-# child (regression: this used to hang on cosim's watchdog).
+# child (regression: this used to hang on cosim's watchdog). The non-empty
+# loop-over-calls shape lives in test_loop_control.py.
 def test_zero_trip_loop_over_calls():
     @kernel
     def zlc_step(A: i32[16], B: i32[16], i: index):
@@ -128,44 +111,60 @@ def test_zero_trip_loop_over_calls():
     assert not np.array_equal(B, A * 2 + 1)
 
 
+# An UNGATED call (no call predecessor to hand off from) is released at the cycle
+# it was SCHEDULED at, not at the region's issue pulse. Nothing makes its
+# operands ready at issue: a scalar argument read from memory is only valid once
+# the load's latency has passed, so a call fired at issue latches whatever the
+# data port held before.
+def test_an_ungated_call_waits_for_its_loaded_operand():
+    @kernel
+    def ugc_add3(x: i32) -> i32:
+        y: i32 = x + 3
+        return y * 2
+
+    # From a LOAD: the operand is not valid at the region's issue pulse.
+    @kernel
+    def ugc_from_load(A: i32[4], out: i32[1]):
+        out[0] = ugc_add3(A[1])
+
+    # From an ARGUMENT: valid at issue, so this arm passed either way and pins
+    # that the offset release did not break it.
+    @kernel
+    def ugc_from_arg(x: i32, out: i32[1]):
+        out[0] = ugc_add3(x)
+
+    A = np.array([10, 20, 30, 40], np.int32)
+    out = np.zeros(1, np.int32)
+    _to_rtl(ugc_from_load).cosim(A, out)
+    assert out[0] == (20 + 3) * 2, int(out[0])
+
+    out = np.zeros(1, np.int32)
+    _to_rtl(ugc_from_arg).cosim(np.int32(20), out)
+    assert out[0] == (20 + 3) * 2, int(out[0])
+
+    # Several of them in one region, which is what a fully unrolled body is: each
+    # is ungated (no call orders another; they share no array), so each waits for
+    # its own load rather than all firing together at issue.
+    @kernel
+    def ugc_many(A: i32[4], out: i32[1]):
+        out[0] = ugc_add3(A[0]) + ugc_add3(A[1]) + ugc_add3(A[2]) + ugc_add3(A[3])
+
+    out = np.zeros(1, np.int32)
+    _to_rtl(ugc_many).cosim(A, out)
+    assert out[0] == sum((int(a) + 3) * 2 for a in A), int(out[0])
+
+
 # --- Concurrency inference between independent calls -------------------------
 
 
-# Two sub-kernels with disjoint memory footprints get no ordering edge: both
-# fire at cycle 0, and the composed latency is the max rather than the sum.
-def test_sequential_independent_kernels():
-    @kernel
-    def ic1(A: i32[16], oa: i32[16]):
-        for i in range(16):
-            oa[i] = A[i] + 1
-
-    @kernel
-    def ic2(B: i32[16], ob: i32[16]):
-        for i in range(16):
-            ob[i] = B[i] * 2
-
-    @kernel
-    def indep_top(A: i32[16], B: i32[16], oa: i32[16], ob: i32[16]):
-        ic1(A, oa)
-        ic2(B, ob)
-
-    l1 = _latency(ic1)
-    l2 = _latency(ic2)
-    oa = np.zeros(16, np.int32)
-    ob = np.zeros(16, np.int32)
-    r = _to_rtl(indep_top).cosim(A16, B16, oa, ob)
-    assert np.array_equal(oa, A16 + 1)
-    assert np.array_equal(ob, B16 * 2)
-    assert r.cycles == max(l1, l2)  # data-independent: the children overlap
-
-
 # Interprocedural per-argument footprint analysis: disjoint writers and pure
-# readers overlap, a genuine WAW serializes, and a container-local buffer with
-# two writers + one reader gets one port group per accessor, never a mux.
+# readers overlap, and a genuine WAW serializes. The port groups those disjoint
+# writers get are test_ports.py's subject; here the footprint is only the reason
+# no ordering edge is added.
 def test_concurrent_shared_array_access():
     # Two sub-kernels WRITING one shared array in disjoint slices: the
     # per-argument callee footprint proves they cannot collide, so no edge is
-    # added and each access gets its own port group (never a shared mux).
+    # added and the writers overlap.
     @kernel
     def cw1(A: i32[16], B: i32[16]):
         for i in range(8):
@@ -183,12 +182,8 @@ def test_concurrent_shared_array_access():
 
     l1 = _latency(cw1)
     l2 = _latency(cw2)
-    mod = _to_rtl(cw_top)
-    wr = [w[0] for w in mod.interfaces["cw_top"]["writes"]]
-    assert [w["base"] for w in wr] == ["B_wr0", "B_wr1"]
-    assert {w["arg"] for w in wr} == {1}
     B = np.zeros(16, np.int32)
-    r = mod.cosim(A16, B)
+    r = _to_rtl(cw_top).cosim(A16, B)
     assert np.array_equal(B, np.concatenate([A16[:8] + 1, A16[8:] * 2]))
     assert r.cycles == max(l1, l2)  # disjoint slices: the writers overlap
 
@@ -391,35 +386,11 @@ def test_nested_container_instantiates_as_a_plain_call():
     B = np.zeros(16, np.int32)
     C = np.zeros(16, np.int32)
     out = np.zeros(16, np.int32)
-    r = rtl.cosim(A, B, C, out)
-    assert r.cycles > 0
+    rtl.cosim(A, B, C, out)
     assert np.array_equal(out, (A + 1) * 2 + 3)
 
 
 # --- Mixed containers (loose datapath beside sub-kernel calls) ---------------
-
-
-# A pure SERIAL call graph (no loose datapath) still lowers via the leaf
-# CallUnit path: both children instantiate in the container's own module.
-def test_pure_sequential_still_emits():
-    @kernel
-    def sc1(A: i32[16], B: i32[16]):
-        for i in range(16):
-            B[i] = A[i] + 1
-
-    @kernel
-    def sc2(B: i32[16], out: i32[16]):
-        for i in range(16):
-            out[i] = B[i] * 2
-
-    @kernel
-    def seq_top(A: i32[16], B: i32[16], out: i32[16]):
-        sc1(A, B)
-        sc2(B, out)
-
-    rtl = _to_rtl(seq_top)  # must not raise
-    assert "allo.dcp.instance" in rtl.dcp  # leaf CallUnit path (structural lock)
-    assert rtl.mlir.count("hw.instance") >= 2  # both children instantiated
 
 
 # A container mixing its own datapath with a call mastering only
@@ -446,8 +417,7 @@ def test_mixed_container_internal_buffer_call():
     assert "seq.hlmem" in rtl.mlir  # the shared buffers, on-chip
     A = np.arange(1, 17, dtype=np.int32)
     out = np.zeros(16, dtype=np.int32)
-    r = rtl.cosim(A, out)
-    assert r.cycles > 0
+    rtl.cosim(A, out)
     assert np.array_equal(out, ((A + 1) + 10) * 2)
 
 
@@ -475,8 +445,7 @@ def test_mixed_container_loose_region_between_calls():
 
     A = np.arange(16, dtype=np.int32)
     out = np.zeros(16, dtype=np.int32)
-    r = _to_rtl(mr_top).cosim(A, out)
-    assert r.cycles > 0
+    _to_rtl(mr_top).cosim(A, out)
     assert np.array_equal(out, ((A + 1) + 5) * 2)
 
 
@@ -497,8 +466,7 @@ def test_loose_region_after_a_call_writes_boundary_output():
 
     A = np.arange(16, dtype=np.int32)
     out = np.zeros(16, dtype=np.int32)
-    r = _to_rtl(mcb_top).cosim(A, out)
-    assert r.cycles > 0
+    _to_rtl(mcb_top).cosim(A, out)
     assert np.array_equal(out, (A + 1) + 5)
 
 
@@ -526,42 +494,16 @@ def test_adjacent_calls_with_no_loose_op_between_them():
         cc1(x, p, q)  # adjacent calls, one region: cc1 must finish before cc2
         cc2(p, q, out)
 
+    rtl = _to_rtl(cc_top)
+    # The two-port claim, stated: cc1 reads x twice per iteration, so the
+    # boundary argument is wired to a read group per access rather than muxed.
+    rd = [p["base"] for acc in rtl.interfaces["cc_top"]["reads"] for p in acc]
+    assert rd == ["x_rd0", "x_rd1"]
+
     x = np.arange(8, dtype=np.int32) + 1
     out = np.zeros(8, dtype=np.int32)
-    r = _to_rtl(cc_top).cosim(x, out)
-    assert r.cycles > 0
+    rtl.cosim(x, out)
     assert np.array_equal(out, (x + 1) * 10 + (x + 2))
-
-
-# A boundary array write-mastered by two serial children time-shares one write
-# port through a self-gated priority mux, so the idle master never writes.
-def test_mixed_container_shared_boundary_serial_masters():
-    @kernel
-    def wm(s: i32[8], out: i32[8]):
-        for i in range(4):
-            out[i] = s[i] + 1  # writes out[0:4]
-
-    @kernel
-    def wn(s: i32[8], out: i32[8]):
-        for i in range(4):
-            out[i + 4] = s[i + 4] * 2  # writes out[4:8], sharing out's write port
-
-    @kernel
-    def sm_top(A: i32[8], out: i32[8]):
-        s: i32[8]
-        for i in range(8):  # loose region -> mixed container; s read by both
-            s[i] = A[i] + 5
-        wm(s, out)
-        wn(s, out)
-
-    A = np.arange(8, dtype=np.int32) + 1
-    out = np.zeros(8, dtype=np.int32)
-    r = _to_rtl(sm_top).cosim(A, out)
-    assert r.cycles > 0
-    exp = np.empty(8, dtype=np.int32)
-    exp[:4] = (A[:4] + 5) + 1
-    exp[4:] = (A[4:] + 5) * 2
-    assert np.array_equal(out, exp)
 
 
 # --- Loop-body call sequencing ------------------------------------------------

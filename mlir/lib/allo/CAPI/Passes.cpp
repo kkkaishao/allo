@@ -5,7 +5,9 @@
 
 #include "allo-c/Passes.h"
 #include "allo/Microarch/EmitDriver.h"
+#include "allo/Scheduling/Scheduler.h"
 #include "allo/Scheduling/Utils.h"
+#include "allo/Support/Logging.h"
 
 #include "allo/Translation/VerilogEmitter.h"
 #include "allo/Translation/VivadoHLSEmitter.h"
@@ -77,3 +79,28 @@ MlirLogicalResult alloEmitDatapathToHW(MlirModule module, MlirStringRef binding,
   callback(MlirStringRef{out.data(), out.size()}, userData);
   return mlirLogicalResultSuccess();
 }
+
+MlirLogicalResult alloRunSDCSchedulingPipeline(MlirModule module,
+                                               MlirStringRef top,
+                                               float cycleTime,
+                                               MlirStringRef scheduler) {
+  ModuleOp mod = unwrap(module);
+  StringRef topName = unwrap(top);
+  StringRef schedulerName = unwrap(scheduler);
+  std::optional<allo::SchedulerKind> kind =
+      allo::parseSchedulerKind(schedulerName);
+  if (!kind) {
+    allo::logging::error(allo::logging::Stage::Sched, mod)
+        << "Unknown scheduler '" << schedulerName
+        << "'; expected \"heuristic\" or \"exact\"";
+    return mlirLogicalResultFailure();
+  }
+  if (failed(allo::runPreScheduleVerification(mod, topName)))
+    return mlirLogicalResultFailure();
+  if (failed(allo::runSDCScheduler(mod, topName, cycleTime, *kind)))
+    return mlirLogicalResultFailure();
+  allo::runPostScheduleConversion(mod);
+  return mlirLogicalResultSuccess();
+}
+
+bool alloHasExactScheduler() { return allo::hasExactScheduler(); }

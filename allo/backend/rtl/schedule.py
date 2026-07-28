@@ -29,6 +29,7 @@ from ..._mlir.ir import (
     BlockArgument,
     OpResult,
 )
+from ..._mlir.dialects.allo import run_sdc_scheduling
 
 RTL_PREPARE_PIPELINE = """
 builtin.module(
@@ -478,7 +479,8 @@ def run_schedule(
     accumulators=0,
     perfectize=False,
     unroll_under_pipeline=True,
-    flatten=True,
+    scalarize_threshold=16,
+    scheduler="heuristic",
 ) -> ScheduleResult:
     """Schedule ``top`` and return the :class:`ScheduleResult`; ``module`` is
     rewritten in place, left holding the ``allo.dcp.*`` ops the schedule reifies
@@ -498,56 +500,36 @@ def run_schedule(
             loop under a guard, fusing it into one pipeline.
         unroll_under_pipeline: fully unroll the loops nested inside a pipelined
             loop, so the nest pipelines at one II.
-        flatten: coalesce constant-trip perfect nests so the whole nest pipelines
-            at one II. Delinearizes the address map (``floordiv``/``mod``), which
-            the codegen path folds back in dcp-flatten-memref.
+        scalarize_threshold: scalarize memory accesses to arrays with this many or
+            fewer elements, so they are kept in registers rather than a memory.
+            Set to 0 to disable.
+        scheduler: the solver that settles the resource half of each problem.
+            ``"heuristic"`` is the SDC simplex plus greedy placement;
+            ``"exact"`` is CP-SAT, available only in a build with OR-Tools.
     """
     run_pipeline(module, RTL_PREPARE_PIPELINE)
-
-    sched_opts = [f"top={top}"]
-    if cycle_time is not None:
-        sched_opts.append(f"cycle-time={cycle_time}")
-    sdc = "sdc-scheduling{" + " ".join(sched_opts) + "}"
-    # convert-schedule-to-dcp characterizes the dcp.operator symbols from the
-    # same injected dcp.device / dcp.operator IR the scheduler read.
-    convert = "convert-schedule-to-dcp"
-    # Scheduling-path normalizations before the SDC solve, kept out of
-    # HLS_PREPARE_PIPELINE since the Vitis path does its own:
-    #   * fold-if-statements -- predicate affine.if / scf.if, or fold an
-    #     affine.if guard into the enclosing loop bounds, so as little
-    #     control flow as possible remains inside a loop body;
-    #   * cse -- fold the redundant loads/ops speculation introduces so they
-    #     do not inflate the resource-bound II;
-    #   * reassociate-reductions -- rebalance unrolled reduction chains so a
-    #     loop-carried accumulator's recurrence spans one operator, not the
-    #     whole unrolled chain.
     reassoc = (
         "reassociate-reductions{float-reassoc="
         f"{'true' if float_reassoc else 'false'}}}"
     )
     rotate = f"rotate-reductions{{accumulators={int(accumulators)}}}"
-    perf = "perfectize-loop-nest," if perfectize else ""
-    uup = "unroll-under-pipeline," if unroll_under_pipeline else ""
-    flat = "flatten-perfect-loops," if flatten else ""
-    # propagate-partition pushes `allo.part` from an array onto every callee
-    # parameter it is passed to. Must precede sdc-scheduling: the callee is
-    # scheduled against its per-bank ResII. RTL-path only -- Vitis reads
-    # `allo.part` as a pragma and does its own interprocedural handling.
-    part = "propagate-partition{" + f"top={top}" + "}"
-    # verify-rtl-legality rejects what the backend cannot lower while the facts
-    # are still cheap to read. It runs LAST of the normalizations: after
-    # raise-counted-while (some whiles are for loops by then) and after
-    # propagate-partition (which is what makes a caller/callee partition
-    # comparison meaningful).
-    verify = "verify-rtl-legality{" + f"top={top}" + "}"
-    # sdc-scheduling emits the schedule as the allo.sched.* carrier;
-    # convert-schedule-to-dcp reifies it into module-scoped allo.dcp.* ops
-    # and strips the carrier.
+    loops = (
+        "loop-canonicalization{"
+        f"unroll-under-pipeline={'true' if unroll_under_pipeline else 'false'} "
+        f"perfectize={'true' if perfectize else 'false'}}}"
+    )
+    part = f"propagate-partition{{top={top}}}"
+    scalarize = f"scalarize-memory{{max-elements={scalarize_threshold}}}"
     pipeline = (
-        f"builtin.module(func.func(raise-counted-while,{uup}"
-        f"{perf}{flat}"
-        f"canonicalize,fold-if-statements,cse,{reassoc},{rotate}),"
-        f"{part},{verify},{sdc},{convert})"
+        f"builtin.module(func.func(raise-counted-while,elide-dead-init,{loops},"
+        f"canonicalize,fold-if-statements,cse,{scalarize},"
+        f"{reassoc},{rotate}),"
+        f"{part},func.func(assign-banks))"
     )
     run_pipeline(module, pipeline)
+    ret = run_sdc_scheduling(module, top, cycle_time or 5.0, scheduler)
+    if not ret:
+        raise RuntimeError(
+            f"Scheduling step failed for {top}. Please check the log for details."
+        )
     return export_schedule_result(module)

@@ -6,7 +6,6 @@ add_mlir_conversion_library(MLIRAlloConversion
     LowerInstructions.cpp
     LowerDataflow.cpp
     LowerToLLVM.cpp
-    ConvertScheduleToDcp.cpp
 
     DEPENDS
     MLIRAlloIncGen

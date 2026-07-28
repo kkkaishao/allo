@@ -1,3 +1,8 @@
+/*
+ * Copyright Allo authors. All Rights Reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 #ifndef ALLO_TRANSFORMS_PASSES_TD
 #define ALLO_TRANSFORMS_PASSES_TD
 
@@ -147,119 +152,280 @@ def RaiseCountedWhilePass
   ];
 }
 
-def FlattenPerfectLoopsPass
-    : Pass<"flatten-perfect-loops", "func::FuncOp"> {
-  let summary = "Coalesce constant-trip perfect affine loop nests into one loop";
+def LoopCanonicalizationPass
+    : Pass<"loop-canonicalization", "func::FuncOp"> {
+  let summary = "Shape every counted loop nest into one pipelineable region";
   let description = [{
-    Coalesce the maximal normalized (lower bound 0, step 1), constant-trip-count
-    prefix of each perfect affine loop band into a single loop (via
-    `affine::coalesceLoops`), so the SDC scheduler pipelines the whole nest at
-    one II instead of scheduling only the innermost body and paying the pipeline
-    fill/drain at every inner-loop re-entry. A loop with a symbolic bound is left
-    alone: the coalesced induction-variable arithmetic (`floordiv`/`mod` by the
-    bound) would be semi-affine and defeat the dependence analysis. A loop
-    carrying `iter_args` is also left alone: coalescing merges the induction
-    spaces but drops loop-carried values, which would silently miscompile an
-    inner accumulator. The pass only handles simple nests, and does not attempt
-    to convert a non-perfect nest into a perfect one (e.g. by peeling or
-    sinking); complex nests should be flattened by the `transform.allo.flatten`
-    op.
+    Four rewrites, run as one recursive descent per nest: unroll the loops under
+    a pipelined one, sink an imperfect nest's prologue and epilogue into its
+    inner loop, normalize a perfect band to lower bound 0 and step 1, and
+    coalesce that band into a single loop.
+
+    ## Unrolling under a pipeline (`unroll-under-pipeline`, default on)
+
+    Pipelining a loop implies its body is a single straight-line datapath
+    clocked at one II, so every loop nested inside a pipelined loop
+    (`allo.pipeline.ii` != -1) is fully unrolled into it, matching Vitis, where
+    `#pragma HLS pipeline` on an outer loop auto-unrolls the inner loops. A
+    nested loop that is not a constant-trip counted loop (a dynamic bound, or an
+    `scf.while`) cannot be unrolled, so the pipeline cannot be formed and the
+    nest is left unchanged with a remark. An unrolled interior is straight-line,
+    so nothing below applies and the descent stops there.
+
+    ## Perfectizing (`perfectize`, default off)
+
+    An outer counted loop whose body is `{ prologue..., inner loop,
+    epilogue... }` is made perfect by sinking the surrounding ops into the inner
+    loop: the epilogue under a last-iteration guard (remapping the inner loop's
+    results to its yielded values); a prologue store under a first-iteration
+    guard (runs once, e.g. an accumulator init); a pure prologue op or a load of
+    a memref not written in the nest unguarded (recompute). The guard is an
+    `affine.if` (constant IV) for an affine.for inner or an `scf.if` (runtime
+    `cmpi`) for an scf.for inner; `fold-if-statements` predicates it. Bails,
+    leaving the nest untouched, on sibling inner loops, an `scf.while`, an
+    escaping or aliasing value, or other side effects. Off by default: it is a
+    QoR alternative, and the scheduler runs an imperfect nest as sequential
+    sub-regions without it.
+
+    ## Normalizing
+
+    Moving a loop's lower bound and step out of the loop and into the subscripts
+    that read its induction variable leaves `for i' in [0, trip)` and
+    `i = lb + step*i'`, which is what coalescing requires and nothing else
+    establishes. `s.unroll(k)` leaves exactly the form that needs it:
+    `loopUnrollByFactor` turns a unit-step loop into one stepping by the factor,
+    so the standard way of opening memory bandwidth was also the way of refusing
+    to flatten the nest it opened.
+
+    Two loops are left alone, both decided structurally before the rewrite. A
+    **runtime lower bound**: `for j in range(i, N)` would become `j = i + j'`,
+    so an address naming `j` would name two counter registers and the adder
+    joining them where it named one, and it buys nothing, a runtime lower bound
+    meaning a runtime trip count, which coalescing separately refuses. An
+    induction variable with a **non-affine use**: only an affine consumer
+    absorbs the leftover `affine.apply` (canonicalization composes it into the
+    map), and anywhere else it stays an op the scheduler pays for.
+
+    ## Coalescing
+
+    The maximal normalized, constant-trip-count prefix of each perfect affine
+    band is coalesced into a single loop (`affine::coalesceLoops`), so the SDC
+    scheduler pipelines the whole nest at one II instead of scheduling only the
+    innermost body and paying the pipeline fill/drain at every inner-loop
+    re-entry. A loop with a symbolic bound is left alone: the coalesced
+    induction-variable arithmetic (`floordiv`/`mod` by the bound) would be
+    semi-affine and defeat the dependence analysis. A loop carrying `iter_args`
+    is also left alone: coalescing merges the induction spaces but drops
+    loop-carried values, which would silently miscompile an inner accumulator.
+    Levels are then given back until no array's composed address needs a
+    divider: recovering an induction variable divides by a trip count, which is
+    wiring only when that count is a power of two, and the address is the one
+    path nothing else prices. Banking needs no such rule, since a bank digit
+    that folded to a constant holds no dimension and so survives the
+    delinearization unchanged. Only simple nests are handled; complex ones
+    should go through the `transform.allo.flatten` op, which coalesces
+    unconditionally.
   }];
+  let options = [
+    Option<"unrollUnderPipeline", "unroll-under-pipeline", "bool", "true",
+           "Fully unroll the loops nested inside a pipelined loop.">,
+    Option<"perfectize", "perfectize", "bool", "false",
+           "Sink an imperfect nest's prologue and epilogue into its inner "
+           "loop.">
+  ];
   let dependentDialects = [
-    "mlir::affine::AffineDialect", "mlir::arith::ArithDialect", "mlir::scf::SCFDialect"
+    "mlir::affine::AffineDialect", "mlir::arith::ArithDialect",
+    "mlir::scf::SCFDialect"
   ];
 }
 
-def FlattenDcpMemrefPass
-    : Pass<"dcp-flatten-memref", "func::FuncOp"> {
-  let summary = "Linearize scheduled DCP memory addresses into a flat 1-D index";
+def AssignBanksPass : Pass<"assign-banks", "func::FuncOp"> {
+  let summary = "Decide which bank of a partitioned array each access reaches";
   let description = [{
-    A DCP-normalization pass (runs after `convert-schedule-to-dcp`, before
-    `allo-datapath-to-hw`). `flatten-perfect-loops` coalesces a perfect nest into
-    one induction variable and delinearizes each subscript against it
-    (`A[iv floordiv N, iv mod N]`), so the reified `dcp.load`/`dcp.store` carries a
-    `floordiv`/`mod` address map the datapath emitter cannot lower. Since the
-    backend's memories are already flat, row-major storage, this pass composes the
-    memref's row-major linearization into each access map, folding the
-    `floordiv`/`mod` back into the plain linear index (`A_flat[iv]`). The
-    delinearize/linearize pair cancels, so the emitted address is the bare
-    counter, matching Vitis's flat-array addressing. Only maps that actually carry
-    a `floordiv`/`mod` are touched; a plain multi-dim map is already linearized by
-    the emitter. A residual `floordiv`/`mod` after simplification (a transposed or
-    non-row-major access) is left for the banking pass and its bit-slice / crossbar
-    lowering. The memref type itself is left as the flat backing store (a
-    downstream type-rewrite finalizer is deferred).
+    Runs before the scheduler, once the `allo.part` attributes are final
+    (`propagate-partition`) and the access maps are in their final affine form
+    (after `loop-canonicalization` / `scalarize-memory`). It records the bank an
+    access reaches as an `allo.bank` attribute on the access, which
+    `convert-schedule-to-dcp` then moves onto the `dcp.load`/`dcp.store` op's
+    own `bank` attribute.
+
+    The bank an access uses is a DERIVED fact, and deriving it separately at
+    each consumer means three IR layers, three map forms and a
+    delinearize/linearize round trip in between whose losslessness they only
+    happen to agree on: the scheduler's port model before the solve,
+    `dcp-resolve-banking` after it, and the emitter's routing and crossbar after
+    that. The dangerous direction is silent: an access billed one bank's port
+    that reaches the crossbar and takes a port on every bank breaks the II the
+    solve proved. Deciding once and recording makes them agree by construction.
+
+    The decision itself is exactly what the partition attribute implies
+    (`staticBankOf`): a bank index that folds to a constant, else none, meaning
+    the access reaches every bank. Being a recorded fact rather than a predicate
+    is what makes it a place a real bank-assignment policy could live.
+
+    The fold is asked of the map over the values its subscripts TAKE, not over
+    the operands it names: an induction variable of constant lower bound `lb`
+    and step `s` runs over `lb + s*d`. The step is the fact the map alone cannot
+    carry, and `s.unroll` is what leaves it behind, since `loopUnrollByFactor`
+    turns a unit-step loop into one stepping by the factor. Without the
+    substitution the canonical way to open memory bandwidth, unroll by `k` over
+    a cyclic partition of factor `k`, resolves NO bank and doubles the II. That
+    form is for reasoning only and never escapes this pass: the counter still
+    holds `i` itself, so pricing or emitting the substituted expression would
+    charge arithmetic that is not built.
+
+    A partition that resolves no access at all is reported, per array. It is
+    legal and it is sometimes what the author wants (a crossbar), but it is also
+    what a mis-shaped partition looks like, and every other layer downstream is
+    silent about it.
+
+    ## A SKEWED array records a slot, not a bank
+
+    A skew banks on the SUM of the subscripts, so no access to it has a
+    compile-time bank: `(i + j) mod F` is a runtime value whichever way it is
+    read. What it has instead is a SLOT. The sum splits into a runtime part and
+    a constant, so the bank is `(class + slot) mod F`, and two accesses of the
+    same class reach the same bank exactly when their slots agree, at every
+    value of the class. A slot is therefore billable exactly as a static bank
+    is: F accesses with F distinct slots take one port per bank rather than a
+    port on every bank, which is the whole reason a skew is worth having. It is
+    not ROUTABLE, since only `MemUnit::skewed` consumers that select among banks
+    at run time may read it, which is why `dcp-resolve-banking` declines such an
+    array.
+
+    Two conditions, both checked here rather than downstream, because the port
+    model reads the answer before the solve:
+
+    * The classes must agree among accesses that can CONTEND, which is those in
+      one block: two accesses in different blocks are in different scheduling
+      regions and never take a port in the same cycle. An array filled in one
+      nest and read in another therefore has two classes and no conflict.
+    * Every access must get a slot, or none does. The emitter shares one port
+      per bank across a lane on the strength of its accesses staying off each
+      other's banks; one access left to crossbar would take a port on every one
+      of them.
+
+    An argument array gets no slot at all. Its banks are boundary interfaces the
+    manifest published, one set per access, so there is no shared port for a
+    lane to economize. That is the same boundary, and the same reason, as
+    `dcp-resolve-banking`'s internal-only split.
   }];
-  let dependentDialects = ["mlir::affine::AffineDialect"];
 }
 
 def ResolveBankingPass
     : Pass<"dcp-resolve-banking", "func::FuncOp"> {
   let summary = "Split a statically-banked partitioned array into per-bank memrefs";
   let description = [{
-    A DCP-normalization pass (runs after `convert-schedule-to-dcp`, before
-    `dcp-flatten-memref`). An `allo.part` cyclic partition asks for N physical
-    banks; this pass materializes them for an **internal** array (a
-    `memref.alloc`/`alloca`) whose every access is *statically banked*: the
-    partition-dim subscript is iteration-invariant modulo the factor, so each
-    access hits a compile-time-constant bank (`MemoryModel::staticBank`, the same
-    predicate the scheduler bound its per-bank ResII against). It creates one
-    per-bank alloc (bank-shaped, no partition attribute) and routes each access to
-    its bank with the in-bank offset (`i_d floordiv F`), reusing the scheduler's
-    static-bank decision so the physical banks match. The emitter then sees N
-    plain (`numBanks == 1`) memories with no banking logic. A partitioned array
-    with a data-dependent bank (or an external/argument array) is left
-    untouched, so it reaches the emitter still `numBanks > 1`, the crossbar
-    fallback.
+    A DCP-normalization pass, the only one, run between
+    `convert-schedule-to-dcp` and emit. An `allo.part` partition asks for N
+    physical banks; this pass materializes them for an **internal** array (a
+    `memref.alloc`/`alloca`) every access of which `assign-banks` assigned a
+    bank. It creates one per-bank alloc (bank-shaped, no partition attribute)
+    and routes each access to its bank with the in-bank coordinate
+    (`bankSplitOf`), so the physical banks match the ones the scheduler bound
+    its per-bank ResII against. The emitter then sees N plain (`numBanks == 1`)
+    memories with no banking logic. A partitioned array with an access that was
+    assigned no bank (or an external/argument array) is left untouched, so it
+    reaches the emitter still `numBanks > 1`, the crossbar fallback.
+
+    This is a REALIZATION step, not a decision: it splits where the recorded
+    decision permits, and asks nothing about the address itself.
+
+    Two asymmetries the name hides. **Internal only** is not a limitation to be
+    lifted: an argument array's banks are boundary interfaces the manifest
+    publishes so the host can shard a numpy array across them
+    (`Interface.cpp`), so its layout is a contract rather than a choice, and
+    the per-bank interfaces ARE its realization. For an argument the emitter
+    path is not a fallback, it is the only path.
+
+    And the granularity differs: the bank decision is PER ACCESS (that is what
+    the port model bills and what the emitter routes on), while this pass is all
+    or nothing PER ARRAY, since one unassigned user needs a crossbar over the
+    very banks a split removes. That costs nothing in the schedule. An unsplit
+    array's assigned accesses still reach one bank each and its unassigned ones
+    still reach all of them, so the split changes which IR carries the banks,
+    never how many ports an access takes.
   }];
   let dependentDialects = [
     "mlir::affine::AffineDialect", "mlir::memref::MemRefDialect"
   ];
 }
 
-def UnrollUnderPipelinePass
-    : Pass<"unroll-under-pipeline", "func::FuncOp"> {
-  let summary = "Fully unroll the loops nested inside a pipelined loop";
+def ElideDeadInitPass
+    : Pass<"elide-dead-init", "ModuleOp"> {
+  let summary = "Drop a local array's initializer when every element that is "
+                "read is written first";
   let description = [{
-    Pipelining a loop implies its body is a single straight-line datapath
-    clocked at one II, so every loop nested inside a pipelined loop
-    (`allo.pipeline.ii` != -1) must be fully unrolled into it, matching Vitis,
-    where `#pragma HLS pipeline` on an outer loop auto-unrolls the inner loops.
-    The resulting single pipelined loop is then scheduled by the
-    innermost-pipeline path at its target II.
+    `buf: i32[N] = 0` declared inside a loop lowers to a `linalg.fill` that
+    re-executes on every enclosing iteration. When nothing ever reads an element
+    the fill left behind, that fill is dead, and it is not cheap: its stores are
+    scheduled, they contend for the array's write ports, and they lengthen the
+    enclosing region. Measured on a 32-entry buffer under a 16-iteration loop,
+    latency 1616 -> 1088; on an 8-entry one that `auto-complete-partition` turns
+    into registers, 448 -> 304.
 
-    A nested loop that is not a constant-trip counted loop (a dynamic bound, or
-    an `scf.while`) cannot be unrolled, so the pipeline cannot be formed and the
-    loop is left unchanged with a remark (falls back to scheduling the
-    innermost).
+    The condition is EVERY READ IS WRITTEN FIRST, not whole-array coverage. A
+    nest writing `0..k` followed by one reading `0..k` qualifies while never
+    covering the declared shape; a `+=` accumulator does not, its first read
+    preceding every write; nor does a sliding window, whose taps ARE the
+    filter's startup state.
+
+    A read qualifies through either of two tests. The first walks the array's
+    live range from the initializer onward, through nested regions, threading
+    polyhedral element sets: what every execution has definitely written by the
+    current op against what has been read before any write covered it. The
+    initializer is dead when the second comes back empty. The second test pairs
+    the read with each write through affine dependence analysis, which settles a
+    read that trails its own producer by an iteration, as in a scan or a
+    wavefront. A `func.call` is summarized per parameter, bottom up over the
+    call graph, by the same walk over the callee body.
+
+    Element sets are taken at the depth of the loops around the DECLARATION so
+    that those stay symbols. Guards and loop domains go into the iteration space
+    before it is projected away, so a store below an `affine.if` claims only
+    what it really writes and a store below a loop that may not run claims
+    nothing; a data-dependent `scf.if` leaves no condition to fold, so only what
+    both arms write is certain. A read may be over-approximated, a write may
+    not, which is why inner IVs and mod/div terms are existentially quantified
+    rather than projected out.
+
+    Qualification: a local `memref.alloc` / `alloca` whose every use is an
+    affine load or store, a whole-array fill, or a call this pass can summarize,
+    so no traffic is hidden; an initializer that is the FIRST thing to touch the
+    array, since a read before it observes the previous execution's residue; and
+    an initializer that is safe to delete whole, meaning a `linalg.fill` or a
+    nest whose only effect is writing this array. Recursion and any unmodelled
+    use read as opaque. `ALLO_LOG_LEVEL=debug` reports what survived and why.
+
+    Position: after `convert-allo-to-func`, so calls are resolvable, and before
+    `convert-linalg-to-affine-loops`, where the initializer is still one op whose
+    coverage is definitional rather than a nest to be matched.
   }];
   let dependentDialects = [
-    "mlir::affine::AffineDialect", "mlir::scf::SCFDialect"
+    "mlir::affine::AffineDialect", "mlir::linalg::LinalgDialect",
+    "mlir::memref::MemRefDialect"
   ];
 }
 
-def PerfectizeLoopNestPass
-    : Pass<"perfectize-loop-nest", "func::FuncOp"> {
-  let summary = "Perfectize an imperfect loop nest by sinking prologue/epilogue";
+def ScalarizeMemoryPass
+    : Pass<"scalarize-memory", "func::FuncOp"> {
+  let summary = "Scalarize a small local array to registers or remove it entirely";
   let description = [{
-    Turn an imperfect loop nest, an outer counted loop (`affine.for`/`scf.for`)
-    whose body is `{ prologue ops..., inner loop, epilogue ops... }`, into a
-    perfect one so the perfect-nest scheduler pipelines it (otherwise the driver
-    skips the whole nest, losing even the inner loop). The surrounding ops are
-    sunk into the inner loop: the epilogue under a last-iteration guard
-    (remapping the inner loop's results to its yielded values); a prologue store
-    under a first-iteration guard (runs once, e.g. an accumulator init); a pure
-    prologue op / a load of a memref not written in the nest unguarded
-    (recompute). The guard is an `affine.if` (constant IV) for an affine.for inner
-    or an `scf.if` (runtime `cmpi`) for an scf.for inner;
-    `fold-if-statements` predicates it.
+    Perform two steps of small-array handling. First wraps `affine-scalrep` pass to
+    perform store-to-load forwarding on a local array, eliminate or fold away
+    redundant memory accesses.
 
-    Bails (leaves the nest untouched) on: sibling inner loops, an scf.while, an
-    escaping/aliasing value, or other side effects.
+    Second, for the untouched survivors, if the array is small enough (at most
+    `maxElements` elements) and every subscript is a constant, automatically partition
+    it with `allo.part` so it lowers to registers rather than a memory whose ports and
+    access latency bound the II.
   }];
   let dependentDialects = [
-    "mlir::affine::AffineDialect", "mlir::scf::SCFDialect",
-    "mlir::arith::ArithDialect"
+    "mlir::affine::AffineDialect", "mlir::memref::MemRefDialect"
+  ];
+  let options = [
+    Option<"maxElements", "max-elements", "int64_t", "16",
+           "Partition a local array with at most this many elements">
   ];
 }
 
@@ -337,33 +503,30 @@ def LegalizeArithPass : Pass<"legalize-arith", "ModuleOp"> {
   let dependentDialects = ["mlir::arith::ArithDialect"];
 }
 
-def SdcSchedulingPass : Pass<"sdc-scheduling", "ModuleOp"> {
-  let summary = "Run SDC-based scheduling";
-  let description = [{
-    Perform SDC-based scheduling on the whole design, and emit the result using
-    `allo.sched.*` attributes on operations. Scheduling results can be further
-    processed by `convert-schedule-to-dcp` to reify the schedule into `allo.dcp.*`
-    ops.
-  }];
-  let options = [
-    Option<"cycleTime", "cycle-time", "float", "0.0",
-           "Target clock period (ns); <=0 falls back to 5.0. Operator/device "
-           "timing is read from the injected dcp.device / dcp.operator IR">,
-    Option<"top", "top", "std::string", "\"top\"",
-           "Name of the top kernel of the design (for scheduling)">
-  ];
-}
-
 def PropagatePartitionPass
     : Pass<"propagate-partition", "ModuleOp"> {
-  let summary = "Push a partitioned array's `allo.part` onto every callee "
-                "parameter it is passed to";
+  let summary = "Give every carrier of one array the single `allo.part` its "
+                "kernels agree on";
   let description = [{
-    A partition is a property of the ARRAY, stated once where the array lives (a
-    container's `memref.alloc`, or a kernel argument). A sub-kernel sees that
-    array only through its own parameter, a different memref in a different
-    function, so without this pass the callee is scheduled and emitted against
-    an unbanked parameter and the partition is silently dropped.
+    A partition is a property of the ARRAY, but the array is named once per
+    function it is visible in: a `memref.alloc`, a `memref.global`, a parameter
+    of each kernel it is passed to. Each place carries its own `allo.part`, and
+    every consumer reads whichever one is nearest, so left alone a callee is
+    scheduled against an unbanked parameter while its caller materializes banks.
+
+    This pass makes them one statement. Carriers are unified along call-argument
+    edges into per-array classes (an async spawn is a call like any other), every
+    partition stated on a class is JOINED, and the result is written back to all
+    of them. The relation is symmetric because a sub-kernel masters ports on the
+    caller's array rather than receiving a copy, so a directive travels in either
+    direction and reaches the array's other kernels.
+
+    The join is `joinPartitions`, which lives beside `bankLayoutOf` so the order
+    and the decode it orders cannot drift apart: axes on different dimensions
+    compose, factors on one dimension must divide, a complete partition absorbs,
+    and a block against a cyclic axis on one dimension is reported as the
+    conflict `Skew` exists to answer. One sweep suffices, since which carriers
+    denote one array follows from the call graph and never from the attributes.
 
     Runs before `sdc-scheduling`, so a callee is scheduled knowing its banks:
     banking a composed array pays off only if the *callee* issues N accesses per
@@ -372,11 +535,6 @@ def PropagatePartitionPass
     hardware and buy nothing.) After this, leaf banking handles a partitioned
     parameter unchanged, and a container merely materializes the banks its
     children already agree on.
-
-    Propagation is top-down and monotone (it only adds an attribute). Two
-    callsites passing differently-partitioned arrays to one callee is reported as
-    an error, not reconciled: the callee has one body and one schedule, and
-    cloning it per partition is a schedule-layer decision, not a lowering one.
   }];
   let options = [
     Option<"top", "top", "std::string", "\"top\"",
@@ -402,7 +560,7 @@ def OutlineLooseProcessesPass
     datapath ops is outlined into a private function and replaced by a call to
     it, so the container satisfies the no-datapath invariant by construction and
     the outlined work is scheduled, emitted and composed exactly like any other
-    child. The same move `perfectize-loop-nest` makes for an imperfect nest.
+    child. The same move `loop-canonicalization` makes for an imperfect nest.
 
     The outlined call is deliberately NOT marked `allo.async`: a spawn is
     broadcast the container's `start`, whereas a plain child fires at its
@@ -416,38 +574,6 @@ def OutlineLooseProcessesPass
     keeps this pass free of its own error paths and the diagnostic in the one
     place that knows what a structural top can wire.
   }];
-  let dependentDialects = ["mlir::func::FuncDialect"];
-}
-
-def VerifyRtlLegalityPass
-    : Pass<"verify-rtl-legality", "ModuleOp"> {
-  let summary = "Reject a program the RTL backend cannot lower, before any "
-                "region is scheduled";
-  let description = [{
-    A legality check whose answer is already settled in the pre-scheduling IR
-    belongs here rather than in the scheduler or the emitter. Both of those walk
-    the call DAG bottom up, so a violation in the TOP function is paid for with
-    a full schedule plus a full emission of everything underneath it, and the
-    checks that suffer most are exactly the ones about top-level composition
-    (the process network, the channels, the call boundary), because the
-    structural top is validated last.
-
-    Nothing here re-derives a fact: every check reads the same predicate its
-    late counterpart read (`OperatorLibrary`, `MemoryLibrary`, `bankLayoutOf`,
-    `whileFlushingPipelines`, `composesOnStructuralTop`), so hoisting cannot
-    disagree with the backend about what is legal.
-
-    Scoped to the call-graph closure of `top`, because that is what the emit
-    driver visits; verifying a dead function would reject programs that compile.
-
-    What does NOT belong here: anything reading an output of the solver, the
-    region partitioner or the binder. Those have no pre-scheduling form and stay
-    in `validateDatapath`.
-  }];
-  let options = [
-    Option<"top", "top", "std::string", "\"top\"",
-           "Name of the top kernel of the design">
-  ];
   let dependentDialects = ["mlir::func::FuncDialect"];
 }
 

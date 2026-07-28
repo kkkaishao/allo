@@ -371,7 +371,11 @@ def test_internal_signal_names():
 # and muxes the two addr masters onto it (the second child drives from the
 # first's done). `t` is the internal buffer chaining them; the loose RMW seed
 # makes the container mixed (leaf-routed) and keeps the init live.
-def test_two_children_reading_one_boundary_array_share_a_port():
+# Two serial children READING one boundary array. Nothing is at stake in a
+# shared read (no write to order against), so each accessor takes its own read
+# group off the same argument rather than time-sharing one, and the RMW through
+# the internal `t` still sequences them.
+def test_two_children_reading_one_boundary_array_get_a_group_each():
     @kernel
     def acc_t(A: i32[8], t: i32[8]):
         for i in range(8):
@@ -390,10 +394,14 @@ def test_two_children_reading_one_boundary_array_share_a_port():
         acc_t(A, t)  # adjacent calls, one region; both master A's read port
         scale_t(A, t, out)
 
+    rtl = _to_rtl(shared_read_top)
+    rd = [p for acc in rtl.interfaces["shared_read_top"]["reads"] for p in acc]
+    assert [p["base"] for p in rd] == ["A_rd0", "A_rd1"]  # a group per accessor
+    assert {p["arg"] for p in rd} == {0}  # both off the one boundary argument
+
     A = np.arange(8, dtype=np.int32) + 1
     out = np.zeros(8, dtype=np.int32)
-    r = _to_rtl(shared_read_top).cosim(A, out)
-    assert r.cycles > 0
+    rtl.cosim(A, out)
     assert np.array_equal(out, A * 3)  # A*2 + t, with t == A after the RMW
 
 
@@ -423,8 +431,7 @@ def test_two_children_writing_one_boundary_array_mux_addr_data_we():
 
     A = np.arange(8, dtype=np.int32) + 1
     out = np.zeros(8, dtype=np.int32)
-    r = _to_rtl(shared_write_top).cosim(A, out)
-    assert r.cycles > 0
+    _to_rtl(shared_write_top).cosim(A, out)
     exp = np.empty(8, dtype=np.int32)
     exp[:4] = (A[:4] + 5) + 1
     exp[4:] = (A[4:] + 5) * 2
@@ -454,8 +461,9 @@ def test_disjoint_writers_get_separate_port_groups():
 
     rtl = _to_rtl(pg_top)
     assert "allo.dcp.instance" in rtl.dcp  # leaf CallUnit path (structural lock)
-    wr = [w[0]["base"] for w in rtl.interfaces["pg_top"]["writes"]]
-    assert wr == ["B_wr0", "B_wr1"]  # one port group per accessor, not a mux
+    wr = [w[0] for w in rtl.interfaces["pg_top"]["writes"]]
+    assert [w["base"] for w in wr] == ["B_wr0", "B_wr1"]  # per accessor, not a mux
+    assert {w["arg"] for w in wr} == {1}  # both groups master the same argument
     A = np.arange(16, dtype=np.int32) + 1
     B = np.zeros(16, np.int32)
     rtl.cosim(A, B)

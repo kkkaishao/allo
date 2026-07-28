@@ -1,7 +1,7 @@
 # Copyright Allo authors. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Sanity checks for the RTL backend's end-to-end path, independent of any one scenario."""
+"""Sanity checks for the RTL backend's end-to-end path"""
 
 import os
 import shutil
@@ -16,7 +16,7 @@ from allo.lang import i32
 sys.path.insert(0, os.path.dirname(__file__))
 from _common import _to_rtl  # noqa: E402
 
-pytestmark = pytest.mark.skipif(
+needs_verilator = pytest.mark.skipif(
     shutil.which("verilator") is None, reason="verilator not available"
 )
 
@@ -26,6 +26,7 @@ B16 = (np.arange(16, dtype=np.int32) * 5 + 3) & 0xFF
 
 # Elementwise kernels over the basic address shapes: direct index, neighbor
 # offset, constant stride, a scalar operand, and a func-scope literal.
+@needs_verilator
 def test_elementwise_and_addressing():
     @kernel
     def vand(A: i32[16], B: i32[16], out: i32[16]):
@@ -33,9 +34,8 @@ def test_elementwise_and_addressing():
             out[i] = A[i] & B[i]
 
     out = np.zeros(16, np.int32)
-    r = _to_rtl(vand).cosim(A16, B16, out)
+    _to_rtl(vand).cosim(A16, B16, out)
     assert np.array_equal(out, A16 & B16)
-    assert r.cycles > 0
 
     @kernel
     def shift(A: i32[16], out: i32[16]):

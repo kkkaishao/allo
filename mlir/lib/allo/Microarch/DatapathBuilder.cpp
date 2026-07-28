@@ -9,6 +9,8 @@
 #include "allo/Microarch/Reservation.h" // verifyBinding (MRT legality)
 
 #include "allo/IR/AlloOps.h"
+#include "allo/Scheduling/AddressCost.h"   // splitAddress (strength reduction)
+#include "allo/Scheduling/MemoryAccess.h"  // resolveRoot (storage identity)
 #include "allo/Scheduling/MemoryModel.h"   // characterize (storage shape)
 #include "allo/Support/Logging.h"          // unmodelled-op diagnostic
 #include "allo/Translation/EmitterState.h" // nameFromLoc, sanitizeCppIdentifier
@@ -41,54 +43,15 @@ static Value dcpMemref(Operation *op) {
   return nullptr;
 }
 
-// The STORAGE IDENTITY of a memref or stream SSA value: the one definition
-// every access to that buffer / channel must agree on.
-//
-// A buffer allocated inside a region and used by a later one cannot be named
-// directly (SSA dominance), so the reifier threads it out through the region's
-// terminator: the producer stores to `%alloc` while the consumer loads from the
-// REGION RESULT forwarding it. Those are different Values, so keying storage by
-// the operand as written builds ONE MEMORY PER REGION: the writes land in one
-// and the reads come back from the other (uninitialized), and because the two
-// halves are then distinct MemUnits `recordSiblingDeps` sees no shared memref
-// and adds no ordering edge either. Both failures are silent.
-//
-// So peel every DCP region result back to the value it forwards, and a
-// pipeline's iter-arg back to its init, until reaching the real definition.
-static Value storageRoot(Value memref) {
-  while (true) {
-    if (auto res = dyn_cast<OpResult>(memref)) {
-      Operation *owner = res.getOwner();
-      unsigned k = res.getResultNumber();
-      if (auto seq = dyn_cast<dcp::DCPathSequentialOp>(owner)) {
-        memref = seq.getBody().front().getTerminator()->getOperand(k);
-        continue;
-      }
-      if (auto pipe = dyn_cast<dcp::DCPathPipelineOp>(owner)) {
-        // Terminator-kind agnostic: `uncondition` operands for a counted loop,
-        // `condition`'s carried operands for a while (whose leading `i1` would
-        // otherwise shift the indexing by one).
-        memref = pipe.getCarriedValues()[k];
-        continue;
-      }
-      // A guard yields from two arms, so a value crossing one has no single
-      // definition to peel to. No frontend shape produces that; fail loudly
-      // rather than silently splitting the buffer as above.
-      assert(!isa<dcp::DCPathSelectOp>(owner) &&
-             "a memref/stream yielded from a dcp.select has no single storage "
-             "root");
-      return memref;
-    }
-    // A pipeline iter-arg (block argument 0 is the counter) forwards its init.
-    auto barg = dyn_cast<BlockArgument>(memref);
-    if (!barg)
-      return memref;
-    auto pipe = dyn_cast<dcp::DCPathPipelineOp>(barg.getOwner()->getParentOp());
-    if (!pipe || barg.getArgNumber() == 0)
-      return memref; // a func argument, or the counter: already a root
-    memref = pipe.getInits()[barg.getArgNumber() - 1];
-  }
-}
+// The storage identity of a memref or stream SSA value is `resolveRoot`: a
+// buffer threaded out of the region that allocated it is the same memory to
+// its producer and its consumer. Keying storage by the operand as written
+// would build one memory per region, writes landing in one and reads coming
+// back from the other (uninitialized); the two halves would then be distinct
+// MemUnits, so `recordSiblingDeps` would see no shared memref and add no
+// ordering edge either. Both failures are silent, which is why the
+// scheduler's port model and this builder read the identity from one
+// definition.
 
 // The addressing of a dcp memory access: its affine map plus index operands.
 static void dcpAddressing(Operation *op, AffineMap &map,
@@ -200,7 +163,7 @@ Source DatapathBuilder::constant(int64_t v, Type t) {
 MemId DatapathBuilder::getOrCreateMem(Value memref) {
   // Key on the storage root, not the operand as written, so a buffer threaded
   // out of a region is the SAME memory to its producer and its consumer.
-  memref = storageRoot(memref);
+  memref = resolveRoot(memref);
   if (auto it = memOf.find(memref); it != memOf.end())
     return it->second;
   MemId id = dp.mems.size();
@@ -226,6 +189,9 @@ MemId DatapathBuilder::getOrCreateMem(Value memref) {
   // Anything still banked here is data-dependent or a partitioned argument.
   m.layout = allo::bankLayoutOf(memref);
   m.numBanks = m.layout.numBanks;
+  // THE expression behind `scattered` (see its declaration for why the top is
+  // the only place a complete partition changes the boundary shape).
+  m.scattered = m.external && dp.atTop && m.layout.registers;
   assert(m.numBanks == std::max(1u, mc.numBanks) &&
          "the emitter's bank decomposition disagrees with the one the "
          "scheduler's port model was billed against");
@@ -255,7 +221,7 @@ StreamId DatapathBuilder::getOrCreateStream(Value stream, bool isInput) {
   // Key on the storage root for the same reason a memref does: a channel
   // threaded out of a region names different Values at its two ends, and split
   // in two a self-loop reads as two one-directional channels.
-  stream = storageRoot(stream);
+  stream = resolveRoot(stream);
   if (auto it = streamOf.find(stream); it != streamOf.end())
     return it->second;
   StreamId id = dp.streams.size();
@@ -345,9 +311,10 @@ RegionBlock DatapathBuilder::addRegion(Operation *regionOp, RegionId ridx) {
     rb.determinacy = d.getValue();
   // A CONCURRENT region's `latency` is not a single-run span: its children run
   // to their own completion, ordered by back-pressure, so the number is a floor
-  // and not a hand-off contract. Recording it would break the invariant below.
+  // and not a hand-off contract.
   if (auto lat = regionOp->getAttrOfType<IntegerAttr>("latency"))
-    if (rb.determinacy != DeterminacyEnum::Concurrent)
+    if (rb.determinacy != DeterminacyEnum::Concurrent &&
+        !regionOp->hasAttr("latency_bound"))
       rb.staticLatency = lat.getInt();
   assert((!rb.staticLatency.has_value() ||
           rb.determinacy == DeterminacyEnum::CountedStatic) &&
@@ -729,6 +696,28 @@ void DatapathBuilder::enumerateBoundaryPorts() {
     if (!m.external)
       continue;
     std::string owner = ownerOfMem(m.id);
+    // A scattered argument's ports are per element, enumerated once for the
+    // memory (not per access), since every access reads them all and selects.
+    // Its accesses keep the default portIdx/portBase; nothing addresses them.
+    if (m.scattered) {
+      // The directions actually used decide the names: an argument used one
+      // way takes the bare `A_k`; used both ways, its two ports need telling
+      // apart. Read-only is a property of the use, here as everywhere else.
+      bool reads = false, writes = false;
+      for (const MemUnit::Access &acc : m.accesses)
+        (acc.isWrite ? writes : reads) = true;
+      for (unsigned k = 0, e = m.depthWords; k < e; ++k) {
+        MemUnit::ElemPort p;
+        if (reads)
+          p.in = elemBase(owner, k, writes ? ElemDir::In : ElemDir::Only);
+        if (writes) {
+          p.out = elemBase(owner, k, reads ? ElemDir::Out : ElemDir::Only);
+          p.we = portWe(p.out);
+        }
+        m.elemPorts.push_back(std::move(p));
+      }
+      continue;
+    }
     for (auto [a, acc] : llvm::enumerate(m.accesses)) {
       auto &ports = acc.isWrite ? dp.writePorts : dp.readPorts;
       acc.portIdx = ports.size();
@@ -1013,19 +1002,61 @@ void DatapathBuilder::allocateInputSlots() {
     u.inputInitDist.assign(n, 1);
   }
   for (MemUnit &m : dp.mems) {
-    auto shape = cast<MemRefType>(m.memref.getType()).getShape();
     for (MemUnit::Access &acc : m.accesses) {
       SmallVector<Value> operands;
       dcpAddressing(acc.op, acc.addrMap, operands);
       acc.addr.assign(operands.size(), Source{});
-      // Which bank this access reaches, decided by the `addrMap` just read: a
-      // compile-time index routes to one, a data-dependent one spans every bank
-      // (empty). An unbanked memref keeps the default 0.
-      if (m.numBanks > 1) {
-        std::optional<int64_t> b = staticBankOf(m.layout, acc.addrMap, shape);
-        acc.staticBank = b ? std::optional<unsigned>(*b) : std::nullopt;
+      // Which bank this access reaches: the one `assign-banks` decided, or
+      // every one of them when it decided none. This is the one write of
+      // `staticBank`, so it covers the unbanked memrefs too.
+      if (m.numBanks == 1) {
+        acc.staticBank = 0; // the one bank there is
+        continue;
       }
+      acc.staticBank = assignedBankOf(acc.op);
+      // Under a skew the recorded index is a SLOT, which no derivation off the
+      // map can confirm (the bank it names is only fixed at run time), so the
+      // assert below would be comparing two different things.
+      if (m.layout.skew())
+        continue;
+      // `bankAddress` builds the offset WITHIN this bank out of `addrMap`, so
+      // where the map still resolves a bank on its own it has to be the decided
+      // one. It often cannot: the decision read the loop steps too.
+      std::optional<int64_t> derived =
+          staticBankOf(m.layout, acc.addrMap,
+                       cast<MemRefType>(m.memref.getType()).getShape());
+      assert((!acc.staticBank || !derived ||
+              *derived == static_cast<int64_t>(*acc.staticBank)) &&
+             "the assigned bank is not the one this access's address map "
+             "reaches");
+      (void)derived;
     }
+    assignLanes(m);
+  }
+}
+
+// Group a skewed memory's accesses into LANES: within a lane the slots are
+// distinct, so the accesses reach distinct banks and share one port on each.
+// Same-slot accesses always collide, so each takes the next lane, which is the
+// port the model billed it. Numbered per region, and reads apart from writes,
+// because that is the granularity a port is contended at: the port model
+// constrains one region at a time, and a read port is not a write port.
+void DatapathBuilder::assignLanes(MemUnit &m) {
+  // A constant table has no ports to share (it is combinational), and an
+  // argument's ports are boundary interfaces the manifest already published,
+  // one set per access, which is why `assign-banks` assigns it no slot either.
+  if (!m.layout.skew() || m.external || m.isRom)
+    return;
+  // One access without a slot and the array is back to crossbarring: a lane
+  // shares a port on the strength of every user holding a distinct slot.
+  if (llvm::any_of(m.accesses,
+                   [](const MemUnit::Access &a) { return !a.staticBank; }))
+    return;
+  m.skewed = true;
+  llvm::DenseMap<std::tuple<unsigned, unsigned, unsigned>, unsigned> used;
+  for (MemUnit::Access &acc : m.accesses) {
+    assert(*acc.staticBank < m.numBanks && "a slot indexes the skew's banks");
+    acc.lane = used[{acc.region, acc.isWrite, *acc.staticBank}]++;
   }
 }
 
@@ -1082,6 +1113,189 @@ void DatapathBuilder::resolveUnitInputs() {
         mb.ops.push_back(opj);
         recordEdge(r, mb.sources[j], ridx);
       }
+    }
+  }
+}
+
+// Floor-based residue, which is what an affine `mod` means: non-negative for a
+// positive divisor whatever the sign of \p a, so a digit register starts in
+// range and its unsigned wrap compare is exact.
+static int64_t mod(int64_t a, int64_t b) {
+  return a - llvm::divideFloorSigned(a, b) * b;
+}
+
+// The slot in \p rb holding \p want, appended if no identical stride is there.
+static unsigned slotFor(RegionBlock &rb, const RegionBlock::AddrStride &want) {
+  auto *it =
+      llvm::find_if(rb.addrStrides, [&](const RegionBlock::AddrStride &a) {
+        return a.init == want.init && a.step == want.step &&
+               a.bump == want.bump && a.wrap == want.wrap &&
+               a.down == want.down && a.hasCarry == want.hasCarry &&
+               (!a.hasCarry || a.carry == want.carry);
+      });
+  if (it == rb.addrStrides.end()) {
+    rb.addrStrides.push_back(want);
+    it = std::prev(rb.addrStrides.end());
+  }
+  return static_cast<unsigned>(it - rb.addrStrides.begin());
+}
+
+// The register holding `t.coeff * digit` over region \p rid's counter, plus the
+// companion residue register a quotient digit carries off.
+//
+// \p base is absorbed by the first NON-WRAPPING register and zeroed: a scaled
+// counter loads a constant at start anyway, so taking it there splits one
+// stride slot off an otherwise identical one, against an adder on the port's
+// setup path. A wrapping register cannot take it, holding a residue its wrap
+// assumes stays in range.
+static MemUnit::Access::ScaledTerm strideFor(Datapath &dp, unsigned rid,
+                                             const SplitAddress::Term &t,
+                                             int64_t &base) {
+  RegionBlock &rb = dp.regions[rid];
+  // The digit's argument, `scale * counter + offset`: where it starts and what
+  // it advances by, which is all the register needs. Running backwards, every
+  // wrap becomes a borrow and every carry a decrement.
+  int64_t start = t.scale * *dp.constantOf(rb.lbSource) + t.offset;
+  int64_t advance = t.scale * *dp.constantOf(rb.stepSource);
+  bool down = advance < 0;
+  RegionBlock::AddrStride want;
+  if (!t.isDigit()) {
+    want = {t.coeff * start + base, t.coeff * advance};
+    base = 0;
+  } else if (t.divisor == 1) {
+    // A pure residue accumulates and wraps on itself.
+    want = {t.coeff * mod(start, t.modulus),
+            t.coeff * advance,
+            0,
+            t.coeff * t.modulus,
+            0,
+            false,
+            down};
+  } else {
+    // A quotient advances by one wherever its argument crosses a multiple of
+    // the divisor, which is what the companion residue register says. Unscaled,
+    // unreferenced by any access, and shared by every digit over that argument.
+    unsigned carry = slotFor(
+        rb, {mod(start, t.divisor), advance, 0, t.divisor, 0, false, down});
+    int64_t q = llvm::divideFloorSigned(start, t.divisor);
+    want = {t.coeff * (t.modulus ? mod(q, t.modulus) : q),
+            0,
+            down ? -t.coeff : t.coeff,
+            t.modulus ? t.coeff * t.modulus : 0,
+            carry,
+            true,
+            down};
+  }
+  return {rid, slotFor(rb, want)};
+}
+
+// Merge the terms landing on the same DIGIT of the same region, \p region
+// giving each operand position the region whose counter it follows. A region
+// has one counter, so those terms add their coefficients rather than taking a
+// register and an adder each, as `for j in range(i, N)` needs after it
+// normalizes to `j = i + j'`.
+static SmallVector<SplitAddress::Term>
+mergeTermsByDigit(ArrayRef<SplitAddress::Term> terms,
+                  ArrayRef<std::optional<unsigned>> region) {
+  using Digit = std::tuple<unsigned, int64_t, int64_t, int64_t, int64_t>;
+  llvm::MapVector<Digit, unsigned> group;
+  SmallVector<SplitAddress::Term> merged;
+  for (const SplitAddress::Term &t : terms) {
+    Digit d{*region[t.operand], t.scale, t.offset, t.divisor, t.modulus};
+    auto [it, isNew] = group.try_emplace(d, merged.size());
+    if (isNew)
+      merged.push_back(t);
+    else
+      merged[it->second].coeff += t.coeff;
+  }
+  llvm::erase_if(merged, [](const SplitAddress::Term &t) { return !t.coeff; });
+  return merged;
+}
+
+// Reduce ONE cone of an address. The in-bank offset and the bank digit run off
+// the same operands and are the same kind of expression, so they take the same
+// route: a bank under a cyclic partition is `counter mod F`, which is a wrap
+// register exactly as a delinearized subscript is.
+static MemUnit::Access::Reduced
+reduceCone(Datapath &dp, AffineExpr e, AffineMap addrMap,
+           ArrayRef<std::optional<unsigned>> region) {
+  MemUnit::Access::Reduced out;
+  if (!e)
+    return out;
+  SplitAddress sp =
+      splitAddress(e, addrMap.getNumDims(), addrMap.getNumSymbols(),
+                   [&](unsigned p) -> std::optional<int64_t> {
+                     if (!region[p])
+                       return std::nullopt;
+                     return dp.constantOf(dp.regions[*region[p]].stepSource);
+                   });
+  int64_t base = sp.base;
+  for (const SplitAddress::Term &t : mergeTermsByDigit(sp.terms, region))
+    out.terms.push_back(strideFor(dp, *region[t.operand], t, base));
+  // The digits the residual reads, IN ORDER and undeduplicated: it names them
+  // by position, and the scheduler priced the same list from the same
+  // `splitAddress`, so the two cannot disagree about which is which.
+  for (const SplitAddress::Term &t : sp.reads)
+    out.reads.push_back(strideFor(dp, *region[t.operand], t, base));
+  out.base = base; // 0 unless no register took it
+  out.residual = sp.residual;
+  return out;
+}
+
+// Address strength reduction: decide which TERMS of each access's address can
+// come from registers that advance with the loop counters, and record the
+// scaled counters those registers need.
+//
+// Runs after `resolveAccessOperands` (a term has to resolve to a counter) and
+// after `recordRegionBounds` (a stride is a constant only if the counter's
+// bounds are). A term that qualifies on neither count stays in the residual and
+// `buildAddr` evaluates it, so this only ever removes arithmetic.
+//
+// `splitAddress` is the same decomposition the scheduler priced the access
+// with, so what is built here is what was paid for. If they could disagree the
+// schedule would be optimistic, which is why they share the one definition.
+//
+// An operand the schedule needs late arrives through a delay chain, which is
+// peeled: what matters is whether the chain HEAD is a counter, the scaled
+// counter being delayed once for the whole sum instead of per operand. So
+// counters wanted in different cycles cannot share that one delay, and the
+// first one's cycle decides while the rest stay in the residual.
+//
+// The split runs on the IN-BANK OFFSET, which for an unbanked memref is the
+// flat index. That is what lets a banked access reduce at all: `buf[i, 4*j]`
+// under a cyclic-4 last axis offsets by `i*extent + j`, as linear as any.
+void DatapathBuilder::planAddressGenerators() {
+  for (MemUnit &m : dp.mems) {
+    auto shape = cast<MemRefType>(m.memref.getType()).getShape();
+    for (MemUnit::Access &acc : m.accesses) {
+      // Which operands a register can follow, decided up front so the predicate
+      // handed to `splitAddress` is a pure one.
+      SmallVector<std::optional<unsigned>> region(acc.addr.size());
+      std::optional<unsigned> delay;
+      for (unsigned p = 0, e = acc.addr.size(); p < e; ++p) {
+        Source s = acc.addr[p];
+        unsigned d = 0;
+        if (s.kind == Source::Kind::Reg) {
+          d = s.outPort;
+          s = dp.regs[s.id].input;
+        }
+        if (s.kind != Source::Kind::Counter || (delay && *delay != d))
+          continue;
+        RegionBlock &rb = dp.regions[s.id];
+        if (!dp.constantOf(rb.lbSource) || !dp.constantOf(rb.stepSource))
+          continue;
+        delay = d;
+        region[p] = s.id;
+      }
+      AddressExprs e =
+          addressExprsOf(m.layout, acc.addrMap, shape, acc.staticBank);
+      acc.offset = reduceCone(dp, e.offset, acc.addrMap, region);
+      acc.bank = reduceCone(dp, e.bank, acc.addrMap, region);
+      // Both cones read the same operands, so one delay covers them, and a
+      // digit the residual reads is a register like any other.
+      bool anyRegister = !acc.offset.terms.empty() || !acc.bank.terms.empty() ||
+                         !acc.offset.reads.empty() || !acc.bank.reads.empty();
+      acc.addrDelay = anyRegister ? delay.value_or(0) : 0;
     }
   }
 }
@@ -1214,8 +1428,9 @@ void DatapathBuilder::applyBinding(ArrayRef<SmallVector<UnitId, 2>> groups) {
       dp.units[uid].boundOps.clear(); // dead: dropped from its region below
     }
   }
-  // Drop the merged-away (empty) units from each region's membership; derive
-  // and emit iterate region.units, so a dead unit is simply never visited.
+  // Drop the merged-away (empty) units from each region's membership: both
+  // shape derivation and emission iterate region.units, so a dead unit is
+  // simply never visited.
   for (RegionBlock &rb : dp.regions) {
     SmallVector<UnitId> kept;
     for (UnitId uid : rb.units)
@@ -1369,6 +1584,7 @@ void DatapathBuilder::build() {
   recordResults();                // scalar func-result output ports
   applyBinding(policy.plan(dp));  // trivial => no groups, no muxes
   deriveInterconnect();
+  planAddressGenerators(); // address strength reduction (needs resolved terms)
   recordSiblingDeps(regionOps); // top-level composition DAG (concurrency gates)
   verifyBinding(dp); // MRT legality: no unit shared by conflicting ops
 }

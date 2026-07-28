@@ -5,12 +5,13 @@
 requires = [
     "nanobind>=2.10",
     "scikit-build-core>=0.10",
+    "setuptools_scm>=8",
 ]
 build-backend = "scikit_build_core.build"
 
 [project]
 name = "allo"
-version = "0.5"
+dynamic = ["version"]
 dependencies = [
     "rich",
     "sympy",
@@ -33,7 +34,6 @@ classifiers = [
     "Operating System :: OS Independent"
 ]
 
-# The developer toolchain, installed with `pip install -e '.[dev]'`.
 [project.optional-dependencies]
 dev = [
     "nanobind",
@@ -50,14 +50,20 @@ dev = [
 minimum-version = "build-system.requires"
 cmake.version = ">=3.20"
 ninja.version = ">=1.10"
-cmake.build-type = "Release"
+cmake.build-type = "Debug"
 cmake.source-dir = "."
-# Persistent build tree so the generated `allo/_mlir` symlinks always resolve.
 build-dir = "build"
 wheel.packages = ["allo"]
+experimental = true
+
+[tool.setuptools_scm]
+local_scheme = "no-local-version"
+
+[tool.scikit-build.metadata.version]
+provider = "version"
+provider-path = "."
 
 [tool.scikit-build.cmake.define]
-# Build against the same LLVM toolchain the bundled MLIR was built with.
 CMAKE_C_COMPILER = "clang"
 CMAKE_CXX_COMPILER = "clang++"
 CMAKE_VISIBILITY_INLINES_HIDDEN = "ON"
@@ -65,8 +71,11 @@ CMAKE_C_VISIBILITY_PRESET = "hidden"
 CMAKE_CXX_VISIBILITY_PRESET = "hidden"
 Python_FIND_VIRTUALENV = "ONLY"
 Python3_FIND_VIRTUALENV = "ONLY"
-MLIR_BINDINGS_PYTHON_NB_DOMAIN = "allo"
 LLVM_ENABLE_ZSTD = "OFF"
+
+[[tool.scikit-build.overrides]]
+if.env.ALLO_ENABLE_ORTOOLS = true
+cmake.define.ALLO_ENABLE_ORTOOLS = "ON"
 
 [tool.scikit-build.editable]
 mode = "redirect"

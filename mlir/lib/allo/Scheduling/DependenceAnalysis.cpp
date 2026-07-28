@@ -24,6 +24,8 @@
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/Support/MathExtras.h"
 
+#include <limits>
+
 using namespace mlir;
 using namespace mlir::affine;
 using namespace mlir::allo;
@@ -138,24 +140,44 @@ static void collectAssumptions(Value cond, SmallVectorImpl<Assumption> &out) {
 // Memref dependences
 //===----------------------------------------------------------------------===//
 
-// Record the affine memref dependences of every ordered pair of accesses.
+// Rewrite the components of one polyhedral result into ITERATION units, the
+// unit every consumer reads them in.
+static void
+rescaleOnLoopStep(SmallVectorImpl<affine::DependenceComponent> &comps) {
+  for (affine::DependenceComponent &c : comps) {
+    int64_t step = cast<affine::AffineForOp>(c.op).getStepAsInt();
+    auto rescale = [&](std::optional<int64_t> &v, int64_t open, bool isLower) {
+      if (!v || *v == open) {
+        v = std::nullopt;
+        return;
+      }
+      int64_t d = isLower ? llvm::divideFloorSigned(*v, step)
+                          : llvm::divideCeilSigned(*v, step);
+      v = isLower && *v > 0 ? std::max<int64_t>(d, 1) : d;
+    };
+    rescale(c.lb, std::numeric_limits<int64_t>::min(), /*isLower=*/true);
+    rescale(c.ub, std::numeric_limits<int64_t>::max(), /*isLower=*/false);
+  }
+}
+
+// Records the affine memref dependences of every ordered pair of accesses.
 // `checkMemrefAccessDependence` is queried at each loop depth from 1 to
 // numCommonLoops (a dependence carried by the d-th common surrounding loop)
-// and at numCommonLoops + 1: the loop-independent (intra-iteration) case, all
-// common loops pinned to the same iteration. The polyhedral test handles that
-// top depth natively: with `allowRAR = false` it also orients the otherwise-
-// symmetric dist-0 dependence by program order (reporting it only when the
-// source ancestor precedes the destination ancestor in their common block)
-// and drops read-read pairs, which never conflict. This also catches
-// same-iteration conflicts between DIFFERENT subscripts that can alias (e.g.
+// and at numCommonLoops + 1, the loop-independent (intra-iteration) case with
+// all common loops pinned to the same iteration. The polyhedral test handles
+// that top depth natively: with `allowRAR = false` it also orients the
+// otherwise-symmetric dist-0 dependence by program order (reporting it only
+// when the source ancestor precedes the destination ancestor in their common
+// block) and drops read-read pairs, which never conflict. This also catches
+// same-iteration conflicts between different subscripts that can alias (e.g.
 // `A[i][j]` vs `A[j][i]` on the diagonal, or `A[2*i]` vs `A[i]` at i == 0).
-// Aliasing between distinct memrefs is not modeled (distinct SSA memrefs are
-// assumed disjoint).
+// Aliasing between distinct memrefs is not modeled; distinct SSA memrefs are
+// assumed disjoint.
 //
-// A pair either endpoint of which the test cannot model (`nonPolyhedral`) is
+// A pair with either endpoint the test cannot model (`nonPolyhedral`) is
 // skipped entirely and left to the conservative path, so each pair is owned
-// by exactly one analysis; consequently an `assume.nodep` hint, which prunes
-// only conservative edges, retires all of a pair's edges or none.
+// by exactly one analysis: an `assume.nodep` hint, which prunes only
+// conservative edges, retires all of a pair's edges or none.
 static void
 checkMemrefDependence(ArrayRef<Operation *> memoryOps,
                       const llvm::SmallDenseSet<Operation *> &nonPolyhedral,
@@ -179,8 +201,10 @@ checkMemrefDependence(ArrayRef<Operation *> memoryOps,
         SmallVector<affine::DependenceComponent, 2> comps;
         auto result = affine::checkMemrefAccessDependence(
             srcAccess, dstAccess, depth, &constraints, &comps, allowRAR);
-        if (hasDependence(result.value))
+        if (hasDependence(result.value)) {
+          rescaleOnLoopStep(comps);
           results[dst].emplace_back(src, result.value, comps);
+        }
       }
     }
   }
@@ -293,24 +317,24 @@ streamDepComponents(Operation *op, int64_t distance) {
 }
 
 // Streams are FIFOs: every pair of accesses to the same FIFO must preserve
-// its program+iteration order, regardless of direction (unlike memory,
-// get-get is ordered and there is no RAW/WAR/WAW distinction). Each
-// may-aliasing pair is serialized with a distance-0 intra-iteration edge plus
-// a distance-1 loop-carried back edge, closing the recurrence that bounds the
-// II. With the latency-1 stream operators the back edge yields exactly the
-// FIFO issue-order bound (II >= 1 + (t_later - t_earlier)), so this is
-// precise, not conservative.
+// program and iteration order regardless of direction (unlike memory, get-get
+// is ordered; there is no RAW/WAR/WAW distinction). Each may-aliasing pair is
+// serialized with a distance-0 intra-iteration edge plus a distance-1
+// loop-carried back edge, closing the recurrence that bounds II. With
+// latency-1 stream operators the back edge yields exactly the FIFO
+// issue-order bound (II >= 1 + (t_later - t_earlier)): precise, not
+// conservative.
 //
-// This pair of edges is also what makes several accesses to one channel
-// emittable: they force distinct start cycles, spanning less than one II, in
-// program order. That is exactly the disjointness the emitter needs to
-// time-multiplex the channel's single {data,valid,ready} port across them, so
-// the k-access case needs no stream-port resource. The edges are strictly
-// stronger than a port limit, which would bound concurrency but not order.
+// This edge pair also makes several accesses to one channel emittable: it
+// forces distinct start cycles, spanning less than one II, in program order,
+// exactly the disjointness the emitter needs to time-multiplex the channel's
+// single {data,valid,ready} port across them, so the k-access case needs no
+// stream-port resource. The edges are strictly stronger than a port limit,
+// which would bound concurrency but not order.
 //
-// The all-pairs serialization is deliberate. Within a mutually-aliasing group
-// the extra edges are implied by transitivity (a chain would suffice) and leave
-// the SDC optimum unchanged, while the per-pair `Distinct` pruning keeps
+// All-pairs serialization is deliberate: within a mutually-aliasing group the
+// extra edges are implied by transitivity (a chain would suffice) and leave
+// the SDC optimum unchanged, while per-pair `Distinct` pruning keeps
 // provably-separate FIFOs independent. A plain program-order chain could not,
 // since FIFO may-aliasing is non-transitive.
 static void checkStreamDependence(SmallVectorImpl<Operation *> &streamOps,
@@ -359,17 +383,17 @@ static void checkStreamDependence(SmallVectorImpl<Operation *> &streamOps,
 
 // Whether the polyhedral test can model where `op` sits: every loop
 // enclosing it must be an affine.for. `getAffineForIVs` (and through it
-// `getInnermostCommonLoopDepth`) collects affine.for ancestors while
-// silently SKIPPING every other loop form, so an affine access under an
+// `getInnermostCommonLoopDepth`) collects affine.for ancestors while silently
+// skipping every other loop form, so an affine access under an
 // scf.for/scf.while is outside the test's domain even though `MemRefAccess`
 // accepts it: the depth ladder never names that loop, so a dependence it
-// carries is never queried and the pair is reported loop-independent. Left
-// to the polyhedral path, a memory-carried accumulate in a dynamic-trip loop
+// carries is never queried and the pair is reported loop-independent. Left to
+// the polyhedral path, a memory-carried accumulate in a dynamic-trip loop
 // (`for j in range(n): out[i] += ...`) would lose its recurrence and
-// pipeline at II = 1. Such accesses go to the conservative path with the
+// pipeline at II = 1, so such accesses go to the conservative path with the
 // non-affine ones.
 //
-// Note this costs no precision on the subscripts themselves: an scf.for IV is
+// This costs no precision on the subscripts themselves: an scf.for IV is
 // neither a valid affine dim nor a valid symbol, so an access whose loop nest
 // is not all-affine cannot have used those IVs in its subscripts anyway.
 static bool inAffineNest(Operation *op) {
@@ -406,9 +430,9 @@ memDepComponents(Operation *op, int64_t distance) {
 // with at least one write are serialized in program order (a distance-0
 // forward edge), plus a distance-1 loop-carried back edge when they share an
 // innermost loop (closing the recurrence that bounds II). Read-read pairs
-// commute and are left independent. This is the correctness backstop that
-// keeps such accesses from being silently reordered; an `allo.assume.nodep`
-// hint can prune a proven-false edge to recover II.
+// commute and are left independent. This is the correctness backstop against
+// silent reordering; an `allo.assume.nodep` hint can prune a proven-false
+// edge to recover II.
 static void checkConservativeDependence(
     ArrayRef<Operation *> accessOps,
     const llvm::SmallDenseSet<Operation *> &nonPolyhedral,
@@ -468,7 +492,7 @@ static Block *loopBodyForIV(Value iv) {
     return loop.getBody();
   if (auto loop = scf::getForInductionVarOwner(iv))
     return loop.getBody();
-  // `flatten-perfect-loops` rewrites each original iv to an `affine.apply`
+  // `loop-canonicalization` rewrites each original iv to an `affine.apply`
   // (floordiv/mod) of the surviving iv. Trace back through it so a nodep scoped
   // to a pre-coalescing iv still resolves to the coalesced loop.
   if (auto apply = iv.getDefiningOp<affine::AffineApplyOp>())
@@ -655,15 +679,14 @@ DependenceAnalysis::DependenceAnalysis(func::FuncOp funcOp) : func(funcOp) {
   }
 }
 
+// Retargets oldOp's dependence list and every edge sourced from it to newOp.
 void DependenceAnalysis::replaceOp(Operation *oldOp, Operation *newOp) {
-  // Move the dependence list keyed on oldOp over to newOp.
   auto it = results.find(oldOp);
   if (it != results.end()) {
     results[newOp] = std::move(it->second);
     results.erase(it);
   }
 
-  // Redirect any dependences that originate from oldOp.
   for (auto &entry : results)
     for (auto &dep : entry.second)
       if (dep.source == oldOp)

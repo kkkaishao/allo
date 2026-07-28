@@ -4062,19 +4062,26 @@ static void generateBufferAtCopy(OpBuilder &builder, Location loc,
   localOperands.reserve(2 * rank);
 
   for (unsigned d = 0; d < rank; ++d) {
-    auto forOp = affine::createCanonicalizedAffineForOp(
-        builder, loc, footprint.symbols, footprint.lowerBounds[d],
-        footprint.symbols, footprint.upperBounds[d], /*step=*/1);
-    builder = OpBuilder::atBlockTerminator(forOp.getBody());
+    Value globalIndex;
+    if (footprint.shape[d] == 1) {
+      globalIndex = builder.createOrFold<affine::AffineApplyOp>(
+          loc, footprint.lowerBounds[d], footprint.symbols);
+    } else {
+      auto forOp = affine::createCanonicalizedAffineForOp(
+          builder, loc, footprint.symbols, footprint.lowerBounds[d],
+          footprint.symbols, footprint.upperBounds[d], /*step=*/1);
+      builder = OpBuilder::atBlockTerminator(forOp.getBody());
+      globalIndex = forOp.getInductionVar();
+    }
 
     auto offset = affine::AffineApplyOp::create(
         builder, loc, footprint.lowerBounds[d], footprint.symbols);
     maybeDeadApplys.push_back(offset);
     localOperands.push_back(offset);
-    localOperands.push_back(forOp.getInductionVar());
+    localOperands.push_back(globalIndex);
     localExprs.push_back(builder.getAffineDimExpr(2 * d + 1) -
                          builder.getAffineDimExpr(2 * d));
-    globalIndices.push_back(forOp.getInductionVar());
+    globalIndices.push_back(globalIndex);
   }
 
   auto localMap = AffineMap::get(2 * rank, /*symbolCount=*/0, localExprs,

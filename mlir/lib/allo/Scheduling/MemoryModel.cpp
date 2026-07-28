@@ -8,15 +8,18 @@
 #include "allo-c/Schedule.h" // kPartitionAttr, kBindStorageAttr
 #include "allo/IR/AlloAttrs.h"
 #include "allo/IR/AlloOps.h" // dcp::DCPathStoreOp (post-reification)
+#include "allo/Scheduling/AddressCost.h"  // simplifiedForHardware
 #include "allo/Scheduling/MemoryAccess.h" // asMemAccess (the access substrate)
 
-#include "mlir/Analysis/FlatLinearValueConstraints.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h" // memref::GlobalOp / GetGlobalOp
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/SymbolTable.h"
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/Support/raw_ostream.h"
+
+#include <map>
 
 using namespace mlir;
 using namespace mlir::allo;
@@ -33,11 +36,22 @@ static Value storageOf(Operation *op) {
 }
 
 // Look up attribute \p name on \p memRef's carrier: its defining op, else the
-// function-argument attrs if it is a func argument.
+// function-argument attrs if it is a func argument. A `memref.get_global` is a
+// REFERENCE to storage, not the storage itself, so its carrier is the
+// `memref.global` that declares it, which is where the schedule primitives and
+// `propagate-partition` write; reading the reference instead loses every
+// storage directive given to a global array.
 template <typename AttrT>
 static AttrT carrierAttr(Value memRef, StringRef name) {
-  if (Operation *def = memRef.getDefiningOp())
+  if (Operation *def = memRef.getDefiningOp()) {
+    if (auto get = dyn_cast<memref::GetGlobalOp>(def)) {
+      auto global = SymbolTable::lookupNearestSymbolFrom<memref::GlobalOp>(
+          get, get.getNameAttr());
+      assert(global && "get_global references an undefined memref.global");
+      return global->getAttrOfType<AttrT>(name);
+    }
     return def->getAttrOfType<AttrT>(name);
+  }
   if (auto barg = dyn_cast<BlockArgument>(memRef))
     if (auto func = dyn_cast<func::FuncOp>(barg.getOwner()->getParentOp()))
       return func.template getArgAttrOfType<AttrT>(barg.getArgNumber(), name);
@@ -133,7 +147,7 @@ bool mlir::allo::isConstantTable(Value memRef) {
 // arrays default to LUTRAM in Vitis). This is the memref's position on the
 // implementation axis, the input to per-impl access timing.
 static MemoryImplEnum resolveImpl(Value memRef, MemoryImplEnum defaultImpl) {
-  if (partitionOf(memRef).unlimited)
+  if (bankLayoutOf(memRef).registers)
     return MemoryImplEnum::Register;
   auto bs =
       parseBindStorage(carrierAttr<DictionaryAttr>(memRef, kBindStorageAttr));
@@ -142,7 +156,7 @@ static MemoryImplEnum resolveImpl(Value memRef, MemoryImplEnum defaultImpl) {
 
 void MemoryBankModel::observe(Operation *op) {
   if (Value root = storageOf(op))
-    byMemref[root].accesses.push_back(op);
+    byMemref.try_emplace(root);
 }
 
 void MemoryBankModel::finalize() {
@@ -151,12 +165,12 @@ void MemoryBankModel::finalize() {
     MemInfo &info = entry.second;
     // A stream channel is a FIFO, not an array: one transfer per end per cycle,
     // no banking or storage-impl axis, and two independent ends, i.e. `splitRW`
-    // at one port each. `partitionOf` below would cast its type to MemRefType.
+    // at one port each. `bankLayoutOf` below would cast its type to MemRefType.
     if (isa<StreamType>(memRef.getType())) {
       info.splitRW = true;
       info.readPorts = 1;
       info.writePorts = 1;
-      continue;
+      continue; // and its default `layout` is the single unbanked one
     }
     // Port topology from `allo.bind.storage`. A SimpleDualPort (S2P) RAM has a
     // dedicated read and write port; every other topology shares its ports for
@@ -172,63 +186,60 @@ void MemoryBankModel::finalize() {
     } else {
       info.sharedPorts = portCount(bs.port);
     }
-    auto part = partitionOf(memRef);
+    info.layout = bankLayoutOf(memRef);
     // A constant table has no port to contend for (see `isConstantTable`); a
     // complete partition scattered the array into registers. Either way there
     // is nothing to bind against.
-    info.unlimited = part.unlimited || constTable;
-    info.partitionFactor = part.factor;
-    info.cyclicAxes = std::move(part.cyclicAxes);
-    bool hasBlock = part.hasBlock;
-    // Per-bank refinement holds only when every access is statically banked on
-    // every cyclic axis; block/complete/mixed or roaming access instead falls
-    // back to the aggregate limit.
-    if (info.unlimited || info.cyclicAxes.empty() || hasBlock)
-      continue;
-    info.perBank = llvm::all_of(info.accesses, [&](Operation *access) {
-      return llvm::all_of(info.cyclicAxes, [&](const auto &ax) {
-        return staticBank(access, ax.first, ax.second).has_value();
-      });
-    });
+    info.unlimited = info.layout.registers || constTable;
   }
 }
 
-std::optional<std::pair<std::string, unsigned>>
-MemoryBankModel::resource(Operation *op) const {
+SmallVector<std::pair<std::string, unsigned>>
+MemoryBankModel::resources(Operation *op) const {
   auto memRef = storageOf(op);
   if (!memRef)
-    return std::nullopt;
+    return {};
   auto it = byMemref.find(memRef);
   if (it == byMemref.end())
-    return std::nullopt;
+    return {};
   const MemInfo &info = it->second;
-  std::string base = "mem_" + std::to_string(hash_value(memRef));
   if (info.unlimited)
-    return std::make_pair(base + "_rsrc", 0u); // unlimited -> no binding
+    return {};
 
   // The pool this access draws from, and its ports per bank. Split (S2P) ->
   // dedicated read/write pools that never contend; shared -> one `_rw` pool for
   // both directions.
   auto a = asMemAccess(op);
-  bool isWrite = a && a->isWrite;
+  assert(a && "storageOf named a storage root, so this is a memory access");
   StringRef dir;
   unsigned portsPerBank;
   if (info.splitRW) {
-    dir = isWrite ? "_w" : "_r";
-    portsPerBank = isWrite ? info.writePorts : info.readPorts;
+    dir = a->isWrite ? "_w" : "_r";
+    portsPerBank = a->isWrite ? info.writePorts : info.readPorts;
   } else {
     dir = "_rw";
     portsPerBank = info.sharedPorts;
   }
+  std::string base = "mem_" + std::to_string(hash_value(memRef));
 
-  if (info.perBank) {
-    std::string key = base + "_bank";
-    for (auto [dim, factor] : info.cyclicAxes)
-      key += "_" + std::to_string(*staticBank(op, dim, factor));
-    return std::make_pair(key + dir.str(), portsPerBank);
-  }
-  return std::make_pair(base + "_rsrc" + dir.str(),
-                        portsPerBank * info.partitionFactor);
+  // The banks this one access occupies: its assigned bank alone, or every one
+  // of them when it has none and reaches the emitter's crossbar. READ rather
+  // than derived, so the ports billed and the routing built are one fact.
+  unsigned numBanks = info.layout.numBanks;
+  std::optional<unsigned> bank;
+  if (numBanks > 1)
+    bank = assignedBankOf(op);
+  SmallVector<std::pair<std::string, unsigned>> ports;
+  auto take = [&](unsigned k) {
+    ports.emplace_back(base + "_b" + std::to_string(k) + dir.str(),
+                       portsPerBank);
+  };
+  if (numBanks == 1 || bank)
+    take(bank.value_or(0));
+  else
+    for (unsigned k = 0; k < numBanks; ++k)
+      take(k);
+  return ports;
 }
 
 namespace mlir::allo {
@@ -238,6 +249,28 @@ int64_t BankLayout::bankWords() const {
   for (int64_t e : bankShape)
     n *= e;
   return n;
+}
+
+StringRef bankKindName(BankLayout::Kind kind) {
+  switch (kind) {
+  case BankLayout::Kind::Cyclic:
+    return "cyclic";
+  case BankLayout::Kind::Block:
+    return "block";
+  case BankLayout::Kind::Skew:
+    return "skew";
+  }
+  llvm_unreachable("unhandled bank layout kind");
+}
+
+const BankLayout::Axis *BankLayout::skew() const {
+  const Axis *found = nullptr;
+  for (const Axis &a : axes)
+    if (a.kind == Kind::Skew) {
+      assert(!found && "a layout carries at most one skewed axis");
+      found = &a;
+    }
+  return found;
 }
 
 // The banking a memref's `allo.part` implies, in element space: each block or
@@ -264,14 +297,19 @@ BankLayout bankLayoutOf(Value memRef) {
       return l;
     }
     int64_t f = axis.getFactor();
-    bool block = axis.getKind() == PartitionKindEnum::BlockPartition;
+    BankLayout::Kind kind = axis.getKind() == PartitionKindEnum::BlockPartition
+                                ? BankLayout::Kind::Block
+                            : axis.getKind() == PartitionKindEnum::SkewPartition
+                                ? BankLayout::Kind::Skew
+                                : BankLayout::Kind::Cyclic;
     auto addAxis = [&](unsigned d) {
       int64_t extent = (l.bankShape[d] + f - 1) / f;
-      l.axes.push_back({d, f, block, extent});
+      l.axes.push_back({d, f, kind, extent});
       l.bankShape[d] = extent;
       l.numBanks *= static_cast<unsigned>(f);
     };
-    // `dim == 0` partitions every dimension by this factor.
+    // `dim == 0` partitions every dimension by this factor (never a skew, whose
+    // verifier requires a named distribution dimension).
     if (axis.getDim() == 0)
       for (unsigned d = 0, e = mt.getRank(); d < e; ++d)
         addAxis(d);
@@ -281,65 +319,314 @@ BankLayout bankLayoutOf(Value memRef) {
   return l;
 }
 
-// The coordinate expression of dimension \p k for an address map that is either
-// in element space (one result per dimension) or already linearized by
-// `dcp-flatten-memref` (one result), delinearized row-major in the latter case.
-// Dimension 0 needs no `mod`: a linear index is always below the total size.
-static AffineExpr coordExpr(AffineMap map, ArrayRef<int64_t> shape,
-                            unsigned k) {
+//===--------------------------------------------------------------------===//
+// The partition lattice: the canonical spelling of a banking, and the coarsest
+// banking that satisfies two of them. Lives beside `bankLayoutOf` because it is
+// that decode read as an order: what the join must preserve is exactly what the
+// decode gives each axis.
+//===--------------------------------------------------------------------===//
+
+static bool isCompletePartition(PartitionAttr part) {
+  return part && llvm::any_of(part.getPartitions(), [](PartitionAxisAttr a) {
+           return a.getKind() == PartitionKindEnum::CompletePartition;
+         });
+}
+
+static bool hasSkewAxis(PartitionAttr part) {
+  return part && llvm::any_of(part.getPartitions(), [](PartitionAxisAttr a) {
+           return a.getKind() == PartitionKindEnum::SkewPartition;
+         });
+}
+
+// The whole-array top, spelled once. `bankLayoutOf` scatters into registers on
+// ANY complete axis whatever dimension it names, so the dimension carries no
+// meaning and normalizing it away is what lets two spellings of "registers"
+// compare equal.
+static PartitionAttr completePartition(MLIRContext *ctx) {
+  return PartitionAttr::get(
+      ctx, {PartitionAxisAttr::get(ctx, PartitionKindEnum::CompletePartition,
+                                   /*factor=*/0, /*dim=*/0)});
+}
+
+PartitionAttr canonicalizePartition(PartitionAttr part, MemRefType type) {
+  if (!part)
+    return {};
+  MLIRContext *ctx = part.getContext();
+  if (isCompletePartition(part))
+    return completePartition(ctx);
+  // `dim == 0` means every dimension, which `bankLayoutOf` expands in
+  // increasing dimension order; doing it here is that same fold made explicit,
+  // so an axis list can be compared one dimension at a time.
+  SmallVector<PartitionAxisAttr, 4> axes;
+  for (PartitionAxisAttr axis : part.getPartitions()) {
+    if (axis.getDim() != 0) {
+      axes.push_back(axis);
+      continue;
+    }
+    for (int64_t d = 1, e = type.getRank(); d <= e; ++d)
+      axes.push_back(
+          PartitionAxisAttr::get(ctx, axis.getKind(), axis.getFactor(), d));
+  }
+  llvm::sort(axes, [](PartitionAxisAttr x, PartitionAxisAttr y) {
+    return x.getDim() < y.getDim();
+  });
+  return PartitionAttr::get(ctx, axes);
+}
+
+// The single axis refining both \p x and \p y on the dimension they share, of
+// static extent \p extent. A cyclic residue class modulo F is a union of the
+// classes modulo kF, so a multiple of the factor always refines; a block chunk
+// of `ceil(extent / F)` splits into finer chunks only where the division leaves
+// no remainder, else a finer chunk straddles a coarser boundary and the two
+// bankings are simply different.
+static llvm::FailureOr<PartitionAxisAttr> joinAxis(PartitionAxisAttr x,
+                                                   PartitionAxisAttr y,
+                                                   int64_t extent,
+                                                   std::string &why) {
+  assert(x.getDim() == y.getDim() && "joining axes of different dimensions");
+  assert(x.getKind() != PartitionKindEnum::SkewPartition &&
+         y.getKind() != PartitionKindEnum::SkewPartition &&
+         "a skew is handled whole-attribute, being its array's only axis");
+  llvm::raw_string_ostream os(why);
+  if (x.getKind() != y.getKind()) {
+    os << "dimension " << x.getDim() << " is "
+       << ConvertToPartitionString(x.getKind()) << "-partitioned on one side, "
+       << ConvertToPartitionString(y.getKind())
+       << " on the other; a chunked layout and an interleaved one place the "
+          "same elements in different banks, so no single banking serves both. "
+          "Give both sides the same kind, or partition the array with a Skew, "
+          "which stays conflict-free along either axis";
+    return failure();
+  }
+  int64_t lo = std::min(x.getFactor(), y.getFactor());
+  int64_t hi = std::max(x.getFactor(), y.getFactor());
+  if (hi % lo != 0) {
+    os << "dimension " << x.getDim() << " is partitioned by " << lo
+       << " on one side and by " << hi
+       << " on the other; the factors must divide, so that the finer banking "
+          "keeps apart everything the coarser one does";
+    return failure();
+  }
+  if (x.getKind() == PartitionKindEnum::BlockPartition &&
+      (ShapedType::isDynamic(extent) || extent % hi != 0)) {
+    os << "dimension " << x.getDim() << " is block-partitioned by " << lo
+       << " on one side and by " << hi << " on the other, but its extent ("
+       << extent
+       << ") is not a multiple of the larger factor, so the two chunkings cut "
+          "the dimension at different points";
+    return failure();
+  }
+  return PartitionAxisAttr::get(x.getContext(), x.getKind(), hi, x.getDim());
+}
+
+llvm::FailureOr<PartitionAttr> joinPartitions(PartitionAttr a, PartitionAttr b,
+                                              MemRefType type,
+                                              std::string &why) {
+  a = canonicalizePartition(a, type);
+  b = canonicalizePartition(b, type);
+  if (!a || a == b)
+    return b;
+  if (!b)
+    return a;
+  MLIRContext *ctx = type.getContext();
+  // A complete partition is the top: every element becomes its own register,
+  // which distinguishes every pair of elements and serves every consumer.
+  if (isCompletePartition(a) || isCompletePartition(b))
+    return completePartition(ctx);
+  if (hasSkewAxis(a) || hasSkewAxis(b)) {
+    llvm::raw_string_ostream(why)
+        << "a skew partition must be an array's only axis (its bank already "
+           "reads every subscript), so "
+        << a << " and " << b << " cannot be combined";
+    return failure();
+  }
+  // Axes on different dimensions compose in mixed radix and need no
+  // reconciling; only a shared dimension has to fold into one axis. The ordered
+  // map is also what puts the result in canonical order.
+  std::map<int64_t, PartitionAxisAttr> byDim;
+  for (PartitionAxisAttr axis : a.getPartitions())
+    byDim.emplace(axis.getDim(), axis);
+  for (PartitionAxisAttr axis : b.getPartitions()) {
+    auto [slot, fresh] = byDim.try_emplace(axis.getDim(), axis);
+    if (fresh)
+      continue;
+    auto joined =
+        joinAxis(slot->second, axis, type.getDimSize(axis.getDim() - 1), why);
+    if (failed(joined))
+      return failure();
+    slot->second = *joined;
+  }
+  SmallVector<PartitionAxisAttr, 4> axes;
+  for (auto &[dim, axis] : byDim)
+    axes.push_back(axis);
+  return PartitionAttr::get(ctx, axes);
+}
+
+// The linear form a skewed axis reads its bank digit from: every subscript,
+// summed. A skew is the only axis of its layout (`PartitionAttr::verify`), so
+// this sees the access's own coordinates rather than a partly peeled set, which
+// is what lets `skewSlotOf` reproduce it from the map alone.
+static AffineExpr skewSum(ArrayRef<AffineExpr> coord) {
+  AffineExpr s = coord.front();
+  for (AffineExpr c : coord.drop_front())
+    s = s + c;
+  return s;
+}
+
+BankSplitExpr bankSplitOf(const BankLayout &layout, AffineMap map,
+                          ArrayRef<int64_t> shape) {
+  assert(map && "bank split of an access with no address map");
+  assert(map.getNumResults() == shape.size() &&
+         "an address map is in element space, one result per memref dimension");
+  // The per-bank strides below are products of the trailing extents, so a
+  // dynamic non-leading dim poisons them (the same condition
+  // `linearizeAccessMap` states).
+  assert((shape.empty() ||
+          llvm::none_of(shape.drop_front(),
+                        [](int64_t d) { return ShapedType::isDynamic(d); })) &&
+         "banked addressing needs static non-leading memref dims");
   unsigned rank = shape.size();
-  if (map.getNumResults() == rank)
-    return map.getResult(k);
-  AffineExpr e = map.getResult(0);
-  int64_t stride = 1;
-  for (unsigned d = k + 1; d < rank; ++d)
-    stride *= shape[d];
-  if (stride != 1)
-    e = e.floorDiv(stride);
-  return k == 0 ? e : e % shape[k];
+  unsigned nd = map.getNumDims(), ns = map.getNumSymbols();
+  MLIRContext *ctx = map.getContext();
+
+  SmallVector<AffineExpr> coord(map.getResults());
+
+  // Peel each axis's digit off its own subscript, cyclic taking the residue and
+  // block the quotient; a skew reads every subscript and divides only its
+  // distribution dimension. The digits compose in mixed radix.
+  AffineExpr bank;
+  for (const BankLayout::Axis &a : layout.axes) {
+    AffineExpr ci = coord[a.dim];
+    AffineExpr digit;
+    switch (a.kind) {
+    case BankLayout::Kind::Block:
+      digit = ci.floorDiv(a.extent);
+      coord[a.dim] = ci % a.extent;
+      break;
+    case BankLayout::Kind::Cyclic:
+      digit = ci % a.factor;
+      coord[a.dim] = ci.floorDiv(a.factor);
+      break;
+    case BankLayout::Kind::Skew:
+      digit = skewSum(coord) % a.factor;
+      coord[a.dim] = ci.floorDiv(a.factor);
+      break;
+    }
+    bank = bank ? bank * a.factor + digit : digit;
+  }
+  if (!bank)
+    bank = getAffineConstantExpr(0, ctx); // unpartitioned: the one bank
+
+  // What remains linearizes over the PER-BANK extents, which is the address
+  // space one bank actually has.
+  SmallVector<int64_t> stride(rank, 1);
+  for (int k = static_cast<int>(rank) - 2; k >= 0; --k)
+    stride[k] = stride[k + 1] * layout.bankShape[k + 1];
+  AffineExpr offset = getAffineConstantExpr(0, ctx);
+  for (unsigned k = 0; k < rank; ++k) {
+    offset = offset + coord[k] * stride[k];
+    coord[k] = simplifiedForHardware(coord[k], nd, ns);
+  }
+
+  return {simplifiedForHardware(bank, nd, ns),
+          simplifiedForHardware(offset, nd, ns), std::move(coord)};
+}
+
+// The interval \p e takes over \p ranges, or nullopt when an operand in it is
+// unbounded. Endpoint arithmetic, which is exact here because every operator is
+// monotone in its argument; the one over-approximation is a residue whose
+// argument straddles a multiple of the divisor, which widens to the whole
+// residue class. Both directions are SOUND, and soundness is what matters: a
+// caller acts on `lo == hi` and a wider interval only declines.
+static std::optional<std::pair<int64_t, int64_t>>
+rangeOf(AffineExpr e, ArrayRef<DimRange> ranges) {
+  if (auto c = dyn_cast<AffineConstantExpr>(e))
+    return std::pair{c.getValue(), c.getValue()};
+  if (auto d = dyn_cast<AffineDimExpr>(e)) {
+    if (d.getPosition() >= ranges.size() || !ranges[d.getPosition()].known)
+      return std::nullopt;
+    const DimRange &r = ranges[d.getPosition()];
+    return std::pair{r.lo, r.hi};
+  }
+  auto bin = dyn_cast<AffineBinaryOpExpr>(e);
+  if (!bin)
+    return std::nullopt; // a symbol: loop-invariant, but not bounded here
+  std::optional<std::pair<int64_t, int64_t>> l = rangeOf(bin.getLHS(), ranges),
+                                             r = rangeOf(bin.getRHS(), ranges);
+  if (!l || !r)
+    return std::nullopt;
+  if (bin.getKind() == AffineExprKind::Add)
+    return std::pair{l->first + r->first, l->second + r->second};
+  // Every other operator's right operand is a constant in a well-formed map.
+  if (r->first != r->second)
+    return std::nullopt;
+  int64_t k = r->first;
+  if (bin.getKind() == AffineExprKind::Mul)
+    return k >= 0 ? std::pair{l->first * k, l->second * k}
+                  : std::pair{l->second * k, l->first * k};
+  if (k <= 0)
+    return std::nullopt;
+  int64_t qlo = llvm::divideFloorSigned(l->first, k),
+          qhi = llvm::divideFloorSigned(l->second, k);
+  if (bin.getKind() == AffineExprKind::FloorDiv)
+    return std::pair{qlo, qhi};
+  if (bin.getKind() == AffineExprKind::CeilDiv)
+    return std::pair{llvm::divideCeilSigned(l->first, k),
+                     llvm::divideCeilSigned(l->second, k)};
+  assert(bin.getKind() == AffineExprKind::Mod && "unhandled affine operator");
+  if (qlo != qhi)
+    return std::pair{int64_t{0}, k - 1}; // straddles: the whole residue class
+  return std::pair{l->first - qlo * k, l->second - qlo * k};
 }
 
 std::optional<int64_t> staticBankOf(const BankLayout &layout, AffineMap map,
-                                    ArrayRef<int64_t> shape) {
+                                    ArrayRef<int64_t> shape,
+                                    ArrayRef<DimRange> ranges) {
   if (!map)
     return std::nullopt;
-  int64_t bank = 0;
-  for (const BankLayout::Axis &a : layout.axes) {
-    AffineExpr e = coordExpr(map, shape, a.dim);
-    auto one = AffineMap::get(map.getNumDims(), map.getNumSymbols(), e,
-                              map.getContext());
-    std::optional<int64_t> digit;
-    if (a.block) {
-      // A block bank is `i floordiv extent`, which is fixed only when the
-      // subscript itself is: unlike a cyclic residue, no coefficient condition
-      // pins it (a varying `i` walks from one chunk into the next).
-      if (auto cst = dyn_cast<AffineConstantExpr>(
-              simplifyAffineExpr(e, map.getNumDims(), map.getNumSymbols())))
-        digit = cst.getValue() / a.extent;
-    } else {
-      digit = staticBank(one, 0, a.factor);
-    }
-    if (!digit)
-      return std::nullopt;
-    bank = bank * a.factor + *digit;
-  }
-  return bank;
+  // "Statically banked" is not a separate predicate: it is the bank
+  // expression taking ONE value, which a constant fold covers directly and a
+  // bounded iteration domain (a block partition's digit) can cover too.
+  AffineExpr bank = bankSplitOf(layout, map, shape).bank;
+  if (auto cst = dyn_cast<AffineConstantExpr>(bank))
+    return cst.getValue();
+  if (std::optional<std::pair<int64_t, int64_t>> r = rangeOf(bank, ranges))
+    if (r->first == r->second)
+      return r->first;
+  return std::nullopt;
+}
+
+std::optional<SkewSlot> skewSlotOf(const BankLayout &layout, AffineMap map,
+                                   ArrayRef<int64_t> shape) {
+  const BankLayout::Axis *ax = layout.skew();
+  if (!map || !ax)
+    return std::nullopt;
+  assert(layout.axes.size() == 1 && "a skew is its layout's only axis");
+  assert(map.getNumResults() == shape.size() &&
+         "an address map is in element space, one result per memref dimension");
+  unsigned nd = map.getNumDims(), ns = map.getNumSymbols();
+  AffineExpr sum = skewSum(map.getResults());
+  // The constant part is what the sum reads with every operand at zero, so the
+  // rest is the runtime part. Both halves come from one substitution rather
+  // than from walking the expression, which no shape of affine sum can defeat.
+  AffineExpr zero = getAffineConstantExpr(0, map.getContext());
+  SmallVector<AffineExpr> zeroDims(nd, zero), zeroSyms(ns, zero);
+  auto cst = dyn_cast<AffineConstantExpr>(
+      simplifyAffineExpr(sum.replaceDimsAndSymbols(zeroDims, zeroSyms), 0, 0));
+  if (!cst)
+    return std::nullopt;
+  int64_t f = ax->factor;
+  return SkewSlot{simplifyAffineExpr(sum - cst.getValue(), nd, ns),
+                  static_cast<unsigned>(((cst.getValue() % f) + f) % f)};
 }
 
 AffineMap linearizeAccessMap(AffineMap map, ArrayRef<int64_t> shape) {
-  // Already linear (dcp-flatten-memref's form): the same discriminant
-  // `coordExpr` reads, so the two directions agree on which form they see.
   unsigned rank = shape.size();
-  if (map.getNumResults() != rank) {
-    assert(map.getNumResults() == 1 &&
-           "an address map is either in element space (one result per memref "
-           "dimension) or already linearized (exactly one result)");
-    return map;
-  }
+  assert(map.getNumResults() == rank &&
+         "an address map is in element space, one result per memref dimension");
   // Row-major strides are a product of the TRAILING extents, so a dynamic
-  // non-leading dim poisons every stride; shape[0] is never read, which is why
-  // a leading dynamic dim is safe. A rank-0 memref (a `Stateful` scalar's
-  // backing storage) has no trailing dim and no stride to poison.
+  // non-leading dim poisons every stride (shape[0] is never read, so a
+  // leading dynamic dim is safe); a rank-0 memref has no stride to poison.
   assert((shape.empty() ||
           llvm::none_of(shape.drop_front(),
                         [](int64_t d) { return ShapedType::isDynamic(d); })) &&
@@ -350,48 +637,24 @@ AffineMap linearizeAccessMap(AffineMap map, ArrayRef<int64_t> shape) {
   AffineExpr lin = getAffineConstantExpr(0, map.getContext());
   for (unsigned k = 0; k < rank; ++k)
     lin = lin + map.getResult(k) * stride[k];
-  lin = simplifyAffineExpr(lin, map.getNumDims(), map.getNumSymbols());
+  lin = simplifiedForHardware(lin, map.getNumDims(), map.getNumSymbols());
   return AffineMap::get(map.getNumDims(), map.getNumSymbols(), lin,
                         map.getContext());
 }
 
-// The aggregate projection of `bankLayoutOf`, for consumers that only need the
-// bank count / kind rather than the full decomposition.
-PartitionInfo partitionOf(Value memRef) {
-  BankLayout l = bankLayoutOf(memRef);
-  PartitionInfo p;
-  p.unlimited = l.registers;
-  p.factor = l.numBanks;
-  for (const BankLayout::Axis &a : l.axes) {
-    if (a.block)
-      p.hasBlock = true;
-    else
-      p.cyclicAxes.push_back({a.dim, a.factor});
-  }
-  return p;
-}
-
-// The compile-time bank of \p op on a cyclic axis (0-based `dim`, `factor`), or
-// nullopt when the subscript is not iteration-invariant modulo the factor (a
-// roaming or non-affine access): a fixed bank needs every variable coefficient
-// of the partition-dim subscript to vanish modulo the factor.
-std::optional<int64_t> staticBank(AffineMap map, unsigned dim, int64_t factor) {
-  if (!map || dim >= map.getNumResults())
+std::optional<unsigned> assignedBankOf(Operation *op) {
+  // Two carriers, one fact: a discardable attribute while the access is still
+  // affine, the reified op's own attribute once it is not.
+  IntegerAttr bank;
+  if (auto l = dyn_cast<dcp::DCPathLoadOp>(op))
+    bank = l.getBankAttr();
+  else if (auto s = dyn_cast<dcp::DCPathStoreOp>(op))
+    bank = s.getBankAttr();
+  else
+    bank = op->getAttrOfType<IntegerAttr>(kBankAttr);
+  if (!bank)
     return std::nullopt;
-  SmallVector<int64_t> flat;
-  if (failed(getFlattenedAffineExpr(map.getResult(dim), map.getNumDims(),
-                                    map.getNumSymbols(), &flat)))
-    return std::nullopt;
-  // flat = [dim/sym/local coeffs..., constant].
-  for (unsigned i = 0, e = flat.size() - 1; i < e; ++i)
-    if (flat[i] % factor != 0)
-      return std::nullopt;
-  return ((flat.back() % factor) + factor) % factor;
-}
-
-std::optional<int64_t> staticBank(Operation *op, unsigned dim, int64_t factor) {
-  auto a = asMemAccess(op);
-  return a ? staticBank(a->map, dim, factor) : std::nullopt;
+  return static_cast<unsigned>(bank.getInt());
 }
 
 } // namespace mlir::allo
@@ -445,9 +708,9 @@ MemoryChar allo::characterize(Value memref, MemoryImplEnum defaultImpl) {
   c.constantTable = isConstantTable(memref);
   c.readOnly = bs.kind == MemoryKindEnum::ROM || c.constantTable;
   c.portsPerBank = portCount(bs.port);
-  auto part = partitionOf(memref);
-  c.numBanks = part.factor;
-  c.registers = part.unlimited;
+  BankLayout layout = bankLayoutOf(memref);
+  c.numBanks = layout.numBanks;
+  c.registers = layout.registers;
   c.impl = resolveImpl(memref, defaultImpl);
   return c;
 }

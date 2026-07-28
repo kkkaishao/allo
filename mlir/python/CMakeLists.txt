@@ -1,9 +1,7 @@
 # Copyright Allo authors. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
-#
-# Assembles the `allo._mlir` Python package on top of the upstream MLIR Python
-# bindings (single MLIR instance via the aggregate CAPI dylib). This is additive
-# and lives alongside the legacy hand-written `_liballo` extension in ../python.
+
+set(MLIR_BINDINGS_PYTHON_NB_DOMAIN "allo")
 
 include(AddMLIRPython)
 

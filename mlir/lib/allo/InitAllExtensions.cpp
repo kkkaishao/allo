@@ -1,3 +1,8 @@
+/*
+ * Copyright Allo authors. All Rights Reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 #include "allo/InitAllExtensions.h"
 
 #include "mlir/Dialect/Affine/TransformOps/AffineTransformOps.h"

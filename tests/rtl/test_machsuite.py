@@ -394,7 +394,9 @@ def test_dynamic_programming():
     assert res.func("needwun").latency is not None
     cyclic = [r for r in res.func("needwun").regions if r.kind == "cyclic"]
     assert len(cyclic) >= 4
-    assert max(r.ii for r in cyclic) > FADD
+    # An all-integer kernel: the bound is the memory-carried recurrence through
+    # `result`, so the nest cannot close at II=1. No adder latency is involved.
+    assert max(r.ii for r in cyclic) > 1
 
     def nw_golden(SEQA, SEQB):
         M = np.zeros(MATRIX_SIZE, np.int32)
@@ -460,7 +462,7 @@ def test_dynamic_programming():
     assert np.array_equal(result, gnw)
 
 
-def test_while_loops():
+def test_data_dependent_while_kernels():
     """A data-dependent `while` schedules as a conditional (flushing) pipeline and
     leaves the latency unknown; no raw scf.while survives into the DCP IR. kmp
     nests two backtracking whiles whose conditions read memory, and drives end to
@@ -710,9 +712,9 @@ def test_grid_parallel():
     """`allo.grid` lowers to a nested affine.for band that the whole scheduling
     pipeline handles: constant trips give a static latency, and a real
     memory-carried recurrence still closes despite the grid's nodep hint. gemm's
-    k-reduction serializes into C[i, j] and drives correctly end to end; the two
-    stencils cover the dependence-free grid and boundary copies (their own cosim is
-    in test_rtl_backend_e2e.py)."""
+    k-reduction serializes into C[i, j] and drives correctly end to end. The grid
+    stencils live in test_loop_control.py, which cosims them at non-power-of-two
+    extents that exercise the div/mod delinearisation this file's shapes miss."""
     P = 8
 
     # The canonical grid() matmul: C[i, j] is affine, so the grid's assume.nodep
@@ -735,55 +737,6 @@ def test_grid_parallel():
     rtl.cosim(A, B, C)
     # f32 accumulation reassociates in hardware, so compare to a tolerance.
     assert np.allclose(C, A @ B, rtol=2e-3, atol=2e-3)
-
-    # A 2-D grid stencil: the 3x3 window accumulation pipelines at II=1 and the
-    # write to a distinct sol[i, j] per iteration carries no dependence.
-    ROW, COL, F = 32, 32, 9
-
-    @kernel
-    def stencil2d(orig: i32[ROW, COL], filt: i32[F], sol: i32[ROW, COL]):
-        for i, j in allo.grid(ROW - 2, COL - 2):
-            temp: i32 = 0
-            for m in range(3):
-                for n in range(3):
-                    mul: i32 = filt[m * 3 + n] * orig[i + m, j + n]
-                    temp += mul
-            sol[i, j] = temp
-
-    res = _sched(stencil2d)
-    assert res.func("stencil2d").latency is not None
-    assert res.cyclic() and all(r.ii == 1 for r in res.cyclic())
-
-    # A 3-D grid stencil: three boundary-copy grids plus one interior 6-neighbor
-    # accumulation grid; the boundary copies pipeline at II=1.
-    R, C, H = 8, 16, 16
-
-    @kernel
-    def stencil3d(coeff: i32[2], orig: i32[R, C, H], sol: i32[R, C, H]):
-        for j, k in allo.grid(C, R):
-            sol[k, j, 0] = orig[k, j, 0]
-            sol[k, j, H - 1] = orig[k, j, H - 1]
-        for i, k in allo.grid(H - 1, R):
-            sol[k, 0, i + 1] = orig[k, 0, i + 1]
-            sol[k, C - 1, i + 1] = orig[k, C - 1, i + 1]
-        for j, i in allo.grid(C - 2, H - 2):
-            sol[0, j + 1, i + 1] = orig[0, j + 1, i + 1]
-            sol[R - 1, j + 1, i + 1] = orig[R - 1, j + 1, i + 1]
-        for i, j, k in allo.grid(H - 2, C - 2, R - 2):
-            sum0: i32 = orig[k + 1, j + 1, i + 1]
-            sum1: i32 = (
-                orig[k + 1, j + 1, i + 2]
-                + orig[k + 1, j + 1, i]
-                + orig[k + 1, j + 2, i + 1]
-                + orig[k + 1, j, i + 1]
-                + orig[k + 2, j + 1, i + 1]
-                + orig[k, j + 1, i + 1]
-            )
-            sol[k + 1, j + 1, i + 1] = sum0 * coeff[0] + sum1 * coeff[1]
-
-    res = _sched(stencil3d)
-    assert res.func("stencil3d").latency is not None
-    assert min(_iis(res.cyclic())) == 1  # boundary copies fully pipelined
 
 
 def test_double_precision_divide():
@@ -872,32 +825,40 @@ def test_double_precision_divide():
 
 
 def test_port_bound_ii_read_write_same_array():
-    """A load and a store contending for one array's ports bound the II by
-    resource, not by operator type: `weights` sees 3 reads + 1 write per iteration
-    over 2 ports, so II = ceil(4/2) = 2. It is updated in place and read back for
-    the norm in the same iteration, so time-sharing the ports must not let the norm
-    see a stale value; the norm comes back on the scalar result port at done."""
-    IN, NPL, LR = 4, 4, 2
+    """Loads and stores contending for one array's ports bound the II by resource,
+    not by operator type: `weights` sees 2 reads + 2 writes per iteration over 2
+    ports, so II = ceil(4/2) = 2. The two elements are exchanged, so time-sharing
+    the ports must not let either write land before both reads; the norm comes back
+    on the scalar result port at done.
+
+    The accesses are to DISTINCT elements on purpose. A read of the element just
+    written is not port pressure at all any more: `scalarize-memory` forwards the
+    stored value, which is the right answer but leaves nothing to oversubscribe."""
+    NPL, LR = 8, 2
 
     # Integer accumulate, so the norm recurrence is combinational and the port
     # oversubscription -- the actual subject -- is the binding constraint.
     @kernel
-    def wnorm(weights: i32[IN * NPL], dweights: i32[IN * NPL]) -> i32:
+    def wnorm(weights: i32[2 * NPL], dweights: i32[2 * NPL]) -> i32:
         norm: i32 = 0
-        for i in range(IN):
-            for j in range(NPL):
-                weights[i * NPL + j] -= dweights[i * NPL + j] * LR
-                norm += weights[i * NPL + j] * weights[i * NPL + j]
+        for i in range(NPL):
+            lo: i32 = weights[2 * i]
+            hi: i32 = weights[2 * i + 1]
+            weights[2 * i] = hi - dweights[2 * i] * LR
+            weights[2 * i + 1] = lo - dweights[2 * i + 1] * LR
+            norm += lo * lo + hi * hi
         return norm
 
     rtl = _to_rtl(wnorm)
     assert _iis(rtl.schedule().cyclic()) == [2]
 
     rng = np.random.default_rng(0)
-    weights = rng.integers(0, 8, size=IN * NPL).astype(np.int32)
-    dweights = rng.integers(0, 8, size=IN * NPL).astype(np.int32)
-    exp_w = (weights - dweights * LR).astype(np.int32)
-    exp_norm = int(np.sum(exp_w.astype(np.int64) ** 2))
+    weights = rng.integers(0, 8, size=2 * NPL).astype(np.int32)
+    dweights = rng.integers(0, 8, size=2 * NPL).astype(np.int32)
+    exp_w = weights.copy()
+    exp_w[0::2] = weights[1::2] - dweights[0::2] * LR
+    exp_w[1::2] = weights[0::2] - dweights[1::2] * LR
+    exp_norm = int(np.sum(weights.astype(np.int64) ** 2))
 
     r = rtl.cosim(weights, dweights)
     assert np.array_equal(weights, exp_w)

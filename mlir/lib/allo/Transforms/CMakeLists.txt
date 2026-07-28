@@ -9,19 +9,17 @@ add_mlir_library(MLIRAlloTransforms
     FoldConstantCalls.cpp
     GenerateApintWrapper.cpp
     FoldIfStatements.cpp
-    FlattenPerfectLoops.cpp
-    FlattenDcpMemref.cpp
+    LoopCanonicalization.cpp
+    AssignBanks.cpp
     ResolveBanking.cpp
     PropagatePartition.cpp
     OutlineLooseProcesses.cpp
-    PerfectizeLoopNest.cpp
     RaiseCountedWhile.cpp
-    UnrollUnderPipeline.cpp
+    ElideDeadInit.cpp
+    ScalarizeMemory.cpp
     ReassociateReductions.cpp
     RotateReductions.cpp
     LegalizeArith.cpp
-    VerifyRtlLegality.cpp
-    SdcScheduling.cpp
 
     DEPENDS
     MLIRAlloIncGen
@@ -35,6 +33,7 @@ add_mlir_library(MLIRAlloTransforms
     MLIRArithDialect
     MLIRArithTransforms
     MLIRFuncDialect
+    MLIRLinalgDialect
     MLIRLLVMDialect
     MLIRMemRefDialect
     MLIRSCFDialect

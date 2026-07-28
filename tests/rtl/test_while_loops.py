@@ -14,7 +14,7 @@ from allo import kernel
 from allo.lang import i32, f32, index
 
 sys.path.insert(0, os.path.dirname(__file__))
-from _common import Mod, _sched, _to_rtl  # noqa: E402
+from _common import Mod, _sched, _to_rtl, _one_region, _hold_done  # noqa: E402
 
 pytestmark = pytest.mark.skipif(
     shutil.which("verilator") is None, reason="verilator not available"
@@ -51,48 +51,163 @@ def test_while_scheduling():
     # conditional (no flushing controller).
     assert (w.ii, w.length, w.latency) == (f.ii, f.length, f.latency)
     assert not w.conditional and not w.latency_is_bound
+    # The data-dependent counterpart is scheduled and driven together in
+    # test_while_flushing_pipeline_cosim.
+
+
+def test_decreasing_index_while_raises_cosim():
+    # A decreasing (countdown) counted while with an `index` IV raises to a
+    # counted for. The rewrite reconstructs the IV from the loop counter as
+    # `init - j`, so the body sees i = N, N-1, ..., 1 in the original order and
+    # the loop schedules as counted, not a flushing pipeline. Covers a constant
+    # trip, a runtime (dynamic-bound) trip, and the zero-trip entry.
+    N = 64
+    A = (np.arange(N, dtype=np.int32) * 3 + 1) & 0xFF
 
     @kernel
-    def wr(n0: i32, out: i32[1]):
-        x: i32 = n0
-        c: i32 = 0
-        while x > 1:
-            x = x - 1
-            c = c + 1
-        out[0] = c
+    def dec_const(A: i32[N], out: i32[1]):
+        i: index = N
+        s: i32 = 0
+        while i > 0:
+            s = s + A[i - 1]
+            i = i - 1
+        out[0] = s
 
-    mod = _to_rtl(wr)
+    loop = _sched(dec_const).cyclic()[0]
+    # Constant trip: counted, known latency (N issues plus one stage), and not a
+    # conditional/flushing region.
+    assert not loop.conditional and not loop.latency_is_bound
+    assert loop.latency == N + 1
+    out = np.zeros(1, np.int32)
+    _to_rtl(dec_const).cosim(A, out)
+    assert out[0] == int(A.sum())  # counts i down from N, so sums all of A
+
+    @kernel
+    def dec_var(A: i32[N], n0: index, out: i32[1]):
+        i: index = n0
+        s: i32 = 0
+        while i > 0:
+            s = s + A[i - 1]
+            i = i - 1
+        out[0] = s
+
+    mod = _to_rtl(dec_var)
     loop = mod.schedule().cyclic()[0]
-    assert loop.conditional is True
-    assert loop.latency is None
-    assert "dcp.condition" in mod.dcp  # reified while terminator
+    # Runtime trip: still counted (a dynamic bound), so not conditional, but its
+    # length -- hence latency -- is left unknown.
+    assert not loop.conditional and loop.latency is None
+    for n0 in (0, 1, 5, N):  # n0 == 0 exits on entry
+        out = np.zeros(1, np.int32)
+        mod.cosim(A, np.int64(n0), out)
+        assert out[0] == int(A[:n0].sum())
+
+
+def test_i32_counted_while_raises_cosim():
+    # A counted while whose IV is `i32` (not `index`) raises like an index one:
+    # the matcher looks through the extend/truncate the frontend wraps i32
+    # arithmetic in for overflow, and the rewrite casts the counter back to i32.
+    # Covers both directions.
+    N = 32
+    A = (np.arange(N, dtype=np.int32) * 3 + 1) & 0xFF
+
+    @kernel
+    def incr(A: i32[N], out: i32[1]):
+        i: i32 = 0
+        s: i32 = 0
+        while i < N:
+            s = s + A[i]
+            i = i + 1
+        out[0] = s
+
+    @kernel
+    def decr(A: i32[N], out: i32[1]):
+        i: i32 = N
+        s: i32 = 0
+        while i > 0:
+            s = s + A[i - 1]
+            i = i - 1
+        out[0] = s
+
+    for k in (incr, decr):
+        assert not _sched(k).cyclic()[0].conditional  # raised to a counted for
+        out = np.zeros(1, np.int32)
+        _to_rtl(k).cosim(A, out)
+        assert out[0] == int(A.sum())
+
+
+def test_used_iv_result_while_raises_cosim():
+    # A counted while whose IV is read after the loop still raises: the pass
+    # rebuilds the exit IV as `init + trip*delta`, the first value failing the
+    # test. Covers an increasing runtime bound (result == n, and result == init
+    # for the zero-trip case) and a decreasing constant bound (result == 3).
+    N = 16
+    A = (np.arange(N, dtype=np.int32) % 7 + 1).astype(np.int32)
+
+    @kernel
+    def up(A: i32[N], n: i32, out: i32[2]):
+        i: i32 = 0
+        s: i32 = 0
+        while i < n:
+            s = s + A[i]
+            i = i + 1
+        out[0] = s
+        out[1] = i  # first i failing i < n == max(0, n)
+
+    mod = _to_rtl(up)
+    assert not mod.schedule().cyclic()[0].conditional  # raised, not flushing
+    for n in (0, 5, N):  # n == 0 exits on entry, so i stays init (0)
+        out = np.zeros(2, np.int32)
+        mod.cosim(A, np.int32(n), out)
+        assert out[0] == int(A[:n].sum())
+        assert out[1] == n
+
+    @kernel
+    def down(A: i32[N], out: i32[2]):
+        i: i32 = N
+        s: i32 = 0
+        while i > 3:
+            s = s + A[i - 1]
+            i = i - 1
+        out[0] = s
+        out[1] = i  # first i failing i > 3 == 3
+
+    mod = _to_rtl(down)
+    out = np.zeros(2, np.int32)
+    mod.cosim(A, out)
+    assert out[0] == int(A[3:N].sum())
+    assert out[1] == 3
 
 
 def test_while_with_nested_while():
-    # Two decreasing (hence un-raised) whiles nested. The inner while's
-    # straight-line body schedules as a flushing pipeline; the outer while's
-    # body is decomposed around it and the outer runs sequentially. Exercises
-    # the nested-loop-in-while decomposition recursing through a while child.
-    N = 64
+    # A data-dependent double-while: both continue-tests are combinational over
+    # carried accumulators (`oacc < olimit`, `iacc < ilimit`) advanced by the
+    # data, so neither is counted and neither raises. The outer holds a nested
+    # loop, so it runs sequentially; the inner flushes. Exercises the
+    # nested-loop-in-while decomposition recursing through a while child.
+    N = 16
 
     @kernel
-    def nested_while(A: i32[N]) -> i32:
+    def nested_while(A: i32[N], olimit: i32, ilimit: i32, out: i32[1]):
         total: i32 = 0
-        s: i32 = N
-        while s > 0:
-            t: i32 = s
-            while t > 0:
-                total += A[t - 1]
-                t -= 1
-            s -= 1
-        return total
+        oacc: i32 = 0
+        i: i32 = 0
+        while oacc < olimit:
+            iacc: i32 = 0
+            j: i32 = 0
+            while iacc < ilimit:
+                iacc = iacc + A[j]
+                total = total + A[j]
+                j = j + 1
+            oacc = oacc + iacc
+            i = i + 1
+        out[0] = total
 
     mod = _to_rtl(nested_while)
     res = mod.schedule()
     assert len(res.cyclic()) >= 1  # the inner while pipelines
     assert res.func("nested_while").latency is None  # data-dependent trips
-    # Both whiles close: the inner -> flushing pipeline, the outer -> sequential
-    # while dcp.pipeline wrapping it. No raw scf.while; two dcp.condition ends.
+    # Both whiles close to dcp: the inner -> flushing pipeline, the outer ->
+    # sequential container wrapping it. No raw scf.while; two dcp.condition ends.
     assert "scf.while" not in mod.dcp
     assert mod.dcp.count("dcp.condition") == 2
 
@@ -103,68 +218,109 @@ def test_while_with_nested_while():
 def test_while_flushing_pipeline_cosim():
     # The flushing pipeline emitted end-to-end: `running` gated by the exit
     # condition, each loop-carried iter-arg frozen into a survivor register at
-    # exit, and the sibling store reading the frozen count. `x > 1` runs x-1
-    # steps, so c = max(0, n0-1) -- including the zero-iteration case (n0<=1).
+    # exit, and the sibling store reading the frozen count. The exit test
+    # `acc < limit` is combinational over the carried `acc`, so the loop flushes
+    # while its trip -- driven by the data in A -- stays unknown. `c` counts the
+    # committed iterations, including the zero-iteration case (limit <= 0).
+    N = 32
+
     @kernel
-    def wr(n0: i32, out: i32[1]):
-        x: i32 = n0
+    def wr(A: i32[N], limit: i32, out: i32[1]):
+        acc: i32 = 0
         c: i32 = 0
-        while x > 1:
-            x = x - 1
+        while acc < limit:
+            acc = acc + A[c]
             c = c + 1
         out[0] = c
 
     mod = _to_rtl(wr)
-    for n0 in (1, 2, 3, 7, 20):
+    # The schedule this rests on: a data-dependent while stays conditional, and
+    # its trip -- so its latency -- is left unknown rather than faked.
+    loop = mod.schedule().cyclic()[0]
+    assert loop.conditional is True
+    assert loop.latency is None
+    assert "dcp.condition" in mod.dcp  # reified while terminator
+
+    A = (np.arange(N, dtype=np.int32) % 7 + 1).astype(np.int32)
+
+    def gold(limit):  # smallest c with sum(A[:c]) >= limit
+        acc = c = 0
+        while acc < limit:
+            acc += int(A[c])
+            c += 1
+        return c
+
+    for limit in (0, 1, 10, 50):  # limit == 0 exits on entry
         out = np.zeros(1, np.int32)
-        r = mod.cosim(np.int32(n0), out)
-        assert out[0] == max(0, n0 - 1)
-        assert r.cycles > 0
+        mod.cosim(A, np.int32(limit), out)
+        assert out[0] == gold(limit)
 
 
 def test_while_two_carried_accumulate_cosim():
-    # A while carrying TWO recurrences whose result depends on both: acc folds
-    # x while x counts down, so the frozen `acc` survivor is the triangular sum.
-    @kernel
-    def wacc(n0: i32, out: i32[1]):
-        x: i32 = n0
-        acc: i32 = 0
-        while x > 0:
-            acc = acc + x
-            x = x - 1
-        out[0] = acc
+    # A while carrying TWO recurrences whose result depends on both: `acc` drives
+    # the combinational exit test while `s` folds the running `acc`, so the
+    # frozen `s` survivor depends on the whole acc trajectory and the trip.
+    N = 32
 
+    @kernel
+    def wacc(A: i32[N], limit: i32, out: i32[1]):
+        acc: i32 = 0
+        s: i32 = 0
+        i: i32 = 0
+        while acc < limit:
+            acc = acc + A[i]
+            s = s + acc
+            i = i + 1
+        out[0] = s
+
+    A = (np.arange(N, dtype=np.int32) % 7 + 1).astype(np.int32)
     mod = _to_rtl(wacc)
-    for n0 in (0, 1, 5, 9):
+
+    def gold(limit):
+        acc = s = i = 0
+        while acc < limit:
+            acc += int(A[i])
+            s += acc
+            i += 1
+        return s
+
+    for limit in (0, 1, 10, 50):
         out = np.zeros(1, np.int32)
-        mod.cosim(np.int32(n0), out)
-        assert out[0] == n0 * (n0 + 1) // 2
+        mod.cosim(A, np.int32(limit), out)
+        assert out[0] == gold(limit)
 
 
 def test_while_multistage_flush_cosim():
-    # A store-less while whose *body* spans two stages (the `A[x-1]` load
-    # pushes `next_acc` to stage 1) but whose condition `x > 0` is
-    # combinational. The flushing pipeline drains the deeper survivor: `acc`
-    # advances one cycle after each issue, and the exit is delayed to match, so
-    # the frozen `acc` is the correct sum. Distinct from a memory-*dependent*
-    # condition (still deferred).
+    # A store-less while whose *body* spans two stages (the `A[i]` load pushes
+    # `next_acc` to stage 1) but whose condition `acc < limit` is combinational
+    # over the carried `acc`. The flushing pipeline drains the deeper survivor:
+    # `acc` advances one cycle after each issue, and the exit is delayed to
+    # match, so the frozen `acc` is the correct sum.
     N = 64
 
     @kernel
-    def wsum(n0: i32, A: i32[N], out: i32[1]):
-        x: i32 = n0
+    def wsum(A: i32[N], limit: i32, out: i32[1]):
         acc: i32 = 0
-        while x > 0:
-            acc = acc + A[x - 1]
-            x = x - 1
+        i: i32 = 0
+        while acc < limit:
+            acc = acc + A[i]
+            i = i + 1
         out[0] = acc
 
-    A = (np.arange(N, dtype=np.int32) * 3 + 1) & 0xFF
+    A = (np.arange(N, dtype=np.int32) % 9 + 1).astype(np.int32)
     mod = _to_rtl(wsum)
-    for n0 in (0, 1, 4, 10, 25):
+
+    def gold(limit):  # acc once it first reaches limit
+        acc = i = 0
+        while acc < limit:
+            acc += int(A[i])
+            i += 1
+        return acc
+
+    for limit in (0, 1, 20, 100):
         out = np.zeros(1, np.int32)
-        mod.cosim(np.int32(n0), A, out)
-        assert out[0] == int(A[:n0].sum())
+        mod.cosim(A, np.int32(limit), out)
+        assert out[0] == gold(limit)
 
 
 def test_while_in_loop_store_cosim():
@@ -178,36 +334,53 @@ def test_while_in_loop_store_cosim():
     N = 32
 
     @kernel
-    def wstore(A: i32[N], B: i32[N], n0: i32):  # write-once per iteration
-        x: i32 = n0
-        while x > 0:
-            B[x - 1] = A[x - 1] * 2
-            x = x - 1
+    def wstore(A: i32[N], limit: i32, B: i32[N]):  # write-once per iteration
+        acc: i32 = 0
+        i: i32 = 0
+        while acc < limit:
+            B[i] = A[i] * 2
+            acc = acc + A[i]
+            i = i + 1
 
     @kernel
-    def wscan(A: i32[N], B: i32[N], n0: i32):  # store the running prefix sum
-        x: i32 = n0
+    def wscan(A: i32[N], limit: i32, B: i32[N]):  # store the running prefix sum
         acc: i32 = 0
-        while x > 0:
-            acc = acc + A[x - 1]
-            B[x - 1] = acc
-            x = x - 1
+        i: i32 = 0
+        while acc < limit:
+            acc = acc + A[i]
+            B[i] = acc
+            i = i + 1
 
     ma, mb = _to_rtl(wstore), _to_rtl(wscan)
     assert ma.schedule().cyclic()[0].conditional and "dcp.condition" in ma.dcp
-    A = (np.arange(N, dtype=np.int32) * 3 + 1) & 0xFF
-    for n0 in (0, 1, 7, N):
+    A = (np.arange(N, dtype=np.int32) % 7 + 1).astype(np.int32)
+
+    def gold_store(limit):
         B = np.zeros(N, np.int32)
-        ma.cosim(A, B, np.int32(n0))
-        gold = np.zeros(N, np.int32)
-        gold[:n0] = A[:n0] * 2
-        assert np.array_equal(B, gold)
+        acc = i = 0
+        while acc < limit:
+            B[i] = int(A[i]) * 2
+            acc += int(A[i])
+            i += 1
+        return B
+
+    def gold_scan(limit):
+        B = np.zeros(N, np.int32)
+        acc = i = 0
+        while acc < limit:
+            acc += int(A[i])
+            B[i] = acc
+            i += 1
+        return B
+
+    for limit in (0, 1, 20, 50):  # limit == 0 writes nothing
+        B = np.zeros(N, np.int32)
+        ma.cosim(A, np.int32(limit), B)
+        assert np.array_equal(B, gold_store(limit))
 
         B = np.zeros(N, np.int32)
-        mb.cosim(A, B, np.int32(n0))
-        gold = np.zeros(N, np.int32)
-        gold[:n0] = np.cumsum(A[:n0][::-1])[::-1]  # acc counts x down from n0
-        assert np.array_equal(B, gold)
+        mb.cosim(A, np.int32(limit), B)
+        assert np.array_equal(B, gold_scan(limit))
 
 
 # --- condition shapes: memory, IP, nested --------------------------------------
@@ -265,9 +438,15 @@ def test_while_mem_condition_shared_array_cosim():
             i = i + 1
         out[0] = s
 
+    rtl = _to_rtl(wmem)
+    # The non-contention claim, stated: A carries a read port group per access,
+    # so the condition never waits on the body's port.
+    rd = [p["base"] for acc in rtl.interfaces["wmem"]["reads"] for p in acc]
+    assert rd == ["A_rd0", "A_rd1"]
+
     A = np.array([5, 3, 8, 2, 0] + [9] * 11, dtype=np.int32)  # sentinel 0 at idx 4
     out = np.zeros(1, np.int32)
-    _to_rtl(wmem).cosim(A, out)
+    rtl.cosim(A, out)
     assert out[0] == 5 + 3 + 8 + 2  # sum until A[4] == 0 stops the loop
 
 
@@ -324,31 +503,46 @@ def test_while_ip_condition_cosim():
 
 
 def test_nested_while_cosim():
-    # A sequential-wrapper while (outer `s`) around a flushing-pipeline while
-    # (inner `t`), carrying a cross-region accumulator `total`. The outer while
-    # is a conditional container: its iter-args are survivor registers advanced
-    # by the children's results, the raw `s > 0` condition is evaluated over
-    # those registers, and the children re-run each outer iteration. total ends
-    # as sum_{s=1..N} sum_{t=1..s} A[t-1].
-    N = 8
+    # A sequential-wrapper while (outer `oacc`) around a flushing-pipeline while
+    # (inner `iacc`), carrying a cross-region accumulator `total`. The outer is a
+    # conditional container: its iter-args are survivor registers, the
+    # combinational `oacc < olimit` test is evaluated over them, and the inner
+    # re-runs each outer iteration (which advances `oacc` by the inner's result).
+    N = 16
 
     @kernel
-    def nested(A: i32[N], out: i32[1]):
+    def nested(A: i32[N], olimit: i32, ilimit: i32, out: i32[1]):
         total: i32 = 0
-        s: i32 = N
-        while s > 0:
-            t: i32 = s
-            while t > 0:
-                total += A[t - 1]
-                t -= 1
-            s -= 1
+        oacc: i32 = 0
+        i: i32 = 0
+        while oacc < olimit:
+            iacc: i32 = 0
+            j: i32 = 0
+            while iacc < ilimit:
+                iacc = iacc + A[j]
+                total = total + A[j]
+                j = j + 1
+            oacc = oacc + iacc
+            i = i + 1
         out[0] = total
 
-    A = (np.arange(N, dtype=np.int32) * 3 + 1) & 0xFF
-    expected = sum(int(A[:s].sum()) for s in range(1, N + 1))
-    out = np.zeros(1, np.int32)
-    _to_rtl(nested).cosim(A, out)
-    assert out[0] == expected
+    A = (np.arange(N, dtype=np.int32) % 7 + 1).astype(np.int32)
+
+    def gold(olimit, ilimit):
+        total = oacc = 0
+        while oacc < olimit:
+            iacc = j = 0
+            while iacc < ilimit:
+                iacc += int(A[j])
+                total += int(A[j])
+                j += 1
+            oacc += iacc
+        return total
+
+    for olimit, ilimit in [(1, 1), (20, 10), (50, 15)]:
+        out = np.zeros(1, np.int32)
+        _to_rtl(nested).cosim(A, np.int32(olimit), np.int32(ilimit), out)
+        assert out[0] == gold(olimit, ilimit)
 
 
 # --- call-in-while control drop ------------------------------------------------
@@ -359,7 +553,8 @@ def test_call_in_a_while_body():
     # that schedule issues an iteration per cycle, which a child instance fired
     # and awaited per iteration can never follow. It drops to the sequential
     # CHECK/RUN controller, the same route a nested loop or a non-combinational
-    # condition takes.
+    # condition takes. The memory-sentinel condition also keeps it uncounted, so
+    # the doomed iteration (where A[i] == 0) is never fired and never stores.
     @kernel
     def wc_child(A: i32[16], B: i32[16], i: index):
         B[i] = A[i] * 2
@@ -367,41 +562,25 @@ def test_call_in_a_while_body():
     @kernel
     def wc_top(A: i32[16], B: i32[16]):
         i: i32 = 0
-        while i < 16:
+        while A[i] != 0:
             wc_child(A, B, i)
             i += 1
 
-    A16 = (np.arange(16, dtype=np.int32) * 3 + 1) & 0x3F
+    rtl = _to_rtl(wc_top)
+    # The drop, stated: a CHECK/RUN while emits an `r<N>_check` and its region
+    # carries no static II. A flushing pipeline has neither.
+    assert Mod(rtl.mlir, "wc_top").regions_with("check")
+    assert rtl.schedule().funcs[0].regions[0].ii is None
+
+    A16 = np.array([3, 5, 7, 2, 4, 6, 0] + [9] * 9, dtype=np.int32)  # sentinel at 6
     B = np.zeros(16, np.int32)
-    _to_rtl(wc_top).cosim(A16, B)
-    assert np.array_equal(B, A16 * 2)
+    rtl.cosim(A16, B)
+    gold = np.zeros(16, np.int32)
+    gold[:6] = A16[:6] * 2  # only the pre-sentinel iterations store
+    assert np.array_equal(B, gold)
 
 
 # --- checked-iteration skeleton reuse -------------------------------------------
-
-
-def _one_region(m):
-    """The single done-driven region of `m` (the one that emits an `r<N>_fire`)."""
-    ids = m.regions_with("fire")
-    assert len(ids) == 1, f"expected one done-driven region, got {ids}"
-    return ids[0]
-
-
-def _hold_done(m, region):
-    """The set-pulse of region `region`'s done latch.
-
-    `holdDone` is `done = compreg(mux(start, false, mux(set, true, done)))`:
-    cleared by the region start so a retriggered region re-edges, set by the
-    completion pulse. Returns `set`, having checked the shape.
-    """
-    reg, inp = m.reg_named(f"r{region}_done")
-    clear = m.mux(inp)
-    assert clear and clear[1].startswith("false"), f"r{region}_done not cleared: {inp}"
-    hold = m.mux(clear[2])
-    assert (
-        hold and hold[1].startswith("true") and hold[2] == reg
-    ), f"r{region}_done is not a hold latch: {clear[2]}"
-    return hold[0]
 
 
 def test_checked_while_reuses_the_counted_skeleton():
@@ -409,17 +588,25 @@ def test_checked_while_reuses_the_counted_skeleton():
     # inner while) keeps the same fire / done-latch pair a counted cell uses,
     # replacing only the counter-driven test with a delayed condition pulse:
     # no counter, no separate empty term, since the first CHECK already answers
-    # it. Cosims a nested double-while summation.
+    # it. The outer test `oacc < olimit` is combinational over a carried
+    # accumulator (data-advanced, so uncounted), which is what settles the CHECK
+    # in one cycle. Cosims a nested double-while summation.
+    N = 16
+
     @kernel
-    def nested(A: i32[8], out: i32[1]):
+    def nested(A: i32[N], olimit: i32, ilimit: i32, out: i32[1]):
         total: i32 = 0
-        s: i32 = 8
-        while s > 0:  # conditional container
-            t: i32 = s
-            while t > 0:  # flushing-pipeline leaf
-                total += A[t - 1]
-                t -= 1
-            s -= 1
+        oacc: i32 = 0
+        i: i32 = 0
+        while oacc < olimit:  # conditional container
+            iacc: i32 = 0
+            j: i32 = 0
+            while iacc < ilimit:  # flushing-pipeline leaf
+                iacc = iacc + A[j]
+                total = total + A[j]
+                j = j + 1
+            oacc = oacc + iacc
+            i = i + 1
         out[0] = total
 
     rtl = _to_rtl(nested)
@@ -439,7 +626,19 @@ def test_checked_while_reuses_the_counted_skeleton():
     # reaches the launch decision.
     assert not [v for v in m.cone(fire) if m.defs.get(v, "").startswith("comb.add")]
 
-    A = (np.arange(8, dtype=np.int32) * 3 + 1) & 0xFF
+    A = (np.arange(N, dtype=np.int32) % 7 + 1).astype(np.int32)
+
+    def gold(olimit, ilimit):
+        total = oacc = 0
+        while oacc < olimit:
+            iacc = j = 0
+            while iacc < ilimit:
+                iacc += int(A[j])
+                total += int(A[j])
+                j += 1
+            oacc += iacc
+        return total
+
     out = np.zeros(1, np.int32)
-    rtl.cosim(A, out)
-    assert out[0] == sum(int(A[:s].sum()) for s in range(1, 9))
+    rtl.cosim(A, np.int32(20), np.int32(10), out)
+    assert out[0] == gold(20, 10)

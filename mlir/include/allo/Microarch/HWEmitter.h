@@ -124,6 +124,14 @@ struct RegionControl {
                    // enable`): the stall shell hazards a stage-0 stream access
                    // on this (not the gated issue) to stay combinationally
                    // acyclic. Equals `issue` when there is no stall.
+  Value running;   // the region is executing: the level the counter reloads its
+                   // lower bound while low. Null for a done-driven controller,
+                   // whose counter reloads on `start` instead.
+  /// One register per `RegionBlock::addrStrides` entry, holding that multiple
+  /// of `counter`. Emitted beside the counter and updated by the same
+  /// expression, so the two cannot fall out of step: whatever advance and
+  /// reload the counter takes, these take.
+  llvm::SmallVector<Value> scaledCounters;
 };
 
 //===----------------------------------------------------------------------===//
@@ -177,6 +185,16 @@ struct ControlEmitter {
   RegionControl emitPipelineControl(const uarch::RegionBlock &rb,
                                     const Terminator &term, Value start,
                                     const StallShell &sh) const;
+  /// The scaled counters of \p rb: one register per `addrStrides` entry,
+  /// holding that multiple of the region's counter. \p update is the counter's
+  /// own next-value expression with `lb` and `step` scaled, supplied by the
+  /// caller because the two controller families disagree about it. \p
+  /// bypassStart mirrors a done-driven counter's start-cycle bypass (null for
+  /// none).
+  llvm::SmallVector<Value> emitScaledCounters(
+      const uarch::RegionBlock &rb, const Terminator &term, Value bypassStart,
+      llvm::function_ref<Value(Value cur, Value stepped, Value init)> update)
+      const;
   /// The one pipelined control skeleton for the free-running (II==1), modulo
   /// (II>1), and while (flushing) regimes: they share a `running` flag + an
   /// iteration counter and differ only in \p term (a counter reaching a bound
@@ -195,7 +213,13 @@ struct ControlEmitter {
   RegionControl emitPipelined(unsigned region, int64_t ii,
                               const Terminator &term, Value start,
                               const StallShell &sh) const;
-  RegionControl emitAcyclic(unsigned region, Value start, bool topLevel) const;
+  /// The straight-line control skeleton: one pass, no counter. \p sh is the
+  /// same G-half contract `emitPipelined` honors: the single pass is DEFERRED
+  /// while `issueEnable` is low rather than dropped, which is what lets a
+  /// stage-0 stream access wait for its handshake. A rigid shell issues
+  /// unconditionally and builds no state at all.
+  RegionControl emitAcyclic(unsigned region, Value start, bool topLevel,
+                            const StallShell &sh) const;
 
   /// The counted done-driven controller: `Container` and `CallNode` x
   /// `CountedStatic`. Runs one body pass per iteration of \p term, launching
@@ -289,6 +313,24 @@ struct DatapathEmitter {
   };
   SmallVector<StreamDrive> streamDrives; // by StreamId (sized on first use)
 
+  /// One store to a scattered argument, as its element ports see it. The SAME
+  /// N ports are shared by every write to that argument, where an addressed
+  /// argument gets a port group per access, so they cannot be driven where the
+  /// store is emitted: a second store in the same region, or in any other
+  /// region, would drive them again. Every write records its terms here and
+  /// `finalizeScatteredPorts` drives each element once, after all regions have
+  /// emitted, exactly as `StreamDrive` does for a channel's one handshake.
+  ///
+  /// The commit pulse is region-scoped (it is timed against that region's stall
+  /// shell and issue), which is why the pulse is BUILT at the store and only
+  /// COMBINED here.
+  struct ScatterWrite {
+    Value we;    // this store's commit pulse
+    Value index; // the element it targets, at the memory's address width
+    Value data;  // the datum it presents
+  };
+  DenseMap<unsigned, SmallVector<ScatterWrite, 1>> scatterWrites; // by MemId
+
   /// A kernel-local channel's body wires: what a boundary channel reads off its
   /// module ports, an internal one reads off its own `seq.fifo`. Declared as
   /// backedges before any region emits (`declareInternalChannels`) and resolved
@@ -349,25 +391,25 @@ struct DatapathEmitter {
   /// The resolved (already stage-delayed) index sources an access's affine map
   /// is evaluated over, dims then symbols.
   llvm::SmallVector<Value> addrSources(const uarch::MemUnit::Access &acc);
-  /// The element subscripts of a memory access: its affine map evaluated over
-  /// the index sources, delinearized when `dcp-flatten-memref` has collapsed
-  /// the map to a single linear result. For the BANKED path only, which is the
-  /// one that needs element space; a flat address goes through `computeAddr`,
-  /// which never delinearizes.
-  llvm::SmallVector<Value> elementCoords(const uarch::MemUnit &m,
-                                         const uarch::MemUnit::Access &acc);
-  /// The linear element address of a memory access: its affine map composed
-  /// with the memref's row-major strides symbolically, then evaluated once.
-  Value computeAddr(const uarch::MemUnit &m, const uarch::MemUnit::Access &acc);
-  /// The bank + in-bank offset of a banked access, derived in element space
-  /// from the memref's `BankLayout`: each partitioned axis contributes its bank
-  /// digit in mixed radix, and the remaining local coordinates linearize over
-  /// the per-bank shape. The runtime dual of the static split
-  /// (`dcp-resolve-banking`), so both route an element to the same bank.
+  /// One cone \p r of this access's address as hardware at \p width: a
+  /// constant, one register per strength-reduced term, and whatever did not
+  /// reduce, evaluated.
+  Value buildAddr(const uarch::MemUnit::Access &acc,
+                  const uarch::MemUnit::Access::Reduced &r, unsigned width);
+  /// The address hardware of an access: the element index within the bank it
+  /// reaches, plus the bank digit when that is decided at runtime.
+  /// `addressExprsOf` derives both symbolically from the memref's `BankLayout`
+  /// and this evaluates them, so it is the runtime dual of the static split
+  /// (`dcp-resolve-banking`) and both route an element to the same bank. Also
+  /// covers an unbanked memref, whose one-bank offset is the flat index.
   BankSplit bankAddress(const uarch::MemUnit &m,
                         const uarch::MemUnit::Access &acc);
   /// Narrow a linear address to a memory's clog2(depth)-bit index (hlmem).
   Value memAddr(const uarch::MemUnit &m, Value addr);
+  /// Which element of a scattered argument an access names, at the datapath
+  /// width (it is compared against literal element numbers, not used to index).
+  Value scatterIndex(const uarch::MemUnit &m,
+                     const uarch::MemUnit::Access &acc);
 
   /// Bind external read-data input ports into readData (once, before regions).
   void bindReadPorts();
@@ -384,6 +426,10 @@ struct DatapathEmitter {
     slot.issue = rc.issue;
     if (rc.wantIssue)
       slot.wantIssue = rc.wantIssue;
+    if (rc.running)
+      slot.running = rc.running;
+    if (!rc.scaledCounters.empty())
+      slot.scaledCounters = rc.scaledCounters;
   }
   /// Record a region's latched result \p port (from the orchestrator's survivor
   /// capture) so a sibling reading Source::Survivor{region, port} resolves to
@@ -405,6 +451,12 @@ struct DatapathEmitter {
   /// emitted later; emitUnits fills each backedge in when it wires the unit.
   void declareUnits(const uarch::RegionBlock &rb);
   void emitInternalReads(const uarch::RegionBlock &rb);
+  /// The skewed halves of the two above: one port per bank per LANE instead of
+  /// per bank per access, which is the bandwidth a skewed layout exists to buy
+  /// and the bandwidth the port model billed once the slots were assigned.
+  void emitSkewedInternalReads(const uarch::RegionBlock &rb);
+  void emitSkewedInternalWrites(const uarch::RegionBlock &rb, Value commit,
+                                DatapathFeedback &fb);
   /// Read crossbar for each data-dependent external (argument) read in region
   /// \p rb: drive every bank interface's address with the offset, read each
   /// bank's data port, and mux by the runtime bank (bound into readData before
@@ -474,7 +526,8 @@ struct DatapathEmitter {
   /// ONE place a start policy is chosen on the instance substrate;
   /// `EmitContext::startFor` is the same question on the region substrate.
   Value startForCall(const uarch::CallUnit &cu, Value issue,
-                     llvm::ArrayRef<Value> predDones, bool concurrent);
+                     llvm::ArrayRef<Value> predDones, bool concurrent,
+                     const StallShell &sh);
   /// The queue(s) behind a channel whose ends are child ports: one `seq.fifo`
   /// per consumer end (the fan-out tee), each optionally fronted by the
   /// init-prepend shim of a seeded channel, and a pass-through where one end is
@@ -513,6 +566,11 @@ struct DatapathEmitter {
   /// channel's `seq.fifo`, from the accumulated `streamDrives` once all regions
   /// have emitted. Call exactly once, before `hw.output`.
   void finalizeStreamPorts();
+  /// Drive each scattered argument's per-element data + write-enable outputs
+  /// from the accumulated `scatterWrites`, once all regions have emitted. Call
+  /// exactly once, before `hw.output`; a read-only scattered argument has no
+  /// output port and drives nothing.
+  void finalizeScatteredPorts();
   /// Build one kernel-local channel's `seq.fifo` from its accumulated drives
   /// (\p data is the puts' muxed token) and resolve its `streamWires`.
   void emitInternalChannel(const uarch::StreamChannel &s, Value data);

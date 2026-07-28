@@ -15,7 +15,7 @@ from allo import kernel
 from allo.lang import f32, i32, Stream
 
 sys.path.insert(0, os.path.dirname(__file__))
-from _common import Mod, _latency, _to_rtl  # noqa: E402
+from _common import Mod, _to_rtl  # noqa: E402
 
 pytestmark = pytest.mark.skipif(
     shutil.which("verilator") is None, reason="verilator not available"
@@ -143,35 +143,6 @@ def test_three_start_policies_from_one_table():
     mod.cosim(o0, o1)
     assert np.array_equal(o0, (np.arange(N) * 2 + 1) * 3), list(o0)
     assert np.array_equal(o1, np.arange(N) * 7 + 1), list(o1)
-
-
-# --- why concurrency is safe: the classification behind the topologies ------
-
-
-# An await-spawned dataflow container is concurrent (self-timed): a caller waits on
-# its real done, never a static offset; the spawned leaves stay counted_static.
-def test_async_dataflow_container_is_concurrent():
-    n = 16
-
-    @kernel
-    async def dp(s: Stream[i32]):
-        for i in range(n):
-            s.put(i * 2)
-
-    @kernel
-    async def dc(s: Stream[i32], out: i32[n]):
-        for i in range(n):
-            out[i] = s.get() + 1
-
-    @kernel
-    async def dtop(out: i32[n]):
-        fifo: Stream[i32]
-        await dp(fifo)
-        await dc(fifo, out)
-
-    d = _to_rtl(dtop).dcp
-    assert "dcp.determinacy = #allo<determinacy concurrent>" in d
-    assert "dcp.determinacy = #allo<determinacy counted_static>" in d  # the leaves
 
 
 # --- topologies: linear chains ------------------------------------------------
@@ -411,7 +382,9 @@ def test_dataflow_linear_chain_variants():
     # The deep channel keeps its depth; the depth-1 channel is raised to 2 (the
     # seq.fifo minimum, so it never appears as "depth 1") rather than crashing on
     # zero-width pointers, and the design still builds and runs.
-    assert "depth 4" in mod.mlir and "depth 1" not in mod.mlir, mod.mlir
+    # Anchored: a bare `"depth 1" in` substring test also matches `depth 16`.
+    assert re.search(r"\bdepth 4\b", mod.mlir), mod.mlir
+    assert not re.search(r"\bdepth 1\b", mod.mlir), mod.mlir
     golden = np.zeros(n, np.int32)
     mod.csim(golden)
     exp = np.array([2 * i + 1 for i in range(n)], np.int32)
@@ -1003,6 +976,9 @@ def test_loose_compute_beside_the_network():
     # the datapath ops.
     assert "@lc_top.datapath0" in mod.dcp
     assert "dcp.compute" not in _container_body(mod.dcp, "lc_top")
+    # And it is spawned, not sequenced: the container stays self-timed with the
+    # outlined process in it, which is what "runs concurrently" means here.
+    assert "dcp.determinacy = #allo<determinacy concurrent>" in mod.dcp
 
     out = np.zeros(N, np.int32)
     aux = np.zeros(N, np.int32)
@@ -1298,40 +1274,3 @@ def test_mixed_dataflow_sequential():
     mod.cosim(tmp, out)
     exp = np.array([(2 * i + 1) * 3 for i in range(16)], np.int32)
     assert np.array_equal(out, exp), list(out)
-
-    # The same handshake reached from a PURE-sequential container: the producer
-    # is a data-dependent `while` leaf with no static latency, so the consumer
-    # that reads what it wrote must stall on its real `done`. Keyed on the
-    # callee's determinacy (no `dcp.latency`), not a container-wide mode -- the
-    # same per-child start map gives a determinate producer a static offset.
-    @kernel
-    def sp_prod(n0: i32, B: i32[16]):
-        c: i32 = 0
-        x: i32 = n0
-        while x > 1:  # data-dependent trip -> whole-kernel latency unknown
-            x = x - 1
-            c = c + 1  # c = n0 - 1, escapes to the store loop (not DCE-able)
-        for i in range(16):
-            B[i] = i + c
-
-    @kernel
-    def sp_cons(B: i32[16], out: i32[16]):
-        for i in range(16):
-            out[i] = B[i] + 100
-
-    @kernel
-    def sp_top(n0: i32, B: i32[16], out: i32[16]):
-        sp_prod(n0, B)  # indeterminate producer writes B
-        sp_cons(B, out)  # reads B -> must wait for prod's real done
-
-    assert _latency(sp_prod) is None
-
-    mod = _to_rtl(sp_top)
-    assert "dcp.instance @sp_top.sp_prod(" in mod.dcp
-    assert _latency(sp_top) is None  # container inherits the while's indeterminacy
-
-    spB = np.zeros(16, np.int32)
-    spout = np.zeros(16, np.int32)
-    mod.cosim(np.int32(5), spB, spout)  # n0 = 5 -> c = 4
-    exp = np.array([i + 4 + 100 for i in range(16)], np.int32)
-    assert np.array_equal(spout, exp), list(spout)

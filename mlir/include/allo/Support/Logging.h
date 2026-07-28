@@ -42,7 +42,7 @@ void emit(Level level, Stage stage, llvm::StringRef where,
 bool enabled(Level level);
 // Concise source anchor for an op / location (symbolic name + file:line:col).
 std::string describe(mlir::Operation *op);
-std::string describe(const mlir::Location &loc);
+std::string describe(const mlir::Location &loc, bool withFile = true);
 } // namespace detail
 
 // RAII stream proxy: accumulate a message with `<<`, emit it on destruction.

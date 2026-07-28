@@ -29,6 +29,14 @@ FMUL = _LAT[("mul", 32)]  # floating-point multiply latency
 FDIV = _LAT[("div", 32)]  # floating-point divide latency
 IMUL = 0  # integer multiply is combinational (latency 0)
 MEM = builtin_device.memory[MemoryKind.LUTRAM].read_latency  # default read/write
+MEM_URAM = builtin_device.memory[MemoryKind.URAM].read_latency
+
+# Combinational delay in ns by op kind, the table the chaining scheduler cuts
+# against, and the default clock it cuts to. A test that picks a clock to make a
+# chain fit or not fit derives the period from these rather than restating the
+# device's numbers.
+COMB = builtin_device.comb
+PERIOD_NS = 1000.0 / builtin_device.default_freq_mhz
 
 # A memory-carried accumulate (`M[x] += ...`) closes a distance-1 recurrence
 # read -> add -> write, so its II is the sum; a scalar-carried accumulate keeps
@@ -174,3 +182,27 @@ class Mod:
         hits = [(r, i) for lb, r, i in self.regs if lb == label]
         assert len(hits) == 1, f"expected one {label!r} register, got {hits}"
         return hits[0]
+
+
+def _one_region(m):
+    """The single done-driven region of `m` (the one that emits an `r<N>_fire`)."""
+    ids = m.regions_with("fire")
+    assert len(ids) == 1, f"expected one done-driven region, got {ids}"
+    return ids[0]
+
+
+def _hold_done(m, region):
+    """The set-pulse of region `region`'s done latch.
+
+    `holdDone` is `done = compreg(mux(start, false, mux(set, true, done)))`:
+    cleared by the region start so a retriggered region re-edges, set by the
+    completion pulse. Returns `set`, having checked the shape.
+    """
+    reg, inp = m.reg_named(f"r{region}_done")
+    clear = m.mux(inp)
+    assert clear and clear[1].startswith("false"), f"r{region}_done not cleared: {inp}"
+    hold = m.mux(clear[2])
+    assert (
+        hold and hold[1].startswith("true") and hold[2] == reg
+    ), f"r{region}_done is not a hold latch: {clear[2]}"
+    return hold[0]

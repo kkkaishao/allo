@@ -502,6 +502,9 @@ void HWEmitter::emit() {
   // shared by every access to it, so it can only be driven once every region
   // has contributed.
   datapath.finalizeStreamPorts();
+  // Same reason, for the same kind of shared port: a scattered argument's N
+  // element outputs are shared by every store to it.
+  datapath.finalizeScatteredPorts();
   // Scalar results: the returning region's survivor register, stable once
   // its region (and thus `done`) has risen; the cosim samples it at `done`.
   for (const uarch::Result &r : dp.results)

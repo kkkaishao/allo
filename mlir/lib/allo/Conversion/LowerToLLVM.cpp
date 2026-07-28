@@ -4,6 +4,7 @@
  */
 
 #include "allo/Conversion/Passes.h"
+#include "allo/IR/AlloOps.h"
 #include "allo/Transforms/Passes.h"
 #include "mlir/Conversion/Passes.h"
 #include "mlir/Dialect/Affine/Transforms/Passes.h"
@@ -20,7 +21,27 @@
 using namespace mlir;
 using namespace mlir::allo;
 
+namespace {
+struct StripSchedulingHintsPass
+    : public PassWrapper<StripSchedulingHintsPass, OperationPass<ModuleOp>> {
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(StripSchedulingHintsPass)
+  StringRef getArgument() const final { return "allo-strip-scheduling-hints"; }
+
+  void runOnOperation() override {
+    // Collect first: erasing mid-walk invalidates the iteration.
+    SmallVector<Operation *> hints;
+    getOperation()->walk([&](Operation *op) {
+      if (isa<AssumeNoDepOp, AssumeSSAOp>(op))
+        hints.push_back(op);
+    });
+    for (Operation *hint : hints)
+      hint->erase();
+  }
+};
+} // namespace
+
 void allo::populateLowerToLLVMPipeline(OpPassManager &pm, bool enableTensor) {
+  pm.addPass(std::make_unique<StripSchedulingHintsPass>());
   pm.addPass(createCanonicalizerPass());
   pm.addPass(createCSEPass());
   pm.addPass(createGridMappingPass());
