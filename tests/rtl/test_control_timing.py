@@ -389,7 +389,7 @@ def test_normalizing_a_strided_loop_lets_its_nest_coalesce():
     for k in (inner_stride, outer_stride):
         mod = _to_rtl(k)
         assert (
-            mod.dcp.count("allo.dcp.pipeline") == 1
+            len(mod.schedule().func(k.__name__).cyclic(wrappers=True)) == 1
         ), f"{k.__name__}: the strided band did not coalesce into one region"
         assert _iis(mod.schedule().func(k.__name__).regions) == [1]
         out = np.zeros((8, 8), np.int32)

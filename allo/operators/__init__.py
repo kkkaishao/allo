@@ -7,13 +7,12 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any, Literal, overload
 
 from .spmw import *
+
+# `min`, `max` and `pow` are the DSL's own names (see allo/operators/arith.py).
+# pylint: disable-next=redefined-builtin
 from .arith import *
 
 from .._mlir.dialects import allo as _allo_ops
-
-# `assume.nodep` enum encodings (mirror allo::AssumeDepTypeEnum / AssumeDepDirEnum).
-_DEP_TYPE_VALUES = {"inter": 0, "intra": 1}
-_DEP_DIR_VALUES = {"raw": 0, "war": 1, "waw": 2}
 from ..lang.core import (
     AlloValue as _AlloValue,
     ShapedType as _ShapedType,
@@ -22,6 +21,10 @@ from ..lang.core import (
 from ..lang.operator import operator as _operator
 from ..compiler.builder import AlloOpBuilder as _AlloOpBuilder
 from .utils import operator_body_unreachable as _unreachable
+
+# `assume.nodep` enum encodings (mirror allo::AssumeDepTypeEnum / AssumeDepDirEnum).
+_DEP_TYPE_VALUES = {"inter": 0, "intra": 1}
+_DEP_DIR_VALUES = {"raw": 0, "war": 1, "waw": 2}
 
 if TYPE_CHECKING:
     # Overloads exist only for editor/LSP hinting; the runtime `assume` below is
@@ -37,6 +40,8 @@ if TYPE_CHECKING:
         iv: int,
         /,
         *,
+        # `type=` is the documented keyword of the `assume.nodep` hint.
+        # pylint: disable-next=redefined-builtin
         type: Literal["inter", "intra"] = "inter",
         direction: Literal["raw", "war", "waw"] | None = None,
         distance: int | None = None,

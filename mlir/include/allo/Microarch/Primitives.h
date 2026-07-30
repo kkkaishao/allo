@@ -3,23 +3,6 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-//===----------------------------------------------------------------------===//
-// The emission substrate: everything that builds hardware but knows nothing
-// about regions, controllers, or the datapath's structure.
-//
-//   * free helpers: the type/width rule, storage declaration, a compute unit's
-//     comb lowering, affine index evaluation, and the module-boundary ABI
-//     (declare ports / instantiate);
-//   * banking: the read crossbar and write demux over a partitioned array's N
-//     banks;
-//   * ShiftChain: the taps of one shift register, index == cycles;
-//   * EmitContext: clock/reset/constants plus the low-level comb and
-//     sequential primitives (reg, mux, delay, pulse, ...).
-//
-// Nothing here reads a `RegionBlock` or a controller, which is why it is its
-// own header: it is the layer under both F and G.
-//===----------------------------------------------------------------------===//
-
 #ifndef ALLO_MICROARCH_PRIMITIVES_H
 #define ALLO_MICROARCH_PRIMITIVES_H
 
@@ -321,6 +304,11 @@ struct EmitContext {
   /// 0 : (setPulse ? 1 : out[t]). The shared done-latch of the container
   /// regimes.
   Value holdDone(Value setPulse, Value start);
+  /// "\p level has risen since \p passStart": 0 from \p passStart (that cycle
+  /// included, so the flag re-edges however short the pass) until \p level's
+  /// rising edge, 1 from that edge on (0 added latency; it rises the same cycle
+  /// \p level does).
+  Value completedSince(Value level, Value passStart);
   /// Split a one-cycle \p when pulse by predicate \p cond into {taken,
   /// notTaken} = {when & cond, when & ~cond}. The predicated fork a run-once or
   /// per-iteration container uses: `taken` (re)starts the children, `notTaken`

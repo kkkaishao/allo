@@ -1,22 +1,7 @@
 # Copyright Allo authors. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Generic, config-driven cocotb testbench.
-
-This module runs inside the simulator's embedded Python (cocotb imports it by
-name). It reads a JSON config (path in ``$ALLO_COSIM_CFG``) describing the module's
-ports and the numpy-backed memories, drives clk/rst/start, services every memory
-port, waits for ``done``, and writes the output arrays + cycle count back to files
-for the host to read.
-
-Each backing memory is modeled as a synchronous (registered) RAM at the access
-latency its interface manifest declares, the device number the schedule was
-solved against, not a fixed 1. At the base latency of 1, read data presented in
-cycle k+1 reflects the address sampled at the edge ending cycle k, and a write
-commits at that edge; a latency of L defers that by L-1 further edges. Reads
-latch *before* writes apply at the same edge, so a read-modify-write on one array
-sees the pre-write value (SV NBA semantics).
-"""
+"""Generic, config-driven cocotb testbench."""
 
 from __future__ import annotations
 
@@ -38,22 +23,17 @@ def _i(sig) -> int:
 
 
 async def _serve_mem(hdl, clk, mem, readers, writers, size):
-    """Service one backing array as a synchronous RAM at each port's DECLARED
-    access latency, matching an ``always_ff @(posedge clk)`` model: the read
-    address / write enable+addr+data are sampled *before* the edge (in ReadOnly,
-    so they are the settled cycle values, like an NBA's RHS), then the read data
-    is presented and the write committed at the edge.
+    """Service one backing array as a synchronous RAM at each port's declared
+    access latency, matching an ``always_ff @(posedge clk)`` model: the address
+    and the write enable/addr/data are sampled before the edge, then the read
+    data is presented and the write committed at the edge.
 
-    Each port's ``latency`` comes from the interface manifest, which carries the
-    device memory model's number, the one the scheduler solved against. It is
-    the driver's half of a contract the emitted RTL does not enforce: the module
-    binds its read-data input with no delay elements, so it simply *expects* the
-    datum ``latency`` cycles after the address. Serving every port in 1 cycle
-    regardless (as this did) makes a URAM-bound argument, scheduled at 2, read a
-    cycle early, and cosim would pass while the hardware was wrong.
-
-    A latency of L presents/commits L-1 edges later than the base 1-cycle model,
-    via a per-port pipeline of in-flight values.
+    The manifest's ``latency`` is the number the scheduler solved against, and
+    honoring it is the driver's half of a contract the RTL does not enforce: the
+    module binds its read-data input with no delay elements, so it expects the
+    datum that many cycles after the address. A latency of L presents and
+    commits L-1 edges later than the 1-cycle base, through a per-port pipeline
+    of in-flight values.
     """
     rd = [
         (getattr(hdl, r["addr"]), getattr(hdl, r["data"]), int(r["latency"]))
@@ -71,18 +51,20 @@ async def _serve_mem(hdl, clk, mem, readers, writers, size):
     assert all(lat >= 1 for *_, lat in rd) and all(
         lat >= 1 for *_, lat in wr
     ), "a boundary port needs a >= 1 cycle access latency to be edge-triggered"
-    # In-flight values for a port whose latency exceeds the 1-cycle base: each
-    # holds the L-1 results/commits not yet due.
+    # The L-1 results and commits not yet due, per port.
     rd_pipe = [[0] * (lat - 1) for *_, lat in rd]
     wr_pipe = [[None] * (lat - 1) for *_, lat in wr]
-    clamp = lambda a: a if 0 <= a < size else 0
+
+    def clamp(addr):
+        return addr if 0 <= addr < size else 0
+
     while True:
         await ReadOnly()  # end of cycle: settled (pre-edge) values
         r_addr = [clamp(_i(addr)) for addr, _, _ in rd]
         w = [(_i(we), clamp(_i(addr)), _i(dat), lat) for we, addr, dat, lat in wr]
         await RisingEdge(clk)  # commit at the edge (NBA-like)
-        # Reads resolve against pre-write memory (read-during-write returns the
-        # old datum), so they are presented before the writes commit below.
+        # A read resolves against pre-write memory, so it is presented before
+        # the writes commit below.
         for k, (_, data, lat) in enumerate(rd):
             v = int(mem[r_addr[k]])
             if lat == 1:
@@ -99,12 +81,43 @@ async def _serve_mem(hdl, clk, mem, readers, writers, size):
                 mem[due[1]] = due[2]
 
 
+async def _serve_regfile(hdl, clk, arr, elements):
+    """Hold a completely-partitioned argument's registers, which live on this
+    side of the boundary: present each element on its ``in`` port and capture the
+    module's ``out`` at every edge its ``we`` is high.
+
+    Simpler than ``_serve_mem`` rather than a variation on it: no address to
+    decode, no read latency to model, and a write latency of exactly 1, so no
+    in-flight pipeline either. An element the module never enables keeps the
+    value it was preloaded with.
+    """
+    ins = [(getattr(hdl, e["in"]), k) for k, e in enumerate(elements) if "in" in e]
+    outs = [
+        (getattr(hdl, e["we"]), getattr(hdl, e["out"]), k)
+        for k, e in enumerate(elements)
+        if "out" in e
+    ]
+    for sig, k in ins:
+        sig.value = int(arr[k])
+    if not outs:
+        return  # read-only: nothing to capture, and the values above are held
+    while True:
+        await ReadOnly()  # end of cycle: settled (pre-edge) values
+        due = [(k, _i(data)) for we, data, k in outs if _i(we)]
+        await RisingEdge(clk)  # commit at the edge (NBA-like)
+        for k, v in due:
+            arr[k] = v
+        # A read-write element feeds back through this side, so its input
+        # follows the register just captured.
+        for sig, k in ins:
+            sig.value = int(arr[k])
+
+
 async def _feed_stream(hdl, clk, s, tokens, gap=0.0):
-    """Source a FIFO stream: drive data + valid, and advance to the next token
-    only on a cycle the DUT's ready is high at the edge (valid/ready handshake).
-    With ``gap`` > 0, randomly withholds valid to starve the DUT (a latency-
-    insensitive process must stall, not lose/duplicate a token). Holds valid low
-    once the sequence is exhausted."""
+    """Source a FIFO stream: drive data and valid, advancing to the next token
+    only on a cycle the DUT's ready is high at the edge. With ``gap`` > 0,
+    randomly withholds valid to starve the DUT, which must stall rather than
+    lose or duplicate a token. Holds valid low once the sequence runs out."""
     data = getattr(hdl, s["data"])
     valid = getattr(hdl, s["valid"])
     ready = getattr(hdl, s["ready"])
@@ -128,8 +141,8 @@ async def _feed_stream(hdl, clk, s, tokens, gap=0.0):
 async def _drain_stream(hdl, clk, s, out, count, gap=0.0):
     """Sink a FIFO stream: capture data on every cycle the DUT drives valid while
     ready is held, until ``count`` tokens are collected. With ``gap`` > 0,
-    randomly deasserts ready to back-pressure the DUT (which must freeze, not
-    drop a token)."""
+    randomly deasserts ready to back-pressure the DUT, which must freeze rather
+    than drop a token."""
     data = getattr(hdl, s["data"])
     valid = getattr(hdl, s["valid"])
     ready = getattr(hdl, s["ready"])
@@ -145,11 +158,10 @@ async def _drain_stream(hdl, clk, s, out, count, gap=0.0):
 
 @cocotb.test()
 async def cosim(hdl):
-    with open(os.environ["ALLO_COSIM_CFG"]) as f:
+    with open(os.environ["ALLO_COSIM_CFG"], encoding="utf-8") as f:
         cfg = json.load(f)
 
-    # The control ports come from the manifest like every other port, so this
-    # harness holds no hardware name of its own.
+    # Every hardware name comes from the config, none from this harness.
     ctl = cfg["control"]
     clk = getattr(hdl, ctl["clk"])
     rst = getattr(hdl, ctl["rst"])
@@ -160,8 +172,8 @@ async def cosim(hdl):
     for s in cfg["scalars"]:
         getattr(hdl, s["name"]).value = s["value"]
 
-    # Streams: quiesce the handshake lines during reset (feeders/drainers take
-    # over after) and prepare an output-capture list per drained stream.
+    # Quiesce the handshake lines during reset, and prepare one capture list
+    # per drained stream.
     stream_out: dict[str, list] = {}
     for s in cfg["streams"]:
         if s["input"]:
@@ -170,7 +182,7 @@ async def cosim(hdl):
             getattr(hdl, s["ready"]).value = 0
             stream_out[s["base"]] = []
 
-    # Load each backing array (preloaded input / RMW seed, or zeros for a pure output).
+    # Preloaded input or RMW seed, else zeros for a pure output.
     arrays = []
     for m in cfg["mems"]:
         if m["file_in"]:
@@ -178,6 +190,10 @@ async def cosim(hdl):
         else:
             arr = np.zeros(m["size"], dtype=np.uint64)
         arrays.append(arr)
+    # Always preloaded, so an element the kernel never writes passes through.
+    regs = [
+        np.load(rf["file_in"]).reshape(-1).astype(np.uint64) for rf in cfg["regfiles"]
+    ]
 
     rst.value = 1
     start.value = 0
@@ -190,10 +206,10 @@ async def cosim(hdl):
         cocotb.start_soon(
             _serve_mem(hdl, clk, arr, m["readers"], m["writers"], m["size"])
         )
-    # Feed each input stream its token sequence; drain each output stream. A
-    # non-zero `stream_gap` randomly starves inputs / back-pressures outputs to
-    # exercise the latency-insensitive stall shell (the result must be identical
-    # -- KPN determinism).
+    for rf, arr in zip(cfg["regfiles"], regs):
+        cocotb.start_soon(_serve_regfile(hdl, clk, arr, rf["elements"]))
+    # A non-zero `stream_gap` starves inputs and back-pressures outputs to
+    # exercise the stall shell; KPN determinism makes the result identical.
     gap = cfg.get("stream_gap", 0.0)
     for s in cfg["streams"]:
         if s["input"]:
@@ -219,14 +235,16 @@ async def cosim(hdl):
     for m, arr in zip(cfg["mems"], arrays):
         if m["file_out"]:
             np.save(m["file_out"], arr[: m["size"]].astype(np.uint64))
+    for rf, arr in zip(cfg["regfiles"], regs):
+        if rf["file_out"]:
+            np.save(rf["file_out"], arr.astype(np.uint64))
     for s in cfg["streams"]:
         if not s["input"]:
             np.save(s["file_out"], np.array(stream_out[s["base"]], dtype=np.uint64))
-    # Scalar results: sample each output port now that `done` has settled and the
-    # port holds its final value; the host decodes the bit pattern.
+    # `done` has settled, so each result port holds its final value.
     results = [_i(getattr(hdl, n)) for n in cfg["result_ports"]]
-    with open(cfg["results_out"], "w") as f:
+    with open(cfg["results_out"], "w", encoding="utf-8") as f:
         json.dump(results, f)
-    with open(cfg["cycles_out"], "w") as f:
+    with open(cfg["cycles_out"], "w", encoding="utf-8") as f:
         f.write(str(cycles))
     assert cycles < timeout, f"cosim timed out after {timeout} cycles"

@@ -42,8 +42,8 @@
 #ifndef ALLO_MICROARCH_HWEMIT_H
 #define ALLO_MICROARCH_HWEMIT_H
 
-#include "allo/Microarch/Naming.h" // every emitted identifier is composed there
-#include "allo/Microarch/Primitives.h" // the emission substrate
+#include "allo/Microarch/Naming.h"
+#include "allo/Microarch/Primitives.h"
 #include "circt/Dialect/HW/HWOps.h"
 #include "circt/Support/BackedgeBuilder.h"
 
@@ -250,7 +250,14 @@ struct ControlEmitter {
   /// null when unreachable. The latch's register cycle is the store/result
   /// commit cycle, so a sibling starting on this done reads every committed
   /// store and every survivor. A \p retrig region resets its completion state
-  /// on \p start.
+  /// on \p start, and its returned level additionally reads 0 on the \p start
+  /// cycle itself. That mask is what makes the level re-edge for a region whose
+  /// completion pulse COINCIDES with \p start, an acyclic one at func scope
+  /// (whose issue is \p start) draining at stage 0: the pulse wins over the
+  /// reset, so the register would latch high on the first pass and re-set from
+  /// 1 on every later one, leaving a rising-edge consumer waiting forever.
+  /// Delaying the pulse instead would cost the region a cycle it has already
+  /// declared as its latency.
   /// \p sh times the drain: under an elastic shell the completion pulse is held
   /// through back-pressure, since the last store/token is not committed until
   /// it is accepted.

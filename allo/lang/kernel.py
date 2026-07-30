@@ -6,10 +6,9 @@ import inspect
 import textwrap
 import functools
 import re
-from collections.abc import Sequence
-from typing import Literal, ParamSpec, Generic, TypeVar, overload
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
+from typing import Literal, ParamSpec, Generic, TypeVar, overload
 
 from ..lang.core import (
     constexpr,
@@ -73,6 +72,7 @@ def _register_cmdline_source(fn: Callable) -> None:
     linecache.cache[filename] = (len(source), None, lines, filename)
 
 
+# pylint: disable-next=too-many-instance-attributes
 class Kernel(Generic[P, R]):
     _module: Module
 
@@ -286,6 +286,8 @@ class Kernel(Generic[P, R]):
             {name: unwrap_if_constexpr(value) for name, value in scope.items()}
         )
         try:
+            # a type annotation is an expression; evaluating it is the point
+            # pylint: disable-next=eval-used
             return eval(text, {"__builtins__": {}}, eval_scope)
         except Exception as e:
             raise TypeError(f"Unsupported type annotation '{text}': {e}") from e
@@ -382,6 +384,8 @@ class Kernel(Generic[P, R]):
                 )
         return StatefulType(inner)
 
+    # keyed on the kernel, so the cache dies with it
+    # pylint: disable-next=method-cache-max-size-none
     @functools.cache
     def parse_argument_annotations(self) -> list[TypeBase]:
         arg_types = []
@@ -401,6 +405,8 @@ class Kernel(Generic[P, R]):
             arg_types.append(ty)
         return arg_types
 
+    # keyed on the kernel, so the cache dies with it
+    # pylint: disable-next=method-cache-max-size-none
     @functools.cache
     def parse_return_annotation(self) -> list[TypeBase]:
         annotation = self.signature.return_annotation
@@ -431,12 +437,12 @@ class Kernel(Generic[P, R]):
         if self._module is not None:
             return self._module
 
-        from ..compiler.mlir_codegen import compile
+        from ..compiler.mlir_codegen import compile as compile_kernel
 
         self.check_templates_bounded()
         arg_types = self.parse_argument_annotations()
         res_types = self.parse_return_annotation()
-        return compile(self, arg_types, res_types, options=self.options)
+        return compile_kernel(self, arg_types, res_types, options=self.options)
 
     def schedule(self):
         from ..schedule import Schedule
@@ -510,8 +516,6 @@ class ConstevalFunction(Generic[P, R]):
         self.__qualname__ = fn.__qualname__
 
     def __call__(self, *args: P.args, **kwargs: P.kwargs) -> R:
-        from ..lang.core import unwrap_if_constexpr
-
         args = [unwrap_if_constexpr(arg) for arg in args]  # type: ignore
         kwargs = {k: unwrap_if_constexpr(v) for k, v in kwargs.items()}  # type: ignore
         return self.fn(*args, **kwargs)

@@ -7,9 +7,6 @@
 #include "allo/IR/AlloAttrs.h"
 #include "allo/IR/AlloTypes.h"
 
-// The generated ISA op parsers (custom<DynamicIndexList>) need these helpers.
-#include "mlir/Interfaces/ViewLikeInterface.h"
-
 #include "llvm/Support/Format.h"
 
 #include "allo/IR/AlloDialect.cpp.inc"
@@ -18,14 +15,9 @@
 
 // ISA interfaces must precede the op/type classes that implement them.
 #include "allo/IR/AlloOpInterfaces.cpp.inc"
-#include "allo/IR/AlloOpsInterfaces.cpp.inc"
-#include "allo/IR/AlloTypeInterfaces.cpp.inc"
 
 #define GET_OP_CLASSES
 #include "allo/IR/AlloOps.cpp.inc"
-
-#define GET_OP_CLASSES
-#include "allo/IR/AlloISAOps.cpp.inc"
 
 #define GET_ATTRDEF_CLASSES
 #include "allo/IR/AlloAttrs.cpp.inc"
@@ -274,10 +266,6 @@ void AlloDialect::initialize() {
 #define GET_OP_LIST
 #include "allo/IR/AlloOps.cpp.inc"
       >();
-  addOperations<
-#define GET_OP_LIST
-#include "allo/IR/AlloISAOps.cpp.inc"
-      >();
 }
 
 LogicalResult
@@ -450,12 +438,58 @@ LogicalResult DCPathDeviceOp::verify() {
   return success();
 }
 
+// The call's copy of the callee's contract, held to the original.
+//
+// `dcp.instance` carries the callee's `latency` and `determinacy` so the
+// datapath can time the call locally, without a symbol lookup. That makes it a
+// SECOND copy of a number the callee also states, and the two saying different
+// things is a consumer placed at an offset the callee does not honour.
+//
+// After emit the callee is an `hw.module`, which publishes no contract; the
+// signature and timing checks are then skipped and only the symbol must
+// resolve.
 LogicalResult
 DCPathInstanceOp::verifySymbolUses(SymbolTableCollection &symbolTable) {
-  // The callee is a scheduled `func.func` at reify time (an `hw.module` after
-  // emit); accept any symbol so the verifier survives both stages.
-  if (!symbolTable.lookupNearestSymbolFrom(*this, getCalleeAttr()))
+  Operation *sym = symbolTable.lookupNearestSymbolFrom(*this, getCalleeAttr());
+  if (!sym)
     return emitOpError("references unknown callee '") << getCallee() << "'";
+  auto callee = dyn_cast<DCPathModuleOp>(sym);
+  if (!callee)
+    return success();
+
+  // The signature check a `func.call` gets for free: operands are the callee's
+  // arguments in order.
+  FunctionType sig = callee.getFunctionType();
+  if (sig.getNumInputs() != getInputs().size())
+    return emitOpError("passes ")
+           << getInputs().size() << " operand(s) to @" << callee.getSymName()
+           << ", which takes " << sig.getNumInputs();
+  for (auto [i, t] : llvm::enumerate(sig.getInputs()))
+    if (getInputs()[i].getType() != t)
+      return emitOpError("operand ")
+             << i << " has type " << getInputs()[i].getType() << ", but @"
+             << callee.getSymName() << " takes " << t;
+  if (sig.getNumResults() != getResults().size())
+    return emitOpError("takes ")
+           << getResults().size() << " result(s) from @" << callee.getSymName()
+           << ", which returns " << sig.getNumResults();
+  for (auto [i, t] : llvm::enumerate(sig.getResults()))
+    if (getResults()[i].getType() != t)
+      return emitOpError("result ")
+             << i << " has type " << getResults()[i].getType() << ", but @"
+             << callee.getSymName() << " returns " << t;
+
+  if (getLatency() != callee.getLatency())
+    return emitOpError("declares latency ")
+           << (getLatency() ? std::to_string(*getLatency()) : "none")
+           << ", but @" << callee.getSymName() << " publishes "
+           << (callee.getLatency() ? std::to_string(*callee.getLatency())
+                                   : "none");
+  if (getDeterminacy() != callee.getDeterminacy())
+    return emitOpError("declares determinacy ")
+           << stringifyDeterminacyEnum(getDeterminacy()) << ", but @"
+           << callee.getSymName() << " publishes "
+           << stringifyDeterminacyEnum(callee.getDeterminacy());
   return success();
 }
 
@@ -623,6 +657,126 @@ static ParseResult parseOptionalDeterminacy(OpAsmParser &p,
   return success();
 }
 
+void DCPathModuleOp::build(OpBuilder &b, OperationState &state, StringRef name,
+                           FunctionType type, DeterminacyEnum determinacy) {
+  state.addAttribute(SymbolTable::getSymbolAttrName(), b.getStringAttr(name));
+  state.addAttribute(getFunctionTypeAttrName(state.name), TypeAttr::get(type));
+  state.addAttribute(getDeterminacyAttrName(state.name),
+                     DeterminacyEnumAttr::get(b.getContext(), determinacy));
+  state.addRegion();
+}
+
+// The kernel's timing contract, checked where a caller's composition assumes
+// it. `counted_static` is the class that licenses placing a consumer at a fixed
+// offset from the call, so it is the one that must be backed by an exact
+// number; the reverse direction catches a kernel that HAS one and hides it
+// behind a class no caller composes statically against.
+LogicalResult DCPathModuleOp::verify() {
+  std::optional<int64_t> lat = getLatency();
+  if (getLatencyBound() && !lat)
+    return emitOpError("latency_bound requires latency");
+  bool exact = lat && !getLatencyBound();
+  DeterminacyEnum d = getDeterminacy();
+  if (d == DeterminacyEnum::CountedStatic && !exact)
+    return emitOpError("a counted_static kernel needs an exact latency, not a ")
+           << (lat ? "bounded one" : "missing one");
+  // A concurrent container's span is a completion floor over self-timed
+  // processes; it may carry one without promising a caller an offset.
+  if (exact && d != DeterminacyEnum::CountedStatic &&
+      d != DeterminacyEnum::Concurrent)
+    return emitOpError("an exact latency contradicts determinacy ")
+           << stringifyDeterminacyEnum(d);
+  return success();
+}
+
+void DCPathModuleOp::print(OpAsmPrinter &p) {
+  p << ' ';
+  auto op = llvm::cast<FunctionOpInterface>(getOperation());
+  if (auto vis =
+          op->getAttrOfType<StringAttr>(SymbolTable::getVisibilityAttrName()))
+    p << vis.getValue() << ' ';
+  p.printSymbolName(getSymName());
+  function_interface_impl::printFunctionSignature(p, op, getArgumentTypes(),
+                                                  false, getResultTypes());
+  if (IntegerAttr lat = getLatencyAttr()) {
+    p << " lat=" << lat.getInt();
+    if (getLatencyBound())
+      p << " bound";
+  }
+  p << ' ' << stringifyDeterminacyEnum(getDeterminacy());
+  function_interface_impl::printFunctionAttributes(
+      p, op,
+      {SymbolTable::getVisibilityAttrName(), getFunctionTypeAttrName(),
+       getArgAttrsAttrName(), getResAttrsAttrName(), getLatencyAttrName(),
+       getLatencyBoundAttrName(), getDeterminacyAttrName()});
+  p << ' ';
+  p.printRegion(getBody(), /*printEntryBlockArgs=*/false,
+                /*printBlockTerminators=*/true);
+}
+
+ParseResult DCPathModuleOp::parse(OpAsmParser &p, OperationState &result) {
+  SmallVector<OpAsmParser::Argument> entryArgs;
+  SmallVector<DictionaryAttr> resAttrs;
+  SmallVector<Type> resTypes;
+  Builder &b = p.getBuilder();
+
+  (void)impl::parseOptionalVisibilityKeyword(p, result.attributes);
+  StringAttr nameAttr;
+  if (p.parseSymbolName(nameAttr, SymbolTable::getSymbolAttrName(),
+                        result.attributes))
+    return failure();
+
+  bool isVariadic = false;
+  if (function_interface_impl::parseFunctionSignatureWithArguments(
+          p, false, entryArgs, isVariadic, resTypes, resAttrs))
+    return failure();
+  SmallVector<Type> argTypes;
+  for (auto &arg : entryArgs)
+    argTypes.push_back(arg.type);
+  result.addAttribute(getFunctionTypeAttrName(result.name),
+                      TypeAttr::get(b.getFunctionType(argTypes, resTypes)));
+
+  if (succeeded(p.parseOptionalKeyword("lat"))) {
+    int64_t latency;
+    if (p.parseEqual() || p.parseInteger(latency))
+      return failure();
+    result.addAttribute(getLatencyAttrName(result.name),
+                        b.getI64IntegerAttr(latency));
+    if (succeeded(p.parseOptionalKeyword("bound")))
+      result.addAttribute(getLatencyBoundAttrName(result.name),
+                          b.getUnitAttr());
+  }
+  if (parseOptionalDeterminacy(p, result, getDeterminacyAttrName(result.name)))
+    return failure();
+
+  NamedAttrList parsed;
+  if (p.parseOptionalAttrDictWithKeyword(parsed))
+    return failure();
+  result.attributes.append(parsed);
+  call_interface_impl::addArgAndResultAttrs(b, result, entryArgs, resAttrs,
+                                            getArgAttrsAttrName(result.name),
+                                            getResAttrsAttrName(result.name));
+
+  return p.parseRegion(*result.addRegion(), entryArgs,
+                       /*enableNameShadowing=*/false);
+}
+
+LogicalResult DCPathOutputOp::verify() {
+  auto mod = cast<DCPathModuleOp>((*this)->getParentOp());
+  ArrayRef<Type> results = mod.getResultTypes();
+  if (results.size() != getNumOperands())
+    return emitOpError("has ")
+           << getNumOperands() << " operands, but @" << mod.getSymName()
+           << " returns " << results.size();
+  for (unsigned i = 0, e = results.size(); i != e; ++i)
+    if (getOperand(i).getType() != results[i])
+      return emitOpError() << "operand " << i << " has type "
+                           << getOperand(i).getType() << ", but @"
+                           << mod.getSymName() << " result " << i << " is "
+                           << results[i];
+  return success();
+}
+
 void DCPathOperatorOp::print(OpAsmPrinter &p) {
   p << ' ';
   p.printSymbolName(getSymName());
@@ -787,10 +941,10 @@ void DCPathPipelineOp::print(OpAsmPrinter &p) {
     p << " step " << step;
   if (IntegerAttr ii = getIiAttr())
     p << " ii=" << ii.getInt();
-  if (IntegerAttr s = getStartAttr())
-    p << " at " << s.getInt();
   if (IntegerAttr l = getLengthAttr())
     p << " length=" << l.getInt();
+  if (IntegerAttr d = getDrainAttr())
+    p << " drain=" << d.getInt();
   if (IntegerAttr lat = getLatencyAttr()) {
     p << " lat=" << lat.getInt();
     if (getLatencyBound())
@@ -822,7 +976,7 @@ void DCPathPipelineOp::print(OpAsmPrinter &p) {
   p.printOptionalAttrDict(
       (*this)->getAttrs(),
       /*elidedAttrs=*/{getTripAttrName(), getLbAttrName(), getStepAttrName(),
-                       getIiAttrName(), getStartAttrName(), getLengthAttrName(),
+                       getIiAttrName(), getLengthAttrName(), getDrainAttrName(),
                        getLatencyAttrName(), getLatencyBoundAttrName(),
                        getDeterminacyAttrName(),
                        getOperandSegmentSizesAttrName()});
@@ -909,19 +1063,19 @@ ParseResult DCPathPipelineOp::parse(OpAsmParser &p, OperationState &result) {
       return failure();
     result.addAttribute(getIiAttrName(result.name), b.getI64IntegerAttr(ii));
   }
-  if (succeeded(p.parseOptionalKeyword("at"))) {
-    int64_t start;
-    if (p.parseInteger(start))
-      return failure();
-    result.addAttribute(getStartAttrName(result.name),
-                        b.getI64IntegerAttr(start));
-  }
   if (succeeded(p.parseOptionalKeyword("length"))) {
     int64_t length;
     if (p.parseEqual() || p.parseInteger(length))
       return failure();
     result.addAttribute(getLengthAttrName(result.name),
                         b.getI64IntegerAttr(length));
+  }
+  if (succeeded(p.parseOptionalKeyword("drain"))) {
+    int64_t drain;
+    if (p.parseEqual() || p.parseInteger(drain))
+      return failure();
+    result.addAttribute(getDrainAttrName(result.name),
+                        b.getI64IntegerAttr(drain));
   }
   if (succeeded(p.parseOptionalKeyword("lat"))) {
     int64_t latency;
@@ -986,10 +1140,10 @@ LogicalResult DCPathSequentialOp::verify() {
 }
 
 void DCPathSequentialOp::print(OpAsmPrinter &p) {
-  if (IntegerAttr s = getStartAttr())
-    p << " at " << s.getInt();
   if (IntegerAttr l = getLengthAttr())
     p << " length=" << l.getInt();
+  if (IntegerAttr d = getDrainAttr())
+    p << " drain=" << d.getInt();
   if (IntegerAttr lat = getLatencyAttr()) {
     p << " lat=" << lat.getInt();
     if (getLatencyBound())
@@ -1011,26 +1165,26 @@ void DCPathSequentialOp::print(OpAsmPrinter &p) {
     p << ' ' << stringifyDeterminacyEnum(*d);
   p.printOptionalAttrDict(
       (*this)->getAttrs(),
-      /*elidedAttrs=*/{getStartAttrName(), getLengthAttrName(),
+      /*elidedAttrs=*/{getLengthAttrName(), getDrainAttrName(),
                        getLatencyAttrName(), getLatencyBoundAttrName(),
                        getDeterminacyAttrName()});
 }
 
 ParseResult DCPathSequentialOp::parse(OpAsmParser &p, OperationState &result) {
   Builder &b = p.getBuilder();
-  if (succeeded(p.parseOptionalKeyword("at"))) {
-    int64_t start;
-    if (p.parseInteger(start))
-      return failure();
-    result.addAttribute(getStartAttrName(result.name),
-                        b.getI64IntegerAttr(start));
-  }
   if (succeeded(p.parseOptionalKeyword("length"))) {
     int64_t length;
     if (p.parseEqual() || p.parseInteger(length))
       return failure();
     result.addAttribute(getLengthAttrName(result.name),
                         b.getI64IntegerAttr(length));
+  }
+  if (succeeded(p.parseOptionalKeyword("drain"))) {
+    int64_t drain;
+    if (p.parseEqual() || p.parseInteger(drain))
+      return failure();
+    result.addAttribute(getDrainAttrName(result.name),
+                        b.getI64IntegerAttr(drain));
   }
   if (succeeded(p.parseOptionalKeyword("lat"))) {
     int64_t latency;
@@ -1096,8 +1250,6 @@ LogicalResult DCPathSelectOp::verify() {
 
 void DCPathSelectOp::print(OpAsmPrinter &p) {
   p << ' ' << getCondition();
-  if (IntegerAttr s = getStartAttr())
-    p << " at " << s.getInt();
   if (IntegerAttr lat = getLatencyAttr()) {
     p << " lat=" << lat.getInt();
     if (getLatencyBound())
@@ -1122,10 +1274,10 @@ void DCPathSelectOp::print(OpAsmPrinter &p) {
   }
   if (std::optional<DeterminacyEnum> d = getDeterminacy())
     p << ' ' << stringifyDeterminacyEnum(*d);
-  p.printOptionalAttrDict(
-      (*this)->getAttrs(),
-      /*elidedAttrs=*/{getStartAttrName(), getLatencyAttrName(),
-                       getLatencyBoundAttrName(), getDeterminacyAttrName()});
+  p.printOptionalAttrDict((*this)->getAttrs(),
+                          /*elidedAttrs=*/{getLatencyAttrName(),
+                                           getLatencyBoundAttrName(),
+                                           getDeterminacyAttrName()});
 }
 
 ParseResult DCPathSelectOp::parse(OpAsmParser &p, OperationState &result) {
@@ -1133,13 +1285,6 @@ ParseResult DCPathSelectOp::parse(OpAsmParser &p, OperationState &result) {
   OpAsmParser::UnresolvedOperand cond;
   if (p.parseOperand(cond))
     return failure();
-  if (succeeded(p.parseOptionalKeyword("at"))) {
-    int64_t start;
-    if (p.parseInteger(start))
-      return failure();
-    result.addAttribute(getStartAttrName(result.name),
-                        b.getI64IntegerAttr(start));
-  }
   if (succeeded(p.parseOptionalKeyword("lat"))) {
     int64_t latency;
     if (p.parseEqual() || p.parseInteger(latency))

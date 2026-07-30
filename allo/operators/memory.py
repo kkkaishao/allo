@@ -31,7 +31,6 @@ from .._mlir.ir import (
     AffineDimExpr,
     AffineSymbolExpr,
     AffineConstantExpr,
-    UnitAttr,
     IntegerAttr,
     IntegerType,
 )

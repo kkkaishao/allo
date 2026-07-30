@@ -3,33 +3,8 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-//===----------------------------------------------------------------------===//
-// What a memory access's ADDRESS is, and what it costs as hardware.
-//
-// Two things live here because they have to agree. `addressExprsOf` states
-// WHICH expressions an access's address hardware computes, and the rest of the
-// file prices them. Three layers read the first (the scheduler, the
-// strength-reduction planner, the emitter) and two read the second, so a
-// disagreement between them is a schedule that was proved against arithmetic
-// nobody built, or worse, one that never paid for arithmetic that is there.
-//
-// The cost is charged to the storage port the cone feeds
-// (`OperatorLibrary::lookup`), because an address is folded into the access's
-// affine map rather than standing as an operation of its own, so no dependence
-// carries its delay. `simplifiedForHardware` additionally decides which of
-// several equivalent forms of one address is the one to build.
-//
-// The cost is STRUCTURAL over the affine expression rather than a lookup in the
-// device's `comb` delay table, because an affine map guarantees what a generic
-// expression does not: a `Mul` is always by a constant and a `FloorDiv` / `Mod`
-// always by a constant divisor. A constant multiply is a shift-add network, not
-// a multiplier; a power-of-two divisor is wiring, not a divider. Pricing those
-// through the `comb` mul/div rows would overstate the common case by an order
-// of magnitude, which is the whole reason this is not a table lookup.
-//===----------------------------------------------------------------------===//
-
-#ifndef ALLO_SCHEDULING_ADDRESSCOST_H
-#define ALLO_SCHEDULING_ADDRESSCOST_H
+#ifndef ALLO_SCHEDULING_ADDRESS_MODEL_H
+#define ALLO_SCHEDULING_ADDRESS_MODEL_H
 
 #include "allo/Scheduling/OperatorLibrary.h"
 
@@ -304,4 +279,4 @@ double addressDelayOf(Operation *op, const OperatorLibrary &lib);
 
 } // namespace mlir::allo
 
-#endif // ALLO_SCHEDULING_ADDRESSCOST_H
+#endif // ALLO_SCHEDULING_ADDRESS_MODEL_H

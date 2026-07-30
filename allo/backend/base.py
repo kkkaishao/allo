@@ -22,10 +22,6 @@ from .._mlir.passmanager import PassManager
 from ..lang.kernel import Kernel
 from ..diagnostics import render_diagnostic, DiagnosticLocation
 
-# Allo passes live in the process-global MLIR pass registry; register them once
-# (std::call_once-guarded in C++) so backend pipelines (`lower-to-llvm`,
-# `grid-mapping`, `convert-allo-to-func`, ...) resolve via upstream PassManager.
-
 
 def lookup_kernel(module: ir.Module, name: str):
     """Return the top-level kernel op named ``name`` (an OpView) or ``None``."""
@@ -69,10 +65,9 @@ def run_pipeline(module: ir.Module, pipeline: str) -> None:
                 raise RuntimeError(
                     f"An error occurred during code generation process:\n{msg}"
                 ) from None
-            else:
-                raise RuntimeError(
-                    f"An error occurred during code generation process:\n{diag.message}"
-                ) from None
+            raise RuntimeError(
+                f"An error occurred during code generation process:\n{diag.message}"
+            ) from None
 
 
 _PROCESS_CACHE: dict[tuple[str, str], Any] = {}

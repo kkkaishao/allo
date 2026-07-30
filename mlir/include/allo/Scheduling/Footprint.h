@@ -3,14 +3,6 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-//===----------------------------------------------------------------------===//
-// Memory / stream footprint summaries. A `Summary` aggregates, per memref root,
-// whether a subtree reads / writes it (and the affine access ops, for
-// polyhedral disjointness), plus the stream FIFOs it touches. Shared by the
-// coarse cross-region graph (`RegionGraph`) and the per-level hierarchical
-// analysis.
-//===----------------------------------------------------------------------===//
-
 #ifndef ALLO_SCHEDULING_FOOTPRINT_H
 #define ALLO_SCHEDULING_FOOTPRINT_H
 

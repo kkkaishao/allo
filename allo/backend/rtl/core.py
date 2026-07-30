@@ -1,26 +1,11 @@
 # Copyright Allo authors. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""The RTL backend handle.
-
-``schedule.export("rtl", ...)`` returns an :class:`RTL`, which compiles the
-kernel to hw/Verilog and exposes:
-
-* ``schedule()`` -- the SDC scheduling result, for inspecting II / latency.
-* ``csim(*args)`` -- functional golden, run on the CPU/LLVM-JIT path (untimed).
-* ``cosim(*args)`` -- drive the emitted RTL under cocotb + a simulator, write the
-  outputs back in place, and return the cycle count. No auto-compare: keep a
-  golden copy from ``csim`` and assert against it.
-
-One handle is one hardware configuration: the scheduling options are fixed at
-export, and ``schedule()``, ``compile()`` and ``cosim()`` all describe the same
-scheduled module. The kernel module is snapshotted at export -- modifying the
-original kernel afterwards does not affect an existing handle.
-"""
+"""The RTL backend"""
 
 from __future__ import annotations
 
-import json
+import warnings
 
 from typing import Any, ParamSpec, TypeVar
 
@@ -36,6 +21,7 @@ from .device import (
     inject_device,
     operator_descs,
 )
+from .interface import Interfaces
 from .schedule import run_schedule, ScheduleResult
 from .sim import shell
 from ...lang.core import ShapedType
@@ -44,16 +30,17 @@ from ...lang.kernel import Kernel
 P = ParamSpec("P")
 R = TypeVar("R")
 
-# DCP normalization before emit: dcp-resolve-banking materializes the per-bank
-# memrefs for a partitioned array whose every access assign-banks resolved. It
-# is the only one; the address map stays in element space all the way to the
-# emitter, which linearizes it symbolically at the point of use.
-_NORMALIZE_PIPELINE = "builtin.module(func.func(dcp-resolve-banking))"
+# The one DCP normalization before emit: it materializes the per-bank memrefs of
+# a partitioned array. Addresses stay in element space until the emitter.
+_NORMALIZE_PIPELINE = "builtin.module(dcp-resolve-banking)"
 
 
+# pylint: disable-next=too-many-instance-attributes
 class RTL(Backend[P, R]):
     name = "rtl"
 
+    # the backend knobs are all keyword-only
+    # pylint: disable-next=too-many-arguments
     def __init__(
         self,
         kernel: Kernel[P, R],
@@ -72,40 +59,31 @@ class RTL(Backend[P, R]):
         """Build an RTL handle for one hardware configuration.
 
         Args:
-            device: the hardware platform (:class:`Device`) -- storage
-                primitives, native chaining delays, operator IPs, and a default
-                clock. Defaults to ``builtin_device``.
-            freq_mhz: target frequency, driving both the SDC cycle time and the
-                cosim clock. Overrides the device's ``default_freq_mhz``.
+            device: the hardware platform: storage primitives, native chaining
+                delays, operator IPs and a default clock.
+            freq_mhz: target frequency, overriding the device default. Drives
+                both the SDC cycle time and the cosim clock.
             simulator: the engine cocotb drives for ``cosim``.
             binding: operator-sharing policy.
             accumulators: rotate float reductions across this many accumulators,
-                dropping their II to ``ceil(latency / accumulators)`` (0 = off;
-                at least the reduction operator's latency gives II=1).
+                dropping their II to ``ceil(latency / accumulators)`` (0 = off).
             float_reassoc: rebalance float reduction chains into logarithmic
-                trees. Not bit-exact, so pass ``False`` when exact floating-point
-                semantics are required.
+                trees. Not bit-exact.
             unroll_under_pipeline: fully unroll the loops nested inside a
                 pipelined loop, so the nest pipelines at one II (Vitis ``#pragma
-                HLS pipeline`` semantics). ``False`` keeps them rolled and lets
-                the scheduler pipeline the imperfect nest by overlap instead.
+                HLS pipeline`` semantics). ``False`` keeps them rolled and the
+                directive is then not honored.
             perfectize: sink an imperfect nest's prologue/epilogue into the inner
                 loop under a guard, fusing it into one pipeline. A QoR
-                alternative -- the scheduler handles imperfect nests without it.
+                alternative; the scheduler handles imperfect nests without it.
+            scalarize_threshold: keep arrays of at most this many elements in
+                registers rather than a memory (0 = off).
             scheduler: the solver that settles the resource half of each
                 scheduling problem. ``"heuristic"`` is the SDC simplex plus
-                greedy placement; ``"exact"`` is CP-SAT, exact under the same
-                model and available only in a build with OR-Tools.
-            auto_partition: complete-partition a small local array so it lowers
-                to registers rather than a memory whose ports and access latency
-                bound the II. ``False`` leaves every unbound array on the
-                device's default storage, which is what a measurement OF that
-                storage model wants.
+                greedy placement, ``"exact"`` CP-SAT (only with OR-Tools).
         """
         super().__init__(kernel)
         self._device = device if device is not None else builtin_device
-        # Frequency is a per-run parameter: the explicit override, else the
-        # device default. It drives both the SDC cycle time and the cosim clock.
         self.freq_mhz = (
             freq_mhz if freq_mhz is not None else self._device.default_freq_mhz
         )
@@ -122,16 +100,14 @@ class RTL(Backend[P, R]):
         }
         self.arg_types = kernel.parse_argument_annotations()
         self.res_types = kernel.parse_return_annotation()
-        # The three stage artifacts, each built once on first use: `self.module`
-        # is the pristine snapshot, `_dcp_ir` the scheduled DCP module, `_hw_ir`
-        # the emitted hw/comb/seq module.
+        # The stage artifacts, each built once on first use. `self.module` stays
+        # the pristine snapshot.
         self._dcp_ir: Module | None = None
         self._schedule_result: ScheduleResult | None = None
         self._hw_ir: Module | None = None
         self._verilog: str | None = None
         self._cpu: CPU[P, R] | None = None
-        # {module name -> port-interface manifest}, authored by the C++ emitter.
-        self._interfaces: dict[str, Any] | None = None
+        self._interfaces: Interfaces | None = None
 
     @property
     def top(self) -> str:
@@ -145,13 +121,10 @@ class RTL(Backend[P, R]):
         II, latency and per-op start times. Computed once and reused by
         ``compile()``, so it always describes the RTL that ``cosim`` runs."""
         if self._schedule_result is None:
-            # Schedule a copy: the driver reifies the schedule into the module in
-            # place, and `self.module` stays the pristine snapshot.
+            # The schedule is reified in place, so it runs on a copy. Operator
+            # and device timing is injected into that copy only, keeping the CPU
+            # functional path clear of it.
             self._dcp_ir = ir_ext.clone_module(self.module)
-            # Inject the device operators + technology tables into the scheduled
-            # copy only, so the CPU functional path (on the pristine self.module)
-            # never sees them. The scheduler and reifier read this IR for all
-            # operator/device timing; frequency stays a per-run parameter.
             inject_operators(self._dcp_ir, self._device.operators)
             inject_device(self._dcp_ir, self._device)
             self._schedule_result = run_schedule(
@@ -163,33 +136,36 @@ class RTL(Backend[P, R]):
         return self._schedule_result
 
     @property
-    def dcp(self) -> str:
-        """The scheduled DCP MLIR module"""
+    def dcp_module(self) -> Module:
+        """The scheduled DCP module object."""
         self.schedule()
-        return str(self._dcp_ir)
+        assert self._dcp_ir is not None  # set by schedule()
+        return self._dcp_ir
+
+    @property
+    def dcp(self) -> str:
+        """The textual scheduled DCP MLIR module.
+        NOTE: the textual form is not stable"""
+        return str(self.dcp_module)
 
     # -- emission ---------------------------------------------------------
 
     def compile(self) -> Module:
         """Compile the kernel to hw/comb/seq MLIR"""
         if self._hw_ir is None:
-            # An array return has no meaning at a hardware port. This constrains
-            # emission only -- such a kernel still schedules.
+            # An array return has no meaning at a hardware port. Emission only:
+            # such a kernel still schedules.
             if any(isinstance(t, ShapedType) for t in self.res_types):
                 raise TypeError(
                     "RTL does not support returning arrays; use an out-parameter "
                     "instead"
                 )
-            # operator IPs are injected into the scheduled copy inside schedule()
             self.schedule()
-            # Normalize and emit on a copy, so `dcp` keeps reading the scheduled
-            # module rather than this pipeline's lowered remains.
+            # Emit on a copy, so `dcp` keeps reading the scheduled module.
             work = ir_ext.clone_module(self._dcp_ir)
             run_pipeline(work, _NORMALIZE_PIPELINE)
-            # The datapath emitter is a direct C++ call, not a pass, so its
-            # `emitError` diagnostics do not flow through the PassManager ->
-            # MLIRError path; capture them here so a failed emission raises the
-            # diagnostic instead of returning None.
+            # The emitter is a direct call rather than a pass, so its diagnostics
+            # do not reach the PassManager -> MLIRError path. Capture them here.
             diagnostics: list[str] = []
             handler = work.context.attach_diagnostic_handler(
                 lambda d: bool(diagnostics.append(d.message)) or True
@@ -203,7 +179,7 @@ class RTL(Backend[P, R]):
                     "An error occurred during code generation process:\n"
                     + "\n".join(diagnostics)
                 )
-            self._interfaces = json.loads(manifests)
+            self._interfaces = Interfaces.from_json(manifests)
             self._hw_ir = work
         return self._hw_ir
 
@@ -222,8 +198,8 @@ class RTL(Backend[P, R]):
         return self._verilog
 
     @property
-    def interfaces(self) -> dict[str, Any]:
-        """{module name -> port-interface manifest} for the emitted modules"""
+    def interfaces(self) -> Interfaces:
+        """The emitted modules' port interfaces, keyed by RTL module name"""
         self.compile()
         return self._interfaces
 
@@ -244,21 +220,17 @@ class RTL(Backend[P, R]):
         stall_prob: float = 0.0,
     ) -> shell.CosimResult:
         """Drive the emitted RTL under cocotb; write outputs back in place and
-        return the cycle count. Does not compare -- keep a ``csim`` golden.
+        return the cycle count. Does not compare: keep a ``csim`` golden.
 
-        An array output is written through an explicit out-parameter argument, so
-        pass a pre-allocated buffer for each such argument; it is written in
-        place. A scalar (``-> i32``) result stays an output port, sampled at
-        ``done``.
-
-        A stream (``Stream[...]``) argument is driven token-by-token over its
-        FIFO handshake: pass a 1-D array of tokens for each input stream and a
-        pre-allocated buffer for each output stream (drained in place).
-        ``stall_prob`` (0..1) randomly starves inputs / back-pressures outputs to
-        exercise the latency-insensitive shell -- the result must be unchanged.
+        An array output crosses as an out-parameter, so pass a pre-allocated
+        buffer for each; a scalar result stays an output port sampled at
+        ``done``. A ``Stream[...]`` argument is driven token-by-token over its
+        FIFO handshake: a 1-D array of tokens for an input, a pre-allocated
+        buffer for an output. ``stall_prob`` (0..1) randomly starves inputs and
+        back-pressures outputs; the result must be unchanged.
         """
         self.compile()  # fills self._interfaces
-        return shell.cosim(
+        result = shell.cosim(
             self.verilog,
             self.interfaces,
             self.top,
@@ -272,7 +244,35 @@ class RTL(Backend[P, R]):
             waves=waves,
             stall_prob=stall_prob,
         )
+        if stall_prob == 0:
+            self._check_latency(result.cycles)
+        return result
 
+    def _check_latency(self, cycles: int) -> None:
+        """Hold the latency model to the hardware: a kernel whose span is an
+        exact static contract must run for exactly that many cycles. The only
+        check in the compiler that compares a model against a measurement rather
+        than against another model.
+        """
+        fn = self.schedule().func(self.top)
+        # A bounded, indeterminate or concurrent kernel publishes a figure that
+        # is deliberately not tight, so only an exact contract is held to a
+        # measured count.
+        if not fn.latency_is_exact:
+            return
+        modelled = fn.latency
+        assert modelled is not None  # implied by latency_is_exact
+        if modelled == cycles:
+            return
+        msg = (
+            f"DEV-ONLY: latency model disagrees with the hardware for '{fn.name}': "
+            f"declared latency = {modelled}, measured {cycles} cycles "
+            f"(delta {cycles - modelled:+d}), which may indicate a bug in "
+            "the compiler or the RTL."
+        )
+        warnings.warn(msg, stacklevel=2)
+
+    # pylint: disable-next=arguments-differ
     def run(self, mode: str, *args: Any, **kwargs: Any) -> Any:
         if mode == "csim":
             return self.csim(*args, **kwargs)

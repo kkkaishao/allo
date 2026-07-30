@@ -10,7 +10,7 @@ import operator
 from contextlib import contextmanager
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Type, cast
+from typing import NoReturn, cast
 from types import ModuleType
 
 import numpy as np
@@ -57,7 +57,7 @@ from .._mlir.dialects.ub import PoisonOp
 from .builder import AlloOpBuilder
 from ..lang.kernel import ConstevalFunction, Kernel, KernelOptions
 from ..lang.kernel import kernel as kernel_decorator
-from ..lang.ip import ip as ip_decorator, IP
+from ..lang.ip import ip as ip_decorator
 from ..lang.core import (
     ConstexprValue,
     AlloValue,
@@ -173,7 +173,10 @@ class _AffineOperands:
 _ABSENT = object()
 
 
+# one visit_* method per supported AST node, over one shared lowering state
+# pylint: disable-next=too-many-instance-attributes,too-many-public-methods
 class MLIRCodeGenerator(ast.NodeVisitor):
+    # pylint: disable-next=too-many-arguments
     def __init__(
         self,
         context: Context,
@@ -241,7 +244,8 @@ class MLIRCodeGenerator(ast.NodeVisitor):
         self.block_terminated = False
         self.has_explicit_return_annotation = False
 
-        self.compile_error = self.builder.compile_error
+    def compile_error(self, message: str) -> NoReturn:
+        self.builder.compile_error(message)
 
     builtin_namespace = {
         "range": Range,
@@ -310,17 +314,23 @@ class MLIRCodeGenerator(ast.NodeVisitor):
     def _is_allowed_static_value(self, name: str, val: object):
         return (
             name in self.builtin_namespace
-            or isinstance(val, ModuleType)
-            or isinstance(val, Kernel)
-            or isinstance(val, NestedKernelSymbol)
-            or isinstance(val, (Operator, BoundOperator))
             or val is Range
             or val is Grid
-            or isinstance(val, TypeBase)
-            or isinstance(val, ConstexprValue)
-            or isinstance(val, ConstevalFunction)
-            # A captured NumPy array is a compile-time constant array initializer.
-            or isinstance(val, np.ndarray)
+            or isinstance(
+                val,
+                (
+                    ModuleType,
+                    Kernel,
+                    NestedKernelSymbol,
+                    Operator,
+                    BoundOperator,
+                    TypeBase,
+                    ConstexprValue,
+                    ConstevalFunction,
+                    # a captured NumPy array is a constant array initializer
+                    np.ndarray,
+                ),
+            )
         )
 
     def _is_allowed_global_var(self, name: str, val: object, absent):
@@ -367,7 +377,7 @@ class MLIRCodeGenerator(ast.NodeVisitor):
 
     def visit(self, node: ast.AST):
         if node is None:
-            return
+            return None
 
         last_node = self.builder.curr_node
         last_loc = self.builder.get_loc()
@@ -411,7 +421,7 @@ class MLIRCodeGenerator(ast.NodeVisitor):
                 break
             if isinstance(stmt, ast.FunctionDef):
                 if not allow_nested_kernel_def:
-                    return self.compile_error(
+                    self.compile_error(
                         "Nested kernel definitions are only supported at the top level of a kernel body."
                     )
                 self.visit(stmt)
@@ -467,9 +477,7 @@ class MLIRCodeGenerator(ast.NodeVisitor):
             # construct a fake assignment node to visit the default argument value
             target = ast.Name(id=name, ctx=ast.Store())
             if annotation is None:
-                return self.compile_error(
-                    "Default arguments must have type annotations"
-                )
+                self.compile_error("Default arguments must have type annotations")
             init_node = ast.AnnAssign(
                 target=target,
                 annotation=annotation,
@@ -521,7 +529,7 @@ class MLIRCodeGenerator(ast.NodeVisitor):
         for name, ty in zip(arg_names, self.arg_types):
             if isinstance(ty, ConstexprType):
                 if not isinstance(self.lscope.get(name), ConstexprValue):
-                    return self.compile_error(
+                    self.compile_error(
                         f"Missing constexpr argument binding for parameter '{name}' in function '{self.func_name}'."
                     )
                 continue
@@ -539,7 +547,7 @@ class MLIRCodeGenerator(ast.NodeVisitor):
         # restore the function context
         if not self.block_terminated:
             if len(self.res_types) > 0:
-                return self.compile_error(
+                self.compile_error(
                     "Missing return statement for non-void function. Please add a top-level return statement matching the declared return type."
                 )
             ip, _ = self.builder.get_insertion_point_and_loc()
@@ -578,7 +586,7 @@ class MLIRCodeGenerator(ast.NodeVisitor):
 
     def _register_nested_kernel_def(self, node: ast.FunctionDef):
         if len(node.decorator_list) != 1:
-            return self.compile_error(
+            self.compile_error(
                 f"Nested function '{node.name}' must use exactly one '@kernel' decorator."
             )
 
@@ -587,7 +595,7 @@ class MLIRCodeGenerator(ast.NodeVisitor):
         if isinstance(decorator, ast.Call):
             for kw in decorator.keywords:
                 if kw.arg != "mapping":
-                    return self.compile_error(
+                    self.compile_error(
                         f"Nested kernel '{node.name}' does not support decorator keyword argument '{kw.arg}'."
                     )
                 mapping_node = kw.value
@@ -596,17 +604,18 @@ class MLIRCodeGenerator(ast.NodeVisitor):
         decorator = self._resolve_kernel_decorator(decorator)
 
         if decorator is ip_decorator:
-            return self.compile_error(
-                f"External IPs are not allowed to be defined as nested functions. Use a top-level '@ip' definition instead."
+            self.compile_error(
+                "External IPs are not allowed to be defined as nested functions. "
+                "Use a top-level '@ip' definition instead."
             )
 
         if decorator is not kernel_decorator:
-            return self.compile_error(
+            self.compile_error(
                 f"Nested function '{node.name}' is not allowed. Only allo kernels are supported for nested definitions."
             )
 
         if node.name in self.lscope or node.name in self.fscope:
-            return self.compile_error(
+            self.compile_error(
                 f"Nested kernel name '{node.name}' conflicts with an existing local symbol."
             )
         self.fscope[node.name] = NestedKernelSymbol(
@@ -873,7 +882,7 @@ class MLIRCodeGenerator(ast.NodeVisitor):
                 elts = arg.elts
                 if len(elts) == 1:
                     specs.append((None, elts[0]))
-                elif len(elts) in (2, 3):
+                elif len(elts) in {2, 3}:
                     specs.append((elts[0], elts[1]))
                 else:
                     return None
@@ -885,7 +894,7 @@ class MLIRCodeGenerator(ast.NodeVisitor):
     # mapped to ``(make_residual, is_equality)`` where the residual is constrained
     # ``>= 0`` (inequality) or ``== 0`` (equality). ``!=`` is a disjunction with no
     # single-constraint form and is intentionally absent (so it forces scf.if).
-    _AFFINE_CONSTRAINT_OPS: dict[Type[ast.cmpop], tuple] = {
+    _AFFINE_CONSTRAINT_OPS: dict[type[ast.cmpop], tuple] = {
         ast.Eq: (lambda lhs, rhs: lhs - rhs, True),
         ast.LtE: (lambda lhs, rhs: rhs - lhs, False),
         ast.Lt: (lambda lhs, rhs: rhs - lhs - 1, False),
@@ -970,7 +979,7 @@ class MLIRCodeGenerator(ast.NodeVisitor):
             )
         return self.call_operator(library_op, [lhs, rhs])
 
-    _available_comparison_methods: dict[Type[ast.cmpop], Operator] = {
+    _available_comparison_methods: dict[type[ast.cmpop], Operator] = {
         ast.Eq: arith_ops.eq,
         ast.NotEq: arith_ops.ne,
         ast.Lt: arith_ops.lt,
@@ -1218,7 +1227,7 @@ class MLIRCodeGenerator(ast.NodeVisitor):
             )
         return self.call_operator(library_op, [lhs, rhs])
 
-    _available_binary_methods: dict[Type[ast.operator], Operator] = {
+    _available_binary_methods: dict[type[ast.operator], Operator] = {
         ast.Add: arith_ops.add,
         ast.Sub: arith_ops.sub,
         ast.Mult: arith_ops.mul,
@@ -1242,7 +1251,7 @@ class MLIRCodeGenerator(ast.NodeVisitor):
             )
         return self.call_operator(fn, [operand])
 
-    _available_unary_methods: dict[Type[ast.unaryop], Operator] = {
+    _available_unary_methods: dict[type[ast.unaryop], Operator] = {
         ast.UAdd: arith_ops.pos,
         ast.USub: arith_ops.neg,
         ast.Not: arith_ops.logical_not,
@@ -1276,10 +1285,7 @@ class MLIRCodeGenerator(ast.NodeVisitor):
 
         if len(nontrivial_values) == 0:
             # all values are constant folded
-            if library_op == arith_ops.logical_and:
-                return ConstexprValue(True)
-            else:
-                return ConstexprValue(False)
+            return ConstexprValue(library_op is arith_ops.logical_and)
 
         while len(nontrivial_values) >= 2:
             # reduce from left to right
@@ -1291,17 +1297,17 @@ class MLIRCodeGenerator(ast.NodeVisitor):
         assert len(nontrivial_values) == 1
         return nontrivial_values[0]
 
-    _available_boolop_methods: dict[Type[ast.boolop], Operator] = {
+    _available_boolop_methods: dict[type[ast.boolop], Operator] = {
         ast.And: arith_ops.logical_and,
         ast.Or: arith_ops.logical_or,
     }
 
-    def visit_Break(self, node):
+    def visit_Break(self, _node):
         return self.compile_error(
             "'break' statement is not supported in allo kernel functions"
         )
 
-    def visit_Continue(self, node):
+    def visit_Continue(self, _node):
         return self.compile_error(
             "'continue' statement is not supported in allo kernel functions"
         )
@@ -1317,18 +1323,16 @@ class MLIRCodeGenerator(ast.NodeVisitor):
             return_vals = [self.visit(node.value)]
 
         if len(return_vals) > 0 and not self.has_explicit_return_annotation:
-            return self.compile_error(
-                "Return values require an explicit return annotation."
-            )
+            self.compile_error("Return values require an explicit return annotation.")
         if len(return_vals) != len(self.res_types):
-            return self.compile_error(
+            self.compile_error(
                 f"Return value count mismatch: expected {len(self.res_types)}, got {len(return_vals)}."
             )
 
         coerced = []
         for value, dst_type in zip(return_vals, self.res_types):
             if not isinstance(value, (AlloValue, ConstexprValue)):
-                return self.compile_error(
+                self.compile_error(
                     f"Unsupported return value '{value}' of type '{type(value).__name__}'."
                 )
             coerced.append(self.builder.cast(value, dst_type))
@@ -1438,6 +1442,8 @@ class MLIRCodeGenerator(ast.NodeVisitor):
             phi_ir_types = [ty.materialize(self.context) for ty in phi_types]
             if affine_cond is not None:
                 integer_set, operands = affine_cond
+                # the MLIR op builders take an extension __init__ that pylint cannot see
+                # pylint: disable-next=unexpected-keyword-arg,no-value-for-parameter
                 if_op = AffineIfOp(
                     integer_set,
                     phi_ir_types,
@@ -1448,6 +1454,7 @@ class MLIRCodeGenerator(ast.NodeVisitor):
                 )
                 yield_cls = AffineYieldOp
             else:
+                # pylint: disable-next=unexpected-keyword-arg
                 if_op = IfOp(
                     cond.handle,
                     phi_ir_types,
@@ -1577,11 +1584,11 @@ class MLIRCodeGenerator(ast.NodeVisitor):
                 loc=self.builder._loc,
             )
             return AlloValue(sel_op.result, res_type)
-        else:
-            # constexpr path
-            cond = self._unwrap_constexpr_condition(cond, "Ternary expression")
-            selected = node.body if cond else node.orelse
-            return self.visit(selected)
+
+        # constexpr path
+        cond = self._unwrap_constexpr_condition(cond, "Ternary expression")
+        selected = node.body if cond else node.orelse
+        return self.visit(selected)
 
     _condition_types = {
         bool,
@@ -1616,7 +1623,8 @@ class MLIRCodeGenerator(ast.NodeVisitor):
         if not (then_has_return or else_has_return):
             affine_cond = self._build_affine_condition(node.test)
             if affine_cond is not None:
-                return self.visit_if_impl(None, node, affine_cond=affine_cond)
+                self.visit_if_impl(None, node, affine_cond=affine_cond)
+                return
         cond = self.visit(node.test)
         if isinstance(cond, AlloValue):
             cond = self.builder.to_condition(cond)
@@ -1658,9 +1666,9 @@ class MLIRCodeGenerator(ast.NodeVisitor):
     def visit_Match(self, node: ast.Match):
         subject = self.visit(node.subject)
         if not isinstance(subject, AlloValue) or not isinstance(subject.type, DType):
-            return self.compile_error("match subject must be a runtime value.")
+            self.compile_error("match subject must be a runtime value.")
         if not (subject.type.is_int_signless() or subject.type.is_index()):
-            return self.compile_error("match is only supported on integer subjects.")
+            self.compile_error("match is only supported on integer subjects.")
         # scf.index_switch requires an `index`-typed argument.
         arg = self.builder.scalar_cast(subject, index)
 
@@ -1669,23 +1677,21 @@ class MLIRCodeGenerator(ast.NodeVisitor):
         default_body: list | None = None
         for case in node.cases:
             if case.guard is not None:
-                return self.compile_error(
+                self.compile_error(
                     "guards (`case ... if ...:`) are not supported in match statements."
                 )
             if self._branch_has_return(case.body):
-                return self.compile_error(
-                    "'return' is not supported inside match cases."
-                )
+                self.compile_error("'return' is not supported inside match cases.")
             if self._is_wildcard_pattern(case.pattern):
                 if default_body is not None:
-                    return self.compile_error(
+                    self.compile_error(
                         "match can only have a single wildcard `case _:`."
                     )
                 default_body = case.body
             else:
                 value = self._match_case_value(case.pattern)
                 if value in case_values:
-                    return self.compile_error(f"duplicate match case value {value}.")
+                    self.compile_error(f"duplicate match case value {value}.")
                 case_values.append(value)
                 case_bodies.append(case.body)
 
@@ -1720,6 +1726,8 @@ class MLIRCodeGenerator(ast.NodeVisitor):
             phi_ir_types = [ty.materialize(self.context) for ty in phi_types]
             # The wrapper creates one (empty) block per region: regions[0] is the
             # default region, the rest are the case regions aligned with cases.
+            # the MLIR op builders take an extension __init__ that pylint cannot see
+            # pylint: disable-next=no-value-for-parameter
             switch_op = IndexSwitchOp(
                 phi_ir_types,
                 arg.handle,
@@ -1852,14 +1860,14 @@ class MLIRCodeGenerator(ast.NodeVisitor):
                 "only single generator is supported in list comprehensions"
             )
         comp = node.generators[0]
-        iter = self.visit(comp.iter)
-        if not isinstance(iter, tuple):
+        iterable = self.visit(comp.iter)
+        if not isinstance(iterable, tuple):
             return self.compile_error(
                 "only tuple iteration is supported in list comprehensions"
             )
 
         results = []
-        for item in iter:
+        for item in iterable:
             if not isinstance(comp.target, ast.Name):
                 return self.compile_error(
                     "only simple variable targets are supported in list comprehensions",
@@ -2065,21 +2073,22 @@ class MLIRCodeGenerator(ast.NodeVisitor):
 
     def visit_AnnAssign(self, node: ast.AnnAssign):
         if isinstance(node.target, ast.Attribute):
-            return self.compile_error(
+            self.compile_error(
                 "assignment to attributes is not supported in allo kernel functions"
             )
         if not isinstance(node.target, ast.Name):
-            return self.compile_error(
+            self.compile_error(
                 "annotated assignment only supports simple variable targets"
             )
         if node.target.id in self.lscope:
-            return self.compile_error(
+            self.compile_error(
                 f"Variable '{node.target.id}' is already defined in the current scope."
             )
 
         parsed_type = self._parse_annotation(node.annotation, node.target.id)
         if isinstance(parsed_type, StatefulType):
-            return self._visit_stateful_decl(node, parsed_type)
+            self._visit_stateful_decl(node, parsed_type)
+            return
         if isinstance(parsed_type, StreamType):
             init = self._parse_stream_init(node) if node.value is not None else None
             self._set_value_with_loc(
@@ -2093,7 +2102,7 @@ class MLIRCodeGenerator(ast.NodeVisitor):
                     node.target.id, self.builder.make_buffer(parsed_type)
                 )
                 return
-            return self.compile_error(
+            self.compile_error(
                 f"Annotated variable '{node.target.id}' must have an initializer."
             )
 
@@ -2108,7 +2117,7 @@ class MLIRCodeGenerator(ast.NodeVisitor):
 
         if isinstance(value, np.ndarray):
             if not isinstance(parsed_type, ShapedType):
-                return self.compile_error(
+                self.compile_error(
                     f"NumPy array can only initialize a shaped variable, but "
                     f"'{node.target.id}' is annotated as "
                     f"'{ast.unparse(node.annotation)}'."
@@ -2120,14 +2129,14 @@ class MLIRCodeGenerator(ast.NodeVisitor):
 
         if isinstance(parsed_type, ConstexprType):
             if isinstance(value, AlloValue):
-                return self.compile_error(
+                self.compile_error(
                     f"Unsupported assignment with type annotation 'constexpr' and value of type '{value.type}'."
                 )
             self._set_value(node.target.id, ConstexprValue(value))
             return
 
         if not isinstance(value, (AlloValue, ConstexprValue)):
-            return self.compile_error(
+            self.compile_error(
                 f"Unsupported initializer for variable '{node.target.id}' with type annotation '{ast.unparse(node.annotation)}'."
             )
         self._set_value_with_loc(node.target.id, self.builder.cast(value, parsed_type))
@@ -2135,7 +2144,7 @@ class MLIRCodeGenerator(ast.NodeVisitor):
     def visit_Assign(self, node: ast.Assign):
         targets = node.targets
         if len(targets) != 1:
-            return self.compile_error("multiple assignment targets are not supported")
+            self.compile_error("multiple assignment targets are not supported")
         target = targets[0]
         if isinstance(target, ast.Name):
             with self._name_loc_prefix(target.id):
@@ -2147,14 +2156,15 @@ class MLIRCodeGenerator(ast.NodeVisitor):
     def _do_assignment(self, target, value: object):
         assert isinstance(target.ctx, ast.Store)
         if isinstance(target, ast.Subscript):
-            return self.visit_Subscript_Store(target, value)
+            self.visit_Subscript_Store(target, value)
+            return
         if isinstance(target, ast.Tuple):
             assert isinstance(value, tuple)
             for i, elt in enumerate(target.elts):
                 self._do_assignment(elt, value[i])
             return
         if isinstance(target, ast.Attribute):
-            return self.compile_error(
+            self.compile_error(
                 "assignment to attributes is not supported in allo kernel functions"
             )
         if isinstance(target, ast.Name):
@@ -2162,7 +2172,7 @@ class MLIRCodeGenerator(ast.NodeVisitor):
             # the first time we see a variable is considered its definition site, and its type if inferred from the assigned value. subsequent assignments to the same variable must be type-compatible with the first definition.
             if target not in self.lscope:
                 if isinstance(value, ConstexprValue):
-                    return self.compile_error(
+                    self.compile_error(
                         "Constexpr variables must be explicitly declared with type annotation. Please add a type annotation of 'constexpr' to this variable."
                     )
                 self._set_value_with_loc(target, value)
@@ -2170,9 +2180,10 @@ class MLIRCodeGenerator(ast.NodeVisitor):
             proxy = self.lscope[target]
             if isinstance(proxy, StatefulValue):
                 # Persistent storage: store into the global, keep the binding.
-                return self._write_stateful(proxy, value)
+                self._write_stateful(proxy, value)
+                return
             if isinstance(proxy, ConstexprValue):
-                return self.compile_error(
+                self.compile_error(
                     f"Cannot reassign to variable '{target}' defined as a constexpr"
                 )
             assert isinstance(proxy, AlloValue)
@@ -2243,9 +2254,7 @@ class MLIRCodeGenerator(ast.NodeVisitor):
 
     def visit_While(self, node: ast.While):
         if node.orelse:
-            return self.compile_error(
-                "'while' statement with 'else' block is not supported"
-            )
+            self.compile_error("'while' statement with 'else' block is not supported")
         with EnterSubRegion(self):
             liveins = self.lscope.copy()
             names, init_handles, init_types = self._test_loop_iter_args(
@@ -2305,13 +2314,9 @@ class MLIRCodeGenerator(ast.NodeVisitor):
 
     def visit_For(self, node: ast.For):
         if node.orelse:
-            return self.compile_error(
-                "'for' statement with 'else' block is not supported"
-            )
+            self.compile_error("'for' statement with 'else' block is not supported")
         if not isinstance(node.iter, ast.Call):
-            return self.compile_error(
-                "Only 'for' loops over 'range()/grid()' are supported"
-            )
+            self.compile_error("Only 'for' loops over 'range()/grid()' are supported")
 
         IteratorClass = self.visit(node.iter.func)
         iter_args = [self.visit(arg) for arg in node.iter.args]
@@ -2324,21 +2329,18 @@ class MLIRCodeGenerator(ast.NodeVisitor):
             step = iterator.step
         elif IteratorClass is Grid:
             iterator = IteratorClass(*iter_args, **iter_kwargs)  # type: ignore
-            return self.visit_Grid(node, iterator)
+            self.visit_Grid(node, iterator)
+            return
         else:
-            return self.compile_error(
+            self.compile_error(
                 "Only 'for' loops over 'range()' and 'grid()' are supported"
             )
 
         if not isinstance(node.target, ast.Name):
-            return self.compile_error(
-                "loop target must be a single variable in 'for' loops"
-            )
+            self.compile_error("loop target must be a single variable in 'for' loops")
 
         if isinstance(step, ConstexprValue) and step.value <= 0:
-            return self.compile_error(
-                "loop step must be a positive integer in 'for' loops"
-            )
+            self.compile_error("loop step must be a positive integer in 'for' loops")
 
         # A loop lowers to affine.for (so its body can use affine.load/store) when
         # the step is a positive constant and both bounds are affine expressions
@@ -2436,15 +2438,15 @@ class MLIRCodeGenerator(ast.NodeVisitor):
 
     def visit_Grid(self, node: ast.For, iterator: Grid):
         if len(iterator.starts) <= 1:
-            return self.compile_error(
+            self.compile_error(
                 "Use range() for single-dimensional loops; grid() requires at least two dimensions."
             )
         if not isinstance(node.target, ast.Tuple):
-            return self.compile_error(
+            self.compile_error(
                 "loop target must be a tuple of variables in 'for' loops over 'grid()'"
             )
         if len(node.target.elts) != len(iterator.starts):
-            return self.compile_error(
+            self.compile_error(
                 f"loop target must have the same number of variables as the dimensions of the grid iterator. Expected {len(iterator.starts)} variables, but got {len(node.target.elts)}."
             )
 
@@ -2454,9 +2456,7 @@ class MLIRCodeGenerator(ast.NodeVisitor):
         ndim = len(lbs)
 
         if any(isinstance(step, ConstexprValue) and step.value <= 0 for step in steps):
-            return self.compile_error(
-                "loop step must be a positive integer in 'for' loops"
-            )
+            self.compile_error("loop step must be a positive integer in 'for' loops")
 
         # A grid is an unordered/parallel iteration space, but the scheduler works
         # on ordered loops, so it lowers to a *nest of `affine.for`* (when every
@@ -2495,7 +2495,7 @@ class MLIRCodeGenerator(ast.NodeVisitor):
             targets = []
             for i, target in enumerate(node.target.elts):
                 if not isinstance(target, ast.Name):
-                    return self.compile_error(
+                    self.compile_error(
                         "loop target must be a single variable in 'for' loops over 'grid()'"
                     )
                 iv_proxy = AlloValue(iv_placeholders[i].result, index)
@@ -2509,7 +2509,7 @@ class MLIRCodeGenerator(ast.NodeVisitor):
                 node, liveins, ignore=set(targets)
             )
             if len(init_handles) > 0:
-                return self.compile_error(
+                self.compile_error(
                     "Non-trivial loop-carried dependencies are not supported in "
                     "'for' loops over 'grid()' at this moment."
                 )
@@ -2578,7 +2578,7 @@ class MLIRCodeGenerator(ast.NodeVisitor):
         nested = set()
 
         def collect(op, is_nested):
-            if op.name in ("affine.store", "memref.store"):
+            if op.name in {"affine.store", "memref.store"}:
                 mref = op.operands[1]  # store operands: [value, memref, indices...]
                 if mref not in seen:
                     seen.add(mref)
@@ -2681,18 +2681,17 @@ class MLIRCodeGenerator(ast.NodeVisitor):
             if fn.lazy:
                 k = Kernel(fn.fn, mapping=(), options=KernelOptions())
                 k._is_lazy_consteval = True
-                return self.call_kernel(k, args, kws, is_lazy=True)
-            else:
-                try:
-                    ret = fn(*args, **kws)
-                    # TODO: check if returned value is valid
-                    return ConstexprValue(ret)
-                except CompilationError:
-                    raise
-                except Exception as e:
-                    return self.compile_error(
-                        f"error when calling consteval function '{fn.__name__}': {e}"
-                    )
+                return self.call_kernel(k, args, kws)
+            try:
+                ret = fn(*args, **kws)
+                # TODO: check if returned value is valid
+                return ConstexprValue(ret)
+            except CompilationError:
+                raise
+            except Exception as e:
+                return self.compile_error(
+                    f"error when calling consteval function '{fn.__name__}': {e}"
+                )
         fn_mod = getattr(fn, "__module__", type(fn).__module__)
         fn_name = getattr(fn, "__name__", type(fn).__name__)
         return self.compile_error(
@@ -2727,9 +2726,7 @@ class MLIRCodeGenerator(ast.NodeVisitor):
     def _check_recursive_call(self, key: str):
         if key in self._active_kernel_calls:
             chain = " -> ".join(self._active_kernel_calls + [key])
-            return self.compile_error(
-                f"Recursive kernel calls are not supported: {chain}"
-            )
+            self.compile_error(f"Recursive kernel calls are not supported: {chain}")
 
     def _build_kernel_call_operand(
         self, value: object, expected_ty: TypeBase, arg_name: str
@@ -2857,7 +2854,7 @@ class MLIRCodeGenerator(ast.NodeVisitor):
                 f"Invalid arguments for nested kernel '{nested.name}': expected at most {len(params)} positional arguments, got {len(args)}."
             )
 
-        bound = {name: value for name, value in zip(param_names, args)}
+        bound = dict(zip(param_names, args))
         for kw_name, kw_val in kws.items():
             if kw_name not in param_names:
                 return self.compile_error(
@@ -3030,7 +3027,7 @@ class MLIRCodeGenerator(ast.NodeVisitor):
             is_async=is_async,
         )
 
-    def call_kernel(self, fn: Kernel, args, kws, is_lazy=False, is_async=False):
+    def call_kernel(self, fn: Kernel, args, kws, is_async=False):
         """Lower/call a kernel specialization and decode structured return values."""
 
         key = self._kernel_call_key(fn)
@@ -3090,7 +3087,8 @@ class MLIRCodeGenerator(ast.NodeVisitor):
             is_async=is_async,
         )
 
-    def call_operator(self, fn: Operator | BoundOperator, args, kwargs={}):
+    def call_operator(self, fn: Operator | BoundOperator, args, kwargs=None):
+        kwargs = kwargs or {}
         if isinstance(fn, BoundOperator):
             args = fn.bind_args(args)
             fn = fn.op
@@ -3153,7 +3151,6 @@ class MLIRCodeGenerator(ast.NodeVisitor):
                 file_name=self.file_name,
                 begin_line=self.begin_line,
             )
-        return None
 
     statically_implemented_functions = {
         # dsl.static_assert: execute_static_assert,
@@ -3179,10 +3176,11 @@ class EnterSubRegion:
         self.generator.builder.restore_insertion_point(self.ip)
 
 
+# pylint: disable-next=redefined-builtin
 def compile(
     fn: Kernel,
-    arg_types: Sequence[TypeBase | str] = [],
-    res_types: Sequence[TypeBase | str] = [],
+    arg_types: Sequence[TypeBase | str] = (),
+    res_types: Sequence[TypeBase | str] = (),
     options: KernelOptions | None = None,
     show_traceback=False,
 ):
@@ -3212,6 +3210,8 @@ def compile(
         raise TypeError("Stream is not allowed as a kernel return type.")
     effective_options = fn.options if options is None else options
 
+    # the whole codegen is one unit; the handlers below rewrite any failure
+    # pylint: disable-next=too-many-try-statements
     try:
         context = Context()
         register_dialect(context)
@@ -3269,11 +3269,10 @@ def compile(
         # transfer the ownership of context to kernel
         fn.context = context
         return module
-    except (StaticAssertionError, CompilationError, InternalCompilerError) as exc:
+    except (CompilationError, InternalCompilerError) as exc:
         if show_traceback:
             raise
-        else:
-            raise exc.with_traceback(None) from None
+        raise exc.with_traceback(None) from None
     except Exception as exc:
         if show_traceback:
             raise

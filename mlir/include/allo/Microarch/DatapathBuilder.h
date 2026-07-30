@@ -3,23 +3,6 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-//===----------------------------------------------------------------------===//
-// DatapathBuilder: constructs the L2 `Datapath` model from a function carrying
-// materialized `allo.dcp.*` ops, in two composable phases:
-//
-//   * Allocation & binding: a `RegionBlock` per dcp region op, and the trivial
-//     resource binding (every compute op its own `FuncUnit`, every memref its
-//     own `MemUnit`, each literal a `ConstCell`, scalar args `IOPort`s).
-//     `bindResource` is the seam for non-trivial binding (sharing + muxes).
-//   * Interconnect derivation: `resolveOperand` applies the register-depth rule
-//     `d*II + (tY - tX) - lat`, and `insertRegister` materializes the
-//     shift-register chains.
-//
-// The build-time scratch maps (producerOf / ioOf / regionIdxOf / memOf) are
-// MEMBERS, not threaded arguments, so a new piece of build state is one more
-// member rather than one more parameter on every method.
-//===----------------------------------------------------------------------===//
-
 #ifndef ALLO_MICROARCH_DATAPATHBUILDER_H
 #define ALLO_MICROARCH_DATAPATHBUILDER_H
 
@@ -55,7 +38,7 @@ struct Resolved {
 //===----------------------------------------------------------------------===//
 struct DatapathBuilder {
   Datapath &dp;
-  func::FuncOp func;
+  dcp::DCPathModuleOp func;
 
   // Build-time scratch (NOT part of the result): value/op provenance maps.
   llvm::DenseMap<Value, MemId> memOf;
@@ -97,8 +80,8 @@ struct DatapathBuilder {
   const CalleeCtx *callees;    // child modules/ifaces for a dcp.instance
                                // (null for a plain leaf, no calls)
 
-  DatapathBuilder(Datapath &dp, func::FuncOp func, const BindingPolicy &policy,
-                  const MemoryLibrary &memLib,
+  DatapathBuilder(Datapath &dp, dcp::DCPathModuleOp func,
+                  const BindingPolicy &policy, const MemoryLibrary &memLib,
                   const CalleeCtx *callees = nullptr)
       : dp(dp), func(func), policy(policy), memLib(memLib), callees(callees) {}
 

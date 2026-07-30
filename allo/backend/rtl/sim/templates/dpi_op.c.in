@@ -1,3 +1,0 @@
-extern "C" long long {name}({params}) {{
-{binds}{body}
-}}

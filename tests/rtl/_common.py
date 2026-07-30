@@ -1,12 +1,7 @@
 # Copyright Allo authors. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Shared helpers for the RTL tests.
-
-The named latencies (``FADD``, ``FMUL``, ...) are read from the shipped built-in
-device, the one the RTL backend uses by default, so the II assertions read as the
-recurrence arithmetic they check while tracking the device's real numbers.
-"""
+"""Shared helpers for the RTL tests."""
 
 from __future__ import annotations
 
@@ -64,6 +59,125 @@ def _iis(regions):
     """Sorted IIs of ``regions``; a dynamic-trip sequential wrapper (``ii`` is
     ``None``) is skipped."""
     return sorted(r.ii for r in regions if r.ii is not None)
+
+
+def _impls(result):
+    """The IP modules the schedule binds ops to, across every region."""
+    return {o.impl for r in result.regions(wrappers=True) for o in r.ops if o.impl}
+
+
+def _outer(func, kind):
+    """``func``'s own outermost regions (depth 0) of ``kind``.
+
+    A region nested in a container is reported at a greater depth, so this is
+    the caller's own top-level structure rather than anything a child of it
+    contributes."""
+    return [r for r in func.regions if r.kind == kind and r.depth == 0]
+
+
+# --- structural reading of the scheduled DCP IR ------------------------------
+
+
+def _walk(root, name=None):
+    """Every op nested under ``root`` in program order, optionally only those
+    named ``name`` (a full op name, e.g. ``"allo.dcp.select"``)."""
+    op = getattr(root, "operation", root)
+    found = []
+    for region in op.regions:
+        for block in region.blocks:
+            for child in block.operations:
+                if name is None or child.operation.name == name:
+                    found.append(child.operation)
+                found += _walk(child, name)
+    return found
+
+
+def _attr(op, name):
+    """``op``'s ``name`` attribute as a plain Python value; a unit attribute,
+    which carries none, reads as itself."""
+    a = op.attributes[name]
+    return getattr(a, "value", a)
+
+
+class _Scope:
+    """A span of DCP IR read op by op: the whole module, or one kernel."""
+
+    def __init__(self, root):
+        self.root = root
+
+    def ops(self, name=None):
+        return _walk(self.root, name)
+
+    def count(self, name):
+        return len(_walk(self.root, name))
+
+    def has(self, name):
+        return bool(_walk(self.root, name))
+
+    def attrs(self, op_name, attr):
+        """The value of ``attr`` on every ``op_name`` op that carries it."""
+        return [_attr(o, attr) for o in self.ops(op_name) if attr in o.attributes]
+
+
+class Dcp(_Scope):
+    """The scheduled DCP module, read through the MLIR bindings.
+
+    The printed IR is a debugging aid, not an interface: nothing holds its
+    layout still. A structural assertion asks the module for its ops and their
+    attributes instead, and reaches for :class:`ScheduleResult` first for
+    anything the schedule already reports.
+    """
+
+    def __init__(self, rtl):
+        super().__init__(rtl.dcp_module)
+        self.kernels = {
+            _attr(op, "sym_name"): DcpFunc(op)
+            for op in _walk(self.root, "allo.dcp.module")
+        }
+
+    def func(self, name):
+        assert name in self.kernels, f"no kernel {name!r} in {list(self.kernels)}"
+        return self.kernels[name]
+
+
+class DcpFunc(_Scope):
+    """One scheduled kernel (an ``allo.dcp.module``).
+
+    Its callees are separate top-level kernels rather than nested bodies, so an
+    assertion made here is about this kernel's own span and cannot be satisfied
+    by one of its children.
+    """
+
+    def __init__(self, op):
+        super().__init__(op)
+        self.name = _attr(op, "sym_name")
+
+    def callees(self, *, spawned=None):
+        """The callee of each ``dcp.instance``, in program order. ``spawned``
+        selects only the `await` spawns (``True``) or only the sequenced calls
+        (``False``); an `allo.async` carrier is what marks a spawn."""
+        return [
+            _attr(i, "callee")
+            for i in self.ops("allo.dcp.instance")
+            if spawned is None or ("allo.async" in i.attributes) == spawned
+        ]
+
+    def arg_attrs(self, name):
+        """The value of argument attribute ``name`` on each argument carrying
+        it, in argument order."""
+        if "arg_attrs" not in self.root.attributes:
+            return []
+        return [d[name] for d in self.root.attributes["arg_attrs"] if name in d]
+
+    def accesses(self, memref):
+        """The scheduled loads and stores that reach ``memref`` (an SSA value),
+        in program order."""
+        return [
+            o
+            for o in self.ops()
+            if o.name in ("allo.dcp.load", "allo.dcp.store")
+            and any(v == memref for v in o.operands)
+        ]
 
 
 # --- structural reading of the emitted RTL -----------------------------------

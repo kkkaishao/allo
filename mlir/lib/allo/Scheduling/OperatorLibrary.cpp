@@ -6,7 +6,7 @@
 #include "allo/Scheduling/OperatorLibrary.h"
 
 #include "allo/IR/AlloOps.h"
-#include "allo/Scheduling/AddressCost.h" // addressDelayOf (per-site address)
+#include "allo/Scheduling/AddressModel.h" // addressDelayOf (per-site address)
 
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"

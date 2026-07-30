@@ -15,7 +15,9 @@ import pytest
 import allo
 from allo import kernel
 from allo.lang import i32, f32, f64, u8, index
+from allo.backend.rtl import RegionKind
 from tests.rtl._common import (
+    Dcp,
     _sched,
     _to_rtl,
     _iis,
@@ -578,7 +580,8 @@ def test_data_dependent_while_kernels():
     # A region nested in an scf.while reports an unknown execution count, so the
     # whole-kernel latency stays unknown.
     assert res.func("bfs_queue").latency is None
-    assert "scf.while" not in rtl.dcp and "allo.dcp.condition" in rtl.dcp
+    d = Dcp(rtl)
+    assert not d.has("scf.while") and d.has("allo.dcp.condition")
     guard = next(r for r in res.cyclic(wrappers=True) if r.conditional)
     assert guard.ii is None  # sequential (data-dependent length), no static II
 
@@ -940,7 +943,8 @@ def test_radix_sort():
                 valid_buffer = 0
 
     rtl = _to_rtl(ss_sort)
-    assert "dcp.select" in rtl.dcp  # the ping-pong closes into a result-mux guard
+    # the ping-pong closes into a result-mux guard
+    assert rtl.schedule().regions(RegionKind.GUARD, wrappers=True)
 
     a = np.random.default_rng(0).integers(0, 256, SIZE).astype(np.int32)
     gold = np.sort(a)
@@ -987,7 +991,7 @@ def test_bfs_bulk():
                 level_counts[horizon + 1] = cnt
 
     rtl = _to_rtl(bfs_bulk)
-    assert "dcp.select" in rtl.dcp
+    assert rtl.schedule().regions(RegionKind.GUARD, wrappers=True)
 
     nodes = np.zeros(N_NODES * 2, np.int32)
     nodes[0], nodes[1] = 0, 7  # node 0 owns edges[0:7]

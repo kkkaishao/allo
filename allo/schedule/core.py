@@ -88,6 +88,8 @@ class BindStorageType(Enum):
     FIFO = "fifo"
 
 
+# one public method per schedule primitive
+# pylint: disable-next=too-many-public-methods
 class Schedule(Generic[P, R]):
     """Lazy schedule frontend: primitives accumulate a reusable transform program
     (``@sched(%root)``) and a predicted snapshot; ``apply()`` runs the program once.
@@ -164,6 +166,8 @@ class Schedule(Generic[P, R]):
     def __str__(self) -> str:
         return self.payload.__str__()
 
+    # `backend` leads the kernel arguments; that is the documented call shape.
+    # pylint: disable-next=keyword-arg-before-vararg
     def __call__(self, backend: str = "cpu", *args: P.args, **kwargs: P.kwargs) -> R:
         if self.kernel is None:
             raise ScheduleError("Cannot call a schedule without a source kernel")
@@ -233,11 +237,11 @@ class Schedule(Generic[P, R]):
             from ..backend import CPU
 
             return CPU(kernel, **kwargs)
-        elif backend == "vitis":
+        if backend == "vitis":
             from ..backend.vitis import Vitis
 
             return Vitis(kernel, **kwargs)
-        elif backend == "rtl":
+        if backend == "rtl":
             from ..backend.rtl import RTL
 
             return RTL(kernel, **kwargs)
@@ -577,7 +581,7 @@ class Schedule(Generic[P, R]):
             raise InvalidScheduleArgumentError("reorder targets must be unique")
 
         desired_pred = [self._pred(loop) for loop in desired]
-        current = sorted(desired_pred, key=lambda op: self.predicted.depth(op))
+        current = sorted(desired_pred, key=self.predicted.depth)
         current_keys = [(op.scope, op.key) for op in current]
         permutation = [current_keys.index((op.scope, op.key)) for op in desired_pred]
 
@@ -825,6 +829,7 @@ class Schedule(Generic[P, R]):
 
     materialize = apply
 
+    # pylint: disable-next=redefined-builtin
     def _copy_symbol(self, name: str, id=None) -> str:
         """Callee-copy symbol for a stage kernel: ``{primary}.{name}[.{id}]``
         (the same scheme ``compose`` uses for repeat copies)."""
@@ -899,6 +904,8 @@ class Schedule(Generic[P, R]):
         self._mark_dirty()
         return self
 
+    # `id` names the callee copy; it is part of the documented schedule API.
+    # pylint: disable-next=redefined-builtin
     def compose(self, *callees: Schedule, id=None) -> Schedule:
         """Apply each ``callee``'s whole schedule to the specialized copy of that kernel
         inside this kernel. Pass several direct callees to compose them in one call:
@@ -922,6 +929,7 @@ class Schedule(Generic[P, R]):
             self._compose(callee, id)
         return self
 
+    # pylint: disable-next=redefined-builtin
     def _compose(self, callee: Schedule, id) -> None:
         copy_key = self._copy_symbol(callee._primary_name, id)
         # Resolve the top-level copy up front so a missing callee always reports, even

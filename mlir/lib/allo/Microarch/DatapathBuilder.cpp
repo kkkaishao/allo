@@ -9,14 +9,14 @@
 #include "allo/Microarch/Reservation.h" // verifyBinding (MRT legality)
 
 #include "allo/IR/AlloOps.h"
-#include "allo/Scheduling/AddressCost.h"   // splitAddress (strength reduction)
+#include "allo/Scheduling/AddressModel.h"  // splitAddress (strength reduction)
+#include "allo/Scheduling/LatencyModel.h"  // composeSpan (the one composer)
 #include "allo/Scheduling/MemoryAccess.h"  // resolveRoot (storage identity)
 #include "allo/Scheduling/MemoryModel.h"   // characterize (storage shape)
 #include "allo/Support/Logging.h"          // unmodelled-op diagnostic
 #include "allo/Translation/EmitterState.h" // nameFromLoc, sanitizeCppIdentifier
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
-#include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h" // memref::GetGlobalOp/GlobalOp (ROM)
 #include "mlir/IR/BuiltinAttributes.h"
 #include "llvm/ADT/MapVector.h"
@@ -126,8 +126,9 @@ static bool isTransientDin(Value v) {
     return false;
   if (isa<dcp::DCPathLoadOp>(def))
     return true;
-  // Stable producers: a FIFO head, a nested region's survivor, a constant.
-  if (isa<StreamGetOp, dcp::DCPathPipelineOp, dcp::DCPathSequentialOp,
+  // Stable producers: a FIFO head, a nested region's survivor (any of the three
+  // region ops, which is what the interface names), a call result, a constant.
+  if (isa<StreamGetOp, dcp::DCPathRegionOpInterface, dcp::DCPathInstanceOp,
           arith::ConstantOp>(def))
     return false;
   if (dcpLatency(def) == 0)
@@ -253,10 +254,7 @@ RegionBlock DatapathBuilder::addRegion(Operation *regionOp, RegionId ridx) {
   // an inner loop). The nearest enclosing region op is the parent, already
   // processed by this pre-order walk, so it runs its children hierarchically.
   Operation *p = regionOp->getParentOp();
-  while (
-      p &&
-      !isa<dcp::DCPathPipelineOp, dcp::DCPathSequentialOp, dcp::DCPathSelectOp>(
-          p))
+  while (p && !isa<dcp::DCPathRegionOpInterface>(p))
     p = p->getParentOp();
   if (p) {
     unsigned pidx = regionIdxOf.lookup(p);
@@ -304,40 +302,35 @@ RegionBlock DatapathBuilder::addRegion(Operation *regionOp, RegionId ridx) {
     rb.kind = RegionBlock::Kind::Acyclic;
   }
 
-  // Declared composition class + single-run latency, so the composer dispatches
-  // on a declared property rather than re-deriving region shape. A
-  // `counted_static` guard may carry no `latency` and hands off by handshake.
-  if (auto d = regionOp->getAttrOfType<DeterminacyEnumAttr>("determinacy"))
-    rb.determinacy = d.getValue();
-  // A CONCURRENT region's `latency` is not a single-run span: its children run
-  // to their own completion, ordered by back-pressure, so the number is a floor
-  // and not a hand-off contract.
-  if (auto lat = regionOp->getAttrOfType<IntegerAttr>("latency"))
-    if (rb.determinacy != DeterminacyEnum::Concurrent &&
-        !regionOp->hasAttr("latency_bound"))
-      rb.staticLatency = lat.getInt();
-  assert((!rb.staticLatency.has_value() ||
-          rb.determinacy == DeterminacyEnum::CountedStatic) &&
-         "a region with a static latency must be declared counted_static");
+  // Composition class, DERIVED from the region rather than read back off its
+  // attribute, which the reifier stamps from this very function.
+  rb.determinacy = dcpRegionTiming(regionOp).determinacy;
+  // The one number that IS read back, on purpose: the model's claim about this
+  // region's terminal cycle, which `emitRegion` holds the datapath to.
+  if (std::optional<uint64_t> d =
+          cast<dcp::DCPathRegionOpInterface>(regionOp).getDrain())
+    rb.modelledDrain = static_cast<int64_t>(*d);
   return rb;
 }
 
-// The ONE derivation of the controller discriminant's structural axis. The
-// emitter's dispatch and the validator's legality rules both read `rb.shape`;
-// neither re-derives it from `children` / `guard` / `callUnits`. Order matters:
-// a guard is a guard whichever arms it has, a region with child regions
-// sequences them, and only then does a lone-call counted loop become the
-// instance-substrate hand-off.
+// The controller discriminant's structural axis, taken from `dcpRegionShape`
+// so that the emitter's dispatch, the validator's legality rules and the
+// latency composer read one answer.
+//
+// The BUILT model reaches the same answer down a different path, off linked
+// parent/child edges and bound CallUnits. Asserting the two agree catches a
+// region op and the model built from it describing different hardware.
 void DatapathBuilder::deriveShapes() {
   for (RegionBlock &rb : dp.regions) {
-    if (rb.guard)
-      rb.shape = RegionBlock::Shape::Guard;
-    else if (!rb.children.empty())
-      rb.shape = RegionBlock::Shape::Container;
-    else if (rb.kind == RegionBlock::Kind::Cyclic && !rb.callUnits.empty())
-      rb.shape = RegionBlock::Shape::CallNode;
-    else
-      rb.shape = RegionBlock::Shape::Leaf;
+    rb.shape = dcpRegionShape(rb.op);
+    [[maybe_unused]] RegionBlock::Shape modelled =
+        rb.guard               ? RegionBlock::Shape::Guard
+        : !rb.children.empty() ? RegionBlock::Shape::Container
+        : (rb.kind == RegionBlock::Kind::Cyclic && !rb.callUnits.empty())
+            ? RegionBlock::Shape::CallNode
+            : RegionBlock::Shape::Leaf;
+    assert(rb.shape == modelled &&
+           "the region op's shape disagrees with the built model's");
 
     // The invariants each shape carries, stated where the shape is decided
     // rather than at the consumer that would otherwise trip over them.
@@ -493,14 +486,16 @@ void DatapathBuilder::bindCompute(dcp::DCPathComputeOp comp, RegionBlock &rb) {
     u.latency = 0;
     u.pipelined = true;
   } else {
-    // IP: `op_type` is the operator's sym_name = the RTL module name; its
-    // timing + stall contract are stamped onto the compute at emit
-    // (`stampOperatorTiming`).
+    // IP: `op_type` is the operator's sym_name = the RTL module name, and the
+    // declaration it names is the one copy of its timing and stall contract.
+    auto opr = SymbolTable::lookupNearestSymbolFrom<dcp::DCPathOperatorOp>(
+        comp, comp.getOpTypeAttr());
+    assert(opr && "a dcp.compute op_type must reference a live dcp.operator");
     u.impl = comp.getOpTypeAttr().getValue().str();
     u.opType = u.impl;
-    u.latency = dcpLatency(comp);
-    u.pipelined = comp->getAttrOfType<BoolAttr>("pipelined").getValue();
-    u.stall = comp->getAttrOfType<StallContractEnumAttr>("stall").getValue();
+    u.latency = static_cast<unsigned>(opr.getLatency());
+    u.pipelined = opr.getPipelined();
+    u.stall = opr.getStall();
   }
   u.resultType = comp.getResult().getType();
   // The unit's reservation slot: its issue cycle, taken modulo II in a cyclic
@@ -535,8 +530,7 @@ void DatapathBuilder::bindResource(Operation *op, RegionBlock &rb) {
 
   // A nested region op (a loop wrapper, or a dcp.select guard) is a child
   // region, walked in its own iteration.
-  if (isa<dcp::DCPathPipelineOp, dcp::DCPathSequentialOp, dcp::DCPathSelectOp>(
-          op))
+  if (isa<dcp::DCPathRegionOpInterface>(op))
     return;
   // Literals are pre-registered as ConstCells (see collectConstants).
   if (isa<arith::ConstantOp>(op))
@@ -641,6 +635,16 @@ void DatapathBuilder::recordCallDeps() {
   auto shares = [](ArrayRef<MemId> a, ArrayRef<MemId> b) {
     return llvm::any_of(a, [&](MemId m) { return llvm::is_contained(b, m); });
   };
+  // Two children joined by a CHANNEL, which back-pressure alone can order: they
+  // are co-resident and the downstream one drains the queue the upstream one
+  // fills, so waiting for the producer deadlocks on a queue shorter than run.
+  auto channelled = [](const CallUnit &a, const CallUnit &b) {
+    return llvm::any_of(a.streamArgs, [&](const CallUnit::StreamArg &x) {
+      return llvm::any_of(b.streamArgs, [&](const CallUnit::StreamArg &y) {
+        return x.chan == y.chan;
+      });
+    });
+  };
   for (const RegionBlock &rb : dp.regions) {
     bool concurrent = rb.determinacy == DeterminacyEnum::Concurrent;
     for (auto [i, cid] : llvm::enumerate(rb.callUnits)) {
@@ -655,13 +659,14 @@ void DatapathBuilder::recordCallDeps() {
       };
       for (unsigned j = 0; j < i; ++j) {
         const CallUnit &p = dp.calls[rb.callUnits[j]];
-        // A CONCURRENT container places every child at 0, so the hazard
-        // DIRECTION (RAW / WAW / WAR) is the whole ordering. A SCHEDULED one
-        // orders by `start`: gate an earlier or indeterminate neighbour only.
+        // A CONCURRENT container places every child at 0, so hazard DIRECTION
+        // (RAW / WAW / WAR) is the whole ordering, between children the
+        // channels do not order. A SCHEDULED one orders by `start`.
         bool hazard =
             concurrent
-                ? (shares(memsOf(p, true), memsOf(cu, std::nullopt)) ||
-                   shares(memsOf(cu, true), memsOf(p, false)))
+                ? !channelled(p, cu) &&
+                      (shares(memsOf(p, true), memsOf(cu, std::nullopt)) ||
+                       shares(memsOf(cu, true), memsOf(p, false)))
                 : (p.start < cu.start || !p.latency) &&
                       shares(memsOf(p, std::nullopt), memsOf(cu, std::nullopt));
         if (hazard)
@@ -744,8 +749,7 @@ Source DatapathBuilder::resolveValue(Value v) {
     // A nested region's result: the survivor register the producing region
     // latched it into, and the ONLY channel a value leaves a region by. A loop
     // bound, a carried next-value and a data operand all cross it.
-    if (isa<dcp::DCPathPipelineOp, dcp::DCPathSequentialOp,
-            dcp::DCPathSelectOp>(def))
+    if (isa<dcp::DCPathRegionOpInterface>(def))
       return Source{Source::Kind::Survivor, regionIdxOf.lookup(def),
                     cast<OpResult>(v).getResultNumber()};
     return {}; // an unmodelled producer
@@ -857,7 +861,7 @@ void DatapathBuilder::bindIOArgs() {
 }
 
 void DatapathBuilder::recordResults() {
-  auto ret = cast<func::ReturnOp>(func.front().getTerminator());
+  auto ret = cast<dcp::DCPathOutputOp>(func.getBody().front().getTerminator());
   for (auto [i, v] : llvm::enumerate(ret.getOperands())) {
     assert(!isa<MemRefType>(v.getType()) &&
            "a memref result should be an out-param by emit "
@@ -1450,6 +1454,14 @@ void DatapathBuilder::applyBinding(ArrayRef<SmallVector<UnitId, 2>> groups) {
 // in an earlier one (a scalar survivor handed between siblings). The emitter
 // starts a predecessor-free region concurrently with the kernel `start` and
 // gates the rest on their producers' joined `done`.
+//
+// `siblingPredecessors` answers the same question for the latency model and is
+// NOT shared with this. It works off the IR, where a memref operand is a touch
+// whether or not the region reaches storage through it, so it
+// over-approximates; this works off the BUILT model, where a MemUnit access and
+// a CallUnit's mastered memrefs say which regions reach which storage. The
+// model wants the superset: a spurious edge there only lengthens a span, while
+// one HERE would serialize real hardware.
 void DatapathBuilder::recordSiblingDeps(ArrayRef<Operation *> regionOps) {
   // Top-level ancestor of a region (walk the container chain to the root).
   auto topOf = [&](RegionId r) {
@@ -1530,6 +1542,30 @@ void DatapathBuilder::recordSiblingDeps(ArrayRef<Operation *> regionOps) {
           addPred(dit->second, consumer);
       }
   });
+
+  // The two relations, diffed. `siblingPredecessors` must be a SUPERSET, and
+  // each edge beyond this one is a pair the span serializes and the hardware
+  // overlaps: a cycle the published latency counts and never spends.
+  if (!logging::detail::enabled(Level::Debug))
+    return;
+  SmallVector<RegionId> topIds;
+  SmallVector<SmallVector<Operation *>> nodeOps;
+  for (Operation *regionOp : regionOps) {
+    RegionId rid = regionIdxOf.lookup(regionOp);
+    if (dp.regions[rid].parent)
+      continue;
+    topIds.push_back(rid);
+    nodeOps.push_back({regionOp});
+  }
+  auto modelled = siblingPredecessors(nodeOps);
+  for (auto [i, rid] : llvm::enumerate(topIds))
+    for (unsigned p : modelled[i])
+      if (!llvm::is_contained(dp.regions[rid].predecessors, topIds[p]))
+        debug(Stage::Emit, dp.regions[rid].op)
+            << "Latency model orders region " << topIds[p] << " before region "
+            << rid
+            << ", the built model does not: the composed span pays for "
+               "a hand-off the hardware overlaps";
 }
 
 //===----------------------------------------------------------------------===//
@@ -1545,10 +1581,8 @@ void DatapathBuilder::build() {
   // processed before its nested children (the parent/child linkage and the
   // outer-index counter attribution rely on parent-before-child).
   SmallVector<Operation *> regionOps;
-  func.walk<WalkOrder::PreOrder>([&](Operation *op) {
-    if (isa<dcp::DCPathPipelineOp, dcp::DCPathSequentialOp,
-            dcp::DCPathSelectOp>(op))
-      regionOps.push_back(op);
+  func.walk<WalkOrder::PreOrder>([&](dcp::DCPathRegionOpInterface region) {
+    regionOps.push_back(region);
   });
 
   // Scalar-argument IO ports: one of the maps `resolveValue` reads, so every

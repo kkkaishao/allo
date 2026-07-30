@@ -35,8 +35,4 @@ def Stream : Allo_Type<"Stream"> {
   let genVerifyDecl = 1;
 }
 
-// ISA buffer/pattern types are generated through this single typedef unit so the
-// dialect emits exactly one parseType/printType dispatch.
-include "allo/IR/AlloISATypes.td"
-
 #endif // ALLO_TYPES

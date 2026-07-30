@@ -312,8 +312,7 @@ def AssignBanksPass : Pass<"assign-banks", "func::FuncOp"> {
   }];
 }
 
-def ResolveBankingPass
-    : Pass<"dcp-resolve-banking", "func::FuncOp"> {
+def ResolveBankingPass : Pass<"dcp-resolve-banking"> {
   let summary = "Split a statically-banked partitioned array into per-bank memrefs";
   let description = [{
     A DCP-normalization pass, the only one, run between

@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-#include "allo/Microarch/Verify.h"
+#include "allo/Microarch/Verification.h"
 
 #include "allo-c/Schedule.h"           // kPartitionAttr
 #include "allo/Microarch/Naming.h"     // operatorModuleName
@@ -24,16 +24,16 @@ namespace mlir::allo::uarch {
 // 1. Model well-formedness.
 //===----------------------------------------------------------------------===//
 
-// A scheduled datapath always holds at least one region: emission only visits
-// functions `hasDCPRegions` accepted, and the builder's region walk collects a
-// superset of that predicate.
-LogicalResult verifyDatapath(func::FuncOp func, const Datapath &dp) {
+// A scheduled datapath always holds at least one region: a `dcp.module` is what
+// a reified kernel closes into, and the builder's region walk collects every
+// region the reify put in one.
+LogicalResult verifyDatapath(dcp::DCPathModuleOp func, const Datapath &dp) {
   // Supported subset: top-level siblings in program order, plus container
   // loops whose children sequence within one outer iteration (crossing as a
   // survivor register).
-  assert(!dp.regions.empty() && "a scheduled function has no schedulable "
-                                "region; the builder's region walk and "
-                                "hasDCPRegions disagree");
+  assert(!dp.regions.empty() &&
+         "a scheduled kernel has no schedulable region; the builder's region "
+         "walk found none where the reify built at least one");
   // The builder already reported the offending edge; fail before any
   // hardware is built from the placeholder depths it left.
   if (dp.infeasible)
@@ -66,7 +66,8 @@ LogicalResult verifyDatapath(func::FuncOp func, const Datapath &dp) {
 // 2. Device-contract limits.
 //===----------------------------------------------------------------------===//
 
-LogicalResult checkDeviceCapability(func::FuncOp func, const Datapath &dp) {
+LogicalResult checkDeviceCapability(dcp::DCPathModuleOp func,
+                                    const Datapath &dp) {
   // Access latencies the emitted structure cannot realize. These are device
   // rows the SCHEDULER honors, so silently emitting a 1-cycle port instead
   // would place every consumer of that array on the wrong cycle.
@@ -128,55 +129,32 @@ LogicalResult checkDeviceCapability(func::FuncOp func, const Datapath &dp) {
 // emits is a child guard's predicate before the children run. That is why the
 // check below is what a unit READS rather than whether units exist.
 //
-// Only the level-pipelined (Phase B) schedule produces a counted container
-// with datapath: it fuses the level's leaf ops into the outer pipeline, at
-// their own cycles between the children. The sequential decomposition wraps
-// each of those runs in its own child region instead, so every other path
-// lands a container whose body is nothing but declarations.
-//
-// Without this check the failure is silent or a crash: an external store
-// leaves its boundary port undriven (a null operand reaching
-// `Operation::create`), and a compute over a child's result reads that
-// child's survivor before the child has emitted.
+// An INVARIANT, not a legality check: the reifier wraps every run of loose ops
+// between a level's child loops in its own child region, so a counted container
+// only ever holds declarations and predicates. Were one to arrive with work of
+// its own, an external store would leave its boundary port undriven (a null
+// operand reaching `Operation::create`) and a compute over a child's result
+// would read that child's survivor before the child has emitted.
 //
 // A CONDITIONAL container is a different controller: `emitConditionalContainer`
 // emits its own condition cone (`emitConditionRegion`), so its reads and units
 // are expected. Its writes and stream accesses are not emitted, but no
 // frontend shape puts one in a while condition, so that stays a gap rather
 // than a check.
-static LogicalResult checkContainerOwnsNoDatapath(const RegionBlock &rb,
-                                                  const Datapath &dp) {
-  auto reject = [&](Operation *op, StringRef what) {
-    unsupported(Stage::Emit, op ? op : rb.op)
-        << "A loop that both nests inner loops and carries " << what
-        << " of its own is not lowered yet: the container controller sequences "
-           "its children and runs no schedule, so this work has no cycle to "
-           "issue on. Leave `unroll_under_pipeline` at its default, which "
-           "unrolls the inner loops into the pipelined level instead";
-    return failure();
-  };
-  if (!rb.memAccesses.empty())
-    return reject(dp.mems[rb.memAccesses.front().id]
-                      .accesses[rb.memAccesses.front().idx]
-                      .op,
-                  "a memory access");
-  if (!rb.streamAccesses.empty())
-    return reject(dp.streams[rb.streamAccesses.front().id]
-                      .accesses[rb.streamAccesses.front().idx]
-                      .op,
-                  "a stream access");
-  if (!rb.callUnits.empty())
-    return reject(dp.calls[rb.callUnits.front()].invoke, "a sub-kernel call");
+[[maybe_unused]] static bool containerOwnsNoDatapath(const RegionBlock &rb,
+                                                     const Datapath &dp) {
+  if (!rb.memAccesses.empty() || !rb.streamAccesses.empty() ||
+      !rb.callUnits.empty())
+    return false;
   for (UnitId uid : rb.units)
     for (const Source &s : dp.units[uid].inputs)
       if (s.kind == Source::Kind::Survivor &&
           llvm::is_contained(rb.children, s.id))
-        return reject(dp.units[uid].repOp(), "a computation over an inner "
-                                             "loop's result");
-  return success();
+        return false;
+  return true;
 }
 
-LogicalResult checkEmitterSubset(func::FuncOp func, const Datapath &dp) {
+LogicalResult checkEmitterSubset(dcp::DCPathModuleOp func, const Datapath &dp) {
   // Region shapes. Mirrors `emitRegion`'s dispatch, reading the same stored
   // discriminant rather than re-deriving it.
   for (const RegionBlock &rb : dp.regions) {
@@ -196,9 +174,10 @@ LogicalResult checkEmitterSubset(func::FuncOp func, const Datapath &dp) {
         "a loop body holding a sub-kernel call alongside other work reached "
         "the leaf loop-over-calls controller; the scheduler must decompose "
         "it into sub-regions");
-    if (rb.shape == RegionBlock::Shape::Container && !rb.conditional &&
-        failed(checkContainerOwnsNoDatapath(rb, dp)))
-      return failure();
+    assert((rb.shape != RegionBlock::Shape::Container || rb.conditional ||
+            containerOwnsNoDatapath(rb, dp)) &&
+           "a counted container reached emission carrying work of its own; the "
+           "reifier gives every run of loose ops a child region");
   }
 
   // `verify-rtl-legality` owns the shapes a CONCURRENT container admits (no
@@ -342,7 +321,7 @@ static void assertStructuralInvariants(const Datapath &dp) {
 #endif
 }
 
-LogicalResult validateDatapath(func::FuncOp func, const Datapath &dp) {
+LogicalResult validateDatapath(dcp::DCPathModuleOp func, const Datapath &dp) {
   if (failed(verifyDatapath(func, dp)) ||
       failed(checkDeviceCapability(func, dp)) ||
       failed(checkEmitterSubset(func, dp)))

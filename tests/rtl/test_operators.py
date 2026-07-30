@@ -19,7 +19,7 @@ from allo.operators import arith as allo_arith
 from allo.backend.rtl.device import builtin_device, MemoryKind
 
 sys.path.insert(0, os.path.dirname(__file__))
-from _common import _sched, _to_rtl, FADD  # noqa: E402
+from _common import Dcp, _sched, _to_rtl, _impls, FADD  # noqa: E402
 
 pytestmark = pytest.mark.skipif(
     shutil.which("verilator") is None, reason="verilator not available"
@@ -75,7 +75,7 @@ def test_operator_ip_overlay_shifts_schedule():
 
     r0 = addk.schedule().export("rtl")
     lat0 = r0.schedule().func("addk").latency
-    assert "fadd_fast" not in r0.dcp
+    assert "fadd_fast" not in Dcp(r0).attrs("allo.dcp.operator", "sym_name")
 
     @ip(
         name="fadd_fast",
@@ -96,8 +96,8 @@ def test_operator_ip_overlay_shifts_schedule():
     r1 = addk2.schedule().export("rtl", device=dev)
     lat1 = r1.schedule().func("addk2").latency
 
-    assert "dcp.operator @fadd_fast" in r1.dcp
-    assert "dcp.compute @fadd_fast" in r1.dcp
+    assert "fadd_fast" in Dcp(r1).attrs("allo.dcp.operator", "sym_name")
+    assert "fadd_fast" in _impls(r1.schedule())
     assert lat0 is not None and lat1 is not None
 
 
@@ -184,10 +184,10 @@ def test_free_running_operator_cosim():
     dev.add_operator(fadd_free)  # last-wins: overrides the built-in fadd
     rtl = _to_rtl(addk, device=dev)
     # The manifest declares each instantiated operator's realized port shape.
-    ops = [o for i in rtl.interfaces.values() for o in i["operators"]]
-    free = [o for o in ops if o["module"] == "fadd_free"]
+    ops = [o for i in rtl.interfaces.values() for o in i.operators]
+    free = [o for o in ops if o.module == "fadd_free"]
     assert free, "the free operator was not instantiated"
-    names = [p["name"] for p in free[0]["ports"]]
+    names = [p.name for p in free[0].ports]
     assert "ce" not in names, f"a free-running extern must carry no ce: {names}"
 
     rng = np.random.default_rng(3)
@@ -330,7 +330,8 @@ def test_float_max_with_ip_kept_cosim():
     rtl = _to_rtl(fmax_keep, device=dev)
     kinds = {o.kind for r in rtl.schedule().func("fmax_keep").regions for o in r.ops}
     assert not (kinds & {"cmpf", "select"})  # kept as one op, not expanded
-    assert "dcp.operator @fmax_ip" in rtl.dcp and "dcp.compute @fmax_ip" in rtl.dcp
+    assert "fmax_ip" in Dcp(rtl).attrs("allo.dcp.operator", "sym_name")
+    assert "fmax_ip" in _impls(rtl.schedule())
 
     rng = np.random.default_rng(6)
     A = (rng.random(N, dtype=np.float32) - np.float32(0.5)).astype(np.float32)
@@ -364,9 +365,9 @@ def test_max_maxnum_split_binds_distinctly():
         for i in range(N):
             o[i] = allo_arith.max(A[i], B[i], propagate_nan=False)  # arith.maxnumf
 
-    assert "dcp.compute @fmax_ip" in _to_rtl(kmaximumf, device=dev).dcp  # bound
+    assert "fmax_ip" in _impls(_to_rtl(kmaximumf, device=dev).schedule())  # bound
     maxnum = _to_rtl(kmaxnumf, device=dev)
-    assert "dcp.compute @fmax_ip" not in maxnum.dcp  # NOT bound to the max IP
+    assert "fmax_ip" not in _impls(maxnum.schedule())  # NOT bound to the max IP
     k = {o.kind for r in maxnum.schedule().func("kmaxnumf").regions for o in r.ops}
     assert "cmpf" in k and "select" in k  # expanded instead
 

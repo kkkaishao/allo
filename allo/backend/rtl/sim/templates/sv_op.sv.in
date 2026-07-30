@@ -1,9 +1,0 @@
-module {name}({ports});
-  reg [{msb}:0] p [0:{last}];
-  integer i;
-  always @(posedge {clk}) {guard}begin
-    p[0] <= {call};
-    for (i = 1; i < {latency}; i = i + 1) p[i] <= p[i - 1];
-  end
-  assign {out_name} = p[{last}];
-endmodule

@@ -52,6 +52,8 @@ class CmpPred(Enum):
     GE = 5
 
 
+# one public method per MLIR op this frontend can emit
+# pylint: disable-next=too-many-instance-attributes,too-many-public-methods
 class AlloOpBuilder:
     """IR construction helper backed by upstream `allo._mlir`.
 
@@ -158,6 +160,8 @@ class AlloOpBuilder:
     def create_const_float(self, value: float, dtype: DType) -> AlloValue:
         ir_ty = dtype.materialize(self.context)
         return AlloValue(
+            # the MLIR op builders take an extension __init__ that pylint cannot see
+            # pylint: disable-next=too-many-function-args
             arith.ConstantOp(ir_ty, float(value), ip=self._ip, loc=self._loc).result,
             dtype,
         )
@@ -179,6 +183,7 @@ class AlloOpBuilder:
         assert dtype.is_int_signless()
         ir_ty = dtype.materialize(self.context)
         return AlloValue(
+            # pylint: disable-next=too-many-function-args
             arith.ConstantOp(
                 ir_ty, self._checked_int_const(value, dtype), ip=self._ip, loc=self._loc
             ).result,
@@ -188,6 +193,7 @@ class AlloOpBuilder:
     def create_const_index(self, value: int) -> AlloValue:
         ir_ty = ir.IndexType.get(self.context)
         return AlloValue(
+            # pylint: disable-next=too-many-function-args
             arith.ConstantOp(ir_ty, int(value), ip=self._ip, loc=self._loc).result,
             index,
         )
@@ -277,6 +283,7 @@ class AlloOpBuilder:
             return AlloValue(
                 # arith.ConstantOp accepts an Attribute value at runtime, but the
                 # upstream stub types `value` as int|float|array only.
+                # pylint: disable-next=too-many-function-args
                 arith.ConstantOp(
                     self._materialize(dst_type), dense_attr, ip=self._ip, loc=self._loc  # type: ignore[arg-type]
                 ).result,
@@ -1040,27 +1047,27 @@ class AlloOpBuilder:
     # Memory operations
     ###########################
 
-    def make_buffer(self, type: ShapedType) -> AlloValue:
-        if isinstance(type, BufferType):
+    def make_buffer(self, buffer_type: ShapedType) -> AlloValue:
+        if isinstance(buffer_type, BufferType):
             op = memref.AllocOp(
-                self._materialize(type), [], [], ip=self._ip, loc=self._loc
+                self._materialize(buffer_type), [], [], ip=self._ip, loc=self._loc
             )
             # Tag element signedness for backend codegen (mirrors create_stream);
             # MLIR integers are signless, so this marker is the only record of
             # whether a body-local buffer holds signed data.
             op.operation.attributes[allo_d.SIGNED_ATTR_NAME] = self.get_string_attr(
-                "s" if type.dtype.is_int() else "u"
+                "s" if buffer_type.dtype.is_int() else "u"
             )
-            return AlloValue(op.result, type)
-        if isinstance(type, TensorType):
+            return AlloValue(op.result, buffer_type)
+        if isinstance(buffer_type, TensorType):
             op = tensor.EmptyOp(
-                list(type.shape),
-                self._materialize(type.dtype),
+                list(buffer_type.shape),
+                self._materialize(buffer_type.dtype),
                 ip=self._ip,
                 loc=self._loc,
             )
-            return AlloValue(op.result, type)
-        assert False, f"Unsupported shaped type: {type}"
+            return AlloValue(op.result, buffer_type)
+        assert False, f"Unsupported shaped type: {buffer_type}"
 
     def fill_buffer(self, buffer: AlloValue, value: AlloValue):
         assert isinstance(buffer.type, ShapedType)
@@ -1077,6 +1084,8 @@ class AlloOpBuilder:
             op = memref.LoadOp(lhs.handle, index_values, ip=self._ip, loc=self._loc)
             return AlloValue(op.result, lhs.dtype)
         if isinstance(lhs.type, TensorType):
+            # the two branches are mutually exclusive
+            # pylint: disable-next=redefined-variable-type
             op = tensor.ExtractOp(lhs.handle, index_values, ip=self._ip, loc=self._loc)
             return AlloValue(op.result, lhs.dtype)
         assert False, f"Unsupported shaped type: {lhs.type}"
@@ -1128,7 +1137,6 @@ class AlloOpBuilder:
             ip=self._ip,
             loc=self._loc,
         )
-        return None
 
     def create_affine_for(
         self,
@@ -1196,4 +1204,3 @@ class AlloOpBuilder:
         allo_d.StreamPutOp(
             handle, index_values, value.handle, ip=self._ip, loc=self._loc
         )
-        return None

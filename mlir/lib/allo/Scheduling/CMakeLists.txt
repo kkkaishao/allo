@@ -22,16 +22,17 @@ if(ALLO_ENABLE_ORTOOLS)
 endif()
 
 add_mlir_library(MLIRAlloScheduling
-    AddressCost.cpp
+    AddressModel.cpp
     CPSATScheduler.cpp
     DependenceAnalysis.cpp
     Footprint.cpp
-    HierarchicalDependence.cpp
+    LatencyModel.cpp
     MemoryAccess.cpp
     MemoryModel.cpp
     OperatorLibrary.cpp
     ProblemBuilder.cpp
     RegionGraph.cpp
+    ScheduleModel.cpp
     Scheduler.cpp
     PreVerification.cpp
     SDC.cpp

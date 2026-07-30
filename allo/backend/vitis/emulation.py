@@ -14,12 +14,13 @@ from __future__ import annotations
 
 import os
 
+from collections.abc import Mapping
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any
 
 import numpy as np
 
-from .csim import _numpy_dtype_for_dtype
+from ..utils import dtype_to_numpy_dtype
 from .utils import _render_template
 from ...lang.core import APInt, BufferType, DType, TypeBase
 from ...logging import run_command, stage
@@ -71,7 +72,7 @@ def _validate_impl_dtype(dtype: TypeBase, index: int) -> None:
 
 def _element_bytes(dtype: DType) -> int:
     """Host byte size of one element of ``dtype`` (its standard-width container)."""
-    return int(np.dtype(_numpy_dtype_for_dtype(dtype)).itemsize)
+    return int(np.dtype(dtype_to_numpy_dtype(dtype)).itemsize)
 
 
 def _buffer_bytes(buffer_type: BufferType) -> int:
@@ -138,7 +139,7 @@ def generate_impl_makefile(top: str, freq_mhz: float, vitis_root: Path) -> str:
     """Render ``impl.mk`` (the emulation/hardware Makefile) for ``top``."""
     # v++ --kernel_frequency expects an integer MHz.
     freq = int(freq_mhz) if float(freq_mhz).is_integer() else freq_mhz
-    n_jobs = int(os.getenv("VIVADO_IMPL_JOBS", 4))
+    n_jobs = int(os.getenv("VIVADO_IMPL_JOBS", "4"))
     return _render_template(
         "impl.mk",
         top=top,
@@ -156,7 +157,7 @@ def _as_impl_array(arg: Any, buffer_type: BufferType) -> np.ndarray:
         raise ValueError(
             f"Expected buffer shape {tuple(buffer_type.shape)}, got {arg.shape}"
         )
-    np_dtype = _numpy_dtype_for_dtype(buffer_type.dtype)
+    np_dtype = dtype_to_numpy_dtype(buffer_type.dtype)
     array = arg if arg.dtype == np_dtype else arg.astype(np_dtype)
     return np.ascontiguousarray(array)
 
@@ -170,7 +171,7 @@ def write_impl_inputs(
             data = _as_impl_array(arg, arg_type).tobytes()
         else:
             assert isinstance(arg_type, DType)
-            data = np.asarray(arg, dtype=_numpy_dtype_for_dtype(arg_type)).tobytes()
+            data = np.asarray(arg, dtype=dtype_to_numpy_dtype(arg_type)).tobytes()
         (project_path / f"input{i}.data").write_bytes(data)
 
 
@@ -181,7 +182,7 @@ def read_impl_outputs(
     for i, (arg_type, arg) in enumerate(zip(arg_types, args)):
         if not isinstance(arg_type, BufferType):
             continue
-        np_dtype = _numpy_dtype_for_dtype(arg_type.dtype)
+        np_dtype = dtype_to_numpy_dtype(arg_type.dtype)
         data = np.fromfile(project_path / f"output{i}.data", dtype=np_dtype)
         arg[...] = data.reshape(arg_type.shape).astype(arg.dtype, copy=False)
 

@@ -9,7 +9,7 @@
 #include "allo/Microarch/BindingPolicy.h"
 #include "allo/Microarch/HWEmitter.h" // HWEmitter
 #include "allo/Microarch/Interface.h"
-#include "allo/Microarch/Verify.h" // validateDatapath
+#include "allo/Microarch/Verification.h" // validateDatapath
 #include "allo/Scheduling/OperatorLibrary.h"
 #include "allo/Support/Logging.h"
 
@@ -19,7 +19,6 @@
 #include "circt/Dialect/Seq/SeqOps.h"
 #include "circt/Support/BackedgeBuilder.h"
 
-#include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinTypes.h"
@@ -50,8 +49,18 @@ namespace mlir::allo::uarch {
 // (`ce == 0` freezes the pipe in lockstep with the shell). Both are a function
 // of `impl`, so every instance of a module name shares one port shape, which is
 // what makes the dedup safe. Returns unit id -> its extern module.
+//
+// The module NAME is the `dcp.operator`'s own `sym_name`, and that declaration
+// is still live here (it is dropped once every kernel has emitted), so the
+// module carries two symbols of that name until then. That is legal, since
+// duplicate symbols are a verifier condition and nothing verifies between; what
+// it constrains is LOOKUP. `SymbolTable::lookupSymbolIn` returns the first
+// match in block order and the typed overload only `dyn_cast`s it, so a
+// `dcp.operator` found second would resolve to null. The declarations are
+// injected at the block's beginning and these modules land before the function
+// being emitted, which keeps the declaration first.
 static DenseMap<unsigned, Operation *>
-declareOperatorModules(func::FuncOp func, const uarch::Datapath &dp,
+declareOperatorModules(dcp::DCPathModuleOp func, const uarch::Datapath &dp,
                        OpBuilder &b, llvm::StringMap<Operation *> &opModules,
                        std::vector<iface::Operator> &declared) {
   auto *ctx = b.getContext();
@@ -217,7 +226,7 @@ llvm::StringMap<Value> instantiateChild(OpBuilder &b, Location loc,
 // (validateDatapath). `opModules` caches extern operator modules across
 // functions.
 static FailureOr<std::pair<hw::HWModuleOp, iface::ModuleInterface>>
-emitModule(func::FuncOp func, uarch::Datapath &dp, OpBuilder &b,
+emitModule(dcp::DCPathModuleOp func, uarch::Datapath &dp, OpBuilder &b,
            llvm::StringMap<Operation *> &opModules,
            const uarch::CalleeCtx *callees = nullptr) {
   auto *ctx = b.getContext();
@@ -261,48 +270,6 @@ emitModule(func::FuncOp func, uarch::Datapath &dp, OpBuilder &b,
   return std::make_pair(hwMod, std::move(model));
 }
 
-static bool hasDCPRegions(func::FuncOp func) {
-  bool found = false;
-  func.walk([&](Operation *op) {
-    if (isa<dcp::DCPathPipelineOp, dcp::DCPathSequentialOp>(op)) {
-      found = true;
-      return WalkResult::interrupt();
-    }
-    return WalkResult::advance();
-  });
-  return found;
-}
-
-// The IP operators' timing lives on module-level `dcp.operator` symbols. Fold
-// each onto its referencing `dcp.compute` (its `latency` + `pipelined`) so the
-// datapath reads timing locally, then drop the spent `dcp.operator` /
-// `dcp.device` declarations. This lets each extern operator module share the
-// operator's `sym_name` (the RTL module name) with no symbol clash: there is
-// no live same-named symbol once the declarations are gone. Runs on the emit
-// clone, so the canonical scheduled module keeps the normalized form.
-static void stampOperatorTiming(ModuleOp module) {
-  Builder bd(module.getContext());
-  module.walk([&](dcp::DCPathComputeOp comp) {
-    FlatSymbolRefAttr sym = comp.getOpTypeAttr();
-    if (!sym)
-      return; // a combinational compute (comb_kind); no operator timing
-    auto opr =
-        SymbolTable::lookupNearestSymbolFrom<dcp::DCPathOperatorOp>(comp, sym);
-    assert(opr && "a dcp.compute op_type must reference a live dcp.operator");
-    comp->setAttr("latency", bd.getI64IntegerAttr(opr.getLatency()));
-    comp->setAttr("pipelined", bd.getBoolAttr(opr.getPipelined()));
-    comp->setAttr("stall",
-                  StallContractEnumAttr::get(bd.getContext(), opr.getStall()));
-  });
-  SmallVector<Operation *> spent;
-  module.walk([&](Operation *op) {
-    if (isa<dcp::DCPathOperatorOp, dcp::DCPathDeviceOp>(op))
-      spent.push_back(op);
-  });
-  for (Operation *op : spent)
-    op->erase();
-}
-
 LogicalResult emitDatapathToHW(ModuleOp module, StringRef binding,
                                StringRef top,
                                llvm::StringMap<std::string> &interfaces) {
@@ -313,20 +280,15 @@ LogicalResult emitDatapathToHW(ModuleOp module, StringRef binding,
   ctx->getOrLoadDialect<comb::CombDialect>();
   ctx->getOrLoadDialect<seq::SeqDialect>();
 
-  // The device's storage timing is read BEFORE `stampOperatorTiming` drops
-  // `dcp.device`. Compute timing folds onto each `dcp.compute`, but memory
-  // latency has no such carrier, so it threads into the datapath builder.
+  // Storage timing has no per-access carrier, so it threads into the datapath
+  // builder as a library. Compute timing needs none: a `dcp.compute` names its
+  // `dcp.operator`, and that declaration stays live for the whole of emission.
   MemoryLibrary memLib = OperatorLibrary::fromModule(module).memoryLibrary();
 
-  // Fold operator timing onto the compute ops and drop the declarations, before
-  // any datapath is built or an extern operator module is named.
-  stampOperatorTiming(module);
-
-  SmallVector<func::FuncOp> scheduled;
-  module.walk([&](func::FuncOp f) {
-    if (hasDCPRegions(f))
-      scheduled.push_back(f);
-  });
+  // Every reified kernel is a `dcp.module`; there is no second container to
+  // filter for a schedule, because carrying one is what the op is.
+  SmallVector<dcp::DCPathModuleOp> scheduled(
+      module.getOps<dcp::DCPathModuleOp>());
 
   auto policy = bindingPolicyFor(binding);
   if (!policy) {
@@ -339,10 +301,10 @@ LogicalResult emitDatapathToHW(ModuleOp module, StringRef binding,
   // Emission is rooted at the top function and runs bottom-up over the call
   // DAG: each callee emits before its caller, so a container always finds
   // its children already registered. Mirrors the scheduler's traversal order.
-  llvm::StringMap<func::FuncOp> byName;
-  for (func::FuncOp f : scheduled)
+  llvm::StringMap<dcp::DCPathModuleOp> byName;
+  for (dcp::DCPathModuleOp f : scheduled)
     byName[f.getSymName()] = f;
-  func::FuncOp topFunc = byName.lookup(top);
+  dcp::DCPathModuleOp topFunc = byName.lookup(top);
   if (!topFunc) {
     error(Stage::Emit, module)
         << "Top function '" << top << "' is not a scheduled function";
@@ -369,21 +331,14 @@ LogicalResult emitDatapathToHW(ModuleOp module, StringRef binding,
 
   // Post-order over the call DAG (acyclic; the frontend rejects recursion),
   // via a self-parameter recursive lambda (`self(self, ...)`).
-  auto emitOne = [&](auto &self, func::FuncOp f) -> LogicalResult {
+  auto emitOne = [&](auto &self, dcp::DCPathModuleOp f) -> LogicalResult {
     if (!visited.insert(f.getSymName()).second)
       return success(); // a shared callee already emitted
     // Children first: emit every scheduled callee (a leaf call misses
-    // `byName`). A callee is referenced by a `func.call` or a `dcp.instance`
-    // (a leaf CallUnit); both must recurse before their caller emits.
-    WalkResult wr = f.walk([&](Operation *op) -> WalkResult {
-      StringRef callee;
-      if (auto call = dyn_cast<func::CallOp>(op))
-        callee = call.getCallee();
-      else if (auto inv = dyn_cast<dcp::DCPathInstanceOp>(op))
-        callee = inv.getCallee();
-      else
-        return WalkResult::advance();
-      auto it = byName.find(callee);
+    // `byName`). A `dcp.instance` is the only way a kernel reaches another one,
+    // so it is the only edge to recurse on.
+    WalkResult wr = f.walk([&](dcp::DCPathInstanceOp inv) -> WalkResult {
+      auto it = byName.find(inv.getCallee());
       if (it != byName.end() && failed(self(self, it->second)))
         return WalkResult::interrupt();
       return WalkResult::advance();
@@ -418,11 +373,21 @@ LogicalResult emitDatapathToHW(ModuleOp module, StringRef binding,
     return failure();
 
   // cleanup non-hw ops to avoid Verilog export errors
-  for (func::FuncOp f : scheduled)
+  for (dcp::DCPathModuleOp f : scheduled)
     f.erase();
   for (memref::GlobalOp g :
        llvm::make_early_inc_range(module.getOps<memref::GlobalOp>()))
     g.erase();
+  // The spent declarations, dropped LAST: every `dcp.compute` reads its timing
+  // off the `dcp.operator` it names, and dropping them is also what leaves each
+  // extern operator module the sole owner of the `sym_name` it shares.
+  SmallVector<Operation *> spent;
+  module.walk([&](Operation *op) {
+    if (isa<dcp::DCPathOperatorOp, dcp::DCPathDeviceOp>(op))
+      spent.push_back(op);
+  });
+  for (Operation *op : spent)
+    op->erase();
   return success();
 }
 

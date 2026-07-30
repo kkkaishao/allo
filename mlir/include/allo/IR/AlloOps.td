@@ -414,6 +414,47 @@ def ScheduledOpInterface : OpInterface<"ScheduledOpInterface"> {
   ];
 }
 
+def DCPathRegionOpInterface : OpInterface<"DCPathRegionOpInterface"> {
+  let description = [{
+    A dcp SCHEDULING REGION: `dcp.pipeline`, `dcp.sequential` or `dcp.select`.
+    What the three share is a timing report, and this is how the latency model
+    and the emitter read it.
+
+    They are read through an interface rather than by attribute name because
+    the name is the failure mode. These are typed ODS arguments with generated
+    accessors, but every consumer works over `Operation *` (it handles all three
+    uniformly), so before this each one reached them as `"latency"`, `"drain"`,
+    `"trip"` string literals: keys no verifier checks, no rename follows, and a
+    typo turns into a silently absent number rather than a compile error. That
+    is the argument `dcp.module` was landed on, one level down.
+
+    `drain` and `trip` are not properties of all three; a guard has neither and
+    a `dcp.sequential` has no trip. They still belong here, because a consumer
+    asking "what is this region's trip" wants "none" rather than a cast it has
+    to write, and the default below is that answer.
+  }];
+  let cppNamespace = "::mlir::allo::dcp";
+  let methods = [
+    InterfaceMethod<"This region's composed span, when one composes exactly",
+      "::std::optional<uint64_t>", "getLatency">,
+    InterfaceMethod<"Publish this region's composed span",
+      "void", "setLatency", (ins "::std::optional<uint64_t>":$span)>,
+    InterfaceMethod<"Whether the span above is an upper bound, not exact",
+      "bool", "getLatencyBound">,
+    InterfaceMethod<"Which controller family paces this region",
+      "::std::optional<::mlir::allo::DeterminacyEnum>", "getDeterminacy">,
+    InterfaceMethod<"Publish this region's pacing class",
+      "void", "setDeterminacy",
+      (ins "::std::optional<::mlir::allo::DeterminacyEnum>":$pacing)>,
+    InterfaceMethod<"The TERMINAL cycle: last issue pulse to deepest commit",
+      "::std::optional<uint64_t>", "getDrain", (ins), /*methodBody=*/"",
+      [{ return ::std::nullopt; }]>,
+    InterfaceMethod<"Iterations of this region's body, when statically known",
+      "::std::optional<uint64_t>", "getTrip", (ins), /*methodBody=*/"",
+      [{ return ::std::nullopt; }]>,
+  ];
+}
+
 class DCPath_Op<string mnemonic, list<Trait> traits = []> : Allo_Op<mnemonic, traits> {
   let cppNamespace = "::mlir::allo::dcp";
 }
@@ -483,9 +524,78 @@ def DCPathUnitOp : DCPath_Op<"dcp.unit",
   let assemblyFormat = "$sym_name `of` $op_type attr-dict";
 }
 
+def DCPathModuleOp : DCPath_Op<"dcp.module", [
+    AffineScope, AutomaticAllocationScope, FunctionOpInterface,
+    IsolatedFromAbove, OpAsmOpInterface,
+    SingleBlockImplicitTerminator<"DCPathOutputOp">]> {
+  let summary = "One scheduled kernel: the container an hw.module is emitted from";
+  let description = [{
+    A kernel once its schedule is reified: the body holds `dcp` regions and
+    nothing else that controls time, and `dcp.instance` is the only way it
+    reaches another one. It replaces the `func.func` the frontend and the
+    scheduler work on, at the one point the schedule stops being a promise about
+    that IR and becomes the structure of the hardware.
+
+    The three timing fields are the kernel's CONTRACT with its callers, and they
+    are op arguments rather than discardable attributes so the verifier below
+    reaches them. `latency` is the whole-kernel span, absent when the length is
+    data-dependent; `latency_bound` marks it a worst case (an assume-bounded
+    trip) rather than an exact count; `determinacy` is the class a caller
+    composes against. A caller reading a `latency` that is not the cycle the
+    kernel actually finishes on places its consumers at the wrong offset, and
+    since nothing handshakes, that is a read before the write.
+  }];
+  let arguments = (ins
+    SymbolNameAttr:$sym_name,
+    TypeAttrOf<FunctionType>:$function_type,
+    OptionalAttr<StrAttr>:$sym_visibility,
+    OptionalAttr<DictArrayAttr>:$arg_attrs,
+    OptionalAttr<DictArrayAttr>:$res_attrs,
+    OptionalAttr<I64Attr>:$latency,
+    UnitAttr:$latency_bound,
+    DeterminacyAttr:$determinacy);
+  let regions = (region SizedRegion<1>:$body);
+  let hasCustomAssemblyFormat = 1;
+  let hasVerifier = 1;
+  let builders = [OpBuilder<(ins
+    "::mlir::StringRef":$name, "::mlir::FunctionType":$type,
+    "::mlir::allo::DeterminacyEnum":$determinacy)>];
+  let extraClassDeclaration = [{
+    //===------------------------------------------------------------------===//
+    // FunctionOpInterface Methods
+    //===------------------------------------------------------------------===//
+
+    ::mlir::Region *getCallableRegion() { return &getBody(); }
+    ArrayRef<Type> getArgumentTypes() { return getFunctionType().getInputs(); }
+    ArrayRef<Type> getResultTypes() { return getFunctionType().getResults(); }
+
+    //===------------------------------------------------------------------===//
+    // OpAsmOpInterface Methods
+    //===------------------------------------------------------------------===//
+
+    /// Allow the dialect prefix to be omitted.
+    static StringRef getDefaultDialect() { return "allo"; }
+  }];
+}
+
+def DCPathOutputOp : DCPath_Op<"dcp.output",
+    [Pure, ReturnLike, Terminator, HasParent<"DCPathModuleOp">]> {
+  let summary = "Terminator of a dcp.module: the kernel's scalar results";
+  let description = [{
+    Its operands are the kernel's results, in signature order, each produced by
+    the region that computes it. An array result has no meaning at a hardware
+    port, so every operand here is a scalar the emitter drives on an output
+    port.
+  }];
+  let arguments = (ins Variadic<AnyType>:$operands);
+  let builders = [OpBuilder<(ins), [{ /* no operands */ }]>];
+  let assemblyFormat = "attr-dict ($operands^ `:` type($operands))?";
+  let hasVerifier = 1;
+}
+
 def DCPathPipelineOp : DCPath_Op<"dcp.pipeline",
     [RecursiveMemoryEffects, AllTypesMatch<["inits", "results"]>,
-     AttrSizedOperandSegments, ScheduledOpInterface]> {
+     AttrSizedOperandSegments, ScheduledOpInterface, DCPathRegionOpInterface]> {
   let summary = "An II-scheduled loop carrying iter-args (counted or while)";
   let description = [{
     A cyclic scheduling region at initiation interval `ii`. The single block's
@@ -516,6 +626,13 @@ def DCPathPipelineOp : DCPath_Op<"dcp.pipeline",
     and therefore has no static initiation interval. Its hardware is a
     done-based sequential controller: start iteration i+1 when iteration i
     finishes.
+
+    `drain` is the region's TERMINAL cycle: how long after its last issue pulse
+    the deepest output commits. It is what a span is composed from
+    (`leafSpan`), because a region's `done` rises exactly
+    `drain + 1` cycles after that pulse. `length` is the schedule DEPTH, the
+    cycle by which everything has issued, and is a report. The two differ, and
+    composing off the wrong one is what makes a consumer sample early.
   }];
   let arguments = (ins
     Optional<Index>:$lbBound,
@@ -526,8 +643,8 @@ def DCPathPipelineOp : DCPath_Op<"dcp.pipeline",
     OptionalAttr<I64Attr>:$lb,
     OptionalAttr<I64Attr>:$step,
     OptionalAttr<I64Attr>:$ii,
-    OptionalAttr<I64Attr>:$start,
     OptionalAttr<I64Attr>:$length,
+    OptionalAttr<I64Attr>:$drain,
     OptionalAttr<I64Attr>:$latency,
     UnitAttr:$latency_bound,
     OptionalAttr<DeterminacyAttr>:$determinacy);
@@ -551,17 +668,20 @@ def DCPathPipelineOp : DCPath_Op<"dcp.pipeline",
 
 def DCPathSequentialOp : DCPath_Op<"dcp.sequential",
     [SingleBlockImplicitTerminator<"DCPathUnconditionOp">, RecursiveMemoryEffects,
-     ScheduledOpInterface]> {
+     ScheduledOpInterface, DCPathRegionOpInterface]> {
   let summary = "A straight-line (acyclic) scheduling region";
   let description = [{
     A non-loop region whose ops carry `start` relative to the region. Produces
     `results` consumed by later regions; regions compose in program order. The
     region is not isolated: its ops may reference values from earlier regions
     directly.
+
+    `drain` is the terminal cycle its `done` is composed off, `length` the
+    schedule depth kept as a report; see `dcp.pipeline`.
   }];
   let arguments = (ins
-    OptionalAttr<I64Attr>:$start,
     OptionalAttr<I64Attr>:$length,
+    OptionalAttr<I64Attr>:$drain,
     OptionalAttr<I64Attr>:$latency,
     UnitAttr:$latency_bound,
     OptionalAttr<DeterminacyAttr>:$determinacy);
@@ -572,7 +692,8 @@ def DCPathSequentialOp : DCPath_Op<"dcp.sequential",
 }
 
 def DCPathSelectOp : DCPath_Op<"dcp.select",
-    [RecursiveMemoryEffects, ScheduledOpInterface]> {
+    [RecursiveMemoryEffects, ScheduledOpInterface,
+     DCPathRegionOpInterface]> {
   let summary = "A control-path guard: selects the active data path";
   let description = [{
     The DCP `if`. `$condition` (an `i1`, the explicit control input, like a
@@ -590,7 +711,6 @@ def DCPathSelectOp : DCPath_Op<"dcp.select",
   }];
   let arguments = (ins
     I1:$condition,
-    OptionalAttr<I64Attr>:$start,
     OptionalAttr<I64Attr>:$latency,
     UnitAttr:$latency_bound,
     OptionalAttr<DeterminacyAttr>:$determinacy);

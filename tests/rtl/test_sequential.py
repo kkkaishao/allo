@@ -12,9 +12,10 @@ import pytest
 
 from allo import kernel
 from allo.lang import i32, index
+from allo.backend.rtl import RegionKind
 
 sys.path.insert(0, os.path.dirname(__file__))
-from _common import _latency, _to_rtl  # noqa: E402
+from _common import Dcp, Mod, _latency, _to_rtl  # noqa: E402
 
 pytestmark = pytest.mark.skipif(
     shutil.which("verilator") is None, reason="verilator not available"
@@ -52,7 +53,7 @@ def test_sequential_two_kernel_shared_array():
     rtl = _to_rtl(seq_top)
     # A pure serial call graph with no loose datapath still lowers via the leaf
     # CallUnit path, both children instantiated in the container's own module.
-    assert "allo.dcp.instance" in rtl.dcp
+    assert Dcp(rtl).func(rtl.top).callees()
     assert rtl.mlir.count("hw.instance") >= 2
 
     B = np.zeros(16, np.int32)
@@ -152,6 +153,104 @@ def test_an_ungated_call_waits_for_its_loaded_operand():
     out = np.zeros(1, np.int32)
     _to_rtl(ugc_many).cosim(A, out)
     assert out[0] == sum((int(a) + 3) * 2 for a in A), int(out[0])
+
+
+# --- What a `done` level means on the pass after the first -------------------
+
+
+# A kernel `done` is the conjunction of its regions' `done`s, but each of those
+# is a level cleared by the start of the region that OWNS it, which for anything
+# but the first is later than the kernel's own start. So on a re-invocation the
+# later regions still read the previous one's TRUE, and the conjunction rises as
+# soon as the FIRST region completes: the caller latches a result the callee has
+# not computed yet. Needs no unroll and no interesting memory, only a callee with
+# two regions invoked more than once.
+def test_a_reinvoked_callee_is_not_done_when_its_first_region_is():
+    @kernel
+    def dtr_two_regions(a: i32[4]) -> i32:
+        acc: i32 = 0
+        for i in range(4):
+            acc += a[i]
+        scaled: i32 = 0
+        for j in range(4):
+            scaled += acc
+        return scaled
+
+    # The same arithmetic in ONE region: no conjunction to read stale, so this
+    # arm passed either way and holds the fix to the multi-region case.
+    @kernel
+    def dtr_one_region(a: i32[4]) -> i32:
+        acc: i32 = 0
+        for i in range(4):
+            acc += a[i] * 4
+        return acc
+
+    def caller(callee):
+        @kernel
+        def dtr_top(src: i32[3, 4], out: i32[3]):
+            for t in range(3):
+                buf: i32[4] = 0
+                for k in range(4):
+                    buf[k] = src[t, k]
+                out[t] = callee(buf)
+
+        return dtr_top
+
+    src = np.arange(12, dtype=np.int32).reshape(3, 4)
+    want = src.sum(axis=1) * 4
+    for callee in (dtr_two_regions, dtr_one_region):
+        out = np.zeros(3, np.int32)
+        _to_rtl(caller(callee)).cosim(src.copy(), out)
+        # Every element, not just the first: the first invocation is correct
+        # even with a stale conjunction, since nothing has latched a TRUE yet.
+        assert np.array_equal(out, want), (callee.__name__, list(out))
+
+
+# A region that drains in the cycle it is ISSUED sets its `done` on the same
+# pulse that clears it. The set wins, so the level latches high and every later
+# pass re-sets it from 1, leaving a consumer that watches for a 0->1 edge waiting
+# forever. `emitDone` masks the start cycle out of the level for exactly this.
+# A comb-only callee is the reachable case: it drains at stage 0 off an acyclic
+# region whose issue IS the kernel start, and being tiny it gets re-invoked from
+# a loop, where a lost edge is a deadlock rather than a wrong value.
+def test_a_zero_drain_callee_re_edges_on_every_invocation():
+    @kernel
+    def zd_bump(x: i32) -> i32:
+        return x + 1
+
+    # zd_bump is invoked once per iteration of the callee's own loop, and the
+    # callee once per iteration of the caller's: the edge has to come back at
+    # both levels.
+    @kernel
+    def zd_sum(src: i32[3, 2], n: i32, acc: i32[1]):
+        d: i32 = 0
+        for i in range(2):
+            d += zd_bump(src[n, i])
+        acc[0] = d
+
+    @kernel
+    def zd_top(src: i32[3, 2], out: i32[3]):
+        for n in range(3):
+            acc: i32[1] = 0
+            zd_sum(src, n, acc)
+            out[n] = acc[0]
+
+    src = np.arange(1, 7, dtype=np.int32).reshape(3, 2)
+    out = np.zeros(3, np.int32)
+    _to_rtl(zd_top).cosim(src.copy(), out)
+    assert np.array_equal(out, src.sum(axis=1) + 2), list(out)
+
+    # The invariant itself, at the port: zd_bump's `done` output is its done
+    # register ANDed with ~start, so the level reads 0 on the start cycle
+    # whatever the region behind it does with that pulse.
+    m = Mod(_to_rtl(zd_top).mlir, "zd_top_zd_sum_zd_bump")
+    done = m.text.split("hw.output %")[1].split(",")[0].strip()
+    assert m.defs[done].startswith("comb.and"), m.defs[done]
+    gate = [v for v in m.operands(done) if v != "r0_done"]
+    assert len(gate) == 1 and m.defs[gate[0]].startswith("comb.xor %start"), (
+        m.defs[done],
+        [m.defs.get(v) for v in gate],
+    )
 
 
 # --- Concurrency inference between independent calls -------------------------
@@ -292,7 +391,7 @@ def test_independent_calls_on_disjoint_arrays_overlap():
         ov2(B, ob)  # disjoint from ov1 -> overlaps it on the leaf
 
     rtl = _to_rtl(ov_top)
-    assert "allo.dcp.instance" in rtl.dcp  # leaf CallUnit path (structural lock)
+    assert Dcp(rtl).func(rtl.top).callees()  # leaf CallUnit path (structural lock)
     l1, l2 = _latency(ov1), _latency(ov2)
     A = np.arange(16, dtype=np.int32)
     B = np.arange(16, dtype=np.int32) + 100
@@ -343,7 +442,7 @@ def test_nested_sequential_composition():
     C = np.zeros(16, np.int32)
     out = np.zeros(16, np.int32)
     rtl = _to_rtl(nt_top)
-    assert "dcp.instance @nt_top.nt_mid(" in rtl.dcp
+    assert "nt_top.nt_mid" in Dcp(rtl).func("nt_top").callees()
     r = rtl.cosim(A16, B, C, out)
     assert np.array_equal(out, (A16 + 1) * 2 + 3)
     assert r.cycles == lmid + l3  # nt_leaf3 waits for the whole inner container
@@ -378,10 +477,12 @@ def test_nested_container_instantiates_as_a_plain_call():
         r1b_l3(C, out)  # reads the container's output -> serial on the leaf
 
     rtl = _to_rtl(r1b_top)
-    # The container child instantiates in r1b_top's OWN body (the "(" after
-    # r1b_mid distinguishes the outer invoke from the inner r1b_mid.r1b_l* ones).
-    assert "allo.dcp.instance @r1b_top.r1b_mid(" in rtl.dcp
-    assert "allo.dcp.instance @r1b_top.r1b_l3(" in rtl.dcp
+    # The container child instantiates in r1b_top's OWN body, which is what
+    # separates the outer invoke from the inner r1b_mid.r1b_l* ones.
+    assert Dcp(rtl).func("r1b_top").callees() == [
+        "r1b_top.r1b_mid",
+        "r1b_top.r1b_l3",
+    ]
     A = np.arange(16, dtype=np.int32)
     B = np.zeros(16, np.int32)
     C = np.zeros(16, np.int32)
@@ -412,7 +513,8 @@ def test_mixed_container_internal_buffer_call():
             out[i] = C[i] * 2
 
     rtl = _to_rtl(ib_top)
-    assert "dcp.instance @ib_top.ib_child" in rtl.dcp  # a scheduled call node
+    # a scheduled call node
+    assert "ib_top.ib_child" in Dcp(rtl).func("ib_top").callees()
     assert "hw.instance" in rtl.mlir  # instantiated in the container's module
     assert "seq.hlmem" in rtl.mlir  # the shared buffers, on-chip
     A = np.arange(1, 17, dtype=np.int32)
@@ -497,7 +599,7 @@ def test_adjacent_calls_with_no_loose_op_between_them():
     rtl = _to_rtl(cc_top)
     # The two-port claim, stated: cc1 reads x twice per iteration, so the
     # boundary argument is wired to a read group per access rather than muxed.
-    rd = [p["base"] for acc in rtl.interfaces["cc_top"]["reads"] for p in acc]
+    rd = [p.base for acc in rtl.interfaces["cc_top"].reads for p in acc]
     assert rd == ["x_rd0", "x_rd1"]
 
     x = np.arange(8, dtype=np.int32) + 1
@@ -649,11 +751,10 @@ def test_a_lone_call_body_stays_on_the_leaf_controller():
         for i in range(16):
             lone_child(A, B, i)
 
-    dcp = _to_rtl(lone_top).dcp
-    top = dcp[dcp.index("func.func public @lone_top") :]
-    top = top[: top.index("func.func private")]
-    assert top.count("allo.dcp.pipeline") == 1
-    assert "allo.dcp.sequential" not in top  # no child region: still a leaf
+    top = _to_rtl(lone_top).schedule().func("lone_top")
+    assert len(top.cyclic(wrappers=True)) == 1
+    # no child region: still a leaf
+    assert not [r for r in top.regions if r.kind is RegionKind.ACYCLIC]
 
 
 # A body with a call plus loose work decomposes into a container with
@@ -670,14 +771,11 @@ def test_a_mixed_call_body_becomes_a_container():
             mx_child(A, B, i)
             C[i] = A[i] + 1
 
-    dcp = _to_rtl(mx_top).dcp
-    top = dcp[dcp.index("func.func public @mx_top") :]
-    top = top[: top.index("func.func private")]
+    top = _to_rtl(mx_top).schedule().func("mx_top")
     # One outer pipeline wrapping a dcp.sequential that holds the invoke, plus
     # a second child region for the loose store.
-    assert top.count("allo.dcp.pipeline") == 1
-    assert top.count("allo.dcp.sequential") == 2
-    call_region = top[: top.index("allo.dcp.instance")].rsplit(
-        "allo.dcp.sequential", 1
-    )[1]
-    assert "dcp.store" not in call_region  # the call region holds only the call
+    assert len(top.cyclic(wrappers=True)) == 1
+    assert len([r for r in top.regions if r.kind is RegionKind.ACYCLIC]) == 2
+    call_region = next(r for r in top.regions if r.has("dcp.instance"))
+    # the call region holds only the call
+    assert [o.kind for o in call_region.ops] == ["dcp.instance"]

@@ -4,7 +4,10 @@
  */
 
 #include "allo/Microarch/HWEmitter.h"
+#include "allo/Scheduling/LatencyModel.h"
 #include "circt/Dialect/Comb/CombOps.h"
+
+#include <algorithm>
 
 using namespace mlir;
 using namespace mlir::allo;
@@ -105,6 +108,10 @@ RegionControl ControlEmitter::emitPipelined(unsigned region, int64_t ii,
                                             const StallShell &sh) const {
   // G's half of H: a rigid region issues unconditionally.
   Value enable = sh ? sh.issueEnable : c.t1;
+  static_assert(kPipelinedBoundary.arm == 1,
+                "`running` below is a register set by `start`, so the first "
+                "iteration issues one cycle in; a different declared arm would "
+                "have to be built here, not just written down");
   auto runNext = c.bb.get(c.i1);
   Value running = c.reg(runNext, c.f1);
   nameValue(running, regionSignal(region, "run"));
@@ -152,22 +159,20 @@ RegionControl ControlEmitter::emitPipelined(unsigned region, int64_t ii,
 //   * CallNode: the body is one instantiated sub-kernel.
 // Both keep the same four cells: an induction register advancing on `advance`,
 // the `isLast` test against the bound, the launch pulse, and a done latch
-// cleared on `start`. The single difference is when the FIRST pass launches:
-//   * a Container launches one cycle after `start`, off the settled counter
-//     register, because its children read that counter as their own bound and
-//     sample it at their own start;
-//   * a CallNode launches on `start` itself, reading the counter through a
-//     `start`-cycle bypass, because a call region's start->done latency is the
-//     scheduled figure a caller composes against and a register there would add
-//     a cycle to it.
-// Either way the ADVANCE launch is registered, since the counter it feeds only
-// settles the cycle after `advance`.
+// cleared on `start`. The single difference is when the FIRST pass launches,
+// and it is spelled once, as the two families' `arm` in `LatencyModel.h`.
 IterationControl
 ControlEmitter::emitCountedIteration(const uarch::RegionBlock &rb,
                                      const Terminator &term, Value start,
                                      Value complete) const {
   assert(term.lb && "a counted iteration controller needs induction bounds");
-  bool launchAtStart = rb.shape == uarch::RegionBlock::Shape::CallNode;
+  const BoundaryCost &boundary = rb.shape == uarch::RegionBlock::Shape::CallNode
+                                     ? kCallNodeBoundary
+                                     : kContainerBoundary;
+  // Launching on `start` itself means reading the counter combinationally
+  // there, before its register settles, so the bypass is a CONSEQUENCE of a
+  // zero arm cost and moves with it.
+  bool launchAtStart = boundary.arm == 0;
 
   Backedge ivNext = c.bb.get(term.lb.getType());
   Value ivReg = c.reg(ivNext, term.lb);
@@ -191,8 +196,13 @@ ControlEmitter::emitCountedIteration(const uarch::RegionBlock &rb,
   // `gateStart` masks the start launch of an empty region (a runtime zero trip
   // or a static lb >= ub), which completes through `empty` below instead.
   Value first = term.gateStart(c, start);
-  Value launch = launchAtStart ? c.orBits(first, c.reg(advance, c.f1))
-                               : c.reg(c.orBits(first, advance), c.f1);
+  // Each launch path delayed by its own boundary cost, sharing whatever the two
+  // have in common so a family paying the same on both keeps one register.
+  unsigned shared = std::min(boundary.arm, boundary.reArm);
+  Value launch = c.delayValid(
+      c.orBits(c.delayValid(first, boundary.arm - shared, StallShell{}),
+               c.delayValid(advance, boundary.reArm - shared, StallShell{})),
+      shared, StallShell{});
   nameValue(launch, regionSignal(rb.id, "fire"));
   // An empty region completes one cycle after `start`, not on it: `done` is a
   // level cleared by `start`, so a pulse landing there would leave it high with
@@ -219,7 +229,12 @@ IterationControl ControlEmitter::emitCheckedIteration(unsigned region,
                                                       unsigned tCond,
                                                       Value start,
                                                       Value complete) const {
-  Value check = c.reg(c.orBits(start, complete), c.f1);
+  static_assert(kCheckedBoundary.arm == kCheckedBoundary.reArm,
+                "one CHECK register serves both the start and the drain path; "
+                "differing costs would need them split as in the counted "
+                "controller");
+  Value check = c.delayValid(c.orBits(start, complete), kCheckedBoundary.arm,
+                             StallShell{});
   nameValue(check, regionSignal(region, "check"));
   // A container derives no stall shell of its own, since its stream-touching
   // work sits in a child leaf under that leaf's shell, so the CHECK window is
@@ -234,16 +249,9 @@ IterationControl ControlEmitter::emitCheckedIteration(unsigned region,
           done};
 }
 
-// Acyclic (straight-line) region: a single pass. A NESTED acyclic child arms
-// `start` delayed one cycle, a registered pulse matching the cyclic regimes'
-// registered `running`. This is what lets it read the outer counter correctly:
-// the container advances its counter on the child's start pulse, so the new
-// index only settles the next cycle (register semantics), exactly when this
-// registered arming (and a cyclic child's `running`) rises. A TOP-LEVEL acyclic
-// region has no outer counter, so that register would be pure latency: it arms
-// on `start` directly, so a pure-seq call container's latency equals its
-// reported schedule depth (no spurious +1). There is no iteration index of its
-// own.
+// Acyclic (straight-line) region: a single pass, armed after its family's `arm`
+// cost (`LatencyModel.h`, which carries why the nested and top-level cells
+// disagree). There is no iteration index of its own.
 //
 // Under an elastic shell the arming pulse is LATCHED into `pend`, the acyclic
 // counterpart of the pipelined regime's `running`: a single one-shot pulse
@@ -259,7 +267,9 @@ IterationControl ControlEmitter::emitCheckedIteration(unsigned region,
 RegionControl ControlEmitter::emitAcyclic(unsigned region, Value start,
                                           bool topLevel,
                                           const StallShell &sh) const {
-  Value armed = topLevel ? start : c.reg(start, c.f1);
+  const BoundaryCost &boundary =
+      topLevel ? kAcyclicTopBoundary : kAcyclicNestedBoundary;
+  Value armed = c.delayValid(start, boundary.arm, StallShell{});
   if (!sh) {
     nameValue(armed, regionSignal(region, "issue"));
     return {armed, /*counter=*/Value(), /*wantIssue=*/Value(),
@@ -302,15 +312,22 @@ Value ControlEmitter::emitDone(unsigned region, unsigned drainStage,
     fire = c.andBits(fire, sh.chainEnable);
   if (emptyDone)
     fire = c.orBits(emptyDone, fire);
+  static_assert(kDoneLatchCycles == 1,
+                "completion is one latch register below; a different declared "
+                "cost would have to be built here, not just written down");
   auto dNext = c.bb.get(c.i1);
   Value done = c.reg(dNext, c.f1);
   nameValue(done, regionSignal(region, "done"));
   // `retrig` clears the held `done` on `start`, giving a fresh 0->1 edge each
-  // pass. Callers must keep `fire` off the `start` cycle: it wins over this
-  // clear and would hold the level at 1 with no edge.
+  // pass.
   Value held = retrig ? c.mux(start, c.f1, done) : done;
   dNext.setValue(c.mux(fire, c.t1, held));
-  return done;
+  if (!retrig)
+    return done;
+  // `fire` wins over that clear and the two can coincide, so mask the start
+  // cycle out of the LEVEL: it reads 0 there whether or not the clear landed,
+  // which is what lets every pass re-edge.
+  return c.andBits(done, c.notBit(start));
 }
 
 } // namespace mlir::allo::uarch

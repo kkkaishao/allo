@@ -8,8 +8,8 @@
 
 #include "allo/IR/AlloOps.h"             // kAlloAsyncAttr
 #include "allo/Scheduling/MemoryModel.h" // MemoryLibrary
+#include "allo/Scheduling/RegionGraph.h" // calleeStaticLatency
 #include "allo/Scheduling/Scheduler.h"
-#include "allo/Scheduling/Utils.h" // sched::kLatencyAttr
 
 #include "circt/Scheduling/Problems.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h" // func::CallOp
@@ -164,23 +164,24 @@ private:
 // Scheduled-call latency: a scheduling helper, separate from operator
 // characterization. A plain (non-async) call to an already-scheduled callee is
 // a fixed-latency node in the enclosing problem. Its latency is the callee's
-// whole-kernel latency (its `sched.latency`, annotated bottom-up), with
-// registered boundaries. Returns {latency, stable operator-type name} for such
-// a call, else nullopt.
+// whole-kernel latency, read through `calleeStaticLatency` so that ONE function
+// answers "how long does this callee run" whichever phase is asking: the
+// carrier is a `func.func`'s `allo.sched.latency` while scheduling and a
+// `dcp.module`'s own field once the callee has been reified.
+// Returns {latency, stable operator-type name} for such a call, else nullopt.
 //===----------------------------------------------------------------------===//
 inline std::optional<std::pair<int64_t, std::string>>
 scheduledCallLatency(Operation *op) {
   auto call = dyn_cast<func::CallOp>(op);
   if (!call || op->hasAttr(kAlloAsyncAttr))
     return std::nullopt;
-  auto callee = SymbolTable::lookupNearestSymbolFrom<func::FuncOp>(
-      op, call.getCalleeAttr());
+  Operation *callee = calleeOf(op);
   if (!callee)
     return std::nullopt;
-  auto lat = callee->getAttrOfType<IntegerAttr>(sched::kLatencyAttr);
+  std::optional<int64_t> lat = calleeStaticLatency(callee);
   if (!lat)
     return std::nullopt;
-  return std::make_pair(lat.getInt(), ("call." + call.getCallee()).str());
+  return std::make_pair(*lat, ("call." + call.getCallee()).str());
 }
 
 //===----------------------------------------------------------------------===//

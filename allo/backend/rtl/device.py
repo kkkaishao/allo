@@ -15,8 +15,8 @@ from .sim.ip_models import OpDesc, Ty
 
 
 class MemoryKind(Enum):
-    """A storage primitive. The value is the name the scheduler's storage model
-    (``MemoryImplEnum``) uses -- keep them in sync."""
+    """A storage primitive. The value is the name the scheduler's
+    ``MemoryImplEnum`` uses; keep them in sync."""
 
     REG = "register"
     LUTRAM = "lutram"
@@ -57,18 +57,15 @@ class CombKind(Enum):
 
 class Device:
     """A hardware platform: storage primitives, native-operator chaining delays,
-    operator IPs, and a default synthesis frequency. Build it fluently
-    (``set_memory``/``set_comb_delay``/``add_operator``) and pass it to the RTL
-    backend."""
+    operator IPs and a default synthesis frequency. Built fluently through
+    ``set_memory`` / ``set_comb_delay`` / ``add_operator``."""
 
     def __init__(self, name: str):
         self.name = name
         self.memory: dict[MemoryKind, MemoryTiming] = {}
         self.default_memory: MemoryTiming | None = None
-        # Native-operator chaining delays: kind (an ``OpKind`` string) -> ns.
-        self.comb: dict[str, float] = {}
-        # Instanced (IP) operators the device provides (built-in + user @ip).
-        self.operators: list[IP] = []
+        self.comb: dict[str, float] = {}  # native chaining delays: kind -> ns
+        self.operators: list[IP] = []  # built-in and user `@ip` operators
         self.default_freq_mhz: float = 100.0
 
     def set_memory(
@@ -133,9 +130,8 @@ class Device:
         return self
 
     def copy(self) -> Device:
-        """An independent copy: extending it (e.g. adding an operator IP) does not
-        mutate this device. Timing/IP objects are shared (they are never
-        mutated). Use ``builtin_device.copy()`` to build on the default platform."""
+        """An independent copy, so extending it does not mutate this device. The
+        timing and IP objects are shared, never mutated."""
         d = Device(self.name)
         d.memory = dict(self.memory)
         d.default_memory = self.default_memory
@@ -159,9 +155,9 @@ def _ty(dtype) -> Ty:
 
 
 def operator_descs(operators: Sequence[IP]) -> list[OpDesc]:
-    """The device operators as behavioral :class:`OpDesc` descriptors -- the
-    cosim source of truth for each extern IP's kind/latency/dtypes (the emitted
-    hw IR supplies only the realized port shape). Non-operator IPs are skipped."""
+    """The device operators as behavioral :class:`OpDesc` descriptors, the cosim
+    source of truth for each extern IP's kind, latency and dtypes. Non-operator
+    IPs are skipped."""
     out = []
     for op in operators:
         if op.optype is None:
@@ -194,8 +190,7 @@ _STALL_STYLE_TO_ENUM = {"ce": 0, "free": 1, "elastic": 2}
 def inject_operators(module, operators: Sequence[IP]):
     """Inject each device operator as a module-level ``dcp.operator`` symbol the
     scheduler and reifier match concrete ``arith.*``/``math.*`` ops onto. The
-    symbol (``sym_name``) IS the RTL module name the emitter instantiates. A
-    no-op when the device provides no operators."""
+    ``sym_name`` IS the RTL module name the emitter instantiates."""
     if not operators:
         return
     from ..._mlir.ir import (
@@ -221,8 +216,7 @@ def inject_operators(module, operators: Sequence[IP]):
                 ctx, op.parse_argument_annotations(), op.parse_return_annotation()
             )
             t = op.timing
-            # The stall contract: a pipelined IP's style (free/elastic/ce), else
-            # the clock-enable default (matching the enum's Ce default).
+            # A pipelined IP's style, else the clock-enable default.
             stall = StallContractAttr.get(_STALL_STYLE_TO_ENUM[t.style or "ce"], ctx)
             DCPathOperatorOp(
                 sym_name=op.func_name,
@@ -239,11 +233,9 @@ def inject_operators(module, operators: Sequence[IP]):
 
 def inject_device(module, device: Device):
     """Inject the device technology tables as a module-level ``dcp.device`` op:
-    per native-kind combinational chaining delays (``comb``) and the storage
-    model (``memory``/``default_memory``/``fifo``). The scheduler and reifier
-    read these, overriding the built-in library defaults (design doc SS8). Target
-    frequency is deliberately NOT injected -- it is a per-run scheduling
-    parameter (the device's default, overridable), not device technology data."""
+    the per-kind combinational chaining delays and the storage model, which
+    override the built-in library defaults. Target frequency is not injected: it
+    is a per-run scheduling parameter, not technology data."""
     from ..._mlir.ir import (
         InsertionPoint,
         Location,
@@ -289,6 +281,8 @@ def inject_device(module, device: Device):
 
 
 # --- built-in operators ----------------------------------------------------
+# An `@ip` body is `...`: the parameters exist to declare the IP's signature.
+# pylint: disable=unused-argument
 
 
 @ip(optype=OperatorType.ADD, latency=7, in_delay_ns=0.5, pipelined=True, style="ce")
@@ -374,6 +368,8 @@ def fcvt_l2(a: f32) -> f64: ...
 def bf2f_l2(a: bf16) -> f32: ...
 
 
+# pylint: enable=unused-argument
+
 # The built-in device: storage + native chaining tables + the operators above.
 builtin_device = Device("builtin")
 builtin_device.set_memory(MemoryKind.REG, 0, 1, 0.1, 0.1)
@@ -401,8 +397,8 @@ builtin_device.add_operators(
     fcvt_l2,
     bf2f_l2,
 )
-# Native (combinational) chaining delays. Integer arithmetic -- including
-# mul/div/rem -- is combinational; float/cast are the operators above.
+# Native chaining delays. Integer arithmetic, mul/div/rem included, is
+# combinational; float and cast go through the operators above.
 builtin_device.set_comb_delay(CombKind.ADD, 1.2)
 builtin_device.set_comb_delay(CombKind.SUB, 1.2)
 builtin_device.set_comb_delay(CombKind.MUL, 2.0)

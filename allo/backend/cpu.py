@@ -7,7 +7,7 @@ import ctypes
 import platform
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Generic, ParamSpec, TypeVar
+from typing import ParamSpec, TypeVar
 
 import ml_dtypes
 import numpy as np
@@ -249,12 +249,12 @@ class CPU(Backend[P, R]):
         kernel: Kernel[P, R],
         *,
         opt_level: int = 2,
-        shared_libs: list[str] = [],
+        shared_libs: list[str] | None = None,
     ):
         super().__init__(kernel)
         self.opt_level = opt_level
         self.shared_libs = [_dataflow_runtime_lib()]
-        self.shared_libs.extend(shared_libs)
+        self.shared_libs.extend(shared_libs or [])
         self.engine: ExecutionEngine | None = None
         self.arg_types: list[TypeBase] = []
         self.res_types: list[TypeBase] = []
@@ -281,14 +281,13 @@ class CPU(Backend[P, R]):
             self.arg_types = cache.arg_types
             self.res_types = cache.res_types
             return self.module
-        else:
-            cache = self._build_pcache(self.shared_libs)
-            self._pcache_set("cpu.compile", cache_key, cache)
-            self.module = cache.module
-            self.engine = cache.engine
-            self.arg_types = cache.arg_types
-            self.res_types = cache.res_types
-            return self.module
+        cache = self._build_pcache(self.shared_libs)
+        self._pcache_set("cpu.compile", cache_key, cache)
+        self.module = cache.module
+        self.engine = cache.engine
+        self.arg_types = cache.arg_types
+        self.res_types = cache.res_types
+        return self.module
 
     def _build_pcache(self, shared_libs: list[str]) -> _CPUCompileCacheEntry:
         with stage("Compiling CPU Kernels"):

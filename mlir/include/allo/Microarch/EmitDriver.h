@@ -3,16 +3,6 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-//===----------------------------------------------------------------------===//
-// The emit driver: the `allo-datapath-to-hw` entry point and the module-level
-// work around each kernel's body. It walks the call DAG bottom-up, declares
-// the extern operator modules a kernel instantiates, and builds each module's
-// boundary.
-//
-// Everything here is per-MODULE or per-FUNCTION. The per-region emission it
-// drives lives in HWEmitter.h.
-//===----------------------------------------------------------------------===//
-
 #ifndef ALLO_MICROARCH_EMITDRIVER_H
 #define ALLO_MICROARCH_EMITDRIVER_H
 
@@ -20,7 +10,6 @@
 
 #include "circt/Dialect/HW/HWOps.h"
 
-#include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/Support/LLVM.h"
 #include "llvm/ADT/StringMap.h"

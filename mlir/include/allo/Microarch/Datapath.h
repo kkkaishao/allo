@@ -3,32 +3,14 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-//===----------------------------------------------------------------------===//
-// The L2 microarchitecture layer: an in-memory, value-typed, technology-
-// independent bound-datapath model that sits between the materialized schedule
-// (`allo.dcp.*` ops) and structural RTL (hw/seq/comb). It is deliberately not
-// an MLIR dialect: TableGen buys parse/print/round-trip, which this model will
-// never use. It DOES have several consumers and one model->model transform
-// (`applyBinding`), so what it needs is a verifier and a uniform traversal.
-// Neither of those comes from TableGen.
-//
-// Design invariant: the binder writes only the decision maps (op->unit,
-// value->reg, access->port); the structural cells (units/regs/muxes) and their
-// interconnect are *derived* from those decisions plus the schedule. Rebinding
-// is therefore "edit the maps, re-derive", and the emitter depends only on the
-// derived structure, never on which binding policy produced it.
-//
-// Register chains are modelled as one shift register, each consumer reading its
-// own tap; memref arguments are bare external memory interfaces (no AXI).
-//===----------------------------------------------------------------------===//
-
 #ifndef ALLO_MICROARCH_DATAPATH_H
 #define ALLO_MICROARCH_DATAPATH_H
 
 #include "allo/IR/AlloAttrs.h"           // MemoryImplEnum
+#include "allo/IR/AlloOps.h"             // dcp::DCPathModuleOp
 #include "allo/Scheduling/MemoryModel.h" // MemoryLibrary + BankLayout
+#include "allo/Scheduling/RegionGraph.h" // RegionShape
 
-#include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/AffineMap.h"
 #include "mlir/IR/Attributes.h"
 #include "mlir/IR/Operation.h"
@@ -637,24 +619,14 @@ struct RegionBlock {
   /// Every other cell is a shape the frontend cannot produce; `emitRegion`
   /// rejects rather than falling through, so a newly reachable one is a
   /// deliberate extension and not an emergent special case.
-  enum class Shape {
-    /// Runs a schedule itself: an II-paced pipeline or a straight-line
-    /// sequential. A `dcp.instance` inside one is a fixed-latency datapath
-    /// node (a `CallUnit`), not a child to sequence.
-    Leaf,
-    /// Drives child regions in its body (a loop wrapping an inner loop, or a
-    /// sequential wrapper), one hierarchical pass per outer iteration.
-    Container,
-    /// Predicates its children: a `dcp.select`, run-once under its `condition`.
-    Guard,
-    /// Hands off to an instantiated module: a counted loop whose entire body
-    /// is one `CallUnit`, advanced by the child's real `done` rather than by a
-    /// pipeline cadence. The child is on the *instance* substrate, which is why
-    /// this is not a `Container` (its children list is empty).
-    CallNode,
-  };
-  /// Derived once by `DatapathBuilder::deriveShapes`, after the region walk has
-  /// linked every parent/child edge and bound every CallUnit.
+  ///
+  /// The four cells are spelled once in `RegionShape`, so the reifier (which
+  /// charges each shape's boundary cost) and the emitter (which picks its
+  /// controller) cannot come to different answers.
+  using Shape = allo::RegionShape;
+  /// Read off the region op by `dcpRegionShape` in
+  /// `DatapathBuilder::deriveShapes`, which re-asks it of the BUILT model
+  /// (parent/child edges linked, CallUnits bound) and asserts the two agree.
   Shape shape = Shape::Leaf;
 
   enum class Kind { Cyclic, Acyclic } kind = Kind::Acyclic;
@@ -749,29 +721,24 @@ struct RegionBlock {
   /// values at all.
   llvm::SmallVector<AddrStride> addrStrides;
 
-  // Declared composition class + single-run latency, read off the region op's
-  // `determinacy` / `latency` (reifier `setDcpLatencies`) attrs.
+  // Composition class, DERIVED by `dcpRegionTiming` in `addRegion`. The region
+  // op carries it as an attribute too, but only as a report stamped from that
+  // same function, so this reads the region and not the report.
   //
-  // No consumer reads them structurally. They are declared for a time-triggered
-  // static composition step: `composeSiblings` hands EVERY sibling off by
-  // `risingEdge(join(done))`, even for a fully static schedule, and the static
-  // offset that would replace it is `staticLatency`, the single-run start->done
-  // depth (a pipeline's body length + (trip-1)*ii, a sequential's body length),
-  // plus one cycle per survivor-yielding region (the reifier's
-  // `regionBoundaryCost`).
-  //
-  // What they do carry is two asserted invariants, both drift guards on the
-  // reifier:
-  //   * `addRegion`: a present `staticLatency` implies
-  //     `determinacy == counted_static`. The converse fails, so `staticLatency`
-  //     (not `determinacy`) is the time-trigger gate.
-  //   * `deriveShapes`: `conditional` implies `determinacy == conditional`,
-  //     tying the emitter's termination discriminant to the declared one.
-  // The reifier stamps a `dcp.select` guard `conditional` with no `latency`
-  // (its run-once completion is data-dependent) and NOT `counted_static`, which
-  // is what makes the second invariant one-directional.
+  // `deriveShapes` asserts the one cross-axis invariant, that `conditional`
+  // implies `determinacy == conditional`, tying the emitter's termination
+  // discriminant to the derived class.
   DeterminacyEnum determinacy = DeterminacyEnum::Indeterminate;
-  std::optional<int64_t> staticLatency;
+
+  // The TERMINAL cycle the latency model was composed off (`drain` on the
+  // region op), against which `HWEmitter::emitRegion` checks the `drainStage`
+  // it independently derives from the built datapath.
+  //
+  // The one place a model of the hardware meets the hardware; every other check
+  // in the compiler compares one model against another. A leaf's `done` rises
+  // `drainStage + 1` cycles after its last issue, so a divergence here is a
+  // consumer placed at an offset the hardware does not honour.
+  std::optional<int64_t> modelledDrain;
 
   // Composition predecessors: the earlier top-level sibling regions this one
   // must start after. Only top-level regions populate it, since container
@@ -838,7 +805,7 @@ struct RegionBlock {
 //===----------------------------------------------------------------------===//
 
 struct Datapath {
-  func::FuncOp func;
+  dcp::DCPathModuleOp func;
   /// Whether this function is the TOP of the emitted design, i.e. whether its
   /// arguments name storage nobody in the design owns. A callee's array
   /// argument is a port it masters on its caller's storage, which is why the
@@ -882,7 +849,7 @@ struct Datapath {
   /// \p memLib is the device's storage-timing view (the `dcp.device` `memory:`
   /// table the scheduler timed every access against); it resolves each
   /// MemUnit's implementation and access latency.
-  Datapath(func::FuncOp func, const BindingPolicy &policy,
+  Datapath(dcp::DCPathModuleOp func, const BindingPolicy &policy,
            const MemoryLibrary &memLib, const CalleeCtx *callees = nullptr,
            bool isTop = false);
 

@@ -19,6 +19,7 @@ from allo.operators import math as amath
 from allo.lang.ip import ip
 from allo.backend.rtl.device import builtin_device
 from _common import (
+    Dcp,
     _to_rtl,
     _iis,
     FADD,
@@ -810,7 +811,7 @@ def test_correlation_folded_bound():
         corr[CM - 1, CM - 1] = 1.0
 
     rtl = _to_rtl(compute_corr)
-    assert "affine.if" not in rtl.dcp  # folded into the bound, not predicated
+    assert not Dcp(rtl).has("affine.if")  # folded into the bound, not predicated
     assert _iis(rtl.schedule().func("compute_corr").cyclic()) == [FADD]
 
     data = _f32(0, CN, CM)

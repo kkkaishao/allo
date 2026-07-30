@@ -2,8 +2,9 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import ast
-from .._mlir.ir import Context, FunctionType
 from collections.abc import Sequence
+
+from .._mlir.ir import Context, FunctionType
 from ..lang.core import TypeBase, ConstexprType, StreamType, ShapedType, DType
 
 

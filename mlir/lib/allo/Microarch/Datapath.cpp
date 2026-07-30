@@ -8,7 +8,6 @@
 
 #include "allo/IR/AlloOps.h"
 
-#include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/Support/raw_ostream.h"
 
@@ -27,10 +26,27 @@ unsigned dcpStart(Operation *op) {
 }
 
 unsigned dcpLatency(Operation *op) {
+  // An OPERATOR latency: the cycles between an op's issue and its result
+  // landing. A region carries a `latency` too, but that one is the whole
+  // region's start->done span, so answering for it would report a span as an
+  // operator delay.
+  assert(!isa<dcp::DCPathRegionOpInterface>(op) &&
+         "a region's `latency` is its whole span, not an operator latency");
   if (auto l = dyn_cast<dcp::DCPathLoadOp>(op))
     return static_cast<unsigned>(l.getLatency());
-  // An IP compute carries its operator's `latency`, stamped onto it at emit
-  // (see `stampOperatorTiming`); a combinational compute has none (latency 0).
+  // An IP compute takes its latency from the `dcp.operator` it names, which
+  // outlives emission for this reason; a combinational one lands in the cycle
+  // it issues.
+  if (auto comp = dyn_cast<dcp::DCPathComputeOp>(op)) {
+    FlatSymbolRefAttr sym = comp.getOpTypeAttr();
+    if (!sym)
+      return 0;
+    auto opr =
+        SymbolTable::lookupNearestSymbolFrom<dcp::DCPathOperatorOp>(comp, sym);
+    assert(opr && "a dcp.compute op_type must reference a live dcp.operator");
+    return static_cast<unsigned>(opr.getLatency());
+  }
+  // A store and a call carry their own `latency`, each an ODS field of its op.
   if (auto lat = op->getAttrOfType<IntegerAttr>("latency"))
     return static_cast<unsigned>(lat.getInt());
   return 0;
@@ -75,7 +91,7 @@ std::optional<int64_t> Datapath::constantOf(const Source &s) const {
   return ia ? std::optional<int64_t>(ia.getInt()) : std::nullopt;
 }
 
-Datapath::Datapath(func::FuncOp func, const BindingPolicy &policy,
+Datapath::Datapath(dcp::DCPathModuleOp func, const BindingPolicy &policy,
                    const MemoryLibrary &memLib, const CalleeCtx *callees,
                    bool isTop) {
   atTop = isTop;

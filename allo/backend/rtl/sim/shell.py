@@ -1,13 +1,7 @@
 # Copyright Allo authors. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Build the DUT and run it through ``cocotb_tools.runner``.
-
-``cosim`` emits the DUT (Verilog + extern-IP behavioral models + DPI), marshals
-the numpy arguments to files, runs the generic testbench (``cocotb_tb``) on the
-named simulator (verilator / icarus / ...), and reads the written arrays + cycle
-count back.
-"""
+"""Build the DUT and run it through ``cocotb_tools.runner``."""
 
 from __future__ import annotations
 
@@ -23,13 +17,13 @@ import numpy as np
 
 from . import ip_models
 from . import ports as _ports
+from ..interface import Interfaces, ModuleInterface
 
 _TB_MODULE = "allo.backend.rtl.sim.cocotb_tb"
 
 
 def available(simulator: str = "verilator") -> bool:
-    # Verilog is emitted in-process (CIRCT is linked into the package), so only
-    # the simulator itself is an external dependency.
+    # Verilog is emitted in-process, so only the simulator is external.
     return shutil.which(simulator) is not None
 
 
@@ -38,31 +32,18 @@ class CosimResult:
     cycles: int
     latency_ns: float
     waveform: Path | None = None
-    # The kernel's scalar return value sampled at `done`: the bare value for a
-    # single scalar result, a tuple for several, or None when the kernel returns
-    # nothing / only array (out-param) results. Array results are written back in
-    # place, so they do not appear here.
+    # The scalar return value sampled at `done`: bare for one result, a tuple
+    # for several, None for none. An array result is written back in place.
     result: object = None
 
 
-def interface_of(interfaces: dict, symbol: str) -> dict:
-    """The port manifest of the module emitted for the MLIR symbol ``symbol``.
-    The manifest is keyed by the RTL module name, which differs from the symbol
-    whenever the symbol needed legalizing (``top.child`` -> ``top_child``), so
-    the lookup goes through the manifest's own ``symbol`` field."""
-    for iface in interfaces.values():
-        if iface["symbol"] == symbol:
-            return iface
-    raise KeyError(f"no emitted module for symbol '{symbol}'")
-
-
 def _write_sources(
-    verilog: str, module: str, workdir: Path, operators, interfaces: dict
+    verilog: str, module: str, workdir: Path, operators, interfaces: Interfaces
 ) -> tuple[list[Path], list[str]]:
-    """Write the DUT Verilog (+ extern-IP behavioral models) and DPI C. Returns
-    (verilog_sources, build_args) for the runner. The extern-IP models and DPI are
-    generated from the device ``operators`` (kind/latency/dtypes) joined to the
-    extern instances the port manifest declares (realized port shape)."""
+    """Write the DUT Verilog (plus extern-IP behavioral models) and DPI C, and
+    return ``(verilog_sources, build_args)`` for the runner. The models come from
+    the device ``operators`` joined to the extern instances the manifest
+    declares."""
     dut = workdir / f"{module}.sv"
     dut.write_text(verilog + "\n" + ip_models.sv_models(interfaces, operators))
     build_args: list[str] = []
@@ -75,8 +56,9 @@ def _write_sources(
 
 
 def _build_config(
-    interface,
+    interface: ModuleInterface,
     mems,
+    regfiles,
     streams,
     arg_types,
     args,
@@ -86,7 +68,11 @@ def _build_config(
     workdir,
     stall_prob=0.0,
 ) -> dict:
-    """Serialize each backing array to ``.npy`` and build the testbench config."""
+    """Serialize each backing array to ``.npy`` and build the testbench config.
+
+    The testbench reads this as plain JSON from the simulator's embedded Python,
+    so every port object is projected back into a dict here; the model stops at
+    this boundary."""
     mem_cfgs = []
     for m in mems:
         tag = f"{m.arg}_b{m.bank}"  # one backing array per (argument, bank)
@@ -102,60 +88,99 @@ def _build_config(
                 "file_out": file_out,
                 "size": m.size,
                 "width": m.width,
-                "readers": m.readers,
-                "writers": m.writers,
+                "readers": [
+                    {"addr": r.addr, "data": r.data, "latency": r.latency}
+                    for r in m.readers
+                ],
+                "writers": [
+                    {"addr": w.addr, "data": w.data, "we": w.we, "latency": w.latency}
+                    for w in m.writers
+                ],
+            }
+        )
+    # A completely-partitioned argument: its whole bit pattern in flat element
+    # order, one value per port, always preloaded so an element the kernel never
+    # stores to passes through.
+    reg_cfgs = []
+    for rf in regfiles:
+        arg = rf.port.arg
+        bits = _ports.bit_pattern(args[arg], rf.np_dtype, rf.width)
+        file_in = workdir / f"in_reg{arg}.npy"
+        np.save(file_in, bits.astype(np.uint64))
+        # An unused direction stays absent rather than null.
+        elements = []
+        for e in rf.port.elements:
+            cfg = {}
+            if e.in_ is not None:
+                cfg["in"] = e.in_
+            if e.out is not None:
+                cfg["out"], cfg["we"] = e.out, e.we
+            elements.append(cfg)
+        reg_cfgs.append(
+            {
+                "file_in": str(file_in),
+                "file_out": (
+                    str(workdir / f"out_reg{arg}.npy") if rf.port.writeback else None
+                ),
+                "elements": elements,
             }
         )
     scalars = [
         {
-            "name": sc["name"],
-            "value": _ports.scalar_bits(args[sc["arg"]], arg_types[sc["arg"]]),
+            "name": sc.name,
+            "value": _ports.scalar_bits(args[sc.arg], arg_types[sc.arg]),
         }
-        for sc in interface["scalars"]
+        for sc in interface.scalars
     ]
-    # Streams: an input's token sequence is serialized to `.npy` (the feeder
-    # drives them through the valid/ready handshake); an output records where to
-    # write the drained tokens and how many to expect (its pre-allocated buffer's
-    # length). Each config carries the concrete handshake port names.
+    # An input stream's tokens are serialized to `.npy` for the feeder; an
+    # output records where to write the drained ones and how many to expect.
     stream_cfgs = []
     for s in streams:
+        p = s.port
         cfg = {
-            "base": s.base,
-            "data": s.data,
-            "valid": s.valid,
-            "ready": s.ready,
-            "input": s.is_input,
+            "base": p.base,
+            "data": p.data,
+            "valid": p.valid,
+            "ready": p.ready,
+            "input": p.is_input,
         }
-        if s.is_input:
-            bits = _ports.bit_pattern(np.asarray(args[s.arg]), s.np_dtype, s.width)
-            file_in = workdir / f"in_stream{s.arg}.npy"
+        if p.is_input:
+            bits = _ports.bit_pattern(np.asarray(args[p.arg]), s.np_dtype, s.width)
+            file_in = workdir / f"in_stream{p.arg}.npy"
             np.save(file_in, bits.astype(np.uint64))
             cfg["file_in"] = str(file_in)
         else:
-            cfg["count"] = int(np.asarray(args[s.arg]).reshape(-1).shape[0])
-            cfg["file_out"] = str(workdir / f"out_stream{s.arg}.npy")
+            cfg["count"] = int(np.asarray(args[p.arg]).reshape(-1).shape[0])
+            cfg["file_out"] = str(workdir / f"out_stream{p.arg}.npy")
         stream_cfgs.append(cfg)
+    ctl = interface.control
     return {
-        "top": interface["module"],
-        # The fixed control ports, read from the manifest like any other port.
-        "control": interface["control"],
+        "top": interface.module,
+        "control": {
+            "clk": ctl.clk,
+            "rst": ctl.rst,
+            "start": ctl.start,
+            "done": ctl.done,
+        },
         "clock_ps": clock_ps,
         "timeout": timeout,
         "reset_cycles": 3,
         "settle_cycles": 2,
         "mems": mem_cfgs,
+        "regfiles": reg_cfgs,
         "scalars": scalars,
         "streams": stream_cfgs,
         "stream_gap": stall_prob,
-        "result_ports": [r["name"] for r in interface["results"]],
+        "result_ports": [r.name for r in interface.results],
         "results_out": str(workdir / "results.json"),
         "cycles_out": str(workdir / "cycles.txt"),
     }
 
 
+# pylint: disable-next=too-many-arguments
 def cosim(
     verilog: str,
-    interfaces: dict,
+    interfaces: Interfaces,
     top: str,
     arg_types,
     args,
@@ -170,53 +195,55 @@ def cosim(
     stall_prob: float = 0.0,
 ) -> CosimResult:
     """Drive the emitted RTL under cocotb + ``simulator`` with the numpy ``args``,
-    bound to ports by the port manifest of the module ``top`` (an MLIR symbol; the
-    manifest names the RTL module it became). ``interfaces`` is the whole
-    {module -> manifest} map, since the extern-IP models cover every emitted
-    module, not just the top. Writes each output argument back in place; returns
-    the cycle count."""
+    bound to ports by the manifest of the module ``top`` (an MLIR symbol).
+    ``interfaces`` is the whole map, since the extern-IP models cover every
+    emitted module. Writes each output argument back in place and returns the
+    cycle count."""
     from cocotb_tools.runner import get_runner
 
     assert len(args) == len(
         arg_types
     ), f"cosim expected {len(arg_types)} kernel arguments, got {len(args)}"
-    interface = interface_of(interfaces, top)
-    module = interface["module"]
+    interface = interfaces.of_symbol(top)
+    module = interface.module
     mems = _ports.plan_mems(interface, arg_types)
+    regfiles = _ports.plan_regfiles(interface, arg_types)
     streams = _ports.plan_streams(interface, arg_types)
 
     tmp = workdir is None
     wd = Path(tempfile.mkdtemp(prefix="allo_cosim_")) if tmp else Path(workdir)
     wd.mkdir(parents=True, exist_ok=True)
+    # the whole simulator build/run is one unit; `finally` owns the cleanup
+    # pylint: disable-next=too-many-try-statements
     try:
         verilog_sources, build_args = _write_sources(
             verilog, module, wd, operators, interfaces
         )
         if simulator == "verilator":
-            # The extern-IP behavioral models are width-approximate -- a fixed
-            # 64-bit DPI backs a possibly-wider operator (e.g. a chained widened
-            # multiply is i96) -- so verilator's width-mismatch warnings are
-            # benign here. Keep them non-fatal; the golden comparison still
-            # catches any real value corruption.
+            # A fixed 64-bit DPI backs a possibly-wider operator, so
+            # verilator's width-mismatch warnings are benign here.
             build_args = ["-Wno-fatal", *build_args]
-            # Every DUT is built in a fresh directory, so each one recompiles the
-            # same verilator runtime translation units from scratch. Verilator's
-            # makefile prefixes each compile with OBJCACHE, so pointing that at a
-            # compiler cache turns all but the first build into a hit. An explicit
-            # setting wins, including an empty one that opts out.
+            # Each DUT builds in a fresh directory and recompiles the same
+            # verilator runtime units, which OBJCACHE turns into cache hits. An
+            # explicit setting wins, including an empty one that opts out.
             if "OBJCACHE" not in os.environ:
                 cache = next(
                     (c for c in ("ccache", "sccache") if shutil.which(c)), None
                 )
                 if cache:
                     os.environ["OBJCACHE"] = cache
-        # Clock period as an even integer ps (cocotb splits it into two half
-        # periods); it only affects sim time, not the reported cycle count.
+            # A `.gch` records the path it was built from, so a cached one
+            # names a deleted temp dir and the compile fails. Drop `pch_defines`
+            # to decline it and keep `time_macros`, which caches the rest.
+            os.environ.setdefault("CCACHE_SLOPPINESS", "time_macros")
+        # An even integer ps, since cocotb splits it into two half periods. It
+        # only affects sim time, not the reported cycle count.
         clock_ps = round(1.0e6 / freq_mhz)
         clock_ps += clock_ps & 1
         cfg = _build_config(
             interface,
             mems,
+            regfiles,
             streams,
             arg_types,
             args,
@@ -257,16 +284,25 @@ def cosim(
                 )
                 vals = _ports.from_bits(bits, m.np_dtype, m.width, (m.size,))
                 m.scatter_out(args[m.arg], vals)
+        # A written scattered argument: its registers are flat and unbanked, so
+        # the drained values land straight back in the caller's array.
+        for rf in regfiles:
+            if rf.port.writeback:
+                buf = args[rf.port.arg]
+                bits = np.load(wd / f"out_reg{rf.port.arg}.npy").astype(
+                    _ports._UINT[rf.width]
+                )
+                buf[...] = _ports.from_bits(bits, rf.np_dtype, rf.width, buf.shape)
         # Drained output-stream tokens, written into the caller's buffer in place.
         for s in streams:
-            if not s.is_input:
-                buf = np.asarray(args[s.arg])
-                bits = np.load(wd / f"out_stream{s.arg}.npy").astype(
+            if not s.port.is_input:
+                buf = np.asarray(args[s.port.arg])
+                bits = np.load(wd / f"out_stream{s.port.arg}.npy").astype(
                     _ports._UINT[s.width]
                 )
                 buf[...] = _ports.from_bits(bits, s.np_dtype, s.width, buf.shape)
-        # Decode each sampled scalar-result port by its return type (the manifest
-        # order matches the scalar `result_types`); surface a bare value / tuple.
+        # Decode each sampled result port by its return type; the manifest order
+        # matches `result_types`.
         raw = json.loads((wd / "results.json").read_text())
         assert len(raw) == len(
             result_types

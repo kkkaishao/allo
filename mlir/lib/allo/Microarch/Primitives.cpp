@@ -347,6 +347,11 @@ Value EmitContext::holdDone(Value setPulse, Value start) {
   return done;
 }
 
+Value EmitContext::completedSince(Value level, Value passStart) {
+  Value edge = risingEdge(level);
+  return andBits(orBits(holdDone(edge, passStart), edge), notBit(passStart));
+}
+
 std::pair<Value, Value> EmitContext::branchPulse(Value when, Value cond) {
   return {andBits(when, cond), andBits(when, notBit(cond))};
 }

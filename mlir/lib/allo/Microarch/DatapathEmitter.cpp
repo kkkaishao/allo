@@ -4,8 +4,8 @@
  */
 
 #include "allo/Microarch/HWEmitter.h"
-#include "allo/Scheduling/AddressCost.h" // addressExprsOf (offset + bank digit)
-#include "allo/Scheduling/MemoryModel.h" // BankLayout
+#include "allo/Scheduling/AddressModel.h" // addressExprsOf (offset + bank digit)
+#include "allo/Scheduling/MemoryModel.h"  // BankLayout
 
 #include "circt/Dialect/Comb/CombOps.h"
 #include "circt/Dialect/Seq/SeqOps.h"
@@ -1413,7 +1413,9 @@ void DatapathEmitter::emitComposedChannel(const uarch::StreamChannel &s) {
 //     none of its own), a consumer of a scalar result (that port only holds
 //     from the producer's `done`, so an exact-cycle release is not a safe
 //     contract even against a determinate producer), or a child gated by an
-//     indeterminate producer (there is no cycle to name);
+//     indeterminate producer (there is no cycle to name). A CHANNEL-CONNECTED
+//     pair never reaches here: `recordCallDeps` records no edge between two,
+//     since back-pressure is already their ordering;
 //   * BROADCAST, the container's own start, for an ungated spawn, ordered
 //     thereafter by FIFO back-pressure alone;
 //   * TIME-TRIGGERED at the scheduled offset otherwise, which in a SCHEDULED
@@ -1426,6 +1428,18 @@ void DatapathEmitter::emitComposedChannel(const uarch::StreamChannel &s) {
 //     predecessor declares a latency, but the declaration is not tight enough
 //     to release a memory-hazard consumer against, so `done` remains the
 //     contract.
+//
+// A child's `done` is a level its own start clears, so on a retriggered region
+// it still reads the previous pass's 1 until the child is released, which for
+// both an offset and a handshake is after `issue`. The two readers that mean
+// "completed THIS pass", the predecessor join and the region's completion
+// conjunction, therefore take it through `completedSince(issue)`; it rises the
+// same cycle `done` does, so timing within a pass is unchanged. A SCHEDULED
+// composition only, since there `issue` is the pass-start pulse the calls are
+// placed against. A CONCURRENT one has no such boundary, its children being
+// spawns paced by channel back-pressure rather than by a pass, and its start
+// policy holds `issue` out of a handshake's cone on purpose: a handshake there
+// must not become a time-trigger wearing a mask.
 Value DatapathEmitter::startForCall(const uarch::CallUnit &cu, Value issue,
                                     ArrayRef<Value> predDones, bool concurrent,
                                     const StallShell &sh) {
@@ -1576,13 +1590,18 @@ void DatapathEmitter::emitCalls(const uarch::RegionBlock &rb, Value issue,
             c.R(seq::ReadPortOp::create(c.b, c.loc, hlmem, ValueRange{addr},
                                         /*rdEn=*/Value(), m.readLatency)));
     }
-    doneByCid[cu.id] = outs[kDone];
-    dones.push_back(outs[kDone]);
+    // Scoped to this pass for the join above and the conjunction below, both of
+    // which mean "completed THIS pass" and would otherwise read the previous
+    // one's latched 1 (see the note on the start policy above).
+    Value completed =
+        concurrent ? outs[kDone] : c.completedSince(outs[kDone], issue);
+    doneByCid[cu.id] = completed;
+    dones.push_back(completed);
     if (!cu.streamArgs.empty())
       callOuts[cu.id] = std::move(outs);
   }
-  // The region completes when every call has: the AND of their held dones
-  // (last-to-finish; a serial chain degenerates to the last call's done).
+  // The region completes when every call has: the AND of their dones
+  // (last-to-finish; a serial chain degenerates to the last call's).
   Value all;
   for (Value d : dones)
     all = all ? c.andBits(all, d) : d;

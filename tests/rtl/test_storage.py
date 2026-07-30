@@ -15,11 +15,12 @@ from allo import kernel
 from allo.lang import f32, i32, u8, index, Stateful, Stream
 from allo.schedule import Schedule
 from allo.backend.base import run_pipeline
+from allo.backend.rtl import Memory, RegisterFile
 from allo.backend.rtl.device import builtin_device, MemoryKind
 from allo.backend.rtl.schedule import RTL_PREPARE_PIPELINE
 
 sys.path.insert(0, os.path.dirname(__file__))
-from _common import _sched, _to_rtl, _iis, FADD, MEM, MEM_URAM  # noqa: E402
+from _common import Dcp, _walk, _sched, _to_rtl, _iis, FADD, MEM, MEM_URAM  # noqa: E402
 
 pytestmark = pytest.mark.skipif(
     shutil.which("verilator") is None, reason="verilator not available"
@@ -111,7 +112,7 @@ def test_banked_boundary_argument():
     mod = s.export("rtl")
     # The boundary carries per-port bank info (both banks reached).
     iface = mod.interfaces[mod.top]
-    assert {r["bank"] for acc in iface["reads"] for r in acc} == {0, 1}
+    assert {r.bank for acc in iface.reads for r in acc} == {0, 1}
     # Both halves of the split are derived on the affine expression, so both
     # fold: bank `(2i) mod 2` is a constant and offset `(2i) floordiv 2` is the
     # counter itself. A statically banked access therefore emits NO address
@@ -137,8 +138,8 @@ def test_banked_boundary_argument():
     mod = s.export("rtl")
     # Each argument presents two bank interfaces (_b0/_b1), not one flat port.
     iface = mod.interfaces[mod.top]
-    rbases = {r["base"] for acc in iface["reads"] for r in acc}
-    wbases = {w["base"] for acc in iface["writes"] for w in acc}
+    rbases = {r.base for acc in iface.reads for r in acc}
+    wbases = {w.base for acc in iface.writes for w in acc}
     assert {"A_rd0_b0", "A_rd0_b1"} <= rbases
     assert {"out_wr0_b0", "out_wr0_b1"} <= wbases
 
@@ -181,9 +182,9 @@ def test_banking_beyond_1d_pow2_cyclic():
     s = eblk.schedule()
     s.partition("A", dim=1, kind=s.Block, factor=2)
     mod = s.export("rtl")
-    rd = [r for acc in mod.interfaces[mod.top]["reads"] for r in acc]
-    assert rd[0]["axes"] == [{"dim": 0, "factor": 2, "kind": "block"}]
-    assert rd[0]["shape"] == [16]
+    rd = [r for acc in mod.interfaces[mod.top].reads for r in acc]
+    assert rd[0].axes == (Memory.Axis(0, 2, "block"),)
+    assert rd[0].shape == (16,)
     out = np.zeros(16, np.int32)
     mod.cosim(A16, out)
     assert np.array_equal(out, A16 + 1)
@@ -442,12 +443,14 @@ def test_the_bank_an_access_reaches_is_decided_once():
     s = mixed.schedule()
     s.partition("buf", dim=1, kind=s.Cyclic, factor=2)
     mod = s.export("rtl")
-    banked = [ln for ln in mod.dcp.splitlines() if "%alloc[" in ln]
-    assert [re.search(r"bank (\d+)", ln).group(1) for ln in banked if "bank" in ln] == [
-        "0",
-        "1",
+    fn = Dcp(mod).func("mixed")
+    (alloc,) = fn.ops("memref.alloc")
+    access = fn.accesses(alloc.results[0])
+    assert [a.attributes["bank"].value for a in access if "bank" in a.attributes] == [
+        0,
+        1,
     ]
-    assert sum("bank" not in ln for ln in banked) == 1  # the roaming write
+    assert sum("bank" not in a.attributes for a in access) == 1  # the roaming write
 
     # A BLOCK partition now splits, which it never could while the split ran its
     # own cyclic-only predicate: a block axis is statically banked at a constant
@@ -505,7 +508,8 @@ def test_composed_banking():
     s = cbi_top.schedule()
     s.partition("tmp", dim=1, kind=s.Cyclic, factor=2)
     mod = s.export("rtl")
-    assert "dcp.instance @cbi_top.cbi_prod(" in mod.dcp  # the leaf CallUnit path
+    # the leaf CallUnit path
+    assert "cbi_top.cbi_prod" in Dcp(mod).func("cbi_top").callees()
     assert re.findall(r"seq\.hlmem @(\w+) [^:]*: <(\d+)x", mod.mlir) == [
         ("tmp_b0", "8"),
         ("tmp_b1", "8"),
@@ -532,9 +536,9 @@ def test_composed_banking():
     s = cbb_top.schedule()
     s.partition("A", dim=1, kind=s.Cyclic, factor=2)
     mod = s.export("rtl")
-    assert "dcp.instance @cbb_top.cbb(" in mod.dcp
-    rd = [g[0] for g in mod.interfaces["cbb_top"]["reads"]]
-    assert {(r["arg"], r["bank"], r["factor"]) for r in rd} == {(0, 0, 2), (0, 1, 2)}
+    assert "cbb_top.cbb" in Dcp(mod).func("cbb_top").callees()
+    rd = [g[0] for g in mod.interfaces["cbb_top"].reads]
+    assert {(r.arg, r.bank, r.factor) for r in rd} == {(0, 0, 2), (0, 1, 2)}
     o = np.zeros(16, np.int32)
     mod.cosim(A16, o)
     assert np.array_equal(o, np.where(np.arange(16) % 2 == 0, A16 + 1, A16 + 100))
@@ -616,7 +620,11 @@ def test_partitions_of_two_kernels_compose_across_dimensions():
     s.compose(ps, cs)
     mod = s.export("rtl")
     # Both axes, one attribute, on the buffer and on both children alike.
-    assert mod.dcp.count("#allo.partition<[(1,Cyclic,2), (2,Cyclic,2)]>") == 3
+    d = Dcp(mod)
+    (alloc,) = d.func("xd_top").ops("memref.alloc")
+    part = alloc.attributes["allo.part"]
+    assert d.func("xd_top.xd_prod").arg_attrs("allo.part") == [part]
+    assert d.func("xd_top.xd_cons").arg_attrs("allo.part") == [part]
     assert re.findall(r"seq\.hlmem @(\w+) [^:]*: <(\d+)x", mod.mlir) == [
         ("buf_b0", "4"),
         ("buf_b1", "4"),
@@ -829,8 +837,8 @@ def test_a_skewed_argument_keeps_the_conservative_billing():
     s = ext.schedule()
     s.partition("Ain", dim=2, kind=s.Skew, factor=4)
     mod = s.export("rtl")
-    rd = [r for acc in mod.interfaces[mod.top]["reads"] for r in acc]
-    assert rd[0]["axes"] == [{"dim": 1, "factor": 4, "kind": "skew"}]
+    rd = [r for acc in mod.interfaces[mod.top].reads for r in acc]
+    assert rd[0].axes == (Memory.Axis(1, 4, "skew"),)
     out = np.zeros((8, 8), np.int32)
     mod.cosim(A88, out)
     assert np.array_equal(out, A88 + 1)
@@ -1385,7 +1393,7 @@ def test_multicycle_storage_on_argument_cosim():
     # the URAM argument's read ports declare 2 cycles, the 1-cycle default 1.
     def read_latencies(rtl):
         iface = rtl.interfaces["argmem"]
-        return {p["latency"] for acc in iface["reads"] for p in acc}
+        return {p.latency for acc in iface.reads for p in acc}
 
     assert read_latencies(argmem_rtl(Schedule.URAM)) == {2}
     assert read_latencies(argmem_rtl(None)) == {1}
@@ -1489,7 +1497,7 @@ def test_a_container_local_buffer_is_on_chip_storage():
     # The buffer is internal: it must not show up as a boundary interface.
     top = mod.interfaces[mod.top]
     assert not any(
-        m["base"].startswith("tmp") for acc in top["reads"] + top["writes"] for m in acc
+        m.base.startswith("tmp") for acc in top.reads + top.writes for m in acc
     ), top
     out = np.zeros(N, np.int32)
     mod.cosim(out)
@@ -1802,7 +1810,6 @@ def test_a_forwarded_buffer_costs_no_storage():
 
 # --- dead-initializer elision -----------------------------------------------
 
-_STORE = re.compile(r"\b(?:affine|memref)\.store\b")
 _NO_ELIDE = RTL_PREPARE_PIPELINE.replace("elide-dead-init,\n", "")
 
 MIXED = np.array([3, -1, 7, -4, 0, 5, -9, 2], np.int32)
@@ -1815,7 +1822,9 @@ def _stores(kernel_fn):
     for pipeline in (_NO_ELIDE, RTL_PREPARE_PIPELINE):
         module = kernel_fn.schedule().module
         run_pipeline(module, pipeline)
-        counts.append(len(_STORE.findall(str(module))))
+        counts.append(
+            len(_walk(module, "affine.store")) + len(_walk(module, "memref.store"))
+        )
     return tuple(counts)
 
 
@@ -2509,13 +2518,13 @@ def test_a_complete_partitioned_argument_becomes_element_ports():
     # unlimited combinational ports a Complete partition bills the scheduler for.
     mod = _scattered()
     iface = mod.interfaces["scatter"]
-    (rf,) = iface["registers"]
+    (rf,) = iface.registers
     # Read-only, so the bare name and no output side at all.
-    assert rf["elements"] == [{"in": f"A_{k}"} for k in range(8)], rf
-    assert rf["width"] == 32 and rf["shape"] == [8]
+    assert rf.elements == tuple(RegisterFile.Element(f"A_{k}") for k in range(8)), rf
+    assert rf.width == 32 and rf.shape == (8,)
     # It is a register file, NOT an addressed port group: `A` appears in neither
     # read nor write interfaces, and takes no address port.
-    assert all(p["arg"] != 0 for acc in iface["reads"] for p in acc), iface["reads"]
+    assert all(p.arg != 0 for acc in iface.reads for p in acc), iface.reads
     assert "A_rd0_addr" not in mod.verilog
 
     out = np.zeros(8, np.int32)
@@ -2576,12 +2585,8 @@ def test_a_read_write_scattered_argument_splits_its_directions():
     s = rmw.schedule()
     s.partition("A", kind=s.Complete)
     mod = s.export("rtl")
-    (rf,) = mod.interfaces["rmw"]["registers"]
-    assert rf["elements"][0] == {
-        "in": "A_0_in",
-        "out": "A_0_out",
-        "we": "A_0_out_we",
-    }, rf
+    (rf,) = mod.interfaces["rmw"].registers
+    assert rf.elements[0] == RegisterFile.Element("A_0_in", "A_0_out", "A_0_out_we"), rf
 
     a = A8.copy()
     mod.cosim(a)
@@ -2600,8 +2605,8 @@ def test_a_write_only_scattered_argument_keeps_the_bare_name():
     s = wo.schedule()
     s.partition("A", kind=s.Complete)
     mod = s.export("rtl")
-    (rf,) = mod.interfaces["wo"]["registers"]
-    assert rf["elements"][0] == {"out": "A_0", "we": "A_0_we"}, rf
+    (rf,) = mod.interfaces["wo"].registers
+    assert rf.elements[0] == RegisterFile.Element(None, "A_0", "A_0_we"), rf
 
     a = A8.copy()
     mod.cosim(a)

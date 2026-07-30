@@ -4,6 +4,7 @@
  */
 
 #include "allo/Microarch/HWEmitter.h"
+#include "allo/Scheduling/LatencyModel.h"
 
 #include "circt/Dialect/Comb/CombOps.h"
 
@@ -155,6 +156,14 @@ Value HWEmitter::emitRegion(const uarch::RegionBlock &rb, Value start,
       rb.conditional ? ctx.andBits(rc.issue, term.cond) : lastIssue;
   unsigned resultDrain = captureResults(rb, captureOn, start);
   unsigned drainStage = std::max(fb.storeDrain, resultDrain);
+  // The model against the hardware, at the one point they meet. A stream region
+  // is excluded because `resolveAccessOperands` re-stamps its put stages, a
+  // call-holding leaf because it also waits on the child's `done`.
+  assert((!rb.modelledDrain || !rb.streamAccesses.empty() ||
+          !rb.callUnits.empty() ||
+          static_cast<int64_t>(drainStage) == *rb.modelledDrain) &&
+         "the composed span's drain disagrees with the built datapath's; a "
+         "consumer placed against it samples on the wrong cycle");
 
   // A counted leaf that is empty (lb >= ub) issues nothing, so it completes
   // on `start` via `emptyDone`, delayed one cycle so the pulse doesn't land
@@ -279,8 +288,12 @@ Value HWEmitter::composeSiblings(llvm::ArrayRef<uarch::RegionId> regions,
     }
     Value startK = ctx.startFor(start, predDones);
     Value done = emitRegion(rb, startK, /*retrig=*/true);
-    doneOf[rid] = done;
-    allDone = allDone ? ctx.andBits(allDone, done) : done;
+    // A lone region is its own conjunction and has no consumer to hand a stale
+    // level to, so it keeps the raw done.
+    Value completed =
+        regions.size() > 1 ? ctx.completedSince(done, start) : done;
+    doneOf[rid] = completed;
+    allDone = allDone ? ctx.andBits(allDone, completed) : completed;
   }
   return allDone;
 }
@@ -442,10 +455,10 @@ Value HWEmitter::emitGuard(const uarch::RegionBlock &rb, Value start) {
   // data-dependent scf guard), or the parent container's combinational
   // predicate unit (an affine guard, emitted by the container beforehand).
   Value cond = datapath.resolveSource(rb.condition);
-  // CHECK one cycle after start (as in emitConditionalContainer): this
+  // CHECK after the guard's arm cost (as in emitConditionalContainer): this
   // decouples the completion pulse from the start-clear below, since a
   // skipped guard's done would otherwise coincide with `start` and be masked.
-  Value checkTime = ctx.reg(start, ctx.f1);
+  Value checkTime = ctx.delayValid(start, kGuardBoundary.arm, StallShell{});
   nameValue(checkTime, regionSignal(rb.id, "check"));
   // Two mutually-exclusive arm pulses: thenStart and elseStart.
   auto [thenStart, elseStart] = ctx.branchPulse(checkTime, cond);

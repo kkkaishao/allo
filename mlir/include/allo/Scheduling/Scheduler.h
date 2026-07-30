@@ -6,6 +6,8 @@
 #ifndef ALLO_SCHEDULING_SCHEDULER_H
 #define ALLO_SCHEDULING_SCHEDULER_H
 
+#include "allo/Scheduling/ScheduleModel.h"
+
 #include "circt/Scheduling/Problems.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/Operation.h"
@@ -289,10 +291,28 @@ solveSchedulingProblem(ChainingSharedOperatorsProblem &problem,
   return success();
 }
 
-LogicalResult runPreScheduleVerification(ModuleOp module, StringRef top);
+/// Reject a kernel the backend cannot schedule at all: an unmodelled memory
+/// effect, an unrealizable operator, an illegal channel or partition, and an
+/// address cone that does not fit in \p cycleTime. Everything here is a
+/// property of the input rather than of a scheduling decision, so it is settled
+/// before a single problem is built.
+///
+/// \p cycleTime is the RESOLVED target period in ns (the caller applies the
+/// default), so this and `runSDCScheduler` price against one number.
+LogicalResult runPreScheduleVerification(ModuleOp module, StringRef top,
+                                         float cycleTime);
+
+/// Solve the schedule of every func reachable from \p top, recording it in
+/// \p model. The IR is left in affine/scf form; nothing is materialized.
+/// \p cycleTime is the resolved target period in ns, as above.
 LogicalResult runSDCScheduler(ModuleOp module, StringRef top, float cycleTime,
-                              SchedulerKind kind);
-void runPostScheduleConversion(ModuleOp module);
+                              SchedulerKind kind, ScheduleModel &model);
+
+/// Reify \p model onto the IR as `dcp.*` regions. It runs immediately after the
+/// scheduler over the same module, which is what makes the model's `Operation
+/// *` keys valid; it also ADDS to the model, for the condition cones and
+/// symbolic bounds it schedules itself.
+void runPostScheduleConversion(ModuleOp module, ScheduleModel &model);
 
 } // namespace mlir::allo
 

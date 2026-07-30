@@ -13,7 +13,7 @@ add_mlir_library(MLIRAlloMicroarch
     Naming.cpp
     Reservation.cpp
     Interface.cpp
-    Verify.cpp
+    Verification.cpp
 
     DEPENDS
     MLIRAlloIncGen

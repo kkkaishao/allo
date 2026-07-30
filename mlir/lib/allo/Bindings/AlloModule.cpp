@@ -113,28 +113,23 @@ NB_MODULE(_allo, m) {
   allo.def(
       "run_sdc_scheduling",
       [](MlirModule module, const std::string &top, float cycleTime,
-         const std::string &scheduler) -> bool {
-        return mlirLogicalResultIsSuccess(alloRunSDCSchedulingPipeline(
-            module, mlirStringRefCreate(top.data(), top.size()), cycleTime,
-            mlirStringRefCreate(scheduler.data(), scheduler.size())));
+         const std::string &scheduler) -> std::optional<std::string> {
+        std::string out;
+        if (mlirLogicalResultIsFailure(alloRunSDCSchedulingPipeline(
+                module, mlirStringRefCreate(top.data(), top.size()), cycleTime,
+                mlirStringRefCreate(scheduler.data(), scheduler.size()),
+                appendToString, &out)))
+          return std::nullopt;
+        return out;
       },
       nb::arg("module"), nb::arg("top"), nb::arg("cycle_time"),
-      nb::arg("scheduler") = "heuristic");
+      nb::arg("scheduler") = "heuristic",
+      "Schedule `top` and reify the schedule into `module` in place as "
+      "`allo.dcp.*` ops; return the schedule report as JSON (regions, per-op "
+      "start times, latencies), or None if scheduling fails.");
   allo.def("has_exact_scheduler", &alloHasExactScheduler,
            "Whether this build accepts `scheduler=\"exact\"`, i.e. links "
            "OR-Tools.");
-  allo.def(
-      "dump_region_dependence_analysis",
-      [](MlirModule module, const std::string &funcName) {
-        std::string out;
-        MlirStringRef ref =
-            mlirStringRefCreate(funcName.data(), funcName.length());
-        alloDumpRegionDependenceAnalysis(module, ref, appendToString, &out);
-        return out;
-      },
-      nb::arg("module"), nb::arg("func_name"),
-      "Dump a coarse cross-region dependence graph (analysis only) to a DOT "
-      "file (for visualization in Graphviz).");
 
   //===--------------------------------------------------------------------===//
   // schedule

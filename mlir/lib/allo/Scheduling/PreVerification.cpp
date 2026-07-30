@@ -4,7 +4,9 @@
  */
 
 #include "allo/IR/AlloOps.h"
+#include "allo/Scheduling/AddressModel.h"       // addressExprsOf, addressCostOf
 #include "allo/Scheduling/DependenceAnalysis.h" // isUnmodeledMemoryAccess
+#include "allo/Scheduling/MemoryAccess.h"       // asMemAccess
 #include "allo/Scheduling/MemoryModel.h"
 #include "allo/Scheduling/OperatorLibrary.h"
 #include "allo/Scheduling/ProblemBuilder.h" // whileFlushingPipelines
@@ -21,7 +23,7 @@
 #include "mlir/Interfaces/LoopLikeInterface.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/MapVector.h"
-#include "llvm/ADT/SetVector.h"
+#include "llvm/Support/Format.h"
 
 using namespace mlir;
 using namespace mlir::allo;
@@ -648,7 +650,122 @@ LogicalResult checkChannelCycles(func::FuncOp func,
   return failure();
 }
 
-LogicalResult allo::runPreScheduleVerification(ModuleOp module, StringRef top) {
+//===----------------------------------------------------------------------===//
+// Address cost: the check, and the report behind it.
+//
+// `OperatorLibrary::lookup` charges an access's address cone to the port it
+// feeds. What it cannot do is SPLIT one: an address is folded into the access's
+// affine map rather than standing as its own operation, so there is nowhere to
+// put a register and chaining can only accept or reject. CIRCT rejects it by
+// `emitError`-ing on the whole containing op (`ChainingSupport.cpp:34`), which
+// names neither the access nor the expression, so the same condition is tested
+// here first and reported against the address that caused it.
+//
+// The number is the cost of the address the emitter ACTUALLY builds
+// (`addressExprsOf`): the in-bank offset rather than the flat index, plus the
+// bank digit when one is decoded at runtime, carried at the addressed bank's
+// own width, with constant coefficients as signed-digit shift-adds and only
+// the dividers pinned to the full datapath width (they are the one thing that
+// cannot be narrowed). So the price, the report and the netlist agree, with no
+// assumption that a synthesis tool narrows anything afterwards.
+//
+// EVERY array access is priced, the non-affine ones included. Their subscript
+// is timed compute, but the row-major linearization over it and the bank digit
+// off it are address arithmetic like any other, and the emitter builds both.
+//
+// The per-access lines are `debug` level, so a normal compile sees only the
+// rejection; `ALLO_LOG_LEVEL=debug` shows every priced address.
+//===----------------------------------------------------------------------===//
+static LogicalResult checkAddressCost(func::FuncOp funcOp,
+                                      const OperatorLibrary &lib,
+                                      float cycleTimeNs) {
+  bool fits = true;
+  unsigned total = 0, nonTrivial = 0, overCycle = 0, banked = 0,
+           withDivider = 0;
+  double worstNow = 0.0;
+
+  funcOp.walk([&](Operation *op) {
+    std::optional<MemAccess> a = asMemAccess(op);
+    if (!a || a->kind != AccessKind::Array)
+      return;
+    ++total;
+    // The expressions the emitter evaluates, priced the way it will build them
+    // (strength-reduced where they can be), so the number printed and the
+    // number charged are the same number.
+    auto shape = cast<MemRefType>(a->root.getType()).getShape();
+    AddressExprs e = addressExprsOf(bankLayoutOf(a->root), a->map, shape,
+                                    assignedBankOf(op));
+    if (e.bank)
+      ++banked;
+    AddressCost cost = addressCostOf(op, lib);
+    if (cost.trivial())
+      return;
+    ++nonTrivial;
+    worstNow = std::max(worstNow, cost.delay);
+    if (cost.dividers)
+      ++withDivider;
+    // Name both cones, since either can be the one that does not fit.
+    std::string addr;
+    llvm::raw_string_ostream os(addr);
+    os << e.offset;
+    if (e.bank)
+      os << " (bank " << e.bank << ")";
+    // Test what the solver will see rather than the cone alone: the port's own
+    // setup rides on the same combinational path, and `lookup` is the one place
+    // that adds them, so asking it is what keeps this from drifting.
+    double charged = lib.lookup(op).inDelay;
+    bool over = charged > cycleTimeNs;
+    if (over) {
+      ++overCycle;
+      fits = false;
+      unsupported(Stage::Prep, op)
+          << "computing the address " << addr << " takes "
+          << llvm::format("%.2f", cost.delay)
+          << " ns, which with the storage port's own setup is "
+          << llvm::format("%.2f", charged) << " ns against a "
+          << llvm::format("%.2f", cycleTimeNs)
+          << " ns clock period. The backend cannot pipeline an address: it is "
+             "folded into the access's address map rather than scheduled as an "
+             "operation of its own, so there is nowhere to place a register. "
+             "Compute the subscript into a variable so it becomes a "
+             "schedulable value, partition by a power of two so the bank digit "
+             "is a mask rather than a divider, or lower the target frequency";
+    }
+    // A real divider is a narrow case worth naming (a loop-counter digit is a
+    // register, a power-of-two divisor a mask); speaks only when the address
+    // still fits, since the rejection above already covers the failing case.
+    if (cost.dividers && !over)
+      warn(Stage::Prep, op)
+          << "The address " << addr << " costs "
+          << llvm::format("%.2f", cost.delay)
+          << " ns because it divides at "
+             "runtime. A divisor that is a power of two is a mask, and a "
+             "dividend that advances with a loop counter is a register the "
+             "controller maintains; a divider is what is left when the "
+             "subscript is neither. Choose a power-of-two partition factor, or "
+             "index the array by a loop counter";
+    debug(Stage::Prep, op) << "Address " << addr << ": "
+                           << llvm::format("%.2f", cost.delay) << " ns"
+                           << (over ? " (OVER the clock period)" : "") << " at "
+                           << e.width << "b [" << cost.adders << " add, "
+                           << cost.dividers << " div, " << cost.multipliers
+                           << " mul]";
+  });
+
+  if (!total)
+    return success(fits);
+  debug(Stage::Prep) << "Address arithmetic in " << funcOp.getSymName().str()
+                     << ": " << nonTrivial << "/" << total
+                     << " array accesses cost logic, worst "
+                     << llvm::format("%.2f", worstNow) << " ns (" << overCycle
+                     << " over the " << llvm::format("%.2f", cycleTimeNs)
+                     << " ns period, " << withDivider << " carrying a divider, "
+                     << banked << " decoding a bank at runtime)";
+  return success(fits);
+}
+
+LogicalResult allo::runPreScheduleVerification(ModuleOp module, StringRef top,
+                                               float cycleTimeNs) {
   module->getContext()->getOrLoadDialect<func::FuncDialect>();
 
   auto topFunc = module.lookupSymbol<func::FuncOp>(top);
@@ -656,29 +773,25 @@ LogicalResult allo::runPreScheduleVerification(ModuleOp module, StringRef top) {
     error(Stage::Prep, module) << "Top function '" << top << "' not found";
     return failure();
   }
-  auto orderOr = buildAndSortCallsiteGraph(topFunc);
-  if (failed(orderOr))
-    return failure();
-
   // The closure the emit driver visits, callees before callers so a call can
   // read facts already computed for its callee.
-  SetVector<Operation *> closure;
-  SymbolTableCollection syms;
-  for (Operation *op : *orderOr)
-    if (auto callee = syms.lookupNearestSymbolFrom<func::FuncOp>(
-            op, cast<func::CallOp>(op).getCalleeAttr());
-        callee && !callee.isExternal())
-      closure.insert(callee);
-  closure.insert(topFunc);
+  auto closureOr = callGraphPostOrder(topFunc);
+  if (failed(closureOr))
+    return failure();
 
   OperatorLibrary lib = OperatorLibrary::fromModule(module);
   llvm::DenseMap<std::pair<Operation *, unsigned>, bool> streamArgIsInput;
   DenseSet<Value> boundaryArrays = boundaryArraysOf(topFunc);
-  for (Operation *op : closure)
-    recordStreamArgDirections(cast<func::FuncOp>(op), streamArgIsInput);
-  for (Operation *op : closure)
-    if (failed(verifyFunc(cast<func::FuncOp>(op), module, lib, streamArgIsInput,
-                          boundaryArrays, op == topFunc.getOperation())))
+  for (func::FuncOp fn : *closureOr)
+    recordStreamArgDirections(fn, streamArgIsInput);
+  for (func::FuncOp fn : *closureOr)
+    if (failed(verifyFunc(fn, module, lib, streamArgIsInput, boundaryArrays,
+                          fn == topFunc)))
+      return failure();
+  // Last, because it prices the addresses the banking above has just been
+  // held legal: a rejected partition would make the cost meaningless.
+  for (func::FuncOp fn : *closureOr)
+    if (failed(checkAddressCost(fn, lib, cycleTimeNs)))
       return failure();
   return success();
 }

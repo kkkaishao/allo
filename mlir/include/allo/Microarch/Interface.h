@@ -3,30 +3,10 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-//===----------------------------------------------------------------------===//
-// The port-interface model: the single source of truth for a module's boundary
-// port *names*.
-//
-// Every hardware boundary of a kernel is one typed interface: a `Stream`
-// (FIFO handshake), a `Memory` (a read/write access to an argument array), a
-// `Scalar` input, or a `Result` output. Each interface owns the *concrete*
-// port-name strings the rest of the flow uses (`s_st_data`/`_valid`/`_ready`,
-// `out_wr0_addr`/`_data`/`_we`, ...), all composed by `Naming.h`, so that the
-// emitter (port declaration + body access), the dataflow-composition wiring,
-// and the cosim harness never build a name independently and diverge.
-//
-// The structs carry only strings + ints (arg index, bank, factor, depth, bit
-// width), so the whole model serializes to JSON and crosses the C++/Python seam
-// verbatim: C++ authors every port name, Python only reads. That covers the
-// module's own name, the fixed control ABI (clk/rst/start/done) and the extern
-// operator modules it instantiates, i.e. everything a simulator needs to bind
-// the design, so no consumer re-derives a name or reads the emitted IR back.
-//===----------------------------------------------------------------------===//
-
 #ifndef ALLO_MICROARCH_INTERFACE_H
 #define ALLO_MICROARCH_INTERFACE_H
 
-#include "allo/Microarch/Naming.h" // uarch::Datapath + the naming vocabulary
+#include "allo/Microarch/Naming.h" // uarch::Datapath
 
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/StringRef.h"

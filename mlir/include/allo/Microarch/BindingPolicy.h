@@ -3,15 +3,6 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-//===----------------------------------------------------------------------===//
-// BindingPolicy: the seam where resource sharing decisions are made. Following
-// "store decisions, derive structure", a policy is a PURE decision. Given the
-// trivially-allocated datapath (one FuncUnit per op) plus the MRT, it returns
-// which units to fold onto one physical unit. The builder applies the decision
-// (updating the binding maps) and re-derives the interconnect (the sharing
-// muxes); the emitter never sees which policy ran.
-//===----------------------------------------------------------------------===//
-
 #ifndef ALLO_MICROARCH_BINDINGPOLICY_H
 #define ALLO_MICROARCH_BINDINGPOLICY_H
 

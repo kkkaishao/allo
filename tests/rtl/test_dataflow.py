@@ -15,7 +15,7 @@ from allo import kernel
 from allo.lang import f32, i32, Stream
 
 sys.path.insert(0, os.path.dirname(__file__))
-from _common import Mod, _to_rtl  # noqa: E402
+from _common import Dcp, Mod, _to_rtl  # noqa: E402
 
 pytestmark = pytest.mark.skipif(
     shutil.which("verilator") is None, reason="verilator not available"
@@ -59,13 +59,12 @@ def _is_and(m, v, *want):
     return rhs.startswith("comb.and") and sorted(m.operands(v)) == sorted(want)
 
 
-def _container_body(dcp: str, name: str) -> str:
-    """The text of `name`'s own func body (up to the next func), so an assertion
-    about the container is not satisfied by one of its children."""
-    start = dcp.index(f"@{name}(")
-    rest = dcp[start:]
-    nxt = rest.find("func.func", 1)
-    return rest if nxt < 0 else rest[:nxt]
+def _outlined(mod, container: str) -> list[str]:
+    """The processes outlined out of `container`'s own body, each a kernel of
+    its own named `<container>.datapath<k>`."""
+    return sorted(
+        k for k in Dcp(mod).kernels if k.startswith(f"{container}.datapath")
+    )
 
 
 # --- the composition operator: one table, three start policies --------------
@@ -974,11 +973,11 @@ def test_loose_compute_beside_the_network():
     mod = _to_rtl(lc_top)
     # The outlined work is a real child module, and the container keeps none of
     # the datapath ops.
-    assert "@lc_top.datapath0" in mod.dcp
-    assert "dcp.compute" not in _container_body(mod.dcp, "lc_top")
+    assert _outlined(mod, "lc_top") == ["lc_top.datapath0"]
+    assert not Dcp(mod).func("lc_top").has("allo.dcp.compute")
     # And it is spawned, not sequenced: the container stays self-timed with the
     # outlined process in it, which is what "runs concurrently" means here.
-    assert "dcp.determinacy = #allo<determinacy concurrent>" in mod.dcp
+    assert mod.schedule().func("lc_top").determinacy == "concurrent"
 
     out = np.zeros(N, np.int32)
     aux = np.zeros(N, np.int32)
@@ -1073,7 +1072,7 @@ def test_prologue_and_epilogue_are_separate_processes():
             out[i] = tmp[i] * 7
 
     mod = _to_rtl(pe_top)
-    assert "@pe_top.datapath0" in mod.dcp and "@pe_top.datapath1" in mod.dcp
+    assert _outlined(mod, "pe_top") == ["pe_top.datapath0", "pe_top.datapath1"]
 
     buf = np.zeros(N, np.int32)
     tmp = np.zeros(N, np.int32)
@@ -1163,7 +1162,7 @@ def test_the_container_itself_can_drive_a_channel():
         await cd_cons(f, out)
 
     mod = _to_rtl(cd_top)
-    assert "@cd_top.datapath0" in mod.dcp
+    assert _outlined(mod, "cd_top") == ["cd_top.datapath0"]
     out = np.zeros(N, np.int32)
     mod.cosim(A, out)
     assert np.array_equal(out, A * 2 + 1), list(out)
@@ -1185,7 +1184,7 @@ def test_a_sequential_composition_is_not_outlined():
         for i in range(N):
             z[i] = x[i] + 1
 
-    assert "datapath0" not in _to_rtl(sq_top).dcp
+    assert _outlined(_to_rtl(sq_top), "sq_top") == []
 
 
 # --- mixing dataflow subnetworks with sequential kernels ----------------------
@@ -1262,8 +1261,9 @@ def test_mixed_dataflow_sequential():
     assert "hw.instance" in mod.mlir and "seq.fifo" in mod.mlir
     # Every child is a call node, spawn or not: `allo.async` marks the START
     # POLICY, it does not make a different kind of node.
-    assert "dcp.instance @rd_top.rd_post(" in mod.dcp
-    assert "dcp.instance @rd_top.rd_cons(" in mod.dcp and "allo.async" in mod.dcp
+    top = Dcp(mod).func("rd_top")
+    assert top.callees(spawned=False) == ["rd_top.rd_post"]
+    assert top.callees(spawned=True) == ["rd_top.rd_prod", "rd_top.rd_cons"]
     # ... and rd_post takes the handshake, not the broadcast: its `start` is
     # something the top computed, not the container's own.
     inst = [l for l in mod.mlir.splitlines() if "hw.instance" in l and "rd_post" in l]

@@ -10,7 +10,6 @@
 #include "allo/Transforms/Passes.h"
 
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
-#include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/IR/AffineExpr.h"
 #include "mlir/IR/AffineMap.h"
@@ -123,7 +122,7 @@ struct ResolveBankingPass
     : public allo::impl::ResolveBankingPassBase<ResolveBankingPass> {
   void runOnOperation() override {
     SmallVector<Operation *> allocs;
-    getOperation().walk([&](Operation *op) {
+    getOperation()->walk([&](Operation *op) {
       if (isa<memref::AllocOp, memref::AllocaOp>(op) &&
           op->hasAttr(kPartitionAttr))
         allocs.push_back(op);

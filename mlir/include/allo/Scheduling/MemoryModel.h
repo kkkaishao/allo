@@ -3,17 +3,6 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-//===----------------------------------------------------------------------===//
-// The storage dimension of the scheduling model, the counterpart to the
-// operator (compute) library. It provides:
-//   - MemoryLibrary: read/write latency + delay for array and FIFO accesses,
-//     from the device `memory:` section;
-//   - characterize(): a memref's banking/port shape, from its `allo.part` /
-//     `allo.bind.storage` attributes;
-//   - MemoryBankModel / populateMemoryResources: the per-memref port resources
-//     the resource-aware schedulers bind against.
-//===----------------------------------------------------------------------===//
-
 #ifndef ALLO_SCHEDULING_MEMORYMODEL_H
 #define ALLO_SCHEDULING_MEMORYMODEL_H
 

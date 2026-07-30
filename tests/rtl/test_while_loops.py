@@ -14,7 +14,7 @@ from allo import kernel
 from allo.lang import i32, f32, index
 
 sys.path.insert(0, os.path.dirname(__file__))
-from _common import Mod, _sched, _to_rtl, _one_region, _hold_done  # noqa: E402
+from _common import Dcp, Mod, _sched, _to_rtl, _one_region, _hold_done  # noqa: E402
 
 pytestmark = pytest.mark.skipif(
     shutil.which("verilator") is None, reason="verilator not available"
@@ -74,10 +74,11 @@ def test_decreasing_index_while_raises_cosim():
         out[0] = s
 
     loop = _sched(dec_const).cyclic()[0]
-    # Constant trip: counted, known latency (N issues plus one stage), and not a
-    # conditional/flushing region.
+    # Constant trip: counted, known latency, and not a conditional/flushing
+    # region. The span is the arming cycle, N issues one II apart, the accumulate
+    # landing, and the completion latch.
     assert not loop.conditional and not loop.latency_is_bound
-    assert loop.latency == N + 1
+    assert loop.latency == N + 2
     out = np.zeros(1, np.int32)
     _to_rtl(dec_const).cosim(A, out)
     assert out[0] == int(A.sum())  # counts i down from N, so sums all of A
@@ -208,8 +209,9 @@ def test_while_with_nested_while():
     assert res.func("nested_while").latency is None  # data-dependent trips
     # Both whiles close to dcp: the inner -> flushing pipeline, the outer ->
     # sequential container wrapping it. No raw scf.while; two dcp.condition ends.
-    assert "scf.while" not in mod.dcp
-    assert mod.dcp.count("dcp.condition") == 2
+    d = Dcp(mod)
+    assert not d.has("scf.while")
+    assert d.func("nested_while").count("allo.dcp.condition") == 2
 
 
 # --- flushing-pipeline correctness ---------------------------------------------
@@ -239,7 +241,7 @@ def test_while_flushing_pipeline_cosim():
     loop = mod.schedule().cyclic()[0]
     assert loop.conditional is True
     assert loop.latency is None
-    assert "dcp.condition" in mod.dcp  # reified while terminator
+    assert Dcp(mod).has("allo.dcp.condition")  # reified while terminator
 
     A = (np.arange(N, dtype=np.int32) % 7 + 1).astype(np.int32)
 
@@ -352,7 +354,7 @@ def test_while_in_loop_store_cosim():
             i = i + 1
 
     ma, mb = _to_rtl(wstore), _to_rtl(wscan)
-    assert ma.schedule().cyclic()[0].conditional and "dcp.condition" in ma.dcp
+    assert ma.schedule().cyclic()[0].conditional and Dcp(ma).has("allo.dcp.condition")
     A = (np.arange(N, dtype=np.int32) % 7 + 1).astype(np.int32)
 
     def gold_store(limit):
@@ -441,7 +443,7 @@ def test_while_mem_condition_shared_array_cosim():
     rtl = _to_rtl(wmem)
     # The non-contention claim, stated: A carries a read port group per access,
     # so the condition never waits on the body's port.
-    rd = [p["base"] for acc in rtl.interfaces["wmem"]["reads"] for p in acc]
+    rd = [p.base for acc in rtl.interfaces["wmem"].reads for p in acc]
     assert rd == ["A_rd0", "A_rd1"]
 
     A = np.array([5, 3, 8, 2, 0] + [9] * 11, dtype=np.int32)  # sentinel 0 at idx 4

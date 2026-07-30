@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-#include "allo/Scheduling/AddressCost.h"  // addressCost
+#include "allo/Scheduling/AddressModel.h" // addressCost
 #include "allo/Scheduling/MemoryAccess.h" // asMemAccess
 #include "allo/Scheduling/RegionGraph.h"  // isSyncSubKernelCall
 #include "allo/Support/Logging.h"

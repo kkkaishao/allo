@@ -11,8 +11,18 @@ import pytest
 
 from allo import kernel
 from allo.lang import i32, f32
+from allo.backend.rtl import RegionKind
 
-from _common import Mod, _to_rtl, _latency, _iis, FADD, MEM_REDUCE_II  # noqa: E402
+from _common import (  # noqa: E402
+    Dcp,
+    Mod,
+    _to_rtl,
+    _latency,
+    _iis,
+    _outer,
+    FADD,
+    MEM_REDUCE_II,
+)
 
 pytestmark = pytest.mark.skipif(
     shutil.which("verilator") is None, reason="verilator not available"
@@ -619,7 +629,6 @@ def test_data_dependent_guard_closes_into_select_and_gates_its_store():
     mod = _to_rtl(cond_reduce)
     res = mod.schedule()
     assert _iis(res.func("cond_reduce").cyclic()) == [FADD]  # guarded reduction
-    assert "dcp.select" in mod.dcp
     guard = next(r for r in res.funcs[0].regions if r.kind == "guard")
     assert guard.conditional and guard.container
 
@@ -651,12 +660,12 @@ def test_affine_two_constraint_guard_closes_into_select():
 
     mod = _to_rtl(agf)
     res = mod.schedule()
-    assert "dcp.select" in mod.dcp
     # Phase A lifts the IntegerSet predicate into start-0 dcp.compute units (the
     # conjunction `andi` of two `sge` compares, predicate 5), so the guard
     # condition is a first-class Source -- no raw arith.cmpi/andi survives for
     # the emitter to re-interpret.
-    assert "comb andi" in mod.dcp and mod.dcp.count("predicate = 5 : i64") >= 2
+    assert any(r.has("andi") for r in res.regions(wrappers=True))
+    assert Dcp(mod).func("agf").attrs("allo.dcp.compute", "predicate").count(5) >= 2
     guard = next(r for r in res.funcs[0].regions if r.kind == "guard")
     assert guard.conditional and guard.container
     assert _iis(res.cyclic()) == [MEM_REDUCE_II]  # memory-carried `out[i] +=`
@@ -692,7 +701,6 @@ def test_guard_gates_only_its_own_store_not_a_sibling():
 
     mod = _to_rtl(imp)
     res = mod.schedule()
-    assert "dcp.select" in mod.dcp
     # Scalar-carried reduction inside the guard -> register recurrence (II=FADD).
     assert _iis(res.cyclic()) == [FADD]
     assert any(r.kind == "guard" for r in res.funcs[0].regions)
@@ -726,7 +734,7 @@ def test_result_mux_select():
                     out[g, i] = b[g, i] * 2
 
     mod = _to_rtl(dual_affine)
-    assert "dcp.select" in mod.dcp
+    assert mod.schedule().regions(RegionKind.GUARD, wrappers=True)
     a = np.arange(4 * N, dtype=np.int32).reshape(4, N)
     b = a + 1000
     out = np.zeros((4, N), np.int32)
@@ -762,7 +770,7 @@ def test_result_mux_select():
             out[g] = acc
 
     mod = _to_rtl(rmux)
-    assert "dcp.select" in mod.dcp
+    assert mod.schedule().regions(RegionKind.GUARD, wrappers=True)
     out = np.zeros(4, np.int32)
     mod.cosim(a.copy(), out)
     assert np.array_equal(out, np.where(np.arange(4) < 2, a.sum(1), 0).astype(np.int32))
@@ -885,7 +893,7 @@ def test_scalar_result_consumed_by_a_sibling_call():
     A = np.arange(16, dtype=np.int32)
     out = np.zeros(16, dtype=np.int32)
     rtl = _to_rtl(top)
-    assert "allo.dcp.instance" in rtl.dcp
+    assert Dcp(rtl).func(rtl.top).callees()  # the leaf CallUnit path
     rtl.cosim(A, out)
     s = int((A + 1).sum())  # 120 + 16 = 136
     assert np.array_equal(out, np.full(16, s * 2, dtype=np.int32))
@@ -941,7 +949,8 @@ def test_call_multi_scalar_result():
 
     rtl = _to_rtl(mr_top)
     # One instance with two results, and two result ports on the child module.
-    assert "-> (i32, i32)" in rtl.dcp
+    (call,) = Dcp(rtl).func("mr_top").ops("allo.dcp.instance")
+    assert len(call.results) == 2
     out = np.zeros(2, dtype=np.int32)
     rtl.cosim(np.int32(7), out)
     assert np.array_equal(out, np.array([8, 14], dtype=np.int32))
@@ -962,12 +971,12 @@ def test_call_scalar_result_consumed_in_its_own_region():
         out[0] = a
         out[1] = a * 3
 
-    d = _to_rtl(sr_top).dcp
     # The complement of test_indeterminate_calls.py, which splits the same shape
     # in two: a DETERMINATE callee needs no isolation, so both consumers stay in
-    # the caller's one region.
-    body = d.split("func.func public @")[1].split("func.func private")[0]
-    assert sum("allo.dcp.sequential at" in ln for ln in body.splitlines()) == 1
+    # the caller's one region. The callee is a separate kernel and a nested
+    # region is reported deeper, so neither can add to this count.
+    caller = _to_rtl(sr_top).schedule().func("sr_top")
+    assert len(_outer(caller, RegionKind.ACYCLIC)) == 1
 
     out = np.zeros(2, dtype=np.int32)
     _to_rtl(sr_top).cosim(np.int32(7), out)

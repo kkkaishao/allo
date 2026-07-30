@@ -3,18 +3,6 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-//===----------------------------------------------------------------------===//
-// Modulo-reservation-table (MRT) oracle: the exact compatibility judgment
-// binding is built on. Under a fixed SDC/modulo schedule every op's occupancy
-// of its functional unit is a compile-time constant (its issue residue mod II,
-// or its absolute start in an acyclic region), so "can these two ops share one
-// unit?" is an exact set-intersection test rather than a lifetime heuristic.
-//
-// This is the constraint side of binding (what may legally share); the
-// objective side (what sharing costs) needs the operator area axis, which is
-// separate.
-//===----------------------------------------------------------------------===//
-
 #ifndef ALLO_MICROARCH_RESERVATION_H
 #define ALLO_MICROARCH_RESERVATION_H
 

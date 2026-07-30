@@ -12,9 +12,10 @@ import pytest
 
 from allo import kernel
 from allo.lang import i32, f32, index, Stream
+from allo.backend.rtl import RegionKind
 
 sys.path.insert(0, os.path.dirname(__file__))
-from _common import Mod, _to_rtl, _latency  # noqa: E402
+from _common import Dcp, Mod, _to_rtl, _sched, _latency, _outer  # noqa: E402
 
 # Applied per test rather than to the module: the taxonomy half never
 # simulates, and must keep running where verilator is absent.
@@ -27,15 +28,16 @@ needs_verilator = pytest.mark.skipif(
 # `calleeDeterminate` reads it, so a callee is a static-offset producer iff it
 # is `counted_static`. The region value is the declared controller-regime
 # discriminant.
-def _reg(det: str) -> str:
-    """A dcp region op's determinacy, printed as a bare keyword right after the
-    region body (just before the op's attr-dict)."""
-    return f"}} {det}"
+def _regs(result) -> set:
+    """Every REGION determinacy the schedule declares."""
+    return {r.determinacy for r in result.regions(wrappers=True)}
 
 
-def _func(det: str) -> str:
-    """A whole-kernel `dcp.determinacy` attribute (on the func)."""
-    return f"dcp.determinacy = #allo<determinacy {det}>"
+def _kernels(result) -> set:
+    """Every WHOLE-KERNEL determinacy the schedule declares. Kept apart from
+    the region classes above, which draw on the same four keywords: a region's
+    own class must not be able to satisfy a claim about its kernel."""
+    return {f.determinacy for f in result.funcs}
 
 
 # ---------------------------------------------------------------------------
@@ -50,9 +52,9 @@ def test_counted_loop_and_kernel_are_counted_static():
         for i in range(16):
             B[i] = A[i] + 1
 
-    d = _to_rtl(leaf).dcp
-    assert "allo.dcp.pipeline" in d and _reg("counted_static") in d
-    assert _func("counted_static") in d
+    res = _sched(leaf)
+    assert res.cyclic() and _regs(res) == {"counted_static"}
+    assert _kernels(res) == {"counted_static"}
 
 
 # A static sequential composition: the container and both leaves are exact,
@@ -73,9 +75,10 @@ def test_sequential_container_is_counted_static():
         sc1(A, B)
         sc2(B, out)
 
-    d = _to_rtl(seq_top).dcp
-    assert _func("counted_static") in d
-    assert "concurrent" not in d  # a plain call graph is not a dataflow spawn
+    res = _sched(seq_top)
+    assert _kernels(res) == {"counted_static"}
+    # a plain call graph is not a dataflow spawn
+    assert "concurrent" not in _regs(res)
 
 
 # A genuine (data-dependent-exit) while flushing-pipelines -> its region is
@@ -92,9 +95,9 @@ def test_data_dependent_while_is_conditional():
             c = c + 1
         out[0] = c
 
-    d = _to_rtl(wr).dcp
-    assert _reg("conditional") in d
-    assert _func("indeterminate") in d
+    res = _sched(wr)
+    assert "conditional" in _regs(res)
+    assert "indeterminate" in _kernels(res)
 
 
 # A data-dependent guard closes into a dcp.select -> conditional.
@@ -110,9 +113,9 @@ def test_guard_select_is_conditional():
                     acc += A[k, j]
                 out[j] = acc
 
-    d = _to_rtl(cond_reduce).dcp
-    assert "allo.dcp.select" in d and _reg("conditional") in d
-    assert _func("indeterminate") in d
+    res = _sched(cond_reduce)
+    assert res.regions(RegionKind.GUARD, wrappers=True) and "conditional" in _regs(res)
+    assert "indeterminate" in _kernels(res)
 
 
 # A dynamic outer trip has no exact latency -> the wrapper region and the
@@ -127,14 +130,17 @@ def test_dynamic_trip_wrapper_is_indeterminate():
             for j in range(N):
                 y[i] += A[i, j]
 
-    d = _to_rtl(band).dcp
-    assert _reg("indeterminate") in d
-    assert _func("indeterminate") in d
+    res = _sched(band)
+    assert "indeterminate" in _regs(res)
+    assert "indeterminate" in _kernels(res)
 
 
 # An await-spawned dataflow container is concurrent (self-timed) -> a caller
-# waits on its real done, never a static offset; the spawned leaves stay
-# counted_static.
+# waits on its real done, never a static offset. The spawned leaves are
+# INDETERMINATE, and for the same reason the container is: each one puts to or
+# gets from a channel, so a full queue or a starved input stretches its run by an
+# amount no schedule names. The span each composes is a floor, and publishing it
+# as a contract is what let a stream kernel claim 19 cycles and measure 28.
 def test_async_dataflow_container_is_concurrent():
     N = 16
 
@@ -154,9 +160,10 @@ def test_async_dataflow_container_is_concurrent():
         await dp(fifo)
         await dc(fifo, out)
 
-    d = _to_rtl(dtop).dcp
-    assert _func("concurrent") in d
-    assert _func("counted_static") in d  # the leaves
+    res = _sched(dtop)
+    # every leaf is back-pressured, so nothing here is counted_static
+    assert _kernels(res) == {"concurrent", "indeterminate"}
+    assert _latency(dp) is None and _latency(dc) is None
 
 
 # ---------------------------------------------------------------------------
@@ -190,10 +197,10 @@ def ic_sum_out(A: i32[8], B: i32[1]):
 
 
 def _regions(m):
-    """The caller's own top-level dcp regions, as their opening lines. The
-    callee is printed after it, so stop at the next `func.func`."""
-    body = m.dcp.split("func.func public @")[1].split("func.func private")[0]
-    return [ln.strip() for ln in body.splitlines() if "allo.dcp.sequential at" in ln]
+    """The caller's own top-level acyclic regions. A callee is a separate
+    kernel and a nested region is reported at a greater depth, so neither can
+    add to this."""
+    return _outer(m.schedule().func(m.top), RegionKind.ACYCLIC)
 
 
 # --- the scalar result --------------------------------------------------------
@@ -298,7 +305,7 @@ def test_a_buffer_handed_to_a_sibling_call():
     assert _latency(sp_prod) is None
 
     mod = _to_rtl(sp_top)
-    assert "dcp.instance @sp_top.sp_prod(" in mod.dcp
+    assert Dcp(mod).func("sp_top").callees() == ["sp_top.sp_prod", "sp_top.sp_cons"]
     assert _latency(sp_top) is None  # container inherits the while's indeterminacy
 
     spB = np.zeros(16, np.int32)

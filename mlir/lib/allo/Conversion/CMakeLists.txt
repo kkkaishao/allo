@@ -3,7 +3,6 @@
 
 add_mlir_conversion_library(MLIRAlloConversion
     ConvertAlloToFunc.cpp
-    LowerInstructions.cpp
     LowerDataflow.cpp
     LowerToLLVM.cpp
 

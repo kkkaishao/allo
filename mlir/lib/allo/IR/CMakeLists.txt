@@ -3,8 +3,6 @@
 
 add_mlir_dialect_library(MLIRAllo
     AlloOps.cpp
-    AlloISATypes.cpp
-    AlloISAOps.cpp
 
     DEPENDS
     MLIRAlloIncGen

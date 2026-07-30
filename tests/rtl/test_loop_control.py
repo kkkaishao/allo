@@ -16,6 +16,7 @@ from allo.lang import i32, f32, index
 
 sys.path.insert(0, os.path.dirname(__file__))
 from _common import (  # noqa: E402
+    Dcp,
     Mod,
     _sched,
     _to_rtl,
@@ -23,9 +24,6 @@ from _common import (  # noqa: E402
     _iis,
     _one_region,
     _hold_done,
-    COMB,
-    FDIV,
-    MEM,
     MEM_REDUCE_II,
 )
 
@@ -944,7 +942,7 @@ def test_nested_loop_over_calls():
     mod = _to_rtl(nl_top)
     # The nest survives as two levels: an outer container over an inner
     # loop-over-calls, not one coalesced 16-iteration loop.
-    assert mod.dcp.count("allo.dcp.pipeline") == 2
+    assert len(mod.schedule().func("nl_top").cyclic(wrappers=True)) == 2
     B = np.zeros((4, 4), np.int32)
     mod.cosim(A44, B)
     assert np.array_equal(B, A44 * 2)
@@ -1093,7 +1091,7 @@ def test_leaf_loop_over_calls_controller_paces_on_child_done():
             lc_step(A, B, i)  # invoke the sub-kernel 16 times
 
     rtl = _to_rtl(lc_top)
-    assert "allo.dcp.instance" in rtl.dcp  # leaf CallUnit path (structural lock)
+    assert Dcp(rtl).func(rtl.top).callees()  # leaf CallUnit path (structural lock)
     m = rtl.mlir
     assert "hw.instance" in m  # the single child instance
     assert "%i = seq.compreg" in m  # the loop counter, named after the source IV
@@ -1233,98 +1231,11 @@ def test_pipeline_directive_preserves_result_cosim():
     assert np.array_equal(out, A8 * B8)
 
 
-# --- pipelined-level scheduling under mixed loop ancestors --------------------
-
-
-def test_pipelined_level_recurrence_under_mixed_loop_ancestor():
-    # An imperfect pipelined nest schedules via the fused-overlap (level) path
-    # (the outer loop pipelined over its inner loop as a fixed-latency node) when
-    # `unroll_under_pipeline` is off. Here the pipelined level `j` sits under a
-    # *runtime-bounded* outer loop `i` -- a memory-loaded trip makes `i` an
-    # `scf.for`, so the nest MIXES scf.for and affine.for. The level carries a
-    # memory recurrence (`acc[0]` divided every iteration). The affine dependence
-    # components index only the affine loop `j` (an scf iv is no affine dim), so
-    # attributing the recurrence to `j` by positional nesting depth would
-    # over-count past the scf ancestor and silently drop the edge -- an unsound
-    # II = the 4-cycle inner-loop occupancy. Matching the level to its component
-    # by identity keeps the edge, so the II is the recurrence bound read -> div
-    # -> write.
-    RECUR_II = MEM + FDIV + MEM
-
-    def mixed():
-        @kernel
-        def mix(A: f32[64, 64], acc: f32[1], B: f32[64, 2], nbuf: index[1]):
-            n: index = nbuf[0]  # memory-loaded bound => scf.for ancestor
-            allo.assume(n < 64)
-            for i in range(n):
-                for j in range(64, name="j"):  # pipelined affine level
-                    acc[0] = acc[0] / A[i, j]  # level-carried recurrence
-                    for p in range(2):  # inner loop kept rolled (level node)
-                        B[j, p] = A[i, j]
-
-        return mix
-
-    s = mixed().schedule()
-    s.pipeline("j")
-    mod = s.export("rtl", unroll_under_pipeline=False)
-    # Two cyclic regions: the pipelined level `j` and its inner loop `p` (II=1).
-    # The level's II is the recurrence bound; without the identity-matched
-    # projection it would collapse to the 4-cycle inner-loop occupancy.
-    iis = _iis(mod.schedule().cyclic())
-    assert max(iis) == RECUR_II
-
-
-def test_outer_level_scheduling_is_timing_aware():
-    # The outer-level scheduling problem is timing-aware: a combinational chain
-    # among the outer level's loose ops is cut at the cycle boundary, exactly as
-    # in the leaf body (an inner-loop node is a registered boundary, so it never
-    # joins the chain). Here the level carries a 3-deep int-add chain (3 x 1.2ns
-    # = 3.6ns); extra stores of the intermediates keep it from being
-    # reassociated into a tree. At a tight clock the chain spans two cycles; at a
-    # slack clock, one.
-    def level_add_cycles(freq_mhz):
-        @kernel
-        def chain(
-            A: i32[8, 8],
-            b: i32[8],
-            c: i32[8],
-            d: i32[8],
-            o0: i32[8],
-            o1: i32[8],
-            o2: i32[8],
-        ):
-            for i in range(8, name="i"):  # pipelined imperfect nest -> level path
-                s0: i32 = b[i] + c[i]
-                s1: i32 = s0 + d[i]
-                s2: i32 = s1 + b[i]  # 3-deep combinational chain at the level
-                o0[i] = s0  # extra uses -> not a reassociable single-use chain
-                o1[i] = s1
-                for p in range(8, name="p"):  # inner loop node (registered)
-                    A[i, p] = s2
-                o2[i] = s2
-
-        s = chain.schedule()
-        s.pipeline("i")
-        mod = s.export("rtl", unroll_under_pipeline=False, freq_mhz=freq_mhz)
-        res = mod.schedule()
-        # The level region is the pipelined outer loop holding the 3-add chain.
-        level = next(
-            r for r in res.cyclic() if sum(o.kind == "addi" for o in r.ops) == 3
-        )
-        return len({o.t for o in level.ops if o.kind == "addi"})
-
-    # The clocks come off the device's own combinational table, so the test
-    # tracks a retimed `add` instead of restating 1.2ns in three places.
-    chain_ns = 3 * COMB["add"]
-    assert level_add_cycles(1000 / (chain_ns * 0.9)) == 2  # shorter than the chain
-    assert level_add_cycles(1000 / (chain_ns * 1.8)) == 1  # comfortably longer
-
-
-def test_a_level_pipelined_container_of_pure_loops_emits(capfd):
-    # The complement: a level whose body holds ONLY child loops owns no datapath,
-    # so Phase B reaches hardware. It runs one outer iteration at a time (the
-    # container advances on the last child's drain), so the schedule's II is a
-    # floor the emitted controller does not yet reach -- correct, not fast.
+def test_pipelined_imperfect_nest_falls_back_to_sub_regions(capfd):
+    # A pipeline directive on an imperfect nest is not honored: fusing the level
+    # over its inner loops is not implemented, so the body decomposes into
+    # sub-regions the container sequences one outer iteration at a time. Correct,
+    # not fast, and the backend has to say so.
     @kernel
     def two(A: i32[16, 4], out: i32[16, 4]):
         buf: i32[16, 4]
@@ -1341,8 +1252,8 @@ def test_a_level_pipelined_container_of_pure_loops_emits(capfd):
     out = np.zeros((16, 4), np.int32)
     mod.cosim(A, out)
     assert np.array_equal(out, (A + 1) * 2)
-    # The gap is reported, never measured: pinning "emitted cycles exceed the
-    # solved latency" would lock the shortfall in and fail the day the emitter
-    # closes it. What must hold is that the backend declares the gap.
+    # The shortfall is reported, never measured: pinning cycles would lock it in
+    # and fail the day the fused level is implemented. What must hold is that the
+    # backend declares the directive unhonored.
     text = "".join(capfd.readouterr())
-    assert "Outer-iteration overlap is not emitted yet" in text, text
+    assert "pipeline directive on an imperfect nest is not honored" in text, text

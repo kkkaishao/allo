@@ -7,7 +7,6 @@ from typing import TypeVar, ParamSpec, overload, Literal
 from collections.abc import Callable
 
 from .kernel import Kernel
-from .._mlir.ir import Module
 
 P = ParamSpec("P")
 R = TypeVar("R")
@@ -71,9 +70,8 @@ def verify_timing(timing: Timing):
             raise ValueError("Pipelined operations must specify a style.")
         if timing.style not in ("free", "elastic", "ce"):
             raise ValueError("Pipeling style must be one of 'free', 'elastic', 'ce'")
-    else:
-        if timing.style is not None:
-            raise ValueError("Non-pipelined operations cannot specify a style.")
+    elif timing.style is not None:
+        raise ValueError("Non-pipelined operations cannot specify a style.")
 
 
 class IP(Kernel[P, R]):
@@ -191,18 +189,17 @@ def ip(
             style=style,
             optype=optype,
         )
-    else:
 
-        def decorator(fn: Callable[P, R]) -> IP[P, R]:
-            return IP(
-                fn=fn,
-                name=name,
-                latency=latency,
-                in_delay_ns=in_delay_ns,
-                out_delay_ns=out_delay_ns,
-                pipelined=pipelined,
-                style=style,
-                optype=optype,
-            )
+    def decorator(fn: Callable[P, R]) -> IP[P, R]:
+        return IP(
+            fn=fn,
+            name=name,
+            latency=latency,
+            in_delay_ns=in_delay_ns,
+            out_delay_ns=out_delay_ns,
+            pipelined=pipelined,
+            style=style,
+            optype=optype,
+        )
 
-        return decorator
+    return decorator

@@ -13,10 +13,11 @@ import pytest
 
 import allo
 from allo import kernel
+from allo.backend.rtl import Control, Operator
 from allo.lang import Stream, f32, i32
 
 sys.path.insert(0, os.path.dirname(__file__))
-from _common import _to_rtl  # noqa: E402
+from _common import Dcp, _to_rtl  # noqa: E402
 
 pytestmark = pytest.mark.skipif(
     shutil.which("verilator") is None, reason="verilator not available"
@@ -27,11 +28,11 @@ def _bases(rtl, module):
     """The port-group bases of one emitted module, by role."""
     m = rtl.interfaces[module]
     return {
-        "reads": [[p["base"] for p in group] for group in m["reads"]],
-        "writes": [[p["base"] for p in group] for group in m["writes"]],
-        "scalars": [s["name"] for s in m["scalars"]],
-        "results": [r["name"] for r in m["results"]],
-        "streams": [s["base"] for s in m["streams"]],
+        "reads": [[p.base for p in group] for group in m.reads],
+        "writes": [[p.base for p in group] for group in m.writes],
+        "scalars": [s.name for s in m.scalars],
+        "results": [r.name for r in m.results],
+        "streams": [s.base for s in m.streams],
     }
 
 
@@ -96,9 +97,9 @@ def test_banked_argument_names_every_bank():
         "streams": [],
     }
     # `factor` travels with every interface of the group; `bank` identifies it.
-    group = rtl.interfaces["banked"]["reads"][1]
-    assert [p["bank"] for p in group] == [0, 1, 2, 3]
-    assert {p["factor"] for p in group} == {4}
+    group = rtl.interfaces["banked"].reads[1]
+    assert [p.bank for p in group] == [0, 1, 2, 3]
+    assert {p.factor for p in group} == {4}
 
     A = np.arange(16, dtype=np.int32)
     idx = np.array([3, 1, 4, 1, 5, 9, 2, 6], dtype=np.int32)
@@ -203,9 +204,9 @@ def test_port_name_grammar():
     iface = mod.interfaces[mod.top]
     # Every port carries a role suffix, so a keyword owner is already legal
     # once composed: `input_in`, not an escaped `input__in`.
-    assert [s["name"] for s in iface["scalars"]] == ["input_in"]
-    assert [r["base"] for acc in iface["reads"] for r in acc] == ["wire_rd0"]
-    assert [w["base"] for acc in iface["writes"] for w in acc] == ["reg_wr0"]
+    assert [s.name for s in iface.scalars] == ["input_in"]
+    assert [r.base for acc in iface.reads for r in acc] == ["wire_rd0"]
+    assert [w.base for acc in iface.writes for w in acc] == ["reg_wr0"]
     # Every manifest name appears verbatim in the emitted module header (a
     # rewritten `input_0` would not match `\binput_in\b`).
     head = mod.verilog.split(");", 1)[0]
@@ -239,8 +240,8 @@ def test_port_name_grammar():
         return acc
 
     iface = _to_rtl(two_reads).interfaces["two_reads"]
-    assert [r["base"] for acc in iface["reads"] for r in acc] == ["A_rd0", "A_rd1"]
-    assert [r["name"] for r in iface["results"]] == ["ret_out"]
+    assert [r.base for acc in iface.reads for r in acc] == ["A_rd0", "A_rd1"]
+    assert [r.name for r in iface.results] == ["ret_out"]
 
     # A relay chain: the middle process gets `fifo[p]` and puts `fifo[p+1]`, so
     # both stream arguments carry the source name `fifo`. The colliding pair is
@@ -267,7 +268,7 @@ def test_port_name_grammar():
         pe(A, out, fifo)
 
     mod = _to_rtl(chain)
-    bases = {k: [s["base"] for s in v["streams"]] for k, v in mod.interfaces.items()}
+    bases = {k: [s.base for s in v.streams] for k, v in mod.interfaces.items()}
     assert sorted(bases["chain_pe_1"]) == ["fifo_st_in", "fifo_st_out"], bases
     assert bases["chain_pe_0"] == ["fifo_st"], bases
     assert bases["chain_pe_2"] == ["fifo_st"], bases
@@ -287,21 +288,16 @@ def test_manifest_is_the_whole_binding_contract():
             out[i] = A[i] * 2.0
 
     iface = _to_rtl(mk).interfaces["mk"]
-    assert iface["module"] == "mk" and iface["symbol"] == "mk"
-    assert iface["control"] == {
-        "clk": "clk",
-        "rst": "rst",
-        "start": "start",
-        "done": "done",
-    }
+    assert iface.module == "mk" and iface.symbol == "mk"
+    assert iface.control == Control("clk", "rst", "start", "done")
     # The f32 multiply is an IP: the manifest names its module, the device
     # operator it joins to, and each port's role (so `clk`/`ce`/the result are
     # found structurally, not by matching their names back out).
-    ops = iface["operators"]
+    ops = iface.operators
     assert ops, "an f32 multiply must instantiate an extern operator"
-    roles = [p["role"] for p in ops[0]["ports"]]
-    assert roles.count("data") >= 1 and roles.count("clk") == 1
-    assert roles[-1] == "out" and ops[0]["impl"]
+    roles = [p.role for p in ops[0].ports]
+    assert roles.count(Operator.Role.DATA) >= 1 and roles.count(Operator.Role.CLK) == 1
+    assert roles[-1] is Operator.Role.OUT and ops[0].impl
 
     # A nested callee's symbol carries a dot; the module name is the legalized
     # form, and the manifest is keyed by (and reports) that.
@@ -324,9 +320,8 @@ def test_manifest_is_the_whole_binding_contract():
         await mc(fifo, out)
 
     ifaces = _to_rtl(mtop).interfaces
-    by_symbol = {i["symbol"]: i for i in ifaces.values()}
-    assert by_symbol["mtop.mp"]["module"] == "mtop_mp"
-    assert all(k == i["module"] for k, i in ifaces.items()), "keyed by module name"
+    assert ifaces.of_symbol("mtop.mp").module == "mtop_mp"
+    assert all(k == i.module for k, i in ifaces.items()), "keyed by module name"
 
 
 # Internal (non-manifest) cells still carry readable names: region-scoped
@@ -395,9 +390,9 @@ def test_two_children_reading_one_boundary_array_get_a_group_each():
         scale_t(A, t, out)
 
     rtl = _to_rtl(shared_read_top)
-    rd = [p for acc in rtl.interfaces["shared_read_top"]["reads"] for p in acc]
-    assert [p["base"] for p in rd] == ["A_rd0", "A_rd1"]  # a group per accessor
-    assert {p["arg"] for p in rd} == {0}  # both off the one boundary argument
+    rd = [p for acc in rtl.interfaces["shared_read_top"].reads for p in acc]
+    assert [p.base for p in rd] == ["A_rd0", "A_rd1"]  # a group per accessor
+    assert {p.arg for p in rd} == {0}  # both off the one boundary argument
 
     A = np.arange(8, dtype=np.int32) + 1
     out = np.zeros(8, dtype=np.int32)
@@ -460,10 +455,10 @@ def test_disjoint_writers_get_separate_port_groups():
         pgw2(A, B)  # disjoint slice of B -> concurrent, its own port group
 
     rtl = _to_rtl(pg_top)
-    assert "allo.dcp.instance" in rtl.dcp  # leaf CallUnit path (structural lock)
-    wr = [w[0] for w in rtl.interfaces["pg_top"]["writes"]]
-    assert [w["base"] for w in wr] == ["B_wr0", "B_wr1"]  # per accessor, not a mux
-    assert {w["arg"] for w in wr} == {1}  # both groups master the same argument
+    assert Dcp(rtl).func(rtl.top).callees()  # leaf CallUnit path (structural lock)
+    wr = [w[0] for w in rtl.interfaces["pg_top"].writes]
+    assert [w.base for w in wr] == ["B_wr0", "B_wr1"]  # per accessor, not a mux
+    assert {w.arg for w in wr} == {1}  # both groups master the same argument
     A = np.arange(16, dtype=np.int32) + 1
     B = np.zeros(16, np.int32)
     rtl.cosim(A, B)

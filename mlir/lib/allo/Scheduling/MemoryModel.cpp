@@ -8,7 +8,7 @@
 #include "allo-c/Schedule.h" // kPartitionAttr, kBindStorageAttr
 #include "allo/IR/AlloAttrs.h"
 #include "allo/IR/AlloOps.h" // dcp::DCPathStoreOp (post-reification)
-#include "allo/Scheduling/AddressCost.h"  // simplifiedForHardware
+#include "allo/Scheduling/AddressModel.h" // simplifiedForHardware
 #include "allo/Scheduling/MemoryAccess.h" // asMemAccess (the access substrate)
 
 #include "mlir/Dialect/Func/IR/FuncOps.h"
@@ -52,9 +52,14 @@ static AttrT carrierAttr(Value memRef, StringRef name) {
     }
     return def->getAttrOfType<AttrT>(name);
   }
+  // Asked in both phases, of the `func.func` the scheduler works on and of the
+  // `dcp.module` it closes into, so it keys on the interface rather than on
+  // either op.
   if (auto barg = dyn_cast<BlockArgument>(memRef))
-    if (auto func = dyn_cast<func::FuncOp>(barg.getOwner()->getParentOp()))
-      return func.template getArgAttrOfType<AttrT>(barg.getArgNumber(), name);
+    if (auto func =
+            dyn_cast<FunctionOpInterface>(barg.getOwner()->getParentOp()))
+      return llvm::dyn_cast_or_null<AttrT>(
+          func.getArgAttr(barg.getArgNumber(), name));
   return {};
 }
 

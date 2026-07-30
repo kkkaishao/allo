@@ -6,7 +6,6 @@
 #include "allo-c/Passes.h"
 #include "allo/Microarch/EmitDriver.h"
 #include "allo/Scheduling/Scheduler.h"
-#include "allo/Scheduling/Utils.h"
 #include "allo/Support/Logging.h"
 
 #include "allo/Translation/VerilogEmitter.h"
@@ -28,18 +27,6 @@ MlirLogicalResult alloEmitVivadoHLS(MlirModule module, bool enableApFloat,
   mlir::detail::CallbackOstream stream(callback, userData);
   return wrap(allo::emitVivadoHLS(unwrap(module), stream, enableApFloat,
                                   indexWidth, withLocation, unwrap(top)));
-}
-
-MlirLogicalResult alloDumpRegionDependenceAnalysis(MlirModule module,
-                                                   MlirStringRef funcName,
-                                                   MlirStringCallback callback,
-                                                   void *userData) {
-  FailureOr<std::string> result = allo::dumpRegionDependenceAnaysis(
-      unwrap(module), std::string(funcName.data, funcName.length));
-  if (failed(result))
-    return mlirLogicalResultFailure();
-  callback(MlirStringRef{result->data(), result->size()}, userData);
-  return mlirLogicalResultSuccess();
 }
 
 MlirLogicalResult alloEmitVerilog(MlirModule module,
@@ -80,10 +67,10 @@ MlirLogicalResult alloEmitDatapathToHW(MlirModule module, MlirStringRef binding,
   return mlirLogicalResultSuccess();
 }
 
-MlirLogicalResult alloRunSDCSchedulingPipeline(MlirModule module,
-                                               MlirStringRef top,
-                                               float cycleTime,
-                                               MlirStringRef scheduler) {
+MlirLogicalResult
+alloRunSDCSchedulingPipeline(MlirModule module, MlirStringRef top,
+                             float cycleTime, MlirStringRef scheduler,
+                             MlirStringCallback callback, void *userData) {
   ModuleOp mod = unwrap(module);
   StringRef topName = unwrap(top);
   StringRef schedulerName = unwrap(scheduler);
@@ -95,11 +82,23 @@ MlirLogicalResult alloRunSDCSchedulingPipeline(MlirModule module,
         << "'; expected \"heuristic\" or \"exact\"";
     return mlirLogicalResultFailure();
   }
-  if (failed(allo::runPreScheduleVerification(mod, topName)))
+  // The target clock period: the option, else a 5.0 ns default. Resolved once
+  // here, since both halves price against it and a second copy of the default
+  // is a second answer to what the target frequency is.
+  float cycleTimeNs = cycleTime > 0.0f ? cycleTime : 5.0f;
+  if (failed(allo::runPreScheduleVerification(mod, topName, cycleTimeNs)))
     return mlirLogicalResultFailure();
-  if (failed(allo::runSDCScheduler(mod, topName, cycleTime, *kind)))
+  // The solved schedule travels between the two halves in memory rather than as
+  // attributes on the IR, so it lives exactly as long as this pipeline does and
+  // its `Operation *` keys cannot outlive the ops they name.
+  allo::ScheduleModel model;
+  if (failed(allo::runSDCScheduler(mod, topName, cycleTimeNs, *kind, model)))
     return mlirLogicalResultFailure();
-  allo::runPostScheduleConversion(mod);
+  allo::runPostScheduleConversion(mod, model);
+  // The report the reify recorded, which is the only part of the model that
+  // outlives the pipeline.
+  std::string report = model.toJSON();
+  callback(MlirStringRef{report.data(), report.size()}, userData);
   return mlirLogicalResultSuccess();
 }
 

@@ -27,36 +27,15 @@
 
 #include "allo/IR/AlloDialect.h.inc"
 
-// ISA op interfaces (BufferAccessOpInterface references BufferTypeInterface,
-// which is pulled in via AlloTypes.h above).
 #include "allo/IR/AlloOpInterfaces.h.inc"
-
-// Op interfaces defined in AlloOps.td (e.g. ScheduledOpInterface); must precede
-// the op classes that implement them.
-#include "allo/IR/AlloOpsInterfaces.h.inc"
 
 #define GET_OP_CLASSES
 #include "allo/IR/AlloOps.h.inc"
 
-#define GET_OP_CLASSES
-#include "allo/IR/AlloISAOps.h.inc"
-
 namespace mlir::allo {
 constexpr llvm::StringLiteral kAlloSignedAttr = "allo.signed";
 constexpr llvm::StringLiteral kAlloLazyAttr = "allo.lazy";
-// A concurrent-spawn (`await`) marker carried onto the `func.call` that
-// `convert-allo-to-func` produces from an `allo.invoke {async}` (func.call has
-// no `async` field). Written by ConvertAlloToFunc and read by the dataflow
-// composition lowering, which stay in sync through this one constant.
 constexpr llvm::StringLiteral kAlloAsyncAttr = "allo.async";
-// Power-on contents of an on-chip memory: the value of every declared word, in
-// natural order. `seq.hlmem` carries no initializer, so an array that starts
-// with compile-time contents AND is written rides this attribute. It sits on
-// the `seq.hlmem` out of the microarch emitters, then on the enclosing
-// `hw.module` (keyed by memory name) across the lowering that erases the
-// memory, until `allo-initialize-memories` writes the values in an `initial`
-// block. That pass consumes and erases it, so it never reaches the emitted
-// Verilog.
 constexpr llvm::StringLiteral kMemoryInitAttr = "allo.mem.init";
 } // namespace mlir::allo
 

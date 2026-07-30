@@ -7,7 +7,7 @@
 #include "allo/IR/AlloOps.h" // kAlloAsyncAttr
 #include "allo/Scheduling/DependenceAnalysis.h"
 #include "allo/Scheduling/Footprint.h"
-#include "allo/Scheduling/Utils.h" // sched::kLatencyAttr
+#include "allo/Scheduling/LatencyModel.h"
 #include "allo/Support/Logging.h"
 
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
@@ -34,6 +34,34 @@ bool mlir::allo::isDeclarationOp(Operation *op) {
              memref::GetGlobalOp, StreamCreateOp>(op);
 }
 
+bool mlir::allo::spanFormsRegion(ArrayRef<Operation *> ops) {
+  return llvm::any_of(ops, [](Operation *op) {
+    return !op->hasTrait<OpTrait::IsTerminator>() && !isDeclarationOp(op);
+  });
+}
+
+RegionShape mlir::allo::dcpRegionShape(Operation *regionOp) {
+  if (isa<dcp::DCPathSelectOp>(regionOp))
+    return RegionShape::Guard;
+  assert((isa<dcp::DCPathPipelineOp, dcp::DCPathSequentialOp>(regionOp)) &&
+         "a shape is a property of a dcp REGION op, not of any op");
+  bool childRegion = false, instance = false;
+  for (Operation &inner : regionOp->getRegion(0).front()) {
+    if (isa<dcp::DCPathPipelineOp, dcp::DCPathSequentialOp,
+            dcp::DCPathSelectOp>(inner))
+      childRegion = true;
+    else if (isa<dcp::DCPathInstanceOp>(inner))
+      instance = true;
+  }
+  if (childRegion)
+    return RegionShape::Container;
+  // Only a CYCLIC region hands off once per iteration; an acyclic one holding
+  // an instance is a leaf whose datapath happens to include a call node.
+  if (instance && isa<dcp::DCPathPipelineOp>(regionOp))
+    return RegionShape::CallNode;
+  return RegionShape::Leaf;
+}
+
 // Whether a call node's operand/result types are the ones a leaf CallUnit can
 // carry: memrefs the child masters and scalars it reads / returns. The one
 // definition, asked of a `func.call` before reification and of a
@@ -51,22 +79,25 @@ bool mlir::allo::callLowerable(func::CallOp call) {
   return lowerableSignature(call.getOperandTypes(), call.getResultTypes());
 }
 
-std::optional<int64_t> mlir::allo::calleeStaticLatency(func::FuncOp callee) {
-  auto read = [&](llvm::StringRef name) -> std::optional<int64_t> {
-    if (auto a = callee->getAttrOfType<IntegerAttr>(name))
-      return a.getInt();
-    return std::nullopt;
-  };
-  if (std::optional<int64_t> l = read("dcp.latency"))
-    return l;
-  return read(sched::kLatencyAttr);
+Operation *mlir::allo::calleeOf(Operation *call) {
+  return SymbolTable::lookupNearestSymbolFrom(
+      call, cast<func::CallOp>(call).getCalleeAttr());
+}
+
+std::optional<int64_t> mlir::allo::calleeStaticLatency(Operation *callee) {
+  // A reified kernel answers from its own field; there is no second number on
+  // it to pick the wrong one of.
+  if (auto mod = dyn_cast<dcp::DCPathModuleOp>(callee))
+    return mod.getLatency();
+  if (auto a = callee->getAttrOfType<IntegerAttr>(kLatencyAttr))
+    return a.getInt();
+  return std::nullopt;
 }
 
 bool mlir::allo::isIndeterminateCall(Operation *op) {
   if (!isSyncSubKernelCall(op))
     return false;
-  auto callee = SymbolTable::lookupNearestSymbolFrom<func::FuncOp>(
-      op, cast<func::CallOp>(op).getCalleeAttr());
+  Operation *callee = calleeOf(op);
   return !callee || !calleeStaticLatency(callee);
 }
 
@@ -150,6 +181,25 @@ bool mlir::allo::blockHasSyncCall(Block &block) {
                                        : WalkResult::advance();
       })
       .wasInterrupted();
+}
+
+bool mlir::allo::isElastic(Operation *op) {
+  return op
+      ->walk([](Operation *inner) {
+        return isa<StreamGetOp, StreamPutOp>(inner) ? WalkResult::interrupt()
+                                                    : WalkResult::advance();
+      })
+      .wasInterrupted();
+}
+
+RegionShape mlir::allo::countedLoopShape(LoopLikeOpInterface loop) {
+  assert((isa<affine::AffineForOp, scf::ForOp>(loop.getOperation())) &&
+         "a counted loop is an affine.for or an scf.for");
+  if (loopBodyDecomposes(loop))
+    return RegionShape::Container;
+  return blockHasSyncCall(loop.getLoopRegions().front()->front())
+             ? RegionShape::CallNode
+             : RegionShape::Leaf;
 }
 
 bool mlir::allo::loopBodyDecomposes(LoopLikeOpInterface loop) {
@@ -310,22 +360,6 @@ void allo::printRegionGraphDot(const RegionGraph &g, func::FuncOp func,
   os << "}\n";
 }
 
-FailureOr<std::string>
-allo::dumpRegionDependenceAnaysis(ModuleOp module,
-                                  const std::string &funcName) {
-  if (funcName.empty()) {
-    return failure();
-  }
-  std::string s;
-  llvm::raw_string_ostream os(s);
-  for (func::FuncOp func : module.getOps<func::FuncOp>())
-    if (funcName.empty() || func.getSymName() == funcName)
-      printRegionGraphDot(DependenceAnalysis(func).getRegionGraph(), func, os);
-  if (s.empty())
-    return failure();
-  return os.str();
-}
-
 static void buildDepsRec(func::FuncOp fn, SymbolTableCollection &syms,
                          DenseMap<Operation *, SmallVector<Operation *>> &deps,
                          DenseSet<Operation *> &builtFns) {
@@ -400,4 +434,26 @@ allo::buildAndSortCallsiteGraph(func::FuncOp root) {
     if (!dfs(call, deps, visited, onStack, path, sorted))
       return failure();
   return sorted;
+}
+
+llvm::FailureOr<SmallVector<func::FuncOp>>
+allo::callGraphPostOrder(func::FuncOp root) {
+  auto callsOr = buildAndSortCallsiteGraph(root);
+  if (failed(callsOr))
+    return failure();
+  SymbolTableCollection syms;
+  SmallVector<func::FuncOp> order;
+  llvm::SmallPtrSet<Operation *, 32> seen;
+  for (Operation *call : *callsOr) {
+    auto callee = syms.lookupNearestSymbolFrom<func::FuncOp>(
+        call, cast<func::CallOp>(call).getCalleeAttr());
+    if (callee && !callee.isExternal() && seen.insert(callee).second)
+      order.push_back(callee);
+  }
+  // The root is not the callee of anything reachable from itself, so it is
+  // appended rather than found; the guard covers a self-recursive shape the
+  // cycle check would already have rejected.
+  if (seen.insert(root).second)
+    order.push_back(root);
+  return order;
 }

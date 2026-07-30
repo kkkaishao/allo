@@ -18,9 +18,9 @@ from collections.abc import Mapping
 import numpy as np
 
 from .utils import _render_template
-from ..utils import numpy_to_ctype
+from ..utils import numpy_to_ctype, dtype_to_numpy_dtype
 from ..base import write_text_if_changed
-from ...lang.core import BufferType, DType, TypeBase, widen_apint_to_std
+from ...lang.core import BufferType, DType, TypeBase
 from ...logging import completed_output, log_debug, log_detail, run_command, stage
 
 CSIM_MAKEFILE = "csim.mk"
@@ -31,22 +31,6 @@ CSIM_SHARED_LIBRARY = "libkernel.so"
 # flow). The two differ only in toolchain/flags -- same emitted C++, same ABI.
 CSIM_NATIVE_TEMPLATE = "csim.mk"
 CSIM_LEGACY_TEMPLATE = "csim_legacy.mk"
-
-
-_DTYPE_TO_NP = {
-    "float32": np.float32,
-    "float64": np.float64,
-    "index": np.int32,
-    "int8": np.int8,
-    "int16": np.int16,
-    "int32": np.int32,
-    "int64": np.int64,
-    "uint1": np.bool_,
-    "uint8": np.uint8,
-    "uint16": np.uint16,
-    "uint32": np.uint32,
-    "uint64": np.uint64,
-}
 
 
 def _version_key(path: Path) -> tuple[int, ...]:
@@ -81,6 +65,7 @@ def _clang_supports_hls_csim(clang: str, host_lib: str) -> bool:
             capture_output=True,
             text=True,
             env=env,
+            check=False,
         )
         return proc.returncode == 0
     except OSError:
@@ -236,15 +221,8 @@ def _generate_csim_makefile(
     )
 
 
-def _numpy_dtype_for_dtype(dtype: DType):
-    dtype = widen_apint_to_std(dtype)
-    if dtype.name not in _DTYPE_TO_NP:
-        raise TypeError(f"Unsupported Vitis Python-native csim dtype: {dtype}")
-    return _DTYPE_TO_NP[dtype.name]
-
-
 def _ctype_for_dtype(dtype: DType):
-    return numpy_to_ctype(_numpy_dtype_for_dtype(dtype))
+    return numpy_to_ctype(dtype_to_numpy_dtype(dtype))
 
 
 def _as_csim_array(arg, buffer_type: BufferType):
@@ -257,7 +235,7 @@ def _as_csim_array(arg, buffer_type: BufferType):
             f"Expected buffer shape {tuple(buffer_type.shape)}, got {arg.shape}"
         )
 
-    np_dtype = _numpy_dtype_for_dtype(buffer_type.dtype)
+    np_dtype = dtype_to_numpy_dtype(buffer_type.dtype)
     array = arg
     if array.dtype != np_dtype:
         array = array.astype(np_dtype)
@@ -275,7 +253,7 @@ def _writeback_csim_arrays(arg_arrays) -> None:
 def _csim_argtype(arg_type: TypeBase):
     if isinstance(arg_type, BufferType):
         return np.ctypeslib.ndpointer(
-            dtype=_numpy_dtype_for_dtype(arg_type.dtype),
+            dtype=dtype_to_numpy_dtype(arg_type.dtype),
             ndim=len(arg_type.shape),
             flags="C_CONTIGUOUS",
         )

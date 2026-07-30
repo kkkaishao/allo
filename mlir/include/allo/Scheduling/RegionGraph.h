@@ -3,15 +3,6 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-//===----------------------------------------------------------------------===//
-// Coarse cross-region dependence graph. Nodes are scheduling regions (loops +
-// maximal straight-line runs of a func's entry block); edges are coarse,
-// root-level memory/stream/SSA dependences between sibling regions. This is the
-// second tier of the analysis (the first being the per-region affine/stream
-// precision used to build each SDC problem). It drives concurrency reporting
-// and cross-region composition. It does NOT reorder anything.
-//===----------------------------------------------------------------------===//
-
 #ifndef ALLO_SCHEDULING_REGIONGRAPH_H
 #define ALLO_SCHEDULING_REGIONGRAPH_H
 
@@ -86,6 +77,50 @@ SmallVector<SchedRegion> enumerateRegions(Block &block);
 /// straight-line runs).
 SmallVector<SchedRegion> enumerateRegions(func::FuncOp func);
 
+/// The structural axis of the controller discriminant. ONE rule, stated once:
+/// the reifier reads it to charge a region's boundary cost, the emitter reads
+/// it to pick a controller family, and neither derives it a second time.
+enum class RegionShape {
+  /// Runs a schedule itself: an II-paced pipeline or a straight-line
+  /// sequential. A `dcp.instance` inside one is a fixed-latency datapath node
+  /// (a `CallUnit`), not a child to sequence.
+  Leaf,
+  /// Drives child regions in its body (a loop wrapping an inner loop, or a
+  /// sequential wrapper), one hierarchical pass per outer iteration.
+  Container,
+  /// Predicates its children: a `dcp.select`, run-once under its `condition`.
+  Guard,
+  /// Hands off to an instantiated module: a counted loop whose entire body is
+  /// one `dcp.instance`, advanced by the child's real `done` rather than by a
+  /// pipeline cadence. The child is on the *instance* substrate, which is why
+  /// this is not a `Container` (it has no child regions).
+  CallNode,
+};
+
+/// The shape of a reified region op (`dcp.pipeline` / `dcp.sequential` /
+/// `dcp.select`), read off its body. Order matters: a select is a guard
+/// whichever arms it has, a region holding child regions sequences them, and
+/// only then does a lone-instance counted loop become the instance hand-off.
+RegionShape dcpRegionShape(Operation *regionOp);
+
+/// The same shape, asked of the SOURCE counted loop before its body is
+/// materialized. THE shape decision on this side: the scheduler dispatches on
+/// it to pick a problem, its composer to charge a boundary, and the reifier to
+/// build the region, so none of the three can disagree about which loops
+/// sequence children. `dcpRegionShape` asks it again of the region that comes
+/// out, which is where a drift would be caught.
+///
+/// Asked of EVERY loop of a nest, including the outer levels of a perfect band:
+/// each one above the innermost drives its child as a container. One SOLUTION
+/// covers a whole band instead, which is why a flat walk of solutions cannot
+/// see the levels a composition has to charge.
+RegionShape countedLoopShape(LoopLikeOpInterface loop);
+
+/// Whether a straight-line region carries a datapath, i.e. materializes into a
+/// `dcp.sequential` at all. A span of nothing but declarations is left in place
+/// (`isDeclarationOp`), so it forms no region and occupies no cycle.
+bool spanFormsRegion(ArrayRef<Operation *> ops);
+
 /// A DECLARATION: an op that names storage or a literal and binds no hardware.
 /// A straight-line region of nothing but these carries no datapath, so the
 /// reifier leaves it in place rather than wrapping it, and a level whose body
@@ -97,14 +132,26 @@ bool isDeclarationOp(Operation *op);
 /// dataflow, ordered by its streams rather than by the schedule.
 bool isSyncSubKernelCall(Operation *op);
 
+/// The kernel a `func.call` names, whichever container the phase has: a
+/// `func.func` while scheduling, a `dcp.module` once reified. Not filtered by
+/// op type: a filter that misses returns null, and null reads as
+/// "indeterminate callee" rather than as an error.
+Operation *calleeOf(Operation *call);
+
 /// A callee's whole-kernel static latency, from whichever carrier the current
-/// phase has: `allo.sched.latency` while scheduling, `dcp.latency` once the
-/// callee has been reified (reification strips the schedule carrier). Empty
-/// when the callee's length is data-dependent. The partitioner runs in BOTH
-/// phases and their descents must agree, so this reads both carriers. The
-/// reifier's own `dcp.instance` timing reads it too, so one call cannot be
-/// indeterminate to one of them and not the other.
-std::optional<int64_t> calleeStaticLatency(func::FuncOp callee);
+/// phase has: `allo.sched.latency` on a `func.func` while scheduling, the
+/// `dcp.module`'s own `latency` once the callee has been reified. Empty when
+/// the callee's length is data-dependent. The partitioner runs in BOTH phases
+/// and their descents must agree, so this reads either container; the reifier's
+/// own `dcp.instance` timing reads it too, so one call cannot be indeterminate
+/// to one of them and not the other.
+///
+/// Reification is post-order over the call graph, so a caller always asks this
+/// of an already-reified callee and gets the exact number rather than the
+/// scheduler's provisional one. The two carriers live on different OPS, so
+/// violating that order means finding a `func.func` where a `dcp.module` is
+/// asserted.
+std::optional<int64_t> calleeStaticLatency(Operation *callee);
 
 /// A sync call whose callee carries no static latency: its body is
 /// data-dependent, so both its results and its writes land on the child's
@@ -116,6 +163,22 @@ bool isIndeterminateCall(Operation *op);
 /// `while` body must decompose whenever it does: the flushing-pipeline schedule
 /// issues an iteration per cycle, which no re-fired child instance can follow.
 bool blockHasSyncCall(Block &block);
+
+/// Whether \p op hands off through a STREAM anywhere under it, so the emitter
+/// wraps it in a stall shell (`HWEmitter::emitRegion`) and back-pressure, not
+/// its schedule, decides when it finishes.
+///
+/// The span such a region composes is a FLOOR, what the run costs with every
+/// token available on time; a full output queue or a starved input stretches it
+/// by an amount no static analysis names. So an elastic region carries no
+/// static span at all (`composeSpan`), which makes its whole kernel
+/// indeterminate and its callers gate on its real `done`.
+///
+/// Structural rather than an attempt to prove a given channel never stalls,
+/// which is a whole-network analysis. Asked of affine/scf IR by the scheduler
+/// and of the dcp regions by the reifier, so it keys on the stream ops
+/// themselves, which reification keeps verbatim.
+bool isElastic(Operation *op);
 
 /// Whether a sync call can be modelled as a leaf CallUnit: every operand is a
 /// memref or scalar and every result a scalar. It excludes a stream operand,
@@ -162,8 +225,24 @@ StringRef toString(XEdgeKind kind);
 void printRegionGraphDot(const RegionGraph &graph, func::FuncOp func,
                          raw_ostream &os);
 
+/// Topologically sort the synchronous call graph, as CALLSITES. Fails on a
+/// cycle, diagnosed on the callsites that form it. For a consumer that binds
+/// per callsite (two calls to one kernel pass different arrays), which is why
+/// this granularity survives alongside `callGraphPostOrder` below.
 llvm::FailureOr<SmallVector<Operation *>>
 buildAndSortCallsiteGraph(func::FuncOp root);
+
+/// The kernels reachable from \p root, CALLEES BEFORE CALLERS, with \p root
+/// last. One entry per function, since the unit of work is the function and
+/// several callsites may name one callee; external callees are dropped, having
+/// no body to work on.
+///
+/// This order is what lets a caller read a fact its callee already published:
+/// the pre-schedule verifier's stream directions, and the scheduler's callee
+/// latency, on which the CALLER's own region partition depends
+/// (`isIndeterminateCall`).
+llvm::FailureOr<SmallVector<func::FuncOp>>
+callGraphPostOrder(func::FuncOp root);
 } // namespace mlir::allo
 
 #endif // ALLO_SCHEDULING_REGIONGRAPH_H

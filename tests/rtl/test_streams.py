@@ -16,7 +16,7 @@ from allo import kernel
 from allo.lang import i32, f32, Stream
 
 sys.path.insert(0, os.path.dirname(__file__))
-from _common import _sched, _to_rtl, _iis, FADD, Mod  # noqa: E402
+from _common import Dcp, _sched, _to_rtl, _iis, FADD, Mod  # noqa: E402
 
 pytestmark = pytest.mark.skipif(
     shutil.which("verilator") is None, reason="verilator not available"
@@ -932,10 +932,13 @@ def test_dataflow_predicated_stream_access():
 
     mod = _to_rtl(pp_prod)
     res = mod.schedule()
-    # The put carries a predicate (`... if %c`), the loop pipelines at II=1, and
-    # no guard (dcp.select) / raw scf.if is left.
-    assert "allo.stream.put" in mod.dcp and "if %" in mod.dcp
-    assert "scf.if" not in mod.dcp and "dcp.select" not in mod.dcp
+    # The put carries its optional predicate operand, the loop pipelines at
+    # II=1, and no guard (dcp.select) / raw scf.if is left.
+    d = Dcp(mod)
+    (put,) = d.func("pp_prod").ops("allo.stream.put")
+    # segments are (stream, indices, value, pred): the last is the predicate
+    assert put.attributes["operandSegmentSizes"][3] == 1
+    assert not d.has("scf.if")
     assert _iis(res.func("pp_prod").cyclic()) == [1]
     assert not any(r.kind == "guard" for r in res.funcs[0].regions)
 
