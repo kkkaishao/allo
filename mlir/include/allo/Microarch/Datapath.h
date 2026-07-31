@@ -631,6 +631,15 @@ struct RegionBlock {
 
   enum class Kind { Cyclic, Acyclic } kind = Kind::Acyclic;
   std::optional<unsigned> ii; // set iff Cyclic
+
+  /// Whether at most ONE pass of this region is in flight. A cyclic region
+  /// overlaps its iterations at `ii` by construction; every other family runs
+  /// a pass to its `done` before the next is issued. Named here rather than
+  /// re-derived at each consumer, because what reads it (`RegionTag`, so that
+  /// `delayValid` may time a long delay with a counter rather than one
+  /// flip-flop per cycle) is relying on the overlap rule, not on the kind.
+  bool singlePass() const { return kind == Kind::Acyclic; }
+
   // Counted-loop induction: the IV runs `lb, lb+step, ...` up to (excluding)
   // `ub`. Each bound is an ordinary datapath `Source`, either a data-dependent
   // range start / count / stride or a literal `ConstCell` synthesized by

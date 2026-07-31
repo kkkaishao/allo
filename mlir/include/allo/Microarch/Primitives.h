@@ -218,6 +218,14 @@ struct EmitContext {
   // (valid chains, activation pulses) read as `r3_v2` rather than `_GEN_41`.
   std::string regionTag;
 
+  // Whether at most ONE pass of the region being emitted is in flight, which is
+  // what lets `delayValid` time a long delay with a counter instead of a shift
+  // register. A pipelined region is the counterexample and the reason this is
+  // not simply always true: its chain taps each hold a DIFFERENT in-flight
+  // iteration, so collapsing them to one counter would drop every pulse but
+  // the first. False outside any region, so nothing opts in by accident.
+  bool regionSinglePass = false;
+
   EmitContext(OpBuilder &b, Location loc, circt::BackedgeBuilder &bb, Type i1,
               Type i32)
       : b(b), loc(loc), i1(i1), i32(i32), bb(bb) {}
@@ -262,7 +270,16 @@ struct EmitContext {
   ShiftChain shiftChain(Value in, unsigned depth, const StallShell &sh);
   /// A 1-bit signal delayed `n` cycles (issue -> a store's pipeline stage): the
   /// last tap of an `n`-deep `shiftChain`. Resets to 0, so no spurious valid.
+  ///
+  /// A deep delay in a single-pass region is built as `delayPulseCounted`
+  /// instead, since `n` registers to hold one pulse is a cost that tracks the
+  /// SCHEDULE rather than the datapath: an operation sitting a whole callee's
+  /// latency into its region would otherwise spend tens of thousands of them.
   Value delayValid(Value sig, unsigned n, const StallShell &sh);
+  /// One pulse delayed `n` cycles by a counter: `log2(n)` registers instead of
+  /// `n`, at the cost of admitting only one pulse at a time. Sound exactly
+  /// where `regionSinglePass` holds, and asserts it.
+  Value delayPulseCounted(Value pulse, unsigned n, const StallShell &sh);
   /// A scheduled op's activation pulse: \p pulse delayed to the op's pipeline
   /// stage (its `dcpStart`). The one name for "this op fires now": a store's
   /// write-enable, a shared-unit input's mux select, and a fused accumulator's
@@ -323,10 +340,16 @@ struct EmitContext {
 struct RegionTag {
   EmitContext &c;
   std::string saved;
-  RegionTag(EmitContext &c, unsigned region) : c(c), saved(c.regionTag) {
+  bool savedSinglePass;
+  RegionTag(EmitContext &c, unsigned region, bool singlePass = false)
+      : c(c), saved(c.regionTag), savedSinglePass(c.regionSinglePass) {
     c.regionTag = "r" + std::to_string(region);
+    c.regionSinglePass = singlePass;
   }
-  ~RegionTag() { c.regionTag = saved; }
+  ~RegionTag() {
+    c.regionTag = saved;
+    c.regionSinglePass = savedSinglePass;
+  }
 };
 
 } // namespace mlir::allo::uarch

@@ -198,6 +198,15 @@ protected:
   /// sees when their kernel has an unsatisfiable dependence cycle.
   void reportInfeasible();
   virtual LogicalResult checkLastOp();
+  /// The objective rows, optimized lexicographically in this order. The second
+  /// one is a TIEBREAK: minimizing the last operation's start time leaves a
+  /// whole face of optimal solutions, and the simplex would otherwise return an
+  /// arbitrary vertex of it, so an operation with slack could land anywhere in
+  /// its feasible window. That is not free downstream: the emitter builds an
+  /// operation's start pulse as `delayValid(regionStart, t)`, one flip-flop per
+  /// cycle of `t`, so a slack-bearing node placed late costs its whole slack in
+  /// registers while changing no latency.
+  enum { OBJ_LATENCY = 0, OBJ_AXAP /* i.e. either ASAP or ALAP */ };
   virtual bool fillObjectiveRow(SmallVector<int> &row, unsigned obj);
   virtual void fillConstraintRow(SmallVector<int> &row,
                                  Problem::Dependence dep);
@@ -357,8 +366,6 @@ private:
 protected:
   Problem &getProblem() override { return prob; }
   LogicalResult checkLastOp() override;
-  enum { OBJ_LATENCY = 0, OBJ_AXAP /* i.e. either ASAP or ALAP */ };
-  bool fillObjectiveRow(SmallVector<int> &row, unsigned obj) override;
   void updateMargins();
   LogicalResult scheduleOperation(Operation *n);
   LogicalResult growIIByDeDinechin(Operation *n);
@@ -631,10 +638,20 @@ LogicalResult SimplexSchedulerBase::checkLastOp() {
 
 bool SimplexSchedulerBase::fillObjectiveRow(SmallVector<int> &row,
                                             unsigned obj) {
-  assert(obj == 0);
-  // Minimize start time of user-specified last operation.
-  row[startTimeLocations[startTimeVariables[lastOp]]] = 1;
-  return false;
+  switch (obj) {
+  case OBJ_LATENCY:
+    // Minimize start time of user-specified last operation.
+    row[startTimeLocations[startTimeVariables[lastOp]]] = 1;
+    return true;
+  case OBJ_AXAP:
+    // Minimize sum of start times of all-but-the-last operation.
+    for (auto *op : getProblem().getOperations())
+      if (op != lastOp)
+        row[startTimeLocations[startTimeVariables[op]]] = 1;
+    return false;
+  default:
+    llvm_unreachable("Unsupported objective requested");
+  }
 }
 
 void SimplexSchedulerBase::fillConstraintRow(SmallVector<int> &row,
@@ -1384,24 +1401,6 @@ void ModuloSimplexScheduler::MRT::release(Operation *op) {
   }
   assert(held && "releasing an operation that holds no unit");
   (void)held;
-}
-
-bool ModuloSimplexScheduler::fillObjectiveRow(SmallVector<int> &row,
-                                              unsigned obj) {
-  switch (obj) {
-  case OBJ_LATENCY:
-    // Minimize start time of user-specified last operation.
-    row[startTimeLocations[startTimeVariables[lastOp]]] = 1;
-    return true;
-  case OBJ_AXAP:
-    // Minimize sum of start times of all-but-the-last operation.
-    for (auto *op : getProblem().getOperations())
-      if (op != lastOp)
-        row[startTimeLocations[startTimeVariables[op]]] = 1;
-    return false;
-  default:
-    llvm_unreachable("Unsupported objective requested");
-  }
 }
 
 void ModuloSimplexScheduler::updateMargins() {

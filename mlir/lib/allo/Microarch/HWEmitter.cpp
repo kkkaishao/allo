@@ -80,7 +80,8 @@ Terminator HWEmitter::terminatorOf(const uarch::RegionBlock &rb) {
 // captureResults); the shared skeleton reads as a linear sequence.
 Value HWEmitter::emitRegion(const uarch::RegionBlock &rb, Value start,
                             bool retrig) {
-  RegionTag tag(ctx, rb.id); // naming scope for this region's pipeline cells
+  RegionTag tag(ctx, rb.id,
+                rb.singlePass()); // naming scope for this region's cells
   // The controller is selected by (shape x termination) and nothing else: one
   // switch over the table in `RegionBlock::Shape`. Falling out of the switch is
   // the `Leaf` cell, whose controller is built inline below.
@@ -334,7 +335,7 @@ HWEmitter::setupCarriedIterArgs(const uarch::RegionBlock &rb, Value start,
 // `done`, a held level cleared on its start, so its rising edge marks each
 // completion.
 Value HWEmitter::emitLoopCall(const uarch::RegionBlock &rb, Value start) {
-  RegionTag tag(ctx, rb.id);
+  RegionTag tag(ctx, rb.id, rb.singlePass());
   // A loop-over-call body is one child instance and nothing else
   // (`validateDatapath`), so the region is rigid: it derives no stall shell,
   // and every timing primitive below reduces to its unconditional form.
@@ -368,7 +369,7 @@ Value HWEmitter::emitLoopCall(const uarch::RegionBlock &rb, Value start) {
 // survivor register (captured in the producer, read in the consumer). Returns a
 // latched completion level.
 Value HWEmitter::emitContainer(const uarch::RegionBlock &rb, Value start) {
-  RegionTag tag(ctx, rb.id);
+  RegionTag tag(ctx, rb.id, rb.singlePass());
   // Bounds are compile-time constants, or runtime Sources for a variable-trip
   // container. The counted done-driven controller is paced by `lastDrain`, the
   // last child's done edge, resolved once the children emit.
@@ -411,7 +412,7 @@ Value HWEmitter::emitContainer(const uarch::RegionBlock &rb, Value start) {
 // squash or stall: the same non-speculative flushing family as a leaf while.
 Value HWEmitter::emitConditionalContainer(const uarch::RegionBlock &rb,
                                           Value start) {
-  RegionTag tag(ctx, rb.id);
+  RegionTag tag(ctx, rb.id, rb.singlePass());
 
   // Outer iter-arg registers = this region's survivors: each latches its
   // init at `start`, then advances to a child survivor's value when an
@@ -450,7 +451,7 @@ Value HWEmitter::emitConditionalContainer(const uarch::RegionBlock &rb,
 // iteration or iter-args, unlike emitConditionalContainer, since the
 // predicate is independent of the children.
 Value HWEmitter::emitGuard(const uarch::RegionBlock &rb, Value start) {
-  RegionTag tag(ctx, rb.id);
+  RegionTag tag(ctx, rb.id, rb.singlePass());
   // The predicate as a Source: a scheduled condition region's survivor (a
   // data-dependent scf guard), or the parent container's combinational
   // predicate unit (an affine guard, emitted by the container beforehand).

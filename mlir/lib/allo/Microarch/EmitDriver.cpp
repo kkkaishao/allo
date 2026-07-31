@@ -270,6 +270,26 @@ emitModule(dcp::DCPathModuleOp func, uarch::Datapath &dp, OpBuilder &b,
   return std::make_pair(hwMod, std::move(model));
 }
 
+static void cleanupDcpOps(ModuleOp module) {
+  // cleanup non-hw ops to avoid Verilog export errors
+  for (dcp::DCPathModuleOp f :
+       llvm::make_early_inc_range(module.getOps<dcp::DCPathModuleOp>()))
+    f.erase();
+  for (memref::GlobalOp g :
+       llvm::make_early_inc_range(module.getOps<memref::GlobalOp>()))
+    g.erase();
+  // The spent declarations, dropped LAST: every `dcp.compute` reads its timing
+  // off the `dcp.operator` it names, and dropping them is also what leaves each
+  // extern operator module the sole owner of the `sym_name` it shares.
+  SmallVector<Operation *> spent;
+  module.walk([&](Operation *op) {
+    if (isa<dcp::DCPathOperatorOp, dcp::DCPathDeviceOp>(op))
+      spent.push_back(op);
+  });
+  for (Operation *op : spent)
+    op->erase();
+}
+
 LogicalResult emitDatapathToHW(ModuleOp module, StringRef binding,
                                StringRef top,
                                llvm::StringMap<std::string> &interfaces) {
@@ -287,8 +307,7 @@ LogicalResult emitDatapathToHW(ModuleOp module, StringRef binding,
 
   // Every reified kernel is a `dcp.module`; there is no second container to
   // filter for a schedule, because carrying one is what the op is.
-  SmallVector<dcp::DCPathModuleOp> scheduled(
-      module.getOps<dcp::DCPathModuleOp>());
+  auto scheduled = llvm::to_vector(module.getOps<dcp::DCPathModuleOp>());
 
   auto policy = bindingPolicyFor(binding);
   if (!policy) {
@@ -372,22 +391,7 @@ LogicalResult emitDatapathToHW(ModuleOp module, StringRef binding,
   if (failed(emitOne(emitOne, topFunc)))
     return failure();
 
-  // cleanup non-hw ops to avoid Verilog export errors
-  for (dcp::DCPathModuleOp f : scheduled)
-    f.erase();
-  for (memref::GlobalOp g :
-       llvm::make_early_inc_range(module.getOps<memref::GlobalOp>()))
-    g.erase();
-  // The spent declarations, dropped LAST: every `dcp.compute` reads its timing
-  // off the `dcp.operator` it names, and dropping them is also what leaves each
-  // extern operator module the sole owner of the `sym_name` it shares.
-  SmallVector<Operation *> spent;
-  module.walk([&](Operation *op) {
-    if (isa<dcp::DCPathOperatorOp, dcp::DCPathDeviceOp>(op))
-      spent.push_back(op);
-  });
-  for (Operation *op : spent)
-    op->erase();
+  cleanupDcpOps(module);
   return success();
 }
 

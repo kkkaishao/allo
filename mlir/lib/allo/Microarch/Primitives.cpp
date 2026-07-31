@@ -273,7 +273,43 @@ ShiftChain EmitContext::shiftChain(Value in, unsigned depth,
   return chain;
 }
 
+// Above this many cycles a counter is the cheaper cell: it costs log2(n)
+// registers plus a comparator against the n a chain spends outright. Set well
+// clear of the ordinary pipeline-stage delays so the shape of a small chain,
+// which several structural tests read, is left alone.
+static constexpr unsigned kCountedDelayCycles = 64;
+
+Value EmitContext::delayPulseCounted(Value pulse, unsigned n,
+                                     const StallShell &sh) {
+  assert(regionSinglePass && "a counted delay drops every pulse but the first, "
+                             "so it needs a region that issues one pass");
+  assert(n >= 1 && "a zero-cycle delay is the signal itself");
+  // `pulse` arms the counter at 0; it counts every cycle the region advances
+  // and fires as it reaches n-1, so the output rises exactly n cycles after the
+  // input, the same contract a chain tap carries. Under an elastic shell it
+  // counts only while enabled, so it freezes with the chain it replaces.
+  Backedge armedNext = bb.get(i1);
+  Backedge countNext = bb.get(i32);
+  Value armed =
+      sh ? enabledReg(armedNext, sh.chainEnable, f1) : reg(armedNext, f1);
+  Value count = sh ? enabledReg(countNext, sh.chainEnable, zero32)
+                   : reg(countNext, zero32);
+  Value fire = andBits(armed, icmpEq(count, n - 1));
+  armedNext.setValue(mux(pulse, t1, mux(fire, f1, armed)));
+  countNext.setValue(mux(
+      pulse, zero32,
+      mux(armed, R(comb::AddOp::create(b, loc, count, one32, false)), count)));
+  if (!regionTag.empty()) {
+    nameValue(armed, regionSignal(regionTag, "wait" + std::to_string(n)));
+    nameValue(count,
+              regionSignal(regionTag, "wait" + std::to_string(n) + "_c"));
+  }
+  return fire;
+}
+
 Value EmitContext::delayValid(Value sig, unsigned n, const StallShell &sh) {
+  if (n >= kCountedDelayCycles && regionSinglePass)
+    return delayPulseCounted(sig, n, sh);
   ShiftChain chain = shiftChain(sig, n, sh);
   // The densest cluster of otherwise-anonymous state in a pipelined region.
   // Label each stage with the cycle it is valid at, so a waveform reads
