@@ -45,18 +45,12 @@ Terminator HWEmitter::terminatorOf(const uarch::RegionBlock &rb) {
          "counted-loop counter is up-counting; a statically non-positive step "
          "must have been rejected by the frontend or the op verifier");
   auto ivType = cast<IntegerType>(rb.counterType);
-  // A bound resolved to the counter's width. Identity for every bound the
-  // frontend produces (an i32 index); the resize lets a loop-over-call whose
-  // child indexes at another width build its bounds here.
+  // A bound resolved to the counter's width. Identity for a literal bound,
+  // which `recordRegionBounds` already tied in at that width; the resize is for
+  // a RUNTIME bound, which arrives as an ordinary index.
   auto at = [&](const uarch::Source &s) {
-    Value v = datapath.resolveSource(s);
-    unsigned want = ivType.getWidth(),
-             have = cast<IntegerType>(v.getType()).getWidth();
-    if (want == have)
-      return v;
-    return want > have
-               ? comb::createOrFoldSExt(ctx.b, ctx.loc, v, ivType)
-               : ctx.R(comb::ExtractOp::create(ctx.b, ctx.loc, ivType, v, 0));
+    return resize(ctx.b, ctx.loc, datapath.resolveSource(s), ivType.getWidth(),
+                  /*isSigned=*/true);
   };
   Value lb = at(rb.lbSource), step = at(rb.stepSource);
   if (rb.ubSource)

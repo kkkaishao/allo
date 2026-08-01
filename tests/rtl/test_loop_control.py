@@ -1101,6 +1101,31 @@ def test_leaf_loop_over_calls_controller_paces_on_child_done():
     assert np.array_equal(B, A * 2 + 1)
 
 
+# The shape says the body is one instance; it does NOT say the child reads the
+# counter. `for r: child(A)` re-runs one instance on state living in the memory
+# it masters, so the counter is a private iteration count that never leaves the
+# region.
+def test_loop_over_calls_without_an_index_operand():
+    @kernel
+    def rp_step(A: i32[8]):
+        for i in range(8):
+            A[i] = A[i] * 2 + 1
+
+    @kernel
+    def rp_top(A: i32[8]):
+        for r in range(5):
+            rp_step(A)  # same arguments every pass; the state is in `A`
+
+    rtl = _to_rtl(rp_top)
+    assert Dcp(rtl).func(rtl.top).callees()  # the leaf CallUnit path, as above
+    assert rtl.mlir.count("hw.instance") == 1, "one instance re-fired, not five"
+
+    A = (np.arange(8, dtype=np.int32) * 3 + 1) & 0x3F
+    got = A.copy()
+    rtl.cosim(got)
+    assert np.array_equal(got, A * 32 + 31)  # (2x+1) applied five times
+
+
 # The loop-over-calls controller takes its induction bounds from
 # terminatorOf, the same source every other counted region uses, rather than
 # a hardcoded 0 to N step 1: the counter seeds at lb, advances by step,

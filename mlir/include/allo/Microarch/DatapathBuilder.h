@@ -163,9 +163,10 @@ struct DatapathBuilder {
   /// bound, an array nothing writes is a ROM whoever reads it.
   void reclassifyRoms();
   /// Derive every cyclic region's `counterType`, the width its iteration
-  /// counter and therefore its bounds are built at. Runs after
-  /// `recordCallScalars`, which is what identifies a loop-over-call's IV
-  /// operand and hence the callee port whose width its counter must match.
+  /// counter and therefore its bounds are built at, from that loop's own
+  /// induction range. It reads nothing but the region op, so it runs before the
+  /// Source-resolving passes; a consumer wanting another width adapts at its
+  /// own end.
   void deriveCounterTypes();
   /// Record each pipeline's induction bounds (lb/ub/step) as Sources on its
   /// RegionBlock: a runtime bound from the `lbBound`/`dynamicBound`/`stepBound`

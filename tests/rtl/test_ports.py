@@ -349,9 +349,11 @@ def test_internal_signal_names():
             out[i] = acc
 
     v = _to_rtl(gv).verilog
-    # Both loop counters, including the outer (container) one.
-    assert re.search(r"\breg\s+\[31:0\]\s+i;", v), "container counter lost its IV"
-    assert re.search(r"\breg\s+\[31:0\]\s+j;", v)
+    # Both loop counters, including the outer (container) one. The declared
+    # width is whatever each loop's own range needs, so this asks for the NAME
+    # and leaves the width to the test that measures it.
+    assert re.search(r"\breg\s+(\[\d+:0\]\s+)?i;", v), "container counter lost its IV"
+    assert re.search(r"\breg\s+(\[\d+:0\]\s+)?j;", v)
     assert re.search(r"\br\d+_sv\d+\b", v), "the survivor latch is named"
     assert re.search(r"_acc_u\d+_y", v), "an IP result reaches the wire as `acc`"
 

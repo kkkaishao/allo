@@ -62,9 +62,7 @@ def _is_and(m, v, *want):
 def _outlined(mod, container: str) -> list[str]:
     """The processes outlined out of `container`'s own body, each a kernel of
     its own named `<container>.datapath<k>`."""
-    return sorted(
-        k for k in Dcp(mod).kernels if k.startswith(f"{container}.datapath")
-    )
+    return sorted(k for k in Dcp(mod).kernels if k.startswith(f"{container}.datapath"))
 
 
 # --- the composition operator: one table, three start policies --------------

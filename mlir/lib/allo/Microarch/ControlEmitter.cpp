@@ -28,8 +28,7 @@ RegionControl ControlEmitter::emitPipelineControl(const uarch::RegionBlock &rb,
   nameValue(rc.counter, rb.counterName.empty() ? regionSignal(rb.id, "iv")
                                                : rb.counterName);
   rc.scaledCounters = emitScaledCounters(
-      rb, term, /*bypassStart=*/Value(),
-      [&](Value cur, Value stepped, Value init) {
+      rb, /*bypassStart=*/Value(), [&](Value cur, Value stepped, Value init) {
         // Exactly `iterNext` above, with `lb` and `step` scaled.
         return c.mux(rc.running, c.mux(rc.issue, stepped, cur), init);
       });
@@ -40,17 +39,18 @@ RegionControl ControlEmitter::emitPipelineControl(const uarch::RegionBlock &rb,
 // counters are written beside the counter they have to track. Drifting from
 // that counter is the only way these can be wrong.
 llvm::SmallVector<Value> ControlEmitter::emitScaledCounters(
-    const uarch::RegionBlock &rb, const Terminator &term, Value bypassStart,
+    const uarch::RegionBlock &rb, Value bypassStart,
     llvm::function_ref<Value(Value, Value, Value)> update) const {
   llvm::SmallVector<Value> scaled;
-  if (rb.addrStrides.empty())
-    return scaled;
-  auto ty = cast<IntegerType>(term.lb.getType());
   // Whether each slot's register wraps THIS advance, which is what a digit
   // above it advances on. A carry slot always precedes its consumer, so the
   // signal exists by the time it is read.
   llvm::SmallVector<Value> wrapped(rb.addrStrides.size());
   for (auto [slot, s] : llvm::enumerate(rb.addrStrides)) {
+    // Each register at the width ITS OWN range needs, which is what the digit
+    // or the array it walks says and not what the counter happens to be: a
+    // cyclic-4 bank digit is 3 bits beside a 32-bit iteration counter.
+    auto ty = c.b.getIntegerType(s.width);
     Backedge next = c.bb.get(ty);
     Value init = c.konst(ty, s.init);
     Value reg = c.reg(next, init);
@@ -139,7 +139,7 @@ RegionControl ControlEmitter::emitPipelined(unsigned region, int64_t ii,
   // Induction register: the counter IS the source IV, holding `lb` at start and
   // advancing by `step` on each gated issue, so Source::Counter reads the real
   // loop variable and a `lb != 0` / `step != 1` loop needs no body rewriting.
-  auto iterNext = c.bb.get(c.i32);
+  auto iterNext = c.bb.get(term.lb.getType());
   Value iv = c.reg(iterNext, term.lb);
   Value ivStep = c.R(comb::AddOp::create(c.b, c.loc, iv, term.step, false));
   iterNext.setValue(c.mux(running, c.mux(issue, ivStep, iv), term.lb));
@@ -187,7 +187,7 @@ ControlEmitter::emitCountedIteration(const uarch::RegionBlock &rb,
   Value advance = c.andBits(complete, c.notBit(last));
   ivNext.setValue(c.mux(start, term.lb, c.mux(advance, ivStep, iv)));
   llvm::SmallVector<Value> scaled = emitScaledCounters(
-      rb, term, /*bypassStart=*/launchAtStart ? start : Value(),
+      rb, /*bypassStart=*/launchAtStart ? start : Value(),
       [&](Value cur, Value stepped, Value init) {
         // Exactly `ivNext` above, with `lb` and `step` scaled.
         return c.mux(start, init, c.mux(advance, stepped, cur));

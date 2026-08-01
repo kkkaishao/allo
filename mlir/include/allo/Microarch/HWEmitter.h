@@ -186,13 +186,14 @@ struct ControlEmitter {
                                     const Terminator &term, Value start,
                                     const StallShell &sh) const;
   /// The scaled counters of \p rb: one register per `addrStrides` entry,
-  /// holding that multiple of the region's counter. \p update is the counter's
-  /// own next-value expression with `lb` and `step` scaled, supplied by the
-  /// caller because the two controller families disagree about it. \p
+  /// holding that multiple of the region's counter, each at its OWN width
+  /// (`AddrStride::width`) rather than the counter's. \p update is the
+  /// counter's own next-value expression with `lb` and `step` scaled, supplied
+  /// by the caller because the two controller families disagree about it. \p
   /// bypassStart mirrors a done-driven counter's start-cycle bypass (null for
   /// none).
   llvm::SmallVector<Value> emitScaledCounters(
-      const uarch::RegionBlock &rb, const Terminator &term, Value bypassStart,
+      const uarch::RegionBlock &rb, Value bypassStart,
       llvm::function_ref<Value(Value cur, Value stepped, Value init)> update)
       const;
   /// The one pipelined control skeleton for the free-running (II==1), modulo
@@ -282,6 +283,13 @@ struct DatapathEmitter {
   // `wantIssue` is null when the region has no stall shell (a stage-0 stream
   // access hazards on it).
   DenseMap<unsigned, RegionControl> controlOf;
+  // Each region's counter widened to `kIndexWidth`, built once at that seam.
+  // The counter REGISTER is only as wide as its own induction range needs
+  // (`RegionBlock::counterType`), while a datapath READ of it is an ordinary
+  // index: an address-cone operand, a compute unit's `index` operand, a child's
+  // index port. Those are two different wires whenever a region narrowed, and
+  // this is the second one.
+  DenseMap<unsigned, Value> counterIndex;
   // H's output per region: the stall shell that region's timing runs against.
   // Keyed like `controlOf`, and for the same reason. An access or a shared-unit
   // mux is timed against the shell of the region that OWNS it, which need not
@@ -429,8 +437,11 @@ struct DatapathEmitter {
   /// has no counter, and `wantIssue` for a region with no stall shell.
   void setControl(unsigned region, const RegionControl &rc) {
     RegionControl &slot = controlOf[region];
-    if (rc.counter)
+    if (rc.counter) {
       slot.counter = rc.counter;
+      counterIndex[region] =
+          resize(c.b, c.loc, rc.counter, kIndexWidth, /*isSigned=*/true);
+    }
     slot.issue = rc.issue;
     if (rc.wantIssue)
       slot.wantIssue = rc.wantIssue;

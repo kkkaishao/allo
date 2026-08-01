@@ -34,6 +34,18 @@ IntegerType memElemType(const uarch::MemUnit &m, OpBuilder &b) {
   return hwType(cast<MemRefType>(m.memref.getType()).getElementType(), b);
 }
 
+Value resize(OpBuilder &b, Location loc, Value v, unsigned width,
+             bool isSigned) {
+  auto want = b.getIntegerType(width);
+  unsigned have = cast<IntegerType>(v.getType()).getWidth();
+  if (have == width)
+    return v;
+  if (have > width)
+    return comb::ExtractOp::create(b, loc, want, v, 0).getResult();
+  return isSigned ? comb::createOrFoldSExt(b, loc, v, want)
+                  : comb::createZExt(b, loc, v, width);
+}
+
 unsigned declaredDepth(unsigned words) { return std::max(2u, words); }
 
 SmallVector<APInt> initWords(ElementsAttr init, unsigned width,
@@ -126,18 +138,9 @@ Value emitCompute(OpBuilder &b, Location loc, StringRef kind,
                             cast<IntegerType>(resultType).getWidth());
   if (kind == "trunci")
     return comb::ExtractOp::create(b, loc, resultType, lhs, 0).getResult();
-  if (kind == "index_cast") {
-    // index <-> integer: both carried at their hw integer width (hwType maps
-    // index to i32), so this is a signed resize to the result width: sExt,
-    // low-bit extract, or identity when the widths already match.
-    unsigned dst = cast<IntegerType>(resultType).getWidth();
-    unsigned src = cast<IntegerType>(lhs.getType()).getWidth();
-    if (dst == src)
-      return lhs;
-    return dst > src ? comb::createOrFoldSExt(b, loc, lhs, resultType)
-                     : comb::ExtractOp::create(b, loc, resultType, lhs, 0)
-                           .getResult();
-  }
+  if (kind == "index_cast")
+    return resize(b, loc, lhs, cast<IntegerType>(resultType).getWidth(),
+                  /*isSigned=*/true);
   // Float negate: arith.negf flips the sign bit of the float, which rides as
   // its integer bit pattern here, so this is a single XOR, no IP. Unary, so
   // it precedes the `rhs = operands[1]` read below.

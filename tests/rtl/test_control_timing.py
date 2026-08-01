@@ -344,7 +344,9 @@ def test_a_subscript_that_cannot_be_carried_keeps_the_row_its_register():
     # visible `comb.mul` by it (`mulConst` leaves the recoding to synthesis).
     # Asked of that constant rather than of `comb.mul` at large, since a runtime
     # loop bound negates with one too and that is control, not address.
-    twenty = set(re.findall(r"(%c20_i32\w*) = hw\.constant 20", m))
+    # Any width: the stride register is built at the range it walks, not at the
+    # counter's width, so `20` is a constant of that register's own type.
+    twenty = set(re.findall(r"(%c20_i\d+\w*) = hw\.constant 20", m))
     assert twenty, "no stride of 20 anywhere: the test measures nothing"
     assert any(
         re.search(rf"comb\.add %r0_addr\d+, {c}\b", m) for c in twenty

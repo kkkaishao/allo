@@ -47,6 +47,19 @@ struct CalleeCtx {
   const llvm::StringMap<iface::ModuleInterface> &ifaces;
 };
 
+/// The width a runtime `index` value is carried at. An `index` has no width of
+/// its own in MLIR, so the datapath picks one, and everything that carries an
+/// index reads it here: `hwWidth`, the operands an address cone is evaluated
+/// over (`evalAffine`), and the boundary address ports the manifest publishes.
+///
+/// A counter or an address register may be BUILT narrower than this wherever
+/// its own value range allows (`RegionBlock::counterType`,
+/// `RegionBlock::AddrStride::width`); this is the width such a value widens
+/// back to the moment it is read as an ordinary index. Named rather than
+/// spelled at each of those points because it is a default, and a default is
+/// the kind of thing that becomes a device or schedule option.
+inline constexpr unsigned kIndexWidth = 32;
+
 //===----------------------------------------------------------------------===//
 // Identifiers. Cells are referenced by small integer ids (indices into the
 // Datapath's vectors) rather than pointers, so the whole model stays trivially
@@ -440,6 +453,12 @@ struct CallUnit {
   struct ScalarArg {
     Source src;
     std::string port; // child scalar-input port name
+    /// The port's width, so the wiring adapts the driver to the CHILD rather
+    /// than the child's width propagating back into whatever produces it. It
+    /// matters for one driver, an enclosing counter: an index has no width of
+    /// its own, so caller and callee each pick one and only this says they
+    /// agree.
+    unsigned width = 0;
   };
   llvm::SmallVector<ScalarArg, 1> scalarIns;
 
@@ -749,6 +768,13 @@ struct RegionBlock {
     unsigned carry = 0; // slot whose wrap gates `bump`; self means none
     bool hasCarry = false; // whether `carry` names one
     bool down = false;     // counts down, so `wrap` is added on borrow
+    /// The width the register is BUILT at. Every field above is a compile-time
+    /// constant, so the range it runs over is one too, and this is that range
+    /// rounded up to bits: a wrapping digit needs `clog2` of its modulus and a
+    /// row stride `clog2` of the array it walks, neither of which has anything
+    /// to do with the counter's own width, which these borrowed before.
+    /// `kIndexWidth` whenever the range is not bounded (`slotFor`).
+    unsigned width = kIndexWidth;
   };
   /// Deduplicated, since two accesses down the same row share a stride. Some
   /// slots exist only to carry another (the `x mod D` companion of a quotient
@@ -975,11 +1001,11 @@ unsigned dcpLatency(Operation *op);
 /// value with no producing op (a constant, the iteration counter).
 unsigned readyCycleOf(Operation *op);
 
-/// The datapath's hardware width for a value type: `index` -> 32, a float
-/// carried as its bit pattern, an integer verbatim. This is the ONE width rule.
-/// The model is value-typed but the emitted carrier is a bit vector, and the
-/// emitter (`uarch::hwType`) and the boundary port model (`iface::bitWidth`)
-/// must not disagree about how wide it is.
+/// The datapath's hardware width for a value type: `index` -> `kIndexWidth`, a
+/// float carried as its bit pattern, an integer verbatim. This is the ONE width
+/// rule. The model is value-typed but the emitted carrier is a bit vector, and
+/// the emitter (`uarch::hwType`) and the boundary port model
+/// (`iface::bitWidth`) must not disagree about how wide it is.
 unsigned hwWidth(Type t);
 
 /// The banking of an *external* (argument) memory access, so the boundary

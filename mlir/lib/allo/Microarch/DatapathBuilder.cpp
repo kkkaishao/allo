@@ -395,7 +395,7 @@ void DatapathBuilder::bindCall(dcp::DCPathInstanceOp inv, RegionBlock &rb) {
       // resolved by recordCallScalars, once every region exists.
       const auto *sc = mi.scalarForArg(static_cast<int>(k));
       assert(sc && "a scalar operand with no matching callee scalar port");
-      cu.scalarIns.push_back({Source{}, sc->name});
+      cu.scalarIns.push_back({Source{}, sc->name, sc->width});
       continue;
     }
     auto mem = getOrCreateMem(operand);
@@ -816,35 +816,52 @@ Source DatapathBuilder::resolveValue(Value v) {
   return Source{Source::Kind::Survivor, rid, arg - 1};
 }
 
-// The counter width of every cyclic region: i32, except a loop-over-call, whose
-// counter drives the callee's index port directly and so must be built at that
-// port's width. Recorded here rather than dug back out at emission, where the
-// only place that can adapt it is a controller rebuilding the terminator it was
-// just handed.
+// The bits region \p rb's iteration counter needs, which is what its OWN range
+// says. The register holds `lb, lb+step, ...` and the terminator compares
+// `iv + step` against `ub` under a SIGNED predicate, so THREE values ride this
+// width: `lb`, `step` (the addend, and a cell of its own) and `lb + trip*step`,
+// which is both the one-past value and the `ub` the bounds are tied in at. An
+// empty loop is the case that needs `step` named: `0 to 0` bounds fit in a bit,
+// its step does not.
+//
+// `kIndexWidth` when any bound is only known at run time (no range to narrow
+// against) and for a while, whose controller builds its own zero-based
+// terminator.
+static unsigned counterWidth(const RegionBlock &rb) {
+  auto pipe = cast<dcp::DCPathPipelineOp>(rb.op);
+  if (rb.conditional || !rb.tripCount || pipe.getLbBound() ||
+      pipe.getStepBound() || pipe.getDynamicBound())
+    return kIndexWidth;
+  int64_t lb = pipe.getLb().value_or(0), step = pipe.getStep().value_or(1);
+  int64_t span, last;
+  if (llvm::MulOverflow(*rb.tripCount, step, span) ||
+      llvm::AddOverflow(lb, span, last))
+    return kIndexWidth;
+  auto bits = [](int64_t v) {
+    return static_cast<unsigned>(
+        APInt(64, static_cast<uint64_t>(v), /*isSigned=*/true)
+            .getSignificantBits());
+  };
+  return std::min(kIndexWidth, std::max({bits(lb), bits(step), bits(last)}));
+}
+
+// The width every cyclic region builds its iteration counter, and therefore its
+// induction bounds, at. Recorded here rather than dug back out at emission,
+// where the only place that could adapt it is a controller rebuilding the
+// terminator it was just handed.
+//
+// It is a property of that one loop and of nothing downstream of it. A consumer
+// wanting another width adapts at ITS end, as every other consumer of an index
+// already does: an ordinary datapath read widens back to `kIndexWidth`
+// (`Source::Kind::Counter`), a child's index port takes the port's width
+// (`CallUnit::ScalarArg::width`), an address cone takes the memory's, and an
+// address register carries its own (`AddrStride::width`). Deriving the counter
+// from a consumer instead would make a loop that has no such consumer,
+// `for r in range(N): child(A)`, unrepresentable.
 void DatapathBuilder::deriveCounterTypes() {
-  Type i32 = IntegerType::get(func.getContext(), 32);
-  for (RegionBlock &rb : dp.regions) {
-    if (rb.kind != RegionBlock::Kind::Cyclic)
-      continue;
-    rb.counterType = i32;
-    if (rb.shape != RegionBlock::Shape::CallNode)
-      continue;
-    assert(callees && "a loop-over-call needs callee context");
-    const CallUnit &cu = dp.calls[rb.callUnits.front()];
-    auto it = callees->ifaces.find(cu.callee);
-    assert(it != callees->ifaces.end() && "the loop child must be registered");
-    const iface::ModuleInterface &mi = it->second;
-    // The IV operand is the scalar whose driver is this region's counter.
-    Type ivType;
-    for (const CallUnit::ScalarArg &sa : cu.scalarIns)
-      if (sa.src.kind == Source::Kind::Counter && sa.src.id == rb.id)
-        for (const iface::Scalar &s : mi.scalars)
-          if (s.name == sa.port)
-            ivType = IntegerType::get(func.getContext(), s.width);
-    assert(ivType &&
-           "a loop-over-call region has no induction-variable child port");
-    rb.counterType = ivType;
-  }
+  for (RegionBlock &rb : dp.regions)
+    if (rb.kind == RegionBlock::Kind::Cyclic)
+      rb.counterType = IntegerType::get(func.getContext(), counterWidth(rb));
 }
 
 void DatapathBuilder::recordRegionBounds(ArrayRef<Operation *> regionOps) {
@@ -1170,8 +1187,42 @@ static int64_t mod(int64_t a, int64_t b) {
   return a - llvm::divideFloorSigned(a, b) * b;
 }
 
+// The width a stride register is built at: enough bits for every value it
+// holds, and for the raw pre-wrap sum its update compares before fixing.
+//
+// A WRAPPING register lives in `[0, wrap)`, and `raw = cur + step + bump`
+// reaches `2*wrap - 1` going up (`step + bump <= wrap` by construction) or
+// borrows from just below zero going down, which the unsigned compare reads as
+// the same headroom either way. A PLAIN accumulator runs from `init` over the
+// loop's advances, one past the last iteration since a counted controller still
+// computes the step it does not take.
+//
+// The default width whenever that range is not bounded by a constant trip, or
+// reaches below zero: a stride is ZERO-extended wherever it is read, so a
+// negative value could not be widened back exactly. Every stride an address is
+// built from is non-negative, which is the same assumption the unsigned wrap
+// compare already makes.
+static unsigned strideWidth(const RegionBlock::AddrStride &s,
+                            std::optional<int64_t> trip) {
+  auto bits = [](uint64_t v) {
+    return std::min(kIndexWidth, std::max(1u, APInt(64, v).getActiveBits()));
+  };
+  if (s.wrap) {
+    assert(s.wrap > 0 && "a wrap is a modulus, and the update compares against "
+                         "it unsigned");
+    return bits(2 * static_cast<uint64_t>(s.wrap) - 1);
+  }
+  int64_t span, last;
+  if (!trip || llvm::MulOverflow(s.step + s.bump, *trip, span) ||
+      llvm::AddOverflow(s.init, span, last) || s.init < 0 || last < 0)
+    return kIndexWidth;
+  return bits(std::max(s.init, last));
+}
+
 // The slot in \p rb holding \p want, appended if no identical stride is there.
-static unsigned slotFor(RegionBlock &rb, const RegionBlock::AddrStride &want) {
+// The width is DERIVED from the rest, so it takes no part in the comparison.
+static unsigned slotFor(RegionBlock &rb, RegionBlock::AddrStride want) {
+  want.width = strideWidth(want, rb.tripCount);
   auto *it =
       llvm::find_if(rb.addrStrides, [&](const RegionBlock::AddrStride &a) {
         return a.init == want.init && a.step == want.step &&
@@ -1662,6 +1713,7 @@ void DatapathBuilder::build() {
 
   deriveShapes();           // controller discriminant (needs every child)
   enumerateBoundaryPorts(); // module boundary ports (needs every access)
+  deriveCounterTypes();     // counter width (each loop's own range)
   // Everything below resolves Values to Sources, and so runs here rather than
   // during the walk: `resolveValue` needs the complete region model.
   bindScopeOps();                 // func-scope cones, before anyone reads one
@@ -1669,7 +1721,6 @@ void DatapathBuilder::build() {
   recordCallScalars();            // each dcp.instance's scalar operand drivers
   recordCallDeps();               // composition DAG on the instance substrate
   reclassifyRoms();               // read-only is a property of the USE
-  deriveCounterTypes();           // counter width (needs the call IV operand)
   recordRegionBounds(regionOps);  // induction bounds, at that width
   recordResults();                // scalar func-result output ports
   applyBinding(policy.plan(dp));  // trivial => no groups, no muxes

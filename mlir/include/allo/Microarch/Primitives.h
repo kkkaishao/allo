@@ -65,10 +65,24 @@ void recordMemoryInit(circt::seq::HLMemOp mem,
                       llvm::ArrayRef<llvm::APInt> words);
 /// Whether a native integer/logic mnemonic has an `emitCompute` comb lowering.
 bool combEmitted(StringRef kind);
-/// The datapath's width for an index value (`uarch::hwWidth` of an `index`).
-/// An address expression may be carried narrower than this (see `evalAffine`),
-/// but its operands arrive at this width and a divider is computed at it.
-inline constexpr unsigned kDatapathAddressWidth = 32;
+/// The datapath's width for an index value, seen from the address side: an
+/// address expression may be carried narrower than this (see `evalAffine`), but
+/// its operands arrive at this width and a divider is computed at it. The same
+/// number as `kIndexWidth`, because an address IS an index; the two names
+/// distinguish the two questions asked of it.
+inline constexpr unsigned kDatapathAddressWidth = kIndexWidth;
+
+/// \p v resized to \p width bits: truncated when narrowing, sign- or
+/// zero-extended when widening, and returned unchanged at equal width.
+///
+/// The ONE width-adaptation primitive. Truncation IS reduction modulo
+/// `2^width`, which `+`, `-` and `*` commute with, so narrowing is exact
+/// wherever the value itself fits; widening restores the value a narrower
+/// carrier held, and only its own sign convention says how. An index is signed
+/// (a loop counter runs under signed compares, and a lower bound may be
+/// negative); an address, a bank digit and a scaled counter are not.
+Value resize(OpBuilder &b, Location loc, Value v, unsigned width,
+             bool isSigned);
 
 /// Evaluate an affine index expression to a \p width -bit hw value, emitting
 /// comb ops. \p idx holds the resolved value of each map operand (dims then

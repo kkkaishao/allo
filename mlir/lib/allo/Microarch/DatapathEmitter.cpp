@@ -4,7 +4,7 @@
  */
 
 #include "allo/Microarch/HWEmitter.h"
-#include "allo/Scheduling/AddressModel.h" // addressExprsOf (offset + bank digit)
+#include "allo/Scheduling/AddressModel.h" // addressExprsOf
 #include "allo/Scheduling/MemoryModel.h"  // BankLayout
 
 #include "circt/Dialect/Comb/CombOps.h"
@@ -29,22 +29,11 @@ static Value konstLike(OpBuilder &b, Location loc, Value v, int64_t k) {
   return hw::ConstantOp::create(b, loc, v.getType(), k).getResult();
 }
 
-// Reduce \p v to \p width bits, which for a two's-complement integer IS
-// reduction modulo 2^width. Widen back with `zextTo` only where a fixed-width
-// consumer demands it (a module boundary port).
-static Value truncTo(OpBuilder &b, Location loc, Value v, unsigned width) {
-  if (cast<IntegerType>(v.getType()).getWidth() == width)
-    return v;
-  return comb::ExtractOp::create(b, loc, b.getIntegerType(width), v, 0)
-      .getResult();
-}
-
-static Value zextTo(OpBuilder &b, Location loc, Value v, unsigned width) {
-  unsigned w = cast<IntegerType>(v.getType()).getWidth();
-  if (w == width)
-    return v;
-  Value pad = hw::ConstantOp::create(b, loc, b.getIntegerType(width - w), 0);
-  return comb::ConcatOp::create(b, loc, ValueRange{pad, v}).getResult();
+// An address, a bank digit and a scaled counter are all non-negative by
+// construction, so every width change on the address path is the UNSIGNED
+// resize (`uarch::resize`).
+static Value addrAt(OpBuilder &b, Location loc, Value v, unsigned width) {
+  return resize(b, loc, v, width, /*isSigned=*/false);
 }
 
 // Unsigned divide / remainder by a compile-time constant: a shift / mask for a
@@ -103,7 +92,7 @@ static unsigned addrWidth(const uarch::MemUnit &m) {
 // manifest and the cosim harness are written against, so a narrow in-bank
 // address widens back here. The padding is constant, so it costs nothing.
 static Value boundaryAddr(EmitContext &c, Value addr) {
-  return zextTo(c.b, c.loc, addr, kDatapathAddressWidth);
+  return addrAt(c.b, c.loc, addr, kDatapathAddressWidth);
 }
 
 Value readCrossbar(EmitContext &c, ArrayRef<Value> bankValues, Value bank) {
@@ -153,8 +142,9 @@ Value DatapathEmitter::resolveSource(const uarch::Source &s) {
     return streamReadData.lookup(accKey(s.id, s.outPort));
   case uarch::Source::Kind::Counter: {
     // The iteration counter of Source's region (an outer container's counter is
-    // live while its nested region emits).
-    Value cv = controlOf.lookup(s.id).counter;
+    // live while its nested region emits), as an ordinary index value: at
+    // `kIndexWidth` whatever width the region built its register at.
+    Value cv = counterIndex.lookup(s.id);
     assert(cv && "counter source with no emitted region counter");
     return cv;
   }
@@ -274,9 +264,9 @@ Value evalAffine(OpBuilder &b, Location loc, AffineExpr e, ValueRange idx,
   if (auto cst = dyn_cast<AffineConstantExpr>(e))
     return hw::ConstantOp::create(b, loc, t, cst.getValue()).getResult();
   if (auto d = dyn_cast<AffineDimExpr>(e))
-    return truncTo(b, loc, idx[d.getPosition()], width);
+    return addrAt(b, loc, idx[d.getPosition()], width);
   if (auto sym = dyn_cast<AffineSymbolExpr>(e))
-    return truncTo(b, loc, idx[numDims + sym.getPosition()], width);
+    return addrAt(b, loc, idx[numDims + sym.getPosition()], width);
   auto bin = cast<AffineBinaryOpExpr>(e);
   if (e.getKind() == AffineExprKind::Add)
     return comb::AddOp::create(
@@ -309,7 +299,7 @@ Value evalAffine(OpBuilder &b, Location loc, AffineExpr e, ValueRange idx,
       llvm::isPowerOf2_64(static_cast<uint64_t>(f))) {
     unsigned k =
         std::min<unsigned>(width, llvm::Log2_64(static_cast<uint64_t>(f)));
-    return zextTo(b, loc, evalAffine(b, loc, bin.getLHS(), idx, numDims, k),
+    return addrAt(b, loc, evalAffine(b, loc, bin.getLHS(), idx, numDims, k),
                   width);
   }
   Value lhs =
@@ -319,7 +309,7 @@ Value evalAffine(OpBuilder &b, Location loc, AffineExpr e, ValueRange idx,
          "unexpected affine op");
   Value q = e.getKind() == AffineExprKind::FloorDiv ? divConst(b, loc, lhs, f)
                                                     : modConst(b, loc, lhs, f);
-  return truncTo(b, loc, q, width);
+  return addrAt(b, loc, q, width);
 }
 
 // The resolved (already stage-delayed) index sources of an access: the operands
@@ -356,20 +346,22 @@ Value DatapathEmitter::buildAddr(const uarch::MemUnit::Access &acc,
     const uarch::RegionControl &rc = controlOf.lookup(t.region);
     assert(t.slot < rc.scaledCounters.size() &&
            "a reduced address term has no scaled counter in its region");
-    add(truncTo(c.b, c.loc, rc.scaledCounters[t.slot], width));
+    add(addrAt(c.b, c.loc, rc.scaledCounters[t.slot], width));
   }
   if (addr && acc.addrDelay)
     addr = c.shiftChain(addr, acc.addrDelay, shellFor(acc.region)).last();
   if (r.residual) {
     // A register the residual reads runs live like a counter, so each is
     // delayed on its own (summed terms share one delay only by being summed
-    // first). Appended untruncated: `evalAffine` narrows and re-widens itself.
+    // first). Appended at the datapath width, which is what `evalAffine` reads
+    // its operands at; it narrows and re-widens the cone itself.
     SmallVector<Value> idx = addrSources(acc);
     for (const uarch::MemUnit::Access::ScaledTerm &t : r.reads) {
       const uarch::RegionControl &rc = controlOf.lookup(t.region);
       assert(t.slot < rc.scaledCounters.size() &&
              "a residual's digit has no scaled counter in its region");
-      Value v = rc.scaledCounters[t.slot];
+      Value v =
+          addrAt(c.b, c.loc, rc.scaledCounters[t.slot], kDatapathAddressWidth);
       if (acc.addrDelay)
         v = c.shiftChain(v, acc.addrDelay, shellFor(acc.region)).last();
       idx.push_back(v);
@@ -419,24 +411,18 @@ BankSplit DatapathEmitter::bankAddress(const uarch::MemUnit &m,
 }
 
 // The clog2(depth)-bit index `seq.hlmem` / `hw.array_get` addressing expects,
-// which is also the width `bankAddress` carries its arithmetic at. So this is a
-// no-op for an address they produced, and a real narrowing only for one
-// arriving at the datapath width from elsewhere (a child instance's `addr`
-// output, which crosses a module boundary).
+// which is also the width `bankAddress` carries its arithmetic at.
 Value DatapathEmitter::memAddr(const uarch::MemUnit &m, Value addr) {
-  return truncTo(c.b, c.loc, addr, addrWidth(m));
+  return addrAt(c.b, c.loc, addr, addrWidth(m));
 }
 
 // Which element of a scattered argument \p acc names, at the DATAPATH width.
 // The crossbar and the write demux compare it against literal element numbers
-// (`icmpEq` builds those at that width), so it is a digit rather than an
-// address, exactly as a bank digit is and for the same reason. An address is
-// carried at whatever the memory needs to index itself, which is narrower
-// whenever the element count is, so narrowing it here would compare two widths.
+// (`icmpEq` builds those at that width).
 Value DatapathEmitter::scatterIndex(const uarch::MemUnit &m,
                                     const uarch::MemUnit::Access &acc) {
   assert(m.scattered && "an element index belongs to a scattered argument");
-  return zextTo(c.b, c.loc, bankAddress(m, acc).offset, kDatapathAddressWidth);
+  return addrAt(c.b, c.loc, bankAddress(m, acc).offset, kDatapathAddressWidth);
 }
 
 // Bind the read-data input ports into readData, once, before the per-region
@@ -721,7 +707,13 @@ void DatapathEmitter::emitUnits(const uarch::RegionBlock &rb, UnitMode mode) {
         Value iv = rc.counter, issue = rc.issue;
         assert(iv && issue &&
                "recurrence input in a region with no controller");
-        Value lb = resolveSource(rb.lbSource);
+        // Against the RAW counter register, so the whole test is at the width
+        // its terminator compares at; a bound from elsewhere resizes into it.
+        auto ivTy = cast<IntegerType>(rb.counterType);
+        auto at = [&](Value x) {
+          return resize(c.b, c.loc, x, ivTy.getWidth(), /*isSigned=*/true);
+        };
+        Value lb = at(resolveSource(rb.lbSource));
         unsigned dist = u.inputInitDist[k];
         Value cond;
         if (dist <= 1) {
@@ -730,14 +722,16 @@ void DatapathEmitter::emitUnits(const uarch::RegionBlock &rb, UnitMode mode) {
           // iv < lb + dist*step  ==  !(iv >= lb + dist*step)
           std::optional<int64_t> kstep = dp.constantOf(rb.stepSource);
           Value distStep =
-              kstep
-                  ? c.konst(c.i32, static_cast<int64_t>(dist) * *kstep)
-                  : c.R(comb::MulOp::create(
-                        c.b, c.loc, c.konst(c.i32, static_cast<int64_t>(dist)),
-                        resolveSource(rb.stepSource), false));
+              kstep ? c.konst(ivTy, static_cast<int64_t>(dist) * *kstep)
+                    : c.R(comb::MulOp::create(
+                          c.b, c.loc, c.konst(ivTy, static_cast<int64_t>(dist)),
+                          at(resolveSource(rb.stepSource)), false));
           Value bound =
               c.R(comb::AddOp::create(c.b, c.loc, lb, distStep, false));
-          cond = c.notBit(c.icmpUgeV(iv, bound));
+          // Signed, as `Terminator::isLast` compares the same counter against
+          // the same kind of bound; a negative `lb` orders the wrong way round
+          // under the unsigned predicate this used to take.
+          cond = c.notBit(c.icmpSgeV(iv, bound));
         }
         Value iter0 = c.R(comb::AndOp::create(c.b, c.loc, issue, cond, false));
         Value gate = c.activationPulse(iter0, u.repOp(), sh);
@@ -1547,7 +1541,8 @@ void DatapathEmitter::emitCalls(const uarch::RegionBlock &rb, Value issue,
     // Source (an IO port, a latched sibling survivor, an earlier child's
     // live result, or a constant), sampled at the child's start.
     for (const uarch::CallUnit::ScalarArg &sa : cu.scalarIns)
-      ins[sa.port] = resolveSource(sa.src);
+      ins[sa.port] = resize(c.b, c.loc, resolveSource(sa.src), sa.width,
+                            /*isSigned=*/true);
 
     // Wire the child instance: inputs by port name from `ins`, outputs by name.
     auto outs = instantiateChild(c.b, c.loc, child,

@@ -56,7 +56,7 @@ unsigned readyCycleOf(Operation *op) { return dcpStart(op) + dcpLatency(op); }
 
 unsigned hwWidth(Type t) {
   if (isa<IndexType>(t))
-    return 32;
+    return kIndexWidth;
   if (auto f = dyn_cast<FloatType>(t))
     return f.getWidth();
   return cast<IntegerType>(t).getWidth();
