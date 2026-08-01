@@ -593,9 +593,9 @@ def test_static_lb_and_step_cosim():
     exp[0:16:2] = A16[0:16:2] + 5  # odd indices stay 0: only the even IV writes
     assert np.array_equal(out, exp)
 
-    # A static empty loop (trip=0): lb >= ub, so it issues nothing and completes
-    # on `start` rather than deadlocking (a store-drain done would never fire).
-    # The sibling store must still run.
+    # A static empty loop (trip=0): lb >= ub, so `loop-canonicalization` erases
+    # it with its body before any hardware is built for it, leaving the sibling
+    # loop as the kernel's only region.
     @kernel
     def zt(A: i32[8], out: i32[8]):
         for i in range(1, 1):
@@ -603,8 +603,10 @@ def test_static_lb_and_step_cosim():
         for i in range(8):
             out[i] = A[i] * 2
 
+    rtl = _to_rtl(zt)
+    assert len(rtl.schedule().func("zt").regions) == 1  # only the sibling left
     out = np.zeros(8, np.int32)
-    _to_rtl(zt).cosim(A16[:8].copy(), out)
+    rtl.cosim(A16[:8].copy(), out)
     assert np.array_equal(out, A16[:8] * 2)
 
 

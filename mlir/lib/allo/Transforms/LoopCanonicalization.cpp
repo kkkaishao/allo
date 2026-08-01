@@ -44,7 +44,7 @@ namespace {
 //===----------------------------------------------------------------------===//
 
 // A counted loop, whichever dialect spells it.
-bool isCounted(Operation *op) {
+bool isForLoop(Operation *op) {
   return isa<affine::AffineForOp, scf::ForOp>(op);
 }
 
@@ -59,7 +59,7 @@ Block *loopBody(Operation *loop) {
 SmallVector<Operation *> nestedLoops(Operation *loop) {
   SmallVector<Operation *> out;
   loopBody(loop)->walk<WalkOrder::PreOrder>([&](Operation *op) {
-    if (!isCounted(op))
+    if (!isForLoop(op))
       return WalkResult::advance();
     out.push_back(op);
     return WalkResult::skip();
@@ -86,6 +86,42 @@ std::optional<int64_t> constantTrip(Operation *loop) {
 }
 
 //===----------------------------------------------------------------------===//
+// Erase the loops that never run.
+//===----------------------------------------------------------------------===//
+
+// Whether \p loop provably runs zero times.
+bool isTripZero(Operation *loop) {
+  if (auto af = dyn_cast<affine::AffineForOp>(loop))
+    return affine::getConstantTripCount(af) == 0;
+  auto sf = cast<scf::ForOp>(loop);
+  if (sf.getLowerBound() == sf.getUpperBound())
+    return true;
+  std::optional<int64_t> lb = getConstantIntValue(sf.getLowerBound()),
+                         ub = getConstantIntValue(sf.getUpperBound()),
+                         step = getConstantIntValue(sf.getStep());
+  if (!lb || !ub || !step)
+    return false;
+  return *step > 0 ? *ub <= *lb : *step < 0 && *ub >= *lb;
+}
+
+// Erase every loop under \p root that never runs, its whole body with it.
+void eraseNeverTakenLoops(Operation *root) {
+  SmallVector<Operation *> dead;
+  root->walk<WalkOrder::PreOrder>([&](LoopLikeOpInterface op) {
+    if (!isForLoop(op) || !isTripZero(op))
+      return WalkResult::advance();
+    dead.push_back(op);
+    return WalkResult::skip();
+  });
+  for (Operation *loop : dead) {
+    info(Stage::Prep, loop) << "Detected a loop with a compile-time trip count "
+                               "of 0; dropping it and its body";
+    loop->replaceAllUsesWith(cast<LoopLikeOpInterface>(loop).getInits());
+    loop->erase();
+  }
+}
+
+//===----------------------------------------------------------------------===//
 // Unroll the loops under a pipelined one.
 //===----------------------------------------------------------------------===//
 
@@ -102,7 +138,7 @@ bool innerLoopsUnrollable(Operation *loop) {
   WalkResult r = loopBody(loop)->walk([&](Operation *op) {
     if (!isa<affine::AffineForOp, scf::ForOp, scf::WhileOp>(op))
       return WalkResult::advance();
-    return isCounted(op) && constantTrip(op) ? WalkResult::advance()
+    return isForLoop(op) && constantTrip(op) ? WalkResult::advance()
                                              : WalkResult::interrupt();
   });
   return !r.wasInterrupted();
@@ -208,7 +244,7 @@ std::optional<Match> matchImperfect(Operation *outer, std::string &reason) {
   unsigned innerCount = 0;
   bool hasWhile = false;
   for (Operation &op : loopBody(outer)->without_terminator()) {
-    if (isCounted(&op)) {
+    if (isForLoop(&op)) {
       if (!m.lin)
         m.lin = &op;
       ++innerCount;
@@ -507,6 +543,9 @@ struct LoopCanonicalizationPass
     affine::AffineStoreOp::getCanonicalizationPatterns(patterns, ctx);
     FrozenRewritePatternSet compose(std::move(patterns));
 
+    // Drop trip-0 loops first
+    eraseNeverTakenLoops(getOperation());
+
     // promote single-iteration loops first
     getOperation()->walk([&](affine::AffineForOp forOp) {
       (void)affine::promoteIfSingleIteration(forOp);
@@ -515,7 +554,7 @@ struct LoopCanonicalizationPass
     // The outermost counted loops; the recursion owns everything under them.
     SmallVector<Operation *> roots;
     getOperation().walk<WalkOrder::PreOrder>([&](Operation *op) {
-      if (!isCounted(op))
+      if (!isForLoop(op))
         return WalkResult::advance();
       roots.push_back(op);
       return WalkResult::skip();

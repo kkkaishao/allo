@@ -90,9 +90,12 @@ def test_sequential_internal_buffer_shared():
     assert np.array_equal(out, A * 3 - 7)
 
 
-# A zero-trip loop over a sub-kernel call must complete without firing the
-# child (regression: this used to hang on cosim's watchdog). The non-empty
-# loop-over-calls shape lives in test_loop_control.py.
+# A STATIC zero-trip loop over a sub-kernel call is erased outright by
+# `loop-canonicalization`, so the child is never instantiated and no controller
+# is asked to complete a loop that fires nothing (regression: this used to hang
+# on cosim's watchdog). Nothing is left of the kernel afterwards, which is also
+# what pins the zero-region module: it completes a cycle after `start` instead
+# of never.
 def test_zero_trip_loop_over_calls():
     @kernel
     def zlc_step(A: i32[16], B: i32[16], i: index):
@@ -103,13 +106,48 @@ def test_zero_trip_loop_over_calls():
         for i in range(0):
             zlc_step(A, B, i)
 
+    rtl = _to_rtl(zlc_top)
+    assert Dcp(rtl).func("zlc_top").callees() == []  # nothing left to call
     A = (np.arange(16, dtype=np.int32) * 3 + 1) & 0x3F
     B = np.full(16, 9, np.int32)
-    _to_rtl(zlc_top).cosim(A, B)
-    # A write-only argument is not preloaded, so the backing array starts at
-    # zero; the child never fired, so it stays there -- not A * 2 + 1.
-    assert np.array_equal(B, np.zeros(16, np.int32))
-    assert not np.array_equal(B, A * 2 + 1)
+    rtl.cosim(A, B)
+    # Nothing is left to run, so nothing is written
+    assert np.array_equal(B, np.full(16, 9, np.int32))
+
+
+# A callee that computes nothing is not free the way an inlined no-op would be:
+# it is emitted as its own module, instantiated, wired to the arrays it names and
+# sequenced by the caller's controller. `drop-trivial-func` erases both shapes
+# it recognizes, an empty body (here what the zero-trip erasure leaves) and an
+# identity return, along with every call, so neither reaches the emitter.
+def test_trivial_callees_are_dropped():
+    @kernel
+    def tc_empty(A: i32[16], B: i32[16]):
+        for i in range(0):
+            B[i] = A[i]
+
+    @kernel
+    def tc_ident(x: i32) -> i32:
+        return x
+
+    @kernel
+    def tc_real(x: i32) -> i32:
+        return x * 3
+
+    @kernel
+    def tc_top(A: i32[16], out: i32[1]):
+        B: i32[16]
+        tc_empty(A, B)
+        out[0] = tc_ident(A[0]) + tc_real(A[1])
+
+    rtl = _to_rtl(tc_top)
+    # Only the callee that computes something is left, its call included.
+    assert sorted(Dcp(rtl).kernels) == ["tc_top", "tc_top.tc_real"]
+    assert Dcp(rtl).func("tc_top").callees() == ["tc_top.tc_real"]
+    out = np.zeros(1, np.int32)
+    rtl.cosim(A16, out)
+    # The identity call's result is its operand: the caller reads A[0] itself.
+    assert out[0] == A16[0] + A16[1] * 3, int(out[0])
 
 
 # An UNGATED call (no call predecessor to hand off from) is released at the cycle

@@ -268,6 +268,11 @@ Value HWEmitter::sequence(llvm::ArrayRef<uarch::RegionId> regions, Value start,
 // conjunction equals the final `done`.
 Value HWEmitter::composeSiblings(llvm::ArrayRef<uarch::RegionId> regions,
                                  Value start) {
+  // Nothing to compose: complete a cycle after `start`, the shape an empty
+  // counted region's `done` already takes.
+  if (regions.empty())
+    return ctx.holdDone(ctx.reg(start, ctx.f1), start);
+
   llvm::DenseMap<uarch::RegionId, Value> doneOf;
   Value allDone;
   for (uarch::RegionId rid : regions) {

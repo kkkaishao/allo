@@ -156,10 +156,24 @@ def LoopCanonicalizationPass
     : Pass<"loop-canonicalization", "func::FuncOp"> {
   let summary = "Shape every counted loop nest into one pipelineable region";
   let description = [{
-    Four rewrites, run as one recursive descent per nest: unroll the loops under
-    a pipelined one, sink an imperfect nest's prologue and epilogue into its
-    inner loop, normalize a perfect band to lower bound 0 and step 1, and
-    coalesce that band into a single loop.
+    One sweep that erases the loops which never run, then four rewrites run as
+    one recursive descent per nest: unroll the loops under a pipelined one, sink
+    an imperfect nest's prologue and epilogue into its inner loop, normalize a
+    perfect band to lower bound 0 and step 1, and coalesce that band into a
+    single loop.
+
+    ## Erasing zero-trip loops
+
+    A counted loop that provably runs zero times is erased with its whole body,
+    its results replaced by its `iter_args` inits, before anything else reads a
+    nest's shape. Two shapes are recognized: constant bounds that do not cross
+    (`range(1, 1)`, `range(0)`), and an `affine.for` whose lower and upper
+    bounds are the same expression over the same operands (`range(n, n)`,
+    whose trip-count map folds to the constant 0); an `scf.for` adds the same
+    lower/upper SSA value. Nothing below is written for a trip count of 0 (the
+    perfectizing guard would fire on iteration -1, a coalesced band would carry
+    a zero factor), and the hardware for such a loop is a controller that only
+    ever takes its empty escape.
 
     ## Unrolling under a pipeline (`unroll-under-pipeline`, default on)
 
@@ -237,6 +251,23 @@ def LoopCanonicalizationPass
     "mlir::affine::AffineDialect", "mlir::arith::ArithDialect",
     "mlir::scf::SCFDialect"
   ];
+}
+
+def DropTrivialFuncPass : Pass<"drop-trivial-func", "ModuleOp"> {
+  let summary = "Erase a function that computes nothing, along with its calls";
+  let description = [{
+    A function whose entire body is `return` of its own arguments computes
+    nothing: an empty one and an identity one, which returns an argument unchanged.
+    Each is erased with every `func.call` naming it, a call's results taking the
+    operands the callee forwarded.
+
+    Only PRIVATE functions are erased: a public one is the module's interface,
+    so its symbol outlives whatever its body says. A symbol reached any way
+    other than a `func.call` keeps its function whole, there being no call site
+    to rewrite. Dropping a call can leave its own caller trivial, so the pass
+    runs to a fixpoint.
+  }];
+  let dependentDialects = ["mlir::func::FuncDialect"];
 }
 
 def AssignBanksPass : Pass<"assign-banks", "func::FuncOp"> {

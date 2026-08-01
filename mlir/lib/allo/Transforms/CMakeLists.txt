@@ -10,6 +10,7 @@ add_mlir_library(MLIRAlloTransforms
     GenerateApintWrapper.cpp
     FoldIfStatements.cpp
     LoopCanonicalization.cpp
+    DropTrivialFunc.cpp
     AssignBanks.cpp
     ResolveBanking.cpp
     PropagatePartition.cpp

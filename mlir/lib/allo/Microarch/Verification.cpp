@@ -24,16 +24,16 @@ namespace mlir::allo::uarch {
 // 1. Model well-formedness.
 //===----------------------------------------------------------------------===//
 
-// A scheduled datapath always holds at least one region: a `dcp.module` is what
-// a reified kernel closes into, and the builder's region walk collects every
-// region the reify put in one.
+// Supported subset: top-level siblings in program order, plus container loops
+// whose children sequence within one outer iteration (crossing as a survivor
+// register).
 LogicalResult verifyDatapath(dcp::DCPathModuleOp func, const Datapath &dp) {
-  // Supported subset: top-level siblings in program order, plus container
-  // loops whose children sequence within one outer iteration (crossing as a
-  // survivor register).
-  assert(!dp.regions.empty() &&
-         "a scheduled kernel has no schedulable region; the builder's region "
-         "walk found none where the reify built at least one");
+  // A kernel with no schedulable region computes nothing.
+  if (dp.regions.empty())
+    warn(Stage::Emit, func)
+        << "Kernel '" << func.getSymName()
+        << "' has no schedulable region: it emits as hardware that does "
+           "nothing and completes immediately";
   // The builder already reported the offending edge; fail before any
   // hardware is built from the placeholder depths it left.
   if (dp.infeasible)
