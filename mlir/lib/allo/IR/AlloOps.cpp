@@ -514,6 +514,9 @@ LogicalResult DCPathPipelineOp::verify() {
     return emitOpError("step given as both an operand and an attribute");
   if (getLatencyBound() && !getLatencyAttr())
     return emitOpError("latency_bound requires latency");
+  if (getTripBoundAttr() && getTripAttr())
+    return emitOpError("trip_bound is the worst case of a trip that is not "
+                       "compile-time; it cannot accompany an exact trip");
   Block &body = getBody().front();
   if (body.getNumArguments() != 1 + getInits().size())
     return emitOpError(
@@ -939,6 +942,8 @@ void DCPathPipelineOp::print(OpAsmPrinter &p) {
     p << " step " << s; // a runtime stride
   else if (step != 1)
     p << " step " << step;
+  if (IntegerAttr tb = getTripBoundAttr())
+    p << " trip_bound=" << tb.getInt();
   if (IntegerAttr ii = getIiAttr())
     p << " ii=" << ii.getInt();
   if (IntegerAttr l = getLengthAttr())
@@ -975,11 +980,11 @@ void DCPathPipelineOp::print(OpAsmPrinter &p) {
     p << ' ' << stringifyDeterminacyEnum(*d);
   p.printOptionalAttrDict(
       (*this)->getAttrs(),
-      /*elidedAttrs=*/{getTripAttrName(), getLbAttrName(), getStepAttrName(),
-                       getIiAttrName(), getLengthAttrName(), getDrainAttrName(),
-                       getLatencyAttrName(), getLatencyBoundAttrName(),
-                       getDeterminacyAttrName(),
-                       getOperandSegmentSizesAttrName()});
+      /*elidedAttrs=*/{
+          getTripAttrName(), getTripBoundAttrName(), getLbAttrName(),
+          getStepAttrName(), getIiAttrName(), getLengthAttrName(),
+          getDrainAttrName(), getLatencyAttrName(), getLatencyBoundAttrName(),
+          getDeterminacyAttrName(), getOperandSegmentSizesAttrName()});
 }
 
 ParseResult DCPathPipelineOp::parse(OpAsmParser &p, OperationState &result) {
@@ -1057,6 +1062,13 @@ ParseResult DCPathPipelineOp::parse(OpAsmParser &p, OperationState &result) {
     result.addAttribute(getTripAttrName(result.name),
                         b.getI64IntegerAttr(std::max<int64_t>(
                             0, llvm::divideCeilSigned(ub - lb, step))));
+  if (succeeded(p.parseOptionalKeyword("trip_bound"))) {
+    int64_t tripBound;
+    if (p.parseEqual() || p.parseInteger(tripBound))
+      return failure();
+    result.addAttribute(getTripBoundAttrName(result.name),
+                        b.getI64IntegerAttr(tripBound));
+  }
   // `ii` is optional: absent for a data-dependent sequential wrapper.
   if (succeeded(p.parseOptionalKeyword("ii"))) {
     if (p.parseEqual() || p.parseInteger(ii))

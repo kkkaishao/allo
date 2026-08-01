@@ -532,7 +532,7 @@ static void materializeWhilePipeline(const RegionAttrs &r, scf::WhileOp w,
   auto pipe = DCPathPipelineOp::create(
       b, loc, w.getResultTypes(), /*lbBound=*/Value(), /*dynamicBound=*/Value(),
       /*stepBound=*/Value(), inits, /*trip=*/IntegerAttr(),
-      /*lb=*/IntegerAttr(),
+      /*trip_bound=*/IntegerAttr(), /*lb=*/IntegerAttr(),
       /*step=*/IntegerAttr(), optI64Attr(b, r.ii), optI64Attr(b, r.length),
       optI64Attr(b, r.drain), optI64Attr(b, r.latency),
       r.latencyBound ? b.getUnitAttr() : UnitAttr(), DeterminacyEnumAttr());
@@ -609,9 +609,14 @@ static DCPathPipelineOp materializeLoopToPipeline(const RegionAttrs &r,
     lbAttr = bounds.lb;
   if (!bounds.stepVal && bounds.step != 1)
     stepAttr = bounds.step;
+  // The worst-case count of a loop with no static one
+  std::optional<int64_t> trip = constantTripOf(loop);
+  std::optional<int64_t> tripBound;
+  if (!trip)
+    tripBound = model.tripBoundOf(loopOp);
   auto pipe = DCPathPipelineOp::create(
       b, loc, loopOp->getResultTypes(), bounds.lbVal, dynamicBound,
-      bounds.stepVal, inits, optI64Attr(b, constantTripOf(loop)),
+      bounds.stepVal, inits, optI64Attr(b, trip), optI64Attr(b, tripBound),
       optI64Attr(b, lbAttr), optI64Attr(b, stepAttr), optI64Attr(b, r.ii),
       optI64Attr(b, r.length), optI64Attr(b, r.drain), optI64Attr(b, r.latency),
       r.latencyBound ? b.getUnitAttr() : UnitAttr(), DeterminacyEnumAttr());

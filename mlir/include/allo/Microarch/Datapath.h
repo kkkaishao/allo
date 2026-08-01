@@ -701,16 +701,15 @@ struct RegionBlock {
   // `ubSource` None and `terminatorOf` builds the expression; every other
   // counted region resolves its ub straight from the Source.
   std::optional<int64_t> tripCount; // constant trip iff Cyclic
-  Source lbSource;                  // lower bound (counter init)
-  Source ubSource;                  // upper bound; see `tripCount` above
-  Source stepSource;                // step (counter increment)
-  // The width the iteration counter is BUILT at, and therefore the width its
-  // bounds are resolved to. It is i32 for every region whose counter stays
-  // inside the module, and the callee's index-port width for a `CallNode`,
-  // whose counter drives that port directly. Stored so the one place that
-  // assembles the bounds (`terminatorOf`) can adapt there instead of a
-  // controller rebuilding the whole `Terminator` after the fact. Null for an
-  // Acyclic region. Derived by `DatapathBuilder::deriveCounterTypes`.
+  /// An UPPER BOUND on the trip of a loop that has no constant one, from the
+  /// `allo.assume.ssa` range the scheduler distilled (`dcp.pipeline`'s
+  /// `trip_bound`). Mutually exclusive with `tripCount`, which the op verifier
+  /// enforces.
+  std::optional<int64_t> tripBound;
+  Source lbSource;   // lower bound (counter init)
+  Source ubSource;   // upper bound; see `tripCount` above
+  Source stepSource; // step (counter increment)
+  // The width the iteration counter is BUILT at.
   Type counterType;
   // TERMINATION class as the emitter discriminates it, axis 2 of the pair
   // above. A while loop (a `dcp.condition` terminator) is a flushing pipeline

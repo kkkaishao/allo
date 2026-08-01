@@ -633,6 +633,32 @@ static std::optional<SpanNode> buildSpanNode(const SchedRegion &region,
   return n;
 }
 
+// Record every counted loop whose iteration count only an `allo.assume.ssa`
+// range bounds, for the reify to stamp as `trip_bound` and the emitter to size
+// its counter by.
+//
+// Its own walk over the loops rather than a by-product of the composition
+// below, for two reasons: that one stops early when a callee's span is unknown,
+// and it descends the region tree, where this wants every loop whatever its
+// shape. Both call the same `loopTrip`, so neither can bound a loop the other
+// would not.
+//
+// This is the ONE fact reification cannot re-derive. Everything else about a
+// loop's induction (its lb, step and constant trip) is still on the loop when
+// the reify reads it; the assumption that bounded a symbolic trip is not, being
+// a hint the analysis has already consumed and erased.
+static void recordTripBounds(func::FuncOp funcOp, ScheduleModel &model,
+                             DependenceAnalysis &deps) {
+  funcOp.walk([&](Operation *op) {
+    if (!isa<AffineForOp, scf::ForOp>(op))
+      return;
+    bool isBound = false;
+    std::optional<int64_t> trip = loopTrip(op, deps, isBound);
+    if (isBound && trip)
+      model.setTripBound(op, *trip);
+  });
+}
+
 // COMPOSE the solved region tree into one whole-kernel span, and PUBLISH it.
 // The driver's second step, over the model the solve filled: the only thing the
 // scheduler writes to the IR, and the only thing a caller of this kernel sees.
@@ -901,6 +927,7 @@ LogicalResult mlir::allo::runSDCScheduler(ModuleOp module, StringRef top,
     size_t solvedBefore = model.regionCount();
     if (failed(scheduleFunc(fn, loadedLib, model, deps, cycleTime, kind)))
       return failure();
+    recordTripBounds(fn, model, deps);
     // A func that solved NO region (an empty body, or nothing but
     // declarations) publishes no latency: composing over no node reports zero,
     // which a caller would read as an exact zero-cycle contract.

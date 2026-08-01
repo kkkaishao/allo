@@ -621,6 +621,10 @@ def DCPathPipelineOp : DCPath_Op<"dcp.pipeline",
     modulo-unroll math. A while loop carries none of these: `dcp.condition`
     gates termination, and its counter free-runs from 0.
 
+    `trip_bound` is an UPPER BOUND on the iteration count of a loop whose exact
+    count is not compile-time, established by an `allo.assume.ssa` range. It is
+    set only when `trip` is absent, and the two are not interchangeable.
+
     `ii` is optional. It is absent only for a residual *sequential* wrapper
     whose body length is data-dependent (an enclosed loop with a dynamic trip)
     and therefore has no static initiation interval. Its hardware is a
@@ -640,6 +644,7 @@ def DCPathPipelineOp : DCPath_Op<"dcp.pipeline",
     Optional<Index>:$stepBound,
     Variadic<AnyType>:$inits,
     OptionalAttr<I64Attr>:$trip,
+    OptionalAttr<I64Attr>:$trip_bound,
     OptionalAttr<I64Attr>:$lb,
     OptionalAttr<I64Attr>:$step,
     OptionalAttr<I64Attr>:$ii,

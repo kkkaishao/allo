@@ -177,6 +177,16 @@ public:
     return it == regions.end() ? nullptr : &it->second;
   }
 
+  /// Record that an `allo.assume.ssa` range bounds \p loop's iteration count at
+  /// \p trip, for a loop whose exact count is not compile-time.
+  void setTripBound(Operation *loop, int64_t trip) { tripBounds[loop] = trip; }
+  /// The assumption-derived worst-case trip of \p loop, or empty when its trip
+  /// is compile-time or nothing bounds it.
+  std::optional<int64_t> tripBoundOf(Operation *loop) const {
+    auto it = tripBounds.find(loop);
+    return it == tripBounds.end() ? std::nullopt : std::optional(it->second);
+  }
+
   /// Regions solved so far, module-wide. Sampled either side of one func to
   /// tell "this func solved nothing" from "this func solved a zero-cycle span",
   /// which are different answers to "what latency does it publish".
@@ -191,6 +201,7 @@ public:
   void forget(Operation *op) {
     ops.erase(op);
     regions.erase(op);
+    tripBounds.erase(op);
   }
 
   /// Read \p module's reified `allo.dcp.*` ops into `report`. Called once, at
@@ -210,6 +221,7 @@ public:
 private:
   llvm::DenseMap<Operation *, OpSchedule> ops;
   llvm::DenseMap<Operation *, RegionSolution> regions;
+  llvm::DenseMap<Operation *, int64_t> tripBounds;
 };
 
 } // namespace mlir::allo

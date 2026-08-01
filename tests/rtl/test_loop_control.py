@@ -4,6 +4,7 @@
 """`for`-loop structure, scheduling, and the shared iteration-control controller."""
 
 import os
+import re
 import shutil
 import sys
 
@@ -789,6 +790,62 @@ def test_assume_hints():
 
     assert _iis(_sched(par_scatter).cyclic()) == [1]
     assert _iis(_sched(seq_scatter).cyclic()) == [MEM_REDUCE_II]
+
+
+# A hint that bounds a runtime trip is also a hint about WIDTH. The scheduler
+# distils `assume(n <= K)` into a worst-case count; reification carries it as
+# `trip_bound`, the one induction fact it cannot re-derive (the loop keeps its
+# runtime bound operand, while the assumption that bounded it has already been
+# consumed and erased); the emitter then sizes the iteration counter and the
+# address strides riding it by that count instead of by the index width.
+def test_assume_bounded_trip_narrows_the_counter():
+    def build(hint):
+        if hint:
+
+            @kernel
+            def k(A: i32[256], B: i32[256], n: index):
+                allo.assume(n <= 100)
+                for i in range(n):
+                    B[i] = A[i] * 3
+
+        else:
+
+            @kernel
+            def k(A: i32[256], B: i32[256], n: index):
+                for i in range(n):
+                    B[i] = A[i] * 3
+
+        return k
+
+    # The width of every register the induction drives: the counter, named
+    # after the source IV, and the strength-reduced address strides.
+    def widths(m):
+        return {
+            name: int(w)
+            for name, w in re.findall(r"%(\w+) = seq\.compreg[^\n]*: i(\d+)", m)
+            if name == "i" or "_addr" in name
+        }
+
+    plain = widths(_to_rtl(build(False)).mlir)
+    assert plain and set(plain.values()) == {32}, "unhinted: nothing to narrow to"
+
+    rtl = _to_rtl(build(True))
+    assert Dcp(rtl).attrs("allo.dcp.pipeline", "trip_bound") == [100]
+    hinted = widths(rtl.mlir)
+    assert hinted.keys() == plain.keys()
+    # 100 iterations of a stride-1 counter need 8 signed bits, and every
+    # address off it indexes within the same span.
+    assert hinted["i"] == 8
+    assert all(w <= 8 for w in hinted.values()), hinted
+
+    # The bound is not the bound: a run well inside it writes its own trip, not
+    # the assumed one.
+    A = (np.arange(256, dtype=np.int32) % 97) + 1
+    B = np.zeros(256, np.int32)
+    rtl.cosim(A, B, 37)
+    exp = np.zeros(256, np.int32)
+    exp[:37] = A[:37] * 3
+    assert np.array_equal(B, exp)
 
 
 # --- the shared iteration-control controller skeleton ------------------------

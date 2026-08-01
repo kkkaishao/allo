@@ -294,6 +294,10 @@ RegionBlock DatapathBuilder::addRegion(Operation *regionOp, RegionId ridx) {
       rb.ii = static_cast<unsigned>(*ii);
     if (auto t = pipe.getTripAttr())
       rb.tripCount = t.getInt();
+    if (auto t = pipe.getTripBoundAttr())
+      rb.tripBound = t.getInt();
+    assert(!(rb.tripCount && rb.tripBound) &&
+           "an exact trip and a worst-case bound on the same loop");
     // The induction bounds themselves are resolved by `recordRegionBounds`,
     // once the counter width is known and `resolveValue` can see the whole
     // region model.
@@ -823,19 +827,16 @@ Source DatapathBuilder::resolveValue(Value v) {
 // which is both the one-past value and the `ub` the bounds are tied in at. An
 // empty loop is the case that needs `step` named: `0 to 0` bounds fit in a bit,
 // its step does not.
-//
-// `kIndexWidth` when any bound is only known at run time (no range to narrow
-// against) and for a while, whose controller builds its own zero-based
-// terminator.
+// A loop whose trip only an ASSUMPTION bounds takes the same formula with the
+// bound in place of the count.
 static unsigned counterWidth(const RegionBlock &rb) {
   auto pipe = cast<dcp::DCPathPipelineOp>(rb.op);
-  if (rb.conditional || !rb.tripCount || pipe.getLbBound() ||
-      pipe.getStepBound() || pipe.getDynamicBound())
+  std::optional<int64_t> trip = rb.tripCount ? rb.tripCount : rb.tripBound;
+  if (rb.conditional || !trip || pipe.getLbBound() || pipe.getStepBound())
     return kIndexWidth;
   int64_t lb = pipe.getLb().value_or(0), step = pipe.getStep().value_or(1);
   int64_t span, last;
-  if (llvm::MulOverflow(*rb.tripCount, step, span) ||
-      llvm::AddOverflow(lb, span, last))
+  if (llvm::MulOverflow(*trip, step, span) || llvm::AddOverflow(lb, span, last))
     return kIndexWidth;
   auto bits = [](int64_t v) {
     return static_cast<unsigned>(
@@ -1196,12 +1197,6 @@ static int64_t mod(int64_t a, int64_t b) {
 // the same headroom either way. A PLAIN accumulator runs from `init` over the
 // loop's advances, one past the last iteration since a counted controller still
 // computes the step it does not take.
-//
-// The default width whenever that range is not bounded by a constant trip, or
-// reaches below zero: a stride is ZERO-extended wherever it is read, so a
-// negative value could not be widened back exactly. Every stride an address is
-// built from is non-negative, which is the same assumption the unsigned wrap
-// compare already makes.
 static unsigned strideWidth(const RegionBlock::AddrStride &s,
                             std::optional<int64_t> trip) {
   auto bits = [](uint64_t v) {
@@ -1222,7 +1217,7 @@ static unsigned strideWidth(const RegionBlock::AddrStride &s,
 // The slot in \p rb holding \p want, appended if no identical stride is there.
 // The width is DERIVED from the rest, so it takes no part in the comparison.
 static unsigned slotFor(RegionBlock &rb, RegionBlock::AddrStride want) {
-  want.width = strideWidth(want, rb.tripCount);
+  want.width = strideWidth(want, rb.tripCount ? rb.tripCount : rb.tripBound);
   auto *it =
       llvm::find_if(rb.addrStrides, [&](const RegionBlock::AddrStride &a) {
         return a.init == want.init && a.step == want.step &&
