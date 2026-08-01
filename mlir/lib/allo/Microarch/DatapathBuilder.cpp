@@ -9,11 +9,12 @@
 #include "allo/Microarch/Reservation.h" // verifyBinding (MRT legality)
 
 #include "allo/IR/AlloOps.h"
-#include "allo/Scheduling/AddressModel.h"  // splitAddress (strength reduction)
-#include "allo/Scheduling/LatencyModel.h"  // composeSpan (the one composer)
-#include "allo/Scheduling/MemoryAccess.h"  // resolveRoot (storage identity)
-#include "allo/Scheduling/MemoryModel.h"   // characterize (storage shape)
-#include "allo/Support/Logging.h"          // unmodelled-op diagnostic
+#include "allo/Scheduling/AddressModel.h" // splitAddress (strength reduction)
+#include "allo/Scheduling/LatencyModel.h" // composeSpan (the one composer)
+#include "allo/Scheduling/MemoryAccess.h" // resolveRoot (storage identity)
+#include "allo/Scheduling/MemoryModel.h"  // characterize (storage shape)
+#include "allo/Scheduling/OperatorLibrary.h" // combKindOf (func-scope cones)
+#include "allo/Support/Logging.h"            // unmodelled-op diagnostic
 #include "allo/Translation/EmitterState.h" // nameFromLoc, sanitizeCppIdentifier
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
@@ -512,6 +513,43 @@ void DatapathBuilder::bindCompute(dcp::DCPathComputeOp comp, RegionBlock &rb) {
   dp.units.push_back(std::move(u));
 }
 
+void DatapathBuilder::bindScopeOps() {
+  for (Operation &opRef : func.getBody().front()) {
+    Operation *op = &opRef;
+    // A region op is a RegionBlock, a literal is already a ConstCell, a memref
+    // declaration is materialized on first access, and the terminator's
+    // operands are read by `recordResults`. Everything else at this scope is
+    // the reifier's leftover bound / predicate arithmetic.
+    if (isa<dcp::DCPathRegionOpInterface, arith::ConstantOp, memref::AllocOp,
+            memref::AllocaOp, memref::GetGlobalOp, StreamCreateOp,
+            dcp::DCPathOutputOp>(op))
+      continue;
+    std::optional<CombOpKindEnum> ck = combKindOf(op);
+    if (!ck || op->getNumResults() != 1) {
+      // Anchored on the offending op, not on whoever reads it: a func-scope op
+      // this cannot model would otherwise be reported as an unresolved bound
+      // one region away.
+      unsupported(Stage::Emit, op)
+          << "Operation '" << op->getName()
+          << "' sits outside every scheduling region and is not a "
+             "combinational expression the datapath can build there";
+      dp.infeasible = true;
+      continue;
+    }
+    ScopeUnit su;
+    su.id = dp.scopeUnits.size();
+    su.op = op;
+    su.opType = stringifyCombOpKindEnum(*ck).str();
+    su.resultType = op->getResult(0).getType();
+    // Block order guarantees an operand produced by an earlier cone is already
+    // registered, so this one resolution pass is enough.
+    for (Value v : op->getOperands())
+      su.inputs.push_back(resolveValue(v));
+    producerOf[op->getResult(0)] = Source{Source::Kind::Scope, su.id, 0};
+    dp.scopeUnits.push_back(std::move(su));
+  }
+}
+
 void DatapathBuilder::bindResource(Operation *op, RegionBlock &rb) {
   // One arm per kind of resource a body op binds, plus the kinds that bind
   // nothing. Falling out the bottom is the loud case: an unmodelled op would
@@ -951,10 +989,14 @@ Resolved DatapathBuilder::resolveOperand(Value v, Operation *consumer,
   switch (base.kind) {
   // A held source is already valid when the consumer issues, so it ties
   // straight in: a survivor for the whole of the producing region's run, an
-  // IO port and a literal for the whole kernel.
+  // IO port and a literal for the whole kernel, and a func-scope cone for as
+  // long as the held values it reads. Delaying one would be sound but pure
+  // waste, and falling through to the scheduled arm below would ask a raw
+  // func-scope op for a `start` it does not carry.
   case Source::Kind::Survivor:
   case Source::Kind::IO:
   case Source::Kind::Const:
+  case Source::Kind::Scope:
     return {base, Value(), 0, true};
   // The counter presents its index at cycle 0 of ITS region (for an enclosing
   // loop's index, held across the whole nested run), so a consumer scheduled
@@ -1535,12 +1577,25 @@ void DatapathBuilder::recordSiblingDeps(ArrayRef<Operation *> regionOps) {
     if (uit == opTop.end())
       return;
     RegionId consumer = uit->second;
-    for (Value v : o->getOperands())
-      if (auto *def = v.getDefiningOp()) {
-        auto dit = opTop.find(def);
-        if (dit != opTop.end() && dit->second != consumer)
+    for (Value v : o->getOperands()) {
+      auto *def = v.getDefiningOp();
+      if (!def)
+        continue;
+      if (auto dit = opTop.find(def); dit != opTop.end()) {
+        if (dit->second != consumer)
           addPred(dit->second, consumer);
+        continue;
       }
+      // A def no region owns is a func-scope cone (a `ScopeUnit`). It is
+      // combinational over held registers, so the consumer must wait for
+      // whoever LATCHES them: without this the region reading a top-level
+      // loop's bound expression, or a top-level guard's predicate, would start
+      // concurrently with the region producing it and sample a survivor before
+      // it settles.
+      for (unsigned p : ownersThroughScope(def, opTop))
+        if (p != consumer)
+          addPred(p, consumer);
+    }
   });
 
   // The two relations, diffed. `siblingPredecessors` must be a SUPERSET, and
@@ -1609,6 +1664,7 @@ void DatapathBuilder::build() {
   enumerateBoundaryPorts(); // module boundary ports (needs every access)
   // Everything below resolves Values to Sources, and so runs here rather than
   // during the walk: `resolveValue` needs the complete region model.
+  bindScopeOps();                 // func-scope cones, before anyone reads one
   recordRegionResults(regionOps); // per-region results/recurrence + predicate
   recordCallScalars();            // each dcp.instance's scalar operand drivers
   recordCallDeps();               // composition DAG on the instance substrate

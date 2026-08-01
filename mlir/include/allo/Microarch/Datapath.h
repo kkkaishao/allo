@@ -80,6 +80,8 @@ using CallId = unsigned;
 //               (id = the StreamChannel)
 //   Call     -> which scalar result of a sub-kernel call (id = the CallUnit):
 //               the child instance's result output, landing at start+latency
+//   Scope    -> 0 (id = the ScopeUnit): a func-scope combinational cone,
+//               stable from its inputs' producing regions onward
 //===----------------------------------------------------------------------===//
 
 struct Source {
@@ -94,7 +96,8 @@ struct Source {
     Counter,
     Survivor,
     Stream,
-    Call
+    Call,
+    Scope
   };
   Kind kind = Kind::None;
   unsigned id = 0;
@@ -159,6 +162,31 @@ struct FuncUnit {
   // shift register `ym2 = ym1; ym1 = y` gives ym2 distance 2, so its init must
   // hold for the first two iterations, not just the first).
   llvm::SmallVector<unsigned, 2> inputInitDist;
+};
+
+/// A combinational cell sitting at FUNC SCOPE, outside every region: one op of
+/// the arith cone the reifier leaves in the module body when a top-level loop's
+/// induction bound or a top-level guard's predicate is an expression rather
+/// than a value the datapath already carries (`for i in range(start, m+1)` in a
+/// callee, `if k == 0` before a `dcp.select`).
+///
+/// It is NOT a `FuncUnit`. A unit belongs to one region, issues on that
+/// region's pulse and holds a reservation slot; this belongs to none, issues on
+/// nothing, and must be readable from every region that comes after its inputs
+/// settle.
+///
+/// SSA dominance closes its input set: a value defined at func scope can only
+/// read a scalar kernel argument, a literal, a top-level region's survivor, or
+/// an earlier cone. All four are HELD, so the cone is a pure function of
+/// settled registers with no clock, no register chain and no stall shell. Its
+/// one timing obligation is a composition edge, and `recordSiblingDeps` carries
+/// it by chasing through the cone to the regions its inputs come from.
+struct ScopeUnit {
+  unsigned id = 0;
+  Operation *op = nullptr;             // the func-scope arith op
+  std::string opType;                  // its comb mnemonic (`combKindOf`)
+  Type resultType;                     // value-typed, like FuncUnit::resultType
+  llvm::SmallVector<Source, 2> inputs; // one resolved driver per operand
 };
 
 /// A shift-register chain carrying one SSA value across cycle boundaries. Its
@@ -823,6 +851,7 @@ struct Datapath {
 
   // Derived structural cells.
   std::vector<FuncUnit> units;
+  std::vector<ScopeUnit> scopeUnits; // func-scope cones, in block order
   std::vector<Register> regs;
   std::vector<MemUnit> mems;
   std::vector<StreamChannel> streams;
@@ -892,6 +921,7 @@ struct SourceSite {
   enum class Slot {
     UnitInput,        // a compute unit's operand port
     UnitInit,         // that port's reduction identity (absent => None)
+    ScopeInput,       // a func-scope cone's operand
     RegisterInput,    // a shift chain's head driver
     MuxInput,         // one arm of a derived sharing mux
     MemAddress,       // an address operand of a memory access

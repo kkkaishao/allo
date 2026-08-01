@@ -11,6 +11,8 @@
 
 #include "mlir/IR/Block.h"
 #include "llvm/ADT/ArrayRef.h"
+#include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/SmallVector.h"
 
 #include <cstdint>
 #include <optional>
@@ -201,6 +203,23 @@ std::optional<int64_t> composeSequence(llvm::ArrayRef<SpanNode> nodes);
 /// here: it drops exactly the edges the emitter keeps.
 std::vector<llvm::SmallVector<unsigned, 2>>
 siblingPredecessors(llvm::ArrayRef<llvm::SmallVector<Operation *>> nodeOps);
+
+/// The nodes \p def ultimately reads, given \p owner (op -> owning node) and a
+/// \p def that \p owner does not name. The reifier leaves a pure arith cone at
+/// FUNC SCOPE whenever a top-level loop's induction bound or a top-level
+/// guard's predicate is an expression (`for i in range(start, m+1)` in a
+/// callee, `if k == 0` before a `dcp.select`), and such an op belongs to no
+/// node, so an SSA edge routed through it reads as no edge at all. The cone is
+/// combinational, so it carries the dependence of everything it reads: chase
+/// through it to the ops a node does own.
+///
+/// Shared by the two relations that must not disagree about it
+/// (`siblingPredecessors` and `DatapathBuilder::recordSiblingDeps`), which are
+/// otherwise deliberately separate: they read different substrates, but "what
+/// does this value ultimately come from" is one graph question.
+llvm::SmallVector<unsigned, 2>
+ownersThroughScope(Operation *def,
+                   const llvm::DenseMap<Operation *, unsigned> &owner);
 
 /// A func's top-level span: its regions composed over their dependence DAG.
 ///

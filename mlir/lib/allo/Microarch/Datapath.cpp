@@ -79,7 +79,11 @@ Operation *Datapath::producingOp(const Source &s) const {
   case Source::Kind::Const:
   case Source::Kind::Counter:
   case Source::Kind::Survivor:
-    return nullptr; // at-issue, held, or produced outside this region
+  case Source::Kind::Scope:
+    // At-issue, held, or produced outside this region. A `Scope` cone HAS an op
+    // but no schedule: it is combinational over settled registers, so reporting
+    // it here would hand `readyCycleOf` an op with no `start` attribute.
+    return nullptr;
   }
   llvm_unreachable("unhandled Source::Kind");
 }
@@ -112,6 +116,8 @@ std::string SourceSite::describe() const {
     return idx("operand") + " of a compute unit";
   case Slot::UnitInit:
     return "the reduction identity of " + idx("operand");
+  case Slot::ScopeInput:
+    return idx("operand") + " of a func-scope expression";
   case Slot::RegisterInput:
     return "the input of a pipeline register";
   case Slot::MuxInput:
@@ -162,6 +168,9 @@ void forEachSource(
     for (auto [k, s] : llvm::enumerate(u.inputInits))
       visit(s, Slot::UnitInit, k, u.repOp(), /*required=*/false);
   }
+  for (const ScopeUnit &su : dp.scopeUnits)
+    for (auto [k, s] : llvm::enumerate(su.inputs))
+      visit(s, Slot::ScopeInput, k, su.op, /*required=*/true);
   for (const Register &r : dp.regs)
     visit(r.input, Slot::RegisterInput, r.id, nullptr, /*required=*/true);
   for (const Mux &x : dp.muxes)
@@ -258,6 +267,9 @@ static void printSource(const Source &s, raw_ostream &os) {
   case Source::Kind::Call:
     os << "call" << s.id << "#" << s.outPort;
     break;
+  case Source::Kind::Scope:
+    os << "g" << s.id;
+    break;
   }
 }
 
@@ -295,6 +307,11 @@ void Datapath::dump(llvm::raw_ostream &os) const {
       os << " ii=" << *rb.ii;
     if (rb.tripCount)
       os << " trip=" << *rb.tripCount;
+    if (!rb.predecessors.empty()) {
+      os << " after=[";
+      llvm::interleaveComma(rb.predecessors, os, [&](RegionId p) { os << p; });
+      os << "]";
+    }
     os << "\n";
     for (UnitId uid : rb.units) {
       const FuncUnit &u = this->units[uid];
@@ -375,6 +392,13 @@ void Datapath::dump(llvm::raw_ostream &os) const {
       });
       os << "]";
     }
+    os << "\n";
+  }
+
+  for (const ScopeUnit &su : this->scopeUnits) {
+    os << "  scope g" << su.id << ": " << su.opType << " : " << su.resultType
+       << " <= ";
+    printSourceList(su.inputs, os);
     os << "\n";
   }
 

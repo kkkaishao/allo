@@ -306,6 +306,7 @@ struct DatapathEmitter {
   DenseMap<unsigned, Value> unitVal;             // unit id -> result
   DenseMap<unsigned, circt::Backedge> unitBE;    // unit id -> result backedge
   DenseMap<unsigned, Value> muxVal;              // mux id -> resolved output
+  DenseMap<unsigned, Value> scopeVal; // ScopeUnit id -> emitted comb value
 
   /// One channel's port drives, accumulated over every access to it. A FIFO
   /// has a single {data,valid,ready} triple that several accesses time-share:

@@ -121,6 +121,10 @@ struct DatapathBuilder {
   /// A `dcp.compute` -> a FuncUnit, combinational or IP-realized, holding the
   /// op at its reservation slot (its issue cycle, modulo II when cyclic).
   void bindCompute(dcp::DCPathComputeOp comp, RegionBlock &rb);
+  /// Bind the func-scope arith cone: every op the reifier left in the module
+  /// body outside a region (a top-level loop's affine bound expression, a
+  /// top-level guard's predicate) -> a `ScopeUnit` (see its declaration).
+  void bindScopeOps();
   /// Allocate (or reuse) a MemUnit for \p memref (external iff a func
   /// argument).
   MemId getOrCreateMem(Value memref);

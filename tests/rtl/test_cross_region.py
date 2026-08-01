@@ -539,6 +539,109 @@ def test_loop_bound_from_enclosing_counter():
 
 
 # ---------------------------------------------------------------------------
+# Func-scope cones: the arith the reifier leaves in the kernel body, outside
+# every region, when a TOP-LEVEL loop's bound or guard's predicate is an
+# expression.
+# ---------------------------------------------------------------------------
+
+
+def _loose_ops(func):
+    """The ops in ``func``'s own body that belong to no region: exactly the
+    func-scope cone. Constants are excluded (they tie in as literal cells
+    wherever they sit), as are the region ops and the terminator."""
+    body = func.root.regions[0].blocks[0]
+    return [
+        o.operation.name
+        for o in body.operations
+        if not o.operation.name.startswith("allo.dcp.")
+        and o.operation.name != "arith.constant"
+    ]
+
+
+def test_func_scope_loop_bound_cone():
+    # A top-level window loop: `hi + 1` is an affine expression of a scalar
+    # argument, so the reifier materializes an `arith.addi` at func scope
+    # reading the prologue's survivor. The bound resolves through it, and the
+    # loop runs [lo, hi].
+    @kernel
+    def windowed(src: i32[16], dst: i32[16], lo: i32, hi: i32):
+        for i in range(lo, hi + 1):
+            dst[i] = src[i]
+
+    rtl = _to_rtl(windowed)
+    # Locked, so the test cannot quietly stop covering the shape if the reifier
+    # ever wraps these ops in a region of their own.
+    assert _loose_ops(Dcp(rtl).func("windowed")) == ["arith.addi"]
+
+    src = (np.arange(16, dtype=np.int32) + 3) * 5
+    dst = np.zeros(16, np.int32)
+    rtl.cosim(src, dst, np.int32(2), np.int32(9))
+    expected = np.zeros(16, np.int32)
+    expected[2:10] = src[2:10]  # inclusive of `hi`, and nothing outside
+    assert np.array_equal(dst, expected)
+
+
+def test_func_scope_guard_predicate_cone():
+    # The same cone in the other slot: a top-level `if` over a scalar argument
+    # closes into a `dcp.select` whose predicate is a func-scope `arith.cmpi`.
+    # The guard must gate its arm, both ways.
+    @kernel
+    def guarded(flag: i32, out: i32[16]):
+        for i in range(16):
+            out[i] = i
+        if flag == 0:
+            for j in range(16):
+                out[j] = 99
+
+    rtl = _to_rtl(guarded)
+    assert _loose_ops(Dcp(rtl).func("guarded")) == ["arith.cmpi"]
+
+    taken = np.zeros(16, np.int32)
+    rtl.cosim(np.int32(0), taken)
+    assert np.array_equal(taken, np.full(16, 99, np.int32))
+
+    skipped = np.zeros(16, np.int32)
+    _to_rtl(guarded).cosim(np.int32(1), skipped)
+    assert np.array_equal(skipped, np.arange(16, dtype=np.int32))
+
+
+def test_func_scope_cone_carries_its_composition_edge():
+    # The cone's one timing obligation. Region 2's ONLY tie to region 0 (the
+    # prologue latching `n`) is its bound expression, which belongs to no
+    # region: without chasing through it, the composer would see no edge and
+    # start region 2 with the kernel, reading the survivor before it settles.
+    # Region 1 sweeps a disjoint array and must stay concurrent, so this is a
+    # lock on the edge being exactly the one the cone implies.
+    @kernel
+    def scoped_bound(a: i32[16], b: i32[16], n: i32):
+        for j in range(16):
+            a[j] = j
+        # `i + 1`, so a written cell is never the 0 an untouched one reads back
+        # as: the trip count is then visible in the result.
+        for i in range(0, n + 1):
+            b[i] = i + 1
+
+    rtl = _to_rtl(scoped_bound)
+    assert _loose_ops(Dcp(rtl).func("scoped_bound")) == ["arith.addi"]
+
+    # Read off the control structure, the same way the concurrent-siblings
+    # lock reads it: what the consuming region's run register is gated on.
+    m = Mod(rtl.mlir, "scoped_bound")
+    _, run2 = m.reg_named("r2_run")
+    cone = {m.hint.get(v, v) for v in m.cone(run2, limit=256)}
+    assert "r0_done" in cone  # gated on the region that latches the bound
+    assert "r1_done" not in cone  # and on nothing else
+
+    a = np.zeros(16, np.int32)
+    b = np.zeros(16, np.int32)
+    rtl.cosim(a, b, np.int32(6))
+    assert np.array_equal(a, np.arange(16, dtype=np.int32))
+    expected = np.zeros(16, np.int32)
+    expected[:7] = np.arange(1, 8)  # exactly n+1 iterations, and no more
+    assert np.array_equal(b, expected)
+
+
+# ---------------------------------------------------------------------------
 # Cross-region hand-off: regression witnesses for the survivor path. A sibling
 # region can only reach a value through the formal-result path (SSA dominance
 # forbids reading another region's inner value), while an enclosing-to-nested

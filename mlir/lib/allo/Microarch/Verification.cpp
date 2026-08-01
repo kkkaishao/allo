@@ -219,8 +219,12 @@ LogicalResult checkEmitterSubset(dcp::DCPathModuleOp func, const Datapath &dp) {
   // while waits t_cond cycles. `verifyDatapath` already rejects a `None`.
   auto conditionOk = [&](const Source &s, bool sequential) {
     switch (s.kind) {
+    // A scheduled prologue predicate, and a func-scope cone combinational over
+    // exactly such predicates and the module's ports: both are settled at the
+    // region start.
     case Source::Kind::Survivor:
-      return true; // a scheduled prologue predicate, valid at the region start
+    case Source::Kind::Scope:
+      return true;
     case Source::Kind::Unit:
       return sequential || dcpStart(dp.units[s.id].repOp()) == 0;
     default:
@@ -255,6 +259,12 @@ LogicalResult checkEmitterSubset(dcp::DCPathModuleOp func, const Datapath &dp) {
   for (const FuncUnit &u : dp.units)
     assert((u.comb ? combEmitted(u.opType) : !u.impl.empty()) &&
            "an unrealizable operator reached emission");
+  // A func-scope cone is combinational by construction (`bindScopeOps` rejects
+  // anything `combKindOf` does not name), so only `emitCompute`'s coverage is
+  // left to check.
+  for (const ScopeUnit &su : dp.scopeUnits)
+    assert(combEmitted(su.opType) &&
+           "an unrealizable func-scope expression reached emission");
   return success();
 }
 
