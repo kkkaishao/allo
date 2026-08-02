@@ -17,6 +17,7 @@ add_mlir_library(MLIRAlloTransforms
     OutlineLooseProcesses.cpp
     RaiseCountedWhile.cpp
     ElideDeadInit.cpp
+    RaiseToAffine.cpp
     ScalarizeMemory.cpp
     ReassociateReductions.cpp
     RotateReductions.cpp

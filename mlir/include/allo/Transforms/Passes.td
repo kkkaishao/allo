@@ -437,6 +437,22 @@ def ElideDeadInitPass
   ];
 }
 
+def RaiseToAffinePass
+    : Pass<"raise-to-affine", "func::FuncOp"> {
+  let summary = "Raise scf.for loops and memref accesses to their affine form";
+  let description = [{
+    Rewrite an `scf.for` to an `affine.for`, and a `memref.load` / `memref.store`
+    to its affine counterpart, wherever the affine form computes what the
+    original computed: bounds and subscripts must be affine functions of the
+    enclosing induction variables and loop-invariant values, and the step a
+    positive constant.
+  }];
+  let dependentDialects = [
+    "mlir::affine::AffineDialect", "mlir::arith::ArithDialect",
+    "mlir::memref::MemRefDialect", "mlir::scf::SCFDialect"
+  ];
+}
+
 def ScalarizeMemoryPass
     : Pass<"scalarize-memory", "func::FuncOp"> {
   let summary = "Scalarize a small local array to registers or remove it entirely";

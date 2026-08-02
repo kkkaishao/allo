@@ -3,6 +3,7 @@
 
 add_mlir_library(MLIRAlloSupport
     AffineValueMapBuilder.cpp
+    AffineRaising.cpp
     TopologyGraph.cpp
     Logging.cpp
     PARTIAL_SOURCES_INTENDED
@@ -15,6 +16,8 @@ add_mlir_library(MLIRAlloSupport
     MLIRIR
     MLIRAffineDialect
     MLIRArithDialect
+    MLIRMemRefDialect
+    MLIRSCFDialect
     spdlog::spdlog_header_only
 )
 
