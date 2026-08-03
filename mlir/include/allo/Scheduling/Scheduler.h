@@ -308,22 +308,23 @@ inline int64_t drainOf(circt::scheduling::Problem &problem,
 }
 
 /// One value a region spends a DELAY REGISTER chain on. The chain is as long as
-/// its deepest reader needs and costs one flip-flop per bit per REGISTER on it:
+/// its deepest reader needs and costs one flip-flop per bit per cycle of that:
 ///
 /// ```
 /// depth(v) = max over reads ( t_read + ii * distance ) - ( t_def + latency )
-/// cost(v)  = width * ceil( depth(v) / ii )
+/// cost(v)  = width * depth(v)
 /// ```
-///
-/// The ceiling is the fold the emitter builds (`EmitContext::foldedChain`):
-/// a cyclic region holds one iteration per II cycles, so one register per II
-/// of depth carries every live value. `ii` is 1 on a line, where the chain is
-/// a plain shift register and the two agree.
 ///
 /// No register is shared between two values (`insertRegister` keys one chain
 /// per value and region), which is what makes this a SUM over values that is
 /// linear in the schedule rather than a MAXLIVE over time coupled to an
 /// allocation, and so a term an objective can carry directly.
+///
+/// It over-states a cyclic region by up to the II: only one iteration is in
+/// flight per II cycles, so the emitter folds the chain to `ceil(depth / ii)`
+/// registers (`EmitContext::foldedChain`). Staying linear is what keeps the
+/// term carryable, so the objective prices the unfolded chain and is
+/// conservative about anything that buys area by lengthening a lifetime.
 struct RegisterTerm {
   Operation *def;
   /// Cycles after `def` issues before the value is readable.
