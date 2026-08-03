@@ -341,6 +341,130 @@ void Datapath::reportAllocation() const {
         << " units (" << ip << " IP), " << rb.muxes.size() << " muxes, "
         << fanin << " mux inputs, " << muxBits << " 2:1 mux bits";
   }
+
+  // Write ports per array, and how many REGIONS the writers are spread over. A
+  // second write port defeats RAM inference outright, so an array whose writers
+  // sit in different regions is paying for a concurrency it cannot have:
+  // regions touching a shared memref are ordered by `recordSiblingDeps`.
+  for (const MemUnit &m : mems) {
+    llvm::SmallDenseSet<unsigned> regionsWriting;
+    unsigned writes = 0, fromCalls = 0;
+    Operation *anchor = nullptr;
+    for (const MemUnit::Access &acc : m.accesses)
+      if (acc.isWrite) {
+        ++writes;
+        regionsWriting.insert(acc.region);
+        if (!anchor)
+          anchor = acc.op;
+      }
+    for (const CallUnit &cu : calls)
+      for (const CallUnit::MemArg &ma : cu.memArgs)
+        if (ma.mem == m.id && ma.isWrite) {
+          ++writes;
+          ++fromCalls;
+          regionsWriting.insert(cu.region);
+          if (!anchor)
+            anchor = cu.invoke;
+        }
+    if (writes < 2)
+      continue;
+    logging::info(logging::Stage::Emit, anchor)
+        << "Memory: " << writes << " write ports (" << fromCalls
+        << " from calls) on " << m.depthWords << "x" << m.width
+        << " bits over " << regionsWriting.size() << " regions, needs "
+        << portsNeeded(m.id, /*writesOnly=*/true) << " write "
+        << portsNeeded(m.id, /*writesOnly=*/false) << " total, "
+        << (m.external ? "external" : "internal");
+  }
+}
+
+unsigned Datapath::portsNeeded(MemId id, bool writesOnly) const {
+  const MemUnit &m = mems[id];
+  // Top-level ancestor of a region: the granularity `recordSiblingDeps` orders
+  // at, and a container's children stay serial below it.
+  auto topOf = [&](RegionId r) {
+    while (regions[r].parent)
+      r = *regions[r].parent;
+    return r;
+  };
+  // Does call \p a precede \p b transitively? A channel-joined pair in a
+  // concurrent container is deliberately NOT ordered, and writes from such a
+  // pair really are simultaneous.
+  auto callPrecedes = [&](CallId a, CallId b) {
+    llvm::SmallVector<CallId> work{b};
+    llvm::SmallDenseSet<CallId> seen{b};
+    while (!work.empty()) {
+      CallId c = work.pop_back_val();
+      for (const CallUnit::Pred &p : calls[c].predecessors) {
+        if (p.call == a)
+          return true;
+        if (seen.insert(p.call).second)
+          work.push_back(p.call);
+      }
+    }
+    return false;
+  };
+
+  struct Writer {
+    RegionId top, region;
+    unsigned residue;
+    int call; // CallId, or -1 for a region-local access
+  };
+  llvm::SmallVector<Writer> ws;
+  for (const MemUnit::Access &acc : m.accesses)
+    if (acc.isWrite || !writesOnly) {
+      unsigned ii = regions[acc.region].ii.value_or(0);
+      unsigned start = dcpStart(acc.op);
+      ws.push_back({topOf(acc.region), acc.region, ii ? start % ii : start, -1});
+    }
+  for (const CallUnit &cu : calls)
+    for (const CallUnit::MemArg &ma : cu.memArgs)
+      if (ma.mem == id && (ma.isWrite || !writesOnly))
+        ws.push_back({topOf(cu.region), cu.region, 0, int(cu.id)});
+  if (ws.size() < 2)
+    return ws.size();
+
+  // A container drives its children serially, so two accesses in different
+  // regions under one top are ordered UNLESS a concurrent container is in the
+  // chain, which places every child at 0.
+  auto underConcurrent = [&](RegionId r) {
+    for (;; r = *regions[r].parent) {
+      if (regions[r].determinacy == DeterminacyEnum::Concurrent)
+        return true;
+      if (!regions[r].parent)
+        return false;
+    }
+  };
+  auto overlaps = [&](const Writer &a, const Writer &b) {
+    if (a.top != b.top)
+      return false;
+    if (a.call >= 0 && b.call >= 0)
+      return !callPrecedes(a.call, b.call) && !callPrecedes(b.call, a.call);
+    if (a.call < 0 && b.call < 0) {
+      if (a.region == b.region)
+        return a.residue == b.residue;
+      return underConcurrent(a.region) || underConcurrent(b.region);
+    }
+    return true;
+  };
+  // The largest mutually-overlapping set of writers. Exhaustive below a width
+  // the search is free at; above it every writer is assumed simultaneous,
+  // which only over-states and so never merges a port unsafely.
+  if (ws.size() > 16)
+    return ws.size();
+  unsigned needed = 1;
+  for (uint32_t s = 1, e = 1u << ws.size(); s < e; ++s) {
+    if (unsigned(llvm::popcount(s)) <= needed)
+      continue;
+    bool clique = true;
+    for (unsigned i = 0; i < ws.size() && clique; ++i)
+      for (unsigned j = i + 1; j < ws.size() && clique; ++j)
+        if ((s >> i & 1) && (s >> j & 1))
+          clique = overlaps(ws[i], ws[j]);
+    if (clique)
+      needed = llvm::popcount(s);
+  }
+  return needed;
 }
 
 void Datapath::dump(llvm::raw_ostream &os) const {

@@ -60,6 +60,8 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+from benchmark import area
+
 REPO = Path(__file__).resolve().parents[1]
 MARK = "@@QOR@@"
 
@@ -141,6 +143,13 @@ _RAISED = re.compile(r"Raised (\d+) loop\(s\) and (\d+) further memref access")
 _ALLOC = re.compile(
     r"Allocation: (\d+) compute ops on (\d+) units \((\d+) IP\), "
     r"(\d+) muxes, (\d+) mux inputs, (\d+) 2:1 mux bits"
+)
+# Per array, the write ports it was given and how many REGIONS they came from.
+# A second write port defeats RAM inference, so writers spread over regions are
+# paying for a concurrency that region ordering rules out.
+_MEMPORTS = re.compile(
+    r"Memory: (\d+) write ports \((\d+) from calls\) on (\d+)x(\d+) bits "
+    r"over (\d+) regions, needs (\d+) write (\d+) total, (\w+)"
 )
 # Per region, the operator types whose timing row covers several operator
 # identities. A binder folds only within one identity, so a limit keyed on the
@@ -255,6 +264,10 @@ def measure_one(
             t1 = time.time()
             rtl.compile()
             out["compile_s"] = round(time.time() - t1, 2)
+            # Before `rtl.verilog`, which lowers `seq` to `sv` IN PLACE: the
+            # scorer wants `seq.compreg` and the `comb` cones, not their SV
+            # expansion.
+            out["area"] = area.score(rtl.mlir)
             verilog = rtl.verilog
             out["verilog_lines"] = verilog.count("\n")
             # The RTL itself, so a re-run can be checked for BYTE identity
@@ -349,6 +362,12 @@ def _run_child(
             if d["alloc"]:
                 for f in ("ops", "units", "muxes", "mux_bits"):
                     d[f"alloc_{f}"] = sum(a[f] for a in d["alloc"])
+            d["mem_ports"] = [
+                {"writes": int(w), "from_calls": int(c), "depth": int(dp),
+                 "width": int(wd), "regions": int(rg), "needs": int(nd),
+                 "needs_total": int(nt), "external": ext == "external"}
+                for w, c, dp, wd, rg, nd, nt, ext in _MEMPORTS.findall(text)
+            ]
             d["class_splits"] = [
                 {"type": t, "ops": int(n), "classes": int(c)}
                 for tail in _SPLIT.findall(text)
@@ -504,6 +523,64 @@ def alloc_table(results: list[dict]) -> str:
     return "\n".join(lines)
 
 
+def area_table(results: list[dict]) -> str:
+    """Per variant, predicted area from the measured device tables.
+
+    `ipLUT`/`muxLUT`/`lgcLUT` split the LUT total by what spends it, which is
+    the split an allocation objective trades along: a fold removes IP and grows
+    mux. `SRL` is the delay chains, which is where the register term's cost
+    ACTUALLY lands; `regFF` beside `modFF` is what they cost against what the
+    objective charges for them. Memory is carried apart and never summed in."""
+    rows = [r for r in results if r.get("area")]
+    if not rows:
+        return "no area data (needs --stage compile)"
+    head = (
+        f"{'benchmark/variant':<34} {'sched':<6} {'LUT':>8} {'ipLUT':>8}"
+        f" {'muxLUT':>8} {'lgcLUT':>8} {'memLUT':>8} {'SRL':>6} {'DSP':>5}"
+        f" {'regFF':>8} {'modFF':>8} {'ramKb':>7}"
+    )
+    lines = [head, "-" * len(head)]
+    tot = dict.fromkeys(
+        ("lut", "ip_lut", "mux_lut", "logic_lut", "mem_lut", "srl", "dsp",
+         "reg_ff", "reg_ff_modelled", "mem_bits"), 0)
+    multiwrite = 0
+    unmodelled: dict[str, int] = {}
+    for r in sorted(rows, key=lambda r: -r["area"]["lut"]):
+        a = r["area"]
+        for f in tot:
+            tot[f] += a[f]
+        for k, n in a.get("unmodelled", {}).items():
+            unmodelled[k] = unmodelled.get(k, 0) + n
+        multiwrite += a["multiwrite_arrays"]
+        lines.append(
+            f"{_key_of(r):<34} {r['scheduler'][:6]:<6} {a['lut']:>8}"
+            f" {a['ip_lut']:>8} {a['mux_lut']:>8} {a['logic_lut']:>8}"
+            f" {a['mem_lut']:>8} {a['srl']:>6} {a['dsp']:>5} {a['reg_ff']:>8}"
+            f" {a['reg_ff_modelled']:>8} {a['mem_bits'] / 1024:>7.1f}"
+        )
+    lines.append("-" * len(head))
+    lines.append(
+        f"{'TOTAL':<34} {'':<6} {tot['lut']:>8} {tot['ip_lut']:>8}"
+        f" {tot['mux_lut']:>8} {tot['logic_lut']:>8} {tot['mem_lut']:>8}"
+        f" {tot['srl']:>6} {tot['dsp']:>5} {tot['reg_ff']:>8}"
+        f" {tot['reg_ff_modelled']:>8} {tot['mem_bits'] / 1024:>7.1f}"
+    )
+    over = tot["reg_ff_modelled"] / max(tot["reg_ff"], 1)
+    lines.append("")
+    lines.append(
+        f"the objective charges {tot['reg_ff_modelled']} flip-flops for chains "
+        f"that cost {tot['reg_ff']} FF + {tot['srl']} SRL: {over:.1f}x over"
+    )
+    if multiwrite:
+        lines.append(
+            f"{multiwrite} arrays have more than one writer, so they infer no "
+            f"RAM and cost {tot['mem_lut']} LUTs of register file"
+        )
+    if unmodelled:
+        lines.append(f"UNMODELLED (scored as zero): {unmodelled}")
+    return "\n".join(lines)
+
+
 def split_table(results: list[dict]) -> str:
     """Where one timing row covers several operator identities, aggregated over
     the bed. A binder folds only within one identity, so a count keyed on the
@@ -618,6 +695,12 @@ def main():
         help="the per-variant allocation (units, muxes) and the operator-type "
         "splits. Both need ALLO_LOG_LEVEL=info",
     )
+    ap.add_argument(
+        "--area",
+        action="store_true",
+        help="predicted LUT/DSP/FF from the measured device tables, split by "
+        "what spends them. The scoreboard an allocation change is argued from",
+    )
     ap.add_argument("--compare", metavar="BASE.json", help="diff against a saved run")
     args = ap.parse_args()
 
@@ -708,6 +791,8 @@ def main():
     if args.alloc:
         print("\n" + alloc_table(ok))
         print("\n" + split_table(ok))
+    if args.area:
+        print("\n" + area_table(ok))
 
     tally = {}
     for r in results:

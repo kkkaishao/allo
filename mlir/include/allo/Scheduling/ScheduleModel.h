@@ -157,7 +157,9 @@ public:
   /// Record \p op's solved start. An op is scheduled ONCE, by the solver or by
   /// the reify for a cone the solver never saw, never by both.
   void setStart(Operation *op, int64_t start) {
-    bool inserted = ops.try_emplace(op, OpSchedule{start, std::nullopt}).second;
+    bool inserted =
+        ops.try_emplace(op, OpSchedule{start, std::nullopt, std::nullopt})
+            .second;
     assert(inserted && "an op carries one start time");
     (void)inserted;
   }

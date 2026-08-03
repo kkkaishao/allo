@@ -319,6 +319,27 @@ struct DatapathEmitter {
   };
   DenseMap<unsigned, SmallVector<ScatterWrite, 1>> scatterWrites; // by MemId
 
+  /// One store to an internal array whose writers PROVABLY cannot issue
+  /// together (`Datapath::writePortsNeeded` == 1), held back so they can share
+  /// a single `seq.write`. A port per static write defeats block-RAM inference
+  /// and drops the array into a register file, which the bed pays 655k LUTs
+  /// for; one muxed port infers a RAM. Combined by
+  /// `finalizeSharedWritePorts`, for the same reason `ScatterWrite` exists:
+  /// the writes come from different regions and calls, so the shared port can
+  /// only be driven once all of them have emitted.
+  struct SharedWrite {
+    unsigned bank; // the bank this store commits to (0 when unbanked)
+    Value addr;
+    Value data;
+    Value we; // commit pulse, already delayed for the device write latency
+  };
+  DenseMap<unsigned, SmallVector<SharedWrite, 2>> sharedWrites; // by MemId
+
+  /// Whether \p m's writes are held back to share one port. False for an
+  /// external, scattered, skewed or dynamically banked array, none of which
+  /// present a single addressable write port to merge onto.
+  bool mergesWrites(const uarch::MemUnit &m) const;
+
   /// A kernel-local channel's body wires: what a boundary channel reads off
   /// its module ports, an internal one reads off its own `seq.fifo`. Declared
   /// as backedges before any region emits (`declareInternalChannels`) and
@@ -554,6 +575,7 @@ struct DatapathEmitter {
   /// exactly once, before `hw.output`; a read-only scattered argument has no
   /// output port and drives nothing.
   void finalizeScatteredPorts();
+  void finalizeSharedWritePorts();
   /// Build one kernel-local channel's `seq.fifo` from its accumulated drives
   /// (\p data is the puts' muxed token) and resolve its `streamWires`.
   void emitInternalChannel(const uarch::StreamChannel &s, Value data);

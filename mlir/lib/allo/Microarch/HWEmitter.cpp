@@ -508,6 +508,9 @@ void HWEmitter::emit() {
   // Same reason, for the same kind of shared port: a scattered argument's N
   // element outputs are shared by every store to it.
   datapath.finalizeScatteredPorts();
+  // And an internal array whose writers cannot overlap, which shares ONE
+  // `seq.write` so the array still infers a block RAM.
+  datapath.finalizeSharedWritePorts();
   // Scalar results: the returning region's survivor register, stable once
   // its region (and thus `done`) has risen; the cosim samples it at `done`.
   for (const uarch::Result &r : dp.results)

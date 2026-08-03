@@ -916,6 +916,21 @@ struct Datapath {
   /// bound to, and the muxes sharing grew, with their width. A diagnostic, not
   /// an IR attribute or a manifest field.
   void reportAllocation() const;
+
+  /// The fewest ports memory \p id can be built with: the largest set of its
+  /// accesses that can issue in ONE cycle, counting a child's port as an
+  /// access. With \p writesOnly, only writes are counted, which is what
+  /// defeats block-RAM inference on its own; otherwise every access counts,
+  /// which is what a RAM PORT actually serves (a port reads OR writes in a
+  /// cycle, so two writers plus a concurrent reader need three).
+  ///
+  /// Conservative in the safe direction. Only an ordering the model already
+  /// proves separates a pair: two top-level regions touching one array are
+  /// ordered by `recordSiblingDeps`, two calls by `recordCallDeps` unless a
+  /// channel joins them in a concurrent container, and two region-local
+  /// accesses at different modulo residues never share a cycle. Anything else
+  /// counts as simultaneous, so this never under-states.
+  unsigned portsNeeded(MemId id, bool writesOnly) const;
 };
 
 //===----------------------------------------------------------------------===//

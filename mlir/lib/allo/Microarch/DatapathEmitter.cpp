@@ -942,7 +942,11 @@ void DatapathEmitter::emitAccesses(const uarch::RegionBlock &rb, Value issue,
         c.delayValid(c.activationPulse(commitPulse(), acc.op, sh), pre, sh);
     Value data = late(resolveSource(acc.data));
     auto wlat = c.b.getI64IntegerAttr(1);
-    if (acc.staticBank) {
+    if (mergesWrites(m)) {
+      sharedWrites[m.id].push_back(
+          {*acc.staticBank, late(memAddr(m, bankAddress(m, acc).offset)), data,
+           we});
+    } else if (acc.staticBank) {
       // A compile-time bank writes its own memory: no demux, and no write port
       // on the other banks (the read twin above). An unbanked memref is the
       // same case at bank 0.
@@ -961,6 +965,42 @@ void DatapathEmitter::emitAccesses(const uarch::RegionBlock &rb, Value issue,
                                  writeDemux(c, we, bank, k), wlat);
     }
     fb.storeDrain = std::max<unsigned>(fb.storeDrain, storeDrainOf(m, acc));
+  }
+}
+
+bool DatapathEmitter::mergesWrites(const uarch::MemUnit &m) const {
+  if (m.external || m.scattered || m.skewed)
+    return false;
+  // A dynamically banked write drives every bank behind a demux, so it has no
+  // single port to share; require every writer to name its bank.
+  for (const uarch::MemUnit::Access &acc : m.accesses)
+    if (acc.isWrite && !acc.staticBank)
+      return false;
+  return dp.portsNeeded(m.id, /*writesOnly=*/true) == 1;
+}
+
+// Drive an array's one shared write port from every store held back for it.
+// The writers are provably never enabled in the same cycle, so the priority
+// chain below is a one-hot select and its first arm is a don't-care.
+void DatapathEmitter::finalizeSharedWritePorts() {
+  for (const uarch::MemUnit &m : dp.mems) {
+    auto it = sharedWrites.find(m.id);
+    if (it == sharedWrites.end())
+      continue;
+    ArrayRef<SharedWrite> writes = it->second;
+    for (auto [k, hlmem] : llvm::enumerate(memBanks[m.id])) {
+      Value addr, data, we;
+      for (const SharedWrite &w : writes) {
+        if (w.bank != k)
+          continue;
+        addr = addr ? c.mux(w.we, w.addr, addr) : w.addr;
+        data = data ? c.mux(w.we, w.data, data) : w.data;
+        we = we ? c.orBits(we, w.we) : w.we;
+      }
+      if (we)
+        seq::WritePortOp::create(c.b, c.loc, hlmem, ValueRange{addr}, data, we,
+                                 c.b.getI64IntegerAttr(1));
+    }
   }
 }
 
@@ -1604,10 +1644,14 @@ void DatapathEmitter::emitCalls(const uarch::RegionBlock &rb, Value issue,
       // deeper write pipelines into the fixed 1-cycle port, as emitAccesses.
       if (ma.isWrite) {
         unsigned pre = m.writeLatency - 1;
-        seq::WritePortOp::create(
-            c.b, c.loc, hlmem, ValueRange{c.shiftChain(addr, pre, sh).last()},
-            c.shiftChain(outs[ma.data], pre, sh).last(),
-            c.delayValid(outs[ma.we], pre, sh), c.b.getI64IntegerAttr(1));
+        Value a = c.shiftChain(addr, pre, sh).last();
+        Value d = c.shiftChain(outs[ma.data], pre, sh).last();
+        Value w = c.delayValid(outs[ma.we], pre, sh);
+        if (mergesWrites(m))
+          sharedWrites[m.id].push_back({ma.bank, a, d, w});
+        else
+          seq::WritePortOp::create(c.b, c.loc, hlmem, ValueRange{a}, d, w,
+                                   c.b.getI64IntegerAttr(1));
       } else
         rdBackedge[ma.data].setValue(
             c.R(seq::ReadPortOp::create(c.b, c.loc, hlmem, ValueRange{addr},
