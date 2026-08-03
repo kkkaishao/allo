@@ -242,7 +242,7 @@ SmallVector<AllocationVar> allocationVars(CpModelBuilder &model,
 ///
 /// The tie-break has three terms, all counted in flip-flops:
 ///
-///   * `width(v) * depth(v)` per value carried in a delay chain
+///   * `width(v) * ceil(depth(v) / ii)` per value carried in a delay chain
 ///     (`RegisterTerm`);
 ///   * the sum of all start times at weight one: a 1-bit activation-pulse
 ///     chain per cycle of an op's start offset;
@@ -264,13 +264,19 @@ void minimizeCost(CpModelBuilder &model, IntVar primary,
   // Bounds how far the tie-break can reach, so `primary`'s weight below
   // strictly dominates it.
   int64_t bits = starts.size();
+  // A chain costs one register per II of depth, which is the fold the emitter
+  // builds (`EmitContext::foldedChain`). `regs * fold >= depth` plus the
+  // minimization below IS `ceil(depth / fold)`, so the ceiling needs no
+  // division constraint. `fold` is 1 on a line, where the chain is plain.
+  int64_t fold = std::max<int64_t>(ii, 1);
   for (const RegisterTerm &term : span.regs) {
-    IntVar depth = model.NewIntVar(operations_research::Domain(0, horizon));
+    IntVar regs = model.NewIntVar(
+        operations_research::Domain(0, (horizon + fold - 1) / fold));
     IntVar def = startVars.at(term.def);
     for (auto [reader, distance] : term.reads)
       model.AddLessOrEqual(startVars.at(reader) + distance * ii - term.latency,
-                           def + depth);
-    vars.push_back(depth);
+                           def + regs * fold);
+    vars.push_back(regs);
     weights.push_back(term.width);
     bits += term.width;
   }
