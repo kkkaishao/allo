@@ -4,6 +4,7 @@
 add_mlir_conversion_library(MLIRAlloConversion
     ConvertAlloToFunc.cpp
     LowerDataflow.cpp
+    LowerHLMem.cpp
     LowerToLLVM.cpp
 
     DEPENDS
@@ -12,6 +13,9 @@ add_mlir_conversion_library(MLIRAlloConversion
     LINK_LIBS PUBLIC
     CIRCTLoopSchedule
     CIRCTScheduling
+    CIRCTHW
+    CIRCTSV
+    CIRCTSeq
     MLIRIR
     MLIRAllo
     MLIRAlloSupport
