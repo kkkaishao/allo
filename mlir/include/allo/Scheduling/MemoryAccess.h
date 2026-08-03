@@ -20,12 +20,13 @@ namespace mlir::allo {
 enum class AccessKind { Array, Stream };
 
 /// A recognized memory access. `root` is the underlying buffer/stream SSA value
-/// (view-like ops peeled), so distinct roots are distinct storage. `map` is the
-/// element-space subscript map, one result per memref dimension, and an ARRAY
-/// access always has one: a non-affine `memref.load/store` carries the identity
-/// map over its indices, so every consumer sees one encoding. `indices` are the
-/// subscript operands (array) or FIFO-select operands (stream); a stream has no
-/// map. Whether an access is AFFINE is a question about the op
+/// (`resolveRoot`, in `Support/AliasAnalysis.h`), so distinct roots are
+/// distinct storage. `map` is the element-space subscript map, one result per
+/// memref dimension, and an ARRAY access always has one: a non-affine
+/// `memref.load/store` carries the identity map over its indices, so every
+/// consumer sees one encoding. `indices` are the subscript operands (array) or
+/// FIFO-select operands (stream); a stream has no map. Whether an access is
+/// AFFINE is a question about the op
 /// (`affine::AffineReadOpInterface`), not about the map.
 struct MemAccess {
   Operation *op = nullptr;
@@ -39,14 +40,6 @@ struct MemAccess {
 /// Recognize \p op as a memory access (affine/memref load-store, or stream
 /// get/put); nullopt if it is not one.
 std::optional<MemAccess> asMemAccess(Operation *op);
-
-/// Peel to the STORAGE IDENTITY of a buffer or stream: the one definition every
-/// access to it must agree on. Peels view-like ops (subview / cast /
-/// reinterpret_cast / view), and on DCP IR the region results and pipeline
-/// iter-args that forward a buffer out of the region that allocated it.
-/// Identity when \p v is already a root; distinct roots are assumed
-/// non-aliasing (the Allo frontend has no pointers).
-Value resolveRoot(Value v);
 
 } // namespace mlir::allo
 

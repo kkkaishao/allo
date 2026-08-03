@@ -204,6 +204,11 @@ struct Register {
   Type type;
   unsigned depth = 0; // chain length in cycles (>= 1 for a real register)
   Source input;       // driver of the chain head (the producing cell output)
+  /// The cycle within the producing iteration at which `input` carries a fresh
+  /// datum (`readyCycleOf` the producer, 0 for a held source): the other half
+  /// of the depth formula, and the phase an II-folded chain captures on. Not
+  /// re-derivable from `input`, whose shared unit names a representative op.
+  unsigned ready = 0;
 };
 
 /// A memref-backed memory with banks and ports. The storage primitive (register

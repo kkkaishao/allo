@@ -7,6 +7,7 @@
 
 #include "allo/IR/AlloTypes.h"
 #include "allo/Scheduling/MemoryAccess.h"
+#include "allo/Support/AliasAnalysis.h" // resolveRoot (storage identity)
 
 #include "mlir/Dialect/Affine/Analysis/AffineAnalysis.h"
 #include "mlir/Dialect/Affine/Analysis/AffineStructures.h"

@@ -3,6 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+#include "allo/Support/AliasAnalysis.h" // alloAliasAnalysis
 #include "allo/TransformOps/AlloTransformOps.h"
 #include "allo/TransformOps/Utils.h"
 #include "mlir/Analysis/FlatLinearValueConstraints.h"
@@ -1458,7 +1459,7 @@ static void runComputeAtPostCleanup(affine::AffineForOp consumerLoop) {
     scopeOp = kernel.getOperation();
   else
     scopeOp = consumerLoop->getParentOp();
-  AliasAnalysis aliasAnalysis(scopeOp);
+  AliasAnalysis aliasAnalysis = alloAliasAnalysis(scopeOp);
 
   SmallVector<affine::AffineReadOpInterface, 16> loads;
   consumerLoop.walk(

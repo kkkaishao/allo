@@ -485,6 +485,12 @@ void DatapathEmitter::createInternalMemories() {
 // holds). Each chain's head input is a backedge resolved once the units exist.
 void DatapathEmitter::emitRegisters(const uarch::RegionBlock &rb) {
   StallShell sh = shellFor(rb.id);
+  // A published phase is the foldability condition: only a schedule-paced
+  // controller at II > 1 publishes one, and only there does one iteration land
+  // every `ii` cycles. A depth-1 chain is one register either way.
+  Value phase = controlOf.lookup(rb.id).phase;
+  unsigned ii = rb.ii.value_or(1);
+  assert((!phase || ii > 1) && "a phase was published for a region at II 1");
   for (uarch::RegId rid : rb.regs) {
     const uarch::Register &rg = dp.regs[rid];
     auto head = c.bb.get(hwType(rg.type, c.b));
@@ -492,14 +498,20 @@ void DatapathEmitter::emitRegisters(const uarch::RegionBlock &rb) {
     // A register is a plain delay chain; reduction-identity re-injection
     // rides the consuming unit's recurrence input (emitUnits), not the
     // register.
-    regStages[rg.id] = c.shiftChain(head, rg.depth, sh);
+    regStages[rg.id] =
+        phase && rg.depth > 1
+            ? c.foldedChain(head, rg.depth, ii, phase, rg.ready, sh)
+            : c.shiftChain(head, rg.depth, sh);
     // Name each held stage `<value>_d<k>`: the value it delays, plus how many
     // cycles late it is. Stage 0 is the undelayed input, already named by its
-    // producer, so leave it alone rather than relabel a shared wire.
+    // producer, so leave it alone rather than relabel a shared wire. A folded
+    // chain repeats one register across the `ii` taps it serves, so name it
+    // once, at the shallowest delay it provides.
     std::string owner = ownerOf(rg.value, regOwner(rg.id));
-    for (auto [k, stage] : llvm::enumerate(regStages[rg.id].stages))
-      if (k)
-        nameValue(stage, regTapName(owner, k));
+    auto &taps = regStages[rg.id].stages;
+    for (unsigned k = 1; k < taps.size(); ++k)
+      if (taps[k] != taps[k - 1])
+        nameValue(taps[k], regTapName(owner, k));
   }
 }
 

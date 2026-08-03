@@ -12,7 +12,7 @@
 #include "allo/Scheduling/LatencyModel.h"
 
 #include "allo/IR/AlloOps.h"
-#include "allo/Scheduling/MemoryAccess.h" // resolveRoot (storage identity)
+#include "allo/Support/AliasAnalysis.h" // resolveRoot (storage identity)
 
 #include "llvm/ADT/MapVector.h"
 #include "llvm/ADT/SmallPtrSet.h"

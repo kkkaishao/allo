@@ -11,9 +11,9 @@
 #include "allo/IR/AlloOps.h"
 #include "allo/Scheduling/AddressModel.h" // splitAddress (strength reduction)
 #include "allo/Scheduling/LatencyModel.h" // composeSpan (the one composer)
-#include "allo/Scheduling/MemoryAccess.h" // resolveRoot (storage identity)
 #include "allo/Scheduling/MemoryModel.h"  // characterize (storage shape)
 #include "allo/Scheduling/OperatorLibrary.h" // combKindOf (func-scope cones)
+#include "allo/Support/AliasAnalysis.h"      // resolveRoot (storage identity)
 #include "allo/Support/Logging.h"            // unmodelled-op diagnostic
 #include "allo/Translation/EmitterState.h" // nameFromLoc, sanitizeCppIdentifier
 
@@ -929,7 +929,7 @@ Resolved DatapathBuilder::resolveOperand(Value v, Operation *consumer,
       dp.infeasible = true;
       depth = 0;
     }
-    return {base, key, static_cast<unsigned>(depth), true};
+    return {base, key, static_cast<unsigned>(depth), ready, true};
   };
 
   // The one operand that does not read `v` at all: an unlatched iter_arg of the
@@ -978,7 +978,7 @@ Resolved DatapathBuilder::resolveOperand(Value v, Operation *consumer,
   case Source::Kind::IO:
   case Source::Kind::Const:
   case Source::Kind::Scope:
-    return {base, Value(), 0, true};
+    return {base, Value(), 0, 0, true};
   // The counter presents its index at cycle 0 of ITS region (for an enclosing
   // loop's index, held across the whole nested run), so a consumer scheduled
   // at tY delays it that far.
@@ -997,7 +997,7 @@ Resolved DatapathBuilder::resolveOperand(Value v, Operation *consumer,
 }
 
 RegId DatapathBuilder::insertRegister(Value key, ArrayRef<unsigned> depths,
-                                      Source input, RegionId region) {
+                                      RegHead head, RegionId region) {
   Register reg;
   reg.id = dp.regs.size();
   reg.value = key;
@@ -1005,7 +1005,8 @@ RegId DatapathBuilder::insertRegister(Value key, ArrayRef<unsigned> depths,
   // The chain is as long as its deepest consumer needs; the shallower ones read
   // their own tap off it (Source::Reg's `outPort`).
   reg.depth = *llvm::max_element(depths);
-  reg.input = input;
+  reg.input = head.base;
+  reg.ready = head.ready;
   dp.regions[region].regs.push_back(reg.id);
   dp.regs.push_back(reg);
   return reg.id;
@@ -1094,7 +1095,9 @@ void DatapathBuilder::recordEdge(Resolved r, Source &slot, unsigned regionIdx) {
   }
   RegKey key{r.key, regionIdx};
   depthsByKey[key].push_back(r.depth);
-  baseByKey[key] = r.base;
+  assert((!headByKey.count(key) || headByKey[key].ready == r.ready) &&
+         "one value's edges disagree on when it lands");
+  headByKey[key] = {r.base, r.ready};
   pending.push_back({&slot, key, r.depth});
 }
 
@@ -1430,7 +1433,7 @@ void DatapathBuilder::insertRegisters() {
   llvm::DenseMap<RegKey, RegId> keyToReg;
   for (auto &kv : depthsByKey)
     keyToReg[kv.first] = insertRegister(kv.first.first, kv.second,
-                                        baseByKey[kv.first], kv.first.second);
+                                        headByKey[kv.first], kv.first.second);
 
   for (const RegDepth &p : pending)
     *p.slot = Source{Source::Kind::Reg, keyToReg[p.key], p.depth};

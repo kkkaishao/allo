@@ -115,6 +115,11 @@ struct RegionControl {
   Value running;   // the region is executing: the level the counter reloads its
                    // lower bound while low. Null for a done-driven controller,
                    // whose counter reloads on `start` instead.
+  /// The region's time base: the modulo phase [0, ii), reloaded on `start` and
+  /// advancing on every enabled cycle after it, drain included. An iteration
+  /// issues at phase 0, so an op landing at cycle `r` lands at phase `r % ii`.
+  /// Null unless a schedule-paced controller runs this region at II > 1.
+  Value phase;
   /// One register per `RegionBlock::addrStrides` entry, holding that multiple
   /// of `counter`. Emitted beside the counter and updated by the same
   /// expression, so the two cannot fall out of step.
@@ -394,8 +399,10 @@ struct DatapathEmitter {
   void createInternalMemories();
   /// Wire a region's controller output into the datapath, the G->F seam. The
   /// counter answers Source::Counter; the issue pulse times a fused
-  /// accumulator's init injection. Both are absent for an acyclic region
-  /// (no counter), and `wantIssue` for a region with no stall shell.
+  /// accumulator's init injection; the phase paces a folded value chain. Each
+  /// is absent where its controller publishes none, hence the field-by-field
+  /// copy: a counter for an acyclic region, `wantIssue` without a stall shell,
+  /// a phase outside a schedule-paced region at II > 1.
   void setControl(unsigned region, const RegionControl &rc) {
     RegionControl &slot = controlOf[region];
     if (rc.counter) {
@@ -408,6 +415,8 @@ struct DatapathEmitter {
       slot.wantIssue = rc.wantIssue;
     if (rc.running)
       slot.running = rc.running;
+    if (rc.phase)
+      slot.phase = rc.phase;
     if (!rc.scaledCounters.empty())
       slot.scaledCounters = rc.scaledCounters;
   }

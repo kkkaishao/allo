@@ -611,7 +611,8 @@ def test_loose_region_after_a_call_writes_boundary_output():
 
 
 # Two ADJACENT calls with no intervening loose op reify into ONE region; they
-# still serialize, and the boundary arg they both read is wired to two ports.
+# still serialize, and the boundary arg they read is wired to one port per
+# surviving access.
 def test_adjacent_calls_with_no_loose_op_between_them():
     @kernel
     def cc1(x: i32[8], p: i32[8], q: i32[8]):
@@ -635,10 +636,11 @@ def test_adjacent_calls_with_no_loose_op_between_them():
         cc2(p, q, out)
 
     rtl = _to_rtl(cc_top)
-    # The two-port claim, stated: cc1 reads x twice per iteration, so the
-    # boundary argument is wired to a read group per access rather than muxed.
+    # One read group per surviving ACCESS: cc1's two source-level reads of x[i]
+    # are the same subscript, so load CSE leaves one. What a group per distinct
+    # access buys is tested in test_ports.py.
     rd = [p.base for acc in rtl.interfaces["cc_top"].reads for p in acc]
-    assert rd == ["x_rd0", "x_rd1"]
+    assert rd == ["x_rd0"]
 
     x = np.arange(8, dtype=np.int32) + 1
     out = np.zeros(8, dtype=np.int32)
