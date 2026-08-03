@@ -32,6 +32,11 @@
 #include "mlir/IR/Builders.h"
 #include "mlir/Pass/Pass.h"
 
+namespace mlir::allo {
+#define GEN_PASS_DEF_LOWERHLMEMPASS
+#include "allo/Conversion/Passes.h.inc"
+} // namespace mlir::allo
+
 using namespace mlir;
 using namespace mlir::allo;
 using namespace circt;
@@ -131,18 +136,7 @@ void lowerMemory(seq::HLMemOp mem) {
   mem.erase();
 }
 
-struct LowerHLMemPass
-    : public PassWrapper<LowerHLMemPass, OperationPass<hw::HWModuleOp>> {
-  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(LowerHLMemPass)
-  StringRef getArgument() const final { return "allo-lower-hlmem"; }
-  StringRef getDescription() const final {
-    return "Lower seq.hlmem and its ports onto an sv.reg array";
-  }
-
-  void getDependentDialects(DialectRegistry &registry) const override {
-    registry.insert<hw::HWDialect, sv::SVDialect, seq::SeqDialect>();
-  }
-
+struct LowerHLMemPass : public allo::impl::LowerHLMemPassBase<LowerHLMemPass> {
   void runOnOperation() override {
     SmallVector<seq::HLMemOp> mems;
     getOperation().walk([&](seq::HLMemOp mem) { mems.push_back(mem); });
@@ -152,7 +146,3 @@ struct LowerHLMemPass
 };
 
 } // namespace
-
-std::unique_ptr<Pass> mlir::allo::createLowerHLMemPass() {
-  return std::make_unique<LowerHLMemPass>();
-}

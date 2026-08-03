@@ -13,6 +13,20 @@ def ConvertAlloToFuncPass : Pass<"convert-allo-to-func"> {
   let description = [{Convert allo dialect to func dialect}];
 }
 
+def LowerHLMemPass : Pass<"allo-lower-hlmem", "circt::hw::HWModuleOp"> {
+  let summary = "Lower seq.hlmem and its ports onto an sv.reg array";
+  let description = [{
+    Replaces CIRCT's `lower-seq-hlmem`, which materializes every write of a
+    memory inside one `always_ff` and so cannot describe a port per `always`
+    block, the only shape a true-dual-port block RAM infers from. Also gives the
+    array its power-on contents, which the memory carries and the lowering would
+    otherwise erase.
+  }];
+  let dependentDialects = [
+    "circt::hw::HWDialect", "circt::sv::SVDialect", "circt::seq::SeqDialect"
+  ];
+}
+
 def LowerDataflowPass : Pass<"lower-dataflow", "ModuleOp"> {
   let summary = "Lower local scalar streams to the host dataflow simulator ABI";
   let description = [{

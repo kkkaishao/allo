@@ -17,11 +17,6 @@ namespace mlir::allo {
 void populateLowerToLLVMPipeline(OpPassManager &pm, bool enableTensor);
 void registerAlloLLVMLoweringPipeline();
 
-/// Lower every `seq.hlmem` in one `hw.module`, and the read and write ports
-/// referring to it, onto an `sv.reg` array carrying its power-on contents.
-/// Replaces CIRCT's `lower-seq-hlmem`; the pass says why this tree owns it.
-std::unique_ptr<Pass> createLowerHLMemPass();
-
 constexpr llvm::StringLiteral kAlloDataflowPEAttrName = "allo.dataflow.pe";
 
 } // namespace mlir::allo
