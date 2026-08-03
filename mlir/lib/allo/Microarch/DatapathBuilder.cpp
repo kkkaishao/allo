@@ -25,6 +25,7 @@
 
 #include <algorithm>
 #include <deque>
+#include <numeric>
 
 using namespace mlir;
 using namespace mlir::allo;
@@ -1019,8 +1020,6 @@ void DatapathBuilder::deriveInterconnect() {
 
 void DatapathBuilder::allocateInputSlots() {
   for (FuncUnit &u : dp.units) {
-    if (u.boundOps.empty())
-      continue; // merged-away (dead) unit: dropped from its region
     unsigned n = u.repOp()->getNumOperands();
     u.inputs.assign(n, Source{});
     u.inputInits.assign(n,
@@ -1101,8 +1100,6 @@ void DatapathBuilder::recordEdge(Resolved r, Source &slot, unsigned regionIdx) {
 
 void DatapathBuilder::resolveUnitInputs() {
   for (FuncUnit &u : dp.units) {
-    if (u.boundOps.empty())
-      continue;
     Operation *op0 = u.repOp();
     unsigned ridx = regionIdxOf.lookup(op0->getParentOp());
     unsigned ii = dp.regions[ridx].ii.value_or(1);
@@ -1463,31 +1460,61 @@ void DatapathBuilder::insertRegisters() {
   }
 }
 
-void DatapathBuilder::applyBinding(ArrayRef<SmallVector<UnitId, 2>> groups) {
-  for (const SmallVector<UnitId, 2> &group : groups) {
-    UnitId into = group.front();
-    FuncUnit &su = dp.units[into];
-    for (UnitId uid : ArrayRef<UnitId>(group).drop_front()) {
-      for (const std::pair<Operation *, unsigned> &bo :
-           dp.units[uid].boundOps) {
-        su.boundOps.push_back(bo);
-        dp.opToUnit[bo.first] = into;
-        producerOf[bo.first->getResult(0)] =
-            Source{Source::Kind::Unit, into, 0};
-      }
-      dp.units[uid].boundOps.clear(); // dead: dropped from its region below
+void DatapathBuilder::allocateUnits(ArrayRef<SmallVector<UnitId, 2>> groups) {
+  if (groups.empty())
+    return; // the trivial allocation, which the walk already built
+
+  // Where each unit folds: itself, unless the policy named it in a group.
+  SmallVector<UnitId> leader(dp.units.size());
+  std::iota(leader.begin(), leader.end(), 0);
+  for (const SmallVector<UnitId, 2> &group : groups)
+    for (UnitId uid : group) {
+      assert(leader[uid] == uid &&
+             "a policy named one unit in two groups; the second fold would "
+             "silently win and its ops would issue on a unit nothing checked "
+             "them against");
+      leader[uid] = group.front();
     }
+
+  // Rebuild rather than empty the folded-away entries. A `FuncUnit` with no
+  // bound op has no `repOp()`, and leaving one in the table makes that a
+  // hazard every consumer has to remember to skip; keeping the table dense
+  // makes it an invariant instead.
+  SmallVector<UnitId> remap(dp.units.size(), 0);
+  std::vector<FuncUnit> allocated;
+  for (UnitId old = 0, e = dp.units.size(); old < e; ++old) {
+    if (leader[old] != old)
+      continue;
+    remap[old] = allocated.size();
+    allocated.push_back(std::move(dp.units[old]));
+    allocated.back().id = remap[old];
   }
-  // Drop the merged-away (empty) units from each region's membership: both
-  // shape derivation and emission iterate region.units, so a dead unit is
-  // simply never visited.
+  // The leader keeps `boundOps.front()`, so `repOp()` and every name derived
+  // from it are the ones the trivial allocation would have produced.
+  for (UnitId old = 0, e = dp.units.size(); old < e; ++old)
+    if (leader[old] != old)
+      for (const std::pair<Operation *, unsigned> &bo : dp.units[old].boundOps)
+        allocated[remap[leader[old]]].boundOps.push_back(bo);
+  dp.units = std::move(allocated);
+
+  // Region membership: the folded-away ids are gone, the survivors renumbered.
   for (RegionBlock &rb : dp.regions) {
-    SmallVector<UnitId> kept;
+    SmallVector<UnitId, 4> kept;
     for (UnitId uid : rb.units)
-      if (!dp.units[uid].boundOps.empty())
-        kept.push_back(uid);
-    rb.units.assign(kept.begin(), kept.end());
+      if (leader[uid] == uid)
+        kept.push_back(remap[uid]);
+    rb.units = std::move(kept);
   }
+  // The two provenance maps, rewritten FROM the table rather than alongside
+  // it, so a Source's bound-op index cannot drift from the slot it names. This
+  // is the whole of what holds a UnitId at this phase: no `record*` pass has
+  // run, so `bindCompute`'s own entries are the only Sources naming a unit.
+  for (const FuncUnit &u : dp.units)
+    for (auto [slot, bo] : llvm::enumerate(u.boundOps)) {
+      dp.opToUnit[bo.first] = u.id;
+      producerOf[bo.first->getResult(0)] =
+          Source{Source::Kind::Unit, u.id, static_cast<unsigned>(slot)};
+    }
 }
 
 // Composition predecessors of each top-level region (`rb.predecessors`): the
@@ -1662,6 +1689,17 @@ void DatapathBuilder::build() {
     dp.regions.push_back(std::move(rb));
   }
 
+  // The allocation, settled here and not later: every pass below resolves
+  // Values to Sources, and a Source names a unit by index, so folding two
+  // units after one of them has been resolved would leave that Source naming
+  // a unit with no ops. `producerOf` and `opToUnit` are the only UnitId
+  // holders at this point (see the phase order in the header).
+  allocateUnits(policy.plan(dp)); // trivial => one unit per op, a no-op here
+  assert(llvm::all_of(dp.units,
+                      [](const FuncUnit &u) { return !u.boundOps.empty(); }) &&
+         "the unit table is the allocation: a unit exists because ops are "
+         "bound to it");
+
   deriveShapes();           // controller discriminant (needs every child)
   enumerateBoundaryPorts(); // module boundary ports (needs every access)
   deriveCounterTypes();     // counter width (each loop's own range)
@@ -1674,7 +1712,6 @@ void DatapathBuilder::build() {
   reclassifyRoms();               // read-only is a property of the USE
   recordRegionBounds(regionOps);  // induction bounds, at that width
   recordResults();                // scalar func-result output ports
-  applyBinding(policy.plan(dp));  // trivial => no groups, no muxes
   deriveInterconnect();
   planAddressGenerators(); // address strength reduction (needs resolved terms)
   recordSiblingDeps(regionOps); // top-level composition DAG (concurrency gates)

@@ -66,8 +66,16 @@ using CallId = unsigned;
 //===----------------------------------------------------------------------===//
 // A resolved driver of one input port. Exactly one Source feeds each input, so
 // muxes (when sharing forces a choice) appear as their own cells whose output
-// is the Source. `outPort` is overloaded per kind:
-//   Unit    -> result index (single-result units use 0)
+// is the Source.
+//
+// A Source names a WIRE. For every cell but a shared unit that is the same
+// thing as naming a value, because the cell drives one. A shared unit's output
+// carries a different bound op's result in each of its issue cycles, so a
+// consumer asking WHEN its value is ready has to say which one it means:
+// `outPort` is that index, and `producingOp` is the one place it is read.
+// `outPort` is overloaded per kind:
+//   Unit    -> which bound op's result this is (index into `boundOps`; 0 under
+//              the trivial allocation, where a unit has exactly one)
 //   Reg     -> tap level to read (0 = chain head, i.e. the newest sample)
 //   Mem     -> index of the read access whose loaded data this is
 //   Mux      -> 0
@@ -126,7 +134,10 @@ struct FuncUnit {
   Type resultType; // value-typed (e.g. f32), not bit-blasted
 
   // Ops bound here, each with its issue cycle (residue mod II in a cyclic
-  // region). Sharing puts several non-conflicting ops in this list.
+  // region). Sharing puts several non-conflicting ops in this list. NEVER
+  // empty: the unit table IS the allocation, so a unit exists because ops are
+  // bound to it, and `allocateUnits` rebuilds the table rather than emptying
+  // the entries it folds away.
   llvm::SmallVector<std::pair<Operation *, unsigned>, 1> boundOps;
 
   /// The representative bound op: the one whose operand types, arity and

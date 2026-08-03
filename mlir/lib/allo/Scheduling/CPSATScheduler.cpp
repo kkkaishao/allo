@@ -778,7 +778,7 @@ LogicalResult noExactScheduler(Operation *containingOp, StringRef which) {
 LogicalResult mlir::allo::scheduleCPSAT(ChainingSharedOperatorsProblem &prob,
                                         Operation *lastOp, float cycleTime,
                                         const SpanObjective &span,
-                                        bool exactChaining) {
+                                        const SchedulerOptions &opts) {
   return noExactScheduler(prob.getContainingOp(), "acyclic");
 }
 
@@ -786,7 +786,7 @@ LogicalResult mlir::allo::scheduleCPSAT(ChainingModuloProblem &prob,
                                         Operation *lastOp, float cycleTime,
                                         unsigned minII,
                                         const SpanObjective &span,
-                                        bool exactChaining) {
+                                        const SchedulerOptions &opts) {
   return noExactScheduler(prob.getContainingOp(), "cyclic");
 }
 

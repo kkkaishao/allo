@@ -63,7 +63,7 @@ declareOperatorModules(dcp::DCPathModuleOp func, const uarch::Datapath &dp,
   DenseMap<unsigned, Operation *> unitModule;
   llvm::StringSet<> listed; // one manifest entry per module, not per unit
   for (const uarch::FuncUnit &u : dp.units) {
-    if (u.comb || u.boundOps.empty())
+    if (u.comb)
       continue;
     Operation *srcOp = u.repOp();
     assert(u.inputs.size() == srcOp->getNumOperands() &&

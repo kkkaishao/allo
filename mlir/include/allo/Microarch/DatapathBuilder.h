@@ -196,12 +196,15 @@ struct DatapathBuilder {
   /// remaining operand is a scalar.
   void recordResults();
 
-  /// Apply the policy's sharing decision: fold each group's units onto its
-  /// first (moving their bound ops + rebinding `opToUnit`/`producerOf`), then
-  /// drop the emptied units from their region. Runs after the trivial
-  /// allocation and before interconnect derivation, which then grows the
-  /// sharing muxes.
-  void applyBinding(llvm::ArrayRef<llvm::SmallVector<UnitId, 2>> groups);
+  /// Settle the allocation: fold each group named by \p groups onto one unit
+  /// and REBUILD the table densely, so a unit with no bound op never exists.
+  ///
+  /// Runs immediately after the region walk, which is the last point at which
+  /// a `UnitId` is held only by `producerOf` and `dp.opToUnit`, both rewritten
+  /// here. Every pass below resolves Values to Sources against the table, so a
+  /// decision taken after any of them would leave those Sources naming a unit
+  /// that no longer has ops (see the class comment on the phase order).
+  void allocateUnits(llvm::ArrayRef<llvm::SmallVector<UnitId, 2>> groups);
 
   // Value resolution ---------------------------------------------
   /// The ONE Value -> Source resolution: the channel through which \p v can be

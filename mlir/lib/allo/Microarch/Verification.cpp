@@ -212,7 +212,7 @@ LogicalResult checkEmitterSubset(dcp::DCPathModuleOp func, const Datapath &dp) {
     case Source::Kind::Scope:
       return true;
     case Source::Kind::Unit:
-      return sequential || dcpStart(dp.units[s.id].repOp()) == 0;
+      return sequential || dcpStart(dp.producingOp(s)) == 0;
     default:
       return false; // a memory / IP / raw driver
     }

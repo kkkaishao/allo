@@ -65,7 +65,7 @@ unsigned hwWidth(Type t) {
 Operation *Datapath::producingOp(const Source &s) const {
   switch (s.kind) {
   case Source::Kind::Unit:
-    return units[s.id].repOp();
+    return units[s.id].boundOps[s.outPort].first;
   case Source::Kind::Mem: // outPort = the read access index
     return mems[s.id].accesses[s.outPort].op;
   case Source::Kind::Stream: // outPort = the get access index
@@ -160,9 +160,6 @@ void forEachSource(
   };
 
   for (const FuncUnit &u : dp.units) {
-    // A merged-away unit was dropped from its region and drives nothing.
-    if (u.boundOps.empty())
-      continue;
     for (auto [k, s] : llvm::enumerate(u.inputs))
       visit(s, Slot::UnitInput, k, u.repOp(), /*required=*/true);
     for (auto [k, s] : llvm::enumerate(u.inputInits))
@@ -238,7 +235,7 @@ static void printSource(const Source &s, raw_ostream &os) {
     os << "-";
     break;
   case Source::Kind::Unit:
-    os << "u" << s.id;
+    os << "u" << s.id << "#" << s.outPort;
     break;
   case Source::Kind::Reg:
     os << "r" << s.id << "@" << s.outPort;
