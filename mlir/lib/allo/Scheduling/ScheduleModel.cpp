@@ -51,8 +51,8 @@ std::string opKind(Operation *op, const llvm::StringMap<StringRef> &kinds) {
 } // namespace
 
 void mlir::allo::ScheduleModel::record(ModuleOp module) {
-  // A `dcp.operator`'s symbol IS the RTL module name that realizes it, so the
-  // impl below needs only the kind table plus the symbol itself.
+  // A `dcp.operator`'s symbol names the realization, so the impl below needs
+  // only the kind table plus the symbol itself.
   llvm::StringMap<StringRef> kinds;
   for (DCPathOperatorOp op : module.getOps<DCPathOperatorOp>())
     kinds[op.getSymName()] = op.getKind();
@@ -199,6 +199,10 @@ std::string mlir::allo::ScheduleModel::toJSON() const {
                  {"ms", s.millis}};
     if (s.ii)
       entry["ii"] = *s.ii;
+    if (s.allocatedOps) {
+      entry["allocated_ops"] = s.allocatedOps;
+      entry["allocated_units"] = s.allocatedUnits;
+    }
     solveEntries.push_back(std::move(entry));
   }
 

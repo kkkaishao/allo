@@ -159,22 +159,23 @@ Value DatapathEmitter::resolveSource(const uarch::Source &s) {
     // A scalar kernel argument, exposed as its own module input port.
     return pa.getInput(scalarPortName(dp, dp.ios[s.id]));
   case uarch::Source::Kind::Mux: {
-    // A shared unit's input: drive each source on the cycle its op consumes
-    // it, via a priority chain (mutually exclusive, MRT-verified selects)
-    // with source 0 as default; the select is the op's `activationPulse`.
+    // A shared unit's input: the bound ops hold disjoint MRT residues, so the
+    // `activationPulse` selects are one-hot and an AND-OR reduction serves.
+    // With no op issuing the result is zero, which no consumer samples.
     if (Value v = muxVal.lookup(s.id))
       return v;
     const uarch::Mux &mx = dp.muxes[s.id];
     Value issue = controlOf.lookup(mx.region).issue;
     assert(issue && "mux in a region with no controller");
-    Value v = resolveSource(mx.sources[0]);
     // Timed against the OWNING region's shell (`mx.region`), not whichever
     // region is emitting: the select rides that region's issue pulse.
     StallShell sh = shellFor(mx.region);
-    for (unsigned i = 1; i < mx.sources.size(); ++i) {
-      Value sel = c.activationPulse(issue, mx.selectOps[i], sh);
-      v = c.mux(sel, resolveSource(mx.sources[i]), v);
+    SmallVector<Value> values, selects;
+    for (auto [src, op] : llvm::zip(mx.sources, mx.selectOps)) {
+      values.push_back(resolveSource(src));
+      selects.push_back(c.activationPulse(issue, op, sh));
     }
+    Value v = c.oneHotSelect(values, selects);
     muxVal[s.id] = v;
     return v;
   }
@@ -661,7 +662,7 @@ void DatapathEmitter::emitExternalReadAddrs(const uarch::RegionBlock &rb) {
 // topological order.
 void DatapathEmitter::declareUnits(const uarch::RegionBlock &rb) {
   for (uarch::UnitId uid : rb.units) {
-    auto b = c.bb.get(hwType(dp.units[uid].resultType, c.b));
+    auto b = c.bb.get(hwType(dp.units[uid].identity.resultType, c.b));
     unitBE[uid] = b;
     unitVal[uid] = b;
   }
@@ -687,7 +688,7 @@ void DatapathEmitter::emitUnits(const uarch::RegionBlock &rb, UnitMode mode) {
       // A guard predicate is a start-0 compute the children gate on, so the IP
       // path is unreachable for it; a while's condition cone may take cycles
       // (`t_cond`), and its mode says so.
-      assert((u.comb || mode == UnitMode::Condition) &&
+      assert((u.identity.comb || mode == UnitMode::Condition) &&
              "a container predicate must be a native (comb) unit");
     }
     SmallVector<Value> operands;
@@ -737,9 +738,9 @@ void DatapathEmitter::emitUnits(const uarch::RegionBlock &rb, UnitMode mode) {
     }
 
     Value result;
-    if (u.comb) {
-      result = emitCompute(c.b, c.loc, u.opType, operands,
-                           hwType(u.resultType, c.b), u.repOp());
+    if (u.identity.comb) {
+      result = emitCompute(c.b, c.loc, u.identity.realization, operands,
+                           hwType(u.identity.resultType, c.b), u.repOp());
     } else {
       // An IP instance takes its data operands, then clock, then (for a
       // clock-enabled contract) a `ce` bit that rides the region's

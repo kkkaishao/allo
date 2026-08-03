@@ -260,6 +260,29 @@ Value EmitContext::mux(Value sel, Value t, Value f) {
   return R(comb::MuxOp::create(b, loc, sel, t, f));
 }
 
+Value EmitContext::oneHotSelect(ArrayRef<Value> values,
+                                ArrayRef<Value> selects) {
+  assert(values.size() == selects.size() && !values.empty() &&
+         "one select per value, and a select over nothing is not a value");
+  if (values.size() == 1)
+    return values.front();
+  auto type = cast<IntegerType>(values.front().getType());
+  SmallVector<Value> terms;
+  terms.reserve(values.size());
+  for (auto [value, sel] : llvm::zip(values, selects)) {
+    assert(value.getType() == type &&
+           "one select drives one port, so every source is that port's width");
+    // A 1-bit port needs no replication, and `comb.replicate` by 1 is illegal.
+    Value mask = type.getWidth() == 1
+                     ? sel
+                     : R(comb::ReplicateOp::create(b, loc, sel,
+                                                   (int32_t)type.getWidth()));
+    terms.push_back(R(comb::AndOp::create(b, loc, value, mask, false)));
+  }
+  // One variadic OR, so the synthesizer balances the reduction tree.
+  return R(comb::OrOp::create(b, loc, type, terms, false));
+}
+
 ShiftChain EmitContext::shiftChain(Value in, unsigned depth,
                                    const StallShell &sh) {
   ShiftChain chain;

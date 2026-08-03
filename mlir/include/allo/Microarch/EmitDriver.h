@@ -30,8 +30,11 @@ namespace mlir::allo::uarch {
 /// policy. On success \p interfaces maps each emitted module's symbol name to
 /// its port-interface JSON (the cosim manifest), so a caller gets the boundary
 /// directly without reading any IR attribute.
+/// \p cycleTime is the resolved target period in ns, as the scheduler took it:
+/// sharing a unit grows a multiplexer the schedule was cut without, and
+/// `validateDatapath` holds the result to the same clock.
 LogicalResult emitDatapathToHW(ModuleOp module, StringRef binding,
-                               StringRef top,
+                               StringRef top, float cycleTime,
                                llvm::StringMap<std::string> &interfaces);
 
 } // namespace mlir::allo::uarch

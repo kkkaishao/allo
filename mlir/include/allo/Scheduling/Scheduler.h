@@ -12,6 +12,7 @@
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/Operation.h"
 #include "mlir/Support/LogicalResult.h"
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/StringRef.h"
 
 #include <optional>
@@ -60,6 +61,84 @@ public:
   /// actually decides.
   bool holdsLimitedUnit(Operation *op);
 
+  /// Whether \p op holds a unit of \p rsrc.
+  bool usesResource(Operation *op, ResourceType rsrc) {
+    auto linked = getLinkedResourceTypes(op);
+    return linked && llvm::is_contained(*linked, rsrc);
+  }
+
+  /// The operations holding a unit of \p rsrc, earliest start first, so a
+  /// derived assignment is a function of the schedule rather than of walk
+  /// order. Every operation must be scheduled.
+  SmallVector<Operation *> usersOf(ResourceType rsrc);
+
+  //===--------------------------------------------------------------------===//
+  // Allocatable resources: how many units to build, as opposed to how many
+  // exist. A `limit` is a device fact (a RAM has two ports); an allocation is
+  // a decision only the exact solver makes. An allocatable resource carries no
+  // limit, so `holdsLimitedUnit` stays false for its operations and no
+  // reservation table of the heuristic ever sees it.
+  //===--------------------------------------------------------------------===//
+
+  /// What one allocatable resource may cost and how many of it may exist.
+  struct AllocatableUnit {
+    /// The trivial allocation: one unit per operation linked to the resource.
+    /// Always feasible, so declaring a resource never makes a problem
+    /// infeasible.
+    unsigned ceiling = 0;
+    /// What one instance costs, in flip-flops, the unit the objective's
+    /// register tie-break counts in.
+    unsigned cost = 0;
+  };
+
+  void setAllocatable(ResourceType rsrc, AllocatableUnit unit) {
+    allocatable[rsrc] = unit;
+  }
+  std::optional<AllocatableUnit> getAllocatable(ResourceType rsrc) {
+    return allocatable.lookup(rsrc);
+  }
+
+  /// How many units a solve decided to build. Absent until one does, leaving
+  /// the trivial allocation in force.
+  void setAllocation(ResourceType rsrc, unsigned units) {
+    allocation[rsrc] = units;
+  }
+  std::optional<unsigned> getAllocation(ResourceType rsrc) {
+    return allocation.lookup(rsrc);
+  }
+
+  /// Which instance of its allocatable operator \p op runs on: an index below
+  /// `getAllocation` of that operator's resource. Absent until `assignUnits`
+  /// derives it, and for every operation on nothing allocatable.
+  std::optional<unsigned> getAssignedUnit(Operation *op) {
+    return assignedUnit.lookup(op);
+  }
+
+  /// Turn every decided count into an assignment of operations to instances,
+  /// spread round-robin over all the instances the decision bought rather than
+  /// packed into the fewest that would fit.
+  ///
+  /// Derived rather than solved, and valid at the occupancies an allocation is
+  /// offered for: cyclic (\p ii > 0) occupancy is one cycle, so handing out
+  /// 0, 1, 2, ... within each congruence class fits the count the model bounded
+  /// that class by; acyclic (\p ii == 0) windows form an interval graph, where
+  /// left-edge uses exactly as many instances as the busiest cycle needs.
+  void assignUnits(unsigned ii);
+
+  /// Whether \p op contends for a resource whose count is being decided.
+  bool holdsAllocatableUnit(Operation *op);
+
+  /// Whether \p op contends for anything at all: a capped unit, an allocated
+  /// one, or both. This is what needs a congruence class in a modulo model.
+  bool contendsForUnit(Operation *op) {
+    return holdsLimitedUnit(op) || holdsAllocatableUnit(op);
+  }
+
+  /// No two operations assigned to one instance contend for it in the same
+  /// cycle, and no instance index exceeds the count decided. Vacuous where no
+  /// solve set an allocation.
+  LogicalResult verifyAllocation(unsigned ii);
+
   /// No limited resource is oversubscribed in any cycle, counting each
   /// operation's whole occupancy window. \p ii == 0 checks an acyclic
   /// schedule; a non-zero \p ii checks the windows modulo the initiation
@@ -70,6 +149,9 @@ public:
 
 private:
   OperationProperty<unsigned> resourceCycles;
+  ResourceTypeProperty<AllocatableUnit> allocatable;
+  ResourceTypeProperty<unsigned> allocation;
+  OperationProperty<unsigned> assignedUnit;
 };
 
 /// The cyclic twin: CIRCT's `ModuloProblem` with occupancy windows, i.e.
@@ -310,6 +392,12 @@ inline constexpr double kDefaultSolveBudget = 30.0;
 struct SchedulerOptions {
   SchedulerKind kind = SchedulerKind::Heuristic;
   double budget = kDefaultSolveBudget;
+  /// Whether to decide how many copies of each operator a region builds
+  /// (`populateOperatorAllocation`) rather than leave every operation its own.
+  /// Only meaningful alongside a binding that folds them: with the trivial
+  /// binding the emitter builds one unit per operation anyway. The heuristic
+  /// ignores it, since it decides no allocations.
+  bool allocate = false;
 };
 
 /// \p name ("heuristic" / "exact" / "exact-chaining") as a kind, or nullopt

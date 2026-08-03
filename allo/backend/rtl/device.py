@@ -190,7 +190,10 @@ _STALL_STYLE_TO_ENUM = {"ce": 0, "free": 1, "elastic": 2}
 def inject_operators(module, operators: Sequence[IP]):
     """Inject each device operator as a module-level ``dcp.operator`` symbol the
     scheduler and reifier match concrete ``arith.*``/``math.*`` ops onto. The
-    ``sym_name`` IS the RTL module name the emitter instantiates."""
+    ``sym_name`` is the stem of the RTL module name the emitter instantiates:
+    one declaration can cover several distinct pieces of hardware, so the
+    emitter appends whatever else distinguishes them (a float compare's
+    predicate: ``fcmp_l1`` -> ``fcmp_l1_ogt``)."""
     if not operators:
         return
     from ..._mlir.ir import (

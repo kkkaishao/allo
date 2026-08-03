@@ -65,7 +65,11 @@ class RTL(Backend[P, R]):
             freq_mhz: target frequency, overriding the device default. Drives
                 both the SDC cycle time and the cosim clock.
             simulator: the engine cocotb drives for ``cosim``.
-            binding: operator-sharing policy.
+            binding: operator-sharing policy. ``"trivial"`` gives every
+                operation its own unit; ``"greedy-share"`` folds every
+                compatible pair the clock allows; ``"planned"`` builds the
+                allocation the scheduler decided, which only an exact scheduler
+                makes, so under the heuristic it is the trivial binding.
             accumulators: rotate float reductions across this many accumulators,
                 dropping their II to ``ceil(latency / accumulators)`` (0 = off).
             float_reassoc: rebalance float reduction chains into logarithmic
@@ -103,6 +107,9 @@ class RTL(Backend[P, R]):
             "scalarize_threshold": scalarize_threshold,
             "scheduler": scheduler,
             "budget": budget,
+            # An allocation is only worth deciding where the emitter builds it:
+            # the trivial binding keeps one unit per operation.
+            "allocate": binding != "trivial",
         }
         self.arg_types = kernel.parse_argument_annotations()
         self.res_types = kernel.parse_return_annotation()
@@ -177,7 +184,9 @@ class RTL(Backend[P, R]):
                 lambda d: bool(diagnostics.append(d.message)) or True
             )
             try:
-                manifests = emit_datapath_to_hw(work, self.binding, self.top)
+                manifests = emit_datapath_to_hw(
+                    work, self.binding, self.top, self._cycle_time
+                )
             finally:
                 handler.detach()
             if manifests is None:

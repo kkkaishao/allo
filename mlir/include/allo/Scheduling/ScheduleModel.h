@@ -24,6 +24,9 @@ struct OpSchedule {
   /// Sub-cycle start (ns within the cycle), from a chaining solve. Empty when
   /// the region was solved without one.
   std::optional<float> startInCycle;
+  /// Which allocated instance runs it: an index into
+  /// `ScheduleModel::allocatedUnits`. Empty unless an exact solve allocated.
+  std::optional<unsigned> unit;
 };
 
 /// The solved schedule of ONE region: what the solver DECIDED, and nothing the
@@ -64,8 +67,9 @@ struct ScheduledOpReport {
   std::string kind;
   /// Start cycle, relative to the region's own start.
   int64_t start = 0;
-  /// The RTL module name of the IP instance that realizes it, empty for a
-  /// combinational or memory op, which no IP realizes.
+  /// The `dcp.operator` symbol realizing it, empty for a combinational or
+  /// memory op, which no IP realizes. The emitted module name derives from it
+  /// (`operatorModuleName`).
   std::string impl;
   /// Sub-cycle start (ns within the cycle), from a chaining solve.
   std::optional<float> z;
@@ -113,6 +117,10 @@ struct SolveReport {
   /// Problem size: operations registered, and how many of those hold at least
   /// one limited unit.
   int64_t ops = 0, limitedOps = 0;
+  /// What the solve allocated: operations whose operator count it decided, and
+  /// the instances it decided to build for them. Both zero where nothing was
+  /// allocatable, and always zero for a heuristic solve.
+  int64_t allocatedOps = 0, allocatedUnits = 0;
   /// The initiation interval settled, absent for an acyclic span.
   std::optional<int64_t> ii;
   /// Wall time of the whole solve in milliseconds.
@@ -161,6 +169,35 @@ public:
     assert(it != ops.end() && "a sub-cycle start belongs to a scheduled op");
     it->second.startInCycle = z;
   }
+
+  /// One functional-unit instance an allocation decided to build. The reify
+  /// declares a `dcp.unit` per entry and points the operations that run on it
+  /// at that symbol.
+  struct AllocatedUnit {
+    std::string name;   // the `dcp.unit` symbol, unique across the module
+    std::string opType; // the `dcp.operator` it realizes
+  };
+
+  /// Declare \p count instances of \p opType and return the index of the first.
+  /// Names are minted here, the one object spanning a whole module's
+  /// scheduling, so a `dcp.unit` symbol is unique across it.
+  unsigned addUnits(llvm::StringRef opType, unsigned count) {
+    unsigned base = units.size();
+    for (unsigned k = 0; k < count; ++k)
+      units.push_back(
+          {(opType + "_u" + llvm::Twine(units.size())).str(), opType.str()});
+    return base;
+  }
+
+  /// Record that \p op runs on `allocatedUnits()[index]`.
+  void setUnit(Operation *op, unsigned index) {
+    auto it = ops.find(op);
+    assert(it != ops.end() && "an instance belongs to a scheduled op");
+    it->second.unit = index;
+  }
+
+  /// Every instance the allocation decided to build, module-wide.
+  llvm::ArrayRef<AllocatedUnit> allocatedUnits() const { return units; }
 
   /// \p op's place in its region's schedule, or null when it has none: a
   /// declaration, a terminator, a region anchor, an op no phase scheduled.
@@ -235,6 +272,7 @@ public:
 
 private:
   llvm::DenseMap<Operation *, OpSchedule> ops;
+  std::vector<AllocatedUnit> units;
   llvm::DenseMap<Operation *, RegionSolution> regions;
   llvm::DenseMap<Operation *, int64_t> tripBounds;
 };

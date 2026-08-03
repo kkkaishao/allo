@@ -34,10 +34,13 @@ alloEmitVerilog(MlirModule module, MlirStringCallback callback, void *userData);
 /// and streams back through `callback` a single JSON object mapping each
 /// emitted module's name to its port-interface JSON (the cosim manifest, with
 /// concrete field names). `binding` names the resource-binding policy. Returns
-/// failure (callback not invoked) if emission fails.
+/// failure (callback not invoked) if emission fails. `cycleTime` is the
+/// resolved target period in ns, the one the scheduler cut against; a binding
+/// decision can lengthen a combinational path, so the emitter is held to it
+/// too.
 MLIR_CAPI_EXPORTED MlirLogicalResult alloEmitDatapathToHW(
     MlirModule module, MlirStringRef binding, MlirStringRef top,
-    MlirStringCallback callback, void *userData);
+    double cycleTime, MlirStringCallback callback, void *userData);
 
 MLIR_CAPI_EXPORTED MlirLogicalResult
 alloEmitSplitVerilog(MlirModule module, MlirStringRef directory);
@@ -49,12 +52,13 @@ alloEmitSplitVerilog(MlirModule module, MlirStringRef directory);
 /// resource half of every scheduling problem: "heuristic" (the SDC simplex plus
 /// greedy placement), "exact" (CP-SAT, only in a build with OR-Tools) or
 /// "exact-chaining". `budget` is what one exact solve may spend, in
-/// deterministic time units; zero or less takes the default. Returns failure
-/// (callback not invoked) if any phase fails.
+/// deterministic time units; zero or less takes the default. `allocate` lets an
+/// exact solve decide how many copies of each operator a region builds. Returns
+/// failure (callback not invoked) if any phase fails.
 MLIR_CAPI_EXPORTED MlirLogicalResult alloRunSDCSchedulingPipeline(
     MlirModule module, MlirStringRef top, float cycleTime,
-    MlirStringRef scheduler, double budget, MlirStringCallback callback,
-    void *userData);
+    MlirStringRef scheduler, double budget, bool allocate,
+    MlirStringCallback callback, void *userData);
 
 /// Whether this build accepts `scheduler = "exact"`, i.e. links OR-Tools. The
 /// option exists in both distributions, so this is what tells them apart.

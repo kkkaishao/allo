@@ -41,12 +41,13 @@ MlirLogicalResult alloEmitSplitVerilog(MlirModule module,
 }
 
 MlirLogicalResult alloEmitDatapathToHW(MlirModule module, MlirStringRef binding,
-                                       MlirStringRef top,
+                                       MlirStringRef top, double cycleTime,
                                        MlirStringCallback callback,
                                        void *userData) {
   llvm::StringMap<std::string> interfaces;
   if (failed(allo::uarch::emitDatapathToHW(unwrap(module), unwrap(binding),
-                                           unwrap(top), interfaces)))
+                                           unwrap(top), (float)cycleTime,
+                                           interfaces)))
     return mlirLogicalResultFailure();
   // Combine the per-module interface JSON into one object keyed by module name.
   // Each value is already valid JSON, so it is embedded verbatim; module names
@@ -70,8 +71,8 @@ MlirLogicalResult alloEmitDatapathToHW(MlirModule module, MlirStringRef binding,
 MlirLogicalResult
 alloRunSDCSchedulingPipeline(MlirModule module, MlirStringRef top,
                              float cycleTime, MlirStringRef scheduler,
-                             double budget, MlirStringCallback callback,
-                             void *userData) {
+                             double budget, bool allocate,
+                             MlirStringCallback callback, void *userData) {
   ModuleOp mod = unwrap(module);
   StringRef topName = unwrap(top);
   StringRef schedulerName = unwrap(scheduler);
@@ -89,8 +90,8 @@ alloRunSDCSchedulingPipeline(MlirModule module, MlirStringRef top,
   float cycleTimeNs = cycleTime > 0.0f ? cycleTime : 5.0f;
   // Same rule for what one exact solve may spend: the option, else the default,
   // resolved once so no second copy of it exists downstream.
-  allo::SchedulerOptions opts{*kind, budget > 0.0 ? budget
-                                                  : allo::kDefaultSolveBudget};
+  allo::SchedulerOptions opts{
+      *kind, budget > 0.0 ? budget : allo::kDefaultSolveBudget, allocate};
   if (failed(allo::runPreScheduleVerification(mod, topName, cycleTimeNs)))
     return mlirLogicalResultFailure();
   // The solved schedule travels between the two halves in memory rather than as

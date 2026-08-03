@@ -88,17 +88,18 @@ NB_MODULE(_allo, m) {
       nb::arg("module"));
   allo.def(
       "emit_datapath_to_hw",
-      [](MlirModule module, const std::string &binding,
-         const std::string &top) -> std::optional<std::string> {
+      [](MlirModule module, const std::string &binding, const std::string &top,
+         double cycle_time) -> std::optional<std::string> {
         std::string out;
         if (mlirLogicalResultIsFailure(alloEmitDatapathToHW(
                 module, mlirStringRefCreate(binding.data(), binding.size()),
-                mlirStringRefCreate(top.data(), top.size()), appendToString,
-                &out)))
+                mlirStringRefCreate(top.data(), top.size()), cycle_time,
+                appendToString, &out)))
           return std::nullopt;
         return out;
       },
       nb::arg("module"), nb::arg("binding"), nb::arg("top"),
+      nb::arg("cycle_time"),
       "Lower the functions reachable from `top` to hw.modules in place, rooted "
       "at `top`; return a JSON object mapping each emitted module name to its "
       "port-interface manifest.");
@@ -113,18 +114,19 @@ NB_MODULE(_allo, m) {
   allo.def(
       "run_sdc_scheduling",
       [](MlirModule module, const std::string &top, float cycleTime,
-         const std::string &scheduler,
-         double budget) -> std::optional<std::string> {
+         const std::string &scheduler, double budget,
+         bool allocate) -> std::optional<std::string> {
         std::string out;
         if (mlirLogicalResultIsFailure(alloRunSDCSchedulingPipeline(
                 module, mlirStringRefCreate(top.data(), top.size()), cycleTime,
                 mlirStringRefCreate(scheduler.data(), scheduler.size()), budget,
-                appendToString, &out)))
+                allocate, appendToString, &out)))
           return std::nullopt;
         return out;
       },
       nb::arg("module"), nb::arg("top"), nb::arg("cycle_time"),
       nb::arg("scheduler") = "heuristic", nb::arg("budget") = 0.0,
+      nb::arg("allocate") = false,
       "Schedule `top` and reify the schedule into `module` in place as "
       "`allo.dcp.*` ops; return the schedule report as JSON (regions, per-op "
       "start times, latencies), or None if scheduling fails. `budget` is what "

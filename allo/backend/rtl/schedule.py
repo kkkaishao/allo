@@ -50,7 +50,7 @@ class ScheduledOp:
 
     kind: str  # operator mnemonic (addi/mulf/load/store/...); an open set, so str
     t: int  # start cycle within the region
-    impl: str | None = None  # realization (IP module name / native keyword)
+    impl: str | None = None  # realization (device operator symbol / native)
     z: float | None = None  # SDC z-slack, when carried
 
     @classmethod
@@ -183,6 +183,11 @@ class SolveReport:
     limited_ops: int  # of those, holding at least one limited unit
     ms: float  # wall time of the solve
     ii: int | None = None  # what the solve decided; None for an acyclic span
+    #: operations whose operator count the solve decided, and the units it
+    #: decided to build for them. Both 0 unless the solve allocated, which only
+    #: an exact solve with ``allocate`` does.
+    allocated_ops: int = 0
+    allocated_units: int = 0
 
     @classmethod
     def from_json(cls, d: dict) -> SolveReport:
@@ -194,6 +199,8 @@ class SolveReport:
             limited_ops=d["limited_ops"],
             ms=d["ms"],
             ii=d.get("ii"),
+            allocated_ops=d.get("allocated_ops", 0),
+            allocated_units=d.get("allocated_units", 0),
         )
 
 
@@ -253,6 +260,7 @@ def run_schedule(
     scalarize_threshold=16,
     scheduler="heuristic",
     budget=None,
+    allocate=False,
 ) -> ScheduleResult:
     """Schedule ``top`` and return the :class:`ScheduleResult`; ``module`` is
     rewritten in place, left holding the ``allo.dcp.*`` ops the schedule reifies
@@ -283,6 +291,9 @@ def run_schedule(
             default. Raising it buys a better placement on the few regions large
             enough to exhaust it and costs nothing on the rest, which finish
             orders of magnitude under it.
+        allocate: decide how many copies of each operator a region builds,
+            rather than leaving every operation its own. Exact schedulers only,
+            and only useful under a sharing binding.
     """
     run_pipeline(module, RTL_PREPARE_PIPELINE)
     reassoc = (
@@ -311,7 +322,7 @@ def run_schedule(
     )
     try:
         result = run_sdc_scheduling(
-            module, top, cycle_time or 5.0, scheduler, budget or 0.0
+            module, top, cycle_time or 5.0, scheduler, budget or 0.0, allocate
         )
     finally:
         handler.detach()

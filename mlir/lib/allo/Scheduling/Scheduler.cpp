@@ -1912,6 +1912,90 @@ bool OccupancyProblem::holdsLimitedUnit(Operation *op) {
          });
 }
 
+bool OccupancyProblem::holdsAllocatableUnit(Operation *op) {
+  auto linked = getLinkedResourceTypes(op);
+  return linked && llvm::any_of(*linked, [&](ResourceType rsrc) {
+           return getAllocatable(rsrc).has_value();
+         });
+}
+
+SmallVector<Operation *> OccupancyProblem::usersOf(ResourceType rsrc) {
+  SmallVector<Operation *> users;
+  for (Operation *op : getOperations())
+    if (usesResource(op, rsrc))
+      users.push_back(op);
+  llvm::stable_sort(users, [&](Operation *a, Operation *b) {
+    return *getStartTime(a) < *getStartTime(b);
+  });
+  return users;
+}
+
+void OccupancyProblem::assignUnits(unsigned ii) {
+  for (ResourceType rsrc : getResourceTypes()) {
+    std::optional<unsigned> units = getAllocation(rsrc);
+    if (!units)
+      continue;
+    SmallVector<Operation *> users = usersOf(rsrc);
+    // Both rules round-robin over all the instances rather than packing into
+    // the fewest that fit, so the count decided is the count built.
+    unsigned cursor = 0;
+    if (ii) {
+      // Occupancy is one cycle here, so an instance is available iff it is
+      // free in the operation's congruence class.
+      llvm::DenseSet<std::pair<unsigned, unsigned>> taken;
+      for (Operation *op : users) {
+        unsigned cls = *getStartTime(op) % ii;
+        while (!taken.insert({cursor % *units, cls}).second)
+          ++cursor;
+        assignedUnit[op] = cursor++ % *units;
+      }
+    } else {
+      // First fit over occupancy windows in start order, rotating the instance
+      // scanned first so the load spreads.
+      SmallVector<unsigned> freeAt(*units, 0);
+      for (Operation *op : users) {
+        unsigned start = *getStartTime(op);
+        unsigned k = cursor % *units;
+        for (unsigned tried = 1; freeAt[k] > start && tried < *units; ++tried)
+          k = (k + 1) % *units;
+        assert(freeAt[k] <= start && "the busiest cycle needs more instances "
+                                     "than the allocation decided");
+        assignedUnit[op] = k;
+        freeAt[k] = start + getResourceCycles(op);
+        cursor = k + 1;
+      }
+    }
+  }
+}
+
+LogicalResult OccupancyProblem::verifyAllocation(unsigned ii) {
+  for (ResourceType rsrc : getResourceTypes()) {
+    std::optional<unsigned> units = getAllocation(rsrc);
+    if (!units)
+      continue; // no solve decided one, so the trivial allocation stands
+    // (instance, cycle) pairs already taken.
+    llvm::DenseSet<std::pair<unsigned, unsigned>> busy;
+    for (Operation *op : getOperations()) {
+      if (!usesResource(op, rsrc))
+        continue;
+      std::optional<unsigned> unit = getAssignedUnit(op);
+      if (!unit || *unit >= *units) {
+        assert(false && "an operation on an allocated operator has no instance "
+                        "to run on, or one past the count decided");
+        return failure();
+      }
+      unsigned start = *getStartTime(op);
+      for (unsigned k = 0, occ = getResourceCycles(op); k < occ; ++k)
+        if (!busy.insert({*unit, ii ? (start + k) % ii : start + k}).second) {
+          assert(false && "two operations share one operator instance in the "
+                          "same cycle");
+          return failure();
+        }
+    }
+  }
+  return success();
+}
+
 LogicalResult OccupancyProblem::verifyOccupancy(unsigned ii) {
   for (ResourceType rsrc : getResourceTypes()) {
     unsigned limit = getLimit(rsrc).value_or(0);
@@ -1922,8 +2006,7 @@ LogicalResult OccupancyProblem::verifyOccupancy(unsigned ii) {
     // this counts uses rather than operations.
     SmallDenseMap<unsigned, unsigned> used;
     for (Operation *op : getOperations()) {
-      auto rsrcs = getLinkedResourceTypes(op);
-      if (!rsrcs || !llvm::is_contained(*rsrcs, rsrc))
+      if (!usesResource(op, rsrc))
         continue;
       unsigned start = *getStartTime(op);
       for (unsigned k = 0, occ = getResourceCycles(op); k < occ; ++k)
@@ -1944,7 +2027,10 @@ LogicalResult OccupancyProblem::verifyOccupancy(unsigned ii) {
 LogicalResult ModuloOccupancyProblem::verify() {
   if (failed(ModuloProblem::verify()))
     return failure();
-  return verifyOccupancy(*getInitiationInterval());
+  unsigned ii = *getInitiationInterval();
+  if (failed(verifyOccupancy(ii)))
+    return failure();
+  return verifyAllocation(ii);
 }
 
 //===----------------------------------------------------------------------===//
@@ -1997,7 +2083,8 @@ LogicalResult ChainingSharedOperatorsProblem::check() {
 LogicalResult ChainingSharedOperatorsProblem::verify() {
   if (ChainingProblem::verify().succeeded() &&
       SharedOperatorsProblem::verify().succeeded() &&
-      verifyOccupancy(/*ii=*/0).succeeded())
+      verifyOccupancy(/*ii=*/0).succeeded() &&
+      verifyAllocation(/*ii=*/0).succeeded())
     return success();
   return failure();
 }

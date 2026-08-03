@@ -230,18 +230,19 @@ std::string channelSignal(llvm::StringRef chan, llvm::StringRef sig) {
 }
 
 std::string operatorPredicate(const FuncUnit &u) {
-  // A compare is the only IP carrying a `predicate` attr, copied onto the op
-  // by the reifier. Integer compare is combinational, so an IP compare is
-  // always floating-point.
+  // A compare is the only IP carrying a `predicate`, and the only identity
+  // axis a module name has to spell. Integer compare is combinational, so an
+  // IP compare is floating-point.
   if (auto pred =
-          u.repOp()->getAttrOfType<arith::CmpFPredicateAttr>("predicate"))
+          dyn_cast_if_present<arith::CmpFPredicateAttr>(u.identity.predicate))
     return arith::stringifyCmpFPredicate(pred.getValue()).str();
   return "";
 }
 
 std::string operatorModuleName(const FuncUnit &u) {
   std::string pred = operatorPredicate(u);
-  return pred.empty() ? u.impl : u.impl + "_" + pred;
+  return pred.empty() ? u.identity.realization
+                      : u.identity.realization + "_" + pred;
 }
 
 void nameValue(Value v, llvm::StringRef name) {

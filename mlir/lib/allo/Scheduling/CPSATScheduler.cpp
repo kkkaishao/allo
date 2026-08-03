@@ -208,28 +208,57 @@ IntVar drainVariable(CpModelBuilder &model,
   return drain;
 }
 
-/// Minimize \p primary, with the region's register AREA as the tie-break
-/// below it, weighted so the two never interact: `primary` (the region's
-/// span) is settled first, and the tie-break decides only among schedules
-/// that reach it.
+/// One allocatable resource in the model: the unit count to decide, and what
+/// one instance costs in the objective.
+struct AllocationVar {
+  Problem::ResourceType rsrc;
+  IntVar units;
+  int64_t cost = 0;
+};
+
+/// Declare `N_r` for every allocatable resource: how many copies of one
+/// operator this region builds, in `[1, ceiling]` and hinted at the ceiling so
+/// the heuristic's schedule stays a consistent hint. The caller states the
+/// capacity constraint.
+SmallVector<AllocationVar> allocationVars(CpModelBuilder &model,
+                                          OccupancyProblem &prob) {
+  SmallVector<AllocationVar> allocs;
+  for (Problem::ResourceType rsrc : prob.getResourceTypes()) {
+    auto unit = prob.getAllocatable(rsrc);
+    if (!unit)
+      continue;
+    assert(unit->ceiling > 0 && "an allocatable resource with no operation");
+    IntVar n = model.NewIntVar(operations_research::Domain(1, unit->ceiling));
+    model.AddHint(n, unit->ceiling);
+    allocs.push_back({rsrc, n, unit->cost});
+  }
+  return allocs;
+}
+
+/// Minimize \p primary, with the region's area as the tie-break below it,
+/// weighted so the two never interact: `primary` (the region's span) is
+/// settled first, and the tie-break decides only among schedules that reach
+/// it.
 ///
-/// The tie-break has two terms, both counted in flip-flops:
+/// The tie-break has three terms, all counted in flip-flops:
 ///
 ///   * `width(v) * depth(v)` per value carried in a delay chain
 ///     (`RegisterTerm`);
-///   * the sum of all start times at weight ONE: the cost of a 1-bit
-///     activation-pulse chain per cycle of an op's start offset (the part of
-///     the area the term above does not carry).
+///   * the sum of all start times at weight one: a 1-bit activation-pulse
+///     chain per cycle of an op's start offset;
+///   * `cost(r) * N_r` per allocatable operator: the instances this region
+///     builds, priced at the flip-flops one holds in its own pipeline.
 ///
 /// The weights are the hardware's own, not a tuning knob: a value chain is
-/// `width` times a pulse chain because it is `width` flip-flops wide. The two
-/// terms pull in opposite directions on a chain's endpoints (register depth
-/// wants a producer late and its readers early) vs. its interior (which the
-/// pulse term settles).
+/// `width` times a pulse chain because it is `width` flip-flops wide. The
+/// three terms pull against each other, so one currency settles the trade:
+/// register depth wants a producer late and its readers early, the pulse term
+/// settles the chain's interior, and sharing an operator forces two operations
+/// into different cycles, which lengthens lifetimes.
 void minimizeCost(CpModelBuilder &model, IntVar primary,
                   ArrayRef<IntVar> starts, const SpanObjective &span,
-                  DenseMap<Operation *, IntVar> &startVars, int64_t ii,
-                  int64_t horizon) {
+                  DenseMap<Operation *, IntVar> &startVars,
+                  ArrayRef<AllocationVar> allocs, int64_t ii, int64_t horizon) {
   SmallVector<IntVar> vars(starts.begin(), starts.end());
   SmallVector<int64_t> weights(starts.size(), 1);
   // Bounds how far the tie-break can reach, so `primary`'s weight below
@@ -245,9 +274,56 @@ void minimizeCost(CpModelBuilder &model, IntVar primary,
     weights.push_back(term.width);
     bits += term.width;
   }
+  for (const AllocationVar &alloc : allocs) {
+    vars.push_back(alloc.units);
+    weights.push_back(alloc.cost);
+    // `units` never exceeds the operation count, hence never the horizon, so
+    // one `cost` bounds this term as one `width` bounds a register chain's.
+    bits += alloc.cost;
+  }
   vars.push_back(primary);
   weights.push_back(bits * (horizon + 1));
   model.Minimize(LinearExpr::WeightedSum(vars, weights));
+}
+
+/// The unit counts one solve decided, held apart from the problem because the
+/// cyclic search runs many solves and only the adopted one's counts stand.
+using Allocated = SmallVector<std::pair<Problem::ResourceType, unsigned>>;
+
+Allocated readAllocation(const CpSolverResponse &response,
+                         ArrayRef<AllocationVar> allocs) {
+  Allocated decided;
+  for (const AllocationVar &alloc : allocs)
+    decided.push_back({alloc.rsrc, static_cast<unsigned>(SolutionIntegerValue(
+                                       response, alloc.units))});
+  return decided;
+}
+
+/// What \p decided costs in flip-flops: every instance built, at its own cost.
+int64_t areaOf(OccupancyProblem &prob, const Allocated &decided) {
+  int64_t area = 0;
+  for (auto [rsrc, units] : decided)
+    area += static_cast<int64_t>(prob.getAllocatable(rsrc)->cost) * units;
+  return area;
+}
+
+/// Write \p decided onto the problem and derive which instance each operation
+/// runs on. \p ii is 0 for a straight-line region.
+void applyAllocation(OccupancyProblem &prob, const Allocated &decided,
+                     unsigned ii) {
+  if (decided.empty())
+    return;
+  int64_t built = 0, ops = 0;
+  for (auto [rsrc, units] : decided) {
+    prob.setAllocation(rsrc, units);
+    built += units;
+    ops += prob.getAllocatable(rsrc)->ceiling;
+  }
+  // Counts alone are not buildable; this derives the per-operation instance.
+  prob.assignUnits(ii);
+  info(Stage::Sched, prob.getContainingOp())
+      << "Allocated: " << ops << " operations onto " << built
+      << " instances of " << decided.size() << " shared operator types";
 }
 
 /// Report a solve that produced nothing usable and leave the heuristic's
@@ -330,29 +406,34 @@ LogicalResult mlir::allo::scheduleCPSAT(ChainingSharedOperatorsProblem &prob,
                            startVars.at(dep.getDestination()));
   addChaining(model, prob, startVars, chaining);
 
-  // Resources: an op occupies one instance of every limited unit it links to
-  // for its whole window, so a cumulative constraint per resource matches
+  // Resources: an op occupies one instance of every unit it links to for its
+  // whole window, so a cumulative constraint per resource matches
   // `verifyOccupancy`. Multi-unit ops contribute the same window to each.
-  for (Problem::ResourceType rsrc : prob.getResourceTypes()) {
-    unsigned limit = prob.getLimit(rsrc).value_or(0);
-    if (limit == 0)
-      continue;
-    CumulativeConstraint cumulative = model.AddCumulative(limit);
-    for (Operation *op : ops) {
-      auto linked = prob.getLinkedResourceTypes(op);
-      if (!linked || !llvm::is_contained(*linked, rsrc))
-        continue;
-      cumulative.AddDemand(model.NewFixedSizeIntervalVar(
-                               startVars.at(op), prob.getResourceCycles(op)),
-                           1);
-    }
-  }
+  auto cumulativeOn = [&](Problem::ResourceType rsrc, LinearExpr capacity) {
+    CumulativeConstraint cumulative = model.AddCumulative(std::move(capacity));
+    for (Operation *op : ops)
+      if (prob.usesResource(op, rsrc))
+        cumulative.AddDemand(model.NewFixedSizeIntervalVar(
+                                 startVars.at(op), prob.getResourceCycles(op)),
+                             1);
+  };
+  for (Problem::ResourceType rsrc : prob.getResourceTypes())
+    if (unsigned limit = prob.getLimit(rsrc).value_or(0))
+      cumulativeOn(rsrc, limit);
+
+  // An allocatable operator takes the same shape, with the count being decided
+  // as the capacity. Occupancy windows on a line form an interval graph, so a
+  // capacity is an assignment: `N` units suffice when no cycle needs more.
+  SmallVector<AllocationVar> allocs = allocationVars(model, prob);
+  for (const AllocationVar &alloc : allocs)
+    cumulativeOn(alloc.rsrc, alloc.units);
 
   // What the region is charged, bounded by what the heuristic already reached.
   int64_t heuristicDrain = drainOf(prob, span.drain);
   IntVar drain =
       drainVariable(model, startVars, span.drain, horizon, heuristicDrain);
-  minimizeCost(model, drain, orderedStarts, span, startVars, /*ii=*/0, horizon);
+  minimizeCost(model, drain, orderedStarts, span, startVars, allocs, /*ii=*/0,
+               horizon);
 
   CpSolverResponse response =
       SolveWithParameters(model.Build(), solverParameters(opts.budget));
@@ -382,6 +463,7 @@ LogicalResult mlir::allo::scheduleCPSAT(ChainingSharedOperatorsProblem &prob,
 
   for (Operation *op : ops)
     prob.setStartTime(op, SolutionIntegerValue(response, startVars.at(op)));
+  applyAllocation(prob, readAllocation(response, allocs), /*ii=*/0);
   return finishSchedule(prob, cycleTime);
 }
 
@@ -466,8 +548,8 @@ ModuloOutcome solveAtII(ChainingModuloProblem &prob, Operation *lastOp,
                         const SchedulerOptions &opts,
                         std::optional<int64_t> drainBound, unsigned ii,
                         unsigned horizon, bool hint,
-                        DenseMap<Operation *, unsigned> &starts, bool &proven,
-                        int64_t &drain) {
+                        DenseMap<Operation *, unsigned> &starts,
+                        Allocated &decided, bool &proven, int64_t &drain) {
   const auto &ops = prob.getOperations();
 
   CpModelBuilder model;
@@ -508,7 +590,7 @@ ModuloOutcome solveAtII(ChainingModuloProblem &prob, Operation *lastOp,
   for (unsigned p = 0; p < ii; ++p)
     classes[p] = p;
   for (Operation *op : ops) {
-    if (!prob.holdsLimitedUnit(op))
+    if (!prob.contendsForUnit(op))
       continue;
     SmallVector<BoolVar> slots;
     slots.reserve(ii);
@@ -525,24 +607,39 @@ ModuloOutcome solveAtII(ChainingModuloProblem &prob, Operation *lastOp,
   // Modulo reservation: an op holding a unit for `occ` cycles wraps the II
   // table floor(occ/ii) times (every class) plus `occ % ii` more from its
   // own slot, exactly what `MRT::enter` counts, so the two models cross-check.
+  auto usesIn = [&](Problem::ResourceType rsrc, unsigned slot) {
+    LinearExpr used;
+    for (Operation *op : ops) {
+      if (!prob.usesResource(op, rsrc))
+        continue;
+      unsigned occ = prob.getResourceCycles(op);
+      used += static_cast<int64_t>(occ / ii);
+      const SmallVector<BoolVar> &slots = slotsOf.at(op);
+      for (unsigned k = 0, partial = occ % ii; k < partial; ++k)
+        used += slots[(slot + ii - k) % ii];
+    }
+    return used;
+  };
   for (Problem::ResourceType rsrc : prob.getResourceTypes()) {
     unsigned limit = prob.getLimit(rsrc).value_or(0);
     if (limit == 0)
       continue;
-    for (unsigned slot = 0; slot < ii; ++slot) {
-      LinearExpr used;
-      for (Operation *op : ops) {
-        auto linked = prob.getLinkedResourceTypes(op);
-        if (!linked || !llvm::is_contained(*linked, rsrc))
-          continue;
-        unsigned occ = prob.getResourceCycles(op);
-        used += static_cast<int64_t>(occ / ii);
-        const SmallVector<BoolVar> &slots = slotsOf.at(op);
-        for (unsigned k = 0, partial = occ % ii; k < partial; ++k)
-          used += slots[(slot + ii - k) % ii];
-      }
-      model.AddLessOrEqual(used, static_cast<int64_t>(limit));
-    }
+    for (unsigned slot = 0; slot < ii; ++slot)
+      model.AddLessOrEqual(usesIn(rsrc, slot), static_cast<int64_t>(limit));
+  }
+
+  // The same sum against the count being decided. Allocatable operators occupy
+  // one cycle here, so an op sits in one class and a per-class count is
+  // realizable as an assignment. `N_r >= ceil(total/ii)` is implied, cut here.
+  SmallVector<AllocationVar> allocs = allocationVars(model, prob);
+  for (const AllocationVar &alloc : allocs) {
+    int64_t total = 0;
+    for (Operation *op : ops)
+      if (prob.usesResource(op, alloc.rsrc))
+        total += prob.getResourceCycles(op);
+    model.AddGreaterOrEqual(alloc.units, (total + ii - 1) / ii);
+    for (unsigned slot = 0; slot < ii; ++slot)
+      model.AddLessOrEqual(usesIn(alloc.rsrc, slot), alloc.units);
   }
 
   // `(trip - 1) * ii` is constant at a fixed II, so minimizing the span here
@@ -552,7 +649,7 @@ ModuloOutcome solveAtII(ChainingModuloProblem &prob, Operation *lastOp,
   if (span.trip)
     drainVar = drainVariable(model, startVars, span.drain, horizon, drainBound);
   minimizeCost(model, drainVar.value_or(orderedStarts[anchorIndex]),
-               orderedStarts, span, startVars, ii, horizon);
+               orderedStarts, span, startVars, allocs, ii, horizon);
 
   CpSolverResponse response =
       SolveWithParameters(model.Build(), solverParameters(opts.budget));
@@ -567,6 +664,7 @@ ModuloOutcome solveAtII(ChainingModuloProblem &prob, Operation *lastOp,
   proven = response.status() == CpSolverStatus::OPTIMAL;
   for (Operation *op : ops)
     starts[op] = SolutionIntegerValue(response, startVars.at(op));
+  decided = readAllocation(response, allocs);
   drain = drainVar ? SolutionIntegerValue(response, *drainVar) : 0;
   return ModuloOutcome::Scheduled;
 }
@@ -613,7 +711,7 @@ LogicalResult mlir::allo::scheduleCPSAT(ChainingModuloProblem &prob,
   unsigned contending = 0;
   for (Operation *op : ops) {
     sequential += latencyOf(prob, op) + 1;
-    if (prob.holdsLimitedUnit(op))
+    if (prob.contendsForUnit(op))
       ++contending;
     if (warm.placed)
       greedyReach = std::max(greedyReach, int64_t(*prob.getStartTime(op)));
@@ -645,7 +743,15 @@ LogicalResult mlir::allo::scheduleCPSAT(ChainingModuloProblem &prob,
   std::optional<int64_t> best = heuristicSpan;
   int64_t floorDrain = bySpan ? drainFloor(prob, chaining, span.drain) : 0;
 
+  // Whether this region has an allocation to decide at all, which the cut
+  // below admits a span tie for.
+  bool allocates = false;
+  for (Problem::ResourceType rsrc : prob.getResourceTypes())
+    allocates |= prob.getAllocatable(rsrc).has_value();
+
   DenseMap<Operation *, unsigned> bestStarts;
+  Allocated bestAllocation;
+  int64_t bestArea = 0;
   unsigned bestII = 0;
   bool bestProven = false;
   bool adopted = false;
@@ -654,19 +760,22 @@ LogicalResult mlir::allo::scheduleCPSAT(ChainingModuloProblem &prob,
   for (unsigned ii = warm.lowerBoundII; ii <= upperII; ++ii) {
     // The bound: this interval's span already reaches the incumbent's before a
     // single operation is placed in it, and every interval past it is worse.
-    if (best && iiWeight * ii + floorDrain >= *best)
+    // Where an allocation is decided, an interval that only ties on span can
+    // still win on area, so the cut admits the tie.
+    if (best && iiWeight * ii + floorDrain >= *best + (allocates ? 1 : 0))
       break;
     std::optional<int64_t> drainBound;
     if (best)
       drainBound = *best - iiWeight * ii;
 
     DenseMap<Operation *, unsigned> starts;
+    Allocated decided;
     bool proven = false;
     int64_t drain = 0;
     ModuloOutcome outcome = solveAtII(prob, lastOp, chaining, span, opts,
                                       drainBound, ii, window + ii * contending,
                                       /*hint=*/warm.placed && ii == greedyII,
-                                      starts, proven, drain);
+                                      starts, decided, proven, drain);
     if (outcome == ModuloOutcome::Infeasible) {
       // INFEASIBLE is a proof only where nothing bounded the solve; under the
       // incumbent's bound it is the weaker "nothing here beats it".
@@ -682,12 +791,16 @@ LogicalResult mlir::allo::scheduleCPSAT(ChainingModuloProblem &prob,
       break;
     }
     // Adopt on a strict improvement, or on the first exact schedule at all.
+    // Improvement is lexicographic: span first, then the instances built.
     int64_t solved = iiWeight * ii + drain;
-    if (!adopted || solved < *best) {
+    int64_t area = areaOf(prob, decided);
+    if (!adopted || solved < *best || (solved == *best && area < bestArea)) {
       best = solved;
+      bestArea = area;
       bestII = ii;
       bestProven = proven;
       bestStarts = std::move(starts);
+      bestAllocation = std::move(decided);
       adopted = true;
     }
     if (!bySpan)
@@ -726,6 +839,7 @@ LogicalResult mlir::allo::scheduleCPSAT(ChainingModuloProblem &prob,
   prob.setInitiationInterval(bestII);
   for (Operation *op : ops)
     prob.setStartTime(op, bestStarts.at(op));
+  applyAllocation(prob, bestAllocation, bestII);
 
   {
     auto d = info(Stage::Sched, prob.getContainingOp());
@@ -750,7 +864,8 @@ LogicalResult mlir::allo::scheduleCPSAT(ChainingModuloProblem &prob,
         << "Exact scheduling ran out of budget placing the region at II="
         << bestII
         << ", so it shipped the best schedule it had found rather than the "
-           "shortest one; the span it reached is nobody's optimum";
+           "cheapest one; what it reached is no worse than the heuristic's but "
+           "is not known to be minimal in span, registers or instances";
   if (exhaustedAt)
     warn(Stage::Sched, prob.getContainingOp())
         << "Exact scheduling ran out of budget at II=" << *exhaustedAt

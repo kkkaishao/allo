@@ -7,6 +7,8 @@
 #include "allo/Microarch/DatapathBuilder.h"
 
 #include "allo/IR/AlloOps.h"
+#include "allo/Scheduling/OperatorLibrary.h" // unit input delay
+#include "allo/Support/Logging.h"            // the allocation report
 
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/Support/raw_ostream.h"
@@ -96,10 +98,10 @@ std::optional<int64_t> Datapath::constantOf(const Source &s) const {
 }
 
 Datapath::Datapath(dcp::DCPathModuleOp func, const BindingPolicy &policy,
-                   const MemoryLibrary &memLib, const CalleeCtx *callees,
-                   bool isTop) {
+                   const OperatorLibrary &lib, float cycleTime,
+                   const CalleeCtx *callees, bool isTop) {
   atTop = isTop;
-  DatapathBuilder builder(*this, func, policy, memLib, callees);
+  DatapathBuilder builder(*this, func, policy, lib, cycleTime, callees);
   builder.build();
 }
 
@@ -276,6 +278,71 @@ static void printSourceList(ArrayRef<Source> ss, raw_ostream &os) {
   os << "]";
 }
 
+unsigned muxLevels(unsigned sources) {
+  return sources <= 1 ? 0 : llvm::Log2_32_Ceil(sources);
+}
+
+double muxLevelDelay(const OperatorLibrary &lib) {
+  return lib.combDelay(OpKind::Or);
+}
+
+/// The delay `u`'s inputs must settle within, read from the same library row
+/// the scheduler priced it against.
+static double unitInDelay(const FuncUnit &u, const OperatorLibrary &lib) {
+  if (u.identity.comb) {
+    std::optional<CombOpKindEnum> kind =
+        symbolizeCombOpKindEnum(u.identity.realization);
+    assert(kind && "a comb unit realizes a CombOpKind");
+    return lib.combDelay(*kind);
+  }
+  auto opr = SymbolTable::lookupNearestSymbolFrom<dcp::DCPathOperatorOp>(
+      u.repOp(), cast<dcp::DCPathComputeOp>(u.repOp()).getOpTypeAttr());
+  assert(opr && "an IP unit names a live dcp.operator");
+  return opr.getInDelay().convertToDouble();
+}
+
+double unitSlack(const FuncUnit &u, float cycleTime,
+                 const OperatorLibrary &lib) {
+  double in = unitInDelay(u, lib);
+  double slack = cycleTime;
+  for (const auto &[op, residue] : u.boundOps) {
+    auto z = op->getAttrOfType<FloatAttr>("z");
+    slack = std::min(slack, cycleTime - (z ? z.getValueAsDouble() : 0.0) - in);
+  }
+  return slack;
+}
+
+void Datapath::reportAllocation() const {
+  // A mux's width is the width of the port it drives, which only the
+  // consuming unit knows.
+  llvm::DenseMap<MuxId, unsigned> muxWidth;
+  for (const FuncUnit &u : units)
+    for (auto [k, s] : llvm::enumerate(u.inputs))
+      if (s.kind == Source::Kind::Mux)
+        muxWidth[s.id] = hwWidth(u.repOp()->getOperand(k).getType());
+
+  for (const RegionBlock &rb : regions) {
+    if (rb.units.empty())
+      continue;
+    unsigned ops = 0, ip = 0, fanin = 0, muxBits = 0;
+    for (UnitId uid : rb.units) {
+      ops += units[uid].boundOps.size();
+      ip += !units[uid].identity.comb;
+    }
+    for (MuxId mid : rb.muxes) {
+      unsigned k = muxes[mid].sources.size();
+      assert(muxWidth.count(mid) && "a mux drives a shared unit's input port");
+      // A k:1 mux costs about (k-1) 2:1 muxes per bit.
+      fanin += k;
+      muxBits += muxWidth.lookup(mid) * (k - 1);
+    }
+    logging::info(logging::Stage::Emit, rb.op)
+        << "Allocation: " << ops << " compute ops on " << rb.units.size()
+        << " units (" << ip << " IP), " << rb.muxes.size() << " muxes, "
+        << fanin << " mux inputs, " << muxBits << " 2:1 mux bits";
+  }
+}
+
 void Datapath::dump(llvm::raw_ostream &os) const {
   auto func = this->func;
   os << "datapath @" << func.getSymName() << " {\n";
@@ -312,10 +379,10 @@ void Datapath::dump(llvm::raw_ostream &os) const {
     os << "\n";
     for (UnitId uid : rb.units) {
       const FuncUnit &u = this->units[uid];
-      os << "    unit u" << uid << ": " << u.opType << " lat=" << u.latency
-         << (u.pipelined ? " pipelined" : " sequential") << " : "
-         << u.resultType << "  [" << u.repOp()->getName() << " @"
-         << u.boundOps.front().second << "] <= ";
+      os << "    unit u" << uid << ": " << u.identity.realization
+         << " lat=" << u.latency << (u.pipelined ? " pipelined" : " sequential")
+         << " : " << u.identity.resultType << "  [" << u.repOp()->getName()
+         << " @" << u.boundOps.front().second << "] <= ";
       printSourceList(u.inputs, os);
       for (unsigned k = 0; k < u.inputInits.size(); ++k)
         if (u.inputInits[k].kind != Source::Kind::None) {

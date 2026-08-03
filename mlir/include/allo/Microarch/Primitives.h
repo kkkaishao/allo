@@ -274,6 +274,11 @@ struct EmitContext {
   Value latchReg(Value init, Value next, Value load, Value advance);
   /// Combinational (0-cycle) 2:1 mux: out = sel ? t : f.
   Value mux(Value sel, Value t, Value f);
+  /// Combinational (0-cycle) k:1 select over mutually exclusive selects:
+  /// `OR over i of (values[i] & replicate(selects[i]))`, `ceil(log2 k)` levels
+  /// deep (`muxLevels`). With no select high the result is zero, which every
+  /// caller must treat as a don't-care.
+  Value oneHotSelect(ArrayRef<Value> values, ArrayRef<Value> selects);
   /// Shift register on \p sh's time base: each tap advances every clock under a
   /// rigid shell, and only while `chainEnable` is high under an elastic one, so
   /// the taps freeze together and the "index == cycles delayed" contract holds

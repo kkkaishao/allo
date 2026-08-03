@@ -6,10 +6,11 @@
 #ifndef ALLO_MICROARCH_DATAPATH_H
 #define ALLO_MICROARCH_DATAPATH_H
 
-#include "allo/IR/AlloAttrs.h"           // MemoryImplEnum
-#include "allo/IR/AlloOps.h"             // dcp::DCPathModuleOp
-#include "allo/Scheduling/MemoryModel.h" // MemoryLibrary + BankLayout
-#include "allo/Scheduling/RegionGraph.h" // RegionShape
+#include "allo/IR/AlloAttrs.h"                // MemoryImplEnum
+#include "allo/IR/AlloOps.h"                  // dcp::DCPathModuleOp
+#include "allo/Scheduling/MemoryModel.h"      // BankLayout
+#include "allo/Scheduling/OperatorIdentity.h" // what one unit realizes
+#include "allo/Scheduling/RegionGraph.h"      // RegionShape
 
 #include "mlir/IR/AffineMap.h"
 #include "mlir/IR/Attributes.h"
@@ -123,15 +124,16 @@ struct Source {
 /// holds a single entry and no input needs a mux.
 struct FuncUnit {
   UnitId id = 0;
-  std::string opType;   // the operator mnemonic (comb: "addi"; IP: module name)
-  std::string impl;     // IP module name (empty when combinational)
-  bool comb = false;    // combinational (a `comb` primitive), not an IP module
-  unsigned latency = 0; // result available `latency` cycles after issue
+  // What this unit realizes, agreed on by every op bound here: two units may
+  // be folded only if their identities are equal. It carries the realization
+  // the emitter builds (a `comb` primitive or an IP instance), the result
+  // type, and the fields the RTL module name is spelled from.
+  OperatorIdentity identity;
+  unsigned latency = 0;  // result available `latency` cycles after issue
   bool pipelined = true; // accepts a new input every cycle
   // The IP's port/back-pressure contract (from its `dcp.operator`); unused for
   // a combinational unit. Clock-enable is the only contract the emitter builds.
   StallContractEnum stall = StallContractEnum::Ce;
-  Type resultType; // value-typed (e.g. f32), not bit-blasted
 
   // Ops bound here, each with its issue cycle (residue mod II in a cyclic
   // region). Sharing puts several non-conflicting ops in this list. NEVER
@@ -140,11 +142,10 @@ struct FuncUnit {
   // the entries it folds away.
   llvm::SmallVector<std::pair<Operation *, unsigned>, 1> boundOps;
 
-  /// The representative bound op: the one whose operand types, arity and
-  /// op-specific attributes characterize the unit. Every other op bound here is
-  /// reservation-compatible with it (`Reservation.h`), so the choice of
-  /// `front()` is arbitrary, but it must be the SAME everywhere: naming, port
-  /// shape and timing all read it. Use this rather than `boundOps.front()`.
+  /// The representative bound op: the one whose operands shape the unit's
+  /// input ports and whose location names it. What the unit is lives in
+  /// `identity`. The choice of `front()` is arbitrary but must be the same
+  /// everywhere, so use this rather than `boundOps.front()`.
   Operation *repOp() const {
     assert(!boundOps.empty() &&
            "a unit with no bound op has no representative");
@@ -191,7 +192,7 @@ struct ScopeUnit {
   unsigned id = 0;
   Operation *op = nullptr;             // the func-scope arith op
   std::string opType;                  // its comb mnemonic (`combKindOf`)
-  Type resultType;                     // value-typed, like FuncUnit::resultType
+  Type resultType;                     // value-typed, not bit-blasted
   llvm::SmallVector<Source, 2> inputs; // one resolved driver per operand
 };
 
@@ -535,12 +536,31 @@ struct Mux {
   // The op whose issue selects each source (parallel to `sources`): the source
   // is driven onto the shared unit's input on the cycle that op consumes it, so
   // the select is `delayValid(issue, dcpStart(op))`, the same per-op activation
-  // pulse a store's write-enable uses. The MRT guarantees these are
-  // mutually exclusive (disjoint residues), so the derived mux is a plain
-  // priority chain.
+  // pulse a store's write-enable uses. The MRT guarantees these are mutually
+  // exclusive (disjoint residues), so the emitter builds a one-hot select.
   llvm::SmallVector<Operation *, 2> selectOps;
   RegionId region = 0; // region whose issue pulse times the selects
 };
+
+/// The combinational depth, in LUT levels, of the select a mux of \p sources
+/// sources costs: `ceil(log2 k)`, since the emitter builds a one-hot AND-OR
+/// reduction (`EmitContext::oneHotSelect`) and each level halves the term
+/// count. Zero for a single source, which is a wire. Levels rather than
+/// nanoseconds, so the technology stays in the device.
+unsigned muxLevels(unsigned sources);
+
+/// What one such level costs in ns: the device's OR row, since the select is
+/// an AND-OR reduction rather than a chain of 2:1 selects. The policy that
+/// decides a fold and the check that rejects a bad one price it here.
+double muxLevelDelay(const OperatorLibrary &lib);
+
+/// The sub-cycle room \p u's bound ops have left, in ns: the smallest
+/// `cycleTime - z(op) - inDelay(u)` over them, where `z` is the sub-cycle start
+/// the scheduler solved and `inDelay` the row it priced the unit against. This
+/// bounds the combinational delay binding may add in front of the unit. Never
+/// negative on a schedule the chaining model accepted.
+double unitSlack(const FuncUnit &u, float cycleTime,
+                 const OperatorLibrary &lib);
 
 /// A top-level scalar INPUT port (a scalar kernel argument). Memref arguments
 /// become external `MemUnit`s instead, and a scalar function result is a
@@ -864,12 +884,13 @@ struct Datapath {
   bool infeasible = false;
 
   Datapath() = default;
-  /// \p memLib is the device's storage-timing view (the `dcp.device` `memory:`
-  /// table the scheduler timed every access against); it resolves each
-  /// MemUnit's implementation and access latency.
+  /// \p lib is the device the scheduler priced this kernel against: its storage
+  /// view resolves each MemUnit's implementation and access latency, its
+  /// operator rows let \p policy price a fold's multiplexer against
+  /// \p cycleTime, the period the schedule was cut to.
   Datapath(dcp::DCPathModuleOp func, const BindingPolicy &policy,
-           const MemoryLibrary &memLib, const CalleeCtx *callees = nullptr,
-           bool isTop = false);
+           const OperatorLibrary &lib, float cycleTime,
+           const CalleeCtx *callees = nullptr, bool isTop = false);
 
   /// The dcp op whose execution produces \p s's value, or null when the Source
   /// has no producing op: a literal, the iteration counter, a kernel input
@@ -885,6 +906,11 @@ struct Datapath {
   std::optional<int64_t> constantOf(const Source &s) const;
 
   void dump(llvm::raw_ostream &os) const;
+
+  /// Log what the allocation cost, per region: compute ops, the units they were
+  /// bound to, and the muxes sharing grew, with their width. A diagnostic, not
+  /// an IR attribute or a manifest field.
+  void reportAllocation() const;
 };
 
 //===----------------------------------------------------------------------===//

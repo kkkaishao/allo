@@ -292,19 +292,23 @@ static void convertOp(Operation &op, OpBuilder &b, IRMapping &map,
   // one of two exclusive paths: a combinational op carries a `comb_kind`; an IP
   // op references its injected `dcp.operator` via `op_type`.
   if (op.getNumResults() == 1 && at && !isa<arith::ConstantOp>(op)) {
-    OperatorChar c = lib.lookup(&op);
+    OperatorIdentity id = lib.lookup(&op).identity;
+    assert(id.realized() && "a scheduled compute op with no realization");
     CombOpKindEnumAttr combKind;
     FlatSymbolRefAttr opType;
-    if (c.symbol.empty()) {
-      std::optional<CombOpKindEnum> ck = combKindOf(&op);
-      assert(ck && "combinational compute op with no CombOpKind lowering");
-      combKind = CombOpKindEnumAttr::get(b.getContext(), *ck);
-    } else {
-      opType = FlatSymbolRefAttr::get(b.getContext(), c.symbol);
-    }
-    auto nw = DCPathComputeOp::create(
-        b, loc, op.getResult(0).getType(), remap(op.getOperands()), combKind,
-        opType, b.getI64IntegerAttr(start), FlatSymbolRefAttr());
+    if (id.comb)
+      combKind = CombOpKindEnumAttr::get(
+          b.getContext(), *symbolizeCombOpKindEnum(id.realization));
+    else
+      opType = FlatSymbolRefAttr::get(b.getContext(), id.realization);
+    // The instance the allocation put it on, when a solve decided one.
+    FlatSymbolRefAttr unit;
+    if (at->unit)
+      unit = FlatSymbolRefAttr::get(b.getContext(),
+                                    model.allocatedUnits()[*at->unit].name);
+    auto nw = DCPathComputeOp::create(b, loc, op.getResult(0).getType(),
+                                      remap(op.getOperands()), combKind, opType,
+                                      b.getI64IntegerAttr(start), unit);
     for (NamedAttribute attr : op.getAttrs())
       nw->setAttr(attr.getName(), attr.getValue());
     setZ(nw);
@@ -1189,6 +1193,12 @@ void mlir::allo::runPostScheduleConversion(ModuleOp module,
                                            ScheduleModel &model) {
   loadDependentDialects(*module->getContext());
   auto lib = OperatorLibrary::fromModule(module);
+  // One `dcp.unit` per allocated instance, declared at the top of the module
+  // so the symbols resolve whatever order the funcs below are reified in.
+  OpBuilder b(module.getBody(), module.getBody()->begin());
+  for (const ScheduleModel::AllocatedUnit &u : model.allocatedUnits())
+    DCPathUnitOp::create(b, module.getLoc(), b.getStringAttr(u.name),
+                         FlatSymbolRefAttr::get(b.getContext(), u.opType));
   SmallVector<func::FuncOp> funcs(module.getOps<func::FuncOp>());
   llvm::DenseSet<Operation *> reified;
   for (func::FuncOp func : funcs)

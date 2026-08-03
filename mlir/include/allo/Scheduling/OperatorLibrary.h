@@ -6,9 +6,10 @@
 #ifndef ALLO_SCHEDULING_OPERATORLIBRARY_H
 #define ALLO_SCHEDULING_OPERATORLIBRARY_H
 
-#include "allo/IR/AlloOps.h"             // kAlloAsyncAttr
-#include "allo/Scheduling/MemoryModel.h" // MemoryLibrary
-#include "allo/Scheduling/RegionGraph.h" // calleeStaticLatency
+#include "allo/IR/AlloOps.h"                  // kAlloAsyncAttr
+#include "allo/Scheduling/MemoryModel.h"      // MemoryLibrary
+#include "allo/Scheduling/OperatorIdentity.h" // OperatorIdentity
+#include "allo/Scheduling/RegionGraph.h"      // calleeStaticLatency
 #include "allo/Scheduling/Scheduler.h"
 
 #include "circt/Scheduling/Problems.h"
@@ -24,6 +25,7 @@
 #include "llvm/ADT/StringRef.h"
 
 #include <cstdint>
+#include <map>
 #include <optional>
 #include <string>
 #include <vector>
@@ -79,6 +81,13 @@ OpKind classify(Operation *op);
 llvm::StringRef opKindString(OpKind kind);
 std::optional<OpKind> parseOpKind(llvm::StringRef s);
 
+/// The abstract kind a combinational realization is priced under, for a caller
+/// holding the realization after the `arith` op `classify` needs is gone.
+/// Strictly coarser: the signed and unsigned mnemonics share a row, as do the
+/// four integer casts. `Unknown` for a realization no abstract row covers
+/// (`affine.apply`).
+OpKind opKindOf(CombOpKindEnum kind);
+
 /// The combinational realization kind of \p op. This enumerates the emitter's
 /// native `comb` coverage: every case has an `emitCompute` lowering. Nullopt
 /// for an op with no comb lowering (a float/cast IP, a memory access, or an
@@ -103,24 +112,27 @@ struct OperatorEntry {
   llvm::SmallVector<Type> argTypes; // IP/advanced: exact operand element types.
   llvm::SmallVector<Type> resTypes; // IP/advanced: exact result element types.
 
-  uint32_t latency = 0; // cycles
-  double inDelay = 0.0; // ns
+  uint32_t latency = 0;  // cycles
+  bool pipelined = true; // accepts a new input every cycle
+  double inDelay = 0.0;  // ns
   double outDelay = 0.0;
   std::string symbol; // the injected `dcp.operator` sym_name (IP rows only).
 };
 
-/// The timing characterization resolved for a specific operation. It carries no
-/// pipelined-ness: an operator type is unlimited in the problem, so an
-/// occupancy window on one would reserve nothing. The emitter reads
-/// `dcp.operator`'s own `pipelined` attribute for the unit it builds
-/// (`DatapathBuilder`); re-add this when the scheduler LIMITS operators
-/// (allocation as a decision variable).
+/// What a lookup resolves for a specific operation: the timing row it is priced
+/// under, and the operator identity it needs. The two are separate keys: the
+/// scheduling problem prices `typeName`, while an allocation limit, the
+/// binder's share test and the emitted module name all key on `identity`.
 struct OperatorChar {
   std::string typeName; // stable: one Problem::OperatorType per matched entry
   uint32_t latency = 0;
+  /// Whether one instance accepts a new input every cycle. Read only by
+  /// `populateOperatorAllocation`; an unlimited operator type reserves nothing
+  /// however long its window, so the timing half has no use for it.
+  bool pipelined = true;
   double inDelay = 0.0;
   double outDelay = 0.0;
-  std::string symbol; // the matched `dcp.operator` sym_name (IP), else empty
+  OperatorIdentity identity; // empty for an op no functional unit is built for
 };
 
 /// The operator library, built from the injected device IR: comb rows from
@@ -156,12 +168,29 @@ public:
   /// (`addressDelaysOf`), which has no `Operation *` to hand `lookup`.
   double combDelay(OpKind kind) const;
 
+  /// The same, for a caller holding a reified realization (a `dcp.compute`'s
+  /// `comb_kind`) rather than an abstract kind. Falls back to the default row
+  /// exactly as `lookup` does, so an `affine.apply`, which no abstract row
+  /// matches, is priced the way it was scheduled rather than at zero.
+  double combDelay(CombOpKindEnum kind) const;
+
 private:
+  /// The device's combinational row for \p kind, null when it declares none.
+  /// Last wins, like `matchEntry`.
+  const OperatorEntry *combEntry(OpKind kind) const;
+
   std::vector<OperatorEntry> advancedEntries; // matched first (raw name)
   std::vector<OperatorEntry> entries;         // abstract rows
   OperatorEntry defaultEntry;
   MemoryLibrary memory;
 };
+
+/// Log, for one solved region, every operator type covering more than one
+/// operator identity, i.e. every place a resource limit stated over the timing
+/// row would span several physical operators. Measurement only: nothing
+/// consumes the log.
+void reportOperatorClassSplit(circt::scheduling::Problem &problem,
+                              const OperatorLibrary &lib);
 
 //===----------------------------------------------------------------------===//
 // Scheduled-call latency: a scheduling helper, separate from operator
@@ -240,6 +269,102 @@ LogicalResult populateOperatorTypes(ArrayRef<Operation *> ops,
                                     ProblemT &problem,
                                     const OperatorLibrary &lib) {
   return populateOperatorTypesImpl(
+      problem,
+      [&](auto handle) {
+        for (Operation *top : ops)
+          top->walk(handle);
+      },
+      lib);
+}
+
+//===----------------------------------------------------------------------===//
+// Allocation model: how many copies of an operator a region builds. The
+// sibling of `populateOperatorTypes`, keyed on the operator identity rather
+// than the timing row, since only one physical operator can host two
+// operations.
+//===----------------------------------------------------------------------===//
+
+/// Declare one allocatable resource per operator identity this region could
+/// build fewer copies of than it has operations. Scope:
+///
+///   * IP identities only. Folding a combinational operator pays for a
+///     multiplexer nearly as wide as the operator itself (a 32-bit adder is
+///     ~32 LUTs against ~64 of mux).
+///   * At least two operations, or there is nothing to fold.
+///   * In a cyclic region, a one-cycle occupancy. Past one cycle the
+///     reservation window wraps the initiation interval and a count per
+///     congruence class no longer implies that many units suffice
+///     (circular-arc colouring). Acyclic windows form an interval graph, where
+///     the count is exactly the chromatic number, so any occupancy is fine.
+///
+/// The cost is `latency * width` flip-flops, what one instance holds in its own
+/// pipeline, in the unit the objective's register tie-break counts. It
+/// under-estimates a real IP, so the objective cannot over-value a fold.
+template <class ProblemT, class WalkFn>
+LogicalResult populateOperatorAllocationImpl(ProblemT &problem, WalkFn walkFn,
+                                             const OperatorLibrary &lib) {
+  using namespace circt::scheduling;
+  if constexpr (!std::is_base_of_v<OccupancyProblem, ProblemT>) {
+    return success();
+  } else {
+    constexpr bool isCyclic = std::is_base_of_v<CyclicProblem, ProblemT>;
+    // One identity's operations, in walk order. Sorted keying, rather than by
+    // insertion, so two compiles declare the resources in the same order.
+    struct OperatorClass {
+      llvm::SmallVector<Operation *> ops;
+      unsigned occupancy = 1;
+      unsigned cost = 0;
+    };
+    std::map<std::string, OperatorClass> byIdentity;
+    walkFn([&](Operation *op) {
+      OperatorChar c = lib.lookup(op);
+      if (!c.identity.realized() || c.identity.comb)
+        return;
+      // A non-pipelined unit is busy for its whole latency; a pipelined one
+      // contends only for its issue slot.
+      unsigned occ = c.pipelined ? 1 : std::max(1u, c.latency);
+      if (isCyclic && occ > 1)
+        return; // a count alone is not sufficient modulo the II
+      OperatorClass &cls = byIdentity[c.identity.key()];
+      cls.ops.push_back(op);
+      cls.occupancy = occ;
+      cls.cost = c.latency * c.identity.resultType.getIntOrFloatBitWidth();
+    });
+
+    for (auto &[key, cls] : byIdentity) {
+      if (cls.ops.size() < 2)
+        continue;
+      Problem::ResourceType rsrc = problem.getOrInsertResourceType(key);
+      problem.setAllocatable(
+          rsrc, typename ProblemT::AllocatableUnit{
+                    static_cast<unsigned>(cls.ops.size()), cls.cost});
+      for (Operation *op : cls.ops) {
+        llvm::SmallVector<Problem::ResourceType> units;
+        if (auto linked = problem.getLinkedResourceTypes(op))
+          units.assign(linked->begin(), linked->end());
+        units.push_back(rsrc);
+        problem.setLinkedResourceTypes(op, units);
+        problem.setResourceCycles(op, cls.occupancy);
+      }
+    }
+    return success();
+  }
+}
+
+/// Populate the allocation model for every op reachable from \p body.
+template <class ProblemT>
+LogicalResult populateOperatorAllocation(Block &body, ProblemT &problem,
+                                         const OperatorLibrary &lib) {
+  return populateOperatorAllocationImpl(
+      problem, [&](auto handle) { body.walk(handle); }, lib);
+}
+
+/// The same over the (walked) top-level ops of a straight-line region.
+template <class ProblemT>
+LogicalResult populateOperatorAllocation(ArrayRef<Operation *> ops,
+                                         ProblemT &problem,
+                                         const OperatorLibrary &lib) {
+  return populateOperatorAllocationImpl(
       problem,
       [&](auto handle) {
         for (Operation *top : ops)

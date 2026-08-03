@@ -468,8 +468,12 @@ def DCPathOperatorOp : DCPath_Op<"dcp.operator", [Symbol]> {
     on the IP path (its `op_type`) so schedule legality and register depths are
     self-contained and verifiable.
 
-    `sym_name` is BOTH the referenced symbol and the RTL module name the emitter
-    instantiates. `kind` is the abstract operator kind
+    `sym_name` is the referenced symbol and the stem of the RTL module name the
+    emitter instantiates, not the whole name: one declaration can cover several
+    distinct pieces of hardware, so the emitter appends whatever else the
+    operator's identity distinguishes (a float compare's predicate:
+    `fcmp_l1` -> `fcmp_l1_ogt`). `operatorModuleName` spells the full name.
+    `kind` is the abstract operator kind
     (`add`/`mul`/`cmp`/`int_float_cast`/...); `signature` is the concrete
     realized type (e.g. `(f32, f32) -> f32`), matched by exact element types.
     `stall` is the port/back-pressure contract the emitter instantiates it

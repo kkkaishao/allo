@@ -13,6 +13,7 @@
 #include "mlir/Dialect/MemRef/IR/MemRef.h" // memref::GetGlobalOp
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
+#include "llvm/Support/Format.h"
 
 using namespace mlir;
 using namespace mlir::allo;
@@ -65,8 +66,103 @@ LogicalResult verifyDatapath(dcp::DCPathModuleOp func, const Datapath &dp) {
 // 2. Device-contract limits.
 //===----------------------------------------------------------------------===//
 
+namespace {
+
+/// The combinational delay binding added, propagated along the chains it can
+/// lengthen.
+///
+/// The scheduler proved `z(op) + inDelay(op) <= period` over a datapath whose
+/// unit inputs are all driven directly, and a multiplexer shifts its consumer's
+/// arrival by a constant. The delta is therefore additive along a combinational
+/// path, so propagating it alone and comparing against each op's remaining
+/// sub-cycle slack is exact.
+struct MuxDelay {
+  MuxDelay(const Datapath &dp, double level) : dp(dp), level(level) {}
+
+  const Datapath &dp;
+  double level; // one LUT level of the one-hot select's AND-OR reduction
+  llvm::DenseMap<UnitId, double> memo;
+
+  double ofUnit(UnitId id) {
+    auto seen = memo.find(id);
+    if (seen != memo.end())
+      return seen->second;
+    // Seeded before the walk, so a fused recurrence's self-referential input
+    // terminates instead of recursing forever.
+    memo[id] = 0.0;
+    double added = 0.0;
+    for (const Source &in : dp.units[id].inputs)
+      added = std::max(added, ofSource(in));
+    memo[id] = added;
+    return added;
+  }
+
+  double ofSource(const Source &s) {
+    if (s.kind == Source::Kind::Mux) {
+      const Mux &m = dp.muxes[s.id];
+      double in = 0.0;
+      for (const Source &src : m.sources)
+        in = std::max(in, ofSource(src));
+      return in + muxLevels(m.sources.size()) * level;
+    }
+    // Anything else is held when the cycle starts: a register tap, a port, a
+    // literal, a survivor, or a unit whose own output is registered.
+    if (s.kind != Source::Kind::Unit || dp.units[s.id].latency)
+      return 0.0;
+    return ofUnit(s.id);
+  }
+};
+
+/// Every shared unit's inputs still settle within the period, muxes included.
+/// Vacuous under the trivial binding, which grows no mux. This catches what a
+/// policy cannot see before the datapath resolves: delay accumulated across a
+/// chain of shared combinational units.
+LogicalResult checkBindingMeetsPeriod(const Datapath &dp, float cycleTime,
+                                      const OperatorLibrary &lib) {
+  if (dp.muxes.empty())
+    return success();
+  // One picosecond of slop, the resolution the scheduler's own model carries.
+  constexpr double kSlop = 1e-3;
+  MuxDelay mux(dp, muxLevelDelay(lib));
+  bool ok = true;
+  for (const FuncUnit &u : dp.units) {
+    double added = mux.ofUnit(u.id);
+    if (added == 0.0)
+      continue;
+    double slack = unitSlack(u, cycleTime, lib);
+    if (added <= slack + kSlop)
+      continue;
+    // Anchor on the tightest bound op, the one the slack came from.
+    Operation *worst = u.repOp();
+    for (const auto &[op, residue] : u.boundOps) {
+      auto z = op->getAttrOfType<FloatAttr>("z");
+      auto wz = worst->getAttrOfType<FloatAttr>("z");
+      if (z && (!wz || z.getValueAsDouble() > wz.getValueAsDouble()))
+        worst = op;
+    }
+    // `added` covers the whole input cone, so it may come from a shared
+    // predecessor rather than from a multiplexer on this unit.
+    unsupported(Stage::Emit, worst)
+        << "Binding put " << llvm::format("%.2f", added)
+        << " ns of multiplexer on the path reaching this operation (its unit "
+           "is shared between "
+        << u.boundOps.size() << " operations), which is "
+        << llvm::format("%.2f", added - slack)
+        << " ns more than the schedule left it against a "
+        << llvm::format("%.2f", cycleTime)
+        << " ns clock. The schedule was cut before the multiplexer existed, so "
+           "this would miss timing in silicon. Use binding='trivial' for this "
+           "kernel, or raise the target period";
+    ok = false;
+  }
+  return success(ok);
+}
+
+} // namespace
+
 LogicalResult checkDeviceCapability(dcp::DCPathModuleOp func,
-                                    const Datapath &dp) {
+                                    const Datapath &dp, float cycleTime,
+                                    const OperatorLibrary &lib) {
   // Access latencies the emitted structure cannot realize. These are device
   // rows the SCHEDULER honors, so silently emitting a 1-cycle port instead
   // would place every consumer of that array on the wrong cycle.
@@ -103,7 +199,7 @@ LogicalResult checkDeviceCapability(dcp::DCPathModuleOp func,
     for (UnitId uid : rb.units)
       unitRegion[uid] = rb.id;
   for (const FuncUnit &u : dp.units) {
-    if (u.comb || u.stall == allo::StallContractEnum::Ce)
+    if (u.identity.comb || u.stall == allo::StallContractEnum::Ce)
       continue;
     assert(u.stall != allo::StallContractEnum::Elastic &&
            "an elastic IP reached emission");
@@ -116,7 +212,8 @@ LogicalResult checkDeviceCapability(dcp::DCPathModuleOp func,
       return failure();
     }
   }
-  return success();
+
+  return checkBindingMeetsPeriod(dp, cycleTime, lib);
 }
 
 //===----------------------------------------------------------------------===//
@@ -243,7 +340,8 @@ LogicalResult checkEmitterSubset(dcp::DCPathModuleOp func, const Datapath &dp) {
   // Operator realizability is settled before scheduling: an op with neither an
   // IP row nor a `combKindOf` lowering never becomes a `dcp.compute`.
   for (const FuncUnit &u : dp.units)
-    assert((u.comb ? combEmitted(u.opType) : !u.impl.empty()) &&
+    assert((u.identity.comb ? combEmitted(u.identity.realization)
+                            : u.identity.realized()) &&
            "an unrealizable operator reached emission");
   // A func-scope cone is combinational by construction (`bindScopeOps` rejects
   // anything `combKindOf` does not name), so only `emitCompute`'s coverage is
@@ -317,9 +415,10 @@ static void assertStructuralInvariants(const Datapath &dp) {
 #endif
 }
 
-LogicalResult validateDatapath(dcp::DCPathModuleOp func, const Datapath &dp) {
+LogicalResult validateDatapath(dcp::DCPathModuleOp func, const Datapath &dp,
+                               float cycleTime, const OperatorLibrary &lib) {
   if (failed(verifyDatapath(func, dp)) ||
-      failed(checkDeviceCapability(func, dp)) ||
+      failed(checkDeviceCapability(func, dp, cycleTime, lib)) ||
       failed(checkEmitterSubset(func, dp)))
     return failure();
   assertStructuralInvariants(dp);

@@ -7,6 +7,7 @@
 #define ALLO_MICROARCH_VERIFY_H
 
 #include "allo/Microarch/Datapath.h"
+#include "allo/Scheduling/OperatorLibrary.h" // prices muxes and units
 
 #include "mlir/Support/LLVM.h"
 
@@ -16,15 +17,20 @@ namespace mlir::allo::uarch {
 /// every required `Source` slot resolved.
 LogicalResult verifyDatapath(dcp::DCPathModuleOp func, const Datapath &dp);
 
-/// Device-contract limits the emitted structure cannot realize.
+/// Device-contract limits the emitted structure cannot realize, including the
+/// clock: the schedule was cut against \p cycleTime (ns) over a datapath with
+/// no sharing muxes, so a binding that grows them is held to it here. \p lib
+/// prices those muxes and the units they feed.
 LogicalResult checkDeviceCapability(dcp::DCPathModuleOp func,
-                                    const Datapath &dp);
+                                    const Datapath &dp, float cycleTime,
+                                    const OperatorLibrary &lib);
 
 /// Shapes outside the subset this emitter lowers.
 LogicalResult checkEmitterSubset(dcp::DCPathModuleOp func, const Datapath &dp);
 
 /// The three above, in order. The one call the emit driver makes.
-LogicalResult validateDatapath(dcp::DCPathModuleOp func, const Datapath &dp);
+LogicalResult validateDatapath(dcp::DCPathModuleOp func, const Datapath &dp,
+                               float cycleTime, const OperatorLibrary &lib);
 
 } // namespace mlir::allo::uarch
 

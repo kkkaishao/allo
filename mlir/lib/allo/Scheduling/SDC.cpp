@@ -425,6 +425,26 @@ static void annotateRegion(circt::scheduling::ChainingProblem &problem,
   r.tripIsBound = tripIsBound;
 }
 
+// Publish the solved allocation into \p model: one entry per instance the
+// region builds, and the instance each operation runs on.
+static void annotateAllocation(OccupancyProblem &problem, ScheduleModel &model,
+                               const OperatorLibrary &lib) {
+  for (circt::scheduling::Problem::ResourceType rsrc :
+       problem.getResourceTypes()) {
+    std::optional<unsigned> units = problem.getAllocation(rsrc);
+    if (!units)
+      continue;
+    SmallVector<Operation *> users = problem.usersOf(rsrc);
+    assert(!users.empty() && "an allocated resource nothing runs on");
+    // One resource is one operator identity, so every operation on it names
+    // the same `dcp.operator`.
+    unsigned base =
+        model.addUnits(lib.lookup(users.front()).identity.realization, *units);
+    for (Operation *op : users)
+      model.setUnit(op, base + *problem.getAssignedUnit(op));
+  }
+}
+
 // The pipeline directive on the loop (or an enclosing loop up to the region
 // anchor), from `s.pipeline(ii=N)` -> `allo.pipeline.ii`:
 //   >= 1  requested target II: a lower bound on the achieved II
@@ -488,6 +508,14 @@ static void recordSolve(ScheduleModel &model, OccupancyProblem &problem,
   for (Operation *op : problem.getOperations())
     if (problem.holdsLimitedUnit(op))
       ++s.limitedOps;
+  // Present only when an exact solve decided an allocation; the ceiling is
+  // what the trivial allocation would have built.
+  for (circt::scheduling::Problem::ResourceType rsrc :
+       problem.getResourceTypes())
+    if (std::optional<unsigned> units = problem.getAllocation(rsrc)) {
+      s.allocatedUnits += *units;
+      s.allocatedOps += problem.getAllocatable(rsrc)->ceiling;
+    }
   if (ii)
     s.ii = (int64_t)*ii;
   s.millis = std::chrono::duration<double, std::milli>(now() - since).count();
@@ -510,7 +538,11 @@ scheduleCyclic(LoopLikeOpInterface body, DependenceAnalysis &deps,
   Block *bodyBlock = &body.getLoopRegions().front()->front();
   if (failed(populateOperatorTypes(*bodyBlock, problem, lib)))
     return failure();
+  reportOperatorClassSplit(problem, lib);
   if (failed(populateMemoryResources(*bodyBlock, problem)))
+    return failure();
+  if (opts.allocate &&
+      failed(populateOperatorAllocation(*bodyBlock, problem, lib)))
     return failure();
   populateCallOccupancy(*bodyBlock, problem);
   Operation *anchor = bodyBlock->getTerminator();
@@ -577,6 +609,7 @@ scheduleCyclic(LoopLikeOpInterface body, DependenceAnalysis &deps,
   }
 
   annotateRegion(problem, model, body.getOperation(), ii, trip, isBound, drain);
+  annotateAllocation(problem, model, lib);
   return success();
 }
 
@@ -598,6 +631,7 @@ static LogicalResult scheduleWhile(scf::WhileOp w, DependenceAnalysis &deps,
           },
           lib)))
     return failure();
+  reportOperatorClassSplit(problem, lib);
   if (failed(populateMemoryResourcesImpl(problem, [&](auto handle) {
         w.getBefore().walk(handle);
         w.getAfter().walk(handle);
@@ -646,7 +680,10 @@ static LogicalResult scheduleAcyclic(ArrayRef<Operation *> ops,
       buildAcyclicProblem<ChainingSharedOperatorsProblem>(ops, deps);
   if (failed(populateOperatorTypes(ops, problem, lib)))
     return failure();
+  reportOperatorClassSplit(problem, lib);
   if (failed(populateMemoryResources(ops, problem)))
+    return failure();
+  if (opts.allocate && failed(populateOperatorAllocation(ops, problem, lib)))
     return failure();
   // A straight-line region runs once, so its whole cost IS its drain, and it
   // carries nothing between iterations it does not have.
@@ -664,6 +701,7 @@ static LogicalResult scheduleAcyclic(ArrayRef<Operation *> ops,
   annotateRegion(problem, model, ops.front(), /*ii=*/std::nullopt,
                  /*trip=*/std::nullopt, /*tripIsBound=*/false,
                  drainOf(problem, outputs));
+  annotateAllocation(problem, model, lib);
   return success();
 }
 

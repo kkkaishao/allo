@@ -162,7 +162,7 @@ MemId DatapathBuilder::getOrCreateMem(Value memref) {
   // Banking / ports from the same storage model the scheduler binds against
   // (allo.part / allo.bind.storage); depthWords is per-bank so that
   // numBanks * depthWords covers the array.
-  auto mc = allo::characterize(memref, memLib.defaultImpl);
+  auto mc = allo::characterize(memref, lib.memoryLibrary().defaultImpl);
   // An initialized global the kernel stores to needs a real write port, so it
   // is a ROM only if nothing writes it. `isRom` is `MemoryChar::constantTable`,
   // the same predicate the scheduler's port model bills against.
@@ -185,7 +185,7 @@ MemId DatapathBuilder::getOrCreateMem(Value memref) {
   // Access latency of the resolved primitive, from the same device table the
   // scheduler timed this memref's accesses against (`MemoryLibrary::timing`).
   // The emitter builds ports at these latencies; do not re-derive from `impl`.
-  auto mkt = memLib.timing(m.impl);
+  auto mkt = lib.memoryLibrary().timing(m.impl);
   m.readLatency = mkt.latency.read;
   m.writeLatency = mkt.latency.write;
   // A dynamic shape would silently size to depthWords 0 (a zero-depth hlmem /
@@ -464,25 +464,21 @@ void DatapathBuilder::bindMemory(Operation *op, Value memref, RegionBlock &rb) {
 void DatapathBuilder::bindCompute(dcp::DCPathComputeOp comp, RegionBlock &rb) {
   FuncUnit u;
   u.id = dp.units.size();
-  if (auto ck = comp.getCombKind()) {
+  u.identity = operatorIdentity(comp);
+  if (u.identity.comb) {
     // Combinational: emitted inline as a `comb` primitive (latency 0).
-    u.opType = stringifyCombOpKindEnum(*ck).str();
-    u.comb = true;
     u.latency = 0;
     u.pipelined = true;
   } else {
-    // IP: `op_type` is the operator's sym_name = the RTL module name, and the
-    // declaration it names is the one copy of its timing and stall contract.
+    // IP: the `dcp.operator` the identity names is the one copy of its timing
+    // and stall contract.
     auto opr = SymbolTable::lookupNearestSymbolFrom<dcp::DCPathOperatorOp>(
         comp, comp.getOpTypeAttr());
     assert(opr && "a dcp.compute op_type must reference a live dcp.operator");
-    u.impl = comp.getOpTypeAttr().getValue().str();
-    u.opType = u.impl;
     u.latency = static_cast<unsigned>(opr.getLatency());
     u.pipelined = opr.getPipelined();
     u.stall = opr.getStall();
   }
-  u.resultType = comp.getResult().getType();
   // The unit's reservation slot: its issue cycle, taken modulo II in a cyclic
   // region since successive iterations overlap there.
   int64_t t = dcpStart(comp);
@@ -1694,7 +1690,7 @@ void DatapathBuilder::build() {
   // units after one of them has been resolved would leave that Source naming
   // a unit with no ops. `producerOf` and `opToUnit` are the only UnitId
   // holders at this point (see the phase order in the header).
-  allocateUnits(policy.plan(dp)); // trivial => one unit per op, a no-op here
+  allocateUnits(policy.plan(dp, {cycleTime, lib})); // trivial => a no-op
   assert(llvm::all_of(dp.units,
                       [](const FuncUnit &u) { return !u.boundOps.empty(); }) &&
          "the unit table is the allocation: a unit exists because ops are "

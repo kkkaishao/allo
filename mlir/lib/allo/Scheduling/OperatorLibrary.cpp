@@ -7,6 +7,7 @@
 
 #include "allo/IR/AlloOps.h"
 #include "allo/Scheduling/AddressModel.h" // addressDelayOf (per-site address)
+#include "allo/Support/Logging.h"         // logging::info
 
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
@@ -15,9 +16,12 @@
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/StringSet.h"
 #include "llvm/ADT/StringSwitch.h"
 #include "llvm/ADT/TypeSwitch.h"
 #include "llvm/Support/FormatVariadic.h"
+
+#include <map>
 
 using namespace mlir;
 using namespace mlir::allo;
@@ -276,6 +280,23 @@ bool needsIP(Operation *op) {
   }
 }
 
+// The identity of the unit \p op runs on. Empty when the caller found no
+// realization, or when \p op is not the single-result compute a `FuncUnit` is
+// built from.
+OperatorIdentity identityOf(Operation *op, std::string realization, bool comb) {
+  OperatorIdentity id;
+  if (realization.empty() || op->getNumResults() != 1)
+    return id;
+  id.realization = std::move(realization);
+  id.comb = comb;
+  id.argTypes.assign(op->getOperandTypes().begin(),
+                     op->getOperandTypes().end());
+  id.resultType = op->getResult(0).getType();
+  id.predicate = op->getAttr("predicate");
+  id.map = op->getAttr("map");
+  return id;
+}
+
 MemoryLibrary memoryFromDevice(dcp::DCPathDeviceOp device) {
   MemoryLibrary m;
   auto i64 = [](DictionaryAttr d, StringRef k) {
@@ -350,6 +371,7 @@ OperatorLibrary OperatorLibrary::fromModule(ModuleOp module) {
   module.walk([&](dcp::DCPathOperatorOp op) {
     OperatorEntry e;
     e.latency = (uint32_t)op.getLatency();
+    e.pipelined = op.getPipelined();
     e.inDelay = op.getInDelay().convertToDouble();
     e.outDelay = op.getOutDelay().convertToDouble();
     e.symbol = op.getSymName().str();
@@ -371,14 +393,73 @@ OperatorLibrary OperatorLibrary::fromModule(ModuleOp module) {
 // Lookup
 //===----------------------------------------------------------------------===//
 
-double OperatorLibrary::combDelay(OpKind kind) const {
-  // Last wins, like `matchEntry`. `dcp.device.comb` is a dictionary, so there
-  // is at most one row per kind in practice.
-  double delay = 0.0;
+OpKind mlir::allo::opKindOf(CombOpKindEnum kind) {
+  using E = CombOpKindEnum;
+  switch (kind) {
+  case E::Addi:
+    return OpKind::Add;
+  case E::Subi:
+    return OpKind::Sub;
+  case E::Muli:
+    return OpKind::Mul;
+  case E::Divsi:
+  case E::Divui:
+    return OpKind::Div;
+  case E::Remsi:
+  case E::Remui:
+    return OpKind::Rem;
+  case E::Andi:
+    return OpKind::And;
+  case E::Ori:
+    return OpKind::Or;
+  case E::Xori:
+    return OpKind::Xor;
+  case E::Shli:
+    return OpKind::Shl;
+  case E::Shrsi:
+  case E::Shrui:
+    return OpKind::Shr;
+  case E::Cmpi:
+    return OpKind::Cmp;
+  case E::Select:
+    return OpKind::Select;
+  case E::Extsi:
+  case E::Extui:
+  case E::Trunci:
+  case E::IndexCast:
+    return OpKind::ICastI;
+  case E::Negf:
+    return OpKind::Neg;
+  case E::Minsi:
+  case E::Minui:
+    return OpKind::Min;
+  case E::Maxsi:
+  case E::Maxui:
+    return OpKind::Max;
+  case E::Apply:
+    return OpKind::Unknown; // no abstract row; priced by the default one
+  }
+  llvm_unreachable("every comb realization names an abstract kind or Unknown");
+}
+
+const OperatorEntry *OperatorLibrary::combEntry(OpKind kind) const {
+  // `dcp.device.comb` is a dictionary, so there is at most one row per kind in
+  // practice.
+  const OperatorEntry *found = nullptr;
   for (const OperatorEntry &e : entries)
     if (e.comb && e.kind == kind)
-      delay = e.outDelay;
-  return delay;
+      found = &e;
+  return found;
+}
+
+double OperatorLibrary::combDelay(CombOpKindEnum kind) const {
+  const OperatorEntry *e = combEntry(opKindOf(kind));
+  return e ? e->outDelay : defaultEntry.outDelay;
+}
+
+double OperatorLibrary::combDelay(OpKind kind) const {
+  const OperatorEntry *e = combEntry(kind);
+  return e ? e->outDelay : 0.0;
 }
 
 OperatorChar OperatorLibrary::lookup(Operation *op) const {
@@ -436,17 +517,81 @@ OperatorChar OperatorLibrary::lookup(Operation *op) const {
   }
 
   // The stable Problem::OperatorType key: an IP row's symbol, a comb row's
-  // `comb.<kind>`, else `default`. A non-empty `symbol` denotes the IP
-  // realization path (`op_type`); an empty one, the combinational path.
+  // `comb.<kind>`, else `default`.
   OperatorChar c;
   c.typeName = !e->symbol.empty() ? e->symbol
                : e->comb          ? ("comb." + opKindString(e->kind)).str()
                                   : std::string("default");
   c.latency = e->latency;
+  c.pipelined = e->pipelined;
   c.inDelay = e->inDelay;
   c.outDelay = e->outDelay;
-  c.symbol = e->symbol;
+  // The realization is the row's own symbol when it is an IP, else the native
+  // lowering the reifier picks; the default row reaches the comb arm too.
+  if (!e->symbol.empty())
+    c.identity = identityOf(op, e->symbol, /*comb=*/false);
+  else if (std::optional<CombOpKindEnum> ck = combKindOf(op))
+    c.identity = identityOf(op, stringifyCombOpKindEnum(*ck).str(), true);
   return c;
+}
+
+std::string OperatorIdentity::key() const {
+  std::string s = realization;
+  llvm::raw_string_ostream os(s);
+  os << '(';
+  llvm::interleaveComma(argTypes, os);
+  os << ")->" << resultType;
+  if (predicate)
+    os << " p" << predicate;
+  if (map)
+    os << " m" << map;
+  return os.str();
+}
+
+OperatorIdentity mlir::allo::operatorIdentity(dcp::DCPathComputeOp comp) {
+  if (std::optional<CombOpKindEnum> ck = comp.getCombKind())
+    return identityOf(comp, stringifyCombOpKindEnum(*ck).str(), true);
+  return identityOf(comp, comp.getOpTypeAttr().getValue().str(), false);
+}
+
+OperatorIdentity mlir::allo::operatorIdentity(Operation *op,
+                                              const OperatorLibrary &lib) {
+  if (auto comp = dyn_cast<dcp::DCPathComputeOp>(op))
+    return operatorIdentity(comp);
+  return lib.lookup(op).identity;
+}
+
+void mlir::allo::reportOperatorClassSplit(circt::scheduling::Problem &problem,
+                                          const OperatorLibrary &lib) {
+  if (!logging::detail::enabled(logging::Level::Info))
+    return;
+  // Operator type -> {ops priced under it, their distinct identities}. Sorted,
+  // so two compiles report the classes in the same order.
+  std::map<std::string, std::pair<unsigned, llvm::StringSet<>>> byType;
+  for (Operation *op : problem.getOperations()) {
+    OperatorIdentity id = operatorIdentity(op, lib);
+    if (!id.realized())
+      continue;
+    auto &[count, classes] = byType[lib.lookup(op).typeName];
+    ++count;
+    classes.insert(id.key());
+  }
+
+  // Only a type pricing several ops under several identities over-approximates.
+  llvm::SmallVector<std::pair<std::string, std::pair<unsigned, unsigned>>>
+      split;
+  for (auto &[type, seen] : byType)
+    if (seen.first > 1 && seen.second.size() > 1)
+      split.push_back({type, {seen.first, (unsigned)seen.second.size()}});
+  if (split.empty())
+    return;
+
+  auto d = logging::info(logging::Stage::Sched, problem.getContainingOp());
+  d << "Operator classes: " << split.size() << " of " << byType.size()
+    << " operator types cover several operator identities:";
+  for (auto &[type, counts] : split)
+    d << " " << type << " " << counts.first << " ops / " << counts.second
+      << " classes,";
 }
 
 bool OperatorLibrary::requiresUnmatchedIP(Operation *op) const {

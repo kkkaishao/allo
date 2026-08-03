@@ -136,6 +136,20 @@ _CARRIED = re.compile(
     r"(\d+) unknown-distance"
 )
 _RAISED = re.compile(r"Raised (\d+) loop\(s\) and (\d+) further memref access")
+# Per region, what the allocation cost: compute ops, the units they were bound
+# to, and the interconnect sharing grew.
+_ALLOC = re.compile(
+    r"Allocation: (\d+) compute ops on (\d+) units \((\d+) IP\), "
+    r"(\d+) muxes, (\d+) mux inputs, (\d+) 2:1 mux bits"
+)
+# Per region, the operator types whose timing row covers several operator
+# identities. A binder folds only within one identity, so a limit keyed on the
+# type over-approximates the hardware it can build.
+_SPLIT = re.compile(
+    r"Operator classes: \d+ of \d+ operator types cover several operator "
+    r"identities:(.*)"
+)
+_SPLIT_ONE = re.compile(r"(\S+) (\d+) ops / (\d+) classes")
 
 
 def _load(key):
@@ -155,12 +169,15 @@ def measure_one(
     stage: str,
     freq: float | None = None,
     budget: float | None = None,
+    binding: str = "trivial",
 ) -> dict:
     """Schedule (and by default compile) one variant, returning its metrics.
 
     ``freq`` overrides the device's default clock (MHz), i.e. the period the
     chaining half of every problem is cut against. ``budget`` overrides what one
-    exact solve may spend, in deterministic time units."""
+    exact solve may spend, in deterministic time units. ``binding`` is the
+    operator-sharing policy, i.e. how many physical units the schedule is
+    realized on."""
     bench = _load(key)
     out: dict = {
         "key": key,
@@ -168,6 +185,7 @@ def measure_one(
         "scheduler": scheduler,
         "freq_mhz": freq,
         "budget": budget,
+        "binding": binding,
         "stage": "build",
         "status": "error",
     }
@@ -181,7 +199,7 @@ def measure_one(
         sched = bench.schedules[variant](parts)
 
         out["stage"] = "schedule"
-        opts = {"scheduler": scheduler}
+        opts = {"scheduler": scheduler, "binding": binding}
         if freq is not None:
             opts["freq_mhz"] = freq
         if budget is not None:
@@ -221,6 +239,8 @@ def measure_one(
                 "kind": s.kind,
                 "ops": s.ops,
                 "limited_ops": s.limited_ops,
+                "allocated_ops": s.allocated_ops,
+                "allocated_units": s.allocated_units,
                 "ii": s.ii,
                 "ms": round(s.ms, 2),
             }
@@ -243,6 +263,13 @@ def measure_one(
             # figure below matches.
             out["verilog_sha"] = hashlib.sha256(verilog.encode()).hexdigest()[:16]
             out.update(count_registers(verilog))
+            # The allocation as the emitted hardware states it: one
+            # `hw.instance` per IP operator, so a fold drops one. A
+            # combinational unit is an expression with no instance to count, so
+            # only its muxes show up here.
+            hw = rtl.mlir
+            out["hw_instances"] = hw.count("hw.instance")
+            out["comb_muxes"] = hw.count("comb.mux")
 
         out["status"] = "pass"
     except BaseException as e:  # a fired assert is a result, not a crash
@@ -253,7 +280,12 @@ def measure_one(
 
 
 def _run_child(
-    item, stage: str, timeout: int, freq: float | None, budget: float | None
+    item,
+    stage: str,
+    timeout: int,
+    freq: float | None,
+    budget: float | None,
+    binding: str,
 ) -> dict:
     key, variant, scheduler = item
     env = dict(os.environ)
@@ -268,6 +300,8 @@ def _run_child(
         f"{key}::{variant}::{scheduler}",
         "--stage",
         stage,
+        "--binding",
+        binding,
     ]
     if freq is not None:
         cmd += ["--freq", str(freq)]
@@ -303,6 +337,22 @@ def _run_child(
             ]
             d["raised"] = [
                 sum(int(m[i]) for m in _RAISED.findall(text)) for i in (0, 1)
+            ]
+            # Both need ALLO_LOG_LEVEL=info and are absent at the default level.
+            d["alloc"] = [
+                dict(
+                    zip(("ops", "units", "ip", "muxes", "mux_inputs", "mux_bits"),
+                        (int(x) for x in m))
+                )
+                for m in _ALLOC.findall(text)
+            ]
+            if d["alloc"]:
+                for f in ("ops", "units", "muxes", "mux_bits"):
+                    d[f"alloc_{f}"] = sum(a[f] for a in d["alloc"])
+            d["class_splits"] = [
+                {"type": t, "ops": int(n), "classes": int(c)}
+                for tail in _SPLIT.findall(text)
+                for t, n, c in _SPLIT_ONE.findall(tail)
             ]
             d["warnings"] = [l.strip()[:300] for l in text.splitlines() if "WARN" in l][
                 :20
@@ -420,8 +470,62 @@ def solve_table(results: list[dict], top: int) -> str:
     return "\n".join(lines)
 
 
+def alloc_table(results: list[dict]) -> str:
+    """Per variant, how many physical units the schedule was realized on and
+    what interconnect that took.
+
+    `ops/unit` is the sharing ratio, 1.00 under the trivial binding. `muxFF` is
+    the 2:1-mux bit count that sharing cost. Needs ALLO_LOG_LEVEL=info; empty
+    otherwise."""
+    rows = [r for r in results if r.get("alloc")]
+    if not rows:
+        return "no allocation data (re-run with ALLO_LOG_LEVEL=info)"
+    head = (
+        f"{'benchmark/variant':<34} {'sched':<6} {'regions':>7} {'ops':>7}"
+        f" {'units':>7} {'ops/unit':>9} {'muxes':>7} {'muxFF':>9} {'splits':>7}"
+    )
+    lines = [head, "-" * len(head)]
+    tot = dict.fromkeys(("ops", "units", "muxes", "mux_bits"), 0)
+    for r in sorted(rows, key=lambda r: -r.get("alloc_mux_bits", 0)):
+        o, u = r["alloc_ops"], r["alloc_units"]
+        for f in tot:
+            tot[f] += r[f"alloc_{f}"]
+        lines.append(
+            f"{_key_of(r):<34} {r['scheduler'][:6]:<6} {len(r['alloc']):>7}"
+            f" {o:>7} {u:>7} {o / u:>9.2f} {r['alloc_muxes']:>7}"
+            f" {r['alloc_mux_bits']:>9} {len(r.get('class_splits', [])):>7}"
+        )
+    lines.append("-" * len(head))
+    lines.append(
+        f"{'TOTAL':<34} {'':<6} {'':>7} {tot['ops']:>7} {tot['units']:>7}"
+        f" {tot['ops'] / max(tot['units'], 1):>9.2f} {tot['muxes']:>7}"
+        f" {tot['mux_bits']:>9}"
+    )
+    return "\n".join(lines)
+
+
+def split_table(results: list[dict]) -> str:
+    """Where one timing row covers several operator identities, aggregated over
+    the bed. A binder folds only within one identity, so a count keyed on the
+    operator type spans several physical operators."""
+    agg: dict[str, list[int]] = {}
+    for r in results:
+        for s in r.get("class_splits", []):
+            row = agg.setdefault(s["type"], [0, 0, 0])
+            row[0] += 1  # regions where this type splits
+            row[1] += s["ops"]
+            row[2] = max(row[2], s["classes"])
+    if not agg:
+        return "no operator type splits (or ALLO_LOG_LEVEL is not info)"
+    head = f"{'operator type':<28} {'regions':>8} {'ops':>8} {'max classes':>12}"
+    lines = [head, "-" * len(head)]
+    for t, (n, ops, mx) in sorted(agg.items(), key=lambda kv: -kv[1][1]):
+        lines.append(f"{t:<28} {n:>8} {ops:>8} {mx:>12}")
+    return "\n".join(lines)
+
+
 def compare_table(base: list[dict], new: list[dict]) -> str:
-    """What moved between two runs. THE output a modelling change is argued from.
+    """What moved between two runs.
 
     Only exact latencies are differenced: a bound may move because the
     assumption behind it moved, which is not a schedule getting better."""
@@ -497,10 +601,23 @@ def main():
         "deterministic time units (default 10). The axis a budget policy is "
         "swept over; it does nothing to the heuristic",
     )
+    ap.add_argument(
+        "--binding",
+        default="trivial",
+        help="operator-sharing policy: 'trivial' (the default, one unit per "
+        "op), 'greedy-share' or 'planned', which builds the allocation the "
+        "exact scheduler decided",
+    )
     ap.add_argument("--timeout", type=int, default=900, help="wall seconds per run")
     ap.add_argument("-o", "--out", default="qor.json")
     ap.add_argument("--per-region", action="store_true")
     ap.add_argument("--solves", type=int, default=0, metavar="N", help="slowest N")
+    ap.add_argument(
+        "--alloc",
+        action="store_true",
+        help="the per-variant allocation (units, muxes) and the operator-type "
+        "splits. Both need ALLO_LOG_LEVEL=info",
+    )
     ap.add_argument("--compare", metavar="BASE.json", help="diff against a saved run")
     args = ap.parse_args()
 
@@ -510,7 +627,13 @@ def main():
             MARK
             + json.dumps(
                 measure_one(
-                    key, variant, scheduler, args.stage, args.freq, args.budget
+                    key,
+                    variant,
+                    scheduler,
+                    args.stage,
+                    args.freq,
+                    args.budget,
+                    args.binding,
                 )
             )
         )
@@ -543,7 +666,8 @@ def main():
     clock = f", freq={args.freq}MHz" if args.freq else ""
     pool_size = f", budget={args.budget}" if args.budget else ""
     print(
-        f"{len(work)} runs, {args.jobs} jobs, stage={args.stage}{clock}{pool_size}",
+        f"{len(work)} runs, {args.jobs} jobs, stage={args.stage}"
+        f", binding={args.binding}{clock}{pool_size}",
         flush=True,
     )
 
@@ -551,7 +675,13 @@ def main():
     with ThreadPoolExecutor(max_workers=args.jobs) as pool:
         futs = [
             pool.submit(
-                _run_child, w, args.stage, args.timeout, args.freq, args.budget
+                _run_child,
+                w,
+                args.stage,
+                args.timeout,
+                args.freq,
+                args.budget,
+                args.binding,
             )
             for w in work
         ]
@@ -575,6 +705,9 @@ def main():
         print("\n" + region_table(ok))
     if args.solves:
         print("\n" + solve_table(ok, args.solves))
+    if args.alloc:
+        print("\n" + alloc_table(ok))
+        print("\n" + split_table(ok))
 
     tally = {}
     for r in results:

@@ -38,40 +38,17 @@ bool reservationsDisjoint(const Reservation &a, const Reservation &b) {
                        [&](unsigned c) { return cyclesA.contains(c); });
 }
 
-bool sameOperatorType(const FuncUnit &a, const FuncUnit &b) {
-  if (a.opType != b.opType || a.impl != b.impl || a.resultType != b.resultType)
-    return false;
-  // opType/impl/resultType alone under-specify the operator (operand widths,
-  // predicate, or map can differ). The emitter builds from `repOp()`, so
-  // reject divergent merges here; verifyBinding backstops it post-merge.
-  Operation *oa = a.repOp();
-  Operation *ob = b.repOp();
-  return std::equal(oa->getOperandTypes().begin(), oa->getOperandTypes().end(),
-                    ob->getOperandTypes().begin(),
-                    ob->getOperandTypes().end()) &&
-         oa->getAttr("predicate") == ob->getAttr("predicate") &&
-         oa->getAttr("map") == ob->getAttr("map");
-}
-
 void verifyBinding(const Datapath &dp) {
   for (const RegionBlock &rb : dp.regions)
     for (UnitId uid : rb.units) {
       const FuncUnit &u = dp.units[uid];
-      // The emitter builds one physical unit from boundOps.front() (operand
-      // widths, predicate, map). A merge that differs in these would miscompile
-      // the non-front ops; this backstops that (vacuous under trivial binding).
-      if (Operation *f = u.boundOps.empty() ? nullptr : u.repOp())
-        for (const auto &bo : u.boundOps)
-          assert(
-              std::equal(bo.first->getOperandTypes().begin(),
-                         bo.first->getOperandTypes().end(),
-                         f->getOperandTypes().begin(),
-                         f->getOperandTypes().end()) &&
-              bo.first->getAttr("predicate") == f->getAttr("predicate") &&
-              bo.first->getAttr("map") == f->getAttr("map") &&
-              "shared unit binds semantically divergent ops (operand widths / "
-              "compare predicate / apply map differ); emit uses "
-              "repOp() and miscompiles the others");
+      // The emitter builds one operator from the unit's identity, so a bound
+      // op of any other identity would be miscompiled. Vacuous under trivial
+      // binding.
+      for (const auto &bo : u.boundOps)
+        assert(operatorIdentity(cast<dcp::DCPathComputeOp>(bo.first)) ==
+                   u.identity &&
+               "shared unit binds an op of a different operator identity");
       for (unsigned i = 0, e = u.boundOps.size(); i < e; ++i) {
         auto ri = reservationOf(rb, u, u.boundOps[i].second);
         for (unsigned j = i + 1; j < e; ++j) {

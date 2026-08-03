@@ -43,15 +43,16 @@ namespace mlir::allo::uarch {
 // Native (comb) units emit inline, no extern. One input port per operand
 // (`a`, `b`, `c`, ... at its width), then clk, then `ce` when the realization
 // is clock-enabled (`ce == 0` freezes it in lockstep with the shell), then the
-// output. Port shape is a function of `impl` alone, so one module name safely
-// covers every instance. Returns unit id -> its extern module.
+// output. Port shape is a function of the unit's identity, so deduplicating by
+// module name is safe only as far as the name separates identities, which the
+// assert below checks. Returns unit id -> its extern module.
 //
-// The module name is the `dcp.operator`'s own `sym_name`; that declaration
-// stays live until every kernel has emitted, so the symbol is briefly
-// duplicated (legal: nothing verifies between). `SymbolTable::lookupSymbolIn`
-// returns the first match in block order, so the declarations are injected at
-// the block's beginning to keep the `dcp.operator` first and lookup
-// unambiguous.
+// The module name stems from the `dcp.operator`'s own `sym_name`; that
+// declaration stays live until every kernel has emitted, so the symbol is
+// briefly duplicated (legal: nothing verifies between).
+// `SymbolTable::lookupSymbolIn` returns the first match in block order, so the
+// declarations are injected at the block's beginning to keep the
+// `dcp.operator` first and lookup unambiguous.
 static DenseMap<unsigned, Operation *>
 declareOperatorModules(dcp::DCPathModuleOp func, const uarch::Datapath &dp,
                        OpBuilder &b, llvm::StringMap<Operation *> &opModules,
@@ -61,18 +62,20 @@ declareOperatorModules(dcp::DCPathModuleOp func, const uarch::Datapath &dp,
   using PortInfo = hw::PortInfo;
   using Dir = hw::ModulePort::Direction;
   DenseMap<unsigned, Operation *> unitModule;
-  llvm::StringSet<> listed; // one manifest entry per module, not per unit
+  // One manifest entry per module, not per unit; the value is the identity
+  // that claimed the name.
+  llvm::StringMap<const allo::OperatorIdentity *> listed;
   for (const uarch::FuncUnit &u : dp.units) {
-    if (u.comb)
+    if (u.identity.comb)
       continue;
     Operation *srcOp = u.repOp();
     assert(u.inputs.size() == srcOp->getNumOperands() &&
            "IP unit input count must match its bound op's operand count");
-    IntegerType outW = hwType(u.resultType, b);
+    IntegerType outW = hwType(u.identity.resultType, b);
     std::string modName = operatorModuleName(u);
-    // The port shape is a function of the realization, so every instance of a
-    // module name shares it: build the manifest entry alongside the ports.
-    iface::Operator entry{modName, u.impl, operatorPredicate(u), {}};
+    // Build the manifest entry alongside the ports.
+    iface::Operator entry{
+        modName, u.identity.realization, operatorPredicate(u), {}};
     SmallVector<PortInfo> ep;
     for (unsigned k = 0; k < u.inputs.size(); ++k) {
       IntegerType w = hwType(srcOp->getOperand(k).getType(), b);
@@ -94,7 +97,10 @@ declareOperatorModules(dcp::DCPathModuleOp func, const uarch::Datapath &dp,
     if (!mod)
       mod = hw::HWModuleExternOp::create(b, loc, StringAttr::get(ctx, modName),
                                          hw::ModulePortInfo(ep));
-    if (listed.insert(modName).second)
+    auto [claim, fresh] = listed.try_emplace(modName, &u.identity);
+    assert(*claim->second == u.identity &&
+           "two operator identities share one module name");
+    if (fresh)
       declared.push_back(std::move(entry));
     unitModule[u.id] = mod;
   }
@@ -220,11 +226,12 @@ llvm::StringMap<Value> instantiateChild(OpBuilder &b, Location loc,
 // functions.
 static FailureOr<std::pair<hw::HWModuleOp, iface::ModuleInterface>>
 emitModule(dcp::DCPathModuleOp func, uarch::Datapath &dp, OpBuilder &b,
-           llvm::StringMap<Operation *> &opModules,
+           llvm::StringMap<Operation *> &opModules, float cycleTime,
+           const OperatorLibrary &lib,
            const uarch::CalleeCtx *callees = nullptr) {
   auto *ctx = b.getContext();
   Location loc = func.getLoc();
-  if (failed(validateDatapath(func, dp)))
+  if (failed(validateDatapath(func, dp, cycleTime, lib)))
     return failure();
 
   Type i1 = b.getI1Type();
@@ -271,12 +278,12 @@ static void cleanupDcpOps(ModuleOp module) {
   for (memref::GlobalOp g :
        llvm::make_early_inc_range(module.getOps<memref::GlobalOp>()))
     g.erase();
-  // The spent declarations, dropped LAST: every `dcp.compute` reads its timing
-  // off the `dcp.operator` it names, and dropping them is also what leaves each
-  // extern operator module the sole owner of the `sym_name` it shares.
+  // Spent declarations, dropped last: a `dcp.compute` reads its timing off the
+  // `dcp.operator` it names and a `dcp.unit` references one, and dropping them
+  // leaves each extern operator module sole owner of its `sym_name`.
   SmallVector<Operation *> spent;
   module.walk([&](Operation *op) {
-    if (isa<dcp::DCPathOperatorOp, dcp::DCPathDeviceOp>(op))
+    if (isa<dcp::DCPathOperatorOp, dcp::DCPathDeviceOp, dcp::DCPathUnitOp>(op))
       spent.push_back(op);
   });
   for (Operation *op : spent)
@@ -284,7 +291,7 @@ static void cleanupDcpOps(ModuleOp module) {
 }
 
 LogicalResult emitDatapathToHW(ModuleOp module, StringRef binding,
-                               StringRef top,
+                               StringRef top, float cycleTime,
                                llvm::StringMap<std::string> &interfaces) {
   // Called directly (not via the pass manager), so load the dialects this
   // emits, the ones the pass declares as dependent, into the context.
@@ -293,10 +300,10 @@ LogicalResult emitDatapathToHW(ModuleOp module, StringRef binding,
   ctx->getOrLoadDialect<comb::CombDialect>();
   ctx->getOrLoadDialect<seq::SeqDialect>();
 
-  // Storage timing has no per-access carrier, so it threads into the datapath
-  // builder as a library. Compute timing needs none: a `dcp.compute` names its
-  // `dcp.operator`, and that declaration stays live for the whole of emission.
-  MemoryLibrary memLib = OperatorLibrary::fromModule(module).memoryLibrary();
+  // Storage and comb timing have no per-access carrier, so they thread into
+  // the datapath builder as a library; an IP's timing rides the `dcp.operator`
+  // its `dcp.compute` names, which stays live for the whole of emission.
+  OperatorLibrary lib = OperatorLibrary::fromModule(module);
 
   // Every reified kernel is a `dcp.module`; there is no second container to
   // filter for a schedule, because carrying one is what the op is.
@@ -306,7 +313,7 @@ LogicalResult emitDatapathToHW(ModuleOp module, StringRef binding,
   if (!policy) {
     error(Stage::Emit, module)
         << "Unknown binding policy '" << binding
-        << "'; the policies are 'trivial' and 'greedy-share'";
+        << "'; the policies are 'trivial', 'greedy-share' and 'planned'";
     return failure();
   }
 
@@ -367,13 +374,14 @@ LogicalResult emitDatapathToHW(ModuleOp module, StringRef binding,
     });
     uarch::CalleeCtx cc{modules, ifaceModels};
     const uarch::CalleeCtx *callees = hasInvoke ? &cc : nullptr;
-    Datapath dp(f, *policy, memLib, callees, /*isTop=*/f == topFunc);
+    Datapath dp(f, *policy, lib, cycleTime, callees, /*isTop=*/f == topFunc);
     LLVM_DEBUG({
       llvm::dbgs() << "// datapath for @" << f.getSymName() << "\n";
       dp.dump(llvm::dbgs());
     });
+    dp.reportAllocation();
     b.setInsertionPoint(f);
-    auto pairOr = emitModule(f, dp, b, opModules, callees);
+    auto pairOr = emitModule(f, dp, b, opModules, cycleTime, lib, callees);
     if (failed(pairOr))
       return failure();
     registerModule(f.getSymName(), pairOr->first, std::move(pairOr->second));

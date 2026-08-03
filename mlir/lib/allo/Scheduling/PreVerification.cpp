@@ -168,10 +168,10 @@ LogicalResult checkOperations(func::FuncOp func, const OperatorLibrary &lib) {
     }
     if (!isComputeOp(op))
       return WalkResult::advance();
-    std::string symbol = lib.lookup(op).symbol;
-    // The two realization paths, in the order the reifier tries them: an IP
-    // row's symbol, else a native comb lowering.
-    if (symbol.empty() && !combKindOf(op)) {
+    // The identity names the IP row's symbol or the native comb lowering, and
+    // is empty when the device offers neither.
+    OperatorIdentity id = operatorIdentity(op, lib);
+    if (!id.realized()) {
       error(Stage::Prep, op)
           << "Operator '" << op->getName()
           << "' is not realized by the device: it has neither an IP module "
@@ -179,7 +179,7 @@ LogicalResult checkOperations(func::FuncOp func, const OperatorLibrary &lib) {
              "support";
       return WalkResult::interrupt();
     }
-    if (!symbol.empty() && failed(checkStallContract(op, symbol)))
+    if (!id.comb && failed(checkStallContract(op, id.realization)))
       return WalkResult::interrupt();
     return WalkResult::advance();
   });

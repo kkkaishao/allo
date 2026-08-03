@@ -65,6 +65,7 @@ LLVM_USE_LINKER = "lld"
 
 [[tool.scikit-build.overrides]]
 if.env.ALLO_ENABLE_ORTOOLS = true
+inherit.cmake.define = "append"
 cmake.define.ALLO_ENABLE_ORTOOLS = "ON"
 
 [tool.scikit-build.editable]

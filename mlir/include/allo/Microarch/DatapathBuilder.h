@@ -71,14 +71,16 @@ struct DatapathBuilder {
                                   // `sources` survive later pushes
 
   const BindingPolicy &policy; // decides resource sharing
-  const MemoryLibrary &memLib; // device storage timing (impl + access latency)
+  const OperatorLibrary &lib;  // device storage + operator timing
+  float cycleTime;             // the period the schedule was cut against
   const CalleeCtx *callees;    // child modules/ifaces for a dcp.instance
                                // (null for a plain leaf, no calls)
 
   DatapathBuilder(Datapath &dp, dcp::DCPathModuleOp func,
-                  const BindingPolicy &policy, const MemoryLibrary &memLib,
-                  const CalleeCtx *callees = nullptr)
-      : dp(dp), func(func), policy(policy), memLib(memLib), callees(callees) {}
+                  const BindingPolicy &policy, const OperatorLibrary &lib,
+                  float cycleTime, const CalleeCtx *callees = nullptr)
+      : dp(dp), func(func), policy(policy), lib(lib), cycleTime(cycleTime),
+        callees(callees) {}
 
   /// build the datapath model
   void build();

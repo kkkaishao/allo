@@ -193,12 +193,12 @@ std::string childInstanceName(llvm::StringRef callee, unsigned n);
 /// (`fifo_mem`, `fifo_count`) with no name attribute to steer them.
 std::string channelSignal(llvm::StringRef chan, llvm::StringRef sig);
 
-/// The extern operator-module name for an IP-realized unit: its `impl` (the
-/// operator's RTL module name), with a floating-point compare additionally
-/// encoding its predicate, since `impl` alone (`fcmp_l1`) does not say which
-/// comparison. Not passed through `verilogName`, because the simulation-model
-/// generator joins this name back to the device operator's `sym_name` and it
-/// must stay the device's own string.
+/// The extern operator-module name for an IP-realized unit: the `dcp.operator`
+/// symbol its `OperatorIdentity` names, with a floating-point compare
+/// additionally encoding its predicate, since the symbol alone (`fcmp_l1`) does
+/// not say which comparison. Not passed through `verilogName`, because the
+/// simulation-model generator joins this name back to the device operator's
+/// `sym_name` and it must stay the device's string.
 std::string operatorModuleName(const FuncUnit &u);
 /// The predicate an operator module name encodes (a floating-point compare's
 /// `ogt`), empty otherwise. Published in the manifest so the simulation model
