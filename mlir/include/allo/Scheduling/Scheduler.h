@@ -319,6 +319,12 @@ inline int64_t drainOf(circt::scheduling::Problem &problem,
 /// per value and region), which is what makes this a SUM over values that is
 /// linear in the schedule rather than a MAXLIVE over time coupled to an
 /// allocation, and so a term an objective can carry directly.
+///
+/// It over-states a cyclic region by up to the II: only one iteration is in
+/// flight per II cycles, so the emitter folds the chain to `ceil(depth / ii)`
+/// registers (`EmitContext::foldedChain`). Staying linear is what keeps the
+/// term carryable, so the objective prices the unfolded chain and is
+/// conservative about anything that buys area by lengthening a lifetime.
 struct RegisterTerm {
   Operation *def;
   /// Cycles after `def` issues before the value is readable.
