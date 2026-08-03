@@ -49,7 +49,15 @@ struct Assumption {
   int64_t c, k;
   bool isEq; // true: == 0, false: >= 0
 };
+
+// Two accesses, orientation-independent: the polyhedral test visits a pair in
+// both orders and one undecided orientation condemns the pair.
+using OpPair = std::pair<Operation *, Operation *>;
 } // namespace
+
+static OpPair unorderedPair(Operation *a, Operation *b) {
+  return a < b ? OpPair{a, b} : OpPair{b, a};
+}
 
 // Parse a comparison of one SSA value against a constant into `c*v + k
 // (>=|==) 0`. Returns nullopt for shapes not modeled (a `ne`, or both
@@ -176,10 +184,15 @@ rescaleOnLoopStep(SmallVectorImpl<affine::DependenceComponent> &comps) {
 //
 // A pair with either endpoint the test cannot model (`nonPolyhedral`) is
 // skipped entirely and left to the conservative path, so each pair is owned
-// by exactly one analysis.
+// by exactly one analysis. A pair the test ACCEPTS but cannot decide answers
+// `Failure`, which is not `NoDependence`, so it joins \p undecided and takes
+// the conservative path too: `hasDependence` is true only for a proven
+// dependence, and an undecided pair left silently unordered would let two
+// accesses that may alias share a cycle.
 static void
 checkMemrefDependence(ArrayRef<Operation *> memoryOps,
                       const llvm::SmallDenseSet<Operation *> &nonPolyhedral,
+                      llvm::DenseSet<OpPair> &undecided,
                       MemoryDependenceResult &results) {
   for (Operation *dst : memoryOps) {
     results.try_emplace(dst); // every access gets a (possibly empty) entry
@@ -200,6 +213,8 @@ checkMemrefDependence(ArrayRef<Operation *> memoryOps,
         SmallVector<affine::DependenceComponent, 2> comps;
         auto result = affine::checkMemrefAccessDependence(
             srcAccess, dstAccess, depth, &constraints, &comps, allowRAR);
+        if (result.value == affine::DependenceResult::Failure)
+          undecided.insert(unorderedPair(src, dst));
         if (hasDependence(result.value)) {
           rescaleOnLoopStep(comps);
           results[dst].emplace_back(src, result.value, comps);
@@ -416,14 +431,16 @@ memDepComponents(Operation *op, int64_t distance) {
 static void checkConservativeDependence(
     ArrayRef<Operation *> accessOps,
     const llvm::SmallDenseSet<Operation *> &nonPolyhedral,
-    MemoryDependenceResult &results) {
+    const llvm::DenseSet<OpPair> &undecided, MemoryDependenceResult &results) {
   for (unsigned i = 0, e = accessOps.size(); i < e; ++i) {
     for (unsigned j = i + 1; j < e; ++j) {
       Operation *earlier = accessOps[i];
       Operation *later = accessOps[j];
 
-      // Pairs the polyhedral test models are handled precisely there.
-      if (!nonPolyhedral.contains(earlier) && !nonPolyhedral.contains(later))
+      // Pairs the polyhedral test models are handled precisely there, unless it
+      // answered `Failure` and so decided nothing.
+      if (!nonPolyhedral.contains(earlier) && !nonPolyhedral.contains(later) &&
+          !undecided.contains(unorderedPair(earlier, later)))
         continue;
       // Different arrays never conflict (distinct roots are distinct arrays;
       // the Allo frontend has no pointers); read-read pairs commute.
@@ -626,10 +643,12 @@ DependenceAnalysis::DependenceAnalysis(func::FuncOp funcOp) : func(funcOp) {
 
   // Affine memref dependences: each ordered pair over all carried depths plus
   // the loop-independent (intra-iteration) depth (see checkMemrefDependence).
-  checkMemrefDependence(memoryOps, nonPolyhedral, results);
+  llvm::DenseSet<OpPair> undecided;
+  checkMemrefDependence(memoryOps, nonPolyhedral, undecided, results);
 
-  // Conservative ordering for the pairs the polyhedral test skips.
-  checkConservativeDependence(accessOps, nonPolyhedral, results);
+  // Conservative ordering for the pairs the polyhedral test skips or cannot
+  // decide.
+  checkConservativeDependence(accessOps, nonPolyhedral, undecided, results);
 
   AffineValueMapBuilder builder(funcOp.getContext());
   checkStreamDependence(streamOps, builder, results);
