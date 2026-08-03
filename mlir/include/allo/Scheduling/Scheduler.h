@@ -22,11 +22,11 @@ namespace mlir::allo {
 /// pipelined. CIRCT's `SharedOperatorsProblem` assumes they are: a limited
 /// operation holds its unit for exactly the cycle it issues in, so the only
 /// resource fact the problem carries is a per-type limit. Real operators break
-/// that assumption. A non-pipelined memory port holds its port for the whole
-/// access, a synchronous sub-kernel call holds its child instance until the
-/// child is done, and a child loop standing in for a whole nested pipeline
-/// holds it for that pipeline's latency. Two such operations may not overlap
-/// on one unit even though they start in different cycles.
+/// that assumption. A synchronous sub-kernel call holds its child instance
+/// until the child is done, so a loop re-firing one cannot issue faster than
+/// the callee runs (`populateCallOccupancy`, the one producer today). Two such
+/// operations may not overlap on one unit even though they start in different
+/// cycles.
 ///
 /// This problem carries that occupancy window per operation, so everything the
 /// resource model knows lives in the problem: nothing is stashed on the IR, and
@@ -63,6 +63,12 @@ public:
   void setResourceCycles(Operation *op, unsigned cycles) {
     resourceCycles[op] = cycles;
   }
+
+  /// Whether \p op holds at least one unit whose count is capped, i.e. whether
+  /// it contends for anything. An unlimited link constrains nothing and no
+  /// reservation tracks it, so this is the half of a problem a resource solver
+  /// actually decides.
+  bool holdsLimitedUnit(Operation *op);
 
   /// No limited resource is oversubscribed in any cycle, counting each
   /// operation's whole occupancy window. \p ii == 0 checks an acyclic
@@ -134,6 +140,34 @@ public:
   LogicalResult verify() override;
 };
 
+/// The chain-breaking edges \p prob needs to meet \p cycleTime: for every
+/// combinational path whose accumulated delay would not fit the period, an
+/// auxiliary edge from the path's ORIGIN to the operation, which both solvers
+/// weigh one cycle more than a plain dependence. Schedule-independent, so a
+/// caller may run it before or after solving.
+///
+/// A fork of CIRCT's `computeChainBreakingDependences`, which drops chains on
+/// the floor in two ways and so leaves a too-long path unbroken. Both are
+/// silent: `ChainingProblem` does not carry the period, so nothing downstream
+/// can test the result, and a schedule that misses it is wrong only in silicon.
+///
+///   * WHEN an operation counts as handled. Upstream marks it on entry
+///     (`chains[op][op] = 0`), which is also the test its successors apply, so
+///     an operation reached before one of its predecessors both defers itself
+///     AND advertises a half-built chain map, and the successor inherits none
+///     of the chains above it. The worklist is `Problem::getOperations()`,
+///     which is INSERTION-ordered rather than topological (`insertDependence`
+///     adds an endpoint that was not already there), so this is reachable, and
+///     two benchmark variants reach it. Here an operation is marked only once
+///     its map is complete.
+///   * The chain a REGISTERED predecessor carries. Upstream assigns its
+///     outgoing delay, but that predecessor may also be the origin of a longer
+///     chain arriving by another route, and then whichever route the operands
+///     are visited in last wins. Here the two are maxed.
+LogicalResult computeChainBreaks(
+    circt::scheduling::ChainingProblem &prob, float cycleTime,
+    SmallVectorImpl<circt::scheduling::Problem::Dependence> &result);
+
 //===----------------------------------------------------------------------===//
 // SDC simplex schedulers.
 //
@@ -189,6 +223,76 @@ LogicalResult scheduleSimplex(ChainingSharedOperatorsProblem &prob,
                               Operation *lastOp, float cycleTime);
 
 //===----------------------------------------------------------------------===//
+// What a solve is charged: the span objective.
+//===----------------------------------------------------------------------===//
+
+/// One region OUTPUT's contribution to the region's drain: it commits at
+/// `start(op) + offset`.
+///
+/// The drain is the max over these (`drainOf`), and the exact scheduler bounds
+/// its own drain variable below by each one, so the quantity a solve minimizes
+/// and the quantity `leafSpan` charges are ONE expression rather than two
+/// derivations that happen to agree. Only `SDC.cpp` classifies the outputs, it
+/// being the layer that still holds the region's results.
+struct DrainTerm {
+  Operation *op;
+  int64_t offset;
+};
+
+/// The drain of a SOLVED problem: the cycle its deepest output commits.
+inline int64_t drainOf(circt::scheduling::Problem &problem,
+                       ArrayRef<DrainTerm> terms) {
+  int64_t drain = 0;
+  for (const DrainTerm &term : terms)
+    drain =
+        std::max(drain, static_cast<int64_t>(*problem.getStartTime(term.op)) +
+                            term.offset);
+  return drain;
+}
+
+/// One value a region spends a DELAY REGISTER chain on. The chain is as long as
+/// its deepest reader needs and costs one flip-flop per bit per cycle of that:
+///
+/// ```
+/// depth(v) = max over reads ( t_read + ii * distance ) - ( t_def + latency )
+/// cost(v)  = width * depth(v)
+/// ```
+///
+/// No register is shared between two values (`insertRegister` keys one chain
+/// per value and region), which is what makes this a SUM over values that is
+/// linear in the schedule rather than a MAXLIVE over time coupled to an
+/// allocation, and so a term an objective can carry directly.
+struct RegisterTerm {
+  Operation *def;
+  /// Cycles after `def` issues before the value is readable.
+  int64_t latency;
+  /// Flip-flops one cycle of delay costs.
+  int64_t width;
+  /// Each reader, and the iteration distance its read spans.
+  SmallVector<std::pair<Operation *, int64_t>> reads;
+};
+
+/// What a region's span is charged, and so what the exact scheduler minimizes:
+/// `(trip - 1) * ii + drain`, the part of `leafSpan` a solve controls, with the
+/// region's register cost as the tie-break below it.
+///
+/// The heuristic ignores this and keeps minimizing the anchor's start time,
+/// which is a max over every SINK where the drain is a max over the OUTPUTS
+/// alone, i.e. an over-constrained proxy for the quantity actually charged.
+struct SpanObjective {
+  /// The region's outputs.
+  ArrayRef<DrainTerm> drain;
+  /// The values it spends a delay register on.
+  ArrayRef<RegisterTerm> regs;
+  /// The region's trip count, when it is a compile-time constant. Empty leaves
+  /// the exact scheduler on the anchor-start objective, which is the right one
+  /// wherever no span composes off this solve (a `while`, a dynamic bound) or
+  /// wherever iterations do not overlap and it is the schedule DEPTH, not the
+  /// drain, that the trip multiplies (`s.pipeline(ii=-1)`).
+  std::optional<int64_t> trip;
+};
+
+//===----------------------------------------------------------------------===//
 // CP-SAT exact schedulers.
 //
 // Which solver settles the RESOURCE half of a problem. The SDC simplex is
@@ -202,25 +306,75 @@ enum class SchedulerKind {
   /// The SDC simplex plus greedy modulo / shared-operator placement.
   Heuristic,
   /// CP-SAT over the same problem: exact under the model, and available only
-  /// in a build with OR-Tools.
+  /// in a build with OR-Tools. The chain breaks stay the pre-pass's, so the
+  /// only thing that differs from the heuristic is resource placement, and any
+  /// difference between the two schedules is attributable to it.
   Exact,
+  /// As above, but the chain breaks are decided in the constraint program too.
+  /// The pre-pass breaks a too-long chain at its ORIGIN, which forces origin
+  /// and operation into different cycles where a register mid-chain would have
+  /// done; deciding it in the model lets the solver put the break where it is
+  /// cheapest, and pay for it against the same span and area objective.
+  ExactChaining,
 };
 
-/// \p name ("heuristic" / "exact") as a kind, or nullopt when it names neither.
+/// Whether \p kind solves the resource half with CP-SAT, i.e. needs OR-Tools.
+inline bool usesExactScheduler(SchedulerKind kind) {
+  return kind != SchedulerKind::Heuristic;
+}
+
+/// How much work ONE SOLVE may consume, in OR-Tools' DETERMINISTIC time units.
+/// A deterministic budget rather than a wall-clock one is what keeps a compile
+/// reproducible: the same problem consumes the same budget on any machine, so a
+/// schedule never depends on how loaded the host was. The unit is roughly a
+/// second of a single core on current hardware.
+///
+/// Per SOLVE, so a cyclic region spends it again for every initiation interval
+/// its search probes. Bounding the REGION instead was tried and is worse: the
+/// probes are not equally valuable, and giving each one whatever is left of a
+/// region pool starves the later ones, which cost the bed's hardest region 110%
+/// of its register bits. What bounds a region is the branch and bound's own
+/// cut, which admits one or two probes on nearly every region.
+///
+/// The level is a policy and the bed's response curve is what sets it. More
+/// budget is monotone in quality, because the incumbent bound means extra
+/// search can only find a schedule that WINS, and superlinear in time. A flat
+/// number is also the right SHAPE despite the spread in region size: a budget
+/// is a limit rather than an allowance, and the small regions that are 86% of
+/// the bed finish two orders of magnitude under it, so scaling it by problem
+/// size changes nothing that a flat raise does not.
+inline constexpr double kDefaultSolveBudget = 30.0;
+
+/// What the caller asked the scheduler for.
+struct SchedulerOptions {
+  SchedulerKind kind = SchedulerKind::Heuristic;
+  double budget = kDefaultSolveBudget;
+};
+
+/// \p name ("heuristic" / "exact" / "exact-chaining") as a kind, or nullopt
+/// when it names none of them.
 std::optional<SchedulerKind> parseSchedulerKind(StringRef name);
 
 /// Whether this build has the CP-SAT exact scheduler compiled in.
 bool hasExactScheduler();
 
-/// Solve \p prob exactly with CP-SAT, minimizing the start time of \p lastOp
-/// under the target clock period \p cycleTime. Reports `unsupported` and fails
-/// in a build without OR-Tools, so callers dispatch on the requested kind and
-/// never on the build configuration.
+/// Solve \p prob exactly with CP-SAT, minimizing \p span under the target clock
+/// period \p cycleTime. Reports `unsupported` and fails in a build without
+/// OR-Tools, so callers dispatch on the requested kind and never on the build
+/// configuration.
+///
+/// \p opts carries which chaining form the model states (see
+/// `SchedulerKind::ExactChaining`) and what the region's solve may spend.
 LogicalResult scheduleCPSAT(ChainingSharedOperatorsProblem &prob,
-                            Operation *lastOp, float cycleTime);
-/// Cyclic twin; \p minII lower-bounds the initiation interval.
+                            Operation *lastOp, float cycleTime,
+                            const SpanObjective &span,
+                            const SchedulerOptions &opts);
+/// Cyclic twin; \p minII lower-bounds the initiation interval, and the search
+/// over intervals is a branch and bound on \p span.
 LogicalResult scheduleCPSAT(ChainingModuloProblem &prob, Operation *lastOp,
-                            float cycleTime, unsigned minII);
+                            float cycleTime, unsigned minII,
+                            const SpanObjective &span,
+                            const SchedulerOptions &opts);
 
 /// Check, solve (via our SDC simplex), and verify \p problem, minimizing the
 /// start time of \p anchor. Templated so the static problem type selects the
@@ -253,17 +407,18 @@ LogicalResult solveSchedulingProblem(ProblemT &problem, Operation *anchor,
 
 /// Chaining modulo variant with a target-II lower bound (from a pipeline
 /// directive): the achieved II is max(\p minII, the natural minimum). \p minII
-/// == 1 imposes no additional bound. \p kind selects the resource solver; both
+/// == 1 imposes no additional bound. \p opts selects the resource solver; both
 /// paths are wrapped by the same `check` and `verify`, so an exact solve is
 /// held to the model the heuristic is held to.
 inline LogicalResult solveSchedulingProblem(ChainingModuloProblem &problem,
                                             Operation *anchor, float cycleTime,
                                             unsigned minII,
-                                            SchedulerKind kind) {
+                                            const SchedulerOptions &opts,
+                                            const SpanObjective &span) {
   if (failed(problem.check()))
     return failure();
-  if (kind == SchedulerKind::Exact) {
-    if (failed(scheduleCPSAT(problem, anchor, cycleTime, minII)))
+  if (usesExactScheduler(opts.kind)) {
+    if (failed(scheduleCPSAT(problem, anchor, cycleTime, minII, span, opts)))
       return failure();
   } else if (failed(mlir::allo::scheduleSimplex(problem, anchor, cycleTime,
                                                 minII))) {
@@ -275,13 +430,13 @@ inline LogicalResult solveSchedulingProblem(ChainingModuloProblem &problem,
 }
 
 /// Acyclic twin of the variant above.
-inline LogicalResult
-solveSchedulingProblem(ChainingSharedOperatorsProblem &problem,
-                       Operation *anchor, float cycleTime, SchedulerKind kind) {
+inline LogicalResult solveSchedulingProblem(
+    ChainingSharedOperatorsProblem &problem, Operation *anchor, float cycleTime,
+    const SchedulerOptions &opts, const SpanObjective &span) {
   if (failed(problem.check()))
     return failure();
-  if (kind == SchedulerKind::Exact) {
-    if (failed(scheduleCPSAT(problem, anchor, cycleTime)))
+  if (usesExactScheduler(opts.kind)) {
+    if (failed(scheduleCPSAT(problem, anchor, cycleTime, span, opts)))
       return failure();
   } else if (failed(mlir::allo::scheduleSimplex(problem, anchor, cycleTime))) {
     return failure();
@@ -306,7 +461,8 @@ LogicalResult runPreScheduleVerification(ModuleOp module, StringRef top,
 /// \p model. The IR is left in affine/scf form; nothing is materialized.
 /// \p cycleTime is the resolved target period in ns, as above.
 LogicalResult runSDCScheduler(ModuleOp module, StringRef top, float cycleTime,
-                              SchedulerKind kind, ScheduleModel &model);
+                              const SchedulerOptions &opts,
+                              ScheduleModel &model);
 
 /// Reify \p model onto the IR as `dcp.*` regions. It runs immediately after the
 /// scheduler over the same module, which is what makes the model's `Operation

@@ -458,8 +458,8 @@ public:
       : ModuloSimplexScheduler(prob, lastOp, minII), prob(prob),
         cycleTime(cycleTime) {}
   LogicalResult schedule() override {
-    if (failed(computeChainBreakingDependences(prob, cycleTime,
-                                               additionalConstraints)))
+    if (failed(mlir::allo::computeChainBreaks(prob, cycleTime,
+                                              additionalConstraints)))
       return failure();
     if (!additionalConstraints.empty())
       info(Stage::Sched, prob.getContainingOp())
@@ -501,8 +501,8 @@ public:
       : SharedOperatorsSimplexScheduler(prob, lastOp), prob(prob),
         cycleTime(cycleTime) {}
   LogicalResult schedule() override {
-    if (failed(computeChainBreakingDependences(prob, cycleTime,
-                                               additionalConstraints)))
+    if (failed(mlir::allo::computeChainBreaks(prob, cycleTime,
+                                              additionalConstraints)))
       return failure();
     if (!additionalConstraints.empty())
       info(Stage::Sched, prob.getContainingOp())
@@ -516,6 +516,79 @@ public:
 };
 
 } // anonymous namespace
+
+//===----------------------------------------------------------------------===//
+// Chain breaking
+//===----------------------------------------------------------------------===//
+
+LogicalResult
+mlir::allo::computeChainBreaks(ChainingProblem &prob, float cycleTime,
+                               SmallVectorImpl<Problem::Dependence> &result) {
+  // The period is a hard constraint, so no operator may exceed it on its own.
+  for (auto opr : prob.getOperatorTypes())
+    if (*prob.getIncomingDelay(opr) > cycleTime ||
+        *prob.getOutgoingDelay(opr) > cycleTime) {
+      error(Stage::Sched, prob.getContainingOp())
+          << "Operator '" << opr.getValue()
+          << "' does not fit the requested clock period of "
+          << format("%g", cycleTime) << " ns on its own";
+      return failure();
+    }
+
+  // chains[v][u]: the delay arriving at `v` along the longest combinational
+  // chain starting at `u`. A key is also the "handled" marker, so nothing is
+  // written for an operation until every predecessor of it is complete.
+  DenseMap<Operation *, SmallDenseMap<Operation *, float>> chains;
+
+  // Problem order, which is the IR's. `chains` is keyed by pointer, so its
+  // iteration order is one of ADDRESSES, and the edges below would otherwise
+  // reach a solver in an order that varies between two compiles of one kernel.
+  DenseMap<Operation *, unsigned> order;
+  for (Operation *op : prob.getOperations())
+    order.try_emplace(op, order.size());
+
+  return handleOperationsInTopologicalOrder(prob, [&](Operation *op) {
+    for (auto dep : prob.getDependences(op))
+      if (dep.isDefUse() && !chains.count(dep.getSource()))
+        return failure(); // a predecessor is still pending; retry `op` later
+
+    // `op` is the origin of its own chain, and every chain arriving at it is
+    // one of its combinational predecessors' extended by that predecessor.
+    chains[op][op] = 0.0f;
+    for (auto dep : prob.getDependences(op)) {
+      if (!dep.isDefUse()) // an auxiliary edge transports no value
+        continue;
+      Operation *pred = dep.getSource();
+      auto predOpr = *prob.getLinkedOperatorType(pred);
+      float outgoing = *prob.getOutgoingDelay(predOpr);
+      if (*prob.getLatency(predOpr) > 0) {
+        // Registered: the chain restarts at `pred` carrying its output delay,
+        // maxed against any longer chain that also reaches here through `pred`.
+        chains[op][pred] = std::max(chains[op][pred], outgoing);
+        continue;
+      }
+      for (auto [origin, delay] : chains[pred])
+        chains[op][origin] = std::max(delay + outgoing, chains[op][origin]);
+    }
+
+    // Break every chain `op` cannot be appended to within the period. Erasing
+    // it here is what keeps `op`'s successors from inheriting a chain the edge
+    // has just cut.
+    float incoming = *prob.getIncomingDelay(*prob.getLinkedOperatorType(op));
+    SmallVector<Operation *, 4> tooLong;
+    for (auto [origin, delay] : chains[op])
+      if (delay + incoming > cycleTime)
+        tooLong.push_back(origin);
+    llvm::sort(tooLong, [&](Operation *a, Operation *b) {
+      return order.at(a) < order.at(b);
+    });
+    for (Operation *origin : tooLong) {
+      result.emplace_back(origin, op);
+      chains[op].erase(origin);
+    }
+    return success();
+  });
+}
 
 //===----------------------------------------------------------------------===//
 // SimplexSchedulerBase
@@ -1763,7 +1836,7 @@ void ChainingSimplexScheduler::fillAdditionalConstraintRow(
 }
 
 LogicalResult ChainingSimplexScheduler::schedule() {
-  if (failed(checkLastOp()) || failed(computeChainBreakingDependences(
+  if (failed(checkLastOp()) || failed(mlir::allo::computeChainBreaks(
                                    prob, cycleTime, additionalConstraints)))
     return failure();
 
@@ -1814,7 +1887,7 @@ void ChainingCyclicSimplexScheduler::fillAdditionalConstraintRow(
 }
 
 LogicalResult ChainingCyclicSimplexScheduler::schedule() {
-  if (failed(checkLastOp()) || failed(computeChainBreakingDependences(
+  if (failed(checkLastOp()) || failed(mlir::allo::computeChainBreaks(
                                    prob, cycleTime, additionalConstraints)))
     return failure();
 
@@ -1857,6 +1930,13 @@ LogicalResult OccupancyProblem::checkLatency(Operation *op) {
   // zero-latency operation on a limited resource. A combinational access holds
   // its port for the cycle it issues in and contends like any other.
   return Problem::checkLatency(op);
+}
+
+bool OccupancyProblem::holdsLimitedUnit(Operation *op) {
+  auto linked = getLinkedResourceTypes(op);
+  return linked && llvm::any_of(*linked, [&](ResourceType rsrc) {
+           return getLimit(rsrc).value_or(0) > 0;
+         });
 }
 
 LogicalResult OccupancyProblem::verifyOccupancy(unsigned ii) {

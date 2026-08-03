@@ -106,17 +106,20 @@ struct OperatorEntry {
   uint32_t latency = 0; // cycles
   double inDelay = 0.0; // ns
   double outDelay = 0.0;
-  bool pipelined = true;
   std::string symbol; // the injected `dcp.operator` sym_name (IP rows only).
 };
 
-/// The timing characterization resolved for a specific operation.
+/// The timing characterization resolved for a specific operation. It carries no
+/// pipelined-ness: an operator type is unlimited in the problem, so an
+/// occupancy window on one would reserve nothing. The emitter reads
+/// `dcp.operator`'s own `pipelined` attribute for the unit it builds
+/// (`DatapathBuilder`); re-add this when the scheduler LIMITS operators
+/// (allocation as a decision variable).
 struct OperatorChar {
   std::string typeName; // stable: one Problem::OperatorType per matched entry
   uint32_t latency = 0;
   double inDelay = 0.0;
   double outDelay = 0.0;
-  bool pipelined = true;
   std::string symbol; // the matched `dcp.operator` sym_name (IP), else empty
 };
 

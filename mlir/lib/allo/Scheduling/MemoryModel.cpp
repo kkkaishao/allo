@@ -701,8 +701,8 @@ MemoryLibrary::Timing MemoryLibrary::timing(Operation *op) const {
                             ? MemoryImplEnum::Auto
                             : resolveImpl(a->root, defaultImpl);
   MemKindTiming t = a->kind == AccessKind::Stream ? fifo : timing(impl);
-  return a->isWrite ? Timing{t.latency.write, t.delay.write, true, impl}
-                    : Timing{t.latency.read, t.delay.read, true, impl};
+  return a->isWrite ? Timing{t.latency.write, t.delay.write, impl}
+                    : Timing{t.latency.read, t.delay.read, impl};
 }
 
 MemoryChar allo::characterize(Value memref, MemoryImplEnum defaultImpl) {

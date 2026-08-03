@@ -85,13 +85,43 @@ struct RegionReport {
   /// than a leaf, and whether its execution is predicated (a while pipeline or
   /// a guard).
   bool container = false, conditional = false;
-  std::optional<int64_t> ii, trip, length, latency;
+  /// `length` is the schedule DEPTH, the cycle by which every op has completed;
+  /// `drain` is the TERMINAL cycle its `done` composes off. Reported separately
+  /// because a solver may leave slack between them, and only `drain` is
+  /// charged.
+  std::optional<int64_t> ii, trip, length, drain, latency;
   /// The latency above is an upper bound, not an exact count.
   bool latencyBound = false;
   /// The mnemonic of the region's determinacy class, the controller family that
   /// paces it. Empty only when the attribute is absent.
   std::string determinacy;
   std::vector<ScheduledOpReport> ops;
+};
+
+/// What ONE region's solve COST, which is a measurement of the compiler rather
+/// than a fact about the hardware.
+///
+/// It rides beside the report rather than on a `dcp` op, because an attribute
+/// would put a compile-time number into the IR the emitter reads, and nothing
+/// downstream may ever build against how long a solve took.
+///
+/// Deliberately NOT joined to `RegionReport`: a solve is keyed by the affine
+/// loop that owned the problem, and by the time the report is built off the
+/// reified `dcp` ops that loop is gone. Both lists are in program order per
+/// func, which is as much of a correspondence as is sound to claim.
+struct SolveReport {
+  /// The func it belongs to, and where its region is, as the log names it.
+  std::string func, where;
+  /// `cyclic` for a counted loop, `while` for a flushing while, `acyclic` for a
+  /// straight-line span.
+  std::string kind;
+  /// Problem size: operations registered, and how many of those hold at least
+  /// one limited unit.
+  int64_t ops = 0, limitedOps = 0;
+  /// The initiation interval settled, absent for an acyclic span.
+  std::optional<int64_t> ii;
+  /// Wall time of the whole solve in milliseconds.
+  double millis = 0.0;
 };
 
 /// One kernel's schedule: an `allo.dcp.module` and the regions it holds.
@@ -217,6 +247,11 @@ public:
   /// The reified schedule, whole-module. Public because it is plain data: the
   /// reify fills it and the CAPI serializes it, and nothing else reads it.
   std::vector<FuncReport> report;
+
+  /// What each region's solve cost, in solve order. Filled by the SOLVER, so
+  /// unlike `report` it survives whether or not the reify runs, and it is the
+  /// only per-region compile-time figure anything downstream can read.
+  std::vector<SolveReport> solves;
 
 private:
   llvm::DenseMap<Operation *, OpSchedule> ops;

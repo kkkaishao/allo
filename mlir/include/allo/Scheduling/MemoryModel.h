@@ -30,6 +30,19 @@
 
 namespace mlir::allo {
 
+/// A counter or an address register may be BUILT narrower than this wherever
+/// its own value range allows (`RegionBlock::counterType`,
+/// `RegionBlock::AddrStride::width`); this is the width such a value widens
+/// back to the moment it is read as an ordinary index. Named rather than
+/// spelled at each of those points because it is a default, and a default is
+/// the kind of thing that becomes a device or schedule option.
+///
+/// Here rather than in the datapath because both layers price against it: the
+/// emitter builds the register, and the exact scheduler charges an index-typed
+/// value's delay chain at this width when it decides where to place the
+/// operations feeding it.
+inline constexpr unsigned kIndexWidth = 32;
+
 //===----------------------------------------------------------------------===//
 // Memory timing library: the `memory:` section of the device file. It holds
 // read/write latency + delay per storage *implementation*
@@ -74,7 +87,6 @@ public:
   struct Timing {
     unsigned latency = 0;
     double delay = 0.0;
-    bool pipelined = true;
     // The accessed array's resolved storage implementation (Auto for a stream).
     // Accesses of different implementations must map to *different* operator
     // types, or they collapse onto one latency, so this keys the type.
@@ -422,19 +434,19 @@ namespace mlir::allo {
 
 //===----------------------------------------------------------------------===//
 // Memory resource model: apply the per-memref port/bank model to a scheduling
-// problem. The storage twin of `populateOperatorTypes`. It attaches the
-// limited port resources (and multi-cycle occupancy) that memory accesses bind
-// against. Occupancy comes from the `MemoryLibrary`; the port key + limit come
-// from the array's `allo.part` / `allo.bind.storage` attributes. Only an
-// `OccupancyProblem` carries limited resources, so this compiles to a no-op for
-// any other problem type.
+// problem. The storage twin of `populateOperatorTypes`. It attaches the limited
+// port resources that memory accesses bind against; the port key + limit come
+// from the array's `allo.part` / `allo.bind.storage` attributes. A port is a
+// one-cycle reservation whatever its latency, which is `getResourceCycles`'s
+// default, so no occupancy window is set here: a storage primitive accepts an
+// address every cycle. Only an `OccupancyProblem` carries limited resources, so
+// this compiles to a no-op for any other problem type.
 //===----------------------------------------------------------------------===//
 
 /// Assign per-memref memory-port resources to every memory access reached by
-/// \p walkFn, sourced from \p memLib.
+/// \p walkFn.
 template <class ProblemT, class WalkFn>
-LogicalResult populateMemoryResourcesImpl(ProblemT &problem, WalkFn walkFn,
-                                          const MemoryLibrary &memLib) {
+LogicalResult populateMemoryResourcesImpl(ProblemT &problem, WalkFn walkFn) {
   using namespace circt::scheduling;
   if constexpr (!std::is_base_of_v<OccupancyProblem, ProblemT>) {
     return success();
@@ -452,12 +464,6 @@ LogicalResult populateMemoryResourcesImpl(ProblemT &problem, WalkFn walkFn,
       if (units.empty()) // non-memory, or storage with no port to contend for
         return;
       problem.setLinkedResourceTypes(op, units);
-      // A non-pipelined multi-cycle port holds its resources for its whole
-      // latency; a combinational one still holds them for the cycle it issues
-      // in.
-      MemoryLibrary::Timing t = memLib.timing(op);
-      problem.setResourceCycles(
-          op, (t.pipelined || t.latency <= 1) ? 1u : t.latency);
     });
     return success();
   }
@@ -465,25 +471,20 @@ LogicalResult populateMemoryResourcesImpl(ProblemT &problem, WalkFn walkFn,
 
 /// Populate memory-port resources for every access reachable from \p body.
 template <class ProblemT>
-LogicalResult populateMemoryResources(Block &body, ProblemT &problem,
-                                      const MemoryLibrary &memLib) {
-  return populateMemoryResourcesImpl(
-      problem, [&](auto handle) { body.walk(handle); }, memLib);
+LogicalResult populateMemoryResources(Block &body, ProblemT &problem) {
+  return populateMemoryResourcesImpl(problem,
+                                     [&](auto handle) { body.walk(handle); });
 }
 
 /// Populate memory-port resources over the (walked) top-level ops of a
 /// straight-line region.
 template <class ProblemT>
 LogicalResult populateMemoryResources(ArrayRef<Operation *> ops,
-                                      ProblemT &problem,
-                                      const MemoryLibrary &memLib) {
-  return populateMemoryResourcesImpl(
-      problem,
-      [&](auto handle) {
-        for (Operation *top : ops)
-          top->walk(handle);
-      },
-      memLib);
+                                      ProblemT &problem) {
+  return populateMemoryResourcesImpl(problem, [&](auto handle) {
+    for (Operation *top : ops)
+      top->walk(handle);
+  });
 }
 
 } // namespace mlir::allo

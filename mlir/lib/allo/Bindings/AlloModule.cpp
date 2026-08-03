@@ -113,20 +113,23 @@ NB_MODULE(_allo, m) {
   allo.def(
       "run_sdc_scheduling",
       [](MlirModule module, const std::string &top, float cycleTime,
-         const std::string &scheduler) -> std::optional<std::string> {
+         const std::string &scheduler,
+         double budget) -> std::optional<std::string> {
         std::string out;
         if (mlirLogicalResultIsFailure(alloRunSDCSchedulingPipeline(
                 module, mlirStringRefCreate(top.data(), top.size()), cycleTime,
-                mlirStringRefCreate(scheduler.data(), scheduler.size()),
+                mlirStringRefCreate(scheduler.data(), scheduler.size()), budget,
                 appendToString, &out)))
           return std::nullopt;
         return out;
       },
       nb::arg("module"), nb::arg("top"), nb::arg("cycle_time"),
-      nb::arg("scheduler") = "heuristic",
+      nb::arg("scheduler") = "heuristic", nb::arg("budget") = 0.0,
       "Schedule `top` and reify the schedule into `module` in place as "
       "`allo.dcp.*` ops; return the schedule report as JSON (regions, per-op "
-      "start times, latencies), or None if scheduling fails.");
+      "start times, latencies), or None if scheduling fails. `budget` is what "
+      "one exact solve may spend in deterministic time units; 0 takes the "
+      "default.");
   allo.def("has_exact_scheduler", &alloHasExactScheduler,
            "Whether this build accepts `scheduler=\"exact\"`, i.e. links "
            "OR-Tools.");

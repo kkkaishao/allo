@@ -7,6 +7,7 @@
 #include "allo/IR/AlloOps.h"
 #include "allo/Scheduling/DependenceAnalysis.h"
 #include "allo/Scheduling/LatencyModel.h"
+#include "allo/Scheduling/MemoryModel.h" // kIndexWidth
 #include "allo/Scheduling/OperatorLibrary.h"
 #include "allo/Scheduling/ProblemBuilder.h"
 #include "allo/Scheduling/RegionGraph.h"
@@ -25,6 +26,8 @@
 #include "mlir/Dialect/Utils/StaticValueUtils.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "llvm/Support/MathExtras.h"
+
+#include <chrono>
 
 using namespace mlir;
 using namespace mlir::affine;
@@ -104,9 +107,14 @@ static int64_t scheduleDepth(circt::scheduling::Problem &problem) {
   return depth;
 }
 
-// The region's TERMINAL cycle: how long after its LAST ISSUE pulse the deepest
-// output commits. Its `done` rises one cycle later, on the completion latch,
-// which is what `leafSpan` composes.
+// The region's OUTPUTS, as the terms whose max is its TERMINAL cycle: how long
+// after its LAST ISSUE pulse the deepest output commits. Its `done` rises one
+// cycle later, on the completion latch, which is what `leafSpan` composes.
+//
+// Taken apart rather than maxed here so the exact scheduler can bound a
+// variable by each term and MINIMIZE the quantity that is charged, instead of
+// re-deriving which operations are outputs (`DrainTerm`). Classification only,
+// so it is answerable before the solve; `drainOf` is the max, afterwards.
 //
 // Four kinds of output, each charged at the cycle the emitter commits it, so
 // this is the model's copy of `max(fb.storeDrain, resultDrain)`:
@@ -123,31 +131,109 @@ static int64_t scheduleDepth(circt::scheduling::Problem &problem) {
 // a straight-line span's escaping defs). One a region only FORWARDS charges
 // nothing: a block argument or an earlier region's survivor is settled before
 // the region starts, and a DECLARATION binds no hardware to wait on.
-static int64_t regionDrain(circt::scheduling::Problem &problem,
-                           ValueRange results) {
-  int64_t drain = 0;
+static SmallVector<DrainTerm> drainTerms(circt::scheduling::Problem &problem,
+                                         ValueRange results) {
+  SmallVector<DrainTerm> terms;
   for (Operation *op : problem.getOperations()) {
-    std::optional<unsigned> start = problem.getStartTime(op);
-    if (!start)
-      continue;
     if (isa<AffineStoreOp, memref::StoreOp>(op) || isSyncSubKernelCall(op))
-      drain = std::max(drain, *start + solvedLatency(problem, op) - 1);
+      terms.push_back({op, solvedLatency(problem, op) - 1});
     else if (isa<StreamPutOp>(op))
-      drain = std::max<int64_t>(drain, *start);
+      terms.push_back({op, 0});
   }
   for (Value v : results) {
     Operation *def = v.getDefiningOp();
-    if (!def || isDeclarationOp(def))
-      continue;
     // A CALL's result is the one escaping value not read through a capture
     // register of this region's: the region's `done` IS the child's, charged by
     // the loop above, and the consumer's own arming cycle pays the latch.
-    if (isSyncSubKernelCall(def))
+    if (!def || isDeclarationOp(def) || isSyncSubKernelCall(def) ||
+        !problem.hasOperation(def))
       continue;
-    if (std::optional<unsigned> start = problem.getStartTime(def))
-      drain = std::max(drain, *start + solvedLatency(problem, def));
+    terms.push_back({def, solvedLatency(problem, def)});
   }
-  return drain;
+  return terms;
+}
+
+// The flip-flops one cycle of delay on \p type costs, or 0 for a value that is
+// not carried in a register at all (a memref, a stream).
+//
+// An INDEX is charged at `kIndexWidth`. It reaches hardware as an address, and
+// the emitter may build that register NARROWER wherever the range it spans
+// allows (`AddrStride::width`), so this is an upper bound rather than the exact
+// cost. Charging it nothing instead is measurably worse: an address chain the
+// objective prices at zero is one the solver lengthens for free.
+static int64_t registerWidth(Type type) {
+  if (auto i = dyn_cast<IntegerType>(type))
+    return i.getWidth();
+  if (auto f = dyn_cast<FloatType>(type))
+    return f.getWidth();
+  if (isa<IndexType>(type))
+    return kIndexWidth;
+  return 0;
+}
+
+// The values a region spends a DELAY REGISTER on, and what each one charges:
+// `DatapathBuilder::resolveOperand` plus `insertRegister`, stated over the
+// problem so a solve can minimize the same quantity the emitter will spend.
+//
+// The cases `resolveOperand` charges differently, mirrored here and nowhere
+// else:
+//
+//   * a SCHEDULED PRODUCER in the same region, i.e. a def-use edge inside the
+//     problem: the ordinary chain, and the bulk of what a region spends;
+//   * a LOOP-CARRIED read of an iter_arg: the same edge `distance` iterations
+//     back, which is why this shares `iterArgSource` with the builder that
+//     inserts those dependences;
+//   * a value held for LONGER than the region (a survivor, an IO port, a
+//     literal, a func-scope cone): free, since the consumer ties straight in.
+//     Left out by falling through: none of them is defined by an op in the
+//     problem.
+//
+// Two costs it does NOT carry, both linear in a start time and both left to the
+// sum-of-starts term the objective keeps beside this one: an enclosing loop's
+// COUNTER, for `registerWidth`'s reason above, and the ACTIVATION PULSE chain,
+// one bit per cycle of an op's start offset.
+//
+// \p carried is the counted-loop body whose block arguments after the induction
+// variable are its iter_args, or null where the problem has no such recurrence
+// to price (a straight-line span, a `while`).
+static SmallVector<RegisterTerm>
+registerTerms(circt::scheduling::Problem &problem, Block *carried) {
+  SmallVector<RegisterTerm> terms;
+  DenseMap<Value, unsigned> slotOf;
+  auto readBy = [&](Value v, Operation *def, Operation *reader,
+                    int64_t distance) {
+    int64_t width = registerWidth(v.getType());
+    if (width == 0)
+      return;
+    auto [slot, isNew] = slotOf.try_emplace(v, terms.size());
+    if (isNew)
+      terms.push_back({def, solvedLatency(problem, def), width, {}});
+    terms[slot->second].reads.push_back({reader, distance});
+  };
+
+  for (Operation *reader : problem.getOperations()) {
+    // A terminator carries no compute and takes no input register: the values
+    // it hands on are latched by the region's completion, not delayed into it.
+    if (reader->hasTrait<OpTrait::IsTerminator>())
+      continue;
+    for (auto &dep : problem.getDependences(reader))
+      if (dep.isDefUse())
+        readBy(dep.getSource()->getResult(*dep.getSourceIndex()),
+               dep.getSource(), reader, /*distance=*/0);
+  }
+
+  if (!carried)
+    return terms;
+  Operation *yield = carried->getTerminator();
+  for (unsigned i = 0, n = yield->getNumOperands(); i < n; ++i) {
+    auto [def, distance] = iterArgSource(carried, yield, i);
+    if (!def || !problem.hasOperation(def))
+      continue;
+    for (Operation *reader : carried->getArgument(i + 1).getUsers())
+      if (problem.hasOperation(reader))
+        readBy(def->getResult(0), def, reader, distance);
+  }
+  return terms;
 }
 
 // Whether the problem carries a loop-carried recurrence, i.e. a dependence
@@ -391,6 +477,37 @@ static void populateCallOccupancy(Block &body, ChainingModuloProblem &problem) {
   }
 }
 
+// A steady-clock stopwatch, so a solve's cost is reported in the same units a
+// user waits in.
+using Stopwatch = std::chrono::steady_clock::time_point;
+static Stopwatch now() { return std::chrono::steady_clock::now(); }
+
+// Record what one region's solve cost, timed from \p since. Keyed by WHERE the
+// region is rather than by the op that owned it: the schedule report is built
+// later off the reified dcp ops, by which time this problem's loop is gone.
+//
+// \p ii is what the solve DECIDED, which for a non-pipelined loop is not the
+// interval the region is reported to run at; the region report carries that
+// one, and conflating them would hide a solver decision behind a fold.
+static void recordSolve(ScheduleModel &model, OccupancyProblem &problem,
+                        StringRef kind, std::optional<unsigned> ii,
+                        Stopwatch since) {
+  SolveReport s;
+  Operation *containing = problem.getContainingOp();
+  if (auto fn = containing->getParentOfType<func::FuncOp>())
+    s.func = fn.getSymName().str();
+  s.where = logging::detail::describe(containing);
+  s.kind = kind.str();
+  s.ops = (int64_t)problem.getOperations().size();
+  for (Operation *op : problem.getOperations())
+    if (problem.holdsLimitedUnit(op))
+      ++s.limitedOps;
+  if (ii)
+    s.ii = (int64_t)*ii;
+  s.millis = std::chrono::duration<double, std::milli>(now() - since).count();
+  model.solves.push_back(std::move(s));
+}
+
 // Schedule one counted loop body (affine.for or scf.for) as a
 // `ChainingModuloProblem` (resource-aware, timing-aware) and annotate the
 // result (start times, II, sub-cycle times). \p minII lower-bounds the II.
@@ -402,24 +519,34 @@ static LogicalResult
 scheduleCyclic(LoopLikeOpInterface body, DependenceAnalysis &deps,
                const OperatorLibrary &lib, ScheduleModel &model,
                const SchedRegion &region, float cycleTime, unsigned minII,
-               bool pipelined, SchedulerKind kind) {
+               bool pipelined, const SchedulerOptions &opts) {
   auto problem = buildCyclicProblem<ChainingModuloProblem>(body, deps);
   Block *bodyBlock = &body.getLoopRegions().front()->front();
   if (failed(populateOperatorTypes(*bodyBlock, problem, lib)))
     return failure();
-  if (failed(populateMemoryResources(*bodyBlock, problem, lib.memoryLibrary())))
+  if (failed(populateMemoryResources(*bodyBlock, problem)))
     return failure();
   populateCallOccupancy(*bodyBlock, problem);
   Operation *anchor = bodyBlock->getTerminator();
-  if (failed(solveSchedulingProblem(problem, anchor, cycleTime, minII, kind)))
-    return failure();
-  int64_t depth = scheduleDepth(problem);
-  unsigned ii = pipelined ? problem.getInitiationInterval().value_or(depth)
-                          : static_cast<unsigned>(depth);
   bool isBound = false;
   std::optional<int64_t> trip = regionTrip(region.anchor(), deps, isBound);
   // A counted loop hands its carried next-values on: the terminator's operands.
-  int64_t drain = regionDrain(problem, anchor->getOperands());
+  SmallVector<DrainTerm> outputs = drainTerms(problem, anchor->getOperands());
+  SmallVector<RegisterTerm> regs = registerTerms(problem, bodyBlock);
+  // What this region's span is charged, for the exact scheduler to minimize.
+  // The trip is withheld where the iterations do not overlap: `ii` is the body
+  // DEPTH there, so the depth and not the drain is what the trip multiplies.
+  SpanObjective span{outputs, regs, pipelined ? trip : std::nullopt};
+  Stopwatch solveStart = now();
+  if (failed(solveSchedulingProblem(problem, anchor, cycleTime, minII, opts,
+                                    span)))
+    return failure();
+  recordSolve(model, problem, "cyclic", problem.getInitiationInterval(),
+              solveStart);
+  int64_t depth = scheduleDepth(problem);
+  unsigned ii = pipelined ? problem.getInitiationInterval().value_or(depth)
+                          : static_cast<unsigned>(depth);
+  int64_t drain = drainOf(problem, outputs);
   // For the report only, through the arithmetic that composes it for real.
   SpanNode node;
   node.trip = trip;
@@ -474,7 +601,7 @@ static LogicalResult scheduleWhile(scf::WhileOp w, DependenceAnalysis &deps,
                                    const OperatorLibrary &lib,
                                    ScheduleModel &model,
                                    const SchedRegion &region, float cycleTime,
-                                   SchedulerKind kind) {
+                                   const SchedulerOptions &opts) {
   auto problem = buildWhileProblem<ChainingModuloProblem>(w, deps);
   // Operator types over both regions in one memory-bank analysis.
   if (failed(populateOperatorTypesImpl(
@@ -485,22 +612,30 @@ static LogicalResult scheduleWhile(scf::WhileOp w, DependenceAnalysis &deps,
           },
           lib)))
     return failure();
-  if (failed(populateMemoryResourcesImpl(
-          problem,
-          [&](auto handle) {
-            w.getBefore().walk(handle);
-            w.getAfter().walk(handle);
-          },
-          lib.memoryLibrary())))
+  if (failed(populateMemoryResourcesImpl(problem, [&](auto handle) {
+        w.getBefore().walk(handle);
+        w.getAfter().walk(handle);
+      })))
     return failure();
   Operation *anchor = w.getYieldOp().getOperation();
   // A while pipelines as a flushing pipeline; honor a requested target II (>=1)
   // as a lower bound. `ii=-1` (pipelining off) is not modeled for while loops.
   int64_t dir = pipelineDirective(w, region.anchor());
   unsigned minII = dir >= 1 ? static_cast<unsigned>(dir) : 1;
-  if (failed(solveSchedulingProblem(problem, anchor, cycleTime, minII, kind)))
+  SmallVector<DrainTerm> outputs = drainTerms(problem, anchor->getOperands());
+  // A while's state recurrence is a register this does not price: its two
+  // regions are one problem and its carried values are not a counted loop's
+  // iter_args, so `registerTerms` is handed no body to read them off.
+  SmallVector<RegisterTerm> regs = registerTerms(problem, /*carried=*/nullptr);
+  Stopwatch solveStart = now();
+  // No trip, so no span composes off this solve and none is minimized: the
+  // objective stays the anchor's start time (`SpanObjective::trip`).
+  if (failed(
+          solveSchedulingProblem(problem, anchor, cycleTime, minII, opts,
+                                 SpanObjective{outputs, regs, std::nullopt})))
     return failure();
   std::optional<unsigned> ii = problem.getInitiationInterval();
+  recordSolve(model, problem, "while", ii, solveStart);
   info(Stage::Sched, w.getOperation())
       << "  -> While loop scheduled as a flushing pipeline: II="
       << ii.value_or(0)
@@ -510,7 +645,7 @@ static LogicalResult scheduleWhile(scf::WhileOp w, DependenceAnalysis &deps,
   annotateRegion(problem, model, w.getOperation(),
                  ii ? std::optional<int64_t>(*ii) : std::nullopt,
                  /*trip=*/std::nullopt, /*tripIsBound=*/false,
-                 regionDrain(problem, anchor->getOperands()));
+                 drainOf(problem, outputs));
   return success();
 }
 
@@ -520,22 +655,29 @@ static LogicalResult scheduleAcyclic(ArrayRef<Operation *> ops,
                                      DependenceAnalysis &deps,
                                      const OperatorLibrary &lib,
                                      ScheduleModel &model, float cycleTime,
-                                     SchedulerKind kind) {
+                                     const SchedulerOptions &opts) {
   ChainingSharedOperatorsProblem problem =
       buildAcyclicProblem<ChainingSharedOperatorsProblem>(ops, deps);
   if (failed(populateOperatorTypes(ops, problem, lib)))
     return failure();
-  if (failed(populateMemoryResources(ops, problem, lib.memoryLibrary())))
+  if (failed(populateMemoryResources(ops, problem)))
     return failure();
-  if (failed(solveSchedulingProblem(problem, ops.back(), cycleTime, kind)))
+  // A straight-line region runs once, so its whole cost IS its drain, and it
+  // carries nothing between iterations it does not have.
+  SmallVector<DrainTerm> outputs = drainTerms(problem, spanEscapingValues(ops));
+  SmallVector<RegisterTerm> regs = registerTerms(problem, /*carried=*/nullptr);
+  Stopwatch solveStart = now();
+  if (failed(solveSchedulingProblem(problem, ops.back(), cycleTime, opts,
+                                    SpanObjective{outputs, regs, /*trip=*/1})))
     return failure();
+  recordSolve(model, problem, "acyclic", /*ii=*/std::nullopt, solveStart);
   info(Stage::Sched, ops.front())
       << "Scheduled: depth = " << scheduleDepth(problem) << " cycles";
-  // A straight-line region runs once; how often its enclosing loops re-run it
-  // is those loops' business, charged where they are composed.
+  // How often its enclosing loops re-run it is those loops' business, charged
+  // where they are composed.
   annotateRegion(problem, model, ops.front(), /*ii=*/std::nullopt,
                  /*trip=*/std::nullopt, /*tripIsBound=*/false,
-                 regionDrain(problem, spanEscapingValues(ops)));
+                 drainOf(problem, outputs));
   return success();
 }
 
@@ -717,7 +859,7 @@ static void publishKernelLatency(func::FuncOp funcOp, ScheduleModel &model,
 static LogicalResult scheduleBlock(Block &block, DependenceAnalysis &deps,
                                    const OperatorLibrary &lib,
                                    ScheduleModel &model, float cycleTimeNs,
-                                   SchedulerKind kind);
+                                   const SchedulerOptions &opts);
 
 // Schedule one region: a straight-line span as an acyclic problem, a
 // counted loop as a cyclic problem. An imperfect counted nest, whose
@@ -729,7 +871,7 @@ static LogicalResult scheduleRegion(const SchedRegion &region,
                                     DependenceAnalysis &deps,
                                     const OperatorLibrary &lib,
                                     ScheduleModel &model, float cycleTimeNs,
-                                    SchedulerKind kind) {
+                                    const SchedulerOptions &opts) {
   if (region.kind != allo::RegionKind::Loop) {
     // An all-constant span is a tie-off the reify leaves in place (no
     // latency, no materialized region); scheduling it would cost a spurious
@@ -740,7 +882,7 @@ static LogicalResult scheduleRegion(const SchedRegion &region,
     info(Stage::Sched, region.anchor())
         << "A straight-line span of " << region.ops.size()
         << " op(s), using acyclic scheduling";
-    return scheduleAcyclic(region.ops, deps, lib, model, cycleTimeNs, kind);
+    return scheduleAcyclic(region.ops, deps, lib, model, cycleTimeNs, opts);
   }
   if (isa<AffineForOp, scf::ForOp>(region.anchor())) {
     LoopLikeOpInterface innermost =
@@ -763,7 +905,7 @@ static LogicalResult scheduleRegion(const SchedRegion &region,
           << "Detected imperfect nest, decomposing into sub-regions "
              "scheduled in program order.";
       Block &body = innermost.getLoopRegions().front()->front();
-      return scheduleBlock(body, deps, lib, model, cycleTimeNs, kind);
+      return scheduleBlock(body, deps, lib, model, cycleTimeNs, opts);
     }
     {
       auto d = info(Stage::Sched, innermost.getOperation());
@@ -780,7 +922,7 @@ static LogicalResult scheduleRegion(const SchedRegion &region,
     }
     return scheduleCyclic(innermost, deps, lib, model, region, cycleTimeNs,
                           dir >= 1 ? static_cast<unsigned>(dir) : 1,
-                          /*pipelined=*/dir != -1, kind);
+                          /*pipelined=*/dir != -1, opts);
   }
   // An uncounted while (counted ones are already scf.for) with a
   // straight-line body schedules as a flushing pipeline over before+after;
@@ -796,7 +938,7 @@ static LogicalResult scheduleRegion(const SchedRegion &region,
              "into sub-regions scheduled in program order (the outer while "
              "runs sequentially, latency data-dependent)";
       return scheduleBlock(whileOp.getAfter().front(), deps, lib, model,
-                           cycleTimeNs, kind);
+                           cycleTimeNs, opts);
     }
     // `verify-rtl-legality` rejects a flushing while that does not forward
     // 1:1, so `buildWhileProblem`'s slot alignment holds here.
@@ -804,7 +946,7 @@ static LogicalResult scheduleRegion(const SchedRegion &region,
            "a flushing while reached scheduling without identity forwarding");
     info(Stage::Sched, whileOp.getOperation())
         << "Detected as a while-loop, using flushing-pipeline schedule";
-    return scheduleWhile(whileOp, deps, lib, model, region, cycleTimeNs, kind);
+    return scheduleWhile(whileOp, deps, lib, model, region, cycleTimeNs, opts);
   }
   // An `if` that `fold-if-statements` could not predicate stays a control
   // construct: decompose each branch into sub-regions and leave the `if` raw
@@ -817,7 +959,7 @@ static LogicalResult scheduleRegion(const SchedRegion &region,
     for (Region &branch : ifOp->getRegions())
       if (!branch.empty())
         if (failed(scheduleBlock(branch.front(), deps, lib, model, cycleTimeNs,
-                                 kind)))
+                                 opts)))
           return failure();
     return success();
   }
@@ -828,9 +970,9 @@ static LogicalResult scheduleRegion(const SchedRegion &region,
 static LogicalResult scheduleBlock(Block &block, DependenceAnalysis &deps,
                                    const OperatorLibrary &lib,
                                    ScheduleModel &model, float cycleTimeNs,
-                                   SchedulerKind kind) {
+                                   const SchedulerOptions &opts) {
   for (const SchedRegion &region : enumerateRegions(block))
-    if (failed(scheduleRegion(region, deps, lib, model, cycleTimeNs, kind)))
+    if (failed(scheduleRegion(region, deps, lib, model, cycleTimeNs, opts)))
       return failure();
   return success();
 }
@@ -845,7 +987,7 @@ static LogicalResult scheduleFunc(func::FuncOp funcOp,
                                   const OperatorLibrary &lib,
                                   ScheduleModel &model,
                                   DependenceAnalysis &deps, float cycleTimeNs,
-                                  SchedulerKind kind) {
+                                  const SchedulerOptions &opts) {
   std::string infoStr = "-- Start scheduling for " + funcOp.getSymName().str();
   info(Stage::Sched) << std::string(infoStr.size() * 2, '-');
   info(Stage::Sched) << infoStr;
@@ -863,7 +1005,7 @@ static LogicalResult scheduleFunc(func::FuncOp funcOp,
 
   // Schedule the function body's regions, recursing into imperfect nests.
   return scheduleBlock(funcOp.getBody().front(), deps, lib, model, cycleTimeNs,
-                       kind);
+                       opts);
 }
 
 static void loadDependentDialects(MLIRContext &context) {
@@ -877,14 +1019,15 @@ static void loadDependentDialects(MLIRContext &context) {
 }
 
 LogicalResult mlir::allo::runSDCScheduler(ModuleOp module, StringRef top,
-                                          float cycleTime, SchedulerKind kind,
+                                          float cycleTime,
+                                          const SchedulerOptions &opts,
                                           ScheduleModel &model) {
   // Fail before any work when the exact scheduler was asked for and this build
   // has none: the whole compile would fail region by region otherwise, and the
   // fix is to the build rather than to the kernel.
-  if (kind == SchedulerKind::Exact && !hasExactScheduler()) {
+  if (usesExactScheduler(opts.kind) && !hasExactScheduler()) {
     unsupported(Stage::Sched, module)
-        << "scheduler=\"exact\" was requested but this build was configured "
+        << "An exact scheduler was requested but this build was configured "
            "without OR-Tools. Rebuild with -DALLO_ENABLE_ORTOOLS=ON, or use "
            "the default scheduler=\"heuristic\"";
     return failure();
@@ -925,7 +1068,7 @@ LogicalResult mlir::allo::runSDCScheduler(ModuleOp module, StringRef top,
       eraseHintAndDeadInputs(rewriter, op, deps.getAssumedRanges());
 
     size_t solvedBefore = model.regionCount();
-    if (failed(scheduleFunc(fn, loadedLib, model, deps, cycleTime, kind)))
+    if (failed(scheduleFunc(fn, loadedLib, model, deps, cycleTime, opts)))
       return failure();
     recordTripBounds(fn, model, deps);
     // A func that solved NO region (an empty body, or nothing but

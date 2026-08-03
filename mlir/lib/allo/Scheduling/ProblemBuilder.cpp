@@ -10,6 +10,7 @@
 #include "allo/Scheduling/OperatorLibrary.h"
 #include "allo/Scheduling/RegionGraph.h" // blockHasSyncCall
 #include "allo/Scheduling/Scheduler.h"
+#include "allo/Support/Logging.h"
 
 #include "mlir/Dialect/Affine/Analysis/AffineAnalysis.h"
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
@@ -40,6 +41,41 @@ innermostCarriedDistance(ArrayRef<affine::DependenceComponent> comps,
       carriedDistanceAtLevel(comps, comps.size(), drop, valid));
 }
 
+// Why a loop-carried memory edge holds the distance it holds. `Proven` came out
+// of the polyhedral test. `NonAffine` came from the conservative fallback for a
+// pair the test cannot model, so the distance is an assumption an
+// `allo.assume.nodep` may retire. `Unknown` came from a `*` direction the test
+// could not bound, which is where a range on a symbolic subscript would tighten
+// the distance rather than remove it.
+namespace {
+enum class DistanceOrigin { Proven, NonAffine, Unknown };
+struct CarriedEdgeCounts {
+  unsigned carried = 0, nonAffine = 0, unknown = 0;
+};
+} // namespace
+
+static DistanceOrigin distanceOrigin(const MemoryDependence &dep,
+                                     Operation *dst, DependenceAnalysis &deps) {
+  if (deps.isNonPolyhedral(dep.source) || deps.isNonPolyhedral(dst))
+    return DistanceOrigin::NonAffine;
+  auto comps = ArrayRef(dep.dependenceComponents);
+  if (!comps.empty() && !comps.back().lb.has_value())
+    return DistanceOrigin::Unknown;
+  return DistanceOrigin::Proven;
+}
+
+// How much of a region's recurrence structure rests on an assumption rather
+// than a proof, which is what says whether a hint could recover II here.
+static void reportCarriedEdges(Operation *containingOp,
+                               const CarriedEdgeCounts &counts) {
+  if (!counts.nonAffine && !counts.unknown)
+    return;
+  logging::info(logging::Stage::Sched, containingOp)
+      << "Carried memory dependences: " << counts.carried << " total, "
+      << counts.nonAffine << " non-affine, " << counts.unknown
+      << " unknown-distance";
+}
+
 // A dependence carried by an enclosing loop (a positive distance at some
 // level) is satisfied by that loop's sequential execution, so it does not
 // order two ops within a single straight-line instance. Unlike a
@@ -58,11 +94,10 @@ isLoopCarriedDependence(ArrayRef<affine::DependenceComponent> comps) {
 // Trace an iter_arg's incoming value to the operation that actually defines it,
 // following any chain of iter_arg-to-iter_arg shifts (a yield operand that is
 // itself an iter_arg of this loop, as produced by accumulator rotation) and
-// counting one loop-carried distance per hop. Returns {definer, distance}, or
-// {nullptr, 0} for a pure shift cycle (loop-invariant, no recurrence) or a
-// value defined outside the loop.
-static std::pair<Operation *, unsigned>
-traceIterArgSource(Block *body, Operation *yield, unsigned iterArg) {
+// counting one loop-carried distance per hop. See the header for why this is
+// not local to this file.
+std::pair<Operation *, unsigned> iterArgSource(Block *body, Operation *yield,
+                                               unsigned iterArg) {
   auto v = yield->getOperand(iterArg);
   unsigned distance = 0;
   llvm::SmallDenseSet<unsigned> seen;
@@ -123,6 +158,7 @@ ProblemT buildCyclicProblem(LoopLikeOpInterface loop,
                             DependenceAnalysis &deps) {
   ProblemT problem(loop.getOperation());
   Block *body = &loop.getLoopRegions().front()->front();
+  CarriedEdgeCounts counts;
 
   // Insert memory and stream dependences into the problem.
   body->walk([&](Operation *op) {
@@ -143,6 +179,13 @@ ProblemT buildCyclicProblem(LoopLikeOpInterface loop,
           innermostCarriedDistance(memoryDep.dependenceComponents, drop);
       if (drop)
         continue;
+
+      if (distance >= 1) {
+        ++counts.carried;
+        DistanceOrigin origin = distanceOrigin(memoryDep, op, deps);
+        counts.nonAffine += origin == DistanceOrigin::NonAffine;
+        counts.unknown += origin == DistanceOrigin::Unknown;
+      }
 
       Problem::Dependence dep(memoryDep.source, op);
       auto depInserted = problem.insertDependence(dep);
@@ -215,7 +258,7 @@ ProblemT buildCyclicProblem(LoopLikeOpInterface loop,
       // The value carried into iter_arg `i` may reach its real definer through
       // a chain of shifts; the distance is the number of iterations it spans (1
       // for a direct recurrence, P for a P-slot rotated accumulator).
-      auto [definer, distance] = traceIterArgSource(body, anchor, i);
+      auto [definer, distance] = iterArgSource(body, anchor, i);
       if (!definer)
         continue;
 
@@ -233,6 +276,7 @@ ProblemT buildCyclicProblem(LoopLikeOpInterface loop,
   // computed over the finished graph.
   anchorSinks(problem, anchor);
 
+  reportCarriedEdges(loop.getOperation(), counts);
   return problem;
 }
 
@@ -286,6 +330,7 @@ ProblemT buildWhileProblem(scf::WhileOp w, DependenceAnalysis &deps) {
   auto condOp = w.getConditionOp();
   auto yieldOp = w.getYieldOp();
   auto *condProducer = condOp.getCondition().getDefiningOp();
+  CarriedEdgeCounts counts;
 
   // Register every op in both regions first, so a later-walked back-edge
   // source still resolves. The before terminator (`scf.condition`) is a pure
@@ -310,6 +355,12 @@ ProblemT buildWhileProblem(scf::WhileOp w, DependenceAnalysis &deps) {
             innermostCarriedDistance(memoryDep.dependenceComponents, drop);
         if (drop)
           continue;
+        if (distance >= 1) {
+          ++counts.carried;
+          DistanceOrigin origin = distanceOrigin(memoryDep, op, deps);
+          counts.nonAffine += origin == DistanceOrigin::NonAffine;
+          counts.unknown += origin == DistanceOrigin::Unknown;
+        }
         Problem::Dependence dep(memoryDep.source, op);
         if (failed(problem.insertDependence(dep)))
           continue;
@@ -363,6 +414,7 @@ ProblemT buildWhileProblem(scf::WhileOp w, DependenceAnalysis &deps) {
   // condition is a block argument or the after region is bare.
   anchorSinks(problem, anchor);
 
+  reportCarriedEdges(w.getOperation(), counts);
   return problem;
 }
 

@@ -13,6 +13,7 @@
 #include "mlir/IR/Value.h"
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/DenseSet.h"
 
 #include <optional>
 
@@ -75,11 +76,17 @@ public:
     return assumedRanges;
   }
 
+  /// Whether the polyhedral test cannot model \p op's access.
+  bool isNonPolyhedral(Operation *op) const {
+    return nonPolyhedral.contains(op);
+  }
+
 private:
   func::FuncOp func;
   circt::analysis::MemoryDependenceResult results;
   std::optional<RegionGraph> regionGraph;
   llvm::DenseMap<Value, AssumedRange> assumedRanges;
+  llvm::SmallDenseSet<Operation *> nonPolyhedral;
 };
 
 /// Whether \p op carries a memory effect this analysis does not model

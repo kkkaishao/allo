@@ -70,7 +70,8 @@ MlirLogicalResult alloEmitDatapathToHW(MlirModule module, MlirStringRef binding,
 MlirLogicalResult
 alloRunSDCSchedulingPipeline(MlirModule module, MlirStringRef top,
                              float cycleTime, MlirStringRef scheduler,
-                             MlirStringCallback callback, void *userData) {
+                             double budget, MlirStringCallback callback,
+                             void *userData) {
   ModuleOp mod = unwrap(module);
   StringRef topName = unwrap(top);
   StringRef schedulerName = unwrap(scheduler);
@@ -79,20 +80,24 @@ alloRunSDCSchedulingPipeline(MlirModule module, MlirStringRef top,
   if (!kind) {
     allo::logging::error(allo::logging::Stage::Sched, mod)
         << "Unknown scheduler '" << schedulerName
-        << "'; expected \"heuristic\" or \"exact\"";
+        << "'; expected \"heuristic\", \"exact\" or \"exact-chaining\"";
     return mlirLogicalResultFailure();
   }
   // The target clock period: the option, else a 5.0 ns default. Resolved once
   // here, since both halves price against it and a second copy of the default
   // is a second answer to what the target frequency is.
   float cycleTimeNs = cycleTime > 0.0f ? cycleTime : 5.0f;
+  // Same rule for what one exact solve may spend: the option, else the default,
+  // resolved once so no second copy of it exists downstream.
+  allo::SchedulerOptions opts{*kind, budget > 0.0 ? budget
+                                                  : allo::kDefaultSolveBudget};
   if (failed(allo::runPreScheduleVerification(mod, topName, cycleTimeNs)))
     return mlirLogicalResultFailure();
   // The solved schedule travels between the two halves in memory rather than as
   // attributes on the IR, so it lives exactly as long as this pipeline does and
   // its `Operation *` keys cannot outlive the ops they name.
   allo::ScheduleModel model;
-  if (failed(allo::runSDCScheduler(mod, topName, cycleTimeNs, *kind, model)))
+  if (failed(allo::runSDCScheduler(mod, topName, cycleTimeNs, opts, model)))
     return mlirLogicalResultFailure();
   allo::runPostScheduleConversion(mod, model);
   // The report the reify recorded, which is the only part of the model that

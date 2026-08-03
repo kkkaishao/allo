@@ -623,7 +623,6 @@ DependenceAnalysis::DependenceAnalysis(func::FuncOp funcOp) : func(funcOp) {
   // polyhedral test: the op itself is non-affine, or its loop nest is not
   // all-affine. That subset takes the conservative fallback below.
   SmallVector<Operation *> accessOps;
-  llvm::SmallDenseSet<Operation *> nonPolyhedral;
   SmallVector<AssumeNoDepOp> noDepHints;
   SmallVector<Assumption> assumptions;
   funcOp->walk([&](Operation *op) {

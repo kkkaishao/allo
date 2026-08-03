@@ -352,7 +352,6 @@ OperatorLibrary OperatorLibrary::fromModule(ModuleOp module) {
     e.latency = (uint32_t)op.getLatency();
     e.inDelay = op.getInDelay().convertToDouble();
     e.outDelay = op.getOutDelay().convertToDouble();
-    e.pipelined = op.getPipelined();
     e.symbol = op.getSymName().str();
     auto sig = op.getSignature();
     e.argTypes = elementTypes(sig.getInputs());
@@ -401,7 +400,6 @@ OperatorChar OperatorLibrary::lookup(Operation *op) const {
       c.typeName += stringifyMemoryImplEnum(t.impl).str();
     c.latency = t.latency;
     c.inDelay = c.outDelay = t.delay;
-    c.pipelined = t.pipelined;
     // The address cone is no operation of its own, so no dependence carries its
     // delay: charge it to the port it feeds. The type NAME carries it too, or
     // two sites costing differently would share one characterization.
@@ -447,7 +445,6 @@ OperatorChar OperatorLibrary::lookup(Operation *op) const {
   c.latency = e->latency;
   c.inDelay = e->inDelay;
   c.outDelay = e->outDelay;
-  c.pipelined = e->pipelined;
   c.symbol = e->symbol;
   return c;
 }

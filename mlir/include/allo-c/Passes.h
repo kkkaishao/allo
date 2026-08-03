@@ -47,11 +47,14 @@ alloEmitSplitVerilog(MlirModule module, MlirStringRef directory);
 /// JSON: per-func regions with their per-op start times, plus the per-region
 /// and whole-kernel latency. `scheduler` names the solver that settles the
 /// resource half of every scheduling problem: "heuristic" (the SDC simplex plus
-/// greedy placement) or "exact" (CP-SAT, only in a build with OR-Tools).
-/// Returns failure (callback not invoked) if any phase fails.
+/// greedy placement), "exact" (CP-SAT, only in a build with OR-Tools) or
+/// "exact-chaining". `budget` is what one exact solve may spend, in
+/// deterministic time units; zero or less takes the default. Returns failure
+/// (callback not invoked) if any phase fails.
 MLIR_CAPI_EXPORTED MlirLogicalResult alloRunSDCSchedulingPipeline(
     MlirModule module, MlirStringRef top, float cycleTime,
-    MlirStringRef scheduler, MlirStringCallback callback, void *userData);
+    MlirStringRef scheduler, double budget, MlirStringCallback callback,
+    void *userData);
 
 /// Whether this build accepts `scheduler = "exact"`, i.e. links OR-Tools. The
 /// option exists in both distributions, so this is what tells them apart.

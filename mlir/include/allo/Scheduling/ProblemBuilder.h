@@ -24,6 +24,20 @@ class OperatorLibrary;
 template <class ProblemT>
 ProblemT buildCyclicProblem(LoopLikeOpInterface loop, DependenceAnalysis &deps);
 
+/// The operation that actually DEFINES the value carried into iter_arg
+/// \p iterArg of the counted loop whose body is \p body and whose terminator is
+/// \p yield, and how many iterations back it sits: 1 for a direct recurrence, P
+/// for a P-slot rotated accumulator, following any chain of
+/// iter_arg-to-iter_arg shifts. `{nullptr, 0}` for a pure shift cycle
+/// (loop-invariant, so no recurrence) or a value defined outside the loop.
+///
+/// Exported because two things read it: the inter-iteration dependence edges
+/// `buildCyclicProblem` inserts, and the delay-register terms the exact
+/// scheduler prices a loop-carried read at. A second copy of this walk would
+/// let the two disagree about which reads are recurrences.
+std::pair<Operation *, unsigned> iterArgSource(Block *body, Operation *yield,
+                                               unsigned iterArg);
+
 /// Whether an `scf.while` forwards all before-args to the after region 1:1
 /// (identity forwarding, equal arity): the shape `buildWhileProblem` schedules,
 /// aligning inits/before-args/after-args/yield/results by one slot index.

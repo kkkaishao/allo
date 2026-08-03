@@ -52,14 +52,6 @@ struct CalleeCtx {
 /// index reads it here: `hwWidth`, the operands an address cone is evaluated
 /// over (`evalAffine`), and the boundary address ports the manifest publishes.
 ///
-/// A counter or an address register may be BUILT narrower than this wherever
-/// its own value range allows (`RegionBlock::counterType`,
-/// `RegionBlock::AddrStride::width`); this is the width such a value widens
-/// back to the moment it is read as an ordinary index. Named rather than
-/// spelled at each of those points because it is a default, and a default is
-/// the kind of thing that becomes a device or schedule option.
-inline constexpr unsigned kIndexWidth = 32;
-
 //===----------------------------------------------------------------------===//
 // Identifiers. Cells are referenced by small integer ids (indices into the
 // Datapath's vectors) rather than pointers, so the whole model stays trivially

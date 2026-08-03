@@ -107,6 +107,8 @@ void mlir::allo::ScheduleModel::record(ModuleOp module) {
       }
       if (std::optional<uint64_t> trip = interface.getTrip())
         r.trip = (int64_t)*trip;
+      if (std::optional<uint64_t> drain = interface.getDrain())
+        r.drain = (int64_t)*drain;
       if (std::optional<uint64_t> latency = interface.getLatency())
         r.latency = (int64_t)*latency;
       r.latencyBound = r.latency && interface.getLatencyBound();
@@ -169,6 +171,8 @@ std::string mlir::allo::ScheduleModel::toJSON() const {
         entry["trip"] = *r.trip;
       if (r.length)
         entry["length"] = *r.length;
+      if (r.drain)
+        entry["drain"] = *r.drain;
       if (r.latency)
         entry["latency"] = *r.latency;
       if (!r.determinacy.empty())
@@ -185,7 +189,21 @@ std::string mlir::allo::ScheduleModel::toJSON() const {
     funcs.push_back(std::move(entry));
   }
 
-  Value root = Object{{"funcs", std::move(funcs)}};
+  Array solveEntries;
+  for (const SolveReport &s : solves) {
+    Object entry{{"func", s.func},
+                 {"where", s.where},
+                 {"kind", s.kind},
+                 {"ops", s.ops},
+                 {"limited_ops", s.limitedOps},
+                 {"ms", s.millis}};
+    if (s.ii)
+      entry["ii"] = *s.ii;
+    solveEntries.push_back(std::move(entry));
+  }
+
+  Value root =
+      Object{{"funcs", std::move(funcs)}, {"solves", std::move(solveEntries)}};
   std::string s;
   llvm::raw_string_ostream os(s);
   os << root;
