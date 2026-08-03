@@ -4,6 +4,7 @@
 add_mlir_library(MLIRAlloSupport
     AffineValueMapBuilder.cpp
     AffineRaising.cpp
+    AliasAnalysis.cpp
     TopologyGraph.cpp
     Logging.cpp
     PARTIAL_SOURCES_INTENDED
@@ -14,6 +15,7 @@ add_mlir_library(MLIRAlloSupport
     LINK_LIBS PRIVATE
     MLIRAllo
     MLIRIR
+    MLIRAnalysis
     MLIRAffineDialect
     MLIRArithDialect
     MLIRMemRefDialect

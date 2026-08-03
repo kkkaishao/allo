@@ -287,6 +287,20 @@ struct EmitContext {
   /// a tapped `Register` (consumers read distinct taps) and `delayValid` (last
   /// tap).
   ShiftChain shiftChain(Value in, unsigned depth, const StallShell &sh);
+  /// `shiftChain`'s tap table folded to an initiation interval: with a fresh
+  /// datum landing on \p in only every \p ii cycles, `ceil(depth / ii)`
+  /// registers hold every live value, each capturing once per iteration when
+  /// \p phase reaches the landing phase `ready % ii`. `stages[k]` is register
+  /// `ceil(k / ii)`, so the taps index by the same cycle count a plain chain
+  /// uses and no consumer can tell the two apart.
+  ///
+  /// \p phase must be a free-running time base (`RegionControl::phase`), never
+  /// a pulse: a datum reaches register `j` only on the `j`-th capture after it
+  /// lands, so a chain that stops capturing at the last issue strands its last
+  /// `ceil(depth / ii) - 1` iterations. Sound only where one iteration issues
+  /// every `ii` cycles, i.e. a schedule-paced cyclic leaf.
+  ShiftChain foldedChain(Value in, unsigned depth, unsigned ii, Value phase,
+                         unsigned ready, const StallShell &sh);
   /// A 1-bit signal delayed `n` cycles (issue -> a store's pipeline stage): the
   /// last tap of an `n`-deep `shiftChain`. Resets to 0, so no spurious valid.
   ///

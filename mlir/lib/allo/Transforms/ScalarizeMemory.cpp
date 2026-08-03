@@ -3,7 +3,8 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-#include "allo-c/Schedule.h" // kPartitionAttr, kBindStorageAttr
+#include "allo-c/Schedule.h"            // kPartitionAttr, kBindStorageAttr
+#include "allo/Support/AliasAnalysis.h" // alloAliasAnalysis
 #include "allo/Support/Logging.h"
 #include "allo/Transforms/Passes.h"
 
@@ -47,9 +48,9 @@ struct ScalarizeMemoryPass
             {op, op->getLoc(), cast<MemRefType>(op->getResult(0).getType())});
     });
 
+    AliasAnalysis aa = alloAliasAnalysis(func);
     affine::affineScalarReplace(func, getAnalysis<DominanceInfo>(),
-                                getAnalysis<PostDominanceInfo>(),
-                                getAnalysis<AliasAnalysis>());
+                                getAnalysis<PostDominanceInfo>(), aa);
 
     if (before.empty())
       return;

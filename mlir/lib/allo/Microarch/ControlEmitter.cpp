@@ -119,18 +119,21 @@ RegionControl ControlEmitter::emitPipelined(unsigned region, int64_t ii,
   // gates it to once per II; II==1 (and a while) wants to issue every running
   // cycle. The stall shell then gates this by `enable` below.
   Value wantIssue = running;
+  Value phase;
   if (ii > 1) {
     auto phaseNext = c.bb.get(c.i32);
-    Value phase = c.reg(phaseNext, c.zero32);
+    phase = c.reg(phaseNext, c.zero32);
     nameValue(phase, regionSignal(region, "phase"));
     wantIssue = c.R(
         comb::AndOp::create(c.b, c.loc, running, c.icmpEq(phase, 0), false));
     Value phasep1 = c.R(comb::AddOp::create(c.b, c.loc, phase, c.one32, false));
     Value phaseAdv = c.mux(c.icmpEq(phase, ii - 1), c.zero32, phasep1);
-    // Freeze the phase while stalled (enable low) so the II cadence resumes
-    // where it paused; a stall-free region advances it every cycle.
-    phaseNext.setValue(
-        c.mux(running, c.mux(enable, phaseAdv, phase), c.zero32));
+    // The phase is the region's time base, not only an issue gate: it reloads
+    // on `start` and free-runs, so the value chains folded onto it keep
+    // advancing through the drain. A stalled cycle (enable low) freezes it,
+    // and those chains with it, so the cadence resumes where it paused.
+    phaseNext.setValue(c.mux(term.gateStart(c, start), c.zero32,
+                             c.mux(enable, phaseAdv, phase)));
   }
   // Gated issue: a stalled cycle (enable low) issues nothing, so the counter,
   // `running`, and (with the enabled shift chains) the whole datapath hold.
@@ -149,8 +152,9 @@ RegionControl ControlEmitter::emitPipelined(unsigned region, int64_t ii,
       comb::AndOp::create(c.b, c.loc, issue, term.isLast(c, ivStep), false));
   Value runAfterLast = c.mux(terminate, c.f1, running);
   runNext.setValue(c.mux(term.gateStart(c, start), c.t1, runAfterLast));
-  return {/*issue=*/issue, /*counter=*/iv, /*wantIssue=*/wantIssue,
-          /*running=*/running, /*scaledCounters=*/{}};
+  return {/*issue=*/issue,         /*counter=*/iv,
+          /*wantIssue=*/wantIssue, /*running=*/running,
+          /*phase=*/phase,         /*scaledCounters=*/{}};
 }
 
 // The one counted done-driven skeleton, covering the two cells whose iterations
@@ -211,7 +215,8 @@ ControlEmitter::emitCountedIteration(const uarch::RegionBlock &rb,
   Value done = c.holdDone(c.orBits(empty, c.andBits(complete, last)), start);
   nameValue(done, regionSignal(rb.id, "done"));
   return {{/*issue=*/launch, /*counter=*/iv, /*wantIssue=*/Value(),
-           /*running=*/Value(), /*scaledCounters=*/std::move(scaled)},
+           /*running=*/Value(), /*phase=*/Value(),
+           /*scaledCounters=*/std::move(scaled)},
           done};
 }
 
@@ -245,7 +250,7 @@ IterationControl ControlEmitter::emitCheckedIteration(unsigned region,
   Value done = c.holdDone(finish, start);
   nameValue(done, regionSignal(region, "done"));
   return {{/*issue=*/launch, /*counter=*/Value(), /*wantIssue=*/Value(),
-           /*running=*/Value(), /*scaledCounters=*/{}},
+           /*running=*/Value(), /*phase=*/Value(), /*scaledCounters=*/{}},
           done};
 }
 
@@ -268,8 +273,12 @@ RegionControl ControlEmitter::emitAcyclic(unsigned region, Value start,
   Value armed = c.delayValid(start, boundary.arm, StallShell{});
   if (!sh) {
     nameValue(armed, regionSignal(region, "issue"));
-    return {armed, /*counter=*/Value(), /*wantIssue=*/Value(),
-            /*running=*/Value(), /*scaledCounters=*/{}};
+    return {armed,
+            /*counter=*/Value(),
+            /*wantIssue=*/Value(),
+            /*running=*/Value(),
+            /*phase=*/Value(),
+            /*scaledCounters=*/{}};
   }
   auto pendNext = c.bb.get(c.i1);
   Value pending = c.reg(pendNext, c.f1);
@@ -280,8 +289,12 @@ RegionControl ControlEmitter::emitAcyclic(unsigned region, Value start,
   // Hold the pass pending until it actually issues; the pass is a single one,
   // so `wantIssue` falls the cycle after and the latch stays down.
   pendNext.setValue(c.andBits(wantIssue, c.notBit(sh.issueEnable)));
-  return {issue, /*counter=*/Value(), /*wantIssue=*/wantIssue,
-          /*running=*/Value(), /*scaledCounters=*/{}};
+  return {issue,
+          /*counter=*/Value(),
+          /*wantIssue=*/wantIssue,
+          /*running=*/Value(),
+          /*phase=*/Value(),
+          /*scaledCounters=*/{}};
 }
 
 // The region's completion signal: one latched level for every regime (cyclic,

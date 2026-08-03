@@ -459,7 +459,9 @@ def ScalarizeMemoryPass
   let description = [{
     Perform two steps of small-array handling. First wraps `affine-scalrep` pass to
     perform store-to-load forwarding on a local array, eliminate or fold away
-    redundant memory accesses.
+    redundant memory accesses. It runs under Allo's aliasing contract
+    (`alloAliasAnalysis`), which also lets it drop the overwritten stores a fully
+    unrolled accumulation over a kernel argument leaves behind.
 
     Second, for the untouched survivors, if the array is small enough (at most
     `maxElements` elements) and every subscript is a constant, automatically partition

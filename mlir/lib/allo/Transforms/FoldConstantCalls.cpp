@@ -6,6 +6,7 @@
 #include "allo/Transforms/Passes.h"
 
 #include "allo/IR/AlloOps.h"
+#include "allo/Support/AliasAnalysis.h" // alloAliasAnalysis
 #include "mlir/Analysis/AliasAnalysis.h"
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Affine/LoopUtils.h"
@@ -105,7 +106,7 @@ bool FoldConstantCallsPass::evaluate(IRRewriter &rewriter, KernelOp callee,
     {
       DominanceInfo dom(fn);
       PostDominanceInfo pdom(fn);
-      AliasAnalysis aa(fn);
+      AliasAnalysis aa = alloAliasAnalysis(fn);
       affine::affineScalarReplace(fn, dom, pdom, aa);
     }
     {

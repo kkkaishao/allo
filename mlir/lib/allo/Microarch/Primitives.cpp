@@ -299,6 +299,28 @@ ShiftChain EmitContext::shiftChain(Value in, unsigned depth,
   return chain;
 }
 
+ShiftChain EmitContext::foldedChain(Value in, unsigned depth, unsigned ii,
+                                    Value phase, unsigned ready,
+                                    const StallShell &sh) {
+  assert(ii > 1 && "a fold at II 1 is the plain chain, one register per tap");
+  // A stall freezes the phase, so the capture term stays high across it and
+  // would otherwise shift the chain once per stalled cycle.
+  Value capture = icmpEq(phase, ready % ii);
+  Value ce = sh ? andBits(sh.chainEnable, capture) : capture;
+  Value rz = konst(in.getType(), 0);
+  llvm::SmallVector<Value> held;
+  Value cur = in;
+  for (unsigned j = 0, n = (depth + ii - 1) / ii; j < n; ++j) {
+    cur = enabledReg(cur, ce, rz);
+    held.push_back(cur);
+  }
+  ShiftChain chain;
+  chain.stages.push_back(in); // stage 0 = the source, as in a plain chain
+  for (unsigned k = 1; k <= depth; ++k)
+    chain.stages.push_back(held[(k - 1) / ii]); // register ceil(k / ii)
+  return chain;
+}
+
 // Above this many cycles a counter (log2(n) registers + a comparator) is
 // cheaper than a chain (n registers). Set well clear of ordinary pipeline-stage
 // delays so the shape of a small chain, which structural tests read, is left

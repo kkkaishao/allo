@@ -19,12 +19,13 @@ namespace mlir::allo::uarch {
 
 /// The producer of a value plus the register depth a consumer needs to read it.
 struct Resolved {
-  Source base;      // the producing cell output
-  Value key;        // register key (the produced SSA value; null => never reg)
-  unsigned depth;   // pipeline-register depth for this edge
-  bool ok = false;  // false => producer outside this region / not modelled
-  Source init = {}; // reduction identity iff this edge reads a loop-carried
-                    // iter_arg (a recurrence input); None otherwise
+  Source base;    // the producing cell output
+  Value key;      // register key (the produced SSA value; null => never reg)
+  unsigned depth; // pipeline-register depth for this edge
+  unsigned ready = 0; // cycle `base` lands at within its iteration
+  bool ok = false;    // false => producer outside this region / not modelled
+  Source init = {};   // reduction identity iff this edge reads a loop-carried
+                      // iter_arg (a recurrence input); None otherwise
   unsigned initDist = 1; // recurrence distance (iterations): `init` must be
                          // re-injected for the first `initDist` runs
 };
@@ -57,6 +58,10 @@ struct DatapathBuilder {
     RegKey key;
     unsigned depth;
   };
+  struct RegHead { // what drives a chain's head, and when it lands there
+    Source base;
+    unsigned ready;
+  };
   struct MuxBuild { // a shared unit port's per-op drivers, muxed after chains
     UnitId unit;
     unsigned port;
@@ -65,7 +70,7 @@ struct DatapathBuilder {
     llvm::SmallVector<Source, 2> sources; // parallel to ops
   };
   llvm::MapVector<RegKey, llvm::SmallVector<unsigned>> depthsByKey;
-  llvm::DenseMap<RegKey, Source> baseByKey;
+  llvm::DenseMap<RegKey, RegHead> headByKey;
   llvm::SmallVector<RegDepth> pending;
   std::deque<MuxBuild> muxBuilds; // a deque so `record`'s slot pointers into
                                   // `sources` survive later pushes
@@ -236,7 +241,7 @@ struct DatapathBuilder {
   Resolved resolveOperand(Value v, Operation *consumer, unsigned ii);
   /// Materialize one shift-register chain carrying \p key, deep enough for the
   /// largest of \p depths, with a tap at each distinct depth. Returns its id.
-  RegId insertRegister(Value key, ArrayRef<unsigned> depths, Source input,
+  RegId insertRegister(Value key, ArrayRef<unsigned> depths, RegHead head,
                        RegionId region);
   /// Resolve every unit input / memory address / store-data / stream driver,
   /// threading non-zero-depth edges through inserted register chains. Drives
