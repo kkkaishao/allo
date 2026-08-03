@@ -378,6 +378,33 @@ void Datapath::reportAllocation() const {
   }
 }
 
+/// The largest set of mutually adjacent vertices in \p adj, a bitset per vertex,
+/// by Bron-Kerbosch with pivoting: every maximal clique contains the pivot or a
+/// candidate NOT adjacent to it, so only those need branching, which is what
+/// makes the search tractable where enumerating subsets is not. \p budget bounds
+/// a recursion that stays exponential in the worst case; exhausting it reports
+/// the whole vertex set, which only over-states.
+static unsigned maxClique(llvm::ArrayRef<uint64_t> adj, uint64_t candidates,
+                          uint64_t excluded, unsigned depth, unsigned &budget) {
+  if (!candidates && !excluded)
+    return depth;
+  if (budget == 0)
+    return adj.size();
+  --budget;
+  unsigned pivot = llvm::countr_zero(candidates | excluded);
+  unsigned best = depth;
+  for (uint64_t branch = candidates & ~adj[pivot]; branch;) {
+    unsigned v = llvm::countr_zero(branch);
+    uint64_t bit = uint64_t(1) << v;
+    branch &= ~bit;
+    best = std::max(best, maxClique(adj, candidates & adj[v], excluded & adj[v],
+                                    depth + 1, budget));
+    candidates &= ~bit;
+    excluded |= bit;
+  }
+  return best;
+}
+
 unsigned Datapath::portsNeeded(MemId id, bool writesOnly) const {
   const MemUnit &m = mems[id];
   // Top-level ancestor of a region: the granularity `recordSiblingDeps` orders
@@ -447,24 +474,22 @@ unsigned Datapath::portsNeeded(MemId id, bool writesOnly) const {
     }
     return true;
   };
-  // The largest mutually-overlapping set of writers. Exhaustive below a width
-  // the search is free at; above it every writer is assumed simultaneous,
-  // which only over-states and so never merges a port unsafely.
-  if (ws.size() > 16)
+  // The largest mutually-overlapping set of writers, over one bitset per
+  // writer, so the search is 64 wide. Above that every writer is assumed
+  // simultaneous, which only over-states and so never merges a port unsafely.
+  if (ws.size() > 64)
     return ws.size();
-  unsigned needed = 1;
-  for (uint32_t s = 1, e = 1u << ws.size(); s < e; ++s) {
-    if (unsigned(llvm::popcount(s)) <= needed)
-      continue;
-    bool clique = true;
-    for (unsigned i = 0; i < ws.size() && clique; ++i)
-      for (unsigned j = i + 1; j < ws.size() && clique; ++j)
-        if ((s >> i & 1) && (s >> j & 1))
-          clique = overlaps(ws[i], ws[j]);
-    if (clique)
-      needed = llvm::popcount(s);
-  }
-  return needed;
+  llvm::SmallVector<uint64_t> adj(ws.size(), 0);
+  for (unsigned i = 0; i < ws.size(); ++i)
+    for (unsigned j = i + 1; j < ws.size(); ++j)
+      if (overlaps(ws[i], ws[j])) {
+        adj[i] |= uint64_t(1) << j;
+        adj[j] |= uint64_t(1) << i;
+      }
+  unsigned budget = 1u << 20;
+  uint64_t all = ws.size() == 64 ? ~uint64_t(0)
+                                 : (uint64_t(1) << ws.size()) - 1;
+  return maxClique(adj, all, /*excluded=*/0, /*depth=*/0, budget);
 }
 
 void Datapath::dump(llvm::raw_ostream &os) const {
