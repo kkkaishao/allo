@@ -370,20 +370,20 @@ void Datapath::reportAllocation() const {
       continue;
     logging::info(logging::Stage::Emit, anchor)
         << "Memory: " << writes << " write ports (" << fromCalls
-        << " from calls) on " << m.depthWords << "x" << m.width
-        << " bits over " << regionsWriting.size() << " regions, needs "
+        << " from calls) on " << m.depthWords << "x" << m.width << " bits over "
+        << regionsWriting.size() << " regions, needs "
         << portsNeeded(m.id, /*writesOnly=*/true) << " write "
         << portsNeeded(m.id, /*writesOnly=*/false) << " total, "
         << (m.external ? "external" : "internal");
   }
 }
 
-/// The largest set of mutually adjacent vertices in \p adj, a bitset per vertex,
-/// by Bron-Kerbosch with pivoting: every maximal clique contains the pivot or a
-/// candidate NOT adjacent to it, so only those need branching, which is what
-/// makes the search tractable where enumerating subsets is not. \p budget bounds
-/// a recursion that stays exponential in the worst case; exhausting it reports
-/// the whole vertex set, which only over-states.
+/// The largest set of mutually adjacent vertices in \p adj, a bitset per
+/// vertex, by Bron-Kerbosch with pivoting: every maximal clique contains the
+/// pivot or a candidate NOT adjacent to it, so only those need branching, which
+/// is what makes the search tractable where enumerating subsets is not. \p
+/// budget bounds a recursion that stays exponential in the worst case;
+/// exhausting it reports the whole vertex set, which only over-states.
 static unsigned maxClique(llvm::ArrayRef<uint64_t> adj, uint64_t candidates,
                           uint64_t excluded, unsigned depth, unsigned &budget) {
   if (!candidates && !excluded)
@@ -442,7 +442,8 @@ unsigned Datapath::portsNeeded(MemId id, bool writesOnly) const {
     if (acc.isWrite || !writesOnly) {
       unsigned ii = regions[acc.region].ii.value_or(0);
       unsigned start = dcpStart(acc.op);
-      ws.push_back({topOf(acc.region), acc.region, ii ? start % ii : start, -1});
+      ws.push_back(
+          {topOf(acc.region), acc.region, ii ? start % ii : start, -1});
     }
   for (const CallUnit &cu : calls)
     for (const CallUnit::MemArg &ma : cu.memArgs)
@@ -487,8 +488,8 @@ unsigned Datapath::portsNeeded(MemId id, bool writesOnly) const {
         adj[j] |= uint64_t(1) << i;
       }
   unsigned budget = 1u << 20;
-  uint64_t all = ws.size() == 64 ? ~uint64_t(0)
-                                 : (uint64_t(1) << ws.size()) - 1;
+  uint64_t all =
+      ws.size() == 64 ? ~uint64_t(0) : (uint64_t(1) << ws.size()) - 1;
   return maxClique(adj, all, /*excluded=*/0, /*depth=*/0, budget);
 }
 
