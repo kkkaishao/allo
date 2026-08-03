@@ -101,3 +101,12 @@ def discover(suites: tuple[str, ...] = _SUITES) -> list[Benchmark]:
             if bench is not None:
                 found.append(bench)
     return found
+
+
+def find(key: str) -> Benchmark:
+    """The one benchmark named `suite/name`; how a runner's child process gets
+    back to the workload its parent chose."""
+    for b in discover():
+        if b.key == key:
+            return b
+    raise SystemExit(f"no benchmark {key!r}")

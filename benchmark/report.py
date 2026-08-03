@@ -8,8 +8,8 @@
     python -m benchmark.report --compare base.json
 
 This is the measurement half of the bed. `spec.py` says what a benchmark is and
-the cosim probe answers whether a variant is CORRECT; this answers what it
-COSTS, which is the question a scheduling-model change has to be argued from.
+`verify.py` answers whether a variant is CORRECT; this answers what it COSTS,
+which is the question a scheduling-model change has to be argued from.
 
 What it reports, and why each number rather than a neighbouring one:
 
@@ -43,8 +43,8 @@ and a solver that runs away all have to be survivable, and only a process
 boundary survives all three.
 
 NOT a correctness suite. It stops at `compile`, so nothing here says a variant
-computes the right answer; that is the cosim probe's job and the two should not
-be conflated again.
+computes the right answer; that is `verify.py`'s job and the two should not be
+conflated again.
 """
 
 from __future__ import annotations
@@ -163,12 +163,9 @@ _SPLIT_ONE = re.compile(r"(\S+) (\d+) ops / (\d+) classes")
 
 def _load(key):
     sys.path.insert(0, str(REPO))
-    from benchmark.spec import discover
+    from benchmark.spec import find
 
-    for b in discover():
-        if b.key == key:
-            return b
-    raise SystemExit(f"no benchmark {key!r}")
+    return find(key)
 
 
 def measure_one(

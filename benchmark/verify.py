@@ -1,0 +1,410 @@
+# Copyright Allo authors. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+"""Correctness over the benchmark bed, swept over the BINDING axis.
+
+    python -m benchmark.verify                    # trivial and greedy-share
+    python -m benchmark.verify --binding planned --scheduler exact
+    python -m benchmark.verify -k gemm
+
+The correctness half of the bed. `spec.py` says what a benchmark is, `report.py`
+says what a variant COSTS, and this says whether it computes the right answer:
+every variant cosims against the numpy `reference` its benchmark declares, so
+the bed's own claim, that a schedule may change the hardware and never the
+function, is the thing under test.
+
+The axis is the BINDING, i.e. how many physical units the schedule is realized
+on. `tests/rtl` runs the trivial binding only, so a sharing bug that needs a real
+workload to expose has nothing standing in front of it; sweeping the axis over
+the whole bed is that guard, and it is why an axis here rather than another unit
+test. `--scheduler` is a scalar and not a second axis on purpose: the two
+compose, and a sweep of the product answers a question nobody asked.
+
+Two things it reports beyond pass and fail, both because a green run can be
+empty:
+
+    rtl_sha  the emitted Verilog's hash. Two bindings that produce byte
+             identical RTL checked ONE hardware twice, which is exactly what
+             `planned` under the heuristic scheduler does, so the probe states
+             how many variants it actually distinguished rather than letting a
+             row count imply it.
+    cycles   the measured cosim cycle count. `cosim` already holds an exact
+             latency contract to it, so a binding that moved the schedule shows
+             up as a number rather than as a silent pass.
+
+Each run is a subprocess for the reason `report.py` uses one: a solver that does
+not terminate, an assert that fires and a simulator that dies are all results,
+and only a process boundary survives all three.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import shutil
+import subprocess
+import sys
+import time
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+
+import numpy as np
+
+REPO = Path(__file__).resolve().parents[1]
+MARK = "@@VERIFY@@"
+
+# What one cosim may run for, derived from the model rather than fixed: a design
+# that hangs then aborts at a multiple of what it should have taken, instead of
+# at whatever constant covers the biggest kernel in the bed.
+_CYCLE_FLOOR = 40_000
+_CYCLE_SLACK = 4
+# A kernel whose span the model does not know (a dynamic trip count, an
+# indeterminate body) has nothing to scale, so it gets a flat ceiling.
+_CYCLE_UNKNOWN = 2_000_000
+
+
+def _cycle_budget(latency: int | None) -> int:
+    if latency is None:
+        return _CYCLE_UNKNOWN
+    return max(_CYCLE_FLOOR, _CYCLE_SLACK * latency)
+
+
+def _mismatch(bench, args, expected) -> dict | None:
+    """The first output argument that differs, or None if every one matches.
+
+    Reported as how MANY elements differ and by how much, not as a bare failure:
+    a shared datapath usually breaks one operator, so one wrong element in a
+    thousand and a thousand in a thousand are different bugs and the probe
+    should not need a re-run to tell them apart."""
+    assert len(expected) == len(bench.outputs), "reference does not cover outputs"
+    for idx, exp in zip(bench.outputs, expected):
+        got, exp = np.asarray(args[idx]), np.asarray(exp)
+        if bench.tolerance:
+            rtol, atol = bench.tolerance
+            bad = ~np.isclose(got, exp, rtol=rtol, atol=atol)
+        else:
+            bad = got != exp
+        if not bad.any():
+            continue
+        # In float64 whatever the kernel's type: an unsigned difference wraps.
+        diff = np.abs(got.astype(np.float64) - exp.astype(np.float64))
+        at = np.unravel_index(int(diff.argmax()), diff.shape)
+        return {
+            "arg": idx,
+            "bad": int(bad.sum()),
+            "of": int(bad.size),
+            "max_abs": float(diff.max()),
+            "at": [int(i) for i in at],
+        }
+    return None
+
+
+# --- one run -----------------------------------------------------------------
+
+
+def verify_one(
+    key: str,
+    variant: str,
+    binding: str,
+    scheduler: str = "heuristic",
+    seed: int = 0,
+    cycles: int = 0,
+) -> dict:
+    """Compile one variant under one binding, cosim it and compare.
+
+    ``binding`` is the operator-sharing policy and the axis this probe exists
+    for; ``cycles`` overrides the derived simulation budget."""
+    from benchmark.spec import find
+
+    bench = find(key)
+    out: dict = {
+        "key": key,
+        "variant": variant,
+        "binding": binding,
+        "scheduler": scheduler,
+        "stage": "build",
+        "status": "error",
+    }
+    t0 = time.time()
+    if variant in bench.skip:
+        out.update(status="skip", stage="skip", note=bench.skip[variant])
+        return out
+
+    try:
+        parts = bench.build()
+        sched = bench.schedules[variant](parts)
+        rtl = sched.export("rtl", binding=binding, scheduler=scheduler)
+
+        out["stage"] = "schedule"
+        fn = rtl.schedule().func(rtl.top)
+        out["latency"] = fn.latency
+        out["latency_exact"] = fn.latency_is_exact
+
+        out["stage"] = "compile"
+        rtl.compile()
+        out["rtl_sha"] = hashlib.sha256(rtl.verilog.encode()).hexdigest()[:16]
+
+        rng = np.random.default_rng(seed)
+        args = bench.inputs(rng)
+        # `reference` takes the kernel's arguments, output buffers included, so
+        # it gets copies: one that accumulated into a buffer it was handed would
+        # otherwise be scored against the DUT's own answer.
+        expected = bench.reference(
+            *(a.copy() if isinstance(a, np.ndarray) else a for a in args)
+        )
+
+        out["stage"] = "cosim"
+        out["cycles"] = rtl.cosim(
+            *args, timeout=cycles or _cycle_budget(fn.latency)
+        ).cycles
+
+        out["stage"] = "compare"
+        bad = _mismatch(bench, args, expected)
+        if bad is not None:
+            out.update(status="wrong", mismatch=bad)
+        else:
+            out["status"] = "pass"
+    except BaseException as e:  # a fired assert is a result, not a crash
+        out["error"] = f"{type(e).__name__}: {e}"[:2000]
+    finally:
+        out["seconds"] = round(time.time() - t0, 1)
+    return out
+
+
+def _run_child(item, scheduler: str, seed: int, cycles: int, timeout: int) -> dict:
+    key, variant, binding = item
+    env = dict(os.environ)
+    env["XILINX_VITIS"] = "/nonexistent"
+    env["PYTHONPATH"] = str(REPO)
+    env.setdefault("ALLO_LOG_LEVEL", "warn")
+    cmd = [
+        sys.executable,
+        "-m",
+        "benchmark.verify",
+        "--one",
+        f"{key}::{variant}::{binding}",
+        "--scheduler",
+        scheduler,
+        "--seed",
+        str(seed),
+        "--cycles",
+        str(cycles),
+    ]
+    t0 = time.time()
+    base = {"key": key, "variant": variant, "binding": binding, "scheduler": scheduler}
+    try:
+        p = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=timeout, env=env, cwd=str(REPO)
+        )
+    except subprocess.TimeoutExpired:
+        return {
+            **base,
+            "status": "timeout",
+            "stage": "?",
+            "seconds": round(time.time() - t0, 1),
+        }
+    for line in p.stdout.splitlines():
+        if line.startswith(MARK):
+            return json.loads(line[len(MARK) :])
+    return {
+        **base,
+        "status": "crash",
+        "stage": "?",
+        "seconds": round(time.time() - t0, 1),
+        "error": (p.stdout + p.stderr)[-3000:],
+    }
+
+
+# --- tables ------------------------------------------------------------------
+
+
+def _key_of(r) -> str:
+    return f"{r['key']}/{r['variant']}"
+
+
+_COLS = [("status", "status", 7), ("cycles", "cycles", 10), ("bad", "bad", 7)]
+_GROUP = sum(w for _, _, w in _COLS) + len(_COLS)
+
+
+def variant_table(results: list[dict], bindings: list[str]) -> str:
+    """One row per variant, one column group per binding.
+
+    `bad` is how many output elements differed, so a wrong row says whether one
+    operator or the whole datapath is broken."""
+    by: dict = {}
+    for r in results:
+        by.setdefault(_key_of(r), {})[r["binding"]] = r
+
+    top = f"{'':<34}" + "".join(f"  {('[' + b + ']').center(_GROUP)}" for b in bindings)
+    head = f"{'benchmark/variant':<34}" + "".join(
+        "  " + "".join(" " + label.rjust(w) for _, label, w in _COLS) for _ in bindings
+    )
+    lines = [top, head, "-" * len(head)]
+    for name in sorted(by):
+        row = f"{name:<34}"
+        for b in bindings:
+            r = by[name][b]  # every (variant, binding) pair is one run
+            row += "  "
+            for field, _, w in _COLS:
+                if field == "bad":
+                    v = r.get("mismatch", {}).get("bad", "-")
+                else:
+                    v = r.get(field, "-")
+                row += " " + str(v).rjust(w)
+        lines.append(row)
+    return "\n".join(lines)
+
+
+def coverage_note(results: list[dict], bindings: list[str]) -> str:
+    """How much of the sweep was a SECOND hardware rather than the same one
+    again. A binding that folds nothing emits the RTL the trivial binding
+    already emitted, and those rows cost a cosim without guarding anything."""
+    if len(bindings) < 2:
+        return ""
+    shas: dict = {}
+    for r in results:
+        if r.get("rtl_sha"):
+            shas.setdefault(_key_of(r), {})[r["binding"]] = r["rtl_sha"]
+    full = [m for m in shas.values() if len(m) == len(bindings)]
+    same = [m for m in full if len(set(m.values())) == 1]
+    return (
+        f"{len(full) - len(same)} of {len(full)} variants emitted DIFFERENT RTL "
+        f"across {bindings}; the other {len(same)} checked one hardware "
+        f"{len(bindings)} times"
+    )
+
+
+def failure_report(results: list[dict]) -> str:
+    """Every run that did not pass, with what it was doing when it stopped."""
+    bad = [r for r in results if r["status"] not in ("pass", "skip")]
+    if not bad:
+        return ""
+    lines = [f"{len(bad)} failing run(s):", ""]
+    for r in sorted(bad, key=lambda r: (_key_of(r), r["binding"])):
+        detail = r.get("error") or json.dumps(r.get("mismatch", {}))
+        # Flattened rather than cut at the first newline: an emitter diagnostic
+        # arrives wrapped under a generic first line, so a line-1 excerpt says
+        # only that something failed.
+        lines.append(
+            f"{_key_of(r)} [{r['binding']}] {r['status']} at {r['stage']}: "
+            + " ".join(detail.split())[:220]
+        )
+    return "\n".join(lines)
+
+
+# --- driver ------------------------------------------------------------------
+
+
+def main():
+    ap = argparse.ArgumentParser(description=(__doc__ or "").splitlines()[0])
+    ap.add_argument("--one", help=argparse.SUPPRESS)  # the child entry point
+    ap.add_argument("-j", "--jobs", type=int, default=8)
+    ap.add_argument("-k", "--filter", default="", help="substring of suite/name")
+    ap.add_argument(
+        "--binding",
+        default="trivial,greedy-share",
+        help="comma-separated axis: 'trivial' (one unit per op), 'greedy-share' "
+        "(fold every compatible pair) or 'planned' (the allocation the scheduler "
+        "decided, which needs --scheduler exact to be anything else)",
+    )
+    ap.add_argument(
+        "--scheduler",
+        default="heuristic",
+        help="the solver each binding is realized on. A scalar, not an axis",
+    )
+    ap.add_argument("--seed", type=int, default=0, help="the input generator's seed")
+    ap.add_argument(
+        "--cycles",
+        type=int,
+        default=0,
+        help="simulation budget per run; 0 derives it from the modelled latency",
+    )
+    ap.add_argument("--timeout", type=int, default=1800, help="wall seconds per run")
+    ap.add_argument("-o", "--out", default="verify.json")
+    args = ap.parse_args()
+
+    if args.one:
+        key, variant, binding = args.one.split("::")
+        print(
+            MARK
+            + json.dumps(
+                verify_one(
+                    key, variant, binding, args.scheduler, args.seed, args.cycles
+                )
+            )
+        )
+        return
+
+    sys.path.insert(0, str(REPO))
+    from allo.backend.rtl import has_exact_scheduler
+    from benchmark.spec import discover
+
+    if shutil.which("verilator") is None:
+        raise SystemExit("cosim needs verilator on PATH")
+    bindings = [b for b in args.binding.split(",") if b]
+    if not bindings:
+        raise SystemExit("no binding to run")
+    if args.scheduler.startswith("exact") and not has_exact_scheduler():
+        raise SystemExit(
+            "this build has no OR-Tools, so the exact schedulers are absent"
+        )
+    if "planned" in bindings and not args.scheduler.startswith("exact"):
+        print(
+            "NOTE: `planned` under the heuristic scheduler IS the trivial "
+            "binding, so those runs check one hardware twice",
+            file=sys.stderr,
+        )
+
+    work = [
+        (b.key, v, binding)
+        for b in discover()
+        for v in b.schedules
+        for binding in bindings
+        if args.filter in b.key
+    ]
+    print(
+        f"{len(work)} runs, {args.jobs} jobs, scheduler={args.scheduler},"
+        f" bindings={bindings}",
+        flush=True,
+    )
+
+    results, done = [], 0
+    with ThreadPoolExecutor(max_workers=args.jobs) as pool:
+        futs = [
+            pool.submit(
+                _run_child, w, args.scheduler, args.seed, args.cycles, args.timeout
+            )
+            for w in work
+        ]
+        for f in futs:
+            r = f.result()
+            results.append(r)
+            done += 1
+            tag = {"pass": "ok", "skip": "--"}.get(r["status"], r["status"].upper())
+            print(
+                f"[{done:3d}/{len(work)}] {tag:>8}  {_key_of(r)}"
+                f" [{r['binding']}]  {r.get('seconds', 0)}s",
+                flush=True,
+            )
+
+    Path(args.out).write_text(json.dumps(results, indent=1))
+    print(f"\nwrote {args.out}\n")
+    print(variant_table(results, bindings))
+    note = coverage_note(results, bindings)
+    if note:
+        print("\n" + note)
+
+    tally: dict = {}
+    for r in results:
+        tally[r["status"]] = tally.get(r["status"], 0) + 1
+    print("\n" + "  ".join(f"{k}={v}" for k, v in sorted(tally.items())))
+    report = failure_report(results)
+    if report:
+        print("\n" + report)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
