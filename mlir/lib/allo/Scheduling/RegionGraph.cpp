@@ -63,9 +63,7 @@ RegionShape mlir::allo::dcpRegionShape(Operation *regionOp) {
 }
 
 // Whether a call node's operand/result types are the ones a leaf CallUnit can
-// carry: memrefs the child masters and scalars it reads / returns. The one
-// definition, asked of a `func.call` before reification and of a
-// `dcp.instance` after (`spawnsConcurrently`).
+// carry: memrefs the child masters and scalars it reads / returns.
 static bool lowerableSignature(TypeRange operands, TypeRange results) {
   return llvm::all_of(operands,
                       [](Type t) {
@@ -85,8 +83,6 @@ Operation *mlir::allo::calleeOf(Operation *call) {
 }
 
 std::optional<int64_t> mlir::allo::calleeStaticLatency(Operation *callee) {
-  // A reified kernel answers from its own field; there is no second number on
-  // it to pick the wrong one of.
   if (auto mod = dyn_cast<dcp::DCPathModuleOp>(callee))
     return mod.getLatency();
   if (auto a = callee->getAttrOfType<IntegerAttr>(kLatencyAttr))
@@ -121,9 +117,8 @@ bool mlir::allo::isContainerStructure(Operation &op) {
 }
 
 bool mlir::allo::spawnsConcurrently(Operation *invoke) {
-  // `await` (broadcast start), or the same "not leaf-lowerable" signature test
-  // `composesOnStructuralTop` applies pre-reification. In practice that is a
-  // `Stream` operand, a back-pressured hand-off no schedule can time.
+  // await, or the same signature test `composesOnStructuralTop` applies
+  // pre-reification (in practice, a Stream operand).
   return invoke->hasAttr(kAlloAsyncAttr) ||
          !lowerableSignature(invoke->getOperandTypes(),
                              invoke->getResultTypes());
@@ -131,13 +126,10 @@ bool mlir::allo::spawnsConcurrently(Operation *invoke) {
 
 SmallVector<SchedRegion> mlir::allo::enumerateRegions(Block &block) {
   SmallVector<SchedRegion> regions;
-  // A DETERMINATE call is isolated only in a nested block; see the header for
-  // why the function's own entry block keeps such calls inside their span.
+  // A DETERMINATE call is isolated only in a nested block, not the entry block.
   Operation *parent = block.getParentOp();
   bool isolateCalls = !isa_and_nonnull<func::FuncOp>(parent);
-  // An INDETERMINATE one is isolated in the entry block too, but only where it
-  // becomes a leaf CallUnit, the node other ops are scheduled against. `||`
-  // short-circuits, so the cast runs only for a func's own block.
+  // `||` short-circuits, so the cast runs only for a func's own block.
   bool isolateIndeterminate =
       isolateCalls || !composesOnStructuralTop(cast<func::FuncOp>(parent));
 

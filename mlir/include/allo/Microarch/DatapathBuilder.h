@@ -25,11 +25,8 @@ struct Resolved {
   bool ok = false;  // false => producer outside this region / not modelled
   Source init = {}; // reduction identity iff this edge reads a loop-carried
                     // iter_arg (a recurrence input); None otherwise
-  unsigned initDist =
-      1; // recurrence distance (iterations) for `init`: the init
-         // must be re-injected for the first `initDist` runs (a
-         // distance-d carry, e.g. a 2nd-order shift register,
-         // reads d undefined past values before its own outputs)
+  unsigned initDist = 1; // recurrence distance (iterations): `init` must be
+                         // re-injected for the first `initDist` runs
 };
 
 //===----------------------------------------------------------------------===//
@@ -52,10 +49,8 @@ struct DatapathBuilder {
 
   // Interconnect-derivation scratch (transient; see deriveInterconnect).
   // A register is keyed by (held value, consuming region): the SAME value (an
-  // enclosing loop's counter, delayed to a later stage) is read in several
-  // nested regions, and each needs its OWN delay chain built in its own region.
-  // A single shared register would be emitted in one region and tapped,
-  // unbuilt, from a sibling emitted earlier.
+  // enclosing loop's counter) can be read in several nested regions, and each
+  // needs its own delay chain built in its own region.
   using RegKey = std::pair<::mlir::Value, unsigned>;
   struct RegDepth { // a register-fed input slot, patched once its chain exists
     Source *slot;
@@ -96,10 +91,10 @@ struct DatapathBuilder {
   /// the parent/child linkage. Returned by value; pushed by `build`.
   RegionBlock addRegion(Operation *regionOp, RegionId ridx);
   /// Derive every region's `shape` discriminant (see `RegionBlock::Shape`) and
-  /// assert the structural invariants each shape carries. Runs immediately
-  /// after the region walk, the earliest point at which both the parent/child
-  /// edges and the CallUnits it reads are complete. It is therefore not inside
-  /// `addRegion`, which sees neither for the region it is building.
+  /// assert the structural invariants each shape carries. Runs right after the
+  /// region walk, the earliest point where both the parent/child edges and
+  /// the CallUnits it reads are complete (unlike `addRegion`, which sees
+  /// neither for the region it is building).
   void deriveShapes();
   /// Bind one body op to its resource: the dispatch, one arm per resource kind
   /// (below) plus the kinds that bind nothing (a nested region, a literal, a
@@ -133,11 +128,10 @@ struct DatapathBuilder {
   /// touch (a get => input, a put => output).
   StreamId getOrCreateStream(Value stream, bool isInput);
   /// Record how each region produces its results (`rb.results`) and, for the
-  /// two regimes that have one, its control predicate (`rb.condition`). One
-  /// pass over all three regimes because they are one concept: a region result
-  /// is a survivor register, and a loop's k-th result is the final value of its
-  /// k-th iter-arg (see `RegionResult`). No-op for a result-less counted
-  /// region.
+  /// two regimes that have one, its control predicate (`rb.condition`). A
+  /// region result is a survivor register; a loop's k-th result is the final
+  /// value of its k-th iter-arg (see `RegionResult`). No-op for a
+  /// result-less counted region.
   void recordRegionResults(llvm::ArrayRef<Operation *> regionOps);
   /// Resolve each `dcp.instance`'s scalar operands into its CallUnit's
   /// `scalarIns`. Separate from `bindResource`, which creates the CallUnit
@@ -145,22 +139,19 @@ struct DatapathBuilder {
   /// model (see `resolveValue`).
   void recordCallScalars();
   /// Record every CallUnit's composition predecessors (`cu.predecessors`), the
-  /// instance-substrate counterpart of `recordSiblingDeps`. The rule depends on
-  /// how the owning region composes, and the two are genuinely different
-  /// questions, which is why they live side by side rather than merged. A
-  /// SCHEDULED composition orders its children by their placed `start` and only
-  /// has to gate an earlier or indeterminate producer, while a CONCURRENT one
-  /// places every child at 0 and must read the hazard direction (RAW / WAW /
-  /// WAR) to order them at all. Runs after `recordCallScalars`, whose Sources
-  /// carry the scalar-result edges.
+  /// instance-substrate counterpart of `recordSiblingDeps`. A SCHEDULED
+  /// composition orders its children by their placed `start` and only gates
+  /// an earlier or indeterminate producer; a CONCURRENT one places every child
+  /// at 0 and must read the hazard direction (RAW / WAW / WAR) to order them
+  /// at all. Runs after `recordCallScalars`, whose Sources carry the
+  /// scalar-result edges.
   void recordCallDeps();
   /// Re-decide which initialized arrays are constant TABLES, once the
   /// children's port directions are known. `isConstantTable` (the scheduler's
   /// predicate, read at `getOrCreateMem` time) conservatively disqualifies any
-  /// array handed to a sub-kernel, because before the callee interfaces exist
-  /// it cannot see which way the child touches it. Read-only is a property of
-  /// the USE, so at this point, with every access and every child port group
-  /// bound, an array nothing writes is a ROM whoever reads it.
+  /// array handed to a sub-kernel, since before the callee interfaces exist it
+  /// cannot see which way the child touches it; here, with every access and
+  /// child port group bound, an array nothing writes is a ROM.
   void reclassifyRoms();
   /// Derive every cyclic region's `counterType`, the width its iteration
   /// counter and therefore its bounds are built at, from that loop's own
@@ -182,16 +173,11 @@ struct DatapathBuilder {
   /// external access's slot and port-group NAME
   /// (`MemUnit::Access::{portIdx, portBase}`), and each call-mastered boundary
   /// argument's group name (`CallUnit::MemArg::topBase`), all off ONE
-  /// per-(memory, role) counter. Runs once every access and call is bound.
-  ///
-  /// Three properties of that one counter matter. It runs per (memory, role),
-  /// so adding an access to one argument never renames another's port groups.
-  /// A call-mastered group continues the same counter rather than starting its
-  /// own, which is why it is assigned here instead of in a second pass tied to
-  /// this one by a prose contract; parent accesses lead, then child ports in
-  /// call order. And the owner name comes from `uniqueOwnerOf` against the
-  /// module's whole memref list, because two arguments carrying one source name
-  /// would otherwise give their port groups identical names.
+  /// per-(memory, role) counter so parent accesses are numbered first and
+  /// child ports continue the same sequence in call order. Runs once every
+  /// access and call is bound. The owner name comes from `uniqueOwnerOf`
+  /// against the module's whole memref list, so two arguments sharing one
+  /// source name still get distinct port-group names.
   void enumerateBoundaryPorts();
   /// Record each top-level region's composition predecessors
   /// (`rb.predecessors`): the earlier top-level siblings it must start after,
@@ -222,21 +208,19 @@ struct DatapathBuilder {
   /// read, or None if this datapath cannot read it (every caller reports that
   /// as an unresolved slot rather than dropping it silently).
   ///
-  /// Four disjoint cases. The order below is documentation, not precedence:
+  /// Four disjoint cases:
   ///   * a scheduled producer bound during the region walk (`producerOf`): a
   ///     compute unit, a memory / stream read port, a call result;
   ///   * a nested region's result -> that region's Survivor register;
   ///   * a scalar function argument (`ioOf`) -> an IOPort;
   ///   * a `dcp.pipeline` block argument -> its region's Counter (arg 0), or
-  ///     the matching Survivor where the region LATCHES its iter-args.
+  ///     the matching Survivor where the region LATCHES its iter-args (a
+  ///     container / while); a childless counted reduction instead fuses its
+  ///     accumulator into the datapath, readable only through the recurrence
+  ///     edge `resolveOperand` builds.
   ///
-  /// That last clause is the whole subtlety. A container / while latches each
-  /// iter-arg into a survivor register, stable for the whole of a nested run
-  /// and therefore readable from anywhere; a childless counted reduction fuses
-  /// its accumulator into the datapath instead, and its only reader is the
-  /// recurrence edge `resolveOperand` builds. Reading `container` means this
-  /// needs the COMPLETE region model, so every caller runs after the region
-  /// walk.
+  /// Needs the COMPLETE region model (to know which regions latch), so every
+  /// caller runs after the region walk.
   Source resolveValue(Value v);
 
   // Interconnect derivation ---------------------------------------

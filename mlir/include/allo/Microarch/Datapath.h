@@ -47,11 +47,6 @@ struct CalleeCtx {
   const llvm::StringMap<iface::ModuleInterface> &ifaces;
 };
 
-/// The width a runtime `index` value is carried at. An `index` has no width of
-/// its own in MLIR, so the datapath picks one, and everything that carries an
-/// index reads it here: `hwWidth`, the operands an address cone is evaluated
-/// over (`evalAffine`), and the boundary address ports the manifest publishes.
-///
 //===----------------------------------------------------------------------===//
 // Identifiers. Cells are referenced by small integer ids (indices into the
 // Datapath's vectors) rather than pointers, so the whole model stays trivially
@@ -169,23 +164,18 @@ struct FuncUnit {
   llvm::SmallVector<unsigned, 2> inputInitDist;
 };
 
-/// A combinational cell sitting at FUNC SCOPE, outside every region: one op of
-/// the arith cone the reifier leaves in the module body when a top-level loop's
-/// induction bound or a top-level guard's predicate is an expression rather
-/// than a value the datapath already carries (`for i in range(start, m+1)` in a
-/// callee, `if k == 0` before a `dcp.select`).
+/// A combinational cell at FUNC SCOPE, outside every region: one op of the
+/// arith cone the reifier leaves in the module body when a top-level loop's
+/// bound or a guard's predicate is an expression rather than a value the
+/// datapath already carries (`for i in range(start, m+1)`, `if k == 0` before
+/// a `dcp.select`).
 ///
-/// It is NOT a `FuncUnit`. A unit belongs to one region, issues on that
-/// region's pulse and holds a reservation slot; this belongs to none, issues on
-/// nothing, and must be readable from every region that comes after its inputs
-/// settle.
-///
-/// SSA dominance closes its input set: a value defined at func scope can only
-/// read a scalar kernel argument, a literal, a top-level region's survivor, or
-/// an earlier cone. All four are HELD, so the cone is a pure function of
-/// settled registers with no clock, no register chain and no stall shell. Its
-/// one timing obligation is a composition edge, and `recordSiblingDeps` carries
-/// it by chasing through the cone to the regions its inputs come from.
+/// Not a `FuncUnit`: it belongs to no region, issues on nothing, and has no
+/// clock, register chain or stall shell. SSA dominance closes its input set to
+/// scalar kernel arguments, literals, top-level survivors and earlier cones,
+/// all HELD, so it is a pure function of settled registers. Its one timing
+/// obligation is a composition edge, carried by `recordSiblingDeps` chasing
+/// through the cone to the regions its inputs come from.
 struct ScopeUnit {
   unsigned id = 0;
   Operation *op = nullptr;             // the func-scope arith op
@@ -232,18 +222,13 @@ struct MemUnit {
   /// False on a skewed memory that fell back, which then crossbars like any
   /// other.
   bool skewed = false;
-  /// This argument crosses the TOP boundary completely partitioned, so it
-  /// arrives as one port per ELEMENT rather than as an addressed interface.
-  /// The one expression is `external && dp.atTop && layout.registers`, applied
-  /// once by the builder.
-  ///
-  /// A complete partition commits the scheduler to unlimited combinational
-  /// ports (`MemoryBankModel` bills none), and at a boundary the only structure
-  /// that delivers that is every element present at once: an addressed port
-  /// serves one element per cycle, which is exactly the resource the schedule
-  /// was solved without. Below the top the question does not arise, because
-  /// whoever owns the storage (a `seq.hlmem`, or a scattered argument's own
-  /// input ports) serves an ordinary addressed port from it.
+  /// This argument crosses the TOP boundary completely partitioned, arriving
+  /// as one port per ELEMENT rather than an addressed interface
+  /// (`external && dp.atTop && layout.registers`). A complete partition commits
+  /// the scheduler to unlimited combinational ports, which only an
+  /// element-per-port boundary delivers (an addressed port serves one element
+  /// per cycle). Below the top the owning storage (`seq.hlmem`, or the
+  /// scattered argument's own ports) serves an ordinary addressed port.
   bool scattered = false;
   /// The module ports holding one element of a `scattered` argument: the input
   /// it arrives on, and the output + write-enable it leaves on. A direction the
@@ -259,27 +244,21 @@ struct MemUnit {
   llvm::SmallVector<ElemPort> elemPorts;
   MemoryImplEnum impl = MemoryImplEnum::LUTRAM; // resolved storage primitive
 
-  // Access latency of `impl`, read from the device memory model. These are the
-  // SAME numbers the scheduler stamped onto this memref's
-  // `dcp.load`/`dcp.store` (asserted per access in `bindResource`).
-  //
-  // The emitter must build its read / write ports at exactly these latencies:
-  // the consumer's register depth was solved as `tY - (start + readLatency)`,
-  // so a port built at any other latency samples the wrong cycle. A
-  // call-mastered buffer the parent never touches has no access to read them
-  // off, which is why they live here rather than being re-derived per site.
+  // Access latency of `impl`, the same numbers the scheduler stamped onto this
+  // memref's `dcp.load`/`dcp.store` (asserted per access in `bindResource`).
+  // The consumer's register depth was solved as `tY - (start + readLatency)`,
+  // so ports must be built at exactly these latencies; kept here rather than
+  // re-derived per site since a call-mastered buffer has no access to read
+  // them off.
   unsigned readLatency = 0;
   unsigned writeLatency = 1;
 
   // `romInit` is the `initial_value` (a DenseElementsAttr) of the
-  // `memref.global` this memref reads through, when it has one.
-  //
-  // `isRom` is the narrower property the emitter can realize: initialized and
-  // never written. Such an array is a constant table, emitted as a
-  // combinational `hw.aggregate_constant` indexed by `hw.array_get` (registered
-  // to the read latency) with no writable hlmem. Read-only is a property of the
-  // use, not of carrying an initializer: a mutable global with a power-on value
-  // (`allo.lang.Stateful`) has `romInit` but is not a ROM.
+  // `memref.global` this memref reads through, when it has one. `isRom` is
+  // the narrower, emitter-realizable property: initialized and never written,
+  // so it becomes a combinational `hw.aggregate_constant` table with no
+  // writable hlmem. Read-only is a property of the USE: a mutable global with
+  // a power-on value (`allo.lang.Stateful`) has `romInit` but is not a ROM.
   bool isRom = false;
   Attribute romInit;
 
@@ -304,34 +283,25 @@ struct MemUnit {
     /// memory's access, which takes no module port.
     std::string portBase;
     /// Which bank this access routes to, when its memref is partitioned
-    /// (`numBanks > 1`): the index `assign-banks` assigned it, or empty when it
-    /// assigned none, in which case the access crossbars over all `numBanks`
-    /// banks (boundary interfaces for an argument, `seq.hlmem`s for an internal
-    /// buffer). 0 for an unbanked memref, which is the one bank there is.
+    /// (`numBanks > 1`): the index `assign-banks` assigned it, or empty to
+    /// crossbar over all `numBanks` banks. 0 for an unbanked memref.
     /// `externalBank` pairs it with the memref's bank count.
     ///
-    /// READ, not derived (`assignedBankOf` in `allocateInputSlots`), which
-    /// writes every access including the unbanked ones. It is the same recorded
-    /// decision the scheduler's port model was billed against before the solve,
-    /// so an access charged one bank's port cannot end up taking one on every
-    /// bank here. The default is the CONSERVATIVE end: an `Access` built on
-    /// some future path that never reaches that write crossbars, which is
-    /// wasteful, where defaulting to bank 0 would silently route it to the
-    /// wrong storage.
+    /// READ, not derived (`assignedBankOf` writes every access, including
+    /// unbanked ones), so it matches what the scheduler's port model was
+    /// billed against before the solve. Defaults to crossbar rather than bank
+    /// 0, so an access on some unreached future path is merely wasteful
+    /// instead of silently routed to the wrong storage.
     ///
-    /// Under a SKEWED layout it holds a SLOT, not a bank: the physical bank is
-    /// the slot rotated by a runtime value shared with the array's other
-    /// accesses, so it is billable (distinct slots are distinct banks at every
-    /// rotation) but not routable. `MemUnit::skewed` is the flag that says
-    /// which of the two readings applies, and every consumer that ROUTES must
-    /// check it. The port model, which only counts, need not.
+    /// Under a SKEWED layout this holds a SLOT, not a bank: the physical bank
+    /// is the slot rotated by a runtime value shared with the array's other
+    /// accesses, so it is billable but not routable without first checking
+    /// `MemUnit::skewed`.
     std::optional<unsigned> staticBank;
-    /// Which of a skewed memory's parallel port sets this access uses. Accesses
-    /// of one lane hold distinct slots, so they reach distinct banks and can
-    /// SHARE one port on each: the lane is read once per bank and its accesses
-    /// select among those reads. Two accesses of the same slot always collide,
-    /// so they land in different lanes and get a port each, which is exactly
-    /// what the port model billed them. Always 0 off the skewed path.
+    /// Which of a skewed memory's parallel port sets this access uses.
+    /// Accesses in one lane hold distinct slots, so they reach distinct banks
+    /// and share one port per bank; two accesses of the same slot collide and
+    /// must land in different lanes. Always 0 off the skewed path.
     unsigned lane = 0;
     AffineMap addrMap; // index map over `addr` operands (identity when the
                        // subscript was not affine)
@@ -343,17 +313,16 @@ struct MemUnit {
       unsigned region;
       unsigned slot; // index into that RegionBlock's `addrStrides`
     };
-    /// ADDRESS STRENGTH REDUCTION. One expression this access's address
-    /// hardware computes: `base` plus one register per term (a scaled counter
-    /// or a digit of one that the controller advances, instead of arithmetic
-    /// the datapath rebuilds every cycle) plus `residual` evaluated over
-    /// `addr`. `planAddressGenerators` decides them together (`splitAddress`)
-    /// and `buildAddr` builds exactly them.
+    /// ADDRESS STRENGTH REDUCTION. This access's address is `base` plus one
+    /// register per term (a scaled counter, or a digit of one, that the
+    /// controller advances instead of rebuilding arithmetic every cycle) plus
+    /// `residual` evaluated over `addr`. `planAddressGenerators`/
+    /// `splitAddress` decide the split; `buildAddr` builds it.
     ///
-    /// PARTIAL: a term reduces or does not on its own, so a data-dependent
-    /// subscript does not cost the reduction to the row stride beside it. With
-    /// nothing reduced `terms` is empty and the residual holds the whole
-    /// expression, which is the arithmetic an unreduced address builds.
+    /// PARTIAL: a term reduces or not on its own, so a data-dependent
+    /// subscript doesn't cost the reduction on the row stride beside it. With
+    /// nothing reduced, `terms` is empty and `residual` holds the whole
+    /// expression.
     struct Reduced {
       llvm::SmallVector<ScaledTerm, 3> terms;
       /// The expression's constant, and ZERO whenever a term exists: a register
@@ -597,9 +566,8 @@ struct Result {
 // sequential hand-off chains them.
 //===----------------------------------------------------------------------===//
 
-/// How a region produces one of its results. This is the ONE shape covering
-/// every regime, so a consumer reads the same three fields whichever controller
-/// runs.
+/// How a region produces one of its results. One shape covers every regime,
+/// so a consumer reads the same three fields whichever controller runs.
 /// A region result is always a *survivor register*: the value is latched when
 /// it lands and held for whoever reads it (a sibling region, an enclosing
 /// container's next iteration, the function's output port), which is why a
@@ -636,14 +604,10 @@ struct RegionBlock {
   /// rather than on the enclosing function.
   Operation *op = nullptr;
 
-  /// STRUCTURAL SHAPE, axis 1 of the controller discriminant. Which controller
-  /// lowers a region is a function of (shape x termination class), and this is
-  /// the axis the model must store. The termination axis is declared in the IR
-  /// (`determinacy`), but the shape is a property of the region's *structure*,
-  /// so it is derived once here instead of being recomputed from
-  /// `children.empty()` / `guard` / `callUnits.empty()` at every consumer,
-  /// including the validator, which would otherwise have to reproduce the
-  /// emitter's own dispatch to know which timing rule applies.
+  /// STRUCTURAL SHAPE, axis 1 of the controller discriminant (shape x
+  /// termination class picks the controller). Derived once here instead of
+  /// recomputed from `children.empty()` / `guard` / `callUnits.empty()` at
+  /// every consumer, including the validator.
   ///
   /// The populated cells:
   ///
@@ -655,13 +619,9 @@ struct RegionBlock {
   ///   Guard        | branch-pulse, run-once | (same: run-once either way)
   ///   CallNode     | fire + child `done`    | n/a
   ///
-  /// Every other cell is a shape the frontend cannot produce; `emitRegion`
-  /// rejects rather than falling through, so a newly reachable one is a
-  /// deliberate extension and not an emergent special case.
-  ///
-  /// The four cells are spelled once in `RegionShape`, so the reifier (which
-  /// charges each shape's boundary cost) and the emitter (which picks its
-  /// controller) cannot come to different answers.
+  /// Every other cell is unreachable; `emitRegion` rejects rather than falling
+  /// through. Spelled once in `RegionShape`, so the reifier (boundary cost)
+  /// and the emitter (controller choice) cannot disagree.
   using Shape = allo::RegionShape;
   /// Read off the region op by `dcpRegionShape` in
   /// `DatapathBuilder::deriveShapes`, which re-asks it of the BUILT model
@@ -680,18 +640,14 @@ struct RegionBlock {
   bool singlePass() const { return kind == Kind::Acyclic; }
 
   // Counted-loop induction: the IV runs `lb, lb+step, ...` up to (excluding)
-  // `ub`. Each bound is an ordinary datapath `Source`, either a data-dependent
-  // range start / count / stride or a literal `ConstCell` synthesized by
-  // `recordRegionBounds`, so a bound reads exactly like every other operand in
-  // the model and needs no "constant or Source" decode at its consumers.
-  // Set for a Cyclic region, None for an Acyclic one (no counter).
+  // `ub`. Each bound is a datapath `Source`, either a data-dependent value or a
+  // literal `ConstCell` synthesized by `recordRegionBounds`. Set for a Cyclic
+  // region, None for an Acyclic one (no counter).
   //
-  // `ubSource` is the one exception, and `tripCount` is why: a constant trip
-  // over a RUNTIME lb or step (the `for j in range(i, i+K)` window) has
-  // `ub = lb + K*step`, DERIVED arithmetic rather than a value the datapath
-  // already produces, so no cell can carry it. That case alone leaves
-  // `ubSource` None and `terminatorOf` builds the expression; every other
-  // counted region resolves its ub straight from the Source.
+  // `ubSource` is the one exception: a constant trip over a RUNTIME lb or step
+  // (the `for j in range(i, i+K)` window) has `ub = lb + K*step`, DERIVED
+  // arithmetic no cell can carry, so `ubSource` is None there and
+  // `terminatorOf` builds the expression instead.
   std::optional<int64_t> tripCount; // constant trip iff Cyclic
   /// An UPPER BOUND on the trip of a loop that has no constant one, from the
   /// `allo.assume.ssa` range the scheduler distilled (`dcp.pipeline`'s
@@ -706,10 +662,10 @@ struct RegionBlock {
   // TERMINATION class as the emitter discriminates it, axis 2 of the pair
   // above. A while loop (a `dcp.condition` terminator) is a flushing pipeline
   // whose exit is data-dependent. The declared `determinacy` below is the same
-  // axis read off the IR. The two agree in the direction that matters (a while
-  // is always declared `Conditional`, asserted in `deriveShapes`) but NOT in
-  // the converse: the reifier also stamps a `dcp.select` `Conditional`, while
-  // `conditional` stays false for it since a guard is not a flushing loop.
+  // axis read off the IR, and the two agree where a while is always declared
+  // `Conditional` (asserted in `deriveShapes`), but NOT conversely: the
+  // reifier also stamps a `dcp.select` `Conditional`, while `conditional`
+  // stays false for it since a guard is not a flushing loop.
   bool conditional = false;
   // The two raw structural flags `shape` is derived from, recorded by the
   // builder as it walks. Consumers should read `shape`.
@@ -724,33 +680,30 @@ struct RegionBlock {
   /// `coeff * digit` of it for a coefficient and a digit an access's address
   /// needs, tracked incrementally rather than rebuilt.
   ///
-  /// This is address strength reduction. The constant multiply is the
-  /// arithmetic that dominates an address (a row stride of 400 is a
-  /// three-digit signed-digit network; the sum that follows it is one adder),
-  /// and it is the part an induction variable makes unnecessary: consecutive
-  /// iterations differ by a constant.
+  /// ADDRESS STRENGTH REDUCTION: the constant multiply that dominates an
+  /// address (a row stride of 400 is a three-digit signed-digit network) is
+  /// unnecessary once an induction variable makes consecutive iterations
+  /// differ by a constant.
   ///
   /// A DIGIT of the counter rides the same register with two more constants.
   /// `(x floordiv D) mod K` advances by nothing on most iterations and by one
-  /// on the ones where `x` crosses a multiple of `D`, so it is maintained by a
-  /// carry from a companion register holding `x mod D` (itself a stride with
-  /// `wrap = D`), and it wraps at `K` by subtracting once. A `floordiv` or a
-  /// `mod` on the ADDRESS path pays every cycle, where this pays a comparator
-  /// off it.
+  /// where `x` crosses a multiple of `D`, maintained by a carry from a
+  /// companion register holding `x mod D` (itself a stride with `wrap = D`),
+  /// wrapping at `K` by subtracting once. A `floordiv`/`mod` on the address
+  /// path pays every cycle; this pays a comparator instead.
   ///
-  /// So one update rule covers both:
+  /// One update rule covers both:
   ///
   ///     raw  = cur + step + (carry fired ? bump : 0)
   ///     next = wrap && raw >= wrap ? raw - wrap : raw
   ///
-  /// with a plain scaled counter at `bump = wrap = 0`. `step + bump <= wrap`
-  /// holds by construction (`asDigit` refuses a step that could wrap twice), so
-  /// the single subtract is exact.
+  /// A plain scaled counter is `bump = wrap = 0`. `step + bump <= wrap` holds
+  /// by construction (`asDigit` refuses a step that could wrap twice), so the
+  /// single subtract is exact.
   ///
-  /// A DECREASING digit (`A[N-1-i]`) mirrors it: `step` and `bump` go negative
-  /// and the wrap ADDS on borrow rather than subtracting on overflow. The
-  /// borrow is `raw > cur` unsigned, since subtracting a positive amount can
-  /// only raise the value by wrapping around zero.
+  /// A DECREASING digit (`A[N-1-i]`) mirrors it: `step`/`bump` go negative and
+  /// the wrap ADDS on borrow (`raw > cur` unsigned) instead of subtracting on
+  /// overflow.
   struct AddrStride {
     int64_t init;       // `coeff * lb`, the value the register loads at start
     int64_t step;       // `coeff * step`, added wherever the counter advances
@@ -759,12 +712,11 @@ struct RegionBlock {
     unsigned carry = 0; // slot whose wrap gates `bump`; self means none
     bool hasCarry = false; // whether `carry` names one
     bool down = false;     // counts down, so `wrap` is added on borrow
-    /// The width the register is BUILT at. Every field above is a compile-time
-    /// constant, so the range it runs over is one too, and this is that range
-    /// rounded up to bits: a wrapping digit needs `clog2` of its modulus and a
-    /// row stride `clog2` of the array it walks, neither of which has anything
-    /// to do with the counter's own width, which these borrowed before.
-    /// `kIndexWidth` whenever the range is not bounded (`slotFor`).
+    /// The width the register is BUILT at: every field above is compile-time,
+    /// so the range it runs over is too, rounded up to bits (a wrapping digit
+    /// needs `clog2` of its modulus; a row stride, `clog2` of the array),
+    /// independent of the counter's own width. `kIndexWidth` when the range is
+    /// unbounded (`slotFor`).
     unsigned width = kIndexWidth;
   };
   /// Deduplicated, since two accesses down the same row share a stride. Some

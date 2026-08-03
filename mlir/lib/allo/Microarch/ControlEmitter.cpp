@@ -250,20 +250,16 @@ IterationControl ControlEmitter::emitCheckedIteration(unsigned region,
 }
 
 // Acyclic (straight-line) region: a single pass, armed after its family's `arm`
-// cost (`LatencyModel.h`, which carries why the nested and top-level cells
-// disagree). There is no iteration index of its own.
+// cost (`LatencyModel.h`). There is no iteration index of its own.
 //
 // Under an elastic shell the arming pulse is LATCHED into `pend`, the acyclic
 // counterpart of the pipelined regime's `running`: a single one-shot pulse
 // cannot be gated, only dropped, so a stage-0 stream access would sample its
 // `_data` at the arming cycle whatever `_valid` said (and a stage-0 put would
 // drop its token and never complete). The latch turns "issue now" into "issue
-// as soon as the shell allows", which the whole region's timeline already
-// follows, since every chain below it rides that same shell. `pend` is
-// combinationally ORed with the arming pulse rather than replacing it, so an
-// available token still issues at the arming cycle and the top-level latency
-// above is unchanged. A rigid region has nothing to defer and stays a bare
-// pulse.
+// as soon as the shell allows". `pend` is combinationally ORed with the arming
+// pulse rather than replacing it, so an available token still issues at the
+// arming cycle. A rigid region has nothing to defer and stays a bare pulse.
 RegionControl ControlEmitter::emitAcyclic(unsigned region, Value start,
                                           bool topLevel,
                                           const StallShell &sh) const {
@@ -292,15 +288,12 @@ RegionControl ControlEmitter::emitAcyclic(unsigned region, Value start,
 // while, acyclic). It rises when the last iteration's deepest output has
 // drained, that is, `lastIssue` (the final iteration's issue pulse) delayed by
 // `drainStage` cycles, or immediately on `emptyDone` (an empty region, when
-// reachable). The latch's register cycle is the LAST commit cycle, so a sibling
-// starting on this done's edge reads every committed store and survivor.
-// `drainStage` equals the deepest output's commit cycle minus that one, and
-// `storeDrainOf` derives a store's half of it from the memory's write latency
-// (a store-less region uses its result ready cycle instead). Keying on
-// `lastIssue` (an actual issue pulse), rather than a store-retire count, keeps
-// a region that retires several stores in one cycle from completing early. A
-// `retrig` region (re-run by an enclosing container) resets its completion
-// state on `start`.
+// reachable). The latch's register cycle is the LAST commit cycle, so a
+// sibling starting on this done's edge reads every committed store and
+// survivor. Keying on `lastIssue` (an actual issue pulse) rather than a
+// store-retire count keeps a region that retires several stores in one cycle
+// from completing early. A `retrig` region (re-run by an enclosing container)
+// resets its completion state on `start`.
 Value ControlEmitter::emitDone(unsigned region, unsigned drainStage,
                                Value lastIssue, Value emptyDone, Value start,
                                bool retrig, const StallShell &sh) const {

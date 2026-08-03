@@ -41,12 +41,10 @@ innermostCarriedDistance(ArrayRef<affine::DependenceComponent> comps,
       carriedDistanceAtLevel(comps, comps.size(), drop, valid));
 }
 
-// Why a loop-carried memory edge holds the distance it holds. `Proven` came out
-// of the polyhedral test. `NonAffine` came from the conservative fallback for a
-// pair the test cannot model, so the distance is an assumption an
-// `allo.assume.nodep` may retire. `Unknown` came from a `*` direction the test
-// could not bound, which is where a range on a symbolic subscript would tighten
-// the distance rather than remove it.
+// Origin of a loop-carried memory edge's distance: `Proven` by the polyhedral
+// test; `NonAffine` is the conservative fallback for a pair the test cannot
+// model (an assumption `allo.assume.nodep` may retire); `Unknown` came from a
+// `*` direction the test could not bound.
 namespace {
 enum class DistanceOrigin { Proven, NonAffine, Unknown };
 struct CarriedEdgeCounts {
@@ -94,8 +92,7 @@ isLoopCarriedDependence(ArrayRef<affine::DependenceComponent> comps) {
 // Trace an iter_arg's incoming value to the operation that actually defines it,
 // following any chain of iter_arg-to-iter_arg shifts (a yield operand that is
 // itself an iter_arg of this loop, as produced by accumulator rotation) and
-// counting one loop-carried distance per hop. See the header for why this is
-// not local to this file.
+// counting one loop-carried distance per hop.
 std::pair<Operation *, unsigned> iterArgSource(Block *body, Operation *yield,
                                                unsigned iterArg) {
   auto v = yield->getOperand(iterArg);
@@ -117,23 +114,12 @@ std::pair<Operation *, unsigned> iterArgSource(Block *body, Operation *yield,
 static bool isSyncCall(Operation *op); // a plain (non-async) sub-kernel call
 
 // Anchor every remaining dependence-DAG sink to \p anchor with a
-// loop-independent (distance-0) edge, making the anchor the problem's unique
-// sink. The modulo scheduler requires that: it minimizes the anchor's start
-// time, and `ModuloSimplexScheduler::checkLastOp` rejects a problem outright
-// if any other operation has no distance-0 successor.
-//
-// The explicit side-effect anchoring in the builders covers the common case
-// (a store / stream access / sync call has no results at all, so nothing can
-// depend on it), but it enumerates op kinds and so cannot be complete. A sink
-// is a graph property: any op whose consumers are all loop-carried, or a
-// nested region's result-less terminator, is one too. Computing the set is
-// exact and makes the rejection structurally unreachable rather than a
-// user-facing limit. The same shape appears in the pipelined-level problem,
-// which anchors every level node to the terminator.
-//
-// Anchoring is sound: the anchor is the loop body's terminator, so an edge
-// `sink -> anchor` only states that the iteration is not complete until the
-// sink has produced its result, which is exactly the region's own semantics.
+// loop-independent (distance-0) edge, making the anchor the unique sink the
+// modulo scheduler requires (it minimizes the anchor's start time; an
+// unanchored sink is rejected by `ModuloSimplexScheduler::checkLastOp`). A
+// sink is a graph property (any op whose consumers are all loop-carried, or a
+// result-less nested terminator), broader than the explicit side-effect
+// anchoring the builders already do, so this closes the remaining cases.
 template <class ProblemT>
 static void anchorSinks(ProblemT &problem, Operation *anchor) {
   DenseSet<Operation *> sinks(problem.getOperations().begin(),
@@ -295,9 +281,8 @@ bool whileHasIdentityForwarding(scf::WhileOp w) {
 }
 
 bool conditionIsCombinational(scf::WhileOp w, const OperatorLibrary &lib) {
-  // The continue-test settles the cycle the loop issues iff every op in its
-  // cone (the before region; `scf.condition` is a pure wire) is 0-latency,
-  // else the while needs a sequential CHECK/RUN controller, not a pipeline.
+  // Combinational iff every op in the before region (except the pure-wire
+  // `scf.condition`) is 0-latency.
   bool comb = true;
   auto *term = w.getConditionOp().getOperation();
   w.getBefore().walk([&](Operation *op) {
@@ -418,10 +403,8 @@ ProblemT buildWhileProblem(scf::WhileOp w, DependenceAnalysis &deps) {
   return problem;
 }
 
-// A synchronous sub-kernel call: a plain (non-async) func.call, which the
-// parent schedules as an opaque fixed-latency node in program order. An async
-// call is composed structurally as dataflow (ordered by its streams, not the
-// SDC schedule), so it is not treated as a sync call here.
+// A plain (non-async) func.call, scheduled as an opaque fixed-latency node.
+// An async call composes structurally as dataflow, ordered by its streams.
 static bool isSyncCall(Operation *op) {
   return isa<func::CallOp>(op) && !op->hasAttr(kAlloAsyncAttr);
 }

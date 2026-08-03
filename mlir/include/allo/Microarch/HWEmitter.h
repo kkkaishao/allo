@@ -7,29 +7,24 @@
 // PER-REGION emission, split by role along the control/datapath (F/G) seam.
 //
 //   * ControlEmitter is control (G): every per-region controller plus the
-//     completion signal. Controllers come in two families. SCHEDULE-paced
-//     covers the free-running, modulo and while regimes (`emitPipelined`).
-//     DONE-paced covers the counted container and loop-over-call
-//     (`emitCountedIteration`) and the CHECK/RUN while
-//     (`emitCheckedIteration`).
+//     completion signal. SCHEDULE-paced controllers cover the free-running,
+//     modulo and while regimes (`emitPipelined`); DONE-paced cover the counted
+//     container and loop-over-call (`emitCountedIteration`) and the CHECK/RUN
+//     while (`emitCheckedIteration`).
 //   * DatapathEmitter is datapath (F): register chains, compute units, memory,
 //     addressing, and Source resolution (`resolveSource`).
 //   * HWEmitter is the orchestrator. It wires the two per region and composes
 //     sibling and nested regions.
 //
-// The control/datapath seam is a *typed interface*. A controller returns a
-// `RegionControl {issue, counter}`; the datapath returns its store drain (the
-// deepest store's stage) through `DatapathFeedback`. None of these are shared
-// mutable members, so extending either side with a new regime or a new cell is
-// a local change.
+// The control/datapath seam is typed: a controller returns a `RegionControl
+// {issue, counter}`; the datapath returns its store drain (the deepest
+// store's stage) through `DatapathFeedback`.
 //
-// Elasticity (H) is a THIRD derivation, not traffic across that seam. A
+// Elasticity (H) is a third derivation, not traffic across that seam. A
 // region's `StallShell` (Primitives.h) is derived once by `deriveStallShell`
 // and handed to each side explicitly: G takes `issueEnable`, F takes
-// `chainEnable`. It rides neither `RegionControl` nor `DatapathFeedback`, and
-// it is not an emitter-wide ambient. It is keyed per region
-// (`DatapathEmitter::shellOf`), so a Source is timed against the shell of the
-// region that OWNS it.
+// `chainEnable`. It is keyed per region (`DatapathEmitter::shellOf`), so a
+// Source is timed against the shell of the region that OWNS it.
 //
 // The two layers this one sits between are their own headers.
 //   * Primitives.h is the emission substrate (EmitContext, ShiftChain, the
@@ -60,24 +55,18 @@ struct ModuleInterface; // each callee's port model, read to wire its instance
 namespace mlir::allo::uarch {
 
 //===----------------------------------------------------------------------===//
-// Terminator: what ends a pipelined region's run. Either a counter reaches an
-// iteration bound (a counted loop) or a data-dependent condition goes false (a
-// while). This is the data-dependent-timing discriminant as a value:
-// `Counted` -> free-running / modulo (a static regime), `Conditional` ->
-// flushing. A counted bound is a compile-time constant (konst) or a runtime
-// element count resolved from the datapath (a dynamic trip, F->G). A
-// conditional's `cond` is a datapath value, typically a backedge resolved after
-// the datapath emits its producer. One definition of the last-issue and
-// start-gate tests, shared by the single pipelined control skeleton
-// (emitPipelined) and the survivor-capture path.
+// Terminator: what ends a pipelined region's run, either a counter reaching
+// an iteration bound (`Counted`, a counted loop) or a data-dependent condition
+// going false (`Conditional`, a while). The last-issue and start-gate tests,
+// shared by the pipelined control skeleton (emitPipelined) and the
+// survivor-capture path.
 //===----------------------------------------------------------------------===//
 struct Terminator {
   enum class Kind { Counted, Conditional };
   Kind kind = Kind::Counted;
   // Induction bounds. `lb`/`step` seed the counter register (init lb, +=step)
   // and `ub` its termination (iv+step >= ub). A while free-runs a 0-based
-  // counter (lb=0/step=1, ub null), terminating on ~cond. Values (konst for a
-  // constant bound, a resolved datapath Source for a dynamic ub).
+  // counter (lb=0/step=1, ub null), terminating on ~cond.
   Value lb, ub, step;
   Value cond; // Conditional: the i1 continue condition (a datapath value)
 
@@ -94,15 +83,14 @@ struct Terminator {
   Value isLast(EmitContext &c, Value ivStep) const {
     return kind == Kind::Conditional ? c.notBit(cond) : c.icmpSgeV(ivStep, ub);
   }
-  /// The region is empty (issues nothing): the lower bound already meets the
-  /// upper (lb >= ub). A while is never "empty" here. Its zero-iteration case
-  /// is the condition false on iteration 0, handled by the normal exit pulse.
+  /// The region is empty (issues nothing): lb >= ub. A while is never "empty"
+  /// here; its zero-iteration case is the condition false on iteration 0,
+  /// handled by the normal exit pulse.
   Value isEmpty(EmitContext &c) const {
     return kind == Kind::Conditional ? c.f1 : c.icmpSgeV(lb, ub);
   }
-  /// The start pulse gated so an empty region issues nothing. A counted loop is
-  /// empty on a runtime zero-trip or a static lb >= ub. A while passes through,
-  /// its emptiness handled by the condition.
+  /// The start pulse gated so an empty region issues nothing; a while passes
+  /// through unconditionally.
   Value gateStart(EmitContext &c, Value start) const {
     return kind == Kind::Counted ? c.andBits(start, c.notBit(isEmpty(c)))
                                  : start;
@@ -129,40 +117,34 @@ struct RegionControl {
                    // whose counter reloads on `start` instead.
   /// One register per `RegionBlock::addrStrides` entry, holding that multiple
   /// of `counter`. Emitted beside the counter and updated by the same
-  /// expression, so the two cannot fall out of step: whatever advance and
-  /// reload the counter takes, these take.
+  /// expression, so the two cannot fall out of step.
   llvm::SmallVector<Value> scaledCounters;
 };
 
 //===----------------------------------------------------------------------===//
 // DatapathFeedback (F -> G): the store timing a control regime consumes to
-// compute completion. The typed counterpart of RegionControl, so a new regime
-// signal is a field add, not one more parameter on `emitDone`.
+// compute completion.
 //===----------------------------------------------------------------------===//
 struct DatapathFeedback {
-  // The deepest store's schedule stage (max dcpStart over the region's stores);
-  // 0 if it stores nothing. The region's `done` waits until the last
-  // iteration's last store has been presented + committed (the latch adds the
-  // commit cycle), so a multi-store region cannot complete prematurely. A
-  // stream put folds into this too (its `done` waits for the last token
-  // pushed).
+  // The deepest store's schedule stage (max dcpStart over the region's
+  // stores); 0 if it stores nothing. The region's `done` waits until the last
+  // iteration's last store has been presented + committed, so a multi-store
+  // region cannot complete prematurely. A stream put folds into this too.
   unsigned storeDrain = 0;
-  // The `done` of a CallUnit region's child instance. When set, it IS
-  // the region's completion (a call region completes on the child's real done,
-  // determinate or not), bypassing the store-drain `emitDone`. Null for a
+  // The `done` of a CallUnit region's child instance. When set, it IS the
+  // region's completion, bypassing the store-drain `emitDone`. Null for a
   // call-free region.
   Value callDone;
 };
 
 //===----------------------------------------------------------------------===//
 // IterationControl: the output of a DONE-DRIVEN controller, one whose
-// iterations are paced by the body COMPLETING rather than by the schedule's own
-// cadence. That is the whole difference from `emitPipelined`: a leaf issues an
-// iteration every II cycles because its schedule says so, while a container, a
-// loop-over-call and a CHECK/RUN while each launch the next pass only once the
-// current one has drained. All three therefore share one skeleton (boundary
-// pulse, continue test, launch, done latch) and differ only in the cell of
-// (shape x termination) they occupy.
+// iterations are paced by the body COMPLETING rather than by the schedule's
+// own cadence (as `emitPipelined`'s regimes are). A container, a
+// loop-over-call and a CHECK/RUN while each launch the next pass only once
+// the current one has drained, sharing one skeleton (boundary pulse, continue
+// test, launch, done latch) that differs only in the cell of (shape x
+// termination) they occupy.
 //
 // `rc` is the same G->F seam a leaf hands over: `issue` is the body-launch
 // pulse and `counter` the IV. `done` is the region's completion level, latched
@@ -189,7 +171,7 @@ struct ControlEmitter {
   /// holding that multiple of the region's counter, each at its OWN width
   /// (`AddrStride::width`) rather than the counter's. \p update is the
   /// counter's own next-value expression with `lb` and `step` scaled, supplied
-  /// by the caller because the two controller families disagree about it. \p
+  /// by the caller since the two controller families disagree about it. \p
   /// bypassStart mirrors a done-driven counter's start-cycle bypass (null for
   /// none).
   llvm::SmallVector<Value> emitScaledCounters(
@@ -201,24 +183,21 @@ struct ControlEmitter {
   /// iteration counter and differ only in \p term (a counter reaching a bound
   /// vs the continue-condition going false) and, for II>1, a phase counter
   /// gating issue. Non-speculative for a conditional terminator (II >= t_cond,
-  /// so no doomed iteration issues -> no squash); no backpressure
-  /// (fixed-latency memory, no FIFO). A conditional \p term carries `cond` as a
-  /// datapath value (F->G), typically a backedge resolved after the datapath
-  /// emits its producer.
+  /// so no doomed iteration issues); no backpressure (fixed-latency memory, no
+  /// FIFO). A conditional \p term carries `cond` as a datapath value (F->G),
+  /// typically a backedge resolved after the datapath emits its producer.
   /// \p sh is G's half of the region's elasticity (H): issue is gated
-  /// `wantIssue & sh.issueEnable`, so a stalled cycle issues nothing and (with
-  /// the enabled shift chains F builds against the same shell) the whole region
-  /// freezes. A rigid shell leaves issue ungated.
-  /// \p region names the emitted state cells (`r<id>_run` / `_iv` / `_phase`),
-  /// so a waveform reads as one loop's controller instead of `_GEN_11`.
+  /// `wantIssue & sh.issueEnable`, so a stalled cycle issues nothing. A rigid
+  /// shell leaves issue ungated.
+  /// \p region names the emitted state cells (`r<id>_run` / `_iv` / `_phase`).
   RegionControl emitPipelined(unsigned region, int64_t ii,
                               const Terminator &term, Value start,
                               const StallShell &sh) const;
   /// The straight-line control skeleton: one pass, no counter. \p sh is the
   /// same G-half contract `emitPipelined` honors: the single pass is DEFERRED
-  /// while `issueEnable` is low rather than dropped, which is what lets a
-  /// stage-0 stream access wait for its handshake. A rigid shell issues
-  /// unconditionally and builds no state at all.
+  /// while `issueEnable` is low rather than dropped, which lets a stage-0
+  /// stream access wait for its handshake. A rigid shell issues unconditionally
+  /// and builds no state at all.
   RegionControl emitAcyclic(unsigned region, Value start, bool topLevel,
                             const StallShell &sh) const;
 
@@ -227,8 +206,7 @@ struct ControlEmitter {
   /// the next when \p complete pulses (the body's drain edge, a Backedge the
   /// caller resolves once the body has emitted) and completing when the last
   /// one drains. \p rb supplies the counter's name and, through its `shape`,
-  /// the one thing the two cells disagree about: whether the FIRST pass may
-  /// launch on \p start itself.
+  /// whether the FIRST pass may launch on \p start itself.
   IterationControl emitCountedIteration(const uarch::RegionBlock &rb,
                                         const Terminator &term, Value start,
                                         Value complete) const;
@@ -244,24 +222,19 @@ struct ControlEmitter {
                                         Value complete) const;
 
   /// The region's completion signal: one latched level for every regime. It
-  /// rises when the last issued iteration's outputs have drained, which is \p
-  /// lastIssue (the final iteration's issue pulse) delayed \p drainStage cycles
-  /// (the deepest store or result stage). It also rises immediately on \p
-  /// emptyDone, since an empty region completes in one cycle; that input is
-  /// null when unreachable. The latch's register cycle is the store/result
-  /// commit cycle, so a sibling starting on this done reads every committed
-  /// store and every survivor. A \p retrig region resets its completion state
-  /// on \p start, and its returned level additionally reads 0 on the \p start
-  /// cycle itself. That mask is what makes the level re-edge for a region whose
-  /// completion pulse COINCIDES with \p start, an acyclic one at func scope
-  /// (whose issue is \p start) draining at stage 0: the pulse wins over the
-  /// reset, so the register would latch high on the first pass and re-set from
-  /// 1 on every later one, leaving a rising-edge consumer waiting forever.
-  /// Delaying the pulse instead would cost the region a cycle it has already
-  /// declared as its latency.
-  /// \p sh times the drain: under an elastic shell the completion pulse is held
-  /// through back-pressure, since the last store/token is not committed until
-  /// it is accepted.
+  /// rises when \p lastIssue (the final iteration's issue pulse) delayed \p
+  /// drainStage cycles (the deepest store or result stage), or immediately on
+  /// \p emptyDone (an empty region completes in one cycle; null when
+  /// unreachable). The latch's register cycle is the store/result commit
+  /// cycle, so a sibling starting on this done reads every committed store and
+  /// survivor. A \p retrig region resets its completion state on \p start, and
+  /// its returned level additionally reads 0 on the \p start cycle itself: a
+  /// region whose completion pulse COINCIDES with \p start (e.g. an acyclic
+  /// one draining at stage 0) would otherwise latch high on the first pass and
+  /// never produce a later rising edge.
+  /// \p sh times the drain: under an elastic shell the completion pulse is
+  /// held through back-pressure, since the last store/token is not committed
+  /// until it is accepted.
   Value emitDone(unsigned region, unsigned drainStage, Value lastIssue,
                  Value emptyDone, Value start, bool retrig,
                  const StallShell &sh) const;
@@ -280,21 +253,18 @@ struct DatapathEmitter {
 
   // A region's controller outputs (RegionControl: issue / counter / ungated
   // wantIssue), the G->F seam. `counter` is null for an acyclic region;
-  // `wantIssue` is null when the region has no stall shell (a stage-0 stream
-  // access hazards on it).
+  // `wantIssue` is null when the region has no stall shell.
   DenseMap<unsigned, RegionControl> controlOf;
   // Each region's counter widened to `kIndexWidth`, built once at that seam.
   // The counter REGISTER is only as wide as its own induction range needs
-  // (`RegionBlock::counterType`), while a datapath READ of it is an ordinary
-  // index: an address-cone operand, a compute unit's `index` operand, a child's
-  // index port. Those are two different wires whenever a region narrowed, and
-  // this is the second one.
+  // (`RegionBlock::counterType`); a datapath READ of it (an address-cone
+  // operand, a compute unit's `index` operand, a child's index port) is an
+  // ordinary index, so this is the second, wider wire.
   DenseMap<unsigned, Value> counterIndex;
   // H's output per region: the stall shell that region's timing runs against.
-  // Keyed like `controlOf`, and for the same reason. An access or a shared-unit
-  // mux is timed against the shell of the region that OWNS it, which need not
-  // be the one currently emitting. An unregistered region is RIGID (the default
-  // `StallShell`), which is what a region with no stream accesses is.
+  // An access or a shared-unit mux is timed against the shell of the region
+  // that OWNS it, which need not be the one currently emitting. An
+  // unregistered region is RIGID (the default `StallShell`).
   DenseMap<unsigned, StallShell> shellOf;
   DenseMap<uint64_t, Value> streamReadData; // (channel id, access idx) -> the
                                             // input-stream data port value
@@ -317,11 +287,10 @@ struct DatapathEmitter {
   DenseMap<unsigned, Value> scopeVal; // ScopeUnit id -> emitted comb value
 
   /// One channel's port drives, accumulated over every access to it. A FIFO
-  /// has a single {data,valid,ready} triple that several accesses time-share:
-  /// within one region they interleave inside the II, across regions they run
-  /// one after the other. Since `hw.output` takes each port exactly once, every
-  /// region contributes its terms here and `finalizeStreamPorts` drives the
-  /// ports once, after all regions have emitted.
+  /// has a single {data,valid,ready} triple that several accesses time-share.
+  /// Since `hw.output` takes each port exactly once, every region contributes
+  /// its terms here and `finalizeStreamPorts` drives the ports once, after all
+  /// regions have emitted.
   struct StreamDrive {
     Value valid;                                  // OR of the puts' pulses
     Value ready;                                  // OR of the gets' pulses
@@ -330,16 +299,14 @@ struct DatapathEmitter {
   SmallVector<StreamDrive> streamDrives; // by StreamId (sized on first use)
 
   /// One store to a scattered argument, as its element ports see it. The SAME
-  /// N ports are shared by every write to that argument, where an addressed
-  /// argument gets a port group per access, so they cannot be driven where the
-  /// store is emitted: a second store in the same region, or in any other
-  /// region, would drive them again. Every write records its terms here and
+  /// N ports are shared by every write to that argument, so they cannot be
+  /// driven where the store is emitted. Every write records its terms here and
   /// `finalizeScatteredPorts` drives each element once, after all regions have
   /// emitted, exactly as `StreamDrive` does for a channel's one handshake.
   ///
-  /// The commit pulse is region-scoped (it is timed against that region's stall
-  /// shell and issue), which is why the pulse is BUILT at the store and only
-  /// COMBINED here.
+  /// The commit pulse is region-scoped (timed against that region's stall
+  /// shell and issue), which is why it is BUILT at the store and only COMBINED
+  /// here.
   struct ScatterWrite {
     Value we;    // this store's commit pulse
     Value index; // the element it targets, at the memory's address width
@@ -347,12 +314,11 @@ struct DatapathEmitter {
   };
   DenseMap<unsigned, SmallVector<ScatterWrite, 1>> scatterWrites; // by MemId
 
-  /// A kernel-local channel's body wires: what a boundary channel reads off its
-  /// module ports, an internal one reads off its own `seq.fifo`. Declared as
-  /// backedges before any region emits (`declareInternalChannels`) and resolved
-  /// by `finalizeStreamPorts`, which can only build the FIFO once every access
-  /// has contributed its drive, since the FIFO's inputs and its outputs sit on
-  /// opposite sides of the same accesses.
+  /// A kernel-local channel's body wires: what a boundary channel reads off
+  /// its module ports, an internal one reads off its own `seq.fifo`. Declared
+  /// as backedges before any region emits (`declareInternalChannels`) and
+  /// resolved by `finalizeStreamPorts`, since the FIFO can only be built once
+  /// every access has contributed its drive.
   struct StreamWires {
     circt::Backedge data;  // the FIFO's show-ahead output
     circt::Backedge valid; // a token is available (~empty)
@@ -362,23 +328,20 @@ struct DatapathEmitter {
 
   /// Body wires of a channel whose ends are CHILD PORTS (`callEnds`): the
   /// producer end's `ready` and, per CONSUMER end, its `{data, valid}`. Both
-  /// halves are backedges because an instance and the queue behind it are built
-  /// in opposite orders: the child's input ports must exist before the FIFO
-  /// that will drive them, and the FIFO needs the child's outputs. Declared by
-  /// `declareInternalChannels`, resolved by `emitComposedChannel`.
+  /// halves are backedges because the child's input ports must exist before
+  /// the FIFO that will drive them, and the FIFO needs the child's outputs.
+  /// Declared by `declareInternalChannels`, resolved by `emitComposedChannel`.
   ///
-  /// One entry per consumer, since several readers are a FAN-OUT: each owns a
-  /// FIFO of its own, all pushed by the producer on the same cycle, so every
-  /// consumer sees the whole token sequence and the per-consumer buffering is
-  /// what decouples them.
+  /// One entry per consumer: several readers are a FAN-OUT, each owning its
+  /// own FIFO so per-consumer buffering decouples them.
   struct ComposedWires {
     circt::Backedge prodReady;
     llvm::SmallVector<circt::Backedge, 1> sinkData, sinkValid;
   };
   DenseMap<unsigned, ComposedWires> composedWires; // by StreamId
   /// Each instantiated child's output ports, by name. The channel realization
-  /// reads these to find a producer's `{data, valid}` and a consumer's `ready`,
-  /// since `emitCalls` builds the instances well before the queues between
+  /// reads these to find a producer's `{data, valid}` and a consumer's
+  /// `ready`, since `emitCalls` builds the instances before the queues between
   /// them.
   DenseMap<unsigned, llvm::StringMap<Value>> callOuts; // by CallId
 
@@ -398,11 +361,10 @@ struct DatapathEmitter {
 
   /// Resolve a datapath Source to the SSA value driving it.
   Value resolveSource(const uarch::Source &s);
-  /// The cycle a freshly-produced Source's value lands, relative to the issuing
-  /// pulse of the iteration that produced it: a compute unit's op slot + its
-  /// latency, a memory read's slot + read latency, or 0 for an at-issue
-  /// constant. The single definition of result-landing timing, used by survivor
-  /// capture.
+  /// The cycle a freshly-produced Source's value lands, relative to the
+  /// issuing pulse of the iteration that produced it: a compute unit's op slot
+  /// + its latency, a memory read's slot + read latency, or 0 for an at-issue
+  /// constant. Used by survivor capture.
   unsigned readyCycle(const uarch::Source &s) const;
   /// The resolved (already stage-delayed) index sources an access's affine map
   /// is evaluated over, dims then symbols.
@@ -413,17 +375,16 @@ struct DatapathEmitter {
   Value buildAddr(const uarch::MemUnit::Access &acc,
                   const uarch::MemUnit::Access::Reduced &r, unsigned width);
   /// The address hardware of an access: the element index within the bank it
-  /// reaches, plus the bank digit when that is decided at runtime.
-  /// `addressExprsOf` derives both symbolically from the memref's `BankLayout`
-  /// and this evaluates them, so it is the runtime dual of the static split
-  /// (`dcp-resolve-banking`) and both route an element to the same bank. Also
+  /// reaches, plus the bank digit when that is decided at runtime. The runtime
+  /// dual of the static split (`dcp-resolve-banking`), both deriving from the
+  /// memref's `BankLayout` and routing an element to the same bank. Also
   /// covers an unbanked memref, whose one-bank offset is the flat index.
   BankSplit bankAddress(const uarch::MemUnit &m,
                         const uarch::MemUnit::Access &acc);
   /// Narrow a linear address to a memory's clog2(depth)-bit index (hlmem).
   Value memAddr(const uarch::MemUnit &m, Value addr);
   /// Which element of a scattered argument an access names, at the datapath
-  /// width (it is compared against literal element numbers, not used to index).
+  /// width (compared against literal element numbers, not used to index).
   Value scatterIndex(const uarch::MemUnit &m,
                      const uarch::MemUnit::Access &acc);
 
@@ -433,8 +394,8 @@ struct DatapathEmitter {
   void createInternalMemories();
   /// Wire a region's controller output into the datapath, the G->F seam. The
   /// counter answers Source::Counter; the issue pulse times a fused
-  /// accumulator's init injection. Both are absent for an acyclic region, which
-  /// has no counter, and `wantIssue` for a region with no stall shell.
+  /// accumulator's init injection. Both are absent for an acyclic region
+  /// (no counter), and `wantIssue` for a region with no stall shell.
   void setControl(unsigned region, const RegionControl &rc) {
     RegionControl &slot = controlOf[region];
     if (rc.counter) {
@@ -450,16 +411,15 @@ struct DatapathEmitter {
     if (!rc.scaledCounters.empty())
       slot.scaledCounters = rc.scaledCounters;
   }
-  /// Record a region's latched result \p port (from the orchestrator's survivor
-  /// capture) so a sibling reading Source::Survivor{region, port} resolves to
-  /// it.
+  /// Record a region's latched result \p port (from the orchestrator's
+  /// survivor capture) so a sibling reading Source::Survivor{region, port}
+  /// resolves to it.
   void setSurvivor(unsigned region, unsigned port, Value v) {
     survivorOf[accKey(region, port)] = v;
   }
   /// Register region \p region's stall shell, the H seam. The orchestrator
-  /// registers the PROMISE (two backedges) before F and G emit against it, then
-  /// re-registers the derived shell once `deriveStallShell` has resolved them,
-  /// since the promise's placeholders are erased by that RAUW.
+  /// registers a PROMISE (two backedges) before F and G emit against it, then
+  /// re-registers the derived shell once `deriveStallShell` has resolved them.
   void setShell(unsigned region, const StallShell &sh) { shellOf[region] = sh; }
   /// Region \p region's stall shell; rigid for an unregistered region.
   StallShell shellFor(unsigned region) const { return shellOf.lookup(region); }
@@ -471,8 +431,7 @@ struct DatapathEmitter {
   void declareUnits(const uarch::RegionBlock &rb);
   void emitInternalReads(const uarch::RegionBlock &rb);
   /// The skewed halves of the two above: one port per bank per LANE instead of
-  /// per bank per access, which is the bandwidth a skewed layout exists to buy
-  /// and the bandwidth the port model billed once the slots were assigned.
+  /// per bank per access, the bandwidth a skewed layout exists to buy.
   void emitSkewedInternalReads(const uarch::RegionBlock &rb);
   void emitSkewedInternalWrites(const uarch::RegionBlock &rb, Value commit,
                                 DatapathFeedback &fb);
@@ -487,29 +446,27 @@ struct DatapathEmitter {
   /// crossbar. Runs after the units, so an address computed by one resolves to
   /// its filled value rather than a dangling backedge.
   void emitExternalReadAddrs(const uarch::RegionBlock &rb);
-  /// Where a region's units are being emitted from, which is what decides
-  /// whether a recurrence input re-injects its reduction identity. The two
-  /// container modes differ only in what they are allowed to contain, and both
-  /// state it as an assert rather than relying on a re-injection being inert.
+  /// Where a region's units are being emitted from, which decides whether a
+  /// recurrence input re-injects its reduction identity.
   enum class UnitMode {
     /// A leaf region: it has a per-iteration issue pulse, so a loop-carried
     /// input re-injects `inputInits[k]` on its first `inputInitDist[k]` runs.
     /// Its backedges are declared earlier, before the reads resolve.
     Leaf,
     /// A container's own PREDICATE units: a child guard's `i > j` over the
-    /// counter / iter-arg survivors, reified by the reifier as a start-0
-    /// combinational compute. A container has no issue pulse, and
-    /// correspondingly no recurrence init to re-inject. Declares its own
-    /// backedges. Called after the counter + iter-arg survivors are set and
-    /// before the children are sequenced, so a child guard reads its parent's
-    /// predicate as a Source::Unit.
+    /// counter / iter-arg survivors, reified as a start-0 combinational
+    /// compute. A container has no issue pulse, and correspondingly no
+    /// recurrence init to re-inject. Declares its own backedges. Called after
+    /// the counter + iter-arg survivors are set and before the children are
+    /// sequenced, so a child guard reads its parent's predicate as a
+    /// Source::Unit.
     Container,
     /// A sequential while's own CONDITION cone (`emitConditionRegion`). Same
     /// no-recurrence rule as `Container`, but the cone may be MULTI-CYCLE (a
-    /// memory read or an IP compare), which is exactly what the CHECK/RUN
-    /// regime's `t_cond` wait exists for, so it carries no `comb` restriction.
-    /// Its backedges are declared by that caller, which emits the reads the
-    /// cone addresses first.
+    /// memory read or an IP compare), which is what the CHECK/RUN regime's
+    /// `t_cond` wait exists for, so it carries no `comb` restriction. Its
+    /// backedges are declared by that caller, which emits the reads the cone
+    /// addresses first.
     Condition,
   };
   void emitUnits(const uarch::RegionBlock &rb, UnitMode mode = UnitMode::Leaf);
@@ -517,11 +474,11 @@ struct DatapathEmitter {
   /// condition memory reads (address over the frozen iter-arg survivors) plus
   /// its compute. Returns the settled condition value together with its ready
   /// latency `t_cond`, the cycles after CHECK-start at which the condition is
-  /// valid. A generalisation of `emitUnits(.., Container)` that also emits the
-  /// container's own reads; a combinational condition has no read
-  /// (`t_cond == 0`), reducing to it exactly. The read address is the frozen
-  /// iter-arg survivor, so the loaded value is a stable wire across the CHECK
-  /// window; the caller samples it at `delayValid(checkStart, t_cond)`.
+  /// valid (0 for a combinational condition). A generalisation of
+  /// `emitUnits(.., Container)` that also emits the container's own reads. The
+  /// read address is the frozen iter-arg survivor, so the loaded value is a
+  /// stable wire across the CHECK window; the caller samples it at
+  /// `delayValid(checkStart, t_cond)`.
   std::pair<Value, unsigned> emitConditionRegion(const uarch::RegionBlock &rb,
                                                  const uarch::Source &condSrc);
   void resolveRegHeads(const uarch::RegionBlock &rb);
@@ -532,18 +489,17 @@ struct DatapathEmitter {
                     DatapathFeedback &fb);
 
   /// Instantiate each CallUnit (dcp.instance) in region \p rb as a child
-  /// `hw.instance`: wire clk/rst/`start`; drive/read each mastered
-  /// buffer's hlmem via the child's addr/data/we ports; fold the child's `done`
-  /// into \p fb.callDone (the region's completion). The buffers' hlmems
-  /// (createInternalMemories) already exist; runs BEFORE the region's own
+  /// `hw.instance`: wire clk/rst/`start`; drive/read each mastered buffer's
+  /// hlmem via the child's addr/data/we ports; fold the child's `done` into
+  /// \p fb.callDone (the region's completion). Runs BEFORE the region's own
   /// register heads and accesses, since a call's scalar result is an ordinary
   /// datapath Source a register chain or a store may read.
   void emitCalls(const uarch::RegionBlock &rb, Value issue,
                  DatapathFeedback &fb);
-  /// The start pulse of one child, from the composition operator's start-policy
-  /// table read on this node's contract and its region's composition class. The
-  /// ONE place a start policy is chosen on the instance substrate;
-  /// `EmitContext::startFor` is the same question on the region substrate.
+  /// The start pulse of one child, from the composition operator's
+  /// start-policy table read on this node's contract and its region's
+  /// composition class. `EmitContext::startFor` is the same question on the
+  /// region substrate.
   Value startForCall(const uarch::CallUnit &cu, Value issue,
                      llvm::ArrayRef<Value> predDones, bool concurrent,
                      const StallShell &sh);
@@ -574,11 +530,10 @@ struct DatapathEmitter {
   /// becomes `{chainEnable, issueEnable}`, and each put's stage folds into
   /// \p fb.storeDrain (a put is a store).
   ///
-  /// Runs on the already-emitted (F, G) pair, so the shell it returns is what
-  /// the region's registered PROMISE stands for: this pass times its own deeper
-  /// pulses against that promise (`shellFor(rb.id)`), and the caller resolves
-  /// the promise with the result. A region with no stream accesses is rigid and
-  /// derives nothing.
+  /// Runs on the already-emitted (F, G) pair, timing its own deeper pulses
+  /// against the region's registered PROMISE (`shellFor(rb.id)`); the caller
+  /// resolves the promise with the result. A region with no stream accesses is
+  /// rigid and derives nothing.
   StallShell deriveStallShell(const uarch::RegionBlock &rb, Value issue,
                               DatapathFeedback &fb);
   /// Drive every boundary channel's module ports, and build every local
@@ -633,47 +588,45 @@ struct HWEmitter {
   Value emitRegion(const uarch::RegionBlock &rb, Value start, bool retrig);
   /// A loop-over-call region: a counted `dcp.pipeline` wrapping one
   /// `dcp.instance`. One child instance is fired \p tripCount times, a counter
-  /// driving its index and each invocation advancing on the child's real `done`
-  /// (throughput = one iteration per child latency, not the pipeline cadence).
-  /// The counter is the region's `rc.counter` (so `emitCalls` wires the child's
-  /// index port to it) and the child start is `rc.issue`; `done` latches the
-  /// last iteration.
+  /// driving its index and each invocation advancing on the child's real
+  /// `done` (throughput = one iteration per child latency, not the pipeline
+  /// cadence). The counter is the region's `rc.counter` (so `emitCalls` wires
+  /// the child's index port to it) and the child start is `rc.issue`; `done`
+  /// latches the last iteration.
   Value emitLoopCall(const uarch::RegionBlock &rb, Value start);
   /// The final iteration's issue pulse: a counted region's last iteration
   /// (counter+1 reaches the bound) or a while's condition-false exit; the issue
-  /// pulse itself for an acyclic region (a single pass, no counter). The one
-  /// pulse the `done` (emitDone) and the survivor captures (captureResults)
-  /// both key off.
+  /// pulse itself for an acyclic region (a single pass, no counter). The pulse
+  /// `done` (emitDone) and the survivor captures (captureResults) both key off.
   Value lastIssuePulse(const RegionControl &rc, const Terminator &term);
   /// Capture LEAF region \p rb's results (`rb.results`) into the survivor
   /// registers a sibling reads, each at its own ready cycle relative to \p
   /// captureOn; returns the region's result-drain stage (the latest-landing
   /// result's ready cycle, folded into the region's `drainStage`). One path for
   /// both terminations: \p captureOn is the last iteration's issue pulse for a
-  /// counted loop and each continuing iteration's for a while, which is the
-  /// only thing the two regimes disagree about.
+  /// counted loop and each continuing iteration's for a while.
   unsigned captureResults(const uarch::RegionBlock &rb, Value captureOn,
                           Value start);
-  /// Run \p regions in program order, each region starting when its predecessor
-  /// drains (the first on \p start); returns the last region's done (a level).
-  /// The shared sequencer for func-scope siblings and a container's children.
+  /// Run \p regions in program order, each region starting when its
+  /// predecessor drains (the first on \p start); returns the last region's
+  /// done (a level). The shared sequencer for func-scope siblings and a
+  /// container's children.
   Value sequence(llvm::ArrayRef<uarch::RegionId> regions, Value start,
                  bool retrig);
   /// Compose the func-scope sibling regions by their dependence DAG
   /// (`rb.predecessors`): a predecessor-free region starts with the kernel
   /// \p start (independent siblings run concurrently), the rest on the rising
-  /// edge of their predecessors' joined `done`. Regions emit in program order
-  /// (SSA dominance), and the returned kernel `done` is the conjunction of
-  /// every region's `done`, so it completes when the last region does,
-  /// whichever that is. Degenerates to `sequence` when every region depends on
-  /// its predecessor.
+  /// edge of their predecessors' joined `done`. The returned kernel `done` is
+  /// the conjunction of every region's `done`, so it completes when the last
+  /// region does, whichever that is. Degenerates to `sequence` when every
+  /// region depends on its predecessor.
   Value composeSiblings(llvm::ArrayRef<uarch::RegionId> regions, Value start);
   /// Set up a container's loop-carried iter-args as frozen survivor registers
   /// (latch each `rb.results[k].init` at \p start, advance on \p advance),
   /// record each as Source::Survivor{rb, k}, and return the per-arg next-value
   /// backedges (set to `resolveSource(rb.results[k].value)` after the children
-  /// emit). The container counterpart of `captureResults`: same recurrence,
-  /// split in two because the next-value comes from children that emit later.
+  /// emit). The container counterpart of `captureResults`, split in two
+  /// because the next-value comes from children that emit later.
   llvm::SmallVector<circt::Backedge>
   setupCarriedIterArgs(const uarch::RegionBlock &rb, Value start,
                        Value advance);
@@ -693,8 +646,8 @@ struct HWEmitter {
   /// predicate start-gates child 0 (`start & cond`); a false predicate
   /// completes the region in one cycle (`start & ~cond`) without ever issuing
   /// the children, so their stores never fire. Simpler than
-  /// emitConditionalContainer: no iteration / iter-args (the predicate does not
-  /// depend on the children).
+  /// emitConditionalContainer: no iteration / iter-args, since the predicate
+  /// does not depend on the children.
   Value emitGuard(const uarch::RegionBlock &rb, Value start);
   /// Emit the whole module body: preamble + each top-level region in order.
   void emit();

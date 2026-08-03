@@ -24,12 +24,12 @@
 using namespace mlir;
 using namespace mlir::allo;
 
-// The storage root an access operates on (views peeled), or null for a non-
-// access. Arrays and streams are BOTH port-limited storage, an array by its
-// memory ports and a stream by its handshake, so both belong to the model. A
-// FIFO carries exactly one transfer per end per cycle; without a resource for
-// it, several accesses to one channel are free to land on the SAME cycle, which
-// the emitter can only reject (their token order would be lost).
+// The storage root an access operates on (views peeled), or null for a
+// non-access. Arrays and streams are BOTH port-limited storage: an array by
+// its memory ports, a stream by its handshake. A FIFO carries exactly one
+// transfer per end per cycle; without a resource for it, several accesses to
+// one channel could land on the same cycle, which the emitter can only
+// reject (their token order would be lost).
 static Value storageOf(Operation *op) {
   auto a = asMemAccess(op);
   return a ? a->root : Value();
@@ -538,11 +538,11 @@ BankSplitExpr bankSplitOf(const BankLayout &layout, AffineMap map,
 }
 
 // The interval \p e takes over \p ranges, or nullopt when an operand in it is
-// unbounded. Endpoint arithmetic, which is exact here because every operator is
-// monotone in its argument; the one over-approximation is a residue whose
-// argument straddles a multiple of the divisor, which widens to the whole
-// residue class. Both directions are SOUND, and soundness is what matters: a
-// caller acts on `lo == hi` and a wider interval only declines.
+// unbounded. Endpoint arithmetic, exact here since every operator is monotone
+// in its argument; the one over-approximation is a residue whose argument
+// straddles a multiple of the divisor, widened to the whole residue class.
+// Both directions are SOUND: a caller acts on `lo == hi` and a wider interval
+// only declines.
 static std::optional<std::pair<int64_t, int64_t>>
 rangeOf(AffineExpr e, ArrayRef<DimRange> ranges) {
   if (auto c = dyn_cast<AffineConstantExpr>(e))

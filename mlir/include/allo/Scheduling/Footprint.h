@@ -51,19 +51,19 @@ enum class Conflict { None, RAW, WAR, WAW };
 Conflict footprintConflict(const Access &a, const Access &b);
 
 /// Fold a synchronous sub-kernel call's footprint into \p s, keyed by the
-/// CALLER's operand roots. `summarizeOp` cannot see through an opaque call, so
-/// it marks every memref operand read+write+nonAffine. That makes any two
-/// calls sharing an array conflict, even two readers of one input. This looks
-/// INTO the callee instead and records, per parameter, the direction plus the
-/// callee's own affine access ops (recursing through nested calls). Two calls
-/// sharing an array can then be proven read-only or element-disjoint by
-/// `callFootprintConflict` and left unordered, i.e. free to overlap.
+/// CALLER's operand roots. `summarizeOp` cannot see through an opaque call,
+/// so it marks every memref operand read+write+nonAffine, making any two
+/// calls sharing an array conflict even if both only read it. This looks INTO
+/// the callee instead and records, per parameter, the direction plus the
+/// callee's own affine access ops (recursing through nested calls), so two
+/// calls sharing an array can be proven read-only or element-disjoint by
+/// `callFootprintConflict` and left unordered.
 ///
 /// Returns false when a construct defeats the summary (an unresolvable /
 /// external callee, a call cycle, a view operand whose index space is offset
-/// from its root's). \p s may then hold a partial record; it is subsumed by the
-/// conservative `summarizeOp` marks the caller applies instead, so their union
-/// stays conservative.
+/// from its root's). \p s may then hold a partial record, subsumed by the
+/// conservative marks `summarizeOp` applies instead, so their union stays
+/// conservative.
 bool summarizeCall(func::CallOp call, Summary &s);
 
 /// The ordering hazard between an EARLIER access \p a and a LATER access \p b

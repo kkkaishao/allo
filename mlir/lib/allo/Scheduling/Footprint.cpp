@@ -204,17 +204,16 @@ bool mlir::allo::summarizeCall(func::CallOp call, Summary &s) {
 }
 
 // Whether two accesses to one array provably touch DISJOINT elements when
-// they may live in DIFFERENT functions: each naming its own parameter, so
-// `footprintsDisjoint`'s `MemRefAccess` pair test (which demands one
-// identical memref Value) does not apply. Compare polyhedral REGIONS
-// instead: `MemRefRegion` at loop depth 0 is the set of indices an access
-// touches across all its enclosing loops, with exactly `rank` dimensions and
-// the IVs projected out. A `func.call` is type-checked, so parameters bound
-// to one array share its shape: the two regions then align positionally and
-// intersect meaningfully. Symbols keep their Value identity across the
-// merge, so two callees' unrelated symbols stay distinct columns and the
-// intersection stays non-empty: unproven disjointness conservatively reads
-// as a conflict.
+// they may live in DIFFERENT functions: each names its own parameter, so
+// `footprintsDisjoint`'s `MemRefAccess`-pair test (demanding one identical
+// memref Value) does not apply. Compares polyhedral REGIONS instead:
+// `MemRefRegion` at loop depth 0 is the set of indices an access touches
+// across all its enclosing loops, with exactly `rank` dimensions and the IVs
+// projected out. A `func.call` is type-checked, so parameters bound to one
+// array share its shape and the two regions align positionally. Symbols keep
+// their Value identity across the merge, so two callees' unrelated symbols
+// stay distinct columns and the intersection stays non-empty: unproven
+// disjointness conservatively reads as a conflict.
 static bool regionsDisjoint(const Access &ai, const Access &aj) {
   if (ai.nonAffine || aj.nonAffine)
     return false;

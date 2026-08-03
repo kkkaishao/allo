@@ -98,17 +98,12 @@ struct RegionReport {
   std::vector<ScheduledOpReport> ops;
 };
 
-/// What ONE region's solve COST, which is a measurement of the compiler rather
-/// than a fact about the hardware.
+/// What ONE region's solve COST: a measurement of the compiler, not the
+/// hardware, so it is never stamped as an IR attribute the emitter could read.
 ///
-/// It rides beside the report rather than on a `dcp` op, because an attribute
-/// would put a compile-time number into the IR the emitter reads, and nothing
-/// downstream may ever build against how long a solve took.
-///
-/// Deliberately NOT joined to `RegionReport`: a solve is keyed by the affine
-/// loop that owned the problem, and by the time the report is built off the
-/// reified `dcp` ops that loop is gone. Both lists are in program order per
-/// func, which is as much of a correspondence as is sound to claim.
+/// Kept separate from `RegionReport`: a solve is keyed by the affine loop that
+/// owned the problem, which no longer exists by the time the report is built
+/// off the reified `dcp` ops. Both lists are in program order per func.
 struct SolveReport {
   /// The func it belongs to, and where its region is, as the log names it.
   std::string func, where;
@@ -137,33 +132,18 @@ struct FuncReport {
 
 /// What the scheduling pipeline knows, in the two forms its two phases need.
 ///
-/// The first is the SOLUTION, the hand-off from `runSDCScheduler` to
+/// The SOLUTION is the hand-off from `runSDCScheduler` to
 /// `runPostScheduleConversion`: per-op start times and per-region solutions.
+/// The REPORT is what the reify builds from the module it has just written,
+/// read back by Python through `toJSON`; it is a separate form because by
+/// then `forget` has dropped every op the reify erased, so the solution has
+/// no keys left to read. The two are valid at disjoint times: the solution
+/// between the phases, the report only after.
 ///
-/// The second is the REPORT, which the reify builds from the module it has just
-/// written and Python reads back through `toJSON`. It is a second form rather
-/// than a view of the first because by then the first has no keys left to read:
-/// `forget` drops every op the reify erases, and everything the report names
-/// (region kind, nesting, op mnemonic, IP impl, composed latency, determinacy)
-/// is a fact about the reified `allo.dcp.*` ops that the solver never held. The
-/// two are disjoint in time: the solution is valid only between the phases, the
-/// report only after the second.
-///
-/// Keyed by `Operation *`, whose precondition is the invariant the two phases
-/// already rely on: they run back to back over one module, with no pass between
-/// them to fold, rebuild or erase an op. The reify may ADD to it, for a
-/// condition cone it lifts or arithmetic it synthesizes for a symbolic bound,
-/// and it reads a region's solution before it replaces the op that keys it, so
-/// no lookup ever reaches a clone.
-///
-/// An `Operation *` key carries ONE obligation, `forget` below: a key is an
-/// address, and an erased op's address is handed straight back out by the next
-/// `create`.
-///
-/// A missing field is a compile error rather than a silent `nullopt`, and an
-/// absent SOLUTION is distinguishable from a defaulted one, which is what keeps
-/// a dropped descriptor from degrading an exact kernel to indeterminate with no
-/// diagnostic.
+/// Keyed by `Operation *`. The two phases run back to back with no pass
+/// between them to fold, rebuild or erase an op, so a key stays valid across
+/// them; `forget` (below) must be called on every erase, since MLIR may hand
+/// an erased op's address to the very next `create`.
 class ScheduleModel {
 public:
   /// Record \p op's solved start. An op is scheduled ONCE, by the solver or by

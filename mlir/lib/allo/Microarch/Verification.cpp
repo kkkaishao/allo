@@ -51,9 +51,8 @@ LogicalResult verifyDatapath(dcp::DCPathModuleOp func, const Datapath &dp) {
     badSite = site;
   });
   if (found) {
-    // The "cross-region value hand-off" phrase is the stable part (tests and
-    // the frontend match on it); the slot is the part that says WHERE. The
-    // builder's three hand-off rejects use the same phrase.
+    // "cross-region value hand-off" is the stable phrase tests match on; the
+    // builder's own hand-off rejects use the same wording.
     unsupported(Stage::Emit, badSite.op ? badSite.op : func.getOperation())
         << "A cross-region value hand-off is not lowered yet: "
         << badSite.describe() << " is unresolved";
@@ -124,23 +123,10 @@ LogicalResult checkDeviceCapability(dcp::DCPathModuleOp func,
 // 3. What this emitter lowers.
 //===----------------------------------------------------------------------===//
 
-// A COUNTED container (`emitContainer`) drives child regions and has no
-// per-iteration issue pulse to time work of its own against; the only thing it
-// emits is a child guard's predicate before the children run. That is why the
-// check below is what a unit READS rather than whether units exist.
-//
-// An INVARIANT, not a legality check: the reifier wraps every run of loose ops
-// between a level's child loops in its own child region, so a counted container
-// only ever holds declarations and predicates. Were one to arrive with work of
-// its own, an external store would leave its boundary port undriven (a null
-// operand reaching `Operation::create`) and a compute over a child's result
-// would read that child's survivor before the child has emitted.
-//
-// A CONDITIONAL container is a different controller: `emitConditionalContainer`
-// emits its own condition cone (`emitConditionRegion`), so its reads and units
-// are expected. Its writes and stream accesses are not emitted, but no
-// frontend shape puts one in a while condition, so that stays a gap rather
-// than a check.
+// Invariant, not a legality check: the reifier gives every run of loose ops
+// its own child region, so a counted container never holds work of its own;
+// hence checking what a unit READS rather than whether units exist. A
+// conditional container is exempt: it emits its own condition cone.
 [[maybe_unused]] static bool containerOwnsNoDatapath(const RegionBlock &rb,
                                                      const Datapath &dp) {
   if (!rb.memAccesses.empty() || !rb.streamAccesses.empty() ||
@@ -250,9 +236,9 @@ LogicalResult checkEmitterSubset(dcp::DCPathModuleOp func, const Datapath &dp) {
       return failure();
     }
   }
-  // A leaf `while` with an in-loop store lowers: emitAccesses gates each
-  // store's write-enable by `issue & cond`, so a doomed exit iteration
-  // commits nothing, matching the non-speculative loop-carried-survivor rule.
+  // A leaf `while` with an in-loop store lowers safely: emitAccesses gates the
+  // store's write-enable by `issue & cond`, so a doomed exit iteration commits
+  // nothing.
 
   // Operator realizability is settled before scheduling: an op with neither an
   // IP row nor a `combKindOf` lowering never becomes a `dcp.compute`.

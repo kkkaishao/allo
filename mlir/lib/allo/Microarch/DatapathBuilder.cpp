@@ -44,16 +44,6 @@ static Value dcpMemref(Operation *op) {
   return nullptr;
 }
 
-// The storage identity of a memref or stream SSA value is `resolveRoot`: a
-// buffer threaded out of the region that allocated it is the same memory to
-// its producer and its consumer. Keying storage by the operand as written
-// would build one memory per region, writes landing in one and reads coming
-// back from the other (uninitialized); the two halves would then be distinct
-// MemUnits, so `recordSiblingDeps` would see no shared memref and add no
-// ordering edge either. Both failures are silent, which is why the
-// scheduler's port model and this builder read the identity from one
-// definition.
-
 // The addressing of a dcp memory access: its affine map plus index operands.
 static void dcpAddressing(Operation *op, AffineMap &map,
                           SmallVector<Value> &operands) {
@@ -67,8 +57,7 @@ static void dcpAddressing(Operation *op, AffineMap &map,
 }
 
 // The body block of a dcp region op. A guard (dcp.select) has no `else` here
-// (result-mux guards are unsupported), so its body is the `then` branch,
-// which holds the guarded sub-schedule (child regions), gated by the predicate.
+// (result-mux guards are unsupported), so its body is the `then` branch.
 static Block *regionBody(Operation *regionOp) {
   if (auto pipe = dyn_cast<dcp::DCPathPipelineOp>(regionOp))
     return &pipe.getBody().front();
@@ -78,11 +67,10 @@ static Block *regionBody(Operation *regionOp) {
 }
 
 // Trace a pipeline iter-arg (0-based) back to the op defining its next value,
-// counting one loop-carried distance per iter_arg-to-iter_arg shift. This is
-// the recurrence distance the scheduler solved against. Reads the loop-carried
-// next-values through `getCarriedValues()` (the `dcp.uncondition` operands of a
-// counted loop, or the `dcp.condition`'s carried operands of a while, which
-// skip its leading condition), so iter-arg k always maps to carried[k].
+// counting one loop-carried distance per iter_arg-to-iter_arg shift: the
+// recurrence distance the scheduler solved against. `getCarriedValues()`
+// (the `dcp.uncondition` operands of a counted loop, or the `dcp.condition`'s
+// carried operands of a while) maps iter-arg k to carried[k].
 static std::pair<Operation *, unsigned>
 traceIterArgSource(dcp::DCPathPipelineOp pipe, unsigned iterArg) {
   Block &body = pipe.getBody().front();
@@ -104,19 +92,14 @@ traceIterArgSource(dcp::DCPathPipelineOp pipe, unsigned iterArg) {
 
 // Is \p v a transient FIFO-din value, one that changes while the region is
 // back-pressured (`valid & ~ready`), so it must be captured into a
-// chain-enable-frozen register before it drives a FIFO write? It is transient
-// iff it is, or is a purely combinational function of, one of the two sources
-// that move under back-pressure:
-//   * a memory load: a live counter-addressed read (an external port or an
-//     always-enabled seq.read), re-addressed as the counter advances/resets;
-//   * the loop counter (pipeline block arg 0), reset to `lb` in the drain.
-// A value built only from FIFO heads (held while their get is not popped),
-// survivors / call results (latched for the producing region's life),
-// constants, io, or *registered* (latency>=1) units is frozen with the datapath
-// while back-pressured, so it needs no extra register. Combinational
-// (latency-0) ops propagate transient-ness from their operands; the SSA din
-// tree is acyclic (iter-args are stable block args), so the recursion
-// terminates.
+// chain-enable-frozen register before it drives a FIFO write? True iff it is,
+// or is a combinational function of, one of the two sources that move under
+// back-pressure: a memory load (a live counter-addressed read, re-addressed as
+// the counter advances/resets) or the loop counter (pipeline block arg 0,
+// reset to `lb` in the drain). Everything else (FIFO heads, survivors, call
+// results, constants, io, or any registered unit) is frozen with the datapath
+// while stalled and needs no extra register; a combinational op propagates
+// transient-ness from its operands.
 static bool isTransientDin(Value v) {
   if (auto barg = dyn_cast<BlockArgument>(v))
     return isa_and_nonnull<dcp::DCPathPipelineOp>(
@@ -204,9 +187,9 @@ MemId DatapathBuilder::getOrCreateMem(Value memref) {
   auto mkt = memLib.timing(m.impl);
   m.readLatency = mkt.latency.read;
   m.writeLatency = mkt.latency.write;
-  // A dynamic-shape memref would silently fall to total == 0 -> depthWords == 0
-  // -> a zero-depth internal hlmem / zero-width external address interface,
-  // with no diagnostic. Allo arrays are statically shaped by this stage.
+  // A dynamic shape would silently size to depthWords 0 (a zero-depth hlmem /
+  // zero-width address interface) with no diagnostic; arrays are statically
+  // shaped by this stage.
   assert(mt.hasStaticShape() &&
          "datapath memory requires a static shape (a dynamic memref sizes to "
          "depthWords 0)");
@@ -319,12 +302,11 @@ RegionBlock DatapathBuilder::addRegion(Operation *regionOp, RegionId ridx) {
 }
 
 // The controller discriminant's structural axis, taken from `dcpRegionShape`
-// so that the emitter's dispatch, the validator's legality rules and the
-// latency composer read one answer.
-//
-// The BUILT model reaches the same answer down a different path, off linked
-// parent/child edges and bound CallUnits. Asserting the two agree catches a
-// region op and the model built from it describing different hardware.
+// so the emitter's dispatch, the validator's legality rules and the latency
+// composer read one answer. The BUILT model reaches the same answer down a
+// different path (linked parent/child edges and bound CallUnits); asserting
+// the two agree catches a region op and its built model describing different
+// hardware.
 void DatapathBuilder::deriveShapes() {
   for (RegionBlock &rb : dp.regions) {
     rb.shape = dcpRegionShape(rb.op);
@@ -459,14 +441,11 @@ void DatapathBuilder::bindStream(Operation *op, RegionBlock &rb) {
 void DatapathBuilder::bindMemory(Operation *op, Value memref, RegionBlock &rb) {
   bool isWrite = isa<dcp::DCPathStoreOp>(op);
   auto mid = getOrCreateMem(memref);
-  // A ROM has no write path, so a store bound to it would be silently
-  // dropped. `getOrCreateMem` clears `isRom` for any memref a `dcp.store`
-  // names, so this fires only if that scan and this binding disagree.
+  // Fires only if `getOrCreateMem`'s ROM scan and this binding disagree.
   assert(!(isWrite && dp.mems[mid].isRom) &&
          "store bound to a memory classified read-only");
-  // The MemUnit's device-resolved latency IS the latency the scheduler stamped
-  // on this access; a mismatch would build a port timed against a cycle the
-  // consumer's register depth was not solved for. Both read the same table.
+  // A mismatch would time a port against a cycle the consumer's register
+  // depth was not solved for; both read the same device table.
   assert(dcpLatency(op) ==
              (isWrite ? dp.mems[mid].writeLatency : dp.mems[mid].readLatency) &&
          "scheduled access latency disagrees with the device memory model");
@@ -559,10 +538,7 @@ void DatapathBuilder::bindResource(Operation *op, RegionBlock &rb) {
   // nothing. Falling out the bottom is the loud case: an unmodelled op would
   // otherwise be dropped from the hardware while compilation reported success.
   if (auto inv = dyn_cast<dcp::DCPathInstanceOp>(op))
-    // A sub-kernel call: a CallUnit owned by this region. The child instance
-    // masters its memref operands' memory ports; a scalar operand becomes a
-    // Source input, a scalar result a survivor.
-    return bindCall(inv, rb);
+    return bindCall(inv, rb); // a sub-kernel call -> a CallUnit
   if (isa<StreamGetOp, StreamPutOp>(op))
     return bindStream(op, rb); // a handshaked FIFO access
   if (auto mr = dcpMemref(op))
@@ -725,9 +701,6 @@ void DatapathBuilder::recordCallDeps() {
 }
 
 void DatapathBuilder::enumerateBoundaryPorts() {
-  // ONE numbering for every boundary memory port: each external access is a
-  // port group with an INDEX (into read/writePorts) and a NAME, off a counter
-  // per (memory, role) that call-mastered ports continue after the parent's.
   llvm::SmallVector<Value> memRefs;
   for (const MemUnit &m : dp.mems)
     memRefs.push_back(m.memref);
@@ -820,15 +793,13 @@ Source DatapathBuilder::resolveValue(Value v) {
   return Source{Source::Kind::Survivor, rid, arg - 1};
 }
 
-// The bits region \p rb's iteration counter needs, which is what its OWN range
-// says. The register holds `lb, lb+step, ...` and the terminator compares
-// `iv + step` against `ub` under a SIGNED predicate, so THREE values ride this
-// width: `lb`, `step` (the addend, and a cell of its own) and `lb + trip*step`,
-// which is both the one-past value and the `ub` the bounds are tied in at. An
-// empty loop is the case that needs `step` named: `0 to 0` bounds fit in a bit,
-// its step does not.
-// A loop whose trip only an ASSUMPTION bounds takes the same formula with the
-// bound in place of the count.
+// The bits region \p rb's iteration counter needs. The register holds
+// `lb, lb+step, ...` and the terminator compares `iv + step` against `ub`
+// under a SIGNED predicate, so three values ride this width: `lb`, `step`
+// (its own cell) and `lb + trip*step` (the one-past value, also `ub`). `step`
+// must be named even for an empty loop, whose `0 to 0` bounds alone would fit
+// in a bit. A loop whose trip only an ASSUMPTION bounds uses the bound in
+// place of the count.
 static unsigned counterWidth(const RegionBlock &rb) {
   auto pipe = cast<dcp::DCPathPipelineOp>(rb.op);
   std::optional<int64_t> trip = rb.tripCount ? rb.tripCount : rb.tripBound;
@@ -846,19 +817,12 @@ static unsigned counterWidth(const RegionBlock &rb) {
   return std::min(kIndexWidth, std::max({bits(lb), bits(step), bits(last)}));
 }
 
-// The width every cyclic region builds its iteration counter, and therefore its
-// induction bounds, at. Recorded here rather than dug back out at emission,
-// where the only place that could adapt it is a controller rebuilding the
-// terminator it was just handed.
-//
-// It is a property of that one loop and of nothing downstream of it. A consumer
-// wanting another width adapts at ITS end, as every other consumer of an index
-// already does: an ordinary datapath read widens back to `kIndexWidth`
-// (`Source::Kind::Counter`), a child's index port takes the port's width
-// (`CallUnit::ScalarArg::width`), an address cone takes the memory's, and an
-// address register carries its own (`AddrStride::width`). Deriving the counter
-// from a consumer instead would make a loop that has no such consumer,
-// `for r in range(N): child(A)`, unrepresentable.
+// The width every cyclic region builds its iteration counter, and therefore
+// its induction bounds, at: a property of that one loop, not of any consumer.
+// A consumer wanting another width adapts at ITS end (an ordinary datapath
+// read widens back to `kIndexWidth`, a child's index port takes the port's
+// width, an address cone takes the memory's, an address register carries its
+// own).
 void DatapathBuilder::deriveCounterTypes() {
   for (RegionBlock &rb : dp.regions)
     if (rb.kind == RegionBlock::Kind::Cyclic)
@@ -1008,9 +972,7 @@ Resolved DatapathBuilder::resolveOperand(Value v, Operation *consumer,
   // A held source is already valid when the consumer issues, so it ties
   // straight in: a survivor for the whole of the producing region's run, an
   // IO port and a literal for the whole kernel, and a func-scope cone for as
-  // long as the held values it reads. Delaying one would be sound but pure
-  // waste, and falling through to the scheduled arm below would ask a raw
-  // func-scope op for a `start` it does not carry.
+  // long as the held values it reads.
   case Source::Kind::Survivor:
   case Source::Kind::IO:
   case Source::Kind::Const:
@@ -1190,12 +1152,11 @@ static int64_t mod(int64_t a, int64_t b) {
 
 // The width a stride register is built at: enough bits for every value it
 // holds, and for the raw pre-wrap sum its update compares before fixing.
-//
-// A WRAPPING register lives in `[0, wrap)`, and `raw = cur + step + bump`
-// reaches `2*wrap - 1` going up (`step + bump <= wrap` by construction) or
-// borrows from just below zero going down, which the unsigned compare reads as
-// the same headroom either way. A PLAIN accumulator runs from `init` over the
-// loop's advances, one past the last iteration since a counted controller still
+// A WRAPPING register lives in `[0, wrap)`; `raw = cur + step + bump` reaches
+// `2*wrap - 1` going up (`step + bump <= wrap` by construction) or borrows
+// from just below zero going down, same headroom either way under the
+// unsigned compare. A PLAIN accumulator runs from `init` over the loop's
+// advances, one past the last iteration since a counted controller still
 // computes the step it does not take.
 static unsigned strideWidth(const RegionBlock::AddrStride &s,
                             std::optional<int64_t> trip) {
@@ -1232,14 +1193,13 @@ static unsigned slotFor(RegionBlock &rb, RegionBlock::AddrStride want) {
   return static_cast<unsigned>(it - rb.addrStrides.begin());
 }
 
-// The register holding `t.coeff * digit` over region \p rid's counter, plus the
-// companion residue register a quotient digit carries off.
+// The register holding `t.coeff * digit` over region \p rid's counter, plus
+// the companion residue register a quotient digit carries off.
 //
-// \p base is absorbed by the first NON-WRAPPING register and zeroed: a scaled
-// counter loads a constant at start anyway, so taking it there splits one
-// stride slot off an otherwise identical one, against an adder on the port's
-// setup path. A wrapping register cannot take it, holding a residue its wrap
-// assumes stays in range.
+// \p base is absorbed by the first NON-WRAPPING register and zeroed (a scaled
+// counter loads a constant at start anyway, so folding it in avoids an extra
+// adder on the port's setup path). A wrapping register cannot take it: it
+// holds a residue whose wrap assumes it stays in range.
 static MemUnit::Access::ScaledTerm strideFor(Datapath &dp, unsigned rid,
                                              const SplitAddress::Term &t,
                                              int64_t &base) {
@@ -1336,25 +1296,23 @@ reduceCone(Datapath &dp, AffineExpr e, AffineMap addrMap,
 
 // Address strength reduction: decide which TERMS of each access's address can
 // come from registers that advance with the loop counters, and record the
-// scaled counters those registers need.
+// scaled counters those registers need. A term that does not qualify stays in
+// the residual for `buildAddr` to evaluate, so this only ever removes
+// arithmetic.
 //
 // Runs after `resolveAccessOperands` (a term has to resolve to a counter) and
 // after `recordRegionBounds` (a stride is a constant only if the counter's
-// bounds are). A term that qualifies on neither count stays in the residual and
-// `buildAddr` evaluates it, so this only ever removes arithmetic.
+// bounds are). `splitAddress` is the same decomposition the scheduler priced
+// the access with.
 //
-// `splitAddress` is the same decomposition the scheduler priced the access
-// with, so what is built here is what was paid for. If they could disagree the
-// schedule would be optimistic, which is why they share the one definition.
+// An operand arriving through a delay chain is peeled to its HEAD: what
+// matters is whether the head is a counter, since the scaled counter is
+// delayed once for the whole sum rather than per operand. Counters wanted at
+// different cycles can't share that one delay, so the first one's cycle
+// decides and the rest stay in the residual.
 //
-// An operand the schedule needs late arrives through a delay chain, which is
-// peeled: what matters is whether the chain HEAD is a counter, the scaled
-// counter being delayed once for the whole sum instead of per operand. So
-// counters wanted in different cycles cannot share that one delay, and the
-// first one's cycle decides while the rest stay in the residual.
-//
-// The split runs on the IN-BANK OFFSET, which for an unbanked memref is the
-// flat index. That is what lets a banked access reduce at all: `buf[i, 4*j]`
+// The split runs on the IN-BANK OFFSET (the flat index for an unbanked
+// memref), which is what lets a banked access reduce at all: `buf[i, 4*j]`
 // under a cyclic-4 last axis offsets by `i*extent + j`, as linear as any.
 void DatapathBuilder::planAddressGenerators() {
   for (MemUnit &m : dp.mems) {
@@ -1533,23 +1491,21 @@ void DatapathBuilder::applyBinding(ArrayRef<SmallVector<UnitId, 2>> groups) {
 }
 
 // Composition predecessors of each top-level region (`rb.predecessors`): the
-// earlier top-level siblings it must start after. Two signals, both attributed
-// to the top-level ancestor: (1) a shared memref: any two regions touching
-// the same `MemUnit` are ordered (a RAW/WAR/WAW hazard, or, for two readers, a
+// earlier top-level siblings it must start after. Two signals, both
+// attributed to the top-level ancestor: (1) a shared memref, any two regions
+// touching the same `MemUnit` (a RAW/WAR/WAW hazard, or, for two readers, a
 // read-port conflict; functional units never conflict across regions under
-// per-region binding, so shared *memory* is the only cross-region resource);
-// (2) a cross-region SSA edge: an op in a later region uses a value produced
+// per-region binding, so shared memory is the only cross-region resource);
+// (2) a cross-region SSA edge, an op in a later region using a value produced
 // in an earlier one (a scalar survivor handed between siblings). The emitter
 // starts a predecessor-free region concurrently with the kernel `start` and
 // gates the rest on their producers' joined `done`.
 //
-// `siblingPredecessors` answers the same question for the latency model and is
-// NOT shared with this. It works off the IR, where a memref operand is a touch
-// whether or not the region reaches storage through it, so it
-// over-approximates; this works off the BUILT model, where a MemUnit access and
-// a CallUnit's mastered memrefs say which regions reach which storage. The
-// model wants the superset: a spurious edge there only lengthens a span, while
-// one HERE would serialize real hardware.
+// `siblingPredecessors` answers the same question for the latency model but
+// works off the IR (a memref operand is a touch whether or not the region
+// reaches storage through it), so it over-approximates; this works off the
+// BUILT model instead. The model wants the superset: a spurious edge there
+// only lengthens a span, while one HERE would serialize real hardware.
 void DatapathBuilder::recordSiblingDeps(ArrayRef<Operation *> regionOps) {
   // Top-level ancestor of a region (walk the container chain to the root).
   auto topOf = [&](RegionId r) {

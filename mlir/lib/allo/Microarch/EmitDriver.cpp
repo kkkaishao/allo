@@ -40,25 +40,18 @@ namespace mlir::allo::uarch {
 
 // Declare an extern operator module for each IP-realized compute unit, named by
 // `operatorModuleName` and deduplicated across the whole module (`opModules`).
-// Native (comb) units emit inline, no extern. One input port per operand (named
-// `a`, `b`, `c`, ... at each operand's width: a unary cast/`sqrt` gets `a`
-// only, a binary op `a`+`b`, a compare two operands yielding i1) then the
-// output at the result width. The interface follows the realization's stall
-// contract:
-// `(a.., clk) -> y` free-running, or `(a.., clk, ce) -> y` when clock-enabled
-// (`ce == 0` freezes the pipe in lockstep with the shell). Both are a function
-// of `impl`, so every instance of a module name shares one port shape, which is
-// what makes the dedup safe. Returns unit id -> its extern module.
+// Native (comb) units emit inline, no extern. One input port per operand
+// (`a`, `b`, `c`, ... at its width), then clk, then `ce` when the realization
+// is clock-enabled (`ce == 0` freezes it in lockstep with the shell), then the
+// output. Port shape is a function of `impl` alone, so one module name safely
+// covers every instance. Returns unit id -> its extern module.
 //
-// The module NAME is the `dcp.operator`'s own `sym_name`, and that declaration
-// is still live here (it is dropped once every kernel has emitted), so the
-// module carries two symbols of that name until then. That is legal, since
-// duplicate symbols are a verifier condition and nothing verifies between; what
-// it constrains is LOOKUP. `SymbolTable::lookupSymbolIn` returns the first
-// match in block order and the typed overload only `dyn_cast`s it, so a
-// `dcp.operator` found second would resolve to null. The declarations are
-// injected at the block's beginning and these modules land before the function
-// being emitted, which keeps the declaration first.
+// The module name is the `dcp.operator`'s own `sym_name`; that declaration
+// stays live until every kernel has emitted, so the symbol is briefly
+// duplicated (legal: nothing verifies between). `SymbolTable::lookupSymbolIn`
+// returns the first match in block order, so the declarations are injected at
+// the block's beginning to keep the `dcp.operator` first and lookup
+// unambiguous.
 static DenseMap<unsigned, Operation *>
 declareOperatorModules(dcp::DCPathModuleOp func, const uarch::Datapath &dp,
                        OpBuilder &b, llvm::StringMap<Operation *> &opModules,
@@ -317,9 +310,8 @@ LogicalResult emitDatapathToHW(ModuleOp module, StringRef binding,
     return failure();
   }
 
-  // Emission is rooted at the top function and runs bottom-up over the call
-  // DAG: each callee emits before its caller, so a container always finds
-  // its children already registered. Mirrors the scheduler's traversal order.
+  // Bottom-up over the call DAG (see the header doc): a container always
+  // finds its children already registered.
   llvm::StringMap<dcp::DCPathModuleOp> byName;
   for (dcp::DCPathModuleOp f : scheduled)
     byName[f.getSymName()] = f;

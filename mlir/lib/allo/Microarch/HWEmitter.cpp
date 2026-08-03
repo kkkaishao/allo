@@ -21,26 +21,19 @@ namespace mlir::allo::uarch {
 // The counted induction bounds (lb/ub/step) of region \p rb: the IV runs
 // `lb, lb+step, ...` and terminates on `iv+step >= ub`. Each bound is an
 // ordinary datapath Source (a literal cell or a data-dependent range
-// start/count/stride), resolved to the region's `counterType`. This is the ONE
-// place the bounds are assembled, so also the one place their width is settled.
-// Empty (default) for an acyclic region (no counter) or a while (which builds
-// its own Terminator::conditional from the resolved condition).
+// start/count/stride), resolved to the region's `counterType`. Empty (default)
+// for an acyclic region (no counter) or a while (which builds its own
+// Terminator::conditional from the resolved condition).
 //
 // The counter counts up through SIGNED compares, so a negative lb is fine but
-// the step must be positive. Three cases cover the step:
-//   1. A literal non-positive step: rejected by the frontend, "loop step must
-//      be a positive integer".
-//   2. A constant-folded SSA step: rejected by `DCPathPipelineOp::verify`,
-//      "step must be > 0".
-//   3. A genuinely runtime step (`for i in range(0, n, s)` over a loaded `s`):
-//      a supported shape whose sign no static check settles, so positivity is
-//      a contract with the caller. At step <= 0 the counter never reaches `ub`,
-//      so the loop hangs and writes out of bounds on the way. Closing that
-//      needs a guard in the emitted hardware, not a check here.
+// the step must be positive. A literal or constant-folded non-positive step is
+// rejected by the frontend / `DCPathPipelineOp::verify`; a genuinely runtime
+// step's sign is a contract with the caller, since no static check settles it
+// (step <= 0 would hang the loop and write out of bounds on the way).
 Terminator HWEmitter::terminatorOf(const uarch::RegionBlock &rb) {
   if (!rb.lbSource)
     return {}; // acyclic: no counter, hence no bounds
-  // Backstop for cases 1 and 2 above.
+  // Backstop for a statically-known non-positive step.
   assert(dp.constantOf(rb.stepSource).value_or(1) > 0 &&
          "counted-loop counter is up-counting; a statically non-positive step "
          "must have been rejected by the frontend or the op verifier");
@@ -261,11 +254,9 @@ Value HWEmitter::sequence(llvm::ArrayRef<uarch::RegionId> regions, Value start,
 // siblings run concurrently), the rest on the rising edge of their
 // predecessors' joined `done`. Emission is in program order, so a predecessor's
 // `done` is already built when its consumer reads it. The kernel `done` is the
-// conjunction of every region's `done`: it rises when the last region
-// completes, which under concurrency need not be the last in program order. A
-// pure chain (every region depends on the previous) reproduces `sequence`
-// exactly: each start is the rising edge of the prior `done` and the
-// conjunction equals the final `done`.
+// conjunction of every region's `done`, rising when the last region completes
+// (under concurrency, not necessarily the last in program order). A pure chain
+// (every region depends on the previous) reproduces `sequence` exactly.
 Value HWEmitter::composeSiblings(llvm::ArrayRef<uarch::RegionId> regions,
                                  Value start) {
   // Nothing to compose: complete a cycle after `start`, the shape an empty
@@ -307,9 +298,9 @@ Value HWEmitter::composeSiblings(llvm::ArrayRef<uarch::RegionId> regions,
 // produced them. Shared by the counted (emitContainer) and conditional
 // (emitConditionalContainer) regimes.
 //
-// This is the same recurrence a leaf captures in `captureResults`; a container
-// splits it into two halves because its next-value is produced by children that
-// emit AFTER the register they feed must already exist.
+// The same recurrence a leaf captures in `captureResults`, split into two
+// halves here because the register the next-value feeds must exist before the
+// children that produce it emit.
 SmallVector<circt::Backedge>
 HWEmitter::setupCarriedIterArgs(const uarch::RegionBlock &rb, Value start,
                                 Value advance) {
@@ -460,7 +451,6 @@ Value HWEmitter::emitGuard(const uarch::RegionBlock &rb, Value start) {
   // skipped guard's done would otherwise coincide with `start` and be masked.
   Value checkTime = ctx.delayValid(start, kGuardBoundary.arm, StallShell{});
   nameValue(checkTime, regionSignal(rb.id, "check"));
-  // Two mutually-exclusive arm pulses: thenStart and elseStart.
   auto [thenStart, elseStart] = ctx.branchPulse(checkTime, cond);
   // Each arm runs its children once (retrig so a re-entered guard presents
   // fresh edges each enclosing pass); an empty arm drains on its own start

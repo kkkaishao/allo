@@ -29,11 +29,9 @@ using namespace mlir;
 using namespace mlir::allo;
 using namespace mlir::allo::logging;
 
-// An op the reifier turns into a `dcp.compute`. It takes the IP path when a
-// library row matched and the combinational path otherwise, so exactly these
-// ops need a realization. Scoped by dialect, since only these are scheduled as
-// compute: `ConvertScheduleToDcp` reaches the same split for a single-result
-// non-constant op that carries a start time.
+// An op the reifier turns into a `dcp.compute` (IP path or combinational
+// path). Must stay in sync with the split `convertOp` (PostConversion.cpp)
+// makes for a single-result non-constant op carrying a start time.
 static bool isComputeOp(Operation *op) {
   return op->getNumResults() == 1 && !op->hasTrait<OpTrait::ConstantLike>() &&
          (isa<arith::ArithDialect, math::MathDialect>(op->getDialect()) ||
@@ -210,11 +208,9 @@ LogicalResult checkStallContract(Operation *op, StringRef symbol) {
 //===--------------------------------------------------------------------===//
 
 // A local buffer read before anything writes it takes whatever its storage
-// happens to hold: zeros in csim, the previous iteration's values in the
-// hardware, which reuses the buffer across iterations. MLIR calls that
-// undefined, so the program is legal and the schedule is sound; this is
-// simply the one ordinary way to lose `cosim == csim`, which is a headline
-// property of this backend, so it warns rather than fails.
+// happens to hold: zeros in csim, but the previous iteration's values in
+// hardware (the buffer is reused across iterations). Legal MLIR, so this
+// warns rather than fails, but it is the ordinary way to lose cosim == csim.
 static void warnUninitializedReads(func::FuncOp func) {
   llvm::MapVector<Value, Operation *> firstTouch;
   DenseSet<Value> opaque; // a buffer whose whole traffic is not in view
@@ -255,13 +251,12 @@ static void warnUninitializedReads(func::FuncOp func) {
   }
 }
 
-// The array arguments that are REAL boundary ports: the top function's own, and
-// every callee argument one is passed down to. A sub-kernel argument that is
-// not one names storage its CALLER owns; the child masters a `seq.hlmem` port
-// the parent builds for it, and that port realizes whatever the device
-// declares, a combinational read included. Only a genuine boundary port answers
-// to a driver on the other side of the module, so only it carries the contract
-// below.
+// The array arguments that are REAL boundary ports: the top function's own,
+// and every callee argument one is passed down to. A sub-kernel argument that
+// is not one names storage its caller owns (a `seq.hlmem` port the parent
+// builds), which can realize any device timing including a combinational
+// read; only a genuine boundary port answers to an external driver, so only
+// it carries the contract below.
 static DenseSet<Value> boundaryArraysOf(func::FuncOp top) {
   DenseSet<Value> boundary;
   for (BlockArgument arg : top.getArguments())
@@ -289,15 +284,11 @@ static DenseSet<Value> boundaryArraysOf(func::FuncOp top) {
   return boundary;
 }
 
-// The boundary contract of a completely-partitioned argument, reached when such
-// an argument resolved to a 0-cycle read. It is NOT the addressed port every
-// other argument gets: a complete partition commits the scheduler to unlimited
-// combinational ports, and the only boundary shape that delivers them is one
-// port per element, which is what `MemUnit::scattered` emits (and what Vitis
-// emits for the same directive).
-//
-// Two shapes of that are not built yet, and both are backend gaps rather than
-// illegal kernels, so they read as NYI.
+// The boundary contract of a completely-partitioned argument, reached when
+// such an argument resolved to a 0-cycle read: not an addressed port but one
+// port per element (`MemUnit::scattered`), since a complete partition commits
+// the scheduler to unlimited combinational ports. The two shapes below are
+// backend gaps (NYI), not illegal kernels.
 static LogicalResult checkScatteredArgument(func::FuncOp func, Value array,
                                             MemoryChar &mc, bool isTop) {
   auto elements = cast<MemRefType>(array.getType()).getNumElements();
@@ -396,12 +387,11 @@ static bool sameBanking(BankLayout &a, BankLayout &b) {
   return true;
 }
 
-// A sub-kernel masters one port group per bank and indexes each in that bank's
-// own element space, so caller and callee must agree on the whole banking; at a
-// different layout the child addresses the wrong elements.
-// `propagate-partition` reconciles the two ends into one attribute, so a
-// disagreement left here is one that never reached it: hand-written IR, or an
-// array whose carrier that pass could not name.
+// A sub-kernel masters one port group per bank and indexes each in that
+// bank's own element space, so caller and callee must agree on the whole
+// banking; at a different layout the child addresses the wrong elements.
+// `propagate-partition` reconciles both ends already, so a disagreement here
+// is hand-written IR or an array whose carrier that pass could not name.
 LogicalResult checkPartitionAgreement(func::FuncOp func) {
   SymbolTableCollection syms;
   WalkResult r = func.walk([&](func::CallOp call) {
@@ -654,27 +644,22 @@ LogicalResult checkChannelCycles(func::FuncOp func,
 // Address cost: the check, and the report behind it.
 //
 // `OperatorLibrary::lookup` charges an access's address cone to the port it
-// feeds. What it cannot do is SPLIT one: an address is folded into the access's
-// affine map rather than standing as its own operation, so there is nowhere to
-// put a register and chaining can only accept or reject. CIRCT rejects it by
-// `emitError`-ing on the whole containing op (`ChainingSupport.cpp:34`), which
-// names neither the access nor the expression, so the same condition is tested
-// here first and reported against the address that caused it.
+// feeds, but cannot SPLIT one: an address is folded into the access's affine
+// map rather than standing as its own operation, so chaining can only accept
+// or reject it. CIRCT rejects it via a generic `emitError` on the containing
+// op (`ChainingSupport.cpp:34`), naming neither the access nor the
+// expression, so the same condition is tested here first and reported
+// against the offending address.
 //
-// The number is the cost of the address the emitter ACTUALLY builds
-// (`addressExprsOf`): the in-bank offset rather than the flat index, plus the
-// bank digit when one is decoded at runtime, carried at the addressed bank's
-// own width, with constant coefficients as signed-digit shift-adds and only
-// the dividers pinned to the full datapath width (they are the one thing that
-// cannot be narrowed). So the price, the report and the netlist agree, with no
-// assumption that a synthesis tool narrows anything afterwards.
+// The cost priced is that of the address the emitter actually builds
+// (`addressExprsOf`): the in-bank offset (not the flat index) plus any
+// runtime bank digit, at the addressed bank's own width, with constant
+// coefficients as shift-adds and only dividers at full datapath width. Every
+// array access is priced, including non-affine ones, whose row-major
+// linearization and bank digit are address arithmetic like any other.
 //
-// EVERY array access is priced, the non-affine ones included. Their subscript
-// is timed compute, but the row-major linearization over it and the bank digit
-// off it are address arithmetic like any other, and the emitter builds both.
-//
-// The per-access lines are `debug` level, so a normal compile sees only the
-// rejection; `ALLO_LOG_LEVEL=debug` shows every priced address.
+// Per-access lines are `debug` level; a normal compile sees only rejections,
+// `ALLO_LOG_LEVEL=debug` shows every priced address.
 //===----------------------------------------------------------------------===//
 static LogicalResult checkAddressCost(func::FuncOp funcOp,
                                       const OperatorLibrary &lib,
@@ -689,9 +674,6 @@ static LogicalResult checkAddressCost(func::FuncOp funcOp,
     if (!a || a->kind != AccessKind::Array)
       return;
     ++total;
-    // The expressions the emitter evaluates, priced the way it will build them
-    // (strength-reduced where they can be), so the number printed and the
-    // number charged are the same number.
     auto shape = cast<MemRefType>(a->root.getType()).getShape();
     AddressExprs e = addressExprsOf(bankLayoutOf(a->root), a->map, shape,
                                     assignedBankOf(op));
@@ -710,9 +692,8 @@ static LogicalResult checkAddressCost(func::FuncOp funcOp,
     os << e.offset;
     if (e.bank)
       os << " (bank " << e.bank << ")";
-    // Test what the solver will see rather than the cone alone: the port's own
-    // setup rides on the same combinational path, and `lookup` is the one place
-    // that adds them, so asking it is what keeps this from drifting.
+    // `lookup`'s inDelay adds the port's own setup to the address cone, which
+    // is what the solver actually sees.
     double charged = lib.lookup(op).inDelay;
     bool over = charged > cycleTimeNs;
     if (over) {
@@ -731,9 +712,8 @@ static LogicalResult checkAddressCost(func::FuncOp funcOp,
              "schedulable value, partition by a power of two so the bank digit "
              "is a mask rather than a divider, or lower the target frequency";
     }
-    // A real divider is a narrow case worth naming (a loop-counter digit is a
-    // register, a power-of-two divisor a mask); speaks only when the address
-    // still fits, since the rejection above already covers the failing case.
+    // Only warn when the address still fits; the rejection above already
+    // covers the failing case.
     if (cost.dividers && !over)
       warn(Stage::Prep, op)
           << "The address " << addr << " costs "

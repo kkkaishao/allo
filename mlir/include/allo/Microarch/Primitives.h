@@ -189,8 +189,8 @@ struct ShiftChain {
 //     DEFERS the denied pass (a latched `running` / `pend`) rather than
 //     dropping it, which is what lets a stage-0 access wait for its handshake.
 //     It coincides with `chainEnable` today, since a starved stage-0 input
-//     freezes the whole region rather than injecting a bubble; the two stay
-//     separate fields because a bubbling regime is the one E1 would add.
+//     freezes the whole region rather than injecting a bubble; kept as a
+//     separate field for a future bubbling regime that would decouple them.
 //
 // Both null is a RIGID shell, the identity: every primitive below reduces to
 // its unconditional form, which is exactly what a region with no stream

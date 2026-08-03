@@ -66,22 +66,16 @@ static std::string render(const Recurrence &rec) {
   return s;
 }
 
-/// This class provides a framework to model certain scheduling problems as
-/// lexico-parametric linear programs (LP), which are then solved with an
-/// extended version of the dual simplex algorithm.
-///
-/// The approach is described in:
+/// Models a scheduling problem as a lexico-parametric linear program (LP),
+/// solved with an extended dual simplex algorithm, per:
 ///  [1] B. D. de Dinechin, "Simplex Scheduling: More than Lifetime-Sensitive
 ///      Instruction Scheduling", PRISM 1994.22, 1994.
 ///  [2] B. D. de Dinechin, "Fast Modulo Scheduling Under the Simplex Scheduling
 ///      Framework", PRISM 1995.01, 1995.
 ///
-/// Resource-free scheduling problems (called "central problems" in the papers)
-/// have an *integer* linear programming formulation with a totally unimodular
-/// constraint matrix. Such ILPs can however be solved optimally in polynomial
-/// time with a (non-integer) LP solver (such as the simplex algorithm), as the
-/// LP solution is guaranteed to be integer. Note that this is the same idea as
-/// used by SDC-based schedulers.
+/// A resource-free ("central") problem's ILP has a totally unimodular
+/// constraint matrix, so the plain (non-integer) simplex already returns an
+/// integer optimum.
 class SimplexSchedulerBase {
 protected:
   /// The objective is to minimize the start time of this operation.
@@ -140,9 +134,7 @@ protected:
   /// `firstConstraintRow`+*i*.
   SmallVector<unsigned> basicVariables;
 
-  /// Used to conveniently retrieve an operation's start time variable. The
-  /// alternative would be to find the op's index in the problem's list of
-  /// operations.
+  /// An operation's start time variable id.
   DenseMap<Operation *, unsigned> startTimeVariables;
 
   /// This vector keeps track of the current locations (i.e. row or column) of
@@ -754,8 +746,6 @@ void SimplexSchedulerBase::buildTableau() {
   // are out of basis, whereas all slack variables are in basis. We will number
   // them accordingly.
   unsigned var = 0;
-
-  // Assign column and variable numbers to the operations' start times.
   for (auto *op : prob.getOperations()) {
     nonBasicVariables.push_back(var);
     startTimeVariables[op] = var;
@@ -766,13 +756,11 @@ void SimplexSchedulerBase::buildTableau() {
   // one column for each parameter (1,S,T), and for all operations
   nColumns = nParameters + nonBasicVariables.size();
 
-  // Helper to grow both the tableau and the implicit column vector.
   auto addRow = [&]() -> SmallVector<int> & {
     implicitBasicVariableColumnVector.push_back(0);
     return tableau.emplace_back(nColumns, 0);
   };
 
-  // Set up the objective rows.
   nObjectives = 0;
   bool hasMoreObjectives;
   do {
@@ -781,7 +769,6 @@ void SimplexSchedulerBase::buildTableau() {
     ++nObjectives;
   } while (hasMoreObjectives);
 
-  // Now set up rows/constraints for the dependences.
   for (auto *op : prob.getOperations()) {
     for (auto &dep : prob.getDependences(op)) {
       auto &consRowVec = addRow();
@@ -956,7 +943,6 @@ void SimplexSchedulerBase::pivot(unsigned pivotRow, unsigned pivotColumn) {
     implicitBasicVariableColumnVector[row] = 0; // Reset for next pivot step.
   }
 
-  // Look up numeric IDs of variables involved in this pivot operation.
   unsigned &nonBasicVar =
       nonBasicVariables[pivotColumn - firstNonBasicVariableColumn];
   unsigned &basicVar = basicVariables[pivotRow - firstConstraintRow];
@@ -967,7 +953,6 @@ void SimplexSchedulerBase::pivot(unsigned pivotRow, unsigned pivotColumn) {
   if (basicVar < startTimeLocations.size())
     startTimeLocations[basicVar] = pivotColumn; // ...going out of basis.
 
-  // Record the swap in the variable lists.
   std::swap(nonBasicVar, basicVar);
 }
 
@@ -976,7 +961,6 @@ LogicalResult SimplexSchedulerBase::solveTableau() {
   // feasibility is reached, i.e. the parametric constants in all constraint
   // rows are non-negative.
   while (auto pivotRow = findDualPivotRow()) {
-    // Look for pivot elements.
     if (auto pivotCol = findDualPivotColumn(*pivotRow)) {
       pivot(*pivotRow, *pivotCol);
       continue;
@@ -1021,7 +1005,6 @@ LogicalResult SimplexSchedulerBase::restoreDualFeasibility() {
   // non-lexico-negative. Changing the order of the objective rows can violate
   // that; primal pivot steps restore it.
   while (auto pivotCol = findPrimalPivotColumn()) {
-    // Look for pivot elements.
     if (auto pivotRow = findPrimalPivotRow(*pivotCol)) {
       pivot(*pivotRow, *pivotCol);
       continue;
@@ -1063,8 +1046,6 @@ unsigned SimplexSchedulerBase::freeze(unsigned startTimeVariable,
   // suitable column should not fail.
   auto pivotCol = findDualPivotColumn(pivotRow, /* allowPositive= */ true);
   assert(pivotCol);
-
-  // Perform the exchange.
   pivot(pivotRow, *pivotCol);
 
   // After the exchange, `startTimeVariable` is represented by `pivotCol`.
@@ -1090,7 +1071,6 @@ LogicalResult SimplexSchedulerBase::scheduleAt(unsigned startTimeVariable,
   assert(startTimeVariable < startTimeLocations.size());
   assert(!frozenVariables.count(startTimeVariable));
 
-  // Freeze variable and translate its column by parameter S.
   unsigned frozenCol = freeze(startTimeVariable, timeStep);
   translate(frozenCol, /* factor1= */ 0, /* factorS= */ 1, /* factorT= */ 0);
 
@@ -1314,7 +1294,6 @@ LogicalResult SharedOperatorsSimplexScheduler::schedule() {
   // allocation limits, re-solving the LP with each added constraint. Each solve
   // is optimal given prior fixes; overall optimality is not guaranteed.
 
-  // Determine which operations are subject to resource constraints.
   auto &ops = prob.getOperations();
   SmallVector<Operation *> limitedOps;
   for (auto *op : ops)
@@ -1498,11 +1477,8 @@ void ModuloSimplexScheduler::updateMargins() {
 /// fallback). The de Dinechin move is tried first since it grows the schedule
 /// less, but only SPECULATIVELY: it assumes fully-pipelined reservations
 /// (`hasBlockingOps` bypasses it) and that the partial schedule absorbs its
-/// moves, neither of which is checked ahead of time. Upstream asserts on
-/// failure instead; here a failed re-solve is a statement about the solver's
-/// behavior under this heuristic, not an invariant of the datapath model, and
-/// asserting under NDEBUG would let an inconsistent tableau silently produce a
-/// wrong schedule.
+/// moves, neither of which is checked ahead of time, so a failed re-solve
+/// there is rolled back rather than asserted.
 LogicalResult ModuloSimplexScheduler::scheduleOperation(Operation *n) {
   unsigned stvN = startTimeVariables[n];
 
@@ -1636,10 +1612,8 @@ LogicalResult ModuloSimplexScheduler::growIIByDeDinechin(Operation *n) {
   info(Stage::Sched) << "Incrementing II to " << (parameterT + 1)
                      << " to resolve resource conflict for " << *n;
 
-  // This is simpler than the paper's general approach because operators
-  // here are fully pipelined, so incrementing the II by one always suffices.
-
-  // Decompose start time.
+  // Fully-pipelined operators mean incrementing the II by one always suffices
+  // here (the paper's general case may need more).
   unsigned phiN = stN / parameterT;
   unsigned tauN = stN % parameterT;
 
@@ -1647,7 +1621,6 @@ LogicalResult ModuloSimplexScheduler::growIIByDeDinechin(Operation *n) {
   // the current op wants, so it can stay there.
   unsigned deltaN = 1;
 
-  // We're going to revisit the current partial schedule.
   SmallVector<Operation *> moved;
   for (Operation *j : scheduled) {
     unsigned stvJ = startTimeVariables[j];

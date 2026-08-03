@@ -52,14 +52,10 @@ static Value divConst(OpBuilder &b, Location loc, Value v, int64_t d) {
       .getResult();
 }
 
-// Multiply by a compile-time constant. An affine coefficient is always
-// constant, and a power-of-two one is a shift, i.e. wiring.
-//
-// Anything else stays a `comb.mul` DELIBERATELY. Synthesis recodes a constant
-// multiplier into a signed-digit shift-add network (`x * 15` becomes
-// `(x << 4) - x`, one adder), which beats the naive binary decomposition this
-// could emit instead (three adders for the same coefficient). Emitting our own
-// decomposition would take the choice away from the tool that makes it better.
+// Multiply by a compile-time constant. A power-of-two coefficient is a shift,
+// i.e. wiring; anything else stays a `comb.mul` deliberately, since synthesis
+// recodes a constant multiplier into a shift-add network better than a
+// decomposition emitted here could.
 static Value mulConst(OpBuilder &b, Location loc, Value v, int64_t k) {
   if (k == 1)
     return v;
@@ -729,8 +725,8 @@ void DatapathEmitter::emitUnits(const uarch::RegionBlock &rb, UnitMode mode) {
           Value bound =
               c.R(comb::AddOp::create(c.b, c.loc, lb, distStep, false));
           // Signed, as `Terminator::isLast` compares the same counter against
-          // the same kind of bound; a negative `lb` orders the wrong way round
-          // under the unsigned predicate this used to take.
+          // the same kind of bound; an unsigned predicate would order a
+          // negative `lb` the wrong way round.
           cond = c.notBit(c.icmpSgeV(iv, bound));
         }
         Value iter0 = c.R(comb::AndOp::create(c.b, c.loc, issue, cond, false));

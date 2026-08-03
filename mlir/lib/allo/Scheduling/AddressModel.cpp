@@ -31,17 +31,16 @@ AddressDelays mlir::allo::addressDelaysOf(const OperatorLibrary &lib) {
 
 // A carry chain's delay tracks its width, so a cone narrowed from the
 // characterization width scales with it. Wiring-only forms (a shift by a
-// constant, a mask, a constant term) never come through here: they cost no
-// logic at any width.
+// constant, a mask, a constant term) never reach here: they cost no logic at
+// any width.
 static double scaled(double base, unsigned width) {
   return base * width / AddressDelays::refWidth;
 }
 
 // Nonzero digits of the non-adjacent form of \p v: the fewest signed powers of
-// two that sum to it. This is how synthesis recodes a constant multiply, and it
-// beats a naive binary decomposition wherever a run of set bits appears (`x*15`
-// is `(x << 4) - x`, one adder, where the binary form needs three). Pricing the
-// binary form would overstate exactly the coefficients that recode best.
+// two that sum to it. This is how synthesis recodes a constant multiply,
+// beating a naive binary decomposition wherever a run of set bits appears
+// (`x*15` is `(x << 4) - x`, one adder, vs. three for the binary form).
 static unsigned nafWeight(uint64_t v) {
   unsigned w = 0;
   while (v) {
@@ -98,8 +97,7 @@ AddressCost mlir::allo::addressCost(AffineExpr e, const AddressDelays &delays,
 
   case AffineExprKind::Mul: {
     // A non-constant coefficient is a genuine multiplier. Unreachable from an
-    // affine.load's map, but a semi-affine map is representable, and an
-    // instrument that crashes on one is worse than one that prices it.
+    // affine.load's map, but a semi-affine map is representable.
     if (!konst) {
       ++c.multipliers;
       c.delay = in + scaled(delays.mul, width);
@@ -376,13 +374,11 @@ SplitAddress mlir::allo::splitAddress(AffineExpr e, unsigned numDims,
 }
 
 // Mixed-radix digit extraction, rewritten to divide before it masks:
-// `(x mod (a*b)) floordiv b` and `(x floordiv b) mod a` are the same digit, and
-// the second is the one a bank decomposition wants, because `a` is a partition
-// factor and so usually a power of two, which turns the outer division into a
-// mask. The first form is what a coalesced nest hands the split, since its
-// subscript is already `iv mod extent`, so without this a block-partitioned
-// array under `loop-canonicalization` chains two real divisions.
-// `simplifyAffineExpr` knows neither direction.
+// `(x mod (a*b)) floordiv b` and `(x floordiv b) mod a` are the same digit,
+// and the second is what a bank decomposition wants, since `a` is usually a
+// power-of-two partition factor, turning the outer division into a mask. A
+// coalesced nest hands the split the first form (its subscript is already
+// `iv mod extent`), which `simplifyAffineExpr` does not rewrite either way.
 static AffineExpr divideBeforeMasking(AffineExpr e) {
   auto bin = dyn_cast<AffineBinaryOpExpr>(e);
   if (!bin)
@@ -405,16 +401,13 @@ static AffineExpr divideBeforeMasking(AffineExpr e) {
 
 // A residue reads its operand's coefficients modulo the divisor:
 // `(a*x + c) mod k` is `((a mod k)*x + c) mod k`, so a term whose coefficient
-// is a multiple of `k` contributes nothing and is dropped outright.
+// is a multiple of `k` contributes nothing and is dropped.
 //
-// This is the one rewrite that has to exist here rather than upstream, because
-// what it undoes is not ours. Affine map composition (`canonicalize` folding an
-// `affine.apply` into a load, which is how a coalesced or normalized nest's
-// index reaches the map) flattens `x mod 2` into `x - (x floordiv 2)*2` BEFORE
-// this file sees anything, so every candidate starts from the flattened form
-// and no amount of re-simplifying recovers the mask. Under a skewed layout that
-// difference lands inside the bank digit, where the coefficients are multiples
-// of the factor and the whole term is worth nothing: a coalesced 8x8 skew reads
+// Needed because affine map composition (`canonicalize` folding an
+// `affine.apply` into a load) flattens `x mod 2` into `x - (x floordiv 2)*2`
+// before this file sees anything, and no amount of re-simplifying recovers
+// the mask. Under a skewed layout that lands inside the bank digit, where the
+// coefficients are multiples of the factor: a coalesced 8x8 skew reads
 // `(d0 floordiv 2 + d0*4 - (d0 floordiv 2)*8 + 1) mod 4`, four chained
 // operators, where `(d0 floordiv 2 + 1) mod 4` is one.
 static AffineExpr reduceModCoefficients(AffineExpr e) {
@@ -441,11 +434,11 @@ static AffineExpr reduceModCoefficients(AffineExpr e) {
 
 // `x - (x floordiv k)*k` is `x mod k`, re-folded.
 //
-// `simplifyAffineExpr` FLATTENS a residue into that difference, so a coalesced
-// or normalized subscript arrives already flattened and no amount of
-// re-simplifying recovers the mask. The flattened form is a subtract and a
-// shift that nothing can carry, where `x mod k` is a digit of a counter and so
-// a register (`asDigit`).
+// `simplifyAffineExpr` FLATTENS a residue into that difference, so a
+// coalesced or normalized subscript arrives already flattened and no amount
+// of re-simplifying recovers the mask. The flattened form is a subtract and a
+// shift that nothing can carry, where `x mod k` is a digit of a counter and
+// so a register (`asDigit`).
 static AffineExpr refoldResidues(AffineExpr e) {
   auto bin = dyn_cast<AffineBinaryOpExpr>(e);
   if (!bin)
@@ -487,8 +480,8 @@ static AffineExpr refoldResidues(AffineExpr e) {
 
 AffineExpr mlir::allo::simplifiedForHardware(AffineExpr e, unsigned numDims,
                                              unsigned numSymbols) {
-  // Ratios, not nanoseconds: every layer has to be handed the same form and
-  // only `addressCostOf` holds a device. See the header on why they are inert.
+  // Ratios, not nanoseconds: every layer must agree on one form, and only
+  // `addressCostOf` holds a device to price against.
   static constexpr AddressDelays kRank{/*add=*/1.0, /*mul=*/4.0, /*div=*/16.0};
   AffineExpr best = e;
   double bestRank = addressCost(e, kRank, AddressDelays::refWidth).delay;
@@ -555,14 +548,14 @@ unsigned mlir::allo::addressWidthOf(ArrayRef<int64_t> shape) {
 }
 
 // The step of \p v when it is the induction variable of a counted loop with
-// constant bounds, the one shape whose consecutive values differ by a
-// compile-time constant and so the one a register can track. The register loads
-// `coeff * lb` at start and adds `coeff * step`, so both have to be constants;
+// constant bounds: the one shape whose consecutive values differ by a
+// compile-time constant, so the one a register can track. The register loads
+// `coeff * lb` at start and adds `coeff * step`, so both must be constants;
 // an `affine.for` step always is, an `scf.for` step is an operand.
 //
 // Read off the loop IR here; the emitter asks the same question of the region
-// model it lowered to (`planAddressGenerators`), which is dialect-agnostic and
-// so answers yes for an `scf.for` too. Both have to agree on which loops carry.
+// model it lowered to (`planAddressGenerators`), dialect-agnostic and so
+// answering yes for an `scf.for` too. Both must agree on which loops carry.
 static std::optional<int64_t> constantStepOf(Value v) {
   auto barg = dyn_cast<BlockArgument>(v);
   if (!barg)

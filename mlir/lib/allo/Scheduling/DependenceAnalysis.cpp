@@ -164,20 +164,18 @@ rescaleOnLoopStep(SmallVectorImpl<affine::DependenceComponent> &comps) {
 // `checkMemrefAccessDependence` is queried at each loop depth from 1 to
 // numCommonLoops (a dependence carried by the d-th common surrounding loop)
 // and at numCommonLoops + 1, the loop-independent (intra-iteration) case with
-// all common loops pinned to the same iteration. The polyhedral test handles
-// that top depth natively: with `allowRAR = false` it also orients the
-// otherwise-symmetric dist-0 dependence by program order (reporting it only
-// when the source ancestor precedes the destination ancestor in their common
-// block) and drops read-read pairs, which never conflict. This also catches
-// same-iteration conflicts between different subscripts that can alias (e.g.
-// `A[i][j]` vs `A[j][i]` on the diagonal, or `A[2*i]` vs `A[i]` at i == 0).
-// Aliasing between distinct memrefs is not modeled; distinct SSA memrefs are
-// assumed disjoint.
+// all common loops pinned to the same iteration. At that top depth,
+// `allowRAR = false` orients the otherwise-symmetric dist-0 dependence by
+// program order (reported only when the source ancestor precedes the
+// destination ancestor in their common block) and drops read-read pairs,
+// which never conflict. This also catches same-iteration conflicts between
+// different subscripts that can alias (e.g. `A[i][j]` vs `A[j][i]` on the
+// diagonal, or `A[2*i]` vs `A[i]` at i == 0). Aliasing between distinct
+// memrefs is not modeled; distinct SSA memrefs are assumed disjoint.
 //
 // A pair with either endpoint the test cannot model (`nonPolyhedral`) is
 // skipped entirely and left to the conservative path, so each pair is owned
-// by exactly one analysis: an `assume.nodep` hint, which prunes only
-// conservative edges, retires all of a pair's edges or none.
+// by exactly one analysis.
 static void
 checkMemrefDependence(ArrayRef<Operation *> memoryOps,
                       const llvm::SmallDenseSet<Operation *> &nonPolyhedral,
@@ -245,10 +243,9 @@ enum class FifoAlias { Same, Distinct, Unknown };
 // Whether result `k` of `m` is a function of an enclosing loop IV. The
 // builder classifies loop IVs as affine DIMS and loop-invariant values
 // (function args, worker-ids) as SYMBOLS, so "uses a dim" is exactly "varies
-// across loop iterations". A constant inter-access offset on such a
-// coordinate means the two accesses sweep OVERLAPPING FIFO-index ranges over
-// the iteration space, so they may alias cross-iteration (a fixed offset on a
-// spatial/worker-id index does not: those select genuinely distinct FIFOs).
+// across loop iterations", which is what a constant inter-access offset on
+// that coordinate needs to mean the two accesses sweep overlapping FIFO-index
+// ranges (a fixed offset on a worker-id index instead selects a distinct FIFO).
 static bool coordDependsOnIV(const affine::AffineValueMap &m, unsigned k) {
   bool usesDim = false;
   m.getAffineMap().getResult(k).walk([&](AffineExpr e) {
@@ -316,27 +313,17 @@ streamDepComponents(Operation *op, int64_t distance) {
   return comps;
 }
 
-// Streams are FIFOs: every pair of accesses to the same FIFO must preserve
-// program and iteration order regardless of direction (unlike memory, get-get
-// is ordered; there is no RAW/WAR/WAW distinction). Each may-aliasing pair is
-// serialized with a distance-0 intra-iteration edge plus a distance-1
-// loop-carried back edge, closing the recurrence that bounds II. With
-// latency-1 stream operators the back edge yields exactly the FIFO
-// issue-order bound (II >= 1 + (t_later - t_earlier)): precise, not
-// conservative.
+// Streams are FIFOs: every pair of accesses to the same channel must preserve
+// program and iteration order regardless of direction (get-get is ordered
+// too, unlike memory's RAW/WAR/WAW). Each may-aliasing pair gets a distance-0
+// intra-iteration edge plus a distance-1 loop-carried back edge, closing the
+// recurrence that bounds II exactly at the FIFO issue-order bound (II >= 1 +
+// (t_later - t_earlier)), not merely conservatively.
 //
-// This edge pair also makes several accesses to one channel emittable: it
-// forces distinct start cycles, spanning less than one II, in program order,
-// exactly the disjointness the emitter needs to time-multiplex the channel's
-// single {data,valid,ready} port across them, so the k-access case needs no
-// stream-port resource. The edges are strictly stronger than a port limit,
-// which would bound concurrency but not order.
-//
-// All-pairs serialization is deliberate: within a mutually-aliasing group the
-// extra edges are implied by transitivity (a chain would suffice) and leave
-// the SDC optimum unchanged, while per-pair `Distinct` pruning keeps
-// provably-separate FIFOs independent. A plain program-order chain could not,
-// since FIFO may-aliasing is non-transitive.
+// All pairs are serialized rather than chaining program order, because FIFO
+// may-aliasing is non-transitive: a chain would under-constrain a
+// mutually-aliasing group, while per-pair `Distinct` pruning still keeps
+// provably-separate FIFOs independent.
 static void checkStreamDependence(SmallVectorImpl<Operation *> &streamOps,
                                   AffineValueMapBuilder &builder,
                                   MemoryDependenceResult &results) {
@@ -387,15 +374,9 @@ static void checkStreamDependence(SmallVectorImpl<Operation *> &streamOps,
 // skipping every other loop form, so an affine access under an
 // scf.for/scf.while is outside the test's domain even though `MemRefAccess`
 // accepts it: the depth ladder never names that loop, so a dependence it
-// carries is never queried and the pair is reported loop-independent. Left to
-// the polyhedral path, a memory-carried accumulate in a dynamic-trip loop
-// (`for j in range(n): out[i] += ...`) would lose its recurrence and
-// pipeline at II = 1, so such accesses go to the conservative path with the
-// non-affine ones.
-//
-// This costs no precision on the subscripts themselves: an scf.for IV is
-// neither a valid affine dim nor a valid symbol, so an access whose loop nest
-// is not all-affine cannot have used those IVs in its subscripts anyway.
+// carries is never queried and the pair is reported loop-independent, losing
+// a memory-carried recurrence (e.g. `for j in range(n): out[i] += ...`).
+// Such accesses go to the conservative path with the non-affine ones.
 static bool inAffineNest(Operation *op) {
   for (Operation *p = op->getParentOp(); p; p = p->getParentOp())
     if (isa<LoopLikeOpInterface>(p) && !isa<affine::AffineForOp>(p))
@@ -425,14 +406,12 @@ memDepComponents(Operation *op, int64_t distance) {
 // Conservative memory dependences for pairs the polyhedral test cannot model
 // (`nonPolyhedral`: a plain memref.load/store, e.g. indirect A[idx[i]],
 // histogram/scatter, or scf-lowered tiles; or an affine access whose loop
-// nest is not all-affine; see inAffineNest). Following Vitis's "assumed
-// dependent unless proven disjoint" rule, any two accesses to the same array
-// with at least one write are serialized in program order (a distance-0
-// forward edge), plus a distance-1 loop-carried back edge when they share an
-// innermost loop (closing the recurrence that bounds II). Read-read pairs
-// commute and are left independent. This is the correctness backstop against
-// silent reordering; an `allo.assume.nodep` hint can prune a proven-false
-// edge to recover II.
+// nest is not all-affine; see inAffineNest). Any two accesses to the same
+// array with at least one write are serialized in program order (a
+// distance-0 forward edge), plus a distance-1 loop-carried back edge when
+// they share an innermost loop (closing the recurrence that bounds II).
+// Read-read pairs commute and are left independent. An `allo.assume.nodep`
+// hint can prune a proven-false edge to recover II.
 static void checkConservativeDependence(
     ArrayRef<Operation *> accessOps,
     const llvm::SmallDenseSet<Operation *> &nonPolyhedral,

@@ -80,9 +80,9 @@ static bool isPureCombCondition(ScheduleModel &model, Value v) {
                       [&](Value o) { return isPureCombCondition(model, o); });
 }
 
-// Schedule \p v's defining arith op (and its operands) at start 0. The tree is
-// known pure (isPureCombCondition), so every non-constant op is a liftable
-// arith op; the already-scheduled guard just dedups a shared subtree.
+// Schedule \p v's defining arith op (and its operands) at start 0.
+// Precondition: isPureCombCondition(v). The already-scheduled guard dedups a
+// shared subtree.
 static void tagConditionStartZero(ScheduleModel &model, Value v) {
   Operation *def = v.getDefiningOp();
   if (!def || isa<arith::ConstantOp>(def) ||
@@ -94,13 +94,10 @@ static void tagConditionStartZero(ScheduleModel &model, Value v) {
 }
 
 // Lift the predicate or continue-condition \p cond into start-0 `dcp.compute`s
-// (via `convertOp`), so it becomes a combinational unit the datapath `src`
-// resolves rather than a raw arith tree the emitter re-interprets. Only a
-// *pure* comb tree is lifted: a straight-line leaf while (already solved as one
-// cyclic problem) keeps its real starts, and a memory- or IP-dependent
-// condition stays raw for a clean reject. Only the two unscheduled pure shapes
-// become first-class Sources: an affine.if guard predicate over the counter,
-// and a sequential-wrapper while condition over the iter-args.
+// so it becomes a combinational Source rather than a raw arith tree, if it is
+// pure (an affine.if guard over the counter, or a sequential-wrapper while
+// condition over the iter-args). A memory- or IP-dependent condition, or an
+// already-scheduled leaf while's condition, is left as-is.
 static void scheduleConditionTree(ScheduleModel &model, Value cond) {
   if (isPureCombCondition(model, cond))
     tagConditionStartZero(model, cond);
@@ -165,16 +162,11 @@ static int64_t tagConditionCone(ScheduleModel &model, Value v,
 }
 
 // Schedule a while's continue-condition so it becomes a resolvable Source, by
-// ASAP-scheduling its cone (each op at the max of its operands' ready cycles).
-// A pure comb tree collapses to all-start-0 (every latency is 0, e.g. a
-// nested-loop or sequential-wrapper while over the iter-args). A memory- or
-// IP-dependent tree gets real per-op starts (a load or float op before the
-// compare) so the sequential CHECK/RUN controller can wait `t_cond` for it, and
-// a multi-latency cone (`a - b > tol`) then derives non-negative register
-// depths rather than the negative edge a flat start-0 tag would. An
-// unschedulable tree (a store, a call, a math IP with no library row) stays raw
-// for a clean reject; a flushing leaf while's in-body condition is already
-// scheduled and passes through unchanged.
+// ASAP-scheduling its cone (conditionReadyCycle / tagConditionCone). A memory-
+// or IP-dependent cone (`a - b > tol`) gets real per-op starts so the
+// sequential CHECK/RUN controller can wait for it and the datapath derives
+// non-negative register depths; an unschedulable cone stays raw for a clean
+// reject.
 static void scheduleWhileCondition(ScheduleModel &model, Value cond,
                                    const OperatorLibrary &lib) {
   if (conditionReadyCycle(model, cond, lib))
@@ -303,8 +295,6 @@ static void convertOp(Operation &op, OpBuilder &b, IRMapping &map,
     OperatorChar c = lib.lookup(&op);
     CombOpKindEnumAttr combKind;
     FlatSymbolRefAttr opType;
-    // The realization discriminant is whether an IP row matched (a non-empty
-    // symbol); otherwise the op is combinational and lowers via its CombOpKind.
     if (c.symbol.empty()) {
       std::optional<CombOpKindEnum> ck = combKindOf(&op);
       assert(ck && "combinational compute op with no CombOpKind lowering");
@@ -315,7 +305,6 @@ static void convertOp(Operation &op, OpBuilder &b, IRMapping &map,
     auto nw = DCPathComputeOp::create(
         b, loc, op.getResult(0).getType(), remap(op.getOperands()), combKind,
         opType, b.getI64IntegerAttr(start), FlatSymbolRefAttr());
-    // Carry the source op's attributes
     for (NamedAttribute attr : op.getAttrs())
       nw->setAttr(attr.getName(), attr.getValue());
     setZ(nw);
@@ -464,16 +453,13 @@ static Value dynamicTripBound(LoopLikeOpInterface loop) {
   return scfLoop ? scfLoop.getUpperBound() : Value();
 }
 
-// Materialize an affine.for bound as an `index` value at `b`'s insertion point
-// (before the loop), reading the enclosing IVs: the max of the lower-bound
-// map's results, the min of the upper-bound map's. An identity map yields the
-// enclosing IV directly with no op, resolving as that loop's Source::Counter
-// once the enclosing loop is reified. A non-trivial expression synthesizes
-// arith ops tagged `start=0`, so `convertOp` lifts them to combinational
-// `dcp.compute` units, also resolvable bound Sources with their IV reads
-// remapped to the enclosing counter. This is the affine counterpart of an
-// scf.for's runtime bound operand, for a symbolic (IV-relative) triangular or
-// tile bound (`for j in range(i+1, n)`).
+// Materialize an affine.for bound as an `index` value at `b`'s insertion
+// point (before the loop): the max of the lower-bound map's results, the min
+// of the upper-bound map's. A non-trivial expression synthesizes arith ops
+// tagged `start=0` so `convertOp` lifts them to combinational `dcp.compute`
+// Sources; this is the affine counterpart of an scf.for's runtime bound
+// operand, for a symbolic (IV-relative) triangular or tile bound (`for j in
+// range(i+1, n)`).
 static Value materializeAffineBound(OpBuilder &b, ScheduleModel &model,
                                     Location loc, AffineForOp af,
                                     bool isLower) {
@@ -516,12 +502,11 @@ static Block *createCounterBlock(OpBuilder &b, DCPathPipelineOp pipe,
 
 // Rewrite an `scf.while` into a while `dcp.pipeline`: `trip` unset, terminated
 // by `dcp.condition` carrying the condition value plus the loop-carried
-// next-values. A straight-line while flushing-pipelines with `ii` from its own
-// solve; a nested-loop while runs sequentially (it owns no solve, which leaves
-// `ii` unset), its after-block already materialized so its dcp children clone
-// in verbatim. Both the before-arg and after-arg of a slot map to the same
-// iter-arg (identity forwarding is required); the counter block-arg is a
-// free-running index.
+// next-values. A straight-line while flushing-pipelines with `ii` from its
+// own solve; a nested-loop while runs sequentially (`ii` unset), its
+// after-block already materialized so its dcp children clone in verbatim.
+// Requires identity forwarding: both the before-arg and after-arg of a slot
+// map to the same iter-arg.
 static void materializeWhilePipeline(const RegionAttrs &r, scf::WhileOp w,
                                      ScheduleModel &model,
                                      const OperatorLibrary &lib) {
@@ -738,19 +723,13 @@ static bool isCalled(DCPathModuleOp mod) {
 }
 
 // Hold the scheduler's `allo.sched.latency` to the span the reify just built.
-//
-// The two are computations of ONE quantity, the kernel's whole span, off
-// different inputs (solved regions against materialized ones), and they are not
-// required to AGREE. The `dcp.module`'s own is the exact one: it becomes the
-// emitter's `staticLatency`, an offset a time-triggered consumer fires at. The
-// scheduler's is what PLACES a caller's consumers, and may be a loose upper
-// bound: a consumer placed late is slow, one placed early reads a callee that
-// has not written yet.
-//
-// So the invariant is one-sided, and an UNDERCOUNT is the miscompile. Checked
-// only where the number is READ, which is at a CALL: a top-level kernel's own
-// `allo.sched.latency` reaches nobody, and a callee is reified before its
-// callers, so their `func.call`s are still here to see.
+// The two need not agree: the `dcp.module`'s own becomes the emitter's exact
+// `staticLatency`, while the scheduler's number only PLACES a caller's
+// consumers and may be a loose upper bound. So the invariant is one-sided:
+// an UNDERCOUNT (scheduler < reify) is the miscompile, since a consumer
+// placed against it would sample before the callee writes. Checked only at a
+// CALL, since a callee is reified before its callers and their `func.call`s
+// are still here to see.
 static void checkLatencyBound(DCPathModuleOp mod, std::optional<int64_t> dcpLat,
                               bool concurrent) {
   auto sched = mod->getAttrOfType<IntegerAttr>(kLatencyAttr);
@@ -780,32 +759,20 @@ static void checkLatencyBound(DCPathModuleOp mod, std::optional<int64_t> dcpLat,
                             "callee would sample before it writes";
 }
 
-// Stamp `latency` and `determinacy` on every reified region, then the
-// whole-kernel contract on the `dcp.module` itself.
+// Stamp `latency` and `determinacy` on every reified region (from
+// `dcpRegionTiming`, the report), then the whole-kernel contract on the
+// `dcp.module` itself.
 //
-// The per-region stamp is a REPORT. Both values come from `dcpRegionTiming`,
-// the same function the emitter derives them with, and nothing in the compiler
-// reads them back. A region whose span does not compose keeps whatever
-// `latency` construction gave it, which for an assume-bounded trip is the only
-// place that bound survives (`latency_bound` marks it).
+// The kernel's span composes the top-level regions over their dependence
+// DAG: independent siblings overlap (both start at the kernel's own
+// `start`), so the span is the longest path through them, not the sum.
 //
-// The kernel's span is the top-level regions composed over their DEPENDENCE
-// DAG: `composeSiblings` starts a region with no predecessors on the kernel's
-// own `start`, so independent siblings overlap and the span is the longest path
-// through them rather than the sum. An instance is charged where it SITS, by
-// the region holding it, never by a second number taken over the callsites,
-// which would count a child once whatever its enclosing trip.
-//
-// A container publishes a span only when BOTH questions are settled: `allKnown`
-// asks whether every child publishes a start->done contract at all, `known`
-// whether every top-level region has a static span to place those children
-// within. A kernel whose calls sit inside a `while` or an unpredicated `if` has
-// the first and not the second, and answering off the children alone gives a
-// number about them rather than about the kernel.
-//
-// Every child is a `dcp.instance` carrying its own `start` and `latency`,
-// whichever way its container composes; what makes a container CONCURRENT is
-// asked of the invokes directly via `spawnsConcurrently`.
+// A container publishes a span only when BOTH `allKnown` (every child
+// publishes a start->done contract) and `known` (every top-level region has
+// a static span to place those children within) hold; a kernel whose calls
+// sit inside a `while` or an unpredicated `if` fails the second. What makes a
+// container CONCURRENT is asked of its invokes directly via
+// `spawnsConcurrently`.
 static void setDcpLatencies(DCPathModuleOp mod) {
   mod.walk([&](DCPathRegionOpInterface region) {
     RegionTiming t = dcpRegionTiming(region);
@@ -1194,17 +1161,13 @@ static void loadDependentDialects(MLIRContext &ctx) {
 }
 
 // Post-order over the call graph: every callee is reified before the caller
-// that composes against it.
-//
-// `calleeStaticLatency` answers from a `dcp.module`'s own field, the span this
-// reify composes, and falls back to the scheduler's `allo.sched.latency` on a
-// `func.func`. The two do not agree, so the order is what makes the reified
-// number authoritative rather than whichever the caller happened to reach.
-// `makeInvoke` asserts the order rather than trusting it.
+// that composes against it, so `makeInvoke` reads the callee's exact
+// `dcp.module` latency rather than the scheduler's provisional one.
 //
 // `done` keys on the ADDRESS of a func it has closed into a `dcp.module`, and
-// so never dereferences one: only the funcs collected before any conversion are
-// ever looked up, and those were all live at once, so no two share an address.
+// so never dereferences one: only the funcs collected before any conversion
+// are ever looked up, and those were all live at once, so no two share an
+// address.
 static void reifyCalleesFirst(func::FuncOp func, ScheduleModel &model,
                               const OperatorLibrary &lib,
                               llvm::DenseSet<Operation *> &done) {

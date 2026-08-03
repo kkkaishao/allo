@@ -31,10 +31,8 @@ ProblemT buildCyclicProblem(LoopLikeOpInterface loop, DependenceAnalysis &deps);
 /// iter_arg-to-iter_arg shifts. `{nullptr, 0}` for a pure shift cycle
 /// (loop-invariant, so no recurrence) or a value defined outside the loop.
 ///
-/// Exported because two things read it: the inter-iteration dependence edges
-/// `buildCyclicProblem` inserts, and the delay-register terms the exact
-/// scheduler prices a loop-carried read at. A second copy of this walk would
-/// let the two disagree about which reads are recurrences.
+/// Shared by `buildCyclicProblem`'s dependence edges and the exact
+/// scheduler's delay-register pricing of loop-carried reads.
 std::pair<Operation *, unsigned> iterArgSource(Block *body, Operation *yield,
                                                unsigned iterArg);
 
@@ -43,14 +41,13 @@ std::pair<Operation *, unsigned> iterArgSource(Block *body, Operation *yield,
 /// aligning inits/before-args/after-args/yield/results by one slot index.
 bool whileHasIdentityForwarding(scf::WhileOp w);
 
-/// Whether an `scf.while`'s continue-condition is combinational, i.e. settled
+/// Whether an `scf.while`'s continue-condition is combinational, i.e. settles
 /// the cycle the loop issues, so the while can flushing-pipeline. False when
 /// the condition cone (the before region, which under identity forwarding only
 /// computes the condition) holds a multi-cycle op per \p lib: a memory read
 /// (`while (A[i] != key)`) or a latency IP (a float compare, `while (r >
 /// tol)`). A non-combinational condition routes to the sequential CHECK/RUN
-/// controller, which waits for the condition to settle. The scheduler and the
-/// reifier share this one predicate, so they route in lockstep.
+/// controller instead, which waits for the condition to settle.
 bool conditionIsCombinational(scf::WhileOp w, const OperatorLibrary &lib);
 
 /// Whether \p w takes the flushing-pipeline schedule rather than decomposing
@@ -58,8 +55,7 @@ bool conditionIsCombinational(scf::WhileOp w, const OperatorLibrary &lib);
 /// per-iteration length is data-dependent, so the inner ops cannot flatten into
 /// one issue cadence), its condition is combinational, and its body holds no
 /// sub-kernel call (no re-fired child instance can follow a one-cycle issue).
-/// Only a while on this path must forward its loop-carried values 1:1, so the
-/// scheduler and the pre-scheduling verifier route on this one predicate.
+/// Only a while on this path must forward its loop-carried values 1:1.
 bool whileFlushingPipelines(scf::WhileOp w, const OperatorLibrary &lib);
 
 /// Build a cyclic scheduling problem for an uncounted `scf.while` (its before +
@@ -72,12 +68,11 @@ template <class ProblemT>
 ProblemT buildWhileProblem(scf::WhileOp w, DependenceAnalysis &deps);
 
 /// Build an acyclic scheduling problem for a straight-line region (the
-/// top-level
-/// \p ops of a maximal non-loop run). Registers the ops with their intra-span
-/// memory/stream dependences (no inter-iteration distance) and makes the last
-/// program-order op the unique sink (so minimizing it schedules the span ASAP).
-/// SSA def-use is modeled implicitly. The pass instantiates \p ProblemT for
-/// `ChainingSharedOperatorsProblem`.
+/// top-level \p ops of a maximal non-loop run). Registers the ops with their
+/// intra-span memory/stream dependences (no inter-iteration distance) and
+/// makes the last program-order op the unique sink (so minimizing it
+/// schedules the span ASAP). SSA def-use is modeled implicitly. The pass
+/// instantiates \p ProblemT for `ChainingSharedOperatorsProblem`.
 template <class ProblemT>
 ProblemT buildAcyclicProblem(ArrayRef<Operation *> ops,
                              DependenceAnalysis &deps);

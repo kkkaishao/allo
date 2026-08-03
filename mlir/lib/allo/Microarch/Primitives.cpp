@@ -276,10 +276,10 @@ ShiftChain EmitContext::shiftChain(Value in, unsigned depth,
   return chain;
 }
 
-// Above this many cycles a counter is the cheaper cell: it costs log2(n)
-// registers plus a comparator against the n a chain spends outright. Set well
-// clear of the ordinary pipeline-stage delays so the shape of a small chain,
-// which several structural tests read, is left alone.
+// Above this many cycles a counter (log2(n) registers + a comparator) is
+// cheaper than a chain (n registers). Set well clear of ordinary pipeline-stage
+// delays so the shape of a small chain, which structural tests read, is left
+// alone.
 static constexpr unsigned kCountedDelayCycles = 64;
 
 Value EmitContext::delayPulseCounted(Value pulse, unsigned n,
@@ -287,10 +287,9 @@ Value EmitContext::delayPulseCounted(Value pulse, unsigned n,
   assert(regionSinglePass && "a counted delay drops every pulse but the first, "
                              "so it needs a region that issues one pass");
   assert(n >= 1 && "a zero-cycle delay is the signal itself");
-  // `pulse` arms the counter at 0; it counts every cycle the region advances
-  // and fires as it reaches n-1, so the output rises exactly n cycles after the
-  // input, the same contract a chain tap carries. Under an elastic shell it
-  // counts only while enabled, so it freezes with the chain it replaces.
+  // `pulse` arms the counter at 0; it counts every advancing cycle and fires
+  // at n-1, so the output rises exactly n cycles after the input (a chain
+  // tap's contract). Under an elastic shell it counts only while enabled.
   Backedge armedNext = bb.get(i1);
   Backedge countNext = bb.get(i32);
   Value armed =

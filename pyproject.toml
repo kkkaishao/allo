@@ -2,48 +2,37 @@
 # SPDX-License-Identifier: Apache-2.0
 
 [build-system]
-requires = [
-    "nanobind>=2.10",
-    "scikit-build-core>=0.10",
-    "setuptools_scm>=8",
-]
+requires = ["nanobind>=2.10", "scikit-build-core>=0.10", "setuptools_scm>=8"]
 build-backend = "scikit_build_core.build"
 
 [project]
 name = "allo"
 dynamic = ["version"]
-dependencies = [
-    "rich",
-    "sympy",
-    "numpy",
-    "ml_dtypes"
-]
+dependencies = ["rich", "sympy", "numpy", "ml_dtypes"]
 requires-python = ">=3.12"
-authors = [
-    {name = "Allo Authors"}
-]
+authors = [{ name = "Allo Authors" }]
 description = "Allo: Accelerator Design and Programming Language"
-readme = {file = "README.md", content-type = "text/markdown"}
+readme = { file = "README.md", content-type = "text/markdown" }
 license = "Apache-2.0"
 license-files = ["LICENSE"]
 keywords = ["compiler", "hls", "fpga", "accelerator"]
 classifiers = [
-    "Programming Language :: Python :: 3",
-    "Topic :: Scientific/Engineering",
-    "Topic :: System :: Hardware",
-    "Operating System :: OS Independent"
+  "Programming Language :: Python :: 3",
+  "Topic :: Scientific/Engineering",
+  "Topic :: System :: Hardware",
+  "Operating System :: OS Independent",
 ]
 
 [project.optional-dependencies]
 dev = [
-    "nanobind",
-    "pytest",
-    "pytest-xdist",
-    "cocotb",
-    "sccache",
-    "clang-format",
-    "black==24.8.0",
-    "pylint==3.0.2",
+  "nanobind",
+  "pytest",
+  "pytest-xdist",
+  "cocotb",
+  "sccache",
+  "clang-format",
+  "black==24.8.0",
+  "pylint==3.0.2",
 ]
 
 [tool.scikit-build]
@@ -72,6 +61,7 @@ CMAKE_CXX_VISIBILITY_PRESET = "hidden"
 Python_FIND_VIRTUALENV = "ONLY"
 Python3_FIND_VIRTUALENV = "ONLY"
 LLVM_ENABLE_ZSTD = "OFF"
+LLVM_USE_LINKER = "lld"
 
 [[tool.scikit-build.overrides]]
 if.env.ALLO_ENABLE_ORTOOLS = true

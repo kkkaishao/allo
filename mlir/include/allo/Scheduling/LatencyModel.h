@@ -23,10 +23,8 @@ namespace mlir::allo {
 /// The cycles a controller family spends at its region's BOUNDARIES, outside
 /// the region's own schedule.
 ///
-/// These are decisions about where registers sit, written here and read by the
-/// controller, so that moving a register moves the composed span with it. Only
-/// STRUCTURAL constants live here; a datapath-derived delay (a condition cone's
-/// `tCond`, a region's `drainStage`) flows in as a parameter.
+/// Only STRUCTURAL constants live here; a datapath-derived delay (a condition
+/// cone's `tCond`, a region's `drainStage`) is passed in as a parameter.
 struct BoundaryCost {
   /// `start` -> the first body pass issues.
   unsigned arm;
@@ -79,18 +77,14 @@ inline constexpr BoundaryCost kPipelinedBoundary{/*arm=*/1, /*reArm=*/1};
 /// `start && isEmpty` feeds the `done` latch. Two cycles, whichever family
 /// drives the region.
 ///
-/// A separate constant because it is a separate CONTROLLER PATH, not this
-/// arithmetic at trip zero: both expressions below describe the steady state
-/// and are written for `trip >= 1`.
+/// A separate constant, not the arithmetic below at trip zero: both
+/// expressions describe the steady state and are written for `trip >= 1`.
 inline constexpr int64_t kEmptyRegionCycles = 2;
 
 /// A done-paced region's whole span, given what one pass of its body costs
-/// (\p bodySpan, the sum of its children's spans).
-///
-/// The one expression both composers evaluate: the scheduler over the loop nest
-/// while it still has affine loops, the reifier over the dcp regions built from
-/// those same loops. The last pass pays the completion latch instead of a
-/// re-arm, which is why the two are written separately.
+/// (\p bodySpan, the sum of its children's spans). Evaluated identically by
+/// the scheduler (over affine/scf loops) and the reifier (over the dcp
+/// regions built from them).
 inline int64_t containerSpan(const BoundaryCost &boundary, int64_t trip,
                              int64_t bodySpan) {
   if (trip == 0)
@@ -114,14 +108,9 @@ inline int64_t leafSpan(const BoundaryCost &boundary, int64_t trip, int64_t ii,
 }
 
 /// One region as the latency model sees it: enough to compose a span, and
-/// nothing else.
-///
-/// TWO structural walks build these, the scheduler's off affine/scf loops and
-/// the reifier's off the dcp regions built from those same loops, and both then
-/// call the SAME arithmetic above. A walk that holds no arithmetic is checkable
-/// by reading it, and arithmetic with one definition cannot drift between the
-/// phase that PLACES a consumer against a span and the phase that BUILDS the
-/// hardware realizing it.
+/// nothing else. Built by two structural walks (the scheduler over affine/scf
+/// loops, the reifier over the dcp regions built from them) that both feed
+/// the same composition arithmetic above.
 struct SpanNode {
   RegionShape shape = RegionShape::Leaf;
   /// Iterations of this region's body. Empty when data-dependent (a `while`, a
@@ -139,12 +128,11 @@ struct SpanNode {
   /// An INSTANCE element's whole start->done contract (see `instance`).
   std::optional<int64_t> contract;
   /// A worst case the SCHEDULER bounded from an `allo.assume.ssa` range, for a
-  /// node whose own `trip` is data-dependent. It stands in for a span this node
+  /// node whose own `trip` is data-dependent. Stands in for a span this node
   /// cannot compose, and only where a bound is a usable answer: exported as a
   /// kernel's own `latency` (flagged `latency_bound`, so a caller waits it
   /// out), never as a container's body pass, which has to pace a real counter.
-  ///
-  /// It exists because reification keeps the bounded LATENCY but drops the
+  /// Carried here because reification keeps the bounded LATENCY but drops the
   /// assumed TRIP that produced it, so this side cannot re-derive it.
   std::optional<int64_t> assumedSpan;
   /// A straight-line span rather than a counted loop.
@@ -267,7 +255,7 @@ struct RegionTiming {
 /// emitter calls it to DECIDE a controller family. Those attributes are
 /// therefore a report of this function, never an input to it.
 ///
-/// Four classes, tested in order, because each shadows the ones after it.
+/// Four classes, tested in order since each shadows the ones after it.
 /// CONCURRENT children run to their own completion ordered by back-pressure, so
 /// a span over them is a floor rather than a hand-off contract. CONDITIONAL
 /// control decides when it ends, so no static span describes it. COUNTED_STATIC

@@ -19,30 +19,20 @@
 namespace mlir::allo {
 
 /// A resource-constrained problem whose shared instances need not be fully
-/// pipelined. CIRCT's `SharedOperatorsProblem` assumes they are: a limited
-/// operation holds its unit for exactly the cycle it issues in, so the only
-/// resource fact the problem carries is a per-type limit. Real operators break
-/// that assumption. A synchronous sub-kernel call holds its child instance
-/// until the child is done, so a loop re-firing one cannot issue faster than
-/// the callee runs (`populateCallOccupancy`, the one producer today). Two such
-/// operations may not overlap on one unit even though they start in different
-/// cycles.
-///
-/// This problem carries that occupancy window per operation, so everything the
-/// resource model knows lives in the problem: nothing is stashed on the IR, and
-/// `verifyOccupancy` sees the whole reservation rather than only its first
-/// cycle.
+/// pipelined: unlike CIRCT's `SharedOperatorsProblem` (a per-type limit only,
+/// assuming an op holds its unit for exactly its issue cycle), this problem
+/// carries a per-operation occupancy window, so a synchronous call that holds
+/// its callee's instance until the callee is done can be modeled
+/// (`populateCallOccupancy`).
 ///
 /// An operation may hold several units at once (a memory port and a shared
-/// functional unit, say). It takes them all at its start time and holds each
-/// for the same window, so a cycle is feasible for it only where every one of
-/// them has room. `setLinkedResourceTypes` states an operation's complete unit
-/// list; the schedulers reserve all or none of it.
+/// functional unit, say); `setLinkedResourceTypes` states its complete unit
+/// list, and a cycle is feasible for it only where every unit in that list has
+/// room across the whole window.
 ///
-/// It also drops CIRCT's rule that a limited operation must have a non-zero
-/// latency. A combinational access still occupies its port for the cycle it
-/// issues in and contends like any other; rejecting it would force the port
-/// model to leave those accesses unconstrained.
+/// A limited operation may also have zero latency here (CIRCT requires
+/// non-zero): a combinational access still occupies its port for the cycle it
+/// issues in and contends like any other.
 class OccupancyProblem
     : public virtual circt::scheduling::SharedOperatorsProblem {
 public:
@@ -146,24 +136,11 @@ public:
 /// weigh one cycle more than a plain dependence. Schedule-independent, so a
 /// caller may run it before or after solving.
 ///
-/// A fork of CIRCT's `computeChainBreakingDependences`, which drops chains on
-/// the floor in two ways and so leaves a too-long path unbroken. Both are
-/// silent: `ChainingProblem` does not carry the period, so nothing downstream
-/// can test the result, and a schedule that misses it is wrong only in silicon.
-///
-///   * WHEN an operation counts as handled. Upstream marks it on entry
-///     (`chains[op][op] = 0`), which is also the test its successors apply, so
-///     an operation reached before one of its predecessors both defers itself
-///     AND advertises a half-built chain map, and the successor inherits none
-///     of the chains above it. The worklist is `Problem::getOperations()`,
-///     which is INSERTION-ordered rather than topological (`insertDependence`
-///     adds an endpoint that was not already there), so this is reachable, and
-///     two benchmark variants reach it. Here an operation is marked only once
-///     its map is complete.
-///   * The chain a REGISTERED predecessor carries. Upstream assigns its
-///     outgoing delay, but that predecessor may also be the origin of a longer
-///     chain arriving by another route, and then whichever route the operands
-///     are visited in last wins. Here the two are maxed.
+/// Visits operations in topological order (`Problem::getOperations()` is only
+/// insertion-ordered) and marks one "handled" (`chains[op][op] = 0`) only once
+/// every predecessor's chain map is complete, so a successor never inherits a
+/// half-built map. A registered predecessor's outgoing chain is maxed against
+/// any longer chain reaching the same origin through another route.
 LogicalResult computeChainBreaks(
     circt::scheduling::ChainingProblem &prob, float cycleTime,
     SmallVectorImpl<circt::scheduling::Problem::Dependence> &result);
@@ -190,15 +167,13 @@ LogicalResult scheduleSimplex(circt::scheduling::ChainingCyclicProblem &prob,
                               Operation *lastOp, float cycleTime);
 /// What the SDC heuristic contributes to a solve that is not its own: the II
 /// bound it settles before placing anything, and whether its greedy placement
-/// then reached a schedule worth hinting from and falling back to.
+/// reached a schedule.
 ///
-/// Asking for one also makes a PLACEMENT failure advisory. The greedy leaves
-/// the problem unscheduled and `placed` stays false, but the call still
-/// succeeds, because the caller is going to place the region itself and the
-/// regions the greedy cannot place are exactly the ones an exact solver is for.
-/// A failure underneath it is not advisory and still fails the call: the
-/// resource-free LP is exact, so its infeasibility says no schedule exists at
-/// any II, which no solver can repair.
+/// Passing one also makes a PLACEMENT failure advisory: the call still
+/// succeeds with `placed == false`, since the caller will place the region
+/// itself. A failure in the resource-free LP below placement is not advisory
+/// and still fails the call, since that LP is exact: infeasible there means no
+/// schedule exists at any II.
 struct SimplexWarmStart {
   /// The largest II any bound justifies before resources are placed: the
   /// resource-min II, a loop-carried recurrence, and the pipeline directive's
@@ -323,26 +298,12 @@ inline bool usesExactScheduler(SchedulerKind kind) {
   return kind != SchedulerKind::Heuristic;
 }
 
-/// How much work ONE SOLVE may consume, in OR-Tools' DETERMINISTIC time units.
-/// A deterministic budget rather than a wall-clock one is what keeps a compile
-/// reproducible: the same problem consumes the same budget on any machine, so a
-/// schedule never depends on how loaded the host was. The unit is roughly a
-/// second of a single core on current hardware.
+/// How much work ONE SOLVE may consume, in OR-Tools' DETERMINISTIC time units
+/// (roughly one core-second on current hardware). Deterministic rather than
+/// wall-clock so a compile is reproducible across machines.
 ///
-/// Per SOLVE, so a cyclic region spends it again for every initiation interval
-/// its search probes. Bounding the REGION instead was tried and is worse: the
-/// probes are not equally valuable, and giving each one whatever is left of a
-/// region pool starves the later ones, which cost the bed's hardest region 110%
-/// of its register bits. What bounds a region is the branch and bound's own
-/// cut, which admits one or two probes on nearly every region.
-///
-/// The level is a policy and the bed's response curve is what sets it. More
-/// budget is monotone in quality, because the incumbent bound means extra
-/// search can only find a schedule that WINS, and superlinear in time. A flat
-/// number is also the right SHAPE despite the spread in region size: a budget
-/// is a limit rather than an allowance, and the small regions that are 86% of
-/// the bed finish two orders of magnitude under it, so scaling it by problem
-/// size changes nothing that a flat raise does not.
+/// Charged per solve, not per region: a cyclic region's search spends this
+/// budget again for every initiation interval it probes.
 inline constexpr double kDefaultSolveBudget = 30.0;
 
 /// What the caller asked the scheduler for.
