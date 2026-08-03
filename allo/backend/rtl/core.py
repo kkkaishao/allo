@@ -55,6 +55,7 @@ class RTL(Backend[P, R]):
         perfectize: bool = False,
         scalarize_threshold: int = 16,
         scheduler: str = "heuristic",
+        budget: float | None = None,
     ):
         """Build an RTL handle for one hardware configuration.
 
@@ -80,7 +81,11 @@ class RTL(Backend[P, R]):
                 registers rather than a memory (0 = off).
             scheduler: the solver that settles the resource half of each
                 scheduling problem. ``"heuristic"`` is the SDC simplex plus
-                greedy placement, ``"exact"`` CP-SAT (only with OR-Tools).
+                greedy placement, ``"exact"`` CP-SAT, and ``"exact-chaining"``
+                CP-SAT deciding the chain breaks too (both need OR-Tools).
+            budget: what one exact solve may spend, in the solver's
+                deterministic time units; None takes the default. Only the
+                largest regions ever reach it.
         """
         super().__init__(kernel)
         self._device = device if device is not None else builtin_device
@@ -97,6 +102,7 @@ class RTL(Backend[P, R]):
             "perfectize": perfectize,
             "scalarize_threshold": scalarize_threshold,
             "scheduler": scheduler,
+            "budget": budget,
         }
         self.arg_types = kernel.parse_argument_annotations()
         self.res_types = kernel.parse_return_annotation()

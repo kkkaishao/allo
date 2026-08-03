@@ -69,7 +69,11 @@ class RegionSchedule:
     ops: list[ScheduledOp] = field(default_factory=list)
     ii: int | None = None  # cyclic only; None for a dynamic-trip sequential wrapper
     trip: int | None = None  # constant trip count, when known
-    length: int | None = None  # single-iteration cycle span
+    length: int | None = None  # schedule depth: every op has completed by here
+    # Terminal cycle: the last issue pulse to the deepest output committing, so
+    # `done` rises a cycle later. What a span composes from, and not `length`,
+    # which may carry slack the solver left above the last commit.
+    drain: int | None = None
     latency: int | None = None  # region latency (cycles)
     latency_is_bound: bool = False  # latency is an upper bound, not exact
     conditional: bool = False  # while-pipeline (dcp.condition) or a guard
@@ -88,6 +92,7 @@ class RegionSchedule:
             ii=d.get("ii"),
             trip=d.get("trip"),
             length=d.get("length"),
+            drain=d.get("drain"),
             latency=d.get("latency"),
             latency_is_bound=d["latency_bound"],
             conditional=d["conditional"],
@@ -97,7 +102,7 @@ class RegionSchedule:
     @property
     def is_wrapper(self) -> bool:
         """A container region carrying no compute of its own (a residual outer
-        loop around leaf regions) -- a derived nesting node, not a scheduling
+        loop around leaf regions): a derived nesting node, not a scheduling
         decision."""
         return self.container and not self.ops
 
@@ -162,17 +167,53 @@ class FuncSchedule:
 
 
 @dataclass(frozen=True)
+class SolveReport:
+    """What one region's SOLVE cost: a measurement of the compiler, not a fact
+    about the hardware.
+
+    Deliberately not joined to a :class:`RegionSchedule`. A solve is keyed by the
+    affine loop that owned the problem, and the regions above are read off the
+    reified ``dcp`` ops, by which point that loop is gone. Both lists are in
+    program order per func, which is as much of a correspondence as holds."""
+
+    func: str
+    where: str  # source location, as the scheduler's own log names it
+    kind: str  # `cyclic` / `while` / `acyclic`
+    ops: int  # operations in the problem
+    limited_ops: int  # of those, holding at least one limited unit
+    ms: float  # wall time of the solve
+    ii: int | None = None  # what the solve decided; None for an acyclic span
+
+    @classmethod
+    def from_json(cls, d: dict) -> SolveReport:
+        return cls(
+            func=d["func"],
+            where=d["where"],
+            kind=d["kind"],
+            ops=d["ops"],
+            limited_ops=d["limited_ops"],
+            ms=d["ms"],
+            ii=d.get("ii"),
+        )
+
+
+@dataclass(frozen=True)
 class ScheduleResult:
     """The whole-module schedule result: the schedule of every kernel."""
 
     funcs: list[FuncSchedule] = field(default_factory=list)
+    #: per-region solve cost, in solve order (see :class:`SolveReport`).
+    solves: list[SolveReport] = field(default_factory=list)
 
     @classmethod
     def from_json(cls, text: str | dict) -> ScheduleResult:
         """Parse the JSON schedule result the scheduler returns, either as the
         raw string or as an already-decoded object."""
         d = json.loads(text) if isinstance(text, str) else text
-        return cls(funcs=[FuncSchedule.from_json(f) for f in d["funcs"]])
+        return cls(
+            funcs=[FuncSchedule.from_json(f) for f in d["funcs"]],
+            solves=[SolveReport.from_json(s) for s in d.get("solves", [])],
+        )
 
     def func(self, suffix: str) -> FuncSchedule:
         """The sub-function whose name ends with ``suffix`` (kernels compose by
@@ -211,6 +252,7 @@ def run_schedule(
     unroll_under_pipeline=True,
     scalarize_threshold=16,
     scheduler="heuristic",
+    budget=None,
 ) -> ScheduleResult:
     """Schedule ``top`` and return the :class:`ScheduleResult`; ``module`` is
     rewritten in place, left holding the ``allo.dcp.*`` ops the schedule reifies
@@ -232,8 +274,15 @@ def run_schedule(
             fewer elements, so they are kept in registers rather than a memory.
             Set to 0 to disable.
         scheduler: the solver that settles the resource half of each problem.
-            ``"heuristic"`` is the SDC simplex plus greedy placement;
-            ``"exact"`` is CP-SAT, available only in a build with OR-Tools.
+            ``"heuristic"`` is the SDC simplex plus greedy placement; ``"exact"``
+            is CP-SAT over the same problem, keeping the chain-breaking pre-pass;
+            ``"exact-chaining"`` additionally decides where to break a too-long
+            combinational chain in the solver. Both exact modes need OR-Tools.
+        budget: what ONE SOLVE may spend, in the solver's deterministic time
+            units (roughly a second of one core each); ``None`` takes the
+            default. Raising it buys a better placement on the few regions large
+            enough to exhaust it and costs nothing on the rest, which finish
+            orders of magnitude under it.
     """
     run_pipeline(module, RTL_PREPARE_PIPELINE)
     reassoc = (
@@ -249,15 +298,25 @@ def run_schedule(
     part = f"propagate-partition{{top={top}}}"
     scalarize = f"scalarize-memory{{max-elements={scalarize_threshold}}}"
     pipeline = (
-        f"builtin.module(canonicalize,cse,func.func(raise-counted-while,{loops},"
+        f"builtin.module(canonicalize,cse,func.func(raise-to-affine,cse,"
+        f"raise-counted-while,{loops},"
         f"canonicalize,fold-if-statements,cse,{scalarize},"
-        f"{reassoc},{rotate}),"
+        f"{reassoc},{rotate}),drop-trivial-func,"
         f"{part},func.func(assign-banks))"
     )
     run_pipeline(module, pipeline)
-    result = run_sdc_scheduling(module, top, cycle_time or 5.0, scheduler)
+    diagnostics: list[str] = []
+    handler = module.context.attach_diagnostic_handler(
+        lambda d: diagnostics.append(d.message) or True
+    )
+    try:
+        result = run_sdc_scheduling(
+            module, top, cycle_time or 5.0, scheduler, budget or 0.0
+        )
+    finally:
+        handler.detach()
     if result is None:
         raise RuntimeError(
-            f"Scheduling step failed for {top}. Please check the log for details."
+            "An error occurred during scheduling process:\n" + "\n".join(diagnostics)
         )
     return ScheduleResult.from_json(result)

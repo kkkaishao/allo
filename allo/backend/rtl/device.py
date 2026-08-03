@@ -349,6 +349,16 @@ def i2f_l3(a: i32) -> f32: ...
 
 
 @ip(
+    optype=OperatorType.INT_FLOAT_CAST,
+    latency=3,
+    in_delay_ns=0.5,
+    pipelined=True,
+    style="ce",
+)
+def f2i_l3(a: f32) -> i32: ...
+
+
+@ip(
     optype=OperatorType.FLOAT_CAST,
     latency=2,
     in_delay_ns=0.5,
@@ -394,6 +404,7 @@ builtin_device.add_operators(
     bfsub_l4,
     bfmul_l2,
     i2f_l3,
+    f2i_l3,
     fcvt_l2,
     bf2f_l2,
 )

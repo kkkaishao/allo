@@ -108,12 +108,7 @@ def test_runtime_vs_static_bounds():
     assert np.allclose(out_e, g, rtol=2e-3, atol=2e-3)
 
 
-def test_tiled_variable_trip():
-    """bbgemm's tile bounds (`i_max = min(i+S, M)`) make the inner loops
-    runtime-bounded scf.for whose LOWER bound is the enclosing tile IV -- a nest of
-    variable-trip container regions. Each inner region's counter inits from that
-    outer counter and terminates on the runtime `i_max`. The accumulate is integer,
-    so the result matches A @ B exactly."""
+def test_tiled_trip():
     M, N, K, S = 8, 8, 8, 4
 
     @kernel
@@ -137,7 +132,7 @@ def test_tiled_variable_trip():
 
     rtl = _to_rtl(bbgemm)
     res = rtl.schedule()
-    assert res.func("bbgemm").latency is None  # runtime tile bounds
+    assert res.func("bbgemm").latency is not None  # should be raised to affine
     assert any(r.has("muli") for r in res.cyclic())  # the matmul pipelines
 
     rng = np.random.default_rng(0)

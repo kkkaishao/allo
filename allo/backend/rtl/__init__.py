@@ -18,6 +18,7 @@ from .schedule import (
     FuncSchedule,
     RegionSchedule,
     ScheduledOp,
+    SolveReport,
     RegionKind,
     has_exact_scheduler,
 )
@@ -41,6 +42,7 @@ __all__ = [
     "FuncSchedule",
     "RegionSchedule",
     "ScheduledOp",
+    "SolveReport",
     "RegionKind",
     "has_exact_scheduler",
     "RTL",

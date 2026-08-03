@@ -20,9 +20,10 @@
   use `docker/run-vitis.sh <command>` to run commands in a docker container.
 
 # Code style
-- Make small, targeted diffs rather than large refactors, and always be concise
+- Make small, targeted diffs rather than large refactors, and always be concise.
 - If user explicitly requests a refactor, then larger diffs are acceptable,
   prefer cleaner code structure for future maintainability at this time.
+- Don't abuse comments to explain code. Write concise comments to explain the core logic.
 - Use Modern C++ features and best practices in C++ code
 - Use `assert` to enforce invariants and assumptions that should always hold by the design,
   and fail loudly during development instead of being silently tolerated.

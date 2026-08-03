@@ -872,7 +872,7 @@ def test_nussinov_triangular_dp():
     rtl = _to_rtl(nussinov)
     res = rtl.schedule()
     assert res.func("nussinov").latency is None  # data-dependent trips
-    loop = res.cyclic()[0]
+    loop = next(r for r in res.cyclic() if r.is_leaf)
     assert loop.ii > 1  # memory-carried max recurrence into table[i, j]
     assert loop.has("select")  # boundary/compare guards if-converted
 

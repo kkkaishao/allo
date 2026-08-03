@@ -25,6 +25,8 @@ from _common import (  # noqa: E402
     _iis,
     _one_region,
     _hold_done,
+    MEM,
+    FMUL,
     MEM_REDUCE_II,
 )
 
@@ -710,6 +712,83 @@ def test_intra_iteration_dependence():
 
     loop = _sched(disjoint).cyclic()[0]
     assert loop.op("store").t == loop.op("load").t  # no edge either way
+
+
+# Which analysis owns an access is decided by its FORM. A subscript that is
+# affine in the induction variable but reaches the access as index ARITHMETIC
+# (`A[N - 1 - i]`) leaves the frontend as a `memref` access, outside the
+# polyhedral test, so every pair it takes part in falls to the conservative
+# "dependent unless proven disjoint" fallback: a dist-0 forward edge plus a
+# dist-1 back edge that pins II to the whole read-write chain. Raising the
+# access to affine form recovers the map, and with it the exact answer, which
+# is a smaller II here and the SAME II below.
+def test_a_reversed_subscript_is_decided_by_the_polyhedral_test():
+    N = 16
+
+    @kernel
+    def reverse(A: f32[N]):
+        for i in range(N):
+            j: index = N - 1 - i
+            A[j] = A[j] * 2.0
+
+    # One element per iteration, never revisited: no iteration carries the loop.
+    mod = _to_rtl(reverse)
+    assert _iis(mod.schedule().cyclic()) == [1]
+
+    A = _f32(N)
+    exp = A * 2.0
+    mod.cosim(A)
+    assert np.allclose(A, exp, rtol=2e-3, atol=2e-3), list(A)
+
+
+def test_a_reversed_subscript_keeps_a_real_recurrence():
+    N = 16
+
+    @kernel
+    def sweep(A: f32[N]):
+        for i in range(N - 1):
+            j: index = N - 2 - i
+            A[j] = A[j + 1] * 2.0
+
+    # `A[j + 1]` is what the PREVIOUS iteration wrote, so the raise must land on
+    # a proven distance-1 recurrence rather than on no edge at all.
+    mod = _to_rtl(sweep)
+    assert _iis(mod.schedule().cyclic()) == [MEM + FMUL + MEM]
+
+    A = _f32(N)
+    exp = A.copy()
+    for i in range(N - 1):
+        exp[N - 2 - i] = exp[N - 1 - i] * 2.0
+    mod.cosim(A)
+    assert np.allclose(A, exp, rtol=2e-3, atol=2e-3), list(A)
+
+
+# The same accident one level up. A nest whose inner bound is the enclosing
+# induction variable (`for j in range(i + 1, N)`, the shape of every triangular
+# sweep) leaves the frontend as an `scf.for`, whose induction variable is not a
+# valid affine dim: neither the loop NOR the accesses under it can be raised
+# while it stands, so the whole body takes the conservative fallback. The loop
+# is raised first, and its accesses become raisable at exactly that point.
+def test_a_triangular_nest_is_raised_with_the_loop_that_blocked_it():
+    N = 12
+
+    @kernel
+    def triangular(A: f32[N, N]):
+        for i in range(N):
+            for j in range(i + 1, N):
+                A[i, j] = A[i, j] * 2.0
+
+    # One element per iteration, so nothing is carried and the sweep pipelines
+    # at II=1; the conservative pair would have cost the whole read-write chain.
+    mod = _to_rtl(triangular)
+    assert _iis(mod.schedule().cyclic()) == [1]
+
+    A = _f32(N, N)
+    exp = A.copy()
+    for i in range(N):
+        exp[i, i + 1 : N] = exp[i, i + 1 : N] * 2.0
+    mod.cosim(A)
+    assert np.allclose(A, exp, rtol=2e-3, atol=2e-3), A
 
 
 # A dependence distance is a number of ITERATIONS. The polyhedral test reports
