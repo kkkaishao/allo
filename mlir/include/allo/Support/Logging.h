@@ -19,22 +19,18 @@ class Location;
 
 namespace mlir::allo::logging {
 
-// Severity, ascending. Mapped onto spdlog levels in Logging.cpp. `Error` and
-// `Unsupported` are the two FATAL levels, siblings rather than a ranking:
-// `Error` is an illegal program, `Unsupported` (tagged `NYI`) a legal one this
-// backend does not lower yet. `Unsupported` sits last only so the ascending
-// threshold never filters it.
+// Severity, ascending. `Error` (an illegal program) and `Unsupported` (a legal
+// one this backend does not lower yet) are siblings, both FATAL; `Unsupported`
+// sits last only so the ascending threshold never filters it.
 enum class Level { Debug, Info, Warn, Error, Unsupported };
 
 // Compiler stage printed in the second bracket. Extend as new stages log.
 enum class Stage { Prep, Sched, Dcp, Emit };
 
 namespace detail {
-// Format `LEVEL: [STAGE] message[ (at where)]` and route to the backend. For a
-// fatal level with a non-null `subject`, additionally emit an MLIR error
-// diagnostic on it, so a fatal message both logs and propagates: it fails the
-// pass and surfaces to the caller. The logger augments MLIR error reporting
-// rather than replacing it.
+// Format `LEVEL: [STAGE] message[ (at where)]` and route to the backend. A
+// fatal level with a non-null `subject` additionally emits an MLIR error
+// diagnostic on it, so the message both logs and fails the pass.
 void emit(Level level, Stage stage, llvm::StringRef where,
           llvm::StringRef message, mlir::Operation *subject);
 // Whether `level` passes the threshold (skip building dropped lines). A fatal
@@ -46,8 +42,8 @@ std::string describe(const mlir::Location &loc, bool withFile = true);
 } // namespace detail
 
 // RAII stream proxy: accumulate a message with `<<`, emit it on destruction.
-// Create through the factories below; it relies on C++17 guaranteed copy
-// elision, so it needs no move or copy constructor.
+// Created through the factories below, which rely on C++17 guaranteed copy
+// elision, so no move or copy constructor is needed.
 class Diagnostic {
 public:
   Diagnostic(Level level, Stage stage, std::string where,
@@ -81,8 +77,7 @@ private:
 };
 
 // Factories. The op/location overloads render a source anchor (a null op omits
-// it); the convenience wrappers fix the level. Pass the subject op at a fatal
-// site so the failure propagates, not just logs.
+// it). Pass the subject op at a fatal site so the failure propagates.
 inline Diagnostic log(Level level, Stage stage) {
   return Diagnostic(level, stage, std::string(), nullptr);
 }
@@ -105,9 +100,8 @@ inline Diagnostic warn(Stage stage, mlir::Operation *op = nullptr) {
 inline Diagnostic error(Stage stage, mlir::Operation *op = nullptr) {
   return log(Level::Error, stage, op);
 }
-// A legal program this backend does not lower yet. Fatal like `error`, but the
-// fix is a compiler feature rather than a change to the user's kernel, so the
-// message says what is missing and the tag reads `NYI`.
+// A legal program this backend does not lower yet: fatal like `error`, tagged
+// `NYI`, with a message naming the missing compiler feature.
 inline Diagnostic unsupported(Stage stage, mlir::Operation *op = nullptr) {
   return log(Level::Unsupported, stage, op);
 }

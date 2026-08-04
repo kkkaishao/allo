@@ -3,12 +3,9 @@
  * SPDX-License-Identifier: Apache-2.0
  *
  * Registration here is strictly ADDITIVE on top of the upstream
- * RegisterEverything bundled in the same package: it touches only the `allo`
- * dialect, the Allo transform-dialect extension, and Allo-specific passes.
- * Re-registering the upstream dialects/passes would collide with
- * RegisterEverything, which shares one set of MLIR global registries:
- * re-running the upstream pass/pipeline registration aborts with
- * "<pipeline> registered multiple times".
+ * RegisterEverything bundled in the same package: only the `allo` dialect, the
+ * Allo transform-dialect extension, and Allo-specific passes. The two share one
+ * set of MLIR global registries, so re-registering anything upstream aborts.
  */
 
 #include "allo-c/Registration.h"

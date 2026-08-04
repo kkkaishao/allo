@@ -66,10 +66,8 @@ void allo::populateLowerToLLVMPipeline(OpPassManager &pm, bool enableTensor) {
 
   pm.addPass(createConvertAlloToFuncPass());
   // No global C-wrapper request: only the top kernel needs the C interface ABI,
-  // and the backend marks it explicitly with `llvm.emit_c_interface` (preserved
-  // through ConvertAlloToFunc). Requesting wrappers for every function would
-  // otherwise force the `_mlir_ciface_` prefix onto the dataflow runtime
-  // symbols.
+  // marked with `llvm.emit_c_interface` and preserved by ConvertAlloToFunc. A
+  // global request would prefix the dataflow runtime symbols `_mlir_ciface_`.
   auto &nestedPM = pm.nest<func::FuncOp>();
   nestedPM.addPass(createConvertLinalgToAffineLoopsPass());
   nestedPM.addPass(affine::createAffineScalarReplacementPass());

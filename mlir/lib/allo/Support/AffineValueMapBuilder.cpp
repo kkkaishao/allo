@@ -28,18 +28,15 @@ Value mlir::allo::stripCast(Value value) {
 
 AffineExpr AffineValueMapBuilder::addDim(Value v) {
   auto *it = llvm::find(dims, v);
-  // if found, return its existing position
   if (it != dims.end()) {
     return getAffineDimExpr(std::distance(dims.begin(), it), ctx);
   }
-  // otherwise, register it
   unsigned pos = dims.size();
   dims.push_back(v);
   return getAffineDimExpr(pos, ctx);
 }
 
 AffineExpr AffineValueMapBuilder::addSym(Value v) {
-  // same as adding a dim
   auto *it = llvm::find(syms, v);
   if (it != syms.end()) {
     return getAffineSymbolExpr(std::distance(syms.begin(), it), ctx);
@@ -51,10 +48,8 @@ AffineExpr AffineValueMapBuilder::addSym(Value v) {
 
 FailureOr<AffineExpr> AffineValueMapBuilder::importValueInternal(Value v) {
   v = stripCast(v);
-  // Case 0: fast rejection
   if (exprFailureCache.contains(v))
     return failure();
-  // Case 1: constant integer
   IntegerAttr::ValueType cst;
   if (matchPattern(v, m_ConstantInt(&cst))) {
     return getAffineConstantExpr(cst.getSExtValue(), ctx);
@@ -64,7 +59,6 @@ FailureOr<AffineExpr> AffineValueMapBuilder::importValueInternal(Value v) {
   if (isa_and_present<GetWorkerIdOp, GetNumWorkersOp>(v.getDefiningOp())) {
     return addSym(v);
   }
-  // Case 2: affine dim or symbol, use upstream utils
   if (affine::isValidDim(v)) {
     return addDim(v);
   }
@@ -72,7 +66,6 @@ FailureOr<AffineExpr> AffineValueMapBuilder::importValueInternal(Value v) {
     return addSym(v);
   }
   auto *defOp = v.getDefiningOp();
-  // Case 3: affine.apply, recursively import its map results
   if (auto applyOp = dyn_cast_if_present<affine::AffineApplyOp>(defOp)) {
     if (failed(importMapAndOperands(
             applyOp.getAffineMap(), applyOp.getDimOperands(),
@@ -80,7 +73,6 @@ FailureOr<AffineExpr> AffineValueMapBuilder::importValueInternal(Value v) {
       return cacheFailure(v);
     return exprs.back();
   }
-  // Case 4: arithmetic operations
   if (auto addOp = dyn_cast_if_present<arith::AddIOp>(defOp)) {
     auto lhs = importValueInternal(addOp.getLhs());
     auto rhs = importValueInternal(addOp.getRhs());
@@ -145,8 +137,7 @@ affine::AffineValueMap AffineValueMapBuilder::compose() const {
 void AffineValueMapBuilder::reset() {
   dims.clear();
   syms.clear();
-  results.clear();
-  // exprFailureCache.clear();
+  results.clear(); // exprFailureCache is deliberately kept
   exprs.clear();
 }
 
@@ -170,8 +161,7 @@ LogicalResult AffineValueMapBuilder::importMapAndOperands(
     symExprs.push_back(*symExpr);
   }
   for (auto result : map.getResults()) {
-    // affine.min/max may carry multi-result maps; each result is one
-    // candidate bound expression in the final min/max set.
+    // One result is one candidate bound expression in the final min/max set.
     exprs.push_back(result.replaceDimsAndSymbols(dimExprs, symExprs));
   }
   return success();

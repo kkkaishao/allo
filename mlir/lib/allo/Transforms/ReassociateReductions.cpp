@@ -26,8 +26,7 @@ using namespace mlir::allo::logging;
 namespace {
 
 // A loop-carried iter_arg (not the induction variable) of an enclosing
-// affine.for. Such an accumulator is folded in last so its recurrence stays a
-// single operator.
+// affine.for.
 bool isLoopCarried(Value v) {
   auto arg = dyn_cast<BlockArgument>(v);
   if (!arg)
@@ -41,10 +40,10 @@ struct ReductionChain {
   SmallVector<Value> leaves;        // the operands the chain folds together
 };
 
-// Flatten the maximal chain of `proto`'s operator: recursively absorb any
-// single-use step of the same operator/idiom, collecting every non-chain
-// operand (peeled through the idiom's extends) as a leaf. Absorbed steps are
-// recorded so their ops can be erased once the chain is rebalanced.
+// Flatten the maximal chain of `proto`'s operator: absorb any single-use step
+// of the same operator/idiom, collecting every non-chain operand (peeled
+// through the idiom's extends) as a leaf. Absorbed steps are recorded so their
+// ops can be erased once the chain is rebalanced.
 void flatten(Value v, const ReductionStep &proto, ReductionChain &chain) {
   ReductionStep s = matchReductionStep(v);
   if (s && sameReduction(s, proto) && v.hasOneUse()) {

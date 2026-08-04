@@ -31,9 +31,7 @@ enum class Dir { Increasing, Decreasing };
 // A matched affine while: the IV iter-arg, its init and tested bound, the
 // signed constant step, and whether the ordered test was inclusive. The IV
 // evolves as `init + k*delta` and the loop exits when the test against `bound`
-// first fails. `delta`'s sign is the direction; its magnitude is the step. This
-// is the whole model the rewrite consumes, independent of the loop's surface
-// shape.
+// first fails.
 struct AffineWhile {
   unsigned ivIndex;
   Value init;
@@ -113,8 +111,7 @@ classifyPredicate(arith::CmpIPredicate p) {
 
 // Match a counted while as an affine-IV model: a pure ordered test of one IV
 // against a loop-invariant bound, with a constant-step self-update whose sign
-// agrees with the test. Returns nullopt (leave the loop alone) on any
-// deviation.
+// agrees with the test. Returns nullopt on any deviation.
 static std::optional<AffineWhile> matchCountedWhile(scf::WhileOp w) {
   if (!w.getBefore().hasOneBlock() || !w.getAfter().hasOneBlock())
     return std::nullopt;
@@ -193,9 +190,8 @@ static std::optional<AffineWhile> matchCountedWhile(scf::WhileOp w) {
   if ((dir == Dir::Increasing) != (delta > 0))
     return std::nullopt;
 
-  // Raise any integer or index IV. The rewrite reconstructs the IV from an
-  // index counter and casts through the IV's type, so both directions and a
-  // used result need no special handling in the match.
+  // Raise any integer or index IV: the rewrite reconstructs the IV from an
+  // index counter and casts through the IV's type.
   if (!ivArg.getType().isIntOrIndex())
     return std::nullopt;
 
@@ -226,9 +222,9 @@ struct RaiseCountedWhile : OpRewritePattern<scf::WhileOp> {
       return arith::ConstantIntOp::create(b, l, ivType, v);
     };
 
-    // The IV value at counter position `count` (in the IV type): init +
-    // count*delta. A unit-step zero-based increasing loop folds this back to
-    // `count` itself.
+    // The IV value at counter position `count` (in the IV type):
+    // `init + count*delta`, which folds back to `count` for a unit-step
+    // zero-based increasing loop.
     auto ivAt = [&](OpBuilder &b, Location l, Value count) -> Value {
       Value scaled =
           b.createOrFold<arith::MulIOp>(l, count, constIv(b, l, m->delta));

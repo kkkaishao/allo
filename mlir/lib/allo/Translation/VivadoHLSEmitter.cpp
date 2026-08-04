@@ -31,7 +31,7 @@ static std::string getIntegerTypeName(unsigned width, bool isSigned) {
 
 // The "allo.signed" marker carries one char per function operand then result:
 // 's' signed integer, 'u' unsigned integer, 'x' non-integer. A missing or short
-// marker falls back to unsigned, preserving prior behavior.
+// marker falls back to unsigned.
 static bool operandIsSigned(func::FuncOp func, unsigned idx) {
   auto attr = func->getAttrOfType<StringAttr>(allo::kAlloSignedAttr);
   if (!attr)
@@ -41,7 +41,7 @@ static bool operandIsSigned(func::FuncOp func, unsigned idx) {
 }
 
 // A C++ literal for the low ``width`` set bits, e.g. ``0xfULL`` for width 4.
-// Used to mask out a bit slice; only widths up to 64 fit in a single literal.
+// Only widths up to 64 fit in a single literal.
 static std::string getBitMaskLiteral(unsigned width) {
   assert(width >= 1 && width <= 64 && "bit slice width out of range");
   uint64_t mask = width == 64 ? ~uint64_t(0) : (uint64_t(1) << width) - 1;
@@ -74,7 +74,6 @@ std::string VivadoHLSEmitter::getTypeName(Type type, bool isSigned) {
            ">";
   if (auto shapedType = dyn_cast<ShapedType>(type))
     type = shapedType.getElementType();
-  /// Primitive types
   if (isa<Float16Type>(type))
     return "half";
   if (isa<Float32Type>(type))
@@ -136,9 +135,9 @@ static std::size_t streamFifoDepth(StreamType type) {
   return depth;
 }
 
-/// Return the outermost loop with `allo.pipeline.ii` if there is only
-/// a single loop nest in the block, otherwise return nullptr.
-/// This is used to determine if we can apply a rewind pragma to the loop.
+/// Return the outermost loop with `allo.pipeline.ii` if the block holds a
+/// single loop nest, otherwise nullptr. The result is where a rewind pragma
+/// may go.
 static LoopLikeOpInterface hasSingleLoopNest(Block &block) {
   LoopLikeOpInterface ret = nullptr;
   Block *currBlock = &block;
@@ -174,7 +173,6 @@ void VivadoHLSEmitter::emitFunction(func::FuncOp func) {
     state.failed = true;
     return;
   }
-  // preprocess: auto rewind single-loop processes
   if (auto loop = hasSingleLoopNest(func.getBlocks().front())) {
     loop->setAttr(kPipelineRewindAttr, UnitAttr::get(func.getContext()));
   }
@@ -185,7 +183,6 @@ void VivadoHLSEmitter::emitFunction(func::FuncOp func) {
   emitFunctionSignature(func);
   state.os << " {\n";
   state.addIndent();
-  // emit function-level directives
   emitFunctionDirectives(func);
   emitBlock(func.getBlocks().front());
   state.reduceIndent();
@@ -273,9 +270,9 @@ void VivadoHLSEmitter::emitFunctionDirectives(func::FuncOp func) {
              << " depth=" << streamFifoDepth(streamType) << "\n";
   }
 
-  // Globals lower to file-scope statics, and a scheduled array_partition on
-  // one is recorded on its `memref.global`. The pragma is function-scoped but a
-  // static is visible everywhere, so emit each global's pragma in the top.
+  // A global lowers to a file-scope static and its scheduled array_partition is
+  // recorded on the `memref.global`. The pragma is function-scoped, so emit
+  // every global's pragma in the top function.
   if (isTopFunc(func)) {
     for (auto global :
          func->getParentOfType<ModuleOp>().getOps<memref::GlobalOp>()) {
@@ -295,7 +292,6 @@ void VivadoHLSEmitter::emitFunctionDirectives(func::FuncOp func) {
     return;
   }
 
-  // emit partition / bind_storage directives for arguments
   for (auto [arg, attr] : llvm::zip(func.getArguments(), *argAttrs)) {
     auto dict = cast<DictionaryAttr>(attr);
     if (auto partOr = dict.getNamed(kPartitionAttr))
@@ -310,7 +306,6 @@ void VivadoHLSEmitter::emitFunctionDirectives(func::FuncOp func) {
 
 void VivadoHLSEmitter::emitCall(func::CallOp op) {
   llvm::raw_ostream &os = state.os;
-  // cpp cannot handle multiple return values
   if (op->getNumResults() > 1) {
     op->emitError()
         << "Multiple call results are not supported in Vivado HLS emitter.";
@@ -350,9 +345,8 @@ void VivadoHLSEmitter::emitPartitionPragma(allo::PartitionAttr attr,
       // ignore factor for complete partition since it is not needed
       break;
     case allo::PartitionKindEnum::SkewPartition:
-      // No `array_partition` spells a skew: its bank is a function of every
-      // subscript, where the pragma's kinds each read one. Emitting the nearest
-      // cyclic would silently place the elements somewhere else.
+      // No `array_partition` kind expresses a skew: its bank is a function of
+      // every subscript, where each pragma kind reads one.
       state.os << " /*unsupported: skew partition has no HLS pragma*/";
       state.failed = true;
       break;
@@ -372,7 +366,6 @@ void VivadoHLSEmitter::emitBindStoragePragma(DictionaryAttr attr,
 
 void VivadoHLSEmitter::emitAffineFor(affine::AffineForOp op) {
   llvm::raw_ostream &os = state.os;
-  // declare variables for iter args
   bool firstIter = true;
   for (auto [result, iter, init] :
        llvm::zip(op.getResults(), op.getRegionIterArgs(), op.getInits())) {
@@ -393,15 +386,13 @@ void VivadoHLSEmitter::emitAffineFor(affine::AffineForOp op) {
   os << " = ";
   std::string ivName = state.getName(op.getInductionVar());
   AffineMap lbMap = op.getLowerBoundMap();
-  // if lb num results > 1, affine.for will take the max of all results as the
-  // lower bound
+  // affine.for takes the max over a multi-result lower bound map
   if (lbMap.getNumResults() > 1)
     emitAffineMapReduction(lbMap, op.getLowerBoundOperands(), "std::max");
   else
     AffineExprEmitter(state, op.getLowerBoundOperands(), lbMap.getNumDims())
         .emitAffineMap(lbMap);
-  // if ub num results > 1, affine.for will take the min of all results as the
-  // upper bound
+  // affine.for takes the min over a multi-result upper bound map
   os << "; " << ivName << " < ";
   AffineMap ubMap = op.getUpperBoundMap();
   if (ubMap.getNumResults() > 1)
@@ -409,10 +400,8 @@ void VivadoHLSEmitter::emitAffineFor(affine::AffineForOp op) {
   else
     AffineExprEmitter(state, op.getUpperBoundOperands(), ubMap.getNumDims())
         .emitAffineMap(ubMap);
-  // emit step
   os << "; " << ivName << " += " << op.getStep() << ") {\n";
   state.addIndent();
-  // emit pragmas
   emitLoopDirectives(op);
   emitBlock(*op.getBody());
   state.reduceIndent();
@@ -483,7 +472,6 @@ void VivadoHLSEmitter::emitAffineStore(affine::AffineStoreOp op) {
 
 void VivadoHLSEmitter::emitAffineIf(affine::AffineIfOp op) {
   llvm::raw_ostream &os = state.os;
-  // emit results
   for (auto [idx, result] : llvm::enumerate(op.getResults())) {
     if (idx)
       os.indent(state.currentIndent);
@@ -598,12 +586,10 @@ void VivadoHLSEmitter::emitValueRef(Value val) {
 
 // Emit ``static_cast<T>(value)`` where T is value's own type rendered with the
 // requested signedness. MLIR integers are signless and locals default to the
-// unsigned C++ type, so sign-sensitive ops route operands through this to read
-// them with the signedness their semantics dictate.
+// unsigned C++ type, so sign-sensitive ops read their operands through this.
 void VivadoHLSEmitter::emitSignedOperand(Value value, bool isSigned) {
-  // The local's declared C++ type already fixes its signedness, so only cast
-  // when the consumer wants the other one. A same-rendered-type cast is a
-  // textual no-op: index, for instance, always renders signed.
+  // Cast only when the wanted signedness differs from the declared one; index,
+  // for instance, always renders signed.
   if (getTypeName(value.getType(), state.signednessOf(value)) ==
       getTypeName(value.getType(), isSigned)) {
     emitValueRef(value);
@@ -670,8 +656,8 @@ void VivadoHLSEmitter::emitStreamTransferLoops(bool isPut, Value stream,
 void VivadoHLSEmitter::emitStreamCreate(allo::StreamCreateOp op) {
   llvm::raw_ostream &os = state.os;
   auto streamType = cast<StreamType>(op.getStream().getType());
-  // The signless payload's signedness is carried per-op (like memref.alloc) so
-  // the FIFO element type matches the callee parameters this stream feeds.
+  // The signless payload's signedness is carried per-op so the FIFO element
+  // type matches the callee parameters this stream feeds.
   bool isSigned = false;
   if (auto attr = op->getAttrOfType<StringAttr>(allo::kAlloSignedAttr))
     isSigned = attr.getValue() == "s";
@@ -733,8 +719,7 @@ void VivadoHLSEmitter::emitBitGetSlice(allo::BitGetSliceOp op) {
     state.failed = true;
     return;
   }
-  // result = (src >> lo) & mask, where the static width fixes the mask. The
-  // offset `lo` may be dynamic, so the shift handles it directly.
+  // result = (src >> lo) & mask, where the result width fixes the mask
   llvm::raw_ostream &os = state.os;
   emitValueDecl(op.getResult());
   os << " = (";
@@ -752,9 +737,7 @@ void VivadoHLSEmitter::emitBitSetSlice(allo::BitSetSliceOp op) {
     state.failed = true;
     return;
   }
-  // result = (src & ~(mask << lo)) | ((value & mask) << lo): clear the target
-  // window in `src`, then splice in the masked value at the (possibly dynamic)
-  // offset `lo`.
+  // result = (src & ~(mask << lo)) | ((value & mask) << lo)
   std::string mask = getBitMaskLiteral(width);
   std::string srcType = getTypeName(op.getSrc().getType());
   llvm::raw_ostream &os = state.os;
@@ -807,23 +790,21 @@ void VivadoHLSEmitter::emitAffineMapReduction(
 
 void VivadoHLSEmitter::emitMemrefAlloc(memref::AllocOp op) {
   llvm::raw_ostream &os = state.os;
-  // A generated temporary may carry an `allo.signed` marker so its element type
-  // matches the signedness of the callee it feeds (see
-  // materialize-apint-wrapper).
+  // A generated temporary may carry an `allo.signed` marker from
+  // generate-apint-wrapper so its element type matches the callee it feeds.
   bool isSigned = false;
   if (auto attr = op->getAttrOfType<StringAttr>(allo::kAlloSignedAttr))
     isSigned = attr.getValue() == "s";
   emitValueDecl(op.getResult(), isSigned);
   os << ";";
-  // A local on-chip buffer may carry an `allo.part` attribute from a scheduled
-  // array_partition (e.g. a reuse buffer feeding a systolic array at full
-  // bandwidth); the arg path above only covers function arguments.
+  // A local buffer may carry an `allo.part` attribute from a scheduled
+  // array_partition; emitFunctionDirectives only covers function arguments.
   if (auto partAttr = op->getAttrOfType<allo::PartitionAttr>(kPartitionAttr)) {
     os << "\n";
     emitPartitionPragma(partAttr, state.getName(op.getResult()));
   }
-  // A local on-chip buffer may also carry an `allo.bind.storage` attribute from
-  // a scheduled bind_storage (e.g. force a reuse buffer onto URAM).
+  // A local buffer may likewise carry an `allo.bind.storage` attribute from a
+  // scheduled bind_storage.
   if (auto bindAttr = op->getAttrOfType<DictionaryAttr>(kBindStorageAttr)) {
     os << "\n";
     emitBindStoragePragma(bindAttr, state.getName(op.getResult()));
@@ -858,9 +839,9 @@ void VivadoHLSEmitter::emitMemrefGlobal(memref::GlobalOp op) {
   auto initValue = op.getInitialValue();
   auto dense =
       initValue ? dyn_cast<DenseElementsAttr>(*initValue) : DenseElementsAttr();
-  // A global with a constant initializer is defined at file scope (internal
-  // linkage) so its value survives across top-function calls into csim and
-  // synthesis; otherwise it is an `extern` decl. All globals precede functions.
+  // A global with a constant initializer is defined at file scope with internal
+  // linkage, so its value survives across top-function calls; without one it is
+  // an `extern` declaration.
   if (!dense) {
     os << "extern " << getTypeName(type) << " "
        << getSymbolName(op.getSymName());
@@ -894,9 +875,9 @@ void VivadoHLSEmitter::emitDenseInitializer(DenseElementsAttr dense,
       state.failed = true;
       return;
     }
-    // Globals print as unsigned C types (getPrimitiveTypeName default), so emit
-    // the zero-extended value with a matching unsigned suffix; signedness is
-    // recovered by the static_cast the emitter already inserts on each load.
+    // Globals print as unsigned C types, so emit the zero-extended value with a
+    // matching unsigned suffix; signedness is recovered by the static_cast the
+    // emitter already inserts on each load.
     const char *suffix = width <= 32 ? "u" : "ull";
     for (const APInt &v : dense.getValues<APInt>()) {
       os << (first ? "" : ", ") << v.getZExtValue() << suffix;
@@ -917,14 +898,13 @@ void VivadoHLSEmitter::emitDenseInitializer(DenseElementsAttr dense,
 }
 
 void VivadoHLSEmitter::emitMemrefGetGlobal(memref::GetGlobalOp op) {
-  // we only need to map the result of get_global to the global variable name
+  // map the result of get_global onto the global variable's emitted name
   state.nameTable[op.getResult()] = getSymbolName(op.getName());
 }
 
-// `allo.assume.nodep` is the direct analogue of `#pragma HLS dependence`: emit
-// it on the enclosing loop the hint sits in. `dependent = false` (the common
-// case, e.g. from a lowered grid()) tells Vitis a dependence is absent so it
-// can pipeline; the optional direction/distance narrow the claim.
+// `allo.assume.nodep` maps onto `#pragma HLS dependence` in the loop the hint
+// sits in. `dependent = false` tells Vitis a dependence is absent so it can
+// pipeline; the optional direction and distance narrow the claim.
 void VivadoHLSEmitter::emitAssumeNoDep(allo::AssumeNoDepOp op) {
   llvm::raw_ostream &os = state.os;
   os << "#pragma HLS dependence variable=" << state.getName(op.getVariable());
@@ -942,7 +922,6 @@ void VivadoHLSEmitter::emitAssumeNoDep(allo::AssumeNoDepOp op) {
 
 void VivadoHLSEmitter::emitFor(scf::ForOp op) {
   llvm::raw_ostream &os = state.os;
-  // declare variables for iter args
   bool firstIter = true;
   for (auto [result, iter, init] :
        llvm::zip(op.getResults(), op.getRegionIterArgs(), op.getInits())) {
@@ -968,7 +947,6 @@ void VivadoHLSEmitter::emitFor(scf::ForOp op) {
   emitValueRef(op.getStep());
   os << ") {\n";
   state.addIndent();
-  // emit pragmas
   emitLoopDirectives(op);
   emitBlock(*op.getBody());
   state.reduceIndent();
@@ -978,7 +956,6 @@ void VivadoHLSEmitter::emitFor(scf::ForOp op) {
 
 void VivadoHLSEmitter::emitIf(scf::IfOp op) {
   llvm::raw_ostream &os = state.os;
-  // emit results
   for (auto [idx, result] : llvm::enumerate(op.getResults())) {
     if (idx)
       os.indent(state.currentIndent);
@@ -1069,9 +1046,7 @@ void VivadoHLSEmitter::emitCastOp(Operation *op) {
 }
 
 // Integer widening. MLIR integers are signless, so route the operand through
-// its correctly-signed C++ type to get sign- (extsi) or zero- (extui)
-// extension; a plain cast to the default-unsigned result type would always
-// zero-extend.
+// its correctly-signed C++ type to get sign (extsi) or zero (extui) extension.
 void VivadoHLSEmitter::emitIntExtOp(Operation *op, bool isSigned) {
   llvm::raw_ostream &os = state.os;
   Value result = op->getResult(0);
@@ -1089,10 +1064,9 @@ void VivadoHLSEmitter::emitIntExtOp(Operation *op, bool isSigned) {
   os << ";";
 }
 
-// arith fp-to-int (fptosi/fptoui): the integer result's signedness is fixed by
-// the op. Route the result through that signed/unsigned type so a negative
-// float yields the right two's-complement bits rather than an unsigned
-// conversion, which is undefined for negatives.
+// arith fp-to-int (fptosi/fptoui): the op fixes the integer result's
+// signedness. Convert through that type, since converting a negative float to
+// an unsigned type is undefined.
 void VivadoHLSEmitter::emitFPToIntOp(Operation *op, bool isSigned) {
   llvm::raw_ostream &os = state.os;
   emitValueDecl(op->getResult(0), isSigned);
@@ -1102,9 +1076,9 @@ void VivadoHLSEmitter::emitFPToIntOp(Operation *op, bool isSigned) {
   os << ");";
 }
 
-// arith int-to-fp (sitofp/uitofp): the integer operand's signedness is fixed by
-// the op. Read the signless operand through that integer type before
-// converting, else a negative value would convert as a large unsigned one.
+// arith int-to-fp (sitofp/uitofp): the op fixes the integer operand's
+// signedness. Read the signless operand through that integer type before
+// converting, else a negative value converts as a large unsigned one.
 void VivadoHLSEmitter::emitIntToFPOp(Operation *op, bool isSigned) {
   llvm::raw_ostream &os = state.os;
   emitValueDecl(op->getResult(0));
@@ -1113,9 +1087,9 @@ void VivadoHLSEmitter::emitIntToFPOp(Operation *op, bool isSigned) {
   os << ");";
 }
 
-// arith.bitcast: reinterpret the operand's bits as the result type without
-// numeric conversion. Routed through the `allo_bitcast` union helper rather
-// than a static_cast, which would round/convert instead of copying the bits.
+// arith.bitcast: reinterpret the operand's bits as the result type. Routed
+// through the `allo_bitcast` union helper, since a static_cast would convert
+// the value instead of copying the bits.
 void VivadoHLSEmitter::emitBitcastOp(arith::BitcastOp op) {
   llvm::raw_ostream &os = state.os;
   emitValueDecl(op.getResult());
@@ -1167,9 +1141,8 @@ void VivadoHLSEmitter::emitSelect(arith::SelectOp op) {
 void VivadoHLSEmitter::emitWhile(scf::WhileOp op) {
   llvm::raw_ostream &os = state.os;
   scf::ConditionOp condOp = op.getConditionOp();
-  // Declare one persistent C variable per before-region iter arg, initialized
-  // from the while inits. These hold the loop-carried state across iterations;
-  // the before region's condition reads them, so they must be named here.
+  // One persistent C variable per before-region iter arg holds the loop-carried
+  // state; the before region's condition reads them, so name them here.
   for (auto [beforeArg, init] :
        llvm::zip(op.getBeforeArguments(), op.getInits())) {
     emitValueDecl(beforeArg);
@@ -1180,18 +1153,15 @@ void VivadoHLSEmitter::emitWhile(scf::WhileOp op) {
   }
   os << "while (true) {\n";
   state.addIndent();
-  // before region: computes the loop condition (and the values scf.condition
-  // forwards to the after region / while results).
+  // the before region computes the loop condition and the forwarded values
   emitBlock(*op.getBeforeBody());
   // scf.condition forwards its operands to the after-region arguments and to
-  // the while results; alias both to the names produced in the before region.
-  // The after region's scf.yield then writes the next state back through those.
+  // the while results; alias both onto the names produced in the before region.
   for (auto [afterArg, condArg] :
        llvm::zip(op.getAfterArguments(), condOp.getArgs()))
     state.nameTable[afterArg] = state.getName(condArg);
   for (auto [result, condArg] : llvm::zip(op.getResults(), condOp.getArgs()))
     state.nameTable[result] = state.getName(condArg);
-  // evaluate condition
   os.indent(state.currentIndent);
   os << "if (!(";
   emitValueRef(condOp.getCondition());
@@ -1252,9 +1222,8 @@ void VivadoHLSEmitter::dispatch(Operation *op) {
       .Case<arith::ShRSIOp>([&](auto op) { emitBinaryOp(op, ">>", true); })
       // Vitis has no ceildiv/floordiv
 
-      // max/min ops: signless integer values default to unsigned C++ types, so
-      // cast operands to match the op's signedness; otherwise a signed maxsi on
-      // a negative value would compare as unsigned.
+      // max/min ops: signless values default to unsigned C++ types, so cast the
+      // operands to match the op's signedness.
       .Case<arith::MaxSIOp>(
           [&](auto op) { emitPrefixBinaryOp(op, "std::max", true); })
       .Case<arith::MinSIOp>(
@@ -1503,8 +1472,7 @@ void VivadoHLSEmitter::emitCmpI(arith::CmpIOp op) {
   emitValueDecl(op.getResult());
   os << " = ";
   // eq/ne give the same result for either signedness; ordered comparisons do
-  // not, so cast the signless operands to the predicate's signedness. Without
-  // it a signed slt on a negative (default-unsigned) value compares unsigned.
+  // not, so cast the signless operands to the predicate's signedness.
   if (pred == arith::CmpIPredicate::eq || pred == arith::CmpIPredicate::ne) {
     emitValueRef(op.getLhs());
     os << " " << getCmpIPredString(pred) << " ";

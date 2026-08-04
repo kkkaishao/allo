@@ -43,9 +43,8 @@ struct OperandSpace {
 };
 
 // The counted loop \p iv is the induction variable of, as its lower bound and
-// step plus an upper bound when that is constant too. Whichever dialect spells
-// the loop: an `scf.for` is counted whenever its bound and step are constants,
-// which is what makes the value space `lb + step*d` rather than `d`.
+// step plus an upper bound when that is constant too. The step is what makes
+// the value space `lb + step*d` rather than `d`.
 struct Counter {
   int64_t lb, step;
   std::optional<int64_t> ub;
@@ -72,8 +71,8 @@ std::optional<Counter> counterOf(BlockArgument iv) {
 
 // The values \p v takes, as an expression over the operand numbering \p space:
 // a constant, a counted loop's induction variable read as `lb + step*d`, or an
-// index built from those by constant adds and multiplies. Anything else is
-// opaque and takes a slot of its own.
+// index built from those by constant adds and multiplies. Anything else takes
+// a slot of its own.
 AffineExpr indexExpr(Value v, OperandSpace &space) {
   if (std::optional<int64_t> c = getConstantIntValue(v))
     return getAffineConstantExpr(*c, v.getContext());
@@ -82,7 +81,7 @@ AffineExpr indexExpr(Value v, OperandSpace &space) {
     if (!ctr)
       return space.dim(v, {});
     // The dim counts ITERATIONS, so a constant trip count is what bounds it,
-    // which is what a block digit needs.
+    // and a block digit needs that bound.
     DimRange r;
     if (ctr->ub && ctr->step > 0 && *ctr->ub > ctr->lb)
       r = {0, llvm::divideCeilSigned(*ctr->ub - ctr->lb, ctr->step) - 1, true};
@@ -94,8 +93,7 @@ AffineExpr indexExpr(Value v, OperandSpace &space) {
     return indexExpr(add.getLhs(), space) + indexExpr(add.getRhs(), space);
   if (auto sub = dyn_cast<arith::SubIOp>(def))
     return indexExpr(sub.getLhs(), space) - indexExpr(sub.getRhs(), space);
-  // A non-constant coefficient is not an affine multiply, so it stays opaque
-  // rather than being read as one.
+  // A non-constant coefficient is not an affine multiply, so it stays opaque.
   if (auto mul = dyn_cast<arith::MulIOp>(def)) {
     if (std::optional<int64_t> c = getConstantIntValue(mul.getRhs()))
       return indexExpr(mul.getLhs(), space) * *c;
@@ -108,10 +106,9 @@ AffineExpr indexExpr(Value v, OperandSpace &space) {
 // \p a's map over the values its subscripts actually TAKE, rather than over the
 // operands the map names: an induction variable of constant lower bound `lb`
 // and step `s` runs over `lb + s*d`, not over `d`. The step is the fact the map
-// alone cannot carry, and it is the one `s.unroll` leaves behind:
-// `loopUnrollByFactor` turns a unit-step loop into one stepping by the factor,
-// so a cyclic bank digit reads `d mod 4`, which says nothing, where the value
-// space says `(4*d) mod 4`, which is 0.
+// alone cannot carry, and `s.unroll` leaves one behind: a cyclic bank digit
+// then reads `d mod 4`, which says nothing, where the value space says
+// `(4*d) mod 4`, which is 0.
 AffineMap inIterationSpace(const MemAccess &a, OperandSpace &space) {
   SmallVector<AffineExpr> dims;
   for (unsigned p = 0, e = a.map.getNumDims(); p < e; ++p)
@@ -123,9 +120,9 @@ AffineMap inIterationSpace(const MemAccess &a, OperandSpace &space) {
                                      a.map.getNumSymbols());
 }
 
-// One array's accesses, gathered before any is assigned. A skew has to see all
-// of them at once (its slots are only billable if every access agrees on the
-// class), so the pass collects first and decides second for both kinds.
+// One array's accesses, gathered before any is assigned. A skew's slots are
+// only billable if every access agrees on the class, so the pass collects
+// first and decides second for both kinds.
 struct Info {
   BankLayout layout;
   Operation *anchor = nullptr;
@@ -134,8 +131,7 @@ struct Info {
   /// are in different scheduling regions, so they never take a port in the same
   /// cycle and the port model never bills them against each other. A skew's
   /// class agreement therefore has to hold within a block, not across the whole
-  /// array: an array filled in one nest and read in another has two classes and
-  /// no conflict between them.
+  /// array.
   llvm::MapVector<Block *, llvm::SmallVector<std::pair<Operation *, AffineMap>>>
       byBlock;
   unsigned accesses = 0;
@@ -158,15 +154,14 @@ struct AssignBanksPass
         return;
       Info &in = byMemref[a->root];
       in.layout = layout;
-      // A function argument has no defining op; the function is where its
-      // `allo.part` lives, so it is the honest anchor for one.
+      // A function argument has no defining op; its `allo.part` lives on the
+      // function, so that is the anchor.
       if (!in.anchor)
         in.anchor = a->root.getDefiningOp() ? a->root.getDefiningOp()
                                             : getOperation().getOperation();
       ++in.accesses;
       // Every array access carries a map, the identity one when its subscript
-      // is not affine, so every access is asked. A subscript the fold cannot
-      // resolve answers "reaches every bank" here rather than by being absent.
+      // is not affine, so every access is asked.
       in.byBlock[op->getBlock()].emplace_back(op,
                                               inIterationSpace(*a, in.space));
     });
@@ -175,7 +170,7 @@ struct AssignBanksPass
       auto shape = cast<MemRefType>(memref.getType()).getShape();
       if (in.layout.skew())
         // An ARGUMENT gets no slot: its ports are boundary interfaces, one set
-        // per access, so there is none to share (see `assignSlots`).
+        // per access, so there is none to share.
         assignSlots(in, shape, !isa<BlockArgument>(memref));
       else
         for (auto &[block, accs] : in.byBlock)
@@ -194,12 +189,9 @@ struct AssignBanksPass
   }
 
   // A skewed array's accesses are billable by SLOT, but only ALL OF THEM: the
-  // emitter shares one port per bank between the accesses of a lane, and an
-  // access left without a slot would have to crossbar over the very banks that
-  // sharing assumes it stays off. So one access the analysis cannot place
-  // returns the whole array to the conservative billing, and it is decided here
-  // rather than in the emitter because the port model reads it before the
-  // solve.
+  // emitter shares one port per bank between the accesses of a lane, so one
+  // access the analysis cannot place returns the whole array to the
+  // conservative billing. The port model reads this before the solve.
   void assignSlots(Info &in, ArrayRef<int64_t> shape, bool internal) {
     if (!internal || !in.accesses)
       return;
@@ -220,11 +212,9 @@ struct AssignBanksPass
       record(op, slot, in);
   }
 
-  // What would make a bank resolve, which is a different sentence per kind: a
-  // cyclic digit is a residue and wants the subscript constant modulo the
-  // factor, a block digit is a quotient and wants the whole range of the
-  // subscript inside one chunk. Telling a block partition about `A[2*i]` sends
-  // the reader after the wrong rewrite.
+  // What would make a bank resolve, one sentence per kind: a cyclic digit is a
+  // residue and wants the subscript constant modulo the factor, a block digit
+  // is a quotient and wants the subscript's whole range inside one chunk.
   static std::string resolutionAdvice(const BankLayout &layout) {
     bool cyclic = false, block = false;
     for (const BankLayout::Axis &a : layout.axes)
@@ -240,9 +230,9 @@ struct AssignBanksPass
     return s + "An access whose subscript is neither reaches every bank.";
   }
 
-  // A partition resolving NO access bought nothing: every access takes a port
-  // on every bank and the emitter builds a crossbar, so the array costs N
-  // memories at the bandwidth of one, and nothing downstream says so.
+  // Report what the partition bought. An unresolved access takes a port on
+  // every bank and the emitter builds a crossbar, so a partition that resolves
+  // nothing costs N memories at the bandwidth of one.
   void report(const Info &in) {
     if (in.assigned == in.accesses)
       return;

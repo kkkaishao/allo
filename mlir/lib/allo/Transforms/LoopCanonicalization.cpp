@@ -53,9 +53,8 @@ Block *loopBody(Operation *loop) {
   return &cast<LoopLikeOpInterface>(loop).getLoopRegions().front()->front();
 }
 
-// The OUTERMOST counted loops nested anywhere in \p loop's body: one inside
-// another is that one's business, and both may sit under an `scf.if` rather
-// than directly in the body.
+// The OUTERMOST counted loops nested anywhere in \p loop's body; they may sit
+// under an `scf.if` rather than directly in the body.
 SmallVector<Operation *> nestedLoops(Operation *loop) {
   SmallVector<Operation *> out;
   loopBody(loop)->walk<WalkOrder::PreOrder>([&](Operation *op) {
@@ -167,13 +166,11 @@ void unrollInner(Operation *loop, StringRef pipelinedName) {
 // Normalize a band to lower bound 0 and step 1.
 //===----------------------------------------------------------------------===//
 
-// Whether normalizing \p loop pays. A RUNTIME lower bound is skipped: `for j in
-// range(i, N)` would become `j = i + j'`, so an address naming `j` would name
-// two counter registers and the adder joining them where it named one, and it
-// buys nothing (a runtime lower bound means a runtime trip count, which is
-// separately what coalescing refuses). An induction variable with a NON-AFFINE
-// use is skipped because only an affine consumer absorbs the `affine.apply` the
-// rewrite leaves behind; anywhere else it stays an op the scheduler pays for.
+// Whether normalizing \p loop pays. A RUNTIME lower bound is skipped: it makes
+// an address naming the induction variable name two counter registers and the
+// adder joining them, and buys nothing. An induction variable with a
+// NON-AFFINE use is skipped because only an affine consumer absorbs the
+// `affine.apply` the rewrite leaves behind.
 bool normalizable(affine::AffineForOp loop) {
   return loop.hasConstantLowerBound() &&
          llvm::all_of(loop.getInductionVar().getUsers(), [](Operation *user) {
@@ -234,11 +231,9 @@ Value loadedMemRef(Operation *op) {
   return {};
 }
 
-// Match \p outer as a sinkable imperfect nest, or return nullopt. When \p outer
-// has the shape of an imperfect nest (a counted inner loop plus surrounding
-// ops) but an unsupported feature blocks it, \p reason is set so the caller can
-// report the skip; a loop that is simply not an imperfect nest leaves \p reason
-// empty (stay silent).
+// Match \p outer as a sinkable imperfect nest, or return nullopt. \p reason is
+// set when \p outer has the shape of an imperfect nest but an unsupported
+// feature blocks it, and left empty when it is simply not one.
 std::optional<Match> matchImperfect(Operation *outer, std::string &reason) {
   Match m;
   unsigned innerCount = 0;
@@ -256,13 +251,11 @@ std::optional<Match> matchImperfect(Operation *outer, std::string &reason) {
     }
     (m.lin ? m.epilogue : m.prologue).push_back(&op);
   }
-  // Not an imperfect nest at all (no counted inner loop, or nothing to sink):
-  // stay silent, since there is nothing this was meant to handle here.
+  // Not an imperfect nest at all: no counted inner loop, or nothing to sink.
   if (!m.lin || (m.prologue.empty() && m.epilogue.empty()))
     return std::nullopt;
 
-  // From here `outer` is a genuine imperfect nest, so every bail explains why
-  // the scheduler will skip it.
+  // From here `outer` is a genuine imperfect nest, so every bail sets a reason.
   if (innerCount > 1)
     return (reason = "it has sibling inner loops"), std::nullopt;
   if (hasWhile)
@@ -409,9 +402,8 @@ bool isBandRoot(affine::AffineForOp loop) {
 
 // A loop may be coalesced iff it is normalized (lower bound 0, step 1) with a
 // constant trip count, the form that keeps the coalesced body pure-affine, and
-// carries no iter_args. `coalesceLoops` merges the induction spaces but drops
-// loop-carried values, so coalescing a nest with an inner accumulator silently
-// rewrites it to the init constant. Leave such nests be.
+// carries no iter_args: `coalesceLoops` merges the induction spaces but drops
+// loop-carried values, silently rewriting an accumulator to its init constant.
 bool isFlattenable(affine::AffineForOp loop) {
   return loop.getInits().empty() && loop.hasConstantLowerBound() &&
          loop.getConstantLowerBound() == 0 && loop.getStepAsInt() == 1 &&
@@ -420,8 +412,7 @@ bool isFlattenable(affine::AffineForOp loop) {
 
 // Each original induction variable, rebuilt from the coalesced counter (dim 0),
 // transcribed from `coalesceLoops` step 3 so the two cannot drift: the k-th is
-// `counter floordiv (trip counts inside k) mod trip[k]`, with no modulo on the
-// outermost.
+// `counter floordiv (trips inside k) mod trip[k]`, no modulo on the outermost.
 SmallVector<AffineExpr>
 recoveredInductionVars(MutableArrayRef<affine::AffineForOp> band) {
   MLIRContext *ctx = band.front().getContext();
@@ -436,13 +427,9 @@ recoveredInductionVars(MutableArrayRef<affine::AffineForOp> band) {
 }
 
 // Whether coalescing \p band leaves a real divider on the address of any array
-// it accesses. Recovering an induction variable divides by a trip count, which
-// is a shift only when that count is a power of two; otherwise the divider is
-// real, and it chains once the band is three deep. It may equally cancel: the
-// memref's row-major linearization composes back through the delinearization,
-// so an access that walks the band's own iteration space in order addresses
-// with the bare counter. Deciding on the composed expression rather than on the
-// trip counts is what tells those two apart.
+// it accesses. Recovering an induction variable divides by a trip count, but
+// the memref's row-major linearization may compose that divider away, so the
+// decision is made on the composed expression rather than on the trip counts.
 bool coalescingCostsADivider(MutableArrayRef<affine::AffineForOp> band) {
   MLIRContext *ctx = band.front().getContext();
   SmallVector<AffineExpr> recovered = recoveredInductionVars(band);
@@ -471,9 +458,8 @@ bool coalescingCostsADivider(MutableArrayRef<affine::AffineForOp> band) {
         }
         AffineMap coalesced = a->map.replaceDimsAndSymbols(
             dims, syms, next, a->map.getNumSymbols());
-        // A structural question, so the delay table is beside the point: what
-        // decides is whether a divider survives the fold, not how long it
-        // takes.
+        // A structural question: what decides is whether a divider survives the
+        // fold, not how long it takes, so the delay table is empty.
         auto shape = cast<MemRefType>(a->root.getType()).getShape();
         if (addressCost(coalesced, shape, AddressDelays{},
                         AddressDelays::refWidth)
@@ -485,11 +471,10 @@ bool coalescingCostsADivider(MutableArrayRef<affine::AffineForOp> band) {
 }
 
 // Whether \p loop's body holds a synchronous sub-kernel call. Coalescing such a
-// nest delinearizes the induction variables into `iv floordiv N` / `iv mod N`
-// address arithmetic, which lands in the body *beside* the call and forces the
-// merged loop to decompose into an arithmetic sub-region plus a call
-// sub-region, run serially per iteration. Left uncoalesced, the inner loop
-// stays a lone call the loop-over-calls controller fires directly.
+// nest lands delinearization arithmetic beside the call, forcing the merged
+// loop into an arithmetic sub-region plus a call sub-region run serially per
+// iteration. Left uncoalesced, the inner loop stays a lone call the
+// loop-over-calls controller fires directly.
 bool callsSubKernel(affine::AffineForOp loop) {
   return loop
       .walk([](Operation *op) {
@@ -514,16 +499,14 @@ void flattenBand(affine::AffineForOp root,
   while (n < band.size() && isFlattenable(band[n]) && !callsSubKernel(band[n]))
     ++n;
   // Then give back levels until the addresses cost no divider. A level only
-  // ever adds a divisor, so the first band that survives is the longest one
-  // that does.
+  // adds a divisor, so the first band that survives is the longest that does.
   while (n >= 2 && coalescingCostsADivider(band.take_front(n)))
     --n;
   if (n < 2)
     return;
   MutableArrayRef<affine::AffineForOp> loops = band.take_front(n);
   (void)affine::coalesceLoops(loops);
-  // `loops.front()` is the coalesced loop; every level under it was erased, so
-  // it is the only one left to name.
+  // `loops.front()` is the coalesced loop; every level under it was erased.
   info(Stage::Prep, loops.front())
       << "Flattening perfect nest of " << n << " loops";
 }
@@ -543,10 +526,8 @@ struct LoopCanonicalizationPass
     affine::AffineStoreOp::getCanonicalizationPatterns(patterns, ctx);
     FrozenRewritePatternSet compose(std::move(patterns));
 
-    // Drop trip-0 loops first
     eraseNeverTakenLoops(getOperation());
 
-    // promote single-iteration loops first
     getOperation()->walk([&](affine::AffineForOp forOp) {
       (void)affine::promoteIfSingleIteration(forOp);
     });
@@ -579,8 +560,7 @@ struct LoopCanonicalizationPass
     }
 
     // Deeper nests first, so this level decides on the shape the level below
-    // has settled into. A deeper level that roots a band of its own has already
-    // normalized itself here, which is what the guard below needs.
+    // has settled into, already normalized if it roots a band of its own.
     for (Operation *child : nestedLoops(loop))
       canonicalize(child, compose);
 

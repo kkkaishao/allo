@@ -18,13 +18,11 @@
 //   * float: a bare `arith.addf` / `arith.mulf`;
 //   * integer: the frontend's width-extension idiom
 //       trunc_w( core( ext(x), ext(y) ) )
-//     (`core` = arith.addi/muli, `ext` = extsi/extui) emitted so the
-//     intermediate never overflows. Since
+//     (`core` = arith.addi/muli, `ext` = extsi/extui). Since
 //       trunc(ext a `core` ext b) == (a `core` b) mod 2^w,
-//     the reduction is exactly associative; rebalancing only re-groups it, and
-//     the same idiom is rebuilt so operand widths are unchanged. Keying
-//     integers on this idiom (never a bare addi) also keeps index/address
-//     arithmetic untouched.
+//     the reduction is exactly associative, and rebuilding the same idiom
+//     leaves operand widths unchanged. Keying integers on this idiom, never a
+//     bare addi, keeps index/address arithmetic untouched.
 namespace mlir::allo {
 
 inline bool isFloatReductionOp(Operation *op) {
@@ -58,8 +56,8 @@ struct ReductionStep {
 };
 
 // Classify `v` as the result of a reduction step, or an invalid step if `v` is
-// not produced by one. A bare integer add/mul is intentionally *not* matched;
-// only the widened idiom is.
+// not produced by one. A bare integer add/mul is not matched, only the widened
+// idiom.
 inline ReductionStep matchReductionStep(Value v) {
   ReductionStep step;
   Operation *d = v.getDefiningOp();

@@ -2,8 +2,7 @@
  * Copyright Allo authors. All Rights Reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
- * C API for the Allo dialect's custom attributes, so the Python bindings can
- * build and introspect them directly.
+ * C API for the Allo dialect's custom attributes, used by the Python bindings.
  */
 
 #ifndef ALLO_C_ALLOATTRS_H
@@ -19,8 +18,8 @@ extern "C" {
 //===----------------------------------------------------------------------===//
 // PartitionAxisAttr  (#allo.part_axis(dim, kind, factor))
 //
-// `kind` mirrors `allo::PartitionKindEnum`:
-//   0 = Complete, 1 = Block, 2 = Cyclic.
+// `kind` mirrors `allo::PartitionKindEnum`: 0 = Complete, 1 = Block,
+// 2 = Cyclic, 3 = Skew.
 //===----------------------------------------------------------------------===//
 
 MLIR_CAPI_EXPORTED bool alloAttributeIsAPartitionAxis(MlirAttribute attr);
@@ -50,9 +49,8 @@ MLIR_CAPI_EXPORTED MlirAttribute alloPartitionAttrGetAxis(MlirAttribute attr,
 MLIR_CAPI_EXPORTED MlirTypeID alloPartitionAttrGetTypeID(void);
 
 //===----------------------------------------------------------------------===//
-// Enum-backed attributes. `value` is the underlying I32 enum case (see the
-// per-attr comments below and AlloAttrs.td), and Get()/GetValue() round-trip
-// it. All four accessors follow the same shape for every enum attr.
+// Enum-backed attributes. `value` is the underlying I32 enum case, which
+// Get()/GetValue() round-trip. Every enum attr gets the same four accessors.
 //===----------------------------------------------------------------------===//
 
 // AssumeDepTypeAttr (#allo<dep_type inter|intra>): 0 = Inter, 1 = Intra.

@@ -99,10 +99,7 @@ NB_MODULE(_allo, m) {
         return out;
       },
       nb::arg("module"), nb::arg("binding"), nb::arg("top"),
-      nb::arg("cycle_time"),
-      "Lower the functions reachable from `top` to hw.modules in place, rooted "
-      "at `top`; return a JSON object mapping each emitted module name to its "
-      "port-interface manifest.");
+      nb::arg("cycle_time"));
   allo.def(
       "emit_split_verilog",
       [](MlirModule module, const std::string &directory) -> bool {
@@ -126,15 +123,8 @@ NB_MODULE(_allo, m) {
       },
       nb::arg("module"), nb::arg("top"), nb::arg("cycle_time"),
       nb::arg("scheduler") = "heuristic", nb::arg("budget") = 0.0,
-      nb::arg("allocate") = false,
-      "Schedule `top` and reify the schedule into `module` in place as "
-      "`allo.dcp.*` ops; return the schedule report as JSON (regions, per-op "
-      "start times, latencies), or None if scheduling fails. `budget` is what "
-      "one exact solve may spend in deterministic time units; 0 takes the "
-      "default.");
-  allo.def("has_exact_scheduler", &alloHasExactScheduler,
-           "Whether this build accepts `scheduler=\"exact\"`, i.e. links "
-           "OR-Tools.");
+      nb::arg("allocate") = false);
+  allo.def("has_exact_scheduler", &alloHasExactScheduler);
 
   //===--------------------------------------------------------------------===//
   // schedule

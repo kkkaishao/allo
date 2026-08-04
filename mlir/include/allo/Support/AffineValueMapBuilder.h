@@ -17,12 +17,10 @@ namespace mlir::allo {
 // value as an affine expression.
 Value stripCast(Value value);
 
-// Incrementally raises raw SSA index values into a canonical
-// `affine::AffineValueMap`. Unlike `MemRefAccess`, which assumes accesses are
-// already in affine.load/store form over a memref, this builder imports
-// arbitrary index-typed SSA values (constants, affine dims/symbols,
-// affine.apply, and arith add/sub/mul/div/rem chains) so that non-affine ops
-// such as stream accesses can be analyzed with affine machinery.
+// Incrementally raises raw index-typed SSA values (constants, affine
+// dims/symbols, affine.apply, and arith add/sub/mul/div/rem chains) into a
+// canonical `affine::AffineValueMap`, so ops outside affine.load/store form can
+// be analyzed with affine machinery.
 struct AffineValueMapBuilder {
   MLIRContext *ctx;
   SmallVector<Value, 4> dims;
@@ -49,8 +47,8 @@ struct AffineValueMapBuilder {
   // Compose the imported expressions and simplify the resulting map.
   affine::AffineValueMap compose() const;
   // Reset internal state to reuse the builder for another map. The failure
-  // cache is kept, since it accelerates repeated failed import attempts on the
-  // same values.
+  // cache is kept, so a builder must not outlive a rewrite that could make a
+  // cached failure importable.
   void reset();
   // Add results to the final value map. Optional when only the composition of
   // the results matters.

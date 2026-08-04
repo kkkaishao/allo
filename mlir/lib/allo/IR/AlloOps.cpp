@@ -13,7 +13,7 @@
 
 #include "allo/IR/AlloEnums.cpp.inc"
 
-// ISA interfaces must precede the op/type classes that implement them.
+// Op interfaces must precede the op/type classes that implement them.
 #include "allo/IR/AlloOpInterfaces.cpp.inc"
 
 #define GET_OP_CLASSES
@@ -43,8 +43,6 @@ StreamType::verify(llvm::function_ref<InFlightDiagnostic()> emitError,
   }
   return success();
 }
-
-// ISA type/op method bodies live in AlloISATypes.cpp and AlloISAOps.cpp.
 
 Type StreamType::parse(AsmParser &parser) {
   if (parser.parseLess())
@@ -121,16 +119,13 @@ ParseResult KernelOp::parse(OpAsmParser &p, OperationState &result) {
   SmallVector<Type> resTypes;
   auto &builder = p.getBuilder();
 
-  // Parse visibilty
   (void)impl::parseOptionalVisibilityKeyword(p, result.attributes);
 
-  // Parse the name as a symbol
   StringAttr nameAttr;
   if (p.parseSymbolName(nameAttr, SymbolTable::getSymbolAttrName(),
                         result.attributes))
     return failure();
 
-  // Parse the function signature
   bool isVariadic = false;
   if (function_interface_impl::parseFunctionSignatureWithArguments(
           p, false, entryArgs, isVariadic, resTypes, resAttrs))
@@ -142,7 +137,6 @@ ParseResult KernelOp::parse(OpAsmParser &p, OperationState &result) {
   result.addAttribute(getFunctionTypeAttrName(result.name),
                       TypeAttr::get(type));
 
-  // Parse the mapping attribute here
   if (p.parseKeyword("mapping") || p.parseEqual())
     return failure();
   DenseI32ArrayAttr mapping;
@@ -150,21 +144,19 @@ ParseResult KernelOp::parse(OpAsmParser &p, OperationState &result) {
     return failure();
   result.addAttribute(getMappingAttrName(result.name), mapping);
 
-  // If function attributes are present, parse them.
   NamedAttrList parsedAttributes;
   if (p.parseOptionalAttrDictWithKeyword(parsedAttributes))
     return failure();
 
   result.attributes.append(parsedAttributes);
 
-  // Add the attributes to the function arguments.
   assert(resAttrs.size() == resTypes.size());
   call_interface_impl::addArgAndResultAttrs(
       builder, result, entryArgs, resAttrs, getArgAttrsAttrName(result.name),
       getResAttrsAttrName(result.name));
 
-  // Parse the optional function body. The printer will not print the body if
-  // its empty, so disallow parsing of empty body in the parser.
+  // The printer omits an empty body, so the parser must reject one to keep the
+  // round-trip.
   auto *body = result.addRegion();
   SMLoc loc = p.getCurrentLocation();
   OptionalParseResult parseResult =
@@ -173,7 +165,6 @@ ParseResult KernelOp::parse(OpAsmParser &p, OperationState &result) {
   if (parseResult.has_value()) {
     if (failed(*parseResult))
       return failure();
-    // Function body was parsed, make sure its not empty.
     if (body->empty())
       return p.emitError(loc, "expected non-empty function body");
   }
@@ -219,7 +210,6 @@ LogicalResult ReturnOp::verify() {
 }
 
 LogicalResult InvokeOp::verifySymbolUses(SymbolTableCollection &symbolTable) {
-  // Check that the callee attribute was specified.
   auto fnAttr = (*this)->getAttrOfType<FlatSymbolRefAttr>("callee");
   if (!fnAttr)
     return emitOpError("requires a 'callee' symbol reference attribute");
@@ -228,7 +218,6 @@ LogicalResult InvokeOp::verifySymbolUses(SymbolTableCollection &symbolTable) {
     return emitOpError() << "'" << fnAttr.getValue()
                          << "' does not reference a valid kernel";
 
-  // Verify that the operand and result types match the callee.
   auto fnType = fn.getFunctionType();
   if (fnType.getNumInputs() != getNumOperands())
     return emitOpError("incorrect number of operands for callee");
@@ -282,9 +271,8 @@ PartitionAxisAttr::verify(llvm::function_ref<InFlightDiagnostic()> emitError,
   if (dims < 0) {
     return emitError() << "dimension index must be non-negative";
   }
-  // `dim == 0` means "every dimension" for block and cyclic, which a skew
-  // cannot mean: its bank already reads every subscript, and `dim` names the
-  // single one it divides down to make room.
+  // `dim == 0` means "every dimension" for block and cyclic. A skew already
+  // reads every subscript, so its `dim` names the single one it divides down.
   if (kind == PartitionKindEnum::SkewPartition && dims == 0) {
     return emitError() << "skew partition must name its distribution dimension";
   }
@@ -302,8 +290,7 @@ PartitionAttr::verify(llvm::function_ref<InFlightDiagnostic()> emitError,
     return emitError() << "duplicate partition axis detected";
   }
   // A skew reads every subscript, so composing it with another axis would ask
-  // one subscript to serve two digits. Keeping it alone is also what lets the
-  // slot analysis read the bank's linear form off the access map directly.
+  // one subscript to serve two digits.
   if (partitions.size() > 1 &&
       llvm::any_of(partitions, [](PartitionAxisAttr a) {
         return a.getKind() == PartitionKindEnum::SkewPartition;
@@ -348,8 +335,7 @@ LogicalResult StreamPutOp::verify() {
 }
 
 LogicalResult AssumeNoDepOp::verify() {
-  // A distance is an inter-iteration notion; an intra-iteration claim carries
-  // none.
+  // A distance is an inter-iteration notion.
   if (getDistanceAttr() && getDepType() == AssumeDepTypeEnum::Intra)
     return emitOpError() << "'distance' is only meaningful for an inter-"
                             "iteration dependence (dep_type = inter)";
@@ -386,8 +372,7 @@ DCPathComputeOp::verifySymbolUses(SymbolTableCollection &symbolTable) {
 LogicalResult DCPathComputeOp::verify() {
   if (getStart() < 0)
     return emitOpError("start cycle must be non-negative");
-  // Exactly one realization path: a combinational kind or an IP operator
-  // symbol.
+  // Exactly one realization path: a combinational kind or an operator symbol.
   if (getCombKindAttr() && getOpTypeAttr())
     return emitOpError("has both 'comb_kind' and 'op_type'; set exactly one");
   if (!getCombKindAttr() && !getOpTypeAttr())
@@ -397,9 +382,9 @@ LogicalResult DCPathComputeOp::verify() {
 }
 
 LogicalResult DCPathDeviceOp::verify() {
-  // A row this dialect cannot symbolize, or one missing a timing field, would
-  // be silently skipped by `memoryFromDevice`, leaving every array of that
-  // implementation timed at zero: scheduled combinationally, read before valid.
+  // `memoryFromDevice` silently skips a row it cannot symbolize or one missing
+  // a timing field, which would time every array of that implementation at
+  // zero.
   auto verifyTiming = [&](Attribute v, const Twine &what) -> LogicalResult {
     auto d = dyn_cast<DictionaryAttr>(v);
     if (!d)
@@ -424,9 +409,8 @@ LogicalResult DCPathDeviceOp::verify() {
   if (Attribute fifo = getFifoAttr())
     if (failed(verifyTiming(fifo, "fifo")))
       return failure();
-  // An unsymbolizable `default_memory` would be dropped, silently leaving every
-  // unbound array on the library's built-in default rather than the requested
-  // implementation.
+  // An unsymbolizable `default_memory` would be dropped, leaving every unbound
+  // array on the library's built-in default.
   if (StringAttr def = getDefaultMemoryAttr()) {
     std::optional<MemoryImplEnum> impl = symbolizeMemoryImplEnum(def.strref());
     if (!impl)
@@ -438,16 +422,9 @@ LogicalResult DCPathDeviceOp::verify() {
   return success();
 }
 
-// The call's copy of the callee's contract, held to the original.
-//
-// `dcp.instance` carries the callee's `latency` and `determinacy` so the
-// datapath can time the call locally, without a symbol lookup. That makes it a
-// SECOND copy of a number the callee also states, and the two saying different
-// things is a consumer placed at an offset the callee does not honour.
-//
-// After emit the callee is an `hw.module`, which publishes no contract; the
-// signature and timing checks are then skipped and only the symbol must
-// resolve.
+// Hold `dcp.instance`'s local copy of the callee's `latency` and `determinacy`
+// to what the callee publishes. After emit the callee is an `hw.module`, which
+// publishes no contract, so only the symbol must resolve.
 LogicalResult
 DCPathInstanceOp::verifySymbolUses(SymbolTableCollection &symbolTable) {
   Operation *sym = symbolTable.lookupNearestSymbolFrom(*this, getCalleeAttr());
@@ -457,8 +434,7 @@ DCPathInstanceOp::verifySymbolUses(SymbolTableCollection &symbolTable) {
   if (!callee)
     return success();
 
-  // The signature check a `func.call` gets for free: operands are the callee's
-  // arguments in order.
+  // Operands are the callee's arguments in order.
   FunctionType sig = callee.getFunctionType();
   if (sig.getNumInputs() != getInputs().size())
     return emitOpError("passes ")
@@ -527,8 +503,7 @@ LogicalResult DCPathPipelineOp::verify() {
         "the first body argument (induction variable) must have index type");
 
   // The terminator determines the loop kind: dcp.uncondition (counted) or
-  // dcp.condition (while). Either carries one value per iter-arg; a while has
-  // no trip (termination is its condition, not a counter).
+  // dcp.condition (while). Either carries one value per iter-arg.
   if (body.empty() || !body.back().hasTrait<OpTrait::IsTerminator>())
     return emitOpError("body must end with a terminator");
   Operation *term = body.getTerminator();
@@ -542,8 +517,7 @@ LogicalResult DCPathPipelineOp::verify() {
     if (y.getOperands().size() != getInits().size())
       return emitOpError("dcp.uncondition must yield one value per iter-arg");
     // A counted loop terminates on its bound, so it must carry one: the `trip`
-    // attribute or the runtime `dynamicBound`. With neither, the lowering has
-    // no upper bound to compare against and the counter free-runs.
+    // attribute or the runtime `dynamicBound`.
     if (!getTripAttr() && !getDynamicBound())
       return emitOpError("a counted pipeline (dcp.uncondition terminator) "
                          "needs a trip attribute or a dynamicBound operand");
@@ -598,8 +572,8 @@ static ParseResult parseNum(OpAsmParser &p, double &v) {
 }
 
 // A storage-timing record `{rd_lat = N, wr_lat = N, rd_delay = F, wr_delay =
-// F}` (ints kept as ints, delays as compact decimals). Printing is generic over
-// the record's fields; parsing keys the two latency fields to integer type.
+// F}`. Printing is generic over the record's fields; parsing keys the two
+// latency fields to integer type.
 static void printTiming(OpAsmPrinter &p, DictionaryAttr d) {
   p << '{';
   llvm::interleaveComma(d, p, [&](NamedAttribute e) {
@@ -644,8 +618,8 @@ static ParseResult parseTiming(OpAsmParser &p, Attribute &out) {
 }
 
 // Parse the optional determinacy keyword a scheduling region prints just before
-// its attr-dict (e.g. `concurrent`). Any bare keyword in that position is a
-// determinacy class, so an unknown one is an error.
+// its attr-dict. Any bare keyword in that position is a determinacy class, so
+// an unknown one is an error.
 static ParseResult parseOptionalDeterminacy(OpAsmParser &p,
                                             OperationState &result,
                                             StringAttr attrName) {
@@ -669,11 +643,9 @@ void DCPathModuleOp::build(OpBuilder &b, OperationState &state, StringRef name,
   state.addRegion();
 }
 
-// The kernel's timing contract, checked where a caller's composition assumes
-// it. `counted_static` is the class that licenses placing a consumer at a fixed
-// offset from the call, so it is the one that must be backed by an exact
-// number; the reverse direction catches a kernel that HAS one and hides it
-// behind a class no caller composes statically against.
+// The kernel's timing contract. `counted_static` licenses placing a consumer at
+// a fixed offset from the call, so it is the one class that must be backed by
+// an exact latency, and the only one (besides `concurrent`) that may carry one.
 LogicalResult DCPathModuleOp::verify() {
   std::optional<int64_t> lat = getLatency();
   if (getLatencyBound() && !lat)
@@ -684,7 +656,7 @@ LogicalResult DCPathModuleOp::verify() {
     return emitOpError("a counted_static kernel needs an exact latency, not a ")
            << (lat ? "bounded one" : "missing one");
   // A concurrent container's span is a completion floor over self-timed
-  // processes; it may carry one without promising a caller an offset.
+  // processes, so it promises a caller no offset.
   if (exact && d != DeterminacyEnum::CountedStatic &&
       d != DeterminacyEnum::Concurrent)
     return emitOpError("an exact latency contradicts determinacy ")
@@ -994,9 +966,9 @@ ParseResult DCPathPipelineOp::parse(OpAsmParser &p, OperationState &result) {
   int64_t lb = 0, ii;
   if (p.parseArgument(iv) || p.parseEqual())
     return failure();
-  // Lower bound after `=`: an SSA `%operand` (the runtime `lbBound`, resolved
-  // first so it leads the operand segments in the declared order lbBound,
-  // dynamicBound, stepBound) or an integer (a compile-time `lb`, default 0).
+  // Lower bound after `=`: an SSA `%operand` (the runtime `lbBound`) or an
+  // integer (a compile-time `lb`, default 0). Resolved first so it leads the
+  // operand segments in the declared order lbBound, dynamicBound, stepBound.
   bool hasLb = false;
   {
     OpAsmParser::UnresolvedOperand lbOp;
@@ -1012,9 +984,8 @@ ParseResult DCPathPipelineOp::parse(OpAsmParser &p, OperationState &result) {
   }
   if (p.parseKeyword("to"))
     return failure();
-  // Termination bound after `to`: `?` for a while loop (no trip, no bound), an
-  // SSA `%operand` for a runtime upper bound (`dynamicBound`), or an integer
-  // upper bound `ub` from which the `trip` count below is derived.
+  // Termination bound after `to`: `?` for a while loop, an SSA `%operand` for a
+  // runtime `dynamicBound`, or an integer `ub` from which `trip` is derived.
   bool hasBound = false, hasUb = false;
   int64_t ub = 0;
   if (succeeded(p.parseOptionalQuestion())) {
@@ -1034,7 +1005,7 @@ ParseResult DCPathPipelineOp::parse(OpAsmParser &p, OperationState &result) {
     }
   }
   // Optional `step` (default 1): an SSA `%operand` (a runtime `stepBound`) or
-  // an integer. Recorded with `lb` as an attribute only when compile-time and
+  // an integer. `lb` and `step` become attributes only when compile-time and
   // non-default, so the common `lb=0`/`step=1` form round-trips unchanged.
   int64_t step = 1;
   bool hasStep = false;
@@ -1055,9 +1026,8 @@ ParseResult DCPathPipelineOp::parse(OpAsmParser &p, OperationState &result) {
   if (!hasStep && step != 1)
     result.addAttribute(getStepAttrName(result.name),
                         b.getI64IntegerAttr(step));
-  // The constant iteration count is derived from the range ceil((ub-lb)/step)
-  // only when every bound is compile-time (a runtime lb/step has no static
-  // trip).
+  // `trip` is ceil((ub-lb)/step), derived only when every bound is
+  // compile-time.
   if (hasUb && !hasLb && !hasStep)
     result.addAttribute(getTripAttrName(result.name),
                         b.getI64IntegerAttr(std::max<int64_t>(
@@ -1121,8 +1091,8 @@ ParseResult DCPathPipelineOp::parse(OpAsmParser &p, OperationState &result) {
                         result.operands))
     return failure();
   // AttrSizedOperandSegments: the three optional bound operands (lbBound,
-  // dynamicBound, stepBound, each 0 or 1) precede the inits in result.operands,
-  // resolved above in that declared order.
+  // dynamicBound, stepBound, each 0 or 1) precede the inits, resolved above in
+  // that declared order.
   result.addAttribute(
       getOperandSegmentSizesAttrName(result.name),
       b.getDenseI32ArrayAttr({hasLb ? 1 : 0, hasBound ? 1 : 0, hasStep ? 1 : 0,
@@ -1135,8 +1105,8 @@ ParseResult DCPathPipelineOp::parse(OpAsmParser &p, OperationState &result) {
       p.parseOptionalAttrDict(result.attributes))
     return failure();
   // Default to an unconditional terminator when the body has none; a while
-  // pipeline prints its dcp.condition explicitly. The terminator is not
-  // implicit, so this stands in for the SingleBlockImplicitTerminator hook.
+  // pipeline prints its dcp.condition explicitly. Stands in for the
+  // SingleBlockImplicitTerminator hook, which this op does not use.
   Block &blk = region->front();
   if (blk.empty() || !blk.back().hasTrait<OpTrait::IsTerminator>()) {
     OpBuilder tb = OpBuilder::atBlockEnd(&blk);
@@ -1227,8 +1197,7 @@ ParseResult DCPathSequentialOp::parse(OpAsmParser &p, OperationState &result) {
 //===----------------------------------------------------------------------===//
 
 // One branch of a dcp.select must end with a dcp.uncondition yielding one value
-// per select result. \p required rejects an empty branch (the then branch, and
-// the else branch when there are results, since a mux needs both sources).
+// per select result. \p required rejects an empty branch.
 static LogicalResult verifySelectBranch(DCPathSelectOp op, Region &r,
                                         bool required, StringRef which) {
   if (r.empty()) {
@@ -1254,8 +1223,8 @@ LogicalResult DCPathSelectOp::verify() {
   if (failed(verifySelectBranch(*this, getThenRegion(), /*required=*/true,
                                 "then")))
     return failure();
-  // The else branch is required exactly when results are yielded (the derived
-  // result-mux needs a value from both paths); otherwise it is optional.
+  // The else branch is required exactly when results are yielded, since the
+  // derived result-mux needs a value from both paths.
   return verifySelectBranch(*this, getElseRegion(),
                             /*required=*/getNumResults() > 0, "else");
 }

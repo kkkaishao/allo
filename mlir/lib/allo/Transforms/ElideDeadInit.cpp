@@ -47,12 +47,10 @@ bool inThenRegion(affine::AffineIfOp guard, Operation *access) {
 }
 
 // The elements `access` touches, in the array's own index space, symbolic in
-// the `depth` induction variables enclosing the array's declaration. Both the
-// enclosing loop domains and the guards go into the iteration space before it
-// is projected away, so a store below an `affine.if` claims only what it really
-// writes and a store below a loop that may not run claims nothing. Negating the
-// condition an else region escaped splits one system into several, which is why
-// this appends rather than returning one.
+// the `depth` induction variables enclosing the array's declaration. Enclosing
+// loop domains and guards constrain the iteration space, and negating the
+// condition an else region escaped splits one system into several, so this
+// appends rather than returning one.
 LogicalResult elementSets(Operation *access, unsigned depth,
                           SmallVectorImpl<FlatAffineValueConstraints> &out) {
   SmallVector<Operation *, 8> enclosing;
@@ -119,9 +117,9 @@ LogicalResult elementSets(Operation *access, unsigned depth,
     if (failed(system.composeMap(&accessMap)))
       return failure();
     system.setDimSymbolSeparation(system.getNumDimAndSymbolVars() - rank);
-    // Induction variables below `depth` are existentially quantified rather
-    // than projected out: Fourier-Motzkin would over-approximate, and an
-    // over-claimed write is exactly what drops a live initializer.
+    // Induction variables below `depth` are existentially quantified, not
+    // projected out: Fourier-Motzkin would over-approximate, and an
+    // over-claimed write drops a live initializer.
     SmallVector<Value, 4> vars;
     system.getValues(rank, system.getNumDimAndSymbolVars(), &vars);
     for (Value var : vars) {
@@ -175,10 +173,9 @@ PresburgerSet quantifyLastSymbol(PresburgerSet &set) {
   return out;
 }
 
-// Drop a callee summary's symbol columns. A column its body never constrains
-// falls away cleanly, which the exact test below is what establishes: the three
-// arms of an if/elif/else each carry a condition, yet their union may well not.
-// A column the body does constrain names something the caller cannot see.
+// Drop a callee summary's symbol columns, or nullopt when the body constrains
+// one, since such a column names something the caller cannot see. The subset
+// test is what establishes that a column falls away cleanly.
 std::optional<PresburgerSet> dropSymbols(PresburgerSet &set,
                                          unsigned numSymbols) {
   PresburgerSet flat = set;
@@ -191,8 +188,7 @@ std::optional<PresburgerSet> dropSymbols(PresburgerSet &set,
 
 // Values a region built below `root` can carry as a symbol column. The walk
 // fixes its symbol list before it starts, so a symbol missing from this list
-// makes the region unplaceable and the array opaque, rather than silently
-// aligning it against the wrong column.
+// makes the region unplaceable and the array opaque.
 void collectSymbols(Operation *root, SmallVectorImpl<Value> &out) {
   auto note = [&](Value value) {
     SmallVector<Value, 4> worklist{value};
@@ -229,10 +225,9 @@ void collectSymbols(Operation *root, SmallVectorImpl<Value> &out) {
 // --- coverage by an earlier write of the same access -------------------------
 
 // Whether `op` sits in the else region of some `affine.if`.
-// `getEnclosingAffineOps` collects that guard whichever region the access is in
-// and `getIndexSet` then adds its THEN condition, so the iteration domain comes
-// back as the complement of the truth. Coverage argued over such a domain is
-// worthless in both directions, so these accesses stay out of the pairing.
+// `getEnclosingAffineOps` collects that guard whichever region `op` is in and
+// `getIndexSet` then adds its THEN condition, so the iteration domain comes
+// back as the complement of the truth. Such accesses stay out of the pairing.
 bool inElseRegion(Operation *op) {
   for (Region *region = op->getParentRegion(); region;
        region = region->getParentRegion()) {
@@ -247,8 +242,7 @@ bool inElseRegion(Operation *op) {
 }
 
 // Bring a batch of constraint systems into one symbol space. The first round
-// grows `systems[0]` to the union of every symbol, the second aligns the rest
-// to it.
+// grows `systems[0]` to the union of every symbol, the second aligns the rest.
 unsigned alignSymbols(MutableArrayRef<FlatAffineValueConstraints *> systems) {
   for (int round = 0; round < 2; ++round)
     for (unsigned i = 1; i < systems.size(); ++i)
@@ -257,14 +251,11 @@ unsigned alignSymbols(MutableArrayRef<FlatAffineValueConstraints *> systems) {
 }
 
 // Whether every instance of `load` is preceded by a write to the same element,
-// so it never sees what the array held before. Coverage is settled in the
-// READ'S ITERATION SPACE: `checkMemrefAccessDependence` at depth d reports
-// exactly the (write, read) iteration pairs that touch one element with the
-// write earlier at loop d, which is the lexicographic order this needs, for
-// free. This is what carries a scan or a wavefront, where the element sets the
-// walk threads forward never cover the array but each read still trails its own
-// producer. Depths at or outside `initDepth` are unusable: there the
-// initializer re-ran between the two.
+// so it never sees what the array held before. `checkMemrefAccessDependence` at
+// depth d reports the (write, read) iteration pairs that touch one element with
+// the write earlier at loop d, which settles coverage in the read's iteration
+// space. Depths at or outside `initDepth` are unusable: there the initializer
+// re-ran between the two.
 bool coveredByEarlierWrite(Operation *load, ArrayRef<Operation *> stores,
                            unsigned initDepth) {
   if (inElseRegion(load))
@@ -289,9 +280,8 @@ bool coveredByEarlierWrite(Operation *load, ArrayRef<Operation *> stores,
               .value != affine::DependenceResult::HasDependence)
         continue;
       // The pairs are laid out as the writing iteration then the reading one.
-      // Quantifying the writer away leaves the readers it reaches; projecting
-      // it out instead would over-approximate, and over-claimed coverage is
-      // exactly what drops a live initializer.
+      // Quantifying the writer away is exact; projecting it out would
+      // over-approximate, and over-claimed coverage drops a live initializer.
       assert(pairs.getNumDimVars() >= numIvs && "dependence lost the reader");
       unsigned numWriterIvs = pairs.getNumDimVars() - numIvs;
       pairs.convertToLocal(VarKind::SetDim, 0, numWriterIvs);
@@ -320,7 +310,7 @@ bool isFillOf(Operation *op, Value buf) {
 }
 
 // The array traffic this pass models. Anything else hides an access, and a
-// hidden read is exactly what makes an initializer live.
+// hidden read is what makes an initializer live.
 bool isModelledUse(Operation *op, Value buf) {
   return isa<affine::AffineLoadOp, affine::AffineStoreOp, func::CallOp>(op) ||
          isFillOf(op, buf);
@@ -328,9 +318,8 @@ bool isModelledUse(Operation *op, Value buf) {
 
 // --- why an initializer survived ---------------------------------------------
 
-// Debug output only. The point is to size what is left on a workload and to
-// split it by cause, not to explain a single kernel: an array reaching any of
-// these but `Elided` keeps its initializer.
+// Debug output only: an array reaching any of these but `Elided` keeps its
+// initializer.
 enum class Decline {
   Elided,
   DynamicShape,
@@ -364,9 +353,8 @@ StringRef describeDecline(Decline reason) {
   llvm_unreachable("unhandled decline reason");
 }
 
-// The source-level name of a local array, which is what a report has to be read
-// against. The frontend puts it in the allocation's location; a pass-built
-// array has none.
+// The source-level name of a local array, which the frontend puts in the
+// allocation's location. A pass-built array has none.
 std::string nameOf(Operation *alloc) {
   std::string name =
       logging::detail::describe(alloc->getLoc(), /*withFile=*/false);
@@ -426,9 +414,8 @@ struct ArgEffect {
 // since a callee is summarized the same way whoever allocated the argument.
 struct Elider {
   SymbolTableCollection symbols;
-  // Why the last round declined, for the report. A round that elides is
-  // followed by another that does not, so only the driver knows whether these
-  // stand for the array or just terminated a chain.
+  // Why the last round declined, for the report. Only the driver knows whether
+  // these stand for the array or just terminated a chain of elisions.
   Operation *blame = nullptr;
   StringRef detail;
   DenseMap<std::pair<Operation *, unsigned>, std::optional<ArgEffect>> cache;
@@ -450,10 +437,9 @@ struct Elider {
     return set;
   }
 
-  // Fold a read into `exposed`, unless what it reaches is already written or
-  // an earlier write of the same access reaches every one of its iterations.
-  // Only an affine load has an access to pair up that way; a call is a set and
-  // nothing more.
+  // Fold a read into `exposed`, unless what it reaches is already written or an
+  // earlier write of the same access covers every one of its iterations. Only
+  // an affine load has an access to pair up that way; a call is a set.
   void expose(Walk &walk, Operation *reader, PresburgerSet &read,
               PresburgerSet &written, PresburgerSet &exposed) {
     PresburgerSet fresh = read.subtract(written);
@@ -467,11 +453,11 @@ struct Elider {
     exposed = exposed.unionSet(fresh);
   }
 
-  // Thread the two sets forward over `[begin, end)`. `written` under-
-  // approximates the elements every execution has written by the time control
-  // reaches the current op, `exposed` over-approximates the ones read before
-  // any write covered them. Returns false when some effect cannot be modelled
-  // at all, which is a different answer from a read that escapes.
+  // Thread the two sets forward over `[begin, end)`: `written` is an
+  // under-approximation of what every execution has written by the current op,
+  // `exposed` an over-approximation of what is read before a write covered it.
+  // Returns false when an effect cannot be modelled at all, which is a
+  // different answer from a read that escapes.
   bool scan(Walk &walk, Block::iterator begin, Block::iterator end,
             unsigned depth, PresburgerSet &written, PresburgerSet &exposed) {
     for (Block::iterator it = begin; it != end; ++it)
@@ -512,10 +498,9 @@ struct Elider {
       return true;
     }
     // A loop body starts from what was written before the loop and nothing
-    // else: an element the body writes at one iteration is not there yet at the
-    // first. Quantifying the induction variable away on the way out turns the
-    // body's writes into the union over the iteration space, which is empty
-    // when the loop may not run.
+    // else: an element the body writes at one iteration is not there at the
+    // first. Quantifying the induction variable away on the way out unions the
+    // body's writes over the iteration space, empty when the loop may not run.
     if (auto loop = dyn_cast<affine::AffineForOp>(op)) {
       walk.symbols.push_back(loop.getInductionVar());
       PresburgerSet body = withSymbols(written, 1);
@@ -547,9 +532,8 @@ struct Elider {
                            elseWritten, elseExposed))
         return false;
       // Each access below an affine guard carries that guard in its own element
-      // set, one branch's condition and the other's negation, so the branches
-      // simply add up. A data-dependent `scf.if` leaves no condition to fold,
-      // so only what both branches write is certain.
+      // set, so the branches add up. A data-dependent `scf.if` leaves no
+      // condition to fold, so only what both branches write is certain.
       written = affineGuard ? thenWritten.unionSet(elseWritten)
                             : thenWritten.intersect(elseWritten);
       exposed = thenExposed.unionSet(elseExposed);
@@ -641,8 +625,7 @@ struct Elider {
 
   // An initializer this pass may delete once it is proven dead: a whole-array
   // fill, or a loop nest whose only effect is writing this array. Erasing the
-  // nest discards nothing, since a value defined inside a region cannot be used
-  // outside it.
+  // nest discards nothing, since a value defined in a region cannot escape it.
   bool erasable(Operation *init, Value buf) {
     if (isFillOf(init, buf))
       return true;
@@ -750,9 +733,8 @@ struct ElideDeadInitPass
     std::array<unsigned, size_t(Decline::Count)> tally{};
     for (Operation *alloc : allocs) {
       // A chain of initializers collapses one at a time: the survivor of a
-      // round may itself be dead against what follows it. The round that stops
-      // the chain reports why, which only stands for the array when no round
-      // got anywhere.
+      // round may itself be dead against what follows it. The reason from the
+      // round that stops the chain stands for the array only when none elided.
       Decline reason;
       unsigned dropped = 0;
       while ((reason = elider.elideOne(alloc)) == Decline::Elided)

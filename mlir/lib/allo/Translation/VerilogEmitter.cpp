@@ -4,7 +4,7 @@
  */
 
 #include "allo/Translation/VerilogEmitter.h"
-#include "allo/Conversion/Passes.h" // the hlmem lowering this tree owns
+#include "allo/Conversion/Passes.h"
 #include "circt/Conversion/Passes.h"
 #include "circt/Conversion/VerifToSV.h"
 #include "circt/Dialect/Comb/CombDialect.h"
@@ -31,8 +31,8 @@ static void addLowerToSV(PassManager &pm) {
   hwPM.addPass(circt::seq::createLowerSeqCompRegCE());
   pm.addPass(createCanonicalizerPass());
   pm.addPass(createCSEPass());
-  // FIFO lowering also emits verif over/underflow assertions; lower them to SV
-  // (sim-only assertions ExportVerilog understands).
+  // FIFO lowering also emits verif assertions; lower them to the sim-only SV
+  // assertions ExportVerilog understands.
   hwPM.addPass(circt::createLowerVerifToSVPass());
   pm.addPass(circt::createLowerSeqToSVPass());
   pm.nest<circt::hw::HWModuleOp>().addPass(circt::createLowerHWToSVPass());

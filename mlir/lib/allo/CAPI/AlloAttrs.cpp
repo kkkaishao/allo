@@ -74,9 +74,8 @@ MlirTypeID alloPartitionAttrGetTypeID(void) {
 }
 
 //===----------------------------------------------------------------------===//
-// Enum-backed attributes: isa / get(value) / getValue / getTypeID all follow
-// one shape, so generate the four accessors from (CApiName, C++ attr, C++
-// enum).
+// Enum-backed attributes: generate the four accessors isa / get(value) /
+// getValue / getTypeID from (CApiName, C++ attr, C++ enum).
 //===----------------------------------------------------------------------===//
 
 #define ALLO_ENUM_ATTR_CAPI(CApiName, CppAttr, CppEnum)                        \

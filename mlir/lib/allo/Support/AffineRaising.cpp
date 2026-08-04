@@ -18,10 +18,9 @@ using namespace mlir::allo;
 //===----------------------------------------------------------------------===//
 
 // Whether the SSA tree computing \p index contains arithmetic whose affine
-// counterpart is a DIFFERENT function. `arith.divsi` / `arith.remsi` truncate
-// toward zero while an AffineExpr floor-divides and takes a non-negative
-// remainder, and a truncation wraps where an affine expression does not, so the
-// two agree only on operands nothing here can bound.
+// counterpart is a DIFFERENT function: `arith.divsi` / `arith.remsi` truncate
+// toward zero where an AffineExpr floor-divides, and a truncation wraps where
+// an affine expression does not.
 static bool hasNonAffineSemantics(Value index) {
   SmallVector<Value> worklist{index};
   llvm::SmallDenseSet<Value> seen;
@@ -48,8 +47,8 @@ accessMap(AffineValueMapBuilder &builder, OperandRange indices) {
   }
   affine::AffineValueMap map = builder.compose();
   // The builder admits operands an affine op would reject (an Allo worker-id
-  // query is loop-invariant but is not a valid affine symbol), so the composed
-  // map is held to the dialect's own rule rather than assumed to satisfy it.
+  // query is loop-invariant but not a valid affine symbol), so hold the
+  // composed map to the dialect's own rule.
   for (unsigned i = 0, e = map.getNumOperands(); i < e; ++i) {
     Value operand = map.getOperand(i);
     bool ok = i < map.getNumDims() ? affine::isValidDim(operand)
@@ -84,7 +83,7 @@ LogicalResult mlir::allo::raiseAffineAccess(RewriterBase &rewriter,
         rewriter, op->getLoc(), store.getValueToStore(), store.getMemRef(),
         map->getAffineMap(), map->getOperands());
   // The schedule id and key ride on the access and name it to the user, so they
-  // must survive a change of form that is not a change of operation.
+  // must survive the change of form.
   raised->setDiscardableAttrs(op->getDiscardableAttrDictionary());
   rewriter.replaceOp(op, raised->getResults());
   return success();
@@ -110,8 +109,7 @@ unsigned mlir::allo::raiseAffineAccesses(RewriterBase &rewriter,
 //===----------------------------------------------------------------------===//
 
 // Read `select(cmp, a, b)` as min/max, returning {isMax, x, y} such that the
-// result is `isMax ? max(x, y) : min(x, y)`. Both operand orders and both
-// true/false orders are recognized for the four ordering predicates.
+// result is `isMax ? max(x, y) : min(x, y)`.
 static FailureOr<std::tuple<bool, Value, Value>>
 matchSelectAsMinMax(arith::SelectOp sel) {
   auto cmp = sel.getCondition().getDefiningOp<arith::CmpIOp>();
@@ -151,9 +149,9 @@ static LogicalResult collectBinaryBoundExprs(AffineValueMapBuilder &builder,
   return collectBoundExprs(builder, rhs, isLowerBound);
 }
 
-// An affine bound is a MAP with several results, meaning the max (lower) or min
-// (upper) of them, so a max/min in the bound's own arithmetic flattens into
-// extra results rather than blocking the raise.
+// Collect \p value into the builder as bound expressions. An affine bound is a
+// MAP whose results are maxed (lower) or minned (upper), so a max/min in the
+// bound's own arithmetic flattens into extra results.
 static LogicalResult collectBoundExprs(AffineValueMapBuilder &builder,
                                        Value value, bool isLowerBound) {
   Operation *defOp = stripCast(value).getDefiningOp();
@@ -246,9 +244,9 @@ mlir::allo::raiseToAffineFor(RewriterBase &rewriter, scf::ForOp forOp,
   affineLoop->setDiscardableAttrs(forOp->getDiscardableAttrDictionary());
 
   // Swap the terminators, then move the body across. A loop built WITH
-  // iter_args gets no implicit terminator at all, because the builder cannot
-  // know what to yield; one built without gets an empty `affine.yield`. So the
-  // block is emptied rather than its terminator erased.
+  // iter_args gets no implicit terminator at all, one built without gets an
+  // empty `affine.yield`, so the block is emptied rather than the terminator
+  // erased.
   Block *body = affineLoop.getBody();
   if (!body->empty())
     rewriter.eraseOp(&body->back());
@@ -271,8 +269,8 @@ mlir::allo::raiseToAffineFor(RewriterBase &rewriter, scf::ForOp forOp,
 }
 
 // Rebuild every bound map over ONE shared operand list, which is what
-// `affine.parallel` takes: unlike `affine.for`, its per-dimension maps do not
-// each carry their own operands.
+// `affine.parallel` takes: its per-dimension maps carry no operands of their
+// own.
 static FailureOr<std::pair<SmallVector<AffineMap>, SmallVector<Value>>>
 normalizeParallelBounds(ArrayRef<affine::AffineValueMap> bounds) {
   if (bounds.empty())

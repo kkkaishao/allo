@@ -45,9 +45,7 @@ struct OutlineLooseProcessesPass
 
   // Split \p container's entry block into maximal runs of loose (datapath) ops,
   // separated by the calls that order them, and make each run a process of its
-  // own. Run k's call sits where run k was, so program order is preserved and
-  // the scheduler's cross-child ordering and the emitter's start gates see the
-  // same sequence the source had.
+  // own. Run k's call sits where run k was, so program order is preserved.
   void outlineContainer(func::FuncOp container, ModuleOp module) {
     SmallVector<SmallVector<Operation *>> runs;
     SmallVector<Operation *> cur;
@@ -85,8 +83,8 @@ struct OutlineLooseProcessesPass
     };
 
     // Inputs: everything the run reads from outside it. A constant is cloned
-    // into the callee rather than threaded through a port, since it is free
-    // there and a scalar port would cost the container a datapath to drive it.
+    // into the callee rather than threaded through a port, which would cost the
+    // container a datapath to drive it.
     SetVector<Value> inputs;
     SetVector<Operation *> constants;
     for (Operation *op : run)
@@ -111,9 +109,8 @@ struct OutlineLooseProcessesPass
             break;
           }
 
-    // Best effort: a run the structural top could not wire anyway is left
-    // where it is, and the emitter's check reports it. Outlining it into an
-    // unemittable process would only move the error.
+    // A run the structural top could not wire anyway is left where it is; the
+    // emitter's check reports it.
     auto portable = [](Value v) { return portableArg(v.getType()); };
     if (!llvm::all_of(inputs, portable) || !llvm::all_of(outputs, [](Value v) {
           return v.getType().isIntOrFloat();

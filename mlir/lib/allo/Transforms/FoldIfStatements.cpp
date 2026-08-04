@@ -35,20 +35,18 @@ namespace {
 // datapath so the scheduler sees no control flow.
 //===----------------------------------------------------------------------===//
 
-// A stream get/put fires (consumes / produces a token) only where its i1
-// predicate holds; masking it means ANDing the branch condition into that
-// predicate instead of speculating the side effect. This keeps a conditional
-// stream access inside the single pipelined region (II preserved) rather than
-// serializing it as a guard region.
+// A stream get/put fires only where its i1 predicate holds, so masking it means
+// ANDing the branch condition into that predicate instead of speculating the
+// side effect. This keeps a conditional stream access inside the single
+// pipelined region rather than serializing it as a guard region.
 bool isMaskableStream(Operation *op) {
   return isa<StreamGetOp, StreamPutOp>(op);
 }
 
 // An op inside an if body may be speculated (hoisted unconditionally) iff it is
-// a load/store (loads are safe on FPGA; stores are predicated), a stream
+// a load/store (loads are safe on FPGA, stores are predicated), a stream
 // get/put (masked by its predicate), or a region-free pure op. Anything else
-// (a nested loop/if, a call, any other side effect) cannot be masked, so the
-// enclosing if is left alone.
+// cannot be masked, so the enclosing if is left alone.
 bool speculatable(Operation *op) {
   if (isa<affine::AffineLoadOp, affine::AffineStoreOp, memref::LoadOp,
           memref::StoreOp>(op))
@@ -87,8 +85,7 @@ bool insideLoop(Operation *op) {
 
 // A branch op that consumes the predicate when speculated: a store (predicated
 // read-modify-write) or a maskable stream op (predicate operand). A branch with
-// one needs its condition materialized (affine) / negated (else); a pure branch
-// does not.
+// none needs no condition materialized.
 bool consumesPredicate(Operation *op) {
   return isa<affine::AffineStoreOp, memref::StoreOp>(op) ||
          isMaskableStream(op);
@@ -100,10 +97,9 @@ bool needsPredicate(Block *block) {
 }
 
 // Hoist a stream get/put out of the branch and gate it on `pred` (ANDed with
-// any predicate it already carries from an enclosing masked if), so it fires
-// only where the branch is taken. A get's result is forwarded to its uses
-// (garbage when it does not fire, but every such use is itself predicated /
-// selected).
+// any predicate it already carries), so it fires only where the branch is
+// taken. A get's result is forwarded to its uses and is garbage when it does
+// not fire, which is safe because every such use is itself predicated.
 void maskStreamOp(Operation *op, Operation *ifOp, Value pred, RewriterBase &b) {
   b.setInsertionPoint(ifOp);
   Value existing = isa<StreamGetOp>(op) ? cast<StreamGetOp>(op).getPred()
@@ -159,8 +155,8 @@ void predicateBranch(Block *body, Operation *ifOp, Value pred,
 }
 
 // Predicate both branches under `cond` and replace the if's results with
-// selects. `cond` is only consumed by a predicated store or a result select, so
-// a pure guard (no stores, no results) may pass a null `cond`.
+// selects. `cond` is consumed only by a predicated store, a masked stream op or
+// a result select, so a guard with none of those may pass a null `cond`.
 void convertCore(Operation *ifOp, Block *thenBlock, Block *elseBlock,
                  Value cond, RewriterBase &b) {
   Location loc = ifOp->getLoc();
@@ -219,8 +215,8 @@ Value materializeCondition(RewriterBase &b, Location loc,
 }
 
 // affine.if: the condition is an integer set, so materialize it, but only when
-// a value result or a predicated store consumes it, so a value-only guard
-// leaves behind no unused condition ops.
+// a value result or a predicated op consumes it, leaving no unused condition
+// ops behind.
 void convert(RewriterBase &b, affine::AffineIfOp ifOp) {
   OpBuilder::InsertionGuard g(b);
   Block *thenBlock = ifOp.getThenBlock();
@@ -247,8 +243,10 @@ struct HyperblockPredication : OpRewritePattern<IfOpTy> {
                                 PatternRewriter &rewriter) const override {
     if (!canConvert(ifOp))
       return failure();
+    Location loc = ifOp.getLoc();
     convert(rewriter, ifOp);
-    info(Stage::Prep, ifOp) << "Performing if-conversion on hyperblock";
+    log(Level::Info, Stage::Prep, loc)
+        << "Performing if-conversion on hyperblock";
     return success();
   }
 };
@@ -276,12 +274,10 @@ void combineBounds(AffineMap a, ValueRange aOps, AffineMap b, ValueRange bOps,
   outOps.append(bOps.begin() + ndb, bOps.end());   // b symbols
 }
 
-// Whether `e` is affine in dim `pos`: degree 1 with a constant coefficient, so
-// that `e` decomposes exactly as `coeff * d_pos + residual` with `residual`
-// independent of the dim. The dim may be added, subtracted or scaled; feeding
-// it to `mod`/`floordiv`/`ceildiv` makes `e` quasi-affine in it, and no such
-// decomposition exists. (A `mul`'s other side is a constant or a symbol, since
-// an AffineExpr cannot multiply two dims, so degree stays 1 there.)
+// Whether `e` is affine in dim `pos`: it decomposes exactly as
+// `coeff * d_pos + residual` with a constant `coeff` and `residual` independent
+// of the dim. Feeding the dim to `mod`/`floordiv`/`ceildiv` makes `e`
+// quasi-affine in it, where no such decomposition exists.
 static bool isAffineInDim(AffineExpr e, unsigned pos) {
   auto bin = dyn_cast<AffineBinaryOpExpr>(e);
   if (!bin)
@@ -348,8 +344,7 @@ struct FoldGuardIntoLoopBound : OpRewritePattern<affine::AffineIfOp> {
       return failure();
     bool lower = coeff.getValue() == 1;
 
-    // Re-express the bound over the `if`'s operands minus the IV dim
-    // (compacted).
+    // Re-express the bound over the `if`'s operands minus the IV dim.
     SmallVector<AffineExpr> dimRepl;
     SmallVector<Value> boundOperands;
     unsigned newDim = 0;

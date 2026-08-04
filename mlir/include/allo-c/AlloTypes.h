@@ -2,8 +2,7 @@
  * Copyright Allo authors. All Rights Reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
- * C API for the Allo dialect's custom types, so the Python bindings can build
- * and introspect them without round-tripping through textual parsing.
+ * C API for the Allo dialect's custom types, used by the Python bindings.
  */
 
 #ifndef ALLO_C_ALLOTYPES_H

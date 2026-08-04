@@ -50,8 +50,8 @@ MlirLogicalResult alloEmitDatapathToHW(MlirModule module, MlirStringRef binding,
                                            interfaces)))
     return mlirLogicalResultFailure();
   // Combine the per-module interface JSON into one object keyed by module name.
-  // Each value is already valid JSON, so it is embedded verbatim; module names
-  // are plain identifiers (no JSON-escaping needed).
+  // Values are already valid JSON and names are plain identifiers, so neither
+  // needs escaping.
   std::string out = "{";
   bool first = true;
   for (const auto &kv : interfaces) {
@@ -84,25 +84,19 @@ alloRunSDCSchedulingPipeline(MlirModule module, MlirStringRef top,
         << "'; expected \"heuristic\", \"exact\" or \"exact-chaining\"";
     return mlirLogicalResultFailure();
   }
-  // The target clock period: the option, else a 5.0 ns default. Resolved once
-  // here, since both halves price against it and a second copy of the default
-  // is a second answer to what the target frequency is.
+  // The target clock period and the exact-solve budget: the option, else the
+  // default. Both are resolved once here, so no second copy exists downstream.
   float cycleTimeNs = cycleTime > 0.0f ? cycleTime : 5.0f;
-  // Same rule for what one exact solve may spend: the option, else the default,
-  // resolved once so no second copy of it exists downstream.
   allo::SchedulerOptions opts{
       *kind, budget > 0.0 ? budget : allo::kDefaultSolveBudget, allocate};
   if (failed(allo::runPreScheduleVerification(mod, topName, cycleTimeNs)))
     return mlirLogicalResultFailure();
-  // The solved schedule travels between the two halves in memory rather than as
-  // attributes on the IR, so it lives exactly as long as this pipeline does and
-  // its `Operation *` keys cannot outlive the ops they name.
+  // The solved schedule travels between the two halves in memory, not as IR
+  // attributes, so its `Operation *` keys cannot outlive the ops they name.
   allo::ScheduleModel model;
   if (failed(allo::runSDCScheduler(mod, topName, cycleTimeNs, opts, model)))
     return mlirLogicalResultFailure();
   allo::runPostScheduleConversion(mod, model);
-  // The report the reify recorded, which is the only part of the model that
-  // outlives the pipeline.
   std::string report = model.toJSON();
   callback(MlirStringRef{report.data(), report.size()}, userData);
   return mlirLogicalResultSuccess();

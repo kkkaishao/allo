@@ -36,9 +36,8 @@ std::atomic<bool> gMuted{false};
 
 std::shared_ptr<spdlog::sinks::stderr_color_sink_mt> gSink;
 
-// A level that fails the compilation: it is never filtered, and it raises an
-// MLIR diagnostic on its subject. The two call sites below read this rather
-// than each spelling the set out, so they cannot drift.
+// A level that fails the compilation: never filtered, and raising an MLIR
+// diagnostic on its subject.
 bool isFatal(Level level) {
   return level == Level::Error || level == Level::Unsupported;
 }
@@ -114,8 +113,8 @@ void initFromEnv() {
 }
 
 // Diagnostics go to stderr so they never corrupt tool output on stdout. The
-// text carries its own `[LEVEL][STAGE]` prefix; the pattern colorizes the whole
-// line by level and our own threshold does the filtering.
+// text carries its own `[LEVEL][STAGE]` prefix, and filtering is done by our
+// own threshold, not spdlog's.
 spdlog::logger &logger() {
   static std::shared_ptr<spdlog::logger> instance = [] {
     gSink = std::make_shared<spdlog::sinks::stderr_color_sink_mt>();
@@ -187,8 +186,7 @@ void detail::emit(Level level, Stage stage, StringRef where, StringRef message,
   logger().log(toSpdlog(level), "{}", line);
 
   // A fatal message also emits an MLIR diagnostic so the pass fails and the
-  // message surfaces to the caller; the plain message (the op's location is
-  // attached by the diagnostic) is captured, not printed, on the binding path.
+  // message surfaces to the caller. The diagnostic attaches the op's location.
   if (isFatal(level) && subject)
     subject->emitError(message);
 }

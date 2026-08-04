@@ -16,22 +16,13 @@
 
 namespace mlir::allo {
 
-// Raising an op into affine form, which is what decides WHICH ANALYSIS OWNS IT
-// downstream. A `memref` access is outside the polyhedral dependence test, so
-// every pair it takes part in falls to the conservative fallback; an `scf.for`
-// induction variable is not a valid affine dim, so neither the loop nor
-// anything under it can be raised while it stands. Nothing here is a semantic
-// change: an op is raised only when the affine form computes what the original
-// computed.
+// Raising ops into affine form, which is what puts them inside the polyhedral
+// dependence test. An op is raised only when the affine form computes what the
+// original computed.
 //
-// Two callers share this: the `raise-to-affine` pass, which raises everything
-// it can before scheduling, and `transform.allo.raise_to_affine`, which raises
-// the one loop a schedule named.
-//
-// Each entry point builds its own `AffineValueMapBuilder`. Sharing one across a
-// loop raise would be wrong: the builder caches an import FAILURE and keeps it
-// across `reset`, while raising a loop is exactly what turns a value that could
-// not be imported into one that can.
+// Each entry point builds its own `AffineValueMapBuilder`: the builder keeps an
+// import FAILURE across `reset`, while raising a loop is exactly what turns a
+// value that could not be imported into one that can.
 
 /// Raise a `memref.load` / `memref.store` whose subscripts are affine functions
 /// of the enclosing induction variables and loop-invariant values. Fails,

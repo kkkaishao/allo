@@ -29,9 +29,9 @@ namespace {
 
 // Where an array's `allo.part` lives: the op that allocates it, the
 // `memref.global` that declares it, or a function's argument attributes. One
-// physical array has one carrier per function it is visible in, and making
-// those agree is this pass's whole job. Mirrors `MemoryModel`'s `carrierAttr`,
-// which is how the scheduler and the emitter read the attribute back.
+// physical array has one carrier per function it is visible in. Mirrors
+// `MemoryModel`'s `carrierAttr`, which is how the scheduler and the emitter
+// read the attribute back.
 struct Carrier {
   Operation *op;                     // alloc / alloca / memref.global / func
   std::optional<unsigned> argNumber; // set iff `op` is the func owning the arg
@@ -54,8 +54,7 @@ struct Carrier {
 // The carrier \p memref resolves to, or nullopt when this pass cannot name one.
 // A rank-preserving `memref.cast` is followed, since `allo.part` names
 // dimensions and a cast leaves them lined up; a view that RESHAPES is not, as
-// its dimensions are not the underlying array's and the two attributes would
-// not be the same statement.
+// its dimensions are not the underlying array's.
 static std::optional<Carrier> carrierOf(Value memref) {
   while (auto castOp = memref.getDefiningOp<memref::CastOp>()) {
     auto from = dyn_cast<MemRefType>(castOp.getSource().getType());
@@ -101,10 +100,9 @@ static std::string describeCarrier(Carrier &c) {
 
 // Union-find over carriers. Two carriers are the SAME STORAGE when a call
 // passes one as the other's argument: a sub-kernel MASTERS PORTS on the
-// caller's array rather than receiving a copy, so the relation is symmetric,
-// and a partition stated at either end is a statement about one physical array.
-// Two callsites handing different arrays to one callee unify those arrays too,
-// which is the transitive closure the callee's single body demands.
+// caller's array rather than receiving a copy. Two callsites handing different
+// arrays to one callee unify those arrays too, which is the transitive closure
+// the callee's single body demands.
 struct Storage {
   SmallVector<Carrier> carriers;
   SmallVector<unsigned> parent;
@@ -146,9 +144,8 @@ struct PropagatePartitionPass
     if (failed(unifyAcrossCalls(*callsOr, storage)))
       return signalPassFailure();
 
-    // Group in discovery order. The diagnostics below name the carriers that
-    // disagree, and a hashed iteration would leave WHICH one is named to the
-    // allocator.
+    // Group in discovery order: the diagnostics below name the carriers that
+    // disagree, and a hashed iteration would leave WHICH one to the allocator.
     SmallVector<SmallVector<unsigned>> classes;
     DenseMap<unsigned, unsigned> classOf;
     for (unsigned i = 0, e = storage.carriers.size(); i < e; ++i) {
@@ -185,9 +182,8 @@ struct PropagatePartitionPass
           storage.unite(storage.add(*array), storage.add(param));
           continue;
         }
-        // An array whose storage this pass cannot name propagates nothing, and
-        // for an unpartitioned one that is the whole story; a partition stated
-        // at one end has no carrier left to reconcile the other end on.
+        // An array whose storage this pass cannot name propagates nothing; a
+        // partition stated at one end has no carrier to reconcile the other on.
         BankLayout here = bankLayoutOf(actual);
         if (!param.part() && here.numBanks == 1 && !here.registers)
           continue;
@@ -203,12 +199,9 @@ struct PropagatePartitionPass
   }
 
   // Settle one physical array: join every partition stated on any of its
-  // carriers, then write the result back to all of them.
-  //
-  // ONE sweep reaches the fixpoint. Which carriers denote one array follows
-  // from the call graph alone and never from the attributes, so updating a
-  // member cannot give it a neighbour it did not already have, and the join is
-  // associative: folding the class once is folding it to convergence.
+  // carriers, then write the result back to all of them. ONE sweep reaches the
+  // fixpoint, since which carriers denote one array follows from the call graph
+  // alone and never from the attributes, and the join is associative.
   LogicalResult reconcile(Storage &storage, ArrayRef<unsigned> members) {
     MemRefType type = storage.carriers[members.front()].type;
     PartitionAttr joined;
@@ -242,8 +235,7 @@ struct PropagatePartitionPass
       if (c.part() == joined)
         continue;
       // Reaching the top's arguments changes the DESIGN's boundary: each bank
-      // becomes its own port group and the host shards the array by bank. Worth
-      // saying, since the directive that caused it was written elsewhere.
+      // becomes its own port group and the host shards the array by bank.
       if (c.op == topFunc.getOperation())
         info(Stage::Prep, topFunc)
             << "Argument " << *c.argNumber << " of the top kernel takes the "

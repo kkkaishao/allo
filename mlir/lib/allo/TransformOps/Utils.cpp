@@ -118,7 +118,6 @@ LogicalResult resolveBufferAttrCarrier(Value value, Operation *&owner,
     return failure();
 
   if (auto arg = dyn_cast<BlockArgument>(root)) {
-    // Memref introduced as a block argument of a function-like op.
     auto func = dyn_cast<FunctionOpInterface>(arg.getOwner()->getParentOp());
     if (!func)
       return failure();
@@ -127,7 +126,6 @@ LogicalResult resolveBufferAttrCarrier(Value value, Operation *&owner,
     return success();
   }
 
-  // Memref introduced by an alloc-like op or a global.
   Operation *defOp = root.getDefiningOp();
   if (!defOp)
     return failure();

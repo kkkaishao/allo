@@ -14,9 +14,8 @@ extern "C" {
 #endif
 
 /// Emits Vivado HLS C++ for `module`, streaming the result through `callback`.
-/// Returns failure if emission fails (in which case `callback` is not invoked).
-/// `top` names the top function (emitted with `extern "C"` linkage and carrying
-/// the global array_partition pragmas); pass an empty string for none.
+/// `top` names the top function, which is emitted with `extern "C"` linkage and
+/// carries the global array_partition pragmas; pass an empty string for none.
 MLIR_CAPI_EXPORTED MlirLogicalResult
 alloEmitVivadoHLS(MlirModule module, bool enableApFloat, unsigned indexWidth,
                   bool withLocation, MlirStringRef top,
@@ -29,15 +28,11 @@ alloDumpRegionDependenceAnalysis(MlirModule module, MlirStringRef funcName,
 MLIR_CAPI_EXPORTED MlirLogicalResult
 alloEmitVerilog(MlirModule module, MlirStringCallback callback, void *userData);
 
-/// Lowers every scheduled function in `module` to structural `hw.module`s (the
-/// free-function form of `allo-datapath-to-hw`, mutating `module` in place),
-/// and streams back through `callback` a single JSON object mapping each
-/// emitted module's name to its port-interface JSON (the cosim manifest, with
-/// concrete field names). `binding` names the resource-binding policy. Returns
-/// failure (callback not invoked) if emission fails. `cycleTime` is the
-/// resolved target period in ns, the one the scheduler cut against; a binding
-/// decision can lengthen a combinational path, so the emitter is held to it
-/// too.
+/// Lowers every scheduled function in `module` to structural `hw.module`s in
+/// place, and streams back through `callback` the cosim manifest: one JSON
+/// object mapping each emitted module's name to its port-interface JSON.
+/// `binding` names the resource-binding policy, `cycleTime` the resolved target
+/// period in ns. Returns failure (callback not invoked) if emission fails.
 MLIR_CAPI_EXPORTED MlirLogicalResult alloEmitDatapathToHW(
     MlirModule module, MlirStringRef binding, MlirStringRef top,
     double cycleTime, MlirStringCallback callback, void *userData);
@@ -48,20 +43,18 @@ alloEmitSplitVerilog(MlirModule module, MlirStringRef directory);
 /// Schedules `top` and reifies the schedule into `module` in place as
 /// `allo.dcp.*` ops, streaming back through `callback` the schedule report as
 /// JSON: per-func regions with their per-op start times, plus the per-region
-/// and whole-kernel latency. `scheduler` names the solver that settles the
-/// resource half of every scheduling problem: "heuristic" (the SDC simplex plus
-/// greedy placement), "exact" (CP-SAT, only in a build with OR-Tools) or
-/// "exact-chaining". `budget` is what one exact solve may spend, in
-/// deterministic time units; zero or less takes the default. `allocate` lets an
-/// exact solve decide how many copies of each operator a region builds. Returns
-/// failure (callback not invoked) if any phase fails.
+/// and whole-kernel latency. `scheduler` is "heuristic", "exact" (CP-SAT, only
+/// in a build with OR-Tools) or "exact-chaining". `budget` is what one exact
+/// solve may spend, in deterministic time units; zero or less takes the
+/// default. `allocate` lets an exact solve decide how many copies of each
+/// operator a region builds. Returns failure (callback not invoked) on any
+/// failed phase.
 MLIR_CAPI_EXPORTED MlirLogicalResult alloRunSDCSchedulingPipeline(
     MlirModule module, MlirStringRef top, float cycleTime,
     MlirStringRef scheduler, double budget, bool allocate,
     MlirStringCallback callback, void *userData);
 
-/// Whether this build accepts `scheduler = "exact"`, i.e. links OR-Tools. The
-/// option exists in both distributions, so this is what tells them apart.
+/// Whether this build accepts `scheduler = "exact"`, i.e. links OR-Tools.
 MLIR_CAPI_EXPORTED bool alloHasExactScheduler(void);
 
 #ifdef __cplusplus
