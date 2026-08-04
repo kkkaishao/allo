@@ -20,14 +20,11 @@ namespace mlir::allo {
 enum class AccessKind { Array, Stream };
 
 /// A recognized memory access. `root` is the underlying buffer/stream SSA value
-/// (`resolveRoot`, in `Support/AliasAnalysis.h`), so distinct roots are
-/// distinct storage. `map` is the element-space subscript map, one result per
-/// memref dimension, and an ARRAY access always has one: a non-affine
-/// `memref.load/store` carries the identity map over its indices, so every
-/// consumer sees one encoding. `indices` are the subscript operands (array) or
-/// FIFO-select operands (stream); a stream has no map. Whether an access is
-/// AFFINE is a question about the op
-/// (`affine::AffineReadOpInterface`), not about the map.
+/// (`resolveRoot`), so distinct roots are distinct storage. `map` is the
+/// element-space subscript map, one result per memref dimension; an ARRAY
+/// access always carries one, a stream none. `indices` are the subscript
+/// operands (array) or FIFO-select operands (stream). Whether an access is
+/// AFFINE is a question about the op, not about the map.
 struct MemAccess {
   Operation *op = nullptr;
   Value root;

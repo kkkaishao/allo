@@ -16,9 +16,9 @@ using namespace mlir::allo;
 using namespace mlir::allo::dcp;
 
 namespace {
-// An IP operator carries its ABSTRACT kind (`add`/`div`/...), so reconstruct
-// the arith mnemonic it came from. IP compute is always floating-point, and an
-// unmapped kind (a cast, say) already reads as its own mnemonic.
+// The arith mnemonic an IP operator's ABSTRACT kind (`add`/`div`/...) came
+// from. IP compute is always floating-point, and an unmapped kind (a cast, say)
+// already reads as its own mnemonic.
 StringRef ipMnemonic(StringRef kind) {
   return llvm::StringSwitch<StringRef>(kind)
       .Case("add", "addf")
@@ -31,9 +31,9 @@ StringRef ipMnemonic(StringRef kind) {
       .Default(kind);
 }
 
-// The mnemonic a scheduled op is reported under, chosen so it reads as the
-// source op it came from rather than as the dcp op that stands for it.
-// \p kinds maps a `dcp.operator` symbol to its abstract kind.
+// The mnemonic a scheduled op is reported under: the source op it came from
+// rather than the dcp op standing for it. \p kinds maps a `dcp.operator` symbol
+// to its abstract kind.
 std::string opKind(Operation *op, const llvm::StringMap<StringRef> &kinds) {
   if (auto compute = dyn_cast<DCPathComputeOp>(op)) {
     if (std::optional<StringRef> sym = compute.getOpType())
@@ -42,7 +42,7 @@ std::string opKind(Operation *op, const llvm::StringMap<StringRef> &kinds) {
     return stringifyCombOpKindEnum(*compute.getCombKind()).str();
   }
   // A memory access reads as its bare mnemonic; anything else keeps the dcp
-  // qualifier, which is what tells a `dcp.instance` from a `stream.get`.
+  // qualifier, which tells a `dcp.instance` from a `stream.get`.
   StringRef name = op->getName().getStringRef();
   if (isa<DCPathLoadOp, DCPathStoreOp>(op))
     return name.rsplit('.').second.str();
@@ -51,8 +51,7 @@ std::string opKind(Operation *op, const llvm::StringMap<StringRef> &kinds) {
 } // namespace
 
 void mlir::allo::ScheduleModel::record(ModuleOp module) {
-  // A `dcp.operator`'s symbol names the realization, so the impl below needs
-  // only the kind table plus the symbol itself.
+  // A `dcp.operator` symbol to its abstract kind, for `opKind` below.
   llvm::StringMap<StringRef> kinds;
   for (DCPathOperatorOp op : module.getOps<DCPathOperatorOp>())
     kinds[op.getSymName()] = op.getKind();
@@ -99,7 +98,7 @@ void mlir::allo::ScheduleModel::record(ModuleOp module) {
           r.length = (int64_t)*length;
       } else {
         // A control guard: it selects the active data path and carries no
-        // compute of its own (its branch children are reported in turn).
+        // compute of its own; its branch children are reported in turn.
         assert(isa<DCPathSelectOp>(op) && "a region is a pipeline, a "
                                           "sequential or a select");
         r.kind = "guard";
@@ -116,7 +115,7 @@ void mlir::allo::ScheduleModel::record(ModuleOp module) {
         r.determinacy = stringifyDeterminacyEnum(*det).str();
 
       // The DIRECT children only: a nested region's ops belong to that region,
-      // which is what keeps an op from being reported twice.
+      // so no op is reported twice.
       for (Operation &child : op->getRegion(0).front()) {
         auto start = child.getAttrOfType<IntegerAttr>("start");
         if (!start)
@@ -163,8 +162,7 @@ std::string mlir::allo::ScheduleModel::toJSON() const {
                    {"conditional", r.conditional},
                    {"latency_bound", r.latencyBound},
                    {"ops", std::move(ops)}};
-      // A number the region does not have is an absent KEY rather than a null:
-      // a consumer tests for the field it needs instead of for a sentinel.
+      // A number the region does not have is an absent KEY, never a null.
       if (r.ii)
         entry["ii"] = *r.ii;
       if (r.trip)

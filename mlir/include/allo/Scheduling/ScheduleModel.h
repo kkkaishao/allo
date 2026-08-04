@@ -37,21 +37,18 @@ struct OpSchedule {
 struct RegionSolution {
   /// Initiation interval. Empty for a straight-line span, which issues once.
   std::optional<int64_t> ii;
-  /// Schedule DEPTH, the cycle by which every op has completed. A REPORT: it is
-  /// stamped onto the region op for the schedule export, and a span composes
-  /// from `drain` instead, because the solver may leave slack above the last
-  /// commit.
+  /// Schedule DEPTH, the cycle by which every op has completed. A REPORT only:
+  /// a span composes from `drain` instead, since the solver may leave slack
+  /// above the last commit.
   int64_t length = 0;
   /// The region's TERMINAL cycle: how long after its last issue pulse the
   /// deepest output commits, so its `done` rises `drain + 1` cycles after that
   /// pulse. What `leafSpan` composes.
   int64_t drain = 0;
   /// The region's own iteration count, one invocation of it. Empty for a
-  /// straight-line span and for a data-dependent trip nothing bounds.
-  ///
-  /// A TRIP, not a latency: every field here is the region's own and
-  /// per-invocation, so a span is composed where it is used (`composeSpan`) and
-  /// no composed number is stored anywhere to go stale.
+  /// straight-line span and for a data-dependent trip nothing bounds. A TRIP,
+  /// not a latency: every field here is per-invocation, so a span is composed
+  /// where it is used (`composeSpan`) rather than stored.
   std::optional<int64_t> trip;
   /// The trip above is a worst case derived from an `allo.assume.ssa` range
   /// rather than a compile-time constant, so every span composed from it is a
@@ -59,9 +56,8 @@ struct RegionSolution {
   bool tripIsBound = false;
 };
 
-/// One scheduled op as the REPORT names it. Everything here reads off the
-/// reified op, so an op is named the way its source op was rather than by the
-/// dcp op that now stands for it.
+/// One scheduled op as the REPORT names it: read off the reified op, but named
+/// the way its source op was rather than by the dcp op standing for it.
 struct ScheduledOpReport {
   /// An arith/affine-style mnemonic: `addi`, `mulf`, `load`, `stream.get`.
   std::string kind;
@@ -75,9 +71,9 @@ struct ScheduledOpReport {
   std::optional<float> z;
 };
 
-/// One scheduling region as the report names it: a `dcp.pipeline`,
-/// `dcp.sequential` or `dcp.select`, with the ops it issues DIRECTLY. A nested
-/// region's own ops are reported under that region, so an op appears once.
+/// One scheduling region as the report names it, with the ops it issues
+/// DIRECTLY. A nested region's own ops are reported under that region, so an
+/// op appears once.
 struct RegionReport {
   /// `cyclic` for a pipeline, `acyclic` for a straight-line span, `guard` for a
   /// select, which carries no compute of its own.
@@ -90,9 +86,8 @@ struct RegionReport {
   /// a guard).
   bool container = false, conditional = false;
   /// `length` is the schedule DEPTH, the cycle by which every op has completed;
-  /// `drain` is the TERMINAL cycle its `done` composes off. Reported separately
-  /// because a solver may leave slack between them, and only `drain` is
-  /// charged.
+  /// `drain` is the TERMINAL cycle its `done` composes off. Separate because a
+  /// solver may leave slack between them, and only `drain` is charged.
   std::optional<int64_t> ii, trip, length, drain, latency;
   /// The latency above is an upper bound, not an exact count.
   bool latencyBound = false;
@@ -106,8 +101,8 @@ struct RegionReport {
 /// hardware, so it is never stamped as an IR attribute the emitter could read.
 ///
 /// Kept separate from `RegionReport`: a solve is keyed by the affine loop that
-/// owned the problem, which no longer exists by the time the report is built
-/// off the reified `dcp` ops. Both lists are in program order per func.
+/// owned the problem, which no longer exists once the report is built off the
+/// reified `dcp` ops. Both lists are in program order per func.
 struct SolveReport {
   /// The func it belongs to, and where its region is, as the log names it.
   std::string func, where;
@@ -138,20 +133,15 @@ struct FuncReport {
   std::vector<RegionReport> regions;
 };
 
-/// What the scheduling pipeline knows, in the two forms its two phases need.
+/// What the scheduling pipeline knows, in the two forms its two phases need:
+/// the SOLUTION hands `runSDCScheduler`'s start times and region solutions to
+/// `runPostScheduleConversion`, and the REPORT is what the reify builds from
+/// the module it has just written, read back by Python through `toJSON`.
 ///
-/// The SOLUTION is the hand-off from `runSDCScheduler` to
-/// `runPostScheduleConversion`: per-op start times and per-region solutions.
-/// The REPORT is what the reify builds from the module it has just written,
-/// read back by Python through `toJSON`; it is a separate form because by
-/// then `forget` has dropped every op the reify erased, so the solution has
-/// no keys left to read. The two are valid at disjoint times: the solution
-/// between the phases, the report only after.
-///
-/// Keyed by `Operation *`. The two phases run back to back with no pass
-/// between them to fold, rebuild or erase an op, so a key stays valid across
-/// them; `forget` (below) must be called on every erase, since MLIR may hand
-/// an erased op's address to the very next `create`.
+/// The two are valid at disjoint times: the solution between the phases, the
+/// report only after, since by then `forget` has dropped every op the reify
+/// erased. Keyed by `Operation *`, which stays valid across the two phases,
+/// running back to back with no pass between them to fold or rebuild an op.
 class ScheduleModel {
 public:
   /// Record \p op's solved start. An op is scheduled ONCE, by the solver or by
@@ -173,8 +163,8 @@ public:
   }
 
   /// One functional-unit instance an allocation decided to build. The reify
-  /// declares a `dcp.unit` per entry and points the operations that run on it
-  /// at that symbol.
+  /// declares a `dcp.unit` per entry and points the operations running on it at
+  /// that symbol.
   struct AllocatedUnit {
     std::string name;   // the `dcp.unit` symbol, unique across the module
     std::string opType; // the `dcp.operator` it realizes
@@ -210,8 +200,7 @@ public:
 
   /// Open the solution OWNED by \p owner: the innermost loop of a counted band,
   /// a flushing `scf.while`, or a straight-line span's first op. That is the op
-  /// both descents land on, which is what makes it the key rather than a
-  /// synthetic id.
+  /// both descents land on, hence the key.
   RegionSolution &addRegion(Operation *owner) {
     auto [it, inserted] = regions.try_emplace(owner);
     assert(inserted && "a region is solved once");
@@ -237,16 +226,14 @@ public:
   }
 
   /// Regions solved so far, module-wide. Sampled either side of one func to
-  /// tell "this func solved nothing" from "this func solved a zero-cycle span",
-  /// which are different answers to "what latency does it publish".
+  /// tell a func that solved nothing from one that solved a zero-cycle span,
+  /// which publish different latencies.
   size_t regionCount() const { return regions.size(); }
 
   /// Drop everything recorded about \p op, which every erase of a scheduled op
-  /// owes the model.
-  ///
-  /// Not hygiene. MLIR frees an erased op and the next `create` may be handed
-  /// that same address, so a stale entry would answer for an op no phase ever
-  /// scheduled.
+  /// owes the model. MLIR frees an erased op and the next `create` may be
+  /// handed that same address, so a stale entry would answer for an op no
+  /// phase ever scheduled.
   void forget(Operation *op) {
     ops.erase(op);
     regions.erase(op);
@@ -254,8 +241,8 @@ public:
   }
 
   /// Read \p module's reified `allo.dcp.*` ops into `report`. Called once, at
-  /// the tail of the reify, because the facts it collects exist only there:
-  /// before it there are no dcp ops, and after it the pipeline is gone.
+  /// the tail of the reify: before it there are no dcp ops, and after it the
+  /// pipeline is gone.
   void record(ModuleOp module);
 
   /// The report as the JSON document Python parses. Optional fields are
@@ -263,13 +250,12 @@ public:
   /// tests for the field it needs instead of for a sentinel.
   std::string toJSON() const;
 
-  /// The reified schedule, whole-module. Public because it is plain data: the
-  /// reify fills it and the CAPI serializes it, and nothing else reads it.
+  /// The reified schedule, whole-module. Plain data: the reify fills it and the
+  /// CAPI serializes it.
   std::vector<FuncReport> report;
 
   /// What each region's solve cost, in solve order. Filled by the SOLVER, so
-  /// unlike `report` it survives whether or not the reify runs, and it is the
-  /// only per-region compile-time figure anything downstream can read.
+  /// unlike `report` it survives whether or not the reify runs.
   std::vector<SolveReport> solves;
 
 private:

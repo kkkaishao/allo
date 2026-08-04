@@ -25,11 +25,9 @@ using namespace mlir;
 using namespace mlir::allo;
 
 // The storage root an access operates on (views peeled), or null for a
-// non-access. Arrays and streams are BOTH port-limited storage: an array by
-// its memory ports, a stream by its handshake. A FIFO carries exactly one
-// transfer per end per cycle; without a resource for it, several accesses to
-// one channel could land on the same cycle, which the emitter can only
-// reject (their token order would be lost).
+// non-access. Arrays and streams are BOTH port-limited storage: an array by its
+// memory ports, a stream by its handshake, a FIFO carrying exactly one transfer
+// per end per cycle.
 static Value storageOf(Operation *op) {
   auto a = asMemAccess(op);
   return a ? a->root : Value();
@@ -37,10 +35,8 @@ static Value storageOf(Operation *op) {
 
 // Look up attribute \p name on \p memRef's carrier: its defining op, else the
 // function-argument attrs if it is a func argument. A `memref.get_global` is a
-// REFERENCE to storage, not the storage itself, so its carrier is the
-// `memref.global` that declares it, which is where the schedule primitives and
-// `propagate-partition` write; reading the reference instead loses every
-// storage directive given to a global array.
+// REFERENCE to storage, so its carrier is the `memref.global` that declares it,
+// which is where the schedule primitives write.
 template <typename AttrT>
 static AttrT carrierAttr(Value memRef, StringRef name) {
   if (Operation *def = memRef.getDefiningOp()) {
@@ -52,9 +48,8 @@ static AttrT carrierAttr(Value memRef, StringRef name) {
     }
     return def->getAttrOfType<AttrT>(name);
   }
-  // Asked in both phases, of the `func.func` the scheduler works on and of the
-  // `dcp.module` it closes into, so it keys on the interface rather than on
-  // either op.
+  // Asked of the `func.func` the scheduler works on and of the `dcp.module` it
+  // closes into, so it keys on the interface rather than on either op.
   if (auto barg = dyn_cast<BlockArgument>(memRef))
     if (auto func =
             dyn_cast<FunctionOpInterface>(barg.getOwner()->getParentOp()))
@@ -66,8 +61,7 @@ static AttrT carrierAttr(Value memRef, StringRef name) {
 // The three orthogonal axes of an `allo.bind.storage` directive, mapped from
 // its `type` string (port topology + RAM/ROM) and `impl` string (storage
 // primitive). An ABSENT `type` is the dual-port RAM default and an absent
-// `impl` is `Auto` (the array falls to the library's default implementation);
-// an unrecognized one is a frontend/scheduler vocabulary mismatch, asserted.
+// `impl` is `Auto`, the library's default implementation.
 namespace {
 struct BindStorage {
   MemoryPortEnum port = MemoryPortEnum::TrueDualPort;
@@ -81,16 +75,16 @@ static BindStorage parseBindStorage(DictionaryAttr bind) {
   if (!bind)
     return bs;
   // Both vocabularies mirror a Python enum the frontend validates, so every
-  // string reaching here is a known case; mapping through an optional makes
-  // a drifted vocabulary a loud bug instead of a silent fall to the default.
+  // string reaching here is a known case; the optional makes a drifted
+  // vocabulary a loud bug instead of a silent fall to the default.
   if (auto ty = bind.getAs<StringAttr>("type")) {
     auto t = ty.getValue();
     auto port =
         llvm::StringSwitch<std::optional<MemoryPortEnum>>(t)
             .Cases({"ram_1p", "rom_1p"}, MemoryPortEnum::SinglePort)
             .Cases({"ram_2p", "ram_s2p"}, MemoryPortEnum::SimpleDualPort)
-            // 2 shared R/W ports; `fifo` is not a topology, but a stream is
-            // never characterized through here so its mapping is immaterial.
+            // 2 shared R/W ports. `fifo` is not a topology, but a stream is
+            // never characterized through here.
             .Cases({"ram_t2p", "ram_1wnr", "rom_2p", "rom_np", "fifo"},
                    MemoryPortEnum::TrueDualPort)
             .Default(std::nullopt);
@@ -136,8 +130,8 @@ bool mlir::allo::isConstantTable(Value memRef) {
   if (!globalInitOf(memRef))
     return false;
   // A write is an `affine`/`memref` store before reification and a `dcp.store`
-  // after, so cover both. Handing the array to a sub-kernel also disqualifies
-  // it, whichever way the child accesses it (see the header).
+  // after, so cover both. A sub-kernel call disqualifies the array whichever
+  // way the child accesses it (see the header).
   return llvm::none_of(memRef.getUsers(), [](Operation *u) {
     if (isa<dcp::DCPathStoreOp, func::CallOp, dcp::DCPathInstanceOp>(u))
       return true;
@@ -146,11 +140,9 @@ bool mlir::allo::isConstantTable(Value memRef) {
   });
 }
 
-// The storage implementation a memref resolves to: a complete partition
-// scatters into registers (regardless of any bind.storage impl); else an
-// explicit `bind.storage impl`; else the library's default (unbound on-chip
-// arrays default to LUTRAM in Vitis). This is the memref's position on the
-// implementation axis, the input to per-impl access timing.
+// The storage implementation a memref resolves to, the input to per-impl access
+// timing: a complete partition scatters into registers whatever `bind.storage
+// impl` says; else an explicit `bind.storage impl`; else the library default.
 static MemoryImplEnum resolveImpl(Value memRef, MemoryImplEnum defaultImpl) {
   if (bankLayoutOf(memRef).registers)
     return MemoryImplEnum::Register;
@@ -169,17 +161,16 @@ void MemoryBankModel::finalize() {
     Value memRef = entry.first;
     MemInfo &info = entry.second;
     // A stream channel is a FIFO, not an array: one transfer per end per cycle,
-    // no banking or storage-impl axis, and two independent ends, i.e. `splitRW`
-    // at one port each. `bankLayoutOf` below would cast its type to MemRefType.
+    // no banking or storage-impl axis, two independent ends, i.e. `splitRW` at
+    // one port each. `bankLayoutOf` below would cast its type to MemRefType.
     if (isa<StreamType>(memRef.getType())) {
       info.splitRW = true;
       info.readPorts = 1;
       info.writePorts = 1;
       continue; // and its default `layout` is the single unbanked one
     }
-    // Port topology from `allo.bind.storage`. A SimpleDualPort (S2P) RAM has a
-    // dedicated read and write port; every other topology shares its ports for
-    // reads and writes. A ROM has no write port, so it uses shared ports.
+    // A SimpleDualPort (S2P) RAM has a dedicated read and write port; every
+    // other topology shares its ports, a ROM having no write port at all.
     auto bs =
         parseBindStorage(carrierAttr<DictionaryAttr>(memRef, kBindStorageAttr));
     bool constTable = isConstantTable(memRef);
@@ -192,9 +183,8 @@ void MemoryBankModel::finalize() {
       info.sharedPorts = portCount(bs.port);
     }
     info.layout = bankLayoutOf(memRef);
-    // A constant table has no port to contend for (see `isConstantTable`); a
-    // complete partition scattered the array into registers. Either way there
-    // is nothing to bind against.
+    // A constant table has no port to contend for and a complete partition
+    // scattered the array into registers: nothing to bind against either way.
     info.unlimited = info.layout.registers || constTable;
   }
 }
@@ -211,9 +201,8 @@ MemoryBankModel::resources(Operation *op) const {
   if (info.unlimited)
     return {};
 
-  // The pool this access draws from, and its ports per bank. Split (S2P) ->
-  // dedicated read/write pools that never contend; shared -> one `_rw` pool for
-  // both directions.
+  // The pool this access draws from, and its ports per bank. Split (S2P) gives
+  // dedicated read/write pools that never contend, shared one `_rw` pool.
   auto a = asMemAccess(op);
   assert(a && "storageOf named a storage root, so this is a memory access");
   StringRef dir;
@@ -227,9 +216,9 @@ MemoryBankModel::resources(Operation *op) const {
   }
   std::string base = "mem_" + std::to_string(hash_value(memRef));
 
-  // The banks this one access occupies: its assigned bank alone, or every one
-  // of them when it has none and reaches the emitter's crossbar. READ rather
-  // than derived, so the ports billed and the routing built are one fact.
+  // The banks this access occupies: its assigned bank alone, or every one of
+  // them when it has none and reaches the emitter's crossbar. READ rather than
+  // derived, so the ports billed and the routing built are one fact.
   unsigned numBanks = info.layout.numBanks;
   std::optional<unsigned> bank;
   if (numBanks > 1)
@@ -280,9 +269,8 @@ const BankLayout::Axis *BankLayout::skew() const {
 
 // The banking a memref's `allo.part` implies, in element space: each block or
 // cyclic axis splits its dimension into `factor` banks of
-// `ceil(extent/factor)`, and the axes compose in mixed radix; a complete
-// partition scatters into registers (no banks at all). See BankLayout for the
-// single definition this implements.
+// `ceil(extent/factor)`, the axes composing in mixed radix; a complete
+// partition scatters into registers. See BankLayout for the full definition.
 BankLayout bankLayoutOf(Value memRef) {
   BankLayout l;
   auto mt = cast<MemRefType>(memRef.getType());
@@ -292,8 +280,8 @@ BankLayout bankLayoutOf(Value memRef) {
   if (!part)
     return l;
   for (PartitionAxisAttr axis : part.getPartitions()) {
-    // A complete partition scatters the array into registers: no banked
-    // storage to describe, so drop any axis seen so far.
+    // A complete partition leaves no banked storage to describe, so drop any
+    // axis seen so far.
     if (axis.getKind() == PartitionKindEnum::CompletePartition) {
       l.axes.clear();
       l.bankShape.assign(shape.begin(), shape.end());
@@ -326,9 +314,7 @@ BankLayout bankLayoutOf(Value memRef) {
 
 //===--------------------------------------------------------------------===//
 // The partition lattice: the canonical spelling of a banking, and the coarsest
-// banking that satisfies two of them. Lives beside `bankLayoutOf` because it is
-// that decode read as an order: what the join must preserve is exactly what the
-// decode gives each axis.
+// banking that satisfies two of them.
 //===--------------------------------------------------------------------===//
 
 static bool isCompletePartition(PartitionAttr part) {
@@ -344,9 +330,8 @@ static bool hasSkewAxis(PartitionAttr part) {
 }
 
 // The whole-array top, spelled once. `bankLayoutOf` scatters into registers on
-// ANY complete axis whatever dimension it names, so the dimension carries no
-// meaning and normalizing it away is what lets two spellings of "registers"
-// compare equal.
+// ANY complete axis whatever dimension it names, so normalizing the dimension
+// away is what lets two spellings of "registers" compare equal.
 static PartitionAttr completePartition(MLIRContext *ctx) {
   return PartitionAttr::get(
       ctx, {PartitionAxisAttr::get(ctx, PartitionKindEnum::CompletePartition,
@@ -360,8 +345,8 @@ PartitionAttr canonicalizePartition(PartitionAttr part, MemRefType type) {
   if (isCompletePartition(part))
     return completePartition(ctx);
   // `dim == 0` means every dimension, which `bankLayoutOf` expands in
-  // increasing dimension order; doing it here is that same fold made explicit,
-  // so an axis list can be compared one dimension at a time.
+  // increasing dimension order; expanding it here lets an axis list be compared
+  // one dimension at a time.
   SmallVector<PartitionAxisAttr, 4> axes;
   for (PartitionAxisAttr axis : part.getPartitions()) {
     if (axis.getDim() != 0) {
@@ -382,8 +367,7 @@ PartitionAttr canonicalizePartition(PartitionAttr part, MemRefType type) {
 // static extent \p extent. A cyclic residue class modulo F is a union of the
 // classes modulo kF, so a multiple of the factor always refines; a block chunk
 // of `ceil(extent / F)` splits into finer chunks only where the division leaves
-// no remainder, else a finer chunk straddles a coarser boundary and the two
-// bankings are simply different.
+// no remainder, else a finer chunk straddles a coarser boundary.
 static llvm::FailureOr<PartitionAxisAttr> joinAxis(PartitionAxisAttr x,
                                                    PartitionAxisAttr y,
                                                    int64_t extent,
@@ -434,8 +418,8 @@ llvm::FailureOr<PartitionAttr> joinPartitions(PartitionAttr a, PartitionAttr b,
   if (!b)
     return a;
   MLIRContext *ctx = type.getContext();
-  // A complete partition is the top: every element becomes its own register,
-  // which distinguishes every pair of elements and serves every consumer.
+  // A complete partition is the top: every element its own register, which
+  // distinguishes every pair and so serves every consumer.
   if (isCompletePartition(a) || isCompletePartition(b))
     return completePartition(ctx);
   if (hasSkewAxis(a) || hasSkewAxis(b)) {
@@ -445,9 +429,9 @@ llvm::FailureOr<PartitionAttr> joinPartitions(PartitionAttr a, PartitionAttr b,
         << a << " and " << b << " cannot be combined";
     return failure();
   }
-  // Axes on different dimensions compose in mixed radix and need no
-  // reconciling; only a shared dimension has to fold into one axis. The ordered
-  // map is also what puts the result in canonical order.
+  // Axes on different dimensions compose in mixed radix; only a shared
+  // dimension folds into one axis. The ordered map also puts the result in
+  // canonical order.
   std::map<int64_t, PartitionAxisAttr> byDim;
   for (PartitionAxisAttr axis : a.getPartitions())
     byDim.emplace(axis.getDim(), axis);
@@ -470,7 +454,7 @@ llvm::FailureOr<PartitionAttr> joinPartitions(PartitionAttr a, PartitionAttr b,
 // The linear form a skewed axis reads its bank digit from: every subscript,
 // summed. A skew is the only axis of its layout (`PartitionAttr::verify`), so
 // this sees the access's own coordinates rather than a partly peeled set, which
-// is what lets `skewSlotOf` reproduce it from the map alone.
+// lets `skewSlotOf` reproduce it from the map alone.
 static AffineExpr skewSum(ArrayRef<AffineExpr> coord) {
   AffineExpr s = coord.front();
   for (AffineExpr c : coord.drop_front())
@@ -484,8 +468,7 @@ BankSplitExpr bankSplitOf(const BankLayout &layout, AffineMap map,
   assert(map.getNumResults() == shape.size() &&
          "an address map is in element space, one result per memref dimension");
   // The per-bank strides below are products of the trailing extents, so a
-  // dynamic non-leading dim poisons them (the same condition
-  // `linearizeAccessMap` states).
+  // dynamic non-leading dim poisons them.
   assert((shape.empty() ||
           llvm::none_of(shape.drop_front(),
                         [](int64_t d) { return ShapedType::isDynamic(d); })) &&
@@ -522,8 +505,8 @@ BankSplitExpr bankSplitOf(const BankLayout &layout, AffineMap map,
   if (!bank)
     bank = getAffineConstantExpr(0, ctx); // unpartitioned: the one bank
 
-  // What remains linearizes over the PER-BANK extents, which is the address
-  // space one bank actually has.
+  // What remains linearizes over the PER-BANK extents, the address space one
+  // bank actually has.
   SmallVector<int64_t> stride(rank, 1);
   for (int k = static_cast<int>(rank) - 2; k >= 0; --k)
     stride[k] = stride[k + 1] * layout.bankShape[k + 1];
@@ -538,11 +521,10 @@ BankSplitExpr bankSplitOf(const BankLayout &layout, AffineMap map,
 }
 
 // The interval \p e takes over \p ranges, or nullopt when an operand in it is
-// unbounded. Endpoint arithmetic, exact here since every operator is monotone
-// in its argument; the one over-approximation is a residue whose argument
-// straddles a multiple of the divisor, widened to the whole residue class.
-// Both directions are SOUND: a caller acts on `lo == hi` and a wider interval
-// only declines.
+// unbounded. Endpoint arithmetic, exact since every operator is monotone in its
+// argument; the one over-approximation is a residue whose argument straddles a
+// multiple of the divisor, widened to the whole residue class. Widening is
+// SOUND: a caller acts on `lo == hi`, so a wider interval only declines.
 static std::optional<std::pair<int64_t, int64_t>>
 rangeOf(AffineExpr e, ArrayRef<DimRange> ranges) {
   if (auto c = dyn_cast<AffineConstantExpr>(e))
@@ -589,9 +571,9 @@ std::optional<int64_t> staticBankOf(const BankLayout &layout, AffineMap map,
                                     ArrayRef<DimRange> ranges) {
   if (!map)
     return std::nullopt;
-  // "Statically banked" is not a separate predicate: it is the bank
-  // expression taking ONE value, which a constant fold covers directly and a
-  // bounded iteration domain (a block partition's digit) can cover too.
+  // "Statically banked" is the bank expression taking ONE value, which a
+  // constant fold covers directly and a bounded iteration domain (a block
+  // partition's digit) can cover too.
   AffineExpr bank = bankSplitOf(layout, map, shape).bank;
   if (auto cst = dyn_cast<AffineConstantExpr>(bank))
     return cst.getValue();
@@ -612,8 +594,8 @@ std::optional<SkewSlot> skewSlotOf(const BankLayout &layout, AffineMap map,
   unsigned nd = map.getNumDims(), ns = map.getNumSymbols();
   AffineExpr sum = skewSum(map.getResults());
   // The constant part is what the sum reads with every operand at zero, so the
-  // rest is the runtime part. Both halves come from one substitution rather
-  // than from walking the expression, which no shape of affine sum can defeat.
+  // rest is the runtime part. One substitution rather than a walk, which no
+  // shape of affine sum can defeat.
   AffineExpr zero = getAffineConstantExpr(0, map.getContext());
   SmallVector<AffineExpr> zeroDims(nd, zero), zeroSyms(ns, zero);
   auto cst = dyn_cast<AffineConstantExpr>(
@@ -630,8 +612,8 @@ AffineMap linearizeAccessMap(AffineMap map, ArrayRef<int64_t> shape) {
   assert(map.getNumResults() == rank &&
          "an address map is in element space, one result per memref dimension");
   // Row-major strides are a product of the TRAILING extents, so a dynamic
-  // non-leading dim poisons every stride (shape[0] is never read, so a
-  // leading dynamic dim is safe); a rank-0 memref has no stride to poison.
+  // non-leading dim poisons every stride; shape[0] is never read, so a leading
+  // dynamic dim is safe.
   assert((shape.empty() ||
           llvm::none_of(shape.drop_front(),
                         [](int64_t d) { return ShapedType::isDynamic(d); })) &&
@@ -649,7 +631,7 @@ AffineMap linearizeAccessMap(AffineMap map, ArrayRef<int64_t> shape) {
 
 std::optional<unsigned> assignedBankOf(Operation *op) {
   // Two carriers, one fact: a discardable attribute while the access is still
-  // affine, the reified op's own attribute once it is not.
+  // affine, the reified op's own attribute afterwards.
   IntegerAttr bank;
   if (auto l = dyn_cast<dcp::DCPathLoadOp>(op))
     bank = l.getBankAttr();
@@ -672,9 +654,9 @@ MemKindTiming MemoryLibrary::timing(MemoryImplEnum impl) const {
   for (const MemPrimitive &p : primitives)
     if (p.impl == impl)
       return p.timing;
-  // An undeclared primitive gets zero timing. Reaching here with a concrete
-  // (non-Auto) impl means a storage kind the device declares no timing for
-  // would be scheduled at latency 0 (a bug); only a stream (Auto) is zero.
+  // Only a stream (Auto) is legitimately zero. A concrete impl reaching here is
+  // a storage kind the device declares no timing for, which would then be
+  // scheduled at latency 0.
   assert(impl == MemoryImplEnum::Auto &&
          "storage impl not declared by the device -> silent latency-0 access");
   static constexpr MemKindTiming zero;

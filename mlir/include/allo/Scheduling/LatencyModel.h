@@ -21,10 +21,9 @@
 namespace mlir::allo {
 
 /// The cycles a controller family spends at its region's BOUNDARIES, outside
-/// the region's own schedule.
-///
-/// Only STRUCTURAL constants live here; a datapath-derived delay (a condition
-/// cone's `tCond`, a region's `drainStage`) is passed in as a parameter.
+/// the region's own schedule. Only STRUCTURAL constants live here; a
+/// datapath-derived delay (a condition cone's `tCond`, a region's
+/// `drainStage`) is passed in as a parameter.
 struct BoundaryCost {
   /// `start` -> the first body pass issues.
   unsigned arm;
@@ -41,9 +40,8 @@ inline constexpr unsigned kDoneLatchCycles = 1;
 /// their own start, so every launch is registered, the first one included.
 inline constexpr BoundaryCost kContainerBoundary{/*arm=*/1, /*reArm=*/1};
 
-/// A call region's start->done span is the figure a caller composes against, so
-/// its first pass launches on `start` itself through a start-cycle bypass.
-/// Advances still ride the settled register.
+/// A call region's first pass launches on `start` itself through a start-cycle
+/// bypass. Advances still ride the settled register.
 inline constexpr BoundaryCost kCallNodeBoundary{/*arm=*/0, /*reArm=*/1};
 
 /// A sequential-wrapper while re-evaluates its condition on a CHECK pulse one
@@ -62,29 +60,25 @@ inline constexpr BoundaryCost kGuardBoundary{/*arm=*/1, /*reArm=*/1};
 inline constexpr BoundaryCost kAcyclicNestedBoundary{/*arm=*/1, /*reArm=*/1};
 
 /// A TOP-LEVEL acyclic region has no outer counter to wait for, so it arms on
-/// `start` directly, which makes a pure-sequential call container's latency
-/// equal its schedule depth.
+/// `start` directly.
 inline constexpr BoundaryCost kAcyclicTopBoundary{/*arm=*/0, /*reArm=*/0};
 
 /// A PIPELINED leaf's `running` is a register set by `start`, so its first
 /// iteration issues one cycle in. Iterations then overlap at the SOLVED `ii`,
 /// which `leafSpan` takes as a parameter, so `reArm` does not describe this
-/// family and is set equal to `arm`.
+/// family.
 inline constexpr BoundaryCost kPipelinedBoundary{/*arm=*/1, /*reArm=*/1};
 
 /// An EMPTY region, a runtime zero trip or a static `lb >= ub`, never launches
 /// a pass at all: `gateStart` masks the start launch and a register on
 /// `start && isEmpty` feeds the `done` latch. Two cycles, whichever family
-/// drives the region.
-///
-/// A separate constant, not the arithmetic below at trip zero: both
-/// expressions describe the steady state and are written for `trip >= 1`.
+/// drives the region. A separate constant, not the arithmetic below at trip
+/// zero, which describes the steady state and is written for `trip >= 1`.
 inline constexpr int64_t kEmptyRegionCycles = 2;
 
 /// A done-paced region's whole span, given what one pass of its body costs
-/// (\p bodySpan, the sum of its children's spans). Evaluated identically by
-/// the scheduler (over affine/scf loops) and the reifier (over the dcp
-/// regions built from them).
+/// (\p bodySpan, the sum of its children's spans). Evaluated identically by the
+/// scheduler and the reifier.
 inline int64_t containerSpan(const BoundaryCost &boundary, int64_t trip,
                              int64_t bodySpan) {
   if (trip == 0)
@@ -98,8 +92,7 @@ inline int64_t containerSpan(const BoundaryCost &boundary, int64_t trip,
 ///
 /// \p drain is the TERMINAL quantity, the cycles from the last issue pulse to
 /// the deepest output committing, so `done` rises `drain + 1` cycles after that
-/// pulse. It is NOT the schedule depth, which is only the cycle by which every
-/// op has ISSUED.
+/// pulse. It is NOT the schedule depth, above which the solver may leave slack.
 inline int64_t leafSpan(const BoundaryCost &boundary, int64_t trip, int64_t ii,
                         int64_t drain) {
   if (trip == 0)
@@ -108,9 +101,9 @@ inline int64_t leafSpan(const BoundaryCost &boundary, int64_t trip, int64_t ii,
 }
 
 /// One region as the latency model sees it: enough to compose a span, and
-/// nothing else. Built by two structural walks (the scheduler over affine/scf
-/// loops, the reifier over the dcp regions built from them) that both feed
-/// the same composition arithmetic above.
+/// nothing else. Built by two structural walks, the scheduler over affine/scf
+/// loops and the reifier over the dcp regions built from them, that both feed
+/// the composition arithmetic above.
 struct SpanNode {
   RegionShape shape = RegionShape::Leaf;
   /// Iterations of this region's body. Empty when data-dependent (a `while`, a
@@ -119,21 +112,17 @@ struct SpanNode {
   std::optional<int64_t> trip;
   /// A LEAF's own solved schedule: its issue cadence and its TERMINAL cycle,
   /// the delay from the last issue pulse to the deepest output committing. `ii`
-  /// stays empty for an acyclic leaf, which issues once.
-  ///
-  /// `drain` and not the schedule DEPTH: the two differ by however much slack
-  /// the solver left above the last commit, which is a number no boundary
-  /// constant can stand in for.
+  /// stays empty for an acyclic leaf, which issues once. `drain` and not the
+  /// schedule DEPTH, since the solver may leave slack above the last commit.
   std::optional<int64_t> drain, ii;
   /// An INSTANCE element's whole start->done contract (see `instance`).
   std::optional<int64_t> contract;
   /// A worst case the SCHEDULER bounded from an `allo.assume.ssa` range, for a
-  /// node whose own `trip` is data-dependent. Stands in for a span this node
-  /// cannot compose, and only where a bound is a usable answer: exported as a
-  /// kernel's own `latency` (flagged `latency_bound`, so a caller waits it
-  /// out), never as a container's body pass, which has to pace a real counter.
-  /// Carried here because reification keeps the bounded LATENCY but drops the
-  /// assumed TRIP that produced it, so this side cannot re-derive it.
+  /// node whose own `trip` is data-dependent. Usable only as a kernel's own
+  /// `latency` (flagged `latency_bound`, so a caller waits it out), never as a
+  /// container's body pass, which has to pace a real counter. Carried here
+  /// because reification keeps the bounded LATENCY but drops the assumed TRIP
+  /// that produced it.
   std::optional<int64_t> assumedSpan;
   /// A straight-line span rather than a counted loop.
   bool acyclic = false;
@@ -156,28 +145,24 @@ struct SpanNode {
 
 /// The per-invocation span of \p n: its start pulse to its `done` rising. It is
 /// WHOLE, including the node's own arming cost, so a composer only ever sums
-/// spans.
-///
-/// A LEAF runs its own solved schedule and drains it. A DONE-PACED region runs
-/// no schedule of its own: one pass is its body elements in sequence, each
-/// handed to the next through its own `done` latch, and its controller re-arms
-/// between passes.
+/// spans. A LEAF runs its own solved schedule and drains it; a DONE-PACED
+/// region runs its body elements in sequence, each handed to the next through
+/// its own `done` latch.
 ///
 /// nullopt whenever any element is data-dependent, which leaves the enclosing
 /// span unknown rather than guessed.
 std::optional<int64_t> composeSpan(const SpanNode &n);
 
-/// A run of nodes composed in PROGRAM ORDER, each starting on its predecessor's
-/// `done` edge, which costs nothing (`startFor` is a rising edge, not a
-/// register). So this is the sum of their spans, and both compositions in the
-/// compiler are this one function: a done-paced region's body pass, and a
-/// func's top-level regions along one path of their DAG.
+/// A run of nodes composed in PROGRAM ORDER, hence the sum of their spans: each
+/// starts on its predecessor's `done` edge, which costs nothing (`startFor` is
+/// a rising edge, not a register). Both compositions in the compiler are this
+/// one function: a done-paced region's body pass, and a func's top-level
+/// regions along one path of their DAG.
 std::optional<int64_t> composeSequence(llvm::ArrayRef<SpanNode> nodes);
 
 /// For each top-level node, in program order, the earlier nodes it must run
-/// after. \p nodeOps gives the ops each node owns, which is what makes this
-/// IR-agnostic: the scheduler passes its affine scheduling regions and the
-/// reifier its dcp regions.
+/// after. \p nodeOps gives the ops each node owns, which keeps this
+/// IR-agnostic across the scheduler's and the reifier's regions.
 ///
 /// Three signals, the same three the emitter composes on
 /// (`DatapathBuilder::recordSiblingDeps`): a shared memref, a shared stream
@@ -187,24 +172,21 @@ std::optional<int64_t> composeSequence(llvm::ArrayRef<SpanNode> nodes);
 /// PASSED through a node counts as a touch, and two nodes that only READ one
 /// array are still ordered, because they share its ports. A spurious edge only
 /// serializes the model; a missing one claims an overlap the hardware does not
-/// have. That is also why `RegionGraph`'s polyhedral refinement is NOT used
-/// here: it drops exactly the edges the emitter keeps.
+/// have. `RegionGraph`'s polyhedral refinement is therefore NOT used here: it
+/// drops exactly the edges the emitter keeps.
 std::vector<llvm::SmallVector<unsigned, 2>>
 siblingPredecessors(llvm::ArrayRef<llvm::SmallVector<Operation *>> nodeOps);
 
 /// The nodes \p def ultimately reads, given \p owner (op -> owning node) and a
-/// \p def that \p owner does not name. The reifier leaves a pure arith cone at
-/// FUNC SCOPE whenever a top-level loop's induction bound or a top-level
-/// guard's predicate is an expression (`for i in range(start, m+1)` in a
-/// callee, `if k == 0` before a `dcp.select`), and such an op belongs to no
-/// node, so an SSA edge routed through it reads as no edge at all. The cone is
-/// combinational, so it carries the dependence of everything it reads: chase
-/// through it to the ops a node does own.
+/// \p def that \p owner does not name.
 ///
-/// Shared by the two relations that must not disagree about it
-/// (`siblingPredecessors` and `DatapathBuilder::recordSiblingDeps`), which are
-/// otherwise deliberately separate: they read different substrates, but "what
-/// does this value ultimately come from" is one graph question.
+/// The reifier leaves a pure arith cone at FUNC SCOPE for a top-level loop
+/// bound or guard predicate that is an expression, and such an op belongs to no
+/// node, so an SSA edge routed through it reads as no edge at all. The cone is
+/// combinational, so it carries the dependence of everything it reads.
+///
+/// Shared by `siblingPredecessors` and `DatapathBuilder::recordSiblingDeps`,
+/// which must not disagree about it.
 llvm::SmallVector<unsigned, 2>
 ownersThroughScope(Operation *def,
                    const llvm::DenseMap<Operation *, unsigned> &owner);
@@ -223,21 +205,17 @@ composeDag(llvm::ArrayRef<SpanNode> nodes,
 /// the `dcp.instance` elements they hold. `SDC.cpp` has the other, over the
 /// affine/scf loops these were built from.
 ///
-/// Public because the EMITTER composes with it too. A region's span and its
-/// composition class are derived where they are used, not read back off an
-/// attribute, which would be a second copy of a computed number.
-///
-/// \p topLevel is a func's entry block, which composes an exported contract; a
-/// region body composes one pass of a counter. See `dcpSpanNodes`.
+/// A region's span and its composition class are derived where they are used,
+/// never read back off an attribute. For \p topLevel see `dcpSpanNodes`.
 SpanNode dcpSpanNode(Operation *regionOp, bool topLevel);
 
 /// The elements of a reified block, in program order.
 ///
-/// The two scopes differ in what a span is FOR. A func's entry block composes
-/// an exported contract, so an assume-bounded region contributes its bound,
-/// which a caller then waits out. A region body composes one pass of a COUNTER,
-/// where a bound cannot pace anything, so a bounded child leaves the container
-/// done-paced instead.
+/// The two scopes differ in what a span is FOR. \p topLevel is a func's entry
+/// block, which composes an exported contract, so an assume-bounded region
+/// contributes its bound, which a caller then waits out. A region body composes
+/// one pass of a COUNTER, where a bound cannot pace anything, so a bounded
+/// child leaves the container done-paced instead.
 std::vector<SpanNode> dcpSpanNodes(Block &block, bool topLevel);
 
 /// How a materialized region is PACED: which controller family drives it, and
@@ -250,18 +228,13 @@ struct RegionTiming {
 
 /// Derive \p regionOp's pacing from the region itself.
 ///
-/// ONE definition, called twice for two different purposes: the reifier calls
-/// it to STAMP `latency` / `latency_bound` / `determinacy` onto the op, and the
-/// emitter calls it to DECIDE a controller family. Those attributes are
-/// therefore a report of this function, never an input to it.
+/// ONE definition, called twice: the reifier STAMPS `latency` /
+/// `latency_bound` / `determinacy` from it, the emitter DECIDES a controller
+/// family from it. Those attributes are a report of this function, never an
+/// input to it.
 ///
-/// Four classes, tested in order since each shadows the ones after it.
-/// CONCURRENT children run to their own completion ordered by back-pressure, so
-/// a span over them is a floor rather than a hand-off contract. CONDITIONAL
-/// control decides when it ends, so no static span describes it. COUNTED_STATIC
-/// is what remains when a span composes exactly, which is the contract a
-/// container may time-trigger against; INDETERMINATE completes on its real
-/// `done`.
+/// Four classes, tested in order since each shadows the ones after it:
+/// CONCURRENT, CONDITIONAL, COUNTED_STATIC, INDETERMINATE.
 RegionTiming dcpRegionTiming(Operation *regionOp);
 
 /// Func-level: whole-kernel latency in cycles, the top-level regions composed

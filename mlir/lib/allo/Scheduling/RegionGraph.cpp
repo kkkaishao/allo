@@ -118,7 +118,7 @@ bool mlir::allo::isContainerStructure(Operation &op) {
 
 bool mlir::allo::spawnsConcurrently(Operation *invoke) {
   // await, or the same signature test `composesOnStructuralTop` applies
-  // pre-reification (in practice, a Stream operand).
+  // pre-reification, in practice a Stream operand.
   return invoke->hasAttr(kAlloAsyncAttr) ||
          !lowerableSignature(invoke->getOperandTypes(),
                              invoke->getResultTypes());
@@ -145,9 +145,8 @@ SmallVector<SchedRegion> mlir::allo::enumerateRegions(Block &block) {
   for (Operation &op : block) {
     if (op.hasTrait<OpTrait::IsTerminator>())
       continue;
-    // A loop, or an `if` that survived if-conversion (guarding a loop/stream/
-    // call, left opaque), is its own region: a single region-bearing op the
-    // scheduler recurses into, not flattened into a straight-line span.
+    // A loop, or an `if` that survived if-conversion, is its own region: the
+    // scheduler recurses into it rather than flattening it into a span.
     if (isa<affine::AffineForOp, scf::ForOp, scf::WhileOp, affine::AffineIfOp,
             scf::IfOp>(&op)) {
       flush();
@@ -195,8 +194,8 @@ RegionShape mlir::allo::countedLoopShape(LoopLikeOpInterface loop) {
 }
 
 bool mlir::allo::loopBodyDecomposes(LoopLikeOpInterface loop) {
-  // A nested loop anywhere under the body (not just at its top level): an
-  // `if` guarding a loop keeps that loop off the body's own op list, and an
+  // A nested loop anywhere under the body, not just at its top level: an `if`
+  // guarding a loop keeps that loop off the body's own op list, and an
   // affine.for enclosing an scf.for must not be treated as innermost either.
   for (Region *r : loop.getLoopRegions())
     if (r->walk([](Operation *op) {
@@ -245,7 +244,7 @@ const RegionGraph &DependenceAnalysis::getRegionGraph() {
         if (it == sums[j].mem.end())
           continue;
         // A shared-root conflict is a real ordering edge only when the regions'
-        // footprints actually intersect (sub-range refinement inside).
+        // footprints actually intersect.
         auto c = footprintConflict(kv.second, it->second);
         if (c == Conflict::None)
           continue;
@@ -368,10 +367,9 @@ static void buildDepsRec(func::FuncOp fn, SymbolTableCollection &syms,
   });
 }
 
-// Topological sort of the synchronous call graph (callsites as nodes, edges to
-// the callee's callsites). Returns false on a cycle, with a diagnostic on the
-// first callsite in the cycle. The graph is a DAG if the program has no
-// recursive synchronous calls (checked by `checkNoRecursiveCalls`).
+// Topological sort of the synchronous call graph: callsites as nodes, edges to
+// the callee's callsites. Returns false on a cycle, with a diagnostic on the
+// first callsite in it.
 static bool dfs(Operation *op,
                 DenseMap<Operation *, SmallVector<Operation *>> &deps,
                 llvm::SmallPtrSet<Operation *, 32> &visited,
@@ -443,7 +441,7 @@ allo::callGraphPostOrder(func::FuncOp root) {
       order.push_back(callee);
   }
   // The root is not the callee of anything reachable from itself, so it is
-  // appended rather than found; the guard covers a self-recursive shape the
+  // appended rather than found. The guard covers a self-recursive shape the
   // cycle check would already have rejected.
   if (seen.insert(root).second)
     order.push_back(root);

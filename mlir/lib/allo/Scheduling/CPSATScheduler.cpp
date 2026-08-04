@@ -55,8 +55,8 @@ SatParameters solverParameters(double budget) {
   return params;
 }
 
-/// The weight of a precedence edge out of \p src: the cycles a dependent must
-/// wait after \p src issues before the value has arrived.
+/// The weight of a precedence edge out of \p src: the cycles a dependent waits
+/// after \p src issues before the value has arrived.
 int64_t latencyOf(Problem &prob, Operation *src) {
   return *prob.getLatency(*prob.getLinkedOperatorType(src));
 }
@@ -86,26 +86,22 @@ Chaining chainingFor(ProblemT &prob, float cycleTime, bool exactChaining) {
   return chaining;
 }
 
-/// Sub-cycle time is a real quantity (ns) but CP-SAT is integer, so the model
-/// carries it in picoseconds, rounded to the nearest. Device delays are given
-/// to a hundredth of a nanosecond, so a picosecond has enough resolution and
-/// the rounding only absorbs float representation error. Round-to-nearest
-/// (not up) matters because a chain that fills the period exactly is common;
-/// rounding up would reject a schedule the clock actually accepts.
+/// Sub-cycle time in picoseconds, rounded to the nearest: CP-SAT is integer.
+/// Device delays are given to a hundredth of a nanosecond, so a picosecond has
+/// enough resolution and the rounding only absorbs float representation error.
+/// Round-to-nearest and not up, because a chain that fills the period exactly
+/// is common and rounding up would reject a schedule the clock accepts.
 constexpr double kPicosPerNs = 1000.0;
 int64_t picos(double ns) { return std::llround(ns * kPicosPerNs); }
 
-/// States the period as a model constraint rather than as pre-pass edges. Adds
-/// one sub-cycle start time `z` per operation, in picoseconds from the start
-/// of its cycle, matching what `computeStartTimesInCycle` computes afterwards:
+/// States the period as a model constraint rather than as pre-pass edges: one
+/// sub-cycle start time `z` per operation, in picoseconds from the start of its
+/// cycle, matching what `computeStartTimesInCycle` computes afterwards.
+/// `z(v) <= P - inDelay(v)`, and where a def-use producer u ends in the cycle v
+/// starts, `z(v) >= (lat(u) == 0 ? z(u) : 0) + outDelay(u)`.
 ///
-///   * `z(v) <= P - inDelay(v)`: v's inputs reach its first register (or its
-///     output, if combinational) inside the period;
-///   * where a def-use producer u ENDS in the cycle v starts (`t_v - t_u ==
-///     lat(u)`), `z(v) >= (lat(u) == 0 ? z(u) : 0) + outDelay(u)`: v waits for
-///     the chain it sits on. Precedence already forces `t_v - t_u >= lat(u)`,
-///     so gating on the `<=` half alone (via `sameCycle`) is enough to detect
-///     "ends in the same cycle".
+/// Precedence already forces `t_v - t_u >= lat(u)`, so gating on the `<=` half
+/// alone (via `sameCycle`) detects "ends in the same cycle".
 ///
 /// Only def-use edges carry a combinational path; an auxiliary edge (memory
 /// order, stream order, loop-carried recurrence) always passes through a port
@@ -179,8 +175,7 @@ void addChaining(CpModelBuilder &model, ProblemT &prob,
 
 /// Derive the solved schedule's sub-cycle start times and check the period.
 /// `ChainingProblem` does not carry the period itself, so this is the only
-/// place that verifies chains fit it; a miss would be a timing failure in
-/// silicon that nothing downstream would otherwise catch.
+/// place that verifies chains fit it.
 LogicalResult finishSchedule(ChainingProblem &prob, float cycleTime) {
   if (failed(computeStartTimesInCycle(prob)))
     return failure();
@@ -190,8 +185,8 @@ LogicalResult finishSchedule(ChainingProblem &prob, float cycleTime) {
 }
 
 /// The region's drain as a variable: the max of `start(op) + offset` over the
-/// same terms `drainOf` maxes over (lower bounds only, tight since the
-/// objective minimizes it).
+/// same terms `drainOf` maxes over, stated as lower bounds only, which is tight
+/// since the objective minimizes it.
 ///
 /// \p bound caps it at an incumbent's, so the solver only searches schedules
 /// that would beat it; an INFEASIBLE result then means "nothing beats the
@@ -219,7 +214,7 @@ struct AllocationVar {
 /// Declare `N_r` for every allocatable resource: how many copies of one
 /// operator this region builds, in `[1, ceiling]` and hinted at the ceiling so
 /// the heuristic's schedule stays a consistent hint. The caller states the
-/// capacity constraint.
+/// capacity constraint against it.
 SmallVector<AllocationVar> allocationVars(CpModelBuilder &model,
                                           OccupancyProblem &prob) {
   SmallVector<AllocationVar> allocs;
@@ -236,25 +231,13 @@ SmallVector<AllocationVar> allocationVars(CpModelBuilder &model,
 }
 
 /// Minimize \p primary, with the region's area as the tie-break below it,
-/// weighted so the two never interact: `primary` (the region's span) is
-/// settled first, and the tie-break decides only among schedules that reach
-/// it.
+/// weighted so the two never interact: `primary` is settled first, and the
+/// tie-break decides only among schedules that reach it.
 ///
-/// The tie-break has three terms, all counted in flip-flops:
-///
-///   * `width(v) * depth(v)` per value carried in a delay chain
-///     (`RegisterTerm`);
-///   * the sum of all start times at weight one: a 1-bit activation-pulse
-///     chain per cycle of an op's start offset;
-///   * `cost(r) * N_r` per allocatable operator: the instances this region
-///     builds, priced at the flip-flops one holds in its own pipeline.
-///
-/// The weights are the hardware's own, not a tuning knob: a value chain is
-/// `width` times a pulse chain because it is `width` flip-flops wide. The
-/// three terms pull against each other, so one currency settles the trade:
-/// register depth wants a producer late and its readers early, the pulse term
-/// settles the chain's interior, and sharing an operator forces two operations
-/// into different cycles, which lengthens lifetimes.
+/// The tie-break counts flip-flops: `width(v) * depth(v)` per value in a delay
+/// chain (`RegisterTerm`), every start time at weight one (a 1-bit activation
+/// pulse chain per cycle of start offset), and `cost(r) * N_r` per allocatable
+/// operator, priced at the flip-flops one instance holds in its own pipeline.
 void minimizeCost(CpModelBuilder &model, IntVar primary,
                   ArrayRef<IntVar> starts, const SpanObjective &span,
                   DenseMap<Operation *, IntVar> &startVars,
@@ -286,7 +269,7 @@ void minimizeCost(CpModelBuilder &model, IntVar primary,
   model.Minimize(LinearExpr::WeightedSum(vars, weights));
 }
 
-/// The unit counts one solve decided, held apart from the problem because the
+/// The unit counts one solve decided. Held apart from the problem because the
 /// cyclic search runs many solves and only the adopted one's counts stand.
 using Allocated = SmallVector<std::pair<Problem::ResourceType, unsigned>>;
 
@@ -327,8 +310,8 @@ void applyAllocation(OccupancyProblem &prob, const Allocated &decided,
 }
 
 /// Report a solve that produced nothing usable and leave the heuristic's
-/// schedule in place. `warn`, not `error` or `unsupported`: the compile is
-/// still correct, it just did not get a better schedule.
+/// schedule in place. A `warn`: the compile is still correct, it just did not
+/// get a better schedule.
 void reportUnsolved(Problem &prob, const CpSolverResponse &response,
                     double budget) {
   assert(response.status() != CpSolverStatus::INFEASIBLE &&
@@ -348,17 +331,15 @@ void reportUnsolved(Problem &prob, const CpSolverResponse &response,
 // The acyclic solve.
 //===----------------------------------------------------------------------===//
 
-/// Refines the heuristic's acyclic schedule to the CP-SAT optimum. The
-/// heuristic runs first as a feasibility check and a warm-start hint: its
-/// resource-free LP is the only thing that can fail, so a failure here is
-/// fatal (unlike the cyclic path, where placement is optional). The horizon is
-/// the whole region laid out end to end, wide enough to contain the
-/// heuristic's own schedule without excluding a shorter one.
+/// Refines the heuristic's acyclic schedule to the CP-SAT optimum.
 ///
-/// A straight-line region runs once, so its whole cost is its drain; that is
-/// what the objective minimizes, with the sum of all starts as a tie-break so
-/// an off-path operation cannot drift for free. The drain is upper-bounded by
-/// the heuristic's own, pruning like a branch-and-bound incumbent.
+/// The heuristic runs first as a feasibility check and a warm-start hint: its
+/// resource-free LP is the only thing that can fail, so a failure here is
+/// fatal, unlike the cyclic path where placement is optional.
+///
+/// A straight-line region runs once, so its whole cost is its drain, which the
+/// objective minimizes, upper-bounded by the heuristic's own drain so the
+/// search prunes like a branch and bound.
 LogicalResult mlir::allo::scheduleCPSAT(ChainingSharedOperatorsProblem &prob,
                                         Operation *lastOp, float cycleTime,
                                         const SpanObjective &span,
@@ -370,16 +351,15 @@ LogicalResult mlir::allo::scheduleCPSAT(ChainingSharedOperatorsProblem &prob,
     return failure();
 
   // The pre-pass is schedule-independent, so taking its edges hands CP-SAT the
-  // chain breaks the heuristic just used, leaving greedy resource placement as
-  // the only difference between the two schedules.
+  // chain breaks the heuristic just used.
   Chaining chaining =
       chainingFor(prob, cycleTime, opts.kind == SchedulerKind::ExactChaining);
 
   const auto &ops = prob.getOperations();
 
-  // Horizon: the whole region laid out end to end (each op after the
-  // previous one's end, its occupancy window, plus a spare cycle), wide
-  // enough that every precedence, chain break and reservation is satisfiable.
+  // Horizon: the whole region laid out end to end (each op after the previous
+  // one's end, its occupancy window, plus a spare cycle), wide enough that
+  // every precedence, chain break and reservation is satisfiable.
   unsigned horizon = 0;
   for (Operation *op : ops)
     horizon += latencyOf(prob, op) + prob.getResourceCycles(op) + 1;
@@ -406,9 +386,9 @@ LogicalResult mlir::allo::scheduleCPSAT(ChainingSharedOperatorsProblem &prob,
                            startVars.at(dep.getDestination()));
   addChaining(model, prob, startVars, chaining);
 
-  // Resources: an op occupies one instance of every unit it links to for its
-  // whole window, so a cumulative constraint per resource matches
-  // `verifyOccupancy`. Multi-unit ops contribute the same window to each.
+  // An op occupies one instance of every unit it links to for its whole window,
+  // so a cumulative constraint per resource matches `verifyOccupancy`. A
+  // multi-unit op contributes the same window to each.
   auto cumulativeOn = [&](Problem::ResourceType rsrc, LinearExpr capacity) {
     CumulativeConstraint cumulative = model.AddCumulative(std::move(capacity));
     for (Operation *op : ops)
@@ -443,9 +423,8 @@ LogicalResult mlir::allo::scheduleCPSAT(ChainingSharedOperatorsProblem &prob,
     return success();
   }
 
-  // FEASIBLE (not OPTIMAL) means the budget stopped short of proving it, so
-  // what ships is an incumbent, never worse than the heuristic's but not known
-  // to be best.
+  // FEASIBLE and not OPTIMAL means the budget stopped short of proving it, so
+  // what ships is an incumbent.
   if (response.status() != CpSolverStatus::OPTIMAL)
     warn(Stage::Sched, prob.getContainingOp())
         << "Exact scheduling ran out of budget before proving this region's "
@@ -480,17 +459,14 @@ enum class ModuloOutcome { Scheduled, Infeasible, Exhausted };
 
 /// A lower bound on the region's drain at ANY initiation interval: the longest
 /// chain of intra-iteration (distance-0) edges reaching an output. An edge
-/// spanning iterations is relaxed by one II per iteration it spans, so only
-/// the distance-0 subgraph bounds a start time regardless of interval width,
-/// and resources only push starts later.
-///
-/// This keeps the branch and bound's cut tight: cutting on `(trip - 1) * ii`
-/// alone is sound but useless once the drain dwarfs the trip, since every
-/// interval up to the trip would pass the cut and get scanned at full budget.
+/// spanning iterations is relaxed by one II per iteration it spans, so only the
+/// distance-0 subgraph bounds a start time regardless of interval width, and
+/// resources only push starts later. This is what keeps the branch and bound's
+/// cut tight once the drain dwarfs the trip.
 ///
 /// Only \p chaining's break edges lengthen a path here; where the period is
 /// stated in the model instead there are no break edges, and the bound is
-/// simply looser (still sound).
+/// simply looser, still sound.
 int64_t drainFloor(ChainingModuloProblem &prob, const Chaining &chaining,
                    ArrayRef<DrainTerm> terms) {
   // Incoming edges by destination, weighted as the model weights them.
@@ -528,21 +504,19 @@ int64_t drainFloor(ChainingModuloProblem &prob, const Chaining &chaining,
 }
 
 /// Solve \p prob at the FIXED initiation interval \p ii, writing the start
-/// times into \p starts when one exists.
+/// times into \p starts when one exists. Fixing the II keeps the model linear:
+/// `ii * distance` in a precedence edge and the modulo congruence below would
+/// otherwise need a variable modulus.
 ///
-/// Fixing the II keeps the model linear: `ii * distance` in a precedence edge
-/// and the modulo congruence below would otherwise need a variable modulus.
+/// \p hint is only valid when the greedy placement itself reached this II; at
+/// any other II its start times are not a schedule.
 ///
-/// \p hint is only valid when the greedy placement itself reached this II;
-/// at any other II its start times are not a schedule and hinting them would
-/// only buy a repair.
+/// \p proven is OPTIMAL against FEASIBLE, which the II search cannot otherwise
+/// tell apart, and an unproven placement's drain is still what the region's
+/// span gets charged.
 ///
-/// \p proven is OPTIMAL vs. FEASIBLE (budget ran out with an incumbent): the
-/// II search cannot otherwise tell the two apart, and an unproven placement's
-/// drain is still what the region's span gets charged.
-///
-/// \p drainBound is the incumbent's, so INFEASIBLE here means "nothing beats
-/// the incumbent at this II" rather than a proof the interval is impossible.
+/// \p drainBound is the incumbent's, so INFEASIBLE here means nothing beats the
+/// incumbent at this II rather than a proof the interval is impossible.
 ModuloOutcome solveAtII(ChainingModuloProblem &prob, Operation *lastOp,
                         const Chaining &chaining, const SpanObjective &span,
                         const SchedulerOptions &opts,
@@ -583,8 +557,8 @@ ModuloOutcome solveAtII(ChainingModuloProblem &prob, Operation *lastOp,
   addChaining(model, prob, startVars, chaining);
 
   // One-hot congruence class per contending op. `t = ii*lap + sum(p*slot[p])`
-  // over a one-hot slot defines class and modulo at once, with no
-  // reification: slot[p] IS membership in class p, which the sums below need.
+  // defines class and modulo at once with no reification: slot[p] IS membership
+  // in class p, which the sums below need.
   DenseMap<Operation *, SmallVector<BoolVar>> slotsOf;
   SmallVector<int64_t> classes(ii);
   for (unsigned p = 0; p < ii; ++p)
@@ -642,9 +616,9 @@ ModuloOutcome solveAtII(ChainingModuloProblem &prob, Operation *lastOp,
       model.AddLessOrEqual(usesIn(alloc.rsrc, slot), alloc.units);
   }
 
-  // `(trip - 1) * ii` is constant at a fixed II, so minimizing the span here
-  // is minimizing the drain; the outer search carries the II term. With no
-  // span to compose, the anchor's start time takes the primary slot instead.
+  // `(trip - 1) * ii` is constant at a fixed II, so minimizing the span here is
+  // minimizing the drain; the outer search carries the II term. With no span to
+  // compose, the anchor's start time takes the primary slot instead.
   std::optional<IntVar> drainVar;
   if (span.trip)
     drainVar = drainVariable(model, startVars, span.drain, horizon, drainBound);
@@ -672,10 +646,9 @@ ModuloOutcome solveAtII(ChainingModuloProblem &prob, Operation *lastOp,
 } // namespace
 
 /// Refines the heuristic's modulo (cyclic) schedule by searching fixed II
-/// values from the heuristic's own II lower bound upward, as a branch and
-/// bound on the region's span. This path only needs the heuristic's II lower
-/// bound (from the resource-free LP); its placement is optional context
-/// (`SimplexWarmStart`), not a precondition.
+/// values from the heuristic's own II lower bound upward, as a branch and bound
+/// on the region's span. Only that lower bound (from the resource-free LP) is
+/// needed; the heuristic's placement is optional context (`SimplexWarmStart`).
 ///
 /// The search cannot return at the first feasible II: what the region is
 /// charged is `(trip - 1) * ii + drain`, and a larger II can still win by
@@ -686,8 +659,6 @@ LogicalResult mlir::allo::scheduleCPSAT(ChainingModuloProblem &prob,
                                         unsigned minII,
                                         const SpanObjective &span,
                                         const SchedulerOptions &opts) {
-  // Needs only the heuristic's II lower bound from the LP; its placement is
-  // optional (see SimplexWarmStart) and not required to succeed.
   SimplexWarmStart warm;
   if (failed(
           mlir::allo::scheduleSimplex(prob, lastOp, cycleTime, minII, &warm)))
@@ -702,9 +673,9 @@ LogicalResult mlir::allo::scheduleCPSAT(ChainingModuloProblem &prob,
   Chaining chaining =
       chainingFor(prob, cycleTime, opts.kind == SchedulerKind::ExactChaining);
 
-  // Window: region laid out end to end (satisfies precedence + chain
-  // breaks) plus one II per contending op, widened to the heuristic's own
-  // reach. Must be provably sufficient, since INFEASIBLE here counts as proof.
+  // Window: region laid out end to end (satisfying precedence and chain breaks)
+  // plus one II per contending op, widened to the heuristic's own reach. Must
+  // be provably sufficient, since INFEASIBLE here counts as proof.
   const auto &ops = prob.getOperations();
   int64_t sequential = 0;
   int64_t greedyReach = 0;
@@ -729,14 +700,14 @@ LogicalResult mlir::allo::scheduleCPSAT(ChainingModuloProblem &prob,
       warm.placed ? greedyII : std::max(warm.lowerBoundII, totalOccupancy);
 
   // The part of `leafSpan` this solve controls. With no trip there is no span
-  // to compare across intervals and the search keeps its old shape: the first
-  // feasible II, placed as shallowly as the anchor objective can manage.
+  // to compare across intervals, so the search takes the first feasible II,
+  // placed as shallowly as the anchor objective can manage.
   bool bySpan = span.trip.has_value();
   int64_t iiWeight = bySpan ? *span.trip - 1 : 0;
 
   // The incumbent: bounds every model below, and is the fallback if none beats
-  // it. Without it, a budget-limited placement at a new II is unbounded and
-  // can ship a schedule worse than the heuristic's.
+  // it. Without it, a budget-limited placement at a new II is unbounded and can
+  // ship a schedule worse than the heuristic's.
   std::optional<int64_t> heuristicSpan;
   if (bySpan && warm.placed)
     heuristicSpan = iiWeight * greedyII + drainOf(prob, span.drain);
@@ -758,10 +729,10 @@ LogicalResult mlir::allo::scheduleCPSAT(ChainingModuloProblem &prob,
   std::optional<unsigned> exhaustedAt;
 
   for (unsigned ii = warm.lowerBoundII; ii <= upperII; ++ii) {
-    // The bound: this interval's span already reaches the incumbent's before a
-    // single operation is placed in it, and every interval past it is worse.
-    // Where an allocation is decided, an interval that only ties on span can
-    // still win on area, so the cut admits the tie.
+    // Cut: this interval's span already reaches the incumbent's before a single
+    // operation is placed in it, and every interval past it is worse. Where an
+    // allocation is decided, an interval that only ties on span can still win
+    // on area, so the cut admits the tie.
     if (best && iiWeight * ii + floorDrain >= *best + (allocates ? 1 : 0))
       break;
     std::optional<int64_t> drainBound;
@@ -820,8 +791,7 @@ LogicalResult mlir::allo::scheduleCPSAT(ChainingModuloProblem &prob,
           << upperII << " is infeasible";
       return failure();
     }
-    // The heuristic's schedule stands unless an exact one beats it; both arms
-    // leave the problem exactly as the simplex left it.
+    // Both arms leave the problem exactly as the simplex left it.
     if (exhaustedAt)
       warn(Stage::Sched, prob.getContainingOp())
           << "Exact scheduling ran out of budget at II=" << *exhaustedAt

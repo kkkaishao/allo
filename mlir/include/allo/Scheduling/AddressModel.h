@@ -18,11 +18,10 @@ struct BankLayout;
 
 /// The address expressions an access's hardware computes, and the width they
 /// carry at. Not the flat row-major index: a banked access addresses ONE bank
-/// at the in-bank offset, a different and usually cheaper expression
-/// (`A[2*i]` under cyclic-2 has offset `i`, no hardware, vs. flat address
-/// `2*i`, a shift-add). An access whose bank varies at runtime builds a second
-/// cone for the digit, a real divider whenever the factor is not a power of
-/// two.
+/// at the in-bank offset, usually cheaper (`A[2*i]` under cyclic-2 has offset
+/// `i`, no hardware, against flat address `2*i`, a shift-add). An access whose
+/// bank varies at runtime builds a second cone for the digit, a real divider
+/// whenever the factor is not a power of two.
 struct AddressExprs {
   AffineExpr offset;  // the element index WITHIN the bank this access reaches
   AffineExpr bank;    // which bank, or null when it is decided at compile time
@@ -34,7 +33,7 @@ struct AddressExprs {
 ///
 /// Uniform over banked and unbanked: an unpartitioned memref is a one-bank
 /// layout whose `offset` IS the flat row-major index and whose `bank` is the
-/// constant 0 nothing builds, so there is one path rather than a special case.
+/// constant 0 nothing builds.
 AddressExprs addressExprsOf(const BankLayout &layout, AffineMap map,
                             llvm::ArrayRef<int64_t> shape,
                             std::optional<unsigned> assignedBank);
@@ -57,10 +56,9 @@ struct AddressCost {
 ///
 /// `simplifyAffineExpr` is a canonicalizer, not a cost function: it flattens
 /// `x mod k` into `x - (x floordiv k) * k`, three operators where the residue
-/// was a mask, though it also does real work no rewrite replaces (merging
-/// `(x mod 6) mod 3` into one residue). Several rewrite candidates are built
-/// and the cheapest kept, ranked on device-independent weights so every layer
-/// (only `addressCostOf` holds an `OperatorLibrary`) picks the same form.
+/// was a mask, though it also does real work no rewrite replaces. Several
+/// candidates are built and the cheapest kept, ranked on device-independent
+/// weights so every layer picks the same form.
 AffineExpr simplifiedForHardware(AffineExpr e, unsigned numDims,
                                  unsigned numSymbols);
 
@@ -72,9 +70,9 @@ struct AddressDelays {
   double div = 0.0; // a divider / remainder unit
 
   /// The width those numbers are characterized at (an `index`'s hardware
-  /// width, `uarch::hwWidth`). A narrower cone scales linearly off this: the
-  /// carry-chain approximation, since an FPGA adder's delay tracks width while
-  /// a shift or mask costs no logic at any width.
+  /// width, `uarch::hwWidth`). A narrower cone scales linearly off this: an
+  /// FPGA carry chain's delay tracks width, while a shift or mask costs no
+  /// logic at any width.
   static constexpr unsigned refWidth = 32;
 };
 
@@ -89,23 +87,22 @@ AddressDelays addressDelaysOf(const OperatorLibrary &lib);
 /// * `floordiv`/`mod` do not commute with truncation mod `2^width`, so a
 ///   divider and everything feeding it stay at `refWidth` regardless of
 ///   `width`; only the divider's result may be truncated. `+`, `-`, `*` do
-///   commute and so may be carried narrow.
+///   commute and so may be carried narrow, as may the subtree under a
+///   power-of-two `mod`, which IS a mask.
 AddressCost addressCost(AffineExpr e, const AddressDelays &delays,
                         unsigned width);
 
-/// The cost of \p map composed with \p shape's row-major strides, i.e. the
-/// FLAT element index (not what a banked access builds; see `addressExprsOf`).
-/// Used by `loop-canonicalization` to check whether coalescing would leave a
-/// divider behind. A null \p map prices as zero (the stream / non-access
-/// case); an array access always carries a map, the identity one when its
-/// subscript is not affine.
+/// The cost of \p map composed with \p shape's row-major strides, i.e. the FLAT
+/// element index (not what a banked access builds; see `addressExprsOf`). A
+/// null \p map prices as zero, the stream / non-access case.
 AddressCost addressCost(AffineMap map, llvm::ArrayRef<int64_t> shape,
                         const AddressDelays &delays, unsigned width);
 
 /// Whether a register can follow an operand, and its per-iteration step when
-/// one can. A DIGIT of a counter is maintained by wrapping a register once
-/// per iteration, so a step that could carry it past two multiples of the
-/// divisor is not maintainable, and both layers must refuse the same ones.
+/// one can. A DIGIT of a counter is maintained by wrapping a register once per
+/// iteration, so a step that could carry it past two multiples of the divisor
+/// is not maintainable, and the pricing and the build must refuse the same
+/// ones.
 using CarriedFn = llvm::function_ref<std::optional<int64_t>(unsigned)>;
 
 /// An address as `base + sum(coeff * digit-of-operand) + residual`, where
@@ -113,10 +110,9 @@ using CarriedFn = llvm::function_ref<std::optional<int64_t>(unsigned)>;
 ///
 /// A term is what a REGISTER can carry: either a scaled counter (constant
 /// per-iteration difference, so advanced rather than rebuilt) or a DIGIT of
-/// one, `(x floordiv D) mod K`, which advances by a comparator/wrap rather
-/// than a constant but is just as cheap a register. The residual is
-/// everything else, in the operands' own numbering, and is null when nothing
-/// is left.
+/// one, `(x floordiv D) mod K`, which advances by a comparator/wrap rather than
+/// a constant but is just as cheap a register. The residual is everything else,
+/// in the operands' own numbering, and is null when nothing is left.
 ///
 /// The split is PARTIAL by design: `A[i,j]` with `i` a counter and `j`
 /// data-dependent has a row stride a register can follow and a column it
@@ -128,11 +124,10 @@ struct SplitAddress {
   /// where `digit(x)` is `(x floordiv divisor) mod modulus`.
   ///
   /// `divisor == 1` and no modulus is the plain scaled counter, advancing by a
-  /// constant. A DIGIT is periodic instead: it advances by nothing most
-  /// iterations and wraps/carries when its argument crosses a multiple of
-  /// `divisor`, which a register maintains as cheaply
-  /// (`RegionBlock::AddrStride`) as a `floordiv`/`mod` on the address path
-  /// costs every cycle.
+  /// constant. A DIGIT is periodic: it advances by nothing most iterations and
+  /// wraps when its argument crosses a multiple of `divisor`, which a register
+  /// (`RegionBlock::AddrStride`) maintains as cheaply as a `floordiv`/`mod` on
+  /// the address path costs every cycle.
   struct Term {
     unsigned operand;
     int64_t coeff;
@@ -148,7 +143,7 @@ struct SplitAddress {
   /// Digits the residual READS rather than the address sums: an operator cheap
   /// on a register but expensive on a counter belongs on top of one.
   /// `(x mod 5) floordiv 2` is the shape: the residue is a register and the
-  /// `floordiv 2` over it is a shift, where evaluated together the pair is two
+  /// `floordiv 2` over it a shift, where evaluated together the pair is two
   /// real dividers.
   ///
   /// Named as SYMBOLS numbered from the map's own `numSymbols`, so no existing
@@ -160,53 +155,48 @@ struct SplitAddress {
 /// Split \p e, an address expression over \p numDims dims then symbols, with
 /// \p carried naming the operands a register can follow.
 ///
-/// Shared by the scheduler (pricing the address) and the emitter (building
-/// it), both of which pass `addressExprsOf(...).offset`, so a banked access is
-/// split on the expression its bank is actually addressed through.
-///
-/// A subtree holding nothing carried is residual WHOLE, never redistributed:
-/// an address that reduces nothing comes back out as it went in.
+/// Both the scheduler and the emitter pass `addressExprsOf(...).offset`, so a
+/// banked access is split on the expression its bank is actually addressed
+/// through. A subtree holding nothing carried is residual WHOLE, never
+/// redistributed.
 SplitAddress splitAddress(AffineExpr e, unsigned numDims, unsigned numSymbols,
                           CarriedFn carried);
 
 /// What \p addr costs once every term arrives from a register that advances
-/// with its operand: the coefficients are gone and what is left is the network
-/// summing the terms with the residual.
+/// with its operand: only the network summing the terms with the residual is
+/// left.
 ///
 /// Priced in the order `buildAddr` writes it, one input per term and the
 /// residual last, so the count is the emitter's actual chain, not an optimal
-/// adder tree; the residual's own cone runs BESIDE the registers' adders
-/// rather than under them. The base costs nothing, absorbed into the first
-/// register's start value, or, with no register to absorb it, into the whole
-/// address.
+/// adder tree; the residual's own cone runs BESIDE the registers' adders rather
+/// than under them. The base costs nothing, absorbed into the first register's
+/// start value.
 AddressCost splitAddressCost(const SplitAddress &addr,
                              const AddressDelays &delays, unsigned width);
 
 /// The width an address over \p shape is carried at: enough bits to index it,
 /// which is what `DatapathEmitter::addrWidth` narrows to. Stated once here so
 /// the pricing and the emitted datapath, decided in different passes, agree.
-/// `addressExprsOf` applies it to the PER-BANK shape, which is what one bank's
-/// address port is wide.
+/// `addressExprsOf` applies it to the PER-BANK shape, one bank's address port
+/// width.
 unsigned addressWidthOf(llvm::ArrayRef<int64_t> shape);
 
 /// The cost of \p op's address AS THE EMITTER WILL BUILD IT. Zero for a stream
-/// or non-access; every array access is priced, subscript affine or not, since
-/// linearization and the bank digit are address arithmetic either way.
+/// or non-access; every array access is priced, subscript affine or not.
 ///
 /// Both cones are charged: the in-bank offset and, when the access roams, the
 /// bank digit. Strength reduction is decided once here for both the scheduler
-/// and the emitter: a term following an enclosing counter with constant
-/// bounds is carried in a register that advances with it
+/// and the emitter: a term following an enclosing counter with constant bounds
+/// is carried in a register that advances with it
 /// (`DatapathBuilder::planAddressGenerators`), so only the summing network and
-/// whatever did not reduce are charged. The emitter additionally knows
-/// whether the counter's bounds resolved to constants and whether the term is
-/// wanted in the same cycle, so it may send more terms to the residual than
-/// priced here; this pricing is optimistic on that gap, not pessimistic.
+/// whatever did not reduce are charged. The emitter also knows whether the
+/// counter's bounds resolved to constants and whether the term is wanted in the
+/// same cycle, so it may send more terms to the residual: this pricing is
+/// OPTIMISTIC on that gap, not pessimistic.
 ///
-/// A banked access is priced on its `AddressExprs`, not the flat index: the
-/// offset is narrower/cheaper where the flat address is not, and a runtime
-/// bank digit is a second cone run off the same operands, so delay is the MAX
-/// of the two cones while operator counts add.
+/// A banked access is priced on its `AddressExprs`, not the flat index: a
+/// runtime bank digit is a second cone off the same operands, so delay is the
+/// MAX of the two cones while operator counts add.
 AddressCost addressCostOf(Operation *op, const OperatorLibrary &lib);
 
 /// `addressCostOf`'s delay, QUANTIZED to a hundredth of a nanosecond: the

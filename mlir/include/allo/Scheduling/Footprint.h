@@ -36,9 +36,9 @@ struct Summary {
 /// Fold one op's memory / stream effect into \p s.
 void summarizeOp(Operation *op, Summary &s);
 
-/// Whether two accesses provably touch DISJOINT elements of a shared root (both
-/// all-affine and no write-involving pair's polyhedral footprints intersect);
-/// conservatively false otherwise.
+/// Whether two accesses provably touch DISJOINT elements of a shared root: both
+/// all-affine, and no write-involving pair's polyhedral footprints intersect.
+/// Conservatively false otherwise.
 bool footprintsDisjoint(const Access &ai, const Access &aj);
 
 /// The ordering-hazard kind between an EARLIER access `a` and a LATER access
@@ -51,13 +51,8 @@ enum class Conflict { None, RAW, WAR, WAW };
 Conflict footprintConflict(const Access &a, const Access &b);
 
 /// Fold a synchronous sub-kernel call's footprint into \p s, keyed by the
-/// CALLER's operand roots. `summarizeOp` cannot see through an opaque call,
-/// so it marks every memref operand read+write+nonAffine, making any two
-/// calls sharing an array conflict even if both only read it. This looks INTO
-/// the callee instead and records, per parameter, the direction plus the
-/// callee's own affine access ops (recursing through nested calls), so two
-/// calls sharing an array can be proven read-only or element-disjoint by
-/// `callFootprintConflict` and left unordered.
+/// CALLER's operand roots: per parameter, the access direction plus the
+/// callee's own affine access ops, recursing through nested calls.
 ///
 /// Returns false when a construct defeats the summary (an unresolvable /
 /// external callee, a call cycle, a view operand whose index space is offset
@@ -66,12 +61,11 @@ Conflict footprintConflict(const Access &a, const Access &b);
 /// conservative.
 bool summarizeCall(func::CallOp call, Summary &s);
 
-/// The ordering hazard between an EARLIER access \p a and a LATER access \p b
-/// on a shared root, for accesses recorded by `summarizeCall`: their affine ops
-/// live in the CALLEES, each naming its own parameter rather than one common
-/// memref Value, so `footprintConflict`'s `MemRefAccess`-pair test does not
-/// apply. Same classification, but disjointness compares polyhedral REGIONS
-/// over the index space the parameters share with the array.
+/// `footprintConflict` for accesses recorded by `summarizeCall`. Their affine
+/// ops live in the CALLEES, each naming its own parameter rather than one
+/// common memref Value, so the `MemRefAccess`-pair test does not apply:
+/// disjointness compares polyhedral REGIONS over the index space the
+/// parameters share with the array.
 Conflict callFootprintConflict(const Access &a, const Access &b);
 
 } // namespace mlir::allo

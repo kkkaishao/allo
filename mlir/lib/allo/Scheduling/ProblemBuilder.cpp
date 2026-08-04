@@ -27,12 +27,10 @@ using namespace circt::scheduling;
 
 namespace mlir::allo {
 
-// Project a memory dependence's components onto the innermost scheduled
-// loop (its deepest, last component), setting `drop` when an ENCLOSING loop
-// carries the dependence (satisfied by that loop's sequential execution, so
-// it does not constrain the innermost modulo schedule). A thin wrapper over
-// the shared `carriedDistanceAtLevel`: for the innermost loop the target
-// level is exactly the number of components.
+// Project a memory dependence's components onto the innermost scheduled loop
+// (its last component), setting `drop` when an enclosing loop carries the
+// dependence: that loop's sequential execution satisfies it, so it does not
+// constrain the innermost modulo schedule.
 static unsigned
 innermostCarriedDistance(ArrayRef<affine::DependenceComponent> comps,
                          bool &drop) {
@@ -42,9 +40,8 @@ innermostCarriedDistance(ArrayRef<affine::DependenceComponent> comps,
 }
 
 // Origin of a loop-carried memory edge's distance: `Proven` by the polyhedral
-// test; `NonAffine` is the conservative fallback for a pair the test cannot
-// model (an assumption `allo.assume.nodep` may retire); `Unknown` came from a
-// `*` direction the test could not bound.
+// test, `NonAffine` the conservative fallback for a pair the test cannot model,
+// `Unknown` a `*` direction the test could not bound.
 namespace {
 enum class DistanceOrigin { Proven, NonAffine, Unknown };
 struct CarriedEdgeCounts {
@@ -62,8 +59,8 @@ static DistanceOrigin distanceOrigin(const MemoryDependence &dep,
   return DistanceOrigin::Proven;
 }
 
-// How much of a region's recurrence structure rests on an assumption rather
-// than a proof, which is what says whether a hint could recover II here.
+// Report how many of a region's carried memory edges rest on an assumption
+// rather than a proof.
 static void reportCarriedEdges(Operation *containingOp,
                                const CarriedEdgeCounts &counts) {
   if (!counts.nonAffine && !counts.unknown)
@@ -74,13 +71,10 @@ static void reportCarriedEdges(Operation *containingOp,
       << " unknown-distance";
 }
 
-// A dependence carried by an enclosing loop (a positive distance at some
-// level) is satisfied by that loop's sequential execution, so it does not
-// order two ops within a single straight-line instance. Unlike a
-// modulo-scheduled loop, an acyclic span has no scheduled loop of its own,
-// so while the cyclic builder keeps innermost-carried edges (with their
-// distance), a span must drop every carried edge and keep only
-// loop-independent (all-zero) ones.
+// Whether a dependence is carried by some enclosing loop (a positive distance
+// at any level), hence satisfied by that loop's sequential execution and not an
+// ordering within a single straight-line instance. An acyclic span has no
+// scheduled loop of its own, so it keeps only loop-independent edges.
 static bool
 isLoopCarriedDependence(ArrayRef<affine::DependenceComponent> comps) {
   for (const affine::DependenceComponent &c : comps)
@@ -89,9 +83,8 @@ isLoopCarriedDependence(ArrayRef<affine::DependenceComponent> comps) {
   return false;
 }
 
-// Trace an iter_arg's incoming value to the operation that actually defines it,
-// following any chain of iter_arg-to-iter_arg shifts (a yield operand that is
-// itself an iter_arg of this loop, as produced by accumulator rotation) and
+// Trace an iter_arg's incoming value to the operation that defines it,
+// following any chain of iter_arg-to-iter_arg shifts (accumulator rotation) and
 // counting one loop-carried distance per hop.
 std::pair<Operation *, unsigned> iterArgSource(Block *body, Operation *yield,
                                                unsigned iterArg) {
@@ -111,15 +104,13 @@ std::pair<Operation *, unsigned> iterArgSource(Block *body, Operation *yield,
                  : std::make_pair<Operation *, unsigned>(nullptr, 0);
 }
 
-static bool isSyncCall(Operation *op); // a plain (non-async) sub-kernel call
+static bool isSyncCall(Operation *op);
 
 // Anchor every remaining dependence-DAG sink to \p anchor with a
 // loop-independent (distance-0) edge, making the anchor the unique sink the
-// modulo scheduler requires (it minimizes the anchor's start time; an
-// unanchored sink is rejected by `ModuloSimplexScheduler::checkLastOp`). A
-// sink is a graph property (any op whose consumers are all loop-carried, or a
-// result-less nested terminator), broader than the explicit side-effect
-// anchoring the builders already do, so this closes the remaining cases.
+// modulo scheduler requires: an unanchored sink is rejected by
+// `ModuloSimplexScheduler::checkLastOp`. A sink here is a graph property, any
+// op whose consumers are all loop-carried, or a result-less nested terminator.
 template <class ProblemT>
 static void anchorSinks(ProblemT &problem, Operation *anchor) {
   DenseSet<Operation *> sinks(problem.getOperations().begin(),
@@ -154,9 +145,8 @@ ProblemT buildCyclicProblem(LoopLikeOpInterface loop,
       if (!hasDependence(memoryDep.dependenceType))
         continue;
 
-      // Only model dependences whose source is inside this loop. Whole-func
-      // analysis may surface cross-region dependences whose endpoints are
-      // scheduled elsewhere; cross-region analysis handles those.
+      // Only model dependences whose source is inside this loop: whole-func
+      // analysis also surfaces pairs whose endpoints are scheduled elsewhere.
       if (!body->findAncestorOpInBlock(*memoryDep.source))
         continue;
 
@@ -179,8 +169,8 @@ ProblemT buildCyclicProblem(LoopLikeOpInterface loop,
       (void)depInserted;
 
       // One pair may carry both an intra-iteration (dist 0) and a loop-carried
-      // edge (e.g. `A[2*i]`/`A[i]`, which alias only at i == 0): keep the
-      // tightest (smallest) distance so the same-iteration ordering survives.
+      // edge (`A[2*i]`/`A[i]` alias only at i == 0): keep the smallest distance
+      // so the same-iteration ordering survives.
       unsigned cur = problem.getDistance(dep).value_or(distance);
       problem.setDistance(dep, std::min(cur, distance));
     }
@@ -221,9 +211,8 @@ ProblemT buildCyclicProblem(LoopLikeOpInterface loop,
     return WalkResult::advance();
   });
 
-  // Anchor: side-effecting ops (stores, streams, a sync sub-kernel call) must
-  // be scheduled before the loop terminator, making it the problem's unique
-  // sink; a call in the body would otherwise be a second, unordered sink.
+  // Side-effecting ops (stores, streams, a sync sub-kernel call) must be
+  // scheduled before the loop terminator, making it the problem's unique sink.
   auto *anchor = body->getTerminator();
   body->walk([&](Operation *op) {
     if (!isa<AffineStoreOp, memref::StoreOp, StreamGetOp, StreamPutOp>(op) &&
@@ -235,15 +224,12 @@ ProblemT buildCyclicProblem(LoopLikeOpInterface loop,
     (void)depInserted;
   });
 
-  // Handle explicitly computed loop-carried values, i.e. excluding the
-  // induction variable. Insert inter-iteration dependences from the definers of
-  // "iter_args" to their users.
+  // Inter-iteration dependences from the definers of the iter_args (the
+  // explicitly computed loop-carried values, excluding the induction variable)
+  // to their users.
   if (unsigned nIterArgs = anchor->getNumOperands(); nIterArgs > 0) {
     auto iterArgs = loop.getRegionIterArgs();
     for (unsigned i = 0; i < nIterArgs; ++i) {
-      // The value carried into iter_arg `i` may reach its real definer through
-      // a chain of shifts; the distance is the number of iterations it spans (1
-      // for a direct recurrence, P for a P-slot rotated accumulator).
       auto [definer, distance] = iterArgSource(body, anchor, i);
       if (!definer)
         continue;
@@ -358,17 +344,16 @@ ProblemT buildWhileProblem(scf::WhileOp w, DependenceAnalysis &deps) {
   addMemDeps(before);
   addMemDeps(after);
 
-  // Non-speculative condition gate: the whole after body (state update +
-  // stores) waits for the condition, so the state recurrence runs through it
-  // (II >= t_cond, no speculation). dist 0 (intra-iteration).
+  // Non-speculative condition gate at distance 0: the whole after body waits
+  // for the condition, so the state recurrence runs through it (II >= t_cond).
   if (condProducer)
     after.walk([&](Operation *op) {
       (void)problem.insertDependence(Problem::Dependence(condProducer, op));
     });
 
-  // Loop-carried state recurrence: the next value of slot `j` (yield operand
-  // j) feeds back one iteration later to that slot's readers: the users of
-  // before-arg[j] and after-arg[j], excluding the forwarding terminators.
+  // Loop-carried state recurrence: yield operand `j` feeds back one iteration
+  // later to the users of before-arg[j] and after-arg[j], the forwarding
+  // terminators excluded.
   for (unsigned j = 0, n = before.getNumArguments(); j < n; ++j) {
     auto *definer = yieldOp.getOperand(j).getDefiningOp();
     if (!definer)
@@ -395,16 +380,16 @@ ProblemT buildWhileProblem(scf::WhileOp w, DependenceAnalysis &deps) {
   });
 
   // Every other sink joins the yield too. The `before` region normally reaches
-  // the anchor through the condition gate above, which is empty when the
-  // condition is a block argument or the after region is bare.
+  // the anchor through the condition gate, which is empty when the condition is
+  // a block argument or the after region is bare.
   anchorSinks(problem, anchor);
 
   reportCarriedEdges(w.getOperation(), counts);
   return problem;
 }
 
-// A plain (non-async) func.call, scheduled as an opaque fixed-latency node.
-// An async call composes structurally as dataflow, ordered by its streams.
+// A plain (non-async) func.call, scheduled as an opaque fixed-latency node. An
+// async call composes structurally as dataflow, ordered by its streams.
 static bool isSyncCall(Operation *op) {
   return isa<func::CallOp>(op) && !op->hasAttr(kAlloAsyncAttr);
 }
@@ -420,9 +405,9 @@ ProblemT buildAcyclicProblem(ArrayRef<Operation *> ops,
   for (Operation *top : ops)
     top->walk([&](Operation *op) { spanOps.insert(op); });
 
-  // Insert ops + intra-span memory/stream dependences. Only loop-INDEPENDENT
-  // (distance-0) edges are modeled; adding a carried edge distance-less
-  // would falsely close a cycle with the forward edge (spurious infeasibility).
+  // Only loop-independent (distance-0) edges are modeled: this problem carries
+  // no distance, so a carried edge would falsely close a cycle with the forward
+  // edge and make the span infeasible.
   for (Operation *top : ops)
     top->walk([&](Operation *op) {
       problem.insertOperation(op);
@@ -433,8 +418,6 @@ ProblemT buildAcyclicProblem(ArrayRef<Operation *> ops,
         // Only intra-span dependences belong to this problem.
         if (!spanOps.contains(memoryDep.source))
           continue;
-        // A loop-carried dependence is satisfied across iterations of the
-        // enclosing loop, not within this single instance; drop it.
         if (isLoopCarriedDependence(memoryDep.dependenceComponents))
           continue;
         Problem::Dependence dep(memoryDep.source, op);
@@ -444,9 +427,9 @@ ProblemT buildAcyclicProblem(ArrayRef<Operation *> ops,
       }
     });
 
-  // DependenceAnalysis misses call ops; sync calls are instead ordered by
-  // memory footprint: a shared write serializes, disjoint/read-only don't,
-  // and an opaque callee falls back to a conservative (safe) record.
+  // DependenceAnalysis misses call ops, so sync calls are ordered by memory
+  // footprint instead: a shared write serializes, disjoint or read-only does
+  // not, and an opaque callee falls back to a conservative record.
   auto summarize = [](Operation *top, Summary &s) {
     top->walk([&](Operation *op) {
       if (isSyncCall(op) && summarizeCall(cast<func::CallOp>(op), s))
@@ -477,7 +460,6 @@ ProblemT buildAcyclicProblem(ArrayRef<Operation *> ops,
       continue;
     // Two sync calls are already ordered by the footprint edges above; a
     // blanket edge here would falsely serialize data-independent calls.
-    // Every other pair keeps the ASAP-sink edge (zero latency, no ordering).
     if (isSyncCall(op) && isSyncCall(sink))
       continue;
     (void)problem.insertDependence(Problem::Dependence(op, sink));
@@ -486,9 +468,7 @@ ProblemT buildAcyclicProblem(ArrayRef<Operation *> ops,
   return problem;
 }
 
-// Explicit instantiations. The scheduler pass builds only the resource-aware
-// chaining problems: loops as `ChainingModuloProblem`, straight-line spans as
-// `ChainingSharedOperatorsProblem`.
+// Explicit instantiations for the problem types the scheduler pass builds.
 template ChainingModuloProblem
 buildCyclicProblem<ChainingModuloProblem>(LoopLikeOpInterface,
                                           DependenceAnalysis &);

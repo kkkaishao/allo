@@ -24,10 +24,9 @@ static Value streamBaseOf(Operation *op) {
   return cast<StreamPutOp>(op).getStream();
 }
 
-// Normalizes affine and non-affine (memref.load/store, stream get/put)
-// accesses to one shape: a root value, an affine map, and index operands.
-// Non-affine ops get the multi-dim identity map so address pricing and bank
-// digit derivation downstream can treat both forms uniformly.
+// Normalizes affine and non-affine accesses to one shape: a root value, an
+// affine map, and index operands. A non-affine op gets the multi-dim identity
+// map, so downstream pricing and bank derivation see one encoding.
 std::optional<MemAccess> mlir::allo::asMemAccess(Operation *op) {
   MemAccess a;
   a.op = op;
@@ -44,8 +43,6 @@ std::optional<MemAccess> mlir::allo::asMemAccess(Operation *op) {
     llvm::append_range(a.indices, write.getMapOperands());
     return a;
   }
-  // Non-affine subscript: identity map over indices matches the affine
-  // encoding.
   if (auto load = dyn_cast<memref::LoadOp>(op)) {
     a.root = resolveRoot(load.getMemRef());
     llvm::append_range(a.indices, load.getIndices());

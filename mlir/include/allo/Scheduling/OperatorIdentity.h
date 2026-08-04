@@ -20,17 +20,13 @@ namespace mlir::allo {
 
 class OperatorLibrary;
 
-/// What one physical operator is: the equivalence a resource limit is counted
-/// over, a binder may fold two ops within, and the emitter names one RTL module
-/// after. Two operations share an identity exactly when one unit can run both.
-///
-/// The operator library's second key, distinct from `OperatorChar::typeName`,
-/// which names a timing row and is coarser: one comb row prices integer
-/// arithmetic of every width, one `dcp.operator` every predicate of a compare.
+/// What one physical operator is: two operations share an identity exactly when
+/// one unit can run both. The library's second key, finer than
+/// `OperatorChar::typeName`, which names a timing row.
 struct OperatorIdentity {
   /// The realization: a `dcp.operator` symbol (IP path) or a `CombOpKind`
   /// mnemonic (native path). Empty when no functional unit is built for the
-  /// operation at all: a memory or stream access, a literal, a call.
+  /// operation: a memory or stream access, a literal, a call.
   std::string realization;
   bool comb = false;                   // `realization` names a CombOpKind
   llvm::SmallVector<Type, 2> argTypes; // operand types, so width is in here

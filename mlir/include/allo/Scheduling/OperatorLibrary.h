@@ -37,9 +37,8 @@ namespace mlir::allo {
 //===----------------------------------------------------------------------===//
 
 /// The abstract operator kind timing is characterized against; `classify` maps
-/// concrete IR ops onto these. The three cast kinds are separate because
-/// integer resize, integer/float conversion, and float resize have distinct
-/// hardware timing.
+/// concrete IR ops onto these. The three cast kinds are separate because their
+/// hardware timing differs.
 enum class OpKind {
   Add,
   Sub,
@@ -70,9 +69,7 @@ enum class OpKind {
   Unknown // op the classifier does not recognize (e.g. math.sqrt).
 };
 
-/// Classify \p op into its abstract kind. This is the mapping from a concrete
-/// IR op onto the abstract vocabulary. Matching then compares the op's concrete
-/// operand and result types against a library row's types.
+/// Classify \p op into its abstract kind.
 OpKind classify(Operation *op);
 
 /// The abstract-kind string a device/operator uses (`add`/`sub`/.../`select`),
@@ -82,16 +79,14 @@ llvm::StringRef opKindString(OpKind kind);
 std::optional<OpKind> parseOpKind(llvm::StringRef s);
 
 /// The abstract kind a combinational realization is priced under, for a caller
-/// holding the realization after the `arith` op `classify` needs is gone.
-/// Strictly coarser: the signed and unsigned mnemonics share a row, as do the
-/// four integer casts. `Unknown` for a realization no abstract row covers
-/// (`affine.apply`).
+/// holding the realization after the `arith` op is gone. Strictly coarser than
+/// `classify`: signed and unsigned mnemonics share a row, as do the four
+/// integer casts. `Unknown` for a realization no abstract row covers.
 OpKind opKindOf(CombOpKindEnum kind);
 
-/// The combinational realization kind of \p op. This enumerates the emitter's
-/// native `comb` coverage: every case has an `emitCompute` lowering. Nullopt
-/// for an op with no comb lowering (a float/cast IP, a memory access, or an
-/// unrelated op).
+/// The combinational realization kind of \p op, nullopt for an op with no comb
+/// lowering (a float/cast IP, a memory access, an unrelated op). Every case
+/// here has an `emitCompute` lowering in the emitter.
 std::optional<CombOpKindEnum> combKindOf(Operation *op);
 
 //===----------------------------------------------------------------------===//
@@ -99,12 +94,8 @@ std::optional<CombOpKindEnum> combKindOf(Operation *op);
 //===----------------------------------------------------------------------===//
 
 /// One row of the operator library. A comb row (`comb == true`) matches by
-/// `kind` + all-integer operands (integer arithmetic is uniformly
-/// combinational, any width); an IP row matches by `kind` + an exact operand /
-/// result element-type list (`argTypes`/`resTypes`), carrying its injected
-/// `dcp.operator` symbol; an advanced row additionally keys on the raw MLIR
-/// mnemonic (`mlirOp`). Comb rows come from `dcp.device.comb`, IP/advanced rows
-/// from injected `dcp.operator` symbols.
+/// `kind` + all-integer operands, at any width; an IP row by `kind` + an exact
+/// operand/result element-type list; an advanced row additionally by `mlirOp`.
 struct OperatorEntry {
   OpKind kind = OpKind::Unknown; // abstract kind (Unknown on an advanced row).
   std::string mlirOp;            // advanced: raw MLIR op name (else empty).
@@ -119,16 +110,14 @@ struct OperatorEntry {
   std::string symbol; // the injected `dcp.operator` sym_name (IP rows only).
 };
 
-/// What a lookup resolves for a specific operation: the timing row it is priced
-/// under, and the operator identity it needs. The two are separate keys: the
-/// scheduling problem prices `typeName`, while an allocation limit, the
-/// binder's share test and the emitted module name all key on `identity`.
+/// What a lookup resolves for one operation. Two separate keys: the scheduling
+/// problem prices `typeName`, while an allocation limit, the binder's share
+/// test and the emitted module name all key on `identity`.
 struct OperatorChar {
   std::string typeName; // stable: one Problem::OperatorType per matched entry
   uint32_t latency = 0;
   /// Whether one instance accepts a new input every cycle. Read only by
-  /// `populateOperatorAllocation`; an unlimited operator type reserves nothing
-  /// however long its window, so the timing half has no use for it.
+  /// `populateOperatorAllocation`.
   bool pipelined = true;
   double inDelay = 0.0;
   double outDelay = 0.0;
@@ -137,15 +126,15 @@ struct OperatorChar {
 
 /// The operator library, built from the injected device IR: comb rows from
 /// `dcp.device.comb`, IP rows from `dcp.operator` symbols, storage timing from
-/// `dcp.device.memory`. `lookup` returns the matching row's characterization
-/// (advanced first, then abstract last-wins, else the default).
+/// `dcp.device.memory`.
 class OperatorLibrary {
 public:
   /// Build the library from a module's injected `dcp.device` + `dcp.operator`
   /// ops. A module with no `dcp.device` yields an empty (all-default) library.
   static OperatorLibrary fromModule(ModuleOp module);
 
-  /// Resolve the characterization for \p op: the matching row, else default.
+  /// Resolve the characterization for \p op: the matching row (advanced first,
+  /// then abstract last-wins), else the default.
   OperatorChar lookup(Operation *op) const;
 
   /// Whether \p op needs an IP realization (a float or advanced compute op) but
@@ -153,25 +142,23 @@ public:
   /// scheduling it at the default zero latency.
   bool requiresUnmatchedIP(Operation *op) const;
 
-  /// Whether the device provides a DIRECT realization for \p op, i.e. a
-  /// matching IP operator or comb row. `legalize-arith` keeps a composite
-  /// arith op (max/min/maxnum/minnum/ceildiv/floordiv) when this holds, and
-  /// expands it into primitive arith otherwise.
+  /// Whether the device provides a direct realization for \p op: a matching IP
+  /// operator or comb row. `legalize-arith` keeps a composite arith op
+  /// (max/min/maxnum/minnum/ceildiv/floordiv) when this holds and expands it
+  /// into primitive arith otherwise.
   bool hasDirectRealization(Operation *op) const;
 
   /// The storage-timing view of the device.
   const MemoryLibrary &memoryLibrary() const { return memory; }
 
   /// The chaining delay of the device's combinational row for \p kind, or 0.0
-  /// when the device declares none. For a caller pricing hardware it builds
-  /// itself out of native operators rather than characterizing an existing op
-  /// (`addressDelaysOf`), which has no `Operation *` to hand `lookup`.
+  /// when the device declares none. For a caller with no `Operation *` to hand
+  /// `lookup` (`addressDelaysOf`).
   double combDelay(OpKind kind) const;
 
   /// The same, for a caller holding a reified realization (a `dcp.compute`'s
-  /// `comb_kind`) rather than an abstract kind. Falls back to the default row
-  /// exactly as `lookup` does, so an `affine.apply`, which no abstract row
-  /// matches, is priced the way it was scheduled rather than at zero.
+  /// `comb_kind`). Falls back to the DEFAULT row, not to 0.0, so an
+  /// `affine.apply` is priced the way it was scheduled.
   double combDelay(CombOpKindEnum kind) const;
 
 private:
@@ -186,21 +173,15 @@ private:
 };
 
 /// Log, for one solved region, every operator type covering more than one
-/// operator identity, i.e. every place a resource limit stated over the timing
-/// row would span several physical operators. Measurement only: nothing
-/// consumes the log.
+/// operator identity. Measurement only: nothing consumes the log.
 void reportOperatorClassSplit(circt::scheduling::Problem &problem,
                               const OperatorLibrary &lib);
 
 //===----------------------------------------------------------------------===//
-// Scheduled-call latency: a scheduling helper, separate from operator
-// characterization. A plain (non-async) call to an already-scheduled callee is
-// a fixed-latency node in the enclosing problem. Its latency is the callee's
-// whole-kernel latency, read through `calleeStaticLatency` so that ONE function
-// answers "how long does this callee run" whichever phase is asking: the
-// carrier is a `func.func`'s `allo.sched.latency` while scheduling and a
-// `dcp.module`'s own field once the callee has been reified.
-// Returns {latency, stable operator-type name} for such a call, else nullopt.
+// Scheduled-call latency
+//
+// A plain (non-async) call to an already-scheduled callee is a fixed-latency
+// node priced through `calleeStaticLatency`; nullopt for any other op.
 //===----------------------------------------------------------------------===//
 inline std::optional<std::pair<int64_t, std::string>>
 scheduledCallLatency(Operation *op) {
@@ -222,8 +203,7 @@ scheduledCallLatency(Operation *op) {
 
 /// Assign an operator type (latency + delays) to every op reached by \p walkFn,
 /// sourced from \p lib. A `ChainingProblem` also receives incoming/outgoing
-/// delays. A scheduled sync call is a fixed-latency node (see
-/// `scheduledCallLatency`); everything else is characterized by the library.
+/// delays; a scheduled sync call is a fixed-latency node.
 template <class ProblemT, class WalkFn>
 LogicalResult populateOperatorTypesImpl(ProblemT &problem, WalkFn walkFn,
                                         const OperatorLibrary &lib) {
@@ -278,10 +258,9 @@ LogicalResult populateOperatorTypes(ArrayRef<Operation *> ops,
 }
 
 //===----------------------------------------------------------------------===//
-// Allocation model: how many copies of an operator a region builds. The
-// sibling of `populateOperatorTypes`, keyed on the operator identity rather
-// than the timing row, since only one physical operator can host two
-// operations.
+// Allocation model: how many copies of an operator a region builds. Keyed on
+// the operator identity rather than the timing row, since only one physical
+// operator can host two operations.
 //===----------------------------------------------------------------------===//
 
 /// Declare one allocatable resource per operator identity this region could
@@ -297,9 +276,9 @@ LogicalResult populateOperatorTypes(ArrayRef<Operation *> ops,
 ///     (circular-arc colouring). Acyclic windows form an interval graph, where
 ///     the count is exactly the chromatic number, so any occupancy is fine.
 ///
-/// The cost is `latency * width` flip-flops, what one instance holds in its own
-/// pipeline, in the unit the objective's register tie-break counts. It
-/// under-estimates a real IP, so the objective cannot over-value a fold.
+/// The cost is `latency * width` flip-flops, in the unit the objective's
+/// register tie-break counts. It under-estimates a real IP, so the objective
+/// cannot over-value a fold.
 template <class ProblemT, class WalkFn>
 LogicalResult populateOperatorAllocationImpl(ProblemT &problem, WalkFn walkFn,
                                              const OperatorLibrary &lib) {
@@ -308,8 +287,8 @@ LogicalResult populateOperatorAllocationImpl(ProblemT &problem, WalkFn walkFn,
     return success();
   } else {
     constexpr bool isCyclic = std::is_base_of_v<CyclicProblem, ProblemT>;
-    // One identity's operations, in walk order. Sorted keying, rather than by
-    // insertion, so two compiles declare the resources in the same order.
+    // One identity's operations, in walk order. Sorted keying, not insertion
+    // order, so two compiles declare the resources in the same order.
     struct OperatorClass {
       llvm::SmallVector<Operation *> ops;
       unsigned occupancy = 1;

@@ -4,9 +4,8 @@
  */
 
 //===----------------------------------------------------------------------===//
-// The latency arithmetic, in one place. Every cycle a region costs is charged
-// here; the two structural walks that feed it (`SDC.cpp` over affine/scf loops,
-// `PostConversion.cpp` over the dcp regions built from them) only report shape.
+// The latency arithmetic. Every cycle a region costs is charged here; the two
+// structural walks that feed it (`SDC.cpp`, `PostConversion.cpp`) report shape.
 //===----------------------------------------------------------------------===//
 
 #include "allo/Scheduling/LatencyModel.h"
@@ -22,7 +21,7 @@ using namespace mlir::allo;
 using namespace mlir::allo::dcp;
 
 // An ODS `I64Attr` accessor hands back `uint64_t`; every count in this model is
-// signed. Converted once, here, rather than cast at each of the seven reads.
+// signed.
 static std::optional<int64_t> asInt64(std::optional<uint64_t> v) {
   if (v)
     return static_cast<int64_t>(*v);
@@ -34,23 +33,21 @@ std::optional<int64_t> mlir::allo::composeSpan(const SpanNode &n) {
   // composes inside it.
   if (n.instance)
     return n.contract;
-  // A guard runs under a predicate, so it has no span until the predicate has a
-  // value, which is not at compile time.
+  // A guard runs under a predicate, so it has no compile-time span.
   if (n.shape == RegionShape::Guard)
     return std::nullopt;
   // A stall shell stretches a run by whatever back-pressure costs it, so what
-  // composes below is a floor and not a contract. Ahead of the bound, since a
-  // floor is the wrong direction to hand a consumer either way.
+  // composes below is a floor and not a contract. Tested ahead of the bound,
+  // since a floor is the wrong direction to hand a consumer either way.
   if (n.elastic)
     return std::nullopt;
   // A data-dependent trip has no composable span; a carried bound stands in
-  // where the builder judged one usable, and is otherwise absent.
+  // where the builder judged one usable.
   if (!n.trip)
     return n.assumedSpan;
   if (n.shape == RegionShape::Container || n.shape == RegionShape::CallNode) {
     // A DONE-PACED region runs no schedule of its own, so `drain`/`ii` do not
-    // describe it: one pass is its body elements in sequence, and the
-    // controller re-arms between passes.
+    // describe it: one pass is its body elements in sequence.
     std::optional<int64_t> body = composeSequence(n.children);
     if (!body)
       return std::nullopt;
@@ -89,7 +86,7 @@ mlir::allo::ownersThroughScope(Operation *def,
   while (!work.empty()) {
     Operation *o = work.pop_back_val();
     // An owned op is a root: whoever reads through the cone waits for it, and
-    // its own operands are that node's business, not this walk's.
+    // its own operands belong to that node, not to this walk.
     if (auto it = owner.find(o); it != owner.end()) {
       if (!llvm::is_contained(roots, it->second))
         roots.push_back(it->second);
@@ -139,8 +136,8 @@ mlir::allo::siblingPredecessors(ArrayRef<SmallVector<Operation *>> nodeOps) {
               addPred(it->second, i);
             continue;
           }
-          // A def no node owns is a func-scope cone; it carries the dependence
-          // of everything it reads (`ownersThroughScope`).
+          // A def no node owns is a func-scope cone: it carries the dependence
+          // of everything it reads.
           for (unsigned p : ownersThroughScope(def, owner))
             if (p != i)
               addPred(p, i);
@@ -177,8 +174,8 @@ std::vector<SpanNode> mlir::allo::dcpSpanNodes(Block &block, bool topLevel) {
   std::vector<SpanNode> nodes;
   for (Operation &inner : block)
     // An instance inside a region is a body element like any other. At kernel
-    // scope there are none: the reify wraps every call into a region, which
-    // keeps this list index-aligned with `siblingPredecessors`.
+    // scope there are none, since the reify wraps every call into a region,
+    // which keeps this list index-aligned with `siblingPredecessors`.
     if (isa<DCPathRegionOpInterface>(inner) ||
         (!topLevel && isa<DCPathInstanceOp>(inner)))
       nodes.push_back(dcpSpanNode(&inner, topLevel));
@@ -200,7 +197,7 @@ SpanNode mlir::allo::dcpSpanNode(Operation *op, bool topLevel) {
   if (auto inv = dyn_cast<DCPathInstanceOp>(op)) {
     // A callee's `latency` is already a start->done contract, counted to its
     // own `done` rising. It crosses a module boundary, so it is the one
-    // composed number this side cannot derive and has to be told.
+    // composed number this side cannot derive.
     n.instance = true;
     n.contract = asInt64(inv.getLatency());
     return n;
@@ -227,9 +224,9 @@ SpanNode mlir::allo::dcpSpanNode(Operation *op, bool topLevel) {
     n.trip = asInt64(pipe.getTrip()); // a while leaves it unset: data-dependent
     n.ii = asInt64(pipe.getIi());
   }
-  // A dynamic trip is stamped with no `trip` but keeps the scheduler's
-  // assume-bounded worst case, which this side cannot re-derive: reification
-  // keeps the loop's runtime bound operand, not the assumption that bounded it.
+  // A dynamic trip carries no `trip` but keeps the scheduler's assume-bounded
+  // worst case, which this side cannot re-derive: reification keeps the loop's
+  // runtime bound operand, not the assumption that bounded it.
   if (!n.trip && topLevel && region.getLatencyBound())
     n.assumedSpan = asInt64(region.getLatency());
   return n;

@@ -32,17 +32,13 @@ namespace mlir::allo {
 
 /// The width an `index` value widens back to once read as an ordinary index,
 /// even though a counter or address register may be BUILT narrower
-/// (`RegionBlock::counterType`, `RegionBlock::AddrStride::width`) wherever its
-/// value range allows. Named here because both the emitter (building the
-/// register) and the scheduler (pricing an index-typed value's delay chain)
-/// price against it.
+/// (`RegionBlock::counterType`, `RegionBlock::AddrStride::width`). Both the
+/// emitter and the scheduler price against it.
 inline constexpr unsigned kIndexWidth = 32;
 
 //===----------------------------------------------------------------------===//
-// Memory timing library: the `memory:` section of the device file. Holds
-// read/write latency + delay per storage implementation
-// (register/LUTRAM/BRAM/URAM), plus one FIFO (stream) timing. The storage
-// analog of the operator library.
+// Memory timing library: the `memory:` section of the device file. Read/write
+// latency and delay per storage implementation, plus one FIFO (stream) timing.
 //===----------------------------------------------------------------------===//
 
 /// Read/write latencies (cycles) of one storage kind.
@@ -58,8 +54,7 @@ struct RWDelay {
 };
 
 /// Timing of one storage kind (a primitive implementation, or the FIFO):
-/// latency and delay, each split by direction. Grouped by metric to match the
-/// YAML.
+/// latency and delay, each split by direction.
 struct MemKindTiming {
   RWLatency latency;
   RWDelay delay;
@@ -72,9 +67,8 @@ struct MemPrimitive {
   MemKindTiming timing;
 };
 
-/// The storage-timing library. `timing` characterizes a memory/stream access by
-/// resolving the accessed memref's implementation and indexing `primitives`;
-/// the fields are filled from the `memory:` YAML section (absent -> zero).
+/// The storage-timing library, filled from the `memory:` YAML section (absent
+/// -> zero).
 class MemoryLibrary {
 public:
   struct Timing {
@@ -85,24 +79,23 @@ public:
     // types, or they collapse onto one latency, so this keys the type.
     MemoryImplEnum impl = MemoryImplEnum::Auto;
   };
-  /// Timing for a memory/stream access op (load/store/stream get/put); a
-  /// zero-latency, zero-delay result if \p op is not a memory access. An array
-  /// access is timed by its memref's implementation.
+  /// Timing for a memory/stream access op; zero latency and delay if \p op is
+  /// not one. An array access is timed by its memref's implementation.
   Timing timing(Operation *op) const;
 
   /// The timing of storage implementation \p impl, or a zero (combinational)
   /// timing if the library declares no such primitive.
   MemKindTiming timing(MemoryImplEnum impl) const;
 
-  /// The storage implementation an array access resolves to. A stream (timed
-  /// by `fifo`) and a non-access both give `Auto`. Unlike `timing`, this does
-  /// NOT consult the primitive table, so a caller can diagnose an
-  /// implementation the device never declared *before* it falls to zero timing.
+  /// The storage implementation an array access resolves to; `Auto` for a
+  /// stream or a non-access. Unlike `timing`, does NOT consult the primitive
+  /// table, so a caller can diagnose an undeclared implementation *before* it
+  /// falls to zero timing.
   MemoryImplEnum resolvedImpl(Operation *op) const;
 
-  /// Whether the device declares timing for \p impl. The storage twin of
-  /// `requiresUnmatchedIP`: an array resolving to an undeclared primitive would
-  /// otherwise be scheduled at latency 0 and read before its data is valid.
+  /// Whether the device declares timing for \p impl. An array resolving to an
+  /// undeclared primitive would otherwise be scheduled at latency 0 and read
+  /// before its data is valid.
   bool declares(MemoryImplEnum impl) const;
 
   MemoryImplEnum defaultImpl = MemoryImplEnum::LUTRAM; // unbound on-chip arrays
@@ -113,9 +106,8 @@ public:
 
 //===----------------------------------------------------------------------===//
 // Per-memref storage shape, derived from the array's `allo.part` /
-// `allo.bind.storage` attributes. These are the same partition/topology facts
-// MemoryBankModel binds the resource-aware scheduler against, re-exposed for
-// the microarch datapath (MemUnit) so both come from one model.
+// `allo.bind.storage` attributes. The same facts MemoryBankModel binds the
+// scheduler against, re-exposed for the microarch datapath (MemUnit).
 //===----------------------------------------------------------------------===//
 
 struct MemoryChar {
@@ -133,29 +125,24 @@ std::optional<Attribute> globalInitOf(Value memRef);
 
 /// Whether \p memRef is a CONSTANT TABLE: it has a `memref.global` initializer
 /// and nothing writes it. Read-only is a property of the USE, not the
-/// declaration: an initialized array stored to even once is a real memory
-/// that merely starts with contents, not a constant table.
+/// declaration: an initialized array stored to even once is a real memory that
+/// merely starts with contents.
 ///
-/// The ONE definition the scheduler's port model and the emitter's ROM
-/// realization share. A constant table lowers to `hw.aggregate_constant` read
-/// by one `hw.array_get` per access: combinational, no handshake, genuinely
-/// UNLIMITED-port; billing it a 2-port RAM budget inflates II for free. This
-/// is narrower than `MemoryChar::readOnly`: an explicit `bind.storage
-/// type="rom_1p"` is a real memory whose ports the user chose.
+/// A constant table lowers to `hw.aggregate_constant` read by one
+/// `hw.array_get` per access: combinational, no handshake, genuinely
+/// UNLIMITED-port. Narrower than `MemoryChar::readOnly`: an explicit
+/// `bind.storage type="rom_1p"` is a real memory whose ports the user chose.
 ///
 /// Handing the array to a SUB-KERNEL also disqualifies it: a child MASTERS
 /// PORTS, driving addr/data/we into storage the parent owns, and a constant
-/// table has none to master. Such an array needs real storage, keeping its
-/// declared values as power-on contents, so the port model must bill it.
+/// table has none to master.
 bool isConstantTable(Value memRef);
 
-/// Characterize a memref's storage shape from its partition/storage attributes
-/// (a pure function of the attributes, independent of any scheduling region).
-/// \p defaultImpl resolves an array with no explicit `allo.bind.storage impl=`;
-/// pass the device's `MemoryLibrary::defaultImpl` so this agrees with the
-/// implementation `MemoryLibrary::timing` resolved when it stamped the access
-/// latencies (a hardcoded default here would silently disagree with the
-/// schedule on any device whose `default_memory` is not that constant).
+/// Characterize a memref's storage shape from its partition/storage
+/// attributes, independent of any scheduling region. \p defaultImpl resolves an
+/// array with no explicit `allo.bind.storage impl=`; pass the device's
+/// `MemoryLibrary::defaultImpl`, or this disagrees with the implementation the
+/// access latencies were stamped from.
 MemoryChar characterize(Value memref, MemoryImplEnum defaultImpl);
 
 //===----------------------------------------------------------------------===//
@@ -165,10 +152,8 @@ MemoryChar characterize(Value memref, MemoryImplEnum defaultImpl);
 
 /// The bank decomposition of a partitioned memref, in ELEMENT space: which
 /// bank holds element `(i_0 .. i_{r-1})`, and where inside that bank it sits.
-/// The single definition of "which bank", shared by the port model
-/// (`MemoryBankModel`), the static split (`dcp-resolve-banking`), the runtime
-/// crossbar (the emitter), and the host-side layout (interface manifest ->
-/// cosim).
+/// The single definition of "which bank", shared by the port model, the static
+/// split, the emitter's crossbar and the host-side layout.
 ///
 /// A CYCLIC axis of factor F puts element `i_d` in bank `i_d mod F` at local
 /// coordinate `i_d floordiv F`. A BLOCK axis puts it in bank
@@ -181,9 +166,8 @@ MemoryChar characterize(Value memref, MemoryImplEnum defaultImpl);
 /// not `F`); a skew is never spelled that way, since its bank already reads
 /// every subscript.
 ///
-/// The skew exists because block and cyclic are both functions of ONE
-/// subscript, so no axis choice serves an array read both as `A[i][j]` and
-/// `A[j][i]`. What a skew buys is CONFLICT FREEDOM, not a compile-time bank:
+/// A skew buys CONFLICT FREEDOM, not a compile-time bank, where block and
+/// cyclic (both functions of ONE subscript) serve an array read only one way:
 /// `A[i][Fj+k]` and `A[Fj+k][i]` each reach F distinct banks as `k` runs over
 /// the factor, so an unrolled group takes one port per bank instead of F (see
 /// `skewSlotOf`).
@@ -205,9 +189,8 @@ struct BankLayout {
   /// Elements in one bank (the product of `bankShape`).
   int64_t bankWords() const;
 
-  /// The single skewed axis, or null. At most one is allowed, because the slot
-  /// analysis reasons about ONE rotation of the bank index and two skews
-  /// compose into two independent ones.
+  /// The single skewed axis, or null. At most one is allowed: the slot analysis
+  /// reasons about ONE rotation of the bank index.
   const Axis *skew() const;
 };
 
@@ -217,9 +200,8 @@ llvm::StringRef bankKindName(BankLayout::Kind kind);
 
 /// Decode a memref's `allo.part` attribute into its element-space bank
 /// decomposition (a single unpartitioned bank when there is no attribute). THE
-/// decoder of that attribute, as `assignedBankOf` is the one reader of a
-/// decided bank: a consumer that wants only the bank count or only the
-/// complete-partition flag reads them off here rather than parsing again.
+/// decoder of that attribute: a consumer wanting only the bank count or the
+/// complete-partition flag reads it off here rather than parsing again.
 BankLayout bankLayoutOf(Value memRef);
 
 /// The canonical spelling of \p part for a memref of \p type: a COMPLETE
@@ -227,11 +209,11 @@ BankLayout bankLayoutOf(Value memRef);
 /// cyclic axis expands into one axis per dimension, and the axes are sorted by
 /// dimension. Null canonicalizes to null.
 ///
-/// `bankLayoutOf` folds the axes IN ORDER into a mixed-radix bank index, so an
-/// attribute's spelling is part of the bank index function, not presentation:
-/// two attributes describing the same banking must be spelled identically
-/// before a caller and callee can be said to agree on one (a sub-kernel
-/// masters port group `k` of exactly the caller's bank `k`).
+/// `bankLayoutOf` folds the axes IN ORDER into a mixed-radix bank index, so a
+/// spelling is part of the bank index function, not presentation: two
+/// attributes describing the same banking must be spelled identically before a
+/// caller and callee agree on one (a sub-kernel masters port group `k` of
+/// exactly the caller's bank `k`).
 PartitionAttr canonicalizePartition(PartitionAttr part, MemRefType type);
 
 /// The coarsest banking of a memref of \p type that satisfies both \p a and
@@ -241,16 +223,15 @@ PartitionAttr canonicalizePartition(PartitionAttr part, MemRefType type);
 /// places in distinct banks `b` does too. A partition directive is a LOWER
 /// BOUND on the bank-distinctness its kernel needs, so a kernel scheduled
 /// against the join still sees every access group it asked to be
-/// conflict-free. A complete partition is the top (every element its own
-/// register) and an absent attribute the bottom (one bank).
+/// conflict-free. A complete partition is the top and an absent attribute the
+/// bottom (one bank).
 ///
 /// Axes on DIFFERENT dimensions compose in mixed radix with no reconciling
 /// needed. On ONE dimension the join must remain a SINGLE axis (`allo.part`
 /// admits no duplicate dimension), so it exists only when one factor divides
 /// the other (and, for a block axis, the finer chunk boundaries fall on the
-/// coarser ones). A block axis against a cyclic axis has no common
-/// single-axis refinement at all: the array-read-both-ways conflict `Skew`
-/// exists to answer.
+/// coarser ones). A block axis against a cyclic axis has no common single-axis
+/// refinement at all.
 llvm::FailureOr<PartitionAttr> joinPartitions(PartitionAttr a, PartitionAttr b,
                                               MemRefType type,
                                               std::string &why);
@@ -261,13 +242,11 @@ llvm::FailureOr<PartitionAttr> joinPartitions(PartitionAttr a, PartitionAttr b,
 /// per-bank shape into `offset`. \p map is in ELEMENT SPACE, one result per
 /// memref dimension; linearizing happens at the point of use, never in the IR.
 ///
-/// Deriving this on the EXPRESSION rather than on emitted values is what
-/// makes common banked idioms free: `A[2*i]` under cyclic-2 has bank
-/// `(2*i) mod 2` and offset `(2*i) floordiv 2`, which `simplifyAffineExpr`
-/// folds to `0` and `i` (no hardware), where the same derivation on emitted
-/// values leaves a multiply/mask/shift nothing downstream can fold away. The
-/// flat address takes this same route (`linearizeAccessMap`); this is its
-/// banked twin.
+/// Deriving this on the EXPRESSION rather than on emitted values is what makes
+/// common banked idioms free: `A[2*i]` under cyclic-2 has bank `(2*i) mod 2`
+/// and offset `(2*i) floordiv 2`, which fold to `0` and `i` (no hardware),
+/// where the same derivation on emitted values leaves a multiply/mask/shift
+/// nothing downstream can fold away.
 struct BankSplitExpr {
   AffineExpr bank;   // which of `layout`'s banks, mixed radix in axis order
   AffineExpr offset; // the element's row-major index inside that bank
@@ -288,20 +267,18 @@ struct DimRange {
 };
 
 /// The compile-time bank of an access whose address map is \p map over a memref
-/// of \p shape, or nullopt when the bank varies at runtime (a roaming access,
-/// or any block axis whose subscript is not a constant).
+/// of \p shape, or nullopt when the bank varies at runtime.
 ///
-/// This is `bankSplitOf(...).bank` when that expression is ONE VALUE: the
-/// bank a consumer routes to and the bank the port model bills are the same
-/// expression asked two questions, so they cannot drift apart. A cyclic digit
-/// is one value when every variable coefficient of its subscript vanishes
-/// modulo the factor.
+/// This is `bankSplitOf(...).bank` when that expression is ONE VALUE, so the
+/// bank a consumer routes to and the bank the port model bills cannot drift
+/// apart. A cyclic digit is one value when every variable coefficient of its
+/// subscript vanishes modulo the factor.
 ///
 /// \p ranges bounds the dims (the map's own numbering), which a block digit
 /// needs: `A[i]` under block-2 of an `i32[16]` is `i floordiv 8`, which folds
-/// for no `i` but is CONSTANT for every `i` a loop over `[0,8)` produces, so
-/// the standard idiom (a loop per block) resolves nothing without it. An
-/// empty \p ranges asks the folding question alone.
+/// for no `i` but is CONSTANT over every `i` a loop on `[0,8)` produces, so the
+/// standard idiom (a loop per block) resolves nothing without it. An empty
+/// \p ranges asks the folding question alone.
 std::optional<int64_t> staticBankOf(const BankLayout &layout, AffineMap map,
                                     llvm::ArrayRef<int64_t> shape,
                                     llvm::ArrayRef<DimRange> ranges = {});
@@ -316,11 +293,10 @@ std::optional<int64_t> staticBankOf(const BankLayout &layout, AffineMap map,
 /// index is one rotation of the slot index, a bijection).
 ///
 /// A slot is billable the way a static bank is: `assign-banks` records it in
-/// `kBankAttr`, the port model bills a port on it, and F accesses with F
-/// distinct slots take one port per bank instead of a port on every bank. The
-/// emitter must NOT route to it directly: the physical bank is the slot
-/// rotated by `cls`, known only at run time. `BankLayout::skew()` tells the
-/// two readings of `kBankAttr` apart.
+/// `kBankAttr` and the port model bills a port on it, so F accesses with F
+/// distinct slots take one port per bank. The emitter must NOT route to it
+/// directly: the physical bank is the slot rotated by `cls`, known only at run
+/// time. `BankLayout::skew()` tells the two readings of `kBankAttr` apart.
 struct SkewSlot {
   AffineExpr cls;    // the runtime part of the bank's linear form
   unsigned slot = 0; // its constant part, modulo the factor
@@ -341,27 +317,25 @@ constexpr llvm::StringLiteral kBankAttr = "allo.bank";
 
 /// The bank \p op was assigned, or nullopt when it reaches EVERY bank of its
 /// memref: a roaming subscript, a non-affine index, or an `assign-banks` that
-/// never ran. Reads whichever carrier the IR layer uses, so the port model,
-/// the static split and the emitter consult one recorded decision rather than
-/// each re-deriving `staticBankOf`. Nullopt is the conservative answer
-/// everywhere (bill, route and address through all the banks).
+/// never ran. Reads whichever carrier the IR layer uses, so every consumer sees
+/// one recorded decision. Nullopt is the conservative answer everywhere (bill,
+/// route and address through all the banks).
 std::optional<unsigned> assignedBankOf(Operation *op);
 
 /// \p map, in element space, rewritten as the single row-major linear element
-/// index it addresses, simplified. The ONE definition of the linear
-/// direction, applied AT THE POINT OF USE by everything needing a flat
-/// address, so pricing, strength reduction and the emitter cannot disagree.
+/// index it addresses, simplified. Applied AT THE POINT OF USE by everything
+/// needing a flat address, so pricing, strength reduction and the emitter
+/// cannot disagree.
 ///
 /// Nothing rewrites the IR with it, deliberately: element space carries
 /// per-dimension structure the linear form cannot be simplified back into
 /// (`(6i+j) floordiv 6` does not fold to `i` without knowing `j < 6`), and the
 /// bank split needs that structure.
 ///
-/// Doing this on the EXPRESSION rather than on emitted values is what makes
-/// the delinearize/linearize pair of a coalesced nest cancel: `iv -> (iv
-/// floordiv N, iv mod N)` composed with `(r, c) -> r*N + c` simplifies back
-/// to `iv`, where the same round trip built out of `comb` ops is a divider, a
-/// modulo and a multiplier that no later pass can fold.
+/// Working on the EXPRESSION is what cancels the delinearize/linearize pair of
+/// a coalesced nest: `iv -> (iv floordiv N, iv mod N)` composed with
+/// `(r, c) -> r*N + c` simplifies back to `iv`, where the same round trip built
+/// out of `comb` ops is a divider, a modulo and a multiplier.
 AffineMap linearizeAccessMap(AffineMap map, llvm::ArrayRef<int64_t> shape);
 
 } // namespace mlir::allo
@@ -374,12 +348,11 @@ namespace mlir::allo {
 /// `allo.bind.storage`) come from the array; each `allo.part` bank is then a
 /// separate limited resource with those ports.
 ///
-/// An access holds one port on EVERY bank it can reach: the bank
-/// `assign-banks` assigned it, or all of them when assigned none. The latter
-/// is not a conservative bound but the crossbar the emitter builds (read
-/// every bank and mux the result, or drive every bank and demux the write
-/// enable), so a partitioned array under a roaming access sustains
-/// `portsPerBank` concurrent accesses, not `portsPerBank * numBanks`.
+/// An access holds one port on EVERY bank it can reach: the bank `assign-banks`
+/// assigned it, or all of them when assigned none. The latter is not a
+/// conservative bound but the crossbar the emitter builds, so a partitioned
+/// array under a roaming access sustains `portsPerBank` concurrent accesses,
+/// not `portsPerBank * numBanks`.
 class MemoryBankModel {
 public:
   void observe(Operation *op);
@@ -409,17 +382,15 @@ private:
 namespace mlir::allo {
 
 //===----------------------------------------------------------------------===//
-// Memory resource model: applies the per-memref port/bank model to a
-// scheduling problem, the storage twin of `populateOperatorTypes`. The port
-// key + limit come from the array's `allo.part` / `allo.bind.storage`
-// attributes. A port is a one-cycle reservation whatever its latency
-// (`getResourceCycles`'s default), so no occupancy window is set here. Only
-// an `OccupancyProblem` carries limited resources, so this is a no-op for any
-// other problem type.
+// Memory resource model: applies the per-memref port/bank model to a scheduling
+// problem, the storage twin of `populateOperatorTypes`.
 //===----------------------------------------------------------------------===//
 
 /// Assign per-memref memory-port resources to every memory access reached by
-/// \p walkFn.
+/// \p walkFn. A port is a one-cycle reservation whatever its latency
+/// (`getResourceCycles`'s default), so no occupancy window is set. Only an
+/// `OccupancyProblem` carries limited resources; any other problem type is a
+/// no-op.
 template <class ProblemT, class WalkFn>
 LogicalResult populateMemoryResourcesImpl(ProblemT &problem, WalkFn walkFn) {
   using namespace circt::scheduling;

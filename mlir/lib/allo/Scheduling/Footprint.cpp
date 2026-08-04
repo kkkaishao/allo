@@ -23,9 +23,7 @@ using namespace mlir;
 using namespace mlir::allo;
 
 void mlir::allo::summarizeOp(Operation *op, Summary &s) {
-  // A recognized load/store/stream access, root resolved through views. A
-  // stream touches a FIFO root; an array access records its direction and
-  // whether it is affine (non-affine defeats sub-range refinement).
+  // A recognized load/store/stream access, root resolved through views.
   if (auto a = asMemAccess(op)) {
     if (a->kind == AccessKind::Stream) {
       s.streams.insert(a->root);
@@ -34,17 +32,16 @@ void mlir::allo::summarizeOp(Operation *op, Summary &s) {
     Access &acc = s.mem[a->root];
     (a->isWrite ? acc.writes : acc.reads) = true;
     // `footprintsDisjoint` runs the polyhedral test over an
-    // `affine::MemRefAccess`, so what it needs is an affine-dialect op. Every
-    // array access carries a map, so the map cannot answer this.
+    // `affine::MemRefAccess`, so it needs an affine-dialect op. Every array
+    // access carries a map, so the map cannot answer this.
     if (isa<affine::AffineReadOpInterface, affine::AffineWriteOpInterface>(op))
       acc.affine.push_back(op);
     else
       acc.nonAffine = true;
     return;
   }
-  // Any op not provably side-effect-free (an opaque call, memref.copy, an
-  // unregistered op) may touch memory: conservatively read+write every memref
-  // operand root and mark every stream operand.
+  // Any op not provably side-effect-free may touch memory: conservatively
+  // read+write every memref operand root and mark every stream operand.
   if (isMemoryEffectFree(op))
     return;
   for (Value operand : op->getOperands()) {
@@ -69,9 +66,9 @@ bool mlir::allo::footprintsDisjoint(const Access &ai, const Access &aj) {
       affine::MemRefAccess accA(a), accB(b);
       if (accA.memref != accB.memref)
         return false; // different memref (e.g. subview): cannot prove disjoint
-      // A dependence at any depth means the two may touch one element:
-      // carried by a common enclosing loop (1..n), or loop-independent
-      // (n+1, same iteration of every common loop). Depth 1 alone misses it.
+      // A dependence at any depth means the two may touch one element: carried
+      // by a common enclosing loop (1..n), or loop-independent (n+1, the same
+      // iteration of every common loop). Depth 1 alone misses it.
       unsigned n = affine::getNumCommonSurroundingLoops(*a, *b);
       for (unsigned d = 1; d <= n + 1; ++d) {
         affine::FlatAffineValueConstraints cst;
@@ -103,9 +100,8 @@ Conflict mlir::allo::footprintConflict(const Access &a, const Access &b) {
 // Fold the memory effects `fn` has on its PARAMETERS into `s`, keyed by the
 // caller-side root each parameter is bound to (`actuals`, one per parameter;
 // null for a parameter the caller cannot observe). A nested call recurses with
-// the binding composed, so a container's footprint is its leaves'. `active`
-// guards a call cycle (the scheduler's call graph is a DAG, but this analysis
-// does not rely on that). Returns false when a construct defeats the summary.
+// the binding composed. `active` guards a call cycle, which this analysis does
+// not assume away. Returns false when a construct defeats the summary.
 static bool summarizeFuncInto(func::FuncOp fn, ArrayRef<Value> actuals,
                               Summary &s,
                               llvm::SmallPtrSetImpl<Operation *> &active) {
@@ -113,9 +109,9 @@ static bool summarizeFuncInto(func::FuncOp fn, ArrayRef<Value> actuals,
     return false; // a call cycle has no finite footprint
   llvm::scope_exit pop([&] { active.erase(fn); });
 
-  // The caller-side root a callee value denotes: a parameter maps to the
-  // actual it is bound to; anything else (a callee-local `alloc`) is memory
-  // the caller cannot observe and constrains nothing at the call site.
+  // The caller-side root a callee value denotes. Anything that is not a
+  // parameter (a callee-local `alloc`) is memory the caller cannot observe and
+  // constrains nothing at the call site.
   auto mapRoot = [&](Value v) -> Value {
     auto arg = dyn_cast<BlockArgument>(v);
     if (!arg || arg.getOwner()->getParentOp() != fn)
@@ -155,9 +151,9 @@ static bool summarizeFuncInto(func::FuncOp fn, ArrayRef<Value> actuals,
       }
       Access &acc = s.mem[root];
       (a->isWrite ? acc.writes : acc.reads) = true;
-      // Only an affine access naming the parameter DIRECTLY has indices in
-      // the array's own index space (the space the caller shares with it),
-      // so only then is its region comparable across the call.
+      // Only an affine access naming the parameter DIRECTLY has indices in the
+      // array's own index space, the space the caller shares with it, so only
+      // then is its region comparable across the call.
       if (isa<affine::AffineReadOpInterface, affine::AffineWriteOpInterface>(
               op) &&
           affine::MemRefAccess(op).memref == a->root)
@@ -166,8 +162,8 @@ static bool summarizeFuncInto(func::FuncOp fn, ArrayRef<Value> actuals,
         acc.nonAffine = true;
       return;
     }
-    // Any other op that may touch memory: conservative on each mapped operand
-    // (as `summarizeOp`, but in the caller's terms).
+    // Any other op that may touch memory: conservative on each mapped operand,
+    // as `summarizeOp`, but in the caller's terms.
     if (isMemoryEffectFree(op))
       return;
     for (Value operand : op->getOperands()) {
@@ -194,8 +190,7 @@ bool mlir::allo::summarizeCall(func::CallOp call, Summary &s) {
   SmallVector<Value> actuals;
   for (Value o : call.getArgOperands()) {
     // Bail on a view operand rather than key by its root: the callee indexes
-    // the view, whose index space is offset from the root's. Every other
-    // operand is its own root, matching `summarizeOp`'s keying.
+    // the view, whose index space is offset from the root's.
     if (isa<MemRefType>(o.getType()) && resolveRoot(o) != o)
       return false;
     actuals.push_back(o);
@@ -204,17 +199,16 @@ bool mlir::allo::summarizeCall(func::CallOp call, Summary &s) {
   return summarizeFuncInto(callee, actuals, s, active);
 }
 
-// Whether two accesses to one array provably touch DISJOINT elements when
-// they may live in DIFFERENT functions: each names its own parameter, so
-// `footprintsDisjoint`'s `MemRefAccess`-pair test (demanding one identical
-// memref Value) does not apply. Compares polyhedral REGIONS instead:
-// `MemRefRegion` at loop depth 0 is the set of indices an access touches
-// across all its enclosing loops, with exactly `rank` dimensions and the IVs
-// projected out. A `func.call` is type-checked, so parameters bound to one
-// array share its shape and the two regions align positionally. Symbols keep
-// their Value identity across the merge, so two callees' unrelated symbols
-// stay distinct columns and the intersection stays non-empty: unproven
-// disjointness conservatively reads as a conflict.
+// Whether two accesses to one array provably touch DISJOINT elements when they
+// may live in DIFFERENT functions, comparing polyhedral REGIONS.
+//
+// `MemRefRegion` at loop depth 0 is the set of indices an access touches across
+// all its enclosing loops, with exactly `rank` dimensions and the IVs projected
+// out. A `func.call` is type-checked, so parameters bound to one array share
+// its shape and the two regions align positionally. Symbols keep their Value
+// identity across the merge, so two callees' unrelated symbols stay distinct
+// columns and the intersection stays non-empty: unproven disjointness
+// conservatively reads as a conflict.
 static bool regionsDisjoint(const Access &ai, const Access &aj) {
   if (ai.nonAffine || aj.nonAffine)
     return false;

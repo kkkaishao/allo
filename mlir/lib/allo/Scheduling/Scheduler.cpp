@@ -4,13 +4,11 @@
  */
 
 //===----------------------------------------------------------------------===//
-// Self-contained fork of CIRCT's linear-programming (SDC) simplex schedulers
-// (externals/circt/lib/Scheduling/SimplexSchedulers.cpp), vendored into the
-// Allo tree so the scheduling engine is ours to instrument (debugging /
-// inspection) and extend without growing a CIRCT diff. It reuses CIRCT's public
-// Problem data model (circt/Scheduling/Problems.h) and chaining utilities
-// (circt/Scheduling/Utilities.h); only the solver lives here. Portions derived
-// from LLVM/CIRCT, Apache-2.0 WITH LLVM-exception.
+// Fork of CIRCT's linear-programming (SDC) simplex schedulers
+// (externals/circt/lib/Scheduling/SimplexSchedulers.cpp). Only the solver lives
+// here; the Problem data model and the chaining utilities stay CIRCT's.
+//
+// Portions derived from LLVM/CIRCT, Apache-2.0 WITH LLVM-exception.
 //===----------------------------------------------------------------------===//
 
 #include "allo/Scheduling/Scheduler.h"
@@ -43,10 +41,9 @@ using llvm::format;
 
 namespace {
 
-/// A dependence circuit that binds the initiation interval: the ops around it,
-/// plus the sums the II bound is read off. `latency` counts each edge's source
-/// latency (and the extra cycle a chain-breaking constraint adds); `distance`
-/// counts the iterations each edge spans.
+/// A dependence circuit that binds the initiation interval. `latency` sums each
+/// edge's source latency plus the extra cycle a chain-breaking constraint adds;
+/// `distance` sums the iterations the edges span.
 struct Recurrence {
   SmallVector<Operation *> ops; // the circuit, in dependence order
   int64_t latency = 0;
@@ -173,31 +170,23 @@ protected:
   SmallVector<Problem::Dependence> additionalConstraints;
 
   virtual Problem &getProblem() = 0;
-  /// Iteration distance a dependence spans. Only a cyclic problem carries one;
-  /// an acyclic problem is the `distance == 0` special case, so the base
-  /// answers 0 and the cyclic subclasses override, mirroring how
-  /// `fillConstraintRow` adds the parameter-T term.
+  /// Iteration distance a dependence spans. The base answers 0 (the acyclic
+  /// `distance == 0` special case); the cyclic subclasses override.
   virtual unsigned distanceOf(Problem::Dependence dep);
   /// The dependence circuit that binds the II at \p ii: the constraints are
   /// `t_dst - t_src >= latency(src) + extra - ii*distance`, so a schedule
   /// exists iff no circuit's weights sum positive. A positive circuit forces
   /// `ii >= ceil(latency / distance)`, and one with `distance == 0` can never
-  /// be satisfied, which is exactly what "the problem is infeasible" means
-  /// here. Empty when no circuit binds. O(|ops| * |deps|) Bellman-Ford.
+  /// be satisfied. Empty when no circuit binds. O(|ops| * |deps|) Bellman-Ford.
   Recurrence bindingRecurrence(unsigned ii);
-  /// Report a failed initial solve, naming the recurrence responsible. Shared
-  /// by every scheduler's `schedule()`; the message is the only thing a user
-  /// sees when their kernel has an unsatisfiable dependence cycle.
+  /// Report a failed initial solve, naming the recurrence responsible.
   void reportInfeasible();
   virtual LogicalResult checkLastOp();
   /// The objective rows, optimized lexicographically in this order. The second
   /// one is a TIEBREAK: minimizing the last operation's start time leaves a
-  /// whole face of optimal solutions, and the simplex would otherwise return an
-  /// arbitrary vertex of it, so an operation with slack could land anywhere in
-  /// its feasible window. That is not free downstream: the emitter builds an
-  /// operation's start pulse as `delayValid(regionStart, t)`, one flip-flop per
-  /// cycle of `t`, so a slack-bearing node placed late costs its whole slack in
-  /// registers while changing no latency.
+  /// whole face of optimal solutions, and the emitter builds an operation's
+  /// start pulse as `delayValid(regionStart, t)`, one flip-flop per cycle of
+  /// `t`, so a slack-bearing node placed late costs registers for no latency.
   enum { OBJ_LATENCY = 0, OBJ_AXAP /* i.e. either ASAP or ALAP */ };
   virtual bool fillObjectiveRow(SmallVector<int> &row, unsigned obj);
   virtual void fillConstraintRow(SmallVector<int> &row,
@@ -225,14 +214,11 @@ protected:
   void moveBy(unsigned startTimeVariable, unsigned amount);
   unsigned getStartTime(unsigned startTimeVariable);
 
-  /// A restorable copy of the linear program's mutable state. A transform that
-  /// moves several variables and only then re-solves cannot be undone by
-  /// inverting the moves: a failed `solveTableau` leaves them applied on a
-  /// primal-infeasible tableau, and re-solving to get back is exactly what just
-  /// failed. Attempting such a transform speculatively therefore means keeping
-  /// a copy. Holds everything a pivot, a `translate` or a `moveBy` touches;
-  /// `implicitBasicVariableColumnVector` is pivot scratch and the tableau's
-  /// dimensions never change, so neither is saved.
+  /// A restorable copy of the linear program's mutable state. A failed
+  /// `solveTableau` cannot be undone by inverting the moves that led to it, so
+  /// a speculative transform must keep a copy. Holds everything a pivot, a
+  /// `translate` or a `moveBy` touches; `implicitBasicVariableColumnVector` is
+  /// pivot scratch and the tableau's dimensions never change.
   struct LPState {
     SmallVector<SmallVector<int>> tableau;
     SmallVector<unsigned> nonBasicVariables, basicVariables;
@@ -332,9 +318,8 @@ private:
   SmallVector<unsigned> asapTimes, alapTimes;
   SmallVector<Operation *> unscheduled, scheduled;
   MRT mrt;
-  // Lower bound on the II from a pipeline directive; the search seeds the II at
-  // max(this, the resource-min II) and only ever grows it, so the achieved II
-  // is max(this, the natural minimum). 1 imposes no additional bound.
+  // Lower bound on the II from a pipeline directive. The search only ever grows
+  // the II, so the achieved II is max(this, the natural minimum).
   unsigned minII = 1;
   // Set when any limited op occupies its unit for >1 cycle (non-pipelined). The
   // de Dinechin II-increment assumes fully-pipelined (1-slot) reservations, so
@@ -345,14 +330,13 @@ private:
   unsigned totalResourceCycles = 0;
   // The largest II any bound justifies before resources are placed: the
   // resource-min II, a loop-carried recurrence, and the pipeline directive's
-  // floor, whichever is largest. The greedy placement can only grow the II
-  // beyond it, so `parameterT - lowerBoundII` is what the heuristic cost.
+  // floor, whichever is largest. Greedy placement can only grow the II past it.
   unsigned lowerBoundII = 1;
   // Whether the resource-free solve that settles `lowerBoundII` got that far.
   bool boundSettled = false;
-  // Whether a caller is going to place this region itself if the greedy cannot
-  // (see `SimplexWarmStart`). It changes only what a placement failure is
-  // reported AS, never what the placement does.
+  // Whether a caller places this region itself if the greedy cannot (see
+  // `SimplexWarmStart`). It changes only what a placement failure is reported
+  // AS, never what the placement does.
   bool placementAdvisory = false;
 
 protected:
@@ -371,8 +355,7 @@ public:
         minII(minII) {}
   LogicalResult schedule() override;
   /// See `lowerBoundII`. Settled before placement, so it is meaningful even
-  /// after `schedule` fails, but only once `hasLowerBound` holds: a
-  /// resource-free solve that itself failed never got as far as settling it.
+  /// after `schedule` fails, but only once `hasLowerBound` holds.
   unsigned getLowerBoundII() const { return lowerBoundII; }
   bool hasLowerBound() const { return boundSettled; }
   void setPlacementAdvisory() { placementAdvisory = true; }
@@ -425,10 +408,9 @@ public:
 };
 
 // This class solves the resource-constrained, cyclic, chaining-enabled
-// `ChainingModuloProblem` by reusing the `ModuloSimplexScheduler` (MRT + II
-// increment) and layering the orthogonal chaining constraints around it: a
-// pre-pass fills the chain-breaking dependences (consumed by `buildTableau`),
-// and a post-pass fills the sub-cycle start times.
+// `ChainingModuloProblem` on top of the `ModuloSimplexScheduler`: a pre-pass
+// fills the chain-breaking dependences (consumed by `buildTableau`), and a
+// post-pass fills the sub-cycle start times.
 class ChainingModuloSimplexScheduler : public ModuloSimplexScheduler {
 private:
   ChainingModuloProblem &prob;
@@ -465,12 +447,9 @@ public:
 };
 
 // This class solves the resource-constrained, acyclic, chaining-enabled
-// `ChainingSharedOperatorsProblem` by reusing the
-// `SharedOperatorsSimplexScheduler` (per-cycle resource reservation) and
-// layering the orthogonal chaining constraints around it. It is the acyclic
-// mirror of `ChainingModuloSimplexScheduler`: a pre-pass fills the
-// chain-breaking dependences (consumed by `buildTableau`), and a post-pass
-// fills the sub-cycle start times.
+// `ChainingSharedOperatorsProblem` on top of the
+// `SharedOperatorsSimplexScheduler`. The acyclic mirror of
+// `ChainingModuloSimplexScheduler`.
 class ChainingSharedOperatorsSimplexScheduler
     : public SharedOperatorsSimplexScheduler {
 private:
@@ -534,7 +513,7 @@ mlir::allo::computeChainBreaks(ChainingProblem &prob, float cycleTime,
 
   // Problem order, which is the IR's. `chains` is keyed by pointer, so its
   // iteration order is one of ADDRESSES, and the edges below would otherwise
-  // reach a solver in an order that varies between two compiles of one kernel.
+  // vary between two compiles of one kernel.
   DenseMap<Operation *, unsigned> order;
   for (Operation *op : prob.getOperations())
     order.try_emplace(op, order.size());
@@ -978,9 +957,8 @@ LogicalResult SimplexSchedulerBase::solveTableau() {
       assert(entry1Col < 0);
       int newParameterT = (-entry1Col - 1) / entryTCol + 1;
       if (newParameterT > parameterT) {
-        // Name the circuit that forces the bump; it is what a user would have
-        // to shorten to get the II back. The search is O(|ops| * |deps|), so
-        // only run it when the message will actually be printed.
+        // Name the circuit that forces the bump. The search is
+        // O(|ops| * |deps|), so only run it when the message will be printed.
         auto diag = info(Stage::Sched, getProblem().getContainingOp());
         diag << "II=" << parameterT
              << " is not achievable: a loop-carried recurrence requires II>="
@@ -1257,11 +1235,10 @@ static bool isLimited(Operation *op, SharedOperatorsProblem &prob) {
   });
 }
 
-/// The limited units \p op holds, in link order. An operation may hold several
-/// at once (a memory port and a shared functional unit, say), and it takes them
-/// all at its start time and releases them together, so a cycle is feasible for
-/// it only if every one of them has room. An unlimited link is dropped here:
-/// it constrains nothing, so no reservation table tracks it.
+/// The limited units \p op holds, in link order. An operation takes all of them
+/// at its start time and releases them together, so a cycle is feasible for it
+/// only if every one has room. An unlimited link is dropped: it constrains
+/// nothing, so no reservation table tracks it.
 static SmallVector<Problem::ResourceType>
 limitedUnits(SharedOperatorsProblem &prob, Operation *op) {
   auto maybeRsrcs = prob.getLinkedResourceTypes(op);
@@ -1474,10 +1451,8 @@ void ModuloSimplexScheduler::updateMargins() {
 
 /// Tries `n` at its current time step and the II-1 slots after it, then grows
 /// the II if none admit it (`growIIByDeDinechin` first, `growIIUniformly` as
-/// fallback). The de Dinechin move is tried first since it grows the schedule
-/// less, but only SPECULATIVELY: it assumes fully-pipelined reservations
-/// (`hasBlockingOps` bypasses it) and that the partial schedule absorbs its
-/// moves, neither of which is checked ahead of time, so a failed re-solve
+/// fallback). The de Dinechin move assumes fully-pipelined reservations
+/// (`hasBlockingOps` bypasses it) and is only SPECULATIVE, so a failed re-solve
 /// there is rolled back rather than asserted.
 LogicalResult ModuloSimplexScheduler::scheduleOperation(Operation *n) {
   unsigned stvN = startTimeVariables[n];
@@ -1505,8 +1480,7 @@ LogicalResult ModuloSimplexScheduler::scheduleOperation(Operation *n) {
       break;
     }
 
-  // `n` does not fit at this II, so the II has to grow (see the doc comment
-  // above for why the targeted move is tried first and why it can fail).
+  // `n` does not fit at this II, so the II has to grow.
   if (!hasBlockingOps) {
     LPState savedLP = saveLP();
     auto savedTables = mrt.tables;
@@ -1526,14 +1500,10 @@ LogicalResult ModuloSimplexScheduler::scheduleOperation(Operation *n) {
 // Grow the II without assuming anything about the partial schedule: every
 // scheduled op is shifted by its own `phi`, which keeps it in its modulo slot
 // once the II is one larger, then the reservation table is rebuilt and `n` is
-// retried. This is both the path for non-pipelined ops (whose multi-slot
-// reservations the targeted move cannot express) and the fallback when the
-// targeted move fails.
+// retried. The path for non-pipelined ops, whose multi-slot reservations the
+// targeted move cannot express, and the fallback when that move fails.
 LogicalResult ModuloSimplexScheduler::growIIUniformly(Operation *n) {
   unsigned stvN = startTimeVariables[n];
-  // One line for the whole search rather than one per attempt: a non-converging
-  // search runs to the bound below, and the II it settles at is reported by the
-  // caller either way.
   info(Stage::Sched, n) << "II=" << parameterT << " is not achievable for "
                         << n->getName().getStringRef()
                         << ", growing the II uniformly until it fits";
@@ -1703,17 +1673,13 @@ unsigned ModuloSimplexScheduler::computeResMinII() {
 /// in earliest-first, least-slack-breaks-ties order. That order matters:
 /// pinning a consumer caps how late its operands may issue, and once a
 /// resource saturates at this II there is no cycle left for the last of them.
-/// Ordering by slack alone gets this backwards, since a sink is exactly what
-/// has none, costing a whole cycle of II on a loop whose accesses fill their
-/// ports exactly (`test_exact_scheduler.py`'s ten- and eight-read reductions).
 LogicalResult ModuloSimplexScheduler::schedule() {
   if (failed(checkLastOp()))
     return failure();
 
   parameterS = 0;
   // Seed the II at the resource-min II, but never below the pipeline
-  // directive's target: the search only grows the II, so the result is
-  // max(minII, natural).
+  // directive's target; the search only grows it from there.
   unsigned resMinII = computeResMinII();
   parameterT = std::max(resMinII, minII);
   info(Stage::Sched, prob.getContainingOp())
@@ -1733,8 +1699,8 @@ LogicalResult ModuloSimplexScheduler::schedule() {
     return failure();
   }
   // The resource-free solve already raises the II to any loop-carried
-  // recurrence's minimum, so `parameterT` here is the best lower bound
-  // anything downstream can justify; everything past this point only grows it.
+  // recurrence's minimum, so `parameterT` here is the best lower bound anything
+  // downstream can justify.
   lowerBoundII = parameterT;
   boundSettled = true;
 
@@ -1755,8 +1721,7 @@ LogicalResult ModuloSimplexScheduler::schedule() {
     // ASAP/ALAP margins, refreshed against the operations pinned so far.
     updateMargins();
 
-    // Earliest-first, least slack breaking the tie (see the doc comment above
-    // for why this order, not slack alone, is what keeps the II tight).
+    // Earliest-first, least slack breaking the tie (see the doc comment above).
     auto priority = [&](Operation *op) {
       unsigned stv = startTimeVariables[op];
       return std::make_pair(asapTimes[stv], alapTimes[stv] - asapTimes[stv]);
@@ -1775,7 +1740,7 @@ LogicalResult ModuloSimplexScheduler::schedule() {
 
   // Resource placement is greedy, so an II above the LP's bound may be the
   // problem's real minimum or just what the heuristic cost; nothing here can
-  // tell the two apart, so say so rather than report the II as optimal.
+  // tell the two apart.
   if (parameterT > static_cast<int>(lowerBoundII))
     warn(Stage::Sched, prob.getContainingOp())
         << "Scheduled at II=" << parameterT
@@ -2035,8 +2000,7 @@ LogicalResult ModuloOccupancyProblem::verify() {
 
 //===----------------------------------------------------------------------===//
 // ChainingModuloProblem (declared in Scheduler.h): the composition of CIRCT's
-// ChainingProblem and ModuloOccupancyProblem. Mirrors CIRCT's
-// ChainingCyclicProblem.
+// ChainingProblem and ModuloOccupancyProblem.
 //===----------------------------------------------------------------------===//
 
 LogicalResult ChainingModuloProblem::checkDefUse(Dependence dep) {

@@ -29,9 +29,9 @@ using namespace mlir;
 using namespace mlir::allo;
 using namespace mlir::allo::logging;
 
-// An op the reifier turns into a `dcp.compute` (IP path or combinational
-// path). Must stay in sync with the split `convertOp` (PostConversion.cpp)
-// makes for a single-result non-constant op carrying a start time.
+// An op the reifier turns into a `dcp.compute`. Must stay in sync with the
+// split `convertOp` (PostConversion.cpp) makes for a single-result non-constant
+// op carrying a start time.
 static bool isComputeOp(Operation *op) {
   return op->getNumResults() == 1 && !op->hasTrait<OpTrait::ConstantLike>() &&
          (isa<arith::ArithDialect, math::MathDialect>(op->getDialect()) ||
@@ -46,7 +46,7 @@ struct CallEnd {
 };
 
 // A channel as this function sees it: the ends it issues itself, the ends its
-// children hold, and the seed that breaks a feedback cycle's start dependence.
+// children hold, and the seed that breaks a feedback cycle.
 struct Channel {
   Value root;
   bool internal = false; // declared here (`stream.create`) vs a boundary arg
@@ -80,12 +80,11 @@ static LogicalResult verifyFunc(
 
 // Element count above which a completely-partitioned argument's
 // port-per-element boundary is worth a word. Matches `scalarize-memory`'s own
-// scatter threshold, which answers the same "is this small enough to be
-// registers" question.
+// scatter threshold.
 static constexpr int64_t kScatterWarnElements = 16;
 
-// The direction \p call imposes on \p stream, from the callee parameter it
-// is passed to. Empty when the callee never resolves one, which the unused
+// The direction \p call imposes on \p stream, from the callee parameter it is
+// passed to. Empty when the callee never resolves one, which the unused
 // boundary-argument check below reports against the callee itself.
 static std::optional<bool> calleeStreamDirection(
     func::CallOp call, Value stream,
@@ -168,8 +167,8 @@ LogicalResult checkOperations(func::FuncOp func, const OperatorLibrary &lib) {
     }
     if (!isComputeOp(op))
       return WalkResult::advance();
-    // The identity names the IP row's symbol or the native comb lowering, and
-    // is empty when the device offers neither.
+    // The identity names the IP row's symbol or the native comb lowering,
+    // and is empty when the device offers neither.
     OperatorIdentity id = operatorIdentity(op, lib);
     if (!id.realized()) {
       error(Stage::Prep, op)
@@ -186,10 +185,9 @@ LogicalResult checkOperations(func::FuncOp func, const OperatorLibrary &lib) {
   return failure(r.wasInterrupted());
 }
 
-// `ce` is the only IP port ABI the emitter realizes. `elastic` is
-// variable-latency, which nothing downstream honors: consumers are scheduled
-// at the operator's fixed latency and the instance gets the free-running port
-// shape.
+// `ce` is the only IP port ABI the emitter realizes. Nothing downstream honors
+// `elastic`: consumers are scheduled at the operator's fixed latency and the
+// instance gets the free-running port shape.
 LogicalResult checkStallContract(Operation *op, StringRef symbol) {
   auto opr = SymbolTable::lookupNearestSymbolFrom<dcp::DCPathOperatorOp>(
       op, StringAttr::get(op->getContext(), symbol));
@@ -208,9 +206,8 @@ LogicalResult checkStallContract(Operation *op, StringRef symbol) {
 //===--------------------------------------------------------------------===//
 
 // A local buffer read before anything writes it takes whatever its storage
-// happens to hold: zeros in csim, but the previous iteration's values in
-// hardware (the buffer is reused across iterations). Legal MLIR, so this
-// warns rather than fails, but it is the ordinary way to lose cosim == csim.
+// holds: zeros in csim, but the previous iteration's values in hardware, since
+// the buffer is reused across iterations. Legal MLIR, so this only warns.
 static void warnUninitializedReads(func::FuncOp func) {
   llvm::MapVector<Value, Operation *> firstTouch;
   DenseSet<Value> opaque; // a buffer whose whole traffic is not in view
@@ -234,8 +231,8 @@ static void warnUninitializedReads(func::FuncOp func) {
         !isa_and_nonnull<memref::AllocOp, memref::AllocaOp>(alloc) ||
         isa<affine::AffineStoreOp, memref::StoreOp>(first))
       continue;
-    // A read under a condition the declaration is not under may not run, so
-    // it is no evidence that nothing wrote first.
+    // A read under a condition the declaration is not under may not run, so it
+    // is no evidence that nothing wrote first.
     bool conditional = false;
     for (Operation *p = first->getParentOp(); p && p != alloc->getParentOp();
          p = p->getParentOp())
@@ -251,12 +248,10 @@ static void warnUninitializedReads(func::FuncOp func) {
   }
 }
 
-// The array arguments that are REAL boundary ports: the top function's own,
-// and every callee argument one is passed down to. A sub-kernel argument that
-// is not one names storage its caller owns (a `seq.hlmem` port the parent
-// builds), which can realize any device timing including a combinational
-// read; only a genuine boundary port answers to an external driver, so only
-// it carries the contract below.
+// The array arguments that are real boundary ports: the top function's own, and
+// every callee argument one is passed down to. Any other sub-kernel argument
+// names storage its caller owns, which can realize any device timing including
+// a combinational read; only a boundary port answers to an external driver.
 static DenseSet<Value> boundaryArraysOf(func::FuncOp top) {
   DenseSet<Value> boundary;
   for (BlockArgument arg : top.getArguments())
@@ -284,11 +279,10 @@ static DenseSet<Value> boundaryArraysOf(func::FuncOp top) {
   return boundary;
 }
 
-// The boundary contract of a completely-partitioned argument, reached when
-// such an argument resolved to a 0-cycle read: not an addressed port but one
-// port per element (`MemUnit::scattered`), since a complete partition commits
-// the scheduler to unlimited combinational ports. The two shapes below are
-// backend gaps (NYI), not illegal kernels.
+// The boundary contract of a completely-partitioned argument, reached when such
+// an argument resolved to a 0-cycle read: not an addressed port but one port
+// per element (`MemUnit::scattered`), since a complete partition commits the
+// scheduler to unlimited combinational ports.
 static LogicalResult checkScatteredArgument(func::FuncOp func, Value array,
                                             MemoryChar &mc, bool isTop) {
   auto elements = cast<MemRefType>(array.getType()).getNumElements();
@@ -301,8 +295,8 @@ static LogicalResult checkScatteredArgument(func::FuncOp func, Value array,
     return failure();
   }
   // Below the top, the array is a port the child masters on caller-owned
-  // storage, served at the device's latency. A scattered TOP argument reaching
-  // a child has no such owner: the top would have to crossbar its input wires.
+  // storage. A scattered TOP argument reaching a child has no such owner: the
+  // top would have to crossbar its input wires.
   if (!isTop) {
     unsupported(Stage::Prep, func)
         << "Passing the completely-partitioned argument array "
@@ -315,7 +309,7 @@ static LogicalResult checkScatteredArgument(func::FuncOp func, Value array,
     return failure();
   }
   // One port per element is what the argument asked for, but it is also real
-  // area at the top level, so say so rather than silently emitting hundreds.
+  // area at the top level.
   if (elements > kScatterWarnElements)
     warn(Stage::Prep, func)
         << "The completely-partitioned argument array " << array.getType()
@@ -352,14 +346,14 @@ LogicalResult checkMemories(func::FuncOp func, const MemoryLibrary &memLib,
     }
     RWLatency lat = memLib.timing(impl).latency;
     // A boundary port's latency is a contract with the driver, not enforced by
-    // the RTL: any latency >= 1 works, but 0 does not since the port is
-    // edge-triggered. The write-latency check below applies to every array.
+    // the RTL: any latency >= 1 works, but 0 does not, since the port is
+    // edge-triggered.
     if (boundaryArrays.contains(array) && lat.read < 1 &&
         failed(checkScatteredArgument(func, array, mc, isTop)))
       return failure();
-    // An internal array lives in an `seq.hlmem`, whose write is edge-
-    // triggered too: a store commits at `writeLatency - 1`, which a 0-cycle
-    // write wraps. A 0-cycle read is fine internally.
+    // An `seq.hlmem` write is edge-triggered too: a store commits at
+    // `writeLatency - 1`, which a 0-cycle write wraps. A 0-cycle read is fine
+    // internally.
     if (lat.write < 1) {
       error(Stage::Prep, anchor)
           << "Storage impl '" << stringifyMemoryImplEnum(impl)
@@ -387,11 +381,9 @@ static bool sameBanking(BankLayout &a, BankLayout &b) {
   return true;
 }
 
-// A sub-kernel masters one port group per bank and indexes each in that
-// bank's own element space, so caller and callee must agree on the whole
-// banking; at a different layout the child addresses the wrong elements.
-// `propagate-partition` reconciles both ends already, so a disagreement here
-// is hand-written IR or an array whose carrier that pass could not name.
+// A sub-kernel masters one port group per bank and indexes each in that bank's
+// own element space, so caller and callee must agree on the whole banking; at a
+// different layout the child addresses the wrong elements.
 LogicalResult checkPartitionAgreement(func::FuncOp func) {
   SymbolTableCollection syms;
   WalkResult r = func.walk([&](func::CallOp call) {
@@ -427,9 +419,8 @@ LogicalResult checkPartitionAgreement(func::FuncOp func) {
 
 LogicalResult checkComposition(func::FuncOp func, const OperatorLibrary &lib) {
   if (composesOnStructuralTop(func)) {
-    // A loop around a spawn reads as loose control flow to the check below,
-    // so name it first: the loop is what the user has to move, not the
-    // container's shape.
+    // A loop around a spawn reads as loose control flow to the check below, so
+    // name it first: the loop is what the user has to move.
     WalkResult r = func.walk([&](func::CallOp call) {
       if (!call->getParentOfType<LoopLikeOpInterface>())
         return WalkResult::advance();
@@ -442,8 +433,7 @@ LogicalResult checkComposition(func::FuncOp func, const OperatorLibrary &lib) {
     if (r.wasInterrupted())
       return failure();
     // `outline-loose-processes` lifts a loose span into a process of its own,
-    // but skips a span whose live-in is not an array, a stream or a scalar,
-    // and leaves the report to here.
+    // but skips a span whose live-in is not an array, a stream or a scalar.
     for (Operation &op : func.front())
       if (!isContainerStructure(op)) {
         unsupported(Stage::Prep, &op)
@@ -475,9 +465,8 @@ LogicalResult checkComposition(func::FuncOp func, const OperatorLibrary &lib) {
 // Channels.
 //===--------------------------------------------------------------------===//
 
-// A channel is one {data,valid,ready} triple time-shared by every access to
-// it, and a directed cycle of unseeded channels deadlocks. Both properties
-// are settled by the process network's shape, which nothing between here and
+// Check every channel's ends and the cycles between them. Both properties are
+// settled by the process network's shape, which nothing between here and
 // emission changes.
 static LogicalResult checkChannels(
     func::FuncOp func,
@@ -538,9 +527,8 @@ LogicalResult checkChannelEnds(func::FuncOp func, const Channel &ch) {
   else if (!ch.callEnds.empty())
     anchor = ch.callEnds.front().call;
 
-  // Several READERS are a fan-out the emitter inserts (one FIFO each);
-  // several WRITERS are a merge, whose token interleaving is not
-  // deterministic.
+  // Several readers are a fan-out the emitter inserts, one FIFO each; several
+  // writers are a merge, whose token interleaving is not deterministic.
   if (ch.producers > 1) {
     unsupported(Stage::Prep, anchor)
         << "A stream channel is written by more than one process; a channel "
@@ -557,8 +545,8 @@ LogicalResult checkChannelEnds(func::FuncOp func, const Channel &ch) {
            "channel inside the kernel";
     return failure();
   }
-  // A local channel with one end only is a stall by construction: the puts
-  // fill it and block, or the first get waits on a token nothing produces.
+  // A local channel with one end only stalls by construction: the puts fill it
+  // and block, or the first get waits on a token nothing produces.
   if (ch.internal && !(ch.anyPut && ch.anyGet)) {
     error(Stage::Prep, anchor)
         << "The kernel-local stream is "
@@ -601,8 +589,7 @@ LogicalResult checkChannelCycles(func::FuncOp func,
   llvm::DenseMap<Operation *, int> color; // 0 white / 1 gray / 2 black
   llvm::DenseMap<Operation *, Operation *> parent;
   SmallVector<Operation *> cycle;
-  // Self-parameter recursive lambda (`self(self, ...)`): a local DFS with no
-  // std::function type-erasure.
+  // Self-parameter recursive lambda: a local DFS with no std::function.
   auto visit = [&](auto &self, Operation *u) -> bool {
     color[u] = 1;
     for (Operation *v : adj[u]) {
@@ -643,23 +630,9 @@ LogicalResult checkChannelCycles(func::FuncOp func,
 //===----------------------------------------------------------------------===//
 // Address cost: the check, and the report behind it.
 //
-// `OperatorLibrary::lookup` charges an access's address cone to the port it
-// feeds, but cannot SPLIT one: an address is folded into the access's affine
-// map rather than standing as its own operation, so chaining can only accept
-// or reject it. CIRCT rejects it via a generic `emitError` on the containing
-// op (`ChainingSupport.cpp:34`), naming neither the access nor the
-// expression, so the same condition is tested here first and reported
-// against the offending address.
-//
-// The cost priced is that of the address the emitter actually builds
-// (`addressExprsOf`): the in-bank offset (not the flat index) plus any
-// runtime bank digit, at the addressed bank's own width, with constant
-// coefficients as shift-adds and only dividers at full datapath width. Every
-// array access is priced, including non-affine ones, whose row-major
-// linearization and bank digit are address arithmetic like any other.
-//
-// Per-access lines are `debug` level; a normal compile sees only rejections,
-// `ALLO_LOG_LEVEL=debug` shows every priced address.
+// An address is folded into the access's affine map rather than standing as its
+// own op, so chaining can only accept or reject it, never split it. Per-access
+// lines are `debug` level; a normal compile sees only rejections.
 //===----------------------------------------------------------------------===//
 static LogicalResult checkAddressCost(func::FuncOp funcOp,
                                       const OperatorLibrary &lib,
@@ -692,8 +665,8 @@ static LogicalResult checkAddressCost(func::FuncOp funcOp,
     os << e.offset;
     if (e.bank)
       os << " (bank " << e.bank << ")";
-    // `lookup`'s inDelay adds the port's own setup to the address cone, which
-    // is what the solver actually sees.
+    // `lookup`'s inDelay adds the port's own setup to the address cone,
+    // which is what the solver sees.
     double charged = lib.lookup(op).inDelay;
     bool over = charged > cycleTimeNs;
     if (over) {
@@ -768,8 +741,8 @@ LogicalResult allo::runPreScheduleVerification(ModuleOp module, StringRef top,
     if (failed(verifyFunc(fn, module, lib, streamArgIsInput, boundaryArrays,
                           fn == topFunc)))
       return failure();
-  // Last, because it prices the addresses the banking above has just been
-  // held legal: a rejected partition would make the cost meaningless.
+  // Last, because it prices the addresses the banking above has just been held
+  // legal: a rejected partition would make the cost meaningless.
   for (func::FuncOp fn : *closureOr)
     if (failed(checkAddressCost(fn, lib, cycleTimeNs)))
       return failure();

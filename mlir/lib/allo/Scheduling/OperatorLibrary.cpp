@@ -190,8 +190,8 @@ OpKind mlir::allo::classify(Operation *op) {
 
 namespace {
 
-// The element types of `types` (element type of a shaped type, else the type
-// itself): the concrete operand/result types an IP row is matched against.
+// The element type of each shaped type in `types`, else the type itself: what
+// an IP row is matched against.
 llvm::SmallVector<Type> elementTypes(TypeRange types) {
   llvm::SmallVector<Type> out;
   for (Type t : types) {
@@ -202,8 +202,8 @@ llvm::SmallVector<Type> elementTypes(TypeRange types) {
   return out;
 }
 
-// Whether every data operand of `op` is an integer (element type): the
-// predicate an integer-arithmetic comb row matches on.
+// Whether every data operand of `op` has integer element type: what an
+// integer-arithmetic comb row matches on.
 bool allIntegerOperands(Operation *op) {
   auto ts = elementTypes(op->getOperandTypes());
   return !ts.empty() &&
@@ -211,10 +211,9 @@ bool allIntegerOperands(Operation *op) {
 }
 
 // The library row matching \p op, or null. Advanced (raw-mnemonic) rows match
-// first (exact type list); abstract rows match last-wins, so a later-injected
-// operator overrides an earlier one of the same signature (user @ip > built-in
-// IP > comb fallback). An IP row matches by kind + exact operand/result element
-// types; a comb row by kind + integer operands (or any type for select/neg).
+// first on an exact type list; abstract rows match last-wins, so a
+// later-injected operator overrides an earlier one of the same signature
+// (user @ip > built-in IP > comb fallback).
 const OperatorEntry *matchEntry(const std::vector<OperatorEntry> &advanced,
                                 const std::vector<OperatorEntry> &entries,
                                 Operation *op) {
@@ -231,9 +230,9 @@ const OperatorEntry *matchEntry(const std::vector<OperatorEntry> &advanced,
     if (e.kind != kind)
       continue;
     if (e.comb) {
-      // `select`/`neg` comb rows match any operand type (a mux over any
-      // datatype / a float sign flip, neither with an IP counterpart); every
-      // other comb kind is integer arithmetic.
+      // `select`/`neg` comb rows match any operand type: a mux over any
+      // datatype, a float sign flip. Every other comb kind is integer
+      // arithmetic.
       if (kind == OpKind::Select || kind == OpKind::Neg ||
           allIntegerOperands(op))
         return &e;
@@ -245,10 +244,8 @@ const OperatorEntry *matchEntry(const std::vector<OperatorEntry> &advanced,
   return nullptr;
 }
 
-// Whether \p op needs an IP realization: a float arithmetic/compare, any cast
-// to or from float, or a math.* advanced op. Integer arithmetic, integer
-// resize, and memory/stream accesses are combinational or storage, and never
-// require an IP.
+// Whether \p op needs an IP realization: a float arithmetic op or compare
+// other than neg/select, any cast to or from float, or a math.* advanced op.
 bool needsIP(Operation *op) {
   auto isFloat = [](Type t) { return isa<FloatType>(t); };
   bool floaty = llvm::any_of(elementTypes(op->getOperandTypes()), isFloat) ||
@@ -280,9 +277,8 @@ bool needsIP(Operation *op) {
   }
 }
 
-// The identity of the unit \p op runs on. Empty when the caller found no
-// realization, or when \p op is not the single-result compute a `FuncUnit` is
-// built from.
+// The identity of the unit \p op runs on. Empty without a realization, or when
+// \p op is not the single-result compute a `FuncUnit` is built from.
 OperatorIdentity identityOf(Operation *op, std::string realization, bool comb) {
   OperatorIdentity id;
   if (realization.empty() || op->getNumResults() != 1)
@@ -346,9 +342,8 @@ OperatorLibrary OperatorLibrary::fromModule(ModuleOp module) {
   dcp::DCPathDeviceOp device;
   module.walk([&](dcp::DCPathDeviceOp d) { device = d; });
 
-  // Comb rows first: `entries` is matched last-wins (see `matchEntry`), so
-  // combinational integer arithmetic is the lowest-priority fallback; an
-  // injected IP of the same kind (built-in or user) overrides it.
+  // Comb rows first: `entries` is matched last-wins, so comb is the
+  // lowest-priority fallback and an injected IP of the same kind overrides it.
   if (device) {
     for (NamedAttribute na : device.getComb()) {
       auto kind = parseOpKind(na.getName().strref());
@@ -365,9 +360,8 @@ OperatorLibrary OperatorLibrary::fromModule(ModuleOp module) {
     lib.memory = memoryFromDevice(device);
   }
 
-  // IP rows in injection order (built-in, then user), matched last-wins: a
-  // user `@ip` appended after the built-ins overrides a built-in of the same
-  // signature. Match types are the operator's declared signature element types.
+  // IP rows in injection order (built-in, then user), matched last-wins: a user
+  // `@ip` overrides a built-in of the same signature.
   module.walk([&](dcp::DCPathOperatorOp op) {
     OperatorEntry e;
     e.latency = (uint32_t)op.getLatency();
@@ -501,9 +495,8 @@ OperatorChar OperatorLibrary::lookup(Operation *op) const {
 
   const auto *e = matchEntry(advancedEntries, entries, op);
   if (!e) {
-    // The default row (0-latency comb fallback) is only safe for a
-    // float->float arith op when it is genuinely combinational (`combKindOf`)
-    // or `needsIP` already rejected the schedule; otherwise it is a miscompile.
+    // The default row (0-latency comb) is a miscompile for a float->float arith
+    // op that is neither combinational nor already rejected by `needsIP`.
     auto isFloat = [](Type t) { return isa<FloatType>(t); };
     bool floatIn = llvm::any_of(elementTypes(op->getOperandTypes()), isFloat);
     bool floatOut = llvm::any_of(elementTypes(op->getResultTypes()), isFloat);

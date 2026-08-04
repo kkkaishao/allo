@@ -22,11 +22,12 @@ enum class RegionKind { Loop, StraightLine };
 /// FIFO decouples timing); SSA is an exact def-use edge.
 enum class XEdgeKind { RAW, WAR, WAW, StreamElastic, SSA };
 
-/// A scheduling region: a single affine loop, or a maximal run of non-loop ops.
+/// A scheduling region: a single region-bearing op, or a maximal run of other
+/// ops.
 struct SchedRegion {
   unsigned id;
   RegionKind kind;
-  /// Top-level ops of the region (a Loop region holds its `affine.for`).
+  /// Top-level ops of the region; a Loop region holds exactly its loop op.
   SmallVector<Operation *> ops;
 
   Operation *anchor() const { return ops.front(); }
@@ -53,19 +54,16 @@ struct RegionGraph {
 /// Partition a block into scheduling regions (loops + maximal straight-line
 /// runs). The scheduler recurses this into imperfect-nest bodies.
 ///
-/// In a nested block (loop/while body, `if` branch), a synchronous sub-kernel
-/// call is isolated into its own region: the enclosing container re-runs such
-/// a block per iteration, gated on the child's real `done`.
+/// In a nested block (loop/while body, `if` branch), every synchronous
+/// sub-kernel call is isolated into its own region: the enclosing container
+/// re-runs such a block per iteration, gated on the child's real `done`.
 ///
-/// In the function's entry block, a DETERMINATE call stays inside its
-/// straight-line span (composed by the sequencer as a time-triggered node).
-/// An INDETERMINATE call (`isIndeterminateCall`) is isolated there too: its
-/// completion cycle is data-dependent, so sharing a span with it would
-/// schedule sibling ops against a meaningless start time. Each such call
-/// becomes its own region, and consumers become sibling regions gated on its
-/// `done`. This isolation only applies where the call is a leaf CallUnit; a
-/// `composesOnStructuralTop` function wires every call as a concurrent
-/// process instead.
+/// In the function's entry block, only an INDETERMINATE call
+/// (`isIndeterminateCall`) is isolated: its completion cycle is data-dependent,
+/// so sharing a span with it would schedule sibling ops against a meaningless
+/// start time. That isolation only applies where the call is a leaf CallUnit; a
+/// `composesOnStructuralTop` function wires every call as a concurrent process
+/// instead.
 SmallVector<SchedRegion> enumerateRegions(Block &block);
 
 /// Partition `func`'s entry block into scheduling regions (loops + maximal
@@ -86,8 +84,8 @@ enum class RegionShape {
   Guard,
   /// Hands off to an instantiated module: a counted loop whose entire body is
   /// one `dcp.instance`, advanced by the child's real `done` rather than by a
-  /// pipeline cadence. The child is on the *instance* substrate, which is why
-  /// this is not a `Container` (it has no child regions).
+  /// pipeline cadence. The child is on the *instance* substrate, so this is not
+  /// a `Container`: it has no child regions.
   CallNode,
 };
 
@@ -98,13 +96,13 @@ enum class RegionShape {
 RegionShape dcpRegionShape(Operation *regionOp);
 
 /// The same shape, asked of the SOURCE counted loop before its body is
-/// materialized. The scheduler, its composer, and the reifier all read this
-/// (not `dcpRegionShape`'s post-reification version), so they agree on which
-/// loops sequence children.
+/// materialized. The scheduler, its composer and the reifier all read this
+/// rather than `dcpRegionShape`, so they agree on which loops sequence
+/// children.
 ///
 /// Asked of every loop in a nest, including outer levels of a perfect band:
 /// each level above the innermost drives its child as a container, a fact a
-/// single schedule solution (covering the whole band) does not expose.
+/// single schedule solution covering the whole band does not expose.
 RegionShape countedLoopShape(LoopLikeOpInterface loop);
 
 /// Whether a straight-line region carries a datapath, i.e. materializes into a
@@ -113,9 +111,9 @@ RegionShape countedLoopShape(LoopLikeOpInterface loop);
 bool spanFormsRegion(ArrayRef<Operation *> ops);
 
 /// A DECLARATION: an op that names storage or a literal and binds no hardware.
-/// A straight-line region of nothing but these carries no datapath, so the
-/// reifier leaves it in place rather than wrapping it, and a level whose body
-/// holds only these plus child loops has no work of its own to schedule.
+/// A region of nothing but these carries no datapath, so the reifier leaves it
+/// in place, and a level holding only these plus child loops has no work of its
+/// own to schedule.
 bool isDeclarationOp(Operation *op);
 
 /// A synchronous sub-kernel call: a plain (non-async) `func.call`, scheduled as
@@ -125,21 +123,19 @@ bool isSyncSubKernelCall(Operation *op);
 
 /// The kernel a `func.call` names, whichever container the phase has: a
 /// `func.func` while scheduling, a `dcp.module` once reified. Not filtered by
-/// op type: a filter that misses returns null, and null reads as
-/// "indeterminate callee" rather than as an error.
+/// op type, since null reads as an indeterminate callee rather than an error.
 Operation *calleeOf(Operation *call);
 
-/// A callee's whole-kernel static latency, read from whichever carrier the
-/// current phase has: `allo.sched.latency` on a `func.func` while scheduling,
-/// or the `dcp.module`'s own `latency` field once reified. Empty when the
-/// callee's length is data-dependent. Reification is post-order over the call
-/// graph, so a caller always sees its callee's final reified latency.
+/// A callee's whole-kernel static latency, from whichever carrier the current
+/// phase has: `allo.sched.latency` on a `func.func` while scheduling, the
+/// `dcp.module`'s own `latency` once reified. Empty when the callee's length is
+/// data-dependent. Reification is post-order over the call graph, so a caller
+/// always sees its callee's final reified latency.
 std::optional<int64_t> calleeStaticLatency(Operation *callee);
 
-/// A sync call whose callee carries no static latency: its body is
-/// data-dependent, so both its results and its writes land on the child's
-/// `done`, at a cycle no static schedule can name. The region partitioner
-/// isolates such a call; see `enumerateRegions`.
+/// A sync call whose callee carries no static latency: its results and its
+/// writes land on the child's `done`, at a cycle no static schedule can name.
+/// The region partitioner isolates such a call; see `enumerateRegions`.
 bool isIndeterminateCall(Operation *op);
 
 /// Whether \p block holds a synchronous sub-kernel call anywhere under it. A
@@ -151,13 +147,12 @@ bool blockHasSyncCall(Block &block);
 /// wraps it in a stall shell (`HWEmitter::emitRegion`) and back-pressure, not
 /// its schedule, decides when it finishes.
 ///
-/// Such a region carries no static span (`composeSpan`): back-pressure (a full
-/// output queue, a starved input) can stretch it by an amount no static
-/// analysis names, so its whole kernel is indeterminate and callers gate on
-/// its real `done`.
+/// Such a region carries no static span (`composeSpan`): back-pressure can
+/// stretch it by an amount no static analysis names, so its whole kernel is
+/// indeterminate and callers gate on its real `done`.
 ///
-/// Structural only, not a proof a given channel never stalls (a whole-network
-/// analysis); keys on the stream ops, which reification keeps verbatim.
+/// Structural only, not a proof a given channel never stalls; keys on the
+/// stream ops, which reification keeps verbatim.
 bool isElastic(Operation *op);
 
 /// Whether a sync call can be modelled as a leaf CallUnit: every operand is a
@@ -168,31 +163,27 @@ bool callLowerable(func::CallOp call);
 /// Whether \p func composes its children on the STRUCTURAL TOP rather than the
 /// leaf: it has an `await` spawn (async), or wires children through a stream (a
 /// plain KPN-style call whose operand is a `Stream`, concurrent even without
-/// `await`). Read before reification (the scheduler,
-/// `outline-loose-processes`); `spawnsConcurrently` is the same question asked
-/// of one reified child.
+/// `await`). Read before reification; `spawnsConcurrently` is the same question
+/// asked of one reified child.
 bool composesOnStructuralTop(func::FuncOp func);
 
 /// Whether \p invoke is a CONCURRENT child: an `await` spawn, or a call wired
 /// to a sibling through a `Stream`. Either way completion is ordered by
 /// back-pressure rather than a schedule, making its container a process
-/// network. The reified counterpart of `composesOnStructuralTop` (that reads
-/// `func.call`s pre-reification, this reads a `dcp.instance` post).
+/// network. The reified counterpart of `composesOnStructuralTop`.
 bool spawnsConcurrently(Operation *invoke);
 
 /// Whether \p op is part of a concurrent container's own STRUCTURE: the calls
 /// it composes, the channels / buffers / constant tables it declares, and the
 /// constants feeding them. Everything else in such a container is loose
-/// datapath, which `outline-loose-processes` lifts into a process of its own
-/// and `verify-rtl-legality` rejects whatever the outliner had to leave behind.
+/// datapath, which `outline-loose-processes` lifts into a process of its own.
 bool isContainerStructure(Operation &op);
 
 /// Whether a counted loop's body decomposes into sub-regions, becoming a
-/// sequential wrapper that runs children in program order rather than one
-/// flat modulo problem. True when the body nests a loop, or (via the call
-/// isolation above) holds a sub-kernel call alongside anything else: a flat
-/// modulo schedule has one issue cadence, which a per-iteration child re-fire
-/// (advancing on that child's `done`) cannot share.
+/// sequential wrapper that runs children in program order rather than one flat
+/// modulo problem. True when the body nests a loop, or holds a sub-kernel call
+/// alongside anything else: a flat modulo schedule has one issue cadence, which
+/// a per-iteration child re-fire advancing on that child's `done` cannot share.
 bool loopBodyDecomposes(LoopLikeOpInterface loop);
 
 StringRef toString(XEdgeKind kind);
@@ -203,16 +194,14 @@ void printRegionGraphDot(const RegionGraph &graph, func::FuncOp func,
 
 /// Topologically sort the synchronous call graph, as CALLSITES. Fails on a
 /// cycle, diagnosed on the callsites that form it. For a consumer that binds
-/// per callsite (two calls to one kernel pass different arrays), which is why
-/// this granularity survives alongside `callGraphPostOrder` below.
+/// per callsite: two calls to one kernel may pass different arrays.
 llvm::FailureOr<SmallVector<Operation *>>
 buildAndSortCallsiteGraph(func::FuncOp root);
 
 /// The kernels reachable from \p root, CALLEES BEFORE CALLERS, with \p root
-/// last. One entry per function (several callsites may name one callee);
-/// external callees are dropped, having no body to work on. This order lets a
-/// caller read a fact its callee already published, e.g. the callee latency
-/// `isIndeterminateCall` depends on.
+/// last. One entry per function; external callees are dropped, having no body
+/// to work on. This order lets a caller read a fact its callee already
+/// published, e.g. the callee latency `isIndeterminateCall` depends on.
 llvm::FailureOr<SmallVector<func::FuncOp>>
 callGraphPostOrder(func::FuncOp root);
 } // namespace mlir::allo
