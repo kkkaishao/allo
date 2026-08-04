@@ -1,13 +1,22 @@
 # Copyright Allo authors. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Predicted FPGA area of an emitted design, from measured device tables.
+"""Predicted FPGA area of an emitted design: count the structures, price them
+against the device.
 
 This is P7: the scoreboard S3 has to be argued from. `report.py` says what a
 schedule COSTS in the units the compiler already counts (cycles, flip-flops,
 instances); this says what it costs in the units a device is actually spent in,
 so a change to the allocation objective can be checked against something other
 than its own currency.
+
+What is left here is the half only a reader of the emitted IR can do: find the
+register chains, recognize the one-hot multiplexer cones, count each array's
+write ports, and decide which structure the synthesizer will build. What each
+structure COSTS is the device's own declaration
+(`allo/backend/rtl/area_tables.py`), evaluated through the compiler's one cost
+evaluator. Until this split there were two measured models running in parallel,
+and the two had already drifted.
 
 The tables are MEASURED, not estimated: Vivado 2023.2, `xcu55c-fsvh2892-2L-e`,
 out-of-context synthesis of one DUT per (kind, width) and one Xilinx
@@ -42,175 +51,39 @@ The one result here that contradicts the compiler: **a value delay chain deeper
 than three does not cost flip-flops.** Vivado extracts it into SRLs, so its cost
 is about `w` SRL sites plus `2w` flip-flops and is nearly INDEPENDENT of depth,
 against the `depth * width` flip-flops the scheduling objective's register term
-charges. Measured on both a DUT sweep and a whole kernel; see `chain_area`.
+charges. Measured on both a DUT sweep and a whole kernel; the device declares it
+as `dcp.chain`, and two terms of the measurement do not survive that
+declaration, both as under-counts (see `set_chain_uses` in `area_tables.py`).
 """
 
 from __future__ import annotations
 
-import math
 import re
-from dataclasses import dataclass, replace
+from collections import Counter
+from dataclasses import dataclass
 
-# --- measured device area (P6, xcu55c) --------------------------------------
+from allo.backend.rtl.device import CombKind, builtin_device
 
-
-@dataclass(frozen=True)
-class Area:
-    """Physical resources. Kept as a VECTOR: a scalar cannot rank an f32
-    divider (766 LUT, no DSP) against an f64 multiplier (205 LUT, 7 DSP), which
-    is the mistake `AllocatableUnit::cost` makes today."""
-
-    lut: int = 0
-    ff: int = 0
-    dsp: int = 0
-    carry8: int = 0
-    #: Shift-register LUTs. Their own field because they occupy LUT sites but
-    #: only in SLICEM, so they are neither free nor interchangeable with logic.
-    srl: int = 0
-
-    def __add__(self, o: "Area") -> "Area":
-        return Area(self.lut + o.lut, self.ff + o.ff, self.dsp + o.dsp,
-                    self.carry8 + o.carry8, self.srl + o.srl)
-
-    def __mul__(self, n: int) -> "Area":
-        return Area(self.lut * n, self.ff * n, self.dsp * n,
-                    self.carry8 * n, self.srl * n)
-
-
-ZERO = Area()
-
-# Comb operators, LUTs as a function of operand width. Each is the measured
-# shape, not a fitted curve: `and`/`or`/`xor`/`mux` are exactly w, an adder adds
-# a carry chain, a shift is a barrel (about w*ceil(log4 w)), and a divider is
-# quadratic. A cast is WIRING and costs nothing at all.
-def _logic(w: int) -> Area:
-    return Area(lut=w)
-
-
-def _addsub(w: int) -> Area:
-    return Area(lut=w, carry8=math.ceil(w / 8))
-
-
-def _cmp(w: int) -> Area:
-    return Area(lut=w, carry8=math.ceil(w / 16))
-
-
-def _shift(w: int) -> Area:
-    return Area(lut=w * max(1, math.ceil(math.log(w, 4))))
-
-
-def _mul(w: int) -> Area:
-    # Measured 1/3/10 DSP48E2 at w=16/32/64, with a little glue; below 18 bits
-    # one DSP holds it, above that the partial products multiply up.
-    dsp = {8: 0, 16: 1, 32: 3, 64: 10}.get(w, max(1, math.ceil((w / 18) ** 2)))
-    return Area(lut=15 if w >= 32 else 39, dsp=dsp, carry8=math.ceil(w / 16))
-
-
-def _div(w: int) -> Area:
-    # Measured 75/286/1086 LUTs at w=8/16/32: about 1.06*w^2.
-    return Area(lut=round(1.06 * w * w), carry8=5 * w)
-
-
-COMB_AREA = {
-    "comb.and": _logic, "comb.or": _logic, "comb.xor": _logic,
-    "comb.mux": _logic,
-    "comb.add": _addsub, "comb.sub": _addsub,
-    "comb.icmp": _cmp,
-    "comb.shl": _shift, "comb.shru": _shift, "comb.shrs": _shift,
-    "comb.mul": _mul,
-    "comb.divu": _div, "comb.divs": _div, "comb.modu": _div, "comb.mods": _div,
-    # Pure wiring: a rename of bits, which synthesis charges nothing for.
-    "comb.extract": lambda w: ZERO, "comb.concat": lambda w: ZERO,
-    "comb.replicate": lambda w: ZERO,
+# The `comb` op each device operator kind prices. The device characterizes "an
+# integer add", not `addi` against `subi`, so several ops share a row; a cast is
+# WIRING and reaches no cell, which is why `comb.extract` and friends are in
+# `_FREE` rather than here.
+COMB_KIND = {
+    "comb.and": CombKind.AND, "comb.or": CombKind.OR, "comb.xor": CombKind.XOR,
+    "comb.mux": CombKind.SELECT,
+    "comb.add": CombKind.ADD, "comb.sub": CombKind.SUB,
+    "comb.icmp": CombKind.CMP,
+    "comb.shl": CombKind.SHL, "comb.shru": CombKind.SHR,
+    "comb.shrs": CombKind.SHR,
+    "comb.mul": CombKind.MUL,
+    "comb.divu": CombKind.DIV, "comb.divs": CombKind.DIV,
+    "comb.modu": CombKind.REM, "comb.mods": CombKind.REM,
 }
 
-# The device operator IPs, each the Xilinx Floating-Point core at the latency
-# `device.py` declares. `sym_name` is the STEM of the module name, so a
-# compare arrives with its predicate appended (`fcmp_l1_ogt`).
-IP_AREA = {
-    "fadd_l7": Area(247, 315, 2, 10),
-    "fsub_l7": Area(247, 315, 2, 10),
-    "fmul_l4": Area(115, 173, 2, 9),
-    "fdiv_l12": Area(766, 1381, 0, 111),
-    "fcmp_l1": Area(64, 12, 0, 7),
-    "dadd_l14": Area(710, 872, 3, 30),
-    "dsub_l14": Area(710, 872, 3, 30),
-    "dmul_l9": Area(205, 542, 7, 16),
-    "ddiv_l24": Area(3185, 6035, 0, 399),
-    "dcmp_l1": Area(118, 12, 0, 12),
-    "i2f_l3": Area(165, 228, 0, 11),
-    "f2i_l3": Area(183, 232, 0, 6),
-    "fcvt_l2": Area(50, 99, 0, 1),
-    # bf16 has no measured core; priced from its f32 sibling by width.
-    "bfadd_l4": Area(124, 158, 1, 5),
-    "bfsub_l4": Area(124, 158, 1, 5),
-    "bfmul_l2": Area(58, 87, 1, 5),
-    "bf2f_l2": Area(25, 50, 0, 1),
-}
-
-
-def mux_lut_per_bit(k: int) -> int:
-    """LUTs per bit of a `k`-source one-hot AND-OR select.
-
-    A LUT6 absorbs three (data, select) pairs and about 2.5 more per further
-    level, so this is LINEAR in k rather than logarithmic. Fits all ten
-    measured points (k = 2..40) exactly. `muxLevels(k) = ceil(log2 k)` prices
-    the DELAY of the same structure and says nothing about its area."""
-    assert k >= 1, "a select over nothing is not a value"
-    if k == 1:
-        return 0  # one source is a wire
-    return 1 if k <= 3 else 1 + math.ceil((k - 3) / 2.5)
-
-
-def mux_area(k: int, width: int) -> Area:
-    return Area(lut=mux_lut_per_bit(k) * width)
-
-
-#: Below this depth a chain stays in flip-flops; at or above it Vivado extracts
-#: an SRL, even though the emitter resets every stage. Measured exactly here.
-SRL_MIN_DEPTH = 4
-#: A one-bit chain is left in flip-flops whatever its depth. Measured at
-#: w = 1, 8 and 32, so the threshold itself is only bracketed.
-SRL_MIN_WIDTH = 8
-
-
-def chain_area(depth: int, width: int) -> Area:
-    """A `depth`-stage, `width`-bit value delay chain.
-
-    Deep chains are SRLs, so the cost is about `width` SRL sites plus `2*width`
-    flip-flops and barely moves with depth: at w=32 the measured flip-flop count
-    is 67 at depth 4 and 127 at depth 64, against the `depth*width` (128 and
-    2048) that `RegisterTerm` charges. This is the single largest disagreement
-    between the objective's area model and the part."""
-    assert depth >= 1 and width >= 1
-    if depth < SRL_MIN_DEPTH or width < SRL_MIN_WIDTH:
-        return Area(ff=depth * width)
-    # An SRL32E holds 32 stages, plus one LUT per bit of addressing and output
-    # multiplexing, and the head and tail stages stay in flip-flops.
-    return Area(lut=width, srl=width * math.ceil(depth / 32),
-                ff=2 * width + depth - 1)
-
-
-#: Fabric LUTs per bit of a memory that failed RAM inference. Every word needs a
-#: data multiplexer and a write decode, so it scales with the whole array.
-#: Measured 1.6x to 3.3x of `depth*width` over 64..512 deep and 8..32 wide.
-MULTIWRITE_LUT_PER_BIT = 2.0
-
-
-def memory_area(depth: int, width: int, writers: int,
-                independent: bool) -> tuple[Area, int]:
-    """Fabric cost of one array, and the bits that went to block RAM instead.
-
-    A single writer is the RAM template the synthesizer recognizes, so it costs
-    no fabric; extra READ ports only replicate the RAM. Two writers still infer
-    a TRUE dual port when each is described in its own always block, which is
-    what `independent` reports; sharing a block, or asking for a third port,
-    infers nothing and the array falls back to registers."""
-    assert depth >= 1 and width >= 1 and writers >= 0
-    bits = depth * width
-    if writers <= 1 or (independent and writers == 2):
-        return ZERO, bits
-    return Area(lut=round(MULTIWRITE_LUT_PER_BIT * bits), ff=bits), 0
+#: The storage the compiler itself names, and the one an array that failed RAM
+#: inference falls back to: every word gets a data multiplexer and a write
+#: decode, which is what a complete partition builds too.
+REGISTER_FILE = "register"
 
 
 # --- reading the emitted design ---------------------------------------------
@@ -345,8 +218,23 @@ def _onehot_muxes(defs: dict[str, _Op], ops: list[_Op]) -> dict[int, int]:
     return found
 
 
-def score(mlir: str) -> dict:
-    """Predicted area of the emitted design `mlir` (the `hw` dialect module)."""
+def _operator_costs(device) -> dict[str, tuple]:
+    """Each priced operator's declared cost and the operand width it is a
+    function of. The width is fixed by the IP's signature, which is why the
+    declaration is a constant, but it is still the parameter its kind carries."""
+    out = {}
+    for op in device.operators:
+        uses = device.operator_uses.get(op.func_name)
+        if uses:
+            widths = [a.primitive_width for a in op.parse_argument_annotations()]
+            out[op.func_name] = (uses, max(widths))
+    return out
+
+
+def score(mlir: str, device=builtin_device) -> dict:
+    """Predicted area of the emitted design `mlir` (the `hw` dialect module),
+    priced against `device`. Resource names are the device's own, so the totals
+    below hold whatever a part calls its primitives."""
     defs, ops = _parse(mlir)
     muxes = _onehot_muxes(defs, ops)
     consumed = set()
@@ -355,16 +243,23 @@ def score(mlir: str) -> dict:
             for v in op.operands:
                 consumed.add(id(defs[v]))  # the `and`s belong to the mux
 
-    # Registers are priced per CHAIN, not per stage: past depth 3 the chain is
-    # an SRL and the flip-flop count stops tracking depth.
+    price = device.price
+    ip_costs = _operator_costs(device)
+    register_file = device.storage[REGISTER_FILE].uses
+
+    # Registers are priced per CHAIN, not per stage: past the extraction cliff
+    # the chain is an SRL and the flip-flop count stops tracking depth.
     chains = _chains(defs, ops)
-    reg_area = ZERO
+    regs: Counter = Counter()
     chain_stages = 0
     deep_stages = 0
     for depth, width, run in chains:
-        reg_area += chain_area(depth, width)
+        spent = price(device.chain_uses, (depth, width))
+        regs.update(spent)
         chain_stages += depth
-        if depth >= SRL_MIN_DEPTH and width >= SRL_MIN_WIDTH:
+        # "Deep" is whatever the device charges SLICEM for: the extraction
+        # threshold is the part's, not this reader's.
+        if spent.get("slicem_lut"):
             deep_stages += depth
         for o in run:
             consumed.add(id(o))
@@ -376,12 +271,11 @@ def score(mlir: str) -> dict:
         if op.name == "seq.write":
             writers[op.operands[0]] = writers.get(op.operands[0], 0) + 1
 
-    total = reg_area
-    datapath = ZERO
-    ip = ZERO
-    mux_area_total = ZERO
-    mem_fabric = ZERO
-    regs = reg_area
+    total = Counter(regs)
+    datapath: Counter = Counter()
+    ip: Counter = Counter()
+    mux_total: Counter = Counter()
+    mem_fabric: Counter = Counter()
     n_mux = 0
     mux_sources = 0
     instances: dict[str, int] = {}
@@ -394,9 +288,9 @@ def score(mlir: str) -> dict:
             continue
         if id(op) in muxes:
             k = muxes[id(op)]
-            a = mux_area(k, op.width)
-            mux_area_total += a
-            total += a
+            a = price(device.mux_uses, (k, op.width))
+            mux_total.update(a)
+            total.update(a)
             n_mux += 1
             mux_sources += k
             continue
@@ -407,12 +301,18 @@ def score(mlir: str) -> dict:
             assert m, f"an instance names a module: {op.line}"
             mod = m.group(1)
             instances[mod] = instances.get(mod, 0) + 1
-            a = _ip_area(mod)
-            if a is None:
+            # The module name is an operator stem plus whatever else
+            # distinguishes the hardware (a compare's predicate).
+            cost = ip_costs.get(mod) or next(
+                (c for stem, c in ip_costs.items() if mod.startswith(stem + "_")),
+                None,
+            )
+            if cost is None:
                 unmodelled[mod] = unmodelled.get(mod, 0) + 1
                 continue
-            ip += a
-            total += a
+            a = price(cost[0], (cost[1],))
+            ip.update(a)
+            total.update(a)
             continue
         if op.name == "seq.hlmem":
             m = _HLMEM.search(op.line)
@@ -421,35 +321,46 @@ def score(mlir: str) -> dict:
                 depth = 1
                 for d in shape:
                     depth *= d
-                a, ram = memory_area(depth, int(m.group(2)),
-                                     writers.get(op.result, 0),
-                                     _INDEPENDENT in op.line)
-                mem_fabric += a
-                total += a
-                mem_bits += ram
-                regfile_arrays += ram == 0
+                width = int(m.group(2))
+                n = writers.get(op.result, 0)
+                # A single writer is the RAM template the synthesizer
+                # recognizes, so it costs no fabric; extra READ ports only
+                # replicate the RAM. Two writers still infer a TRUE dual port
+                # when each is described in its own always block; sharing a
+                # block, or asking for a third port, infers nothing and the
+                # array falls back to a register file.
+                assert depth >= 1 and width >= 1 and n >= 0
+                if n <= 1 or (n == 2 and _INDEPENDENT in op.line):
+                    mem_bits += depth * width
+                else:
+                    a = price(register_file, (depth, width))
+                    mem_fabric.update(a)
+                    total.update(a)
+                    regfile_arrays += 1
             continue
         if op.name in _FREE:
             continue
-        fn = COMB_AREA.get(op.name)
-        if fn is None:
+        kind = COMB_KIND.get(op.name)
+        if kind is None:
             unmodelled[op.name] = unmodelled.get(op.name, 0) + 1
             continue
-        a = fn(op.width)
-        datapath += a
-        total += a
+        a = price(device.comb_uses.get(kind.value, ()), (op.width,))
+        datapath.update(a)
+        total.update(a)
 
     return {
         # `lut` is every LUT site the design occupies, SRLs included, since an
-        # SRL is a LUT that happens to hold state.
-        "lut": total.lut + total.srl, "logic_only_lut": total.lut,
-        "srl": total.srl, "ff": total.ff, "dsp": total.dsp,
-        "carry8": total.carry8,
-        "ip_lut": ip.lut, "ip_ff": ip.ff, "ip_dsp": ip.dsp,
-        "mux_lut": mux_area_total.lut,
-        "logic_lut": datapath.lut, "logic_carry8": datapath.carry8,
-        "reg_ff": regs.ff, "reg_lut": regs.lut + regs.srl,
-        "mem_lut": mem_fabric.lut, "mem_ff": mem_fabric.ff,
+        # SRL is a LUT that happens to hold state. The device counts the two
+        # apart because only a SLICEM LUT can be one.
+        "lut": total["lut"] + total["slicem_lut"],
+        "logic_only_lut": total["lut"],
+        "srl": total["slicem_lut"], "ff": total["ff"], "dsp": total["dsp"],
+        "carry8": total["carry8"],
+        "ip_lut": ip["lut"], "ip_ff": ip["ff"], "ip_dsp": ip["dsp"],
+        "mux_lut": mux_total["lut"],
+        "logic_lut": datapath["lut"], "logic_carry8": datapath["carry8"],
+        "reg_ff": regs["ff"], "reg_lut": regs["lut"] + regs["slicem_lut"],
+        "mem_lut": mem_fabric["lut"], "mem_ff": mem_fabric["ff"],
         # Arrays that failed RAM inference and became a register file, which is
         # not the same as arrays with several writers: two independent ports
         # still infer a true dual port.
@@ -462,14 +373,3 @@ def score(mlir: str) -> dict:
         "mem_bits": mem_bits,
         "unmodelled": unmodelled,
     }
-
-
-def _ip_area(module: str):
-    """The measured area of extern `module`, whose name is an operator stem
-    plus whatever else distinguishes the hardware (a compare's predicate)."""
-    if module in IP_AREA:
-        return IP_AREA[module]
-    for stem, a in IP_AREA.items():
-        if module.startswith(stem + "_"):
-            return a
-    return None

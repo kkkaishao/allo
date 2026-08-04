@@ -8,6 +8,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from enum import Enum
+from functools import lru_cache
 
 from ...lang import f32, f64, bf16, i32, bool as _bool
 from ...lang.ip import ip, IP, OperatorType
@@ -94,38 +95,42 @@ def Table(points: dict[int, float]) -> Cost:
 #: of its kind)`` pairs, which is what ``#allo.res_use`` carries.
 Spend = tuple[tuple[str, tuple[Cost, ...]], ...]
 
-#: The context the `uses` attributes are parsed into, with the attributes
-#: themselves keyed by their text. One per process: an attribute is uniqued in
-#: the context that built it and has to outlive every evaluation of it.
-_COST_CONTEXT = None
-_COST_ATTRS: dict[str, object] = {}
+#: Every `uses` attribute built so far, keyed by the declaration it came from:
+#: pricing one design asks for the same handful of rows tens of thousands of
+#: times.
+_COST_ATTRS: dict[Spend, object] = {}
+
+
+@lru_cache(maxsize=None)
+def _cost_context():
+    """The context every ``uses`` attribute is parsed into. One per process: an
+    attribute is uniqued in the context that built it and has to outlive every
+    evaluation of it."""
+    from ..._mlir.ir import Context
+    from ..._mlir.dialects.allo import register_dialect
+
+    ctx = Context()
+    register_dialect(ctx)
+    return ctx
 
 
 def _res_use_text(spent: Spend, scope: str = "") -> str:
     """``spent`` as an ``#allo.res_use`` array literal. ``scope`` is the device
     symbol a reference from OUTSIDE the device's region has to reach through."""
-    return "[{}]".format(
-        ", ".join(
-            f"#allo.res_use<@{scope}{name}, "
-            f"[{', '.join(c._mlir() for c in factors)}]>"
-            for name, factors in spent
-        )
+    body = ", ".join(
+        f"#allo.res_use<@{scope}{name}, [{', '.join(c._mlir() for c in factors)}]>"
+        for name, factors in spent
     )
+    return f"[{body}]"
 
 
 def _res_use_attr(spent: Spend):
-    """The parsed attribute for ``spent``, built once per declaration: pricing
-    one design asks for the same handful of rows tens of thousands of times."""
-    global _COST_CONTEXT
+    """The parsed ``#allo.res_use`` array for ``spent``."""
     attr = _COST_ATTRS.get(spent)
     if attr is None:
-        from ..._mlir.ir import Attribute, Context
-        from ..._mlir.dialects.allo import register_dialect
+        from ..._mlir.ir import Attribute
 
-        if _COST_CONTEXT is None:
-            _COST_CONTEXT = Context()
-            register_dialect(_COST_CONTEXT)
-        with _COST_CONTEXT:
+        with _cost_context():
             attr = _COST_ATTRS[spent] = Attribute.parse(_res_use_text(spent))
     return attr
 
@@ -200,11 +205,15 @@ class CombKind(Enum):
     FLOAT_CAST = "fcast"
 
 
+# One attribute per kind of thing a part declares, so the count tracks the
+# vocabulary rather than any coupling between them.
+# pylint: disable=too-many-instance-attributes
 class Device:
     """A hardware platform: what it HAS (resources), what it can REALIZE
-    (storage structures, native operator kinds, operator IPs) and a default
-    synthesis frequency. Built fluently through ``add_resource`` /
-    ``add_storage`` / ``set_comb_delay`` / ``add_operator``."""
+    (storage structures, native operator kinds, operator IPs, multiplexers,
+    delay chains) and a default synthesis frequency. Built fluently through
+    ``add_resource`` / ``add_storage`` / ``set_comb_delay`` / ``add_operator``
+    and the ``set_*_uses`` declarations."""
 
     def __init__(self, name: str):
         self.name = name
@@ -386,9 +395,7 @@ class Device:
             )
         return self
 
-    def set_operator_uses(
-        self, operator: IP, uses: dict[Resource, Cost]
-    ) -> Device:
+    def set_operator_uses(self, operator: IP, uses: dict[Resource, Cost]) -> Device:
         """What one instance of an operator IP spends. Its parameter is the
         operand width, as a native operator kind's is, even though the IP's
         signature already fixes that width: the arity follows the realization's

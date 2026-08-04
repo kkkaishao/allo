@@ -91,8 +91,23 @@ IP_AREA = {
 #: because 2.5 pairs per level is a measurement and the ceiling it sits under is
 #: what makes the per-bit cost whole. One source is a wire and costs nothing.
 MUX_LUT_PER_BIT = {
-    1: 0, 2: 1, 4: 2, 6: 3, 9: 4, 11: 5, 14: 6, 16: 7, 19: 8,
-    21: 9, 24: 10, 26: 11, 29: 12, 31: 13, 34: 14, 36: 15, 39: 16,
+    1: 0,
+    2: 1,
+    4: 2,
+    6: 3,
+    9: 4,
+    11: 5,
+    14: 6,
+    16: 7,
+    19: 8,
+    21: 9,
+    24: 10,
+    26: 11,
+    29: 12,
+    31: 13,
+    34: 14,
+    36: 15,
+    39: 16,
 }
 
 #: Below this depth a delay chain stays in flip-flops; at or above it Vivado
@@ -227,7 +242,10 @@ def declare_xcu55c_area(device: "Device") -> None:
     # against 33,245 LUTs and 16,416 flip-flops.
     device.set_storage_uses(
         "register",
-        {lut: (Linear(MULTIWRITE_LUT_PER_BIT), Linear(1.0)), ff: (Linear(1.0), Linear(1.0))},
+        {
+            lut: (Linear(MULTIWRITE_LUT_PER_BIT), Linear(1.0)),
+            ff: (Linear(1.0), Linear(1.0)),
+        },
     )
     # The tiled rows: a structure holds so many bits however the array is cut.
     # Distributed RAM and shift registers live in SLICEM, block RAM and
