@@ -22,6 +22,7 @@
 #include "mlir/Support/LogicalResult.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/StringRef.h"
 
 #include <cstdint>
@@ -108,6 +109,8 @@ struct OperatorEntry {
   double inDelay = 0.0;  // ns
   double outDelay = 0.0;
   std::string symbol; // the injected `dcp.operator` sym_name (IP rows only).
+  ArrayAttr uses;     // what one instance spends, null where the device is
+                      // silent (see `OperatorLibrary::priceOf`).
 };
 
 /// What a lookup resolves for one operation. Two separate keys: the scheduling
@@ -121,6 +124,11 @@ struct OperatorChar {
   bool pipelined = true;
   double inDelay = 0.0;
   double outDelay = 0.0;
+  /// What ONE instance of the matched row costs in the device's currency
+  /// (`OperatorLibrary::priceOf`), at this operation's own width. Zero where
+  /// the device prices the row at nothing and where it prices it not at all,
+  /// which are the same thing to an objective.
+  int64_t price = 0;
   OperatorIdentity identity; // empty for an op no functional unit is built for
 };
 
@@ -161,7 +169,40 @@ public:
   /// `affine.apply` is priced the way it was scheduled.
   double combDelay(CombOpKindEnum kind) const;
 
+  //===--------------------------------------------------------------------===//
+  // Area, in the objective's currency.
+  //
+  // One unit of a resource costs `kPriceResolution` times the largest capacity
+  // the device declares, over its own: a resource the part has less of costs
+  // more, which is the only ranking a scheduler can have between a LUT and a
+  // DSP slice. The scale itself is arbitrary and cancels, since every term of
+  // the objective is in it; what it buys is resolution, the most plentiful
+  // resource pricing at `kPriceResolution` and everything else rounding
+  // against that.
+  //
+  // A capacity is a price input and NOT a budget: regions are solved
+  // independently, so no single solve can see a whole-device total (see
+  // `dcp.resource`).
+  //===--------------------------------------------------------------------===//
+
+  /// What `k` sources of `width` bits cost to select between, which is what
+  /// sharing one functional unit puts in front of each of its operand ports.
+  int64_t muxPrice(int64_t sources, int64_t width) const;
+
+  /// What carrying a `width`-bit value across `depth` cycles costs. Zero at
+  /// depth 0, which is a wire and not a chain.
+  int64_t chainPrice(int64_t depth, int64_t width) const;
+
+  /// What ONE cycle of an activation pulse chain costs: one more stage of a
+  /// one-bit chain, which is a flip-flop wherever the device says so without
+  /// this layer having to know the symbol it says it under.
+  int64_t pulsePrice() const;
+
 private:
+  /// What \p uses spends at \p params, every resource at its price. Null
+  /// \p uses is free, which is what a device saying nothing about a row means.
+  int64_t priceOf(ArrayAttr uses, ArrayRef<int64_t> params) const;
+
   /// The device's combinational row for \p kind, null when it declares none.
   /// Last wins, like `matchEntry`.
   const OperatorEntry *combEntry(OpKind kind) const;
@@ -170,7 +211,14 @@ private:
   std::vector<OperatorEntry> entries;         // abstract rows
   OperatorEntry defaultEntry;
   MemoryLibrary memory;
+  llvm::StringMap<int64_t> resourcePrices; // one `dcp.resource`, priced
+  ArrayAttr muxUses;                       // `dcp.mux`, over (k, width)
+  ArrayAttr chainUses;                     // `dcp.chain`, over (depth, width)
 };
+
+/// What the most plentiful resource on a device prices at, and so how much
+/// resolution every other price keeps. See the area block above.
+inline constexpr int64_t kPriceResolution = 8;
 
 /// Log, for one solved region, every operator type covering more than one
 /// operator identity. Measurement only: nothing consumes the log.
@@ -276,9 +324,12 @@ LogicalResult populateOperatorTypes(ArrayRef<Operation *> ops,
 ///     (circular-arc colouring). Acyclic windows form an interval graph, where
 ///     the count is exactly the chromatic number, so any occupancy is fine.
 ///
-/// The cost is `latency * width` flip-flops, in the unit the objective's
-/// register tie-break counts. It under-estimates a real IP, so the objective
-/// cannot over-value a fold.
+/// What `n` instances cost is what the DEVICE charges for `n` of them, in the
+/// currency the rest of the objective is in: `n` copies of the measured core,
+/// plus the multiplexer that many puts in front of every operand port. An
+/// UPPER bound on the multiplexer, since two operations sharing a driver need
+/// no select between them and the emitter builds one only where the drivers
+/// differ.
 template <class ProblemT, class WalkFn>
 LogicalResult populateOperatorAllocationImpl(ProblemT &problem, WalkFn walkFn,
                                              const OperatorLibrary &lib) {
@@ -292,7 +343,9 @@ LogicalResult populateOperatorAllocationImpl(ProblemT &problem, WalkFn walkFn,
     struct OperatorClass {
       llvm::SmallVector<Operation *> ops;
       unsigned occupancy = 1;
-      unsigned cost = 0;
+      int64_t unitPrice = 0;
+      int64_t ports = 0;    // operand ports one instance multiplexes
+      int64_t portWidth = 0; // bits each of them carries
     };
     std::map<std::string, OperatorClass> byIdentity;
     walkFn([&](Operation *op) {
@@ -307,16 +360,31 @@ LogicalResult populateOperatorAllocationImpl(ProblemT &problem, WalkFn walkFn,
       OperatorClass &cls = byIdentity[c.identity.key()];
       cls.ops.push_back(op);
       cls.occupancy = occ;
-      cls.cost = c.latency * c.identity.resultType.getIntOrFloatBitWidth();
+      cls.unitPrice = c.price;
+      cls.ports = op->getNumOperands();
+      cls.portWidth = 0;
+      for (Type t : op->getOperandTypes())
+        if (t.isIntOrFloat())
+          cls.portWidth =
+              std::max<int64_t>(cls.portWidth, t.getIntOrFloatBitWidth());
     });
 
     for (auto &[key, cls] : byIdentity) {
       if (cls.ops.size() < 2)
         continue;
+      auto ceiling = static_cast<unsigned>(cls.ops.size());
+      llvm::SmallVector<int64_t> price(ceiling + 1, 0);
+      for (unsigned n = 1; n <= ceiling; ++n) {
+        // Round-robin, the rule `assignUnits` hands the operations out by:
+        // `ceiling % n` instances host one more than the rest.
+        unsigned busy = ceiling % n, share = ceiling / n;
+        price[n] = n * cls.unitPrice +
+                   cls.ports * (busy * lib.muxPrice(share + 1, cls.portWidth) +
+                                (n - busy) * lib.muxPrice(share, cls.portWidth));
+      }
       Problem::ResourceType rsrc = problem.getOrInsertResourceType(key);
       problem.setAllocatable(
-          rsrc, typename ProblemT::AllocatableUnit{
-                    static_cast<unsigned>(cls.ops.size()), cls.cost});
+          rsrc, typename ProblemT::AllocatableUnit{ceiling, std::move(price)});
       for (Operation *op : cls.ops) {
         llvm::SmallVector<Problem::ResourceType> units;
         if (auto linked = problem.getLinkedResourceTypes(op))

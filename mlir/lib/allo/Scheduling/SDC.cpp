@@ -520,7 +520,7 @@ scheduleCyclic(LoopLikeOpInterface body, DependenceAnalysis &deps,
   SmallVector<RegisterTerm> regs = registerTerms(problem, bodyBlock);
   // The trip is withheld where iterations do not overlap: `ii` is the body
   // depth there, so depth, not drain, is what the trip multiplies.
-  SpanObjective span{outputs, regs, pipelined ? trip : std::nullopt};
+  SpanObjective span{outputs, regs, pipelined ? trip : std::nullopt, &lib};
   Stopwatch solveStart = now();
   if (failed(solveSchedulingProblem(problem, anchor, cycleTime, minII, opts,
                                     span)))
@@ -617,7 +617,8 @@ static LogicalResult scheduleWhile(scf::WhileOp w, DependenceAnalysis &deps,
   // time.
   if (failed(
           solveSchedulingProblem(problem, anchor, cycleTime, minII, opts,
-                                 SpanObjective{outputs, regs, std::nullopt})))
+                                 SpanObjective{outputs, regs, std::nullopt,
+                                               &lib})))
     return failure();
   std::optional<unsigned> ii = problem.getInitiationInterval();
   recordSolve(model, problem, "while", ii, solveStart);
@@ -656,7 +657,8 @@ static LogicalResult scheduleAcyclic(ArrayRef<Operation *> ops,
   SmallVector<RegisterTerm> regs = registerTerms(problem, /*carried=*/nullptr);
   Stopwatch solveStart = now();
   if (failed(solveSchedulingProblem(problem, ops.back(), cycleTime, opts,
-                                    SpanObjective{outputs, regs, /*trip=*/1})))
+                                    SpanObjective{outputs, regs, /*trip=*/1,
+                                                  &lib})))
     return failure();
   recordSolve(model, problem, "acyclic", /*ii=*/std::nullopt, solveStart);
   info(Stage::Sched, ops.front())

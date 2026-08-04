@@ -351,9 +351,24 @@ OperatorLibrary OperatorLibrary::fromModule(ModuleOp module) {
       e.comb = true;
       e.latency = 0;
       e.inDelay = e.outDelay = comb.getDelay().convertToDouble();
+      e.uses = comb.getUsesAttr();
       lib.entries.push_back(std::move(e));
     }
     lib.memory = memoryFromDevice(device);
+
+    // The currency: the most plentiful resource sets the scale, so a price is
+    // how scarce a resource is relative to the one the part has most of.
+    int64_t widest = 1;
+    for (auto r : device.getBody().getOps<dcp::DCPathResourceOp>())
+      widest = std::max<int64_t>(widest, r.getCapacity());
+    for (auto r : device.getBody().getOps<dcp::DCPathResourceOp>())
+      lib.resourcePrices[r.getSymName()] = std::max<int64_t>(
+          1, llvm::divideNearest<int64_t>(kPriceResolution * widest,
+                                          r.getCapacity()));
+    for (auto m : device.getBody().getOps<dcp::DCPathMuxOp>())
+      lib.muxUses = m.getUsesAttr();
+    for (auto c : device.getBody().getOps<dcp::DCPathChainOp>())
+      lib.chainUses = c.getUsesAttr();
   }
 
   // IP rows in injection order (built-in, then user), matched last-wins: a user
@@ -365,6 +380,7 @@ OperatorLibrary OperatorLibrary::fromModule(ModuleOp module) {
     e.inDelay = op.getInDelay().convertToDouble();
     e.outDelay = op.getOutDelay().convertToDouble();
     e.symbol = op.getSymName().str();
+    e.uses = op.getUsesAttr();
     auto sig = op.getSignature();
     e.argTypes = elementTypes(sig.getInputs());
     e.resTypes = elementTypes(sig.getResults());
@@ -452,6 +468,36 @@ double OperatorLibrary::combDelay(OpKind kind) const {
   return e ? e->outDelay : 0.0;
 }
 
+int64_t OperatorLibrary::priceOf(ArrayAttr uses,
+                                 ArrayRef<int64_t> params) const {
+  int64_t total = 0;
+  for (auto [resource, count] : evaluateResourceUse(uses, params)) {
+    auto it = resourcePrices.find(resource.getLeafReference().getValue());
+    assert(it != resourcePrices.end() &&
+           "a realization spends a resource the device does not declare, which "
+           "the dialect verifier resolves before this point");
+    assert(count >= 0 && "a realization spends a negative resource count");
+    total += it->second * count;
+  }
+  return total;
+}
+
+int64_t OperatorLibrary::muxPrice(int64_t sources, int64_t width) const {
+  return priceOf(muxUses, {sources, width});
+}
+
+int64_t OperatorLibrary::chainPrice(int64_t depth, int64_t width) const {
+  // A chain of no stages is a wire. The device row characterizes a structure
+  // that exists, so its head and tail terms are not zero at depth zero.
+  if (depth <= 0)
+    return 0;
+  return priceOf(chainUses, {depth, width});
+}
+
+int64_t OperatorLibrary::pulsePrice() const {
+  return chainPrice(2, 1) - chainPrice(1, 1);
+}
+
 OperatorChar OperatorLibrary::lookup(Operation *op) const {
   auto kind = classify(op);
 
@@ -518,6 +564,12 @@ OperatorChar OperatorLibrary::lookup(Operation *op) const {
   c.pipelined = e->pipelined;
   c.inDelay = e->inDelay;
   c.outDelay = e->outDelay;
+  // Every row is characterized over one parameter, an operand width; an IP's
+  // signature pins it, so there the factors are constants and this is the
+  // measured core.
+  if (op->getNumResults() == 1)
+    if (Type t = elementTypes(op->getResultTypes()).front(); t.isIntOrFloat())
+      c.price = priceOf(e->uses, {(int64_t)t.getIntOrFloatBitWidth()});
   // The realization is the row's own symbol when it is an IP, else the native
   // lowering the reifier picks; the default row reaches the comb arm too.
   if (!e->symbol.empty())

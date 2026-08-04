@@ -19,6 +19,10 @@
 
 namespace mlir::allo {
 
+/// The device view. Declared rather than included: `OperatorLibrary` is built
+/// on the problems below, so the dependence only runs one way.
+class OperatorLibrary;
+
 /// A resource-constrained problem whose shared instances need not be fully
 /// pipelined: it carries a per-operation occupancy window, so a synchronous
 /// call that holds its callee's instance until the callee is done can be
@@ -78,9 +82,13 @@ public:
     /// The trivial allocation: one unit per operation linked to the resource,
     /// so declaring a resource never makes a problem infeasible.
     unsigned ceiling = 0;
-    /// What one instance costs, in flip-flops, the unit the objective's
-    /// register tie-break counts in.
-    unsigned cost = 0;
+    /// What building `n` instances costs, indexed by `n` over `[0, ceiling]`:
+    /// the instances themselves plus the multiplexers that many of them puts
+    /// in front of the operations sharing each one. A TABLE and not a
+    /// coefficient because a multiplexer's cost per bit rises in plateaus (a
+    /// LUT6 absorbs three source/select pairs), so the total is not monotone
+    /// in the count and no linear term can stand for it.
+    llvm::SmallVector<int64_t> price;
   };
 
   void setAllocatable(ResourceType rsrc, AllocatableUnit unit) {
@@ -119,6 +127,13 @@ public:
 
   /// Whether \p op contends for a resource whose count is being decided.
   bool holdsAllocatableUnit(Operation *op);
+
+  /// The fewest units of \p rsrc the CURRENT schedule needs: the busiest cycle
+  /// of its occupancy windows, or busiest congruence class at a non-zero \p ii.
+  /// Every operation must be scheduled. This is the count `assignUnits` can
+  /// still place, since windows on a line form an interval graph and first fit
+  /// in start order colours one exactly.
+  unsigned demandFor(ResourceType rsrc, unsigned ii);
 
   /// Whether \p op contends for anything at all: a capped unit, an allocated
   /// one, or both. This is what needs a congruence class in a modulo model.
@@ -328,6 +343,11 @@ struct SpanObjective {
   /// wherever iterations do not overlap and the trip multiplies the schedule
   /// DEPTH rather than the drain (`s.pipeline(ii=-1)`).
   std::optional<int64_t> trip;
+  /// The device the area terms are priced against. Every one of them costs
+  /// what the part spends on it, so a register, a multiplexer and an operator
+  /// are comparable; without it the objective would be ranking flip-flops
+  /// against DSP slices in a unit neither is measured in.
+  const OperatorLibrary *device = nullptr;
 };
 
 //===----------------------------------------------------------------------===//

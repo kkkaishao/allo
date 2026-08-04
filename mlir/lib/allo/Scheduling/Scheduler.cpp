@@ -1895,6 +1895,19 @@ SmallVector<Operation *> OccupancyProblem::usersOf(ResourceType rsrc) {
   return users;
 }
 
+unsigned OccupancyProblem::demandFor(ResourceType rsrc, unsigned ii) {
+  SmallDenseMap<unsigned, unsigned> used;
+  unsigned peak = 0;
+  for (Operation *op : getOperations()) {
+    if (!usesResource(op, rsrc))
+      continue;
+    unsigned start = *getStartTime(op);
+    for (unsigned k = 0, occ = getResourceCycles(op); k < occ; ++k)
+      peak = std::max(peak, ++used[ii ? (start + k) % ii : start + k]);
+  }
+  return peak;
+}
+
 void OccupancyProblem::assignUnits(unsigned ii) {
   for (ResourceType rsrc : getResourceTypes()) {
     std::optional<unsigned> units = getAllocation(rsrc);

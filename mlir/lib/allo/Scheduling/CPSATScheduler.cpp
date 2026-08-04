@@ -3,6 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+#include "allo/Scheduling/OperatorLibrary.h" // the device the area is priced at
 #include "allo/Scheduling/Scheduler.h"
 #include "allo/Support/Logging.h"
 
@@ -204,19 +205,29 @@ IntVar drainVariable(CpModelBuilder &model,
 }
 
 /// One allocatable resource in the model: the unit count to decide, and what
-/// one instance costs in the objective.
+/// building that many of it costs.
 struct AllocationVar {
   Problem::ResourceType rsrc;
   IntVar units;
-  int64_t cost = 0;
+  /// Priced off `units` through the resource's own table, so the plateaus in
+  /// what a fold saves and what it grows are in the model exactly.
+  IntVar price;
+  int64_t maxPrice = 0;
 };
 
 /// Declare `N_r` for every allocatable resource: how many copies of one
-/// operator this region builds, in `[1, ceiling]` and hinted at the ceiling so
-/// the heuristic's schedule stays a consistent hint. The caller states the
+/// operator this region builds, in `[1, ceiling]`. The caller states the
 /// capacity constraint against it.
+///
+/// \p hint says the heuristic's start times are being hinted too, and then the
+/// count hinted is the TIGHTEST one those start times admit rather than the
+/// trivial one. Both are consistent with the hinted schedule and the tight one
+/// is what the greedy binder would have built from it, so the solver starts
+/// where the area-agnostic policy ends instead of having to search its way
+/// there; on a region whose budget runs out, the hint is what ships.
 SmallVector<AllocationVar> allocationVars(CpModelBuilder &model,
-                                          OccupancyProblem &prob) {
+                                          OccupancyProblem &prob, unsigned ii,
+                                          bool hint) {
   SmallVector<AllocationVar> allocs;
   for (Problem::ResourceType rsrc : prob.getResourceTypes()) {
     auto unit = prob.getAllocatable(rsrc);
@@ -224,48 +235,101 @@ SmallVector<AllocationVar> allocationVars(CpModelBuilder &model,
       continue;
     assert(unit->ceiling > 0 && "an allocatable resource with no operation");
     IntVar n = model.NewIntVar(operations_research::Domain(1, unit->ceiling));
-    model.AddHint(n, unit->ceiling);
-    allocs.push_back({rsrc, n, unit->cost});
+    if (hint)
+      model.AddHint(n, prob.demandFor(rsrc, ii));
+    std::vector<int64_t> table(unit->price.begin(), unit->price.end());
+    int64_t hi = *llvm::max_element(unit->price);
+    IntVar price = model.NewIntVar(
+        operations_research::Domain(*llvm::min_element(table), hi));
+    model.AddElement(n, table, price);
+    allocs.push_back({rsrc, n, price, hi});
   }
   return allocs;
+}
+
+/// Add \p price at \p size to a weighted sum, for a price tabulated at every
+/// value the size can take. A piecewise-linear price is its FIRST slope on the
+/// size, plus at every change of slope that change charged on how far the size
+/// runs past the point it changes at: `max(size - b, 0)`. Every variable this
+/// adds is determined by the size through a propagator, where selecting one of
+/// the segments instead would be a disjunction per structure for the search to
+/// branch on, and a device has a change of slope per shift register.
+///
+/// The sum is an identity, so what it contributes is bounded by the price's own
+/// maximum however the slopes cancel.
+void addPiecewiseCost(CpModelBuilder &model, IntVar size,
+                      ArrayRef<int64_t> price, SmallVectorImpl<IntVar> &vars,
+                      SmallVectorImpl<int64_t> &weights) {
+  auto hi = static_cast<int64_t>(price.size()) - 1;
+  if (hi < 1)
+    return;
+  int64_t slope = price[1] - price[0];
+  vars.push_back(size);
+  weights.push_back(slope);
+  for (int64_t d = 2; d <= hi; ++d) {
+    int64_t next = price[d] - price[d - 1];
+    if (next == slope)
+      continue;
+    IntVar over = model.NewIntVar(operations_research::Domain(0, hi - d + 1));
+    model.AddMaxEquality(over, {LinearExpr(size) - (d - 1), LinearExpr(0)});
+    vars.push_back(over);
+    weights.push_back(next - slope);
+    slope = next;
+  }
 }
 
 /// Minimize \p primary, with the region's area as the tie-break below it,
 /// weighted so the two never interact: `primary` is settled first, and the
 /// tie-break decides only among schedules that reach it.
 ///
-/// The tie-break counts flip-flops: `width(v) * depth(v)` per value in a delay
-/// chain (`RegisterTerm`), every start time at weight one (a 1-bit activation
-/// pulse chain per cycle of start offset), and `cost(r) * N_r` per allocatable
-/// operator, priced at the flip-flops one instance holds in its own pipeline.
+/// The tie-break is the region's AREA, every term of it in what the device
+/// spends: the delay chain each value carried across slack costs
+/// (`RegisterTerm`), one stage of a one-bit activation pulse chain per cycle of
+/// every start offset, and the table above per allocatable operator. A chain is
+/// NOT `width * depth` flip-flops: past a measured depth the synthesizer stops
+/// building them and extracts a shift register instead, so the cost stops
+/// rising with the width and the term keeps only the gradient the part keeps.
 void minimizeCost(CpModelBuilder &model, IntVar primary,
                   ArrayRef<IntVar> starts, const SpanObjective &span,
                   DenseMap<Operation *, IntVar> &startVars,
                   ArrayRef<AllocationVar> allocs, int64_t ii, int64_t horizon) {
+  assert(span.device && "the objective's area terms need a device to price");
+  int64_t pulse = span.device->pulsePrice();
   SmallVector<IntVar> vars(starts.begin(), starts.end());
-  SmallVector<int64_t> weights(starts.size(), 1);
+  SmallVector<int64_t> weights(starts.size(), pulse);
   // Bounds how far the tie-break can reach, so `primary`'s weight below
-  // strictly dominates it.
-  int64_t bits = starts.size();
+  // strictly dominates it. Loose on purpose: a price is already an area and
+  // needs no horizon factor, but taking it out makes the tie-break a
+  // comparable share of the objective and costs four times the search for a
+  // third of a percent of area.
+  int64_t area = static_cast<int64_t>(starts.size()) * pulse;
+  // One chain price table per width: a region carries many values of the same
+  // type, and tabulating the device's cost is the expensive half.
+  DenseMap<int64_t, SmallVector<int64_t>> chainPrices;
   for (const RegisterTerm &term : span.regs) {
+    auto [entry, isNew] = chainPrices.try_emplace(term.width);
+    if (isNew)
+      for (int64_t d = 0; d <= horizon; ++d)
+        entry->second.push_back(span.device->chainPrice(d, term.width));
+    ArrayRef<int64_t> table = entry->second;
     IntVar depth = model.NewIntVar(operations_research::Domain(0, horizon));
     IntVar def = startVars.at(term.def);
     for (auto [reader, distance] : term.reads)
       model.AddLessOrEqual(startVars.at(reader) + distance * ii - term.latency,
                            def + depth);
-    vars.push_back(depth);
-    weights.push_back(term.width);
-    bits += term.width;
+    addPiecewiseCost(model, depth, table, vars, weights);
+    area += *llvm::max_element(table);
   }
   for (const AllocationVar &alloc : allocs) {
-    vars.push_back(alloc.units);
-    weights.push_back(alloc.cost);
-    // `units` never exceeds the operation count, hence never the horizon, so
-    // one `cost` bounds this term as one `width` bounds a register chain's.
-    bits += alloc.cost;
+    vars.push_back(alloc.price);
+    weights.push_back(1);
+    area += alloc.maxPrice;
   }
   vars.push_back(primary);
-  weights.push_back(bits * (horizon + 1));
+  // A device that declares no area model prices every term at nothing, which
+  // is the honest reading of saying nothing; the floor keeps `primary` from
+  // being weighted at nothing along with it.
+  weights.push_back(std::max<int64_t>(area, 1) * (horizon + 1));
   model.Minimize(LinearExpr::WeightedSum(vars, weights));
 }
 
@@ -282,11 +346,12 @@ Allocated readAllocation(const CpSolverResponse &response,
   return decided;
 }
 
-/// What \p decided costs in flip-flops: every instance built, at its own cost.
+/// What \p decided costs the device: every resource, at the price of the count
+/// it settled on.
 int64_t areaOf(OccupancyProblem &prob, const Allocated &decided) {
   int64_t area = 0;
   for (auto [rsrc, units] : decided)
-    area += static_cast<int64_t>(prob.getAllocatable(rsrc)->cost) * units;
+    area += prob.getAllocatable(rsrc)->price[units];
   return area;
 }
 
@@ -307,6 +372,19 @@ void applyAllocation(OccupancyProblem &prob, const Allocated &decided,
   info(Stage::Sched, prob.getContainingOp())
       << "Allocated: " << ops << " operations onto " << built
       << " instances of " << decided.size() << " shared operator types";
+}
+
+/// Fall back to the tightest allocation the schedule already on the problem
+/// admits, for a solve that decided none. Without it a region whose budget ran
+/// out keeps the TRIVIAL allocation and the emitter builds one instance per
+/// operation, which is strictly worse than what the same schedule supports and
+/// worse than what an area-agnostic greedy binder would fold it to.
+void applyDemandAllocation(OccupancyProblem &prob, unsigned ii) {
+  Allocated decided;
+  for (Problem::ResourceType rsrc : prob.getResourceTypes())
+    if (prob.getAllocatable(rsrc))
+      decided.push_back({rsrc, prob.demandFor(rsrc, ii)});
+  applyAllocation(prob, decided, ii);
 }
 
 /// Report a solve that produced nothing usable and leave the heuristic's
@@ -404,7 +482,8 @@ LogicalResult mlir::allo::scheduleCPSAT(ChainingSharedOperatorsProblem &prob,
   // An allocatable operator takes the same shape, with the count being decided
   // as the capacity. Occupancy windows on a line form an interval graph, so a
   // capacity is an assignment: `N` units suffice when no cycle needs more.
-  SmallVector<AllocationVar> allocs = allocationVars(model, prob);
+  SmallVector<AllocationVar> allocs =
+      allocationVars(model, prob, /*ii=*/0, /*hint=*/true);
   for (const AllocationVar &alloc : allocs)
     cumulativeOn(alloc.rsrc, alloc.units);
 
@@ -420,6 +499,7 @@ LogicalResult mlir::allo::scheduleCPSAT(ChainingSharedOperatorsProblem &prob,
   if (response.status() != CpSolverStatus::OPTIMAL &&
       response.status() != CpSolverStatus::FEASIBLE) {
     reportUnsolved(prob, response, opts.budget);
+    applyDemandAllocation(prob, /*ii=*/0);
     return success();
   }
 
@@ -605,7 +685,7 @@ ModuloOutcome solveAtII(ChainingModuloProblem &prob, Operation *lastOp,
   // The same sum against the count being decided. Allocatable operators occupy
   // one cycle here, so an op sits in one class and a per-class count is
   // realizable as an assignment. `N_r >= ceil(total/ii)` is implied, cut here.
-  SmallVector<AllocationVar> allocs = allocationVars(model, prob);
+  SmallVector<AllocationVar> allocs = allocationVars(model, prob, ii, hint);
   for (const AllocationVar &alloc : allocs) {
     int64_t total = 0;
     for (Operation *op : ops)
@@ -803,6 +883,7 @@ LogicalResult mlir::allo::scheduleCPSAT(ChainingModuloProblem &prob,
           << "Exact scheduling found nothing shorter than the heuristic's "
              "schedule at II="
           << greedyII << "; keeping it";
+    applyDemandAllocation(prob, greedyII);
     return success();
   }
 
