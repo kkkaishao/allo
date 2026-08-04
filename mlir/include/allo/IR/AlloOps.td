@@ -492,25 +492,71 @@ def DCPathOperatorOp : DCPath_Op<"dcp.operator", [Symbol]> {
   let hasCustomAssemblyFormat = 1;
 }
 
-def DCPathDeviceOp : DCPath_Op<"dcp.device"> {
-  let summary = "The device technology tables (combinational + storage timing)";
+def DCPathResourceOp : DCPath_Op<"dcp.resource", [Symbol]> {
+  let summary = "A device resource: a counter with a capacity";
   let description = [{
-    The device model injected from Python before scheduling: the native
-    (combinational) operator chaining delays and the storage timing. The
-    scheduler and reifier read it directly.
+    One physical resource the device has a bounded number of (LUTs, flip-flops,
+    DSP slices, block-RAM tiles). A pure COUNTER: no timing, no ports, no
+    semantics the compiler switches on, which is why the vocabulary is the
+    device's and stays open. What SPENDS a resource is a realization
+    (`dcp.comb`, `dcp.operator`, a multiplexer), through its `uses`.
 
-    `comb` maps an abstract operator kind (`add`/`sub`/`cmp`/...) to its
-    combinational chaining delay (ns). `memory` maps a storage implementation
-    (`register`/`lutram`/`bram`/`uram`) to its `{read_latency, write_latency,
-    read_delay_ns, write_delay_ns}`; `fifo` is the stream get/put timing;
-    `default_memory` is the implementation unbound on-chip arrays use.
+    `capacity` is a PRICE INPUT, not a constraint. Regions are scheduled
+    independently, so a whole-device budget is not a quantity any one solve can
+    enforce; what capacity is for is deriving a price (a resource the device has
+    less of costs more) and reporting utilization.
+  }];
+  let arguments = (ins SymbolNameAttr:$sym_name, I64Attr:$capacity);
+  let assemblyFormat = "$sym_name `capacity` `=` $capacity attr-dict";
+}
+
+def DCPathCombOp : DCPath_Op<"dcp.comb",
+    [DeclareOpInterfaceMethods<SymbolUserOpInterface>]> {
+  let summary = "The device's characterization of one native operator kind";
+  let description = [{
+    A combinational operator the device realizes natively rather than through an
+    IP: its chaining delay, and what it spends. `kind` is the ABSTRACT operator
+    kind (`add`/`sub`/`cmp`/...), coarser than a `dcp.compute`'s `comb_kind`
+    because a device characterizes "an integer add", not `addi` against `subi`.
+
+    `uses` holds one `#allo.res_use` per resource, each a cost over ONE
+    parameter: an operand width.
+  }];
+  let arguments = (ins StrAttr:$kind, F32Attr:$delay, OptionalAttr<ArrayAttr>:$uses);
+  let assemblyFormat = "$kind `delay` `=` $delay (`uses` $uses^)? attr-dict";
+  let hasVerifier = 1;
+}
+
+def DCPathDeviceOp : DCPath_Op<"dcp.device",
+    [Symbol, SymbolTable, SingleBlock, NoTerminator]> {
+  let summary = "The device technology tables (resources, combinational + storage timing)";
+  let description = [{
+    The device model injected from Python before scheduling. The scheduler and
+    reifier read it directly.
+
+    The body declares what the device HAS (`dcp.resource`) and what it realizes
+    natively (`dcp.comb`), each referring to the others by symbol so a
+    misspelled resource is a verifier error rather than an absent row. It is one
+    op to inject and one to erase, and its symbols are scoped to it.
+
+    `dcp.operator` stays at MODULE scope rather than moving in here: its symbol
+    is referenced by program code (a `dcp.compute` names its IP) and reaches the
+    emitted RTL through `operatorModuleName`, so it belongs to the program's
+    symbol table. What lives here is the vocabulary only the device's own
+    declarations use.
+
+    `memory` maps a storage implementation (`register`/`lutram`/`bram`/`uram`)
+    to its `{read_latency, write_latency, read_delay_ns, write_delay_ns}`;
+    `fifo` is the stream get/put timing; `default_memory` is the implementation
+    unbound on-chip arrays use.
   }];
   let arguments = (ins
-    DictionaryAttr:$comb,
+    SymbolNameAttr:$sym_name,
     DictionaryAttr:$memory,
     OptionalAttr<DictionaryAttr>:$fifo,
     OptionalAttr<StrAttr>:$default_memory);
-  let hasCustomAssemblyFormat = 1;
+  let regions = (region SizedRegion<1>:$body);
+  let assemblyFormat = "$sym_name attr-dict-with-keyword $body";
   let hasVerifier = 1;
 }
 

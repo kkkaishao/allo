@@ -34,6 +34,71 @@ class MemoryTiming:
     write_delay_ns: float
 
 
+@dataclass(frozen=True)
+class Resource:
+    """A device resource: a counter with a capacity, and nothing else.
+
+    The vocabulary is the DEVICE's, so a part with different primitives declares
+    different names and the compiler, which only adds and multiplies these, does
+    not care. ``capacity`` is a price input rather than a constraint: regions are
+    scheduled independently, so a whole-device budget is not a quantity any one
+    solve can enforce.
+    """
+
+    name: str
+    capacity: int
+
+
+@dataclass(frozen=True)
+class Cost:
+    """What one realization spends of one resource, as a function of ONE of that
+    realization's parameters (an operand width, a multiplexer's fan-in).
+
+    Build these through :func:`Const` and friends rather than directly. The
+    SHAPE comes from hardware structure and only the coefficients are measured;
+    a shape that is not structural belongs in a :func:`Table`.
+    """
+
+    form: str
+    coeffs: tuple[float, ...]
+
+    def _mlir(self) -> str:
+        body = ", ".join(repr(float(c)) for c in self.coeffs)
+        return f"#allo.cost<{self.form}, [{body}]>"
+
+
+def Const(value: float) -> Cost:
+    """A fixed amount, whatever the parameter."""
+    return Cost("const", (float(value),))
+
+
+def Linear(coeff: float, base: float = 0.0) -> Cost:
+    """``base + coeff * p``."""
+    return Cost("linear", (float(base), float(coeff)))
+
+
+def Quadratic(coeff: float) -> Cost:
+    """``coeff * p * p``, the shape of a divider."""
+    return Cost("quadratic", (float(coeff),))
+
+
+def Step(threshold: float, below_coeff: float, above: float) -> Cost:
+    """``p < threshold ? below_coeff * p : above``: a shift-register cliff, where
+    a chain past the threshold stops being flip-flops and stops growing."""
+    return Cost("step", (float(threshold), float(below_coeff), float(above)))
+
+
+def Table(points: dict[int, float]) -> Cost:
+    """Measured point by point. A parameter between two points takes the lower
+    one's value, and one below the first takes the first's."""
+    if not points:
+        raise ValueError("a cost table needs at least one point")
+    flat: list[float] = []
+    for p in sorted(points):
+        flat += [float(p), float(points[p])]
+    return Cost("table", tuple(flat))
+
+
 class CombKind(Enum):
     """A combinational operator kind whose chaining delay a device may characterize."""
 
@@ -65,8 +130,25 @@ class Device:
         self.memory: dict[MemoryKind, MemoryTiming] = {}
         self.default_memory: MemoryTiming | None = None
         self.comb: dict[str, float] = {}  # native chaining delays: kind -> ns
+        # What the device HAS, and what each native operator SPENDS of it.
+        # Separate from `comb` because a delay is a timing fact and an area is
+        # a resource fact; they are declared together and read by different
+        # consumers.
+        self.resources: dict[str, Resource] = {}
+        self.comb_uses: dict[str, dict[str, Cost]] = {}  # kind -> resource -> cost
         self.operators: list[IP] = []  # built-in and user `@ip` operators
         self.default_freq_mhz: float = 100.0
+
+    def add_resource(self, name: str, capacity: int) -> Resource:
+        """Declare a resource this device has ``capacity`` of, and return the
+        handle a cost refers to."""
+        if name in self.resources:
+            raise ValueError(f"resource {name!r} already declared")
+        if capacity <= 0:
+            raise ValueError(f"resource {name!r} must have a positive capacity")
+        r = Resource(name, int(capacity))
+        self.resources[name] = r
+        return r
 
     def set_memory(
         self,
@@ -99,13 +181,26 @@ class Device:
         self.default_memory = self.memory[kind]
         return self
 
-    def set_comb_delay(self, kind: CombKind, delay_ns: float) -> Device:
-        """Set the combinational chaining delay (ns) of a native operator kind."""
+    def set_comb_delay(
+        self,
+        kind: CombKind,
+        delay_ns: float,
+        uses: dict[Resource, Cost] | None = None,
+    ) -> Device:
+        """Set the combinational chaining delay (ns) of a native operator kind,
+        and optionally what one instance of it spends. A comb kind carries ONE
+        parameter, its operand width, so each cost is a function of that."""
         if not isinstance(kind, CombKind):
             raise TypeError(f"kind must be a CombKind, got {kind!r}")
         if delay_ns < 0:
             raise ValueError(f"comb delay for {kind.value!r} must be non-negative")
         self.comb[kind.value] = float(delay_ns)
+        for resource, cost in (uses or {}).items():
+            if self.resources.get(resource.name) is not resource:
+                raise ValueError(
+                    f"{resource.name!r} is not a resource of device {self.name!r}"
+                )
+            self.comb_uses.setdefault(kind.value, {})[resource.name] = cost
         return self
 
     def set_default_frequency(self, freq_mhz: float) -> Device:
@@ -136,6 +231,8 @@ class Device:
         d.memory = dict(self.memory)
         d.default_memory = self.default_memory
         d.comb = dict(self.comb)
+        d.resources = dict(self.resources)
+        d.comb_uses = {k: dict(v) for k, v in self.comb_uses.items()}
         d.operators = list(self.operators)
         d.default_freq_mhz = self.default_freq_mhz
         return d
@@ -240,6 +337,8 @@ def inject_device(module, device: Device):
     override the built-in library defaults. Target frequency is not injected: it
     is a per-run scheduling parameter, not technology data."""
     from ..._mlir.ir import (
+        ArrayAttr,
+        Attribute,
         InsertionPoint,
         Location,
         DictAttr,
@@ -248,7 +347,11 @@ def inject_device(module, device: Device):
         F32Type,
         IntegerType,
     )
-    from ..._mlir.dialects.allo import DCPathDeviceOp
+    from ..._mlir.dialects.allo import (
+        DCPathCombOp,
+        DCPathDeviceOp,
+        DCPathResourceOp,
+    )
 
     with module.context, Location.unknown():
         f32ty = F32Type.get()
@@ -264,9 +367,6 @@ def inject_device(module, device: Device):
                 }
             )
 
-        comb = DictAttr.get(
-            {k: FloatAttr.get(f32ty, v) for k, v in device.comb.items()}
-        )
         memory = DictAttr.get(
             {
                 t.kind.value: _timing(t)
@@ -274,13 +374,43 @@ def inject_device(module, device: Device):
                 if t.kind is not MemoryKind.FIFO
             }
         )
-        kwargs = {"comb": comb, "memory": memory}
+        kwargs = {"memory": memory}
         fifo = device.memory.get(MemoryKind.FIFO)
         if fifo is not None:
             kwargs["fifo"] = _timing(fifo)
         if device.default_memory is not None:
             kwargs["default_memory"] = device.default_memory.kind.value
-        DCPathDeviceOp(ip=InsertionPoint.at_block_begin(module.body), **kwargs)
+        dev = DCPathDeviceOp(
+            sym_name=device.name,
+            ip=InsertionPoint.at_block_begin(module.body),
+            **kwargs,
+        )
+        # The body declares what the device HAS and what it realizes natively,
+        # each a symbol the others refer to. One op to inject, one to erase.
+        body = dev.regions[0].blocks.append()
+        with InsertionPoint(body):
+            for r in device.resources.values():
+                DCPathResourceOp(
+                    sym_name=r.name, capacity=IntegerAttr.get(i64, r.capacity)
+                )
+            for kind, delay in device.comb.items():
+                uses = device.comb_uses.get(kind)
+                DCPathCombOp(
+                    kind=kind,
+                    delay=FloatAttr.get(f32ty, delay),
+                    uses=(
+                        ArrayAttr.get(
+                            [
+                                Attribute.parse(
+                                    f"#allo.res_use<@{name}, [{cost._mlir()}]>"
+                                )
+                                for name, cost in uses.items()
+                            ]
+                        )
+                        if uses
+                        else None
+                    ),
+                )
 
 
 # --- built-in operators ----------------------------------------------------

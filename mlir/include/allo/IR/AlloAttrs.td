@@ -209,4 +209,81 @@ def StallContractEnum : I32EnumAttr<"StallContractEnum",
 }
 def StallContractAttr : EnumAttr<Allo_Dialect, StallContractEnum, "stall">;
 
+//===----------------------------------------------------------------------===//
+// Resource cost: what one realization spends of one device resource.
+//
+// A resource (`dcp.resource`) is a pure counter the compiler only adds and
+// multiplies, so its NAME is the device's vocabulary and stays open. A cost is
+// how much of one a realization spends, as a function of the parameters that
+// realization's kind carries (an operator's operand width, a multiplexer's
+// fan-in and width, a delay chain's depth and width).
+//
+// Each form is a function of ONE parameter, and a multi-parameter cost is the
+// PRODUCT of one form per parameter (see `ResourceUse`). That keeps the
+// evaluator a one-parameter switch and still covers every measured shape:
+// `0.4*k` per bit is linear in k times linear in width.
+//===----------------------------------------------------------------------===//
+
+// c
+def CostConst     : I32EnumAttrCase<"Const",     0, "const">;
+// coeffs[0] + coeffs[1] * p
+def CostLinear    : I32EnumAttrCase<"Linear",    1, "linear">;
+// coeffs[0] * p * p
+def CostQuadratic : I32EnumAttrCase<"Quadratic", 2, "quadratic">;
+// p < coeffs[0] ? coeffs[1] * p : coeffs[2], the shape of a shift-register
+// cliff: a chain deeper than three stops being flip-flops and stops growing.
+def CostStep      : I32EnumAttrCase<"Step",      3, "step">;
+// Measured point by point: coeffs is [p0, v0, p1, v1, ...] ascending in p, and
+// a parameter between two points takes the lower one's value.
+def CostTable     : I32EnumAttrCase<"Table",     4, "table">;
+def CostFormEnum : I32EnumAttr<"CostFormEnum",
+    "Shape of a resource cost as a function of one parameter",
+    [CostConst, CostLinear, CostQuadratic, CostStep, CostTable]> {
+  let cppNamespace = "mlir::allo";
+  let genSpecializedAttr = 0;
+}
+def CostFormAttr : EnumAttr<Allo_Dialect, CostFormEnum, "cost_form">;
+
+def CostAttr : Allo_Attr<"Cost"> {
+  let mnemonic = "cost";
+  let summary = "One resource cost as a function of one parameter";
+  let description = [{
+    The SHAPE comes from hardware structure and only the coefficients are
+    measured: an N-bit AND is N LUT6s, an adder adds a carry chain, a divider
+    is quadratic. A shape that is not structural belongs in a `table`, which
+    is what the measurement produced in the first place.
+  }];
+  let parameters = (ins
+    "allo::CostFormEnum":$form,
+    "::mlir::DenseF64ArrayAttr":$coeffs);
+  let assemblyFormat = [{
+    `<` $form `,` $coeffs `>`
+  }];
+  let cppNamespace = "mlir::allo";
+  let genVerifyDecl = 1;
+  let extraClassDeclaration = [{
+    /// This cost at \p param, UNROUNDED so a product of factors rounds once at
+    /// the end rather than once per factor.
+    double evaluate(int64_t param) const;
+  }];
+}
+
+def ResourceUseAttr : Allo_Attr<"ResourceUse"> {
+  let mnemonic = "res_use";
+  let summary = "How much of one resource a realization spends";
+  let description = [{
+    `factors` holds one cost per parameter of the realization's kind, and the
+    amount spent is their PRODUCT: factor `i` is evaluated at parameter `i`.
+    A one-parameter kind carries one factor.
+  }];
+  let parameters = (ins
+    "mlir::SymbolRefAttr":$resource,
+    ArrayRefParameter<"allo::CostAttr">:$factors);
+  let assemblyFormat = [{
+    `<` $resource `,` `[` $factors `]` `>`
+  }];
+  let cppNamespace = "mlir::allo";
+  let genVerifyDecl = 1;
+}
+
 #endif // ALLO_ATTRS

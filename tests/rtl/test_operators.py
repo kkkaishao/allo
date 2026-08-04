@@ -16,7 +16,15 @@ from allo.lang import bf16, f32, i32
 from allo.lang.ip import ip, OperatorType
 from allo.operators import math as amath
 from allo.operators import arith as allo_arith
-from allo.backend.rtl.device import builtin_device, MemoryKind
+from allo.backend.rtl.device import (
+    builtin_device,
+    CombKind,
+    Const,
+    Linear,
+    MemoryKind,
+    Quadratic,
+    Table,
+)
 
 sys.path.insert(0, os.path.dirname(__file__))
 from _common import Dcp, _sched, _to_rtl, _impls, FADD  # noqa: E402
@@ -32,6 +40,72 @@ def _f32(*shape):
 
 def _signed_f32(seed):
     return (np.random.default_rng(seed).random(16, dtype=np.float32) - 0.5) * 10
+
+
+# --- what the device declares -------------------------------------------------
+
+
+# A resource is the device's own vocabulary, so nothing in the compiler names
+# `lut` or `dsp`: they are symbols a cost refers to, and the reference is what
+# gets verified. A cost's SHAPE is structural and only its coefficients are
+# measured, which is why the forms are a closed set and the resources are not.
+def test_a_device_declares_its_resources_and_what_they_cost():
+    @kernel
+    def mac(A: i32[16], B: i32[16], out: i32[16]):
+        for i in range(16):
+            out[i] = A[i] * B[i] + 1
+
+    dev = builtin_device.copy()
+    lut = dev.add_resource("lut", capacity=1_303_680)
+    dsp = dev.add_resource("dsp", capacity=9_024)
+    # An N-bit AND is N LUT6s (linear), a divider is quadratic, and a
+    # multiplier's DSP count was measured per width rather than fitted.
+    dev.set_comb_delay(CombKind.ADD, 1.2, uses={lut: Linear(1.0)})
+    dev.set_comb_delay(CombKind.DIV, 2.5, uses={lut: Quadratic(1.06)})
+    dev.set_comb_delay(
+        CombKind.MUL, 2.0, uses={lut: Const(15.0), dsp: Table({8: 0, 16: 1, 32: 3})}
+    )
+
+    text = _to_rtl(mac, device=dev).dcp
+    assert "allo.dcp.resource @lut capacity = 1303680" in text
+    assert "allo.dcp.resource @dsp capacity = 9024" in text
+    # The cost rides the row it belongs to, referring to the resource by symbol.
+    assert "@dsp" in text and "table" in text and "quadratic" in text
+
+
+# A cost naming something that is not a resource is a verifier error, which is
+# the whole point of the symbol: the dictionary it replaced turned a misspelling
+# into an absent row.
+def test_a_cost_must_name_a_declared_resource():
+    dev = builtin_device.copy()
+    ghost = dev.add_resource("ghost", capacity=10)
+    dev.set_comb_delay(CombKind.ADD, 1.2, uses={ghost: Const(1.0)})
+    del dev.resources["ghost"]
+
+    @kernel
+    def k(A: i32[8], out: i32[8]):
+        for i in range(8):
+            out[i] = A[i] + 1
+
+    with pytest.raises(Exception):
+        _to_rtl(k, device=dev).dcp
+
+
+# A device cannot declare the same kind twice: the library keeps the last match,
+# so a duplicate would be one declaration silently overriding another.
+def test_a_device_declares_each_comb_kind_once():
+    dev = builtin_device.copy()
+    lut = dev.add_resource("lut", capacity=100)
+    dev.set_comb_delay(CombKind.ADD, 1.2, uses={lut: Linear(1.0)})
+    dev.set_comb_delay(CombKind.ADD, 0.9)  # overwrites rather than duplicating
+
+    @kernel
+    def k(A: i32[8], out: i32[8]):
+        for i in range(8):
+            out[i] = A[i] + 1
+
+    text = _to_rtl(k, device=dev).dcp
+    assert text.count('allo.dcp.comb "add"') == 1
 
 
 # --- operator injection ------------------------------------------------------

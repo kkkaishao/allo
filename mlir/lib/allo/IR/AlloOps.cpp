@@ -7,7 +7,12 @@
 #include "allo/IR/AlloAttrs.h"
 #include "allo/IR/AlloTypes.h"
 
+#include "llvm/ADT/DenseSet.h"
+#include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/StringSet.h"
 #include "llvm/Support/Format.h"
+
+#include <cmath>
 
 #include "allo/IR/AlloDialect.cpp.inc"
 
@@ -419,139 +424,58 @@ LogicalResult DCPathDeviceOp::verify() {
       return emitOpError("default_memory '")
              << def.strref() << "' is not declared in the memory table";
   }
+  // One row per kind: the library keeps the LAST match, so a duplicate is a
+  // declaration silently overriding another.
+  llvm::StringSet<> seen;
+  for (DCPathCombOp comb : getBody().getOps<DCPathCombOp>())
+    if (!seen.insert(comb.getKind()).second)
+      return emitOpError("declares combinational kind '")
+             << comb.getKind() << "' twice";
   return success();
 }
 
-// Hold `dcp.instance`'s local copy of the callee's `latency` and `determinacy`
-// to what the callee publishes. After emit the callee is an `hw.module`, which
-// publishes no contract, so only the symbol must resolve.
-LogicalResult
-DCPathInstanceOp::verifySymbolUses(SymbolTableCollection &symbolTable) {
-  Operation *sym = symbolTable.lookupNearestSymbolFrom(*this, getCalleeAttr());
-  if (!sym)
-    return emitOpError("references unknown callee '") << getCallee() << "'";
-  auto callee = dyn_cast<DCPathModuleOp>(sym);
-  if (!callee)
+// The KIND string is checked where the vocabulary lives, in `OperatorLibrary`:
+// `OpKind` is a scheduling-layer enum and this dialect sits below it.
+LogicalResult DCPathCombOp::verify() {
+  if (getDelay().convertToDouble() < 0.0)
+    return emitOpError("delay must be non-negative");
+  ArrayAttr uses = getUsesAttr();
+  if (!uses)
     return success();
-
-  // Operands are the callee's arguments in order.
-  FunctionType sig = callee.getFunctionType();
-  if (sig.getNumInputs() != getInputs().size())
-    return emitOpError("passes ")
-           << getInputs().size() << " operand(s) to @" << callee.getSymName()
-           << ", which takes " << sig.getNumInputs();
-  for (auto [i, t] : llvm::enumerate(sig.getInputs()))
-    if (getInputs()[i].getType() != t)
-      return emitOpError("operand ")
-             << i << " has type " << getInputs()[i].getType() << ", but @"
-             << callee.getSymName() << " takes " << t;
-  if (sig.getNumResults() != getResults().size())
-    return emitOpError("takes ")
-           << getResults().size() << " result(s) from @" << callee.getSymName()
-           << ", which returns " << sig.getNumResults();
-  for (auto [i, t] : llvm::enumerate(sig.getResults()))
-    if (getResults()[i].getType() != t)
-      return emitOpError("result ")
-             << i << " has type " << getResults()[i].getType() << ", but @"
-             << callee.getSymName() << " returns " << t;
-
-  if (getLatency() != callee.getLatency())
-    return emitOpError("declares latency ")
-           << (getLatency() ? std::to_string(*getLatency()) : "none")
-           << ", but @" << callee.getSymName() << " publishes "
-           << (callee.getLatency() ? std::to_string(*callee.getLatency())
-                                   : "none");
-  if (getDeterminacy() != callee.getDeterminacy())
-    return emitOpError("declares determinacy ")
-           << stringifyDeterminacyEnum(getDeterminacy()) << ", but @"
-           << callee.getSymName() << " publishes "
-           << stringifyDeterminacyEnum(callee.getDeterminacy());
-  return success();
-}
-
-LogicalResult DCPathInstanceOp::verify() {
-  if (getStart() < 0)
-    return emitOpError("start cycle must be non-negative");
-  return success();
-}
-
-LogicalResult DCPathPipelineOp::verify() {
-  // `ii` is optional (absent for a data-dependent sequential wrapper); when
-  // present it must be a positive initiation interval.
-  if (std::optional<int64_t> ii = getIi(); ii && *ii < 1)
-    return emitOpError("ii must be >= 1");
-  if (std::optional<int64_t> s = getStep(); s && *s <= 0)
-    return emitOpError("step must be > 0"); // termination is iv+step >= ub
-  // A bound is either compile-time (attribute) or runtime (operand), never
-  // both.
-  if (getLbBound() && getLbAttr())
-    return emitOpError("lb given as both an operand and an attribute");
-  if (getStepBound() && getStepAttr())
-    return emitOpError("step given as both an operand and an attribute");
-  if (getLatencyBound() && !getLatencyAttr())
-    return emitOpError("latency_bound requires latency");
-  if (getTripBoundAttr() && getTripAttr())
-    return emitOpError("trip_bound is the worst case of a trip that is not "
-                       "compile-time; it cannot accompany an exact trip");
-  Block &body = getBody().front();
-  if (body.getNumArguments() != 1 + getInits().size())
-    return emitOpError(
-        "body must have one induction argument plus one argument "
-        "per iter-arg");
-  if (!body.getArgument(0).getType().isIndex())
-    return emitOpError(
-        "the first body argument (induction variable) must have index type");
-
-  // The terminator determines the loop kind: dcp.uncondition (counted) or
-  // dcp.condition (while). Either carries one value per iter-arg.
-  if (body.empty() || !body.back().hasTrait<OpTrait::IsTerminator>())
-    return emitOpError("body must end with a terminator");
-  Operation *term = body.getTerminator();
-  if (auto cond = dyn_cast<DCPathConditionOp>(term)) {
-    if (getTripAttr())
-      return emitOpError(
-          "a while pipeline (dcp.condition terminator) must not have a trip");
-    if (cond.getCarried().size() != getInits().size())
-      return emitOpError("dcp.condition must carry one value per iter-arg");
-  } else if (auto y = dyn_cast<DCPathUnconditionOp>(term)) {
-    if (y.getOperands().size() != getInits().size())
-      return emitOpError("dcp.uncondition must yield one value per iter-arg");
-    // A counted loop terminates on its bound, so it must carry one: the `trip`
-    // attribute or the runtime `dynamicBound`.
-    if (!getTripAttr() && !getDynamicBound())
-      return emitOpError("a counted pipeline (dcp.uncondition terminator) "
-                         "needs a trip attribute or a dynamicBound operand");
-  } else {
-    return emitOpError("body must end with dcp.uncondition or dcp.condition");
+  // One parameter, an operand width, so one factor per resource.
+  llvm::SmallDenseSet<Attribute> seen;
+  for (Attribute use : uses) {
+    auto ru = dyn_cast<ResourceUseAttr>(use);
+    if (!ru)
+      return emitOpError("'uses' holds an entry that is not an #allo.res_use");
+    if (ru.getFactors().size() != 1)
+      return emitOpError("a combinational kind is characterized by one "
+                         "parameter (operand width), so its cost of '")
+             << ru.getResource() << "' takes one factor, not "
+             << ru.getFactors().size();
+    if (!seen.insert(ru.getResource()).second)
+      return emitOpError("spends resource '") << ru.getResource() << "' twice";
   }
   return success();
 }
 
-bool DCPathPipelineOp::isWhileLoop() {
-  return isa<DCPathConditionOp>(getBody().front().getTerminator());
-}
-
-DCPathConditionOp DCPathPipelineOp::getConditionOp() {
-  return dyn_cast<DCPathConditionOp>(getBody().front().getTerminator());
-}
-
-DCPathUnconditionOp DCPathPipelineOp::getUnconditionOp() {
-  return dyn_cast<DCPathUnconditionOp>(getBody().front().getTerminator());
-}
-
-Value DCPathPipelineOp::getConditionValue() {
-  DCPathConditionOp c = getConditionOp();
-  return c ? c.getCondition() : Value();
-}
-
-OperandRange DCPathPipelineOp::getCarriedValues() {
-  if (DCPathConditionOp c = getConditionOp())
-    return c.getCarried();
-  return getUnconditionOp().getOperands();
+LogicalResult
+DCPathCombOp::verifySymbolUses(SymbolTableCollection &symbolTable) {
+  ArrayAttr uses = getUsesAttr();
+  if (!uses)
+    return success();
+  for (Attribute use : uses) {
+    auto ru = cast<ResourceUseAttr>(use);
+    if (!symbolTable.lookupNearestSymbolFrom<DCPathResourceOp>(
+            *this, ru.getResource()))
+      return emitOpError("spends '")
+             << ru.getResource() << "', which is not a dcp.resource";
+  }
+  return success();
 }
 
 //===----------------------------------------------------------------------===//
-// dcp.operator / dcp.device custom assembly
+// dcp.operator custom assembly
 //===----------------------------------------------------------------------===//
 
 // Print a delay as a compact decimal (e.g. `0.5`, `1.2`), instead of the
@@ -569,52 +493,6 @@ static ParseResult parseNum(OpAsmParser &p, double &v) {
     return success();
   }
   return p.parseFloat(v);
-}
-
-// A storage-timing record `{rd_lat = N, wr_lat = N, rd_delay = F, wr_delay =
-// F}`. Printing is generic over the record's fields; parsing keys the two
-// latency fields to integer type.
-static void printTiming(OpAsmPrinter &p, DictionaryAttr d) {
-  p << '{';
-  llvm::interleaveComma(d, p, [&](NamedAttribute e) {
-    p << e.getName().strref() << " = ";
-    if (auto i = dyn_cast<IntegerAttr>(e.getValue()))
-      p << i.getInt();
-    else
-      printNum(p, cast<FloatAttr>(e.getValue()).getValueAsDouble());
-  });
-  p << '}';
-}
-
-static ParseResult parseTiming(OpAsmParser &p, Attribute &out) {
-  Builder &b = p.getBuilder();
-  SmallVector<NamedAttribute> fields;
-  StringRef key;
-  auto field = [&]() -> ParseResult {
-    if (p.parseKeyword(&key) || p.parseEqual())
-      return failure();
-    if (key == "rd_lat" || key == "wr_lat") {
-      int64_t n;
-      if (p.parseInteger(n))
-        return failure();
-      fields.push_back(b.getNamedAttr(key, b.getI64IntegerAttr(n)));
-    } else {
-      double f;
-      if (parseNum(p, f))
-        return failure();
-      fields.push_back(b.getNamedAttr(key, b.getF32FloatAttr(f)));
-    }
-    return success();
-  };
-  if (p.parseLBrace() || field())
-    return failure();
-  while (succeeded(p.parseOptionalComma()))
-    if (field())
-      return failure();
-  if (p.parseRBrace())
-    return failure();
-  out = b.getDictionaryAttr(fields);
-  return success();
 }
 
 // Parse the optional determinacy keyword a scheduling region prints just before
@@ -804,90 +682,6 @@ ParseResult DCPathOperatorOp::parse(OpAsmParser &p, OperationState &result) {
                       b.getBoolAttr(pipelined));
   result.addAttribute(getStallAttrName(result.name),
                       StallContractEnumAttr::get(b.getContext(), *s));
-  return success();
-}
-
-void DCPathDeviceOp::print(OpAsmPrinter &p) {
-  p << " {";
-  p.increaseIndent();
-  // comb: one `kind = delay` per line.
-  p.printNewline();
-  p << "comb {";
-  p.increaseIndent();
-  for (NamedAttribute e : getComb()) {
-    p.printNewline();
-    p << e.getName().strref() << " = ";
-    printNum(p, cast<FloatAttr>(e.getValue()).getValueAsDouble());
-  }
-  p.decreaseIndent();
-  p.printNewline();
-  p << '}';
-  // memory: one storage primitive per line.
-  p.printNewline();
-  p << "memory {";
-  p.increaseIndent();
-  for (NamedAttribute e : getMemory()) {
-    p.printNewline();
-    p << e.getName().strref() << " = ";
-    printTiming(p, cast<DictionaryAttr>(e.getValue()));
-  }
-  p.decreaseIndent();
-  p.printNewline();
-  p << '}';
-  if (DictionaryAttr fifo = getFifoAttr()) {
-    p.printNewline();
-    p << "fifo = ";
-    printTiming(p, fifo);
-  }
-  if (StringAttr def = getDefaultMemoryAttr()) {
-    p.printNewline();
-    p << "default_memory = " << def.strref();
-  }
-  p.decreaseIndent();
-  p.printNewline();
-  p << '}';
-}
-
-ParseResult DCPathDeviceOp::parse(OpAsmParser &p, OperationState &result) {
-  Builder &b = p.getBuilder();
-  SmallVector<NamedAttribute> comb, memory;
-  StringRef k;
-  if (p.parseLBrace() || p.parseKeyword("comb") || p.parseLBrace())
-    return failure();
-  while (succeeded(p.parseOptionalKeyword(&k))) {
-    double v;
-    if (p.parseEqual() || parseNum(p, v))
-      return failure();
-    comb.push_back(b.getNamedAttr(k, b.getF32FloatAttr(v)));
-  }
-  if (p.parseRBrace() || p.parseKeyword("memory") || p.parseLBrace())
-    return failure();
-  while (succeeded(p.parseOptionalKeyword(&k))) {
-    Attribute timing;
-    if (p.parseEqual() || parseTiming(p, timing))
-      return failure();
-    memory.push_back(b.getNamedAttr(k, timing));
-  }
-  if (p.parseRBrace())
-    return failure();
-  result.addAttribute(getCombAttrName(result.name), b.getDictionaryAttr(comb));
-  result.addAttribute(getMemoryAttrName(result.name),
-                      b.getDictionaryAttr(memory));
-  if (succeeded(p.parseOptionalKeyword("fifo"))) {
-    Attribute timing;
-    if (p.parseEqual() || parseTiming(p, timing))
-      return failure();
-    result.addAttribute(getFifoAttrName(result.name), timing);
-  }
-  if (succeeded(p.parseOptionalKeyword("default_memory"))) {
-    StringRef def;
-    if (p.parseEqual() || p.parseKeyword(&def))
-      return failure();
-    result.addAttribute(getDefaultMemoryAttrName(result.name),
-                        b.getStringAttr(def));
-  }
-  if (p.parseRBrace())
-    return failure();
   return success();
 }
 
@@ -1294,4 +1088,226 @@ ParseResult DCPathSelectOp::parse(OpAsmParser &p, OperationState &result) {
   return p.parseOptionalAttrDict(result.attributes);
 }
 
+// Hold `dcp.instance`'s local copy of the callee's `latency` and `determinacy`
+// to what the callee publishes. After emit the callee is an `hw.module`, which
+// publishes no contract, so only the symbol must resolve.
+LogicalResult
+DCPathInstanceOp::verifySymbolUses(SymbolTableCollection &symbolTable) {
+  Operation *sym = symbolTable.lookupNearestSymbolFrom(*this, getCalleeAttr());
+  if (!sym)
+    return emitOpError("references unknown callee '") << getCallee() << "'";
+  auto callee = dyn_cast<DCPathModuleOp>(sym);
+  if (!callee)
+    return success();
+
+  // Operands are the callee's arguments in order.
+  FunctionType sig = callee.getFunctionType();
+  if (sig.getNumInputs() != getInputs().size())
+    return emitOpError("passes ")
+           << getInputs().size() << " operand(s) to @" << callee.getSymName()
+           << ", which takes " << sig.getNumInputs();
+  for (auto [i, t] : llvm::enumerate(sig.getInputs()))
+    if (getInputs()[i].getType() != t)
+      return emitOpError("operand ")
+             << i << " has type " << getInputs()[i].getType() << ", but @"
+             << callee.getSymName() << " takes " << t;
+  if (sig.getNumResults() != getResults().size())
+    return emitOpError("takes ")
+           << getResults().size() << " result(s) from @" << callee.getSymName()
+           << ", which returns " << sig.getNumResults();
+  for (auto [i, t] : llvm::enumerate(sig.getResults()))
+    if (getResults()[i].getType() != t)
+      return emitOpError("result ")
+             << i << " has type " << getResults()[i].getType() << ", but @"
+             << callee.getSymName() << " returns " << t;
+
+  if (getLatency() != callee.getLatency())
+    return emitOpError("declares latency ")
+           << (getLatency() ? std::to_string(*getLatency()) : "none")
+           << ", but @" << callee.getSymName() << " publishes "
+           << (callee.getLatency() ? std::to_string(*callee.getLatency())
+                                   : "none");
+  if (getDeterminacy() != callee.getDeterminacy())
+    return emitOpError("declares determinacy ")
+           << stringifyDeterminacyEnum(getDeterminacy()) << ", but @"
+           << callee.getSymName() << " publishes "
+           << stringifyDeterminacyEnum(callee.getDeterminacy());
+  return success();
+}
+
+LogicalResult DCPathInstanceOp::verify() {
+  if (getStart() < 0)
+    return emitOpError("start cycle must be non-negative");
+  return success();
+}
+
+LogicalResult DCPathPipelineOp::verify() {
+  // `ii` is optional (absent for a data-dependent sequential wrapper); when
+  // present it must be a positive initiation interval.
+  if (std::optional<int64_t> ii = getIi(); ii && *ii < 1)
+    return emitOpError("ii must be >= 1");
+  if (std::optional<int64_t> s = getStep(); s && *s <= 0)
+    return emitOpError("step must be > 0"); // termination is iv+step >= ub
+  // A bound is either compile-time (attribute) or runtime (operand), never
+  // both.
+  if (getLbBound() && getLbAttr())
+    return emitOpError("lb given as both an operand and an attribute");
+  if (getStepBound() && getStepAttr())
+    return emitOpError("step given as both an operand and an attribute");
+  if (getLatencyBound() && !getLatencyAttr())
+    return emitOpError("latency_bound requires latency");
+  if (getTripBoundAttr() && getTripAttr())
+    return emitOpError("trip_bound is the worst case of a trip that is not "
+                       "compile-time; it cannot accompany an exact trip");
+  Block &body = getBody().front();
+  if (body.getNumArguments() != 1 + getInits().size())
+    return emitOpError(
+        "body must have one induction argument plus one argument "
+        "per iter-arg");
+  if (!body.getArgument(0).getType().isIndex())
+    return emitOpError(
+        "the first body argument (induction variable) must have index type");
+
+  // The terminator determines the loop kind: dcp.uncondition (counted) or
+  // dcp.condition (while). Either carries one value per iter-arg.
+  if (body.empty() || !body.back().hasTrait<OpTrait::IsTerminator>())
+    return emitOpError("body must end with a terminator");
+  Operation *term = body.getTerminator();
+  if (auto cond = dyn_cast<DCPathConditionOp>(term)) {
+    if (getTripAttr())
+      return emitOpError(
+          "a while pipeline (dcp.condition terminator) must not have a trip");
+    if (cond.getCarried().size() != getInits().size())
+      return emitOpError("dcp.condition must carry one value per iter-arg");
+  } else if (auto y = dyn_cast<DCPathUnconditionOp>(term)) {
+    if (y.getOperands().size() != getInits().size())
+      return emitOpError("dcp.uncondition must yield one value per iter-arg");
+    // A counted loop terminates on its bound, so it must carry one: the `trip`
+    // attribute or the runtime `dynamicBound`.
+    if (!getTripAttr() && !getDynamicBound())
+      return emitOpError("a counted pipeline (dcp.uncondition terminator) "
+                         "needs a trip attribute or a dynamicBound operand");
+  } else {
+    return emitOpError("body must end with dcp.uncondition or dcp.condition");
+  }
+  return success();
+}
+
+bool DCPathPipelineOp::isWhileLoop() {
+  return isa<DCPathConditionOp>(getBody().front().getTerminator());
+}
+
+DCPathConditionOp DCPathPipelineOp::getConditionOp() {
+  return dyn_cast<DCPathConditionOp>(getBody().front().getTerminator());
+}
+
+DCPathUnconditionOp DCPathPipelineOp::getUnconditionOp() {
+  return dyn_cast<DCPathUnconditionOp>(getBody().front().getTerminator());
+}
+
+Value DCPathPipelineOp::getConditionValue() {
+  DCPathConditionOp c = getConditionOp();
+  return c ? c.getCondition() : Value();
+}
+
+OperandRange DCPathPipelineOp::getCarriedValues() {
+  if (DCPathConditionOp c = getConditionOp())
+    return c.getCarried();
+  return getUnconditionOp().getOperands();
+}
+
 } // namespace mlir::allo::dcp
+
+//===----------------------------------------------------------------------===//
+// Resource cost attributes
+//===----------------------------------------------------------------------===//
+
+// How many coefficients each form carries. A table is [p0, v0, p1, v1, ...],
+// so it is even and non-empty rather than a fixed count.
+LogicalResult
+CostAttr::verify(llvm::function_ref<InFlightDiagnostic()> emitError,
+                 CostFormEnum form, DenseF64ArrayAttr coeffsAttr) {
+  if (!coeffsAttr)
+    return emitError() << "a cost needs its coefficients";
+  llvm::ArrayRef<double> coeffs = coeffsAttr.asArrayRef();
+  auto need = [&](size_t n) -> LogicalResult {
+    if (coeffs.size() == n)
+      return success();
+    return emitError() << stringifyCostFormEnum(form) << " takes " << n
+                       << " coefficient(s), got " << coeffs.size();
+  };
+  switch (form) {
+  case CostFormEnum::Const:
+  case CostFormEnum::Quadratic:
+    return need(1);
+  case CostFormEnum::Linear:
+    return need(2);
+  case CostFormEnum::Step:
+    return need(3);
+  case CostFormEnum::Table:
+    if (coeffs.empty() || coeffs.size() % 2 != 0)
+      return emitError() << "table takes [point, value] pairs, got "
+                         << coeffs.size() << " coefficient(s)";
+    for (size_t i = 2; i < coeffs.size(); i += 2)
+      if (coeffs[i] <= coeffs[i - 2])
+        return emitError() << "table points must ascend";
+    return success();
+  }
+  llvm_unreachable("unhandled CostFormEnum");
+}
+
+double CostAttr::evaluate(int64_t param) const {
+  llvm::ArrayRef<double> c = getCoeffs().asArrayRef();
+  double p = static_cast<double>(param);
+  switch (getForm()) {
+  case CostFormEnum::Const:
+    return c[0];
+  case CostFormEnum::Linear:
+    return c[0] + c[1] * p;
+  case CostFormEnum::Quadratic:
+    return c[0] * p * p;
+  case CostFormEnum::Step:
+    return p < c[0] ? c[1] * p : c[2];
+  case CostFormEnum::Table: {
+    // Below the first point the first value stands; the table is ascending, so
+    // the last point at or under `p` is the row.
+    double v = c[1];
+    for (size_t i = 0; i < c.size(); i += 2)
+      if (c[i] <= p)
+        v = c[i + 1];
+    return v;
+  }
+  }
+  llvm_unreachable("unhandled CostFormEnum");
+}
+
+LogicalResult
+ResourceUseAttr::verify(llvm::function_ref<InFlightDiagnostic()> emitError,
+                        SymbolRefAttr resource,
+                        llvm::ArrayRef<CostAttr> factors) {
+  if (factors.empty())
+    return emitError() << "a resource use needs one cost per parameter";
+  return success();
+}
+
+llvm::SmallVector<std::pair<SymbolRefAttr, int64_t>>
+mlir::allo::evaluateResourceUse(ArrayAttr uses,
+                                llvm::ArrayRef<int64_t> params) {
+  llvm::SmallVector<std::pair<SymbolRefAttr, int64_t>> spent;
+  if (!uses)
+    return spent;
+  for (Attribute use : uses) {
+    auto ru = cast<ResourceUseAttr>(use);
+    llvm::ArrayRef<CostAttr> factors = ru.getFactors();
+    assert(factors.size() == params.size() &&
+           "a resource cost carries one factor per parameter of its kind");
+    // Rounded ONCE, at the end: rounding each factor would make the product
+    // depend on how the cost was factored.
+    double amount = 1.0;
+    for (auto [factor, param] : llvm::zip(factors, params))
+      amount *= factor.evaluate(param);
+    spent.emplace_back(ru.getResource(),
+                       static_cast<int64_t>(std::llround(amount)));
+  }
+  return spent;
+}

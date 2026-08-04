@@ -313,7 +313,8 @@ MemoryLibrary memoryFromDevice(dcp::DCPathDeviceOp device) {
     auto impl = symbolizeMemoryImplEnum(na.getName().strref());
     if (!impl)
       continue;
-    m.primitives.push_back({*impl, timing(cast<DictionaryAttr>(na.getValue()))});
+    m.primitives.push_back(
+        {*impl, timing(cast<DictionaryAttr>(na.getValue()))});
   }
   if (DictionaryAttr fifo = device.getFifoAttr())
     m.fifo = timing(fifo);
@@ -342,16 +343,23 @@ OperatorLibrary OperatorLibrary::fromModule(ModuleOp module) {
   // Comb rows first: `entries` is matched last-wins, so comb is the
   // lowest-priority fallback and an injected IP of the same kind overrides it.
   if (device) {
-    for (NamedAttribute na : device.getComb()) {
-      auto kind = parseOpKind(na.getName().strref());
-      if (!kind)
+    for (dcp::DCPathCombOp comb :
+         device.getBody().getOps<dcp::DCPathCombOp>()) {
+      auto kind = parseOpKind(comb.getKind());
+      // `OpKind` is this layer's vocabulary, so the dialect verifier cannot
+      // check it and a row naming something outside it is reported here rather
+      // than dropped into a silent zero delay.
+      if (!kind) {
+        logging::error(logging::Stage::Prep, comb)
+            << "Device declares a combinational delay for '" << comb.getKind()
+            << "', which is not an operator kind";
         continue;
+      }
       OperatorEntry e;
       e.kind = *kind;
       e.comb = true;
       e.latency = 0;
-      e.inDelay = e.outDelay =
-          cast<FloatAttr>(na.getValue()).getValueAsDouble();
+      e.inDelay = e.outDelay = comb.getDelay().convertToDouble();
       lib.entries.push_back(std::move(e));
     }
     lib.memory = memoryFromDevice(device);
