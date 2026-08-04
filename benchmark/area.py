@@ -29,11 +29,14 @@ Three properties of the model that a reader has to know before quoting a number:
     for COMPARING two schedules, which is what it is for, not as a utilization
     estimate.
   - **Memory is priced by its WRITE PORT COUNT, and the cliff is enormous.** One
-    writer infers a block RAM and costs no fabric at all; two writers infer
-    nothing, so the array becomes a register file with a data multiplexer in
-    front of every word. Measured at 512x32: one BRAM18 against 33,245 LUTs and
-    16,416 flip-flops. Block RAM is still reported apart from the fabric totals,
-    since no scheduling decision trades one for the other.
+    writer infers a block RAM and costs no fabric at all; two writers sharing an
+    always block infer nothing, so the array becomes a register file with a data
+    multiplexer in front of every word. Measured at 512x32: one BRAM18 against
+    33,245 LUTs and 16,416 flip-flops. The TEMPLATE decides and not the port
+    count, so two writers each in their own block are a true dual port and free
+    again, which the emitter marks with `allo.mem.independent_writes`. Block RAM
+    is still reported apart from the fabric totals, since no scheduling decision
+    trades one for the other.
 
 The one result here that contradicts the compiler: **a value delay chain deeper
 than three does not cost flip-flops.** Vivado extracts it into SRLs, so its cost
@@ -194,15 +197,18 @@ def chain_area(depth: int, width: int) -> Area:
 MULTIWRITE_LUT_PER_BIT = 2.0
 
 
-def memory_area(depth: int, width: int, writers: int) -> tuple[Area, int]:
+def memory_area(depth: int, width: int, writers: int,
+                independent: bool) -> tuple[Area, int]:
     """Fabric cost of one array, and the bits that went to block RAM instead.
 
     A single writer is the RAM template the synthesizer recognizes, so it costs
-    no fabric; extra READ ports only replicate the RAM. A second WRITER defeats
-    inference outright and the array falls back to registers."""
+    no fabric; extra READ ports only replicate the RAM. Two writers still infer
+    a TRUE dual port when each is described in its own always block, which is
+    what `independent` reports; sharing a block, or asking for a third port,
+    infers nothing and the array falls back to registers."""
     assert depth >= 1 and width >= 1 and writers >= 0
     bits = depth * width
-    if writers <= 1:
+    if writers <= 1 or (independent and writers == 2):
         return ZERO, bits
     return Area(lut=round(MULTIWRITE_LUT_PER_BIT * bits), ff=bits), 0
 
@@ -213,8 +219,10 @@ _ASSIGN = re.compile(r"^\s*(%[\w.$]+)\s*=\s*(\S+)\s*(.*)$")
 _STMT = re.compile(r"^\s*(\S+)\s+(.*)$")
 _WIDTH = re.compile(r"\bi(\d+)\b")
 _INSTANCE = re.compile(r'hw\.instance\s+"[^"]*"\s+@([\w$.]+)')
-_HLMEM = re.compile(r"(%[\w.$]+)\s*=\s*seq\.hlmem\s+@\S+.*<([\dx]+)x?i(\d+)>")
-_MEMACC = re.compile(r"seq\.(read|write)\s+(%[\w.$]+)\[")
+_HLMEM = re.compile(r"seq\.hlmem\s+@\S+.*<([\dx]+)x?i(\d+)>")
+#: The emitter's promise that no two write ports touch one word in a cycle, so
+#: the lowering gives each its own always block and a true dual port infers.
+_INDEPENDENT = "allo.mem.independent_writes"
 _OPERANDS = re.compile(r"%[\w.$]+")
 
 # Everything with no area of its own: declarations, constants, wiring, and the
@@ -237,9 +245,15 @@ class _Op:
 
 
 def _parse(mlir: str) -> tuple[dict[str, _Op], list[_Op]]:
-    """SSA name -> defining op, and every op in order."""
+    """SSA name -> defining op, and every op in order.
+
+    Names are qualified by the module they are in, because an SSA name is
+    module-scoped: two instantiations of one sub-kernel each declare `%temp`,
+    and reading them as one array charged `merge_sort` a second writer it does
+    not have, and let a register chain link across the module boundary."""
     defs: dict[str, _Op] = {}
     ops: list[_Op] = []
+    module = 0
     for line in mlir.splitlines():
         s = line.strip()
         if not s or s.startswith("//") or s in ("}", "{"):
@@ -254,14 +268,18 @@ def _parse(mlir: str) -> tuple[dict[str, _Op], list[_Op]]:
             res, opname, rest = None, m.group(1), m.group(2)
         if not re.match(r"^(comb|seq|hw|sv)\.", opname):
             continue
+        if opname.startswith("hw.module"):
+            module += 1
+        scope = f"{module}:"
         widths = _WIDTH.findall(rest)
         # The trailing type is the one that prices the op: an `icmp` returns i1
         # but costs its OPERAND width, and that is what the last type spells.
         width = int(widths[-1]) if widths else 0
-        op = _Op(opname, _OPERANDS.findall(rest), width, s, res)
+        op = _Op(opname, [scope + v for v in _OPERANDS.findall(rest)], width, s,
+                 scope + res if res else None)
         ops.append(op)
         if res:
-            defs[res] = op
+            defs[op.result] = op
     return defs, ops
 
 
@@ -351,12 +369,12 @@ def score(mlir: str) -> dict:
         for o in run:
             consumed.add(id(o))
 
-    # Write ports per array: one writer is a RAM, two is a register file.
+    # Write ports per array, off the memory each `seq.write` names as its first
+    # operand: one writer is a RAM, two share it only if independent.
     writers: dict[str, int] = {}
     for op in ops:
-        m = _MEMACC.search(op.line)
-        if m and m.group(1) == "write":
-            writers[m.group(2)] = writers.get(m.group(2), 0) + 1
+        if op.name == "seq.write":
+            writers[op.operands[0]] = writers.get(op.operands[0], 0) + 1
 
     total = reg_area
     datapath = ZERO
@@ -368,6 +386,7 @@ def score(mlir: str) -> dict:
     mux_sources = 0
     instances: dict[str, int] = {}
     mem_bits = 0
+    regfile_arrays = 0
     unmodelled: dict[str, int] = {}
 
     for op in ops:
@@ -398,14 +417,17 @@ def score(mlir: str) -> dict:
         if op.name == "seq.hlmem":
             m = _HLMEM.search(op.line)
             if m:
-                shape = [int(x) for x in m.group(2).split("x") if x]
+                shape = [int(x) for x in m.group(1).split("x") if x]
                 depth = 1
                 for d in shape:
                     depth *= d
-                a, ram = memory_area(depth, int(m.group(3)), writers[m.group(1)])
+                a, ram = memory_area(depth, int(m.group(2)),
+                                     writers.get(op.result, 0),
+                                     _INDEPENDENT in op.line)
                 mem_fabric += a
                 total += a
                 mem_bits += ram
+                regfile_arrays += ram == 0
             continue
         if op.name in _FREE:
             continue
@@ -428,7 +450,10 @@ def score(mlir: str) -> dict:
         "logic_lut": datapath.lut, "logic_carry8": datapath.carry8,
         "reg_ff": regs.ff, "reg_lut": regs.lut + regs.srl,
         "mem_lut": mem_fabric.lut, "mem_ff": mem_fabric.ff,
-        "multiwrite_arrays": sum(1 for n in writers.values() if n > 1),
+        # Arrays that failed RAM inference and became a register file, which is
+        # not the same as arrays with several writers: two independent ports
+        # still infer a true dual port.
+        "regfile_arrays": regfile_arrays,
         # What the scheduling objective charges for the same registers today.
         "reg_ff_modelled": sum(d * w for d, w, _ in chains),
         "chain_stages": chain_stages, "deep_chain_stages": deep_stages,

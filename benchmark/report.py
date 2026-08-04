@@ -540,7 +540,7 @@ def area_table(results: list[dict]) -> str:
     tot = dict.fromkeys(
         ("lut", "ip_lut", "mux_lut", "logic_lut", "mem_lut", "srl", "dsp",
          "reg_ff", "reg_ff_modelled", "mem_bits"), 0)
-    multiwrite = 0
+    regfile = 0
     unmodelled: dict[str, int] = {}
     for r in sorted(rows, key=lambda r: -r["area"]["lut"]):
         a = r["area"]
@@ -548,7 +548,7 @@ def area_table(results: list[dict]) -> str:
             tot[f] += a[f]
         for k, n in a.get("unmodelled", {}).items():
             unmodelled[k] = unmodelled.get(k, 0) + n
-        multiwrite += a["multiwrite_arrays"]
+        regfile += a["regfile_arrays"]
         lines.append(
             f"{_key_of(r):<34} {r['scheduler'][:6]:<6} {a['lut']:>8}"
             f" {a['ip_lut']:>8} {a['mux_lut']:>8} {a['logic_lut']:>8}"
@@ -568,10 +568,10 @@ def area_table(results: list[dict]) -> str:
         f"the objective charges {tot['reg_ff_modelled']} flip-flops for chains "
         f"that cost {tot['reg_ff']} FF + {tot['srl']} SRL: {over:.1f}x over"
     )
-    if multiwrite:
+    if regfile:
         lines.append(
-            f"{multiwrite} arrays have more than one writer, so they infer no "
-            f"RAM and cost {tot['mem_lut']} LUTs of register file"
+            f"{regfile} arrays infer no RAM and cost {tot['mem_lut']} LUTs of "
+            f"register file"
         )
     if unmodelled:
         lines.append(f"UNMODELLED (scored as zero): {unmodelled}")
