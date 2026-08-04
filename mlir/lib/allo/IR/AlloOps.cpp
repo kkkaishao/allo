@@ -410,15 +410,20 @@ LogicalResult DCPathDeviceOp::verify() {
   return success();
 }
 
-// One `uses` entry per resource, each carrying one cost factor per parameter of
-// the realization's kind (\p arity of them, spelled by \p params for the
+// Each `uses` entry is one product TERM, carrying one cost factor per parameter
+// of the realization's kind (\p arity of them, spelled by \p params for the
 // diagnostic). A wrong count would otherwise reach the evaluator, which zips
 // factors against parameters and cannot tell a missing one from a whole tuple.
+//
+// A resource may appear in several entries, which is what makes the cost a sum
+// of products rather than one product: `2*width + depth - 1` is a real measured
+// shape and no single product is a sum. The price of that is the check this
+// used to make, that a resource is named ONCE, which caught a typo repeating a
+// row. There is nothing left to distinguish that typo from a second term.
 static LogicalResult verifyResourceUses(Operation *op, ArrayAttr uses,
                                         unsigned arity, StringRef params) {
   if (!uses)
     return success();
-  llvm::SmallDenseSet<Attribute> seen;
   for (Attribute use : uses) {
     auto ru = dyn_cast<ResourceUseAttr>(use);
     if (!ru)
@@ -436,9 +441,6 @@ static LogicalResult verifyResourceUses(Operation *op, ArrayAttr uses,
       return op->emitOpError("is characterized by ")
              << params << ", so its cost of '" << ru.getResource() << "' takes "
              << arity << " factor(s), not " << factors.size();
-    if (!seen.insert(ru.getResource()).second)
-      return op->emitOpError("spends resource '")
-             << ru.getResource() << "' twice";
   }
   return success();
 }
@@ -1371,33 +1373,42 @@ ResourceUseAttr::verify(llvm::function_ref<InFlightDiagnostic()> emitError,
 llvm::SmallVector<std::pair<SymbolRefAttr, int64_t>>
 mlir::allo::evaluateResourceUse(ArrayAttr uses,
                                 llvm::ArrayRef<int64_t> params) {
-  llvm::SmallVector<std::pair<SymbolRefAttr, int64_t>> spent;
-  if (!uses)
-    return spent;
-  for (Attribute use : uses) {
-    auto ru = cast<ResourceUseAttr>(use);
-    llvm::ArrayRef<CostAttr> factors = ru.getFactors();
-    double amount = 1.0;
-    if (factors.size() == 1 &&
-        factors.front().getForm() == CostFormEnum::Tiled) {
-      // The one form that reads the WHOLE tuple: a tile holds so many bits
-      // however the array is cut, so the product sits inside the ceiling and
-      // the arity rule above does not apply to it.
-      assert(!params.empty() && "a tiled cost needs a parameter tuple to tile");
-      double bits = 1.0;
-      for (int64_t p : params)
-        bits *= static_cast<double>(p);
-      amount = std::ceil(bits / factors.front().getCoeffs().asArrayRef()[0]);
-    } else {
-      assert(factors.size() == params.size() &&
-             "a resource cost carries one factor per parameter of its kind");
-      // Rounded ONCE, at the end: rounding each factor would make the product
-      // depend on how the cost was factored.
-      for (auto [factor, param] : llvm::zip(factors, params))
-        amount *= factor.evaluate(param);
+  // One running total per resource, in the order the resources first appear.
+  llvm::SmallVector<std::pair<SymbolRefAttr, double>> totals;
+  if (uses)
+    for (Attribute use : uses) {
+      auto ru = cast<ResourceUseAttr>(use);
+      llvm::ArrayRef<CostAttr> factors = ru.getFactors();
+      double term = 1.0;
+      if (factors.size() == 1 &&
+          factors.front().getForm() == CostFormEnum::Tiled) {
+        // The one form that reads the WHOLE tuple: a tile holds so many bits
+        // however the array is cut, so the product sits inside the ceiling and
+        // the arity rule above does not apply to it.
+        assert(!params.empty() &&
+               "a tiled cost needs a parameter tuple to tile");
+        double bits = 1.0;
+        for (int64_t p : params)
+          bits *= static_cast<double>(p);
+        term = std::ceil(bits / factors.front().getCoeffs().asArrayRef()[0]);
+      } else {
+        assert(factors.size() == params.size() &&
+               "a resource cost carries one factor per parameter of its kind");
+        for (auto [factor, param] : llvm::zip(factors, params))
+          term *= factor.evaluate(param);
+      }
+      auto *it = llvm::find_if(
+          totals, [&](auto &total) { return total.first == ru.getResource(); });
+      if (it == totals.end())
+        totals.emplace_back(ru.getResource(), term);
+      else
+        it->second += term;
     }
-    spent.emplace_back(ru.getResource(),
-                       static_cast<int64_t>(std::llround(amount)));
-  }
+  // Rounded ONCE per resource, after every term is in: rounding a factor or a
+  // term would make the answer depend on how the cost happened to be written.
+  llvm::SmallVector<std::pair<SymbolRefAttr, int64_t>> spent;
+  spent.reserve(totals.size());
+  for (auto &[resource, amount] : totals)
+    spent.emplace_back(resource, static_cast<int64_t>(std::llround(amount)));
   return spent;
 }

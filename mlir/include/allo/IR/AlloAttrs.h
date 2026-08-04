@@ -20,15 +20,17 @@
 
 namespace mlir::allo {
 
-/// What the resource vector \p uses spends at \p params: one entry per named
-/// resource, each the PRODUCT of its factors with factor `i` evaluated at
-/// `params[i]`, rounded to the nearest whole resource ONCE at the end.
+/// What the resource vector \p uses spends at \p params: ONE entry per named
+/// resource, the sum over that resource's terms of the product of the term's
+/// factors with factor `i` evaluated at `params[i]`, rounded to the nearest
+/// whole resource once the sum is complete. Resources come out in the order
+/// they first appear, and a caller never has to add two entries up itself.
 ///
 /// \p uses is a `dcp.resource`-referencing `ResourceUseAttr` array, and
 /// \p params is the parameter tuple of the realization's kind (an operator's
-/// operand width; a multiplexer's fan-in and width; a storage's depth and
-/// width). A null \p uses spends nothing, which is what an undeclared cost
-/// means.
+/// operand width; a multiplexer's fan-in and width; a chain's or a storage's
+/// depth and width). A null \p uses spends nothing, which is what an undeclared
+/// cost means.
 ///
 /// A lone `tiled` factor is the exception to the one-factor-per-parameter rule:
 /// it reads the whole tuple, since `ceil(depth*width/bits)` does not separate.

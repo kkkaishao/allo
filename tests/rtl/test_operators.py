@@ -143,14 +143,36 @@ def test_an_operator_declares_what_its_core_spends():
     assert "#allo.res_use<@builtin::@lut, [<const, [2.470000e+02]>]>" in text
 
 
+# A cost is a SUM of product terms, so a measured shape that is a sum can be
+# declared: an extracted chain's flip-flops are a per-bit term plus a per-stage
+# one, which no single product is. The sum is taken before rounding, so how the
+# cost was factored cannot change the answer.
+def test_a_cost_sums_the_terms_that_name_one_resource():
+    @kernel
+    def k(A: i32[8], out: i32[8]):
+        for i in range(8):
+            out[i] = A[i] + 1
+
+    dev = builtin_device.copy()
+    ff = dev.resources["ff"]
+    dev.set_chain_uses(
+        {ff: [(Const(2.0), Linear(1.0)), (Linear(1.0, base=-1.0), Const(1.0))]}
+    )
+    assert dev.price(dev.chain_uses, (64, 32))["ff"] == 2 * 32 + 64 - 1
+    # Both terms ride one `uses`, naming `@ff` twice.
+    chain = [l for l in _to_rtl(k, device=dev).dcp.splitlines() if "dcp.chain" in l]
+    assert len(chain) == 1 and chain[0].count("allo.res_use<@ff") == 2
+
+
 # The device's own evaluator, reached from Python: one implementation of the
 # measured shapes, not two. `benchmark/area.py` scores through this.
 def test_the_device_prices_a_realization_through_the_compiler():
     dev = builtin_device
     # 3 LUTs per bit of a 6-source select, over 32 bits.
     assert dev.price(dev.mux_uses, (6, 32)) == {"lut": 96}
-    # A chain past the extraction cliff is SRLs, not `depth * width` flip-flops.
-    assert dev.price(dev.chain_uses, (64, 32))["ff"] == 64
+    # A chain past the extraction cliff is SRLs plus a head and tail stage per
+    # bit, not `depth * width` flip-flops.
+    assert dev.price(dev.chain_uses, (64, 32))["ff"] == 2 * 32 + 64 - 1
     assert dev.price(dev.chain_uses, (2, 32))["ff"] == 64
     # A carry chain is a CEILING: a 9-bit adder takes two CARRY8s.
     assert dev.price(dev.comb_uses["add"], (9,)) == {"lut": 9, "carry8": 2}

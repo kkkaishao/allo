@@ -92,8 +92,21 @@ def Table(points: dict[int, float]) -> Cost:
 
 
 #: What one realization spends: ``(resource name, one cost factor per parameter
-#: of its kind)`` pairs, which is what ``#allo.res_use`` carries.
+#: of its kind)`` pairs, which is what ``#allo.res_use`` carries. One pair is
+#: one product TERM, and a resource that names several is spent their sum.
 Spend = tuple[tuple[str, tuple[Cost, ...]], ...]
+
+
+def _terms(cost: Cost | Sequence) -> tuple[tuple[Cost, ...], ...]:
+    """A ``uses`` value as product terms. A :class:`Cost`, or a sequence of one
+    per parameter, is ONE term; a sequence of those is a sum of them."""
+    if isinstance(cost, Cost):
+        return ((cost,),)
+    seq = tuple(cost)
+    if seq and isinstance(seq[0], Cost):
+        return (seq,)
+    return tuple(tuple(term) for term in seq)
+
 
 #: Every `uses` attribute built so far, keyed by the declaration it came from:
 #: pricing one design asks for the same handful of rows tens of thousands of
@@ -241,11 +254,13 @@ class Device:
         self,
         what: str,
         params: str,
-        uses: dict[Resource, Cost | Sequence[Cost]] | None,
+        uses: dict[Resource, Cost | Sequence] | None,
     ) -> Spend:
-        """``uses`` as ``(resource name, factors)`` pairs, checked against the
-        parameter tuple ``params`` of the realization's kind: one factor per
-        parameter, or the single :func:`Tiled` that reads them together."""
+        """``uses`` as ``(resource name, factors)`` pairs, one per product term,
+        checked against the parameter tuple ``params`` of the realization's
+        kind: one factor per parameter, or the single :func:`Tiled` that reads
+        them together. A resource whose value is a sequence of terms is spent
+        their sum."""
         arity = len(params.split(","))
         spent: list[tuple[str, tuple[Cost, ...]]] = []
         for resource, cost in (uses or {}).items():
@@ -253,13 +268,14 @@ class Device:
                 raise ValueError(
                     f"{resource.name!r} is not a resource of device {self.name!r}"
                 )
-            factors = (cost,) if isinstance(cost, Cost) else tuple(cost)
-            if len(factors) != (1 if factors[0].form == "tiled" else arity):
-                raise ValueError(
-                    f"{what} is characterized by ({params}), so its cost of "
-                    f"{resource.name!r} is {arity} factor(s) or one Tiled"
-                )
-            spent.append((resource.name, factors))
+            for factors in _terms(cost):
+                if len(factors) != (1 if factors[0].form == "tiled" else arity):
+                    raise ValueError(
+                        f"{what} is characterized by ({params}), so each term of "
+                        f"its cost of {resource.name!r} is {arity} factor(s) or "
+                        "one Tiled"
+                    )
+                spent.append((resource.name, factors))
         return tuple(spent)
 
     def price(self, uses: Spend, params: Sequence[int]) -> dict[str, int]:
@@ -294,7 +310,7 @@ class Device:
         write_latency: int,
         read_delay_ns: float = 0.0,
         write_delay_ns: float = 0.0,
-        uses: dict[Resource, Cost | Sequence[Cost]] | None = None,
+        uses: dict[Resource, Cost | Sequence] | None = None,
     ) -> Storage:
         """Declare a storage realization and return the handle ``bind_storage``
         and :meth:`set_default_storage` refer to.
@@ -303,7 +319,7 @@ class Device:
         device is the normal way to build a variant, and the default, being a
         name, keeps pointing at whatever is declared under it.
 
-        Storage carries two parameters, ``(depth, width)``, so a ``uses`` entry
+        Storage carries two parameters, ``(depth, width)``, so a ``uses`` term
         is a pair of costs, or the single :func:`Tiled` that reads them
         together.
         """
@@ -326,7 +342,7 @@ class Device:
         return s
 
     def set_storage_uses(
-        self, name: str, uses: dict[Resource, Cost | Sequence[Cost]]
+        self, name: str, uses: dict[Resource, Cost | Sequence]
     ) -> Device:
         """What one storage realization spends, over ``(depth, width)``. Apart
         from :meth:`add_storage` so that a device's timing and its area can be
@@ -379,7 +395,7 @@ class Device:
         self,
         kind: CombKind,
         delay_ns: float,
-        uses: dict[Resource, Cost] | None = None,
+        uses: dict[Resource, Cost | Sequence] | None = None,
     ) -> Device:
         """Set the combinational chaining delay (ns) of a native operator kind,
         and optionally what one instance of it spends. A comb kind carries ONE
@@ -395,7 +411,9 @@ class Device:
             )
         return self
 
-    def set_operator_uses(self, operator: IP, uses: dict[Resource, Cost]) -> Device:
+    def set_operator_uses(
+        self, operator: IP, uses: dict[Resource, Cost | Sequence]
+    ) -> Device:
         """What one instance of an operator IP spends. Its parameter is the
         operand width, as a native operator kind's is, even though the IP's
         signature already fixes that width: the arity follows the realization's
@@ -409,12 +427,12 @@ class Device:
         )
         return self
 
-    def set_mux_uses(self, uses: dict[Resource, Sequence[Cost]]) -> Device:
+    def set_mux_uses(self, uses: dict[Resource, Sequence]) -> Device:
         """What one select over ``k`` sources of ``width`` bits spends."""
         self.mux_uses = self._spend("a multiplexer", "fan-in, width", uses)
         return self
 
-    def set_chain_uses(self, uses: dict[Resource, Sequence[Cost]]) -> Device:
+    def set_chain_uses(self, uses: dict[Resource, Sequence]) -> Device:
         """What one ``depth``-stage, ``width``-bit value delay chain spends."""
         self.chain_uses = self._spend("a delay chain", "depth, width", uses)
         return self

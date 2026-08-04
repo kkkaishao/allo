@@ -204,10 +204,11 @@ def StallContractAttr : EnumAttr<Allo_Dialect, StallContractEnum, "stall">;
 // realization's kind carries (an operator's operand width, a multiplexer's
 // fan-in and width, a delay chain's depth and width).
 //
-// Each form is a function of ONE parameter, and a multi-parameter cost is the
-// PRODUCT of one form per parameter (see `ResourceUse`). That keeps the
-// evaluator a one-parameter switch and still covers every measured shape:
-// `0.4*k` per bit is linear in k times linear in width.
+// Each form is a function of ONE parameter, a multi-parameter term is the
+// PRODUCT of one form per parameter, and a cost is the SUM of the terms naming
+// one resource (see `ResourceUse`). That keeps the evaluator a one-parameter
+// switch and still covers every measured shape: `0.4*k` per bit is linear in k
+// times linear in width, and a sum of two such terms is a sum.
 //===----------------------------------------------------------------------===//
 
 // c
@@ -263,14 +264,22 @@ def CostAttr : Allo_Attr<"Cost"> {
 
 def ResourceUseAttr : Allo_Attr<"ResourceUse"> {
   let mnemonic = "res_use";
-  let summary = "How much of one resource a realization spends";
+  let summary = "One term of what a realization spends of one resource";
   let description = [{
     `factors` holds one cost per parameter of the realization's kind, and the
-    amount spent is their PRODUCT: factor `i` is evaluated at parameter `i`.
+    term's value is their PRODUCT: factor `i` is evaluated at parameter `i`.
     A one-parameter kind carries one factor.
 
-    A `tiled` factor is the exception and stands alone whatever the kind's
-    arity, because it consumes the whole tuple at once.
+    A resource may be named by SEVERAL entries of one `uses`, and what it spends
+    is their SUM, so a cost is a sum of products: a polynomial in the
+    realization's parameters, in a basis the forms below span. One product is
+    not enough because measured shapes are not all separable: a delay chain's
+    `2*width + depth - 1` flip-flops are a per-bit term plus a per-stage term,
+    and no product of one factor per parameter is a sum. Summing costs nothing
+    else, since the forms, the arity rule and the evaluator are unchanged.
+
+    A `tiled` factor is the exception to the arity rule and stands alone
+    whatever the kind's arity, because it consumes the whole tuple at once.
   }];
   let parameters = (ins
     "mlir::SymbolRefAttr":$resource,

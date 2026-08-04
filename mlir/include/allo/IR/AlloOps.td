@@ -481,8 +481,9 @@ def DCPathOperatorOp : DCPath_Op<"dcp.operator",
     with. Combinational ops do NOT get a `dcp.operator`; they take the
     `dcp.compute` `comb_kind` path, with their chaining delay in `dcp.device`.
 
-    `uses` holds one `#allo.res_use` per resource the IP core spends, over ONE
-    parameter, an operand width, exactly as `dcp.comb`'s is. `signature` already
+    `uses` prices the IP core over ONE parameter, an operand width, exactly as
+    `dcp.comb`'s does: one `#allo.res_use` per term and a resource's cost the
+    sum of its terms. `signature` already
     pins the widths, so in practice every factor is a `const` and the parameter
     is never read; the arity still follows the realization's kind, because one
     rule the verifier and the evaluator both switch on is worth more than the
@@ -533,8 +534,9 @@ def DCPathCombOp : DCPath_Op<"dcp.comb",
     kind (`add`/`sub`/`cmp`/...), coarser than a `dcp.compute`'s `comb_kind`
     because a device characterizes "an integer add", not `addi` against `subi`.
 
-    `uses` holds one `#allo.res_use` per resource, each a cost over ONE
-    parameter: an operand width.
+    `uses` prices it over ONE parameter, an operand width: one
+    `#allo.res_use` per term, and what a resource costs is the sum of the terms
+    naming it.
   }];
   let arguments = (ins StrAttr:$kind, F32Attr:$delay, OptionalAttr<ArrayAttr>:$uses);
   let assemblyFormat = "$kind `delay` `=` $delay (`uses` $uses^)? attr-dict";
@@ -565,9 +567,10 @@ def DCPathStorageOp : DCPath_Op<"dcp.storage",
     comes from its own `allo.bind.storage type=`, so this is declared and not
     yet read, the way `uses` is.
 
-    `uses` holds one `#allo.res_use` per resource. Storage carries TWO
-    parameters, `(depth, width)`, so a cost is either two factors or the single
-    `tiled` factor that reads the pair together.
+    `uses` carries one `#allo.res_use` per term, and what a resource costs is
+    the sum of the terms naming it. Storage carries TWO parameters,
+    `(depth, width)`, so a term is either two factors or the single `tiled`
+    factor that reads the pair together.
   }];
   let arguments = (ins
     SymbolNameAttr:$sym_name,
@@ -594,7 +597,7 @@ def DCPathMuxOp : DCPath_Op<"dcp.mux",
     between: a multiplexer is the one structure the emitter builds for a select.
 
     `uses` is over TWO parameters, `(k, width)`. The measured cost is a fan-in
-    curve per bit times the width, which is exactly the product a `uses` is.
+    curve per bit times the width, so it is one term.
   }];
   let arguments = (ins ArrayAttr:$uses);
   let assemblyFormat = "`uses` $uses attr-dict";
@@ -613,7 +616,9 @@ def DCPathChainOp : DCPath_Op<"dcp.chain",
     `uses` is over TWO parameters, `(depth, width)`. Past a measured depth the
     synthesizer stops building flip-flops and extracts a shift register, which
     is the cliff the `step` form exists for, so a device that extracts declares
-    a step and one that does not declares a plain product.
+    a step and one that does not declares a plain product. An extracted chain
+    is also why a cost is a SUM of terms: its flip-flops are a per-bit term
+    plus a per-stage one, which no single product is.
   }];
   let arguments = (ins ArrayAttr:$uses);
   let assemblyFormat = "`uses` $uses attr-dict";

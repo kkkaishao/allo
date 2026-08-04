@@ -214,22 +214,38 @@ def declare_xcu55c_area(device: "Device") -> None:
     # --- the value delay chain, over (depth, width) -------------------------
     # Past the extraction threshold a chain stops being flip-flops: it becomes
     # `width` SRL sites per 32 stages, plus one LUT per bit of addressing and
-    # output multiplexing, plus the head and tail stages. That cliff is what
-    # `Step` is for, and it is the single largest disagreement between the
-    # scheduling objective's register term (`depth * width` flip-flops) and the
-    # part.
+    # output multiplexing, plus a head and a tail stage per bit and one more
+    # flip-flop per stage. That cliff is what `Step` is for, and it is the
+    # single largest disagreement between the scheduling objective's register
+    # term (`depth * width` flip-flops) and the part.
     #
-    # Two terms of P7's measurement do NOT survive the translation, and both are
-    # under-counts. A cost is one factor per parameter multiplied together, and
-    # (a) the extracted chain's `2*width + depth - 1` flip-flops are a SUM of a
-    # per-bit and a per-stage term, which no product is, so only the `2*width`
-    # is declared; (b) a chain narrower than eight bits is left in flip-flops
-    # whatever its depth, and that is a second cliff on the OTHER parameter,
-    # which a factor over depth cannot see. Fixing either needs a cost over the
-    # whole tuple, which is what `Tiled` is and what nothing else is.
+    # The flip-flops are what makes a cost a SUM of terms rather than one
+    # product: `2*width + depth - 1` is a per-bit term plus a per-stage one, and
+    # no product of a factor over depth by a factor over width is a sum. The
+    # per-stage term needs two of them, because a term PROPORTIONAL to depth
+    # cannot also be GATED on depth (a `Step`'s upper arm is a constant), so the
+    # gate is a second term subtracting the same thing back over the three
+    # depths where the chain is still flip-flops.
+    per_stage = [
+        (Linear(1.0, base=-1.0), Const(1.0)),
+        (
+            Table(
+                {d: float(1 - d) for d in range(1, SRL_MIN_DEPTH)}
+                | {SRL_MIN_DEPTH: 0.0}
+            ),
+            Const(1.0),
+        ),
+    ]
+    # One term of P7's measurement still does NOT survive, and it is an
+    # UNDER-count: a chain narrower than eight bits is left in flip-flops
+    # whatever its depth, and that is a cliff on the OTHER parameter, so no
+    # product of per-parameter factors and no sum of them can express it. A
+    # disjunction over two parameters is not a polynomial. It would take a cost
+    # that reads the whole tuple, which is what `Tiled` is and what nothing
+    # else is.
     device.set_chain_uses(
         {
-            ff: (Step(SRL_MIN_DEPTH, 1.0, 2.0), Linear(1.0)),
+            ff: [(Step(SRL_MIN_DEPTH, 1.0, 2.0), Linear(1.0))] + per_stage,
             lut: (Step(SRL_MIN_DEPTH, 0.0, 1.0), Linear(1.0)),
             slicem: (Table(SRL_SITES_PER_BIT), Linear(1.0)),
         }
