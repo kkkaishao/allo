@@ -272,11 +272,13 @@ struct DatapathEmitter {
   DenseMap<unsigned, SmallVector<SharedWrite, 2>> sharedWrites; // by MemId
 
   /// Which of the array's write ports each access is coloured onto
-  /// (`Datapath::writePortColouring`). An array is absent when the colouring
-  /// refused it, and when it presents no single addressable write port to
-  /// colour: an external, scattered or skewed one, or one a dynamically banked
-  /// store drives every bank of behind a demux. Held because the colouring is a
-  /// clique search and every store would otherwise redo it.
+  /// (`Datapath::writePortColouring`), indexed as `MemUnit::accesses`. Present
+  /// with an EMPTY vector for an array only a child writes, whose writes still
+  /// share port 0. An array is absent when the colouring refused it, and when
+  /// it presents no single addressable write port to colour: an external or
+  /// skewed one, or one a dynamically banked store drives every bank of behind
+  /// a demux. Held because the colouring is a clique search and every store
+  /// would otherwise redo it.
   DenseMap<unsigned, SmallVector<unsigned>> writePortOf; // by MemId
 
   /// A kernel-local channel's body wires: what a boundary channel reads off its

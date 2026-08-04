@@ -435,20 +435,27 @@ Datapath::portGraph(MemId id, bool writesOnly,
     RegionId top, region;
     unsigned residue;
     int call; // CallId, or -1 for a region-local access
+    int bank; // the bank it commits to, or -1 when it may reach any
+  };
+  // A skew records a SLOT in `staticBank`, and two slots rotate onto one bank,
+  // so only an unskewed array's index names the memory an access reaches.
+  auto bankOf = [&](std::optional<unsigned> b) {
+    return m.skewed || !b ? -1 : int(*b);
   };
   llvm::SmallVector<Writer> ws;
   for (auto [i, acc] : llvm::enumerate(m.accesses))
     if (acc.isWrite || !writesOnly) {
       unsigned ii = regions[acc.region].ii.value_or(0);
       unsigned start = dcpStart(acc.op);
-      ws.push_back(
-          {topOf(acc.region), acc.region, ii ? start % ii : start, -1});
+      ws.push_back({topOf(acc.region), acc.region, ii ? start % ii : start, -1,
+                    bankOf(acc.staticBank)});
       accessOf.push_back(i);
     }
   for (const CallUnit &cu : calls)
     for (const CallUnit::MemArg &ma : cu.memArgs)
       if (ma.mem == id && (ma.isWrite || !writesOnly)) {
-        ws.push_back({topOf(cu.region), cu.region, 0, int(cu.id)});
+        ws.push_back(
+            {topOf(cu.region), cu.region, 0, int(cu.id), bankOf(ma.bank)});
         accessOf.push_back(kNoWritePort);
       }
   // The bitsets are 64 wide. Above that the relation is not built and every
@@ -469,6 +476,10 @@ Datapath::portGraph(MemId id, bool writesOnly,
     }
   };
   auto overlaps = [&](const Writer &a, const Writer &b) {
+    // A bank is its own `seq.hlmem`, so two accesses that name different ones
+    // contend for nothing however they are scheduled.
+    if (a.bank >= 0 && b.bank >= 0 && a.bank != b.bank)
+      return false;
     if (a.top != b.top)
       return false;
     if (a.call >= 0 && b.call >= 0)
@@ -501,7 +512,7 @@ unsigned Datapath::portsNeeded(MemId id, bool writesOnly) const {
   return maxClique(adj, all, /*excluded=*/0, /*depth=*/0, budget);
 }
 
-llvm::SmallVector<unsigned>
+std::optional<llvm::SmallVector<unsigned>>
 Datapath::writePortColouring(MemId id, unsigned maxPorts) const {
   const MemUnit &m = mems[id];
   llvm::SmallVector<unsigned> accessOf;
@@ -509,7 +520,7 @@ Datapath::writePortColouring(MemId id, unsigned maxPorts) const {
       portGraph(id, /*writesOnly=*/true, accessOf);
   unsigned n = accessOf.size();
   if (adj.size() != n)
-    return {}; // no relation to colour over
+    return std::nullopt; // no relation to colour over
 
   // Greedy in vertex order, taking the lowest port no neighbour holds.
   llvm::SmallVector<unsigned> colour(n, 0);
@@ -523,7 +534,7 @@ Datapath::writePortColouring(MemId id, unsigned maxPorts) const {
     used = std::max(used, colour[i] + 1);
   }
   if (used > maxPorts)
-    return {};
+    return std::nullopt;
 
   // Splitting the writes across ports only orders a simultaneous pair if the
   // scheduler already proved it addresses different words, which it does inside
@@ -536,11 +547,11 @@ Datapath::writePortColouring(MemId id, unsigned maxPorts) const {
           continue;
         if (accessOf[i] == kNoWritePort || accessOf[j] == kNoWritePort ||
             m.accesses[accessOf[i]].region != m.accesses[accessOf[j]].region)
-          return {};
+          return std::nullopt;
       }
-  // Every surviving edge joins two accesses of one region at one modulo
-  // residue, an equivalence, so the graph is a disjoint union of cliques and
-  // greedy colouring is exact.
+  // Every surviving edge joins two accesses of one region, one bank and one
+  // modulo residue, an equivalence, so the graph is a disjoint union of cliques
+  // and greedy colouring is exact.
   assert(used == portsNeeded(id, /*writesOnly=*/true) &&
          "the colouring must use as many ports as the model demands");
 

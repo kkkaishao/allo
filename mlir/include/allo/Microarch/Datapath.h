@@ -851,12 +851,14 @@ struct Datapath {
   /// A diagnostic, not an IR attribute or a manifest field.
   void reportAllocation() const;
 
-  /// The fewest ports memory \p id can be built with: the largest set of its
-  /// accesses that can issue in ONE cycle, counting a child's port as an
-  /// access. With \p writesOnly, only writes are counted, which is the budget a
-  /// RAM's write ports are checked against; otherwise every access counts,
-  /// which is what a RAM PORT actually serves (a port reads OR writes in a
-  /// cycle, so two writers plus a concurrent reader need three).
+  /// The fewest ports ONE BANK of memory \p id can be built with: the largest
+  /// set of its accesses that can issue in one cycle, counting a child's port
+  /// as an access. Per bank, since a bank is its own `seq.hlmem` and accesses
+  /// naming different ones never contend. With \p writesOnly, only writes are
+  /// counted, which is the budget a RAM's write ports are checked against;
+  /// otherwise every access counts, which is what a RAM PORT actually serves (a
+  /// port reads OR writes in a cycle, so two writers plus a concurrent reader
+  /// need three).
   ///
   /// Conservative in the safe direction. Only an ordering the model already
   /// proves separates a pair: two top-level regions touching one array are
@@ -870,18 +872,19 @@ struct Datapath {
   /// `MemUnit::accesses` and `kNoWritePort` at a read: a colouring of the very
   /// relation `portsNeeded` takes its clique over, so it uses exactly that many
   /// ports. A CALL's write, which this does not index, always lands on port 0.
+  /// The result is empty, rather than absent, for an array only calls touch.
   ///
-  /// Empty when the writes cannot be redistributed and each keeps its own port,
-  /// for any of three reasons: `portGraph` declined to relate them, they need
-  /// more than \p maxPorts, which the caller sets from what its device can
+  /// Absent when the writes cannot be redistributed and each keeps its own
+  /// port, for any of three reasons: `portGraph` declined to relate them, they
+  /// need more than \p maxPorts, which the caller sets from what its device can
   /// build, or a simultaneous pair is not PROVEN to address different words.
   /// Writes on different ports must be, having no shared block to order them,
   /// and only a pair inside one region is proven: a memory dependence there
   /// would have made the scheduler separate the two by a cycle, a store's SDC
   /// row carrying its write latency of 1. A call's pair, or one under a
   /// concurrent container, is related by nothing and refuses the colouring.
-  llvm::SmallVector<unsigned> writePortColouring(MemId id,
-                                                 unsigned maxPorts) const;
+  std::optional<llvm::SmallVector<unsigned>>
+  writePortColouring(MemId id, unsigned maxPorts) const;
 
   /// No write port applies: `writePortColouring`'s entry for an access that is
   /// not a write, and `portGraph`'s for a vertex that is a call's port rather

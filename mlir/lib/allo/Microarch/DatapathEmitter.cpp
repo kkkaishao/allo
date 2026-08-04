@@ -445,14 +445,14 @@ void DatapathEmitter::createInternalMemories() {
           c.b.getArrayAttr(fields));
       continue;
     }
-    // Stores that provably never issue together share a write port. A
-    // scattered or skewed array presents no single addressable port, and a
-    // dynamically banked store drives every bank behind a demux, so neither has
-    // a port to be coloured onto. Two ports is the ceiling because a true dual
-    // port is what infers: at three the RAM inference fails outright, so a
-    // third colour would buy nothing and still cost its address and data muxes.
-    SmallVector<unsigned> ports;
-    if (!m.scattered && !m.skewed &&
+    // Stores that provably never issue together share a write port. A skewed
+    // array presents no single addressable port, and a dynamically banked store
+    // drives every bank behind a demux, so neither has a port to be coloured
+    // onto. Two ports is the ceiling because a true dual port is what infers:
+    // at three the RAM inference fails outright, so a third colour would buy
+    // nothing and still cost its address and data muxes.
+    std::optional<SmallVector<unsigned>> ports;
+    if (!m.skewed &&
         llvm::all_of(m.accesses, [](const uarch::MemUnit::Access &a) {
           return !a.isWrite || a.staticBank;
         }))
@@ -465,7 +465,7 @@ void DatapathEmitter::createInternalMemories() {
       // The colouring is exactly the promise the lowering needs to describe
       // each port in its own `always` block, and so to infer a true dual port.
       // A port per static write instead drops the array into a register file.
-      if (!ports.empty())
+      if (ports)
         mem->setAttr(kIndependentWritesAttr, c.b.getUnitAttr());
       // An initialized array the kernel also WRITES is a real memory that
       // merely starts with contents. `seq.hlmem` carries no initializer, so the
@@ -477,8 +477,8 @@ void DatapathEmitter::createInternalMemories() {
       banks.push_back(mem.getHandle());
     }
     memBanks[m.id] = std::move(banks);
-    if (!ports.empty())
-      writePortOf[m.id] = std::move(ports);
+    if (ports)
+      writePortOf[m.id] = std::move(*ports);
   }
 }
 

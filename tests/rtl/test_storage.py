@@ -1619,7 +1619,7 @@ def test_a_multidimensional_container_local_buffer():
         s5_post(tmp, out)
 
     mod = _to_rtl(s5_top)
-    assert "seq.hlmem @tmp %0, %rst : <16xi32>" in mod.mlir
+    assert re.search(r"seq\.hlmem @tmp %0, %rst[^\n]* : <16xi32>", mod.mlir)
     out = np.zeros(16, np.int32)
     o1 = np.zeros(1, np.int32)
     mod.cosim(out, o1)
