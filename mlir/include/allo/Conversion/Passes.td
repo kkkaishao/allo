@@ -16,11 +16,22 @@ def ConvertAlloToFuncPass : Pass<"convert-allo-to-func"> {
 def LowerHLMemPass : Pass<"allo-lower-hlmem", "circt::hw::HWModuleOp"> {
   let summary = "Lower seq.hlmem and its ports onto an sv.reg array";
   let description = [{
-    Replaces CIRCT's `lower-seq-hlmem`, which materializes every write of a
-    memory inside one `always_ff` and so cannot describe a port per `always`
-    block, the only shape a true-dual-port block RAM infers from. Also gives the
-    array its power-on contents, which the memory carries and the lowering would
-    otherwise erase.
+    Replaces each `seq.hlmem` with an `sv.reg` array: a read port becomes a
+    combinational read registered to its latency, with the address delayed for
+    all but the last cycle; a write port becomes a guarded assignment in an
+    `always_ff`. The memory's power-on contents (`allo.mem.init`) are written
+    into the register through an `initial` block, with BLOCKING assignments,
+    which is what synthesis reads back as a block-RAM INIT.
+
+    The write ports share ONE always block unless the memory carries
+    `allo.mem.independent_writes`, the emitter's promise that no two of them
+    write one word in the same cycle. Sharing a block is what makes a
+    same-address collision last-writer-wins rather than a race; a block per port
+    is the only shape a Xilinx true dual port infers from, measured at 512x32 as
+    one BRAM36 against 43,361 LUTs.
+
+    Replaces CIRCT's `lower-seq-hlmem`, which puts every write in one block and
+    so cannot describe the second shape.
   }];
   let dependentDialects = [
     "circt::hw::HWDialect", "circt::sv::SVDialect", "circt::seq::SeqDialect"

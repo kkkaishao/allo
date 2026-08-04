@@ -3,25 +3,6 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-//===----------------------------------------------------------------------===//
-// Lower `seq.hlmem` and the ports referring to it onto an `sv.reg` array.
-//
-// Ported from CIRCT's `lower-seq-hlmem`, which this tree used until the write
-// half had to change. That pass materializes EVERY write of a memory inside one
-// `always_ff`, so an array with two writers becomes a register file with a
-// priority multiplexer in front of every word: no Xilinx template infers a
-// block RAM from it, and measured at 512x32 the difference is one BRAM36
-// against 43,361 LUTs. A true dual port infers only when each port is described
-// in its own block, which is a shape the upstream pass cannot express.
-//
-// Owning the lowering also folds in the two passes that used to bracket it. A
-// memory's power-on contents live on the `seq.hlmem`, which the lowering
-// erases, and belong in the `sv.reg` the lowering creates, so they used to ride
-// out onto the enclosing module as an attribute and be matched back by NAME
-// afterwards. Here the register is in hand, and the initializer is written
-// straight into it.
-//===----------------------------------------------------------------------===//
-
 #include "allo/Conversion/Passes.h"
 #include "allo/IR/AlloOps.h" // kMemoryInitAttr, kIndependentWritesAttr
 
@@ -46,9 +27,6 @@ namespace {
 void lowerMemory(seq::HLMemOp mem) {
   hw::UnpackedArrayType arrayTy = hw::UnpackedArrayType::get(
       mem.getMemType().getElementType(), mem.getMemType().getShape()[0]);
-  // Only the ports may hold an `!seq.hlmem` handle, so a user is one or the
-  // other; both invariants below hold for every producer in this tree, the
-  // datapath emitter and CIRCT's own FIFO lowering.
   assert(mem.getMemType().getShape().size() == 1 &&
          "an hlmem is emitted one dimensional");
   SmallVector<seq::ReadPortOp> reads;
@@ -69,10 +47,8 @@ void lowerMemory(seq::HLMemOp mem) {
   StringRef name = mem.getName();
   Value array = sv::RegOp::create(b, loc, arrayTy, mem.getNameAttr());
 
-  // The power-on contents. The assignments are BLOCKING, which is what a
-  // simulator starts the array from and what synthesis reads back as a
-  // block-RAM INIT; non-blocking ones still simulate, so nothing but the
-  // emitted text catches the difference.
+  // BLOCKING assignments: only those does synthesis read back as a block-RAM
+  // INIT, and only the emitted text tells the two apart.
   if (auto init = mem->getAttrOfType<ArrayAttr>(kMemoryInitAttr)) {
     assert(init.size() == arrayTy.getNumElements() &&
            "an initializer must cover exactly the declared words");
@@ -103,21 +79,16 @@ void lowerMemory(seq::HLMemOp mem) {
           }
         });
   };
-  // A block PER PORT once the memory promises no two ports write one word at
-  // once, which is the shape a true dual port infers from and the reason this
-  // pass exists: at 512x32 it is one BRAM36 against 43,361 LUTs. Sharing one
-  // block is what makes a same-address collision last-writer-wins rather than a
-  // race, so without the promise every write stays in it, as upstream had it.
+  // A block per port only where the memory promises the ports never collide:
+  // sharing one is what orders a same-address collision.
   if (writes.size() > 1 && mem->hasAttr(kIndependentWritesAttr))
     for (seq::WritePortOp write : writes)
       emitBlock(write);
   else
     emitBlock(writes);
 
-  // The reads. A latency above one delays the ADDRESS for all but the last
-  // cycle and registers the datum for that one, so the combinational read never
-  // starts a critical path. A read enable is not modelled, which is upstream's
-  // behaviour too and is why a FIFO's `rdEn` reaches here and is dropped.
+  // A read enable is not modelled, so a FIFO's `rdEn` reaches here and is
+  // dropped.
   for (auto [i, read] : llvm::enumerate(reads)) {
     OpBuilder rb(read);
     rb.setInsertionPointAfter(read);
