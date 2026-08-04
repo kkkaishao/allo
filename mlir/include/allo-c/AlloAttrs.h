@@ -67,8 +67,8 @@ MLIR_CAPI_EXPORTED MlirAttribute alloAssumeDepDirAttrGet(MlirContext ctx,
 MLIR_CAPI_EXPORTED uint32_t alloAssumeDepDirAttrGetValue(MlirAttribute attr);
 MLIR_CAPI_EXPORTED MlirTypeID alloAssumeDepDirAttrGetTypeID(void);
 
-// MemoryImplAttr (#allo<mem_impl ...>): 0=Auto 1=Register 2=LUTRAM 3=BRAM
-// 4=URAM.
+// MemoryImplAttr (#allo<mem_impl ...>): 1=Register 2=LUTRAM 3=BRAM 4=URAM.
+// There is no 0: an unbound array carries no implementation at all.
 MLIR_CAPI_EXPORTED bool alloAttributeIsAMemoryImpl(MlirAttribute attr);
 MLIR_CAPI_EXPORTED MlirAttribute alloMemoryImplAttrGet(MlirContext ctx,
                                                        uint32_t value);

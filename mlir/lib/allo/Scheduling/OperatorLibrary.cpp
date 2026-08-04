@@ -313,10 +313,7 @@ MemoryLibrary memoryFromDevice(dcp::DCPathDeviceOp device) {
     auto impl = symbolizeMemoryImplEnum(na.getName().strref());
     if (!impl)
       continue;
-    MemPrimitive p;
-    p.impl = *impl;
-    p.timing = timing(cast<DictionaryAttr>(na.getValue()));
-    m.primitives.push_back(p);
+    m.primitives.push_back({*impl, timing(cast<DictionaryAttr>(na.getValue()))});
   }
   if (DictionaryAttr fifo = device.getFifoAttr())
     m.fifo = timing(fifo);
@@ -471,8 +468,10 @@ OperatorChar OperatorLibrary::lookup(Operation *op) const {
                   : kind == OpKind::MemWrite   ? "mem.wr"
                   : kind == OpKind::StreamRead ? "srm.rd"
                                                : "srm.wr");
-    if (kind == OpKind::MemRead || kind == OpKind::MemWrite)
-      c.typeName += stringifyMemoryImplEnum(t.impl).str();
+    if (kind == OpKind::MemRead || kind == OpKind::MemWrite) {
+      assert(t.impl && "an array access resolves to a storage implementation");
+      c.typeName += stringifyMemoryImplEnum(*t.impl).str();
+    }
     c.latency = t.latency;
     c.inDelay = c.outDelay = t.delay;
     // The address cone is no operation of its own, so no dependence carries its

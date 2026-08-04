@@ -61,12 +61,12 @@ static AttrT carrierAttr(Value memRef, StringRef name) {
 // The three orthogonal axes of an `allo.bind.storage` directive, mapped from
 // its `type` string (port topology + RAM/ROM) and `impl` string (storage
 // primitive). An ABSENT `type` is the dual-port RAM default and an absent
-// `impl` is `Auto`, the library's default implementation.
+// `impl` is an absent CHOICE, resolved against the library's default.
 namespace {
 struct BindStorage {
   MemoryPortEnum port = MemoryPortEnum::TrueDualPort;
   MemoryKindEnum kind = MemoryKindEnum::RAM;
-  MemoryImplEnum impl = MemoryImplEnum::Auto;
+  std::optional<MemoryImplEnum> impl;
 };
 } // namespace
 
@@ -104,7 +104,7 @@ static BindStorage parseBindStorage(DictionaryAttr bind) {
             .Default(std::nullopt);
     assert(impl && "unknown allo.bind.storage impl= (the frontend's "
                    "BindStorageImpl vocabulary drifted from this switch)");
-    bs.impl = impl.value_or(MemoryImplEnum::Auto);
+    bs.impl = impl;
   }
   return bs;
 }
@@ -148,7 +148,7 @@ static MemoryImplEnum resolveImpl(Value memRef, MemoryImplEnum defaultImpl) {
     return MemoryImplEnum::Register;
   auto bs =
       parseBindStorage(carrierAttr<DictionaryAttr>(memRef, kBindStorageAttr));
-  return bs.impl != MemoryImplEnum::Auto ? bs.impl : defaultImpl;
+  return bs.impl.value_or(defaultImpl);
 }
 
 void MemoryBankModel::observe(Operation *op) {
@@ -654,19 +654,20 @@ MemKindTiming MemoryLibrary::timing(MemoryImplEnum impl) const {
   for (const MemPrimitive &p : primitives)
     if (p.impl == impl)
       return p.timing;
-  // Only a stream (Auto) is legitimately zero. A concrete impl reaching here is
-  // a storage kind the device declares no timing for, which would then be
-  // scheduled at latency 0.
-  assert(impl == MemoryImplEnum::Auto &&
+  // `PreVerification` rejects an array resolving to an implementation the
+  // device does not declare, so reaching here means that check was bypassed and
+  // the access would schedule at latency 0.
+  assert(false &&
          "storage impl not declared by the device -> silent latency-0 access");
   static constexpr MemKindTiming zero;
   return zero;
 }
 
-MemoryImplEnum MemoryLibrary::resolvedImpl(Operation *op) const {
+std::optional<MemoryImplEnum>
+MemoryLibrary::resolvedImpl(Operation *op) const {
   auto a = asMemAccess(op);
   if (!a || a->kind == AccessKind::Stream)
-    return MemoryImplEnum::Auto;
+    return std::nullopt;
   return resolveImpl(a->root, defaultImpl);
 }
 
@@ -679,10 +680,12 @@ MemoryLibrary::Timing MemoryLibrary::timing(Operation *op) const {
   auto a = asMemAccess(op);
   if (!a)
     return {};
-  MemoryImplEnum impl = a->kind == AccessKind::Stream
-                            ? MemoryImplEnum::Auto
-                            : resolveImpl(a->root, defaultImpl);
-  MemKindTiming t = a->kind == AccessKind::Stream ? fifo : timing(impl);
+  // A stream is a FIFO, not array storage: it has no implementation to resolve
+  // and is timed by its own row.
+  std::optional<MemoryImplEnum> impl;
+  if (a->kind != AccessKind::Stream)
+    impl = resolveImpl(a->root, defaultImpl);
+  MemKindTiming t = impl ? timing(*impl) : fifo;
   return a->isWrite ? Timing{t.latency.write, t.delay.write, impl}
                     : Timing{t.latency.read, t.delay.read, impl};
 }

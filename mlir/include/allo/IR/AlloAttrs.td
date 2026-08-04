@@ -83,14 +83,18 @@ def AssumeDepDirAttr : EnumAttr<Allo_Dialect, AssumeDepDirEnum, "dep_dir">;
 // orthogonal: implementation primitive, port topology, and read-only-ness.
 //===----------------------------------------------------------------------===//
 
-def MemImplAuto     : I32EnumAttrCase<"Auto", 0, "auto">;
+// Every case is a REALIZABLE primitive. "Unbound" is not one of them: an array
+// with no `allo.bind.storage impl=` is an absent choice, carried as an empty
+// optional and resolved against the device's `default_memory`, and an access
+// with no storage axis at all (a stream) is likewise empty rather than a case
+// here.
 def MemImplRegister : I32EnumAttrCase<"Register", 1, "register">;
 def MemImplLUTRAM   : I32EnumAttrCase<"LUTRAM", 2, "lutram">;
 def MemImplBRAM     : I32EnumAttrCase<"BRAM", 3, "bram">;
 def MemImplURAM     : I32EnumAttrCase<"URAM", 4, "uram">;
 def MemoryImplEnum : I32EnumAttr<"MemoryImplEnum",
     "Storage implementation primitive a memref is bound to",
-    [MemImplAuto, MemImplRegister, MemImplLUTRAM, MemImplBRAM, MemImplURAM]> {
+    [MemImplRegister, MemImplLUTRAM, MemImplBRAM, MemImplURAM]> {
   let cppNamespace = "mlir::allo";
   let genSpecializedAttr = 0;
 }

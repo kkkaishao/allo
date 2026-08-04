@@ -63,7 +63,7 @@ struct MemKindTiming {
 /// One row of the `primitives:` table: the read/write timing of a storage
 /// implementation (register/LUTRAM/BRAM/URAM).
 struct MemPrimitive {
-  MemoryImplEnum impl = MemoryImplEnum::Auto;
+  MemoryImplEnum impl;
   MemKindTiming timing;
 };
 
@@ -74,24 +74,27 @@ public:
   struct Timing {
     unsigned latency = 0;
     double delay = 0.0;
-    // The accessed array's resolved storage implementation (Auto for a stream).
-    // Accesses of different implementations must map to *different* operator
-    // types, or they collapse onto one latency, so this keys the type.
-    MemoryImplEnum impl = MemoryImplEnum::Auto;
+    // The accessed array's resolved storage implementation, EMPTY for an access
+    // with no storage axis: a stream is a FIFO timed by its own row. Accesses
+    // of different implementations must map to *different* operator types, or
+    // they collapse onto one latency, so this keys the type.
+    std::optional<MemoryImplEnum> impl;
   };
   /// Timing for a memory/stream access op; zero latency and delay if \p op is
   /// not one. An array access is timed by its memref's implementation.
   Timing timing(Operation *op) const;
 
-  /// The timing of storage implementation \p impl, or a zero (combinational)
-  /// timing if the library declares no such primitive.
+  /// The timing of storage implementation \p impl. The device is required to
+  /// declare every implementation an array resolves to, which `PreVerification`
+  /// enforces; an undeclared one asserts here and falls to a zero
+  /// (combinational) timing.
   MemKindTiming timing(MemoryImplEnum impl) const;
 
-  /// The storage implementation an array access resolves to; `Auto` for a
-  /// stream or a non-access. Unlike `timing`, does NOT consult the primitive
-  /// table, so a caller can diagnose an undeclared implementation *before* it
-  /// falls to zero timing.
-  MemoryImplEnum resolvedImpl(Operation *op) const;
+  /// The storage implementation an array access resolves to; EMPTY for a stream
+  /// or a non-access, neither of which has that axis. Unlike `timing`, does NOT
+  /// consult the primitive table, so a caller can diagnose an undeclared
+  /// implementation *before* it falls to zero timing.
+  std::optional<MemoryImplEnum> resolvedImpl(Operation *op) const;
 
   /// Whether the device declares timing for \p impl. An array resolving to an
   /// undeclared primitive would otherwise be scheduled at latency 0 and read
