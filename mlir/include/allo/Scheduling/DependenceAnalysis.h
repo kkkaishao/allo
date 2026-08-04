@@ -6,8 +6,6 @@
 #ifndef ALLO_SCHEDULING_DEPENDENCEANALYSIS_H
 #define ALLO_SCHEDULING_DEPENDENCEANALYSIS_H
 
-#include "allo/Scheduling/RegionGraph.h"
-
 #include "circt/Analysis/DependenceAnalysis.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/Value.h"
@@ -49,14 +47,6 @@ public:
     return results[op];
   }
 
-  /// Redirect dependences of/to \p oldOp onto \p newOp (used when affine
-  /// structures are lowered to their memref/std equivalents).
-  void replaceOp(Operation *oldOp, Operation *newOp);
-
-  /// The coarse cross-region dependence graph over the whole func, built and
-  /// cached on first use. Analysis only. It does not affect scheduling.
-  const RegionGraph &getRegionGraph();
-
   /// The constant range a value is known to lie in, distilled from the
   /// `allo.assume.ssa` facts, or nullopt when no such fact constrains it.
   std::optional<AssumedRange> getAssumedRange(Value v) const {
@@ -77,7 +67,6 @@ public:
 private:
   func::FuncOp func;
   circt::analysis::MemoryDependenceResult results;
-  std::optional<RegionGraph> regionGraph;
   llvm::DenseMap<Value, AssumedRange> assumedRanges;
   llvm::SmallDenseSet<Operation *> nonPolyhedral;
 };

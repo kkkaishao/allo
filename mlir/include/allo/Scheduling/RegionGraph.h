@@ -17,11 +17,6 @@ namespace mlir::allo {
 
 enum class RegionKind { Loop, StraightLine };
 
-/// Coarse dependence kind between two regions. Memory edges distinguish
-/// RAW/WAR/WAW; streams are elastic (any same-FIFO access is ordered, but a
-/// FIFO decouples timing); SSA is an exact def-use edge.
-enum class XEdgeKind { RAW, WAR, WAW, StreamElastic, SSA };
-
 /// A scheduling region: a single region-bearing op, or a maximal run of other
 /// ops.
 struct SchedRegion {
@@ -31,24 +26,6 @@ struct SchedRegion {
   SmallVector<Operation *> ops;
 
   Operation *anchor() const { return ops.front(); }
-};
-
-/// A coarse dependence edge; `src` precedes `dst` in program order.
-struct XEdge {
-  unsigned src;
-  unsigned dst;
-  XEdgeKind kind;
-  Value root; // memref/stream root involved (null for SSA edges)
-};
-
-struct RegionGraph {
-  SmallVector<SchedRegion> regions;
-  SmallVector<XEdge> edges;
-
-  /// True iff `from` can reach `to` via a directed path of length >= 1.
-  bool reaches(unsigned from, unsigned to) const;
-  /// Two regions are concurrent iff neither reaches the other.
-  bool concurrent(unsigned a, unsigned b) const;
 };
 
 /// Partition a block into scheduling regions (loops + maximal straight-line
@@ -185,12 +162,6 @@ bool isContainerStructure(Operation &op);
 /// alongside anything else: a flat modulo schedule has one issue cadence, which
 /// a per-iteration child re-fire advancing on that child's `done` cannot share.
 bool loopBodyDecomposes(LoopLikeOpInterface loop);
-
-StringRef toString(XEdgeKind kind);
-
-/// Emit the region graph as a DOT digraph (concurrent pairs as comments).
-void printRegionGraphDot(const RegionGraph &graph, func::FuncOp func,
-                         raw_ostream &os);
 
 /// Topologically sort the synchronous call graph, as CALLSITES. Fails on a
 /// cycle, diagnosed on the callsites that form it. For a consumer that binds

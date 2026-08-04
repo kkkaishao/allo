@@ -649,17 +649,4 @@ DependenceAnalysis::DependenceAnalysis(func::FuncOp funcOp) : func(funcOp) {
 }
 
 // Retargets oldOp's dependence list and every edge sourced from it to newOp.
-void DependenceAnalysis::replaceOp(Operation *oldOp, Operation *newOp) {
-  auto it = results.find(oldOp);
-  if (it != results.end()) {
-    results[newOp] = std::move(it->second);
-    results.erase(it);
-  }
-
-  for (auto &entry : results)
-    for (auto &dep : entry.second)
-      if (dep.source == oldOp)
-        dep.source = newOp;
-}
-
 } // namespace mlir::allo

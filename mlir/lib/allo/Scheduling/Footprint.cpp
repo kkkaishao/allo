@@ -31,9 +31,8 @@ void mlir::allo::summarizeOp(Operation *op, Summary &s) {
     }
     Access &acc = s.mem[a->root];
     (a->isWrite ? acc.writes : acc.reads) = true;
-    // `footprintsDisjoint` runs the polyhedral test over an
-    // `affine::MemRefAccess`, so it needs an affine-dialect op. Every array
-    // access carries a map, so the map cannot answer this.
+    // The disjointness test runs over an `affine::MemRefAccess`, so it needs
+    // an affine-dialect op; the access map alone cannot answer it.
     if (isa<affine::AffineReadOpInterface, affine::AffineWriteOpInterface>(op))
       acc.affine.push_back(op);
     else
@@ -53,44 +52,6 @@ void mlir::allo::summarizeOp(Operation *op, Summary &s) {
       s.streams.insert(resolveRoot(operand));
     }
   }
-}
-
-bool mlir::allo::footprintsDisjoint(const Access &ai, const Access &aj) {
-  if (ai.nonAffine || aj.nonAffine)
-    return false;
-  for (Operation *a : ai.affine) {
-    for (Operation *b : aj.affine) {
-      if (!isa<affine::AffineWriteOpInterface>(a) &&
-          !isa<affine::AffineWriteOpInterface>(b))
-        continue; // read-read pairs never conflict
-      affine::MemRefAccess accA(a), accB(b);
-      if (accA.memref != accB.memref)
-        return false; // different memref (e.g. subview): cannot prove disjoint
-      // A dependence at any depth means the two may touch one element: carried
-      // by a common enclosing loop (1..n), or loop-independent (n+1, the same
-      // iteration of every common loop). Depth 1 alone misses it.
-      unsigned n = affine::getNumCommonSurroundingLoops(*a, *b);
-      for (unsigned d = 1; d <= n + 1; ++d) {
-        affine::FlatAffineValueConstraints cst;
-        auto r = affine::checkMemrefAccessDependence(
-            accA, accB, d, &cst, /*dependenceComponents=*/nullptr,
-            /*allowRAR=*/true);
-        if (r.value != affine::DependenceResult::NoDependence)
-          return false; // may access the same element
-      }
-    }
-  }
-  return true;
-}
-
-Conflict mlir::allo::footprintConflict(const Access &a, const Access &b) {
-  bool wa = a.writes, wb = b.writes;
-  bool ta = a.reads || wa, tb = b.reads || wb;
-  if (!((wa && tb) || (ta && wb)))
-    return Conflict::None; // both read-only: no ordering constraint
-  if (footprintsDisjoint(a, b))
-    return Conflict::None; // provably disjoint elements
-  return (wa && wb) ? Conflict::WAW : wa ? Conflict::RAW : Conflict::WAR;
 }
 
 //===----------------------------------------------------------------------===//

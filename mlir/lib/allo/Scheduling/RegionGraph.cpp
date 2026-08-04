@@ -5,8 +5,6 @@
 
 #include "allo/Scheduling/RegionGraph.h"
 #include "allo/IR/AlloOps.h" // kAlloAsyncAttr
-#include "allo/Scheduling/DependenceAnalysis.h"
-#include "allo/Scheduling/Footprint.h"
 #include "allo/Scheduling/LatencyModel.h"
 #include "allo/Support/Logging.h"
 
@@ -14,7 +12,6 @@
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
-#include "mlir/IR/AsmState.h"
 #include "llvm/ADT/DenseSet.h"
 
 using namespace mlir;
@@ -211,144 +208,6 @@ SmallVector<SchedRegion> mlir::allo::enumerateRegions(func::FuncOp func) {
   if (func.getFunctionBody().empty())
     return {};
   return enumerateRegions(func.getFunctionBody().front());
-}
-
-//===----------------------------------------------------------------------===//
-// Graph construction
-//===----------------------------------------------------------------------===//
-
-const RegionGraph &DependenceAnalysis::getRegionGraph() {
-  if (regionGraph)
-    return *regionGraph;
-
-  RegionGraph g;
-  g.regions = enumerateRegions(func);
-
-  // Map every op to its region.
-  DenseMap<Operation *, unsigned> opRegion;
-  for (const SchedRegion &r : g.regions)
-    for (Operation *top : r.ops)
-      top->walk([&](Operation *o) { opRegion[o] = r.id; });
-
-  // Footprint per region.
-  SmallVector<Summary> sums(g.regions.size());
-  for (const SchedRegion &r : g.regions)
-    for (Operation *top : r.ops)
-      top->walk([&](Operation *op) { summarizeOp(op, sums[r.id]); });
-
-  // Coarse memory + stream edges between sibling regions (program order i < j).
-  for (unsigned i = 0, e = g.regions.size(); i < e; ++i) {
-    for (unsigned j = i + 1; j < e; ++j) {
-      for (const auto &kv : sums[i].mem) {
-        auto it = sums[j].mem.find(kv.first);
-        if (it == sums[j].mem.end())
-          continue;
-        // A shared-root conflict is a real ordering edge only when the regions'
-        // footprints actually intersect.
-        auto c = footprintConflict(kv.second, it->second);
-        if (c == Conflict::None)
-          continue;
-        XEdgeKind kind = c == Conflict::WAW   ? XEdgeKind::WAW
-                         : c == Conflict::RAW ? XEdgeKind::RAW
-                                              : XEdgeKind::WAR;
-        g.edges.push_back({i, j, kind, kv.first});
-      }
-      for (Value s : sums[i].streams)
-        if (sums[j].streams.count(s))
-          g.edges.push_back({i, j, XEdgeKind::StreamElastic, s});
-    }
-  }
-
-  // Exact SSA def-use edges across regions (deduplicated per region pair).
-  DenseSet<std::pair<unsigned, unsigned>> ssaSeen;
-  for (const SchedRegion &r : g.regions)
-    for (Operation *top : r.ops)
-      top->walk([&](Operation *op) {
-        for (Value operand : op->getOperands()) {
-          auto *def = operand.getDefiningOp();
-          if (!def)
-            continue;
-          auto it = opRegion.find(def);
-          if (it == opRegion.end() || it->second == r.id)
-            continue;
-          if (ssaSeen.insert({it->second, r.id}).second)
-            g.edges.push_back({it->second, r.id, XEdgeKind::SSA, Value()});
-        }
-      });
-
-  regionGraph = std::move(g);
-  return *regionGraph;
-}
-
-//===----------------------------------------------------------------------===//
-// Reachability / concurrency
-//===----------------------------------------------------------------------===//
-
-bool RegionGraph::reaches(unsigned from, unsigned to) const {
-  SmallVector<unsigned> stack{from};
-  DenseSet<unsigned> seen{from};
-  while (!stack.empty()) {
-    unsigned cur = stack.pop_back_val();
-    for (const XEdge &e : edges) {
-      if (e.src != cur)
-        continue;
-      if (e.dst == to)
-        return true;
-      if (seen.insert(e.dst).second)
-        stack.push_back(e.dst);
-    }
-  }
-  return false;
-}
-
-bool RegionGraph::concurrent(unsigned a, unsigned b) const {
-  if (a == b)
-    return false;
-  return !reaches(a, b) && !reaches(b, a);
-}
-
-//===----------------------------------------------------------------------===//
-// DOT dump
-//===----------------------------------------------------------------------===//
-
-StringRef allo::toString(XEdgeKind kind) {
-  switch (kind) {
-  case XEdgeKind::RAW:
-    return "RAW";
-  case XEdgeKind::WAR:
-    return "WAR";
-  case XEdgeKind::WAW:
-    return "WAW";
-  case XEdgeKind::StreamElastic:
-    return "stream";
-  case XEdgeKind::SSA:
-    return "ssa";
-  }
-  return "?";
-}
-
-void allo::printRegionGraphDot(const RegionGraph &g, func::FuncOp func,
-                               raw_ostream &os) {
-  AsmState asmState(func);
-  os << "digraph \"" << func.getSymName() << "\" {\n";
-  for (const SchedRegion &r : g.regions) {
-    StringRef kind = r.kind == RegionKind::Loop ? "loop" : "straightline";
-    os << "  r" << r.id << " [label=\"r" << r.id << " " << kind << "\"];\n";
-  }
-  for (const XEdge &e : g.edges) {
-    os << "  r" << e.src << " -> r" << e.dst << " [label=\""
-       << toString(e.kind);
-    if (e.root) {
-      os << " ";
-      e.root.printAsOperand(os, asmState);
-    }
-    os << "\"];\n";
-  }
-  for (unsigned i = 0, e = g.regions.size(); i < e; ++i)
-    for (unsigned j = i + 1; j < e; ++j)
-      if (g.concurrent(i, j))
-        os << "  // concurrent: r" << i << " r" << j << "\n";
-  os << "}\n";
 }
 
 static void buildDepsRec(func::FuncOp fn, SymbolTableCollection &syms,
