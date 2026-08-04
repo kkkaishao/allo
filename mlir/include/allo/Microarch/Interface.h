@@ -32,15 +32,13 @@ struct FIFO {
 /// a write `{addr, data, we}` (all out, `we` empty for a read).
 struct Memory {
   /// One partitioned axis of the argument, mirroring `allo::BankLayout::Axis`:
-  /// the host needs the same element-space decomposition the RTL addresses
-  /// with, which `bank`/`factor` alone cannot express (they give the bank's
-  /// identity and the total count, not how elements map onto it).
+  /// the host reproduces the same element-space decomposition the RTL addresses
+  /// with, which `bank`/`factor` alone cannot express.
   struct Axis {
     int dim;
     int64_t factor;
     /// `BankLayout::Kind` as the manifest spells it: "cyclic", "block" or
-    /// "skew". A name rather than a flag because the host reproduces the
-    /// decomposition, and a third kind is what a second bool would have hidden.
+    /// "skew".
     std::string kind;
   };
   int arg;
@@ -54,19 +52,14 @@ struct Memory {
                               // unbanked)
 };
 
-/// A completely-partitioned argument array, which crosses the boundary as one
-/// port per ELEMENT rather than as an addressed interface (`MemUnit::scattered`
-/// says why). `elements` holds the port names flat in row-major order, so the
-/// host drives element k of the flattened argument onto `elements[k]`.
-///
-/// Not a `Memory`: there is no address, no bank and no access latency to
-/// publish, and the count is the argument's element count rather than its
-/// access count.
+/// A completely-partitioned argument array, crossing the boundary as one port
+/// per ELEMENT rather than as an addressed interface (`MemUnit::scattered`).
+/// `elements` holds the port names flat in row-major order, so the host drives
+/// element k of the flattened argument onto `elements[k]`.
 struct RegisterFile {
-  /// One element's ports. `in` is where it arrives, `out`/`we` where it leaves,
-  /// and a direction the kernel does not use is empty: an argument it only
-  /// reads has no `out`, one it only writes no `in`. The names differ by that
-  /// too (`A_k` when one direction is live, `A_k_in`/`A_k_out` when both are).
+  /// One element's ports: `in` is where it arrives, `out`/`we` where it leaves.
+  /// A direction the kernel does not use is empty, and the naming follows it:
+  /// `A_k` when one direction is live, `A_k_in`/`A_k_out` when both are.
   struct Element {
     std::string in, out, we;
   };
@@ -90,14 +83,12 @@ struct Result {
 };
 
 /// One extern operator module this module instantiates, with the port shape it
-/// was declared with. Published for two reasons: the simulation-model generator
-/// builds its behavioral module from the manifest rather than re-parsing the
-/// emitted IR, and it joins to the device operator on `impl` + `predicate`
-/// rather than guessing them back out of the module name.
+/// was declared with. The simulation-model generator builds its behavioral
+/// module from this entry and joins to the device operator on `impl` +
+/// `predicate`.
 struct Operator {
-  /// What a port is FOR, so a consumer classifies structurally instead of
-  /// matching the name `clk` / `ce` back out (the `ce` bit in particular
-  /// decides whether the behavioral model gates on a clock enable).
+  /// What a port is FOR, so a consumer classifies structurally rather than by
+  /// name. `Ce` decides whether the behavioral model gates on a clock enable.
   enum class Role { Data, Clk, Ce, Out };
   struct Port {
     std::string name;
@@ -116,8 +107,8 @@ struct Operator {
 /// data-dependent access spans every bank).
 struct ModuleInterface {
   // The emitted RTL module name and the MLIR symbol it came from; they differ
-  // whenever the symbol needed legalizing (`top.child` -> `top_child`), and the
-  // simulator only ever knows the former.
+  // when the symbol needed legalizing (`top.child` -> `top_child`), and the
+  // simulator only knows the former.
   std::string module, symbol;
   std::vector<Scalar> scalars;
   std::vector<FIFO> streams;
@@ -133,17 +124,14 @@ struct ModuleInterface {
   explicit ModuleInterface(const uarch::Datapath &dp);
 
   /// Every memory interface of argument \p arg, reads before writes and flat
-  /// across access groups. An argument accessed at several points has several
-  /// port groups (read-twice -> two reads; an accumulator -> a read and a
-  /// write), and a cyclically partitioned access has one interface per bank
-  /// within its group; a caller wiring the argument needs all of them, which is
-  /// why this flattens rather than preserving the grouping.
+  /// across access groups. One argument can have several port groups (accessed
+  /// at several points) and several interfaces per group (one per bank).
   llvm::SmallVector<const Memory *, 2> portsForArg(int arg) const;
   /// The scalar input port of argument \p arg, or null if \p arg is not one.
   const Scalar *scalarForArg(int arg) const;
   /// The stream interface of argument \p arg, or null if \p arg is not one. A
   /// stream argument is single-ended within a module (one `get` side or one
-  /// `put` side), so unlike a memory it has exactly one interface.
+  /// `put` side), so it has exactly one interface.
   const FIFO *streamForArg(int arg) const;
 
   /// Serialize the model to a compact JSON object.

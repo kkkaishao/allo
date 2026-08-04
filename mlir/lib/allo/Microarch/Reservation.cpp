@@ -16,13 +16,11 @@ Reservation reservationOf(const RegionBlock &region, const FuncUnit &unit,
                           unsigned residue) {
   Reservation r;
   r.region = region.id;
-  // A pipelined unit holds only the issue slot for one cycle regardless of
-  // latency (its stages carry distinct data); a non-pipelined unit stays
-  // busy for its whole latency.
+  // A pipelined unit holds only the issue slot, its stages carrying distinct
+  // data; a non-pipelined unit stays busy for its whole latency.
   unsigned len = unit.pipelined ? 1 : std::max(1u, unit.latency);
-  // Cyclic regions wrap occupancy mod II, so a window crossing the II
-  // boundary self-overlaps when latency > II, marking the unit busy every
-  // cycle. Acyclic regions run once on a straight timeline.
+  // Cyclic regions wrap occupancy mod II, so a latency at or above II marks the
+  // unit busy on every residue. Acyclic regions run on a straight timeline.
   unsigned mod =
       region.kind == RegionBlock::Kind::Cyclic ? region.ii.value_or(1) : 0;
   for (unsigned i = 0; i < len; ++i)
@@ -42,9 +40,8 @@ void verifyBinding(const Datapath &dp) {
   for (const RegionBlock &rb : dp.regions)
     for (UnitId uid : rb.units) {
       const FuncUnit &u = dp.units[uid];
-      // The emitter builds one operator from the unit's identity, so a bound
-      // op of any other identity would be miscompiled. Vacuous under trivial
-      // binding.
+      // The emitter builds one operator from the unit's identity, so a bound op
+      // of any other identity would be miscompiled.
       for (const auto &bo : u.boundOps)
         assert(operatorIdentity(cast<dcp::DCPathComputeOp>(bo.first)) ==
                    u.identity &&

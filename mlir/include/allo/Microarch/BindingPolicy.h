@@ -20,10 +20,10 @@ struct BindingContext {
   const OperatorLibrary &lib;
 };
 
-/// A resource-binding policy. `plan` inspects the trivially-bound datapath and
-/// returns unit groups to merge; each group's units fold onto its first, units
-/// not named keep their own unit. An empty result is the trivial binding (no
-/// sharing). A policy only decides. It must not mutate `dp`.
+/// A resource-binding policy. `plan` returns unit groups to merge, each group
+/// folding onto its first unit and every unit not named keeping its own; an
+/// empty result is the trivial binding. A policy only decides, never mutating
+/// `dp`.
 struct BindingPolicy {
   virtual ~BindingPolicy() = default;
   virtual std::vector<llvm::SmallVector<UnitId, 2>>
@@ -37,19 +37,17 @@ struct TrivialBinding : BindingPolicy {
 };
 
 /// Greedy within-region sharing: fold same-operator-type units whose MRT
-/// reservations are disjoint onto one unit (left-edge over the reservation
-/// table), while the multiplexer that fold grows still fits the clock.
-/// Interconnect-agnostic: it shares every compatible op whose timing allows,
-/// regardless of operator area. A cost-driven policy can replace it.
+/// reservations are disjoint onto one unit, while the multiplexer that fold
+/// grows still fits the clock. Area-agnostic: it shares every compatible op
+/// whose timing allows.
 struct GreedyShareBinding : BindingPolicy {
   std::vector<llvm::SmallVector<UnitId, 2>>
   plan(const Datapath &dp, const BindingContext &ctx) const override;
 };
 
 /// Build the allocation the scheduler decided: fold together every unit whose
-/// bound op names the same `dcp.compute` `unit` symbol, and leave every other
-/// unit alone. An op the scheduler left unallocated (a combinational operator,
-/// or the only one of its identity in its region) has nothing to share with.
+/// bound op names the same `dcp.compute` `unit` symbol. An op the scheduler
+/// left unallocated names no symbol and keeps its own unit.
 struct PlannedBinding : BindingPolicy {
   std::vector<llvm::SmallVector<UnitId, 2>>
   plan(const Datapath &dp, const BindingContext &ctx) const override;

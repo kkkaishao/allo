@@ -72,8 +72,7 @@ void recordMemoryInit(seq::HLMemOp mem, ArrayRef<APInt> words) {
 }
 
 // Integer/logic mnemonics EmitHW lowers to a native `comb` primitive. The
-// single source of truth for `emitCompute`'s coverage; a native op outside this
-// set has no EmitHW lowering (realizability errors, see `emitModule`).
+// single source of truth for `emitCompute`'s coverage.
 bool combEmitted(StringRef kind) {
   return llvm::StringSwitch<bool>(kind)
       .Cases({"addi", "subi", "muli", "andi", "ori", "xori"}, true)
@@ -86,7 +85,7 @@ bool combEmitted(StringRef kind) {
 }
 
 // arith and comb name the same ten integer-compare predicates; map across the
-// two enums (comb adds 4-state predicates that are never produced here).
+// two enums.
 static comb::ICmpPredicate combICmpPredicate(arith::CmpIPredicate p) {
   using A = arith::CmpIPredicate;
   using C = comb::ICmpPredicate;
@@ -117,9 +116,9 @@ static comb::ICmpPredicate combICmpPredicate(arith::CmpIPredicate p) {
 
 Value emitCompute(OpBuilder &b, Location loc, StringRef kind,
                   ValueRange operands, Type resultType, Operation *srcOp) {
-  // affine.apply: a map carried on the op (like arith.cmpi's predicate),
-  // left by loop-canonicalization when reading an IV outside an address.
-  // Uses evalAffine, so a power-of-two divisor stays shift+mask.
+  // affine.apply: the map rides on the op, left by loop-canonicalization when
+  // an IV is read outside an address. Via evalAffine, so a power-of-two divisor
+  // stays shift+mask.
   if (kind == "apply") {
     assert(srcOp->getAttr("map") &&
            "dcp.compute<apply> must carry the original affine map");
@@ -128,9 +127,8 @@ Value emitCompute(OpBuilder &b, Location loc, StringRef kind,
     return evalAffine(b, loc, map.getResult(0), operands, map.getNumDims());
   }
   Value lhs = operands[0];
-  // Width-changing unary casts (the widened-reduction idiom
-  // trunc(add(ext,ext))) resize operand[0] via comb sign/zero-extend or a
-  // low-bit extract; 0-latency, so they slot into the schedule like any comb.
+  // Width-changing unary casts resize operand[0] via a comb sign/zero-extend or
+  // a low-bit extract; 0-latency, so they slot into the schedule like any comb.
   if (kind == "extsi")
     return comb::createOrFoldSExt(b, loc, lhs, resultType);
   if (kind == "extui")
@@ -141,21 +139,19 @@ Value emitCompute(OpBuilder &b, Location loc, StringRef kind,
   if (kind == "index_cast")
     return resize(b, loc, lhs, cast<IntegerType>(resultType).getWidth(),
                   /*isSigned=*/true);
-  // Float negate: arith.negf flips the sign bit of the float, which rides as
-  // its integer bit pattern here, so this is a single XOR, no IP. Unary, so
-  // it precedes the `rhs = operands[1]` read below.
+  // Float negate: the float rides as its integer bit pattern, so flipping its
+  // sign bit is a single XOR, no IP. Unary, so it precedes the
+  // `rhs = operands[1]` read below.
   if (kind == "negf") {
     unsigned w = cast<IntegerType>(resultType).getWidth();
-    // The mask is the width's signed minimum: exactly the top bit set, at any
-    // width. Built as an APInt rather than `1 << (w-1)`, which shifts into the
-    // sign bit of an int64 at w == 64 (UB before C++20) and past it beyond.
+    // The width's signed minimum is exactly the top bit set, at any width. An
+    // APInt, not `1 << (w-1)`, which shifts into an int64's sign bit at
+    // w == 64 (UB before C++20) and past it beyond.
     Value signBit = hw::ConstantOp::create(
         b, loc, IntegerAttr::get(resultType, APInt::getSignedMinValue(w)));
     return comb::XorOp::create(b, loc, lhs, signBit, false)->getResult(0);
   }
-  // 3-input value mux: arith.select(cond, t, f) == comb.mux (cond ? t : f). The
-  // if-conversion of a guarded store lowers to this over the two speculated
-  // values, so it must be native (no binary-IP shape).
+  // 3-input value mux: arith.select(cond, t, f) == comb.mux (cond ? t : f).
   if (kind == "select")
     return comb::MuxOp::create(b, loc, operands[0], operands[1], operands[2])
         ->getResult(0);
@@ -179,21 +175,19 @@ Value emitCompute(OpBuilder &b, Location loc, StringRef kind,
     return comb::ShrSOp::create(b, loc, lhs, rhs, false)->getResult(0);
   if (kind == "shrui")
     return comb::ShrUOp::create(b, loc, lhs, rhs, false)->getResult(0);
-  // Signed / unsigned divide, emitted for a flattened guard's delinearization
-  // (an affine `i floordiv N` in the predicate lowers to signed-divide over
-  // the coalesced counter); a scheduled data divide is multi-cycle IP instead.
+  // Signed / unsigned divide, emitted for a flattened guard's delinearization;
+  // a scheduled data divide is multi-cycle IP instead.
   if (kind == "divsi")
     return comb::DivSOp::create(b, loc, lhs, rhs, false)->getResult(0);
   if (kind == "divui")
     return comb::DivUOp::create(b, loc, lhs, rhs, false)->getResult(0);
   // Signed / unsigned remainder (int rem is combinational under the operator
-  // model). Both operands share the result width.
+  // model).
   if (kind == "remsi")
     return comb::ModSOp::create(b, loc, lhs, rhs, false)->getResult(0);
   if (kind == "remui")
     return comb::ModUOp::create(b, loc, lhs, rhs, false)->getResult(0);
-  // Integer min/max: a compare feeds a mux (canonicalize folds a
-  // `select(a<b,a,b)` idiom into arith.minsi/maxsi/minui/maxui).
+  // Integer min/max: a compare feeds a mux.
   auto minmax = [&](comb::ICmpPredicate p) -> Value {
     Value c = comb::ICmpOp::create(b, loc, p, lhs, rhs, false)->getResult(0);
     return comb::MuxOp::create(b, loc, c, lhs, rhs)->getResult(0);
@@ -206,8 +200,7 @@ Value emitCompute(OpBuilder &b, Location loc, StringRef kind,
     return minmax(comb::ICmpPredicate::ult);
   if (kind == "maxui")
     return minmax(comb::ICmpPredicate::ugt);
-  // Integer compare -> comb.icmp with the predicate carried from arith.cmpi
-  // (preserved onto the compute op by convert-schedule-to-dcp).
+  // Integer compare, with the predicate carried from arith.cmpi.
   if (kind == "cmpi") {
     auto pred =
         cast<arith::CmpIPredicateAttr>(srcOp->getAttr("predicate")).getValue();
@@ -215,8 +208,8 @@ Value emitCompute(OpBuilder &b, Location loc, StringRef kind,
                                 false)
         ->getResult(0);
   }
-  // Not an `assert`: under NDEBUG that would fall through and hand the caller a
-  // null Value to wire into the datapath.
+  // Not an `assert`: under NDEBUG that would fall through and hand back a null
+  // Value to wire into the datapath.
   llvm_unreachable("combEmitted mnemonic without an emitCompute case");
 }
 
@@ -290,9 +283,8 @@ ShiftChain EmitContext::shiftChain(Value in, unsigned depth,
   Value rz = konst(in.getType(), 0);
   Value cur = in;
   for (unsigned s = 1; s <= depth; ++s) {
-    // Under an elastic shell every stage advances only while enabled, so all
-    // taps freeze together and their "index == cycles delayed" contract still
-    // holds under stall; a rigid shell is a plain unconditional shift.
+    // An elastic shell advances every stage only while enabled, so all taps
+    // freeze together; a rigid shell is a plain unconditional shift.
     cur = sh ? enabledReg(cur, sh.chainEnable, rz) : reg(cur, rz);
     chain.stages.push_back(cur);
   }
@@ -323,8 +315,7 @@ ShiftChain EmitContext::foldedChain(Value in, unsigned depth, unsigned ii,
 
 // Above this many cycles a counter (log2(n) registers + a comparator) is
 // cheaper than a chain (n registers). Set well clear of ordinary pipeline-stage
-// delays so the shape of a small chain, which structural tests read, is left
-// alone.
+// delays, so a small chain keeps the shape structural tests read.
 static constexpr unsigned kCountedDelayCycles = 64;
 
 Value EmitContext::delayPulseCounted(Value pulse, unsigned n,
@@ -332,9 +323,9 @@ Value EmitContext::delayPulseCounted(Value pulse, unsigned n,
   assert(regionSinglePass && "a counted delay drops every pulse but the first, "
                              "so it needs a region that issues one pass");
   assert(n >= 1 && "a zero-cycle delay is the signal itself");
-  // `pulse` arms the counter at 0; it counts every advancing cycle and fires
-  // at n-1, so the output rises exactly n cycles after the input (a chain
-  // tap's contract). Under an elastic shell it counts only while enabled.
+  // `pulse` arms the counter at 0; it counts every advancing cycle and fires at
+  // n-1, so the output rises exactly n cycles after the input, as a chain tap
+  // does. Under an elastic shell it counts only while enabled.
   Backedge armedNext = bb.get(i1);
   Backedge countNext = bb.get(i32);
   Value armed =
@@ -358,7 +349,6 @@ Value EmitContext::delayValid(Value sig, unsigned n, const StallShell &sh) {
   if (n >= kCountedDelayCycles && regionSinglePass)
     return delayPulseCounted(sig, n, sh);
   ShiftChain chain = shiftChain(sig, n, sh);
-  // The densest cluster of otherwise-anonymous state in a pipelined region.
   // Label each stage with the cycle it is valid at, so a waveform reads
   // `r1_v3`: region 1, three cycles after issue.
   for (auto [k, stage] : llvm::enumerate(chain.stages))

@@ -5,8 +5,7 @@
 
 //===----------------------------------------------------------------------===//
 // Binding policies (pure decision). Compatibility is the exact MRT test from
-// Reservation.h, since bind-after-schedule makes it a set intersection rather
-// than a lifetime heuristic. See BindingPolicy.h.
+// Reservation.h. See BindingPolicy.h.
 //===----------------------------------------------------------------------===//
 
 #include "allo/Microarch/BindingPolicy.h"
@@ -28,9 +27,8 @@ GreedyShareBinding::plan(const Datapath &dp, const BindingContext &ctx) const {
   double level = muxLevelDelay(ctx.lib);
   std::vector<llvm::SmallVector<UnitId, 2>> groups;
   for (const RegionBlock &rb : dp.regions) {
-    // Each bin is one physical unit's ops, carrying the tightest sub-cycle
-    // slack any member has: growing the bin deepens one multiplexer in front
-    // of all of them.
+    // Each bin is one physical unit's ops, carrying the tightest slack any
+    // member has: growing the bin deepens one multiplexer in front of all.
     struct Bin {
       llvm::SmallVector<UnitId, 2> units;
       double slack;

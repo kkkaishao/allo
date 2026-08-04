@@ -26,8 +26,7 @@ namespace mlir::allo::uarch {
 //===----------------------------------------------------------------------===//
 
 // Supported subset: top-level siblings in program order, plus container loops
-// whose children sequence within one outer iteration (crossing as a survivor
-// register).
+// whose children sequence within one outer iteration.
 LogicalResult verifyDatapath(dcp::DCPathModuleOp func, const Datapath &dp) {
   // A kernel with no schedulable region computes nothing.
   if (dp.regions.empty())
@@ -42,7 +41,7 @@ LogicalResult verifyDatapath(dcp::DCPathModuleOp func, const Datapath &dp) {
 
   // An unresolved (None) Source is a cross-region SSA hand-off the builder
   // could not thread; reject it here rather than asserting in `resolveSource`.
-  // ONE sweep: `forEachSource` owns the slot list and which slots may be empty.
+  // `forEachSource` owns the slot list and which slots may be empty.
   bool found = false;
   SourceSite badSite{};
   forEachSource(dp, [&](const Source &s, const SourceSite &site) {
@@ -74,8 +73,8 @@ namespace {
 /// The scheduler proved `z(op) + inDelay(op) <= period` over a datapath whose
 /// unit inputs are all driven directly, and a multiplexer shifts its consumer's
 /// arrival by a constant. The delta is therefore additive along a combinational
-/// path, so propagating it alone and comparing against each op's remaining
-/// sub-cycle slack is exact.
+/// path, so propagating it alone against each op's remaining sub-cycle slack is
+/// exact.
 struct MuxDelay {
   MuxDelay(const Datapath &dp, double level) : dp(dp), level(level) {}
 
@@ -114,9 +113,9 @@ struct MuxDelay {
 };
 
 /// Every shared unit's inputs still settle within the period, muxes included.
-/// Vacuous under the trivial binding, which grows no mux. This catches what a
-/// policy cannot see before the datapath resolves: delay accumulated across a
-/// chain of shared combinational units.
+/// Vacuous under the trivial binding, which grows no mux. Catches what a policy
+/// cannot see before the datapath resolves: delay accumulated across a chain of
+/// shared combinational units.
 LogicalResult checkBindingMeetsPeriod(const Datapath &dp, float cycleTime,
                                       const OperatorLibrary &lib) {
   if (dp.muxes.empty())
@@ -163,13 +162,12 @@ LogicalResult checkBindingMeetsPeriod(const Datapath &dp, float cycleTime,
 LogicalResult checkDeviceCapability(dcp::DCPathModuleOp func,
                                     const Datapath &dp, float cycleTime,
                                     const OperatorLibrary &lib) {
-  // Access latencies the emitted structure cannot realize. These are device
-  // rows the SCHEDULER honors, so silently emitting a 1-cycle port instead
-  // would place every consumer of that array on the wrong cycle.
+  // Memory rows the SCHEDULER honors, so a structure that silently realizes
+  // them differently would place every consumer on the wrong cycle.
   for (const MemUnit &m : dp.mems) {
     // A partition on an initialized array is a silent no-op: `bankLayoutOf`
     // reads `allo.part` off the `memref.get_global` while the attribute rides
-    // the `memref.global`. Warn by name, since a WRITTEN table loses ports.
+    // the `memref.global`.
     if (m.romInit) {
       assert(m.numBanks == 1 &&
              "an initialized array is laid out as one bank (allo.part on a "
@@ -188,8 +186,8 @@ LogicalResult checkDeviceCapability(dcp::DCPathModuleOp func,
   }
 
   // `ce` is the only IP port ABI the emitter realizes. `free` has no enable, so
-  // in a back-pressured region it keeps clocking and desynchronizes, but is
-  // fine elsewhere; the `elastic` contract is rejected before scheduling.
+  // it keeps clocking and desynchronizes in a back-pressured region, but is
+  // fine elsewhere; `elastic` is rejected before scheduling.
   llvm::SmallDenseSet<unsigned> backPressured;
   for (const StreamChannel &s : dp.streams)
     for (const StreamChannel::Access &acc : s.accesses)
@@ -220,10 +218,9 @@ LogicalResult checkDeviceCapability(dcp::DCPathModuleOp func,
 // 3. What this emitter lowers.
 //===----------------------------------------------------------------------===//
 
-// Invariant, not a legality check: the reifier gives every run of loose ops
-// its own child region, so a counted container never holds work of its own;
-// hence checking what a unit READS rather than whether units exist. A
-// conditional container is exempt: it emits its own condition cone.
+// Whether a counted container holds no work of its own: the reifier gives every
+// run of loose ops its own child region, so this checks what a unit READS
+// rather than whether units exist. A conditional container is exempt.
 [[maybe_unused]] static bool containerOwnsNoDatapath(const RegionBlock &rb,
                                                      const Datapath &dp) {
   if (!rb.memAccesses.empty() || !rb.streamAccesses.empty() ||
@@ -238,19 +235,17 @@ LogicalResult checkDeviceCapability(dcp::DCPathModuleOp func,
 }
 
 LogicalResult checkEmitterSubset(dcp::DCPathModuleOp func, const Datapath &dp) {
-  // Region shapes. Mirrors `emitRegion`'s dispatch, reading the same stored
-  // discriminant rather than re-deriving it.
+  // Region shapes, mirroring `emitRegion`'s dispatch on the same stored
+  // discriminant.
   for (const RegionBlock &rb : dp.regions) {
-    // A counted `dcp.pipeline` carries its trip either as the `trip` attribute
-    // or as the `dynamicBound` operand; the op verifier enforces that, so a
-    // cyclic non-while region always has one of the two by the time it is here.
+    // The op verifier already enforces that a counted `dcp.pipeline` carries
+    // its trip either as the `trip` attribute or as the `dynamicBound` operand.
     assert((rb.kind != RegionBlock::Kind::Cyclic || rb.conditional ||
             rb.tripCount || rb.ubSource) &&
            "a counted cyclic region reached emission with neither a constant "
            "nor a dynamic trip; the reifier owns that");
     // `emitLoopCall` advances on the child's `done`, so it would silently drop
-    // a second child or any loose datapath. Keyed on the stored shape, so it
-    // constrains exactly the regions that reach that controller.
+    // a second child or any loose datapath.
     assert(
         (rb.shape != RegionBlock::Shape::CallNode ||
          (rb.callUnits.size() <= 1 && rb.units.empty() && rb.regs.empty())) &&
@@ -263,9 +258,8 @@ LogicalResult checkEmitterSubset(dcp::DCPathModuleOp func, const Datapath &dp) {
            "reifier gives every run of loose ops a child region");
   }
 
-  // `verify-rtl-legality` owns the shapes a CONCURRENT container admits (no
-  // datapath of its own, each process instantiated once) and the caller/callee
-  // partition agreement, both settled before scheduling.
+  // `verify-rtl-legality` owns the shapes a CONCURRENT container admits and the
+  // caller/callee partition agreement, both settled before scheduling.
 
   // Stream protocol: a channel's {data,valid,ready} triple is time-shared by
   // all its accesses, sound only if the scheduler keeps them ordered and
@@ -302,9 +296,8 @@ LogicalResult checkEmitterSubset(dcp::DCPathModuleOp func, const Datapath &dp) {
   // while waits t_cond cycles. `verifyDatapath` already rejects a `None`.
   auto conditionOk = [&](const Source &s, bool sequential) {
     switch (s.kind) {
-    // A scheduled prologue predicate, and a func-scope cone combinational over
-    // exactly such predicates and the module's ports: both are settled at the
-    // region start.
+    // A scheduled prologue predicate and a func-scope cone are both settled at
+    // the region start.
     case Source::Kind::Survivor:
     case Source::Kind::Scope:
       return true;
@@ -316,8 +309,7 @@ LogicalResult checkEmitterSubset(dcp::DCPathModuleOp func, const Datapath &dp) {
   };
   for (const RegionBlock &rb : dp.regions) {
     // Which of the two while controllers runs is the stored shape: a Container
-    // while is the sequential CHECK/RUN one (it may wait `t_cond`), a Leaf
-    // while the flushing one (it samples the condition in-cycle).
+    // while is the sequential CHECK/RUN one, a Leaf while the flushing one.
     if (rb.conditional && !conditionOk(rb.condition,
                                        /*sequential=*/rb.shape ==
                                            RegionBlock::Shape::Container)) {
@@ -333,7 +325,7 @@ LogicalResult checkEmitterSubset(dcp::DCPathModuleOp func, const Datapath &dp) {
       return failure();
     }
   }
-  // A leaf `while` with an in-loop store lowers safely: emitAccesses gates the
+  // A leaf `while` with an in-loop store needs no check: emitAccesses gates the
   // store's write-enable by `issue & cond`, so a doomed exit iteration commits
   // nothing.
 
@@ -343,9 +335,8 @@ LogicalResult checkEmitterSubset(dcp::DCPathModuleOp func, const Datapath &dp) {
     assert((u.identity.comb ? combEmitted(u.identity.realization)
                             : u.identity.realized()) &&
            "an unrealizable operator reached emission");
-  // A func-scope cone is combinational by construction (`bindScopeOps` rejects
-  // anything `combKindOf` does not name), so only `emitCompute`'s coverage is
-  // left to check.
+  // A func-scope cone is combinational by construction, so only `emitCompute`'s
+  // coverage is left to check.
   for (const ScopeUnit &su : dp.scopeUnits)
     assert(combEmitted(su.opType) &&
            "an unrealizable func-scope expression reached emission");
@@ -360,8 +351,7 @@ LogicalResult checkEmitterSubset(dcp::DCPathModuleOp func, const Datapath &dp) {
 static void assertStructuralInvariants(const Datapath &dp) {
 #ifndef NDEBUG
   // Every access is listed by exactly the region that issues it, and exactly
-  // the EXTERNAL accesses hold a boundary port slot. Consumers read both facts
-  // off the model, so a builder that forgets one would miscompile silently.
+  // the EXTERNAL accesses hold a boundary port slot.
   unsigned listed = 0;
   for (const RegionBlock &rb : dp.regions) {
     listed += rb.memAccesses.size();
@@ -404,8 +394,7 @@ static void assertStructuralInvariants(const Datapath &dp) {
                     "scheduled work; the region partitioner must isolate it");
   }
   // A constant table has no write port for anyone to master. A child may READ
-  // one (that is a container-owned lookup table, and read-only is a property of
-  // the USE), but a writing port group would have nowhere to land.
+  // one, but a writing port group would have nowhere to land.
   for (const CallUnit &cu : dp.calls)
     for (const CallUnit::MemArg &ma : cu.memArgs)
       assert(!(dp.mems[ma.mem].isRom && ma.isWrite) &&

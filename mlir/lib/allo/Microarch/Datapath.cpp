@@ -29,16 +29,15 @@ unsigned dcpStart(Operation *op) {
 
 unsigned dcpLatency(Operation *op) {
   // An OPERATOR latency: the cycles between an op's issue and its result
-  // landing. A region carries a `latency` too, but that one is the whole
-  // region's start->done span, so answering for it would report a span as an
+  // landing. A region's `latency` is its whole start->done span, not an
   // operator delay.
   assert(!isa<dcp::DCPathRegionOpInterface>(op) &&
          "a region's `latency` is its whole span, not an operator latency");
   if (auto l = dyn_cast<dcp::DCPathLoadOp>(op))
     return static_cast<unsigned>(l.getLatency());
   // An IP compute takes its latency from the `dcp.operator` it names, which
-  // outlives emission for this reason; a combinational one lands in the cycle
-  // it issues.
+  // outlives emission for this reason; a combinational one issues and lands in
+  // the same cycle.
   if (auto comp = dyn_cast<dcp::DCPathComputeOp>(op)) {
     FlatSymbolRefAttr sym = comp.getOpTypeAttr();
     if (!sym)
@@ -154,8 +153,8 @@ void forEachSource(
     const Datapath &dp,
     llvm::function_ref<void(const Source &, const SourceSite &)> fn) {
   using Slot = SourceSite::Slot;
-  // Every visit is one call; `required` states whether a None source there
-  // means "absent" or "unresolved", so no consumer re-decides it.
+  // `required` states whether a None source at that slot means "absent" or
+  // "unresolved", so no consumer re-decides it.
   auto visit = [&](const Source &s, Slot slot, unsigned index, Operation *op,
                    bool required) {
     fn(s, SourceSite{slot, index, op, required});
@@ -197,14 +196,14 @@ void forEachSource(
     visit(r.source, Slot::FuncResult, k, nullptr, /*required=*/true);
 
   for (const RegionBlock &rb : dp.regions) {
-    // Set for a counted region (literal bounds are synthesized cells), None for
-    // an acyclic one. `ubSource` is also None for the one derived bound
-    // (`tripCount` over a runtime lb/step), so none of the three is required.
+    // Set for a counted region, None for an acyclic one; `ubSource` is also
+    // None for the one derived bound (`tripCount` over a runtime lb/step), so
+    // none of the three is required.
     for (const Source &s : {rb.lbSource, rb.ubSource, rb.stepSource})
       visit(s, Slot::RegionBound, rb.id, nullptr, /*required=*/false);
     // Only a Container threads its recurrence through `setupCarriedIterArgs`,
     // where an unresolved init or next has nothing to latch. Elsewhere a result
-    // may be untracked, and a consumer that reads one fails at its own slot.
+    // may be untracked.
     bool threaded = rb.shape == RegionBlock::Shape::Container;
     for (auto [k, r] : llvm::enumerate(rb.results)) {
       visit(r.value, Slot::RegionResult, k, nullptr, threaded);
@@ -342,10 +341,9 @@ void Datapath::reportAllocation() const {
         << fanin << " mux inputs, " << muxBits << " 2:1 mux bits";
   }
 
-  // Write ports per array, and how many REGIONS the writers are spread over. A
-  // second write port defeats RAM inference outright, so an array whose writers
-  // sit in different regions is paying for a concurrency it cannot have:
-  // regions touching a shared memref are ordered by `recordSiblingDeps`.
+  // Per array with more than one writer: its write ports, how many of them a
+  // call drives, how many REGIONS the writers are spread over, its geometry,
+  // and the write and total port counts the model demands.
   for (const MemUnit &m : mems) {
     llvm::SmallDenseSet<unsigned> regionsWriting;
     unsigned writes = 0, fromCalls = 0;
@@ -380,8 +378,7 @@ void Datapath::reportAllocation() const {
 
 /// The largest set of mutually adjacent vertices in \p adj, a bitset per
 /// vertex, by Bron-Kerbosch with pivoting: every maximal clique contains the
-/// pivot or a candidate NOT adjacent to it, so only those need branching, which
-/// is what makes the search tractable where enumerating subsets is not. \p
+/// pivot or a candidate NOT adjacent to it, so only those need branching. \p
 /// budget bounds a recursion that stays exponential in the worst case;
 /// exhausting it reports the whole vertex set, which only over-states.
 static unsigned maxClique(llvm::ArrayRef<uint64_t> adj, uint64_t candidates,
@@ -455,7 +452,7 @@ Datapath::portGraph(MemId id, bool writesOnly,
         accessOf.push_back(kNoWritePort);
       }
   // The bitsets are 64 wide. Above that the relation is not built and every
-  // caller assumes each access simultaneous, which only over-states and so
+  // caller treats each access as simultaneous, which only over-states and so
   // never merges a port unsafely.
   if (ws.size() > 64)
     return {};
@@ -562,8 +559,8 @@ void Datapath::dump(llvm::raw_ostream &os) const {
   auto func = this->func;
   os << "datapath @" << func.getSymName() << " {\n";
 
-  // The controller discriminant as the emitter reads it: shape, then the
-  // termination class that picks the cell.
+  // The controller discriminant as the emitter reads it: shape, then
+  // termination class.
   auto shapeName = [](RegionBlock::Shape s) -> const char * {
     switch (s) {
     case RegionBlock::Shape::Leaf:
@@ -659,7 +656,7 @@ void Datapath::dump(llvm::raw_ostream &os) const {
   }
 
   // The composition graph on the instance substrate: each child's start policy
-  // inputs (spawn / determinacy / offset) and the predecessors it waits for.
+  // inputs and the predecessors it waits for.
   for (const CallUnit &cu : this->calls) {
     os << "  call k" << cu.id << ": " << cu.callee << " @r" << cu.region
        << " start=" << cu.start << (cu.async ? " spawn" : "")

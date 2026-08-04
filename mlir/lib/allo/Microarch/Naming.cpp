@@ -40,8 +40,7 @@ std::string join(llvm::StringRef base, llvm::StringLiteral suffix) {
 std::string verilogName(llvm::StringRef name) {
   std::string s = sanitizeCppIdentifier(name); // charset + leading digit
   // ExportVerilog renames a reserved word (`input` -> `input_0`), desyncing the
-  // manifest from the Verilog, so escape it here instead. One '_' suffices
-  // since no keyword ends in one; the loop states the invariant.
+  // manifest from the Verilog, so escape it here instead.
   while (!sv::isNameValid(s, /*caseInsensitiveKeywords=*/false))
     s.push_back('_');
   return s;
@@ -83,9 +82,9 @@ std::string uniqueOwnerOf(Value v, llvm::ArrayRef<Value> siblings,
     ties += ownerOf(s, fallback) == own;
   if (ties <= 1)
     return own;
-  // Two values sharing a source name would collide in port/cell naming (the
-  // case here is unrolling a body that declares an array). Each tied value
-  // falls back to its argument position, else the caller's per-cell fallback.
+  // Two values sharing a source name would collide in port/cell naming. Each
+  // tied value takes a suffix unique by construction: its argument position,
+  // else the caller's per-cell fallback.
   auto ba = dyn_cast<BlockArgument>(v);
   return own + "_" + (ba ? argOwner(ba.getArgNumber()) : fallback.str());
 }
@@ -147,9 +146,8 @@ std::string streamPortBase(const Datapath &dp, const StreamChannel &s) {
     return streamBase(ownerOf(c.stream, chanOwner(c.id)));
   };
   std::string base = own(s);
-  // Count the siblings this name ties with. A tie gives two handshakes one set
-  // of port names, which ExportVerilog uniquifies, desyncing the manifest and
-  // collapsing the by-name instance wiring. Only ported channels can tie.
+  // Count the siblings this name ties with. A tie would give two handshakes one
+  // set of port names, which ExportVerilog uniquifies, desyncing the manifest.
   unsigned sameBase = 0, sameDir = 0;
   for (const StreamChannel &o : dp.streams) {
     if (o.internal || own(o) != base)
@@ -190,8 +188,7 @@ std::string memCellName(llvm::StringRef owner, unsigned numBanks,
 
 std::string memCellName(const Datapath &dp, const MemUnit &m, unsigned bank) {
   // The memrefs of the module are the sibling namespace the tie-break runs in;
-  // the boundary PORT names resolve the same owner once, in
-  // `enumerateBoundaryPorts`, but an internal memory has no port to carry it.
+  // an internal memory has no boundary port carrying an already-resolved owner.
   llvm::SmallVector<Value> siblings;
   for (const MemUnit &o : dp.mems)
     siblings.push_back(o.memref);
@@ -230,9 +227,8 @@ std::string channelSignal(llvm::StringRef chan, llvm::StringRef sig) {
 }
 
 std::string operatorPredicate(const FuncUnit &u) {
-  // A compare is the only IP carrying a `predicate`, and the only identity
-  // axis a module name has to spell. Integer compare is combinational, so an
-  // IP compare is floating-point.
+  // A compare is the only IP carrying a `predicate`. Integer compare is
+  // combinational, so an IP compare is floating-point.
   if (auto pred =
           dyn_cast_if_present<arith::CmpFPredicateAttr>(u.identity.predicate))
     return arith::stringifyCmpFPredicate(pred.getValue()).str();

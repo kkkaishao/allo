@@ -23,8 +23,8 @@ RegionControl ControlEmitter::emitPipelineControl(const uarch::RegionBlock &rb,
     return emitAcyclic(rb.id, start, /*topLevel=*/!rb.parent, sh);
   assert(rb.ii && "a pipelined region reached control emission with no II");
   auto rc = emitPipelined(rb.id, *rb.ii, term, start, sh);
-  // Label the counter register after the source loop variable. A loop whose
-  // IV lost its name still reads as this region's counter.
+  // Label the counter after the source loop variable; a loop whose IV lost its
+  // name still reads as this region's counter.
   nameValue(rc.counter, rb.counterName.empty() ? regionSignal(rb.id, "iv")
                                                : rb.counterName);
   rc.scaledCounters = emitScaledCounters(
@@ -35,8 +35,9 @@ RegionControl ControlEmitter::emitPipelineControl(const uarch::RegionBlock &rb,
   return rc;
 }
 
+// The scaled address counters of region \p rb, one register per stride slot.
 // \p update is passed rather than re-derived so that each family's scaled
-// counters are written beside the counter they have to track. Drifting from
+// counters are written beside the counter they have to track: drifting from
 // that counter is the only way these can be wrong.
 llvm::SmallVector<Value> ControlEmitter::emitScaledCounters(
     const uarch::RegionBlock &rb, Value bypassStart,
@@ -47,9 +48,9 @@ llvm::SmallVector<Value> ControlEmitter::emitScaledCounters(
   // signal exists by the time it is read.
   llvm::SmallVector<Value> wrapped(rb.addrStrides.size());
   for (auto [slot, s] : llvm::enumerate(rb.addrStrides)) {
-    // Each register at the width ITS OWN range needs, which is what the digit
-    // or the array it walks says and not what the counter happens to be: a
-    // cyclic-4 bank digit is 3 bits beside a 32-bit iteration counter.
+    // Each register at the width ITS OWN range needs, not what the counter
+    // happens to be: a cyclic-4 bank digit is 3 bits beside a 32-bit iteration
+    // counter.
     auto ty = c.b.getIntegerType(s.width);
     Backedge next = c.bb.get(ty);
     Value init = c.konst(ty, s.init);
@@ -97,12 +98,11 @@ llvm::SmallVector<Value> ControlEmitter::emitScaledCounters(
 //     phase counter (in-flight drain via the valid chain);
 //   * while (II==1, conditional): a non-speculative flushing pipeline,
 //     terminated by the condition going false.
-// `running` is set by `start` and cleared the cycle the last iteration issues;
-// the iteration counter advances on issue (feeding the counted bound test and
-// the datapath's iteration-0 recurrence-init injection, mostly dead for a
-// while, which rarely indexes by iteration). A conditional terminator is
-// non-speculative (II >= t_cond, so no doomed iteration issues -> no squash)
-// and stall-free (fixed-latency memory, no FIFO).
+// `running` is set by `start` and cleared the cycle after the last iteration
+// issues; the counter advances on issue, feeding the counted bound test and
+// the datapath's iteration-0 recurrence-init injection. A conditional
+// terminator is non-speculative (II >= t_cond, so no doomed iteration issues
+// and nothing squashes) and stall-free (fixed-latency memory, no FIFO).
 RegionControl ControlEmitter::emitPipelined(unsigned region, int64_t ii,
                                             const Terminator &term, Value start,
                                             const StallShell &sh) const {
@@ -115,9 +115,8 @@ RegionControl ControlEmitter::emitPipelined(unsigned region, int64_t ii,
   auto runNext = c.bb.get(c.i1);
   Value running = c.reg(runNext, c.f1);
   nameValue(running, regionSignal(region, "run"));
-  // The ungated per-cycle issue *desire*: modulo (II>1) a phase counter [0,II)
-  // gates it to once per II; II==1 (and a while) wants to issue every running
-  // cycle. The stall shell then gates this by `enable` below.
+  // The ungated per-cycle issue desire: a [0,II) phase counter gates it to once
+  // per II; II==1 (and a while) wants to issue every running cycle.
   Value wantIssue = running;
   Value phase;
   if (ii > 1) {
@@ -130,8 +129,8 @@ RegionControl ControlEmitter::emitPipelined(unsigned region, int64_t ii,
     Value phaseAdv = c.mux(c.icmpEq(phase, ii - 1), c.zero32, phasep1);
     // The phase is the region's time base, not only an issue gate: it reloads
     // on `start` and free-runs, so the value chains folded onto it keep
-    // advancing through the drain. A stalled cycle (enable low) freezes it,
-    // and those chains with it, so the cadence resumes where it paused.
+    // advancing through the drain. A stalled cycle (enable low) freezes it, and
+    // those chains with it, so the cadence resumes where it paused.
     phaseNext.setValue(c.mux(term.gateStart(c, start), c.zero32,
                              c.mux(enable, phaseAdv, phase)));
   }
@@ -139,9 +138,9 @@ RegionControl ControlEmitter::emitPipelined(unsigned region, int64_t ii,
   // `running`, and (with the enabled shift chains) the whole datapath hold.
   Value issue = c.andBits(wantIssue, enable);
   nameValue(issue, regionSignal(region, "issue"));
-  // Induction register: the counter IS the source IV, holding `lb` at start and
-  // advancing by `step` on each gated issue, so Source::Counter reads the real
-  // loop variable and a `lb != 0` / `step != 1` loop needs no body rewriting.
+  // The counter IS the source IV, holding `lb` at start and advancing by `step`
+  // on each gated issue, so a `lb != 0` / `step != 1` loop needs no body
+  // rewriting.
   auto iterNext = c.bb.get(term.lb.getType());
   Value iv = c.reg(iterNext, term.lb);
   Value ivStep = c.R(comb::AddOp::create(c.b, c.loc, iv, term.step, false));
@@ -163,8 +162,8 @@ RegionControl ControlEmitter::emitPipelined(unsigned region, int64_t ii,
 //   * CallNode: the body is one instantiated sub-kernel.
 // Both keep the same four cells: an induction register advancing on `advance`,
 // the `isLast` test against the bound, the launch pulse, and a done latch
-// cleared on `start`. The single difference is when the FIRST pass launches,
-// and it is spelled once, as the two families' `arm` in `LatencyModel.h`.
+// cleared on `start`. They differ only in when the FIRST pass launches, spelled
+// as the two families' `arm` in `LatencyModel.h`.
 IterationControl
 ControlEmitter::emitCountedIteration(const uarch::RegionBlock &rb,
                                      const Terminator &term, Value start,
@@ -174,7 +173,7 @@ ControlEmitter::emitCountedIteration(const uarch::RegionBlock &rb,
                                      ? kCallNodeBoundary
                                      : kContainerBoundary;
   // Launching on `start` itself means reading the counter combinationally
-  // there, before its register settles, so the bypass is a CONSEQUENCE of a
+  // there, before its register settles, so the bypass is a consequence of a
   // zero arm cost and moves with it.
   bool launchAtStart = boundary.arm == 0;
 
@@ -184,9 +183,8 @@ ControlEmitter::emitCountedIteration(const uarch::RegionBlock &rb,
                                           : rb.counterName);
   Value iv = launchAtStart ? c.mux(start, term.lb, ivReg) : ivReg;
   Value ivStep = c.R(comb::AddOp::create(c.b, c.loc, iv, term.step, false));
-  // This pass is the last one; iterations remain otherwise (never for an empty
-  // region, whose body never runs at all, so `advance` stays low and the
-  // counter holds `lb`).
+  // An empty region never advances at all: its body never runs, so `advance`
+  // stays low and the counter holds `lb`.
   Value last = term.isLast(c, ivStep);
   Value advance = c.andBits(complete, c.notBit(last));
   ivNext.setValue(c.mux(start, term.lb, c.mux(advance, ivStep, iv)));
@@ -225,10 +223,10 @@ ControlEmitter::emitCountedIteration(const uarch::RegionBlock &rb,
 // is not available AT the boundary. The condition reads the iter-arg survivor
 // registers, which only settle the cycle after a body pass drains, and may
 // itself take `tCond` cycles (a memory- or IP-dependent condition). So the
-// decision is a delayed CHECK pulse rather than a combinational test, and it
-// forks directly into launch / finish. The zero-iteration case needs no
-// separate empty term: the first CHECK already answers it, and it is a cycle
-// after `start`, which is exactly the edge hygiene `done` needs.
+// decision is a delayed CHECK pulse rather than a combinational test, forking
+// into launch / finish. The zero-iteration case needs no separate empty term:
+// the first CHECK already answers it, a cycle after `start`, which is exactly
+// the edge hygiene `done` needs.
 IterationControl ControlEmitter::emitCheckedIteration(unsigned region,
                                                       Value cond,
                                                       unsigned tCond,
@@ -260,11 +258,10 @@ IterationControl ControlEmitter::emitCheckedIteration(unsigned region,
 // Under an elastic shell the arming pulse is LATCHED into `pend`, the acyclic
 // counterpart of the pipelined regime's `running`: a single one-shot pulse
 // cannot be gated, only dropped, so a stage-0 stream access would sample its
-// `_data` at the arming cycle whatever `_valid` said (and a stage-0 put would
-// drop its token and never complete). The latch turns "issue now" into "issue
-// as soon as the shell allows". `pend` is combinationally ORed with the arming
-// pulse rather than replacing it, so an available token still issues at the
-// arming cycle. A rigid region has nothing to defer and stays a bare pulse.
+// `_data` at the arming cycle whatever `_valid` said, and a stage-0 put would
+// drop its token and never complete. `pend` is combinationally ORed with the
+// arming pulse rather than replacing it, so an available token still issues at
+// the arming cycle. A rigid region has nothing to defer and stays a bare pulse.
 RegionControl ControlEmitter::emitAcyclic(unsigned region, Value start,
                                           bool topLevel,
                                           const StallShell &sh) const {
@@ -299,14 +296,12 @@ RegionControl ControlEmitter::emitAcyclic(unsigned region, Value start,
 
 // The region's completion signal: one latched level for every regime (cyclic,
 // while, acyclic). It rises when the last iteration's deepest output has
-// drained, that is, `lastIssue` (the final iteration's issue pulse) delayed by
-// `drainStage` cycles, or immediately on `emptyDone` (an empty region, when
-// reachable). The latch's register cycle is the LAST commit cycle, so a
+// drained, `lastIssue` delayed by `drainStage` cycles, or immediately on
+// `emptyDone`. The latch's register cycle is the LAST commit cycle, so a
 // sibling starting on this done's edge reads every committed store and
-// survivor. Keying on `lastIssue` (an actual issue pulse) rather than a
-// store-retire count keeps a region that retires several stores in one cycle
-// from completing early. A `retrig` region (re-run by an enclosing container)
-// resets its completion state on `start`.
+// survivor. Keying on `lastIssue` rather than a store-retire count keeps a
+// region that retires several stores in one cycle from completing early. A
+// `retrig` region resets its completion state on `start`.
 Value ControlEmitter::emitDone(unsigned region, unsigned drainStage,
                                Value lastIssue, Value emptyDone, Value start,
                                bool retrig, const StallShell &sh) const {

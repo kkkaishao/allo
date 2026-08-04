@@ -38,20 +38,19 @@ namespace mlir::allo::uarch {
 
 struct BindingPolicy;
 
-/// The already-emitted callees a rerouted container's leaf datapath needs to
-/// lower a `dcp.instance` to a CallUnit: the child `hw.module`s to
-/// instantiate + their port models (callee arg <-> addr/data/we names, read vs
-/// write direction). Null for a plain leaf (no calls). Both maps are populated
-/// bottom-up by the emit driver, so a callee is present before its caller.
+/// The already-emitted callees a `dcp.instance` lowers against: the child
+/// `hw.module`s to instantiate plus their port models. Null for a plain leaf.
+/// Both maps are filled bottom-up by the emit driver, so a callee is present
+/// before its caller.
 struct CalleeCtx {
   const llvm::StringMap<circt::hw::HWModuleOp> &modules;
   const llvm::StringMap<iface::ModuleInterface> &ifaces;
 };
 
 //===----------------------------------------------------------------------===//
-// Identifiers. Cells are referenced by small integer ids (indices into the
-// Datapath's vectors) rather than pointers, so the whole model stays trivially
-// copyable and diffable across a rebind.
+// Identifiers. Cells are referenced by ids indexing the Datapath's vectors
+// rather than by pointers, so the model stays trivially copyable across a
+// rebind.
 //===----------------------------------------------------------------------===//
 
 using UnitId = unsigned;
@@ -66,15 +65,11 @@ using CallId = unsigned;
 
 //===----------------------------------------------------------------------===//
 // A resolved driver of one input port. Exactly one Source feeds each input, so
-// muxes (when sharing forces a choice) appear as their own cells whose output
-// is the Source.
+// a mux forced by sharing is its own cell whose output is the Source.
 //
-// A Source names a WIRE. For every cell but a shared unit that is the same
-// thing as naming a value, because the cell drives one. A shared unit's output
-// carries a different bound op's result in each of its issue cycles, so a
-// consumer asking WHEN its value is ready has to say which one it means:
-// `outPort` is that index, and `producingOp` is the one place it is read.
-// `outPort` is overloaded per kind:
+// A Source names a WIRE. A shared unit's output carries a different bound op's
+// result in each issue cycle, so a consumer asking WHEN its value is ready has
+// to say which one it means. `outPort` is that index, overloaded per kind:
 //   Unit    -> which bound op's result this is (index into `boundOps`; 0 under
 //              the trivial allocation, where a unit has exactly one)
 //   Reg     -> tap level to read (0 = chain head, i.e. the newest sample)
@@ -84,13 +79,12 @@ using CallId = unsigned;
 //   Const    -> 0
 //   Counter  -> 0 (id = the RegionBlock whose iteration counter this is)
 //   Survivor -> which result of the producing region (id = the RegionBlock),
-//               latched when that region completes and read by a sibling region
+//               latched when that region completes
 //   Stream   -> index of the get access whose loaded token this is
 //               (id = the StreamChannel)
-//   Call     -> which scalar result of a sub-kernel call (id = the CallUnit):
-//               the child instance's result output, landing at start+latency
-//   Scope    -> 0 (id = the ScopeUnit): a func-scope combinational cone,
-//               stable from its inputs' producing regions onward
+//   Call     -> which scalar result of a sub-kernel call (id = the CallUnit),
+//               landing at start+latency
+//   Scope    -> 0 (id = the ScopeUnit), a func-scope combinational cone
 //===----------------------------------------------------------------------===//
 
 struct Source {
@@ -125,9 +119,9 @@ struct Source {
 struct FuncUnit {
   UnitId id = 0;
   // What this unit realizes, agreed on by every op bound here: two units may
-  // be folded only if their identities are equal. It carries the realization
-  // the emitter builds (a `comb` primitive or an IP instance), the result
-  // type, and the fields the RTL module name is spelled from.
+  // be folded only if their identities are equal. Carries the realization the
+  // emitter builds, the result type, and the fields the RTL module name is
+  // spelled from.
   OperatorIdentity identity;
   unsigned latency = 0;  // result available `latency` cycles after issue
   bool pipelined = true; // accepts a new input every cycle
@@ -137,15 +131,13 @@ struct FuncUnit {
 
   // Ops bound here, each with its issue cycle (residue mod II in a cyclic
   // region). Sharing puts several non-conflicting ops in this list. NEVER
-  // empty: the unit table IS the allocation, so a unit exists because ops are
-  // bound to it, and `allocateUnits` rebuilds the table rather than emptying
-  // the entries it folds away.
+  // empty: a unit exists because ops are bound to it.
   llvm::SmallVector<std::pair<Operation *, unsigned>, 1> boundOps;
 
   /// The representative bound op: the one whose operands shape the unit's
-  /// input ports and whose location names it. What the unit is lives in
-  /// `identity`. The choice of `front()` is arbitrary but must be the same
-  /// everywhere, so use this rather than `boundOps.front()`.
+  /// input ports and whose location names it. The choice of `front()` is
+  /// arbitrary but must be the same everywhere, so use this rather than
+  /// `boundOps.front()`.
   Operation *repOp() const {
     assert(!boundOps.empty() &&
            "a unit with no bound op has no representative");
@@ -158,35 +150,31 @@ struct FuncUnit {
   // register.
   llvm::SmallVector<Source, 2> inputs;
 
-  // Per-input reduction identity (parallel to `inputs`). A recurrence input is
-  // the port that reads a loop-carried iter_arg, and it carries that iter_arg's
-  // init here, so the emitter re-injects the identity on the port at the first
-  // iteration and a retriggered reduction restarts each outer pass. None for
-  // every non-recurrence input. This is the sole init mechanism; a register in
-  // the recurrence cycle is a plain delay. It lives on the input port rather
-  // than a register because the widened idiom trunc(add(ext(acc),ext(x))) reads
-  // acc through a bare wire, not a tap.
+  // Per-input reduction identity (parallel to `inputs`). A recurrence input
+  // carries the init of the loop-carried iter_arg it reads, which the emitter
+  // re-injects on the port at the first iteration; None for every
+  // non-recurrence input. This is the sole init mechanism, and it lives on the
+  // input port rather than a register because the widened idiom
+  // trunc(add(ext(acc),ext(x))) reads acc through a bare wire, not a tap.
   llvm::SmallVector<Source, 2> inputInits;
 
   // Per-input recurrence distance in iterations (parallel to `inputInits`); the
   // emitter re-injects `inputInits[k]` for the first `inputInitDist[k]` runs. 1
   // for an ordinary distance-1 recurrence; >1 for a chained carry (a 2nd-order
-  // shift register `ym2 = ym1; ym1 = y` gives ym2 distance 2, so its init must
-  // hold for the first two iterations, not just the first).
+  // shift register `ym2 = ym1; ym1 = y` gives ym2 distance 2).
   llvm::SmallVector<unsigned, 2> inputInitDist;
 };
 
 /// A combinational cell at FUNC SCOPE, outside every region: one op of the
 /// arith cone the reifier leaves in the module body when a top-level loop's
 /// bound or a guard's predicate is an expression rather than a value the
-/// datapath already carries (`for i in range(start, m+1)`, `if k == 0` before
-/// a `dcp.select`).
+/// datapath already carries.
 ///
 /// Not a `FuncUnit`: it belongs to no region, issues on nothing, and has no
 /// clock, register chain or stall shell. SSA dominance closes its input set to
 /// scalar kernel arguments, literals, top-level survivors and earlier cones,
 /// all HELD, so it is a pure function of settled registers. Its one timing
-/// obligation is a composition edge, carried by `recordSiblingDeps` chasing
+/// obligation is a composition edge, recorded by `recordSiblingDeps` chasing
 /// through the cone to the regions its inputs come from.
 struct ScopeUnit {
   unsigned id = 0;
@@ -222,51 +210,43 @@ struct MemUnit {
   bool external = false;   // a func-argument memref (bare interface, no AXI)
   unsigned width = 0;      // element width in bits
   unsigned depthWords = 0; // elements per bank
-  // The memref's `allo.part` decomposition: which axes are partitioned, by
-  // what factor and kind, and the resulting per-bank shape. Decoded ONCE here
-  // rather than re-parsed by each consumer that needs it (the boundary port
-  // set, the address crossbar, the per-bank depth, the manifest layout), since
-  // it is a fixed property of the memref. An unpartitioned memref decodes to a
+  // The memref's `allo.part` decomposition: which axes are partitioned, by what
+  // factor and kind, and the resulting per-bank shape. Decoded ONCE here rather
+  // than re-parsed by each consumer. An unpartitioned memref decodes to a
   // single bank whose `bankShape` is the full shape, so this is total: no
   // consumer needs an "is it banked" guard before reading it.
   BankLayout layout;
   unsigned numBanks = 1; // == layout.numBanks (1 = unbanked or registers)
   /// This memory's banks are SKEWED and its accesses carry slots rather than
   /// banks (`Access::staticBank`), so they are read through lane-shared ports
-  /// instead of routed. `layout.skew()` states the layout fact; this states
-  /// that the slots were actually assigned, which `assign-banks` declines for
-  /// an argument array and for one whose accesses do not share a bank class.
-  /// False on a skewed memory that fell back, which then crossbars like any
-  /// other.
+  /// instead of routed. False on a skewed layout whose slots `assign-banks`
+  /// declined to assign, which then crossbars like any other.
   bool skewed = false;
   /// This argument crosses the TOP boundary completely partitioned, arriving
   /// as one port per ELEMENT rather than an addressed interface
   /// (`external && dp.atTop && layout.registers`). A complete partition commits
   /// the scheduler to unlimited combinational ports, which only an
   /// element-per-port boundary delivers (an addressed port serves one element
-  /// per cycle). Below the top the owning storage (`seq.hlmem`, or the
-  /// scattered argument's own ports) serves an ordinary addressed port.
+  /// per cycle). Below the top the owning storage serves an ordinary addressed
+  /// port.
   bool scattered = false;
   /// The module ports holding one element of a `scattered` argument: the input
   /// it arrives on, and the output + write-enable it leaves on. A direction the
-  /// kernel does not use has no port, so exactly the unused ones are empty, and
-  /// the DIRECTION is what decides the names (`A_k` when only one is live,
-  /// `A_k_in` / `A_k_out` when both are, which is the rule Vitis follows).
+  /// kernel does not use has no port, and the DIRECTION decides the names
+  /// (`A_k` when only one is live, `A_k_in` / `A_k_out` when both are, which is
+  /// the rule Vitis follows).
   struct ElemPort {
     std::string in, out, we;
   };
-  /// One per element, flat row-major, when `scattered`. Composed once by
-  /// `enumerateBoundaryPorts`, which is where the whole boundary naming lives;
-  /// empty for every other memory.
+  /// One per element, flat row-major, when `scattered`; composed by
+  /// `enumerateBoundaryPorts`. Empty for every other memory.
   llvm::SmallVector<ElemPort> elemPorts;
   MemoryImplEnum impl = MemoryImplEnum::LUTRAM; // resolved storage primitive
 
   // Access latency of `impl`, the same numbers the scheduler stamped onto this
   // memref's `dcp.load`/`dcp.store` (asserted per access in `bindResource`).
   // The consumer's register depth was solved as `tY - (start + readLatency)`,
-  // so ports must be built at exactly these latencies; kept here rather than
-  // re-derived per site since a call-mastered buffer has no access to read
-  // them off.
+  // so ports must be built at exactly these latencies.
   unsigned readLatency = 0;
   unsigned writeLatency = 1;
 
@@ -294,21 +274,16 @@ struct MemUnit {
     unsigned portIdx = kNoPort;
     /// The boundary port group's base name (`A_rd0`), from which every field
     /// port is composed (`A_rd0_addr`, ...); a data-dependent banked access
-    /// additionally suffixes a bank (`A_rd0_b2`, see `extPorts`). Composed once
-    /// with `portIdx`, since a NAME is as much the port's identity as its slot
-    /// is, and it is the C++/Python manifest contract. Empty for an internal
-    /// memory's access, which takes no module port.
+    /// additionally suffixes a bank (`A_rd0_b2`, see `extPorts`). It is as much
+    /// the port's identity as `portIdx` is, and it is the C++/Python manifest
+    /// contract. Empty for an internal memory's access.
     std::string portBase;
     /// Which bank this access routes to, when its memref is partitioned
     /// (`numBanks > 1`): the index `assign-banks` assigned it, or empty to
     /// crossbar over all `numBanks` banks. 0 for an unbanked memref.
-    /// `externalBank` pairs it with the memref's bank count.
-    ///
-    /// READ, not derived (`assignedBankOf` writes every access, including
-    /// unbanked ones), so it matches what the scheduler's port model was
-    /// billed against before the solve. Defaults to crossbar rather than bank
-    /// 0, so an access on some unreached future path is merely wasteful
-    /// instead of silently routed to the wrong storage.
+    /// `externalBank` pairs it with the memref's bank count. Defaults to
+    /// crossbar rather than bank 0, so an access on some unreached future path
+    /// is merely wasteful instead of silently routed to the wrong storage.
     ///
     /// Under a SKEWED layout this holds a SLOT, not a bank: the physical bank
     /// is the slot rotated by a runtime value shared with the array's other
@@ -333,13 +308,9 @@ struct MemUnit {
     /// ADDRESS STRENGTH REDUCTION. This access's address is `base` plus one
     /// register per term (a scaled counter, or a digit of one, that the
     /// controller advances instead of rebuilding arithmetic every cycle) plus
-    /// `residual` evaluated over `addr`. `planAddressGenerators`/
-    /// `splitAddress` decide the split; `buildAddr` builds it.
-    ///
-    /// PARTIAL: a term reduces or not on its own, so a data-dependent
-    /// subscript doesn't cost the reduction on the row stride beside it. With
-    /// nothing reduced, `terms` is empty and `residual` holds the whole
-    /// expression.
+    /// `residual` evaluated over `addr`. PARTIAL: a term reduces or not on its
+    /// own, so with nothing reduced `terms` is empty and `residual` holds the
+    /// whole expression.
     struct Reduced {
       llvm::SmallVector<ScaledTerm, 3> terms;
       /// The expression's constant, and ZERO whenever a term exists: a register
@@ -348,24 +319,21 @@ struct MemUnit {
       int64_t base = 0;
       AffineExpr residual; // null when the whole expression reduced
       /// Registers the RESIDUAL reads (`SplitAddress::reads`), in the order it
-      /// names them: a digit the address does not sum but an operator on top of
-      /// it wants cheap. Appended to the operand list `buildAddr` evaluates the
+      /// names them. Appended to the operand list `buildAddr` evaluates the
       /// residual over, so they land on the symbol positions it named.
       llvm::SmallVector<ScaledTerm, 2> reads;
     };
     /// The element index within the bank, and the bank digit when one is
-    /// decoded at run time. Two cones off the same operands
-    /// (`addressExprsOf`), reduced by the one definition and built by the one
-    /// builder: a bank digit is `(counter floordiv D) mod F`, which is a
-    /// register as much as a row stride is.
+    /// decoded at run time: two cones off the same operands (`addressExprsOf`).
+    /// A bank digit is `(counter floordiv D) mod F`, which is a register as
+    /// much as a row stride is.
     Reduced offset;
     Reduced bank;
     /// How many cycles late this access needs the SCALED COUNTERS, i.e. the
     /// delay its counter operands would otherwise be tapped at. They run live,
     /// so their sum is delayed once rather than each operand separately, which
     /// is equivalent and costs less register. The residual's operands arrive
-    /// already delayed, so it is added after the chain and this does not apply
-    /// to it.
+    /// already delayed, so this does not apply to it.
     unsigned addrDelay = 0;
   };
   llvm::SmallVector<Access, 2> accesses;
@@ -373,20 +341,17 @@ struct MemUnit {
 
 /// One bound access, referenced as (owning cell id, access index): a memory
 /// access is `dp.mems[id].accesses[idx]`, a stream access
-/// `dp.streams[id].accesses[idx]`. Used both for the module's boundary port
-/// lists (`Datapath::readPorts` / `writePorts`) and for a region's own accesses
-/// (`RegionBlock::memAccesses` / `streamAccesses`).
+/// `dp.streams[id].accesses[idx]`.
 struct AccRef {
   unsigned id, idx;
 };
 
-/// A sub-kernel call as a multi-cycle datapath node. Built from a
-/// `dcp.instance` and owned by the `RegionBlock` it sits in (a `dcp.sequential`
-/// wrapping the call). The child instance *masters* the memory ports of its
-/// memref operands (it drives their addr/data/we; the parent's `MemUnit`
-/// supplies the storage), so a shared internal buffer becomes a
-/// `seq.read`/`seq.write` the child addresses. Its scalar result lands at
-/// `start + latency` as a survivor.
+/// A sub-kernel call as a multi-cycle datapath node, built from a
+/// `dcp.instance` and owned by the `RegionBlock` it sits in. The child instance
+/// *masters* the memory ports of its memref operands (it drives their
+/// addr/data/we; the parent's `MemUnit` supplies the storage), so a shared
+/// internal buffer becomes a `seq.read`/`seq.write` the child addresses. Its
+/// scalar result lands at `start + latency` as a survivor.
 struct CallUnit {
   CallId id = 0;
   Operation *invoke = nullptr; // the dcp::DCPathInstanceOp
@@ -399,14 +364,14 @@ struct CallUnit {
   unsigned start = 0; // region-relative issue cycle (the invoke `start`)
   /// Whether the child completes at a statically known cycle, so a consumer may
   /// be released by a static offset instead of its real `done`. This is the
-  /// invoke's DECLARED `determinacy`, and it is deliberately not
-  /// `latency.has_value()`: a dynamic-trip callee publishes a latency *bound*
-  /// and is still indeterminate, so the two disagree exactly there.
+  /// invoke's DECLARED `determinacy`, deliberately not `latency.has_value()`:
+  /// a dynamic-trip callee publishes a latency *bound* and is still
+  /// indeterminate.
   bool determinate = false;
   /// An `await` SPAWN rather than a scheduled call: it starts with its
   /// container and is ordered thereafter only by FIFO back-pressure, so it has
   /// no offset to be placed at and offers a consumer nothing to be
-  /// time-triggered off. The `Concurrent` start policy at node granularity.
+  /// time-triggered off.
   bool async = false;
 
   /// One memory *port* the child drives for a mastered memref operand. A callee
@@ -454,19 +419,17 @@ struct CallUnit {
   };
   llvm::SmallVector<StreamArg, 1> streamArgs;
 
-  /// The child result-output port per scalar result. The
-  /// result's datapath Source is Source::Call{id, k} (registered in
-  /// producerOf), captured into this region's survivor exactly like a compute
-  /// result: a sibling reads it as Source::Survivor{region, k}.
+  /// The child result-output port per scalar result. The result's datapath
+  /// Source is Source::Call{id, k}, captured into this region's survivor
+  /// exactly like a compute result: a sibling reads it as
+  /// Source::Survivor{region, k}.
   llvm::SmallVector<std::string, 1> resultPorts;
 
-  /// An earlier sibling call this one must start after, and why. Composition
-  /// predecessors at CALL granularity, the exact analogue of
-  /// `RegionBlock::predecessors` on the instance substrate. Derived once by
-  /// `DatapathBuilder::recordCallDeps`, by a rule that depends on how the
-  /// owning region composes: a scheduled composition orders its children by
-  /// their placed `start`, while a concurrent one has no schedule to order them
-  /// by and must read the hazard directions.
+  /// An earlier sibling call this one must start after, and why: composition
+  /// predecessors at CALL granularity. Derived by `recordCallDeps` by a rule
+  /// that depends on how the owning region composes, since a scheduled
+  /// composition orders its children by their placed `start` while a concurrent
+  /// one has no schedule to order them by and must read the hazard directions.
   struct Pred {
     CallId call;
     /// The edge is a scalar RESULT hand-off, not a shared array. Such an edge
@@ -499,19 +462,18 @@ struct StreamChannel {
   bool internal = false;
   /// Initial tokens (a `stream.create` initializer): the channel's history is
   /// `[init] ++ [produced]`, which is what breaks a feedback cycle's start
-  /// dependence. Every process on an unseeded cycle would otherwise block
-  /// reading an empty channel. Realized as a consumer-side prepend shim, not as
-  /// tokens pushed into the FIFO. Null for an unseeded channel.
+  /// dependence, since every process on an unseeded cycle would block reading
+  /// an empty channel. Realized as a consumer-side prepend shim, not as tokens
+  /// pushed into the FIFO. Null for an unseeded channel.
   Attribute init;
 
   /// A channel end that is a CHILD PORT rather than one of this module's own
   /// `get`/`put` accesses: `(call, index into that CallUnit's streamArgs)`. A
-  /// container composes processes, so its channels are wired end-to-end between
-  /// `hw.instance`s and it issues no access of its own; a leaf's channels have
-  /// accesses and no call ends. A channel may have SEVERAL consumer ends, with
-  /// the fan-out realized as one FIFO per reader pushed in lock-step, but only
-  /// one producer end (`validateDatapath`: a merge has no deterministic token
-  /// interleaving).
+  /// container wires its channels end-to-end between `hw.instance`s and issues
+  /// no access of its own; a leaf's channels have accesses and no call ends. A
+  /// channel may have SEVERAL consumer ends, with the fan-out realized as one
+  /// FIFO per reader pushed in lock-step, but only one producer end
+  /// (`validateDatapath`: a merge has no deterministic token interleaving).
   struct CallEnd {
     CallId call;
     unsigned arg; // index into `dp.calls[call].streamArgs`
@@ -538,11 +500,10 @@ struct StreamChannel {
 struct Mux {
   MuxId id = 0;
   llvm::SmallVector<Source, 2> sources;
-  // The op whose issue selects each source (parallel to `sources`): the source
-  // is driven onto the shared unit's input on the cycle that op consumes it, so
-  // the select is `delayValid(issue, dcpStart(op))`, the same per-op activation
-  // pulse a store's write-enable uses. The MRT guarantees these are mutually
-  // exclusive (disjoint residues), so the emitter builds a one-hot select.
+  // The op whose issue selects each source (parallel to `sources`): the select
+  // is `delayValid(issue, dcpStart(op))`, the same per-op activation pulse a
+  // store's write-enable uses. The MRT guarantees these are mutually exclusive
+  // (disjoint residues), so the emitter builds a one-hot select.
   llvm::SmallVector<Operation *, 2> selectOps;
   RegionId region = 0; // region whose issue pulse times the selects
 };
@@ -550,13 +511,11 @@ struct Mux {
 /// The combinational depth, in LUT levels, of the select a mux of \p sources
 /// sources costs: `ceil(log2 k)`, since the emitter builds a one-hot AND-OR
 /// reduction (`EmitContext::oneHotSelect`) and each level halves the term
-/// count. Zero for a single source, which is a wire. Levels rather than
-/// nanoseconds, so the technology stays in the device.
+/// count. Zero for a single source, which is a wire.
 unsigned muxLevels(unsigned sources);
 
 /// What one such level costs in ns: the device's OR row, since the select is
-/// an AND-OR reduction rather than a chain of 2:1 selects. The policy that
-/// decides a fold and the check that rejects a bad one price it here.
+/// an AND-OR reduction rather than a chain of 2:1 selects.
 double muxLevelDelay(const OperatorLibrary &lib);
 
 /// The sub-cycle room \p u's bound ops have left, in ns: the smallest
@@ -568,9 +527,8 @@ double unitSlack(const FuncUnit &u, float cycleTime,
                  const OperatorLibrary &lib);
 
 /// A top-level scalar INPUT port (a scalar kernel argument). Memref arguments
-/// become external `MemUnit`s instead, and a scalar function result is a
-/// `Result` (driven by a survivor), so every IOPort is an input by
-/// construction.
+/// become external `MemUnit`s instead and a scalar function result is a
+/// `Result`, so every IOPort is an input by construction.
 struct IOPort {
   IOId id = 0;
   Value value;
@@ -587,8 +545,7 @@ struct ConstCell {
 /// A scalar function result, exposed as an output port driven by `source` (a
 /// returning region's survivor, a passthrough scalar input, or a constant) and
 /// valid when the function's `done` rises. An array (memref) result becomes a
-/// trailing out-param (the buffer-results-to-out-params prepass) before emit,
-/// so only scalars reach here.
+/// trailing out-param before emit, so only scalars reach here.
 struct Result {
   Source source;
   Type type;
@@ -596,26 +553,22 @@ struct Result {
 };
 
 //===----------------------------------------------------------------------===//
-// Regions. One RegionBlock per dcp region op (dcp.pipeline / dcp.sequential).
-// Cyclic blocks are pipelined loops (constant trip, II-paced); acyclic blocks
-// are straight-line. Blocks run in program order with no overlap, so a single
-// sequential hand-off chains them.
+// Regions. One RegionBlock per dcp region op. Cyclic blocks are II-paced
+// pipelined loops; acyclic blocks are straight-line, and blocks run in program
+// order with no overlap.
 //===----------------------------------------------------------------------===//
 
-/// How a region produces one of its results. One shape covers every regime,
-/// so a consumer reads the same three fields whichever controller runs.
-/// A region result is always a *survivor register*: the value is latched when
-/// it lands and held for whoever reads it (a sibling region, an enclosing
-/// container's next iteration, the function's output port), which is why a
-/// counted loop's final accumulator, a while's frozen recurrence and a guard's
-/// muxed branch value are one concept and not three.
+/// How a region produces one of its results. One shape covers every regime, so
+/// a consumer reads the same three fields whichever controller runs. A region
+/// result is always a *survivor register*: the value is latched when it lands
+/// and held for whoever reads it (a sibling region, an enclosing container's
+/// next iteration, the function's output port).
 ///
 ///   counted loop / while | `value` = the loop-carried next (the terminator's
 ///                        |   `dcp.uncondition` / `dcp.condition` operand),
 ///                        |   `init` = the matching `inits` operand. The two
 ///                        |   regimes differ only in the pulse the capture keys
-///                        |   off, which is the controller's business, not the
-///                        |   model's.
+///                        |   off.
 ///   sequential           | `value` = the yielded value; no recurrence, so
 ///                        |   `init` is None (it lands exactly once).
 ///   guard (dcp.select)   | `value` = the THEN arm's yield, `elseValue` = the
@@ -641,9 +594,7 @@ struct RegionBlock {
   Operation *op = nullptr;
 
   /// STRUCTURAL SHAPE, axis 1 of the controller discriminant (shape x
-  /// termination class picks the controller). Derived once here instead of
-  /// recomputed from `children.empty()` / `guard` / `callUnits.empty()` at
-  /// every consumer, including the validator.
+  /// termination class picks the controller).
   ///
   /// The populated cells:
   ///
@@ -669,10 +620,10 @@ struct RegionBlock {
 
   /// Whether at most ONE pass of this region is in flight. A cyclic region
   /// overlaps its iterations at `ii` by construction; every other family runs
-  /// a pass to its `done` before the next is issued. Named here rather than
-  /// re-derived at each consumer, because what reads it (`RegionTag`, so that
-  /// `delayValid` may time a long delay with a counter rather than one
-  /// flip-flop per cycle) is relying on the overlap rule, not on the kind.
+  /// a pass to its `done` before the next is issued. What reads it
+  /// (`RegionTag`, so that `delayValid` may time a long delay with a counter
+  /// rather than one flip-flop per cycle) relies on the overlap rule, not on
+  /// the kind.
   bool singlePass() const { return kind == Kind::Acyclic; }
 
   // Counted-loop induction: the IV runs `lb, lb+step, ...` up to (excluding)
@@ -697,29 +648,25 @@ struct RegionBlock {
   Type counterType;
   // TERMINATION class as the emitter discriminates it, axis 2 of the pair
   // above. A while loop (a `dcp.condition` terminator) is a flushing pipeline
-  // whose exit is data-dependent. The declared `determinacy` below is the same
-  // axis read off the IR, and the two agree where a while is always declared
-  // `Conditional` (asserted in `deriveShapes`), but NOT conversely: the
-  // reifier also stamps a `dcp.select` `Conditional`, while `conditional`
-  // stays false for it since a guard is not a flushing loop.
+  // whose exit is data-dependent. The declared `determinacy` below agrees where
+  // a while is always declared `Conditional` (asserted in `deriveShapes`), but
+  // NOT conversely: the reifier also stamps a `dcp.select` `Conditional`, while
+  // `conditional` stays false for it since a guard is not a flushing loop.
   bool conditional = false;
-  // The two raw structural flags `shape` is derived from, recorded by the
-  // builder as it walks. Consumers should read `shape`.
+  // The two raw structural flags `shape` is derived from. Consumers should read
+  // `shape`.
   bool guard = false;      // this region op is a dcp.select
   bool container = false;  // nests another dcp region in EITHER arm, so a
                            // guard with children is `container` too and this
                            // is not the same as `shape == Container`
   std::string counterName; // source loop IV name (its NameLoc), for a readable
-                           // iteration-counter wire; empty if the loop's IV
-                           // carried no name (best-effort)
+                           // iteration-counter wire; empty when the IV carried
+                           // no name (best-effort)
   /// A REGISTER this region carries beside its own counter, holding
   /// `coeff * digit` of it for a coefficient and a digit an access's address
-  /// needs, tracked incrementally rather than rebuilt.
-  ///
-  /// ADDRESS STRENGTH REDUCTION: the constant multiply that dominates an
-  /// address (a row stride of 400 is a three-digit signed-digit network) is
-  /// unnecessary once an induction variable makes consecutive iterations
-  /// differ by a constant.
+  /// needs, tracked incrementally rather than rebuilt: an induction variable
+  /// makes consecutive iterations differ by a constant, so the constant
+  /// multiply that dominates an address is unnecessary.
   ///
   /// A DIGIT of the counter rides the same register with two more constants.
   /// `(x floordiv D) mod K` advances by nothing on most iterations and by one
@@ -763,34 +710,29 @@ struct RegionBlock {
   /// values at all.
   llvm::SmallVector<AddrStride> addrStrides;
 
-  // Composition class, DERIVED by `dcpRegionTiming` in `addRegion`. The region
-  // op carries it as an attribute too, but only as a report stamped from that
-  // same function, so this reads the region and not the report.
-  //
+  // Composition class, DERIVED by `dcpRegionTiming` in `addRegion` rather than
+  // read back off the report the same function stamps on the region op.
   // `deriveShapes` asserts the one cross-axis invariant, that `conditional`
-  // implies `determinacy == conditional`, tying the emitter's termination
-  // discriminant to the derived class.
+  // implies `determinacy == conditional`.
   DeterminacyEnum determinacy = DeterminacyEnum::Indeterminate;
 
   // The TERMINAL cycle the latency model was composed off (`drain` on the
   // region op), against which `HWEmitter::emitRegion` checks the `drainStage`
-  // it independently derives from the built datapath.
-  //
-  // The one place a model of the hardware meets the hardware; every other check
-  // in the compiler compares one model against another. A leaf's `done` rises
+  // it independently derives from the built datapath. A leaf's `done` rises
   // `drainStage + 1` cycles after its last issue, so a divergence here is a
   // consumer placed at an offset the hardware does not honour.
   std::optional<int64_t> modelledDrain;
 
   // Composition predecessors: the earlier top-level sibling regions this one
-  // must start after. Only top-level regions populate it, since container
-  // children stay serial. A region depends on an earlier sibling iff they touch
-  // a shared memref (a data hazard or a read-port conflict) or a cross-region
-  // SSA edge (a scalar survivor). Functional units are auto-disjoint under
-  // per-region binding, so shared *memory* is the only cross-region resource.
-  // A region with no predecessors starts concurrently with the kernel; one with
-  // predecessors starts on their joined `done`. Producers precede consumers in
-  // program order, so the relation is a DAG. Set by `recordSiblingDeps`.
+  // must start after, set by `recordSiblingDeps`. Only top-level regions
+  // populate it, since container children stay serial. A region depends on an
+  // earlier sibling iff they touch a shared memref (a data hazard or a
+  // read-port conflict) or a cross-region SSA edge (a scalar survivor);
+  // functional units are auto-disjoint under per-region binding, so shared
+  // *memory* is the only cross-region resource. A region with no predecessors
+  // starts concurrently with the kernel; one with predecessors starts on their
+  // joined `done`. Producers precede consumers in program order, so the
+  // relation is a DAG.
   llvm::SmallVector<RegionId, 2> predecessors;
 
   // Region nesting. A container region drives its `children` in its body; each
@@ -802,8 +744,7 @@ struct RegionBlock {
   // A guard (dcp.select) with a non-empty `else` branch is a *dual* guard: its
   // `children` are the then-branch sub-schedule (run iff the predicate holds)
   // and `elseChildren` are the else-branch sub-schedule (run iff it does not).
-  // Empty for a container loop and for a then-only guard; the two child lists
-  // are the two mutually-exclusive arms.
+  // Empty for a container loop and for a then-only guard.
   llvm::SmallVector<RegionId, 2> elseChildren;
 
   // Cells owned by this region (ids are Datapath-global; these record
@@ -823,9 +764,7 @@ struct RegionBlock {
   // The Sources this region's results come from, indexed by result number (see
   // RegionResult). Empty for a result-less region. For a loop this is also its
   // loop-carried recurrence, with `results[k]` being iter-arg k, since a
-  // counted loop's k-th result IS the final value of its k-th iter-arg. The
-  // emitter reads the same vector whether it captures once at the end (a leaf)
-  // or advances a frozen register per outer iteration (a container).
+  // counted loop's k-th result IS the final value of its k-th iter-arg.
   llvm::SmallVector<RegionResult, 1> results;
 
   // This region's control predicate, as a resolved i1 Source: a while's
@@ -833,12 +772,11 @@ struct RegionBlock {
   // predicate. None for a counted region, which terminates on its counter.
   //
   // A while's condition is a scheduled compute producer (cmpi/cmpf, a
-  // Source::Unit): solved in-body for a leaf while, reified to a start-0
-  // compute for a sequential wrapper. A guard's is that same combinational unit
-  // over the enclosing counter (an affine guard `i > j`) or a scheduled
-  // prologue region's survivor (a data-dependent `flag[j] > 0`). Either way it
-  // is *held* for the run it gates: a guard start-gates its children by it, so
-  // the not-taken arm's stores never fire structurally, with no per-store gate.
+  // Source::Unit); a guard's is that same combinational unit over the enclosing
+  // counter (an affine guard `i > j`) or a scheduled prologue region's survivor
+  // (a data-dependent `flag[j] > 0`). Either way it is *held* for the run it
+  // gates: a guard start-gates its children by it, so the not-taken arm's
+  // stores never fire structurally, with no per-store gate.
   Source condition;
 };
 
@@ -869,11 +807,10 @@ struct Datapath {
 
   // The module's boundary memory ports: every access to an EXTERNAL (func
   // argument) memref, split by role and ordered by (memref, access). An
-  // internal memref is on-chip `seq.hlmem` storage and takes no port, so it
-  // appears in neither list. This is the ONE enumeration. The index of an
-  // access here IS its port identity, mirrored back onto the access as
-  // `MemUnit::Access::portIdx`, and read by the port declaration, the naming
-  // layer, the manifest and the emitter alike.
+  // internal memref is on-chip `seq.hlmem` storage and takes no port. This is
+  // the ONE enumeration: the index of an access here IS its port identity,
+  // mirrored back onto the access as `MemUnit::Access::portIdx` and read by the
+  // port declaration, the naming layer, the manifest and the emitter alike.
   llvm::SmallVector<AccRef> readPorts, writePorts;
 
   // L1 binding decisions the policy writes; the structure above is derived from
@@ -900,27 +837,24 @@ struct Datapath {
   /// The dcp op whose execution produces \p s's value, or null when the Source
   /// has no producing op: a literal, the iteration counter, a kernel input
   /// port, a held value (Reg / Survivor) or a derived mux. The ONE definition
-  /// of the Source -> op mapping, which `Source::outPort`'s per-kind overload
-  /// would otherwise force every consumer to re-spell.
+  /// of the Source -> op mapping.
   Operation *producingOp(const Source &s) const;
 
   /// \p s's compile-time value, when it is an integer literal cell; empty for
-  /// every Source whose value is only known at run time. Lets a consumer fold
-  /// against a bound (an induction step, a recurrence distance) without the
-  /// model carrying a second, constant-only spelling of it.
+  /// every Source whose value is only known at run time.
   std::optional<int64_t> constantOf(const Source &s) const;
 
   void dump(llvm::raw_ostream &os) const;
 
-  /// Log what the allocation cost, per region: compute ops, the units they were
-  /// bound to, and the muxes sharing grew, with their width. A diagnostic, not
-  /// an IR attribute or a manifest field.
+  /// Log what the allocation cost: per region the compute ops, the units they
+  /// were bound to and the muxes sharing grew, then per array its write ports.
+  /// A diagnostic, not an IR attribute or a manifest field.
   void reportAllocation() const;
 
   /// The fewest ports memory \p id can be built with: the largest set of its
   /// accesses that can issue in ONE cycle, counting a child's port as an
-  /// access. With \p writesOnly, only writes are counted, which is what
-  /// defeats block-RAM inference on its own; otherwise every access counts,
+  /// access. With \p writesOnly, only writes are counted, which is the budget a
+  /// RAM's write ports are checked against; otherwise every access counts,
   /// which is what a RAM PORT actually serves (a port reads OR writes in a
   /// cycle, so two writers plus a concurrent reader need three).
   ///
@@ -938,14 +872,14 @@ struct Datapath {
   /// ports. A CALL's write, which this does not index, always lands on port 0.
   ///
   /// Empty when the writes cannot be redistributed and each keeps its own port,
-  /// for either of two reasons. They may need more than \p maxPorts, which the
-  /// caller sets from what its device can build. Or a simultaneous pair may not
-  /// be PROVEN to address different words, which writes on different ports must
-  /// be, having no shared block to order them: only a pair inside one region is
-  /// proven, since a memory dependence there would have made the scheduler
-  /// separate the two by a cycle, a store's SDC row carrying its write latency
-  /// of 1. A call's pair, or one under a concurrent container, is related by
-  /// nothing and refuses the colouring.
+  /// for any of three reasons: `portGraph` declined to relate them, they need
+  /// more than \p maxPorts, which the caller sets from what its device can
+  /// build, or a simultaneous pair is not PROVEN to address different words.
+  /// Writes on different ports must be, having no shared block to order them,
+  /// and only a pair inside one region is proven: a memory dependence there
+  /// would have made the scheduler separate the two by a cycle, a store's SDC
+  /// row carrying its write latency of 1. A call's pair, or one under a
+  /// concurrent container, is related by nothing and refuses the colouring.
   llvm::SmallVector<unsigned> writePortColouring(MemId id,
                                                  unsigned maxPorts) const;
 
@@ -967,9 +901,7 @@ struct Datapath {
 
 //===----------------------------------------------------------------------===//
 // The model visitor. `Source`s are scattered across ~20 slots of the model, so
-// any question of the form "for every driver in this datapath, ..." would
-// otherwise be a hand-rolled sweep that has to be extended for each new slot.
-// `forEachSource` is the one traversal; a new `Source` field is covered by
+// `forEachSource` is the one traversal: a new `Source` field is covered by
 // adding it here, once.
 //===----------------------------------------------------------------------===//
 
@@ -1018,9 +950,8 @@ void forEachSource(
 
 //===----------------------------------------------------------------------===//
 // Timing readers over the scheduled dcp IR. `readyCycleOf` is the single
-// authority for "the cycle a producing op's result lands, relative to its
-// issuing pulse": both the builder (register-depth derivation) and the emitter
-// (result capture) consult it, so the latency model has one definition.
+// authority for the cycle a producing op's result lands, relative to its
+// issuing pulse.
 //===----------------------------------------------------------------------===//
 
 /// Region-relative schedule cycle of a dcp compute/load/store op (its `start`).
@@ -1035,7 +966,7 @@ unsigned readyCycleOf(Operation *op);
 
 /// The datapath's hardware width for a value type: `index` -> `kIndexWidth`, a
 /// float carried as its bit pattern, an integer verbatim. This is the ONE width
-/// rule. The model is value-typed but the emitted carrier is a bit vector, and
+/// rule: the model is value-typed but the emitted carrier is a bit vector, and
 /// the emitter (`uarch::hwType`) and the boundary port model
 /// (`iface::bitWidth`) must not disagree about how wide it is.
 unsigned hwWidth(Type t);
@@ -1046,10 +977,10 @@ unsigned hwWidth(Type t);
 /// data-dependent (`bank` empty -> a crossbar over all `factor` interfaces).
 ///
 /// Both halves are stored on the model (`MemUnit::numBanks` +
-/// `Access::staticBank`), resolved once by the builder; this pairs them under
-/// the name the consumers ask the question by. It lives here, not in an emitter
-/// header, because the boundary/naming layer (`Naming.h`,
-/// `iface::ModuleInterface`) needs it and must depend on L2 only.
+/// `Access::staticBank`); this pairs them under the name the consumers ask the
+/// question by. It lives here, not in an emitter header, because the
+/// boundary/naming layer (`Naming.h`, `iface::ModuleInterface`) needs it and
+/// must depend on L2 only.
 struct ExternalBanking {
   unsigned factor = 1;          // physical banks (1 = unbanked)
   std::optional<unsigned> bank; // static bank, or empty = data-dependent

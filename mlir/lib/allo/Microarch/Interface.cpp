@@ -16,8 +16,7 @@ namespace mlir::allo::iface {
 
 namespace {
 // The boundary carries a value exactly as wide as the datapath does, so the
-// port model reads the ONE width rule rather than restating it (`uarch::hwType`
-// is the same rule with an OpBuilder, for making the `IntegerType`).
+// port model reuses the datapath's width rule rather than restating it.
 using uarch::hwWidth;
 
 int argOf(Value v) {
@@ -25,14 +24,14 @@ int argOf(Value v) {
   return ba ? (int)ba.getArgNumber() : -1;
 }
 
-// The element-space bank decomposition of \p memref, in the manifest's shape:
-// the host reproduces it to shard a numpy argument across the bank interfaces
-// exactly as the emitted address arithmetic does.
+// The element-space bank decomposition of \p mu, in the manifest's shape: the
+// host reproduces it to shard an argument across the bank interfaces exactly as
+// the emitted address arithmetic does.
 std::pair<std::vector<int64_t>, std::vector<Memory::Axis>>
 layoutOf(const uarch::MemUnit &mu) {
   auto shape = cast<MemRefType>(mu.memref.getType()).getShape();
   std::vector<Memory::Axis> axes;
-  for (const BankLayout::Axis &a : mu.layout.axes) // decoded by the builder
+  for (const BankLayout::Axis &a : mu.layout.axes)
     axes.push_back({(int)a.dim, a.factor, bankKindName(a.kind).str()});
   return {{shape.begin(), shape.end()}, std::move(axes)};
 }
@@ -40,8 +39,8 @@ layoutOf(const uarch::MemUnit &mu) {
 
 ModuleInterface::ModuleInterface(const uarch::Datapath &dp) {
   ArrayRef<uarch::AccRef> reads = dp.readPorts, writes = dp.writePorts;
-  // Every IOPort is a scalar kernel argument; a scalar *result* is a
-  // `dp.results` entry, declared further down.
+  // Every IOPort is a scalar kernel argument; a scalar result is a `dp.results`
+  // entry, declared further down.
   for (const uarch::IOPort &io : dp.ios)
     scalars.push_back(
         {argOf(io.value), hwWidth(io.type), scalarPortName(dp, io)});
@@ -56,8 +55,7 @@ ModuleInterface::ModuleInterface(const uarch::Datapath &dp) {
   }
 
   // A scattered argument is declared per element, off the memory rather than
-  // off its accesses, so it appears here and in neither `reads` nor `writes`
-  // (its accesses take no port group at all).
+  // off its accesses, so it appears in neither `reads` nor `writes`.
   for (const uarch::MemUnit &mu : dp.mems) {
     if (!mu.scattered)
       continue;
@@ -72,9 +70,8 @@ ModuleInterface::ModuleInterface(const uarch::Datapath &dp) {
                          std::move(elems)});
   }
 
-  // Each external access expands to one interface per boundary bank (one when
-  // unbanked / statically routed, N for a data-dependent access spanning
-  // banks).
+  // Each external access expands to one interface per boundary bank: one when
+  // unbanked or statically routed, N for a data-dependent access.
   auto group = [&](uarch::AccRef r, bool write) {
     const auto &mu = dp.mems[r.id];
     const auto &acc = mu.accesses[r.idx];
@@ -95,20 +92,20 @@ ModuleInterface::ModuleInterface(const uarch::Datapath &dp) {
   for (uarch::AccRef r : writes)
     this->writes.push_back(group(r, /*write=*/true));
 
-  // A CallUnit-mastered *boundary* argument has no MemUnit::Access (the child
-  // drives the port), so it's declared here with the same `<name>_<role><i>`
-  // naming as a normal port; emitCalls passes the child's ports through.
+  // A CallUnit-mastered boundary argument has no MemUnit::Access (the child
+  // drives the port), so it is declared here with the same `<name>_<role><i>`
+  // naming as a normal port.
   for (const uarch::CallUnit &cu : dp.calls)
     for (const uarch::CallUnit::MemArg &ma : cu.memArgs) {
       if (!ma.isBoundary)
         continue;
-      // One port group per accessor, so concurrent or serial accessors of one
-      // argument get separate groups backed by the same array. A cyclic
-      // argument gets one group per bank.
+      // One port group per accessor, so several accessors of one argument get
+      // separate groups backed by the same array; a cyclic argument gets one
+      // group per bank.
       const auto &mu = dp.mems[ma.mem];
       unsigned w =
           hwWidth(cast<MemRefType>(mu.memref.getType()).getElementType());
-      const auto &base = ma.topBase; // indexed per role by the builder
+      const auto &base = ma.topBase;
       auto [shape, axes] = layoutOf(mu);
       Memory m{argOf(mu.memref),
                ma.isWrite,
@@ -213,8 +210,7 @@ std::string ModuleInterface::toJSON() const {
     Array shape, elements;
     for (int64_t d : rf.shape)
       shape.push_back(d);
-    // An unused direction has no port, so its key is absent rather than empty:
-    // a consumer tests for the port it needs instead of for a sentinel.
+    // An unused direction has no port, so its key is absent rather than empty.
     for (const RegisterFile::Element &e : rf.elements) {
       Object o;
       if (!e.in.empty())
@@ -254,8 +250,8 @@ std::string ModuleInterface::toJSON() const {
 
   Value root = Object{{"module", module},
                       {"symbol", symbol},
-                      // The fixed control ABI, published so no consumer has to
-                      // hard-code it on its own side.
+                      // The fixed control ABI, published so no consumer
+                      // hard-codes it.
                       {"control", Object{{"clk", uarch::kClk},
                                          {"rst", uarch::kRst},
                                          {"start", uarch::kStart},

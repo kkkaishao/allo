@@ -42,16 +42,15 @@ struct DatapathBuilder {
   llvm::DenseMap<Value, MemId> memOf;
   llvm::DenseMap<Value, StreamId> streamOf;
   // Keyed by the produced VALUE, not its op: a multi-result producer (a
-  // sub-kernel call returning several scalars) drives one Source per result,
-  // and every lookup site has the Value in hand anyway.
+  // sub-kernel call) drives one Source per result.
   llvm::DenseMap<Value, Source> producerOf;
   llvm::DenseMap<Value, Source> ioOf;
   llvm::DenseMap<Operation *, unsigned> regionIdxOf;
 
   // Interconnect-derivation scratch (transient; see deriveInterconnect).
   // A register is keyed by (held value, consuming region): the SAME value (an
-  // enclosing loop's counter) can be read in several nested regions, and each
-  // needs its own delay chain built in its own region.
+  // enclosing loop's counter) can be read in several nested regions, each
+  // needing its own delay chain built in its own region.
   using RegKey = std::pair<::mlir::Value, unsigned>;
   struct RegDepth { // a register-fed input slot, patched once its chain exists
     Source *slot;
@@ -98,20 +97,17 @@ struct DatapathBuilder {
   /// the parent/child linkage. Returned by value; pushed by `build`.
   RegionBlock addRegion(Operation *regionOp, RegionId ridx);
   /// Derive every region's `shape` discriminant (see `RegionBlock::Shape`) and
-  /// assert the structural invariants each shape carries. Runs right after the
-  /// region walk, the earliest point where both the parent/child edges and
-  /// the CallUnits it reads are complete (unlike `addRegion`, which sees
-  /// neither for the region it is building).
+  /// assert the structural invariants each shape carries. Runs after the region
+  /// walk, the earliest point where the parent/child edges and the CallUnits it
+  /// reads are complete.
   void deriveShapes();
-  /// Bind one body op to its resource: the dispatch, one arm per resource kind
-  /// (below) plus the kinds that bind nothing (a nested region, a literal, a
-  /// declaration). An op matching none of them is reported and marks the build
-  /// infeasible, rather than being silently dropped from the hardware.
+  /// Bind one body op to its resource: one arm per resource kind, plus the
+  /// kinds that bind nothing (a nested region, a literal, a declaration). An op
+  /// matching none is reported and marks the build infeasible.
   void bindResource(Operation *op, RegionBlock &rb);
   /// A `dcp.instance` -> a CallUnit owned by \p rb: one MemArg per child memory
-  /// port (the child masters them), one scalar-input slot per scalar operand
-  /// (its driver resolved later, by `recordCallScalars`), and a `Source::Call`
-  /// producer per scalar result.
+  /// port, one scalar-input slot per scalar operand (its driver resolved later
+  /// by `recordCallScalars`), and a `Source::Call` producer per scalar result.
   void bindCall(dcp::DCPathInstanceOp inv, RegionBlock &rb);
   /// A `stream.get` / `stream.put` -> one StreamChannel access. Both directions
   /// bind identically; only a get produces a token.
@@ -134,118 +130,90 @@ struct DatapathBuilder {
   /// (a func block arg). \p isInput sets the channel direction on first
   /// touch (a get => input, a put => output).
   StreamId getOrCreateStream(Value stream, bool isInput);
-  /// Record how each region produces its results (`rb.results`) and, for the
-  /// two regimes that have one, its control predicate (`rb.condition`). A
-  /// region result is a survivor register; a loop's k-th result is the final
-  /// value of its k-th iter-arg (see `RegionResult`). No-op for a
-  /// result-less counted region.
+  /// Record how each region produces its results (`rb.results`) and, where it
+  /// has one, its control predicate (`rb.condition`). A region result is a
+  /// survivor register; a loop's k-th result is its k-th iter-arg's last value.
   void recordRegionResults(llvm::ArrayRef<Operation *> regionOps);
   /// Resolve each `dcp.instance`'s scalar operands into its CallUnit's
-  /// `scalarIns`. Separate from `bindResource`, which creates the CallUnit
-  /// during the region walk: a Source resolution needs the complete region
-  /// model (see `resolveValue`).
+  /// `scalarIns`. Separate from `bindResource`: a Source resolution needs the
+  /// complete region model (see `resolveValue`).
   void recordCallScalars();
-  /// Record every CallUnit's composition predecessors (`cu.predecessors`), the
-  /// instance-substrate counterpart of `recordSiblingDeps`. A SCHEDULED
-  /// composition orders its children by their placed `start` and only gates
-  /// an earlier or indeterminate producer; a CONCURRENT one places every child
-  /// at 0 and must read the hazard direction (RAW / WAW / WAR) to order them
-  /// at all. Runs after `recordCallScalars`, whose Sources carry the
-  /// scalar-result edges.
+  /// Record every CallUnit's composition predecessors (`cu.predecessors`). A
+  /// SCHEDULED composition orders its children by their placed `start` and only
+  /// gates an earlier or indeterminate producer; a CONCURRENT one places every
+  /// child at 0 and orders them by hazard direction (RAW / WAW / WAR) instead.
+  /// Runs after `recordCallScalars`, whose Sources carry the scalar-result
+  /// edges.
   void recordCallDeps();
-  /// Re-decide which initialized arrays are constant TABLES, once the
-  /// children's port directions are known. `isConstantTable` (the scheduler's
-  /// predicate, read at `getOrCreateMem` time) conservatively disqualifies any
-  /// array handed to a sub-kernel, since before the callee interfaces exist it
-  /// cannot see which way the child touches it; here, with every access and
-  /// child port group bound, an array nothing writes is a ROM.
+  /// Re-decide which initialized arrays are constant TABLES, once the child
+  /// port directions are known. The scheduler's predicate, read at
+  /// `getOrCreateMem` time, conservatively disqualifies any array handed to a
+  /// sub-kernel; here, with every access and child port group bound, an array
+  /// nothing writes is a ROM.
   void reclassifyRoms();
   /// Derive every cyclic region's `counterType`, the width its iteration
   /// counter and therefore its bounds are built at, from that loop's own
-  /// induction range. It reads nothing but the region op, so it runs before the
-  /// Source-resolving passes; a consumer wanting another width adapts at its
-  /// own end.
+  /// induction range. A consumer wanting another width adapts at ITS end (an
+  /// ordinary datapath read widens back to `kIndexWidth`, a child's index port
+  /// takes the port's width, an address cone takes the memory's).
   void deriveCounterTypes();
   /// Record each pipeline's induction bounds (lb/ub/step) as Sources on its
   /// RegionBlock: a runtime bound from the `lbBound`/`dynamicBound`/`stepBound`
-  /// operand, a compile-time one as a synthesized literal cell. Needs
-  /// `counterType`, which is the width those literals are tied in at.
+  /// operand, a compile-time one as a literal cell. Needs `counterType`, the
+  /// width those literals are tied in at.
   void recordRegionBounds(llvm::ArrayRef<Operation *> regionOps);
   /// A literal \p v of type \p t as a Source, appending the ConstCell that
   /// holds it. For a value the model needs but no `arith.constant` in the body
-  /// produces, such as an induction bound written as an attribute rather than
-  /// an operand.
+  /// produces, such as an induction bound written as an attribute.
   Source constant(int64_t v, Type t);
   /// Enumerate the module's boundary memory ports: `dp.{read,write}Ports`, each
-  /// external access's slot and port-group NAME
-  /// (`MemUnit::Access::{portIdx, portBase}`), and each call-mastered boundary
-  /// argument's group name (`CallUnit::MemArg::topBase`), all off ONE
-  /// per-(memory, role) counter so parent accesses are numbered first and
-  /// child ports continue the same sequence in call order. Runs once every
-  /// access and call is bound. The owner name comes from `uniqueOwnerOf`
-  /// against the module's whole memref list, so two arguments sharing one
-  /// source name still get distinct port-group names.
+  /// external access's `MemUnit::Access::{portIdx, portBase}` and each
+  /// call-mastered boundary argument's `CallUnit::MemArg::topBase`, all off ONE
+  /// per-(memory, role) counter so parent accesses are numbered first and child
+  /// ports continue the same sequence in call order. Runs once every access and
+  /// call is bound. Owner names come from `uniqueOwnerOf` against the module's
+  /// whole memref list, so two arguments sharing a source name still differ.
   void enumerateBoundaryPorts();
   /// Record each top-level region's composition predecessors
-  /// (`rb.predecessors`): the earlier top-level siblings it must start after,
-  /// from a shared memref (any access, whether a hazard or a read-port
-  /// conflict) or a cross-region SSA edge (a scalar survivor). The emitter
-  /// starts a predecessor-free region concurrently and gates the rest on their
-  /// producers' `done`. Runs last (needs the final memref accesses + region
-  /// tree).
+  /// (`rb.predecessors`): the earlier top-level siblings it must start after.
+  /// Runs last (needs the final memref accesses and region tree).
   void recordSiblingDeps(llvm::ArrayRef<Operation *> regionOps);
   /// Scalar (non-memref) function arguments become input IOPorts.
   void bindIOArgs();
   /// Scalar (non-memref) function results become `dp.results` output ports,
-  /// each driven by the Source of its `func.return` operand (a returning
-  /// region's survivor / a passthrough input / a constant). Array results are
-  /// out-params by this stage (buffer-results-to-out-params), so every
-  /// remaining operand is a scalar.
+  /// each driven by the Source of its `func.return` operand. Array results are
+  /// out-params by this stage (buffer-results-to-out-params).
   void recordResults();
 
   /// Settle the allocation: fold each group named by \p groups onto one unit
   /// and REBUILD the table densely, so a unit with no bound op never exists.
   ///
-  /// Runs immediately after the region walk, which is the last point at which
-  /// a `UnitId` is held only by `producerOf` and `dp.opToUnit`, both rewritten
-  /// here. Every pass below resolves Values to Sources against the table, so a
-  /// decision taken after any of them would leave those Sources naming a unit
-  /// that no longer has ops (see the class comment on the phase order).
+  /// Runs immediately after the region walk, the last point at which a
+  /// `UnitId` is held only by `producerOf` and `dp.opToUnit`, both rewritten
+  /// here. A fold taken later would leave already-resolved Sources naming a
+  /// unit with no ops.
   void allocateUnits(llvm::ArrayRef<llvm::SmallVector<UnitId, 2>> groups);
 
   // Value resolution ---------------------------------------------
   /// The ONE Value -> Source resolution: the channel through which \p v can be
   /// read, or None if this datapath cannot read it (every caller reports that
-  /// as an unresolved slot rather than dropping it silently).
-  ///
-  /// Four disjoint cases:
-  ///   * a scheduled producer bound during the region walk (`producerOf`): a
-  ///     compute unit, a memory / stream read port, a call result;
-  ///   * a nested region's result -> that region's Survivor register;
-  ///   * a scalar function argument (`ioOf`) -> an IOPort;
-  ///   * a `dcp.pipeline` block argument -> its region's Counter (arg 0), or
-  ///     the matching Survivor where the region LATCHES its iter-args (a
-  ///     container / while); a childless counted reduction instead fuses its
-  ///     accumulator into the datapath, readable only through the recurrence
-  ///     edge `resolveOperand` builds.
-  ///
-  /// Needs the COMPLETE region model (to know which regions latch), so every
-  /// caller runs after the region walk.
+  /// as an unresolved slot rather than dropping it silently). Needs the
+  /// COMPLETE region model, to know which regions latch their iter-args, so
+  /// every caller runs after the region walk.
   Source resolveValue(Value v);
 
   // Interconnect derivation ---------------------------------------
   /// Resolve an operand \p v consumed by \p consumer (in a region with
-  /// initiation interval \p ii) to its producing Source + register depth:
-  /// `resolveValue` plus the depth rule, plus the one edge that does not read
-  /// \p v at all (an un-latched own iter-arg = the loop recurrence).
+  /// initiation interval \p ii) to its producing Source plus register depth,
+  /// plus the one edge that does not read \p v at all (an un-latched own
+  /// iter-arg = the loop recurrence).
   Resolved resolveOperand(Value v, Operation *consumer, unsigned ii);
   /// Materialize one shift-register chain carrying \p key, deep enough for the
   /// largest of \p depths, with a tap at each distinct depth. Returns its id.
   RegId insertRegister(Value key, ArrayRef<unsigned> depths, RegHead head,
                        RegionId region);
   /// Resolve every unit input / memory address / store-data / stream driver,
-  /// threading non-zero-depth edges through inserted register chains. Drives
-  /// the four phases below.
+  /// threading non-zero-depth edges through inserted register chains.
   void deriveInterconnect();
   /// Size the (empty) input-slot vectors every resolve phase fills.
   void allocateInputSlots();

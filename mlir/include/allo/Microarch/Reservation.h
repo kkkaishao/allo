@@ -11,10 +11,9 @@
 namespace mlir::allo::uarch {
 
 /// The resource cycles one bound op occupies on its functional unit, within its
-/// region's schedule. For a pipelined unit only the issue slot is contended (a
-/// single cycle); a non-pipelined unit is busy for its whole latency. Cyclic
-/// regions count residues mod II (a wrapped window); acyclic regions count
-/// absolute cycles (no wrap).
+/// region's schedule. A pipelined unit contends only its issue slot; a
+/// non-pipelined unit is busy for its whole latency. Cyclic regions count
+/// residues mod II, acyclic regions absolute cycles.
 struct Reservation {
   RegionId region = 0;
   llvm::SmallVector<unsigned, 4> cycles; // occupied resource cycles
@@ -28,16 +27,13 @@ Reservation reservationOf(const RegionBlock &region, const FuncUnit &unit,
 
 /// Whether two reservations may coexist on one shared unit: their occupied
 /// cycles must not intersect. Different regions conservatively conflict, since
-/// binding is within a region only (cross-region sharing is unsupported).
-/// Combined with equal `OperatorIdentity`, this is the full legality test a
-/// policy applies before merging two ops onto one unit; the timing side of a
-/// fold (the mux it grows must fit `unitSlack`) lives with the policy.
+/// cross-region sharing is unsupported. With equal `OperatorIdentity` this is
+/// the full legality test; the timing side of a fold (the mux it grows must fit
+/// `unitSlack`) lives with the policy.
 bool reservationsDisjoint(const Reservation &a, const Reservation &b);
 
 /// Assert the binding is legal: no two ops bound to the same unit contend for
-/// it in the same resource cycle. A dev-time invariant (fail loudly) that a
-/// buggy sharing policy trips immediately; vacuous under the trivial binding
-/// (one op per unit).
+/// it in the same resource cycle. Vacuous under the trivial binding.
 void verifyBinding(const Datapath &dp);
 
 } // namespace mlir::allo::uarch

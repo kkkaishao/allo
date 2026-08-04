@@ -23,16 +23,12 @@ struct ModuleInterface;
 namespace mlir::allo::uarch {
 
 /// Lower the scheduled `func.func`s reachable from \p top to structural
-/// `hw.module`s (leaf datapaths + dataflow/sequential tops), erasing the source
-/// funcs. This is the free function behind the `allo-datapath-to-hw` pass.
-/// Emission is rooted at \p top and runs bottom-up over the call DAG (callees
-/// before callers), mirroring the scheduler. \p binding names the binding
-/// policy. On success \p interfaces maps each emitted module's symbol name to
-/// its port-interface JSON (the cosim manifest), so a caller gets the boundary
-/// directly without reading any IR attribute.
-/// \p cycleTime is the resolved target period in ns, as the scheduler took it:
-/// sharing a unit grows a multiplexer the schedule was cut without, and
-/// `validateDatapath` holds the result to the same clock.
+/// `hw.module`s, erasing the source funcs, and map each emitted module's name
+/// to its port-interface JSON (the cosim manifest) in \p interfaces. This is
+/// the free function behind the `allo-datapath-to-hw` pass.
+/// Emission runs bottom-up over the call DAG, callees before callers.
+/// \p cycleTime is the target period in ns and must be the one the scheduler
+/// took: `validateDatapath` holds the result to the same clock.
 LogicalResult emitDatapathToHW(ModuleOp module, StringRef binding,
                                StringRef top, float cycleTime,
                                llvm::StringMap<std::string> &interfaces);

@@ -40,19 +40,17 @@ namespace mlir::allo::uarch {
 
 // Declare an extern operator module for each IP-realized compute unit, named by
 // `operatorModuleName` and deduplicated across the whole module (`opModules`).
-// Native (comb) units emit inline, no extern. One input port per operand
-// (`a`, `b`, `c`, ... at its width), then clk, then `ce` when the realization
-// is clock-enabled (`ce == 0` freezes it in lockstep with the shell), then the
-// output. Port shape is a function of the unit's identity, so deduplicating by
-// module name is safe only as far as the name separates identities, which the
-// assert below checks. Returns unit id -> its extern module.
+// Native (comb) units emit inline, no extern. Returns unit id -> its extern
+// module. Port order is one input per operand (`a`, `b`, `c`, ... at its
+// width), clk, `ce` when the realization is clock-enabled (`ce == 0` freezes it
+// in lockstep with the shell), then the output. Port shape is a function of the
+// unit's identity, so deduplicating by module name is safe only as far as the
+// name separates identities, which the assert below checks.
 //
-// The module name stems from the `dcp.operator`'s own `sym_name`; that
+// The module name stems from the `dcp.operator`'s own `sym_name`, and that
 // declaration stays live until every kernel has emitted, so the symbol is
-// briefly duplicated (legal: nothing verifies between).
-// `SymbolTable::lookupSymbolIn` returns the first match in block order, so the
-// declarations are injected at the block's beginning to keep the
-// `dcp.operator` first and lookup unambiguous.
+// briefly duplicated. `SymbolTable::lookupSymbolIn` returns the first match in
+// block order, so the `dcp.operator` has to stay ahead of these declarations.
 static DenseMap<unsigned, Operation *>
 declareOperatorModules(dcp::DCPathModuleOp func, const uarch::Datapath &dp,
                        OpBuilder &b, llvm::StringMap<Operation *> &opModules,
@@ -73,7 +71,6 @@ declareOperatorModules(dcp::DCPathModuleOp func, const uarch::Datapath &dp,
            "IP unit input count must match its bound op's operand count");
     IntegerType outW = hwType(u.identity.resultType, b);
     std::string modName = operatorModuleName(u);
-    // Build the manifest entry alongside the ports.
     iface::Operator entry{
         modName, u.identity.realization, operatorPredicate(u), {}};
     SmallVector<PortInfo> ep;
@@ -119,7 +116,7 @@ declareModulePorts(const iface::ModuleInterface &model, OpBuilder &b) {
   SmallVector<PortInfo> ports;
   // The port names are the manifest, authored before CIRCT's LegalizeNames
   // runs, so a name ExportVerilog would rewrite or uniquify desyncs cosim from
-  // the Verilog. `verilogName` prevents that; these check the composed result.
+  // the Verilog. These check the composed result.
   llvm::StringSet<> seen;
   auto port = [&](const Twine &n, Type t, Dir d) {
     std::string s = n.str();
@@ -139,9 +136,9 @@ declareModulePorts(const iface::ModuleInterface &model, OpBuilder &b) {
   // named after a control port trips the duplicate check above.
   for (const iface::Scalar &s : model.scalars)
     port(s.name, iType(s.width), Dir::Input);
-  // Stream FIFO ports, input side: module inputs must stay contiguous at the
-  // front (HWModulePortAccessor maps body args to the first `numInputs` ports
-  // positionally), so {data, valid} / {ready} go here; outputs follow `done`.
+  // Stream FIFO ports, input side. Module inputs must stay contiguous at the
+  // front, since HWModulePortAccessor maps body args to the first `numInputs`
+  // ports positionally, so {data, valid} / {ready} go here.
   for (const iface::FIFO &s : model.streams) {
     if (s.isInput) {
       port(s.data, iType(s.width), Dir::Input);
@@ -157,15 +154,15 @@ declareModulePorts(const iface::ModuleInterface &model, OpBuilder &b) {
     for (const iface::Memory &r : acc)
       port(r.data, iType(r.width), Dir::Input);
   // A fully-partitioned argument gets one input per element, no address or
-  // latency, read combinationally in any number at once. A write-only
-  // argument has no input side; its output follows `done`.
+  // latency, read combinationally in any number at once. A write-only argument
+  // has no input side.
   for (const iface::RegisterFile &rf : model.registers)
     for (const iface::RegisterFile::Element &e : rf.elements)
       if (!e.in.empty())
         port(e.in, iType(rf.width), Dir::Input);
   port(kDone, i1, Dir::Output);
-  // Stream FIFO ports, output side (after `done`, among the module outputs): an
-  // input stream's back-pressure {ready}; an output stream's {data, valid}.
+  // Stream FIFO ports, output side: an input stream's back-pressure {ready}, an
+  // output stream's {data, valid}.
   for (const iface::FIFO &s : model.streams) {
     if (s.isInput) {
       port(s.ready, i1, Dir::Output);
@@ -239,16 +236,16 @@ emitModule(dcp::DCPathModuleOp func, uarch::Datapath &dp, OpBuilder &b,
 
   // The single source for every boundary port name, shared by declaration,
   // manifest and cosim harness; it also carries the extern operator modules
-  // this kernel instantiates. Its port lists come enumerated from the builder.
+  // this kernel instantiates.
   iface::ModuleInterface model(dp);
   auto unitModule =
       declareOperatorModules(func, dp, b, opModules, model.operators);
   auto ports = declareModulePorts(model, b);
 
   hw::ModulePortInfo portInfo(ports);
-  // Legalized here rather than left to ExportVerilog, so the key the manifest
-  // uses is the emitted Verilog module name. A nested callee `top.child` would
-  // otherwise be rewritten downstream.
+  // Legalized here, so the key the manifest uses is the emitted Verilog module
+  // name: a nested callee `top.child` would otherwise be rewritten downstream
+  // by ExportVerilog.
   model.symbol = func.getSymName().str();
   model.module = verilogName(model.symbol);
   StringAttr modName = StringAttr::get(ctx, model.module);
@@ -264,9 +261,8 @@ emitModule(dcp::DCPathModuleOp func, uarch::Datapath &dp, OpBuilder &b,
         e.emit();
       });
 
-  // Hand the port model back to the caller: it derives the cosim manifest
-  // JSON and, for a dataflow container, threads the leaf models into the
-  // structural-top emitter, keeping one in-memory port representation.
+  // The caller derives the cosim manifest JSON from this port model and threads
+  // it back in as a callee model.
   return std::make_pair(hwMod, std::move(model));
 }
 
@@ -279,8 +275,8 @@ static void cleanupDcpOps(ModuleOp module) {
        llvm::make_early_inc_range(module.getOps<memref::GlobalOp>()))
     g.erase();
   // Spent declarations, dropped last: a `dcp.compute` reads its timing off the
-  // `dcp.operator` it names and a `dcp.unit` references one, and dropping them
-  // leaves each extern operator module sole owner of its `sym_name`.
+  // `dcp.operator` it names, and dropping them leaves each extern operator
+  // module sole owner of its `sym_name`.
   SmallVector<Operation *> spent;
   module.walk([&](Operation *op) {
     if (isa<dcp::DCPathOperatorOp, dcp::DCPathDeviceOp, dcp::DCPathUnitOp>(op))
@@ -300,13 +296,11 @@ LogicalResult emitDatapathToHW(ModuleOp module, StringRef binding,
   ctx->getOrLoadDialect<comb::CombDialect>();
   ctx->getOrLoadDialect<seq::SeqDialect>();
 
-  // Storage and comb timing have no per-access carrier, so they thread into
-  // the datapath builder as a library; an IP's timing rides the `dcp.operator`
-  // its `dcp.compute` names, which stays live for the whole of emission.
+  // Storage and comb timing have no per-access carrier, so they thread into the
+  // datapath builder as a library; an IP's timing rides the `dcp.operator` its
+  // `dcp.compute` names, which stays live for the whole of emission.
   OperatorLibrary lib = OperatorLibrary::fromModule(module);
 
-  // Every reified kernel is a `dcp.module`; there is no second container to
-  // filter for a schedule, because carrying one is what the op is.
   auto scheduled = llvm::to_vector(module.getOps<dcp::DCPathModuleOp>());
 
   auto policy = bindingPolicyFor(binding);
@@ -317,8 +311,8 @@ LogicalResult emitDatapathToHW(ModuleOp module, StringRef binding,
     return failure();
   }
 
-  // Bottom-up over the call DAG (see the header doc): a container always
-  // finds its children already registered.
+  // Bottom-up over the call DAG: a container always finds its children already
+  // registered.
   llvm::StringMap<dcp::DCPathModuleOp> byName;
   for (dcp::DCPathModuleOp f : scheduled)
     byName[f.getSymName()] = f;
@@ -331,9 +325,8 @@ LogicalResult emitDatapathToHW(ModuleOp module, StringRef binding,
 
   OpBuilder b(module.getBodyRegion());
   llvm::StringMap<Operation *> opModules;
-  // Callee tables, keyed by symbol name: leaf kernels plus containers
-  // emitted so far. A container composes exactly like a leaf, so both
-  // live here.
+  // Callee tables, keyed by symbol name: leaf kernels plus the containers
+  // emitted so far, which compose exactly like a leaf.
   llvm::StringMap<hw::HWModuleOp> modules;
   llvm::StringMap<iface::ModuleInterface> ifaceModels;
   llvm::StringSet<> visited;
@@ -347,14 +340,14 @@ LogicalResult emitDatapathToHW(ModuleOp module, StringRef binding,
     ifaceModels[name] = std::move(model);
   };
 
-  // Post-order over the call DAG (acyclic; the frontend rejects recursion),
-  // via a self-parameter recursive lambda (`self(self, ...)`).
+  // Post-order over the call DAG, which is acyclic: the frontend rejects
+  // recursion.
   auto emitOne = [&](auto &self, dcp::DCPathModuleOp f) -> LogicalResult {
     if (!visited.insert(f.getSymName()).second)
       return success(); // a shared callee already emitted
-    // Children first: emit every scheduled callee (a leaf call misses
-    // `byName`). A `dcp.instance` is the only way a kernel reaches another one,
-    // so it is the only edge to recurse on.
+    // Children first: a `dcp.instance` is the only way a kernel reaches another
+    // one, so it is the only edge to recurse on, and a leaf call misses
+    // `byName`.
     WalkResult wr = f.walk([&](dcp::DCPathInstanceOp inv) -> WalkResult {
       auto it = byName.find(inv.getCallee());
       if (it != byName.end() && failed(self(self, it->second)))
@@ -364,9 +357,8 @@ LogicalResult emitDatapathToHW(ModuleOp module, StringRef binding,
     if (wr.wasInterrupted())
       return failure();
 
-    // ONE emission path, whichever way the function composes: leaf, sequential
-    // container and dataflow differ only in composition class (the start policy
-    // it picks). Every child is a `dcp.instance` CallUnit in one `Datapath`.
+    // One emission path, whichever way the function composes: leaf, sequential
+    // container and dataflow differ only in the start policy they pick.
     bool hasInvoke = false;
     f.walk([&](dcp::DCPathInstanceOp) {
       hasInvoke = true;

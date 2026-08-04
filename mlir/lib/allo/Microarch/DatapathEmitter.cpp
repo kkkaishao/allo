@@ -23,9 +23,8 @@ namespace mlir::allo::uarch {
 // --- Memory-banking crossbar primitives -------------------------------------
 
 // A literal of \p v's own width. Address arithmetic is carried at whatever
-// width the addressed memory needs (see `evalAffine`), so every operand of a
-// `comb` op below has to be built against the value it accompanies rather than
-// against a fixed i32.
+// width the addressed memory needs, so every operand of a `comb` op below has
+// to be built against the value it accompanies rather than a fixed i32.
 static Value konstLike(OpBuilder &b, Location loc, Value v, int64_t k) {
   return hw::ConstantOp::create(b, loc, v.getType(), k).getResult();
 }
@@ -37,11 +36,8 @@ static Value addrAt(OpBuilder &b, Location loc, Value v, unsigned width) {
   return resize(b, loc, v, width, /*isSigned=*/false);
 }
 
-// Unsigned divide / remainder by a compile-time constant: a shift / mask for a
-// power of two, else a real divider (synthesis folds a constant divisor into a
-// multiply-shift). Every constant divisor reaches the datapath through one
-// place, `evalAffine`, since the bank decomposition is derived on the
-// expression and evaluated through it too.
+// Unsigned divide by a compile-time constant: a shift for a power of two, else
+// a real divider (synthesis folds a constant divisor into a multiply-shift).
 static Value divConst(OpBuilder &b, Location loc, Value v, int64_t d) {
   if (d == 1)
     return v;
@@ -53,10 +49,10 @@ static Value divConst(OpBuilder &b, Location loc, Value v, int64_t d) {
       .getResult();
 }
 
-// Multiply by a compile-time constant. A power-of-two coefficient is a shift,
-// i.e. wiring; anything else stays a `comb.mul` deliberately, since synthesis
-// recodes a constant multiplier into a shift-add network better than a
-// decomposition emitted here could.
+// Multiply by a compile-time constant. A power-of-two coefficient is a shift;
+// anything else stays a `comb.mul` deliberately, since synthesis recodes a
+// constant multiplier into a shift-add network better than a decomposition
+// emitted here could.
 static Value mulConst(OpBuilder &b, Location loc, Value v, int64_t k) {
   if (k == 1)
     return v;
@@ -85,9 +81,9 @@ static unsigned addrWidth(const uarch::MemUnit &m) {
 }
 
 // An address on its way OUT of the module. A boundary address port is
-// `kDatapathAddressWidth` wide for every argument, one fixed contract the
+// `kDatapathAddressWidth` wide for every argument, the fixed contract the
 // manifest and the cosim harness are written against, so a narrow in-bank
-// address widens back here. The padding is constant, so it costs nothing.
+// address widens back here.
 static Value boundaryAddr(EmitContext &c, Value addr) {
   return addrAt(c.b, c.loc, addr, kDatapathAddressWidth);
 }
@@ -104,10 +100,10 @@ Value writeDemux(EmitContext &c, Value we, Value bank, unsigned k) {
 }
 
 // Which of several sources bank \p k takes, each tagged with the bank IT
-// reaches: the inverse of `readCrossbar`, and what lets one port serve a whole
-// lane. At most one tag equals `k` at a time, because a lane holds distinct
-// slots and distinct slots are distinct banks at every rotation, so the
-// priority order carries no meaning and the first arm is a fall-through.
+// reaches: the inverse of `readCrossbar`. At most one tag equals `k` at a time,
+// because a lane holds distinct slots and distinct slots are distinct banks at
+// every rotation, so the priority order carries no meaning and the first arm is
+// a fall-through.
 static Value laneSelect(EmitContext &c,
                         ArrayRef<std::pair<Value, Value>> tagged, unsigned k) {
   Value out = tagged.front().second;
@@ -116,15 +112,14 @@ static Value laneSelect(EmitContext &c,
   return out;
 }
 
-// Resolve a datapath Source to the SSA value driving it. Exhaustive over
-// Source::Kind: the switch is the single extension point for new source kinds
-// (muxes in the binding phase).
+// Resolve a datapath Source to the SSA value driving it, exhaustive over
+// Source::Kind.
 Value DatapathEmitter::resolveSource(const uarch::Source &s) {
   switch (s.kind) {
   case uarch::Source::Kind::Unit: {
     // A same-region operator result. `declareUnits` declares its backedge
-    // before any read resolves, so a miss means this consumer sits outside
-    // the owning region; guarded since a null Value here crashes silently.
+    // before any read resolves, so a miss means this consumer sits outside the
+    // owning region.
     Value v = unitVal.lookup(s.id);
     assert(v && "unit source read outside the region that declared it");
     return v;
@@ -134,21 +129,20 @@ Value DatapathEmitter::resolveSource(const uarch::Source &s) {
   case uarch::Source::Kind::Mem:
     return readData.lookup(accKey(s.id, s.outPort));
   case uarch::Source::Kind::Stream:
-    // An input stream's loaded token: the `_data` module port, bound by
-    // bindStreamReads before any consumer (like a memory read).
+    // An input stream's loaded token, bound by bindStreamReads before any
+    // consumer, like a memory read.
     return streamReadData.lookup(accKey(s.id, s.outPort));
   case uarch::Source::Kind::Counter: {
     // The iteration counter of Source's region (an outer container's counter is
-    // live while its nested region emits), as an ordinary index value: at
-    // `kIndexWidth` whatever width the region built its register at.
+    // live while its nested region emits), at `kIndexWidth` whatever width the
+    // region built its register at.
     Value cv = counterIndex.lookup(s.id);
     assert(cv && "counter source with no emitted region counter");
     return cv;
   }
   case uarch::Source::Kind::Const: {
     // The datapath carries a value as its bit pattern, so a float literal ties
-    // in as its bitcast integer (a float constant reaching a Source is e.g. a
-    // reduction identity `0.0`).
+    // in as its bitcast integer.
     IntegerType t = hwType(dp.consts[s.id].type, c.b);
     Attribute v = dp.consts[s.id].value;
     if (auto ia = dyn_cast<IntegerAttr>(v))
@@ -181,25 +175,23 @@ Value DatapathEmitter::resolveSource(const uarch::Source &s) {
     return v;
   }
   case uarch::Source::Kind::Survivor: {
-    // A sibling region's held result: the orchestrator latched it (setSurvivor)
-    // when the producing region completed, before this consumer emitted.
+    // A sibling region's held result, latched by setSurvivor when the producing
+    // region completed, before this consumer emitted.
     Value sv = survivorOf.lookup(accKey(s.id, s.outPort));
     assert(sv && "survivor source read before its region was captured");
     return sv;
   }
   case uarch::Source::Kind::Call: {
     // A sub-kernel call's scalar result: the child instance's result output,
-    // populated by emitCalls before any consumer (captureResults latches it
-    // into this region's survivor; a same-region later child reads it live).
+    // populated by emitCalls before any consumer.
     Value cv = callResultVal.lookup(accKey(s.id, s.outPort));
     assert(cv && "call result source read before its CallUnit was emitted");
     return cv;
   }
   case uarch::Source::Kind::Scope: {
-    // A func-scope combinational cone over held values (see `ScopeUnit`). It
-    // rides no controller and takes no register, so there is nothing to time
-    // it against: build it where it is first read and hand back the same wire
-    // to everyone after.
+    // A func-scope combinational cone over held values. It rides no controller
+    // and takes no register, so there is nothing to time it against: build it
+    // where it is first read and hand back the same wire to everyone after.
     if (Value v = scopeVal.lookup(s.id))
       return v;
     const uarch::ScopeUnit &su = dp.scopeUnits[s.id];
@@ -213,9 +205,8 @@ Value DatapathEmitter::resolveSource(const uarch::Source &s) {
     return v;
   }
   case uarch::Source::Kind::None:
-    // `validateDatapath` sweeps every required slot for a None Source and
-    // rejects there. Not an `assert`: under NDEBUG that would fall through and
-    // hand the caller a null Value.
+    // `validateDatapath` rejects a None Source earlier. Not an `assert`: under
+    // NDEBUG that would fall through and hand the caller a null Value.
     llvm_unreachable("unresolved (None) source reached emission");
   }
   llvm_unreachable("unhandled Source::Kind");
@@ -230,18 +221,16 @@ unsigned DatapathEmitter::readyCycle(const uarch::Source &s) const {
     assert(cu.latency && "readyCycle of an indeterminate call result");
     return cu.start + static_cast<unsigned>(*cu.latency);
   }
-  // A held source has no landing stage: a literal is constant, an IO port is
-  // stable for the whole kernel, a counter or survivor is a register that has
-  // settled by the time the region reading it issues, and a func-scope cone is
-  // a combinational function of exactly those.
+  // A held source has no landing stage: a literal is constant, an IO port
+  // stable for the whole kernel, a counter or survivor a register settled by
+  // the time the region reading it issues, and a func-scope cone a
+  // combinational function of exactly those.
   if (s.kind == uarch::Source::Kind::Const ||
       s.kind == uarch::Source::Kind::IO ||
       s.kind == uarch::Source::Kind::Counter ||
       s.kind == uarch::Source::Kind::Survivor ||
       s.kind == uarch::Source::Kind::Scope)
     return 0;
-  // Otherwise: map the Source to its producing op (the one Source->op
-  // definition), then defer to the one ready-cycle definition.
   Operation *op = dp.producingOp(s);
   assert(op && "readyCycle only modelled for a Unit / memory read / "
                "stream get / constant / call result");
@@ -250,12 +239,9 @@ unsigned DatapathEmitter::readyCycle(const uarch::Source &s) const {
 
 // Evaluate an affine index expression to a hw value \p width bits wide,
 // emitting comb ops. `idx` holds the resolved value of each map operand (dims
-// then symbols), each at the datapath width. Affine index arithmetic
-// degenerates to adds and multiply-by-constant; a genuine multiplier survives
-// only a non-reducible map, and identity addressing emits nothing. Shared by
-// the two places a map reaches the datapath: a memory access's address
-// (bankAddress) and a standalone affine.apply (emitCompute). See the header on
-// why carrying it at \p width is exact and where that stops holding.
+// then symbols), each at the datapath width. Shared by the two places a map
+// reaches the datapath: a memory access's address (bankAddress) and a
+// standalone affine.apply (emitCompute).
 Value evalAffine(OpBuilder &b, Location loc, AffineExpr e, ValueRange idx,
                  unsigned numDims, unsigned width) {
   Type t = b.getIntegerType(width);
@@ -274,8 +260,8 @@ Value evalAffine(OpBuilder &b, Location loc, AffineExpr e, ValueRange idx,
   if (e.getKind() == AffineExprKind::Mul) {
     Value lhs = evalAffine(b, loc, bin.getLHS(), idx, numDims, width);
     // An affine coefficient is always constant, so this is a shift-or-multiply
-    // rather than a general multiplier (`mulConst`). A semi-affine map is
-    // representable though, so a non-constant one still lowers.
+    // rather than a general multiplier. A semi-affine map is representable
+    // though, so a non-constant one still lowers.
     if (auto k = dyn_cast<AffineConstantExpr>(bin.getRHS()))
       return mulConst(b, loc, lhs, k.getValue());
     return comb::MulOp::create(
@@ -284,15 +270,15 @@ Value evalAffine(OpBuilder &b, Location loc, AffineExpr e, ValueRange idx,
         .getResult();
   }
   // floordiv/mod by a constant is delinearization left by a coalesced nest over
-  // a non-negative index, the same shapes the bank decomposition needs. Neither
-  // is congruent modulo 2^width, so both compute wide and narrow afterwards.
+  // a non-negative index. Neither is congruent modulo 2^width, so both compute
+  // wide and narrow afterwards.
   auto rc = dyn_cast<AffineConstantExpr>(bin.getRHS());
   assert(rc && rc.getValue() > 0 &&
          "affine div/mod by a non-constant or non-positive divisor");
   int64_t f = rc.getValue();
   // With one congruent exception, the one a bank digit always ends in: `x mod
   // 2^k` IS the low k bits, so that subtree is built k bits wide and the mask
-  // disappears with it. `addressCost` narrows it identically.
+  // disappears with it. `addressCost` prices it at the same narrowed width.
   if (e.getKind() == AffineExprKind::Mod && f > 1 &&
       llvm::isPowerOf2_64(static_cast<uint64_t>(f))) {
     unsigned k =
@@ -310,8 +296,8 @@ Value evalAffine(OpBuilder &b, Location loc, AffineExpr e, ValueRange idx,
   return addrAt(b, loc, q, width);
 }
 
-// The resolved (already stage-delayed) index sources of an access: the operands
-// its affine map is evaluated over, dims then symbols.
+// The resolved (already stage-delayed) index sources of an access, dims then
+// symbols.
 SmallVector<Value>
 DatapathEmitter::addrSources(const uarch::MemUnit::Access &acc) {
   SmallVector<Value> idx;
@@ -322,14 +308,10 @@ DatapathEmitter::addrSources(const uarch::MemUnit::Access &acc) {
 
 // Build one cone \p r of this access's address as hardware at \p width, out of
 // the parts `planAddressGenerators` split it into: a constant, one register per
-// strength-reduced term, and whatever did not reduce.
-//
-// Each reduced `coeff * counter` term already exists as a register the
-// controller advances (`RegionBlock::addrStrides`), so the constant multiplies
-// that dominate an address are gone and with them the reason it was the widest
-// cone in the datapath. The residual is added at the end because ITS operands
-// arrive already delayed, where the counters run live: adding it after the
-// chain is what puts both halves in the access's own cycle.
+// strength-reduced term (`RegionBlock::addrStrides`, advanced by the
+// controller), and whatever did not reduce. The residual is added after the
+// delay chain because ITS operands arrive already delayed, where the counters
+// run live, which puts both halves in the access's own cycle.
 Value DatapathEmitter::buildAddr(const uarch::MemUnit::Access &acc,
                                  const uarch::MemUnit::Access::Reduced &r,
                                  unsigned width) {
@@ -352,7 +334,7 @@ Value DatapathEmitter::buildAddr(const uarch::MemUnit::Access &acc,
     // A register the residual reads runs live like a counter, so each is
     // delayed on its own (summed terms share one delay only by being summed
     // first). Appended at the datapath width, which is what `evalAffine` reads
-    // its operands at; it narrows and re-widens the cone itself.
+    // its operands at.
     SmallVector<Value> idx = addrSources(acc);
     for (const uarch::MemUnit::Access::ScaledTerm &t : r.reads) {
       const uarch::RegionControl &rc = controlOf.lookup(t.region);
@@ -377,12 +359,10 @@ Value DatapathEmitter::buildAddr(const uarch::MemUnit::Access &acc,
 // offset is the flat index and whose digit nothing builds.
 //
 // Both halves are derived SYMBOLICALLY (`addressExprsOf`) and only then
-// evaluated, which is what makes the common idioms free. A coalesced nest's map
-// is `iv -> (iv floordiv N, iv mod N)`, and composing the row-major strides on
-// the expression cancels it back to `iv`; the bank digit of `A[2*i]` under
-// cyclic-2 is `(2*i) mod 2`, which folds to a constant, and its offset `(2*i)
-// floordiv 2` folds to the counter itself. Built out of `comb` ops instead,
-// each is a multiply, a mask and a shift that no later pass can fold away.
+// evaluated: composing the row-major strides on a coalesced nest's
+// `iv -> (iv floordiv N, iv mod N)` cancels it back to `iv`, where the same
+// thing built out of `comb` ops is a multiply, a mask and a shift that no later
+// pass can fold away.
 BankSplit DatapathEmitter::bankAddress(const uarch::MemUnit &m,
                                        const uarch::MemUnit::Access &acc) {
   assert(acc.addrMap && "dcp memory access without an affine map");
@@ -392,7 +372,7 @@ BankSplit DatapathEmitter::bankAddress(const uarch::MemUnit &m,
          "the width the address was priced at is not the one it is built at");
   Value offset = buildAddr(acc, acc.offset, e.width);
   // The digit stays at the datapath width, being compared against literal bank
-  // numbers rather than used as an address, and it reduces like the offset:
+  // numbers rather than used as an address. It reduces like the offset:
   // `counter mod F` is a register that wraps, not a `mod` on the setup path.
   Value bank =
       e.bank ? buildAddr(acc, acc.bank, kDatapathAddressWidth) : Value();
@@ -408,7 +388,7 @@ BankSplit DatapathEmitter::bankAddress(const uarch::MemUnit &m,
   return {bank, offset};
 }
 
-// The clog2(depth)-bit index `seq.hlmem` / `hw.array_get` addressing expects,
+// Narrow to the clog2(depth)-bit index `seq.hlmem` / `hw.array_get` expects,
 // which is also the width `bankAddress` carries its arithmetic at.
 Value DatapathEmitter::memAddr(const uarch::MemUnit &m, Value addr) {
   return addrAt(c.b, c.loc, addr, addrWidth(m));
@@ -425,8 +405,8 @@ Value DatapathEmitter::scatterIndex(const uarch::MemUnit &m,
 
 // Bind the read-data input ports into readData, once, before the per-region
 // loop (external memories only; internal ones read via seq.read below). A
-// data-dependent banked read has one data port per bank and is muxed in-region
-// by emitExternalReads, so it is bound there, not here.
+// data-dependent banked read has one data port per bank and is bound by
+// emitExternalReads, which muxes them in-region.
 void DatapathEmitter::bindReadPorts() {
   for (uarch::AccRef r : dp.readPorts) {
     const uarch::MemUnit &m = dp.mems[r.id];
@@ -439,9 +419,8 @@ void DatapathEmitter::bindReadPorts() {
 }
 
 // Instantiate on-chip storage for each internal (non-argument) memory: one
-// seq.hlmem, or, when the array reached emit still partitioned (a
-// data-dependent bank dcp-resolve-banking could not split statically), one
-// per bank, addressed through the crossbar (splitBank/readCrossbar). The
+// seq.hlmem, or one per bank when the array reached emit still partitioned (a
+// data-dependent bank `dcp-resolve-banking` could not split statically). The
 // handles are module-scope so writes and reads in different regions share them.
 void DatapathEmitter::createInternalMemories() {
   for (const uarch::MemUnit &m : dp.mems) {
@@ -451,8 +430,8 @@ void DatapathEmitter::createInternalMemories() {
     unsigned depth = declaredDepth(m.depthWords);
     if (m.isRom) {
       // A constant table: one hw.aggregate_constant holding the global's
-      // initializer, read combinationally by hw.array_get (registered to the
-      // read latency in emitInternalReads). No writable hlmem, no write ports.
+      // initializer, read combinationally by hw.array_get and registered to the
+      // read latency in emitInternalReads. No writable hlmem, no write ports.
       SmallVector<Attribute> fields;
       for (const APInt &w :
            initWords(cast<ElementsAttr>(m.romInit), m.width, depth))
@@ -470,8 +449,8 @@ void DatapathEmitter::createInternalMemories() {
     // scattered or skewed array presents no single addressable port, and a
     // dynamically banked store drives every bank behind a demux, so neither has
     // a port to be coloured onto. Two ports is the ceiling because a true dual
-    // port is: a third infers no RAM, so merging onto one would buy nothing and
-    // spend the address and data muxes that merging costs.
+    // port is what infers: at three the RAM inference fails outright, so a
+    // third colour would buy nothing and still cost its address and data muxes.
     SmallVector<unsigned> ports;
     if (!m.scattered && !m.skewed &&
         llvm::all_of(m.accesses, [](const uarch::MemUnit::Access &a) {
@@ -485,11 +464,13 @@ void DatapathEmitter::createInternalMemories() {
                                {static_cast<int64_t>(depth)}, elemTy);
       // The colouring is exactly the promise the lowering needs to describe
       // each port in its own `always` block, and so to infer a true dual port.
+      // A port per static write instead drops the array into a register file.
       if (!ports.empty())
         mem->setAttr(kIndependentWritesAttr, c.b.getUnitAttr());
       // An initialized array the kernel also WRITES is a real memory that
-      // merely starts with contents. `seq.hlmem` has none, so they ride to the
-      // seq->SV pipeline, which gives the backing reg an `initial` block.
+      // merely starts with contents. `seq.hlmem` carries no initializer, so the
+      // words ride to the seq->SV pipeline, which gives the backing reg an
+      // `initial` block.
       if (m.romInit)
         recordMemoryInit(
             mem, initWords(cast<ElementsAttr>(m.romInit), m.width, depth));
@@ -515,18 +496,16 @@ void DatapathEmitter::emitRegisters(const uarch::RegionBlock &rb) {
     const uarch::Register &rg = dp.regs[rid];
     auto head = c.bb.get(hwType(rg.type, c.b));
     regHeadBE.try_emplace(rg.id, head);
-    // A register is a plain delay chain; reduction-identity re-injection
-    // rides the consuming unit's recurrence input (emitUnits), not the
-    // register.
+    // A register is a plain delay chain; reduction-identity re-injection rides
+    // the consuming unit's recurrence input (emitUnits), not the register.
     regStages[rg.id] =
         phase && rg.depth > 1
             ? c.foldedChain(head, rg.depth, ii, phase, rg.ready, sh)
             : c.shiftChain(head, rg.depth, sh);
-    // Name each held stage `<value>_d<k>`: the value it delays, plus how many
-    // cycles late it is. Stage 0 is the undelayed input, already named by its
-    // producer, so leave it alone rather than relabel a shared wire. A folded
-    // chain repeats one register across the `ii` taps it serves, so name it
-    // once, at the shallowest delay it provides.
+    // Name each held stage `<value>_d<k>`. Stage 0 is the undelayed input,
+    // already named by its producer, so leave it alone rather than relabel a
+    // shared wire. A folded chain repeats one register across the `ii` taps it
+    // serves, so name it once, at the shallowest delay it provides.
     std::string owner = ownerOf(rg.value, regOwner(rg.id));
     auto &taps = regStages[rg.id].stages;
     for (unsigned k = 1; k < taps.size(); ++k)
@@ -535,18 +514,12 @@ void DatapathEmitter::emitRegisters(const uarch::RegionBlock &rb) {
   }
 }
 
-// seq.read for each internal-memory read scheduled in region \p rb, bound into
-// readData *before* emitUnits consumes it (a Source::Mem input). Read latency
-// is the memory's device-resolved `readLatency`, the same number the
-// scheduler timed the access at, so the port lands the datum on exactly the
-// cycle the consumer's register depth was solved against.
 // The skewed twin of `emitInternalReads`: one read port per bank per LANE
 // rather than per bank per access. A lane's accesses hold distinct slots, so
-// they reach distinct banks at every rotation, so bank k can take the offset of
-// whichever of them reaches it and hand its datum back to that one. That is the
-// entire payoff of a skewed layout: F accesses over F banks at one port each,
-// where a crossbar would take a port on every bank for every access, and it is
-// exactly what the port model billed once `assign-banks` recorded the slots.
+// they reach distinct banks at every rotation, and bank k can take the offset
+// of whichever of them reaches it and hand its datum back to that one: F
+// accesses over F banks at one port each, where a crossbar would take a port on
+// every bank for every access.
 void DatapathEmitter::emitSkewedInternalReads(const uarch::RegionBlock &rb) {
   StallShell sh = shellFor(rb.id);
   llvm::MapVector<std::pair<unsigned, unsigned>, SmallVector<unsigned>> lanes;
@@ -577,6 +550,11 @@ void DatapathEmitter::emitSkewedInternalReads(const uarch::RegionBlock &rb) {
   }
 }
 
+// seq.read for each internal-memory read scheduled in region \p rb, bound into
+// readData BEFORE emitUnits consumes it. Read latency is the memory's
+// device-resolved `readLatency`, the number the scheduler timed the access at,
+// so the datum lands on exactly the cycle the consumer's register depth was
+// solved against.
 void DatapathEmitter::emitInternalReads(const uarch::RegionBlock &rb) {
   StallShell sh = shellFor(rb.id);
   emitSkewedInternalReads(rb);
@@ -588,8 +566,7 @@ void DatapathEmitter::emitInternalReads(const uarch::RegionBlock &rb) {
     unsigned lat = m.readLatency;
     if (m.isRom) {
       // A constant table read: index the aggregate_constant combinationally,
-      // then register to the (scheduled) read latency so timing matches a RAM.
-      // (A ROM carries no writes.)
+      // then register to the scheduled read latency so timing matches a RAM.
       Value idx = memAddr(m, bankAddress(m, acc).offset);
       Value elem = c.R(hw::ArrayGetOp::create(c.b, c.loc, romArray[m.id], idx));
       readData[accKey(m.id, r.idx)] =
@@ -603,9 +580,8 @@ void DatapathEmitter::emitInternalReads(const uarch::RegionBlock &rb) {
     };
     Value rd;
     if (acc.staticBank) {
-      // A compile-time bank reads its own memory, the way the boundary path
-      // already routes one: no crossbar, and no read port on the other banks.
-      // An unbanked memref is the same case at bank 0.
+      // A compile-time bank reads its own memory: no crossbar, and no read port
+      // on the other banks. An unbanked memref is the same case at bank 0.
       rd = readAt(banks[*acc.staticBank],
                   memAddr(m, bankAddress(m, acc).offset));
     } else {
@@ -626,9 +602,8 @@ void DatapathEmitter::emitInternalReads(const uarch::RegionBlock &rb) {
 // Read crossbar for each data-dependent external (argument) read in region
 // \p rb: drive every bank interface's address with the in-bank offset, read
 // each bank's data port, and mux by the runtime bank, delayed to the memory's
-// device read latency so the select aligns with its data. Bound into
-// readData before emitUnits, the twin of emitInternalReads for boundary ports
-// instead of hlmems.
+// device read latency so the select aligns with its data. The twin of
+// emitInternalReads for boundary ports instead of hlmems.
 void DatapathEmitter::emitExternalReads(const uarch::RegionBlock &rb) {
   StallShell sh = shellFor(rb.id);
   for (uarch::AccRef r : rb.memAccesses) {
@@ -636,9 +611,9 @@ void DatapathEmitter::emitExternalReads(const uarch::RegionBlock &rb) {
     const uarch::MemUnit::Access &acc = m.accesses[r.idx];
     if (!m.external || acc.isWrite)
       continue;
-    // A scattered argument has no address port: a read is a crossbar over
-    // every element selected by the index (a constant index folds away in
-    // CIRCT, why `A[3]` needs no static/dynamic split). Read latency is 0.
+    // A scattered argument has no address port: a read is a crossbar over every
+    // element selected by the index, and a constant index folds the crossbar
+    // away. Read latency is 0.
     if (m.scattered) {
       SmallVector<Value> elems;
       for (const uarch::MemUnit::ElemPort &p : m.elemPorts)
@@ -665,9 +640,9 @@ void DatapathEmitter::emitExternalReads(const uarch::RegionBlock &rb) {
 
 // Drive the read-address port of each single-interface external read in region
 // \p rb: the in-bank offset for a statically-banked argument (the boundary
-// presents one interface per bank), which for an unbanked argument is the flat
-// element index. A data-dependent banked read spans every interface, and
-// emitExternalReads drives all of its addresses.
+// presents one interface per bank), the flat element index for an unbanked one.
+// A data-dependent banked read spans every interface, and emitExternalReads
+// drives all of its addresses.
 void DatapathEmitter::emitExternalReadAddrs(const uarch::RegionBlock &rb) {
   for (uarch::AccRef r : rb.memAccesses) {
     const uarch::MemUnit &m = dp.mems[r.id];
@@ -682,15 +657,11 @@ void DatapathEmitter::emitExternalReadAddrs(const uarch::RegionBlock &rb) {
   }
 }
 
-// Compute units of region \p rb: native -> comb; IP -> an instance of the
-// extern operator module (internally pipelined by its latency).
 // Backedge every unit output before wiring, so an input may reference a unit
-// emitted later: the widened-reduction idiom reads the accumulator as a depth-0
-// loop-carry from a later unit, a fused recurrence reads its own output, and a
-// data-dependent read address (emitInternalReads, which runs before emitUnits)
-// reads a unit that computes it. A register elsewhere in the recurrence cycle
-// keeps the hardware acyclic; the backedges only free emission from
-// topological order.
+// emitted later: a fused recurrence reads its own output, and a data-dependent
+// read address (emitInternalReads, which runs before emitUnits) reads a unit
+// that computes it. A register elsewhere in the recurrence cycle keeps the
+// hardware acyclic; the backedges only free emission from topological order.
 void DatapathEmitter::declareUnits(const uarch::RegionBlock &rb) {
   for (uarch::UnitId uid : rb.units) {
     auto b = c.bb.get(hwType(dp.units[uid].identity.resultType, c.b));
@@ -699,6 +670,8 @@ void DatapathEmitter::declareUnits(const uarch::RegionBlock &rb) {
   }
 }
 
+// Compute units of region \p rb: native -> comb; IP -> an instance of the
+// extern operator module, internally pipelined by its latency.
 void DatapathEmitter::emitUnits(const uarch::RegionBlock &rb, UnitMode mode) {
   // A leaf's backedges are declared earlier, before its reads resolve; a
   // container's units are the last thing it emits, so they declare their own.
@@ -708,9 +681,9 @@ void DatapathEmitter::emitUnits(const uarch::RegionBlock &rb, UnitMode mode) {
   for (uarch::UnitId uid : rb.units) {
     const uarch::FuncUnit &u = dp.units[uid];
     if (mode != UnitMode::Leaf) {
-      // Pins that skipping the recurrence re-injection below is a no-op here
-      // rather than a silent drop: a container has no per-iteration issue
-      // pulse to time one against.
+      // Skipping the recurrence re-injection below is a no-op here rather than
+      // a silent drop: a container has no per-iteration issue pulse to time one
+      // against.
       assert(llvm::all_of(u.inputInits,
                           [](const uarch::Source &s) {
                             return s.kind == uarch::Source::Kind::None;
@@ -718,7 +691,7 @@ void DatapathEmitter::emitUnits(const uarch::RegionBlock &rb, UnitMode mode) {
              "a container's own unit carries no recurrence init");
       // A guard predicate is a start-0 compute the children gate on, so the IP
       // path is unreachable for it; a while's condition cone may take cycles
-      // (`t_cond`), and its mode says so.
+      // (`t_cond`), which its mode says.
       assert((u.identity.comb || mode == UnitMode::Condition) &&
              "a container predicate must be a native (comb) unit");
     }
@@ -726,9 +699,9 @@ void DatapathEmitter::emitUnits(const uarch::RegionBlock &rb, UnitMode mode) {
     for (unsigned k = 0; k < u.inputs.size(); ++k) {
       Value v =
           resolveSource(u.inputs[k]); // a self-reference reads its own backedge
-      // Re-inject the reduction identity at a recurrence input (a loop-carried
-      // iter_arg read) while `iv` is in `[lb, lb + dist*step)`, gated by the
-      // issue pulse delayed to this op's stage.
+      // Re-inject the reduction identity at a recurrence input while `iv` is in
+      // `[lb, lb + dist*step)`, gated by the issue pulse delayed to this op's
+      // stage.
       if (mode == UnitMode::Leaf &&
           u.inputInits[k].kind != uarch::Source::Kind::None) {
         const auto rc = controlOf.lookup(rb.id);
@@ -757,7 +730,7 @@ void DatapathEmitter::emitUnits(const uarch::RegionBlock &rb, UnitMode mode) {
           Value bound =
               c.R(comb::AddOp::create(c.b, c.loc, lb, distStep, false));
           // Signed, as `Terminator::isLast` compares the same counter against
-          // the same kind of bound; an unsigned predicate would order a
+          // the same kind of bound. An unsigned predicate would order a
           // negative `lb` the wrong way round.
           cond = c.notBit(c.icmpSgeV(iv, bound));
         }
@@ -790,27 +763,23 @@ void DatapathEmitter::emitUnits(const uarch::RegionBlock &rb, UnitMode mode) {
     }
     unitBE[uid].setValue(result);
     unitVal[u.id] = result;
-    // Name the result wire after the frontend variable this op computes (the
-    // dcp op carries the assignment-target NameLoc, e.g. "acc").
+    // Name the result wire after the frontend variable this op computes: the
+    // dcp op carries the assignment-target NameLoc.
     nameValue(result, u.repOp()->getLoc());
   }
 }
 
-// The condition cone of a sequential (CHECK/RUN) while: emit the container's
-// OWN condition memory reads plus its combinational compute, and return the
-// settled condition value + its ready latency t_cond. Unlike a leaf region's
-// `emit`, there is no per-iteration issue pulse: the read address is the
-// frozen iter-arg survivor, so the load is a continuous read of a stable
-// element and its data is a stable wire from `checkStart + t_cond` onward (the
-// survivors do not advance until after the body drains, which is after CHECK
-// decides). A combinational condition has no read, so this reduces to the
-// container's own units with t_cond == 0.
+// The condition cone of a sequential (CHECK/RUN) while: the container's OWN
+// condition memory reads plus its compute, returning the settled condition and
+// its ready latency t_cond. There is no per-iteration issue pulse: the read
+// address is the frozen iter-arg survivor, so the load is a continuous read of
+// a stable element and its data is a stable wire from `checkStart + t_cond`
+// onward, the survivors not advancing until after CHECK decides.
 std::pair<Value, unsigned>
 DatapathEmitter::emitConditionRegion(const uarch::RegionBlock &rb,
                                      const uarch::Source &condSrc) {
-  // Same emission order as a leaf region's `emit`, but the units are this
-  // container's OWN condition cone: no recurrence to re-inject, and possibly
-  // multi-cycle, which `UnitMode::Condition` states.
+  // Same emission order as a leaf region's `emit`, but over this container's
+  // OWN condition cone: `UnitMode::Condition`.
   emitRegisters(rb);
   declareUnits(rb);
   emitInternalReads(rb);
@@ -832,8 +801,7 @@ void DatapathEmitter::resolveRegHeads(const uarch::RegionBlock &rb) {
 // The drain stage a store contributes to its region's `done`. The write is
 // PRESENTED at `dcpStart` and COMMITS `writeLatency` cycles later; `emitDone`
 // rides its own latch register for the last of those cycles (done reads 1 at
-// `lastIssue + drainStage + 1`), so the stage is the commit cycle minus that
-// one.
+// `lastIssue + drainStage + 1`), so the stage is the commit cycle minus one.
 static unsigned storeDrainOf(const uarch::MemUnit &m,
                              const uarch::MemUnit::Access &acc) {
   assert(m.writeLatency >= 1 &&
@@ -846,7 +814,7 @@ static unsigned storeDrainOf(const uarch::MemUnit &m,
 // lane. Bank k takes the address and data of whichever of the lane's accesses
 // reaches it, and its write-enable is the OR of their demuxed enables, so an
 // access commits on its own bank and nowhere else. The OR has at most one live
-// arm for the same reason the address select does.
+// arm for the same reason the address select does (`laneSelect`).
 void DatapathEmitter::emitSkewedInternalWrites(const uarch::RegionBlock &rb,
                                                Value commit,
                                                DatapathFeedback &fb) {
@@ -860,9 +828,9 @@ void DatapathEmitter::emitSkewedInternalWrites(const uarch::RegionBlock &rb,
   for (auto &[key, idxs] : lanes) {
     const uarch::MemUnit &m = dp.mems[key.first];
     ArrayRef<Value> banks = memBanks[m.id];
-    // A `seq.hlmem` write port realizes one cycle, so a deeper device latency
-    // presents everything `writeLatency - 1` cycles early (the unskewed twin
-    // below says the rest).
+    // A `seq.hlmem` write port realizes exactly one cycle, so a deeper device
+    // latency presents address/data/we `writeLatency - 1` cycles late (the
+    // unskewed twin below says the rest).
     unsigned pre = m.writeLatency - 1;
     auto late = [&](Value v) { return c.shiftChain(v, pre, sh).last(); };
     SmallVector<std::pair<Value, Value>> addrs, datas;
@@ -899,8 +867,8 @@ void DatapathEmitter::emitAccesses(const uarch::RegionBlock &rb, Value issue,
   StallShell sh = shellFor(rb.id);
   emitExternalReadAddrs(rb);
   // A store's write-enable is the issue pulse delayed to its stage. A leaf
-  // while's doomed exit iteration still issues, so its store is also gated by
-  // the continue-condition; container/guard stores are gated by not-issuing.
+  // while's doomed exit iteration still issues, so its store is additionally
+  // gated by the continue-condition.
   Value gatedIssue;
   auto commitPulse = [&]() -> Value {
     if (!rb.conditional)
@@ -920,9 +888,9 @@ void DatapathEmitter::emitAccesses(const uarch::RegionBlock &rb, Value issue,
       continue;
     Value we = c.activationPulse(commitPulse(), acc.op, sh);
     Value data = resolveSource(acc.data);
-    // A scattered argument's element ports are shared by every store: this
-    // only records the terms, and `finalizeScatteredPorts` drives each
-    // element once every region has contributed. Write latency is 1, no skew.
+    // A scattered argument's element ports are shared by every store: this only
+    // records the terms, and `finalizeScatteredPorts` drives each element once
+    // every region has contributed. Write latency is 1, no skew.
     if (m.scattered) {
       scatterWrites[m.id].push_back({we, scatterIndex(m, acc), data});
       fb.storeDrain = std::max<unsigned>(fb.storeDrain, storeDrainOf(m, acc));
@@ -944,8 +912,7 @@ void DatapathEmitter::emitAccesses(const uarch::RegionBlock &rb, Value issue,
   }
   emitSkewedInternalWrites(rb, commitPulse(), fb);
   // Internal-memory writes drive seq.write instead of module ports, but still
-  // set the region's store drain, so a region storing only to an internal
-  // buffer completes after its deepest write commits.
+  // set the region's store drain.
   for (uarch::AccRef r : rb.memAccesses) {
     const uarch::MemUnit &m = dp.mems[r.id];
     const uarch::MemUnit::Access &acc = m.accesses[r.idx];
@@ -968,8 +935,7 @@ void DatapathEmitter::emitAccesses(const uarch::RegionBlock &rb, Value issue,
            late(memAddr(m, bankAddress(m, acc).offset)), data, we});
     } else if (acc.staticBank) {
       // A compile-time bank writes its own memory: no demux, and no write port
-      // on the other banks (the read twin above). An unbanked memref is the
-      // same case at bank 0.
+      // on the other banks. An unbanked memref is the same case at bank 0.
       seq::WritePortOp::create(
           c.b, c.loc, banks[*acc.staticBank],
           ValueRange{late(memAddr(m, bankAddress(m, acc).offset))}, data, we,
@@ -1018,21 +984,15 @@ void DatapathEmitter::finalizeSharedWritePorts() {
 }
 
 // Drive each scattered argument's element outputs from every store recorded
-// against it. Per element: the datum is a priority mux over the stores that
-// reach it, and the write-enable the OR of their demuxed pulses, which is the
-// same (`laneSelect`, `writeDemux`) pair `emitSkewedInternalWrites` uses.
+// against it: per element the datum is a priority mux over the stores that
+// reach it, and the write-enable the OR of their demuxed pulses.
 //
 // At most one arm is live per element per cycle, so the priority order carries
-// no meaning. Unlike a skewed lane, that is not structural here: it holds
-// because two stores to one element are ordered by the dependence analysis (a
-// runtime subscript it cannot prove disjoint is ordered conservatively), while
-// two stores to DIFFERENT elements in one cycle are exactly what a complete
-// partition's unlimited ports are for. An internal complete-partitioned array
-// rests on the same assumption, as several `seq.write` ports on one
-// `seq.hlmem`.
-//
-// A constant subscript folds its `icmpEq` away, so `A[3] = x` leaves element 3
-// driven and the other N-1 write-enables constant false.
+// no meaning. Unlike a skewed lane that is not structural here: two stores to
+// one element are ordered by the dependence analysis, while two stores to
+// DIFFERENT elements in one cycle are what a complete partition's unlimited
+// ports are for. A constant subscript folds its `icmpEq` away, so `A[3] = x`
+// leaves element 3 driven and the other N-1 write-enables constant false.
 void DatapathEmitter::finalizeScatteredPorts() {
   for (const uarch::MemUnit &m : dp.mems) {
     auto it = scatterWrites.find(m.id);
@@ -1055,11 +1015,10 @@ void DatapathEmitter::finalizeScatteredPorts() {
   }
 }
 
-// A kernel-local channel is realized as a `seq.fifo` in the module body, but
-// that FIFO cannot be built until every access has contributed its drive, and
-// the accesses read its outputs. So declare those outputs as backedges here,
-// before any region emits, and let `finalizeStreamPorts` build the FIFO and
-// resolve them.
+// A kernel-local channel's `seq.fifo` cannot be built until every access has
+// contributed its drive, and the accesses read its outputs. Declare those
+// outputs as backedges here, before any region emits, and let
+// `finalizeStreamPorts` build the FIFO and resolve them.
 void DatapathEmitter::declareInternalChannels() {
   for (const uarch::StreamChannel &s : dp.streams) {
     // A channel wired between CHILD PORTS declares the other shape: one
@@ -1112,28 +1071,21 @@ void DatapathEmitter::bindStreamReads(const uarch::RegionBlock &rb) {
 // shift chains and every Ce operator hold together and no bubble slips stale
 // data into loop-carried state. A stage-0 access keys on the UNgated
 // `wantIssue` so the signals stay combinationally acyclic, a deeper access on
-// the (registered) delayed issue. A predicated access (`acc.when` set)
-// additionally gates its handshake on the predicate so a token is
-// consumed/produced only where it holds; the predicate is a datapath value (no
-// FIFO status), so acyclicity is preserved.
+// the registered delayed issue. A predicated access (`acc.when` set) also gates
+// its handshake on the predicate, itself a datapath value rather than a FIFO
+// status, so acyclicity is preserved.
 //
-// The pulses this pass builds are themselves timed against the region's
-// PROMISED shell, which is what the returned enables resolve: the enable and
-// the chains it freezes are genuinely mutually recursive (a register-enable
-// feedback, acyclic in hardware because the FIFO status it starts from is
-// stored state), and the promise's backedges are what break that cycle for SSA
-// construction.
-//
-// Several accesses may share one channel: they interleave inside the II, since
-// the FIFO dependence edges put each on its own cycle in program order (which
-// `validateDatapath` re-checks). Each contributes its own term to
-// `streamDrives[s.id]`; the port itself is driven once, by
-// `finalizeStreamPorts`.
+// The pulses built here are timed against the region's PROMISED shell, which is
+// what the returned enables resolve: the enable and the chains it freezes are
+// mutually recursive, acyclic in hardware because the FIFO status it starts
+// from is stored state, and the promise's backedges break that cycle for SSA
+// construction. Several accesses may share one channel, interleaved inside the
+// II by the FIFO dependence edges; each contributes its own term to
+// `streamDrives[s.id]` and `finalizeStreamPorts` drives the port once.
 StallShell DatapathEmitter::deriveStallShell(const uarch::RegionBlock &rb,
                                              Value issue,
                                              DatapathFeedback &fb) {
-  // No stream accesses: nothing to be elastic about, so the region stays rigid
-  // and no shell is derived.
+  // No stream accesses: nothing to be elastic about, so the region stays rigid.
   if (rb.streamAccesses.empty())
     return {};
   streamDrives.resize(dp.streams.size());
@@ -1147,8 +1099,7 @@ StallShell DatapathEmitter::deriveStallShell(const uarch::RegionBlock &rb,
          "defers a starved or back-pressured pass by GATING its issue, so a "
          "controller whose issue cannot be gated would drop the pass and "
          "sample `_data` with no regard for `_valid`");
-  // Outputs: drive data + valid, accumulate the output-full hazard (the sole
-  // freeze cause).
+  // Outputs: drive data + valid, accumulate the output-full hazard.
   Value outHazard; // OR over the region's puts of (valid & ~ready)
   // A stage>=1 put whose handshake fired while the pipeline is frozen: see the
   // `sent` latch below. Resolved once `chainEnable` is final.
@@ -1191,7 +1142,7 @@ StallShell DatapathEmitter::deriveStallShell(const uarch::RegionBlock &rb,
     fb.storeDrain = std::max<unsigned>(fb.storeDrain, acc.stage);
   }
   // Mid-pipeline freeze: a stage>0 get with a needed-but-empty input cannot
-  // bubble past a missing token, so fold that stall into `chainEnable` next to
+  // bubble past a missing token, so fold that stall into `chainEnable` beside
   // the output-full freeze. Only registered state is read here.
   Value midStall;
   unsigned stage0Gets = 0;
@@ -1269,17 +1220,16 @@ StallShell DatapathEmitter::deriveStallShell(const uarch::RegionBlock &rb,
 }
 
 // Drive each channel from the terms every region contributed. A BOUNDARY
-// channel drives its module ports, and the port set follows its direction: an
+// channel drives its module ports, the port set following its direction: an
 // input FIFO's `_data` / `_valid` are module inputs and only `_ready` is
-// driven; an output's are the reverse (`validateDatapath` rejects a boundary
-// channel used in both directions, so the two cases are exhaustive). A
-// kernel-LOCAL channel instead OWNS its queue: one `seq.fifo` here, pushed and
-// popped by this module's own accesses.
+// driven, an output's the reverse (`validateDatapath` rejects a boundary
+// channel used both ways, so the two cases are exhaustive). A kernel-LOCAL
+// channel instead OWNS its queue: one `seq.fifo` here.
 void DatapathEmitter::finalizeStreamPorts() {
   streamDrives.resize(dp.streams.size());
   for (const uarch::StreamChannel &s : dp.streams) {
-    // A channel wired between CHILD PORTS has no access of this module's own to
-    // accumulate a drive from: its handshake closes over the instances instead.
+    // A channel wired between CHILD PORTS has no access of this module's own:
+    // its handshake closes over the instances instead.
     if (!s.callEnds.empty()) {
       emitComposedChannel(s);
       continue;
@@ -1313,8 +1263,7 @@ void DatapathEmitter::finalizeStreamPorts() {
 // handshake closes here: a token is pushed where a put fires and the FIFO has
 // space, popped where a get fires and it holds one. `seq.fifo`'s output is
 // show-ahead, so {output, ~empty, ~full} present exactly the {data, valid,
-// ready} triple the accesses were written against for a boundary port, which is
-// why the access emission needs no local-channel case of its own.
+// ready} triple the accesses were written against for a boundary port.
 void DatapathEmitter::emitInternalChannel(const uarch::StreamChannel &s,
                                           Value data) {
   const StreamDrive &drv = streamDrives[s.id];
@@ -1332,27 +1281,23 @@ void DatapathEmitter::emitInternalChannel(const uarch::StreamChannel &s,
   w.ready.setValue(c.notBit(fifo.getFull()));
 }
 
-// The queue(s) behind a channel wired between CHILD PORTS.
-//
-// One `seq.fifo` per CONSUMER end, all pushed by the producer on the same
-// cycle: the fan-out tee. The producer may write only when every consumer can
-// accept (the bounded fork), so each copy sees the whole token sequence in
-// order, and the per-consumer buffering is what decouples them. A SEEDED
-// channel additionally fronts each consumer with an init-prepend shim: while
-// its `rem` down-counter is non-zero the consumer reads the initial tokens and
-// does not pop, so the history it sees is [init] ++ [produced] and a feedback
-// cycle turns from cycle 0. The `seq.fifo` itself is untouched.
+// The queue(s) behind a channel wired between CHILD PORTS: one `seq.fifo` per
+// CONSUMER end, all pushed by the producer on the same cycle, the fan-out tee.
+// The producer may write only when every consumer can accept (the bounded
+// fork), so each copy sees the whole token sequence in order. A SEEDED channel
+// additionally fronts each consumer with an init-prepend shim: while its `rem`
+// down-counter is non-zero the consumer reads the initial tokens and does not
+// pop, so the history it sees is [init] ++ [produced] and a feedback cycle
+// turns from cycle 0.
 //
 // Where one end is a BOUNDARY port of this module rather than a child, that end
 // needs no queue: the child's own handshake is the module's, so the three wires
-// pass straight through (a boundary output, or an input with a single reader).
-// A fanned-out boundary input is the one mixed case: the module's port pushes
-// the tee.
+// pass straight through. A fanned-out boundary input is the one mixed case: the
+// module's port pushes the tee.
 void DatapathEmitter::emitComposedChannel(const uarch::StreamChannel &s) {
   ComposedWires &w = composedWires[s.id];
   // A channel is composed OR accessed, never both: a stream operand makes its
-  // call concurrent, and a concurrent region issues no access of its own. Were
-  // both to reach here the accumulated drives would be silently dropped.
+  // call concurrent, and a concurrent region issues no access of its own.
   assert(s.accesses.empty() &&
          "a channel wired between child ports also has in-module accesses");
   Type payload = hwType(s.payload, c.b);
@@ -1421,8 +1366,8 @@ void DatapathEmitter::emitComposedChannel(const uarch::StreamChannel &s) {
     Value data = out[k], valid = notEmpty;
     if (nInit) {
       // `rem` counts the initial tokens still to serve, k .. 1; the datum is
-      // picked by the running index (idx = nInit - rem), served in order, and
-      // the rem==1 token falls through as the chain's default.
+      // picked by the running index (idx = nInit - rem) and the rem==1 token
+      // falls through as the chain's default.
       unsigned remW = 1;
       while ((1u << remW) <= nInit)
         ++remW;
@@ -1471,50 +1416,29 @@ void DatapathEmitter::emitComposedChannel(const uarch::StreamChannel &s) {
     w.prodReady.setValue(allNotFull);
 }
 
-// Instantiate each CallUnit (dcp.instance) in region \p rb as a child
-// hw.instance. The child masters each memref operand's memory: it drives the
-// addr/data/we, so the leaf wires those instance-output ports to the buffer's
-// hlmem (a seq.read whose data feeds back to the child, a seq.write). The
-// region's completion is the child's real `done` (fb.callDone). Serial
-// execution (a producer region drains before the child starts, the child before
-// a consumer) means one master per port at a time: no arbitration mux.
-// The start pulse of one child. Composition is one operator over (start policy
-// x substrate); this is the policy half on the instance substrate, read off the
-// node's contract and its region's composition class:
+// The start pulse of one child, read off the node's contract and its region's
+// composition class:
 //
-//   * HANDSHAKE, the rising edge of the predecessors' joined `done`, for every
-//     gated child of a SCHEDULED composition, and, in a CONCURRENT one, for a
-//     child whose ordering cannot be expressed as an offset: a spawn (it has
-//     none of its own), a consumer of a scalar result (that port only holds
-//     from the producer's `done`, so an exact-cycle release is not a safe
-//     contract even against a determinate producer), or a child gated by an
-//     indeterminate producer (there is no cycle to name). A CHANNEL-CONNECTED
-//     pair never reaches here: `recordCallDeps` records no edge between two,
-//     since back-pressure is already their ordering;
-//   * BROADCAST, the container's own start, for an ungated spawn, ordered
-//     thereafter by FIFO back-pressure alone;
-//   * TIME-TRIGGERED at the scheduled offset otherwise, which in a SCHEDULED
-//     composition covers an UNGATED call: one with no call predecessor to hand
-//     off from. Its operands still need not be ready at the region's issue
-//     pulse, and a scalar argument loaded from memory is the reachable case
-//     (the load's data is not valid until its latency has passed), so releasing
-//     it at issue would latch garbage. The offset rides the region's shell, so
-//     it stretches with a stall. A GATED call keeps the handshake: its
-//     predecessor declares a latency, but the declaration is not tight enough
-//     to release a memory-hazard consumer against, so `done` remains the
-//     contract.
+//   * HANDSHAKE, the rising edge of the predecessors' joined `done`, for a
+//     gated child of a SCHEDULED composition and, in a CONCURRENT one, for a
+//     child whose ordering cannot be expressed as an offset: a spawn, a
+//     consumer of a scalar result (that port only holds from the producer's
+//     `done`), or a child gated by an indeterminate producer. A
+//     CHANNEL-CONNECTED pair never reaches here, back-pressure already being
+//     their ordering;
+//   * BROADCAST, the container's own start, for an ungated spawn;
+//   * TIME-TRIGGERED at the scheduled offset otherwise. An ungated call's
+//     operands need not be ready at the region's issue pulse (a scalar argument
+//     loaded from memory is the reachable case), so releasing it at issue would
+//     latch garbage. The offset rides the region's shell, so it stretches with
+//     a stall.
 //
 // A child's `done` is a level its own start clears, so on a retriggered region
-// it still reads the previous pass's 1 until the child is released, which for
-// both an offset and a handshake is after `issue`. The two readers that mean
-// "completed THIS pass", the predecessor join and the region's completion
-// conjunction, therefore take it through `completedSince(issue)`; it rises the
-// same cycle `done` does, so timing within a pass is unchanged. A SCHEDULED
-// composition only, since there `issue` is the pass-start pulse the calls are
-// placed against. A CONCURRENT one has no such boundary, its children being
-// spawns paced by channel back-pressure rather than by a pass, and its start
-// policy holds `issue` out of a handshake's cone on purpose: a handshake there
-// must not become a time-trigger wearing a mask.
+// it still reads the previous pass's 1 until the child is released. The
+// predecessor join and the region's completion conjunction mean "completed THIS
+// pass" and therefore read it through `completedSince(issue)`, in a SCHEDULED
+// composition only: there `issue` is the pass-start pulse the calls are placed
+// against, where a CONCURRENT region has no such boundary.
 Value DatapathEmitter::startForCall(const uarch::CallUnit &cu, Value issue,
                                     ArrayRef<Value> predDones, bool concurrent,
                                     const StallShell &sh) {
@@ -1534,6 +1458,12 @@ Value DatapathEmitter::startForCall(const uarch::CallUnit &cu, Value issue,
   return c.delayValid(issue, cu.start, StallShell{});
 }
 
+// Instantiate each CallUnit (dcp.instance) in region \p rb as a child
+// hw.instance. The child masters each memref operand's memory: it drives the
+// addr/data/we, so the leaf wires those instance-output ports to the buffer's
+// hlmem. The region's completion is the child's real `done` (fb.callDone).
+// Serial execution (a producer region drains before the child starts, the child
+// before a consumer) means one master per port at a time: no arbitration mux.
 void DatapathEmitter::emitCalls(const uarch::RegionBlock &rb, Value issue,
                                 DatapathFeedback &fb) {
   StallShell sh = shellFor(rb.id);
@@ -1580,8 +1510,8 @@ void DatapathEmitter::emitCalls(const uarch::RegionBlock &rb, Value issue,
       }
     }
     // Channel ends: the child drives two of the three handshake wires and reads
-    // the third, whichever side it is on. What it reads is a promise the
-    // channel realization resolves once every end exists.
+    // the third. What it reads is a promise the channel realization resolves
+    // once every end exists.
     for (auto [k, sa] : llvm::enumerate(cu.streamArgs)) {
       ComposedWires &w = composedWires[sa.chan];
       if (!sa.isInput) {
@@ -1600,19 +1530,17 @@ void DatapathEmitter::emitCalls(const uarch::RegionBlock &rb, Value issue,
       ins[sa.valid] = w.sinkValid[slot];
     }
     // Scalar operands: drive each child scalar-input port from its resolved
-    // Source (an IO port, a latched sibling survivor, an earlier child's
-    // live result, or a constant), sampled at the child's start.
+    // Source, sampled at the child's start.
     for (const uarch::CallUnit::ScalarArg &sa : cu.scalarIns)
       ins[sa.port] = resize(c.b, c.loc, resolveSource(sa.src), sa.width,
                             /*isSigned=*/true);
 
-    // Wire the child instance: inputs by port name from `ins`, outputs by name.
     auto outs = instantiateChild(c.b, c.loc, child,
                                  childInstanceName(cu.callee, cu.id), ins);
 
     // Scalar results: the child holds each result on its output port from
     // `done` onward, so that port IS the survivor a sibling reads, with no
-    // separate capture. Same wire in callResultVal and survivorOf.
+    // separate capture.
     for (auto [r, port] : llvm::enumerate(cu.resultPorts)) {
       callResultVal[accKey(cu.id, r)] = outs[port];
       setSurvivor(cu.region, r, outs[port]);
@@ -1634,9 +1562,9 @@ void DatapathEmitter::emitCalls(const uarch::RegionBlock &rb, Value issue,
         continue;
       }
       const uarch::MemUnit &m = dp.mems[ma.mem];
-      // A constant table the child only reads: one `hw.array_get` off the
-      // aggregate, registered to the latency the child was timed against so the
-      // datum lands exactly where a RAM's would.
+      // A constant table the child only reads: one `hw.array_get` registered to
+      // the latency the child was timed against, so the datum lands exactly
+      // where a RAM's would.
       if (m.isRom) {
         Value elem = c.R(hw::ArrayGetOp::create(c.b, c.loc, romArray[m.id],
                                                 memAddr(m, outs[ma.addr])));
@@ -1672,9 +1600,8 @@ void DatapathEmitter::emitCalls(const uarch::RegionBlock &rb, Value issue,
             c.R(seq::ReadPortOp::create(c.b, c.loc, hlmem, ValueRange{addr},
                                         /*rdEn=*/Value(), m.readLatency)));
     }
-    // Scoped to this pass for the join above and the conjunction below, both of
-    // which mean "completed THIS pass" and would otherwise read the previous
-    // one's latched 1 (see the note on the start policy above).
+    // Scoped to this pass for the join above and the conjunction below, which
+    // would otherwise read the previous pass's latched 1.
     Value completed =
         concurrent ? outs[kDone] : c.completedSince(outs[kDone], issue);
     doneByCid[cu.id] = completed;
@@ -1682,8 +1609,7 @@ void DatapathEmitter::emitCalls(const uarch::RegionBlock &rb, Value issue,
     if (!cu.streamArgs.empty())
       callOuts[cu.id] = std::move(outs);
   }
-  // The region completes when every call has: the AND of their dones
-  // (last-to-finish; a serial chain degenerates to the last call's).
+  // The region completes when every call has: the AND of their dones.
   Value all;
   for (Value d : dones)
     all = all ? c.andBits(all, d) : d;
@@ -1692,10 +1618,9 @@ void DatapathEmitter::emitCalls(const uarch::RegionBlock &rb, Value issue,
 }
 
 // Emit region \p rb's whole datapath (F) given the controller's \p issue;
-// returns its store feedback. Stream reads bound first (before any consumer),
-// then registers, internal reads, the child calls, units, register heads and
-// accesses. Every timing primitive here runs on the region's registered shell;
-// deriving that shell (H) is the orchestrator's next step, on what this emits.
+// returns its store feedback. Every timing primitive here runs on the region's
+// registered shell; deriving that shell (H) is the orchestrator's next step, on
+// what this emits.
 DatapathFeedback DatapathEmitter::emit(const uarch::RegionBlock &rb,
                                        Value issue) {
   bindStreamReads(rb);
