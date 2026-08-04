@@ -82,9 +82,10 @@ ModuleInterface::ModuleInterface(const uarch::Datapath &dp) {
     auto [shape, axes] = layoutOf(mu);
     std::vector<Memory> g;
     for (const auto &[bank, base] : extPorts(mu, acc))
-      g.push_back({argOf(mu.memref), write, (int)bank, factor, w, lat, base,
-                   portAddr(base), portData(base),
-                   write ? portWe(base) : std::string(), shape, axes});
+      g.push_back({argOf(mu.memref), write, write && mu.writesIndependent,
+                   (int)bank, factor, w, lat, base, portAddr(base),
+                   portData(base), write ? portWe(base) : std::string(), shape,
+                   axes});
     return g;
   };
   for (uarch::AccRef r : reads)
@@ -109,6 +110,7 @@ ModuleInterface::ModuleInterface(const uarch::Datapath &dp) {
       auto [shape, axes] = layoutOf(mu);
       Memory m{argOf(mu.memref),
                ma.isWrite,
+               ma.isWrite && ma.independent,
                (int)ma.bank,
                (int)ma.factor,
                w,

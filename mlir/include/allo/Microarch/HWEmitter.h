@@ -271,6 +271,18 @@ struct DatapathEmitter {
   };
   DenseMap<unsigned, SmallVector<SharedWrite, 2>> sharedWrites; // by MemId
 
+  /// The same, for a store to an EXTERNAL array whose boundary write port
+  /// groups were merged onto its colours (`MemUnit::writesIndependent`): the
+  /// group is a module output, so several stores drive it and only
+  /// `finalizeBoundaryWritePorts` can, once every region has emitted. Indexed
+  /// by `MemUnit::Access::portIdx`, the group's slot in `Datapath::writePorts`.
+  struct BoundaryWrite {
+    Value addr;
+    Value data;
+    Value we;
+  };
+  DenseMap<unsigned, SmallVector<BoundaryWrite, 2>> boundaryWrites;
+
   /// Which of the array's write ports each access is coloured onto
   /// (`Datapath::writePortColouring`), indexed as `MemUnit::accesses`. Present
   /// with an EMPTY vector for an array only a child writes, whose writes still
@@ -489,6 +501,9 @@ struct DatapathEmitter {
   /// output port and drives nothing.
   void finalizeScatteredPorts();
   void finalizeSharedWritePorts();
+  /// Drive each merged boundary write port group from the stores coloured onto
+  /// it. Call exactly once, with the same timing as the two above.
+  void finalizeBoundaryWritePorts();
   /// Build one kernel-local channel's `seq.fifo` from its accumulated drives
   /// (\p data is the puts' muxed token) and resolve its `streamWires`.
   void emitInternalChannel(const uarch::StreamChannel &s, Value data);

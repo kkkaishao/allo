@@ -43,6 +43,12 @@ struct Memory {
   };
   int arg;
   bool write;
+  /// This module's write interfaces on \p arg never collide: two may be
+  /// enabled in one cycle, but only where the scheduler proved they address
+  /// different words. A caller backing the argument may then give each its own
+  /// `always` block and infer a true dual port; without it every write shares
+  /// one block and the array becomes a register file. Always false on a read.
+  bool independent;
   int bank, factor; // the bank this interface serves / total physical banks
   unsigned width;   // element bit width
   unsigned latency; // access latency

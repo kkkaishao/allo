@@ -452,8 +452,10 @@ void HWEmitter::emit() {
   // store to it.
   datapath.finalizeScatteredPorts();
   // And an internal array's write ports, each shared by the stores coloured
-  // onto it so the array still infers a block RAM.
+  // onto it so the array still infers a block RAM, and an external array's
+  // boundary groups, merged onto the same colours so its OWNER can.
   datapath.finalizeSharedWritePorts();
+  datapath.finalizeBoundaryWritePorts();
   // Scalar results: the returning region's survivor register, stable once its
   // region (and thus `done`) has risen; the cosim samples it at `done`.
   for (const uarch::Result &r : dp.results)

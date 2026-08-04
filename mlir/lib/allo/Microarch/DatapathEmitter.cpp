@@ -456,7 +456,7 @@ void DatapathEmitter::createInternalMemories() {
         llvm::all_of(m.accesses, [](const uarch::MemUnit::Access &a) {
           return !a.isWrite || a.staticBank;
         }))
-      ports = dp.writePortColouring(m.id, /*maxPorts=*/2);
+      ports = dp.writePortColouring(m.id, uarch::Datapath::kMaxWritePorts);
     SmallVector<Value> banks;
     for (unsigned k = 0; k < m.numBanks; ++k) {
       auto mem =
@@ -903,6 +903,14 @@ void DatapathEmitter::emitAccesses(const uarch::RegionBlock &rb, Value issue,
     auto bs = bankAddress(m, acc);
     Value dynBank = eb.factor > 1 && !eb.bank ? bs.bank : Value();
     Value portAddrVal = boundaryAddr(c, bs.offset);
+    // A merged group is one interface for several stores, so it is driven once
+    // all of them have emitted. Merging happens only where every store reaches
+    // a single interface, hence one `extPorts` pair and no demux.
+    if (m.writesIndependent) {
+      boundaryWrites[acc.portIdx].push_back({portAddrVal, data, we});
+      fb.storeDrain = std::max<unsigned>(fb.storeDrain, storeDrainOf(m, acc));
+      continue;
+    }
     for (const auto &[bank, base] : extPorts(m, acc)) {
       pa.setOutput(portAddr(base), portAddrVal);
       pa.setOutput(portData(base), data);
@@ -951,6 +959,30 @@ void DatapathEmitter::emitAccesses(const uarch::RegionBlock &rb, Value issue,
                                  writeDemux(c, we, bank, k), wlat);
     }
     fb.storeDrain = std::max<unsigned>(fb.storeDrain, storeDrainOf(m, acc));
+  }
+}
+
+// Drive each merged boundary write port group from the stores coloured onto
+// it, a one-hot select for the same reason as the shared internal ports below.
+void DatapathEmitter::finalizeBoundaryWritePorts() {
+  for (const uarch::MemUnit &m : dp.mems) {
+    if (!m.external || !m.writesIndependent)
+      continue;
+    for (const uarch::MemUnit::Access &acc : m.accesses) {
+      auto it = boundaryWrites.find(acc.portIdx);
+      if (!acc.isWrite || it == boundaryWrites.end())
+        continue;
+      Value addr, data, we;
+      for (const BoundaryWrite &w : it->second) {
+        addr = addr ? c.mux(w.we, w.addr, addr) : w.addr;
+        data = data ? c.mux(w.we, w.data, data) : w.data;
+        we = we ? c.orBits(we, w.we) : w.we;
+      }
+      pa.setOutput(portAddr(acc.portBase), addr);
+      pa.setOutput(portData(acc.portBase), data);
+      pa.setOutput(portWe(acc.portBase), we);
+      boundaryWrites.erase(it); // the group's other stores are done with it
+    }
   }
 }
 
@@ -1549,7 +1581,7 @@ void DatapathEmitter::emitCalls(const uarch::RegionBlock &rb, Value issue,
     // Master each buffer from the child's addr/data/we outputs: a boundary arg
     // passes through to the top port (flat i32 address); an internal buffer
     // drives its hlmem at the clog2(depth) index and the child's RAM latency.
-    for (const uarch::CallUnit::MemArg &ma : cu.memArgs) {
+    for (auto [argIdx, ma] : llvm::enumerate(cu.memArgs)) {
       if (ma.isBoundary) {
         // One port group per accessor, driven from the child's addr/data/we:
         // concurrent masters get distinct groups (no mux); a serial pair also
@@ -1588,10 +1620,15 @@ void DatapathEmitter::emitCalls(const uarch::RegionBlock &rb, Value issue,
         Value a = c.shiftChain(addr, pre, sh).last();
         Value d = c.shiftChain(outs[ma.data], pre, sh).last();
         Value w = c.delayValid(outs[ma.we], pre, sh);
-        // A call's write always lands on port 0: the colouring refuses to split
-        // an array a call writes, since nothing relates two calls' addresses.
-        if (writePortOf.count(m.id))
-          sharedWrites[m.id].push_back({ma.bank, 0, a, d, w});
+        // The colouring settles a call's write port too, so two ports of ONE
+        // child that declared them independent land in separate `always`
+        // blocks and the array still infers a true dual port.
+        auto ports = writePortOf.find(m.id);
+        if (ports != writePortOf.end())
+          sharedWrites[m.id].push_back(
+              {ma.bank,
+               ports->second[dp.callPortSlot(m.id, cu.id, unsigned(argIdx))], a,
+               d, w});
         else
           seq::WritePortOp::create(c.b, c.loc, hlmem, ValueRange{a}, d, w,
                                    c.b.getI64IntegerAttr(1));

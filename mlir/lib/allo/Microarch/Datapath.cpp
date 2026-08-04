@@ -407,9 +407,9 @@ static unsigned maxClique(llvm::ArrayRef<uint64_t> adj, uint64_t candidates,
   return best;
 }
 
-llvm::SmallVector<uint64_t>
-Datapath::portGraph(MemId id, bool writesOnly,
-                    llvm::SmallVectorImpl<unsigned> &accessOf) const {
+llvm::SmallVector<uint64_t> Datapath::portGraph(
+    MemId id, bool writesOnly, llvm::SmallVectorImpl<unsigned> &accessOf,
+    llvm::SmallVectorImpl<std::pair<int, bool>> *callerOf) const {
   const MemUnit &m = mems[id];
   // Top-level ancestor of a region: the granularity `recordSiblingDeps` orders
   // at, and a container's children stay serial below it.
@@ -441,6 +441,7 @@ Datapath::portGraph(MemId id, bool writesOnly,
     unsigned residue;
     int call; // CallId, or -1 for a region-local access
     int bank; // the bank it commits to, or -1 when it may reach any
+    bool independent = false; // a call port its child proved collision-free
   };
   // A skew records a SLOT in `staticBank`, and two slots rotate onto one bank,
   // so only an unskewed array's index names the memory an access reaches.
@@ -455,13 +456,17 @@ Datapath::portGraph(MemId id, bool writesOnly,
       ws.push_back({topOf(acc.region), acc.region, ii ? start % ii : start, -1,
                     bankOf(acc.staticBank)});
       accessOf.push_back(i);
+      if (callerOf)
+        callerOf->push_back({-1, false});
     }
   for (const CallUnit &cu : calls)
     for (const CallUnit::MemArg &ma : cu.memArgs)
       if (ma.mem == id && (ma.isWrite || !writesOnly)) {
-        ws.push_back(
-            {topOf(cu.region), cu.region, 0, int(cu.id), bankOf(ma.bank)});
+        ws.push_back({topOf(cu.region), cu.region, 0, int(cu.id),
+                      bankOf(ma.bank), ma.independent});
         accessOf.push_back(kNoWritePort);
+        if (callerOf)
+          callerOf->push_back({int(cu.id), ma.independent});
       }
   // The bitsets are 64 wide. Above that the relation is not built and every
   // caller treats each access as simultaneous, which only over-states and so
@@ -517,12 +522,26 @@ unsigned Datapath::portsNeeded(MemId id, bool writesOnly) const {
   return maxClique(adj, all, /*excluded=*/0, /*depth=*/0, budget);
 }
 
+unsigned Datapath::callPortSlot(MemId id, CallId call, unsigned arg) const {
+  unsigned slot = mems[id].accesses.size();
+  for (const CallUnit &cu : calls)
+    for (auto [k, ma] : llvm::enumerate(cu.memArgs)) {
+      if (ma.mem != id || !ma.isWrite)
+        continue;
+      if (cu.id == call && k == arg)
+        return slot;
+      ++slot;
+    }
+  llvm_unreachable("no such call-mastered write of this array");
+}
+
 std::optional<llvm::SmallVector<unsigned>>
 Datapath::writePortColouring(MemId id, unsigned maxPorts) const {
   const MemUnit &m = mems[id];
   llvm::SmallVector<unsigned> accessOf;
+  llvm::SmallVector<std::pair<int, bool>> callerOf;
   llvm::SmallVector<uint64_t> adj =
-      portGraph(id, /*writesOnly=*/true, accessOf);
+      portGraph(id, /*writesOnly=*/true, accessOf, &callerOf);
   unsigned n = accessOf.size();
   if (adj.size() != n)
     return std::nullopt; // no relation to colour over
@@ -541,33 +560,36 @@ Datapath::writePortColouring(MemId id, unsigned maxPorts) const {
   if (used > maxPorts)
     return std::nullopt;
 
-  // Splitting the writes across ports only orders a simultaneous pair if the
-  // scheduler already proved it addresses different words, which it does inside
-  // ONE region and nowhere else. One such pair anywhere and every write stays
-  // on the port it has today.
+  // Splitting the writes across ports only orders a simultaneous pair if it is
+  // PROVEN to address different words. Two accesses of one region are, and so
+  // are two write ports of one child that declared them independent, which is
+  // that child having proven the same thing about its own accesses. Anything
+  // else and every write stays on the port it has today.
+  auto proven = [&](unsigned i, unsigned j) {
+    if (callerOf[i].first < 0 && callerOf[j].first < 0)
+      return m.accesses[accessOf[i]].region == m.accesses[accessOf[j]].region;
+    return callerOf[i].first >= 0 && callerOf[i].first == callerOf[j].first &&
+           callerOf[i].second;
+  };
   if (used > 1)
     for (unsigned i = 0; i < n; ++i)
-      for (unsigned j = i + 1; j < n; ++j) {
-        if (!((adj[i] >> j) & 1))
-          continue;
-        if (accessOf[i] == kNoWritePort || accessOf[j] == kNoWritePort ||
-            m.accesses[accessOf[i]].region != m.accesses[accessOf[j]].region)
+      for (unsigned j = i + 1; j < n; ++j)
+        if (((adj[i] >> j) & 1) && !proven(i, j))
           return std::nullopt;
-      }
-  // Every surviving edge joins two accesses of one region, one bank and one
-  // modulo residue, an equivalence, so the graph is a disjoint union of cliques
-  // and greedy colouring is exact.
+  // Every surviving edge joins two writers of one region or one child, at one
+  // bank and one modulo residue, an equivalence, so the graph is a disjoint
+  // union of cliques and greedy colouring is exact.
   assert(used == portsNeeded(id, /*writesOnly=*/true) &&
          "the colouring must use as many ports as the model demands");
 
+  // Accesses at their own index, then the call-mastered writes appended in
+  // `portGraph` order, which is what `callPortSlot` reproduces.
   llvm::SmallVector<unsigned> port(m.accesses.size(), kNoWritePort);
-  for (unsigned i = 0; i < n; ++i) {
-    if (accessOf[i] == kNoWritePort) {
-      assert(colour[i] == 0 && "a call's write must land on port 0");
-      continue;
-    }
-    port[accessOf[i]] = colour[i];
-  }
+  for (unsigned i = 0; i < n; ++i)
+    if (accessOf[i] == kNoWritePort)
+      port.push_back(colour[i]);
+    else
+      port[accessOf[i]] = colour[i];
   return port;
 }
 

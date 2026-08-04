@@ -376,6 +376,7 @@ void DatapathBuilder::bindCall(dcp::DCPathInstanceOp inv, RegionBlock &rb) {
       // one port group per bank, carrying (bank, factor) at the boundary.
       ma.bank = static_cast<unsigned>(m->bank);
       ma.factor = static_cast<unsigned>(m->factor);
+      ma.independent = m->independent;
       ma.addr = m->addr;
       ma.data = m->data;
       ma.we = m->we;
@@ -702,8 +703,34 @@ void DatapathBuilder::enumerateBoundaryPorts() {
       }
       continue;
     }
+    // Stores that provably never issue together share ONE boundary port group,
+    // the same colouring an internal array's write ports take. A group per
+    // static store instead makes every caller back an array with that many
+    // write interfaces, which past two no RAM template serves, so a child that
+    // writes six words of one row costs its parent a register file.
+    //
+    // Only where every write reaches ONE interface: a data-dependent banked
+    // store spans them all, and two stores routed to different banks are on
+    // different interfaces already.
+    std::optional<SmallVector<unsigned>> shared;
+    if (llvm::all_of(m.accesses, [&](const MemUnit::Access &a) {
+          return !a.isWrite || externalBank(m, a).factor == 1;
+        }))
+      shared = dp.writePortColouring(m.id, Datapath::kMaxWritePorts);
+    m.writesIndependent = shared.has_value();
+    llvm::SmallDenseMap<unsigned, unsigned> portOfColour;
     for (auto [a, acc] : llvm::enumerate(m.accesses)) {
       auto &ports = acc.isWrite ? dp.writePorts : dp.readPorts;
+      if (shared && acc.isWrite) {
+        auto [it, isNew] = portOfColour.try_emplace((*shared)[a], ports.size());
+        if (!isNew) {
+          // A group already open: this store drives it too, one-hot muxed
+          // against the others on it by its own write-enable.
+          acc.portIdx = it->second;
+          acc.portBase = m.accesses[ports[acc.portIdx].idx].portBase;
+          continue;
+        }
+      }
       acc.portIdx = ports.size();
       acc.portBase =
           memBase(owner, acc.isWrite, group[key(m.id, acc.isWrite)]++);

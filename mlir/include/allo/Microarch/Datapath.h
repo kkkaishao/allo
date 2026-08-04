@@ -230,6 +230,15 @@ struct MemUnit {
   /// per cycle). Below the top the owning storage serves an ordinary addressed
   /// port.
   bool scattered = false;
+  /// This memory's boundary WRITE port groups never collide: two of them may
+  /// be enabled in one cycle, but only where the scheduler proved they address
+  /// different words, so a consumer may place each in its own `always` block
+  /// and infer a true dual port. False leaves them a priority chain, which is
+  /// what a group per static store already was.
+  ///
+  /// It is exactly "`writePortColouring` accepted this array", since that is
+  /// the condition the colouring refuses on, and the groups ARE its colours.
+  bool writesIndependent = false;
   /// The module ports holding one element of a `scattered` argument: the input
   /// it arrives on, and the output + write-enable it leaves on. A direction the
   /// kernel does not use has no port, and the DIRECTION decides the names
@@ -385,6 +394,10 @@ struct CallUnit {
     bool isWrite;               // this port writes (vs reads)
     unsigned bank = 0;          // cyclic bank this port serves (0 unbanked)
     unsigned factor = 1;        // partition factor (1 unbanked)
+    /// The child says its write ports on this argument never collide, so the
+    /// array backing them may give each its own `always` block
+    /// (`MemUnit::writesIndependent`, `iface::Memory::independent`).
+    bool independent = false;
     std::string addr, data, we; // child port names; `we` empty for a read
     std::string topBase; // top boundary port base (indexed); empty = internal
   };
@@ -868,38 +881,57 @@ struct Datapath {
   /// counts as simultaneous, so this never under-states.
   unsigned portsNeeded(MemId id, bool writesOnly) const;
 
-  /// Which write port each access of \p id drives, indexed as
-  /// `MemUnit::accesses` and `kNoWritePort` at a read: a colouring of the very
+  /// Which write port each writer of \p id drives: a colouring of the very
   /// relation `portsNeeded` takes its clique over, so it uses exactly that many
-  /// ports. A CALL's write, which this does not index, always lands on port 0.
-  /// The result is empty, rather than absent, for an array only calls touch.
+  /// ports. This function's own accesses come first, indexed as
+  /// `MemUnit::accesses` with `kNoWritePort` at a read, then the CALL-mastered
+  /// writes at the slots `callPortSlot` names.
   ///
   /// Absent when the writes cannot be redistributed and each keeps its own
   /// port, for any of three reasons: `portGraph` declined to relate them, they
   /// need more than \p maxPorts, which the caller sets from what its device can
   /// build, or a simultaneous pair is not PROVEN to address different words.
-  /// Writes on different ports must be, having no shared block to order them,
-  /// and only a pair inside one region is proven: a memory dependence there
-  /// would have made the scheduler separate the two by a cycle, a store's SDC
-  /// row carrying its write latency of 1. A call's pair, or one under a
-  /// concurrent container, is related by nothing and refuses the colouring.
+  /// Writes on different ports must be, having no shared block to order them.
+  /// Two pairs are proven: two accesses inside one region, where a memory
+  /// dependence would have made the scheduler separate them by a cycle (a
+  /// store's SDC row carries its write latency of 1), and two write ports of
+  /// ONE child that declared them independent, which is that child asserting
+  /// the same thing about its own accesses. Two DIFFERENT children, or a child
+  /// and a local access, are related by nothing and refuse the colouring.
   std::optional<llvm::SmallVector<unsigned>>
   writePortColouring(MemId id, unsigned maxPorts) const;
+
+  /// Where a CALL-mastered write of \p id sits in a `writePortColouring`
+  /// result: after this function's accesses, the calls in order and each call's
+  /// memory arguments in order, which is the order `portGraph` builds its
+  /// vertices in.
+  unsigned callPortSlot(MemId id, CallId call, unsigned arg) const;
 
   /// No write port applies: `writePortColouring`'s entry for an access that is
   /// not a write, and `portGraph`'s for a vertex that is a call's port rather
   /// than an access of this function.
   static constexpr unsigned kNoWritePort = ~0u;
 
+  /// How many write ports one array is worth spreading over. A true dual port
+  /// is what infers; at three the inference fails outright, so a third colour
+  /// would buy nothing and still cost its address and data multiplexers. It
+  /// bounds the module BOUNDARY for the same reason, since whatever backs the
+  /// array upstream is the same RAM.
+  static constexpr unsigned kMaxWritePorts = 2;
+
   /// The accesses of \p id the port model counts and the "can issue in one
   /// cycle" relation over them, one adjacency bitset per access. \p accessOf
   /// maps a vertex back to its index in `MemUnit::accesses`, or `kNoWritePort`
-  /// for a call. Shorter than \p accessOf when there are more than the 64 a
-  /// bitset holds, where the relation is not built at all and every access
-  /// counts as simultaneous.
+  /// for a call. \p callerOf, when given, maps it to the call that masters it
+  /// and whether that call declared its ports independent, or to `{-1, false}`
+  /// for an access of this function. Shorter than \p accessOf when there are
+  /// more than the 64 a bitset holds, where the relation is not built at all
+  /// and every access counts as simultaneous.
   llvm::SmallVector<uint64_t>
   portGraph(MemId id, bool writesOnly,
-            llvm::SmallVectorImpl<unsigned> &accessOf) const;
+            llvm::SmallVectorImpl<unsigned> &accessOf,
+            llvm::SmallVectorImpl<std::pair<int, bool>> *callerOf = nullptr)
+      const;
 };
 
 //===----------------------------------------------------------------------===//
