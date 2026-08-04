@@ -3,6 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+#include "allo/IR/AlloOps.h" // kIndependentWritesAttr
 #include "allo/Microarch/HWEmitter.h"
 #include "allo/Scheduling/AddressModel.h" // addressExprsOf
 #include "allo/Scheduling/MemoryModel.h"  // BankLayout
@@ -465,11 +466,27 @@ void DatapathEmitter::createInternalMemories() {
           c.b.getArrayAttr(fields));
       continue;
     }
+    // Stores that provably never issue together share a write port. A
+    // scattered or skewed array presents no single addressable port, and a
+    // dynamically banked store drives every bank behind a demux, so neither has
+    // a port to be coloured onto. Two ports is the ceiling because a true dual
+    // port is: a third infers no RAM, so merging onto one would buy nothing and
+    // spend the address and data muxes that merging costs.
+    SmallVector<unsigned> ports;
+    if (!m.scattered && !m.skewed &&
+        llvm::all_of(m.accesses, [](const uarch::MemUnit::Access &a) {
+          return !a.isWrite || a.staticBank;
+        }))
+      ports = dp.writePortColouring(m.id, /*maxPorts=*/2);
     SmallVector<Value> banks;
     for (unsigned k = 0; k < m.numBanks; ++k) {
       auto mem =
           seq::HLMemOp::create(c.b, c.loc, c.clk, c.rst, memCellName(dp, m, k),
                                {static_cast<int64_t>(depth)}, elemTy);
+      // The colouring is exactly the promise the lowering needs to describe
+      // each port in its own `always` block, and so to infer a true dual port.
+      if (!ports.empty())
+        mem->setAttr(kIndependentWritesAttr, c.b.getUnitAttr());
       // An initialized array the kernel also WRITES is a real memory that
       // merely starts with contents. `seq.hlmem` has none, so they ride to the
       // seq->SV pipeline, which gives the backing reg an `initial` block.
@@ -479,6 +496,8 @@ void DatapathEmitter::createInternalMemories() {
       banks.push_back(mem.getHandle());
     }
     memBanks[m.id] = std::move(banks);
+    if (!ports.empty())
+      writePortOf[m.id] = std::move(ports);
   }
 }
 
@@ -942,10 +961,11 @@ void DatapathEmitter::emitAccesses(const uarch::RegionBlock &rb, Value issue,
         c.delayValid(c.activationPulse(commitPulse(), acc.op, sh), pre, sh);
     Value data = late(resolveSource(acc.data));
     auto wlat = c.b.getI64IntegerAttr(1);
-    if (mergesWrites(m)) {
+    auto ports = writePortOf.find(m.id);
+    if (ports != writePortOf.end()) {
       sharedWrites[m.id].push_back(
-          {*acc.staticBank, late(memAddr(m, bankAddress(m, acc).offset)), data,
-           we});
+          {*acc.staticBank, ports->second[r.idx],
+           late(memAddr(m, bankAddress(m, acc).offset)), data, we});
     } else if (acc.staticBank) {
       // A compile-time bank writes its own memory: no demux, and no write port
       // on the other banks (the read twin above). An unbanked memref is the
@@ -968,39 +988,32 @@ void DatapathEmitter::emitAccesses(const uarch::RegionBlock &rb, Value issue,
   }
 }
 
-bool DatapathEmitter::mergesWrites(const uarch::MemUnit &m) const {
-  if (m.external || m.scattered || m.skewed)
-    return false;
-  // A dynamically banked write drives every bank behind a demux, so it has no
-  // single port to share; require every writer to name its bank.
-  for (const uarch::MemUnit::Access &acc : m.accesses)
-    if (acc.isWrite && !acc.staticBank)
-      return false;
-  return dp.portsNeeded(m.id, /*writesOnly=*/true) == 1;
-}
-
-// Drive an array's one shared write port from every store held back for it.
-// The writers are provably never enabled in the same cycle, so the priority
-// chain below is a one-hot select and its first arm is a don't-care.
+// Drive an array's shared write ports from the stores coloured onto each. Two
+// stores on ONE port are provably never enabled in the same cycle, so the
+// priority chain below is a one-hot select and its first arm is a don't-care.
 void DatapathEmitter::finalizeSharedWritePorts() {
   for (const uarch::MemUnit &m : dp.mems) {
     auto it = sharedWrites.find(m.id);
     if (it == sharedWrites.end())
       continue;
     ArrayRef<SharedWrite> writes = it->second;
-    for (auto [k, hlmem] : llvm::enumerate(memBanks[m.id])) {
-      Value addr, data, we;
-      for (const SharedWrite &w : writes) {
-        if (w.bank != k)
-          continue;
-        addr = addr ? c.mux(w.we, w.addr, addr) : w.addr;
-        data = data ? c.mux(w.we, w.data, data) : w.data;
-        we = we ? c.orBits(we, w.we) : w.we;
+    unsigned ports = 0;
+    for (const SharedWrite &w : writes)
+      ports = std::max(ports, w.port + 1);
+    for (auto [k, hlmem] : llvm::enumerate(memBanks[m.id]))
+      for (unsigned p = 0; p < ports; ++p) {
+        Value addr, data, we;
+        for (const SharedWrite &w : writes) {
+          if (w.bank != k || w.port != p)
+            continue;
+          addr = addr ? c.mux(w.we, w.addr, addr) : w.addr;
+          data = data ? c.mux(w.we, w.data, data) : w.data;
+          we = we ? c.orBits(we, w.we) : w.we;
+        }
+        if (we)
+          seq::WritePortOp::create(c.b, c.loc, hlmem, ValueRange{addr}, data,
+                                   we, c.b.getI64IntegerAttr(1));
       }
-      if (we)
-        seq::WritePortOp::create(c.b, c.loc, hlmem, ValueRange{addr}, data, we,
-                                 c.b.getI64IntegerAttr(1));
-    }
   }
 }
 
@@ -1647,8 +1660,10 @@ void DatapathEmitter::emitCalls(const uarch::RegionBlock &rb, Value issue,
         Value a = c.shiftChain(addr, pre, sh).last();
         Value d = c.shiftChain(outs[ma.data], pre, sh).last();
         Value w = c.delayValid(outs[ma.we], pre, sh);
-        if (mergesWrites(m))
-          sharedWrites[m.id].push_back({ma.bank, a, d, w});
+        // A call's write always lands on port 0: the colouring refuses to split
+        // an array a call writes, since nothing relates two calls' addresses.
+        if (writePortOf.count(m.id))
+          sharedWrites[m.id].push_back({ma.bank, 0, a, d, w});
         else
           seq::WritePortOp::create(c.b, c.loc, hlmem, ValueRange{a}, d, w,
                                    c.b.getI64IntegerAttr(1));

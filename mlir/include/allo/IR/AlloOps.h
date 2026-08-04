@@ -37,6 +37,13 @@ constexpr llvm::StringLiteral kAlloSignedAttr = "allo.signed";
 constexpr llvm::StringLiteral kAlloLazyAttr = "allo.lazy";
 constexpr llvm::StringLiteral kAlloAsyncAttr = "allo.async";
 constexpr llvm::StringLiteral kMemoryInitAttr = "allo.mem.init";
+/// On a `seq.hlmem`: no two of its write ports ever write one word in the same
+/// cycle, so each may be described in its OWN `always` block. That is the only
+/// shape a true-dual-port block RAM infers from, and without the promise the
+/// ports must share a block, where textual order makes a same-address
+/// collision last-writer-wins instead of a race.
+constexpr llvm::StringLiteral kIndependentWritesAttr =
+    "allo.mem.independent_writes";
 } // namespace mlir::allo
 
 #endif // ALLO_OPS_H

@@ -405,7 +405,9 @@ static unsigned maxClique(llvm::ArrayRef<uint64_t> adj, uint64_t candidates,
   return best;
 }
 
-unsigned Datapath::portsNeeded(MemId id, bool writesOnly) const {
+llvm::SmallVector<uint64_t>
+Datapath::portGraph(MemId id, bool writesOnly,
+                    llvm::SmallVectorImpl<unsigned> &accessOf) const {
   const MemUnit &m = mems[id];
   // Top-level ancestor of a region: the granularity `recordSiblingDeps` orders
   // at, and a container's children stay serial below it.
@@ -438,19 +440,25 @@ unsigned Datapath::portsNeeded(MemId id, bool writesOnly) const {
     int call; // CallId, or -1 for a region-local access
   };
   llvm::SmallVector<Writer> ws;
-  for (const MemUnit::Access &acc : m.accesses)
+  for (auto [i, acc] : llvm::enumerate(m.accesses))
     if (acc.isWrite || !writesOnly) {
       unsigned ii = regions[acc.region].ii.value_or(0);
       unsigned start = dcpStart(acc.op);
       ws.push_back(
           {topOf(acc.region), acc.region, ii ? start % ii : start, -1});
+      accessOf.push_back(i);
     }
   for (const CallUnit &cu : calls)
     for (const CallUnit::MemArg &ma : cu.memArgs)
-      if (ma.mem == id && (ma.isWrite || !writesOnly))
+      if (ma.mem == id && (ma.isWrite || !writesOnly)) {
         ws.push_back({topOf(cu.region), cu.region, 0, int(cu.id)});
-  if (ws.size() < 2)
-    return ws.size();
+        accessOf.push_back(kNoWritePort);
+      }
+  // The bitsets are 64 wide. Above that the relation is not built and every
+  // caller assumes each access simultaneous, which only over-states and so
+  // never merges a port unsafely.
+  if (ws.size() > 64)
+    return {};
 
   // A container drives its children serially, so two accesses in different
   // regions under one top are ordered UNLESS a concurrent container is in the
@@ -475,11 +483,6 @@ unsigned Datapath::portsNeeded(MemId id, bool writesOnly) const {
     }
     return true;
   };
-  // The largest mutually-overlapping set of writers, over one bitset per
-  // writer, so the search is 64 wide. Above that every writer is assumed
-  // simultaneous, which only over-states and so never merges a port unsafely.
-  if (ws.size() > 64)
-    return ws.size();
   llvm::SmallVector<uint64_t> adj(ws.size(), 0);
   for (unsigned i = 0; i < ws.size(); ++i)
     for (unsigned j = i + 1; j < ws.size(); ++j)
@@ -487,10 +490,72 @@ unsigned Datapath::portsNeeded(MemId id, bool writesOnly) const {
         adj[i] |= uint64_t(1) << j;
         adj[j] |= uint64_t(1) << i;
       }
+  return adj;
+}
+
+unsigned Datapath::portsNeeded(MemId id, bool writesOnly) const {
+  llvm::SmallVector<unsigned> accessOf;
+  llvm::SmallVector<uint64_t> adj = portGraph(id, writesOnly, accessOf);
+  unsigned n = accessOf.size();
+  if (n < 2 || adj.size() != n)
+    return n; // one access, or too many to relate: all of them at once
   unsigned budget = 1u << 20;
-  uint64_t all =
-      ws.size() == 64 ? ~uint64_t(0) : (uint64_t(1) << ws.size()) - 1;
+  uint64_t all = n == 64 ? ~uint64_t(0) : (uint64_t(1) << n) - 1;
   return maxClique(adj, all, /*excluded=*/0, /*depth=*/0, budget);
+}
+
+llvm::SmallVector<unsigned>
+Datapath::writePortColouring(MemId id, unsigned maxPorts) const {
+  const MemUnit &m = mems[id];
+  llvm::SmallVector<unsigned> accessOf;
+  llvm::SmallVector<uint64_t> adj =
+      portGraph(id, /*writesOnly=*/true, accessOf);
+  unsigned n = accessOf.size();
+  if (adj.size() != n)
+    return {}; // no relation to colour over
+
+  // Greedy in vertex order, taking the lowest port no neighbour holds.
+  llvm::SmallVector<unsigned> colour(n, 0);
+  unsigned used = 0;
+  for (unsigned i = 0; i < n; ++i) {
+    uint64_t taken = 0;
+    for (unsigned j = 0; j < i; ++j)
+      if ((adj[i] >> j) & 1)
+        taken |= uint64_t(1) << colour[j];
+    colour[i] = llvm::countr_one(taken);
+    used = std::max(used, colour[i] + 1);
+  }
+  if (used > maxPorts)
+    return {};
+
+  // Splitting the writes across ports only orders a simultaneous pair if the
+  // scheduler already proved it addresses different words, which it does inside
+  // ONE region and nowhere else. One such pair anywhere and every write stays
+  // on the port it has today.
+  if (used > 1)
+    for (unsigned i = 0; i < n; ++i)
+      for (unsigned j = i + 1; j < n; ++j) {
+        if (!((adj[i] >> j) & 1))
+          continue;
+        if (accessOf[i] == kNoWritePort || accessOf[j] == kNoWritePort ||
+            m.accesses[accessOf[i]].region != m.accesses[accessOf[j]].region)
+          return {};
+      }
+  // Every surviving edge joins two accesses of one region at one modulo
+  // residue, an equivalence, so the graph is a disjoint union of cliques and
+  // greedy colouring is exact.
+  assert(used == portsNeeded(id, /*writesOnly=*/true) &&
+         "the colouring must use as many ports as the model demands");
+
+  llvm::SmallVector<unsigned> port(m.accesses.size(), kNoWritePort);
+  for (unsigned i = 0; i < n; ++i) {
+    if (accessOf[i] == kNoWritePort) {
+      assert(colour[i] == 0 && "a call's write must land on port 0");
+      continue;
+    }
+    port[accessOf[i]] = colour[i];
+  }
+  return port;
 }
 
 void Datapath::dump(llvm::raw_ostream &os) const {

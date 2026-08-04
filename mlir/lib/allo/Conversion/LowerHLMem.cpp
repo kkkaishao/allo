@@ -23,7 +23,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "allo/Conversion/Passes.h"
-#include "allo/IR/AlloOps.h" // kMemoryInitAttr
+#include "allo/IR/AlloOps.h" // kMemoryInitAttr, kIndependentWritesAttr
 
 #include "circt/Dialect/HW/HWOps.h"
 #include "circt/Dialect/SV/SVOps.h"
@@ -88,24 +88,31 @@ void lowerMemory(seq::HLMemOp mem) {
     });
   }
 
-  // The writes. One block for all of them, which is what upstream did and what
-  // defeats block-RAM inference past one writer; splitting them onto a port
-  // each is the change this pass exists to make and is not made yet, because it
-  // turns a same-address collision from last-writer-wins into a race and so
-  // needs the addresses PROVEN disjoint.
   Value hwClk = seq::FromClockOp::create(b, clk.getLoc(), clk);
-  sv::AlwaysFFOp::create(
-      b, loc, sv::EventControl::AtPosEdge, hwClk, sv::ResetType::SyncReset,
-      sv::EventControl::AtPosEdge, mem.getRst(), [&] {
-        for (seq::WritePortOp write : writes) {
-          Location wloc = write.getLoc();
-          sv::IfOp::create(b, wloc, write.getWrEn(), [&] {
-            Value slot = sv::ArrayIndexInOutOp::create(b, wloc, array,
-                                                       write.getAddresses()[0]);
-            sv::PAssignOp::create(b, wloc, slot, write.getInData());
-          });
-        }
-      });
+  auto emitBlock = [&](ArrayRef<seq::WritePortOp> group) {
+    sv::AlwaysFFOp::create(
+        b, loc, sv::EventControl::AtPosEdge, hwClk, sv::ResetType::SyncReset,
+        sv::EventControl::AtPosEdge, mem.getRst(), [&] {
+          for (seq::WritePortOp write : group) {
+            Location wloc = write.getLoc();
+            sv::IfOp::create(b, wloc, write.getWrEn(), [&] {
+              Value slot = sv::ArrayIndexInOutOp::create(
+                  b, wloc, array, write.getAddresses()[0]);
+              sv::PAssignOp::create(b, wloc, slot, write.getInData());
+            });
+          }
+        });
+  };
+  // A block PER PORT once the memory promises no two ports write one word at
+  // once, which is the shape a true dual port infers from and the reason this
+  // pass exists: at 512x32 it is one BRAM36 against 43,361 LUTs. Sharing one
+  // block is what makes a same-address collision last-writer-wins rather than a
+  // race, so without the promise every write stays in it, as upstream had it.
+  if (writes.size() > 1 && mem->hasAttr(kIndependentWritesAttr))
+    for (seq::WritePortOp write : writes)
+      emitBlock(write);
+  else
+    emitBlock(writes);
 
   // The reads. A latency above one delays the ADDRESS for all but the last
   // cycle and registers the datum for that one, so the combinational read never

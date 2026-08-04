@@ -319,26 +319,29 @@ struct DatapathEmitter {
   };
   DenseMap<unsigned, SmallVector<ScatterWrite, 1>> scatterWrites; // by MemId
 
-  /// One store to an internal array whose writers PROVABLY cannot issue
-  /// together (`Datapath::writePortsNeeded` == 1), held back so they can share
-  /// a single `seq.write`. A port per static write defeats block-RAM inference
-  /// and drops the array into a register file, which the bed pays 655k LUTs
-  /// for; one muxed port infers a RAM. Combined by
-  /// `finalizeSharedWritePorts`, for the same reason `ScatterWrite` exists:
-  /// the writes come from different regions and calls, so the shared port can
-  /// only be driven once all of them have emitted.
+  /// One store to an internal array, held back so the stores sharing its write
+  /// port can be muxed onto one `seq.write`. A port per static write defeats
+  /// block-RAM inference and drops the array into a register file, which the
+  /// bed pays 655k LUTs for. Combined by `finalizeSharedWritePorts`, for the
+  /// same reason `ScatterWrite` exists: the writes come from different regions
+  /// and calls, so a port can only be driven once all of them have emitted.
   struct SharedWrite {
     unsigned bank; // the bank this store commits to (0 when unbanked)
+    unsigned port; // the write port it was coloured onto
     Value addr;
     Value data;
     Value we; // commit pulse, already delayed for the device write latency
   };
   DenseMap<unsigned, SmallVector<SharedWrite, 2>> sharedWrites; // by MemId
 
-  /// Whether \p m's writes are held back to share one port. False for an
-  /// external, scattered, skewed or dynamically banked array, none of which
-  /// present a single addressable write port to merge onto.
-  bool mergesWrites(const uarch::MemUnit &m) const;
+  /// Which write port each access of an internal array drives
+  /// (`Datapath::writePortColouring`), for the arrays whose writes may share
+  /// ports at all. An array is absent when the colouring refused it, and when
+  /// it presents no single addressable write port to merge onto: an external,
+  /// scattered or skewed one, or one a dynamically banked store drives every
+  /// bank of behind a demux. Held because the colouring is a clique search and
+  /// every store would otherwise redo it.
+  DenseMap<unsigned, SmallVector<unsigned>> writePortOf; // by MemId
 
   /// A kernel-local channel's body wires: what a boundary channel reads off
   /// its module ports, an internal one reads off its own `seq.fifo`. Declared

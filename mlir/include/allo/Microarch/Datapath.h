@@ -931,6 +931,38 @@ struct Datapath {
   /// accesses at different modulo residues never share a cycle. Anything else
   /// counts as simultaneous, so this never under-states.
   unsigned portsNeeded(MemId id, bool writesOnly) const;
+
+  /// Which write port each access of \p id drives, indexed as
+  /// `MemUnit::accesses` and `kNoWritePort` at a read: a colouring of the very
+  /// relation `portsNeeded` takes its clique over, so it uses exactly that many
+  /// ports. A CALL's write, which this does not index, always lands on port 0.
+  ///
+  /// Empty when the writes cannot be redistributed and each keeps its own port,
+  /// for either of two reasons. They may need more than \p maxPorts, which the
+  /// caller sets from what its device can build. Or a simultaneous pair may not
+  /// be PROVEN to address different words, which writes on different ports must
+  /// be, having no shared block to order them: only a pair inside one region is
+  /// proven, since a memory dependence there would have made the scheduler
+  /// separate the two by a cycle, a store's SDC row carrying its write latency
+  /// of 1. A call's pair, or one under a concurrent container, is related by
+  /// nothing and refuses the colouring.
+  llvm::SmallVector<unsigned> writePortColouring(MemId id,
+                                                 unsigned maxPorts) const;
+
+  /// No write port applies: `writePortColouring`'s entry for an access that is
+  /// not a write, and `portGraph`'s for a vertex that is a call's port rather
+  /// than an access of this function.
+  static constexpr unsigned kNoWritePort = ~0u;
+
+  /// The accesses of \p id the port model counts and the "can issue in one
+  /// cycle" relation over them, one adjacency bitset per access. \p accessOf
+  /// maps a vertex back to its index in `MemUnit::accesses`, or `kNoWritePort`
+  /// for a call. Shorter than \p accessOf when there are more than the 64 a
+  /// bitset holds, where the relation is not built at all and every access
+  /// counts as simultaneous.
+  llvm::SmallVector<uint64_t>
+  portGraph(MemId id, bool writesOnly,
+            llvm::SmallVectorImpl<unsigned> &accessOf) const;
 };
 
 //===----------------------------------------------------------------------===//
