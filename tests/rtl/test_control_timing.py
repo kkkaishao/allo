@@ -256,6 +256,40 @@ def test_chaining_inserts_register():
     assert tight.last_t() > loose.last_t()
 
 
+def test_a_reified_bound_is_priced_against_the_clock(capfd):
+    # What the reifier synthesizes AFTER the solve is combinational logic the
+    # chaining scheduler never saw: a symbolic loop bound is expanded from its
+    # affine map into arith ops stamped `start = 0`, so no chain break can land
+    # in it and no register bounds its depth. It is only checkable at emission,
+    # against the same clock the schedule was cut to.
+    def band():
+        @kernel
+        def k(A: i32[64], out: i32[8]):
+            for i in range(8):
+                s: i32 = 0
+                for j in range(i // 3 * 2 + 1):  # a floordiv bound map
+                    s = s + A[j]
+                out[i] = s
+
+        return k
+
+    # The premise, against the device: a signed floordiv expands to a divider
+    # plus its sign correction (cmp, sub, select on each side), which alone
+    # overruns the default period.
+    assert COMB["div"] + COMB["sub"] + COMB["select"] > PERIOD_NS
+
+    _to_rtl(band()).compile()
+    text = "".join(capfd.readouterr())
+    assert "AFTER the schedule was cut" in text
+    assert "misses timing" in text
+
+    # The clock is what decides, so a period the whole cone fits in reports
+    # nothing. This is also the only remedy the message can offer: the
+    # expression is the compiler's, not a binding the user can withdraw.
+    _to_rtl(band(), freq_mhz=1.0).compile()  # a 1000ns cycle
+    assert "AFTER the schedule was cut" not in "".join(capfd.readouterr())
+
+
 def test_an_address_cone_is_charged_to_the_port_it_feeds():
     # An address never becomes an operation: it is folded into the access's
     # affine map, so no dependence carries its delay and only the access's own

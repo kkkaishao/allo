@@ -19,8 +19,9 @@ LogicalResult verifyDatapath(dcp::DCPathModuleOp func, const Datapath &dp);
 
 /// Device-contract limits the emitted structure cannot realize, including the
 /// clock: the schedule was cut against \p cycleTime (ns) over a datapath with
-/// no sharing muxes, so a binding that grows them is held to it here. \p lib
-/// prices those muxes and the units they feed.
+/// no sharing muxes and only the cells the solve saw, so a binding that grows
+/// muxes and an expression the reifier synthesizes afterwards are both held to
+/// it here. \p lib prices them and the units they feed.
 LogicalResult checkDeviceCapability(dcp::DCPathModuleOp func,
                                     const Datapath &dp, float cycleTime,
                                     const OperatorLibrary &lib);
