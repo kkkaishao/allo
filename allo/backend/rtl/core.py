@@ -138,7 +138,7 @@ class RTL(Backend[P, R]):
             # and device timing is injected into that copy only, keeping the CPU
             # functional path clear of it.
             self._dcp_ir = ir_ext.clone_module(self.module)
-            inject_operators(self._dcp_ir, self._device.operators)
+            inject_operators(self._dcp_ir, self._device)
             inject_device(self._dcp_ir, self._device)
             self._schedule_result = run_schedule(
                 self.top,

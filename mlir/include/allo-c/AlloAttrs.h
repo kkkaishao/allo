@@ -105,6 +105,28 @@ MLIR_CAPI_EXPORTED MlirAttribute alloStallContractAttrGet(MlirContext ctx,
 MLIR_CAPI_EXPORTED uint32_t alloStallContractAttrGetValue(MlirAttribute attr);
 MLIR_CAPI_EXPORTED MlirTypeID alloStallContractAttrGetTypeID(void);
 
+//===----------------------------------------------------------------------===//
+// Resource cost evaluation.
+//
+// The one evaluator, reachable from Python. A second implementation of
+// `CostAttr::evaluate` is the state the resource model exists to end, so the
+// scorer in `benchmark/area.py` prices through this rather than through its own
+// copy of the shapes.
+//===----------------------------------------------------------------------===//
+
+/// Called once per resource `uses` spends, with the resource's LEAF name (the
+/// `lut` of `@u55c::@lut`) and how many of it.
+typedef void (*AlloResourceUseCallback)(MlirStringRef resource, int64_t amount,
+                                        void *userData);
+
+/// Evaluates `uses`, an `#allo.res_use` array, at the `nParams` parameters of
+/// its realization's kind (an operand width; a multiplexer's fan-in and width;
+/// a chain's or a storage's depth and width). A null `uses` spends nothing.
+MLIR_CAPI_EXPORTED void
+alloEvaluateResourceUse(MlirAttribute uses, intptr_t nParams,
+                        const int64_t *params, AlloResourceUseCallback callback,
+                        void *userData);
+
 #ifdef __cplusplus
 }
 #endif

@@ -103,3 +103,16 @@ ALLO_ENUM_ATTR_CAPI(CombOpKind, CombOpKindEnumAttr, CombOpKindEnum)
 ALLO_ENUM_ATTR_CAPI(StallContract, StallContractEnumAttr, StallContractEnum)
 
 #undef ALLO_ENUM_ATTR_CAPI
+
+//===----------------------------------------------------------------------===//
+// Resource cost evaluation
+//===----------------------------------------------------------------------===//
+
+void alloEvaluateResourceUse(MlirAttribute uses, intptr_t nParams,
+                             const int64_t *params,
+                             AlloResourceUseCallback callback, void *userData) {
+  for (auto [resource, amount] : allo::evaluateResourceUse(
+           dyn_cast_or_null<ArrayAttr>(unwrap(uses)),
+           llvm::ArrayRef<int64_t>(params, static_cast<size_t>(nParams))))
+    callback(wrap(resource.getLeafReference().getValue()), amount, userData);
+}

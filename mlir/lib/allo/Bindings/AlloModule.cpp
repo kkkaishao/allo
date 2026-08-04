@@ -5,6 +5,7 @@
 
 #include "AlloBindings.h"
 
+#include "allo-c/AlloAttrs.h"
 #include "allo-c/IRUtils.h"
 #include "allo-c/Passes.h"
 #include "allo-c/Registration.h"
@@ -17,13 +18,18 @@
 
 #include "nanobind/nanobind.h"
 #include "nanobind/stl/optional.h"
+#include "nanobind/stl/pair.h"
 #include "nanobind/stl/string.h"
+#include "nanobind/stl/vector.h"
 
 #include "llvm-c/ErrorHandling.h"
 #include "llvm/Support/Signals.h"
 
+#include <cstdint>
 #include <optional>
 #include <string>
+#include <utility>
+#include <vector>
 
 namespace nb = nanobind;
 
@@ -125,6 +131,31 @@ NB_MODULE(_allo, m) {
       nb::arg("scheduler") = "heuristic", nb::arg("budget") = 0.0,
       nb::arg("allocate") = false);
   allo.def("has_exact_scheduler", &alloHasExactScheduler);
+
+  //===--------------------------------------------------------------------===//
+  // The device's cost evaluator. Exposed so a Python consumer prices through
+  // `CostAttr::evaluate` rather than through a second copy of the shapes; two
+  // implementations of a measured model is the state the resource model exists
+  // to end.
+  //===--------------------------------------------------------------------===//
+  allo.def(
+      "evaluate_resource_use",
+      [](MlirAttribute uses, const std::vector<int64_t> &params) {
+        std::vector<std::pair<std::string, int64_t>> spent;
+        alloEvaluateResourceUse(
+            uses, static_cast<intptr_t>(params.size()), params.data(),
+            [](MlirStringRef resource, int64_t amount, void *userData) {
+              static_cast<std::vector<std::pair<std::string, int64_t>> *>(
+                  userData)
+                  ->emplace_back(std::string(resource.data, resource.length),
+                                 amount);
+            },
+            &spent);
+        return spent;
+      },
+      nb::arg("uses"), nb::arg("params"),
+      "What an #allo.res_use array spends at a realization's parameter tuple, "
+      "as (resource, amount) pairs.");
 
   //===--------------------------------------------------------------------===//
   // schedule

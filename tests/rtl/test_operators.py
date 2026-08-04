@@ -22,6 +22,7 @@ from allo.backend.rtl.device import (
     Const,
     Linear,
     Quadratic,
+    Step,
     Table,
 )
 
@@ -105,6 +106,56 @@ def test_a_device_declares_each_comb_kind_once():
 
     text = _to_rtl(k, device=dev).dcp
     assert text.count('allo.dcp.comb "add"') == 1
+
+
+# A multiplexer and a delay chain are structures the emitter builds and nothing
+# chooses between, so each is one whole-device row. Both carry TWO parameters,
+# and a cost with the wrong number of factors is a verifier error rather than a
+# product the evaluator zips short.
+def test_a_device_prices_its_multiplexers_and_delay_chains():
+    @kernel
+    def k(A: i32[8], out: i32[8]):
+        for i in range(8):
+            out[i] = A[i] + 1
+
+    dev = builtin_device.copy()
+    lut, ff = dev.resources["lut"], dev.resources["ff"]
+    dev.set_mux_uses({lut: (Linear(0.4), Linear(1.0))})
+    dev.set_chain_uses({ff: (Step(4, 1.0, 2.0), Linear(1.0))})
+
+    text = _to_rtl(k, device=dev).dcp
+    assert "allo.dcp.mux uses" in text and "allo.dcp.chain uses" in text
+    with pytest.raises(ValueError, match="fan-in, width"):
+        dev.set_mux_uses({lut: Linear(0.4)})
+
+
+# An IP core's area rides its own declaration, over the one parameter every
+# realization of its kind carries. The resources are the DEVICE's and the
+# operator is not in the device's symbol table, so the reference reaches through
+# the device symbol and resolves from where it is written.
+def test_an_operator_declares_what_its_core_spends():
+    @kernel
+    def addk(a: f32, b: f32) -> f32:
+        return a + b
+
+    text = _to_rtl(addk).dcp
+    assert "allo.dcp.operator @fadd_l7" in text
+    assert "#allo.res_use<@builtin::@lut, [<const, [2.470000e+02]>]>" in text
+
+
+# The device's own evaluator, reached from Python: one implementation of the
+# measured shapes, not two. `benchmark/area.py` scores through this.
+def test_the_device_prices_a_realization_through_the_compiler():
+    dev = builtin_device
+    # 3 LUTs per bit of a 6-source select, over 32 bits.
+    assert dev.price(dev.mux_uses, (6, 32)) == {"lut": 96}
+    # A chain past the extraction cliff is SRLs, not `depth * width` flip-flops.
+    assert dev.price(dev.chain_uses, (64, 32))["ff"] == 64
+    assert dev.price(dev.chain_uses, (2, 32))["ff"] == 64
+    # A carry chain is a CEILING: a 9-bit adder takes two CARRY8s.
+    assert dev.price(dev.comb_uses["add"], (9,)) == {"lut": 9, "carry8": 2}
+    # A block RAM tile holds 36864 bits however the array is cut.
+    assert dev.price(dev.storage["bram"].uses, (1024, 32)) == {"bram36": 1}
 
 
 # --- operator injection ------------------------------------------------------

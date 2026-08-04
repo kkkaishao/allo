@@ -6,7 +6,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 
 from ...lang import f32, f64, bf16, i32, bool as _bool
@@ -90,6 +90,46 @@ def Table(points: dict[int, float]) -> Cost:
     return Cost("table", tuple(flat))
 
 
+#: What one realization spends: ``(resource name, one cost factor per parameter
+#: of its kind)`` pairs, which is what ``#allo.res_use`` carries.
+Spend = tuple[tuple[str, tuple[Cost, ...]], ...]
+
+#: The context the `uses` attributes are parsed into, with the attributes
+#: themselves keyed by their text. One per process: an attribute is uniqued in
+#: the context that built it and has to outlive every evaluation of it.
+_COST_CONTEXT = None
+_COST_ATTRS: dict[str, object] = {}
+
+
+def _res_use_text(spent: Spend, scope: str = "") -> str:
+    """``spent`` as an ``#allo.res_use`` array literal. ``scope`` is the device
+    symbol a reference from OUTSIDE the device's region has to reach through."""
+    return "[{}]".format(
+        ", ".join(
+            f"#allo.res_use<@{scope}{name}, "
+            f"[{', '.join(c._mlir() for c in factors)}]>"
+            for name, factors in spent
+        )
+    )
+
+
+def _res_use_attr(spent: Spend):
+    """The parsed attribute for ``spent``, built once per declaration: pricing
+    one design asks for the same handful of rows tens of thousands of times."""
+    global _COST_CONTEXT
+    attr = _COST_ATTRS.get(spent)
+    if attr is None:
+        from ..._mlir.ir import Attribute, Context
+        from ..._mlir.dialects.allo import register_dialect
+
+        if _COST_CONTEXT is None:
+            _COST_CONTEXT = Context()
+            register_dialect(_COST_CONTEXT)
+        with _COST_CONTEXT:
+            attr = _COST_ATTRS[spent] = Attribute.parse(_res_use_text(spent))
+    return attr
+
+
 def Tiled(bits_per_tile: int) -> Cost:
     """``ceil(depth * width / bits_per_tile)``: the shape of a tiled memory.
 
@@ -122,9 +162,9 @@ class Storage:
     write_latency: int
     read_delay_ns: float
     write_delay_ns: float
-    # One (resource name, factors) pair per resource spent. Storage carries two
-    # parameters, `(depth, width)`, so factors is two costs or one `Tiled`.
-    uses: tuple[tuple[str, tuple[Cost, ...]], ...] = ()
+    # What it spends. Storage carries two parameters, `(depth, width)`, so each
+    # entry is two cost factors or one `Tiled`.
+    uses: Spend = ()
 
 
 @dataclass(frozen=True)
@@ -174,7 +214,12 @@ class Device:
         # a resource fact; they are declared together and read by different
         # consumers.
         self.resources: dict[str, Resource] = {}
-        self.comb_uses: dict[str, dict[str, Cost]] = {}  # kind -> resource -> cost
+        self.comb_uses: dict[str, Spend] = {}  # comb kind -> what it spends
+        self.operator_uses: dict[str, Spend] = {}  # IP symbol -> what it spends
+        # The two structures the emitter builds that nothing chooses between,
+        # so they are one row each rather than a named realization.
+        self.mux_uses: Spend = ()
+        self.chain_uses: Spend = ()
         self.storage: dict[str, Storage] = {}
         # The default is a NAME, not a handle: redeclaring a row (a copied
         # device retuned) must not leave it pointing at the replaced one.
@@ -182,6 +227,43 @@ class Device:
         self.stream_timing: StreamTiming | None = None
         self.operators: list[IP] = []  # built-in and user `@ip` operators
         self.default_freq_mhz: float = 100.0
+
+    def _spend(
+        self,
+        what: str,
+        params: str,
+        uses: dict[Resource, Cost | Sequence[Cost]] | None,
+    ) -> Spend:
+        """``uses`` as ``(resource name, factors)`` pairs, checked against the
+        parameter tuple ``params`` of the realization's kind: one factor per
+        parameter, or the single :func:`Tiled` that reads them together."""
+        arity = len(params.split(","))
+        spent: list[tuple[str, tuple[Cost, ...]]] = []
+        for resource, cost in (uses or {}).items():
+            if self.resources.get(resource.name) is not resource:
+                raise ValueError(
+                    f"{resource.name!r} is not a resource of device {self.name!r}"
+                )
+            factors = (cost,) if isinstance(cost, Cost) else tuple(cost)
+            if len(factors) != (1 if factors[0].form == "tiled" else arity):
+                raise ValueError(
+                    f"{what} is characterized by ({params}), so its cost of "
+                    f"{resource.name!r} is {arity} factor(s) or one Tiled"
+                )
+            spent.append((resource.name, factors))
+        return tuple(spent)
+
+    def price(self, uses: Spend, params: Sequence[int]) -> dict[str, int]:
+        """What one instance of a realization spends at ``params``.
+
+        Goes through the compiler's own ``CostAttr::evaluate``, so a consumer
+        outside the compiler (``benchmark/area.py``) reads the same measured
+        model the scheduler will, rather than a second copy of the shapes."""
+        if not uses:
+            return {}
+        from ..._mlir.dialects.allo import evaluate_resource_use
+
+        return dict(evaluate_resource_use(_res_use_attr(uses), list(params)))
 
     def add_resource(self, name: str, capacity: int) -> Resource:
         """Declare a resource this device has ``capacity`` of, and return the
@@ -222,19 +304,6 @@ class Device:
             raise ValueError(f"storage {name!r}: latency must be non-negative")
         if read_delay_ns < 0 or write_delay_ns < 0:
             raise ValueError(f"storage {name!r}: delay must be non-negative")
-        spent: list[tuple[str, tuple[Cost, ...]]] = []
-        for resource, cost in (uses or {}).items():
-            if self.resources.get(resource.name) is not resource:
-                raise ValueError(
-                    f"{resource.name!r} is not a resource of device {self.name!r}"
-                )
-            factors = (cost,) if isinstance(cost, Cost) else tuple(cost)
-            if len(factors) != (1 if factors[0].form == "tiled" else 2):
-                raise ValueError(
-                    f"storage {name!r} spends {resource.name!r} over (depth, width), "
-                    "so its cost is two factors or one Tiled"
-                )
-            spent.append((resource.name, factors))
         s = Storage(
             name=name,
             ports=ports,
@@ -242,10 +311,24 @@ class Device:
             write_latency=int(write_latency),
             read_delay_ns=float(read_delay_ns),
             write_delay_ns=float(write_delay_ns),
-            uses=tuple(spent),
+            uses=self._spend(f"storage {name!r}", "depth, width", uses),
         )
         self.storage[name] = s
         return s
+
+    def set_storage_uses(
+        self, name: str, uses: dict[Resource, Cost | Sequence[Cost]]
+    ) -> Device:
+        """What one storage realization spends, over ``(depth, width)``. Apart
+        from :meth:`add_storage` so that a device's timing and its area can be
+        declared apart, the way a combinational kind's are."""
+        s = self.storage.get(name)
+        if s is None:
+            raise ValueError(f"{name!r} is not a storage of device {self.name!r}")
+        self.storage[name] = replace(
+            s, uses=self._spend(f"storage {name!r}", "depth, width", uses)
+        )
+        return self
 
     def set_default_storage(self, storage: Storage) -> Device:
         """The storage an array with no ``bind_storage`` resolves to. Takes a
@@ -297,12 +380,36 @@ class Device:
         if delay_ns < 0:
             raise ValueError(f"comb delay for {kind.value!r} must be non-negative")
         self.comb[kind.value] = float(delay_ns)
-        for resource, cost in (uses or {}).items():
-            if self.resources.get(resource.name) is not resource:
-                raise ValueError(
-                    f"{resource.name!r} is not a resource of device {self.name!r}"
-                )
-            self.comb_uses.setdefault(kind.value, {})[resource.name] = cost
+        if uses:
+            self.comb_uses[kind.value] = self._spend(
+                f"comb kind {kind.value!r}", "width", uses
+            )
+        return self
+
+    def set_operator_uses(
+        self, operator: IP, uses: dict[Resource, Cost]
+    ) -> Device:
+        """What one instance of an operator IP spends. Its parameter is the
+        operand width, as a native operator kind's is, even though the IP's
+        signature already fixes that width: the arity follows the realization's
+        kind so that one rule covers every row."""
+        if operator not in self.operators:
+            raise ValueError(
+                f"{operator.func_name!r} is not an operator of device {self.name!r}"
+            )
+        self.operator_uses[operator.func_name] = self._spend(
+            f"operator {operator.func_name!r}", "width", uses
+        )
+        return self
+
+    def set_mux_uses(self, uses: dict[Resource, Sequence[Cost]]) -> Device:
+        """What one select over ``k`` sources of ``width`` bits spends."""
+        self.mux_uses = self._spend("a multiplexer", "fan-in, width", uses)
+        return self
+
+    def set_chain_uses(self, uses: dict[Resource, Sequence[Cost]]) -> Device:
+        """What one ``depth``-stage, ``width``-bit value delay chain spends."""
+        self.chain_uses = self._spend("a delay chain", "depth, width", uses)
         return self
 
     def set_default_frequency(self, freq_mhz: float) -> Device:
@@ -332,7 +439,10 @@ class Device:
         d = Device(self.name)
         d.comb = dict(self.comb)
         d.resources = dict(self.resources)
-        d.comb_uses = {k: dict(v) for k, v in self.comb_uses.items()}
+        d.comb_uses = dict(self.comb_uses)
+        d.operator_uses = dict(self.operator_uses)
+        d.mux_uses = self.mux_uses
+        d.chain_uses = self.chain_uses
         d.storage = dict(self.storage)
         d.default_storage = self.default_storage
         d.stream_timing = self.stream_timing
@@ -387,14 +497,18 @@ def operator_descs(operators: Sequence[IP]) -> list[OpDesc]:
 _STALL_STYLE_TO_ENUM = {"ce": 0, "free": 1, "elastic": 2}
 
 
-def inject_operators(module, operators: Sequence[IP]):
+def inject_operators(module, device: Device):
     """Inject each device operator as a module-level ``dcp.operator`` symbol the
     scheduler and reifier match concrete ``arith.*``/``math.*`` ops onto. The
     ``sym_name`` is the stem of the RTL module name the emitter instantiates:
     one declaration can cover several distinct pieces of hardware, so the
     emitter appends whatever else distinguishes them (a float compare's
-    predicate: ``fcmp_l1`` -> ``fcmp_l1_ogt``)."""
-    if not operators:
+    predicate: ``fcmp_l1`` -> ``fcmp_l1_ogt``).
+
+    The resources an IP spends are the device's, but this op is not in the
+    device's symbol table, so its references reach through the device symbol
+    (``@u55c::@lut``) and resolve from where they are written."""
+    if not device.operators:
         return
     from ..._mlir.ir import (
         InsertionPoint,
@@ -409,7 +523,7 @@ def inject_operators(module, operators: Sequence[IP]):
     with module.context as ctx, Location.unknown():
         f32ty = F32Type.get()
         insert = InsertionPoint.at_block_begin(module.body)
-        for op in operators:
+        for op in device.operators:
             kind = (
                 op.optype.value
                 if isinstance(op.optype, OperatorType)
@@ -430,8 +544,21 @@ def inject_operators(module, operators: Sequence[IP]):
                 out_delay=FloatAttr.get(f32ty, t.out_delay_ns),
                 pipelined=t.pipelined,
                 stall=stall,
+                uses=_uses_attr(
+                    device.operator_uses.get(op.func_name), f"{device.name}::@"
+                ),
                 ip=insert,
             )
+
+
+def _uses_attr(spent, scope: str = ""):
+    """``uses`` as a ``#allo.res_use`` array, or None when nothing is declared:
+    an undeclared cost spends nothing, it is not a zero."""
+    if not spent:
+        return None
+    from ..._mlir.ir import Attribute
+
+    return Attribute.parse(_res_use_text(spent, scope))
 
 
 def inject_device(module, device: Device):
@@ -440,8 +567,6 @@ def inject_device(module, device: Device):
     override the built-in library defaults. Target frequency is not injected: it
     is a per-run scheduling parameter, not technology data."""
     from ..._mlir.ir import (
-        ArrayAttr,
-        Attribute,
         FlatSymbolRefAttr,
         InsertionPoint,
         Location,
@@ -451,9 +576,11 @@ def inject_device(module, device: Device):
         IntegerType,
     )
     from ..._mlir.dialects.allo import (
+        DCPathChainOp,
         DCPathCombOp,
         DCPathDefaultStorageOp,
         DCPathDeviceOp,
+        DCPathMuxOp,
         DCPathResourceOp,
         DCPathStorageOp,
         DCPathStreamTimingOp,
@@ -463,21 +590,6 @@ def inject_device(module, device: Device):
     with module.context as ctx, Location.unknown():
         f32ty = F32Type.get()
         i64 = IntegerType.get_signless(64)
-
-        def _uses(spent) -> ArrayAttr | None:
-            """``uses`` as a `#allo.res_use` array, or None when nothing is
-            declared: an undeclared cost spends nothing, it is not a zero."""
-            if not spent:
-                return None
-            return ArrayAttr.get(
-                [
-                    Attribute.parse(
-                        f"#allo.res_use<@{name}, "
-                        f"[{', '.join(c._mlir() for c in factors)}]>"
-                    )
-                    for name, factors in spent
-                ]
-            )
 
         def _timing(t) -> dict:
             return {
@@ -500,21 +612,22 @@ def inject_device(module, device: Device):
                     sym_name=r.name, capacity=IntegerAttr.get(i64, r.capacity)
                 )
             for kind, delay in device.comb.items():
-                # A comb kind carries ONE parameter, its operand width, so each
-                # cost is a single factor.
-                comb_uses = (device.comb_uses.get(kind) or {}).items()
                 DCPathCombOp(
                     kind=kind,
                     delay=FloatAttr.get(f32ty, delay),
-                    uses=_uses([(name, (cost,)) for name, cost in comb_uses]),
+                    uses=_uses_attr(device.comb_uses.get(kind)),
                 )
             for s in device.storage.values():
                 DCPathStorageOp(
                     sym_name=s.name,
                     ports=MemoryPortAttr.get(s.ports.value, ctx),
-                    uses=_uses(s.uses),
+                    uses=_uses_attr(s.uses),
                     **_timing(s),
                 )
+            if device.mux_uses:
+                DCPathMuxOp(uses=_uses_attr(device.mux_uses))
+            if device.chain_uses:
+                DCPathChainOp(uses=_uses_attr(device.chain_uses))
             if device.default_storage is not None:
                 DCPathDefaultStorageOp(
                     storage=FlatSymbolRefAttr.get(device.default_storage)

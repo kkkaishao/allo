@@ -459,7 +459,8 @@ class DCPath_Op<string mnemonic, list<Trait> traits = []> : Allo_Op<mnemonic, tr
   let cppNamespace = "::mlir::allo::dcp";
 }
 
-def DCPathOperatorOp : DCPath_Op<"dcp.operator", [Symbol]> {
+def DCPathOperatorOp : DCPath_Op<"dcp.operator",
+    [Symbol, DeclareOpInterfaceMethods<SymbolUserOpInterface>]> {
   let summary = "An IP operator characterization referenced by dcp.compute";
   let description = [{
     Declares the timing of one instanced (multi-cycle) IP operator: a
@@ -479,6 +480,17 @@ def DCPathOperatorOp : DCPath_Op<"dcp.operator", [Symbol]> {
     `stall` is the port/back-pressure contract the emitter instantiates it
     with. Combinational ops do NOT get a `dcp.operator`; they take the
     `dcp.compute` `comb_kind` path, with their chaining delay in `dcp.device`.
+
+    `uses` holds one `#allo.res_use` per resource the IP core spends, over ONE
+    parameter, an operand width, exactly as `dcp.comb`'s is. `signature` already
+    pins the widths, so in practice every factor is a `const` and the parameter
+    is never read; the arity still follows the realization's kind, because one
+    rule the verifier and the evaluator both switch on is worth more than the
+    notation a per-op exception would save.
+
+    Its resource references are NESTED (`@u55c::@lut`). The resources belong to
+    the device, this op does not, and a symbol reference has to resolve from
+    where it is written.
   }];
   let arguments = (ins
     SymbolNameAttr:$sym_name,
@@ -488,8 +500,10 @@ def DCPathOperatorOp : DCPath_Op<"dcp.operator", [Symbol]> {
     F32Attr:$in_delay,
     F32Attr:$out_delay,
     DefaultValuedAttr<BoolAttr, "true">:$pipelined,
-    DefaultValuedAttr<StallContractAttr, "::mlir::allo::StallContractEnum::Ce">:$stall);
+    DefaultValuedAttr<StallContractAttr, "::mlir::allo::StallContractEnum::Ce">:$stall,
+    OptionalAttr<ArrayAttr>:$uses);
   let hasCustomAssemblyFormat = 1;
+  let hasVerifier = 1;
 }
 
 def DCPathResourceOp : DCPath_Op<"dcp.resource", [Symbol]> {
@@ -569,6 +583,43 @@ def DCPathStorageOp : DCPath_Op<"dcp.storage",
   let hasVerifier = 1;
 }
 
+def DCPathMuxOp : DCPath_Op<"dcp.mux",
+    [DeclareOpInterfaceMethods<SymbolUserOpInterface>,
+     HasParent<"DCPathDeviceOp">]> {
+  let summary = "What one multiplexer costs on this device";
+  let description = [{
+    A select over `k` sources of `width` bits, which is what a shared functional
+    unit puts in front of each of its operands. One row for the whole device
+    rather than a symbol, because unlike storage there is nothing to choose
+    between: a multiplexer is the one structure the emitter builds for a select.
+
+    `uses` is over TWO parameters, `(k, width)`. The measured cost is a fan-in
+    curve per bit times the width, which is exactly the product a `uses` is.
+  }];
+  let arguments = (ins ArrayAttr:$uses);
+  let assemblyFormat = "`uses` $uses attr-dict";
+  let hasVerifier = 1;
+}
+
+def DCPathChainOp : DCPath_Op<"dcp.chain",
+    [DeclareOpInterfaceMethods<SymbolUserOpInterface>,
+     HasParent<"DCPathDeviceOp">]> {
+  let summary = "What one value delay chain costs on this device";
+  let description = [{
+    A `depth`-stage, `width`-bit register chain: what carrying a value across a
+    schedule's slack costs. One row for the whole device, for the same reason
+    `dcp.mux` is.
+
+    `uses` is over TWO parameters, `(depth, width)`. Past a measured depth the
+    synthesizer stops building flip-flops and extracts a shift register, which
+    is the cliff the `step` form exists for, so a device that extracts declares
+    a step and one that does not declares a plain product.
+  }];
+  let arguments = (ins ArrayAttr:$uses);
+  let assemblyFormat = "`uses` $uses attr-dict";
+  let hasVerifier = 1;
+}
+
 def DCPathDefaultStorageOp : DCPath_Op<"dcp.default_storage",
     [DeclareOpInterfaceMethods<SymbolUserOpInterface>,
      HasParent<"DCPathDeviceOp">]> {
@@ -609,11 +660,11 @@ def DCPathDeviceOp : DCPath_Op<"dcp.device",
     reifier read it directly.
 
     The body declares what the device HAS (`dcp.resource`) and what it can
-    REALIZE (`dcp.comb`, `dcp.storage`), each referring to the others by symbol
-    so a misspelled resource is a verifier error rather than an absent row. It
-    is one op to inject and one to erase, and its symbols are scoped to it.
-    `dcp.default_storage` and `dcp.stream_timing` are the two whole-device
-    settings, at most one of each.
+    REALIZE (`dcp.comb`, `dcp.storage`, `dcp.mux`, `dcp.chain`), each referring
+    to the others by symbol so a misspelled resource is a verifier error rather
+    than an absent row. It is one op to inject and one to erase, and its symbols
+    are scoped to it. `dcp.default_storage`, `dcp.stream_timing`, `dcp.mux` and
+    `dcp.chain` are the whole-device rows, at most one of each.
 
     `dcp.operator` stays at MODULE scope rather than moving in here: its symbol
     is referenced by program code (a `dcp.compute` names its IP) and reaches the

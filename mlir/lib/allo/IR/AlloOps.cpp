@@ -403,6 +403,10 @@ LogicalResult DCPathDeviceOp::verify() {
     return emitOpError("declares more than one dcp.default_storage");
   if (tooMany(getBody().getOps<DCPathStreamTimingOp>()))
     return emitOpError("declares more than one dcp.stream_timing");
+  if (tooMany(getBody().getOps<DCPathMuxOp>()))
+    return emitOpError("declares more than one dcp.mux");
+  if (tooMany(getBody().getOps<DCPathChainOp>()))
+    return emitOpError("declares more than one dcp.chain");
   return success();
 }
 
@@ -492,6 +496,41 @@ DCPathDefaultStorageOp::verifySymbolUses(SymbolTableCollection &symbolTable) {
     return emitOpError("defaults to '")
            << getStorage() << "', which is not a dcp.storage";
   return success();
+}
+
+LogicalResult DCPathMuxOp::verify() {
+  return verifyResourceUses(*this, getUsesAttr(), 2,
+                            "two parameters (fan-in, width)");
+}
+
+LogicalResult
+DCPathMuxOp::verifySymbolUses(SymbolTableCollection &symbolTable) {
+  return verifyUsesResolve(*this, getUsesAttr(), symbolTable);
+}
+
+LogicalResult DCPathChainOp::verify() {
+  return verifyResourceUses(*this, getUsesAttr(), 2,
+                            "two parameters (depth, width)");
+}
+
+LogicalResult
+DCPathChainOp::verifySymbolUses(SymbolTableCollection &symbolTable) {
+  return verifyUsesResolve(*this, getUsesAttr(), symbolTable);
+}
+
+// An IP core's area is a function of its operand width, the same one parameter
+// a `dcp.comb` carries, even though `signature` already fixes that width.
+LogicalResult DCPathOperatorOp::verify() {
+  return verifyResourceUses(*this, getUsesAttr(), 1,
+                            "one parameter (an operand width)");
+}
+
+// This op is at module scope and the resources it spends are the device's, so
+// the reference has to name the device it reaches through (`@u55c::@lut`);
+// `verifyUsesResolve` walks it like any other nested symbol.
+LogicalResult
+DCPathOperatorOp::verifySymbolUses(SymbolTableCollection &symbolTable) {
+  return verifyUsesResolve(*this, getUsesAttr(), symbolTable);
 }
 
 //===----------------------------------------------------------------------===//
@@ -663,6 +702,8 @@ void DCPathOperatorOp::print(OpAsmPrinter &p) {
   if (getPipelined())
     p << " pipelined";
   p << ' ' << stringifyStallContractEnum(getStall());
+  if (ArrayAttr uses = getUsesAttr())
+    p << " uses " << uses;
 }
 
 ParseResult DCPathOperatorOp::parse(OpAsmParser &p, OperationState &result) {
@@ -702,6 +743,12 @@ ParseResult DCPathOperatorOp::parse(OpAsmParser &p, OperationState &result) {
                       b.getBoolAttr(pipelined));
   result.addAttribute(getStallAttrName(result.name),
                       StallContractEnumAttr::get(b.getContext(), *s));
+  if (succeeded(p.parseOptionalKeyword("uses"))) {
+    ArrayAttr uses;
+    if (p.parseAttribute(uses))
+      return failure();
+    result.addAttribute(getUsesAttrName(result.name), uses);
+  }
   return success();
 }
 
