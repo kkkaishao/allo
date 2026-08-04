@@ -331,20 +331,19 @@ LogicalResult checkMemories(func::FuncOp func, const MemoryLibrary &memLib,
   });
 
   for (Value array : arrays) {
-    MemoryChar mc = characterize(array, memLib.defaultImpl);
-    MemoryImplEnum impl = mc.impl;
+    MemoryChar mc = characterize(array, memLib.defaultStorage);
+    StringRef storage = mc.storage;
     Operation *anchor =
         array.getDefiningOp() ? array.getDefiningOp() : func.getOperation();
-    // An implementation the device never declared would fall to the
-    // zero-timing default and schedule combinationally, reading before valid.
-    if (!memLib.declares(impl)) {
+    // A realization the device never declared would fall to the zero-timing
+    // default and schedule combinationally, reading before valid.
+    if (!memLib.declares(storage)) {
       error(Stage::Prep, anchor)
-          << "No memory characterization for storage impl '"
-          << stringifyMemoryImplEnum(impl)
-          << "'; declare it in the device `memory` table";
+          << "No memory characterization for storage '" << storage
+          << "'; declare it as a `dcp.storage` on the device";
       return failure();
     }
-    RWLatency lat = memLib.timing(impl).latency;
+    RWLatency lat = memLib.timing(storage).latency;
     // A boundary port's latency is a contract with the driver, not enforced by
     // the RTL: any latency >= 1 works, but 0 does not, since the port is
     // edge-triggered.
@@ -356,10 +355,10 @@ LogicalResult checkMemories(func::FuncOp func, const MemoryLibrary &memLib,
     // internally.
     if (lat.write < 1) {
       error(Stage::Prep, anchor)
-          << "Storage impl '" << stringifyMemoryImplEnum(impl)
+          << "Storage '" << storage
           << "' declares a 0-cycle write, which no array can be realized at: "
-             "a write needs a clock edge to commit on. Give that row a write "
-             "latency of at least 1 in the device `memory` table";
+             "a write needs a clock edge to commit on. Give that "
+             "`dcp.storage` a write latency of at least 1";
       return failure();
     }
   }

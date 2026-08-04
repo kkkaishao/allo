@@ -59,14 +59,14 @@ static AttrT carrierAttr(Value memRef, StringRef name) {
 }
 
 // The three orthogonal axes of an `allo.bind.storage` directive, mapped from
-// its `type` string (port topology + RAM/ROM) and `impl` string (storage
-// primitive). An ABSENT `type` is the dual-port RAM default and an absent
+// its `type` string (port topology + RAM/ROM) and `impl` string (which storage
+// realization). An ABSENT `type` is the dual-port RAM default and an absent
 // `impl` is an absent CHOICE, resolved against the library's default.
 namespace {
 struct BindStorage {
   MemoryPortEnum port = MemoryPortEnum::TrueDualPort;
   MemoryKindEnum kind = MemoryKindEnum::RAM;
-  std::optional<MemoryImplEnum> impl;
+  std::string storage; // empty: no explicit choice, not "no storage"
 };
 } // namespace
 
@@ -93,19 +93,11 @@ static BindStorage parseBindStorage(DictionaryAttr bind) {
     bs.port = port.value_or(MemoryPortEnum::TrueDualPort);
     bs.kind = t.starts_with("rom") ? MemoryKindEnum::ROM : MemoryKindEnum::RAM;
   }
-  if (auto im = bind.getAs<StringAttr>("impl")) {
-    auto impl =
-        llvm::StringSwitch<std::optional<MemoryImplEnum>>(im.getValue())
-            .Case("bram", MemoryImplEnum::BRAM)
-            .Case("uram", MemoryImplEnum::URAM)
-            .Case("lutram", MemoryImplEnum::LUTRAM)
-            .Case("register", MemoryImplEnum::Register)
-            .Case("srl", MemoryImplEnum::LUTRAM) // shift-register: LUT-based
-            .Default(std::nullopt);
-    assert(impl && "unknown allo.bind.storage impl= (the frontend's "
-                   "BindStorageImpl vocabulary drifted from this switch)");
-    bs.impl = impl;
-  }
+  // `impl` NAMES a `dcp.storage` of the device, so there is no table here to
+  // drift: a name the device does not declare is reported by `PreVerification`
+  // against the array, which is where the user can act on it.
+  if (auto im = bind.getAs<StringAttr>("impl"))
+    bs.storage = im.getValue().str();
   return bs;
 }
 
@@ -140,15 +132,16 @@ bool mlir::allo::isConstantTable(Value memRef) {
   });
 }
 
-// The storage implementation a memref resolves to, the input to per-impl access
-// timing: a complete partition scatters into registers whatever `bind.storage
-// impl` says; else an explicit `bind.storage impl`; else the library default.
-static MemoryImplEnum resolveImpl(Value memRef, MemoryImplEnum defaultImpl) {
+// The name of the storage realization a memref resolves to, the input to
+// per-realization access timing: a complete partition scatters into registers
+// whatever `bind.storage impl` says; else an explicit `bind.storage impl`; else
+// the library default.
+static std::string resolveStorage(Value memRef, StringRef defaultStorage) {
   if (bankLayoutOf(memRef).registers)
-    return MemoryImplEnum::Register;
+    return kRegisterStorage.str();
   auto bs =
       parseBindStorage(carrierAttr<DictionaryAttr>(memRef, kBindStorageAttr));
-  return bs.impl.value_or(defaultImpl);
+  return bs.storage.empty() ? defaultStorage.str() : bs.storage;
 }
 
 void MemoryBankModel::observe(Operation *op) {
@@ -650,47 +643,39 @@ std::optional<unsigned> assignedBankOf(Operation *op) {
 // Memory timing library
 //===----------------------------------------------------------------------===//
 
-MemKindTiming MemoryLibrary::timing(MemoryImplEnum impl) const {
-  for (const MemPrimitive &p : primitives)
-    if (p.impl == impl)
-      return p.timing;
-  // `PreVerification` rejects an array resolving to an implementation the
-  // device does not declare, so reaching here means that check was bypassed and
-  // the access would schedule at latency 0.
-  assert(false &&
-         "storage impl not declared by the device -> silent latency-0 access");
+MemKindTiming MemoryLibrary::timing(StringRef name) const {
+  for (const StorageRealization &s : storage)
+    if (s.name == name)
+      return s.timing;
+  // `PreVerification` rejects an array resolving to a realization the device
+  // does not declare, so reaching here means that check was bypassed and the
+  // access would schedule at latency 0.
+  assert(false && "storage realization not declared by the device -> silent "
+                  "latency-0 access");
   static constexpr MemKindTiming zero;
   return zero;
 }
 
-std::optional<MemoryImplEnum>
-MemoryLibrary::resolvedImpl(Operation *op) const {
-  auto a = asMemAccess(op);
-  if (!a || a->kind == AccessKind::Stream)
-    return std::nullopt;
-  return resolveImpl(a->root, defaultImpl);
-}
-
-bool MemoryLibrary::declares(MemoryImplEnum impl) const {
-  return llvm::any_of(primitives,
-                      [&](const MemPrimitive &p) { return p.impl == impl; });
+bool MemoryLibrary::declares(StringRef name) const {
+  return llvm::any_of(
+      storage, [&](const StorageRealization &s) { return s.name == name; });
 }
 
 MemoryLibrary::Timing MemoryLibrary::timing(Operation *op) const {
   auto a = asMemAccess(op);
   if (!a)
     return {};
-  // A stream is a FIFO, not array storage: it has no implementation to resolve
-  // and is timed by its own row.
-  std::optional<MemoryImplEnum> impl;
+  // A stream is a FIFO, not array storage: it has no realization to resolve and
+  // is timed by its own row.
+  std::string name;
   if (a->kind != AccessKind::Stream)
-    impl = resolveImpl(a->root, defaultImpl);
-  MemKindTiming t = impl ? timing(*impl) : fifo;
-  return a->isWrite ? Timing{t.latency.write, t.delay.write, impl}
-                    : Timing{t.latency.read, t.delay.read, impl};
+    name = resolveStorage(a->root, defaultStorage);
+  MemKindTiming t = name.empty() ? fifo : timing(name);
+  return a->isWrite ? Timing{t.latency.write, t.delay.write, name}
+                    : Timing{t.latency.read, t.delay.read, name};
 }
 
-MemoryChar allo::characterize(Value memref, MemoryImplEnum defaultImpl) {
+MemoryChar allo::characterize(Value memref, StringRef defaultStorage) {
   using namespace detail;
   MemoryChar c;
   auto bs =
@@ -701,6 +686,6 @@ MemoryChar allo::characterize(Value memref, MemoryImplEnum defaultImpl) {
   BankLayout layout = bankLayoutOf(memref);
   c.numBanks = layout.numBanks;
   c.registers = layout.registers;
-  c.impl = resolveImpl(memref, defaultImpl);
+  c.storage = resolveStorage(memref, defaultStorage);
   return c;
 }

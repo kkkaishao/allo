@@ -295,32 +295,23 @@ OperatorIdentity identityOf(Operation *op, std::string realization, bool comb) {
 
 MemoryLibrary memoryFromDevice(dcp::DCPathDeviceOp device) {
   MemoryLibrary m;
-  auto i64 = [](DictionaryAttr d, StringRef k) {
-    return (unsigned)cast<IntegerAttr>(d.get(k)).getInt();
-  };
-  auto f = [](DictionaryAttr d, StringRef k) {
-    return cast<FloatAttr>(d.get(k)).getValueAsDouble();
-  };
-  auto timing = [&](DictionaryAttr d) {
+  // Both rows carry the same four fields under the same accessor names, so one
+  // template reads a `dcp.storage` and a `dcp.stream_timing` alike.
+  auto timing = [](auto row) {
     MemKindTiming t;
-    t.latency.read = i64(d, "rd_lat");
-    t.latency.write = i64(d, "wr_lat");
-    t.delay.read = f(d, "rd_delay");
-    t.delay.write = f(d, "wr_delay");
+    t.latency.read = (unsigned)row.getRdLatency();
+    t.latency.write = (unsigned)row.getWrLatency();
+    t.delay.read = row.getRdDelay().convertToDouble();
+    t.delay.write = row.getWrDelay().convertToDouble();
     return t;
   };
-  for (NamedAttribute na : device.getMemory()) {
-    auto impl = symbolizeMemoryImplEnum(na.getName().strref());
-    if (!impl)
-      continue;
-    m.primitives.push_back(
-        {*impl, timing(cast<DictionaryAttr>(na.getValue()))});
-  }
-  if (DictionaryAttr fifo = device.getFifoAttr())
-    m.fifo = timing(fifo);
-  if (StringAttr def = device.getDefaultMemoryAttr())
-    if (auto impl = symbolizeMemoryImplEnum(def.strref()))
-      m.defaultImpl = *impl;
+  Block &body = device.getBody().front();
+  for (auto s : body.getOps<dcp::DCPathStorageOp>())
+    m.storage.push_back({s.getSymName().str(), s.getPorts(), timing(s)});
+  for (auto st : body.getOps<dcp::DCPathStreamTimingOp>())
+    m.fifo = timing(st);
+  for (auto def : body.getOps<dcp::DCPathDefaultStorageOp>())
+    m.defaultStorage = def.getStorage().str();
   return m;
 }
 
@@ -477,8 +468,9 @@ OperatorChar OperatorLibrary::lookup(Operation *op) const {
                   : kind == OpKind::StreamRead ? "srm.rd"
                                                : "srm.wr");
     if (kind == OpKind::MemRead || kind == OpKind::MemWrite) {
-      assert(t.impl && "an array access resolves to a storage implementation");
-      c.typeName += stringifyMemoryImplEnum(*t.impl).str();
+      assert(!t.storage.empty() &&
+             "an array access resolves to a storage realization");
+      c.typeName += t.storage;
     }
     c.latency = t.latency;
     c.inDelay = c.outDelay = t.delay;

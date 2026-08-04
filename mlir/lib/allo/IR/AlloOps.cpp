@@ -387,43 +387,6 @@ LogicalResult DCPathComputeOp::verify() {
 }
 
 LogicalResult DCPathDeviceOp::verify() {
-  // `memoryFromDevice` silently skips a row it cannot symbolize or one missing
-  // a timing field, which would time every array of that implementation at
-  // zero.
-  auto verifyTiming = [&](Attribute v, const Twine &what) -> LogicalResult {
-    auto d = dyn_cast<DictionaryAttr>(v);
-    if (!d)
-      return emitOpError(what) << " timing must be a dictionary";
-    for (StringRef k : {"rd_lat", "wr_lat"})
-      if (!d.getAs<IntegerAttr>(k))
-        return emitOpError(what)
-               << " timing is missing an integer '" << k << "'";
-    for (StringRef k : {"rd_delay", "wr_delay"})
-      if (!d.getAs<FloatAttr>(k))
-        return emitOpError(what) << " timing is missing a float '" << k << "'";
-    return success();
-  };
-  for (NamedAttribute na : getMemory()) {
-    StringRef name = na.getName().strref();
-    if (!symbolizeMemoryImplEnum(name))
-      return emitOpError("unknown storage implementation '")
-             << name << "' in the memory table";
-    if (failed(verifyTiming(na.getValue(), "storage '" + name + "'")))
-      return failure();
-  }
-  if (Attribute fifo = getFifoAttr())
-    if (failed(verifyTiming(fifo, "fifo")))
-      return failure();
-  // An unsymbolizable `default_memory` would be dropped, leaving every unbound
-  // array on the library's built-in default.
-  if (StringAttr def = getDefaultMemoryAttr()) {
-    std::optional<MemoryImplEnum> impl = symbolizeMemoryImplEnum(def.strref());
-    if (!impl)
-      return emitOpError("unknown default_memory '") << def.strref() << "'";
-    if (!getMemory().getAs<DictionaryAttr>(def.strref()))
-      return emitOpError("default_memory '")
-             << def.strref() << "' is not declared in the memory table";
-  }
   // One row per kind: the library keeps the LAST match, so a duplicate is a
   // declaration silently overriding another.
   llvm::StringSet<> seen;
@@ -431,6 +394,64 @@ LogicalResult DCPathDeviceOp::verify() {
     if (!seen.insert(comb.getKind()).second)
       return emitOpError("declares combinational kind '")
              << comb.getKind() << "' twice";
+  // The two whole-device settings, for the same reason: a second one would
+  // silently win over the first.
+  auto tooMany = [](auto range) {
+    return !range.empty() && !llvm::hasSingleElement(range);
+  };
+  if (tooMany(getBody().getOps<DCPathDefaultStorageOp>()))
+    return emitOpError("declares more than one dcp.default_storage");
+  if (tooMany(getBody().getOps<DCPathStreamTimingOp>()))
+    return emitOpError("declares more than one dcp.stream_timing");
+  return success();
+}
+
+// One `uses` entry per resource, each carrying one cost factor per parameter of
+// the realization's kind (\p arity of them, spelled by \p params for the
+// diagnostic). A wrong count would otherwise reach the evaluator, which zips
+// factors against parameters and cannot tell a missing one from a whole tuple.
+static LogicalResult verifyResourceUses(Operation *op, ArrayAttr uses,
+                                        unsigned arity, StringRef params) {
+  if (!uses)
+    return success();
+  llvm::SmallDenseSet<Attribute> seen;
+  for (Attribute use : uses) {
+    auto ru = dyn_cast<ResourceUseAttr>(use);
+    if (!ru)
+      return op->emitOpError(
+          "'uses' holds an entry that is not an #allo.res_use");
+    ArrayRef<CostAttr> factors = ru.getFactors();
+    bool tiled = llvm::any_of(
+        factors, [](CostAttr c) { return c.getForm() == CostFormEnum::Tiled; });
+    if (tiled && factors.size() != 1)
+      return op->emitOpError("a 'tiled' cost of '")
+             << ru.getResource()
+             << "' consumes the whole parameter tuple, so it stands alone "
+                "rather than multiplying another factor";
+    if (!tiled && factors.size() != arity)
+      return op->emitOpError("is characterized by ")
+             << params << ", so its cost of '" << ru.getResource() << "' takes "
+             << arity << " factor(s), not " << factors.size();
+    if (!seen.insert(ru.getResource()).second)
+      return op->emitOpError("spends resource '")
+             << ru.getResource() << "' twice";
+  }
+  return success();
+}
+
+// Every resource a realization spends must be one this device declares: the
+// symbol is what turns a misspelling into an error instead of a free row.
+static LogicalResult verifyUsesResolve(Operation *op, ArrayAttr uses,
+                                       SymbolTableCollection &symbolTable) {
+  if (!uses)
+    return success();
+  for (Attribute use : uses) {
+    auto ru = cast<ResourceUseAttr>(use);
+    if (!symbolTable.lookupNearestSymbolFrom<DCPathResourceOp>(
+            op, ru.getResource()))
+      return op->emitOpError("spends '")
+             << ru.getResource() << "', which is not a dcp.resource";
+  }
   return success();
 }
 
@@ -439,38 +460,37 @@ LogicalResult DCPathDeviceOp::verify() {
 LogicalResult DCPathCombOp::verify() {
   if (getDelay().convertToDouble() < 0.0)
     return emitOpError("delay must be non-negative");
-  ArrayAttr uses = getUsesAttr();
-  if (!uses)
-    return success();
-  // One parameter, an operand width, so one factor per resource.
-  llvm::SmallDenseSet<Attribute> seen;
-  for (Attribute use : uses) {
-    auto ru = dyn_cast<ResourceUseAttr>(use);
-    if (!ru)
-      return emitOpError("'uses' holds an entry that is not an #allo.res_use");
-    if (ru.getFactors().size() != 1)
-      return emitOpError("a combinational kind is characterized by one "
-                         "parameter (operand width), so its cost of '")
-             << ru.getResource() << "' takes one factor, not "
-             << ru.getFactors().size();
-    if (!seen.insert(ru.getResource()).second)
-      return emitOpError("spends resource '") << ru.getResource() << "' twice";
-  }
-  return success();
+  return verifyResourceUses(*this, getUsesAttr(), 1,
+                            "one parameter (an operand width)");
 }
 
 LogicalResult
 DCPathCombOp::verifySymbolUses(SymbolTableCollection &symbolTable) {
-  ArrayAttr uses = getUsesAttr();
-  if (!uses)
-    return success();
-  for (Attribute use : uses) {
-    auto ru = cast<ResourceUseAttr>(use);
-    if (!symbolTable.lookupNearestSymbolFrom<DCPathResourceOp>(
-            *this, ru.getResource()))
-      return emitOpError("spends '")
-             << ru.getResource() << "', which is not a dcp.resource";
-  }
+  return verifyUsesResolve(*this, getUsesAttr(), symbolTable);
+}
+
+// A 0-cycle write is not checked here even though no array can be realized at
+// one: `PreVerification` reports it against the array that resolved to this
+// row, and a row nothing resolves to costs nothing.
+LogicalResult DCPathStorageOp::verify() {
+  if (getRdDelay().convertToDouble() < 0.0 ||
+      getWrDelay().convertToDouble() < 0.0)
+    return emitOpError("delay must be non-negative");
+  return verifyResourceUses(*this, getUsesAttr(), 2,
+                            "two parameters (depth, width)");
+}
+
+LogicalResult
+DCPathStorageOp::verifySymbolUses(SymbolTableCollection &symbolTable) {
+  return verifyUsesResolve(*this, getUsesAttr(), symbolTable);
+}
+
+LogicalResult
+DCPathDefaultStorageOp::verifySymbolUses(SymbolTableCollection &symbolTable) {
+  if (!symbolTable.lookupNearestSymbolFrom<DCPathStorageOp>(*this,
+                                                            getStorageAttr()))
+    return emitOpError("defaults to '")
+           << getStorage() << "', which is not a dcp.storage";
   return success();
 }
 
@@ -1240,6 +1260,14 @@ CostAttr::verify(llvm::function_ref<InFlightDiagnostic()> emitError,
   case CostFormEnum::Const:
   case CostFormEnum::Quadratic:
     return need(1);
+  case CostFormEnum::Tiled:
+    if (failed(need(1)))
+      return failure();
+    // The tile is a divisor, so a non-positive one is a division by zero
+    // dressed as a declaration.
+    if (coeffs[0] <= 0.0)
+      return emitError() << "tiled needs a positive number of bits per tile";
+    return success();
   case CostFormEnum::Linear:
     return need(2);
   case CostFormEnum::Step:
@@ -1277,8 +1305,11 @@ double CostAttr::evaluate(int64_t param) const {
         v = c[i + 1];
     return v;
   }
+  case CostFormEnum::Tiled:
+    break;
   }
-  llvm_unreachable("unhandled CostFormEnum");
+  llvm_unreachable("tiled reads the whole parameter tuple, so it has no value "
+                   "at one parameter; evaluateResourceUse computes it");
 }
 
 LogicalResult
@@ -1299,13 +1330,25 @@ mlir::allo::evaluateResourceUse(ArrayAttr uses,
   for (Attribute use : uses) {
     auto ru = cast<ResourceUseAttr>(use);
     llvm::ArrayRef<CostAttr> factors = ru.getFactors();
-    assert(factors.size() == params.size() &&
-           "a resource cost carries one factor per parameter of its kind");
-    // Rounded ONCE, at the end: rounding each factor would make the product
-    // depend on how the cost was factored.
     double amount = 1.0;
-    for (auto [factor, param] : llvm::zip(factors, params))
-      amount *= factor.evaluate(param);
+    if (factors.size() == 1 &&
+        factors.front().getForm() == CostFormEnum::Tiled) {
+      // The one form that reads the WHOLE tuple: a tile holds so many bits
+      // however the array is cut, so the product sits inside the ceiling and
+      // the arity rule above does not apply to it.
+      assert(!params.empty() && "a tiled cost needs a parameter tuple to tile");
+      double bits = 1.0;
+      for (int64_t p : params)
+        bits *= static_cast<double>(p);
+      amount = std::ceil(bits / factors.front().getCoeffs().asArrayRef()[0]);
+    } else {
+      assert(factors.size() == params.size() &&
+             "a resource cost carries one factor per parameter of its kind");
+      // Rounded ONCE, at the end: rounding each factor would make the product
+      // depend on how the cost was factored.
+      for (auto [factor, param] : llvm::zip(factors, params))
+        amount *= factor.evaluate(param);
+    }
     spent.emplace_back(ru.getResource(),
                        static_cast<int64_t>(std::llround(amount)));
   }

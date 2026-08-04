@@ -21,7 +21,6 @@ from allo.backend.rtl.device import (
     CombKind,
     Const,
     Linear,
-    MemoryKind,
     Quadratic,
     Table,
 )
@@ -56,8 +55,8 @@ def test_a_device_declares_its_resources_and_what_they_cost():
             out[i] = A[i] * B[i] + 1
 
     dev = builtin_device.copy()
-    lut = dev.add_resource("lut", capacity=1_303_680)
-    dsp = dev.add_resource("dsp", capacity=9_024)
+    lut = dev.resources["lut"]
+    dsp = dev.resources["dsp"]
     # An N-bit AND is N LUT6s (linear), a divider is quadratic, and a
     # multiplier's DSP count was measured per width rather than fitted.
     dev.set_comb_delay(CombKind.ADD, 1.2, uses={lut: Linear(1.0)})
@@ -95,7 +94,7 @@ def test_a_cost_must_name_a_declared_resource():
 # so a duplicate would be one declaration silently overriding another.
 def test_a_device_declares_each_comb_kind_once():
     dev = builtin_device.copy()
-    lut = dev.add_resource("lut", capacity=100)
+    lut = dev.resources["lut"]
     dev.set_comb_delay(CombKind.ADD, 1.2, uses={lut: Linear(1.0)})
     dev.set_comb_delay(CombKind.ADD, 0.9)  # overwrites rather than duplicating
 

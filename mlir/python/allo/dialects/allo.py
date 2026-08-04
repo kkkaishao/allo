@@ -14,7 +14,6 @@ from .._mlir_libs._allo import (
     PartitionAttr,
     AssumeDepTypeAttr,
     AssumeDepDirAttr,
-    MemoryImplAttr,
     MemoryPortAttr,
     MemoryKindAttr,
     DeterminacyAttr,

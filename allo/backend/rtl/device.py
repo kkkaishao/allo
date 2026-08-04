@@ -11,27 +11,18 @@ from enum import Enum
 
 from ...lang import f32, f64, bf16, i32, bool as _bool
 from ...lang.ip import ip, IP, OperatorType
+from .area_tables import declare_xcu55c_area
 from .sim.ip_models import OpDesc, Ty
 
 
-class MemoryKind(Enum):
-    """A storage primitive. The value is the name the scheduler's
-    ``MemoryImplEnum`` uses; keep them in sync."""
+class Port(Enum):
+    """Port topology of a storage primitive: how many concurrent read/write
+    ports it has, and whether reads and writes contend. The values are
+    ``MemoryPortEnum``'s."""
 
-    REG = "register"
-    LUTRAM = "lutram"
-    BRAM = "bram"
-    URAM = "uram"
-    FIFO = "fifo"
-
-
-@dataclass
-class MemoryTiming:
-    kind: MemoryKind
-    read_latency: int
-    write_latency: int
-    read_delay_ns: float
-    write_delay_ns: float
+    SINGLE = 0  # one shared read/write port
+    S2P = 1  # one dedicated read + one dedicated write, no contention
+    T2P = 2  # two shared read/write ports
 
 
 @dataclass(frozen=True)
@@ -99,6 +90,55 @@ def Table(points: dict[int, float]) -> Cost:
     return Cost("table", tuple(flat))
 
 
+def Tiled(bits_per_tile: int) -> Cost:
+    """``ceil(depth * width / bits_per_tile)``: the shape of a tiled memory.
+
+    The one form that reads the WHOLE parameter tuple rather than one of it, so
+    it stands alone instead of multiplying a factor per parameter: a block-RAM
+    tile holds so many bits however the array is cut, which puts the product
+    inside the ceiling and does not separate."""
+    if bits_per_tile <= 0:
+        raise ValueError("a tile holds a positive number of bits")
+    return Cost("tiled", (float(bits_per_tile),))
+
+
+@dataclass(frozen=True)
+class Storage:
+    """A storage realization: one buildable structure an array can live in.
+
+    NOT a resource. A resource is a counter (``@lut``, ``@bram36``); this is
+    something the device can BUILD out of them, with timing and ports of its
+    own, and its ``uses`` names what it spends. That split is why the vocabulary
+    is open: a part whose primitives are not Xilinx's declares different names
+    and nothing in the compiler switches on the list.
+
+    ``allo.bind.storage impl=`` names one of these, and an array with no
+    explicit choice takes the device's :meth:`Device.set_default_storage`.
+    """
+
+    name: str
+    ports: Port
+    read_latency: int
+    write_latency: int
+    read_delay_ns: float
+    write_delay_ns: float
+    # One (resource name, factors) pair per resource spent. Storage carries two
+    # parameters, `(depth, width)`, so factors is two costs or one `Tiled`.
+    uses: tuple[tuple[str, tuple[Cost, ...]], ...] = ()
+
+
+@dataclass(frozen=True)
+class StreamTiming:
+    """Get/put timing of a stream channel. A stream is a FIFO, not array
+    storage: nothing chooses its implementation and nothing binds its ports, so
+    it is one row on the device rather than a :class:`Storage`."""
+
+    read_latency: int
+    write_latency: int
+    read_delay_ns: float
+    write_delay_ns: float
+
+
 class CombKind(Enum):
     """A combinational operator kind whose chaining delay a device may characterize."""
 
@@ -121,14 +161,13 @@ class CombKind(Enum):
 
 
 class Device:
-    """A hardware platform: storage primitives, native-operator chaining delays,
-    operator IPs and a default synthesis frequency. Built fluently through
-    ``set_memory`` / ``set_comb_delay`` / ``add_operator``."""
+    """A hardware platform: what it HAS (resources), what it can REALIZE
+    (storage structures, native operator kinds, operator IPs) and a default
+    synthesis frequency. Built fluently through ``add_resource`` /
+    ``add_storage`` / ``set_comb_delay`` / ``add_operator``."""
 
     def __init__(self, name: str):
         self.name = name
-        self.memory: dict[MemoryKind, MemoryTiming] = {}
-        self.default_memory: MemoryTiming | None = None
         self.comb: dict[str, float] = {}  # native chaining delays: kind -> ns
         # What the device HAS, and what each native operator SPENDS of it.
         # Separate from `comb` because a delay is a timing fact and an area is
@@ -136,6 +175,11 @@ class Device:
         # consumers.
         self.resources: dict[str, Resource] = {}
         self.comb_uses: dict[str, dict[str, Cost]] = {}  # kind -> resource -> cost
+        self.storage: dict[str, Storage] = {}
+        # The default is a NAME, not a handle: redeclaring a row (a copied
+        # device retuned) must not leave it pointing at the replaced one.
+        self.default_storage: str | None = None
+        self.stream_timing: StreamTiming | None = None
         self.operators: list[IP] = []  # built-in and user `@ip` operators
         self.default_freq_mhz: float = 100.0
 
@@ -150,35 +194,93 @@ class Device:
         self.resources[name] = r
         return r
 
-    def set_memory(
+    def add_storage(
         self,
-        kind: MemoryKind,
+        name: str,
+        *,
+        ports: Port,
         read_latency: int,
         write_latency: int,
         read_delay_ns: float = 0.0,
         write_delay_ns: float = 0.0,
-    ) -> "Device":
-        if not isinstance(kind, MemoryKind):
-            raise TypeError(f"kind must be a MemoryKind, got {kind!r}")
+        uses: dict[Resource, Cost | Sequence[Cost]] | None = None,
+    ) -> Storage:
+        """Declare a storage realization and return the handle ``bind_storage``
+        and :meth:`set_default_storage` refer to.
+
+        Redeclaring a name REPLACES the row: retuning one primitive of a copied
+        device is the normal way to build a variant, and the default, being a
+        name, keeps pointing at whatever is declared under it.
+
+        Storage carries two parameters, ``(depth, width)``, so a ``uses`` entry
+        is a pair of costs, or the single :func:`Tiled` that reads them
+        together.
+        """
+        if not isinstance(ports, Port):
+            raise TypeError(f"ports must be a Port, got {ports!r}")
         if read_latency < 0 or write_latency < 0:
-            raise ValueError(f"{kind.name}: latency must be non-negative")
+            raise ValueError(f"storage {name!r}: latency must be non-negative")
         if read_delay_ns < 0 or write_delay_ns < 0:
-            raise ValueError(f"{kind.name}: delay must be non-negative")
-        self.memory[kind] = MemoryTiming(
-            kind=kind,
+            raise ValueError(f"storage {name!r}: delay must be non-negative")
+        spent: list[tuple[str, tuple[Cost, ...]]] = []
+        for resource, cost in (uses or {}).items():
+            if self.resources.get(resource.name) is not resource:
+                raise ValueError(
+                    f"{resource.name!r} is not a resource of device {self.name!r}"
+                )
+            factors = (cost,) if isinstance(cost, Cost) else tuple(cost)
+            if len(factors) != (1 if factors[0].form == "tiled" else 2):
+                raise ValueError(
+                    f"storage {name!r} spends {resource.name!r} over (depth, width), "
+                    "so its cost is two factors or one Tiled"
+                )
+            spent.append((resource.name, factors))
+        s = Storage(
+            name=name,
+            ports=ports,
+            read_latency=int(read_latency),
+            write_latency=int(write_latency),
+            read_delay_ns=float(read_delay_ns),
+            write_delay_ns=float(write_delay_ns),
+            uses=tuple(spent),
+        )
+        self.storage[name] = s
+        return s
+
+    def set_default_storage(self, storage: Storage) -> Device:
+        """The storage an array with no ``bind_storage`` resolves to. Takes a
+        realization, so defaulting to a :class:`Resource` is a type error rather
+        than a name that fails to resolve much later."""
+        if not isinstance(storage, Storage):
+            raise TypeError(
+                f"the default must be a storage realization, got "
+                f"{type(storage).__name__}"
+            )
+        if self.storage.get(storage.name) is not storage:
+            raise ValueError(
+                f"{storage.name!r} is not a storage of device {self.name!r}"
+            )
+        self.default_storage = storage.name
+        return self
+
+    def set_stream_timing(
+        self,
+        read_latency: int,
+        write_latency: int,
+        read_delay_ns: float = 0.0,
+        write_delay_ns: float = 0.0,
+    ) -> Device:
+        """Get/put timing of a stream channel."""
+        if read_latency < 0 or write_latency < 0:
+            raise ValueError("stream latency must be non-negative")
+        if read_delay_ns < 0 or write_delay_ns < 0:
+            raise ValueError("stream delay must be non-negative")
+        self.stream_timing = StreamTiming(
             read_latency=int(read_latency),
             write_latency=int(write_latency),
             read_delay_ns=float(read_delay_ns),
             write_delay_ns=float(write_delay_ns),
         )
-        return self
-
-    def set_default_memory(self, kind: MemoryKind) -> Device:
-        if kind not in self.memory:
-            raise ValueError(f"memory {kind!r} not set on device {self.name!r}")
-        if kind is MemoryKind.FIFO:
-            raise ValueError("FIFO is stream timing, not an array-storage default")
-        self.default_memory = self.memory[kind]
         return self
 
     def set_comb_delay(
@@ -228,11 +330,12 @@ class Device:
         """An independent copy, so extending it does not mutate this device. The
         timing and IP objects are shared, never mutated."""
         d = Device(self.name)
-        d.memory = dict(self.memory)
-        d.default_memory = self.default_memory
         d.comb = dict(self.comb)
         d.resources = dict(self.resources)
         d.comb_uses = {k: dict(v) for k, v in self.comb_uses.items()}
+        d.storage = dict(self.storage)
+        d.default_storage = self.default_storage
+        d.stream_timing = self.stream_timing
         d.operators = list(self.operators)
         d.default_freq_mhz = self.default_freq_mhz
         return d
@@ -339,9 +442,9 @@ def inject_device(module, device: Device):
     from ..._mlir.ir import (
         ArrayAttr,
         Attribute,
+        FlatSymbolRefAttr,
         InsertionPoint,
         Location,
-        DictAttr,
         FloatAttr,
         IntegerAttr,
         F32Type,
@@ -349,44 +452,47 @@ def inject_device(module, device: Device):
     )
     from ..._mlir.dialects.allo import (
         DCPathCombOp,
+        DCPathDefaultStorageOp,
         DCPathDeviceOp,
         DCPathResourceOp,
+        DCPathStorageOp,
+        DCPathStreamTimingOp,
+        MemoryPortAttr,
     )
 
-    with module.context, Location.unknown():
+    with module.context as ctx, Location.unknown():
         f32ty = F32Type.get()
         i64 = IntegerType.get_signless(64)
 
-        def _timing(t) -> DictAttr:
-            return DictAttr.get(
-                {
-                    "rd_lat": IntegerAttr.get(i64, t.read_latency),
-                    "wr_lat": IntegerAttr.get(i64, t.write_latency),
-                    "rd_delay": FloatAttr.get(f32ty, t.read_delay_ns),
-                    "wr_delay": FloatAttr.get(f32ty, t.write_delay_ns),
-                }
+        def _uses(spent) -> ArrayAttr | None:
+            """``uses`` as a `#allo.res_use` array, or None when nothing is
+            declared: an undeclared cost spends nothing, it is not a zero."""
+            if not spent:
+                return None
+            return ArrayAttr.get(
+                [
+                    Attribute.parse(
+                        f"#allo.res_use<@{name}, "
+                        f"[{', '.join(c._mlir() for c in factors)}]>"
+                    )
+                    for name, factors in spent
+                ]
             )
 
-        memory = DictAttr.get(
-            {
-                t.kind.value: _timing(t)
-                for t in device.memory.values()
-                if t.kind is not MemoryKind.FIFO
+        def _timing(t) -> dict:
+            return {
+                "rd_latency": IntegerAttr.get(i64, t.read_latency),
+                "rd_delay": FloatAttr.get(f32ty, t.read_delay_ns),
+                "wr_latency": IntegerAttr.get(i64, t.write_latency),
+                "wr_delay": FloatAttr.get(f32ty, t.write_delay_ns),
             }
-        )
-        kwargs = {"memory": memory}
-        fifo = device.memory.get(MemoryKind.FIFO)
-        if fifo is not None:
-            kwargs["fifo"] = _timing(fifo)
-        if device.default_memory is not None:
-            kwargs["default_memory"] = device.default_memory.kind.value
+
         dev = DCPathDeviceOp(
             sym_name=device.name,
             ip=InsertionPoint.at_block_begin(module.body),
-            **kwargs,
         )
-        # The body declares what the device HAS and what it realizes natively,
-        # each a symbol the others refer to. One op to inject, one to erase.
+        # The body declares what the device HAS and what it can REALIZE, each a
+        # symbol the others refer to. One op to inject, one to erase.
         body = dev.regions[0].blocks.append()
         with InsertionPoint(body):
             for r in device.resources.values():
@@ -394,23 +500,27 @@ def inject_device(module, device: Device):
                     sym_name=r.name, capacity=IntegerAttr.get(i64, r.capacity)
                 )
             for kind, delay in device.comb.items():
-                uses = device.comb_uses.get(kind)
+                # A comb kind carries ONE parameter, its operand width, so each
+                # cost is a single factor.
+                comb_uses = (device.comb_uses.get(kind) or {}).items()
                 DCPathCombOp(
                     kind=kind,
                     delay=FloatAttr.get(f32ty, delay),
-                    uses=(
-                        ArrayAttr.get(
-                            [
-                                Attribute.parse(
-                                    f"#allo.res_use<@{name}, [{cost._mlir()}]>"
-                                )
-                                for name, cost in uses.items()
-                            ]
-                        )
-                        if uses
-                        else None
-                    ),
+                    uses=_uses([(name, (cost,)) for name, cost in comb_uses]),
                 )
+            for s in device.storage.values():
+                DCPathStorageOp(
+                    sym_name=s.name,
+                    ports=MemoryPortAttr.get(s.ports.value, ctx),
+                    uses=_uses(s.uses),
+                    **_timing(s),
+                )
+            if device.default_storage is not None:
+                DCPathDefaultStorageOp(
+                    storage=FlatSymbolRefAttr.get(device.default_storage)
+                )
+            if device.stream_timing is not None:
+                DCPathStreamTimingOp(**_timing(device.stream_timing))
 
 
 # --- built-in operators ----------------------------------------------------
@@ -515,12 +625,53 @@ def bf2f_l2(a: bf16) -> f32: ...
 
 # The built-in device: storage + native chaining tables + the operators above.
 builtin_device = Device("builtin")
-builtin_device.set_memory(MemoryKind.REG, 0, 1, 0.1, 0.1)
-builtin_device.set_memory(MemoryKind.LUTRAM, 1, 1, 0.5, 0.5)
-builtin_device.set_memory(MemoryKind.BRAM, 1, 1, 0.7, 0.7)
-builtin_device.set_memory(MemoryKind.URAM, 2, 1, 0.9, 0.9)
-builtin_device.set_memory(MemoryKind.FIFO, 1, 1, 0.5, 0.5)
-builtin_device.set_default_memory(MemoryKind.LUTRAM)
+# The storage realizations, under the names an `allo.bind.storage impl=`
+# resolves against. `register` is the one name the COMPILER also spells: a
+# complete partition scatters an array into flip-flops whatever else it would
+# have resolved to, so every device must declare a row under it. `srl` is a
+# shift register, a realization of its own that happens to spend LUTs.
+builtin_device.add_storage(
+    "register",
+    ports=Port.T2P,
+    read_latency=0,
+    write_latency=1,
+    read_delay_ns=0.1,
+    write_delay_ns=0.1,
+)
+_lutram = builtin_device.add_storage(
+    "lutram",
+    ports=Port.T2P,
+    read_latency=1,
+    write_latency=1,
+    read_delay_ns=0.5,
+    write_delay_ns=0.5,
+)
+builtin_device.add_storage(
+    "bram",
+    ports=Port.T2P,
+    read_latency=1,
+    write_latency=1,
+    read_delay_ns=0.7,
+    write_delay_ns=0.7,
+)
+builtin_device.add_storage(
+    "uram",
+    ports=Port.T2P,
+    read_latency=2,
+    write_latency=1,
+    read_delay_ns=0.9,
+    write_delay_ns=0.9,
+)
+builtin_device.add_storage(
+    "srl",
+    ports=Port.SINGLE,
+    read_latency=1,
+    write_latency=1,
+    read_delay_ns=0.5,
+    write_delay_ns=0.5,
+)
+builtin_device.set_default_storage(_lutram)
+builtin_device.set_stream_timing(1, 1, 0.5, 0.5)
 builtin_device.set_default_frequency(300.0)
 builtin_device.add_operators(
     fadd_l7,
@@ -557,11 +708,14 @@ builtin_device.set_comb_delay(CombKind.SHL, 0.5)
 builtin_device.set_comb_delay(CombKind.SHR, 0.5)
 builtin_device.set_comb_delay(CombKind.SELECT, 0.5)
 builtin_device.set_comb_delay(CombKind.INT_CAST, 0.3)
+# What the part has and what each row above spends of it, measured on xcu55c.
+declare_xcu55c_area(builtin_device)
 
 __ALL__ = [
     "Device",
-    "MemoryKind",
-    "MemoryTiming",
+    "Port",
+    "Storage",
+    "StreamTiming",
     "CombKind",
     "builtin_device",
     "inject_device",

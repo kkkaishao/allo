@@ -527,6 +527,80 @@ def DCPathCombOp : DCPath_Op<"dcp.comb",
   let hasVerifier = 1;
 }
 
+def DCPathStorageOp : DCPath_Op<"dcp.storage",
+    [Symbol, DeclareOpInterfaceMethods<SymbolUserOpInterface>,
+     HasParent<"DCPathDeviceOp">]> {
+  let summary = "A storage structure the device can hold an array in";
+  let description = [{
+    One buildable way to hold an array: a block RAM, a LUT RAM, a register file,
+    a shift register. A REALIZATION rather than a resource, which is the whole
+    reason this is a symbol and not an enum case: it has timing and ports, and
+    what it SPENDS is its `uses` (a block RAM spends `@bram36` tiles, a LUT RAM
+    spends `@lut`, a register file spends `@ff`). A part with different
+    primitives declares different symbols and nothing in the compiler has to
+    switch on the list.
+
+    An `allo.bind.storage impl=` names one of these; an array with no explicit
+    choice resolves to `dcp.default_storage`. `rd_latency`/`wr_latency` are the
+    cycles an access costs and `rd_delay`/`wr_delay` its combinational delay in
+    ns: the scheduler times every access against the row its array resolves to
+    and the emitter builds the ports at exactly those latencies, so the two
+    cannot drift.
+
+    `ports` is the PRIMITIVE's own topology. What an array is realized at still
+    comes from its own `allo.bind.storage type=`, so this is declared and not
+    yet read, the way `uses` is.
+
+    `uses` holds one `#allo.res_use` per resource. Storage carries TWO
+    parameters, `(depth, width)`, so a cost is either two factors or the single
+    `tiled` factor that reads the pair together.
+  }];
+  let arguments = (ins
+    SymbolNameAttr:$sym_name,
+    MemoryPortAttr:$ports,
+    I64Attr:$rd_latency, F32Attr:$rd_delay,
+    I64Attr:$wr_latency, F32Attr:$wr_delay,
+    OptionalAttr<ArrayAttr>:$uses);
+  let assemblyFormat = [{
+    $sym_name `ports` `=` $ports
+    `rd` `=` $rd_latency `,` $rd_delay
+    `wr` `=` $wr_latency `,` $wr_delay (`uses` $uses^)? attr-dict
+  }];
+  let hasVerifier = 1;
+}
+
+def DCPathDefaultStorageOp : DCPath_Op<"dcp.default_storage",
+    [DeclareOpInterfaceMethods<SymbolUserOpInterface>,
+     HasParent<"DCPathDeviceOp">]> {
+  let summary = "The storage an array with no explicit binding resolves to";
+  let description = [{
+    Names a `dcp.storage` of the same device. It is a symbol reference rather
+    than a string so that defaulting to something that is not storage at all (a
+    resource, an operator) is a verifier error instead of a row that silently
+    goes missing and leaves every unbound array on a built-in fallback.
+  }];
+  let arguments = (ins FlatSymbolRefAttr:$storage);
+  let assemblyFormat = "$storage attr-dict";
+}
+
+def DCPathStreamTimingOp : DCPath_Op<"dcp.stream_timing",
+    [HasParent<"DCPathDeviceOp">]> {
+  let summary = "Get/put timing of a stream channel";
+  let description = [{
+    A stream is a FIFO, not array storage: nothing chooses its implementation,
+    nothing binds its ports, and its area is a function of depth and width
+    alone. So it is one timing row on the device rather than a `dcp.storage`
+    a `bind.storage` could name. `rd` times a get, `wr` a put.
+  }];
+  let arguments = (ins
+    I64Attr:$rd_latency, F32Attr:$rd_delay,
+    I64Attr:$wr_latency, F32Attr:$wr_delay);
+  let assemblyFormat = [{
+    `rd` `=` $rd_latency `,` $rd_delay `wr` `=` $wr_latency `,` $wr_delay
+    attr-dict
+  }];
+}
+
 def DCPathDeviceOp : DCPath_Op<"dcp.device",
     [Symbol, SymbolTable, SingleBlock, NoTerminator]> {
   let summary = "The device technology tables (resources, combinational + storage timing)";
@@ -534,27 +608,20 @@ def DCPathDeviceOp : DCPath_Op<"dcp.device",
     The device model injected from Python before scheduling. The scheduler and
     reifier read it directly.
 
-    The body declares what the device HAS (`dcp.resource`) and what it realizes
-    natively (`dcp.comb`), each referring to the others by symbol so a
-    misspelled resource is a verifier error rather than an absent row. It is one
-    op to inject and one to erase, and its symbols are scoped to it.
+    The body declares what the device HAS (`dcp.resource`) and what it can
+    REALIZE (`dcp.comb`, `dcp.storage`), each referring to the others by symbol
+    so a misspelled resource is a verifier error rather than an absent row. It
+    is one op to inject and one to erase, and its symbols are scoped to it.
+    `dcp.default_storage` and `dcp.stream_timing` are the two whole-device
+    settings, at most one of each.
 
     `dcp.operator` stays at MODULE scope rather than moving in here: its symbol
     is referenced by program code (a `dcp.compute` names its IP) and reaches the
     emitted RTL through `operatorModuleName`, so it belongs to the program's
     symbol table. What lives here is the vocabulary only the device's own
     declarations use.
-
-    `memory` maps a storage implementation (`register`/`lutram`/`bram`/`uram`)
-    to its `{read_latency, write_latency, read_delay_ns, write_delay_ns}`;
-    `fifo` is the stream get/put timing; `default_memory` is the implementation
-    unbound on-chip arrays use.
   }];
-  let arguments = (ins
-    SymbolNameAttr:$sym_name,
-    DictionaryAttr:$memory,
-    OptionalAttr<DictionaryAttr>:$fifo,
-    OptionalAttr<StrAttr>:$default_memory);
+  let arguments = (ins SymbolNameAttr:$sym_name);
   let regions = (region SizedRegion<1>:$body);
   let assemblyFormat = "$sym_name attr-dict-with-keyword $body";
   let hasVerifier = 1;

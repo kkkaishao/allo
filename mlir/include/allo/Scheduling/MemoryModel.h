@@ -6,7 +6,7 @@
 #ifndef ALLO_SCHEDULING_MEMORYMODEL_H
 #define ALLO_SCHEDULING_MEMORYMODEL_H
 
-#include "allo/IR/AlloAttrs.h"         // MemoryImplEnum
+#include "allo/IR/AlloAttrs.h"         // MemoryPortEnum
 #include "allo/Scheduling/Scheduler.h" // OccupancyProblem
 
 #include "circt/Scheduling/Problems.h"
@@ -53,58 +53,60 @@ struct RWDelay {
   double write = 0.0;
 };
 
-/// Timing of one storage kind (a primitive implementation, or the FIFO):
-/// latency and delay, each split by direction.
+/// Timing of one storage realization (or of the stream FIFO): latency and
+/// delay, each split by direction.
 struct MemKindTiming {
   RWLatency latency;
   RWDelay delay;
 };
 
-/// One row of the `primitives:` table: the read/write timing of a storage
-/// implementation (register/LUTRAM/BRAM/URAM).
-struct MemPrimitive {
-  MemoryImplEnum impl;
+/// The one storage name the COMPILER spells rather than the device. A complete
+/// partition scatters an array into flip-flops whatever it would otherwise
+/// resolve to, so every device must declare a row under this name.
+inline constexpr llvm::StringLiteral kRegisterStorage = "register";
+
+/// One `dcp.storage` row: a structure the device can hold an array in, named by
+/// the device's own vocabulary rather than by a case of a closed enum.
+struct StorageRealization {
+  std::string name;
+  MemoryPortEnum ports = MemoryPortEnum::TrueDualPort;
   MemKindTiming timing;
 };
 
-/// The storage-timing library, filled from the `memory:` YAML section (absent
-/// -> zero).
+/// The storage-timing library, filled from the `dcp.storage`,
+/// `dcp.default_storage` and `dcp.stream_timing` rows of the device.
 class MemoryLibrary {
 public:
   struct Timing {
     unsigned latency = 0;
     double delay = 0.0;
-    // The accessed array's resolved storage implementation, EMPTY for an access
+    // The accessed array's resolved storage realization, EMPTY for an access
     // with no storage axis: a stream is a FIFO timed by its own row. Accesses
-    // of different implementations must map to *different* operator types, or
-    // they collapse onto one latency, so this keys the type.
-    std::optional<MemoryImplEnum> impl;
+    // of different realizations must map to *different* operator types, or they
+    // collapse onto one latency, so this keys the type.
+    std::string storage;
   };
   /// Timing for a memory/stream access op; zero latency and delay if \p op is
-  /// not one. An array access is timed by its memref's implementation.
+  /// not one. An array access is timed by its memref's storage realization.
   Timing timing(Operation *op) const;
 
-  /// The timing of storage implementation \p impl. The device is required to
-  /// declare every implementation an array resolves to, which `PreVerification`
+  /// The timing of storage realization \p storage. The device is required to
+  /// declare every realization an array resolves to, which `PreVerification`
   /// enforces; an undeclared one asserts here and falls to a zero
   /// (combinational) timing.
-  MemKindTiming timing(MemoryImplEnum impl) const;
+  MemKindTiming timing(llvm::StringRef storage) const;
 
-  /// The storage implementation an array access resolves to; EMPTY for a stream
-  /// or a non-access, neither of which has that axis. Unlike `timing`, does NOT
-  /// consult the primitive table, so a caller can diagnose an undeclared
-  /// implementation *before* it falls to zero timing.
-  std::optional<MemoryImplEnum> resolvedImpl(Operation *op) const;
-
-  /// Whether the device declares timing for \p impl. An array resolving to an
-  /// undeclared primitive would otherwise be scheduled at latency 0 and read
+  /// Whether the device declares \p storage. An array resolving to an
+  /// undeclared realization would otherwise be scheduled at latency 0 and read
   /// before its data is valid.
-  bool declares(MemoryImplEnum impl) const;
+  bool declares(llvm::StringRef storage) const;
 
-  MemoryImplEnum defaultImpl = MemoryImplEnum::LUTRAM; // unbound on-chip arrays
-  std::vector<MemPrimitive>
-      primitives;     // `memory: primitives:` (per-impl timing)
-  MemKindTiming fifo; // `memory: fifo:` (stream get & put)
+  // What an array with no `allo.bind.storage impl=` resolves to: the device's
+  // `dcp.default_storage`, or this fallback when it declares none. A name
+  // rather than a handle, so replacing a row does not leave it dangling.
+  std::string defaultStorage = "lutram";
+  std::vector<StorageRealization> storage; // the `dcp.storage` rows
+  MemKindTiming fifo;                      // `dcp.stream_timing`
 };
 
 //===----------------------------------------------------------------------===//
@@ -119,7 +121,7 @@ struct MemoryChar {
   bool readOnly = false;      // no write port needed (declared ROM, or by use)
   bool constantTable = false; // realized as a combinational constant array
   bool registers = false;     // complete partition -> scattered to registers
-  MemoryImplEnum impl = MemoryImplEnum::LUTRAM; // resolved storage primitive
+  std::string storage;        // resolved `dcp.storage` realization
 };
 
 /// The `memref.global` initializer behind \p memRef, i.e. a constant table's
@@ -142,11 +144,11 @@ std::optional<Attribute> globalInitOf(Value memRef);
 bool isConstantTable(Value memRef);
 
 /// Characterize a memref's storage shape from its partition/storage
-/// attributes, independent of any scheduling region. \p defaultImpl resolves an
-/// array with no explicit `allo.bind.storage impl=`; pass the device's
-/// `MemoryLibrary::defaultImpl`, or this disagrees with the implementation the
+/// attributes, independent of any scheduling region. \p defaultStorage resolves
+/// an array with no explicit `allo.bind.storage impl=`; pass the device's
+/// `MemoryLibrary::defaultStorage`, or this disagrees with the realization the
 /// access latencies were stamped from.
-MemoryChar characterize(Value memref, MemoryImplEnum defaultImpl);
+MemoryChar characterize(Value memref, llvm::StringRef defaultStorage);
 
 //===----------------------------------------------------------------------===//
 // Partition and static-bank queries. A DCP banking pass reuses these facts so

@@ -14,9 +14,10 @@ import pytest
 from allo import kernel
 from allo.lang import f32, i32, u8, index, Stateful, Stream
 from allo.schedule import Schedule
+from allo.schedule.errors import InvalidScheduleArgumentError
 from allo.backend.base import run_pipeline
 from allo.backend.rtl import Memory, RegisterFile
-from allo.backend.rtl.device import builtin_device, MemoryKind
+from allo.backend.rtl.device import builtin_device, Port, Tiled
 from allo.backend.rtl.schedule import RTL_PREPARE_PIPELINE
 
 sys.path.insert(0, os.path.dirname(__file__))
@@ -1276,6 +1277,101 @@ def test_initialized_array_handed_to_a_sub_kernel(child):
     assert np.array_equal(B, np.arange(1, 9, dtype=np.int32) + A8), list(B)
 
 
+# --- storage realizations the device declares -------------------------------
+
+
+# A storage realization is not a resource: a resource is a counter the compiler
+# adds up, and a realization is something the device BUILDS out of counters,
+# with timing of its own. That split is why the vocabulary is open, and an
+# `impl=` resolves against it BY NAME.
+def test_a_device_can_declare_a_storage_of_its_own():
+    def ii(read_latency):
+        @kernel
+        def mv(A: f32[8, 8], x: f32[8], out: f32[8]):
+            y: f32[8] = 0
+            for i in range(8):
+                for k in range(8):
+                    y[i] += A[i, k] * x[k]
+            for i in range(8):
+                out[i] = y[i]
+
+        dev = builtin_device.copy()
+        mram = dev.add_storage(
+            "mram",
+            ports=Port.T2P,
+            read_latency=read_latency,
+            write_latency=1,
+            read_delay_ns=0.5,
+            write_delay_ns=0.5,
+        )
+        s = mv.schedule()
+        s.bind_storage("y", impl=mram, mem_type=s.RAM_T2P)
+        res = s.export("rtl", device=dev, scalarize_threshold=0).schedule()
+        return max(r.ii for r in res.cyclic())
+
+    # A name the compiler has never heard of times the access all the same, and
+    # the memory-carried recurrence (read + add + write) grows with the read.
+    assert ii(2) - ii(1) == 1
+
+
+def test_binding_storage_to_a_resource_is_a_type_error():
+    # `@lut` is a counter, not a place an array can live. Resources and storage
+    # realizations being different types is what makes that a type error at the
+    # call rather than a name that fails to resolve at export.
+    @kernel
+    def k(A: i32[8], out: i32[8]):
+        for i in range(8):
+            out[i] = A[i] + 1
+
+    lut = builtin_device.resources["lut"]
+    s = k.schedule()
+    with pytest.raises(InvalidScheduleArgumentError):
+        s.bind_storage("A", impl=lut, mem_type=s.RAM_T2P)
+    with pytest.raises(TypeError):
+        builtin_device.copy().set_default_storage(lut)
+
+
+def test_an_undeclared_storage_is_reported():
+    # An `impl=` the device declares no row for would fall to zero timing and
+    # schedule combinationally, reading before the data is valid.
+    @kernel
+    def k(A: i32[8], out: i32[8]):
+        for i in range(8):
+            out[i] = A[i] + 1
+
+    dev = builtin_device.copy()
+    del dev.storage["uram"]
+    s = k.schedule()
+    s.bind_storage("A", impl=Schedule.URAM, mem_type=s.RAM_T2P)
+    with pytest.raises(Exception):
+        s.export("rtl", device=dev).schedule()
+
+
+def test_a_tiled_cost_prices_the_whole_shape():
+    # `tiled` is the one cost form reading the WHOLE parameter tuple: a block
+    # RAM tile holds 36864 bits however a depth-by-width array is cut, so the
+    # product sits inside the ceiling and does not separate into one factor per
+    # parameter the way every other form does.
+    @kernel
+    def k(A: i32[8], out: i32[8]):
+        for i in range(8):
+            out[i] = A[i] + 1
+
+    dev = builtin_device.copy()
+    dev.add_storage(
+        "bram",
+        ports=Port.T2P,
+        read_latency=1,
+        write_latency=1,
+        read_delay_ns=0.7,
+        write_delay_ns=0.7,
+        uses={dev.resources["bram36"]: Tiled(36864)},
+    )
+    text = _to_rtl(k, device=dev).dcp
+    assert "allo.dcp.storage @bram" in text
+    assert "@bram36" in text and "tiled" in text
+
+
 # --- multi-cycle access latency -------------------------------------------
 
 
@@ -1403,8 +1499,16 @@ def _dev(write_latency: int):
     """The built-in device with the default on-chip storage rebound to a
     ``write_latency``-cycle write."""
     d = builtin_device.copy()
-    d.set_memory(MemoryKind.LUTRAM, 1, write_latency, 0.5, 0.5)
-    d.set_default_memory(MemoryKind.LUTRAM)
+    d.set_default_storage(
+        d.add_storage(
+            "lutram",
+            ports=Port.T2P,
+            read_latency=1,
+            write_latency=write_latency,
+            read_delay_ns=0.5,
+            write_delay_ns=0.5,
+        )
+    )
     return d
 
 

@@ -79,26 +79,12 @@ def AssumeDepDirAttr : EnumAttr<Allo_Dialect, AssumeDepDirEnum, "dep_dir">;
 //===----------------------------------------------------------------------===//
 // Memory-model enums: the RTL backend's own storage vocabulary, decoupled from
 // the Vitis `bind_storage` pragma strings. A bridge util maps those pragma
-// strings (bram / ram_s2p / rom_1p / ...) onto these. The three axes are
-// orthogonal: implementation primitive, port topology, and read-only-ness.
+// strings (bram / ram_s2p / rom_1p / ...) onto these. Two axes are enums here,
+// port topology and read-only-ness, because the compiler switches
+// exhaustively on both. The third, WHICH STRUCTURE holds the array, is not an
+// enum at all: it is a `dcp.storage` realization the device declares, since a
+// part with different primitives has different names for them.
 //===----------------------------------------------------------------------===//
-
-// Every case is a REALIZABLE primitive. "Unbound" is not one of them: an array
-// with no `allo.bind.storage impl=` is an absent choice, carried as an empty
-// optional and resolved against the device's `default_memory`, and an access
-// with no storage axis at all (a stream) is likewise empty rather than a case
-// here.
-def MemImplRegister : I32EnumAttrCase<"Register", 1, "register">;
-def MemImplLUTRAM   : I32EnumAttrCase<"LUTRAM", 2, "lutram">;
-def MemImplBRAM     : I32EnumAttrCase<"BRAM", 3, "bram">;
-def MemImplURAM     : I32EnumAttrCase<"URAM", 4, "uram">;
-def MemoryImplEnum : I32EnumAttr<"MemoryImplEnum",
-    "Storage implementation primitive a memref is bound to",
-    [MemImplRegister, MemImplLUTRAM, MemImplBRAM, MemImplURAM]> {
-  let cppNamespace = "mlir::allo";
-  let genSpecializedAttr = 0;
-}
-def MemoryImplAttr : EnumAttr<Allo_Dialect, MemoryImplEnum, "mem_impl">;
 
 // Port topology: how many concurrent read/write ports, and whether reads and
 // writes contend. SinglePort = 1 shared R/W; SimpleDualPort = 1 read + 1 write
@@ -236,9 +222,15 @@ def CostStep      : I32EnumAttrCase<"Step",      3, "step">;
 // Measured point by point: coeffs is [p0, v0, p1, v1, ...] ascending in p, and
 // a parameter between two points takes the lower one's value.
 def CostTable     : I32EnumAttrCase<"Table",     4, "table">;
+// ceil(product of the WHOLE parameter tuple / coeffs[0]), the shape of a tiled
+// memory: a BRAM tile holds 36864 bits however the `depth x width` array is
+// cut, so the product sits inside the ceiling and does not separate into one
+// factor per parameter. The one form that breaks the rule above, which is why
+// it is a case rather than a linear over depth times a linear over width.
+def CostTiled     : I32EnumAttrCase<"Tiled",     5, "tiled">;
 def CostFormEnum : I32EnumAttr<"CostFormEnum",
     "Shape of a resource cost as a function of one parameter",
-    [CostConst, CostLinear, CostQuadratic, CostStep, CostTable]> {
+    [CostConst, CostLinear, CostQuadratic, CostStep, CostTable, CostTiled]> {
   let cppNamespace = "mlir::allo";
   let genSpecializedAttr = 0;
 }
@@ -263,7 +255,8 @@ def CostAttr : Allo_Attr<"Cost"> {
   let genVerifyDecl = 1;
   let extraClassDeclaration = [{
     /// This cost at \p param, UNROUNDED so a product of factors rounds once at
-    /// the end rather than once per factor.
+    /// the end rather than once per factor. Every form but `tiled`, which reads
+    /// the whole tuple and is evaluated by `evaluateResourceUse` itself.
     double evaluate(int64_t param) const;
   }];
 }
@@ -275,6 +268,9 @@ def ResourceUseAttr : Allo_Attr<"ResourceUse"> {
     `factors` holds one cost per parameter of the realization's kind, and the
     amount spent is their PRODUCT: factor `i` is evaluated at parameter `i`.
     A one-parameter kind carries one factor.
+
+    A `tiled` factor is the exception and stands alone whatever the kind's
+    arity, because it consumes the whole tuple at once.
   }];
   let parameters = (ins
     "mlir::SymbolRefAttr":$resource,

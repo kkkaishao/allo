@@ -26,8 +26,12 @@ namespace mlir::allo {
 ///
 /// \p uses is a `dcp.resource`-referencing `ResourceUseAttr` array, and
 /// \p params is the parameter tuple of the realization's kind (an operator's
-/// operand width; a multiplexer's fan-in and width). A null \p uses spends
-/// nothing, which is what an undeclared cost means.
+/// operand width; a multiplexer's fan-in and width; a storage's depth and
+/// width). A null \p uses spends nothing, which is what an undeclared cost
+/// means.
+///
+/// A lone `tiled` factor is the exception to the one-factor-per-parameter rule:
+/// it reads the whole tuple, since `ceil(depth*width/bits)` does not separate.
 llvm::SmallVector<std::pair<mlir::SymbolRefAttr, int64_t>>
 evaluateResourceUse(mlir::ArrayAttr uses, llvm::ArrayRef<int64_t> params);
 

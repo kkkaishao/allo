@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import re
 
-from allo.backend.rtl import RTL, ScheduleResult, MemoryKind, builtin_device
+from allo.backend.rtl import RTL, ScheduleResult, builtin_device
 
 
 # Operator latencies keyed by (kind, arg bit width), read off the built-in
@@ -23,8 +23,8 @@ FADD = FSUB = _LAT[("add", 32)]  # floating-point add/sub latency (cycles)
 FMUL = _LAT[("mul", 32)]  # floating-point multiply latency
 FDIV = _LAT[("div", 32)]  # floating-point divide latency
 IMUL = 0  # integer multiply is combinational (latency 0)
-MEM = builtin_device.memory[MemoryKind.LUTRAM].read_latency  # default read/write
-MEM_URAM = builtin_device.memory[MemoryKind.URAM].read_latency
+MEM = builtin_device.storage["lutram"].read_latency  # default read/write
+MEM_URAM = builtin_device.storage["uram"].read_latency
 
 # Combinational delay in ns by op kind, the table the chaining scheduler cuts
 # against, and the default clock it cuts to. A test that picks a clock to make a

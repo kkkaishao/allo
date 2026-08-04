@@ -155,7 +155,7 @@ MemId DatapathBuilder::getOrCreateMem(Value memref) {
   m.width = mt.getElementTypeBitWidth();
   // Banking / ports from the same storage model the scheduler binds against
   // (allo.part / allo.bind.storage).
-  auto mc = allo::characterize(memref, lib.memoryLibrary().defaultImpl);
+  auto mc = allo::characterize(memref, lib.memoryLibrary().defaultStorage);
   // An initialized global the kernel stores to needs a real write port, so it
   // is a ROM only if nothing writes it: `MemoryChar::constantTable`, the same
   // predicate the scheduler's port model bills against.
@@ -173,11 +173,12 @@ MemId DatapathBuilder::getOrCreateMem(Value memref) {
   assert(m.numBanks == std::max(1u, mc.numBanks) &&
          "the emitter's bank decomposition disagrees with the one the "
          "scheduler's port model was billed against");
-  m.impl = mc.impl;
-  // Access latency of the resolved primitive, from the same device table the
+  m.storage = mc.storage;
+  // Access latency of the resolved realization, from the same device rows the
   // scheduler timed this memref's accesses against (`MemoryLibrary::timing`).
-  // The emitter builds ports at these latencies; do not re-derive from `impl`.
-  auto mkt = lib.memoryLibrary().timing(m.impl);
+  // The emitter builds ports at these latencies; do not re-derive from the
+  // name.
+  auto mkt = lib.memoryLibrary().timing(m.storage);
   m.readLatency = mkt.latency.read;
   m.writeLatency = mkt.latency.write;
   assert(mt.hasStaticShape() &&

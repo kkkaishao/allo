@@ -6,7 +6,7 @@ from __future__ import annotations
 import functools
 import copy
 from collections.abc import Iterable, Sequence
-from typing import Literal, Generic, TypeVar, ParamSpec
+from typing import Literal, Generic, TypeVar, ParamSpec, TYPE_CHECKING
 from enum import Enum
 
 from ..lang.kernel import Kernel
@@ -52,6 +52,9 @@ from .._mlir.dialects.transform import allo as ta
 from .._mlir.dialects.transform import interpreter
 from ..logging import log_debug, text_tail
 
+if TYPE_CHECKING:
+    from ..backend.rtl.device import Storage
+
 
 def _within_context(method):
     """Run a schedule primitive under ``with self.context`` so upstream ODS attr
@@ -70,6 +73,10 @@ R = TypeVar("R")
 
 
 class BindStorageImpl(Enum):
+    """The storage realizations every Allo device declares, spelled for the
+    common case. A device's own `add_storage` handle is equally acceptable
+    wherever one of these is: both name a `dcp.storage` by symbol."""
+
     BRAM = "bram"
     LUTRAM = "lutram"
     URAM = "uram"
@@ -501,12 +508,24 @@ class Schedule(Generic[P, R]):
         self,
         targets: Targets,
         *,
-        impl: BindStorageImpl,
+        impl: BindStorageImpl | Storage,
         mem_type: BindStorageType,
     ) -> Schedule:
-        if not isinstance(impl, BindStorageImpl):
+        """Bind an array to a storage REALIZATION, by one of the standard names
+        or by a handle the device's ``add_storage`` returned. A
+        :class:`~allo.backend.rtl.device.Resource` is neither, so binding to one
+        is a type error rather than a name that fails to resolve at export."""
+        # Imported here: the RTL backend imports the schedule frontend.
+        from ..backend.rtl.device import Storage
+
+        if isinstance(impl, Storage):
+            name = impl.name
+        elif isinstance(impl, BindStorageImpl):
+            name = impl.value
+        else:
             raise InvalidScheduleArgumentError(
-                f"bind_storage impl must be one of {', '.join(e.name for e in BindStorageImpl)}, "
+                "bind_storage impl must be a device storage realization or one of "
+                f"{', '.join(e.name for e in BindStorageImpl)}, got {impl!r}"
             )
         if not isinstance(mem_type, BindStorageType):
             raise InvalidScheduleArgumentError(
@@ -516,7 +535,7 @@ class Schedule(Generic[P, R]):
         self.script.set_callsite_loc()
         for buf in buffers:
             handle = self.script.match_value(buf.owner_key, buf.number, buf.source)
-            ta.BindStorageOp(handle, mem_type.value, impl.value, **self.script.kw)
+            ta.BindStorageOp(handle, mem_type.value, name, **self.script.kw)
         self._mark_dirty()
         return self
 

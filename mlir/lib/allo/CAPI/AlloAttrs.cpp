@@ -96,7 +96,6 @@ MlirTypeID alloPartitionAttrGetTypeID(void) {
 
 ALLO_ENUM_ATTR_CAPI(AssumeDepType, AssumeDepTypeEnumAttr, AssumeDepTypeEnum)
 ALLO_ENUM_ATTR_CAPI(AssumeDepDir, AssumeDepDirEnumAttr, AssumeDepDirEnum)
-ALLO_ENUM_ATTR_CAPI(MemoryImpl, MemoryImplEnumAttr, MemoryImplEnum)
 ALLO_ENUM_ATTR_CAPI(MemoryPort, MemoryPortEnumAttr, MemoryPortEnum)
 ALLO_ENUM_ATTR_CAPI(MemoryKind, MemoryKindEnumAttr, MemoryKindEnum)
 ALLO_ENUM_ATTR_CAPI(Determinacy, DeterminacyEnumAttr, DeterminacyEnum)

@@ -6,7 +6,7 @@
 #ifndef ALLO_MICROARCH_DATAPATH_H
 #define ALLO_MICROARCH_DATAPATH_H
 
-#include "allo/IR/AlloAttrs.h"                // MemoryImplEnum
+#include "allo/IR/AlloAttrs.h"                // MemoryPortEnum
 #include "allo/IR/AlloOps.h"                  // dcp::DCPathModuleOp
 #include "allo/Scheduling/MemoryModel.h"      // BankLayout
 #include "allo/Scheduling/OperatorIdentity.h" // what one unit realizes
@@ -200,9 +200,9 @@ struct Register {
   unsigned ready = 0;
 };
 
-/// A memref-backed memory with banks and ports. The storage primitive (register
-/// / LUTRAM / BRAM / URAM) is resolved by the memory model; this model records
-/// it, but physical selection (address decode, per-primitive ports) is left to
+/// A memref-backed memory with banks and ports. Which `dcp.storage` the device
+/// realizes it in is resolved by the memory model; this model records the name,
+/// but physical selection (address decode, per-primitive ports) is left to
 /// lowering.
 struct MemUnit {
   MemId id = 0;
@@ -241,12 +241,12 @@ struct MemUnit {
   /// One per element, flat row-major, when `scattered`; composed by
   /// `enumerateBoundaryPorts`. Empty for every other memory.
   llvm::SmallVector<ElemPort> elemPorts;
-  MemoryImplEnum impl = MemoryImplEnum::LUTRAM; // resolved storage primitive
+  std::string storage; // resolved `dcp.storage` realization
 
-  // Access latency of `impl`, the same numbers the scheduler stamped onto this
-  // memref's `dcp.load`/`dcp.store` (asserted per access in `bindResource`).
-  // The consumer's register depth was solved as `tY - (start + readLatency)`,
-  // so ports must be built at exactly these latencies.
+  // Access latency of `storage`, the same numbers the scheduler stamped onto
+  // this memref's `dcp.load`/`dcp.store` (asserted per access in
+  // `bindResource`). The consumer's register depth was solved as `tY - (start +
+  // readLatency)`, so ports must be built at exactly these latencies.
   unsigned readLatency = 0;
   unsigned writeLatency = 1;
 

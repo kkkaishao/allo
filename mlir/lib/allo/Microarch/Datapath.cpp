@@ -637,7 +637,7 @@ void Datapath::dump(llvm::raw_ostream &os) const {
     printValueName(m.memref, os);
     os << (m.external ? " external" : " internal") << " w=" << m.width
        << " depth=" << m.depthWords << " banks=" << m.numBanks
-       << " impl=" << stringifyMemoryImplEnum(m.impl) << "\n";
+       << " storage=" << m.storage << "\n";
     for (const MemUnit::Access &acc : m.accesses) {
       os << "    " << (acc.isWrite ? "wr " : "rd ") << acc.op->getName()
          << " @r" << acc.region << " addr=";
