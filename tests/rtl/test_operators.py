@@ -16,6 +16,7 @@ from allo.lang import bf16, f32, i32
 from allo.lang.ip import ip, OperatorType
 from allo.operators import math as amath
 from allo.operators import arith as allo_arith
+from allo.backend.rtl import has_exact_scheduler
 from allo.backend.rtl.device import (
     builtin_device,
     CombKind,
@@ -601,6 +602,28 @@ def test_shared_multiply_mux():
         o = np.zeros(1, np.float32)
         mod.cosim(a, b, c, o)
         assert np.array_equal(o, ref)
+
+
+@pytest.mark.skipif(not has_exact_scheduler(), reason="build has no OR-Tools")
+def test_planned_allocation_is_never_looser_than_greedy():
+    # The exact scheduler decides how many copies of each operator a region
+    # builds and 'planned' builds exactly that. What it starts the search from
+    # is the tightest count its own schedule admits, which is the count the
+    # area-agnostic greedy binder would fold that schedule to, and what it falls
+    # back to when a solve runs out of budget. So the decided allocation can tie
+    # with greedy sharing and never lose to it, whatever the solver got through.
+    @kernel
+    def chain(A: f32[1], B: f32[1], C: f32[1], D: f32[1], o: f32[1]):
+        o[0] = A[0] * B[0] * C[0] * D[0]
+
+    args = [np.array([v], np.float32) for v in (7, 6, 5, 2)]
+    ref = np.array([7 * 6 * 5 * 2], np.float32)
+    greedy = _to_rtl(chain, binding="greedy-share")
+    planned = _to_rtl(chain, scheduler="exact", binding="planned")
+    assert planned.mlir.count("hw.instance") <= greedy.mlir.count("hw.instance")
+    o = np.zeros(1, np.float32)
+    planned.cosim(*args, o)
+    assert np.array_equal(o, ref)
 
 
 # If-conversion over both datapaths: an int compare lowers to native
