@@ -342,10 +342,14 @@ void Datapath::reportAllocation() const {
   }
 
   // Per array with more than one writer: its write ports, how many of them a
-  // call drives, how many REGIONS the writers are spread over, its geometry,
-  // and the write and total port counts the model demands.
+  // call drives and how many DISTINCT calls those come from, how many REGIONS
+  // the writers are spread over, its geometry, and the write and total port
+  // counts the model demands. The call count is what separates a port merge
+  // from a banking problem: several ports of ONE child are the child's own
+  // boundary, several children are genuinely concurrent writers.
   for (const MemUnit &m : mems) {
     llvm::SmallDenseSet<unsigned> regionsWriting;
+    llvm::SmallDenseSet<CallId> callsWriting;
     unsigned writes = 0, fromCalls = 0;
     Operation *anchor = nullptr;
     for (const MemUnit::Access &acc : m.accesses)
@@ -360,6 +364,7 @@ void Datapath::reportAllocation() const {
         if (ma.mem == m.id && ma.isWrite) {
           ++writes;
           ++fromCalls;
+          callsWriting.insert(cu.id);
           regionsWriting.insert(cu.region);
           if (!anchor)
             anchor = cu.invoke;
@@ -367,11 +372,11 @@ void Datapath::reportAllocation() const {
     if (writes < 2)
       continue;
     logging::info(logging::Stage::Emit, anchor)
-        << "Memory: " << writes << " write ports (" << fromCalls
-        << " from calls) on " << m.depthWords << "x" << m.width << " bits over "
-        << regionsWriting.size() << " regions, needs "
-        << portsNeeded(m.id, /*writesOnly=*/true) << " write "
-        << portsNeeded(m.id, /*writesOnly=*/false) << " total, "
+        << "Memory: " << writes << " write ports (" << fromCalls << " from "
+        << callsWriting.size() << " calls) on " << m.depthWords << "x"
+        << m.width << " bits over " << regionsWriting.size()
+        << " regions, needs " << portsNeeded(m.id, /*writesOnly=*/true)
+        << " write " << portsNeeded(m.id, /*writesOnly=*/false) << " total, "
         << (m.external ? "external" : "internal");
   }
 }
