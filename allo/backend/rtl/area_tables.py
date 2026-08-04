@@ -14,15 +14,11 @@ an N-bit AND is N LUT6s so it is linear, an adder adds a carry chain, a divider
 is quadratic. Where the shape is not structural, or is structural but has one
 user and a handful of interesting widths, the measurement itself is the table.
 
-Two places the declaration is coarser than ``area.py``'s arithmetic, both away
-from the widths that were measured:
-
-* A carry-chain count is ``ceil(w/8)`` there and ``0.125 * w`` rounded here.
-  They agree at every multiple of eight and differ at 9 bits by one CARRY8 out
-  of the part's 162,960.
-* A table holds the value of the last point at or below its argument, so a
-  width between two measured ones reads the lower row: a 48-bit barrel shift
-  is priced as the 32-bit one, and anything under 8 bits as the 8-bit one.
+One place the declaration is coarser than ``area.py``'s arithmetic, away from
+the widths that were measured: a table holds the value of the last point at or
+below its argument, so a width between two measured ones reads the lower row.
+A 48-bit barrel shift is priced as the 32-bit one, and anything under 8 bits as
+the 8-bit one.
 """
 
 from __future__ import annotations
@@ -63,7 +59,7 @@ def declare_xcu55c_area(device: "Device") -> None:
     """
     # Deferred so the two modules do not import each other at load time:
     # `device` imports this one, and the vocabulary below is its.
-    from .device import CombKind, Linear, Quadratic, Table
+    from .device import CombKind, Linear, Quadratic, Table, Tiled
 
     lut = device.add_resource("lut", CAPACITY["lut"])
     dsp = device.add_resource("dsp", CAPACITY["dsp"])
@@ -78,8 +74,10 @@ def declare_xcu55c_area(device: "Device") -> None:
     logic = {lut: Linear(1.0)}
     # An adder is that plus a carry chain, one CARRY8 per eight bits. A compare
     # keeps no sum and packs two bits per carry stage, so its chain is half.
-    addsub = {lut: Linear(1.0), carry8: Linear(0.125)}
-    compare = {lut: Linear(1.0), carry8: Linear(0.0625)}
+    # `Tiled` and not a linear coefficient: a carry chain is a CEILING, so an
+    # 9-bit adder takes two CARRY8s and `0.125 * 9` rounded takes one.
+    addsub = {lut: Linear(1.0), carry8: Tiled(8)}
+    compare = {lut: Linear(1.0), carry8: Tiled(16)}
     # A barrel shift is w*ceil(log4 w) LUTs, which is structural but has one
     # user, so it stays the four points it was measured at.
     shift = {lut: Table({8: 16, 16: 32, 32: 96, 64: 192})}
@@ -89,7 +87,7 @@ def declare_xcu55c_area(device: "Device") -> None:
     multiply = {
         lut: Table({8: 39, 16: 39, 32: 15, 64: 15}),
         dsp: Table({8: 0, 16: 1, 32: 3, 64: 10}),
-        carry8: Linear(0.0625),
+        carry8: Tiled(16),
     }
     # Measured 75/286/1086 LUTs at w=8/16/32: quadratic is the structure of the
     # restoring divider, 1.06 is the measurement.
