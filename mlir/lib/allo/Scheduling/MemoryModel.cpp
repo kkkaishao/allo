@@ -66,7 +66,7 @@ namespace {
 struct BindStorage {
   MemoryPortEnum port = MemoryPortEnum::TrueDualPort;
   MemoryKindEnum kind = MemoryKindEnum::RAM;
-  std::string storage; // empty: no explicit choice, not "no storage"
+  StringRef storage; // empty: no explicit choice, not "no storage"
 };
 } // namespace
 
@@ -97,7 +97,7 @@ static BindStorage parseBindStorage(DictionaryAttr bind) {
   // drift: a name the device does not declare is reported by `PreVerification`
   // against the array, which is where the user can act on it.
   if (auto im = bind.getAs<StringAttr>("impl"))
-    bs.storage = im.getValue().str();
+    bs.storage = im.getValue();
   return bs;
 }
 
@@ -141,7 +141,12 @@ static std::string resolveStorage(Value memRef, StringRef defaultStorage) {
     return kRegisterStorage.str();
   auto bs =
       parseBindStorage(carrierAttr<DictionaryAttr>(memRef, kBindStorageAttr));
-  return bs.storage.empty() ? defaultStorage.str() : bs.storage;
+  return (bs.storage.empty() ? defaultStorage : bs.storage).str();
+}
+
+StringRef allo::boundStorageOf(Value memRef) {
+  return parseBindStorage(carrierAttr<DictionaryAttr>(memRef, kBindStorageAttr))
+      .storage;
 }
 
 void MemoryBankModel::observe(Operation *op) {
@@ -683,9 +688,7 @@ MemoryChar allo::characterize(Value memref, StringRef defaultStorage) {
   c.constantTable = isConstantTable(memref);
   c.readOnly = bs.kind == MemoryKindEnum::ROM || c.constantTable;
   c.portsPerBank = portCount(bs.port);
-  BankLayout layout = bankLayoutOf(memref);
-  c.numBanks = layout.numBanks;
-  c.registers = layout.registers;
+  c.numBanks = bankLayoutOf(memref).numBanks;
   c.storage = resolveStorage(memref, defaultStorage);
   return c;
 }

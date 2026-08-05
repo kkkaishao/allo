@@ -286,7 +286,7 @@ static DenseSet<Value> boundaryArraysOf(func::FuncOp top) {
 static LogicalResult checkScatteredArgument(func::FuncOp func, Value array,
                                             MemoryChar &mc, bool isTop) {
   auto elements = cast<MemRefType>(array.getType()).getNumElements();
-  if (!mc.registers) {
+  if (!mc.registers()) {
     error(Stage::Prep, func)
         << "Argument array with a 0-cycle read cannot be realized; a boundary "
            "port is edge-triggered, so its datum arrives no earlier than the "
@@ -335,6 +335,18 @@ LogicalResult checkMemories(func::FuncOp func, const MemoryLibrary &memLib,
     StringRef storage = mc.storage;
     Operation *anchor =
         array.getDefiningOp() ? array.getDefiningOp() : func.getOperation();
+    // A complete partition resolves the array to registers whatever it was
+    // bound to, so the two directives disagreeing has one silent winner unless
+    // it is reported. Nothing else can make `registers()` true against an
+    // explicit choice.
+    StringRef bound = boundStorageOf(array);
+    if (mc.registers() && !bound.empty() && bound != kRegisterStorage) {
+      error(Stage::Prep, anchor)
+          << "Array " << array.getType() << " is bound to storage '" << bound
+          << "' and also completely partitioned, which scatters it into "
+             "registers; the two cannot both hold. Drop one of them";
+      return failure();
+    }
     // A realization the device never declared would fall to the zero-timing
     // default and schedule combinationally, reading before valid.
     if (!memLib.declares(storage)) {

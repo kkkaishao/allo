@@ -120,8 +120,12 @@ struct MemoryChar {
   unsigned portsPerBank = 2;  // concurrent ports per bank (from bind.storage)
   bool readOnly = false;      // no write port needed (declared ROM, or by use)
   bool constantTable = false; // realized as a combinational constant array
-  bool registers = false;     // complete partition -> scattered to registers
   std::string storage;        // resolved `dcp.storage` realization
+
+  /// Whether the array is scattered into flip-flops rather than held in an
+  /// addressed memory. A property of the RESOLVED realization, asked on that
+  /// one axis: a complete partition reaches it by resolving to `register`.
+  bool registers() const { return storage == kRegisterStorage; }
 };
 
 /// The `memref.global` initializer behind \p memRef, i.e. a constant table's
@@ -149,6 +153,12 @@ bool isConstantTable(Value memRef);
 /// `MemoryLibrary::defaultStorage`, or this disagrees with the realization the
 /// access latencies were stamped from.
 MemoryChar characterize(Value memref, llvm::StringRef defaultStorage);
+
+/// The `allo.bind.storage impl=` written on \p memref: what was ASKED for,
+/// before `characterize` resolves it, and empty when nothing was. A complete
+/// partition overrides an explicit choice, so this is what makes the two
+/// directives comparable and their disagreement reportable.
+llvm::StringRef boundStorageOf(Value memref);
 
 //===----------------------------------------------------------------------===//
 // Partition and static-bank queries. A DCP banking pass reuses these facts so

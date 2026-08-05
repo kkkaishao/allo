@@ -1347,6 +1347,31 @@ def test_an_undeclared_storage_is_reported():
         s.export("rtl", device=dev).schedule()
 
 
+def test_a_complete_partition_conflicting_with_a_bind_is_reported():
+    # Layout and realization are different axes, but a complete partition
+    # scatters the array into flip-flops whatever `impl=` asked for, so the two
+    # directives have one silent winner unless it is reported. Agreeing is not
+    # a conflict: `impl=` naming the register row states what the partition
+    # already implies.
+    @kernel
+    def k(A: i32[8], out: i32[8]):
+        for i in range(8):
+            out[i] = A[i] + 1
+
+    s = k.schedule()
+    s.partition("A", kind=s.Complete)
+    s.bind_storage("A", impl=Schedule.BRAM, mem_type=s.RAM_T2P)
+    with pytest.raises(Exception, match="completely partitioned"):
+        s.export("rtl").schedule()
+
+    agree = k.schedule()
+    agree.partition("A", kind=agree.Complete)
+    agree.bind_storage(
+        "A", impl=builtin_device.storage["register"], mem_type=agree.RAM_T2P
+    )
+    agree.export("rtl").schedule()
+
+
 def test_a_tiled_cost_prices_the_whole_shape():
     # `tiled` is the one cost form reading the WHOLE parameter tuple: a block
     # RAM tile holds 36864 bits however a depth-by-width array is cut, so the
