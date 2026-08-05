@@ -60,7 +60,11 @@ public:
   /// arrived: the latency of the operator type \p op is linked to. Every
   /// operation carries one, `populateOperatorTypes` having linked every
   /// operation the problem holds.
-  unsigned latencyOf(Operation *op);
+  ///
+  /// Signed, though the underlying latency is not: every caller composes it
+  /// into an expression that subtracts, and an `unsigned` one silently
+  /// evaluates `latencyOf(op) - 1` on a combinational operator as 2^32 - 1.
+  int64_t latencyOf(Operation *op);
 
   /// The schedule DEPTH of a SOLVED problem: the cycle by which every operation
   /// has completed. A REPORT only, since a span composes from the drain

@@ -448,7 +448,7 @@ LogicalResult mlir::allo::scheduleCPSAT(ChainingSharedOperatorsProblem &prob,
   // Horizon: the whole region laid out end to end (each op after the previous
   // one's end, its occupancy window, plus a spare cycle), wide enough that
   // every precedence, chain break and reservation is satisfiable.
-  unsigned horizon = 0;
+  int64_t horizon = 0;
   for (Operation *op : ops)
     horizon += prob.latencyOf(op) + prob.getResourceCycles(op) + 1;
 

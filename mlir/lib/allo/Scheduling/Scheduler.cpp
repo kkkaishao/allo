@@ -1870,7 +1870,7 @@ LogicalResult OccupancyProblem::checkLatency(Operation *op) {
   return Problem::checkLatency(op);
 }
 
-unsigned OccupancyProblem::latencyOf(Operation *op) {
+int64_t OccupancyProblem::latencyOf(Operation *op) {
   std::optional<OperatorType> opr = getLinkedOperatorType(op);
   assert(opr && "an operation the operator model never characterized");
   std::optional<unsigned> latency = getLatency(*opr);
