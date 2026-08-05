@@ -249,60 +249,58 @@ scheduledCallLatency(Operation *op) {
 // Operator model: apply a library to a scheduling problem.
 //===----------------------------------------------------------------------===//
 
-/// Assign an operator type (latency + delays) to every op reached by \p walkFn,
-/// sourced from \p lib. A `ChainingProblem` also receives incoming/outgoing
-/// delays; a scheduled sync call is a fixed-latency node.
-template <class ProblemT, class WalkFn>
-LogicalResult populateOperatorTypesImpl(ProblemT &problem, WalkFn walkFn,
-                                        const OperatorLibrary &lib) {
+/// Assign an operator type (latency + chaining delays) to every operation
+/// \p problem holds, sourced from \p lib. A scheduled sync call is a
+/// fixed-latency node between registered boundaries.
+///
+/// Over the problem's OWN operations and not a second walk of the IR: each
+/// builder registers every op it walks, and nothing runs between a build and
+/// this to change that set, so the problem is what holds the list.
+template <class ProblemT>
+void populateOperatorTypes(ProblemT &problem, const OperatorLibrary &lib) {
   using namespace circt::scheduling;
-  constexpr bool isChaining = std::is_base_of_v<ChainingProblem, ProblemT>;
-
-  walkFn([&](Operation *op) {
+  for (Operation *op : problem.getOperations()) {
     if (std::optional<std::pair<int64_t, std::string>> cl =
             scheduledCallLatency(op)) {
       Problem::OperatorType opr = problem.getOrInsertOperatorType(cl->second);
       problem.setLatency(opr, static_cast<unsigned>(cl->first));
-      if constexpr (isChaining) {
-        problem.setIncomingDelay(opr, 0.0); // registered boundary
-        problem.setOutgoingDelay(opr, 0.0);
-      }
+      problem.setIncomingDelay(opr, 0.0); // registered boundary
+      problem.setOutgoingDelay(opr, 0.0);
       problem.setLinkedOperatorType(op, opr);
-      return;
+      continue;
     }
     OperatorChar c = lib.lookup(op);
     Problem::OperatorType opr = problem.getOrInsertOperatorType(c.typeName);
     problem.setLatency(opr, c.latency);
-    if constexpr (isChaining) {
-      problem.setIncomingDelay(opr, c.inDelay);
-      problem.setOutgoingDelay(opr, c.outDelay);
-    }
+    problem.setIncomingDelay(opr, c.inDelay);
+    problem.setOutgoingDelay(opr, c.outDelay);
     problem.setLinkedOperatorType(op, opr);
-  });
-  return success();
+  }
 }
 
-/// Populate operator types for every op reachable from \p body (a loop body).
-template <class ProblemT>
-LogicalResult populateOperatorTypes(Block &body, ProblemT &problem,
-                                    const OperatorLibrary &lib) {
-  return populateOperatorTypesImpl(
-      problem, [&](auto handle) { body.walk(handle); }, lib);
-}
-
-/// Populate operator types over the (walked) top-level ops of a straight-line
-/// region.
-template <class ProblemT>
-LogicalResult populateOperatorTypes(ArrayRef<Operation *> ops,
-                                    ProblemT &problem,
-                                    const OperatorLibrary &lib) {
-  return populateOperatorTypesImpl(
-      problem,
-      [&](auto handle) {
-        for (Operation *top : ops)
-          top->walk(handle);
-      },
-      lib);
+/// Reserve a limit-1 resource, held for `latency + 1` cycles, for every sync
+/// sub-kernel call in a counted loop body: it is one child instance re-fired
+/// per iteration, not a pipelined operator, and the loop controller starts the
+/// next invocation on the previous one's `done` plus the cycle it takes to
+/// re-arm. Keyed per callsite, since distinct calls are distinct instances.
+///
+/// A straight-line region needs none: each of its callsites issues once, so
+/// there is no second invocation for an occupancy window to hold off.
+inline void populateCallOccupancy(ChainingModuloProblem &problem) {
+  using P = circt::scheduling::Problem;
+  unsigned idx = 0;
+  for (Operation *op : problem.getOperations()) {
+    std::optional<std::pair<int64_t, std::string>> cl =
+        scheduledCallLatency(op);
+    if (!cl)
+      continue;
+    P::ResourceType rsrc =
+        problem.getOrInsertResourceType(cl->second + "#" + std::to_string(idx));
+    problem.setLimit(rsrc, 1);
+    problem.setLinkedResourceTypes(op, SmallVector<P::ResourceType>{rsrc});
+    problem.setResourceCycles(op, cl->first + 1);
+    ++idx;
+  }
 }
 
 //===----------------------------------------------------------------------===//
@@ -330,94 +328,66 @@ LogicalResult populateOperatorTypes(ArrayRef<Operation *> ops,
 /// UPPER bound on the multiplexer, since two operations sharing a driver need
 /// no select between them and the emitter builds one only where the drivers
 /// differ.
-template <class ProblemT, class WalkFn>
-LogicalResult populateOperatorAllocationImpl(ProblemT &problem, WalkFn walkFn,
-                                             const OperatorLibrary &lib) {
+template <class ProblemT>
+void populateOperatorAllocation(ProblemT &problem, const OperatorLibrary &lib) {
   using namespace circt::scheduling;
-  if constexpr (!std::is_base_of_v<OccupancyProblem, ProblemT>) {
-    return success();
-  } else {
-    constexpr bool isCyclic = std::is_base_of_v<CyclicProblem, ProblemT>;
-    // One identity's operations, in walk order. Sorted keying, not insertion
-    // order, so two compiles declare the resources in the same order.
-    struct OperatorClass {
-      llvm::SmallVector<Operation *> ops;
-      unsigned occupancy = 1;
-      int64_t unitPrice = 0;
-      int64_t ports = 0;    // operand ports one instance multiplexes
-      int64_t portWidth = 0; // bits each of them carries
-    };
-    std::map<std::string, OperatorClass> byIdentity;
-    walkFn([&](Operation *op) {
-      OperatorChar c = lib.lookup(op);
-      if (!c.identity.realized() || c.identity.comb)
-        return;
-      // A non-pipelined unit is busy for its whole latency; a pipelined one
-      // contends only for its issue slot.
-      unsigned occ = c.pipelined ? 1 : std::max(1u, c.latency);
-      if (isCyclic && occ > 1)
-        return; // a count alone is not sufficient modulo the II
-      OperatorClass &cls = byIdentity[c.identity.key()];
-      cls.ops.push_back(op);
-      cls.occupancy = occ;
-      cls.unitPrice = c.price;
-      cls.ports = op->getNumOperands();
-      cls.portWidth = 0;
-      for (Type t : op->getOperandTypes())
-        if (t.isIntOrFloat())
-          cls.portWidth =
-              std::max<int64_t>(cls.portWidth, t.getIntOrFloatBitWidth());
-    });
-
-    for (auto &[key, cls] : byIdentity) {
-      if (cls.ops.size() < 2)
-        continue;
-      auto ceiling = static_cast<unsigned>(cls.ops.size());
-      llvm::SmallVector<int64_t> price(ceiling + 1, 0);
-      for (unsigned n = 1; n <= ceiling; ++n) {
-        // Round-robin, the rule `assignUnits` hands the operations out by:
-        // `ceiling % n` instances host one more than the rest.
-        unsigned busy = ceiling % n, share = ceiling / n;
-        price[n] = n * cls.unitPrice +
-                   cls.ports * (busy * lib.muxPrice(share + 1, cls.portWidth) +
-                                (n - busy) * lib.muxPrice(share, cls.portWidth));
-      }
-      Problem::ResourceType rsrc = problem.getOrInsertResourceType(key);
-      problem.setAllocatable(
-          rsrc, typename ProblemT::AllocatableUnit{ceiling, std::move(price)});
-      for (Operation *op : cls.ops) {
-        llvm::SmallVector<Problem::ResourceType> units;
-        if (auto linked = problem.getLinkedResourceTypes(op))
-          units.assign(linked->begin(), linked->end());
-        units.push_back(rsrc);
-        problem.setLinkedResourceTypes(op, units);
-        problem.setResourceCycles(op, cls.occupancy);
-      }
-    }
-    return success();
+  constexpr bool isCyclic = std::is_base_of_v<CyclicProblem, ProblemT>;
+  // One identity's operations, in problem order. Sorted keying, not insertion
+  // order, so two compiles declare the resources in the same order.
+  struct OperatorClass {
+    llvm::SmallVector<Operation *> ops;
+    unsigned occupancy = 1;
+    int64_t unitPrice = 0;
+    int64_t ports = 0;     // operand ports one instance multiplexes
+    int64_t portWidth = 0; // bits each of them carries
+  };
+  std::map<std::string, OperatorClass> byIdentity;
+  for (Operation *op : problem.getOperations()) {
+    OperatorChar c = lib.lookup(op);
+    if (!c.identity.realized() || c.identity.comb)
+      continue;
+    // A non-pipelined unit is busy for its whole latency; a pipelined one
+    // contends only for its issue slot.
+    unsigned occ = c.pipelined ? 1 : std::max(1u, c.latency);
+    if (isCyclic && occ > 1)
+      continue; // a count alone is not sufficient modulo the II
+    OperatorClass &cls = byIdentity[c.identity.key()];
+    cls.ops.push_back(op);
+    cls.occupancy = occ;
+    cls.unitPrice = c.price;
+    cls.ports = op->getNumOperands();
+    cls.portWidth = 0;
+    for (Type t : op->getOperandTypes())
+      if (t.isIntOrFloat())
+        cls.portWidth =
+            std::max<int64_t>(cls.portWidth, t.getIntOrFloatBitWidth());
   }
-}
 
-/// Populate the allocation model for every op reachable from \p body.
-template <class ProblemT>
-LogicalResult populateOperatorAllocation(Block &body, ProblemT &problem,
-                                         const OperatorLibrary &lib) {
-  return populateOperatorAllocationImpl(
-      problem, [&](auto handle) { body.walk(handle); }, lib);
-}
-
-/// The same over the (walked) top-level ops of a straight-line region.
-template <class ProblemT>
-LogicalResult populateOperatorAllocation(ArrayRef<Operation *> ops,
-                                         ProblemT &problem,
-                                         const OperatorLibrary &lib) {
-  return populateOperatorAllocationImpl(
-      problem,
-      [&](auto handle) {
-        for (Operation *top : ops)
-          top->walk(handle);
-      },
-      lib);
+  for (auto &[key, cls] : byIdentity) {
+    if (cls.ops.size() < 2)
+      continue;
+    auto ceiling = static_cast<unsigned>(cls.ops.size());
+    llvm::SmallVector<int64_t> price(ceiling + 1, 0);
+    for (unsigned n = 1; n <= ceiling; ++n) {
+      // Round-robin, the rule `assignUnits` hands the operations out by:
+      // `ceiling % n` instances host one more than the rest.
+      unsigned busy = ceiling % n, share = ceiling / n;
+      price[n] = n * cls.unitPrice +
+                 cls.ports * (busy * lib.muxPrice(share + 1, cls.portWidth) +
+                              (n - busy) * lib.muxPrice(share, cls.portWidth));
+    }
+    Problem::ResourceType rsrc = problem.getOrInsertResourceType(key);
+    problem.setAllocatable(
+        rsrc, typename ProblemT::AllocatableUnit{ceiling, std::move(price)});
+    for (Operation *op : cls.ops) {
+      llvm::SmallVector<Problem::ResourceType> units;
+      if (auto linked = problem.getLinkedResourceTypes(op))
+        units.assign(linked->begin(), linked->end());
+      units.push_back(rsrc);
+      problem.setLinkedResourceTypes(op, units);
+      problem.setResourceCycles(op, cls.occupancy);
+    }
+  }
 }
 
 } // namespace mlir::allo

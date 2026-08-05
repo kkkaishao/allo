@@ -410,28 +410,6 @@ static int64_t pipelineDirective(Operation *loop, Operation *anchor) {
   }
 }
 
-// Reserve a limit-1 resource, held for `latency + 1` cycles, for every sync
-// sub-kernel call in a loop body: it is one child instance re-fired per
-// iteration, not a pipelined operator, and the loop controller starts the next
-// invocation on the previous one's `done` plus the cycle it takes to re-arm.
-// Keyed per callsite, since distinct calls are distinct instances.
-static void populateCallOccupancy(Block &body, ChainingModuloProblem &problem) {
-  using P = circt::scheduling::Problem;
-  unsigned idx = 0;
-  for (Operation &op : body) {
-    std::optional<std::pair<int64_t, std::string>> cl =
-        scheduledCallLatency(&op);
-    if (!cl)
-      continue;
-    P::ResourceType rsrc =
-        problem.getOrInsertResourceType(cl->second + "#" + std::to_string(idx));
-    problem.setLimit(rsrc, 1);
-    problem.setLinkedResourceTypes(&op, SmallVector<P::ResourceType>{rsrc});
-    problem.setResourceCycles(&op, cl->first + 1);
-    ++idx;
-  }
-}
-
 // A steady-clock stopwatch for timing one solve.
 using Stopwatch = std::chrono::steady_clock::time_point;
 static Stopwatch now() { return std::chrono::steady_clock::now(); }
@@ -481,15 +459,12 @@ scheduleCyclic(LoopLikeOpInterface body, DependenceAnalysis &deps,
                bool pipelined, const SchedulerOptions &opts) {
   auto problem = buildCyclicProblem<ChainingModuloProblem>(body, deps);
   Block *bodyBlock = &body.getLoopRegions().front()->front();
-  if (failed(populateOperatorTypes(*bodyBlock, problem, lib)))
-    return failure();
+  populateOperatorTypes(problem, lib);
   reportOperatorClassSplit(problem, lib);
-  if (failed(populateMemoryResources(*bodyBlock, problem)))
-    return failure();
-  if (opts.allocate &&
-      failed(populateOperatorAllocation(*bodyBlock, problem, lib)))
-    return failure();
-  populateCallOccupancy(*bodyBlock, problem);
+  populateMemoryResources(problem);
+  if (opts.allocate)
+    populateOperatorAllocation(problem, lib);
+  populateCallOccupancy(problem);
   Operation *anchor = bodyBlock->getTerminator();
   bool isBound = false;
   std::optional<int64_t> trip = regionTrip(region.anchor(), deps, isBound);
@@ -565,21 +540,9 @@ static LogicalResult scheduleWhile(scf::WhileOp w, DependenceAnalysis &deps,
                                    const SchedRegion &region, float cycleTime,
                                    const SchedulerOptions &opts) {
   auto problem = buildWhileProblem<ChainingModuloProblem>(w, deps);
-  // Operator types over both regions in one memory-bank analysis.
-  if (failed(populateOperatorTypesImpl(
-          problem,
-          [&](auto handle) {
-            w.getBefore().walk(handle);
-            w.getAfter().walk(handle);
-          },
-          lib)))
-    return failure();
+  populateOperatorTypes(problem, lib);
   reportOperatorClassSplit(problem, lib);
-  if (failed(populateMemoryResourcesImpl(problem, [&](auto handle) {
-        w.getBefore().walk(handle);
-        w.getAfter().walk(handle);
-      })))
-    return failure();
+  populateMemoryResources(problem);
   Operation *anchor = w.getYieldOp().getOperation();
   // Honor a requested target II (>=1) as a lower bound. `ii=-1` (pipelining
   // off) is not modeled for while loops.
@@ -622,13 +585,11 @@ static LogicalResult scheduleAcyclic(ArrayRef<Operation *> ops,
                                      const SchedulerOptions &opts) {
   ChainingSharedOperatorsProblem problem =
       buildAcyclicProblem<ChainingSharedOperatorsProblem>(ops, deps);
-  if (failed(populateOperatorTypes(ops, problem, lib)))
-    return failure();
+  populateOperatorTypes(problem, lib);
   reportOperatorClassSplit(problem, lib);
-  if (failed(populateMemoryResources(ops, problem)))
-    return failure();
-  if (opts.allocate && failed(populateOperatorAllocation(ops, problem, lib)))
-    return failure();
+  populateMemoryResources(problem);
+  if (opts.allocate)
+    populateOperatorAllocation(problem, lib);
   // A straight-line region runs once, so its whole cost is its drain, and it
   // carries nothing between iterations it does not have.
   SmallVector<DrainTerm> outputs = drainTerms(problem, spanEscapingValues(ops));

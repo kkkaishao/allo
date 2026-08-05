@@ -407,51 +407,30 @@ namespace mlir::allo {
 // problem, the storage twin of `populateOperatorTypes`.
 //===----------------------------------------------------------------------===//
 
-/// Assign per-memref memory-port resources to every memory access reached by
-/// \p walkFn. A port is a one-cycle reservation whatever its latency
-/// (`getResourceCycles`'s default), so no occupancy window is set. Only an
-/// `OccupancyProblem` carries limited resources; any other problem type is a
-/// no-op.
-template <class ProblemT, class WalkFn>
-LogicalResult populateMemoryResourcesImpl(ProblemT &problem, WalkFn walkFn) {
+/// Assign per-memref memory-port resources to every memory access \p problem
+/// holds. A port is a one-cycle reservation whatever its latency
+/// (`getResourceCycles`'s default), so no occupancy window is set.
+///
+/// Two passes over the same operations: the bank model has to see every access
+/// of an array before it can say what one of them holds.
+template <class ProblemT>
+void populateMemoryResources(ProblemT &problem) {
   using namespace circt::scheduling;
-  if constexpr (!std::is_base_of_v<OccupancyProblem, ProblemT>) {
-    return success();
-  } else {
-    MemoryBankModel banks;
-    walkFn([&](Operation *op) { banks.observe(op); });
-    banks.finalize();
-    walkFn([&](Operation *op) {
-      SmallVector<Problem::ResourceType> units;
-      for (auto &[key, limit] : banks.resources(op)) {
-        Problem::ResourceType rsrc = problem.getOrInsertResourceType(key);
-        problem.setLimit(rsrc, limit);
-        units.push_back(rsrc);
-      }
-      if (units.empty()) // non-memory, or storage with no port to contend for
-        return;
-      problem.setLinkedResourceTypes(op, units);
-    });
-    return success();
+  MemoryBankModel banks;
+  for (Operation *op : problem.getOperations())
+    banks.observe(op);
+  banks.finalize();
+  for (Operation *op : problem.getOperations()) {
+    SmallVector<Problem::ResourceType> units;
+    for (auto &[key, limit] : banks.resources(op)) {
+      Problem::ResourceType rsrc = problem.getOrInsertResourceType(key);
+      problem.setLimit(rsrc, limit);
+      units.push_back(rsrc);
+    }
+    if (units.empty()) // non-memory, or storage with no port to contend for
+      continue;
+    problem.setLinkedResourceTypes(op, units);
   }
-}
-
-/// Populate memory-port resources for every access reachable from \p body.
-template <class ProblemT>
-LogicalResult populateMemoryResources(Block &body, ProblemT &problem) {
-  return populateMemoryResourcesImpl(problem,
-                                     [&](auto handle) { body.walk(handle); });
-}
-
-/// Populate memory-port resources over the (walked) top-level ops of a
-/// straight-line region.
-template <class ProblemT>
-LogicalResult populateMemoryResources(ArrayRef<Operation *> ops,
-                                      ProblemT &problem) {
-  return populateMemoryResourcesImpl(problem, [&](auto handle) {
-    for (Operation *top : ops)
-      top->walk(handle);
-  });
 }
 
 } // namespace mlir::allo
