@@ -191,7 +191,15 @@ SpanNode mlir::allo::dcpSpanNode(Operation *op, bool topLevel) {
     n.children = dcpSpanNodes(op->getRegion(0).front(), /*topLevel=*/false);
     return n;
   }
-  n.drain = asInt64(region.getDrain());
+  // `drainTerms` prices a call into the drain from its CONTRACT, so a leaf
+  // holding one without has no static span: its terminal cycle is a `done`.
+  // Only an ACYCLIC leaf holds a call at all, a cyclic one being a `CallNode`.
+  bool waitsOnADone = false;
+  for (Operation &inner : op->getRegion(0).front())
+    if (auto inv = dyn_cast<DCPathInstanceOp>(&inner))
+      waitsOnADone |= !inv.getLatency();
+  if (!waitsOnADone)
+    n.drain = asInt64(region.getDrain());
   if (isa<DCPathSequentialOp>(op)) {
     n.acyclic = true;
     n.trip = 1;

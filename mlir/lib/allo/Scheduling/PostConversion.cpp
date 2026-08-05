@@ -604,8 +604,13 @@ static void checkLatencyBound(DCPathModuleOp mod, std::optional<int64_t> dcpLat,
 static void setDcpLatencies(DCPathModuleOp mod) {
   mod.walk([&](DCPathRegionOpInterface region) {
     RegionTiming t = dcpRegionTiming(region);
+    // Total, so a region with no static span is not left carrying whatever
+    // `RegionAttrs` guessed before the region existed. An assume-bounded one is
+    // the exception: `dcpSpanNode` reads that back as its `assumedSpan`.
     if (t.staticLatency)
       region.setLatency(static_cast<uint64_t>(*t.staticLatency));
+    else if (!region.getLatencyBound())
+      region.setLatency(std::nullopt);
     region.setDeterminacy(t.determinacy);
   });
 

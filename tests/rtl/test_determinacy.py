@@ -335,13 +335,11 @@ def test_a_determinate_call_still_shares_its_span():
     assert len(_regions(_to_rtl(ic_det))) == 1
 
 
-# What the isolated region declares for itself. A call with no contract is
-# priced at latency zero, so the only static statement its region can make is
-# that the call occupies the cycle it issues in: drain 0, and a `done` one
-# cycle later. Charging it `latency - 1` cycles underflowed that zero into 2^32
-# and put the same number in the region's declared span, where it also made the
-# exact scheduler's drain bound narrower than the term it bounds and CP-SAT
-# called the region infeasible.
+# Where the isolated region's own drain lands. A call with no contract is
+# priced at latency zero, so the only static statement left is that the call
+# occupies the cycle it issues in. Charging it `latency - 1` cycles underflowed
+# that zero into 2^32, which made the exact scheduler's drain bound narrower
+# than the term it bounds and CP-SAT called the region infeasible.
 @pytest.mark.parametrize(
     "scheduler", ["heuristic"] + (["exact"] if has_exact_scheduler() else [])
 )
@@ -351,7 +349,38 @@ def test_an_indeterminate_calls_region_drains_at_its_own_start(scheduler):
         ic_sum_out(A, B)
 
     (region,) = _regions(_to_rtl(ic_drain, scheduler=scheduler))
-    assert (region.drain, region.latency) == (0, 1)
+    assert region.drain == 0
+
+
+# That drain is not a SPAN. A leaf's drain prices a call from its contract, so
+# a child without one leaves the region completing on a `done` no number names,
+# and a container around it inherits that rather than multiplying a fiction by
+# its trip. The sibling is the control: a region that does have a span keeps it.
+@needs_verilator
+def test_a_region_holding_an_indeterminate_call_declares_no_span():
+    @kernel
+    def ic_nospan(A: i32[8], B: i32[1], C: i32[4]):
+        for i in range(4):
+            ic_sum_out(A, B)
+            C[i] = B[0] + 1
+
+    rtl = _to_rtl(ic_nospan)
+    top = rtl.schedule().func("ic_nospan")
+    (container,) = [r for r in top.regions if r.container]
+    assert (container.determinacy, container.latency, container.ii) == (
+        "indeterminate",
+        None,
+        None,
+    )
+    held, sibling = [r for r in top.regions if not r.container]
+    assert (held.determinacy, held.latency) == ("indeterminate", None)
+    assert sibling.determinacy == "counted_static" and sibling.latency
+
+    # The done-paced container is the point: every pass must wait out a child
+    # whose length the data decides, not re-fire on a counted cadence.
+    B, C = np.zeros(1, np.int32), np.zeros(4, np.int32)
+    rtl.cosim(A_RUN, B, C)
+    assert B[0] == RUN_SUM and np.array_equal(C, [RUN_SUM + 1] * 4), (list(B), list(C))
 
 
 # Isolation adds a region, not an ordering: a sibling that shares nothing
