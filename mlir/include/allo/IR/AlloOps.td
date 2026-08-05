@@ -557,11 +557,15 @@ def DCPathStorageOp : DCPath_Op<"dcp.storage",
     switch on the list.
 
     An `allo.bind.storage impl=` names one of these; an array with no explicit
-    choice resolves to `dcp.default_storage`. `rd_latency`/`wr_latency` are the
-    cycles an access costs and `rd_delay`/`wr_delay` its combinational delay in
-    ns: the scheduler times every access against the row its array resolves to
-    and the emitter builds the ports at exactly those latencies, so the two
-    cannot drift.
+    choice resolves to the row marked `default`, of which a device declares at
+    most one. That mark is a field rather than an op of its own because it is
+    one bit about THIS row, and as a field it cannot be written on something
+    that is not a storage at all.
+
+    `rd_latency`/`wr_latency` are the cycles an access costs and
+    `rd_delay`/`wr_delay` its combinational delay in ns: the scheduler times
+    every access against the row its array resolves to and the emitter builds
+    the ports at exactly those latencies, so the two cannot drift.
 
     `ports` is the PRIMITIVE's own topology. What an array is realized at still
     comes from its own `allo.bind.storage type=`, so this is declared and not
@@ -574,12 +578,13 @@ def DCPathStorageOp : DCPath_Op<"dcp.storage",
   }];
   let arguments = (ins
     SymbolNameAttr:$sym_name,
+    UnitAttr:$is_default,
     MemoryPortAttr:$ports,
     I64Attr:$rd_latency, F32Attr:$rd_delay,
     I64Attr:$wr_latency, F32Attr:$wr_delay,
     OptionalAttr<ArrayAttr>:$uses);
   let assemblyFormat = [{
-    $sym_name `ports` `=` $ports
+    $sym_name (`default` $is_default^)? `ports` `=` $ports
     `rd` `=` $rd_latency `,` $rd_delay
     `wr` `=` $wr_latency `,` $wr_delay (`uses` $uses^)? attr-dict
   }];
@@ -625,20 +630,6 @@ def DCPathChainOp : DCPath_Op<"dcp.chain",
   let hasVerifier = 1;
 }
 
-def DCPathDefaultStorageOp : DCPath_Op<"dcp.default_storage",
-    [DeclareOpInterfaceMethods<SymbolUserOpInterface>,
-     HasParent<"DCPathDeviceOp">]> {
-  let summary = "The storage an array with no explicit binding resolves to";
-  let description = [{
-    Names a `dcp.storage` of the same device. It is a symbol reference rather
-    than a string so that defaulting to something that is not storage at all (a
-    resource, an operator) is a verifier error instead of a row that silently
-    goes missing and leaves every unbound array on a built-in fallback.
-  }];
-  let arguments = (ins FlatSymbolRefAttr:$storage);
-  let assemblyFormat = "$storage attr-dict";
-}
-
 def DCPathStreamTimingOp : DCPath_Op<"dcp.stream_timing",
     [HasParent<"DCPathDeviceOp">]> {
   let summary = "Get/put timing of a stream channel";
@@ -668,8 +659,9 @@ def DCPathDeviceOp : DCPath_Op<"dcp.device",
     REALIZE (`dcp.comb`, `dcp.storage`, `dcp.mux`, `dcp.chain`), each referring
     to the others by symbol so a misspelled resource is a verifier error rather
     than an absent row. It is one op to inject and one to erase, and its symbols
-    are scoped to it. `dcp.default_storage`, `dcp.stream_timing`, `dcp.mux` and
-    `dcp.chain` are the whole-device rows, at most one of each.
+    are scoped to it. `dcp.stream_timing`, `dcp.mux` and `dcp.chain` are the
+    whole-device rows, at most one of each, as is the `dcp.storage` marked
+    `default`.
 
     `dcp.operator` stays at MODULE scope rather than moving in here: its symbol
     is referenced by program code (a `dcp.compute` names its IP) and reaches the

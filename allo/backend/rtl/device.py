@@ -592,7 +592,6 @@ def inject_device(module, device: Device):
     override the built-in library defaults. Target frequency is not injected: it
     is a per-run scheduling parameter, not technology data."""
     from ..._mlir.ir import (
-        FlatSymbolRefAttr,
         InsertionPoint,
         Location,
         FloatAttr,
@@ -603,7 +602,6 @@ def inject_device(module, device: Device):
     from ..._mlir.dialects.allo import (
         DCPathChainOp,
         DCPathCombOp,
-        DCPathDefaultStorageOp,
         DCPathDeviceOp,
         DCPathMuxOp,
         DCPathResourceOp,
@@ -645,6 +643,7 @@ def inject_device(module, device: Device):
             for s in device.storage.values():
                 DCPathStorageOp(
                     sym_name=s.name,
+                    is_default=s.name == device.default_storage,
                     ports=MemoryPortAttr.get(s.ports.value, ctx),
                     uses=_uses_attr(s.uses),
                     **_timing(s),
@@ -653,10 +652,6 @@ def inject_device(module, device: Device):
                 DCPathMuxOp(uses=_uses_attr(device.mux_uses))
             if device.chain_uses:
                 DCPathChainOp(uses=_uses_attr(device.chain_uses))
-            if device.default_storage is not None:
-                DCPathDefaultStorageOp(
-                    storage=FlatSymbolRefAttr.get(device.default_storage)
-                )
             if device.stream_timing is not None:
                 DCPathStreamTimingOp(**_timing(device.stream_timing))
 

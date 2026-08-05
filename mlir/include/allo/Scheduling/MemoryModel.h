@@ -73,8 +73,8 @@ struct StorageRealization {
   MemKindTiming timing;
 };
 
-/// The storage-timing library, filled from the `dcp.storage`,
-/// `dcp.default_storage` and `dcp.stream_timing` rows of the device.
+/// The storage-timing library, filled from the `dcp.storage` and
+/// `dcp.stream_timing` rows of the device.
 class MemoryLibrary {
 public:
   struct Timing {
@@ -102,7 +102,7 @@ public:
   bool declares(llvm::StringRef storage) const;
 
   // What an array with no `allo.bind.storage impl=` resolves to: the device's
-  // `dcp.default_storage`, or this fallback when it declares none. A name
+  // `dcp.storage` marked `default`, or this fallback when it marks none. A name
   // rather than a handle, so replacing a row does not leave it dangling.
   std::string defaultStorage = "lutram";
   std::vector<StorageRealization> storage; // the `dcp.storage` rows

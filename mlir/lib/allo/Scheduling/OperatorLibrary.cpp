@@ -306,12 +306,13 @@ MemoryLibrary memoryFromDevice(dcp::DCPathDeviceOp device) {
     return t;
   };
   Block &body = device.getBody().front();
-  for (auto s : body.getOps<dcp::DCPathStorageOp>())
+  for (auto s : body.getOps<dcp::DCPathStorageOp>()) {
     m.storage.push_back({s.getSymName().str(), s.getPorts(), timing(s)});
+    if (s.getIsDefault())
+      m.defaultStorage = s.getSymName().str();
+  }
   for (auto st : body.getOps<dcp::DCPathStreamTimingOp>())
     m.fifo = timing(st);
-  for (auto def : body.getOps<dcp::DCPathDefaultStorageOp>())
-    m.defaultStorage = def.getStorage().str();
   return m;
 }
 
