@@ -71,32 +71,6 @@ static SmallVector<LoopLikeOpInterface> perfectNest(LoopLikeOpInterface root) {
   return nest;
 }
 
-// The operator latency the problem gave \p op: cycles between issue and the
-// result landing, zero for a combinational op.
-static int64_t solvedLatency(circt::scheduling::Problem &problem,
-                             Operation *op) {
-  if (std::optional<circt::scheduling::Problem::OperatorType> opr =
-          problem.getLinkedOperatorType(op))
-    return problem.getLatency(*opr).value_or(0);
-  return 0;
-}
-
-// The schedule depth of a solved problem: the cycle by which every op has
-// completed. A report only: a span is composed from `drain` instead, which the
-// solver may leave below the depth.
-//
-// A combinational op still occupies its cycle, hence the floor of one here
-// (not in `solvedLatency`).
-static int64_t scheduleDepth(circt::scheduling::Problem &problem) {
-  int64_t depth = 1;
-  for (Operation *op : problem.getOperations())
-    if (std::optional<unsigned> start = problem.getStartTime(op))
-      depth =
-          std::max(depth, static_cast<int64_t>(*start) +
-                              std::max<int64_t>(1, solvedLatency(problem, op)));
-  return depth;
-}
-
 // The region's outputs, as the terms whose max is its terminal cycle: how long
 // after its last issue pulse the deepest output commits. Left as separate terms
 // so the exact scheduler can bound a variable by each one and minimize the
@@ -111,12 +85,12 @@ static int64_t scheduleDepth(circt::scheduling::Problem &problem) {
 // \p results are the values escaping the region. One only forwarded (a block
 // argument, an earlier region's survivor, or a declaration) charges nothing: it
 // is settled before the region starts or binds no hardware to wait on.
-static SmallVector<DrainTerm> drainTerms(circt::scheduling::Problem &problem,
+static SmallVector<DrainTerm> drainTerms(OccupancyProblem &problem,
                                          ValueRange results) {
   SmallVector<DrainTerm> terms;
   for (Operation *op : problem.getOperations()) {
     if (isa<AffineStoreOp, memref::StoreOp>(op) || isSyncSubKernelCall(op))
-      terms.push_back({op, solvedLatency(problem, op) - 1});
+      terms.push_back({op, problem.latencyOf(op) - 1});
     else if (isa<StreamPutOp>(op))
       terms.push_back({op, 0});
   }
@@ -128,7 +102,7 @@ static SmallVector<DrainTerm> drainTerms(circt::scheduling::Problem &problem,
     if (!def || isDeclarationOp(def) || isSyncSubKernelCall(def) ||
         !problem.hasOperation(def))
       continue;
-    terms.push_back({def, solvedLatency(problem, def)});
+    terms.push_back({def, problem.latencyOf(def)});
   }
   return terms;
 }
@@ -162,7 +136,7 @@ static int64_t registerWidth(Type type) {
 // induction variable are its iter_args, or null where there is no such
 // recurrence to price (a straight-line span, a `while`).
 static SmallVector<RegisterTerm>
-registerTerms(circt::scheduling::Problem &problem, Block *carried) {
+registerTerms(OccupancyProblem &problem, Block *carried) {
   SmallVector<RegisterTerm> terms;
   DenseMap<Value, unsigned> slotOf;
   auto readBy = [&](Value v, Operation *def, Operation *reader,
@@ -172,7 +146,7 @@ registerTerms(circt::scheduling::Problem &problem, Block *carried) {
       return;
     auto [slot, isNew] = slotOf.try_emplace(v, terms.size());
     if (isNew)
-      terms.push_back({def, solvedLatency(problem, def), width, {}});
+      terms.push_back({def, problem.latencyOf(def), width, {}});
     terms[slot->second].reads.push_back({reader, distance});
   };
 
@@ -370,7 +344,8 @@ static SmallVector<Value> spanEscapingValues(ArrayRef<Operation *> ops) {
 /// start cycle and sub-cycle start, plus the region's own solution keyed by
 /// \p owner, the op both descents land on: a counted band's innermost loop, a
 /// flushing `scf.while`, or a straight-line span's first op.
-static void annotateRegion(circt::scheduling::ChainingProblem &problem,
+template <class ProblemT>
+static void annotateRegion(ProblemT &problem,
                            ScheduleModel &model, Operation *owner,
                            std::optional<int64_t> ii,
                            std::optional<int64_t> trip, bool tripIsBound,
@@ -391,7 +366,7 @@ static void annotateRegion(circt::scheduling::ChainingProblem &problem,
   RegionSolution &r = model.addRegion(owner);
   r.ii = ii;
   // Both are per-invocation: no composed total is stored.
-  r.length = scheduleDepth(problem);
+  r.length = problem.scheduleDepth();
   r.drain = drain;
   r.trip = trip;
   r.tripIsBound = tripIsBound;
@@ -530,7 +505,7 @@ scheduleCyclic(LoopLikeOpInterface body, DependenceAnalysis &deps,
     return failure();
   recordSolve(model, problem, "cyclic", problem.getInitiationInterval(),
               solveStart);
-  int64_t depth = scheduleDepth(problem);
+  int64_t depth = problem.scheduleDepth();
   unsigned ii = pipelined ? problem.getInitiationInterval().value_or(depth)
                           : static_cast<unsigned>(depth);
   int64_t drain = drainOf(problem, outputs);
@@ -665,7 +640,7 @@ static LogicalResult scheduleAcyclic(ArrayRef<Operation *> ops,
     return failure();
   recordSolve(model, problem, "acyclic", /*ii=*/std::nullopt, solveStart);
   info(Stage::Sched, ops.front())
-      << "Scheduled: depth = " << scheduleDepth(problem) << " cycles";
+      << "Scheduled: depth = " << problem.scheduleDepth() << " cycles";
   // How often its enclosing loops re-run it is charged where they are composed.
   annotateRegion(problem, model, ops.front(), /*ii=*/std::nullopt,
                  /*trip=*/std::nullopt, /*tripIsBound=*/false,

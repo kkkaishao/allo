@@ -56,12 +56,6 @@ SatParameters solverParameters(double budget) {
   return params;
 }
 
-/// The weight of a precedence edge out of \p src: the cycles a dependent waits
-/// after \p src issues before the value has arrived.
-int64_t latencyOf(Problem &prob, Operation *src) {
-  return *prob.getLatency(*prob.getLinkedOperatorType(src));
-}
-
 /// How the model states the clock period: either the chain-breaking edges the
 /// pre-pass computed (each costs a cycle on top of plain precedence), or the
 /// period itself, which `addChaining` encodes as sub-cycle start times.
@@ -155,7 +149,7 @@ void addChaining(CpModelBuilder &model, ProblemT &prob,
                  const Chaining &chaining) {
   for (const Problem::Dependence &dep : chaining.breaks)
     model.AddLessOrEqual(startVars.at(dep.getSource()) +
-                             latencyOf(prob, dep.getSource()) + 1,
+                             prob.latencyOf(dep.getSource()) + 1,
                          startVars.at(dep.getDestination()));
   if (chaining.period)
     addSubCycleTimes(model, prob, startVars, *chaining.period);
@@ -440,7 +434,7 @@ LogicalResult mlir::allo::scheduleCPSAT(ChainingSharedOperatorsProblem &prob,
   // every precedence, chain break and reservation is satisfiable.
   unsigned horizon = 0;
   for (Operation *op : ops)
-    horizon += latencyOf(prob, op) + prob.getResourceCycles(op) + 1;
+    horizon += prob.latencyOf(op) + prob.getResourceCycles(op) + 1;
 
   CpModelBuilder model;
   DenseMap<Operation *, IntVar> startVars;
@@ -460,7 +454,7 @@ LogicalResult mlir::allo::scheduleCPSAT(ChainingSharedOperatorsProblem &prob,
   for (Operation *op : ops)
     for (auto &dep : prob.getDependences(op))
       model.AddLessOrEqual(startVars.at(dep.getSource()) +
-                               latencyOf(prob, dep.getSource()),
+                               prob.latencyOf(dep.getSource()),
                            startVars.at(dep.getDestination()));
   addChaining(model, prob, startVars, chaining);
 
@@ -555,10 +549,10 @@ int64_t drainFloor(ChainingModuloProblem &prob, const Chaining &chaining,
     for (auto &dep : prob.getDependences(op))
       if (prob.getDistance(dep).value_or(0) == 0)
         incoming[op].push_back(
-            {dep.getSource(), latencyOf(prob, dep.getSource())});
+            {dep.getSource(), prob.latencyOf(dep.getSource())});
   for (auto &dep : chaining.breaks)
     incoming[dep.getDestination()].push_back(
-        {dep.getSource(), latencyOf(prob, dep.getSource()) + 1});
+        {dep.getSource(), prob.latencyOf(dep.getSource()) + 1});
 
   // Longest path, memoized; the seeded zero keeps a cycle from recursing
   // forever if the distance-0 subgraph were ever not acyclic.
@@ -629,7 +623,7 @@ ModuloOutcome solveAtII(ChainingModuloProblem &prob, Operation *lastOp,
     for (auto &dep : prob.getDependences(op)) {
       Operation *src = dep.getSource();
       int64_t separation =
-          latencyOf(prob, src) -
+          prob.latencyOf(src) -
           static_cast<int64_t>(ii) * prob.getDistance(dep).value_or(0);
       model.AddLessOrEqual(startVars.at(src) + separation,
                            startVars.at(dep.getDestination()));
@@ -761,7 +755,7 @@ LogicalResult mlir::allo::scheduleCPSAT(ChainingModuloProblem &prob,
   int64_t greedyReach = 0;
   unsigned contending = 0;
   for (Operation *op : ops) {
-    sequential += latencyOf(prob, op) + 1;
+    sequential += prob.latencyOf(op) + 1;
     if (prob.contendsForUnit(op))
       ++contending;
     if (warm.placed)

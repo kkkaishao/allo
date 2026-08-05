@@ -56,6 +56,18 @@ public:
     resourceCycles[op] = cycles;
   }
 
+  /// The cycles a dependent waits after \p op issues before its result has
+  /// arrived: the latency of the operator type \p op is linked to. Every
+  /// operation carries one, `populateOperatorTypes` having linked every
+  /// operation the problem holds.
+  unsigned latencyOf(Operation *op);
+
+  /// The schedule DEPTH of a SOLVED problem: the cycle by which every operation
+  /// has completed. A REPORT only, since a span composes from the drain
+  /// instead, which the solver may leave below the depth. A combinational
+  /// operation still occupies the cycle it issues in, hence the floor of one.
+  int64_t scheduleDepth();
+
   /// Whether \p op holds at least one unit whose count is capped. An unlimited
   /// link constrains nothing and no reservation tracks it.
   bool holdsLimitedUnit(Operation *op);
@@ -133,6 +145,9 @@ public:
   /// Every operation must be scheduled. This is the count `assignUnits` can
   /// still place, since windows on a line form an interval graph and first fit
   /// in start order colours one exactly.
+  ///
+  /// The same histogram `verifyOccupancy` compares against a limit, so what a
+  /// resource is checked to fit and what it is decided to need are one count.
   unsigned demandFor(ResourceType rsrc, unsigned ii);
 
   /// Whether \p op contends for anything at all: a capped unit, an allocated
@@ -146,11 +161,10 @@ public:
   /// solve set an allocation.
   LogicalResult verifyAllocation(unsigned ii);
 
-  /// No limited resource is oversubscribed in any cycle, counting each
-  /// operation's whole occupancy window. \p ii == 0 checks an acyclic
-  /// schedule; a non-zero \p ii checks the windows modulo the initiation
-  /// interval. Not an override: the concrete problems below call it from their
-  /// `verify`.
+  /// No limited resource is oversubscribed in any cycle, i.e. no resource
+  /// demands more than it has. \p ii == 0 checks an acyclic schedule; a
+  /// non-zero \p ii checks the windows modulo the initiation interval. Not an
+  /// override: the concrete problems below call it from their `verify`.
   LogicalResult verifyOccupancy(unsigned ii);
 
 private:

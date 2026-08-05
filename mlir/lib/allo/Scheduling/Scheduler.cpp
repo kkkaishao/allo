@@ -1870,6 +1870,23 @@ LogicalResult OccupancyProblem::checkLatency(Operation *op) {
   return Problem::checkLatency(op);
 }
 
+unsigned OccupancyProblem::latencyOf(Operation *op) {
+  std::optional<OperatorType> opr = getLinkedOperatorType(op);
+  assert(opr && "an operation the operator model never characterized");
+  std::optional<unsigned> latency = getLatency(*opr);
+  assert(latency && "an operator type with no latency");
+  return *latency;
+}
+
+int64_t OccupancyProblem::scheduleDepth() {
+  int64_t depth = 1;
+  for (Operation *op : getOperations())
+    if (std::optional<unsigned> start = getStartTime(op))
+      depth = std::max(depth, static_cast<int64_t>(*start) +
+                                  std::max<int64_t>(1, latencyOf(op)));
+  return depth;
+}
+
 bool OccupancyProblem::holdsLimitedUnit(Operation *op) {
   auto linked = getLinkedResourceTypes(op);
   return linked && llvm::any_of(*linked, [&](ResourceType rsrc) {
@@ -1977,27 +1994,13 @@ LogicalResult OccupancyProblem::verifyAllocation(unsigned ii) {
 LogicalResult OccupancyProblem::verifyOccupancy(unsigned ii) {
   for (ResourceType rsrc : getResourceTypes()) {
     unsigned limit = getLimit(rsrc).value_or(0);
-    if (limit == 0)
-      continue;
-    // Cycle (or congruence class, when cyclic) -> instances in use there. A
-    // window wider than the II wraps and lands in one class more than once, so
-    // this counts uses rather than operations.
-    SmallDenseMap<unsigned, unsigned> used;
-    for (Operation *op : getOperations()) {
-      if (!usesResource(op, rsrc))
-        continue;
-      unsigned start = *getStartTime(op);
-      for (unsigned k = 0, occ = getResourceCycles(op); k < occ; ++k)
-        ++used[ii ? (start + k) % ii : start + k];
+    if (limit && demandFor(rsrc, ii) > limit) {
+      assert(false && "a resource is oversubscribed across its occupancy "
+                      "windows; the reservation table admits an operation "
+                      "only when every slot it touches fits, so a solved "
+                      "schedule cannot reach this");
+      return failure();
     }
-    for (auto [slot, count] : used)
-      if (count > limit) {
-        assert(false && "a resource is oversubscribed across its occupancy "
-                        "windows; the reservation table admits an operation "
-                        "only when every slot it touches fits, so a solved "
-                        "schedule cannot reach this");
-        return failure();
-      }
   }
   return success();
 }
