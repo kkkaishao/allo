@@ -203,11 +203,15 @@ llvm::SmallVector<Type> elementTypes(TypeRange types) {
 }
 
 // Whether every data operand of `op` has integer element type: what an
-// integer-arithmetic comb row matches on.
+// integer-arithmetic comb row matches on. An `index` counts, and has to: a
+// bound, a counter and an address are index-typed, and a row that skipped them
+// would leave the device's own adder and divider priced at the DEFAULT row,
+// which is 0.1 ns whatever it builds.
 bool allIntegerOperands(Operation *op) {
   auto ts = elementTypes(op->getOperandTypes());
-  return !ts.empty() &&
-         llvm::all_of(ts, [](Type t) { return isa<IntegerType>(t); });
+  return !ts.empty() && llvm::all_of(ts, [](Type t) {
+    return isa<IntegerType, IndexType>(t);
+  });
 }
 
 // The library row matching \p op, or null. Advanced (raw-mnemonic) rows match
