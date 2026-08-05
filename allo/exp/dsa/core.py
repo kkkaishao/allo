@@ -275,6 +275,106 @@ class TensorProxy:
 
 
 # ==========================================================================#
+# Global config state (state registers)
+# ==========================================================================#
+
+
+class Require:
+    """One ``field == value`` precondition on a compute instruction, produced by a
+    ``@I.require`` body evaluating ``register.field == value``. Consumed by the oracle
+    (a trace-time legality assert) and, later, by config placement (which config to
+    emit); it never participates in instruction matching."""
+
+    __slots__ = ("field", "value")
+
+    def __init__(self, field, value):
+        self.field = field
+        self.value = value
+
+
+class StateField:
+    """One enumerated field of a config register: the atomic unit that maps 1:1 to an
+    ``allo.state`` symbol. ``__eq__`` is overloaded to *build a Require* (so a
+    ``@I.require`` reads as ``reg.field == "value"``); the first listed enum is the
+    reset value."""
+
+    def __init__(self, register, name, enums):
+        enums = list(enums)
+        assert enums, f"state field '{name}': needs at least one enum value"
+        self.register = register
+        self.name = name
+        self.enums = enums
+        self.default = enums[0]
+
+    def __eq__(self, value) -> Require:  # NB: builds a Require, not a bool
+        assert value in self.enums, f"{self.symbol}: {value!r} not in {self.enums}"
+        return Require(self, value)
+
+    __hash__ = object.__hash__  # identity; never keyed by value (its __eq__ isn't bool)
+
+    @property
+    def symbol(self) -> str:
+        """The ``allo.state`` symbol name, register-qualified so fields of different
+        registers never collide."""
+        return f"{self.register.name}_{self.name}"
+
+
+class DescField:
+    """One typed (integer) field of a config register: carried *payload*, not a
+    selectable mode (e.g. a tiling factor such as ``KL1``). Maps to a field of the
+    register's ``allo.desc``. Payload fields never appear in ``@require`` — they do
+    not gate instruction selection — so any ``==`` on them is a mistake."""
+
+    def __init__(self, register, name):
+        self.register = register
+        self.name = name
+
+    def __eq__(self, other):
+        raise TypeError(
+            f"typed field '{self.register.name}.{self.name}' is config payload, "
+            f"not a @require mode; do not compare it"
+        )
+
+    __hash__ = object.__hash__
+
+
+class StateRegister:
+    """A named group of config fields (a hardware config register such as a FeatherX
+    ``Set*VNLayout`` target). A field declared with an enum list is an enumerated
+    *mode* (a ``StateField`` -> one ``allo.state``, usable in ``@require``); a field
+    declared as ``int`` is typed *payload* (a ``DescField`` -> a field of the
+    register's ``allo.desc``). One config instruction writes any subset of them.
+    ``reg.<field>`` returns the field object."""
+
+    def __init__(self, name, fields: dict):
+        self.name = name
+        self._fields = {}
+        for fname, spec in fields.items():
+            if spec is int:
+                self._fields[fname] = DescField(self, fname)
+            else:
+                self._fields[fname] = StateField(self, fname, spec)
+
+    def __getattr__(self, name):
+        fields = self.__dict__.get("_fields", {})
+        if name in fields:
+            return fields[name]
+        raise AttributeError(name)
+
+    @property
+    def fields(self) -> list:
+        return list(self._fields.values())
+
+    @property
+    def state_fields(self) -> list:
+        return [f for f in self._fields.values() if isinstance(f, StateField)]
+
+    @property
+    def desc_fields(self) -> list:
+        return [f for f in self._fields.values() if isinstance(f, DescField)]
+
+
+# ==========================================================================#
 # ISA model
 # ==========================================================================#
 
@@ -311,11 +411,21 @@ class InstructionSpec:
         self.cost = cost  # search cost (tree-DP objective); default 1 = op count
         self.access_fn = None
         self.compute_fn = None
+        self.require_fn = None  # optional @I.require: schedule-state preconditions
         self.doc = None  # the defining function's docstring (carried onto Instruction)
 
     @property
     def buffers(self) -> list[BufferSpec]:
         return self.sources + self.destinations
+
+    def requirements(self) -> list:
+        """The ``@I.require`` preconditions as a list of ``Require`` (empty if the
+        instruction declares none). Evaluated fresh so the register closure is read
+        at call time."""
+        if self.require_fn is None:
+            return []
+        reqs = self.require_fn()
+        return list(reqs) if isinstance(reqs, (list, tuple)) else [reqs]
 
 
 class InstructionBuilder:
@@ -331,6 +441,10 @@ class InstructionBuilder:
 
     def compute(self, fn):
         self.spec.compute_fn = fn
+        return fn
+
+    def require(self, fn):
+        self.spec.require_fn = fn
         return fn
 
 
@@ -370,6 +484,12 @@ class Instruction(Generic[P, R]):
         assert (
             program is not None
         ), f"instruction '{self.name}' can only be called inside @oracle"
+        for req in self.spec.requirements():
+            current = program.state.get(req.field.symbol)
+            assert current == req.value, (
+                f"{self.name}: requires {req.field.symbol} == {req.value!r}, "
+                f"but state is {current!r}"
+            )
         names = self.addr_params + self.compute_params
         bound = _bind_call(names, args, kwargs, self.name)
         n = len(self.addr_params)
@@ -377,6 +497,57 @@ class Instruction(Generic[P, R]):
 
     def __repr__(self):
         return f"Instruction<{self.name}>"
+
+
+class ConfigSpec:
+    """A config instruction: writes enumerated fields of one ``StateRegister``. It has
+    no access/compute regions and yields no tensor; its writable fields are the
+    parameter names of the defining function."""
+
+    def __init__(self, name, register: StateRegister, fields: list, cost=1.0):
+        self.name = name
+        self.register = register
+        self.fields = fields  # field names this config may write
+        self.cost = cost  # switch cost: the price of emitting this config
+        self.doc = None
+
+
+class ConfigInstruction:
+    """A callable config mnemonic. Calling it inside an ``@oracle`` body records a
+    config write and mutates the traced machine state. It produces no tensor and, in
+    the functional oracle, no IR: dataflow/layout modes do not change the math, so the
+    simulator only needs the mode to validate ``@require``. A call writes any subset
+    of the declared fields (a partial reconfigure)."""
+
+    def __init__(self, isa: ISA, spec: ConfigSpec):
+        self.isa = isa
+        self.spec = spec
+        self.name = spec.name
+        self.__name__ = spec.name
+        self.__doc__ = spec.doc
+
+    def __call__(self, **writes):
+        program = self.isa._active_oracle
+        assert (
+            program is not None
+        ), f"config '{self.name}' can only be called inside @oracle"
+        reg = self.spec.register
+        resolved = []
+        for fname, value in writes.items():
+            assert (
+                fname in self.spec.fields
+            ), f"{self.name}: does not write field '{fname}' (writes {self.spec.fields})"
+            field = reg._fields[fname]
+            if isinstance(field, StateField):
+                assert (
+                    value in field.enums
+                ), f"{self.name}: {field.symbol}={value!r} not in {field.enums}"
+            else:  # DescField: typed integer payload
+                assert isinstance(
+                    value, int
+                ), f"{self.name}: field '{reg.name}.{fname}' expects an int, got {value!r}"
+            resolved.append((field, value))
+        program.record_config(self.name, reg, resolved)
 
 
 def _as_list(x):
@@ -390,8 +561,10 @@ class ISA:
         self.name = name
         self.buffers: dict[str, BufferSpec] = {}
         self.instructions: list[InstructionSpec] = []
-        self._ops: dict[str, Instruction] = {}
+        self._ops: dict[str, object] = {}  # Instruction | ConfigInstruction by name
         self._active_oracle = None  # the OracleProgram currently being traced
+        self.states: list[StateRegister] = []  # global config registers
+        self.configs: list[ConfigSpec] = []  # config instructions (write state)
         self.kernels: list[Kernel] = []  # every @unit / @entry kernel
         self.top: Kernel | None = None  # the unique @entry kernel
 
@@ -445,6 +618,41 @@ class ISA:
             assert spec.compute_fn is not None, f"{spec.name}: missing @I.compute"
             self.instructions.append(spec)
             op = Instruction(self, spec)
+            self._ops[op.name] = op
+            return op
+
+        return decorator
+
+    # --- global config state (state registers + config instructions) ---
+    def state(self, name, **fields) -> StateRegister:
+        """Declare a global config register with named enumerated fields (each maps to
+        one ``allo.state``). ``tpu.state("wvn", dataflow=["os", "ws"])`` gives a
+        register whose ``dataflow`` field resets to ``"os"`` (the first enum)."""
+        assert fields, f"state register '{name}': declare at least one field"
+        assert all(
+            r.name != name for r in self.states
+        ), f"duplicate state register '{name}'"
+        reg = StateRegister(name, fields)
+        self.states.append(reg)
+        return reg
+
+    def config(self, reg: StateRegister, *, name=None, cost=1.0):
+        """Decorate ``def <mnemonic>(field=..., ...): ...`` -> a callable config
+        instruction that writes ``reg``'s fields. The parameter names are the fields
+        it may write; a call writes any subset of them (a partial reconfigure).
+        ``cost`` is the switch penalty the compiler charges for emitting it."""
+
+        def decorator(fn) -> ConfigInstruction:
+            params = list(inspect.signature(fn).parameters)
+            unknown = [p for p in params if p not in reg._fields]
+            assert not unknown, (
+                f"config '{fn.__name__}': params {unknown} are not fields of state "
+                f"register '{reg.name}' {list(reg._fields)}"
+            )
+            spec = ConfigSpec(name or fn.__name__, reg, params, cost)
+            spec.doc = fn.__doc__
+            self.configs.append(spec)
+            op = ConfigInstruction(self, spec)
             self._ops[op.name] = op
             return op
 

@@ -11,11 +11,18 @@ then run, top to bottom in compilation order:
 
 - ``match_program`` (Stage 1) — cover the source compute DAG with instruction
   patterns via cost-aware tree-DP, folding a multi-node subgraph into one
-  instruction; binds each instruction's source buffers to source SSA values.
+  instruction; binds each instruction's source buffers to source SSA values, and
+  records the interchangeable candidates at each site.
+- ``assign_modes`` — if the ISA declares config state, pick among each site's
+  interchangeable schedule variants (identical compute, different ``@require`` mode)
+  to minimize instruction + config-switch cost, via a sequence (Viterbi) DP. A no-op
+  otherwise.
 - ``solve`` (Stage 2) — infer each instruction's shape params by unifying its
   symbolic visible shapes with the bound source shapes (exact-fit; no tiling).
 - ``plan`` (Stage 3) — liveness-driven slot allocation + data movement (routing
-  and spilling), producing a ``CompiledProgram`` (an emit list + I/O map).
+  and spilling), then ``place_configs`` interleaves the minimal ``@require`` config
+  sequence (change points), producing a ``CompiledProgram`` (a placed program +
+  I/O map).
 
 The public entry is ``ISA.compile_program(source)`` (sugar over ``compile_program``
 here); the returned ``CompiledProgram`` is callable — ``prog(*inputs)`` runs it on
@@ -38,7 +45,7 @@ from ..._mlir import ir
 from ..._mlir.dialects import tosa
 from . import primitive
 from .core import ISA, Instruction, _index_params, arity, param_roles, trace_instruction
-from .oracle import EmitRecord, OracleConfig, OracleProgram, simulate
+from .oracle import ConfigRecord, EmitRecord, OracleConfig, OracleProgram, simulate
 
 # ==========================================================================#
 # Catalog: prim-tag index + source-op recognizer
@@ -78,17 +85,33 @@ def _canon(value):
         value = owner.operands[0]  # reshape input1 (the data operand)
 
 
+def _reads_index_ge(node, n_src: int) -> bool:
+    """True if the compute DAG reads a buffer arg at index >= ``n_src`` (a
+    destination). Such an instruction reads its own output (an in-place accumulate)."""
+    if node.kind == "arg":
+        return node.buffer_index >= n_src
+    return any(_reads_index_ge(a, n_src) for a in node.args)
+
+
 def instruction_pattern(instruction: Instruction):
     """The compute pattern of an instruction: the root ``TensorProxy`` of its
     semantics DAG. Internal nodes are prim ops; ``arg`` leaves bind to the
     instruction's source buffers (by ``buffer_index``). A 1:1 instruction is just
-    a depth-1 pattern. Returns ``None`` for data-movement (identity) or
-    multi-output instructions (not matched yet)."""
+    a depth-1 pattern. Returns ``None`` for data-movement (identity), multi-output
+    instructions (not matched yet), or an instruction whose compute reads its own
+    destination buffer (an in-place accumulate): the matcher cannot bind a dst read,
+    so it is oracle-only — to compile an accumulate, model the accumulator as a
+    source operand (``dst = add(c_in, matmul(a, b))``), which the allocator then
+    coalesces back onto one slot."""
     _, _, results = trace_instruction(instruction.spec)
     if len(results) != 1:
         return None
     root = results[0]
-    return None if root.kind in ("identity", "arg") else root
+    if root.kind in ("identity", "arg"):
+        return None
+    if _reads_index_ge(root, len(instruction.spec.sources)):
+        return None  # reads its own destination -> not selectable (would mis-bind)
+    return root
 
 
 def source_tag(op) -> str | None:
@@ -135,6 +158,9 @@ class Match:
     operand_values: list  # leaf bindings, in source-buffer order
     result_value: object  # the tile's output ir.Value
     shape_params: dict = field(default_factory=dict)  # solved access param -> int
+    candidates: list = field(
+        default_factory=list
+    )  # interchangeable (instruction, operands) for this site (mode assignment)
 
     @property
     def bound_values(self) -> list:
@@ -290,7 +316,10 @@ def _match_pattern(pnode, value, def_op, use, bindings, within, interior) -> boo
             return False
         bindings[pnode.buffer_index] = value
         return True
-    op = def_op.get(value)
+    # Recognize an internal (folded) op through any reshape wrappers (torch emits
+    # 2-D<->3-D reshapes around matmul); arg leaves above stay raw so their shapes
+    # still drive the shape solver.
+    op = def_op.get(_canon(value))
     if op is None or source_tag(op) != pnode.kind:
         return False
     if pnode.kind == "transpose" and _perms(op) != list(pnode.permutation):
@@ -312,7 +341,7 @@ def _match_pattern(pnode, value, def_op, use, bindings, within, interior) -> boo
             _match_pattern(pa, sv, def_op, use, bindings, within, interior)
             for pa, sv in zip(pnode.args, order)
         ):
-            interior.add(value)
+            interior.add(_canon(value))  # canonical key (matches use/within counting)
             return True
         bindings.clear()
         bindings.update(saved_b)
@@ -401,12 +430,14 @@ def match_program(catalog: Catalog, source_module) -> Selection:
             use[cv] = use.get(cv, 0) + 1
 
     memo: dict = {}  # canonical value -> _Choice (optimal tile to materialize it)
+    cand: dict = {}  # canonical value -> [(instruction, operands)] (all valid matches)
 
     def materialize(v) -> _Choice:
         if v in memo:
             return memo[v]
         op = def_op[v]
         chosen = None
+        valid: list = []
         for instr, root in catalog.candidates(source_tag(op)):
             bindings, within, interior = {}, {}, set()
             if not _match_pattern(root, v, def_op, use, bindings, within, interior):
@@ -420,6 +451,7 @@ def match_program(catalog: Catalog, source_module) -> Selection:
             if not all(i in bindings for i in range(n_src)):
                 continue
             operands = [bindings[i] for i in range(n_src)]
+            valid.append((instr, operands))
             cost = instr.spec.cost + sum(
                 materialize(_canon(ov)).cost
                 for ov in operands
@@ -428,6 +460,10 @@ def match_program(catalog: Catalog, source_module) -> Selection:
             if chosen is None or cost < chosen.cost:
                 chosen = _Choice(cost, instr, operands)
         assert chosen is not None, _no_match_error(op, catalog)
+        # Candidates that match the same source structure compute the same result;
+        # they may differ only in the schedule state their @require declares (mode
+        # assignment picks among them). The cheapest is the default (chosen).
+        cand[v] = valid
         memo[v] = chosen
         return chosen
 
@@ -439,7 +475,7 @@ def match_program(catalog: Catalog, source_module) -> Selection:
             return
         visited.add(v)
         ch = materialize(v)
-        matches.append(Match(ch.instruction, ch.operands, v))
+        matches.append(Match(ch.instruction, ch.operands, v, candidates=cand[v]))
         for ov in ch.operands:
             if _canon(ov) in def_op:
                 schedule(_canon(ov))
@@ -463,6 +499,39 @@ def _static_shape(value) -> list[int]:
     shape = list(ty.shape)
     assert all(d >= 0 for d in shape), f"source value has dynamic shape {shape}"
     return shape
+
+
+def _strip_leading_units(shape) -> list:
+    """Drop leading statically-1 dims. An element is an ``int`` (a source shape) or
+    an ``IndexExpr`` (an instruction's visible shape); a symbolic dim is never
+    dropped, since its value is unknown."""
+
+    def unit(dim) -> bool:
+        if isinstance(dim, int):
+            return dim == 1
+        return not _index_params(dim) and dim.static_int() == 1
+
+    i = 0
+    while i < len(shape) and unit(shape[i]):
+        i += 1
+    return list(shape[i:])
+
+
+def _align_ranks(ishape, sshape) -> tuple[list, list]:
+    """Align an instruction's visible shape with a bound source shape *modulo
+    leading unit (batch) dims* — the shape-solver counterpart of ``_canon``.
+
+    A leading ``1`` does not change the linear value sequence, so it is a rank alias
+    carrying no shape information: ``[1, 4, 4]`` and ``[4, 4]`` describe the same 16
+    values. torch_mlir makes this unavoidable — it brackets every 2-D ``a @ b`` in
+    reshapes to batched 3-D and back, so within one chain the matmuls are 3-D while
+    the elementwise ops around them are 2-D, and an instruction written at either
+    rank meets the other (FeatherX's 3-D ``mac`` accumulates a 2-D partial sum;
+    QKV's 2-D ``softmax`` consumes a 3-D matmul). Stripping only when the ranks
+    actually differ leaves every same-rank comparison an exact-fit check."""
+    if len(ishape) == len(sshape):
+        return list(ishape), list(sshape)
+    return _strip_leading_units(ishape), _strip_leading_units(sshape)
 
 
 def _to_sympy(e, symtab: dict):
@@ -492,6 +561,63 @@ def _is_affine(expr, syms) -> bool:
         return False
 
 
+def _solve_match(m: Match) -> None:
+    """Solve one match's shape params in place (see ``solve`` for the method); raises
+    ``AssertionError`` if the instruction does not fit the bound source shapes."""
+    spec = m.instruction.spec
+    name = m.instruction.name
+    _, arg_shapes, _ = trace_instruction(spec)
+    bound = m.bound_values
+    assert len(arg_shapes) == len(
+        bound
+    ), f"{name}: {len(arg_shapes)} access operands but {len(bound)} bound values"
+    roles, _ = param_roles(spec)
+    stride_params = [i for i, r in roles.items() if r == "stride"]
+    assert not stride_params, (
+        f"{name}: params {stride_params} appear only as strides — stride params "
+        f"are not supported yet"
+    )
+
+    symtab: dict = {}
+    eqs = []
+    for ishape, value in zip(arg_shapes, bound):
+        ishape, sshape = _align_ranks(ishape, _static_shape(value))
+        assert len(ishape) == len(sshape), f"{name}: rank mismatch {ishape} vs {sshape}"
+        for idim, sdim in zip(ishape, sshape):
+            if _index_params(idim):  # depends on shape params -> an equation
+                eqs.append(sympy.Eq(_to_sympy(idim, symtab), sdim))
+            else:  # statically known -> exact-fit check
+                fixed = idim if isinstance(idim, int) else idim.static_int()
+                assert fixed == sdim, (
+                    f"{name}: shape mismatch — expects {fixed} but source is "
+                    f"{sdim} (no tiling)"
+                )
+    if not symtab:
+        return
+
+    syms = [symtab[i] for i in sorted(symtab)]
+    for eq in eqs:
+        assert _is_affine(eq.lhs - eq.rhs, syms), (
+            f"{name}: shape constraint is nonlinear in its params (a collapse of "
+            f"multiple symbolic dims is ambiguous) — under-determined"
+        )
+    solutions = sympy.linsolve(eqs, syms)
+    assert (
+        solutions
+    ), f"{name}: shapes are inconsistent — the source does not fit (no tiling)"
+    (values,) = solutions  # a consistent linear system has one solution tuple
+    for i, val in zip(sorted(symtab), values):
+        assert not val.free_symbols, (
+            f"{name}: shape param p{i} is under-constrained ({val}); no source "
+            f"dimension pins it"
+        )
+        assert val.is_integer and val >= 0, (
+            f"{name}: shape param p{i} = {val} is not a non-negative integer "
+            f"(no tiling)"
+        )
+        m.shape_params[i] = int(val)
+
+
 def solve(selection: Selection) -> Selection:
     """Infer each instruction's shape params by unifying its symbolic visible shape
     with the bound source shapes — shape inference as constraint solving.
@@ -510,61 +636,142 @@ def solve(selection: Selection) -> Selection:
     Nonlinear constraints (a collapse of multiple symbolic dims) are rejected up front;
     a param that is pure addressing (stride) cannot be inferred and is unsupported."""
     for m in selection.matches:
-        spec = m.instruction.spec
-        name = m.instruction.name
-        _, arg_shapes, _ = trace_instruction(spec)
-        bound = m.bound_values
-        assert len(arg_shapes) == len(
-            bound
-        ), f"{name}: {len(arg_shapes)} access operands but {len(bound)} bound values"
-        roles, _ = param_roles(spec)
-        stride_params = [i for i, r in roles.items() if r == "stride"]
-        assert not stride_params, (
-            f"{name}: params {stride_params} appear only as strides — stride params "
-            f"are not supported yet"
-        )
-
-        symtab: dict = {}
-        eqs = []
-        for ishape, value in zip(arg_shapes, bound):
-            sshape = _static_shape(value)
-            assert len(ishape) == len(
-                sshape
-            ), f"{name}: rank mismatch {ishape} vs {sshape}"
-            for idim, sdim in zip(ishape, sshape):
-                if _index_params(idim):  # depends on shape params -> an equation
-                    eqs.append(sympy.Eq(_to_sympy(idim, symtab), sdim))
-                else:  # statically known -> exact-fit check
-                    fixed = idim if isinstance(idim, int) else idim.static_int()
-                    assert fixed == sdim, (
-                        f"{name}: shape mismatch — expects {fixed} but source is "
-                        f"{sdim} (no tiling)"
-                    )
-        if not symtab:
-            continue
-
-        syms = [symtab[i] for i in sorted(symtab)]
-        for eq in eqs:
-            assert _is_affine(eq.lhs - eq.rhs, syms), (
-                f"{name}: shape constraint is nonlinear in its params (a collapse of "
-                f"multiple symbolic dims is ambiguous) — under-determined"
-            )
-        solutions = sympy.linsolve(eqs, syms)
-        assert (
-            solutions
-        ), f"{name}: shapes are inconsistent — the source does not fit (no tiling)"
-        (values,) = solutions  # a consistent linear system has one solution tuple
-        for i, val in zip(sorted(symtab), values):
-            assert not val.free_symbols, (
-                f"{name}: shape param p{i} is under-constrained ({val}); no source "
-                f"dimension pins it"
-            )
-            assert val.is_integer and val >= 0, (
-                f"{name}: shape param p{i} = {val} is not a non-negative integer "
-                f"(no tiling)"
-            )
-            m.shape_params[i] = int(val)
+        _solve_match(m)
     return selection
+
+
+# ==========================================================================#
+# Mode assignment — pick schedule-variant instructions (config-switch minimizing)
+# ==========================================================================#
+
+
+def _solvable(instr, operands, result_value) -> bool:
+    """Whether ``instr`` fits the source shapes at this site (a candidate filter)."""
+    try:
+        _solve_match(Match(instr, operands, result_value))
+        return True
+    except AssertionError:
+        return False
+
+
+def assign_modes(isa, selection: Selection) -> Selection:
+    """Choose, among each match's interchangeable candidates, the variant that
+    minimizes total instruction cost + config-switch cost over the program — a
+    sequence (Viterbi) DP.
+
+    Interchangeable candidates all match the same source computation (Stage 1); they
+    differ only in the schedule state their ``@require`` declares (e.g. output- vs
+    weight-stationary), so swapping one for another is semantically safe. The compute
+    emit order equals match order — planner-inserted moves carry no ``@require`` and
+    never reorder computes — so minimizing switches here is exact for the final
+    ``place_configs``. A no-op unless the ISA declares config state."""
+    if not isa.states:
+        return selection
+
+    def key(established: dict):
+        return tuple(sorted(established.items()))
+
+    reset = {f.symbol: f.default for reg in isa.states for f in reg.state_fields}
+    # dp: established-state key -> (min cost so far, established state, chosen path)
+    dp = {key(reset): (0.0, reset, [])}
+    for m in selection.matches:
+        options = [
+            (instr, operands)
+            for instr, operands in (m.candidates or [(m.instruction, m.operand_values)])
+            if _solvable(instr, operands, m.result_value)
+        ]
+        assert (
+            options
+        ), f"no solvable candidate for the match producing {m.instruction.name}"
+        nxt: dict = {}
+        for cost0, established, path in dp.values():
+            for instr, operands in options:
+                records, established2 = _configs_for(
+                    isa, established, instr.spec.requirements()
+                )
+                switch = sum(isa._ops[r.name].spec.cost for r in records)
+                total = cost0 + instr.spec.cost + switch
+                k = key(established2)
+                if k not in nxt or total < nxt[k][0]:
+                    nxt[k] = (total, established2, path + [(instr, operands)])
+        dp = nxt
+    _cost, _state, best = min(dp.values(), key=lambda t: t[0])
+    for m, (instr, operands) in zip(selection.matches, best):
+        m.instruction, m.operand_values = instr, operands
+    return selection
+
+
+# ==========================================================================#
+# Config placement — realize @require modes as the minimal config sequence
+# ==========================================================================#
+
+
+def _cover_register(isa, register, field_values: dict) -> list:
+    """Greedy set-cover of a register's changed fields by config instructions on it.
+    Returns a list of ``ConfigRecord``, each writing the subset of changes it covers;
+    a single config that declares all changed fields yields one record."""
+    configs = [c for c in isa.configs if c.register is register]
+    remaining = dict(field_values)  # StateField -> value
+    records = []
+    while remaining:
+        best = max(
+            configs,
+            key=lambda c: sum(f.name in c.fields for f in remaining),
+            default=None,
+        )
+        covered = {
+            f: v
+            for f, v in remaining.items()
+            if best is not None and f.name in best.fields
+        }
+        assert covered, (
+            f"no config instruction on register '{register.name}' writes field(s) "
+            f"{[f.name for f in remaining]}"
+        )
+        records.append(ConfigRecord(best.name, register, list(covered.items())))
+        for f in covered:
+            del remaining[f]
+    return records
+
+
+def _configs_for(isa, established: dict, requirements: list) -> tuple:
+    """The config records that realize ``requirements`` from the ``established`` state,
+    plus the updated state. A field is (re)written only where its required value
+    differs from the currently-established one (change-point / redundant-store
+    elimination); changes are grouped per register and covered by config instructions.
+    """
+    changed: dict = {}  # register -> {StateField: value}
+    for req in requirements:
+        if established.get(req.field.symbol) != req.value:
+            changed.setdefault(req.field.register, {})[req.field] = req.value
+    records = []
+    for register, field_values in changed.items():
+        records.extend(_cover_register(isa, register, field_values))
+    updated = dict(established)
+    for req in requirements:
+        updated[req.field.symbol] = req.value
+    return records, updated
+
+
+def place_configs(isa, emits: list) -> list:
+    """Interleave the minimal config sequence into a compute-emit stream, returning a
+    tagged program ``[("config" | "emit", record)]``.
+
+    Seeded with each register's reset default, so a requirement already satisfied at
+    reset costs no config; established modes persist across emits (including moves,
+    which carry no ``@require``), so a config is (re)emitted only where a required
+    field value changes. Config records carry no IR in the functional oracle (see
+    ``codegen.build_main``); they describe the real emitted program for ``dump`` and
+    for a hardware backend."""
+    established = {f.symbol: f.default for reg in isa.states for f in reg.state_fields}
+    steps: list = []
+    for e in emits:
+        requirements = isa._ops[e.name].spec.requirements()
+        if requirements:
+            records, established = _configs_for(isa, established, requirements)
+            steps.extend(("config", r) for r in records)
+        steps.append(("emit", e))
+    return steps
 
 
 # ==========================================================================#
@@ -576,9 +783,12 @@ def solve(selection: Selection) -> Selection:
 class CompiledProgram:
     isa: object
     io_buffer: object  # the global buffer holding program I/O
-    emits: list  # list[EmitRecord]
+    emits: list  # list[EmitRecord] (the compute/move stream, pre config placement)
     inputs: list  # per func arg: (offset, shape)
     outputs: list  # per func result: (offset, shape, label)
+    steps: list = field(
+        default_factory=list
+    )  # placed program: [("config" | "emit", record)] (configs interleaved)
 
     def _format(self) -> str:
         io = self.io_buffer.name
@@ -586,8 +796,12 @@ class CompiledProgram:
         for i, (off, shape) in enumerate(self.inputs):
             lines.append(f"    arg{i} = {io}[{off}]  shape={tuple(shape)}")
         lines.append("  program:")
-        for e in self.emits:
-            lines.append(f"    {e.name}({', '.join(str(a) for a in e.addr)})")
+        for kind, rec in self.steps:
+            if kind == "config":
+                writes = ", ".join(f"{f.name}={v}" for f, v in rec.writes)
+                lines.append(f"    {rec.name}({writes})")
+            else:
+                lines.append(f"    {rec.name}({', '.join(str(a) for a in rec.addr)})")
         lines.append("  outputs:")
         for off, shape, label in self.outputs:
             lines.append(f"    {label} = {io}[{off}]  shape={tuple(shape)}")
@@ -613,7 +827,7 @@ class CompiledProgram:
             init[offset : offset + flat.size] = flat
 
         program = OracleProgram()
-        program.steps.extend(("emit", e) for e in self.emits)
+        program.steps.extend(self.steps)  # tagged ("config" | "emit", record) stream
         for offset, shape, label in self.outputs:
             program.record_inspect(buf, slice(offset, offset + prod(shape)), label)
 
@@ -722,27 +936,37 @@ class _Compute:
     offset_of: dict  # access param -> buffer position
     shape_params: dict  # access param -> solved size
     n_addr: int
-    in_place: bool  # the result may reuse a dying operand's slot
+    reusable: set  # source-operand indices whose slot the result may reuse in place
 
 
-def _in_place_safe(instruction) -> bool:
-    """Whether the instruction's result may alias one of its dying operands.
+def _reusable_operands(instruction) -> set:
+    """Source-operand indices whose slot the result may safely reuse in place.
 
-    Safe iff the compute is purely element-wise — every output element reads only
-    the same-position inputs (add/sub/mul/relu/identity). A matmul, or any op that
-    reads across elements, must not overwrite an operand it is still reading."""
+    Reuse is safe for an operand iff its value reaches the result through only
+    position-preserving ops: output position i then depends only on that operand's
+    position i, so writing the result over the operand is fine. A matmul mixes
+    positions, so any operand feeding a matmul is not reusable — but an *accumulator*
+    read only by an element-wise add (``c + a @ b``) is, which lets a K-reduction
+    chain collapse onto a single accumulator slot (the hardware's block buffer). For
+    a purely element-wise op every operand is reusable (the old whole-op predicate);
+    for a plain matmul none is."""
     _, _, results = trace_instruction(instruction.spec)
     if len(results) != 1:
-        return False
+        return set()
+    n_src = len(instruction.spec.sources)
+    safe: set = set()
 
-    def elementwise(n) -> bool:
-        if n.kind == "arg":
-            return True
-        if n.kind == "matmul":
-            return False
-        return all(elementwise(a) for a in n.args)
+    def walk(node, position_preserving: bool):
+        if node.kind == "arg":
+            if position_preserving and node.buffer_index < n_src:
+                safe.add(node.buffer_index)
+            return
+        child_ok = position_preserving and node.kind != "matmul"
+        for a in node.args:
+            walk(a, child_ok)
 
-    return elementwise(results[0])
+    walk(results[0], True)
+    return safe
 
 
 def _loc_size(value, buf) -> int:
@@ -845,7 +1069,7 @@ def plan(isa, selection: Selection) -> CompiledProgram:
                 offset_of,
                 m.shape_params,
                 arity(spec.access_fn),
-                _in_place_safe(m.instruction),
+                _reusable_operands(m.instruction),
             )
         )
 
@@ -924,15 +1148,15 @@ def plan(isa, selection: Selection) -> CompiledProgram:
         for t, st in enumerate(steps):
             reads, write = reads_of(st), st.write
             reused = None
-            if isinstance(st, _Compute) and st.in_place:
+            if isinstance(st, _Compute) and st.reusable:
                 reused = next(
                     (
-                        r
-                        for r in reads
-                        if r.buffer is write.buffer
-                        and r.last_use == t
-                        and r.size == write.size
-                        and not r.freed
+                        reads[i]
+                        for i in st.reusable
+                        if reads[i].buffer is write.buffer
+                        and reads[i].last_use == t
+                        and reads[i].size == write.size
+                        and not reads[i].freed
                     ),
                     None,
                 )
@@ -1041,7 +1265,10 @@ def plan(isa, selection: Selection) -> CompiledProgram:
         (l.offset, _shape(v), f"out{i}")
         for i, (l, v) in enumerate(zip(output_locs, output_vals))
     ]
-    return CompiledProgram(isa, io, emits, inputs, outputs)
+    # Config placement: realize each emit's @require modes as the minimal config
+    # sequence (change points over the final, spilled order).
+    steps = place_configs(isa, emits)
+    return CompiledProgram(isa, io, emits, inputs, outputs, steps)
 
 
 # ==========================================================================#
@@ -1061,5 +1288,6 @@ def compile_program(source: str, isa) -> CompiledProgram:
         normalize_source(module)
         catalog = Catalog(isa)
         selection = match_program(catalog, module)
+        assign_modes(isa, selection)  # pick config-switch-minimizing schedule variants
         solve(selection)
         return plan(isa, selection)

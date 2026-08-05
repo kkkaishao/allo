@@ -58,17 +58,46 @@ class InspectRecord:
     label: str | None
 
 
-class OracleProgram:
-    """The ordered emit/inspect stream collected while tracing an oracle body."""
+@dataclass
+class ConfigRecord:
+    name: str  # config mnemonic
+    register: object  # StateRegister
+    writes: list  # list[(StateField, value)] applied by this config
 
-    def __init__(self):
+
+class OracleProgram:
+    """The ordered emit/inspect/config stream collected while tracing an oracle body,
+    plus the running machine state (``allo.state`` symbol -> current enum value)."""
+
+    def __init__(self, isa=None):
         self.steps: list[tuple[str, object]] = []
+        self.state: dict[str, str] = (
+            {}
+        )  # state symbol -> current value (reset defaults)
+        if isa is not None:
+            for reg in isa.states:
+                for (
+                    field
+                ) in reg.state_fields:  # enum modes only (desc payload isn't state)
+                    self.state[field.symbol] = field.default
 
     def record_emit(self, name, addr, compute):
         self.steps.append(("emit", EmitRecord(name, list(addr), list(compute))))
 
     def record_inspect(self, buffer, sl, label):
         self.steps.append(("inspect", InspectRecord(buffer, sl, label)))
+
+    def record_config(self, name, register, writes):
+        """Record a config write and apply its enum-mode part to the traced state.
+        ``writes`` is a list of ``(field, value)``; enum ``StateField``s (which carry
+        a ``symbol``) update the tracked mode, typed ``DescField`` payload does not.
+        Carries no IR in the oracle: modes do not change the math, only which
+        ``@require`` is satisfied."""
+        for field, value in writes:
+            symbol = getattr(field, "symbol", None)
+            if symbol is not None:  # enum mode; typed payload has no tracked state
+                self.state[symbol] = value
+        self.steps.append(("config", ConfigRecord(name, register, list(writes))))
 
     @property
     def inspects(self) -> list[InspectRecord]:
@@ -131,7 +160,7 @@ class Oracle:
 
     def __call__(self, **overrides):
         config = replace(self.config, **overrides) if overrides else self.config
-        program = OracleProgram()
+        program = OracleProgram(self.isa)
         prev = self.isa._active_oracle
         self.isa._active_oracle = program
         try:

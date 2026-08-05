@@ -68,20 +68,46 @@ def build_catalog(isa: ISA) -> Module:
     with context, Location.unknown(context):
         module = Module.create()
         with InsertionPoint(module.body):
-            emit_catalog(context, isa)
+            emit_catalog(context, isa, with_states=True)
         assert module.operation.verify(), "generated catalog failed verification"
     return module
 
 
-def emit_catalog(context: ir.Context, isa: ISA):
-    """Emit ``allo.buffer`` + ``allo.define`` ops at the current insertion point
-    (assumed to be a module body)."""
+def emit_catalog(context: ir.Context, isa: ISA, with_states: bool = False):
+    """Emit ``allo.buffer`` (+ optionally ``allo.state``) + ``allo.define`` ops at the
+    current insertion point (assumed to be a module body).
+
+    ``with_states`` is off for the oracle: config state carries no IR in the
+    functional simulator (and ``allo.state`` has no LLVM lowering), so state
+    declarations belong to the static catalog only, not the JIT-ed program module."""
     for buf in isa.buffers.values():
         allo_d.DeclareBufferOp(
             buf.name, buf.size, ir.TypeAttr.get(buf.kind.materialize(context))
         )
+    if with_states:
+        for reg in isa.states:
+            for field in reg.state_fields:
+                _emit_state(context, field)
+            if reg.desc_fields:
+                _emit_desc(context, reg)
     for spec in isa.instructions:
         _build_define(context, spec)
+
+
+def _emit_state(context: ir.Context, field):
+    """Declare one enumerated config field as an ``allo.state`` symbol."""
+    state_ty = ir.Type.parse("!allo.state<i32>", context)
+    enums = ir.ArrayAttr.get([ir.StringAttr.get(e) for e in field.enums])
+    allo_d.DeclareStateOp(
+        field.symbol, enums, ir.TypeAttr.get(state_ty), defaultState=field.default
+    )
+
+
+def _emit_desc(context: ir.Context, reg):
+    """Declare a config register's typed (integer) payload fields as one ``allo.desc``."""
+    fields = ", ".join(f'"{f.name}":i32' for f in reg.desc_fields)
+    desc_ty = ir.Type.parse(f"!allo.desc<[{fields}]>", context)
+    allo_d.DeclareDescOp(reg.name, 1, ir.TypeAttr.get(desc_ty))
 
 
 def _build_define(context: ir.Context, spec: InstructionSpec):
@@ -460,9 +486,11 @@ def build_main(context: ir.Context, isa: ISA, program):
                 a_dyn, a_st = encode_index_list(rec.addr)
                 c_dyn, c_st = encode_index_list(rec.compute)
                 allo_d.EmitOp(rec.name, a_dyn, c_dyn, a_st, c_st)
-            else:
+            elif kind == "inspect":
                 func_d.CallOp([], f"{INSPECT_PREFIX}{k}", [])
                 k += 1
+            # "config" steps carry no IR here: modes do not change the math, and
+            # allo.state has no LLVM lowering (see emit_catalog's with_states note).
         func_d.ReturnOp([])
     for k in range(len(inspects)):
         func_d.FuncOp(
