@@ -310,6 +310,8 @@ MemoryLibrary memoryFromDevice(dcp::DCPathDeviceOp device) {
     m.storage.push_back({s.getSymName().str(), s.getPorts(), timing(s)});
     if (s.getIsDefault())
       m.defaultStorage = s.getSymName().str();
+    if (s.getIsScatter())
+      m.scatterStorage = s.getSymName().str();
   }
   for (auto st : body.getOps<dcp::DCPathStreamTimingOp>())
     m.fifo = timing(st);

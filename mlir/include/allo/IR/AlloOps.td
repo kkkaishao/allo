@@ -562,6 +562,13 @@ def DCPathStorageOp : DCPath_Op<"dcp.storage",
     one bit about THIS row, and as a field it cannot be written on something
     that is not a storage at all.
 
+    `scatter` marks the row that is NOT a memory: one cell per element, no
+    address, and therefore no port limit. A completely partitioned array
+    resolves here whatever it would otherwise have taken, since once every bank
+    holds one word there is no addressed structure left to build. A device
+    declares at most one, under whatever name its primitives go by, and a
+    device that declares none cannot hold a complete partition.
+
     `rd_latency`/`wr_latency` are the cycles an access costs and
     `rd_delay`/`wr_delay` its combinational delay in ns: the scheduler times
     every access against the row its array resolves to and the emitter builds
@@ -579,12 +586,13 @@ def DCPathStorageOp : DCPath_Op<"dcp.storage",
   let arguments = (ins
     SymbolNameAttr:$sym_name,
     UnitAttr:$is_default,
+    UnitAttr:$is_scatter,
     MemoryPortAttr:$ports,
     I64Attr:$rd_latency, F32Attr:$rd_delay,
     I64Attr:$wr_latency, F32Attr:$wr_delay,
     OptionalAttr<ArrayAttr>:$uses);
   let assemblyFormat = [{
-    $sym_name (`default` $is_default^)? `ports` `=` $ports
+    $sym_name (`default` $is_default^)? (`scatter` $is_scatter^)? `ports` `=` $ports
     `rd` `=` $rd_latency `,` $rd_delay
     `wr` `=` $wr_latency `,` $wr_delay (`uses` $uses^)? attr-dict
   }];

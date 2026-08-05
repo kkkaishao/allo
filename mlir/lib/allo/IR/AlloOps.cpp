@@ -402,6 +402,9 @@ LogicalResult DCPathDeviceOp::verify() {
   if (llvm::count_if(getBody().getOps<DCPathStorageOp>(),
                      [](DCPathStorageOp s) { return s.getIsDefault(); }) > 1)
     return emitOpError("marks more than one dcp.storage `default`");
+  if (llvm::count_if(getBody().getOps<DCPathStorageOp>(),
+                     [](DCPathStorageOp s) { return s.getIsScatter(); }) > 1)
+    return emitOpError("marks more than one dcp.storage `scatter`");
   if (tooMany(getBody().getOps<DCPathStreamTimingOp>()))
     return emitOpError("declares more than one dcp.stream_timing");
   if (tooMany(getBody().getOps<DCPathMuxOp>()))

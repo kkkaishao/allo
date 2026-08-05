@@ -284,9 +284,11 @@ static DenseSet<Value> boundaryArraysOf(func::FuncOp top) {
 // per element (`MemUnit::scattered`), since a complete partition commits the
 // scheduler to unlimited combinational ports.
 static LogicalResult checkScatteredArgument(func::FuncOp func, Value array,
-                                            MemoryChar &mc, bool isTop) {
+                                            MemoryChar &mc,
+                                            const MemoryLibrary &memLib,
+                                            bool isTop) {
   auto elements = cast<MemRefType>(array.getType()).getNumElements();
-  if (!mc.registers()) {
+  if (!memLib.isScatter(mc.storage)) {
     error(Stage::Prep, func)
         << "Argument array with a 0-cycle read cannot be realized; a boundary "
            "port is edge-triggered, so its datum arrives no earlier than the "
@@ -331,20 +333,29 @@ LogicalResult checkMemories(func::FuncOp func, const MemoryLibrary &memLib,
   });
 
   for (Value array : arrays) {
-    MemoryChar mc = characterize(array, memLib.defaultStorage);
+    MemoryChar mc = characterize(array, memLib);
     StringRef storage = mc.storage;
     Operation *anchor =
         array.getDefiningOp() ? array.getDefiningOp() : func.getOperation();
-    // A complete partition resolves the array to registers whatever it was
-    // bound to, so the two directives disagreeing has one silent winner unless
-    // it is reported. Nothing else can make `registers()` true against an
-    // explicit choice.
+    // A complete partition scatters the array whatever it was bound to, so the
+    // two directives disagreeing has one silent winner unless it is reported.
+    // Nothing else resolves an explicitly bound array to the scatter row.
     StringRef bound = boundStorageOf(array);
-    if (mc.registers() && !bound.empty() && bound != kRegisterStorage) {
+    if (memLib.isScatter(storage) && !bound.empty() && !memLib.isScatter(bound)) {
       error(Stage::Prep, anchor)
           << "Array " << array.getType() << " is bound to storage '" << bound
           << "' and also completely partitioned, which scatters it into "
              "registers; the two cannot both hold. Drop one of them";
+      return failure();
+    }
+    // A completely partitioned array resolves to the device's `scatter` row and
+    // there is none, so it has nowhere to go: an empty name would otherwise
+    // fall through as a stream's, which is timed by an unrelated row.
+    if (storage.empty()) {
+      error(Stage::Prep, anchor)
+          << "Array " << array.getType()
+          << " is completely partitioned, but the device marks no `dcp.storage` "
+             "`scatter` for one cell per element to be built out of";
       return failure();
     }
     // A realization the device never declared would fall to the zero-timing
@@ -360,7 +371,7 @@ LogicalResult checkMemories(func::FuncOp func, const MemoryLibrary &memLib,
     // the RTL: any latency >= 1 works, but 0 does not, since the port is
     // edge-triggered.
     if (boundaryArrays.contains(array) && lat.read < 1 &&
-        failed(checkScatteredArgument(func, array, mc, isTop)))
+        failed(checkScatteredArgument(func, array, mc, memLib, isTop)))
       return failure();
     // An `seq.hlmem` write is edge-triggered too: a store commits at
     // `writeLatency - 1`, which a 0-cycle write wraps. A 0-cycle read is fine

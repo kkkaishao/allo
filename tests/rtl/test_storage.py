@@ -1372,6 +1372,48 @@ def test_a_complete_partition_conflicting_with_a_bind_is_reported():
     agree.export("rtl").schedule()
 
 
+def test_the_device_names_the_storage_a_scatter_goes_into():
+    # The compiler spells no storage name of its own. A complete partition
+    # resolves to whichever row the DEVICE marked `is_scatter`, so a part whose
+    # flip-flops go by another name marks that one and nothing in the tree
+    # switches on the list; a part that has none cannot hold a scatter at all.
+    @kernel
+    def k(A: i32[8], out: i32[8]):
+        for i in range(8):
+            out[i] = A[i] + 1
+
+    renamed = builtin_device.copy()
+    del renamed.storage["register"]
+    renamed.add_storage(
+        "ff_cell",
+        ports=Port.T2P,
+        read_latency=0,
+        write_latency=1,
+        read_delay_ns=0.1,
+        write_delay_ns=0.1,
+        is_scatter=True,
+    )
+    s = k.schedule()
+    s.partition("A", kind=s.Complete)
+    s.export("rtl", device=renamed).schedule()
+
+    bare = builtin_device.copy()
+    del bare.storage["register"]
+    s = k.schedule()
+    s.partition("A", kind=s.Complete)
+    with pytest.raises(Exception, match="scatter"):
+        s.export("rtl", device=bare).schedule()
+
+    with pytest.raises(ValueError, match="at most one"):
+        builtin_device.copy().add_storage(
+            "another",
+            ports=Port.T2P,
+            read_latency=0,
+            write_latency=1,
+            is_scatter=True,
+        )
+
+
 def test_a_tiled_cost_prices_the_whole_shape():
     # `tiled` is the one cost form reading the WHOLE parameter tuple: a block
     # RAM tile holds 36864 bits however a depth-by-width array is cut, so the

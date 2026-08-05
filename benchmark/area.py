@@ -80,10 +80,18 @@ COMB_KIND = {
     "comb.modu": CombKind.REM, "comb.mods": CombKind.REM,
 }
 
-#: The storage the compiler itself names, and the one an array that failed RAM
-#: inference falls back to: every word gets a data multiplexer and a write
-#: decode, which is what a complete partition builds too.
-REGISTER_FILE = "register"
+def _register_file(device):
+    """What an array that failed RAM inference falls back to: every word gets a
+    data multiplexer and a write decode, which is what a complete partition
+    builds too. The device's `is_scatter` row, since the compiler names no
+    storage of its own and neither does this scoreboard."""
+    row = next((s for s in device.storage.values() if s.is_scatter), None)
+    if row is None:
+        raise ValueError(
+            f"device {device.name!r} marks no scatter storage, so there is "
+            "nothing to price an array that failed RAM inference against"
+        )
+    return row.uses
 
 
 # --- reading the emitted design ---------------------------------------------
@@ -245,7 +253,7 @@ def score(mlir: str, device=builtin_device) -> dict:
 
     price = device.price
     ip_costs = _operator_costs(device)
-    register_file = device.storage[REGISTER_FILE].uses
+    register_file = _register_file(device)
 
     # Registers are priced per CHAIN, not per stage: past the extraction cliff
     # the chain is an SRL and the flip-flop count stops tracking depth.

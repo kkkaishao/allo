@@ -155,7 +155,7 @@ MemId DatapathBuilder::getOrCreateMem(Value memref) {
   m.width = mt.getElementTypeBitWidth();
   // Banking / ports from the same storage model the scheduler binds against
   // (allo.part / allo.bind.storage).
-  auto mc = allo::characterize(memref, lib.memoryLibrary().defaultStorage);
+  auto mc = allo::characterize(memref, lib.memoryLibrary());
   // An initialized global the kernel stores to needs a real write port, so it
   // is a ROM only if nothing writes it: `MemoryChar::constantTable`, the same
   // predicate the scheduler's port model bills against.

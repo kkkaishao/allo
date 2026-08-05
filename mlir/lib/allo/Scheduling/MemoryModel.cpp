@@ -133,15 +133,17 @@ bool mlir::allo::isConstantTable(Value memRef) {
 }
 
 // The name of the storage realization a memref resolves to, the input to
-// per-realization access timing: a complete partition scatters into registers
-// whatever `bind.storage impl` says; else an explicit `bind.storage impl`; else
-// the library default.
-static std::string resolveStorage(Value memRef, StringRef defaultStorage) {
+// per-realization access timing: a complete partition takes the device's
+// `scatter` row whatever `bind.storage impl` says, since once every bank holds
+// one word there is no addressed structure left; else an explicit
+// `bind.storage impl`; else the device's `default` row. An empty result is a
+// device that marks no `scatter`, which `PreVerification` reports.
+static std::string resolveStorage(Value memRef, const MemoryLibrary &lib) {
   if (bankLayoutOf(memRef).registers)
-    return kRegisterStorage.str();
+    return lib.scatterStorage;
   auto bs =
       parseBindStorage(carrierAttr<DictionaryAttr>(memRef, kBindStorageAttr));
-  return (bs.storage.empty() ? defaultStorage : bs.storage).str();
+  return (bs.storage.empty() ? StringRef(lib.defaultStorage) : bs.storage).str();
 }
 
 StringRef allo::boundStorageOf(Value memRef) {
@@ -674,13 +676,13 @@ MemoryLibrary::Timing MemoryLibrary::timing(Operation *op) const {
   // is timed by its own row.
   std::string name;
   if (a->kind != AccessKind::Stream)
-    name = resolveStorage(a->root, defaultStorage);
+    name = resolveStorage(a->root, *this);
   MemKindTiming t = name.empty() ? fifo : timing(name);
   return a->isWrite ? Timing{t.latency.write, t.delay.write, name}
                     : Timing{t.latency.read, t.delay.read, name};
 }
 
-MemoryChar allo::characterize(Value memref, StringRef defaultStorage) {
+MemoryChar allo::characterize(Value memref, const MemoryLibrary &lib) {
   using namespace detail;
   MemoryChar c;
   auto bs =
@@ -689,6 +691,6 @@ MemoryChar allo::characterize(Value memref, StringRef defaultStorage) {
   c.readOnly = bs.kind == MemoryKindEnum::ROM || c.constantTable;
   c.portsPerBank = portCount(bs.port);
   c.numBanks = bankLayoutOf(memref).numBanks;
-  c.storage = resolveStorage(memref, defaultStorage);
+  c.storage = resolveStorage(memref, lib);
   return c;
 }

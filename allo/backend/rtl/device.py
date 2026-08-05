@@ -180,6 +180,10 @@ class Storage:
     write_latency: int
     read_delay_ns: float
     write_delay_ns: float
+    # The row that is NOT a memory: one cell per element, no address, no port
+    # limit. A completely partitioned array resolves here whatever it would
+    # otherwise have taken, and a device declares at most one.
+    is_scatter: bool = False
     # What it spends. Storage carries two parameters, `(depth, width)`, so each
     # entry is two cost factors or one `Tiled`.
     uses: Spend = ()
@@ -310,6 +314,7 @@ class Device:
         write_latency: int,
         read_delay_ns: float = 0.0,
         write_delay_ns: float = 0.0,
+        is_scatter: bool = False,
         uses: dict[Resource, Cost | Sequence] | None = None,
     ) -> Storage:
         """Declare a storage realization and return the handle ``bind_storage``
@@ -318,6 +323,11 @@ class Device:
         Redeclaring a name REPLACES the row: retuning one primitive of a copied
         device is the normal way to build a variant, and the default, being a
         name, keeps pointing at whatever is declared under it.
+
+        ``is_scatter`` marks the row that is not a memory at all: one cell per
+        element, which is what a completely partitioned array becomes. A device
+        marks at most one, and one that marks none cannot hold a complete
+        partition.
 
         Storage carries two parameters, ``(depth, width)``, so a ``uses`` term
         is a pair of costs, or the single :func:`Tiled` that reads them
@@ -329,6 +339,14 @@ class Device:
             raise ValueError(f"storage {name!r}: latency must be non-negative")
         if read_delay_ns < 0 or write_delay_ns < 0:
             raise ValueError(f"storage {name!r}: delay must be non-negative")
+        other = next(
+            (s for s in self.storage.values() if s.is_scatter and s.name != name), None
+        )
+        if is_scatter and other is not None:
+            raise ValueError(
+                f"device {self.name!r} already scatters into {other.name!r}; "
+                "a device has at most one storage an array can be scattered into"
+            )
         s = Storage(
             name=name,
             ports=ports,
@@ -336,6 +354,7 @@ class Device:
             write_latency=int(write_latency),
             read_delay_ns=float(read_delay_ns),
             write_delay_ns=float(write_delay_ns),
+            is_scatter=bool(is_scatter),
             uses=self._spend(f"storage {name!r}", "depth, width", uses),
         )
         self.storage[name] = s
@@ -644,6 +663,7 @@ def inject_device(module, device: Device):
                 DCPathStorageOp(
                     sym_name=s.name,
                     is_default=s.name == device.default_storage,
+                    is_scatter=s.is_scatter,
                     ports=MemoryPortAttr.get(s.ports.value, ctx),
                     uses=_uses_attr(s.uses),
                     **_timing(s),
@@ -759,10 +779,10 @@ def bf2f_l2(a: bf16) -> f32: ...
 # The built-in device: storage + native chaining tables + the operators above.
 builtin_device = Device("builtin")
 # The storage realizations, under the names an `allo.bind.storage impl=`
-# resolves against. `register` is the one name the COMPILER also spells: a
-# complete partition scatters an array into flip-flops whatever else it would
-# have resolved to, so every device must declare a row under it. `srl` is a
-# shift register, a realization of its own that happens to spend LUTs.
+# resolves against. The compiler spells none of them: `register` is the SCATTER
+# row here only because it is marked, and a part whose flip-flops go by another
+# name marks that one instead. `srl` is a shift register, a realization of its
+# own that happens to spend LUTs.
 builtin_device.add_storage(
     "register",
     ports=Port.T2P,
@@ -770,6 +790,7 @@ builtin_device.add_storage(
     write_latency=1,
     read_delay_ns=0.1,
     write_delay_ns=0.1,
+    is_scatter=True,
 )
 _lutram = builtin_device.add_storage(
     "lutram",

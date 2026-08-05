@@ -60,11 +60,6 @@ struct MemKindTiming {
   RWDelay delay;
 };
 
-/// The one storage name the COMPILER spells rather than the device. A complete
-/// partition scatters an array into flip-flops whatever it would otherwise
-/// resolve to, so every device must declare a row under this name.
-inline constexpr llvm::StringLiteral kRegisterStorage = "register";
-
 /// One `dcp.storage` row: a structure the device can hold an array in, named by
 /// the device's own vocabulary rather than by a case of a closed enum.
 struct StorageRealization {
@@ -101,10 +96,22 @@ public:
   /// before its data is valid.
   bool declares(llvm::StringRef storage) const;
 
+  /// Whether \p storage is the row the device marked `scatter`: one cell per
+  /// element, no address, no port limit. False for every row when the device
+  /// marks none, which is what makes a complete partition unrealizable there
+  /// rather than silently addressed.
+  bool isScatter(llvm::StringRef storage) const {
+    return !scatterStorage.empty() && storage == scatterStorage;
+  }
+
   // What an array with no `allo.bind.storage impl=` resolves to: the device's
   // `dcp.storage` marked `default`, or this fallback when it marks none. A name
   // rather than a handle, so replacing a row does not leave it dangling.
   std::string defaultStorage = "lutram";
+  // What a completely partitioned array resolves to: the `dcp.storage` marked
+  // `scatter`, EMPTY when the device marks none. The compiler names no storage
+  // of its own, so this is the one place the two axes meet.
+  std::string scatterStorage;
   std::vector<StorageRealization> storage; // the `dcp.storage` rows
   MemKindTiming fifo;                      // `dcp.stream_timing`
 };
@@ -121,11 +128,6 @@ struct MemoryChar {
   bool readOnly = false;      // no write port needed (declared ROM, or by use)
   bool constantTable = false; // realized as a combinational constant array
   std::string storage;        // resolved `dcp.storage` realization
-
-  /// Whether the array is scattered into flip-flops rather than held in an
-  /// addressed memory. A property of the RESOLVED realization, asked on that
-  /// one axis: a complete partition reaches it by resolving to `register`.
-  bool registers() const { return storage == kRegisterStorage; }
 };
 
 /// The `memref.global` initializer behind \p memRef, i.e. a constant table's
@@ -148,11 +150,11 @@ std::optional<Attribute> globalInitOf(Value memRef);
 bool isConstantTable(Value memRef);
 
 /// Characterize a memref's storage shape from its partition/storage
-/// attributes, independent of any scheduling region. \p defaultStorage resolves
-/// an array with no explicit `allo.bind.storage impl=`; pass the device's
-/// `MemoryLibrary::defaultStorage`, or this disagrees with the realization the
-/// access latencies were stamped from.
-MemoryChar characterize(Value memref, llvm::StringRef defaultStorage);
+/// attributes, independent of any scheduling region. \p lib resolves the two
+/// rows the array itself does not name: what an unbound array takes, and what a
+/// completely partitioned one scatters into. It has to be the same device the
+/// access latencies were stamped from, or the two disagree.
+MemoryChar characterize(Value memref, const MemoryLibrary &lib);
 
 /// The `allo.bind.storage impl=` written on \p memref: what was ASKED for,
 /// before `characterize` resolves it, and empty when nothing was. A complete
