@@ -7,6 +7,7 @@
 #define ALLO_SCHEDULING_OPERATORLIBRARY_H
 
 #include "allo/IR/AlloOps.h"                  // kAlloAsyncAttr
+#include "allo/Scheduling/MemoryAccess.h"     // asMemAccess
 #include "allo/Scheduling/MemoryModel.h"      // MemoryLibrary
 #include "allo/Scheduling/OperatorIdentity.h" // OperatorIdentity
 #include "allo/Scheduling/RegionGraph.h"      // calleeStaticLatency
@@ -219,15 +220,28 @@ scheduledCallLatency(Operation *op) {
 // Operator model: apply a library to a scheduling problem.
 //===----------------------------------------------------------------------===//
 
+/// What one memory or stream access is worth to a schedule. NOT a device
+/// operator row: an access builds no functional unit, so it has no identity
+/// and no price, and both libraries answer for it. Its length and port delay
+/// are the storage's (\p memLib); the address cone feeding that port is
+/// ARITHMETIC, priced against \p opLib's combinational rows.
+///
+/// The two meet here rather than inside either library, because a scheduling
+/// problem is the only thing that needs them added up.
+OperatorChar accessCharacterization(Operation *op, const OperatorLibrary &opLib,
+                                    const MemoryLibrary &memLib);
+
 /// Assign an operator type (latency + chaining delays) to every operation
-/// \p problem holds, sourced from \p lib. A scheduled sync call is a
-/// fixed-latency node between registered boundaries.
+/// \p problem holds. Three sources, because a problem holds three kinds of
+/// node: an operator row for a compute op, the callee's own schedule for a
+/// sync call, and the storage plus its address cone for an access.
 ///
 /// Over the problem's OWN operations and not a second walk of the IR: each
 /// builder registers every op it walks, and nothing runs between a build and
 /// this to change that set, so the problem is what holds the list.
 template <class ProblemT>
-void populateOperatorTypes(ProblemT &problem, const OperatorLibrary &lib) {
+void populateOperatorTypes(ProblemT &problem, const OperatorLibrary &lib,
+                           const MemoryLibrary &memLib) {
   using namespace circt::scheduling;
   for (Operation *op : problem.getOperations()) {
     if (isSyncSubKernelCall(op)) {
@@ -245,7 +259,8 @@ void populateOperatorTypes(ProblemT &problem, const OperatorLibrary &lib) {
       problem.setLinkedOperatorType(op, opr);
       continue;
     }
-    OperatorChar c = lib.lookup(op);
+    OperatorChar c = asMemAccess(op) ? accessCharacterization(op, lib, memLib)
+                                     : lib.lookup(op);
     Problem::OperatorType opr = problem.getOrInsertOperatorType(c.typeName);
     problem.setLatency(opr, c.latency);
     problem.setIncomingDelay(opr, c.inDelay);
@@ -308,6 +323,8 @@ inline void populateOperatorOccupancy(ChainingModuloProblem &problem,
   for (Operation *op : problem.getOperations()) {
     if (isSyncSubKernelCall(op))
       continue; // a re-fired child instance, `populateCallOccupancy`'s window
+    if (asMemAccess(op))
+      continue; // a storage port, whose limit is `populateMemoryResources`'
     OperatorChar c = lib.lookup(op);
     // A one-cycle window is what a pipelined unit already holds, and bounds no
     // interval.
@@ -370,6 +387,8 @@ void populateOperatorAllocation(ProblemT &problem, const OperatorLibrary &lib) {
   for (Operation *op : problem.getOperations()) {
     if (isSyncSubKernelCall(op))
       continue; // one child instance per callsite; no unit to fold it onto
+    if (asMemAccess(op))
+      continue; // a storage port; nothing an operator allocation can fold
     OperatorChar c = lib.lookup(op);
     if (!c.identity.realized() || c.identity.comb)
       continue;

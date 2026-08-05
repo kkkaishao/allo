@@ -366,7 +366,7 @@ LogicalResult FuncScheduler::scheduleCyclic(LoopLikeOpInterface body,
   CarriedEdges carried;
   auto problem = buildCyclicProblem<ChainingModuloProblem>(body, deps, carried);
   Block *bodyBlock = &body.getLoopRegions().front()->front();
-  populateOperatorTypes(problem, lib);
+  populateOperatorTypes(problem, lib, lib.memoryLibrary());
   recordOperatorClasses(problem, lib, model);
   // What contends, then how many of it to build: an occupancy window is a
   // physical property of the region and holds however the units are allocated.
@@ -458,7 +458,7 @@ LogicalResult FuncScheduler::scheduleWhile(scf::WhileOp w,
                                            const SchedRegion &region) {
   CarriedEdges carried;
   auto problem = buildWhileProblem<ChainingModuloProblem>(w, deps, carried);
-  populateOperatorTypes(problem, lib);
+  populateOperatorTypes(problem, lib, lib.memoryLibrary());
   recordOperatorClasses(problem, lib, model);
   populateMemoryResources(problem, lib.memoryLibrary());
   // A flushing while issues an iteration per II like a pipeline: a
@@ -569,7 +569,7 @@ LogicalResult FuncScheduler::scheduleAcyclic(ArrayRef<Operation *> ops,
                                              bool ownsRegion) {
   ChainingSharedOperatorsProblem problem =
       buildAcyclicProblem<ChainingSharedOperatorsProblem>(ops, deps);
-  populateOperatorTypes(problem, lib);
+  populateOperatorTypes(problem, lib, lib.memoryLibrary());
   recordOperatorClasses(problem, lib, model);
   populateMemoryResources(problem, lib.memoryLibrary());
   if (opts.allocate)

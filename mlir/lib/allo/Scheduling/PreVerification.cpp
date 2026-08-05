@@ -684,9 +684,10 @@ static LogicalResult checkAddressCost(func::FuncOp funcOp,
     os << e.offset;
     if (e.bank)
       os << " (bank " << e.bank << ")";
-    // `lookup`'s inDelay adds the port's own setup to the address cone,
+    // The access's own inDelay adds the port's setup to the address cone,
     // which is what the solver sees.
-    double charged = lib.lookup(op).inDelay;
+    double charged =
+        accessCharacterization(op, lib, lib.memoryLibrary()).inDelay;
     bool over = charged > cycleTimeNs;
     if (over) {
       ++overCycle;

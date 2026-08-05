@@ -392,51 +392,49 @@ int64_t OperatorLibrary::pulsePrice() const {
   return chainPrice(2, 1) - chainPrice(1, 1);
 }
 
+OperatorChar mlir::allo::accessCharacterization(Operation *op,
+                                                const OperatorLibrary &opLib,
+                                                const MemoryLibrary &memLib) {
+  std::optional<MemAccess> a = asMemAccess(op);
+  assert(a && "accessCharacterization was handed something that is not an "
+              "access");
+  MemoryLibrary::Timing t = memLib.timing(op);
+  OperatorChar c;
+  bool stream = a->kind == AccessKind::Stream;
+  c.typeName = stream ? (a->isWrite ? "srm.wr" : "srm.rd")
+                      : (a->isWrite ? "mem.wr" : "mem.rd");
+  if (!stream) {
+    assert(!t.storage.empty() &&
+           "an array access resolves to a storage realization");
+    c.typeName += t.storage;
+  }
+  c.latency = t.latency;
+  c.inDelay = c.outDelay = t.delay;
+  // The address cone is no operation of its own, so no dependence carries its
+  // delay: charge it to the port it feeds. The type NAME carries it too, or
+  // two sites costing differently would share one characterization.
+  if (double addr = addressDelayOf(op, opLib)) {
+    // A registered port takes the cone on its input side alone, ending at its
+    // own address register. A zero-latency port has none, and CIRCT requires
+    // its two delays to agree, so there the cone lands on both.
+    c.inDelay += addr;
+    if (c.latency == 0)
+      c.outDelay += addr;
+    c.typeName += "@" + llvm::formatv("{0:F2}", addr).str();
+  }
+  return c;
+}
+
 OperatorChar OperatorLibrary::lookup(Operation *op) const {
-  // A sub-kernel call is not an operator: no device row, identity, or price.
-  // Its length is its callee's own schedule (`scheduledCallLatency`), or
-  // nothing nameable when the callee is indeterminate; each caller decides
-  // what that means for its own question.
+  // Neither a sub-kernel call nor a memory access is an operator: no device
+  // row, identity, or price. A call's length is its callee's own schedule
+  // (`scheduledCallLatency`), an access's is its storage's
+  // (`accessCharacterization`); each caller decides what that means for its
+  // own question.
   assert(!isSyncSubKernelCall(op) &&
          "the operator library was asked to time a sub-kernel call");
-  auto kind = classify(op);
-
-  // Memory / stream accesses are the storage dimension.
-  switch (kind) {
-  case OpKind::MemRead:
-  case OpKind::MemWrite:
-  case OpKind::StreamRead:
-  case OpKind::StreamWrite: {
-    auto t = memory.timing(op);
-    OperatorChar c;
-    c.typeName = (kind == OpKind::MemRead      ? "mem.rd"
-                  : kind == OpKind::MemWrite   ? "mem.wr"
-                  : kind == OpKind::StreamRead ? "srm.rd"
-                                               : "srm.wr");
-    if (kind == OpKind::MemRead || kind == OpKind::MemWrite) {
-      assert(!t.storage.empty() &&
-             "an array access resolves to a storage realization");
-      c.typeName += t.storage;
-    }
-    c.latency = t.latency;
-    c.inDelay = c.outDelay = t.delay;
-    // The address cone is no operation of its own, so no dependence carries its
-    // delay: charge it to the port it feeds. The type NAME carries it too, or
-    // two sites costing differently would share one characterization.
-    if (double addr = addressDelayOf(op, *this)) {
-      // A registered port takes the cone on its input side alone, ending at its
-      // own address register. A zero-latency port has none, and CIRCT requires
-      // its two delays to agree, so there the cone lands on both.
-      c.inDelay += addr;
-      if (c.latency == 0)
-        c.outDelay += addr;
-      c.typeName += "@" + llvm::formatv("{0:F2}", addr).str();
-    }
-    return c;
-  }
-  default:
-    break;
-  }
+  assert(!asMemAccess(op) &&
+         "the operator library was asked to time a memory access");
 
   const auto *e = matchEntry(advancedEntries, entries, op);
   if (!e) {
@@ -512,7 +510,7 @@ void mlir::allo::recordOperatorClasses(circt::scheduling::Problem &problem,
                                        const OperatorLibrary &lib,
                                        ScheduleModel &model) {
   for (Operation *op : problem.getOperations()) {
-    if (isSyncSubKernelCall(op))
+    if (isSyncSubKernelCall(op) || asMemAccess(op))
       continue; // no operator row, so no class for one to over-approximate
     OperatorIdentity id = operatorIdentity(op, lib);
     if (!id.realized())
