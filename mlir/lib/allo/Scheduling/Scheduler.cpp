@@ -364,9 +364,9 @@ protected:
   Problem &getProblem() override { return prob; }
   void fillAdditionalConstraintRow(SmallVector<int> &row,
                                    Problem::Dependence dep) override {
-    // Inherited (cyclic) constraint row: latency + II*distance ...
+    // Inherited (cyclic) constraint row: latency + II*distance, plus one
+    // extra time step to break the combinational chain.
     fillConstraintRow(row, dep);
-    // ... plus one extra time step to break the combinational chain.
     row[parameter1Column] -= 1;
   }
 
@@ -404,9 +404,9 @@ protected:
   Problem &getProblem() override { return prob; }
   void fillAdditionalConstraintRow(SmallVector<int> &row,
                                    Problem::Dependence dep) override {
-    // Acyclic constraint row (latency only, no II term) ...
+    // Acyclic constraint row (latency only, no II term), plus one extra time
+    // step to break the combinational chain.
     fillConstraintRow(row, dep);
-    // ... plus one extra time step to break the combinational chain.
     row[parameter1Column] -= 1;
   }
 
@@ -1028,14 +1028,11 @@ void SimplexSchedulerBase::moveBy(unsigned startTimeVariable, unsigned amount) {
 
   frozenVariables[startTimeVariable] += amount;
 
-  // Moving an already frozen variable means translating it by the desired
-  // amount, and solving the tableau to restore primal feasibility...
+  // Translate by the desired amount; solving to restore primal feasibility is
+  // deferred to the caller, which typically batch-moves several operations
+  // (an intermediate solve could see a still-infeasible tableau).
   translate(startTimeLocations[startTimeVariable], /* factor1= */ amount,
             /* factorS= */ 0, /* factorT= */ 0);
-
-  // ... however, we typically batch-move multiple operations (otherwise, the
-  // tableau may become infeasible on intermediate steps), so actually defer
-  // solving to the caller.
 }
 
 SimplexSchedulerBase::LPState SimplexSchedulerBase::saveLP() {

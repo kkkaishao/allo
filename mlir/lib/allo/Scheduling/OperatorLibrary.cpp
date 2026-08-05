@@ -508,13 +508,10 @@ int64_t OperatorLibrary::pulsePrice() const {
 }
 
 OperatorChar OperatorLibrary::lookup(Operation *op) const {
-  // A sub-kernel call is NOT an operator. It has no device row to match, no
-  // identity and no price, and its length is its CALLEE's own schedule
-  // (`scheduledCallLatency`), or nothing a schedule can name at all when the
-  // callee is indeterminate. Answering it here would hand back the 0-latency
-  // default row below, which is how a `while` whose continue-condition calls a
-  // sub-kernel once reached the flushing-pipeline schedule and aborted in the
-  // emitter. Every caller decides what a call means for its own question.
+  // A sub-kernel call is not an operator: no device row, identity, or price.
+  // Its length is its callee's own schedule (`scheduledCallLatency`), or
+  // nothing nameable when the callee is indeterminate; each caller decides
+  // what that means for its own question.
   assert(!isSyncSubKernelCall(op) &&
          "the operator library was asked to time a sub-kernel call");
   auto kind = classify(op);
@@ -558,20 +555,12 @@ OperatorChar OperatorLibrary::lookup(Operation *op) const {
 
   const auto *e = matchEntry(advancedEntries, entries, op);
   if (!e) {
-    // Matching NOTHING is the ordinary answer, not an error: what reaches here
-    // on a real kernel is `arith.constant`, the `affine.yield`/`scf.yield`
-    // terminators and `affine.apply`, none of which the device builds a unit
-    // for. The first three genuinely cost nothing; `affine.apply` takes the
-    // default row's delay, which is what `combDelay(CombOpKindEnum::Apply)`
-    // charges it too, so the schedule and the emitter share one approximation
-    // rather than disagreeing.
-    //
-    // Reaching here is a MISCOMPILE only for an op whose time exists but lives
-    // in another model. A sub-kernel call is asserted against at the top; a
-    // float->float arith op is one an IP has to realize:
-    //
-    // The default row (0-latency comb) is a miscompile for a float->float arith
-    // op that is neither combinational nor already rejected by `needsIP`.
+    // Matching nothing is ordinary: a constant, a yield terminator, or
+    // `affine.apply` cost nothing real here (apply takes the default row's
+    // delay, matching `combDelay(CombOpKindEnum::Apply)`). A float->float
+    // arith op reaching here would miscompile at latency 0, so assert
+    // instead; extend `classify()`/`needsIP()` (`validateDatapath` repeats
+    // this check for a release build).
     auto isFloat = [](Type t) { return isa<FloatType>(t); };
     bool floatIn = llvm::any_of(elementTypes(op->getOperandTypes()), isFloat);
     bool floatOut = llvm::any_of(elementTypes(op->getResultTypes()), isFloat);

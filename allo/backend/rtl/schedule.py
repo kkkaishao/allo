@@ -34,12 +34,11 @@ outline-loose-processes)
 
 
 def run_schedule(top, module, settings: ScheduleSettings) -> ScheduleResult:
-    """Schedule ``top`` under ``settings`` and return the :class:`ScheduleResult`;
+    """Schedule ``top`` under ``settings`` and return the :class:`ScheduleResult`.
     ``module`` is rewritten in place, left holding the ``allo.dcp.*`` ops the
     schedule reifies into. Operator/device timing is read from the ``dcp.device``
-    / ``dcp.operator`` ops injected into ``module`` before this call.
-
-    The knobs and what each does are the fields of :class:`ScheduleSettings`.
+    / ``dcp.operator`` ops injected into ``module`` before this call. The knobs
+    are the fields of :class:`ScheduleSettings`.
     """
     run_pipeline(module, RTL_PREPARE_PIPELINE)
     reassoc = (

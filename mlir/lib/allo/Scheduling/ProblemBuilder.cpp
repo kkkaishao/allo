@@ -304,28 +304,19 @@ static Value expandGuardPredicate(OpBuilder &b, AffineIfOp guard) {
   return cond;
 }
 
-// Turn every region BOUNDARY expression into operations, so the solve sees
-// them: a counted loop's runtime bounds and a guard's predicate are an
-// `AffineMap` and an `IntegerSet`, and the constraint system has a vertex only
-// for an operation. Left as attributes they reach the datapath uncut, on a path
-// the container gives exactly one period.
+// Reifies each region boundary expression (a counted loop's runtime bounds, a
+// guard's predicate) into operations, since the constraint system has a
+// vertex only for an operation and an `AffineMap`/`IntegerSet` alone gives it
+// none. The loop/guard itself is not rewritten; the reified values live in
+// \p model as each anchor's entry cone. Runs after \p deps is built and adds
+// only pure ops naming no memref, so it cannot invalidate it.
 //
-// The loop and the guard are NOT rewritten: their map and set stay where they
-// are, having no reader past the reify, and the values travel in the model.
-// That is also what keeps the dependence analysis exact, since the arith an
-// expansion produces is no valid affine symbol; this runs AFTER `deps` is
-// built, which has already distilled every distance, and adds only pure ops
-// naming no memref, so it cannot invalidate it.
-//
-// This CHANGES THE REGION SHAPE the partitioning downstream of it sees, and is
-// meant to. An expansion builds into the anchor's own block, so a non-trivial
-// bound on an INNER loop puts operations beside it, `perfectNest` stops
-// descending there, and a nest that would have been one Leaf modulo problem
-// becomes a Container over sub-regions. That is the right answer: the boundary
-// arithmetic is real work needing a schedule, and a level driving it plus a
-// child is exactly what a Container is. It rests on `expandAffineExpr` building
-// NOTHING for a trivial map, which is what keeps the ordinary `for i in
-// range(n)` nest perfect (`expandLoopBound`).
+// This changes region shape: a non-trivial bound on an inner loop places ops
+// beside it, so `perfectNest` stops descending there and what would be one
+// Leaf modulo problem becomes a Container over sub-regions, since the bound
+// arithmetic is itself work needing a schedule. `expandLoopBound` builds
+// nothing for a trivial map, which keeps an ordinary `for i in range(n)` nest
+// perfect.
 void expandRegionBoundaries(func::FuncOp funcOp, DependenceAnalysis &deps,
                             ScheduleModel &model) {
   SmallVector<Operation *> anchors;

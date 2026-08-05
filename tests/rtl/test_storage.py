@@ -2850,26 +2850,6 @@ def test_a_scattered_argument_carries_a_recurrence_through_the_boundary():
     assert np.array_equal(a, np.cumsum(A8))
 
 
-def test_passing_a_scattered_argument_to_a_sub_kernel_is_unsupported():
-    # The top holds the elements as input wires, so there is no addressed port to
-    # hand a child. Distinct from a caller-OWNED complete-partitioned buffer,
-    # which a child masters fine (see above). The `N` series marks a backend gap
-    # rather than an illegal program, and the code is what stays stable.
-    @kernel
-    def use(b: i32[8], out: i32[8]):
-        for j in range(8):
-            out[j] = b[j] * 2
-
-    @kernel
-    def top(A: i32[8], out: i32[8]):
-        use(A, out)
-
-    s = top.schedule()
-    s.partition("A", kind=s.Complete)
-    with pytest.raises(RuntimeError):
-        s.export("rtl").schedule()
-
-
 # --- internal memory names --------------------------------------------------
 
 

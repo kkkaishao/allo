@@ -81,11 +81,10 @@ Chaining chainingFor(ProblemT &prob, float cycleTime, bool exactChaining) {
   return chaining;
 }
 
-/// Sub-cycle time in picoseconds, rounded to the nearest: CP-SAT is integer.
-/// Device delays are given to a hundredth of a nanosecond, so a picosecond has
-/// enough resolution and the rounding only absorbs float representation error.
-/// Round-to-nearest and not up, because a chain that fills the period exactly
-/// is common and rounding up would reject a schedule the clock accepts.
+/// Sub-cycle time in picoseconds, rounded to nearest: CP-SAT is integer, and a
+/// picosecond has enough resolution against delays given to a hundredth of a
+/// nanosecond. Round-to-nearest rather than up, since a chain that fills the
+/// period exactly is common and rounding up would reject it.
 constexpr double kPicosPerNs = 1000.0;
 int64_t picos(double ns) { return std::llround(ns * kPicosPerNs); }
 
@@ -100,7 +99,7 @@ int64_t picos(double ns) { return std::llround(ns * kPicosPerNs); }
 ///
 /// Only def-use edges carry a combinational path; an auxiliary edge (memory
 /// order, stream order, loop-carried recurrence) always passes through a port
-/// or register, so both forms of chaining see the same chains.
+/// or register.
 template <class ProblemT>
 void addSubCycleTimes(CpModelBuilder &model, ProblemT &prob,
                       DenseMap<Operation *, IntVar> &startVars,
@@ -214,11 +213,9 @@ struct AllocationVar {
 /// capacity constraint against it.
 ///
 /// \p hint says the heuristic's start times are being hinted too, and then the
-/// count hinted is the TIGHTEST one those start times admit rather than the
-/// trivial one. Both are consistent with the hinted schedule and the tight one
-/// is what the greedy binder would have built from it, so the solver starts
-/// where the area-agnostic policy ends instead of having to search its way
-/// there; on a region whose budget runs out, the hint is what ships.
+/// count hinted is the TIGHTEST one those start times admit (what the greedy
+/// binder would have built from them), not the trivial one; on a region whose
+/// budget runs out, the hint is what ships.
 SmallVector<AllocationVar> allocationVars(CpModelBuilder &model,
                                           OccupancyProblem &prob, unsigned ii,
                                           bool hint) {
@@ -245,9 +242,8 @@ SmallVector<AllocationVar> allocationVars(CpModelBuilder &model,
 /// value the size can take. A piecewise-linear price is its FIRST slope on the
 /// size, plus at every change of slope that change charged on how far the size
 /// runs past the point it changes at: `max(size - b, 0)`. Every variable this
-/// adds is determined by the size through a propagator, where selecting one of
-/// the segments instead would be a disjunction per structure for the search to
-/// branch on, and a device has a change of slope per shift register.
+/// adds is determined by the size through a propagator, avoiding a
+/// per-segment disjunction for the search to branch on.
 ///
 /// The sum is an identity, so what it contributes is bounded by the price's own
 /// maximum however the slopes cancel.
@@ -290,11 +286,9 @@ void minimizeCost(CpModelBuilder &model, IntVar primary,
   int64_t pulse = span.device.pulsePrice();
   SmallVector<IntVar> vars(starts.begin(), starts.end());
   SmallVector<int64_t> weights(starts.size(), pulse);
-  // Bounds how far the tie-break can reach, so `primary`'s weight below
-  // strictly dominates it. Loose on purpose: a price is already an area and
-  // needs no horizon factor, but taking it out makes the tie-break a
-  // comparable share of the objective and costs four times the search for a
-  // third of a percent of area.
+  // Bounds the tie-break so `primary`'s weight below dominates it. Loose on
+  // purpose: a tight bound turns the tie-break into a comparable share of the
+  // objective, at a large search cost for negligible area.
   int64_t area = static_cast<int64_t>(starts.size()) * pulse;
   // One chain price table per width: a region carries many values of the same
   // type, and tabulating the device's cost is the expensive half.
@@ -323,12 +317,9 @@ void minimizeCost(CpModelBuilder &model, IntVar primary,
   // being weighted at nothing along with it.
   int64_t dominating = std::max<int64_t>(area, 1) * (horizon + 1);
 #ifndef NDEBUG
-  // `area` is charged term by term above, so it only bounds the tie-break for
-  // as long as every term charges it. Read the reach back off the terms
-  // themselves: the largest the weighted sum can be is each variable at
-  // whichever end of its domain its weight favours. A term added without a
-  // matching charge trips here rather than quietly letting the tie-break
-  // outweigh `primary` and buy a cycle with area.
+  // Recomputes the tie-break's max reach from each variable's domain and
+  // weight; a term added above without a matching charge to `area` trips this
+  // rather than letting the tie-break outweigh `primary`.
   int64_t reach = 0;
   for (auto [var, weight] : llvm::zip(vars, weights)) {
     operations_research::Domain d = var.Domain();
@@ -385,10 +376,9 @@ void applyAllocation(OccupancyProblem &prob, const Allocated &decided,
 }
 
 /// Fall back to the tightest allocation the schedule already on the problem
-/// admits, for a solve that decided none. Without it a region whose budget ran
-/// out keeps the TRIVIAL allocation and the emitter builds one instance per
-/// operation, which is strictly worse than what the same schedule supports and
-/// worse than what an area-agnostic greedy binder would fold it to.
+/// admits, for a solve that decided none. Without it, a region whose budget
+/// ran out keeps the trivial allocation (one instance per operation) instead
+/// of what the schedule actually supports.
 void applyDemandAllocation(OccupancyProblem &prob, unsigned ii) {
   Allocated decided;
   for (Problem::ResourceType rsrc : prob.getResourceTypes())
@@ -423,7 +413,7 @@ void reportUnsolved(Problem &prob, const CpSolverResponse &response,
 ///
 /// The heuristic runs first as a feasibility check and a warm-start hint: its
 /// resource-free LP is the only thing that can fail, so a failure here is
-/// fatal, unlike the cyclic path where placement is optional.
+/// fatal.
 ///
 /// A straight-line region runs once, so its whole cost is its drain, which the
 /// objective minimizes, upper-bounded by the heuristic's own drain so the
@@ -635,10 +625,9 @@ ModuloOutcome solveAtII(ChainingModuloProblem &prob, Operation *lastOp,
     orderedStarts.push_back(var);
   }
 
-  // Precedence. An edge spanning `distance` iterations is relaxed by one II per
-  // iteration it spans, which is the cyclic constraint row `buildTableau`
-  // emits. A chain-breaking edge is intra-iteration, so `addChaining` states it
-  // without the II term.
+  // Precedence. An edge spanning `distance` iterations is relaxed by one II
+  // per iteration it spans, matching the cyclic constraint row `buildTableau`
+  // emits; a chain-breaking edge is intra-iteration and carries no II term.
   for (Operation *op : ops)
     for (auto &dep : prob.getDependences(op)) {
       Operation *src = dep.getSource();
@@ -744,10 +733,10 @@ ModuloOutcome solveAtII(ChainingModuloProblem &prob, Operation *lastOp,
 /// on the region's span. Only that lower bound (from the resource-free LP) is
 /// needed; the heuristic's placement is optional context (`SimplexWarmStart`).
 ///
-/// The search cannot return at the first feasible II: what the region is
-/// charged is `(trip - 1) * ii + drain`, and a larger II can still win by
-/// admitting a shorter drain. So it keeps the best span seen and cuts at the
-/// first interval whose II term alone already reaches it.
+/// The search cannot stop at the first feasible II: what the region is charged
+/// is `(trip - 1) * ii + drain`, and a larger II can still win with a shorter
+/// drain. It keeps the best span seen and cuts once an interval's II term
+/// alone already reaches it.
 LogicalResult mlir::allo::scheduleCPSAT(ChainingModuloProblem &prob,
                                         Operation *lastOp, float cycleTime,
                                         unsigned minII,
@@ -823,10 +812,9 @@ LogicalResult mlir::allo::scheduleCPSAT(ChainingModuloProblem &prob,
   std::optional<unsigned> exhaustedAt;
 
   for (unsigned ii = warm.lowerBoundII; ii <= upperII; ++ii) {
-    // Cut: this interval's span already reaches the incumbent's before a single
-    // operation is placed in it, and every interval past it is worse. Where an
-    // allocation is decided, an interval that only ties on span can still win
-    // on area, so the cut admits the tie.
+    // Cut: this interval's span already reaches the incumbent's before a
+    // single operation is placed, and every later interval is worse. Where an
+    // allocation is decided, admit a tie since it can still win on area.
     if (best && iiWeight * ii + floorDrain >= *best + (allocates ? 1 : 0))
       break;
     std::optional<int64_t> drainBound;

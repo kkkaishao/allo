@@ -1,33 +1,8 @@
 # Copyright Allo authors. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""What the `xcu55c` part has, and what each thing it builds spends of it.
-
-The numbers are P6's and P7's measurements: Vivado 2023.2,
-``xcu55c-fsvh2892-2L-e``, out-of-context synthesis of one DUT per (kind, width),
-one Xilinx Floating-Point core per device operator at its declared latency, and
-a sweep per multiplexer fan-in, chain depth and array shape; primitives counted
-off the netlist. They lived in ``benchmark/area.py`` as a second model running
-beside the compiler; this is the same table in the device's own vocabulary, so
-there is one declaration and several readers.
-
-Each cost is the measured SHAPE with a measured coefficient, never a curve fit:
-an N-bit AND is N LUT6s so it is linear, an adder adds a carry chain, a divider
-is quadratic. Where the shape is not structural, or is structural but has one
-user and a handful of interesting widths, the measurement itself is the table.
-
-Two places the declaration is coarser than ``area.py``'s arithmetic:
-
-* A table holds the value of the last point at or below its argument, so a
-  width between two measured ones reads the lower row. A 48-bit barrel shift is
-  priced as the 32-bit one, and anything under 8 bits as the 8-bit one.
-* A ``Tiled`` cost is the array's BITS over a tile's, so it under-counts an
-  array too shallow to fill a tile's depth: a 4x32 block RAM is one whole
-  BRAM36, not ``ceil(128/36864)``. The same approximation for every tiled row.
-
-And one shape the vocabulary cannot hold at all, which is written up where it
-bites, on ``chain``.
-"""
+"""The xcu55c device's measured area/resource cost model: what the part has,
+and what each structure it builds spends of it."""
 
 from __future__ import annotations
 
@@ -37,26 +12,21 @@ if TYPE_CHECKING:
     from .device import Device
 
 
-#: What the part has. The card data sheet (DS978) gives 1,304K LUTs, 2,607K
-#: registers, 9,024 DSP slices, 70.9 Mb of 36 Kb block RAM and 960 UltraRAM
-#: blocks; the exact LUT and flip-flop counts are the Virtex UltraScale+ product
-#: table's for XCVU47P, the die xcu55c is built on, and round to the card's.
+#: Part capacity, from the DS978 data sheet; exact LUT/FF counts are the Virtex
+#: UltraScale+ product table's for XCVU47P, the die xcu55c is built on.
 CAPACITY = {
     "lut": 1_303_680,
     "ff": 2_607_360,
     "dsp": 9_024,
-    # DERIVED, not quoted: no data sheet lists CARRY8. An UltraScale+ CLB holds
-    # eight LUT6 and one CARRY8 (UG574), so the part has one per eight LUTs.
+    # DERIVED, not quoted: an UltraScale+ CLB holds eight LUT6 and one CARRY8
+    # (UG574), so the part has one CARRY8 per eight LUTs.
     "carry8": 162_960,
-    # DERIVED for the same reason: only a SLICEM LUT can hold a shift register
-    # or a distributed RAM, and about half an UltraScale+ device's slices are
-    # SLICEM (UG574), so the part has one SRL site per two LUTs.
+    # DERIVED: only a SLICEM LUT holds a shift register or distributed RAM, and
+    # about half an UltraScale+ device's slices are SLICEM (UG574).
     "slicem_lut": 651_840,
     "bram36": 2_016,
-    # A tile counter, named for its size the way `bram36` is, because the
-    # STORAGE realization an array binds to is `uram` and the two share the
-    # device's one symbol table: the counter and the structure built out of it
-    # are different things and cannot answer to one name.
+    # Tile counter, named for its size like `bram36`; the storage realization
+    # an array binds to is `uram`, a distinct name in the same symbol table.
     "uram288": 960,
 }
 
@@ -84,12 +54,10 @@ IP_AREA = {
     "bf2f_l2": (25, 50, 0, 1),
 }
 
-#: LUTs per bit of a `k`-source one-hot AND-OR select, over the fan-ins P6
-#: measured (k = 2 to 40), listed where the staircase steps. A LUT6 absorbs
-#: three (data, select) pairs and about 2.5 more per further level, so the curve
-#: is LINEAR in k rather than logarithmic; it is a table and not a `Linear`
-#: because 2.5 pairs per level is a measurement and the ceiling it sits under is
-#: what makes the per-bit cost whole. One source is a wire and costs nothing.
+#: LUTs per bit of a `k`-source one-hot AND-OR select, measured for k = 2..40,
+#: listed where the staircase steps. A LUT6 absorbs three (data, select) pairs
+#: and ~2.5 more per further level, so the curve is LINEAR in k, not
+#: logarithmic. One source is a wire and costs nothing.
 MUX_LUT_PER_BIT = {
     1: 0,
     2: 1,
@@ -116,9 +84,8 @@ MUX_LUT_PER_BIT = {
 SRL_MIN_DEPTH = 4
 
 #: SLICEM sites per bit of an extracted chain: an SRL32E holds 32 stages, so the
-#: staircase is `ceil(depth/32)` and it starts at the extraction threshold.
-#: `Tiled(32)` IS that ceiling, but a tiled cost reads the whole `(depth,
-#: width)` tuple and this ceiling is per bit, so the staircase is spelled out.
+#: staircase is `ceil(depth/32)` starting at the extraction threshold. Spelled
+#: out per bit rather than as `Tiled(32)`, which reads the whole tuple.
 SRL_SITES_PER_BIT = {1: 0, SRL_MIN_DEPTH: 1}
 SRL_SITES_PER_BIT.update({32 * i + 1: i + 1 for i in range(1, 17)})
 
@@ -129,25 +96,23 @@ MULTIWRITE_LUT_PER_BIT = 2.0
 
 
 def declare_xcu55c_area(device: "Device") -> None:
-    """Declare P6's and P7's measured area model on ``device``: the resources
-    the part has, and what one instance of each thing it builds spends of them.
+    """Declare the measured area model on ``device``: the resources the part
+    has, and what one instance of each thing it builds spends of them.
 
-    The chaining delays and the storage timing are the device's own and are read
-    back rather than restated, so this only ever adds the resource side of a row
-    that exists.
+    Chaining delays and storage timing are the device's own and are read back
+    rather than restated; this only adds the resource side of an existing row.
     """
-    # Deferred so the two modules do not import each other at load time:
-    # `device` imports this one, and the vocabulary below is its.
+    # Deferred: `device` imports this module, so importing back at load time
+    # would cycle.
     from .device import CombKind, Const, Linear, Quadratic, Step, Table, Tiled
 
     lut = device.add_resource("lut", CAPACITY["lut"])
     ff = device.add_resource("ff", CAPACITY["ff"])
     dsp = device.add_resource("dsp", CAPACITY["dsp"])
     carry8 = device.add_resource("carry8", CAPACITY["carry8"])
-    # Its own counter rather than part of `@lut`, even though an SRL occupies a
-    # LUT site: a design runs out of SLICEM with ordinary LUTs to spare, and a
-    # delay chain competes for it with a distributed RAM and not with logic.
-    # Folding the two would price them as interchangeable, which they are not.
+    # A separate counter from `@lut`: a design can run out of SLICEM with
+    # ordinary LUTs to spare, since a delay chain competes for SLICEM with a
+    # distributed RAM, not with logic.
     slicem = device.add_resource("slicem_lut", CAPACITY["slicem_lut"])
     bram36 = device.add_resource("bram36", CAPACITY["bram36"])
     uram288 = device.add_resource("uram288", CAPACITY["uram288"])
@@ -155,10 +120,9 @@ def declare_xcu55c_area(device: "Device") -> None:
     # --- native combinational operators, over (width) -----------------------
     # A bitwise operator and a multiplexer are one LUT6 per bit exactly.
     logic = {lut: Linear(1.0)}
-    # An adder is that plus a carry chain, one CARRY8 per eight bits. A compare
-    # keeps no sum and packs two bits per carry stage, so its chain is half.
-    # `Tiled` and not a linear coefficient: a carry chain is a CEILING, so an
-    # 9-bit adder takes two CARRY8s and `0.125 * 9` rounded takes one.
+    # An adder is that plus a carry chain, one CARRY8 per eight bits (a compare
+    # packs two bits per stage, so its chain is half). `Tiled`, not linear,
+    # because a carry chain is a ceiling: a 9-bit adder takes two CARRY8s.
     addsub = {lut: Linear(1.0), carry8: Tiled(8)}
     compare = {lut: Linear(1.0), carry8: Tiled(16)}
     # A barrel shift is w*ceil(log4 w) LUTs, which is structural but has one
@@ -212,20 +176,11 @@ def declare_xcu55c_area(device: "Device") -> None:
     device.set_mux_uses({lut: (Table(MUX_LUT_PER_BIT), Linear(1.0))})
 
     # --- the value delay chain, over (depth, width) -------------------------
-    # Past the extraction threshold a chain stops being flip-flops: it becomes
-    # `width` SRL sites per 32 stages, plus one LUT per bit of addressing and
-    # output multiplexing, plus a head and a tail stage per bit and one more
-    # flip-flop per stage. That cliff is what `Step` is for, and it is the
-    # single largest disagreement between the scheduling objective's register
-    # term (`depth * width` flip-flops) and the part.
-    #
-    # The flip-flops are what makes a cost a SUM of terms rather than one
-    # product: `2*width + depth - 1` is a per-bit term plus a per-stage one, and
-    # no product of a factor over depth by a factor over width is a sum. The
-    # per-stage term needs two of them, because a term PROPORTIONAL to depth
-    # cannot also be GATED on depth (a `Step`'s upper arm is a constant), so the
-    # gate is a second term subtracting the same thing back over the three
-    # depths where the chain is still flip-flops.
+    # Past the extraction threshold a chain becomes `width` SRL sites per 32
+    # stages plus one LUT per bit of addressing/muxing plus a head and tail
+    # stage; `Step` models that cliff. The flip-flop cost is a SUM of a per-bit
+    # term and a per-stage term (`2*width + depth - 1`), split in two because a
+    # term proportional to depth cannot also be gated on depth.
     per_stage = [
         (Linear(1.0, base=-1.0), Const(1.0)),
         (
@@ -236,13 +191,9 @@ def declare_xcu55c_area(device: "Device") -> None:
             Const(1.0),
         ),
     ]
-    # One term of P7's measurement still does NOT survive, and it is an
-    # UNDER-count: a chain narrower than eight bits is left in flip-flops
-    # whatever its depth, and that is a cliff on the OTHER parameter, so no
-    # product of per-parameter factors and no sum of them can express it. A
-    # disjunction over two parameters is not a polynomial. It would take a cost
-    # that reads the whole tuple, which is what `Tiled` is and what nothing
-    # else is.
+    # UNDER-count: a chain narrower than eight bits stays in flip-flops
+    # whatever its depth, a cliff on the OTHER parameter that no sum of
+    # per-parameter factors can express; not modelled here.
     device.set_chain_uses(
         {
             ff: [(Step(SRL_MIN_DEPTH, 1.0, 2.0), Linear(1.0))] + per_stage,
@@ -252,10 +203,9 @@ def declare_xcu55c_area(device: "Device") -> None:
     )
 
     # --- storage realizations, over (depth, width) --------------------------
-    # A register file is what an array that failed RAM inference becomes: every
-    # word gets a data multiplexer and a write decode, so it costs the whole
-    # array in flip-flops and twice it in LUTs. Measured at 512x32: one BRAM18
-    # against 33,245 LUTs and 16,416 flip-flops.
+    # A register file (an array that failed RAM inference) costs the whole
+    # array in flip-flops and twice it in LUTs (data mux + write decode).
+    # Measured at 512x32: one BRAM18 against 33,245 LUTs, 16,416 flip-flops.
     device.set_storage_uses(
         "register",
         {

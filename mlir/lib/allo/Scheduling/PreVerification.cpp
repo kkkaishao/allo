@@ -337,9 +337,8 @@ LogicalResult checkMemories(func::FuncOp func, const MemoryLibrary &memLib,
     StringRef storage = mc.storage;
     Operation *anchor =
         array.getDefiningOp() ? array.getDefiningOp() : func.getOperation();
-    // A complete partition scatters the array whatever it was bound to, so the
-    // two directives disagreeing has one silent winner unless it is reported.
-    // Nothing else resolves an explicitly bound array to the scatter row.
+    // A complete partition scatters the array regardless of its bound storage;
+    // nothing else resolves an explicitly bound array to the scatter row.
     StringRef bound = boundStorageOf(array);
     if (memLib.isScatter(storage) && !bound.empty() && !memLib.isScatter(bound)) {
       error(Stage::Prep, Code::ArrayLayoutConflict, anchor)
@@ -348,9 +347,8 @@ LogicalResult checkMemories(func::FuncOp func, const MemoryLibrary &memLib,
              "registers; the two cannot both hold. Drop one of them";
       return failure();
     }
-    // A completely partitioned array resolves to the device's `scatter` row and
-    // there is none, so it has nowhere to go: an empty name would otherwise
-    // fall through as a stream's, which is timed by an unrelated row.
+    // A completely partitioned array needs the device's `scatter` row; an empty
+    // name would otherwise fall through as a stream's, timed by an unrelated row.
     if (storage.empty()) {
       error(Stage::Prep, Code::StorageNotDeclared, anchor)
           << "Array " << array.getType()

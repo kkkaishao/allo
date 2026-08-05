@@ -224,10 +224,8 @@ class Device:
     def __init__(self, name: str):
         self.name = name
         self.comb: dict[str, float] = {}  # native chaining delays: kind -> ns
-        # What the device HAS, and what each native operator SPENDS of it.
-        # Separate from `comb` because a delay is a timing fact and an area is
-        # a resource fact; they are declared together and read by different
-        # consumers.
+        # Separate from `comb`: a delay is a timing fact and an area is a
+        # resource fact, read by different consumers.
         self.resources: dict[str, Resource] = {}
         self.comb_uses: dict[str, Spend] = {}  # comb kind -> what it spends
         self.operator_uses: dict[str, Spend] = {}  # IP symbol -> what it spends
@@ -242,12 +240,9 @@ class Device:
         self.stream_timing: StreamTiming | None = None
         self.operators: list[IP] = []  # built-in and user `@ip` operators
         self.default_freq_mhz: float = 100.0
-        # How many write ports one array is worth spreading over: past this the
-        # RAM inference fails and the array becomes a register file, so a
-        # further port would buy nothing and still cost its muxes. A DEVICE
-        # fact, not a per-storage one: `bind_storage impl=` is a timing and area
-        # label the emitter never binds against, so what limits the ports is
-        # which primitive the design infers into.
+        # How many write ports an array is worth spreading over; past this RAM
+        # inference fails and the array becomes a register file. A device fact,
+        # not a per-storage one: it limits which primitive the design infers into.
         self.max_writes: int = 2
 
     def _spend(
@@ -780,11 +775,9 @@ def bf2f_l2(a: bf16) -> f32: ...
 
 # The built-in device: storage + native chaining tables + the operators above.
 builtin_device = Device("builtin")
-# The storage realizations, under the names an `allo.bind.storage impl=`
-# resolves against. The compiler spells none of them: `register` is the SCATTER
-# row here only because it is marked, and a part whose flip-flops go by another
-# name marks that one instead. `srl` is a shift register, a realization of its
-# own that happens to spend LUTs.
+# Storage realizations, under the names an `allo.bind.storage impl=` resolves
+# against. `register` is the SCATTER row because it is marked so, not by name;
+# `srl` is a shift register, its own realization that happens to spend LUTs.
 builtin_device.add_storage(
     "register",
     read_latency=0,

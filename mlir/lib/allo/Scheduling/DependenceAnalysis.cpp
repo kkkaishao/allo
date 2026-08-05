@@ -792,5 +792,4 @@ DependenceAnalysis::DependenceAnalysis(func::FuncOp funcOp) : func(funcOp) {
   }
 }
 
-// Retargets oldOp's dependence list and every edge sourced from it to newOp.
 } // namespace mlir::allo

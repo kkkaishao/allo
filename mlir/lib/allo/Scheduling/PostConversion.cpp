@@ -41,9 +41,9 @@ static IntegerAttr optI64Attr(Builder &b, std::optional<int64_t> v) {
   return v ? b.getI64IntegerAttr(*v) : IntegerAttr();
 }
 
-// Erase \p op, having dropped the schedule of everything under it. An erased
-// op's address is handed back out by the next `create`, so an entry that
-// outlives its op would answer for whatever lands there next.
+// Erase \p op, dropping the schedule of everything under it first: an erased
+// op's address is handed back out by the next `create`, so a stale entry
+// would answer for whatever lands there next.
 static void eraseScheduled(ScheduleModel &model, Operation *op) {
   op->walk([&](Operation *inner) { model.forget(inner); });
   op->erase();
@@ -59,7 +59,7 @@ static DeterminacyEnumAttr determinacyAttr(Builder &b, DeterminacyEnum d) {
 // device model, so the reifier only references them and never materializes one.
 //===----------------------------------------------------------------------===//
 
-// Defined below with the rest of the call machinery.
+// Defined with the call machinery below.
 static DCPathInstanceOp makeInvoke(OpBuilder &b, Location loc,
                                    TypeRange resultTypes, ValueRange operands,
                                    FlatSymbolRefAttr calleeAttr, Operation *at,
@@ -98,9 +98,8 @@ static void convertOp(Operation &op, OpBuilder &b, IRMapping &map,
   // A memory access's latency is the accessed memref's read/write latency,
   // from the device memory model.
   auto memLatency = [&]() -> uint64_t { return lib.lookup(&op).latency; };
-  // The bank `assign-banks` decided, moved off the discardable attribute onto
-  // the dcp op's own so no later rewrite can drop the decision the schedule was
-  // already billed against. Absent means the access reaches every bank.
+  // The bank `assign-banks` decided, moved onto the dcp op's own attribute so
+  // no later rewrite can drop it. Absent means the access reaches every bank.
   IntegerAttr bank = op.getAttrOfType<IntegerAttr>(kBankAttr);
   // The address map of an array access: an affine op's own map, and for a
   // non-affine one the identity map over its indices.
@@ -200,8 +199,8 @@ static void convertOp(Operation &op, OpBuilder &b, IRMapping &map,
 
 namespace {
 // What a `dcp.pipeline` or `dcp.sequential` is constructed with, derived from
-// the `RegionSolution` for it. A null solution leaves every field empty, and
-// that is a real answer: an all-constant span the solver skipped, or a residual
+// the `RegionSolution` for it. A null solution leaves every field empty: this
+// means either an all-constant span the solver skipped, or a residual
 // wrapper that owns no solve of its own.
 struct RegionAttrs {
   std::optional<int64_t> ii;
@@ -217,9 +216,9 @@ struct RegionAttrs {
     ii = r->ii;
     length = r->length;
     drain = r->drain;
-    // The region as the latency model sees it. A container's span is later
-    // recomposed from its children and overwrites this; what only this can
-    // supply is an assume-bounded trip.
+    // The region as the latency model sees it; a container's span is later
+    // recomposed from its children and overwrites this. What only this
+    // supplies is an assume-bounded trip.
     SpanNode n;
     n.drain = r->drain;
     n.ii = r->ii;
@@ -324,10 +323,8 @@ static Value dynamicTripBound(LoopLikeOpInterface loop) {
   return scfLoop ? scfLoop.getUpperBound() : Value();
 }
 
-// The value the scheduler's expansion of \p af's bound map settled on, which it
-// scheduled and cut against the clock like any other operation. Present exactly
-// where the wiring below asks for one, since both sides read the same two
-// conditions off the same loop.
+// The value the scheduler's expansion of \p af's bound map settled on, itself
+// scheduled and cut against the clock like any other operation.
 static Value scheduledBound(ScheduleModel &model, AffineForOp af,
                             bool isLower) {
   const ScheduleModel::EntryCone *cone = model.entryConeOf(af.getOperation());
@@ -699,11 +696,11 @@ struct Reifier {
   }
 
   // One region of a block, by anchor kind. A `while` cannot flushing-pipeline
-  // when it nests a loop (the per-iteration length is then data-dependent),
-  // when it calls a sub-kernel (one instance is fired and awaited per
-  // iteration), or when its continue-condition is not settled in-cycle.
-  // `conditionIsCombinational` is the predicate the scheduler routes on, read
-  // here so the two descents stay in lockstep.
+  // when it nests a loop (per-iteration length is then data-dependent), when
+  // it calls a sub-kernel (one instance fired and awaited per iteration), or
+  // when its continue-condition is not settled in-cycle.
+  // `conditionIsCombinational` is the same predicate the scheduler routes
+  // on, kept in lockstep here.
   void materializeRegion(const SchedRegion &region) {
     if (region.kind == allo::RegionKind::StraightLine) {
       materializeSequential(RegionAttrs(model.regionOf(region.ops.front())),
@@ -805,10 +802,10 @@ struct Reifier {
 
   // The synthesized timing of a residual sequential wrapper, which owns no
   // solve of its own. Iterations do not overlap, so its II is one body pass.
-  // A body pass and the whole span go unknown separately: a dynamic INNER trip
-  // leaves the pass data-dependent, so `ii` and `length` are unset and the
-  // wrapper becomes a done-based sequential controller; a dynamic OUTER trip
-  // keeps a concrete pass but no static total, so only `latency` is unset.
+  // A dynamic INNER trip leaves the pass itself data-dependent, so `ii` and
+  // `length` are unset and the wrapper becomes a done-based sequential
+  // controller; a dynamic OUTER trip keeps a concrete pass but no static
+  // total, so only `latency` is unset.
   RegionAttrs sequentialWrapperAttrs(LoopLikeOpInterface loop) {
     Block &body = loop.getLoopRegions().front()->front();
     RegionAttrs r;
@@ -937,12 +934,10 @@ static void loadDependentDialects(MLIRContext &ctx) {
   ctx.getOrLoadDialect<memref::MemRefDialect>();
 }
 
-// Post-order over the call graph: every callee is reified before the caller
-// that composes against it, so `makeInvoke` reads the callee's exact
-// `dcp.module` latency rather than the scheduler's provisional one. `done` keys
-// on the address of a func already closed into a `dcp.module` and never
-// dereferences one; the funcs it looks up were all live at once, so no two
-// share an address.
+// Post-order over the call graph, so every callee is reified before the
+// caller that composes against it (see `makeInvoke`). `done` keys on the
+// func's address and never dereferences a closed one; the funcs it looks up
+// were all live at once, so no two share an address.
 static void reifyCalleesFirst(func::FuncOp func, ScheduleModel &model,
                               const OperatorLibrary &lib,
                               llvm::DenseSet<Operation *> &done) {

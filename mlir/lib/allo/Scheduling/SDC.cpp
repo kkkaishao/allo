@@ -36,9 +36,8 @@ using namespace mlir::allo::logging;
 // \p root: descend while a level's body is exactly { inner counted loop,
 // terminator }. Returns [root, ..., innermost].
 //
-// Asked AFTER `expandRegionBoundaries`, which is what puts an inner loop's
-// runtime bound arithmetic beside it and so breaks the band there on purpose;
-// see that function for why.
+// Must run after `expandRegionBoundaries`, which moves an inner loop's
+// runtime bound arithmetic beside it, breaking the band there deliberately.
 static SmallVector<LoopLikeOpInterface> perfectNest(LoopLikeOpInterface root) {
   SmallVector<LoopLikeOpInterface> nest{root};
   while (true) {
@@ -55,24 +54,23 @@ static SmallVector<LoopLikeOpInterface> perfectNest(LoopLikeOpInterface root) {
 }
 
 // The region's outputs, as the terms whose max is its terminal cycle: how long
-// after its last issue pulse the deepest output commits. Left as separate terms
-// so the exact scheduler can bound a variable by each one and minimize the
-// charged quantity; `drainOf` takes the max, after the solve.
+// after its last issue pulse the deepest output commits. Kept as separate
+// terms so the exact scheduler can bound a variable by each one and minimize
+// the charged quantity; `drainOf` takes the max after the solve.
 //
-// Each output is charged at the cycle the emitter commits it: a store presents
-// at its start and commits `writeLatency` cycles later, a sync sub-kernel call
-// charges the same way (its `done` rises at its start plus its contract), a
-// stream put commits at its stage, and a value handed onward is latched the
-// cycle it lands, one cycle above a store presented at the same depth.
+// Each output is charged at its commit cycle: a store commits `writeLatency`
+// cycles after its start, a sync sub-kernel call the same way (its `done`
+// rises at its start plus its contract), a stream put commits at its stage,
+// and a value handed onward is latched the cycle it lands, one cycle above a
+// store presented at the same depth.
 //
 // \p results are the values escaping the region. One only forwarded (a block
-// argument, an earlier region's survivor, or a declaration) charges nothing: it
-// is settled before the region starts or binds no hardware to wait on.
+// argument, an earlier region's survivor, or a declaration) charges nothing:
+// it is settled before the region starts or binds no hardware to wait on.
 //
-// The floor of one cycle is what an INDETERMINATE call is charged: it has no
-// contract to place its `done` against, so the operator model gives it latency
-// zero and the only static statement left is that it occupies the cycle it
-// issues in. The region's own span is dynamic either way.
+// An INDETERMINATE call is charged a floor of one cycle: it has no contract
+// to place its `done` against, so the operator model gives it latency zero
+// and the only static fact left is that it occupies the cycle it issues in.
 static SmallVector<DrainTerm> drainTerms(OccupancyProblem &problem,
                                          ValueRange results) {
   SmallVector<DrainTerm> terms;
@@ -111,14 +109,15 @@ static int64_t registerWidth(Type type) {
 }
 
 // The values a region spends a delay register on, and what each one charges:
-// mirrors `DatapathBuilder::resolveOperand` + `insertRegister`, stated over
-// the problem so a solve can minimize the same quantity the emitter spends. Two
-// kinds are charged: a scheduled producer read in the same region (a def-use
-// edge in the problem), and a loop-carried read of an iter_arg, the same edge
-// `distance` iterations back. A value held longer than the region (a survivor,
-// an IO port, a literal) is free and is defined by no op in the problem, so it
-// falls through. An enclosing loop's counter and the activation-pulse chain are
-// not charged here, both left to the objective's sum-of-starts tie-break.
+// mirrors `DatapathBuilder::resolveOperand` + `insertRegister`, so a solve
+// minimizes the same quantity the emitter spends.
+//
+// Two kinds are charged: a scheduled producer read in the same region (a
+// def-use edge), and a loop-carried read of an iter_arg (the same edge
+// `distance` iterations back). A value held longer than the region (a
+// survivor, an IO port, a literal) is defined by no op in the problem and is
+// free. An enclosing loop's counter and the activation-pulse chain are not
+// charged here, both left to the objective's sum-of-starts tie-break.
 //
 // \p carried is the counted-loop body whose block arguments after the
 // induction variable are its iter_args, or null where there is no such
@@ -203,13 +202,12 @@ static Stopwatch now() { return std::chrono::steady_clock::now(); }
 
 namespace {
 
-/// Solving ONE function's schedule. Everything below shares the analysis it
-/// reads, the device it prices against, the model it fills and what the caller
-/// asked for, so those are stated once here instead of threaded through every
+/// Solves ONE function's schedule. Holds the analysis, device, model and
+/// options every method needs, instead of threading them through each
 /// signature.
 ///
-/// One instance per function, and no longer lived than the `DependenceAnalysis`
-/// it is handed: the span composition reads that analysis after the solve.
+/// One instance per function, no longer lived than the `DependenceAnalysis` it
+/// is handed: the span composition reads that analysis after the solve.
 class FuncScheduler {
 public:
   FuncScheduler(DependenceAnalysis &deps, const OperatorLibrary &lib,
@@ -218,7 +216,7 @@ public:
       : deps(deps), lib(lib), model(model), cycleTime(cycleTime), opts(opts) {}
 
   /// Consume this function's assumption hints, solve its regions, and publish
-  /// what the whole kernel costs. Definitions carry the commentary.
+  /// what the whole kernel costs.
   LogicalResult run(func::FuncOp funcOp);
 
 private:
@@ -463,10 +461,9 @@ LogicalResult FuncScheduler::scheduleWhile(scf::WhileOp w,
   populateOperatorTypes(problem, lib);
   recordOperatorClasses(problem, lib, model);
   populateMemoryResources(problem, lib.memoryLibrary());
-  // A flushing while issues an iteration per II like any pipeline, so a
-  // non-pipelined operator bounds its interval the same way, and its operators
-  // fold the same way. It needs no call occupancy: `whileFlushingPipelines`
-  // rejects a body holding a sync call.
+  // A flushing while issues an iteration per II like a pipeline: a
+  // non-pipelined operator bounds its interval the same way. No call occupancy
+  // is needed, since `whileFlushingPipelines` rejects a body with a sync call.
   populateOperatorOccupancy(problem, lib);
   if (opts.allocate)
     populateOperatorAllocation(problem, lib);
@@ -475,10 +472,9 @@ LogicalResult FuncScheduler::scheduleWhile(scf::WhileOp w,
   // off) is not modeled for while loops.
   int64_t dir = pipelineDirective(w, region.anchor());
   unsigned minII = dir >= 1 ? static_cast<unsigned>(dir) : 1;
-  // A while's state recurrence is a register this does not price: its carried
-  // values are not a counted loop's iter_args, so no body is handed in to read
-  // them off. No trip either, so no span is minimized and the objective stays
-  // the anchor's start time.
+  // A while's carried state is not priced as a register: its values are not a
+  // counted loop's iter_args, so no body is passed in to read them. No trip
+  // either, so the objective is just the anchor's start time.
   SpanObjective span(problem, anchor->getOperands(), /*carried=*/nullptr,
                      /*trip=*/std::nullopt, lib);
   Stopwatch solveStart = now();
@@ -503,15 +499,13 @@ LogicalResult FuncScheduler::scheduleWhile(scf::WhileOp w,
 }
 
 // The operations a sequential while's continue-condition reads, in program
-// order. The CHECK region emits arithmetic and loads and nothing else, so any
-// other producer FAILS here, reported against the op itself; leaving the cone
-// unscheduled instead only moves the report to the emitter, which sees the
-// arithmetic beside the offender go untimed and blames that.
+// order. The CHECK region emits arithmetic and loads only, so any other
+// producer FAILS here, reported against the op itself; leaving the cone
+// unscheduled would only move the report to the emitter.
 //
-// An EMPTY cone is the other answer entirely and a normal one: the condition is
-// settled before the loop starts, so there is nothing to time. A value defined
-// outside the before block is such a value, an iter-arg survivor, an enclosing
-// counter or a literal, and it bounds the walk.
+// An EMPTY cone is normal: the condition is settled before the loop starts,
+// so there is nothing to time. A value defined outside the before block
+// bounds the walk (an iter-arg survivor, an enclosing counter, or a literal).
 static FailureOr<SmallVector<Operation *>> conditionCone(scf::WhileOp w) {
   Block &before = w.getBefore().front();
   llvm::SmallPtrSet<Operation *, 8> reads;
@@ -751,9 +745,8 @@ void FuncScheduler::publishKernelLatency(func::FuncOp funcOp) {
 LogicalResult FuncScheduler::scheduleRegion(const SchedRegion &region) {
   if (region.kind != allo::RegionKind::Loop) {
     // A span of nothing but declarations is a tie-off the reify leaves in
-    // place, so scheduling it costs a spurious region and lets a func with
-    // nothing else publish a zero-cycle latency. THE predicate, shared with
-    // the composition below and with the reify.
+    // place; scheduling it would spuriously let a func with nothing else
+    // publish a zero-cycle latency. Shared predicate with the reify.
     if (!spanFormsRegion(region.ops))
       return success();
     info(Stage::Sched, region.anchor())

@@ -1619,10 +1619,9 @@ void DatapathBuilder::build() {
   deriveCounterTypes();     // counter width (each loop's own range)
   // Everything below resolves Values to Sources, and so runs here rather than
   // during the walk: `resolveValue` needs the complete region model.
-  // Every op the reify leaves in the module body binds no hardware.
+  // Every op the reify leaves in the module body binds no hardware:
   // `enumerateRegions` is total over a block, so anything that computes is
-  // inside a region; what used to defeat that was the reify synthesizing a
-  // bound or a predicate AFTER the partition had already run.
+  // inside a region.
 #ifndef NDEBUG
   for (Operation &op : func.getBody().front())
     assert((isa<dcp::DCPathRegionOpInterface, dcp::DCPathOutputOp>(&op) ||

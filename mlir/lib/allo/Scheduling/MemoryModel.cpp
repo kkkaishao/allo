@@ -657,11 +657,9 @@ MemoryLibrary::Timing MemoryLibrary::timing(Operation *op) const {
   auto a = asMemAccess(op);
   if (!a)
     return {};
-  // A stream is a FIFO, not array storage: it has no realization to resolve and
-  // is timed by its own row. Keyed on the ACCESS KIND and not on an unresolved
-  // name, which `resolveStorage` also returns for an ARRAY the device declares
-  // no row for: sharing one sentinel between the two timed such an array as a
-  // FIFO instead of reporting it.
+  // A stream is a FIFO, timed by its own row rather than via `resolveStorage`
+  // (which also returns empty for an array with no declared realization).
+  // Branch on the access kind, not the resolved name, or the two cases collide.
   std::string name;
   MemKindTiming t = fifo;
   if (a->kind != AccessKind::Stream) {

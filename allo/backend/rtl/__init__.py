@@ -15,10 +15,8 @@ from .interface import (
     Operator,
 )
 
-# The report documents and the vocabulary a caller asserts on. `reports.Memory`
-# is an ARRAY in the design and `Memory` above is a boundary port interface: two
-# different things that cannot share one name here, so reach the former through
-# the `reports` namespace.
+# `reports.Memory` (an array in the design) and `Memory` above (a boundary port
+# interface) are distinct types, so the former is reached through `reports`.
 from .reports import (
     CompileReport,
     CompilerReport,

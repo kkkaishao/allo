@@ -34,8 +34,8 @@ LogicalResult verifyDatapath(dcp::DCPathModuleOp func, const Datapath &dp) {
         << "Kernel '" << func.getSymName()
         << "' has no schedulable region: it emits as hardware that does "
            "nothing and completes immediately";
-  // The builder already reported the offending edge; fail before any
-  // hardware is built from the placeholder depths it left.
+  // The builder already reported the offending edge; the depths it left are
+  // placeholders, so fail before hardware is built from them.
   if (dp.infeasible)
     return failure();
 
@@ -51,8 +51,7 @@ LogicalResult verifyDatapath(dcp::DCPathModuleOp func, const Datapath &dp) {
     badSite = site;
   });
   if (found) {
-    // "cross-region value hand-off" is the stable phrase tests match on; the
-    // builder's own hand-off rejects use the same wording.
+    // Wording matches the builder's own hand-off rejection.
     unsupported(Stage::Emit, Code::CrossRegionHandOff,
                 badSite.op ? badSite.op : func.getOperation())
         << "A cross-region value hand-off is not lowered yet: "
@@ -69,15 +68,15 @@ LogicalResult verifyDatapath(dcp::DCPathModuleOp func, const Datapath &dp) {
 namespace {
 
 /// The multiplexer delay a shared BINDING adds, propagated along the chains it
-/// can lengthen. It is the one delay the schedule cannot have accounted for:
+/// lengthens. It is the one delay the schedule cannot have accounted for:
 /// every other cell reaching the datapath carries the sub-cycle start (`z`) a
 /// solve proved for it, muxes being the only thing built after the cut.
 ///
 /// The scheduler proved `z(op) + inDelay(op) <= period` over a datapath whose
-/// unit inputs are all driven directly, and each addition shifts its consumer's
-/// arrival by a constant. The delta is therefore additive along a combinational
-/// path, so propagating it alone against each op's remaining sub-cycle slack is
-/// exact.
+/// unit inputs are all driven directly, and each addition shifts its
+/// consumer's arrival by a constant. The delta is therefore additive along a
+/// combinational path, so propagating it alone against each op's remaining
+/// sub-cycle slack is exact.
 struct AddedDelay {
   AddedDelay(const Datapath &dp, double level) : dp(dp), level(level) {}
 
@@ -125,10 +124,10 @@ LogicalResult checkCombPathsMeetPeriod(const Datapath &dp, float cycleTime,
   constexpr double kSlop = 1e-3;
   AddedDelay added(dp, muxLevelDelay(lib));
 
-  // What makes the multiplexer the only unaccounted delay: every cell reaching
-  // the datapath was placed by a solve, which stamps the sub-cycle start it
-  // proved. Nothing synthesizes a cell after the cut any more, so a cell
-  // without one is an internal invariant broken, not a fault to report.
+  // The multiplexer is the only unaccounted delay: every cell reaching the
+  // datapath is placed by a solve, which stamps the sub-cycle start it
+  // proved. A cell without one is an internal invariant broken, not a fault
+  // to report.
   for (const FuncUnit &u : dp.units)
     for (const auto &[op, residue] : u.boundOps)
       assert(op->hasAttr("z") &&
