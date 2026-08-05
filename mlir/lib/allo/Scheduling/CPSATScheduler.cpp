@@ -499,6 +499,10 @@ LogicalResult mlir::allo::scheduleCPSAT(ChainingSharedOperatorsProblem &prob,
 
   // What the region is charged, bounded by what the heuristic already reached.
   int64_t heuristicDrain = span.drainOf(prob);
+  assert(heuristicDrain <= horizon &&
+         "the horizon must cover the schedule the heuristic just found, or "
+         "capping the drain variable at it cuts that schedule out and the "
+         "solve comes back INFEASIBLE against a model that has one");
   IntVar drain =
       drainVariable(model, startVars, span.drain, horizon, heuristicDrain);
   minimizeCost(model, drain, orderedStarts, span, startVars, allocs, /*ii=*/0,

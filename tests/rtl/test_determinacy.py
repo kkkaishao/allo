@@ -12,7 +12,7 @@ import pytest
 
 from allo import kernel
 from allo.lang import i32, f32, index, Stream
-from allo.backend.rtl import RegionKind
+from allo.backend.rtl import RegionKind, has_exact_scheduler
 
 sys.path.insert(0, os.path.dirname(__file__))
 from _common import Dcp, Mod, _to_rtl, _sched, _latency, _outer  # noqa: E402
@@ -333,6 +333,25 @@ def test_a_determinate_call_still_shares_its_span():
         B[0] = r + 1
 
     assert len(_regions(_to_rtl(ic_det))) == 1
+
+
+# What the isolated region declares for itself. A call with no contract is
+# priced at latency zero, so the only static statement its region can make is
+# that the call occupies the cycle it issues in: drain 0, and a `done` one
+# cycle later. Charging it `latency - 1` cycles underflowed that zero into 2^32
+# and put the same number in the region's declared span, where it also made the
+# exact scheduler's drain bound narrower than the term it bounds and CP-SAT
+# called the region infeasible.
+@pytest.mark.parametrize(
+    "scheduler", ["heuristic"] + (["exact"] if has_exact_scheduler() else [])
+)
+def test_an_indeterminate_calls_region_drains_at_its_own_start(scheduler):
+    @kernel
+    def ic_drain(A: i32[8], B: i32[1]):
+        ic_sum_out(A, B)
+
+    (region,) = _regions(_to_rtl(ic_drain, scheduler=scheduler))
+    assert (region.drain, region.latency) == (0, 1)
 
 
 # Isolation adds a region, not an ordering: a sibling that shares nothing

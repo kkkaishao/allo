@@ -68,12 +68,17 @@ static SmallVector<LoopLikeOpInterface> perfectNest(LoopLikeOpInterface root) {
 // \p results are the values escaping the region. One only forwarded (a block
 // argument, an earlier region's survivor, or a declaration) charges nothing: it
 // is settled before the region starts or binds no hardware to wait on.
+//
+// The floor of one cycle is what an INDETERMINATE call is charged: it has no
+// contract to place its `done` against, so the operator model gives it latency
+// zero and the only static statement left is that it occupies the cycle it
+// issues in. The region's own span is dynamic either way.
 static SmallVector<DrainTerm> drainTerms(OccupancyProblem &problem,
                                          ValueRange results) {
   SmallVector<DrainTerm> terms;
   for (Operation *op : problem.getOperations()) {
     if (isa<AffineStoreOp, memref::StoreOp>(op) || isSyncSubKernelCall(op))
-      terms.push_back({op, problem.latencyOf(op) - 1});
+      terms.push_back({op, std::max<int64_t>(problem.latencyOf(op), 1) - 1});
     else if (isa<StreamPutOp>(op))
       terms.push_back({op, 0});
   }
