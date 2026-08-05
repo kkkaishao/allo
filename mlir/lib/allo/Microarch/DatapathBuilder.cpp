@@ -156,7 +156,7 @@ MemId DatapathBuilder::getOrCreateMem(Value memref) {
   // Banking / ports from the same storage model the scheduler binds against
   // (allo.part / allo.bind.storage): ONE characterization, so the ports billed
   // and the ports built cannot disagree.
-  MemoryChar mc = allo::characterize(memref, lib.memoryLibrary());
+  MemoryChar mc = allo::characterize(memref, dev.memory);
   // An initialized global the kernel stores to needs a real write port, so it
   // is a ROM only if nothing writes it: `MemoryChar::constantTable`, the same
   // predicate the scheduler's port model bills against.
@@ -174,7 +174,7 @@ MemId DatapathBuilder::getOrCreateMem(Value memref) {
   // scheduler timed this memref's accesses against (`MemoryLibrary::timing`).
   // The emitter builds ports at these latencies; do not re-derive from the
   // name.
-  auto mkt = lib.memoryLibrary().timing(m.storage);
+  auto mkt = dev.memory.timing(m.storage);
   m.readLatency = mkt.latency.read;
   m.writeLatency = mkt.latency.write;
   assert(mt.hasStaticShape() &&
@@ -1608,7 +1608,7 @@ void DatapathBuilder::build() {
 
   // The allocation, settled here and not later: every pass below resolves
   // Values to Sources against the unit table (see `allocateUnits`).
-  allocateUnits(policy.plan(dp, {cycleTime, lib})); // trivial => a no-op
+  allocateUnits(policy.plan(dp, {cycleTime, dev.operators})); // trivial => a no-op
   assert(llvm::all_of(dp.units,
                       [](const FuncUnit &u) { return !u.boundOps.empty(); }) &&
          "the unit table is the allocation: a unit exists because ops are "

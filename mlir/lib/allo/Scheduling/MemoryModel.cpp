@@ -635,6 +635,36 @@ std::optional<unsigned> assignedBankOf(Operation *op) {
 // Memory timing library
 //===----------------------------------------------------------------------===//
 
+MemoryLibrary MemoryLibrary::fromModule(ModuleOp module) {
+  MemoryLibrary m;
+  dcp::DCPathDeviceOp device;
+  module.walk([&](dcp::DCPathDeviceOp d) { device = d; });
+  if (!device)
+    return m;
+  // Both rows carry the same four fields under the same accessor names, so one
+  // template reads a `dcp.storage` and a `dcp.stream_timing` alike.
+  auto timing = [](auto row) {
+    MemKindTiming t;
+    t.latency.read = (unsigned)row.getRdLatency();
+    t.latency.write = (unsigned)row.getWrLatency();
+    t.delay.read = row.getRdDelay().convertToDouble();
+    t.delay.write = row.getWrDelay().convertToDouble();
+    return t;
+  };
+  m.maxWritePorts = static_cast<unsigned>(device.getMaxWrites());
+  Block &body = device.getBody().front();
+  for (auto s : body.getOps<dcp::DCPathStorageOp>()) {
+    m.storage.push_back({s.getSymName().str(), timing(s)});
+    if (s.getIsDefault())
+      m.defaultStorage = s.getSymName().str();
+    if (s.getIsScatter())
+      m.scatterStorage = s.getSymName().str();
+  }
+  for (auto st : body.getOps<dcp::DCPathStreamTimingOp>())
+    m.fifo = timing(st);
+  return m;
+}
+
 MemKindTiming MemoryLibrary::timing(StringRef name) const {
   for (const StorageRealization &s : storage)
     if (s.name == name)

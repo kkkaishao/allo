@@ -11,7 +11,6 @@
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Math/IR/Math.h"
-#include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "llvm/ADT/STLExtras.h"
@@ -90,8 +89,9 @@ OpKind mlir::allo::opKindOf(CombOpKindEnum kind) {
 // Classification: concrete IR op -> abstract kind
 //
 // Total, so it also covers what has no native lowering: float arithmetic, the
-// float casts, the composite integer kinds `legalize-arith` expands, and the
-// storage accesses that are timed by their memory rather than an operator row.
+// float casts, and the composite integer kinds `legalize-arith` expands.
+// `Unknown` for everything else, an access included: an access is timed by its
+// storage (`accessCharacterization`), so no operator row answers for it.
 //===----------------------------------------------------------------------===//
 
 OpKind mlir::allo::classify(Operation *op) {
@@ -116,12 +116,6 @@ OpKind mlir::allo::classify(Operation *op) {
       .Case<arith::SIToFPOp, arith::UIToFPOp, arith::FPToSIOp, arith::FPToUIOp>(
           [](auto) { return OpKind::FCastI; })
       .Case<arith::ExtFOp, arith::TruncFOp>([](auto) { return OpKind::FCastF; })
-      .Case<affine::AffineLoadOp, memref::LoadOp>(
-          [](auto) { return OpKind::MemRead; })
-      .Case<affine::AffineStoreOp, memref::StoreOp>(
-          [](auto) { return OpKind::MemWrite; })
-      .Case<StreamGetOp>([](auto) { return OpKind::StreamRead; })
-      .Case<StreamPutOp>([](auto) { return OpKind::StreamWrite; })
       .Default([](auto) { return OpKind::Unknown; });
 }
 
@@ -242,32 +236,6 @@ OperatorIdentity identityOf(Operation *op, std::optional<CombOpKindEnum> comb,
   return id;
 }
 
-MemoryLibrary memoryFromDevice(dcp::DCPathDeviceOp device) {
-  MemoryLibrary m;
-  // Both rows carry the same four fields under the same accessor names, so one
-  // template reads a `dcp.storage` and a `dcp.stream_timing` alike.
-  auto timing = [](auto row) {
-    MemKindTiming t;
-    t.latency.read = (unsigned)row.getRdLatency();
-    t.latency.write = (unsigned)row.getWrLatency();
-    t.delay.read = row.getRdDelay().convertToDouble();
-    t.delay.write = row.getWrDelay().convertToDouble();
-    return t;
-  };
-  m.maxWritePorts = static_cast<unsigned>(device.getMaxWrites());
-  Block &body = device.getBody().front();
-  for (auto s : body.getOps<dcp::DCPathStorageOp>()) {
-    m.storage.push_back({s.getSymName().str(), timing(s)});
-    if (s.getIsDefault())
-      m.defaultStorage = s.getSymName().str();
-    if (s.getIsScatter())
-      m.scatterStorage = s.getSymName().str();
-  }
-  for (auto st : body.getOps<dcp::DCPathStreamTimingOp>())
-    m.fifo = timing(st);
-  return m;
-}
-
 } // namespace
 
 //===----------------------------------------------------------------------===//
@@ -297,7 +265,6 @@ OperatorLibrary OperatorLibrary::fromModule(ModuleOp module) {
       e.uses = comb.getUsesAttr();
       lib.entries.push_back(std::move(e));
     }
-    lib.memory = memoryFromDevice(device);
 
     // The currency: the most plentiful resource sets the scale, so a price is
     // how scarce a resource is relative to the one the part has most of.

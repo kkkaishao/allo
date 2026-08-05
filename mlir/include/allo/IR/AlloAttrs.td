@@ -139,11 +139,10 @@ def DeterminacyAttr : EnumAttr<Allo_Dialect, DeterminacyEnum, "determinacy">;
 // `kind` names one of these), and what the scheduler classifies an operation
 // into to find that row.
 //
-// The arithmetic kinds are what a device declares. The four access kinds and
-// `unknown` are the rest of the classification: an array or stream access is
-// timed by its storage rather than an operator row, and `unknown` is an op no
-// abstract row covers (`math.sqrt`, an `affine.apply`). No device row names
-// them, and one naming them is inert rather than wrong.
+// Operators only. An array or stream ACCESS is not here: it is timed by its
+// storage (`dcp.storage`, `dcp.stream_timing`) and builds no functional unit,
+// so it has no row to name. `unknown` is an operation no abstract row covers
+// (`math.sqrt`, an `affine.apply`), which keeps the classification total.
 //===----------------------------------------------------------------------===//
 
 def OpKindAdd         : I32EnumAttrCase<"Add",         0,  "add">;
@@ -177,11 +176,7 @@ def OpKindICastI      : I32EnumAttrCase<"ICastI",      19, "icast">;
 def OpKindFCastI      : I32EnumAttrCase<"FCastI",      20, "ifcast">;
 // float resize (extf / truncf)
 def OpKindFCastF      : I32EnumAttrCase<"FCastF",      21, "fcast">;
-def OpKindMemRead     : I32EnumAttrCase<"MemRead",     22, "memread">;
-def OpKindMemWrite    : I32EnumAttrCase<"MemWrite",    23, "memwrite">;
-def OpKindStreamRead  : I32EnumAttrCase<"StreamRead",  24, "streamread">;
-def OpKindStreamWrite : I32EnumAttrCase<"StreamWrite", 25, "streamwrite">;
-def OpKindUnknown     : I32EnumAttrCase<"Unknown",     26, "unknown">;
+def OpKindUnknown     : I32EnumAttrCase<"Unknown",     22, "unknown">;
 
 def OpKindEnum : I32EnumAttr<"OpKindEnum",
     "The abstract operator kind a device characterizes timing against",
@@ -189,7 +184,6 @@ def OpKindEnum : I32EnumAttr<"OpKindEnum",
      OpKindMin, OpKindMaxNum, OpKindMinNum, OpKindCeilDiv, OpKindFloorDiv,
      OpKindNeg, OpKindCmp, OpKindAnd, OpKindOr, OpKindXor, OpKindShl,
      OpKindShr, OpKindSelect, OpKindICastI, OpKindFCastI, OpKindFCastF,
-     OpKindMemRead, OpKindMemWrite, OpKindStreamRead, OpKindStreamWrite,
      OpKindUnknown]> {
   let cppNamespace = "mlir::allo";
   let genSpecializedAttr = 0;

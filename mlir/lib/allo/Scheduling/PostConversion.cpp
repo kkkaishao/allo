@@ -69,7 +69,7 @@ static DCPathInstanceOp makeInvoke(OpBuilder &b, Location loc,
 // the pipeline block \p b is inserting into, mapping its results in \p map. Ops
 // that are not compute/memory (constants, address arithmetic) are cloned as-is.
 static void convertOp(Operation &op, OpBuilder &b, IRMapping &map,
-                      ScheduleModel &model, const OperatorLibrary &lib) {
+                      ScheduleModel &model, const DeviceModel &dev) {
   Location loc = op.getLoc();
   const OpSchedule *at = model.scheduleOf(&op);
   int64_t start = at ? at->start : 0;
@@ -99,7 +99,7 @@ static void convertOp(Operation &op, OpBuilder &b, IRMapping &map,
   // asked of the memory model directly: an access is timed by its storage and
   // has no operator row.
   auto memLatency = [&]() -> uint64_t {
-    return lib.memoryLibrary().timing(&op).latency;
+    return dev.memory.timing(&op).latency;
   };
   // The bank `assign-banks` decided, moved onto the dcp op's own attribute so
   // no later rewrite can drop it. Absent means the access reaches every bank.
@@ -169,7 +169,7 @@ static void convertOp(Operation &op, OpBuilder &b, IRMapping &map,
   // one of two exclusive paths: a combinational op carries a `comb_kind`, an IP
   // op references its injected `dcp.operator` via `op_type`.
   if (op.getNumResults() == 1 && at && !isa<arith::ConstantOp>(op)) {
-    OperatorIdentity id = lib.lookup(&op).identity;
+    OperatorIdentity id = dev.operators.lookup(&op).identity;
     assert(id.realized() && "a scheduled compute op with no realization");
     CombOpKindEnumAttr combKind;
     FlatSymbolRefAttr opType;
@@ -356,7 +356,7 @@ static Block *createCounterBlock(OpBuilder &b, DCPathPipelineOp pipe,
 // of a slot map to the same iter-arg.
 static void materializeWhilePipeline(const RegionAttrs &r, scf::WhileOp w,
                                      ScheduleModel &model,
-                                     const OperatorLibrary &lib) {
+                                     const DeviceModel &dev) {
   OpBuilder b(w);
   Location loc = w.getLoc();
 
@@ -380,9 +380,9 @@ static void materializeWhilePipeline(const RegionAttrs &r, scf::WhileOp w,
 
   b.setInsertionPointToEnd(blk);
   for (Operation &op : before.without_terminator())
-    convertOp(op, b, map, model, lib);
+    convertOp(op, b, map, model, dev);
   for (Operation &op : after.without_terminator())
-    convertOp(op, b, map, model, lib);
+    convertOp(op, b, map, model, dev);
 
   Value cond = map.lookupOrDefault(w.getConditionOp().getCondition());
   SmallVector<Value> carried;
@@ -401,7 +401,7 @@ static void materializeWhilePipeline(const RegionAttrs &r, scf::WhileOp w,
 static DCPathPipelineOp materializeLoopToPipeline(const RegionAttrs &r,
                                                   LoopLikeOpInterface loop,
                                                   ScheduleModel &model,
-                                                  const OperatorLibrary &lib) {
+                                                  const DeviceModel &dev) {
   Operation *loopOp = loop.getOperation();
   OpBuilder b(loopOp);
   Location loc = loop.getLoc();
@@ -456,7 +456,7 @@ static DCPathPipelineOp materializeLoopToPipeline(const RegionAttrs &r,
 
   b.setInsertionPointToEnd(blk);
   for (Operation &op : body->without_terminator())
-    convertOp(op, b, map, model, lib);
+    convertOp(op, b, map, model, dev);
 
   Operation *term = body->getTerminator();
   SmallVector<Value> yields;
@@ -476,7 +476,7 @@ static DCPathPipelineOp materializeLoopToPipeline(const RegionAttrs &r,
 static void materializeSequential(const RegionAttrs &r,
                                   ArrayRef<Operation *> ops,
                                   ScheduleModel &model,
-                                  const OperatorLibrary &lib, bool container) {
+                                  const DeviceModel &dev, bool container) {
   SmallVector<Operation *> body;
   for (Operation *op : ops)
     if (!op->hasTrait<OpTrait::IsTerminator>())
@@ -536,7 +536,7 @@ static void materializeSequential(const RegionAttrs &r,
   IRMapping map;
   b.setInsertionPointToEnd(blk);
   for (Operation *op : work)
-    convertOp(*op, b, map, model, lib);
+    convertOp(*op, b, map, model, dev);
 
   SmallVector<Value> yields(llvm::map_range(
       escaping, [&](Value v) { return map.lookupOrDefault(v); }));
@@ -687,7 +687,7 @@ namespace {
 struct Reifier {
   func::FuncOp func;
   ScheduleModel &model;
-  const OperatorLibrary &lib;
+  const DeviceModel &dev;
   // Set in run(): this func calls sub-kernels, so a shared `memref.alloc` an
   // acyclic span holds is hoisted to func level rather than yielded.
   bool container = false;
@@ -706,25 +706,25 @@ struct Reifier {
   void materializeRegion(const SchedRegion &region) {
     if (region.kind == allo::RegionKind::StraightLine) {
       materializeSequential(RegionAttrs(model.regionOf(region.ops.front())),
-                            region.ops, model, lib, container);
+                            region.ops, model, dev, container);
       return;
     }
     Operation *anchor = region.anchor();
     if (isa<AffineForOp, scf::ForOp>(anchor)) {
       materializeCountedLoop(cast<LoopLikeOpInterface>(anchor));
     } else if (auto w = dyn_cast<scf::WhileOp>(anchor)) {
-      if (hasNestedLoop(w) || !conditionIsCombinational(w, lib) ||
+      if (hasNestedLoop(w) || !conditionIsCombinational(w, dev) ||
           blockHasSyncCall(w.getAfter().front())) {
         // A while that cannot flush-pipeline takes the sequential CHECK/RUN
         // controller (`ii` unset). A non-identity-forwarding one is left raw.
         materializeBlock(w.getAfter().front());
         if (whileHasIdentityForwarding(w))
-          materializeWhilePipeline(RegionAttrs(), w, model, lib);
+          materializeWhilePipeline(RegionAttrs(), w, model, dev);
       } else {
         // A straight-line while with a combinational condition
         // flushing-pipelines, `ii` from its own solve.
         materializeWhilePipeline(RegionAttrs(model.regionOf(anchor)), w, model,
-                                 lib);
+                                 dev);
       }
     } else if (isa<scf::IfOp, AffineIfOp>(anchor)) {
       // An opaque guard left by if-conversion: materialize each branch, then
@@ -789,10 +789,10 @@ struct Reifier {
     if (shape == RegionShape::Container) {
       materializeBlock(body);
       pipe = materializeLoopToPipeline(sequentialWrapperAttrs(loop), loop,
-                                       model, lib);
+                                       model, dev);
     } else {
       assert(sol && "a leaf counted loop owns the solve keyed by it");
-      pipe = materializeLoopToPipeline(RegionAttrs(sol), loop, model, lib);
+      pipe = materializeLoopToPipeline(RegionAttrs(sol), loop, model, dev);
     }
     // A container whose child spans are all declarations-only builds no child
     // region and comes out a leaf; nothing else may move.
@@ -908,8 +908,8 @@ static DCPathModuleOp toDcpModule(func::FuncOp func) {
 }
 
 static void materializeFunc(func::FuncOp func, ScheduleModel &model,
-                            const OperatorLibrary &lib) {
-  Reifier{func, model, lib}.run();
+                            const DeviceModel &dev) {
+  Reifier{func, model, dev}.run();
 
   // A fully-deferred function still closes into a `dcp.module` so the module is
   // uniform, but publishes no contract: it never went through scheduling.
@@ -941,7 +941,7 @@ static void loadDependentDialects(MLIRContext &ctx) {
 // func's address and never dereferences a closed one; the funcs it looks up
 // were all live at once, so no two share an address.
 static void reifyCalleesFirst(func::FuncOp func, ScheduleModel &model,
-                              const OperatorLibrary &lib,
+                              const DeviceModel &dev,
                               llvm::DenseSet<Operation *> &done) {
   if (!done.insert(func.getOperation()).second)
     return;
@@ -953,14 +953,14 @@ static void reifyCalleesFirst(func::FuncOp func, ScheduleModel &model,
       callees.push_back(c);
   });
   for (func::FuncOp c : callees)
-    reifyCalleesFirst(c, model, lib, done);
-  materializeFunc(func, model, lib);
+    reifyCalleesFirst(c, model, dev, done);
+  materializeFunc(func, model, dev);
 }
 
 void mlir::allo::runPostScheduleConversion(ModuleOp module,
                                            ScheduleModel &model) {
   loadDependentDialects(*module->getContext());
-  auto lib = OperatorLibrary::fromModule(module);
+  auto dev = DeviceModel::fromModule(module);
   // One `dcp.unit` per allocated instance, declared at the top of the module so
   // the symbols resolve whatever order the funcs below are reified in.
   OpBuilder b(module.getBody(), module.getBody()->begin());
@@ -970,7 +970,7 @@ void mlir::allo::runPostScheduleConversion(ModuleOp module,
   SmallVector<func::FuncOp> funcs(module.getOps<func::FuncOp>());
   llvm::DenseSet<Operation *> reified;
   for (func::FuncOp func : funcs)
-    reifyCalleesFirst(func, model, lib, reified);
+    reifyCalleesFirst(func, model, dev, reified);
   verifyDcpClosed(module);
   model.record(module);
 }

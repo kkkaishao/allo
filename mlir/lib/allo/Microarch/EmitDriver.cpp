@@ -320,7 +320,7 @@ LogicalResult emitDatapathToHW(ModuleOp module, StringRef binding,
   // Storage and comb timing have no per-access carrier, so they thread into the
   // datapath builder as a library; an IP's timing rides the `dcp.operator` its
   // `dcp.compute` names, which stays live for the whole of emission.
-  OperatorLibrary lib = OperatorLibrary::fromModule(module);
+  DeviceModel dev = DeviceModel::fromModule(module);
 
   auto scheduled = llvm::to_vector(module.getOps<dcp::DCPathModuleOp>());
 
@@ -387,14 +387,15 @@ LogicalResult emitDatapathToHW(ModuleOp module, StringRef binding,
     });
     uarch::CalleeCtx cc{modules, ifaceModels};
     const uarch::CalleeCtx *callees = hasInvoke ? &cc : nullptr;
-    Datapath dp(f, *policy, lib, cycleTime, callees, /*isTop=*/f == topFunc);
+    Datapath dp(f, *policy, dev, cycleTime, callees, /*isTop=*/f == topFunc);
     LLVM_DEBUG({
       llvm::dbgs() << "// datapath for @" << f.getSymName() << "\n";
       dp.dump(llvm::dbgs());
     });
     b.setInsertionPoint(f);
     auto pairOr =
-        emitModule(f, dp, b, opModules, cycleTime, lib, report, callees);
+        emitModule(f, dp, b, opModules, cycleTime, dev.operators, report,
+                   callees);
     if (failed(pairOr))
       return failure();
     registerModule(f.getSymName(), pairOr->first, std::move(pairOr->second));

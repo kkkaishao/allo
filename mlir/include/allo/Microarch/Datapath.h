@@ -33,6 +33,9 @@ class HWModuleOp;
 namespace mlir::allo::iface {
 struct ModuleInterface;
 } // namespace mlir::allo::iface
+namespace mlir::allo {
+struct DeviceModel;
+} // namespace mlir::allo
 
 namespace mlir::allo::uarch {
 
@@ -823,12 +826,12 @@ struct Datapath {
   bool infeasible = false;
 
   Datapath() = default;
-  /// \p lib is the device the scheduler priced this kernel against: its storage
-  /// view resolves each MemUnit's implementation and access latency, its
-  /// operator rows let \p policy price a fold's multiplexer against
+  /// \p dev is the device the scheduler priced this kernel against: its
+  /// storage model resolves each MemUnit's implementation and access latency,
+  /// its operator rows let \p policy price a fold's multiplexer against
   /// \p cycleTime, the period the schedule was cut to.
   Datapath(dcp::DCPathModuleOp func, const BindingPolicy &policy,
-           const OperatorLibrary &lib, float cycleTime,
+           const DeviceModel &dev, float cycleTime,
            const CalleeCtx *callees = nullptr, bool isTop = false);
 
   /// The dcp op whose execution produces \p s's value, or null when the Source

@@ -378,7 +378,7 @@ void expandRegionBoundaries(func::FuncOp funcOp, DependenceAnalysis &deps,
   }
 }
 
-bool conditionIsCombinational(scf::WhileOp w, const OperatorLibrary &lib) {
+bool conditionIsCombinational(scf::WhileOp w, const DeviceModel &dev) {
   // Combinational iff every op in the before region (except the pure-wire
   // `scf.condition`) is 0-latency.
   bool comb = true;
@@ -394,8 +394,8 @@ bool conditionIsCombinational(scf::WhileOp w, const OperatorLibrary &lib) {
     if (op == term)
       return WalkResult::advance();
     // An access is timed by its storage, everything else by an operator row.
-    unsigned latency = asMemAccess(op) ? lib.memoryLibrary().timing(op).latency
-                                       : lib.lookup(op).latency;
+    unsigned latency = asMemAccess(op) ? dev.memory.timing(op).latency
+                                       : dev.operators.lookup(op).latency;
     if (latency == 0)
       return WalkResult::advance();
     comb = false;
@@ -404,7 +404,7 @@ bool conditionIsCombinational(scf::WhileOp w, const OperatorLibrary &lib) {
   return comb;
 }
 
-bool whileFlushingPipelines(scf::WhileOp w, const OperatorLibrary &lib) {
+bool whileFlushingPipelines(scf::WhileOp w, const DeviceModel &dev) {
   for (Region &r : w->getRegions())
     if (r.walk([](Operation *op) {
            return isa<affine::AffineForOp, scf::ForOp, scf::WhileOp>(op)
@@ -412,7 +412,7 @@ bool whileFlushingPipelines(scf::WhileOp w, const OperatorLibrary &lib) {
                       : WalkResult::advance();
          }).wasInterrupted())
       return false;
-  return conditionIsCombinational(w, lib) &&
+  return conditionIsCombinational(w, dev) &&
          !blockHasSyncCall(w.getAfter().front());
 }
 

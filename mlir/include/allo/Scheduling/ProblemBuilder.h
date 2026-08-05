@@ -15,6 +15,7 @@
 namespace mlir::allo {
 
 class OperatorLibrary;
+struct DeviceModel;
 
 /// Turn every region BOUNDARY expression in \p func into operations, so a
 /// problem built afterwards holds them: a counted loop's runtime bounds and a
@@ -59,14 +60,14 @@ bool whileHasIdentityForwarding(scf::WhileOp w);
 /// sub-kernel call, whose length is its callee's schedule and so is no row \p
 /// lib can answer for. Either routes the while to the sequential CHECK/RUN
 /// controller instead.
-bool conditionIsCombinational(scf::WhileOp w, const OperatorLibrary &lib);
+bool conditionIsCombinational(scf::WhileOp w, const DeviceModel &dev);
 
 /// Whether \p w takes the flushing-pipeline schedule rather than decomposing
 /// into sub-regions run in program order: it nests no loop (whose per-iteration
 /// length is data-dependent), its condition is combinational, and its body
 /// holds no sub-kernel call. Only a while on this path must forward its
 /// loop-carried values 1:1.
-bool whileFlushingPipelines(scf::WhileOp w, const OperatorLibrary &lib);
+bool whileFlushingPipelines(scf::WhileOp w, const DeviceModel &dev);
 
 /// Build a cyclic scheduling problem for an uncounted `scf.while`, its before
 /// and after regions scheduled as one iteration: both regions' ops and deps,

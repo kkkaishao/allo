@@ -210,10 +210,10 @@ namespace {
 /// is handed: the span composition reads that analysis after the solve.
 class FuncScheduler {
 public:
-  FuncScheduler(DependenceAnalysis &deps, const OperatorLibrary &lib,
+  FuncScheduler(DependenceAnalysis &deps, const DeviceModel &dev,
                 ScheduleModel &model, float cycleTime,
                 const SchedulerOptions &opts)
-      : deps(deps), lib(lib), model(model), cycleTime(cycleTime), opts(opts) {}
+      : deps(deps), dev(dev), model(model), cycleTime(cycleTime), opts(opts) {}
 
   /// Consume this function's assumption hints, solve its regions, and publish
   /// what the whole kernel costs.
@@ -256,7 +256,7 @@ private:
   void publishKernelLatency(func::FuncOp funcOp);
 
   DependenceAnalysis &deps;
-  const OperatorLibrary &lib;
+  const DeviceModel &dev;
   ScheduleModel &model;
   float cycleTime;
   const SchedulerOptions &opts;
@@ -300,7 +300,8 @@ void FuncScheduler::annotateAllocation(OccupancyProblem &problem) {
     // One resource is one operator identity, so every operation on it names
     // the same `dcp.operator`.
     unsigned base =
-        model.addUnits(lib.lookup(users.front()).identity.ipSymbol, *units);
+        model.addUnits(dev.operators.lookup(users.front()).identity.ipSymbol,
+                       *units);
     for (Operation *op : users)
       model.setUnit(op, base + *problem.getAssignedUnit(op));
   }
@@ -366,15 +367,15 @@ LogicalResult FuncScheduler::scheduleCyclic(LoopLikeOpInterface body,
   CarriedEdges carried;
   auto problem = buildCyclicProblem<ChainingModuloProblem>(body, deps, carried);
   Block *bodyBlock = &body.getLoopRegions().front()->front();
-  populateOperatorTypes(problem, lib, lib.memoryLibrary());
-  recordOperatorClasses(problem, lib, model);
+  populateOperatorTypes(problem, dev.operators, dev.memory);
+  recordOperatorClasses(problem, dev.operators, model);
   // What contends, then how many of it to build: an occupancy window is a
   // physical property of the region and holds however the units are allocated.
-  populateMemoryResources(problem, lib.memoryLibrary());
-  populateOperatorOccupancy(problem, lib);
+  populateMemoryResources(problem, dev.memory);
+  populateOperatorOccupancy(problem, dev.operators);
   populateCallOccupancy(problem);
   if (opts.allocate)
-    populateOperatorAllocation(problem, lib);
+    populateOperatorAllocation(problem, dev.operators);
   Operation *anchor = bodyBlock->getTerminator();
   // The trip this solution records is the INNERMOST loop's, the one its solved
   // `length`/`ii` describe. Every level above drives its child as a container,
@@ -384,7 +385,7 @@ LogicalResult FuncScheduler::scheduleCyclic(LoopLikeOpInterface body,
   // The trip is withheld where iterations do not overlap: `ii` is the body
   // depth there, so depth, not drain, is what the trip multiplies.
   SpanObjective span(problem, anchor->getOperands(), bodyBlock,
-                     pipelined ? trip.count : std::nullopt, lib);
+                     pipelined ? trip.count : std::nullopt, dev.operators);
   Stopwatch solveStart = now();
   if (failed(solveSchedulingProblem(problem, anchor, cycleTime, minII, opts,
                                     span)))
@@ -458,15 +459,15 @@ LogicalResult FuncScheduler::scheduleWhile(scf::WhileOp w,
                                            const SchedRegion &region) {
   CarriedEdges carried;
   auto problem = buildWhileProblem<ChainingModuloProblem>(w, deps, carried);
-  populateOperatorTypes(problem, lib, lib.memoryLibrary());
-  recordOperatorClasses(problem, lib, model);
-  populateMemoryResources(problem, lib.memoryLibrary());
+  populateOperatorTypes(problem, dev.operators, dev.memory);
+  recordOperatorClasses(problem, dev.operators, model);
+  populateMemoryResources(problem, dev.memory);
   // A flushing while issues an iteration per II like a pipeline: a
   // non-pipelined operator bounds its interval the same way. No call occupancy
   // is needed, since `whileFlushingPipelines` rejects a body with a sync call.
-  populateOperatorOccupancy(problem, lib);
+  populateOperatorOccupancy(problem, dev.operators);
   if (opts.allocate)
-    populateOperatorAllocation(problem, lib);
+    populateOperatorAllocation(problem, dev.operators);
   Operation *anchor = w.getYieldOp().getOperation();
   // Honor a requested target II (>=1) as a lower bound. `ii=-1` (pipelining
   // off) is not modeled for while loops.
@@ -476,7 +477,7 @@ LogicalResult FuncScheduler::scheduleWhile(scf::WhileOp w,
   // counted loop's iter_args, so no body is passed in to read them. No trip
   // either, so the objective is just the anchor's start time.
   SpanObjective span(problem, anchor->getOperands(), /*carried=*/nullptr,
-                     /*trip=*/std::nullopt, lib);
+                     /*trip=*/std::nullopt, dev.operators);
   Stopwatch solveStart = now();
   if (failed(solveSchedulingProblem(problem, anchor, cycleTime, minII, opts,
                                     span)))
@@ -569,15 +570,15 @@ LogicalResult FuncScheduler::scheduleAcyclic(ArrayRef<Operation *> ops,
                                              bool ownsRegion) {
   ChainingSharedOperatorsProblem problem =
       buildAcyclicProblem<ChainingSharedOperatorsProblem>(ops, deps);
-  populateOperatorTypes(problem, lib, lib.memoryLibrary());
-  recordOperatorClasses(problem, lib, model);
-  populateMemoryResources(problem, lib.memoryLibrary());
+  populateOperatorTypes(problem, dev.operators, dev.memory);
+  recordOperatorClasses(problem, dev.operators, model);
+  populateMemoryResources(problem, dev.memory);
   if (opts.allocate)
-    populateOperatorAllocation(problem, lib);
+    populateOperatorAllocation(problem, dev.operators);
   // A straight-line region runs once, so its whole cost is its drain, and it
   // carries nothing between iterations it does not have.
   SpanObjective span(problem, spanEscapingValues(ops, model),
-                     /*carried=*/nullptr, /*trip=*/1, lib);
+                     /*carried=*/nullptr, /*trip=*/1, dev.operators);
   Stopwatch solveStart = now();
   if (failed(
           solveSchedulingProblem(problem, ops.back(), cycleTime, opts, span)))
@@ -802,7 +803,7 @@ LogicalResult FuncScheduler::scheduleRegion(const SchedRegion &region) {
     // A nested loop (data-dependent per-iteration length) or a condition not
     // settled at issue forces the sequential CHECK/RUN controller. The
     // reifier's routing shares `conditionIsCombinational`, so the two agree.
-    if (!whileFlushingPipelines(whileOp, lib)) {
+    if (!whileFlushingPipelines(whileOp, dev)) {
       info(Stage::Sched, whileOp)
           << "While loop cannot flushing-pipeline (nested loop, sub-kernel "
              "call, or non-combinational condition); decomposing its body "
@@ -926,7 +927,7 @@ LogicalResult mlir::allo::runSDCScheduler(ModuleOp module, StringRef top,
   loadDependentDialects(*module->getContext());
   // Timing characterization for every op (latency + delays), built from the
   // injected `dcp.device` + `dcp.operator` IR, once for scheduling and reify.
-  auto loadedLib = OperatorLibrary::fromModule(module);
+  auto loadedDev = DeviceModel::fromModule(module);
 
   // Callees before callers: a caller's own region partition asks whether each
   // call is indeterminate, which reads the callee's published latency.
@@ -945,7 +946,7 @@ LogicalResult mlir::allo::runSDCScheduler(ModuleOp module, StringRef top,
     // `allo.assume.*` hints. Outlives the solve: the span composition reads its
     // value ranges to bound a symbolic trip.
     DependenceAnalysis deps(fn);
-    FuncScheduler sched(deps, loadedLib, model, cycleTime, opts);
+    FuncScheduler sched(deps, loadedDev, model, cycleTime, opts);
     if (failed(sched.run(fn)))
       return failure();
   }

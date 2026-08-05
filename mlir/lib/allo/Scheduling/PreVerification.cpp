@@ -71,10 +71,10 @@ static LogicalResult checkStallContract(Operation *op, StringRef symbol);
 static LogicalResult checkMemories(func::FuncOp func, const MemoryLibrary &lib,
                                    DenseSet<Value> &boundaryArrays, bool isTop);
 static LogicalResult checkComposition(func::FuncOp func,
-                                      const OperatorLibrary &lib);
+                                      const DeviceModel &dev);
 static LogicalResult checkPartitionAgreement(func::FuncOp func);
 static LogicalResult verifyFunc(
-    func::FuncOp func, ModuleOp module, const OperatorLibrary &lib,
+    func::FuncOp func, ModuleOp module, const DeviceModel &dev,
     llvm::DenseMap<std::pair<Operation *, unsigned>, bool> &streamArgIsInput,
     DenseSet<Value> &boundaryArrays, bool isTop);
 
@@ -128,12 +128,13 @@ static void recordStreamArgDirections(
 }
 
 LogicalResult verifyFunc(
-    func::FuncOp func, ModuleOp module, const OperatorLibrary &lib,
+    func::FuncOp func, ModuleOp module, const DeviceModel &dev,
     llvm::DenseMap<std::pair<Operation *, unsigned>, bool> &streamArgIsInput,
     DenseSet<Value> &boundaryArrays, bool isTop) {
-  if (failed(checkSignature(func)) || failed(checkOperations(func, lib)) ||
-      failed(checkMemories(func, lib.memoryLibrary(), boundaryArrays, isTop)) ||
-      failed(checkComposition(func, lib)))
+  if (failed(checkSignature(func)) ||
+      failed(checkOperations(func, dev.operators)) ||
+      failed(checkMemories(func, dev.memory, boundaryArrays, isTop)) ||
+      failed(checkComposition(func, dev)))
     return failure();
   return checkChannels(func, streamArgIsInput);
 }
@@ -437,7 +438,7 @@ LogicalResult checkPartitionAgreement(func::FuncOp func) {
 // Composition and control shape.
 //===--------------------------------------------------------------------===//
 
-LogicalResult checkComposition(func::FuncOp func, const OperatorLibrary &lib) {
+LogicalResult checkComposition(func::FuncOp func, const DeviceModel &dev) {
   if (composesOnStructuralTop(func)) {
     // A loop around a spawn reads as loose control flow to the check below, so
     // name it first: the loop is what the user has to move.
@@ -467,7 +468,7 @@ LogicalResult checkComposition(func::FuncOp func, const OperatorLibrary &lib) {
   }
 
   WalkResult r = func.walk([&](scf::WhileOp w) {
-    if (!whileFlushingPipelines(w, lib) || whileHasIdentityForwarding(w))
+    if (!whileFlushingPipelines(w, dev) || whileHasIdentityForwarding(w))
       return WalkResult::advance();
     error(Stage::Prep, Code::WhileForwardingNotIdentity, w)
         << "While loop not scheduled: its loop-carried values are not "
@@ -654,7 +655,7 @@ LogicalResult checkChannelCycles(func::FuncOp func,
 // lines are `debug` level; a normal compile sees only rejections.
 //===----------------------------------------------------------------------===//
 static LogicalResult checkAddressCost(func::FuncOp funcOp,
-                                      const OperatorLibrary &lib,
+                                      const DeviceModel &dev,
                                       float cycleTimeNs) {
   bool fits = true;
   unsigned total = 0, nonTrivial = 0, overCycle = 0, banked = 0,
@@ -671,7 +672,7 @@ static LogicalResult checkAddressCost(func::FuncOp funcOp,
                                     assignedBankOf(op));
     if (e.bank)
       ++banked;
-    AddressCost cost = addressCostOf(op, lib);
+    AddressCost cost = addressCostOf(op, dev.operators);
     if (cost.trivial())
       return;
     ++nonTrivial;
@@ -687,7 +688,7 @@ static LogicalResult checkAddressCost(func::FuncOp funcOp,
     // The access's own inDelay adds the port's setup to the address cone,
     // which is what the solver sees.
     double charged =
-        accessCharacterization(op, lib, lib.memoryLibrary()).inDelay;
+        accessCharacterization(op, dev.operators, dev.memory).inDelay;
     bool over = charged > cycleTimeNs;
     if (over) {
       ++overCycle;
@@ -753,19 +754,19 @@ LogicalResult allo::runPreScheduleVerification(ModuleOp module, StringRef top,
   if (failed(closureOr))
     return failure();
 
-  OperatorLibrary lib = OperatorLibrary::fromModule(module);
+  DeviceModel dev = DeviceModel::fromModule(module);
   llvm::DenseMap<std::pair<Operation *, unsigned>, bool> streamArgIsInput;
   DenseSet<Value> boundaryArrays = boundaryArraysOf(topFunc);
   for (func::FuncOp fn : *closureOr)
     recordStreamArgDirections(fn, streamArgIsInput);
   for (func::FuncOp fn : *closureOr)
-    if (failed(verifyFunc(fn, module, lib, streamArgIsInput, boundaryArrays,
+    if (failed(verifyFunc(fn, module, dev, streamArgIsInput, boundaryArrays,
                           fn == topFunc)))
       return failure();
   // Last, because it prices the addresses the banking above has just been held
   // legal: a rejected partition would make the cost meaningless.
   for (func::FuncOp fn : *closureOr)
-    if (failed(checkAddressCost(fn, lib, cycleTimeNs)))
+    if (failed(checkAddressCost(fn, dev, cycleTimeNs)))
       return failure();
   return success();
 }

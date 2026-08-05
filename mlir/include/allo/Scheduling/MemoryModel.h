@@ -13,6 +13,7 @@
 #include "mlir/IR/AffineMap.h"
 #include "mlir/IR/Block.h"
 #include "mlir/IR/BuiltinAttributes.h"
+#include "mlir/IR/BuiltinOps.h" // ModuleOp
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/Operation.h"
 #include "mlir/IR/Value.h"
@@ -71,6 +72,11 @@ struct StorageRealization {
 /// `dcp.stream_timing` rows of the device.
 class MemoryLibrary {
 public:
+  /// Build the library from a module's injected `dcp.device`: its
+  /// `dcp.storage` rows and its `dcp.stream_timing`. A module with no
+  /// `dcp.device` yields an empty (all-default) library.
+  static MemoryLibrary fromModule(ModuleOp module);
+
   struct Timing {
     unsigned latency = 0;
     double delay = 0.0;

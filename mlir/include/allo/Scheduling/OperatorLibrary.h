@@ -125,9 +125,6 @@ public:
   /// into primitive arith otherwise.
   bool hasDirectRealization(Operation *op) const;
 
-  /// The storage-timing view of the device.
-  const MemoryLibrary &memoryLibrary() const { return memory; }
-
   /// The chaining delay of the device's combinational row for \p kind, or 0.0
   /// when the device declares none. For a caller with no `Operation *` to hand
   /// `lookup` (`addressDelaysOf`).
@@ -179,10 +176,24 @@ private:
   std::vector<OperatorEntry> advancedEntries; // matched first (raw name)
   std::vector<OperatorEntry> entries;         // abstract rows
   OperatorEntry defaultEntry;
-  MemoryLibrary memory;
   llvm::StringMap<int64_t> resourcePrices; // one `dcp.resource`, priced
   ArrayAttr muxUses;                       // `dcp.mux`, over (k, width)
   ArrayAttr chainUses;                     // `dcp.chain`, over (depth, width)
+};
+
+/// The device as the compiler reads it: what it can COMPUTE and what it can
+/// STORE IN. Two peer models of one `dcp.device`, neither part of the other,
+/// travelling together because everything that schedules or emits a region
+/// needs both: an operation is timed by an operator row, an access by its
+/// storage, and an access's ADDRESS is arithmetic timed by an operator row.
+struct DeviceModel {
+  OperatorLibrary operators;
+  MemoryLibrary memory;
+
+  static DeviceModel fromModule(ModuleOp module) {
+    return {OperatorLibrary::fromModule(module),
+            MemoryLibrary::fromModule(module)};
+  }
 };
 
 /// What the most plentiful resource on a device prices at, and so how much

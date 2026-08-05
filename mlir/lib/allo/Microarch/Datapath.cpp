@@ -107,11 +107,11 @@ std::optional<int64_t> Datapath::constantOf(const Source &s) const {
 }
 
 Datapath::Datapath(dcp::DCPathModuleOp func, const BindingPolicy &policy,
-                   const OperatorLibrary &lib, float cycleTime,
+                   const DeviceModel &dev, float cycleTime,
                    const CalleeCtx *callees, bool isTop) {
   atTop = isTop;
-  maxWritePorts = lib.memoryLibrary().maxWritePorts;
-  DatapathBuilder builder(*this, func, policy, lib, cycleTime, callees);
+  maxWritePorts = dev.memory.maxWritePorts;
+  DatapathBuilder builder(*this, func, policy, dev, cycleTime, callees);
   builder.build();
 }
 
