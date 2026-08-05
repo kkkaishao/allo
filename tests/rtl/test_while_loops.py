@@ -12,6 +12,7 @@ import pytest
 
 from allo import kernel
 from allo.lang import i32, f32, index
+from allo.backend.rtl import has_exact_scheduler
 
 sys.path.insert(0, os.path.dirname(__file__))
 from _common import Dcp, Mod, _sched, _to_rtl, _one_region, _hold_done  # noqa: E402
@@ -256,6 +257,47 @@ def test_while_flushing_pipeline_cosim():
         out = np.zeros(1, np.int32)
         mod.cosim(A, np.int32(limit), out)
         assert out[0] == gold(limit)
+
+
+@pytest.mark.skipif(not has_exact_scheduler(), reason="build has no OR-Tools")
+def test_while_pipeline_operators_are_allocated():
+    # A flushing while is a pipeline like any counted loop, so the exact
+    # scheduler decides how many copies of each operator its body builds. Until
+    # this region populated an allocation, a while body was never CONSIDERED: it
+    # reported zero allocated operations whatever the binding was, and `planned`
+    # quietly fell back to one instance per operation inside it, worse than the
+    # same body written as a `for`.
+    #
+    # What is locked is that the body's operators reach the decision, not which
+    # count it reaches: one unit per operation is a legitimate area answer for an
+    # operator whose multiplexer costs more than a second copy.
+    N = 32
+
+    @kernel
+    def wmul(Ai: i32[N], A: f32[N], out: f32[N], limit: i32):
+        c: i32 = 0
+        acc: i32 = 0
+        while acc < limit:
+            acc = acc + Ai[c]
+            out[c] = A[c] * A[c + 1] * A[c + 2]
+            c = c + 1
+
+    mod = _to_rtl(wmul, scheduler="exact", binding="planned")
+    res = mod.schedule()
+    assert res.cyclic()[0].conditional  # a flushing while, not a raised `for`
+    solve = next(s for s in res.solves if s.kind == "while")
+    assert solve.allocated_ops > 0, "the while body never reached the allocation"
+
+    # `Ai` all ones makes the trip exactly `limit`, so `c + 2` stays inside `A`.
+    Ai = np.ones(N, np.int32)
+    A = np.random.default_rng(9).random(N, dtype=np.float32).astype(np.float32)
+    for limit in (0, 1, 8):
+        out = np.zeros(N, np.float32)
+        mod.cosim(Ai, A, out, np.int32(limit))
+        gold = np.zeros(N, np.float32)
+        for c in range(limit):
+            gold[c] = A[c] * A[c + 1] * A[c + 2]
+        np.testing.assert_allclose(out, gold, rtol=2e-3, atol=1e-5)
 
 
 def test_while_two_carried_accumulate_cosim():

@@ -511,9 +511,12 @@ LogicalResult FuncScheduler::scheduleWhile(scf::WhileOp w,
   reportOperatorClassSplit(problem, lib);
   populateMemoryResources(problem);
   // A flushing while issues an iteration per II like any pipeline, so a
-  // non-pipelined operator bounds its interval the same way. It needs no call
-  // occupancy: `whileFlushingPipelines` rejects a body holding a sync call.
+  // non-pipelined operator bounds its interval the same way, and its operators
+  // fold the same way. It needs no call occupancy: `whileFlushingPipelines`
+  // rejects a body holding a sync call.
   populateOperatorOccupancy(problem, lib);
+  if (opts.allocate)
+    populateOperatorAllocation(problem, lib);
   Operation *anchor = w.getYieldOp().getOperation();
   // Honor a requested target II (>=1) as a lower bound. `ii=-1` (pipelining
   // off) is not modeled for while loops.
@@ -540,6 +543,7 @@ LogicalResult FuncScheduler::scheduleWhile(scf::WhileOp w,
   annotateRegion(problem, w.getOperation(), *ii,
                  /*trip=*/std::nullopt, /*tripIsBound=*/false,
                  span.drainOf(problem));
+  annotateAllocation(problem);
   return success();
 }
 
