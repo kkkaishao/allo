@@ -177,20 +177,6 @@ std::optional<int64_t> composeSequence(llvm::ArrayRef<SpanNode> nodes);
 std::vector<llvm::SmallVector<unsigned, 2>>
 siblingPredecessors(llvm::ArrayRef<llvm::SmallVector<Operation *>> nodeOps);
 
-/// The nodes \p def ultimately reads, given \p owner (op -> owning node) and a
-/// \p def that \p owner does not name.
-///
-/// The reifier leaves a pure arith cone at FUNC SCOPE for a top-level loop
-/// bound or guard predicate that is an expression, and such an op belongs to no
-/// node, so an SSA edge routed through it reads as no edge at all. The cone is
-/// combinational, so it carries the dependence of everything it reads.
-///
-/// Shared by `siblingPredecessors` and `DatapathBuilder::recordSiblingDeps`,
-/// which must not disagree about it.
-llvm::SmallVector<unsigned, 2>
-ownersThroughScope(Operation *def,
-                   const llvm::DenseMap<Operation *, unsigned> &owner);
-
 /// A func's top-level span: its regions composed over their dependence DAG.
 ///
 /// The LONGEST PATH, not the sum. Independent siblings overlap, so summing them

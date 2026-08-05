@@ -93,7 +93,6 @@ struct AddedDelay {
   const OperatorLibrary &lib;
   double level; // one LUT level of the one-hot select's AND-OR reduction
   llvm::DenseMap<UnitId, Delay> memo;
-  llvm::DenseMap<unsigned, Delay> scopeMemo;
 
   /// What arrives at \p id's input ports, its own delay excluded.
   Delay ofUnit(UnitId id) {
@@ -110,21 +109,6 @@ struct AddedDelay {
     return added;
   }
 
-  /// What a consumer of the func-scope cone \p id waits for, the cone's own
-  /// delay included: a cone is combinational end to end and no pass priced it.
-  Delay ofScope(unsigned id) {
-    auto seen = scopeMemo.find(id);
-    if (seen != scopeMemo.end())
-      return seen->second;
-    const ScopeUnit &su = dp.scopeUnits[id];
-    Delay added;
-    for (const Source &in : su.inputs)
-      added = later(added, ofSource(in));
-    added.cone += combDelay(su.opType);
-    scopeMemo[id] = added;
-    return added;
-  }
-
   Delay ofSource(const Source &s) {
     if (s.kind == Source::Kind::Mux) {
       const Mux &m = dp.muxes[s.id];
@@ -134,8 +118,6 @@ struct AddedDelay {
       in.mux += muxLevels(m.sources.size()) * level;
       return in;
     }
-    if (s.kind == Source::Kind::Scope)
-      return ofScope(s.id);
     // Anything else is held when the cycle starts: a register tap, a port, a
     // literal, a survivor, or a unit whose own output is registered.
     if (s.kind != Source::Kind::Unit || dp.units[s.id].latency)
@@ -151,10 +133,10 @@ struct AddedDelay {
   }
 
   /// Whether the scheduling stage placed \p u: it stamps the sub-cycle start it
-  /// proved (`z`) onto every op it schedules. A loop bound, a branch predicate
-  /// expanded from its integer set, or a while condition the reifier
-  /// synthesizes after the solve carries none, so no chain-break pass cut it
-  /// and nothing charged its delay to the clock.
+  /// proved (`z`) onto every op it schedules. The one thing left that carries
+  /// none is a sequential while's condition, which the reify ASAP-walks after
+  /// the solve, so no chain-break pass cut it and nothing charged its delay to
+  /// the clock. A bound and a predicate the SCHEDULER expands now.
   static bool scheduled(const FuncUnit &u) {
     return llvm::all_of(u.boundOps, [](const auto &bound) {
       return bound.first->hasAttr("z");
@@ -188,14 +170,14 @@ LogicalResult checkCombPathsMeetPeriod(const Datapath &dp, float cycleTime,
     for (UnitId uid : rb.units)
       unitRegion[uid] = rb.id;
 
-  // The worst overrun of one reified expression, per region plus a last slot
-  // for the func-scope cones, which belong to none. Its cells are one chain, so
-  // reporting each of them reports one fault as many times as it is deep.
+  // The worst overrun of one reified expression, per region. Its cells are one
+  // chain, so reporting each of them reports one fault as many times as it is
+  // deep.
   struct Overrun {
     double path = 0.0, over = 0.0;
     Operation *op = nullptr;
   };
-  llvm::SmallVector<Overrun> cones(dp.regions.size() + 1);
+  llvm::SmallVector<Overrun> cones(dp.regions.size());
   auto record = [&](unsigned slot, double path, double over, Operation *op) {
     if (over > cones[slot].over)
       cones[slot] = {path, over, op};
@@ -241,20 +223,12 @@ LogicalResult checkCombPathsMeetPeriod(const Datapath &dp, float cycleTime,
     record(unitRegion.lookup(u.id), cycleTime - slack + d.ns(), d.ns() - slack,
            u.repOp());
   }
-  // A func-scope cone drives a bound or a predicate at the module level, where
-  // no unit's slack holds it, so the period alone does.
-  for (const ScopeUnit &su : dp.scopeUnits) {
-    double path = added.ofScope(su.id).ns();
-    if (path > cycleTime + kSlop)
-      record(dp.regions.size(), path, path - cycleTime, su.op);
-  }
-
   for (const Overrun &worst : cones) {
     if (!worst.op)
       continue;
     warn(Stage::Emit, worst.op)
-        << "An expression the compiler expanded AFTER the schedule was cut (a "
-           "loop bound, a branch predicate or a while condition) is "
+        << "A while condition the compiler expanded AFTER the schedule was "
+           "cut is "
         << llvm::format("%.2f", worst.path)
         << " ns of combinational logic against a "
         << llvm::format("%.2f", cycleTime) << " ns clock, "
@@ -407,10 +381,8 @@ LogicalResult checkEmitterSubset(dcp::DCPathModuleOp func, const Datapath &dp) {
   // while waits t_cond cycles. `verifyDatapath` already rejects a `None`.
   auto conditionOk = [&](const Source &s, bool sequential) {
     switch (s.kind) {
-    // A scheduled prologue predicate and a func-scope cone are both settled at
-    // the region start.
+    // A scheduled prologue predicate is settled at the region start.
     case Source::Kind::Survivor:
-    case Source::Kind::Scope:
       return true;
     case Source::Kind::Unit:
       return sequential || dcpStart(dp.producingOp(s)) == 0;
@@ -446,11 +418,6 @@ LogicalResult checkEmitterSubset(dcp::DCPathModuleOp func, const Datapath &dp) {
     assert((u.identity.comb ? combEmitted(u.identity.realization)
                             : u.identity.realized()) &&
            "an unrealizable operator reached emission");
-  // A func-scope cone is combinational by construction, so only `emitCompute`'s
-  // coverage is left to check.
-  for (const ScopeUnit &su : dp.scopeUnits)
-    assert(combEmitted(su.opType) &&
-           "an unrealizable func-scope expression reached emission");
   return success();
 }
 

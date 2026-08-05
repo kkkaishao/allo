@@ -77,28 +77,6 @@ std::optional<int64_t> mlir::allo::composeSequence(ArrayRef<SpanNode> nodes) {
   return sum;
 }
 
-llvm::SmallVector<unsigned, 2>
-mlir::allo::ownersThroughScope(Operation *def,
-                               const DenseMap<Operation *, unsigned> &owner) {
-  llvm::SmallVector<unsigned, 2> roots;
-  llvm::SmallVector<Operation *, 4> work{def};
-  llvm::SmallPtrSet<Operation *, 8> seen{def};
-  while (!work.empty()) {
-    Operation *o = work.pop_back_val();
-    // An owned op is a root: whoever reads through the cone waits for it, and
-    // its own operands belong to that node, not to this walk.
-    if (auto it = owner.find(o); it != owner.end()) {
-      if (!llvm::is_contained(roots, it->second))
-        roots.push_back(it->second);
-      continue;
-    }
-    for (Value v : o->getOperands())
-      if (Operation *d = v.getDefiningOp(); d && seen.insert(d).second)
-        work.push_back(d);
-  }
-  return roots;
-}
-
 std::vector<llvm::SmallVector<unsigned, 2>>
 mlir::allo::siblingPredecessors(ArrayRef<SmallVector<Operation *>> nodeOps) {
   // Which node owns each op, so a cross-node SSA use can name the producer's
@@ -136,11 +114,11 @@ mlir::allo::siblingPredecessors(ArrayRef<SmallVector<Operation *>> nodeOps) {
               addPred(it->second, i);
             continue;
           }
-          // A def no node owns is a func-scope cone: it carries the dependence
-          // of everything it reads.
-          for (unsigned p : ownersThroughScope(def, owner))
-            if (p != i)
-              addPred(p, i);
+          // A def no node owns binds no hardware and so orders nothing: a
+          // block partitions entirely into regions, and the only ops outside
+          // one are declarations.
+          assert(isDeclarationOp(def) &&
+                 "a computing op outside every region drives a node's input");
         }
       });
   for (auto &entry : sharers)

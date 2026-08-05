@@ -12,7 +12,7 @@
 #include "allo/Scheduling/AddressModel.h" // splitAddress (strength reduction)
 #include "allo/Scheduling/LatencyModel.h" // composeSpan (the one composer)
 #include "allo/Scheduling/MemoryModel.h"  // characterize (storage shape)
-#include "allo/Scheduling/OperatorLibrary.h" // combKindOf (func-scope cones)
+#include "allo/Scheduling/OperatorLibrary.h" // operatorIdentity, characterize
 #include "allo/Support/AliasAnalysis.h"      // resolveRoot (storage identity)
 #include "allo/Support/Logging.h"            // unmodelled-op diagnostic
 #include "allo/Translation/EmitterState.h" // nameFromLoc, sanitizeCppIdentifier
@@ -472,41 +472,6 @@ void DatapathBuilder::bindCompute(dcp::DCPathComputeOp comp, RegionBlock &rb) {
   dp.units.push_back(std::move(u));
 }
 
-void DatapathBuilder::bindScopeOps() {
-  for (Operation &opRef : func.getBody().front()) {
-    Operation *op = &opRef;
-    // Skipped: a region op is a RegionBlock, a literal a ConstCell, a memref
-    // declaration materializes on first access, the terminator is read by
-    // `recordResults`. The rest is leftover bound / predicate arithmetic.
-    if (isa<dcp::DCPathRegionOpInterface, arith::ConstantOp, memref::AllocOp,
-            memref::AllocaOp, memref::GetGlobalOp, StreamCreateOp,
-            dcp::DCPathOutputOp>(op))
-      continue;
-    std::optional<CombOpKindEnum> ck = combKindOf(op);
-    if (!ck || op->getNumResults() != 1) {
-      // Anchored on the offending op: otherwise this reports as an unresolved
-      // bound one region away.
-      unsupported(Stage::Emit, op)
-          << "Operation '" << op->getName()
-          << "' sits outside every scheduling region and is not a "
-             "combinational expression the datapath can build there";
-      dp.infeasible = true;
-      continue;
-    }
-    ScopeUnit su;
-    su.id = dp.scopeUnits.size();
-    su.op = op;
-    su.opType = stringifyCombOpKindEnum(*ck).str();
-    su.resultType = op->getResult(0).getType();
-    // Block order guarantees an operand produced by an earlier cone is already
-    // registered, so this one resolution pass is enough.
-    for (Value v : op->getOperands())
-      su.inputs.push_back(resolveValue(v));
-    producerOf[op->getResult(0)] = Source{Source::Kind::Scope, su.id, 0};
-    dp.scopeUnits.push_back(std::move(su));
-  }
-}
-
 void DatapathBuilder::bindResource(Operation *op, RegionBlock &rb) {
   if (auto inv = dyn_cast<dcp::DCPathInstanceOp>(op))
     return bindCall(inv, rb); // a sub-kernel call -> a CallUnit
@@ -954,7 +919,6 @@ Resolved DatapathBuilder::resolveOperand(Value v, Operation *consumer,
   case Source::Kind::Survivor:
   case Source::Kind::IO:
   case Source::Kind::Const:
-  case Source::Kind::Scope:
     return {base, Value(), 0, 0, true};
   // The counter presents its index at cycle 0 of ITS region, so a consumer
   // scheduled at tY delays it that far.
@@ -1578,13 +1542,11 @@ void DatapathBuilder::recordSiblingDeps(ArrayRef<Operation *> regionOps) {
           addPred(dit->second, consumer);
         continue;
       }
-      // A def no region owns is a func-scope cone (a `ScopeUnit`), which is
-      // combinational over held registers, so the consumer waits for whoever
-      // LATCHES them: otherwise a region reading a top-level loop's bound
-      // expression would start concurrently with its producer.
-      for (unsigned p : ownersThroughScope(def, opTop))
-        if (p != consumer)
-          addPred(p, consumer);
+      // A def no region owns binds no hardware and so orders nothing:
+      // `enumerateRegions` is total over a block, and the only ops the reify
+      // leaves outside a region are declarations.
+      assert(isDeclarationOp(def) &&
+             "a computing op outside every region drives a region's input");
     }
   });
 
@@ -1661,7 +1623,16 @@ void DatapathBuilder::build() {
   deriveCounterTypes();     // counter width (each loop's own range)
   // Everything below resolves Values to Sources, and so runs here rather than
   // during the walk: `resolveValue` needs the complete region model.
-  bindScopeOps();                 // func-scope cones, before anyone reads one
+  // Every op the reify leaves in the module body binds no hardware.
+  // `enumerateRegions` is total over a block, so anything that computes is
+  // inside a region; what used to defeat that was the reify synthesizing a
+  // bound or a predicate AFTER the partition had already run.
+#ifndef NDEBUG
+  for (Operation &op : func.getBody().front())
+    assert((isa<dcp::DCPathRegionOpInterface, dcp::DCPathOutputOp>(&op) ||
+            isDeclarationOp(&op)) &&
+           "an operation outside every region reached the datapath");
+#endif
   recordRegionResults(regionOps); // per-region results/recurrence + predicate
   recordCallScalars();            // each dcp.instance's scalar operand drivers
   recordCallDeps();               // composition DAG on the instance substrate

@@ -84,7 +84,6 @@ using CallId = unsigned;
 //               (id = the StreamChannel)
 //   Call     -> which scalar result of a sub-kernel call (id = the CallUnit),
 //               landing at start+latency
-//   Scope    -> 0 (id = the ScopeUnit), a func-scope combinational cone
 //===----------------------------------------------------------------------===//
 
 struct Source {
@@ -99,8 +98,7 @@ struct Source {
     Counter,
     Survivor,
     Stream,
-    Call,
-    Scope
+    Call
   };
   Kind kind = Kind::None;
   unsigned id = 0;
@@ -163,25 +161,6 @@ struct FuncUnit {
   // for an ordinary distance-1 recurrence; >1 for a chained carry (a 2nd-order
   // shift register `ym2 = ym1; ym1 = y` gives ym2 distance 2).
   llvm::SmallVector<unsigned, 2> inputInitDist;
-};
-
-/// A combinational cell at FUNC SCOPE, outside every region: one op of the
-/// arith cone the reifier leaves in the module body when a top-level loop's
-/// bound or a guard's predicate is an expression rather than a value the
-/// datapath already carries.
-///
-/// Not a `FuncUnit`: it belongs to no region, issues on nothing, and has no
-/// clock, register chain or stall shell. SSA dominance closes its input set to
-/// scalar kernel arguments, literals, top-level survivors and earlier cones,
-/// all HELD, so it is a pure function of settled registers. Its one timing
-/// obligation is a composition edge, recorded by `recordSiblingDeps` chasing
-/// through the cone to the regions its inputs come from.
-struct ScopeUnit {
-  unsigned id = 0;
-  Operation *op = nullptr;             // the func-scope arith op
-  std::string opType;                  // its comb mnemonic (`combKindOf`)
-  Type resultType;                     // value-typed, not bit-blasted
-  llvm::SmallVector<Source, 2> inputs; // one resolved driver per operand
 };
 
 /// A shift-register chain carrying one SSA value across cycle boundaries. Its
@@ -813,7 +792,6 @@ struct Datapath {
 
   // Derived structural cells.
   std::vector<FuncUnit> units;
-  std::vector<ScopeUnit> scopeUnits; // func-scope cones, in block order
   std::vector<Register> regs;
   std::vector<MemUnit> mems;
   std::vector<StreamChannel> streams;
@@ -946,7 +924,6 @@ struct SourceSite {
   enum class Slot {
     UnitInput,        // a compute unit's operand port
     UnitInit,         // that port's reduction identity (absent => None)
-    ScopeInput,       // a func-scope cone's operand
     RegisterInput,    // a shift chain's head driver
     MuxInput,         // one arm of a derived sharing mux
     MemAddress,       // an address operand of a memory access

@@ -188,22 +188,6 @@ Value DatapathEmitter::resolveSource(const uarch::Source &s) {
     assert(cv && "call result source read before its CallUnit was emitted");
     return cv;
   }
-  case uarch::Source::Kind::Scope: {
-    // A func-scope combinational cone over held values. It rides no controller
-    // and takes no register, so there is nothing to time it against: build it
-    // where it is first read and hand back the same wire to everyone after.
-    if (Value v = scopeVal.lookup(s.id))
-      return v;
-    const uarch::ScopeUnit &su = dp.scopeUnits[s.id];
-    SmallVector<Value> operands;
-    for (const uarch::Source &in : su.inputs)
-      operands.push_back(resolveSource(in));
-    Value v = emitCompute(c.b, c.loc, su.opType, operands,
-                          hwType(su.resultType, c.b), su.op);
-    nameValue(v, su.op->getLoc());
-    scopeVal[s.id] = v;
-    return v;
-  }
   case uarch::Source::Kind::None:
     // `validateDatapath` rejects a None Source earlier. Not an `assert`: under
     // NDEBUG that would fall through and hand the caller a null Value.
@@ -222,14 +206,12 @@ unsigned DatapathEmitter::readyCycle(const uarch::Source &s) const {
     return cu.start + static_cast<unsigned>(*cu.latency);
   }
   // A held source has no landing stage: a literal is constant, an IO port
-  // stable for the whole kernel, a counter or survivor a register settled by
-  // the time the region reading it issues, and a func-scope cone a
-  // combinational function of exactly those.
+  // stable for the whole kernel, and a counter or survivor a register settled
+  // by the time the region reading it issues.
   if (s.kind == uarch::Source::Kind::Const ||
       s.kind == uarch::Source::Kind::IO ||
       s.kind == uarch::Source::Kind::Counter ||
-      s.kind == uarch::Source::Kind::Survivor ||
-      s.kind == uarch::Source::Kind::Scope)
+      s.kind == uarch::Source::Kind::Survivor)
     return 0;
   Operation *op = dp.producingOp(s);
   assert(op && "readyCycle only modelled for a Unit / memory read / "
