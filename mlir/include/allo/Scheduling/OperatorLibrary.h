@@ -261,11 +261,17 @@ template <class ProblemT>
 void populateOperatorTypes(ProblemT &problem, const OperatorLibrary &lib) {
   using namespace circt::scheduling;
   for (Operation *op : problem.getOperations()) {
-    if (std::optional<std::pair<int64_t, std::string>> cl =
-            scheduledCallLatency(op)) {
-      Problem::OperatorType opr = problem.getOrInsertOperatorType(cl->second);
-      problem.setLatency(opr, static_cast<unsigned>(cl->first));
-      problem.setIncomingDelay(opr, 0.0); // registered boundary
+    if (isSyncSubKernelCall(op)) {
+      // Timed by its callee, between registered boundaries. An INDETERMINATE
+      // callee has no length to charge, so the node takes zero and its region
+      // waits on the child's `done` instead (`isIndeterminateCall`).
+      std::optional<std::pair<int64_t, std::string>> cl =
+          scheduledCallLatency(op);
+      Problem::OperatorType opr = problem.getOrInsertOperatorType(
+          cl ? cl->second
+             : ("call." + cast<func::CallOp>(op).getCallee() + ".open").str());
+      problem.setLatency(opr, cl ? static_cast<unsigned>(cl->first) : 0);
+      problem.setIncomingDelay(opr, 0.0);
       problem.setOutgoingDelay(opr, 0.0);
       problem.setLinkedOperatorType(op, opr);
       continue;
@@ -331,6 +337,8 @@ inline void populateOperatorOccupancy(ChainingModuloProblem &problem,
   using P = circt::scheduling::Problem;
   unsigned idx = 0;
   for (Operation *op : problem.getOperations()) {
+    if (isSyncSubKernelCall(op))
+      continue; // a re-fired child instance, `populateCallOccupancy`'s window
     OperatorChar c = lib.lookup(op);
     // A one-cycle window is what a pipelined unit already holds, and bounds no
     // interval.
@@ -391,6 +399,8 @@ void populateOperatorAllocation(ProblemT &problem, const OperatorLibrary &lib) {
   };
   std::map<std::string, OperatorClass> byIdentity;
   for (Operation *op : problem.getOperations()) {
+    if (isSyncSubKernelCall(op))
+      continue; // one child instance per callsite; no unit to fold it onto
     OperatorChar c = lib.lookup(op);
     if (!c.identity.realized() || c.identity.comb)
       continue;

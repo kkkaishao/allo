@@ -272,11 +272,14 @@ bool conditionIsCombinational(scf::WhileOp w, const OperatorLibrary &lib) {
   bool comb = true;
   auto *term = w.getConditionOp().getOperation();
   w.getBefore().walk([&](Operation *op) {
-    // A sub-kernel call is timed by its CALLEE's schedule, not by a device row,
-    // so the library has nothing to characterize it against and answers 0. It
-    // is fired and awaited over as many cycles as the child takes, which is
-    // never the issue cycle.
-    if (op == term || (!isSyncSubKernelCall(op) && lib.lookup(op).latency == 0))
+    // A sub-kernel call is timed by its callee and not by any row of `lib`,
+    // which will not answer for one. It is fired and awaited over as many
+    // cycles as the child takes, which is never the issue cycle.
+    if (isSyncSubKernelCall(op)) {
+      comb = false;
+      return WalkResult::interrupt();
+    }
+    if (op == term || lib.lookup(op).latency == 0)
       return WalkResult::advance();
     comb = false;
     return WalkResult::interrupt();
