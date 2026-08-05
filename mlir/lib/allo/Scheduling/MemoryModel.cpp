@@ -156,36 +156,21 @@ void MemoryBankModel::observe(Operation *op) {
     byMemref.try_emplace(root);
 }
 
-void MemoryBankModel::finalize() {
-  for (auto &entry : byMemref) {
-    Value memRef = entry.first;
-    MemInfo &info = entry.second;
+void MemoryBankModel::finalize(const MemoryLibrary &lib) {
+  for (auto &[root, info] : byMemref) {
     // A stream channel is a FIFO, not an array: one transfer per end per cycle,
-    // no banking or storage-impl axis, two independent ends, i.e. `splitRW` at
-    // one port each. `bankLayoutOf` below would cast its type to MemRefType.
-    if (isa<StreamType>(memRef.getType())) {
+    // no banking or storage-impl axis to characterize, two independent ends,
+    // i.e. `splitRW` at one port each. `characterize` would cast its type to
+    // MemRefType.
+    if (isa<StreamType>(root.getType())) {
       info.splitRW = true;
       info.readPorts = 1;
       info.writePorts = 1;
-      continue; // and its default `layout` is the single unbanked one
+      // Its default `layout` is the single unbanked one, and it resolves no
+      // `storage` realization, which nothing here asks a stream for.
+      continue;
     }
-    // A SimpleDualPort (S2P) RAM has a dedicated read and write port; every
-    // other topology shares its ports, a ROM having no write port at all.
-    auto bs =
-        parseBindStorage(carrierAttr<DictionaryAttr>(memRef, kBindStorageAttr));
-    bool constTable = isConstantTable(memRef);
-    bool readOnly = bs.kind == MemoryKindEnum::ROM || constTable;
-    if (bs.port == MemoryPortEnum::SimpleDualPort && !readOnly) {
-      info.splitRW = true;
-      info.readPorts = 1;
-      info.writePorts = 1;
-    } else {
-      info.sharedPorts = portCount(bs.port);
-    }
-    info.layout = bankLayoutOf(memRef);
-    // A constant table has no port to contend for and a complete partition
-    // scattered the array into registers: nothing to bind against either way.
-    info.unlimited = info.layout.registers || constTable;
+    info = characterize(root, lib);
   }
 }
 
@@ -197,8 +182,8 @@ MemoryBankModel::resources(Operation *op) const {
   auto it = byMemref.find(memRef);
   if (it == byMemref.end())
     return {};
-  const MemInfo &info = it->second;
-  if (info.unlimited)
+  const MemoryChar &info = it->second;
+  if (info.unlimited())
     return {};
 
   // The pool this access draws from, and its ports per bank. Split (S2P) gives
@@ -692,14 +677,21 @@ MemoryLibrary::Timing MemoryLibrary::timing(Operation *op) const {
 }
 
 MemoryChar allo::characterize(Value memref, const MemoryLibrary &lib) {
-  using namespace detail;
   MemoryChar c;
   auto bs =
       parseBindStorage(carrierAttr<DictionaryAttr>(memref, kBindStorageAttr));
   c.constantTable = isConstantTable(memref);
-  c.readOnly = bs.kind == MemoryKindEnum::ROM || c.constantTable;
-  c.portsPerBank = portCount(bs.port);
-  c.numBanks = bankLayoutOf(memref).numBanks;
+  // A SimpleDualPort (S2P) RAM has a dedicated read and write port; every other
+  // topology shares its ports, a ROM having no write port to dedicate.
+  bool readOnly = bs.kind == MemoryKindEnum::ROM || c.constantTable;
+  if (bs.port == MemoryPortEnum::SimpleDualPort && !readOnly) {
+    c.splitRW = true;
+    c.readPorts = 1;
+    c.writePorts = 1;
+  } else {
+    c.sharedPorts = portCount(bs.port);
+  }
+  c.layout = bankLayoutOf(memref);
   c.storage = resolveStorage(memref, lib);
   return c;
 }

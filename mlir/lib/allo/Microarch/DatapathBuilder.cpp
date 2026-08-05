@@ -154,8 +154,9 @@ MemId DatapathBuilder::getOrCreateMem(Value memref) {
   auto mt = cast<MemRefType>(memref.getType());
   m.width = mt.getElementTypeBitWidth();
   // Banking / ports from the same storage model the scheduler binds against
-  // (allo.part / allo.bind.storage).
-  auto mc = allo::characterize(memref, lib.memoryLibrary());
+  // (allo.part / allo.bind.storage): ONE characterization, so the ports billed
+  // and the ports built cannot disagree.
+  MemoryChar mc = allo::characterize(memref, lib.memoryLibrary());
   // An initialized global the kernel stores to needs a real write port, so it
   // is a ROM only if nothing writes it: `MemoryChar::constantTable`, the same
   // predicate the scheduler's port model bills against.
@@ -163,16 +164,11 @@ MemId DatapathBuilder::getOrCreateMem(Value memref) {
     m.romInit = *init;
     m.isRom = mc.constantTable;
   }
-  // The one `allo.part` decode for this memref. `characterize` derives its bank
-  // count from the same layout, so the assert below guards drift between them.
-  m.layout = allo::bankLayoutOf(memref);
+  m.layout = mc.layout;
   m.numBanks = m.layout.numBanks;
   // THE expression behind `scattered` (see its declaration for why the top is
   // the only place a complete partition changes the boundary shape).
   m.scattered = m.external && dp.atTop && m.layout.registers;
-  assert(m.numBanks == std::max(1u, mc.numBanks) &&
-         "the emitter's bank decomposition disagrees with the one the "
-         "scheduler's port model was billed against");
   m.storage = mc.storage;
   // Access latency of the resolved realization, from the same device rows the
   // scheduler timed this memref's accesses against (`MemoryLibrary::timing`).

@@ -426,7 +426,7 @@ LogicalResult FuncScheduler::scheduleCyclic(LoopLikeOpInterface body,
   reportOperatorClassSplit(problem, lib);
   // What contends, then how many of it to build: an occupancy window is a
   // physical property of the region and holds however the units are allocated.
-  populateMemoryResources(problem);
+  populateMemoryResources(problem, lib.memoryLibrary());
   populateOperatorOccupancy(problem, lib);
   populateCallOccupancy(problem);
   if (opts.allocate)
@@ -509,7 +509,7 @@ LogicalResult FuncScheduler::scheduleWhile(scf::WhileOp w,
   auto problem = buildWhileProblem<ChainingModuloProblem>(w, deps);
   populateOperatorTypes(problem, lib);
   reportOperatorClassSplit(problem, lib);
-  populateMemoryResources(problem);
+  populateMemoryResources(problem, lib.memoryLibrary());
   // A flushing while issues an iteration per II like any pipeline, so a
   // non-pipelined operator bounds its interval the same way, and its operators
   // fold the same way. It needs no call occupancy: `whileFlushingPipelines`
@@ -603,7 +603,7 @@ LogicalResult FuncScheduler::scheduleAcyclic(ArrayRef<Operation *> ops) {
       buildAcyclicProblem<ChainingSharedOperatorsProblem>(ops, deps);
   populateOperatorTypes(problem, lib);
   reportOperatorClassSplit(problem, lib);
-  populateMemoryResources(problem);
+  populateMemoryResources(problem, lib.memoryLibrary());
   if (opts.allocate)
     populateOperatorAllocation(problem, lib);
   // A straight-line region runs once, so its whole cost is its drain, and it

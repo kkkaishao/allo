@@ -121,18 +121,9 @@ public:
 };
 
 //===----------------------------------------------------------------------===//
-// Per-memref storage shape, derived from the array's `allo.part` /
-// `allo.bind.storage` attributes. The same facts MemoryBankModel binds the
-// scheduler against, re-exposed for the microarch datapath (MemUnit).
+// Per-memref storage predicates, read off the array's `allo.part` /
+// `allo.bind.storage` attributes.
 //===----------------------------------------------------------------------===//
-
-struct MemoryChar {
-  unsigned numBanks = 1;      // physical banks (block/cyclic partition factor)
-  unsigned portsPerBank = 2;  // concurrent ports per bank (from bind.storage)
-  bool readOnly = false;      // no write port needed (declared ROM, or by use)
-  bool constantTable = false; // realized as a combinational constant array
-  std::string storage;        // resolved `dcp.storage` realization
-};
 
 /// The `memref.global` initializer behind \p memRef, i.e. a constant table's
 /// declared contents, or nullopt when it has none.
@@ -152,13 +143,6 @@ std::optional<Attribute> globalInitOf(Value memRef);
 /// PORTS, driving addr/data/we into storage the parent owns, and a constant
 /// table has none to master.
 bool isConstantTable(Value memRef);
-
-/// Characterize a memref's storage shape from its partition/storage
-/// attributes, independent of any scheduling region. \p lib resolves the two
-/// rows the array itself does not name: what an unbound array takes, and what a
-/// completely partitioned one scatters into. It has to be the same device the
-/// access latencies were stamped from, or the two disagree.
-MemoryChar characterize(Value memref, const MemoryLibrary &lib);
 
 /// The `allo.bind.storage impl=` written on \p memref: what was ASKED for,
 /// before `characterize` resolves it, and empty when nothing was. A complete
@@ -224,6 +208,36 @@ llvm::StringRef bankKindName(BankLayout::Kind kind);
 /// decoder of that attribute: a consumer wanting only the bank count or the
 /// complete-partition flag reads it off here rather than parsing again.
 BankLayout bankLayoutOf(Value memRef);
+
+/// One array's storage shape: how it banks, what ports one bank has, and which
+/// `dcp.storage` realization it resolves to. THE characterization, billed by the
+/// scheduler's port model (`MemoryBankModel`) and built by the microarch
+/// datapath (`MemUnit`), so what a schedule reserves and what the emitter wires
+/// cannot drift apart.
+struct MemoryChar {
+  BankLayout layout;          // element-space banks (one when unpartitioned)
+  bool splitRW = false;       // dedicated read/write ports (SimpleDualPort)
+  unsigned sharedPorts = 2;   // per bank, shared R/W (Single/TrueDual/default)
+  unsigned readPorts = 0;     // per bank, dedicated read  (splitRW)
+  unsigned writePorts = 0;    // per bank, dedicated write (splitRW)
+  bool constantTable = false; // realized as a combinational constant array
+  /// Resolved `dcp.storage` realization. EMPTY only for the one array that has
+  /// nowhere to go, a complete partition on a device marking no `scatter` row,
+  /// which `PreVerification` reports against the array.
+  std::string storage;
+
+  /// Whether there is no port here to contend for: a constant table is
+  /// combinational, and a complete partition scattered the array into
+  /// registers.
+  bool unlimited() const { return layout.registers || constantTable; }
+};
+
+/// Characterize a memref's storage shape from its partition/storage
+/// attributes, independent of any scheduling region. \p lib resolves the two
+/// rows the array itself does not name: what an unbound array takes, and what a
+/// completely partitioned one scatters into. It has to be the same device the
+/// access latencies were stamped from, or the two disagree.
+MemoryChar characterize(Value memref, const MemoryLibrary &lib);
 
 /// The canonical spelling of \p part for a memref of \p type: a COMPLETE
 /// partition collapses to its one whole-array axis, a `dim == 0` block or
@@ -364,20 +378,19 @@ AffineMap linearizeAccessMap(AffineMap map, llvm::ArrayRef<int64_t> shape);
 namespace mlir::allo {
 
 /// Per-bank memory-port model. `observe` every memory access in a scheduling
-/// region, `finalize` the per-memref storage shape, then `resources` gives the
-/// port resources one access holds. Base ports (2, or 1 for a single-port
-/// `allo.bind.storage`) come from the array; each `allo.part` bank is then a
-/// separate limited resource with those ports.
+/// region, `finalize` to `characterize` the arrays behind them, then `resources`
+/// gives the port resources one access holds. Each `allo.part` bank is a
+/// separate limited resource carrying the array's ports.
 ///
 /// An access holds one port on EVERY bank it can reach: the bank `assign-banks`
 /// assigned it, or all of them when assigned none. The latter is not a
 /// conservative bound but the crossbar the emitter builds, so a partitioned
-/// array under a roaming access sustains `portsPerBank` concurrent accesses,
-/// not `portsPerBank * numBanks`.
+/// array under a roaming access sustains one bank's ports, not that times the
+/// bank count.
 class MemoryBankModel {
 public:
   void observe(Operation *op);
-  void finalize();
+  void finalize(const MemoryLibrary &lib);
   /// The port resources \p op holds at once, as {resource key, ports per bank}:
   /// one entry per bank it reaches. The limit repeats because it is a property
   /// of the bank, not of the access. Empty when \p op is not a memory access,
@@ -387,15 +400,7 @@ public:
   resources(Operation *op) const;
 
 private:
-  struct MemInfo {
-    bool unlimited = false;   // no port to bind (registers / constant table)
-    bool splitRW = false;     // dedicated read/write ports (SimpleDualPort)
-    unsigned sharedPorts = 2; // per bank, shared R/W (Single/TrueDual/default)
-    unsigned readPorts = 0;   // per bank, dedicated read  (splitRW)
-    unsigned writePorts = 0;  // per bank, dedicated write (splitRW)
-    BankLayout layout;        // element-space banks (one bank when unbanked)
-  };
-  llvm::DenseMap<Value, MemInfo> byMemref;
+  llvm::DenseMap<Value, MemoryChar> byMemref;
 };
 
 } // namespace mlir::allo
@@ -413,13 +418,17 @@ namespace mlir::allo {
 ///
 /// Two passes over the same operations: the bank model has to see every access
 /// of an array before it can say what one of them holds.
+///
+/// \p lib is what `characterize` resolves an array's storage row against. The
+/// ports billed here do not depend on that row, but drawing them from the SAME
+/// characterization the emitter builds from is what keeps the two in step.
 template <class ProblemT>
-void populateMemoryResources(ProblemT &problem) {
+void populateMemoryResources(ProblemT &problem, const MemoryLibrary &lib) {
   using namespace circt::scheduling;
   MemoryBankModel banks;
   for (Operation *op : problem.getOperations())
     banks.observe(op);
-  banks.finalize();
+  banks.finalize(lib);
   for (Operation *op : problem.getOperations()) {
     SmallVector<Problem::ResourceType> units;
     for (auto &[key, limit] : banks.resources(op)) {
