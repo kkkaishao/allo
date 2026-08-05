@@ -96,8 +96,11 @@ static void convertOp(Operation &op, OpBuilder &b, IRMapping &map,
   };
 
   // A memory access's latency is the accessed memref's read/write latency,
-  // from the device memory model.
-  auto memLatency = [&]() -> uint64_t { return lib.lookup(&op).latency; };
+  // asked of the memory model directly: an access is timed by its storage and
+  // has no operator row.
+  auto memLatency = [&]() -> uint64_t {
+    return lib.memoryLibrary().timing(&op).latency;
+  };
   // The bank `assign-banks` decided, moved onto the dcp op's own attribute so
   // no later rewrite can drop it. Absent means the access reaches every bank.
   IntegerAttr bank = op.getAttrOfType<IntegerAttr>(kBankAttr);

@@ -7,6 +7,7 @@
 
 #include "allo/IR/AlloOps.h"
 #include "allo/Scheduling/Footprint.h"
+#include "allo/Scheduling/MemoryAccess.h" // asMemAccess
 #include "allo/Scheduling/OperatorLibrary.h"
 #include "allo/Scheduling/RegionGraph.h" // blockHasSyncCall
 #include "allo/Scheduling/Scheduler.h"
@@ -390,7 +391,12 @@ bool conditionIsCombinational(scf::WhileOp w, const OperatorLibrary &lib) {
       comb = false;
       return WalkResult::interrupt();
     }
-    if (op == term || lib.lookup(op).latency == 0)
+    if (op == term)
+      return WalkResult::advance();
+    // An access is timed by its storage, everything else by an operator row.
+    unsigned latency = asMemAccess(op) ? lib.memoryLibrary().timing(op).latency
+                                       : lib.lookup(op).latency;
+    if (latency == 0)
       return WalkResult::advance();
     comb = false;
     return WalkResult::interrupt();
