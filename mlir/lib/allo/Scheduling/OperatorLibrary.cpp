@@ -305,9 +305,10 @@ MemoryLibrary memoryFromDevice(dcp::DCPathDeviceOp device) {
     t.delay.write = row.getWrDelay().convertToDouble();
     return t;
   };
+  m.maxWritePorts = static_cast<unsigned>(device.getMaxWrites());
   Block &body = device.getBody().front();
   for (auto s : body.getOps<dcp::DCPathStorageOp>()) {
-    m.storage.push_back({s.getSymName().str(), s.getPorts(), timing(s)});
+    m.storage.push_back({s.getSymName().str(), timing(s)});
     if (s.getIsDefault())
       m.defaultStorage = s.getSymName().str();
     if (s.getIsScatter())

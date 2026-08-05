@@ -804,6 +804,12 @@ struct Datapath {
   /// argument is a port it masters on its caller's storage, which is why the
   /// two answer `MemUnit::scattered` differently.
   bool atTop = false;
+  /// How many write ports one array is worth spreading over, from the device's
+  /// `max_writes`. A true dual port is what infers; past it the inference fails
+  /// outright, so a further colour would buy nothing and still cost its address
+  /// and data multiplexers. It bounds the module BOUNDARY for the same reason,
+  /// since whatever backs the array upstream is the same RAM.
+  unsigned maxWritePorts = 2;
 
   // Derived structural cells.
   std::vector<FuncUnit> units;
@@ -912,12 +918,6 @@ struct Datapath {
   /// than an access of this function.
   static constexpr unsigned kNoWritePort = ~0u;
 
-  /// How many write ports one array is worth spreading over. A true dual port
-  /// is what infers; at three the inference fails outright, so a third colour
-  /// would buy nothing and still cost its address and data multiplexers. It
-  /// bounds the module BOUNDARY for the same reason, since whatever backs the
-  /// array upstream is the same RAM.
-  static constexpr unsigned kMaxWritePorts = 2;
 
   /// The accesses of \p id the port model counts and the "can issue in one
   /// cycle" relation over them, one adjacency bitset per access. \p accessOf

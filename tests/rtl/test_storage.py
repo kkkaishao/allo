@@ -17,7 +17,7 @@ from allo.schedule import Schedule
 from allo.schedule.errors import InvalidScheduleArgumentError
 from allo.backend.base import run_pipeline
 from allo.backend.rtl import Memory, RegisterFile
-from allo.backend.rtl.device import builtin_device, Port, Tiled
+from allo.backend.rtl.device import builtin_device, Tiled
 from allo.backend.rtl.schedule import RTL_PREPARE_PIPELINE
 
 sys.path.insert(0, os.path.dirname(__file__))
@@ -1298,7 +1298,6 @@ def test_a_device_can_declare_a_storage_of_its_own():
         dev = builtin_device.copy()
         mram = dev.add_storage(
             "mram",
-            ports=Port.T2P,
             read_latency=read_latency,
             write_latency=1,
             read_delay_ns=0.5,
@@ -1386,7 +1385,6 @@ def test_the_device_names_the_storage_a_scatter_goes_into():
     del renamed.storage["register"]
     renamed.add_storage(
         "ff_cell",
-        ports=Port.T2P,
         read_latency=0,
         write_latency=1,
         read_delay_ns=0.1,
@@ -1407,11 +1405,36 @@ def test_the_device_names_the_storage_a_scatter_goes_into():
     with pytest.raises(ValueError, match="at most one"):
         builtin_device.copy().add_storage(
             "another",
-            ports=Port.T2P,
             read_latency=0,
             write_latency=1,
             is_scatter=True,
         )
+
+
+def test_the_device_says_how_many_write_ports_infer():
+    # Two stores the schedule proved never collide get an `always` block each,
+    # which is what infers a true dual port. How many blocks are worth spreading
+    # over is the PART's answer, not the compiler's: a device whose memories
+    # infer one write port says so and the two stores collapse into one block,
+    # which is the register-file fallback.
+    @kernel
+    def k(A: i32[16], out: i32[16]):
+        buf: i32[16] = 0
+        for i in range(8):
+            buf[2 * i] = A[2 * i] + 1
+            buf[2 * i + 1] = A[2 * i + 1] + 2
+        for i in range(16):
+            out[i] = buf[i]
+
+    blocks = {}
+    for ports in (2, 1):
+        dev = builtin_device.copy().set_max_writes(ports)
+        rtl = k.schedule().export("rtl", device=dev).verilog
+        blocks[ports] = rtl.count("always_ff @(posedge clk)")
+    assert blocks[2] == blocks[1] + 1
+
+    with pytest.raises(ValueError, match="at least one write port"):
+        builtin_device.copy().set_max_writes(0)
 
 
 def test_a_tiled_cost_prices_the_whole_shape():
@@ -1427,7 +1450,6 @@ def test_a_tiled_cost_prices_the_whole_shape():
     dev = builtin_device.copy()
     dev.add_storage(
         "bram",
-        ports=Port.T2P,
         read_latency=1,
         write_latency=1,
         read_delay_ns=0.7,
@@ -1569,7 +1591,6 @@ def _dev(write_latency: int):
     d.set_default_storage(
         d.add_storage(
             "lutram",
-            ports=Port.T2P,
             read_latency=1,
             write_latency=write_latency,
             read_delay_ns=0.5,

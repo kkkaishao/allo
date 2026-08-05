@@ -1,7 +1,7 @@
 # Copyright Allo authors. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-from .device import Device, Port, Storage, builtin_device
+from .device import Device, Storage, builtin_device
 from .interface import (
     Interfaces,
     ModuleInterface,
@@ -27,7 +27,6 @@ from .sim.shell import CosimResult
 
 __all__ = [
     "Device",
-    "Port",
     "Storage",
     "builtin_device",
     "Interfaces",

@@ -14,7 +14,7 @@ import pytest
 import allo
 from allo import kernel
 from allo.lang import i32, f32, index, Stream
-from allo.backend.rtl.device import builtin_device, Port
+from allo.backend.rtl.device import builtin_device
 
 sys.path.insert(0, os.path.dirname(__file__))
 from _common import Mod, _sched, _to_rtl, _iis, COMB, PERIOD_NS  # noqa: E402
@@ -171,7 +171,6 @@ def _dev(write_latency: int):
     d.set_default_storage(
         d.add_storage(
             "lutram",
-            ports=Port.T2P,
             read_latency=1,
             write_latency=write_latency,
             read_delay_ns=0.5,

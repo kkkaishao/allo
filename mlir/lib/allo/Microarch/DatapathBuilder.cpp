@@ -716,7 +716,7 @@ void DatapathBuilder::enumerateBoundaryPorts() {
     if (llvm::all_of(m.accesses, [&](const MemUnit::Access &a) {
           return !a.isWrite || externalBank(m, a).factor == 1;
         }))
-      shared = dp.writePortColouring(m.id, Datapath::kMaxWritePorts);
+      shared = dp.writePortColouring(m.id, dp.maxWritePorts);
     m.writesIndependent = shared.has_value();
     llvm::SmallDenseMap<unsigned, unsigned> portOfColour;
     for (auto [a, acc] : llvm::enumerate(m.accesses)) {

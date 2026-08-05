@@ -114,9 +114,6 @@ ALLO_ENUM_ATTR(PyAssumeDepTypeAttr, "AssumeDepTypeAttr",
 ALLO_ENUM_ATTR(PyAssumeDepDirAttr, "AssumeDepDirAttr",
                alloAttributeIsAAssumeDepDir, alloAssumeDepDirAttrGet,
                alloAssumeDepDirAttrGetValue, alloAssumeDepDirAttrGetTypeID)
-ALLO_ENUM_ATTR(PyMemoryPortAttr, "MemoryPortAttr", alloAttributeIsAMemoryPort,
-               alloMemoryPortAttrGet, alloMemoryPortAttrGetValue,
-               alloMemoryPortAttrGetTypeID)
 ALLO_ENUM_ATTR(PyMemoryKindAttr, "MemoryKindAttr", alloAttributeIsAMemoryKind,
                alloMemoryKindAttrGet, alloMemoryKindAttrGetValue,
                alloMemoryKindAttrGetTypeID)
@@ -139,7 +136,6 @@ void allo::populateAlloAttrs(nb::module_ &m) {
   PyPartitionAttr::bind(m);
   PyAssumeDepTypeAttr::bind(m);
   PyAssumeDepDirAttr::bind(m);
-  PyMemoryPortAttr::bind(m);
   PyMemoryKindAttr::bind(m);
   PyDeterminacyAttr::bind(m);
   PyCombOpKindAttr::bind(m);

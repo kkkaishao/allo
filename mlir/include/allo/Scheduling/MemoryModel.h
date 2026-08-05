@@ -64,7 +64,6 @@ struct MemKindTiming {
 /// the device's own vocabulary rather than by a case of a closed enum.
 struct StorageRealization {
   std::string name;
-  MemoryPortEnum ports = MemoryPortEnum::TrueDualPort;
   MemKindTiming timing;
 };
 
@@ -114,6 +113,11 @@ public:
   std::string scatterStorage;
   std::vector<StorageRealization> storage; // the `dcp.storage` rows
   MemKindTiming fifo;                      // `dcp.stream_timing`
+  // How many write ports one array is worth spreading over, from the device's
+  // `max_writes`. A device fact rather than a per-realization one: `impl=` is a
+  // timing and area label the emitter never binds against, so what limits the
+  // ports is which primitive the design infers into.
+  unsigned maxWritePorts = 2;
 };
 
 //===----------------------------------------------------------------------===//

@@ -100,6 +100,7 @@ Datapath::Datapath(dcp::DCPathModuleOp func, const BindingPolicy &policy,
                    const OperatorLibrary &lib, float cycleTime,
                    const CalleeCtx *callees, bool isTop) {
   atTop = isTop;
+  maxWritePorts = lib.memoryLibrary().maxWritePorts;
   DatapathBuilder builder(*this, func, policy, lib, cycleTime, callees);
   builder.build();
 }

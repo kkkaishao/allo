@@ -67,14 +67,6 @@ MLIR_CAPI_EXPORTED MlirAttribute alloAssumeDepDirAttrGet(MlirContext ctx,
 MLIR_CAPI_EXPORTED uint32_t alloAssumeDepDirAttrGetValue(MlirAttribute attr);
 MLIR_CAPI_EXPORTED MlirTypeID alloAssumeDepDirAttrGetTypeID(void);
 
-// MemoryPortAttr (#allo<mem_port ...>): 0=SinglePort 1=SimpleDualPort
-// 2=TrueDualPort.
-MLIR_CAPI_EXPORTED bool alloAttributeIsAMemoryPort(MlirAttribute attr);
-MLIR_CAPI_EXPORTED MlirAttribute alloMemoryPortAttrGet(MlirContext ctx,
-                                                       uint32_t value);
-MLIR_CAPI_EXPORTED uint32_t alloMemoryPortAttrGetValue(MlirAttribute attr);
-MLIR_CAPI_EXPORTED MlirTypeID alloMemoryPortAttrGetTypeID(void);
-
 // MemoryKindAttr (#allo<mem_kind ram|rom>): 0 = RAM, 1 = ROM.
 MLIR_CAPI_EXPORTED bool alloAttributeIsAMemoryKind(MlirAttribute attr);
 MLIR_CAPI_EXPORTED MlirAttribute alloMemoryKindAttrGet(MlirContext ctx,

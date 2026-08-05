@@ -98,7 +98,6 @@ def MemoryPortEnum : I32EnumAttr<"MemoryPortEnum",
   let cppNamespace = "mlir::allo";
   let genSpecializedAttr = 0;
 }
-def MemoryPortAttr : EnumAttr<Allo_Dialect, MemoryPortEnum, "mem_port">;
 
 // RAM vs ROM: a ROM has no write ports (a store to it is a design error).
 def MemKindRAM : I32EnumAttrCase<"RAM", 0, "ram">;

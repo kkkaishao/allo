@@ -16,16 +16,6 @@ from .area_tables import declare_xcu55c_area
 from .sim.ip_models import OpDesc, Ty
 
 
-class Port(Enum):
-    """Port topology of a storage primitive: how many concurrent read/write
-    ports it has, and whether reads and writes contend. The values are
-    ``MemoryPortEnum``'s."""
-
-    SINGLE = 0  # one shared read/write port
-    S2P = 1  # one dedicated read + one dedicated write, no contention
-    T2P = 2  # two shared read/write ports
-
-
 @dataclass(frozen=True)
 class Resource:
     """A device resource: a counter with a capacity, and nothing else.
@@ -175,7 +165,6 @@ class Storage:
     """
 
     name: str
-    ports: Port
     read_latency: int
     write_latency: int
     read_delay_ns: float
@@ -253,6 +242,13 @@ class Device:
         self.stream_timing: StreamTiming | None = None
         self.operators: list[IP] = []  # built-in and user `@ip` operators
         self.default_freq_mhz: float = 100.0
+        # How many write ports one array is worth spreading over: past this the
+        # RAM inference fails and the array becomes a register file, so a
+        # further port would buy nothing and still cost its muxes. A DEVICE
+        # fact, not a per-storage one: `bind_storage impl=` is a timing and area
+        # label the emitter never binds against, so what limits the ports is
+        # which primitive the design infers into.
+        self.max_writes: int = 2
 
     def _spend(
         self,
@@ -309,7 +305,6 @@ class Device:
         self,
         name: str,
         *,
-        ports: Port,
         read_latency: int,
         write_latency: int,
         read_delay_ns: float = 0.0,
@@ -333,8 +328,6 @@ class Device:
         is a pair of costs, or the single :func:`Tiled` that reads them
         together.
         """
-        if not isinstance(ports, Port):
-            raise TypeError(f"ports must be a Port, got {ports!r}")
         if read_latency < 0 or write_latency < 0:
             raise ValueError(f"storage {name!r}: latency must be non-negative")
         if read_delay_ns < 0 or write_delay_ns < 0:
@@ -349,7 +342,6 @@ class Device:
             )
         s = Storage(
             name=name,
-            ports=ports,
             read_latency=int(read_latency),
             write_latency=int(write_latency),
             read_delay_ns=float(read_delay_ns),
@@ -462,6 +454,16 @@ class Device:
         self.default_freq_mhz = float(freq_mhz)
         return self
 
+    def set_max_writes(self, ports: int) -> Device:
+        """How many write ports the part's memories infer at. Stores the
+        schedule proved never collide are spread over this many `always`
+        blocks; past it the inference fails and the array becomes a register
+        file, so a further port would cost muxes and buy nothing."""
+        if ports < 1:
+            raise ValueError("a memory has at least one write port")
+        self.max_writes = int(ports)
+        return self
+
     def add_operator(self, operator: IP) -> Device:
         if not isinstance(operator, IP):
             raise TypeError(f"expected an operator IP, got {type(operator).__name__}")
@@ -492,6 +494,7 @@ class Device:
         d.stream_timing = self.stream_timing
         d.operators = list(self.operators)
         d.default_freq_mhz = self.default_freq_mhz
+        d.max_writes = self.max_writes
         return d
 
 
@@ -626,7 +629,6 @@ def inject_device(module, device: Device):
         DCPathResourceOp,
         DCPathStorageOp,
         DCPathStreamTimingOp,
-        MemoryPortAttr,
     )
 
     with module.context as ctx, Location.unknown():
@@ -643,6 +645,7 @@ def inject_device(module, device: Device):
 
         dev = DCPathDeviceOp(
             sym_name=device.name,
+            max_writes=IntegerAttr.get(i64, device.max_writes),
             ip=InsertionPoint.at_block_begin(module.body),
         )
         # The body declares what the device HAS and what it can REALIZE, each a
@@ -664,7 +667,6 @@ def inject_device(module, device: Device):
                     sym_name=s.name,
                     is_default=s.name == device.default_storage,
                     is_scatter=s.is_scatter,
-                    ports=MemoryPortAttr.get(s.ports.value, ctx),
                     uses=_uses_attr(s.uses),
                     **_timing(s),
                 )
@@ -785,7 +787,6 @@ builtin_device = Device("builtin")
 # own that happens to spend LUTs.
 builtin_device.add_storage(
     "register",
-    ports=Port.T2P,
     read_latency=0,
     write_latency=1,
     read_delay_ns=0.1,
@@ -794,7 +795,6 @@ builtin_device.add_storage(
 )
 _lutram = builtin_device.add_storage(
     "lutram",
-    ports=Port.T2P,
     read_latency=1,
     write_latency=1,
     read_delay_ns=0.5,
@@ -802,7 +802,6 @@ _lutram = builtin_device.add_storage(
 )
 builtin_device.add_storage(
     "bram",
-    ports=Port.T2P,
     read_latency=1,
     write_latency=1,
     read_delay_ns=0.7,
@@ -810,7 +809,6 @@ builtin_device.add_storage(
 )
 builtin_device.add_storage(
     "uram",
-    ports=Port.T2P,
     read_latency=2,
     write_latency=1,
     read_delay_ns=0.9,
@@ -818,7 +816,6 @@ builtin_device.add_storage(
 )
 builtin_device.add_storage(
     "srl",
-    ports=Port.SINGLE,
     read_latency=1,
     write_latency=1,
     read_delay_ns=0.5,
@@ -867,7 +864,6 @@ declare_xcu55c_area(builtin_device)
 
 __ALL__ = [
     "Device",
-    "Port",
     "Storage",
     "StreamTiming",
     "CombKind",
