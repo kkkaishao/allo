@@ -108,70 +108,96 @@ std::optional<OpKind> mlir::allo::parseOpKind(llvm::StringRef s) {
       .Default(std::nullopt);
 }
 
+//===----------------------------------------------------------------------===//
+// Native realizations: the one table the three views below are generated from.
+//
+// A row is (`CombOpKindEnum` case, abstract `OpKind` case, the MLIR ops it
+// realizes). One table rather than three switches, because the three have to
+// agree: `classify(op) == opKindOf(*combKindOf(op))` wherever an op has a
+// native lowering, and nothing outside the table could enforce that. Adding a
+// native operator is one row here plus one `emitCompute` case.
+//
+// A row's kind is FINER than its abstract kind, which is what the two columns
+// are for: a device characterizes "an integer add", while the emitter has to
+// know it is emitting `addi` and not `subi`.
+//===----------------------------------------------------------------------===//
+
+#define ALLO_COMB_KINDS(X)                                                     \
+  X(Addi, Add, arith::AddIOp)                                                  \
+  X(Subi, Sub, arith::SubIOp)                                                  \
+  X(Muli, Mul, arith::MulIOp)                                                  \
+  X(Divsi, Div, arith::DivSIOp)                                                \
+  X(Divui, Div, arith::DivUIOp)                                                \
+  X(Remsi, Rem, arith::RemSIOp)                                                \
+  X(Remui, Rem, arith::RemUIOp)                                                \
+  X(Andi, And, arith::AndIOp)                                                  \
+  X(Ori, Or, arith::OrIOp)                                                     \
+  X(Xori, Xor, arith::XOrIOp)                                                  \
+  X(Shli, Shl, arith::ShLIOp)                                                  \
+  X(Shrsi, Shr, arith::ShRSIOp)                                                \
+  X(Shrui, Shr, arith::ShRUIOp)                                                \
+  X(Cmpi, Cmp, arith::CmpIOp)                                                  \
+  X(Select, Select, arith::SelectOp)                                           \
+  X(Extsi, ICastI, arith::ExtSIOp)                                             \
+  X(Extui, ICastI, arith::ExtUIOp)                                             \
+  X(Trunci, ICastI, arith::TruncIOp)                                           \
+  X(IndexCast, ICastI, arith::IndexCastOp, arith::IndexCastUIOp)               \
+  X(Negf, Neg, arith::NegFOp)                                                  \
+  X(Minsi, Min, arith::MinSIOp)                                                \
+  X(Minui, Min, arith::MinUIOp)                                                \
+  X(Maxsi, Max, arith::MaxSIOp)                                                \
+  X(Maxui, Max, arith::MaxUIOp)                                                \
+  /* An address expression, priced by the DEFAULT row: no device row covers */ \
+  /* a whole affine map, whose delay is its own operators' (`addressDelay`) */ \
+  X(Apply, Unknown, affine::AffineApplyOp)
+
 std::optional<CombOpKindEnum> mlir::allo::combKindOf(Operation *op) {
-  using E = CombOpKindEnum;
-  return llvm::TypeSwitch<Operation *, std::optional<E>>(op)
-      .Case<arith::AddIOp>([](auto) { return E::Addi; })
-      .Case<arith::SubIOp>([](auto) { return E::Subi; })
-      .Case<arith::MulIOp>([](auto) { return E::Muli; })
-      .Case<arith::DivSIOp>([](auto) { return E::Divsi; })
-      .Case<arith::DivUIOp>([](auto) { return E::Divui; })
-      .Case<arith::RemSIOp>([](auto) { return E::Remsi; })
-      .Case<arith::RemUIOp>([](auto) { return E::Remui; })
-      .Case<arith::AndIOp>([](auto) { return E::Andi; })
-      .Case<arith::OrIOp>([](auto) { return E::Ori; })
-      .Case<arith::XOrIOp>([](auto) { return E::Xori; })
-      .Case<arith::ShLIOp>([](auto) { return E::Shli; })
-      .Case<arith::ShRSIOp>([](auto) { return E::Shrsi; })
-      .Case<arith::ShRUIOp>([](auto) { return E::Shrui; })
-      .Case<arith::CmpIOp>([](auto) { return E::Cmpi; })
-      .Case<arith::SelectOp>([](auto) { return E::Select; })
-      .Case<arith::ExtSIOp>([](auto) { return E::Extsi; })
-      .Case<arith::ExtUIOp>([](auto) { return E::Extui; })
-      .Case<arith::TruncIOp>([](auto) { return E::Trunci; })
-      .Case<arith::IndexCastOp, arith::IndexCastUIOp>(
-          [](auto) { return E::IndexCast; })
-      .Case<affine::AffineApplyOp>([](auto) { return E::Apply; })
-      .Case<arith::NegFOp>([](auto) { return E::Negf; })
-      .Case<arith::MinSIOp>([](auto) { return E::Minsi; })
-      .Case<arith::MaxSIOp>([](auto) { return E::Maxsi; })
-      .Case<arith::MinUIOp>([](auto) { return E::Minui; })
-      .Case<arith::MaxUIOp>([](auto) { return E::Maxui; })
-      .Default([](auto) { return std::nullopt; });
+  return llvm::TypeSwitch<Operation *, std::optional<CombOpKindEnum>>(op)
+#define X(comb, abstract, ...)                                                 \
+  .Case<__VA_ARGS__>([](auto) { return CombOpKindEnum::comb; })
+      ALLO_COMB_KINDS(X)
+#undef X
+          .Default([](auto) { return std::nullopt; });
+}
+
+OpKind mlir::allo::opKindOf(CombOpKindEnum kind) {
+  switch (kind) {
+#define X(comb, abstract, ...)                                                 \
+  case CombOpKindEnum::comb:                                                   \
+    return OpKind::abstract;
+    ALLO_COMB_KINDS(X)
+#undef X
+  }
+  llvm_unreachable("every comb realization names an abstract kind or Unknown");
 }
 
 //===----------------------------------------------------------------------===//
 // Classification: concrete IR op -> abstract kind
+//
+// Total, so it also covers what has no native lowering: float arithmetic, the
+// float casts, the composite integer kinds `legalize-arith` expands, and the
+// storage accesses that are timed by their memory rather than an operator row.
 //===----------------------------------------------------------------------===//
 
 OpKind mlir::allo::classify(Operation *op) {
   return llvm::TypeSwitch<Operation *, OpKind>(op)
-      .Case<arith::AddIOp, arith::AddFOp>([](auto) { return OpKind::Add; })
-      .Case<arith::SubIOp, arith::SubFOp>([](auto) { return OpKind::Sub; })
-      .Case<arith::MulIOp, arith::MulFOp>([](auto) { return OpKind::Mul; })
-      .Case<arith::DivSIOp, arith::DivUIOp, arith::DivFOp>(
-          [](auto) { return OpKind::Div; })
-      .Case<arith::RemSIOp, arith::RemUIOp, arith::RemFOp>(
-          [](auto) { return OpKind::Rem; })
-      .Case<arith::MaximumFOp, arith::MaxSIOp, arith::MaxUIOp>(
-          [](auto) { return OpKind::Max; })
-      .Case<arith::MinimumFOp, arith::MinSIOp, arith::MinUIOp>(
-          [](auto) { return OpKind::Min; })
+#define X(comb, abstract, ...)                                                 \
+  .Case<__VA_ARGS__>([](auto) { return OpKind::abstract; })
+      ALLO_COMB_KINDS(X)
+#undef X
+          .Case<arith::AddFOp>([](auto) { return OpKind::Add; })
+      .Case<arith::SubFOp>([](auto) { return OpKind::Sub; })
+      .Case<arith::MulFOp>([](auto) { return OpKind::Mul; })
+      .Case<arith::DivFOp>([](auto) { return OpKind::Div; })
+      .Case<arith::RemFOp>([](auto) { return OpKind::Rem; })
+      .Case<arith::MaximumFOp>([](auto) { return OpKind::Max; })
+      .Case<arith::MinimumFOp>([](auto) { return OpKind::Min; })
       .Case<arith::MaxNumFOp>([](auto) { return OpKind::MaxNum; })
       .Case<arith::MinNumFOp>([](auto) { return OpKind::MinNum; })
       .Case<arith::CeilDivSIOp, arith::CeilDivUIOp>(
           [](auto) { return OpKind::CeilDiv; })
       .Case<arith::FloorDivSIOp>([](auto) { return OpKind::FloorDiv; })
-      .Case<arith::NegFOp>([](auto) { return OpKind::Neg; })
-      .Case<arith::CmpIOp, arith::CmpFOp>([](auto) { return OpKind::Cmp; })
-      .Case<arith::AndIOp>([](auto) { return OpKind::And; })
-      .Case<arith::OrIOp>([](auto) { return OpKind::Or; })
-      .Case<arith::XOrIOp>([](auto) { return OpKind::Xor; })
-      .Case<arith::ShLIOp>([](auto) { return OpKind::Shl; })
-      .Case<arith::ShRSIOp, arith::ShRUIOp>([](auto) { return OpKind::Shr; })
-      .Case<arith::SelectOp>([](auto) { return OpKind::Select; })
-      .Case<arith::ExtSIOp, arith::ExtUIOp, arith::TruncIOp, arith::IndexCastOp,
-            arith::IndexCastUIOp>([](auto) { return OpKind::ICastI; })
+      .Case<arith::CmpFOp>([](auto) { return OpKind::Cmp; })
       .Case<arith::SIToFPOp, arith::UIToFPOp, arith::FPToSIOp, arith::FPToUIOp>(
           [](auto) { return OpKind::FCastI; })
       .Case<arith::ExtFOp, arith::TruncFOp>([](auto) { return OpKind::FCastF; })
@@ -411,55 +437,6 @@ OperatorLibrary OperatorLibrary::fromModule(ModuleOp module) {
 //===----------------------------------------------------------------------===//
 // Lookup
 //===----------------------------------------------------------------------===//
-
-OpKind mlir::allo::opKindOf(CombOpKindEnum kind) {
-  using E = CombOpKindEnum;
-  switch (kind) {
-  case E::Addi:
-    return OpKind::Add;
-  case E::Subi:
-    return OpKind::Sub;
-  case E::Muli:
-    return OpKind::Mul;
-  case E::Divsi:
-  case E::Divui:
-    return OpKind::Div;
-  case E::Remsi:
-  case E::Remui:
-    return OpKind::Rem;
-  case E::Andi:
-    return OpKind::And;
-  case E::Ori:
-    return OpKind::Or;
-  case E::Xori:
-    return OpKind::Xor;
-  case E::Shli:
-    return OpKind::Shl;
-  case E::Shrsi:
-  case E::Shrui:
-    return OpKind::Shr;
-  case E::Cmpi:
-    return OpKind::Cmp;
-  case E::Select:
-    return OpKind::Select;
-  case E::Extsi:
-  case E::Extui:
-  case E::Trunci:
-  case E::IndexCast:
-    return OpKind::ICastI;
-  case E::Negf:
-    return OpKind::Neg;
-  case E::Minsi:
-  case E::Minui:
-    return OpKind::Min;
-  case E::Maxsi:
-  case E::Maxui:
-    return OpKind::Max;
-  case E::Apply:
-    return OpKind::Unknown; // no abstract row; priced by the default one
-  }
-  llvm_unreachable("every comb realization names an abstract kind or Unknown");
-}
 
 const OperatorEntry *OperatorLibrary::combEntry(OpKind kind) const {
   // `dcp.device.comb` is a dictionary, so there is at most one row per kind in
