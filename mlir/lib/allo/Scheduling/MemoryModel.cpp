@@ -673,11 +673,20 @@ MemoryLibrary::Timing MemoryLibrary::timing(Operation *op) const {
   if (!a)
     return {};
   // A stream is a FIFO, not array storage: it has no realization to resolve and
-  // is timed by its own row.
+  // is timed by its own row. Keyed on the ACCESS KIND and not on an unresolved
+  // name, which `resolveStorage` also returns for an ARRAY the device declares
+  // no row for: sharing one sentinel between the two timed such an array as a
+  // FIFO instead of reporting it.
   std::string name;
-  if (a->kind != AccessKind::Stream)
+  MemKindTiming t = fifo;
+  if (a->kind != AccessKind::Stream) {
     name = resolveStorage(a->root, *this);
-  MemKindTiming t = name.empty() ? fifo : timing(name);
+    // The one way a resolution comes back empty is a completely partitioned
+    // array on a device marking no `scatter` row, which `PreVerification`
+    // rejects; reaching here means that check was bypassed.
+    assert(!name.empty() && "an array access resolves to a storage realization");
+    t = timing(name);
+  }
   return a->isWrite ? Timing{t.latency.write, t.delay.write, name}
                     : Timing{t.latency.read, t.delay.read, name};
 }
