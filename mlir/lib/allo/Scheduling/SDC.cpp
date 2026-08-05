@@ -39,6 +39,10 @@ using namespace mlir::allo::logging;
 // The maximal perfect band of counted loops (affine.for / scf.for) rooted at
 // \p root: descend while a level's body is exactly { inner counted loop,
 // terminator }. Returns [root, ..., innermost].
+//
+// Asked AFTER `expandRegionBoundaries`, which is what puts an inner loop's
+// runtime bound arithmetic beside it and so breaks the band there on purpose;
+// see that function for why.
 static SmallVector<LoopLikeOpInterface> perfectNest(LoopLikeOpInterface root) {
   SmallVector<LoopLikeOpInterface> nest{root};
   while (true) {
@@ -549,13 +553,16 @@ LogicalResult FuncScheduler::scheduleWhile(scf::WhileOp w,
 }
 
 // The operations a sequential while's continue-condition reads, in program
-// order. EMPTY when the cone holds a shape the CHECK region cannot emit (a
-// store, a sub-kernel call, a nested region), which leaves it unscheduled so
-// the emitter rejects the while rather than timing a cone it cannot build.
+// order. The CHECK region emits arithmetic and loads and nothing else, so any
+// other producer FAILS here, reported against the op itself; leaving the cone
+// unscheduled instead only moves the report to the emitter, which sees the
+// arithmetic beside the offender go untimed and blames that.
 //
-// A value defined outside the before block is settled when the loop starts: an
-// iter-arg survivor, an enclosing counter, a literal. It bounds the walk.
-static SmallVector<Operation *> conditionCone(scf::WhileOp w) {
+// An EMPTY cone is the other answer entirely and a normal one: the condition is
+// settled before the loop starts, so there is nothing to time. A value defined
+// outside the before block is such a value, an iter-arg survivor, an enclosing
+// counter or a literal, and it bounds the walk.
+static FailureOr<SmallVector<Operation *>> conditionCone(scf::WhileOp w) {
   Block &before = w.getBefore().front();
   llvm::SmallPtrSet<Operation *, 8> reads;
   SmallVector<Value> work{w.getConditionOp().getCondition()};
@@ -566,8 +573,15 @@ static SmallVector<Operation *> conditionCone(scf::WhileOp w) {
     if (!reads.insert(def).second)
       continue;
     if (!isa<AffineLoadOp, memref::LoadOp>(def) &&
-        !isa<arith::ArithDialect>(def->getDialect()))
-      return {};
+        !isa<arith::ArithDialect>(def->getDialect())) {
+      unsupported(Stage::Sched, def)
+          << "The continue-condition of this while reads '"
+          << def->getName().getStringRef()
+          << "', which the sequential CHECK region cannot evaluate; it emits "
+             "arithmetic and array reads only. Compute the value in the loop "
+             "body and test a carried variable instead";
+      return failure();
+    }
     for (Value o : def->getOperands())
       if (!isa<MemRefType>(o.getType())) // the memref names storage, not a value
         work.push_back(o);
@@ -588,13 +602,15 @@ static SmallVector<Operation *> conditionCone(scf::WhileOp w) {
 // into sub-regions, and the two never overlap, CHECK deciding before RUN
 // issues.
 LogicalResult FuncScheduler::scheduleWhileCondition(scf::WhileOp w) {
-  SmallVector<Operation *> cone = conditionCone(w);
-  if (cone.empty())
+  FailureOr<SmallVector<Operation *>> cone = conditionCone(w);
+  if (failed(cone))
+    return failure();
+  if (cone->empty()) // settled before the loop: the CHECK waits out nothing
     return success();
   info(Stage::Sched, w.getOperation())
-      << "Scheduling the while's own condition cone of " << cone.size()
+      << "Scheduling the while's own condition cone of " << cone->size()
       << " op(s): the CHECK controller waits out its depth each iteration";
-  return scheduleAcyclic(cone);
+  return scheduleAcyclic(*cone);
 }
 
 // Schedule one straight-line region as a `ChainingSharedOperatorsProblem` and
@@ -912,6 +928,16 @@ void FuncScheduler::consumeHints(func::FuncOp funcOp) {
 // expansion produces is no valid affine symbol; this runs AFTER `deps` is
 // built, which has already distilled every distance, and adds only pure ops
 // naming no memref, so it cannot invalidate it.
+//
+// This CHANGES THE REGION SHAPE the partitioning downstream of it sees, and is
+// meant to. An expansion builds into the anchor's own block, so a non-trivial
+// bound on an INNER loop puts operations beside it, `perfectNest` stops
+// descending there, and a nest that would have been one Leaf modulo problem
+// becomes a Container over sub-regions. That is the right answer: the boundary
+// arithmetic is real work needing a schedule, and a level driving it plus a
+// child is exactly what a Container is. It rests on `expandAffineExpr` building
+// NOTHING for a trivial map, which is what keeps the ordinary `for i in
+// range(n)` nest perfect (`expandLoopBound`).
 void FuncScheduler::expandRegionBoundaries(func::FuncOp funcOp) {
   SmallVector<Operation *> anchors;
   funcOp.walk([&](Operation *op) {

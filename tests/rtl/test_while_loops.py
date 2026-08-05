@@ -624,6 +624,33 @@ def test_call_in_a_while_body():
     assert np.array_equal(B, gold)
 
 
+def test_while_condition_reads_a_shape_the_check_cannot_evaluate():
+    # The sequential CHECK region evaluates arithmetic and array reads and
+    # nothing else, so a sub-kernel call in the continue-condition has to be
+    # reported. What the test locks is WHERE and against WHAT: the scheduler
+    # names the call, which is the only place that fact is known. Leaving the
+    # cone unscheduled instead pushes the report to the emitter, which sees the
+    # `index_cast`/`cmpi` beside the call go untimed and blames those.
+    #
+    # The nested loop is what routes this while to the sequential controller.
+    N = 16
+
+    @kernel
+    def wcc_child(A: i32[N], i: index) -> i32:
+        return A[i] * 2
+
+    @kernel
+    def wcc_top(A: i32[N], B: i32[N]):
+        i: i32 = 0
+        while wcc_child(A, i) != 0:
+            for j in range(4):
+                B[j] = B[j] + i
+            i = i + 1
+
+    with pytest.raises(Exception, match="CHECK region cannot evaluate"):
+        _to_rtl(wcc_top).schedule()
+
+
 # --- checked-iteration skeleton reuse -------------------------------------------
 
 
