@@ -13,8 +13,8 @@ R = TypeVar("R")
 
 
 class OperatorType(Enum):
-    """The abstract operator kinds an IP can characterize (mirrors ``OpKind`` in
-    ``OperatorLibrary.h``). The value is the abstract ``kind`` string the injected
+    """The abstract operator kinds an IP can characterize (mirrors ``OpKindEnum``
+    in ``AlloAttrs.td``). The value is the abstract ``kind`` string the injected
     ``dcp.operator`` carries; ``classify`` maps concrete ``arith.*`` ops onto these
     (int vs float split by the signature dtype). An *advanced* operator
     (``math.sqrt``/``sin``/``cos``/...) has no member here — pass its MLIR op name

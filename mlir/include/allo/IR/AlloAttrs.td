@@ -134,6 +134,69 @@ def DeterminacyEnum : I32EnumAttr<"DeterminacyEnum",
 def DeterminacyAttr : EnumAttr<Allo_Dialect, DeterminacyEnum, "determinacy">;
 
 //===----------------------------------------------------------------------===//
+// OpKind: the ABSTRACT operator vocabulary, independent of MLIR op names. What
+// a device characterizes a row against (`dcp.comb`, and a `dcp.operator` whose
+// `kind` names one of these), and what the scheduler classifies an operation
+// into to find that row.
+//
+// The arithmetic kinds are what a device declares. The four access kinds and
+// `unknown` are the rest of the classification: an array or stream access is
+// timed by its storage rather than an operator row, and `unknown` is an op no
+// abstract row covers (`math.sqrt`, an `affine.apply`). No device row names
+// them, and one naming them is inert rather than wrong.
+//===----------------------------------------------------------------------===//
+
+def OpKindAdd         : I32EnumAttrCase<"Add",         0,  "add">;
+def OpKindSub         : I32EnumAttrCase<"Sub",         1,  "sub">;
+def OpKindMul         : I32EnumAttrCase<"Mul",         2,  "mul">;
+def OpKindDiv         : I32EnumAttrCase<"Div",         3,  "div">;
+def OpKindRem         : I32EnumAttrCase<"Rem",         4,  "rem">;
+// maximumf / maxsi / maxui (NaN-propagating or integer maximum)
+def OpKindMax         : I32EnumAttrCase<"Max",         5,  "max">;
+// minimumf / minsi / minui
+def OpKindMin         : I32EnumAttrCase<"Min",         6,  "min">;
+// maxnumf (maxNum: returns the non-NaN operand)
+def OpKindMaxNum      : I32EnumAttrCase<"MaxNum",      7,  "maxnum">;
+def OpKindMinNum      : I32EnumAttrCase<"MinNum",      8,  "minnum">;
+// ceildivsi / ceildivui
+def OpKindCeilDiv     : I32EnumAttrCase<"CeilDiv",     9,  "ceildiv">;
+// floordivsi
+def OpKindFloorDiv    : I32EnumAttrCase<"FloorDiv",    10, "floordiv">;
+def OpKindNeg         : I32EnumAttrCase<"Neg",         11, "neg">;
+def OpKindCmp         : I32EnumAttrCase<"Cmp",         12, "cmp">;
+def OpKindAnd         : I32EnumAttrCase<"And",         13, "and">;
+def OpKindOr          : I32EnumAttrCase<"Or",          14, "or">;
+def OpKindXor         : I32EnumAttrCase<"Xor",         15, "xor">;
+def OpKindShl         : I32EnumAttrCase<"Shl",         16, "shl">;
+def OpKindShr         : I32EnumAttrCase<"Shr",         17, "shr">;
+def OpKindSelect      : I32EnumAttrCase<"Select",      18, "select">;
+// The three cast kinds are separate because their hardware timing differs.
+// Integer resize (sext / zext / trunc / index_cast)
+def OpKindICastI      : I32EnumAttrCase<"ICastI",      19, "icast">;
+// int <-> float conversion (si/ui-to-fp, fp-to-si/ui)
+def OpKindFCastI      : I32EnumAttrCase<"FCastI",      20, "ifcast">;
+// float resize (extf / truncf)
+def OpKindFCastF      : I32EnumAttrCase<"FCastF",      21, "fcast">;
+def OpKindMemRead     : I32EnumAttrCase<"MemRead",     22, "memread">;
+def OpKindMemWrite    : I32EnumAttrCase<"MemWrite",    23, "memwrite">;
+def OpKindStreamRead  : I32EnumAttrCase<"StreamRead",  24, "streamread">;
+def OpKindStreamWrite : I32EnumAttrCase<"StreamWrite", 25, "streamwrite">;
+def OpKindUnknown     : I32EnumAttrCase<"Unknown",     26, "unknown">;
+
+def OpKindEnum : I32EnumAttr<"OpKindEnum",
+    "The abstract operator kind a device characterizes timing against",
+    [OpKindAdd, OpKindSub, OpKindMul, OpKindDiv, OpKindRem, OpKindMax,
+     OpKindMin, OpKindMaxNum, OpKindMinNum, OpKindCeilDiv, OpKindFloorDiv,
+     OpKindNeg, OpKindCmp, OpKindAnd, OpKindOr, OpKindXor, OpKindShl,
+     OpKindShr, OpKindSelect, OpKindICastI, OpKindFCastI, OpKindFCastF,
+     OpKindMemRead, OpKindMemWrite, OpKindStreamRead, OpKindStreamWrite,
+     OpKindUnknown]> {
+  let cppNamespace = "mlir::allo";
+  let genSpecializedAttr = 0;
+}
+def OpKindAttr : EnumAttr<Allo_Dialect, OpKindEnum, "op_kind">;
+
+//===----------------------------------------------------------------------===//
 // CombOpKind: the combinational op a `dcp.compute` realizes when it takes the
 // comb (not IP) path.
 //===----------------------------------------------------------------------===//

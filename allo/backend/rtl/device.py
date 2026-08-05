@@ -609,6 +609,7 @@ def inject_device(module, device: Device):
     override the built-in library defaults. Target frequency is not injected: it
     is a per-run scheduling parameter, not technology data."""
     from ..._mlir.ir import (
+        Attribute,
         InsertionPoint,
         Location,
         FloatAttr,
@@ -653,7 +654,7 @@ def inject_device(module, device: Device):
                 )
             for kind, delay in device.comb.items():
                 DCPathCombOp(
-                    kind=kind,
+                    kind=Attribute.parse(f"#allo<op_kind {kind}>"),
                     delay=FloatAttr.get(f32ty, delay),
                     uses=_uses_attr(device.comb_uses.get(kind)),
                 )

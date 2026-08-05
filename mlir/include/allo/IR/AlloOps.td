@@ -538,7 +538,7 @@ def DCPathCombOp : DCPath_Op<"dcp.comb",
     `#allo.res_use` per term, and what a resource costs is the sum of the terms
     naming it.
   }];
-  let arguments = (ins StrAttr:$kind, F32Attr:$delay, OptionalAttr<ArrayAttr>:$uses);
+  let arguments = (ins OpKindAttr:$kind, F32Attr:$delay, OptionalAttr<ArrayAttr>:$uses);
   let assemblyFormat = "$kind `delay` `=` $delay (`uses` $uses^)? attr-dict";
   let hasVerifier = 1;
 }

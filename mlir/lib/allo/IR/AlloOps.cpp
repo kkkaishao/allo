@@ -9,7 +9,6 @@
 
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/STLExtras.h"
-#include "llvm/ADT/StringSet.h"
 #include "llvm/Support/Format.h"
 
 #include <cmath>
@@ -389,11 +388,11 @@ LogicalResult DCPathComputeOp::verify() {
 LogicalResult DCPathDeviceOp::verify() {
   // One row per kind: the library keeps the LAST match, so a duplicate is a
   // declaration silently overriding another.
-  llvm::StringSet<> seen;
+  llvm::DenseSet<OpKindEnum> seen;
   for (DCPathCombOp comb : getBody().getOps<DCPathCombOp>())
     if (!seen.insert(comb.getKind()).second)
       return emitOpError("declares combinational kind '")
-             << comb.getKind() << "' twice";
+             << stringifyOpKindEnum(comb.getKind()) << "' twice";
   // The two whole-device settings, for the same reason: a second one would
   // silently win over the first.
   auto tooMany = [](auto range) {
@@ -465,8 +464,6 @@ static LogicalResult verifyUsesResolve(Operation *op, ArrayAttr uses,
   return success();
 }
 
-// The KIND string is checked where the vocabulary lives, in `OperatorLibrary`:
-// `OpKind` is a scheduling-layer enum and this dialect sits below it.
 LogicalResult DCPathCombOp::verify() {
   if (getDelay().convertToDouble() < 0.0)
     return emitOpError("delay must be non-negative");

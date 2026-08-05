@@ -7,7 +7,6 @@
 
 #include "allo/IR/AlloOps.h"
 #include "allo/Scheduling/AddressModel.h" // addressDelayOf (per-site address)
-#include "allo/Support/Logging.h"         // logging::info
 
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
@@ -16,8 +15,6 @@
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "llvm/ADT/STLExtras.h"
-#include "llvm/ADT/StringSet.h"
-#include "llvm/ADT/StringSwitch.h"
 #include "llvm/ADT/TypeSwitch.h"
 #include "llvm/Support/FormatVariadic.h"
 
@@ -25,88 +22,6 @@
 
 using namespace mlir;
 using namespace mlir::allo;
-
-//===----------------------------------------------------------------------===//
-// Abstract-kind <-> string
-//===----------------------------------------------------------------------===//
-
-llvm::StringRef mlir::allo::opKindString(OpKind kind) {
-  switch (kind) {
-  case OpKind::Add:
-    return "add";
-  case OpKind::Sub:
-    return "sub";
-  case OpKind::Mul:
-    return "mul";
-  case OpKind::Div:
-    return "div";
-  case OpKind::Rem:
-    return "rem";
-  case OpKind::Max:
-    return "max";
-  case OpKind::Min:
-    return "min";
-  case OpKind::MaxNum:
-    return "maxnum";
-  case OpKind::MinNum:
-    return "minnum";
-  case OpKind::CeilDiv:
-    return "ceildiv";
-  case OpKind::FloorDiv:
-    return "floordiv";
-  case OpKind::Neg:
-    return "neg";
-  case OpKind::Cmp:
-    return "cmp";
-  case OpKind::And:
-    return "and";
-  case OpKind::Or:
-    return "or";
-  case OpKind::Xor:
-    return "xor";
-  case OpKind::Shl:
-    return "shl";
-  case OpKind::Shr:
-    return "shr";
-  case OpKind::Select:
-    return "select";
-  case OpKind::ICastI:
-    return "icast";
-  case OpKind::FCastI:
-    return "ifcast";
-  case OpKind::FCastF:
-    return "fcast";
-  default:
-    return "";
-  }
-}
-
-std::optional<OpKind> mlir::allo::parseOpKind(llvm::StringRef s) {
-  return llvm::StringSwitch<std::optional<OpKind>>(s)
-      .Case("add", OpKind::Add)
-      .Case("sub", OpKind::Sub)
-      .Case("mul", OpKind::Mul)
-      .Case("div", OpKind::Div)
-      .Case("rem", OpKind::Rem)
-      .Case("max", OpKind::Max)
-      .Case("min", OpKind::Min)
-      .Case("maxnum", OpKind::MaxNum)
-      .Case("minnum", OpKind::MinNum)
-      .Case("ceildiv", OpKind::CeilDiv)
-      .Case("floordiv", OpKind::FloorDiv)
-      .Case("neg", OpKind::Neg)
-      .Case("cmp", OpKind::Cmp)
-      .Case("and", OpKind::And)
-      .Case("or", OpKind::Or)
-      .Case("xor", OpKind::Xor)
-      .Case("shl", OpKind::Shl)
-      .Case("shr", OpKind::Shr)
-      .Case("select", OpKind::Select)
-      .Case("icast", OpKind::ICastI)
-      .Case("ifcast", OpKind::FCastI)
-      .Case("fcast", OpKind::FCastF)
-      .Default(std::nullopt);
-}
 
 //===----------------------------------------------------------------------===//
 // Native realizations: the one table the three views below are generated from.
@@ -374,19 +289,8 @@ OperatorLibrary OperatorLibrary::fromModule(ModuleOp module) {
   if (device) {
     for (dcp::DCPathCombOp comb :
          device.getBody().getOps<dcp::DCPathCombOp>()) {
-      auto kind = parseOpKind(comb.getKind());
-      // `OpKind` is this layer's vocabulary, so the dialect verifier cannot
-      // check it and a row naming something outside it is reported here rather
-      // than dropped into a silent zero delay.
-      if (!kind) {
-        logging::error(logging::Stage::Prep,
-                       logging::Code::DeviceDeclarationInvalid, comb)
-            << "Device declares a combinational delay for '" << comb.getKind()
-            << "', which is not an operator kind";
-        continue;
-      }
       OperatorEntry e;
-      e.kind = *kind;
+      e.kind = comb.getKind();
       e.comb = true;
       e.latency = 0;
       e.inDelay = e.outDelay = comb.getDelay().convertToDouble();
@@ -423,7 +327,7 @@ OperatorLibrary OperatorLibrary::fromModule(ModuleOp module) {
     auto sig = op.getSignature();
     e.argTypes = elementTypes(sig.getInputs());
     e.resTypes = elementTypes(sig.getResults());
-    if (std::optional<OpKind> kind = parseOpKind(op.getKind())) {
+    if (std::optional<OpKind> kind = symbolizeOpKindEnum(op.getKind())) {
       e.kind = *kind;
       lib.entries.push_back(std::move(e));
     } else {
@@ -558,7 +462,7 @@ OperatorChar OperatorLibrary::lookup(Operation *op) const {
   // `comb.<kind>`, else `default`.
   OperatorChar c;
   c.typeName = !e->symbol.empty() ? e->symbol
-               : e->comb          ? ("comb." + opKindString(e->kind)).str()
+               : e->comb          ? ("comb." + stringifyOpKindEnum(e->kind)).str()
                                   : std::string("default");
   c.latency = e->latency;
   c.pipelined = e->pipelined;

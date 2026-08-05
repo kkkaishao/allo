@@ -115,7 +115,7 @@ def test_a_device_declares_each_comb_kind_once():
             out[i] = A[i] + 1
 
     text = _to_rtl(k, device=dev).dcp
-    assert text.count('allo.dcp.comb "add"') == 1
+    assert text.count("allo.dcp.comb add delay") == 1
 
 
 # A multiplexer and a delay chain are structures the emitter builds and nothing

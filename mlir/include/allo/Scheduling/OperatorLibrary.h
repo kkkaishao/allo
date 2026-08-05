@@ -37,47 +37,14 @@ namespace mlir::allo {
 // Abstract operator vocabulary (hardware-facing, independent of MLIR op names).
 //===----------------------------------------------------------------------===//
 
-/// The abstract operator kind timing is characterized against; `classify` maps
-/// concrete IR ops onto these. The three cast kinds are separate because their
-/// hardware timing differs.
-enum class OpKind {
-  Add,
-  Sub,
-  Mul,
-  Div,
-  Rem,
-  Max,      // maximumf / maxsi / maxui (NaN-propagating or integer maximum)
-  Min,      // minimumf / minsi / minui
-  MaxNum,   // maxnumf (maxNum: returns the non-NaN operand)
-  MinNum,   // minnumf
-  CeilDiv,  // ceildivsi / ceildivui
-  FloorDiv, // floordivsi
-  Neg,
-  Cmp,
-  And,
-  Or,
-  Xor,
-  Shl,
-  Shr,
-  Select,
-  ICastI, // integer resize (sext / zext / trunc / index_cast)
-  FCastI, // int <-> float conversion (si/ui-to-fp, fp-to-si/ui)
-  FCastF, // float resize (extf / truncf)
-  MemRead,
-  MemWrite,
-  StreamRead,
-  StreamWrite,
-  Unknown // op the classifier does not recognize (e.g. math.sqrt).
-};
+/// The abstract operator kind timing is characterized against, spelled in the
+/// IR by `dcp.comb` and a built-in `dcp.operator` (see `OpKindEnum` in
+/// `AlloAttrs.td`). `stringifyOpKindEnum` / `symbolizeOpKindEnum` convert, the
+/// latter returning nullopt for an advanced mnemonic such as `sqrt`.
+using OpKind = OpKindEnum;
 
 /// Classify \p op into its abstract kind.
 OpKind classify(Operation *op);
-
-/// The abstract-kind string a device/operator uses (`add`/`sub`/.../`select`),
-/// and its inverse; `parseOpKind` returns nullopt for a non-abstract name (an
-/// advanced mnemonic such as `sqrt`).
-llvm::StringRef opKindString(OpKind kind);
-std::optional<OpKind> parseOpKind(llvm::StringRef s);
 
 /// The abstract kind a combinational realization is priced under, for a caller
 /// holding the realization after the `arith` op is gone. Strictly coarser than
