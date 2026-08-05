@@ -632,7 +632,13 @@ def test_while_condition_reads_a_shape_the_check_cannot_evaluate():
     # cone unscheduled instead pushes the report to the emitter, which sees the
     # `index_cast`/`cmpi` beside the call go untimed and blames those.
     #
-    # The nested loop is what routes this while to the sequential controller.
+    # Both shapes below must reach that one report. The second is the one that
+    # matters: with no nested loop to force the sequential route, the call in
+    # the condition has to be what forces it. A call is timed by its CALLEE's
+    # schedule and the operator library has no row to answer for it, so reading
+    # a latency off the library called it combinational, the while took the
+    # flushing schedule, and the emitter ABORTED on a leaf-loop-over-calls
+    # invariant it was never meant to be handed.
     N = 16
 
     @kernel
@@ -640,15 +646,23 @@ def test_while_condition_reads_a_shape_the_check_cannot_evaluate():
         return A[i] * 2
 
     @kernel
-    def wcc_top(A: i32[N], B: i32[N]):
+    def wcc_nested(A: i32[N], B: i32[N]):
         i: i32 = 0
         while wcc_child(A, i) != 0:
             for j in range(4):
                 B[j] = B[j] + i
             i = i + 1
 
-    with pytest.raises(Exception, match="CHECK region cannot evaluate"):
-        _to_rtl(wcc_top).schedule()
+    @kernel
+    def wcc_flat(A: i32[N], B: i32[N]):
+        i: i32 = 0
+        while wcc_child(A, i) != 0:
+            B[i] = i
+            i = i + 1
+
+    for k in (wcc_nested, wcc_flat):
+        with pytest.raises(Exception, match="CHECK region cannot evaluate"):
+            _to_rtl(k).schedule()
 
 
 # --- checked-iteration skeleton reuse -------------------------------------------
