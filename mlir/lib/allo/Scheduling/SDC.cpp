@@ -15,7 +15,6 @@
 #include "allo/Scheduling/Scheduler.h"
 #include "allo/Support/Logging.h"
 
-#include "mlir/Dialect/Affine/Analysis/LoopAnalysis.h"
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Affine/LoopUtils.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
@@ -23,9 +22,7 @@
 #include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
-#include "mlir/Dialect/Utils/StaticValueUtils.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
-#include "llvm/Support/MathExtras.h"
 
 #include <chrono>
 
@@ -185,147 +182,6 @@ static bool hasCarriedRecurrence(circt::scheduling::CyclicProblem &problem) {
   return false;
 }
 
-// An inclusive integer interval `[lo, hi]`; an open endpoint is unbounded.
-using Interval = std::pair<std::optional<int64_t>, std::optional<int64_t>>;
-
-// Bound an affine trip-count expression given each operand's known range. The
-// divisor/multiplier of a mul/div/mod is always a constant in affine form, so
-// each case is exact interval arithmetic; a missing operand bound propagates as
-// an open endpoint.
-static Interval evalInterval(AffineExpr e, ArrayRef<AssumedRange> operands,
-                             unsigned numDims) {
-  if (auto c = dyn_cast<AffineConstantExpr>(e))
-    return {c.getValue(), c.getValue()};
-  if (auto d = dyn_cast<AffineDimExpr>(e))
-    return {operands[d.getPosition()].lb, operands[d.getPosition()].ub};
-  if (auto s = dyn_cast<AffineSymbolExpr>(e)) {
-    const AssumedRange &r = operands[numDims + s.getPosition()];
-    return {r.lb, r.ub};
-  }
-  auto bin = cast<AffineBinaryOpExpr>(e);
-  Interval l = evalInterval(bin.getLHS(), operands, numDims);
-  auto constRHS = dyn_cast<AffineConstantExpr>(bin.getRHS());
-  auto apply = [](std::optional<int64_t> a, std::optional<int64_t> b,
-                  auto op) -> std::optional<int64_t> {
-    if (a && b)
-      return op(*a, *b);
-    return std::nullopt;
-  };
-  switch (bin.getKind()) {
-  case AffineExprKind::Add: {
-    Interval r = evalInterval(bin.getRHS(), operands, numDims);
-    auto add = [](int64_t a, int64_t b) { return a + b; };
-    return {apply(l.first, r.first, add), apply(l.second, r.second, add)};
-  }
-  case AffineExprKind::Mul: {
-    int64_t c = constRHS.getValue(); // affine: one factor is constant
-    auto mul = [&](std::optional<int64_t> x) {
-      return apply(x, c, std::multiplies<int64_t>());
-    };
-    return c >= 0 ? Interval{mul(l.first), mul(l.second)}
-                  : Interval{mul(l.second), mul(l.first)};
-  }
-  case AffineExprKind::FloorDiv:
-  case AffineExprKind::CeilDiv: {
-    int64_t c = constRHS.getValue(); // affine, positive divisor
-    bool ceil = bin.getKind() == AffineExprKind::CeilDiv;
-    auto div = [&](std::optional<int64_t> x) -> std::optional<int64_t> {
-      if (!x)
-        return std::nullopt;
-      return ceil ? llvm::divideCeilSigned(*x, c)
-                  : llvm::divideFloorSigned(*x, c);
-    };
-    return {div(l.first), div(l.second)};
-  }
-  case AffineExprKind::Mod:
-    return {int64_t{0}, constRHS.getValue() - 1};
-  default:
-    return {std::nullopt, std::nullopt};
-  }
-}
-
-// The trip count of one loop: exact when it is a compile-time constant,
-// otherwise a worst-case upper bound derived from the `allo.assume.ssa` ranges
-// of its symbolic bounds (setting `isBound`), or nullopt if still unbounded.
-static std::optional<int64_t>
-loopTripCount(AffineForOp loop, DependenceAnalysis &deps, bool &isBound) {
-  if (std::optional<uint64_t> c = getConstantTripCount(loop))
-    return static_cast<int64_t>(*c);
-
-  AffineMap map;
-  SmallVector<Value> operands;
-  getTripCountMapAndOperands(loop, &map, &operands);
-  if (!map || map.getNumResults() != 1)
-    return std::nullopt;
-
-  SmallVector<AssumedRange> ranges;
-  for (Value v : operands) {
-    if (std::optional<int64_t> c = getConstantIntValue(v))
-      ranges.push_back({*c, *c});
-    else if (std::optional<AssumedRange> r = deps.getAssumedRange(v))
-      ranges.push_back(*r);
-    else
-      ranges.push_back({});
-  }
-  Interval iv = evalInterval(map.getResult(0), ranges, map.getNumDims());
-  if (!iv.second)
-    return std::nullopt;
-  isBound = true;
-  return std::max<int64_t>(0, *iv.second);
-}
-
-// The trip count of one counted scf.for: exact when lb/ub/step are all
-// compile-time constants, otherwise a worst-case upper bound from the
-// `allo.assume.ssa` ranges of its (dynamic) bound operands (setting `isBound`),
-// or nullopt if still unbounded.
-static std::optional<int64_t>
-scfForTripCount(scf::ForOp loop, DependenceAnalysis &deps, bool &isBound) {
-  auto rangeOf = [&](Value v) -> AssumedRange {
-    if (std::optional<int64_t> c = getConstantIntValue(v))
-      return {*c, *c};
-    if (std::optional<AssumedRange> r = deps.getAssumedRange(v))
-      return *r;
-    return {};
-  };
-  AssumedRange lb = rangeOf(loop.getLowerBound());
-  AssumedRange ub = rangeOf(loop.getUpperBound());
-  AssumedRange step = rangeOf(loop.getStep());
-  auto isConst = [](const AssumedRange &r) {
-    return r.lb && r.ub && *r.lb == *r.ub;
-  };
-  // Exact when every bound is a known constant.
-  if (isConst(lb) && isConst(ub) && isConst(step)) {
-    int64_t s = *step.lb;
-    if (s <= 0)
-      return std::nullopt; // non-positive step unsupported
-    return std::max<int64_t>(0, llvm::divideCeilSigned(*ub.lb - *lb.lb, s));
-  }
-  // Worst case: ceil((max ub - min lb) / min step), needing a positive step.
-  if (ub.ub && lb.lb && step.lb && *step.lb >= 1) {
-    isBound = true;
-    return std::max<int64_t>(0,
-                             llvm::divideCeilSigned(*ub.ub - *lb.lb, *step.lb));
-  }
-  return std::nullopt;
-}
-
-// Trip count of any counted loop (affine.for or scf.for).
-static std::optional<int64_t>
-loopTrip(Operation *loop, DependenceAnalysis &deps, bool &isBound) {
-  if (auto affineLoop = dyn_cast<AffineForOp>(loop))
-    return loopTripCount(affineLoop, deps, isBound);
-  return scfForTripCount(cast<scf::ForOp>(loop), deps, isBound);
-}
-
-// The trip a region's own solution records: that of the innermost loop of the
-// band it anchors, the one its solved `length`/`ii` describe. Every loop above
-// it drives its child as a container, composed in `buildSpanNode`.
-static std::optional<int64_t>
-regionTrip(Operation *anchor, DependenceAnalysis &deps, bool &isBound) {
-  return loopTrip(perfectNest(cast<LoopLikeOpInterface>(anchor)).back(), deps,
-                  isBound);
-}
-
 // The values a straight-line span hands to something outside itself. Must match
 // what the reify treats as escaping, so the two agree on what the region's
 // completion waits to capture.
@@ -466,14 +322,17 @@ scheduleCyclic(LoopLikeOpInterface body, DependenceAnalysis &deps,
     populateOperatorAllocation(problem, lib);
   populateCallOccupancy(problem);
   Operation *anchor = bodyBlock->getTerminator();
-  bool isBound = false;
-  std::optional<int64_t> trip = regionTrip(region.anchor(), deps, isBound);
+  // The trip this solution records is the INNERMOST loop's, the one its solved
+  // `length`/`ii` describe. Every level above drives its child as a container,
+  // composed in `buildSpanNode`.
+  LoopTrip trip = deps.tripOf(body.getOperation());
   // A counted loop hands its carried next-values on: the terminator's operands.
   SmallVector<DrainTerm> outputs = drainTerms(problem, anchor->getOperands());
   SmallVector<RegisterTerm> regs = registerTerms(problem, bodyBlock);
   // The trip is withheld where iterations do not overlap: `ii` is the body
   // depth there, so depth, not drain, is what the trip multiplies.
-  SpanObjective span{outputs, regs, pipelined ? trip : std::nullopt, &lib};
+  SpanObjective span{outputs, regs, pipelined ? trip.count : std::nullopt,
+                     &lib};
   Stopwatch solveStart = now();
   if (failed(solveSchedulingProblem(problem, anchor, cycleTime, minII, opts,
                                     span)))
@@ -486,7 +345,7 @@ scheduleCyclic(LoopLikeOpInterface body, DependenceAnalysis &deps,
   int64_t drain = drainOf(problem, outputs);
   // For the report only, through the arithmetic that composes it for real.
   SpanNode node;
-  node.trip = trip;
+  node.trip = trip.count;
   node.drain = drain;
   node.ii = ii;
   std::optional<int64_t> latency = composeSpan(node);
@@ -504,7 +363,7 @@ scheduleCyclic(LoopLikeOpInterface body, DependenceAnalysis &deps,
       d << " (>1: a shared-resource limit, e.g. memory ports)";
     if (latency)
       d << ", latency = " << *latency
-        << (isBound ? " (assume-bounded worst case)" : "");
+        << (trip.bounded ? " (assume-bounded worst case)" : "");
     else
       d << ", latency dynamic (trip not statically known)";
   }
@@ -526,7 +385,8 @@ scheduleCyclic(LoopLikeOpInterface body, DependenceAnalysis &deps,
           << " cycle(s), limiting iteration overlap";
   }
 
-  annotateRegion(problem, model, body.getOperation(), ii, trip, isBound, drain);
+  annotateRegion(problem, model, body.getOperation(), ii, trip.count,
+                 trip.bounded, drain);
   annotateAllocation(problem, model, lib);
   return success();
 }
@@ -612,16 +472,14 @@ static LogicalResult scheduleAcyclic(ArrayRef<Operation *> ops,
 
 static std::optional<SpanNode> buildSpanNode(const SchedRegion &region,
                                              ScheduleModel &model,
-                                             DependenceAnalysis &deps,
-                                             bool &isBound);
+                                             DependenceAnalysis &deps);
 
 // The body elements of a container, in program order.
 static std::vector<SpanNode> buildSpanNodes(Block &body, ScheduleModel &model,
-                                            DependenceAnalysis &deps,
-                                            bool &isBound) {
+                                            DependenceAnalysis &deps) {
   std::vector<SpanNode> nodes;
   for (const SchedRegion &child : enumerateRegions(body))
-    if (std::optional<SpanNode> n = buildSpanNode(child, model, deps, isBound))
+    if (std::optional<SpanNode> n = buildSpanNode(child, model, deps))
       nodes.push_back(std::move(*n));
   return nodes;
 }
@@ -640,8 +498,7 @@ static std::vector<SpanNode> buildSpanNodes(Block &body, ScheduleModel &model,
 // still forms a node, with the unknown left in its own fields.
 static std::optional<SpanNode> buildSpanNode(const SchedRegion &region,
                                              ScheduleModel &model,
-                                             DependenceAnalysis &deps,
-                                             bool &isBound) {
+                                             DependenceAnalysis &deps) {
   SpanNode n;
   // Driven by an enclosing region rather than by the func's own sequencer, the
   // same question the reify side asks of a dcp op's parents.
@@ -667,7 +524,7 @@ static std::optional<SpanNode> buildSpanNode(const SchedRegion &region,
   if (!isa<AffineForOp, scf::ForOp>(anchor))
     return n; // a while: a data-dependent trip, so no static span
   auto loop = cast<LoopLikeOpInterface>(anchor);
-  n.trip = loopTrip(anchor, deps, isBound);
+  n.trip = deps.tripOf(anchor).count;
   n.shape = countedLoopShape(loop);
   Block &body = loop.getLoopRegions().front()->front();
 
@@ -688,7 +545,7 @@ static std::optional<SpanNode> buildSpanNode(const SchedRegion &region,
   // A container owns no solution: it sequences the regions its body decomposed
   // into, and its span is composed from theirs.
   if (n.shape == RegionShape::Container) {
-    n.children = buildSpanNodes(body, model, deps, isBound);
+    n.children = buildSpanNodes(body, model, deps);
     return n;
   }
   // A leaf nests no loop, so it is the op the solve was keyed by.
@@ -709,10 +566,9 @@ static void recordTripBounds(func::FuncOp funcOp, ScheduleModel &model,
   funcOp.walk([&](Operation *op) {
     if (!isa<AffineForOp, scf::ForOp>(op))
       return;
-    bool isBound = false;
-    std::optional<int64_t> trip = loopTrip(op, deps, isBound);
-    if (isBound && trip)
-      model.setTripBound(op, *trip);
+    LoopTrip trip = deps.tripOf(op);
+    if (trip.bounded && trip.count)
+      model.setTripBound(op, *trip.count);
   });
 }
 
@@ -742,12 +598,10 @@ static void publishKernelLatency(func::FuncOp funcOp, ScheduleModel &model,
   if (!callsKnown)
     return;
 
-  bool isBound = false;
   std::vector<SpanNode> top;
   SmallVector<SmallVector<Operation *>> topOps;
   for (const SchedRegion &region : enumerateRegions(funcOp))
-    if (std::optional<SpanNode> n =
-            buildSpanNode(region, model, deps, isBound)) {
+    if (std::optional<SpanNode> n = buildSpanNode(region, model, deps)) {
       top.push_back(std::move(*n));
       topOps.emplace_back(region.ops.begin(), region.ops.end());
     }

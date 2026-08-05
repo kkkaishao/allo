@@ -12,6 +12,7 @@
 #include "allo/Support/Logging.h"
 
 #include "mlir/Dialect/Affine/Analysis/AffineAnalysis.h"
+#include "mlir/Dialect/Affine/Analysis/LoopAnalysis.h"
 #include "mlir/Dialect/Affine/Analysis/Utils.h"
 #include "mlir/Dialect/Affine/IR/AffineMemoryOpInterfaces.h"
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
@@ -552,6 +553,139 @@ applyNoDepHints(ArrayRef<AssumeNoDepOp> hints,
 //===----------------------------------------------------------------------===//
 
 namespace mlir::allo {
+
+//===----------------------------------------------------------------------===//
+// Trip counts
+//
+// What a counted loop runs, exactly where the IR says so and as a worst case
+// where only an `allo.assume.ssa` range does.
+//===----------------------------------------------------------------------===//
+
+namespace {
+// An inclusive integer interval `[lo, hi]`; an open endpoint is unbounded.
+using Interval = std::pair<std::optional<int64_t>, std::optional<int64_t>>;
+
+// Bound an affine trip-count expression given each operand's known range. The
+// divisor/multiplier of a mul/div/mod is always a constant in affine form, so
+// each case is exact interval arithmetic; a missing operand bound propagates as
+// an open endpoint.
+Interval evalInterval(AffineExpr e, ArrayRef<AssumedRange> operands,
+                      unsigned numDims) {
+  if (auto c = dyn_cast<AffineConstantExpr>(e))
+    return {c.getValue(), c.getValue()};
+  if (auto d = dyn_cast<AffineDimExpr>(e))
+    return {operands[d.getPosition()].lb, operands[d.getPosition()].ub};
+  if (auto s = dyn_cast<AffineSymbolExpr>(e)) {
+    const AssumedRange &r = operands[numDims + s.getPosition()];
+    return {r.lb, r.ub};
+  }
+  auto bin = cast<AffineBinaryOpExpr>(e);
+  Interval l = evalInterval(bin.getLHS(), operands, numDims);
+  auto constRHS = dyn_cast<AffineConstantExpr>(bin.getRHS());
+  auto apply = [](std::optional<int64_t> a, std::optional<int64_t> b,
+                  auto op) -> std::optional<int64_t> {
+    if (a && b)
+      return op(*a, *b);
+    return std::nullopt;
+  };
+  switch (bin.getKind()) {
+  case AffineExprKind::Add: {
+    Interval r = evalInterval(bin.getRHS(), operands, numDims);
+    auto add = [](int64_t a, int64_t b) { return a + b; };
+    return {apply(l.first, r.first, add), apply(l.second, r.second, add)};
+  }
+  case AffineExprKind::Mul: {
+    int64_t c = constRHS.getValue(); // affine: one factor is constant
+    auto mul = [&](std::optional<int64_t> x) {
+      return apply(x, c, std::multiplies<int64_t>());
+    };
+    return c >= 0 ? Interval{mul(l.first), mul(l.second)}
+                  : Interval{mul(l.second), mul(l.first)};
+  }
+  case AffineExprKind::FloorDiv:
+  case AffineExprKind::CeilDiv: {
+    int64_t c = constRHS.getValue(); // affine, positive divisor
+    bool ceil = bin.getKind() == AffineExprKind::CeilDiv;
+    auto div = [&](std::optional<int64_t> x) -> std::optional<int64_t> {
+      if (!x)
+        return std::nullopt;
+      return ceil ? llvm::divideCeilSigned(*x, c)
+                  : llvm::divideFloorSigned(*x, c);
+    };
+    return {div(l.first), div(l.second)};
+  }
+  case AffineExprKind::Mod:
+    return {int64_t{0}, constRHS.getValue() - 1};
+  default:
+    return {std::nullopt, std::nullopt};
+  }
+}
+} // namespace
+
+// An `affine.for`: exact from the constant trip count, else bounded by the
+// interval its trip-count map evaluates to over the assumed ranges.
+static LoopTrip affineTrip(AffineForOp loop, const DependenceAnalysis &deps) {
+  if (std::optional<uint64_t> c = getConstantTripCount(loop))
+    return {static_cast<int64_t>(*c), false};
+
+  AffineMap map;
+  SmallVector<Value> operands;
+  getTripCountMapAndOperands(loop, &map, &operands);
+  if (!map || map.getNumResults() != 1)
+    return {};
+
+  SmallVector<AssumedRange> ranges;
+  for (Value v : operands) {
+    if (std::optional<int64_t> c = getConstantIntValue(v))
+      ranges.push_back({*c, *c});
+    else if (std::optional<AssumedRange> r = deps.getAssumedRange(v))
+      ranges.push_back(*r);
+    else
+      ranges.push_back({});
+  }
+  Interval iv = evalInterval(map.getResult(0), ranges, map.getNumDims());
+  if (!iv.second)
+    return {};
+  return {std::max<int64_t>(0, *iv.second), true};
+}
+
+// An `scf.for`: exact when lb/ub/step are all compile-time constants, else the
+// worst case `ceil((max ub - min lb) / min step)`, which needs a positive step.
+static LoopTrip scfTrip(scf::ForOp loop, const DependenceAnalysis &deps) {
+  auto rangeOf = [&](Value v) -> AssumedRange {
+    if (std::optional<int64_t> c = getConstantIntValue(v))
+      return {*c, *c};
+    if (std::optional<AssumedRange> r = deps.getAssumedRange(v))
+      return *r;
+    return {};
+  };
+  AssumedRange lb = rangeOf(loop.getLowerBound());
+  AssumedRange ub = rangeOf(loop.getUpperBound());
+  AssumedRange step = rangeOf(loop.getStep());
+  auto isConst = [](const AssumedRange &r) {
+    return r.lb && r.ub && *r.lb == *r.ub;
+  };
+  if (isConst(lb) && isConst(ub) && isConst(step)) {
+    int64_t s = *step.lb;
+    if (s <= 0)
+      return {}; // non-positive step unsupported
+    return {std::max<int64_t>(0, llvm::divideCeilSigned(*ub.lb - *lb.lb, s)),
+            false};
+  }
+  if (ub.ub && lb.lb && step.lb && *step.lb >= 1) {
+    return {
+        std::max<int64_t>(0, llvm::divideCeilSigned(*ub.ub - *lb.lb, *step.lb)),
+        true};
+  }
+  return {};
+}
+
+LoopTrip DependenceAnalysis::tripOf(Operation *loop) const {
+  if (auto affineLoop = dyn_cast<AffineForOp>(loop))
+    return affineTrip(affineLoop, *this);
+  return scfTrip(cast<scf::ForOp>(loop), *this);
+}
+
 
 int64_t carriedDistanceAtLevel(ArrayRef<affine::DependenceComponent> comps,
                                unsigned level, bool &drop, bool &valid) {

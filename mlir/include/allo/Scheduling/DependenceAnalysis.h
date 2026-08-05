@@ -24,6 +24,18 @@ struct AssumedRange {
   std::optional<int64_t> ub;
 };
 
+/// What one counted loop runs, as everything downstream of the analysis needs
+/// it. A returned pair rather than a count plus a `bool &`, since a caller
+/// composing a tree of these has to combine both halves.
+struct LoopTrip {
+  /// Iterations, or empty when nothing bounds them.
+  std::optional<int64_t> count;
+  /// `count` is a WORST CASE derived from an `allo.assume.ssa` range rather
+  /// than a compile-time constant, so every span composed from it is a bound
+  /// and not an exact number of cycles.
+  bool bounded = false;
+};
+
 /// The dependence distance carried by the counted loop at 1-based nesting depth
 /// \p level among a dependence's shared enclosing loops, projected from its
 /// components (outermost -> innermost). Sets \p drop when an OUTER loop carries
@@ -63,6 +75,15 @@ public:
   bool isNonPolyhedral(Operation *op) const {
     return nonPolyhedral.contains(op);
   }
+
+  /// What \p loop (an `affine.for` or `scf.for`) runs: its exact count where
+  /// that is compile-time, else the worst case the `allo.assume.ssa` ranges of
+  /// its symbolic bounds admit, else empty.
+  ///
+  /// It lives here because the assumption ranges do: a symbolic trip is bounded
+  /// by the same facts this analysis distilled, and the scheduler, its span
+  /// composer and the trip-bound record all ask for one loop's trip.
+  LoopTrip tripOf(Operation *loop) const;
 
 private:
   func::FuncOp func;
