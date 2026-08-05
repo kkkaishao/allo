@@ -318,11 +318,28 @@ void minimizeCost(CpModelBuilder &model, IntVar primary,
     weights.push_back(1);
     area += alloc.maxPrice;
   }
-  vars.push_back(primary);
   // A device that declares no area model prices every term at nothing, which
   // is the honest reading of saying nothing; the floor keeps `primary` from
   // being weighted at nothing along with it.
-  weights.push_back(std::max<int64_t>(area, 1) * (horizon + 1));
+  int64_t dominating = std::max<int64_t>(area, 1) * (horizon + 1);
+#ifndef NDEBUG
+  // `area` is charged term by term above, so it only bounds the tie-break for
+  // as long as every term charges it. Read the reach back off the terms
+  // themselves: the largest the weighted sum can be is each variable at
+  // whichever end of its domain its weight favours. A term added without a
+  // matching charge trips here rather than quietly letting the tie-break
+  // outweigh `primary` and buy a cycle with area.
+  int64_t reach = 0;
+  for (auto [var, weight] : llvm::zip(vars, weights)) {
+    operations_research::Domain d = var.Domain();
+    reach += std::max(weight * d.Min(), weight * d.Max());
+  }
+  assert(dominating > reach &&
+         "the area tie-break reaches past the weight that is supposed to "
+         "dominate it, so `area` above has stopped covering its own terms");
+#endif
+  vars.push_back(primary);
+  weights.push_back(dominating);
   model.Minimize(LinearExpr::WeightedSum(vars, weights));
 }
 
