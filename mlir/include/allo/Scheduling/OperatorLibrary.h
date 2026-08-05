@@ -119,8 +119,9 @@ struct OperatorEntry {
 struct OperatorChar {
   std::string typeName; // stable: one Problem::OperatorType per matched entry
   uint32_t latency = 0;
-  /// Whether one instance accepts a new input every cycle. Read only by
-  /// `populateOperatorAllocation`.
+  /// Whether one instance accepts a new input every cycle. False bounds a
+  /// cyclic region's interval (`populateOperatorOccupancy`) and keeps the
+  /// operator out of a cyclic allocation (`populateOperatorAllocation`).
   bool pipelined = true;
   double inDelay = 0.0;
   double outDelay = 0.0;
@@ -299,6 +300,53 @@ inline void populateCallOccupancy(ChainingModuloProblem &problem) {
     problem.setLimit(rsrc, 1);
     problem.setLinkedResourceTypes(op, SmallVector<P::ResourceType>{rsrc});
     problem.setResourceCycles(op, cl->first + 1);
+    ++idx;
+  }
+}
+
+/// Reserve a PRIVATE limit-1 resource, held for the operator's whole latency,
+/// for every operation on a NON-PIPELINED operator. Such a unit takes one input
+/// per latency window, so a modulo schedule that re-issues the same operation
+/// every II cycles needs `II >= latency`. Without this the model lets a
+/// non-pipelined IP run at II=1 and the emitter builds a datapath that feeds it
+/// faster than it can accept.
+///
+/// The window is the latency itself, the span `reservationOf` marks the unit
+/// busy for, so what bounds the interval here and what the binder checks a unit
+/// against are ONE number.
+///
+/// Private per operation, because this prices an operation against ITSELF one
+/// iteration on, which holds however many units the region builds. What a unit
+/// SHARED between two operations costs is `populateOperatorAllocation`'s, and it
+/// declines a non-pipelined operator in a cyclic region for want of a
+/// circular-arc colouring, leaving every such operation the unit this bounds.
+///
+/// Only an IP row can be non-pipelined: a comb row and the default row are
+/// zero-latency and pipelined, and a memory access is timed by its storage.
+///
+/// A straight-line region needs none: it issues each operation once, so there
+/// is no second issue for a window to hold off.
+inline void populateOperatorOccupancy(ChainingModuloProblem &problem,
+                                      const OperatorLibrary &lib) {
+  using P = circt::scheduling::Problem;
+  unsigned idx = 0;
+  for (Operation *op : problem.getOperations()) {
+    OperatorChar c = lib.lookup(op);
+    // A one-cycle window is what a pipelined unit already holds, and bounds no
+    // interval.
+    if (c.pipelined || c.latency < 2)
+      continue;
+    assert(c.identity.realized() &&
+           "only an IP row is non-pipelined, and an IP row names a realization");
+    P::ResourceType rsrc = problem.getOrInsertResourceType(
+        c.identity.key() + "#" + std::to_string(idx));
+    problem.setLimit(rsrc, 1);
+    SmallVector<P::ResourceType> units;
+    if (auto linked = problem.getLinkedResourceTypes(op))
+      units.assign(linked->begin(), linked->end());
+    units.push_back(rsrc);
+    problem.setLinkedResourceTypes(op, units);
+    problem.setResourceCycles(op, c.latency);
     ++idx;
   }
 }

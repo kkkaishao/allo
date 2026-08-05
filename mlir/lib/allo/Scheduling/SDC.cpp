@@ -424,10 +424,13 @@ LogicalResult FuncScheduler::scheduleCyclic(LoopLikeOpInterface body,
   Block *bodyBlock = &body.getLoopRegions().front()->front();
   populateOperatorTypes(problem, lib);
   reportOperatorClassSplit(problem, lib);
+  // What contends, then how many of it to build: an occupancy window is a
+  // physical property of the region and holds however the units are allocated.
   populateMemoryResources(problem);
+  populateOperatorOccupancy(problem, lib);
+  populateCallOccupancy(problem);
   if (opts.allocate)
     populateOperatorAllocation(problem, lib);
-  populateCallOccupancy(problem);
   Operation *anchor = bodyBlock->getTerminator();
   // The trip this solution records is the INNERMOST loop's, the one its solved
   // `length`/`ii` describe. Every level above drives its child as a container,
@@ -487,9 +490,9 @@ LogicalResult FuncScheduler::scheduleCyclic(LoopLikeOpInterface body,
       }
     if (blocking)
       info(Stage::Sched, blocking)
-          << "Operator " << blocking->getName().getStringRef()
+          << blocking->getName().getStringRef()
           << " is non-pipelined and holds its unit for " << maxOcc
-          << " cycle(s), limiting iteration overlap";
+          << " cycle(s), so no iteration may issue sooner";
   }
 
   annotateRegion(problem, body.getOperation(), ii, trip.count,
@@ -507,6 +510,10 @@ LogicalResult FuncScheduler::scheduleWhile(scf::WhileOp w,
   populateOperatorTypes(problem, lib);
   reportOperatorClassSplit(problem, lib);
   populateMemoryResources(problem);
+  // A flushing while issues an iteration per II like any pipeline, so a
+  // non-pipelined operator bounds its interval the same way. It needs no call
+  // occupancy: `whileFlushingPipelines` rejects a body holding a sync call.
+  populateOperatorOccupancy(problem, lib);
   Operation *anchor = w.getYieldOp().getOperation();
   // Honor a requested target II (>=1) as a lower bound. `ii=-1` (pipelining
   // off) is not modeled for while loops.

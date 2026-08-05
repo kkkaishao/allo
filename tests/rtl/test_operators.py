@@ -28,7 +28,7 @@ from allo.backend.rtl.device import (
 )
 
 sys.path.insert(0, os.path.dirname(__file__))
-from _common import Dcp, _sched, _to_rtl, _impls, FADD  # noqa: E402
+from _common import Dcp, _sched, _to_rtl, _impls, _iis, FADD  # noqa: E402
 
 pytestmark = pytest.mark.skipif(
     shutil.which("verilator") is None, reason="verilator not available"
@@ -268,6 +268,49 @@ def test_advanced_math_sqrt_cosim():
     A = rng.random(N, dtype=np.float32).astype(np.float32)  # non-negative
     B = np.zeros(N, np.float32)
     _to_rtl(sqrtk, device=dev).cosim(A, B)
+    np.testing.assert_allclose(B, np.sqrt(A), rtol=1e-5, atol=1e-6)
+
+
+def test_non_pipelined_ip_bounds_the_initiation_interval():
+    # A NON-PIPELINED unit takes one input per latency window, so a loop that
+    # re-issues it every II cycles needs II >= latency. Nothing else here bounds
+    # the interval (two arrays, two ports each, no carried recurrence), so the
+    # pipelined twin of the same IP runs at II=1 and the `pipelined` flag alone
+    # is the difference.
+    #
+    # The lock is WRITTEN rather than measured: the behavioral model an `@ip`
+    # emits accepts an input every cycle whatever the flag says, so the cosim
+    # below passes either way. Only the II catches a datapath that would feed a
+    # real unit faster than it can accept.
+    N, LAT = 16, 3
+
+    def _dev(pipelined):
+        @ip(
+            optype="sqrt",
+            latency=LAT,
+            in_delay_ns=0.5,
+            pipelined=pipelined,
+            # A non-pipelined IP declares no stall style; it takes the ce default.
+            style="ce" if pipelined else None,
+        )
+        def fsqrt(a: f32) -> f32: ...
+
+        dev = builtin_device.copy()
+        dev.add_operator(fsqrt)
+        return dev
+
+    @kernel
+    def sqrtk4(A: f32[N], B: f32[N]):
+        for i in range(N):
+            B[i] = amath.sqrt(A[i])
+
+    assert _iis(_sched(sqrtk4, device=_dev(True)).func("sqrtk4").regions) == [1]
+    assert _iis(_sched(sqrtk4, device=_dev(False)).func("sqrtk4").regions) == [LAT]
+
+    rng = np.random.default_rng(11)
+    A = rng.random(N, dtype=np.float32).astype(np.float32)  # non-negative
+    B = np.zeros(N, np.float32)
+    _to_rtl(sqrtk4, device=_dev(False)).cosim(A, B)
     np.testing.assert_allclose(B, np.sqrt(A), rtol=1e-5, atol=1e-6)
 
 
