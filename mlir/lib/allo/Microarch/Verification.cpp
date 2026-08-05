@@ -67,10 +67,10 @@ LogicalResult verifyDatapath(dcp::DCPathModuleOp func, const Datapath &dp) {
 
 namespace {
 
-/// The combinational delay the SCHEDULE never accounted for, propagated along
-/// the chains it can lengthen. Two contributors, tracked apart because their
-/// remedies differ: the multiplexers a shared binding grows, and the cells the
-/// reifier synthesizes after the solve.
+/// The multiplexer delay a shared BINDING adds, propagated along the chains it
+/// can lengthen. It is the one delay the schedule cannot have accounted for:
+/// every other cell reaching the datapath carries the sub-cycle start (`z`) a
+/// solve proved for it, muxes being the only thing built after the cut.
 ///
 /// The scheduler proved `z(op) + inDelay(op) <= period` over a datapath whose
 /// unit inputs are all driven directly, and each addition shifts its consumer's
@@ -78,166 +78,89 @@ namespace {
 /// path, so propagating it alone against each op's remaining sub-cycle slack is
 /// exact.
 struct AddedDelay {
-  /// One arrival, split by what added it. `ns` is what a consumer waits for,
-  /// whatever the composition.
-  struct Delay {
-    double mux = 0.0;  // levels of a shared unit's input multiplexer
-    double cone = 0.0; // cells the scheduling stage never priced
-    double ns() const { return mux + cone; }
-  };
-
-  AddedDelay(const Datapath &dp, const OperatorLibrary &lib, double level)
-      : dp(dp), lib(lib), level(level) {}
+  AddedDelay(const Datapath &dp, double level) : dp(dp), level(level) {}
 
   const Datapath &dp;
-  const OperatorLibrary &lib;
   double level; // one LUT level of the one-hot select's AND-OR reduction
-  llvm::DenseMap<UnitId, Delay> memo;
+  llvm::DenseMap<UnitId, double> memo;
 
   /// What arrives at \p id's input ports, its own delay excluded.
-  Delay ofUnit(UnitId id) {
+  double ofUnit(UnitId id) {
     auto seen = memo.find(id);
     if (seen != memo.end())
       return seen->second;
     // Seeded before the walk, so a fused recurrence's self-referential input
     // terminates instead of recursing forever.
-    memo[id] = Delay{};
-    Delay added;
+    memo[id] = 0.0;
+    double added = 0.0;
     for (const Source &in : dp.units[id].inputs)
-      added = later(added, ofSource(in));
+      added = std::max(added, ofSource(in));
     memo[id] = added;
     return added;
   }
 
-  Delay ofSource(const Source &s) {
+  double ofSource(const Source &s) {
     if (s.kind == Source::Kind::Mux) {
       const Mux &m = dp.muxes[s.id];
-      Delay in;
+      double in = 0.0;
       for (const Source &src : m.sources)
-        in = later(in, ofSource(src));
-      in.mux += muxLevels(m.sources.size()) * level;
-      return in;
+        in = std::max(in, ofSource(src));
+      return in + muxLevels(m.sources.size()) * level;
     }
     // Anything else is held when the cycle starts: a register tap, a port, a
     // literal, a survivor, or a unit whose own output is registered.
     if (s.kind != Source::Kind::Unit || dp.units[s.id].latency)
-      return {};
-    const FuncUnit &u = dp.units[s.id];
-    Delay in = ofUnit(u.id);
-    if (!scheduled(u)) {
-      assert(u.identity.comb &&
-             "only a combinational cell reaches the datapath unscheduled");
-      in.cone += combDelay(u.identity.realization);
-    }
-    return in;
-  }
-
-  /// Whether the scheduling stage placed \p u: it stamps the sub-cycle start it
-  /// proved (`z`) onto every op it schedules. The one thing left that carries
-  /// none is a sequential while's condition, which the reify ASAP-walks after
-  /// the solve, so no chain-break pass cut it and nothing charged its delay to
-  /// the clock. A bound and a predicate the SCHEDULER expands now.
-  static bool scheduled(const FuncUnit &u) {
-    return llvm::all_of(u.boundOps, [](const auto &bound) {
-      return bound.first->hasAttr("z");
-    });
-  }
-
-  /// The device row a combinational realization is priced against.
-  double combDelay(StringRef realization) const {
-    std::optional<CombOpKindEnum> kind = symbolizeCombOpKindEnum(realization);
-    assert(kind && "a combinational cell realizes a CombOpKind");
-    return lib.combDelay(*kind);
-  }
-
-  static Delay later(const Delay &a, const Delay &b) {
-    return a.ns() >= b.ns() ? a : b;
+      return 0.0;
+    return ofUnit(s.id);
   }
 };
 
-/// Every unit's inputs still settle within the period, muxes and reified cones
-/// included. Two faults with two remedies, so two levels: a binding that misses
-/// timing is REJECTED, since binding is a choice the user can withdraw, while
-/// logic the reifier synthesized after the solve is WARNED about, since no
-/// option avoids it and only a slower clock or a simpler expression does.
+/// Every unit's inputs still settle within the period, the multiplexers a
+/// shared binding grew included. ONE fault with one remedy, so a REJECT:
+/// binding is a choice the user can withdraw.
 LogicalResult checkCombPathsMeetPeriod(const Datapath &dp, float cycleTime,
                                        const OperatorLibrary &lib) {
   // One picosecond of slop, the resolution the scheduler's own model carries.
   constexpr double kSlop = 1e-3;
-  AddedDelay added(dp, lib, muxLevelDelay(lib));
-  llvm::DenseMap<UnitId, RegionId> unitRegion;
-  for (const RegionBlock &rb : dp.regions)
-    for (UnitId uid : rb.units)
-      unitRegion[uid] = rb.id;
+  AddedDelay added(dp, muxLevelDelay(lib));
 
-  // The worst overrun of one reified expression, per region. Its cells are one
-  // chain, so reporting each of them reports one fault as many times as it is
-  // deep.
-  struct Overrun {
-    double path = 0.0, over = 0.0;
-    Operation *op = nullptr;
-  };
-  llvm::SmallVector<Overrun> cones(dp.regions.size());
-  auto record = [&](unsigned slot, double path, double over, Operation *op) {
-    if (over > cones[slot].over)
-      cones[slot] = {path, over, op};
-  };
+  // What makes the multiplexer the only unaccounted delay: every cell reaching
+  // the datapath was placed by a solve, which stamps the sub-cycle start it
+  // proved. Nothing synthesizes a cell after the cut any more, so a cell
+  // without one is an internal invariant broken, not a fault to report.
+  for (const FuncUnit &u : dp.units)
+    for (const auto &[op, residue] : u.boundOps)
+      assert(op->hasAttr("z") &&
+             "a cell reached the datapath the scheduling stage never placed");
 
   bool ok = true;
   for (const FuncUnit &u : dp.units) {
-    AddedDelay::Delay d = added.ofUnit(u.id);
-    if (d.ns() == 0.0)
-      continue;
+    double mux = added.ofUnit(u.id);
     double slack = unitSlack(u, cycleTime, lib);
-    if (d.ns() <= slack + kSlop)
+    if (mux <= slack + kSlop)
       continue;
-    // The multiplexer alone overruns, so the binding is the fault whatever else
-    // rides the same path.
-    if (d.mux > slack + kSlop) {
-      // Anchor on the tightest bound op, the one the slack came from.
-      Operation *worst = u.repOp();
-      for (const auto &[op, residue] : u.boundOps) {
-        auto z = op->getAttrOfType<FloatAttr>("z");
-        auto wz = worst->getAttrOfType<FloatAttr>("z");
-        if (z && (!wz || z.getValueAsDouble() > wz.getValueAsDouble()))
-          worst = op;
-      }
-      // `d.mux` covers the whole input cone, so it may come from a shared
-      // predecessor rather than from a multiplexer on this unit.
-      unsupported(Stage::Emit, worst)
-          << "Binding put " << llvm::format("%.2f", d.mux)
-          << " ns of multiplexer on the path reaching this operation (its unit "
-             "is shared between "
-          << u.boundOps.size() << " operations), which is "
-          << llvm::format("%.2f", d.mux - slack)
-          << " ns more than the schedule left it against a "
-          << llvm::format("%.2f", cycleTime)
-          << " ns clock. The schedule was cut before the multiplexer existed, "
-             "so this would miss timing in silicon. Use binding='trivial' for "
-             "this kernel, or raise the target period";
-      ok = false;
-      continue;
+    // Anchor on the tightest bound op, the one the slack came from.
+    Operation *worst = u.repOp();
+    for (const auto &[op, residue] : u.boundOps) {
+      auto z = op->getAttrOfType<FloatAttr>("z");
+      auto wz = worst->getAttrOfType<FloatAttr>("z");
+      if (z && (!wz || z.getValueAsDouble() > wz.getValueAsDouble()))
+        worst = op;
     }
-    // `cycleTime - slack` is the unit's own `z + inDelay`, so this is the whole
-    // combinational path ending at it.
-    record(unitRegion.lookup(u.id), cycleTime - slack + d.ns(), d.ns() - slack,
-           u.repOp());
-  }
-  for (const Overrun &worst : cones) {
-    if (!worst.op)
-      continue;
-    warn(Stage::Emit, worst.op)
-        << "A while condition the compiler expanded AFTER the schedule was "
-           "cut is "
-        << llvm::format("%.2f", worst.path)
-        << " ns of combinational logic against a "
-        << llvm::format("%.2f", cycleTime) << " ns clock, "
-        << llvm::format("%.2f", worst.over)
-        << " ns over. The scheduling stage never saw it, so no chain break was "
-           "placed in it and no simulation can show the violation: the emitted "
-           "RTL misses timing in silicon. Lower the target frequency, or "
-           "simplify the expression (a floordiv or mod in an affine map "
-           "expands to a divider)";
+    // `mux` covers the whole input cone, so it may come from a shared
+    // predecessor rather than from a multiplexer on this unit.
+    unsupported(Stage::Emit, worst)
+        << "Binding put " << llvm::format("%.2f", mux)
+        << " ns of multiplexer on the path reaching this operation (its unit "
+           "is shared between "
+        << u.boundOps.size() << " operations), which is "
+        << llvm::format("%.2f", mux - slack)
+        << " ns more than the schedule left it against a "
+        << llvm::format("%.2f", cycleTime)
+        << " ns clock. The schedule was cut before the multiplexer existed, so "
+           "this would miss timing in silicon. Use binding='trivial' for this "
+           "kernel, or raise the target period";
+    ok = false;
   }
   return success(ok);
 }

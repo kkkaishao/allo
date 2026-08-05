@@ -54,47 +54,6 @@ static DeterminacyEnumAttr determinacyAttr(Builder &b, DeterminacyEnum d) {
   return DeterminacyEnumAttr::get(b.getContext(), d);
 }
 
-// Whether \p v is a pure combinational arith tree over block args and
-// constants, the shape that can be lifted into start-0 `dcp.compute`s. An
-// impure condition stays raw, and `validateDatapath` rejects it rather than
-// deriving a negative-depth edge.
-static bool isPureCombCondition(ScheduleModel &model, Value v) {
-  if (isa<BlockArgument>(v))
-    return true;
-  Operation *def = v.getDefiningOp();
-  if (!def)
-    return false;
-  if (isa<arith::ConstantOp>(def))
-    return true;
-  // A dcp region result is settled at the guard's start, so it is a leaf.
-  if (isa<DCPathRegionOpInterface>(def))
-    return true;
-  if (!isa<arith::ArithDialect>(def->getDialect()) || model.scheduleOf(def))
-    return false;
-  return llvm::all_of(def->getOperands(),
-                      [&](Value o) { return isPureCombCondition(model, o); });
-}
-
-// Schedule \p v's defining arith op (and its operands) at start 0.
-// Precondition: isPureCombCondition(v).
-static void tagConditionStartZero(ScheduleModel &model, Value v) {
-  Operation *def = v.getDefiningOp();
-  if (!def || isa<arith::ConstantOp>(def) ||
-      isa<DCPathRegionOpInterface>(def) || model.scheduleOf(def))
-    return; // a settled region result is a leaf, never tagged
-  model.setStart(def, 0);
-  for (Value o : def->getOperands())
-    tagConditionStartZero(model, o);
-}
-
-// Lift the predicate or continue-condition \p cond into start-0 `dcp.compute`s
-// so it becomes a combinational Source, if it is pure. Anything else is left
-// as-is.
-static void scheduleConditionTree(ScheduleModel &model, Value cond) {
-  if (isPureCombCondition(model, cond))
-    tagConditionStartZero(model, cond);
-}
-
 //===----------------------------------------------------------------------===//
 // Per-op conversion. The `dcp.operator` symbols are already injected from the
 // device model, so the reifier only references them and never materializes one.
@@ -781,9 +740,6 @@ struct Reifier {
                "a guard carries the scheduler's expansion of its set");
         cond = cone->predicate;
       }
-      // Lift a raw predicate tree to start-0 computes so the guard's condition
-      // is a Source::Unit; an already-scheduled one is left untouched.
-      scheduleConditionTree(model, cond);
       closeIntoDcpSelect(b, anchor, cond);
     }
   }
