@@ -126,6 +126,7 @@ class MemoryCost:
         )
 
 
+# pylint: disable=too-many-instance-attributes
 @dataclass(frozen=True)
 class Memory:
     """One array, and the storage decision taken for it."""

@@ -59,6 +59,7 @@ class RegionScheduleCost:
         return cls(drain=d.get("drain"))
 
 
+# pylint: disable=too-many-instance-attributes
 @dataclass(frozen=True)
 class RegionSchedule:
     """One scheduling region (a dcp.pipeline / dcp.sequential / dcp.select)."""

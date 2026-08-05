@@ -6,7 +6,7 @@ and what each structure it builds spends of it."""
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import NamedTuple, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from .device import Device
@@ -30,28 +30,40 @@ CAPACITY = {
     "uram288": 960,
 }
 
+
+class IPArea(NamedTuple):
+    """What one measured IP core spends, in the four resources it draws on. A
+    row rather than a bare tuple so the order is checked where it is written,
+    not only where it is read (`zip` against the resources below)."""
+
+    lut: int
+    ff: int
+    dsp: int
+    carry8: int
+
+
 #: The device operator IPs, each the Xilinx Floating-Point core at the latency
-#: `device.py` declares, as (LUT, FF, DSP, CARRY8). An IP's signature fixes its
-#: widths, so every one of these is a constant.
+#: `device.py` declares. An IP's signature fixes its widths, so every one of
+#: these is a constant.
 IP_AREA = {
-    "fadd_l7": (247, 315, 2, 10),
-    "fsub_l7": (247, 315, 2, 10),
-    "fmul_l4": (115, 173, 2, 9),
-    "fdiv_l12": (766, 1381, 0, 111),
-    "fcmp_l1": (64, 12, 0, 7),
-    "dadd_l14": (710, 872, 3, 30),
-    "dsub_l14": (710, 872, 3, 30),
-    "dmul_l9": (205, 542, 7, 16),
-    "ddiv_l24": (3185, 6035, 0, 399),
-    "dcmp_l1": (118, 12, 0, 12),
-    "i2f_l3": (165, 228, 0, 11),
-    "f2i_l3": (183, 232, 0, 6),
-    "fcvt_l2": (50, 99, 0, 1),
+    "fadd_l7": IPArea(247, 315, 2, 10),
+    "fsub_l7": IPArea(247, 315, 2, 10),
+    "fmul_l4": IPArea(115, 173, 2, 9),
+    "fdiv_l12": IPArea(766, 1381, 0, 111),
+    "fcmp_l1": IPArea(64, 12, 0, 7),
+    "dadd_l14": IPArea(710, 872, 3, 30),
+    "dsub_l14": IPArea(710, 872, 3, 30),
+    "dmul_l9": IPArea(205, 542, 7, 16),
+    "ddiv_l24": IPArea(3185, 6035, 0, 399),
+    "dcmp_l1": IPArea(118, 12, 0, 12),
+    "i2f_l3": IPArea(165, 228, 0, 11),
+    "f2i_l3": IPArea(183, 232, 0, 6),
+    "fcvt_l2": IPArea(50, 99, 0, 1),
     # bf16 has no measured core; priced from its f32 sibling by width.
-    "bfadd_l4": (124, 158, 1, 5),
-    "bfsub_l4": (124, 158, 1, 5),
-    "bfmul_l2": (58, 87, 1, 5),
-    "bf2f_l2": (25, 50, 0, 1),
+    "bfadd_l4": IPArea(124, 158, 1, 5),
+    "bfsub_l4": IPArea(124, 158, 1, 5),
+    "bfmul_l2": IPArea(58, 87, 1, 5),
+    "bf2f_l2": IPArea(25, 50, 0, 1),
 }
 
 #: LUTs per bit of a `k`-source one-hot AND-OR select, measured for k = 2..40,

@@ -47,8 +47,6 @@ _DERIVED_SETTINGS = {"cycle_time_ns", "allocate"}
 class RTL(Backend[P, R]):
     name = "rtl"
 
-    # the backend knobs are all keyword-only
-    # pylint: disable-next=too-many-arguments
     def __init__(
         self,
         kernel: Kernel[P, R],

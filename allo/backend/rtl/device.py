@@ -627,7 +627,7 @@ def inject_device(module, device: Device):
         DCPathStreamTimingOp,
     )
 
-    with module.context as ctx, Location.unknown():
+    with module.context, Location.unknown():
         f32ty = F32Type.get()
         i64 = IntegerType.get_signless(64)
 
