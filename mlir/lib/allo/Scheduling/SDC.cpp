@@ -17,12 +17,16 @@
 
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Affine/LoopUtils.h"
+#include "mlir/Dialect/Affine/Utils.h" // expandAffineExpr
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/IR/IntegerSet.h"
+#include "mlir/IR/OperationSupport.h" // OperationEquivalence
 #include "mlir/Interfaces/SideEffectInterfaces.h"
+#include "llvm/ADT/MapVector.h"
 
 #include <chrono>
 
@@ -172,16 +176,65 @@ static bool hasCarriedRecurrence(circt::scheduling::CyclicProblem &problem) {
 
 // The values a straight-line span hands to something outside itself. Must match
 // what the reify treats as escaping, so the two agree on what the region's
-// completion waits to capture.
-static SmallVector<Value> spanEscapingValues(ArrayRef<Operation *> ops) {
+// completion waits to capture. A boundary value is one of them with no USE
+// outside the span: a loop bound and a guard predicate reach their region
+// through the model, since neither can be an affine operand.
+static SmallVector<Value> spanEscapingValues(ArrayRef<Operation *> ops,
+                                             const ScheduleModel &model) {
   llvm::SmallPtrSet<Operation *, 16> inSpan(ops.begin(), ops.end());
   SmallVector<Value> escaping;
   for (Operation *op : ops)
     for (Value res : op->getResults())
-      if (llvm::any_of(res.getUsers(),
+      if (model.isEntryValue(res) ||
+          llvm::any_of(res.getUsers(),
                        [&](Operation *user) { return !inSpan.contains(user); }))
         escaping.push_back(res);
   return escaping;
+}
+
+// The value an `affine.for` bound evaluates to at \p b's insertion point: the
+// max of the lower-bound map's results, the min of the upper-bound map's. A
+// trivial map hands an operand straight back and builds nothing.
+static Value expandLoopBound(OpBuilder &b, AffineForOp loop, bool isLower) {
+  AffineMap map = isLower ? loop.getLowerBoundMap() : loop.getUpperBoundMap();
+  ValueRange operands =
+      isLower ? loop.getLowerBoundOperands() : loop.getUpperBoundOperands();
+  Location loc = loop.getLoc();
+  SmallVector<Value> parts;
+  for (AffineExpr e : map.getResults())
+    parts.push_back(expandAffineExpr(b, loc, e,
+                                     operands.take_front(map.getNumDims()),
+                                     operands.drop_front(map.getNumDims())));
+  Value bound = parts.front();
+  for (Value v : llvm::drop_begin(parts))
+    bound = isLower ? arith::MaxSIOp::create(b, loc, bound, v).getResult()
+                    : arith::MinSIOp::create(b, loc, bound, v).getResult();
+  return bound;
+}
+
+// The `i1` an `affine.if`'s integer set evaluates to at \p b's insertion point:
+// the conjunction of its constraints, each `expr >= 0`, or `== 0` for an
+// equality.
+static Value expandGuardPredicate(OpBuilder &b, AffineIfOp guard) {
+  Location loc = guard.getLoc();
+  IntegerSet set = guard.getIntegerSet();
+  SmallVector<Value> operands(guard.getOperands());
+  ArrayRef<Value> args(operands);
+  unsigned numDims = set.getNumDims();
+  Value zero = arith::ConstantIndexOp::create(b, loc, 0);
+  Value cond;
+  for (unsigned i = 0, e = set.getNumConstraints(); i < e; ++i) {
+    Value aff =
+        expandAffineExpr(b, loc, set.getConstraint(i), args.take_front(numDims),
+                         args.drop_front(numDims));
+    auto pred =
+        set.isEq(i) ? arith::CmpIPredicate::eq : arith::CmpIPredicate::sge;
+    Value cmp = arith::CmpIOp::create(b, loc, pred, aff, zero);
+    cond = cond ? arith::AndIOp::create(b, loc, cond, cmp).getResult() : cmp;
+  }
+  if (!cond) // an empty set is always true
+    cond = arith::ConstantIntOp::create(b, loc, /*value=*/1, /*width=*/1);
+  return cond;
 }
 
 // A steady-clock stopwatch for timing one solve.
@@ -213,6 +266,10 @@ private:
   // built.
   void eraseHint(RewriterBase &b, Operation *op);
   void consumeHints(func::FuncOp funcOp);
+
+  // The expressions a region's BOUNDARY is, turned into operations the solve
+  // can see and cut.
+  void expandRegionBoundaries(func::FuncOp funcOp);
 
   // The IR walk: a block into regions, a region onto the problem that fits it.
   LogicalResult scheduleBlock(Block &block);
@@ -484,8 +541,8 @@ LogicalResult FuncScheduler::scheduleAcyclic(ArrayRef<Operation *> ops) {
     populateOperatorAllocation(problem, lib);
   // A straight-line region runs once, so its whole cost is its drain, and it
   // carries nothing between iterations it does not have.
-  SpanObjective span(problem, spanEscapingValues(ops), /*carried=*/nullptr,
-                     /*trip=*/1, lib);
+  SpanObjective span(problem, spanEscapingValues(ops, model),
+                     /*carried=*/nullptr, /*trip=*/1, lib);
   Stopwatch solveStart = now();
   if (failed(
           solveSchedulingProblem(problem, ops.back(), cycleTime, opts, span)))
@@ -772,11 +829,84 @@ void FuncScheduler::consumeHints(func::FuncOp funcOp) {
     eraseHint(rewriter, op);
 }
 
+// Turn every region BOUNDARY expression into operations, so the solve sees
+// them: a counted loop's runtime bounds and a guard's predicate are an
+// `AffineMap` and an `IntegerSet`, and the constraint system has a vertex only
+// for an operation. Left as attributes they reach the datapath uncut, on a path
+// the container gives exactly one period.
+//
+// The loop and the guard are NOT rewritten: their map and set stay where they
+// are, having no reader past the reify, and the values travel in the model.
+// That is also what keeps the dependence analysis exact, since the arith an
+// expansion produces is no valid affine symbol; this runs AFTER `deps` is
+// built, which has already distilled every distance, and adds only pure ops
+// naming no memref, so it cannot invalidate it.
+void FuncScheduler::expandRegionBoundaries(func::FuncOp funcOp) {
+  SmallVector<Operation *> anchors;
+  funcOp.walk([&](Operation *op) {
+    if (isa<AffineForOp, AffineIfOp>(op))
+      anchors.push_back(op);
+  });
+
+  // What the expansions build, per block and in block order, so the fold below
+  // only ever looks back at an operation that dominates.
+  llvm::MapVector<Block *, SmallVector<Operation *>> built;
+  for (Operation *anchor : anchors) {
+    OpBuilder b(anchor);
+    Operation *before = anchor->getPrevNode();
+    ScheduleModel::EntryCone cone;
+    if (auto loop = dyn_cast<AffineForOp>(anchor)) {
+      // The two conditions the reify wires a runtime bound under: a trip no
+      // constant fixes needs the upper bound, a symbolic start the lower one.
+      LoopTrip trip = deps.tripOf(loop);
+      if (!trip.count || trip.bounded)
+        cone.upper = expandLoopBound(b, loop, /*isLower=*/false);
+      if (!loop.hasConstantLowerBound())
+        cone.lower = expandLoopBound(b, loop, /*isLower=*/true);
+    } else {
+      cone.predicate = expandGuardPredicate(b, cast<AffineIfOp>(anchor));
+    }
+    if (!cone.lower && !cone.upper && !cone.predicate)
+      continue;
+    model.setEntryCone(anchor, cone);
+    SmallVector<Operation *> &here = built[anchor->getBlock()];
+    for (Operation *op = before ? before->getNextNode()
+                                : &anchor->getBlock()->front();
+         op != anchor; op = op->getNextNode())
+      here.push_back(op);
+  }
+
+  // Fold what the expansions duplicated. One runs per bound and per constraint,
+  // so a block routinely holds the same subexpression several times over, and
+  // no pass between here and the reify would fold them.
+  for (auto &[block, ops] : built) {
+    SmallVector<Operation *> kept;
+    for (Operation *op : ops) {
+      Operation **same = llvm::find_if(kept, [&](Operation *k) {
+        return OperationEquivalence::isEquivalentTo(
+            k, op, OperationEquivalence::IgnoreLocations);
+      });
+      if (same == kept.end()) {
+        kept.push_back(op);
+        continue;
+      }
+      for (auto [from, to] :
+           llvm::zip(op->getResults(), (*same)->getResults())) {
+        model.replaceEntryValue(from, to);
+        from.replaceAllUsesWith(to);
+      }
+      op->erase();
+    }
+  }
+}
+
 // Solve one function's schedule into `model`. The only IR this writes is the
-// hints it consumes and the kernel latency it publishes; the schedule itself is
-// materialized by a later pass off the model.
+// hints it consumes, the boundary expressions it expands and the kernel latency
+// it publishes; the schedule itself is materialized by a later pass off the
+// model.
 LogicalResult FuncScheduler::run(func::FuncOp funcOp) {
   consumeHints(funcOp);
+  expandRegionBoundaries(funcOp);
 
   std::string infoStr = "-- Start scheduling for " + funcOp.getSymName().str();
   info(Stage::Sched) << std::string(infoStr.size() * 2, '-');

@@ -768,9 +768,11 @@ def test_syrk_triangular_accumulate():
     rtl = _to_rtl(syrk)
     res = rtl.schedule()
     assert res.func("update_C").cyclic()[0].has("select")  # if/else if-converted
-    # compute_sum's guarded accumulate if-converts too, into a select on any of
-    # its cyclic regions.
-    assert any(r.has("select") for r in res.func("compute_sum").cyclic())
+    # compute_sum's guard takes the other route: `fold-if-statements` folds it
+    # into the inner loop's UPPER BOUND, so the accumulate is unconditional and
+    # what has to land is the bound, an acyclic region of its own.
+    inner = [r for r in res.func("compute_sum").regions if r.kind == "acyclic"]
+    assert any(r.has("minsi") for r in inner)
 
     A = _f32(0, N, M)
     A_copy = A.copy()

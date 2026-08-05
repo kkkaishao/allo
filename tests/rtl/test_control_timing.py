@@ -263,12 +263,12 @@ def test_chaining_inserts_register():
     assert tight.last_t() > loose.last_t()
 
 
-def test_a_reified_bound_is_priced_against_the_clock(capfd):
-    # What the reifier synthesizes AFTER the solve is combinational logic the
-    # chaining scheduler never saw: a symbolic loop bound is expanded from its
-    # affine map into arith ops stamped `start = 0`, so no chain break can land
-    # in it and no register bounds its depth. It is only checkable at emission,
-    # against the same clock the schedule was cut to.
+def test_a_symbolic_bound_is_cut_like_any_other_chain(capfd):
+    # A symbolic loop bound is an affine MAP, and the constraint system has a
+    # vertex only for an operation, so it used to be expanded after the solve
+    # and reach the datapath as one combinational cone nothing could break. The
+    # scheduler expands it now, which puts it in the enclosing straight-line
+    # region and hands it to the same chaining that cuts everything else.
     def band():
         @kernel
         def k(A: i32[64], out: i32[8]):
@@ -282,19 +282,23 @@ def test_a_reified_bound_is_priced_against_the_clock(capfd):
 
     # The premise, against the device: a signed floordiv expands to a divider
     # plus its sign correction (cmp, sub, select on each side), which alone
-    # overruns the default period.
+    # overruns the default period, so the bound is only buildable if it is cut.
     assert COMB["div"] + COMB["sub"] + COMB["select"] > PERIOD_NS
 
     _to_rtl(band()).compile()
     text = "".join(capfd.readouterr())
-    assert "AFTER the schedule was cut" in text
-    assert "misses timing" in text
+    assert "AFTER the schedule was cut" not in text
+    assert "misses timing" not in text
 
-    # The clock is what decides, so a period the whole cone fits in reports
-    # nothing. This is also the only remedy the message can offer: the
-    # expression is the compiler's, not a binding the user can withdraw.
-    _to_rtl(band(), freq_mhz=1.0).compile()  # a 1000ns cycle
-    assert "AFTER the schedule was cut" not in "".join(capfd.readouterr())
+    # And it is the CLOCK that decides where, which is what says the cut is the
+    # chaining solve's and not a fixed decomposition: the same bound under a
+    # period the whole cone fits in settles in one cycle.
+    def bound_depth(res):
+        return max(r.last_t() for r in res.regions() if r.kind == "acyclic" and r.ops)
+
+    assert bound_depth(_sched(band())) > bound_depth(
+        _sched(band(), freq_mhz=1.0)  # a 1000ns cycle
+    )
 
 
 def test_an_address_cone_is_charged_to_the_port_it_feeds():

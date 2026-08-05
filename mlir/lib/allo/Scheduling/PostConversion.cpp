@@ -427,32 +427,17 @@ static Value dynamicTripBound(LoopLikeOpInterface loop) {
   return scfLoop ? scfLoop.getUpperBound() : Value();
 }
 
-// Materialize an affine.for bound as an `index` value at `b`'s insertion point
-// (before the loop): the max of the lower-bound map's results, the min of the
-// upper-bound map's. A non-trivial expression synthesizes arith ops tagged
-// `start=0` so `convertOp` lifts them to combinational `dcp.compute` Sources.
-static Value materializeAffineBound(OpBuilder &b, ScheduleModel &model,
-                                    Location loc, AffineForOp af,
-                                    bool isLower) {
-  AffineMap map = isLower ? af.getLowerBoundMap() : af.getUpperBoundMap();
-  ValueRange operands =
-      isLower ? af.getLowerBoundOperands() : af.getUpperBoundOperands();
-  ValueRange dims = operands.take_front(map.getNumDims());
-  ValueRange syms = operands.drop_front(map.getNumDims());
-  Operation *loopOp = af.getOperation();
-  Operation *before = loopOp->getPrevNode();
-  SmallVector<Value> parts;
-  for (AffineExpr e : map.getResults())
-    parts.push_back(affine::expandAffineExpr(b, loc, e, dims, syms));
-  Value bound = parts.front();
-  for (Value v : llvm::drop_begin(parts))
-    bound = isLower ? arith::MaxSIOp::create(b, loc, bound, v).getResult()
-                    : arith::MinSIOp::create(b, loc, bound, v).getResult();
-  // The solver never saw these ops, so schedule them here.
-  for (Operation *o = before ? before->getNextNode()
-                             : &loopOp->getBlock()->front();
-       o != loopOp; o = o->getNextNode())
-    model.setStart(o, 0);
+// The value the scheduler's expansion of \p af's bound map settled on, which it
+// scheduled and cut against the clock like any other operation. Present exactly
+// where the wiring below asks for one, since both sides read the same two
+// conditions off the same loop.
+static Value scheduledBound(ScheduleModel &model, AffineForOp af,
+                            bool isLower) {
+  const ScheduleModel::EntryCone *cone = model.entryConeOf(af.getOperation());
+  assert(cone && "a loop with a runtime bound carries the scheduler's "
+                 "expansion of it");
+  Value bound = isLower ? cone->lower : cone->upper;
+  assert(bound && "the scheduler expanded the other bound of this loop");
   return bound;
 }
 
@@ -536,8 +521,7 @@ static DCPathPipelineOp materializeLoopToPipeline(const RegionAttrs &r,
   Value dynamicBound;
   if (!constantTripOf(loop)) {
     if (auto af = dyn_cast<AffineForOp>(loopOp))
-      dynamicBound = materializeAffineBound(b, model, loc, af,
-                                            /*isLower=*/false);
+      dynamicBound = scheduledBound(model, af, /*isLower=*/false);
     else
       dynamicBound = dynamicTripBound(loop);
   }
@@ -549,8 +533,7 @@ static DCPathPipelineOp materializeLoopToPipeline(const RegionAttrs &r,
   // operand, which lbStepOf defaulted to 0.
   if (auto af = dyn_cast<AffineForOp>(loopOp))
     if (!af.hasConstantLowerBound())
-      bounds.lbVal = materializeAffineBound(b, model, loc, af,
-                                            /*isLower=*/true);
+      bounds.lbVal = scheduledBound(model, af, /*isLower=*/true);
   std::optional<int64_t> lbAttr, stepAttr;
   if (!bounds.lbVal && bounds.lb != 0)
     lbAttr = bounds.lb;
@@ -635,11 +618,15 @@ static void materializeSequential(const RegionAttrs &r,
   for (Operation *op : hoisted)
     op->moveBefore(work.front());
 
+  // A boundary value has no USE outside the span: a loop bound and a guard
+  // predicate reach their region through the model, neither being expressible
+  // as an affine operand. `spanEscapingValues` selects the same set.
   llvm::SmallPtrSet<Operation *, 8> inRegion(work.begin(), work.end());
   SmallVector<Value> escaping;
   for (Operation *op : work)
     for (Value res : op->getResults())
-      if (llvm::any_of(res.getUsers(),
+      if (model.isEntryValue(res) ||
+          llvm::any_of(res.getUsers(),
                        [&](Operation *u) { return !inRegion.contains(u); }))
         escaping.push_back(res);
 
@@ -663,8 +650,10 @@ static void materializeSequential(const RegionAttrs &r,
       escaping, [&](Value v) { return map.lookupOrDefault(v); }));
   DCPathUnconditionOp::create(b, loc, yields);
 
-  for (auto [orig, res] : llvm::zip(escaping, seq.getResults()))
+  for (auto [orig, res] : llvm::zip(escaping, seq.getResults())) {
+    model.replaceEntryValue(orig, res);
     orig.replaceAllUsesWith(res);
+  }
   for (Operation *op : llvm::reverse(work))
     eraseScheduled(model, op);
 }
@@ -847,40 +836,22 @@ struct Reifier {
         if (!branch.empty())
           materializeBlock(branch.front());
       OpBuilder b(anchor);
-      Value cond = isa<AffineIfOp>(anchor)
-                       ? affineIfCondition(b, cast<AffineIfOp>(anchor))
-                       : cast<scf::IfOp>(anchor).getCondition();
+      // An `scf.if` carries its condition as an operand; an `affine.if` has an
+      // integer set, which the scheduler expanded and cut against the clock.
+      Value cond;
+      if (auto sif = dyn_cast<scf::IfOp>(anchor)) {
+        cond = sif.getCondition();
+      } else {
+        const ScheduleModel::EntryCone *cone = model.entryConeOf(anchor);
+        assert(cone && cone->predicate &&
+               "a guard carries the scheduler's expansion of its set");
+        cond = cone->predicate;
+      }
       // Lift a raw predicate tree to start-0 computes so the guard's condition
       // is a Source::Unit; an already-scheduled one is left untouched.
       scheduleConditionTree(model, cond);
       closeIntoDcpSelect(b, anchor, cond);
     }
-  }
-
-  // Materialize an affine.if's IntegerSet predicate into an i1: the conjunction
-  // of its constraints, each `expr >= 0`, or `== 0` for an equality. The ops go
-  // before `b`'s point and reference the loop IVs, which the enclosing wrapper
-  // rewires to its counter.
-  Value affineIfCondition(OpBuilder &b, AffineIfOp ifOp) {
-    Location loc = ifOp.getLoc();
-    IntegerSet set = ifOp.getIntegerSet();
-    SmallVector<Value> operands(ifOp.getOperands());
-    ArrayRef<Value> ops(operands);
-    unsigned numDims = set.getNumDims();
-    Value zero = arith::ConstantIndexOp::create(b, loc, 0);
-    Value cond;
-    for (unsigned i = 0, e = set.getNumConstraints(); i < e; ++i) {
-      Value aff = affine::expandAffineExpr(b, loc, set.getConstraint(i),
-                                           ops.take_front(numDims),
-                                           ops.drop_front(numDims));
-      auto pred =
-          set.isEq(i) ? arith::CmpIPredicate::eq : arith::CmpIPredicate::sge;
-      Value cmp = arith::CmpIOp::create(b, loc, pred, aff, zero);
-      cond = cond ? arith::AndIOp::create(b, loc, cond, cmp).getResult() : cmp;
-    }
-    if (!cond) // an empty set is always true
-      cond = arith::ConstantIntOp::create(b, loc, /*value=*/1, /*width=*/1);
-    return cond;
   }
 
   // Close a scheduled if, branches already materialized, into a dcp.select with

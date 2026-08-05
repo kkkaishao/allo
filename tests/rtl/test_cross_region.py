@@ -214,12 +214,14 @@ def test_guard_result_mux_captures_both_arms():
             out[g] = acc
 
     rtl = _to_rtl(rmux)
-    # Two same-named registers under r1, the then-arm's and the else-arm's, plus
-    # r2, the guarded reduction inside the then arm.
+    # r1 latches the guard's own predicate (`g < 2`, an expression the scheduler
+    # placed), then two same-named registers under r2, the then-arm's and the
+    # else-arm's, plus r3, the guarded reduction inside the then arm.
     assert _survivors(rtl) == [
         ("r1_sv0", "enabled"),
-        ("r1_sv0", "enabled"),
-        ("r2_sv0", "latch"),
+        ("r2_sv0", "enabled"),
+        ("r2_sv0", "enabled"),
+        ("r3_sv0", "latch"),
     ]
 
     a = np.arange(64, dtype=np.int32).reshape(4, 16)
@@ -539,16 +541,19 @@ def test_loop_bound_from_enclosing_counter():
 
 
 # ---------------------------------------------------------------------------
-# Func-scope cones: the arith the reifier leaves in the kernel body, outside
-# every region, when a TOP-LEVEL loop's bound or guard's predicate is an
-# expression.
+# Boundary cones: what a TOP-LEVEL loop's bound or a guard's predicate becomes
+# when it is an expression. The scheduler expands it before the solve, so it
+# lands in the enclosing straight-line region and nothing is left loose in the
+# kernel body.
 # ---------------------------------------------------------------------------
 
 
 def _loose_ops(func):
-    """The ops in ``func``'s own body that belong to no region: exactly the
-    func-scope cone. Constants are excluded (they tie in as literal cells
-    wherever they sit), as are the region ops and the terminator."""
+    """The ops in ``func``'s own body that belong to no region. Constants are
+    excluded (they tie in as literal cells wherever they sit), as are the region
+    ops and the terminator. Empty is the invariant: an expression a region's
+    boundary reads is scheduled, so it sits inside a region like anything
+    else."""
     body = func.root.regions[0].blocks[0]
     return [
         o.operation.name
@@ -558,20 +563,21 @@ def _loose_ops(func):
     ]
 
 
-def test_func_scope_loop_bound_cone():
+def test_loop_bound_cone_is_a_scheduled_region():
     # A top-level window loop: `hi + 1` is an affine expression of a scalar
-    # argument, so the reifier materializes an `arith.addi` at func scope
-    # reading the prologue's survivor. The bound resolves through it, and the
-    # loop runs [lo, hi].
+    # argument, so the scheduler expands it into an `arith.addi` the solve
+    # places, and the loop reads the region's survivor. The bound resolves
+    # through it, and the loop runs [lo, hi].
     @kernel
     def windowed(src: i32[16], dst: i32[16], lo: i32, hi: i32):
         for i in range(lo, hi + 1):
             dst[i] = src[i]
 
     rtl = _to_rtl(windowed)
-    # Locked, so the test cannot quietly stop covering the shape if the reifier
-    # ever wraps these ops in a region of their own.
-    assert _loose_ops(Dcp(rtl).func("windowed")) == ["arith.addi"]
+    # Locked, so the test cannot quietly stop covering the shape if a boundary
+    # expression ever escapes back out of a region.
+    assert _loose_ops(Dcp(rtl).func("windowed")) == []
+    assert any(r.has("addi") for r in rtl.schedule().func("windowed").regions)
 
     src = (np.arange(16, dtype=np.int32) + 3) * 5
     dst = np.zeros(16, np.int32)
@@ -581,10 +587,10 @@ def test_func_scope_loop_bound_cone():
     assert np.array_equal(dst, expected)
 
 
-def test_func_scope_guard_predicate_cone():
+def test_guard_predicate_cone_is_a_scheduled_region():
     # The same cone in the other slot: a top-level `if` over a scalar argument
-    # closes into a `dcp.select` whose predicate is a func-scope `arith.cmpi`.
-    # The guard must gate its arm, both ways.
+    # closes into a `dcp.select` whose predicate is an `arith.cmpi` the solve
+    # placed. The guard must gate its arm, both ways.
     @kernel
     def guarded(flag: i32, out: i32[16]):
         for i in range(16):
@@ -594,7 +600,8 @@ def test_func_scope_guard_predicate_cone():
                 out[j] = 99
 
     rtl = _to_rtl(guarded)
-    assert _loose_ops(Dcp(rtl).func("guarded")) == ["arith.cmpi"]
+    assert _loose_ops(Dcp(rtl).func("guarded")) == []
+    assert any(r.has("cmpi") for r in rtl.schedule().func("guarded").regions)
 
     taken = np.zeros(16, np.int32)
     rtl.cosim(np.int32(0), taken)
@@ -605,13 +612,12 @@ def test_func_scope_guard_predicate_cone():
     assert np.array_equal(skipped, np.arange(16, dtype=np.int32))
 
 
-def test_func_scope_cone_carries_its_composition_edge():
-    # The cone's one timing obligation. Region 2's ONLY tie to region 0 (the
-    # prologue latching `n`) is its bound expression, which belongs to no
-    # region: without chasing through it, the composer would see no edge and
-    # start region 2 with the kernel, reading the survivor before it settles.
-    # Region 1 sweeps a disjoint array and must stay concurrent, so this is a
-    # lock on the edge being exactly the one the cone implies.
+def test_bound_cone_carries_its_composition_edge():
+    # The cone's one timing obligation. The consuming loop's ONLY tie to the
+    # region computing its bound is that bound: start it with the kernel and it
+    # reads the survivor before it settles. The `j` loop sweeps a disjoint array
+    # and must stay concurrent, so this is a lock on the edge being exactly the
+    # one the bound implies and no other.
     @kernel
     def scoped_bound(a: i32[16], b: i32[16], n: i32):
         for j in range(16):
@@ -622,14 +628,15 @@ def test_func_scope_cone_carries_its_composition_edge():
             b[i] = i + 1
 
     rtl = _to_rtl(scoped_bound)
-    assert _loose_ops(Dcp(rtl).func("scoped_bound")) == ["arith.addi"]
+    assert _loose_ops(Dcp(rtl).func("scoped_bound")) == []
 
     # Read off the control structure, the same way the concurrent-siblings
-    # lock reads it: what the consuming region's run register is gated on.
+    # lock reads it: what the consuming region's run register is gated on. r1 is
+    # the `j` loop, r2 the bound, r3 the loop reading it.
     m = Mod(rtl.mlir, "scoped_bound")
-    _, run2 = m.reg_named("r2_run")
-    cone = {m.hint.get(v, v) for v in m.cone(run2, limit=256)}
-    assert "r0_done" in cone  # gated on the region that latches the bound
+    _, run3 = m.reg_named("r3_run")
+    cone = {m.hint.get(v, v) for v in m.cone(run3, limit=256)}
+    assert "r2_done" in cone  # gated on the region that latches the bound
     assert "r1_done" not in cone  # and on nothing else
 
     a = np.zeros(16, np.int32)
