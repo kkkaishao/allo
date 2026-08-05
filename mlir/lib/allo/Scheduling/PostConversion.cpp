@@ -95,68 +95,6 @@ static void scheduleConditionTree(ScheduleModel &model, Value cond) {
     tagConditionStartZero(model, cond);
 }
 
-// The ASAP ready cycle of a while continue-condition \p v, over the cone of
-// loads and arith feeding it. Returns nullopt when the cone holds a shape the
-// sequential CHECK region cannot emit, so the caller leaves the condition raw
-// for a clean reject. A pure query: it tags nothing.
-static std::optional<int64_t> conditionReadyCycle(ScheduleModel &model, Value v,
-                                                  const OperatorLibrary &lib) {
-  if (isa<BlockArgument>(v))
-    return 0;
-  Operation *def = v.getDefiningOp();
-  if (!def)
-    return std::nullopt;
-  if (isa<arith::ConstantOp>(def))
-    return 0;
-  if (isa<DCPathRegionOpInterface>(def))
-    return 0; // a preceding region result is settled
-  if (const OpSchedule *at = model.scheduleOf(def))
-    return at->start + static_cast<int64_t>(lib.lookup(def).latency);
-  if (!isa<AffineLoadOp, memref::LoadOp>(def) &&
-      !isa<arith::ArithDialect>(def->getDialect()))
-    return std::nullopt; // store, call, other: leave raw for a clean reject
-  int64_t start = 0;
-  for (Value o : def->getOperands()) {
-    if (isa<MemRefType>(o.getType()))
-      continue; // the memref declaration carries no schedule
-    std::optional<int64_t> r = conditionReadyCycle(model, o, lib);
-    if (!r)
-      return std::nullopt;
-    start = std::max(start, *r);
-  }
-  return start + static_cast<int64_t>(lib.lookup(def).latency);
-}
-
-// Schedule each op of the condition cone \p v at an ASAP start so the datapath
-// derives a non-negative register depth for the load to compare edge.
-// Precondition: `conditionReadyCycle(v)` is non-null.
-static int64_t tagConditionCone(ScheduleModel &model, Value v,
-                                const OperatorLibrary &lib) {
-  if (isa<BlockArgument>(v))
-    return 0;
-  Operation *def = v.getDefiningOp();
-  if (isa<arith::ConstantOp>(def) || isa<DCPathRegionOpInterface>(def))
-    return 0;
-  if (const OpSchedule *at = model.scheduleOf(def))
-    return at->start + static_cast<int64_t>(lib.lookup(def).latency);
-  int64_t start = 0;
-  for (Value o : def->getOperands())
-    if (!isa<MemRefType>(o.getType()))
-      start = std::max(start, tagConditionCone(model, o, lib));
-  model.setStart(def, start);
-  return start + static_cast<int64_t>(lib.lookup(def).latency);
-}
-
-// Schedule a while's continue-condition so it becomes a resolvable Source, by
-// ASAP-scheduling its cone. A memory- or IP-dependent cone gets real per-op
-// starts so the sequential CHECK/RUN controller can wait for it; an
-// unschedulable cone stays raw for a clean reject.
-static void scheduleWhileCondition(ScheduleModel &model, Value cond,
-                                   const OperatorLibrary &lib) {
-  if (conditionReadyCycle(model, cond, lib))
-    tagConditionCone(model, cond, lib);
-}
-
 //===----------------------------------------------------------------------===//
 // Per-op conversion. The `dcp.operator` symbols are already injected from the
 // device model, so the reifier only references them and never materializes one.
@@ -481,10 +419,6 @@ static void materializeWhilePipeline(const RegionAttrs &r, scf::WhileOp w,
     map.map(before.getArgument(j), blk->getArgument(j + 1));
     map.map(after.getArgument(j), blk->getArgument(j + 1));
   }
-
-  // A sequential-wrapper while's before-block condition is unscheduled; a leaf
-  // while's already carries real starts and passes through unchanged.
-  scheduleWhileCondition(model, w.getConditionOp().getCondition(), lib);
 
   b.setInsertionPointToEnd(blk);
   for (Operation &op : before.without_terminator())

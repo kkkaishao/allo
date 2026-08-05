@@ -280,6 +280,7 @@ private:
                                const SchedRegion &region, unsigned minII,
                                bool pipelined);
   LogicalResult scheduleWhile(scf::WhileOp w, const SchedRegion &region);
+  LogicalResult scheduleWhileCondition(scf::WhileOp w);
   LogicalResult scheduleAcyclic(ArrayRef<Operation *> ops);
 
   // What a solve leaves behind: the schedule, the allocation, the measurement.
@@ -529,6 +530,55 @@ LogicalResult FuncScheduler::scheduleWhile(scf::WhileOp w,
   return success();
 }
 
+// The operations a sequential while's continue-condition reads, in program
+// order. EMPTY when the cone holds a shape the CHECK region cannot emit (a
+// store, a sub-kernel call, a nested region), which leaves it unscheduled so
+// the emitter rejects the while rather than timing a cone it cannot build.
+//
+// A value defined outside the before block is settled when the loop starts: an
+// iter-arg survivor, an enclosing counter, a literal. It bounds the walk.
+static SmallVector<Operation *> conditionCone(scf::WhileOp w) {
+  Block &before = w.getBefore().front();
+  llvm::SmallPtrSet<Operation *, 8> reads;
+  SmallVector<Value> work{w.getConditionOp().getCondition()};
+  while (!work.empty()) {
+    Operation *def = work.pop_back_val().getDefiningOp();
+    if (!def || def->getBlock() != &before || isa<arith::ConstantOp>(def))
+      continue;
+    if (!reads.insert(def).second)
+      continue;
+    if (!isa<AffineLoadOp, memref::LoadOp>(def) &&
+        !isa<arith::ArithDialect>(def->getDialect()))
+      return {};
+    for (Value o : def->getOperands())
+      if (!isa<MemRefType>(o.getType())) // the memref names storage, not a value
+        work.push_back(o);
+  }
+  SmallVector<Operation *> cone;
+  for (Operation &op : before.without_terminator())
+    if (reads.contains(&op))
+      cone.push_back(&op);
+  return cone;
+}
+
+// A sequential (CHECK/RUN) while's own condition cone, solved as its own
+// straight-line span. Its depth is the `tCond` the controller waits out before
+// deciding, which the emitter reads back off these start times
+// (`emitConditionRegion`), so cutting it here is what holds it to the clock.
+//
+// The BODY is a separate problem: `scheduleRegion` decomposes the after block
+// into sub-regions, and the two never overlap, CHECK deciding before RUN
+// issues.
+LogicalResult FuncScheduler::scheduleWhileCondition(scf::WhileOp w) {
+  SmallVector<Operation *> cone = conditionCone(w);
+  if (cone.empty())
+    return success();
+  info(Stage::Sched, w.getOperation())
+      << "Scheduling the while's own condition cone of " << cone.size()
+      << " op(s): the CHECK controller waits out its depth each iteration";
+  return scheduleAcyclic(cone);
+}
+
 // Schedule one straight-line region as a `ChainingSharedOperatorsProblem` and
 // annotate the result.
 LogicalResult FuncScheduler::scheduleAcyclic(ArrayRef<Operation *> ops) {
@@ -761,6 +811,8 @@ LogicalResult FuncScheduler::scheduleRegion(const SchedRegion &region) {
              "call, or non-combinational condition); decomposing its body "
              "into sub-regions scheduled in program order (the outer while "
              "runs sequentially, latency data-dependent)";
+      if (failed(scheduleWhileCondition(whileOp)))
+        return failure();
       return scheduleBlock(whileOp.getAfter().front());
     }
     // `verify-rtl-legality` rejects a flushing while that does not forward

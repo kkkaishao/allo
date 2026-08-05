@@ -301,6 +301,57 @@ def test_a_symbolic_bound_is_cut_like_any_other_chain(capfd):
     )
 
 
+def test_a_sequential_whiles_condition_is_cut_like_any_other_chain(capfd):
+    # A sequential (CHECK/RUN) while's continue-condition is the last expression
+    # the reifier used to synthesize after the solve. The scheduler solves it as
+    # its own straight-line span now, so `t_cond`, the cycles the controller
+    # waits before deciding, is a CUT depth rather than an ASAP walk over
+    # unpriced cells.
+    def loop():
+        @kernel
+        def k(A: i32[64], out: i32[1]):
+            i: i32 = 0
+            s: i32 = 0
+            # The load is what forces the CHECK/RUN controller; the arith behind
+            # it is what has to be cut.
+            while A[i] * 3 + A[i] * 5 + 11 < 100:
+                s += A[i]
+                i += 1
+            out[0] = s
+
+        return k
+
+    # The premise, against the device: the condition's own chain does not fit
+    # one default cycle, so it is only buildable if something breaks it.
+    assert COMB["mul"] + 2 * COMB["add"] + COMB["cmp"] > PERIOD_NS
+
+    def cond_depth(res):
+        # The conditional container's own ops ARE the condition cone: its body
+        # is a nested region.
+        cone = [r for r in res.func("k").regions if r.conditional and r.ops]
+        assert len(cone) == 1, cone
+        return cone[0].last_t()
+
+    assert cond_depth(_sched(loop())) > cond_depth(
+        _sched(loop(), freq_mhz=1.0)  # a 1000ns cycle
+    )
+
+    rtl = _to_rtl(loop())
+    rtl.compile()
+    assert "AFTER the schedule was cut" not in "".join(capfd.readouterr())
+
+    # And the multi-cycle wait is real hardware: the controller must hold RUN
+    # off until the condition settles, or it runs an iteration too many.
+    A = (np.arange(64, dtype=np.int32) * 7) % 90
+    out = np.zeros(1, np.int32)
+    rtl.cosim(A, out)
+    i = s = 0
+    while A[i] * 3 + A[i] * 5 + 11 < 100:
+        s += int(A[i])
+        i += 1
+    assert out[0] == s
+
+
 def test_an_address_cone_is_charged_to_the_port_it_feeds():
     # An address never becomes an operation: it is folded into the access's
     # affine map, so no dependence carries its delay and only the access's own
