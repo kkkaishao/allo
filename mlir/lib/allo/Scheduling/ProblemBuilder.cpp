@@ -14,10 +14,15 @@
 
 #include "mlir/Dialect/Affine/Analysis/AffineAnalysis.h"
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
+#include "mlir/Dialect/Affine/Utils.h" // expandAffineExpr
+#include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/IR/IntegerSet.h"
+#include "mlir/IR/OperationSupport.h" // OperationEquivalence
 #include "llvm/ADT/DenseSet.h"
+#include "llvm/ADT/MapVector.h"
 
 using namespace mlir;
 using namespace mlir::affine;
@@ -264,6 +269,138 @@ bool whileHasIdentityForwarding(scf::WhileOp w) {
     if (arg != before.getArgument(i))
       return false;
   return true;
+}
+
+//===----------------------------------------------------------------------===//
+// Region boundaries: an affine bound or guard set, materialized as the arith
+// the constraint system can hold a vertex for.
+//===----------------------------------------------------------------------===//
+
+// The value an `affine.for` bound evaluates to at \p b's insertion point: the
+// max of the lower-bound map's results, the min of the upper-bound map's. A
+// trivial map hands an operand straight back and builds nothing.
+static Value expandLoopBound(OpBuilder &b, AffineForOp loop, bool isLower) {
+  AffineMap map = isLower ? loop.getLowerBoundMap() : loop.getUpperBoundMap();
+  ValueRange operands =
+      isLower ? loop.getLowerBoundOperands() : loop.getUpperBoundOperands();
+  Location loc = loop.getLoc();
+  SmallVector<Value> parts;
+  for (AffineExpr e : map.getResults())
+    parts.push_back(expandAffineExpr(b, loc, e,
+                                     operands.take_front(map.getNumDims()),
+                                     operands.drop_front(map.getNumDims())));
+  Value bound = parts.front();
+  for (Value v : llvm::drop_begin(parts))
+    bound = isLower ? arith::MaxSIOp::create(b, loc, bound, v).getResult()
+                    : arith::MinSIOp::create(b, loc, bound, v).getResult();
+  return bound;
+}
+
+// The `i1` an `affine.if`'s integer set evaluates to at \p b's insertion point:
+// the conjunction of its constraints, each `expr >= 0`, or `== 0` for an
+// equality.
+static Value expandGuardPredicate(OpBuilder &b, AffineIfOp guard) {
+  Location loc = guard.getLoc();
+  IntegerSet set = guard.getIntegerSet();
+  SmallVector<Value> operands(guard.getOperands());
+  ArrayRef<Value> args(operands);
+  unsigned numDims = set.getNumDims();
+  Value zero = arith::ConstantIndexOp::create(b, loc, 0);
+  Value cond;
+  for (unsigned i = 0, e = set.getNumConstraints(); i < e; ++i) {
+    Value aff =
+        expandAffineExpr(b, loc, set.getConstraint(i), args.take_front(numDims),
+                         args.drop_front(numDims));
+    auto pred =
+        set.isEq(i) ? arith::CmpIPredicate::eq : arith::CmpIPredicate::sge;
+    Value cmp = arith::CmpIOp::create(b, loc, pred, aff, zero);
+    cond = cond ? arith::AndIOp::create(b, loc, cond, cmp).getResult() : cmp;
+  }
+  if (!cond) // an empty set is always true
+    cond = arith::ConstantIntOp::create(b, loc, /*value=*/1, /*width=*/1);
+  return cond;
+}
+
+// Turn every region BOUNDARY expression into operations, so the solve sees
+// them: a counted loop's runtime bounds and a guard's predicate are an
+// `AffineMap` and an `IntegerSet`, and the constraint system has a vertex only
+// for an operation. Left as attributes they reach the datapath uncut, on a path
+// the container gives exactly one period.
+//
+// The loop and the guard are NOT rewritten: their map and set stay where they
+// are, having no reader past the reify, and the values travel in the model.
+// That is also what keeps the dependence analysis exact, since the arith an
+// expansion produces is no valid affine symbol; this runs AFTER `deps` is
+// built, which has already distilled every distance, and adds only pure ops
+// naming no memref, so it cannot invalidate it.
+//
+// This CHANGES THE REGION SHAPE the partitioning downstream of it sees, and is
+// meant to. An expansion builds into the anchor's own block, so a non-trivial
+// bound on an INNER loop puts operations beside it, `perfectNest` stops
+// descending there, and a nest that would have been one Leaf modulo problem
+// becomes a Container over sub-regions. That is the right answer: the boundary
+// arithmetic is real work needing a schedule, and a level driving it plus a
+// child is exactly what a Container is. It rests on `expandAffineExpr` building
+// NOTHING for a trivial map, which is what keeps the ordinary `for i in
+// range(n)` nest perfect (`expandLoopBound`).
+void expandRegionBoundaries(func::FuncOp funcOp, DependenceAnalysis &deps,
+                            ScheduleModel &model) {
+  SmallVector<Operation *> anchors;
+  funcOp.walk([&](Operation *op) {
+    if (isa<AffineForOp, AffineIfOp>(op))
+      anchors.push_back(op);
+  });
+
+  // What the expansions build, per block and in block order, so the fold below
+  // only ever looks back at an operation that dominates.
+  llvm::MapVector<Block *, SmallVector<Operation *>> built;
+  for (Operation *anchor : anchors) {
+    OpBuilder b(anchor);
+    Operation *before = anchor->getPrevNode();
+    ScheduleModel::EntryCone cone;
+    if (auto loop = dyn_cast<AffineForOp>(anchor)) {
+      // The two conditions the reify wires a runtime bound under: a trip no
+      // constant fixes needs the upper bound, a symbolic start the lower one.
+      LoopTrip trip = deps.tripOf(loop);
+      if (!trip.count || trip.bounded)
+        cone.upper = expandLoopBound(b, loop, /*isLower=*/false);
+      if (!loop.hasConstantLowerBound())
+        cone.lower = expandLoopBound(b, loop, /*isLower=*/true);
+    } else {
+      cone.predicate = expandGuardPredicate(b, cast<AffineIfOp>(anchor));
+    }
+    if (!cone.lower && !cone.upper && !cone.predicate)
+      continue;
+    model.setEntryCone(anchor, cone);
+    SmallVector<Operation *> &here = built[anchor->getBlock()];
+    for (Operation *op = before ? before->getNextNode()
+                                : &anchor->getBlock()->front();
+         op != anchor; op = op->getNextNode())
+      here.push_back(op);
+  }
+
+  // Fold what the expansions duplicated. One runs per bound and per constraint,
+  // so a block routinely holds the same subexpression several times over, and
+  // no pass between here and the reify would fold them.
+  for (auto &[block, ops] : built) {
+    SmallVector<Operation *> kept;
+    for (Operation *op : ops) {
+      Operation **same = llvm::find_if(kept, [&](Operation *k) {
+        return OperationEquivalence::isEquivalentTo(
+            k, op, OperationEquivalence::IgnoreLocations);
+      });
+      if (same == kept.end()) {
+        kept.push_back(op);
+        continue;
+      }
+      for (auto [from, to] :
+           llvm::zip(op->getResults(), (*same)->getResults())) {
+        model.replaceEntryValue(from, to);
+        from.replaceAllUsesWith(to);
+      }
+      op->erase();
+    }
+  }
 }
 
 bool conditionIsCombinational(scf::WhileOp w, const OperatorLibrary &lib) {

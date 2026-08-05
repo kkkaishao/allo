@@ -17,16 +17,12 @@
 
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Affine/LoopUtils.h"
-#include "mlir/Dialect/Affine/Utils.h" // expandAffineExpr
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
-#include "mlir/IR/IntegerSet.h"
-#include "mlir/IR/OperationSupport.h" // OperationEquivalence
 #include "mlir/Interfaces/SideEffectInterfaces.h"
-#include "llvm/ADT/MapVector.h"
 
 #include <chrono>
 
@@ -201,51 +197,6 @@ static SmallVector<Value> spanEscapingValues(ArrayRef<Operation *> ops,
   return escaping;
 }
 
-// The value an `affine.for` bound evaluates to at \p b's insertion point: the
-// max of the lower-bound map's results, the min of the upper-bound map's. A
-// trivial map hands an operand straight back and builds nothing.
-static Value expandLoopBound(OpBuilder &b, AffineForOp loop, bool isLower) {
-  AffineMap map = isLower ? loop.getLowerBoundMap() : loop.getUpperBoundMap();
-  ValueRange operands =
-      isLower ? loop.getLowerBoundOperands() : loop.getUpperBoundOperands();
-  Location loc = loop.getLoc();
-  SmallVector<Value> parts;
-  for (AffineExpr e : map.getResults())
-    parts.push_back(expandAffineExpr(b, loc, e,
-                                     operands.take_front(map.getNumDims()),
-                                     operands.drop_front(map.getNumDims())));
-  Value bound = parts.front();
-  for (Value v : llvm::drop_begin(parts))
-    bound = isLower ? arith::MaxSIOp::create(b, loc, bound, v).getResult()
-                    : arith::MinSIOp::create(b, loc, bound, v).getResult();
-  return bound;
-}
-
-// The `i1` an `affine.if`'s integer set evaluates to at \p b's insertion point:
-// the conjunction of its constraints, each `expr >= 0`, or `== 0` for an
-// equality.
-static Value expandGuardPredicate(OpBuilder &b, AffineIfOp guard) {
-  Location loc = guard.getLoc();
-  IntegerSet set = guard.getIntegerSet();
-  SmallVector<Value> operands(guard.getOperands());
-  ArrayRef<Value> args(operands);
-  unsigned numDims = set.getNumDims();
-  Value zero = arith::ConstantIndexOp::create(b, loc, 0);
-  Value cond;
-  for (unsigned i = 0, e = set.getNumConstraints(); i < e; ++i) {
-    Value aff =
-        expandAffineExpr(b, loc, set.getConstraint(i), args.take_front(numDims),
-                         args.drop_front(numDims));
-    auto pred =
-        set.isEq(i) ? arith::CmpIPredicate::eq : arith::CmpIPredicate::sge;
-    Value cmp = arith::CmpIOp::create(b, loc, pred, aff, zero);
-    cond = cond ? arith::AndIOp::create(b, loc, cond, cmp).getResult() : cmp;
-  }
-  if (!cond) // an empty set is always true
-    cond = arith::ConstantIntOp::create(b, loc, /*value=*/1, /*width=*/1);
-  return cond;
-}
-
 // A steady-clock stopwatch for timing one solve.
 using Stopwatch = std::chrono::steady_clock::time_point;
 static Stopwatch now() { return std::chrono::steady_clock::now(); }
@@ -278,7 +229,6 @@ private:
 
   // The expressions a region's BOUNDARY is, turned into operations the solve
   // can see and cut.
-  void expandRegionBoundaries(func::FuncOp funcOp);
 
   // The IR walk: a block into regions, a region onto the problem that fits it.
   LogicalResult scheduleBlock(Block &block);
@@ -290,11 +240,12 @@ private:
                                bool pipelined);
   LogicalResult scheduleWhile(scf::WhileOp w, const SchedRegion &region);
   LogicalResult scheduleWhileCondition(scf::WhileOp w);
-  LogicalResult scheduleAcyclic(ArrayRef<Operation *> ops);
+  LogicalResult scheduleAcyclic(ArrayRef<Operation *> ops, bool ownsRegion);
 
   // What a solve leaves behind: the schedule, the allocation, the measurement.
-  void annotateRegion(circt::scheduling::ChainingProblem &problem,
-                      Operation *owner, RegionSolution sol);
+  // A region's own `RegionSolution` is the caller's: it is what that path
+  // decided, and one path decides none (see `scheduleAcyclic`).
+  void annotateStarts(circt::scheduling::ChainingProblem &problem);
   void annotateAllocation(OccupancyProblem &problem);
   void recordSolve(OccupancyProblem &problem, StringRef kind,
                    std::optional<unsigned> ii, Stopwatch since);
@@ -314,16 +265,11 @@ private:
 
 } // namespace
 
-/// Record the solved schedule of one region in \p model: every registered op's
-/// start cycle and sub-cycle start, plus \p sol, keyed by \p owner, the op both
-/// descents land on: a counted band's innermost loop, a flushing `scf.while`,
-/// or a straight-line span's first op.
-///
-/// The caller hands \p sol in already filled. Its `length` in particular is a
-/// number that path already holds: a non-pipelined region RUNS at the body
-/// depth, and a straight-line one reports it.
-void FuncScheduler::annotateRegion(circt::scheduling::ChainingProblem &problem,
-                                   Operation *owner, RegionSolution sol) {
+/// Record the solved schedule in \p model: every registered op's start cycle
+/// and sub-cycle start. What the region as a whole solved to is a
+/// `RegionSolution` the caller opens with `model.addRegion`.
+void FuncScheduler::annotateStarts(
+    circt::scheduling::ChainingProblem &problem) {
   for (Operation *op : problem.getOperations()) {
     std::optional<unsigned> start = problem.getStartTime(op);
     if (!start)
@@ -337,7 +283,6 @@ void FuncScheduler::annotateRegion(circt::scheduling::ChainingProblem &problem,
     if (std::optional<float> z = problem.getStartTimeInCycle(op))
       model.setStartInCycle(op, *z);
   }
-  model.addRegion(owner) = sol;
 }
 
 // Publish the solved allocation into \p model: one entry per instance the
@@ -492,14 +437,14 @@ LogicalResult FuncScheduler::scheduleCyclic(LoopLikeOpInterface body,
           << " cycle(s), so no iteration may issue sooner";
   }
 
+  annotateStarts(problem);
   // Every field is per-invocation: no composed total is stored.
-  RegionSolution sol;
+  RegionSolution &sol = model.addRegion(body.getOperation());
   sol.ii = ii;
   sol.length = depth;
   sol.drain = drain;
   sol.trip = trip.count;
   sol.tripIsBound = trip.bounded;
-  annotateRegion(problem, body.getOperation(), sol);
   annotateAllocation(problem);
   return success();
 }
@@ -541,13 +486,13 @@ LogicalResult FuncScheduler::scheduleWhile(scf::WhileOp w,
   info(Stage::Sched, w.getOperation())
       << "  -> While loop scheduled as a flushing pipeline: II=" << *ii
       << " (trip is data-dependent, so whole-loop latency is unknown)";
+  annotateStarts(problem);
   // The trip is data-dependent, so it stays empty and no span composes off this
   // drain: both are recorded, like `ii`, as what the solve decided.
-  RegionSolution sol;
+  RegionSolution &sol = model.addRegion(w.getOperation());
   sol.ii = *ii;
   sol.length = problem.scheduleDepth();
   sol.drain = span.drainOf(problem);
-  annotateRegion(problem, w.getOperation(), sol);
   annotateAllocation(problem);
   return success();
 }
@@ -610,12 +555,19 @@ LogicalResult FuncScheduler::scheduleWhileCondition(scf::WhileOp w) {
   info(Stage::Sched, w.getOperation())
       << "Scheduling the while's own condition cone of " << cone->size()
       << " op(s): the CHECK controller waits out its depth each iteration";
-  return scheduleAcyclic(*cone);
+  return scheduleAcyclic(*cone, /*ownsRegion=*/false);
 }
 
 // Schedule one straight-line region as a `ChainingSharedOperatorsProblem` and
 // annotate the result.
-LogicalResult FuncScheduler::scheduleAcyclic(ArrayRef<Operation *> ops) {
+//
+// \p ownsRegion is false for a span that is TIMED but is no region of its own:
+// a sequential while's condition cone, whose op start times the emitter reads
+// back (`emitConditionRegion`) while the WHILE's controller paces it. Its
+// `RegionSolution` would be read by nobody, and `publishKernelLatency` counts
+// the ones that exist.
+LogicalResult FuncScheduler::scheduleAcyclic(ArrayRef<Operation *> ops,
+                                             bool ownsRegion) {
   ChainingSharedOperatorsProblem problem =
       buildAcyclicProblem<ChainingSharedOperatorsProblem>(ops, deps);
   populateOperatorTypes(problem, lib);
@@ -632,14 +584,17 @@ LogicalResult FuncScheduler::scheduleAcyclic(ArrayRef<Operation *> ops) {
           solveSchedulingProblem(problem, ops.back(), cycleTime, opts, span)))
     return failure();
   recordSolve(problem, "acyclic", /*ii=*/std::nullopt, solveStart);
-  // A straight-line span issues once, so it carries no II and no trip. How
-  // often its enclosing loops re-run it is charged where they are composed.
-  RegionSolution sol;
-  sol.length = problem.scheduleDepth();
-  sol.drain = span.drainOf(problem);
+  int64_t depth = problem.scheduleDepth();
   info(Stage::Sched, ops.front())
-      << "Scheduled: depth = " << sol.length << " cycles";
-  annotateRegion(problem, ops.front(), sol);
+      << "Scheduled: depth = " << depth << " cycles";
+  annotateStarts(problem);
+  if (ownsRegion) {
+    // A straight-line span issues once, so it carries no II and no trip. How
+    // often its enclosing loops re-run it is charged where they are composed.
+    RegionSolution &sol = model.addRegion(ops.front());
+    sol.length = depth;
+    sol.drain = span.drainOf(problem);
+  }
   annotateAllocation(problem);
   return success();
 }
@@ -770,6 +725,11 @@ void FuncScheduler::publishKernelLatency(func::FuncOp funcOp) {
       top.push_back(std::move(*n));
       topOps.emplace_back(region.ops.begin(), region.ops.end());
     }
+  // A func with no node to compose (an empty body, or nothing but declarations)
+  // publishes nothing: composing over none reports zero, which a caller would
+  // read as an exact zero-cycle contract.
+  if (top.empty())
+    return;
   std::optional<int64_t> total = composeDag(top, siblingPredecessors(topOps));
   if (!total)
     return; // a data-dependent region leaves the kernel total unknown
@@ -794,7 +754,7 @@ LogicalResult FuncScheduler::scheduleRegion(const SchedRegion &region) {
     info(Stage::Sched, region.anchor())
         << "A straight-line span of " << region.ops.size()
         << " op(s), using acyclic scheduling";
-    return scheduleAcyclic(region.ops);
+    return scheduleAcyclic(region.ops, /*ownsRegion=*/true);
   }
   if (isa<AffineForOp, scf::ForOp>(region.anchor())) {
     SmallVector<LoopLikeOpInterface> band =
@@ -916,120 +876,24 @@ void FuncScheduler::consumeHints(func::FuncOp funcOp) {
     eraseHint(rewriter, op);
 }
 
-// Turn every region BOUNDARY expression into operations, so the solve sees
-// them: a counted loop's runtime bounds and a guard's predicate are an
-// `AffineMap` and an `IntegerSet`, and the constraint system has a vertex only
-// for an operation. Left as attributes they reach the datapath uncut, on a path
-// the container gives exactly one period.
-//
-// The loop and the guard are NOT rewritten: their map and set stay where they
-// are, having no reader past the reify, and the values travel in the model.
-// That is also what keeps the dependence analysis exact, since the arith an
-// expansion produces is no valid affine symbol; this runs AFTER `deps` is
-// built, which has already distilled every distance, and adds only pure ops
-// naming no memref, so it cannot invalidate it.
-//
-// This CHANGES THE REGION SHAPE the partitioning downstream of it sees, and is
-// meant to. An expansion builds into the anchor's own block, so a non-trivial
-// bound on an INNER loop puts operations beside it, `perfectNest` stops
-// descending there, and a nest that would have been one Leaf modulo problem
-// becomes a Container over sub-regions. That is the right answer: the boundary
-// arithmetic is real work needing a schedule, and a level driving it plus a
-// child is exactly what a Container is. It rests on `expandAffineExpr` building
-// NOTHING for a trivial map, which is what keeps the ordinary `for i in
-// range(n)` nest perfect (`expandLoopBound`).
-void FuncScheduler::expandRegionBoundaries(func::FuncOp funcOp) {
-  SmallVector<Operation *> anchors;
-  funcOp.walk([&](Operation *op) {
-    if (isa<AffineForOp, AffineIfOp>(op))
-      anchors.push_back(op);
-  });
-
-  // What the expansions build, per block and in block order, so the fold below
-  // only ever looks back at an operation that dominates.
-  llvm::MapVector<Block *, SmallVector<Operation *>> built;
-  for (Operation *anchor : anchors) {
-    OpBuilder b(anchor);
-    Operation *before = anchor->getPrevNode();
-    ScheduleModel::EntryCone cone;
-    if (auto loop = dyn_cast<AffineForOp>(anchor)) {
-      // The two conditions the reify wires a runtime bound under: a trip no
-      // constant fixes needs the upper bound, a symbolic start the lower one.
-      LoopTrip trip = deps.tripOf(loop);
-      if (!trip.count || trip.bounded)
-        cone.upper = expandLoopBound(b, loop, /*isLower=*/false);
-      if (!loop.hasConstantLowerBound())
-        cone.lower = expandLoopBound(b, loop, /*isLower=*/true);
-    } else {
-      cone.predicate = expandGuardPredicate(b, cast<AffineIfOp>(anchor));
-    }
-    if (!cone.lower && !cone.upper && !cone.predicate)
-      continue;
-    model.setEntryCone(anchor, cone);
-    SmallVector<Operation *> &here = built[anchor->getBlock()];
-    for (Operation *op = before ? before->getNextNode()
-                                : &anchor->getBlock()->front();
-         op != anchor; op = op->getNextNode())
-      here.push_back(op);
-  }
-
-  // Fold what the expansions duplicated. One runs per bound and per constraint,
-  // so a block routinely holds the same subexpression several times over, and
-  // no pass between here and the reify would fold them.
-  for (auto &[block, ops] : built) {
-    SmallVector<Operation *> kept;
-    for (Operation *op : ops) {
-      Operation **same = llvm::find_if(kept, [&](Operation *k) {
-        return OperationEquivalence::isEquivalentTo(
-            k, op, OperationEquivalence::IgnoreLocations);
-      });
-      if (same == kept.end()) {
-        kept.push_back(op);
-        continue;
-      }
-      for (auto [from, to] :
-           llvm::zip(op->getResults(), (*same)->getResults())) {
-        model.replaceEntryValue(from, to);
-        from.replaceAllUsesWith(to);
-      }
-      op->erase();
-    }
-  }
-}
-
 // Solve one function's schedule into `model`. The only IR this writes is the
 // hints it consumes, the boundary expressions it expands and the kernel latency
 // it publishes; the schedule itself is materialized by a later pass off the
 // model.
 LogicalResult FuncScheduler::run(func::FuncOp funcOp) {
   consumeHints(funcOp);
-  expandRegionBoundaries(funcOp);
+  expandRegionBoundaries(funcOp, deps, model);
 
   std::string infoStr = "-- Start scheduling for " + funcOp.getSymName().str();
   info(Stage::Sched) << std::string(infoStr.size() * 2, '-');
   info(Stage::Sched) << infoStr;
   info(Stage::Sched) << std::string(infoStr.size() * 2, '-');
 
-#ifndef NDEBUG
-  // `verify-rtl-legality` rejects an access the analysis does not model, so
-  // reaching here means the two disagree and this op's dependences were
-  // dropped; scheduling would freely reorder it against what it aliases.
-  funcOp.walk([](Operation *op) {
-    assert(!isUnmodeledMemoryAccess(op) &&
-           "an unmodeled memory access reached scheduling");
-  });
-#endif
-
   // Schedule the function body's regions, recursing into imperfect nests.
-  size_t solvedBefore = model.regionCount();
   if (failed(scheduleBlock(funcOp.getBody().front())))
     return failure();
   recordTripBounds(funcOp);
-  // A func that solved no region (an empty body, or nothing but declarations)
-  // publishes no latency: composing over no node reports zero, which a caller
-  // would read as an exact zero-cycle contract.
-  if (model.regionCount() > solvedBefore)
-    publishKernelLatency(funcOp);
+  publishKernelLatency(funcOp);
   return success();
 }
 

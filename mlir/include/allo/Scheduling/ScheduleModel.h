@@ -275,11 +275,6 @@ public:
           *slot = to;
   }
 
-  /// Regions solved so far, module-wide. Sampled either side of one func to
-  /// tell a func that solved nothing from one that solved a zero-cycle span,
-  /// which publish different latencies.
-  size_t regionCount() const { return regions.size(); }
-
   /// Drop everything recorded about \p op, which every erase of a scheduled op
   /// owes the model. MLIR frees an erased op and the next `create` may be
   /// handed that same address, so a stale entry would answer for an op no

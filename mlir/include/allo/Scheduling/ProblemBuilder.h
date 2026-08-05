@@ -7,6 +7,7 @@
 #define ALLO_SCHEDULING_PROBLEMBUILDER_H
 
 #include "allo/Scheduling/DependenceAnalysis.h"
+#include "allo/Scheduling/ScheduleModel.h"
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Interfaces/LoopLikeInterface.h"
@@ -14,6 +15,18 @@
 namespace mlir::allo {
 
 class OperatorLibrary;
+
+/// Turn every region BOUNDARY expression in \p func into operations, so a
+/// problem built afterwards holds them: a counted loop's runtime bounds and a
+/// guard's predicate are an `AffineMap` and an `IntegerSet`, and the constraint
+/// system has a vertex only for an operation. The values are recorded in
+/// \p model as each anchor's entry cone; the loop and the guard themselves are
+/// not rewritten.
+///
+/// The one IR rewrite on this side of the pass, and it decides region shape as
+/// well as problem content; see the definition.
+void expandRegionBoundaries(func::FuncOp func, DependenceAnalysis &deps,
+                            ScheduleModel &model);
 
 /// Build a cyclic scheduling problem for one counted loop (`affine.for` or
 /// `scf.for`): its body ops, their dependences with inter-iteration distances,

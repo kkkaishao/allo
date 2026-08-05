@@ -749,6 +749,13 @@ DependenceAnalysis::DependenceAnalysis(func::FuncOp funcOp) : func(funcOp) {
     } else if (auto hint = dyn_cast<AssumeSSAOp>(op)) {
       collectAssumptions(hint.getCondition(), assumptions);
     }
+    // Asserted HERE, in the walk whose branches above are exactly what
+    // `isUnmodeledMemoryAccess` is the complement of. `verify-rtl-legality`
+    // rejects such an access before scheduling, so reaching this means the two
+    // disagree and this op joined no access list: its dependences are dropped
+    // and the solve would freely reorder it against what it aliases.
+    assert(!isUnmodeledMemoryAccess(op) &&
+           "an unmodeled memory access reached the dependence analysis");
   });
 
   // Affine memref dependences over all carried depths plus the
