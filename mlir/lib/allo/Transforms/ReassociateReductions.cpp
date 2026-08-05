@@ -127,9 +127,6 @@ struct ReassociateReductionsPass
           acc = buildReductionStep(b, tail, acc, c);
 
       op->getResult(0).replaceAllUsesWith(acc);
-      info(Stage::Prep, acc.getDefiningOp())
-          << "Rebalancing associative reduction chain of " << n
-          << " terms into a balanced tree";
       for (const ReductionStep &s : chain.steps)
         eraseStep(b, s);
     }

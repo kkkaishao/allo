@@ -74,8 +74,8 @@ def test_matmul_reductions():
 
     rtl = _to_rtl(gemm)
     res = rtl.schedule()
-    assert res.func("gemm_mm").cyclic()[0].ii == MEM_REDUCE_II
-    assert res.func("gemm_add").cyclic()[0].ii == 1
+    assert res.func("gemm_mm").cyclic()[0].interval == MEM_REDUCE_II
+    assert res.func("gemm_add").cyclic()[0].interval == 1
 
     A, B, C = _f32(0, P, Q), _f32(1, Q, R), _f32(2, P, R)
     output = np.zeros((P, R), np.float32)
@@ -117,9 +117,9 @@ def test_matmul_reductions():
 
     rtl = _to_rtl(two_mm)
     res = rtl.schedule()
-    assert res.func("tmm_ab").cyclic()[0].ii == MEM_REDUCE_II
-    assert res.func("tmm_abc").cyclic()[0].ii == MEM_REDUCE_II
-    assert res.func("tmm_add").cyclic()[0].ii == 1
+    assert res.func("tmm_ab").cyclic()[0].interval == MEM_REDUCE_II
+    assert res.func("tmm_abc").cyclic()[0].interval == MEM_REDUCE_II
+    assert res.func("tmm_add").cyclic()[0].interval == 1
 
     A, B, C, D = _f32(0, P, Q), _f32(1, Q, R), _f32(2, R, S), _f32(3, P, S)
     output = np.zeros((P, S), np.float32)
@@ -192,8 +192,8 @@ def test_matmul_reductions():
 
     rtl = _to_rtl(three_mm)
     res = rtl.schedule()
-    assert res.func("mm1").cyclic()[0].ii == MEM_REDUCE_II
-    assert res.func("mm3").cyclic()[0].ii == MEM_REDUCE_II
+    assert res.func("mm1").cyclic()[0].interval == MEM_REDUCE_II
+    assert res.func("mm3").cyclic()[0].interval == MEM_REDUCE_II
 
     A, B, C, D = _f32(0, P3, Q3), _f32(1, Q3, R3), _f32(2, R3, S3), _f32(3, S3, T3)
     out = np.zeros((P3, T3), np.float32)
@@ -232,8 +232,8 @@ def test_reduction_ii_follows_accumulator_location():
 
     rtl = _to_rtl(bicg)
     res = rtl.schedule()
-    assert res.func("stageS").cyclic()[0].ii == 1
-    assert res.func("stageQ").cyclic()[0].ii == MEM_REDUCE_II
+    assert res.func("stageS").cyclic()[0].interval == 1
+    assert res.func("stageQ").cyclic()[0].interval == MEM_REDUCE_II
 
     A, p, r = _f32(0, N, M), _f32(1, M), _f32(2, N)
     q, s = np.zeros(N, np.float32), np.zeros(M, np.float32)
@@ -265,8 +265,8 @@ def test_reduction_ii_follows_accumulator_location():
 
     rtl = _to_rtl(atax)
     res = rtl.schedule()
-    assert res.func("atax_m").cyclic()[0].ii == MEM_REDUCE_II
-    assert res.func("atax_n").cyclic()[0].ii == MEM_REDUCE_II
+    assert res.func("atax_m").cyclic()[0].interval == MEM_REDUCE_II
+    assert res.func("atax_n").cyclic()[0].interval == MEM_REDUCE_II
 
     A, x = _f32(0, AM, AN), _f32(1, AN)
     y = np.zeros(AN, np.float32)
@@ -312,10 +312,10 @@ def test_reduction_ii_follows_accumulator_location():
 
     rtl = _to_rtl(mvt)
     sa = rtl.schedule().func("stageA")
-    assert sa.cyclic()[0].ii == FADD  # scalar recurrence, not MEM_REDUCE_II
+    assert sa.cyclic()[0].interval == FADD  # scalar recurrence, not MEM_REDUCE_II
     assert len([r for r in sa.regions if r.kind == "acyclic"]) >= 2  # prologue+epilogue
     wrapper = next(r for r in sa.regions if r.is_wrapper)
-    assert wrapper.depth == 0 and wrapper.trip == V
+    assert wrapper.depth == 0 and wrapper.trip_count == V
 
     A, y1, y2 = _f32(0, V, V), _f32(1, V), _f32(2, V)
     x1, x2 = _f32(3, V), _f32(4, V)
@@ -345,7 +345,7 @@ def test_stencil_ii_port_vs_recurrence_bound():
     cyclic = rtl.schedule().cyclic()
     # The port bound is a floor: an II below it would oversubscribe the ports.
     # Whether the scheduler reaches the floor is not this test's subject.
-    assert len(cyclic) == 2 and all(r.ii >= 2 for r in cyclic)
+    assert len(cyclic) == 2 and all(r.interval >= 2 for r in cyclic)
 
     A, B = _f32(0, N), _f32(1, N)
     Ag, Bg = A.copy(), B.copy()
@@ -383,7 +383,7 @@ def test_stencil_ii_port_vs_recurrence_bound():
 
     rtl = _to_rtl(fdtd_2d)
     cyclic = rtl.schedule().cyclic()
-    assert len(cyclic) == 4 and all(r.ii == 1 for r in cyclic)
+    assert len(cyclic) == 4 and all(r.interval == 1 for r in cyclic)
 
     ex, ey, hz, fict = _f32(0, Nx, Ny), _f32(1, Nx, Ny), _f32(2, Nx, Ny), _f32(3, Tmax)
     exg, eyg, hzg = ex.copy(), ey.copy(), hz.copy()
@@ -442,7 +442,7 @@ def test_stencil_ii_port_vs_recurrence_bound():
     # Port pressure, not the adder: the body reads A and B at seven points each
     # over a fixed port budget, so the nest cannot close at II=1.
     rtl = _to_rtl(heat_3d)
-    assert rtl.schedule().cyclic()[0].ii > 1
+    assert rtl.schedule().cyclic()[0].interval > 1
 
     A, B = _f32(0, H, H, H), _f32(1, H, H, H)
     Ag, Bg = A.copy(), B.copy()
@@ -490,7 +490,7 @@ def test_stencil_ii_port_vs_recurrence_bound():
 
     rtl = _to_rtl(seidel_2d)
     cyclic = rtl.schedule().cyclic()
-    assert len(cyclic) == 1 and cyclic[0].ii > FDIV
+    assert len(cyclic) == 1 and cyclic[0].interval > FDIV
 
     A = _f32(0, SN, SN)
     Ag = A.copy()
@@ -592,10 +592,10 @@ def test_multi_region_single_func():
         compute_tmp(y_init, y_fifo, A, B, x, tmp)
         compute_y(y_fifo, y, tmp)
 
-    rtl = _to_rtl(gesummv, scalarize_threshold=0)
+    rtl = _to_rtl(gesummv).set_scheduler_opt(scalarize_threshold=0)
     res = rtl.schedule()
     assert MEM_REDUCE_II in _iis(res.func("compute_tmp").cyclic())
-    assert res.func("compute_y").cyclic()[0].ii == 1
+    assert res.func("compute_y").cyclic()[0].interval == 1
 
     A, B, x = _f32(0, G, G), _f32(1, G, G), _f32(2, G)
     y = np.zeros(G, np.float32)
@@ -661,8 +661,8 @@ def test_if_conversion_in_loops():
 
     rtl = _to_rtl(trmm)
     res = rtl.schedule()
-    assert res.func("trmm_S0").cyclic()[0].ii > 1
-    assert res.func("trmm_S1").cyclic()[0].ii == 1
+    assert res.func("trmm_S0").cyclic()[0].interval > 1
+    assert res.func("trmm_S1").cyclic()[0].interval == 1
 
     A, B = _f32(0, M, M), _f32(1, M, N)
     g = B.copy()
@@ -875,7 +875,7 @@ def test_nussinov_triangular_dp():
     res = rtl.schedule()
     assert res.func("nussinov").latency is None  # data-dependent trips
     loop = next(r for r in res.cyclic() if r.is_leaf)
-    assert loop.ii > 1  # memory-carried max recurrence into table[i, j]
+    assert loop.interval > 1  # memory-carried max recurrence into table[i, j]
     assert loop.has("select")  # boundary/compare guards if-converted
 
     rng = np.random.default_rng(2)
@@ -934,7 +934,7 @@ def test_cholesky_triangular():
     rtl = _to_rtl(cholesky, device=dev)
     res = rtl.schedule()
     assert res.func("cholesky").latency is None  # data-dependent trips
-    assert any(r.ii > 1 for r in res.cyclic())
+    assert any(r.interval > 1 for r in res.cyclic())
 
     # Symmetric positive-definite input so every pivot stays positive (`sqrt` of a
     # negative would diverge from the NumPy golden as a NaN).
@@ -1130,7 +1130,7 @@ def test_triangular_solve():
     res = rtl.schedule()
     assert res.func("lu").latency is None
     # memory-carried subtraction recurrence
-    assert any(r.ii is not None and r.ii > 1 for r in res.cyclic())
+    assert any(r.interval is not None and r.interval > 1 for r in res.cyclic())
 
     A = _f32(0, N, N) + np.float32(4.0) * np.eye(N, dtype=np.float32)
     g = A.copy()

@@ -48,6 +48,7 @@ std::string opKind(Operation *op, const llvm::StringMap<StringRef> &kinds) {
     return name.rsplit('.').second.str();
   return name.split('.').second.str();
 }
+
 } // namespace
 
 void mlir::allo::ScheduleModel::record(ModuleOp module) {
@@ -88,14 +89,14 @@ void mlir::allo::ScheduleModel::record(ModuleOp module) {
         // `ii` is absent for a data-dependent sequential wrapper (an enclosed
         // dynamic-trip loop); a pipelined region always has one.
         if (std::optional<uint64_t> ii = pipeline.getIi())
-          r.ii = (int64_t)*ii;
+          r.interval = (int64_t)*ii;
         if (std::optional<uint64_t> length = pipeline.getLength())
-          r.length = (int64_t)*length;
+          r.iterationLatency = (int64_t)*length;
         r.conditional = pipeline.isWhileLoop();
       } else if (auto sequential = dyn_cast<DCPathSequentialOp>(op)) {
         r.kind = "acyclic";
         if (std::optional<uint64_t> length = sequential.getLength())
-          r.length = (int64_t)*length;
+          r.iterationLatency = (int64_t)*length;
       } else {
         // A control guard: it selects the active data path and carries no
         // compute of its own; its branch children are reported in turn.
@@ -105,7 +106,7 @@ void mlir::allo::ScheduleModel::record(ModuleOp module) {
         r.conditional = true;
       }
       if (std::optional<uint64_t> trip = interface.getTrip())
-        r.trip = (int64_t)*trip;
+        r.tripCount = (int64_t)*trip;
       if (std::optional<uint64_t> drain = interface.getDrain())
         r.drain = (int64_t)*drain;
       if (std::optional<uint64_t> latency = interface.getLatency())
@@ -137,6 +138,15 @@ void mlir::allo::ScheduleModel::record(ModuleOp module) {
   }
 }
 
+std::vector<mlir::allo::OperatorClass>
+mlir::allo::ScheduleModel::operatorClasses() const {
+  std::vector<OperatorClass> split;
+  for (const auto &[type, seen] : classes)
+    if (seen.first > 1 && seen.second.size() > 1)
+      split.push_back({type, seen.first, (unsigned)seen.second.size()});
+  return split;
+}
+
 std::string mlir::allo::ScheduleModel::toJSON() const {
   using llvm::json::Array;
   using llvm::json::Object;
@@ -163,16 +173,19 @@ std::string mlir::allo::ScheduleModel::toJSON() const {
                    {"latency_bound", r.latencyBound},
                    {"ops", std::move(ops)}};
       // A number the region does not have is an absent KEY, never a null.
-      if (r.ii)
-        entry["ii"] = *r.ii;
-      if (r.trip)
-        entry["trip"] = *r.trip;
-      if (r.length)
-        entry["length"] = *r.length;
-      if (r.drain)
-        entry["drain"] = *r.drain;
+      if (r.interval)
+        entry["interval"] = *r.interval;
+      if (r.tripCount)
+        entry["trip_count"] = *r.tripCount;
+      if (r.iterationLatency)
+        entry["iteration_latency"] = *r.iterationLatency;
       if (r.latency)
         entry["latency"] = *r.latency;
+      // Composition quantities, apart from the latencies a reader compares.
+      Object cost;
+      if (r.drain)
+        cost["drain"] = *r.drain;
+      entry["cost"] = std::move(cost);
       if (!r.determinacy.empty())
         entry["determinacy"] = r.determinacy;
       regions.push_back(std::move(entry));
@@ -195,17 +208,34 @@ std::string mlir::allo::ScheduleModel::toJSON() const {
                  {"ops", s.ops},
                  {"limited_ops", s.limitedOps},
                  {"ms", s.millis}};
-    if (s.ii)
-      entry["ii"] = *s.ii;
+    if (s.interval)
+      entry["interval"] = *s.interval;
     if (s.allocatedOps) {
       entry["allocated_ops"] = s.allocatedOps;
       entry["allocated_units"] = s.allocatedUnits;
     }
+    if (s.carried)
+      entry["carried_edges"] = Object{{"total", s.carried->total},
+                                      {"non_affine", s.carried->nonAffine},
+                                      {"unknown", s.carried->unknown}};
     solveEntries.push_back(std::move(entry));
   }
 
-  Value root =
-      Object{{"funcs", std::move(funcs)}, {"solves", std::move(solveEntries)}};
+  Array classEntries;
+  for (const OperatorClass &c : operatorClasses())
+    classEntries.push_back(Object{{"type", c.type},
+                                  {"ops", (int64_t)c.ops},
+                                  {"identities", (int64_t)c.identities}});
+
+  Array unhonoredEntries;
+  for (const UnhonoredDirective &u : unhonored)
+    unhonoredEntries.push_back(Object{{"directive", u.directive},
+                                      {"where", u.where},
+                                      {"reason", u.reason}});
+  Value root = Object{{"funcs", std::move(funcs)},
+                      {"solves", std::move(solveEntries)},
+                      {"operator_classes", std::move(classEntries)},
+                      {"unhonored_directives", std::move(unhonoredEntries)}};
   std::string s;
   llvm::raw_string_ostream os(s);
   os << root;

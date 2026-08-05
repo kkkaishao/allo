@@ -197,9 +197,11 @@ def test_multi_cycle_write_costs_scheduled_cycles():
     # write at zero.
     iis = []
     for wr in (1, 2, 3):
-        rtl = _to_rtl(accumulate, device=_dev(wr), scalarize_threshold=0)
+        rtl = _to_rtl(accumulate, device=_dev(wr)).set_scheduler_opt(
+            scalarize_threshold=0
+        )
         regions = rtl.schedule().func("accumulate")
-        iis.append(max(r.ii for r in regions.cyclic()))
+        iis.append(max(r.interval for r in regions.cyclic()))
     assert iis == [iis[0], iis[0] + 1, iis[0] + 2], iis
 
 
@@ -263,7 +265,7 @@ def test_chaining_inserts_register():
     assert tight.last_t() > loose.last_t()
 
 
-def test_a_symbolic_bound_is_cut_like_any_other_chain(capfd):
+def test_a_symbolic_bound_is_cut_like_any_other_chain():
     # A symbolic loop bound is an affine MAP, and the constraint system has a
     # vertex only for an operation, so it used to be expanded after the solve
     # and reach the datapath as one combinational cone nothing could break. The
@@ -285,10 +287,10 @@ def test_a_symbolic_bound_is_cut_like_any_other_chain(capfd):
     # overruns the default period, so the bound is only buildable if it is cut.
     assert COMB["div"] + COMB["sub"] + COMB["select"] > PERIOD_NS
 
+    # A cell the emitter reaches with more delay on its inputs than the schedule
+    # left it is a REFUSAL (`checkCombPathsMeetPeriod`), so compiling at all is
+    # what says the bound was cut against the same clock as everything else.
     _to_rtl(band()).compile()
-    text = "".join(capfd.readouterr())
-    assert "AFTER the schedule was cut" not in text
-    assert "misses timing" not in text
 
     # And it is the CLOCK that decides where, which is what says the cut is the
     # chaining solve's and not a fixed decomposition: the same bound under a
@@ -301,7 +303,7 @@ def test_a_symbolic_bound_is_cut_like_any_other_chain(capfd):
     )
 
 
-def test_a_sequential_whiles_condition_is_cut_like_any_other_chain(capfd):
+def test_a_sequential_whiles_condition_is_cut_like_any_other_chain():
     # A sequential (CHECK/RUN) while's continue-condition is the last expression
     # the reifier used to synthesize after the solve. The scheduler solves it as
     # its own straight-line span now, so `t_cond`, the cycles the controller
@@ -336,9 +338,10 @@ def test_a_sequential_whiles_condition_is_cut_like_any_other_chain(capfd):
         _sched(loop(), freq_mhz=1.0)  # a 1000ns cycle
     )
 
+    # As above: a path the schedule did not leave room for is a refusal, so the
+    # compile completing is the check.
     rtl = _to_rtl(loop())
     rtl.compile()
-    assert "AFTER the schedule was cut" not in "".join(capfd.readouterr())
 
     # And the multi-cycle wait is real hardware: the controller must hold RUN
     # off until the condition settles, or it runs an iteration too many.
@@ -377,7 +380,7 @@ def test_an_address_cone_is_charged_to_the_port_it_feeds():
         n: _sched(k, freq_mhz=500).cyclic()[0]
         for n, k in (("flat", flat), ("cone", cone))
     }
-    assert at500["cone"].length > at500["flat"].length
+    assert at500["cone"].iteration_latency > at500["flat"].iteration_latency
 
 
 def test_an_address_that_follows_the_counters_is_carried_in_a_register():

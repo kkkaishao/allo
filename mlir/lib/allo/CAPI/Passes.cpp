@@ -5,6 +5,7 @@
 
 #include "allo-c/Passes.h"
 #include "allo/Microarch/EmitDriver.h"
+#include "allo/Microarch/Report.h"
 #include "allo/Scheduling/Scheduler.h"
 #include "allo/Support/Logging.h"
 
@@ -45,14 +46,16 @@ MlirLogicalResult alloEmitDatapathToHW(MlirModule module, MlirStringRef binding,
                                        MlirStringCallback callback,
                                        void *userData) {
   llvm::StringMap<std::string> interfaces;
+  allo::uarch::MicroarchReport report;
   if (failed(allo::uarch::emitDatapathToHW(unwrap(module), unwrap(binding),
                                            unwrap(top), (float)cycleTime,
-                                           interfaces)))
+                                           interfaces, report)))
     return mlirLogicalResultFailure();
-  // Combine the per-module interface JSON into one object keyed by module name.
-  // Values are already valid JSON and names are plain identifiers, so neither
-  // needs escaping.
-  std::string out = "{";
+  // One envelope carrying both of the emission's documents: the per-module
+  // port manifests keyed by module name, and the allocation report. Every
+  // value is already valid JSON and a module name is a plain identifier, so
+  // nothing here needs escaping.
+  std::string out = "{\"version\":1,\"interfaces\":{";
   bool first = true;
   for (const auto &kv : interfaces) {
     if (!first)
@@ -63,6 +66,8 @@ MlirLogicalResult alloEmitDatapathToHW(MlirModule module, MlirStringRef binding,
     out += "\":";
     out += kv.second;
   }
+  out += "},\"microarch\":";
+  out += report.toJSON();
   out += '}';
   callback(MlirStringRef{out.data(), out.size()}, userData);
   return mlirLogicalResultSuccess();
@@ -79,7 +84,8 @@ alloRunSDCSchedulingPipeline(MlirModule module, MlirStringRef top,
   std::optional<allo::SchedulerKind> kind =
       allo::parseSchedulerKind(schedulerName);
   if (!kind) {
-    allo::logging::error(allo::logging::Stage::Sched, mod)
+    allo::logging::error(allo::logging::Stage::Sched,
+                         allo::logging::Code::UnknownOption, mod)
         << "Unknown scheduler '" << schedulerName
         << "'; expected \"heuristic\", \"exact\" or \"exact-chaining\"";
     return mlirLogicalResultFailure();

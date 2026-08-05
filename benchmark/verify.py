@@ -135,7 +135,9 @@ def verify_one(
     try:
         parts = bench.build()
         sched = bench.schedules[variant](parts)
-        rtl = sched.export("rtl", binding=binding, scheduler=scheduler)
+        rtl = sched.export("rtl", binding=binding).set_scheduler_opt(
+            scheduler=scheduler
+        )
 
         out["stage"] = "schedule"
         fn = rtl.schedule().func(rtl.top)

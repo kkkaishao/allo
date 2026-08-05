@@ -5,8 +5,10 @@
 
 from __future__ import annotations
 
+import json
 import warnings
 
+from dataclasses import fields, replace
 from typing import Any, ParamSpec, TypeVar
 
 from ..base import Backend, run_pipeline
@@ -22,7 +24,9 @@ from .device import (
     operator_descs,
 )
 from .interface import Interfaces
-from .schedule import run_schedule, ScheduleResult
+from .qor import QoR, estimate
+from .reports import CompileReport, MicroarchReport, ScheduleResult, ScheduleSettings
+from .schedule import run_schedule
 from .sim import shell
 from ...lang.core import ShapedType
 from ...lang.kernel import Kernel
@@ -33,6 +37,10 @@ R = TypeVar("R")
 # The one DCP normalization before emit: it materializes the per-bank memrefs of
 # a partitioned array. Addresses stay in element space until the emitter.
 _NORMALIZE_PIPELINE = "builtin.module(dcp-resolve-banking)"
+
+# Settings the handle derives rather than takes: they are the scheduler's view
+# of `freq_mhz` and `binding`, which the emitter and the cosim clock read too.
+_DERIVED_SETTINGS = {"cycle_time_ns", "allocate"}
 
 
 # pylint: disable-next=too-many-instance-attributes
@@ -49,15 +57,13 @@ class RTL(Backend[P, R]):
         freq_mhz: float | None = None,
         simulator: str = "verilator",
         binding: str = "trivial",
-        accumulators: int = 0,
-        float_reassoc: bool = True,
-        unroll_under_pipeline: bool = True,
-        perfectize: bool = False,
-        scalarize_threshold: int = 16,
-        scheduler: str = "heuristic",
-        budget: float | None = None,
     ):
         """Build an RTL handle for one hardware configuration.
+
+        These four fix the target and how hardware is built for it. The
+        scheduler's own knobs are not arguments here: turn them on the handle
+        with :meth:`set_scheduler_opt`, which names them after the fields of
+        :class:`ScheduleSettings` the report publishes them as.
 
         Args:
             device: the hardware platform: storage primitives, native chaining
@@ -70,26 +76,6 @@ class RTL(Backend[P, R]):
                 compatible pair the clock allows; ``"planned"`` builds the
                 allocation the scheduler decided, which only an exact scheduler
                 makes, so under the heuristic it is the trivial binding.
-            accumulators: rotate float reductions across this many accumulators,
-                dropping their II to ``ceil(latency / accumulators)`` (0 = off).
-            float_reassoc: rebalance float reduction chains into logarithmic
-                trees. Not bit-exact.
-            unroll_under_pipeline: fully unroll the loops nested inside a
-                pipelined loop, so the nest pipelines at one II (Vitis ``#pragma
-                HLS pipeline`` semantics). ``False`` keeps them rolled and the
-                directive is then not honored.
-            perfectize: sink an imperfect nest's prologue/epilogue into the inner
-                loop under a guard, fusing it into one pipeline. A QoR
-                alternative; the scheduler handles imperfect nests without it.
-            scalarize_threshold: keep arrays of at most this many elements in
-                registers rather than a memory (0 = off).
-            scheduler: the solver that settles the resource half of each
-                scheduling problem. ``"heuristic"`` is the SDC simplex plus
-                greedy placement, ``"exact"`` CP-SAT, and ``"exact-chaining"``
-                CP-SAT deciding the chain breaks too (both need OR-Tools).
-            budget: what one exact solve may spend, in the solver's
-                deterministic time units; None takes the default. Only the
-                largest regions ever reach it.
         """
         super().__init__(kernel)
         self._device = device if device is not None else builtin_device
@@ -99,18 +85,12 @@ class RTL(Backend[P, R]):
         self._cycle_time = 1000.0 / self.freq_mhz
         self.simulator = simulator
         self.binding = binding
-        self._sched_opts = {
-            "accumulators": accumulators,
-            "float_reassoc": float_reassoc,
-            "unroll_under_pipeline": unroll_under_pipeline,
-            "perfectize": perfectize,
-            "scalarize_threshold": scalarize_threshold,
-            "scheduler": scheduler,
-            "budget": budget,
+        self._sched_opts = ScheduleSettings(
+            cycle_time_ns=self._cycle_time,
             # An allocation is only worth deciding where the emitter builds it:
             # the trivial binding keeps one unit per operation.
-            "allocate": binding != "trivial",
-        }
+            allocate=binding != "trivial",
+        )
         self.arg_types = kernel.parse_argument_annotations()
         self.res_types = kernel.parse_return_annotation()
         # The stage artifacts, each built once on first use. `self.module` stays
@@ -121,6 +101,7 @@ class RTL(Backend[P, R]):
         self._verilog: str | None = None
         self._cpu: CPU[P, R] | None = None
         self._interfaces: Interfaces | None = None
+        self._microarch: MicroarchReport | None = None
 
     @property
     def top(self) -> str:
@@ -128,6 +109,30 @@ class RTL(Backend[P, R]):
         return self.kernel.func_name
 
     # -- scheduling -------------------------------------------------------
+
+    def set_scheduler_opt(self, **opts: Any) -> RTL:
+        """Turn one or more of the scheduler's knobs and return the handle, so
+        the call chains onto ``export``. The names are the fields of
+        :class:`ScheduleSettings`, which documents what each does and is what
+        ``report.compiler.settings`` publishes them back as.
+
+        ``cycle_time_ns`` and ``allocate`` are not among them: they follow
+        ``freq_mhz`` and ``binding``, and setting either here would leave the
+        schedule describing a different design than the one cosim drives.
+        """
+        assert self._schedule_result is None, (
+            "the schedule is already built, and everything downstream describes "
+            "it, so a knob turned now would not reach the design"
+        )
+        tunable = {f.name for f in fields(ScheduleSettings)} - _DERIVED_SETTINGS
+        unknown = sorted(set(opts) - tunable)
+        if unknown:
+            raise ValueError(
+                f"unknown scheduler option(s) {unknown}; "
+                f"expected any of {sorted(tunable)}"
+            )
+        self._sched_opts = replace(self._sched_opts, **opts)
+        return self
 
     def schedule(self) -> ScheduleResult:
         """Schedule the kernel and return the result: per-func regions with their
@@ -141,10 +146,7 @@ class RTL(Backend[P, R]):
             inject_operators(self._dcp_ir, self._device)
             inject_device(self._dcp_ir, self._device)
             self._schedule_result = run_schedule(
-                self.top,
-                self._dcp_ir,
-                cycle_time=self._cycle_time,
-                **self._sched_opts,
+                self.top, self._dcp_ir, self._sched_opts
             )
         return self._schedule_result
 
@@ -194,7 +196,11 @@ class RTL(Backend[P, R]):
                     "An error occurred during code generation process:\n"
                     + "\n".join(diagnostics)
                 )
-            self._interfaces = Interfaces.from_json(manifests)
+            # One envelope, two documents: the boundary the cosim harness drives
+            # and the allocation the emitter decided.
+            envelope = json.loads(manifests)
+            self._interfaces = Interfaces.from_json(envelope["interfaces"])
+            self._microarch = MicroarchReport.from_json(envelope["microarch"])
             self._hw_ir = work
         return self._hw_ir
 
@@ -217,6 +223,29 @@ class RTL(Backend[P, R]):
         """The emitted modules' port interfaces, keyed by RTL module name"""
         self.compile()
         return self._interfaces
+
+    @property
+    def microarch(self) -> MicroarchReport:
+        """What the emitter BUILT: per region its units and muxes, per array its
+        storage and ports, and the design's register ledger. The allocation half
+        of the compile, joined to ``schedule()`` on (func, region order)."""
+        self.compile()
+        assert self._microarch is not None  # set by compile()
+        return self._microarch
+
+    @property
+    def report(self) -> CompileReport:
+        """The whole compile: schedule, allocation and boundary in one object.
+        Emission has run by the time this returns, so every member is present;
+        for the schedule alone, call ``schedule()``."""
+        return CompileReport(self.schedule(), self.microarch, self.interfaces)
+
+    @property
+    def estimation(self) -> QoR:
+        """What this compile costs: its span, and the area its structures price
+        at against the device it was compiled for. A model, and never a
+        substitute for synthesis; see :mod:`allo.backend.rtl.qor`."""
+        return estimate(self.report, self._device)
 
     # -- verbs ------------------------------------------------------------
 

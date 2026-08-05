@@ -31,8 +31,14 @@ void expandRegionBoundaries(func::FuncOp func, DependenceAnalysis &deps,
 /// Build a cyclic scheduling problem for one counted loop (`affine.for` or
 /// `scf.for`): its body ops, their dependences with inter-iteration distances,
 /// and its iter_arg recurrences. \p ProblemT is a `CyclicProblem` subclass.
+///
+/// \p counts collects what the II will have to respect, split by whether the
+/// dependence test proved the distance or assumed it. It travels out rather
+/// than into the report directly because only the caller knows which solve the
+/// problem becomes.
 template <class ProblemT>
-ProblemT buildCyclicProblem(LoopLikeOpInterface loop, DependenceAnalysis &deps);
+ProblemT buildCyclicProblem(LoopLikeOpInterface loop, DependenceAnalysis &deps,
+                            CarriedEdges &counts);
 
 /// The operation defining the value carried into iter_arg \p iterArg of the
 /// counted loop with body \p body and terminator \p yield, and how many
@@ -66,9 +72,10 @@ bool whileFlushingPipelines(scf::WhileOp w, const OperatorLibrary &lib);
 /// and after regions scheduled as one iteration: both regions' ops and deps,
 /// the non-speculative condition gate, the state recurrence at distance 1, and
 /// a side-effect anchor before `scf.yield`. Requires
-/// `whileHasIdentityForwarding(w)`.
+/// `whileHasIdentityForwarding(w)`. \p counts as in `buildCyclicProblem`.
 template <class ProblemT>
-ProblemT buildWhileProblem(scf::WhileOp w, DependenceAnalysis &deps);
+ProblemT buildWhileProblem(scf::WhileOp w, DependenceAnalysis &deps,
+                           CarriedEdges &counts);
 
 /// Build an acyclic scheduling problem for a straight-line region (the
 /// top-level \p ops of a maximal non-loop run): the ops and their intra-span

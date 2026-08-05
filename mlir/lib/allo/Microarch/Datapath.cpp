@@ -8,7 +8,6 @@
 
 #include "allo/IR/AlloOps.h"
 #include "allo/Scheduling/OperatorLibrary.h" // unit input delay
-#include "allo/Support/Logging.h"            // the allocation report
 
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/Support/raw_ostream.h"
@@ -54,6 +53,20 @@ unsigned dcpLatency(Operation *op) {
 }
 
 unsigned readyCycleOf(Operation *op) { return dcpStart(op) + dcpLatency(op); }
+
+llvm::StringRef shapeName(RegionBlock::Shape s) {
+  switch (s) {
+  case RegionBlock::Shape::Leaf:
+    return "leaf";
+  case RegionBlock::Shape::Container:
+    return "container";
+  case RegionBlock::Shape::Guard:
+    return "guard";
+  case RegionBlock::Shape::CallNode:
+    return "callnode";
+  }
+  llvm_unreachable("unhandled RegionBlock::Shape");
+}
 
 unsigned hwWidth(Type t) {
   if (isa<IndexType>(t))
@@ -301,75 +314,6 @@ double unitSlack(const FuncUnit &u, float cycleTime,
   return slack;
 }
 
-void Datapath::reportAllocation() const {
-  // A mux's width is the width of the port it drives, which only the
-  // consuming unit knows.
-  llvm::DenseMap<MuxId, unsigned> muxWidth;
-  for (const FuncUnit &u : units)
-    for (auto [k, s] : llvm::enumerate(u.inputs))
-      if (s.kind == Source::Kind::Mux)
-        muxWidth[s.id] = hwWidth(u.repOp()->getOperand(k).getType());
-
-  for (const RegionBlock &rb : regions) {
-    if (rb.units.empty())
-      continue;
-    unsigned ops = 0, ip = 0, fanin = 0, muxBits = 0;
-    for (UnitId uid : rb.units) {
-      ops += units[uid].boundOps.size();
-      ip += !units[uid].identity.comb;
-    }
-    for (MuxId mid : rb.muxes) {
-      unsigned k = muxes[mid].sources.size();
-      assert(muxWidth.count(mid) && "a mux drives a shared unit's input port");
-      // A k:1 mux costs about (k-1) 2:1 muxes per bit.
-      fanin += k;
-      muxBits += muxWidth.lookup(mid) * (k - 1);
-    }
-    logging::info(logging::Stage::Emit, rb.op)
-        << "Allocation: " << ops << " compute ops on " << rb.units.size()
-        << " units (" << ip << " IP), " << rb.muxes.size() << " muxes, "
-        << fanin << " mux inputs, " << muxBits << " 2:1 mux bits";
-  }
-
-  // Per array with more than one writer: its write ports, how many of them a
-  // call drives and how many DISTINCT calls those come from, how many REGIONS
-  // the writers are spread over, its geometry, and the write and total port
-  // counts the model demands. The call count is what separates a port merge
-  // from a banking problem: several ports of ONE child are the child's own
-  // boundary, several children are genuinely concurrent writers.
-  for (const MemUnit &m : mems) {
-    llvm::SmallDenseSet<unsigned> regionsWriting;
-    llvm::SmallDenseSet<CallId> callsWriting;
-    unsigned writes = 0, fromCalls = 0;
-    Operation *anchor = nullptr;
-    for (const MemUnit::Access &acc : m.accesses)
-      if (acc.isWrite) {
-        ++writes;
-        regionsWriting.insert(acc.region);
-        if (!anchor)
-          anchor = acc.op;
-      }
-    for (const CallUnit &cu : calls)
-      for (const CallUnit::MemArg &ma : cu.memArgs)
-        if (ma.mem == m.id && ma.isWrite) {
-          ++writes;
-          ++fromCalls;
-          callsWriting.insert(cu.id);
-          regionsWriting.insert(cu.region);
-          if (!anchor)
-            anchor = cu.invoke;
-        }
-    if (writes < 2)
-      continue;
-    logging::info(logging::Stage::Emit, anchor)
-        << "Memory: " << writes << " write ports (" << fromCalls << " from "
-        << callsWriting.size() << " calls) on " << m.depthWords << "x"
-        << m.width << " bits over " << regionsWriting.size()
-        << " regions, needs " << portsNeeded(m.id, /*writesOnly=*/true)
-        << " write " << portsNeeded(m.id, /*writesOnly=*/false) << " total, "
-        << (m.external ? "external" : "internal");
-  }
-}
 
 /// The largest set of mutually adjacent vertices in \p adj, a bitset per
 /// vertex, by Bron-Kerbosch with pivoting: every maximal clique contains the
@@ -589,19 +533,6 @@ void Datapath::dump(llvm::raw_ostream &os) const {
 
   // The controller discriminant as the emitter reads it: shape, then
   // termination class.
-  auto shapeName = [](RegionBlock::Shape s) -> const char * {
-    switch (s) {
-    case RegionBlock::Shape::Leaf:
-      return "leaf";
-    case RegionBlock::Shape::Container:
-      return "container";
-    case RegionBlock::Shape::Guard:
-      return "guard";
-    case RegionBlock::Shape::CallNode:
-      return "callnode";
-    }
-    llvm_unreachable("unhandled RegionBlock::Shape");
-  };
   for (const RegionBlock &rb : this->regions) {
     os << "  region " << rb.id << ": " << shapeName(rb.shape) << "/"
        << (rb.conditional                         ? "while"

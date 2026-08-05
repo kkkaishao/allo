@@ -134,7 +134,7 @@ def test_residual_loops_closed_into_pipelines():
     # Dynamic outer trip: the wrapper's II is still concrete (inner-derived), but
     # its trip is unknown.
     wrapper = next(r for r in mod.schedule().funcs[0].regions if r.is_wrapper)
-    assert wrapper.trip is None and wrapper.ii > 0
+    assert wrapper.trip_count is None and wrapper.interval > 0
 
     @kernel
     def dyn_inner(A: f32[N, N], y: f32[N], n: index):
@@ -147,7 +147,7 @@ def test_residual_loops_closed_into_pipelines():
     # II (done-based sequential controller), but the loop still closes into a
     # dcp.pipeline (its static trip is known).
     wrapper = next(r for r in mod.schedule().funcs[0].regions if r.is_wrapper)
-    assert wrapper.ii is None and wrapper.trip == N
+    assert wrapper.interval is None and wrapper.trip_count == N
 
 
 # --- dynamic trip counts & lb/step induction ---------------------------------
@@ -165,7 +165,7 @@ def test_a_dynamic_bound_closes_its_recurrence_conservatively():
 
     # A[i] reads A[i-1]: a conservative distance-1 back edge forces II > 1;
     # without it the II would be an unsound, optimistic 1.
-    assert _sched(recur).cyclic()[0].ii > 1
+    assert _sched(recur).cyclic()[0].interval > 1
 
 
 # A dynamic-trip loop stays a free-running / modulo pipeline terminating on
@@ -184,7 +184,7 @@ def test_dynamic_trip_cosim():
 
     rtl = _to_rtl(dyn)
     loop = rtl.schedule().cyclic()[0]
-    assert loop.ii == 1  # scalar int accumulate, add is combinational
+    assert loop.interval == 1  # scalar int accumulate, add is combinational
     assert loop.latency is None  # unknown trip -> latency deferred, not faked
 
     for N in (5, 1, 12):
@@ -482,7 +482,7 @@ def test_stencil2d_grid_reduction_cosim():
     # nothing holds the window reduction back from II=1.
     res = rtl.schedule()
     assert res.func("stencil2d").latency is not None
-    assert res.cyclic() and all(r.ii == 1 for r in res.cyclic())
+    assert res.cyclic() and all(r.interval == 1 for r in res.cyclic())
 
     orig = (np.arange(ROW * COL, dtype=np.int32) % 5 + 1).reshape(ROW, COL)
     filt = np.arange(F, dtype=np.int32) % 3 + 1
@@ -701,7 +701,9 @@ def test_intra_iteration_dependence():
     # a loop-carried edge (i >= 1); keeping the tightest (dist 0) distance is what
     # preserves the same-iteration ordering.
     loop = _sched(alias).cyclic()[0]
-    assert loop.ii == 1  # a dist-0 edge orders within the iteration, no recurrence
+    assert (
+        loop.interval == 1
+    )  # a dist-0 edge orders within the iteration, no recurrence
     assert loop.op("store").t < loop.op("load").t
 
     @kernel
@@ -850,8 +852,8 @@ def test_assume_hints():
 
     # Without the hint the aliasing histogram update keeps a conservative
     # loop-carried edge; asserting no inter-iteration dependence prunes it.
-    assert _sched(hist(False)).cyclic()[0].ii == 2
-    assert _sched(hist(True)).cyclic()[0].ii == 1
+    assert _sched(hist(False)).cyclic()[0].interval == 2
+    assert _sched(hist(True)).cyclic()[0].interval == 1
 
     # A grid()'s independence guarantee lowers to `assume.nodep` on the written
     # array, dropping the conservative back edge on a non-affine aliasing write --
@@ -1149,7 +1151,7 @@ def test_loop_over_calls_reports_the_interval_it_runs_at():
 
     child = _latency(li_child)
     regions = _to_rtl(li_top).schedule().func("li_top").regions
-    assert [r.ii for r in regions if r.ii is not None] == [child + 1]
+    assert [r.interval for r in regions if r.interval is not None] == [child + 1]
     B = np.zeros(16, np.int32)
     r = _to_rtl(li_top).cosim(A16, B)
     assert np.array_equal(B, A16 * 2 + 1)
@@ -1355,12 +1357,12 @@ def _mac_kernel():
 
 
 def test_explicit_target_ii_floor_is_honored():
-    assert _sched(_vadd_kernel()).cyclic()[0].ii == 1  # natural minimum
+    assert _sched(_vadd_kernel()).cyclic()[0].interval == 1  # natural minimum
 
     s = _vadd_kernel().schedule()
     s.pipeline("i", ii=3)
     mod = s.export("rtl")
-    assert mod.schedule().cyclic()[0].ii == 3  # target honored as a floor
+    assert mod.schedule().cyclic()[0].interval == 3  # target honored as a floor
 
 
 def test_pipeline_disabled_runs_sequentially():
@@ -1369,8 +1371,8 @@ def test_pipeline_disabled_runs_sequentially():
     mod = s.export("rtl")
     npl = mod.schedule().cyclic()[0]
 
-    assert npl.ii == npl.length  # no overlap: II = body length
-    assert npl.latency == 8 * npl.length  # trip * depth
+    assert npl.interval == npl.iteration_latency  # no overlap: II = body length
+    assert npl.latency == 8 * npl.iteration_latency  # trip * depth
 
 
 def test_pipeline_directive_preserves_result_cosim():
@@ -1394,11 +1396,11 @@ def test_pipeline_directive_preserves_result_cosim():
     assert np.array_equal(out, A8 * B8)
 
 
-def test_pipelined_imperfect_nest_falls_back_to_sub_regions(capfd):
+def test_pipelined_imperfect_nest_falls_back_to_sub_regions():
     # A pipeline directive on an imperfect nest is not honored: fusing the level
     # over its inner loops is not implemented, so the body decomposes into
     # sub-regions the container sequences one outer iteration at a time. Correct,
-    # not fast, and the backend has to say so.
+    # not fast, and the schedule has to SHOW the fallback.
     @kernel
     def two(A: i32[16, 4], out: i32[16, 4]):
         buf: i32[16, 4]
@@ -1410,13 +1412,23 @@ def test_pipelined_imperfect_nest_falls_back_to_sub_regions(capfd):
 
     s = two.schedule()
     s.pipeline("i")
-    mod = s.export("rtl", unroll_under_pipeline=False)
+    mod = s.export("rtl").set_scheduler_opt(unroll_under_pipeline=False)
     A = (np.arange(64, dtype=np.int32) % 7).reshape(16, 4)
     out = np.zeros((16, 4), np.int32)
     mod.cosim(A, out)
     assert np.array_equal(out, (A + 1) * 2)
-    # The shortfall is reported, never measured: pinning cycles would lock it in
-    # and fail the day the fused level is implemented. What must hold is that the
-    # backend declares the directive unhonored.
-    text = "".join(capfd.readouterr())
-    assert "pipeline directive on an imperfect nest is not honored" in text, text
+    # The refusal itself is published, since the region the directive named is
+    # gone by the time any report is built and nothing else records that the
+    # user asked for something they did not get.
+    res = mod.schedule()
+    assert [(u.directive, u.reason) for u in res.unhonored_directives] == [
+        ("pipeline", "imperfect_nest")
+    ]
+    # The shortfall is shown, never measured: pinning cycles would lock it in and
+    # fail the day the fused level is implemented. What must hold is the SHAPE
+    # the fallback takes -- `i`, the level the directive named, issues nothing of
+    # its own and wraps the two sub-regions its body decomposed into.
+    nest = res.func("two").regions
+    assert nest[0].depth == 0 and nest[0].is_wrapper
+    assert [r.depth for r in nest[1:]] == [1, 1]
+    assert all(r.ops for r in nest[1:])

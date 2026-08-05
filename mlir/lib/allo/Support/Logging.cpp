@@ -21,6 +21,7 @@
 #include "spdlog/spdlog.h"
 
 #include <atomic>
+#include <cassert>
 #include <cstdlib>
 #include <memory>
 #include <mutex>
@@ -167,11 +168,20 @@ std::string render(StringRef name, bool isLoop, StringRef pos) {
 
 } // namespace
 
-void detail::emit(Level level, Stage stage, StringRef where, StringRef message,
-                  Operation *subject) {
+void detail::emit(Level level, Stage stage, StringRef code, StringRef where,
+                  StringRef message, Operation *subject) {
+  assert(isFatal(level) == !code.empty() &&
+         "a refusal carries a code and nothing else does");
+  assert((code.empty() || code[5] == (level == Level::Error ? 'E' : 'N')) &&
+         "the code's series names the level it is reported at");
   std::string line;
-  line.reserve(message.size() + where.size() + 24);
+  line.reserve(message.size() + where.size() + code.size() + 24);
   line += levelTag(level);
+  if (!code.empty()) {
+    line += '[';
+    line.append(code.data(), code.size());
+    line += ']';
+  }
   line += ": [";
   line += stageTag(stage);
   line += "] ";
@@ -186,9 +196,11 @@ void detail::emit(Level level, Stage stage, StringRef where, StringRef message,
   logger().log(toSpdlog(level), "{}", line);
 
   // A fatal message also emits an MLIR diagnostic so the pass fails and the
-  // message surfaces to the caller. The diagnostic attaches the op's location.
+  // message surfaces to the caller. The diagnostic attaches the op's location,
+  // and leads with the code: this is the one path by which the stable token
+  // reaches a caller, which sees the diagnostic text and never this log.
   if (isFatal(level) && subject)
-    subject->emitError(message);
+    subject->emitError() << "[" << code << "] " << message;
 }
 
 bool detail::enabled(Level level) {

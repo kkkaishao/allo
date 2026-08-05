@@ -15,6 +15,7 @@
 #include "mlir/Dialect/Arith/IR/Arith.h" // arith::CmpIPredicate
 #include "mlir/IR/BuiltinTypes.h"
 #include "llvm/ADT/StringSwitch.h"
+#include "llvm/Support/SaveAndRestore.h"
 
 using namespace mlir;
 using namespace mlir::allo;
@@ -214,6 +215,52 @@ Value emitCompute(OpBuilder &b, Location loc, StringRef kind,
 }
 
 //===----------------------------------------------------------------------===//
+// RegLedger: what the emission spent in flip-flops.
+//===----------------------------------------------------------------------===//
+
+llvm::StringRef roleName(RegRole role) {
+  switch (role) {
+  case RegRole::Value:
+    return "value";
+  case RegRole::Pulse:
+    return "pulse";
+  case RegRole::Counted:
+    return "counted";
+  case RegRole::Survivor:
+    return "survivor";
+  case RegRole::Counter:
+    return "counter";
+  case RegRole::Control:
+    return "control";
+  }
+  llvm_unreachable("every RegRole has a name");
+}
+
+std::vector<RegClass> RegLedger::classes() const {
+  std::vector<RegClass> out;
+  out.reserve(runs.size());
+  for (const auto &[key, count] : runs) {
+    auto [role, width, depth] = key;
+    out.push_back({role, width, depth, count});
+  }
+  return out;
+}
+
+unsigned RegLedger::bits() const {
+  unsigned total = 0;
+  for (const auto &[key, count] : runs)
+    total += std::get<1>(key) * std::get<2>(key) * count;
+  return total;
+}
+
+void RegLedger::dump(llvm::raw_ostream &os) const {
+  for (const RegClass &c : classes())
+    os << "  " << roleName(c.role) << " x" << c.count << ": " << c.depth
+       << " deep, " << c.width << " bits\n";
+  os << "  total " << bits() << " flip-flops\n";
+}
+
+//===----------------------------------------------------------------------===//
 // EmitContext: the shared builder substrate.
 //===----------------------------------------------------------------------===//
 
@@ -221,13 +268,15 @@ Value EmitContext::konst(Type t, int64_t v) {
   return R(hw::ConstantOp::create(b, loc, t, v));
 }
 
-Value EmitContext::reg(Value in, Value rstVal) {
+Value EmitContext::reg(Value in, Value rstVal, RegRole role) {
+  if (!inChainRun)
+    ledger.add(role, hwWidth(in.getType()), 1);
   return R(seq::CompRegOp::create(b, loc, in, clk, rst, rstVal));
 }
 
-Value EmitContext::enabledReg(Value in, Value ce, Value rstVal) {
+Value EmitContext::enabledReg(Value in, Value ce, Value rstVal, RegRole role) {
   Backedge selfNext = bb.get(in.getType());
-  Value self = reg(selfNext, rstVal);
+  Value self = reg(selfNext, rstVal, role);
   selfNext.setValue(mux(ce, in, self));
   return self;
 }
@@ -242,9 +291,10 @@ Value EmitContext::stallHold(Value in, const StallShell &sh) {
   return out;
 }
 
-Value EmitContext::latchReg(Value init, Value next, Value load, Value advance) {
+Value EmitContext::latchReg(Value init, Value next, Value load, Value advance,
+                            RegRole role) {
   Backedge selfNext = bb.get(init.getType());
-  Value self = reg(selfNext, konst(init.getType(), 0));
+  Value self = reg(selfNext, konst(init.getType(), 0), role);
   selfNext.setValue(mux(load, init, mux(advance, next, self)));
   return self;
 }
@@ -277,17 +327,21 @@ Value EmitContext::oneHotSelect(ArrayRef<Value> values,
 }
 
 ShiftChain EmitContext::shiftChain(Value in, unsigned depth,
-                                   const StallShell &sh) {
+                                   const StallShell &sh, RegRole role) {
   ShiftChain chain;
   chain.stages.push_back(in); // stage 0 = the source (a depth-0 tap reads it)
   Value rz = konst(in.getType(), 0);
   Value cur = in;
-  for (unsigned s = 1; s <= depth; ++s) {
-    // An elastic shell advances every stage only while enabled, so all taps
-    // freeze together; a rigid shell is a plain unconditional shift.
-    cur = sh ? enabledReg(cur, sh.chainEnable, rz) : reg(cur, rz);
-    chain.stages.push_back(cur);
+  {
+    llvm::SaveAndRestore charged(inChainRun, true);
+    for (unsigned s = 1; s <= depth; ++s) {
+      // An elastic shell advances every stage only while enabled, so all taps
+      // freeze together; a rigid shell is a plain unconditional shift.
+      cur = sh ? enabledReg(cur, sh.chainEnable, rz) : reg(cur, rz);
+      chain.stages.push_back(cur);
+    }
   }
+  ledger.add(role, hwWidth(in.getType()), depth);
   return chain;
 }
 
@@ -302,10 +356,17 @@ ShiftChain EmitContext::foldedChain(Value in, unsigned depth, unsigned ii,
   Value rz = konst(in.getType(), 0);
   llvm::SmallVector<Value> held;
   Value cur = in;
-  for (unsigned j = 0, n = (depth + ii - 1) / ii; j < n; ++j) {
-    cur = enabledReg(cur, ce, rz);
-    held.push_back(cur);
+  unsigned n = (depth + ii - 1) / ii;
+  {
+    llvm::SaveAndRestore charged(inChainRun, true);
+    for (unsigned j = 0; j < n; ++j) {
+      cur = enabledReg(cur, ce, rz);
+      held.push_back(cur);
+    }
   }
+  // The run is the registers BUILT, not the cycles spanned: a fold holds the
+  // same `depth` taps in `n` of them.
+  ledger.add(RegRole::Value, hwWidth(in.getType()), n);
   ShiftChain chain;
   chain.stages.push_back(in); // stage 0 = the source, as in a plain chain
   for (unsigned k = 1; k <= depth; ++k)
@@ -328,10 +389,11 @@ Value EmitContext::delayPulseCounted(Value pulse, unsigned n,
   // does. Under an elastic shell it counts only while enabled.
   Backedge armedNext = bb.get(i1);
   Backedge countNext = bb.get(i32);
-  Value armed =
-      sh ? enabledReg(armedNext, sh.chainEnable, f1) : reg(armedNext, f1);
-  Value count = sh ? enabledReg(countNext, sh.chainEnable, zero32)
-                   : reg(countNext, zero32);
+  const RegRole role = RegRole::Counted;
+  Value armed = sh ? enabledReg(armedNext, sh.chainEnable, f1, role)
+                   : reg(armedNext, f1, role);
+  Value count = sh ? enabledReg(countNext, sh.chainEnable, zero32, role)
+                   : reg(countNext, zero32, role);
   Value fire = andBits(armed, icmpEq(count, n - 1));
   armedNext.setValue(mux(pulse, t1, mux(fire, f1, armed)));
   countNext.setValue(mux(
@@ -348,7 +410,7 @@ Value EmitContext::delayPulseCounted(Value pulse, unsigned n,
 Value EmitContext::delayValid(Value sig, unsigned n, const StallShell &sh) {
   if (n >= kCountedDelayCycles && regionSinglePass)
     return delayPulseCounted(sig, n, sh);
-  ShiftChain chain = shiftChain(sig, n, sh);
+  ShiftChain chain = shiftChain(sig, n, sh, RegRole::Pulse);
   // Label each stage with the cycle it is valid at, so a waveform reads
   // `r1_v3`: region 1, three cycles after issue.
   for (auto [k, stage] : llvm::enumerate(chain.stages))

@@ -206,7 +206,8 @@ unsigned HWEmitter::captureResults(const uarch::RegionBlock &rb,
     // result always lands: it powers on at 0.
     Value survivor =
         r.init ? ctx.latchReg(datapath.resolveSource(r.init), res, start, cap)
-               : ctx.enabledReg(res, cap, ctx.konst(res.getType(), 0));
+               : ctx.enabledReg(res, cap, ctx.konst(res.getType(), 0),
+                                RegRole::Survivor);
     nameValue(survivor, survivorName(rb.id, k));
     datapath.setSurvivor(rb.id, k, survivor);
     maxStage = std::max(maxStage, stage);
@@ -415,10 +416,12 @@ Value HWEmitter::emitGuard(const uarch::RegionBlock &rb, Value start) {
   for (auto [k, r] : llvm::enumerate(rb.results)) {
     Value tv = datapath.resolveSource(r.value);
     Value ev = datapath.resolveSource(r.elseValue);
-    Value thenSurv =
-        ctx.enabledReg(tv, thenDrained, ctx.konst(tv.getType(), 0));
-    Value elseSurv =
-        ctx.enabledReg(ev, elseDrained, ctx.konst(ev.getType(), 0));
+    Value thenSurv = ctx.enabledReg(tv, thenDrained,
+                                    ctx.konst(tv.getType(), 0),
+                                    RegRole::Survivor);
+    Value elseSurv = ctx.enabledReg(ev, elseDrained,
+                                    ctx.konst(ev.getType(), 0),
+                                    RegRole::Survivor);
     nameValue(thenSurv, survivorName(rb.id, k));
     nameValue(elseSurv, survivorName(rb.id, k));
     datapath.setSurvivor(rb.id, k, ctx.mux(cond, thenSurv, elseSurv));

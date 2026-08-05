@@ -27,11 +27,128 @@ enum class Level { Debug, Info, Warn, Error, Unsupported };
 // Compiler stage printed in the second bracket. Extend as new stages log.
 enum class Stage { Prep, Sched, Dcp, Emit };
 
+/// The REASON a compile is refused, and the only stable token a diagnostic
+/// carries: the wording of every message is free to change, so a caller that
+/// must recognize a refusal matches the code instead.
+///
+/// One code per reason, never per call site. Two sites that refuse for the same
+/// reason share one, and a code is retired rather than reused when its reason
+/// goes away. The `E` series is an illegal program and the `N` series a legal
+/// one this backend does not lower yet, so a code names its level too; only
+/// `error` and `unsupported` accept one, since a non-fatal line reports a
+/// decision that SUCCEEDED and that decision belongs in a report.
+enum class Code {
+  // Illegal input (`error`).
+  TopFunctionMissing,         // the named top function is not there
+  UnknownOption,              // an option value the backend does not offer
+  OperatorNotRealized,        // the device covers the op with nothing
+  DeviceDeclarationInvalid,   // a device row the backend cannot read
+  StallContractUnusable,      // an IP port contract that cannot drive it
+  ArrayLayoutConflict,        // one array, two layouts that disagree
+  StorageNotDeclared,         // no storage row for what the array needs
+  StorageTimingUnrealizable,  // a port latency no clock edge serves
+  SpawnInLoop,                // a dataflow process spawned per iteration
+  WhileForwardingNotIdentity, // carried values not forwarded 1:1
+  ChannelEndMissing,          // a stream channel is missing an end
+  DataflowCycleUnseeded,      // a feedback cycle with no initial tokens
+  RecursiveCallGraph,         // the call graph is cyclic
+  OperatorOverPeriod,         // one operator exceeds the clock period
+  DependenceInfeasible,       // no schedule satisfies the dependences
+  RegionShapeNotScheduled,    // no scheduling regime for this region
+  CompilerInconsistency,      // our own model disagrees with itself
+
+  // A backend gap (`unsupported`).
+  OperationNotModelled,        // this stage models no such operation
+  MemrefResult,                // an array returned, not written through
+  CrossRegionHandOff,          // a value the reading region cannot see
+  ScatteredArgumentToCallee,   // a scattered array crossing into a call
+  PartitionedViewArgument,     // a partitioned array passed as a view
+  PredicateNotCombinational,   // a control predicate we cannot test
+  ContainerWithDatapath,       // a dataflow container with loose compute
+  ChannelMultiProducer,        // several writers on one channel
+  StreamArgumentBidirectional, // a stream argument read and written
+  AddressOverPeriod,           // an address cone we cannot register
+  BindingMuxOverPeriod,        // a mux over the slack the schedule left
+  SharedReductionUnit,         // a reduction sharing its unit
+  PlacementFailed,             // no feasible cycle for an operation
+  NoExactScheduler,            // this build has no OR-Tools
+};
+
+/// The one table: a code's stable spelling.
+constexpr const char *codeTag(Code code) {
+  switch (code) {
+  case Code::TopFunctionMissing:
+    return "ALLO-E0001";
+  case Code::UnknownOption:
+    return "ALLO-E0002";
+  case Code::OperatorNotRealized:
+    return "ALLO-E0003";
+  case Code::DeviceDeclarationInvalid:
+    return "ALLO-E0004";
+  case Code::StallContractUnusable:
+    return "ALLO-E0005";
+  case Code::ArrayLayoutConflict:
+    return "ALLO-E0006";
+  case Code::StorageNotDeclared:
+    return "ALLO-E0007";
+  case Code::StorageTimingUnrealizable:
+    return "ALLO-E0008";
+  case Code::SpawnInLoop:
+    return "ALLO-E0009";
+  case Code::WhileForwardingNotIdentity:
+    return "ALLO-E0010";
+  case Code::ChannelEndMissing:
+    return "ALLO-E0011";
+  case Code::DataflowCycleUnseeded:
+    return "ALLO-E0012";
+  case Code::RecursiveCallGraph:
+    return "ALLO-E0013";
+  case Code::OperatorOverPeriod:
+    return "ALLO-E0014";
+  case Code::DependenceInfeasible:
+    return "ALLO-E0015";
+  case Code::RegionShapeNotScheduled:
+    return "ALLO-E0016";
+  case Code::CompilerInconsistency:
+    return "ALLO-E0017";
+  case Code::OperationNotModelled:
+    return "ALLO-N0001";
+  case Code::MemrefResult:
+    return "ALLO-N0002";
+  case Code::CrossRegionHandOff:
+    return "ALLO-N0003";
+  case Code::ScatteredArgumentToCallee:
+    return "ALLO-N0004";
+  case Code::PartitionedViewArgument:
+    return "ALLO-N0005";
+  case Code::PredicateNotCombinational:
+    return "ALLO-N0006";
+  case Code::ContainerWithDatapath:
+    return "ALLO-N0007";
+  case Code::ChannelMultiProducer:
+    return "ALLO-N0008";
+  case Code::StreamArgumentBidirectional:
+    return "ALLO-N0009";
+  case Code::AddressOverPeriod:
+    return "ALLO-N0010";
+  case Code::BindingMuxOverPeriod:
+    return "ALLO-N0011";
+  case Code::SharedReductionUnit:
+    return "ALLO-N0012";
+  case Code::PlacementFailed:
+    return "ALLO-N0013";
+  case Code::NoExactScheduler:
+    return "ALLO-N0014";
+  }
+  return "";
+}
+
 namespace detail {
-// Format `LEVEL: [STAGE] message[ (at where)]` and route to the backend. A
-// fatal level with a non-null `subject` additionally emits an MLIR error
-// diagnostic on it, so the message both logs and fails the pass.
-void emit(Level level, Stage stage, llvm::StringRef where,
+// Format `LEVEL[CODE]: [STAGE] message[ (at where)]` and route to the backend
+// (`code` is empty on a non-fatal line, which carries none). A fatal level with
+// a non-null `subject` additionally emits an MLIR error diagnostic on it,
+// carrying the code, so the message both logs and fails the pass.
+void emit(Level level, Stage stage, llvm::StringRef code, llvm::StringRef where,
           llvm::StringRef message, mlir::Operation *subject);
 // Whether `level` passes the threshold (skip building dropped lines). A fatal
 // level is never filtered.
@@ -46,14 +163,14 @@ std::string describe(const mlir::Location &loc, bool withFile = true);
 // elision, so no move or copy constructor is needed.
 class Diagnostic {
 public:
-  Diagnostic(Level level, Stage stage, std::string where,
+  Diagnostic(Level level, Stage stage, const char *code, std::string where,
              mlir::Operation *subject)
-      : level(level), stage(stage), active(detail::enabled(level)),
+      : level(level), stage(stage), active(detail::enabled(level)), code(code),
         subject(subject), where(std::move(where)), stream(message) {}
   ~Diagnostic() {
     if (active) {
       stream.flush();
-      detail::emit(level, stage, where, message, subject);
+      detail::emit(level, stage, code ? code : "", where, message, subject);
     }
   }
 
@@ -70,6 +187,7 @@ private:
   Level level;
   Stage stage;
   bool active;
+  const char *code;
   mlir::Operation *subject;
   std::string where;
   std::string message;
@@ -77,15 +195,16 @@ private:
 };
 
 // Factories. The op/location overloads render a source anchor (a null op omits
-// it). Pass the subject op at a fatal site so the failure propagates.
+// it). `log` builds the non-fatal levels, which carry no code; a fatal one goes
+// through `error` / `unsupported` below, which demand one.
 inline Diagnostic log(Level level, Stage stage) {
-  return Diagnostic(level, stage, std::string(), nullptr);
+  return Diagnostic(level, stage, nullptr, std::string(), nullptr);
 }
 inline Diagnostic log(Level level, Stage stage, mlir::Operation *subject) {
-  return Diagnostic(level, stage, detail::describe(subject), subject);
+  return Diagnostic(level, stage, nullptr, detail::describe(subject), subject);
 }
 inline Diagnostic log(Level level, Stage stage, const mlir::Location &loc) {
-  return Diagnostic(level, stage, detail::describe(loc), nullptr);
+  return Diagnostic(level, stage, nullptr, detail::describe(loc), nullptr);
 }
 
 inline Diagnostic debug(Stage stage, mlir::Operation *op = nullptr) {
@@ -97,13 +216,18 @@ inline Diagnostic info(Stage stage, mlir::Operation *op = nullptr) {
 inline Diagnostic warn(Stage stage, mlir::Operation *op = nullptr) {
   return log(Level::Warn, stage, op);
 }
-inline Diagnostic error(Stage stage, mlir::Operation *op = nullptr) {
-  return log(Level::Error, stage, op);
+// An illegal program: fatal, and `code` names the reason it is refused. Pass
+// the subject op so the failure propagates to the caller.
+inline Diagnostic error(Stage stage, Code code, mlir::Operation *op = nullptr) {
+  return Diagnostic(Level::Error, stage, codeTag(code), detail::describe(op),
+                    op);
 }
 // A legal program this backend does not lower yet: fatal like `error`, tagged
 // `NYI`, with a message naming the missing compiler feature.
-inline Diagnostic unsupported(Stage stage, mlir::Operation *op = nullptr) {
-  return log(Level::Unsupported, stage, op);
+inline Diagnostic unsupported(Stage stage, Code code,
+                              mlir::Operation *op = nullptr) {
+  return Diagnostic(Level::Unsupported, stage, codeTag(code),
+                    detail::describe(op), op);
 }
 
 // Runtime configuration (the threshold is also seeded from the ALLO_LOG_LEVEL

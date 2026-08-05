@@ -248,7 +248,8 @@ private:
   void annotateStarts(circt::scheduling::ChainingProblem &problem);
   void annotateAllocation(OccupancyProblem &problem);
   void recordSolve(OccupancyProblem &problem, StringRef kind,
-                   std::optional<unsigned> ii, Stopwatch since);
+                   std::optional<unsigned> ii, Stopwatch since,
+                   std::optional<CarriedEdges> carried = std::nullopt);
 
   // The second walk: the solved tree composed into one kernel span.
   std::optional<SpanNode> buildSpanNode(const SchedRegion &region);
@@ -329,7 +330,8 @@ static int64_t pipelineDirective(Operation *loop, Operation *anchor) {
 // \p ii is what the solve decided, which for a non-pipelined loop is not the
 // interval the region is reported to run at (that is `annotateRegion`'s).
 void FuncScheduler::recordSolve(OccupancyProblem &problem, StringRef kind,
-                                std::optional<unsigned> ii, Stopwatch since) {
+                                std::optional<unsigned> ii, Stopwatch since,
+                                std::optional<CarriedEdges> carried) {
   SolveReport s;
   Operation *containing = problem.getContainingOp();
   if (auto fn = containing->getParentOfType<func::FuncOp>())
@@ -349,7 +351,8 @@ void FuncScheduler::recordSolve(OccupancyProblem &problem, StringRef kind,
       s.allocatedOps += problem.getAllocatable(rsrc)->ceiling;
     }
   if (ii)
-    s.ii = (int64_t)*ii;
+    s.interval = (int64_t)*ii;
+  s.carried = carried;
   s.millis = std::chrono::duration<double, std::milli>(now() - since).count();
   model.solves.push_back(std::move(s));
 }
@@ -362,10 +365,11 @@ void FuncScheduler::recordSolve(OccupancyProblem &problem, StringRef kind,
 LogicalResult FuncScheduler::scheduleCyclic(LoopLikeOpInterface body,
                                             const SchedRegion &region,
                                             unsigned minII, bool pipelined) {
-  auto problem = buildCyclicProblem<ChainingModuloProblem>(body, deps);
+  CarriedEdges carried;
+  auto problem = buildCyclicProblem<ChainingModuloProblem>(body, deps, carried);
   Block *bodyBlock = &body.getLoopRegions().front()->front();
   populateOperatorTypes(problem, lib);
-  reportOperatorClassSplit(problem, lib);
+  recordOperatorClasses(problem, lib, model);
   // What contends, then how many of it to build: an occupancy window is a
   // physical property of the region and holds however the units are allocated.
   populateMemoryResources(problem, lib.memoryLibrary());
@@ -389,7 +393,7 @@ LogicalResult FuncScheduler::scheduleCyclic(LoopLikeOpInterface body,
     return failure();
   std::optional<unsigned> solvedII = problem.getInitiationInterval();
   assert(solvedII && "a modulo problem that solved carries an interval");
-  recordSolve(problem, "cyclic", solvedII, solveStart);
+  recordSolve(problem, "cyclic", solvedII, solveStart, carried);
   int64_t depth = problem.scheduleDepth();
   // Iterations that do not overlap issue one body length apart, which is the
   // interval the region RUNS at whatever the solve settled on.
@@ -454,9 +458,10 @@ LogicalResult FuncScheduler::scheduleCyclic(LoopLikeOpInterface body,
 // count is data-dependent, so no latency is reported.
 LogicalResult FuncScheduler::scheduleWhile(scf::WhileOp w,
                                            const SchedRegion &region) {
-  auto problem = buildWhileProblem<ChainingModuloProblem>(w, deps);
+  CarriedEdges carried;
+  auto problem = buildWhileProblem<ChainingModuloProblem>(w, deps, carried);
   populateOperatorTypes(problem, lib);
-  reportOperatorClassSplit(problem, lib);
+  recordOperatorClasses(problem, lib, model);
   populateMemoryResources(problem, lib.memoryLibrary());
   // A flushing while issues an iteration per II like any pipeline, so a
   // non-pipelined operator bounds its interval the same way, and its operators
@@ -482,7 +487,7 @@ LogicalResult FuncScheduler::scheduleWhile(scf::WhileOp w,
     return failure();
   std::optional<unsigned> ii = problem.getInitiationInterval();
   assert(ii && "a modulo problem that solved carries an interval");
-  recordSolve(problem, "while", ii, solveStart);
+  recordSolve(problem, "while", ii, solveStart, carried);
   info(Stage::Sched, w.getOperation())
       << "  -> While loop scheduled as a flushing pipeline: II=" << *ii
       << " (trip is data-dependent, so whole-loop latency is unknown)";
@@ -519,7 +524,7 @@ static FailureOr<SmallVector<Operation *>> conditionCone(scf::WhileOp w) {
       continue;
     if (!isa<AffineLoadOp, memref::LoadOp>(def) &&
         !isa<arith::ArithDialect>(def->getDialect())) {
-      unsupported(Stage::Sched, def)
+      unsupported(Stage::Sched, Code::PredicateNotCombinational, def)
           << "The continue-condition of this while reads '"
           << def->getName().getStringRef()
           << "', which the sequential CHECK region cannot evaluate; it emits "
@@ -571,7 +576,7 @@ LogicalResult FuncScheduler::scheduleAcyclic(ArrayRef<Operation *> ops,
   ChainingSharedOperatorsProblem problem =
       buildAcyclicProblem<ChainingSharedOperatorsProblem>(ops, deps);
   populateOperatorTypes(problem, lib);
-  reportOperatorClassSplit(problem, lib);
+  recordOperatorClasses(problem, lib, model);
   populateMemoryResources(problem, lib.memoryLibrary());
   if (opts.allocate)
     populateOperatorAllocation(problem, lib);
@@ -768,12 +773,16 @@ LogicalResult FuncScheduler::scheduleRegion(const SchedRegion &region) {
       // Fusing the level over its inner loops into one modulo problem is not
       // implemented: the container sequences its children and runs no schedule
       // of its own.
-      if (dir >= 1)
+      if (dir >= 1) {
+        model.unhonored.push_back({"pipeline",
+                                   logging::detail::describe(innermost.getLoc()),
+                                   "imperfect_nest"});
         warn(Stage::Sched, innermost.getOperation())
             << "A pipeline directive on an imperfect nest is not honored yet; "
                "scheduling its body as sequential sub-regions. Leave "
                "`unroll_under_pipeline` at its default, which unrolls the "
                "inner loops into the pipelined level instead";
+      }
       info(Stage::Sched, innermost.getOperation())
           << "Detected imperfect nest, decomposing into sub-regions "
              "scheduled in program order.";
@@ -832,7 +841,8 @@ LogicalResult FuncScheduler::scheduleRegion(const SchedRegion &region) {
           return failure();
     return success();
   }
-  error(Stage::Sched, region.anchor()) << "Loop not scheduled";
+  error(Stage::Sched, Code::RegionShapeNotScheduled, region.anchor())
+      << "Loop not scheduled";
   return failure();
 }
 
@@ -914,7 +924,7 @@ LogicalResult mlir::allo::runSDCScheduler(ModuleOp module, StringRef top,
   // Fail before any work when the exact scheduler was asked for and this build
   // has none, rather than region by region: the fix is to the build.
   if (usesExactScheduler(opts.kind) && !hasExactScheduler()) {
-    unsupported(Stage::Sched, module)
+    unsupported(Stage::Sched, Code::NoExactScheduler, module)
         << "An exact scheduler was requested but this build was configured "
            "without OR-Tools. Rebuild with -DALLO_ENABLE_ORTOOLS=ON, or use "
            "the default scheduler=\"heuristic\"";
@@ -929,7 +939,8 @@ LogicalResult mlir::allo::runSDCScheduler(ModuleOp module, StringRef top,
   // call is indeterminate, which reads the callee's published latency.
   auto topFunc = module.lookupSymbol<func::FuncOp>(top);
   if (!topFunc) {
-    error(Stage::Prep, module) << "Top function '" << top << "' not found";
+    error(Stage::Prep, Code::TopFunctionMissing, module)
+        << "Top function '" << top << "' not found";
     return failure();
   }
   auto orderOr = callGraphPostOrder(topFunc);

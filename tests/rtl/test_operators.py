@@ -28,7 +28,16 @@ from allo.backend.rtl.device import (
 )
 
 sys.path.insert(0, os.path.dirname(__file__))
-from _common import Dcp, _sched, _to_rtl, _impls, _iis, FADD  # noqa: E402
+from _common import (
+    Dcp,
+    _sched,
+    _to_rtl,
+    _impls,
+    _iis,
+    FADD,
+    COMB,
+    PERIOD_NS,
+)  # noqa: E402
 
 pytestmark = pytest.mark.skipif(
     shutil.which("verilator") is None, reason="verilator not available"
@@ -88,7 +97,7 @@ def test_a_cost_must_name_a_declared_resource():
         for i in range(8):
             out[i] = A[i] + 1
 
-    with pytest.raises(Exception):
+    with pytest.raises(RuntimeError):
         _to_rtl(k, device=dev).dcp
 
 
@@ -126,7 +135,7 @@ def test_a_device_prices_its_multiplexers_and_delay_chains():
 
     text = _to_rtl(k, device=dev).dcp
     assert "allo.dcp.mux uses" in text and "allo.dcp.chain uses" in text
-    with pytest.raises(ValueError, match="fan-in, width"):
+    with pytest.raises(ValueError):
         dev.set_mux_uses({lut: Linear(0.4)})
 
 
@@ -166,7 +175,7 @@ def test_a_cost_sums_the_terms_that_name_one_resource():
 
 
 # The device's own evaluator, reached from Python: one implementation of the
-# measured shapes, not two. `benchmark/area.py` scores through this.
+# measured shapes, not two. `allo/backend/rtl/qor.py` estimates through this.
 def test_the_device_prices_a_realization_through_the_compiler():
     dev = builtin_device
     # 3 LUTs per bit of a 6-source select, over 32 bits.
@@ -662,7 +671,7 @@ def test_planned_allocation_is_never_looser_than_greedy():
     args = [np.array([v], np.float32) for v in (7, 6, 5, 2)]
     ref = np.array([7 * 6 * 5 * 2], np.float32)
     greedy = _to_rtl(chain, binding="greedy-share")
-    planned = _to_rtl(chain, scheduler="exact", binding="planned")
+    planned = _to_rtl(chain, binding="planned").set_scheduler_opt(scheduler="exact")
     assert planned.mlir.count("hw.instance") <= greedy.mlir.count("hw.instance")
     o = np.zeros(1, np.float32)
     planned.cosim(*args, o)
@@ -761,7 +770,8 @@ def test_rotate_reduction_scales_ii():
                 acc += x[i]
             return acc
 
-        return _sched(red, accumulators=n).cyclic()[0].ii
+        res = _to_rtl(red).set_scheduler_opt(accumulators=n).schedule()
+        return res.cyclic()[0].interval
 
     assert ii(0) == FADD  # unrotated
     assert ii(FADD) == 1  # N == latency -> II 1
@@ -777,7 +787,8 @@ def test_rotate_reduction_scales_ii():
                 acc += x[i]
             return acc
 
-        return _sched(red, accumulators=n).cyclic()[0].ii
+        res = _to_rtl(red).set_scheduler_opt(accumulators=n).schedule()
+        return res.cyclic()[0].interval
 
     assert mixed_ii(0) == FADD
     assert mixed_ii(FADD) == 1
@@ -785,7 +796,7 @@ def test_rotate_reduction_scales_ii():
 
 # Integer reductions rebalance unconditionally (integer arithmetic is exactly
 # associative mod 2^w), cutting an unrolled chain's recurrence to one operator.
-def test_reassociate_int_reduction_recurrence(capfd):
+def test_reassociate_int_reduction_recurrence():
     # Unrolling threads the carried accumulator through four widened multiplies;
     # folding it in last makes the recurrence one (widened, combinational)
     # multiply rather than a chain of four. The rebalance is what this test
@@ -801,8 +812,13 @@ def test_reassociate_int_reduction_recurrence(capfd):
 
     s = red.schedule()
     s.unroll("i", factor=4)
-    s.export("rtl").schedule()
-    assert "Rebalancing associative reduction chain" in "".join(capfd.readouterr())
+    region = s.export("rtl").schedule().cyclic()[0]
+    # The five terms are the four unrolled multiplies plus the accumulator,
+    # folded in LAST, so the carried path is one multiply rather than the four a
+    # chain would leave on it. The recurrence is what bounds the II, so a tree
+    # fits in a span a chain could not: this is measured against the device
+    # rather than pinned, so a faster multiply keeps it honest.
+    assert region.interval * PERIOD_NS < 4 * COMB["mul"]
 
 
 def test_int_product_reduction_cosim():

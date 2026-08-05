@@ -238,7 +238,7 @@ static bool dfs(Operation *op,
     return true;
   if (!onStack.insert(op).second) {
     auto *it = llvm::find(path, op);
-    auto &diag = error(Stage::Prep, op)
+    auto &diag = error(Stage::Prep, Code::RecursiveCallGraph, op)
                  << "Invalid cyclic call graph detected:";
     for (Operation *p : llvm::make_range(it, path.end()))
       diag << "\n  -> " << p->getLoc();

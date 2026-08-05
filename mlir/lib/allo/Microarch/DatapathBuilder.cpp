@@ -490,7 +490,7 @@ void DatapathBuilder::bindResource(Operation *op, RegionBlock &rb) {
           StreamCreateOp>(op))
     return;
 
-  unsupported(Stage::Emit, op)
+  unsupported(Stage::Emit, Code::OperationNotModelled, op)
       << "Operation '" << op->getName()
       << "' is not modelled by the datapath, so it would be dropped from the "
          "emitted hardware";
@@ -781,7 +781,7 @@ void DatapathBuilder::recordRegionBounds(ArrayRef<Operation *> regionOps) {
       return;
     into = resolveValue(b);
     if (!into) {
-      unsupported(Stage::Emit, pipe)
+      unsupported(Stage::Emit, Code::CrossRegionHandOff, pipe)
           << "Loop bound is produced by a value this region cannot read; such "
              "a cross-region value hand-off is not lowered yet";
       dp.infeasible = true;
@@ -861,7 +861,7 @@ Resolved DatapathBuilder::resolveOperand(Value v, Operation *consumer,
     if (depth < 0) {
       assert(false && "the scheduler placed a consumer before its operand is "
                       "ready; the register depth would wrap");
-      error(Stage::Emit, consumer)
+      error(Stage::Emit, Code::CompilerInconsistency, consumer)
           << "Infeasible schedule; the operand is not ready until cycle "
           << (static_cast<int64_t>(ready) - static_cast<int64_t>(distance) * ii)
           << " but its consumer is scheduled at cycle " << tY
@@ -897,7 +897,7 @@ Resolved DatapathBuilder::resolveOperand(Value v, Operation *consumer,
       // An unresolvable init leaves the accumulator to free-run from reset.
       // Only this site knows an init was expected; None is normal elsewhere.
       if (!r.init) {
-        unsupported(Stage::Emit, def)
+        unsupported(Stage::Emit, Code::CrossRegionHandOff, def)
             << "Loop-carried accumulator has an initial value this region "
                "cannot read; such a cross-region value hand-off is not "
                "lowered yet";
@@ -1063,7 +1063,7 @@ void DatapathBuilder::resolveUnitInputs() {
         // A shared unit reaches its input through the mux below, leaving
         // nowhere to time the reduction identity's re-injection against.
         if (r.init.kind != Source::Kind::None) {
-          unsupported(Stage::Emit, opj)
+          unsupported(Stage::Emit, Code::SharedReductionUnit, opj)
               << "Binding policy shares one operator unit between a "
                  "loop-carried reduction and another op; re-injecting the "
                  "reduction identity through the shared input mux is not "
@@ -1343,7 +1343,7 @@ void DatapathBuilder::resolveAccessOperands() {
         // turn a masked get/put into an every-cycle one.
         auto pr = resolveOperand(pred, acc.op, ii);
         if (!pr.ok) {
-          unsupported(Stage::Emit, acc.op)
+          unsupported(Stage::Emit, Code::CrossRegionHandOff, acc.op)
               << "Predicate of this stream access is produced by a value the "
                  "region cannot read; such a cross-region value hand-off is "
                  "not lowered yet, and the access would otherwise fire "

@@ -24,15 +24,12 @@ What it reports, and why each number rather than a neighbouring one:
                  because a span composes off `drain` and the two differ by
                  whatever slack the solver left above the last commit, which is
                  a scheduling decision worth seeing.
-    reg bits     flip-flops in the emitted Verilog, split into the pulse chains
-                 (`r<region>_v<k>`), the value delay chains (`<value>_d<k>`) and
-                 everything else. Bits, not registers: a narrower counter is
-                 fewer bits on the same declaration line, so counting lines or
-                 declarations hides the one axis a schedule can move. Per
-                 VARIANT and not per region, because only a pulse chain's name
-                 carries the region it belongs to; a value chain's does not, and
-                 a split that is right for one role and guessed for the other
-                 would read as a per-region number without being one.
+    reg bits     flip-flops the design holds, split into the activation pulse
+                 chains, the value delay chains and everything else. A COUNT off
+                 the emitter's own ledger, and the split is the role each
+                 register was BUILT for rather than a guess from its name. Bits,
+                 not registers: a narrower counter is fewer bits on the same
+                 declaration, which is the one axis a schedule can move.
     solve ms     wall time of each region's solve, from the scheduler itself.
                  Per REGION, because a whole-compile figure cannot tell a model
                  change that cost 2 ms everywhere from one that cost 4 s once.
@@ -57,61 +54,103 @@ import re
 import subprocess
 import sys
 import time
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-
-from benchmark import area
 
 REPO = Path(__file__).resolve().parents[1]
 MARK = "@@QOR@@"
 
-# --- register accounting -----------------------------------------------------
-
-# CIRCT's ExportVerilog emits one `reg` declaration per `seq.compreg`, with an
-# explicit range for anything wider than a bit and a trailing dimension for a
-# memory. Matching the declaration rather than the `always_ff` block is what
-# gives the WIDTH, which is the number that matters.
-_REG_DECL = re.compile(
-    r"^[ \t]*reg[ \t]+(?:\[[ \t]*(\d+)[ \t]*:[ \t]*(\d+)[ \t]*\][ \t]+)?"
-    r"(\S+?)[ \t]*(\[[^\]]*\])?[ \t]*;",
-    re.M,
-)
-_ALWAYS_FF = re.compile(r"^[ \t]*always_ff[ \t]*@\(posedge", re.M)
-# A region's activation-pulse chain, and a value's delay chain. Both may carry a
-# uniquifying suffix, which CIRCT appends when two names collide.
-_PULSE_REG = re.compile(r"^r\d+_v\d+(_\d+)?$")
-_DELAY_REG = re.compile(r"_d\d+(_\d+)?$")
+# --- what the emitter built --------------------------------------------------
 
 
-def count_registers(verilog: str) -> dict:
-    """Flip-flops in `verilog`, split by the role their name states.
+def registers(microarch) -> dict:
+    """Flip-flops the design holds, split by the role they were BUILT for.
 
-    `parse_ok` is the parser holding itself to the design: every `reg`
-    declaration is driven by one `always_ff`, so a count that disagrees means
-    this regex missed a declaration form and the numbers below are not to be
-    trusted rather than quietly low."""
-    total = delay = pulse = mem = 0
-    n_regs = n_mem = 0
-    for hi, lo, name, dims in _REG_DECL.findall(verilog):
-        width = int(hi) - int(lo) + 1 if hi else 1
-        if dims:  # `reg [31:0] cell[0:63]`: storage, not a schedule register
-            mem += width
-            n_mem += 1
-            continue
-        total += width
-        n_regs += 1
-        if _PULSE_REG.match(name):
-            pulse += width
-        elif _DELAY_REG.search(name):
-            delay += width
+    A count and not a reading: every register passes one line of the emitter,
+    which charges the ledger this reads. Bits, not registers: a narrower counter
+    is fewer bits on the same declaration, which is the one axis a schedule can
+    move."""
+    by_role = Counter()
+    runs = 0
+    for f in microarch.funcs:
+        runs += sum(c.count for c in f.regs)
+        for role, bits in f.reg_bits_by_role().items():
+            by_role[role.value] += bits
     return {
-        "reg_bits": total,
-        "reg_count": n_regs,
-        "pulse_bits": pulse,
-        "delay_bits": delay,
-        "mem_bits": mem,
-        "mem_count": n_mem,
-        "parse_ok": n_regs + n_mem == len(_ALWAYS_FF.findall(verilog)),
+        "reg_bits": microarch.reg_bits,
+        "reg_runs": runs,
+        "pulse_bits": by_role["pulse"] + by_role["counted"],
+        "delay_bits": by_role["value"],
+        "reg_bits_by_role": dict(by_role),
+    }
+
+
+def allocation(microarch) -> list[dict]:
+    """Per region, what the binding cost: the operations it bound, the units it
+    built for them, and the interconnect sharing grew."""
+    return [
+        {
+            "func": f.func,
+            "order": r.order,
+            "ops": r.compute_ops,
+            "units": len(r.units),
+            "ip": len([u for u in r.units if not u.comb]),
+            "muxes": sum(m.count for m in r.muxes),
+            "mux_inputs": r.cost.mux_inputs,
+            "mux_bits": r.cost.mux_bits,
+        }
+        for f in microarch.funcs
+        for r in f.regions
+    ]
+
+
+def memories(microarch) -> list[dict]:
+    """Per array, the ports it was given and where they came from. A second
+    write port defeats RAM inference unless the schedule proved the two never
+    collide, so writers spread over regions are paying for a concurrency that
+    region ordering rules out."""
+    return [
+        {
+            "func": f.func,
+            "owner": m.owner,
+            "depth": m.depth_words,
+            "width": m.width,
+            "banks": m.banks,
+            "writes": m.writes,
+            "from_calls": m.cost.call_writes,
+            "regions": m.cost.writing_regions,
+            "needs": m.cost.ports_needed_write,
+            "needs_total": m.cost.ports_needed_total,
+            "external": m.external,
+        }
+        for f in microarch.funcs
+        for m in f.mems
+    ]
+
+
+def area_of(q) -> dict:
+    """One QoR estimate as a JSON row, split by what spends each resource."""
+    lut = {k: u.lut for k, u in q.by_kind.items()}
+    return {
+        "lut": q.area.lut,
+        "srl": q.area.srl,
+        "ff": q.area.ff,
+        "dsp": q.area.dsp,
+        "carry8": q.area.carry8,
+        "unit_lut": lut.get("units", 0),
+        "mux_lut": lut.get("muxes", 0),
+        "reg_lut": lut.get("regs", 0),
+        "mem_lut": lut.get("memories", 0),
+        "control_lut": lut.get("control", 0),
+        "reg_ff": sum(u.ff for k, u in q.by_kind.items() if k == "regs"),
+        # What the design DECLARES, which is also what the scheduling objective
+        # charges for the same registers.
+        "reg_bits": q.reg_bits,
+        "mem_bits": q.mem_bits,
+        "regfile_arrays": q.regfile_arrays,
+        "unmodelled": q.unmodelled,
+        "counted": sorted(q.counted),
     }
 
 
@@ -128,37 +167,11 @@ _II_GAP = re.compile(r"Scheduled at II=(\d+) against a lower bound of II=(\d+)")
 # that no bound relates to the heuristic's, so it is the one way the exact path
 # can come back worse than the default one.
 _BUDGET = re.compile(r"ran out of budget")
-# Per cyclic region, how many of its loop-carried memory edges hold a distance
-# the polyhedral test PROVED versus one it assumed, and how many `memref`
-# accesses were raised into the test's reach on the way. Both need
-# ALLO_LOG_LEVEL=info and are absent otherwise; they price what a dependence
-# hint, or a better raise, could still recover.
-_CARRIED = re.compile(
-    r"Carried memory dependences: (\d+) total, (\d+) non-affine, "
-    r"(\d+) unknown-distance"
-)
+# How many `memref` accesses were raised into the dependence test's reach. Needs
+# ALLO_LOG_LEVEL=info and is absent otherwise; it prices what a better raise
+# could still recover. Its sibling, the carried-edge census, is a report field
+# (`SolveReport.carried_edges`) and no longer read from the log.
 _RAISED = re.compile(r"Raised (\d+) loop\(s\) and (\d+) further memref access")
-# Per region, what the allocation cost: compute ops, the units they were bound
-# to, and the interconnect sharing grew.
-_ALLOC = re.compile(
-    r"Allocation: (\d+) compute ops on (\d+) units \((\d+) IP\), "
-    r"(\d+) muxes, (\d+) mux inputs, (\d+) 2:1 mux bits"
-)
-# Per array, the write ports it was given and how many REGIONS they came from.
-# A second write port defeats RAM inference, so writers spread over regions are
-# paying for a concurrency that region ordering rules out.
-_MEMPORTS = re.compile(
-    r"Memory: (\d+) write ports \((\d+) from calls\) on (\d+)x(\d+) bits "
-    r"over (\d+) regions, needs (\d+) write (\d+) total, (\w+)"
-)
-# Per region, the operator types whose timing row covers several operator
-# identities. A binder folds only within one identity, so a limit keyed on the
-# type over-approximates the hardware it can build.
-_SPLIT = re.compile(
-    r"Operator classes: \d+ of \d+ operator types cover several operator "
-    r"identities:(.*)"
-)
-_SPLIT_ONE = re.compile(r"(\S+) (\d+) ops / (\d+) classes")
 
 
 def _load(key):
@@ -205,12 +218,13 @@ def measure_one(
         sched = bench.schedules[variant](parts)
 
         out["stage"] = "schedule"
-        opts = {"scheduler": scheduler, "binding": binding}
+        opts = {"binding": binding}
         if freq is not None:
             opts["freq_mhz"] = freq
+        knobs = {"scheduler": scheduler}
         if budget is not None:
-            opts["budget"] = budget
-        rtl = sched.export("rtl", **opts)
+            knobs["budget"] = budget
+        rtl = sched.export("rtl", **opts).set_scheduler_opt(**knobs)
         t1 = time.time()
         res = rtl.schedule()
         out["schedule_s"] = round(time.time() - t1, 2)
@@ -228,10 +242,10 @@ def measure_one(
                 "nesting": r.depth,
                 "kind": str(r.kind.value),
                 "container": r.container,
-                "ii": r.ii,
-                "length": r.length,
-                "drain": r.drain,
-                "trip": r.trip,
+                "ii": r.interval,
+                "length": r.iteration_latency,
+                "drain": r.cost.drain,
+                "trip": r.trip_count,
                 "latency": r.latency,
                 "ops": len(r.ops),
             }
@@ -247,24 +261,44 @@ def measure_one(
                 "limited_ops": s.limited_ops,
                 "allocated_ops": s.allocated_ops,
                 "allocated_units": s.allocated_units,
-                "ii": s.ii,
+                "ii": s.interval,
                 "ms": round(s.ms, 2),
             }
-            for s in res.solves
+            for s in res.compiler.solves
         ]
-        out["solve_ms"] = round(sum(s.ms for s in res.solves), 1)
-        out["solve_ms_max"] = round(max((s.ms for s in res.solves), default=0.0), 1)
-        out["ops_max"] = max((s.ops for s in res.solves), default=0)
+        # Report fields now, not log lines: both used to be scraped out of
+        # `ALLO_LOG_LEVEL=info` output and are unconditional here.
+        out["carried_deps"] = [
+            [c.total, c.non_affine, c.unknown]
+            for s in res.compiler.solves
+            if (c := s.carried_edges)
+        ]
+        out["class_splits"] = [
+            {"type": c.type, "ops": c.ops, "classes": c.identities}
+            for c in res.compiler.coarse_pricing
+        ]
+        out["solve_ms"] = round(sum(s.ms for s in res.compiler.solves), 1)
+        out["solve_ms_max"] = round(
+            max((s.ms for s in res.compiler.solves), default=0.0), 1
+        )
+        out["ops_max"] = max((s.ops for s in res.compiler.solves), default=0)
 
         if stage != "schedule":
             out["stage"] = "compile"
             t1 = time.time()
             rtl.compile()
             out["compile_s"] = round(time.time() - t1, 2)
-            # Before `rtl.verilog`, which lowers `seq` to `sv` IN PLACE: the
-            # scorer wants `seq.compreg` and the `comb` cones, not their SV
-            # expansion.
-            out["area"] = area.score(rtl.mlir)
+            # What the emitter BUILT, off its own report rather than off the
+            # emitted text: the register ledger, the per-region allocation, the
+            # storage each array was given, and what all of it prices at.
+            uarch = rtl.microarch
+            out["area"] = area_of(rtl.estimation)
+            out.update(registers(uarch))
+            out["alloc"] = allocation(uarch)
+            out["mem_ports"] = memories(uarch)
+            for f in ("ops", "units", "muxes", "mux_bits"):
+                out[f"alloc_{f}"] = sum(a[f] for a in out["alloc"])
+            out["ip_units"] = sum(a["ip"] for a in out["alloc"])
             verilog = rtl.verilog
             out["verilog_lines"] = verilog.count("\n")
             # The RTL itself, so a re-run can be checked for BYTE identity
@@ -272,14 +306,6 @@ def measure_one(
             # the emitted hardware, and two schedules can differ while every
             # figure below matches.
             out["verilog_sha"] = hashlib.sha256(verilog.encode()).hexdigest()[:16]
-            out.update(count_registers(verilog))
-            # The allocation as the emitted hardware states it: one
-            # `hw.instance` per IP operator, so a fold drops one. A
-            # combinational unit is an expression with no instance to count, so
-            # only its muxes show up here.
-            hw = rtl.mlir
-            out["hw_instances"] = hw.count("hw.instance")
-            out["comb_muxes"] = hw.count("comb.mux")
 
         out["status"] = "pass"
     except BaseException as e:  # a fired assert is a result, not a crash
@@ -342,33 +368,8 @@ def _run_child(
                 {"ii": int(a), "bound": int(b)} for a, b in _II_GAP.findall(text)
             ]
             d["budget_exhausted"] = len(_BUDGET.findall(text))
-            d["carried_deps"] = [
-                [int(x) for x in m] for m in _CARRIED.findall(text)
-            ]
             d["raised"] = [
                 sum(int(m[i]) for m in _RAISED.findall(text)) for i in (0, 1)
-            ]
-            # Both need ALLO_LOG_LEVEL=info and are absent at the default level.
-            d["alloc"] = [
-                dict(
-                    zip(("ops", "units", "ip", "muxes", "mux_inputs", "mux_bits"),
-                        (int(x) for x in m))
-                )
-                for m in _ALLOC.findall(text)
-            ]
-            if d["alloc"]:
-                for f in ("ops", "units", "muxes", "mux_bits"):
-                    d[f"alloc_{f}"] = sum(a[f] for a in d["alloc"])
-            d["mem_ports"] = [
-                {"writes": int(w), "from_calls": int(c), "depth": int(dp),
-                 "width": int(wd), "regions": int(rg), "needs": int(nd),
-                 "needs_total": int(nt), "external": ext == "external"}
-                for w, c, dp, wd, rg, nd, nt, ext in _MEMPORTS.findall(text)
-            ]
-            d["class_splits"] = [
-                {"type": t, "ops": int(n), "classes": int(c)}
-                for tail in _SPLIT.findall(text)
-                for t, n, c in _SPLIT_ONE.findall(tail)
             ]
             d["warnings"] = [l.strip()[:300] for l in text.splitlines() if "WARN" in l][
                 :20
@@ -421,7 +422,9 @@ def variant_table(results: list[dict], schedulers: list[str]) -> str:
     for r in results:
         by.setdefault(_key_of(r), {})[r["scheduler"]] = r
 
-    top = f"{'':<34}" + "".join(f"  {('[' + s + ']').center(_GROUP)}" for s in schedulers)
+    top = f"{'':<34}" + "".join(
+        f"  {('[' + s + ']').center(_GROUP)}" for s in schedulers
+    )
     head = f"{'benchmark/variant':<34}" + "".join(
         "  " + "".join(" " + label.rjust(w) for _, label, w in _COLS)
         for _ in schedulers
@@ -491,11 +494,10 @@ def alloc_table(results: list[dict]) -> str:
     what interconnect that took.
 
     `ops/unit` is the sharing ratio, 1.00 under the trivial binding. `muxFF` is
-    the 2:1-mux bit count that sharing cost. Needs ALLO_LOG_LEVEL=info; empty
-    otherwise."""
+    the 2:1-mux bit count that sharing cost."""
     rows = [r for r in results if r.get("alloc")]
     if not rows:
-        return "no allocation data (re-run with ALLO_LOG_LEVEL=info)"
+        return "no allocation data (needs --stage compile)"
     head = (
         f"{'benchmark/variant':<34} {'sched':<6} {'regions':>7} {'ops':>7}"
         f" {'units':>7} {'ops/unit':>9} {'muxes':>7} {'muxFF':>9} {'splits':>7}"
@@ -503,7 +505,7 @@ def alloc_table(results: list[dict]) -> str:
     lines = [head, "-" * len(head)]
     tot = dict.fromkeys(("ops", "units", "muxes", "mux_bits"), 0)
     for r in sorted(rows, key=lambda r: -r.get("alloc_mux_bits", 0)):
-        o, u = r["alloc_ops"], r["alloc_units"]
+        o, u = r["alloc_ops"], max(r["alloc_units"], 1)
         for f in tot:
             tot[f] += r[f"alloc_{f}"]
         lines.append(
@@ -521,25 +523,39 @@ def alloc_table(results: list[dict]) -> str:
 
 
 def area_table(results: list[dict]) -> str:
-    """Per variant, predicted area from the measured device tables.
+    """Per variant, what the emitted structures price at against the device.
 
-    `ipLUT`/`muxLUT`/`lgcLUT` split the LUT total by what spends it, which is
-    the split an allocation objective trades along: a fold removes IP and grows
-    mux. `SRL` is the delay chains, which is where the register term's cost
-    ACTUALLY lands; `regFF` beside `modFF` is what they cost against what the
-    objective charges for them. Memory is carried apart and never summed in."""
+    `untLUT`/`muxLUT`/`ctlLUT`/`memLUT` split the LUT total by what spends it,
+    which is the split an allocation objective trades along: a fold removes a
+    unit and grows the muxes feeding the one it folded onto. `SRL` is the delay
+    chains, which is where the register term's cost ACTUALLY lands; `regFF`
+    beside `decFF`, the flip-flops the design DECLARES, is what those chains cost
+    against what the objective charges for them. Memory is carried apart and
+    never summed in."""
     rows = [r for r in results if r.get("area")]
     if not rows:
         return "no area data (needs --stage compile)"
     head = (
-        f"{'benchmark/variant':<34} {'sched':<6} {'LUT':>8} {'ipLUT':>8}"
-        f" {'muxLUT':>8} {'lgcLUT':>8} {'memLUT':>8} {'SRL':>6} {'DSP':>5}"
-        f" {'regFF':>8} {'modFF':>8} {'ramKb':>7}"
+        f"{'benchmark/variant':<34} {'sched':<6} {'LUT':>8} {'untLUT':>8}"
+        f" {'muxLUT':>8} {'ctlLUT':>8} {'memLUT':>8} {'SRL':>6} {'DSP':>5}"
+        f" {'regFF':>8} {'decFF':>8} {'ramKb':>7}"
     )
     lines = [head, "-" * len(head)]
     tot = dict.fromkeys(
-        ("lut", "ip_lut", "mux_lut", "logic_lut", "mem_lut", "srl", "dsp",
-         "reg_ff", "reg_ff_modelled", "mem_bits"), 0)
+        (
+            "lut",
+            "unit_lut",
+            "mux_lut",
+            "control_lut",
+            "mem_lut",
+            "srl",
+            "dsp",
+            "reg_ff",
+            "reg_bits",
+            "mem_bits",
+        ),
+        0,
+    )
     regfile = 0
     unmodelled: dict[str, int] = {}
     for r in sorted(rows, key=lambda r: -r["area"]["lut"]):
@@ -551,21 +567,21 @@ def area_table(results: list[dict]) -> str:
         regfile += a["regfile_arrays"]
         lines.append(
             f"{_key_of(r):<34} {r['scheduler'][:6]:<6} {a['lut']:>8}"
-            f" {a['ip_lut']:>8} {a['mux_lut']:>8} {a['logic_lut']:>8}"
+            f" {a['unit_lut']:>8} {a['mux_lut']:>8} {a['control_lut']:>8}"
             f" {a['mem_lut']:>8} {a['srl']:>6} {a['dsp']:>5} {a['reg_ff']:>8}"
-            f" {a['reg_ff_modelled']:>8} {a['mem_bits'] / 1024:>7.1f}"
+            f" {a['reg_bits']:>8} {a['mem_bits'] / 1024:>7.1f}"
         )
     lines.append("-" * len(head))
     lines.append(
-        f"{'TOTAL':<34} {'':<6} {tot['lut']:>8} {tot['ip_lut']:>8}"
-        f" {tot['mux_lut']:>8} {tot['logic_lut']:>8} {tot['mem_lut']:>8}"
+        f"{'TOTAL':<34} {'':<6} {tot['lut']:>8} {tot['unit_lut']:>8}"
+        f" {tot['mux_lut']:>8} {tot['control_lut']:>8} {tot['mem_lut']:>8}"
         f" {tot['srl']:>6} {tot['dsp']:>5} {tot['reg_ff']:>8}"
-        f" {tot['reg_ff_modelled']:>8} {tot['mem_bits'] / 1024:>7.1f}"
+        f" {tot['reg_bits']:>8} {tot['mem_bits'] / 1024:>7.1f}"
     )
-    over = tot["reg_ff_modelled"] / max(tot["reg_ff"], 1)
+    over = tot["reg_bits"] / max(tot["reg_ff"], 1)
     lines.append("")
     lines.append(
-        f"the objective charges {tot['reg_ff_modelled']} flip-flops for chains "
+        f"the objective charges {tot['reg_bits']} flip-flops for chains "
         f"that cost {tot['reg_ff']} FF + {tot['srl']} SRL: {over:.1f}x over"
     )
     if regfile:
@@ -581,17 +597,18 @@ def area_table(results: list[dict]) -> str:
 def split_table(results: list[dict]) -> str:
     """Where one timing row covers several operator identities, aggregated over
     the bed. A binder folds only within one identity, so a count keyed on the
-    operator type spans several physical operators."""
+    operator type spans several physical operators. One row per VARIANT: the
+    schedule report accumulates the split whole-module."""
     agg: dict[str, list[int]] = {}
     for r in results:
         for s in r.get("class_splits", []):
             row = agg.setdefault(s["type"], [0, 0, 0])
-            row[0] += 1  # regions where this type splits
+            row[0] += 1  # variants where this type splits
             row[1] += s["ops"]
             row[2] = max(row[2], s["classes"])
     if not agg:
-        return "no operator type splits (or ALLO_LOG_LEVEL is not info)"
-    head = f"{'operator type':<28} {'regions':>8} {'ops':>8} {'max classes':>12}"
+        return "no operator type splits"
+    head = f"{'operator type':<28} {'variants':>8} {'ops':>8} {'max classes':>12}"
     lines = [head, "-" * len(head)]
     for t, (n, ops, mx) in sorted(agg.items(), key=lambda kv: -kv[1][1]):
         lines.append(f"{t:<28} {n:>8} {ops:>8} {mx:>12}")
@@ -690,13 +707,14 @@ def main():
         "--alloc",
         action="store_true",
         help="the per-variant allocation (units, muxes) and the operator-type "
-        "splits. Both need ALLO_LOG_LEVEL=info",
+        "splits",
     )
     ap.add_argument(
         "--area",
         action="store_true",
-        help="predicted LUT/DSP/FF from the measured device tables, split by "
-        "what spends them. The scoreboard an allocation change is argued from",
+        help="what the emitted structures price at against the measured device "
+        "tables, split by what spends them. The scoreboard an allocation change "
+        "is argued from",
     )
     ap.add_argument("--compare", metavar="BASE.json", help="diff against a saved run")
     args = ap.parse_args()
@@ -731,7 +749,10 @@ def main():
 
     schedulers = [s for s in args.scheduler.split(",") if s]
     if not has_exact_scheduler() and any(s.startswith("exact") for s in schedulers):
-        print("this build has no OR-Tools, so the exact modes are dropped", file=sys.stderr)
+        print(
+            "this build has no OR-Tools, so the exact modes are dropped",
+            file=sys.stderr,
+        )
         schedulers = [s for s in schedulers if not s.startswith("exact")]
     if not schedulers:
         raise SystemExit("no scheduler to run")
@@ -795,12 +816,6 @@ def main():
     for r in results:
         tally[r["status"]] = tally.get(r["status"], 0) + 1
     print("\n" + "  ".join(f"{k}={v}" for k, v in sorted(tally.items())))
-    bad = [r for r in ok if r.get("parse_ok") is False]
-    if bad:
-        print(
-            f"WARNING: the register parser missed a declaration in {len(bad)} run(s);"
-            " their register counts are not to be trusted"
-        )
 
 
 if __name__ == "__main__":

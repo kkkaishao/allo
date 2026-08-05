@@ -145,7 +145,7 @@ LogicalResult verifyFunc(
 LogicalResult checkSignature(func::FuncOp func) {
   for (Type t : func.getResultTypes())
     if (isa<MemRefType>(t)) {
-      unsupported(Stage::Prep, func)
+      unsupported(Stage::Prep, Code::MemrefResult, func)
           << "Returning a memref is not lowered yet; write the result "
              "through an output argument (out-parameter) instead";
       return failure();
@@ -156,7 +156,7 @@ LogicalResult checkSignature(func::FuncOp func) {
 LogicalResult checkOperations(func::FuncOp func, const OperatorLibrary &lib) {
   WalkResult r = func.walk([&](Operation *op) {
     if (isUnmodeledMemoryAccess(op)) {
-      unsupported(Stage::Prep, op)
+      unsupported(Stage::Prep, Code::OperationNotModelled, op)
           << "Operation '" << op->getName()
           << "' carries a memory effect the dependence analysis does not "
              "model, so scheduling would reorder it against the accesses it "
@@ -171,7 +171,7 @@ LogicalResult checkOperations(func::FuncOp func, const OperatorLibrary &lib) {
     // and is empty when the device offers neither.
     OperatorIdentity id = operatorIdentity(op, lib);
     if (!id.realized()) {
-      error(Stage::Prep, op)
+      error(Stage::Prep, Code::OperatorNotRealized, op)
           << "Operator '" << op->getName()
           << "' is not realized by the device: it has neither an IP module "
              "nor a native lowering. Declare an @ip for it, or add native "
@@ -194,7 +194,7 @@ LogicalResult checkStallContract(Operation *op, StringRef symbol) {
   assert(opr && "a matched operator row names a live dcp.operator");
   if (opr.getStall() != StallContractEnum::Elastic)
     return success();
-  error(Stage::Prep, op)
+  error(Stage::Prep, Code::StallContractUnusable, op)
       << "Operator IP '" << symbol
       << "' declares the elastic (valid/ready, variable-latency) stall "
          "contract, which is not realized. Declare style='ce'";
@@ -289,7 +289,7 @@ static LogicalResult checkScatteredArgument(func::FuncOp func, Value array,
                                             bool isTop) {
   auto elements = cast<MemRefType>(array.getType()).getNumElements();
   if (!memLib.isScatter(mc.storage)) {
-    error(Stage::Prep, func)
+    error(Stage::Prep, Code::StorageTimingUnrealizable, func)
         << "Argument array with a 0-cycle read cannot be realized; a boundary "
            "port is edge-triggered, so its datum arrives no earlier than the "
            "cycle after its address. Bind this argument to a storage impl with "
@@ -300,7 +300,7 @@ static LogicalResult checkScatteredArgument(func::FuncOp func, Value array,
   // storage. A scattered TOP argument reaching a child has no such owner: the
   // top would have to crossbar its input wires.
   if (!isTop) {
-    unsupported(Stage::Prep, func)
+    unsupported(Stage::Prep, Code::ScatteredArgumentToCallee, func)
         << "Passing the completely-partitioned argument array "
         << array.getType()
         << " to a sub-kernel is not lowered yet: it crosses the top boundary "
@@ -342,7 +342,7 @@ LogicalResult checkMemories(func::FuncOp func, const MemoryLibrary &memLib,
     // Nothing else resolves an explicitly bound array to the scatter row.
     StringRef bound = boundStorageOf(array);
     if (memLib.isScatter(storage) && !bound.empty() && !memLib.isScatter(bound)) {
-      error(Stage::Prep, anchor)
+      error(Stage::Prep, Code::ArrayLayoutConflict, anchor)
           << "Array " << array.getType() << " is bound to storage '" << bound
           << "' and also completely partitioned, which scatters it into "
              "registers; the two cannot both hold. Drop one of them";
@@ -352,7 +352,7 @@ LogicalResult checkMemories(func::FuncOp func, const MemoryLibrary &memLib,
     // there is none, so it has nowhere to go: an empty name would otherwise
     // fall through as a stream's, which is timed by an unrelated row.
     if (storage.empty()) {
-      error(Stage::Prep, anchor)
+      error(Stage::Prep, Code::StorageNotDeclared, anchor)
           << "Array " << array.getType()
           << " is completely partitioned, but the device marks no `dcp.storage` "
              "`scatter` for one cell per element to be built out of";
@@ -361,7 +361,7 @@ LogicalResult checkMemories(func::FuncOp func, const MemoryLibrary &memLib,
     // A realization the device never declared would fall to the zero-timing
     // default and schedule combinationally, reading before valid.
     if (!memLib.declares(storage)) {
-      error(Stage::Prep, anchor)
+      error(Stage::Prep, Code::StorageNotDeclared, anchor)
           << "No memory characterization for storage '" << storage
           << "'; declare it as a `dcp.storage` on the device";
       return failure();
@@ -377,7 +377,7 @@ LogicalResult checkMemories(func::FuncOp func, const MemoryLibrary &memLib,
     // `writeLatency - 1`, which a 0-cycle write wraps. A 0-cycle read is fine
     // internally.
     if (lat.write < 1) {
-      error(Stage::Prep, anchor)
+      error(Stage::Prep, Code::StorageTimingUnrealizable, anchor)
           << "Storage '" << storage
           << "' declares a 0-cycle write, which no array can be realized at: "
              "a write needs a clock edge to commit on. Give that "
@@ -421,7 +421,7 @@ LogicalResult checkPartitionAgreement(func::FuncOp func) {
       BankLayout there = bankLayoutOf(callee.getArgument(k));
       if (sameBanking(here, there))
         continue;
-      error(Stage::Prep, call)
+      error(Stage::Prep, Code::ArrayLayoutConflict, call)
           << "Array argument " << k << " of sub-kernel '" << call.getCallee()
           << "' is partitioned into " << there.numBanks
           << " bank(s) there but into " << here.numBanks
@@ -446,7 +446,7 @@ LogicalResult checkComposition(func::FuncOp func, const OperatorLibrary &lib) {
     WalkResult r = func.walk([&](func::CallOp call) {
       if (!call->getParentOfType<LoopLikeOpInterface>())
         return WalkResult::advance();
-      error(Stage::Prep, call)
+      error(Stage::Prep, Code::SpawnInLoop, call)
           << "A dataflow process is spawned inside a loop; a process is "
              "instantiated once and runs concurrently, so spawn it once and "
              "let it iterate internally (move the loop into the process)";
@@ -458,7 +458,7 @@ LogicalResult checkComposition(func::FuncOp func, const OperatorLibrary &lib) {
     // but skips a span whose live-in is not an array, a stream or a scalar.
     for (Operation &op : func.front())
       if (!isContainerStructure(op)) {
-        unsupported(Stage::Prep, &op)
+        unsupported(Stage::Prep, Code::ContainerWithDatapath, &op)
             << "A dataflow container with its own datapath (loose "
                "load/store/compute beside the process network) is not "
                "lowered yet; it composes child instances and channels only. "
@@ -468,18 +468,17 @@ LogicalResult checkComposition(func::FuncOp func, const OperatorLibrary &lib) {
       }
   }
 
-  WalkResult r =
-      func.walk([&](scf::WhileOp w) {
-        if (!whileFlushingPipelines(w, lib) || whileHasIdentityForwarding(w))
-          return WalkResult::advance();
-        error(Stage::Prep, w)
-            << "While loop not scheduled: its loop-carried values are not "
-               "forwarded 1:1 from the before-region through `scf.condition` "
-               "into the after-region (they are reordered, dropped, or "
-               "recombined), which the flushing-pipeline schedule requires; "
-               "carry each value through unchanged";
-        return WalkResult::interrupt();
-      });
+  WalkResult r = func.walk([&](scf::WhileOp w) {
+    if (!whileFlushingPipelines(w, lib) || whileHasIdentityForwarding(w))
+      return WalkResult::advance();
+    error(Stage::Prep, Code::WhileForwardingNotIdentity, w)
+        << "While loop not scheduled: its loop-carried values are not "
+           "forwarded 1:1 from the before-region through `scf.condition` "
+           "into the after-region (they are reordered, dropped, or "
+           "recombined), which the flushing-pipeline schedule requires; "
+           "carry each value through unchanged";
+    return WalkResult::interrupt();
+  });
   return failure(r.wasInterrupted());
 }
 
@@ -552,7 +551,7 @@ LogicalResult checkChannelEnds(func::FuncOp func, const Channel &ch) {
   // Several readers are a fan-out the emitter inserts, one FIFO each; several
   // writers are a merge, whose token interleaving is not deterministic.
   if (ch.producers > 1) {
-    unsupported(Stage::Prep, anchor)
+    unsupported(Stage::Prep, Code::ChannelMultiProducer, anchor)
         << "A stream channel is written by more than one process; a channel "
            "is single-producer and a deterministic merge is not lowered yet";
     return failure();
@@ -560,7 +559,7 @@ LogicalResult checkChannelEnds(func::FuncOp func, const Channel &ch) {
   // A port is an input or an output, so a boundary channel both read and
   // written has nothing to lower to.
   if (ch.anyPut && ch.anyGet && !ch.internal) {
-    unsupported(Stage::Prep, anchor)
+    unsupported(Stage::Prep, Code::StreamArgumentBidirectional, anchor)
         << "A stream ARGUMENT both read and written inside one kernel is not "
            "lowered yet (a boundary channel lowers to one directional port); "
            "route the feedback through a second channel, or declare the "
@@ -570,7 +569,7 @@ LogicalResult checkChannelEnds(func::FuncOp func, const Channel &ch) {
   // A local channel with one end only stalls by construction: the puts fill it
   // and block, or the first get waits on a token nothing produces.
   if (ch.internal && !(ch.anyPut && ch.anyGet)) {
-    error(Stage::Prep, anchor)
+    error(Stage::Prep, Code::ChannelEndMissing, anchor)
         << "The kernel-local stream is "
         << (ch.anyPut ? "never read" : "never written")
         << "; a channel needs both ends inside the kernel that owns it";
@@ -578,8 +577,8 @@ LogicalResult checkChannelEnds(func::FuncOp func, const Channel &ch) {
   }
   // A boundary argument nothing touches would leave a port undriven.
   if (!ch.internal && !ch.anyPut && !ch.anyGet) {
-    error(Stage::Prep, anchor) << "The stream argument is neither read nor "
-                                  "written";
+    error(Stage::Prep, Code::ChannelEndMissing, anchor)
+        << "The stream argument is neither read nor written";
     return failure();
   }
   return success();
@@ -642,7 +641,7 @@ LogicalResult checkChannelCycles(func::FuncOp func,
   for (Operation *x : cycle)
     os << cast<func::CallOp>(x).getCallee() << " -> ";
   os << cast<func::CallOp>(cycle.front()).getCallee(); // close the loop
-  error(Stage::Prep, func)
+  error(Stage::Prep, Code::DataflowCycleUnseeded, func)
       << "Dataflow feedback cycle [" << path
       << "] has no initial tokens and will deadlock; seed a channel on the "
          "cycle with an initializer, e.g. `s: Stream[T, depth] = [<init>]`";
@@ -694,7 +693,7 @@ static LogicalResult checkAddressCost(func::FuncOp funcOp,
     if (over) {
       ++overCycle;
       fits = false;
-      unsupported(Stage::Prep, op)
+      unsupported(Stage::Prep, Code::AddressOverPeriod, op)
           << "computing the address " << addr << " takes "
           << llvm::format("%.2f", cost.delay)
           << " ns, which with the storage port's own setup is "
@@ -745,7 +744,8 @@ LogicalResult allo::runPreScheduleVerification(ModuleOp module, StringRef top,
 
   auto topFunc = module.lookupSymbol<func::FuncOp>(top);
   if (!topFunc) {
-    error(Stage::Prep, module) << "Top function '" << top << "' not found";
+    error(Stage::Prep, Code::TopFunctionMissing, module)
+        << "Top function '" << top << "' not found";
     return failure();
   }
   // The closure the emit driver visits, callees before callers so a call can

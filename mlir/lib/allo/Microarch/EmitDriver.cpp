@@ -9,6 +9,7 @@
 #include "allo/Microarch/BindingPolicy.h"
 #include "allo/Microarch/HWEmitter.h" // HWEmitter
 #include "allo/Microarch/Interface.h"
+#include "allo/Microarch/Report.h"
 #include "allo/Microarch/Verification.h" // validateDatapath
 #include "allo/Scheduling/OperatorLibrary.h"
 #include "allo/Support/Logging.h"
@@ -217,6 +218,14 @@ llvm::StringMap<Value> instantiateChild(OpBuilder &b, Location loc,
   return outs;
 }
 
+/// Flip-flops in \p mod's own body, which is what the ledger claims to count.
+/// A child instance's registers live in the child's body and are not walked.
+static unsigned compRegBits(hw::HWModuleOp mod) {
+  unsigned bits = 0;
+  mod.walk([&](seq::CompRegOp r) { bits += hwWidth(r.getResult().getType()); });
+  return bits;
+}
+
 // Emit an hw.module for one scheduled function's datapath. Returns failure with
 // a diagnostic if the datapath is outside the supported subset
 // (validateDatapath). `opModules` caches extern operator modules across
@@ -224,7 +233,7 @@ llvm::StringMap<Value> instantiateChild(OpBuilder &b, Location loc,
 static FailureOr<std::pair<hw::HWModuleOp, iface::ModuleInterface>>
 emitModule(dcp::DCPathModuleOp func, uarch::Datapath &dp, OpBuilder &b,
            llvm::StringMap<Operation *> &opModules, float cycleTime,
-           const OperatorLibrary &lib,
+           const OperatorLibrary &lib, MicroarchReport &report,
            const uarch::CalleeCtx *callees = nullptr) {
   auto *ctx = b.getContext();
   Location loc = func.getLoc();
@@ -250,6 +259,7 @@ emitModule(dcp::DCPathModuleOp func, uarch::Datapath &dp, OpBuilder &b,
   model.module = verilogName(model.symbol);
   StringAttr modName = StringAttr::get(ctx, model.module);
 
+  RegLedger ledger;
   auto hwMod = hw::HWModuleOp::create(
       b, loc, modName, portInfo,
       [&](OpBuilder &ib, hw::HWModulePortAccessor &pa) {
@@ -259,7 +269,15 @@ emitModule(dcp::DCPathModuleOp func, uarch::Datapath &dp, OpBuilder &b,
         e.ctx.clkRaw = pa.getInput(kClk);
         e.ctx.rst = pa.getInput(kRst);
         e.emit();
+        ledger = std::move(e.ctx.ledger);
       });
+  // Every register came through `EmitContext::reg`, so the ledger is the
+  // emitted design's own flip-flop count and not a model of it. Checked here
+  // rather than in one test, so every emission the suite runs holds it.
+  assert(compRegBits(hwMod) == ledger.bits() &&
+         "a register was built outside EmitContext::reg, so the ledger is no "
+         "longer a count of the emitted design");
+  report.funcs.emplace_back(dp, model.symbol, model.module, ledger);
 
   // The caller derives the cosim manifest JSON from this port model and threads
   // it back in as a callee model.
@@ -288,7 +306,10 @@ static void cleanupDcpOps(ModuleOp module) {
 
 LogicalResult emitDatapathToHW(ModuleOp module, StringRef binding,
                                StringRef top, float cycleTime,
-                               llvm::StringMap<std::string> &interfaces) {
+                               llvm::StringMap<std::string> &interfaces,
+                               MicroarchReport &report) {
+  report.binding = binding.str();
+  report.cycleTime = cycleTime;
   // Called directly (not via the pass manager), so load the dialects this
   // emits, the ones the pass declares as dependent, into the context.
   auto *ctx = module.getContext();
@@ -305,7 +326,7 @@ LogicalResult emitDatapathToHW(ModuleOp module, StringRef binding,
 
   auto policy = bindingPolicyFor(binding);
   if (!policy) {
-    error(Stage::Emit, module)
+    error(Stage::Emit, Code::UnknownOption, module)
         << "Unknown binding policy '" << binding
         << "'; the policies are 'trivial', 'greedy-share' and 'planned'";
     return failure();
@@ -318,7 +339,7 @@ LogicalResult emitDatapathToHW(ModuleOp module, StringRef binding,
     byName[f.getSymName()] = f;
   dcp::DCPathModuleOp topFunc = byName.lookup(top);
   if (!topFunc) {
-    error(Stage::Emit, module)
+    error(Stage::Emit, Code::TopFunctionMissing, module)
         << "Top function '" << top << "' is not a scheduled function";
     return failure();
   }
@@ -371,9 +392,9 @@ LogicalResult emitDatapathToHW(ModuleOp module, StringRef binding,
       llvm::dbgs() << "// datapath for @" << f.getSymName() << "\n";
       dp.dump(llvm::dbgs());
     });
-    dp.reportAllocation();
     b.setInsertionPoint(f);
-    auto pairOr = emitModule(f, dp, b, opModules, cycleTime, lib, callees);
+    auto pairOr =
+        emitModule(f, dp, b, opModules, cycleTime, lib, report, callees);
     if (failed(pairOr))
       return failure();
     registerModule(f.getSymName(), pairOr->first, std::move(pairOr->second));

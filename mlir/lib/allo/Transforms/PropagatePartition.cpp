@@ -133,7 +133,8 @@ struct PropagatePartitionPass
     ModuleOp module = getOperation();
     topFunc = module.lookupSymbol<func::FuncOp>(top);
     if (!topFunc) {
-      error(Stage::Prep, module) << "Top function '" << top << "' not found";
+      error(Stage::Prep, Code::TopFunctionMissing, module)
+          << "Top function '" << top << "' not found";
       return signalPassFailure();
     }
     auto callsOr = buildAndSortCallsiteGraph(topFunc);
@@ -187,7 +188,7 @@ struct PropagatePartitionPass
         BankLayout here = bankLayoutOf(actual);
         if (!param.part() && here.numBanks == 1 && !here.registers)
           continue;
-        unsupported(Stage::Prep, call)
+        unsupported(Stage::Prep, Code::PartitionedViewArgument, call)
             << "Array argument " << k << " of sub-kernel '" << call.getCallee()
             << "' is partitioned but reaches the call through a view, whose "
                "banking is not the underlying array's; pass the array itself, "
@@ -215,7 +216,7 @@ struct PropagatePartitionPass
       std::string why;
       auto next = joinPartitions(joined, here, type, why);
       if (failed(next)) {
-        auto diag = error(Stage::Prep, c.op);
+        auto diag = error(Stage::Prep, Code::ArrayLayoutConflict, c.op);
         diag << "Array partitioning conflict: " << describeCarrier(c) << " is "
              << here << ", which cannot be reconciled with the " << joined
              << " stated elsewhere on the same array, because " << why

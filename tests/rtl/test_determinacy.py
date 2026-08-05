@@ -348,8 +348,8 @@ def test_an_indeterminate_calls_region_drains_at_its_own_start(scheduler):
     def ic_drain(A: i32[8], B: i32[1]):
         ic_sum_out(A, B)
 
-    (region,) = _regions(_to_rtl(ic_drain, scheduler=scheduler))
-    assert region.drain == 0
+    (region,) = _regions(_to_rtl(ic_drain).set_scheduler_opt(scheduler=scheduler))
+    assert region.cost.drain == 0
 
 
 # That drain is not a SPAN. A leaf's drain prices a call from its contract, so
@@ -367,7 +367,7 @@ def test_a_region_holding_an_indeterminate_call_declares_no_span():
     rtl = _to_rtl(ic_nospan)
     top = rtl.schedule().func("ic_nospan")
     (container,) = [r for r in top.regions if r.container]
-    assert (container.determinacy, container.latency, container.ii) == (
+    assert (container.determinacy, container.latency, container.interval) == (
         "indeterminate",
         None,
         None,

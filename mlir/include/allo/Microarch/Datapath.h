@@ -843,11 +843,6 @@ struct Datapath {
 
   void dump(llvm::raw_ostream &os) const;
 
-  /// Log what the allocation cost: per region the compute ops, the units they
-  /// were bound to and the muxes sharing grew, then per array its write ports.
-  /// A diagnostic, not an IR attribute or a manifest field.
-  void reportAllocation() const;
-
   /// The fewest ports ONE BANK of memory \p id can be built with: the largest
   /// set of its accesses that can issue in one cycle, counting a child's port
   /// as an access. Per bank, since a bank is its own `seq.hlmem` and accesses
@@ -982,6 +977,11 @@ unsigned readyCycleOf(Operation *op);
 /// the emitter (`uarch::hwType`) and the boundary port model
 /// (`iface::bitWidth`) must not disagree about how wide it is.
 unsigned hwWidth(Type t);
+
+/// A region's controller shape as one lower-case word. The ONE spelling, shared
+/// by the debug dump and the microarch report, which must not name the same
+/// shape two ways.
+llvm::StringRef shapeName(RegionBlock::Shape s);
 
 /// The banking of an *external* (argument) memory access, so the boundary
 /// presents one interface per bank. `factor == 1` is an unbanked memory

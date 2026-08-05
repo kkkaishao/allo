@@ -58,7 +58,7 @@ def _latency(kernel, **kw):
 def _iis(regions):
     """Sorted IIs of ``regions``; a dynamic-trip sequential wrapper (``ii`` is
     ``None``) is skipped."""
-    return sorted(r.ii for r in regions if r.ii is not None)
+    return sorted(r.interval for r in regions if r.interval is not None)
 
 
 def _impls(result):

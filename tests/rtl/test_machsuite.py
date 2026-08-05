@@ -393,7 +393,7 @@ def test_dynamic_programming():
     assert len(cyclic) >= 4
     # An all-integer kernel: the bound is the memory-carried recurrence through
     # `result`, so the nest cannot close at II=1. No adder latency is involved.
-    assert max(r.ii for r in cyclic) > 1
+    assert max(r.interval for r in cyclic) > 1
 
     def nw_golden(SEQA, SEQB):
         M = np.zeros(MATRIX_SIZE, np.int32)
@@ -578,7 +578,7 @@ def test_data_dependent_while_kernels():
     d = Dcp(rtl)
     assert not d.has("scf.while") and d.has("allo.dcp.condition")
     guard = next(r for r in res.cyclic(wrappers=True) if r.conditional)
-    assert guard.ii is None  # sequential (data-dependent length), no static II
+    assert guard.interval is None  # sequential (data-dependent length), no static II
 
     # CSR of a small DAG (node i -> {i+1, i+2}); each node is enqueued at most
     # once, so the ring buffer never overruns N_NODES.
@@ -726,7 +726,7 @@ def test_grid_parallel():
     rtl = _to_rtl(gemm)
     res = rtl.schedule()
     assert res.func("gemm").latency is not None
-    assert res.func("gemm").cyclic()[-1].ii == MEM_REDUCE_II
+    assert res.func("gemm").cyclic()[-1].interval == MEM_REDUCE_II
 
     rng = np.random.default_rng(0)
     A = (rng.random((P, P), dtype=np.float32) - np.float32(0.5)).astype(np.float32)

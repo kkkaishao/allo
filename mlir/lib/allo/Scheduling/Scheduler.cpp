@@ -443,7 +443,7 @@ mlir::allo::computeChainBreaks(ChainingProblem &prob, float cycleTime,
   for (auto opr : prob.getOperatorTypes())
     if (*prob.getIncomingDelay(opr) > cycleTime ||
         *prob.getOutgoingDelay(opr) > cycleTime) {
-      error(Stage::Sched, prob.getContainingOp())
+      error(Stage::Sched, Code::OperatorOverPeriod, prob.getContainingOp())
           << "Operator '" << opr.getValue()
           << "' does not fit the requested clock period of "
           << format("%g", cycleTime) << " ns on its own";
@@ -598,7 +598,8 @@ void SimplexSchedulerBase::reportInfeasible() {
     if (auto opr = prob.getLinkedOperatorType(op))
       bigII += prob.getLatency(*opr).value_or(0);
   Recurrence rec = bindingRecurrence(bigII);
-  auto diag = error(Stage::Sched, prob.getContainingOp());
+  auto diag =
+      error(Stage::Sched, Code::DependenceInfeasible, prob.getContainingOp());
   if (!rec) {
     // No circuit binds, so the infeasibility comes from the constraints layered
     // on top of the dependences (a fixed start time, a resource reservation).
@@ -1423,8 +1424,9 @@ LogicalResult ModuloSimplexScheduler::growIIUniformly(Operation *n) {
   // Where the compile stops on the default path, and only advice when an exact
   // solver is going to place the region itself.
   auto placementFailed = [&](Operation *at) {
-    return placementAdvisory ? warn(Stage::Sched, at)
-                             : unsupported(Stage::Sched, at);
+    return placementAdvisory
+               ? warn(Stage::Sched, at)
+               : unsupported(Stage::Sched, Code::PlacementFailed, at);
   };
   while (true) {
     SmallVector<std::pair<unsigned, unsigned>> phis;

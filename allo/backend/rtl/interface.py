@@ -304,8 +304,9 @@ class Interfaces(Mapping[str, ModuleInterface]):
         raise KeyError(f"no emitted module for symbol '{symbol}'")
 
     @classmethod
-    def from_json(cls, text: str) -> Interfaces:
-        """Parse the emitter's manifest string, the one place it is decoded."""
-        return cls(
-            {k: ModuleInterface.from_json(v) for k, v in json.loads(text).items()}
-        )
+    def from_json(cls, doc: str | dict) -> Interfaces:
+        """Parse the emitter's manifests, the one place they are decoded. Takes
+        the ``interfaces`` member of the emit envelope, either as the raw string
+        or as an already-decoded object."""
+        d = json.loads(doc) if isinstance(doc, str) else doc
+        return cls({k: ModuleInterface.from_json(v) for k, v in d.items()})

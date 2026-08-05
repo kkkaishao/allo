@@ -3,8 +3,8 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-#include "allo-c/Schedule.h"            // kPartitionAttr, kBindStorageAttr
-#include "allo/Support/AliasAnalysis.h" // alloAliasAnalysis
+#include "allo-c/Schedule.h"               // kPartitionAttr, kBindStorageAttr
+#include "allo/Support/AliasAnalysis.h"    // alloAliasAnalysis
 #include "allo/Support/Logging.h"
 #include "allo/Transforms/Passes.h"
 
@@ -12,6 +12,7 @@
 #include "mlir/Dialect/Affine/Utils.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
+#include "mlir/IR/Builders.h"
 #include "mlir/IR/Dominance.h"
 
 namespace mlir::allo {
@@ -25,15 +26,6 @@ using namespace mlir::allo::logging;
 
 namespace {
 
-// One local array as it stands before the transform. `op` is only ever compared
-// (the operation it names may be erased); the location and the type are uniqued
-// attributes, so they stay valid and can still be reported afterwards.
-struct LocalArray {
-  Operation *op;
-  Location loc;
-  MemRefType type;
-};
-
 struct ScalarizeMemoryPass
     : public allo::impl::ScalarizeMemoryPassBase<ScalarizeMemoryPass> {
   using Base::Base;
@@ -41,34 +33,17 @@ struct ScalarizeMemoryPass
   void runOnOperation() override {
     func::FuncOp func = getOperation();
 
-    SmallVector<LocalArray> before;
-    func.walk([&](Operation *op) {
-      if (isa<memref::AllocOp, memref::AllocaOp>(op))
-        before.push_back(
-            {op, op->getLoc(), cast<MemRefType>(op->getResult(0).getType())});
-    });
-
     AliasAnalysis aa = alloAliasAnalysis(func);
     affine::affineScalarReplace(func, getAnalysis<DominanceInfo>(),
                                 getAnalysis<PostDominanceInfo>(), aa);
 
-    if (before.empty())
-      return;
-    DenseSet<Operation *> survived;
+    // The arrays that SURVIVED the forwarding above. One whose every read
+    // forwarded is gone entirely, and needs no storage decision at all.
+    SmallVector<Operation *> survived;
     func.walk([&](Operation *op) {
       if (isa<memref::AllocOp, memref::AllocaOp>(op))
-        survived.insert(op);
+        survived.push_back(op);
     });
-    // Report the arrays that are gone, not the loads that were forwarded:
-    // deleting an array is a change to the storage decision, which the pipeline
-    // announces, while forwarding a load is ordinary redundancy removal.
-    for (const LocalArray &array : before)
-      if (!survived.count(array.op))
-        log(Level::Info, Stage::Prep, array.loc)
-            << "Every read of the local array " << array.type
-            << " is forwarded from the store that produced it, so it is "
-               "dataflow and needs no storage";
-
     MLIRContext *ctx = &getContext();
     auto complete = PartitionAttr::get(
         ctx, {PartitionAxisAttr::get(ctx, PartitionKindEnum::CompletePartition,
@@ -93,11 +68,6 @@ struct ScalarizeMemoryPass
         continue;
 
       op->setAttr(kPartitionAttr, complete);
-      info(Stage::Prep, op)
-          << "Complete-partitioned the local array " << type << " ("
-          << type.getNumElements() << " elements, within the " << maxElements
-          << "-element threshold), so it lowers to registers rather than a "
-             "memory whose ports and access latency bound the II";
     }
   }
 };

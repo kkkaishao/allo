@@ -874,7 +874,8 @@ LogicalResult mlir::allo::scheduleCPSAT(ChainingModuloProblem &prob,
 
   if (!adopted) {
     if (!warm.placed) {
-      auto d = unsupported(Stage::Sched, prob.getContainingOp());
+      auto d = unsupported(Stage::Sched, Code::PlacementFailed,
+                           prob.getContainingOp());
       d << "Neither scheduler could place this region: the greedy modulo "
            "placement gave up, and ";
       if (exhaustedAt)
@@ -946,7 +947,7 @@ namespace {
 /// an OR-Tools-free build before any region is solved. Kept so the two entry
 /// points exist in both configurations.
 LogicalResult noExactScheduler(Operation *containingOp, StringRef which) {
-  unsupported(Stage::Sched, containingOp)
+  unsupported(Stage::Sched, Code::NoExactScheduler, containingOp)
       << "This build has no exact scheduler: it was configured without "
          "OR-Tools. Rebuild with -DALLO_ENABLE_ORTOOLS=ON, or schedule with "
          "scheduler=\"heuristic\" (the default). Requested for the "

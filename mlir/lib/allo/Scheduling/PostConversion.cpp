@@ -588,12 +588,12 @@ static void checkLatencyBound(DCPathModuleOp mod, std::optional<int64_t> dcpLat,
   }
   assert(false && "the scheduler's callee latency undercuts what the reify "
                   "builds; a consumer placed against it samples early");
-  error(Stage::Dcp, mod) << "Latency bound is UNSOUND for callee '"
-                         << mod.getSymName() << "': scheduler "
-                         << sched.getInt() << " undercuts reify " << *dcpLat
-                         << " by " << *dcpLat - sched.getInt()
-                         << " cycle(s); a consumer time-triggered off this "
-                            "callee would sample before it writes";
+  error(Stage::Dcp, Code::CompilerInconsistency, mod)
+      << "Latency bound is UNSOUND for callee '" << mod.getSymName()
+      << "': scheduler " << sched.getInt() << " undercuts reify " << *dcpLat
+      << " by " << *dcpLat - sched.getInt()
+      << " cycle(s); a consumer time-triggered off this callee would sample "
+         "before it writes";
 }
 
 // Stamp `latency` and `determinacy` on every reified region, then the

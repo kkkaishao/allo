@@ -7,6 +7,7 @@
 #define ALLO_MICROARCH_PRIMITIVES_H
 
 #include "allo/Microarch/Datapath.h"
+#include "allo/Microarch/RegLedger.h"
 
 #include "circt/Dialect/HW/HWOps.h"
 #include "circt/Dialect/Seq/SeqOps.h" // seq::HLMemOp
@@ -194,6 +195,15 @@ struct EmitContext {
   // would drop every pulse but the first. False outside any region.
   bool regionSinglePass = false;
 
+  // Every register this module's emission builds, by run. `reg` below is the
+  // one `seq.compreg` creation in the backend, so this is a count of the
+  // emitted design rather than a model of it; `checkRegLedger` holds the two
+  // together on every emission.
+  RegLedger ledger;
+  // Set while a chain builder runs: it charges the whole run at once, so its
+  // stages must not each charge one of their own.
+  bool inChainRun = false;
+
   EmitContext(OpBuilder &b, Location loc, circt::BackedgeBuilder &bb, Type i1,
               Type i32)
       : b(b), loc(loc), i1(i1), i32(i32), bb(bb) {}
@@ -204,12 +214,17 @@ struct EmitContext {
 
   /// Registered (1-cycle): out[t+1] = in[t], sampled unconditionally on every
   /// clock; out = `rstVal` while in reset (`seq.compreg`).
-  Value reg(Value in, Value rstVal);
+  ///
+  /// The ONE place a register is built, which is what makes `ledger` exact.
+  /// \p role is what the register is FOR, charged as a run of one unless a
+  /// chain builder is already charging the whole run it belongs to.
+  Value reg(Value in, Value rstVal, RegRole role = RegRole::Control);
   /// Clock-enabled register (1-cycle when enabled): out[t+1] = ce[t] ? in[t] :
   /// out[t]. It samples `in` on the clock edge only when `ce` is high, else
   /// holds; out = `rstVal` while in reset. Edge-triggered, NOT a
   /// level-sensitive latch.
-  Value enabledReg(Value in, Value ce, Value rstVal);
+  Value enabledReg(Value in, Value ce, Value rstVal,
+                   RegRole role = RegRole::Control);
   /// Stall-hold: transparent (combinational passthrough) while \p sh's
   /// `chainEnable` is high, holds its last enabled value while low. out = ce ?
   /// in : held; held[t+1] = out[t]. Unlike `enabledReg` it adds NO latency when
@@ -220,7 +235,8 @@ struct EmitContext {
   /// A while iter-arg's frozen result register: out[t+1] = load ? init :
   /// (advance ? next : out[t]). Frozen once the loop exits, so it holds the
   /// loop's final carried value, or `init` for a zero-iteration loop.
-  Value latchReg(Value init, Value next, Value load, Value advance);
+  Value latchReg(Value init, Value next, Value load, Value advance,
+                 RegRole role = RegRole::Survivor);
   /// Combinational (0-cycle) 2:1 mux: out = sel ? t : f.
   Value mux(Value sel, Value t, Value f);
   /// Combinational (0-cycle) k:1 select over mutually exclusive selects:
@@ -233,7 +249,12 @@ struct EmitContext {
   /// the taps freeze together and the "index == cycles delayed" contract holds
   /// under stall too. Returns the taps: `stages[k]` = `in` delayed k cycles,
   /// each stage reset to 0, `stages[0]` = `in` itself.
-  ShiftChain shiftChain(Value in, unsigned depth, const StallShell &sh);
+  ///
+  /// Charges the ledger ONE run of `depth`, since that is the shape a
+  /// synthesizer prices: only the caller knows whether the run carries a datum
+  /// or a pulse, so \p role comes from there.
+  ShiftChain shiftChain(Value in, unsigned depth, const StallShell &sh,
+                        RegRole role = RegRole::Value);
   /// `shiftChain`'s tap table folded to an initiation interval: with a fresh
   /// datum landing on \p in only every \p ii cycles, `ceil(depth / ii)`
   /// registers hold every live value, each capturing once per iteration when

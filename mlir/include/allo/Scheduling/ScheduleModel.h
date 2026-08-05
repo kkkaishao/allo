@@ -10,9 +10,12 @@
 #include "mlir/IR/Operation.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
+#include "llvm/ADT/StringRef.h"
 
 #include <cstdint>
+#include <map>
 #include <optional>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -86,16 +89,42 @@ struct RegionReport {
   /// than a leaf, and whether its execution is predicated (a while pipeline or
   /// a guard).
   bool container = false, conditional = false;
-  /// `length` is the schedule DEPTH, the cycle by which every op has completed;
-  /// `drain` is the TERMINAL cycle its `done` composes off. Separate because a
-  /// solver may leave slack between them, and only `drain` is charged.
-  std::optional<int64_t> ii, trip, length, drain, latency;
+  /// Vitis vocabulary: `interval` is the initiation interval, `latency` the
+  /// whole region's span, `iterationLatency` the schedule DEPTH of one
+  /// iteration. `drain` is the TERMINAL cycle its `done` composes off, which is
+  /// a composition quantity rather than a latency a reader compares: a solver
+  /// may leave slack between it and `iterationLatency`, and only `drain` is
+  /// charged.
+  std::optional<int64_t> interval, tripCount, iterationLatency, drain, latency;
   /// The latency above is an upper bound, not an exact count.
   bool latencyBound = false;
   /// The mnemonic of the region's determinacy class, the controller family that
   /// paces it. Empty only when the attribute is absent.
   std::string determinacy;
   std::vector<ScheduledOpReport> ops;
+};
+
+/// The loop-carried memory edges one problem held, split by what fixed each
+/// distance: the polyhedral test PROVED it, or a conservative fallback ASSUMED
+/// it. An II resting on an assumed edge is a scheduling-quality fact and not a
+/// hardware one, and it is unrecoverable afterwards: the problem the edges
+/// lived in is gone by the time the schedule is reified.
+struct CarriedEdges {
+  /// Every carried edge, then the two assumed kinds among them: `nonAffine` a
+  /// pair the test cannot model at all, `unknown` a direction it modelled but
+  /// could not bound.
+  int64_t total = 0, nonAffine = 0, unknown = 0;
+};
+
+/// One operator TYPE the library prices several operations under, and how many
+/// distinct operator IDENTITIES those operations actually hold. `identities >
+/// 1` is exactly where the library's pricing over-approximates: every operation
+/// of the type is charged one row, though the rows they would each want differ.
+/// Not re-derivable from the schedule, which records the realization an
+/// operation GOT and never the type it was priced under.
+struct OperatorClass {
+  std::string type;
+  unsigned ops = 0, identities = 0;
 };
 
 /// What ONE region's solve COST: a measurement of the compiler, not the
@@ -118,7 +147,10 @@ struct SolveReport {
   /// allocatable, and always zero for a heuristic solve.
   int64_t allocatedOps = 0, allocatedUnits = 0;
   /// The initiation interval settled, absent for an acyclic span.
-  std::optional<int64_t> ii;
+  std::optional<int64_t> interval;
+  /// What the II had to respect across iterations. Absent for an acyclic span,
+  /// which models no carried edge at all.
+  std::optional<CarriedEdges> carried;
   /// Wall time of the whole solve in milliseconds.
   double millis = 0.0;
 };
@@ -133,6 +165,22 @@ struct FuncReport {
   std::string determinacy;
   std::vector<RegionReport> regions;
 };
+
+/// A schedule directive the scheduler did not apply, and what it did instead.
+///
+/// Only the REFUSALS are listed: a directive that lands leaves its mark on the
+/// region it shaped, while one that does not is otherwise invisible, since the
+/// region it named has been decomposed by the time any report is built. This is
+/// the fact behind a warning that would otherwise have nowhere to live.
+struct UnhonoredDirective {
+  /// The directive as the user spelled it (`pipeline`).
+  std::string directive;
+  /// Source anchor of the loop it was attached to, as the log names it.
+  std::string where;
+  /// Why it could not be applied, one stable mnemonic rather than prose.
+  std::string reason;
+};
+
 
 /// What the scheduling pipeline knows, in the two forms its two phases need:
 /// the SOLUTION hands `runSDCScheduler`'s start times and region solutions to
@@ -288,9 +336,24 @@ public:
       entryValues.erase(res);
   }
 
-  /// Read \p module's reified `allo.dcp.*` ops into `report`. Called once, at
-  /// the tail of the reify: before it there are no dcp ops, and after it the
-  /// pipeline is gone.
+  /// Record that one operation priced under operator type \p type holds
+  /// operator identity \p identity. Accumulated whole-module: a type
+  /// over-approximates the same way wherever it is used, so the split is a fact
+  /// about the library and not about one region.
+  void noteOperatorClass(llvm::StringRef type, llvm::StringRef identity) {
+    auto &[ops, identities] = classes[type.str()];
+    ++ops;
+    identities.insert(identity.str());
+  }
+
+  /// The operator types covering SEVERAL identities, in type order. A type
+  /// pricing one operation, or several of one identity, does not
+  /// over-approximate and is not reported.
+  std::vector<OperatorClass> operatorClasses() const;
+
+  /// Read \p module's reified `allo.dcp.*` ops into `report`, and the prep
+  /// passes' stamped decisions into `prep`. Called once, at the tail of the
+  /// reify: before it there are no dcp ops, and after it the pipeline is gone.
   void record(ModuleOp module);
 
   /// The report as the JSON document Python parses. Optional fields are
@@ -306,7 +369,14 @@ public:
   /// unlike `report` it survives whether or not the reify runs.
   std::vector<SolveReport> solves;
 
+  /// Directives the scheduler could not apply, in the order it met them.
+  /// Filled by the SOLVER, like `solves`.
+  std::vector<UnhonoredDirective> unhonored;
+
 private:
+  /// Operator type to the operations priced under it and the identities they
+  /// hold. Ordered, so two compiles report the classes the same way.
+  std::map<std::string, std::pair<unsigned, std::set<std::string>>> classes;
   llvm::DenseMap<Operation *, OpSchedule> ops;
   std::vector<AllocatedUnit> units;
   llvm::DenseMap<Operation *, RegionSolution> regions;

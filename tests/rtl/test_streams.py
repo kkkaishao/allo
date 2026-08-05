@@ -89,7 +89,7 @@ def test_channel_occupancy_bounds_ii(n):
                 s.put(A[i] + 2)
 
     regions = _to_rtl(prod).schedule().func("prod").regions
-    assert [r.ii for r in regions if r.ii is not None] == [n]
+    assert [r.interval for r in regions if r.interval is not None] == [n]
 
 
 # The resource is per channel, not per stream op: two puts to DIFFERENT
@@ -103,7 +103,7 @@ def test_distinct_channels_do_not_contend():
             t.put(A[i] + 1)
 
     regions = _to_rtl(fork).schedule().func("fork").regions
-    assert [r.ii for r in regions if r.ii is not None] == [1]
+    assert [r.interval for r in regions if r.interval is not None] == [1]
 
 
 # Both tokens reach the consumer, in program order. The two put values are
@@ -233,7 +233,11 @@ def test_stream_multi_access_per_channel():
     loop = _sched(mg_two).func("mg_two").cyclic()[0]
     gets = sorted(o.t for o in loop.ops if o.kind == "stream.get")
     # Distinct stages spanning less than the II; WHICH stages is the scheduler's.
-    assert loop.ii >= 2 and len(set(gets)) == 2 and gets[-1] - gets[0] < loop.ii
+    assert (
+        loop.interval >= 2
+        and len(set(gets)) == 2
+        and gets[-1] - gets[0] < loop.interval
+    )
 
     x = np.arange(2 * n, dtype=np.int32) * 7 + 3
     rtl = _to_rtl(mg_two)
@@ -266,7 +270,11 @@ def test_stream_multi_access_per_channel():
 
     loop = _sched(mg_three).func("mg_three").cyclic()[0]
     gets = sorted(o.t for o in loop.ops if o.kind == "stream.get")
-    assert loop.ii >= 3 and len(set(gets)) == 3 and gets[-1] - gets[0] < loop.ii
+    assert (
+        loop.interval >= 3
+        and len(set(gets)) == 3
+        and gets[-1] - gets[0] < loop.interval
+    )
     x = np.arange(3 * n, dtype=np.int32) * 3 + 1
     y = np.zeros(n, np.int32)
     _to_rtl(mg_three).cosim(x, y, stall_prob=0.6)
@@ -334,7 +342,7 @@ def test_stream_li_shell():
 
     res = _sched(top)
     loop = res.func("cons").cyclic()[0]
-    assert loop.ii == 1
+    assert loop.interval == 1
     assert loop.op("stream.get").t <= loop.op("addi").t
     # The epilogue store lands in its own acyclic region.
     assert any(
@@ -405,7 +413,12 @@ def test_stream_ii_gt1_with_memory_read_producer():
 
     # The consumer's inner loop is recurrence-bound: the shell runs the modulo
     # (II>1) regime, not the II==1 fast path.
-    iis = [r.ii for f in _sched(build(8)).funcs for r in f.regions if r.ii is not None]
+    iis = [
+        r.interval
+        for f in _sched(build(8)).funcs
+        for r in f.regions
+        if r.interval is not None
+    ]
     assert max(iis) > 1  # the modulo regime; the exact II is the scheduler's
 
     for K in (8, 16):
@@ -653,7 +666,7 @@ def test_self_loop_delay_line(dtype):
 
     rtl = _to_rtl(lc_sl)
     if dtype is i32:
-        assert rtl.schedule().func("lc_sl").cyclic()[0].ii >= 2
+        assert rtl.schedule().func("lc_sl").cyclic()[0].interval >= 2
         A = np.arange(N, dtype=np.int32) * 3 - 5
         out = np.zeros(N, np.int32)
         rtl.cosim(A, out)
@@ -661,7 +674,7 @@ def test_self_loop_delay_line(dtype):
     else:
         # The claim the i32 arm cannot make: the recurrence now runs through the
         # float adder, so the channel-occupancy floor is no longer what binds.
-        assert rtl.schedule().func("lc_sl").cyclic()[0].ii >= FADD
+        assert rtl.schedule().func("lc_sl").cyclic()[0].interval >= FADD
         A = (np.arange(N, dtype=np.float32) + 1) * 0.5
         out = np.zeros(N, np.float32)
         rtl.cosim(A, out)
@@ -1037,7 +1050,7 @@ def test_stream_shell_freeze_is_token_exact():
     rtl = s.export("rtl")
     loop = rtl.schedule().func("fz_put").cyclic()[0]
     put = next(o for o in loop.ops if o.kind == "stream.put")
-    assert loop.ii == 2 and put.t % loop.ii == 0, (loop.ii, put.t)
+    assert loop.interval == 2 and put.t % loop.interval == 0, (loop.interval, put.t)
     for gap in (0.0, 0.6):
         y = np.zeros(n, np.int32)
         rtl.cosim(x, y, stall_prob=gap)

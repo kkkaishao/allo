@@ -54,7 +54,7 @@ llvm::SmallVector<Value> ControlEmitter::emitScaledCounters(
     auto ty = c.b.getIntegerType(s.width);
     Backedge next = c.bb.get(ty);
     Value init = c.konst(ty, s.init);
-    Value reg = c.reg(next, init);
+    Value reg = c.reg(next, init, RegRole::Counter);
     nameValue(reg, regionSignal(rb.id, "addr" + std::to_string(slot)));
     // The same start-cycle bypass the counter takes, for the same reason: a
     // call region's first pass reads its index on `start` itself.
@@ -121,7 +121,7 @@ RegionControl ControlEmitter::emitPipelined(unsigned region, int64_t ii,
   Value phase;
   if (ii > 1) {
     auto phaseNext = c.bb.get(c.i32);
-    phase = c.reg(phaseNext, c.zero32);
+    phase = c.reg(phaseNext, c.zero32, RegRole::Counter);
     nameValue(phase, regionSignal(region, "phase"));
     wantIssue = c.R(
         comb::AndOp::create(c.b, c.loc, running, c.icmpEq(phase, 0), false));
@@ -142,7 +142,7 @@ RegionControl ControlEmitter::emitPipelined(unsigned region, int64_t ii,
   // on each gated issue, so a `lb != 0` / `step != 1` loop needs no body
   // rewriting.
   auto iterNext = c.bb.get(term.lb.getType());
-  Value iv = c.reg(iterNext, term.lb);
+  Value iv = c.reg(iterNext, term.lb, RegRole::Counter);
   Value ivStep = c.R(comb::AddOp::create(c.b, c.loc, iv, term.step, false));
   iterNext.setValue(c.mux(running, c.mux(issue, ivStep, iv), term.lb));
   // Terminate on the last issued iteration (the next induction value reaches
@@ -178,7 +178,7 @@ ControlEmitter::emitCountedIteration(const uarch::RegionBlock &rb,
   bool launchAtStart = boundary.arm == 0;
 
   Backedge ivNext = c.bb.get(term.lb.getType());
-  Value ivReg = c.reg(ivNext, term.lb);
+  Value ivReg = c.reg(ivNext, term.lb, RegRole::Counter);
   nameValue(ivReg, rb.counterName.empty() ? regionSignal(rb.id, "iv")
                                           : rb.counterName);
   Value iv = launchAtStart ? c.mux(start, term.lb, ivReg) : ivReg;

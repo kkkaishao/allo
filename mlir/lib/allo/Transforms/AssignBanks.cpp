@@ -3,8 +3,8 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-#include "allo/Scheduling/MemoryAccess.h" // asMemAccess
-#include "allo/Scheduling/MemoryModel.h"  // bankLayoutOf, staticBankOf
+#include "allo/Scheduling/MemoryAccess.h"  // asMemAccess
+#include "allo/Scheduling/MemoryModel.h"   // bankLayoutOf, staticBankOf
 #include "allo/Support/Logging.h"
 #include "allo/Transforms/Passes.h"
 
@@ -230,11 +230,12 @@ struct AssignBanksPass
     return s + "An access whose subscript is neither reaches every bank.";
   }
 
-  // Report what the partition bought. An unresolved access takes a port on
-  // every bank and the emitter builds a crossbar, so a partition that resolves
-  // nothing costs N memories at the bandwidth of one.
+  // An unresolved access takes a port on every bank and the emitter builds a
+  // crossbar, so a partition that resolves nothing costs N memories at the
+  // bandwidth of one. The one outcome a user has to act on, hence a warning;
+  // the fact itself is `Memory.partition_resolved` in the microarch report.
   void report(const Info &in) {
-    if (in.assigned == in.accesses)
+    if (in.assigned)
       return;
     unsigned banks = in.layout.numBanks;
     if (in.layout.skew()) {
@@ -245,13 +246,6 @@ struct AssignBanksPass
              "every "
              "access to the array shares one bank expression up to a constant, "
              "as A[i,j] and A[j,i] do and A[i,j] and A[i,2*j] do not";
-      return;
-    }
-    if (in.assigned) {
-      info(Stage::Prep, in.anchor)
-          << "Partition into " << banks << " banks resolves " << in.assigned
-          << " of " << in.accesses
-          << " accesses to one bank; the rest take a port on every bank";
       return;
     }
     warn(Stage::Prep, in.anchor)

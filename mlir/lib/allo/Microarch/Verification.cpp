@@ -53,7 +53,8 @@ LogicalResult verifyDatapath(dcp::DCPathModuleOp func, const Datapath &dp) {
   if (found) {
     // "cross-region value hand-off" is the stable phrase tests match on; the
     // builder's own hand-off rejects use the same wording.
-    unsupported(Stage::Emit, badSite.op ? badSite.op : func.getOperation())
+    unsupported(Stage::Emit, Code::CrossRegionHandOff,
+                badSite.op ? badSite.op : func.getOperation())
         << "A cross-region value hand-off is not lowered yet: "
         << badSite.describe() << " is unresolved";
     return failure();
@@ -149,7 +150,7 @@ LogicalResult checkCombPathsMeetPeriod(const Datapath &dp, float cycleTime,
     }
     // `mux` covers the whole input cone, so it may come from a shared
     // predecessor rather than from a multiplexer on this unit.
-    unsupported(Stage::Emit, worst)
+    unsupported(Stage::Emit, Code::BindingMuxOverPeriod, worst)
         << "Binding put " << llvm::format("%.2f", mux)
         << " ns of multiplexer on the path reaching this operation (its unit "
            "is shared between "
@@ -210,7 +211,7 @@ LogicalResult checkDeviceCapability(dcp::DCPathModuleOp func,
     assert(u.stall != allo::StallContractEnum::Elastic &&
            "an elastic IP reached emission");
     if (backPressured.count(unitRegion.lookup(u.id))) {
-      error(Stage::Emit, u.repOp())
+      error(Stage::Emit, Code::StallContractUnusable, u.repOp())
           << "Operator IP '" << operatorModuleName(u)
           << "' is free-running (no clock enable) but sits in a stream region, "
              "whose datapath freezes under back-pressure; the IP would keep "
@@ -319,14 +320,14 @@ LogicalResult checkEmitterSubset(dcp::DCPathModuleOp func, const Datapath &dp) {
     if (rb.conditional && !conditionOk(rb.condition,
                                        /*sequential=*/rb.shape ==
                                            RegionBlock::Shape::Container)) {
-      unsupported(Stage::Emit, rb.op)
+      unsupported(Stage::Emit, Code::PredicateNotCombinational, rb.op)
           << "A while loop with a non-combinational (memory-/IP-dependent) "
              "condition is not lowered yet";
       return failure();
     }
     if (rb.shape == RegionBlock::Shape::Guard &&
         !conditionOk(rb.condition, /*sequential=*/false)) {
-      unsupported(Stage::Emit, rb.op)
+      unsupported(Stage::Emit, Code::PredicateNotCombinational, rb.op)
           << "A guard with a non-combinational predicate is not lowered yet";
       return failure();
     }

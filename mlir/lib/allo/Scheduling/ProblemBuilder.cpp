@@ -49,9 +49,6 @@ innermostCarriedDistance(ArrayRef<affine::DependenceComponent> comps,
 // `Unknown` a `*` direction the test could not bound.
 namespace {
 enum class DistanceOrigin { Proven, NonAffine, Unknown };
-struct CarriedEdgeCounts {
-  unsigned carried = 0, nonAffine = 0, unknown = 0;
-};
 } // namespace
 
 static DistanceOrigin distanceOrigin(const MemoryDependence &dep,
@@ -62,18 +59,6 @@ static DistanceOrigin distanceOrigin(const MemoryDependence &dep,
   if (!comps.empty() && !comps.back().lb.has_value())
     return DistanceOrigin::Unknown;
   return DistanceOrigin::Proven;
-}
-
-// Report how many of a region's carried memory edges rest on an assumption
-// rather than a proof.
-static void reportCarriedEdges(Operation *containingOp,
-                               const CarriedEdgeCounts &counts) {
-  if (!counts.nonAffine && !counts.unknown)
-    return;
-  logging::info(logging::Stage::Sched, containingOp)
-      << "Carried memory dependences: " << counts.carried << " total, "
-      << counts.nonAffine << " non-affine, " << counts.unknown
-      << " unknown-distance";
 }
 
 // Whether a dependence is carried by some enclosing loop (a positive distance
@@ -136,11 +121,10 @@ static void anchorSinks(ProblemT &problem, Operation *anchor) {
 }
 
 template <class ProblemT>
-ProblemT buildCyclicProblem(LoopLikeOpInterface loop,
-                            DependenceAnalysis &deps) {
+ProblemT buildCyclicProblem(LoopLikeOpInterface loop, DependenceAnalysis &deps,
+                            CarriedEdges &counts) {
   ProblemT problem(loop.getOperation());
   Block *body = &loop.getLoopRegions().front()->front();
-  CarriedEdgeCounts counts;
 
   // Insert memory and stream dependences into the problem.
   body->walk([&](Operation *op) {
@@ -162,7 +146,7 @@ ProblemT buildCyclicProblem(LoopLikeOpInterface loop,
         continue;
 
       if (distance >= 1) {
-        ++counts.carried;
+        ++counts.total;
         DistanceOrigin origin = distanceOrigin(memoryDep, op, deps);
         counts.nonAffine += origin == DistanceOrigin::NonAffine;
         counts.unknown += origin == DistanceOrigin::Unknown;
@@ -253,7 +237,6 @@ ProblemT buildCyclicProblem(LoopLikeOpInterface loop,
   // computed over the finished graph.
   anchorSinks(problem, anchor);
 
-  reportCarriedEdges(loop.getOperation(), counts);
   return problem;
 }
 
@@ -437,7 +420,8 @@ bool whileFlushingPipelines(scf::WhileOp w, const OperatorLibrary &lib) {
 }
 
 template <class ProblemT>
-ProblemT buildWhileProblem(scf::WhileOp w, DependenceAnalysis &deps) {
+ProblemT buildWhileProblem(scf::WhileOp w, DependenceAnalysis &deps,
+                           CarriedEdges &counts) {
   assert(whileHasIdentityForwarding(w) && "while must forward args 1:1");
   ProblemT problem(w.getOperation());
   auto &before = w.getBefore().front();
@@ -445,7 +429,6 @@ ProblemT buildWhileProblem(scf::WhileOp w, DependenceAnalysis &deps) {
   auto condOp = w.getConditionOp();
   auto yieldOp = w.getYieldOp();
   auto *condProducer = condOp.getCondition().getDefiningOp();
-  CarriedEdgeCounts counts;
 
   // Register every op in both regions first, so a later-walked back-edge
   // source still resolves. The before terminator (`scf.condition`) is a pure
@@ -471,7 +454,7 @@ ProblemT buildWhileProblem(scf::WhileOp w, DependenceAnalysis &deps) {
         if (drop)
           continue;
         if (distance >= 1) {
-          ++counts.carried;
+          ++counts.total;
           DistanceOrigin origin = distanceOrigin(memoryDep, op, deps);
           counts.nonAffine += origin == DistanceOrigin::NonAffine;
           counts.unknown += origin == DistanceOrigin::Unknown;
@@ -528,7 +511,6 @@ ProblemT buildWhileProblem(scf::WhileOp w, DependenceAnalysis &deps) {
   // a block argument or the after region is bare.
   anchorSinks(problem, anchor);
 
-  reportCarriedEdges(w.getOperation(), counts);
   return problem;
 }
 
@@ -615,9 +597,10 @@ ProblemT buildAcyclicProblem(ArrayRef<Operation *> ops,
 // Explicit instantiations for the problem types the scheduler pass builds.
 template ChainingModuloProblem
 buildCyclicProblem<ChainingModuloProblem>(LoopLikeOpInterface,
-                                          DependenceAnalysis &);
+                                          DependenceAnalysis &, CarriedEdges &);
 template ChainingModuloProblem
-buildWhileProblem<ChainingModuloProblem>(scf::WhileOp, DependenceAnalysis &);
+buildWhileProblem<ChainingModuloProblem>(scf::WhileOp, DependenceAnalysis &,
+                                         CarriedEdges &);
 template ChainingSharedOperatorsProblem
 buildAcyclicProblem<ChainingSharedOperatorsProblem>(ArrayRef<Operation *>,
                                                     DependenceAnalysis &);

@@ -349,7 +349,8 @@ OperatorLibrary OperatorLibrary::fromModule(ModuleOp module) {
       // check it and a row naming something outside it is reported here rather
       // than dropped into a silent zero delay.
       if (!kind) {
-        logging::error(logging::Stage::Prep, comb)
+        logging::error(logging::Stage::Prep,
+                       logging::Code::DeviceDeclarationInvalid, comb)
             << "Device declares a combinational delay for '" << comb.getKind()
             << "', which is not an operator kind";
         continue;
@@ -634,39 +635,17 @@ OperatorIdentity mlir::allo::operatorIdentity(Operation *op,
   return lib.lookup(op).identity;
 }
 
-void mlir::allo::reportOperatorClassSplit(circt::scheduling::Problem &problem,
-                                          const OperatorLibrary &lib) {
-  if (!logging::detail::enabled(logging::Level::Info))
-    return;
-  // Operator type -> {ops priced under it, their distinct identities}. Sorted,
-  // so two compiles report the classes in the same order.
-  std::map<std::string, std::pair<unsigned, llvm::StringSet<>>> byType;
+void mlir::allo::recordOperatorClasses(circt::scheduling::Problem &problem,
+                                       const OperatorLibrary &lib,
+                                       ScheduleModel &model) {
   for (Operation *op : problem.getOperations()) {
     if (isSyncSubKernelCall(op))
       continue; // no operator row, so no class for one to over-approximate
     OperatorIdentity id = operatorIdentity(op, lib);
     if (!id.realized())
       continue;
-    auto &[count, classes] = byType[lib.lookup(op).typeName];
-    ++count;
-    classes.insert(id.key());
+    model.noteOperatorClass(lib.lookup(op).typeName, id.key());
   }
-
-  // Only a type pricing several ops under several identities over-approximates.
-  llvm::SmallVector<std::pair<std::string, std::pair<unsigned, unsigned>>>
-      split;
-  for (auto &[type, seen] : byType)
-    if (seen.first > 1 && seen.second.size() > 1)
-      split.push_back({type, {seen.first, (unsigned)seen.second.size()}});
-  if (split.empty())
-    return;
-
-  auto d = logging::info(logging::Stage::Sched, problem.getContainingOp());
-  d << "Operator classes: " << split.size() << " of " << byType.size()
-    << " operator types cover several operator identities:";
-  for (auto &[type, counts] : split)
-    d << " " << type << " " << counts.first << " ops / " << counts.second
-      << " classes,";
 }
 
 bool OperatorLibrary::requiresUnmatchedIP(Operation *op) const {

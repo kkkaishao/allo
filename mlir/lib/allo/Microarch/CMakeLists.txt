@@ -11,6 +11,7 @@ add_mlir_library(MLIRAlloMicroarch
     EmitDriver.cpp
     Primitives.cpp
     Naming.cpp
+    Report.cpp
     Reservation.cpp
     Interface.cpp
     Verification.cpp

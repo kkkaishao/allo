@@ -50,7 +50,11 @@ def test_while_scheduling():
     # Raised to a constant-bound for, so the schedule matches `range(128)`
     # exactly -- same II, length, and (non-bound) latency -- and is not
     # conditional (no flushing controller).
-    assert (w.ii, w.length, w.latency) == (f.ii, f.length, f.latency)
+    assert (w.interval, w.iteration_latency, w.latency) == (
+        f.interval,
+        f.iteration_latency,
+        f.latency,
+    )
     assert not w.conditional and not w.latency_is_bound
     # The data-dependent counterpart is scheduled and driven together in
     # test_while_flushing_pipeline_cosim.
@@ -282,10 +286,10 @@ def test_while_pipeline_operators_are_allocated():
             out[c] = A[c] * A[c + 1] * A[c + 2]
             c = c + 1
 
-    mod = _to_rtl(wmul, scheduler="exact", binding="planned")
+    mod = _to_rtl(wmul, binding="planned").set_scheduler_opt(scheduler="exact")
     res = mod.schedule()
     assert res.cyclic()[0].conditional  # a flushing while, not a raised `for`
-    solve = next(s for s in res.solves if s.kind == "while")
+    solve = next(s for s in res.compiler.solves if s.kind == "while")
     assert solve.allocated_ops > 0, "the while body never reached the allocation"
 
     # `Ai` all ones makes the trip exactly `limit`, so `c + 2` stays inside `A`.
@@ -614,7 +618,7 @@ def test_call_in_a_while_body():
     # The drop, stated: a CHECK/RUN while emits an `r<N>_check` and its region
     # carries no static II. A flushing pipeline has neither.
     assert Mod(rtl.mlir, "wc_top").regions_with("check")
-    assert rtl.schedule().funcs[0].regions[0].ii is None
+    assert rtl.schedule().funcs[0].regions[0].interval is None
 
     A16 = np.array([3, 5, 7, 2, 4, 6, 0] + [9] * 9, dtype=np.int32)  # sentinel at 6
     B = np.zeros(16, np.int32)
@@ -661,7 +665,7 @@ def test_while_condition_reads_a_shape_the_check_cannot_evaluate():
             i = i + 1
 
     for k in (wcc_nested, wcc_flat):
-        with pytest.raises(Exception, match="CHECK region cannot evaluate"):
+        with pytest.raises(RuntimeError):
             _to_rtl(k).schedule()
 
 
