@@ -24,7 +24,7 @@ class OperatorLibrary;
 
 /// What one physical operator is: two operations share an identity exactly when
 /// one unit can run both. The library's second key, finer than
-/// `OperatorChar::typeName`, which names a timing row.
+/// `NodeTiming::typeName`, which names a timing row.
 struct OperatorIdentity {
   /// The realization, on exactly one of the two exclusive paths a
   /// `dcp.compute` takes. Both empty when no functional unit is built for the

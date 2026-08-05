@@ -394,8 +394,9 @@ bool conditionIsCombinational(scf::WhileOp w, const DeviceModel &dev) {
     if (op == term)
       return WalkResult::advance();
     // An access is timed by its storage, everything else by an operator row.
-    unsigned latency = asMemAccess(op) ? dev.memory.timing(op).latency
-                                       : dev.operators.lookup(op).latency;
+    unsigned latency = asMemAccess(op)
+                           ? dev.memory.timing(op).latency
+                           : dev.operators.lookup(op).timing.latency;
     if (latency == 0)
       return WalkResult::advance();
     comb = false;

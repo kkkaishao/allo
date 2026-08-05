@@ -359,14 +359,14 @@ int64_t OperatorLibrary::pulsePrice() const {
   return chainPrice(2, 1) - chainPrice(1, 1);
 }
 
-OperatorChar mlir::allo::accessCharacterization(Operation *op,
-                                                const OperatorLibrary &opLib,
-                                                const MemoryLibrary &memLib) {
+NodeTiming mlir::allo::accessCharacterization(Operation *op,
+                                              const OperatorLibrary &opLib,
+                                              const MemoryLibrary &memLib) {
   std::optional<MemAccess> a = asMemAccess(op);
   assert(a && "accessCharacterization was handed something that is not an "
               "access");
   MemoryLibrary::Timing t = memLib.timing(op);
-  OperatorChar c;
+  NodeTiming c;
   bool stream = a->kind == AccessKind::Stream;
   c.typeName = stream ? (a->isWrite ? "srm.wr" : "srm.rd")
                       : (a->isWrite ? "mem.wr" : "mem.rd");
@@ -426,13 +426,13 @@ OperatorChar OperatorLibrary::lookup(Operation *op) const {
   // The stable Problem::OperatorType key: an IP row's symbol, a comb row's
   // `comb.<kind>`, else `default`.
   OperatorChar c;
-  c.typeName = !e->symbol.empty() ? e->symbol
-               : e->comb          ? ("comb." + stringifyOpKindEnum(e->kind)).str()
-                                  : std::string("default");
-  c.latency = e->latency;
+  c.timing.typeName = !e->symbol.empty() ? e->symbol
+                      : e->comb ? ("comb." + stringifyOpKindEnum(e->kind)).str()
+                                : std::string("default");
+  c.timing.latency = e->latency;
+  c.timing.inDelay = e->inDelay;
+  c.timing.outDelay = e->outDelay;
   c.pipelined = e->pipelined;
-  c.inDelay = e->inDelay;
-  c.outDelay = e->outDelay;
   // Every row is characterized over one parameter, an operand width; an IP's
   // signature pins it, so there the factors are constants and this is the
   // measured core.
@@ -482,7 +482,7 @@ void mlir::allo::recordOperatorClasses(circt::scheduling::Problem &problem,
     OperatorIdentity id = operatorIdentity(op, lib);
     if (!id.realized())
       continue;
-    model.noteOperatorClass(lib.lookup(op).typeName, id.key());
+    model.noteOperatorClass(lib.lookup(op).timing.typeName, id.key());
   }
 }
 

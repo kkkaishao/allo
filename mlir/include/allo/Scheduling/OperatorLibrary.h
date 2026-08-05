@@ -81,18 +81,32 @@ struct OperatorEntry {
                       // silent (see `OperatorLibrary::priceOf`).
 };
 
-/// What a lookup resolves for one operation. Two separate keys: the scheduling
-/// problem prices `typeName`, while an allocation limit, the binder's share
-/// test and the emitted module name all key on `identity`.
-struct OperatorChar {
-  std::string typeName; // stable: one Problem::OperatorType per matched entry
+/// What a scheduling problem registers for ONE node: the operator type it runs
+/// under, and the timing that type carries. The shape the three kinds of node
+/// agree on, whatever answered for them (`populateOperatorTypes`): a device
+/// operator row, a callee's own schedule, or a storage port.
+///
+/// `typeName` is the KEY, so two nodes registered under one name must carry
+/// the same timing, and anything that makes a node cost differently has to
+/// reach the name too (an access's address cone does).
+struct NodeTiming {
+  std::string typeName;
   uint32_t latency = 0;
+  double inDelay = 0.0;  // ns, from an operand to this node
+  double outDelay = 0.0; // ns, from this node to its consumer
+};
+
+/// What a lookup resolves for one operation: the timing row it is scheduled
+/// under, and what the library additionally knows about the unit behind it.
+/// Two separate keys: the scheduling problem prices `timing.typeName`, while
+/// an allocation limit, the binder's share test and the emitted module name
+/// all key on `identity`.
+struct OperatorChar {
+  NodeTiming timing; // stable: one Problem::OperatorType per matched entry
   /// Whether one instance accepts a new input every cycle. False bounds a
   /// cyclic region's interval (`populateOperatorOccupancy`) and keeps the
   /// operator out of a cyclic allocation (`populateOperatorAllocation`).
   bool pipelined = true;
-  double inDelay = 0.0;
-  double outDelay = 0.0;
   /// What ONE instance of the matched row costs in the device's currency
   /// (`OperatorLibrary::priceOf`), at this operation's own width. Zero where
   /// the device prices the row at nothing and where it prices it not at all,
@@ -231,16 +245,17 @@ scheduledCallLatency(Operation *op) {
 // Operator model: apply a library to a scheduling problem.
 //===----------------------------------------------------------------------===//
 
-/// What one memory or stream access is worth to a schedule. NOT a device
-/// operator row: an access builds no functional unit, so it has no identity
-/// and no price, and both libraries answer for it. Its length and port delay
-/// are the storage's (\p memLib); the address cone feeding that port is
-/// ARITHMETIC, priced against \p opLib's combinational rows.
+/// What one memory or stream access is worth to a schedule. A NodeTiming and
+/// not an `OperatorChar`: an access builds no functional unit, so there is no
+/// identity to name, nothing to price and nothing to share.
 ///
-/// The two meet here rather than inside either library, because a scheduling
-/// problem is the only thing that needs them added up.
-OperatorChar accessCharacterization(Operation *op, const OperatorLibrary &opLib,
-                                    const MemoryLibrary &memLib);
+/// Both libraries answer for it. Its length and port delay are the storage's
+/// (\p memLib); the address cone feeding that port is ARITHMETIC, priced
+/// against \p opLib's combinational rows. The two meet here rather than inside
+/// either library, because a scheduling problem is the only thing that needs
+/// them added up.
+NodeTiming accessCharacterization(Operation *op, const OperatorLibrary &opLib,
+                                  const MemoryLibrary &memLib);
 
 /// Assign an operator type (latency + chaining delays) to every operation
 /// \p problem holds. Three sources, because a problem holds three kinds of
@@ -255,27 +270,27 @@ void populateOperatorTypes(ProblemT &problem, const OperatorLibrary &lib,
                            const MemoryLibrary &memLib) {
   using namespace circt::scheduling;
   for (Operation *op : problem.getOperations()) {
+    NodeTiming t;
     if (isSyncSubKernelCall(op)) {
       // Timed by its callee, between registered boundaries. An INDETERMINATE
       // callee has no length to charge, so the node takes zero and its region
-      // waits on the child's `done` instead (`isIndeterminateCall`).
+      // waits on the child's `done` instead (`isIndeterminateCall`). A call
+      // sits between registered boundaries, so it chains with nothing.
       std::optional<std::pair<int64_t, std::string>> cl =
           scheduledCallLatency(op);
-      Problem::OperatorType opr = problem.getOrInsertOperatorType(
+      t.typeName =
           cl ? cl->second
-             : ("call." + cast<func::CallOp>(op).getCallee() + ".open").str());
-      problem.setLatency(opr, cl ? static_cast<unsigned>(cl->first) : 0);
-      problem.setIncomingDelay(opr, 0.0);
-      problem.setOutgoingDelay(opr, 0.0);
-      problem.setLinkedOperatorType(op, opr);
-      continue;
+             : ("call." + cast<func::CallOp>(op).getCallee() + ".open").str();
+      t.latency = cl ? static_cast<uint32_t>(cl->first) : 0;
+    } else if (asMemAccess(op)) {
+      t = accessCharacterization(op, lib, memLib);
+    } else {
+      t = lib.lookup(op).timing;
     }
-    OperatorChar c = asMemAccess(op) ? accessCharacterization(op, lib, memLib)
-                                     : lib.lookup(op);
-    Problem::OperatorType opr = problem.getOrInsertOperatorType(c.typeName);
-    problem.setLatency(opr, c.latency);
-    problem.setIncomingDelay(opr, c.inDelay);
-    problem.setOutgoingDelay(opr, c.outDelay);
+    Problem::OperatorType opr = problem.getOrInsertOperatorType(t.typeName);
+    problem.setLatency(opr, t.latency);
+    problem.setIncomingDelay(opr, t.inDelay);
+    problem.setOutgoingDelay(opr, t.outDelay);
     problem.setLinkedOperatorType(op, opr);
   }
 }
@@ -339,7 +354,7 @@ inline void populateOperatorOccupancy(ChainingModuloProblem &problem,
     OperatorChar c = lib.lookup(op);
     // A one-cycle window is what a pipelined unit already holds, and bounds no
     // interval.
-    if (c.pipelined || c.latency < 2)
+    if (c.pipelined || c.timing.latency < 2)
       continue;
     assert(c.identity.realized() &&
            "only an IP row is non-pipelined, and an IP row names a realization");
@@ -351,7 +366,7 @@ inline void populateOperatorOccupancy(ChainingModuloProblem &problem,
       units.assign(linked->begin(), linked->end());
     units.push_back(rsrc);
     problem.setLinkedResourceTypes(op, units);
-    problem.setResourceCycles(op, c.latency);
+    problem.setResourceCycles(op, c.timing.latency);
     ++idx;
   }
 }
@@ -405,7 +420,7 @@ void populateOperatorAllocation(ProblemT &problem, const OperatorLibrary &lib) {
       continue;
     // A non-pipelined unit is busy for its whole latency; a pipelined one
     // contends only for its issue slot.
-    unsigned occ = c.pipelined ? 1 : std::max(1u, c.latency);
+    unsigned occ = c.pipelined ? 1 : std::max(1u, c.timing.latency);
     if (isCyclic && occ > 1)
       continue; // a count alone is not sufficient modulo the II
     OperatorClass &cls = byIdentity[c.identity.key()];
