@@ -83,6 +83,10 @@ public:
   /// It lives here because the assumption ranges do: a symbolic trip is bounded
   /// by the same facts this analysis distilled, and the scheduler, its span
   /// composer and the trip-bound record all ask for one loop's trip.
+  ///
+  /// Memoized: the boundary expansion, the solve, the span composition and the
+  /// trip-bound record each ask for the same loop, and the answer is a function
+  /// of IR this analysis is only valid over anyway.
   LoopTrip tripOf(Operation *loop) const;
 
 private:
@@ -90,6 +94,7 @@ private:
   circt::analysis::MemoryDependenceResult results;
   llvm::DenseMap<Value, AssumedRange> assumedRanges;
   llvm::SmallDenseSet<Operation *> nonPolyhedral;
+  mutable llvm::DenseMap<Operation *, LoopTrip> trips;
 };
 
 /// Whether \p op carries a memory effect this analysis does not model

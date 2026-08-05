@@ -681,9 +681,12 @@ static LoopTrip scfTrip(scf::ForOp loop, const DependenceAnalysis &deps) {
 }
 
 LoopTrip DependenceAnalysis::tripOf(Operation *loop) const {
-  if (auto affineLoop = dyn_cast<AffineForOp>(loop))
-    return affineTrip(affineLoop, *this);
-  return scfTrip(cast<scf::ForOp>(loop), *this);
+  auto [it, fresh] = trips.try_emplace(loop);
+  if (fresh)
+    it->second = isa<AffineForOp>(loop)
+                     ? affineTrip(cast<AffineForOp>(loop), *this)
+                     : scfTrip(cast<scf::ForOp>(loop), *this);
+  return it->second;
 }
 
 

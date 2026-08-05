@@ -289,10 +289,8 @@ private:
   LogicalResult scheduleAcyclic(ArrayRef<Operation *> ops);
 
   // What a solve leaves behind: the schedule, the allocation, the measurement.
-  template <class ProblemT>
-  void annotateRegion(ProblemT &problem, Operation *owner,
-                      std::optional<int64_t> ii, std::optional<int64_t> trip,
-                      bool tripIsBound, int64_t drain);
+  void annotateRegion(circt::scheduling::ChainingProblem &problem,
+                      Operation *owner, RegionSolution sol);
   void annotateAllocation(OccupancyProblem &problem);
   void recordSolve(OccupancyProblem &problem, StringRef kind,
                    std::optional<unsigned> ii, Stopwatch since);
@@ -313,14 +311,15 @@ private:
 } // namespace
 
 /// Record the solved schedule of one region in \p model: every registered op's
-/// start cycle and sub-cycle start, plus the region's own solution keyed by
-/// \p owner, the op both descents land on: a counted band's innermost loop, a
-/// flushing `scf.while`, or a straight-line span's first op.
-template <class ProblemT>
-void FuncScheduler::annotateRegion(ProblemT &problem, Operation *owner,
-                                   std::optional<int64_t> ii,
-                                   std::optional<int64_t> trip,
-                                   bool tripIsBound, int64_t drain) {
+/// start cycle and sub-cycle start, plus \p sol, keyed by \p owner, the op both
+/// descents land on: a counted band's innermost loop, a flushing `scf.while`,
+/// or a straight-line span's first op.
+///
+/// The caller hands \p sol in already filled. Its `length` in particular is a
+/// number that path already holds: a non-pipelined region RUNS at the body
+/// depth, and a straight-line one reports it.
+void FuncScheduler::annotateRegion(circt::scheduling::ChainingProblem &problem,
+                                   Operation *owner, RegionSolution sol) {
   for (Operation *op : problem.getOperations()) {
     std::optional<unsigned> start = problem.getStartTime(op);
     if (!start)
@@ -334,13 +333,7 @@ void FuncScheduler::annotateRegion(ProblemT &problem, Operation *owner,
     if (std::optional<float> z = problem.getStartTimeInCycle(op))
       model.setStartInCycle(op, *z);
   }
-  RegionSolution &r = model.addRegion(owner);
-  r.ii = ii;
-  // Both are per-invocation: no composed total is stored.
-  r.length = problem.scheduleDepth();
-  r.drain = drain;
-  r.trip = trip;
-  r.tripIsBound = tripIsBound;
+  model.addRegion(owner) = sol;
 }
 
 // Publish the solved allocation into \p model: one entry per instance the
@@ -495,8 +488,14 @@ LogicalResult FuncScheduler::scheduleCyclic(LoopLikeOpInterface body,
           << " cycle(s), so no iteration may issue sooner";
   }
 
-  annotateRegion(problem, body.getOperation(), ii, trip.count,
-                 trip.bounded, drain);
+  // Every field is per-invocation: no composed total is stored.
+  RegionSolution sol;
+  sol.ii = ii;
+  sol.length = depth;
+  sol.drain = drain;
+  sol.trip = trip.count;
+  sol.tripIsBound = trip.bounded;
+  annotateRegion(problem, body.getOperation(), sol);
   annotateAllocation(problem);
   return success();
 }
@@ -538,11 +537,13 @@ LogicalResult FuncScheduler::scheduleWhile(scf::WhileOp w,
   info(Stage::Sched, w.getOperation())
       << "  -> While loop scheduled as a flushing pipeline: II=" << *ii
       << " (trip is data-dependent, so whole-loop latency is unknown)";
-  // The trip is data-dependent, so no span composes off this drain: it is
-  // recorded, like `ii`, as what the solve decided.
-  annotateRegion(problem, w.getOperation(), *ii,
-                 /*trip=*/std::nullopt, /*tripIsBound=*/false,
-                 span.drainOf(problem));
+  // The trip is data-dependent, so it stays empty and no span composes off this
+  // drain: both are recorded, like `ii`, as what the solve decided.
+  RegionSolution sol;
+  sol.ii = *ii;
+  sol.length = problem.scheduleDepth();
+  sol.drain = span.drainOf(problem);
+  annotateRegion(problem, w.getOperation(), sol);
   annotateAllocation(problem);
   return success();
 }
@@ -615,12 +616,14 @@ LogicalResult FuncScheduler::scheduleAcyclic(ArrayRef<Operation *> ops) {
           solveSchedulingProblem(problem, ops.back(), cycleTime, opts, span)))
     return failure();
   recordSolve(problem, "acyclic", /*ii=*/std::nullopt, solveStart);
+  // A straight-line span issues once, so it carries no II and no trip. How
+  // often its enclosing loops re-run it is charged where they are composed.
+  RegionSolution sol;
+  sol.length = problem.scheduleDepth();
+  sol.drain = span.drainOf(problem);
   info(Stage::Sched, ops.front())
-      << "Scheduled: depth = " << problem.scheduleDepth() << " cycles";
-  // How often its enclosing loops re-run it is charged where they are composed.
-  annotateRegion(problem, ops.front(), /*ii=*/std::nullopt,
-                 /*trip=*/std::nullopt, /*tripIsBound=*/false,
-                 span.drainOf(problem));
+      << "Scheduled: depth = " << sol.length << " cycles";
+  annotateRegion(problem, ops.front(), sol);
   annotateAllocation(problem);
   return success();
 }
@@ -778,8 +781,9 @@ LogicalResult FuncScheduler::scheduleRegion(const SchedRegion &region) {
     return scheduleAcyclic(region.ops);
   }
   if (isa<AffineForOp, scf::ForOp>(region.anchor())) {
-    LoopLikeOpInterface innermost =
-        perfectNest(cast<LoopLikeOpInterface>(region.anchor())).back();
+    SmallVector<LoopLikeOpInterface> band =
+        perfectNest(cast<LoopLikeOpInterface>(region.anchor()));
+    LoopLikeOpInterface innermost = band.back();
     int64_t dir = pipelineDirective(innermost.getOperation(), region.anchor());
     // The same shape query `buildSpanNode` composes through, so solving and
     // costing agree on which level drives children. Only a Container
@@ -803,10 +807,8 @@ LogicalResult FuncScheduler::scheduleRegion(const SchedRegion &region) {
     {
       auto d = info(Stage::Sched, innermost.getOperation());
       d << "Detected as a for-loop";
-      if (unsigned band =
-              perfectNest(cast<LoopLikeOpInterface>(region.anchor())).size();
-          band > 1)
-        d << " (perfect band of " << band << " levels)";
+      if (band.size() > 1)
+        d << " (perfect band of " << band.size() << " levels)";
       if (dir == -1)
         d << ", pipelining disabled";
       else if (dir >= 1)
