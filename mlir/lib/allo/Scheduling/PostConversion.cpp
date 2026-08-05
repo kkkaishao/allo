@@ -626,7 +626,9 @@ static void materializeSequential(const RegionAttrs &r,
       work.push_back(op);
   }
 
-  if (work.empty() || llvm::all_of(work, isDeclarationOp))
+  // The predicate the scheduler skips such a span by, so a region is
+  // materialized exactly where a solution was solved.
+  if (!spanFormsRegion(work))
     return;
 
   // Move the hoisted allocs above the region so they dominate the wrapped uses.

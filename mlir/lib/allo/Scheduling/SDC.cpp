@@ -398,7 +398,10 @@ static void annotateRegion(circt::scheduling::ChainingProblem &problem,
 }
 
 // Publish the solved allocation into \p model: one entry per instance the
-// region builds, and the instance each operation runs on.
+// region builds, and the instance each operation runs on. Every operation on an
+// allocated resource carries one: `applyAllocation` derives them alongside the
+// counts it sets, and `verifyAllocation` has already failed the solve where one
+// is missing.
 static void annotateAllocation(OccupancyProblem &problem, ScheduleModel &model,
                                const OperatorLibrary &lib) {
   for (circt::scheduling::Problem::ResourceType rsrc :
@@ -837,11 +840,11 @@ static LogicalResult scheduleRegion(const SchedRegion &region,
                                     ScheduleModel &model, float cycleTimeNs,
                                     const SchedulerOptions &opts) {
   if (region.kind != allo::RegionKind::Loop) {
-    // An all-constant span is a tie-off the reify leaves in place, with no
-    // latency and no materialized region; scheduling it would cost a spurious
-    // region and desync the whole-kernel latency.
-    if (llvm::all_of(region.ops,
-                     [](Operation *op) { return isa<arith::ConstantOp>(op); }))
+    // A span of nothing but declarations is a tie-off the reify leaves in
+    // place, so scheduling it costs a spurious region and lets a func with
+    // nothing else publish a zero-cycle latency. THE predicate, shared with
+    // the composition below and with the reify.
+    if (!spanFormsRegion(region.ops))
       return success();
     info(Stage::Sched, region.anchor())
         << "A straight-line span of " << region.ops.size()
