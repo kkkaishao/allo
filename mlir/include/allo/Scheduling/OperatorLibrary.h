@@ -333,8 +333,8 @@ inline void populateCallOccupancy(ChainingModuloProblem &problem) {
 ///
 /// Private per operation, because this prices an operation against ITSELF one
 /// iteration on, which holds however many units the region builds. What a unit
-/// SHARED between two operations costs is `populateOperatorAllocation`'s, and it
-/// declines a non-pipelined operator in a cyclic region for want of a
+/// SHARED between two operations costs is `populateOperatorAllocation`'s, and
+/// it declines a non-pipelined operator in a cyclic region for want of a
 /// circular-arc colouring, leaving every such operation the unit this bounds.
 ///
 /// Only an IP row can be non-pipelined: a comb row and the default row are
@@ -356,8 +356,9 @@ inline void populateOperatorOccupancy(ChainingModuloProblem &problem,
     // interval.
     if (c.pipelined || c.timing.latency < 2)
       continue;
-    assert(c.identity.realized() &&
-           "only an IP row is non-pipelined, and an IP row names a realization");
+    assert(
+        c.identity.realized() &&
+        "only an IP row is non-pipelined, and an IP row names a realization");
     P::ResourceType rsrc = problem.getOrInsertResourceType(
         c.identity.key() + "#" + std::to_string(idx));
     problem.setLimit(rsrc, 1);

@@ -3,8 +3,8 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-#include "allo/Scheduling/MemoryAccess.h"  // asMemAccess
-#include "allo/Scheduling/MemoryModel.h"   // bankLayoutOf, staticBankOf
+#include "allo/Scheduling/MemoryAccess.h" // asMemAccess
+#include "allo/Scheduling/MemoryModel.h"  // bankLayoutOf, staticBankOf
 #include "allo/Support/Logging.h"
 #include "allo/Transforms/Passes.h"
 

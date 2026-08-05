@@ -5,7 +5,7 @@
 
 #include "allo/Microarch/Verification.h"
 
-#include "allo-c/Schedule.h"           // kPartitionAttr
+#include "allo-c/Schedule.h"       // kPartitionAttr
 #include "allo/Microarch/Naming.h" // operatorModuleName
 #include "allo/Support/Logging.h"
 
@@ -339,7 +339,8 @@ LogicalResult checkEmitterSubset(dcp::DCPathModuleOp func, const Datapath &dp) {
   // realization needs no further check: it is a `CombOpKind`, and `emitCompute`
   // covers the enum.
   for (const FuncUnit &u : dp.units)
-    assert(u.identity.realized() && "an unrealizable operator reached emission");
+    assert(u.identity.realized() &&
+           "an unrealizable operator reached emission");
   return success();
 }
 

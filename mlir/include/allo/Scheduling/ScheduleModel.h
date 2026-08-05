@@ -181,7 +181,6 @@ struct UnhonoredDirective {
   std::string reason;
 };
 
-
 /// What the scheduling pipeline knows, in the two forms its two phases need:
 /// the SOLUTION hands `runSDCScheduler`'s start times and region solutions to
 /// `runPostScheduleConversion`, and the REPORT is what the reify builds from

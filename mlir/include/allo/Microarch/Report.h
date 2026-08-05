@@ -71,8 +71,8 @@ struct MemReport {
   std::vector<int64_t> shape; // element shape
   unsigned width = 0;         // element bits
   unsigned banks = 1;
-  std::string layout;  // "none", "cyclic", "block", "skew" or "complete"
-  std::string storage; // the resolved `dcp.storage` realization
+  std::string layout;      // "none", "cyclic", "block", "skew" or "complete"
+  std::string storage;     // the resolved `dcp.storage` realization
   unsigned depthWords = 0; // elements per bank
   unsigned readLatency = 0, writeLatency = 1;
   unsigned reads = 0, writes = 0; // accesses bound in this module
@@ -153,8 +153,8 @@ struct MicroarchReport {
   /// build.
   static constexpr unsigned kVersion = 1;
 
-  std::string binding;  // the sharing policy this emission ran under
-  float cycleTime = 0;  // ns, the period the schedule was cut to
+  std::string binding; // the sharing policy this emission ran under
+  float cycleTime = 0; // ns, the period the schedule was cut to
   std::vector<FuncUarch> funcs;
 
   /// The report as the JSON document Python parses. Absent optionals are

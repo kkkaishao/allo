@@ -229,9 +229,8 @@ std::string mlir::allo::ScheduleModel::toJSON() const {
 
   Array unhonoredEntries;
   for (const UnhonoredDirective &u : unhonored)
-    unhonoredEntries.push_back(Object{{"directive", u.directive},
-                                      {"where", u.where},
-                                      {"reason", u.reason}});
+    unhonoredEntries.push_back(Object{
+        {"directive", u.directive}, {"where", u.where}, {"reason", u.reason}});
   Value root = Object{{"funcs", std::move(funcs)},
                       {"solves", std::move(solveEntries)},
                       {"operator_classes", std::move(classEntries)},

@@ -143,7 +143,8 @@ static std::string resolveStorage(Value memRef, const MemoryLibrary &lib) {
     return lib.scatterStorage;
   auto bs =
       parseBindStorage(carrierAttr<DictionaryAttr>(memRef, kBindStorageAttr));
-  return (bs.storage.empty() ? StringRef(lib.defaultStorage) : bs.storage).str();
+  return (bs.storage.empty() ? StringRef(lib.defaultStorage) : bs.storage)
+      .str();
 }
 
 StringRef allo::boundStorageOf(Value memRef) {
@@ -697,7 +698,8 @@ MemoryLibrary::Timing MemoryLibrary::timing(Operation *op) const {
     // The one way a resolution comes back empty is a completely partitioned
     // array on a device marking no `scatter` row, which `PreVerification`
     // rejects; reaching here means that check was bypassed.
-    assert(!name.empty() && "an array access resolves to a storage realization");
+    assert(!name.empty() &&
+           "an array access resolves to a storage realization");
     t = timing(name);
   }
   return a->isWrite ? Timing{t.latency.write, t.delay.write, name}

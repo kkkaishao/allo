@@ -122,8 +122,8 @@ static int64_t registerWidth(Type type) {
 // \p carried is the counted-loop body whose block arguments after the
 // induction variable are its iter_args, or null where there is no such
 // recurrence to price (a straight-line span, a `while`).
-static SmallVector<RegisterTerm>
-registerTerms(OccupancyProblem &problem, Block *carried) {
+static SmallVector<RegisterTerm> registerTerms(OccupancyProblem &problem,
+                                               Block *carried) {
   SmallVector<RegisterTerm> terms;
   DenseMap<Value, unsigned> slotOf;
   auto readBy = [&](Value v, Operation *def, Operation *reader,
@@ -165,8 +165,8 @@ registerTerms(OccupancyProblem &problem, Block *carried) {
 SpanObjective::SpanObjective(OccupancyProblem &problem, ValueRange results,
                              Block *carried, std::optional<int64_t> trip,
                              const OperatorLibrary &device)
-    : drain(drainTerms(problem, results)), regs(registerTerms(problem, carried)),
-      trip(trip), device(device) {}
+    : drain(drainTerms(problem, results)),
+      regs(registerTerms(problem, carried)), trip(trip), device(device) {}
 
 // Whether the problem carries a loop-carried recurrence (a dependence spanning
 // >= 1 iteration), which can hold the modulo II above the resource bound.
@@ -299,9 +299,8 @@ void FuncScheduler::annotateAllocation(OccupancyProblem &problem) {
     assert(!users.empty() && "an allocated resource nothing runs on");
     // One resource is one operator identity, so every operation on it names
     // the same `dcp.operator`.
-    unsigned base =
-        model.addUnits(dev.operators.lookup(users.front()).identity.ipSymbol,
-                       *units);
+    unsigned base = model.addUnits(
+        dev.operators.lookup(users.front()).identity.ipSymbol, *units);
     for (Operation *op : users)
       model.setUnit(op, base + *problem.getAssignedUnit(op));
   }
@@ -528,7 +527,8 @@ static FailureOr<SmallVector<Operation *>> conditionCone(scf::WhileOp w) {
       return failure();
     }
     for (Value o : def->getOperands())
-      if (!isa<MemRefType>(o.getType())) // the memref names storage, not a value
+      if (!isa<MemRefType>(
+              o.getType())) // the memref names storage, not a value
         work.push_back(o);
   }
   SmallVector<Operation *> cone;
@@ -620,7 +620,8 @@ std::vector<SpanNode> FuncScheduler::buildSpanNodes(Block &body) {
 // nullopt means the region occupies no cycles and forms no node (a
 // straight-line span of nothing but declarations). A data-dependent region
 // still forms a node, with the unknown left in its own fields.
-std::optional<SpanNode> FuncScheduler::buildSpanNode(const SchedRegion &region) {
+std::optional<SpanNode>
+FuncScheduler::buildSpanNode(const SchedRegion &region) {
   SpanNode n;
   // Driven by an enclosing region rather than by the func's own sequencer, the
   // same question the reify side asks of a dcp op's parents.
@@ -768,9 +769,9 @@ LogicalResult FuncScheduler::scheduleRegion(const SchedRegion &region) {
       // implemented: the container sequences its children and runs no schedule
       // of its own.
       if (dir >= 1) {
-        model.unhonored.push_back({"pipeline",
-                                   logging::detail::describe(innermost.getLoc()),
-                                   "imperfect_nest"});
+        model.unhonored.push_back(
+            {"pipeline", logging::detail::describe(innermost.getLoc()),
+             "imperfect_nest"});
         warn(Stage::Sched, innermost.getOperation())
             << "A pipeline directive on an imperfect nest is not honored yet; "
                "scheduling its body as sequential sub-regions. Leave "
@@ -857,10 +858,9 @@ void FuncScheduler::eraseHint(RewriterBase &b, Operation *op) {
   for (Value v : operands)
     if (Operation *def = v.getDefiningOp())
       if (isOpTriviallyDead(def)) {
-        assert(llvm::none_of(def->getResults(),
-                             [&](Value r) {
-                               return deps.getAssumedRanges().count(r);
-                             }) &&
+        assert(llvm::none_of(
+                   def->getResults(),
+                   [&](Value r) { return deps.getAssumedRanges().count(r); }) &&
                "erasing a value the assumed-range map is keyed by");
         eraseHint(b, def);
       }

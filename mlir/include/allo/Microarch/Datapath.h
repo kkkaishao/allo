@@ -370,12 +370,12 @@ struct CallUnit {
   /// two read ports; a read-modify-write accumulator: a read AND a write port),
   /// so there is one MemArg per child port, not per operand.
   struct MemArg {
-    unsigned calleeArg;         // operand position == callee argument index
-    MemId mem;                  // caller MemUnit backing this array
-    bool isBoundary;            // a func BlockArgument vs an internal alloc
-    bool isWrite;               // this port writes (vs reads)
-    unsigned bank = 0;          // cyclic bank this port serves (0 unbanked)
-    unsigned factor = 1;        // partition factor (1 unbanked)
+    unsigned calleeArg;  // operand position == callee argument index
+    MemId mem;           // caller MemUnit backing this array
+    bool isBoundary;     // a func BlockArgument vs an internal alloc
+    bool isWrite;        // this port writes (vs reads)
+    unsigned bank = 0;   // cyclic bank this port serves (0 unbanked)
+    unsigned factor = 1; // partition factor (1 unbanked)
     /// The child says its write ports on this argument never collide, so the
     /// array backing them may give each its own `always` block
     /// (`MemUnit::writesIndependent`, `iface::Memory::independent`).
@@ -894,7 +894,6 @@ struct Datapath {
   /// than an access of this function.
   static constexpr unsigned kNoWritePort = ~0u;
 
-
   /// The accesses of \p id the port model counts and the "can issue in one
   /// cycle" relation over them, one adjacency bitset per access. \p accessOf
   /// maps a vertex back to its index in `MemUnit::accesses`, or `kNoWritePort`
@@ -903,11 +902,9 @@ struct Datapath {
   /// for an access of this function. Shorter than \p accessOf when there are
   /// more than the 64 a bitset holds, where the relation is not built at all
   /// and every access counts as simultaneous.
-  llvm::SmallVector<uint64_t>
-  portGraph(MemId id, bool writesOnly,
-            llvm::SmallVectorImpl<unsigned> &accessOf,
-            llvm::SmallVectorImpl<std::pair<int, bool>> *callerOf = nullptr)
-      const;
+  llvm::SmallVector<uint64_t> portGraph(
+      MemId id, bool writesOnly, llvm::SmallVectorImpl<unsigned> &accessOf,
+      llvm::SmallVectorImpl<std::pair<int, bool>> *callerOf = nullptr) const;
 };
 
 //===----------------------------------------------------------------------===//

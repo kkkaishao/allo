@@ -3,8 +3,8 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-#include "allo-c/Schedule.h"               // kPartitionAttr, kBindStorageAttr
-#include "allo/Support/AliasAnalysis.h"    // alloAliasAnalysis
+#include "allo-c/Schedule.h"            // kPartitionAttr, kBindStorageAttr
+#include "allo/Support/AliasAnalysis.h" // alloAliasAnalysis
 #include "allo/Support/Logging.h"
 #include "allo/Transforms/Passes.h"
 

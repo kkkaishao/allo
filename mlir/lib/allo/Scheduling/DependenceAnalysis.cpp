@@ -689,7 +689,6 @@ LoopTrip DependenceAnalysis::tripOf(Operation *loop) const {
   return it->second;
 }
 
-
 int64_t carriedDistanceAtLevel(ArrayRef<affine::DependenceComponent> comps,
                                unsigned level, bool &drop, bool &valid) {
   drop = false;

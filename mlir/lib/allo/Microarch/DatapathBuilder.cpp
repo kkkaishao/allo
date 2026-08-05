@@ -1608,7 +1608,8 @@ void DatapathBuilder::build() {
 
   // The allocation, settled here and not later: every pass below resolves
   // Values to Sources against the unit table (see `allocateUnits`).
-  allocateUnits(policy.plan(dp, {cycleTime, dev.operators})); // trivial => a no-op
+  allocateUnits(
+      policy.plan(dp, {cycleTime, dev.operators})); // trivial => a no-op
   assert(llvm::all_of(dp.units,
                       [](const FuncUnit &u) { return !u.boundOps.empty(); }) &&
          "the unit table is the allocation: a unit exists because ops are "

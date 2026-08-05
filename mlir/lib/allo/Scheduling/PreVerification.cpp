@@ -341,7 +341,8 @@ LogicalResult checkMemories(func::FuncOp func, const MemoryLibrary &memLib,
     // A complete partition scatters the array regardless of its bound storage;
     // nothing else resolves an explicitly bound array to the scatter row.
     StringRef bound = boundStorageOf(array);
-    if (memLib.isScatter(storage) && !bound.empty() && !memLib.isScatter(bound)) {
+    if (memLib.isScatter(storage) && !bound.empty() &&
+        !memLib.isScatter(bound)) {
       error(Stage::Prep, Code::ArrayLayoutConflict, anchor)
           << "Array " << array.getType() << " is bound to storage '" << bound
           << "' and also completely partitioned, which scatters it into "
@@ -349,11 +350,13 @@ LogicalResult checkMemories(func::FuncOp func, const MemoryLibrary &memLib,
       return failure();
     }
     // A completely partitioned array needs the device's `scatter` row; an empty
-    // name would otherwise fall through as a stream's, timed by an unrelated row.
+    // name would otherwise fall through as a stream's, timed by an unrelated
+    // row.
     if (storage.empty()) {
       error(Stage::Prep, Code::StorageNotDeclared, anchor)
           << "Array " << array.getType()
-          << " is completely partitioned, but the device marks no `dcp.storage` "
+          << " is completely partitioned, but the device marks no "
+             "`dcp.storage` "
              "`scatter` for one cell per element to be built out of";
       return failure();
     }

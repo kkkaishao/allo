@@ -216,8 +216,8 @@ llvm::StringRef bankKindName(BankLayout::Kind kind);
 BankLayout bankLayoutOf(Value memRef);
 
 /// One array's storage shape: how it banks, what ports one bank has, and which
-/// `dcp.storage` realization it resolves to. THE characterization, billed by the
-/// scheduler's port model (`MemoryBankModel`) and built by the microarch
+/// `dcp.storage` realization it resolves to. THE characterization, billed by
+/// the scheduler's port model (`MemoryBankModel`) and built by the microarch
 /// datapath (`MemUnit`), so what a schedule reserves and what the emitter wires
 /// cannot drift apart.
 struct MemoryChar {
@@ -384,9 +384,9 @@ AffineMap linearizeAccessMap(AffineMap map, llvm::ArrayRef<int64_t> shape);
 namespace mlir::allo {
 
 /// Per-bank memory-port model. `observe` every memory access in a scheduling
-/// region, `finalize` to `characterize` the arrays behind them, then `resources`
-/// gives the port resources one access holds. Each `allo.part` bank is a
-/// separate limited resource carrying the array's ports.
+/// region, `finalize` to `characterize` the arrays behind them, then
+/// `resources` gives the port resources one access holds. Each `allo.part` bank
+/// is a separate limited resource carrying the array's ports.
 ///
 /// An access holds one port on EVERY bank it can reach: the bank `assign-banks`
 /// assigned it, or all of them when assigned none. The latter is not a

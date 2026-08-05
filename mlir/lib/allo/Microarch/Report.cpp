@@ -6,7 +6,7 @@
 #include "allo/Microarch/Report.h"
 
 #include "allo/Microarch/Datapath.h"
-#include "allo/Microarch/Naming.h" // operatorModuleName, ownerOf
+#include "allo/Microarch/Naming.h"       // operatorModuleName, ownerOf
 #include "allo/Scheduling/MemoryModel.h" // bankKindName
 
 #include "mlir/IR/BuiltinTypes.h"
@@ -76,11 +76,12 @@ FuncUarch::FuncUarch(const Datapath &dp, llvm::StringRef symbol,
     for (UnitId uid : rb.units) {
       const FuncUnit &u = dp.units[uid];
       r.computeOps += u.boundOps.size();
-      r.units.push_back({u.identity.key(), u.identity.ipSymbol,
-                         u.identity.comb ? std::string() : operatorModuleName(u),
-                         hwWidth(u.identity.resultType), u.latency,
-                         (unsigned)u.boundOps.size(), u.identity.comb.has_value(),
-                         u.pipelined});
+      r.units.push_back(
+          {u.identity.key(), u.identity.ipSymbol,
+           u.identity.comb ? std::string() : operatorModuleName(u),
+           hwWidth(u.identity.resultType), u.latency,
+           (unsigned)u.boundOps.size(), u.identity.comb.has_value(),
+           u.pipelined});
     }
     r.muxes = muxClasses(dp, rb, muxWidth);
     for (MuxId mid : rb.muxes) {
@@ -240,7 +241,8 @@ std::string MicroarchReport::toJSON() const {
                   j.attribute("call_reads", (int64_t)m.cost.callReads);
                   j.attribute("call_writes", (int64_t)m.cost.callWrites);
                   j.attribute("writing_calls", (int64_t)m.cost.writingCalls);
-                  j.attribute("writing_regions", (int64_t)m.cost.writingRegions);
+                  j.attribute("writing_regions",
+                              (int64_t)m.cost.writingRegions);
                   j.attribute("ports_needed_write",
                               (int64_t)m.cost.portsNeededWrite);
                   j.attribute("ports_needed_total",

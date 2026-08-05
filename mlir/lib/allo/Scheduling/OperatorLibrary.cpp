@@ -101,22 +101,23 @@ OpKind mlir::allo::classify(Operation *op) {
       ALLO_COMB_KINDS(X)
 #undef X
           .Case<arith::AddFOp>([](auto) { return OpKind::Add; })
-      .Case<arith::SubFOp>([](auto) { return OpKind::Sub; })
-      .Case<arith::MulFOp>([](auto) { return OpKind::Mul; })
-      .Case<arith::DivFOp>([](auto) { return OpKind::Div; })
-      .Case<arith::RemFOp>([](auto) { return OpKind::Rem; })
-      .Case<arith::MaximumFOp>([](auto) { return OpKind::Max; })
-      .Case<arith::MinimumFOp>([](auto) { return OpKind::Min; })
-      .Case<arith::MaxNumFOp>([](auto) { return OpKind::MaxNum; })
-      .Case<arith::MinNumFOp>([](auto) { return OpKind::MinNum; })
-      .Case<arith::CeilDivSIOp, arith::CeilDivUIOp>(
-          [](auto) { return OpKind::CeilDiv; })
-      .Case<arith::FloorDivSIOp>([](auto) { return OpKind::FloorDiv; })
-      .Case<arith::CmpFOp>([](auto) { return OpKind::Cmp; })
-      .Case<arith::SIToFPOp, arith::UIToFPOp, arith::FPToSIOp, arith::FPToUIOp>(
-          [](auto) { return OpKind::FCastI; })
-      .Case<arith::ExtFOp, arith::TruncFOp>([](auto) { return OpKind::FCastF; })
-      .Default([](auto) { return OpKind::Unknown; });
+          .Case<arith::SubFOp>([](auto) { return OpKind::Sub; })
+          .Case<arith::MulFOp>([](auto) { return OpKind::Mul; })
+          .Case<arith::DivFOp>([](auto) { return OpKind::Div; })
+          .Case<arith::RemFOp>([](auto) { return OpKind::Rem; })
+          .Case<arith::MaximumFOp>([](auto) { return OpKind::Max; })
+          .Case<arith::MinimumFOp>([](auto) { return OpKind::Min; })
+          .Case<arith::MaxNumFOp>([](auto) { return OpKind::MaxNum; })
+          .Case<arith::MinNumFOp>([](auto) { return OpKind::MinNum; })
+          .Case<arith::CeilDivSIOp, arith::CeilDivUIOp>(
+              [](auto) { return OpKind::CeilDiv; })
+          .Case<arith::FloorDivSIOp>([](auto) { return OpKind::FloorDiv; })
+          .Case<arith::CmpFOp>([](auto) { return OpKind::Cmp; })
+          .Case<arith::SIToFPOp, arith::UIToFPOp, arith::FPToSIOp,
+                arith::FPToUIOp>([](auto) { return OpKind::FCastI; })
+          .Case<arith::ExtFOp, arith::TruncFOp>(
+              [](auto) { return OpKind::FCastF; })
+          .Default([](auto) { return OpKind::Unknown; });
 }
 
 //===----------------------------------------------------------------------===//
@@ -272,9 +273,9 @@ OperatorLibrary OperatorLibrary::fromModule(ModuleOp module) {
     for (auto r : device.getBody().getOps<dcp::DCPathResourceOp>())
       widest = std::max<int64_t>(widest, r.getCapacity());
     for (auto r : device.getBody().getOps<dcp::DCPathResourceOp>())
-      lib.resourcePrices[r.getSymName()] = std::max<int64_t>(
-          1, llvm::divideNearest<int64_t>(kPriceResolution * widest,
-                                          r.getCapacity()));
+      lib.resourcePrices[r.getSymName()] =
+          std::max<int64_t>(1, llvm::divideNearest<int64_t>(
+                                   kPriceResolution * widest, r.getCapacity()));
     for (auto m : device.getBody().getOps<dcp::DCPathMuxOp>())
       lib.muxUses = m.getUsesAttr();
     for (auto c : device.getBody().getOps<dcp::DCPathChainOp>())

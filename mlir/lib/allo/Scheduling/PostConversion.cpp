@@ -475,8 +475,8 @@ static DCPathPipelineOp materializeLoopToPipeline(const RegionAttrs &r,
 // is left in place, sourced directly by identity.
 static void materializeSequential(const RegionAttrs &r,
                                   ArrayRef<Operation *> ops,
-                                  ScheduleModel &model,
-                                  const DeviceModel &dev, bool container) {
+                                  ScheduleModel &model, const DeviceModel &dev,
+                                  bool container) {
   SmallVector<Operation *> body;
   for (Operation *op : ops)
     if (!op->hasTrait<OpTrait::IsTerminator>())

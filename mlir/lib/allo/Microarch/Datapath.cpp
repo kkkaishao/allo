@@ -310,7 +310,6 @@ double unitSlack(const FuncUnit &u, float cycleTime,
   return slack;
 }
 
-
 /// The largest set of mutually adjacent vertices in \p adj, a bitset per
 /// vertex, by Bron-Kerbosch with pivoting: every maximal clique contains the
 /// pivot or a candidate NOT adjacent to it, so only those need branching. \p

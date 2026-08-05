@@ -393,9 +393,8 @@ LogicalResult emitDatapathToHW(ModuleOp module, StringRef binding,
       dp.dump(llvm::dbgs());
     });
     b.setInsertionPoint(f);
-    auto pairOr =
-        emitModule(f, dp, b, opModules, cycleTime, dev.operators, report,
-                   callees);
+    auto pairOr = emitModule(f, dp, b, opModules, cycleTime, dev.operators,
+                             report, callees);
     if (failed(pairOr))
       return failure();
     registerModule(f.getSymName(), pairOr->first, std::move(pairOr->second));
