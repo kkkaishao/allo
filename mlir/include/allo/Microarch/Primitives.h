@@ -56,8 +56,6 @@ llvm::SmallVector<llvm::APInt> initWords(ElementsAttr init, unsigned width,
 /// which a synthesis tool reads back as a BRAM INIT.
 void recordMemoryInit(circt::seq::HLMemOp mem,
                       llvm::ArrayRef<llvm::APInt> words);
-/// Whether a native integer/logic mnemonic has an `emitCompute` comb lowering.
-bool combEmitted(StringRef kind);
 /// The datapath's width for an index value, seen from the address side: an
 /// address expression may be carried narrower than this (see `evalAffine`), but
 /// its operands arrive at this width and a divider is computed at it. The same
@@ -83,14 +81,14 @@ Value resize(OpBuilder &b, Location loc, Value v, unsigned width,
 /// are computed at `kDatapathAddressWidth` and their result narrowed.
 Value evalAffine(OpBuilder &b, Location loc, AffineExpr e, ValueRange idx,
                  unsigned numDims, unsigned width = kDatapathAddressWidth);
-/// The comb op realizing a combinational integer compute unit (pre-checked by
-/// `combEmitted`), reading as many of \p operands as the mnemonic's arity
-/// needs.
+/// The comb op realizing a combinational compute unit, reading as many of
+/// \p operands as \p kind's arity needs. Every `CombOpKind` has a case here,
+/// which is what makes the enum the whole native vocabulary.
 /// \p resultType is the unit's hw result type. The width-preserving binary ops
 /// ignore it; the unary casts (extsi/extui/trunci) resize to it.
 /// \p srcOp is the source dcp.compute op, carrying any op-specific attribute
-/// the mnemonic needs (e.g. arith.cmpi's `predicate`).
-Value emitCompute(OpBuilder &b, Location loc, StringRef kind,
+/// the kind needs (e.g. arith.cmpi's `predicate`).
+Value emitCompute(OpBuilder &b, Location loc, allo::CombOpKindEnum kind,
                   ValueRange operands, Type resultType, Operation *srcOp);
 
 /// Declare a module's boundary ports from its port model, in the canonical ABI

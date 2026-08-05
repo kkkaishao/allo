@@ -300,7 +300,7 @@ void FuncScheduler::annotateAllocation(OccupancyProblem &problem) {
     // One resource is one operator identity, so every operation on it names
     // the same `dcp.operator`.
     unsigned base =
-        model.addUnits(lib.lookup(users.front()).identity.realization, *units);
+        model.addUnits(lib.lookup(users.front()).identity.ipSymbol, *units);
     for (Operation *op : users)
       model.setUnit(op, base + *problem.getAssignedUnit(op));
   }

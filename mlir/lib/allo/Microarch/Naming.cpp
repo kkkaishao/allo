@@ -237,8 +237,7 @@ std::string operatorPredicate(const FuncUnit &u) {
 
 std::string operatorModuleName(const FuncUnit &u) {
   std::string pred = operatorPredicate(u);
-  return pred.empty() ? u.identity.realization
-                      : u.identity.realization + "_" + pred;
+  return pred.empty() ? u.identity.ipSymbol : u.identity.ipSymbol + "_" + pred;
 }
 
 void nameValue(Value v, llvm::StringRef name) {

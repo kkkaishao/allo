@@ -281,14 +281,18 @@ bool needsIP(Operation *op) {
   }
 }
 
-// The identity of the unit \p op runs on. Empty without a realization, or when
-// \p op is not the single-result compute a `FuncUnit` is built from.
-OperatorIdentity identityOf(Operation *op, std::string realization, bool comb) {
+// The identity of the unit \p op runs on: a native \p comb realization or the
+// `dcp.operator` \p symbol, exactly one of which a caller gives. Empty without
+// either, or when \p op is not the single-result compute a `FuncUnit` is built
+// from.
+OperatorIdentity identityOf(Operation *op, std::optional<CombOpKindEnum> comb,
+                            StringRef symbol) {
+  assert(!(comb && !symbol.empty()) && "a compute takes one realization path");
   OperatorIdentity id;
-  if (realization.empty() || op->getNumResults() != 1)
+  if ((!comb && symbol.empty()) || op->getNumResults() != 1)
     return id;
-  id.realization = std::move(realization);
   id.comb = comb;
+  id.ipSymbol = symbol.str();
   id.argTypes.assign(op->getOperandTypes().begin(),
                      op->getOperandTypes().end());
   id.resultType = op->getResult(0).getType();
@@ -592,14 +596,14 @@ OperatorChar OperatorLibrary::lookup(Operation *op) const {
   // The realization is the row's own symbol when it is an IP, else the native
   // lowering the reifier picks; the default row reaches the comb arm too.
   if (!e->symbol.empty())
-    c.identity = identityOf(op, e->symbol, /*comb=*/false);
-  else if (std::optional<CombOpKindEnum> ck = combKindOf(op))
-    c.identity = identityOf(op, stringifyCombOpKindEnum(*ck).str(), true);
+    c.identity = identityOf(op, std::nullopt, e->symbol);
+  else
+    c.identity = identityOf(op, combKindOf(op), "");
   return c;
 }
 
 std::string OperatorIdentity::key() const {
-  std::string s = realization;
+  std::string s = realizationName().str();
   llvm::raw_string_ostream os(s);
   os << '(';
   llvm::interleaveComma(argTypes, os);
@@ -612,9 +616,8 @@ std::string OperatorIdentity::key() const {
 }
 
 OperatorIdentity mlir::allo::operatorIdentity(dcp::DCPathComputeOp comp) {
-  if (std::optional<CombOpKindEnum> ck = comp.getCombKind())
-    return identityOf(comp, stringifyCombOpKindEnum(*ck).str(), true);
-  return identityOf(comp, comp.getOpTypeAttr().getValue().str(), false);
+  return identityOf(comp, comp.getCombKind(),
+                    comp.getOpType().value_or(StringRef()));
 }
 
 OperatorIdentity mlir::allo::operatorIdentity(Operation *op,

@@ -14,7 +14,6 @@
 
 #include "mlir/Dialect/Arith/IR/Arith.h" // arith::CmpIPredicate
 #include "mlir/IR/BuiltinTypes.h"
-#include "llvm/ADT/StringSwitch.h"
 #include "llvm/Support/SaveAndRestore.h"
 
 using namespace mlir;
@@ -72,19 +71,6 @@ void recordMemoryInit(seq::HLMemOp mem, ArrayRef<APInt> words) {
   mem->setAttr(kMemoryInitAttr, ArrayAttr::get(mem.getContext(), vals));
 }
 
-// Integer/logic mnemonics EmitHW lowers to a native `comb` primitive. The
-// single source of truth for `emitCompute`'s coverage.
-bool combEmitted(StringRef kind) {
-  return llvm::StringSwitch<bool>(kind)
-      .Cases({"addi", "subi", "muli", "andi", "ori", "xori"}, true)
-      .Cases({"extsi", "extui", "trunci", "index_cast", "index_castui"}, true)
-      .Cases({"cmpi", "select", "shli", "shrsi", "shrui"}, true)
-      .Cases({"divsi", "divui", "remsi", "remui"}, true)
-      .Cases({"minsi", "maxsi", "minui", "maxui"}, true)
-      .Cases({"apply", "negf"}, true)
-      .Default(false);
-}
-
 // arith and comb name the same ten integer-compare predicates; map across the
 // two enums.
 static comb::ICmpPredicate combICmpPredicate(arith::CmpIPredicate p) {
@@ -115,35 +101,46 @@ static comb::ICmpPredicate combICmpPredicate(arith::CmpIPredicate p) {
   llvm_unreachable("unknown arith::CmpIPredicate");
 }
 
-Value emitCompute(OpBuilder &b, Location loc, StringRef kind,
+Value emitCompute(OpBuilder &b, Location loc, CombOpKindEnum kind,
                   ValueRange operands, Type resultType, Operation *srcOp) {
+  using E = CombOpKindEnum;
+  // A constant affine map takes no operands, and the unary kinds take one, so
+  // neither read is unconditional.
+  Value lhs = operands.empty() ? Value() : operands[0];
+  Value rhs = operands.size() > 1 ? operands[1] : Value();
+  // A compare feeds a mux: what an integer min/max is.
+  auto minmax = [&](comb::ICmpPredicate p) -> Value {
+    Value c = comb::ICmpOp::create(b, loc, p, lhs, rhs, false)->getResult(0);
+    return comb::MuxOp::create(b, loc, c, lhs, rhs)->getResult(0);
+  };
+  // No `default`, so a new `CombOpKind` case fails to compile here rather than
+  // reaching the unreachable below.
+  switch (kind) {
   // affine.apply: the map rides on the op, left by loop-canonicalization when
   // an IV is read outside an address. Via evalAffine, so a power-of-two divisor
   // stays shift+mask.
-  if (kind == "apply") {
+  case E::Apply: {
     assert(srcOp->getAttr("map") &&
            "dcp.compute<apply> must carry the original affine map");
     AffineMap map = cast<AffineMapAttr>(srcOp->getAttr("map")).getValue();
     assert(map.getNumResults() == 1 && "affine.apply yields one result");
     return evalAffine(b, loc, map.getResult(0), operands, map.getNumDims());
   }
-  Value lhs = operands[0];
   // Width-changing unary casts resize operand[0] via a comb sign/zero-extend or
   // a low-bit extract; 0-latency, so they slot into the schedule like any comb.
-  if (kind == "extsi")
+  case E::Extsi:
     return comb::createOrFoldSExt(b, loc, lhs, resultType);
-  if (kind == "extui")
+  case E::Extui:
     return comb::createZExt(b, loc, lhs,
                             cast<IntegerType>(resultType).getWidth());
-  if (kind == "trunci")
+  case E::Trunci:
     return comb::ExtractOp::create(b, loc, resultType, lhs, 0).getResult();
-  if (kind == "index_cast")
+  case E::IndexCast:
     return resize(b, loc, lhs, cast<IntegerType>(resultType).getWidth(),
                   /*isSigned=*/true);
   // Float negate: the float rides as its integer bit pattern, so flipping its
-  // sign bit is a single XOR, no IP. Unary, so it precedes the
-  // `rhs = operands[1]` read below.
-  if (kind == "negf") {
+  // sign bit is a single XOR, no IP.
+  case E::Negf: {
     unsigned w = cast<IntegerType>(resultType).getWidth();
     // The width's signed minimum is exactly the top bit set, at any width. An
     // APInt, not `1 << (w-1)`, which shifts into an int64's sign bit at
@@ -153,65 +150,60 @@ Value emitCompute(OpBuilder &b, Location loc, StringRef kind,
     return comb::XorOp::create(b, loc, lhs, signBit, false)->getResult(0);
   }
   // 3-input value mux: arith.select(cond, t, f) == comb.mux (cond ? t : f).
-  if (kind == "select")
+  case E::Select:
     return comb::MuxOp::create(b, loc, operands[0], operands[1], operands[2])
         ->getResult(0);
   // Width-preserving binary integer/logic ops.
-  Value rhs = operands[1];
-  if (kind == "addi")
+  case E::Addi:
     return comb::AddOp::create(b, loc, lhs, rhs, false)->getResult(0);
-  if (kind == "subi")
+  case E::Subi:
     return comb::SubOp::create(b, loc, lhs, rhs, false)->getResult(0);
-  if (kind == "muli")
+  case E::Muli:
     return comb::MulOp::create(b, loc, lhs, rhs, false)->getResult(0);
-  if (kind == "andi")
+  case E::Andi:
     return comb::AndOp::create(b, loc, lhs, rhs, false)->getResult(0);
-  if (kind == "ori")
+  case E::Ori:
     return comb::OrOp::create(b, loc, lhs, rhs, false)->getResult(0);
-  if (kind == "xori")
+  case E::Xori:
     return comb::XorOp::create(b, loc, lhs, rhs, false)->getResult(0);
-  if (kind == "shli")
+  case E::Shli:
     return comb::ShlOp::create(b, loc, lhs, rhs, false)->getResult(0);
-  if (kind == "shrsi")
+  case E::Shrsi:
     return comb::ShrSOp::create(b, loc, lhs, rhs, false)->getResult(0);
-  if (kind == "shrui")
+  case E::Shrui:
     return comb::ShrUOp::create(b, loc, lhs, rhs, false)->getResult(0);
   // Signed / unsigned divide, emitted for a flattened guard's delinearization;
   // a scheduled data divide is multi-cycle IP instead.
-  if (kind == "divsi")
+  case E::Divsi:
     return comb::DivSOp::create(b, loc, lhs, rhs, false)->getResult(0);
-  if (kind == "divui")
+  case E::Divui:
     return comb::DivUOp::create(b, loc, lhs, rhs, false)->getResult(0);
   // Signed / unsigned remainder (int rem is combinational under the operator
   // model).
-  if (kind == "remsi")
+  case E::Remsi:
     return comb::ModSOp::create(b, loc, lhs, rhs, false)->getResult(0);
-  if (kind == "remui")
+  case E::Remui:
     return comb::ModUOp::create(b, loc, lhs, rhs, false)->getResult(0);
-  // Integer min/max: a compare feeds a mux.
-  auto minmax = [&](comb::ICmpPredicate p) -> Value {
-    Value c = comb::ICmpOp::create(b, loc, p, lhs, rhs, false)->getResult(0);
-    return comb::MuxOp::create(b, loc, c, lhs, rhs)->getResult(0);
-  };
-  if (kind == "minsi")
+  case E::Minsi:
     return minmax(comb::ICmpPredicate::slt);
-  if (kind == "maxsi")
+  case E::Maxsi:
     return minmax(comb::ICmpPredicate::sgt);
-  if (kind == "minui")
+  case E::Minui:
     return minmax(comb::ICmpPredicate::ult);
-  if (kind == "maxui")
+  case E::Maxui:
     return minmax(comb::ICmpPredicate::ugt);
   // Integer compare, with the predicate carried from arith.cmpi.
-  if (kind == "cmpi") {
+  case E::Cmpi: {
     auto pred =
         cast<arith::CmpIPredicateAttr>(srcOp->getAttr("predicate")).getValue();
     return comb::ICmpOp::create(b, loc, combICmpPredicate(pred), lhs, rhs,
                                 false)
         ->getResult(0);
   }
+  }
   // Not an `assert`: under NDEBUG that would fall through and hand back a null
   // Value to wire into the datapath.
-  llvm_unreachable("combEmitted mnemonic without an emitCompute case");
+  llvm_unreachable("CombOpKind outside the enum reached emitCompute");
 }
 
 //===----------------------------------------------------------------------===//

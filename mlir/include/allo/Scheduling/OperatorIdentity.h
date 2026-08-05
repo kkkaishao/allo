@@ -13,7 +13,9 @@
 #include "mlir/IR/Types.h"
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/StringRef.h"
 
+#include <optional>
 #include <string>
 
 namespace mlir::allo {
@@ -24,29 +26,35 @@ class OperatorLibrary;
 /// one unit can run both. The library's second key, finer than
 /// `OperatorChar::typeName`, which names a timing row.
 struct OperatorIdentity {
-  /// The realization: a `dcp.operator` symbol (IP path) or a `CombOpKind`
-  /// mnemonic (native path). Empty when no functional unit is built for the
+  /// The realization, on exactly one of the two exclusive paths a
+  /// `dcp.compute` takes. Both empty when no functional unit is built for the
   /// operation: a memory or stream access, a literal, a call.
-  std::string realization;
-  bool comb = false;                   // `realization` names a CombOpKind
+  std::optional<CombOpKindEnum> comb; // native: emitted inline by `emitCompute`
+  std::string ipSymbol;               // IP: a `dcp.operator` symbol
   llvm::SmallVector<Type, 2> argTypes; // operand types, so width is in here
   Type resultType;
   Attribute predicate; // a compare's `predicate`; null otherwise
   Attribute map;       // an `affine.apply`'s `map`; null otherwise
 
   /// Whether an operation of this identity gets a functional unit.
-  bool realized() const { return !realization.empty(); }
+  bool realized() const { return comb || !ipSymbol.empty(); }
 
   bool operator==(const OperatorIdentity &o) const {
-    return comb == o.comb && realization == o.realization &&
+    return comb == o.comb && ipSymbol == o.ipSymbol &&
            llvm::ArrayRef<Type>(argTypes) == llvm::ArrayRef<Type>(o.argTypes) &&
            resultType == o.resultType && predicate == o.predicate &&
            map == o.map;
   }
   bool operator!=(const OperatorIdentity &o) const { return !(*this == o); }
 
-  /// A stable string spelling, for map keys and reports. Not an RTL name:
-  /// `Naming.h` owns those (`operatorModuleName`).
+  /// How the realization itself spells, whichever path it took: the comb
+  /// mnemonic or the IP symbol. A DISPLAY name, for a report or a debug dump;
+  /// `Naming.h` owns the RTL ones (`operatorModuleName`).
+  llvm::StringRef realizationName() const {
+    return comb ? stringifyCombOpKindEnum(*comb) : llvm::StringRef(ipSymbol);
+  }
+
+  /// A stable string spelling of the whole identity, for map keys and reports.
   std::string key() const;
 };
 

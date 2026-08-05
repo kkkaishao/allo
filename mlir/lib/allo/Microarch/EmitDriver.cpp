@@ -73,7 +73,7 @@ declareOperatorModules(dcp::DCPathModuleOp func, const uarch::Datapath &dp,
     IntegerType outW = hwType(u.identity.resultType, b);
     std::string modName = operatorModuleName(u);
     iface::Operator entry{
-        modName, u.identity.realization, operatorPredicate(u), {}};
+        modName, u.identity.ipSymbol, operatorPredicate(u), {}};
     SmallVector<PortInfo> ep;
     for (unsigned k = 0; k < u.inputs.size(); ++k) {
       IntegerType w = hwType(srcOp->getOperand(k).getType(), b);

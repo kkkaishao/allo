@@ -76,11 +76,10 @@ FuncUarch::FuncUarch(const Datapath &dp, llvm::StringRef symbol,
     for (UnitId uid : rb.units) {
       const FuncUnit &u = dp.units[uid];
       r.computeOps += u.boundOps.size();
-      r.units.push_back({u.identity.key(),
-                         u.identity.comb ? std::string() : u.identity.realization,
+      r.units.push_back({u.identity.key(), u.identity.ipSymbol,
                          u.identity.comb ? std::string() : operatorModuleName(u),
                          hwWidth(u.identity.resultType), u.latency,
-                         (unsigned)u.boundOps.size(), u.identity.comb,
+                         (unsigned)u.boundOps.size(), u.identity.comb.has_value(),
                          u.pipelined});
     }
     r.muxes = muxClasses(dp, rb, muxWidth);

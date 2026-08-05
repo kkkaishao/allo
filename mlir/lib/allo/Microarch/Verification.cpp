@@ -6,8 +6,7 @@
 #include "allo/Microarch/Verification.h"
 
 #include "allo-c/Schedule.h"           // kPartitionAttr
-#include "allo/Microarch/Naming.h"     // operatorModuleName
-#include "allo/Microarch/Primitives.h" // combEmitted
+#include "allo/Microarch/Naming.h" // operatorModuleName
 #include "allo/Support/Logging.h"
 
 #include "mlir/Dialect/MemRef/IR/MemRef.h" // memref::GetGlobalOp
@@ -336,11 +335,11 @@ LogicalResult checkEmitterSubset(dcp::DCPathModuleOp func, const Datapath &dp) {
   // nothing.
 
   // Operator realizability is settled before scheduling: an op with neither an
-  // IP row nor a `combKindOf` lowering never becomes a `dcp.compute`.
+  // IP row nor a `combKindOf` lowering never becomes a `dcp.compute`. A comb
+  // realization needs no further check: it is a `CombOpKind`, and `emitCompute`
+  // covers the enum.
   for (const FuncUnit &u : dp.units)
-    assert((u.identity.comb ? combEmitted(u.identity.realization)
-                            : u.identity.realized()) &&
-           "an unrealizable operator reached emission");
+    assert(u.identity.realized() && "an unrealizable operator reached emission");
   return success();
 }
 

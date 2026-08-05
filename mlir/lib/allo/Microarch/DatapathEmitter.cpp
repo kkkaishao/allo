@@ -725,7 +725,7 @@ void DatapathEmitter::emitUnits(const uarch::RegionBlock &rb, UnitMode mode) {
 
     Value result;
     if (u.identity.comb) {
-      result = emitCompute(c.b, c.loc, u.identity.realization, operands,
+      result = emitCompute(c.b, c.loc, *u.identity.comb, operands,
                            hwType(u.identity.resultType, c.b), u.repOp());
     } else {
       // An IP instance takes its data operands, then clock, then (for a

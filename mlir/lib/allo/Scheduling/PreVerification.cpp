@@ -178,7 +178,7 @@ LogicalResult checkOperations(func::FuncOp func, const OperatorLibrary &lib) {
              "support";
       return WalkResult::interrupt();
     }
-    if (!id.comb && failed(checkStallContract(op, id.realization)))
+    if (!id.comb && failed(checkStallContract(op, id.ipSymbol)))
       return WalkResult::interrupt();
     return WalkResult::advance();
   });

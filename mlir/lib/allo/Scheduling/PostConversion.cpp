@@ -171,10 +171,9 @@ static void convertOp(Operation &op, OpBuilder &b, IRMapping &map,
     CombOpKindEnumAttr combKind;
     FlatSymbolRefAttr opType;
     if (id.comb)
-      combKind = CombOpKindEnumAttr::get(
-          b.getContext(), *symbolizeCombOpKindEnum(id.realization));
+      combKind = CombOpKindEnumAttr::get(b.getContext(), *id.comb);
     else
-      opType = FlatSymbolRefAttr::get(b.getContext(), id.realization);
+      opType = FlatSymbolRefAttr::get(b.getContext(), id.ipSymbol);
     // The instance the allocation put it on, when a solve decided one.
     FlatSymbolRefAttr unit;
     if (at->unit)

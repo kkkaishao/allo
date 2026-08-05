@@ -291,12 +291,8 @@ double muxLevelDelay(const OperatorLibrary &lib) {
 /// The delay `u`'s inputs must settle within, read from the same library row
 /// the scheduler priced it against.
 static double unitInDelay(const FuncUnit &u, const OperatorLibrary &lib) {
-  if (u.identity.comb) {
-    std::optional<CombOpKindEnum> kind =
-        symbolizeCombOpKindEnum(u.identity.realization);
-    assert(kind && "a comb unit realizes a CombOpKind");
-    return lib.combDelay(*kind);
-  }
+  if (u.identity.comb)
+    return lib.combDelay(*u.identity.comb);
   auto opr = SymbolTable::lookupNearestSymbolFrom<dcp::DCPathOperatorOp>(
       u.repOp(), cast<dcp::DCPathComputeOp>(u.repOp()).getOpTypeAttr());
   assert(opr && "an IP unit names a live dcp.operator");
@@ -550,7 +546,7 @@ void Datapath::dump(llvm::raw_ostream &os) const {
     os << "\n";
     for (UnitId uid : rb.units) {
       const FuncUnit &u = this->units[uid];
-      os << "    unit u" << uid << ": " << u.identity.realization
+      os << "    unit u" << uid << ": " << u.identity.realizationName()
          << " lat=" << u.latency << (u.pipelined ? " pipelined" : " sequential")
          << " : " << u.identity.resultType << "  [" << u.repOp()->getName()
          << " @" << u.boundOps.front().second << "] <= ";
