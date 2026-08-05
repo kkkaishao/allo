@@ -8,6 +8,11 @@
 // (externals/circt/lib/Scheduling/SimplexSchedulers.cpp). Only the solver lives
 // here; the Problem data model and the chaining utilities stay CIRCT's.
 //
+// A PARTIAL fork, deliberately: only the two rungs this backend solves against
+// survive, the chaining modulo and chaining shared-operators ones. Every Allo
+// region carries a clock period and a resource model, so CIRCT's resource-free
+// and non-chaining schedulers have nothing here to solve.
+//
 // Portions derived from LLVM/CIRCT, Apache-2.0 WITH LLVM-exception.
 //===----------------------------------------------------------------------===//
 
@@ -237,21 +242,6 @@ public:
   virtual LogicalResult schedule() = 0;
 };
 
-/// This class solves the basic, acyclic `Problem`.
-class SimplexScheduler : public SimplexSchedulerBase {
-private:
-  Problem &prob;
-
-protected:
-  Problem &getProblem() override { return prob; }
-
-public:
-  SimplexScheduler(Problem &prob, Operation *lastOp)
-      : SimplexSchedulerBase(lastOp), prob(prob) {}
-
-  LogicalResult schedule() override;
-};
-
 /// This class solves the resource-free `CyclicProblem`.  The optimal initiation
 /// interval (II) is determined as a side product of solving the parametric
 /// problem, and corresponds to the "RecMII" (= recurrence-constrained minimum
@@ -359,52 +349,6 @@ public:
   unsigned getLowerBoundII() const { return lowerBoundII; }
   bool hasLowerBound() const { return boundSettled; }
   void setPlacementAdvisory() { placementAdvisory = true; }
-};
-
-// This class solves the `ChainingProblem` by relying on pre-computed
-// chain-breaking constraints.
-class ChainingSimplexScheduler : public SimplexSchedulerBase {
-private:
-  ChainingProblem &prob;
-  float cycleTime;
-
-protected:
-  Problem &getProblem() override { return prob; }
-  void fillAdditionalConstraintRow(SmallVector<int> &row,
-                                   Problem::Dependence dep) override;
-
-public:
-  ChainingSimplexScheduler(ChainingProblem &prob, Operation *lastOp,
-                           float cycleTime)
-      : SimplexSchedulerBase(lastOp), prob(prob), cycleTime(cycleTime) {}
-  LogicalResult schedule() override;
-};
-
-// This class solves the resource-free `ChainingCyclicProblem` by relying on
-// pre-computed chain-breaking constraints. The optimal initiation interval (II)
-// is determined as a side product of solving the parametric problem, and
-// corresponds to the "RecMII" (= recurrence-constrained minimum II) usually
-// considered as one component in the lower II bound used by modulo schedulers.
-class ChainingCyclicSimplexScheduler : public SimplexSchedulerBase {
-private:
-  ChainingCyclicProblem &prob;
-  float cycleTime;
-
-protected:
-  Problem &getProblem() override { return prob; }
-  unsigned distanceOf(Problem::Dependence dep) override {
-    return prob.getDistance(dep).value_or(0);
-  }
-  void fillConstraintRow(SmallVector<int> &row,
-                         Problem::Dependence dep) override;
-  void fillAdditionalConstraintRow(SmallVector<int> &row,
-                                   Problem::Dependence dep) override;
-
-public:
-  ChainingCyclicSimplexScheduler(ChainingCyclicProblem &prob, Operation *lastOp,
-                                 float cycleTime)
-      : SimplexSchedulerBase(lastOp), prob(prob), cycleTime(cycleTime) {}
-  LogicalResult schedule() override;
 };
 
 // This class solves the resource-constrained, cyclic, chaining-enabled
@@ -1154,37 +1098,6 @@ void SimplexSchedulerBase::dumpTableau() {
 }
 
 //===----------------------------------------------------------------------===//
-// SimplexScheduler
-//===----------------------------------------------------------------------===//
-
-LogicalResult SimplexScheduler::schedule() {
-  if (failed(checkLastOp()))
-    return failure();
-
-  parameterS = 0;
-  parameterT = 0;
-  buildTableau();
-
-  LLVM_DEBUG(dbgs() << "Initial tableau:\n"; dumpTableau());
-
-  if (failed(solveTableau())) {
-    reportInfeasible();
-    return failure();
-  }
-
-  assert(parameterT == 0);
-  LLVM_DEBUG(
-      dbgs() << "Final tableau:\n"; dumpTableau();
-      dbgs() << "Optimal solution found with start time of last operation = "
-             << -getParametricConstant(0) << '\n');
-
-  for (auto *op : prob.getOperations())
-    prob.setStartTime(op, getStartTime(startTimeVariables[op]));
-
-  return success();
-}
-
-//===----------------------------------------------------------------------===//
 // CyclicSimplexScheduler
 //===----------------------------------------------------------------------===//
 
@@ -1761,101 +1674,6 @@ LogicalResult ModuloSimplexScheduler::schedule() {
   return success();
 }
 
-//===----------------------------------------------------------------------===//
-// ChainingSimplexScheduler
-//===----------------------------------------------------------------------===//
-
-void ChainingSimplexScheduler::fillAdditionalConstraintRow(
-    SmallVector<int> &row, Problem::Dependence dep) {
-  fillConstraintRow(row, dep);
-  // One _extra_ time step breaks the chain (the latency is negative in the
-  // tableau).
-  row[parameter1Column] -= 1;
-}
-
-LogicalResult ChainingSimplexScheduler::schedule() {
-  if (failed(checkLastOp()) || failed(mlir::allo::computeChainBreaks(
-                                   prob, cycleTime, additionalConstraints)))
-    return failure();
-
-  parameterS = 0;
-  parameterT = 0;
-  buildTableau();
-
-  LLVM_DEBUG(dbgs() << "Initial tableau:\n"; dumpTableau());
-
-  if (failed(solveTableau())) {
-    reportInfeasible();
-    return failure();
-  }
-
-  assert(parameterT == 0);
-  LLVM_DEBUG(
-      dbgs() << "Final tableau:\n"; dumpTableau();
-      dbgs() << "Optimal solution found with start time of last operation = "
-             << -getParametricConstant(0) << '\n');
-
-  for (auto *op : prob.getOperations())
-    prob.setStartTime(op, getStartTime(startTimeVariables[op]));
-
-  auto filledIn = computeStartTimesInCycle(prob);
-  assert(succeeded(filledIn)); // Problem is known to be acyclic at this point.
-  (void)filledIn;
-
-  return success();
-}
-
-//===----------------------------------------------------------------------===//
-// ChainingCyclicSimplexScheduler
-//===----------------------------------------------------------------------===//
-
-void ChainingCyclicSimplexScheduler::fillConstraintRow(
-    SmallVector<int> &row, Problem::Dependence dep) {
-  SimplexSchedulerBase::fillConstraintRow(row, dep);
-  if (auto dist = prob.getDistance(dep))
-    row[parameterTColumn] = *dist;
-}
-
-void ChainingCyclicSimplexScheduler::fillAdditionalConstraintRow(
-    SmallVector<int> &row, Problem::Dependence dep) {
-  fillConstraintRow(row, dep);
-  // One _extra_ time step breaks the chain (the latency is negative in the
-  // tableau).
-  row[parameter1Column] -= 1;
-}
-
-LogicalResult ChainingCyclicSimplexScheduler::schedule() {
-  if (failed(checkLastOp()) || failed(mlir::allo::computeChainBreaks(
-                                   prob, cycleTime, additionalConstraints)))
-    return failure();
-
-  parameterS = 0;
-  parameterT = 1;
-  buildTableau();
-
-  LLVM_DEBUG(dbgs() << "Initial tableau:\n"; dumpTableau());
-
-  if (failed(solveTableau())) {
-    reportInfeasible();
-    return failure();
-  }
-
-  LLVM_DEBUG(dbgs() << "Final tableau:\n"; dumpTableau();
-             dbgs() << "Optimal solution found with II = " << parameterT
-                    << " and start time of last operation = "
-                    << -getParametricConstant(0) << '\n');
-
-  prob.setInitiationInterval(parameterT);
-  for (auto *op : prob.getOperations())
-    prob.setStartTime(op, getStartTime(startTimeVariables[op]));
-
-  auto filledIn = computeStartTimesInCycle(prob);
-  assert(succeeded(filledIn));
-  (void)filledIn;
-
-  return success();
-}
-
 namespace mlir::allo {
 
 //===----------------------------------------------------------------------===//
@@ -2072,38 +1890,6 @@ LogicalResult ChainingSharedOperatorsProblem::verify() {
 //===----------------------------------------------------------------------===//
 // Public API
 //===----------------------------------------------------------------------===//
-
-LogicalResult scheduleSimplex(Problem &prob, Operation *lastOp) {
-  SimplexScheduler simplex(prob, lastOp);
-  return simplex.schedule();
-}
-
-LogicalResult scheduleSimplex(CyclicProblem &prob, Operation *lastOp) {
-  CyclicSimplexScheduler simplex(prob, lastOp);
-  return simplex.schedule();
-}
-
-LogicalResult scheduleSimplex(OccupancyProblem &prob, Operation *lastOp) {
-  SharedOperatorsSimplexScheduler simplex(prob, lastOp);
-  return simplex.schedule();
-}
-
-LogicalResult scheduleSimplex(ModuloOccupancyProblem &prob, Operation *lastOp) {
-  ModuloSimplexScheduler simplex(prob, lastOp);
-  return simplex.schedule();
-}
-
-LogicalResult scheduleSimplex(ChainingProblem &prob, Operation *lastOp,
-                              float cycleTime) {
-  ChainingSimplexScheduler simplex(prob, lastOp, cycleTime);
-  return simplex.schedule();
-}
-
-LogicalResult scheduleSimplex(ChainingCyclicProblem &prob, Operation *lastOp,
-                              float cycleTime) {
-  ChainingCyclicSimplexScheduler simplex(prob, lastOp, cycleTime);
-  return simplex.schedule();
-}
 
 LogicalResult scheduleSimplex(ChainingModuloProblem &prob, Operation *lastOp,
                               float cycleTime, unsigned minII,

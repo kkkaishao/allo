@@ -20,7 +20,6 @@ enum class RegionKind { Loop, StraightLine };
 /// A scheduling region: a single region-bearing op, or a maximal run of other
 /// ops.
 struct SchedRegion {
-  unsigned id;
   RegionKind kind;
   /// Top-level ops of the region; a Loop region holds exactly its loop op.
   SmallVector<Operation *> ops;

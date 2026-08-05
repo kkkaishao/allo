@@ -442,11 +442,13 @@ LogicalResult FuncScheduler::scheduleCyclic(LoopLikeOpInterface body,
   if (failed(solveSchedulingProblem(problem, anchor, cycleTime, minII, opts,
                                     span)))
     return failure();
-  recordSolve(problem, "cyclic", problem.getInitiationInterval(),
-              solveStart);
+  std::optional<unsigned> solvedII = problem.getInitiationInterval();
+  assert(solvedII && "a modulo problem that solved carries an interval");
+  recordSolve(problem, "cyclic", solvedII, solveStart);
   int64_t depth = problem.scheduleDepth();
-  unsigned ii = pipelined ? problem.getInitiationInterval().value_or(depth)
-                          : static_cast<unsigned>(depth);
+  // Iterations that do not overlap issue one body length apart, which is the
+  // interval the region RUNS at whatever the solve settled on.
+  unsigned ii = pipelined ? *solvedII : static_cast<unsigned>(depth);
   int64_t drain = span.drainOf(problem);
   // For the report only, through the arithmetic that composes it for real.
   SpanNode node;
@@ -521,15 +523,14 @@ LogicalResult FuncScheduler::scheduleWhile(scf::WhileOp w,
                                     span)))
     return failure();
   std::optional<unsigned> ii = problem.getInitiationInterval();
+  assert(ii && "a modulo problem that solved carries an interval");
   recordSolve(problem, "while", ii, solveStart);
   info(Stage::Sched, w.getOperation())
-      << "  -> While loop scheduled as a flushing pipeline: II="
-      << ii.value_or(0)
+      << "  -> While loop scheduled as a flushing pipeline: II=" << *ii
       << " (trip is data-dependent, so whole-loop latency is unknown)";
   // The trip is data-dependent, so no span composes off this drain: it is
   // recorded, like `ii`, as what the solve decided.
-  annotateRegion(problem, w.getOperation(),
-                 ii ? std::optional<int64_t>(*ii) : std::nullopt,
+  annotateRegion(problem, w.getOperation(), *ii,
                  /*trip=*/std::nullopt, /*tripIsBound=*/false,
                  span.drainOf(problem));
   return success();

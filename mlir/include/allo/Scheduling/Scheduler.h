@@ -251,18 +251,12 @@ LogicalResult computeChainBreaks(
 // Fork of CIRCT's `scheduleSimplex` family (implementation in Scheduler.cpp).
 // Call these via `solveSchedulingProblem` below or by fully-qualified name
 // (`mlir::allo::scheduleSimplex`) to avoid ambiguity with the CIRCT overloads.
+//
+// Two entries, for the two problems this backend builds. The resource-free and
+// non-chaining rungs of CIRCT's family have no caller here: every Allo region
+// is solved against a clock period.
 //===----------------------------------------------------------------------===//
 
-LogicalResult scheduleSimplex(circt::scheduling::Problem &prob,
-                              Operation *lastOp);
-LogicalResult scheduleSimplex(circt::scheduling::CyclicProblem &prob,
-                              Operation *lastOp);
-LogicalResult scheduleSimplex(OccupancyProblem &prob, Operation *lastOp);
-LogicalResult scheduleSimplex(ModuloOccupancyProblem &prob, Operation *lastOp);
-LogicalResult scheduleSimplex(circt::scheduling::ChainingProblem &prob,
-                              Operation *lastOp, float cycleTime);
-LogicalResult scheduleSimplex(circt::scheduling::ChainingCyclicProblem &prob,
-                              Operation *lastOp, float cycleTime);
 /// What the SDC heuristic contributes to a solve that is not its own: the II
 /// bound it settles before placing anything, and whether its greedy placement
 /// reached a schedule.
@@ -453,36 +447,8 @@ LogicalResult scheduleCPSAT(ChainingModuloProblem &prob, Operation *lastOp,
                             const SpanObjective &span,
                             const SchedulerOptions &opts);
 
-/// Check, solve (via our SDC simplex), and verify \p problem, minimizing the
-/// start time of \p anchor. Templated so the static problem type selects the
-/// right scheduleSimplex overload (e.g. ModuloProblem -> modulo scheduler).
-template <typename ProblemT>
-LogicalResult solveSchedulingProblem(ProblemT &problem, Operation *anchor) {
-  if (failed(problem.check()))
-    return failure();
-  if (failed(mlir::allo::scheduleSimplex(problem, anchor)))
-    return failure();
-  if (failed(problem.verify()))
-    return failure();
-  return success();
-}
-
-/// Chaining variant: the scheduler additionally enforces the target clock
-/// period
-/// \p cycleTime (ns) by breaking combinational chains across cycle boundaries.
-template <typename ProblemT>
-LogicalResult solveSchedulingProblem(ProblemT &problem, Operation *anchor,
-                                     float cycleTime) {
-  if (failed(problem.check()))
-    return failure();
-  if (failed(mlir::allo::scheduleSimplex(problem, anchor, cycleTime)))
-    return failure();
-  if (failed(problem.verify()))
-    return failure();
-  return success();
-}
-
-/// Chaining modulo variant with a target-II lower bound (from a pipeline
+/// Check, solve, and verify \p problem, minimizing the span \p span charges.
+/// The chaining modulo variant, with a target-II lower bound (from a pipeline
 /// directive): the achieved II is max(\p minII, the natural minimum). \p minII
 /// == 1 imposes no additional bound. \p opts selects the resource solver; both
 /// paths go through the same `check` and `verify`.

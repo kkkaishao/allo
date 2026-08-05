@@ -134,8 +134,8 @@ SmallVector<SchedRegion> mlir::allo::enumerateRegions(Block &block) {
   auto flush = [&]() {
     if (pending.empty())
       return;
-    regions.push_back({(unsigned)regions.size(), RegionKind::StraightLine,
-                       SmallVector<Operation *>(pending)});
+    regions.push_back(
+        {RegionKind::StraightLine, SmallVector<Operation *>(pending)});
     pending.clear();
   };
 
@@ -147,13 +147,12 @@ SmallVector<SchedRegion> mlir::allo::enumerateRegions(Block &block) {
     if (isa<affine::AffineForOp, scf::ForOp, scf::WhileOp, affine::AffineIfOp,
             scf::IfOp>(&op)) {
       flush();
-      regions.push_back({(unsigned)regions.size(), RegionKind::Loop, {&op}});
+      regions.push_back({RegionKind::Loop, {&op}});
     } else if (isSyncSubKernelCall(&op) &&
                (isolateCalls ||
                 (isolateIndeterminate && isIndeterminateCall(&op)))) {
       flush();
-      regions.push_back(
-          {(unsigned)regions.size(), RegionKind::StraightLine, {&op}});
+      regions.push_back({RegionKind::StraightLine, {&op}});
     } else {
       pending.push_back(&op);
     }
