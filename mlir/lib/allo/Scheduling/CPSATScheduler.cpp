@@ -287,8 +287,7 @@ void minimizeCost(CpModelBuilder &model, IntVar primary,
                   ArrayRef<IntVar> starts, const SpanObjective &span,
                   DenseMap<Operation *, IntVar> &startVars,
                   ArrayRef<AllocationVar> allocs, int64_t ii, int64_t horizon) {
-  assert(span.device && "the objective's area terms need a device to price");
-  int64_t pulse = span.device->pulsePrice();
+  int64_t pulse = span.device.pulsePrice();
   SmallVector<IntVar> vars(starts.begin(), starts.end());
   SmallVector<int64_t> weights(starts.size(), pulse);
   // Bounds how far the tie-break can reach, so `primary`'s weight below
@@ -304,7 +303,7 @@ void minimizeCost(CpModelBuilder &model, IntVar primary,
     auto [entry, isNew] = chainPrices.try_emplace(term.width);
     if (isNew)
       for (int64_t d = 0; d <= horizon; ++d)
-        entry->second.push_back(span.device->chainPrice(d, term.width));
+        entry->second.push_back(span.device.chainPrice(d, term.width));
     ArrayRef<int64_t> table = entry->second;
     IntVar depth = model.NewIntVar(operations_research::Domain(0, horizon));
     IntVar def = startVars.at(term.def);
@@ -482,7 +481,7 @@ LogicalResult mlir::allo::scheduleCPSAT(ChainingSharedOperatorsProblem &prob,
     cumulativeOn(alloc.rsrc, alloc.units);
 
   // What the region is charged, bounded by what the heuristic already reached.
-  int64_t heuristicDrain = drainOf(prob, span.drain);
+  int64_t heuristicDrain = span.drainOf(prob);
   IntVar drain =
       drainVariable(model, startVars, span.drain, horizon, heuristicDrain);
   minimizeCost(model, drain, orderedStarts, span, startVars, allocs, /*ii=*/0,
@@ -784,7 +783,7 @@ LogicalResult mlir::allo::scheduleCPSAT(ChainingModuloProblem &prob,
   // ship a schedule worse than the heuristic's.
   std::optional<int64_t> heuristicSpan;
   if (bySpan && warm.placed)
-    heuristicSpan = iiWeight * greedyII + drainOf(prob, span.drain);
+    heuristicSpan = iiWeight * greedyII + span.drainOf(prob);
   std::optional<int64_t> best = heuristicSpan;
   int64_t floorDrain = bySpan ? drainFloor(prob, chaining, span.drain) : 0;
 

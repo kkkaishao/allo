@@ -172,6 +172,12 @@ registerTerms(OccupancyProblem &problem, Block *carried) {
   return terms;
 }
 
+SpanObjective::SpanObjective(OccupancyProblem &problem, ValueRange results,
+                             Block *carried, std::optional<int64_t> trip,
+                             const OperatorLibrary &device)
+    : drain(drainTerms(problem, results)), regs(registerTerms(problem, carried)),
+      trip(trip), device(device) {}
+
 // Whether the problem carries a loop-carried recurrence (a dependence spanning
 // >= 1 iteration), which can hold the modulo II above the resource bound.
 static bool hasCarriedRecurrence(circt::scheduling::CyclicProblem &problem) {
@@ -327,12 +333,10 @@ scheduleCyclic(LoopLikeOpInterface body, DependenceAnalysis &deps,
   // composed in `buildSpanNode`.
   LoopTrip trip = deps.tripOf(body.getOperation());
   // A counted loop hands its carried next-values on: the terminator's operands.
-  SmallVector<DrainTerm> outputs = drainTerms(problem, anchor->getOperands());
-  SmallVector<RegisterTerm> regs = registerTerms(problem, bodyBlock);
   // The trip is withheld where iterations do not overlap: `ii` is the body
   // depth there, so depth, not drain, is what the trip multiplies.
-  SpanObjective span{outputs, regs, pipelined ? trip.count : std::nullopt,
-                     &lib};
+  SpanObjective span(problem, anchor->getOperands(), bodyBlock,
+                     pipelined ? trip.count : std::nullopt, lib);
   Stopwatch solveStart = now();
   if (failed(solveSchedulingProblem(problem, anchor, cycleTime, minII, opts,
                                     span)))
@@ -342,7 +346,7 @@ scheduleCyclic(LoopLikeOpInterface body, DependenceAnalysis &deps,
   int64_t depth = problem.scheduleDepth();
   unsigned ii = pipelined ? problem.getInitiationInterval().value_or(depth)
                           : static_cast<unsigned>(depth);
-  int64_t drain = drainOf(problem, outputs);
+  int64_t drain = span.drainOf(problem);
   // For the report only, through the arithmetic that composes it for real.
   SpanNode node;
   node.trip = trip.count;
@@ -408,18 +412,15 @@ static LogicalResult scheduleWhile(scf::WhileOp w, DependenceAnalysis &deps,
   // off) is not modeled for while loops.
   int64_t dir = pipelineDirective(w, region.anchor());
   unsigned minII = dir >= 1 ? static_cast<unsigned>(dir) : 1;
-  SmallVector<DrainTerm> outputs = drainTerms(problem, anchor->getOperands());
   // A while's state recurrence is a register this does not price: its carried
-  // values are not a counted loop's iter_args, so `registerTerms` is handed no
-  // body to read them off.
-  SmallVector<RegisterTerm> regs = registerTerms(problem, /*carried=*/nullptr);
+  // values are not a counted loop's iter_args, so no body is handed in to read
+  // them off. No trip either, so no span is minimized and the objective stays
+  // the anchor's start time.
+  SpanObjective span(problem, anchor->getOperands(), /*carried=*/nullptr,
+                     /*trip=*/std::nullopt, lib);
   Stopwatch solveStart = now();
-  // No trip, so no span is minimized: the objective stays the anchor's start
-  // time.
-  if (failed(
-          solveSchedulingProblem(problem, anchor, cycleTime, minII, opts,
-                                 SpanObjective{outputs, regs, std::nullopt,
-                                               &lib})))
+  if (failed(solveSchedulingProblem(problem, anchor, cycleTime, minII, opts,
+                                    span)))
     return failure();
   std::optional<unsigned> ii = problem.getInitiationInterval();
   recordSolve(model, problem, "while", ii, solveStart);
@@ -432,7 +433,7 @@ static LogicalResult scheduleWhile(scf::WhileOp w, DependenceAnalysis &deps,
   annotateRegion(problem, model, w.getOperation(),
                  ii ? std::optional<int64_t>(*ii) : std::nullopt,
                  /*trip=*/std::nullopt, /*tripIsBound=*/false,
-                 drainOf(problem, outputs));
+                 span.drainOf(problem));
   return success();
 }
 
@@ -452,12 +453,11 @@ static LogicalResult scheduleAcyclic(ArrayRef<Operation *> ops,
     populateOperatorAllocation(problem, lib);
   // A straight-line region runs once, so its whole cost is its drain, and it
   // carries nothing between iterations it does not have.
-  SmallVector<DrainTerm> outputs = drainTerms(problem, spanEscapingValues(ops));
-  SmallVector<RegisterTerm> regs = registerTerms(problem, /*carried=*/nullptr);
+  SpanObjective span(problem, spanEscapingValues(ops), /*carried=*/nullptr,
+                     /*trip=*/1, lib);
   Stopwatch solveStart = now();
-  if (failed(solveSchedulingProblem(problem, ops.back(), cycleTime, opts,
-                                    SpanObjective{outputs, regs, /*trip=*/1,
-                                                  &lib})))
+  if (failed(
+          solveSchedulingProblem(problem, ops.back(), cycleTime, opts, span)))
     return failure();
   recordSolve(model, problem, "acyclic", /*ii=*/std::nullopt, solveStart);
   info(Stage::Sched, ops.front())
@@ -465,7 +465,7 @@ static LogicalResult scheduleAcyclic(ArrayRef<Operation *> ops,
   // How often its enclosing loops re-run it is charged where they are composed.
   annotateRegion(problem, model, ops.front(), /*ii=*/std::nullopt,
                  /*trip=*/std::nullopt, /*tripIsBound=*/false,
-                 drainOf(problem, outputs));
+                 span.drainOf(problem));
   annotateAllocation(problem, model, lib);
   return success();
 }

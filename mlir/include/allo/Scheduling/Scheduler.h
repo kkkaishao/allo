@@ -347,10 +347,21 @@ struct RegisterTerm {
 /// The heuristic ignores this and keeps minimizing the anchor's start time, an
 /// over-constrained proxy for the quantity actually charged.
 struct SpanObjective {
+  /// Read one region's charge off \p problem, which needs its operator types
+  /// but not a solution: what a term costs is a property of the region, and
+  /// only where each term LANDS is a property of the schedule.
+  ///
+  /// \p results are the values escaping the region, \p carried the counted-loop
+  /// body whose block arguments after the induction variable are its iter_args
+  /// (null where there is no such recurrence to price: a straight-line span, a
+  /// `while`), and \p device what the area terms are priced against.
+  SpanObjective(OccupancyProblem &problem, ValueRange results, Block *carried,
+                std::optional<int64_t> trip, const OperatorLibrary &device);
+
   /// The region's outputs.
-  ArrayRef<DrainTerm> drain;
+  SmallVector<DrainTerm> drain;
   /// The values it spends a delay register on.
-  ArrayRef<RegisterTerm> regs;
+  SmallVector<RegisterTerm> regs;
   /// The region's trip count, when it is a compile-time constant. Empty leaves
   /// the exact scheduler on the anchor-start objective, which is the right one
   /// wherever no span composes off this solve (a `while`, a dynamic bound) or
@@ -361,7 +372,12 @@ struct SpanObjective {
   /// what the part spends on it, so a register, a multiplexer and an operator
   /// are comparable; without it the objective would be ranking flip-flops
   /// against DSP slices in a unit neither is measured in.
-  const OperatorLibrary *device = nullptr;
+  const OperatorLibrary &device;
+
+  /// Where this region's deepest output commits in a SOLVED \p problem.
+  int64_t drainOf(circt::scheduling::Problem &problem) const {
+    return mlir::allo::drainOf(problem, drain);
+  }
 };
 
 //===----------------------------------------------------------------------===//
