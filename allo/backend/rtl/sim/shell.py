@@ -17,6 +17,7 @@ import numpy as np
 
 from . import ip_models
 from . import ports as _ports
+from ... import marshal
 from ..interface import Interfaces, ModuleInterface
 
 _TB_MODULE = "allo.backend.rtl.sim.cocotb_tb"
@@ -78,7 +79,7 @@ def _build_config(
         tag = f"{m.arg}_b{m.bank}"  # one backing array per (argument, bank)
         file_in = None
         if m.readers or not m.writeback:  # read/RMW args are preloaded from the arg
-            bits = m.slice_in(args[m.arg], m.width)
+            bits = m.slice_in(args[m.arg])
             file_in = workdir / f"in_arg{tag}.npy"
             np.save(file_in, bits.astype(np.uint64))
         file_out = str(workdir / f"out_arg{tag}.npy") if m.writeback else None
@@ -87,7 +88,6 @@ def _build_config(
                 "file_in": str(file_in) if file_in else None,
                 "file_out": file_out,
                 "size": m.size,
-                "width": m.width,
                 "readers": [
                     {"addr": r.addr, "data": r.data, "latency": r.latency}
                     for r in m.readers
@@ -104,7 +104,7 @@ def _build_config(
     reg_cfgs = []
     for rf in regfiles:
         arg = rf.port.arg
-        bits = _ports.bit_pattern(args[arg], rf.np_dtype, rf.width)
+        bits = marshal.to_bits(args[arg], rf.host)
         file_in = workdir / f"in_reg{arg}.npy"
         np.save(file_in, bits.astype(np.uint64))
         # An unused direction stays absent rather than null.
@@ -145,7 +145,7 @@ def _build_config(
             "input": p.is_input,
         }
         if p.is_input:
-            bits = _ports.bit_pattern(np.asarray(args[p.arg]), s.np_dtype, s.width)
+            bits = marshal.to_bits(np.asarray(args[p.arg]), s.host)
             file_in = workdir / f"in_stream{p.arg}.npy"
             np.save(file_in, bits.astype(np.uint64))
             cfg["file_in"] = str(file_in)
@@ -276,28 +276,22 @@ def cosim(
         cycles = int((wd / "cycles.txt").read_text().strip())
         for m in mems:
             if m.writeback:
-                bits = np.load(wd / f"out_arg{m.arg}_b{m.bank}.npy").astype(
-                    _ports._UINT[m.width]
-                )
-                vals = _ports.from_bits(bits, m.np_dtype, m.width, (m.size,))
+                bits = np.load(wd / f"out_arg{m.arg}_b{m.bank}.npy")
+                vals = marshal.from_bits(bits, m.host, (m.size,))
                 m.scatter_out(args[m.arg], vals)
         # A written scattered argument: its registers are flat and unbanked, so
         # the drained values land straight back in the caller's array.
         for rf in regfiles:
             if rf.port.writeback:
                 buf = args[rf.port.arg]
-                bits = np.load(wd / f"out_reg{rf.port.arg}.npy").astype(
-                    _ports._UINT[rf.width]
-                )
-                buf[...] = _ports.from_bits(bits, rf.np_dtype, rf.width, buf.shape)
+                bits = np.load(wd / f"out_reg{rf.port.arg}.npy")
+                buf[...] = marshal.from_bits(bits, rf.host, buf.shape)
         # Drained output-stream tokens, written into the caller's buffer in place.
         for s in streams:
             if not s.port.is_input:
                 buf = np.asarray(args[s.port.arg])
-                bits = np.load(wd / f"out_stream{s.port.arg}.npy").astype(
-                    _ports._UINT[s.width]
-                )
-                buf[...] = _ports.from_bits(bits, s.np_dtype, s.width, buf.shape)
+                bits = np.load(wd / f"out_stream{s.port.arg}.npy")
+                buf[...] = marshal.from_bits(bits, s.host, buf.shape)
         # Decode each sampled result port by its return type; the manifest order
         # matches `result_types`.
         raw = json.loads((wd / "results.json").read_text())

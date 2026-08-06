@@ -8,13 +8,15 @@ import re
 import shutil
 import sys
 
+import ml_dtypes
 import numpy as np
 import pytest
 
 import allo
 from allo import kernel
 from allo.backend.rtl import Control, Operator
-from allo.lang import Stream, f32, i32
+from allo.lang import Stream, bf16, f16, f32, i32
+from allo.lang.core import APInt
 
 sys.path.insert(0, os.path.dirname(__file__))
 from _common import Dcp, _to_rtl  # noqa: E402
@@ -509,3 +511,107 @@ def test_call_shares_boundary_arg_with_parent_read():
     _to_rtl(sbr_top).cosim(A, out, t)
     assert np.array_equal(out, A * 5)
     assert np.array_equal(t, A + 100)
+
+
+# --- the host boundary --------------------------------------------------------
+# A width the host cannot name (anything but 8/16/32/64) crosses in a wider numpy
+# container, and the design's ports are only as wide as the type. The host is
+# therefore the one that has to truncate on the way in and sign-extend on the way
+# out, since nothing below it does. The values below are chosen to have the top
+# bit of the 48-bit type set, which is exactly where a missing extension shows.
+def test_nonstandard_width_crosses_the_host_boundary():
+    i48 = APInt(48, signed=True)
+
+    @kernel
+    def copy48(a: i48[4], out: i48[4]):
+        for k in range(4, name="k"):
+            out[k] = a[k]
+
+    @kernel
+    def scale48(a: i48[4]) -> i48:
+        acc: i48 = 0
+        for k in range(4, name="k"):
+            acc = acc + a[k]
+        return acc
+
+    vals = np.array([-1, -(2**47), 5, 2**47 - 1], np.int64)
+    out = np.zeros(4, np.int64)
+    _to_rtl(copy48).cosim(vals, out)
+    assert np.array_equal(out, vals), f"{out} != {vals}"
+
+    total = ((int(vals.sum()) + 2**47) % 2**48) - 2**47
+    assert int(_to_rtl(scale48).cosim(vals).result) == total
+
+
+# The same kernel on the CPU (which widens the boundary in the IR) and in cosim
+# (which keeps the exact width and closes the gap on the host) must agree: the
+# two ABIs are two ways to carry one value, not two values.
+def test_nonstandard_width_agrees_with_cpu():
+    i48 = APInt(48, signed=True)
+
+    @kernel
+    def dot48(x: i32[8], y: i32[8]) -> i48:
+        acc: i48 = 0
+        for k in range(8, name="k"):
+            acc = acc + x[k] * y[k]
+        return acc
+
+    rng = np.random.default_rng(2)
+    x = rng.integers(-(2**31), 2**31, size=8, dtype=np.int64).astype(np.int32)
+    y = rng.integers(-(2**31), 2**31, size=8, dtype=np.int64).astype(np.int32)
+    exact = sum(int(a) * int(b) for a, b in zip(x, y))
+    assert ((exact + 2**47) % 2**48) - 2**47 < 0, "the wrapped value must be negative"
+    assert int(_to_rtl(dot48).cosim(x, y).result) == int(dot48(x, y))
+
+
+# A boundary made of ports rather than C types carries any bit layout there is,
+# which is what `RTL_ABI` declares. binary16 and bfloat16 cross as their own 16
+# bits, with no ctype in the way.
+def test_narrow_floats_cross_the_host_boundary():
+    @kernel
+    def hcopy(a: f16[8], out: f16[8]):
+        for k in range(8, name="k"):
+            out[k] = a[k]
+
+    @kernel
+    def bfsum(a: bf16[8], b: bf16[8], out: bf16[8]):
+        for k in range(8, name="k"):
+            out[k] = a[k] + b[k]
+
+    # 65504 is the largest binary16, 6e-8 a subnormal: both survive only if the
+    # boundary reads the format's own layout rather than the nearest-looking one.
+    a = np.array([1.5, -2.25, 65504.0, 6e-8, 0.0, -0.5, 3.14159, -1e-5], np.float16)
+    out = np.zeros(8, np.float16)
+    _to_rtl(hcopy).cosim(a, out)
+    assert np.array_equal(out, a), f"{out} != {a}"
+
+    x = np.array([1.5, -2.25, 3.5, 7.0, -8.0, 0.5, 100.0, -0.25], ml_dtypes.bfloat16)
+    y = np.array([0.5, 1.25, -3.5, 2.0, 8.0, 0.25, 28.0, 0.75], ml_dtypes.bfloat16)
+    z = np.zeros(8, ml_dtypes.bfloat16)
+    _to_rtl(bfsum).cosim(x, y, z)
+    assert np.array_equal(z, x + y), f"{z} != {x + y}"
+
+
+# An integer past every numpy container has no array form, but a scalar one
+# crosses as a Python int, which has no width to run out of.
+def test_wide_scalar_crosses_as_a_python_int():
+    i128 = APInt(128, signed=True)
+
+    @kernel
+    def wide(x: i32[8], y: i32[8]) -> i128:
+        acc: i128 = 0
+        for k in range(8, name="k"):
+            acc = acc + x[k] * y[k]
+        return acc
+
+    big = np.full(8, 2**31 - 1, np.int32)
+    exact = sum(int(p) * int(q) for p, q in zip(big, big))
+    assert exact.bit_length() > 64, "the sum must not fit a 64-bit container"
+    assert _to_rtl(wide).cosim(big, big).result == exact
+
+    rng = np.random.default_rng(2)
+    x = rng.integers(-(2**31), 2**31, size=8, dtype=np.int64).astype(np.int32)
+    y = rng.integers(-(2**31), 2**31, size=8, dtype=np.int64).astype(np.int32)
+    negative = sum(int(p) * int(q) for p, q in zip(x, y))
+    assert negative < 0, "a negative case pins the sign extension"
+    assert _to_rtl(wide).cosim(x, y).result == negative

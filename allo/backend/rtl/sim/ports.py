@@ -10,10 +10,16 @@ from dataclasses import dataclass, field
 import numpy as np
 
 from ..interface import FIFO, Memory, ModuleInterface, RegisterFile
-from ....lang.core import BufferType, DType, StreamType, widen_apint_to_std
-from ...utils import dtype_to_numpy_dtype
-
-_UINT = {8: np.uint8, 16: np.uint16, 32: np.uint32, 64: np.uint64}
+from ....lang.core import BufferType, StreamType
+from ...marshal import (
+    RTL_ABI,
+    HostType,
+    element_type,
+    host_type,
+    scalar_from_bits,
+    scalar_to_bits,
+    to_bits,
+)
 
 
 def bank_elements(shape, axes: tuple[Memory.Axis, ...], bank: int) -> np.ndarray:
@@ -70,8 +76,7 @@ class Mem:
     arithmetic."""
 
     arg: int
-    np_dtype: type
-    width: int  # host word width (the numpy itemsize), not the port's bit width
+    host: HostType  # the element type as it crosses, port width included
     size: int  # elements in this bank (== the flattened argument when unbanked)
     bank: int = 0  # which bank of the argument (0 when unbanked)
     elements: np.ndarray | None = None  # flat index per offset (None = unbanked)
@@ -82,11 +87,11 @@ class Mem:
     def writeback(self) -> bool:
         return bool(self.writers)
 
-    def slice_in(self, array: np.ndarray, width: int) -> np.ndarray:
+    def slice_in(self, array: np.ndarray) -> np.ndarray:
         """This bank's flat uint bit pattern of ``array`` (its own elements for a
         partitioned argument, the whole array otherwise). A padding slot reads 0.
         """
-        bits = bit_pattern(array, self.np_dtype, width)
+        bits = to_bits(array, self.host)
         if self.elements is None:
             return bits
         return np.where(self.elements >= 0, bits[np.maximum(self.elements, 0)], 0)
@@ -111,30 +116,26 @@ class RegFile:
     side commits on the edge its ``we`` is high."""
 
     port: RegisterFile
-    np_dtype: type
-    width: int  # host word width (the numpy itemsize)
+    host: HostType
 
 
 def plan_regfiles(interface: ModuleInterface, arg_types) -> list[RegFile]:
     """One :class:`RegFile` per completely-partitioned argument."""
     out = []
     for rf in interface.registers:
-        np_dt, width, size = _elem(arg_types[rf.arg])
+        host, size = _elem(arg_types[rf.arg])
         assert size == len(rf.elements), (
             "the manifest declares a port per element, so the count must equal "
             "the flattened argument"
         )
-        out.append(RegFile(rf, np_dt, width))
+        out.append(RegFile(rf, host))
     return out
 
 
-def _elem(arg_type) -> tuple[type, int, int]:
-    """(numpy dtype, element bit width, flattened size) for a buffer argument."""
+def _elem(arg_type) -> tuple[HostType, int]:
+    """(element host type, flattened size) for a buffer argument."""
     assert isinstance(arg_type, BufferType), "memory port on a non-buffer argument"
-    np_dt = dtype_to_numpy_dtype(arg_type.dtype)
-    width = int(np.dtype(np_dt).itemsize) * 8
-    size = int(np.prod(arg_type.shape))
-    return np_dt, width, size
+    return element_type(arg_type.dtype, RTL_ABI), int(np.prod(arg_type.shape))
 
 
 def plan_mems(interface: ModuleInterface, arg_types) -> list[Mem]:
@@ -145,16 +146,18 @@ def plan_mems(interface: ModuleInterface, arg_types) -> list[Mem]:
     def entry(port: Memory) -> Mem:
         key = (port.arg, port.bank)
         if key not in mems:
-            np_dt, width, total = _elem(arg_types[port.arg])
+            host, total = _elem(arg_types[port.arg])
+            assert port.width == host.value_bits, (
+                f"argument {port.arg}: the manifest declares a {port.width}-bit "
+                f"element but the dtype carries {host.value_bits} bits"
+            )
             elements = None
             if port.factor > 1:
                 # One slot per in-bank offset, padding included, which is
                 # exactly the RTL bank's address space.
                 elements = bank_elements(port.shape, port.axes, port.bank)
                 total = int(elements.size)
-            mems[key] = Mem(
-                port.arg, np_dt, width, total, bank=port.bank, elements=elements
-            )
+            mems[key] = Mem(port.arg, host, total, bank=port.bank, elements=elements)
         return mems[key]
 
     for acc in interface.reads:
@@ -172,54 +175,25 @@ class StreamCh:
     feeds token-by-token, or an output it drains."""
 
     port: FIFO
-    np_dtype: type
-    width: int  # host word width (the numpy itemsize), not the payload's
-
-
-def _stream_elem(arg_type) -> tuple[type, int]:
-    """(numpy dtype, payload bit width) for a stream argument."""
-    assert isinstance(arg_type, StreamType), "stream port on a non-stream argument"
-    np_dt = dtype_to_numpy_dtype(arg_type.base_type)
-    width = int(np.dtype(np_dt).itemsize) * 8
-    return np_dt, width
+    host: HostType
 
 
 def plan_streams(interface: ModuleInterface, arg_types) -> list[StreamCh]:
     """One :class:`StreamCh` per stream port, in interface order."""
     out = []
     for s in interface.streams:
-        np_dt, width = _stream_elem(arg_types[s.arg])
-        out.append(StreamCh(s, np_dt, width))
+        arg_type = arg_types[s.arg]
+        assert isinstance(arg_type, StreamType), "stream port on a non-stream argument"
+        out.append(StreamCh(s, element_type(arg_type.base_type, RTL_ABI)))
     return out
 
 
-def bit_pattern(array: np.ndarray, np_dtype: type, width: int) -> np.ndarray:
-    """Reinterpret ``array`` (coerced to ``np_dtype``) as a flat uint bit pattern."""
-    arr = np.ascontiguousarray(array, dtype=np_dtype).reshape(-1)
-    return arr.view(_UINT[width])
-
-
-def from_bits(bits: np.ndarray, np_dtype: type, width: int, shape) -> np.ndarray:
-    """Inverse of :func:`bit_pattern`: uint bits -> ``np_dtype`` array of ``shape``."""
-    return bits.astype(_UINT[width], copy=False).view(np_dtype).reshape(shape)
-
-
 def scalar_bits(value, arg_type) -> int:
-    """The integer bit pattern of a scalar argument at its port width."""
-    dtype = (
-        widen_apint_to_std(arg_type) if not isinstance(arg_type, DType) else arg_type
-    )
-    np_dt = dtype_to_numpy_dtype(dtype)
-    width = int(np.dtype(np_dt).itemsize) * 8
-    return int(np.array(value, np_dt).view(_UINT[width]))
+    """The bit pattern of a scalar argument at its port width."""
+    return scalar_to_bits(value, host_type(arg_type, RTL_ABI))
 
 
 def from_scalar_bits(bits: int, res_type):
-    """Inverse of :func:`scalar_bits`: a result port's integer bit pattern to the
-    numpy scalar of the kernel's return type."""
-    dtype = (
-        widen_apint_to_std(res_type) if not isinstance(res_type, DType) else res_type
-    )
-    np_dt = dtype_to_numpy_dtype(dtype)
-    width = int(np.dtype(np_dt).itemsize) * 8
-    return np.array(bits & ((1 << width) - 1), _UINT[width]).view(np_dt)[()]
+    """Inverse of :func:`scalar_bits`: a result port's bit pattern as the numpy
+    scalar of the kernel's return type."""
+    return scalar_from_bits(bits, host_type(res_type, RTL_ABI))

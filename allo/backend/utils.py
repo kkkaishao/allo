@@ -1,31 +1,11 @@
 # Copyright Allo authors. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-import ctypes
 import random
 import string
 import tempfile
 
 from pathlib import Path
-
-import ml_dtypes
-import numpy as np
-
-from ..lang.core import DType, widen_apint_to_std
-
-
-def numpy_to_ctype(np_dtype) -> type:
-    """Map a numpy element dtype to the ctypes scalar used at the host boundary.
-
-    Shared by the CPU (LLVM JIT) and Vitis C-simulation backends, which both
-    marshal numpy buffers/scalars through ctypes. ``np.float16``/``bfloat16`` have
-    no native ctype, so they cross as raw ``c_int16`` (the caller reinterprets the
-    bits); every other dtype maps via ``np.ctypeslib.as_ctypes_type``.
-    """
-    np_dtype = np.dtype(np_dtype)
-    if np_dtype == np.dtype(np.float16) or np_dtype == np.dtype(ml_dtypes.bfloat16):
-        return ctypes.c_int16
-    return np.ctypeslib.as_ctypes_type(np_dtype)
 
 
 def generate_random_string(prefix: str, length: int = 8) -> str:
@@ -46,26 +26,3 @@ def make_project_path(project: Path | str | None, prefix: str, exist_ok: bool) -
         )
     project_path.mkdir(parents=True, exist_ok=True)
     return project_path
-
-
-_DTYPE_TO_NP = {
-    "float32": np.float32,
-    "float64": np.float64,
-    "index": np.int32,
-    "int8": np.int8,
-    "int16": np.int16,
-    "int32": np.int32,
-    "int64": np.int64,
-    "uint1": np.bool_,
-    "uint8": np.uint8,
-    "uint16": np.uint16,
-    "uint32": np.uint32,
-    "uint64": np.uint64,
-}
-
-
-def dtype_to_numpy_dtype(dtype: DType):
-    dtype = widen_apint_to_std(dtype)
-    if dtype.name not in _DTYPE_TO_NP:
-        raise TypeError(f"Unsupported dtype {dtype} for conversion to numpy dtype.")
-    return _DTYPE_TO_NP[dtype.name]

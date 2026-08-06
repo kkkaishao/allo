@@ -18,7 +18,7 @@ from collections.abc import Mapping
 import numpy as np
 
 from .utils import _render_template
-from ..utils import numpy_to_ctype, dtype_to_numpy_dtype
+from ..marshal import HLS_CSIM_ABI, as_array, host_type, writeback
 from ..base import write_text_if_changed
 from ...lang.core import BufferType, DType, TypeBase
 from ...logging import completed_output, log_debug, log_detail, run_command, stage
@@ -221,53 +221,24 @@ def _generate_csim_makefile(
     )
 
 
-def _ctype_for_dtype(dtype: DType):
-    return numpy_to_ctype(dtype_to_numpy_dtype(dtype))
-
-
-def _as_csim_array(arg, buffer_type: BufferType):
-    if not isinstance(arg, np.ndarray):
-        raise TypeError(
-            "Vitis Python-native csim buffer arguments must be numpy arrays"
-        )
-    if tuple(arg.shape) != tuple(buffer_type.shape):
-        raise ValueError(
-            f"Expected buffer shape {tuple(buffer_type.shape)}, got {arg.shape}"
-        )
-
-    np_dtype = dtype_to_numpy_dtype(buffer_type.dtype)
-    array = arg
-    if array.dtype != np_dtype:
-        array = array.astype(np_dtype)
-    if not array.flags["C_CONTIGUOUS"]:
-        array = np.ascontiguousarray(array)
-    return array
-
-
-def _writeback_csim_arrays(arg_arrays) -> None:
-    for original, array in arg_arrays:
-        if isinstance(original, np.ndarray) and original is not array:
-            original[...] = array.astype(original.dtype, copy=False)
-
-
 def _csim_argtype(arg_type: TypeBase):
     if isinstance(arg_type, BufferType):
         return np.ctypeslib.ndpointer(
-            dtype=dtype_to_numpy_dtype(arg_type.dtype),
+            dtype=host_type(arg_type.dtype, HLS_CSIM_ABI).np_dtype,
             ndim=len(arg_type.shape),
             flags="C_CONTIGUOUS",
         )
     if isinstance(arg_type, DType):
-        return _ctype_for_dtype(arg_type)
+        return host_type(arg_type, HLS_CSIM_ABI).ctype
     raise TypeError(f"Unsupported Vitis Python-native csim argument type: {arg_type}")
 
 
 def _pack_csim_arg(arg, arg_type: TypeBase):
     if isinstance(arg_type, BufferType):
-        array = _as_csim_array(arg, arg_type)
+        array = as_array(arg, arg_type, HLS_CSIM_ABI)
         return array, array
     if isinstance(arg_type, DType):
-        return _ctype_for_dtype(arg_type)(arg), None
+        return host_type(arg_type, HLS_CSIM_ABI).ctype(arg), None
     raise TypeError(f"Unsupported Vitis Python-native csim argument type: {arg_type}")
 
 
@@ -275,7 +246,7 @@ def _csim_return_type(res_types: list[TypeBase]):
     if not res_types:
         return None
     if len(res_types) == 1 and isinstance(res_types[0], DType):
-        return _ctype_for_dtype(res_types[0])
+        return host_type(res_types[0], HLS_CSIM_ABI).ctype
     raise TypeError("Vitis Python-native csim only supports void or scalar return")
 
 
@@ -323,7 +294,7 @@ class PythonNativeCSimulator:
 
         with stage("Running Vitis C Simulation"):
             result = func(*packed_args)
-            _writeback_csim_arrays(arg_arrays)
+            writeback(arg_arrays)
             return result
 
     def build(self, *, exist_ok: bool = True) -> Path:
