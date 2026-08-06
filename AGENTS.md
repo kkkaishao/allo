@@ -4,7 +4,8 @@
 - Run `pip install -e .` to synchronize python packages when modifying both Python side and C++ side
   (it also rebuilds C++ side automatically)
 - Set `ALLO_ENABLE_ORTOOLS=1` to enable OR-Tools support in Allo
-  Set `CMAKE_PREFIX_PATH=$HOME/.local/share` to provide a path for CMake to find OR-Tools packages.
+  Set `CMAKE_PREFIX_PATH=$HOME/.local/share/or-tools-9.15` to provide a path for CMake to find
+  OR-Tools packages.
 
 # Testing
 - Run `python -m pytest tests/` to run all tests

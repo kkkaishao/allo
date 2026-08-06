@@ -17,8 +17,8 @@ set(ALLO_SCHEDULING_LIBS
 )
 if(ALLO_ENABLE_ORTOOLS)
   list(APPEND ALLO_SCHEDULING_LIBS ortools::ortools)
-  set_source_files_properties(CPSATScheduler.cpp
-      PROPERTIES COMPILE_DEFINITIONS ALLO_ENABLE_ORTOOLS)
+  set_source_files_properties(CPSATScheduler.cpp PROPERTIES COMPILE_DEFINITIONS
+      "ALLO_ENABLE_ORTOOLS;$<TARGET_PROPERTY:ortools::ortools,INTERFACE_COMPILE_DEFINITIONS>")
 endif()
 
 add_mlir_library(MLIRAlloScheduling
