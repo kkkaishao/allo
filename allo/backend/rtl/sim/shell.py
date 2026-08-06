@@ -220,9 +220,6 @@ def cosim(
             verilog, module, wd, operators, interfaces
         )
         if simulator == "verilator":
-            # A fixed 64-bit DPI backs a possibly-wider operator, so
-            # verilator's width-mismatch warnings are benign here.
-            build_args = ["-Wno-fatal", *build_args]
             # Each DUT builds in a fresh directory and recompiles the same
             # verilator runtime units, which OBJCACHE turns into cache hits. An
             # explicit setting wins, including an empty one that opts out.

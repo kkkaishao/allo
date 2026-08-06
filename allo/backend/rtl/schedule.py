@@ -68,7 +68,7 @@ def run_schedule(
         f"raise-counted-while,{loops},"
         f"canonicalize,fold-if-statements,cse,{scalarize},"
         f"{reassoc},{rotate},narrow-demanded-bits),drop-trivial-func,"
-        f"{part},func.func(assign-banks))"
+        f"{part},func.func(assign-banks),canonicalize,cse)"
     )
     run_pipeline(module, pipeline)
     diagnostics: list[str] = []

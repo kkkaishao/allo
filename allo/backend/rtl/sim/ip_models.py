@@ -8,6 +8,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from ..interface import Interfaces, Operator
+from ....lang.ip import OperatorType
 
 # --- descriptors (from the device operator table) --------------------------
 
@@ -27,7 +28,7 @@ class OpDesc:
     """One device operator IP, the behavioral source of truth. ``name`` is the
     operator's ``sym_name``, the extern module's base name. ``c_expr`` is a user
     ``add_c_model`` C expression over the operands ``a``, ``b``, ...; ``None``
-    falls back to :func:`_kind_expr`."""
+    falls back to the built-in model for the operator's kind."""
 
     name: str
     kind: str  # abstract kind: add/sub/mul/div/rem/cmp/ifcast/fcast/<math mnemonic>
@@ -37,26 +38,63 @@ class OpDesc:
     c_expr: str | None = None
 
 
+def _operand(k: int) -> str:
+    """Operand ``k``'s name: what the emitter names the extern's data ports and
+    what every built-in model is written over."""
+    return chr(ord("a") + k)
+
+
 # --- the externs, as the port manifest declares them ------------------------
 
 
 @dataclass(frozen=True)
 class _Extern:
     """An instantiated extern operator module: the descriptor plus the realized
-    port shape from the manifest, so the behavioral module matches the extern's
-    ports exactly. Each port carries its role, so the clock, the optional clock
-    enable and the result are found structurally rather than by name."""
+    port shape from the manifest. Each port carries its role, so the clock, the
+    optional clock enable and the result are found structurally rather than by
+    name.
+
+    The two sides come from different places, the ports from the emitter (the
+    bound op's MLIR types) and the dtypes from the IP's Python signature, and
+    they are equal by construction, since an operator binds only on an exact
+    type match. :meth:`__post_init__` checks that rather than letting a
+    disagreement reach the model as a silently wrong width. Once it holds, the
+    manifest is only needed for the NAMES the emitter chose, and every width
+    below is read off the descriptor."""
 
     name: str  # the extern module's RTL name
     ports: tuple[tuple[str, int, Operator.Role], ...]  # (name, width, role) in order
     pred: str  # compare predicate; "" if none
     desc: OpDesc
 
+    def __post_init__(self):
+        d = self.desc
+        ins = self._of_role(Operator.Role.DATA)
+        assert len(ins) == len(d.arg_types), (
+            f"operator '{d.name}': extern has {len(ins)} data ports but the "
+            f"descriptor declares {len(d.arg_types)} operands"
+        )
+        for k, ((pn, pw), ty) in enumerate(zip(ins, d.arg_types)):
+            assert pw == ty.width, (
+                f"operator '{d.name}': extern port '{pn}' is {pw} bits but the "
+                f"descriptor declares operand {ty.name} of {ty.width} bits"
+            )
+            assert pn == _operand(k), (
+                f"operator '{d.name}': data port {k} is named '{pn}'; the "
+                "behavioral models are written over a, b, c in operand order"
+            )
+        assert len(self._of_role(Operator.Role.CLK)) == 1
+        assert len(self._of_role(Operator.Role.CE)) <= 1
+        outs = self._of_role(Operator.Role.OUT)
+        assert len(outs) == 1, f"operator '{d.name}': extern has {len(outs)} outputs"
+        assert outs[0][1] == d.ret_type.width, (
+            f"operator '{d.name}': extern output '{outs[0][0]}' is {outs[0][1]} "
+            f"bits but the descriptor declares {d.ret_type.name} of "
+            f"{d.ret_type.width} bits"
+        )
+
     def _of_role(self, role: Operator.Role) -> list[tuple[str, int]]:
         return [(n, w) for n, w, r in self.ports if r == role]
-
-    def data_inputs(self) -> list[tuple[str, int]]:
-        return self._of_role(Operator.Role.DATA)
 
     @property
     def has_ce(self) -> bool:
@@ -64,164 +102,11 @@ class _Extern:
 
     @property
     def clk(self) -> str:
-        clks = self._of_role(Operator.Role.CLK)
-        assert clks, f"extern {self.name} has no clock port"
-        return clks[0][0]
+        return self._of_role(Operator.Role.CLK)[0][0]
 
     @property
-    def out(self) -> tuple[str, int]:
-        outs = self._of_role(Operator.Role.OUT)
-        assert outs, f"extern {self.name} has no output port"
-        return outs[0]
-
-
-# --- emitted source templates ----------------------------------------------
-
-_DPI_C = """\
-// Auto-generated DPI-C behavioral models for the extern IP operators.
-
-#include <cstring>
-#include <cstdint>
-#include <cmath>
-
-{functions}
-"""
-
-_DPI_OP = """\
-extern "C" long long {name}({params}) {{
-{binds}{body}
-}}
-"""
-
-_SV_MODELS = """\
-// Auto-generated behavioral models for the extern IP operators (ip_models)
-
-{imports}
-
-{modules}
-"""
-
-# A shift register `latency` deep, fed by the DPI call.
-_SV_OP = """\
-module {name}({ports});
-  reg [{msb}:0] p [0:{last}];
-  integer i;
-  always @(posedge {clk}) {guard}begin
-    p[0] <= {call};
-    for (i = 1; i < {latency}; i = i + 1) p[i] <= p[i - 1];
-  end
-  assign {out_name} = p[{last}];
-endmodule
-"""
-
-# --- built-in behavior: abstract kind -> a C expression over `a`, `b` -------
-
-# Float-compare predicate -> C comparison operator. An ordered (o*) and an
-# unordered (u*) relational predicate map to the same operator, since cosim
-# inputs are NaN-free.
-_CMP = {
-    "oeq": "==",
-    "one": "!=",
-    "ogt": ">",
-    "oge": ">=",
-    "olt": "<",
-    "ole": "<=",
-    "ueq": "==",
-    "une": "!=",
-    "ugt": ">",
-    "uge": ">=",
-    "ult": "<",
-    "ule": "<=",
-}
-# The predicates that are not `a <op> b`: the NaN tests and the two constants.
-_CMP_NONREL = {
-    "uno": "std::isnan(a) || std::isnan(b)",
-    "ord": "!std::isnan(a) && !std::isnan(b)",
-    "true": "true",
-    "false": "false",
-}
-_ARITH = {"add": "a + b", "sub": "a - b", "mul": "a * b", "div": "a / b"}
-# Advanced math mnemonic -> C++ <cmath> function (overloaded on float/double).
-_LIBM = {
-    "sqrt": "std::sqrt",
-    "exp": "std::exp",
-    "log": "std::log",
-    "sin": "std::sin",
-    "cos": "std::cos",
-    "tan": "std::tan",
-    "tanh": "std::tanh",
-    "abs": "std::fabs",
-    "absf": "std::fabs",
-    "floor": "std::floor",
-    "ceil": "std::ceil",
-}
-
-
-def _kind_expr(desc: OpDesc, pred: str) -> str:
-    """The built-in C expression for ``desc.kind`` over operands ``a``, ``b``."""
-    k = desc.kind
-    if k in _ARITH:
-        return _ARITH[k]
-    if k == "rem":
-        return "std::fmod(a, b)"
-    if k == "cmp":
-        if pred in _CMP:
-            return f"a {_CMP[pred]} b"
-        expr = _CMP_NONREL.get(pred)
-        assert expr is not None, f"unsupported float-compare predicate '{pred}'"
-        return expr
-    if k in _LIBM:  # advanced unary math
-        return f"{_LIBM[k]}(a)"
-    if k in {"ifcast", "fcast"}:  # unary conversion: value cast src -> dst
-        return f"({_cscalar(desc.ret_type)})a"
-    raise NotImplementedError(
-        f"no cosim behavioral model for operator kind '{k}' (operator "
-        f"'{desc.name}'); attach one with @ip.add_c_model(\"<C expression>\")"
-    )
-
-
-def _compute_expr(e: _Extern) -> str:
-    """The operator's C expression: a user ``add_c_model`` override, else the
-    built-in expression for its kind."""
-    return e.desc.c_expr if e.desc.c_expr is not None else _kind_expr(e.desc, e.pred)
-
-
-# --- operand / result bit-pattern ABI --------------------------------------
-
-
-def _cscalar(ty: Ty) -> str:
-    """The C scalar type a value of ``ty`` is computed in."""
-    if ty.is_float:
-        return "double" if ty.name == "float64" else "float"  # bf16 computes in float
-    return f"int{ty.width}_t" if ty.signed else f"uint{ty.width}_t"
-
-
-def _load(ty: Ty, raw: str, name: str) -> str:
-    """C statement(s) binding operand ``name`` to a typed value from raw bits ``raw``."""
-    if ty.is_float:
-        if ty.name == "bfloat16":
-            return (
-                f"float {name}; {{ unsigned int _u = "
-                f"((unsigned int)({raw} & 0xFFFFu)) << 16; memcpy(&{name}, &_u, 4); }}"
-            )
-        cty, n = ("double", 8) if ty.name == "float64" else ("float", 4)
-        return f"{cty} {name}; memcpy(&{name}, &{raw}, {n});"
-    assert ty.width in {1, 8, 16, 32, 64}, f"unsupported int width {ty.width}"
-    ity = f"int{ty.width}_t" if ty.signed else f"uint{ty.width}_t"
-    return f"{ity} {name} = ({ity}){raw};"
-
-
-def _store(ty: Ty, val: str) -> str:
-    """C expression producing the ``long long`` raw bits of typed value ``val``."""
-    if ty.is_float:
-        if ty.name == "bfloat16":
-            return f"({{ unsigned int _u; memcpy(&_u, &{val}, 4); (long long)(_u >> 16); }})"
-        n = 8 if ty.name == "float64" else 4
-        return f"({{ long long _o = 0; memcpy(&_o, &{val}, {n}); _o; }})"
-    return f"(long long)({val})"
-
-
-# --- join externs to descriptors -------------------------------------------
+    def out(self) -> str:
+        return self._of_role(Operator.Role.OUT)[0][0]
 
 
 def _plan(interfaces: Interfaces, descs) -> list[_Extern]:
@@ -241,7 +126,237 @@ def _plan(interfaces: Interfaces, descs) -> list[_Extern]:
     return list(seen.values())
 
 
-# --- rendering -------------------------------------------------------------
+# --- built-in behavior, and which language it is written in -----------------
+
+
+@dataclass(frozen=True)
+class _Model:
+    """How one operator kind computes, one realization per domain. An integer
+    core is a SystemVerilog expression over the operand ports, which is what
+    makes it exact at any width and at a result width its operands do not share;
+    a float core is a C expression the DPI evaluates. A domain the kind has no
+    meaning in stays ``None``, so a device declaring such a core is told what is
+    wrong instead of getting a model that computes something else.
+
+    ``sv`` covers both signednesses, since the operand ports carry the dtype's
+    own; ``svu`` overrides it only where an unsigned core is a different
+    expression rather than the same one read differently.
+
+    ``{w}`` expands to the result width, ``{ret}`` to the result's C scalar and
+    ``{cmp}`` to the compare predicate's own expression."""
+
+    sv: str | None = None
+    c: str | None = None
+    svu: str | None = None
+
+
+# A cast is a resize and nothing else: the size cast extends by the operand
+# port's own signedness or truncates, which is exactly sext / zext / trunc.
+_MODELS: dict[str, _Model] = {
+    "add": _Model("a + b", "a + b"),
+    "sub": _Model("a - b", "a - b"),
+    "mul": _Model("a * b", "a * b"),
+    "div": _Model("a / b", "a / b"),
+    "rem": _Model("a % b", "std::fmod(a, b)"),
+    # maximumf/minimumf propagate a NaN operand; maxnumf/minnumf return the
+    # other one, which is what fmax/fmin already do.
+    "max": _Model(
+        "a > b ? a : b", "std::isnan(a) || std::isnan(b) ? a + b : std::fmax(a, b)"
+    ),
+    "min": _Model(
+        "a < b ? a : b", "std::isnan(a) || std::isnan(b) ? a + b : std::fmin(a, b)"
+    ),
+    "maxnum": _Model(c="std::fmax(a, b)"),
+    "minnum": _Model(c="std::fmin(a, b)"),
+    # The sign agreement is what separates ceil from floor; unsigned operands
+    # agree by construction, and asking would be a constant comparison. The
+    # correction needs `$signed`: a size cast keeps its operand's signedness, so
+    # an unsigned one would make the whole expression, division included,
+    # unsigned.
+    "ceildiv": _Model(
+        sv="a / b + $signed({w}'(a % b != 0 && (a < 0) == (b < 0)))",
+        svu="a / b + {w}'(a % b != 0)",
+    ),
+    "floordiv": _Model(
+        sv="a / b - $signed({w}'(a % b != 0 && (a < 0) != (b < 0)))",
+        svu="a / b",
+    ),
+    "neg": _Model("-a", "-a"),
+    "cmp": _Model("{cmp}", "{cmp}"),
+    "and": _Model(sv="a & b"),
+    "or": _Model(sv="a | b"),
+    "xor": _Model(sv="a ^ b"),
+    "shl": _Model(sv="a << b"),
+    # `>>>` fills with the sign bit only when its left operand is signed, so one
+    # operator covers both the arithmetic and the logical shift.
+    "shr": _Model(sv="a >>> b"),
+    "select": _Model("a ? b : c", "a ? b : c"),
+    "icast": _Model(sv="{w}'(a)"),
+    "ifcast": _Model(c="({ret})a"),
+    "fcast": _Model(c="({ret})a"),
+    # advanced unary math, by mnemonic rather than by OperatorType
+    "sqrt": _Model(c="std::sqrt(a)"),
+    "exp": _Model(c="std::exp(a)"),
+    "log": _Model(c="std::log(a)"),
+    "sin": _Model(c="std::sin(a)"),
+    "cos": _Model(c="std::cos(a)"),
+    "tan": _Model(c="std::tan(a)"),
+    "tanh": _Model(c="std::tanh(a)"),
+    "abs": _Model("a < 0 ? -a : a", "std::fabs(a)", svu="a"),
+    "absf": _Model(c="std::fabs(a)"),
+    "floor": _Model(c="std::floor(a)"),
+    "ceil": _Model(c="std::ceil(a)"),
+}
+
+# A kind the compiler can bind but the model cannot realize is a cosim that
+# fails late, so the table owes every OperatorType a row.
+assert {t.value for t in OperatorType} <= _MODELS.keys(), (
+    "every OperatorType needs a behavioral model; missing: "
+    f"{sorted({t.value for t in OperatorType} - _MODELS.keys())}"
+)
+
+# Compare predicate -> the expression it stands for. An ordered (o*) and an
+# unordered (u*) float relation map to the same operator, since cosim inputs are
+# NaN-free; the NaN tests and the two constants are not `a <op> b` at all.
+_FCMP = {
+    "oeq": "a == b",
+    "one": "a != b",
+    "ogt": "a > b",
+    "oge": "a >= b",
+    "olt": "a < b",
+    "ole": "a <= b",
+    "ueq": "a == b",
+    "une": "a != b",
+    "ugt": "a > b",
+    "uge": "a >= b",
+    "ult": "a < b",
+    "ule": "a <= b",
+    "uno": "std::isnan(a) || std::isnan(b)",
+    "ord": "!std::isnan(a) && !std::isnan(b)",
+    "true": "true",
+    "false": "false",
+}
+_ICMP = {
+    "eq": "a == b",
+    "ne": "a != b",
+    "slt": "a < b",
+    "sle": "a <= b",
+    "sgt": "a > b",
+    "sge": "a >= b",
+    "ult": "a < b",
+    "ule": "a <= b",
+    "ugt": "a > b",
+    "uge": "a >= b",
+}
+
+
+def _icmp(pred: str, signed: bool) -> str:
+    """The expression for integer predicate ``pred`` over operands read as
+    ``signed``. The predicate names the signedness it wants and the operand
+    ports carry the dtype's, so a core where they disagree is caught here."""
+    expr = _ICMP.get(pred)
+    assert expr is not None, f"unsupported integer-compare predicate '{pred}'"
+    if pred not in ("eq", "ne"):
+        assert (pred[0] == "s") == signed, (
+            f"integer-compare predicate '{pred}' does not match the operand "
+            f"dtype, which is {'signed' if signed else 'unsigned'}"
+        )
+    return expr
+
+
+def _no_model(desc: OpDesc, domain: str) -> NotImplementedError:
+    return NotImplementedError(
+        f"operator '{desc.name}': no {domain} behavioral model for kind "
+        f"'{desc.kind}'; attach one with @ip.add_c_model(\"<C expression>\")"
+    )
+
+
+def _float_op(desc: OpDesc) -> bool:
+    """A float anywhere in the signature, result included, makes it a float
+    operator: that is what an int-to-float cast is."""
+    return any(t.is_float for t in (*desc.arg_types, desc.ret_type))
+
+
+def _via_dpi(desc: OpDesc) -> bool:
+    """Whether this core computes in C rather than in RTL. A user model is a C
+    expression and so always does; otherwise a float operator does, and an
+    integer one does not, since SystemVerilog carries integer width and
+    signedness exactly and C does not."""
+    return desc.c_expr is not None or _float_op(desc)
+
+
+# --- native models: a SystemVerilog expression over the operand ports -------
+
+
+def _sv_expr(desc: OpDesc, pred: str, signed: bool) -> str:
+    """The built-in SystemVerilog expression for an integer ``desc``."""
+    model = _MODELS.get(desc.kind, _Model())
+    expr = model.sv if signed or model.svu is None else model.svu
+    if expr is None:
+        raise _no_model(desc, "integer")
+    return expr.format(w=desc.ret_type.width, cmp=_icmp(pred, signed) if pred else "")
+
+
+# --- DPI models: a C expression over operands decoded from the port bits ----
+
+#: The float formats allo has (see ``APFloat``), each naming its runtime codec.
+#: A format absent here has no bit layout the model knows, which is a hard error
+#: rather than the nearest-looking one.
+_FLOAT_FMT = {
+    "float16": "f16",
+    "bfloat16": "bf16",
+    "float32": "f32",
+    "float64": "f64",
+}
+
+
+def _cscalar(ty: Ty) -> str:
+    """The C scalar a value of ``ty`` is held in. Every integer widens to 64
+    bits, so a width the C types have no name for (a 48-bit accumulator) is
+    still exact; only the load and the store know the real width."""
+    if ty.is_float:
+        return "double" if ty.name == "float64" else "float"  # f16/bf16 in float
+    return "int64_t" if ty.signed else "uint64_t"
+
+
+def _operand_ctype(desc: OpDesc) -> str:
+    """The one C type every operand is evaluated in. Deliberately NOT the
+    result's: a core whose result is wider than its operands (an i32 x i32 ->
+    i64 multiplier) has to compute in something wide enough to hold it, which
+    C's own promotions do not give."""
+    tys = (*desc.arg_types, desc.ret_type)
+    if _float_op(desc):
+        return "double" if any(t.name == "float64" for t in tys) else "float"
+    return "int64_t" if any(t.signed for t in desc.arg_types) else "uint64_t"
+
+
+# `allo_ld_*` / `allo_st_*` are the codecs in `_DPI_RUNTIME`, at the end of this
+# file, which is the one place a dtype's bit layout is written down.
+def _load(ty: Ty, ctype: str, raw: str, name: str) -> str:
+    """A C statement binding operand ``name``, at the operator's evaluation type
+    ``ctype``, to the value the port bits ``raw`` encode."""
+    if ty.is_float:
+        return f"{ctype} {name} = allo_ld_{_FLOAT_FMT[ty.name]}({raw});"
+    fn = "allo_ld_int" if ty.signed else "allo_ld_uint"
+    return f"{ctype} {name} = {fn}({raw}, {ty.width});"
+
+
+def _store(ty: Ty, dst: str, val: str) -> str:
+    """A C statement writing typed value ``val`` into the result port ``dst``."""
+    if ty.is_float:
+        return f"allo_st_{_FLOAT_FMT[ty.name]}({dst}, {val});"
+    return f"allo_st_int({dst}, {ty.width}, (uint64_t){val});"
+
+
+def _c_expr(desc: OpDesc, pred: str) -> str:
+    """The built-in C expression for a float ``desc``, over the bound operands."""
+    expr = _MODELS.get(desc.kind, _Model()).c
+    if expr is None:
+        raise _no_model(desc, "float")
+    cmp = _FCMP.get(pred, "")
+    if desc.kind == "cmp":
+        assert cmp, f"unsupported float-compare predicate '{pred}'"
+    return expr.format(ret=_cscalar(desc.ret_type), cmp=cmp)
 
 
 def _dpi_name(e: _Extern) -> str:
@@ -249,34 +364,152 @@ def _dpi_name(e: _Extern) -> str:
     return f"allo_op_{e.desc.name}" + (f"_{e.pred}" if e.pred else "")
 
 
-def _dpi_slots(e: _Extern) -> tuple[str, str]:
-    """The rendered ``binds`` and ``body`` for one operator's DPI function."""
+def _dpi_body(e: _Extern) -> str:
+    """One operator's DPI function body: bind each operand from its port bits,
+    evaluate, write the result back."""
     d = e.desc
-    binds = "".join(
-        f"  {_load(t, f'p{k}', chr(ord('a') + k))}\n" for k, t in enumerate(d.arg_types)
+    for ty in (*d.arg_types, d.ret_type):
+        if ty.is_float:
+            assert ty.name in _FLOAT_FMT, f"unknown float format '{ty.name}'"
+        elif ty.width > 64:
+            raise NotImplementedError(
+                f"operator '{d.name}': a {ty.width}-bit integer does not fit the "
+                "64-bit C value a user model computes in; drop the add_c_model "
+                "to take the native SystemVerilog model, which has no such limit"
+            )
+    ctype = _operand_ctype(d)
+    assert not (ctype == "double" and d.ret_type.name in {"float16", "bfloat16"}), (
+        f"operator '{d.name}': a {d.ret_type.name} result computed in double "
+        "would round twice; model it from a float operand instead"
     )
-    expr = _compute_expr(e)
-    if d.ret_type.is_float:
-        body = f"  {_cscalar(d.ret_type)} _r = ({expr});\n  return {_store(d.ret_type, '_r')};"
-    else:  # an int or bool result needs no reinterpret
-        body = f"  return {_store(d.ret_type, f'({expr})')};"
-    return binds, body
+    binds = "".join(
+        f"  {_load(t, ctype, f'p{k}', _operand(k))}\n"
+        for k, t in enumerate(d.arg_types)
+    )
+    # A user expression is pasted as written; only a built-in model is a template.
+    expr = d.c_expr if d.c_expr is not None else _c_expr(d, e.pred)
+    return (
+        f"{binds}  {_cscalar(d.ret_type)} _r = ({expr});\n"
+        f"  {_store(d.ret_type, 'r', '_r')}"
+    )
+
+
+_DPI_C = """\
+// Auto-generated DPI-C behavioral models for the extern IP operators.
+
+#include <cstdint>
+#include <cstring>
+#include <cmath>
+
+#include "svdpi.h"
+
+{runtime}
+{functions}
+"""
+
+_DPI_OP = """\
+extern "C" void {name}({params}) {{
+{body}
+}}
+"""
 
 
 def dpi_c(interfaces: Interfaces, descs) -> str:
-    """C implementations of the DPI operators the instantiated externs need."""
-    plan = _plan(interfaces, descs)
-    if not plan:
-        return ""
+    """C implementations of the DPI operators the instantiated externs need, or
+    the empty string when every one of them models natively."""
     fns: dict[str, str] = {}
-    for e in plan:
+    for e in _plan(interfaces, descs):
         name = _dpi_name(e)
-        if name in fns:
+        if not _via_dpi(e.desc) or name in fns:
             continue
-        params = ", ".join(f"long long p{k}" for k in range(len(e.desc.arg_types)))
-        binds, body = _dpi_slots(e)
-        fns[name] = _DPI_OP.format(name=name, params=params, binds=binds, body=body)
-    return _DPI_C.format(functions="\n".join(fns.values()))
+        params = ", ".join(
+            [f"const svBitVecVal *p{k}" for k in range(len(e.desc.arg_types))]
+            + ["svBitVecVal *r"]
+        )
+        fns[name] = _DPI_OP.format(name=name, params=params, body=_dpi_body(e))
+    if not fns:
+        return ""
+    return _DPI_C.format(runtime=_DPI_RUNTIME, functions="\n".join(fns.values()))
+
+
+# --- the emitted SystemVerilog ----------------------------------------------
+
+# A shift register `latency` deep in front of the operator's value. `decl` and
+# `sample` are all the two realization paths differ by: a native model is a
+# combinational wire, while a DPI call has to land in `t` blockingly first,
+# since a nonblocking assignment reading an output that same call had just
+# overwritten would skip a stage.
+_SV_OP = """\
+module {name}({ports});
+{decl}  reg [{msb}:0] p [0:{last}];
+  integer i;
+  always @(posedge {clk}) {guard}begin
+{sample}    for (i = 1; i < {latency}; i = i + 1) p[i] <= p[i - 1];
+  end
+  assign {out} = p[{last}];
+endmodule
+"""
+
+_SV_MODELS = """\
+// Auto-generated behavioral models for the extern IP operators (ip_models)
+
+{imports}
+
+{modules}
+"""
+
+
+def _dpi_import(e: _Extern) -> str:
+    """The import declaration for ``e``'s DPI function. Its widths come from the
+    descriptor, the same side the C is generated from, so the declaration and
+    its implementation cannot disagree."""
+    args = ", ".join(
+        f"input bit [{t.width - 1}:0] p{k}" for k, t in enumerate(e.desc.arg_types)
+    )
+    return (
+        f'import "DPI-C" function void {_dpi_name(e)}({args}, '
+        f"output bit [{e.desc.ret_type.width - 1}:0] r);"
+    )
+
+
+def _sv_module(e: _Extern) -> str:
+    """One extern's behavioral module."""
+    d = e.desc
+    assert d.latency >= 1, f"operator '{d.name}' needs latency >= 1 for a shift model"
+    msb = d.ret_type.width - 1
+    native = not _via_dpi(d)
+    # A native model reads its operands as the dtype says, so the port carries
+    # the signedness rather than every expression restating it.
+    ports = [
+        f"input{' signed' if native and t.signed else ''} "
+        f"[{t.width - 1}:0] {_operand(k)}"
+        for k, t in enumerate(d.arg_types)
+    ]
+    ports.append(f"input {e.clk}")
+    if e.has_ce:
+        ports.append("input ce")
+    ports.append(f"output [{msb}:0] {e.out}")
+
+    if native:
+        expr = _sv_expr(d, e.pred, any(t.signed for t in d.arg_types))
+        decl, sample = f"  wire [{msb}:0] f = {expr};\n", "    p[0] <= f;\n"
+    else:
+        args = ", ".join([_operand(k) for k in range(len(d.arg_types))] + ["t"])
+        decl = f"  reg [{msb}:0] t;\n"
+        sample = f"    {_dpi_name(e)}({args});\n    p[0] <= t;\n"
+
+    return _SV_OP.format(
+        name=e.name,
+        ports=", ".join(ports),
+        decl=decl,
+        msb=msb,
+        last=d.latency - 1,
+        clk=e.clk,
+        guard="if (ce) " if e.has_ce else "",
+        sample=sample,
+        latency=d.latency,
+        out=e.out,
+    )
 
 
 def sv_models(interfaces: Interfaces, descs) -> str:
@@ -285,43 +518,139 @@ def sv_models(interfaces: Interfaces, descs) -> str:
     plan = _plan(interfaces, descs)
     if not plan:
         return ""
-    imports: dict[str, str] = {}
-    modules = []
-    for e in plan:
-        dpi = _dpi_name(e)
-        params = ", ".join(f"input longint p{k}" for k in range(len(e.desc.arg_types)))
-        imports[dpi] = f'import "DPI-C" function longint {dpi}({params});'
-
-        lat = e.desc.latency
-        assert (
-            lat >= 1
-        ), f"operator '{e.desc.name}' needs latency >= 1 for a shift model"
-        ins = e.data_inputs()
-        assert len(ins) == len(e.desc.arg_types), (
-            f"operator '{e.desc.name}': extern has {len(ins)} data ports but the "
-            f"descriptor declares {len(e.desc.arg_types)} operands"
-        )
-        out_name, outw = e.out
-        ports = ", ".join(f"input [{w - 1}:0] {n}" for n, w in ins)
-        ports += f", input {e.clk}"
-        if e.has_ce:
-            ports += ", input ce"
-        ports += f", output [{outw - 1}:0] {out_name}"
-        call = f"{dpi}(" + ", ".join(n for n, _ in ins) + ")"
-        modules.append(
-            _SV_OP.format(
-                name=e.name,
-                ports=ports,
-                msb=outw - 1,
-                last=lat - 1,
-                clk=e.clk,
-                guard="if (ce) " if e.has_ce else "",
-                call=call,
-                latency=lat,
-                out_name=out_name,
-            )
-        )
+    imports = {_dpi_name(e): _dpi_import(e) for e in plan if _via_dpi(e.desc)}
     return _SV_MODELS.format(
         imports="\n".join(imports.values()),
-        modules="\n".join(modules),
+        modules="\n".join(_sv_module(e) for e in plan),
     )
+
+
+# --- the C runtime the generated DPI functions call into --------------------
+
+# Every load and store goes through this, so a port of any width is decoded the
+# same way and each dtype's bit layout is stated exactly once. The narrowing
+# float conversions round to nearest even, which is what the hardware does.
+_DPI_RUNTIME = """\
+// A packed SystemVerilog `bit [W-1:0]` reaches C as `svBitVecVal[]`: 32-bit
+// words, word k holding bits [32k+31 : 32k].
+
+template <typename U>
+static inline U allo_ld_raw(const svBitVecVal *v, unsigned w) {
+  U x = 0;
+  for (unsigned i = 0; i * 32 < w; ++i)
+    x |= (U)(uint32_t)v[i] << (32 * i);
+  const unsigned n = sizeof(U) * 8;
+  return w < n ? (U)(x & ((((U)1) << w) - 1)) : x;
+}
+
+static inline void allo_st_raw(svBitVecVal *v, unsigned w, uint64_t x) {
+  for (unsigned i = 0; i * 32 < w; ++i)
+    v[i] = (svBitVecVal)(uint32_t)(x >> (32 * i));
+  const unsigned tail = w & 31;  // the top word carries only the port's bits
+  if (tail)
+    v[(w - 1) / 32] &= (svBitVecVal)((1u << tail) - 1);
+}
+
+// An integer operand widens to 64 bits by its OWN signedness, so the expression
+// below it sees the value the port carries whatever the port's width.
+static inline int64_t allo_ld_int(const svBitVecVal *v, unsigned w) {
+  const uint64_t x = allo_ld_raw<uint64_t>(v, w);
+  const unsigned sh = 64 - w;
+  return sh ? ((int64_t)(x << sh)) >> sh : (int64_t)x;
+}
+static inline uint64_t allo_ld_uint(const svBitVecVal *v, unsigned w) {
+  return allo_ld_raw<uint64_t>(v, w);
+}
+static inline void allo_st_int(svBitVecVal *v, unsigned w, uint64_t x) {
+  allo_st_raw(v, w, x);
+}
+
+static inline float allo_ld_f32(const svBitVecVal *v) {
+  const uint32_t u = (uint32_t)allo_ld_raw<uint64_t>(v, 32);
+  float f;
+  memcpy(&f, &u, 4);
+  return f;
+}
+static inline void allo_st_f32(svBitVecVal *v, float f) {
+  uint32_t u;
+  memcpy(&u, &f, 4);
+  allo_st_raw(v, 32, u);
+}
+static inline double allo_ld_f64(const svBitVecVal *v) {
+  const uint64_t u = allo_ld_raw<uint64_t>(v, 64);
+  double d;
+  memcpy(&d, &u, 8);
+  return d;
+}
+static inline void allo_st_f64(svBitVecVal *v, double d) {
+  uint64_t u;
+  memcpy(&u, &d, 8);
+  allo_st_raw(v, 64, u);
+}
+
+// binary16: widen exactly, narrow round-to-nearest-even.
+static inline float allo_ld_f16(const svBitVecVal *v) {
+  const uint16_t h = (uint16_t)allo_ld_raw<uint64_t>(v, 16);
+  uint32_t sign = (uint32_t)(h & 0x8000u) << 16;
+  uint32_t exp = (h >> 10) & 0x1Fu, man = h & 0x3FFu, u;
+  if (exp == 0) {
+    if (man == 0) {
+      u = sign;
+    } else {  // subnormal half, a normal float once renormalized
+      exp = 127 - 15 + 1;
+      while (!(man & 0x400u)) {
+        man <<= 1;
+        --exp;
+      }
+      u = sign | (exp << 23) | ((man & 0x3FFu) << 13);
+    }
+  } else if (exp == 0x1Fu) {
+    u = sign | 0x7F800000u | (man << 13);
+  } else {
+    u = sign | ((exp + 127 - 15) << 23) | (man << 13);
+  }
+  float f;
+  memcpy(&f, &u, 4);
+  return f;
+}
+static inline void allo_st_f16(svBitVecVal *v, float f) {
+  uint32_t u;
+  memcpy(&u, &f, 4);
+  const uint32_t sign = (u >> 16) & 0x8000u, be = (u >> 23) & 0xFFu;
+  uint32_t man = u & 0x7FFFFFu, h;
+  int32_t exp = (int32_t)be - 127 + 15;
+  if (be == 0xFFu) {  // inf, or a NaN kept quiet
+    h = sign | 0x7C00u | (man ? 0x200u : 0u);
+  } else if (exp >= 0x1F) {
+    h = sign | 0x7C00u;
+  } else if (exp < -10) {
+    h = sign;
+  } else if (exp <= 0) {  // subnormal half: shift the whole significand down
+    man |= 0x800000u;
+    const unsigned sh = (unsigned)(14 - exp);
+    h = sign | ((man + (1u << (sh - 1)) - 1u + ((man >> sh) & 1u)) >> sh);
+  } else {
+    const uint32_t r = (man + 0x0FFFu + ((man >> 13) & 1u)) >> 13;
+    exp += (int32_t)(r >> 10);  // rounding may carry into the exponent
+    h = exp >= 0x1F ? (sign | 0x7C00u)
+                    : (sign | ((uint32_t)exp << 10) | (r & 0x3FFu));
+  }
+  allo_st_raw(v, 16, h);
+}
+
+// bfloat16: the top 16 bits of a binary32, round-to-nearest-even downward.
+static inline float allo_ld_bf16(const svBitVecVal *v) {
+  const uint32_t u = (uint32_t)allo_ld_raw<uint64_t>(v, 16) << 16;
+  float f;
+  memcpy(&f, &u, 4);
+  return f;
+}
+static inline void allo_st_bf16(svBitVecVal *v, float f) {
+  uint32_t u;
+  memcpy(&u, &f, 4);
+  const bool nan = (u & 0x7F800000u) == 0x7F800000u && (u & 0x7FFFFFu);
+  allo_st_raw(v, 16,
+              nan ? ((u >> 16) | 0x40u)
+                  : ((u + 0x7FFFu + ((u >> 16) & 1u)) >> 16));
+}
+"""

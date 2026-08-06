@@ -12,7 +12,7 @@ import numpy as np
 import pytest
 
 from allo import kernel
-from allo.lang import bf16, f32, i32, KernelOptions
+from allo.lang import bf16, f16, f32, i32, KernelOptions
 from allo.lang.core import APInt
 from allo.lang.ip import operator_ip, OperatorType
 from allo.operators import math as amath
@@ -514,16 +514,15 @@ def test_float_max_no_ip_expands_cosim(propagate_nan):
 
 def test_float_max_with_ip_kept_cosim():
     # A float max on a device WITH a matching max IP is KEPT by legalize-arith
-    # (not expanded) and bound to that IP, one operator instead of cmp+select,
-    # and cosims via the IP's C-model.
+    # (not expanded) and bound to that IP, one operator instead of cmp+select.
+    # No add_c_model: `max` is an OperatorType, so the built-in model table owes
+    # it a behavior and the core is characterized by its declaration alone.
     N = 16
 
     @operator_ip(
         optype=OperatorType.MAX, latency=2, in_delay_ns=0.5, pipelined=True, style="ce"
     )
     def fmax_ip(a: f32, b: f32) -> f32: ...
-
-    fmax_ip.add_c_model("std::fmax(a, b)")
 
     @kernel
     def fmax_keep(A: f32[N], B: f32[N], out: f32[N]):
@@ -544,6 +543,113 @@ def test_float_max_with_ip_kept_cosim():
     out = np.zeros(N, np.float32)
     rtl.cosim(A, B, out)
     np.testing.assert_allclose(out, np.maximum(A, B), rtol=1e-6, atol=1e-6)
+
+
+def _wide_add_ip(width):
+    wide = APInt(width, signed=True)
+
+    @operator_ip(
+        optype=OperatorType.ADD, latency=3, in_delay_ns=0.5, pipelined=True, style="ce"
+    )
+    def wadd(a: wide, b: wide) -> wide: ...
+
+    return wide, wadd
+
+
+def test_wide_int_operator_ip_cosim():
+    # An operator core at a width the C types have no name for. Its model is
+    # native RTL, which carries the port's own 48 bits, so the accumulator wraps
+    # in simulation exactly where the declared type says it does.
+    from allo.backend.rtl.device import operator_descs
+    from allo.backend.rtl.sim import ip_models
+
+    i48, wadd = _wide_add_ip(48)
+
+    @kernel
+    def dot(x: i32[8], y: i32[8]) -> i48:
+        acc: i48 = 0
+        for k in range(8, name="k"):
+            acc = acc + x[k] * y[k]
+        return acc
+
+    dev = default_device.copy()
+    dev.add_operator(wadd)
+    rtl = _to_rtl(dot, device=dev)
+    ops = [o for i in rtl.interfaces.values() for o in i.operators]
+    assert [p.width for p in ops[0].ports if p.role == "data"] == [48, 48]
+    # No DPI at all: an integer core needs no C, so nothing caps it at 64 bits.
+    assert ip_models.dpi_c(rtl.interfaces, operator_descs(dev.operators)) == ""
+
+    rng = np.random.default_rng(0)
+    x = rng.integers(-(2**31), 2**31, size=8, dtype=np.int64).astype(np.int32)
+    y = rng.integers(-(2**31), 2**31, size=8, dtype=np.int64).astype(np.int32)
+    exact = sum(int(a) * int(b) for a, b in zip(x, y))
+    assert abs(exact) > 2**47, "inputs must overflow i48 for the wrap to matter"
+    assert int(rtl.cosim(x, y).result) == ((exact + 2**47) % 2**48) - 2**47
+
+
+def test_behavior_language_follows_the_domain():
+    # Which language a core's behavior is written in follows from the core, not
+    # from a list: an integer one is native RTL (exact at any width, so a 128-bit
+    # core models like any other), a float one is C over the DPI, and a user
+    # `add_c_model` is C whatever the domain, since that is what the user wrote.
+    from allo.backend.rtl.device import operator_descs
+    from allo.backend.rtl.sim import ip_models
+
+    i128, wadd = _wide_add_ip(128)
+
+    @operator_ip(optype=OperatorType.MUL, latency=2, pipelined=True, style="ce")
+    def imul(a: i32, b: i32) -> i32: ...
+
+    imul.add_c_model("a * b")
+
+    @kernel
+    def wide(x: i32[4], y: i32[4], out: i32[4], z: f32[4]) -> i128:
+        acc: i128 = 0
+        for k in range(4, name="k"):
+            out[k] = x[k] * y[k]
+            z[k] = z[k] + z[k]
+            acc = acc + out[k]
+        return acc
+
+    dev = default_device.copy()
+    dev.add_operators(wadd, imul)
+    rtl = _to_rtl(wide, device=dev)
+    descs = operator_descs(dev.operators)
+    sv = ip_models.sv_models(rtl.interfaces, descs)
+    c = ip_models.dpi_c(rtl.interfaces, descs)
+    # The 128-bit add is a wire in RTL; the user-modelled multiply and the float
+    # add are the only two that reach C.
+    assert f"module {wadd.symbol}(" in sv and "wire [127:0] f = a + b;" in sv
+    assert wadd.symbol not in c
+    assert f"allo_op_{imul.symbol}(" in c
+    assert "allo_ld_f32(p0)" in c
+
+
+def test_float_format_picks_its_own_codec():
+    # Each float format decodes through the codec for ITS layout. binary16 and
+    # bfloat16 are both 16 bits and neither is a narrowed binary32 read, so a
+    # model that fell back to the nearest-looking format would compute garbage
+    # without saying so.
+    from allo.backend.rtl.device import operator_descs
+    from allo.backend.rtl.sim import ip_models
+
+    @operator_ip(
+        optype=OperatorType.ADD, latency=3, in_delay_ns=0.5, pipelined=True, style="ce"
+    )
+    def hadd(a: f16, b: f16) -> f16: ...
+
+    @kernel
+    def addk(A: f16[16], B: f16[16], C: f16[16]):
+        for i in range(16):
+            C[i] = A[i] + B[i]
+
+    dev = default_device.copy()
+    dev.add_operator(hadd)
+    rtl = _to_rtl(addk, device=dev)
+    c = ip_models.dpi_c(rtl.interfaces, operator_descs(dev.operators))
+    body = c.split(f"allo_op_{hadd.symbol}(")[1]
+    assert "allo_ld_f16(p0)" in body and "allo_st_f16(r, _r)" in body, body[:400]
 
 
 def test_max_maxnum_split_binds_distinctly():
