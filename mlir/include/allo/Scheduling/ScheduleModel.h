@@ -104,29 +104,6 @@ struct RegionReport {
   std::vector<ScheduledOpReport> ops;
 };
 
-/// The loop-carried memory edges one problem held, split by what fixed each
-/// distance: the polyhedral test PROVED it, or a conservative fallback ASSUMED
-/// it. An II resting on an assumed edge is a scheduling-quality fact and not a
-/// hardware one, and it is unrecoverable afterwards: the problem the edges
-/// lived in is gone by the time the schedule is reified.
-struct CarriedEdges {
-  /// Every carried edge, then the two assumed kinds among them: `nonAffine` a
-  /// pair the test cannot model at all, `unknown` a direction it modelled but
-  /// could not bound.
-  int64_t total = 0, nonAffine = 0, unknown = 0;
-};
-
-/// One operator TYPE the library prices several operations under, and how many
-/// distinct operator IDENTITIES those operations actually hold. `identities >
-/// 1` is exactly where the library's pricing over-approximates: every operation
-/// of the type is charged one row, though the rows they would each want differ.
-/// Not re-derivable from the schedule, which records the realization an
-/// operation GOT and never the type it was priced under.
-struct OperatorClass {
-  std::string type;
-  unsigned ops = 0, identities = 0;
-};
-
 /// What ONE region's solve COST: a measurement of the compiler, not the
 /// hardware, so it is never stamped as an IR attribute the emitter could read.
 ///
@@ -142,15 +119,8 @@ struct SolveReport {
   /// Problem size: operations registered, and how many of those hold at least
   /// one limited unit.
   int64_t ops = 0, limitedOps = 0;
-  /// What the solve allocated: operations whose operator count it decided, and
-  /// the instances it decided to build for them. Both zero where nothing was
-  /// allocatable, and always zero for a heuristic solve.
-  int64_t allocatedOps = 0, allocatedUnits = 0;
   /// The initiation interval settled, absent for an acyclic span.
   std::optional<int64_t> interval;
-  /// What the II had to respect across iterations. Absent for an acyclic span,
-  /// which models no carried edge at all.
-  std::optional<CarriedEdges> carried;
   /// Wall time of the whole solve in milliseconds.
   double millis = 0.0;
 };
@@ -335,21 +305,6 @@ public:
       entryValues.erase(res);
   }
 
-  /// Record that one operation priced under operator type \p type holds
-  /// operator identity \p identity. Accumulated whole-module: a type
-  /// over-approximates the same way wherever it is used, so the split is a fact
-  /// about the library and not about one region.
-  void noteOperatorClass(llvm::StringRef type, llvm::StringRef identity) {
-    auto &[ops, identities] = classes[type.str()];
-    ++ops;
-    identities.insert(identity.str());
-  }
-
-  /// The operator types covering SEVERAL identities, in type order. A type
-  /// pricing one operation, or several of one identity, does not
-  /// over-approximate and is not reported.
-  std::vector<OperatorClass> operatorClasses() const;
-
   /// Read \p module's reified `allo.dcp.*` ops into `report`, and the prep
   /// passes' stamped decisions into `prep`. Called once, at the tail of the
   /// reify: before it there are no dcp ops, and after it the pipeline is gone.
@@ -373,9 +328,6 @@ public:
   std::vector<UnhonoredDirective> unhonored;
 
 private:
-  /// Operator type to the operations priced under it and the identities they
-  /// hold. Ordered, so two compiles report the classes the same way.
-  std::map<std::string, std::pair<unsigned, std::set<std::string>>> classes;
   llvm::DenseMap<Operation *, OpSchedule> ops;
   std::vector<AllocatedUnit> units;
   llvm::DenseMap<Operation *, RegionSolution> regions;

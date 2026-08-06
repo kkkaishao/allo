@@ -474,19 +474,6 @@ OperatorIdentity mlir::allo::operatorIdentity(Operation *op,
   return lib.lookup(op).identity;
 }
 
-void mlir::allo::recordOperatorClasses(circt::scheduling::Problem &problem,
-                                       const OperatorLibrary &lib,
-                                       ScheduleModel &model) {
-  for (Operation *op : problem.getOperations()) {
-    if (isSyncSubKernelCall(op) || asMemAccess(op))
-      continue; // no operator row, so no class for one to over-approximate
-    OperatorIdentity id = operatorIdentity(op, lib);
-    if (!id.realized())
-      continue;
-    model.noteOperatorClass(lib.lookup(op).timing.typeName, id.key());
-  }
-}
-
 bool OperatorLibrary::requiresUnmatchedIP(Operation *op) const {
   return needsIP(op) && matchEntry(advancedEntries, entries, op) == nullptr;
 }

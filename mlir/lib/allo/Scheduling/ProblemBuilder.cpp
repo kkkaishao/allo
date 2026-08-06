@@ -45,23 +45,6 @@ innermostCarriedDistance(ArrayRef<affine::DependenceComponent> comps,
       carriedDistanceAtLevel(comps, comps.size(), drop, valid));
 }
 
-// Origin of a loop-carried memory edge's distance: `Proven` by the polyhedral
-// test, `NonAffine` the conservative fallback for a pair the test cannot model,
-// `Unknown` a `*` direction the test could not bound.
-namespace {
-enum class DistanceOrigin { Proven, NonAffine, Unknown };
-} // namespace
-
-static DistanceOrigin distanceOrigin(const MemoryDependence &dep,
-                                     Operation *dst, DependenceAnalysis &deps) {
-  if (deps.isNonPolyhedral(dep.source) || deps.isNonPolyhedral(dst))
-    return DistanceOrigin::NonAffine;
-  auto comps = ArrayRef(dep.dependenceComponents);
-  if (!comps.empty() && !comps.back().lb.has_value())
-    return DistanceOrigin::Unknown;
-  return DistanceOrigin::Proven;
-}
-
 // Whether a dependence is carried by some enclosing loop (a positive distance
 // at any level), hence satisfied by that loop's sequential execution and not an
 // ordering within a single straight-line instance. An acyclic span has no
@@ -122,8 +105,8 @@ static void anchorSinks(ProblemT &problem, Operation *anchor) {
 }
 
 template <class ProblemT>
-ProblemT buildCyclicProblem(LoopLikeOpInterface loop, DependenceAnalysis &deps,
-                            CarriedEdges &counts) {
+ProblemT buildCyclicProblem(LoopLikeOpInterface loop,
+                            DependenceAnalysis &deps) {
   ProblemT problem(loop.getOperation());
   Block *body = &loop.getLoopRegions().front()->front();
 
@@ -145,13 +128,6 @@ ProblemT buildCyclicProblem(LoopLikeOpInterface loop, DependenceAnalysis &deps,
           innermostCarriedDistance(memoryDep.dependenceComponents, drop);
       if (drop)
         continue;
-
-      if (distance >= 1) {
-        ++counts.total;
-        DistanceOrigin origin = distanceOrigin(memoryDep, op, deps);
-        counts.nonAffine += origin == DistanceOrigin::NonAffine;
-        counts.unknown += origin == DistanceOrigin::Unknown;
-      }
 
       Problem::Dependence dep(memoryDep.source, op);
       auto depInserted = problem.insertDependence(dep);
@@ -418,8 +394,7 @@ bool whileFlushingPipelines(scf::WhileOp w, const DeviceModel &dev) {
 }
 
 template <class ProblemT>
-ProblemT buildWhileProblem(scf::WhileOp w, DependenceAnalysis &deps,
-                           CarriedEdges &counts) {
+ProblemT buildWhileProblem(scf::WhileOp w, DependenceAnalysis &deps) {
   assert(whileHasIdentityForwarding(w) && "while must forward args 1:1");
   ProblemT problem(w.getOperation());
   auto &before = w.getBefore().front();
@@ -451,12 +426,6 @@ ProblemT buildWhileProblem(scf::WhileOp w, DependenceAnalysis &deps,
             innermostCarriedDistance(memoryDep.dependenceComponents, drop);
         if (drop)
           continue;
-        if (distance >= 1) {
-          ++counts.total;
-          DistanceOrigin origin = distanceOrigin(memoryDep, op, deps);
-          counts.nonAffine += origin == DistanceOrigin::NonAffine;
-          counts.unknown += origin == DistanceOrigin::Unknown;
-        }
         Problem::Dependence dep(memoryDep.source, op);
         if (failed(problem.insertDependence(dep)))
           continue;
@@ -595,10 +564,9 @@ ProblemT buildAcyclicProblem(ArrayRef<Operation *> ops,
 // Explicit instantiations for the problem types the scheduler pass builds.
 template ChainingModuloProblem
 buildCyclicProblem<ChainingModuloProblem>(LoopLikeOpInterface,
-                                          DependenceAnalysis &, CarriedEdges &);
+                                          DependenceAnalysis &);
 template ChainingModuloProblem
-buildWhileProblem<ChainingModuloProblem>(scf::WhileOp, DependenceAnalysis &,
-                                         CarriedEdges &);
+buildWhileProblem<ChainingModuloProblem>(scf::WhileOp, DependenceAnalysis &);
 template ChainingSharedOperatorsProblem
 buildAcyclicProblem<ChainingSharedOperatorsProblem>(ArrayRef<Operation *>,
                                                     DependenceAnalysis &);

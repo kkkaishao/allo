@@ -138,15 +138,6 @@ void mlir::allo::ScheduleModel::record(ModuleOp module) {
   }
 }
 
-std::vector<mlir::allo::OperatorClass>
-mlir::allo::ScheduleModel::operatorClasses() const {
-  std::vector<OperatorClass> split;
-  for (const auto &[type, seen] : classes)
-    if (seen.first > 1 && seen.second.size() > 1)
-      split.push_back({type, seen.first, (unsigned)seen.second.size()});
-  return split;
-}
-
 std::string mlir::allo::ScheduleModel::toJSON() const {
   using llvm::json::Array;
   using llvm::json::Object;
@@ -210,22 +201,8 @@ std::string mlir::allo::ScheduleModel::toJSON() const {
                  {"ms", s.millis}};
     if (s.interval)
       entry["interval"] = *s.interval;
-    if (s.allocatedOps) {
-      entry["allocated_ops"] = s.allocatedOps;
-      entry["allocated_units"] = s.allocatedUnits;
-    }
-    if (s.carried)
-      entry["carried_edges"] = Object{{"total", s.carried->total},
-                                      {"non_affine", s.carried->nonAffine},
-                                      {"unknown", s.carried->unknown}};
     solveEntries.push_back(std::move(entry));
   }
-
-  Array classEntries;
-  for (const OperatorClass &c : operatorClasses())
-    classEntries.push_back(Object{{"type", c.type},
-                                  {"ops", (int64_t)c.ops},
-                                  {"identities", (int64_t)c.identities}});
 
   Array unhonoredEntries;
   for (const UnhonoredDirective &u : unhonored)
@@ -233,7 +210,6 @@ std::string mlir::allo::ScheduleModel::toJSON() const {
         {"directive", u.directive}, {"where", u.where}, {"reason", u.reason}});
   Value root = Object{{"funcs", std::move(funcs)},
                       {"solves", std::move(solveEntries)},
-                      {"operator_classes", std::move(classEntries)},
                       {"unhonored_directives", std::move(unhonoredEntries)}};
   std::string s;
   llvm::raw_string_ostream os(s);

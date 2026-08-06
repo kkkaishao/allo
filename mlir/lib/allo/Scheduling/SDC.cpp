@@ -246,8 +246,7 @@ private:
   void annotateStarts(circt::scheduling::ChainingProblem &problem);
   void annotateAllocation(OccupancyProblem &problem);
   void recordSolve(OccupancyProblem &problem, StringRef kind,
-                   std::optional<unsigned> ii, Stopwatch since,
-                   std::optional<CarriedEdges> carried = std::nullopt);
+                   std::optional<unsigned> ii, Stopwatch since);
 
   // The second walk: the solved tree composed into one kernel span.
   std::optional<SpanNode> buildSpanNode(const SchedRegion &region);
@@ -328,8 +327,7 @@ static int64_t pipelineDirective(Operation *loop, Operation *anchor) {
 // \p ii is what the solve decided, which for a non-pipelined loop is not the
 // interval the region is reported to run at (that is `annotateRegion`'s).
 void FuncScheduler::recordSolve(OccupancyProblem &problem, StringRef kind,
-                                std::optional<unsigned> ii, Stopwatch since,
-                                std::optional<CarriedEdges> carried) {
+                                std::optional<unsigned> ii, Stopwatch since) {
   SolveReport s;
   Operation *containing = problem.getContainingOp();
   if (auto fn = containing->getParentOfType<func::FuncOp>())
@@ -340,17 +338,8 @@ void FuncScheduler::recordSolve(OccupancyProblem &problem, StringRef kind,
   for (Operation *op : problem.getOperations())
     if (problem.holdsLimitedUnit(op))
       ++s.limitedOps;
-  // Present only when an exact solve decided an allocation. The ceiling is what
-  // the trivial allocation would have built.
-  for (circt::scheduling::Problem::ResourceType rsrc :
-       problem.getResourceTypes())
-    if (std::optional<unsigned> units = problem.getAllocation(rsrc)) {
-      s.allocatedUnits += *units;
-      s.allocatedOps += problem.getAllocatable(rsrc)->ceiling;
-    }
   if (ii)
     s.interval = (int64_t)*ii;
-  s.carried = carried;
   s.millis = std::chrono::duration<double, std::milli>(now() - since).count();
   model.solves.push_back(std::move(s));
 }
@@ -363,11 +352,9 @@ void FuncScheduler::recordSolve(OccupancyProblem &problem, StringRef kind,
 LogicalResult FuncScheduler::scheduleCyclic(LoopLikeOpInterface body,
                                             const SchedRegion &region,
                                             unsigned minII, bool pipelined) {
-  CarriedEdges carried;
-  auto problem = buildCyclicProblem<ChainingModuloProblem>(body, deps, carried);
+  auto problem = buildCyclicProblem<ChainingModuloProblem>(body, deps);
   Block *bodyBlock = &body.getLoopRegions().front()->front();
   populateOperatorTypes(problem, dev.operators, dev.memory);
-  recordOperatorClasses(problem, dev.operators, model);
   // What contends, then how many of it to build: an occupancy window is a
   // physical property of the region and holds however the units are allocated.
   populateMemoryResources(problem, dev.memory);
@@ -391,7 +378,7 @@ LogicalResult FuncScheduler::scheduleCyclic(LoopLikeOpInterface body,
     return failure();
   std::optional<unsigned> solvedII = problem.getInitiationInterval();
   assert(solvedII && "a modulo problem that solved carries an interval");
-  recordSolve(problem, "cyclic", solvedII, solveStart, carried);
+  recordSolve(problem, "cyclic", solvedII, solveStart);
   int64_t depth = problem.scheduleDepth();
   // Iterations that do not overlap issue one body length apart, which is the
   // interval the region RUNS at whatever the solve settled on.
@@ -456,10 +443,8 @@ LogicalResult FuncScheduler::scheduleCyclic(LoopLikeOpInterface body,
 // count is data-dependent, so no latency is reported.
 LogicalResult FuncScheduler::scheduleWhile(scf::WhileOp w,
                                            const SchedRegion &region) {
-  CarriedEdges carried;
-  auto problem = buildWhileProblem<ChainingModuloProblem>(w, deps, carried);
+  auto problem = buildWhileProblem<ChainingModuloProblem>(w, deps);
   populateOperatorTypes(problem, dev.operators, dev.memory);
-  recordOperatorClasses(problem, dev.operators, model);
   populateMemoryResources(problem, dev.memory);
   // A flushing while issues an iteration per II like a pipeline: a
   // non-pipelined operator bounds its interval the same way. No call occupancy
@@ -483,7 +468,7 @@ LogicalResult FuncScheduler::scheduleWhile(scf::WhileOp w,
     return failure();
   std::optional<unsigned> ii = problem.getInitiationInterval();
   assert(ii && "a modulo problem that solved carries an interval");
-  recordSolve(problem, "while", ii, solveStart, carried);
+  recordSolve(problem, "while", ii, solveStart);
   info(Stage::Sched, w.getOperation())
       << "  -> While loop scheduled as a flushing pipeline: II=" << *ii
       << " (trip is data-dependent, so whole-loop latency is unknown)";
@@ -571,7 +556,6 @@ LogicalResult FuncScheduler::scheduleAcyclic(ArrayRef<Operation *> ops,
   ChainingSharedOperatorsProblem problem =
       buildAcyclicProblem<ChainingSharedOperatorsProblem>(ops, deps);
   populateOperatorTypes(problem, dev.operators, dev.memory);
-  recordOperatorClasses(problem, dev.operators, model);
   populateMemoryResources(problem, dev.memory);
   if (opts.allocate)
     populateOperatorAllocation(problem, dev.operators);

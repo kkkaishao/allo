@@ -12,7 +12,7 @@ from ..._mlir.dialects.allo import run_sdc_scheduling
 # pylint: disable-next=unused-import
 from ..._mlir.dialects.allo import has_exact_scheduler
 
-from .reports.compiler import ScheduleSettings
+from .options import PrepassOptions, SchedulerOptions
 from .reports.schedule import ScheduleResult
 
 RTL_PREPARE_PIPELINE = """
@@ -33,26 +33,36 @@ outline-loose-processes)
 # --- driver ----------------------------------------------------------------
 
 
-def run_schedule(top, module, settings: ScheduleSettings) -> ScheduleResult:
-    """Schedule ``top`` under ``settings`` and return the :class:`ScheduleResult`.
-    ``module`` is rewritten in place, left holding the ``allo.dcp.*`` ops the
-    schedule reifies into. Operator/device timing is read from the ``dcp.device``
-    / ``dcp.operator`` ops injected into ``module`` before this call. The knobs
-    are the fields of :class:`ScheduleSettings`.
+def run_schedule(
+    top,
+    module,
+    options: SchedulerOptions,
+    prepass: PrepassOptions,
+    allocate: bool,
+) -> ScheduleResult:
+    """Schedule ``top`` and return the :class:`ScheduleResult`. ``module`` is
+    rewritten in place, left holding the ``allo.dcp.*`` ops the schedule reifies
+    into. Operator/device timing is read from the ``dcp.device`` /
+    ``dcp.operator`` ops injected into ``module`` before this call.
+
+    ``prepass`` shapes the IR the scheduler is handed, ``options`` is what the
+    scheduler itself is asked for, and ``allocate`` lets an exact solve decide
+    how many copies of each operator a region builds, which only pays off under
+    a binding that folds them.
     """
     run_pipeline(module, RTL_PREPARE_PIPELINE)
     reassoc = (
         "reassociate-reductions{float-reassoc="
-        f"{'true' if settings.float_reassoc else 'false'}}}"
+        f"{'true' if prepass.float_reassoc else 'false'}}}"
     )
-    rotate = f"rotate-reductions{{accumulators={int(settings.accumulators)}}}"
+    rotate = f"rotate-reductions{{accumulators={int(prepass.accumulators)}}}"
     loops = (
         "loop-canonicalization{"
-        f"unroll-under-pipeline={'true' if settings.unroll_under_pipeline else 'false'} "
-        f"perfectize={'true' if settings.perfectize else 'false'}}}"
+        f"unroll-under-pipeline={'true' if prepass.unroll_under_pipeline else 'false'} "
+        f"perfectize={'true' if prepass.perfectize else 'false'}}}"
     )
     part = f"propagate-partition{{top={top}}}"
-    scalarize = f"scalarize-memory{{max-elements={settings.scalarize_threshold}}}"
+    scalarize = f"scalarize-memory{{max-elements={prepass.scalarize_threshold}}}"
     pipeline = (
         f"builtin.module(canonicalize,cse,func.func(raise-to-affine,cse,"
         f"raise-counted-while,{loops},"
@@ -69,10 +79,12 @@ def run_schedule(top, module, settings: ScheduleSettings) -> ScheduleResult:
         result = run_sdc_scheduling(
             module,
             top,
-            settings.cycle_time_ns,
-            settings.scheduler,
-            settings.budget or 0.0,
-            settings.allocate,
+            options.cycle_ns,
+            options.scheduler,
+            options.budget,
+            allocate,
+            options.workers,
+            options.seed,
         )
     finally:
         handler.detach()
@@ -80,4 +92,4 @@ def run_schedule(top, module, settings: ScheduleSettings) -> ScheduleResult:
         raise RuntimeError(
             "An error occurred during scheduling process:\n" + "\n".join(diagnostics)
         )
-    return ScheduleResult.from_json(result, settings)
+    return ScheduleResult.from_json(result, options)

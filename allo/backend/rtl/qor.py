@@ -151,11 +151,6 @@ class QoR:  # pylint: disable=too-many-instance-attributes
     #: count. ``area.ff`` is the modelled figure beside it: what the part holds
     #: once the deep chains are extracted into SRLs.
     reg_bits: int
-    #: operator types whose timing row covers several operator IDENTITIES, and
-    #: how many. Every operation of such a type was scheduled against one row
-    #: though the rows they would each want differ, so a long list is an estimate
-    #: over a coarser model than a short one.
-    coarse_types: dict[str, int]
 
     @property
     def latency_is_exact(self) -> bool:
@@ -343,9 +338,4 @@ def estimate(report: CompileReport, device: Device = builtin_device) -> QoR:
         mem_bits=mem_bits,
         regfile_arrays=regfile_arrays,
         reg_bits=report.microarch.reg_bits,
-        coarse_types={
-            c.type: c.identities
-            for c in sched.compiler.coarse_pricing
-            if c.identities > 1
-        },
     )

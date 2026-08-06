@@ -214,13 +214,6 @@ struct DeviceModel {
 /// resolution every other price keeps. See the area block above.
 inline constexpr int64_t kPriceResolution = 8;
 
-/// Record which operator TYPE prices each of \p problem's operations, and which
-/// operator IDENTITY that operation actually holds. \p model accumulates them
-/// whole-module and publishes the types covering several identities, which is
-/// where the library's pricing over-approximates.
-void recordOperatorClasses(circt::scheduling::Problem &problem,
-                           const OperatorLibrary &lib, ScheduleModel &model);
-
 //===----------------------------------------------------------------------===//
 // Scheduled-call latency
 //

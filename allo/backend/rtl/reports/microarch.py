@@ -1,15 +1,7 @@
 # Copyright Allo authors. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""What the microarchitecture stage decided, as data.
-
-The Python mirror of ``mlir/include/allo/Microarch/Report.h``. Nothing here is
-re-derivable from the emitted IR a caller is handed, and nothing duplicates the
-schedule result: op start cycles, trip counts and realizations are published
-there and joined on ``(func, region order)``. What is only here is the BINDING
-and everything downstream of it, which is to say what the emitter BUILT rather
-than what the scheduler decided.
-"""
+"""What the microarchitecture stage decided, as data."""
 
 from __future__ import annotations
 

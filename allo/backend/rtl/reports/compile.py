@@ -1,14 +1,7 @@
 # Copyright Allo authors. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""The whole compile, as one object.
-
-Assembled in Python rather than in C++: the two stages have separate exits and
-separate documents, and the join between them is a lookup neither producer can
-do. Reaching a :class:`CompileReport` means emission has run, so every field is
-populated and no reader needs a guard. A caller who wants only the schedule
-calls ``mod.schedule()``, which returns a complete result on its own.
-"""
+"""The whole compile, as one object."""
 
 from __future__ import annotations
 

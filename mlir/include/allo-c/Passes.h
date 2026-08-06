@@ -47,12 +47,13 @@ alloEmitSplitVerilog(MlirModule module, MlirStringRef directory);
 /// in a build with OR-Tools) or "exact-chaining". `budget` is what one exact
 /// solve may spend, in deterministic time units; zero or less takes the
 /// default. `allocate` lets an exact solve decide how many copies of each
-/// operator a region builds. Returns failure (callback not invoked) on any
-/// failed phase.
+/// operator a region builds. `workers` (zero or less takes the default) and
+/// `seed` are the CP-SAT search knobs; only the defaults make a compile
+/// reproducible. Returns failure (callback not invoked) on any failed phase.
 MLIR_CAPI_EXPORTED MlirLogicalResult alloRunSDCSchedulingPipeline(
     MlirModule module, MlirStringRef top, float cycleTime,
-    MlirStringRef scheduler, double budget, bool allocate,
-    MlirStringCallback callback, void *userData);
+    MlirStringRef scheduler, double budget, bool allocate, int workers,
+    int seed, MlirStringCallback callback, void *userData);
 
 /// Whether this build accepts `scheduler = "exact"`, i.e. links OR-Tools.
 MLIR_CAPI_EXPORTED bool alloHasExactScheduler(void);

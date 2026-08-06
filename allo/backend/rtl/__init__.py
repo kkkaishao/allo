@@ -27,8 +27,8 @@ from .reports import (
     RegRole,
     ScheduledOp,
     ScheduleResult,
-    ScheduleSettings,
 )
+from .options import PrepassOptions, SchedulerOptions
 from .schedule import has_exact_scheduler
 from .qor import QoR, Utilization, estimate
 from .core import RTL
@@ -57,7 +57,8 @@ __all__ = [
     "RegRole",
     "ScheduledOp",
     "ScheduleResult",
-    "ScheduleSettings",
+    "PrepassOptions",
+    "SchedulerOptions",
     "has_exact_scheduler",
     "QoR",
     "Utilization",

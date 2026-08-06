@@ -405,13 +405,9 @@ inline bool usesExactScheduler(SchedulerKind kind) {
   return kind != SchedulerKind::Heuristic;
 }
 
-/// How much work ONE SOLVE may consume, in OR-Tools' DETERMINISTIC time units
-/// (roughly one core-second on current hardware). Deterministic rather than
-/// wall-clock so a compile is reproducible across machines.
-///
-/// Charged per solve, not per region: a cyclic region's search spends this
-/// budget again for every initiation interval it probes.
 inline constexpr double kDefaultSolveBudget = 30.0;
+inline constexpr int kDefaultSolveWorkers = 1;
+inline constexpr int kDefaultSolveSeed = 0;
 
 /// What the caller asked the scheduler for.
 struct SchedulerOptions {
@@ -423,6 +419,8 @@ struct SchedulerOptions {
   /// binding the emitter builds one unit per operation anyway. The heuristic
   /// ignores it.
   bool allocate = false;
+  int workers = kDefaultSolveWorkers;
+  int seed = kDefaultSolveSeed;
 };
 
 /// \p name ("heuristic" / "exact" / "exact-chaining") as a kind, or nullopt

@@ -45,14 +45,11 @@ using namespace operations_research::sat;
 
 namespace {
 
-/// Solver configuration for every Allo solve: single-worker, fixed seed, and a
-/// deterministic (not wall-clock) time limit of \p budget, so two identical
-/// compiles emit identical RTL.
-SatParameters solverParameters(double budget) {
+SatParameters solverParameters(const SchedulerOptions &opts) {
   SatParameters params;
-  params.set_num_workers(1);
-  params.set_random_seed(0);
-  params.set_max_deterministic_time(budget);
+  params.set_num_workers(opts.workers);
+  params.set_random_seed(opts.seed);
+  params.set_max_deterministic_time(opts.budget);
   return params;
 }
 
@@ -499,7 +496,7 @@ LogicalResult mlir::allo::scheduleCPSAT(ChainingSharedOperatorsProblem &prob,
                horizon);
 
   CpSolverResponse response =
-      SolveWithParameters(model.Build(), solverParameters(opts.budget));
+      SolveWithParameters(model.Build(), solverParameters(opts));
   if (response.status() != CpSolverStatus::OPTIMAL &&
       response.status() != CpSolverStatus::FEASIBLE) {
     reportUnsolved(prob, response, opts.budget);
@@ -709,7 +706,7 @@ ModuloOutcome solveAtII(ChainingModuloProblem &prob, Operation *lastOp,
                orderedStarts, span, startVars, allocs, ii, horizon);
 
   CpSolverResponse response =
-      SolveWithParameters(model.Build(), solverParameters(opts.budget));
+      SolveWithParameters(model.Build(), solverParameters(opts));
   if (response.status() == CpSolverStatus::INFEASIBLE)
     return ModuloOutcome::Infeasible;
   if (response.status() != CpSolverStatus::OPTIMAL &&

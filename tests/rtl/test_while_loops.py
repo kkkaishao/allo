@@ -267,14 +267,14 @@ def test_while_flushing_pipeline_cosim():
 def test_while_pipeline_operators_are_allocated():
     # A flushing while is a pipeline like any counted loop, so the exact
     # scheduler decides how many copies of each operator its body builds. Until
-    # this region populated an allocation, a while body was never CONSIDERED: it
-    # reported zero allocated operations whatever the binding was, and `planned`
-    # quietly fell back to one instance per operation inside it, worse than the
-    # same body written as a `for`.
+    # this region populated an allocation, a while body was never CONSIDERED, and
+    # `planned` quietly fell back to one instance per operation inside it, worse
+    # than the same body written as a `for`.
     #
-    # What is locked is that the body's operators reach the decision, not which
-    # count it reaches: one unit per operation is a legitimate area answer for an
-    # operator whose multiplexer costs more than a second copy.
+    # The two products are independent so that the decision has somewhere to go:
+    # a chain would leave every multiply in one congruence class at this II,
+    # where one unit per operation is the only legal count and a live allocation
+    # would look exactly like a dead one.
     N = 32
 
     @kernel
@@ -283,16 +283,16 @@ def test_while_pipeline_operators_are_allocated():
         acc: i32 = 0
         while acc < limit:
             acc = acc + Ai[c]
-            out[c] = A[c] * A[c + 1] * A[c + 2]
+            out[c] = (A[c] * A[c + 1]) * (A[c + 2] * A[c + 3])
             c = c + 1
 
     mod = _to_rtl(wmul, binding="planned").set_scheduler_opt(scheduler="exact")
-    res = mod.schedule()
-    assert res.cyclic()[0].conditional  # a flushing while, not a raised `for`
-    solve = next(s for s in res.compiler.solves if s.kind == "while")
-    assert solve.allocated_ops > 0, "the while body never reached the allocation"
+    assert mod.schedule().cyclic()[0].conditional  # a flushing while, not a for
+    mod.compile()
+    (region,) = [r for f in mod.microarch.funcs for r in f.regions]
+    assert region.shared_units, "the while body never reached the allocation"
 
-    # `Ai` all ones makes the trip exactly `limit`, so `c + 2` stays inside `A`.
+    # `Ai` all ones makes the trip exactly `limit`, so `c + 3` stays inside `A`.
     Ai = np.ones(N, np.int32)
     A = np.random.default_rng(9).random(N, dtype=np.float32).astype(np.float32)
     for limit in (0, 1, 8):
@@ -300,7 +300,7 @@ def test_while_pipeline_operators_are_allocated():
         mod.cosim(Ai, A, out, np.int32(limit))
         gold = np.zeros(N, np.float32)
         for c in range(limit):
-            gold[c] = A[c] * A[c + 1] * A[c + 2]
+            gold[c] = (A[c] * A[c + 1]) * (A[c + 2] * A[c + 3])
         np.testing.assert_allclose(out, gold, rtol=2e-3, atol=1e-5)
 
 

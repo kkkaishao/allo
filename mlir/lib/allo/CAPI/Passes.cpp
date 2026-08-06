@@ -73,11 +73,10 @@ MlirLogicalResult alloEmitDatapathToHW(MlirModule module, MlirStringRef binding,
   return mlirLogicalResultSuccess();
 }
 
-MlirLogicalResult
-alloRunSDCSchedulingPipeline(MlirModule module, MlirStringRef top,
-                             float cycleTime, MlirStringRef scheduler,
-                             double budget, bool allocate,
-                             MlirStringCallback callback, void *userData) {
+MlirLogicalResult alloRunSDCSchedulingPipeline(
+    MlirModule module, MlirStringRef top, float cycleTime,
+    MlirStringRef scheduler, double budget, bool allocate, int workers,
+    int seed, MlirStringCallback callback, void *userData) {
   ModuleOp mod = unwrap(module);
   StringRef topName = unwrap(top);
   StringRef schedulerName = unwrap(scheduler);
@@ -90,11 +89,13 @@ alloRunSDCSchedulingPipeline(MlirModule module, MlirStringRef top,
         << "'; expected \"heuristic\", \"exact\" or \"exact-chaining\"";
     return mlirLogicalResultFailure();
   }
-  // The target clock period and the exact-solve budget: the option, else the
-  // default. Both are resolved once here, so no second copy exists downstream.
+  // The target clock period, the exact-solve budget and its worker count: the
+  // option, else the default. All are resolved once here, so no second copy
+  // exists downstream. A seed of zero IS the default, so it passes through.
   float cycleTimeNs = cycleTime > 0.0f ? cycleTime : 5.0f;
   allo::SchedulerOptions opts{
-      *kind, budget > 0.0 ? budget : allo::kDefaultSolveBudget, allocate};
+      *kind, budget > 0.0 ? budget : allo::kDefaultSolveBudget, allocate,
+      workers > 0 ? workers : allo::kDefaultSolveWorkers, seed};
   if (failed(allo::runPreScheduleVerification(mod, topName, cycleTimeNs)))
     return mlirLogicalResultFailure();
   // The solved schedule travels between the two halves in memory, not as IR

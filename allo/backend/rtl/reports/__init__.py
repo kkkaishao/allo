@@ -10,8 +10,8 @@ Four documents, split by the question each answers:
                the same one an HLS report names.
 ``microarch``  what the emitter BUILT: units, multiplexers, storage and the
                register ledger. The binding and everything downstream of it.
-``compiler``   the compiler's account of itself: settings, solve cost, and where
-               its own pricing is coarse. Not a property of the design.
+``compiler``   the compiler's account of itself: the scheduler's options and
+               what one solve cost. Not a property of the design.
 ``compile``    the three joined, plus the boundary.
 
 The rule they are pruned against: a report describes the design that EXISTS, not
@@ -24,13 +24,7 @@ each object says who it is for.
 """
 
 from .compile import CompileReport
-from .compiler import (
-    CarriedEdges,
-    CompilerReport,
-    OperatorClass,
-    ScheduleSettings,
-    SolveReport,
-)
+from .compiler import CompilerReport, SolveReport
 from .microarch import (
     Call,
     FuncUarch,
@@ -57,10 +51,7 @@ from .schedule import (
 
 __all__ = [
     "CompileReport",
-    "CarriedEdges",
     "CompilerReport",
-    "OperatorClass",
-    "ScheduleSettings",
     "SolveReport",
     "Call",
     "FuncUarch",

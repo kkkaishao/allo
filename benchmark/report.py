@@ -169,8 +169,7 @@ _II_GAP = re.compile(r"Scheduled at II=(\d+) against a lower bound of II=(\d+)")
 _BUDGET = re.compile(r"ran out of budget")
 # How many `memref` accesses were raised into the dependence test's reach. Needs
 # ALLO_LOG_LEVEL=info and is absent otherwise; it prices what a better raise
-# could still recover. Its sibling, the carried-edge census, is a report field
-# (`SolveReport.carried_edges`) and no longer read from the log.
+# could still recover.
 _RAISED = re.compile(r"Raised (\d+) loop\(s\) and (\d+) further memref access")
 
 
@@ -259,23 +258,10 @@ def measure_one(
                 "kind": s.kind,
                 "ops": s.ops,
                 "limited_ops": s.limited_ops,
-                "allocated_ops": s.allocated_ops,
-                "allocated_units": s.allocated_units,
                 "ii": s.interval,
                 "ms": round(s.ms, 2),
             }
             for s in res.compiler.solves
-        ]
-        # Report fields now, not log lines: both used to be scraped out of
-        # `ALLO_LOG_LEVEL=info` output and are unconditional here.
-        out["carried_deps"] = [
-            [c.total, c.non_affine, c.unknown]
-            for s in res.compiler.solves
-            if (c := s.carried_edges)
-        ]
-        out["class_splits"] = [
-            {"type": c.type, "ops": c.ops, "classes": c.identities}
-            for c in res.compiler.coarse_pricing
         ]
         out["solve_ms"] = round(sum(s.ms for s in res.compiler.solves), 1)
         out["solve_ms_max"] = round(
@@ -500,7 +486,7 @@ def alloc_table(results: list[dict]) -> str:
         return "no allocation data (needs --stage compile)"
     head = (
         f"{'benchmark/variant':<34} {'sched':<6} {'regions':>7} {'ops':>7}"
-        f" {'units':>7} {'ops/unit':>9} {'muxes':>7} {'muxFF':>9} {'splits':>7}"
+        f" {'units':>7} {'ops/unit':>9} {'muxes':>7} {'muxFF':>9}"
     )
     lines = [head, "-" * len(head)]
     tot = dict.fromkeys(("ops", "units", "muxes", "mux_bits"), 0)
@@ -511,7 +497,7 @@ def alloc_table(results: list[dict]) -> str:
         lines.append(
             f"{_key_of(r):<34} {r['scheduler'][:6]:<6} {len(r['alloc']):>7}"
             f" {o:>7} {u:>7} {o / u:>9.2f} {r['alloc_muxes']:>7}"
-            f" {r['alloc_mux_bits']:>9} {len(r.get('class_splits', [])):>7}"
+            f" {r['alloc_mux_bits']:>9}"
         )
     lines.append("-" * len(head))
     lines.append(
@@ -591,27 +577,6 @@ def area_table(results: list[dict]) -> str:
         )
     if unmodelled:
         lines.append(f"UNMODELLED (scored as zero): {unmodelled}")
-    return "\n".join(lines)
-
-
-def split_table(results: list[dict]) -> str:
-    """Where one timing row covers several operator identities, aggregated over
-    the bed. A binder folds only within one identity, so a count keyed on the
-    operator type spans several physical operators. One row per VARIANT: the
-    schedule report accumulates the split whole-module."""
-    agg: dict[str, list[int]] = {}
-    for r in results:
-        for s in r.get("class_splits", []):
-            row = agg.setdefault(s["type"], [0, 0, 0])
-            row[0] += 1  # variants where this type splits
-            row[1] += s["ops"]
-            row[2] = max(row[2], s["classes"])
-    if not agg:
-        return "no operator type splits"
-    head = f"{'operator type':<28} {'variants':>8} {'ops':>8} {'max classes':>12}"
-    lines = [head, "-" * len(head)]
-    for t, (n, ops, mx) in sorted(agg.items(), key=lambda kv: -kv[1][1]):
-        lines.append(f"{t:<28} {n:>8} {ops:>8} {mx:>12}")
     return "\n".join(lines)
 
 
@@ -706,8 +671,7 @@ def main():
     ap.add_argument(
         "--alloc",
         action="store_true",
-        help="the per-variant allocation (units, muxes) and the operator-type "
-        "splits",
+        help="the per-variant allocation (units, muxes)",
     )
     ap.add_argument(
         "--area",
@@ -808,7 +772,6 @@ def main():
         print("\n" + solve_table(ok, args.solves))
     if args.alloc:
         print("\n" + alloc_table(ok))
-        print("\n" + split_table(ok))
     if args.area:
         print("\n" + area_table(ok))
 

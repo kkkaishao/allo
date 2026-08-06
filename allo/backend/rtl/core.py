@@ -24,8 +24,9 @@ from .device import (
     operator_descs,
 )
 from .interface import Interfaces
+from .options import PrepassOptions, SchedulerOptions
 from .qor import QoR, estimate
-from .reports import CompileReport, MicroarchReport, ScheduleResult, ScheduleSettings
+from .reports import CompileReport, MicroarchReport, ScheduleResult
 from .schedule import run_schedule
 from .sim import shell
 from ...lang.core import ShapedType
@@ -38,9 +39,11 @@ R = TypeVar("R")
 # a partitioned array. Addresses stay in element space until the emitter.
 _NORMALIZE_PIPELINE = "builtin.module(dcp-resolve-banking)"
 
-# Settings the handle derives rather than takes: they are the scheduler's view
-# of `freq_mhz` and `binding`, which the emitter and the cosim clock read too.
-_DERIVED_SETTINGS = {"cycle_time_ns", "allocate"}
+# The one option the handle derives rather than takes: it is the scheduler's
+# view of `freq_mhz`, which the emitter and the cosim clock read too. The other
+# derived one, whether to decide an allocation, follows `binding` and is not an
+# option at all (see `schedule`).
+_DERIVED_OPTIONS = {"cycle_ns"}
 
 
 # pylint: disable-next=too-many-instance-attributes
@@ -59,9 +62,9 @@ class RTL(Backend[P, R]):
         """Build an RTL handle for one hardware configuration.
 
         These four fix the target and how hardware is built for it. The
-        scheduler's own knobs are not arguments here: turn them on the handle
+        compiler's own knobs are not arguments here: turn them on the handle
         with :meth:`set_scheduler_opt`, which names them after the fields of
-        :class:`ScheduleSettings` the report publishes them as.
+        :class:`SchedulerOptions` and :class:`PrepassOptions`.
 
         Args:
             device: the hardware platform: storage primitives, native chaining
@@ -83,12 +86,8 @@ class RTL(Backend[P, R]):
         self._cycle_time = 1000.0 / self.freq_mhz
         self.simulator = simulator
         self.binding = binding
-        self._sched_opts = ScheduleSettings(
-            cycle_time_ns=self._cycle_time,
-            # An allocation is only worth deciding where the emitter builds it:
-            # the trivial binding keeps one unit per operation.
-            allocate=binding != "trivial",
-        )
+        self._sched_opts = SchedulerOptions(cycle_ns=self._cycle_time)
+        self._prepass_opts = PrepassOptions()
         self.arg_types = kernel.parse_argument_annotations()
         self.res_types = kernel.parse_return_annotation()
         # The stage artifacts, each built once on first use. `self.module` stays
@@ -109,27 +108,34 @@ class RTL(Backend[P, R]):
     # -- scheduling -------------------------------------------------------
 
     def set_scheduler_opt(self, **opts: Any) -> RTL:
-        """Turn one or more of the scheduler's knobs and return the handle, so
-        the call chains onto ``export``. The names are the fields of
-        :class:`ScheduleSettings`, which documents what each does and is what
-        ``report.compiler.settings`` publishes them back as.
+        """Turn one or more of the compiler's knobs and return the handle, so the
+        call chains onto ``export``. The names are the fields of
+        :class:`SchedulerOptions`, which ``report.compiler.options`` publishes
+        back, and of :class:`PrepassOptions`, which shapes the IR the scheduler
+        is handed; each documents what its fields do.
 
-        ``cycle_time_ns`` and ``allocate`` are not among them: they follow
-        ``freq_mhz`` and ``binding``, and setting either here would leave the
-        schedule describing a different design than the one cosim drives.
+        ``cycle_ns`` is not among them: it follows ``freq_mhz``, and setting it
+        here would leave the schedule describing a different design than the one
+        cosim drives.
         """
         assert self._schedule_result is None, (
             "the schedule is already built, and everything downstream describes "
             "it, so a knob turned now would not reach the design"
         )
-        tunable = {f.name for f in fields(ScheduleSettings)} - _DERIVED_SETTINGS
-        unknown = sorted(set(opts) - tunable)
+        sched = {f.name for f in fields(SchedulerOptions)} - _DERIVED_OPTIONS
+        prepass = {f.name for f in fields(PrepassOptions)}
+        unknown = sorted(set(opts) - sched - prepass)
         if unknown:
             raise ValueError(
                 f"unknown scheduler option(s) {unknown}; "
-                f"expected any of {sorted(tunable)}"
+                f"expected any of {sorted(sched | prepass)}"
             )
-        self._sched_opts = replace(self._sched_opts, **opts)
+        self._sched_opts = replace(
+            self._sched_opts, **{k: v for k, v in opts.items() if k in sched}
+        )
+        self._prepass_opts = replace(
+            self._prepass_opts, **{k: v for k, v in opts.items() if k in prepass}
+        )
         return self
 
     def schedule(self) -> ScheduleResult:
@@ -143,8 +149,14 @@ class RTL(Backend[P, R]):
             self._dcp_ir = ir_ext.clone_module(self.module)
             inject_operators(self._dcp_ir, self._device)
             inject_device(self._dcp_ir, self._device)
+            # An allocation is only worth deciding where the emitter builds it:
+            # the trivial binding keeps one unit per operation.
             self._schedule_result = run_schedule(
-                self.top, self._dcp_ir, self._sched_opts
+                self.top,
+                self._dcp_ir,
+                self._sched_opts,
+                self._prepass_opts,
+                allocate=self.binding != "trivial",
             )
         return self._schedule_result
 

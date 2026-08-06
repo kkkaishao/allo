@@ -1,14 +1,7 @@
 # Copyright Allo authors. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""The schedule result: what the scheduler decided, per kernel and per loop.
-
-Vitis vocabulary where the concept is the same one an HLS report names, so a
-reader brings their existing intuition rather than learning ours: ``interval``
-for the initiation interval, ``latency`` for a whole region's span,
-``iteration_latency`` for the depth of one iteration, ``trip_count`` for the
-iteration count. What is genuinely ours keeps our name.
-"""
+"""The schedule result: what the scheduler decided, per kernel and per loop."""
 
 from __future__ import annotations
 
@@ -16,7 +9,8 @@ import json
 from dataclasses import dataclass, field
 from enum import Enum
 
-from .compiler import CompilerReport, ScheduleSettings
+from ..options import SchedulerOptions
+from .compiler import CompilerReport
 
 
 class RegionKind(str, Enum):
@@ -192,17 +186,16 @@ class ScheduleResult:
     funcs: list[FuncSchedule] = field(default_factory=list)
     #: directives the scheduler could not apply, in the order it met them.
     unhonored_directives: list[UnhonoredDirective] = field(default_factory=list)
-    #: the compiler's account of itself: what it was asked for, what the ask
-    #: cost it, and where its own pricing is coarse. Not a property of the
-    #: design (see :class:`CompilerReport`).
+    #: the compiler's account of itself: what it was asked for and what the ask
+    #: cost it. Not a property of the design (see :class:`CompilerReport`).
     compiler: CompilerReport = field(default_factory=CompilerReport)
 
     @classmethod
     def from_json(
-        cls, text: str | dict, settings: ScheduleSettings | None = None
+        cls, text: str | dict, options: SchedulerOptions | None = None
     ) -> ScheduleResult:
         """Parse the JSON schedule result the scheduler returns, either as the
-        raw string or as an already-decoded object. ``settings`` is what the
+        raw string or as an already-decoded object. ``options`` is what the
         scheduler was ASKED for, which only its caller knows."""
         d = json.loads(text) if isinstance(text, str) else text
         return cls(
@@ -211,7 +204,7 @@ class ScheduleResult:
                 UnhonoredDirective.from_json(u)
                 for u in d.get("unhonored_directives", [])
             ],
-            compiler=CompilerReport.from_json(d, settings),
+            compiler=CompilerReport.from_json(d, options),
         )
 
     def func(self, suffix: str) -> FuncSchedule:
