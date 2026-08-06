@@ -30,7 +30,7 @@ dev = [
   "pytest-xdist",
   "cocotb",
   "sccache",
-  "clang-format",
+  "clang-format==22.1.8",
   "black==24.8.0",
   "pylint==3.0.2",
 ]
@@ -39,7 +39,7 @@ dev = [
 minimum-version = "build-system.requires"
 cmake.version = ">=3.20"
 ninja.version = ">=1.10"
-cmake.build-type = "Debug"
+cmake.build-type = "Release"
 cmake.source-dir = "."
 build-dir = "build"
 wheel.packages = ["allo"]

@@ -6,14 +6,30 @@ set -euo pipefail
 
 CWD=$(dirname "$(realpath "$0")")
 
-echo "Check license header..."
-python3 $CWD/check_license_header.py all
+# Which checks to run. `format` needs nothing but black/clang-format, so CI runs
+# it before paying for a build; `pylint` resolves imports and so needs an
+# installed allo, including the generated `allo/_mlir`.
+STAGE=${1:-all}
+case "$STAGE" in
+  all | format | pylint) ;;
+  *)
+    echo "usage: $0 [all|format|pylint]" >&2
+    exit 2
+    ;;
+esac
 
-echo "Check Python formats using black..."
-python3 $CWD/check_python_format.py
+if [ "$STAGE" = "all" ] || [ "$STAGE" = "format" ]; then
+  echo "Check license header..."
+  python3 $CWD/check_license_header.py all
 
-echo "Check C/C++ formats using clang-format..."
-python3 $CWD/check_cpp_format.py
+  echo "Check Python formats using black..."
+  python3 $CWD/check_python_format.py
 
-echo "Running pylint on allo"
-python3 -m pylint allo --rcfile=$CWD/.pylintrc
+  echo "Check C/C++ formats using clang-format..."
+  python3 $CWD/check_cpp_format.py
+fi
+
+if [ "$STAGE" = "all" ] || [ "$STAGE" = "pylint" ]; then
+  echo "Running pylint on allo"
+  python3 -m pylint allo --rcfile=$CWD/.pylintrc
+fi
