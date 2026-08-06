@@ -88,7 +88,7 @@ struct ReassociateReductionsPass
       if (consumed.contains(op))
         continue;
       ReductionStep tail = matchReductionStep(op->getResult(0));
-      if (!tail.widened() && !floatReassoc) // a bare step is always float
+      if (tail.isFloat() && !floatReassoc)
         continue;
 
       ReductionChain chain;
@@ -104,6 +104,13 @@ struct ReassociateReductionsPass
       SmallVector<Value> carried, rest;
       for (Value leaf : chain.leaves)
         (isLoopCarried(leaf) ? carried : rest).push_back(leaf);
+
+      // A bare integer chain carries no cast marking it as a reduction, so the
+      // accumulator is its key; without one it is ordinary integer arithmetic
+      // and reassociating it would disturb the address expressions later passes
+      // read.
+      if (!tail.isFloat() && !tail.widened() && carried.empty())
+        continue;
 
       // Rewrite only when the depth strictly improves: a carried chain drops
       // its recurrence from N operators to 1; a straight-line chain drops its

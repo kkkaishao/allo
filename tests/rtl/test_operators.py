@@ -12,7 +12,8 @@ import numpy as np
 import pytest
 
 from allo import kernel
-from allo.lang import bf16, f32, i32
+from allo.lang import bf16, f32, i32, KernelOptions
+from allo.lang.core import APInt
 from allo.lang.ip import ip, OperatorType
 from allo.operators import math as amath
 from allo.operators import arith as allo_arith
@@ -819,6 +820,61 @@ def test_reassociate_int_reduction_recurrence():
     # fits in a span a chain could not: this is measured against the device
     # rather than pinned, so a faster multiply keeps it honest.
     assert region.interval * PERIOD_NS < 4 * COMB["mul"]
+
+
+# Bit growth types an expression at its natural width and applies the declared
+# type as a trailing truncation, so every operator in between is built at a
+# width nothing reads. `narrow-demanded-bits` sinks that truncation onto the
+# leaves, where it collapses into the extends bit growth put there.
+def test_narrow_demanded_bits_widths():
+    from allo.backend.base import run_pipeline
+    from allo.backend.rtl.schedule import RTL_PREPARE_PIPELINE
+    from allo.compiler.mlir_codegen import compile as compile_kernel
+
+    i48 = APInt(48, signed=True)
+
+    @kernel
+    def mac(b: i32, c: i32, d: i32) -> i48:
+        a: i48 = b * c + d
+        return a
+
+    module = compile_kernel(mac)
+    run_pipeline(module, RTL_PREPARE_PIPELINE)
+    # The natural widths: a 64-bit product feeding a 65-bit add, then truncated
+    # to the 48 bits the declaration asked for.
+    before = str(module)
+    assert "i64" in before and "i65" in before and "arith.trunci" in before
+
+    run_pipeline(module, "builtin.module(func.func(narrow-demanded-bits))")
+    after = str(module)
+    assert "arith.muli" in after and "arith.addi" in after
+    assert "i64" not in after and "i65" not in after
+    # Nothing is discarded any more, so the truncation is gone rather than moved.
+    assert "arith.trunci" not in after
+
+
+# The narrowing is bit-exact, including the wrap the declared type already
+# implied: an i48 accumulator wraps identically whether its adder is 48 or 65
+# bits wide. The inputs are sized so the exact sum overflows i48.
+def test_narrow_demanded_bits_wraps_exactly():
+    i48 = APInt(48, signed=True)
+
+    @kernel
+    def dot(x: i32[8], y: i32[8]) -> i48:
+        acc: i48 = 0
+        for k in range(8, name="k"):
+            acc = acc + x[k] * y[k]
+        return acc
+
+    rng = np.random.default_rng(0)
+    x = rng.integers(-(2**31), 2**31, size=8, dtype=np.int64).astype(np.int32)
+    y = rng.integers(-(2**31), 2**31, size=8, dtype=np.int64).astype(np.int32)
+    exact = sum(int(a) * int(b) for a, b in zip(x, y))
+    assert abs(exact) > 2**47, "inputs must overflow i48 for the wrap to matter"
+    wrapped = ((exact + 2**47) % 2**48) - 2**47
+
+    r = _to_rtl(dot).cosim(x, y)
+    assert int(r.result) == wrapped
 
 
 def test_int_product_reduction_cosim():

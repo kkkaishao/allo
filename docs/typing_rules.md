@@ -156,6 +156,25 @@ Examples:
 | `i32 * i32 * i32` | `i96`      |
 | `u8 * i8 * u4`    | `i20`      |
 
+### Natural Width vs Built Width
+
+These rules give an expression its **natural** width, computed from the leaves
+up, so an expression never silently loses precision. They do not say how wide
+the operator the RTL backend builds is. Assigning to a narrower declared type
+appends a truncation, and the `narrow-demanded-bits` prepass then sinks that
+truncation onto the leaves, so each operator is built at the width its consumer
+actually reads:
+
+```python
+a: i48 = b * c        # b, c : i32
+```
+
+types `b * c` as `i64` and truncates, but the multiplier that reaches hardware
+is 48 bits wide, with the extends folded into its operands and no truncation
+left. The rewrite is bit-exact: it moves a truncation the program already
+performed. Division, remainder, right shift and comparison read the high bits,
+so their operands keep the natural width.
+
 ### HLS Other Numeric Operators
 
 For `div`, `floordiv`, `mod`, `pow`, comparisons, bitwise operators, and

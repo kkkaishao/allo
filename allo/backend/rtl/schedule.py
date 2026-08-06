@@ -67,7 +67,7 @@ def run_schedule(
         f"builtin.module(canonicalize,cse,func.func(raise-to-affine,cse,"
         f"raise-counted-while,{loops},"
         f"canonicalize,fold-if-statements,cse,{scalarize},"
-        f"{reassoc},{rotate}),drop-trivial-func,"
+        f"{reassoc},{rotate},narrow-demanded-bits),drop-trivial-func,"
         f"{part},func.func(assign-banks))"
     )
     run_pipeline(module, pipeline)

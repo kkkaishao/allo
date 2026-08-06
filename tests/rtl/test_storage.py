@@ -1538,21 +1538,24 @@ def test_multicycle_storage_read_cosim():
     # not a hardcoded 1: URAM reads in 2 cycles, and the scheduler places the
     # consumer accordingly. The extra read cycle shows up in the whole-kernel
     # latency.
+    def reader_depth(result):
+        # Region 1 is the consumer loop, the one whose load carries the port.
+        region = next(x for x in result.func("urambuf").regions if x.order == 1)
+        return region.iteration_latency
+
     exp = A16 * 3 + 1
     out_default = np.zeros(16, np.int32)
     r = _uram_buffer_rtl(None)
-    lat_default = r.schedule().func("urambuf").latency
+    depth_default = reader_depth(r.schedule())
     r.cosim(A16, out_default)
     np.testing.assert_array_equal(out_default, exp)
 
     out_uram = np.zeros(16, np.int32)
     r = _uram_buffer_rtl(Schedule.URAM)
-    lat_uram = r.schedule().func("urambuf").latency
+    depth_uram = reader_depth(r.schedule())
     r.cosim(A16, out_uram)
     np.testing.assert_array_equal(out_uram, exp)
-    # One read sits in the span, so the whole-kernel latency moves by exactly the
-    # difference between the two device read latencies.
-    assert lat_uram - lat_default == MEM_URAM - MEM
+    assert depth_uram - depth_default == MEM_URAM - MEM
 
 
 def test_multicycle_storage_on_argument_cosim():

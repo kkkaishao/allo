@@ -491,11 +491,13 @@ def ReassociateReductionsPass
     recurrence spans a single operator, and balances a straight-line (fully
     unrolled) chain to cut its datapath depth from linear to logarithmic.
 
-    Integer reductions are exactly reassociable and are always rebalanced,
-    including the widened `extsi`/`trunc` idiom bit-growth produces.
-    Floating-point reassociation is not bit-exact, so a bare float step is
-    rebalanced only under the `float-reassoc` option, mirroring Vitis's
-    fp-relaxed.
+    Integer reductions are exactly reassociable and are always rebalanced, both
+    the widened `extsi`/`trunc` idiom bit-growth produces and a bare same-width
+    chain. A bare chain carries no cast marking it as a reduction, so it is
+    taken only when a loop-carried accumulator anchors it, which leaves index
+    and address arithmetic untouched. Floating-point reassociation is not
+    bit-exact, so a bare float step is rebalanced only under the
+    `float-reassoc` option, mirroring Vitis's fp-relaxed.
   }];
   let options = [
     Option<"floatReassoc", "float-reassoc", "bool", "false",
@@ -529,6 +531,37 @@ def RotateReductionsPass
   let dependentDialects = [
     "mlir::affine::AffineDialect", "mlir::arith::ArithDialect"
   ];
+}
+
+def NarrowDemandedBitsPass
+    : Pass<"narrow-demanded-bits", "func::FuncOp"> {
+  let summary = "Narrow integer arithmetic to the bits its consumer reads";
+  let description = [{
+    Bit-growth typing gives an expression its exact natural width, computed from
+    the leaves up, and applies the destination type as a single `arith.trunci`
+    at the end. Every operator in between is therefore built at a width nothing
+    reads: `a: i48 = b * c` over two `i32` values builds a 64-bit multiplier and
+    then discards 16 bits, and `acc: i48 = acc + b * c` puts a 65-bit adder on
+    the accumulator recurrence.
+
+    This pass propagates that truncation back up the expression. For the
+    two's-complement ring operators (`addi`, `subi`, `muli`) the low `w` bits of
+    the result are a function of the low `w` bits of the operands alone, so
+
+        trunc_w(a `op` b) == trunc_w(a) `op` trunc_w(b)
+
+    exactly, for signed and unsigned alike. Sinking the truncation lands it on
+    the leaves, where it meets the extends bit growth introduced and folds away,
+    which exposes the next operator up to the same rewrite. Division, remainder,
+    right shift and comparison read the high bits, so the demand stops at them
+    and their operands keep the natural width.
+
+    The rewrite is bit-exact rather than a relaxation: the truncation it moves
+    is one the program already performed, only later, after paying for bits
+    nothing reads. A wide operator with more than one use keeps its width, since
+    the wide value stays live and narrowing would only add ops.
+  }];
+  let dependentDialects = ["mlir::arith::ArithDialect"];
 }
 
 def LegalizeArithPass : Pass<"legalize-arith", "ModuleOp"> {
