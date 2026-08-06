@@ -119,11 +119,10 @@ public:
   std::string scatterStorage;
   std::vector<StorageRealization> storage; // the `dcp.storage` rows
   MemKindTiming fifo;                      // `dcp.stream_timing`
-  // How many write ports one array is worth spreading over, from the device's
-  // `max_writes`. A device fact rather than a per-realization one: `impl=` is a
-  // timing and area label the emitter never binds against, so what limits the
-  // ports is which primitive the design infers into.
-  unsigned maxWritePorts = 2;
+  // How many write ports one array is worth spreading over.
+  // Currently hardcoded to 2, since almost no actual device has more or less
+  // than 2. Turn this into a device property if we ever see one that does.
+  static constexpr unsigned maxWritePorts = 2;
 };
 
 //===----------------------------------------------------------------------===//

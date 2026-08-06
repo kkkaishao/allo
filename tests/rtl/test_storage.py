@@ -1419,32 +1419,6 @@ def test_the_device_names_the_storage_a_scatter_goes_into():
         )
 
 
-def test_the_device_says_how_many_write_ports_infer():
-    # Two stores the schedule proved never collide get an `always` block each,
-    # which is what infers a true dual port. How many blocks are worth spreading
-    # over is the PART's answer, not the compiler's: a device whose memories
-    # infer one write port says so and the two stores collapse into one block,
-    # which is the register-file fallback.
-    @kernel
-    def k(A: i32[16], out: i32[16]):
-        buf: i32[16] = 0
-        for i in range(8):
-            buf[2 * i] = A[2 * i] + 1
-            buf[2 * i + 1] = A[2 * i + 1] + 2
-        for i in range(16):
-            out[i] = buf[i]
-
-    blocks = {}
-    for ports in (2, 1):
-        dev = default_device.copy().set_max_writes(ports)
-        rtl = k.schedule().export("rtl", device=dev).verilog
-        blocks[ports] = rtl.count("always_ff @(posedge clk)")
-    assert blocks[2] == blocks[1] + 1
-
-    with pytest.raises(ValueError):
-        default_device.copy().set_max_writes(0)
-
-
 def test_a_tiled_cost_prices_the_whole_shape():
     # `tiled` is the one cost form reading the WHOLE parameter tuple: a block
     # RAM tile holds 36864 bits however a depth-by-width array is cut, so the

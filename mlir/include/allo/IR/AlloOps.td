@@ -671,20 +671,11 @@ def DCPathDeviceOp : DCPath_Op<"dcp.device",
     emitted RTL through `operatorModuleName`, so it belongs to the program's
     symbol table. What lives here is the vocabulary only the device's own
     declarations use.
-
-    `max_writes` is how many write ports one array is worth spreading over: two
-    stores the schedule proved never collide go in their own `always` blocks and
-    the RAM infers, while past this many the inference fails outright and a
-    third block would buy nothing and still cost its address and data
-    multiplexers. It sits on the DEVICE rather than on a `dcp.storage` because
-    `bind.storage impl=` is a timing and area LABEL, not a directive the emitter
-    binds against: what actually limits the ports is which primitive the design
-    infers into, which is a property of the part.
   }];
-  let arguments = (ins SymbolNameAttr:$sym_name, I64Attr:$max_writes);
+  let arguments = (ins SymbolNameAttr:$sym_name);
   let regions = (region SizedRegion<1>:$body);
   let assemblyFormat = [{
-    $sym_name `max_writes` `=` $max_writes attr-dict-with-keyword $body
+    $sym_name attr-dict-with-keyword $body
   }];
   let hasVerifier = 1;
 }

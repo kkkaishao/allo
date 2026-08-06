@@ -652,7 +652,6 @@ MemoryLibrary MemoryLibrary::fromModule(ModuleOp module) {
     t.delay.write = row.getWrDelay().convertToDouble();
     return t;
   };
-  m.maxWritePorts = static_cast<unsigned>(device.getMaxWrites());
   Block &body = device.getBody().front();
   for (auto s : body.getOps<dcp::DCPathStorageOp>()) {
     m.storage.push_back({s.getSymName().str(), timing(s)});

@@ -82,10 +82,6 @@ DEFAULT_STORAGE = "lutram"
 #: The row that is not a memory: one cell per element, no address, no port
 #: limit, which is what a completely partitioned array becomes.
 SCATTER_STORAGE = "register"
-#: How many write ports an array is worth spreading over. Past this, RAM
-#: inference fails and the array becomes a register file, so a further port
-#: would cost multiplexers and buy nothing.
-MAX_WRITES = 2
 
 #: Below this depth a delay chain stays in flip-flops; at or above it Vivado
 #: extracts an SRL, even though the emitter resets every stage. Measured.
@@ -297,5 +293,4 @@ def build(part: Part) -> Device:
     d.set_mux_uses({res["lut"]: (Table(MUX_LUT_PER_BIT), Linear(1.0))})
     d.set_chain_uses(_chain_uses(res))
     d.set_default_frequency(part.grade.default_freq_mhz)
-    d.set_max_writes(MAX_WRITES)
     return d.validate()

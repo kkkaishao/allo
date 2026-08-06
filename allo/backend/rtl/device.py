@@ -253,10 +253,6 @@ class Device:
         # `symbol`, which is also what `operator_uses` above is keyed on.
         self.operators: list[OperatorIP] = []
         self.default_freq_mhz: float = 100.0
-        # How many write ports an array is worth spreading over; past this RAM
-        # inference fails and the array becomes a register file. A device fact,
-        # not a per-storage one: it limits which primitive the design infers into.
-        self.max_writes: int = 2
 
     def _spend(
         self,
@@ -462,16 +458,6 @@ class Device:
         self.default_freq_mhz = float(freq_mhz)
         return self
 
-    def set_max_writes(self, ports: int) -> Device:
-        """How many write ports the part's memories infer at. Stores the
-        schedule proved never collide are spread over this many `always`
-        blocks; past it the inference fails and the array becomes a register
-        file, so a further port would cost muxes and buy nothing."""
-        if ports < 1:
-            raise ValueError("a memory has at least one write port")
-        self.max_writes = int(ports)
-        return self
-
     def add_operator(self, operator: OperatorIP) -> Device:
         """Declare a core this device offers. Scans rather than keeping a second
         index: a device holds a couple of dozen operators, and one list that
@@ -542,7 +528,6 @@ class Device:
         d.stream_timing = self.stream_timing
         d.operators = list(self.operators)
         d.default_freq_mhz = self.default_freq_mhz
-        d.max_writes = self.max_writes
         return d
 
 
@@ -693,7 +678,6 @@ def inject_device(module, device: Device):
 
         dev = DCPathDeviceOp(
             sym_name=device.name,
-            max_writes=IntegerAttr.get(i64, device.max_writes),
             ip=InsertionPoint.at_block_begin(module.body),
         )
         # The body declares what the device HAS and what it can REALIZE, each a
