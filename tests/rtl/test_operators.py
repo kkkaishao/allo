@@ -14,12 +14,12 @@ import pytest
 from allo import kernel
 from allo.lang import bf16, f32, i32, KernelOptions
 from allo.lang.core import APInt
-from allo.lang.ip import ip, OperatorType
+from allo.lang.ip import operator_ip, OperatorType
 from allo.operators import math as amath
 from allo.operators import arith as allo_arith
 from allo.backend.rtl import has_exact_scheduler
+from allo.backend.rtl.devices import default_device
 from allo.backend.rtl.device import (
-    builtin_device,
     CombKind,
     Const,
     Linear,
@@ -66,7 +66,7 @@ def test_a_device_declares_its_resources_and_what_they_cost():
         for i in range(16):
             out[i] = A[i] * B[i] + 1
 
-    dev = builtin_device.copy()
+    dev = default_device.copy()
     lut = dev.resources["lut"]
     dsp = dev.resources["dsp"]
     # An N-bit AND is N LUT6s (linear), a divider is quadratic, and a
@@ -88,7 +88,7 @@ def test_a_device_declares_its_resources_and_what_they_cost():
 # the whole point of the symbol: the dictionary it replaced turned a misspelling
 # into an absent row.
 def test_a_cost_must_name_a_declared_resource():
-    dev = builtin_device.copy()
+    dev = default_device.copy()
     ghost = dev.add_resource("ghost", capacity=10)
     dev.set_comb_delay(CombKind.ADD, 1.2, uses={ghost: Const(1.0)})
     del dev.resources["ghost"]
@@ -105,7 +105,7 @@ def test_a_cost_must_name_a_declared_resource():
 # A device cannot declare the same kind twice: the library keeps the last match,
 # so a duplicate would be one declaration silently overriding another.
 def test_a_device_declares_each_comb_kind_once():
-    dev = builtin_device.copy()
+    dev = default_device.copy()
     lut = dev.resources["lut"]
     dev.set_comb_delay(CombKind.ADD, 1.2, uses={lut: Linear(1.0)})
     dev.set_comb_delay(CombKind.ADD, 0.9)  # overwrites rather than duplicating
@@ -129,7 +129,7 @@ def test_a_device_prices_its_multiplexers_and_delay_chains():
         for i in range(8):
             out[i] = A[i] + 1
 
-    dev = builtin_device.copy()
+    dev = default_device.copy()
     lut, ff = dev.resources["lut"], dev.resources["ff"]
     dev.set_mux_uses({lut: (Linear(0.4), Linear(1.0))})
     dev.set_chain_uses({ff: (Step(4, 1.0, 2.0), Linear(1.0))})
@@ -150,8 +150,9 @@ def test_an_operator_declares_what_its_core_spends():
         return a + b
 
     text = _to_rtl(addk).dcp
-    assert "allo.dcp.operator @fadd_l7" in text
-    assert "#allo.res_use<@builtin::@lut, [<const, [2.470000e+02]>]>" in text
+    assert "allo.dcp.operator @add_f32_f32_f32_l7" in text
+    scope = default_device.name  # the device the reference reaches through
+    assert f"#allo.res_use<@{scope}::@lut, [<const, [2.470000e+02]>]>" in text
 
 
 # A cost is a SUM of product terms, so a measured shape that is a sum can be
@@ -164,7 +165,7 @@ def test_a_cost_sums_the_terms_that_name_one_resource():
         for i in range(8):
             out[i] = A[i] + 1
 
-    dev = builtin_device.copy()
+    dev = default_device.copy()
     ff = dev.resources["ff"]
     dev.set_chain_uses(
         {ff: [(Const(2.0), Linear(1.0)), (Linear(1.0, base=-1.0), Const(1.0))]}
@@ -178,7 +179,7 @@ def test_a_cost_sums_the_terms_that_name_one_resource():
 # The device's own evaluator, reached from Python: one implementation of the
 # measured shapes, not two. `allo/backend/rtl/qor.py` estimates through this.
 def test_the_device_prices_a_realization_through_the_compiler():
-    dev = builtin_device
+    dev = default_device
     # 3 LUTs per bit of a 6-source select, over 32 bits.
     assert dev.price(dev.mux_uses, (6, 32)) == {"lut": 96}
     # A chain past the extraction cliff is SRLs plus a head and tail stage per
@@ -194,9 +195,9 @@ def test_the_device_prices_a_realization_through_the_compiler():
 # --- operator injection ------------------------------------------------------
 
 
-# The same kernel schedules once the operator is characterized via `@ip`.
+# The same kernel schedules once the operator is characterized via `@operator_ip`.
 def test_ip_characterizes_math_op():
-    @ip(optype="sqrt", latency=7, pipelined=True, style="ce")
+    @operator_ip(optype="sqrt", latency=7, pipelined=True, style="ce")
     def fsqrt(a: f32) -> f32: ...
 
     @kernel
@@ -204,13 +205,13 @@ def test_ip_characterizes_math_op():
         for i in range(8):
             A[i] = amath.sqrt(A[i])
 
-    dev = builtin_device.copy()
+    dev = default_device.copy()
     dev.add_operator(fsqrt)
     res = _sched(sqrtk2, device=dev)
     assert res.func("sqrtk2").latency is not None
 
 
-# Integer arithmetic is natively combinational: it needs no `@ip` and no
+# Integer arithmetic is natively combinational: it needs no `@operator_ip` and no
 # library row, so the fail-loud check never fires on it.
 def test_integer_ops_never_error():
     @kernel
@@ -232,10 +233,8 @@ def test_operator_ip_overlay_shifts_schedule():
 
     r0 = addk.schedule().export("rtl")
     lat0 = r0.schedule().func("addk").latency
-    assert "fadd_fast" not in Dcp(r0).attrs("allo.dcp.operator", "sym_name")
 
-    @ip(
-        name="fadd_fast",
+    @operator_ip(
         optype=OperatorType.ADD,
         latency=3,
         in_delay_ns=0.5,
@@ -248,13 +247,15 @@ def test_operator_ip_overlay_shifts_schedule():
     def addk2(a: f32, b: f32, c: f32) -> f32:
         return a + b + c
 
-    dev = builtin_device.copy()
+    dev = default_device.copy()
     dev.add_operator(fadd_fast)
     r1 = addk2.schedule().export("rtl", device=dev)
     lat1 = r1.schedule().func("addk2").latency
 
-    assert "fadd_fast" in Dcp(r1).attrs("allo.dcp.operator", "sym_name")
-    assert "fadd_fast" in _impls(r1.schedule())
+    # A faster core than the built-in add, so it takes a symbol of its own.
+    assert fadd_fast.symbol not in Dcp(r0).attrs("allo.dcp.operator", "sym_name")
+    assert fadd_fast.symbol in Dcp(r1).attrs("allo.dcp.operator", "sym_name")
+    assert fadd_fast.symbol in _impls(r1.schedule())
     assert lat0 is not None and lat1 is not None
 
 
@@ -264,7 +265,7 @@ def test_advanced_math_sqrt_cosim():
     # model are arity-general, not binary-only.
     N = 16
 
-    @ip(optype="sqrt", latency=5, pipelined=True, style="ce")
+    @operator_ip(optype="sqrt", latency=5, pipelined=True, style="ce")
     def fsqrt(a: f32) -> f32: ...
 
     @kernel
@@ -272,7 +273,7 @@ def test_advanced_math_sqrt_cosim():
         for i in range(N):
             B[i] = amath.sqrt(A[i])
 
-    dev = builtin_device.copy()
+    dev = default_device.copy()
     dev.add_operator(fsqrt)
     rng = np.random.default_rng(0)
     A = rng.random(N, dtype=np.float32).astype(np.float32)  # non-negative
@@ -288,14 +289,14 @@ def test_non_pipelined_ip_bounds_the_initiation_interval():
     # pipelined twin of the same IP runs at II=1 and the `pipelined` flag alone
     # is the difference.
     #
-    # The lock is WRITTEN rather than measured: the behavioral model an `@ip`
+    # The lock is WRITTEN rather than measured: the behavioral model an `@operator_ip`
     # emits accepts an input every cycle whatever the flag says, so the cosim
     # below passes either way. Only the II catches a datapath that would feed a
     # real unit faster than it can accept.
     N, LAT = 16, 3
 
     def _dev(pipelined):
-        @ip(
+        @operator_ip(
             optype="sqrt",
             latency=LAT,
             in_delay_ns=0.5,
@@ -305,7 +306,7 @@ def test_non_pipelined_ip_bounds_the_initiation_interval():
         )
         def fsqrt(a: f32) -> f32: ...
 
-        dev = builtin_device.copy()
+        dev = default_device.copy()
         dev.add_operator(fsqrt)
         return dev
 
@@ -343,7 +344,7 @@ def test_float_negate_cosim():
 
 def test_int_to_float_cast_cosim():
     # An int->float cast (arith.sitofp) is a unary IP: the built-in
-    # i2f_l3 emits a single-input extern and cosims against a signed conversion.
+    # ifcast_i32_f32_l3 emits a single-input extern and cosims against a signed conversion.
     N = 16
 
     @kernel
@@ -365,8 +366,7 @@ def test_free_running_operator_cosim():
     # anyway) it cosims identically to the clock-enabled default.
     N = 16
 
-    @ip(
-        name="fadd_free",
+    @operator_ip(
         optype=OperatorType.ADD,
         latency=5,
         in_delay_ns=0.5,
@@ -380,12 +380,15 @@ def test_free_running_operator_cosim():
         for i in range(N):
             C[i] = A[i] + B[i]
 
-    dev = builtin_device.copy()
-    dev.add_operator(fadd_free)  # last-wins: overrides the built-in fadd
+    dev = default_device.copy()
+    # Last-wins over the built-in f32 add: it is a different core, so it takes a
+    # symbol of its own, and what makes it override is the (kind, signature) it
+    # shares.
+    dev.add_operator(fadd_free)
     rtl = _to_rtl(addk, device=dev)
     # The manifest declares each instantiated operator's realized port shape.
     ops = [o for i in rtl.interfaces.values() for o in i.operators]
-    free = [o for o in ops if o.module == "fadd_free"]
+    free = [o for o in ops if o.module == fadd_free.symbol]
     assert free, "the free operator was not instantiated"
     names = [p.name for p in free[0].ports]
     assert "ce" not in names, f"a free-running extern must carry no ce: {names}"
@@ -414,11 +417,11 @@ def test_custom_c_model_for_uncharacterized_kind_cosim():
         np.float32
     )
 
-    @ip(optype="erf", latency=6, pipelined=True, style="ce")
+    @operator_ip(optype="erf", latency=6, pipelined=True, style="ce")
     def ferf(a: f32) -> f32: ...
 
     ferf.add_c_model("std::erf(a)")
-    dev = builtin_device.copy()
+    dev = default_device.copy()
     dev.add_operator(ferf)
     B = np.zeros(N, np.float32)
     _to_rtl(erfk, device=dev).cosim(A, B)
@@ -429,10 +432,10 @@ def test_custom_c_model_for_uncharacterized_kind_cosim():
 # Nothing stalls outside a stream region, so a free-style IP is emitted
 # as declared: a plain extern instance with no ce port at all.
 def test_free_running_ip_outside_stream_region_emits():
-    @ip(optype="mul", latency=3, in_delay_ns=0.5, pipelined=True, style="free")
+    @operator_ip(optype="mul", latency=3, in_delay_ns=0.5, pipelined=True, style="free")
     def freemul(a: f32, b: f32) -> f32: ...
 
-    dev = builtin_device.copy()
+    dev = default_device.copy()
     dev.add_operator(freemul)
 
     @kernel
@@ -441,9 +444,9 @@ def test_free_running_ip_outside_stream_region_emits():
             B[i] = A[i] * 2.0
 
     v = _to_rtl(scale, device=dev).verilog
-    assert "freemul" in v
+    assert freemul.symbol in v
     # No `ce` port on a free-running instance: it is the whole difference.
-    inst = [ln for ln in v.splitlines() if ".ce" in ln and "freemul" in ln]
+    inst = [ln for ln in v.splitlines() if ".ce" in ln and freemul.symbol in ln]
     assert not inst, inst
 
 
@@ -515,7 +518,9 @@ def test_float_max_with_ip_kept_cosim():
     # and cosims via the IP's C-model.
     N = 16
 
-    @ip(optype=OperatorType.MAX, latency=2, in_delay_ns=0.5, pipelined=True, style="ce")
+    @operator_ip(
+        optype=OperatorType.MAX, latency=2, in_delay_ns=0.5, pipelined=True, style="ce"
+    )
     def fmax_ip(a: f32, b: f32) -> f32: ...
 
     fmax_ip.add_c_model("std::fmax(a, b)")
@@ -525,13 +530,13 @@ def test_float_max_with_ip_kept_cosim():
         for i in range(N):
             out[i] = allo_arith.max(A[i], B[i], propagate_nan=True)
 
-    dev = builtin_device.copy()
+    dev = default_device.copy()
     dev.add_operator(fmax_ip)
     rtl = _to_rtl(fmax_keep, device=dev)
     kinds = {o.kind for r in rtl.schedule().func("fmax_keep").regions for o in r.ops}
     assert not (kinds & {"cmpf", "select"})  # kept as one op, not expanded
-    assert "fmax_ip" in Dcp(rtl).attrs("allo.dcp.operator", "sym_name")
-    assert "fmax_ip" in _impls(rtl.schedule())
+    assert fmax_ip.symbol in Dcp(rtl).attrs("allo.dcp.operator", "sym_name")
+    assert fmax_ip.symbol in _impls(rtl.schedule())
 
     rng = np.random.default_rng(6)
     A = (rng.random(N, dtype=np.float32) - np.float32(0.5)).astype(np.float32)
@@ -549,10 +554,12 @@ def test_max_maxnum_split_binds_distinctly():
     # it with the wrong operator.
     N = 8
 
-    @ip(optype=OperatorType.MAX, latency=2, in_delay_ns=0.5, pipelined=True, style="ce")
+    @operator_ip(
+        optype=OperatorType.MAX, latency=2, in_delay_ns=0.5, pipelined=True, style="ce"
+    )
     def fmax_ip(a: f32, b: f32) -> f32: ...
 
-    dev = builtin_device.copy()
+    dev = default_device.copy()
     dev.add_operator(fmax_ip)
 
     @kernel
@@ -565,9 +572,9 @@ def test_max_maxnum_split_binds_distinctly():
         for i in range(N):
             o[i] = allo_arith.max(A[i], B[i], propagate_nan=False)  # arith.maxnumf
 
-    assert "fmax_ip" in _impls(_to_rtl(kmaximumf, device=dev).schedule())  # bound
+    assert fmax_ip.symbol in _impls(_to_rtl(kmaximumf, device=dev).schedule())  # bound
     maxnum = _to_rtl(kmaxnumf, device=dev)
-    assert "fmax_ip" not in _impls(maxnum.schedule())  # NOT bound to the max IP
+    assert fmax_ip.symbol not in _impls(maxnum.schedule())  # NOT bound to the max IP
     k = {o.kind for r in maxnum.schedule().func("kmaxnumf").regions for o in r.ops}
     assert "cmpf" in k and "select" in k  # expanded instead
 
@@ -737,7 +744,10 @@ def test_compare_select_and_shift():
 
     Af = _signed_f32(0)
     mod = _to_rtl(frelu)
-    assert "hw.module.extern @fcmp" in mod.mlir and "comb.mux" in mod.mlir
+    fcmp = next(o for o in default_device.operators if o.optype is OperatorType.CMP)
+    # The predicate rides the module name, so the extern is the symbol plus it.
+    assert f"hw.module.extern @{fcmp.symbol}_ogt" in mod.mlir
+    assert "comb.mux" in mod.mlir
     outf = np.zeros(16, np.float32)
     mod.cosim(Af, outf)
     assert np.allclose(outf, np.maximum(Af, 0.0), rtol=1e-5)

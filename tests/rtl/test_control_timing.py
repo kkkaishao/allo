@@ -14,7 +14,7 @@ import pytest
 import allo
 from allo import kernel
 from allo.lang import i32, f32, index, Stream
-from allo.backend.rtl.device import builtin_device
+from allo.backend.rtl.devices import default_device
 
 sys.path.insert(0, os.path.dirname(__file__))
 from _common import Mod, _sched, _to_rtl, _iis, COMB, PERIOD_NS  # noqa: E402
@@ -165,9 +165,9 @@ def test_rigid_region_emits_no_shell():
 
 
 def _dev(write_latency: int):
-    # The built-in device with the default on-chip storage rebound to a
+    # The default device with the default on-chip storage rebound to a
     # write_latency-cycle write.
-    d = builtin_device.copy()
+    d = default_device.copy()
     d.set_default_storage(
         d.add_storage(
             "lutram",

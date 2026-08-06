@@ -2,7 +2,9 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from . import reports
-from .device import Device, Storage, builtin_device
+from . import devices
+from .device import Device, Storage
+from .devices import default_device
 from .interface import (
     Interfaces,
     ModuleInterface,
@@ -36,9 +38,10 @@ from .sim.shell import CosimResult
 
 __all__ = [
     "reports",
+    "devices",
     "Device",
     "Storage",
-    "builtin_device",
+    "default_device",
     "Interfaces",
     "ModuleInterface",
     "Control",

@@ -1,7 +1,8 @@
 # Copyright Allo authors. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Device model for the RTL backend."""
+"""The device SCHEMA for the RTL backend: what a device can say, how a cost is
+expressed, and how both reach the IR."""
 
 from __future__ import annotations
 
@@ -10,9 +11,7 @@ from dataclasses import dataclass, replace
 from enum import Enum
 from functools import lru_cache
 
-from ...lang import f32, f64, bf16, i32, bool as _bool
-from ...lang.ip import ip, IP, OperatorType
-from .area_tables import declare_xcu55c_area
+from ...lang.ip import OperatorIP, OperatorType
 from .sim.ip_models import OpDesc, Ty
 
 
@@ -221,8 +220,20 @@ class Device:
     ``add_resource`` / ``add_storage`` / ``set_comb_delay`` / ``add_operator``
     and the ``set_*_uses`` declarations."""
 
-    def __init__(self, name: str):
+    def __init__(
+        self,
+        name: str,
+        *,
+        part: str = "",
+        fabric: str = "",
+        grade: str = "",
+    ):
         self.name = name
+        # Identity, for a reader and for a sibling backend that targets the same
+        # silicon by part number. Nothing in the compiler switches on these.
+        self.part = part
+        self.fabric = fabric
+        self.grade = grade
         self.comb: dict[str, float] = {}  # native chaining delays: kind -> ns
         # Separate from `comb`: a delay is a timing fact and an area is a
         # resource fact, read by different consumers.
@@ -238,7 +249,9 @@ class Device:
         # device retuned) must not leave it pointing at the replaced one.
         self.default_storage: str | None = None
         self.stream_timing: StreamTiming | None = None
-        self.operators: list[IP] = []  # built-in and user `@ip` operators
+        # Built-in and user `@operator_ip` cores, keyed for a reader by their
+        # `symbol`, which is also what `operator_uses` above is keyed on.
+        self.operators: list[OperatorIP] = []
         self.default_freq_mhz: float = 100.0
         # How many write ports an array is worth spreading over; past this RAM
         # inference fails and the array becomes a register file. A device fact,
@@ -418,7 +431,7 @@ class Device:
         return self
 
     def set_operator_uses(
-        self, operator: IP, uses: dict[Resource, Cost | Sequence]
+        self, operator: OperatorIP, uses: dict[Resource, Cost | Sequence]
     ) -> Device:
         """What one instance of an operator IP spends. Its parameter is the
         operand width, as a native operator kind's is, even though the IP's
@@ -426,10 +439,10 @@ class Device:
         kind so that one rule covers every row."""
         if operator not in self.operators:
             raise ValueError(
-                f"{operator.func_name!r} is not an operator of device {self.name!r}"
+                f"{operator.symbol!r} is not an operator of device {self.name!r}"
             )
-        self.operator_uses[operator.func_name] = self._spend(
-            f"operator {operator.func_name!r}", "width", uses
+        self.operator_uses[operator.symbol] = self._spend(
+            f"operator {operator.symbol!r}", "width", uses
         )
         return self
 
@@ -459,25 +472,65 @@ class Device:
         self.max_writes = int(ports)
         return self
 
-    def add_operator(self, operator: IP) -> Device:
-        if not isinstance(operator, IP):
+    def add_operator(self, operator: OperatorIP) -> Device:
+        """Declare a core this device offers. Scans rather than keeping a second
+        index: a device holds a couple of dozen operators, and one list that
+        cannot disagree with itself beats two structures that can."""
+        if not isinstance(operator, OperatorIP):
             raise TypeError(f"expected an operator IP, got {type(operator).__name__}")
-        if operator.optype is None:
+        symbol = operator.symbol
+        if any(o.symbol == symbol for o in self.operators):
             raise ValueError(
-                f"IP {operator.func_name!r} is not an operator IP (it has no optype)"
+                f"device {self.name!r} already declares an operator {symbol!r}; two "
+                "`dcp.operator`s under one symbol is a symbol table error, and a "
+                "core differing in kind, signature or latency is named apart on "
+                "its own (see OperatorIP.symbol)"
             )
         self.operators.append(operator)
         return self
 
-    def add_operators(self, *ips: IP) -> Device:
+    def add_operators(self, *ips: OperatorIP) -> Device:
         for operator in ips:
             self.add_operator(operator)
+        return self
+
+    def validate(self) -> Device:
+        """Check the device is complete enough to compile and to price against,
+        and return it. Run once where a device is BUILT, so a part that is
+        missing a row fails there rather than deep inside a compile or, worse,
+        as a structure that silently prices at nothing.
+        """
+        if not self.resources:
+            raise ValueError(f"device {self.name!r} declares no resources")
+        scatter = [s.name for s in self.storage.values() if s.is_scatter]
+        if len(scatter) != 1:
+            raise ValueError(
+                f"device {self.name!r} marks {len(scatter)} scatter storages; it "
+                "needs exactly one, since that is what a completely partitioned "
+                "array and an array that failed RAM inference both become"
+            )
+        if self.default_storage is None:
+            raise ValueError(
+                f"device {self.name!r} sets no default storage, so an array with "
+                "no `bind_storage` has nothing to resolve to"
+            )
+        if self.stream_timing is None:
+            raise ValueError(f"device {self.name!r} declares no stream timing")
+        # An undeclared cost is not a zero, but these two have no `unmodelled`
+        # bucket to land in: the estimator prices every mux and every delay chain
+        # through the one whole-device row, so an absent one reads as free.
+        for what, spent in (("mux", self.mux_uses), ("chain", self.chain_uses)):
+            if not spent:
+                raise ValueError(
+                    f"device {self.name!r} declares no {what} cost; every {what} "
+                    "in the design would then price at nothing"
+                )
         return self
 
     def copy(self) -> Device:
         """An independent copy, so extending it does not mutate this device. The
         timing and IP objects are shared, never mutated."""
-        d = Device(self.name)
+        d = Device(self.name, part=self.part, fabric=self.fabric, grade=self.grade)
         d.comb = dict(self.comb)
         d.resources = dict(self.resources)
         d.comb_uses = dict(self.comb_uses)
@@ -506,22 +559,20 @@ def _ty(dtype) -> Ty:
     )
 
 
-def operator_descs(operators: Sequence[IP]) -> list[OpDesc]:
+def operator_descs(operators: Sequence[OperatorIP]) -> list[OpDesc]:
     """The device operators as behavioral :class:`OpDesc` descriptors, the cosim
-    source of truth for each extern IP's kind, latency and dtypes. Non-operator
-    IPs are skipped."""
+    source of truth for each extern IP's kind, latency and dtypes. ``name`` is
+    the operator's symbol, which is the extern module the emitter instantiates
+    and so what the model joins on."""
     out = []
     for op in operators:
-        if op.optype is None:
-            continue
         kind = (
             op.optype.value if isinstance(op.optype, OperatorType) else str(op.optype)
         )
         rets = op.parse_return_annotation()
-        assert len(rets) == 1, f"operator IP {op.func_name!r} must return one scalar"
         out.append(
             OpDesc(
-                name=op.func_name,
+                name=op.symbol,
                 kind=kind,
                 latency=op.timing.latency,
                 arg_types=tuple(_ty(a) for a in op.parse_argument_annotations()),
@@ -542,10 +593,11 @@ _STALL_STYLE_TO_ENUM = {"ce": 0, "free": 1, "elastic": 2}
 def inject_operators(module, device: Device):
     """Inject each device operator as a module-level ``dcp.operator`` symbol the
     scheduler and reifier match concrete ``arith.*``/``math.*`` ops onto. The
-    ``sym_name`` is the stem of the RTL module name the emitter instantiates:
-    one declaration can cover several distinct pieces of hardware, so the
-    emitter appends whatever else distinguishes them (a float compare's
-    predicate: ``fcmp_l1`` -> ``fcmp_l1_ogt``).
+    ``sym_name`` is the operator's :attr:`~allo.lang.ip.OperatorIP.symbol`, and
+    the stem of the RTL module name the emitter instantiates: one declaration
+    can still cover several distinct pieces of hardware, so the emitter appends
+    whatever else distinguishes them (a float compare's predicate:
+    ``cmp_f32_f32_u1_l1`` -> ``cmp_f32_f32_u1_l1_ogt``).
 
     The resources an IP spends are the device's, but this op is not in the
     device's symbol table, so its references reach through the device symbol
@@ -578,7 +630,7 @@ def inject_operators(module, device: Device):
             # A pipelined IP's style, else the clock-enable default.
             stall = StallContractAttr.get(_STALL_STYLE_TO_ENUM[t.style or "ce"], ctx)
             DCPathOperatorOp(
-                sym_name=op.func_name,
+                sym_name=op.symbol,
                 kind=kind,
                 signature=TypeAttr.get(sig),
                 latency=t.latency,
@@ -587,7 +639,7 @@ def inject_operators(module, device: Device):
                 pipelined=t.pipelined,
                 stall=stall,
                 uses=_uses_attr(
-                    device.operator_uses.get(op.func_name), f"{device.name}::@"
+                    device.operator_uses.get(op.symbol), f"{device.name}::@"
                 ),
                 ip=insert,
             )
@@ -674,194 +726,20 @@ def inject_device(module, device: Device):
                 DCPathStreamTimingOp(**_timing(device.stream_timing))
 
 
-# --- built-in operators ----------------------------------------------------
-# An `@ip` body is `...`: the parameters exist to declare the IP's signature.
-# pylint: disable=unused-argument
-
-
-@ip(optype=OperatorType.ADD, latency=7, in_delay_ns=0.5, pipelined=True, style="ce")
-def fadd_l7(a: f32, b: f32) -> f32: ...
-
-
-@ip(optype=OperatorType.SUB, latency=7, in_delay_ns=0.5, pipelined=True, style="ce")
-def fsub_l7(a: f32, b: f32) -> f32: ...
-
-
-@ip(optype=OperatorType.MUL, latency=4, in_delay_ns=0.5, pipelined=True, style="ce")
-def fmul_l4(a: f32, b: f32) -> f32: ...
-
-
-@ip(optype=OperatorType.DIV, latency=12, in_delay_ns=0.5, pipelined=True, style="ce")
-def fdiv_l12(a: f32, b: f32) -> f32: ...
-
-
-@ip(optype=OperatorType.CMP, latency=1, in_delay_ns=0.5, pipelined=True, style="ce")
-def fcmp_l1(a: f32, b: f32) -> _bool: ...
-
-
-@ip(optype=OperatorType.ADD, latency=14, in_delay_ns=0.5, pipelined=True, style="ce")
-def dadd_l14(a: f64, b: f64) -> f64: ...
-
-
-@ip(optype=OperatorType.SUB, latency=14, in_delay_ns=0.5, pipelined=True, style="ce")
-def dsub_l14(a: f64, b: f64) -> f64: ...
-
-
-@ip(optype=OperatorType.MUL, latency=9, in_delay_ns=0.5, pipelined=True, style="ce")
-def dmul_l9(a: f64, b: f64) -> f64: ...
-
-
-@ip(optype=OperatorType.DIV, latency=24, in_delay_ns=0.5, pipelined=True, style="ce")
-def ddiv_l24(a: f64, b: f64) -> f64: ...
-
-
-@ip(optype=OperatorType.CMP, latency=1, in_delay_ns=0.5, pipelined=True, style="ce")
-def dcmp_l1(a: f64, b: f64) -> _bool: ...
-
-
-@ip(optype=OperatorType.ADD, latency=4, in_delay_ns=0.5, pipelined=True, style="ce")
-def bfadd_l4(a: bf16, b: bf16) -> bf16: ...
-
-
-@ip(optype=OperatorType.SUB, latency=4, in_delay_ns=0.5, pipelined=True, style="ce")
-def bfsub_l4(a: bf16, b: bf16) -> bf16: ...
-
-
-@ip(optype=OperatorType.MUL, latency=2, in_delay_ns=0.5, pipelined=True, style="ce")
-def bfmul_l2(a: bf16, b: bf16) -> bf16: ...
-
-
-# int <-> float conversion and float resize (one IP per exact width pair).
-@ip(
-    optype=OperatorType.INT_FLOAT_CAST,
-    latency=3,
-    in_delay_ns=0.5,
-    pipelined=True,
-    style="ce",
-)
-def i2f_l3(a: i32) -> f32: ...
-
-
-@ip(
-    optype=OperatorType.INT_FLOAT_CAST,
-    latency=3,
-    in_delay_ns=0.5,
-    pipelined=True,
-    style="ce",
-)
-def f2i_l3(a: f32) -> i32: ...
-
-
-@ip(
-    optype=OperatorType.FLOAT_CAST,
-    latency=2,
-    in_delay_ns=0.5,
-    pipelined=True,
-    style="ce",
-)
-def fcvt_l2(a: f32) -> f64: ...
-
-
-@ip(
-    optype=OperatorType.FLOAT_CAST,
-    latency=2,
-    in_delay_ns=0.5,
-    pipelined=True,
-    style="ce",
-)
-def bf2f_l2(a: bf16) -> f32: ...
-
-
-# pylint: enable=unused-argument
-
-# The built-in device: storage + native chaining tables + the operators above.
-builtin_device = Device("builtin")
-# Storage realizations, under the names an `allo.bind.storage impl=` resolves
-# against. `register` is the SCATTER row because it is marked so, not by name;
-# `srl` is a shift register, its own realization that happens to spend LUTs.
-builtin_device.add_storage(
-    "register",
-    read_latency=0,
-    write_latency=1,
-    read_delay_ns=0.1,
-    write_delay_ns=0.1,
-    is_scatter=True,
-)
-_lutram = builtin_device.add_storage(
-    "lutram",
-    read_latency=1,
-    write_latency=1,
-    read_delay_ns=0.5,
-    write_delay_ns=0.5,
-)
-builtin_device.add_storage(
-    "bram",
-    read_latency=1,
-    write_latency=1,
-    read_delay_ns=0.7,
-    write_delay_ns=0.7,
-)
-builtin_device.add_storage(
-    "uram",
-    read_latency=2,
-    write_latency=1,
-    read_delay_ns=0.9,
-    write_delay_ns=0.9,
-)
-builtin_device.add_storage(
-    "srl",
-    read_latency=1,
-    write_latency=1,
-    read_delay_ns=0.5,
-    write_delay_ns=0.5,
-)
-builtin_device.set_default_storage(_lutram)
-builtin_device.set_stream_timing(1, 1, 0.5, 0.5)
-builtin_device.set_default_frequency(300.0)
-builtin_device.add_operators(
-    fadd_l7,
-    fsub_l7,
-    fmul_l4,
-    fdiv_l12,
-    fcmp_l1,
-    dadd_l14,
-    dsub_l14,
-    dmul_l9,
-    ddiv_l24,
-    dcmp_l1,
-    bfadd_l4,
-    bfsub_l4,
-    bfmul_l2,
-    i2f_l3,
-    f2i_l3,
-    fcvt_l2,
-    bf2f_l2,
-)
-# Native chaining delays. Integer arithmetic, mul/div/rem included, is
-# combinational; float and cast go through the operators above.
-builtin_device.set_comb_delay(CombKind.ADD, 1.2)
-builtin_device.set_comb_delay(CombKind.SUB, 1.2)
-builtin_device.set_comb_delay(CombKind.MUL, 2.0)
-builtin_device.set_comb_delay(CombKind.DIV, 2.5)
-builtin_device.set_comb_delay(CombKind.REM, 2.5)
-builtin_device.set_comb_delay(CombKind.NEG, 1.0)
-builtin_device.set_comb_delay(CombKind.CMP, 1.0)
-builtin_device.set_comb_delay(CombKind.AND, 0.4)
-builtin_device.set_comb_delay(CombKind.OR, 0.4)
-builtin_device.set_comb_delay(CombKind.XOR, 0.4)
-builtin_device.set_comb_delay(CombKind.SHL, 0.5)
-builtin_device.set_comb_delay(CombKind.SHR, 0.5)
-builtin_device.set_comb_delay(CombKind.SELECT, 0.5)
-builtin_device.set_comb_delay(CombKind.INT_CAST, 0.3)
-# What the part has and what each row above spends of it, measured on xcu55c.
-declare_xcu55c_area(builtin_device)
-
-__ALL__ = [
+__all__ = [
     "Device",
+    "Resource",
     "Storage",
     "StreamTiming",
     "CombKind",
-    "builtin_device",
+    "Cost",
+    "Const",
+    "Linear",
+    "Quadratic",
+    "Step",
+    "Table",
+    "Tiled",
+    "operator_descs",
     "inject_device",
     "inject_operators",
 ]

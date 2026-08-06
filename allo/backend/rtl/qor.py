@@ -10,7 +10,8 @@ import re
 from collections import Counter
 from dataclasses import dataclass
 
-from .device import CombKind, Device, builtin_device
+from .device import CombKind, Device
+from .devices import default_device
 from .reports.microarch import Memory, RegRole, Unit
 from .reports.compile import CompileReport
 
@@ -165,10 +166,10 @@ def _operator_costs(device: Device) -> dict[str, tuple]:
     declaration is a constant, but it is still the parameter its kind carries."""
     out = {}
     for op in device.operators:
-        uses = device.operator_uses.get(op.func_name)
+        uses = device.operator_uses.get(op.symbol)
         if uses:
             widths = [a.primitive_width for a in op.parse_argument_annotations()]
-            out[op.func_name] = (uses, max(widths))
+            out[op.symbol] = (uses, max(widths))
     return out
 
 
@@ -212,7 +213,7 @@ def _infers_ram(mem: Memory, device: Device) -> bool:
 
 # One pass over the report, one bucket per kind of structure it publishes.
 # pylint: disable-next=too-many-locals
-def estimate(report: CompileReport, device: Device = builtin_device) -> QoR:
+def estimate(report: CompileReport, device: Device = default_device) -> QoR:
     """Price ``report``'s structures against ``device``.
 
     Every module the emission built is priced separately: a design with

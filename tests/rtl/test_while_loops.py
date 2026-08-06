@@ -12,7 +12,9 @@ import pytest
 
 from allo import kernel
 from allo.lang import i32, f32, index
+from allo.lang.ip import OperatorType
 from allo.backend.rtl import has_exact_scheduler
+from allo.backend.rtl.devices import default_device
 
 sys.path.insert(0, os.path.dirname(__file__))
 from _common import Dcp, Mod, _sched, _to_rtl, _one_region, _hold_done  # noqa: E402
@@ -515,7 +517,10 @@ def test_while_ip_condition_cosim():
 
     mod = _to_rtl(fconverge)
     assert mod.schedule().cyclic()[0].conditional
-    assert "hw.module.extern @fcmp" in mod.mlir
+    # A float compare's predicate rides the extern module name, so it is the
+    # operator's symbol plus the predicate the op carries.
+    fcmp = next(o for o in default_device.operators if o.optype is OperatorType.CMP)
+    assert f"hw.module.extern @{fcmp.symbol}_ogt" in mod.mlir
 
     def gold_halve(x, tol):
         r = np.float32(x)

@@ -17,12 +17,12 @@ from ..._mlir.ir import Module
 from ..._mlir._mlir_libs._allo import ir_ext
 from ..._mlir.dialects.allo import emit_verilog, emit_datapath_to_hw
 from .device import (
-    builtin_device,
     Device,
     inject_operators,
     inject_device,
     operator_descs,
 )
+from .devices import default_device
 from .interface import Interfaces
 from .options import PrepassOptions, SchedulerOptions
 from .qor import QoR, estimate
@@ -79,7 +79,7 @@ class RTL(Backend[P, R]):
                 makes, so under the heuristic it is the trivial binding.
         """
         super().__init__(kernel)
-        self._device = device if device is not None else builtin_device
+        self._device = device if device is not None else default_device
         self.freq_mhz = (
             freq_mhz if freq_mhz is not None else self._device.default_freq_mhz
         )

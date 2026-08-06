@@ -17,7 +17,8 @@ from allo.schedule import Schedule
 from allo.schedule.errors import InvalidScheduleArgumentError
 from allo.backend.base import run_pipeline
 from allo.backend.rtl import Memory, RegisterFile
-from allo.backend.rtl.device import builtin_device, Tiled
+from allo.backend.rtl.device import Tiled
+from allo.backend.rtl.devices import default_device
 from allo.backend.rtl.schedule import RTL_PREPARE_PIPELINE
 
 sys.path.insert(0, os.path.dirname(__file__))
@@ -1298,7 +1299,7 @@ def test_a_device_can_declare_a_storage_of_its_own():
             for i in range(8):
                 out[i] = y[i]
 
-        dev = builtin_device.copy()
+        dev = default_device.copy()
         mram = dev.add_storage(
             "mram",
             read_latency=read_latency,
@@ -1329,12 +1330,12 @@ def test_binding_storage_to_a_resource_is_a_type_error():
         for i in range(8):
             out[i] = A[i] + 1
 
-    lut = builtin_device.resources["lut"]
+    lut = default_device.resources["lut"]
     s = k.schedule()
     with pytest.raises(InvalidScheduleArgumentError):
         s.bind_storage("A", impl=lut, mem_type=s.RAM_T2P)
     with pytest.raises(TypeError):
-        builtin_device.copy().set_default_storage(lut)
+        default_device.copy().set_default_storage(lut)
 
 
 def test_an_undeclared_storage_is_reported():
@@ -1345,7 +1346,7 @@ def test_an_undeclared_storage_is_reported():
         for i in range(8):
             out[i] = A[i] + 1
 
-    dev = builtin_device.copy()
+    dev = default_device.copy()
     del dev.storage["uram"]
     s = k.schedule()
     s.bind_storage("A", impl=Schedule.URAM, mem_type=s.RAM_T2P)
@@ -1373,7 +1374,7 @@ def test_a_complete_partition_conflicting_with_a_bind_is_reported():
     agree = k.schedule()
     agree.partition("A", kind=agree.Complete)
     agree.bind_storage(
-        "A", impl=builtin_device.storage["register"], mem_type=agree.RAM_T2P
+        "A", impl=default_device.storage["register"], mem_type=agree.RAM_T2P
     )
     agree.export("rtl").schedule()
 
@@ -1388,7 +1389,7 @@ def test_the_device_names_the_storage_a_scatter_goes_into():
         for i in range(8):
             out[i] = A[i] + 1
 
-    renamed = builtin_device.copy()
+    renamed = default_device.copy()
     del renamed.storage["register"]
     renamed.add_storage(
         "ff_cell",
@@ -1402,7 +1403,7 @@ def test_the_device_names_the_storage_a_scatter_goes_into():
     s.partition("A", kind=s.Complete)
     s.export("rtl", device=renamed).schedule()
 
-    bare = builtin_device.copy()
+    bare = default_device.copy()
     del bare.storage["register"]
     s = k.schedule()
     s.partition("A", kind=s.Complete)
@@ -1410,7 +1411,7 @@ def test_the_device_names_the_storage_a_scatter_goes_into():
         s.export("rtl", device=bare).schedule()
 
     with pytest.raises(ValueError):
-        builtin_device.copy().add_storage(
+        default_device.copy().add_storage(
             "another",
             read_latency=0,
             write_latency=1,
@@ -1435,13 +1436,13 @@ def test_the_device_says_how_many_write_ports_infer():
 
     blocks = {}
     for ports in (2, 1):
-        dev = builtin_device.copy().set_max_writes(ports)
+        dev = default_device.copy().set_max_writes(ports)
         rtl = k.schedule().export("rtl", device=dev).verilog
         blocks[ports] = rtl.count("always_ff @(posedge clk)")
     assert blocks[2] == blocks[1] + 1
 
     with pytest.raises(ValueError):
-        builtin_device.copy().set_max_writes(0)
+        default_device.copy().set_max_writes(0)
 
 
 def test_a_tiled_cost_prices_the_whole_shape():
@@ -1454,7 +1455,7 @@ def test_a_tiled_cost_prices_the_whole_shape():
         for i in range(8):
             out[i] = A[i] + 1
 
-    dev = builtin_device.copy()
+    dev = default_device.copy()
     dev.add_storage(
         "bram",
         read_latency=1,
@@ -1595,9 +1596,9 @@ def test_multicycle_storage_on_argument_cosim():
 
 
 def _dev(write_latency: int):
-    """The built-in device with the default on-chip storage rebound to a
+    """The default device with the default on-chip storage rebound to a
     ``write_latency``-cycle write."""
-    d = builtin_device.copy()
+    d = default_device.copy()
     d.set_default_storage(
         d.add_storage(
             "lutram",

@@ -16,8 +16,8 @@ import pytest
 from allo import kernel
 from allo.lang import f32, index
 from allo.operators import math as amath
-from allo.lang.ip import ip
-from allo.backend.rtl.device import builtin_device
+from allo.lang.ip import operator_ip
+from allo.backend.rtl.devices import default_device
 from _common import (
     Dcp,
     _to_rtl,
@@ -915,7 +915,7 @@ def test_cholesky_triangular():
 
     # sqrt is non-combinational with no built-in characterization, so declare it
     # as an operator IP to fully characterize the kernel.
-    @ip(optype="sqrt", latency=7, pipelined=True, style="ce")
+    @operator_ip(optype="sqrt", latency=7, pipelined=True, style="ce")
     def fsqrt(a: f32) -> f32: ...
 
     @kernel
@@ -929,7 +929,7 @@ def test_cholesky_triangular():
                 A[i, i] = A[i, i] - A[i, k] * A[i, k]
             A[i, i] = amath.sqrt(A[i, i] * 1.0)
 
-    dev = builtin_device.copy()
+    dev = default_device.copy()
     dev.add_operator(fsqrt)
     rtl = _to_rtl(cholesky, device=dev)
     res = rtl.schedule()

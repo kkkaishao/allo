@@ -57,7 +57,7 @@ from .._mlir.dialects.ub import PoisonOp
 from .builder import AlloOpBuilder
 from ..lang.kernel import ConstevalFunction, Kernel, KernelOptions
 from ..lang.kernel import kernel as kernel_decorator
-from ..lang.ip import ip as ip_decorator
+from ..lang.ip import operator_ip as ip_decorator
 from ..lang.core import (
     ConstexprValue,
     AlloValue,
@@ -606,7 +606,7 @@ class MLIRCodeGenerator(ast.NodeVisitor):
         if decorator is ip_decorator:
             self.compile_error(
                 "External IPs are not allowed to be defined as nested functions. "
-                "Use a top-level '@ip' definition instead."
+                "Use a top-level '@operator_ip' definition instead."
             )
 
         if decorator is not kernel_decorator:

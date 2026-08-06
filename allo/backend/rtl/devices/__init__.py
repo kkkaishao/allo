@@ -1,0 +1,54 @@
+# Copyright Allo authors. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+"""The device library"""
+
+from __future__ import annotations
+
+from ..device import Device
+from . import alveo
+from .alveo import u55c, u280, u250
+from .spec import Grade, Part
+
+_DEVICES = {d.name: d for module in (alveo,) for d in module.DEVICES}
+
+#: What ``RTL(device=None)`` resolves to. Always an ALIAS of a real part, never
+#: a device of its own: a compile that names no device still compiles for one
+#: piece of silicon, and which one has to be answerable.
+default_device = u55c
+
+
+def get(name: str) -> Device:
+    """The device registered under ``name``, which is also the symbol its
+    injected ``dcp.device`` carries."""
+    device = _DEVICES.get(name)
+    if device is None:
+        raise ValueError(
+            f"unknown device {name!r}; the library holds {sorted(_DEVICES)}"
+        )
+    return device
+
+
+def names() -> list[str]:
+    """Every registered device name."""
+    return sorted(_DEVICES)
+
+
+def parts() -> dict[str, str]:
+    """Device name -> full vendor part number, for every registered device: the
+    one table through which two backends can target the same silicon."""
+    return {name: d.part for name, d in _DEVICES.items()}
+
+
+__all__ = [
+    "Device",
+    "Grade",
+    "Part",
+    "default_device",
+    "get",
+    "names",
+    "parts",
+    "u55c",
+    "u280",
+    "u250",
+]

@@ -369,7 +369,7 @@ def test_stream_li_shell():
         rtl.cosim(x, y, stall_prob=gap)
         assert np.array_equal(y, exp), f"gap={gap}: {list(y)} != {list(exp)}"
 
-    # The same shell with a multi-cycle IP datapath (fmul_l4 -> fadd_l7, an
+    # The same shell with a multi-cycle IP datapath (a float multiply into a float add, an
     # 11-deep pipeline between get and put). The clock-enable stall contract
     # (`ce`) freezes the IP pipeline in lockstep with the shell's shift chains; a
     # free-running IP would keep clocking under back-pressure and desync.

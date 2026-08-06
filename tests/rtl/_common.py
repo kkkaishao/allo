@@ -7,31 +7,31 @@ from __future__ import annotations
 
 import re
 
-from allo.backend.rtl import RTL, ScheduleResult, builtin_device
+from allo.backend.rtl import RTL, ScheduleResult, default_device
 
 
 # Operator latencies keyed by (kind, arg bit width), read off the built-in
-# operator IPs (each an `@ip(optype=...)`).
+# operator IPs (each an `@operator_ip(optype=...)`).
 def _key(op):
     dt = op.parse_argument_annotations()[0]
     return (op.optype.value, int(dt.primitive_width))
 
 
-_LAT = {_key(o): o.timing.latency for o in builtin_device.operators}
+_LAT = {_key(o): o.timing.latency for o in default_device.operators}
 
 FADD = FSUB = _LAT[("add", 32)]  # floating-point add/sub latency (cycles)
 FMUL = _LAT[("mul", 32)]  # floating-point multiply latency
 FDIV = _LAT[("div", 32)]  # floating-point divide latency
 IMUL = 0  # integer multiply is combinational (latency 0)
-MEM = builtin_device.storage["lutram"].read_latency  # default read/write
-MEM_URAM = builtin_device.storage["uram"].read_latency
+MEM = default_device.storage["lutram"].read_latency  # default read/write
+MEM_URAM = default_device.storage["uram"].read_latency
 
 # Combinational delay in ns by op kind, the table the chaining scheduler cuts
 # against, and the default clock it cuts to. A test that picks a clock to make a
 # chain fit or not fit derives the period from these rather than restating the
 # device's numbers.
-COMB = builtin_device.comb
-PERIOD_NS = 1000.0 / builtin_device.default_freq_mhz
+COMB = default_device.comb
+PERIOD_NS = 1000.0 / default_device.default_freq_mhz
 
 # A memory-carried accumulate (`M[x] += ...`) closes a distance-1 recurrence
 # read -> add -> write, so its II is the sum; a scalar-carried accumulate keeps
