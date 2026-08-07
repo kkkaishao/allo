@@ -63,8 +63,10 @@ std::optional<CombOpKindEnum> combKindOf(Operation *op);
 //===----------------------------------------------------------------------===//
 
 /// One row of the operator library. A comb row (`comb == true`) matches by
-/// `kind` + all-integer operands, at any width; an IP row by `kind` + an exact
-/// operand/result element-type list; an advanced row additionally by `mlirOp`.
+/// `kind` + all-integer operands, at any width, except the `select` and `neg`
+/// rows, which match any operand type: a mux over any datatype, a float sign
+/// flip. An IP row matches by `kind` + an exact operand/result element-type
+/// list; an advanced row additionally by `mlirOp`.
 struct OperatorEntry {
   OpKind kind = OpKind::Unknown; // abstract kind (Unknown on an advanced row).
   std::string mlirOp;            // advanced: raw MLIR op name (else empty).

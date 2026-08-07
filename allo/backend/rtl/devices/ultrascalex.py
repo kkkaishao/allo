@@ -109,6 +109,10 @@ DEFAULT_STORAGE = "lutram"
 SCATTER_STORAGE = "register"
 
 
+#: Operator cores measured on this fabric. The trailing comment on each row
+#: is that core's achieved Fmax in MHz, a record of the characterization run
+#: and not an input to the cost model; ``combinational`` marks a core the
+#: run reported no maximum for.
 IP: Mapping[OperatorIP, IPRow] = {
     ip.fadd: IPRow(7, {"lut": 270, "ff": 238, "dsp": 2, "carry8": 10}),  # 418
     ip.fsub: IPRow(7, {"lut": 270, "ff": 238, "dsp": 2, "carry8": 10}),  # 418

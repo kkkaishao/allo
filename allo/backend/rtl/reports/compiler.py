@@ -17,8 +17,9 @@ class SolveReport:
 
     Deliberately not joined to a :class:`RegionSchedule`. A solve is keyed by the
     affine loop that owned the problem, and the regions above are read off the
-    reified ``dcp`` ops, by which point that loop is gone. Both lists are in
-    program order per func, which is as much of a correspondence as holds."""
+    reified ``dcp`` ops, by which point that loop is gone. The two lists do not
+    line up positionally either: a container decomposes into its children and
+    solves nothing of its own, and one solve covers a whole perfect band."""
 
     func: str
     where: str  # source location, as the scheduler's own log names it
@@ -50,7 +51,9 @@ class CompilerReport:
 
     #: the scheduler's knobs, as the solve ran under them.
     options: SchedulerOptions | None = None
-    #: per-region solve cost, in solve order (see :class:`SolveReport`).
+    #: what each solve cost, in the order the scheduler solved: funcs
+    #: callees-first, and within a func its solving regions in program order.
+    #: Not one entry per region (see :class:`SolveReport`).
     solves: list[SolveReport] = field(default_factory=list)
 
     @classmethod

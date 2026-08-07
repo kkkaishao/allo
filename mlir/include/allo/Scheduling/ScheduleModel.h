@@ -319,8 +319,11 @@ public:
   /// CAPI serializes it.
   std::vector<FuncReport> report;
 
-  /// What each region's solve cost, in solve order. Filled by the SOLVER, so
-  /// unlike `report` it survives whether or not the reify runs.
+  /// What each solve cost, in the order the scheduler solved: funcs
+  /// callees-first, and within a func its solving regions in program order. Not
+  /// one entry per `report` region, since a container solves nothing of its own
+  /// and one solve covers a whole perfect band. Filled by the SOLVER, so unlike
+  /// `report` it survives whether or not the reify runs.
   std::vector<SolveReport> solves;
 
   /// Directives the scheduler could not apply, in the order it met them.
