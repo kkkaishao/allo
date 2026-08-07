@@ -925,12 +925,37 @@ LogicalResult mlir::allo::runSDCScheduler(ModuleOp module, StringRef top,
   if (failed(orderOr))
     return failure();
 
+  // The fabric floor: what a path with no operator in it already costs, a
+  // source flip-flop's clock-to-out plus routing. It reaches the solve as the
+  // EARLIEST sub-cycle time any operation may start at, which is where it
+  // belongs: nothing in a cycle can begin before its inputs leave a register.
+  //
+  // Not folded into the operator rows, whose delays are marginal: CIRCT defines
+  // a combinational operator's incoming and outgoing delay as one path (operand
+  // inputs to result outputs), so a per-CYCLE constant is not expressible
+  // there, and charging it per row would cost an N-deep chain N floors.
+  //
+  // Not taken off the period either, which would charge it a second time
+  // wherever a chain begins at a registered node whose own outgoing delay is
+  // already its clock-to-out, and would leave `unitSlack` (which reads the
+  // period and the solved `z`) disagreeing with the solve by one floor.
+  float regFloor = loadedDev.operators.registerFloor();
+  if (cycleTime <= regFloor) {
+    error(Stage::Sched, Code::OperatorOverPeriod, module)
+        << "The requested clock period of " << cycleTime
+        << " ns is at or below this device's register-to-register floor of "
+        << regFloor << " ns, so no cycle has room for any logic at all";
+    return failure();
+  }
+  SchedulerOptions optsWithFloor = opts;
+  optsWithFloor.regFloor = regFloor;
+
   for (func::FuncOp fn : *orderOr) {
     // Whole-func memory + stream dependence analysis, refined by the
     // `allo.assume.*` hints. Outlives the solve: the span composition reads its
     // value ranges to bound a symbolic trip.
     DependenceAnalysis deps(fn);
-    FuncScheduler sched(deps, loadedDev, model, cycleTime, opts);
+    FuncScheduler sched(deps, loadedDev, model, cycleTime, optsWithFloor);
     if (failed(sched.run(fn)))
       return failure();
   }

@@ -133,6 +133,105 @@ struct LowerBitSetSlice : OpRewritePattern<BitSetSliceOp> {
   }
 };
 
+//===----------------------------------------------------------------------===//
+// Constant divisors -> shifts.
+//
+// A divide or a remainder by a power of two is not a divider: it is a shift and
+// a mask.
+//===----------------------------------------------------------------------===//
+
+/// The base-2 log of \p divisor when it is a constant power of two. Only then
+/// is every shift below by a literal, which is wiring rather than a barrel
+/// shifter.
+static std::optional<unsigned> powerOfTwoDivisor(Value divisor) {
+  APInt cst;
+  if (!matchPattern(divisor, m_ConstantInt(&cst)) || !cst.isPowerOf2())
+    return std::nullopt;
+  return cst.logBase2();
+}
+
+/// `x sdiv 2^k`, which is NOT `x >> k`: the shift floors and the division
+/// truncates toward zero, so a negative numerator is nudged by `2^k - 1` first.
+/// A compare, a select and an add, none of which is a divider.
+static Value signedQuotient(PatternRewriter &rewriter, Location loc, Value x,
+                            unsigned k) {
+  Type ty = x.getType();
+  auto cst = [&](uint64_t v) {
+    return arith::ConstantOp::create(rewriter, loc,
+                                     rewriter.getIntegerAttr(ty, v))
+        .getResult();
+  };
+  Value zero = cst(0);
+  Value isNeg =
+      arith::CmpIOp::create(rewriter, loc, arith::CmpIPredicate::slt, x, zero);
+  Value bias = arith::SelectOp::create(rewriter, loc, isNeg,
+                                       cst((uint64_t(1) << k) - 1), zero);
+  return arith::ShRSIOp::create(
+      rewriter, loc, arith::AddIOp::create(rewriter, loc, x, bias), cst(k));
+}
+
+struct ReduceDivUI : OpRewritePattern<arith::DivUIOp> {
+  using OpRewritePattern::OpRewritePattern;
+  LogicalResult matchAndRewrite(arith::DivUIOp op,
+                                PatternRewriter &rewriter) const override {
+    std::optional<unsigned> k = powerOfTwoDivisor(op.getRhs());
+    if (!k)
+      return failure();
+    Value amount = arith::ConstantOp::create(
+        rewriter, op.getLoc(), rewriter.getIntegerAttr(op.getType(), *k));
+    rewriter.replaceOpWithNewOp<arith::ShRUIOp>(op, op.getLhs(), amount);
+    return success();
+  }
+};
+
+struct ReduceRemUI : OpRewritePattern<arith::RemUIOp> {
+  using OpRewritePattern::OpRewritePattern;
+  LogicalResult matchAndRewrite(arith::RemUIOp op,
+                                PatternRewriter &rewriter) const override {
+    std::optional<unsigned> k = powerOfTwoDivisor(op.getRhs());
+    if (!k)
+      return failure();
+    Value mask = arith::ConstantOp::create(
+        rewriter, op.getLoc(),
+        rewriter.getIntegerAttr(op.getType(), (uint64_t(1) << *k) - 1));
+    rewriter.replaceOpWithNewOp<arith::AndIOp>(op, op.getLhs(), mask);
+    return success();
+  }
+};
+
+struct ReduceDivSI : OpRewritePattern<arith::DivSIOp> {
+  using OpRewritePattern::OpRewritePattern;
+  LogicalResult matchAndRewrite(arith::DivSIOp op,
+                                PatternRewriter &rewriter) const override {
+    std::optional<unsigned> k = powerOfTwoDivisor(op.getRhs());
+    if (!k)
+      return failure();
+    rewriter.replaceOp(op,
+                       signedQuotient(rewriter, op.getLoc(), op.getLhs(), *k));
+    return success();
+  }
+};
+
+struct ReduceRemSI : OpRewritePattern<arith::RemSIOp> {
+  using OpRewritePattern::OpRewritePattern;
+  LogicalResult matchAndRewrite(arith::RemSIOp op,
+                                PatternRewriter &rewriter) const override {
+    std::optional<unsigned> k = powerOfTwoDivisor(op.getRhs());
+    if (!k)
+      return failure();
+    Location loc = op.getLoc();
+    Value x = op.getLhs();
+    // The remainder takes the dividend's sign, which `x - (q << k)` already
+    // does, so the quotient above is the only thing that needs care.
+    Value q = signedQuotient(rewriter, loc, x, *k);
+    Value amount = arith::ConstantOp::create(
+        rewriter, loc, rewriter.getIntegerAttr(op.getType(), *k));
+    rewriter.replaceOpWithNewOp<arith::SubIOp>(
+        op, x, arith::ShLIOp::create(rewriter, loc, q, amount));
+    return success();
+  }
+};
+
 // The RTL-path, device-IP-aware replacement for `arith-expand`. A composite
 // arith op the device can realize directly (a matching `dcp.operator`) is KEPT,
 // so the scheduler binds it to that IP; every other one is EXPANDED into
@@ -150,7 +249,8 @@ struct LegalizeArithPass
     // Reuse the upstream expansion patterns
     RewritePatternSet patterns(&getContext());
     arith::populateArithExpandOpsPatterns(patterns);
-    patterns.add<LowerBitGetSlice, LowerBitSetSlice>(&getContext());
+    patterns.add<LowerBitGetSlice, LowerBitSetSlice, ReduceDivUI, ReduceRemUI,
+                 ReduceDivSI, ReduceRemSI>(&getContext());
 
     ConversionTarget target(getContext());
     target.addLegalDialect<arith::ArithDialect>();
@@ -167,6 +267,13 @@ struct LegalizeArithPass
                                  arith::FloorDivSIOp, arith::MaximumFOp,
                                  arith::MinimumFOp, arith::MaxNumFOp,
                                  arith::MinNumFOp>(keepIfRealizable);
+    // A power-of-two divisor makes the op a shift, so it does not survive
+    // either. Every other divisor stays: the device has a core for it, or it
+    // is priced as the divider it really is.
+    target.addDynamicallyLegalOp<arith::DivSIOp, arith::DivUIOp, arith::RemSIOp,
+                                 arith::RemUIOp>([](Operation *op) {
+      return !powerOfTwoDivisor(op->getOperand(1)).has_value();
+    });
 
     if (failed(applyPartialConversion(module, target, std::move(patterns))))
       signalPassFailure();

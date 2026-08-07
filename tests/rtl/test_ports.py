@@ -334,8 +334,11 @@ def test_internal_signal_names():
     @kernel
     def sx(a: i32, X: i32[16], Y: i32[16], Z: i32[16]):
         for i in range(16):
-            buf: i32 = X[i] * a
-            Z[i] = buf + Y[i]
+            # `buf` is combinational and the multiply beside it is a DSP core,
+            # so `buf` has to WAIT for it: that wait is the delay tap whose
+            # name is the subject here.
+            buf: i32 = X[i] + a
+            Z[i] = buf + Y[i] * a
 
     v = _to_rtl(sx).verilog
     assert re.search(r"\bbuf_d1\b", v), "a delay tap keeps its value + delay"

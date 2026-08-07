@@ -17,7 +17,16 @@ from allo.lang import i32, f32, index, Stream
 from allo.backend.rtl.devices import default_device
 
 sys.path.insert(0, os.path.dirname(__file__))
-from _common import Mod, _sched, _to_rtl, _iis, COMB, PERIOD_NS  # noqa: E402
+from _common import (  # noqa: E402
+    Mod,
+    _sched,
+    _to_rtl,
+    _iis,
+    comb_ns,
+    comb_step_ns,
+    REG_NS,
+    PERIOD_NS,
+)
 
 pytestmark = pytest.mark.skipif(
     shutil.which("verilator") is None, reason="verilator not available"
@@ -239,25 +248,34 @@ def test_multi_cycle_write_freezes_under_back_pressure():
 # --- clock-frequency-aware chaining -------------------------------------------
 
 
-# The timing/chaining model is clock-frequency sensitive: a 4-deep
-# combinational int-add chain splits across more cycles under a tight clock
-# than under a loose one.
+# The timing/chaining model is clock-frequency sensitive: a combinational
+# int-add chain deeper than one cycle holds splits across more cycles under a
+# tight clock than under a loose one.
+_ADD_CHAIN = 8
+
+
 def test_chaining_inserts_register():
     def chain():
         @kernel
         def c(A: i32[8], out: i32[8]):
             for i in range(8):
-                x: i32 = A[i] + A[i]
-                y: i32 = x + A[i]
-                z: i32 = y + A[i]
-                out[i] = z + A[i]
+                t1: i32 = A[i] + A[i]
+                t2: i32 = t1 + A[i]
+                t3: i32 = t2 + A[i]
+                t4: i32 = t3 + A[i]
+                t5: i32 = t4 + A[i]
+                t6: i32 = t5 + A[i]
+                t7: i32 = t6 + A[i]
+                out[i] = t7 + A[i]
 
         return c
 
-    # The premise, stated against the device rather than assumed: four
-    # combinational int adds do not fit one default cycle. A device whose adds
-    # got faster would leave the test passing for the wrong reason.
-    assert 4 * COMB["add"] > PERIOD_NS
+    # The premise, stated against the device rather than assumed: this many
+    # chained int adds do not fit one default cycle. The register floor is paid
+    # once per CYCLE and each add contributes its own step on top, which is the
+    # sum the chaining solve actually cuts against; a device whose adds got
+    # faster would leave the test passing for the wrong reason.
+    assert REG_NS + _ADD_CHAIN * comb_step_ns("add") > PERIOD_NS
     # So the chaining scheduler splits the chain across cycles -- more register
     # stages than under a huge cycle time, where the whole chain settles in one.
     tight = _sched(chain()).cyclic()[0]
@@ -285,7 +303,10 @@ def test_a_symbolic_bound_is_cut_like_any_other_chain():
     # The premise, against the device: a signed floordiv expands to a divider
     # plus its sign correction (cmp, sub, select on each side), which alone
     # overruns the default period, so the bound is only buildable if it is cut.
-    assert COMB["div"] + COMB["sub"] + COMB["select"] > PERIOD_NS
+    assert (
+        REG_NS + comb_step_ns("div") + comb_step_ns("sub") + comb_step_ns("select")
+        > PERIOD_NS
+    )
 
     # A cell the emitter reaches with more delay on its inputs than the schedule
     # left it is a REFUSAL (`checkCombPathsMeetPeriod`), so compiling at all is
@@ -315,8 +336,10 @@ def test_a_sequential_whiles_condition_is_cut_like_any_other_chain():
             i: i32 = 0
             s: i32 = 0
             # The load is what forces the CHECK/RUN controller; the arith behind
-            # it is what has to be cut.
-            while A[i] * 3 + A[i] * 5 + 11 < 100:
+            # it is what has to be cut. Adds and not a multiply, because an
+            # integer multiply binds to a DSP core on this device and a core's
+            # latency is not something the chaining solve can cut.
+            while A[i] + A[i] + A[i] + A[i] + A[i] + A[i] + A[i] + A[i] < 100:
                 s += A[i]
                 i += 1
             out[0] = s
@@ -324,8 +347,9 @@ def test_a_sequential_whiles_condition_is_cut_like_any_other_chain():
         return k
 
     # The premise, against the device: the condition's own chain does not fit
-    # one default cycle, so it is only buildable if something breaks it.
-    assert COMB["mul"] + 2 * COMB["add"] + COMB["cmp"] > PERIOD_NS
+    # one default cycle, so it is only buildable if something breaks it. Seven
+    # adds chain the eight terms, and the register floor is paid once.
+    assert REG_NS + 7 * comb_step_ns("add") + comb_step_ns("cmp") > PERIOD_NS
 
     def cond_depth(res):
         # The conditional container's own ops ARE the condition cone: its body
@@ -361,7 +385,7 @@ def test_an_address_cone_is_charged_to_the_port_it_feeds():
     # operator type can account for it. These two kernels run the same four adds
     # over the same trip count and differ only in what it costs to reach the
     # element -- `flat` addresses with the bare counter, `cone` sums three
-    # shifted terms. At 2 ns the compute alone fits and only the cone does not.
+    # shifted terms.
     @kernel
     def flat(A: i32[512], B: i32[512], out: i32[512]):
         for i in range(64):
@@ -376,11 +400,22 @@ def test_an_address_cone_is_charged_to_the_port_it_feeds():
                         A[i, j, k] + B[i, j, k] + A[i, j, k] + B[i, j, k]
                     )
 
-    at500 = {
-        n: _sched(k, freq_mhz=500).cyclic()[0]
-        for n, k in (("flat", flat), ("cone", cone))
-    }
-    assert at500["cone"].iteration_latency > at500["flat"].iteration_latency
+    def fits(k, mhz):
+        try:
+            _sched(k, freq_mhz=mhz)
+            return True
+        except RuntimeError:
+            return False
+
+    base = default_device.default_freq_mhz
+    assert fits(flat, base) and fits(cone, base)
+
+    parted = [
+        mhz
+        for mhz in range(int(base) + 10, 501, 10)
+        if fits(flat, mhz) and not fits(cone, mhz)
+    ]
+    assert parted, "no clock charges the address cone more than the bare counter"
 
 
 def test_an_address_that_follows_the_counters_is_carried_in_a_register():

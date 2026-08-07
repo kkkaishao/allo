@@ -6,11 +6,16 @@
 from __future__ import annotations
 
 from ..device import Device
-from . import alveo
+from . import alveo, kria, series7, versal
 from .alveo import u55c, u280, u250
+from .kria import kv260
+from .series7 import pynqz2
+from .versal import vck190
 from .spec import Grade, Part
 
-_DEVICES = {d.name: d for module in (alveo,) for d in module.DEVICES}
+_DEVICES = {
+    d.name: d for module in (alveo, kria, series7, versal) for d in module.DEVICES
+}
 
 #: What ``RTL(device=None)`` resolves to. Always an ALIAS of a real part, never
 #: a device of its own: a compile that names no device still compiles for one
@@ -51,4 +56,7 @@ __all__ = [
     "u55c",
     "u280",
     "u250",
+    "kv260",
+    "pynqz2",
+    "vck190",
 ]

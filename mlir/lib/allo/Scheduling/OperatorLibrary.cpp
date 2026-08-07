@@ -224,7 +224,7 @@ bool needsIP(Operation *op) {
 // from.
 OperatorIdentity identityOf(Operation *op, std::optional<CombOpKindEnum> comb,
                             StringRef symbol) {
-  assert(!(comb && !symbol.empty()) && "a compute takes one realization path");
+  assert((!comb || symbol.empty()) && "a compute takes one realization path");
   OperatorIdentity id;
   if ((!comb && symbol.empty()) || op->getNumResults() != 1)
     return id;
@@ -257,13 +257,16 @@ OperatorLibrary OperatorLibrary::fromModule(ModuleOp module) {
   // Comb rows first: `entries` is matched last-wins, so comb is the
   // lowest-priority fallback and an injected IP of the same kind overrides it.
   if (device) {
+    lib.regFloor = device.getRegDelay().convertToDouble();
     for (dcp::DCPathCombOp comb :
          device.getBody().getOps<dcp::DCPathCombOp>()) {
       OperatorEntry e;
       e.kind = comb.getKind();
       e.comb = true;
       e.latency = 0;
-      e.inDelay = e.outDelay = comb.getDelay().convertToDouble();
+      // Left as a curve: what width to evaluate it at is the matched
+      // OPERATION's, which `lookup` knows and this does not.
+      e.delay = comb.getDelayAttr();
       e.uses = comb.getUsesAttr();
       lib.entries.push_back(std::move(e));
     }
@@ -321,14 +324,36 @@ const OperatorEntry *OperatorLibrary::combEntry(OpKind kind) const {
   return found;
 }
 
-double OperatorLibrary::combDelay(CombOpKindEnum kind) const {
+double OperatorLibrary::combDelay(CombOpKindEnum kind, int64_t width) const {
   const OperatorEntry *e = combEntry(opKindOf(kind));
-  return e ? e->outDelay : defaultEntry.outDelay;
+  return e ? e->delay.evaluate(width) : defaultEntry.outDelay;
 }
 
-double OperatorLibrary::combDelay(OpKind kind) const {
+double OperatorLibrary::combDelay(OpKind kind, int64_t width) const {
   const OperatorEntry *e = combEntry(kind);
-  return e ? e->outDelay : 0.0;
+  return e ? e->delay.evaluate(width) : 0.0;
+}
+
+double OperatorLibrary::combMarginalDelay(OpKind kind, int64_t width) const {
+  return std::max(0.0, combDelay(kind, width) - regFloor);
+}
+
+double OperatorLibrary::combMarginalDelay(CombOpKindEnum kind,
+                                          int64_t width) const {
+  return std::max(0.0, combDelay(kind, width) - regFloor);
+}
+
+int64_t mlir::allo::combParamWidth(Operation *op) {
+  int64_t width = 0;
+  for (Type t : elementTypes(op->getOperandTypes()))
+    if (t.isIntOrFloat())
+      width = std::max<int64_t>(width, t.getIntOrFloatBitWidth());
+  if (width)
+    return width;
+  for (Type t : elementTypes(op->getResultTypes()))
+    if (t.isIntOrFloat())
+      width = std::max<int64_t>(width, t.getIntOrFloatBitWidth());
+  return width ? width : 1;
 }
 
 int64_t OperatorLibrary::priceOf(ArrayAttr uses,
@@ -425,15 +450,35 @@ OperatorChar OperatorLibrary::lookup(Operation *op) const {
     e = &defaultEntry;
   }
 
+  // Every row is characterized over one parameter, an operand width.
+  int64_t width = combParamWidth(op);
+
   // The stable Problem::OperatorType key: an IP row's symbol, a comb row's
-  // `comb.<kind>`, else `default`.
+  // `comb.<kind>.w<N>`, else `default`.
   OperatorChar c;
-  c.timing.typeName = !e->symbol.empty() ? e->symbol
-                      : e->comb ? ("comb." + stringifyOpKindEnum(e->kind)).str()
-                                : std::string("default");
+  c.timing.typeName =
+      !e->symbol.empty() ? e->symbol
+      : e->comb
+          ? ("comb." + stringifyOpKindEnum(e->kind) + ".w" + Twine(width)).str()
+          : std::string("default");
   c.timing.latency = e->latency;
-  c.timing.inDelay = e->inDelay;
-  c.timing.outDelay = e->outDelay;
+  // A comb row carries its MARGINAL delay: what the operator adds to a path
+  // that already left a register. The fabric floor the measurement also saw is
+  // paid once per CYCLE, so it comes off the chaining BUDGET instead
+  // (`runSDCScheduler`); charging it per operator costs a four-deep chain three
+  // floors it does not spend.
+  //
+  // The two are the same number here because they must be:
+  // `ChainingProblem::checkDelays` rejects a zero-latency operator whose
+  // incoming and outgoing delays differ, since for a combinational cell they
+  // describe one path.
+  if (e->comb)
+    c.timing.inDelay = c.timing.outDelay =
+        std::max(0.0, e->delay.evaluate(width) - regFloor);
+  else {
+    c.timing.inDelay = e->inDelay;
+    c.timing.outDelay = e->outDelay;
+  }
   c.pipelined = e->pipelined;
   // A shift by a literal is wiring, not a shifter. Its own type name because
   // the problem registers timing per NAME: leaving it on the shift row would
@@ -443,12 +488,9 @@ OperatorChar OperatorLibrary::lookup(Operation *op) const {
     c.timing.typeName = "rename." + c.timing.typeName;
     c.timing.inDelay = c.timing.outDelay = 0.0;
   }
-  // Every row is characterized over one parameter, an operand width; an IP's
-  // signature pins it, so there the factors are constants and this is the
-  // measured core.
-  if (op->getNumResults() == 1)
-    if (Type t = elementTypes(op->getResultTypes()).front(); t.isIntOrFloat())
-      c.price = priceOf(e->uses, {(int64_t)t.getIntOrFloatBitWidth()});
+  // An IP's signature pins the width, so there the factors are constants and
+  // this is the measured core.
+  c.price = priceOf(e->uses, {width});
   // The realization is the row's own symbol when it is an IP, else the native
   // lowering the reifier picks; the default row reaches the comb arm too.
   if (!e->symbol.empty())

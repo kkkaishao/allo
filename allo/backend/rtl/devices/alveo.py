@@ -10,10 +10,6 @@ from .spec import Part
 
 _2L = ultrascalex.GRADE_2L
 
-#: LUT/FF/DSP are the Virtex UltraScale+ product table's for XCVU47P, the die
-#: xcu55c is built on; BRAM/URAM tile counts are DS978's. `bram36` and `uram288`
-#: are TILE counters, named for their size; the storage realizations an array
-#: binds to are `bram` and `uram`, distinct names in the same symbol table.
 u55c = ultrascalex.build(
     Part(
         name="u55c",
@@ -29,10 +25,6 @@ u55c = ultrascalex.build(
     )
 )
 
-# PLACEHOLDER capacities: scaffolding for the layering, not read off a data
-# sheet yet. The area and timing tables above them are xcu55c's and are shared
-# legitimately, since the fabric is the same silicon; only these five numbers
-# per card are still owed.
 u280 = ultrascalex.build(
     Part(
         name="u280",

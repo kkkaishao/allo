@@ -241,9 +241,23 @@ public:
 /// Visits operations in topological order and marks one "handled" only once
 /// every predecessor's chain map is complete, so a successor never inherits a
 /// half-built map.
+/// \p regFloor is the earliest sub-cycle time any operation may start at, so
+/// every chain begins having already spent it.
 LogicalResult computeChainBreaks(
-    circt::scheduling::ChainingProblem &prob, float cycleTime,
+    circt::scheduling::ChainingProblem &prob, float cycleTime, float regFloor,
     SmallVectorImpl<circt::scheduling::Problem::Dependence> &result);
+
+/// `circt::scheduling::computeStartTimesInCycle` with a FLOOR: an operation's
+/// sub-cycle start is at least \p regFloor, where CIRCT's takes zero.
+///
+/// CIRCT models an ideal register, whose result is available at physical time
+/// 0.0 of the cycle it is read in. A real one has a clock-to-out, and the
+/// routing out of it is not free either; on xcu55c a register-to-register path
+/// with no logic at all measured 0.419 ns against a 3.333 ns period. Seeding
+/// with it makes a chain from a REGISTERED node cost `max(floor, that node's
+/// outgoing delay)`, which double-charges neither.
+LogicalResult computeStartTimesInCycle(circt::scheduling::ChainingProblem &prob,
+                                       float regFloor);
 
 //===----------------------------------------------------------------------===//
 // SDC simplex schedulers.
@@ -282,10 +296,12 @@ struct SimplexWarmStart {
 /// \p warm, when given, receives the warm start above and switches placement
 /// failures to advisory.
 LogicalResult scheduleSimplex(ChainingModuloProblem &prob, Operation *lastOp,
-                              float cycleTime, unsigned minII = 1,
+                              float cycleTime, float regFloor,
+                              unsigned minII = 1,
                               SimplexWarmStart *warm = nullptr);
 LogicalResult scheduleSimplex(ChainingSharedOperatorsProblem &prob,
-                              Operation *lastOp, float cycleTime);
+                              Operation *lastOp, float cycleTime,
+                              float regFloor);
 
 //===----------------------------------------------------------------------===//
 // What a solve is charged: the span objective.
@@ -421,6 +437,11 @@ struct SchedulerOptions {
   bool allocate = false;
   int workers = kDefaultSolveWorkers;
   int seed = kDefaultSolveSeed;
+  /// The fabric's register-to-register floor (ns): the EARLIEST sub-cycle time
+  /// any operation may start at, since nothing begins before its inputs leave a
+  /// register. Every combinational row is measured including it and carries its
+  /// delay less it, so a cycle pays it once however many operators chain.
+  float regFloor = 0.0f;
 };
 
 /// \p name ("heuristic" / "exact" / "exact-chaining") as a kind, or nullopt
@@ -461,7 +482,7 @@ inline LogicalResult solveSchedulingProblem(ChainingModuloProblem &problem,
     if (failed(scheduleCPSAT(problem, anchor, cycleTime, minII, span, opts)))
       return failure();
   } else if (failed(mlir::allo::scheduleSimplex(problem, anchor, cycleTime,
-                                                minII))) {
+                                                opts.regFloor, minII))) {
     return failure();
   }
   if (failed(problem.verify()))
@@ -478,7 +499,8 @@ inline LogicalResult solveSchedulingProblem(
   if (usesExactScheduler(opts.kind)) {
     if (failed(scheduleCPSAT(problem, anchor, cycleTime, span, opts)))
       return failure();
-  } else if (failed(mlir::allo::scheduleSimplex(problem, anchor, cycleTime))) {
+  } else if (failed(mlir::allo::scheduleSimplex(problem, anchor, cycleTime,
+                                                opts.regFloor))) {
     return failure();
   }
   if (failed(problem.verify()))

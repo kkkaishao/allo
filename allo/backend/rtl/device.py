@@ -71,7 +71,20 @@ def Step(threshold: float, below_coeff: float, above: float) -> Cost:
 
 def Table(points: dict[int, float]) -> Cost:
     """Measured point by point. A parameter between two points takes the lower
-    one's value, and one below the first takes the first's."""
+    one's value, and one below the first takes the first's.
+
+    A STAIRCASE, which fits a quantity that really is piecewise constant: an SRL
+    chain occupies ``ceil(depth/32)`` sites, and at depth 40 that is 2, not the
+    1.3 an interpolation would report.
+
+    KNOWN GAP: a CONTINUOUS quantity sampled into one is under-stated at every
+    parameter between two points, and under is the dangerous direction for a
+    timing model nothing downstream re-checks (a 48-bit divide reading the
+    32-bit row is 45% short). Every combinational delay row is such a quantity
+    today. The fix is a structural form the device can declare instead, not an
+    interpolation rule applied on its behalf; a power law fits 14 of the 16
+    kinds to within 12% on all four measured fabrics.
+    """
     if not points:
         raise ValueError("a cost table needs at least one point")
     flat: list[float] = []
@@ -101,6 +114,10 @@ def _terms(cost: Cost | Sequence) -> tuple[tuple[Cost, ...], ...]:
 #: pricing one design asks for the same handful of rows tens of thousands of
 #: times.
 _COST_ATTRS: dict[Spend, object] = {}
+
+#: The same, for the single costs a `dcp.comb` row's DELAY is, which are not a
+#: `Spend` and so cannot share the table above.
+_DELAY_ATTRS: dict[Cost, object] = {}
 
 
 @lru_cache(maxsize=None)
@@ -197,7 +214,13 @@ class CombKind(Enum):
     MUL = "mul"
     DIV = "div"
     REM = "rem"
-    NEG = "neg"
+    NEG = "neg"  # `arith.negf` only: a float sign flip, not an integer negate
+    # `arith.minsi`/`minui`/`maxsi`/`maxui`, which the operator library already
+    # realizes: a compare feeding a multiplexer. A fabric that declares no row
+    # for these prices them at the default (0.1 ns and free), which they are
+    # not.
+    MIN = "min"
+    MAX = "max"
     CMP = "cmp"
     AND = "and"
     OR = "or"
@@ -234,7 +257,10 @@ class Device:
         self.part = part
         self.fabric = fabric
         self.grade = grade
-        self.comb: dict[str, float] = {}  # native chaining delays: kind -> ns
+        # Native chaining delays: kind -> ns as a function of the operand width.
+        self.comb: dict[str, Cost] = {}
+        # What a register-to-register path with NO operator in it costs (ns).
+        self.reg_delay_ns: float = 0.0
         # Separate from `comb`: a delay is a timing fact and an area is a
         # resource fact, read by different consumers.
         self.resources: dict[str, Resource] = {}
@@ -293,6 +319,29 @@ class Device:
         from ..._mlir.dialects.allo import evaluate_resource_use
 
         return dict(evaluate_resource_use(_res_use_attr(uses), list(params)))
+
+    def comb_delay(self, kind: CombKind | str, width: int) -> float:
+        """The chaining delay (ns) of a native operator kind at ``width`` bits,
+        including the register floor the measurement saw.
+
+        Goes through the compiler's own ``CostAttr::evaluate``, as
+        :meth:`price` does, so a reader outside the compiler cannot disagree
+        with the scheduler about a curve they both consult. 0.0 where the device
+        declares no row: an undeclared delay is not a zero, but a caller asking
+        for one it did not declare has nothing else to be told.
+        """
+        from ..._mlir.dialects.allo import evaluate_cost
+
+        cost = self.comb.get(kind.value if isinstance(kind, CombKind) else kind)
+        if cost is None:
+            return 0.0
+        attr = _DELAY_ATTRS.get(cost)
+        if attr is None:
+            from ..._mlir.ir import Attribute
+
+            with _cost_context():
+                attr = _DELAY_ATTRS[cost] = Attribute.parse(cost._mlir())
+        return evaluate_cost(attr, int(width))
 
     def add_resource(self, name: str, capacity: int) -> Resource:
         """Declare a resource this device has ``capacity`` of, and return the
@@ -409,17 +458,22 @@ class Device:
     def set_comb_delay(
         self,
         kind: CombKind,
-        delay_ns: float,
+        delay_ns: Cost | float,
         uses: dict[Resource, Cost | Sequence] | None = None,
     ) -> Device:
-        """Set the combinational chaining delay (ns) of a native operator kind,
-        and optionally what one instance of it spends. A comb kind carries ONE
-        parameter, its operand width, so each cost is a function of that."""
+        """Set the combinational chaining delay of a native operator kind, and
+        optionally what one instance of it spends. A comb kind carries ONE
+        parameter, its operand width, and BOTH the delay and each cost are
+        functions of it: a 32-bit divider was measured at 23.7 ns against an
+        8-bit one's 4.3, so a scalar per kind either forbids the narrow one or
+        lies about the wide one. A bare number is that constant function."""
         if not isinstance(kind, CombKind):
             raise TypeError(f"kind must be a CombKind, got {kind!r}")
-        if delay_ns < 0:
-            raise ValueError(f"comb delay for {kind.value!r} must be non-negative")
-        self.comb[kind.value] = float(delay_ns)
+        if not isinstance(delay_ns, Cost):
+            if delay_ns < 0:
+                raise ValueError(f"comb delay for {kind.value!r} must be non-negative")
+            delay_ns = Const(float(delay_ns))
+        self.comb[kind.value] = delay_ns
         if uses:
             self.comb_uses[kind.value] = self._spend(
                 f"comb kind {kind.value!r}", "width", uses
@@ -450,6 +504,23 @@ class Device:
     def set_chain_uses(self, uses: dict[Resource, Sequence]) -> Device:
         """What one ``depth``-stage, ``width``-bit value delay chain spends."""
         self.chain_uses = self._spend("a delay chain", "depth, width", uses)
+        return self
+
+    def set_register_floor(self, delay_ns: float) -> Device:
+        """The register-to-register floor: what a path with NO operator in it
+        costs, a source flip-flop's clock-to-out plus the routing every path
+        pays. Measured on a reg-to-reg DUT with nothing between the registers.
+
+        Every combinational delay this device declares includes it, because that
+        is what a measurement of one operator between two registers sees. A
+        cycle pays it ONCE however many operators chain within it, so the
+        scheduler charges a comb row its whole delay where a chain ends and the
+        delay less this where a successor extends the chain. Declaring nothing
+        leaves it at zero, which prices a four-deep chain three floors too high.
+        """
+        if delay_ns < 0:
+            raise ValueError("the register floor must be non-negative")
+        self.reg_delay_ns = float(delay_ns)
         return self
 
     def set_default_frequency(self, freq_mhz: float) -> Device:
@@ -528,6 +599,7 @@ class Device:
         d.stream_timing = self.stream_timing
         d.operators = list(self.operators)
         d.default_freq_mhz = self.default_freq_mhz
+        d.reg_delay_ns = self.reg_delay_ns
         return d
 
 
@@ -678,6 +750,7 @@ def inject_device(module, device: Device):
 
         dev = DCPathDeviceOp(
             sym_name=device.name,
+            reg_delay=FloatAttr.get(f32ty, device.reg_delay_ns),
             ip=InsertionPoint.at_block_begin(module.body),
         )
         # The body declares what the device HAS and what it can REALIZE, each a
@@ -691,7 +764,7 @@ def inject_device(module, device: Device):
             for kind, delay in device.comb.items():
                 DCPathCombOp(
                     kind=Attribute.parse(f"#allo<op_kind {kind}>"),
-                    delay=FloatAttr.get(f32ty, delay),
+                    delay=Attribute.parse(delay._mlir()),
                     uses=_uses_attr(device.comb_uses.get(kind)),
                 )
             for s in device.storage.values():

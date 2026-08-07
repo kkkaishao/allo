@@ -23,9 +23,9 @@ using namespace mlir::allo;
 
 AddressDelays mlir::allo::addressDelaysOf(const OperatorLibrary &lib) {
   AddressDelays d;
-  d.add = lib.combDelay(OpKind::Add);
-  d.mul = lib.combDelay(OpKind::Mul);
-  d.div = lib.combDelay(OpKind::Div);
+  d.add = lib.combMarginalDelay(OpKind::Add, AddressDelays::refWidth);
+  d.mul = lib.combMarginalDelay(OpKind::Mul, AddressDelays::refWidth);
+  d.div = lib.combMarginalDelay(OpKind::Div, AddressDelays::refWidth);
   return d;
 }
 

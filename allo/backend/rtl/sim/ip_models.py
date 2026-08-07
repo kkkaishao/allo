@@ -202,6 +202,16 @@ _MODELS: dict[str, _Model] = {
     "cos": _Model(c="std::cos(a)"),
     "tan": _Model(c="std::tan(a)"),
     "tanh": _Model(c="std::tanh(a)"),
+    # Integer divide and remainder bind by MLIR mnemonic rather than by kind,
+    # since `i32` is signless and the abstract `div` cannot say which arithmetic
+    # is meant. The expression is the same either way: the operand PORTS are
+    # declared `signed` from the core's own dtypes, and `/` and `%` in
+    # SystemVerilog follow their operands, truncating toward zero and taking the
+    # dividend's sign exactly as `arith.divsi` / `arith.remsi` do.
+    "divsi": _Model(sv="a / b"),
+    "divui": _Model(sv="a / b"),
+    "remsi": _Model(sv="a % b"),
+    "remui": _Model(sv="a % b"),
     "abs": _Model("a < 0 ? -a : a", "std::fabs(a)", svu="a"),
     "absf": _Model(c="std::fabs(a)"),
     "floor": _Model(c="std::floor(a)"),

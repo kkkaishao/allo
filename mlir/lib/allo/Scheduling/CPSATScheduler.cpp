@@ -99,17 +99,22 @@ int64_t picos(double ns) { return std::llround(ns * kPicosPerNs); }
 /// or register.
 template <class ProblemT>
 void addSubCycleTimes(CpModelBuilder &model, ProblemT &prob,
-                      DenseMap<Operation *, IntVar> &startVars,
-                      float cycleTime) {
+                      DenseMap<Operation *, IntVar> &startVars, float cycleTime,
+                      float regFloor) {
   int64_t period = picos(cycleTime);
+  // Nothing in a cycle starts before its operands leave a register, so the
+  // fabric floor is every `z`'s LOWER bound. A chain from a registered producer
+  // then waits `max(floor, that producer's outgoing delay)`, which is what the
+  // `>=` below and this bound together say.
+  int64_t floor = picos(regFloor);
   DenseMap<Operation *, IntVar> inCycle;
   for (Operation *op : prob.getOperations()) {
     int64_t in = picos(*prob.getIncomingDelay(*prob.getLinkedOperatorType(op)));
-    assert(in <= period &&
+    assert(in + floor <= period &&
            "an operator whose own delay exceeds the period is rejected by the "
            "chain-breaking pre-pass, which the heuristic ran before this");
     inCycle.try_emplace(
-        op, model.NewIntVar(operations_research::Domain(0, period - in)));
+        op, model.NewIntVar(operations_research::Domain(floor, period - in)));
   }
 
   for (Operation *op : prob.getOperations())
@@ -142,13 +147,13 @@ void addSubCycleTimes(CpModelBuilder &model, ProblemT &prob,
 template <class ProblemT>
 void addChaining(CpModelBuilder &model, ProblemT &prob,
                  DenseMap<Operation *, IntVar> &startVars,
-                 const Chaining &chaining) {
+                 const Chaining &chaining, float regFloor) {
   for (const Problem::Dependence &dep : chaining.breaks)
     model.AddLessOrEqual(startVars.at(dep.getSource()) +
                              prob.latencyOf(dep.getSource()) + 1,
                          startVars.at(dep.getDestination()));
   if (chaining.period)
-    addSubCycleTimes(model, prob, startVars, *chaining.period);
+    addSubCycleTimes(model, prob, startVars, *chaining.period, regFloor);
 }
 
 /// Every operation's inputs settle within the period.
@@ -167,8 +172,9 @@ void addChaining(CpModelBuilder &model, ProblemT &prob,
 /// Derive the solved schedule's sub-cycle start times and check the period.
 /// `ChainingProblem` does not carry the period itself, so this is the only
 /// place that verifies chains fit it.
-LogicalResult finishSchedule(ChainingProblem &prob, float cycleTime) {
-  if (failed(computeStartTimesInCycle(prob)))
+LogicalResult finishSchedule(ChainingProblem &prob, float cycleTime,
+                             float regFloor) {
+  if (failed(mlir::allo::computeStartTimesInCycle(prob, regFloor)))
     return failure();
   assert(chainsFitCycleTime(prob, cycleTime) &&
          "a combinational chain crosses more than one clock period");
@@ -422,7 +428,8 @@ LogicalResult mlir::allo::scheduleCPSAT(ChainingSharedOperatorsProblem &prob,
   // First-fit placement here cannot fail (a cycle with room always exists),
   // so a failure is the resource-free LP declaring infeasibility, which no
   // exact solver repairs either.
-  if (failed(mlir::allo::scheduleSimplex(prob, lastOp, cycleTime)))
+  if (failed(
+          mlir::allo::scheduleSimplex(prob, lastOp, cycleTime, opts.regFloor)))
     return failure();
 
   // The pre-pass is schedule-independent, so taking its edges hands CP-SAT the
@@ -459,7 +466,7 @@ LogicalResult mlir::allo::scheduleCPSAT(ChainingSharedOperatorsProblem &prob,
       model.AddLessOrEqual(startVars.at(dep.getSource()) +
                                prob.latencyOf(dep.getSource()),
                            startVars.at(dep.getDestination()));
-  addChaining(model, prob, startVars, chaining);
+  addChaining(model, prob, startVars, chaining, opts.regFloor);
 
   // An op occupies one instance of every unit it links to for its whole window,
   // so a cumulative constraint per resource matches `verifyOccupancy`. A
@@ -524,7 +531,7 @@ LogicalResult mlir::allo::scheduleCPSAT(ChainingSharedOperatorsProblem &prob,
   for (Operation *op : ops)
     prob.setStartTime(op, SolutionIntegerValue(response, startVars.at(op)));
   applyAllocation(prob, readAllocation(response, allocs), /*ii=*/0);
-  return finishSchedule(prob, cycleTime);
+  return finishSchedule(prob, cycleTime, opts.regFloor);
 }
 
 //===----------------------------------------------------------------------===//
@@ -634,7 +641,7 @@ ModuloOutcome solveAtII(ChainingModuloProblem &prob, Operation *lastOp,
       model.AddLessOrEqual(startVars.at(src) + separation,
                            startVars.at(dep.getDestination()));
     }
-  addChaining(model, prob, startVars, chaining);
+  addChaining(model, prob, startVars, chaining, opts.regFloor);
 
   // One-hot congruence class per contending op. `t = ii*lap + sum(p*slot[p])`
   // defines class and modulo at once with no reification: slot[p] IS membership
@@ -740,8 +747,8 @@ LogicalResult mlir::allo::scheduleCPSAT(ChainingModuloProblem &prob,
                                         const SpanObjective &span,
                                         const SchedulerOptions &opts) {
   SimplexWarmStart warm;
-  if (failed(
-          mlir::allo::scheduleSimplex(prob, lastOp, cycleTime, minII, &warm)))
+  if (failed(mlir::allo::scheduleSimplex(prob, lastOp, cycleTime, opts.regFloor,
+                                         minII, &warm)))
     return failure();
 
   unsigned greedyII = warm.placed ? *prob.getInitiationInterval() : 0;
@@ -922,7 +929,7 @@ LogicalResult mlir::allo::scheduleCPSAT(ChainingModuloProblem &prob,
         << "Exact scheduling ran out of budget at II=" << *exhaustedAt
         << " without deciding it, so the search stopped there; what it kept is "
            "the best of the intervals it did decide";
-  return finishSchedule(prob, cycleTime);
+  return finishSchedule(prob, cycleTime, opts.regFloor);
 }
 
 #else // !ALLO_ENABLE_ORTOOLS

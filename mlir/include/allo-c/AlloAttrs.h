@@ -119,6 +119,11 @@ alloEvaluateResourceUse(MlirAttribute uses, intptr_t nParams,
                         const int64_t *params, AlloResourceUseCallback callback,
                         void *userData);
 
+/// Evaluates one `#allo.cost` at `param`, UNROUNDED. Apart from the array
+/// evaluator above because a `dcp.comb` row's DELAY is a single cost and is
+/// sub-nanosecond: rounding it to a resource count would erase it.
+MLIR_CAPI_EXPORTED double alloEvaluateCost(MlirAttribute cost, int64_t param);
+
 #ifdef __cplusplus
 }
 #endif

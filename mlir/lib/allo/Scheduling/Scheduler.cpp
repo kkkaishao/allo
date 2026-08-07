@@ -359,6 +359,7 @@ class ChainingModuloSimplexScheduler : public ModuloSimplexScheduler {
 private:
   ChainingModuloProblem &prob;
   float cycleTime;
+  float regFloor;
 
 protected:
   Problem &getProblem() override { return prob; }
@@ -372,11 +373,12 @@ protected:
 
 public:
   ChainingModuloSimplexScheduler(ChainingModuloProblem &prob, Operation *lastOp,
-                                 float cycleTime, unsigned minII = 1)
+                                 float cycleTime, float regFloor,
+                                 unsigned minII = 1)
       : ModuloSimplexScheduler(prob, lastOp, minII), prob(prob),
-        cycleTime(cycleTime) {}
+        cycleTime(cycleTime), regFloor(regFloor) {}
   LogicalResult schedule() override {
-    if (failed(mlir::allo::computeChainBreaks(prob, cycleTime,
+    if (failed(mlir::allo::computeChainBreaks(prob, cycleTime, regFloor,
                                               additionalConstraints)))
       return failure();
     if (!additionalConstraints.empty())
@@ -386,7 +388,7 @@ public:
           << " ns clock period (adding pipeline register stages / latency)";
     if (failed(ModuloSimplexScheduler::schedule()))
       return failure();
-    return computeStartTimesInCycle(prob);
+    return mlir::allo::computeStartTimesInCycle(prob, regFloor);
   }
 };
 
@@ -399,6 +401,7 @@ class ChainingSharedOperatorsSimplexScheduler
 private:
   ChainingSharedOperatorsProblem &prob;
   float cycleTime;
+  float regFloor;
 
 protected:
   Problem &getProblem() override { return prob; }
@@ -412,11 +415,12 @@ protected:
 
 public:
   ChainingSharedOperatorsSimplexScheduler(ChainingSharedOperatorsProblem &prob,
-                                          Operation *lastOp, float cycleTime)
+                                          Operation *lastOp, float cycleTime,
+                                          float regFloor)
       : SharedOperatorsSimplexScheduler(prob, lastOp), prob(prob),
-        cycleTime(cycleTime) {}
+        cycleTime(cycleTime), regFloor(regFloor) {}
   LogicalResult schedule() override {
-    if (failed(mlir::allo::computeChainBreaks(prob, cycleTime,
+    if (failed(mlir::allo::computeChainBreaks(prob, cycleTime, regFloor,
                                               additionalConstraints)))
       return failure();
     if (!additionalConstraints.empty())
@@ -426,7 +430,7 @@ public:
           << " ns clock period (adds pipeline register stages / latency)";
     if (failed(SharedOperatorsSimplexScheduler::schedule()))
       return failure();
-    return computeStartTimesInCycle(prob);
+    return mlir::allo::computeStartTimesInCycle(prob, regFloor);
   }
 };
 
@@ -436,8 +440,45 @@ public:
 // Chain breaking
 //===----------------------------------------------------------------------===//
 
+LogicalResult mlir::allo::computeStartTimesInCycle(ChainingProblem &prob,
+                                                   float regFloor) {
+  prob.clearStartTimeInCycle();
+  return handleOperationsInTopologicalOrder(prob, [&](Operation *op) {
+    // The floor, not zero: an operand reaches `op` no earlier than its own
+    // register can drive it.
+    float startTimeInCycle = regFloor;
+    unsigned startTime = *prob.getStartTime(op);
+
+    for (auto dep : prob.getDependences(op)) {
+      if (dep.isAuxiliary()) // carries no value
+        continue;
+      Operation *pred = dep.getSource();
+      auto predStartTimeInCycle = prob.getStartTimeInCycle(pred);
+      if (!predStartTimeInCycle)
+        return failure(); // a predecessor is still pending
+
+      auto predOpr = *prob.getLinkedOperatorType(pred);
+      unsigned predEnd = *prob.getStartTime(pred) + *prob.getLatency(predOpr);
+      if (predEnd < startTime)
+        continue; // registered a whole step earlier
+
+      // `pred` ends in the cycle `op` starts in. A multi-cycle producer
+      // contributes only its outgoing delay, its last register stage being what
+      // the cycle starts from; the floor already bounds that from below.
+      float predEndInCycle =
+          (*prob.getStartTime(pred) == predEnd ? *predStartTimeInCycle : 0.0f) +
+          *prob.getOutgoingDelay(predOpr);
+      startTimeInCycle = std::max(predEndInCycle, startTimeInCycle);
+    }
+
+    prob.setStartTimeInCycle(op, startTimeInCycle);
+    return success();
+  });
+}
+
 LogicalResult
 mlir::allo::computeChainBreaks(ChainingProblem &prob, float cycleTime,
+                               float regFloor,
                                SmallVectorImpl<Problem::Dependence> &result) {
   // The period is a hard constraint, so no operator may exceed it on its own.
   for (auto opr : prob.getOperatorTypes())
@@ -468,8 +509,9 @@ mlir::allo::computeChainBreaks(ChainingProblem &prob, float cycleTime,
         return failure(); // a predecessor is still pending; retry `op` later
 
     // `op` is the origin of its own chain, and every chain arriving at it is
-    // one of its combinational predecessors' extended by that predecessor.
-    chains[op][op] = 0.0f;
+    // one of its combinational predecessors' extended by that predecessor. A
+    // chain starts at the FLOOR, not at zero: its operands leave a register.
+    chains[op][op] = regFloor;
     for (auto dep : prob.getDependences(op)) {
       if (!dep.isDefUse()) // an auxiliary edge transports no value
         continue;
@@ -479,7 +521,10 @@ mlir::allo::computeChainBreaks(ChainingProblem &prob, float cycleTime,
       if (*prob.getLatency(predOpr) > 0) {
         // Registered: the chain restarts at `pred` carrying its output delay,
         // maxed against any longer chain that also reaches here through `pred`.
-        chains[op][pred] = std::max(chains[op][pred], outgoing);
+        // Against the floor too, since `pred`'s own clock-to-out IS that delay
+        // and whichever is larger is what the path really waits for.
+        chains[op][pred] =
+            std::max(chains[op][pred], std::max(regFloor, outgoing));
         continue;
       }
       for (auto [origin, delay] : chains[pred])
@@ -1891,9 +1936,10 @@ LogicalResult ChainingSharedOperatorsProblem::verify() {
 //===----------------------------------------------------------------------===//
 
 LogicalResult scheduleSimplex(ChainingModuloProblem &prob, Operation *lastOp,
-                              float cycleTime, unsigned minII,
+                              float cycleTime, float regFloor, unsigned minII,
                               SimplexWarmStart *warm) {
-  ChainingModuloSimplexScheduler simplex(prob, lastOp, cycleTime, minII);
+  ChainingModuloSimplexScheduler simplex(prob, lastOp, cycleTime, regFloor,
+                                         minII);
   if (warm)
     simplex.setPlacementAdvisory();
   LogicalResult scheduled = simplex.schedule();
@@ -1907,8 +1953,10 @@ LogicalResult scheduleSimplex(ChainingModuloProblem &prob, Operation *lastOp,
 }
 
 LogicalResult scheduleSimplex(ChainingSharedOperatorsProblem &prob,
-                              Operation *lastOp, float cycleTime) {
-  ChainingSharedOperatorsSimplexScheduler simplex(prob, lastOp, cycleTime);
+                              Operation *lastOp, float cycleTime,
+                              float regFloor) {
+  ChainingSharedOperatorsSimplexScheduler simplex(prob, lastOp, cycleTime,
+                                                  regFloor);
   return simplex.schedule();
 }
 

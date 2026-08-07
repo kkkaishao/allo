@@ -115,3 +115,8 @@ void alloEvaluateResourceUse(MlirAttribute uses, intptr_t nParams,
            llvm::ArrayRef<int64_t>(params, static_cast<size_t>(nParams))))
     callback(wrap(resource.getLeafReference().getValue()), amount, userData);
 }
+
+double alloEvaluateCost(MlirAttribute cost, int64_t param) {
+  auto attr = dyn_cast_or_null<allo::CostAttr>(unwrap(cost));
+  return attr ? attr.evaluate(param) : 0.0;
+}

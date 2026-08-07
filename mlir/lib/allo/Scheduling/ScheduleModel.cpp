@@ -17,9 +17,19 @@ using namespace mlir::allo::dcp;
 
 namespace {
 // The arith mnemonic an IP operator's ABSTRACT kind (`add`/`div`/...) came
-// from. IP compute is always floating-point, and an unmapped kind (a cast, say)
-// already reads as its own mnemonic.
-StringRef ipMnemonic(StringRef kind) {
+// from. The suffix follows the OPERANDS and not the kind: an integer multiply
+// or divide binds to a core here too, so `mul` reads as `muli` exactly as
+// readily as `mulf`. An unmapped kind already reads as its own mnemonic, which
+// covers the casts and the integer divides, since those bind by MLIR mnemonic
+// (`divsi`) rather than by abstract kind in the first place.
+StringRef ipMnemonic(StringRef kind, bool isFloat) {
+  if (!isFloat)
+    return llvm::StringSwitch<StringRef>(kind)
+        .Case("add", "addi")
+        .Case("sub", "subi")
+        .Case("mul", "muli")
+        .Case("cmp", "cmpi")
+        .Default(kind);
   return llvm::StringSwitch<StringRef>(kind)
       .Case("add", "addf")
       .Case("sub", "subf")
@@ -36,8 +46,15 @@ StringRef ipMnemonic(StringRef kind) {
 // to its abstract kind.
 std::string opKind(Operation *op, const llvm::StringMap<StringRef> &kinds) {
   if (auto compute = dyn_cast<DCPathComputeOp>(op)) {
-    if (std::optional<StringRef> sym = compute.getOpType())
-      return ipMnemonic(kinds.lookup(*sym)).str();
+    if (std::optional<StringRef> sym = compute.getOpType()) {
+      // The OPERAND's type, not the result's: a compare answers in `i1`
+      // whatever it compared.
+      Type t = compute->getNumOperands() ? compute->getOperand(0).getType()
+                                         : compute->getResult(0).getType();
+      if (auto shaped = dyn_cast<ShapedType>(t))
+        t = shaped.getElementType();
+      return ipMnemonic(kinds.lookup(*sym), isa<FloatType>(t)).str();
+    }
     assert(compute.getCombKind() && "a compute takes one realization path");
     return stringifyCombOpKindEnum(*compute.getCombKind()).str();
   }

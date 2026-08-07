@@ -287,7 +287,19 @@ unsigned muxLevels(unsigned sources) {
 }
 
 double muxLevelDelay(const OperatorLibrary &lib) {
-  return lib.combDelay(OpKind::Or);
+  // At ONE bit: every bit of an OR level settles in parallel, so the tree's
+  // WIDTH buys mux LUTs (`set_mux_uses`) rather than levels.
+  //
+  // The FULL row delay and not the marginal one, which is a measurement and not
+  // a derivation: a level of a wide one-hot select pays routing comparable to a
+  // whole register-to-register hop, not the LUT hop a narrow cone pays. On
+  // u55c a 3-level 32-bit select measured 1.99 ns, against 1.45 ns for three
+  // full rows and 0.21 ns for three marginal ones.
+  //
+  // Even so this UNDER-predicts a wide select by about 1.4x, because the delay
+  // of a mux level grows with the data width and `muxLevels` does not see it
+  // (1-bit 8:1 measured 0.65 ns against 32-bit 8:1's 1.99 ns).
+  return lib.combDelay(OpKind::Or, 1);
 }
 
 /// The delay `u`'s inputs must settle within, read from the same library row
@@ -297,8 +309,13 @@ static double unitInDelay(const FuncUnit &u, const OperatorLibrary &lib) {
   // too (`lookup`): a shift by a literal renames bits and costs nothing.
   if (isBitRename(u.repOp()))
     return 0.0;
+  // The MARGINAL delay, because `z` is what this is subtracted from and `z`
+  // already carries the register floor: the solve seeds every start-in-cycle at
+  // it (`computeStartTimesInCycle`). Charging the full row here would spend the
+  // floor twice and report a unit as over-period by up to one floor while the
+  // schedule it came from was feasible.
   if (u.identity.comb)
-    return lib.combDelay(*u.identity.comb);
+    return lib.combMarginalDelay(*u.identity.comb, combParamWidth(u.repOp()));
   auto opr = SymbolTable::lookupNearestSymbolFrom<dcp::DCPathOperatorOp>(
       u.repOp(), cast<dcp::DCPathComputeOp>(u.repOp()).getOpTypeAttr());
   assert(opr && "an IP unit names a live dcp.operator");

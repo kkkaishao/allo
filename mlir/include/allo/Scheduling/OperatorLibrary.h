@@ -74,12 +74,25 @@ struct OperatorEntry {
 
   uint32_t latency = 0;  // cycles
   bool pipelined = true; // accepts a new input every cycle
-  double inDelay = 0.0;  // ns
+  double inDelay = 0.0;  // ns, IP rows: the signature pins the width
   double outDelay = 0.0;
+  /// Comb rows: the delay as a function of the operand width, since a native
+  /// operator is built at whatever width its operands carry. Null on an IP row,
+  /// whose signature fixes one width and so one delay.
+  CostAttr delay;
   std::string symbol; // the injected `dcp.operator` sym_name (IP rows only).
   ArrayAttr uses;     // what one instance spends, null where the device is
                       // silent (see `OperatorLibrary::priceOf`).
 };
+
+/// The width one operator row is characterized at for \p op: its widest INTEGER
+/// OR FLOAT operand, falling back to the result when it takes none.
+///
+/// The operand and not the result, which is what `dcp.comb`'s one parameter is
+/// documented to be: a 32-bit compare produces one bit and builds thirty-two
+/// LUTs, so pricing it at its result width reports a compare that costs and
+/// delays nothing.
+int64_t combParamWidth(Operation *op);
 
 /// What a scheduling problem registers for ONE node: the operator type it runs
 /// under, and the timing that type carries. The shape the three kinds of node
@@ -139,15 +152,27 @@ public:
   /// into primitive arith otherwise.
   bool hasDirectRealization(Operation *op) const;
 
-  /// The chaining delay of the device's combinational row for \p kind, or 0.0
-  /// when the device declares none. For a caller with no `Operation *` to hand
-  /// `lookup` (`addressDelaysOf`).
-  double combDelay(OpKind kind) const;
+  /// The fabric's register-to-register floor (ns): what a path with no operator
+  /// in it costs. Every measured combinational delay includes it, and a cycle
+  /// pays it once however many operators chain within it.
+  double registerFloor() const { return regFloor; }
 
-  /// The same, for a caller holding a reified realization (a `dcp.compute`'s
-  /// `comb_kind`). Falls back to the DEFAULT row, not to 0.0, so an
-  /// `affine.apply` is priced the way it was scheduled.
-  double combDelay(CombOpKindEnum kind) const;
+  /// The delay from a REGISTER through one instance of \p kind at \p width
+  /// bits: the floor plus the operator's own. What an operator's inputs must
+  /// have settled within, and so what a row contributes as an INCOMING delay.
+  /// 0.0 when the device declares no row for \p kind.
+  double combDelay(OpKind kind, int64_t width) const;
+
+  /// What one instance of \p kind at \p width ADDS to a path that already left
+  /// a register: \ref combDelay less the floor, never negative. What a CHAINED
+  /// operator costs, and so what a row contributes as an OUTGOING delay.
+  double combMarginalDelay(OpKind kind, int64_t width) const;
+
+  /// The same two, for a caller holding a reified realization (a
+  /// `dcp.compute`'s `comb_kind`). Falls back to the DEFAULT row, not to 0.0,
+  /// so an `affine.apply` is priced the way it was scheduled.
+  double combDelay(CombOpKindEnum kind, int64_t width) const;
+  double combMarginalDelay(CombOpKindEnum kind, int64_t width) const;
 
   //===--------------------------------------------------------------------===//
   // Area, in the objective's currency.
@@ -193,6 +218,7 @@ private:
   llvm::StringMap<int64_t> resourcePrices; // one `dcp.resource`, priced
   ArrayAttr muxUses;                       // `dcp.mux`, over (k, width)
   ArrayAttr chainUses;                     // `dcp.chain`, over (depth, width)
+  double regFloor = 0.0;                   // `dcp.device`'s `reg_delay`
 };
 
 /// The device as the compiler reads it: what it can COMPUTE and what it can

@@ -156,6 +156,14 @@ NB_MODULE(_allo, m) {
       nb::arg("uses"), nb::arg("params"),
       "What an #allo.res_use array spends at a realization's parameter tuple, "
       "as (resource, amount) pairs.");
+  allo.def(
+      "evaluate_cost",
+      [](MlirAttribute cost, int64_t param) {
+        return alloEvaluateCost(cost, param);
+      },
+      nb::arg("cost"), nb::arg("param"),
+      "One #allo.cost at one parameter, unrounded: what a `dcp.comb` row's "
+      "delay is at an operand width.");
 
   //===--------------------------------------------------------------------===//
   // schedule

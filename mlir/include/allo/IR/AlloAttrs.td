@@ -278,12 +278,15 @@ def CostQuadratic : I32EnumAttrCase<"Quadratic", 2, "quadratic">;
 def CostStep      : I32EnumAttrCase<"Step",      3, "step">;
 // Measured point by point: coeffs is [p0, v0, p1, v1, ...] ascending in p, and
 // a parameter between two points takes the lower one's value.
+//
+// A STAIRCASE, which fits a quantity that really is piecewise constant (an SRL
+// chain occupies ceil(depth/32) sites, which at depth 40 is 2). A CONTINUOUS
+// quantity sampled into one is UNDER-STATED between points, which is the
+// dangerous direction for a timing model nothing downstream re-checks; every
+// combinational delay row is such a quantity today, and the fix owed is a
+// structural form a device can declare, not an interpolation rule applied on
+// its behalf.
 def CostTable     : I32EnumAttrCase<"Table",     4, "table">;
-// ceil(product of the WHOLE parameter tuple / coeffs[0]), the shape of a tiled
-// memory: a BRAM tile holds 36864 bits however the `depth x width` array is
-// cut, so the product sits inside the ceiling and does not separate into one
-// factor per parameter. The one form that breaks the rule above, which is why
-// it is a case rather than a linear over depth times a linear over width.
 def CostTiled     : I32EnumAttrCase<"Tiled",     5, "tiled">;
 def CostFormEnum : I32EnumAttr<"CostFormEnum",
     "Shape of a resource cost as a function of one parameter",

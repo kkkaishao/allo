@@ -38,7 +38,9 @@ from _common import (
     _iis,
     _latency,
     FADD,
-    COMB,
+    comb_ns,
+    comb_step_ns,
+    REG_NS,
     PERIOD_NS,
 )  # noqa: E402
 
@@ -152,9 +154,14 @@ def test_an_operator_declares_what_its_core_spends():
         return a + b
 
     text = _to_rtl(addk).dcp
-    assert "allo.dcp.operator @add_f32_f32_f32_l7" in text
+    core = "add_f32_f32_f32_l7"
+    assert f"allo.dcp.operator @{core}" in text
     scope = default_device.name  # the device the reference reaches through
-    assert f"#allo.res_use<@{scope}::@lut, [<const, [2.470000e+02]>]>" in text
+    # The count is the DEVICE's, read back rather than restated: what this
+    # pins is that the reference resolves through the device symbol, not what
+    # one core happens to cost this week.
+    luts = dict(default_device.operator_uses[core])["lut"][0].coeffs[0]
+    assert f"#allo.res_use<@{scope}::@lut, [<const, [{luts:.6e}]>]>" in text
 
 
 # A cost is a SUM of product terms, so a measured shape that is a sum can be
@@ -600,7 +607,10 @@ def test_behavior_language_follows_the_domain():
 
     i128, wadd = _wide_add_ip(128)
 
-    @operator_ip(optype=OperatorType.MUL, latency=2, pipelined=True, style="ce")
+    # A latency the built-in i32 multiply core does not already occupy: a
+    # symbol names one piece of hardware, so two cores of the same kind and
+    # signature are told apart by their depth.
+    @operator_ip(optype=OperatorType.MUL, latency=3, pipelined=True, style="ce")
     def imul(a: i32, b: i32) -> i32: ...
 
     imul.add_c_model("a * b")
@@ -910,7 +920,8 @@ def test_disjoint_or_is_a_concatenation():
     spaced = _or_offsets(overlapping)
     assert len(spaced) == 3
     assert all(
-        b - a == pytest.approx(COMB["or"], abs=1e-3) for a, b in zip(spaced, spaced[1:])
+        b - a == pytest.approx(comb_step_ns("or"), abs=1e-3)
+        for a, b in zip(spaced, spaced[1:])
     )
 
     rng = np.random.default_rng(2)
@@ -951,8 +962,11 @@ def test_literal_shift_is_wiring():
     assert len(_sched(literal).func("literal").regions[0].ops) == len(
         _sched(runtime).func("runtime").regions[0].ops
     )
-    # Tight enough that the shifter's delay forces a cut the wiring does not.
-    assert _latency(literal, freq_mhz=700) < _latency(runtime, freq_mhz=700)
+    # The device's own clock already tells the two apart, and the premise is
+    # read off the device rather than assumed: a runtime shift costs a barrel
+    # shifter's step and forces cuts a literal one, costing nothing, does not.
+    assert comb_step_ns("shl") > 0
+    assert _latency(literal) < _latency(runtime)
 
     rng = np.random.default_rng(4)
     A = rng.integers(0, 2**32, 16, dtype=np.uint64).astype(np.uint32)
@@ -1045,9 +1059,15 @@ def test_shared_mux_delay_accumulates_along_a_chain():
         ref[i + 2], ref[i + 3] = a0 + b0, a1 + b1
 
     # The schedule itself moves with the clock (chaining cuts elsewhere, `z`
-    # lands elsewhere), so the fold COUNT is no invariant; that a plan exists at
-    # every one of them is.
-    for freq in (200, 300, 500):
+    # lands elsewhere), so the fold COUNT is no invariant; that a plan exists
+    # wherever the datapath itself does is. Stated against the trivial binding
+    # rather than a list of clocks the device happens to hold: sharing must
+    # never be the thing that refuses a clock one unit per operation accepts.
+    for freq in (200, 300, 400, 450, 500):
+        try:
+            _to_rtl(chain, binding="trivial", freq_mhz=freq).mlir
+        except RuntimeError:
+            continue  # a clock this kernel cannot hold however it is bound
         _to_rtl(chain, binding="greedy-share", freq_mhz=freq).mlir
     assert _shared_units(_to_rtl(chain, binding="greedy-share"))
     for mod in (_to_rtl(chain), _to_rtl(chain, binding="greedy-share")):
@@ -1221,7 +1241,7 @@ def test_reassociate_int_reduction_recurrence():
     # chain would leave on it. The recurrence is what bounds the II, so a tree
     # fits in a span a chain could not: this is measured against the device
     # rather than pinned, so a faster multiply keeps it honest.
-    assert region.interval * PERIOD_NS < 4 * COMB["mul"]
+    assert region.interval * PERIOD_NS < REG_NS + 4 * comb_step_ns("mul")
 
 
 # Bit growth types an expression at its natural width and applies the declared

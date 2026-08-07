@@ -465,8 +465,13 @@ static LogicalResult verifyUsesResolve(Operation *op, ArrayAttr uses,
 }
 
 LogicalResult DCPathCombOp::verify() {
-  if (getDelay().convertToDouble() < 0.0)
-    return emitOpError("delay must be non-negative");
+  // Over the widths a design can carry rather than symbolically: the forms are
+  // piecewise and a table's value between two points is the lower point's, so
+  // "non-negative everywhere" is not a property of the coefficients.
+  for (int64_t w : {1, 8, 16, 32, 64})
+    if (getDelay().evaluate(w) < 0.0)
+      return emitOpError("delay must be non-negative, but is ")
+             << getDelay().evaluate(w) << " ns at width " << w;
   return verifyResourceUses(*this, getUsesAttr(), 1,
                             "one parameter (an operand width)");
 }

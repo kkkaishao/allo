@@ -1043,7 +1043,10 @@ def test_stream_shell_freeze_is_token_exact():
     def fz_put(x_in: Stream[i32], y_out: Stream[i32]):
         for i in range(n, name="i"):
             v: i32 = x_in.get()
-            y_out.put(v * 3 + 7)
+            # `3v` as adds and not a multiply: an integer multiply binds to a
+            # DSP core here, and its latency would move the put off the phase
+            # this case is about.
+            y_out.put(v + v + v + 7)
 
     s = fz_put.schedule()
     s.pipeline("i", ii=2)  # put lands at stage 2 == 0 (mod II)

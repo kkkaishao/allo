@@ -5,7 +5,20 @@
 
 from __future__ import annotations
 
-from ....lang import f32, f64, bf16, i32, bool as _bool
+from ....lang import (
+    f32,
+    f64,
+    bf16,
+    i8,
+    i16,
+    i32,
+    i64,
+    u8,
+    u16,
+    u32,
+    u64,
+    bool as _bool,
+)
 from ....lang.ip import operator_ip, OperatorType
 
 # An `@operator_ip` body is `...`: the parameters exist to declare the
@@ -85,6 +98,98 @@ def fcvt(a: f32) -> f64: ...
 def bf2f(a: bf16) -> f32: ...
 
 
+# Integer multiply. `arith.muli` on `iN` keeps the LOW N bits, and those bits
+# are the same for a signed and an unsigned product, so one core serves both
+# and the abstract kind is enough to select it.
+@operator_ip(optype=OperatorType.MUL, **_ARCHETYPE)
+def imul8(a: i8, b: i8) -> i8: ...
+
+
+@operator_ip(optype=OperatorType.MUL, **_ARCHETYPE)
+def imul16(a: i16, b: i16) -> i16: ...
+
+
+@operator_ip(optype=OperatorType.MUL, **_ARCHETYPE)
+def imul32(a: i32, b: i32) -> i32: ...
+
+
+@operator_ip(optype=OperatorType.MUL, **_ARCHETYPE)
+def imul64(a: i64, b: i64) -> i64: ...
+
+
+# Integer divide and remainder. Here signedness is NOT a detail of how the
+# result is read: `divsi` and `divui` compute different numbers and Xilinx
+# builds them from different cores. The abstract kind cannot separate them,
+# because MLIR's `i32` is signless and both classify as `div`, so each binds by
+# its own MLIR MNEMONIC instead -- which is what a string `optype` already
+# means, the same route the advanced math cores take.
+#
+# Their AREAS, by contrast, differ by under 8% in LUTs and under 1% in FFs, so
+# a fabric prices the pair from one measurement rather than two.
+@operator_ip(optype="divsi", **_ARCHETYPE)
+def idiv8(a: i8, b: i8) -> i8: ...
+
+
+@operator_ip(optype="divsi", **_ARCHETYPE)
+def idiv16(a: i16, b: i16) -> i16: ...
+
+
+@operator_ip(optype="divsi", **_ARCHETYPE)
+def idiv32(a: i32, b: i32) -> i32: ...
+
+
+@operator_ip(optype="divsi", **_ARCHETYPE)
+def idiv64(a: i64, b: i64) -> i64: ...
+
+
+@operator_ip(optype="divui", **_ARCHETYPE)
+def udiv8(a: u8, b: u8) -> u8: ...
+
+
+@operator_ip(optype="divui", **_ARCHETYPE)
+def udiv16(a: u16, b: u16) -> u16: ...
+
+
+@operator_ip(optype="divui", **_ARCHETYPE)
+def udiv32(a: u32, b: u32) -> u32: ...
+
+
+@operator_ip(optype="divui", **_ARCHETYPE)
+def udiv64(a: u64, b: u64) -> u64: ...
+
+
+@operator_ip(optype="remsi", **_ARCHETYPE)
+def irem8(a: i8, b: i8) -> i8: ...
+
+
+@operator_ip(optype="remsi", **_ARCHETYPE)
+def irem16(a: i16, b: i16) -> i16: ...
+
+
+@operator_ip(optype="remsi", **_ARCHETYPE)
+def irem32(a: i32, b: i32) -> i32: ...
+
+
+@operator_ip(optype="remsi", **_ARCHETYPE)
+def irem64(a: i64, b: i64) -> i64: ...
+
+
+@operator_ip(optype="remui", **_ARCHETYPE)
+def urem8(a: u8, b: u8) -> u8: ...
+
+
+@operator_ip(optype="remui", **_ARCHETYPE)
+def urem16(a: u16, b: u16) -> u16: ...
+
+
+@operator_ip(optype="remui", **_ARCHETYPE)
+def urem32(a: u32, b: u32) -> u32: ...
+
+
+@operator_ip(optype="remui", **_ARCHETYPE)
+def urem64(a: u64, b: u64) -> u64: ...
+
+
 # pylint: enable=unused-argument
 
 #: Every archetype, so a fabric's table can be checked against the catalog
@@ -107,4 +212,24 @@ CATALOG = (
     f2i,
     fcvt,
     bf2f,
+    imul8,
+    imul16,
+    imul32,
+    imul64,
+    idiv8,
+    idiv16,
+    idiv32,
+    idiv64,
+    udiv8,
+    udiv16,
+    udiv32,
+    udiv64,
+    irem8,
+    irem16,
+    irem32,
+    irem64,
+    urem8,
+    urem16,
+    urem32,
+    urem64,
 )
