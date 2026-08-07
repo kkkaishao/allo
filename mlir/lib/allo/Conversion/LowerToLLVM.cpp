@@ -31,7 +31,7 @@ struct StripSchedulingHintsPass
     // Collect first: erasing mid-walk invalidates the iteration.
     SmallVector<Operation *> hints;
     getOperation()->walk([&](Operation *op) {
-      if (isa<AssumeNoDepOp, AssumeSSAOp>(op))
+      if (isa<AssumeNoDepOp, AssumeSSAOp, VolatileOp>(op))
         hints.push_back(op);
     });
     for (Operation *hint : hints)

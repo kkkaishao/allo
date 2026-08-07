@@ -37,6 +37,16 @@ namespace mlir::allo {
 /// emitter and the scheduler price against it.
 inline constexpr unsigned kIndexWidth = 32;
 
+/// The bits a value of type \p t occupies in the datapath: `index` at
+/// `kIndexWidth`, since it carries no width of its own; a float as its bit
+/// pattern; an integer verbatim.
+///
+/// The single width rule: the model is value-typed while the emitted carrier is
+/// a bit vector, so the operator pricing (`combParamWidth`), the emitter
+/// (`uarch::datapathType`) and the boundary port model (`iface`) read one
+/// answer.
+unsigned datapathWidth(mlir::Type t);
+
 //===----------------------------------------------------------------------===//
 // Memory timing library: the `memory:` section of the device file. Read/write
 // latency and delay per storage implementation, plus one FIFO (stream) timing.

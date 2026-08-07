@@ -8,7 +8,7 @@
 
 #include "allo/IR/AlloOps.h"
 #include "allo/Scheduling/OperatorLibrary.h" // unit input delay
-#include "allo/Support/BitAnalysis.h"        // isBitRename
+#include "allo/Support/BitAnalysis.h"
 
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/Support/raw_ostream.h"
@@ -67,14 +67,6 @@ llvm::StringRef shapeName(RegionBlock::Shape s) {
     return "callnode";
   }
   llvm_unreachable("unhandled RegionBlock::Shape");
-}
-
-unsigned hwWidth(Type t) {
-  if (isa<IndexType>(t))
-    return kIndexWidth;
-  if (auto f = dyn_cast<FloatType>(t))
-    return f.getWidth();
-  return cast<IntegerType>(t).getWidth();
 }
 
 Operation *Datapath::producingOp(const Source &s) const {
@@ -301,8 +293,8 @@ double muxLevelDelay(const OperatorLibrary &lib) {
 /// the scheduler priced it against.
 static double unitInDelay(const FuncUnit &u, const OperatorLibrary &lib) {
   // The one exception the library row does not carry, which the scheduler takes
-  // too (`lookup`): a shift by a literal renames bits and costs nothing.
-  if (isBitRename(u.repOp()))
+  // too (`lookup`): an op that renames bits rather than computing them.
+  if (isZeroDelay(u.repOp()))
     return 0.0;
   // The marginal delay: this is subtracted from `z`, which already carries the
   // register floor the solve seeds every start-in-cycle at

@@ -15,10 +15,6 @@ using namespace mlir::allo::uarch;
 namespace mlir::allo::iface {
 
 namespace {
-// The boundary carries a value exactly as wide as the datapath does, so the
-// port model reuses the datapath's width rule rather than restating it.
-using uarch::hwWidth;
-
 int argOf(Value v) {
   auto ba = dyn_cast<BlockArgument>(v);
   return ba ? (int)ba.getArgNumber() : -1;
@@ -43,14 +39,14 @@ ModuleInterface::ModuleInterface(const uarch::Datapath &dp) {
   // entry, declared further down.
   for (const uarch::IOPort &io : dp.ios)
     scalars.push_back(
-        {argOf(io.value), hwWidth(io.type), scalarPortName(dp, io)});
+        {argOf(io.value), datapathWidth(io.type), scalarPortName(dp, io)});
 
   for (const uarch::StreamChannel &s : dp.streams) {
     if (s.internal)
       continue; // kernel-local: a seq.fifo in the body, not a boundary port
     auto base = streamPortBase(dp, s);
     streams.push_back({argOf(s.stream), s.isInput, (int)s.depth,
-                       hwWidth(s.payload), base, portData(base),
+                       datapathWidth(s.payload), base, portData(base),
                        portValid(base), portReady(base)});
   }
 
@@ -65,7 +61,7 @@ ModuleInterface::ModuleInterface(const uarch::Datapath &dp) {
     for (const uarch::MemUnit::ElemPort &p : mu.elemPorts)
       elems.push_back({p.in, p.out, p.we});
     registers.push_back({argOf(mu.memref),
-                         hwWidth(mt.getElementType()),
+                         datapathWidth(mt.getElementType()),
                          {shape.begin(), shape.end()},
                          std::move(elems)});
   }
@@ -76,7 +72,7 @@ ModuleInterface::ModuleInterface(const uarch::Datapath &dp) {
     const auto &mu = dp.mems[r.id];
     const auto &acc = mu.accesses[r.idx];
     unsigned w =
-        hwWidth(cast<MemRefType>(mu.memref.getType()).getElementType());
+        datapathWidth(cast<MemRefType>(mu.memref.getType()).getElementType());
     int factor = externalBank(mu, acc).factor;
     unsigned lat = write ? mu.writeLatency : mu.readLatency;
     auto [shape, axes] = layoutOf(mu);
@@ -105,7 +101,7 @@ ModuleInterface::ModuleInterface(const uarch::Datapath &dp) {
       // group per bank.
       const auto &mu = dp.mems[ma.mem];
       unsigned w =
-          hwWidth(cast<MemRefType>(mu.memref.getType()).getElementType());
+          datapathWidth(cast<MemRefType>(mu.memref.getType()).getElementType());
       const auto &base = ma.topBase;
       auto [shape, axes] = layoutOf(mu);
       Memory m{argOf(mu.memref),
@@ -125,7 +121,7 @@ ModuleInterface::ModuleInterface(const uarch::Datapath &dp) {
     }
 
   for (const uarch::Result &r : dp.results)
-    results.push_back({hwWidth(r.type), r.name});
+    results.push_back({datapathWidth(r.type), r.name});
 }
 
 llvm::SmallVector<const Memory *, 2>

@@ -70,13 +70,13 @@ declareOperatorModules(dcp::DCPathModuleOp func, const uarch::Datapath &dp,
     Operation *srcOp = u.repOp();
     assert(u.inputs.size() == srcOp->getNumOperands() &&
            "IP unit input count must match its bound op's operand count");
-    IntegerType outW = hwType(u.identity.resultType, b);
+    IntegerType outW = datapathType(u.identity.resultType, b);
     std::string modName = operatorModuleName(u);
     iface::Operator entry{
         modName, u.identity.ipSymbol, operatorPredicate(u), {}};
     SmallVector<PortInfo> ep;
     for (unsigned k = 0; k < u.inputs.size(); ++k) {
-      IntegerType w = hwType(srcOp->getOperand(k).getType(), b);
+      IntegerType w = datapathType(srcOp->getOperand(k).getType(), b);
       std::string pn(1, static_cast<char>('a' + k));
       ep.push_back({{StringAttr::get(ctx, pn), w, Dir::Input}});
       entry.ports.push_back({pn, w.getWidth(), iface::Operator::Role::Data});
@@ -112,7 +112,7 @@ declareModulePorts(const iface::ModuleInterface &model, OpBuilder &b) {
   auto *ctx = b.getContext();
   Type i1 = b.getI1Type(), i32 = b.getIntegerType(32);
   // A data port's hw width is its field bit width, so `iType(w)` reproduces
-  // `hwType`/`memElemType` for the data ports.
+  // `datapathType`/`memElemType` for the data ports.
   auto iType = [&](unsigned w) -> Type { return b.getIntegerType(w); };
   SmallVector<PortInfo> ports;
   // The port names are the manifest, authored before CIRCT's LegalizeNames
@@ -222,7 +222,7 @@ llvm::StringMap<Value> instantiateChild(OpBuilder &b, Location loc,
 /// A child instance's registers live in the child's body and are not walked.
 static unsigned compRegBits(hw::HWModuleOp mod) {
   unsigned bits = 0;
-  mod.walk([&](seq::CompRegOp r) { bits += hwWidth(r.getResult().getType()); });
+  mod.walk([&](seq::CompRegOp r) { bits += datapathWidth(r.getResult().getType()); });
   return bits;
 }
 

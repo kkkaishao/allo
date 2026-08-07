@@ -8,6 +8,7 @@
 #include "allo/Scheduling/LatencyModel.h"
 #include "allo/Support/Logging.h"
 
+#include "mlir/Dialect/Affine/Analysis/LoopAnalysis.h" // getConstantTripCount
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
@@ -140,7 +141,10 @@ SmallVector<SchedRegion> mlir::allo::enumerateRegions(Block &block) {
   };
 
   for (Operation &op : block) {
-    if (op.hasTrait<OpTrait::IsTerminator>())
+    // Neither a terminator nor a `volatile` marker is work to schedule, and
+    // neither splits the run it sits in. Leaving the marker out of every span
+    // is what makes a boundary value escape the span computing it.
+    if (op.hasTrait<OpTrait::IsTerminator>() || isa<VolatileOp>(&op))
       continue;
     // A loop, or an `if` that survived if-conversion, is its own region: the
     // scheduler recurses into it rather than flattening it into a span.
@@ -201,6 +205,26 @@ bool mlir::allo::loopBodyDecomposes(LoopLikeOpInterface loop) {
          }).wasInterrupted())
       return true;
   return enumerateRegions(loop.getLoopRegions().front()->front()).size() > 1;
+}
+
+EntryCone mlir::allo::entryConeOf(Operation *anchor) {
+  auto marker = dyn_cast_or_null<VolatileOp>(anchor->getPrevNode());
+  if (!marker)
+    return {};
+  ValueRange values = marker.getValues();
+  EntryCone cone;
+  unsigned slot = 0;
+  if (auto loop = dyn_cast<affine::AffineForOp>(anchor)) {
+    if (!loop.hasConstantLowerBound())
+      cone.lower = values[slot++];
+    if (!affine::getConstantTripCount(loop))
+      cone.upper = values[slot++];
+  } else if (isa<affine::AffineIfOp>(anchor)) {
+    cone.predicate = values[slot++];
+  }
+  assert(slot == values.size() &&
+         "the marker carries exactly the boundaries its anchor still needs");
+  return cone;
 }
 
 SmallVector<SchedRegion> mlir::allo::enumerateRegions(func::FuncOp func) {

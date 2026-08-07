@@ -46,6 +46,25 @@ SmallVector<SchedRegion> enumerateRegions(Block &block);
 /// straight-line runs).
 SmallVector<SchedRegion> enumerateRegions(func::FuncOp func);
 
+/// What a region's own boundary expression evaluates to: a counted loop's
+/// runtime bounds, a guard's predicate. An entry the anchor does not need (a
+/// constant bound, an `scf` region carrying its bound as an operand already)
+/// stays null.
+struct EntryCone {
+  Value lower, upper;
+  Value predicate;
+};
+
+/// \p anchor's boundary values, read off the `allo.volatile` marker that
+/// `expand-region-bounds` placed immediately before it. Which slots the marker
+/// carries follows from the anchor's own maps, so this asks the same two
+/// questions the pass asked and takes the values in that order.
+///
+/// A marker rather than an operand of the anchor: an `affine.for` bound and an
+/// `affine.if` set take valid affine symbols, which arith is not, and leaving
+/// the two untouched keeps the dependence analysis exact.
+EntryCone entryConeOf(Operation *anchor);
+
 /// A region's controller shape. The reifier reads it to charge a region's
 /// boundary cost, the emitter reads it to pick a controller family.
 enum class RegionShape {

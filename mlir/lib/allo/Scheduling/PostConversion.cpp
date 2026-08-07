@@ -325,15 +325,12 @@ static Value dynamicTripBound(LoopLikeOpInterface loop) {
   return scfLoop ? scfLoop.getUpperBound() : Value();
 }
 
-// The value the scheduler's expansion of \p af's bound map settled on, itself
+// The value `expand-region-bounds` reified \p af's bound map into, itself
 // scheduled and cut against the clock like any other operation.
-static Value scheduledBound(ScheduleModel &model, AffineForOp af,
-                            bool isLower) {
-  const ScheduleModel::EntryCone *cone = model.entryConeOf(af.getOperation());
-  assert(cone && "a loop with a runtime bound carries the scheduler's "
-                 "expansion of it");
-  Value bound = isLower ? cone->lower : cone->upper;
-  assert(bound && "the scheduler expanded the other bound of this loop");
+static Value scheduledBound(AffineForOp af, bool isLower) {
+  EntryCone cone = entryConeOf(af.getOperation());
+  Value bound = isLower ? cone.lower : cone.upper;
+  assert(bound && "a loop with a runtime bound carries a marker holding it");
   return bound;
 }
 
@@ -413,7 +410,7 @@ static DCPathPipelineOp materializeLoopToPipeline(const RegionAttrs &r,
   Value dynamicBound;
   if (!constantTripOf(loop)) {
     if (auto af = dyn_cast<AffineForOp>(loopOp))
-      dynamicBound = scheduledBound(model, af, /*isLower=*/false);
+      dynamicBound = scheduledBound(af, /*isLower=*/false);
     else
       dynamicBound = dynamicTripBound(loop);
   }
@@ -425,7 +422,7 @@ static DCPathPipelineOp materializeLoopToPipeline(const RegionAttrs &r,
   // operand, which lbStepOf defaulted to 0.
   if (auto af = dyn_cast<AffineForOp>(loopOp))
     if (!af.hasConstantLowerBound())
-      bounds.lbVal = scheduledBound(model, af, /*isLower=*/true);
+      bounds.lbVal = scheduledBound(af, /*isLower=*/true);
   std::optional<int64_t> lbAttr, stepAttr;
   if (!bounds.lbVal && bounds.lb != 0)
     lbAttr = bounds.lb;
@@ -510,15 +507,13 @@ static void materializeSequential(const RegionAttrs &r,
   for (Operation *op : hoisted)
     op->moveBefore(work.front());
 
-  // A boundary value has no USE outside the span: a loop bound and a guard
-  // predicate reach their region through the model, neither being expressible
-  // as an affine operand. `spanEscapingValues` selects the same set.
+  // `spanEscapingValues` selects the same set, so the region's completion waits
+  // for exactly what the solve charged.
   llvm::SmallPtrSet<Operation *, 8> inRegion(work.begin(), work.end());
   SmallVector<Value> escaping;
   for (Operation *op : work)
     for (Value res : op->getResults())
-      if (model.isEntryValue(res) ||
-          llvm::any_of(res.getUsers(),
+      if (llvm::any_of(res.getUsers(),
                        [&](Operation *u) { return !inRegion.contains(u); }))
         escaping.push_back(res);
 
@@ -542,10 +537,10 @@ static void materializeSequential(const RegionAttrs &r,
       escaping, [&](Value v) { return map.lookupOrDefault(v); }));
   DCPathUnconditionOp::create(b, loc, yields);
 
-  for (auto [orig, res] : llvm::zip(escaping, seq.getResults())) {
-    model.replaceEntryValue(orig, res);
+  // A boundary value's `volatile` marker is one of the uses this rewires, so
+  // its anchor reads the region's result rather than the wrapped computation.
+  for (auto [orig, res] : llvm::zip(escaping, seq.getResults()))
     orig.replaceAllUsesWith(res);
-  }
   for (Operation *op : llvm::reverse(work))
     eraseScheduled(model, op);
 }
@@ -710,6 +705,9 @@ struct Reifier {
       return;
     }
     Operation *anchor = region.anchor();
+    // The boundary marker lives until the materialization below has read it
+    // off, and no longer than that.
+    auto marker = dyn_cast_or_null<VolatileOp>(anchor->getPrevNode());
     if (isa<AffineForOp, scf::ForOp>(anchor)) {
       materializeCountedLoop(cast<LoopLikeOpInterface>(anchor));
     } else if (auto w = dyn_cast<scf::WhileOp>(anchor)) {
@@ -734,18 +732,19 @@ struct Reifier {
           materializeBlock(branch.front());
       OpBuilder b(anchor);
       // An `scf.if` carries its condition as an operand; an `affine.if` has an
-      // integer set, which the scheduler expanded and cut against the clock.
+      // integer set, reified beside it and cut against the clock like any other
+      // computation.
       Value cond;
       if (auto sif = dyn_cast<scf::IfOp>(anchor)) {
         cond = sif.getCondition();
       } else {
-        const ScheduleModel::EntryCone *cone = model.entryConeOf(anchor);
-        assert(cone && cone->predicate &&
-               "a guard carries the scheduler's expansion of its set");
-        cond = cone->predicate;
+        cond = entryConeOf(anchor).predicate;
+        assert(cond && "a guard carries a marker holding its predicate");
       }
       closeIntoDcpSelect(b, anchor, cond);
     }
+    if (marker)
+      marker->erase();
   }
 
   // Close a scheduled if, branches already materialized, into a dcp.select with
@@ -849,7 +848,7 @@ struct Reifier {
 static void verifyDcpClosed(ModuleOp module) {
   module.walk([&](Operation *op) {
     if (isa<AffineForOp, scf::ForOp, scf::WhileOp, AffineIfOp, scf::IfOp,
-            func::CallOp, func::FuncOp>(op))
+            func::CallOp, func::FuncOp, VolatileOp>(op))
       warn(Stage::Dcp, op)
           << "Op '" << op->getName().getStringRef()
           << "' survived reification; the post-schedule IR should hold only "

@@ -87,10 +87,19 @@ struct OperatorEntry {
 };
 
 /// The width one operator row is characterized at for \p op: its widest integer
-/// or float operand, falling back to the result when it takes none. `dcp.comb`
+/// or float operand, falling back to the result when it takes none. An `index`
+/// answers `kIndexWidth`, the one width the datapath builds it at. `dcp.comb`
 /// parameterizes on the operand width, so a 32-bit compare prices as 32 bits
 /// rather than as its one-bit result.
 int64_t combParamWidth(Operation *op);
+
+/// Whether \p op costs no logic, so the schedule leaves it no delay: a bit
+/// rename (`isBitRename`), or a resize between two types the datapath carries
+/// at one width, which emits nothing at all.
+///
+/// Both places a datapath node is priced, the chaining solve and the binder's
+/// slack, ask this, so they cannot disagree about what the schedule left.
+bool isZeroDelay(Operation *op);
 
 /// What a scheduling problem registers for ONE node: the operator type it runs
 /// under, and the timing that type carries. The shape the three kinds of node

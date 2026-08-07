@@ -69,11 +69,11 @@ struct AddressDelays {
   double mul = 0.0; // a generic multiplier
   double div = 0.0; // a divider / remainder unit
 
-  /// The width those numbers are characterized at (an `index`'s hardware
-  /// width, `uarch::hwWidth`). A narrower cone scales linearly off this: an
-  /// FPGA carry chain's delay tracks width, while a shift or mask costs no
-  /// logic at any width.
-  static constexpr unsigned refWidth = 32;
+  /// The width those numbers are characterized at, which is the one width an
+  /// `index` is built at everywhere (`datapathWidth`, `combParamWidth`). A
+  /// narrower cone scales linearly off this: an FPGA carry chain's delay tracks
+  /// width, while a shift or mask costs no logic at any width.
+  static constexpr unsigned refWidth = kIndexWidth;
 };
 
 /// Read the comb rows an address cone can be built from.

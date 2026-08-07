@@ -9,7 +9,6 @@
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/Operation.h"
 #include "llvm/ADT/DenseMap.h"
-#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/StringRef.h"
 
 #include <cstdint>
@@ -243,55 +242,6 @@ public:
     return it == tripBounds.end() ? std::nullopt : std::optional(it->second);
   }
 
-  /// What a region's own BOUNDARY expression evaluates to: a counted loop's
-  /// runtime bounds, a guard's predicate. The scheduler expands the `AffineMap`
-  /// or `IntegerSet` into operations so the solve can cut them, and the reify
-  /// wires these values rather than expanding the same expression a second
-  /// time. An entry the region does not need stays null.
-  ///
-  /// It travels here rather than as an SSA operand because an `affine.for`
-  /// bound and an `affine.if` set take valid affine symbols, which the arith an
-  /// expansion produces is not; keeping the loop and the guard untouched is
-  /// also what keeps the dependence analysis exact.
-  struct EntryCone {
-    Value lower, upper;
-    Value predicate;
-  };
-
-  /// Record what \p op's boundary expression evaluates to.
-  void setEntryCone(Operation *op, const EntryCone &cone) {
-    bool inserted = entries.try_emplace(op, cone).second;
-    assert(inserted && "a region's boundary is expanded once");
-    (void)inserted;
-    for (Value v : {cone.lower, cone.upper, cone.predicate})
-      if (v)
-        entryValues.insert(v);
-  }
-
-  /// \p op's boundary values, or null when it has none: a constant-bound loop,
-  /// or an `scf` region carrying its bound and condition as operands already.
-  const EntryCone *entryConeOf(Operation *op) const {
-    auto it = entries.find(op);
-    return it == entries.end() ? nullptr : &it->second;
-  }
-
-  /// Whether \p v is one a boundary reads. Its only consumer names it through
-  /// this map rather than through a use, so the region computing it has to be
-  /// told to yield it.
-  bool isEntryValue(Value v) const { return entryValues.contains(v); }
-
-  /// Follow a recorded boundary value through the rewrite that replaces it,
-  /// which is the reify wrapping the span computing it into a region.
-  void replaceEntryValue(Value from, Value to) {
-    if (!entryValues.erase(from))
-      return;
-    entryValues.insert(to);
-    for (auto &[op, cone] : entries)
-      for (Value *slot : {&cone.lower, &cone.upper, &cone.predicate})
-        if (*slot == from)
-          *slot = to;
-  }
-
   /// Drop everything recorded about \p op, which every erase of a scheduled op
   /// owes the model. MLIR frees an erased op and the next `create` may be
   /// handed that same address, so a stale entry would answer for an op no
@@ -300,9 +250,6 @@ public:
     ops.erase(op);
     regions.erase(op);
     tripBounds.erase(op);
-    entries.erase(op);
-    for (Value res : op->getResults())
-      entryValues.erase(res);
   }
 
   /// Read \p module's reified `allo.dcp.*` ops into `report`, and the prep
@@ -335,8 +282,6 @@ private:
   std::vector<AllocatedUnit> units;
   llvm::DenseMap<Operation *, RegionSolution> regions;
   llvm::DenseMap<Operation *, int64_t> tripBounds;
-  llvm::DenseMap<Operation *, EntryCone> entries;
-  llvm::DenseSet<Value> entryValues;
 };
 
 } // namespace mlir::allo

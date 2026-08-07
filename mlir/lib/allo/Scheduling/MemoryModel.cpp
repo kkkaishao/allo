@@ -222,6 +222,14 @@ MemoryBankModel::resources(Operation *op) const {
   return ports;
 }
 
+unsigned mlir::allo::datapathWidth(Type t) {
+  if (isa<IndexType>(t))
+    return kIndexWidth;
+  if (auto f = dyn_cast<FloatType>(t))
+    return f.getWidth();
+  return cast<IntegerType>(t).getWidth();
+}
+
 namespace mlir::allo {
 
 int64_t BankLayout::bankWords() const {

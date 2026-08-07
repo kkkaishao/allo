@@ -19,11 +19,13 @@ from allo.backend.rtl.devices import default_device
 sys.path.insert(0, os.path.dirname(__file__))
 from _common import (  # noqa: E402
     Mod,
+    _impls,
     _sched,
     _to_rtl,
     _iis,
     comb_ns,
     comb_step_ns,
+    IDIV,
     REG_NS,
     PERIOD_NS,
 )
@@ -282,12 +284,14 @@ def test_chaining_inserts_register():
     assert tight.last_t() > loose.last_t()
 
 
-def test_a_symbolic_bound_is_cut_like_any_other_chain():
+def test_a_symbolic_bound_binds_like_any_other_arithmetic():
     # A symbolic loop bound is an affine MAP, and the constraint system has a
     # vertex only for an operation, so it used to be expanded after the solve
-    # and reach the datapath as one combinational cone nothing could break. The
-    # scheduler expands it now, which puts it in the enclosing straight-line
-    # region and hands it to the same chaining that cuts everything else.
+    # and reach the datapath as one combinational cone nothing could break.
+    # `expand-region-bounds` reifies it before the solve, at the datapath's
+    # index width: `index` carries no width for an operator row to be priced at
+    # or for an IP signature to match, so the same divide that is unbuildable
+    # combinationally binds the device's divider core once it is typed.
     def band():
         @kernel
         def k(A: i32[64], out: i32[8]):
@@ -300,8 +304,9 @@ def test_a_symbolic_bound_is_cut_like_any_other_chain():
         return k
 
     # The premise, against the device: a signed floordiv expands to a divider
-    # plus its sign correction (cmp, sub, select on each side), which alone
-    # overruns the default period, so the bound is only buildable if it is cut.
+    # plus its sign correction (cmp, sub, select on each side), and the divider
+    # alone overruns the default period, so a combinational one is not
+    # buildable at all.
     assert (
         REG_NS + comb_step_ns("div") + comb_step_ns("sub") + comb_step_ns("select")
         > PERIOD_NS
@@ -309,18 +314,18 @@ def test_a_symbolic_bound_is_cut_like_any_other_chain():
 
     # A cell the emitter reaches with more delay on its inputs than the schedule
     # left it is a REFUSAL (`checkCombPathsMeetPeriod`), so compiling at all is
-    # what says the bound was cut against the same clock as everything else.
+    # what says the bound was scheduled against the same clock as everything
+    # else.
     _to_rtl(band()).compile()
 
-    # And it is the CLOCK that decides where, which is what says the cut is the
-    # chaining solve's and not a fixed decomposition: the same bound under a
-    # period the whole cone fits in settles in one cycle.
-    def bound_depth(res):
-        return max(r.last_t() for r in res.regions() if r.kind == "acyclic" and r.ops)
-
-    assert bound_depth(_sched(band())) > bound_depth(
-        _sched(band(), freq_mhz=1.0)  # a 1000ns cycle
-    )
+    # And it is the device's own divider core that carries it, which is what
+    # says the bound's arithmetic is bound like any other integer arithmetic
+    # rather than left as an unrealizable index cone: the region holding it is
+    # at least as deep as that core is long.
+    res = _sched(band())
+    assert any(im.startswith("divsi_i32") for im in _impls(res))
+    spans = [r for r in res.regions() if r.kind == "acyclic" and r.ops]
+    assert max(r.last_t() for r in spans) >= IDIV
 
 
 def test_a_sequential_whiles_condition_is_cut_like_any_other_chain():

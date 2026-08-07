@@ -23,6 +23,7 @@ add_mlir_library(MLIRAlloTransforms
     RotateReductions.cpp
     NarrowDemandedBits.cpp
     LegalizeArith.cpp
+    ExpandRegionBounds.cpp
 
     DEPENDS
     MLIRAlloIncGen

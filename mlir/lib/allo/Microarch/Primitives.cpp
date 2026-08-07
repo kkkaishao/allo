@@ -26,12 +26,12 @@ namespace mlir::allo::uarch {
 // Shared free helpers.
 //===----------------------------------------------------------------------===//
 
-IntegerType hwType(Type t, OpBuilder &b) {
-  return b.getIntegerType(hwWidth(t));
+IntegerType datapathType(Type t, OpBuilder &b) {
+  return b.getIntegerType(datapathWidth(t));
 }
 
 IntegerType memElemType(const uarch::MemUnit &m, OpBuilder &b) {
-  return hwType(cast<MemRefType>(m.memref.getType()).getElementType(), b);
+  return datapathType(cast<MemRefType>(m.memref.getType()).getElementType(), b);
 }
 
 Value resize(OpBuilder &b, Location loc, Value v, unsigned width,
@@ -262,7 +262,7 @@ Value EmitContext::konst(Type t, int64_t v) {
 
 Value EmitContext::reg(Value in, Value rstVal, RegRole role) {
   if (!inChainRun)
-    ledger.add(role, hwWidth(in.getType()), 1);
+    ledger.add(role, datapathWidth(in.getType()), 1);
   return R(seq::CompRegOp::create(b, loc, in, clk, rst, rstVal));
 }
 
@@ -333,7 +333,7 @@ ShiftChain EmitContext::shiftChain(Value in, unsigned depth,
       chain.stages.push_back(cur);
     }
   }
-  ledger.add(role, hwWidth(in.getType()), depth);
+  ledger.add(role, datapathWidth(in.getType()), depth);
   return chain;
 }
 
@@ -358,7 +358,7 @@ ShiftChain EmitContext::foldedChain(Value in, unsigned depth, unsigned ii,
   }
   // The run is the registers BUILT, not the cycles spanned: a fold holds the
   // same `depth` taps in `n` of them.
-  ledger.add(RegRole::Value, hwWidth(in.getType()), n);
+  ledger.add(RegRole::Value, datapathWidth(in.getType()), n);
   ShiftChain chain;
   chain.stages.push_back(in); // stage 0 = the source, as in a plain chain
   for (unsigned k = 1; k <= depth; ++k)

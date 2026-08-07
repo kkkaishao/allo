@@ -343,17 +343,37 @@ double OperatorLibrary::combMarginalDelay(CombOpKindEnum kind,
   return std::max(0.0, combDelay(kind, width) - regFloor);
 }
 
+// The datapath's width for \p t, or 0 for a type it carries no value of (a
+// stream handle). Pricing an `index` at `datapathWidth` is exact where the
+// carrier is full width and conservative where the emitter narrows it
+// (`counterWidth`, `AddrStride::width`), which never widens it.
+static int64_t paramWidthOf(Type t) {
+  return t.isIntOrIndexOrFloat() ? datapathWidth(t) : 0;
+}
+
 int64_t mlir::allo::combParamWidth(Operation *op) {
   int64_t width = 0;
   for (Type t : elementTypes(op->getOperandTypes()))
-    if (t.isIntOrFloat())
-      width = std::max<int64_t>(width, t.getIntOrFloatBitWidth());
+    width = std::max(width, paramWidthOf(t));
   if (width)
     return width;
   for (Type t : elementTypes(op->getResultTypes()))
-    if (t.isIntOrFloat())
-      width = std::max<int64_t>(width, t.getIntOrFloatBitWidth());
+    width = std::max(width, paramWidthOf(t));
   return width ? width : 1;
+}
+
+bool mlir::allo::isZeroDelay(Operation *op) {
+  if (isBitRename(op))
+    return true;
+  // A resize the datapath carries at one width on both sides is the identity:
+  // `uarch::resize` hands the value back and builds nothing. An `index` is
+  // carried at `kIndexWidth`, so an `index_cast` to or from an integer that
+  // wide is a wire; a real narrowing or widening is not.
+  if (!isa<arith::IndexCastOp, arith::IndexCastUIOp, arith::ExtSIOp,
+           arith::ExtUIOp, arith::TruncIOp>(op))
+    return false;
+  return paramWidthOf(op->getOperand(0).getType()) ==
+         paramWidthOf(op->getResult(0).getType());
 }
 
 int64_t OperatorLibrary::priceOf(ArrayAttr uses,
@@ -478,10 +498,11 @@ OperatorChar OperatorLibrary::lookup(Operation *op) const {
     c.timing.outDelay = e->outDelay;
   }
   c.pipelined = e->pipelined;
-  // A shift by a literal is wiring, not a shifter. It takes a type name of its
-  // own because the problem registers timing per name: sharing the shift row
-  // would make two spellings of that row disagree.
-  if (isBitRename(op)) {
+  // A shift by a literal is wiring, not a shifter, and so is a resize that
+  // changes no width. It takes a type name of its own because the problem
+  // registers timing per name: sharing the row would make two spellings of that
+  // row disagree.
+  if (isZeroDelay(op)) {
     c.timing.typeName = "rename." + c.timing.typeName;
     c.timing.inDelay = c.timing.outDelay = 0.0;
   }

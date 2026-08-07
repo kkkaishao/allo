@@ -29,8 +29,8 @@ llvm::KnownBits knownBits(Value v, unsigned depth = 8);
 ///     rather than combines: every result bit takes one side while the other
 ///     contributes a constant zero.
 ///
-/// Both places a datapath node is priced, the chaining solve and the binder's
-/// slack, ask this, so they cannot disagree about what the schedule left.
+/// The bit-level half of `isZeroDelay`, which is what the two pricing sites
+/// ask.
 bool isBitRename(Operation *op);
 
 } // namespace mlir::allo

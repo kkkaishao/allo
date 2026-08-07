@@ -36,13 +36,17 @@ using namespace mlir::allo::logging;
 // \p root: descend while a level's body is exactly { inner counted loop,
 // terminator }. Returns [root, ..., innermost].
 //
-// Must run after `expandRegionBoundaries`, which moves an inner loop's
-// runtime bound arithmetic beside it, breaking the band there deliberately.
+// Must run after `expand-region-bounds`, which places an inner loop's runtime
+// bound arithmetic beside it, breaking the band there deliberately. The
+// `allo.volatile` marker carrying that bound is not work, so it is stepped over
+// and a loop whose bound map is trivial keeps its band.
 static SmallVector<LoopLikeOpInterface> perfectNest(LoopLikeOpInterface root) {
   SmallVector<LoopLikeOpInterface> nest{root};
   while (true) {
     Block &body = nest.back().getLoopRegions().front()->front();
     Operation *first = &body.front();
+    while (isa<VolatileOp>(first))
+      first = first->getNextNode();
     if (first->getNextNode() != body.getTerminator())
       break; // the body holds more than just the inner loop
     auto inner = dyn_cast<LoopLikeOpInterface>(first);
@@ -180,17 +184,14 @@ static bool hasCarriedRecurrence(circt::scheduling::CyclicProblem &problem) {
 
 // The values a straight-line span hands to something outside itself. Must match
 // what the reify treats as escaping, so the two agree on what the region's
-// completion waits to capture. A boundary value is one of them with no USE
-// outside the span: a loop bound and a guard predicate reach their region
-// through the model, since neither can be an affine operand.
-static SmallVector<Value> spanEscapingValues(ArrayRef<Operation *> ops,
-                                             const ScheduleModel &model) {
+// completion waits to capture. A boundary value is one of them, its `volatile`
+// marker sitting beside the anchor rather than in the span.
+static SmallVector<Value> spanEscapingValues(ArrayRef<Operation *> ops) {
   llvm::SmallPtrSet<Operation *, 16> inSpan(ops.begin(), ops.end());
   SmallVector<Value> escaping;
   for (Operation *op : ops)
     for (Value res : op->getResults())
-      if (model.isEntryValue(res) ||
-          llvm::any_of(res.getUsers(),
+      if (llvm::any_of(res.getUsers(),
                        [&](Operation *user) { return !inSpan.contains(user); }))
         escaping.push_back(res);
   return escaping;
@@ -561,7 +562,7 @@ LogicalResult FuncScheduler::scheduleAcyclic(ArrayRef<Operation *> ops,
     populateOperatorAllocation(problem, dev.operators);
   // A straight-line region runs once, so its whole cost is its drain, and it
   // carries nothing between iterations it does not have.
-  SpanObjective span(problem, spanEscapingValues(ops, model),
+  SpanObjective span(problem, spanEscapingValues(ops),
                      /*carried=*/nullptr, /*trip=*/1, dev.operators);
   Stopwatch solveStart = now();
   if (failed(
@@ -865,12 +866,10 @@ void FuncScheduler::consumeHints(func::FuncOp funcOp) {
 }
 
 // Solve one function's schedule into `model`. The only IR this writes is the
-// hints it consumes, the boundary expressions it expands and the kernel latency
-// it publishes; the schedule itself is materialized by a later pass off the
-// model.
+// hints it consumes and the kernel latency it publishes; the schedule itself is
+// materialized by a later pass off the model.
 LogicalResult FuncScheduler::run(func::FuncOp funcOp) {
   consumeHints(funcOp);
-  expandRegionBoundaries(funcOp, deps, model);
 
   std::string infoStr = "-- Start scheduling for " + funcOp.getSymName().str();
   info(Stage::Sched) << std::string(infoStr.size() * 2, '-');

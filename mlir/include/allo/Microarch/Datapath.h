@@ -990,13 +990,6 @@ unsigned dcpLatency(Operation *op);
 /// value with no producing op (a constant, the iteration counter).
 unsigned readyCycleOf(Operation *op);
 
-/// The datapath's hardware width for a value type: `index` -> `kIndexWidth`, a
-/// float carried as its bit pattern, an integer verbatim. This is the ONE width
-/// rule: the model is value-typed but the emitted carrier is a bit vector, and
-/// the emitter (`uarch::hwType`) and the boundary port model
-/// (`iface::bitWidth`) must not disagree about how wide it is.
-unsigned hwWidth(Type t);
-
 /// A region's controller shape as one lower-case word. The ONE spelling, shared
 /// by the debug dump and the microarch report, which must not name the same
 /// shape two ways.

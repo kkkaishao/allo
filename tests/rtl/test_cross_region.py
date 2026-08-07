@@ -542,9 +542,9 @@ def test_loop_bound_from_enclosing_counter():
 
 # ---------------------------------------------------------------------------
 # Boundary cones: what a TOP-LEVEL loop's bound or a guard's predicate becomes
-# when it is an expression. The scheduler expands it before the solve, so it
-# lands in the enclosing straight-line region and nothing is left loose in the
-# kernel body.
+# when it is an expression. `expand-region-bounds` reifies it before the solve,
+# so it lands in the enclosing straight-line region and nothing is left loose
+# in the kernel body.
 # ---------------------------------------------------------------------------
 
 
@@ -565,8 +565,8 @@ def _loose_ops(func):
 
 def test_loop_bound_cone_is_a_scheduled_region():
     # A top-level window loop: `hi + 1` is an affine expression of a scalar
-    # argument, so the scheduler expands it into an `arith.addi` the solve
-    # places, and the loop reads the region's survivor. The bound resolves
+    # argument, so it is reified into an `arith.addi` the solve places, and the
+    # loop reads the region's survivor. The bound resolves
     # through it, and the loop runs [lo, hi].
     @kernel
     def windowed(src: i32[16], dst: i32[16], lo: i32, hi: i32):

@@ -143,7 +143,7 @@ Value DatapathEmitter::resolveSource(const uarch::Source &s) {
   case uarch::Source::Kind::Const: {
     // The datapath carries a value as its bit pattern, so a float literal ties
     // in as its bitcast integer.
-    IntegerType t = hwType(dp.consts[s.id].type, c.b);
+    IntegerType t = datapathType(dp.consts[s.id].type, c.b);
     Attribute v = dp.consts[s.id].value;
     if (auto ia = dyn_cast<IntegerAttr>(v))
       return c.konst(t, ia.getInt());
@@ -541,7 +541,7 @@ void DatapathEmitter::emitRegisters(const uarch::RegionBlock &rb) {
   assert((!phase || ii > 1) && "a phase was published for a region at II 1");
   for (uarch::RegId rid : rb.regs) {
     const uarch::Register &rg = dp.regs[rid];
-    auto head = c.bb.get(hwType(rg.type, c.b));
+    auto head = c.bb.get(datapathType(rg.type, c.b));
     regHeadBE.try_emplace(rg.id, head);
     // A register is a plain delay chain; reduction-identity re-injection rides
     // the consuming unit's recurrence input (emitUnits), not the register.
@@ -711,7 +711,7 @@ void DatapathEmitter::emitExternalReadAddrs(const uarch::RegionBlock &rb) {
 // hardware acyclic; the backedges only free emission from topological order.
 void DatapathEmitter::declareUnits(const uarch::RegionBlock &rb) {
   for (uarch::UnitId uid : rb.units) {
-    auto b = c.bb.get(hwType(dp.units[uid].identity.resultType, c.b));
+    auto b = c.bb.get(datapathType(dp.units[uid].identity.resultType, c.b));
     unitBE[uid] = b;
     unitVal[uid] = b;
   }
@@ -766,7 +766,7 @@ void DatapathEmitter::emitUnits(const uarch::RegionBlock &rb, UnitMode mode) {
     Value result;
     if (u.identity.comb) {
       result = emitCompute(c.b, c.loc, *u.identity.comb, operands,
-                           hwType(u.identity.resultType, c.b), u.repOp());
+                           datapathType(u.identity.resultType, c.b), u.repOp());
     } else {
       // An IP instance takes its data operands, then clock, then (for a
       // clock-enabled contract) a `ce` bit that rides the region's
@@ -1082,7 +1082,7 @@ void DatapathEmitter::declareInternalChannels() {
       ComposedWires &w = composedWires[s.id];
       for (const uarch::StreamChannel::CallEnd &e : s.callEnds)
         if (dp.calls[e.call].streamArgs[e.arg].isInput) {
-          w.sinkData.push_back(c.bb.get(hwType(s.payload, c.b)));
+          w.sinkData.push_back(c.bb.get(datapathType(s.payload, c.b)));
           w.sinkValid.push_back(c.bb.get(c.i1));
         } else
           w.prodReady = c.bb.get(c.i1);
@@ -1090,7 +1090,7 @@ void DatapathEmitter::declareInternalChannels() {
     }
     if (!s.internal)
       continue;
-    streamWires[s.id] = {c.bb.get(hwType(s.payload, c.b)), c.bb.get(c.i1),
+    streamWires[s.id] = {c.bb.get(datapathType(s.payload, c.b)), c.bb.get(c.i1),
                          c.bb.get(c.i1)};
   }
 }
@@ -1325,7 +1325,7 @@ void DatapathEmitter::emitInternalChannel(const uarch::StreamChannel &s,
   assert(drv.valid && drv.ready &&
          "a local channel is validated to have both ends");
   auto fifo = seq::FIFOOp::create(
-      c.b, c.loc, hwType(s.payload, c.b), c.i1, c.i1, Type(), Type(), data,
+      c.b, c.loc, datapathType(s.payload, c.b), c.i1, c.i1, Type(), Type(), data,
       /*rdEn=*/c.andBits(drv.ready, w.valid),
       /*wrEn=*/c.andBits(drv.valid, w.ready), c.clk, c.rst,
       c.b.getI64IntegerAttr(declaredDepth(s.depth)), c.b.getI64IntegerAttr(0),
@@ -1354,7 +1354,7 @@ void DatapathEmitter::emitComposedChannel(const uarch::StreamChannel &s) {
   // call concurrent, and a concurrent region issues no access of its own.
   assert(s.accesses.empty() &&
          "a channel wired between child ports also has in-module accesses");
-  Type payload = hwType(s.payload, c.b);
+  Type payload = datapathType(s.payload, c.b);
   std::string base = s.internal ? std::string() : streamPortBase(dp, s);
 
   // The push side: the producing child, or this module's own stream port for a

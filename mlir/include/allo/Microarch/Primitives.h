@@ -32,9 +32,8 @@ namespace mlir::allo::uarch {
 // unit, and the module-boundary ABI. Shared by every emitter.
 //===----------------------------------------------------------------------===//
 
-/// Map an MLIR datapath type to its hardware integer type (index -> i32, a
-/// float is carried as its bit pattern).
-IntegerType hwType(Type t, OpBuilder &b);
+/// The bit vector an MLIR datapath type is carried as: `datapathWidth` bits.
+IntegerType datapathType(Type t, OpBuilder &b);
 /// The element type of a memory's memref.
 IntegerType memElemType(const uarch::MemUnit &m, OpBuilder &b);
 /// The depth on-chip storage holding \p words elements is DECLARED with. All
@@ -47,7 +46,7 @@ unsigned declaredDepth(unsigned words);
 /// The element bit patterns of a compile-time array initializer, in NATURAL
 /// order (element 0 first), each resized to \p width and padded with zero to
 /// exactly \p depth words. A float table carries its values as their IEEE bit
-/// patterns, the convention the datapath gives every float (`hwType`).
+/// patterns, the convention the datapath gives every float (`datapathType`).
 llvm::SmallVector<llvm::APInt> initWords(ElementsAttr init, unsigned width,
                                          unsigned depth);
 /// Record \p words as the power-on contents of \p mem (`kMemoryInitAttr`).

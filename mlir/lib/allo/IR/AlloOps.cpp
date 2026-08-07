@@ -758,22 +758,27 @@ ParseResult DCPathOperatorOp::parse(OpAsmParser &p, OperationState &result) {
 void DCPathPipelineOp::print(OpAsmPrinter &p) {
   Block &body = getBody().front();
   int64_t lb = getLb().value_or(0), step = getStep().value_or(1);
+  // A runtime bound carries its type: an affine bound is reified at the
+  // datapath's index width, an scf one stays `index`.
+  auto bound = [&](Value v) { p << v << " : " << v.getType(); };
   p << ' ' << body.getArgument(0) << " = ";
   if (Value l = getLbBound())
-    p << l; // a runtime lower bound (data-dependent range start)
+    bound(l); // a runtime lower bound (data-dependent range start)
   else
     p << lb;
   p << " to ";
   if (std::optional<int64_t> t = getTrip())
     p << (lb + *t * step); // the derived upper bound (ub = lb + trip*step)
   else if (Value b = getDynamicBound())
-    p << b; // a runtime upper bound (dynamic trip)
+    bound(b); // a runtime upper bound (dynamic trip)
   else
     p << '?'; // a while loop (termination by dcp.condition)
-  if (Value s = getStepBound())
-    p << " step " << s; // a runtime stride
-  else if (step != 1)
+  if (Value s = getStepBound()) {
+    p << " step ";
+    bound(s); // a runtime stride
+  } else if (step != 1) {
     p << " step " << step;
+  }
   if (IntegerAttr tb = getTripBoundAttr())
     p << " trip_bound=" << tb.getInt();
   if (IntegerAttr ii = getIiAttr())
@@ -834,8 +839,9 @@ ParseResult DCPathPipelineOp::parse(OpAsmParser &p, OperationState &result) {
     OpAsmParser::UnresolvedOperand lbOp;
     OptionalParseResult res = p.parseOptionalOperand(lbOp);
     if (res.has_value()) {
-      if (failed(*res) ||
-          p.resolveOperand(lbOp, b.getIndexType(), result.operands))
+      Type ty;
+      if (failed(*res) || p.parseColonType(ty) ||
+          p.resolveOperand(lbOp, ty, result.operands))
         return failure();
       hasLb = true;
     } else if (p.parseInteger(lb)) {
@@ -854,8 +860,9 @@ ParseResult DCPathPipelineOp::parse(OpAsmParser &p, OperationState &result) {
     OpAsmParser::UnresolvedOperand boundOp;
     OptionalParseResult res = p.parseOptionalOperand(boundOp);
     if (res.has_value()) {
-      if (failed(*res) ||
-          p.resolveOperand(boundOp, b.getIndexType(), result.operands))
+      Type ty;
+      if (failed(*res) || p.parseColonType(ty) ||
+          p.resolveOperand(boundOp, ty, result.operands))
         return failure();
       hasBound = true; // resolved first, so it precedes inits in the segments
     } else {
@@ -873,8 +880,9 @@ ParseResult DCPathPipelineOp::parse(OpAsmParser &p, OperationState &result) {
     OpAsmParser::UnresolvedOperand stepOp;
     OptionalParseResult res = p.parseOptionalOperand(stepOp);
     if (res.has_value()) {
-      if (failed(*res) ||
-          p.resolveOperand(stepOp, b.getIndexType(), result.operands))
+      Type ty;
+      if (failed(*res) || p.parseColonType(ty) ||
+          p.resolveOperand(stepOp, ty, result.operands))
         return failure();
       hasStep = true;
     } else if (p.parseInteger(step)) {

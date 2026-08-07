@@ -380,6 +380,27 @@ def AssumeNoDepOp : Allo_Op<"assume.nodep"> {
 }
 
 //===----------------------------------------------------------------------===//
+// Optimization barrier
+//===----------------------------------------------------------------------===//
+
+def VolatileOp : Allo_Op<"volatile"> {
+  let summary = "Keep SSA values live against dead-code elimination";
+  let description = [{
+    A use no optimization may drop, the SSA analogue of C's `volatile`: each
+    operand stays live, and with it the pure computation feeding it. Carries no
+    hardware, and is erased by the phase that consumes whatever it anchors. Not
+    `Pure`, so DCE keeps it.
+
+    ```mlir
+    %0 = arith.addi %n, %c1 : index
+    allo.volatile %0 : index
+    ```
+  }];
+  let arguments = (ins Variadic<AnyType>:$values);
+  let assemblyFormat = [{ ($values^ `:` type($values))? attr-dict }];
+}
+
+//===----------------------------------------------------------------------===//
 // Data & Control Path (dcp) Operations
 //===----------------------------------------------------------------------===//
 
@@ -815,11 +836,17 @@ def DCPathPipelineOp : DCPath_Op<"dcp.pipeline",
     `drain + 1` cycles after that pulse. `length` is the schedule DEPTH, the
     cycle by which everything has issued, and is a report. The two differ, and
     composing off the wrong one is what makes a consumer sample early.
+
+    A runtime bound is a signless integer or an `index`, and carries its type in
+    the syntax. Both occur: an `scf.for` hands its own `index` bound straight
+    through, while an affine bound is reified at the datapath's index width
+    (`expand-region-bounds`). The emitter resizes whichever it gets to the
+    counter's width.
   }];
   let arguments = (ins
-    Optional<Index>:$lbBound,
-    Optional<Index>:$dynamicBound,
-    Optional<Index>:$stepBound,
+    Optional<AnySignlessIntegerOrIndex>:$lbBound,
+    Optional<AnySignlessIntegerOrIndex>:$dynamicBound,
+    Optional<AnySignlessIntegerOrIndex>:$stepBound,
     Variadic<AnyType>:$inits,
     OptionalAttr<I64Attr>:$trip,
     OptionalAttr<I64Attr>:$trip_bound,

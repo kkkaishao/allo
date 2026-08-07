@@ -587,6 +587,36 @@ def LegalizeArithPass : Pass<"legalize-arith", "ModuleOp"> {
   let dependentDialects = ["mlir::arith::ArithDialect"];
 }
 
+def ExpandRegionBoundsPass
+    : Pass<"expand-region-bounds", "mlir::func::FuncOp"> {
+  let summary = "Reify affine region boundary expressions as operations";
+  let description = [{
+    A counted loop's runtime bounds and a guard's predicate are an `AffineMap`
+    and an `IntegerSet`, which the schedule cannot hold: a constraint system has
+    a vertex only for an operation. This evaluates each of them into arith
+    beside its anchor, so the boundary is scheduled and cut against the clock
+    like any other computation.
+
+    The loop and the guard themselves are not rewritten, which keeps the
+    polyhedral dependence test exact. Arith is not a valid affine symbol, so the
+    reified values reach their anchor through an `allo.volatile` marker placed
+    immediately before it, which is also the use that keeps them alive. The
+    marker carries the runtime lower bound then the upper bound (a guard: its
+    predicate), omitting whatever the anchor's own maps make constant;
+    `entryConeOf` decodes it.
+
+    The arithmetic is typed at `datapathWidth` rather than left on `index`,
+    which carries no width for an operator row to be priced at or for an IP
+    signature to match. That is the width the emitted bound always had.
+
+    Run after every pass that reshapes loops (perfectization, if-folding,
+    raising) and before scheduling: arith beside an inner loop breaks a perfect
+    band deliberately, that band's bound arithmetic being work of its own.
+  }];
+  let dependentDialects = ["mlir::arith::ArithDialect",
+                           "mlir::allo::AlloDialect"];
+}
+
 def PropagatePartitionPass
     : Pass<"propagate-partition", "ModuleOp"> {
   let summary = "Give every carrier of one array the single `allo.part` its "

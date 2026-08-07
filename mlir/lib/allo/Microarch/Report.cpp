@@ -41,7 +41,7 @@ std::vector<MuxClass> muxClasses(const Datapath &dp, const RegionBlock &rb) {
   std::map<std::pair<unsigned, unsigned>, unsigned> byClass;
   for (MuxId mid : rb.muxes)
     ++byClass[{(unsigned)dp.muxes[mid].sources.size(),
-               hwWidth(dp.muxes[mid].type)}];
+               datapathWidth(dp.muxes[mid].type)}];
   std::vector<MuxClass> out;
   out.reserve(byClass.size());
   for (const auto &[key, count] : byClass)
@@ -65,14 +65,14 @@ FuncUarch::FuncUarch(const Datapath &dp, llvm::StringRef symbol,
       r.interval = (int64_t)*rb.ii;
     r.cost.addrStrides = rb.addrStrides.size();
     if (rb.counterType)
-      r.cost.counterWidth = hwWidth(rb.counterType);
+      r.cost.counterWidth = datapathWidth(rb.counterType);
     for (UnitId uid : rb.units) {
       const FuncUnit &u = dp.units[uid];
       r.computeOps += u.boundOps.size();
       r.units.push_back(
           {u.identity.key(), u.identity.ipSymbol,
            u.identity.comb ? std::string() : operatorModuleName(u),
-           hwWidth(u.identity.resultType), u.latency,
+           datapathWidth(u.identity.resultType), u.latency,
            (unsigned)u.boundOps.size(), u.identity.comb.has_value(),
            u.pipelined});
     }
@@ -81,7 +81,7 @@ FuncUarch::FuncUarch(const Datapath &dp, llvm::StringRef symbol,
       unsigned k = dp.muxes[mid].sources.size();
       r.cost.muxInputs += k;
       // A k:1 mux costs about (k-1) 2:1 muxes per bit.
-      r.cost.muxBits += hwWidth(dp.muxes[mid].type) * (k - 1);
+      r.cost.muxBits += datapathWidth(dp.muxes[mid].type) * (k - 1);
     }
     regions.push_back(std::move(r));
   }
@@ -133,7 +133,7 @@ FuncUarch::FuncUarch(const Datapath &dp, llvm::StringRef symbol,
   }
 
   for (const StreamChannel &s : dp.streams)
-    streams.push_back({ownerOf(s.stream, chanOwner(s.id)), hwWidth(s.payload),
+    streams.push_back({ownerOf(s.stream, chanOwner(s.id)), datapathWidth(s.payload),
                        s.depth, !s.callEnds.empty()});
 
   std::map<std::string, CallReport> byCallee;
