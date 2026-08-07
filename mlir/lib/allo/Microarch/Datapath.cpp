@@ -8,6 +8,7 @@
 
 #include "allo/IR/AlloOps.h"
 #include "allo/Scheduling/OperatorLibrary.h" // unit input delay
+#include "allo/Support/BitAnalysis.h"        // isBitRename
 
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/Support/raw_ostream.h"
@@ -291,6 +292,10 @@ double muxLevelDelay(const OperatorLibrary &lib) {
 /// The delay `u`'s inputs must settle within, read from the same library row
 /// the scheduler priced it against.
 static double unitInDelay(const FuncUnit &u, const OperatorLibrary &lib) {
+  // The one exception the row itself does not carry, and the scheduler took it
+  // too (`lookup`): a shift by a literal renames bits and costs nothing.
+  if (isBitRename(u.repOp()))
+    return 0.0;
   if (u.identity.comb)
     return lib.combDelay(*u.identity.comb);
   auto opr = SymbolTable::lookupNearestSymbolFrom<dcp::DCPathOperatorOp>(
@@ -567,10 +572,17 @@ void Datapath::dump(llvm::raw_ostream &os) const {
       const Mux &x = this->muxes[xid];
       os << "    mux x" << xid << ": ";
       printSourceList(x.sources, os);
-      os << " sel@["; // per-source op start cycle (the delayValid select stage)
-      llvm::interleaveComma(x.selectOps, os, [&](Operation *op) {
-        os << cast<IntegerAttr>(op->getAttr("start")).getInt();
-      });
+      // Per-arm select: the op's start cycle (the delayValid select stage),
+      // suffixed by the iteration window a phased arm drives ('i' the reduction
+      // identity, 'r' the iterations after it).
+      os << " sel@[";
+      for (auto [k, op] : llvm::enumerate(x.selectOps)) {
+        os << (k ? ", " : "")
+           << cast<IntegerAttr>(op->getAttr("start")).getInt()
+           << (x.phases[k].kind == Mux::Phase::First  ? "i"
+               : x.phases[k].kind == Mux::Phase::Rest ? "r"
+                                                      : "");
+      }
       os << "]\n";
     }
   }

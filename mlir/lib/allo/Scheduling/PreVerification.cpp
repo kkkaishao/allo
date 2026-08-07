@@ -29,13 +29,28 @@ using namespace mlir;
 using namespace mlir::allo;
 using namespace mlir::allo::logging;
 
-// An op the reifier turns into a `dcp.compute`. Must stay in sync with the
-// split `convertOp` (PostConversion.cpp) makes for a single-result non-constant
-// op carrying a start time.
+// An op the reifier turns into a `dcp.compute`: a single-result non-constant op
+// with no region that `convertOp` (PostConversion.cpp) does not carry on a path
+// of its own. Stated as what it EXCLUDES rather than as a dialect allow-list,
+// because the reifier's own split is: anything left over with one result and a
+// start time IS a compute, and it asserts when nothing realizes one. Everything
+// this admits is therefore refused here, on the offending line, rather than
+// there.
 static bool isComputeOp(Operation *op) {
-  return op->getNumResults() == 1 && !op->hasTrait<OpTrait::ConstantLike>() &&
-         (isa<arith::ArithDialect, math::MathDialect>(op->getDialect()) ||
-          isa<affine::AffineApplyOp>(op));
+  return op->getNumResults() == 1 && op->getNumRegions() == 0 &&
+         !op->hasTrait<OpTrait::ConstantLike>() &&
+         !isa<affine::AffineLoadOp, memref::LoadOp, StreamGetOp, StreamPutOp,
+              StreamCreateOp, memref::AllocOp, memref::AllocaOp,
+              memref::GetGlobalOp, func::CallOp>(op);
+}
+
+// Whether the operator library can even be ASKED about \p op: it prices integer
+// and float arithmetic, and an affine address expression. Anything else is a
+// backend gap rather than a device one, since no `@ip` row would make the
+// datapath model it.
+static bool isPricedOp(Operation *op) {
+  return isa<arith::ArithDialect, math::MathDialect>(op->getDialect()) ||
+         isa<affine::AffineApplyOp>(op);
 }
 
 namespace {
@@ -168,6 +183,14 @@ LogicalResult checkOperations(func::FuncOp func, const OperatorLibrary &lib) {
     }
     if (!isComputeOp(op))
       return WalkResult::advance();
+    if (!isPricedOp(op)) {
+      unsupported(Stage::Prep, Code::OperationNotModelled, op)
+          << "Operation '" << op->getName()
+          << "' produces a value no stage of the datapath models: the operator "
+             "library prices arithmetic, and the scheduler would place a cell "
+             "nothing can build. Express it in arithmetic instead";
+      return WalkResult::interrupt();
+    }
     // The identity names the IP row's symbol or the native comb lowering,
     // and is empty when the device offers neither.
     OperatorIdentity id = operatorIdentity(op, lib);

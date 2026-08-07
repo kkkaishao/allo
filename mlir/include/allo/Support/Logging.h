@@ -69,9 +69,10 @@ enum class Code {
   StreamArgumentBidirectional, // a stream argument read and written
   AddressOverPeriod,           // an address cone we cannot register
   BindingMuxOverPeriod,        // a mux over the slack the schedule left
-  SharedReductionUnit,         // a reduction sharing its unit
-  PlacementFailed,             // no feasible cycle for an operation
-  NoExactScheduler,            // this build has no OR-Tools
+  // ALLO-N0012 is retired: a reduction sharing its unit re-injects its identity
+  // on an arm of that unit's input mux (`uarch::Mux::Phase`).
+  PlacementFailed,  // no feasible cycle for an operation
+  NoExactScheduler, // this build has no OR-Tools
 };
 
 /// The one table: a code's stable spelling.
@@ -133,8 +134,6 @@ constexpr const char *codeTag(Code code) {
     return "ALLO-N0010";
   case Code::BindingMuxOverPeriod:
     return "ALLO-N0011";
-  case Code::SharedReductionUnit:
-    return "ALLO-N0012";
   case Code::PlacementFailed:
     return "ALLO-N0013";
   case Code::NoExactScheduler:

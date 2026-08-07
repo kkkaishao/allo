@@ -154,8 +154,10 @@ struct FuncUnit {
   // Per-input reduction identity (parallel to `inputs`). A recurrence input
   // carries the init of the loop-carried iter_arg it reads, which the emitter
   // re-injects on the port at the first iteration; None for every
-  // non-recurrence input. This is the sole init mechanism, and it lives on the
-  // input port rather than a register because the widened idiom
+  // non-recurrence input, and None on a SHARED port, where the identity is an
+  // arm of the input mux instead (`Mux::Phase`) because the port carries a
+  // different op's operand in each issue cycle. It lives on the input port
+  // rather than a register because the widened idiom
   // trunc(add(ext(acc),ext(x))) reads acc through a bare wire, not a tap.
   llvm::SmallVector<Source, 2> inputInits;
 
@@ -494,12 +496,30 @@ struct StreamChannel {
 /// that sees different drivers across the ops bound to it.
 struct Mux {
   MuxId id = 0;
+  /// Which ITERATIONS of its selecting op's run an arm drives. A loop-carried
+  /// operand reads the reduction identity for the first `dist` iterations and
+  /// the value carried round after them, so it takes TWO arms of this one
+  /// select rather than a 2:1 mux in front of the port: a time-shared port has
+  /// no cycle of its own to time such a mux against, and one select stays one
+  /// AND-OR reduction, which `muxLevels` prices and the period check charges
+  /// without knowing a recurrence is among the arms.
+  struct Phase {
+    enum Kind : uint8_t {
+      Always, // every iteration: an ordinary operand
+      First,  // the first `dist` iterations: the reduction identity
+      Rest,   // every iteration after them: the value carried round
+    };
+    Kind kind = Always;
+    unsigned dist = 1;
+  };
   llvm::SmallVector<Source, 2> sources;
   // The op whose issue selects each source (parallel to `sources`): the select
   // is `delayValid(issue, dcpStart(op))`, the same per-op activation pulse a
-  // store's write-enable uses. The MRT guarantees these are mutually exclusive
-  // (disjoint residues), so the emitter builds a one-hot select.
+  // store's write-enable uses, narrowed by `phases`. The MRT guarantees the ops
+  // are mutually exclusive (disjoint residues) and a First/Rest pair splits one
+  // op's pulse in two, so the emitter builds a one-hot select.
   llvm::SmallVector<Operation *, 2> selectOps;
+  llvm::SmallVector<Phase, 2> phases; // parallel to `sources`
   RegionId region = 0; // region whose issue pulse times the selects
 };
 

@@ -535,7 +535,7 @@ def RotateReductionsPass
 
 def NarrowDemandedBitsPass
     : Pass<"narrow-demanded-bits", "func::FuncOp"> {
-  let summary = "Narrow integer arithmetic to the bits its consumer reads";
+  let summary = "Narrow integer arithmetic to the bits that carry information";
   let description = [{
     Bit-growth typing gives an expression its exact natural width, computed from
     the leaves up, and applies the destination type as a single `arith.trunci`
@@ -560,6 +560,17 @@ def NarrowDemandedBitsPass
     is one the program already performed, only later, after paying for bits
     nothing reads. A wide operator with more than one use keeps its width, since
     the wide value stays live and narrowing would only add ops.
+
+    The dual argument reads the bits forward instead. `x & K` masks a field, and
+    writing a bit field splices with such a mask on every field after the first;
+    where the bits `K` clears are ones the value provably never sets, the mask
+    computes nothing. A forward walk over the casts, shifts and bitwise
+    operators proves which bits a value can hold (`llvm::KnownBits` carries the
+    algebra), and each mask so removed takes a whole AND off a chain the splices
+    build -- off hardware that was never there, the emitted concatenation
+    carrying no mask at all. A mask over bits the value CAN set, one overwriting
+    a field that already holds data or one over a signed shift's replicated sign,
+    is load-bearing and stays.
   }];
   let dependentDialects = ["mlir::arith::ArithDialect"];
 }

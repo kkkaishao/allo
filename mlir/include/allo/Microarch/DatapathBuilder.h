@@ -66,7 +66,8 @@ struct DatapathBuilder {
     unsigned port;
     RegionId region;
     llvm::SmallVector<Operation *, 2> ops;
-    llvm::SmallVector<Source, 2> sources; // parallel to ops
+    llvm::SmallVector<Source, 2> sources;    // parallel to ops
+    llvm::SmallVector<Mux::Phase, 2> phases; // parallel to ops
   };
   llvm::MapVector<RegKey, llvm::SmallVector<unsigned>> depthsByKey;
   llvm::DenseMap<RegKey, RegHead> headByKey;

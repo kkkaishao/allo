@@ -7,6 +7,7 @@
 
 #include "allo/IR/AlloOps.h"
 #include "allo/Scheduling/AddressModel.h" // addressDelayOf (per-site address)
+#include "allo/Support/BitAnalysis.h"     // isBitRename
 
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
@@ -434,6 +435,14 @@ OperatorChar OperatorLibrary::lookup(Operation *op) const {
   c.timing.inDelay = e->inDelay;
   c.timing.outDelay = e->outDelay;
   c.pipelined = e->pipelined;
+  // A shift by a literal is wiring, not a shifter. Its own type name because
+  // the problem registers timing per NAME: leaving it on the shift row would
+  // make the two spellings of that row disagree, and the last one populated
+  // would win for both.
+  if (isBitRename(op)) {
+    c.timing.typeName = "rename." + c.timing.typeName;
+    c.timing.inDelay = c.timing.outDelay = 0.0;
+  }
   // Every row is characterized over one parameter, an operand width; an IP's
   // signature pins it, so there the factors are constants and this is the
   // measured core.

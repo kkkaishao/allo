@@ -5,6 +5,7 @@ add_mlir_library(MLIRAlloSupport
     AffineValueMapBuilder.cpp
     AffineRaising.cpp
     AliasAnalysis.cpp
+    BitAnalysis.cpp
     TopologyGraph.cpp
     Logging.cpp
     PARTIAL_SOURCES_INTENDED

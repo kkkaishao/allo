@@ -335,6 +335,10 @@ struct DatapathEmitter {
 
   /// Resolve a datapath Source to the SSA value driving it.
   Value resolveSource(const uarch::Source &s);
+  /// The window a recurrence input reads its reduction identity in: region \p
+  /// rb's counter still inside its first \p dist iterations. A level, sampled
+  /// when the region issues, which a consumer delays to its own stage.
+  Value firstIterations(const uarch::RegionBlock &rb, unsigned dist);
   /// The cycle a freshly-produced Source's value lands, relative to the issuing
   /// pulse of the iteration that produced it. Used by survivor capture.
   unsigned readyCycle(const uarch::Source &s) const;

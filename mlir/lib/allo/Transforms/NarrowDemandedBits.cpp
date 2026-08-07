@@ -3,6 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+#include "allo/Support/BitAnalysis.h" // knownBits
 #include "allo/Transforms/Passes.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
@@ -55,12 +56,39 @@ struct SinkTruncThroughRingOp : OpRewritePattern<arith::TruncIOp> {
   }
 };
 
+// `x & y` -> `x` when every bit `y` would clear is already zero in `x`: a mask
+// over a field the value cannot hold. Writing a bit field splices with such a
+// mask on every field after the first, and the splices CHAIN, so each mask this
+// removes takes a whole AND off the critical path -- for hardware that was
+// never there, the emitted concatenation carrying no mask at all.
+struct DropRedundantMask : OpRewritePattern<arith::AndIOp> {
+  using OpRewritePattern::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(arith::AndIOp op,
+                                PatternRewriter &rewriter) const override {
+    if (!isa<IntegerType>(op.getType()))
+      return failure(); // an index mask has no width to reason in
+    llvm::KnownBits lhs = knownBits(op.getLhs());
+    llvm::KnownBits rhs = knownBits(op.getRhs());
+    // Bit by bit: the mask keeps this one, or the value never sets it.
+    if ((rhs.One | lhs.Zero).isAllOnes()) {
+      rewriter.replaceOp(op, op.getLhs());
+      return success();
+    }
+    if ((lhs.One | rhs.Zero).isAllOnes()) {
+      rewriter.replaceOp(op, op.getRhs());
+      return success();
+    }
+    return failure();
+  }
+};
+
 struct NarrowDemandedBitsPass
     : public allo::impl::NarrowDemandedBitsPassBase<NarrowDemandedBitsPass> {
   void runOnOperation() override {
     MLIRContext *ctx = &getContext();
     RewritePatternSet patterns(ctx);
-    patterns.add<SinkTruncThroughRingOp>(ctx);
+    patterns.add<SinkTruncThroughRingOp, DropRedundantMask>(ctx);
     // The cast folds are what make the rewrite chain: without them a sunk
     // truncation stops on top of an extend instead of collapsing into it.
     arith::TruncIOp::getCanonicalizationPatterns(patterns, ctx);

@@ -3,6 +3,7 @@
 
 """Operator injection/characterization, arithmetic datapath binding (legalize-arith keep/expand, compare/select/shift), and reduction restructuring."""
 
+import collections
 import math
 import os
 import shutil
@@ -12,7 +13,7 @@ import numpy as np
 import pytest
 
 from allo import kernel
-from allo.lang import bf16, f16, f32, i32, KernelOptions
+from allo.lang import bf16, f16, f32, i32, u32, KernelOptions
 from allo.lang.core import APInt
 from allo.lang.ip import operator_ip, OperatorType
 from allo.operators import math as amath
@@ -35,6 +36,7 @@ from _common import (
     _to_rtl,
     _impls,
     _iis,
+    _latency,
     FADD,
     COMB,
     PERIOD_NS,
@@ -768,6 +770,290 @@ def test_shared_multiply_mux():
         o = np.zeros(1, np.float32)
         mod.cosim(a, b, c, o)
         assert np.array_equal(o, ref)
+
+
+def test_bit_slice_lowers_to_arithmetic():
+    # A bit field is named by the frontend and modelled by nothing below it, so
+    # `legalize-arith` expands it into the integer arithmetic the operator
+    # library prices -- before the schedule is cut, so the chaining solve sees
+    # the field access at its real combinational depth. Every shape the frontend
+    # admits: constant and dynamic offset, read and write, and the width-one
+    # slice a bare `x[k]` is.
+    @kernel
+    def fields(A: u32[16], B: u32[16], C: u32[16], D: u32[16]):
+        for i in range(16):
+            B[i] = A[i][8:16]  # constant offset, read
+            w: u32 = 0
+            w[0:8] = A[i][0:8]  # constant offset, write
+            w[8:16] = A[i][24:32]
+            C[i] = w
+            v: u32 = 0
+            v[i : i + 8] = A[i][i : i + 8]  # dynamic offset, both ways
+            v[3] = A[i][0]  # width-one slice
+            D[i] = v
+
+    A = np.random.default_rng(11).integers(0, 2**32, 16, dtype=np.uint64)
+    A = A.astype(np.uint32)
+    idx = np.arange(16, dtype=np.uint32)
+    want_c = (A & 0xFF) | (((A >> 24) & 0xFF) << 8)
+    want_d = ((((A >> idx) & 0xFF) << idx) & ~np.uint32(1 << 3)) | ((A & 1) << 3)
+
+    mod = _to_rtl(fields)
+    # Nothing of the allo dialect survives into the datapath.
+    assert "allo.bit" not in mod.dcp_module.operation.get_asm()
+    # A constant offset is a bit selection, not a shifter: CIRCT folds a shift
+    # by a literal back into extract / concat, which is the hardware a field
+    # access is. A dynamic one cannot be, `comb.extract` taking its low bit as
+    # an attribute, so it keeps a real shifter.
+    assert ">>" not in mod.verilog.split("B_wr0_data")[1].split(";")[0]
+
+    B, C, D = (np.zeros(16, np.uint32) for _ in range(3))
+    mod.cosim(A.copy(), B, C, D)
+    assert np.array_equal(B, (A >> 8) & 0xFF)
+    assert np.array_equal(C, want_c)
+    assert np.array_equal(D, want_d.astype(np.uint32))
+
+
+def _op_kinds(fn):
+    """How many of each operation the schedule placed in the leaf region."""
+    ops = _sched(fn).func(fn.__name__).regions[0].ops
+    return collections.Counter(o.kind for o in ops)
+
+
+def test_bit_field_write_drops_redundant_masks():
+    # Splicing a field masks the hole it fills, and the splices CHAIN, so four
+    # field writes put four AND-OR pairs on one combinational path. Where the
+    # bits a mask clears are ones the value provably never sets -- every field of
+    # a word that started at zero -- the mask computes nothing, and the forward
+    # bit walk in `narrow-demanded-bits` removes it. What is left is the
+    # concatenation the write really is, which fits the clock the un-analysed
+    # chain did not.
+    @kernel
+    def pack(A: u32[16], B: u32[16]):
+        for i in range(16):
+            w: u32 = 0
+            w[0:8] = A[i][0:8]
+            w[8:16] = A[i][8:16]
+            w[16:24] = A[i][16:24]
+            w[24:32] = A[i][24:32]
+            B[i] = w
+
+    @kernel
+    def copy(A: u32[16], B: u32[16]):
+        for i in range(16):
+            B[i] = A[i]
+
+    # A mask over a field that ALREADY holds data is load-bearing and stays, as
+    # is one over a signed shift, whose high bits are the replicated sign.
+    @kernel
+    def overwrite(A: u32[16], V: u32[16], B: u32[16]):
+        for i in range(16):
+            w: u32 = A[i]
+            w[8:16] = V[i][0:8]
+            B[i] = w
+
+    @kernel
+    def signed_mask(A: i32[16], B: i32[16]):
+        for i in range(16):
+            s: i32 = A[i] >> 4
+            B[i] = s & 65535
+
+    assert _op_kinds(pack)["andi"] == 0
+    assert _op_kinds(overwrite)["andi"] == 1
+    assert _op_kinds(signed_mask)["andi"] == 1
+    # The payoff: a word rebuilt field by field costs no more than copying it.
+    assert _latency(pack) == _latency(copy)
+
+    rng = np.random.default_rng(9)
+    A = rng.integers(0, 2**32, 16, dtype=np.uint64).astype(np.uint32)
+    V = rng.integers(0, 2**32, 16, dtype=np.uint64).astype(np.uint32)
+    Ai = rng.integers(-(2**31), 2**31, 16).astype(np.int32)
+
+    B = np.zeros(16, np.uint32)
+    _to_rtl(pack).cosim(A.copy(), B)
+    assert np.array_equal(B, A)
+    B = np.zeros(16, np.uint32)
+    _to_rtl(overwrite).cosim(A.copy(), V.copy(), B)
+    assert np.array_equal(B, (A & np.uint32(0xFFFF00FF)) | ((V & 0xFF) << 8))
+    B = np.zeros(16, np.int32)
+    _to_rtl(signed_mask).cosim(Ai.copy(), B)
+    assert np.array_equal(B, (Ai >> 4) & 0xFFFF)
+
+
+def test_disjoint_or_is_a_concatenation():
+    # Two values sharing no set bit do not COMBINE, they concatenate: every
+    # result bit takes one side while the other contributes a constant zero, the
+    # same zero a synthesizer propagates. Three such ORs chained therefore cost
+    # nothing and settle at one sub-cycle position, where three overlapping ones
+    # stand a gate delay apart. The forward bit walk is what tells them apart.
+    @kernel
+    def disjoint(A: u32[64], B: u32[64], C: u32[64]):
+        for i in range(64):
+            lo: u32 = A[i][0:8]
+            hi: u32 = B[i][0:8]
+            a: u32 = lo | (hi << 8)
+            b: u32 = a | (lo << 16)
+            C[i] = b | (hi << 24)
+
+    @kernel
+    def overlapping(A: u32[64], B: u32[64], C: u32[64]):
+        for i in range(64):
+            a: u32 = A[i] | B[i]
+            b: u32 = a | A[i]
+            C[i] = b | B[i]
+
+    def _or_offsets(fn):
+        ops = _sched(fn).func(fn.__name__).regions[0].ops
+        return sorted({round(o.z, 3) for o in ops if o.kind == "ori"})
+
+    assert len(_or_offsets(disjoint)) == 1
+    spaced = _or_offsets(overlapping)
+    assert len(spaced) == 3
+    assert all(
+        b - a == pytest.approx(COMB["or"], abs=1e-3) for a, b in zip(spaced, spaced[1:])
+    )
+
+    rng = np.random.default_rng(2)
+    A = rng.integers(0, 2**32, 64, dtype=np.uint64).astype(np.uint32)
+    B = rng.integers(0, 2**32, 64, dtype=np.uint64).astype(np.uint32)
+    lo, hi = A & 0xFF, B & 0xFF
+    C = np.zeros(64, np.uint32)
+    _to_rtl(disjoint).cosim(A.copy(), B.copy(), C)
+    assert np.array_equal(C, lo | (hi << 8) | (lo << 16) | (hi << 24))
+    C = np.zeros(64, np.uint32)
+    _to_rtl(overlapping).cosim(A.copy(), B.copy(), C)
+    assert np.array_equal(C, A | B)
+
+
+def test_literal_shift_is_wiring():
+    # A shift by a LITERAL renames bits: `comb` folds it into an extract /
+    # concat, so it costs no logic. The device's shift row prices a barrel
+    # shifter, the delay a RUNTIME amount pays, so charging it here would cut
+    # chains around hardware that is not there and pay for the cut in registers.
+    # The two kernels have the same operation count and the same memory traffic;
+    # only the shift amount differs, so any gap is the shifter's delay alone.
+    @kernel
+    def literal(A: u32[16], C: u32[16], B: u32[16]):
+        for i in range(16):
+            a: u32 = (A[i] << 3) ^ C[i]
+            b: u32 = (a << 3) ^ C[i]
+            c: u32 = (b << 3) ^ C[i]
+            B[i] = (c << 3) ^ C[i]
+
+    @kernel
+    def runtime(A: u32[16], C: u32[16], B: u32[16]):
+        for i in range(16):
+            a: u32 = (A[i] << C[i]) ^ C[i]
+            b: u32 = (a << C[i]) ^ C[i]
+            c: u32 = (b << C[i]) ^ C[i]
+            B[i] = (c << C[i]) ^ C[i]
+
+    assert len(_sched(literal).func("literal").regions[0].ops) == len(
+        _sched(runtime).func("runtime").regions[0].ops
+    )
+    # Tight enough that the shifter's delay forces a cut the wiring does not.
+    assert _latency(literal, freq_mhz=700) < _latency(runtime, freq_mhz=700)
+
+    rng = np.random.default_rng(4)
+    A = rng.integers(0, 2**32, 16, dtype=np.uint64).astype(np.uint32)
+    C = (rng.integers(0, 2**32, 16, dtype=np.uint64).astype(np.uint32),)[0]
+    want = A
+    for _ in range(4):
+        want = ((want << np.uint32(3)) ^ C).astype(np.uint32)
+    B = np.zeros(16, np.uint32)
+    _to_rtl(literal).cosim(A.copy(), C.copy(), B)
+    assert np.array_equal(B, want)
+
+
+def _shared_units(mod):
+    """How many operations each shared unit carries, across every region."""
+    return sorted(
+        u.bound_ops for r in mod.microarch.top.regions for u in r.shared_units
+    )
+
+
+def _mux_fanins(mod):
+    """Every multiplexer's fan-in, one entry per mux."""
+    return sorted(
+        f
+        for r in mod.microarch.top.regions
+        for m in r.muxes
+        for f in [m.fanin] * m.count
+    )
+
+
+def test_shared_reduction_reinjects_its_identity():
+    # A loop-carried accumulator may share its adder with ordinary ops: the
+    # identity it re-injects on the first iteration rides an ARM of that unit's
+    # input mux (`Mux::Phase`), since a time-shared port has no cycle of its own
+    # to time a 2:1 mux against. The identity is non-zero, so an arm that never
+    # fires (or fires on the wrong iteration) shows up in the sum rather than
+    # cancelling against a zeroed register.
+    @kernel
+    def fred(A: f32[64], B: f32[64], out: f32[1]):
+        s: f32 = 1.5
+        for i in range(0, 64, 4):
+            s = s + A[i]
+            B[i] = A[i] + A[i + 1]
+            B[i + 1] = A[i + 1] + A[i + 2]
+            B[i + 2] = A[i + 2] + A[i + 3]
+            B[i + 3] = A[i + 3] + A[i]
+        out[0] = s
+
+    A = np.random.default_rng(5).standard_normal(64).astype(np.float32)
+    want = np.float32(1.5)
+    for i in range(0, 64, 4):
+        want = np.float32(want + A[i])
+
+    shared = _to_rtl(fred, binding="greedy-share")
+    assert _shared_units(shared), "the reduction's adder was not shared at all"
+    # The recurrence port carries one arm per bound op plus the identity's.
+    assert max(_mux_fanins(shared)) > max(u for u in _shared_units(shared))
+
+    for mod in (_to_rtl(fred), shared):
+        B, out = np.zeros(64, np.float32), np.zeros(1, np.float32)
+        mod.cosim(A.copy(), B, out)
+        assert abs(out[0] - want) < 1e-3
+        assert np.allclose(B[0::4], A[0::4] + A[1::4], rtol=1e-5)
+
+
+def test_shared_mux_delay_accumulates_along_a_chain():
+    # A mux's delay does not stop at the unit it feeds: two shared units on one
+    # combinational chain both shift what they drive, so the binder has to
+    # charge the whole cone rather than one fold at a time. Charging one fold at
+    # a time admits plans the period check then REFUSES, which is what this
+    # chain of native adds used to do. What holds at every clock is that greedy
+    # sharing produces a datapath, and the same one trivial binding computes.
+    @kernel
+    def chain(A: i32[64], B: i32[64]):
+        for i in range(0, 64, 4):
+            a0: i32 = A[i] + A[i + 1]
+            a1: i32 = A[i + 2] + A[i + 3]
+            b0: i32 = a0 + a1
+            b1: i32 = a0 - a1
+            B[i] = b0 + b1
+            B[i + 1] = b0 - b1
+            B[i + 2] = a0 + b0
+            B[i + 3] = a1 + b1
+
+    A = np.random.default_rng(3).integers(-50, 50, size=64).astype(np.int32)
+    ref = np.zeros(64, np.int32)
+    for i in range(0, 64, 4):
+        a0, a1 = A[i] + A[i + 1], A[i + 2] + A[i + 3]
+        b0, b1 = a0 + a1, a0 - a1
+        ref[i], ref[i + 1] = b0 + b1, b0 - b1
+        ref[i + 2], ref[i + 3] = a0 + b0, a1 + b1
+
+    # The schedule itself moves with the clock (chaining cuts elsewhere, `z`
+    # lands elsewhere), so the fold COUNT is no invariant; that a plan exists at
+    # every one of them is.
+    for freq in (200, 300, 500):
+        _to_rtl(chain, binding="greedy-share", freq_mhz=freq).mlir
+    assert _shared_units(_to_rtl(chain, binding="greedy-share"))
+    for mod in (_to_rtl(chain), _to_rtl(chain, binding="greedy-share")):
+        B = np.zeros(64, np.int32)
+        mod.cosim(A.copy(), B)
+        assert np.array_equal(B, ref)
 
 
 @pytest.mark.skipif(not has_exact_scheduler(), reason="build has no OR-Tools")

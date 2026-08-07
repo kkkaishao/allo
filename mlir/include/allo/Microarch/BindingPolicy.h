@@ -37,9 +37,10 @@ struct TrivialBinding : BindingPolicy {
 };
 
 /// Greedy within-region sharing: fold same-operator-type units whose MRT
-/// reservations are disjoint onto one unit, while the multiplexer that fold
-/// grows still fits the clock. Area-agnostic: it shares every compatible op
-/// whose timing allows.
+/// reservations are disjoint onto one unit, while the multiplexers so far grown
+/// still fit the clock along the WHOLE combinational chain each of them
+/// lengthens, not just at the unit they sit on. Area-agnostic: it shares every
+/// compatible op whose timing allows.
 struct GreedyShareBinding : BindingPolicy {
   std::vector<llvm::SmallVector<UnitId, 2>>
   plan(const Datapath &dp, const BindingContext &ctx) const override;

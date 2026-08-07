@@ -1052,26 +1052,36 @@ void DatapathBuilder::resolveUnitInputs() {
       continue;
     }
     // Shared unit: resolve every bound op's port k independently (each may need
-    // its own register depth), then a mux picks per op's issue cycle.
+    // its own register depth), then a mux picks per op's issue cycle. Resolved
+    // up front because a recurrence operand takes TWO arms, and `recordEdge`
+    // takes a pointer into `sources`, so the list must be sized before any
+    // edge lands in it.
     for (unsigned k = 0; k < nPorts; ++k) {
-      muxBuilds.push_back({u.id, k, ridx, {}, {}});
+      SmallVector<Resolved, 2> edges;
+      unsigned arms = 0;
+      for (const auto &bo : u.boundOps) {
+        edges.push_back(resolveOperand(bo.first->getOperand(k), bo.first, ii));
+        arms += edges.back().init ? 2 : 1;
+      }
+      muxBuilds.push_back({u.id, k, ridx, {}, {}, {}});
       MuxBuild &mb = muxBuilds.back();
-      mb.sources.resize(u.boundOps.size());
-      for (unsigned j = 0; j < u.boundOps.size(); ++j) {
+      mb.sources.resize(arms);
+      unsigned arm = 0;
+      for (auto [j, r] : llvm::enumerate(edges)) {
         Operation *opj = u.boundOps[j].first;
-        auto r = resolveOperand(opj->getOperand(k), opj, ii);
-        // A shared unit reaches its input through the mux below, leaving
-        // nowhere to time the reduction identity's re-injection against.
-        if (r.init.kind != Source::Kind::None) {
-          unsupported(Stage::Emit, Code::SharedReductionUnit, opj)
-              << "Binding policy shares one operator unit between a "
-                 "loop-carried reduction and another op; re-injecting the "
-                 "reduction identity through the shared input mux is not "
-                 "modelled. Use binding='trivial' for this kernel";
-          dp.infeasible = true;
+        // The identity rides an arm of its own rather than a mux in front of
+        // the port: a shared port carries a different op's operand each cycle,
+        // leaving no cycle to time such a mux against. An unresolvable init is
+        // reported by `resolveOperand` and takes no arm.
+        if (r.init) {
+          mb.ops.push_back(opj);
+          mb.phases.push_back({Mux::Phase::First, r.initDist});
+          mb.sources[arm++] = r.init; // held: a literal, a port, a survivor
         }
         mb.ops.push_back(opj);
-        recordEdge(r, mb.sources[j], ridx);
+        mb.phases.push_back(
+            {r.init ? Mux::Phase::Rest : Mux::Phase::Always, r.initDist});
+        recordEdge(r, mb.sources[arm++], ridx);
       }
     }
   }
@@ -1372,9 +1382,15 @@ void DatapathBuilder::insertRegisters() {
   auto sameSource = [](const Source &a, const Source &b) {
     return a.kind == b.kind && a.id == b.id && a.outPort == b.outPort;
   };
+  auto unphased = [](const Mux::Phase &p) {
+    return p.kind == Mux::Phase::Always;
+  };
   for (MuxBuild &mb : muxBuilds) {
     Source &slot = dp.units[mb.unit].inputs[mb.port];
-    if (llvm::all_of(mb.sources, [&](const Source &s) {
+    // One driver across every arm is a wire. A phased arm never collapses: its
+    // pair carries the same port in different iterations, not the same value.
+    if (llvm::all_of(mb.phases, unphased) &&
+        llvm::all_of(mb.sources, [&](const Source &s) {
           return sameSource(s, mb.sources[0]);
         })) {
       slot = mb.sources[0];
@@ -1385,6 +1401,7 @@ void DatapathBuilder::insertRegisters() {
     mx.region = mb.region;
     mx.sources.assign(mb.sources.begin(), mb.sources.end());
     mx.selectOps.assign(mb.ops.begin(), mb.ops.end());
+    mx.phases.assign(mb.phases.begin(), mb.phases.end());
     dp.regions[mb.region].muxes.push_back(mx.id);
     slot = Source{Source::Kind::Mux, mx.id, 0};
     dp.muxes.push_back(std::move(mx));

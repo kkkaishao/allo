@@ -165,10 +165,26 @@ Value DatapathEmitter::resolveSource(const uarch::Source &s) {
     // Timed against the OWNING region's shell (`mx.region`), not whichever
     // region is emitting: the select rides that region's issue pulse.
     StallShell sh = shellFor(mx.region);
+    // A recurrence operand's identity window, delayed to its op's stage. Built
+    // once per op: its First and Rest arms split that one pulse, which keeps
+    // them complementary by construction.
+    DenseMap<Operation *, Value> windowOf;
     SmallVector<Value> values, selects;
-    for (auto [src, op] : llvm::zip(mx.sources, mx.selectOps)) {
+    for (auto [k, src] : llvm::enumerate(mx.sources)) {
+      Operation *op = mx.selectOps[k];
+      const uarch::Mux::Phase &ph = mx.phases[k];
+      Value sel = c.activationPulse(issue, op, sh);
+      if (ph.kind != uarch::Mux::Phase::Always) {
+        Value &window = windowOf[op];
+        if (!window)
+          window = c.activationPulse(
+              firstIterations(dp.regions[mx.region], ph.dist), op, sh);
+        sel = c.andBits(sel, ph.kind == uarch::Mux::Phase::First
+                                 ? window
+                                 : c.notBit(window));
+      }
       values.push_back(resolveSource(src));
-      selects.push_back(c.activationPulse(issue, op, sh));
+      selects.push_back(sel);
     }
     Value v = c.oneHotSelect(values, selects);
     muxVal[s.id] = v;
@@ -194,6 +210,33 @@ Value DatapathEmitter::resolveSource(const uarch::Source &s) {
     llvm_unreachable("unresolved (None) source reached emission");
   }
   llvm_unreachable("unhandled Source::Kind");
+}
+
+Value DatapathEmitter::firstIterations(const uarch::RegionBlock &rb,
+                                       unsigned dist) {
+  Value iv = controlOf.lookup(rb.id).counter;
+  assert(iv && "a recurrence input in a region with no iteration counter");
+  // Against the RAW counter register, so the whole test is at the width its
+  // terminator compares at; a bound from elsewhere resizes into it.
+  auto ivTy = cast<IntegerType>(rb.counterType);
+  auto at = [&](Value x) {
+    return resize(c.b, c.loc, x, ivTy.getWidth(), /*isSigned=*/true);
+  };
+  Value lb = at(resolveSource(rb.lbSource));
+  if (dist <= 1)
+    return c.icmpEqV(iv, lb);
+  // iv < lb + dist*step  ==  !(iv >= lb + dist*step)
+  std::optional<int64_t> kstep = dp.constantOf(rb.stepSource);
+  Value distStep =
+      kstep ? c.konst(ivTy, static_cast<int64_t>(dist) * *kstep)
+            : c.R(comb::MulOp::create(c.b, c.loc,
+                                      c.konst(ivTy, static_cast<int64_t>(dist)),
+                                      at(resolveSource(rb.stepSource)), false));
+  Value bound = c.R(comb::AddOp::create(c.b, c.loc, lb, distStep, false));
+  // Signed, as `Terminator::isLast` compares the same counter against the same
+  // kind of bound. An unsigned predicate would order a negative `lb` the wrong
+  // way round.
+  return c.notBit(c.icmpSgeV(iv, bound));
 }
 
 unsigned DatapathEmitter::readyCycle(const uarch::Source &s) const {
@@ -683,40 +726,14 @@ void DatapathEmitter::emitUnits(const uarch::RegionBlock &rb, UnitMode mode) {
           resolveSource(u.inputs[k]); // a self-reference reads its own backedge
       // Re-inject the reduction identity at a recurrence input while `iv` is in
       // `[lb, lb + dist*step)`, gated by the issue pulse delayed to this op's
-      // stage.
+      // stage. A SHARED port carries no init: its identity is an arm of the
+      // input mux, resolved above.
       if (mode == UnitMode::Leaf &&
           u.inputInits[k].kind != uarch::Source::Kind::None) {
-        const auto rc = controlOf.lookup(rb.id);
-        Value iv = rc.counter, issue = rc.issue;
-        assert(iv && issue &&
-               "recurrence input in a region with no controller");
-        // Against the RAW counter register, so the whole test is at the width
-        // its terminator compares at; a bound from elsewhere resizes into it.
-        auto ivTy = cast<IntegerType>(rb.counterType);
-        auto at = [&](Value x) {
-          return resize(c.b, c.loc, x, ivTy.getWidth(), /*isSigned=*/true);
-        };
-        Value lb = at(resolveSource(rb.lbSource));
-        unsigned dist = u.inputInitDist[k];
-        Value cond;
-        if (dist <= 1) {
-          cond = c.icmpEqV(iv, lb); // iv == lb
-        } else {
-          // iv < lb + dist*step  ==  !(iv >= lb + dist*step)
-          std::optional<int64_t> kstep = dp.constantOf(rb.stepSource);
-          Value distStep =
-              kstep ? c.konst(ivTy, static_cast<int64_t>(dist) * *kstep)
-                    : c.R(comb::MulOp::create(
-                          c.b, c.loc, c.konst(ivTy, static_cast<int64_t>(dist)),
-                          at(resolveSource(rb.stepSource)), false));
-          Value bound =
-              c.R(comb::AddOp::create(c.b, c.loc, lb, distStep, false));
-          // Signed, as `Terminator::isLast` compares the same counter against
-          // the same kind of bound. An unsigned predicate would order a
-          // negative `lb` the wrong way round.
-          cond = c.notBit(c.icmpSgeV(iv, bound));
-        }
-        Value iter0 = c.R(comb::AndOp::create(c.b, c.loc, issue, cond, false));
+        Value issue = controlOf.lookup(rb.id).issue;
+        assert(issue && "recurrence input in a region with no controller");
+        Value iter0 = c.R(comb::AndOp::create(
+            c.b, c.loc, issue, firstIterations(rb, u.inputInitDist[k]), false));
         Value gate = c.activationPulse(iter0, u.repOp(), sh);
         v = c.mux(gate, resolveSource(u.inputInits[k]), v);
       }
