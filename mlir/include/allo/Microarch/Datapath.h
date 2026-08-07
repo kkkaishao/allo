@@ -668,10 +668,18 @@ struct RegionBlock {
   bool conditional = false;
   // The two raw structural flags `shape` is derived from. Consumers should read
   // `shape`.
-  bool guard = false;      // this region op is a dcp.select
-  bool container = false;  // nests another dcp region in EITHER arm, so a
-                           // guard with children is `container` too and this
-                           // is not the same as `shape == Container`
+  bool guard = false;     // this region op is a dcp.select
+  bool container = false; // nests another dcp region in EITHER arm, so a
+                          // guard with children is `container` too and this
+                          // is not the same as `shape == Container`
+  /// Whether a value produced by one iteration is read back by a later one out
+  /// of a register of this region: a chain tap at `distance * ii + tY - ready`,
+  /// or a fused IP whose own pipeline is the accumulator. Such a read holds
+  /// only while iterations issue exactly `ii` apart, which is what stops
+  /// `deriveStallShell` from deferring an issue without freezing the datapath.
+  /// A recurrence carried through a stream or a memory is elastic and is not
+  /// one of these.
+  bool cycleIndexedState = false;
   std::string counterName; // source loop IV name (its NameLoc), for a readable
                            // iteration-counter wire; empty when the IV carried
                            // no name (best-effort)

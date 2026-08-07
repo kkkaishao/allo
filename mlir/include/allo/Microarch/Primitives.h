@@ -160,7 +160,8 @@ struct StallShell {
   // advances only while high, so the datapath freezes together.
   Value chainEnable; // F consumes; null => rigid
   // G's half: the controller issues only while high and DEFERS the denied pass
-  // rather than dropping it. Coincides with `chainEnable` today.
+  // rather than dropping it. Implies `chainEnable` and is strictly stronger
+  // wherever the region may drain a deferred pass away, leaving a bubble.
   Value issueEnable; // G consumes; null => rigid (issue ungated)
   /// Whether this region is latency-insensitive at all (has a stall shell).
   explicit operator bool() const { return chainEnable != Value(); }

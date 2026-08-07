@@ -90,6 +90,62 @@ def test_one_shell_enables_every_time_base_cell():
         assert np.array_equal(y, x + 7), f"gap={gap}: {list(y)}"
 
 
+# The two halves part on what a blocked handshake blocks. An empty input holds
+# back only the pass that would read it, so the datapath keeps advancing and
+# the tokens already in flight still leave: `_valid` reaches `issueEnable` and
+# not `chainEnable`. Draining under starvation is what lets a feedback cycle
+# through two processes turn on fewer tokens than the pipeline is deep.
+def test_a_starved_input_defers_the_pass_without_freezing_the_chain():
+    @kernel
+    def defer(x_in: Stream[i32], y_out: Stream[i32]):
+        for i in range(16):
+            y_out.put(x_in.get() * 3 + 7)
+
+    rtl = _to_rtl(defer)
+    m = _Mod(rtl.mlir, "defer")
+    assert m.hints_like(r"_ien$") == ["r0_ien"], "the shell did not split"
+    ce, ien = m.hinted("r0_ce"), m.hinted("r0_ien")
+
+    assert "x_in_st_valid" in m.cone(ien), "issue does not wait for its input"
+    assert "x_in_st_valid" not in m.cone(ce), "a starved input froze the chain"
+    # An in-flight token that cannot leave still freezes it: back-pressure on
+    # the output reaches both halves.
+    assert "y_out_st_ready" in m.cone(ce)
+    assert ien in m.cone(m.signal("r0_issue"))
+    # And the chain cells all stay on F's half.
+    assert {m.enable_of(reg, inp) for _, reg, inp in m.time_base()} == {ce}
+
+    x = np.arange(16, dtype=np.int32) * 5 - 3
+    for gap in _STALLS:
+        y = np.zeros(16, dtype=np.int32)
+        rtl.cosim(x, y, stall_prob=gap)
+        assert np.array_equal(y, x * 3 + 7), f"gap={gap}: {list(y)}"
+
+
+# The one region that cannot take the bubble a deferred pass leaves. A value
+# read back by a later iteration off a register tap is indexed in cycles, so a
+# skipped issue would fold the slot beside it in. Such a region freezes on a
+# starved input instead, which is the two halves collapsing back into one.
+def test_a_register_recurrence_freezes_rather_than_deferring():
+    @kernel
+    def fold(x_in: Stream[i32], out: i32[1]):
+        a: i32 = 0
+        for i in range(16):
+            a += x_in.get()
+        out[0] = a
+
+    rtl = _to_rtl(fold)
+    m = _Mod(rtl.mlir, "fold")
+    assert m.hints_like(r"_ien$") == [], "an accumulator region may not bubble"
+    assert "x_in_st_valid" in m.cone(m.hinted("r0_ce"))
+
+    x = np.arange(16, dtype=np.int32) * 5 - 3
+    for gap in _STALLS:
+        out = np.zeros(1, dtype=np.int32)
+        rtl.cosim(x, out, stall_prob=gap)
+        assert out[0] == x.sum(), f"gap={gap}: {out[0]} != {x.sum()}"
+
+
 # A clock-enabled IP's `ce` port IS the region's `chainEnable`. The shell is
 # consumed at the IP boundary too: a free-running IP would keep clocking
 # while the shift chains are frozen and fold a stale result.

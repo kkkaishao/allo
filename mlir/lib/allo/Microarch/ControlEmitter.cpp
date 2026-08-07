@@ -106,7 +106,8 @@ llvm::SmallVector<Value> ControlEmitter::emitScaledCounters(
 RegionControl ControlEmitter::emitPipelined(unsigned region, int64_t ii,
                                             const Terminator &term, Value start,
                                             const StallShell &sh) const {
-  // G's half of H: a rigid region issues unconditionally.
+  // G's half of H: a rigid region issues unconditionally. The phase counter
+  // below takes F's half instead, being a time base rather than a gate.
   Value enable = sh ? sh.issueEnable : c.t1;
   static_assert(kPipelinedBoundary.arm == 1,
                 "`running` below is a register set by `start`, so the first "
@@ -127,12 +128,15 @@ RegionControl ControlEmitter::emitPipelined(unsigned region, int64_t ii,
         comb::AndOp::create(c.b, c.loc, running, c.icmpEq(phase, 0), false));
     Value phasep1 = c.R(comb::AddOp::create(c.b, c.loc, phase, c.one32, false));
     Value phaseAdv = c.mux(c.icmpEq(phase, ii - 1), c.zero32, phasep1);
-    // The phase is the region's time base, not only an issue gate: it reloads
-    // on `start` and free-runs, so the value chains folded onto it keep
-    // advancing through the drain. A stalled cycle (enable low) freezes it, and
-    // those chains with it, so the cadence resumes where it paused.
-    phaseNext.setValue(c.mux(term.gateStart(c, start), c.zero32,
-                             c.mux(enable, phaseAdv, phase)));
+    // The phase is the region's time base rather than an issue gate: it
+    // reloads on `start` and free-runs with the chains folded onto it, so a
+    // frozen cycle holds them together and the cadence resumes where it
+    // paused. A pass deferred by a starved input leaves the phase running,
+    // which keeps that pass a whole `ii` late and the modulo reservation
+    // intact.
+    phaseNext.setValue(
+        c.mux(term.gateStart(c, start), c.zero32,
+              c.mux(sh ? sh.chainEnable : c.t1, phaseAdv, phase)));
   }
   // Gated issue: a stalled cycle (enable low) issues nothing, so the counter,
   // `running`, and (with the enabled shift chains) the whole datapath hold.

@@ -144,7 +144,8 @@ struct ControlEmitter {
   /// counter, differing only in \p term and, for II>1, a phase counter gating
   /// issue. Non-speculative for a conditional terminator (II >= t_cond, so no
   /// doomed iteration issues); no backpressure. \p sh gates issue as
-  /// `wantIssue & sh.issueEnable`; a rigid shell leaves issue ungated.
+  /// `wantIssue & sh.issueEnable` and runs the phase counter on
+  /// `sh.chainEnable`; a rigid shell leaves both ungated.
   /// \p region names the emitted state cells (`r<id>_run` / `_iv` / `_phase`).
   RegionControl emitPipelined(unsigned region, int64_t ii,
                               const Terminator &term, Value start,
@@ -492,14 +493,15 @@ struct DatapathEmitter {
   /// Bind each input stream's `_data` module port into `streamReadData` (once,
   /// before any consumer), so a Source::Stream resolves like a memory read.
   void bindStreamReads(const uarch::RegionBlock &rb);
-  /// H for one region: wire region \p rb's stream handshakes and RETURN the
+  /// H for one region: wire region \p rb's stream handshakes and return the
   /// stall shell they derive. An input contributes its `_ready` (gated so a
-  /// full output freezes intake too), an output its `_data` plus `_valid`; the
-  /// region's stall (input-empty | output-full) becomes
-  /// `{chainEnable, issueEnable}` and each put's stage folds into
-  /// \p fb.storeDrain. Runs on the already-emitted (F, G) pair, timing its own
-  /// deeper pulses against the region's registered PROMISE; the caller resolves
-  /// that promise with the result.
+  /// full output holds intake too), an output its `_data` plus `_valid`; the
+  /// region's stalls become `{chainEnable, issueEnable}`, split by whether the
+  /// blocked handshake belongs to an in-flight iteration or to the pass about
+  /// to issue, and each put's stage folds into \p fb.storeDrain. Runs on the
+  /// already-emitted (F, G) pair, timing its own deeper pulses against the
+  /// region's registered promise; the caller resolves that promise with the
+  /// result.
   StallShell deriveStallShell(const uarch::RegionBlock &rb, Value issue,
                               DatapathFeedback &fb);
   /// Drive every boundary channel's module ports, and build every local

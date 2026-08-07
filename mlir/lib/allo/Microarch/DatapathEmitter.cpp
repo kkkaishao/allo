@@ -1120,14 +1120,24 @@ void DatapathEmitter::bindStreamReads(const uarch::RegionBlock &rb) {
 }
 
 // H for region \p rb: its stream handshakes, and the shell they derive. A put
-// contributes to `_data`/`_valid`; a get to `_ready`. Both a full output and an
-// empty input freeze the pipeline (`chainEnable`), so the phase counter, the
-// shift chains and every Ce operator hold together and no bubble slips stale
-// data into loop-carried state. A stage-0 access keys on the UNgated
-// `wantIssue` so the signals stay combinationally acyclic, a deeper access on
-// the registered delayed issue. A predicated access (`acc.when` set) also gates
-// its handshake on the predicate, itself a datapath value rather than a FIFO
-// status, so acyclicity is preserved.
+// contributes to `_data`/`_valid`; a get to `_ready`.
+//
+// The two halves split on what a blocked handshake blocks. A stage>=1 access
+// belongs to an iteration in flight, which cannot advance, so it freezes the
+// datapath (`chainEnable`); a stage-0 access belongs to the pass about to
+// start, so it only defers that pass (`issueEnable`) and the region drains.
+// Draining under starvation is what lets a feedback cycle between two
+// processes turn on fewer tokens than the pipeline is deep. The bubble a
+// deferral leaves is safe where every intra-iteration chain advances with its
+// own iteration and every commit rides a pulse that reads 0 in it;
+// `cycleIndexedState` marks the region holding state indexed in cycles
+// instead, and there the two halves are one.
+//
+// A stage-0 access keys on the UNgated `wantIssue` so the signals stay
+// combinationally acyclic, a deeper access on the registered delayed issue. A
+// predicated access (`acc.when` set) also gates its handshake on the
+// predicate, itself a datapath value rather than a FIFO status, so acyclicity
+// is preserved.
 //
 // The pulses built here are timed against the region's PROMISED shell, which is
 // what the returned enables resolve: the enable and the chains it freezes are
@@ -1153,8 +1163,26 @@ StallShell DatapathEmitter::deriveStallShell(const uarch::RegionBlock &rb,
          "defers a starved or back-pressured pass by GATING its issue, so a "
          "controller whose issue cannot be gated would drop the pass and "
          "sample `_data` with no regard for `_valid`");
-  // Outputs: drive data + valid, accumulate the output-full hazard.
-  Value outHazard; // OR over the region's puts of (valid & ~ready)
+  // Stage-0 inputs (read at issue) join into `stage0Valid`; a predicated get
+  // treats a non-needed input as available (`valid | ~pred`). Built before the
+  // puts because a stage-0 put shares the join: a pass that cannot issue
+  // writes no token, so it needs no space.
+  Value stage0Valid;
+  for (uarch::AccRef r : rb.streamAccesses) {
+    const uarch::StreamChannel &s = dp.streams[r.id];
+    const uarch::StreamChannel::Access &acc = s.accesses[r.idx];
+    if (acc.isPut || acc.stage != 0)
+      continue;
+    Value valid = streamValid(s);
+    if (acc.when)
+      valid = c.orBits(valid, c.notBit(resolveSource(acc.when)));
+    stage0Valid = stage0Valid ? c.andBits(stage0Valid, valid) : valid;
+  }
+  Value fed = stage0Valid ? c.andBits(atIssue, stage0Valid) : atIssue;
+
+  // Outputs: drive data + valid, accumulate the two back-pressure hazards.
+  Value outHazard;   // stage>=1: the token is in flight and cannot advance
+  Value issueHazard; // stage 0: the token would be written by the pass itself
   // A stage>=1 put whose handshake fired while the pipeline is frozen: see the
   // `sent` latch below. Resolved once `chainEnable` is final.
   struct Sent {
@@ -1186,29 +1214,26 @@ StallShell DatapathEmitter::deriveStallShell(const uarch::RegionBlock &rb,
     auto &drv = streamDrives[s.id];
     drv.data.push_back({valid, resolveSource(acc.data)});
     drv.valid = drv.valid ? c.orBits(drv.valid, valid) : valid;
-    // A stage-0 put keys its hazard on wantIssue (ungated) & pred; a stage>=1
-    // put's valid is already registered (delayed) and predicate-gated.
-    Value active = acc.stage == 0 ? atIssue : valid;
+    // A stage-0 put keys its hazard on the pass that would write it (`fed` &
+    // pred); a stage>=1 put's valid is already registered (delayed) and
+    // predicate-gated.
+    Value active = acc.stage == 0 ? fed : valid;
     if (pred && acc.stage == 0)
       active = c.andBits(active, pred);
     Value hz = c.andBits(active, c.notBit(streamReady(s)));
-    outHazard = outHazard ? c.orBits(outHazard, hz) : hz;
+    Value &into = acc.stage == 0 ? issueHazard : outHazard;
+    into = into ? c.orBits(into, hz) : hz;
     fb.storeDrain = std::max<unsigned>(fb.storeDrain, acc.stage);
   }
   // Mid-pipeline freeze: a stage>0 get with a needed-but-empty input cannot
   // bubble past a missing token, so fold that stall into `chainEnable` beside
   // the output-full freeze. Only registered state is read here.
   Value midStall;
-  unsigned stage0Gets = 0;
   for (uarch::AccRef r : rb.streamAccesses) {
     const uarch::StreamChannel &s = dp.streams[r.id];
     const uarch::StreamChannel::Access &acc = s.accesses[r.idx];
-    if (acc.isPut)
+    if (acc.isPut || acc.stage == 0)
       continue;
-    if (acc.stage == 0) {
-      ++stage0Gets;
-      continue;
-    }
     Value active = c.delayValid(issue, acc.stage, sh);
     Value want = acc.when ? c.andBits(active, resolveSource(acc.when)) : active;
     Value miss = c.andBits(want, c.notBit(streamValid(s)));
@@ -1218,28 +1243,21 @@ StallShell DatapathEmitter::deriveStallShell(const uarch::RegionBlock &rb,
   if (midStall)
     chainEnable = c.andBits(chainEnable, c.notBit(midStall));
 
-  // Stage-0 inputs (read at issue) fold into `stage0Valid`, the issue gate; a
-  // predicated get treats a non-needed input as available (`valid | ~pred`).
-  // With >1 stage-0 get they must pop together, so their readies gate on it.
-  Value stage0Valid;
-  for (uarch::AccRef r : rb.streamAccesses) {
-    const uarch::StreamChannel &s = dp.streams[r.id];
-    const uarch::StreamChannel::Access &acc = s.accesses[r.idx];
-    if (acc.isPut || acc.stage != 0)
-      continue;
-    Value valid = streamValid(s);
-    if (acc.when)
-      valid = c.orBits(valid, c.notBit(resolveSource(acc.when)));
-    stage0Valid = stage0Valid ? c.andBits(stage0Valid, valid) : valid;
-  }
-  bool join0 = stage0Gets > 1;
-
-  // A starved stage-0 slot freezes the whole shell rather than bubbling: a
-  // bubble would desync the II>1 phase/chain alignment and clock stale data
-  // into a recurrence. An acyclic region freezes on the same term.
+  // G additionally defers a pass whose stage-0 handshakes are not both open.
+  // Spelled `~(wantIssue & ~stage0Valid)` rather than `stage0Valid` so it still
+  // reads 1 outside a pass: under the merge below, a region draining after its
+  // last issue must not freeze on an empty input.
+  Value issueEnable = chainEnable;
   if (stage0Valid)
-    chainEnable = c.andBits(
-        chainEnable, c.notBit(c.andBits(atIssue, c.notBit(stage0Valid))));
+    issueEnable = c.andBits(
+        issueEnable, c.notBit(c.andBits(atIssue, c.notBit(stage0Valid))));
+  if (issueHazard)
+    issueEnable = c.andBits(issueEnable, c.notBit(issueHazard));
+
+  // A region holding cycle-indexed state cannot take that bubble, so its two
+  // halves are one and it freezes where it would otherwise drain.
+  if (rb.cycleIndexedState)
+    chainEnable = issueEnable;
 
   // `chainEnable` is final: retire each stage>=1 put's token until the chain
   // advances past it (`flag' = ~chainEnable & (flag | fired)`). Only the
@@ -1248,29 +1266,27 @@ StallShell DatapathEmitter::deriveStallShell(const uarch::RegionBlock &rb,
     st.in.setValue(c.andBits(c.notBit(chainEnable),
                              c.orBits(st.flag, c.andBits(st.valid, st.ready))));
 
-  // Drive each `_ready`: a stage-0 get accepts when issuing and not frozen
-  // (a join also waits for all stage-0 inputs); a deeper get accepts when
-  // the chain advances; a predicated get pops only where its predicate holds.
+  // Drive each `_ready`: a stage-0 get pops exactly where the pass issues,
+  // which already joins every stage-0 input; a deeper get accepts when the
+  // chain advances; a predicated get pops only where its predicate holds.
   for (uarch::AccRef r : rb.streamAccesses) {
     const uarch::StreamChannel &s = dp.streams[r.id];
     const uarch::StreamChannel::Access &acc = s.accesses[r.idx];
     if (acc.isPut)
       continue;
     Value pred = acc.when ? resolveSource(acc.when) : Value();
-    Value active =
-        acc.stage == 0 ? atIssue : c.delayValid(issue, acc.stage, sh);
-    Value ready = c.andBits(active, chainEnable);
-    if (acc.stage == 0 && join0)
-      ready = c.andBits(ready, stage0Valid);
+    Value ready = acc.stage == 0 ? c.andBits(atIssue, issueEnable)
+                                 : c.andBits(c.delayValid(issue, acc.stage, sh),
+                                             chainEnable);
     if (pred)
       ready = c.andBits(ready, pred);
     auto &drv = streamDrives[s.id];
     drv.ready = drv.ready ? c.orBits(drv.ready, ready) : ready;
   }
   nameValue(chainEnable, regionSignal(rb.id, "ce"));
-  // The two halves coincide: input starvation is already folded into the freeze
-  // above, so the cycle the chain may advance is the cycle a pass may issue.
-  return {chainEnable, chainEnable};
+  if (issueEnable != chainEnable)
+    nameValue(issueEnable, regionSignal(rb.id, "ien"));
+  return {chainEnable, issueEnable};
 }
 
 // Drive each channel from the terms every region contributed. A BOUNDARY
@@ -1325,7 +1341,8 @@ void DatapathEmitter::emitInternalChannel(const uarch::StreamChannel &s,
   assert(drv.valid && drv.ready &&
          "a local channel is validated to have both ends");
   auto fifo = seq::FIFOOp::create(
-      c.b, c.loc, datapathType(s.payload, c.b), c.i1, c.i1, Type(), Type(), data,
+      c.b, c.loc, datapathType(s.payload, c.b), c.i1, c.i1, Type(), Type(),
+      data,
       /*rdEn=*/c.andBits(drv.ready, w.valid),
       /*wrEn=*/c.andBits(drv.valid, w.ready), c.clk, c.rst,
       c.b.getI64IntegerAttr(declaredDepth(s.depth)), c.b.getI64IntegerAttr(0),

@@ -906,9 +906,12 @@ Resolved DatapathBuilder::resolveOperand(Value v, Operation *consumer,
       // is there an iteration of it to reach back to.
       if (isHeld(base))
         r = {base, Value(), 0, 0, true};
-      else if (base && def && def->getParentOp() == regionOp)
+      else if (base && def && def->getParentOp() == regionOp) {
         r = edge(base, next, readyCycleOf(def), distance);
-      else {
+        // The one edge whose delay counts cycles between two iterations, so
+        // this region may not defer an issue on its own.
+        dp.regions[regionIdxOf.lookup(regionOp)].cycleIndexedState = true;
+      } else {
         // Anchored on the loop, where the faulty carried assignment is, rather
         // than on the consumer `validateDatapath` would anchor on.
         unsupported(Stage::Emit, Code::CrossRegionHandOff, pipe)
