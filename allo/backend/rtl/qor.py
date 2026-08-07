@@ -49,6 +49,11 @@ COMB_KIND = {
 _ARGS = re.compile(r"^[^(]*\(([^)]*)\)")
 _INT_WIDTH = re.compile(r"\bi(\d+)\b")
 
+#: How many write ports one array is worth spreading over. Mirrors the
+#: emitter's own ceiling (``MemoryLibrary::maxWritePorts``), which is fixed at
+#: the port count essentially every device's memory primitive provides.
+MAX_WRITE_PORTS = 2
+
 
 @dataclass(frozen=True)
 class Utilization:
@@ -195,12 +200,12 @@ def _unit_width(unit: Unit) -> int:
     return max([unit.width, *widths])
 
 
-def _infers_ram(mem: Memory, device: Device) -> bool:
+def _infers_ram(mem: Memory) -> bool:
     """Whether the synthesizer recognizes a RAM template for this array.
 
     One write port always does. Two do only where the schedule proved the writers
-    never collide, which the emitter proves for writers of ONE region or ports of
-    ONE child; that shape is what is read back here, since the decision itself is
+    never collide, which the emitter proves for writers of one region or ports of
+    one child; that shape is what is read back here, since the decision itself is
     taken during emission and the report carries it only for a boundary array."""
     ports = mem.cost.ports_needed_write
     if ports <= 1:
@@ -208,7 +213,7 @@ def _infers_ram(mem: Memory, device: Device) -> bool:
     one_source = (mem.cost.writing_regions <= 1 and mem.cost.writing_calls == 0) or (
         mem.writes == 0 and mem.cost.writing_calls == 1
     )
-    return ports <= device.max_writes and one_source
+    return ports <= MAX_WRITE_PORTS and one_source
 
 
 # One pass over the report, one bucket per kind of structure it publishes.
@@ -282,7 +287,7 @@ def estimate(report: CompileReport, device: Device = default_device) -> QoR:
         for m in f.mems:
             if m.external or m.scattered:
                 continue  # a boundary port, or cells the register ledger holds
-            if _infers_ram(m, device):
+            if _infers_ram(m):
                 mem_bits += m.bits
                 # A block RAM or UltraRAM the device was ASKED for is charged in
                 # its own tiles; which primitive an INFERRED RAM lands in the

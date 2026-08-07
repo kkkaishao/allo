@@ -16,7 +16,7 @@ from allo.lang import f32, i32, u8, index, Stateful, Stream
 from allo.schedule import Schedule
 from allo.schedule.errors import InvalidScheduleArgumentError
 from allo.backend.base import run_pipeline
-from allo.backend.rtl import Memory, RegisterFile
+from allo.backend.rtl import Memory, RegisterFile, qor
 from allo.backend.rtl.device import Tiled
 from allo.backend.rtl.devices import default_device
 from allo.backend.rtl.schedule import RTL_PREPARE_PIPELINE
@@ -1417,6 +1417,30 @@ def test_the_device_names_the_storage_a_scatter_goes_into():
             write_latency=1,
             is_scatter=True,
         )
+
+
+def test_two_non_colliding_writes_still_price_as_a_ram():
+    # Two stores the schedule proved never collide get an `always` block each,
+    # which is what infers a true dual port. The area estimator reads that
+    # decision back off the report and charges the array as a RAM rather than as
+    # a register file; the ceiling it checks against is the emitter's own.
+    @kernel
+    def k(A: i32[16], out: i32[16]):
+        buf: i32[16] = 0
+        for i in range(8):
+            buf[2 * i] = A[2 * i] + 1
+            buf[2 * i + 1] = A[2 * i + 1] + 2
+        for i in range(16):
+            out[i] = buf[i]
+
+    rtl = _to_rtl(k)
+    rtl.compile()
+    report = rtl.report
+    buf = next(
+        m for f in report.microarch.funcs for m in f.mems if m.owner.startswith("buf")
+    )
+    assert buf.cost.ports_needed_write == 2 <= qor.MAX_WRITE_PORTS
+    assert qor.estimate(report).mem_bits == 16 * 32
 
 
 def test_a_tiled_cost_prices_the_whole_shape():
