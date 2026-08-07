@@ -713,6 +713,124 @@ def test_cross_region_enclosing_invariant_cosim():
     assert np.array_equal(B, A * (A[:, 0:1] + 1))
 
 
+def test_loop_carry_from_a_resident_source():
+    # A recurrence whose NEXT is resident. A literal, a scalar argument, an
+    # upstream region's result reaches back to nothing this loop computes:
+    # the value does not move while the loop runs, so every iteration past the
+    # first reads it off a wire and only iteration 0 takes the init. Each of
+    # the three arrives through a different channel (a constant cell, an input
+    # port, a survivor), which is what makes them one case rather than three.
+    A = np.arange(10, 18, dtype=np.int32)
+
+    @kernel
+    def from_literal(A: i32[8], B: i32[8]):
+        prev: i32 = 0
+        for i in range(8):
+            B[i] = prev + A[i]
+            prev = 3
+
+    B = np.zeros(8, np.int32)
+    _to_rtl(from_literal).cosim(A, B)
+    assert np.array_equal(B, A + np.array([0] + [3] * 7, np.int32))
+
+    @kernel
+    def from_argument(A: i32[8], B: i32[8], c: i32):
+        prev: i32 = 0
+        for i in range(8):
+            B[i] = prev + A[i]
+            prev = c
+
+    B = np.zeros(8, np.int32)
+    _to_rtl(from_argument).cosim(A, B, np.int32(5))
+    assert np.array_equal(B, A + np.array([0] + [5] * 7, np.int32))
+
+    @kernel
+    def from_survivor(A: i32[8], B: i32[8]):
+        s: i32 = 0
+        for j in range(8):
+            s += A[j]
+        prev: i32 = 0
+        for i in range(8):
+            B[i] = prev + A[i]
+            prev = s
+
+    B = np.zeros(8, np.int32)
+    _to_rtl(from_survivor).cosim(A, B)
+    assert np.array_equal(B, A + np.array([0] + [A.sum()] * 7, np.int32))
+
+
+def test_carried_identity_reaches_a_store():
+    # The identity is re-injected at the CONSUMER, since the recurrence
+    # register may sit anywhere in the cycle, and a store is a consumer with
+    # no operator input port to hold one. Reading the carry straight into a
+    # store is therefore the shape that would drop it, writing the previous
+    # iteration's datum on iteration 0 instead of the init.
+    @kernel
+    def delay_line(A: i32[8], B: i32[8]):
+        p: i32 = 7
+        for i in range(8):
+            B[i] = p
+            p = A[i]
+
+    A = np.arange(10, 18, dtype=np.int32)
+    B = np.zeros(8, np.int32)
+    _to_rtl(delay_line).cosim(A, B)
+    assert np.array_equal(B, np.concatenate(([7], A[:-1])))
+
+
+def test_chained_carry_reads_one_identity_per_iteration():
+    # `p2 = p1; p1 = A[i]` shifts one carry into the next, so p2 reaches back
+    # TWO iterations and its first two read the inits DOWN that chain, one
+    # each, not the outermost one twice. Equal inits hide the difference, so
+    # each stage here starts from its own value, and a third stage locks that
+    # it is the chain being walked rather than a special case of two.
+    A = np.arange(10, 18, dtype=np.int32)
+
+    @kernel
+    def shift2(A: i32[8], B: i32[8]):
+        p1: i32 = 1
+        p2: i32 = 2
+        for i in range(8):
+            B[i] = p2
+            p2 = p1
+            p1 = A[i]
+
+    B = np.zeros(8, np.int32)
+    _to_rtl(shift2).cosim(A, B)
+    assert np.array_equal(B, np.concatenate(([2, 1], A[:-2])))
+
+    @kernel
+    def shift3(A: i32[8], B: i32[8]):
+        p1: i32 = 1
+        p2: i32 = 2
+        p3: i32 = 3
+        for i in range(8):
+            B[i] = p3
+            p3 = p2
+            p2 = p1
+            p1 = A[i]
+
+    B = np.zeros(8, np.int32)
+    _to_rtl(shift3).cosim(A, B)
+    assert np.array_equal(B, np.concatenate(([3, 2, 1], A[:-3])))
+
+    # The idiom that makes the distinction matter: Fibonacci seeds its two
+    # carries differently, so reading one identity twice would emit 0, 0, ...
+    @kernel
+    def fib(B: i32[10]):
+        a: i32 = 0
+        b: i32 = 1
+        for i in range(10):
+            B[i] = a
+            c: i32 = a + b
+            a = b
+            b = c
+
+    B = np.zeros(10, np.int32)
+    _to_rtl(fib).cosim(B)
+    assert np.array_equal(B, [0, 1, 1, 2, 3, 5, 8, 13, 21, 34])
+
+
 # ---------------------------------------------------------------------------
 # Guard-select control: a guard that can neither be predicated nor folded into
 # a loop bound closes into `dcp.select`, gating exactly its own guarded store
@@ -1091,3 +1209,28 @@ def test_call_scalar_result_consumed_in_its_own_region():
     out = np.zeros(2, dtype=np.int32)
     _to_rtl(sr_top).cosim(np.int32(7), out)
     assert np.array_equal(out, np.array([8, 24], dtype=np.int32))
+
+
+def test_call_result_yielded_beside_another_value():
+    # A survivor is keyed by the REGION result it is yielded as, which is the
+    # call's own result index only when the call is the whole of what its
+    # region yields. Here the region also yields the literal the loop scales
+    # by, so the call's one result is region result 1: reading it by the call's
+    # index would leave that slot empty and put the child's port in slot 0.
+    @kernel
+    def summed(A: i32[16]) -> i32:
+        s: i32 = 0
+        for i in range(16):
+            s += A[i]
+        return s
+
+    @kernel
+    def scale_by_sum(A: i32[16], out: i32[16]):
+        s: i32 = summed(A)
+        for i in range(16):
+            out[i] = s * 2  # `2` escapes its region alongside `s`
+
+    A = np.arange(16, dtype=np.int32)
+    out = np.zeros(16, dtype=np.int32)
+    _to_rtl(scale_by_sum).cosim(A, out)
+    assert np.array_equal(out, np.full(16, int(A.sum()) * 2, dtype=np.int32))

@@ -67,26 +67,39 @@ static Block *regionBody(Operation *regionOp) {
   return &cast<dcp::DCPathSequentialOp>(regionOp).getBody().front();
 }
 
-// Trace a pipeline iter-arg (0-based) back to the op defining its next value,
-// counting one loop-carried distance per iter_arg-to-iter_arg shift: the
-// recurrence distance the scheduler solved against.
-static std::pair<Operation *, unsigned>
-traceIterArgSource(dcp::DCPathPipelineOp pipe, unsigned iterArg) {
+// Trace a pipeline iter-arg (0-based) back to the value assigned to it each
+// iteration, appending to \p chain each iter-arg the walk shifts through,
+// itself first. The walk stops at the first value that is not such a shift,
+// which is where the recurrence reads its datum from and which the caller
+// resolves like any other; `chain.size()` is then the recurrence distance the
+// scheduler solved against. A null return means the shifts CYCLE, so there is
+// no such datum.
+static Value traceIterArgSource(dcp::DCPathPipelineOp pipe, unsigned iterArg,
+                                SmallVectorImpl<unsigned> &chain) {
   Block &body = pipe.getBody().front();
   auto carried = pipe.getCarriedValues();
   Value v = carried[iterArg];
-  unsigned distance = 0;
+  chain.push_back(iterArg);
   llvm::SmallDenseSet<unsigned> seen;
   while (auto arg = dyn_cast<BlockArgument>(v)) {
-    if (arg.getOwner() != &body || arg.getArgNumber() == 0 ||
-        !seen.insert(arg.getArgNumber()).second)
-      return {nullptr, 0};
-    ++distance;
-    v = carried[arg.getArgNumber() - 1]; // block arg (k+1) -> carried[k]
+    // Arg 0 is the counter and an arg of another block is an enclosing value;
+    // neither shifts, so both end the walk.
+    if (arg.getOwner() != &body || arg.getArgNumber() == 0)
+      break;
+    if (!seen.insert(arg.getArgNumber()).second)
+      return {};
+    chain.push_back(arg.getArgNumber() - 1);
+    v = carried[chain.back()]; // block arg (k+1) -> carried[k]
   }
-  auto *def = v.getDefiningOp();
-  return def ? std::make_pair(def, distance + 1)
-             : std::make_pair<Operation *, unsigned>(nullptr, 0);
+  return v;
+}
+
+// A source valid for the whole of a region's run, so a consumer ties straight
+// in and needs no register: a literal, a boundary port, or a survivor an
+// earlier region latched before this one started.
+static bool isHeld(Source s) {
+  return s.kind == Source::Kind::Const || s.kind == Source::Kind::IO ||
+         s.kind == Source::Kind::Survivor;
 }
 
 // Is \p v a transient FIFO-din value, one that changes while the region is
@@ -874,34 +887,56 @@ Resolved DatapathBuilder::resolveOperand(Value v, Operation *consumer,
   };
 
   // The one operand that does not read `v` at all: an unlatched iter_arg of the
-  // consumer's OWN region is the loop RECURRENCE, so the edge runs back to the
-  // previous iteration's producer, `distance` iterations away.
+  // consumer's OWN region is the loop RECURRENCE, so the edge runs back to
+  // whatever the loop assigns it, `distance` iterations away.
   if (auto barg = dyn_cast<BlockArgument>(v))
     if (auto pipe =
             dyn_cast<dcp::DCPathPipelineOp>(barg.getOwner()->getParentOp());
         pipe == regionOp && barg.getArgNumber() >= 1 &&
         !dp.regions[regionIdxOf.lookup(pipe)].container) {
       unsigned iterArg = barg.getArgNumber() - 1;
-      auto [def, distance] = traceIterArgSource(pipe, iterArg);
-      if (!def || def->getParentOp() != regionOp)
+      SmallVector<unsigned, 2> chain;
+      Value next = traceIterArgSource(pipe, iterArg, chain);
+      unsigned distance = chain.size();
+      Source base = next ? resolveValue(next) : Source{};
+      Operation *def = next ? next.getDefiningOp() : nullptr;
+      Resolved r;
+      // A RESIDENT next never moves while this loop runs, so past the first
+      // `distance` iterations the recurrence reads it unchanged, off a wire:
+      // `prev = c` holds `c` from iteration `distance` on. Anything else has to
+      // be produced HERE, by an op this region schedules, since only then is
+      // there an iteration of it to reach back to.
+      if (isHeld(base))
+        r = {base, Value(), 0, 0, true};
+      else if (base && def && def->getParentOp() == regionOp)
+        r = edge(base, next, readyCycleOf(def), distance);
+      else {
+        // The sweep in `validateDatapath` would anchor on the consumer, which
+        // is not where the fault is: the carried assignment is.
+        unsupported(Stage::Emit, Code::CrossRegionHandOff, pipe)
+            << "Value " << iterArg
+            << " carried by this loop is assigned from a value the loop's own "
+               "datapath cannot read; such a cross-region value hand-off is "
+               "not lowered yet";
+        dp.infeasible = true;
         return {};
-      auto it = producerOf.find(def->getResult(0));
-      if (it == producerOf.end())
-        return {};
-      // The emitter re-injects the iter_arg's init (reduction identity) on THIS
-      // consumer input, since the recurrence register may sit elsewhere in the
-      // cycle.
-      auto r = edge(it->second, def->getResult(0), readyCycleOf(def), distance);
-      r.init = resolveValue(pipe.getInits()[iterArg]);
-      r.initDist = distance; // re-inject the init for the first `distance` runs
+      }
+      // The emitter re-injects the identities on THIS consumer input, since the
+      // recurrence register may sit elsewhere in the cycle. One per iteration
+      // below `distance`: a chained carry shifts one iter_arg into the next, so
+      // iteration n reads the init of the stage n steps DOWN the chain, which
+      // is what `chain` enumerates.
+      for (unsigned stage : chain)
+        r.inits.push_back(resolveValue(pipe.getInits()[stage]));
       // An unresolvable init leaves the accumulator to free-run from reset.
       // Only this site knows an init was expected; None is normal elsewhere.
-      if (!r.init) {
-        unsupported(Stage::Emit, Code::CrossRegionHandOff, def)
+      if (!llvm::all_of(r.inits, [](Source s) { return bool(s); })) {
+        unsupported(Stage::Emit, Code::CrossRegionHandOff, pipe)
             << "Loop-carried accumulator has an initial value this region "
                "cannot read; such a cross-region value hand-off is not "
                "lowered yet";
         dp.infeasible = true;
+        r.inits.clear();
       }
       return r;
     }
@@ -909,20 +944,14 @@ Resolved DatapathBuilder::resolveOperand(Value v, Operation *consumer,
   Source base = resolveValue(v);
   if (!base)
     return {};
-  switch (base.kind) {
   // A held source is already valid when the consumer issues, so it ties
   // straight in and needs no register.
-  case Source::Kind::Survivor:
-  case Source::Kind::IO:
-  case Source::Kind::Const:
+  if (isHeld(base))
     return {base, Value(), 0, 0, true};
   // The counter presents its index at cycle 0 of ITS region, so a consumer
   // scheduled at tY delays it that far.
-  case Source::Kind::Counter:
+  if (base.kind == Source::Kind::Counter)
     return edge(base, v, /*ready=*/0, /*distance=*/0);
-  default:
-    break;
-  }
   // A scheduled producer: readable only from the region it issues in, and only
   // after it lands.
   Operation *def = v.getDefiningOp();
@@ -959,9 +988,7 @@ void DatapathBuilder::allocateInputSlots() {
   for (FuncUnit &u : dp.units) {
     unsigned n = u.repOp()->getNumOperands();
     u.inputs.assign(n, Source{});
-    u.inputInits.assign(n,
-                        Source{}); // parallel; set for recurrence inputs below
-    u.inputInitDist.assign(n, 1);
+    u.inputInits.resize(n); // parallel; filled for recurrence inputs below
   }
   for (MemUnit &m : dp.mems) {
     for (MemUnit::Access &acc : m.accesses) {
@@ -1021,7 +1048,8 @@ void DatapathBuilder::assignLanes(MemUnit &m) {
   }
 }
 
-void DatapathBuilder::recordEdge(Resolved r, Source &slot, unsigned regionIdx) {
+void DatapathBuilder::recordEdge(const Resolved &r, Source &slot,
+                                 unsigned regionIdx) {
   if (!r.ok)
     return;
   if (r.depth == 0) {
@@ -1036,6 +1064,33 @@ void DatapathBuilder::recordEdge(Resolved r, Source &slot, unsigned regionIdx) {
   pending.push_back({&slot, key, r.depth});
 }
 
+void DatapathBuilder::recordCarriedEdge(const Resolved &r, Value operand,
+                                        Operation *consumer, Source &slot,
+                                        unsigned regionIdx) {
+  if (r.inits.empty()) {
+    recordEdge(r, slot, regionIdx);
+    return;
+  }
+  // Arms of one issue pulse, split by iteration: the recurrence reads identity
+  // n at iteration n and the edge itself from `inits.size()` on, which is the
+  // same shape a SHARED unit port carries. Every arm is sized before any is
+  // filled, since `recordEdge` takes a pointer into `sources`.
+  unsigned arms = r.inits.size() + 1;
+  muxBuilds.push_back({&slot,
+                       regionIdx,
+                       operand.getType(),
+                       SmallVector<Operation *, 2>(arms, consumer),
+                       {},
+                       {}});
+  MuxBuild &mb = muxBuilds.back();
+  for (unsigned n = 0; n + 1 < arms; ++n)
+    mb.phases.push_back({Mux::Phase::At, n});
+  mb.phases.push_back({Mux::Phase::From, arms - 1});
+  mb.sources.assign(r.inits.begin(), r.inits.end()); // held: literal/port/...
+  mb.sources.resize(arms);
+  recordEdge(r, mb.sources.back(), regionIdx);
+}
+
 void DatapathBuilder::resolveUnitInputs() {
   for (FuncUnit &u : dp.units) {
     Operation *op0 = u.repOp();
@@ -1046,41 +1101,44 @@ void DatapathBuilder::resolveUnitInputs() {
       for (unsigned k = 0; k < nPorts; ++k) {
         auto r = resolveOperand(op0->getOperand(k), op0, ii);
         recordEdge(r, u.inputs[k], ridx);
-        u.inputInits[k] = r.init; // None unless k reads a loop-carried iter_arg
-        u.inputInitDist[k] = r.initDist;
+        u.inputInits[k] =
+            r.inits; // empty unless k reads a loop-carried iter_arg
       }
       continue;
     }
     // Shared unit: resolve every bound op's port k independently (each may need
     // its own register depth), then a mux picks per op's issue cycle. Resolved
-    // up front because a recurrence operand takes TWO arms, and `recordEdge`
-    // takes a pointer into `sources`, so the list must be sized before any
-    // edge lands in it.
+    // up front because a recurrence operand takes an arm per identity, and
+    // `recordEdge` takes a pointer into `sources`, so the list must be sized
+    // before any edge lands in it.
     for (unsigned k = 0; k < nPorts; ++k) {
       SmallVector<Resolved, 2> edges;
       unsigned arms = 0;
       for (const auto &bo : u.boundOps) {
         edges.push_back(resolveOperand(bo.first->getOperand(k), bo.first, ii));
-        arms += edges.back().init ? 2 : 1;
+        arms += 1 + edges.back().inits.size();
       }
-      muxBuilds.push_back({u.id, k, ridx, {}, {}, {}});
+      muxBuilds.push_back(
+          {&u.inputs[k], ridx, op0->getOperand(k).getType(), {}, {}, {}});
       MuxBuild &mb = muxBuilds.back();
       mb.sources.resize(arms);
       unsigned arm = 0;
       for (auto [j, r] : llvm::enumerate(edges)) {
         Operation *opj = u.boundOps[j].first;
-        // The identity rides an arm of its own rather than a mux in front of
+        // Each identity rides an arm of its own rather than a mux in front of
         // the port: a shared port carries a different op's operand each cycle,
         // leaving no cycle to time such a mux against. An unresolvable init is
         // reported by `resolveOperand` and takes no arm.
-        if (r.init) {
+        for (auto [n, init] : llvm::enumerate(r.inits)) {
           mb.ops.push_back(opj);
-          mb.phases.push_back({Mux::Phase::First, r.initDist});
-          mb.sources[arm++] = r.init; // held: a literal, a port, a survivor
+          mb.phases.push_back({Mux::Phase::At, static_cast<unsigned>(n)});
+          mb.sources[arm++] = init; // held: a literal, a port, a survivor
         }
         mb.ops.push_back(opj);
-        mb.phases.push_back(
-            {r.init ? Mux::Phase::Rest : Mux::Phase::Always, r.initDist});
+        mb.phases.push_back(r.inits.empty() ? Mux::Phase{}
+                                            : Mux::Phase{Mux::Phase::From,
+                                                         static_cast<unsigned>(
+                                                             r.inits.size())});
         recordEdge(r, mb.sources[arm++], ridx);
       }
     }
@@ -1298,11 +1356,13 @@ void DatapathBuilder::resolveAccessOperands() {
       AffineMap ignored;
       dcpAddressing(acc.op, ignored, operands);
       for (unsigned k = 0, e = operands.size(); k < e; ++k)
-        recordEdge(resolveOperand(operands[k], acc.op, ii), acc.addr[k], ridx);
-      if (acc.isWrite)
-        recordEdge(resolveOperand(cast<dcp::DCPathStoreOp>(acc.op).getValue(),
-                                  acc.op, ii),
-                   acc.data, ridx);
+        recordCarriedEdge(resolveOperand(operands[k], acc.op, ii), operands[k],
+                          acc.op, acc.addr[k], ridx);
+      if (acc.isWrite) {
+        Value datum = cast<dcp::DCPathStoreOp>(acc.op).getValue();
+        recordCarriedEdge(resolveOperand(datum, acc.op, ii), datum, acc.op,
+                          acc.data, ridx);
+      }
     }
 
   // Re-stamp an access's schedule cycle. `start` is the single source both the
@@ -1342,7 +1402,7 @@ void DatapathBuilder::resolveAccessOperands() {
           ++shift;
           r = resolveOperand(token, acc.op, ii);
         }
-        recordEdge(r, acc.data, ridx);
+        recordCarriedEdge(r, token, acc.op, acc.data, ridx);
       }
       auto pred = isa<StreamGetOp>(acc.op)
                       ? cast<StreamGetOp>(acc.op).getPred()
@@ -1360,7 +1420,7 @@ void DatapathBuilder::resolveAccessOperands() {
                  "unconditionally";
           dp.infeasible = true;
         }
-        recordEdge(pr, acc.when, ridx);
+        recordCarriedEdge(pr, pred, acc.op, acc.when, ridx);
       }
     }
   }
@@ -1386,7 +1446,7 @@ void DatapathBuilder::insertRegisters() {
     return p.kind == Mux::Phase::Always;
   };
   for (MuxBuild &mb : muxBuilds) {
-    Source &slot = dp.units[mb.unit].inputs[mb.port];
+    Source &slot = *mb.slot;
     // One driver across every arm is a wire. A phased arm never collapses: its
     // pair carries the same port in different iterations, not the same value.
     if (llvm::all_of(mb.phases, unphased) &&
@@ -1399,6 +1459,7 @@ void DatapathBuilder::insertRegisters() {
     Mux mx;
     mx.id = dp.muxes.size();
     mx.region = mb.region;
+    mx.type = mb.type;
     mx.sources.assign(mb.sources.begin(), mb.sources.end());
     mx.selectOps.assign(mb.ops.begin(), mb.ops.end());
     mx.phases.assign(mb.phases.begin(), mb.phases.end());

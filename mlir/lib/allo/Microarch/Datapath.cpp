@@ -173,8 +173,9 @@ void forEachSource(
   for (const FuncUnit &u : dp.units) {
     for (auto [k, s] : llvm::enumerate(u.inputs))
       visit(s, Slot::UnitInput, k, u.repOp(), /*required=*/true);
-    for (auto [k, s] : llvm::enumerate(u.inputInits))
-      visit(s, Slot::UnitInit, k, u.repOp(), /*required=*/false);
+    for (auto [k, inits] : llvm::enumerate(u.inputInits))
+      for (const Source &s : inits)
+        visit(s, Slot::UnitInit, k, u.repOp(), /*required=*/false);
   }
   for (const Register &r : dp.regs)
     visit(r.input, Slot::RegisterInput, r.id, nullptr, /*required=*/true);
@@ -555,10 +556,11 @@ void Datapath::dump(llvm::raw_ostream &os) const {
          << " : " << u.identity.resultType << "  [" << u.repOp()->getName()
          << " @" << u.boundOps.front().second << "] <= ";
       printSourceList(u.inputs, os);
-      for (unsigned k = 0; k < u.inputInits.size(); ++k)
-        if (u.inputInits[k].kind != Source::Kind::None) {
-          os << " init[" << k << "]="; // recurrence-input reduction identity
-          printSource(u.inputInits[k], os);
+      // A recurrence input's reduction identities, one per early iteration.
+      for (auto [k, inits] : llvm::enumerate(u.inputInits))
+        if (!inits.empty()) {
+          os << " init[" << k << "]=";
+          printSourceList(inits, os);
         }
       os << "\n";
     }
@@ -573,15 +575,15 @@ void Datapath::dump(llvm::raw_ostream &os) const {
       os << "    mux x" << xid << ": ";
       printSourceList(x.sources, os);
       // Per-arm select: the op's start cycle (the delayValid select stage),
-      // suffixed by the iteration window a phased arm drives ('i' the reduction
-      // identity, 'r' the iterations after it).
+      // suffixed by the iteration window a phased arm drives ('iN' the
+      // reduction identity of iteration N, 'rN' the iterations from N on).
       os << " sel@[";
       for (auto [k, op] : llvm::enumerate(x.selectOps)) {
+        const Mux::Phase &ph = x.phases[k];
         os << (k ? ", " : "")
-           << cast<IntegerAttr>(op->getAttr("start")).getInt()
-           << (x.phases[k].kind == Mux::Phase::First  ? "i"
-               : x.phases[k].kind == Mux::Phase::Rest ? "r"
-                                                      : "");
+           << cast<IntegerAttr>(op->getAttr("start")).getInt();
+        if (ph.kind != Mux::Phase::Always)
+          os << (ph.kind == Mux::Phase::At ? "i" : "r") << ph.iter;
       }
       os << "]\n";
     }

@@ -24,10 +24,11 @@ struct Resolved {
   unsigned depth; // pipeline-register depth for this edge
   unsigned ready = 0; // cycle `base` lands at within its iteration
   bool ok = false;    // false => producer outside this region / not modelled
-  Source init = {};   // reduction identity iff this edge reads a loop-carried
-                      // iter_arg (a recurrence input); None otherwise
-  unsigned initDist = 1; // recurrence distance (iterations): `init` must be
-                         // re-injected for the first `initDist` runs
+  // The reduction identities iff this edge reads a loop-carried iter_arg (a
+  // recurrence input), one per iteration: `inits[n]` must be re-injected at
+  // iteration n, and `base` only carries the edge from `inits.size()` on, that
+  // size being the recurrence distance. Empty for every other edge.
+  llvm::SmallVector<Source, 1> inits = {};
 };
 
 //===----------------------------------------------------------------------===//
@@ -61,10 +62,10 @@ struct DatapathBuilder {
     Source base;
     unsigned ready;
   };
-  struct MuxBuild { // a shared unit port's per-op drivers, muxed after chains
-    UnitId unit;
-    unsigned port;
+  struct MuxBuild { // one slot's per-op drivers, muxed after the chains exist
+    Source *slot;
     RegionId region;
+    Type type;
     llvm::SmallVector<Operation *, 2> ops;
     llvm::SmallVector<Source, 2> sources;    // parallel to ops
     llvm::SmallVector<Mux::Phase, 2> phases; // parallel to ops
@@ -219,7 +220,14 @@ struct DatapathBuilder {
   void assignLanes(MemUnit &m);
   /// Record a resolved edge into \p slot: a depth-0 edge ties directly, a
   /// deeper one is deferred (its register chain is built in insertRegisters).
-  void recordEdge(Resolved r, Source &slot, unsigned regionIdx);
+  void recordEdge(const Resolved &r, Source &slot, unsigned regionIdx);
+  /// `recordEdge` for a slot that is a bare Source, with no input port beside
+  /// it to hold a recurrence identity (`FuncUnit::inputInits`): an address, a
+  /// store datum, a stream token. A recurrence edge on \p operand of \p
+  /// consumer is muxed against its identity, phased on that op's own issue
+  /// cycle; every other edge is recorded unchanged.
+  void recordCarriedEdge(const Resolved &r, Value operand, Operation *consumer,
+                         Source &slot, unsigned regionIdx);
   /// Resolve every unit input (single, or shared-then-muxed).
   void resolveUnitInputs();
   /// Resolve every memory address / store data and stream data + predicate.

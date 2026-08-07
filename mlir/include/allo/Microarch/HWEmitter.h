@@ -335,10 +335,19 @@ struct DatapathEmitter {
 
   /// Resolve a datapath Source to the SSA value driving it.
   Value resolveSource(const uarch::Source &s);
-  /// The window a recurrence input reads its reduction identity in: region \p
-  /// rb's counter still inside its first \p dist iterations. A level, sampled
-  /// when the region issues, which a consumer delays to its own stage.
+  /// The window a recurrence input reads its reduction identities in: region
+  /// \p rb's counter still inside its first \p dist iterations. A level,
+  /// sampled when the region issues, which a consumer delays to its own stage.
   Value firstIterations(const uarch::RegionBlock &rb, unsigned dist);
+  /// The one of those iterations that reads identity \p iter: rb's counter at
+  /// `lb + iter*step`. Same kind of level as `firstIterations`, and identical
+  /// to it for the first iteration of any recurrence.
+  Value atIteration(const uarch::RegionBlock &rb, unsigned iter);
+  /// \p rb's counter and its lower bound, at the counter register's width.
+  std::pair<Value, Value> counterAndLb(const uarch::RegionBlock &rb);
+  /// The counter value \p rb's n-th iteration holds, `lb + n*step` at that
+  /// width; null for n == 0, which is \p lb itself.
+  Value ivAt(const uarch::RegionBlock &rb, unsigned n, Value lb);
   /// The cycle a freshly-produced Source's value lands, relative to the issuing
   /// pulse of the iteration that produced it. Used by survivor capture.
   unsigned readyCycle(const uarch::Source &s) const;
@@ -423,8 +432,8 @@ struct DatapathEmitter {
   /// recurrence input re-injects its reduction identity.
   enum class UnitMode {
     /// A leaf region: it has a per-iteration issue pulse, so a loop-carried
-    /// input re-injects `inputInits[k]` on its first `inputInitDist[k]` runs.
-    /// Its backedges are declared earlier, before the reads resolve.
+    /// input re-injects `inputInits[k][n]` on its n-th run. Its backedges are
+    /// declared earlier, before the reads resolve.
     Leaf,
     /// A container's own PREDICATE units, a start-0 combinational compute over
     /// the counter and iter-arg survivors. A container has no issue pulse, and

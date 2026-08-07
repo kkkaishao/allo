@@ -10,7 +10,7 @@
 #include "allo/Scheduling/MemoryModel.h" // bankKindName
 
 #include "mlir/IR/BuiltinTypes.h"
-#include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/Support/JSON.h"
 #include "llvm/Support/raw_ostream.h"
 
@@ -36,13 +36,12 @@ std::string layoutName(const MemUnit &m) {
   return bankKindName(first).str();
 }
 
-/// The multiplexers of one region, aggregated by (fan-in, width). A mux's width
-/// is the width of the port it drives, which only the consuming unit knows.
-std::vector<MuxClass> muxClasses(const Datapath &dp, const RegionBlock &rb,
-                                 const llvm::DenseMap<MuxId, unsigned> &width) {
+/// The multiplexers of one region, aggregated by (fan-in, width).
+std::vector<MuxClass> muxClasses(const Datapath &dp, const RegionBlock &rb) {
   std::map<std::pair<unsigned, unsigned>, unsigned> byClass;
   for (MuxId mid : rb.muxes)
-    ++byClass[{(unsigned)dp.muxes[mid].sources.size(), width.lookup(mid)}];
+    ++byClass[{(unsigned)dp.muxes[mid].sources.size(),
+               hwWidth(dp.muxes[mid].type)}];
   std::vector<MuxClass> out;
   out.reserve(byClass.size());
   for (const auto &[key, count] : byClass)
@@ -57,12 +56,6 @@ FuncUarch::FuncUarch(const Datapath &dp, llvm::StringRef symbol,
     : func(symbol.str()), module(module.str()), top(dp.atTop),
       regs(ledger.classes()), readPorts(dp.readPorts.size()),
       writePorts(dp.writePorts.size()) {
-  llvm::DenseMap<MuxId, unsigned> muxWidth;
-  for (const FuncUnit &u : dp.units)
-    for (auto [k, s] : llvm::enumerate(u.inputs))
-      if (s.kind == Source::Kind::Mux)
-        muxWidth[s.id] = hwWidth(u.repOp()->getOperand(k).getType());
-
   for (const RegionBlock &rb : dp.regions) {
     RegionUarch r;
     r.order = rb.id;
@@ -83,12 +76,12 @@ FuncUarch::FuncUarch(const Datapath &dp, llvm::StringRef symbol,
            (unsigned)u.boundOps.size(), u.identity.comb.has_value(),
            u.pipelined});
     }
-    r.muxes = muxClasses(dp, rb, muxWidth);
+    r.muxes = muxClasses(dp, rb);
     for (MuxId mid : rb.muxes) {
       unsigned k = dp.muxes[mid].sources.size();
       r.cost.muxInputs += k;
       // A k:1 mux costs about (k-1) 2:1 muxes per bit.
-      r.cost.muxBits += muxWidth.lookup(mid) * (k - 1);
+      r.cost.muxBits += hwWidth(dp.muxes[mid].type) * (k - 1);
     }
     regions.push_back(std::move(r));
   }
