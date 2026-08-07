@@ -1,7 +1,7 @@
 # Copyright Allo authors. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""The device SCHEMA for the RTL backend: what a device can say, how a cost is
+"""The device schema for the RTL backend: what a device declares, how a cost is
 expressed, and how both reach the IR."""
 
 from __future__ import annotations
@@ -73,17 +73,12 @@ def Table(points: dict[int, float]) -> Cost:
     """Measured point by point. A parameter between two points takes the lower
     one's value, and one below the first takes the first's.
 
-    A STAIRCASE, which fits a quantity that really is piecewise constant: an SRL
-    chain occupies ``ceil(depth/32)`` sites, and at depth 40 that is 2, not the
-    1.3 an interpolation would report.
+    A staircase, which fits a piecewise-constant quantity: an SRL chain occupies
+    ``ceil(depth/32)`` sites, so depth 40 costs 2 sites and not 1.3.
 
-    KNOWN GAP: a CONTINUOUS quantity sampled into one is under-stated at every
-    parameter between two points, and under is the dangerous direction for a
-    timing model nothing downstream re-checks (a 48-bit divide reading the
-    32-bit row is 45% short). Every combinational delay row is such a quantity
-    today. The fix is a structural form the device can declare instead, not an
-    interpolation rule applied on its behalf; a power law fits 14 of the 16
-    kinds to within 12% on all four measured fabrics.
+    Sampling a continuous quantity into one under-states it at every parameter
+    between two points, and nothing downstream re-checks a timing model: a
+    48-bit divide reading the 32-bit delay row is 45% short.
     """
     if not points:
         raise ValueError("a cost table needs at least one point")
@@ -115,7 +110,7 @@ def _terms(cost: Cost | Sequence) -> tuple[tuple[Cost, ...], ...]:
 #: times.
 _COST_ATTRS: dict[Spend, object] = {}
 
-#: The same, for the single costs a `dcp.comb` row's DELAY is, which are not a
+#: The same, for the single costs a `dcp.comb` row's delay is, which are not a
 #: `Spend` and so cannot share the table above.
 _DELAY_ATTRS: dict[Cost, object] = {}
 
@@ -215,10 +210,9 @@ class CombKind(Enum):
     DIV = "div"
     REM = "rem"
     NEG = "neg"  # `arith.negf` only: a float sign flip, not an integer negate
-    # `arith.minsi`/`minui`/`maxsi`/`maxui`, which the operator library already
-    # realizes: a compare feeding a multiplexer. A fabric that declares no row
-    # for these prices them at the default (0.1 ns and free), which they are
-    # not.
+    # `arith.minsi`/`minui`/`maxsi`/`maxui`, realized as a compare feeding a
+    # multiplexer. A fabric that declares no row for these prices them at the
+    # default of 0.1 ns and free.
     MIN = "min"
     MAX = "max"
     CMP = "cmp"
@@ -259,7 +253,7 @@ class Device:
         self.grade = grade
         # Native chaining delays: kind -> ns as a function of the operand width.
         self.comb: dict[str, Cost] = {}
-        # What a register-to-register path with NO operator in it costs (ns).
+        # What a register-to-register path with no operator in it costs (ns).
         self.reg_delay_ns: float = 0.0
         # Separate from `comb`: a delay is a timing fact and an area is a
         # resource fact, read by different consumers.
@@ -275,8 +269,8 @@ class Device:
         # device retuned) must not leave it pointing at the replaced one.
         self.default_storage: str | None = None
         self.stream_timing: StreamTiming | None = None
-        # Built-in and user `@operator_ip` cores, keyed for a reader by their
-        # `symbol`, which is also what `operator_uses` above is keyed on.
+        # Built-in and user `@operator_ip` cores. `operator_uses` above is keyed
+        # on their `symbol`.
         self.operators: list[OperatorIP] = []
         self.default_freq_mhz: float = 100.0
 
@@ -324,11 +318,9 @@ class Device:
         """The chaining delay (ns) of a native operator kind at ``width`` bits,
         including the register floor the measurement saw.
 
-        Goes through the compiler's own ``CostAttr::evaluate``, as
-        :meth:`price` does, so a reader outside the compiler cannot disagree
-        with the scheduler about a curve they both consult. 0.0 where the device
-        declares no row: an undeclared delay is not a zero, but a caller asking
-        for one it did not declare has nothing else to be told.
+        Evaluated by the compiler's own ``CostAttr::evaluate``, as :meth:`price`
+        is, so a reader outside the compiler reads the same curve the scheduler
+        does. Returns 0.0 where the device declares no row.
         """
         from ..._mlir.dialects.allo import evaluate_cost
 
@@ -462,11 +454,9 @@ class Device:
         uses: dict[Resource, Cost | Sequence] | None = None,
     ) -> Device:
         """Set the combinational chaining delay of a native operator kind, and
-        optionally what one instance of it spends. A comb kind carries ONE
-        parameter, its operand width, and BOTH the delay and each cost are
-        functions of it: a 32-bit divider was measured at 23.7 ns against an
-        8-bit one's 4.3, so a scalar per kind either forbids the narrow one or
-        lies about the wide one. A bare number is that constant function."""
+        optionally what one instance of it spends. A comb kind carries one
+        parameter, its operand width, and both the delay and each cost are
+        functions of it. A bare number is the constant function."""
         if not isinstance(kind, CombKind):
             raise TypeError(f"kind must be a CombKind, got {kind!r}")
         if not isinstance(delay_ns, Cost):
@@ -507,16 +497,14 @@ class Device:
         return self
 
     def set_register_floor(self, delay_ns: float) -> Device:
-        """The register-to-register floor: what a path with NO operator in it
-        costs, a source flip-flop's clock-to-out plus the routing every path
-        pays. Measured on a reg-to-reg DUT with nothing between the registers.
+        """The register-to-register floor (ns): a source flip-flop's clock-to-out
+        plus the routing every path pays, measured with nothing between the
+        registers.
 
-        Every combinational delay this device declares includes it, because that
-        is what a measurement of one operator between two registers sees. A
-        cycle pays it ONCE however many operators chain within it, so the
-        scheduler charges a comb row its whole delay where a chain ends and the
-        delay less this where a successor extends the chain. Declaring nothing
-        leaves it at zero, which prices a four-deep chain three floors too high.
+        Every combinational delay this device declares includes it. A cycle pays
+        it once however many operators chain within it, so the scheduler charges
+        a comb row its whole delay where a chain ends and the delay less this
+        floor where a successor extends the chain. It defaults to zero.
         """
         if delay_ns < 0:
             raise ValueError("the register floor must be non-negative")
@@ -530,9 +518,7 @@ class Device:
         return self
 
     def add_operator(self, operator: OperatorIP) -> Device:
-        """Declare a core this device offers. Scans rather than keeping a second
-        index: a device holds a couple of dozen operators, and one list that
-        cannot disagree with itself beats two structures that can."""
+        """Declare a core this device offers."""
         if not isinstance(operator, OperatorIP):
             raise TypeError(f"expected an operator IP, got {type(operator).__name__}")
         symbol = operator.symbol
@@ -553,9 +539,8 @@ class Device:
 
     def validate(self) -> Device:
         """Check the device is complete enough to compile and to price against,
-        and return it. Run once where a device is BUILT, so a part that is
-        missing a row fails there rather than deep inside a compile or, worse,
-        as a structure that silently prices at nothing.
+        and return it. Call it where a device is built, so a part missing a row
+        fails there rather than inside a compile.
         """
         if not self.resources:
             raise ValueError(f"device {self.name!r} declares no resources")
@@ -573,9 +558,9 @@ class Device:
             )
         if self.stream_timing is None:
             raise ValueError(f"device {self.name!r} declares no stream timing")
-        # An undeclared cost is not a zero, but these two have no `unmodelled`
-        # bucket to land in: the estimator prices every mux and every delay chain
-        # through the one whole-device row, so an absent one reads as free.
+        # The estimator prices every mux and every delay chain through the one
+        # whole-device row, so an absent row reads as free rather than as
+        # unmodelled.
         for what, spent in (("mux", self.mux_uses), ("chain", self.chain_uses)):
             if not spent:
                 raise ValueError(
@@ -619,8 +604,8 @@ def _ty(dtype) -> Ty:
 def operator_descs(operators: Sequence[OperatorIP]) -> list[OpDesc]:
     """The device operators as behavioral :class:`OpDesc` descriptors, the cosim
     source of truth for each extern IP's kind, latency and dtypes. ``name`` is
-    the operator's symbol, which is the extern module the emitter instantiates
-    and so what the model joins on."""
+    the operator's symbol, the extern module the emitter instantiates and what
+    the model joins on."""
     out = []
     for op in operators:
         kind = (
@@ -650,9 +635,9 @@ _STALL_STYLE_TO_ENUM = {"ce": 0, "free": 1, "elastic": 2}
 def inject_operators(module, device: Device):
     """Inject each device operator as a module-level ``dcp.operator`` symbol the
     scheduler and reifier match concrete ``arith.*``/``math.*`` ops onto. The
-    ``sym_name`` is the operator's :attr:`~allo.lang.ip.OperatorIP.symbol`, and
-    the stem of the RTL module name the emitter instantiates: one declaration
-    can still cover several distinct pieces of hardware, so the emitter appends
+    ``sym_name`` is the operator's :attr:`~allo.lang.ip.OperatorIP.symbol` and
+    the stem of the RTL module name the emitter instantiates. One declaration
+    can cover several distinct pieces of hardware, so the emitter appends
     whatever else distinguishes them (a float compare's predicate:
     ``cmp_f32_f32_u1_l1`` -> ``cmp_f32_f32_u1_l1_ogt``).
 

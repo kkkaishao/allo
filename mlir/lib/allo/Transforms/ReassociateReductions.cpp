@@ -105,10 +105,9 @@ struct ReassociateReductionsPass
       for (Value leaf : chain.leaves)
         (isLoopCarried(leaf) ? carried : rest).push_back(leaf);
 
-      // A bare integer chain carries no cast marking it as a reduction, so the
-      // accumulator is its key; without one it is ordinary integer arithmetic
-      // and reassociating it would disturb the address expressions later passes
-      // read.
+      // A bare integer chain carries no cast marking it as a reduction, so a
+      // loop-carried accumulator is its key. Without one it is ordinary
+      // integer arithmetic, such as the address expressions later passes read.
       if (!tail.isFloat() && !tail.widened() && carried.empty())
         continue;
 

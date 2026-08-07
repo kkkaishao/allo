@@ -10,11 +10,10 @@ import re
 from allo.backend.rtl import RTL, ScheduleResult, default_device
 
 
-# Operator latencies keyed by (kind, first argument dtype), read off the
-# built-in operator IPs (each an `@operator_ip(optype=...)`). The dtype and not
-# just its width, because a float and an integer multiply are both `mul` at 32
-# bits; and `optype` may be a plain string, which is how a core that binds by
-# MLIR mnemonic rather than by abstract kind declares itself.
+# Operator latencies keyed by (kind, first argument dtype). The dtype and not
+# just its width, since a float and an integer multiply are both `mul` at 32
+# bits. `optype` may be a plain string for a core that binds by MLIR mnemonic
+# rather than by abstract kind.
 def _key(op):
     kind = getattr(op.optype, "value", op.optype)
     return (kind, op.parse_argument_annotations()[0].name)
@@ -35,24 +34,23 @@ MEM_URAM = default_device.storage["uram"].read_latency
 # restating the device's numbers.
 PERIOD_NS = 1000.0 / default_device.default_freq_mhz
 
-# What one register-to-register hop costs before any logic: measured, and paid
-# once per CYCLE rather than once per operator, which is why a chain of n
-# operators costs `REG_NS + n * comb_step_ns(...)` and not `n * comb_ns(...)`.
+# What one register-to-register hop costs before any logic. Paid once per cycle
+# rather than once per operator, so a chain of n operators costs
+# `REG_NS + n * comb_step_ns(...)` and not `n * comb_ns(...)`.
 REG_NS = default_device.reg_delay_ns
 
 
-# A device row is a CURVE over operand width, so a caller names the width it
-# means. 32 is the default because these kernels are i32.
+# A device delay row is a curve over operand width, so a caller names the width
+# it means. 32 is the default because these kernels are i32.
 def comb_ns(kind: str, width: int = 32) -> float:
-    """What ``kind`` costs on a path starting AT a register, the register floor
-    included. Evaluated by the compiler's own cost evaluator, so a test cannot
-    disagree with the scheduler about a curve they both read."""
+    """What ``kind`` costs on a path starting at a register, the register floor
+    included. Evaluated by the compiler's own cost evaluator."""
     return default_device.comb_delay(kind, width)
 
 
 def comb_step_ns(kind: str, width: int = 32) -> float:
-    """What ``kind`` ADDS to a path that already left a register, which is the
-    spacing the chaining solve leaves between two chained operators."""
+    """What ``kind`` adds to a path that already left a register, the spacing the
+    chaining solve leaves between two chained operators."""
     return max(0.0, comb_ns(kind, width) - REG_NS)
 
 

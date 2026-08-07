@@ -119,9 +119,8 @@ public:
   std::string scatterStorage;
   std::vector<StorageRealization> storage; // the `dcp.storage` rows
   MemKindTiming fifo;                      // `dcp.stream_timing`
-  // How many write ports one array is worth spreading over.
-  // Currently hardcoded to 2, since almost no actual device has more or less
-  // than 2. Turn this into a device property if we ever see one that does.
+  // How many write ports one array is worth spreading over. Fixed at 2, the
+  // port count essentially every device's memory primitive provides.
   static constexpr unsigned maxWritePorts = 2;
 };
 

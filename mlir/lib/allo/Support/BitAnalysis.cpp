@@ -17,10 +17,10 @@ using namespace mlir::allo;
 
 namespace {
 
-/// What an operation does to BITS, which is all this file asks of one. Coarser
-/// than the operator library's rows in one direction and finer in another: they
-/// name the device row an op is priced under, where a signed and an unsigned
-/// shift share one and move bits differently.
+/// What an operation does to bits, which is all this file asks of one. Not the
+/// operator library's rows: those name the device row an op is priced under,
+/// where a signed and an unsigned shift share one row yet move bits
+/// differently.
 enum class BitOp {
   Unknown,
   ZExt,
@@ -35,11 +35,10 @@ enum class BitOp {
   Select
 };
 
-/// Read \p op on whichever side of reification it sits: a reified compute names
-/// its realization outright, an `arith` one is matched on its type. An operator
-/// neither arm recognizes reads as `Unknown`, so this table drifting behind a
-/// new operator costs a conclusion and never correctness, which is why it does
-/// not have to be kept in step with the operator library's.
+/// Classifies \p op on whichever side of reification it sits: a reified
+/// compute names its realization outright, an `arith` one is matched on its
+/// type. An operator neither arm recognizes reads as `Unknown`, which costs a
+/// conclusion and never correctness.
 BitOp bitOpOf(Operation *op) {
   if (auto comp = dyn_cast<dcp::DCPathComputeOp>(op)) {
     std::optional<CombOpKindEnum> kind = comp.getCombKind();
@@ -96,8 +95,8 @@ llvm::KnownBits mlir::allo::knownBits(Value v, unsigned depth) {
   if (!op || !depth)
     return unknown;
   // Every operand reached below is integer-typed, so the recursion stays inside
-  // this function's contract. An index cast is deliberately not among them: its
-  // operand has no width to walk into.
+  // this function's contract. An index cast is not among them: its operand has
+  // no width to walk into.
   auto of = [&](unsigned k) { return knownBits(op->getOperand(k), depth - 1); };
   switch (bitOpOf(op)) {
   case BitOp::ZExt:
@@ -137,8 +136,7 @@ bool mlir::allo::isBitRename(Operation *op) {
   }
   case BitOp::Or:
   case BitOp::Xor: {
-    // An `index` operand has no width to reason in, and neither operator can
-    // carry a bit field anyway.
+    // An `index` operand has no width to reason in.
     if (!isa<IntegerType>(op->getResult(0).getType()))
       return false;
     // Sharing no set bit, the two sides concatenate: `or` and `xor` agree bit

@@ -336,12 +336,11 @@ struct DatapathEmitter {
   /// Resolve a datapath Source to the SSA value driving it.
   Value resolveSource(const uarch::Source &s);
   /// The window a recurrence input reads its reduction identities in: region
-  /// \p rb's counter still inside its first \p dist iterations. A level,
-  /// sampled when the region issues, which a consumer delays to its own stage.
+  /// \p rb's counter still inside its first \p dist iterations. A level, valid
+  /// when the region issues, which a consumer delays to its own stage.
   Value firstIterations(const uarch::RegionBlock &rb, unsigned dist);
-  /// The one of those iterations that reads identity \p iter: rb's counter at
-  /// `lb + iter*step`. Same kind of level as `firstIterations`, and identical
-  /// to it for the first iteration of any recurrence.
+  /// The single iteration that reads identity \p iter: \p rb's counter at
+  /// `lb + iter*step`. The same kind of level as `firstIterations`.
   Value atIteration(const uarch::RegionBlock &rb, unsigned iter);
   /// \p rb's counter and its lower bound, at the counter register's width.
   std::pair<Value, Value> counterAndLb(const uarch::RegionBlock &rb);

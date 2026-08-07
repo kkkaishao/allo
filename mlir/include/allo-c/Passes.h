@@ -48,8 +48,9 @@ alloEmitSplitVerilog(MlirModule module, MlirStringRef directory);
 /// solve may spend, in deterministic time units; zero or less takes the
 /// default. `allocate` lets an exact solve decide how many copies of each
 /// operator a region builds. `workers` (zero or less takes the default) and
-/// `seed` are the CP-SAT search knobs; only the defaults make a compile
-/// reproducible. Returns failure (callback not invoked) on any failed phase.
+/// `seed` tune the CP-SAT search; changing either makes a compile
+/// non-reproducible. Returns failure (callback not invoked) on any failed
+/// phase.
 MLIR_CAPI_EXPORTED MlirLogicalResult alloRunSDCSchedulingPipeline(
     MlirModule module, MlirStringRef top, float cycleTime,
     MlirStringRef scheduler, double budget, bool allocate, int workers,

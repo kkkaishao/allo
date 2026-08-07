@@ -28,9 +28,9 @@ TrivialBinding::plan(const Datapath &, const BindingContext &) const {
 namespace {
 
 /// Whether \p op reads a loop recurrence: an un-latched iter-arg of its own
-/// leaf pipeline, the one operand that costs a SECOND mux arm, the reduction
-/// identity it re-injects (`Mux::Phase`). The same test `resolveOperand` makes,
-/// asked of the IR because a policy runs before the interconnect exists.
+/// leaf pipeline. Such an operand costs a second mux arm, for the reduction
+/// identity it re-injects (`Mux::Phase`). Asked of the IR because a policy runs
+/// before the interconnect exists.
 bool readsRecurrence(const RegionBlock &rb, Operation *op) {
   if (rb.container || rb.kind != RegionBlock::Kind::Cyclic)
     return false;
@@ -44,17 +44,14 @@ bool readsRecurrence(const RegionBlock &rb, Operation *op) {
 /// What one candidate binding costs a region's clock.
 ///
 /// A multiplexer's delay does not stop at the unit it feeds: that unit's result
-/// reaches whatever it combinationally drives on the same cycle, so two shared
+/// reaches whatever it combinationally drives in the same cycle, so two shared
 /// units on one chain pay for both. The schedule proved `z(op) + inDelay(op) <=
 /// period` over a mux-free datapath, leaving each unit `unitSlack` of room for
-/// the WHOLE cone reaching it, which is what a fold has to fit inside.
+/// the whole cone reaching it, which is what a fold has to fit inside.
 ///
-/// This is `checkCombPathsMeetPeriod`'s recursion read off the ops rather than
-/// the Sources it has yet to build. That check stays the authority; this is its
-/// conservative pre-image, because every edge its Source walk follows is a
-/// same-cycle zero-latency same-region producer (one of the edges below) and it
-/// can only find FEWER levels than assumed here, a mux whose arms turn out
-/// identical collapsing to a wire.
+/// `checkCombPathsMeetPeriod` stays the authority; this is its conservative
+/// pre-image, the same recursion read off the ops rather than the Sources it
+/// has yet to build, and it can only over-count levels.
 struct ShareCone {
   ShareCone(const Datapath &dp, const RegionBlock &rb,
             const BindingContext &ctx)
@@ -101,9 +98,9 @@ private:
   double added(unsigned i) {
     if (memo[i] >= 0.0)
       return memo[i];
-    // Seeded before the walk: two bins may feed each other once ops issuing on
-    // different cycles share units, and a revisit reads 0 rather than recurring
-    // forever, exactly as the period check's own walk does.
+    // Seeded before the walk so a revisit reads 0 rather than recurring
+    // forever: two bins may feed each other once ops issuing on different
+    // cycles share units.
     memo[i] = 0.0;
     double in = 0.0;
     for (unsigned p : preds[i])
@@ -111,8 +108,7 @@ private:
     return memo[i] = in + muxLevels(fanin[i]) * level;
   }
 
-  /// Every member's cone inside the room its schedule left it. No slop, so a
-  /// plan admitted here is strictly inside what the period check accepts.
+  /// Whether every member's cone fits the slack its schedule left it.
   bool fits() {
     memo.assign(fanin.size(), -1.0);
     for (unsigned i = 0, e = fanin.size(); i < e; ++i)

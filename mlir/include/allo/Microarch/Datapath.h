@@ -151,18 +151,17 @@ struct FuncUnit {
   // register.
   llvm::SmallVector<Source, 2> inputs;
 
-  // Per-input reduction identities (parallel to `inputs`), one per iteration
-  // of the recurrence's distance: the emitter re-injects `inputInits[k][n]` on
-  // port k at iteration n, and the input itself takes over from iteration
-  // `inputInits[k].size()` on. A distance-1 recurrence has the one identity of
-  // the iter_arg it reads; a CHAINED carry (a 2nd-order shift register
-  // `ym2 = ym1; ym1 = y` gives ym2 distance 2) walks down the chain, reading
-  // one stage's init per early iteration. Empty for every non-recurrence
-  // input, and empty on a SHARED port, where the identities are arms of the
-  // input mux instead (`Mux::Phase`) because the port carries a different op's
-  // operand in each issue cycle. They live on the input port rather than a
-  // register because the widened idiom trunc(add(ext(acc),ext(x))) reads acc
-  // through a bare wire, not a tap.
+  // Per-input reduction identities (parallel to `inputs`), one per iteration of
+  // the recurrence distance: the emitter re-injects `inputInits[k][n]` on port
+  // k at iteration n, and the input takes over from iteration
+  // `inputInits[k].size()` on. A distance-1 recurrence carries the single
+  // identity of the iter_arg it reads; a chained carry (`ym2 = ym1; ym1 = y`
+  // gives ym2 distance 2) reads one stage's init per early iteration. Empty for
+  // a non-recurrence input, and empty on a shared port, whose identities are
+  // arms of the input mux instead (`Mux::Phase`) since that port carries a
+  // different op's operand in each issue cycle. The identities sit on the input
+  // port and not on a register because the widened idiom
+  // trunc(add(ext(acc),ext(x))) reads acc through a bare wire, not a tap.
   llvm::SmallVector<llvm::SmallVector<Source, 1>, 2> inputInits;
 };
 
@@ -494,16 +493,13 @@ struct StreamChannel {
 /// that sees different drivers across the ops bound to it.
 struct Mux {
   MuxId id = 0;
-  /// Which ITERATIONS of its selecting op's run an arm drives. A recurrence of
+  /// Which iterations of its selecting op's run an arm drives. A recurrence of
   /// distance `d` reads one identity per iteration below `d` and the value
-  /// carried round from `d` on, so it takes `d + 1` arms of this one select
-  /// rather than a chain of muxes in front of the port. That is the only place
-  /// to put them wherever `FuncUnit::inputInits` cannot: on a time-shared port,
-  /// which has no cycle of its own to time such a mux against, and in a slot
-  /// with no input port beside it at all (an address, a store datum, a stream
-  /// token). One select also stays one AND-OR reduction, which `muxLevels`
-  /// prices and the period check charges without knowing a recurrence is among
-  /// the arms.
+  /// carried round from `d` on, taking `d + 1` arms of one select instead of a
+  /// mux chain in front of the port. Used wherever `FuncUnit::inputInits`
+  /// cannot hold the identities: a time-shared port, which has no cycle of its
+  /// own to time such a mux against, and a slot with no input port beside it at
+  /// all (an address, a store datum, a stream token).
   struct Phase {
     enum Kind : uint8_t {
       Always, // every iteration: an ordinary operand
@@ -517,12 +513,12 @@ struct Mux {
   // The op whose issue selects each source (parallel to `sources`): the select
   // is `delayValid(issue, dcpStart(op))`, the same per-op activation pulse a
   // store's write-enable uses, narrowed by `phases`. The MRT guarantees the ops
-  // are mutually exclusive (disjoint residues) and a First/Rest pair splits one
-  // op's pulse in two, so the emitter builds a one-hot select.
+  // are mutually exclusive (disjoint residues) and `phases` partitions one op's
+  // pulse across its arms, so the emitter builds a one-hot select.
   llvm::SmallVector<Operation *, 2> selectOps;
   llvm::SmallVector<Phase, 2> phases; // parallel to `sources`
   RegionId region = 0; // region whose issue pulse times the selects
-  Type type;           // the muxed value's type: what the select costs per bit
+  Type type;           // the muxed value's type, whose width prices the select
 };
 
 /// The combinational depth, in LUT levels, of the select a mux of \p sources
@@ -808,11 +804,12 @@ struct Datapath {
   /// argument is a port it masters on its caller's storage, which is why the
   /// two answer `MemUnit::scattered` differently.
   bool atTop = false;
-  /// How many write ports one array is worth spreading over, from the device's
-  /// `max_writes`. A true dual port is what infers; past it the inference fails
-  /// outright, so a further colour would buy nothing and still cost its address
-  /// and data multiplexers. It bounds the module BOUNDARY for the same reason,
-  /// since whatever backs the array upstream is the same RAM.
+  /// How many write ports one array is worth spreading over, taken from
+  /// `MemoryLibrary::maxWritePorts`. A true dual port is what infers; past it
+  /// the inference fails outright, so a further colour would buy nothing and
+  /// still cost its address and data multiplexers. It bounds the module
+  /// boundary for the same reason, since whatever backs the array upstream is
+  /// the same RAM.
   unsigned maxWritePorts = 2;
 
   // Derived structural cells.

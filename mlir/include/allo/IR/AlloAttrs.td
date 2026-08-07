@@ -277,15 +277,10 @@ def CostQuadratic : I32EnumAttrCase<"Quadratic", 2, "quadratic">;
 // cliff: a chain deeper than three stops being flip-flops and stops growing.
 def CostStep      : I32EnumAttrCase<"Step",      3, "step">;
 // Measured point by point: coeffs is [p0, v0, p1, v1, ...] ascending in p, and
-// a parameter between two points takes the lower one's value.
-//
-// A STAIRCASE, which fits a quantity that really is piecewise constant (an SRL
-// chain occupies ceil(depth/32) sites, which at depth 40 is 2). A CONTINUOUS
-// quantity sampled into one is UNDER-STATED between points, which is the
-// dangerous direction for a timing model nothing downstream re-checks; every
-// combinational delay row is such a quantity today, and the fix owed is a
-// structural form a device can declare, not an interpolation rule applied on
-// its behalf.
+// a parameter between two points takes the lower one's value. This staircase
+// fits a piecewise constant quantity, such as the ceil(depth/32) sites an SRL
+// chain occupies. A continuous quantity sampled into a table is under-stated
+// between its points.
 def CostTable     : I32EnumAttrCase<"Table",     4, "table">;
 def CostTiled     : I32EnumAttrCase<"Tiled",     5, "tiled">;
 def CostFormEnum : I32EnumAttr<"CostFormEnum",

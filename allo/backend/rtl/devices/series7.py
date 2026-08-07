@@ -134,8 +134,8 @@ _STORAGE = {
 
 def _comb_uses(r: Mapping[str, Resource]) -> dict[CombKind, dict | None]:
     """What one instance of each native operator kind spends, over its operand
-    width. ``None`` is FREE and not unpriced: ``icast`` is a rename of bits and
-    ``neg`` a float sign flip, so neither reaches a cell the part charges for."""
+    width. ``None`` means free rather than unpriced: ``icast`` renames bits and
+    ``neg`` flips a float sign, so neither reaches a cell the part charges for."""
     lut, dsp, carry4 = r["lut"], r["dsp"], r["carry4"]
     logic = {lut: Linear(1.0)}
     addsub = {lut: Linear(1.0), carry4: Tiled(4)}
@@ -172,6 +172,7 @@ def _comb_uses(r: Mapping[str, Resource]) -> dict[CombKind, dict | None]:
 
 
 def _chain_uses(r: Mapping[str, Resource]) -> dict:
+    """What one delay chain spends, over its depth and bit width."""
     per_stage = [
         (Linear(1.0, base=-1.0), Const(1.0)),
         (

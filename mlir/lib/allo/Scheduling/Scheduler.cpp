@@ -463,8 +463,8 @@ LogicalResult mlir::allo::computeStartTimesInCycle(ChainingProblem &prob,
         continue; // registered a whole step earlier
 
       // `pred` ends in the cycle `op` starts in. A multi-cycle producer
-      // contributes only its outgoing delay, its last register stage being what
-      // the cycle starts from; the floor already bounds that from below.
+      // contributes only its outgoing delay, its last register stage being
+      // what the cycle starts from.
       float predEndInCycle =
           (*prob.getStartTime(pred) == predEnd ? *predStartTimeInCycle : 0.0f) +
           *prob.getOutgoingDelay(predOpr);
@@ -510,7 +510,7 @@ mlir::allo::computeChainBreaks(ChainingProblem &prob, float cycleTime,
 
     // `op` is the origin of its own chain, and every chain arriving at it is
     // one of its combinational predecessors' extended by that predecessor. A
-    // chain starts at the FLOOR, not at zero: its operands leave a register.
+    // chain starts at the floor, not at zero: its operands leave a register.
     chains[op][op] = regFloor;
     for (auto dep : prob.getDependences(op)) {
       if (!dep.isDefUse()) // an auxiliary edge transports no value
@@ -520,9 +520,8 @@ mlir::allo::computeChainBreaks(ChainingProblem &prob, float cycleTime,
       float outgoing = *prob.getOutgoingDelay(predOpr);
       if (*prob.getLatency(predOpr) > 0) {
         // Registered: the chain restarts at `pred` carrying its output delay,
-        // maxed against any longer chain that also reaches here through `pred`.
-        // Against the floor too, since `pred`'s own clock-to-out IS that delay
-        // and whichever is larger is what the path really waits for.
+        // maxed against any longer chain that also reaches here through `pred`,
+        // and against the floor, which is `pred`'s own clock-to-out.
         chains[op][pred] =
             std::max(chains[op][pred], std::max(regFloor, outgoing));
         continue;

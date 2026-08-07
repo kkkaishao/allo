@@ -69,8 +69,7 @@ enum class Code {
   StreamArgumentBidirectional, // a stream argument read and written
   AddressOverPeriod,           // an address cone we cannot register
   BindingMuxOverPeriod,        // a mux over the slack the schedule left
-  // ALLO-N0012 is retired: a reduction sharing its unit re-injects its identity
-  // on an arm of that unit's input mux (`uarch::Mux::Phase`).
+  // ALLO-N0012 is retired and is not reused.
   PlacementFailed,  // no feasible cycle for an operation
   NoExactScheduler, // this build has no OR-Tools
 };

@@ -16,12 +16,10 @@ using namespace mlir::allo;
 using namespace mlir::allo::dcp;
 
 namespace {
-// The arith mnemonic an IP operator's ABSTRACT kind (`add`/`div`/...) came
-// from. The suffix follows the OPERANDS and not the kind: an integer multiply
-// or divide binds to a core here too, so `mul` reads as `muli` exactly as
-// readily as `mulf`. An unmapped kind already reads as its own mnemonic, which
-// covers the casts and the integer divides, since those bind by MLIR mnemonic
-// (`divsi`) rather than by abstract kind in the first place.
+// The arith mnemonic an IP operator's abstract kind (`add`/`div`/...) came
+// from. The suffix follows the operand type and not the kind, since an integer
+// multiply binds to a core here too. An unmapped kind already reads as its own
+// mnemonic, which covers the casts and the integer divides.
 StringRef ipMnemonic(StringRef kind, bool isFloat) {
   if (!isFloat)
     return llvm::StringSwitch<StringRef>(kind)
@@ -47,7 +45,7 @@ StringRef ipMnemonic(StringRef kind, bool isFloat) {
 std::string opKind(Operation *op, const llvm::StringMap<StringRef> &kinds) {
   if (auto compute = dyn_cast<DCPathComputeOp>(op)) {
     if (std::optional<StringRef> sym = compute.getOpType()) {
-      // The OPERAND's type, not the result's: a compare answers in `i1`
+      // The operand's type, not the result's: a compare answers in `i1`
       // whatever it compared.
       Type t = compute->getNumOperands() ? compute->getOperand(0).getType()
                                          : compute->getResult(0).getType();

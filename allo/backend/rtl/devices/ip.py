@@ -1,7 +1,7 @@
 # Copyright Allo authors. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""The operator cores a fabric may offer, as ARCHETYPES."""
+"""The archetypes of the operator cores a fabric may offer."""
 
 from __future__ import annotations
 
@@ -21,8 +21,8 @@ from ....lang import (
 )
 from ....lang.ip import operator_ip, OperatorType
 
-# An `@operator_ip` body is `...`: the parameters exist to declare the
-# signature. The declared latency is a placeholder each fabric's table replaces.
+# An `@operator_ip` body is `...`: the parameters only declare the signature.
+# The declared latency is a placeholder each fabric's table replaces.
 # pylint: disable=unused-argument
 
 _ARCHETYPE = {"latency": 1, "in_delay_ns": 0.5, "pipelined": True, "style": "ce"}
@@ -80,7 +80,7 @@ def bfsub(a: bf16, b: bf16) -> bf16: ...
 def bfmul(a: bf16, b: bf16) -> bf16: ...
 
 
-# int <-> float conversion and float resize: one archetype per exact width pair,
+# Int/float conversion and float resize: one archetype per exact width pair,
 # since a core's signature fixes its widths.
 @operator_ip(optype=OperatorType.INT_FLOAT_CAST, **_ARCHETYPE)
 def i2f(a: i32) -> f32: ...
@@ -98,9 +98,9 @@ def fcvt(a: f32) -> f64: ...
 def bf2f(a: bf16) -> f32: ...
 
 
-# Integer multiply. `arith.muli` on `iN` keeps the LOW N bits, and those bits
-# are the same for a signed and an unsigned product, so one core serves both
-# and the abstract kind is enough to select it.
+# Integer multiply. `arith.muli` on `iN` keeps the low N bits, which are the
+# same for a signed and an unsigned product, so one core serves both and the
+# abstract kind selects it.
 @operator_ip(optype=OperatorType.MUL, **_ARCHETYPE)
 def imul8(a: i8, b: i8) -> i8: ...
 
@@ -117,15 +117,11 @@ def imul32(a: i32, b: i32) -> i32: ...
 def imul64(a: i64, b: i64) -> i64: ...
 
 
-# Integer divide and remainder. Here signedness is NOT a detail of how the
-# result is read: `divsi` and `divui` compute different numbers and Xilinx
-# builds them from different cores. The abstract kind cannot separate them,
-# because MLIR's `i32` is signless and both classify as `div`, so each binds by
-# its own MLIR MNEMONIC instead -- which is what a string `optype` already
-# means, the same route the advanced math cores take.
-#
-# Their AREAS, by contrast, differ by under 8% in LUTs and under 1% in FFs, so
-# a fabric prices the pair from one measurement rather than two.
+# Integer divide and remainder. `divsi` and `divui` compute different numbers
+# and Xilinx builds them from different cores, but MLIR's `i32` is signless and
+# both classify as `div`, so each binds by its own MLIR mnemonic instead of by
+# the abstract kind. Their areas differ by under 8% in LUTs and under 1% in
+# FFs, so a fabric prices the pair from one measurement.
 @operator_ip(optype="divsi", **_ARCHETYPE)
 def idiv8(a: i8, b: i8) -> i8: ...
 
@@ -192,8 +188,7 @@ def urem64(a: u64, b: u64) -> u64: ...
 
 # pylint: enable=unused-argument
 
-#: Every archetype, so a fabric's table can be checked against the catalog
-#: rather than against a reader's memory.
+#: Every archetype, for checking a fabric's table against.
 CATALOG = (
     fadd,
     fsub,

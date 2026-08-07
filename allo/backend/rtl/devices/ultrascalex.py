@@ -78,7 +78,7 @@ TIMING: Mapping[Grade, FabricTiming] = {
             CombKind.ADD: Table({8: 0.934, 16: 1.054, 32: 1.312, 64: 1.675}),
             CombKind.SUB: Table({8: 0.934, 16: 1.054, 32: 1.312, 64: 1.675}),
             CombKind.MUL: Table({8: 2.032, 16: 2.933, 32: 4.158, 64: 6.524}),
-            # 64 bits extrapolated as above.
+            # The 64-bit DIV and REM entries are extrapolated, not measured.
             CombKind.DIV: Table({8: 6.598, 16: 15.439, 32: 36.402, 64: 87.4}),
             CombKind.REM: Table({8: 6.830, 16: 15.289, 32: 37.631, 64: 90.3}),
             CombKind.NEG: Table({32: 0.541, 64: 0.667}),
@@ -171,8 +171,8 @@ _STORAGE = {
 
 def _comb_uses(r: Mapping[str, Resource]) -> dict[CombKind, dict | None]:
     """What one instance of each native operator kind spends, over its operand
-    width. ``None`` is FREE and not unpriced: ``icast`` is a rename of bits and
-    ``neg`` a float sign flip, so neither reaches a cell the part charges for."""
+    width. ``None`` means free rather than unpriced: ``icast`` renames bits and
+    ``neg`` flips a float sign, so neither reaches a cell the part charges for."""
     lut, dsp, carry8 = r["lut"], r["dsp"], r["carry8"]
     logic = {lut: Linear(1.0)}
     addsub = {lut: Linear(1.0), carry8: Tiled(8)}
@@ -209,6 +209,7 @@ def _comb_uses(r: Mapping[str, Resource]) -> dict[CombKind, dict | None]:
 
 
 def _chain_uses(r: Mapping[str, Resource]) -> dict:
+    """What one delay chain spends, over its depth and bit width."""
     per_stage = [
         (Linear(1.0, base=-1.0), Const(1.0)),
         (

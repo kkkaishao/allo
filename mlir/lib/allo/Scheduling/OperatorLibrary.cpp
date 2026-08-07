@@ -264,8 +264,8 @@ OperatorLibrary OperatorLibrary::fromModule(ModuleOp module) {
       e.kind = comb.getKind();
       e.comb = true;
       e.latency = 0;
-      // Left as a curve: what width to evaluate it at is the matched
-      // OPERATION's, which `lookup` knows and this does not.
+      // Left as a curve: the width to evaluate it at is the matched
+      // operation's, which `lookup` knows and this does not.
       e.delay = comb.getDelayAttr();
       e.uses = comb.getUsesAttr();
       lib.entries.push_back(std::move(e));
@@ -462,16 +462,14 @@ OperatorChar OperatorLibrary::lookup(Operation *op) const {
           ? ("comb." + stringifyOpKindEnum(e->kind) + ".w" + Twine(width)).str()
           : std::string("default");
   c.timing.latency = e->latency;
-  // A comb row carries its MARGINAL delay: what the operator adds to a path
-  // that already left a register. The fabric floor the measurement also saw is
-  // paid once per CYCLE, so it comes off the chaining BUDGET instead
-  // (`runSDCScheduler`); charging it per operator costs a four-deep chain three
-  // floors it does not spend.
+  // A comb row carries its marginal delay: what the operator adds to a path
+  // that already left a register. The floor the measurement also saw is paid
+  // once per cycle, as the lower bound on every sub-cycle start time, so
+  // charging it per operator would cost an N-deep chain N floors.
   //
-  // The two are the same number here because they must be:
-  // `ChainingProblem::checkDelays` rejects a zero-latency operator whose
-  // incoming and outgoing delays differ, since for a combinational cell they
-  // describe one path.
+  // Incoming and outgoing hold the same number because
+  // `ChainingProblem::checkDelays` rejects a zero-latency operator whose two
+  // delays differ: for a combinational cell they describe one path.
   if (e->comb)
     c.timing.inDelay = c.timing.outDelay =
         std::max(0.0, e->delay.evaluate(width) - regFloor);
@@ -480,10 +478,9 @@ OperatorChar OperatorLibrary::lookup(Operation *op) const {
     c.timing.outDelay = e->outDelay;
   }
   c.pipelined = e->pipelined;
-  // A shift by a literal is wiring, not a shifter. Its own type name because
-  // the problem registers timing per NAME: leaving it on the shift row would
-  // make the two spellings of that row disagree, and the last one populated
-  // would win for both.
+  // A shift by a literal is wiring, not a shifter. It takes a type name of its
+  // own because the problem registers timing per name: sharing the shift row
+  // would make two spellings of that row disagree.
   if (isBitRename(op)) {
     c.timing.typeName = "rename." + c.timing.typeName;
     c.timing.inDelay = c.timing.outDelay = 0.0;

@@ -22,15 +22,14 @@
 //       trunc(ext a `core` ext b) == (a `core` b) mod 2^w,
 //     the reduction is exactly associative, and rebuilding the same idiom
 //     leaves operand widths unchanged.
-//   * integer, bare: a same-width `arith.addi` / `arith.muli`, which is what
-//     the idiom collapses to once the operand widths are narrowed to what the
-//     consumer observes.
+//   * integer, bare: a same-width `arith.addi` / `arith.muli`, what the idiom
+//     collapses to once operand widths are narrowed to what the consumer reads.
 //
-// A bare integer core carries nothing marking it as a reduction, so the shape
-// alone is not the key: a caller walking arbitrary ops must anchor it
-// structurally, by a loop-carried accumulator among the chain's leaves, to
-// leave index and address arithmetic untouched. A caller that matched the loop
-// shape first, as rotate-reductions does, already holds that anchor.
+// A bare integer core carries nothing marking it as a reduction, so shape alone
+// is not the key: a caller walking arbitrary ops must anchor it on a
+// loop-carried accumulator among the chain's leaves, which leaves index and
+// address arithmetic untouched. A caller that matched the loop shape first, as
+// rotate-reductions does, already holds that anchor.
 namespace mlir::allo {
 
 inline bool isFloatReductionOp(Operation *op) {

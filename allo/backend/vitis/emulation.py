@@ -29,10 +29,9 @@ HOST_CPP = "host.cpp"
 
 
 def _validate_impl_dtype(dtype: TypeBase, index: int) -> None:
-    """Reject element types whose host byte layout is ambiguous at the m_axi /
-    s_axilite boundary. Unlike C simulation (which widens through the
-    ``generate-apint-wrapper`` ABI), emulation/hardware uses the real kernel
-    types, which is what :data:`HLS_HW_ABI` declares; the lookup is the check."""
+    """Reject element types :data:`HLS_HW_ABI` cannot carry at the m_axi /
+    s_axilite boundary. Emulation and hardware use the real kernel types rather
+    than the widened ``generate-apint-wrapper`` ABI C simulation uses."""
     where = "return value" if index == -1 else f"argument {index}"
     if not isinstance(dtype, DType):
         raise TypeError(

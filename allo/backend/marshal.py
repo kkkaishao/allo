@@ -1,12 +1,7 @@
 # Copyright Allo authors. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""How a kernel value crosses the host boundary, stated once for every backend.
-
-The backends differ in what they can carry, and used to differ only in which
-helper they happened to call. Here each target declares an :class:`Abi` and asks
-:func:`host_type` the same question, so a difference is a row in a table rather
-than a divergence between copies."""
+"""How a kernel value crosses the host boundary, per backend ABI."""
 
 from __future__ import annotations
 
@@ -22,23 +17,18 @@ from ..lang.core import APInt, BufferType, DType, IndexType
 
 
 class Widening(Enum):
-    """What a target does with an integer whose width the host cannot name,
-    which is anything but 1/8/16/32/64."""
+    """What a target does with an integer width the host cannot name, which is
+    anything but 1/8/16/32/64."""
 
-    IR = "ir"  # `generate-apint-wrapper` widened the kernel boundary itself
-    HOST = "host"  # the design keeps the exact width, so the host closes the gap
+    IR = "ir"  # `generate-apint-wrapper` widens the kernel boundary itself
+    HOST = "host"  # the design keeps the exact width; the host closes the gap
     NONE = "none"  # such a width cannot cross at all
 
 
 @dataclass(frozen=True)
 class Abi:
     """What one target carries across the host boundary. ``name`` is how the
-    target calls itself in a diagnostic.
-
-    ``narrow_floats`` and ``wide_scalars`` are separate questions: a boundary
-    made of C types can carry binary16 as its raw 16 bits without being able to
-    carry a 128-bit integer at all, while one made of ports carries any width
-    there is."""
+    target calls itself in a diagnostic."""
 
     name: str
     index_width: int  # `index` lowers to i64 under LLVM, to kIndexWidth in RTL
@@ -48,8 +38,8 @@ class Abi:
 
 
 LLVM_ABI = Abi("CPU", 64, Widening.IR, narrow_floats=True, wide_scalars=False)
-# No narrow floats: the C simulation calls the kernel's own `half` signature, and
-# a `half` is not passed the way the raw 16 bits behind it would be.
+# No narrow floats: the C simulation calls the kernel's own `half` signature,
+# which is not passed the way the raw 16 bits behind it would be.
 HLS_CSIM_ABI = Abi(
     "Vitis csim", 32, Widening.IR, narrow_floats=False, wide_scalars=False
 )
@@ -61,8 +51,7 @@ HLS_HW_ABI = Abi(
     wide_scalars=False,
 )
 # The RTL boundary is ports rather than C types, so any bit layout crosses it:
-# a narrow float is its own 16 bits, and an integer past every numpy container
-# is a Python int, which has no width to run out of.
+# a narrow float as its own 16 bits, a wider-than-64 integer as a Python int.
 RTL_ABI = Abi("RTL cosim", 32, Widening.HOST, narrow_floats=True, wide_scalars=True)
 
 
@@ -109,14 +98,10 @@ class HostType:
     """One kernel dtype as it crosses one boundary: the numpy dtype the host
     holds it in, and how many of that container's bits the value occupies.
 
-    The two differ exactly where a design keeps a width the host cannot name,
-    and closing that gap is what :func:`to_bits` and :func:`from_bits` are for.
-    Where the IR widened the boundary instead, they are equal and both are
-    no-ops.
-
-    ``np_dtype`` is ``None`` for a value past every numpy container, which
-    crosses as a Python int. That is a scalar-only form: numpy is what an array
-    is made of, so an array still needs a container."""
+    The two differ where the design keeps a width the host cannot name;
+    :func:`to_bits` and :func:`from_bits` close that gap. ``np_dtype`` is
+    ``None`` for a value past every numpy container, which crosses as a Python
+    int and so only as a scalar."""
 
     np_dtype: type | None
     value_bits: int
@@ -147,7 +132,7 @@ class HostType:
     @property
     def ctype(self) -> type:
         """The ctypes scalar for a value crossing by value. A narrow float has
-        none, so it crosses as raw ``c_int16`` and the caller reinterprets."""
+        none, so it crosses as raw ``c_int16``."""
         if self.narrow_float:
             return ctypes.c_int16
         return np.ctypeslib.as_ctypes_type(np.dtype(self.np_dtype))
@@ -182,7 +167,7 @@ def host_type(dtype: DType, abi: Abi) -> HostType:
                 "at the host boundary; use a standard width (8/16/32/64)"
             )
         std = next(s for s in _STD_WIDTHS if width <= s)
-        # Under IR widening the kernel boundary IS the wider type, so nothing is
+        # Under IR widening the kernel boundary is the wider type, so nothing is
         # left for the host; under host widening the design kept `width`.
         carried = std if abi.widening is Widening.IR else width
         return HostType(_INT_NP[(std, signed)], carried, signed)
@@ -198,8 +183,8 @@ def host_type(dtype: DType, abi: Abi) -> HostType:
 
 
 def element_type(dtype: DType, abi: Abi) -> HostType:
-    """``dtype`` where it has to be an ARRAY element. An array is made of numpy,
-    so unlike a scalar it cannot fall back to a Python int."""
+    """``dtype`` as an array element. An array is made of numpy, so unlike a
+    scalar it cannot fall back to a Python int."""
     host = host_type(dtype, abi)
     if host.np_dtype is None:
         raise TypeError(
@@ -214,8 +199,8 @@ def element_type(dtype: DType, abi: Abi) -> HostType:
 
 def as_array(arg, buffer_type: BufferType, abi: Abi) -> np.ndarray:
     """``arg`` as a C-contiguous array of the element type ``abi`` carries.
-    Returns the caller's own object when it already is one, which is what lets
-    :func:`writeback` tell whether there is a copy to write back."""
+    Returns the caller's own object when it already is one, which is how
+    :func:`writeback` tells whether there is a copy to write back."""
     if not isinstance(arg, np.ndarray):
         raise TypeError(f"{abi.name} buffer arguments must be numpy arrays")
     if tuple(arg.shape) != tuple(buffer_type.shape):
@@ -229,16 +214,16 @@ def as_array(arg, buffer_type: BufferType, abi: Abi) -> np.ndarray:
 
 def to_ctype_scalar(value, host: HostType):
     """One value as a 1-element ctypes array, for a boundary that takes scalars
-    by value. A narrow float has no ctype, so it crosses as the raw 16 bits its
-    numpy scalar holds."""
+    by value. A narrow float crosses as the raw 16 bits its numpy scalar
+    holds."""
     if host.narrow_float:
         value = host.np_dtype(value).view(np.int16)
     return (host.ctype * 1)(value)
 
 
 def from_ctype_scalar(raw, host: HostType):
-    """Inverse of :func:`to_ctype_scalar`: what crossed as raw bits has to be
-    read back through them, or it comes out as the integer they spell."""
+    """Inverse of :func:`to_ctype_scalar`. What crossed as raw bits is read back
+    through them, or it comes out as the integer they spell."""
     if host.narrow_float:
         return np.int16(raw).view(host.np_dtype)
     return raw
@@ -257,8 +242,8 @@ def writeback(pairs) -> None:
 
 def to_bits(array: np.ndarray, host: HostType) -> np.ndarray:
     """``array`` as a flat unsigned bit pattern at the boundary's own width. A
-    padded value is masked down to its own bits, since that is all a port that
-    wide can accept."""
+    padded value is masked down to its own bits, which is all a port that wide
+    accepts."""
     arr = np.ascontiguousarray(array, dtype=host.np_dtype).reshape(-1)
     bits = arr.view(_UINT[host.container_bits])
     if host.padded:
@@ -267,7 +252,7 @@ def to_bits(array: np.ndarray, host: HostType) -> np.ndarray:
 
 
 def from_bits(bits: np.ndarray, host: HostType, shape) -> np.ndarray:
-    """Inverse of :func:`to_bits`. A padded SIGNED value is sign-extended here:
+    """Inverse of :func:`to_bits`. A padded signed value is sign-extended here:
     the design's ports are only as wide as the type, so nothing below the host
     has done it."""
     container = _UINT[host.container_bits]
@@ -287,8 +272,8 @@ def scalar_to_bits(value, host: HostType) -> int:
 
 
 def scalar_from_bits(bits: int, host: HostType):
-    """Inverse of :func:`scalar_to_bits`: a numpy scalar, or a Python int where
-    the value is past every numpy container."""
+    """Inverse of :func:`scalar_to_bits`. Returns a numpy scalar, or a Python
+    int where the value is past every numpy container."""
     value = bits & host.mask
     if host.np_dtype is not None:
         word = np.array([value], _UINT[host.container_bits])

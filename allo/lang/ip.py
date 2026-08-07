@@ -135,7 +135,7 @@ class IP(Kernel[P, R]):
 
 
 #: How a dtype family abbreviates in an operator symbol. A family the table does
-#: not name keeps its whole dtype name, which is longer but never ambiguous.
+#: not name keeps its full dtype name.
 _FAMILY_TAG = {"float": "f", "bfloat": "bf", "int": "i", "uint": "u"}
 
 
@@ -147,17 +147,16 @@ def _dtype_tag(dtype) -> str:
     return f"{tag}{width}" if tag and width else name
 
 
-# The base's `schedule` / `module` / `add_rtl_model` raise because an external
-# block has none of them, which is the right answer for an operator core too.
+# An operator core has no schedule, module, or RTL model, so the base's
+# raising implementations stand.
 # pylint: disable-next=abstract-method
 class OperatorIP(IP[P, R]):
-    """An IP the compiler MATCHES onto concrete ``arith``/``math`` ops, rather
-    than one a kernel instantiates by name.
+    """An IP the compiler matches onto concrete ``arith``/``math`` ops instead
+    of one a kernel instantiates by name.
 
     ``optype`` is the abstract kind it realizes; every op of that kind whose
     signature it fits binds to it, and a device declares at most one such core
-    per (kind, signature). That is why an operator IP is never called: it is
-    selected, and what selects it is the op already in the IR.
+    per (kind, signature).
     """
 
     def __init__(
@@ -180,9 +179,8 @@ class OperatorIP(IP[P, R]):
             style=style,
         )
         self.optype = optype
-        # The readable BASE of the symbol, and never what makes it unique. It
-        # defaults to the kind's own string, which is what a device wants unless
-        # it has two cores of one kind and signature to tell apart.
+        # The readable base of the symbol, not what makes it unique. Defaults
+        # to the kind's own string.
         self.mnemonic = mnemonic or (
             optype.value if isinstance(optype, OperatorType) else str(optype)
         )
@@ -193,29 +191,26 @@ class OperatorIP(IP[P, R]):
         the extern RTL module name the emitter instantiates and the key the
         cosim behavioral model joins on.
 
-        The rule has to give a DISTINCT name to every distinct piece of
-        hardware: two ``dcp.operator``s sharing a symbol is a symbol-table
-        error, and two sharing an area row is a silent mispricing. So every
-        axis a core specializes along is a field::
+        Every axis a core specializes along is a field, so that distinct
+        hardware never shares a symbol::
 
             <mnemonic>_<arg tag>..._<result tag>_l<latency>
 
         * ``mnemonic`` is the kind, defaulting to ``optype``'s own string
-          (``add``, ``cmp``, ``ifcast``, or an advanced op's ``sqrt``). A device
-          overrides it only to read better.
-        * one tag per ARGUMENT and then one for the RESULT. The field count is
-          therefore the arity, so a unary core cannot collide with a binary one;
-          the tags are dtypes rather than widths, so ``bf16`` and a future
-          ``f16`` stay apart; and the result is carried even where it repeats an
-          argument, because a cast is the case where it is the only thing that
-          differs (``ifcast_i32_f32_l3`` against ``ifcast_f32_i32_l3``).
+          (``add``, ``cmp``, ``ifcast``, or an advanced op's ``sqrt``).
+        * one tag per argument and then one for the result, so the field count
+          is the arity and a unary core cannot collide with a binary one. Tags
+          are dtypes rather than widths, keeping ``bf16`` apart from a future
+          ``f16``. The result tag is carried even where it repeats an argument,
+          since a cast differs only there (``ifcast_i32_f32_l3`` against
+          ``ifcast_f32_i32_l3``).
         * ``_l<latency>`` last, since a core pipelined differently is different
           hardware with a different area. No dtype tag begins with ``l``, so the
           suffix cannot be read as one.
 
-        A float compare is the one core this does not fully determine: the
-        predicate belongs to the op and not to the IP, so the emitter appends it
-        to the module name (``cmp_f32_f32_u1_l1_ogt``).
+        A float compare is not fully determined here: the predicate belongs to
+        the op and not to the IP, so the emitter appends it to the module name
+        (``cmp_f32_f32_u1_l1_ogt``).
         """
         rets = self.parse_return_annotation()
         assert len(rets) == 1, f"operator IP {self.func_name!r} returns one scalar"
@@ -223,9 +218,8 @@ class OperatorIP(IP[P, R]):
         return f"{self.mnemonic}_{'_'.join(tags)}_l{self.timing.latency}"
 
     def retimed(self, latency: int) -> "OperatorIP[P, R]":
-        """A copy of this core pipelined to ``latency``. The symbol follows, so
-        a device that builds the same core at two depths gets two names without
-        having to spell either."""
+        """A copy of this core pipelined to ``latency``. The symbol follows the
+        new latency, so the same core at two depths gets two names."""
         core = copy.copy(self)
         core.timing = replace(self.timing, latency=latency)
         verify_timing(core.timing)
@@ -271,9 +265,9 @@ def operator_ip(
     style: Literal["free", "elastic", "ce"] | None = None,
 ) -> OperatorIP[P, R] | Callable[[Callable[P, R]], OperatorIP[P, R]]:
     """Declare an operator core: an external block the compiler binds ops of
-    ``optype`` onto. The body is ``...``; the parameters exist to declare the
-    signature, which together with ``optype`` and ``latency`` is what selects
-    the core and what names it (see :attr:`OperatorIP.symbol`)."""
+    ``optype`` onto. The body is ``...``; the parameters declare the signature,
+    which with ``optype`` and ``latency`` selects and names the core (see
+    :attr:`OperatorIP.symbol`)."""
 
     def build(fn: Callable[P, R]) -> OperatorIP[P, R]:
         assert callable(fn), "The first argument must be a callable function."

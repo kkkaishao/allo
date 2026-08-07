@@ -47,8 +47,7 @@ def run_schedule(
 
     ``prepass`` shapes the IR the scheduler is handed, ``options`` is what the
     scheduler itself is asked for, and ``allocate`` lets an exact solve decide
-    how many copies of each operator a region builds, which only pays off under
-    a binding that folds them.
+    how many copies of each operator a region builds.
     """
     run_pipeline(module, RTL_PREPARE_PIPELINE)
     reassoc = (

@@ -335,8 +335,7 @@ def test_internal_signal_names():
     def sx(a: i32, X: i32[16], Y: i32[16], Z: i32[16]):
         for i in range(16):
             # `buf` is combinational and the multiply beside it is a DSP core,
-            # so `buf` has to WAIT for it: that wait is the delay tap whose
-            # name is the subject here.
+            # so `buf` waits for it. That wait is the delay tap named below.
             buf: i32 = X[i] + a
             Z[i] = buf + Y[i] * a
 
@@ -518,10 +517,9 @@ def test_call_shares_boundary_arg_with_parent_read():
 
 # --- the host boundary --------------------------------------------------------
 # A width the host cannot name (anything but 8/16/32/64) crosses in a wider numpy
-# container, and the design's ports are only as wide as the type. The host is
-# therefore the one that has to truncate on the way in and sign-extend on the way
-# out, since nothing below it does. The values below are chosen to have the top
-# bit of the 48-bit type set, which is exactly where a missing extension shows.
+# container while the design's ports stay as wide as the type, so the host
+# truncates on the way in and sign-extends on the way out. The values below set
+# the top bit of the 48-bit type, where a missing extension shows.
 def test_nonstandard_width_crosses_the_host_boundary():
     i48 = APInt(48, signed=True)
 
@@ -547,8 +545,7 @@ def test_nonstandard_width_crosses_the_host_boundary():
 
 
 # The same kernel on the CPU (which widens the boundary in the IR) and in cosim
-# (which keeps the exact width and closes the gap on the host) must agree: the
-# two ABIs are two ways to carry one value, not two values.
+# (which keeps the exact width and closes the gap on the host) must agree.
 def test_nonstandard_width_agrees_with_cpu():
     i48 = APInt(48, signed=True)
 
@@ -567,9 +564,8 @@ def test_nonstandard_width_agrees_with_cpu():
     assert int(_to_rtl(dot48).cosim(x, y).result) == int(dot48(x, y))
 
 
-# A boundary made of ports rather than C types carries any bit layout there is,
-# which is what `RTL_ABI` declares. binary16 and bfloat16 cross as their own 16
-# bits, with no ctype in the way.
+# A boundary made of ports rather than C types carries any bit layout, which is
+# what `RTL_ABI` declares: binary16 and bfloat16 cross as their own 16 bits.
 def test_narrow_floats_cross_the_host_boundary():
     @kernel
     def hcopy(a: f16[8], out: f16[8]):

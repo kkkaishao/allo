@@ -925,20 +925,11 @@ LogicalResult mlir::allo::runSDCScheduler(ModuleOp module, StringRef top,
   if (failed(orderOr))
     return failure();
 
-  // The fabric floor: what a path with no operator in it already costs, a
-  // source flip-flop's clock-to-out plus routing. It reaches the solve as the
-  // EARLIEST sub-cycle time any operation may start at, which is where it
-  // belongs: nothing in a cycle can begin before its inputs leave a register.
-  //
-  // Not folded into the operator rows, whose delays are marginal: CIRCT defines
-  // a combinational operator's incoming and outgoing delay as one path (operand
-  // inputs to result outputs), so a per-CYCLE constant is not expressible
-  // there, and charging it per row would cost an N-deep chain N floors.
-  //
-  // Not taken off the period either, which would charge it a second time
-  // wherever a chain begins at a registered node whose own outgoing delay is
-  // already its clock-to-out, and would leave `unitSlack` (which reads the
-  // period and the solved `z`) disagreeing with the solve by one floor.
+  // The fabric floor: a source flip-flop's clock-to-out plus routing, what a
+  // path with no operator in it already costs. It reaches the solve as the
+  // earliest sub-cycle time any operation may start at, not as a per-row delay
+  // (which would cost an N-deep chain N floors) and not off the period (which
+  // would leave `unitSlack` disagreeing with the solve by one floor).
   float regFloor = loadedDev.operators.registerFloor();
   if (cycleTime <= regFloor) {
     error(Stage::Sched, Code::OperatorOverPeriod, module)

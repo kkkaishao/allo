@@ -88,9 +88,8 @@ def test_a_device_declares_its_resources_and_what_they_cost():
     assert "@dsp" in text and "table" in text and "quadratic" in text
 
 
-# A cost naming something that is not a resource is a verifier error, which is
-# the whole point of the symbol: the dictionary it replaced turned a misspelling
-# into an absent row.
+# A cost naming something that is not a resource is a verifier error, so a
+# misspelled name fails loudly instead of becoming an absent row.
 def test_a_cost_must_name_a_declared_resource():
     dev = default_device.copy()
     ghost = dev.add_resource("ghost", capacity=10)
@@ -157,17 +156,16 @@ def test_an_operator_declares_what_its_core_spends():
     core = "add_f32_f32_f32_l7"
     assert f"allo.dcp.operator @{core}" in text
     scope = default_device.name  # the device the reference reaches through
-    # The count is the DEVICE's, read back rather than restated: what this
-    # pins is that the reference resolves through the device symbol, not what
-    # one core happens to cost this week.
+    # The count is read back off the device rather than restated: what this pins
+    # is that the reference resolves through the device symbol.
     luts = dict(default_device.operator_uses[core])["lut"][0].coeffs[0]
     assert f"#allo.res_use<@{scope}::@lut, [<const, [{luts:.6e}]>]>" in text
 
 
-# A cost is a SUM of product terms, so a measured shape that is a sum can be
+# A cost is a sum of product terms, so a measured shape that is a sum can be
 # declared: an extracted chain's flip-flops are a per-bit term plus a per-stage
-# one, which no single product is. The sum is taken before rounding, so how the
-# cost was factored cannot change the answer.
+# one. The sum is taken before rounding, so the factoring cannot change the
+# answer.
 def test_a_cost_sums_the_terms_that_name_one_resource():
     @kernel
     def k(A: i32[8], out: i32[8]):
@@ -292,16 +290,15 @@ def test_advanced_math_sqrt_cosim():
 
 
 def test_non_pipelined_ip_bounds_the_initiation_interval():
-    # A NON-PIPELINED unit takes one input per latency window, so a loop that
+    # A non-pipelined unit takes one input per latency window, so a loop that
     # re-issues it every II cycles needs II >= latency. Nothing else here bounds
     # the interval (two arrays, two ports each, no carried recurrence), so the
     # pipelined twin of the same IP runs at II=1 and the `pipelined` flag alone
     # is the difference.
     #
-    # The lock is WRITTEN rather than measured: the behavioral model an `@operator_ip`
-    # emits accepts an input every cycle whatever the flag says, so the cosim
-    # below passes either way. Only the II catches a datapath that would feed a
-    # real unit faster than it can accept.
+    # The behavioral model an `@operator_ip` emits accepts an input every cycle
+    # whatever the flag says, so the cosim below passes either way. Only the II
+    # catches a datapath that would feed a real unit faster than it accepts.
     N, LAT = 16, 3
 
     def _dev(pipelined):
@@ -352,8 +349,8 @@ def test_float_negate_cosim():
 
 
 def test_int_to_float_cast_cosim():
-    # An int->float cast (arith.sitofp) is a unary IP: the built-in
-    # ifcast_i32_f32_l3 emits a single-input extern and cosims against a signed conversion.
+    # An int->float cast (arith.sitofp) is a unary IP: the built-in core emits a
+    # single-input extern and cosims against a signed conversion.
     N = 16
 
     @kernel
@@ -390,9 +387,8 @@ def test_free_running_operator_cosim():
             C[i] = A[i] + B[i]
 
     dev = default_device.copy()
-    # Last-wins over the built-in f32 add: it is a different core, so it takes a
-    # symbol of its own, and what makes it override is the (kind, signature) it
-    # shares.
+    # Last-wins over the built-in f32 add: a different core takes a symbol of
+    # its own, and the (kind, signature) it shares is what makes it override.
     dev.add_operator(fadd_free)
     rtl = _to_rtl(addk, device=dev)
     # The manifest declares each instantiated operator's realized port shape.
@@ -524,8 +520,8 @@ def test_float_max_no_ip_expands_cosim(propagate_nan):
 def test_float_max_with_ip_kept_cosim():
     # A float max on a device WITH a matching max IP is KEPT by legalize-arith
     # (not expanded) and bound to that IP, one operator instead of cmp+select.
-    # No add_c_model: `max` is an OperatorType, so the built-in model table owes
-    # it a behavior and the core is characterized by its declaration alone.
+    # `max` is an OperatorType, so the built-in model table supplies its
+    # behavior and no add_c_model is needed.
     N = 16
 
     @operator_ip(
@@ -598,10 +594,9 @@ def test_wide_int_operator_ip_cosim():
 
 
 def test_behavior_language_follows_the_domain():
-    # Which language a core's behavior is written in follows from the core, not
-    # from a list: an integer one is native RTL (exact at any width, so a 128-bit
-    # core models like any other), a float one is C over the DPI, and a user
-    # `add_c_model` is C whatever the domain, since that is what the user wrote.
+    # A core's behavior language follows from the core: an integer one is native
+    # RTL (exact at any width), a float one is C over the DPI, and a user
+    # `add_c_model` is C whatever the domain.
     from allo.backend.rtl.device import operator_descs
     from allo.backend.rtl.sim import ip_models
 
@@ -639,10 +634,9 @@ def test_behavior_language_follows_the_domain():
 
 
 def test_float_format_picks_its_own_codec():
-    # Each float format decodes through the codec for ITS layout. binary16 and
-    # bfloat16 are both 16 bits and neither is a narrowed binary32 read, so a
-    # model that fell back to the nearest-looking format would compute garbage
-    # without saying so.
+    # Each float format decodes through the codec for its own layout. binary16
+    # and bfloat16 are both 16 bits and neither is a narrowed binary32, so a
+    # model falling back to the nearest-looking format computes garbage.
     from allo.backend.rtl.device import operator_descs
     from allo.backend.rtl.sim import ip_models
 
@@ -783,12 +777,11 @@ def test_shared_multiply_mux():
 
 
 def test_bit_slice_lowers_to_arithmetic():
-    # A bit field is named by the frontend and modelled by nothing below it, so
-    # `legalize-arith` expands it into the integer arithmetic the operator
-    # library prices -- before the schedule is cut, so the chaining solve sees
-    # the field access at its real combinational depth. Every shape the frontend
-    # admits: constant and dynamic offset, read and write, and the width-one
-    # slice a bare `x[k]` is.
+    # No phase below the frontend models a bit field, so `legalize-arith`
+    # expands it into the integer arithmetic the operator library prices, before
+    # the schedule is cut so the chaining solve sees the field access at its real
+    # combinational depth. Covers every shape the frontend admits: constant and
+    # dynamic offset, read and write, and the width-one slice a bare `x[k]` is.
     @kernel
     def fields(A: u32[16], B: u32[16], C: u32[16], D: u32[16]):
         for i in range(16):
@@ -812,9 +805,8 @@ def test_bit_slice_lowers_to_arithmetic():
     # Nothing of the allo dialect survives into the datapath.
     assert "allo.bit" not in mod.dcp_module.operation.get_asm()
     # A constant offset is a bit selection, not a shifter: CIRCT folds a shift
-    # by a literal back into extract / concat, which is the hardware a field
-    # access is. A dynamic one cannot be, `comb.extract` taking its low bit as
-    # an attribute, so it keeps a real shifter.
+    # by a literal back into extract / concat. A dynamic offset cannot fold,
+    # `comb.extract` taking its low bit as an attribute, so it keeps a shifter.
     assert ">>" not in mod.verilog.split("B_wr0_data")[1].split(";")[0]
 
     B, C, D = (np.zeros(16, np.uint32) for _ in range(3))
@@ -831,13 +823,12 @@ def _op_kinds(fn):
 
 
 def test_bit_field_write_drops_redundant_masks():
-    # Splicing a field masks the hole it fills, and the splices CHAIN, so four
+    # Splicing a field masks the hole it fills, and the splices chain, so four
     # field writes put four AND-OR pairs on one combinational path. Where the
-    # bits a mask clears are ones the value provably never sets -- every field of
-    # a word that started at zero -- the mask computes nothing, and the forward
-    # bit walk in `narrow-demanded-bits` removes it. What is left is the
-    # concatenation the write really is, which fits the clock the un-analysed
-    # chain did not.
+    # bits a mask clears are ones the value provably never sets (every field of
+    # a word that started at zero) the mask computes nothing and the forward bit
+    # walk in `narrow-demanded-bits` removes it, leaving the concatenation the
+    # write really is.
     @kernel
     def pack(A: u32[16], B: u32[16]):
         for i in range(16):
@@ -853,7 +844,7 @@ def test_bit_field_write_drops_redundant_masks():
         for i in range(16):
             B[i] = A[i]
 
-    # A mask over a field that ALREADY holds data is load-bearing and stays, as
+    # A mask over a field that already holds data is load-bearing and stays, as
     # is one over a signed shift, whose high bits are the replicated sign.
     @kernel
     def overwrite(A: u32[16], V: u32[16], B: u32[16]):
@@ -891,11 +882,11 @@ def test_bit_field_write_drops_redundant_masks():
 
 
 def test_disjoint_or_is_a_concatenation():
-    # Two values sharing no set bit do not COMBINE, they concatenate: every
-    # result bit takes one side while the other contributes a constant zero, the
-    # same zero a synthesizer propagates. Three such ORs chained therefore cost
-    # nothing and settle at one sub-cycle position, where three overlapping ones
-    # stand a gate delay apart. The forward bit walk is what tells them apart.
+    # Two values sharing no set bit concatenate rather than combine: every result
+    # bit takes one side while the other contributes a constant zero. Three such
+    # ORs chained cost nothing and settle at one sub-cycle position, where three
+    # overlapping ones stand a gate delay apart. The forward bit walk in
+    # `narrow-demanded-bits` is what tells them apart.
     @kernel
     def disjoint(A: u32[64], B: u32[64], C: u32[64]):
         for i in range(64):
@@ -937,12 +928,11 @@ def test_disjoint_or_is_a_concatenation():
 
 
 def test_literal_shift_is_wiring():
-    # A shift by a LITERAL renames bits: `comb` folds it into an extract /
+    # A shift by a literal renames bits: `comb` folds it into an extract /
     # concat, so it costs no logic. The device's shift row prices a barrel
-    # shifter, the delay a RUNTIME amount pays, so charging it here would cut
-    # chains around hardware that is not there and pay for the cut in registers.
-    # The two kernels have the same operation count and the same memory traffic;
-    # only the shift amount differs, so any gap is the shifter's delay alone.
+    # shifter, which is what a runtime amount pays for. The two kernels have the
+    # same operation count and memory traffic and differ only in the shift
+    # amount, so any gap is the shifter's delay alone.
     @kernel
     def literal(A: u32[16], C: u32[16], B: u32[16]):
         for i in range(16):
@@ -962,9 +952,8 @@ def test_literal_shift_is_wiring():
     assert len(_sched(literal).func("literal").regions[0].ops) == len(
         _sched(runtime).func("runtime").regions[0].ops
     )
-    # The device's own clock already tells the two apart, and the premise is
-    # read off the device rather than assumed: a runtime shift costs a barrel
-    # shifter's step and forces cuts a literal one, costing nothing, does not.
+    # The premise, read off the device rather than assumed: a runtime shift
+    # costs a barrel shifter's step and forces cuts a literal one does not.
     assert comb_step_ns("shl") > 0
     assert _latency(literal) < _latency(runtime)
 
@@ -998,11 +987,10 @@ def _mux_fanins(mod):
 
 def test_shared_reduction_reinjects_its_identity():
     # A loop-carried accumulator may share its adder with ordinary ops: the
-    # identity it re-injects on the first iteration rides an ARM of that unit's
+    # identity it re-injects on the first iteration rides an arm of that unit's
     # input mux (`Mux::Phase`), since a time-shared port has no cycle of its own
     # to time a 2:1 mux against. The identity is non-zero, so an arm that never
-    # fires (or fires on the wrong iteration) shows up in the sum rather than
-    # cancelling against a zeroed register.
+    # fires, or fires on the wrong iteration, shows up in the sum.
     @kernel
     def fred(A: f32[64], B: f32[64], out: f32[1]):
         s: f32 = 1.5
@@ -1033,11 +1021,11 @@ def test_shared_reduction_reinjects_its_identity():
 
 def test_shared_mux_delay_accumulates_along_a_chain():
     # A mux's delay does not stop at the unit it feeds: two shared units on one
-    # combinational chain both shift what they drive, so the binder has to
-    # charge the whole cone rather than one fold at a time. Charging one fold at
-    # a time admits plans the period check then REFUSES, which is what this
-    # chain of native adds used to do. What holds at every clock is that greedy
-    # sharing produces a datapath, and the same one trivial binding computes.
+    # combinational chain both shift what they drive, so the binder charges the
+    # whole cone rather than one fold at a time. Charging one fold at a time
+    # admits plans the period check then refuses. What holds at every clock is
+    # that greedy sharing produces a datapath, the same one trivial binding
+    # computes.
     @kernel
     def chain(A: i32[64], B: i32[64]):
         for i in range(0, 64, 4):
@@ -1058,11 +1046,9 @@ def test_shared_mux_delay_accumulates_along_a_chain():
         ref[i], ref[i + 1] = b0 + b1, b0 - b1
         ref[i + 2], ref[i + 3] = a0 + b0, a1 + b1
 
-    # The schedule itself moves with the clock (chaining cuts elsewhere, `z`
-    # lands elsewhere), so the fold COUNT is no invariant; that a plan exists
-    # wherever the datapath itself does is. Stated against the trivial binding
-    # rather than a list of clocks the device happens to hold: sharing must
-    # never be the thing that refuses a clock one unit per operation accepts.
+    # The schedule moves with the clock, so the fold count is no invariant. What
+    # is invariant is that sharing never refuses a clock the trivial binding
+    # (one unit per operation) accepts.
     for freq in (200, 300, 400, 450, 500):
         try:
             _to_rtl(chain, binding="trivial", freq_mhz=freq).mlir
@@ -1079,11 +1065,10 @@ def test_shared_mux_delay_accumulates_along_a_chain():
 @pytest.mark.skipif(not has_exact_scheduler(), reason="build has no OR-Tools")
 def test_planned_allocation_is_never_looser_than_greedy():
     # The exact scheduler decides how many copies of each operator a region
-    # builds and 'planned' builds exactly that. What it starts the search from
-    # is the tightest count its own schedule admits, which is the count the
-    # area-agnostic greedy binder would fold that schedule to, and what it falls
-    # back to when a solve runs out of budget. So the decided allocation can tie
-    # with greedy sharing and never lose to it, whatever the solver got through.
+    # builds and 'planned' builds exactly that. Its search starts from, and falls
+    # back on, the tightest count its own schedule admits, which is what the
+    # area-agnostic greedy binder would fold that schedule to. So the decided
+    # allocation ties with greedy sharing and never loses to it.
     @kernel
     def chain(A: f32[1], B: f32[1], C: f32[1], D: f32[1], o: f32[1]):
         o[0] = A[0] * B[0] * C[0] * D[0]
@@ -1237,10 +1222,9 @@ def test_reassociate_int_reduction_recurrence():
     s.unroll("i", factor=4)
     region = s.export("rtl").schedule().cyclic()[0]
     # The five terms are the four unrolled multiplies plus the accumulator,
-    # folded in LAST, so the carried path is one multiply rather than the four a
-    # chain would leave on it. The recurrence is what bounds the II, so a tree
-    # fits in a span a chain could not: this is measured against the device
-    # rather than pinned, so a faster multiply keeps it honest.
+    # folded in last, so the carried path is one multiply rather than the four a
+    # chain would leave on it. The recurrence bounds the II, so a tree fits in a
+    # span a chain could not. Measured against the device rather than pinned.
     assert region.interval * PERIOD_NS < REG_NS + 4 * comb_step_ns("mul")
 
 
@@ -1275,9 +1259,8 @@ def test_narrow_demanded_bits_widths():
     assert "arith.trunci" not in after
 
 
-# The narrowing is bit-exact, including the wrap the declared type already
-# implied: an i48 accumulator wraps identically whether its adder is 48 or 65
-# bits wide. The inputs are sized so the exact sum overflows i48.
+# The narrowing is bit-exact: an i48 accumulator wraps identically whether its
+# adder is 48 or 65 bits wide. The inputs are sized so the exact sum overflows.
 def test_narrow_demanded_bits_wraps_exactly():
     i48 = APInt(48, signed=True)
 

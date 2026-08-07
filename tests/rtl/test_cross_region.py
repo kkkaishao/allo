@@ -714,12 +714,11 @@ def test_cross_region_enclosing_invariant_cosim():
 
 
 def test_loop_carry_from_a_resident_source():
-    # A recurrence whose NEXT is resident. A literal, a scalar argument, an
-    # upstream region's result reaches back to nothing this loop computes:
-    # the value does not move while the loop runs, so every iteration past the
-    # first reads it off a wire and only iteration 0 takes the init. Each of
-    # the three arrives through a different channel (a constant cell, an input
-    # port, a survivor), which is what makes them one case rather than three.
+    # A recurrence whose next value is resident: a literal, a scalar argument or
+    # an upstream region's result does not move while the loop runs, so every
+    # iteration past the first reads it off a wire and only iteration 0 takes
+    # the init. The three arrive through different channels (a constant cell, an
+    # input port, a survivor).
     A = np.arange(10, 18, dtype=np.int32)
 
     @kernel
@@ -760,11 +759,10 @@ def test_loop_carry_from_a_resident_source():
 
 
 def test_carried_identity_reaches_a_store():
-    # The identity is re-injected at the CONSUMER, since the recurrence
-    # register may sit anywhere in the cycle, and a store is a consumer with
-    # no operator input port to hold one. Reading the carry straight into a
-    # store is therefore the shape that would drop it, writing the previous
-    # iteration's datum on iteration 0 instead of the init.
+    # The identity is re-injected at the consumer, since the recurrence register
+    # may sit anywhere in the cycle, and a store is a consumer with no operator
+    # input port to hold one. Reading the carry straight into a store is the
+    # shape that drops it, writing the previous iteration's datum on iteration 0.
     @kernel
     def delay_line(A: i32[8], B: i32[8]):
         p: i32 = 7
@@ -780,10 +778,10 @@ def test_carried_identity_reaches_a_store():
 
 def test_chained_carry_reads_one_identity_per_iteration():
     # `p2 = p1; p1 = A[i]` shifts one carry into the next, so p2 reaches back
-    # TWO iterations and its first two read the inits DOWN that chain, one
-    # each, not the outermost one twice. Equal inits hide the difference, so
-    # each stage here starts from its own value, and a third stage locks that
-    # it is the chain being walked rather than a special case of two.
+    # two iterations and its first two read the inits down that chain, one each,
+    # not the outermost one twice. Equal inits hide the difference, so each stage
+    # starts from its own value; a third stage locks that the chain is walked
+    # rather than two being a special case.
     A = np.arange(10, 18, dtype=np.int32)
 
     @kernel
@@ -814,8 +812,8 @@ def test_chained_carry_reads_one_identity_per_iteration():
     _to_rtl(shift3).cosim(A, B)
     assert np.array_equal(B, np.concatenate(([3, 2, 1], A[:-3])))
 
-    # The idiom that makes the distinction matter: Fibonacci seeds its two
-    # carries differently, so reading one identity twice would emit 0, 0, ...
+    # Fibonacci seeds its two carries differently, so reading one identity twice
+    # emits 0, 0, ...
     @kernel
     def fib(B: i32[10]):
         a: i32 = 0
@@ -1212,11 +1210,10 @@ def test_call_scalar_result_consumed_in_its_own_region():
 
 
 def test_call_result_yielded_beside_another_value():
-    # A survivor is keyed by the REGION result it is yielded as, which is the
-    # call's own result index only when the call is the whole of what its
-    # region yields. Here the region also yields the literal the loop scales
-    # by, so the call's one result is region result 1: reading it by the call's
-    # index would leave that slot empty and put the child's port in slot 0.
+    # A survivor is keyed by the region result it is yielded as, which matches
+    # the call's own result index only when the call is all its region yields.
+    # Here the region also yields the literal the loop scales by, so the call's
+    # one result is region result 1.
     @kernel
     def summed(A: i32[16]) -> i32:
         s: i32 = 0

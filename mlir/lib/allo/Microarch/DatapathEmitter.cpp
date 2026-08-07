@@ -166,10 +166,10 @@ Value DatapathEmitter::resolveSource(const uarch::Source &s) {
     // region is emitting: the select rides that region's issue pulse.
     StallShell sh = shellFor(mx.region);
     // A recurrence operand's iteration windows, delayed to their op's stage and
-    // built once per (op, iteration). The At arms of one recurrence and the
-    // From arm complementing them partition that op's pulse by construction,
-    // and the two windows are cached apart since one op may carry recurrences
-    // of different distances, whose `iter` numbers then mean different things.
+    // built once per (op, iteration). The At arms and the From arm that
+    // complements them partition that op's pulse by construction. The two kinds
+    // are cached apart because one op may carry recurrences of different
+    // distances, whose `iter` numbers then mean different things.
     DenseMap<std::pair<Operation *, unsigned>, Value> atOf, fromOf;
     SmallVector<Value> values, selects;
     for (auto [k, src] : llvm::enumerate(mx.sources)) {
@@ -217,8 +217,6 @@ Value DatapathEmitter::resolveSource(const uarch::Source &s) {
   llvm_unreachable("unhandled Source::Kind");
 }
 
-// `lb + n*step` at the counter's width, the value its n-th iteration holds.
-// Null for n == 0, which is `lb` itself and needs no arithmetic.
 Value DatapathEmitter::ivAt(const uarch::RegionBlock &rb, unsigned n,
                             Value lb) {
   if (!n)
@@ -234,9 +232,8 @@ Value DatapathEmitter::ivAt(const uarch::RegionBlock &rb, unsigned n,
   return c.R(comb::AddOp::create(c.b, c.loc, lb, nStep, false));
 }
 
-// The counter and its lower bound, both at the RAW counter register's width so
-// the whole test is at the one its terminator compares at; a bound from
-// elsewhere resizes into it.
+// Both at the raw counter register's width, the width its terminator compares
+// at, so a bound from elsewhere resizes into it.
 std::pair<Value, Value>
 DatapathEmitter::counterAndLb(const uarch::RegionBlock &rb) {
   Value iv = controlOf.lookup(rb.id).counter;
@@ -251,10 +248,9 @@ Value DatapathEmitter::firstIterations(const uarch::RegionBlock &rb,
   auto [iv, lb] = counterAndLb(rb);
   if (dist <= 1)
     return c.icmpEqV(iv, lb);
-  // iv < lb + dist*step  ==  !(iv >= lb + dist*step). Signed, as
+  // iv < lb + dist*step == !(iv >= lb + dist*step). Signed, as
   // `Terminator::isLast` compares the same counter against the same kind of
-  // bound; an unsigned predicate would order a negative `lb` the wrong way
-  // round.
+  // bound; an unsigned predicate would order a negative `lb` wrongly.
   return c.notBit(c.icmpSgeV(iv, ivAt(rb, dist, lb)));
 }
 
@@ -499,7 +495,7 @@ void DatapathEmitter::createInternalMemories() {
     // Stores that provably never issue together share a write port. A skewed
     // array presents no single addressable port, and a dynamically banked store
     // drives every bank behind a demux, so neither has a port to be coloured
-    // onto. The device's `max_writes` is the ceiling: past it the RAM inference
+    // onto. `Datapath::maxWritePorts` is the ceiling: past it the RAM inference
     // fails outright, so a further colour would buy nothing and still cost its
     // address and data muxes.
     std::optional<SmallVector<unsigned>> ports;
@@ -753,7 +749,7 @@ void DatapathEmitter::emitUnits(const uarch::RegionBlock &rb, UnitMode mode) {
       // Re-inject a recurrence input's identities, one per iteration `iv`
       // spends below the recurrence distance, each gated by the issue pulse
       // delayed to this op's stage. Innermost first, so a later iteration's mux
-      // sits nearer the port and the windows need no mutual exclusion. A SHARED
+      // sits nearer the port and the windows need no mutual exclusion. A shared
       // port carries none: its identities are arms of the input mux above.
       if (mode == UnitMode::Leaf)
         for (auto [n, init] : llvm::enumerate(u.inputInits[k])) {
@@ -1597,11 +1593,10 @@ void DatapathEmitter::emitCalls(const uarch::RegionBlock &rb, Value issue,
                                  childInstanceName(cu.callee, cu.id), ins);
 
     // Scalar results: the child holds each result on its output port from
-    // `done` onward, so that port IS the survivor a sibling reads, with no
-    // separate capture (which is why `captureResults` skips a Call result).
-    // A survivor is keyed by the REGION result it is yielded as, though, and
-    // that is the call's own index only where the call is the whole of what
-    // the region yields.
+    // `done` onward, so that port is the survivor a sibling reads, with no
+    // separate capture (`captureResults` skips a Call result). A survivor is
+    // keyed by the region result it is yielded as, which is the call's own
+    // index only where the call is the whole of what the region yields.
     for (auto [r, port] : llvm::enumerate(cu.resultPorts)) {
       callResultVal[accKey(cu.id, r)] = outs[port];
       for (auto [k, res] : llvm::enumerate(dp.regions[cu.region].results))

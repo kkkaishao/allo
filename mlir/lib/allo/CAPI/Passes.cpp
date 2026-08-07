@@ -89,9 +89,9 @@ MlirLogicalResult alloRunSDCSchedulingPipeline(
         << "'; expected \"heuristic\", \"exact\" or \"exact-chaining\"";
     return mlirLogicalResultFailure();
   }
-  // The target clock period, the exact-solve budget and its worker count: the
-  // option, else the default. All are resolved once here, so no second copy
-  // exists downstream. A seed of zero IS the default, so it passes through.
+  // The target clock period, the exact-solve budget and its worker count take
+  // the option, else the default, resolved once here so no second copy exists
+  // downstream. A seed of zero is itself the default and passes through.
   float cycleTimeNs = cycleTime > 0.0f ? cycleTime : 5.0f;
   allo::SchedulerOptions opts{
       *kind, budget > 0.0 ? budget : allo::kDefaultSolveBudget, allocate,

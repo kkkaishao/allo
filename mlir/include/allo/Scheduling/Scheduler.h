@@ -247,15 +247,12 @@ LogicalResult computeChainBreaks(
     circt::scheduling::ChainingProblem &prob, float cycleTime, float regFloor,
     SmallVectorImpl<circt::scheduling::Problem::Dependence> &result);
 
-/// `circt::scheduling::computeStartTimesInCycle` with a FLOOR: an operation's
-/// sub-cycle start is at least \p regFloor, where CIRCT's takes zero.
-///
-/// CIRCT models an ideal register, whose result is available at physical time
-/// 0.0 of the cycle it is read in. A real one has a clock-to-out, and the
-/// routing out of it is not free either; on xcu55c a register-to-register path
-/// with no logic at all measured 0.419 ns against a 3.333 ns period. Seeding
-/// with it makes a chain from a REGISTERED node cost `max(floor, that node's
-/// outgoing delay)`, which double-charges neither.
+/// `circt::scheduling::computeStartTimesInCycle` with a floor: an operation's
+/// sub-cycle start is at least \p regFloor, where CIRCT's takes zero. CIRCT
+/// models an ideal register whose result is available at time 0.0 of the cycle
+/// it is read in; a real one costs clock-to-out plus routing (0.419 ns on
+/// xcu55c, against a 3.333 ns period). A chain from a registered node then
+/// costs `max(regFloor, that node's outgoing delay)`.
 LogicalResult computeStartTimesInCycle(circt::scheduling::ChainingProblem &prob,
                                        float regFloor);
 
@@ -421,6 +418,10 @@ inline bool usesExactScheduler(SchedulerKind kind) {
   return kind != SchedulerKind::Heuristic;
 }
 
+/// Defaults for one solve. The budget is in OR-Tools deterministic time units
+/// (roughly a core-second) and is charged per solve, so a cyclic search spends
+/// it again at every initiation interval it probes. One worker and a fixed seed
+/// make two identical compiles emit identical RTL.
 inline constexpr double kDefaultSolveBudget = 30.0;
 inline constexpr int kDefaultSolveWorkers = 1;
 inline constexpr int kDefaultSolveSeed = 0;
@@ -437,10 +438,9 @@ struct SchedulerOptions {
   bool allocate = false;
   int workers = kDefaultSolveWorkers;
   int seed = kDefaultSolveSeed;
-  /// The fabric's register-to-register floor (ns): the EARLIEST sub-cycle time
-  /// any operation may start at, since nothing begins before its inputs leave a
-  /// register. Every combinational row is measured including it and carries its
-  /// delay less it, so a cycle pays it once however many operators chain.
+  /// The fabric's register-to-register floor (ns): the earliest sub-cycle time
+  /// any operation may start at. Combinational rows carry their measured delay
+  /// less the floor, so a cycle pays it once however many operators chain.
   float regFloor = 0.0f;
 };
 

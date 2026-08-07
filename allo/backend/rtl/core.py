@@ -39,10 +39,8 @@ R = TypeVar("R")
 # a partitioned array. Addresses stay in element space until the emitter.
 _NORMALIZE_PIPELINE = "builtin.module(dcp-resolve-banking)"
 
-# The one option the handle derives rather than takes: it is the scheduler's
-# view of `freq_mhz`, which the emitter and the cosim clock read too. The other
-# derived one, whether to decide an allocation, follows `binding` and is not an
-# option at all (see `schedule`).
+# The one option the handle derives rather than takes: the scheduler's view of
+# `freq_mhz`, which the emitter and the cosim clock read too.
 _DERIVED_OPTIONS = {"cycle_ns"}
 
 
@@ -62,8 +60,8 @@ class RTL(Backend[P, R]):
         """Build an RTL handle for one hardware configuration.
 
         These four fix the target and how hardware is built for it. The
-        compiler's own knobs are not arguments here: turn them on the handle
-        with :meth:`set_scheduler_opt`, which names them after the fields of
+        compiler's own knobs are set on the handle with
+        :meth:`set_scheduler_opt`, by the field names of
         :class:`SchedulerOptions` and :class:`PrepassOptions`.
 
         Args:
@@ -108,11 +106,10 @@ class RTL(Backend[P, R]):
     # -- scheduling -------------------------------------------------------
 
     def set_scheduler_opt(self, **opts: Any) -> RTL:
-        """Turn one or more of the compiler's knobs and return the handle, so the
-        call chains onto ``export``. The names are the fields of
-        :class:`SchedulerOptions`, which ``report.compiler.options`` publishes
-        back, and of :class:`PrepassOptions`, which shapes the IR the scheduler
-        is handed; each documents what its fields do.
+        """Turn one or more of the compiler's knobs and return the handle, so
+        calls chain. The names are the fields of :class:`SchedulerOptions`,
+        which ``report.compiler.options`` publishes back, and of
+        :class:`PrepassOptions`, which shapes the IR the scheduler is handed.
 
         ``cycle_ns`` is not among them: it follows ``freq_mhz``, and setting it
         here would leave the schedule describing a different design than the one

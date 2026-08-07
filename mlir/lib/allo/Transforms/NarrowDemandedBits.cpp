@@ -22,17 +22,17 @@ using namespace mlir::allo;
 namespace {
 
 // The two's-complement ring operators, whose low `w` result bits are a function
-// of the low `w` bits of the operands alone. That is what makes sinking a
-// truncation through them exact; division, remainder, right shift and compare
-// all read the high bits, so the demand stops at those.
+// of the low `w` bits of the operands alone, which is what makes sinking a
+// truncation through them exact. Division, remainder, right shift and compare
+// read the high bits, so the demand stops at those.
 bool isRingOp(Operation *op) {
   return isa<arith::AddIOp, arith::SubIOp, arith::MulIOp>(op);
 }
 
 // trunc_w(a `op` b) -> trunc_w(a) `op` trunc_w(b), moving the truncation toward
 // the leaves so the operator is built at the width its consumer reads. The
-// truncations it leaves behind meet the extends bit growth introduced and fold,
-// which exposes the next operator up to the same rewrite.
+// truncations left behind meet the extends bit growth introduced and fold,
+// exposing the next operator up to the same rewrite.
 struct SinkTruncThroughRingOp : OpRewritePattern<arith::TruncIOp> {
   using OpRewritePattern::OpRewritePattern;
 
@@ -40,7 +40,7 @@ struct SinkTruncThroughRingOp : OpRewritePattern<arith::TruncIOp> {
                                 PatternRewriter &rewriter) const override {
     Operation *op = trunc.getIn().getDefiningOp();
     // Without a single use the wide result stays live, so the wide operator
-    // would survive and this would only add truncations.
+    // survives and this only adds truncations.
     if (!op || !isRingOp(op) || !op->hasOneUse())
       return failure();
 
@@ -58,9 +58,8 @@ struct SinkTruncThroughRingOp : OpRewritePattern<arith::TruncIOp> {
 
 // `x & y` -> `x` when every bit `y` would clear is already zero in `x`: a mask
 // over a field the value cannot hold. Writing a bit field splices with such a
-// mask on every field after the first, and the splices CHAIN, so each mask this
-// removes takes a whole AND off the critical path -- for hardware that was
-// never there, the emitted concatenation carrying no mask at all.
+// mask on every field after the first, and the splices chain, so each mask
+// removed takes a whole AND off the critical path.
 struct DropRedundantMask : OpRewritePattern<arith::AndIOp> {
   using OpRewritePattern::OpRewritePattern;
 

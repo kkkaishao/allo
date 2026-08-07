@@ -24,10 +24,10 @@ struct Resolved {
   unsigned depth; // pipeline-register depth for this edge
   unsigned ready = 0; // cycle `base` lands at within its iteration
   bool ok = false;    // false => producer outside this region / not modelled
-  // The reduction identities iff this edge reads a loop-carried iter_arg (a
-  // recurrence input), one per iteration: `inits[n]` must be re-injected at
-  // iteration n, and `base` only carries the edge from `inits.size()` on, that
-  // size being the recurrence distance. Empty for every other edge.
+  // Reduction identities of the loop-carried iter_arg this edge reads, one per
+  // iteration: `inits[n]` is re-injected at iteration n, and `base` carries the
+  // edge from `inits.size()` on, that size being the recurrence distance. Empty
+  // for every other edge.
   llvm::SmallVector<Source, 1> inits = {};
 };
 
@@ -221,11 +221,11 @@ struct DatapathBuilder {
   /// Record a resolved edge into \p slot: a depth-0 edge ties directly, a
   /// deeper one is deferred (its register chain is built in insertRegisters).
   void recordEdge(const Resolved &r, Source &slot, unsigned regionIdx);
-  /// `recordEdge` for a slot that is a bare Source, with no input port beside
-  /// it to hold a recurrence identity (`FuncUnit::inputInits`): an address, a
+  /// `recordEdge` for a slot that is a bare Source with no input port beside it
+  /// to hold a recurrence identity (`FuncUnit::inputInits`): an address, a
   /// store datum, a stream token. A recurrence edge on \p operand of \p
-  /// consumer is muxed against its identity, phased on that op's own issue
-  /// cycle; every other edge is recorded unchanged.
+  /// consumer is muxed against its identities, phased on that op's issue cycle;
+  /// every other edge is recorded unchanged.
   void recordCarriedEdge(const Resolved &r, Value operand, Operation *consumer,
                          Source &slot, unsigned regionIdx);
   /// Resolve every unit input (single, or shared-then-muxed).

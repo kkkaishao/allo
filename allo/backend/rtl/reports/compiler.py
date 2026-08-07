@@ -1,7 +1,7 @@
 # Copyright Allo authors. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""The compiler's account of ITSELF."""
+"""The compiler's account of itself."""
 
 from __future__ import annotations
 
@@ -27,7 +27,7 @@ class SolveReport:
     limited_ops: int  # of those, holding at least one limited unit
     ms: float  # wall time of the solve
     #: the interval this solve searched to, and so the depth of the search that
-    #: `ms` measures; `None` for an acyclic span. The interval the region RUNS
+    #: `ms` measures; `None` for an acyclic span. The interval the region runs
     #: at is `RegionSchedule.interval`, which the two need not agree on.
     interval: int | None = None
 
@@ -48,8 +48,7 @@ class SolveReport:
 class CompilerReport:
     """Everything about the compile that is not about the hardware."""
 
-    #: the scheduler's knobs, as the solve ran under them. The same object the
-    #: caller turned, not a copy of it.
+    #: the scheduler's knobs, as the solve ran under them.
     options: SchedulerOptions | None = None
     #: per-region solve cost, in solve order (see :class:`SolveReport`).
     solves: list[SolveReport] = field(default_factory=list)

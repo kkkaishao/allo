@@ -38,7 +38,7 @@ struct TrivialBinding : BindingPolicy {
 
 /// Greedy within-region sharing: fold same-operator-type units whose MRT
 /// reservations are disjoint onto one unit, while the multiplexers so far grown
-/// still fit the clock along the WHOLE combinational chain each of them
+/// still fit the clock along the whole combinational chain each of them
 /// lengthens, not just at the unit they sit on. Area-agnostic: it shares every
 /// compatible op whose timing allows.
 struct GreedyShareBinding : BindingPolicy {

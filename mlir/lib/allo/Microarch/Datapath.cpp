@@ -287,33 +287,27 @@ unsigned muxLevels(unsigned sources) {
 }
 
 double muxLevelDelay(const OperatorLibrary &lib) {
-  // At ONE bit: every bit of an OR level settles in parallel, so the tree's
-  // WIDTH buys mux LUTs (`set_mux_uses`) rather than levels.
-  //
-  // The FULL row delay and not the marginal one, which is a measurement and not
-  // a derivation: a level of a wide one-hot select pays routing comparable to a
-  // whole register-to-register hop, not the LUT hop a narrow cone pays. On
-  // u55c a 3-level 32-bit select measured 1.99 ns, against 1.45 ns for three
-  // full rows and 0.21 ns for three marginal ones.
-  //
-  // Even so this UNDER-predicts a wide select by about 1.4x, because the delay
-  // of a mux level grows with the data width and `muxLevels` does not see it
-  // (1-bit 8:1 measured 0.65 ns against 32-bit 8:1's 1.99 ns).
+  // Priced at one bit, since every bit of an OR level settles in parallel, so
+  // width buys mux LUTs (`set_mux_uses`) rather than levels. The full row delay
+  // and not the marginal one: a level of a wide one-hot select pays routing
+  // comparable to a whole register-to-register hop, not the LUT hop a narrow
+  // cone pays. This still under-predicts a wide select by about 1.4x, since a
+  // mux level's delay grows with the data width and `muxLevels` does not see
+  // that.
   return lib.combDelay(OpKind::Or, 1);
 }
 
 /// The delay `u`'s inputs must settle within, read from the same library row
 /// the scheduler priced it against.
 static double unitInDelay(const FuncUnit &u, const OperatorLibrary &lib) {
-  // The one exception the row itself does not carry, and the scheduler took it
+  // The one exception the library row does not carry, which the scheduler takes
   // too (`lookup`): a shift by a literal renames bits and costs nothing.
   if (isBitRename(u.repOp()))
     return 0.0;
-  // The MARGINAL delay, because `z` is what this is subtracted from and `z`
-  // already carries the register floor: the solve seeds every start-in-cycle at
-  // it (`computeStartTimesInCycle`). Charging the full row here would spend the
-  // floor twice and report a unit as over-period by up to one floor while the
-  // schedule it came from was feasible.
+  // The marginal delay: this is subtracted from `z`, which already carries the
+  // register floor the solve seeds every start-in-cycle at
+  // (`computeStartTimesInCycle`). Charging the full row would spend that floor
+  // twice and report a feasible schedule's unit as over-period.
   if (u.identity.comb)
     return lib.combMarginalDelay(*u.identity.comb, combParamWidth(u.repOp()));
   auto opr = SymbolTable::lookupNearestSymbolFrom<dcp::DCPathOperatorOp>(

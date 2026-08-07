@@ -29,22 +29,19 @@ namespace {
 //
 // `allo.bit.get_slice` / `set_slice` name a field of an integer, which no phase
 // below this one models: the operator library prices arith and math, and the
-// datapath realizes what that library covers. Expanding here, BEFORE the
-// schedule is cut, is what lets the chaining solve see the field access at its
-// real combinational depth; expanding at reify would grow a cone the cut never
-// saw.
+// datapath realizes what that library covers. Expanding before the schedule is
+// cut lets the chaining solve see the field access at its real combinational
+// depth.
 //
-// The field WIDTH is the result type's (a get) or the value operand's (a set),
-// so `hi` says nothing the width does not and is left to die. The OFFSET may be
-// dynamic, which is why this shifts rather than selects: `comb.extract` takes
-// its low bit as an ATTRIBUTE and cannot name a runtime one. A constant offset
-// still arrives there, since a shift by a literal folds back into the extract /
-// concat the field access really is.
+// The field width is the result type's (a get) or the value operand's (a set),
+// so `hi` is not read. The offset may be dynamic, so this shifts rather than
+// selects: `comb.extract` takes its low bit as an attribute and cannot name a
+// runtime one. A shift by a literal folds back into the extract or concat the
+// field access really is.
 //===----------------------------------------------------------------------===//
 
-/// The offset when it is a literal. Worth asking because it makes every shift
-/// and mask below constant, which is the difference between a field access that
-/// costs the schedule a barrel shifter and one that costs it wiring.
+/// The offset when it is a literal, which makes every shift and mask below
+/// constant: wiring rather than a barrel shifter.
 std::optional<uint64_t> constantOffset(Value lo) {
   APInt cst;
   return matchPattern(lo, m_ConstantInt(&cst))
@@ -140,9 +137,7 @@ struct LowerBitSetSlice : OpRewritePattern<BitSetSliceOp> {
 // a mask.
 //===----------------------------------------------------------------------===//
 
-/// The base-2 log of \p divisor when it is a constant power of two. Only then
-/// is every shift below by a literal, which is wiring rather than a barrel
-/// shifter.
+/// The base-2 log of \p divisor when it is a constant power of two.
 static std::optional<unsigned> powerOfTwoDivisor(Value divisor) {
   APInt cst;
   if (!matchPattern(divisor, m_ConstantInt(&cst)) || !cst.isPowerOf2())
@@ -150,9 +145,8 @@ static std::optional<unsigned> powerOfTwoDivisor(Value divisor) {
   return cst.logBase2();
 }
 
-/// `x sdiv 2^k`, which is NOT `x >> k`: the shift floors and the division
-/// truncates toward zero, so a negative numerator is nudged by `2^k - 1` first.
-/// A compare, a select and an add, none of which is a divider.
+/// `x sdiv 2^k`, which is not `x >> k`: the shift floors while the division
+/// truncates toward zero, so a negative numerator is biased by `2^k - 1` first.
 static Value signedQuotient(PatternRewriter &rewriter, Location loc, Value x,
                             unsigned k) {
   Type ty = x.getType();
@@ -222,7 +216,7 @@ struct ReduceRemSI : OpRewritePattern<arith::RemSIOp> {
     Location loc = op.getLoc();
     Value x = op.getLhs();
     // The remainder takes the dividend's sign, which `x - (q << k)` already
-    // does, so the quotient above is the only thing that needs care.
+    // gives once the quotient truncates toward zero.
     Value q = signedQuotient(rewriter, loc, x, *k);
     Value amount = arith::ConstantOp::create(
         rewriter, loc, rewriter.getIntegerAttr(op.getType(), *k));
@@ -268,8 +262,8 @@ struct LegalizeArithPass
                                  arith::MinimumFOp, arith::MaxNumFOp,
                                  arith::MinNumFOp>(keepIfRealizable);
     // A power-of-two divisor makes the op a shift, so it does not survive
-    // either. Every other divisor stays: the device has a core for it, or it
-    // is priced as the divider it really is.
+    // either. Every other divisor stays and is bound to a device core or
+    // priced as a divider.
     target.addDynamicallyLegalOp<arith::DivSIOp, arith::DivUIOp, arith::RemSIOp,
                                  arith::RemUIOp>([](Operation *op) {
       return !powerOfTwoDivisor(op->getOperand(1)).has_value();

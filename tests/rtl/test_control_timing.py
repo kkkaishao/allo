@@ -249,8 +249,8 @@ def test_multi_cycle_write_freezes_under_back_pressure():
 
 
 # The timing/chaining model is clock-frequency sensitive: a combinational
-# int-add chain deeper than one cycle holds splits across more cycles under a
-# tight clock than under a loose one.
+# int-add chain too deep for one cycle splits across more cycles under a tight
+# clock than under a loose one.
 _ADD_CHAIN = 8
 
 
@@ -272,12 +272,11 @@ def test_chaining_inserts_register():
 
     # The premise, stated against the device rather than assumed: this many
     # chained int adds do not fit one default cycle. The register floor is paid
-    # once per CYCLE and each add contributes its own step on top, which is the
-    # sum the chaining solve actually cuts against; a device whose adds got
-    # faster would leave the test passing for the wrong reason.
+    # once per cycle and each add contributes its own step on top, which is the
+    # sum the chaining solve cuts against.
     assert REG_NS + _ADD_CHAIN * comb_step_ns("add") > PERIOD_NS
-    # So the chaining scheduler splits the chain across cycles -- more register
-    # stages than under a huge cycle time, where the whole chain settles in one.
+    # So the chaining scheduler splits the chain across cycles, leaving more
+    # register stages than a huge cycle time, where the whole chain settles in one.
     tight = _sched(chain()).cyclic()[0]
     loose = _sched(chain(), freq_mhz=1.0).cyclic()[0]  # a 1000ns cycle
     assert tight.last_t() > loose.last_t()
@@ -336,9 +335,8 @@ def test_a_sequential_whiles_condition_is_cut_like_any_other_chain():
             i: i32 = 0
             s: i32 = 0
             # The load is what forces the CHECK/RUN controller; the arith behind
-            # it is what has to be cut. Adds and not a multiply, because an
-            # integer multiply binds to a DSP core on this device and a core's
-            # latency is not something the chaining solve can cut.
+            # it is what has to be cut. Adds and not a multiply: an integer
+            # multiply binds to a DSP core, whose latency the solve cannot cut.
             while A[i] + A[i] + A[i] + A[i] + A[i] + A[i] + A[i] + A[i] < 100:
                 s += A[i]
                 i += 1

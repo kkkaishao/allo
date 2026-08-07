@@ -45,6 +45,8 @@ using namespace operations_research::sat;
 
 namespace {
 
+/// Solver configuration for one solve. The time limit is deterministic rather
+/// than wall-clock, so two identical compiles emit identical RTL.
 SatParameters solverParameters(const SchedulerOptions &opts) {
   SatParameters params;
   params.set_num_workers(opts.workers);
@@ -103,9 +105,8 @@ void addSubCycleTimes(CpModelBuilder &model, ProblemT &prob,
                       float regFloor) {
   int64_t period = picos(cycleTime);
   // Nothing in a cycle starts before its operands leave a register, so the
-  // fabric floor is every `z`'s LOWER bound. A chain from a registered producer
-  // then waits `max(floor, that producer's outgoing delay)`, which is what the
-  // `>=` below and this bound together say.
+  // fabric floor is every `z`'s lower bound. A chain from a registered producer
+  // then costs `max(floor, that producer's outgoing delay)`.
   int64_t floor = picos(regFloor);
   DenseMap<Operation *, IntVar> inCycle;
   for (Operation *op : prob.getOperations()) {

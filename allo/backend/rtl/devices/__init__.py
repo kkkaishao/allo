@@ -17,9 +17,8 @@ _DEVICES = {
     d.name: d for module in (alveo, kria, series7, versal) for d in module.DEVICES
 }
 
-#: What ``RTL(device=None)`` resolves to. Always an ALIAS of a real part, never
-#: a device of its own: a compile that names no device still compiles for one
-#: piece of silicon, and which one has to be answerable.
+#: What ``RTL(device=None)`` resolves to. Always an alias of a registered part,
+#: never a device of its own.
 default_device = u55c
 
 
@@ -40,8 +39,7 @@ def names() -> list[str]:
 
 
 def parts() -> dict[str, str]:
-    """Device name -> full vendor part number, for every registered device: the
-    one table through which two backends can target the same silicon."""
+    """Every registered device name mapped to its full vendor part number."""
     return {name: d.part for name, d in _DEVICES.items()}
 
 

@@ -268,10 +268,7 @@ def test_while_flushing_pipeline_cosim():
 @pytest.mark.skipif(not has_exact_scheduler(), reason="build has no OR-Tools")
 def test_while_pipeline_operators_are_allocated():
     # A flushing while is a pipeline like any counted loop, so the exact
-    # scheduler decides how many copies of each operator its body builds. Until
-    # this region populated an allocation, a while body was never CONSIDERED, and
-    # `planned` quietly fell back to one instance per operation inside it, worse
-    # than the same body written as a `for`.
+    # scheduler decides how many copies of each operator its body builds.
     #
     # The two products are independent so that the decision has somewhere to go:
     # a chain would leave every multiply in one congruence class at this II,
@@ -517,8 +514,8 @@ def test_while_ip_condition_cosim():
 
     mod = _to_rtl(fconverge)
     assert mod.schedule().cyclic()[0].conditional
-    # A float compare's predicate rides the extern module name, so it is the
-    # operator's symbol plus the predicate the op carries.
+    # The extern module name carries the compare predicate, so it is the
+    # operator's symbol plus the predicate the op declares.
     fcmp = next(o for o in default_device.operators if o.optype is OperatorType.CMP)
     assert f"hw.module.extern @{fcmp.symbol}_ogt" in mod.mlir
 

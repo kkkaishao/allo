@@ -369,10 +369,10 @@ def test_stream_li_shell():
         rtl.cosim(x, y, stall_prob=gap)
         assert np.array_equal(y, exp), f"gap={gap}: {list(y)} != {list(exp)}"
 
-    # The same shell with a multi-cycle IP datapath (a float multiply into a float add, an
-    # 11-deep pipeline between get and put). The clock-enable stall contract
-    # (`ce`) freezes the IP pipeline in lockstep with the shell's shift chains; a
-    # free-running IP would keep clocking under back-pressure and desync.
+    # The same shell with a multi-cycle IP datapath (a float multiply into a
+    # float add, an 11-deep pipeline between get and put). The `ce` stall
+    # contract freezes the IP pipeline in lockstep with the shell's shift chains;
+    # a free-running IP would keep clocking under back-pressure and desync.
     @kernel
     def fstage(x_in: Stream[f32], y_out: Stream[f32]):
         for i in range(16):
@@ -1043,9 +1043,8 @@ def test_stream_shell_freeze_is_token_exact():
     def fz_put(x_in: Stream[i32], y_out: Stream[i32]):
         for i in range(n, name="i"):
             v: i32 = x_in.get()
-            # `3v` as adds and not a multiply: an integer multiply binds to a
-            # DSP core here, and its latency would move the put off the phase
-            # this case is about.
+            # Adds rather than a multiply: an integer multiply binds to a DSP
+            # core whose latency moves the put off the phase under test.
             y_out.put(v + v + v + 7)
 
     s = fz_put.schedule()

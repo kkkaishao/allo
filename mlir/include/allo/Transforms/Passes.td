@@ -539,10 +539,9 @@ def NarrowDemandedBitsPass
   let description = [{
     Bit-growth typing gives an expression its exact natural width, computed from
     the leaves up, and applies the destination type as a single `arith.trunci`
-    at the end. Every operator in between is therefore built at a width nothing
-    reads: `a: i48 = b * c` over two `i32` values builds a 64-bit multiplier and
-    then discards 16 bits, and `acc: i48 = acc + b * c` puts a 65-bit adder on
-    the accumulator recurrence.
+    at the end. Every operator in between is built at a width nothing reads:
+    `a: i48 = b * c` over two `i32` values builds a 64-bit multiplier and then
+    discards 16 bits.
 
     This pass propagates that truncation back up the expression. For the
     two's-complement ring operators (`addi`, `subi`, `muli`) the low `w` bits of
@@ -554,23 +553,16 @@ def NarrowDemandedBitsPass
     the leaves, where it meets the extends bit growth introduced and folds away,
     which exposes the next operator up to the same rewrite. Division, remainder,
     right shift and comparison read the high bits, so the demand stops at them
-    and their operands keep the natural width.
+    and their operands keep the natural width. A wide operator with more than
+    one use keeps its width, since the wide value stays live.
 
-    The rewrite is bit-exact rather than a relaxation: the truncation it moves
-    is one the program already performed, only later, after paying for bits
-    nothing reads. A wide operator with more than one use keeps its width, since
-    the wide value stays live and narrowing would only add ops.
-
-    The dual argument reads the bits forward instead. `x & K` masks a field, and
-    writing a bit field splices with such a mask on every field after the first;
-    where the bits `K` clears are ones the value provably never sets, the mask
-    computes nothing. A forward walk over the casts, shifts and bitwise
-    operators proves which bits a value can hold (`llvm::KnownBits` carries the
-    algebra), and each mask so removed takes a whole AND off a chain the splices
-    build -- off hardware that was never there, the emitted concatenation
-    carrying no mask at all. A mask over bits the value CAN set, one overwriting
-    a field that already holds data or one over a signed shift's replicated sign,
-    is load-bearing and stays.
+    The pass also reads the bits forward. `x & K` is dropped when every bit `K`
+    clears is one the value provably never sets, which a forward walk over the
+    casts, shifts and bitwise operators establishes (`llvm::KnownBits` carries
+    the algebra). Writing a bit field splices with such a mask on every field
+    after the first. A mask over bits the value can set, one overwriting a field
+    that already holds data or one over a signed shift's replicated sign, is
+    load-bearing and stays.
   }];
   let dependentDialects = ["mlir::arith::ArithDialect"];
 }

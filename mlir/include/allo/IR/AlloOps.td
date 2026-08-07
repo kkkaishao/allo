@@ -538,12 +538,8 @@ def DCPathCombOp : DCPath_Op<"dcp.comb",
     `#allo.res_use` per term, and what a resource costs is the sum of the terms
     naming it.
 
-    `delay` is a function of that SAME parameter, not a scalar, because a
-    combinational delay tracks width as surely as an area does: a 32-bit
-    divider was measured at 23.7 ns against a 8-bit one's 4.3, and a single
-    number for the kind either forbids the narrow one or lies about the wide
-    one. It is a `#allo.cost` so that the delay and the area of one row are
-    written in one language.
+    `delay` is a `#allo.cost` over that same parameter rather than a scalar,
+    since a combinational delay tracks operand width the way an area does.
   }];
   let arguments = (ins OpKindAttr:$kind, CostAttr:$delay, OptionalAttr<ArrayAttr>:$uses);
   let assemblyFormat = "$kind `delay` `=` $delay (`uses` $uses^)? attr-dict";
@@ -679,9 +675,9 @@ def DCPathDeviceOp : DCPath_Op<"dcp.device",
     symbol table. What lives here is the vocabulary only the device's own
     declarations use.
 
-    `reg_delay` is the fabric's register-to-register FLOOR: what a path costs
-    with no operator in it at all, a source flip-flop's clock-to-out plus the
-    routing every path pays.
+    `reg_delay` is the fabric's register-to-register floor: what a path with no
+    operator in it costs, a source flip-flop's clock-to-out plus the routing
+    every path pays.
   }];
   let arguments = (ins SymbolNameAttr:$sym_name,
                        DefaultValuedAttr<F32Attr, "0.0">:$reg_delay);

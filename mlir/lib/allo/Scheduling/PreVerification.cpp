@@ -31,11 +31,9 @@ using namespace mlir::allo::logging;
 
 // An op the reifier turns into a `dcp.compute`: a single-result non-constant op
 // with no region that `convertOp` (PostConversion.cpp) does not carry on a path
-// of its own. Stated as what it EXCLUDES rather than as a dialect allow-list,
-// because the reifier's own split is: anything left over with one result and a
-// start time IS a compute, and it asserts when nothing realizes one. Everything
-// this admits is therefore refused here, on the offending line, rather than
-// there.
+// of its own. An exclusion list rather than a dialect allow-list, matching the
+// reifier's own split, so an op it cannot realize is refused here on the
+// offending line instead of asserting there.
 static bool isComputeOp(Operation *op) {
   return op->getNumResults() == 1 && op->getNumRegions() == 0 &&
          !op->hasTrait<OpTrait::ConstantLike>() &&
@@ -44,10 +42,10 @@ static bool isComputeOp(Operation *op) {
               memref::GetGlobalOp, func::CallOp>(op);
 }
 
-// Whether the operator library can even be ASKED about \p op: it prices integer
-// and float arithmetic, and an affine address expression. Anything else is a
-// backend gap rather than a device one, since no `@ip` row would make the
-// datapath model it.
+// Whether the operator library can be asked about \p op: it prices integer and
+// float arithmetic and affine address expressions. Anything else is a backend
+// gap rather than a device one, since no `@ip` row would make the datapath
+// model it.
 static bool isPricedOp(Operation *op) {
   return isa<arith::ArithDialect, math::MathDialect>(op->getDialect()) ||
          isa<affine::AffineApplyOp>(op);

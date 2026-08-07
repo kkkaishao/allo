@@ -70,10 +70,9 @@ static Block *regionBody(Operation *regionOp) {
 // Trace a pipeline iter-arg (0-based) back to the value assigned to it each
 // iteration, appending to \p chain each iter-arg the walk shifts through,
 // itself first. The walk stops at the first value that is not such a shift,
-// which is where the recurrence reads its datum from and which the caller
-// resolves like any other; `chain.size()` is then the recurrence distance the
-// scheduler solved against. A null return means the shifts CYCLE, so there is
-// no such datum.
+// which is where the recurrence reads its datum from; `chain.size()` is then
+// the recurrence distance the scheduler solved against. Returns null when the
+// shifts form a cycle, so there is no such datum.
 static Value traceIterArgSource(dcp::DCPathPipelineOp pipe, unsigned iterArg,
                                 SmallVectorImpl<unsigned> &chain) {
   Block &body = pipe.getBody().front();
@@ -887,7 +886,7 @@ Resolved DatapathBuilder::resolveOperand(Value v, Operation *consumer,
   };
 
   // The one operand that does not read `v` at all: an unlatched iter_arg of the
-  // consumer's OWN region is the loop RECURRENCE, so the edge runs back to
+  // consumer's own region is the loop recurrence, so the edge runs back to
   // whatever the loop assigns it, `distance` iterations away.
   if (auto barg = dyn_cast<BlockArgument>(v))
     if (auto pipe =
@@ -901,18 +900,17 @@ Resolved DatapathBuilder::resolveOperand(Value v, Operation *consumer,
       Source base = next ? resolveValue(next) : Source{};
       Operation *def = next ? next.getDefiningOp() : nullptr;
       Resolved r;
-      // A RESIDENT next never moves while this loop runs, so past the first
-      // `distance` iterations the recurrence reads it unchanged, off a wire:
-      // `prev = c` holds `c` from iteration `distance` on. Anything else has to
-      // be produced HERE, by an op this region schedules, since only then is
-      // there an iteration of it to reach back to.
+      // A held `next` never moves while this loop runs, so from iteration
+      // `distance` on the recurrence reads it unchanged, off a wire. Anything
+      // else must be produced by an op this region schedules, since only then
+      // is there an iteration of it to reach back to.
       if (isHeld(base))
         r = {base, Value(), 0, 0, true};
       else if (base && def && def->getParentOp() == regionOp)
         r = edge(base, next, readyCycleOf(def), distance);
       else {
-        // The sweep in `validateDatapath` would anchor on the consumer, which
-        // is not where the fault is: the carried assignment is.
+        // Anchored on the loop, where the faulty carried assignment is, rather
+        // than on the consumer `validateDatapath` would anchor on.
         unsupported(Stage::Emit, Code::CrossRegionHandOff, pipe)
             << "Value " << iterArg
             << " carried by this loop is assigned from a value the loop's own "
@@ -921,10 +919,10 @@ Resolved DatapathBuilder::resolveOperand(Value v, Operation *consumer,
         dp.infeasible = true;
         return {};
       }
-      // The emitter re-injects the identities on THIS consumer input, since the
+      // The emitter re-injects the identities on this consumer input, since the
       // recurrence register may sit elsewhere in the cycle. One per iteration
       // below `distance`: a chained carry shifts one iter_arg into the next, so
-      // iteration n reads the init of the stage n steps DOWN the chain, which
+      // iteration n reads the init of the stage n steps down the chain, which
       // is what `chain` enumerates.
       for (unsigned stage : chain)
         r.inits.push_back(resolveValue(pipe.getInits()[stage]));
@@ -944,8 +942,6 @@ Resolved DatapathBuilder::resolveOperand(Value v, Operation *consumer,
   Source base = resolveValue(v);
   if (!base)
     return {};
-  // A held source is already valid when the consumer issues, so it ties
-  // straight in and needs no register.
   if (isHeld(base))
     return {base, Value(), 0, 0, true};
   // The counter presents its index at cycle 0 of ITS region, so a consumer
@@ -1071,10 +1067,10 @@ void DatapathBuilder::recordCarriedEdge(const Resolved &r, Value operand,
     recordEdge(r, slot, regionIdx);
     return;
   }
-  // Arms of one issue pulse, split by iteration: the recurrence reads identity
-  // n at iteration n and the edge itself from `inits.size()` on, which is the
-  // same shape a SHARED unit port carries. Every arm is sized before any is
-  // filled, since `recordEdge` takes a pointer into `sources`.
+  // Arms of one issue pulse, split by iteration: identity n at iteration n and
+  // the edge itself from `inits.size()` on, the same shape a shared unit port
+  // carries. Every arm is sized before any is filled, since `recordEdge` takes
+  // a pointer into `sources`.
   unsigned arms = r.inits.size() + 1;
   muxBuilds.push_back({&slot,
                        regionIdx,
@@ -1107,10 +1103,10 @@ void DatapathBuilder::resolveUnitInputs() {
       continue;
     }
     // Shared unit: resolve every bound op's port k independently (each may need
-    // its own register depth), then a mux picks per op's issue cycle. Resolved
-    // up front because a recurrence operand takes an arm per identity, and
-    // `recordEdge` takes a pointer into `sources`, so the list must be sized
-    // before any edge lands in it.
+    // its own register depth), then a mux picks per op's issue cycle. All
+    // resolved up front because a recurrence operand takes an arm per identity
+    // and `recordEdge` takes a pointer into `sources`, so the list must be
+    // sized before any edge lands in it.
     for (unsigned k = 0; k < nPorts; ++k) {
       SmallVector<Resolved, 2> edges;
       unsigned arms = 0;

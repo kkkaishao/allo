@@ -851,7 +851,7 @@ def test_assume_hints():
         return h
 
     # Without the hint the aliasing histogram update keeps a conservative
-    # loop-carried edge;
+    # loop-carried edge; asserting no inter-iteration dependence prunes it.
     assert _sched(hist(True)).cyclic()[0].interval == 1
     assert _sched(hist(False)).cyclic()[0].interval > 1
 
@@ -1258,8 +1258,8 @@ def test_loop_over_calls_without_an_index_operand():
 
     rtl = _to_rtl(rp_top)
     assert Dcp(rtl).func(rtl.top).callees()  # the leaf CallUnit path, as above
-    # The CALLEE's instances, not every instance: an operator core in the
-    # child is one too, and how many of those there are is not the subject.
+    # Count the callee's instances, not every instance: an operator core in the
+    # child is one too.
     callee = re.findall(r'hw\.instance "[^"]*" @(\w*rp_step)\b', rtl.mlir)
     assert len(callee) == 1, "one instance re-fired, not five"
 

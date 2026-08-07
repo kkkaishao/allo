@@ -186,8 +186,8 @@ class ScheduleResult:
     funcs: list[FuncSchedule] = field(default_factory=list)
     #: directives the scheduler could not apply, in the order it met them.
     unhonored_directives: list[UnhonoredDirective] = field(default_factory=list)
-    #: the compiler's account of itself: what it was asked for and what the ask
-    #: cost it. Not a property of the design (see :class:`CompilerReport`).
+    #: the compiler's account of itself: what it was asked for and what that
+    #: cost. Not a property of the design (see :class:`CompilerReport`).
     compiler: CompilerReport = field(default_factory=CompilerReport)
 
     @classmethod
@@ -196,7 +196,7 @@ class ScheduleResult:
     ) -> ScheduleResult:
         """Parse the JSON schedule result the scheduler returns, either as the
         raw string or as an already-decoded object. ``options`` is what the
-        scheduler was ASKED for, which only its caller knows."""
+        scheduler was asked for, which only its caller knows."""
         d = json.loads(text) if isinstance(text, str) else text
         return cls(
             funcs=[FuncSchedule.from_json(f) for f in d["funcs"]],

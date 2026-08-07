@@ -465,9 +465,9 @@ static LogicalResult verifyUsesResolve(Operation *op, ArrayAttr uses,
 }
 
 LogicalResult DCPathCombOp::verify() {
-  // Over the widths a design can carry rather than symbolically: the forms are
-  // piecewise and a table's value between two points is the lower point's, so
-  // "non-negative everywhere" is not a property of the coefficients.
+  // Sampled at representative widths rather than checked symbolically: a cost
+  // form is piecewise, so non-negativity is not a property of the
+  // coefficients.
   for (int64_t w : {1, 8, 16, 32, 64})
     if (getDelay().evaluate(w) < 0.0)
       return emitOpError("delay must be non-negative, but is ")

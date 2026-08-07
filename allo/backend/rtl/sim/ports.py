@@ -76,7 +76,7 @@ class Mem:
     arithmetic."""
 
     arg: int
-    host: HostType  # the element type as it crosses, port width included
+    host: HostType  # element type as it crosses, port width included
     size: int  # elements in this bank (== the flattened argument when unbanked)
     bank: int = 0  # which bank of the argument (0 when unbanked)
     elements: np.ndarray | None = None  # flat index per offset (None = unbanked)
@@ -194,6 +194,5 @@ def scalar_bits(value, arg_type) -> int:
 
 
 def from_scalar_bits(bits: int, res_type):
-    """Inverse of :func:`scalar_bits`: a result port's bit pattern as the numpy
-    scalar of the kernel's return type."""
+    """A result port's bit pattern as the numpy scalar of the return type."""
     return scalar_from_bits(bits, host_type(res_type, RTL_ABI))
