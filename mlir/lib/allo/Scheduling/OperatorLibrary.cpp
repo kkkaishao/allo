@@ -8,6 +8,7 @@
 #include "allo/IR/AlloOps.h"
 #include "allo/Scheduling/AddressModel.h" // addressDelayOf (per-site address)
 #include "allo/Support/BitAnalysis.h"     // isBitRename
+#include "allo/Support/Logging.h"
 
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
@@ -18,7 +19,9 @@
 #include "llvm/ADT/TypeSwitch.h"
 #include "llvm/Support/FormatVariadic.h"
 
+#include <limits>
 #include <map>
+#include <tuple>
 
 using namespace mlir;
 using namespace mlir::allo;
@@ -151,13 +154,15 @@ bool allIntegerOperands(Operation *op) {
   });
 }
 
-// The library row matching \p op, or null. Advanced (raw-mnemonic) rows match
-// first on an exact type list; abstract rows match last-wins, so a
-// later-injected operator overrides an earlier one of the same signature
-// (user @ip > built-in IP > comb fallback).
-const OperatorEntry *matchEntry(const std::vector<OperatorEntry> &advanced,
-                                const std::vector<OperatorEntry> &entries,
-                                Operation *op) {
+// Every library row that could realize \p op, in declaration order: an advanced
+// row matches its raw mnemonic and exact element-type list, an IP row its
+// abstract kind and exact element-type list, a comb row its abstract kind.
+// A device offering both an IP and a comb realization of one kind puts two rows
+// here; `selectImplementation` ranks them.
+llvm::SmallVector<const OperatorEntry *, 2>
+matchEntries(const std::vector<OperatorEntry> &advanced,
+             const std::vector<OperatorEntry> &entries, Operation *op) {
+  llvm::SmallVector<const OperatorEntry *, 2> out;
   auto kind = classify(op);
   auto mnem = op->getName().stripDialect();
   auto aTys = elementTypes(op->getOperandTypes());
@@ -166,8 +171,8 @@ const OperatorEntry *matchEntry(const std::vector<OperatorEntry> &advanced,
   for (const OperatorEntry &e : advanced)
     if (e.mlirOp == mnem && ArrayRef<Type>(e.argTypes) == a &&
         ArrayRef<Type>(e.resTypes) == r)
-      return &e;
-  for (const OperatorEntry &e : llvm::reverse(entries)) {
+      out.push_back(&e);
+  for (const OperatorEntry &e : entries) {
     if (e.kind != kind)
       continue;
     if (e.comb) {
@@ -176,13 +181,13 @@ const OperatorEntry *matchEntry(const std::vector<OperatorEntry> &advanced,
       // arithmetic.
       if (kind == OpKind::Select || kind == OpKind::Neg ||
           allIntegerOperands(op))
-        return &e;
+        out.push_back(&e);
     } else if (ArrayRef<Type>(e.argTypes) == a &&
                ArrayRef<Type>(e.resTypes) == r) {
-      return &e;
+      out.push_back(&e);
     }
   }
-  return nullptr;
+  return out;
 }
 
 // Whether \p op needs an IP realization: a float arithmetic op or compare
@@ -254,8 +259,9 @@ OperatorLibrary OperatorLibrary::fromModule(ModuleOp module) {
   dcp::DCPathDeviceOp device;
   module.walk([&](dcp::DCPathDeviceOp d) { device = d; });
 
-  // Comb rows first: `entries` is matched last-wins, so comb is the
-  // lowest-priority fallback and an injected IP of the same kind overrides it.
+  // Comb and IP rows share `entries`, both as candidates for an operation of
+  // their kind. Order carries no ranking beyond the last comb row of a kind
+  // winning over an earlier one; `selectImplementation` decides the rest.
   if (device) {
     lib.regFloor = device.getRegDelay().convertToDouble();
     for (dcp::DCPathCombOp comb :
@@ -286,8 +292,9 @@ OperatorLibrary OperatorLibrary::fromModule(ModuleOp module) {
       lib.chainUses = c.getUsesAttr();
   }
 
-  // IP rows in injection order (built-in, then user), matched last-wins: a user
-  // `@ip` overrides a built-in of the same signature.
+  // IP rows in injection order, built-in then user. Two cores of one kind and
+  // signature are both candidates, and the ranking rather than the injection
+  // order says which an operation binds.
   module.walk([&](dcp::DCPathOperatorOp op) {
     OperatorEntry e;
     e.latency = (uint32_t)op.getLatency();
@@ -314,6 +321,34 @@ OperatorLibrary OperatorLibrary::fromModule(ModuleOp module) {
 // Lookup
 //===----------------------------------------------------------------------===//
 
+const OperatorEntry *OperatorLibrary::selectImplementation(
+    ArrayRef<const OperatorEntry *> candidates, int64_t width) const {
+  // Shortest, then cheapest at this width, then the first symbol: a total order
+  // over the IPs, so the choice does not depend on the order they were injected
+  // in. A core the device did not measure at this width ranks last rather than
+  // free.
+  auto rank = [&](const OperatorEntry *e) {
+    return std::make_tuple(
+        e->latency,
+        priceOf(e->uses, {width}).value_or(std::numeric_limits<int64_t>::max()),
+        StringRef(e->symbol));
+  };
+  const OperatorEntry *best = nullptr;
+  for (const OperatorEntry *e : candidates) {
+    assert((e->comb || !e->symbol.empty()) && "an IP row carries its symbol");
+    if (!e->comb && (!best || rank(e) < rank(best)))
+      best = e;
+  }
+  if (best)
+    return best;
+  // No IP: the combinational row, the last of its kind the device declared,
+  // which is the one `combEntry` reads too.
+  for (const OperatorEntry *e : candidates)
+    if (e->comb)
+      best = e;
+  return best;
+}
+
 const OperatorEntry *OperatorLibrary::combEntry(OpKind kind) const {
   // `dcp.device.comb` is a dictionary, so there is at most one row per kind in
   // practice.
@@ -326,12 +361,22 @@ const OperatorEntry *OperatorLibrary::combEntry(OpKind kind) const {
 
 double OperatorLibrary::combDelay(CombOpKindEnum kind, int64_t width) const {
   const OperatorEntry *e = combEntry(opKindOf(kind));
-  return e ? e->delay.evaluate(width) : defaultEntry.outDelay;
+  if (!e)
+    return defaultEntry.outDelay;
+  std::optional<double> d = e->delay.evaluate(width);
+  assert(d && "a realization the scheduler priced through `lookup` is inside "
+              "the row's measured widths");
+  return *d;
 }
 
 double OperatorLibrary::combDelay(OpKind kind, int64_t width) const {
   const OperatorEntry *e = combEntry(kind);
-  return e ? e->delay.evaluate(width) : 0.0;
+  if (!e)
+    return 0.0;
+  assert(!e->delay.unmeasuredAt(width) &&
+         "the compiler builds no structure wider than the widths a device row "
+         "was measured at; a program width is checked in `lookup`");
+  return *e->delay.evaluate(width);
 }
 
 double OperatorLibrary::combMarginalDelay(OpKind kind, int64_t width) const {
@@ -376,10 +421,13 @@ bool mlir::allo::isZeroDelay(Operation *op) {
          paramWidthOf(op->getResult(0).getType());
 }
 
-int64_t OperatorLibrary::priceOf(ArrayAttr uses,
-                                 ArrayRef<int64_t> params) const {
+std::optional<int64_t>
+OperatorLibrary::priceOf(ArrayAttr uses, ArrayRef<int64_t> params) const {
+  auto spent = evaluateResourceUse(uses, params);
+  if (!spent)
+    return std::nullopt;
   int64_t total = 0;
-  for (auto [resource, count] : evaluateResourceUse(uses, params)) {
+  for (auto [resource, count] : *spent) {
     auto it = resourcePrices.find(resource.getLeafReference().getValue());
     assert(it != resourcePrices.end() &&
            "a realization spends a resource the device does not declare, which "
@@ -391,7 +439,10 @@ int64_t OperatorLibrary::priceOf(ArrayAttr uses,
 }
 
 int64_t OperatorLibrary::muxPrice(int64_t sources, int64_t width) const {
-  return priceOf(muxUses, {sources, width});
+  std::optional<int64_t> price = priceOf(muxUses, {sources, width});
+  assert(price && "a multiplexer row holds over every fan-in a region can "
+                  "share an operator over");
+  return *price;
 }
 
 int64_t OperatorLibrary::chainPrice(int64_t depth, int64_t width) const {
@@ -399,7 +450,10 @@ int64_t OperatorLibrary::chainPrice(int64_t depth, int64_t width) const {
   // that exists, so its head and tail terms are not zero at depth zero.
   if (depth <= 0)
     return 0;
-  return priceOf(chainUses, {depth, width});
+  std::optional<int64_t> price = priceOf(chainUses, {depth, width});
+  assert(price && "a delay chain row holds over every depth a schedule can "
+                  "carry a value across");
+  return *price;
 }
 
 int64_t OperatorLibrary::pulsePrice() const {
@@ -450,7 +504,11 @@ OperatorChar OperatorLibrary::lookup(Operation *op) const {
   assert(!asMemAccess(op) &&
          "the operator library was asked to time a memory access");
 
-  const auto *e = matchEntry(advancedEntries, entries, op);
+  // Every row is characterized over one parameter, an operand width, which is
+  // also what the price tie-break between two candidates is read at.
+  int64_t width = combParamWidth(op);
+  const OperatorEntry *e =
+      selectImplementation(matchEntries(advancedEntries, entries, op), width);
   if (!e) {
     // Matching nothing is ordinary: a constant, a yield terminator, or
     // `affine.apply` cost nothing real here (apply takes the default row's
@@ -470,8 +528,27 @@ OperatorChar OperatorLibrary::lookup(Operation *op) const {
     e = &defaultEntry;
   }
 
-  // Every row is characterized over one parameter, an operand width.
-  int64_t width = combParamWidth(op);
+  // What the row is worth at this operation's width, both numbers together: a
+  // row the device measured over other widths gives it neither a delay nor an
+  // area. Reported here, where the width and the row meet, and left unrealized
+  // so the pre-schedule realizability check refuses the program.
+  std::optional<double> delay =
+      e->comb ? e->delay.evaluate(width) : std::optional<double>(0.0);
+  std::optional<int64_t> price = priceOf(e->uses, {width});
+  if (!delay || !price) {
+    CostAttr bad = delay ? unmeasuredUse(e->uses, {width}) : e->delay;
+    auto [lo, hi] = bad.measuredDomain();
+    std::string row =
+        e->symbol.empty() ? stringifyOpKindEnum(e->kind).str() : e->symbol;
+    logging::error(logging::Stage::Prep,
+                   logging::Code::DeviceDeclarationInvalid, op)
+        << "Operation '" << op->getName() << "' is " << width
+        << " bits wide, and the device's '" << row << "' row is measured over "
+        << lo << ".." << hi
+        << " bits. Measure the fabric at this width, or narrow the operands to "
+           "one it covers";
+    return OperatorChar{};
+  }
 
   // The stable Problem::OperatorType key: an IP row's symbol, a comb row's
   // `comb.<kind>.w<N>`, else `default`.
@@ -491,8 +568,7 @@ OperatorChar OperatorLibrary::lookup(Operation *op) const {
   // `ChainingProblem::checkDelays` rejects a zero-latency operator whose two
   // delays differ: for a combinational cell they describe one path.
   if (e->comb)
-    c.timing.inDelay = c.timing.outDelay =
-        std::max(0.0, e->delay.evaluate(width) - regFloor);
+    c.timing.inDelay = c.timing.outDelay = std::max(0.0, *delay - regFloor);
   else {
     c.timing.inDelay = e->inDelay;
     c.timing.outDelay = e->outDelay;
@@ -508,7 +584,7 @@ OperatorChar OperatorLibrary::lookup(Operation *op) const {
   }
   // An IP's signature pins the width, so there the factors are constants and
   // this is the measured core.
-  c.price = priceOf(e->uses, {width});
+  c.price = *price;
   // The realization is the row's own symbol when it is an IP, else the native
   // lowering the reifier picks; the default row reaches the comb arm too.
   if (!e->symbol.empty())
@@ -544,9 +620,9 @@ OperatorIdentity mlir::allo::operatorIdentity(Operation *op,
 }
 
 bool OperatorLibrary::requiresUnmatchedIP(Operation *op) const {
-  return needsIP(op) && matchEntry(advancedEntries, entries, op) == nullptr;
+  return needsIP(op) && matchEntries(advancedEntries, entries, op).empty();
 }
 
 bool OperatorLibrary::hasDirectRealization(Operation *op) const {
-  return matchEntry(advancedEntries, entries, op) != nullptr;
+  return !matchEntries(advancedEntries, entries, op).empty();
 }

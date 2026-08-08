@@ -42,10 +42,18 @@ class Cost:
 
     form: str
     coeffs: tuple[float, ...]
+    #: The two arms of a :func:`Piecewise`, and empty for every other form.
+    arms: tuple[Cost, ...] = ()
 
-    def _mlir(self) -> str:
-        body = ", ".join(repr(float(c)) for c in self.coeffs)
-        return f"#allo.cost<{self.form}, [{body}]>"
+    def _attr(self):
+        """This cost as an ``#allo.cost``, in whatever context is current."""
+        from ..._mlir.dialects.allo import CostAttr
+
+        return CostAttr.get(
+            self.form,
+            [float(c) for c in self.coeffs],
+            [a._attr() for a in self.arms],
+        )
 
 
 def Const(value: float) -> Cost:
@@ -71,10 +79,10 @@ def Step(threshold: float, below_coeff: float, above: float) -> Cost:
 
 def Table(points: dict[int, float]) -> Cost:
     """Measured point by point. A parameter between two points takes the lower
-    one's value, and one below the first takes the first's.
+    one's value, and one outside the first and last is not measured at all.
 
-    A staircase, which fits a piecewise-constant quantity: an SRL chain occupies
-    ``ceil(depth/32)`` sites, so depth 40 costs 2 sites and not 1.3.
+    A staircase, which fits a quantity that really steps: a multiply takes a
+    whole number of DSP slices, never 1.7 of one.
 
     Sampling a continuous quantity into one under-states it at every parameter
     between two points, and nothing downstream re-checks a timing model: a
@@ -86,6 +94,32 @@ def Table(points: dict[int, float]) -> Cost:
     for p in sorted(points):
         flat += [float(p), float(points[p])]
     return Cost("table", tuple(flat))
+
+
+def Interp(points: dict[int, float]) -> Cost:
+    """The same measured points as a :func:`Table`, read continuously: a
+    parameter between two points takes their linear interpolation, and one
+    outside the first and last is not measured at all.
+
+    For a quantity that is continuous in its parameter, such as an operator's
+    delay in its operand width, which a staircase under-states at every
+    parameter between two of its points.
+    """
+    if not points:
+        raise ValueError("a cost table needs at least one point")
+    flat: list[float] = []
+    for p in sorted(points):
+        flat += [float(p), float(points[p])]
+    return Cost("interp", tuple(flat))
+
+
+def Piecewise(breakpoint: float, below: Cost, above: Cost) -> Cost:
+    """``p < breakpoint ? below(p) : above(p)``, with arms of any form.
+
+    The general form of :func:`Step`, whose lower arm is forced proportional and
+    whose upper arm is forced constant.
+    """
+    return Cost("piecewise", (float(breakpoint),), (below, above))
 
 
 #: What one realization spends: ``(resource name, one cost factor per parameter
@@ -116,10 +150,10 @@ _DELAY_ATTRS: dict[Cost, object] = {}
 
 
 @lru_cache(maxsize=None)
-def _cost_context():
-    """The context every ``uses`` attribute is parsed into. One per process: an
-    attribute is uniqued in the context that built it and has to outlive every
-    evaluation of it."""
+def _scratch_context():
+    """The context the evaluation-only attributes below are uniqued in, one per
+    process. Not the RTL module's context: an attribute holds its context alive,
+    and :meth:`Device.price` is called with no module in reach."""
     from ..._mlir.ir import Context
     from ..._mlir.dialects.allo import register_dialect
 
@@ -128,34 +162,69 @@ def _cost_context():
     return ctx
 
 
-def _res_use_text(spent: Spend, scope: str = "") -> str:
-    """``spent`` as an ``#allo.res_use`` array literal. ``scope`` is the device
-    symbol a reference from OUTSIDE the device's region has to reach through."""
-    body = ", ".join(
-        f"#allo.res_use<@{scope}{name}, [{', '.join(c._mlir() for c in factors)}]>"
-        for name, factors in spent
+def _res_use_array(spent: Spend, scope: str = ""):
+    """``spent`` as an ``#allo.res_use`` array, in whatever context is current.
+    ``scope`` names the device symbol a reference from outside the device's
+    region has to reach through, giving ``@u55c::@lut`` rather than ``@lut``."""
+    from ..._mlir.ir import ArrayAttr, SymbolRefAttr
+    from ..._mlir.dialects.allo import ResourceUseAttr
+
+    return ArrayAttr.get(
+        [
+            ResourceUseAttr.get(
+                SymbolRefAttr.get([scope, name] if scope else [name]),
+                [c._attr() for c in factors],
+            )
+            for name, factors in spent
+        ]
     )
-    return f"[{body}]"
 
 
 def _res_use_attr(spent: Spend):
-    """The parsed ``#allo.res_use`` array for ``spent``."""
+    """The ``#allo.res_use`` array for ``spent``, for evaluation only."""
     attr = _COST_ATTRS.get(spent)
     if attr is None:
-        from ..._mlir.ir import Attribute
-
-        with _cost_context():
-            attr = _COST_ATTRS[spent] = Attribute.parse(_res_use_text(spent))
+        with _scratch_context():
+            attr = _COST_ATTRS[spent] = _res_use_array(spent)
     return attr
+
+
+def _cost_attr(cost: Cost):
+    """The ``#allo.cost`` for one cost, for evaluation only."""
+    attr = _DELAY_ATTRS.get(cost)
+    if attr is None:
+        with _scratch_context():
+            attr = _DELAY_ATTRS[cost] = cost._attr()
+    return attr
+
+
+def _measured_over(cost: Cost) -> str:
+    """A cost's measured points, for a diagnostic."""
+    if cost.form in ("table", "interp"):
+        return f"{cost.form} measured over {cost.coeffs[0]:g}..{cost.coeffs[-2]:g}"
+    return repr(cost)
+
+
+def _unmeasured(uses: Spend, params: Sequence[int]) -> str:
+    """Which cost of ``uses`` the compiler's evaluator declined to read at
+    ``params``, named for a diagnostic. Found by asking the evaluator factor by
+    factor, so the rule stays the compiler's."""
+    for name, factors in uses:
+        if len(factors) != len(params):
+            continue  # a lone Tiled, which reads the whole tuple
+        for factor, param in zip(factors, params):
+            if _cost_attr(factor).evaluate(int(param)) is None:
+                return f"the cost of {name!r} is a {_measured_over(factor)}"
+    return "a cost is not measured"
 
 
 def Tiled(bits_per_tile: int) -> Cost:
     """``ceil(depth * width / bits_per_tile)``: the shape of a tiled memory.
 
-    The one form that reads the WHOLE parameter tuple rather than one of it, so
-    it stands alone instead of multiplying a factor per parameter: a block-RAM
-    tile holds so many bits however the array is cut, which puts the product
-    inside the ceiling and does not separate."""
+    Standing alone it reads the whole parameter tuple: a block-RAM tile holds so
+    many bits however the array is cut, which puts the product inside the
+    ceiling and does not separate. As one of a full set of factors it tiles its
+    own parameter instead, ``ceil(p / bits_per_tile)``."""
     if bits_per_tile <= 0:
         raise ValueError("a tile holds a positive number of bits")
     return Cost("tiled", (float(bits_per_tile),))
@@ -293,7 +362,8 @@ class Device:
                     f"{resource.name!r} is not a resource of device {self.name!r}"
                 )
             for factors in _terms(cost):
-                if len(factors) != (1 if factors[0].form == "tiled" else arity):
+                whole_tuple = len(factors) == 1 and factors[0].form == "tiled"
+                if len(factors) != arity and not whole_tuple:
                     raise ValueError(
                         f"{what} is characterized by ({params}), so each term of "
                         f"its cost of {resource.name!r} is {arity} factor(s) or "
@@ -307,12 +377,22 @@ class Device:
 
         Goes through the compiler's own ``CostAttr::evaluate``, so a consumer
         outside the compiler (``benchmark/area.py``) reads the same measured
-        model the scheduler will, rather than a second copy of the shapes."""
+        model the scheduler will, rather than a second copy of the shapes.
+
+        Raises where a cost was not measured at its parameter: a `Table` and an
+        `Interp` hold measurements, which are read and never extrapolated."""
         if not uses:
             return {}
-        from ..._mlir.dialects.allo import evaluate_resource_use
+        from ..._mlir.dialects.allo import ResourceUseAttr
 
-        return dict(evaluate_resource_use(_res_use_attr(uses), list(params)))
+        spent = ResourceUseAttr.evaluate_all(_res_use_attr(uses), list(params))
+        if spent is None:
+            raise ValueError(
+                f"{_unmeasured(uses, params)}, so it does not price "
+                f"{tuple(params)}; measure it there, or price the realization "
+                "at a parameter it covers"
+            )
+        return dict(spent)
 
     def comb_delay(self, kind: CombKind | str, width: int) -> float:
         """The chaining delay (ns) of a native operator kind at ``width`` bits,
@@ -320,20 +400,20 @@ class Device:
 
         Evaluated by the compiler's own ``CostAttr::evaluate``, as :meth:`price`
         is, so a reader outside the compiler reads the same curve the scheduler
-        does. Returns 0.0 where the device declares no row.
+        does. Returns 0.0 where the device declares no row, and raises at a
+        width the row was not measured at.
         """
-        from ..._mlir.dialects.allo import evaluate_cost
-
-        cost = self.comb.get(kind.value if isinstance(kind, CombKind) else kind)
+        name = kind.value if isinstance(kind, CombKind) else kind
+        cost = self.comb.get(name)
         if cost is None:
             return 0.0
-        attr = _DELAY_ATTRS.get(cost)
-        if attr is None:
-            from ..._mlir.ir import Attribute
-
-            with _cost_context():
-                attr = _DELAY_ATTRS[cost] = Attribute.parse(cost._mlir())
-        return evaluate_cost(attr, int(width))
+        delay = _cost_attr(cost).evaluate(int(width))
+        if delay is None:
+            raise ValueError(
+                f"the {self.name} {name!r} delay is a {_measured_over(cost)} "
+                f"and was not measured at {width} bits"
+            )
+        return delay
 
     def add_resource(self, name: str, capacity: int) -> Resource:
         """Declare a resource this device has ``capacity`` of, and return the
@@ -537,6 +617,19 @@ class Device:
             self.add_operator(operator)
         return self
 
+    def remove_operator(self, operator: OperatorIP | str) -> Device:
+        """Drop a core, named by handle or by symbol, and what it spends with
+        it. Several cores of one kind and signature are candidates the library
+        chooses between, so withdrawing one is how a device offers fewer.
+        Raises where the device does not declare it."""
+        symbol = operator.symbol if isinstance(operator, OperatorIP) else operator
+        found = next((o for o in self.operators if o.symbol == symbol), None)
+        if found is None:
+            raise ValueError(f"{symbol!r} is not an operator of device {self.name!r}")
+        self.operators.remove(found)
+        self.operator_uses.pop(symbol, None)
+        return self
+
     def validate(self) -> Device:
         """Check the device is complete enough to compile and to price against,
         and return it. Call it where a device is built, so a part missing a row
@@ -629,9 +722,6 @@ def operator_descs(operators: Sequence[OperatorIP]) -> list[OpDesc]:
 
 
 # See mlir/include/allo/IR/AlloAttrs.td
-_STALL_STYLE_TO_ENUM = {"ce": 0, "free": 1, "elastic": 2}
-
-
 def inject_operators(module, device: Device):
     """Inject each device operator as a module-level ``dcp.operator`` symbol the
     scheduler and reifier match concrete ``arith.*``/``math.*`` ops onto. The
@@ -670,7 +760,7 @@ def inject_operators(module, device: Device):
             )
             t = op.timing
             # A pipelined IP's style, else the clock-enable default.
-            stall = StallContractAttr.get(_STALL_STYLE_TO_ENUM[t.style or "ce"], ctx)
+            stall = StallContractAttr.get(t.style or "ce", ctx)
             DCPathOperatorOp(
                 sym_name=op.symbol,
                 kind=kind,
@@ -680,9 +770,7 @@ def inject_operators(module, device: Device):
                 out_delay=FloatAttr.get(f32ty, t.out_delay_ns),
                 pipelined=t.pipelined,
                 stall=stall,
-                uses=_uses_attr(
-                    device.operator_uses.get(op.symbol), f"{device.name}::@"
-                ),
+                uses=_uses_attr(device.operator_uses.get(op.symbol), device.name),
                 ip=insert,
             )
 
@@ -690,11 +778,7 @@ def inject_operators(module, device: Device):
 def _uses_attr(spent, scope: str = ""):
     """``uses`` as a ``#allo.res_use`` array, or None when nothing is declared:
     an undeclared cost spends nothing, it is not a zero."""
-    if not spent:
-        return None
-    from ..._mlir.ir import Attribute
-
-    return Attribute.parse(_res_use_text(spent, scope))
+    return _res_use_array(spent, scope) if spent else None
 
 
 def inject_device(module, device: Device):
@@ -703,7 +787,6 @@ def inject_device(module, device: Device):
     override the built-in library defaults. Target frequency is not injected: it
     is a per-run scheduling parameter, not technology data."""
     from ..._mlir.ir import (
-        Attribute,
         InsertionPoint,
         Location,
         FloatAttr,
@@ -712,6 +795,7 @@ def inject_device(module, device: Device):
         IntegerType,
     )
     from ..._mlir.dialects.allo import (
+        OpKindAttr,
         DCPathChainOp,
         DCPathCombOp,
         DCPathDeviceOp,
@@ -748,8 +832,8 @@ def inject_device(module, device: Device):
                 )
             for kind, delay in device.comb.items():
                 DCPathCombOp(
-                    kind=Attribute.parse(f"#allo<op_kind {kind}>"),
-                    delay=Attribute.parse(delay._mlir()),
+                    kind=OpKindAttr.get(kind),
+                    delay=delay._attr(),
                     uses=_uses_attr(device.comb_uses.get(kind)),
                 )
             for s in device.storage.values():
@@ -780,6 +864,8 @@ __all__ = [
     "Quadratic",
     "Step",
     "Table",
+    "Interp",
+    "Piecewise",
     "Tiled",
     "operator_descs",
     "inject_device",

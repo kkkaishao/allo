@@ -11,6 +11,7 @@
 #include "llvm/ADT/SmallVector.h"
 
 #include <cstdint>
+#include <optional>
 #include <utility>
 
 #include "allo/IR/AlloEnums.h.inc"
@@ -34,8 +35,15 @@ namespace mlir::allo {
 ///
 /// A lone `tiled` factor is the exception to the one-factor-per-parameter rule:
 /// it reads the whole tuple, since `ceil(depth*width/bits)` does not separate.
-llvm::SmallVector<std::pair<mlir::SymbolRefAttr, int64_t>>
+///
+/// Nullopt where a factor is not measured at its parameter
+/// (`CostAttr::evaluate`); `unmeasuredUse` names the row for the diagnostic.
+std::optional<llvm::SmallVector<std::pair<mlir::SymbolRefAttr, int64_t>>>
 evaluateResourceUse(mlir::ArrayAttr uses, llvm::ArrayRef<int64_t> params);
+
+/// The cost inside \p uses whose measured points do not cover its parameter,
+/// null wherever `evaluateResourceUse` answers.
+CostAttr unmeasuredUse(mlir::ArrayAttr uses, llvm::ArrayRef<int64_t> params);
 
 } // namespace mlir::allo
 

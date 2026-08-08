@@ -49,53 +49,101 @@ MLIR_CAPI_EXPORTED MlirAttribute alloPartitionAttrGetAxis(MlirAttribute attr,
 MLIR_CAPI_EXPORTED MlirTypeID alloPartitionAttrGetTypeID(void);
 
 //===----------------------------------------------------------------------===//
-// Enum-backed attributes. `value` is the underlying I32 enum case, which
-// Get()/GetValue() round-trip. Every enum attr gets the same four accessors.
+// Enum-backed attributes. Every one gets the same five accessors.
+//
+// `Get` takes the underlying I32 enum case, which `GetValue` round-trips.
+// `GetByName` takes the case's mnemonic instead, the spelling that appears in
+// the assembly (`mul` of `#allo<op_kind mul>`), and returns a null attribute
+// for a name the enum does not have. A caller outside the compiler uses it
+// rather than transcribing the numbering, which goes stale when a case is
+// inserted.
 //===----------------------------------------------------------------------===//
 
-// AssumeDepTypeAttr (#allo<dep_type inter|intra>): 0 = Inter, 1 = Intra.
-MLIR_CAPI_EXPORTED bool alloAttributeIsAAssumeDepType(MlirAttribute attr);
-MLIR_CAPI_EXPORTED MlirAttribute alloAssumeDepTypeAttrGet(MlirContext ctx,
-                                                          uint32_t value);
-MLIR_CAPI_EXPORTED uint32_t alloAssumeDepTypeAttrGetValue(MlirAttribute attr);
-MLIR_CAPI_EXPORTED MlirTypeID alloAssumeDepTypeAttrGetTypeID(void);
+#define ALLO_ENUM_ATTR_CAPI_DECL(Name)                                         \
+  MLIR_CAPI_EXPORTED bool alloAttributeIsA##Name(MlirAttribute attr);          \
+  MLIR_CAPI_EXPORTED MlirAttribute allo##Name##AttrGet(MlirContext ctx,        \
+                                                       uint32_t value);        \
+  MLIR_CAPI_EXPORTED MlirAttribute allo##Name##AttrGetByName(                  \
+      MlirContext ctx, MlirStringRef name);                                    \
+  MLIR_CAPI_EXPORTED uint32_t allo##Name##AttrGetValue(MlirAttribute attr);    \
+  MLIR_CAPI_EXPORTED MlirTypeID allo##Name##AttrGetTypeID(void);
 
-// AssumeDepDirAttr (#allo<dep_dir raw|war|waw>): 0 = RAW, 1 = WAR, 2 = WAW.
-MLIR_CAPI_EXPORTED bool alloAttributeIsAAssumeDepDir(MlirAttribute attr);
-MLIR_CAPI_EXPORTED MlirAttribute alloAssumeDepDirAttrGet(MlirContext ctx,
-                                                         uint32_t value);
-MLIR_CAPI_EXPORTED uint32_t alloAssumeDepDirAttrGetValue(MlirAttribute attr);
-MLIR_CAPI_EXPORTED MlirTypeID alloAssumeDepDirAttrGetTypeID(void);
+// #allo<dep_type inter|intra>
+ALLO_ENUM_ATTR_CAPI_DECL(AssumeDepType)
+// #allo<dep_dir raw|war|waw>
+ALLO_ENUM_ATTR_CAPI_DECL(AssumeDepDir)
+// #allo<mem_kind ram|rom>
+ALLO_ENUM_ATTR_CAPI_DECL(MemoryKind)
+// #allo<determinacy counted_static|conditional|indeterminate|concurrent>
+ALLO_ENUM_ATTR_CAPI_DECL(Determinacy)
+// #allo<op_kind add|sub|mul|...>, the abstract operator vocabulary
+ALLO_ENUM_ATTR_CAPI_DECL(OpKind)
+// #allo<comb_kind addi|subi|muli|...>, the comb op a dcp.compute realizes
+ALLO_ENUM_ATTR_CAPI_DECL(CombOpKind)
+// #allo<stall ce|free|elastic>
+ALLO_ENUM_ATTR_CAPI_DECL(StallContract)
+// #allo<cost_form const|linear|...>, the shapes CostAttr below takes
+ALLO_ENUM_ATTR_CAPI_DECL(CostForm)
 
-// MemoryKindAttr (#allo<mem_kind ram|rom>): 0 = RAM, 1 = ROM.
-MLIR_CAPI_EXPORTED bool alloAttributeIsAMemoryKind(MlirAttribute attr);
-MLIR_CAPI_EXPORTED MlirAttribute alloMemoryKindAttrGet(MlirContext ctx,
-                                                       uint32_t value);
-MLIR_CAPI_EXPORTED uint32_t alloMemoryKindAttrGetValue(MlirAttribute attr);
-MLIR_CAPI_EXPORTED MlirTypeID alloMemoryKindAttrGetTypeID(void);
+#undef ALLO_ENUM_ATTR_CAPI_DECL
 
-// DeterminacyAttr (#allo<determinacy ...>):
-//   0=CountedStatic 1=Conditional 2=Indeterminate 3=Concurrent.
-MLIR_CAPI_EXPORTED bool alloAttributeIsADeterminacy(MlirAttribute attr);
-MLIR_CAPI_EXPORTED MlirAttribute alloDeterminacyAttrGet(MlirContext ctx,
-                                                        uint32_t value);
-MLIR_CAPI_EXPORTED uint32_t alloDeterminacyAttrGetValue(MlirAttribute attr);
-MLIR_CAPI_EXPORTED MlirTypeID alloDeterminacyAttrGetTypeID(void);
+//===----------------------------------------------------------------------===//
+// CostAttr  (#allo.cost<form, [coeffs], [arms]>)
+//
+// `form` is an `allo::CostFormEnum` case, which `alloCostFormAttrGetByName`
+// resolves from its mnemonic. `arms` holds the two arms of a `piecewise` and
+// is empty for every other form.
+//===----------------------------------------------------------------------===//
 
-// CombOpKindAttr (#allo<comb_kind ...>): the CombOpKindEnum case (see the .td).
-MLIR_CAPI_EXPORTED bool alloAttributeIsACombOpKind(MlirAttribute attr);
-MLIR_CAPI_EXPORTED MlirAttribute alloCombOpKindAttrGet(MlirContext ctx,
-                                                       uint32_t value);
-MLIR_CAPI_EXPORTED uint32_t alloCombOpKindAttrGetValue(MlirAttribute attr);
-MLIR_CAPI_EXPORTED MlirTypeID alloCombOpKindAttrGetTypeID(void);
+MLIR_CAPI_EXPORTED bool alloAttributeIsACost(MlirAttribute attr);
 
-// StallContractAttr (#allo<stall ce|free|elastic>): 0 = Ce, 1 = Free, 2 =
-// Elastic.
-MLIR_CAPI_EXPORTED bool alloAttributeIsAStallContract(MlirAttribute attr);
-MLIR_CAPI_EXPORTED MlirAttribute alloStallContractAttrGet(MlirContext ctx,
-                                                          uint32_t value);
-MLIR_CAPI_EXPORTED uint32_t alloStallContractAttrGetValue(MlirAttribute attr);
-MLIR_CAPI_EXPORTED MlirTypeID alloStallContractAttrGetTypeID(void);
+MLIR_CAPI_EXPORTED MlirAttribute alloCostAttrGet(MlirContext ctx, uint32_t form,
+                                                 intptr_t nCoeffs,
+                                                 const double *coeffs,
+                                                 intptr_t nArms,
+                                                 MlirAttribute const *arms);
+
+MLIR_CAPI_EXPORTED uint32_t alloCostAttrGetForm(MlirAttribute attr);
+MLIR_CAPI_EXPORTED intptr_t alloCostAttrGetNumCoeffs(MlirAttribute attr);
+MLIR_CAPI_EXPORTED double alloCostAttrGetCoeff(MlirAttribute attr,
+                                               intptr_t pos);
+MLIR_CAPI_EXPORTED intptr_t alloCostAttrGetNumArms(MlirAttribute attr);
+MLIR_CAPI_EXPORTED MlirAttribute alloCostAttrGetArm(MlirAttribute attr,
+                                                    intptr_t pos);
+MLIR_CAPI_EXPORTED MlirTypeID alloCostAttrGetTypeID(void);
+
+/// The `table` or `interp` inside `attr` whose measured points do not cover
+/// `param`, and a null attribute wherever `alloEvaluateCost` answers.
+MLIR_CAPI_EXPORTED MlirAttribute alloCostAttrUnmeasuredAt(MlirAttribute attr,
+                                                          int64_t param);
+
+/// The first and last point a `table` or an `interp` was measured at. False,
+/// leaving both alone, for every other form, which is a shape and has no
+/// measured domain.
+MLIR_CAPI_EXPORTED bool alloCostAttrGetMeasuredDomain(MlirAttribute attr,
+                                                      int64_t *first,
+                                                      int64_t *last);
+
+//===----------------------------------------------------------------------===//
+// ResourceUseAttr  (#allo.res_use<@resource, [factors]>)
+//
+// One term of what a realization spends of one resource: `factors` holds one
+// `#allo.cost` per parameter of the realization's kind, and the term is their
+// product. `resource` is a `SymbolRefAttr` naming a `dcp.resource`.
+//===----------------------------------------------------------------------===//
+
+MLIR_CAPI_EXPORTED bool alloAttributeIsAResourceUse(MlirAttribute attr);
+
+MLIR_CAPI_EXPORTED MlirAttribute alloResourceUseAttrGet(
+    MlirContext ctx, MlirAttribute resource, intptr_t nFactors,
+    MlirAttribute const *factors);
+
+MLIR_CAPI_EXPORTED MlirAttribute
+alloResourceUseAttrGetResource(MlirAttribute attr);
+MLIR_CAPI_EXPORTED intptr_t alloResourceUseAttrGetNumFactors(MlirAttribute attr);
+MLIR_CAPI_EXPORTED MlirAttribute
+alloResourceUseAttrGetFactor(MlirAttribute attr, intptr_t pos);
+MLIR_CAPI_EXPORTED MlirTypeID alloResourceUseAttrGetTypeID(void);
 
 //===----------------------------------------------------------------------===//
 // Resource cost evaluation.
@@ -114,15 +162,20 @@ typedef void (*AlloResourceUseCallback)(MlirStringRef resource, int64_t amount,
 /// Evaluates `uses`, an `#allo.res_use` array, at the `nParams` parameters of
 /// its realization's kind (an operand width; a multiplexer's fan-in and width;
 /// a chain's or a storage's depth and width). A null `uses` spends nothing.
-MLIR_CAPI_EXPORTED void
+///
+/// False, with no call made, when a cost was not measured at its parameter: a
+/// measurement is read, never extrapolated.
+MLIR_CAPI_EXPORTED bool
 alloEvaluateResourceUse(MlirAttribute uses, intptr_t nParams,
                         const int64_t *params, AlloResourceUseCallback callback,
                         void *userData);
 
-/// Evaluates one `#allo.cost` at `param` without rounding. Separate from the
-/// array evaluator above, whose rounding to a resource count would erase a
-/// sub-nanosecond `dcp.comb` delay.
-MLIR_CAPI_EXPORTED double alloEvaluateCost(MlirAttribute cost, int64_t param);
+/// Evaluates one `#allo.cost` at `param` into `*value`, without rounding.
+/// Separate from the array evaluator above, whose rounding to a resource count
+/// would erase a sub-nanosecond `dcp.comb` delay. False, leaving `*value`
+/// alone, when `param` falls outside the cost's measured points.
+MLIR_CAPI_EXPORTED bool alloEvaluateCost(MlirAttribute cost, int64_t param,
+                                         double *value);
 
 #ifdef __cplusplus
 }

@@ -19,7 +19,12 @@ def _key(op):
     return (kind, op.parse_argument_annotations()[0].name)
 
 
-_LAT = {_key(o): o.timing.latency for o in default_device.operators}
+# Several cores of one kind and signature are candidates, and the library binds
+# the shortest, so that is the latency a test predicts a schedule against.
+_LAT: dict[tuple[str, str], int] = {}
+for _o in default_device.operators:
+    _k = _key(_o)
+    _LAT[_k] = min(_LAT.get(_k, _o.timing.latency), _o.timing.latency)
 
 FADD = FSUB = _LAT[("add", "float32")]  # floating-point add/sub latency (cycles)
 FMUL = _LAT[("mul", "float32")]  # floating-point multiply latency

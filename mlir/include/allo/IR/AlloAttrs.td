@@ -283,9 +283,19 @@ def CostStep      : I32EnumAttrCase<"Step",      3, "step">;
 // between its points.
 def CostTable     : I32EnumAttrCase<"Table",     4, "table">;
 def CostTiled     : I32EnumAttrCase<"Tiled",     5, "tiled">;
+// The same [p0, v0, p1, v1, ...] points as `table`, read continuously: a
+// parameter between two points takes their linear interpolation. This fits a
+// continuous quantity measured at a few points, such as an operator's delay,
+// which a staircase under-states everywhere between them.
+def CostInterp    : I32EnumAttrCase<"Interp",    6, "interp">;
+// coeffs[0] < p ? arms[1](p) : arms[0](p), with both arms costs of any form.
+// Generalizes `step`, whose lower arm is forced proportional and whose upper
+// arm is forced constant.
+def CostPiecewise : I32EnumAttrCase<"Piecewise", 7, "piecewise">;
 def CostFormEnum : I32EnumAttr<"CostFormEnum",
     "Shape of a resource cost as a function of one parameter",
-    [CostConst, CostLinear, CostQuadratic, CostStep, CostTable, CostTiled]> {
+    [CostConst, CostLinear, CostQuadratic, CostStep, CostTable, CostTiled,
+     CostInterp, CostPiecewise]> {
   let cppNamespace = "mlir::allo";
   let genSpecializedAttr = 0;
 }
@@ -299,20 +309,39 @@ def CostAttr : Allo_Attr<"Cost"> {
     measured: an N-bit AND is N LUT6s, an adder adds a carry chain, a divider
     is quadratic. A shape that is not structural belongs in a `table`, which
     is what the measurement produced in the first place.
+
+    A shape holds at every parameter. A `table` and an `interp` hold the
+    measurements themselves, so they answer only between their first and last
+    point: outside that domain there is nothing measured to read, and a caller
+    reports the gap rather than extrapolating one end flat.
   }];
   let parameters = (ins
     "allo::CostFormEnum":$form,
-    "::mlir::DenseF64ArrayAttr":$coeffs);
+    "::mlir::DenseF64ArrayAttr":$coeffs,
+    // The two arms of a `piecewise`, and empty for every other form.
+    OptionalArrayRefParameter<"allo::CostAttr">:$arms);
   let assemblyFormat = [{
-    `<` $form `,` $coeffs `>`
+    `<` $form `,` $coeffs (`,` `[` $arms^ `]`)? `>`
   }];
   let cppNamespace = "mlir::allo";
   let genVerifyDecl = 1;
   let extraClassDeclaration = [{
     /// This cost at \p param, UNROUNDED so a product of factors rounds once at
-    /// the end rather than once per factor. Every form but `tiled`, which reads
-    /// the whole tuple and is evaluated by `evaluateResourceUse` itself.
-    double evaluate(int64_t param) const;
+    /// the end rather than once per factor. A `tiled` factor reads \p param
+    /// alone; its whole-tuple reading is `evaluateResourceUse`'s.
+    ///
+    /// Nullopt where \p param falls outside a `table` or an `interp`'s measured
+    /// points: a measurement is read, never extrapolated, so the caller reports
+    /// the domain `unmeasuredAt` names instead of taking a number.
+    std::optional<double> evaluate(int64_t param) const;
+
+    /// The `table` or `interp` this cost reads at \p param whose measured
+    /// points do not cover it, null wherever `evaluate` answers. A `piecewise`
+    /// answers for the arm it selects.
+    CostAttr unmeasuredAt(int64_t param) const;
+
+    /// The first and last point a `table` or an `interp` was measured at.
+    std::pair<int64_t, int64_t> measuredDomain() const;
   }];
 }
 
@@ -332,8 +361,10 @@ def ResourceUseAttr : Allo_Attr<"ResourceUse"> {
     and no product of one factor per parameter is a sum. Summing costs nothing
     else, since the forms, the arity rule and the evaluator are unchanged.
 
-    A `tiled` factor is the exception to the arity rule and stands alone
-    whatever the kind's arity, because it consumes the whole tuple at once.
+    A single `tiled` factor at arity greater than one is the exception to the
+    arity rule: it consumes the whole tuple at once, `ceil(product/c0)`. A
+    `tiled` among a full set of factors reads its own parameter like any other,
+    `ceil(p_i/c0)`.
   }];
   let parameters = (ins
     "mlir::SymbolRefAttr":$resource,

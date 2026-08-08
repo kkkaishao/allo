@@ -144,17 +144,27 @@ public:
   /// ops. A module with no `dcp.device` yields an empty (all-default) library.
   static OperatorLibrary fromModule(ModuleOp module);
 
-  /// Resolve the characterization for \p op: the matching row (advanced first,
-  /// then abstract last-wins), else the default.
+  /// Resolve the characterization for \p op: the row `selectImplementation`
+  /// picks out of the candidates matching it, else the default row.
+  ///
+  /// Pure and memoized nowhere: the answer depends only on the library and on
+  /// \p op's own name, types and attributes. That is what lets its callers,
+  /// spread from problem building to reification, agree without threading a
+  /// decision between them.
+  ///
+  /// A row the device never measured at \p op's width answers for nothing: the
+  /// gap is reported against \p op and the characterization comes back
+  /// unrealized, which is what the pre-schedule realizability check refuses the
+  /// program on.
   OperatorChar lookup(Operation *op) const;
 
   /// Whether \p op needs an IP realization (a float or advanced compute op) but
-  /// no library row matched, so the caller can report an error instead of
+  /// its candidate set is empty, so the caller can report an error instead of
   /// scheduling it at the default zero latency.
   bool requiresUnmatchedIP(Operation *op) const;
 
-  /// Whether the device provides a direct realization for \p op: a matching IP
-  /// operator or comb row. `legalize-arith` keeps a composite arith op
+  /// Whether the device provides a direct realization for \p op, i.e. its
+  /// candidate set is non-empty. `legalize-arith` keeps a composite arith op
   /// (max/min/maxnum/minnum/ceildiv/floordiv) when this holds and expands it
   /// into primitive arith otherwise.
   bool hasDirectRealization(Operation *op) const;
@@ -166,6 +176,13 @@ public:
   /// The delay from a register through one instance of \p kind at \p width
   /// bits: the floor plus the operator's own, which is what a row contributes
   /// as an incoming delay. 0.0 when the device declares no row for \p kind.
+  ///
+  /// \p width here is a width the compiler picks for a structure it builds (the
+  /// datapath's index width for address arithmetic, one bit for a multiplexer
+  /// level), never a program's operand width, which `lookup` reads. Below the
+  /// row's first measured point it reads that point, which bounds a structure
+  /// narrower than anything the device was characterized at; above the last
+  /// there is no such bound, and the compiler builds nothing that wide.
   double combDelay(OpKind kind, int64_t width) const;
 
   /// What one instance of \p kind at \p width adds to a path that already left
@@ -175,7 +192,9 @@ public:
 
   /// The same two, for a caller holding a reified realization (a
   /// `dcp.compute`'s `comb_kind`). Falls back to the default row, not to 0.0,
-  /// so an `affine.apply` is priced the way it was scheduled.
+  /// so an `affine.apply` is priced the way it was scheduled. \p width is the
+  /// realized operation's own, which `lookup` already read the row at, so a
+  /// reification that got this far is inside the measured points.
   double combDelay(CombOpKindEnum kind, int64_t width) const;
   double combMarginalDelay(CombOpKindEnum kind, int64_t width) const;
 
@@ -211,13 +230,24 @@ public:
 private:
   /// What \p uses spends at \p params, every resource at its price. Null
   /// \p uses is free, which is what a device saying nothing about a row means.
-  int64_t priceOf(ArrayAttr uses, ArrayRef<int64_t> params) const;
+  /// Nullopt where a cost was not measured at its parameter.
+  std::optional<int64_t> priceOf(ArrayAttr uses,
+                                 ArrayRef<int64_t> params) const;
+
+  /// Which of \p candidates \p op is realized on, at \p width bits; null for an
+  /// empty set. An IP outranks the combinational row whatever their latencies,
+  /// since whether a combinational realization fits the period is a scheduling
+  /// question this layer cannot answer. Among IPs the shortest wins, then the
+  /// cheapest, then the first by symbol.
+  const OperatorEntry *
+  selectImplementation(ArrayRef<const OperatorEntry *> candidates,
+                       int64_t width) const;
 
   /// The device's combinational row for \p kind, null when it declares none.
-  /// Last wins, like `matchEntry`.
+  /// The last declared wins, as in `selectImplementation`.
   const OperatorEntry *combEntry(OpKind kind) const;
 
-  std::vector<OperatorEntry> advancedEntries; // matched first (raw name)
+  std::vector<OperatorEntry> advancedEntries; // rows keyed by raw MLIR name
   std::vector<OperatorEntry> entries;         // abstract rows
   OperatorEntry defaultEntry;
   llvm::StringMap<int64_t> resourcePrices; // one `dcp.resource`, priced

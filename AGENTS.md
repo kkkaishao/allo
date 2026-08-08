@@ -13,7 +13,7 @@
   Avoid full suite run as far as possible.
 - Set `XILINX_VITIS` to any invalid path to skip tests for synthesis with Vitis to save time
 - Install the developer toolchain with `pip install -e .[dev]` to run the RTL cosim tests
-- Run the RTL cosim tests in parallel with `pytest tests/rtl -n [jobs]` (pytest-xdist)
+- Run the RTL cosim tests in parallel with `pytest tests/rtl -n [jobs]` (pytest-xdist).
 
 # Running
 - Use `conda run -n allo-rtlgen <command>` to run commands in the conda environment
@@ -24,7 +24,6 @@
 - Make small, targeted diffs rather than large refactors, and always be concise.
 - If user explicitly requests a refactor, then larger diffs are acceptable,
   prefer cleaner code structure for future maintainability at this time.
-- Don't abuse comments to explain code. Write concise comments to explain the core logic.
 - Use Modern C++ features and best practices in C++ code
 - Use `assert` to enforce invariants and assumptions that should always hold by the design,
   and fail loudly during development instead of being silently tolerated.
@@ -32,6 +31,14 @@
   even though it may take more effort and break some regression tests in the short term.
 - Don't over encapsulate code in helper functions, e.g. encapsulating one or two lines
   of logic in a free function, which can make the code harder to read and understand.
+
+# Comment Style
+- DO NOT include any reference to intermediate design documents.
+- DO NOT include too much reasoning or explanation in comments.
+- DO NOT drafting design documents in comments.
+- DO NOT continuously append comments when the code is modified, instead, update the comments
+  to reflect the current state of the code.
+- The comments should always be publicly understandable and self-contained. Always be concise.
 
 # Don'ts
 - Do not modify repository structure without approval

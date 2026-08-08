@@ -155,8 +155,9 @@ class OperatorIP(IP[P, R]):
     of one a kernel instantiates by name.
 
     ``optype`` is the abstract kind it realizes; every op of that kind whose
-    signature it fits binds to it, and a device declares at most one such core
-    per (kind, signature).
+    signature it fits binds to it. A device may declare several such cores per
+    (kind, signature), which are candidates the operator library chooses
+    between.
     """
 
     def __init__(

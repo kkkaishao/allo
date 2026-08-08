@@ -433,17 +433,14 @@ static LogicalResult verifyResourceUses(Operation *op, ArrayAttr uses,
       return op->emitOpError(
           "'uses' holds an entry that is not an #allo.res_use");
     ArrayRef<CostAttr> factors = ru.getFactors();
-    bool tiled = llvm::any_of(
-        factors, [](CostAttr c) { return c.getForm() == CostFormEnum::Tiled; });
-    if (tiled && factors.size() != 1)
-      return op->emitOpError("a 'tiled' cost of '")
-             << ru.getResource()
-             << "' consumes the whole parameter tuple, so it stands alone "
-                "rather than multiplying another factor";
-    if (!tiled && factors.size() != arity)
-      return op->emitOpError("is characterized by ")
-             << params << ", so its cost of '" << ru.getResource() << "' takes "
-             << arity << " factor(s), not " << factors.size();
+    // One factor per parameter, or the single `tiled` that reads them together.
+    if (factors.size() == arity)
+      continue;
+    if (factors.size() == 1 && factors.front().getForm() == CostFormEnum::Tiled)
+      continue;
+    return op->emitOpError("is characterized by ")
+           << params << ", so its cost of '" << ru.getResource() << "' takes "
+           << arity << " factor(s) or one 'tiled', not " << factors.size();
   }
   return success();
 }
@@ -467,11 +464,15 @@ static LogicalResult verifyUsesResolve(Operation *op, ArrayAttr uses,
 LogicalResult DCPathCombOp::verify() {
   // Sampled at representative widths rather than checked symbolically: a cost
   // form is piecewise, so non-negativity is not a property of the
-  // coefficients.
-  for (int64_t w : {1, 8, 16, 32, 64})
-    if (getDelay().evaluate(w) < 0.0)
+  // coefficients. A width the row was not measured at is skipped rather than
+  // sampled: the measured domain is part of the declaration, and no fabric
+  // characterizes a one-bit operator.
+  for (int64_t w : {1, 8, 16, 32, 64}) {
+    std::optional<double> d = getDelay().evaluate(w);
+    if (d && *d < 0.0)
       return emitOpError("delay must be non-negative, but is ")
-             << getDelay().evaluate(w) << " ns at width " << w;
+             << *d << " ns at width " << w;
+  }
   return verifyResourceUses(*this, getUsesAttr(), 1,
                             "one parameter (an operand width)");
 }
@@ -1297,10 +1298,12 @@ OperandRange DCPathPipelineOp::getCarriedValues() {
 //===----------------------------------------------------------------------===//
 
 // How many coefficients each form carries. A table is [p0, v0, p1, v1, ...],
-// so it is even and non-empty rather than a fixed count.
+// so it is even and non-empty rather than a fixed count. Only `piecewise`
+// carries arms.
 LogicalResult
 CostAttr::verify(llvm::function_ref<InFlightDiagnostic()> emitError,
-                 CostFormEnum form, DenseF64ArrayAttr coeffsAttr) {
+                 CostFormEnum form, DenseF64ArrayAttr coeffsAttr,
+                 llvm::ArrayRef<CostAttr> arms) {
   if (!coeffsAttr)
     return emitError() << "a cost needs its coefficients";
   llvm::ArrayRef<double> coeffs = coeffsAttr.asArrayRef();
@@ -1310,6 +1313,10 @@ CostAttr::verify(llvm::function_ref<InFlightDiagnostic()> emitError,
     return emitError() << stringifyCostFormEnum(form) << " takes " << n
                        << " coefficient(s), got " << coeffs.size();
   };
+  size_t wantArms = form == CostFormEnum::Piecewise ? 2 : 0;
+  if (arms.size() != wantArms)
+    return emitError() << stringifyCostFormEnum(form) << " takes " << wantArms
+                       << " arm(s), got " << arms.size();
   switch (form) {
   case CostFormEnum::Const:
   case CostFormEnum::Quadratic:
@@ -1326,19 +1333,51 @@ CostAttr::verify(llvm::function_ref<InFlightDiagnostic()> emitError,
     return need(2);
   case CostFormEnum::Step:
     return need(3);
+  case CostFormEnum::Piecewise:
+    // The one coefficient is the breakpoint; the arms carry the shapes.
+    return need(1);
   case CostFormEnum::Table:
+  case CostFormEnum::Interp:
     if (coeffs.empty() || coeffs.size() % 2 != 0)
-      return emitError() << "table takes [point, value] pairs, got "
-                         << coeffs.size() << " coefficient(s)";
+      return emitError() << stringifyCostFormEnum(form)
+                         << " takes [point, value] pairs, got " << coeffs.size()
+                         << " coefficient(s)";
     for (size_t i = 2; i < coeffs.size(); i += 2)
       if (coeffs[i] <= coeffs[i - 2])
-        return emitError() << "table points must ascend";
+        return emitError() << stringifyCostFormEnum(form)
+                           << " points must ascend";
     return success();
   }
   llvm_unreachable("unhandled CostFormEnum");
 }
 
-double CostAttr::evaluate(int64_t param) const {
+CostAttr CostAttr::unmeasuredAt(int64_t param) const {
+  llvm::ArrayRef<double> c = getCoeffs().asArrayRef();
+  double p = static_cast<double>(param);
+  switch (getForm()) {
+  case CostFormEnum::Table:
+  case CostFormEnum::Interp:
+    // Only above the last point. Below the first, the narrowest measurement
+    // bounds a structure narrower than anything the row was measured at, so
+    // reading it over-states rather than guesses.
+    return p > c[c.size() - 2] ? *this : CostAttr();
+  case CostFormEnum::Piecewise:
+    return getArms()[p < c[0] ? 0 : 1].unmeasuredAt(param);
+  default:
+    // Every other form is a shape, and a shape holds at every parameter.
+    return CostAttr();
+  }
+}
+
+std::pair<int64_t, int64_t> CostAttr::measuredDomain() const {
+  assert(
+      (getForm() == CostFormEnum::Table || getForm() == CostFormEnum::Interp) &&
+      "only measured points carry a domain");
+  llvm::ArrayRef<double> c = getCoeffs().asArrayRef();
+  return {static_cast<int64_t>(c[0]), static_cast<int64_t>(c[c.size() - 2])};
+}
+
+std::optional<double> CostAttr::evaluate(int64_t param) const {
   llvm::ArrayRef<double> c = getCoeffs().asArrayRef();
   double p = static_cast<double>(param);
   switch (getForm()) {
@@ -1351,19 +1390,33 @@ double CostAttr::evaluate(int64_t param) const {
   case CostFormEnum::Step:
     return p < c[0] ? c[1] * p : c[2];
   case CostFormEnum::Table: {
-    // Below the first point the first value stands; the table is ascending, so
-    // the last point at or under `p` is the row.
+    // The table is ascending, so the last point at or under `p` is the row.
+    if (unmeasuredAt(param))
+      return std::nullopt;
     double v = c[1];
     for (size_t i = 0; i < c.size(); i += 2)
       if (c[i] <= p)
         v = c[i + 1];
     return v;
   }
+  case CostFormEnum::Interp:
+    if (unmeasuredAt(param))
+      return std::nullopt;
+    if (p <= c[0])
+      return c[1]; // the first measurement stands below itself
+    for (size_t i = 2; i < c.size(); i += 2)
+      if (p <= c[i])
+        return c[i - 1] +
+               (p - c[i - 2]) / (c[i] - c[i - 2]) * (c[i + 1] - c[i - 1]);
+    return c[1]; // a single measured point, read at that point
   case CostFormEnum::Tiled:
-    break;
+    // One parameter's worth of tiles. The whole-tuple reading, where the
+    // product sits inside the ceiling, is `evaluateResourceUse`'s.
+    return std::ceil(p / c[0]);
+  case CostFormEnum::Piecewise:
+    return getArms()[p < c[0] ? 0 : 1].evaluate(param);
   }
-  llvm_unreachable("tiled reads the whole parameter tuple, so it has no value "
-                   "at one parameter; evaluateResourceUse computes it");
+  llvm_unreachable("unhandled CostFormEnum");
 }
 
 LogicalResult
@@ -1375,7 +1428,22 @@ ResourceUseAttr::verify(llvm::function_ref<InFlightDiagnostic()> emitError,
   return success();
 }
 
-llvm::SmallVector<std::pair<SymbolRefAttr, int64_t>>
+CostAttr mlir::allo::unmeasuredUse(ArrayAttr uses,
+                                   llvm::ArrayRef<int64_t> params) {
+  if (uses)
+    for (Attribute use : uses) {
+      llvm::ArrayRef<CostAttr> factors =
+          cast<ResourceUseAttr>(use).getFactors();
+      if (factors.size() != params.size())
+        continue; // a lone `tiled`, which is a shape over the whole tuple
+      for (auto [factor, param] : llvm::zip(factors, params))
+        if (CostAttr bad = factor.unmeasuredAt(param))
+          return bad;
+    }
+  return CostAttr();
+}
+
+std::optional<llvm::SmallVector<std::pair<SymbolRefAttr, int64_t>>>
 mlir::allo::evaluateResourceUse(ArrayAttr uses,
                                 llvm::ArrayRef<int64_t> params) {
   // One running total per resource, in the order the resources first appear.
@@ -1387,9 +1455,9 @@ mlir::allo::evaluateResourceUse(ArrayAttr uses,
       double term = 1.0;
       if (factors.size() == 1 &&
           factors.front().getForm() == CostFormEnum::Tiled) {
-        // The one form that reads the WHOLE tuple: a tile holds so many bits
-        // however the array is cut, so the product sits inside the ceiling and
-        // the arity rule above does not apply to it.
+        // A lone `tiled` reads the whole tuple: a tile holds so many bits
+        // however the array is cut, so the product sits inside the ceiling. One
+        // among a full set of factors instead tiles its own parameter.
         assert(!params.empty() &&
                "a tiled cost needs a parameter tuple to tile");
         double bits = 1.0;
@@ -1399,8 +1467,12 @@ mlir::allo::evaluateResourceUse(ArrayAttr uses,
       } else {
         assert(factors.size() == params.size() &&
                "a resource cost carries one factor per parameter of its kind");
-        for (auto [factor, param] : llvm::zip(factors, params))
-          term *= factor.evaluate(param);
+        for (auto [factor, param] : llvm::zip(factors, params)) {
+          std::optional<double> v = factor.evaluate(param);
+          if (!v)
+            return std::nullopt;
+          term *= *v;
+        }
       }
       auto *it = llvm::find_if(
           totals, [&](auto &total) { return total.first == ru.getResource(); });

@@ -133,39 +133,6 @@ NB_MODULE(_allo, m) {
   allo.def("has_exact_scheduler", &alloHasExactScheduler);
 
   //===--------------------------------------------------------------------===//
-  // The device's cost evaluator. Exposed so a Python consumer prices through
-  // `CostAttr::evaluate` rather than through a second copy of the shapes; two
-  // implementations of a measured model is the state the resource model exists
-  // to end.
-  //===--------------------------------------------------------------------===//
-  allo.def(
-      "evaluate_resource_use",
-      [](MlirAttribute uses, const std::vector<int64_t> &params) {
-        std::vector<std::pair<std::string, int64_t>> spent;
-        alloEvaluateResourceUse(
-            uses, static_cast<intptr_t>(params.size()), params.data(),
-            [](MlirStringRef resource, int64_t amount, void *userData) {
-              static_cast<std::vector<std::pair<std::string, int64_t>> *>(
-                  userData)
-                  ->emplace_back(std::string(resource.data, resource.length),
-                                 amount);
-            },
-            &spent);
-        return spent;
-      },
-      nb::arg("uses"), nb::arg("params"),
-      "What an #allo.res_use array spends at a realization's parameter tuple, "
-      "as (resource, amount) pairs.");
-  allo.def(
-      "evaluate_cost",
-      [](MlirAttribute cost, int64_t param) {
-        return alloEvaluateCost(cost, param);
-      },
-      nb::arg("cost"), nb::arg("param"),
-      "One #allo.cost at one parameter, unrounded: what a `dcp.comb` row's "
-      "delay is at an operand width.");
-
-  //===--------------------------------------------------------------------===//
   // schedule
   //===--------------------------------------------------------------------===//
   auto schedule = m.def_submodule("schedule", "schedule analysis");

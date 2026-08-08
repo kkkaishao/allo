@@ -561,7 +561,9 @@ def test_nonstandard_width_agrees_with_cpu():
     y = rng.integers(-(2**31), 2**31, size=8, dtype=np.int64).astype(np.int32)
     exact = sum(int(a) * int(b) for a, b in zip(x, y))
     assert ((exact + 2**47) % 2**48) - 2**47 < 0, "the wrapped value must be negative"
-    assert int(_to_rtl(dot48).cosim(x, y).result) == int(dot48(x, y))
+    # The product narrows to 48 bits, and a 48-bit combinational multiply
+    # measures past the default clock's period on this part.
+    assert int(_to_rtl(dot48, freq_mhz=200).cosim(x, y).result) == int(dot48(x, y))
 
 
 # A boundary made of ports rather than C types carries any bit layout, which is

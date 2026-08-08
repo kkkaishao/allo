@@ -9,16 +9,12 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import NamedTuple
 
-from ..device import CombKind, Cost, Resource
+from ..device import CombKind, Cost, Linear, Piecewise, Resource, Table
 
 #: Below this depth a delay chain stays in flip-flops; at or above it Vivado
-#: extracts a shift register, even with every stage reset.
+#: extracts a shift register, even with every stage reset. An SRL32E holds 32
+#: stages, so an extracted chain occupies ``ceil(depth/32)`` SLICEM sites a bit.
 SRL_MIN_DEPTH = 4
-
-#: SLICEM sites per bit of an extracted chain. An SRL32E holds 32 stages, so the
-#: staircase is ``ceil(depth/32)`` from the extraction threshold on.
-SRL_SITES_PER_BIT = {1: 0, SRL_MIN_DEPTH: 1}
-SRL_SITES_PER_BIT.update({32 * i + 1: i + 1 for i in range(1, 17)})
 
 #: LUTs per bit of a ``k``-source one-hot AND-OR select, measured for k = 2..40
 #: and listed where the staircase steps. A LUT6 absorbs three (data, select)
@@ -43,6 +39,17 @@ MUX_LUT_PER_BIT = {
     36: 15,
     39: 16,
 }
+
+#: LUTs per bit of a select, as a cost over its fan-in: the measured staircase
+#: across the swept range, and past it the least-squares line through those
+#: points (slope 0.408449, intercept 0.263495, within 0.20 LUT of the last
+#: measurement). A region shares an operator over more sources than the sweep
+#: covered, where a staircase would clamp flat and charge nothing for the rest.
+MUX_LUT_COST = Piecewise(
+    max(MUX_LUT_PER_BIT) + 1,
+    Table(MUX_LUT_PER_BIT),
+    Linear(0.4084490071, base=0.2634952767),
+)
 
 #: Fabric LUTs per bit of an array that failed RAM inference. Every word needs a
 #: data multiplexer and a write decode, so it scales with the whole array.
@@ -112,7 +119,13 @@ class StorageSpec(NamedTuple):
 class IPRow(NamedTuple):
     """Latency and area of one operator core on one fabric, from a single
     measurement. A core pipelined to another latency is a separate row with its
-    own symbol and area."""
+    own symbol and area.
+
+    Several rows of one archetype are candidates the library chooses between.
+    ``mnemonic`` overrides the stem of the symbol, which is how two rows that
+    share a latency are still named apart; ``None`` takes the archetype's own.
+    """
 
     latency: int
     area: Mapping[str, int]  # resource name -> count, in the fabric's vocabulary
+    mnemonic: str | None = None

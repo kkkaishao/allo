@@ -16,6 +16,10 @@ from .._mlir_libs._allo import (
     AssumeDepDirAttr,
     MemoryKindAttr,
     DeterminacyAttr,
+    OpKindAttr,
     CombOpKindAttr,
     StallContractAttr,
+    CostFormAttr,
+    CostAttr,
+    ResourceUseAttr,
 )
