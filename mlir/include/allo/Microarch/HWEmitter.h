@@ -13,6 +13,7 @@
 #ifndef ALLO_MICROARCH_HWEMIT_H
 #define ALLO_MICROARCH_HWEMIT_H
 
+#include "allo/IR/AlloOps.h" // kMemPortAttr
 #include "allo/Microarch/Naming.h"
 #include "allo/Microarch/Primitives.h"
 #include "circt/Dialect/HW/HWOps.h"
@@ -276,27 +277,18 @@ struct DatapathEmitter {
   };
   DenseMap<unsigned, SmallVector<SharedWrite, 2>> sharedWrites; // by MemId
 
-  /// The same, for a store to an EXTERNAL array whose boundary write port
-  /// groups were merged onto its colours (`MemUnit::writesIndependent`): the
-  /// group is a module output, so several stores drive it and only
-  /// `finalizeBoundaryWritePorts` can, once every region has emitted. Indexed
-  /// by `MemUnit::Access::portIdx`, the group's slot in `Datapath::writePorts`.
+  /// The same, for a store to an external array. The port group is a module
+  /// output that several stores may drive, so only `finalizeBoundaryWritePorts`
+  /// drives it, once every region has emitted. Indexed by
+  /// `MemUnit::Access::portIdx`, the group's slot in `Datapath::writePorts`.
   struct BoundaryWrite {
     Value addr;
     Value data;
     Value we;
   };
-  DenseMap<unsigned, SmallVector<BoundaryWrite, 2>> boundaryWrites;
-
-  /// Which of the array's write ports each access is coloured onto
-  /// (`Datapath::writePortColouring`), indexed as `MemUnit::accesses`. Present
-  /// with an EMPTY vector for an array only a child writes, whose writes still
-  /// share port 0. An array is absent when the colouring refused it, and when
-  /// it presents no single addressable write port to colour: an external or
-  /// skewed one, or one a dynamically banked store drives every bank of behind
-  /// a demux. Held because the colouring is a clique search and every store
-  /// would otherwise redo it.
-  DenseMap<unsigned, SmallVector<unsigned>> writePortOf; // by MemId
+  /// A MapVector, not a DenseMap: `finalizeBoundaryWritePorts` iterates it to
+  /// drive the ports, and the emitted module must not depend on a hash order.
+  llvm::MapVector<unsigned, SmallVector<BoundaryWrite, 2>> boundaryWrites;
 
   /// A kernel-local channel's body wires: what a boundary channel reads off its
   /// module ports, an internal one reads off its own `seq.fifo`. Backedges,
@@ -419,7 +411,20 @@ struct DatapathEmitter {
   /// Backedge every unit output before any consumer resolves it, so a read
   /// address or another unit input may reference a unit emitted later.
   void declareUnits(const uarch::RegionBlock &rb);
-  void emitInternalReads(const uarch::RegionBlock &rb);
+  void emitInternalReads(const uarch::RegionBlock &rb, Value issue);
+  /// The address one read port presents for the accesses bound to it: each
+  /// drives it on its own issue cycle, held with the datapath so a read frozen
+  /// by back-pressure keeps re-presenting its address. \p idxs indexes
+  /// `m.accesses`, all in the region \p sh and \p issue belong to.
+  Value sharedAddress(const uarch::MemUnit &m, ArrayRef<unsigned> idxs,
+                      Value issue, const StallShell &sh);
+  /// Stamp an emitted `seq.read`/`seq.write` with the physical port it drives
+  /// (`kMemPortAttr`), which puts a port's read and write in one `always`
+  /// block and so makes them one port of a dual-port RAM.
+  template <typename OpT> OpT atPort(OpT op, unsigned port) {
+    op->setAttr(kMemPortAttr, c.b.getI64IntegerAttr(port));
+    return op;
+  }
   /// The skewed halves of the two above: one port per bank per LANE instead of
   /// per bank per access, the bandwidth a skewed layout exists to buy.
   void emitSkewedInternalReads(const uarch::RegionBlock &rb);
@@ -430,11 +435,11 @@ struct DatapathEmitter {
   /// bank's data port, and mux by the runtime bank. Bound into readData before
   /// emitUnits consumes it, like emitInternalReads.
   void emitExternalReads(const uarch::RegionBlock &rb);
-  /// Drive the read-address port of each SINGLE-INTERFACE external read in
-  /// region \p rb (unbanked or statically banked); the data-dependent ones are
-  /// `emitExternalReads`. Runs after the units, so an address computed by one
-  /// resolves to its filled value rather than a dangling backedge.
-  void emitExternalReadAddrs(const uarch::RegionBlock &rb);
+  /// Drive the read-address port of each single-interface external port group
+  /// in region \p rb (unbanked or statically banked); the data-dependent ones
+  /// are `emitExternalReads`. Runs after the units, so an address computed by
+  /// one resolves to its filled value rather than a dangling backedge.
+  void emitExternalReadAddrs(const uarch::RegionBlock &rb, Value issue);
   /// Where a region's units are being emitted from, which decides whether a
   /// recurrence input re-injects its reduction identity.
   enum class UnitMode {

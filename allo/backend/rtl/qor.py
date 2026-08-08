@@ -12,7 +12,7 @@ from dataclasses import dataclass
 
 from .device import CombKind, Device
 from .devices import default_device
-from .reports.microarch import Memory, RegRole, Unit
+from .reports.microarch import RegRole, Unit
 from .reports.compile import CompileReport
 
 #: The device kind that prices a native combinational unit, keyed by the
@@ -195,30 +195,6 @@ def _unit_width(unit: Unit) -> int:
     return max([unit.width, *widths])
 
 
-def _infers_ram(mem: Memory, device: Device) -> bool:
-    """Whether the synthesizer recognizes a RAM template for this array.
-
-    The resolved storage row's ports decide it, the same budget the emitter
-    holds itself to: the reads have to fit its read ports and the writers its
-    write ports. Several writers fit only where the schedule proved they never
-    collide, which the emitter proves for writers of one region or ports of one
-    child; that shape is what is read back here, since the decision itself is
-    taken during emission."""
-    row = device.storage.get(mem.storage)
-    max_reads = row.max_reads if row is not None else None
-    max_writes = row.max_writes if row is not None else None
-    if max_reads is not None and mem.cost.read_ports > max_reads:
-        return False
-    ports = mem.cost.ports_needed_write
-    if max_writes is not None and ports > max_writes:
-        return False
-    if ports <= 1:
-        return True
-    return (mem.cost.writing_regions <= 1 and mem.cost.writing_calls == 0) or (
-        mem.writes == 0 and mem.cost.writing_calls == 1
-    )
-
-
 # One pass over the report, one bucket per kind of structure it publishes.
 # pylint: disable-next=too-many-locals
 def estimate(report: CompileReport, device: Device = default_device) -> QoR:
@@ -288,25 +264,40 @@ def estimate(report: CompileReport, device: Device = default_device) -> QoR:
                 charge("muxes", f.func, one * m.count)
 
         for m in f.mems:
-            if m.external or m.scattered:
-                continue  # a boundary port, or cells the register ledger holds
-            if _infers_ram(m, device):
-                mem_bits += m.bits
-                # A block RAM or UltraRAM the device was ASKED for is charged in
-                # its own tiles; which primitive an INFERRED RAM lands in the
-                # model cannot say, and the measurement says it costs no fabric.
-                row = device.storage.get(m.storage)
-                tiled = ("bram36", "uram288")
-                if row is not None and any(r in tiled for r, _ in row.uses):
-                    charge(
-                        "memories",
-                        f.func,
-                        Utilization.of(price(row.uses, (m.depth_words, m.width))),
-                    )
+            # A boundary port, or cells the register ledger already holds. The
+            # emitter's own classification, not a predicate re-derived here:
+            # deciding it a second time is how the estimate and the design come
+            # to disagree.
+            if m.realization in {"boundary", "scatter"}:
                 continue
-            bank = Utilization.of(price(regfile, (m.depth_words, m.width)))
-            charge("memories", f.func, bank * m.banks)
-            regfile_arrays += 1
+            if m.realization == "register_file":
+                bank = Utilization.of(price(regfile, (m.depth_words, m.width)))
+                charge("memories", f.func, bank * m.banks)
+                regfile_arrays += 1
+                continue
+            if m.realization == "rom":
+                # A read-only table is emitted as a constant array read by an
+                # index, so the part builds it out of logic and it holds no
+                # memory bits at all. Its `storage` row is only where its read
+                # latency came from; nothing is realized there.
+                charge(
+                    "memories",
+                    f.func,
+                    Utilization.of(price(device.rom_uses, (m.depth_words, m.width))),
+                )
+                continue
+            mem_bits += m.bits
+            # A block RAM or UltraRAM the device was ASKED for is charged in
+            # its own tiles; which primitive an INFERRED RAM lands in the
+            # model cannot say, and the measurement says it costs no fabric.
+            row = device.storage.get(m.storage)
+            tiled = ("bram36", "uram288")
+            if row is not None and any(r in tiled for r, _ in row.uses):
+                charge(
+                    "memories",
+                    f.func,
+                    Utilization.of(price(row.uses, (m.depth_words, m.width))),
+                )
 
         # A channel between two children is a queue this module builds, priced as
         # a register file since the register ledger does not hold it. A channel

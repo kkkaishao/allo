@@ -64,11 +64,58 @@ static AttrT carrierAttr(Value memRef, StringRef name) {
 // `impl` is an absent CHOICE, resolved against the library's default.
 namespace {
 struct BindStorage {
-  MemoryPortEnum port = MemoryPortEnum::TrueDualPort;
+  // The topology asked for, empty where the directive names none. Absent is not
+  // the dual-port default: an array that asked for nothing takes whatever its
+  // realization has, and only an explicit topology narrows that.
+  std::optional<MemoryPortEnum> port;
   MemoryKindEnum kind = MemoryKindEnum::RAM;
   StringRef storage; // empty: no explicit choice, not "no storage"
 };
 } // namespace
+
+// The tighter of two limits on one axis; nullopt is no limit and yields.
+static std::optional<unsigned> tighter(std::optional<unsigned> a,
+                                       std::optional<unsigned> b) {
+  if (!a)
+    return b;
+  if (!b)
+    return a;
+  return std::min(*a, *b);
+}
+
+StoragePorts StoragePorts::meet(const StoragePorts &other) const {
+  return {tighter(reads, other.reads), tighter(writes, other.writes),
+          tighter(pool, other.pool)};
+}
+
+bool StoragePorts::exceededBy(const StoragePorts &other) const {
+  auto over = [](std::optional<unsigned> have, std::optional<unsigned> want) {
+    return have && want && *want > *have;
+  };
+  return over(reads, other.reads) || over(writes, other.writes) ||
+         over(pool, other.pool) ||
+         // A pool bounds both directions, so a topology asking for more
+         // accesses at once than a poolless row serves in either direction
+         // exceeds it just as directly.
+         over(reads, other.pool) || over(writes, other.pool);
+}
+
+bool StoragePorts::fit(unsigned nreads, unsigned nwrites,
+                       unsigned nports) const {
+  return (!reads || nreads <= *reads) && (!writes || nwrites <= *writes) &&
+         (!pool || nports <= *pool);
+}
+
+std::string StoragePorts::describe() const {
+  auto axis = [](std::optional<unsigned> n) {
+    return n ? std::to_string(*n) : std::string("unlimited");
+  };
+  std::string s = axis(reads) + " read / " + axis(writes) + " write";
+  if (pool)
+    s +=
+        " over " + axis(pool) + (*pool == 1 ? " shared port" : " shared ports");
+  return s;
+}
 
 static BindStorage parseBindStorage(DictionaryAttr bind) {
   BindStorage bs;
@@ -90,7 +137,7 @@ static BindStorage parseBindStorage(DictionaryAttr bind) {
             .Default(std::nullopt);
     assert(port && "unknown allo.bind.storage type= (the frontend's "
                    "BindStorageType vocabulary drifted from this switch)");
-    bs.port = port.value_or(MemoryPortEnum::TrueDualPort);
+    bs.port = port;
     bs.kind = t.starts_with("rom") ? MemoryKindEnum::ROM : MemoryKindEnum::RAM;
   }
   // `impl` NAMES a `dcp.storage` of the device, so there is no table here to
@@ -101,9 +148,35 @@ static BindStorage parseBindStorage(DictionaryAttr bind) {
   return bs;
 }
 
-// Concurrent ports of a topology (per bank).
-static unsigned portCount(MemoryPortEnum p) {
-  return p == MemoryPortEnum::SinglePort ? 1u : 2u;
+// What a topology asks for, per bank. A SimpleDualPort (S2P) RAM has one
+// dedicated port of each direction, so its two ends never contend and it
+// declares no pool; every other topology shares its ports between the
+// directions.
+static StoragePorts topologyPorts(MemoryPortEnum p) {
+  switch (p) {
+  case MemoryPortEnum::SinglePort:
+    return {1u, 1u, 1u};
+  case MemoryPortEnum::SimpleDualPort:
+    return {1u, 1u, std::nullopt};
+  case MemoryPortEnum::TrueDualPort:
+    return {2u, 2u, 2u};
+  }
+  llvm_unreachable("unhandled MemoryPortEnum");
+}
+
+std::optional<StoragePorts> allo::requestedPortsOf(Value memref) {
+  auto bs =
+      parseBindStorage(carrierAttr<DictionaryAttr>(memref, kBindStorageAttr));
+  if (!bs.port)
+    return std::nullopt;
+  StoragePorts p = topologyPorts(*bs.port);
+  // A ROM has no write port to dedicate, so its whole topology is reads. An
+  // `rom_2p` serves two of them where a `ram_2p` serves one of each.
+  if (bs.kind == MemoryKindEnum::ROM) {
+    unsigned n = p.pool.value_or(p.reads.value_or(0) + p.writes.value_or(0));
+    p = {n, n, n};
+  }
+  return p;
 }
 
 std::optional<Attribute> mlir::allo::globalInitOf(Value memRef) {
@@ -160,13 +233,11 @@ void MemoryBankModel::observe(Operation *op) {
 void MemoryBankModel::finalize(const MemoryLibrary &lib) {
   for (auto &[root, info] : byMemref) {
     // A stream channel is a FIFO, not an array: one transfer per end per cycle,
-    // no banking or storage-impl axis to characterize, two independent ends,
-    // i.e. `splitRW` at one port each. `characterize` would cast its type to
+    // no banking or storage-impl axis to characterize, and two independent ends
+    // (one port each, no pool). `characterize` would cast its type to
     // MemRefType.
     if (isa<StreamType>(root.getType())) {
-      info.splitRW = true;
-      info.readPorts = 1;
-      info.writePorts = 1;
+      info.ports = {1u, 1u, std::nullopt};
       // Its default `layout` is the single unbanked one, and it resolves no
       // `storage` realization, which nothing here asks a stream for.
       continue;
@@ -187,19 +258,17 @@ MemoryBankModel::resources(Operation *op) const {
   if (info.unlimited())
     return {};
 
-  // The pool this access draws from, and its ports per bank. Split (S2P) gives
-  // dedicated read/write pools that never contend, shared one `_rw` pool.
+  // The pools this access draws from: its own direction's, where the row caps
+  // that direction, and the shared pool, where the row has one. An access holds
+  // both at once, which makes two writers and a concurrent reader three ports
+  // of a block RAM rather than two writes plus one read.
   auto a = asMemAccess(op);
   assert(a && "storageOf named a storage root, so this is a memory access");
-  StringRef dir;
-  unsigned portsPerBank;
-  if (info.splitRW) {
-    dir = a->isWrite ? "_w" : "_r";
-    portsPerBank = a->isWrite ? info.writePorts : info.readPorts;
-  } else {
-    dir = "_rw";
-    portsPerBank = info.sharedPorts;
-  }
+  SmallVector<std::pair<StringRef, unsigned>> pools;
+  if (auto dir = a->isWrite ? info.ports.writes : info.ports.reads)
+    pools.emplace_back(a->isWrite ? "_w" : "_r", *dir);
+  if (info.ports.pool)
+    pools.emplace_back("_rw", *info.ports.pool);
   std::string base = "mem_" + std::to_string(hash_value(memRef));
 
   // The banks this access occupies: its assigned bank alone, or every one of
@@ -211,8 +280,8 @@ MemoryBankModel::resources(Operation *op) const {
     bank = assignedBankOf(op);
   SmallVector<std::pair<std::string, unsigned>> ports;
   auto take = [&](unsigned k) {
-    ports.emplace_back(base + "_b" + std::to_string(k) + dir.str(),
-                       portsPerBank);
+    for (auto &[dir, limit] : pools)
+      ports.emplace_back(base + "_b" + std::to_string(k) + dir.str(), limit);
   };
   if (numBanks == 1 || bank)
     take(bank.value_or(0));
@@ -667,7 +736,10 @@ MemoryLibrary MemoryLibrary::fromModule(ModuleOp module) {
   for (auto s : body.getOps<dcp::DCPathStorageOp>()) {
     m.storage.push_back({s.getSymName().str(),
                          timing(s),
-                         {limit(s.getMaxReads()), limit(s.getMaxWrites())}});
+                         {limit(s.getMaxReads()), limit(s.getMaxWrites()),
+                          limit(s.getMaxPorts())},
+                         s.getRamStyle().value_or("").str(),
+                         !s.getNoInit()});
     if (s.getIsDefault())
       m.defaultStorage = s.getSymName().str();
     if (s.getIsScatter())
@@ -678,29 +750,21 @@ MemoryLibrary MemoryLibrary::fromModule(ModuleOp module) {
   return m;
 }
 
-MemKindTiming MemoryLibrary::timing(StringRef name) const {
+const StorageRealization *MemoryLibrary::row(StringRef name) const {
   for (const StorageRealization &s : storage)
     if (s.name == name)
-      return s.timing;
+      return &s;
+  return nullptr;
+}
+
+MemKindTiming MemoryLibrary::timing(StringRef name) const {
+  const StorageRealization *s = row(name);
   // `PreVerification` rejects an array resolving to a realization the device
   // does not declare, so reaching here means that check was bypassed and the
   // access would schedule at latency 0.
-  assert(false && "storage realization not declared by the device -> silent "
-                  "latency-0 access");
-  static constexpr MemKindTiming zero;
-  return zero;
-}
-
-StoragePorts MemoryLibrary::ports(StringRef name) const {
-  for (const StorageRealization &s : storage)
-    if (s.name == name)
-      return s.ports;
-  return {};
-}
-
-bool MemoryLibrary::declares(StringRef name) const {
-  return llvm::any_of(
-      storage, [&](const StorageRealization &s) { return s.name == name; });
+  assert(s && "storage realization not declared by the device -> silent "
+              "latency-0 access");
+  return s ? s->timing : MemKindTiming{};
 }
 
 MemoryLibrary::Timing MemoryLibrary::timing(Operation *op) const {
@@ -727,20 +791,19 @@ MemoryLibrary::Timing MemoryLibrary::timing(Operation *op) const {
 
 MemoryChar allo::characterize(Value memref, const MemoryLibrary &lib) {
   MemoryChar c;
-  auto bs =
-      parseBindStorage(carrierAttr<DictionaryAttr>(memref, kBindStorageAttr));
   c.constantTable = isConstantTable(memref);
-  // A SimpleDualPort (S2P) RAM has a dedicated read and write port; every other
-  // topology shares its ports, a ROM having no write port to dedicate.
-  bool readOnly = bs.kind == MemoryKindEnum::ROM || c.constantTable;
-  if (bs.port == MemoryPortEnum::SimpleDualPort && !readOnly) {
-    c.splitRW = true;
-    c.readPorts = 1;
-    c.writePorts = 1;
-  } else {
-    c.sharedPorts = portCount(bs.port);
-  }
   c.layout = bankLayoutOf(memref);
   c.storage = resolveStorage(memref, lib);
+  // The realization decides what the array has and a `type=` topology narrows
+  // it, the meet keeping the tighter of the two. `PreVerification` reports a
+  // topology asking for more than the row has.
+  //
+  // An argument is held in the same budget: whatever backs it upstream is the
+  // structure it resolved to, and the boundary publishes one interface per port
+  // bound here.
+  if (const StorageRealization *row = lib.row(c.storage))
+    c.ports = row->ports;
+  if (auto want = requestedPortsOf(memref))
+    c.ports = c.ports.meet(*want);
   return c;
 }

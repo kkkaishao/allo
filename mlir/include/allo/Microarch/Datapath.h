@@ -215,14 +215,10 @@ struct MemUnit {
   /// the storage is the parent's, and the child masters an ordinary addressed
   /// port on it whether or not the parent scattered it.
   bool scattered = false;
-  /// This memory's boundary WRITE port groups never collide: two of them may
-  /// be enabled in one cycle, but only where the scheduler proved they address
-  /// different words, so a consumer may place each in its own `always` block
-  /// and infer a true dual port. False leaves them a priority chain, which is
-  /// what a group per static store already was.
-  ///
-  /// It is exactly "`writePortColouring` accepted this array", since that is
-  /// the condition the colouring refuses on, and the groups ARE its colours.
+  /// Whether `bindMemoryPorts` split the writes across ports, which it does
+  /// only where two enabled in one cycle provably address different words. A
+  /// consumer may then place each port in its own `always` block; false puts
+  /// them all in one, whose priority order resolves the collision.
   bool writesIndependent = false;
   /// The module ports holding one element of a `scattered` argument: the input
   /// it arrives on, and the output + write-enable it leaves on. A direction the
@@ -236,21 +232,48 @@ struct MemUnit {
   /// `enumerateBoundaryPorts`. Empty for every other memory.
   llvm::SmallVector<ElemPort> elemPorts;
   std::string storage; // resolved `dcp.storage` realization
+  /// The vendor attribute pinning the array to `storage`, from that row,
+  /// stamped on the emitted declaration. Empty where the row declares none and
+  /// for a realization the row cannot hold.
+  std::string ramStyle;
 
-  /// Ports `storage` provides, from its `dcp.storage` row; nullopt where the
-  /// row declares no limit. A memory needing more is built as a register file.
-  std::optional<unsigned> maxReads, maxWrites;
-  /// Read ports one bank is built with: one per read access reaching it plus
-  /// one per child reading it, since nothing shares a read port. A skewed bank
-  /// serves a whole lane from one port. Zero for a scattered memory.
-  unsigned readPortsBuilt = 0;
+  /// Ports one bank of `storage` provides, from its `dcp.storage` row narrowed
+  /// by the topology the array asked for. The same budget the scheduler
+  /// reserved against.
+  StoragePorts ports;
+  /// Ports one bank is built with: the distinct ports `bindMemoryPorts`
+  /// assigned to the accesses reaching a bank, maximized over the banks. The
+  /// third is not the sum of the first two, since a port of a pooled storage
+  /// may carry both a read and a write. A skewed bank serves a whole lane from
+  /// one port. Zero for a scattered memory and for a ROM, neither addressed.
+  unsigned readPortsBuilt = 0, writePortsBuilt = 0, portsBuilt = 0;
 
-  /// Whether the read ports this memory is built with fit `storage`. Gates the
-  /// write colouring alongside `maxWrites`: an array over either budget is
-  /// built as a register file, which has no port limit.
-  bool readsFitStorage() const {
-    return !maxReads || readPortsBuilt <= *maxReads;
+  /// Whether the ports this memory is built with fit `storage` on every axis.
+  bool fitsStorage() const {
+    return ports.fit(readPortsBuilt, writePortsBuilt, portsBuilt);
   }
+
+  /// What this module builds to hold the array, decided by
+  /// `classifyRealizations` from the port binding and read by the emitter, the
+  /// report and the cost model.
+  enum class Realization {
+    /// Nothing: the cells are the caller's and this module holds ports on
+    /// them. Every argument array, addressed or scattered.
+    Boundary,
+    /// A combinational constant table (`hw.aggregate_constant`), unlimited-port
+    /// and with no storage cost.
+    Rom,
+    /// One register per element, selected by comparison rather than addressed,
+    /// which is what buys a complete partition its unlimited ports.
+    Scatter,
+    /// An addressed array whose bound ports its `storage` row can serve.
+    Ram,
+    /// An addressed array whose bound ports exceed that row. The emission is
+    /// the same, but no RAM template matches it, so the part builds flip-flops
+    /// at the row's latency without its density.
+    RegisterFile,
+  };
+  Realization realization = Realization::Ram;
 
   // Access latency of `storage`, the same numbers the scheduler stamped onto
   // this memref's `dcp.load`/`dcp.store` (asserted per access in
@@ -274,6 +297,10 @@ struct MemUnit {
     Operation *op = nullptr;
     bool isWrite = false;
     unsigned region = 0; // the RegionBlock this access is scheduled in
+    /// The port of its bank this access drives, assigned by `bindMemoryPorts`.
+    /// Two accesses share a port only where the model proves they never issue
+    /// in the same cycle, so the port carries a select rather than an arbiter.
+    /// Under a skewed layout it is the access's `lane`.
     unsigned port = 0;
     /// This access's slot in the module's boundary port list: an index into
     /// `Datapath::readPorts` or `writePorts` by `isWrite`, and thus its port
@@ -394,6 +421,10 @@ struct CallUnit {
     bool isWrite;        // this port writes (vs reads)
     unsigned bank = 0;   // cyclic bank this port serves (0 unbanked)
     unsigned factor = 1; // partition factor (1 unbanked)
+    /// The caller-side port of that bank this child drives, from the same
+    /// `bindMemoryPorts` assignment the caller's own accesses take
+    /// (`MemUnit::Access::port`).
+    unsigned port = 0;
     /// The child says its write ports on this argument never collide, so the
     /// array backing them may give each its own `always` block
     /// (`MemUnit::writesIndependent`, `iface::Memory::independent`).
@@ -885,65 +916,42 @@ struct Datapath {
 
   void dump(llvm::raw_ostream &os) const;
 
-  /// The fewest ports ONE BANK of memory \p id can be built with: the largest
-  /// set of its accesses that can issue in one cycle, counting a child's port
-  /// as an access. Per bank, since a bank is its own `seq.hlmem` and accesses
-  /// naming different ones never contend. With \p writesOnly, only writes are
-  /// counted, which is the budget a RAM's write ports are checked against;
-  /// otherwise every access counts, which is what a RAM PORT actually serves (a
-  /// port reads OR writes in a cycle, so two writers plus a concurrent reader
-  /// need three).
+  /// A vertex of `portGraph` that is a child's port rather than an access of
+  /// this function, so it has no index in `MemUnit::accesses`.
+  static constexpr unsigned kNoAccess = ~0u;
+
+  /// One vertex of `portGraph`: which access of this function it is
+  /// (`kNoAccess` for a child's port), which call masters it (-1 for an access
+  /// of this function), whether that call declared its ports collision-free,
+  /// which direction it runs in, and which bank it commits to (-1 when it may
+  /// reach any).
+  struct PortVertex {
+    unsigned access = kNoAccess;
+    int call = -1;
+    bool independent = false;
+    bool write = false;
+    int bank = -1;
+  };
+
+  /// The accesses of \p id in direction \p writes that hold a port, and the
+  /// "can issue in one cycle" relation over them, one adjacency bitset per
+  /// vertex. A child's port counts as an access. \p writes selects one
+  /// direction; nullopt takes both, writes before reads.
   ///
   /// Conservative in the safe direction. Only an ordering the model already
   /// proves separates a pair: two top-level regions touching one array are
   /// ordered by `recordSiblingDeps`, two calls by `recordCallDeps` unless a
-  /// channel joins them in a concurrent container, and two region-local
-  /// accesses at different modulo residues never share a cycle. Anything else
-  /// counts as simultaneous, so this never under-states.
-  unsigned portsNeeded(MemId id, bool writesOnly) const;
-
-  /// Which write port each writer of \p id drives: a colouring of the very
-  /// relation `portsNeeded` takes its clique over, so it uses exactly that many
-  /// ports. This function's own accesses come first, indexed as
-  /// `MemUnit::accesses` with `kNoWritePort` at a read, then the CALL-mastered
-  /// writes at the slots `callPortSlot` names.
+  /// channel joins them in a concurrent container, two region-local accesses at
+  /// different modulo residues never share a cycle, and two accesses committing
+  /// to different banks contend for nothing. Anything else counts as
+  /// simultaneous, so a non-edge is a proof and an edge is the absence of one.
   ///
-  /// Absent when the writes cannot be redistributed and each keeps its own
-  /// port, for any of three reasons: `portGraph` declined to relate them, they
-  /// need more than \p maxPorts, which the caller sets from what its device can
-  /// build, or a simultaneous pair is not PROVEN to address different words.
-  /// Writes on different ports must be, having no shared block to order them.
-  /// Two pairs are proven: two accesses inside one region, where a memory
-  /// dependence would have made the scheduler separate them by a cycle (a
-  /// store's SDC row carries its write latency of 1), and two write ports of
-  /// ONE child that declared them independent, which is that child asserting
-  /// the same thing about its own accesses. Two DIFFERENT children, or a child
-  /// and a local access, are related by nothing and refuse the colouring.
-  std::optional<llvm::SmallVector<unsigned>>
-  writePortColouring(MemId id, unsigned maxPorts) const;
-
-  /// Where a CALL-mastered write of \p id sits in a `writePortColouring`
-  /// result: after this function's accesses, the calls in order and each call's
-  /// memory arguments in order, which is the order `portGraph` builds its
-  /// vertices in.
-  unsigned callPortSlot(MemId id, CallId call, unsigned arg) const;
-
-  /// No write port applies: `writePortColouring`'s entry for an access that is
-  /// not a write, and `portGraph`'s for a vertex that is a call's port rather
-  /// than an access of this function.
-  static constexpr unsigned kNoWritePort = ~0u;
-
-  /// The accesses of \p id the port model counts and the "can issue in one
-  /// cycle" relation over them, one adjacency bitset per access. \p accessOf
-  /// maps a vertex back to its index in `MemUnit::accesses`, or `kNoWritePort`
-  /// for a call. \p callerOf, when given, maps it to the call that masters it
-  /// and whether that call declared its ports independent, or to `{-1, false}`
-  /// for an access of this function. Shorter than \p accessOf when there are
-  /// more than the 64 a bitset holds, where the relation is not built at all
-  /// and every access counts as simultaneous.
-  llvm::SmallVector<uint64_t> portGraph(
-      MemId id, bool writesOnly, llvm::SmallVectorImpl<unsigned> &accessOf,
-      llvm::SmallVectorImpl<std::pair<int, bool>> *callerOf = nullptr) const;
+  /// Empty (shorter than \p verts) above the 64 vertices a bitset holds, where
+  /// the relation is not built and every caller treats each access as
+  /// simultaneous.
+  llvm::SmallVector<uint64_t>
+  portGraph(MemId id, std::optional<bool> writes,
+            llvm::SmallVectorImpl<PortVertex> &verts) const;
 };
 
 //===----------------------------------------------------------------------===//

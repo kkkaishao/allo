@@ -24,6 +24,7 @@ from . import ip
 from .spec import (
     MULTIWRITE_LUT_PER_BIT,
     MUX_LUT_COST,
+    ROM_ENTRIES_PER_LUT,
     SRL_MIN_DEPTH,
     Derived,
     FabricTiming,
@@ -283,12 +284,16 @@ _STORAGE = {
             r["ff"]: (Linear(1.0), Linear(1.0)),
         },
     ),
-    # Distributed RAM has one write port; the synthesizer replicates it for
-    # further reads, so only the write side is capped.
+    # Distributed RAM has one write port and one addressed read; the
+    # synthesizer serves further reads by replicating the whole array, so the
+    # read limit caps how many copies an array is worth rather than the
+    # structure, and the two directions are separate structures (no pool).
     "lutram": StorageSpec(
         ("slicem_lut",),
         lambda r: {r["slicem_lut"]: Tiled(64)},
+        max_reads=2,
         max_writes=1,
+        ram_style="distributed",
     ),
     # A shift register writes only at its head and reads one addressed tap.
     "srl": StorageSpec(
@@ -297,17 +302,24 @@ _STORAGE = {
         max_reads=1,
         max_writes=1,
     ),
+    # Two ports, each reading OR writing in a cycle: hence the pool, which two
+    # writers and a concurrent reader together exceed.
     "bram": StorageSpec(
         ("bram36",),
         lambda r: {r["bram36"]: Tiled(36864)},
         max_reads=2,
         max_writes=2,
+        max_ports=2,
+        ram_style="block",
     ),
     "uram": StorageSpec(
         ("uram288",),
         lambda r: {r["uram288"]: Tiled(294912)},
         max_reads=2,
         max_writes=2,
+        max_ports=2,
+        ram_style="ultra",
+        can_init=False,
     ),
 }
 
@@ -403,6 +415,9 @@ def build(part: Part) -> Device:
             is_scatter=name == SCATTER_STORAGE,
             max_reads=spec.max_reads,
             max_writes=spec.max_writes,
+            max_ports=spec.max_ports,
+            ram_style=spec.ram_style,
+            can_init=spec.can_init,
             uses=spec.uses(res),
         )
     d.set_default_storage(d.storage[DEFAULT_STORAGE])
@@ -424,6 +439,8 @@ def build(part: Part) -> Device:
 
     d.set_mux_uses({res["lut"]: (MUX_LUT_COST, Linear(1.0))})
     d.set_chain_uses(_chain_uses(res))
+    # A constant table is logic, not storage: one LUT is a 64-entry lookup.
+    d.set_rom_uses({res["lut"]: (Tiled(ROM_ENTRIES_PER_LUT), Linear(1.0))})
     d.set_register_floor(timing.reg_ns)
     d.set_default_frequency(part.grade.default_freq_mhz)
     return d.validate()

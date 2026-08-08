@@ -586,7 +586,9 @@ def test_normalizing_a_strided_loop_lets_its_nest_coalesce():
         assert (
             len(mod.schedule().func(k.__name__).cyclic(wrappers=True)) == 1
         ), f"{k.__name__}: the strided band did not coalesce into one region"
-        assert _iis(mod.schedule().func(k.__name__).regions) == [1]
+        # The coalesced band still issues one iteration per write port: both
+        # forms store two elements of `out`, and distributed RAM has one.
+        assert _iis(mod.schedule().func(k.__name__).regions) == [2]
         out = np.zeros((8, 8), np.int32)
         mod.cosim(A, out)
         assert np.array_equal(out, A + 1)

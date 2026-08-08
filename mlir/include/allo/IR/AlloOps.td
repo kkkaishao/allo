@@ -599,9 +599,24 @@ def DCPathStorageOp : DCPath_Op<"dcp.storage",
     the ports at exactly those latencies, so the two cannot drift.
 
     `max_rd`/`max_wr` are how many ports of each direction the structure has,
-    omitted where it has no limit. An array needing more is built as a register
-    file instead. A `scatter` row declares neither, holding one cell per element
-    and no addressed port.
+    omitted where it has no limit, and `max_p` how many it has altogether, each
+    serving a read or a write in a cycle. An array needing more than any of the
+    three is built as a register file instead. A `scatter` row declares none of
+    them, holding one cell per element and no addressed port.
+
+    A block RAM's two ports each read or write, so two writers and a concurrent
+    reader take three of them and `max_p` is what says so. A row whose
+    directions are independent structures, as a LUT RAM's single write port and
+    its replicated reads are, declares no `max_p`.
+
+    `style` is the vendor attribute that pins an array to this structure,
+    stamped on the emitted array declaration (Xilinx spells it
+    `ram_style = "block"`). Omitted where the part has no such attribute, and
+    the synthesizer then chooses for itself.
+
+    `no_init` marks a structure that powers up undefined, as an UltraRAM does.
+    An array declared with compile-time contents is refused there rather than
+    silently built out of something else.
 
     `uses` carries one `#allo.res_use` per term, and what a resource costs is
     the sum of the terms naming it. Storage carries TWO parameters,
@@ -616,12 +631,18 @@ def DCPathStorageOp : DCPath_Op<"dcp.storage",
     I64Attr:$wr_latency, F32Attr:$wr_delay,
     OptionalAttr<I64Attr>:$max_reads,
     OptionalAttr<I64Attr>:$max_writes,
+    OptionalAttr<I64Attr>:$max_ports,
+    OptionalAttr<StrAttr>:$ram_style,
+    UnitAttr:$no_init,
     OptionalAttr<ArrayAttr>:$uses);
   let assemblyFormat = [{
     $sym_name (`default` $is_default^)? (`scatter` $is_scatter^)?
+    (`no_init` $no_init^)?
     `rd` `=` $rd_latency `,` $rd_delay
     `wr` `=` $wr_latency `,` $wr_delay
     (`max_rd` `=` $max_reads^)? (`max_wr` `=` $max_writes^)?
+    (`max_p` `=` $max_ports^)?
+    (`style` `=` $ram_style^)?
     (`uses` $uses^)? attr-dict
   }];
   let hasVerifier = 1;

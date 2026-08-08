@@ -50,22 +50,18 @@ struct MuxClass {
   unsigned fanin = 0, width = 0, count = 0;
 };
 
-/// What the cost model needs of one array and no reader does: the ports the
-/// model DEMANDED, and who drives them. Grouped apart because a reader asking
-/// what an array became is answered by the fields above it.
+/// What the cost model needs of one array and no reader does: the ports it was
+/// bound with, and who drives them. Grouped apart because a reader asking what
+/// an array became is answered by the fields above it.
 struct MemCost {
-  // `callReads`/`callWrites` are ports a CHILD drives, and `writingCalls`
-  // counts the DISTINCT children among them: several ports of one child are
-  // that child's own boundary, several children are genuinely concurrent
-  // writers, and only the second is a banking problem.
+  // Ports a child drives: several ports of one child are that child's own
+  // boundary, several children are concurrent writers, and only the second is
+  // a banking problem.
   unsigned callReads = 0, callWrites = 0;
-  unsigned writingCalls = 0, writingRegions = 0;
-  // What `Datapath::portsNeeded` demanded of ONE bank, which is what the
-  // storage had to be built to serve.
-  unsigned portsNeededWrite = 0, portsNeededTotal = 0;
-  // Read ports one bank is built with (`MemUnit::readPortsBuilt`), one per read
-  // since nothing shares one. Checked against the realization's read budget.
-  unsigned readPorts = 0;
+  // Ports one bank is built with (`MemUnit::readPortsBuilt` and its twins).
+  // `ports` is not their sum: a port of a pooled storage may carry both a read
+  // and a write that never issue together.
+  unsigned readPorts = 0, writePorts = 0, ports = 0;
 };
 
 /// One array, and the storage decision taken for it.
@@ -82,6 +78,10 @@ struct MemReport {
   MemCost cost;
   bool external = false, scattered = false, writesIndependent = false;
   bool rom = false, skewed = false;
+  /// What the module built to hold it (`MemUnit::Realization`, spelled
+  /// "boundary" / "rom" / "scatter" / "ram" / "register_file"), read back from
+  /// the emitter rather than re-derived.
+  std::string realization;
   /// Whether the partition BOUGHT the bandwidth it costs: every access reaches
   /// one bank. An access the analysis could not fix takes a port on every bank,
   /// so a partition resolving none of them is N memories at the bandwidth of

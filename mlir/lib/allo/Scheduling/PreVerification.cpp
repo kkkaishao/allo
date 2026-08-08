@@ -370,6 +370,19 @@ LogicalResult checkMemories(func::FuncOp func, const MemoryLibrary &memLib,
              "registers; the two cannot both hold. Drop one of them";
       return failure();
     }
+    // The contents are one array of words and the emitter realizes them as one
+    // bank: a constant table is a single `hw.aggregate_constant` and a written
+    // one a single `initial` block. A complete partition is not banking and
+    // stays legal.
+    if (globalInitOf(array) && mc.layout.numBanks > 1) {
+      unsupported(Stage::Prep, Code::PartitionedInitializedArray, anchor)
+          << "Array " << array.getType()
+          << " is declared with compile-time contents and partitioned into "
+          << mc.layout.numBanks
+          << " banks, which the backend realizes as one bank. Drop the "
+             "partition, or fill the array from the kernel instead";
+      return failure();
+    }
     // A completely partitioned array needs the device's `scatter` row; an empty
     // name would otherwise fall through as a stream's, timed by an unrelated
     // row.
@@ -383,13 +396,42 @@ LogicalResult checkMemories(func::FuncOp func, const MemoryLibrary &memLib,
     }
     // A realization the device never declared would fall to the zero-timing
     // default and schedule combinationally, reading before valid.
-    if (!memLib.declares(storage)) {
+    const StorageRealization *row = memLib.row(storage);
+    if (!row) {
       error(Stage::Prep, Code::StorageNotDeclared, anchor)
           << "No memory characterization for storage '" << storage
           << "'; declare it as a `dcp.storage` on the device";
       return failure();
     }
-    RWLatency lat = memLib.timing(storage).latency;
+    // The two axes of one directive: `type=` asks for a port topology and
+    // `impl=` picks the structure that has to provide it. `characterize` keeps
+    // the tighter of the two, so a directive asking for more than its structure
+    // has would silently run at the structure's ports; report it here instead.
+    if (auto want = requestedPortsOf(array);
+        want && row->ports.exceededBy(*want)) {
+      error(Stage::Prep, Code::ArrayLayoutConflict, anchor)
+          << "Array " << array.getType() << " asks for a port topology of "
+          << want->describe() << ", but storage '" << storage << "' has "
+          << row->ports.describe()
+          << ". Drop the `type` or bind it to a storage that has them";
+      return failure();
+    }
+    // A structure that powers up undefined cannot be the one holding an array
+    // declared with contents; asked for it anyway, the synthesizer quietly
+    // builds something else and the design occupies what it was not priced as.
+    // A read-only table escapes this: it is realized as logic and never reaches
+    // this storage at all.
+    if (!row->canInit && globalInitOf(array) && !mc.constantTable) {
+      error(Stage::Prep, Code::StorageTimingUnrealizable, anchor)
+          << "Array " << array.getType()
+          << " is declared with compile-time contents and also written, so it "
+             "is a memory that must come up holding them, but storage '"
+          << storage
+          << "' powers up undefined. Bind it to a storage that can be "
+             "initialized, or fill it from the kernel instead";
+      return failure();
+    }
+    RWLatency lat = row->timing.latency;
     // A boundary port's latency is a contract with the driver, not enforced by
     // the RTL: any latency >= 1 works, but 0 does not, since the port is
     // edge-triggered.

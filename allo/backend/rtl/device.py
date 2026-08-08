@@ -231,7 +231,9 @@ def Tiled(bits_per_tile: int) -> Cost:
 
 
 @dataclass(frozen=True)
-class Storage:
+# One field per fact the device states about the structure, so the count tracks
+# its vocabulary rather than any coupling between them.
+class Storage:  # pylint: disable=too-many-instance-attributes
     """A storage realization: one buildable structure an array can live in.
 
     NOT a resource. A resource is a counter (``@lut``, ``@bram36``); this is
@@ -257,6 +259,21 @@ class Storage:
     # needing more is built as a register file rather than as this row.
     max_reads: int | None = None
     max_writes: int | None = None
+    # Ports the structure has altogether, each serving a read or a write in a
+    # cycle. A block RAM's two ports are one pool, so two writers and a
+    # concurrent reader need three of them and it has two. ``None`` where the
+    # directions are independent structures, as a LUT RAM's single write port
+    # against its replicated reads is. Never below either direction's limit.
+    max_ports: int | None = None
+    # The vendor attribute that pins an array to this structure, stamped on the
+    # emitted array declaration (Xilinx spells it `ram_style = "block"`).
+    # ``None`` where the part has no such attribute or nothing can be pinned to
+    # the row, and the synthesizer then picks a structure of its own.
+    ram_style: str | None = None
+    # Whether the structure can come up holding contents. False for one that
+    # powers up undefined, as an UltraRAM does: an array declared with
+    # compile-time contents cannot be held there.
+    can_init: bool = True
     # What it spends. Storage carries two parameters, `(depth, width)`, so each
     # entry is two cost factors or one `Tiled`.
     uses: Spend = ()
@@ -333,10 +350,11 @@ class Device:
         self.resources: dict[str, Resource] = {}
         self.comb_uses: dict[str, Spend] = {}  # comb kind -> what it spends
         self.operator_uses: dict[str, Spend] = {}  # IP symbol -> what it spends
-        # The two structures the emitter builds that nothing chooses between,
+        # The three structures the emitter builds that nothing chooses between,
         # so they are one row each rather than a named realization.
         self.mux_uses: Spend = ()
         self.chain_uses: Spend = ()
+        self.rom_uses: Spend = ()
         self.storage: dict[str, Storage] = {}
         # The default is a NAME, not a handle: redeclaring a row (a copied
         # device retuned) must not leave it pointing at the replaced one.
@@ -430,6 +448,9 @@ class Device:
         self.resources[name] = r
         return r
 
+    # Every argument is one independent fact the device declares about the row,
+    # and they are keyword-only, so grouping them would only add a name to spell.
+    # pylint: disable-next=too-many-arguments
     def add_storage(
         self,
         name: str,
@@ -441,6 +462,9 @@ class Device:
         is_scatter: bool = False,
         max_reads: int | None = None,
         max_writes: int | None = None,
+        max_ports: int | None = None,
+        ram_style: str | None = None,
+        can_init: bool = True,
         uses: dict[Resource, Cost | Sequence] | None = None,
     ) -> Storage:
         """Declare a storage realization and return the handle ``bind_storage``
@@ -460,6 +484,20 @@ class Device:
         built as a register file. A scatter row declares neither, having no
         addressed port to count.
 
+        ``max_ports`` is how many it has altogether, each serving a read or a
+        write in a cycle. Declare it wherever the two directions draw on one
+        pool, as a block RAM's two ports do; omit it where they are independent
+        structures, as a LUT RAM's single write port and its replicated reads
+        are.
+
+        ``ram_style`` is the vendor attribute that pins an array to this
+        structure, stamped on the emitted declaration. Omit it and the
+        synthesizer chooses instead.
+
+        ``can_init`` is whether the structure comes up holding contents. Clear
+        it for one that powers up undefined, as an UltraRAM does; an array
+        declared with compile-time contents is then refused there.
+
         Storage carries two parameters, ``(depth, width)``, so a ``uses`` term
         is a pair of costs, or the single :func:`Tiled` that reads them
         together.
@@ -468,13 +506,27 @@ class Device:
             raise ValueError(f"storage {name!r}: latency must be non-negative")
         if read_delay_ns < 0 or write_delay_ns < 0:
             raise ValueError(f"storage {name!r}: delay must be non-negative")
-        for role, limit in (("max_reads", max_reads), ("max_writes", max_writes)):
+        limits = (
+            ("max_reads", max_reads),
+            ("max_writes", max_writes),
+            ("max_ports", max_ports),
+        )
+        for role, limit in limits:
             if limit is not None and limit < 1:
                 raise ValueError(f"storage {name!r}: {role} must be at least one port")
             if limit is not None and is_scatter:
                 raise ValueError(
                     f"storage {name!r} holds one cell per element, so it has no "
                     f"{role} to declare"
+                )
+        # A pool below one of the directions it serves would make that
+        # direction's own limit unreachable, so the row would be describing two
+        # different structures.
+        for role, limit in limits[:2]:
+            if max_ports is not None and limit is not None and limit > max_ports:
+                raise ValueError(
+                    f"storage {name!r}: {role}={limit} exceeds max_ports={max_ports}, "
+                    "but an access of either direction takes one port of the pool"
                 )
         other = next(
             (s for s in self.storage.values() if s.is_scatter and s.name != name), None
@@ -493,6 +545,9 @@ class Device:
             is_scatter=bool(is_scatter),
             max_reads=None if max_reads is None else int(max_reads),
             max_writes=None if max_writes is None else int(max_writes),
+            max_ports=None if max_ports is None else int(max_ports),
+            ram_style=ram_style,
+            can_init=bool(can_init),
             uses=self._spend(f"storage {name!r}", "depth, width", uses),
         )
         self.storage[name] = s
@@ -597,6 +652,16 @@ class Device:
         self.chain_uses = self._spend("a delay chain", "depth, width", uses)
         return self
 
+    def set_rom_uses(self, uses: dict[Resource, Sequence]) -> Device:
+        """What one ``depth`` x ``width`` constant table spends.
+
+        A read-only table is not held in a storage realization at all: it is
+        emitted as a constant array read by an index, so the part builds it out
+        of logic. That is why it is a whole-device row like the multiplexer and
+        the delay chain rather than a ``dcp.storage`` an array binds to."""
+        self.rom_uses = self._spend("a constant table", "depth, width", uses)
+        return self
+
     def set_register_floor(self, delay_ns: float) -> Device:
         """The register-to-register floor (ns): a source flip-flop's clock-to-out
         plus the routing every path pays, measured with nothing between the
@@ -672,10 +737,14 @@ class Device:
             )
         if self.stream_timing is None:
             raise ValueError(f"device {self.name!r} declares no stream timing")
-        # The estimator prices every mux and every delay chain through the one
-        # whole-device row, so an absent row reads as free rather than as
-        # unmodelled.
-        for what, spent in (("mux", self.mux_uses), ("chain", self.chain_uses)):
+        # The estimator prices every mux, delay chain and constant table through
+        # the one whole-device row, so an absent row reads as free rather than
+        # as unmodelled.
+        for what, spent in (
+            ("mux", self.mux_uses),
+            ("chain", self.chain_uses),
+            ("constant table", self.rom_uses),
+        ):
             if not spent:
                 raise ValueError(
                     f"device {self.name!r} declares no {what} cost; every {what} "
@@ -693,6 +762,7 @@ class Device:
         d.operator_uses = dict(self.operator_uses)
         d.mux_uses = self.mux_uses
         d.chain_uses = self.chain_uses
+        d.rom_uses = self.rom_uses
         d.storage = dict(self.storage)
         d.default_storage = self.default_storage
         d.stream_timing = self.stream_timing
@@ -867,6 +937,9 @@ def inject_device(module, device: Device):
                     is_scatter=s.is_scatter,
                     max_reads=_port_limit(i64, s.max_reads),
                     max_writes=_port_limit(i64, s.max_writes),
+                    max_ports=_port_limit(i64, s.max_ports),
+                    ram_style=s.ram_style,
+                    no_init=not s.can_init,
                     uses=_uses_attr(s.uses),
                     **_timing(s),
                 )

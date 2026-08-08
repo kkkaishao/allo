@@ -56,6 +56,14 @@ MUX_LUT_COST = Piecewise(
 #: Measured 1.6x to 3.3x of ``depth*width`` over 64..512 deep and 8..32 wide.
 MULTIWRITE_LUT_PER_BIT = 2.0
 
+#: Entries of a constant table one LUT covers, for ONE output bit. A LUT6
+#: computes any function of six inputs, so it is exactly a 64-entry one-bit
+#: lookup, and a table costs ``width * ceil(depth / 64)`` of them; the wide
+#: multiplexers stitching a deeper table together ride the slice's own F7/F8
+#: and cost nothing further. An upper bound: a table whose contents are regular
+#: minimizes below it.
+ROM_ENTRIES_PER_LUT = 64
+
 
 class Grade(NamedTuple):
     """A speed grade: which of a fabric's timing tables a part reads, and the
@@ -114,12 +122,24 @@ class StorageSpec(NamedTuple):
 
     A port limit of ``None`` is no limit, which is what the scatter row takes:
     one cell per element is not addressed. An array needing more ports than the
-    row has is built as a register file."""
+    row has is built as a register file.
+
+    ``max_ports`` is the pool the two directions draw on together, declared
+    where a port serves a read or a write (a block RAM) and omitted where the
+    directions are independent structures (a LUT RAM's write port against its
+    replicated reads).
+
+    ``ram_style`` is the vendor attribute that pins an array to the row, so
+    that what the part builds is what the device priced, and ``can_init`` is
+    whether the structure comes up holding contents at all."""
 
     needs: tuple[str, ...]
     uses: Callable[[Mapping[str, Resource]], dict]
     max_reads: int | None = None
     max_writes: int | None = None
+    max_ports: int | None = None
+    ram_style: str | None = None
+    can_init: bool = True
 
 
 class IPRow(NamedTuple):

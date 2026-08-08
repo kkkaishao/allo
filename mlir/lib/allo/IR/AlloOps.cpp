@@ -489,13 +489,20 @@ LogicalResult DCPathStorageOp::verify() {
   if (getRdDelay().convertToDouble() < 0.0 ||
       getWrDelay().convertToDouble() < 0.0)
     return emitOpError("delay must be non-negative");
-  for (std::optional<int64_t> limit : {getMaxReads(), getMaxWrites()}) {
+  std::optional<uint64_t> pool = getMaxPorts();
+  for (std::optional<uint64_t> limit : {getMaxReads(), getMaxWrites(), pool}) {
     if (limit && *limit < 1)
       return emitOpError("a port limit must be at least one port");
     // A scatter row holds one cell per element and no addressed port.
     if (limit && getIsScatter())
       return emitOpError("a `scatter` row holds one cell per element and so "
                          "has no port limit to declare");
+    // A pool below one of the directions it serves leaves that direction's own
+    // limit unreachable, so the row describes two different structures.
+    if (limit && pool && *limit > *pool)
+      return emitOpError("a direction's port limit exceeds `max_p`, but an "
+                         "access of either direction takes one port of the "
+                         "pool");
   }
   return verifyResourceUses(*this, getUsesAttr(), 2,
                             "two parameters (depth, width)");

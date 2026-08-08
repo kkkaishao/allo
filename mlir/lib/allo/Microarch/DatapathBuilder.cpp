@@ -184,18 +184,18 @@ MemId DatapathBuilder::getOrCreateMem(Value memref) {
   // addressed port on it.
   m.scattered = m.layout.registers && (!m.external || dp.atTop);
   m.storage = mc.storage;
-  // Access latency of the resolved realization, from the same device rows the
-  // scheduler timed this memref's accesses against (`MemoryLibrary::timing`).
-  // The emitter builds ports at these latencies; do not re-derive from the
-  // name.
-  auto mkt = dev.memory.timing(m.storage);
-  m.readLatency = mkt.latency.read;
-  m.writeLatency = mkt.latency.write;
-  // Port budget from that same row: how many ports the structure holding this
-  // array has.
-  StoragePorts sp = dev.memory.ports(m.storage);
-  m.maxReads = sp.reads;
-  m.maxWrites = sp.writes;
+  // Everything the device states about the resolved realization, from the same
+  // rows the scheduler timed this memref's accesses against. The emitter builds
+  // ports at these latencies; do not re-derive from the name.
+  const StorageRealization *sr = dev.memory.row(m.storage);
+  assert(sr && "`PreVerification` rejects an array whose storage realization "
+               "the device does not declare");
+  m.readLatency = sr->timing.latency.read;
+  m.writeLatency = sr->timing.latency.write;
+  m.ramStyle = sr->ramStyle;
+  // Port budget from that same characterization, so the ports the scheduler
+  // reserved and the ports `bindMemoryPorts` assigns are one number.
+  m.ports = mc.ports;
   assert(mt.hasStaticShape() &&
          "datapath memory requires a static shape (a dynamic memref sizes to "
          "depthWords 0)");
@@ -646,33 +646,216 @@ void DatapathBuilder::recordCallDeps() {
   }
 }
 
-// One read port per read on every bank it can reach, since nothing shares a
-// read port: a compile-time bank reads its own, a roaming one crossbars over
-// all of them, and a child masters one on the bank it was handed. A skewed bank
-// serves a whole lane from one port. A scattered array has no addressed port.
-void DatapathBuilder::countReadPorts() {
-  for (MemUnit &m : dp.mems) {
-    if (m.scattered)
-      continue;
-    llvm::SmallVector<unsigned> perBank(m.numBanks, 0);
-    llvm::SmallDenseSet<unsigned> lanes;
-    for (const MemUnit::Access &acc : m.accesses) {
-      if (acc.isWrite)
-        continue;
-      if (m.skewed)
-        lanes.insert(acc.lane);
-      else if (acc.staticBank)
-        ++perBank[*acc.staticBank];
-      else
-        for (unsigned &n : perBank)
-          ++n;
+// Bind \p m: which port of its bank each access drives, and how many ports one
+// bank is therefore built with.
+//
+// Two accesses share a port only where `portGraph` has no edge between them,
+// which proves they never issue in the same cycle, so the port carries a select
+// over them rather than an arbiter. Three shapes take a port of their own: an
+// access with no bank of its own, which a crossbar routes to every bank; every
+// access of an array with more of them than the relation is built for; and, on
+// the write side, every write of an array whose splitting is not proven safe.
+DatapathBuilder::PortCounts
+DatapathBuilder::bindPorts(MemUnit &m, std::optional<bool> writes,
+                           unsigned base) {
+  llvm::SmallVector<Datapath::PortVertex> verts;
+  llvm::SmallVector<uint64_t> adj = dp.portGraph(m.id, writes, verts);
+  unsigned n = verts.size();
+  llvm::SmallVector<unsigned> colour(n, 0);
+  unsigned used = 0;
+  // Whether the writes may go on separate ports, which are separate `always`
+  // blocks with nothing between them to resolve a collision. Only a pair proven
+  // to address different words may: two accesses of one region, which a memory
+  // dependence made the scheduler separate, and two write ports of one child
+  // that declared them independent. Two different children, or a child and a
+  // local access, are related by nothing.
+  bool split = true;
+
+  if (adj.size() != n) {
+    split = false; // too many accesses to relate: each keeps its own port
+  } else {
+    uint64_t all = n == 64 ? ~uint64_t(0) : (uint64_t(1) << n) - 1;
+    for (unsigned i = 0; i < n; ++i)
+      if (verts[i].bank < 0) {
+        adj[i] |= all & ~(uint64_t(1) << i);
+        for (unsigned j = 0; j < n; ++j)
+          if (j != i)
+            adj[j] |= uint64_t(1) << i;
+      }
+    // What a pair on one port shares its address by decides how far apart they
+    // may sit. Two writes need nothing, an address being a don't-care in any
+    // cycle its enable is low, so stores share a port across regions. A read
+    // and a write share by the write's own enable, likewise a signal in its own
+    // right, so those share across regions too. Two reads share by a select
+    // over their activation pulses held against a stall, and only accesses of
+    // one region hold theirs against the same one, so two reads of different
+    // regions and a child's read port keep ports of their own.
+    //
+    // A container's own reads share with nothing: they form its condition cone,
+    // live on every cycle its children run rather than on a pulse of its own.
+    auto containerRead = [&](unsigned i) {
+      return !verts[i].write && verts[i].call < 0 &&
+             dp.regions[m.accesses[verts[i].access].region].shape ==
+                 RegionBlock::Shape::Container;
+    };
+    auto sharable = [&](unsigned i, unsigned j) {
+      if (containerRead(i) || containerRead(j))
+        return false;
+      if (verts[i].write || verts[j].write)
+        return true;
+      if (verts[i].call >= 0 || verts[j].call >= 0)
+        return false;
+      return m.accesses[verts[i].access].region ==
+             m.accesses[verts[j].access].region;
+    };
+    for (unsigned i = 0; i < n; ++i)
+      for (unsigned j = i + 1; j < n; ++j) {
+        if (!sharable(i, j)) {
+          adj[i] |= uint64_t(1) << j;
+          adj[j] |= uint64_t(1) << i;
+        }
+      }
+    // Greedy in vertex order, taking the lowest port no neighbour holds.
+    for (unsigned i = 0; i < n; ++i) {
+      uint64_t taken = 0;
+      for (unsigned j = 0; j < i; ++j)
+        if ((adj[i] >> j) & 1)
+          taken |= uint64_t(1) << colour[j];
+      colour[i] = llvm::countr_one(taken);
+      used = std::max(used, colour[i] + 1);
     }
-    for (const CallUnit &cu : dp.calls)
-      for (const CallUnit::MemArg &ma : cu.memArgs)
-        if (ma.mem == m.id && !ma.isWrite)
-          ++perBank[ma.bank];
-    m.readPortsBuilt = lanes.size() + *llvm::max_element(perBank);
+    auto proven = [&](unsigned i, unsigned j) {
+      if (verts[i].call < 0 && verts[j].call < 0)
+        return m.accesses[verts[i].access].region ==
+               m.accesses[verts[j].access].region;
+      return verts[i].call >= 0 && verts[i].call == verts[j].call &&
+             verts[i].independent;
+    };
+    for (unsigned i = 0; split && used > 1 && i < n; ++i)
+      for (unsigned j = i + 1; j < n; ++j)
+        if (verts[i].write && verts[j].write && ((adj[i] >> j) & 1) &&
+            !proven(i, j)) {
+          split = false;
+          break;
+        }
   }
+  // An unsplittable set of writes stays on one `always` block, which arbitrates
+  // the collision it might have. Each still keeps a port of its own so the
+  // block holds one assignment per write: two writes to different words in one
+  // cycle must both commit, and a select would drop one.
+  if (!split) {
+    assert(writes && *writes &&
+           "an unsplittable write set is bound on its own");
+    for (unsigned i = 0; i < n; ++i)
+      colour[i] = i;
+    used = n;
+  }
+  // Only a colouring that included the writes has anything to say about them.
+  if (!writes || *writes) {
+    llvm::SmallDenseSet<unsigned> writeColours;
+    for (unsigned i = 0; i < n; ++i)
+      if (verts[i].write)
+        writeColours.insert(colour[i]);
+    m.writesIndependent = split && writeColours.size() > 1;
+  }
+
+  // The vertex order `portGraph` builds: writes before reads, and within each
+  // this function's accesses before the ports its children master.
+  unsigned v = 0;
+  for (bool dir : {true, false}) {
+    if (writes && *writes != dir)
+      continue;
+    for (MemUnit::Access &acc : m.accesses)
+      if (acc.isWrite == dir)
+        acc.port = base + colour[v++];
+    for (CallUnit &cu : dp.calls)
+      for (CallUnit::MemArg &ma : cu.memArgs)
+        if (ma.mem == m.id && ma.isWrite == dir)
+          ma.port = base + colour[v++];
+  }
+  assert(v == n && "the port binding walks `portGraph`'s vertex order");
+
+  // Ports one bank is built with: a bank is its own `seq.hlmem` and only the
+  // accesses reaching it take its ports.
+  PortCounts out;
+  out.colours = used;
+  for (unsigned k = 0; k < m.numBanks; ++k) {
+    llvm::SmallDenseSet<unsigned> all, rd, wr;
+    for (unsigned i = 0; i < n; ++i)
+      if (verts[i].bank < 0 || verts[i].bank == int(k)) {
+        all.insert(colour[i]);
+        (verts[i].write ? wr : rd).insert(colour[i]);
+      }
+    out.total = std::max<unsigned>(out.total, all.size());
+    out.reads = std::max<unsigned>(out.reads, rd.size());
+    out.writes = std::max<unsigned>(out.writes, wr.size());
+  }
+  return out;
+}
+
+void DatapathBuilder::bindMemoryPorts() {
+  for (MemUnit &m : dp.mems) {
+    // Neither is addressed, so neither has a port to contend for: a scattered
+    // array is one cell per element and a constant table is combinational.
+    if (m.scattered || m.isRom)
+      continue;
+    // A skew answers this at the same granularity: a lane's accesses hold
+    // distinct slots, so they reach distinct banks and share one port on each.
+    if (m.skewed) {
+      llvm::SmallDenseSet<unsigned> lanes[2];
+      for (MemUnit::Access &acc : m.accesses) {
+        acc.port = acc.lane;
+        lanes[acc.isWrite].insert(acc.lane);
+      }
+      m.readPortsBuilt = lanes[0].size();
+      m.writePortsBuilt = lanes[1].size();
+      m.portsBuilt = m.readPortsBuilt + m.writePortsBuilt;
+      continue;
+    }
+    // A direction at a time, reads numbered past the writes so no port carries
+    // both. On a row whose directions are separate structures, merging them
+    // buys an address multiplexer and nothing else.
+    auto separate = [&] {
+      PortCounts w = bindPorts(m, /*writes=*/true, /*base=*/0);
+      PortCounts r = bindPorts(m, /*writes=*/false, /*base=*/w.colours);
+      m.writePortsBuilt = w.writes;
+      m.readPortsBuilt = r.reads;
+      m.portsBuilt = w.writes + r.reads;
+    };
+    separate();
+    // Where the row's ports are a pool, each serving either direction, a read
+    // may ride a write's port and one address bus carries both. Worth the
+    // multiplexer only where the array does not otherwise fit, and possible
+    // only where the writes were split, an unsplittable set already being one
+    // `always` block.
+    if (m.ports.pool && !m.external && !m.fitsStorage() &&
+        (m.writePortsBuilt <= 1 || m.writesIndependent)) {
+      // The shared bus carries the write's address on the cycle it commits, so
+      // a write that presents its terms early would drive the read's cycle too.
+      assert(m.writeLatency == 1 &&
+             "a pooled row's write port realizes in one cycle");
+      PortCounts u = bindPorts(m, /*writes=*/std::nullopt, /*base=*/0);
+      if (u.total < m.portsBuilt) {
+        m.readPortsBuilt = u.reads;
+        m.writePortsBuilt = u.writes;
+        m.portsBuilt = u.total;
+      } else {
+        separate();
+      }
+    }
+  }
+}
+
+void DatapathBuilder::classifyRealizations() {
+  using R = MemUnit::Realization;
+  for (MemUnit &m : dp.mems)
+    // An argument is a boundary whatever shape its cells have upstream: this
+    // module builds none of them and only holds ports on them.
+    m.realization = m.external        ? R::Boundary
+                    : m.isRom         ? R::Rom
+                    : m.scattered     ? R::Scatter
+                    : m.fitsStorage() ? R::Ram
+                                      : R::RegisterFile;
 }
 
 void DatapathBuilder::enumerateBoundaryPorts() {
@@ -712,34 +895,26 @@ void DatapathBuilder::enumerateBoundaryPorts() {
       }
       continue;
     }
-    // Stores that provably never issue together share one boundary port group,
-    // the same colouring an internal array's write ports take. A group per
-    // static store makes every caller back the array with that many write
-    // interfaces.
+    // One boundary port group per bound port: accesses that provably never
+    // issue together share a port, and so share the interface the caller backs
+    // the array with, driving it through a select on their own activation. A
+    // group per access instead makes every caller provide that many interfaces
+    // for bandwidth the schedule never asks for.
     //
-    // Only where every write reaches one interface: a data-dependent banked
-    // store spans them all, and two stores routed to different banks are on
-    // different interfaces already. Whatever backs the array upstream is the
-    // structure this one resolved, so its ports are the same budget.
-    std::optional<SmallVector<unsigned>> shared;
-    if (m.readsFitStorage() &&
-        llvm::all_of(m.accesses, [&](const MemUnit::Access &a) {
-          return !a.isWrite || externalBank(m, a).factor == 1;
-        }))
-      shared = dp.writePortColouring(m.id, m.maxWrites.value_or(~0u));
-    m.writesIndependent = shared.has_value();
-    llvm::SmallDenseMap<unsigned, unsigned> portOfColour;
+    // Keyed by bank as well as port, since a port index is one per bank and two
+    // accesses routed to different banks are different interfaces. A
+    // data-dependent banked access spans every interface, and `bindMemoryPorts`
+    // already gave it a port of its own. One map per direction, since the two
+    // number their groups in their own port list.
+    llvm::SmallDenseMap<std::pair<unsigned, unsigned>, unsigned> groupOfPort[2];
     for (auto [a, acc] : llvm::enumerate(m.accesses)) {
       auto &ports = acc.isWrite ? dp.writePorts : dp.readPorts;
-      if (shared && acc.isWrite) {
-        auto [it, isNew] = portOfColour.try_emplace((*shared)[a], ports.size());
-        if (!isNew) {
-          // A group already open: this store drives it too, one-hot muxed
-          // against the others on it by its own write-enable.
-          acc.portIdx = it->second;
-          acc.portBase = m.accesses[ports[acc.portIdx].idx].portBase;
-          continue;
-        }
+      auto [it, isNew] = groupOfPort[acc.isWrite].try_emplace(
+          {acc.staticBank.value_or(~0u), acc.port}, ports.size());
+      if (!isNew) {
+        acc.portIdx = it->second;
+        acc.portBase = m.accesses[ports[acc.portIdx].idx].portBase;
+        continue;
       }
       acc.portIdx = ports.size();
       acc.portBase =
@@ -1729,10 +1904,8 @@ void DatapathBuilder::build() {
          "the unit table is the allocation: a unit exists because ops are "
          "bound to it");
 
-  deriveShapes();           // controller discriminant (needs every child)
-  countReadPorts();         // per-memory read budget (needs every access/call)
-  enumerateBoundaryPorts(); // module boundary ports (needs every access)
-  deriveCounterTypes();     // counter width (each loop's own range)
+  deriveShapes();       // controller discriminant (needs every child)
+  deriveCounterTypes(); // counter width (each loop's own range)
   // Everything below resolves Values to Sources, and so runs here rather than
   // during the walk: `resolveValue` needs the complete region model.
   // Every op the reify leaves in the module body binds no hardware:
@@ -1752,6 +1925,12 @@ void DatapathBuilder::build() {
   recordResults();                // scalar func-result output ports
   deriveInterconnect();
   planAddressGenerators(); // address strength reduction (needs resolved terms)
+  // Ports last of all: an access holds one only once it knows which bank it
+  // commits to and which skew lane it holds, both settled by the interconnect
+  // pass above, and the boundary port list is one group per bound port.
+  bindMemoryPorts();
+  classifyRealizations();
+  enumerateBoundaryPorts();
   recordSiblingDeps(regionOps); // top-level composition DAG (concurrency gates)
   verifyBinding(dp); // MRT legality: no unit shared by conflicting ops
 }

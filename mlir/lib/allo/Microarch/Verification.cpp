@@ -172,38 +172,40 @@ LogicalResult checkDeviceCapability(dcp::DCPathModuleOp func,
   // Memory rows the SCHEDULER honors, so a structure that silently realizes
   // them differently would place every consumer on the wrong cycle.
   for (const MemUnit &m : dp.mems) {
-    // A partition on an initialized array is a silent no-op: `bankLayoutOf`
-    // reads `allo.part` off the `memref.get_global` while the attribute rides
-    // the `memref.global`.
-    if (m.romInit) {
-      assert(m.numBanks == 1 &&
-             "an initialized array is laid out as one bank (allo.part on a "
-             "memref.global never reaches the layout)");
-      auto gg = m.memref.getDefiningOp<memref::GetGlobalOp>();
-      assert(gg && "an initializer can only come from a memref.get_global");
-      auto global = SymbolTable::lookupNearestSymbolFrom<memref::GlobalOp>(
-          gg, gg.getNameAttr());
-      if (global && global->hasAttr(kPartitionAttr))
-        warn(Stage::Emit, func)
-            << "Partition on the initialized array '" << gg.getName()
-            << "' is ignored: an array declared with compile-time contents is "
-               "realized as a single bank";
-    }
+    assert((!m.romInit || m.numBanks == 1) &&
+           "`PreVerification` refuses a banked array declared with contents");
+    // A constant table is combinational logic with no port limit, so a
+    // partition of one buys no bandwidth.
+    if (m.isRom)
+      if (auto gg = m.memref.getDefiningOp<memref::GetGlobalOp>()) {
+        auto global = SymbolTable::lookupNearestSymbolFrom<memref::GlobalOp>(
+            gg, gg.getNameAttr());
+        if (global && global->hasAttr(kPartitionAttr))
+          warn(Stage::Emit, func)
+              << "Partition on the constant table '" << gg.getName()
+              << "' buys nothing: a read-only table is realized as "
+                 "combinational logic, which reads through as many ports as "
+                 "the schedule asks for";
+      }
     assert(m.writeLatency >= 1 && "a 0-cycle write port reached emission");
     // The scatter realization is registers, and the emitter builds them at
     // exactly that timing: a read is a combinational select over the cells and
     // a store lands on the next edge, neither carrying a delay to absorb one.
     assert((!m.scattered || (m.readLatency == 0 && m.writeLatency == 1)) &&
            "a scattered memory must be timed as registers");
-    // An array over the read budget is built as a register file, at the row's
-    // latencies but not its area.
-    if (!m.scattered && !m.isRom && !m.readsFitStorage())
+    // An array over the port budget is built as a register file, at the row's
+    // latencies but not its area. The budget is one number per axis, so a block
+    // RAM's two writers and concurrent reader are over it even though neither
+    // direction alone is.
+    if (m.realization == MemUnit::Realization::RegisterFile)
       warn(Stage::Emit, func)
-          << "Array " << m.memref.getType() << " reads through "
-          << m.readPortsBuilt << " ports, more than the " << *m.maxReads
-          << " of storage '" << m.storage
-          << "'; it becomes a register file instead. Partition it so the reads "
-             "spread over banks, or bind it to a storage with more ports";
+          << "Array " << m.memref.getType() << " is built with "
+          << m.readPortsBuilt << " read / " << m.writePortsBuilt << " write ("
+          << m.portsBuilt << " altogether) ports per bank, more than storage '"
+          << m.storage << "' has (" << m.ports.describe()
+          << "); it becomes a register file instead. Partition it so the "
+             "accesses spread over banks, or let fewer of them issue at once. "
+             "Only accesses the model proves never issue together share a port";
   }
 
   // `ce` is the only IP port ABI the emitter realizes. `free` has no enable, so
@@ -375,10 +377,13 @@ static void assertStructuralInvariants(const Datapath &dp) {
              "a region lists an access another region issues");
   }
   for (const MemUnit &m : dp.mems) {
-    // A scattered argument's ports are per ELEMENT, so its accesses hold no
-    // port slot: each of them reads every element port and selects.
-    assert(m.elemPorts.size() == (m.scattered ? m.depthWords : 0) &&
-           "element ports belong to exactly the scattered memories, one per "
+    // A scattered argument's ports are per element, so its accesses hold no
+    // port slot: each reads every element port and selects. An internal
+    // scattered array holds the same cells as registers, which reach no
+    // boundary.
+    assert(m.elemPorts.size() ==
+               (m.scattered && m.external ? m.depthWords : 0) &&
+           "element ports belong to exactly the scattered arguments, one per "
            "element");
     for (const MemUnit::Access &acc : m.accesses) {
       --listed;

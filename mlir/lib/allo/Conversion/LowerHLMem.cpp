@@ -4,9 +4,11 @@
  */
 
 #include "allo/Conversion/Passes.h"
-#include "allo/IR/AlloOps.h" // kMemoryInitAttr, kIndependentWritesAttr
+#include "allo/IR/AlloOps.h" // kMemoryInitAttr, kIndependentWritesAttr, kMemPortAttr
 
+#include "circt/Dialect/Comb/CombOps.h"
 #include "circt/Dialect/HW/HWOps.h"
+#include "circt/Dialect/SV/SVAttributes.h"
 #include "circt/Dialect/SV/SVOps.h"
 #include "circt/Dialect/Seq/SeqOps.h"
 
@@ -24,11 +26,21 @@ using namespace circt;
 
 namespace {
 
+/// The accesses of one physical port: its read, its write, and every write of
+/// the memory where the writes could not be split at all. They share one
+/// `always` block, which is what a read and a write of one RAM port are.
+struct MemPort {
+  SmallVector<seq::WritePortOp> writes;
+  seq::ReadPortOp read; // null where the port only writes
+  unsigned readIdx = 0; // its index among the memory's reads, for the reg name
+};
+
 void lowerMemory(seq::HLMemOp mem) {
-  hw::UnpackedArrayType arrayTy = hw::UnpackedArrayType::get(
-      mem.getMemType().getElementType(), mem.getMemType().getShape()[0]);
-  assert(mem.getMemType().getShape().size() == 1 &&
+  seq::HLMemType memType = mem.getMemType();
+  assert(memType.getShape().size() == 1 &&
          "an hlmem is emitted one dimensional");
+  Type elemTy = memType.getElementType();
+  auto arrayTy = hw::UnpackedArrayType::get(elemTy, memType.getShape()[0]);
   SmallVector<seq::ReadPortOp> reads;
   SmallVector<seq::WritePortOp> writes;
   for (Operation *user : mem.getHandle().getUsers()) {
@@ -45,7 +57,14 @@ void lowerMemory(seq::HLMemOp mem) {
   Location loc = mem.getLoc();
   Value clk = mem.getClk();
   StringRef name = mem.getName();
-  Value array = sv::RegOp::create(b, loc, arrayTy, mem.getNameAttr());
+  auto array = sv::RegOp::create(b, loc, arrayTy, mem.getNameAttr());
+  // Pin the array to the structure the device priced it as; left to itself the
+  // synthesizer picks one of its own.
+  if (auto style = mem->getAttrOfType<StringAttr>(kRamStyleAttr)) {
+    std::string expr = ("\"" + style.getValue() + "\"").str();
+    sv::setSVAttributes(
+        array, {sv::SVAttributeAttr::get(b.getContext(), "ram_style", expr)});
+  }
 
   // BLOCKING assignments: only those does synthesis read back as a block-RAM
   // INIT, and only the emitted text tells the two apart.
@@ -64,48 +83,106 @@ void lowerMemory(seq::HLMemOp mem) {
     });
   }
 
-  Value hwClk = seq::FromClockOp::create(b, clk.getLoc(), clk);
-  auto emitBlock = [&](ArrayRef<seq::WritePortOp> group) {
-    sv::AlwaysFFOp::create(
-        b, loc, sv::EventControl::AtPosEdge, hwClk, sv::ResetType::SyncReset,
-        sv::EventControl::AtPosEdge, mem.getRst(), [&] {
-          for (seq::WritePortOp write : group) {
-            Location wloc = write.getLoc();
-            sv::IfOp::create(b, wloc, write.getWrEn(), [&] {
-              Value slot = sv::ArrayIndexInOutOp::create(
-                  b, wloc, array, write.getAddresses()[0]);
-              sv::PAssignOp::create(b, wloc, slot, write.getInData());
-            });
-          }
-        });
+  // One `always` block per physical port (`allo.mem.port`): the write and the
+  // read bound to one port address the array in a single process off one
+  // address, which is the shape a dual-port RAM infers from. An access carrying
+  // no tag shares with nothing, since a FIFO's two ends, lowered before this
+  // pass, can push and pop in one cycle.
+  SmallVector<MemPort> ports;
+  llvm::DenseMap<unsigned, unsigned> byTag;
+  auto portOf = [&](Operation *op) -> MemPort & {
+    auto tag = op->getAttrOfType<IntegerAttr>(kMemPortAttr);
+    if (!tag) {
+      ports.emplace_back();
+      return ports.back();
+    }
+    auto [it, isNew] = byTag.try_emplace(unsigned(tag.getInt()), ports.size());
+    if (isNew)
+      ports.emplace_back();
+    return ports[it->second];
   };
-  // A block per port only where the memory promises the ports never collide:
-  // sharing one is what orders a same-address collision.
-  if (writes.size() > 1 && mem->hasAttr(kIndependentWritesAttr))
+  // Writes not proven collision-free share one block whatever ports they hold,
+  // its priority order resolving the collision they might have. Nothing infers
+  // a RAM from that shape.
+  bool splitWrites = writes.size() <= 1 || mem->hasAttr(kIndependentWritesAttr);
+  if (splitWrites)
     for (seq::WritePortOp write : writes)
-      emitBlock(write);
+      portOf(write).writes.push_back(write);
   else
-    emitBlock(writes);
-
-  // A read enable is not modelled, so a FIFO's `rdEn` reaches here and is
-  // dropped.
+    ports.emplace_back().writes.assign(writes.begin(), writes.end());
+  SmallVector<seq::ReadPortOp> combReads;
   for (auto [i, read] : llvm::enumerate(reads)) {
-    OpBuilder rb(read);
-    rb.setInsertionPointAfter(read);
-    Location rloc = read.getLoc();
-    Value addr = read.getAddresses()[0];
-    unsigned latency = read.getLatency();
-    for (unsigned d = 0; d + 1 < latency; ++d)
-      addr = seq::CompRegOp::create(
-          rb, rloc, addr, clk,
-          rb.getStringAttr(name + "_rdaddr" + Twine(i) + "_dly" + Twine(d)));
-    Value slot = sv::ArrayIndexInOutOp::create(rb, rloc, array, addr);
-    Value data = sv::ReadInOutOp::create(rb, rloc, slot);
-    if (latency > 0)
+    // A latency-0 read is combinational and belongs to no clocked process.
+    if (read.getLatency() == 0) {
+      combReads.push_back(read);
+      continue;
+    }
+    MemPort &port = portOf(read);
+    assert(!port.read && "the accesses bound to one read port are merged into "
+                         "one `seq.read` before this, so a port has at most "
+                         "one");
+    port.read = read;
+    port.readIdx = i;
+  }
+
+  Value hwClk = seq::FromClockOp::create(b, clk.getLoc(), clk);
+  for (MemPort &group : ports) {
+    // A port has one address bus: its write owns it on the cycle it commits and
+    // its read takes it the rest of the time. What the read takes back on a
+    // write cycle is a datum nothing samples, the two having been proved never
+    // to issue together.
+    Value addr, reg;
+    std::string rdName;
+    if (group.read) {
+      rdName = (name + "_rd" + Twine(group.readIdx)).str();
+      assert(group.writes.size() <= 1 &&
+             "a port carrying a read carries at most one write, or the two "
+             "would have no single address to share");
+      addr = group.read.getAddresses()[0];
+      if (!group.writes.empty())
+        addr =
+            comb::MuxOp::create(b, loc, group.writes.front().getWrEn(),
+                                group.writes.front().getAddresses()[0], addr);
+      reg = sv::RegOp::create(b, group.read.getLoc(), elemTy,
+                              b.getStringAttr(rdName + "_reg"));
+    }
+    sv::AlwaysFFOp::create(b, loc, sv::EventControl::AtPosEdge, hwClk, [&] {
+      for (seq::WritePortOp write : group.writes) {
+        Location wloc = write.getLoc();
+        Value wa = addr ? addr : write.getAddresses()[0];
+        sv::IfOp::create(b, wloc, write.getWrEn(), [&] {
+          Value slot = sv::ArrayIndexInOutOp::create(b, wloc, array, wa);
+          sv::PAssignOp::create(b, wloc, slot, write.getInData());
+        });
+      }
+      // A read enable is not modelled, so a FIFO's `rdEn` reaches here and is
+      // dropped.
+      if (group.read) {
+        Location rloc = group.read.getLoc();
+        Value slot = sv::ArrayIndexInOutOp::create(b, rloc, array, addr);
+        sv::PAssignOp::create(b, rloc, reg,
+                              sv::ReadInOutOp::create(b, rloc, slot));
+      }
+    });
+    if (!group.read)
+      continue;
+    // The port reads at latency 1; anything deeper is an output pipeline
+    // register on the data, which is the register a block RAM or an UltraRAM
+    // has. Registering the address instead lands on the same cycle and throws
+    // that register away.
+    Location rloc = group.read.getLoc();
+    Value data = sv::ReadInOutOp::create(b, rloc, reg);
+    for (unsigned d = 1; d < group.read.getLatency(); ++d)
       data = seq::CompRegOp::create(
-          rb, rloc, data, clk,
-          rb.getStringAttr(name + "_rd" + Twine(i) + "_reg"));
-    read.replaceAllUsesWith(data);
+          b, rloc, data, clk, b.getStringAttr(rdName + "_dly" + Twine(d)));
+    group.read.replaceAllUsesWith(data);
+    group.read.erase();
+  }
+  for (seq::ReadPortOp read : combReads) {
+    Location rloc = read.getLoc();
+    Value slot =
+        sv::ArrayIndexInOutOp::create(b, rloc, array, read.getAddresses()[0]);
+    read.replaceAllUsesWith(sv::ReadInOutOp::create(b, rloc, slot).getResult());
     read.erase();
   }
 

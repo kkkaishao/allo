@@ -91,35 +91,33 @@ class MuxClass:
 
 @dataclass(frozen=True)
 class MemoryCost:
-    """What the cost model needs of one array and no reader does: the ports the
-    model DEMANDED, and who drives them.
+    """What the cost model needs of one array and no reader does: the ports it
+    was bound with, and who drives them.
 
-    ``writing_calls`` counts the DISTINCT children driving a write port: several
+    ``call_reads`` / ``call_writes`` count the ports a child drives: several
     ports of one child are that child's own boundary, several children are
-    genuinely concurrent writers, and only the second is a banking problem."""
+    concurrent writers, and only the second is a banking problem."""
 
     call_reads: int
     call_writes: int
-    writing_calls: int
-    writing_regions: int
-    #: what the model demanded of ONE bank, which is what the storage had to be
-    #: built to serve.
-    ports_needed_write: int
-    ports_needed_total: int
-    #: read ports one bank is built with, one per read since nothing shares one.
-    #: What the realization's read budget is checked against.
+    #: ports one bank is built with, per direction: the distinct ports the
+    #: binding assigned. Accesses share one only where the model proved they
+    #: never issue in the same cycle.
     read_ports: int
+    write_ports: int
+    #: ports it is built with altogether, which is not their sum: a port of a
+    #: pooled storage may carry both a read and a write that never issue
+    #: together, and then one address bus carries both.
+    ports: int
 
     @classmethod
     def from_json(cls, d: dict) -> MemoryCost:
         return cls(
             call_reads=d["call_reads"],
             call_writes=d["call_writes"],
-            writing_calls=d["writing_calls"],
-            writing_regions=d["writing_regions"],
-            ports_needed_write=d["ports_needed_write"],
-            ports_needed_total=d["ports_needed_total"],
             read_ports=d["read_ports"],
+            write_ports=d["write_ports"],
+            ports=d["ports"],
         )
 
 
@@ -145,6 +143,11 @@ class Memory:
     writes_independent: bool
     rom: bool
     skewed: bool
+    #: what the module built to hold it: ``"boundary"`` (the cells are the
+    #: caller's), ``"rom"``, ``"scatter"``, ``"ram"``, or ``"register_file"``
+    #: for an array whose bound ports over-ran its storage row. The emitter's
+    #: own decision, read back rather than re-derived.
+    realization: str
     #: whether the partition BOUGHT the bandwidth it costs: every access reaches
     #: one bank. An access the analysis could not fix takes a port on every
     #: bank, so a partition resolving none of them is N memories at the
@@ -177,6 +180,7 @@ class Memory:
             writes_independent=d["writes_independent"],
             rom=d["rom"],
             skewed=d["skewed"],
+            realization=d["realization"],
             partition_resolved=d["partition_resolved"],
         )
 

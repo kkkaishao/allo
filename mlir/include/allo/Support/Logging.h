@@ -70,8 +70,9 @@ enum class Code {
   AddressOverPeriod,           // an address cone we cannot register
   BindingMuxOverPeriod,        // a mux over the slack the schedule left
   // ALLO-N0012 is retired and is not reused.
-  PlacementFailed,  // no feasible cycle for an operation
-  NoExactScheduler, // this build has no OR-Tools
+  PlacementFailed,             // no feasible cycle for an operation
+  NoExactScheduler,            // this build has no OR-Tools
+  PartitionedInitializedArray, // banked contents, realized as one bank
 };
 
 /// The one table: a code's stable spelling.
@@ -137,6 +138,8 @@ constexpr const char *codeTag(Code code) {
     return "ALLO-N0013";
   case Code::NoExactScheduler:
     return "ALLO-N0014";
+  case Code::PartitionedInitializedArray:
+    return "ALLO-N0015";
   }
   return "";
 }

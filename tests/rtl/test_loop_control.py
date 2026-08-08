@@ -534,7 +534,9 @@ def test_stencil3d_grid_boundary_cosim():
     rtl = _to_rtl(stencil3d)
     res = rtl.schedule()
     assert res.func("stencil3d").latency is not None
-    assert min(_iis(res.cyclic())) == 1  # the boundary copies carry no dependence
+    # The boundary copies carry no dependence, so what paces them is their two
+    # stores per iteration against the one write port distributed RAM has.
+    assert min(_iis(res.cyclic())) == 2
 
     coeff = np.array([2, 3], np.int32)
     orig = (np.arange(R * C * H, dtype=np.int32) % 5 + 1).reshape(R, C, H)

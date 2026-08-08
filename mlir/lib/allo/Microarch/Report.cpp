@@ -36,6 +36,23 @@ std::string layoutName(const MemUnit &m) {
   return bankKindName(first).str();
 }
 
+/// The structure the module built for an array, as one word.
+llvm::StringRef realizationName(MemUnit::Realization r) {
+  switch (r) {
+  case MemUnit::Realization::Boundary:
+    return "boundary";
+  case MemUnit::Realization::Rom:
+    return "rom";
+  case MemUnit::Realization::Scatter:
+    return "scatter";
+  case MemUnit::Realization::Ram:
+    return "ram";
+  case MemUnit::Realization::RegisterFile:
+    return "register_file";
+  }
+  llvm_unreachable("every realization is named");
+}
+
 /// The multiplexers of one region, aggregated by (fan-in, width).
 std::vector<MuxClass> muxClasses(const Datapath &dp, const RegionBlock &rb) {
   std::map<std::pair<unsigned, unsigned>, unsigned> byClass;
@@ -98,28 +115,16 @@ FuncUarch::FuncUarch(const Datapath &dp, llvm::StringRef symbol,
     mr.depthWords = m.depthWords;
     mr.readLatency = m.readLatency;
     mr.writeLatency = m.writeLatency;
-    llvm::SmallDenseSet<unsigned> writingRegions;
-    llvm::SmallDenseSet<CallId> writingCalls;
-    for (const MemUnit::Access &acc : m.accesses) {
+    for (const MemUnit::Access &acc : m.accesses)
       (acc.isWrite ? mr.writes : mr.reads)++;
-      if (acc.isWrite)
-        writingRegions.insert(acc.region);
-    }
     for (const CallUnit &cu : dp.calls)
-      for (const CallUnit::MemArg &ma : cu.memArgs) {
-        if (ma.mem != m.id)
-          continue;
-        (ma.isWrite ? mr.cost.callWrites : mr.cost.callReads)++;
-        if (ma.isWrite) {
-          writingCalls.insert(cu.id);
-          writingRegions.insert(cu.region);
-        }
-      }
-    mr.cost.writingCalls = writingCalls.size();
-    mr.cost.writingRegions = writingRegions.size();
-    mr.cost.portsNeededWrite = dp.portsNeeded(m.id, /*writesOnly=*/true);
-    mr.cost.portsNeededTotal = dp.portsNeeded(m.id, /*writesOnly=*/false);
+      for (const CallUnit::MemArg &ma : cu.memArgs)
+        if (ma.mem == m.id)
+          (ma.isWrite ? mr.cost.callWrites : mr.cost.callReads)++;
     mr.cost.readPorts = m.readPortsBuilt;
+    mr.cost.writePorts = m.writePortsBuilt;
+    mr.cost.ports = m.portsBuilt;
+    mr.realization = realizationName(m.realization);
     mr.external = m.external;
     mr.scattered = m.scattered;
     mr.writesIndependent = m.writesIndependent;
@@ -234,18 +239,14 @@ std::string MicroarchReport::toJSON() const {
                 j.attributeObject("cost", [&] {
                   j.attribute("call_reads", (int64_t)m.cost.callReads);
                   j.attribute("call_writes", (int64_t)m.cost.callWrites);
-                  j.attribute("writing_calls", (int64_t)m.cost.writingCalls);
-                  j.attribute("writing_regions",
-                              (int64_t)m.cost.writingRegions);
-                  j.attribute("ports_needed_write",
-                              (int64_t)m.cost.portsNeededWrite);
-                  j.attribute("ports_needed_total",
-                              (int64_t)m.cost.portsNeededTotal);
                   j.attribute("read_ports", (int64_t)m.cost.readPorts);
+                  j.attribute("write_ports", (int64_t)m.cost.writePorts);
+                  j.attribute("ports", (int64_t)m.cost.ports);
                 });
                 j.attribute("external", m.external);
                 j.attribute("scattered", m.scattered);
                 j.attribute("writes_independent", m.writesIndependent);
+                j.attribute("realization", m.realization);
                 j.attribute("rom", m.rom);
                 j.attribute("skewed", m.skewed);
                 j.attribute("partition_resolved", m.partitionResolved);

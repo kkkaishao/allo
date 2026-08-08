@@ -1118,6 +1118,63 @@ def test_constant_table_reads_are_unlimited_port():
     assert np.array_equal(B, t[A % 8] + t[(A + 1) % 8] + t[(A + 2) % 8])
 
 
+def test_a_constant_table_is_priced_as_the_logic_it_is_built_from():
+    # A ROM holds no memory bits and occupies no storage row: it is emitted as a
+    # constant array read by an index, so the part builds it out of LUTs. One
+    # LUT6 is a 64-entry one-bit lookup, so a 64-deep table costs its width.
+    table = (np.arange(64, dtype=np.int32) * 7) & 0xFF
+
+    @kernel
+    def rom(A: i32[8], B: i32[8]):
+        tbl: i32[64] = table
+        for i in range(8):
+            B[i] = tbl[A[i] % 64]
+
+    rtl = _to_rtl(rom)
+    rtl.compile()
+    mem = next(
+        m
+        for f in rtl.report.microarch.funcs
+        for m in f.mems
+        if m.owner.startswith("tbl")
+    )
+    assert mem.realization == "rom"
+    est = qor.estimate(rtl.report)
+    assert est.mem_bits == 0, "a constant table is logic, not memory"
+    assert est.by_kind["memories"].lut == 32
+
+    # Binding it to a block RAM changes nothing: the emission ignores the row
+    # (only its read latency is taken from it), so charging a BRAM tile would be
+    # pricing a structure the design does not contain.
+    s = rom.schedule()
+    s.bind_storage("tbl", impl=Schedule.BRAM, mem_type=s.RAM_T2P)
+    rtl = s.export("rtl")
+    rtl.compile()
+    assert qor.estimate(rtl.report).area.bram36 == 0
+
+
+def test_a_banked_array_cannot_be_declared_with_contents():
+    # The contents are one array of words and the emitter realizes them as one
+    # bank, so a banking partition on such an array is refused rather than
+    # silently dropped. A complete partition is not banking and stays legal.
+    table = (np.arange(16, dtype=np.int32) * 7) & 0xFF
+
+    @kernel
+    def tbl16(A: i32[16], B: i32[16]):
+        tbl: i32[16] = table
+        for i in range(16):
+            B[i] = tbl[i] + A[i]
+
+    s = tbl16.schedule()
+    s.partition("tbl", kind=Schedule.Cyclic, dim=1, factor=2)
+    with pytest.raises(RuntimeError):
+        s.export("rtl").schedule()
+
+    s = tbl16.schedule()
+    s.partition("tbl")
+    s.export("rtl").schedule()
+
+
 def test_written_array_keeps_its_port_limit():
     # The contrast that keeps the ROM grant narrow: the SAME three reads off an
     # array the kernel writes are still bound by its two ports (II=2). Read-only
@@ -1354,6 +1411,67 @@ def test_an_undeclared_storage_is_reported():
         s.export("rtl", device=dev).schedule()
 
 
+def test_a_storage_that_powers_up_undefined_cannot_hold_declared_contents():
+    # An UltraRAM comes up with no contents, so an array that must start holding
+    # them is not something it can be. Asked for it anyway, the synthesizer
+    # quietly builds a block RAM instead and the design occupies what it was
+    # never priced as, which is exactly the drift a diagnostic here prevents.
+    @kernel
+    def rmw(A: i32[8], B: i32[8]):
+        tbl: i32[8] = [1, 2, 3, 4, 5, 6, 7, 8]
+        for i in range(8):
+            tbl[i] = tbl[i] + A[i]
+        for i in range(8):
+            B[i] = tbl[i]
+
+    s = rmw.schedule()
+    s.bind_storage("tbl", impl=Schedule.URAM, mem_type=s.RAM_T2P)
+    with pytest.raises(RuntimeError):
+        s.export("rtl").schedule()
+
+    # A read-only table escapes it: it is realized as logic and never reaches
+    # the storage at all.
+    @kernel
+    def ro(A: i32[8], B: i32[8]):
+        tbl: i32[8] = [1, 2, 3, 4, 5, 6, 7, 8]
+        for i in range(8):
+            B[i] = tbl[i] + A[i]
+
+    s = ro.schedule()
+    s.bind_storage("tbl", impl=Schedule.URAM, mem_type=s.RAM_T2P)
+    s.export("rtl").schedule()
+
+
+def test_a_multi_cycle_read_registers_the_datum_not_the_address():
+    # A 2-cycle read is a port that reads in one cycle and holds the datum in an
+    # output register, which is the register a block RAM and an UltraRAM have.
+    # Registering the address instead lands the same datum on the same cycle and
+    # throws that register away, leaving the array with the deeper timing and
+    # nothing to build it out of.
+    @kernel
+    def k(A: i32[32], out: i32[32]):
+        buf: i32[32] = 0
+        for i in range(32):
+            buf[i] = A[i] + 1
+        for i in range(32):
+            out[i] = buf[i]
+
+    s = k.schedule()
+    s.bind_storage("buf", impl=Schedule.URAM, mem_type=s.RAM_T2P)
+    rtl = s.export("rtl")
+    rtl.compile()
+    v = rtl.verilog
+    assert re.search(r"buf__rd0_reg <= buf_\[\w+\];", v), "the port reads in one"
+    assert re.search(r"buf__rd0_dly1 <= buf__rd0_reg;", v), "the datum is held"
+    assert "_rdaddr" not in v, "no address delay stage"
+    assert '(* ram_style = "ultra" *)' in v
+
+    out = np.zeros(32, np.int32)
+    A = np.arange(32, dtype=np.int32)
+    rtl.cosim(A, out)
+    assert np.array_equal(out, A + 1)
+
+
 def test_a_complete_partition_conflicting_with_a_bind_is_reported():
     # Layout and realization are different axes, but a complete partition
     # scatters the array into flip-flops whatever `impl=` asked for, so the two
@@ -1436,11 +1554,12 @@ def test_a_scatter_row_declares_no_port_limit():
             )
 
 
-def test_more_reads_than_the_row_has_ports_becomes_a_register_file():
-    # A read port is never shared, so an array is built with one per read. Past
-    # what the storage row declares there is no RAM to infer, and claiming
-    # independent write ports would remove the register fallback the array still
-    # needs, so the emitter drops the claim instead.
+def test_reads_share_the_ports_the_row_has_rather_than_taking_one_each():
+    # Six reads of one array in one region. The scheduler bills the row's read
+    # ports, so it staggers them across cycles; the port binding then puts them
+    # on that many ports rather than one each, and the array still infers a RAM.
+    # The two halves have to agree: a schedule cut to fit two ports whose
+    # emission built six would spend the II and get the register file anyway.
     @kernel
     def k(A: i32[32], out: i32[8]):
         buf: i32[32] = 0
@@ -1457,33 +1576,40 @@ def test_more_reads_than_the_row_has_ports_becomes_a_register_file():
             for m in f.mems
             if m.owner.startswith("buf")
         )
-        return mem, rtl.mlir
+        return mem, rtl
 
-    # Distributed RAM declares no read limit: six reads still infer a RAM.
-    mem, mlir = buf_of(_to_rtl(k))
-    assert mem.storage == "lutram" and mem.cost.read_ports == 6
-    assert "independent" in mlir
+    mem, _ = buf_of(_to_rtl(k))
+    assert mem.storage == "lutram"
+    assert mem.reads == 6 and mem.cost.read_ports == 2
+    # A LUT RAM's write port and its replicated reads are separate structures,
+    # so its three ports really are three and it has all three.
+    assert mem.cost.ports == 3 and mem.realization == "ram"
 
-    # A block RAM has two ports, which six reads do not fit.
+    # A block RAM's two ports are ONE pool, each serving a read or a write in a
+    # cycle, so two read ports and the fill loop's write port cannot each take
+    # one. The fill loop and the drain loop never run together, so the write
+    # rides a read's port instead: two ports, one block RAM, and the vendor
+    # attribute pinning it there.
     s = k.schedule()
     s.bind_storage("buf", impl=Schedule.BRAM, mem_type=s.RAM_T2P)
-    mem, mlir = buf_of(s.export("rtl"))
-    assert mem.storage == "bram" and mem.cost.read_ports == 6
-    assert "independent" not in mlir
+    mem, rtl = buf_of(s.export("rtl"))
+    assert mem.storage == "bram"
+    assert mem.cost.read_ports == 2 and mem.cost.write_ports == 1
+    assert mem.cost.ports == 2 and mem.realization == "ram"
+    assert '(* ram_style = "block" *)' in rtl.verilog
+    assert qor.estimate(rtl.report).area.bram36 == 1
 
 
-def test_two_non_colliding_writes_price_as_a_ram_where_the_row_has_two_ports():
-    # Two stores the schedule proved never collide get an `always` block each,
-    # which is what infers a true dual port. The area estimator reads that
-    # decision back off the report and charges the array as a RAM rather than as
-    # a register file; the ceiling it checks against is the emitter's own, which
-    # is the resolved storage row's write ports. Distributed RAM has one, so the
-    # same two stores only reach a RAM once the array is bound somewhere with
-    # two.
+def test_a_row_with_one_write_port_is_scheduled_to_one_rather_than_overrun():
+    # Two stores per iteration against a row with a single write port. The
+    # scheduler bills that one port, so it puts the stores on different cycles
+    # (II 2, not 1) and the binding lands them both on it: the array stays a
+    # RAM, where billing two and building one would have silently produced a
+    # register file at the II of a RAM.
     #
     # Deeper than the auto-partition threshold on purpose: a completely
     # partitioned array is realized as registers and never reaches a port at
-    # all, so only a deeper one puts the colouring under test.
+    # all, so only a deeper one puts the binding under test.
     @kernel
     def k(A: i32[32], out: i32[32]):
         buf: i32[32] = 0
@@ -1501,18 +1627,32 @@ def test_two_non_colliding_writes_price_as_a_ram_where_the_row_has_two_ports():
             for m in f.mems
             if m.owner.startswith("buf")
         )
-        assert m.cost.ports_needed_write == 2
-        return m, qor.estimate(rtl.report)
+        return m, qor.estimate(rtl.report), rtl
 
-    mem, est = buf_of(_to_rtl(k))
+    mem, est, rtl = buf_of(_to_rtl(k))
     assert mem.storage == "lutram"
-    assert est.mem_bits == 0  # one write port: a register file, not a RAM
+    assert mem.writes == 2 and mem.cost.write_ports == 1
+    assert mem.realization == "ram" and est.mem_bits == 32 * 32
+    # One port carries both stores, so nothing claims they are independent.
+    assert not mem.writes_independent and "independent" not in rtl.mlir
 
+    # Two write ports where the row has two: each gets its own `always` block,
+    # which is what infers a true dual port. The drain loop's read rides one of
+    # them, since the two loops never run together and a pooled port serves
+    # either direction, so the three accesses still fit the two ports it has.
     s = k.schedule()
     s.bind_storage("buf", impl=Schedule.BRAM, mem_type=s.RAM_T2P)
-    mem, est = buf_of(s.export("rtl"))
+    mem, est, rtl = buf_of(s.export("rtl"))
     assert mem.storage == "bram"
-    assert est.mem_bits == 32 * 32
+    assert mem.cost.write_ports == 2 and mem.writes_independent
+    assert mem.cost.ports == 2 and mem.realization == "ram"
+    assert "independent" in rtl.mlir and est.area.bram36 == 1
+    # The port a read and a write share addresses the array once, in one
+    # `always` block: two address buses over three accesses is what a dual-port
+    # RAM has to see, and three would infer nothing.
+    assert re.search(
+        r"buf_\[(\w+)\] <= \w+;.*\n.*buf__rd0_reg <= buf_\[\1\]", rtl.verilog
+    ), "the shared port's write and read take one address"
 
 
 def test_a_tiled_cost_prices_the_whole_shape():

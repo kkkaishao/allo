@@ -172,9 +172,28 @@ struct DatapathBuilder {
   /// call is bound. Owner names come from `uniqueOwnerOf` against the module's
   /// whole memref list, so two arguments sharing a source name still differ.
   void enumerateBoundaryPorts();
-  /// Count the read ports each memory is built with (`readPortsBuilt`). Runs
-  /// once every access and call is bound, before the write colourings read it.
-  void countReadPorts();
+  /// Bind every memory access and child port to a port of its bank
+  /// (`MemUnit::Access::port`, `CallUnit::MemArg::port`) and record how many
+  /// ports each bank is built with. The boundary port enumeration, the emitter
+  /// and the report all read it. Runs after `deriveInterconnect`, the first
+  /// point at which an access knows its bank and its skew lane.
+  void bindMemoryPorts();
+  /// Ports one bank comes out of a `bindPorts` colouring with: split by
+  /// direction, and counted outright, which is below their sum wherever a port
+  /// carries both. `colours` is the whole memory's count, where a second
+  /// colouring of the other direction starts numbering.
+  struct PortCounts {
+    unsigned reads = 0, writes = 0, total = 0, colours = 0;
+  };
+  /// Colour one memory's port graph and write the result into
+  /// `MemUnit::Access::port` / `CallUnit::MemArg::port`. \p writes picks a
+  /// direction, or nullopt takes both together. \p base offsets the numbering
+  /// so a second, separate colouring cannot collide with the first.
+  PortCounts bindPorts(MemUnit &m, std::optional<bool> writes, unsigned base);
+  /// Decide each memory's `MemUnit::Realization`. Runs after
+  /// `bindMemoryPorts`, whose port counts separate a RAM from the register
+  /// file an over-budget array falls to.
+  void classifyRealizations();
   /// Record each top-level region's composition predecessors
   /// (`rb.predecessors`): the earlier top-level siblings it must start after.
   /// Runs last (needs the final memref accesses and region tree).

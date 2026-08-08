@@ -71,11 +71,38 @@ struct MemKindTiming {
   RWDelay delay;
 };
 
-/// Ports of each direction one storage realization provides, nullopt where it
-/// has no limit.
+/// What one storage realization can serve in a cycle, per bank: ports of each
+/// direction, and the pool the two directions draw on together. Nullopt is no
+/// limit on that axis. The one port budget, reserved against by the scheduler
+/// and bound against by the datapath.
+///
+/// A block RAM's two ports each read or write, so two writers and a concurrent
+/// reader take three of them and the pool is what says so. A row whose
+/// directions are independent structures declares no pool, as a LUT RAM's
+/// single write port against its replicated reads does.
 struct StoragePorts {
   std::optional<unsigned> reads;
   std::optional<unsigned> writes;
+  std::optional<unsigned> pool;
+
+  /// The tighter of the two budgets on every axis. A nullopt is no limit and
+  /// yields to whatever the other side declares.
+  StoragePorts meet(const StoragePorts &other) const;
+
+  /// Whether \p other asks for a port this budget does not have on some axis,
+  /// which is what makes a requested topology and a chosen realization
+  /// comparable.
+  bool exceededBy(const StoragePorts &other) const;
+
+  /// Whether \p reads read ports, \p writes write ports and \p ports of them
+  /// altogether fit on every axis. The third is not the sum of the first two:
+  /// where a port serves either direction, one of them may carry a read and a
+  /// write that never issue together.
+  bool fit(unsigned reads, unsigned writes, unsigned ports) const;
+
+  /// This budget as one phrase for a diagnostic ("2 read / 1 write over 2
+  /// shared ports"), an unlimited axis spelled as such.
+  std::string describe() const;
 };
 
 /// One `dcp.storage` row: a structure the device can hold an array in, named by
@@ -84,6 +111,13 @@ struct StorageRealization {
   std::string name;
   MemKindTiming timing;
   StoragePorts ports;
+  /// The vendor attribute that pins an array to this structure, stamped on the
+  /// emitted declaration. Empty where the part has no such attribute, and the
+  /// synthesizer then chooses.
+  std::string ramStyle;
+  /// Whether the structure comes up holding contents. False for one that powers
+  /// up undefined, as an UltraRAM does.
+  bool canInit = true;
 };
 
 /// The storage-timing library, filled from the `dcp.storage` and
@@ -108,20 +142,22 @@ public:
   /// not one. An array access is timed by its memref's storage realization.
   Timing timing(Operation *op) const;
 
-  /// The timing of storage realization \p storage. The device is required to
+  /// The device's row for the storage realization \p name, or null where it
+  /// declares none. Everything the device states about a structure is read
+  /// from here, so one lookup answers timing, ports and vendor attribute
+  /// together.
+  const StorageRealization *row(llvm::StringRef name) const;
+
+  /// The timing of storage realization \p name. The device is required to
   /// declare every realization an array resolves to, which `PreVerification`
   /// enforces; an undeclared one asserts here and falls to a zero
   /// (combinational) timing.
-  MemKindTiming timing(llvm::StringRef storage) const;
+  MemKindTiming timing(llvm::StringRef name) const;
 
-  /// The ports storage realization \p storage provides; unlimited for one the
-  /// device does not declare, which `PreVerification` rejects on its own.
-  StoragePorts ports(llvm::StringRef storage) const;
-
-  /// Whether the device declares \p storage. An array resolving to an
-  /// undeclared realization would otherwise be scheduled at latency 0 and read
-  /// before its data is valid.
-  bool declares(llvm::StringRef storage) const;
+  /// Whether the device declares \p name. An array resolving to an undeclared
+  /// realization would otherwise be scheduled at latency 0 and read before its
+  /// data is valid.
+  bool declares(llvm::StringRef name) const { return row(name); }
 
   /// Whether \p storage is the row the device marked `scatter`: one cell per
   /// element, no address, no port limit. False for every row when the device
@@ -238,11 +274,11 @@ BankLayout bankLayoutOf(Value memRef);
 /// datapath (`MemUnit`), so what a schedule reserves and what the emitter wires
 /// cannot drift apart.
 struct MemoryChar {
-  BankLayout layout;          // element-space banks (one when unpartitioned)
-  bool splitRW = false;       // dedicated read/write ports (SimpleDualPort)
-  unsigned sharedPorts = 2;   // per bank, shared R/W (Single/TrueDual/default)
-  unsigned readPorts = 0;     // per bank, dedicated read  (splitRW)
-  unsigned writePorts = 0;    // per bank, dedicated write (splitRW)
+  BankLayout layout; // element-space banks (one when unpartitioned)
+  /// Ports one bank has: the resolved `storage` row's, narrowed by the
+  /// `allo.bind.storage type=` topology. One budget for the scheduler and the
+  /// emitter both.
+  StoragePorts ports;
   bool constantTable = false; // realized as a combinational constant array
   /// Resolved `dcp.storage` realization. EMPTY only for the one array that has
   /// nowhere to go, a complete partition on a device marking no `scatter` row,
@@ -261,6 +297,12 @@ struct MemoryChar {
 /// completely partitioned one scatters into. It has to be the same device the
 /// access latencies were stamped from, or the two disagree.
 MemoryChar characterize(Value memref, const MemoryLibrary &lib);
+
+/// The ports the `allo.bind.storage type=` topology on \p memref asks for, or
+/// nullopt where it names none. A constraint rather than a budget: the array's
+/// realization decides what it has and this only narrows it. `PreVerification`
+/// reports a topology the row cannot meet.
+std::optional<StoragePorts> requestedPortsOf(Value memref);
 
 /// The canonical spelling of \p part for a memref of \p type: a COMPLETE
 /// partition collapses to its one whole-array axis, a `dim == 0` block or
