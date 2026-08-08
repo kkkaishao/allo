@@ -27,6 +27,7 @@ enum class RegRole {
   Survivor, // a region result, or a loop-carried iter-arg latch
   Counter,  // an iteration counter, or one of its address strides
   Control,  // run / phase / pending / done, and the rest of the control plane
+  Storage,  // one element of an array scattered into registers
 };
 
 llvm::StringRef roleName(RegRole role);

@@ -186,14 +186,21 @@ std::string memCellName(llvm::StringRef owner, unsigned numBanks,
   return numBanks > 1 ? bankBase(owner, bank) : verilogName(owner);
 }
 
-std::string memCellName(const Datapath &dp, const MemUnit &m, unsigned bank) {
-  // The memrefs of the module are the sibling namespace the tie-break runs in;
-  // an internal memory has no boundary port carrying an already-resolved owner.
+// The memrefs of the module are the sibling namespace the tie-break runs in; an
+// internal memory has no boundary port carrying an already-resolved owner.
+static std::string memOwnerName(const Datapath &dp, const MemUnit &m) {
   llvm::SmallVector<Value> siblings;
   for (const MemUnit &o : dp.mems)
     siblings.push_back(o.memref);
-  return memCellName(uniqueOwnerOf(m.memref, siblings, memOwner(m.id)),
-                     m.numBanks, bank);
+  return uniqueOwnerOf(m.memref, siblings, memOwner(m.id));
+}
+
+std::string memCellName(const Datapath &dp, const MemUnit &m, unsigned bank) {
+  return memCellName(memOwnerName(dp, m), m.numBanks, bank);
+}
+
+std::string memElemName(const Datapath &dp, const MemUnit &m, unsigned k) {
+  return verilogName(memOwnerName(dp, m) + "_" + std::to_string(k));
 }
 
 std::string regionSignal(llvm::StringRef tag, llvm::StringRef sig) {

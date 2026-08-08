@@ -203,13 +203,17 @@ struct MemUnit {
   /// instead of routed. False on a skewed layout whose slots `assign-banks`
   /// declined to assign, which then crossbars like any other.
   bool skewed = false;
-  /// This argument crosses the TOP boundary completely partitioned, arriving
-  /// as one port per ELEMENT rather than an addressed interface
-  /// (`external && dp.atTop && layout.registers`). A complete partition commits
-  /// the scheduler to unlimited combinational ports, which only an
-  /// element-per-port boundary delivers (an addressed port serves one element
-  /// per cycle). Below the top the owning storage serves an ordinary addressed
-  /// port.
+  /// This memory is realized as one CELL PER ELEMENT rather than as an
+  /// addressed interface, which is what `layout.registers` (a complete
+  /// partition) asks for: it commits the scheduler to unlimited combinational
+  /// ports, and an addressed port serves one element per cycle.
+  ///
+  /// Where the cells live depends on who owns them. A top-level argument's are
+  /// the caller's, so they arrive as one port per element (`elemPorts`). An
+  /// INTERNAL array's are this module's, so they are registers here and reads
+  /// select over them combinationally. A callee's array argument is neither:
+  /// the storage is the parent's, and the child masters an ordinary addressed
+  /// port on it whether or not the parent scattered it.
   bool scattered = false;
   /// This memory's boundary WRITE port groups never collide: two of them may
   /// be enabled in one cycle, but only where the scheduler proved they address

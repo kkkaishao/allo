@@ -190,6 +190,11 @@ LogicalResult checkDeviceCapability(dcp::DCPathModuleOp func,
                "realized as a single bank";
     }
     assert(m.writeLatency >= 1 && "a 0-cycle write port reached emission");
+    // The scatter realization is registers, and the emitter builds them at
+    // exactly that timing: a read is a combinational select over the cells and
+    // a store lands on the next edge, neither carrying a delay to absorb one.
+    assert((!m.scattered || (m.readLatency == 0 && m.writeLatency == 1)) &&
+           "a scattered memory must be timed as registers");
   }
 
   // `ce` is the only IP port ABI the emitter realizes. `free` has no enable, so

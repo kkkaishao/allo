@@ -224,6 +224,8 @@ llvm::StringRef roleName(RegRole role) {
     return "counter";
   case RegRole::Control:
     return "control";
+  case RegRole::Storage:
+    return "storage";
   }
   llvm_unreachable("every RegRole has a name");
 }

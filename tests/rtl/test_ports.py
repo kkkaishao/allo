@@ -221,12 +221,15 @@ def test_port_name_grammar():
 
     # A bare owner that is a keyword still needs the escape: an on-chip buffer
     # named `buf` carries no role suffix and collides with the gate primitive.
+    # Deeper than the auto-partition threshold, since a completely partitioned
+    # array is realized per element and its cells carry an index that already
+    # separates them from the keyword.
     @kernel
-    def kwbuf(A: i32[16], out: i32[16]):
-        buf: i32[16] = 0
-        for i in range(16):
+    def kwbuf(A: i32[32], out: i32[32]):
+        buf: i32[32] = 0
+        for i in range(32):
             buf[i] = A[i] * 2
-        for j in range(16):
+        for j in range(32):
             out[j] = buf[j] + 1
 
     assert re.search(r"\bbuf_\b", _to_rtl(kwbuf).verilog)

@@ -178,9 +178,11 @@ MemId DatapathBuilder::getOrCreateMem(Value memref) {
   }
   m.layout = mc.layout;
   m.numBanks = m.layout.numBanks;
-  // THE expression behind `scattered` (see its declaration for why the top is
-  // the only place a complete partition changes the boundary shape).
-  m.scattered = m.external && dp.atTop && m.layout.registers;
+  // THE expression behind `scattered` (see its declaration for where the cells
+  // live). A callee's array argument is the one place a complete partition
+  // changes nothing: the storage is the parent's and the child masters an
+  // addressed port on it.
+  m.scattered = m.layout.registers && (!m.external || dp.atTop);
   m.storage = mc.storage;
   // Access latency of the resolved realization, from the same device rows the
   // scheduler timed this memref's accesses against (`MemoryLibrary::timing`).

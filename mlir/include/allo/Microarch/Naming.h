@@ -144,6 +144,9 @@ std::string resultPortName(unsigned i, unsigned n);
 std::string memCellName(llvm::StringRef owner, unsigned numBanks,
                         unsigned bank);
 std::string memCellName(const Datapath &dp, const MemUnit &m, unsigned bank);
+/// `<owner>_<k>`: element \p k of an internal array scattered into registers.
+/// The index is bare, as `elemBase` spells a scattered argument's.
+std::string memElemName(const Datapath &dp, const MemUnit &m, unsigned k);
 /// `r<region>_<sig>`: a region's control-plane signal (`run`, `issue`, `iv`,
 /// `phase`, `done`, `ce`). The StringRef form takes an already-formed tag
 /// (`EmitContext::regionTag`).

@@ -1424,13 +1424,17 @@ def test_two_non_colliding_writes_still_price_as_a_ram():
     # which is what infers a true dual port. The area estimator reads that
     # decision back off the report and charges the array as a RAM rather than as
     # a register file; the ceiling it checks against is the emitter's own.
+    #
+    # Deeper than the auto-partition threshold on purpose: a completely
+    # partitioned array is realized as registers and never reaches a port at
+    # all, so only a deeper one puts the colouring under test.
     @kernel
-    def k(A: i32[16], out: i32[16]):
-        buf: i32[16] = 0
-        for i in range(8):
+    def k(A: i32[32], out: i32[32]):
+        buf: i32[32] = 0
+        for i in range(16):
             buf[2 * i] = A[2 * i] + 1
             buf[2 * i + 1] = A[2 * i + 1] + 2
-        for i in range(16):
+        for i in range(32):
             out[i] = buf[i]
 
     rtl = _to_rtl(k)
@@ -1440,7 +1444,7 @@ def test_two_non_colliding_writes_still_price_as_a_ram():
         m for f in report.microarch.funcs for m in f.mems if m.owner.startswith("buf")
     )
     assert buf.cost.ports_needed_write == 2 <= qor.MAX_WRITE_PORTS
-    assert qor.estimate(report).mem_bits == 16 * 32
+    assert qor.estimate(report).mem_bits == 32 * 32
 
 
 def test_a_tiled_cost_prices_the_whole_shape():
@@ -1960,7 +1964,10 @@ def test_buffer_threaded_across_regions_is_one_memory(depth):
                 B[i] = t[0]
 
     mod = _to_rtl(cross)
-    assert len(re.findall(r"= seq\.hlmem", mod.mlir)) == 1, mod.mlir
+    # Counted off the memories rather than off the emitted cells: `t` is small
+    # enough to be auto-partitioned, so it is realized as one register per
+    # element and holds no `seq.hlmem` to count.
+    assert len([m for f in mod.microarch.funcs for m in f.mems if not m.external]) == 1
     B = np.zeros(8, np.int32)
     mod.cosim(A8, B)
     assert np.array_equal(B, A8[0] + np.cumsum(A8))
@@ -1982,7 +1989,7 @@ def test_two_stores_threaded_across_regions():
             B[i] = t[0] + t[1]
 
     mod = _to_rtl(cross2)
-    assert len(re.findall(r"= seq\.hlmem", mod.mlir)) == 1, mod.mlir
+    assert len([m for f in mod.microarch.funcs for m in f.mems if not m.external]) == 1
     B = np.zeros(8, np.int32)
     mod.cosim(A8, B)
     c = np.cumsum(A8)
@@ -2585,14 +2592,18 @@ def test_a_data_dependent_subscript_keeps_its_storage():
     s = roam.schedule()
     s.pipeline("i")
     mod = s.export("rtl")
-    assert len(re.findall(r"= seq\.hlmem", mod.mlir)) == 1, mod.mlir
+    # Still ONE storage, and `register` is realized as it is priced: a cell per
+    # element, so no addressed memory is built for it at all.
+    assert len([m for f in mod.microarch.funcs for m in f.mems if not m.external]) == 1
     assert mod.microarch.mem("buf_").storage == "register"
+    assert "seq.hlmem" not in mod.mlir, mod.mlir
 
     # Threshold 0 disqualifies every array, so the same buffer stays on ports.
     s2 = roam.schedule()
     s2.pipeline("i")
     on_ports = s2.export("rtl").set_scheduler_opt(scalarize_threshold=0)
     assert on_ports.microarch.mem("buf_").storage != "register"
+    assert len(re.findall(r"= seq\.hlmem", on_ports.mlir)) == 1, on_ports.mlir
 
     A = (np.arange(64, dtype=np.int32) % 11).reshape(16, 4)
     out = np.zeros(16, np.int32)

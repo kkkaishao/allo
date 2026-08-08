@@ -441,13 +441,22 @@ Value DatapathEmitter::memAddr(const uarch::MemUnit &m, Value addr) {
   return addrAt(c.b, c.loc, addr, addrWidth(m));
 }
 
-// Which element of a scattered argument \p acc names, at the DATAPATH width.
-// The crossbar and the write demux compare it against literal element numbers
+// Which element of a scattered memory \p acc names, at the DATAPATH width. The
+// crossbar and the write demux compare it against literal element numbers
 // (`icmpEq` builds those at that width).
 Value DatapathEmitter::scatterIndex(const uarch::MemUnit &m,
                                     const uarch::MemUnit::Access &acc) {
-  assert(m.scattered && "an element index belongs to a scattered argument");
+  assert(m.scattered && "an element index belongs to a scattered memory");
   return addrAt(c.b, c.loc, bankAddress(m, acc).offset, kDatapathAddressWidth);
+}
+
+// The element registers of scattered internal array \p id, in element order.
+// They are backedges until `finalizeScatteredPorts` resolves them, so a reader
+// takes them without waiting for the stores that drive them.
+SmallVector<Value> DatapathEmitter::scatterValues(unsigned id) {
+  auto it = scatterElems.find(id);
+  assert(it != scatterElems.end() && "no element registers for this array");
+  return {it->second.begin(), it->second.end()};
 }
 
 // Bind the read-data input ports into readData, once, before the per-region
@@ -490,6 +499,20 @@ void DatapathEmitter::createInternalMemories() {
       romArray[m.id] = hw::AggregateConstantOp::create(
           c.b, c.loc, hw::ArrayType::get(elemTy, depth),
           c.b.getArrayAttr(fields));
+      continue;
+    }
+    // A completely partitioned array is one register per element, not an
+    // addressed memory: that is what buys the unlimited combinational ports the
+    // scheduler was billed against. Only the backedges here; the registers
+    // themselves need every store, so `finalizeScatteredPorts` builds them.
+    // Exactly `depthWords` of them, not `declaredDepth`: the padding word only
+    // exists to keep an hlmem's address at least one bit wide, and an element
+    // is selected by comparison rather than addressed.
+    if (m.scattered) {
+      SmallVector<Backedge> elems;
+      for (unsigned k = 0; k < m.depthWords; ++k)
+        elems.push_back(c.bb.get(elemTy));
+      scatterElems[m.id] = std::move(elems);
       continue;
     }
     // Stores that provably never issue together share a write port. A skewed
@@ -618,6 +641,14 @@ void DatapathEmitter::emitInternalReads(const uarch::RegionBlock &rb) {
       Value elem = c.R(hw::ArrayGetOp::create(c.b, c.loc, romArray[m.id], idx));
       readData[accKey(m.id, r.idx)] =
           lat ? c.shiftChain(elem, lat, sh).last() : elem;
+      continue;
+    }
+    // A scattered array has no address port: a read selects over the element
+    // registers, and a constant subscript folds the select away. `register`
+    // storage is timed at read latency 0, so there is nothing to delay.
+    if (m.scattered) {
+      readData[accKey(m.id, r.idx)] =
+          readCrossbar(c, scatterValues(m.id), scatterIndex(m, acc));
       continue;
     }
     ArrayRef<Value> banks = memBanks[m.id];
@@ -957,6 +988,14 @@ void DatapathEmitter::emitAccesses(const uarch::RegionBlock &rb, Value issue,
     Value we =
         c.delayValid(c.activationPulse(commitPulse(), acc.op, sh), pre, sh);
     Value data = late(resolveSource(acc.data));
+    // A scattered array's element registers are shared by every store, so this
+    // only records the terms and `finalizeScatteredPorts` builds each register
+    // once every region and call has contributed.
+    if (m.scattered) {
+      scatterWrites[m.id].push_back({we, scatterIndex(m, acc), data});
+      fb.storeDrain = std::max<unsigned>(fb.storeDrain, storeDrainOf(m, acc));
+      continue;
+    }
     auto wlat = c.b.getI64IntegerAttr(1);
     auto ports = writePortOf.find(m.id);
     if (ports != writePortOf.end()) {
@@ -1037,9 +1076,11 @@ void DatapathEmitter::finalizeSharedWritePorts() {
   }
 }
 
-// Drive each scattered argument's element outputs from every store recorded
-// against it: per element the datum is a priority mux over the stores that
-// reach it, and the write-enable the OR of their demuxed pulses.
+// Settle each scattered memory's elements from every store recorded against it:
+// per element the datum is a priority mux over the stores that reach it, and
+// the write-enable the OR of their demuxed pulses. An ARGUMENT's cells are the
+// caller's and this drives its element ports; an INTERNAL array's are this
+// module's and this builds them, one enabled register per element.
 //
 // At most one arm is live per element per cycle, so the priority order carries
 // no meaning. Unlike a skewed lane that is not structural here: two stores to
@@ -1049,22 +1090,46 @@ void DatapathEmitter::finalizeSharedWritePorts() {
 // leaves element 3 driven and the other N-1 write-enables constant false.
 void DatapathEmitter::finalizeScatteredPorts() {
   for (const uarch::MemUnit &m : dp.mems) {
-    auto it = scatterWrites.find(m.id);
-    if (!m.scattered || it == scatterWrites.end())
-      continue; // not scattered, or scattered and never written
-    ArrayRef<ScatterWrite> writes = it->second;
-    for (auto [k, p] : llvm::enumerate(m.elemPorts)) {
-      // Selected by the PULSE, not the index: two stores in different regions
-      // can name element k at once (an idle region's stale address register),
-      // so only the enabled one may drive; the first arm is a don't-care.
+    if (!m.scattered)
+      continue;
+    ArrayRef<ScatterWrite> writes;
+    if (auto it = scatterWrites.find(m.id); it != scatterWrites.end())
+      writes = it->second;
+    // Selected by the PULSE, not the index: two stores in different regions can
+    // name element k at once (an idle region's stale address register), so only
+    // the enabled one may drive; the first arm is a don't-care.
+    auto driveOf = [&](unsigned k) {
       Value data, we;
       for (const ScatterWrite &w : writes) {
         Value hits = writeDemux(c, w.we, w.index, k);
         data = data ? c.mux(hits, w.data, data) : w.data;
         we = we ? c.orBits(we, hits) : hits;
       }
-      pa.setOutput(p.out, data);
-      pa.setOutput(p.we, we);
+      return std::pair{data, we};
+    };
+    if (m.external) {
+      if (writes.empty())
+        continue; // read-only: the caller's cells arrive and never leave
+      for (auto [k, p] : llvm::enumerate(m.elemPorts)) {
+        auto [data, we] = driveOf(k);
+        pa.setOutput(p.out, data);
+        pa.setOutput(p.we, we);
+      }
+      continue;
+    }
+    // An element no store reaches holds its reset value for the whole run, so
+    // it is that constant rather than a register.
+    IntegerType elemTy = memElemType(m, c.b);
+    for (auto [k, be] : llvm::enumerate(scatterElems[m.id])) {
+      auto [data, we] = driveOf(k);
+      Value zero = c.konst(elemTy, 0);
+      if (!we) {
+        be.setValue(zero);
+        continue;
+      }
+      Value cell = c.enabledReg(data, we, zero, RegRole::Storage);
+      nameValue(cell, memElemName(dp, m, k));
+      be.setValue(cell);
     }
   }
 }
@@ -1646,6 +1711,21 @@ void DatapathEmitter::emitCalls(const uarch::RegionBlock &rb, Value issue,
                                                 memAddr(m, outs[ma.addr])));
         rdBackedge[ma.data].setValue(
             c.shiftChain(elem, m.readLatency, sh).last());
+        continue;
+      }
+      // A scattered array holds no addressable port, so the child's addressed
+      // one is served off the element registers: a select for its read, a term
+      // per store for its write. The child keeps the ordinary port ABI, and a
+      // constant address folds both away.
+      if (m.scattered) {
+        assert(ma.bank == 0 && "a scattered array is one bank, so a child "
+                               "masters it in whole-array element space");
+        Value idx = addrAt(c.b, c.loc, outs[ma.addr], kDatapathAddressWidth);
+        if (ma.isWrite)
+          scatterWrites[m.id].push_back({outs[ma.we], idx, outs[ma.data]});
+        else
+          rdBackedge[ma.data].setValue(
+              readCrossbar(c, scatterValues(m.id), idx));
         continue;
       }
       // One hlmem per bank: the child masters bank `ma.bank`, already indexed

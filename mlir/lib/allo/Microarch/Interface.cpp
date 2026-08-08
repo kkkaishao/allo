@@ -50,10 +50,11 @@ ModuleInterface::ModuleInterface(const uarch::Datapath &dp) {
                        portValid(base), portReady(base)});
   }
 
-  // A scattered argument is declared per element, off the memory rather than
-  // off its accesses, so it appears in neither `reads` nor `writes`.
+  // A scattered ARGUMENT is declared per element, off the memory rather than
+  // off its accesses, so it appears in neither `reads` nor `writes`. A
+  // scattered internal array is registers in the body and reaches no port.
   for (const uarch::MemUnit &mu : dp.mems) {
-    if (!mu.scattered)
+    if (!mu.scattered || !mu.external)
       continue;
     auto mt = cast<MemRefType>(mu.memref.getType());
     auto shape = mt.getShape();

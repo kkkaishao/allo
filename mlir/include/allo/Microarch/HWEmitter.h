@@ -221,7 +221,12 @@ struct DatapathEmitter {
                                            // (populated by emitCalls)
   DenseMap<unsigned, SmallVector<Value>>
       memBanks; // internal mem id -> its bank hlmem handle(s) (one unless
-                // banked)
+                // banked); empty for a scattered array, which holds no hlmem
+  /// One backedge per element of a SCATTERED INTERNAL array, in flat row-major
+  /// order: the register's own output. Declared with the array so a read can
+  /// select over the elements before the stores that drive them have emitted,
+  /// and resolved by `finalizeScatteredPorts` once they all have.
+  DenseMap<unsigned, SmallVector<circt::Backedge>> scatterElems; // by MemId
   DenseMap<unsigned, Value>
       romArray; // ROM mem id -> its hw.aggregate_constant array value
   DenseMap<unsigned, circt::Backedge> regHeadBE; // reg id -> chain head input
@@ -367,10 +372,12 @@ struct DatapathEmitter {
                         const uarch::MemUnit::Access &acc);
   /// Narrow a linear address to a memory's clog2(depth)-bit index (hlmem).
   Value memAddr(const uarch::MemUnit &m, Value addr);
-  /// Which element of a scattered argument an access names, at the datapath
+  /// Which element of a scattered memory an access names, at the datapath
   /// width (compared against literal element numbers, not used to index).
   Value scatterIndex(const uarch::MemUnit &m,
                      const uarch::MemUnit::Access &acc);
+  /// The element registers of a scattered INTERNAL array, in element order.
+  SmallVector<Value> scatterValues(unsigned id);
 
   /// Bind external read-data input ports into readData (once, before regions).
   void bindReadPorts();

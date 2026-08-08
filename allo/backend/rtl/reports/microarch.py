@@ -21,6 +21,7 @@ class RegRole(str, Enum):
     SURVIVOR = "survivor"  # a region result, or a loop-carried latch
     COUNTER = "counter"  # an iteration counter, or one of its address strides
     CONTROL = "control"  # run / phase / pending / done, and the rest
+    STORAGE = "storage"  # one element of an array scattered into registers
 
 
 @dataclass(frozen=True)
