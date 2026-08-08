@@ -122,6 +122,7 @@ def memories(microarch) -> list[dict]:
             "regions": m.cost.writing_regions,
             "needs": m.cost.ports_needed_write,
             "needs_total": m.cost.ports_needed_total,
+            "read_ports": m.cost.read_ports,
             "external": m.external,
         }
         for f in microarch.funcs
