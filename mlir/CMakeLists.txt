@@ -24,19 +24,6 @@ endif()
 
 find_package(MLIR CONFIG REQUIRED)
 
-# OR-Tools backs the optional CP-SAT exact scheduler, and this find must come
-# BEFORE find_package(CIRCT): a CIRCT built with OR-Tools names
-# `ortools::ortools` in the link interface it exports for `CIRCTScheduling`, and
-# CIRCTTargets.cmake fails outright if that imported target does not yet exist.
-# So the find is unconditional rather than gated on the option below; the option
-# only decides whether OUR exact scheduler is compiled. A genuinely
-# OR-Tools-free distribution therefore needs an OR-Tools-free CIRCT beneath it.
-#
-# The option is OFF by default and never inferred from whether OR-Tools happens
-# to be installed. What a distribution contains must not depend on the build
-# machine, and a detected default is worse than useless here: `option()` caches
-# its first value, so one configure that missed OR-Tools would silently pin the
-# build tree to a scheduler-less wheel forever.
 find_package(ortools CONFIG QUIET)
 option(ALLO_ENABLE_ORTOOLS
        "Build the CP-SAT exact scheduler (requires OR-Tools)" OFF)
@@ -58,15 +45,6 @@ else()
   message(STATUS "OR-Tools disabled: the exact (CP-SAT) scheduler is not built")
 endif()
 if(ortools_FOUND)
-  # Gated on the PACKAGE, not on ALLO_ENABLE_ORTOOLS: a CIRCT built with
-  # OR-Tools links it into `CIRCTScheduling`, so the Python extensions pull a
-  # shared libortools in transitively even when our exact scheduler is off, and
-  # without its directory on their rpath they fail to dlopen. Turning our option
-  # off does NOT give an OR-Tools-free build; only an OR-Tools-free CIRCT does.
-  #
-  # This is a DEVELOPER convenience either way: an absolute rpath into a local
-  # prefix is not relocatable, so a build meant to be distributed has to link a
-  # STATIC OR-Tools (or bundle the dylib) rather than rely on it.
   set(CMAKE_INSTALL_RPATH_USE_LINK_PATH ON)
 endif()
 
@@ -87,6 +65,15 @@ include_directories(${MLIR_INCLUDE_DIRS})
 include_directories(${CIRCT_INCLUDE_DIRS})
 include_directories(${CMAKE_CURRENT_BINARY_DIR}/include)
 include_directories(${CMAKE_CURRENT_SOURCE_DIR}/include)
+
+# Third-party headers must be SYSTEM includes
+include_directories(SYSTEM ${spdlog_SOURCE_DIR}/include)
+if(ortools_FOUND)
+  get_target_property(ALLO_ORTOOLS_INCLUDE_DIRS
+                      ortools::ortools INTERFACE_INCLUDE_DIRECTORIES)
+  include_directories(SYSTEM ${ALLO_ORTOOLS_INCLUDE_DIRS})
+endif()
+
 add_definitions(${LLVM_DEFINITIONS})
 
 message(STATUS "Using Python binding")
