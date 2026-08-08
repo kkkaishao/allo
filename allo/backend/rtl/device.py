@@ -113,13 +113,13 @@ def Interp(points: dict[int, float]) -> Cost:
     return Cost("interp", tuple(flat))
 
 
-def Piecewise(breakpoint: float, below: Cost, above: Cost) -> Cost:
+def Piecewise(bp: float, below: Cost, above: Cost) -> Cost:
     """``p < breakpoint ? below(p) : above(p)``, with arms of any form.
 
     The general form of :func:`Step`, whose lower arm is forced proportional and
     whose upper arm is forced constant.
     """
-    return Cost("piecewise", (float(breakpoint),), (below, above))
+    return Cost("piecewise", (float(bp),), (below, above))
 
 
 #: What one realization spends: ``(resource name, one cost factor per parameter
@@ -200,7 +200,7 @@ def _cost_attr(cost: Cost):
 
 def _measured_over(cost: Cost) -> str:
     """A cost's measured points, for a diagnostic."""
-    if cost.form in ("table", "interp"):
+    if cost.form in {"table", "interp"}:
         return f"{cost.form} measured over {cost.coeffs[0]:g}..{cost.coeffs[-2]:g}"
     return repr(cost)
 
