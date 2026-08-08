@@ -222,7 +222,9 @@ llvm::StringMap<Value> instantiateChild(OpBuilder &b, Location loc,
 /// A child instance's registers live in the child's body and are not walked.
 static unsigned compRegBits(hw::HWModuleOp mod) {
   unsigned bits = 0;
-  mod.walk([&](seq::CompRegOp r) { bits += datapathWidth(r.getResult().getType()); });
+  mod.walk([&](seq::CompRegOp r) {
+    bits += datapathWidth(r.getResult().getType());
+  });
   return bits;
 }
 

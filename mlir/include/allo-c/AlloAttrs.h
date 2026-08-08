@@ -134,13 +134,14 @@ MLIR_CAPI_EXPORTED bool alloCostAttrGetMeasuredDomain(MlirAttribute attr,
 
 MLIR_CAPI_EXPORTED bool alloAttributeIsAResourceUse(MlirAttribute attr);
 
-MLIR_CAPI_EXPORTED MlirAttribute alloResourceUseAttrGet(
-    MlirContext ctx, MlirAttribute resource, intptr_t nFactors,
-    MlirAttribute const *factors);
+MLIR_CAPI_EXPORTED MlirAttribute
+alloResourceUseAttrGet(MlirContext ctx, MlirAttribute resource,
+                       intptr_t nFactors, MlirAttribute const *factors);
 
 MLIR_CAPI_EXPORTED MlirAttribute
 alloResourceUseAttrGetResource(MlirAttribute attr);
-MLIR_CAPI_EXPORTED intptr_t alloResourceUseAttrGetNumFactors(MlirAttribute attr);
+MLIR_CAPI_EXPORTED intptr_t
+alloResourceUseAttrGetNumFactors(MlirAttribute attr);
 MLIR_CAPI_EXPORTED MlirAttribute
 alloResourceUseAttrGetFactor(MlirAttribute attr, intptr_t pos);
 MLIR_CAPI_EXPORTED MlirTypeID alloResourceUseAttrGetTypeID(void);

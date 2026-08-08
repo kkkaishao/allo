@@ -118,9 +118,9 @@ struct PyPartitionAttr : mpx::PyConcreteAttribute<PyPartitionAttr> {
       c.def_static(                                                            \
           "get",                                                               \
           [](const std::string &name, mpx::DefaultingPyMlirContext ctx) {      \
-            MlirAttribute attr = GetByNameFn(                                  \
-                ctx.get()->get(),                                              \
-                mlirStringRefCreate(name.data(), name.size()));                \
+            MlirAttribute attr =                                               \
+                GetByNameFn(ctx.get()->get(),                                  \
+                            mlirStringRefCreate(name.data(), name.size()));    \
             if (mlirAttributeIsNull(attr))                                     \
               throw nb::value_error(                                           \
                   (PyName " has no case named '" + name + "'").c_str());       \
@@ -253,10 +253,11 @@ struct PyResourceUseAttr : mpx::PyConcreteAttribute<PyResourceUseAttr> {
           if (!alloEvaluateResourceUse(
                   uses, static_cast<intptr_t>(params.size()), params.data(),
                   [](MlirStringRef resource, int64_t amount, void *userData) {
-                    static_cast<
-                        std::vector<std::pair<std::string, int64_t>> *>(userData)
+                    static_cast<std::vector<std::pair<std::string, int64_t>> *>(
+                        userData)
                         ->emplace_back(
-                            std::string(resource.data, resource.length), amount);
+                            std::string(resource.data, resource.length),
+                            amount);
                   },
                   &spent))
             return std::nullopt;

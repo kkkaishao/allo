@@ -66,13 +66,15 @@ struct Chaining {
 /// Build the chaining constraint: the pre-pass's break edges, or \p cycleTime
 /// itself when \p exactChaining.
 template <class ProblemT>
-Chaining chainingFor(ProblemT &prob, float cycleTime, bool exactChaining) {
+Chaining chainingFor(ProblemT &prob, float cycleTime, float regFloor,
+                     bool exactChaining) {
   Chaining chaining;
   if (exactChaining) {
     chaining.period = cycleTime;
     return chaining;
   }
-  auto broke = mlir::allo::computeChainBreaks(prob, cycleTime, chaining.breaks);
+  auto broke = mlir::allo::computeChainBreaks(prob, cycleTime, regFloor,
+                                              chaining.breaks);
   assert(succeeded(broke) && "chain breaking is a pure function of the problem "
                              "and the cycle time, and the heuristic just ran "
                              "it successfully");
@@ -435,8 +437,8 @@ LogicalResult mlir::allo::scheduleCPSAT(ChainingSharedOperatorsProblem &prob,
 
   // The pre-pass is schedule-independent, so taking its edges hands CP-SAT the
   // chain breaks the heuristic just used.
-  Chaining chaining =
-      chainingFor(prob, cycleTime, opts.kind == SchedulerKind::ExactChaining);
+  Chaining chaining = chainingFor(prob, cycleTime, opts.regFloor,
+                                  opts.kind == SchedulerKind::ExactChaining);
 
   const auto &ops = prob.getOperations();
 
@@ -758,8 +760,8 @@ LogicalResult mlir::allo::scheduleCPSAT(ChainingModuloProblem &prob,
 
   // The heuristic ran the pre-pass whichever form this takes, so the schedule
   // this falls back to meets the period either way.
-  Chaining chaining =
-      chainingFor(prob, cycleTime, opts.kind == SchedulerKind::ExactChaining);
+  Chaining chaining = chainingFor(prob, cycleTime, opts.regFloor,
+                                  opts.kind == SchedulerKind::ExactChaining);
 
   // Window: region laid out end to end (satisfying precedence and chain breaks)
   // plus one II per contending op, widened to the heuristic's own reach. Must

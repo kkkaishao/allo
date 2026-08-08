@@ -90,7 +90,8 @@ MlirTypeID alloPartitionAttrGetTypeID(void) {
   }                                                                            \
   MlirAttribute allo##CApiName##AttrGetByName(MlirContext ctx,                 \
                                               MlirStringRef name) {            \
-    std::optional<allo::CppEnum> value = allo::symbolize##CppEnum(unwrap(name)); \
+    std::optional<allo::CppEnum> value =                                       \
+        allo::symbolize##CppEnum(unwrap(name));                                \
     return wrap(value ? allo::CppAttr::get(unwrap(ctx), *value)                \
                       : Attribute());                                          \
   }                                                                            \
@@ -130,9 +131,9 @@ MlirAttribute alloCostAttrGet(MlirContext ctx, uint32_t form, intptr_t nCoeffs,
     armAttrs.push_back(cast<allo::CostAttr>(unwrap(arms[i])));
   return wrap(allo::CostAttr::get(
       unwrap(ctx), static_cast<allo::CostFormEnum>(form),
-      DenseF64ArrayAttr::get(unwrap(ctx),
-                             llvm::ArrayRef<double>(
-                                 coeffs, static_cast<size_t>(nCoeffs))),
+      DenseF64ArrayAttr::get(
+          unwrap(ctx),
+          llvm::ArrayRef<double>(coeffs, static_cast<size_t>(nCoeffs))),
       armAttrs));
 }
 

@@ -133,8 +133,8 @@ FuncUarch::FuncUarch(const Datapath &dp, llvm::StringRef symbol,
   }
 
   for (const StreamChannel &s : dp.streams)
-    streams.push_back({ownerOf(s.stream, chanOwner(s.id)), datapathWidth(s.payload),
-                       s.depth, !s.callEnds.empty()});
+    streams.push_back({ownerOf(s.stream, chanOwner(s.id)),
+                       datapathWidth(s.payload), s.depth, !s.callEnds.empty()});
 
   std::map<std::string, CallReport> byCallee;
   for (const CallUnit &cu : dp.calls) {
