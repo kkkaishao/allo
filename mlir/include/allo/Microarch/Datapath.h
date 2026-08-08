@@ -237,6 +237,21 @@ struct MemUnit {
   llvm::SmallVector<ElemPort> elemPorts;
   std::string storage; // resolved `dcp.storage` realization
 
+  /// Ports `storage` provides, from its `dcp.storage` row; nullopt where the
+  /// row declares no limit. A memory needing more is built as a register file.
+  std::optional<unsigned> maxReads, maxWrites;
+  /// Read ports one bank is built with: one per read access reaching it plus
+  /// one per child reading it, since nothing shares a read port. A skewed bank
+  /// serves a whole lane from one port. Zero for a scattered memory.
+  unsigned readPortsBuilt = 0;
+
+  /// Whether the read ports this memory is built with fit `storage`. Gates the
+  /// write colouring alongside `maxWrites`: an array over either budget is
+  /// built as a register file, which has no port limit.
+  bool readsFitStorage() const {
+    return !maxReads || readPortsBuilt <= *maxReads;
+  }
+
   // Access latency of `storage`, the same numbers the scheduler stamped onto
   // this memref's `dcp.load`/`dcp.store` (asserted per access in
   // `bindResource`). The consumer's register depth was solved as `tY - (start +
@@ -816,13 +831,6 @@ struct Datapath {
   /// argument is a port it masters on its caller's storage, which is why the
   /// two answer `MemUnit::scattered` differently.
   bool atTop = false;
-  /// How many write ports one array is worth spreading over, taken from
-  /// `MemoryLibrary::maxWritePorts`. A true dual port is what infers; past it
-  /// the inference fails outright, so a further colour would buy nothing and
-  /// still cost its address and data multiplexers. It bounds the module
-  /// boundary for the same reason, since whatever backs the array upstream is
-  /// the same RAM.
-  unsigned maxWritePorts = 2;
 
   // Derived structural cells.
   std::vector<FuncUnit> units;

@@ -660,9 +660,14 @@ MemoryLibrary MemoryLibrary::fromModule(ModuleOp module) {
     t.delay.write = row.getWrDelay().convertToDouble();
     return t;
   };
+  auto limit = [](std::optional<int64_t> n) {
+    return n ? std::optional<unsigned>((unsigned)*n) : std::nullopt;
+  };
   Block &body = device.getBody().front();
   for (auto s : body.getOps<dcp::DCPathStorageOp>()) {
-    m.storage.push_back({s.getSymName().str(), timing(s)});
+    m.storage.push_back({s.getSymName().str(),
+                         timing(s),
+                         {limit(s.getMaxReads()), limit(s.getMaxWrites())}});
     if (s.getIsDefault())
       m.defaultStorage = s.getSymName().str();
     if (s.getIsScatter())
@@ -684,6 +689,13 @@ MemKindTiming MemoryLibrary::timing(StringRef name) const {
                   "latency-0 access");
   static constexpr MemKindTiming zero;
   return zero;
+}
+
+StoragePorts MemoryLibrary::ports(StringRef name) const {
+  for (const StorageRealization &s : storage)
+    if (s.name == name)
+      return s.ports;
+  return {};
 }
 
 bool MemoryLibrary::declares(StringRef name) const {

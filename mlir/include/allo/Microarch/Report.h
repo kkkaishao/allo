@@ -63,6 +63,9 @@ struct MemCost {
   // What `Datapath::portsNeeded` demanded of ONE bank, which is what the
   // storage had to be built to serve.
   unsigned portsNeededWrite = 0, portsNeededTotal = 0;
+  // Read ports one bank is built with (`MemUnit::readPortsBuilt`), one per read
+  // since nothing shares one. Checked against the realization's read budget.
+  unsigned readPorts = 0;
 };
 
 /// One array, and the storage decision taken for it.

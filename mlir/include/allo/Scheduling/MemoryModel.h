@@ -71,11 +71,19 @@ struct MemKindTiming {
   RWDelay delay;
 };
 
+/// Ports of each direction one storage realization provides, nullopt where it
+/// has no limit.
+struct StoragePorts {
+  std::optional<unsigned> reads;
+  std::optional<unsigned> writes;
+};
+
 /// One `dcp.storage` row: a structure the device can hold an array in, named by
 /// the device's own vocabulary rather than by a case of a closed enum.
 struct StorageRealization {
   std::string name;
   MemKindTiming timing;
+  StoragePorts ports;
 };
 
 /// The storage-timing library, filled from the `dcp.storage` and
@@ -106,6 +114,10 @@ public:
   /// (combinational) timing.
   MemKindTiming timing(llvm::StringRef storage) const;
 
+  /// The ports storage realization \p storage provides; unlimited for one the
+  /// device does not declare, which `PreVerification` rejects on its own.
+  StoragePorts ports(llvm::StringRef storage) const;
+
   /// Whether the device declares \p storage. An array resolving to an
   /// undeclared realization would otherwise be scheduled at latency 0 and read
   /// before its data is valid.
@@ -129,9 +141,6 @@ public:
   std::string scatterStorage;
   std::vector<StorageRealization> storage; // the `dcp.storage` rows
   MemKindTiming fifo;                      // `dcp.stream_timing`
-  // How many write ports one array is worth spreading over. Fixed at 2, the
-  // port count essentially every device's memory primitive provides.
-  static constexpr unsigned maxWritePorts = 2;
 };
 
 //===----------------------------------------------------------------------===//

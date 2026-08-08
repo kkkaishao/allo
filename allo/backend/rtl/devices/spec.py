@@ -108,12 +108,18 @@ class Derived(NamedTuple):
 
 class StorageSpec(NamedTuple):
     """What a fabric declares about one storage realization apart from its
-    timing: the resources it cannot exist without, and what one instance spends
-    over ``(depth, width)``. A die missing any of ``needs`` does not get the
-    row."""
+    timing: the resources it cannot exist without, what one instance spends over
+    ``(depth, width)``, and how many ports of each direction it has. A die
+    missing any of ``needs`` does not get the row.
+
+    A port limit of ``None`` is no limit, which is what the scatter row takes:
+    one cell per element is not addressed. An array needing more ports than the
+    row has is built as a register file."""
 
     needs: tuple[str, ...]
     uses: Callable[[Mapping[str, Resource]], dict]
+    max_reads: int | None = None
+    max_writes: int | None = None
 
 
 class IPRow(NamedTuple):

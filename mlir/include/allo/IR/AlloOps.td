@@ -598,6 +598,11 @@ def DCPathStorageOp : DCPath_Op<"dcp.storage",
     every access against the row its array resolves to and the emitter builds
     the ports at exactly those latencies, so the two cannot drift.
 
+    `max_rd`/`max_wr` are how many ports of each direction the structure has,
+    omitted where it has no limit. An array needing more is built as a register
+    file instead. A `scatter` row declares neither, holding one cell per element
+    and no addressed port.
+
     `uses` carries one `#allo.res_use` per term, and what a resource costs is
     the sum of the terms naming it. Storage carries TWO parameters,
     `(depth, width)`, so a term is either two factors or the single `tiled`
@@ -609,11 +614,15 @@ def DCPathStorageOp : DCPath_Op<"dcp.storage",
     UnitAttr:$is_scatter,
     I64Attr:$rd_latency, F32Attr:$rd_delay,
     I64Attr:$wr_latency, F32Attr:$wr_delay,
+    OptionalAttr<I64Attr>:$max_reads,
+    OptionalAttr<I64Attr>:$max_writes,
     OptionalAttr<ArrayAttr>:$uses);
   let assemblyFormat = [{
     $sym_name (`default` $is_default^)? (`scatter` $is_scatter^)?
     `rd` `=` $rd_latency `,` $rd_delay
-    `wr` `=` $wr_latency `,` $wr_delay (`uses` $uses^)? attr-dict
+    `wr` `=` $wr_latency `,` $wr_delay
+    (`max_rd` `=` $max_reads^)? (`max_wr` `=` $max_writes^)?
+    (`uses` $uses^)? attr-dict
   }];
   let hasVerifier = 1;
 }

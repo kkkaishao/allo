@@ -489,6 +489,14 @@ LogicalResult DCPathStorageOp::verify() {
   if (getRdDelay().convertToDouble() < 0.0 ||
       getWrDelay().convertToDouble() < 0.0)
     return emitOpError("delay must be non-negative");
+  for (std::optional<int64_t> limit : {getMaxReads(), getMaxWrites()}) {
+    if (limit && *limit < 1)
+      return emitOpError("a port limit must be at least one port");
+    // A scatter row holds one cell per element and no addressed port.
+    if (limit && getIsScatter())
+      return emitOpError("a `scatter` row holds one cell per element and so "
+                         "has no port limit to declare");
+  }
   return verifyResourceUses(*this, getUsesAttr(), 2,
                             "two parameters (depth, width)");
 }

@@ -119,6 +119,7 @@ FuncUarch::FuncUarch(const Datapath &dp, llvm::StringRef symbol,
     mr.cost.writingRegions = writingRegions.size();
     mr.cost.portsNeededWrite = dp.portsNeeded(m.id, /*writesOnly=*/true);
     mr.cost.portsNeededTotal = dp.portsNeeded(m.id, /*writesOnly=*/false);
+    mr.cost.readPorts = m.readPortsBuilt;
     mr.external = m.external;
     mr.scattered = m.scattered;
     mr.writesIndependent = m.writesIndependent;
@@ -240,6 +241,7 @@ std::string MicroarchReport::toJSON() const {
                               (int64_t)m.cost.portsNeededWrite);
                   j.attribute("ports_needed_total",
                               (int64_t)m.cost.portsNeededTotal);
+                  j.attribute("read_ports", (int64_t)m.cost.readPorts);
                 });
                 j.attribute("external", m.external);
                 j.attribute("scattered", m.scattered);

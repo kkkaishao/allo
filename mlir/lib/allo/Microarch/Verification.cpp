@@ -195,6 +195,15 @@ LogicalResult checkDeviceCapability(dcp::DCPathModuleOp func,
     // a store lands on the next edge, neither carrying a delay to absorb one.
     assert((!m.scattered || (m.readLatency == 0 && m.writeLatency == 1)) &&
            "a scattered memory must be timed as registers");
+    // An array over the read budget is built as a register file, at the row's
+    // latencies but not its area.
+    if (!m.scattered && !m.isRom && !m.readsFitStorage())
+      warn(Stage::Emit, func)
+          << "Array " << m.memref.getType() << " reads through "
+          << m.readPortsBuilt << " ports, more than the " << *m.maxReads
+          << " of storage '" << m.storage
+          << "'; it becomes a register file instead. Partition it so the reads "
+             "spread over banks, or bind it to a storage with more ports";
   }
 
   // `ce` is the only IP port ABI the emitter realizes. `free` has no enable, so

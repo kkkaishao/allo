@@ -253,6 +253,10 @@ class Storage:
     # limit. A completely partitioned array resolves here whatever it would
     # otherwise have taken, and a device declares at most one.
     is_scatter: bool = False
+    # Ports of each direction the structure has, ``None`` for no limit. An array
+    # needing more is built as a register file rather than as this row.
+    max_reads: int | None = None
+    max_writes: int | None = None
     # What it spends. Storage carries two parameters, `(depth, width)`, so each
     # entry is two cost factors or one `Tiled`.
     uses: Spend = ()
@@ -435,6 +439,8 @@ class Device:
         read_delay_ns: float = 0.0,
         write_delay_ns: float = 0.0,
         is_scatter: bool = False,
+        max_reads: int | None = None,
+        max_writes: int | None = None,
         uses: dict[Resource, Cost | Sequence] | None = None,
     ) -> Storage:
         """Declare a storage realization and return the handle ``bind_storage``
@@ -449,6 +455,11 @@ class Device:
         marks at most one, and one that marks none cannot hold a complete
         partition.
 
+        ``max_reads`` / ``max_writes`` are how many ports of each direction the
+        structure has, omitted where it has no limit. An array needing more is
+        built as a register file. A scatter row declares neither, having no
+        addressed port to count.
+
         Storage carries two parameters, ``(depth, width)``, so a ``uses`` term
         is a pair of costs, or the single :func:`Tiled` that reads them
         together.
@@ -457,6 +468,14 @@ class Device:
             raise ValueError(f"storage {name!r}: latency must be non-negative")
         if read_delay_ns < 0 or write_delay_ns < 0:
             raise ValueError(f"storage {name!r}: delay must be non-negative")
+        for role, limit in (("max_reads", max_reads), ("max_writes", max_writes)):
+            if limit is not None and limit < 1:
+                raise ValueError(f"storage {name!r}: {role} must be at least one port")
+            if limit is not None and is_scatter:
+                raise ValueError(
+                    f"storage {name!r} holds one cell per element, so it has no "
+                    f"{role} to declare"
+                )
         other = next(
             (s for s in self.storage.values() if s.is_scatter and s.name != name), None
         )
@@ -472,6 +491,8 @@ class Device:
             read_delay_ns=float(read_delay_ns),
             write_delay_ns=float(write_delay_ns),
             is_scatter=bool(is_scatter),
+            max_reads=None if max_reads is None else int(max_reads),
+            max_writes=None if max_writes is None else int(max_writes),
             uses=self._spend(f"storage {name!r}", "depth, width", uses),
         )
         self.storage[name] = s
@@ -809,6 +830,9 @@ def inject_device(module, device: Device):
         f32ty = F32Type.get()
         i64 = IntegerType.get_signless(64)
 
+        def _port_limit(ty, n):
+            return None if n is None else IntegerAttr.get(ty, n)
+
         def _timing(t) -> dict:
             return {
                 "rd_latency": IntegerAttr.get(i64, t.read_latency),
@@ -841,6 +865,8 @@ def inject_device(module, device: Device):
                     sym_name=s.name,
                     is_default=s.name == device.default_storage,
                     is_scatter=s.is_scatter,
+                    max_reads=_port_limit(i64, s.max_reads),
+                    max_writes=_port_limit(i64, s.max_writes),
                     uses=_uses_attr(s.uses),
                     **_timing(s),
                 )

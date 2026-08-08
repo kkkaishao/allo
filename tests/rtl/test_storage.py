@@ -1419,11 +1419,67 @@ def test_the_device_names_the_storage_a_scatter_goes_into():
         )
 
 
-def test_two_non_colliding_writes_still_price_as_a_ram():
+def test_a_scatter_row_declares_no_port_limit():
+    # One cell per element is not addressed, so a `scatter` row has no port to
+    # limit; a limit on it would bound the very realization a complete partition
+    # resolves to.
+    for limit in ({"max_reads": 1}, {"max_writes": 1}):
+        dev = default_device.copy()
+        del dev.storage["register"]
+        with pytest.raises(ValueError):
+            dev.add_storage(
+                "ff_cell",
+                read_latency=0,
+                write_latency=1,
+                is_scatter=True,
+                **limit,
+            )
+
+
+def test_more_reads_than_the_row_has_ports_becomes_a_register_file():
+    # A read port is never shared, so an array is built with one per read. Past
+    # what the storage row declares there is no RAM to infer, and claiming
+    # independent write ports would remove the register fallback the array still
+    # needs, so the emitter drops the claim instead.
+    @kernel
+    def k(A: i32[32], out: i32[8]):
+        buf: i32[32] = 0
+        for i in range(32):
+            buf[i] = A[i]
+        for j in range(8):
+            out[j] = buf[0] + buf[1] + buf[2] + buf[3] + buf[4] + buf[5]
+
+    def buf_of(rtl):
+        rtl.compile()
+        mem = next(
+            m
+            for f in rtl.report.microarch.funcs
+            for m in f.mems
+            if m.owner.startswith("buf")
+        )
+        return mem, rtl.mlir
+
+    # Distributed RAM declares no read limit: six reads still infer a RAM.
+    mem, mlir = buf_of(_to_rtl(k))
+    assert mem.storage == "lutram" and mem.cost.read_ports == 6
+    assert "independent" in mlir
+
+    # A block RAM has two ports, which six reads do not fit.
+    s = k.schedule()
+    s.bind_storage("buf", impl=Schedule.BRAM, mem_type=s.RAM_T2P)
+    mem, mlir = buf_of(s.export("rtl"))
+    assert mem.storage == "bram" and mem.cost.read_ports == 6
+    assert "independent" not in mlir
+
+
+def test_two_non_colliding_writes_price_as_a_ram_where_the_row_has_two_ports():
     # Two stores the schedule proved never collide get an `always` block each,
     # which is what infers a true dual port. The area estimator reads that
     # decision back off the report and charges the array as a RAM rather than as
-    # a register file; the ceiling it checks against is the emitter's own.
+    # a register file; the ceiling it checks against is the emitter's own, which
+    # is the resolved storage row's write ports. Distributed RAM has one, so the
+    # same two stores only reach a RAM once the array is bound somewhere with
+    # two.
     #
     # Deeper than the auto-partition threshold on purpose: a completely
     # partitioned array is realized as registers and never reaches a port at
@@ -1437,14 +1493,26 @@ def test_two_non_colliding_writes_still_price_as_a_ram():
         for i in range(32):
             out[i] = buf[i]
 
-    rtl = _to_rtl(k)
-    rtl.compile()
-    report = rtl.report
-    buf = next(
-        m for f in report.microarch.funcs for m in f.mems if m.owner.startswith("buf")
-    )
-    assert buf.cost.ports_needed_write == 2 <= qor.MAX_WRITE_PORTS
-    assert qor.estimate(report).mem_bits == 32 * 32
+    def buf_of(rtl):
+        rtl.compile()
+        m = next(
+            m
+            for f in rtl.report.microarch.funcs
+            for m in f.mems
+            if m.owner.startswith("buf")
+        )
+        assert m.cost.ports_needed_write == 2
+        return m, qor.estimate(rtl.report)
+
+    mem, est = buf_of(_to_rtl(k))
+    assert mem.storage == "lutram"
+    assert est.mem_bits == 0  # one write port: a register file, not a RAM
+
+    s = k.schedule()
+    s.bind_storage("buf", impl=Schedule.BRAM, mem_type=s.RAM_T2P)
+    mem, est = buf_of(s.export("rtl"))
+    assert mem.storage == "bram"
+    assert est.mem_bits == 32 * 32
 
 
 def test_a_tiled_cost_prices_the_whole_shape():

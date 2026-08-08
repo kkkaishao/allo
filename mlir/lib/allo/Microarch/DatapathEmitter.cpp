@@ -518,15 +518,14 @@ void DatapathEmitter::createInternalMemories() {
     // Stores that provably never issue together share a write port. A skewed
     // array presents no single addressable port, and a dynamically banked store
     // drives every bank behind a demux, so neither has a port to be coloured
-    // onto. `Datapath::maxWritePorts` is the ceiling: past it the RAM inference
-    // fails outright, so a further colour would buy nothing and still cost its
-    // address and data muxes.
+    // onto. The realization's ports are the ceiling in both directions: past
+    // them the array is built as a register file, which has no port limit.
     std::optional<SmallVector<unsigned>> ports;
-    if (!m.skewed &&
+    if (!m.skewed && m.readsFitStorage() &&
         llvm::all_of(m.accesses, [](const uarch::MemUnit::Access &a) {
           return !a.isWrite || a.staticBank;
         }))
-      ports = dp.writePortColouring(m.id, dp.maxWritePorts);
+      ports = dp.writePortColouring(m.id, m.maxWrites.value_or(~0u));
     SmallVector<Value> banks;
     for (unsigned k = 0; k < m.numBanks; ++k) {
       auto mem =

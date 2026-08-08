@@ -191,6 +191,11 @@ MemId DatapathBuilder::getOrCreateMem(Value memref) {
   auto mkt = dev.memory.timing(m.storage);
   m.readLatency = mkt.latency.read;
   m.writeLatency = mkt.latency.write;
+  // Port budget from that same row: how many ports the structure holding this
+  // array has.
+  StoragePorts sp = dev.memory.ports(m.storage);
+  m.maxReads = sp.reads;
+  m.maxWrites = sp.writes;
   assert(mt.hasStaticShape() &&
          "datapath memory requires a static shape (a dynamic memref sizes to "
          "depthWords 0)");
@@ -641,6 +646,35 @@ void DatapathBuilder::recordCallDeps() {
   }
 }
 
+// One read port per read on every bank it can reach, since nothing shares a
+// read port: a compile-time bank reads its own, a roaming one crossbars over
+// all of them, and a child masters one on the bank it was handed. A skewed bank
+// serves a whole lane from one port. A scattered array has no addressed port.
+void DatapathBuilder::countReadPorts() {
+  for (MemUnit &m : dp.mems) {
+    if (m.scattered)
+      continue;
+    llvm::SmallVector<unsigned> perBank(m.numBanks, 0);
+    llvm::SmallDenseSet<unsigned> lanes;
+    for (const MemUnit::Access &acc : m.accesses) {
+      if (acc.isWrite)
+        continue;
+      if (m.skewed)
+        lanes.insert(acc.lane);
+      else if (acc.staticBank)
+        ++perBank[*acc.staticBank];
+      else
+        for (unsigned &n : perBank)
+          ++n;
+    }
+    for (const CallUnit &cu : dp.calls)
+      for (const CallUnit::MemArg &ma : cu.memArgs)
+        if (ma.mem == m.id && !ma.isWrite)
+          ++perBank[ma.bank];
+    m.readPortsBuilt = lanes.size() + *llvm::max_element(perBank);
+  }
+}
+
 void DatapathBuilder::enumerateBoundaryPorts() {
   llvm::SmallVector<Value> memRefs;
   for (const MemUnit &m : dp.mems)
@@ -678,20 +712,21 @@ void DatapathBuilder::enumerateBoundaryPorts() {
       }
       continue;
     }
-    // Stores that provably never issue together share ONE boundary port group,
+    // Stores that provably never issue together share one boundary port group,
     // the same colouring an internal array's write ports take. A group per
-    // static store instead makes every caller back an array with that many
-    // write interfaces, which past two no RAM template serves, so a child that
-    // writes six words of one row costs its parent a register file.
+    // static store makes every caller back the array with that many write
+    // interfaces.
     //
-    // Only where every write reaches ONE interface: a data-dependent banked
+    // Only where every write reaches one interface: a data-dependent banked
     // store spans them all, and two stores routed to different banks are on
-    // different interfaces already.
+    // different interfaces already. Whatever backs the array upstream is the
+    // structure this one resolved, so its ports are the same budget.
     std::optional<SmallVector<unsigned>> shared;
-    if (llvm::all_of(m.accesses, [&](const MemUnit::Access &a) {
+    if (m.readsFitStorage() &&
+        llvm::all_of(m.accesses, [&](const MemUnit::Access &a) {
           return !a.isWrite || externalBank(m, a).factor == 1;
         }))
-      shared = dp.writePortColouring(m.id, dp.maxWritePorts);
+      shared = dp.writePortColouring(m.id, m.maxWrites.value_or(~0u));
     m.writesIndependent = shared.has_value();
     llvm::SmallDenseMap<unsigned, unsigned> portOfColour;
     for (auto [a, acc] : llvm::enumerate(m.accesses)) {
@@ -1695,6 +1730,7 @@ void DatapathBuilder::build() {
          "bound to it");
 
   deriveShapes();           // controller discriminant (needs every child)
+  countReadPorts();         // per-memory read budget (needs every access/call)
   enumerateBoundaryPorts(); // module boundary ports (needs every access)
   deriveCounterTypes();     // counter width (each loop's own range)
   // Everything below resolves Values to Sources, and so runs here rather than

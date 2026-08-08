@@ -172,6 +172,9 @@ struct DatapathBuilder {
   /// call is bound. Owner names come from `uniqueOwnerOf` against the module's
   /// whole memref list, so two arguments sharing a source name still differ.
   void enumerateBoundaryPorts();
+  /// Count the read ports each memory is built with (`readPortsBuilt`). Runs
+  /// once every access and call is bound, before the write colourings read it.
+  void countReadPorts();
   /// Record each top-level region's composition predecessors
   /// (`rb.predecessors`): the earlier top-level siblings it must start after.
   /// Runs last (needs the final memref accesses and region tree).

@@ -283,10 +283,32 @@ _STORAGE = {
             r["ff"]: (Linear(1.0), Linear(1.0)),
         },
     ),
-    "lutram": StorageSpec(("slicem_lut",), lambda r: {r["slicem_lut"]: Tiled(64)}),
-    "srl": StorageSpec(("slicem_lut",), lambda r: {r["slicem_lut"]: Tiled(32)}),
-    "bram": StorageSpec(("bram36",), lambda r: {r["bram36"]: Tiled(36864)}),
-    "uram": StorageSpec(("uram288",), lambda r: {r["uram288"]: Tiled(294912)}),
+    # Distributed RAM has one write port; the synthesizer replicates it for
+    # further reads, so only the write side is capped.
+    "lutram": StorageSpec(
+        ("slicem_lut",),
+        lambda r: {r["slicem_lut"]: Tiled(64)},
+        max_writes=1,
+    ),
+    # A shift register writes only at its head and reads one addressed tap.
+    "srl": StorageSpec(
+        ("slicem_lut",),
+        lambda r: {r["slicem_lut"]: Tiled(32)},
+        max_reads=1,
+        max_writes=1,
+    ),
+    "bram": StorageSpec(
+        ("bram36",),
+        lambda r: {r["bram36"]: Tiled(36864)},
+        max_reads=2,
+        max_writes=2,
+    ),
+    "uram": StorageSpec(
+        ("uram288",),
+        lambda r: {r["uram288"]: Tiled(294912)},
+        max_reads=2,
+        max_writes=2,
+    ),
 }
 
 
@@ -369,8 +391,8 @@ def build(part: Part) -> Device:
             res[name] = d.add_resource(name, capacity)
 
     for name, t in timing.storage.items():
-        needs, spend = _STORAGE[name]
-        if not all(n in res for n in needs):
+        spec = _STORAGE[name]
+        if not all(n in res for n in spec.needs):
             continue
         d.add_storage(
             name,
@@ -379,7 +401,9 @@ def build(part: Part) -> Device:
             read_delay_ns=t.read_ns,
             write_delay_ns=t.write_ns,
             is_scatter=name == SCATTER_STORAGE,
-            uses=spend(res),
+            max_reads=spec.max_reads,
+            max_writes=spec.max_writes,
+            uses=spec.uses(res),
         )
     d.set_default_storage(d.storage[DEFAULT_STORAGE])
     d.set_stream_timing(*timing.stream)

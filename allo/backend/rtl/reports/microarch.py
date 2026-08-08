@@ -106,6 +106,9 @@ class MemoryCost:
     #: built to serve.
     ports_needed_write: int
     ports_needed_total: int
+    #: read ports one bank is built with, one per read since nothing shares one.
+    #: What the realization's read budget is checked against.
+    read_ports: int
 
     @classmethod
     def from_json(cls, d: dict) -> MemoryCost:
@@ -116,6 +119,7 @@ class MemoryCost:
             writing_regions=d["writing_regions"],
             ports_needed_write=d["ports_needed_write"],
             ports_needed_total=d["ports_needed_total"],
+            read_ports=d["read_ports"],
         )
 
 
