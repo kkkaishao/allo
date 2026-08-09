@@ -89,12 +89,14 @@ bool StoragePorts::exceededBy(const StoragePorts &other) const {
   auto over = [](std::optional<unsigned> have, std::optional<unsigned> want) {
     return have && want && *want > *have;
   };
-  return over(instReads, other.instReads) ||
-         over(instWrites, other.instWrites) || over(instPool, other.instPool) ||
+  // Against what the array may be given, not against one instance: a request
+  // for two reads is met by a row serving one in each of two copies.
+  return over(reads(), other.reads()) || over(writes(), other.writes()) ||
+         over(slots(), other.slots()) ||
          // A pool bounds both directions, so a topology asking for more
          // accesses at once than a poolless row serves in either direction
          // exceeds it just as directly.
-         over(instReads, other.instPool) || over(instWrites, other.instPool);
+         over(reads(), other.slots()) || over(writes(), other.slots());
 }
 
 bool StoragePorts::fit(unsigned nreads, unsigned nwrites,
