@@ -536,11 +536,14 @@ void DatapathEmitter::createInternalMemories() {
         // block, which arbitrates the collision they might have.
         if (m.writesIndependent)
           mem->setAttr(kIndependentWritesAttr, c.b.getUnitAttr());
-        // Pin the array to the row it was timed and priced against, whatever
-        // its ports came to. The row is this module's decision, and leaving it
-        // unsaid hands the structure to the synthesizer, which then builds
-        // something the cost model did not price.
-        if (!m.ramStyle.empty())
+        // Pin the array to the row it is REALIZED in, whatever its ports came
+        // to: the row is this module's decision, and leaving it unsaid hands
+        // the structure to the synthesizer, which then builds something the
+        // cost model did not price. An array whose writes no copy count can
+        // serve is realized as registers instead and priced there, so pinning
+        // it to the row it resolved to would state a structure this module has
+        // already decided against.
+        if (m.realization == MemUnit::Realization::Ram && !m.ramStyle.empty())
           mem->setAttr(kRamStyleAttr, c.b.getStringAttr(m.ramStyle));
         // An initialized array the kernel also WRITES is a real memory that
         // merely starts with contents. `seq.hlmem` carries no initializer, so

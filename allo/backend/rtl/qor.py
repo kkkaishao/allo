@@ -190,15 +190,16 @@ def _operator_costs(device: Device) -> dict[str, tuple]:
 
 
 def _register_file(device: Device):
-    """What an array that failed RAM inference falls back to: every word gets a
+    """What an array no copy count can hold gets realized as: every word gets a
     data multiplexer and a write decode, which is what a complete partition
-    builds too. The device's ``is_scatter`` row, since the compiler names no
-    storage of its own and neither does this estimator."""
+    builds too. The device's ``is_scatter`` row, a row the compiler may choose
+    and price like any other, since the compiler names no storage of its own
+    and neither does this estimator."""
     row = next((s for s in device.storage.values() if s.is_scatter), None)
     if row is None:
         raise ValueError(
             f"device {device.name!r} marks no scatter storage, so there is "
-            "nothing to price an array that failed RAM inference against"
+            "nothing to price an array whose writes no copy count can serve"
         )
     return row.uses
 
@@ -297,16 +298,12 @@ def estimate(report: CompileReport, device: Device = default_device) -> QoR:
                     Utilization.of(price(device.rom_uses, (m.depth_words, m.width))),
                 )
                 continue
-            # An addressed array costs its row once per instance the compiler
-            # decided on and once per bank. The instance count is read off the
-            # report, not recomputed here: deciding it twice is how the estimate
-            # and the emission come to disagree. A write set over the row's is
-            # the one case that prices against the scatter row, no instance
-            # count serving it since every copy needs every write.
+            # An array no number of copies of its row can hold, which is a write
+            # set over one instance's. READ off the emitter's classification,
+            # like the two above it: this used to re-derive the predicate here
+            # and the two halves could then disagree about what was built.
             row = device.storage.get(m.storage)
-            if row is None or (
-                m.cost.row_writes and m.cost.write_ports > m.cost.row_writes
-            ):
+            if row is None or m.realization == "register_file":
                 charge(
                     "memories",
                     f.func,
@@ -314,6 +311,9 @@ def estimate(report: CompileReport, device: Device = default_device) -> QoR:
                 )
                 regfile_arrays += 1
                 continue
+            # An addressed array costs its row once per instance the compiler
+            # decided on and once per bank. The instance count is read off the
+            # report, not recomputed here, for the same reason.
             copies = m.cost.instances * m.banks
             mem_bits += m.bits * m.cost.instances
             charge(

@@ -82,7 +82,8 @@ std::optional<unsigned> StoragePorts::slots() const {
 StoragePorts StoragePorts::meet(const StoragePorts &other) const {
   return {tighter(instReads, other.instReads),
           tighter(instWrites, other.instWrites),
-          tighter(instPool, other.instPool), std::min(copies, other.copies)};
+          tighter(instPool, other.instPool), std::min(copies, other.copies),
+          stated || other.stated};
 }
 
 bool StoragePorts::exceededBy(const StoragePorts &other) const {
@@ -99,16 +100,22 @@ bool StoragePorts::exceededBy(const StoragePorts &other) const {
          over(reads(), other.slots()) || over(writes(), other.slots());
 }
 
-bool StoragePorts::fit(unsigned nreads, unsigned nwrites,
-                       unsigned nports) const {
-  // A bus carrying a write is one port of EVERY copy; a read-only one is a port
-  // of the single copy that serves it.
-  unsigned taken = nports + (copies - 1) * nwrites;
-  auto within = [](std::optional<unsigned> limit, unsigned n) {
-    return !limit || n <= *limit;
-  };
-  return within(reads(), nreads) && within(writes(), nwrites) &&
-         within(slots(), taken);
+bool StoragePorts::holds(unsigned nreads, unsigned nwrites,
+                         unsigned nports) const {
+  (void)nreads; // a read costs a port of ONE copy, counted through `nports`
+  if ((instWrites && nwrites > *instWrites) ||
+      (instPool && nwrites > *instPool))
+    return false;
+  // Buses carrying no write: the reads needing a port of their own somewhere.
+  // A copy hosts every write and has what is left over for them.
+  unsigned own = nports - nwrites;
+  unsigned perCopy = instPool ? *instPool - nwrites
+                              : instReads.value_or(own);
+  if (stated)
+    return own <= perCopy;
+  // Another copy is always available, so the reads only fail where a copy has
+  // nothing left to give them: the writes fill one instance on their own.
+  return own == 0 || perCopy > 0;
 }
 
 std::string StoragePorts::describe() const {
@@ -175,16 +182,17 @@ bool allo::topologyCovers(MemoryPortEnum a, MemoryPortEnum b) {
 // declares no pool; every other topology shares its ports between the
 // directions.
 //
-// One copy: the request names the ports the ARRAY is to have, so a copy the
-// compiler added on top would give it more than it asked for.
+// `stated`, and one copy with it: the request names the ports the ARRAY is to
+// have, so a copy the compiler added on top would give it more than it asked
+// for.
 static StoragePorts topologyPorts(MemoryPortEnum p) {
   switch (p) {
   case MemoryPortEnum::SinglePort:
-    return {1u, 1u, 1u, 1u};
+    return {1u, 1u, 1u, 1u, true};
   case MemoryPortEnum::SimpleDualPort:
-    return {1u, 1u, std::nullopt, 1u};
+    return {1u, 1u, std::nullopt, 1u, true};
   case MemoryPortEnum::TrueDualPort:
-    return {2u, 2u, 2u, 1u};
+    return {2u, 2u, 2u, 1u, true};
   }
   llvm_unreachable("unhandled MemoryPortEnum");
 }
@@ -200,7 +208,7 @@ std::optional<StoragePorts> allo::requestedPortsOf(Value memref) {
   if (bs.kind == MemoryKindEnum::ROM) {
     unsigned n = p.instPool.value_or(p.instReads.value_or(0) +
                                      p.instWrites.value_or(0));
-    p = {n, n, n, 1u};
+    p = {n, n, n, 1u, true};
   }
   return p;
 }
@@ -286,7 +294,7 @@ void MemoryBankModel::finalize(const MemoryLibrary &lib) {
     // (one port each, no pool) and nothing that copies it. `characterize` would
     // cast its type to MemRefType.
     if (isa<StreamType>(root.getType())) {
-      info.ports = {1u, 1u, std::nullopt, 1u};
+      info.ports = {1u, 1u, std::nullopt, 1u, true};
       // Its default `layout` is the single unbanked one, and it resolves no
       // `storage` realization, which nothing here asks a stream for.
       continue;

@@ -193,19 +193,22 @@ LogicalResult checkDeviceCapability(dcp::DCPathModuleOp func,
     // a store lands on the next edge, neither carrying a delay to absorb one.
     assert((!m.scattered || (m.readLatency == 0 && m.writeLatency == 1)) &&
            "a scattered memory must be timed as registers");
-    // An array over the port budget is built as a register file, at the row's
-    // latencies but not its area. The budget is one number per axis, so a block
-    // RAM's two writers and concurrent reader are over it even though neither
-    // direction alone is.
+    // Only a WRITE set can put an array here: every copy of a row needs every
+    // write, so one instance's write ports are the ceiling however many copies
+    // are built, and on a pooled row writes that fill the pool leave a read no
+    // port anywhere. Reads alone never reach this and say nothing, the copies
+    // being what serves them.
     if (m.realization == MemUnit::Realization::RegisterFile)
       warn(Stage::Emit, func)
           << "Array " << m.memref.getType() << " is built with "
-          << m.readPortsBuilt << " read / " << m.writePortsBuilt << " write ("
-          << m.portsBuilt << " altogether) ports per bank, more than storage '"
-          << m.storage << "' has (" << m.ports.describe()
-          << "); it becomes a register file instead. Partition it so the "
-             "accesses spread over banks, or let fewer of them issue at once. "
-             "Only accesses the model proves never issue together share a port";
+          << m.writePortsBuilt << " concurrent write ports per bank, and one "
+          << m.storage << " has " << m.ports.describe()
+          << ", so no number of copies holds it: it is realized as registers, "
+             "one cell per element, which costs the whole array in logic. "
+             "Partition it so the writers land in different banks, bind it to "
+             "a storage with more write ports, or let fewer of them issue at "
+             "once. Only accesses the model proves never issue together share "
+             "a port";
   }
 
   // `ce` is the only IP port ABI the emitter realizes. `free` has no enable, so

@@ -91,10 +91,16 @@ struct StoragePorts {
   std::optional<unsigned> instReads;
   std::optional<unsigned> instWrites;
   std::optional<unsigned> instPool;
-  /// Instances an array here may be spread over. One where the ports were
-  /// stated for the whole array instead of for a structure it is held in: an
-  /// `allo.bind.storage type=` topology, or a stream's two ends.
+  /// Instances an array here may be spread over IN A CYCLE, which is what the
+  /// scheduler is allowed to issue against. Not a bound on the copies BUILT:
+  /// the port binding colours by what may share an address bus, so a schedule
+  /// issuing two reads can still need three buses and each of those is a copy.
   unsigned copies = kStorageCopies;
+  /// Whether the counts above describe the WHOLE array rather than one instance
+  /// of a structure the compiler may copy. An `allo.bind.storage type=`
+  /// topology names the ports the array is to have and a stream has two ends,
+  /// and neither leaves room for a copy the compiler adds on top.
+  bool stated = false;
 
   /// Reads the array may be given at once: one instance's, once per copy.
   std::optional<unsigned> reads() const;
@@ -114,11 +120,21 @@ struct StoragePorts {
   /// comparable.
   bool exceededBy(const StoragePorts &other) const;
 
-  /// Whether \p reads read ports, \p writes write ports and \p ports of them
-  /// altogether fit. The third is not the sum of the first two: where a port
-  /// serves either direction, one of them may carry a read and a write that
-  /// never issue together.
-  bool fit(unsigned reads, unsigned writes, unsigned ports) const;
+  /// Whether this row can hold an array built with \p reads read ports,
+  /// \p writes write ports and \p ports of them altogether, given AS MANY
+  /// COPIES AS IT TAKES. The third is not the sum of the first two: where a
+  /// port serves either direction, one of them may carry a read and a write
+  /// that never issue together.
+  ///
+  /// Reads never disqualify a row, a further read being a further copy, which
+  /// is what the part does and what the emitter builds. A write does: every
+  /// copy needs every write, so one instance's write ports are the ceiling
+  /// however many copies there are. On a pooled row the writes also spend a
+  /// port of every copy, so writes filling the pool leave a read nowhere to go.
+  ///
+  /// Where the ports are `stated` there is no copy to add and the whole array
+  /// has to fit one instance.
+  bool holds(unsigned reads, unsigned writes, unsigned ports) const;
 
   /// This budget as one phrase for a diagnostic ("2 read / 1 write over 2
   /// shared ports in 2 copies"), an unlimited axis spelled as such.

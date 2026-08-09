@@ -250,9 +250,11 @@ struct MemUnit {
   /// one port. Zero for a scattered memory and for a ROM, neither addressed.
   unsigned readPortsBuilt = 0, writePortsBuilt = 0, portsBuilt = 0;
 
-  /// Whether the ports this memory is built with fit `storage` on every axis.
+  /// Whether `storage` can hold the ports this memory is built with, over as
+  /// many copies as that takes. Reads never decide it: a further read is a
+  /// further copy. What decides it is the writes, which every copy needs.
   bool fitsStorage() const {
-    return ports.fit(readPortsBuilt, writePortsBuilt, portsBuilt);
+    return ports.holds(readPortsBuilt, writePortsBuilt, portsBuilt);
   }
 
   /// Instances of `storage` this bank is held in, decided by `bindMemoryPorts`

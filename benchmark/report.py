@@ -119,6 +119,10 @@ def memories(microarch) -> list[dict]:
             "banks": m.banks,
             "writes": m.writes,
             "storage": m.storage,
+            # What it was actually built as, which is not the row: a write set
+            # no copy count can serve is realized as registers instead.
+            "realization": m.realization,
+            "instances": m.cost.instances,
             "from_calls": m.cost.call_writes,
             "write_ports": m.cost.write_ports,
             "read_ports": m.cost.read_ports,
