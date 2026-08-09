@@ -77,11 +77,10 @@ struct MemKindTiming {
 /// until there is a reason to take it as an option.
 constexpr unsigned kStorageCopies = 2;
 
-/// The ports of ONE instance of a storage realization, per bank, and how many
-/// instances an array here may be spread over. Nullopt is no limit on that
-/// axis. What an array may be given in a cycle is neither of the two but
-/// derived from them, which is what the scheduler reserves against and the
-/// datapath binds against.
+/// The ports of ONE instance of a storage realization, per bank. Nullopt is no
+/// limit on that axis. What an ARRAY may be given in a cycle is none of the
+/// three but derived from them, which is what the scheduler reserves against
+/// and the datapath binds against.
 ///
 /// A block RAM instance's two ports each read or write, so two writers and a
 /// concurrent reader take three of them and the pool is what says so. A row
@@ -91,53 +90,46 @@ struct StoragePorts {
   std::optional<unsigned> instReads;
   std::optional<unsigned> instWrites;
   std::optional<unsigned> instPool;
-  /// Instances an array here may be spread over IN A CYCLE, which is what the
-  /// scheduler is allowed to issue against. Not a bound on the copies BUILT:
-  /// the port binding colours by what may share an address bus, so a schedule
-  /// issuing two reads can still need three buses and each of those is a copy.
-  unsigned copies = kStorageCopies;
   /// Whether the counts above describe the WHOLE array rather than one instance
   /// of a structure the compiler may copy. An `allo.bind.storage type=`
   /// topology names the ports the array is to have and a stream has two ends,
   /// and neither leaves room for a copy the compiler adds on top.
   bool stated = false;
 
-  /// Reads the array may be given at once: one instance's, once per copy.
-  std::optional<unsigned> reads() const;
-  /// Writes it may be given: one instance's. A copy that missed a write would
-  /// stop holding the same array, so copies buy no write port.
-  std::optional<unsigned> writes() const;
-  /// Accesses at once where the row pools the directions, IN SLOTS: a read
-  /// takes one slot of one copy, a write one slot of every copy.
-  std::optional<unsigned> slots() const;
+  /// Instances an array here may be spread over IN A CYCLE, which is what the
+  /// scheduler is allowed to issue against. Not a bound on the copies BUILT:
+  /// the port binding colours by what may share an address bus, so a schedule
+  /// issuing two reads can still need three buses and each of those is a copy.
+  unsigned copies() const { return stated ? 1 : kStorageCopies; }
 
   /// The tighter of the two budgets on every axis. A nullopt is no limit and
   /// yields to whatever the other side declares.
   StoragePorts meet(const StoragePorts &other) const;
 
-  /// Whether \p other asks of one instance a port this one does not have,
-  /// which is what makes a requested topology and a chosen realization
-  /// comparable.
-  bool exceededBy(const StoragePorts &other) const;
-
-  /// Whether this row can hold an array built with \p reads read ports,
-  /// \p writes write ports and \p ports of them altogether, given AS MANY
-  /// COPIES AS IT TAKES. The third is not the sum of the first two: where a
-  /// port serves either direction, one of them may carry a read and a write
-  /// that never issue together.
+  /// Whether this row can hold an array built with \p writes write ports over
+  /// \p ports address buses, given AS MANY COPIES AS IT TAKES. The second is
+  /// not the first plus the reads: where a port serves either direction, one
+  /// bus may carry a read and a write that never issue together.
   ///
-  /// Reads never disqualify a row, a further read being a further copy, which
-  /// is what the part does and what the emitter builds. A write does: every
-  /// copy needs every write, so one instance's write ports are the ceiling
-  /// however many copies there are. On a pooled row the writes also spend a
-  /// port of every copy, so writes filling the pool leave a read nowhere to go.
+  /// Reads are not an argument because they never disqualify a row: a further
+  /// read is a further copy, which is what the part does and what the emitter
+  /// builds. A write does: every copy needs every write, so one instance's
+  /// write ports are the ceiling however many copies there are. On a pooled row
+  /// the writes also spend a port of every copy, so writes filling the pool
+  /// leave a read nowhere to go.
   ///
   /// Where the ports are `stated` there is no copy to add and the whole array
   /// has to fit one instance.
-  bool holds(unsigned reads, unsigned writes, unsigned ports) const;
+  bool holds(unsigned writes, unsigned ports) const;
 
-  /// This budget as one phrase for a diagnostic ("2 read / 1 write over 2
-  /// shared ports in 2 copies"), an unlimited axis spelled as such.
+  /// Whether it can serve the topology \p want names, which is the same
+  /// question asked of ports a directive requested rather than ones a binding
+  /// built.
+  bool holds(const StoragePorts &want) const;
+
+  /// ONE INSTANCE's ports as one phrase for a diagnostic ("2 read / 1 write
+  /// over 2 shared ports"), an unlimited axis spelled as such. What copies of
+  /// it an array may be given is the sentence around this, not part of it.
   std::string describe() const;
 };
 
@@ -197,11 +189,6 @@ public:
   /// enforces; an undeclared one asserts here and falls to a zero
   /// (combinational) timing.
   MemKindTiming timing(llvm::StringRef name) const;
-
-  /// Whether the device declares \p name. An array resolving to an undeclared
-  /// realization would otherwise be scheduled at latency 0 and read before its
-  /// data is valid.
-  bool declares(llvm::StringRef name) const { return row(name); }
 
   /// Whether \p storage is the row the device marked `scatter`: one cell per
   /// element, no address, no port limit. False for every row when the device
@@ -275,15 +262,15 @@ bool isConstantTable(Value memRef);
 /// directives comparable and their disagreement reportable.
 llvm::StringRef boundStorageOf(Value memref);
 
-/// The three orthogonal axes of one `allo.bind.storage` directive, mapped from
-/// its `type` string (port topology + RAM/ROM) and its `impl` string (which
-/// storage realization).
+/// The two orthogonal axes of one `allo.bind.storage` directive, mapped from
+/// its `type` string (which port topology) and its `impl` string (which storage
+/// realization). The RAM/ROM half of a `type` spelling is not an axis: read-only
+/// is a property of the USE, which `isConstantTable` decides.
 struct BindStorage {
   /// The topology asked for, empty where the directive names none. Absent is
   /// not the dual-port default: an array that asked for nothing takes whatever
   /// its realization has, and only an explicit topology narrows that.
   std::optional<MemoryPortEnum> port;
-  MemoryKindEnum kind = MemoryKindEnum::RAM;
   llvm::StringRef storage; // empty: no explicit choice, not "no storage"
 };
 
@@ -361,9 +348,9 @@ BankLayout bankLayoutOf(Value memRef);
 /// cannot drift apart.
 struct MemoryChar {
   BankLayout layout; // element-space banks (one when unpartitioned)
-  /// Ports one bank has: the resolved `storage` row's, narrowed by the
-  /// `allo.bind.storage type=` topology. One budget for the scheduler and the
-  /// emitter both.
+  /// Ports ONE INSTANCE of the row holding one bank has: the resolved
+  /// `storage` row's, narrowed by the `allo.bind.storage type=` topology. One
+  /// budget for the scheduler and the emitter both.
   StoragePorts ports;
   bool constantTable = false; // realized as a combinational constant array
   /// Resolved `dcp.storage` realization. EMPTY only for the one array that has

@@ -66,9 +66,9 @@ struct MemCost {
   // decided once the ports are bound. What the cost model multiplies by, read
   // rather than re-derived.
   unsigned instances = 1;
-  // Read and write ports one copy of the row provides, 0 for no limit. The row
-  // narrowed by the topology the array asked for, which the device table alone
-  // does not give.
+  // Read and write ports ONE INSTANCE of the row provides, 0 for no limit,
+  // which `instances` beside it is the multiplier of. The row narrowed by the
+  // topology the array asked for, which the device table alone does not give.
   unsigned rowReads = 0, rowWrites = 0;
 };
 

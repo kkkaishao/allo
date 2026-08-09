@@ -298,12 +298,18 @@ def estimate(report: CompileReport, device: Device = default_device) -> QoR:
                     Utilization.of(price(device.rom_uses, (m.depth_words, m.width))),
                 )
                 continue
+            row = device.storage.get(m.storage)
+            if row is None:
+                # This part declares no such row, which happens only when a
+                # report is priced against a device other than the one it was
+                # built for. Reported rather than charged as something else.
+                unmodelled[m.storage] += 1
+                continue
             # An array no number of copies of its row can hold, which is a write
             # set over one instance's. READ off the emitter's classification,
             # like the two above it: this used to re-derive the predicate here
             # and the two halves could then disagree about what was built.
-            row = device.storage.get(m.storage)
-            if row is None or m.realization == "register_file":
+            if m.realization == "register_file":
                 charge(
                     "memories",
                     f.func,

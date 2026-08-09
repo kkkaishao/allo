@@ -232,9 +232,10 @@ struct MemUnit {
   /// `enumerateBoundaryPorts`. Empty for every other memory.
   llvm::SmallVector<ElemPort> elemPorts;
   std::string storage; // resolved `dcp.storage` realization
-  /// The vendor attribute pinning the array to `storage`, from that row,
-  /// stamped on the emitted declaration. Empty where the row declares none and
-  /// for a realization the row cannot hold.
+  /// The vendor attribute pinning the array to `storage`, from that row. Empty
+  /// where the row declares none. Stamped on the emitted declaration only where
+  /// the array is realized as a `Ram`, a register file having been decided
+  /// against the row.
   std::string ramStyle;
 
   /// Ports one instance of `storage` provides, from its `dcp.storage` row
@@ -253,9 +254,7 @@ struct MemUnit {
   /// Whether `storage` can hold the ports this memory is built with, over as
   /// many copies as that takes. Reads never decide it: a further read is a
   /// further copy. What decides it is the writes, which every copy needs.
-  bool fitsStorage() const {
-    return ports.holds(readPortsBuilt, writePortsBuilt, portsBuilt);
-  }
+  bool fitsStorage() const { return ports.holds(writePortsBuilt, portsBuilt); }
 
   /// Instances of `storage` this bank is held in, decided by `bindMemoryPorts`
   /// once the ports are bound. Reads past one instance's are served by another

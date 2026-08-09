@@ -114,9 +114,9 @@ class MemoryCost:
     #: multiplied by; a count read off the emission, not a formula re-applied
     #: here.
     instances: int = 1
-    #: ports one copy of the row provides, 0 for no limit. The row narrowed by
-    #: the topology the array asked for, which the device table alone does not
-    #: give.
+    #: ports ONE INSTANCE of the row provides, 0 for no limit, which
+    #: ``instances`` above is the multiplier of. The row narrowed by the
+    #: topology the array asked for, which the device table alone does not give.
     row_reads: int = 0
     row_writes: int = 0
 

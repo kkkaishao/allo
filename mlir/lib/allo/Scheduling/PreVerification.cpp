@@ -413,8 +413,7 @@ LogicalResult checkMemories(func::FuncOp func, const MemoryLibrary &memLib,
     // `impl=` picks the structure that has to provide it. `characterize` keeps
     // the tighter of the two, so a directive asking for more than its structure
     // has would silently run at the structure's ports; report it here instead.
-    if (auto want = requestedPortsOf(array);
-        want && row->ports.exceededBy(*want)) {
+    if (auto want = requestedPortsOf(array); want && !row->ports.holds(*want)) {
       error(Stage::Prep, Code::ArrayLayoutConflict, anchor)
           << "Array " << array.getType() << " asks for a port topology of "
           << want->describe() << ", but storage '" << storage << "' has "
