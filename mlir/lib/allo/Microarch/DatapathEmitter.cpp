@@ -521,33 +521,36 @@ void DatapathEmitter::createInternalMemories() {
       scatterElems[m.id] = std::move(elems);
       continue;
     }
+    // One cell per instance of each bank, bank-major. Reads past what one
+    // instance of the row has are served by another copy of the whole array,
+    // so the copies are what the module builds and what it was priced for.
     SmallVector<Value> banks;
-    for (unsigned k = 0; k < m.numBanks; ++k) {
-      auto mem =
-          seq::HLMemOp::create(c.b, c.loc, c.clk, c.rst, memCellName(dp, m, k),
-                               {static_cast<int64_t>(depth)}, elemTy);
-      // The port binding proved these writes never collide, which is exactly
-      // the promise the lowering needs to describe each in its own `always`
-      // block, and so to infer a true dual port. Without it they share one
-      // block, which arbitrates the collision they might have.
-      if (m.writesIndependent)
-        mem->setAttr(kIndependentWritesAttr, c.b.getUnitAttr());
-      // Pin the array to the row it was timed and priced against, whatever its
-      // ports came to. The row is this module's decision, and leaving it unsaid
-      // hands the structure to the synthesizer, which then builds something the
-      // cost model did not price. Ports over what one instance has are copies
-      // of that same row, not a different structure.
-      if (!m.ramStyle.empty())
-        mem->setAttr(kRamStyleAttr, c.b.getStringAttr(m.ramStyle));
-      // An initialized array the kernel also WRITES is a real memory that
-      // merely starts with contents. `seq.hlmem` carries no initializer, so the
-      // words ride to the seq->SV pipeline, which gives the backing reg an
-      // `initial` block.
-      if (m.romInit)
-        recordMemoryInit(
-            mem, initWords(cast<ElementsAttr>(m.romInit), m.width, depth));
-      banks.push_back(mem.getHandle());
-    }
+    for (unsigned k = 0; k < m.numBanks; ++k)
+      for (unsigned i = 0; i < m.instances; ++i) {
+        auto mem = seq::HLMemOp::create(c.b, c.loc, c.clk, c.rst,
+                                        memCellName(dp, m, k, i),
+                                        {static_cast<int64_t>(depth)}, elemTy);
+        // The port binding proved these writes never collide, which is exactly
+        // the promise the lowering needs to describe each in its own `always`
+        // block, and so to build a true dual port. Without it they share one
+        // block, which arbitrates the collision they might have.
+        if (m.writesIndependent)
+          mem->setAttr(kIndependentWritesAttr, c.b.getUnitAttr());
+        // Pin the array to the row it was timed and priced against, whatever
+        // its ports came to. The row is this module's decision, and leaving it
+        // unsaid hands the structure to the synthesizer, which then builds
+        // something the cost model did not price.
+        if (!m.ramStyle.empty())
+          mem->setAttr(kRamStyleAttr, c.b.getStringAttr(m.ramStyle));
+        // An initialized array the kernel also WRITES is a real memory that
+        // merely starts with contents. `seq.hlmem` carries no initializer, so
+        // the words ride to the seq->SV pipeline, which gives the backing reg
+        // an `initial` block. Every copy starts with them.
+        if (m.romInit)
+          recordMemoryInit(
+              mem, initWords(cast<ElementsAttr>(m.romInit), m.width, depth));
+        banks.push_back(mem.getHandle());
+      }
     memBanks[m.id] = std::move(banks);
   }
 }
@@ -600,7 +603,7 @@ void DatapathEmitter::emitSkewedInternalReads(const uarch::RegionBlock &rb) {
   }
   for (auto &[key, idxs] : lanes) {
     const uarch::MemUnit &m = dp.mems[key.first];
-    ArrayRef<Value> banks = memBanks[m.id];
+    unsigned lane = key.second;
     unsigned lat = m.readLatency;
     SmallVector<std::pair<Value, Value>> tagged; // (runtime bank, in-bank addr)
     for (unsigned i : idxs) {
@@ -611,10 +614,10 @@ void DatapathEmitter::emitSkewedInternalReads(const uarch::RegionBlock &rb) {
     // skew rather than by the port graph, so it proves nothing about what else
     // touches this bank.
     SmallVector<Value> vals;
-    for (unsigned k = 0; k < banks.size(); ++k)
+    for (unsigned k = 0; k < m.numBanks; ++k)
       vals.push_back(c.R(seq::ReadPortOp::create(
-          c.b, c.loc, banks[k], ValueRange{laneSelect(c, tagged, k)},
-          /*rdEn=*/Value(), lat)));
+          c.b, c.loc, memReadCell(m, k, lane),
+          ValueRange{laneSelect(c, tagged, k)}, /*rdEn=*/Value(), lat)));
     // Each access picks its own bank's datum back out, delayed with it.
     for (auto [i, t] : llvm::zip(idxs, tagged)) {
       Value sel = lat ? c.shiftChain(t.first, lat, sh).last() : t.first;
@@ -673,11 +676,11 @@ void DatapathEmitter::emitInternalReads(const uarch::RegionBlock &rb,
     auto bs = bankAddress(m, acc);
     Value addr = memAddr(m, bs.offset);
     SmallVector<Value> vals;
-    for (Value h : memBanks[m.id])
-      vals.push_back(
-          c.R(atPort(seq::ReadPortOp::create(c.b, c.loc, h, ValueRange{addr},
-                                             /*rdEn=*/Value(), lat),
-                     acc.port)));
+    for (unsigned k = 0; k < m.numBanks; ++k)
+      vals.push_back(c.R(atPort(
+          seq::ReadPortOp::create(c.b, c.loc, memReadCell(m, k, acc.port),
+                                  ValueRange{addr}, /*rdEn=*/Value(), lat),
+          acc.port)));
     Value sel = lat ? c.shiftChain(bs.bank, lat, sh).last() : bs.bank;
     readData[accKey(m.id, r.idx)] = readCrossbar(c, vals, sel);
   }
@@ -685,10 +688,11 @@ void DatapathEmitter::emitInternalReads(const uarch::RegionBlock &rb,
     auto [id, bank, port] = key;
     const uarch::MemUnit &m = dp.mems[id];
     Value addr = sharedAddress(m, idxs, issue, sh);
-    Value rd = c.R(atPort(seq::ReadPortOp::create(
-                              c.b, c.loc, memBanks[id][bank], ValueRange{addr},
-                              /*rdEn=*/Value(), m.readLatency),
-                          port));
+    Value rd =
+        c.R(atPort(seq::ReadPortOp::create(
+                       c.b, c.loc, memReadCell(m, bank, port), ValueRange{addr},
+                       /*rdEn=*/Value(), m.readLatency),
+                   port));
     for (unsigned i : idxs)
       readData[accKey(m.id, i)] = rd;
   }
@@ -933,7 +937,6 @@ void DatapathEmitter::emitSkewedInternalWrites(const uarch::RegionBlock &rb,
   }
   for (auto &[key, idxs] : lanes) {
     const uarch::MemUnit &m = dp.mems[key.first];
-    ArrayRef<Value> banks = memBanks[m.id];
     // A `seq.hlmem` write port realizes exactly one cycle, so a deeper device
     // latency presents address/data/we `writeLatency - 1` cycles late (the
     // unskewed twin below says the rest).
@@ -953,7 +956,7 @@ void DatapathEmitter::emitSkewedInternalWrites(const uarch::RegionBlock &rb,
       fb.storeDrain = std::max<unsigned>(fb.storeDrain, storeDrainOf(m, acc));
     }
     auto wlat = c.b.getI64IntegerAttr(1);
-    for (unsigned k = 0; k < banks.size(); ++k) {
+    for (unsigned k = 0; k < m.numBanks; ++k) {
       Value we = writeDemux(c, wes[0], bankOf[0], k);
       for (unsigned i = 1; i < idxs.size(); ++i)
         we = c.orBits(we, writeDemux(c, wes[i], bankOf[i], k));
@@ -961,9 +964,10 @@ void DatapathEmitter::emitSkewedInternalWrites(const uarch::RegionBlock &rb,
       // the port graph, so nothing proves this store and a read of the same
       // bank stay out of each other's cycle, and only that proof lets the two
       // share one address.
-      seq::WritePortOp::create(c.b, c.loc, banks[k],
-                               ValueRange{laneSelect(c, addrs, k)},
-                               laneSelect(c, datas, k), we, wlat);
+      for (Value cell : memWriteCells(m, k))
+        seq::WritePortOp::create(c.b, c.loc, cell,
+                                 ValueRange{laneSelect(c, addrs, k)},
+                                 laneSelect(c, datas, k), we, wlat);
     }
   }
 }
@@ -1034,7 +1038,6 @@ void DatapathEmitter::emitAccesses(const uarch::RegionBlock &rb, Value issue,
     const uarch::MemUnit::Access &acc = m.accesses[r.idx];
     if (m.external || !acc.isWrite || m.skewed)
       continue;
-    ArrayRef<Value> banks = memBanks[m.id];
     // A `seq.hlmem` write port realizes exactly one cycle, so a deeper device
     // latency presents address/data/we `writeLatency - 1` cycles late. The
     // datum still lands at `dcpStart + writeLatency` (see `storeDrainOf`).
@@ -1066,10 +1069,12 @@ void DatapathEmitter::emitAccesses(const uarch::RegionBlock &rb, Value issue,
       auto bs = bankAddress(m, acc);
       Value addr = late(memAddr(m, bs.offset));
       Value bank = late(bs.bank);
-      for (unsigned k = 0; k < banks.size(); ++k)
-        atPort(seq::WritePortOp::create(c.b, c.loc, banks[k], ValueRange{addr},
-                                        data, writeDemux(c, we, bank, k), wlat),
-               acc.port);
+      for (unsigned k = 0; k < m.numBanks; ++k)
+        for (Value cell : memWriteCells(m, k))
+          atPort(seq::WritePortOp::create(c.b, c.loc, cell, ValueRange{addr},
+                                          data, writeDemux(c, we, bank, k),
+                                          wlat),
+                 acc.port);
     }
     fb.storeDrain = std::max<unsigned>(fb.storeDrain, storeDrainOf(m, acc));
   }
@@ -1106,7 +1111,7 @@ void DatapathEmitter::finalizeSharedWritePorts() {
     unsigned ports = 0;
     for (const SharedWrite &w : writes)
       ports = std::max(ports, w.port + 1);
-    for (auto [k, hlmem] : llvm::enumerate(memBanks[m.id]))
+    for (unsigned k = 0; k < m.numBanks; ++k)
       for (unsigned p = 0; p < ports; ++p) {
         Value addr, data, we;
         for (const SharedWrite &w : writes) {
@@ -1116,8 +1121,12 @@ void DatapathEmitter::finalizeSharedWritePorts() {
           data = data ? c.mux(w.we, w.data, data) : w.data;
           we = we ? c.orBits(we, w.we) : w.we;
         }
-        if (we)
-          atPort(seq::WritePortOp::create(c.b, c.loc, hlmem, ValueRange{addr},
+        if (!we)
+          continue;
+        // The same port on every instance of the bank: a copy that missed a
+        // write would stop holding the same array.
+        for (Value cell : memWriteCells(m, k))
+          atPort(seq::WritePortOp::create(c.b, c.loc, cell, ValueRange{addr},
                                           data, we, c.b.getI64IntegerAttr(1)),
                  p);
       }
@@ -1779,10 +1788,9 @@ void DatapathEmitter::emitCalls(const uarch::RegionBlock &rb, Value issue,
       // One hlmem per bank: the child masters bank `ma.bank`, already indexed
       // in that bank's own space via `allo.part`, so this routes straight to
       // it with no crossbar (validateDatapath rejects a partition mismatch).
-      assert(ma.bank < memBanks[m.id].size() &&
+      assert(ma.bank < m.numBanks &&
              "child bank index exceeds the buffer's bank count; "
              "validateDatapath must have rejected the partition mismatch");
-      Value hlmem = memBanks[m.id][ma.bank];
       Value addr = memAddr(m, outs[ma.addr]);
       // The child was compiled against this buffer's device latency, read here
       // from the MemUnit since the parent never accesses the buffer itself. A
@@ -1797,10 +1805,11 @@ void DatapathEmitter::emitCalls(const uarch::RegionBlock &rb, Value issue,
         // blocks and the array still infers a true dual port.
         sharedWrites[m.id].push_back({ma.bank, ma.port, a, d, w});
       } else
-        rdBackedge[ma.data].setValue(c.R(
-            atPort(seq::ReadPortOp::create(c.b, c.loc, hlmem, ValueRange{addr},
-                                           /*rdEn=*/Value(), m.readLatency),
-                   ma.port)));
+        rdBackedge[ma.data].setValue(
+            c.R(atPort(seq::ReadPortOp::create(
+                           c.b, c.loc, memReadCell(m, ma.bank, ma.port),
+                           ValueRange{addr}, /*rdEn=*/Value(), m.readLatency),
+                       ma.port)));
     }
     // Scoped to this pass for the join above and the conjunction below, which
     // would otherwise read the previous pass's latched 1.

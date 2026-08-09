@@ -263,6 +263,15 @@ struct MemUnit {
   /// either of them re-applies.
   unsigned instances = 1;
 
+  /// Which instance of a bank serves each read port, by `instanceKey`. Only the
+  /// binding knows which ports reach which bank, and a port index is a colour
+  /// rather than a dense read index, so the choice is made there and looked up
+  /// here. Empty while `instances` is 1, every read going to the one instance.
+  llvm::DenseMap<uint64_t, unsigned> readInstance;
+  static uint64_t instanceKey(unsigned bank, unsigned port) {
+    return (uint64_t(bank) << 32) | port;
+  }
+
   /// What this module builds to hold the array, decided by
   /// `classifyRealizations` from the port binding and read by the emitter and
   /// the report. Not by the cost model, which prices an addressed array by

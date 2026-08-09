@@ -854,8 +854,39 @@ void DatapathBuilder::bindMemoryPorts() {
   // the loop early, so this runs over every memory rather than inside.
   for (MemUnit &m : dp.mems) {
     unsigned per = m.ports.reads.value_or(0);
-    if (per && m.readPortsBuilt > per)
-      m.instances = (m.readPortsBuilt + per - 1) / per;
+    if (!per || m.readPortsBuilt <= per)
+      continue;
+    m.instances = (m.readPortsBuilt + per - 1) / per;
+    // Each bank ranks the read ports that reach it and hands them out a whole
+    // instance at a time. Per bank, not over the memory: `readPortsBuilt` is
+    // the largest any one bank holds, so ranking every colour together would
+    // run past it wherever two banks hold different ones and would put more
+    // reads on an instance than it has.
+    llvm::SmallVector<llvm::SmallVector<unsigned>> byBank(m.numBanks);
+    auto reaches = [&](std::optional<unsigned> bank, unsigned port) {
+      // A skew's `staticBank` is a slot, not a bank, and its accesses read
+      // every bank through the crossbar, as an unassigned access does.
+      if (bank && !m.skewed)
+        byBank[*bank].push_back(port);
+      else
+        for (auto &ports : byBank)
+          ports.push_back(port);
+    };
+    for (const MemUnit::Access &acc : m.accesses)
+      if (!acc.isWrite)
+        reaches(acc.staticBank, acc.port);
+    for (const CallUnit &cu : dp.calls)
+      for (const CallUnit::MemArg &ma : cu.memArgs)
+        if (ma.mem == m.id && !ma.isWrite)
+          reaches(ma.bank, ma.port);
+    for (auto [k, ports] : llvm::enumerate(byBank)) {
+      llvm::sort(ports);
+      ports.erase(std::unique(ports.begin(), ports.end()), ports.end());
+      for (auto [rank, port] : llvm::enumerate(ports)) {
+        assert(rank / per < m.instances && "a read ranked past the instances");
+        m.readInstance[MemUnit::instanceKey(k, port)] = rank / per;
+      }
+    }
   }
 }
 

@@ -298,9 +298,12 @@ def test_a_dynamic_bank_costs_a_port_on_every_bank():
     s = stencil.schedule()
     s.partition("buf", dim=1, kind=s.Cyclic, factor=2)
     mod = s.export("rtl")
-    assert mod.mlir.count("= seq.hlmem") == 2
     # Two banks, three crossbarred reads: six read ports, three on each bank.
     assert len(re.findall(r"\bseq\.read\b", mod.mlir)) == 6
+    # Three is more than one instance of the row serves, so each bank is held in
+    # two copies of it and both are emitted: the reads split over them and every
+    # write reaches both.
+    assert mod.mlir.count("= seq.hlmem") == 4
     # ... which is one more than the two banks hold, so the read loop runs at
     # II=2 while the copy loop stays fully pipelined.
     assert _iis(mod.schedule().cyclic()) == [1, 2]
@@ -802,12 +805,15 @@ def test_a_skewed_partition_serves_a_row_and_a_column():
     cyc = _transpose_pair((2, Schedule.Cyclic))
     skew = _transpose_pair((2, Schedule.Skew))
 
-    # Same four memories either way; what differs is the ports into them. Under
-    # cyclic the four row reads bank statically (one port each) and the four
-    # column reads crossbar (a port on every bank): 4 + 4*4 = 20. Under the skew
-    # the eight reads fall into two LANES of four distinct slots, and a lane
-    # shares one port per bank: 2 * 4 = 8.
-    assert cyc.mlir.count("= seq.hlmem") == skew.mlir.count("= seq.hlmem") == 4
+    # Four banks either way; what differs is the ports into them, and so how
+    # many copies of the row a bank needs. Under cyclic the four row reads bank
+    # statically (one port each) and the four column reads crossbar (a port on
+    # every bank): 4 + 4*4 = 20 reads, five to a bank, which takes three copies
+    # of a two-read row. Under the skew the eight reads fall into two LANES of
+    # four distinct slots and a lane shares one port per bank: 2 * 4 = 8 reads,
+    # two to a bank, which one copy serves.
+    assert skew.mlir.count("= seq.hlmem") == 4
+    assert cyc.mlir.count("= seq.hlmem") == 12
     assert len(re.findall(r"\bseq\.read\b", cyc.mlir)) == 20
     assert len(re.findall(r"\bseq\.read\b", skew.mlir)) == 8
 

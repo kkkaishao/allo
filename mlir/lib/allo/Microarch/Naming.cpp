@@ -179,11 +179,12 @@ std::string resultPortName(unsigned i, unsigned n) {
 // Internal cells.
 //===----------------------------------------------------------------------===//
 
-std::string memCellName(llvm::StringRef owner, unsigned numBanks,
-                        unsigned bank) {
+std::string memCellName(llvm::StringRef owner, unsigned numBanks, unsigned bank,
+                        unsigned instances, unsigned inst) {
   // The only name with no role suffix, so it escapes itself: a buffer named
   // `buf` collides with the Verilog gate primitive.
-  return numBanks > 1 ? bankBase(owner, bank) : verilogName(owner);
+  std::string name = numBanks > 1 ? bankBase(owner, bank) : verilogName(owner);
+  return instances > 1 ? name + "_c" + std::to_string(inst) : name;
 }
 
 // The memrefs of the module are the sibling namespace the tie-break runs in; an
@@ -195,8 +196,9 @@ static std::string memOwnerName(const Datapath &dp, const MemUnit &m) {
   return uniqueOwnerOf(m.memref, siblings, memOwner(m.id));
 }
 
-std::string memCellName(const Datapath &dp, const MemUnit &m, unsigned bank) {
-  return memCellName(memOwnerName(dp, m), m.numBanks, bank);
+std::string memCellName(const Datapath &dp, const MemUnit &m, unsigned bank,
+                        unsigned inst) {
+  return memCellName(memOwnerName(dp, m), m.numBanks, bank, m.instances, inst);
 }
 
 std::string memElemName(const Datapath &dp, const MemUnit &m, unsigned k) {

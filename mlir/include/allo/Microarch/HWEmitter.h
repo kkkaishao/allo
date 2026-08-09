@@ -220,9 +220,24 @@ struct DatapathEmitter {
   DenseMap<uint64_t, Value> callResultVal; // (call id, result idx) -> the child
                                            // instance's scalar result output
                                            // (populated by emitCalls)
-  DenseMap<unsigned, SmallVector<Value>>
-      memBanks; // internal mem id -> its bank hlmem handle(s) (one unless
-                // banked); empty for a scattered array, which holds no hlmem
+  /// Internal mem id -> the hlmem handles holding it, bank-major over the
+  /// instances of each bank (`bank * instances + inst`). Empty for a scattered
+  /// array, which holds no hlmem. Index it through `memReadCell` /
+  /// `memWriteCells` rather than directly.
+  DenseMap<unsigned, SmallVector<Value>> memBanks;
+  /// The one instance of \p m's bank \p bank that answers read port \p port.
+  /// Every instance holds the whole array, so one of them is enough.
+  Value memReadCell(const uarch::MemUnit &m, unsigned bank, unsigned port) {
+    return memBanks[m.id][bank * m.instances +
+                          m.readInstance.lookup(
+                              uarch::MemUnit::instanceKey(bank, port))];
+  }
+  /// Every instance of \p m's bank \p bank: a write reaches all of them, each
+  /// copy needing it to stay the same array.
+  ArrayRef<Value> memWriteCells(const uarch::MemUnit &m, unsigned bank) {
+    return ArrayRef<Value>(memBanks[m.id])
+        .slice(bank * m.instances, m.instances);
+  }
   /// One backedge per element of a SCATTERED INTERNAL array, in flat row-major
   /// order: the register's own output. Declared with the array so a read can
   /// select over the elements before the stores that drive them have emitted,

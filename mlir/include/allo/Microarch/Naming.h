@@ -140,10 +140,13 @@ std::string resultPortName(unsigned i, unsigned n);
 //===----------------------------------------------------------------------===//
 
 /// On-chip storage for the buffer named \p owner: bank \p bank when it is one
-/// of \p numBanks. The Datapath overload resolves a MemUnit's owner name first.
-std::string memCellName(llvm::StringRef owner, unsigned numBanks,
-                        unsigned bank);
-std::string memCellName(const Datapath &dp, const MemUnit &m, unsigned bank);
+/// of \p numBanks, and instance \p inst when the bank is held in \p instances
+/// of them. An index that has only one value is left off. The Datapath overload
+/// resolves a MemUnit's owner name and instance count first.
+std::string memCellName(llvm::StringRef owner, unsigned numBanks, unsigned bank,
+                        unsigned instances = 1, unsigned inst = 0);
+std::string memCellName(const Datapath &dp, const MemUnit &m, unsigned bank,
+                        unsigned inst = 0);
 /// `<owner>_<k>`: element \p k of an internal array scattered into registers.
 /// The index is bare, as `elemBase` spells a scattered argument's.
 std::string memElemName(const Datapath &dp, const MemUnit &m, unsigned k);
