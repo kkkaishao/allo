@@ -242,8 +242,10 @@ class Storage:  # pylint: disable=too-many-instance-attributes
     is open: a part whose primitives are not Xilinx's declares different names
     and nothing in the compiler switches on the list.
 
-    ``allo.bind.storage impl=`` names one of these, and an array with no
-    explicit choice takes the device's :meth:`Device.set_default_storage`.
+    ``allo.bind.storage impl=`` names one of these. An array with no explicit
+    choice takes :meth:`Device.set_default_storage` where the device sets one,
+    and otherwise the cheapest row on this part that the compiler can pin it
+    to, among those at the least access latency.
     """
 
     name: str
@@ -572,9 +574,14 @@ class Device:
         return self
 
     def set_default_storage(self, storage: Storage) -> Device:
-        """The storage an array with no ``bind_storage`` resolves to. Takes a
-        realization, so defaulting to a :class:`Resource` is a type error rather
-        than a name that fails to resolve much later."""
+        """Hold every array with no ``bind_storage`` here, whatever it costs.
+
+        An OVERRIDE, and a device needs none: left unset, the compiler picks
+        the cheapest row on this part that it can pin the array to, among those
+        at the least access latency. Set it to state the policy yourself.
+
+        Takes a realization, so defaulting to a :class:`Resource` is a type
+        error rather than a name that fails to resolve much later."""
         if not isinstance(storage, Storage):
             raise TypeError(
                 f"the default must be a storage realization, got "
@@ -733,11 +740,6 @@ class Device:
                 f"device {self.name!r} marks {len(scatter)} scatter storages; it "
                 "needs exactly one, since that is what a completely partitioned "
                 "array and an array that failed RAM inference both become"
-            )
-        if self.default_storage is None:
-            raise ValueError(
-                f"device {self.name!r} sets no default storage, so an array with "
-                "no `bind_storage` has nothing to resolve to"
             )
         if self.stream_timing is None:
             raise ValueError(f"device {self.name!r} declares no stream timing")

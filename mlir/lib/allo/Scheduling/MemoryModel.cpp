@@ -232,18 +232,41 @@ bool mlir::allo::isConstantTable(Value memRef) {
 }
 
 // The name of the storage realization a memref resolves to, the input to
-// per-realization access timing: a complete partition takes the device's
-// `scatter` row whatever `bind.storage impl` says, since once every bank holds
-// one word there is no addressed structure left; else an explicit
-// `bind.storage impl`; else the device's `default` row. An empty result is a
-// device that marks no `scatter`, which `PreVerification` reports.
+// per-realization access timing, in the order the four sources outrank each
+// other:
+//
+//   * a complete partition takes the device's `scatter` row whatever
+//     `bind.storage impl` says, since once every bank holds one word there is
+//     no addressed structure left;
+//   * else an explicit `bind.storage impl`, the user's own choice;
+//   * else the device's `default` row where it marks one, which is a device
+//     stating the policy itself and turns the derivation off;
+//   * else the row `rowFor` derives from what the array COSTS on this part.
+//
+// An empty result is a device that can hold this array nowhere, which
+// `PreVerification` reports.
+//
+// Off the array's own shape and the device alone, so every caller reaches the
+// same row: the scheduler times against it before there is a schedule, and the
+// emitter builds it after.
 static std::string resolveStorage(Value memRef, const MemoryLibrary &lib) {
-  if (bankLayoutOf(memRef).registers)
+  BankLayout layout = bankLayoutOf(memRef);
+  if (layout.registers)
     return lib.scatterStorage;
   auto bs =
       parseBindStorage(carrierAttr<DictionaryAttr>(memRef, kBindStorageAttr));
-  return (bs.storage.empty() ? StringRef(lib.defaultStorage) : bs.storage)
-      .str();
+  if (!bs.storage.empty())
+    return bs.storage.str();
+  if (!lib.defaultStorage.empty())
+    return lib.defaultStorage;
+  auto type = dyn_cast<MemRefType>(memRef.getType());
+  if (!type)
+    return {};
+  // Per BANK, which is the structure that gets built: the bank count is a
+  // common factor across the rows and cannot reorder them, but a row's tiling
+  // minimum is charged once per bank and very much can.
+  return lib.rowFor(layout.bankWords(), datapathWidth(type.getElementType()),
+                    globalInitOf(memRef).has_value());
 }
 
 StringRef allo::boundStorageOf(Value memRef) {
@@ -766,6 +789,8 @@ MemoryLibrary MemoryLibrary::fromModule(ModuleOp module) {
     return n ? std::optional<unsigned>((unsigned)*n) : std::nullopt;
   };
   Block &body = device.getBody().front();
+  for (auto r : body.getOps<dcp::DCPathResourceOp>())
+    m.capacity[r.getSymName()] = r.getCapacity();
   for (auto s : body.getOps<dcp::DCPathStorageOp>()) {
     m.storage.push_back(
         {s.getSymName().str(),
@@ -773,7 +798,9 @@ MemoryLibrary MemoryLibrary::fromModule(ModuleOp module) {
          {limit(s.getInstReads()), limit(s.getInstWrites()),
           limit(s.getInstPorts()), kStorageCopies},
          s.getRamStyle().value_or("").str(),
-         !s.getNoInit()});
+         !s.getNoInit(),
+         s.getIsScatter(),
+         s.getUsesAttr()});
     if (s.getIsDefault())
       m.defaultStorage = s.getSymName().str();
     if (s.getIsScatter())
@@ -789,6 +816,59 @@ const StorageRealization *MemoryLibrary::row(StringRef name) const {
     if (s.name == name)
       return &s;
   return nullptr;
+}
+
+std::optional<double> MemoryLibrary::fractionOfPart(StringRef storage,
+                                                    int64_t words,
+                                                    unsigned width) const {
+  const StorageRealization *s = row(storage);
+  if (!s || !s->uses)
+    return std::nullopt;
+  auto spent = evaluateResourceUse(s->uses, {words, int64_t(width)});
+  if (!spent || spent->empty())
+    return std::nullopt;
+  double worst = 0.0;
+  for (auto &[resource, count] : *spent) {
+    auto cap = capacity.find(resource.getLeafReference().getValue());
+    if (cap == capacity.end() || cap->second <= 0)
+      return std::nullopt;
+    worst = std::max(worst, double(count) / double(cap->second));
+  }
+  return worst;
+}
+
+std::string MemoryLibrary::rowFor(int64_t words, unsigned width,
+                                  bool needsInit) const {
+  // Only a row the device can PIN is a candidate: choosing a structure and
+  // leaving the synthesizer to agree is the delegation this whole model is
+  // against. A row without a vendor attribute is reachable through
+  // `bind_storage impl=` alone, which is the user taking that risk knowingly.
+  llvm::SmallVector<std::pair<const StorageRealization *, double>> viable;
+  for (const StorageRealization &s : this->storage) {
+    if (s.scatter || s.ramStyle.empty() || (needsInit && !s.canInit))
+      continue;
+    if (auto cost = fractionOfPart(s.name, words, width))
+      viable.emplace_back(&s, *cost);
+  }
+  if (viable.empty())
+    return {};
+  // Read latency first, then write: a deeper row is out however cheap it is.
+  auto latency = [](const StorageRealization *s) {
+    return std::pair(s->timing.latency.read, s->timing.latency.write);
+  };
+  auto fastest = latency(llvm::min_element(viable, [&](auto &a, auto &b) {
+                           return latency(a.first) < latency(b.first);
+                         })->first);
+  // Strictly cheaper to displace, so two rows the device prices the same break
+  // by declaration order and the choice stays the device's own.
+  const StorageRealization *pick = nullptr;
+  double best = 0.0;
+  for (auto &[s, cost] : viable)
+    if (latency(s) == fastest && (!pick || cost < best)) {
+      pick = s;
+      best = cost;
+    }
+  return pick->name;
 }
 
 MemKindTiming MemoryLibrary::timing(StringRef name) const {

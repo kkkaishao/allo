@@ -102,7 +102,6 @@ TIMING: Mapping[Grade, FabricTiming] = {
     ),
 }
 
-DEFAULT_STORAGE = "lutram"
 SCATTER_STORAGE = "register"
 
 #: Operator cores measured on this fabric, each inside a registered wrapper so
@@ -323,7 +322,6 @@ def build(part: Part) -> Device:
             can_init=spec.can_init,
             uses=spec.uses(res),
         )
-    d.set_default_storage(d.storage[DEFAULT_STORAGE])
     d.set_stream_timing(*timing.stream)
 
     comb = _comb_uses(res)

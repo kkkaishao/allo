@@ -138,6 +138,14 @@ struct StorageRealization {
   /// Whether the structure comes up holding contents. False for one that powers
   /// up undefined, as an UltraRAM does.
   bool canInit = true;
+  /// Whether this is the row that is not a memory: one cell per element, no
+  /// address, which is where a complete partition goes.
+  bool scatter = false;
+  /// What ONE instance spends over `(depth, width)`, the `uses` of the row
+  /// verbatim. Held as the attribute rather than a number because the price is
+  /// only meaningful at an array's own shape. Null where the device left the
+  /// row unpriced.
+  mlir::ArrayAttr uses;
 };
 
 /// The storage-timing library, filled from the `dcp.storage` and
@@ -187,16 +195,38 @@ public:
     return !scatterStorage.empty() && storage == scatterStorage;
   }
 
-  // What an array with no `allo.bind.storage impl=` resolves to: the device's
-  // `dcp.storage` marked `default`, or this fallback when it marks none. A name
+  /// What one bank of \p words x \p width of \p storage spends, as a fraction
+  /// of the part: the worst of its resources, which is the axis a design runs
+  /// out on. Nullopt where the row is unpriced, where a cost is not measured at
+  /// this shape, or where the device quotes no capacity for what it spends.
+  /// ONE instance, the copies being a decision no one has taken this early.
+  std::optional<double> fractionOfPart(llvm::StringRef storage, int64_t words,
+                                       unsigned width) const;
+
+  /// The row an unbound array of \p words x \p width takes: among the rows the
+  /// device can PIN an array to, the cheapest by `fractionOfPart` of those at
+  /// the least access latency. Latency first and without exception, since a
+  /// row's latency is the contract the schedule is built on and trading a cycle
+  /// for area is the user's call to make with `bind_storage`. \p needsInit
+  /// excludes a row that powers up undefined. Empty where the device declares
+  /// nothing it can both pin and price, and `defaultStorage` then stands.
+  std::string rowFor(int64_t words, unsigned width, bool needsInit) const;
+
+  // The `dcp.storage` marked `default`, EMPTY where the device marks none. A
+  // device that marks one holds every unbound array there and the derivation
+  // never runs; a device that marks none leaves the choice to `rowFor`. A name
   // rather than a handle, so replacing a row does not leave it dangling.
-  std::string defaultStorage = "lutram";
+  std::string defaultStorage;
   // What a completely partitioned array resolves to: the `dcp.storage` marked
   // `scatter`, EMPTY when the device marks none. The compiler names no storage
   // of its own, so this is the one place the two axes meet.
   std::string scatterStorage;
   std::vector<StorageRealization> storage; // the `dcp.storage` rows
   MemKindTiming fifo;                      // `dcp.stream_timing`
+  /// How much of each `dcp.resource` the part has, which is what turns a row's
+  /// spend into a fraction and so makes two rows spending different primitives
+  /// comparable at all.
+  llvm::StringMap<int64_t> capacity;
 };
 
 //===----------------------------------------------------------------------===//

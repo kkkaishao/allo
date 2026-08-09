@@ -384,15 +384,20 @@ LogicalResult checkMemories(func::FuncOp func, const MemoryLibrary &memLib,
              "partition, or fill the array from the kernel instead";
       return failure();
     }
-    // A completely partitioned array needs the device's `scatter` row; an empty
-    // name would otherwise fall through as a stream's, timed by an unrelated
-    // row.
+    // Nowhere to hold the array; an empty name would otherwise fall through as
+    // a stream's, timed by an unrelated row.
     if (storage.empty()) {
-      error(Stage::Prep, Code::StorageNotDeclared, anchor)
-          << "Array " << array.getType()
-          << " is completely partitioned, but the device marks no "
-             "`dcp.storage` "
-             "`scatter` for one cell per element to be built out of";
+      auto diag = error(Stage::Prep, Code::StorageNotDeclared, anchor);
+      diag << "Array " << array.getType();
+      if (mc.layout.registers)
+        diag << " is completely partitioned, but the device marks no "
+                "`dcp.storage` `scatter` for one cell per element to be built "
+                "out of";
+      else
+        diag << " has no `bind_storage impl`, and the device marks no "
+                "`default` `dcp.storage` and declares none the compiler can "
+                "choose: a row it may choose has to carry a `style` to pin the "
+                "array with and `uses` to price it by";
       return failure();
     }
     // A realization the device never declared would fall to the zero-timing
