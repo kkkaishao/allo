@@ -856,6 +856,21 @@ void DatapathBuilder::bindMemoryPorts() {
     // Off `instReads`, what ONE instance serves, not off `reads`, which is what
     // the array may be given altogether and so is already a multiple of it.
     unsigned per = m.ports.instReads.value_or(0);
+    if (m.ports.pool) {
+      // A pooled port serves either direction, and the binding may already have
+      // ridden a write on a read's where the two never issue together, so what
+      // the bank was BUILT with is the question and not the two directions
+      // separately. Within the pool one instance holds it.
+      if (m.portsBuilt <= *m.ports.pool)
+        continue;
+      // Past it every copy takes every write and the reads share what is left,
+      // so a written block RAM serves one read a copy, which is what the part
+      // does: 1024x32 measures one tile at one read and two at two. Nothing
+      // left is an array this row cannot hold at all.
+      per = std::min(per, *m.ports.pool > m.writePortsBuilt
+                              ? *m.ports.pool - m.writePortsBuilt
+                              : 0u);
+    }
     if (!per || m.readPortsBuilt <= per)
       continue;
     m.instances = (m.readPortsBuilt + per - 1) / per;
