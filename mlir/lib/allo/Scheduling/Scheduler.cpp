@@ -1254,13 +1254,14 @@ LogicalResult SharedOperatorsSimplexScheduler::schedule() {
     // the op holds is free for its whole occupancy window (occ consecutive
     // cycles; occ == 1 when pipelined).
     unsigned occ = prob.getResourceCycles(op);
+    unsigned slots = prob.getResourceDemand(op);
     unsigned startTimeVar = startTimeVariables[op];
     unsigned candTime = getStartTime(startTimeVar);
     auto hasRoom = [&](unsigned t) {
       for (Problem::ResourceType rsrc : units) {
         unsigned limit = *prob.getLimit(rsrc);
         for (unsigned i = 0; i < occ; ++i)
-          if (reservationTable[rsrc].lookup(t + i) >= limit)
+          if (reservationTable[rsrc].lookup(t + i) + slots > limit)
             return false;
       }
       return true;
@@ -1277,7 +1278,7 @@ LogicalResult SharedOperatorsSimplexScheduler::schedule() {
     // Record the use of every unit across the occupancy window.
     for (Problem::ResourceType rsrc : units)
       for (unsigned i = 0; i < occ; ++i)
-        ++reservationTable[rsrc][candTime + i];
+        reservationTable[rsrc][candTime + i] += slots;
 
     LLVM_DEBUG(dbgs() << "After scheduling " << startTimeVar
                       << " to t=" << candTime << ":\n";
@@ -1339,10 +1340,11 @@ LogicalResult ModuloSimplexScheduler::MRT::enter(Operation *op,
   // than II wraps, hitting one slot twice, which a per-slot set would hide. The
   // window is the same on every unit, all taken at the op's start time.
   unsigned occ = sched.prob.getResourceCycles(op);
+  unsigned slots = sched.prob.getResourceDemand(op);
   unsigned base = timeStep % sched.parameterT;
   SmallDenseMap<unsigned, unsigned> want;
   for (unsigned i = 0; i < occ; ++i)
-    ++want[(base + i) % sched.parameterT];
+    want[(base + i) % sched.parameterT] += slots;
 
   // Admit only if every touched slot of every unit fits, then commit to all of
   // them: an op that fits in one unit but not another must leave no partial
@@ -1366,6 +1368,7 @@ LogicalResult ModuloSimplexScheduler::MRT::enter(Operation *op,
 
 void ModuloSimplexScheduler::MRT::release(Operation *op) {
   unsigned occ = sched.prob.getResourceCycles(op);
+  unsigned slots = sched.prob.getResourceDemand(op);
   // Undo enter's per-slot increments on every unit it reserved, recomputed from
   // the stored base + occ so a wrapped slot is decremented once per lap. The
   // reverse tables record exactly the units entered, unlimited links skipped.
@@ -1377,8 +1380,8 @@ void ModuloSimplexScheduler::MRT::release(Operation *op) {
     auto &table = tables[rsrc];
     for (unsigned i = 0; i < occ; ++i) {
       unsigned &cnt = table[(it->second + i) % sched.parameterT];
-      assert(cnt > 0 && "releasing an MRT slot that was never reserved");
-      --cnt;
+      assert(cnt >= slots && "releasing an MRT slot that was never reserved");
+      cnt -= slots;
     }
     revTab.erase(it);
     held = true;
@@ -1608,8 +1611,9 @@ unsigned ModuloSimplexScheduler::computeResMinII() {
 
     for (auto rsrc : *maybeRsrcs) {
       if (prob.getLimit(rsrc).value_or(0) > 0)
-        // occupancy: the whole window a non-pipelined unit is held for
-        uses[rsrc] += prob.getResourceCycles(op);
+        // occupancy: the whole window a non-pipelined unit is held for, times
+        // the units the operation holds at once
+        uses[rsrc] += prob.getResourceCycles(op) * prob.getResourceDemand(op);
     }
   }
 
@@ -1780,8 +1784,12 @@ unsigned OccupancyProblem::demandFor(ResourceType rsrc, unsigned ii) {
     if (!usesResource(op, rsrc))
       continue;
     unsigned start = *getStartTime(op);
-    for (unsigned k = 0, occ = getResourceCycles(op); k < occ; ++k)
-      peak = std::max(peak, ++used[ii ? (start + k) % ii : start + k]);
+    unsigned slots = getResourceDemand(op);
+    for (unsigned k = 0, occ = getResourceCycles(op); k < occ; ++k) {
+      unsigned &cnt = used[ii ? (start + k) % ii : start + k];
+      cnt += slots;
+      peak = std::max(peak, cnt);
+    }
   }
   return peak;
 }

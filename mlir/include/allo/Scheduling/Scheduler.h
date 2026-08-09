@@ -56,6 +56,17 @@ public:
     resourceCycles[op] = cycles;
   }
 
+  /// How many units of EVERY resource it links to \p op holds at once. One
+  /// unless set: a write to an array held in several copies reaches all of
+  /// them, taking a port of each, and every limit it is billed against counts
+  /// those copies too.
+  unsigned getResourceDemand(Operation *op) {
+    return resourceDemand.lookup(op).value_or(1);
+  }
+  void setResourceDemand(Operation *op, unsigned units) {
+    resourceDemand[op] = units;
+  }
+
   /// The cycles a dependent waits after \p op issues before its result has
   /// arrived: the latency of the operator type \p op is linked to. Every
   /// operation carries one, `populateOperatorTypes` having linked every
@@ -173,6 +184,7 @@ public:
 
 private:
   OperationProperty<unsigned> resourceCycles;
+  OperationProperty<unsigned> resourceDemand;
   ResourceTypeProperty<AllocatableUnit> allocatable;
   ResourceTypeProperty<unsigned> allocation;
   OperationProperty<unsigned> assignedUnit;

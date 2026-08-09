@@ -480,7 +480,7 @@ LogicalResult mlir::allo::scheduleCPSAT(ChainingSharedOperatorsProblem &prob,
       if (prob.usesResource(op, rsrc))
         cumulative.AddDemand(model.NewFixedSizeIntervalVar(
                                  startVars.at(op), prob.getResourceCycles(op)),
-                             1);
+                             prob.getResourceDemand(op));
   };
   for (Problem::ResourceType rsrc : prob.getResourceTypes())
     if (unsigned limit = prob.getLimit(rsrc).value_or(0))
@@ -677,10 +677,11 @@ ModuloOutcome solveAtII(ChainingModuloProblem &prob, Operation *lastOp,
       if (!prob.usesResource(op, rsrc))
         continue;
       unsigned occ = prob.getResourceCycles(op);
-      used += static_cast<int64_t>(occ / ii);
+      auto held = static_cast<int64_t>(prob.getResourceDemand(op));
+      used += static_cast<int64_t>(occ / ii) * held;
       const SmallVector<BoolVar> &slots = slotsOf.at(op);
       for (unsigned k = 0, partial = occ % ii; k < partial; ++k)
-        used += slots[(slot + ii - k) % ii];
+        used += LinearExpr::Term(slots[(slot + ii - k) % ii], held);
     }
     return used;
   };
