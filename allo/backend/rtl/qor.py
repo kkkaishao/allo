@@ -149,7 +149,7 @@ class QoR:  # pylint: disable=too-many-instance-attributes
     #: structures with no cost row, by kind. Reported, never dropped: a silently
     #: unpriced structure reads as a cheaper design.
     unmodelled: dict[str, int]
-    mem_bits: int  # stored bits, replicas included, apart from the fabric totals
+    mem_bits: int  # stored bits, every instance counted, apart from the fabric totals
     #: arrays priced as a multi-write register file: their writes exceed what one
     #: copy of their storage row provides, and replication cannot serve a write.
     #: Reads over the budget are not here; they buy copies of the row.
@@ -297,11 +297,12 @@ def estimate(report: CompileReport, device: Device = default_device) -> QoR:
                     Utilization.of(price(device.rom_uses, (m.depth_words, m.width))),
                 )
                 continue
-            # An addressed array costs its row, once per copy the reads need and
-            # once per bank: reads past one copy's budget are served by
-            # replicating the whole array. A write cannot be served that way,
-            # every copy needing each of them, so a write set over the budget is
-            # the one case that prices against the scatter row.
+            # An addressed array costs its row once per instance the compiler
+            # decided on and once per bank. The instance count is read off the
+            # report, not recomputed here: deciding it twice is how the estimate
+            # and the emission come to disagree. A write set over the row's is
+            # the one case that prices against the scatter row, no instance
+            # count serving it since every copy needs every write.
             row = device.storage.get(m.storage)
             if row is None or (
                 m.cost.row_writes and m.cost.write_ports > m.cost.row_writes
@@ -313,8 +314,8 @@ def estimate(report: CompileReport, device: Device = default_device) -> QoR:
                 )
                 regfile_arrays += 1
                 continue
-            copies = m.cost.replicas * m.banks
-            mem_bits += m.bits * m.cost.replicas
+            copies = m.cost.instances * m.banks
+            mem_bits += m.bits * m.cost.instances
             charge(
                 "memories",
                 f.func,

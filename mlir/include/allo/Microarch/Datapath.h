@@ -237,9 +237,11 @@ struct MemUnit {
   /// for a realization the row cannot hold.
   std::string ramStyle;
 
-  /// Ports one bank of `storage` provides, from its `dcp.storage` row narrowed
-  /// by the topology the array asked for. The same budget the scheduler
-  /// reserved against.
+  /// Ports one instance of `storage` provides, from its `dcp.storage` row
+  /// narrowed by the topology the array asked for. The same budget the
+  /// scheduler reserved against. Not a count of what a bank is built with:
+  /// `bindPorts` colours by what may share an address bus and never consults
+  /// this, so `readPortsBuilt` may be many times it.
   StoragePorts ports;
   /// Ports one bank is built with: the distinct ports `bindMemoryPorts`
   /// assigned to the accesses reaching a bank, maximized over the banks. The
@@ -253,20 +255,18 @@ struct MemUnit {
     return ports.fit(readPortsBuilt, writePortsBuilt, portsBuilt);
   }
 
-  /// Copies of `storage` the array is held in. Reads past one instance's budget
-  /// are served by replicating the whole array, each copy taking every write, so
-  /// reads over the budget cost copies rather than changing the structure. A
-  /// write cannot be served that way, every copy needing it, so the two
-  /// directions are not symmetric.
-  unsigned replicas() const {
-    unsigned per = ports.reads.value_or(0);
-    return per && readPortsBuilt > per ? (readPortsBuilt + per - 1) / per : 1;
-  }
+  /// Instances of `storage` this bank is held in, decided by `bindMemoryPorts`
+  /// once the ports are bound. Reads past one instance's are served by another
+  /// copy of the whole array, each copy taking every write; a write cannot be
+  /// served that way, every copy needing it, so the two directions are not
+  /// symmetric. A decision the report and the cost model read, never a formula
+  /// either of them re-applies.
+  unsigned instances = 1;
 
   /// What this module builds to hold the array, decided by
   /// `classifyRealizations` from the port binding and read by the emitter and
   /// the report. Not by the cost model, which prices an addressed array by
-  /// `replicas` of its row whichever of the two addressed cases it is.
+  /// `instances` of its row whichever of the two addressed cases it is.
   enum class Realization {
     /// Nothing: the cells are the caller's and this module holds ports on
     /// them. Every argument array, addressed or scattered.

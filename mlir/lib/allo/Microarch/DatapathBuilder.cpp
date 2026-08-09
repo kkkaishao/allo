@@ -849,6 +849,14 @@ void DatapathBuilder::bindMemoryPorts() {
       }
     }
   }
+  // Instances of its row each bank is held in, decided here because the bound
+  // ports are what it follows from. A skew binds its ports by lane and leaves
+  // the loop early, so this runs over every memory rather than inside.
+  for (MemUnit &m : dp.mems) {
+    unsigned per = m.ports.reads.value_or(0);
+    if (per && m.readPortsBuilt > per)
+      m.instances = (m.readPortsBuilt + per - 1) / per;
+  }
 }
 
 void DatapathBuilder::classifyRealizations() {
