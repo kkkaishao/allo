@@ -201,6 +201,10 @@ std::string memCellName(const Datapath &dp, const MemUnit &m, unsigned bank,
   return memCellName(memOwnerName(dp, m), m.numBanks, bank, m.instances, inst);
 }
 
+std::string memArrayName(const Datapath &dp, const MemUnit &m) {
+  return memCellName(memOwnerName(dp, m), m.numBanks, /*bank=*/0);
+}
+
 std::string memElemName(const Datapath &dp, const MemUnit &m, unsigned k) {
   return verilogName(memOwnerName(dp, m) + "_" + std::to_string(k));
 }

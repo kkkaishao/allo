@@ -853,7 +853,9 @@ void DatapathBuilder::bindMemoryPorts() {
   // ports are what it follows from. A skew binds its ports by lane and leaves
   // the loop early, so this runs over every memory rather than inside.
   for (MemUnit &m : dp.mems) {
-    unsigned per = m.ports.reads.value_or(0);
+    // Off `instReads`, what ONE instance serves, not off `reads`, which is what
+    // the array may be given altogether and so is already a multiple of it.
+    unsigned per = m.ports.instReads.value_or(0);
     if (!per || m.readPortsBuilt <= per)
       continue;
     m.instances = (m.readPortsBuilt + per - 1) / per;

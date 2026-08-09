@@ -255,16 +255,21 @@ class Storage:  # pylint: disable=too-many-instance-attributes
     # limit. A completely partitioned array resolves here whatever it would
     # otherwise have taken, and a device declares at most one.
     is_scatter: bool = False
-    # Ports of each direction the structure has, ``None`` for no limit. An array
-    # needing more is built as a register file rather than as this row.
+    # Ports of each direction an array held here may be given, ``None`` for no
+    # limit.
     max_reads: int | None = None
     max_writes: int | None = None
-    # Ports the structure has altogether, each serving a read or a write in a
+    # Ports it may be given altogether, each serving a read or a write in a
     # cycle. A block RAM's two ports are one pool, so two writers and a
     # concurrent reader need three of them and it has two. ``None`` where the
     # directions are independent structures, as a LUT RAM's single write port
     # against its replicated reads is. Never below either direction's limit.
     max_ports: int | None = None
+    # How many of ``max_reads`` ONE instance serves; reads past it are held in
+    # another copy of the whole array. ``None`` defaults to ``max_reads``, one
+    # instance covering the allowance. A write has no counterpart, every copy
+    # needing it.
+    inst_reads: int | None = None
     # The vendor attribute that pins an array to this structure, stamped on the
     # emitted array declaration (Xilinx spells it `ram_style = "block"`).
     # ``None`` where the part has no such attribute or nothing can be pinned to
@@ -463,6 +468,7 @@ class Device:
         max_reads: int | None = None,
         max_writes: int | None = None,
         max_ports: int | None = None,
+        inst_reads: int | None = None,
         ram_style: str | None = None,
         can_init: bool = True,
         uses: dict[Resource, Cost | Sequence] | None = None,
@@ -546,6 +552,7 @@ class Device:
             max_reads=None if max_reads is None else int(max_reads),
             max_writes=None if max_writes is None else int(max_writes),
             max_ports=None if max_ports is None else int(max_ports),
+            inst_reads=None if inst_reads is None else int(inst_reads),
             ram_style=ram_style,
             can_init=bool(can_init),
             uses=self._spend(f"storage {name!r}", "depth, width", uses),
@@ -938,6 +945,7 @@ def inject_device(module, device: Device):
                     max_reads=_port_limit(i64, s.max_reads),
                     max_writes=_port_limit(i64, s.max_writes),
                     max_ports=_port_limit(i64, s.max_ports),
+                    inst_reads=_port_limit(i64, s.inst_reads),
                     ram_style=s.ram_style,
                     no_init=not s.can_init,
                     uses=_uses_attr(s.uses),

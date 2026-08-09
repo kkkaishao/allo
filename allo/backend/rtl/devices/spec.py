@@ -129,6 +129,11 @@ class StorageSpec(NamedTuple):
     directions are independent structures (a LUT RAM's write port against its
     replicated reads).
 
+    ``inst_reads`` is how many of ``max_reads`` ONE instance serves; reads past
+    it are held in another copy of the whole array. Defaults to ``max_reads``,
+    one instance covering the allowance. A write has no counterpart, every copy
+    needing it, so ``max_writes`` is already per instance.
+
     ``ram_style`` is the vendor attribute that pins an array to the row, so
     that what the part builds is what the device priced, and ``can_init`` is
     whether the structure comes up holding contents at all."""
@@ -138,6 +143,7 @@ class StorageSpec(NamedTuple):
     max_reads: int | None = None
     max_writes: int | None = None
     max_ports: int | None = None
+    inst_reads: int | None = None
     ram_style: str | None = None
     can_init: bool = True
 

@@ -70,7 +70,7 @@ static std::optional<unsigned> tighter(std::optional<unsigned> a,
 
 StoragePorts StoragePorts::meet(const StoragePorts &other) const {
   return {tighter(reads, other.reads), tighter(writes, other.writes),
-          tighter(pool, other.pool)};
+          tighter(pool, other.pool), tighter(instReads, other.instReads)};
 }
 
 bool StoragePorts::exceededBy(const StoragePorts &other) const {
@@ -155,11 +155,11 @@ bool allo::topologyCovers(MemoryPortEnum a, MemoryPortEnum b) {
 static StoragePorts topologyPorts(MemoryPortEnum p) {
   switch (p) {
   case MemoryPortEnum::SinglePort:
-    return {1u, 1u, 1u};
+    return {1u, 1u, 1u, 1u};
   case MemoryPortEnum::SimpleDualPort:
-    return {1u, 1u, std::nullopt};
+    return {1u, 1u, std::nullopt, 1u};
   case MemoryPortEnum::TrueDualPort:
-    return {2u, 2u, 2u};
+    return {2u, 2u, 2u, 2u};
   }
   llvm_unreachable("unhandled MemoryPortEnum");
 }
@@ -174,7 +174,7 @@ std::optional<StoragePorts> allo::requestedPortsOf(Value memref) {
   // `rom_2p` serves two of them where a `ram_2p` serves one of each.
   if (bs.kind == MemoryKindEnum::ROM) {
     unsigned n = p.pool.value_or(p.reads.value_or(0) + p.writes.value_or(0));
-    p = {n, n, n};
+    p = {n, n, n, n};
   }
   return p;
 }
@@ -237,7 +237,7 @@ void MemoryBankModel::finalize(const MemoryLibrary &lib) {
     // (one port each, no pool). `characterize` would cast its type to
     // MemRefType.
     if (isa<StreamType>(root.getType())) {
-      info.ports = {1u, 1u, std::nullopt};
+      info.ports = {1u, 1u, std::nullopt, 1u};
       // Its default `layout` is the single unbanked one, and it resolves no
       // `storage` realization, which nothing here asks a stream for.
       continue;
@@ -734,12 +734,16 @@ MemoryLibrary MemoryLibrary::fromModule(ModuleOp module) {
   };
   Block &body = device.getBody().front();
   for (auto s : body.getOps<dcp::DCPathStorageOp>()) {
-    m.storage.push_back({s.getSymName().str(),
-                         timing(s),
-                         {limit(s.getMaxReads()), limit(s.getMaxWrites()),
-                          limit(s.getMaxPorts())},
-                         s.getRamStyle().value_or("").str(),
-                         !s.getNoInit()});
+    m.storage.push_back(
+        {s.getSymName().str(),
+         timing(s),
+         {limit(s.getMaxReads()), limit(s.getMaxWrites()),
+          limit(s.getMaxPorts()),
+          // One instance covers the whole allowance unless the
+          // row says otherwise.
+          limit(s.getInstReads() ? s.getInstReads() : s.getMaxReads())},
+         s.getRamStyle().value_or("").str(),
+         !s.getNoInit()});
     if (s.getIsDefault())
       m.defaultStorage = s.getSymName().str();
     if (s.getIsScatter())

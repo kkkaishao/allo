@@ -84,6 +84,13 @@ struct StoragePorts {
   std::optional<unsigned> reads;
   std::optional<unsigned> writes;
   std::optional<unsigned> pool;
+  /// How many of `reads` ONE instance of the structure serves. Reads past it
+  /// buy another copy of the whole array rather than a different structure, so
+  /// this is what the instance count divides by while `reads` stays what the
+  /// scheduler may issue in a cycle. Defaults to `reads`, one instance covering
+  /// the allowance. Writes have no counterpart: a copy that missed one would
+  /// stop holding the same array, so `writes` is already per instance.
+  std::optional<unsigned> instReads;
 
   /// The tighter of the two budgets on every axis. A nullopt is no limit and
   /// yields to whatever the other side declares.

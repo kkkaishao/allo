@@ -300,10 +300,10 @@ def test_a_dynamic_bank_costs_a_port_on_every_bank():
     mod = s.export("rtl")
     # Two banks, three crossbarred reads: six read ports, three on each bank.
     assert len(re.findall(r"\bseq\.read\b", mod.mlir)) == 6
-    # Three is more than one instance of the row serves, so each bank is held in
-    # two copies of it and both are emitted: the reads split over them and every
-    # write reaches both.
-    assert mod.mlir.count("= seq.hlmem") == 4
+    # A distributed RAM instance serves one addressed read, so a bank taking
+    # three of them is held in three copies and all three are emitted: the reads
+    # split over them and every write reaches all.
+    assert mod.mlir.count("= seq.hlmem") == 6
     # ... which is one more than the two banks hold, so the read loop runs at
     # II=2 while the copy loop stays fully pipelined.
     assert _iis(mod.schedule().cyclic()) == [1, 2]
@@ -676,7 +676,13 @@ def test_partition_factors_join_to_the_finer_one():
     s = fj_top.schedule()
     s.compose(ps, cs)
     mod = s.export("rtl")
-    assert re.findall(r"seq\.hlmem @(\w+) [^:]*: <(\d+)x", mod.mlir) == [
+    # By bank, the instance suffix stripped: how many copies of the row a bank
+    # is held in follows from its read ports and is not what this is about.
+    cells = {
+        (re.sub(r"_c\d+$", "", name), depth)
+        for name, depth in re.findall(r"seq\.hlmem @(\w+) [^:]*: <(\d+)x", mod.mlir)
+    }
+    assert sorted(cells) == [
         ("tmp_b0", "4"),
         ("tmp_b1", "4"),
         ("tmp_b2", "4"),
@@ -806,14 +812,14 @@ def test_a_skewed_partition_serves_a_row_and_a_column():
     skew = _transpose_pair((2, Schedule.Skew))
 
     # Four banks either way; what differs is the ports into them, and so how
-    # many copies of the row a bank needs. Under cyclic the four row reads bank
-    # statically (one port each) and the four column reads crossbar (a port on
-    # every bank): 4 + 4*4 = 20 reads, five to a bank, which takes three copies
-    # of a two-read row. Under the skew the eight reads fall into two LANES of
-    # four distinct slots and a lane shares one port per bank: 2 * 4 = 8 reads,
-    # two to a bank, which one copy serves.
-    assert skew.mlir.count("= seq.hlmem") == 4
-    assert cyc.mlir.count("= seq.hlmem") == 12
+    # many copies of the row a bank needs, a distributed RAM instance serving
+    # one addressed read. Under cyclic the four row reads bank statically (one
+    # port each) and the four column reads crossbar (a port on every bank):
+    # 4 + 4*4 = 20 reads, five to a bank, five copies of each. Under the skew
+    # the eight reads fall into two LANES of four distinct slots and a lane
+    # shares one port per bank: 2 * 4 = 8 reads, two to a bank, two copies.
+    assert skew.mlir.count("= seq.hlmem") == 8
+    assert cyc.mlir.count("= seq.hlmem") == 20
     assert len(re.findall(r"\bseq\.read\b", cyc.mlir)) == 20
     assert len(re.findall(r"\bseq\.read\b", skew.mlir)) == 8
 

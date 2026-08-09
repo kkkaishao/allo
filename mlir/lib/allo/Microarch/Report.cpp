@@ -105,7 +105,7 @@ FuncUarch::FuncUarch(const Datapath &dp, llvm::StringRef symbol,
 
   for (const MemUnit &m : dp.mems) {
     MemReport mr;
-    mr.owner = memCellName(dp, m, /*bank=*/0);
+    mr.owner = memArrayName(dp, m);
     auto mt = cast<MemRefType>(m.memref.getType());
     mr.shape.assign(mt.getShape().begin(), mt.getShape().end());
     mr.width = m.width;

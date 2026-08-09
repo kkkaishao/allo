@@ -147,6 +147,10 @@ std::string memCellName(llvm::StringRef owner, unsigned numBanks, unsigned bank,
                         unsigned instances = 1, unsigned inst = 0);
 std::string memCellName(const Datapath &dp, const MemUnit &m, unsigned bank,
                         unsigned inst = 0);
+/// The buffer's own name, carrying no instance index: what the report calls the
+/// array and what a reader looks it up by. Apart from `memCellName` because how
+/// many cells hold an array is not part of its identity.
+std::string memArrayName(const Datapath &dp, const MemUnit &m);
 /// `<owner>_<k>`: element \p k of an internal array scattered into registers.
 /// The index is bare, as `elemBase` spells a scattered argument's.
 std::string memElemName(const Datapath &dp, const MemUnit &m, unsigned k);

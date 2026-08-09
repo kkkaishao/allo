@@ -187,15 +187,17 @@ _STORAGE = {
             r["ff"]: (Linear(1.0), Linear(1.0)),
         },
     ),
-    # Distributed RAM has one write port and one addressed read; the
-    # synthesizer serves further reads by replicating the whole array, so the
-    # read limit caps how many copies an array is worth rather than the
-    # structure, and the two directions are separate structures (no pool).
+    # Distributed RAM has one write port and ONE addressed read, the two being
+    # separate structures (no pool). A second read address is a whole further
+    # copy of the array: measured 640 / 1280 / 1920 / 2560 LUT as memory at
+    # 1024x32 for one through four reads. `max_reads` is then how many reads an
+    # array here may be given at once, which is two copies' worth.
     "lutram": StorageSpec(
         ("slicem_lut",),
         lambda r: {r["slicem_lut"]: Tiled(64)},
         max_reads=2,
         max_writes=1,
+        inst_reads=1,
         ram_style="distributed",
     ),
     # A shift register writes only at its head and reads one addressed tap.
@@ -319,6 +321,7 @@ def build(part: Part) -> Device:
             max_reads=spec.max_reads,
             max_writes=spec.max_writes,
             max_ports=spec.max_ports,
+            inst_reads=spec.inst_reads,
             ram_style=spec.ram_style,
             can_init=spec.can_init,
             uses=spec.uses(res),

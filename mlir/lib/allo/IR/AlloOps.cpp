@@ -504,6 +504,18 @@ LogicalResult DCPathStorageOp::verify() {
                          "access of either direction takes one port of the "
                          "pool");
   }
+  // One instance cannot serve more reads than the row allows an array in total,
+  // and a row that caps reads at all has to say how many one instance covers.
+  if (std::optional<uint64_t> inst = getInstReads()) {
+    if (*inst < 1)
+      return emitOpError("`inst_rd` must be at least one port");
+    if (getIsScatter())
+      return emitOpError("a `scatter` row holds one cell per element and so "
+                         "has no port limit to declare");
+    if (!getMaxReads() || *inst > *getMaxReads())
+      return emitOpError("`inst_rd` exceeds `max_rd`, but an instance cannot "
+                         "serve more reads than the array may be given");
+  }
   return verifyResourceUses(*this, getUsesAttr(), 2,
                             "two parameters (depth, width)");
 }
