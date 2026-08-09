@@ -532,9 +532,12 @@ void DatapathEmitter::createInternalMemories() {
       // block, which arbitrates the collision they might have.
       if (m.writesIndependent)
         mem->setAttr(kIndependentWritesAttr, c.b.getUnitAttr());
-      // Pin the structure only where the ports fit it: a register file asked to
-      // be a block RAM is a synthesis warning and a register file anyway.
-      if (m.realization == R::Ram && !m.ramStyle.empty())
+      // Pin the array to the row it was timed and priced against, whatever its
+      // ports came to. The row is this module's decision, and leaving it unsaid
+      // hands the structure to the synthesizer, which then builds something the
+      // cost model did not price. Ports over what one instance has are copies
+      // of that same row, not a different structure.
+      if (!m.ramStyle.empty())
         mem->setAttr(kRamStyleAttr, c.b.getStringAttr(m.ramStyle));
       // An initialized array the kernel also WRITES is a real memory that
       // merely starts with contents. `seq.hlmem` carries no initializer, so the
