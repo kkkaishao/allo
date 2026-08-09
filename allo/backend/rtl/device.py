@@ -255,21 +255,18 @@ class Storage:  # pylint: disable=too-many-instance-attributes
     # limit. A completely partitioned array resolves here whatever it would
     # otherwise have taken, and a device declares at most one.
     is_scatter: bool = False
-    # Ports of each direction an array held here may be given, ``None`` for no
-    # limit.
-    max_reads: int | None = None
-    max_writes: int | None = None
-    # Ports it may be given altogether, each serving a read or a write in a
+    # Ports of each direction ONE INSTANCE of the structure has, ``None`` for no
+    # limit. What an array held here may be given is not stated but derived: the
+    # compiler decides how many instances to hold it in, every copy taking every
+    # write and serving ``inst_reads`` reads of its own.
+    inst_reads: int | None = None
+    inst_writes: int | None = None
+    # Ports one instance has altogether, each serving a read or a write in a
     # cycle. A block RAM's two ports are one pool, so two writers and a
     # concurrent reader need three of them and it has two. ``None`` where the
     # directions are independent structures, as a LUT RAM's single write port
-    # against its replicated reads is. Never below either direction's limit.
-    max_ports: int | None = None
-    # How many of ``max_reads`` ONE instance serves; reads past it are held in
-    # another copy of the whole array. ``None`` defaults to ``max_reads``, one
-    # instance covering the allowance. A write has no counterpart, every copy
-    # needing it.
-    inst_reads: int | None = None
+    # against its one addressed read is. Never below either direction's limit.
+    inst_ports: int | None = None
     # The vendor attribute that pins an array to this structure, stamped on the
     # emitted array declaration (Xilinx spells it `ram_style = "block"`).
     # ``None`` where the part has no such attribute or nothing can be pinned to
@@ -465,10 +462,9 @@ class Device:
         read_delay_ns: float = 0.0,
         write_delay_ns: float = 0.0,
         is_scatter: bool = False,
-        max_reads: int | None = None,
-        max_writes: int | None = None,
-        max_ports: int | None = None,
         inst_reads: int | None = None,
+        inst_writes: int | None = None,
+        inst_ports: int | None = None,
         ram_style: str | None = None,
         can_init: bool = True,
         uses: dict[Resource, Cost | Sequence] | None = None,
@@ -485,16 +481,18 @@ class Device:
         marks at most one, and one that marks none cannot hold a complete
         partition.
 
-        ``max_reads`` / ``max_writes`` are how many ports of each direction the
-        structure has, omitted where it has no limit. An array needing more is
-        built as a register file. A scatter row declares neither, having no
-        addressed port to count.
+        ``inst_reads`` / ``inst_writes`` are how many ports of each direction
+        ONE INSTANCE of the structure has, omitted where it has no limit. A
+        scatter row declares neither, having no addressed port to count.
 
-        ``max_ports`` is how many it has altogether, each serving a read or a
-        write in a cycle. Declare it wherever the two directions draw on one
-        pool, as a block RAM's two ports do; omit it where they are independent
-        structures, as a LUT RAM's single write port and its replicated reads
-        are.
+        ``inst_ports`` is how many one instance has altogether, each serving a
+        read or a write in a cycle. Declare it wherever the two directions draw
+        on one pool, as a block RAM's two ports do; omit it where they are
+        independent structures, as a LUT RAM's single write port and its one
+        addressed read are.
+
+        None of the three bounds an ARRAY: how many instances one is held in is
+        the compiler's to decide, every copy taking every write.
 
         ``ram_style`` is the vendor attribute that pins an array to this
         structure, stamped on the emitted declaration. Omit it and the
@@ -513,9 +511,9 @@ class Device:
         if read_delay_ns < 0 or write_delay_ns < 0:
             raise ValueError(f"storage {name!r}: delay must be non-negative")
         limits = (
-            ("max_reads", max_reads),
-            ("max_writes", max_writes),
-            ("max_ports", max_ports),
+            ("inst_reads", inst_reads),
+            ("inst_writes", inst_writes),
+            ("inst_ports", inst_ports),
         )
         for role, limit in limits:
             if limit is not None and limit < 1:
@@ -529,10 +527,10 @@ class Device:
         # direction's own limit unreachable, so the row would be describing two
         # different structures.
         for role, limit in limits[:2]:
-            if max_ports is not None and limit is not None and limit > max_ports:
+            if inst_ports is not None and limit is not None and limit > inst_ports:
                 raise ValueError(
-                    f"storage {name!r}: {role}={limit} exceeds max_ports={max_ports}, "
-                    "but an access of either direction takes one port of the pool"
+                    f"storage {name!r}: {role}={limit} exceeds inst_ports={inst_ports},"
+                    " but an access of either direction takes one port of the pool"
                 )
         other = next(
             (s for s in self.storage.values() if s.is_scatter and s.name != name), None
@@ -549,10 +547,9 @@ class Device:
             read_delay_ns=float(read_delay_ns),
             write_delay_ns=float(write_delay_ns),
             is_scatter=bool(is_scatter),
-            max_reads=None if max_reads is None else int(max_reads),
-            max_writes=None if max_writes is None else int(max_writes),
-            max_ports=None if max_ports is None else int(max_ports),
             inst_reads=None if inst_reads is None else int(inst_reads),
+            inst_writes=None if inst_writes is None else int(inst_writes),
+            inst_ports=None if inst_ports is None else int(inst_ports),
             ram_style=ram_style,
             can_init=bool(can_init),
             uses=self._spend(f"storage {name!r}", "depth, width", uses),
@@ -942,10 +939,9 @@ def inject_device(module, device: Device):
                     sym_name=s.name,
                     is_default=s.name == device.default_storage,
                     is_scatter=s.is_scatter,
-                    max_reads=_port_limit(i64, s.max_reads),
-                    max_writes=_port_limit(i64, s.max_writes),
-                    max_ports=_port_limit(i64, s.max_ports),
                     inst_reads=_port_limit(i64, s.inst_reads),
+                    inst_writes=_port_limit(i64, s.inst_writes),
+                    inst_ports=_port_limit(i64, s.inst_ports),
                     ram_style=s.ram_style,
                     no_init=not s.can_init,
                     uses=_uses_attr(s.uses),

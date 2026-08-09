@@ -68,37 +68,57 @@ static std::optional<unsigned> tighter(std::optional<unsigned> a,
   return std::min(*a, *b);
 }
 
+std::optional<unsigned> StoragePorts::reads() const {
+  return instReads ? std::optional<unsigned>(*instReads * copies)
+                   : std::nullopt;
+}
+
+std::optional<unsigned> StoragePorts::writes() const { return instWrites; }
+
+std::optional<unsigned> StoragePorts::slots() const {
+  return instPool ? std::optional<unsigned>(*instPool * copies) : std::nullopt;
+}
+
 StoragePorts StoragePorts::meet(const StoragePorts &other) const {
-  return {tighter(reads, other.reads), tighter(writes, other.writes),
-          tighter(pool, other.pool), tighter(instReads, other.instReads)};
+  return {tighter(instReads, other.instReads),
+          tighter(instWrites, other.instWrites),
+          tighter(instPool, other.instPool), std::min(copies, other.copies)};
 }
 
 bool StoragePorts::exceededBy(const StoragePorts &other) const {
   auto over = [](std::optional<unsigned> have, std::optional<unsigned> want) {
     return have && want && *want > *have;
   };
-  return over(reads, other.reads) || over(writes, other.writes) ||
-         over(pool, other.pool) ||
+  return over(instReads, other.instReads) ||
+         over(instWrites, other.instWrites) || over(instPool, other.instPool) ||
          // A pool bounds both directions, so a topology asking for more
          // accesses at once than a poolless row serves in either direction
          // exceeds it just as directly.
-         over(reads, other.pool) || over(writes, other.pool);
+         over(instReads, other.instPool) || over(instWrites, other.instPool);
 }
 
 bool StoragePorts::fit(unsigned nreads, unsigned nwrites,
                        unsigned nports) const {
-  return (!reads || nreads <= *reads) && (!writes || nwrites <= *writes) &&
-         (!pool || nports <= *pool);
+  // A bus carrying a write is one port of EVERY copy; a read-only one is a port
+  // of the single copy that serves it.
+  unsigned taken = nports + (copies - 1) * nwrites;
+  auto within = [](std::optional<unsigned> limit, unsigned n) {
+    return !limit || n <= *limit;
+  };
+  return within(reads(), nreads) && within(writes(), nwrites) &&
+         within(slots(), taken);
 }
 
 std::string StoragePorts::describe() const {
   auto axis = [](std::optional<unsigned> n) {
     return n ? std::to_string(*n) : std::string("unlimited");
   };
-  std::string s = axis(reads) + " read / " + axis(writes) + " write";
-  if (pool)
-    s +=
-        " over " + axis(pool) + (*pool == 1 ? " shared port" : " shared ports");
+  std::string s = axis(reads()) + " read / " + axis(writes()) + " write";
+  if (instPool)
+    s += " over " + axis(instPool) +
+         (*instPool == 1 ? " shared port" : " shared ports");
+  if (copies > 1)
+    s += " in " + std::to_string(copies) + " copies";
   return s;
 }
 
@@ -152,6 +172,9 @@ bool allo::topologyCovers(MemoryPortEnum a, MemoryPortEnum b) {
 // dedicated port of each direction, so its two ends never contend and it
 // declares no pool; every other topology shares its ports between the
 // directions.
+//
+// One copy: the request names the ports the ARRAY is to have, so a copy the
+// compiler added on top would give it more than it asked for.
 static StoragePorts topologyPorts(MemoryPortEnum p) {
   switch (p) {
   case MemoryPortEnum::SinglePort:
@@ -159,7 +182,7 @@ static StoragePorts topologyPorts(MemoryPortEnum p) {
   case MemoryPortEnum::SimpleDualPort:
     return {1u, 1u, std::nullopt, 1u};
   case MemoryPortEnum::TrueDualPort:
-    return {2u, 2u, 2u, 2u};
+    return {2u, 2u, 2u, 1u};
   }
   llvm_unreachable("unhandled MemoryPortEnum");
 }
@@ -173,8 +196,9 @@ std::optional<StoragePorts> allo::requestedPortsOf(Value memref) {
   // A ROM has no write port to dedicate, so its whole topology is reads. An
   // `rom_2p` serves two of them where a `ram_2p` serves one of each.
   if (bs.kind == MemoryKindEnum::ROM) {
-    unsigned n = p.pool.value_or(p.reads.value_or(0) + p.writes.value_or(0));
-    p = {n, n, n, n};
+    unsigned n = p.instPool.value_or(p.instReads.value_or(0) +
+                                     p.instWrites.value_or(0));
+    p = {n, n, n, 1u};
   }
   return p;
 }
@@ -233,9 +257,9 @@ void MemoryBankModel::observe(Operation *op) {
 void MemoryBankModel::finalize(const MemoryLibrary &lib) {
   for (auto &[root, info] : byMemref) {
     // A stream channel is a FIFO, not an array: one transfer per end per cycle,
-    // no banking or storage-impl axis to characterize, and two independent ends
-    // (one port each, no pool). `characterize` would cast its type to
-    // MemRefType.
+    // no banking or storage-impl axis to characterize, two independent ends
+    // (one port each, no pool) and nothing that copies it. `characterize` would
+    // cast its type to MemRefType.
     if (isa<StreamType>(root.getType())) {
       info.ports = {1u, 1u, std::nullopt, 1u};
       // Its default `layout` is the single unbanked one, and it resolves no
@@ -246,7 +270,7 @@ void MemoryBankModel::finalize(const MemoryLibrary &lib) {
   }
 }
 
-SmallVector<std::pair<std::string, unsigned>>
+MemoryBankModel::PortDemand
 MemoryBankModel::resources(Operation *op) const {
   auto memRef = storageOf(op);
   if (!memRef)
@@ -262,13 +286,18 @@ MemoryBankModel::resources(Operation *op) const {
   // that direction, and the shared pool, where the row has one. An access holds
   // both at once, which makes two writers and a concurrent reader three ports
   // of a block RAM rather than two writes plus one read.
+  //
+  // Billed in SLOTS, one instance's ports once per copy: a read takes a slot of
+  // the one copy that serves it and a write a slot of every copy, so a row's
+  // copies are worth exactly what they buy.
   auto a = asMemAccess(op);
   assert(a && "storageOf named a storage root, so this is a memory access");
+  unsigned copies = info.ports.copies;
   SmallVector<std::pair<StringRef, unsigned>> pools;
-  if (auto dir = a->isWrite ? info.ports.writes : info.ports.reads)
-    pools.emplace_back(a->isWrite ? "_w" : "_r", *dir);
-  if (info.ports.pool)
-    pools.emplace_back("_rw", *info.ports.pool);
+  if (auto dir = a->isWrite ? info.ports.instWrites : info.ports.instReads)
+    pools.emplace_back(a->isWrite ? "_w" : "_r", *dir * copies);
+  if (info.ports.instPool)
+    pools.emplace_back("_rw", *info.ports.instPool * copies);
   std::string base = "mem_" + std::to_string(hash_value(memRef));
 
   // The banks this access occupies: its assigned bank alone, or every one of
@@ -278,17 +307,19 @@ MemoryBankModel::resources(Operation *op) const {
   std::optional<unsigned> bank;
   if (numBanks > 1)
     bank = assignedBankOf(op);
-  SmallVector<std::pair<std::string, unsigned>> ports;
+  PortDemand out;
+  out.slots = a->isWrite ? copies : 1;
   auto take = [&](unsigned k) {
     for (auto &[dir, limit] : pools)
-      ports.emplace_back(base + "_b" + std::to_string(k) + dir.str(), limit);
+      out.units.emplace_back(base + "_b" + std::to_string(k) + dir.str(),
+                             limit);
   };
   if (numBanks == 1 || bank)
     take(bank.value_or(0));
   else
     for (unsigned k = 0; k < numBanks; ++k)
       take(k);
-  return ports;
+  return out;
 }
 
 unsigned mlir::allo::datapathWidth(Type t) {
@@ -737,11 +768,8 @@ MemoryLibrary MemoryLibrary::fromModule(ModuleOp module) {
     m.storage.push_back(
         {s.getSymName().str(),
          timing(s),
-         {limit(s.getMaxReads()), limit(s.getMaxWrites()),
-          limit(s.getMaxPorts()),
-          // One instance covers the whole allowance unless the
-          // row says otherwise.
-          limit(s.getInstReads() ? s.getInstReads() : s.getMaxReads())},
+         {limit(s.getInstReads()), limit(s.getInstWrites()),
+          limit(s.getInstPorts()), kStorageCopies},
          s.getRamStyle().value_or("").str(),
          !s.getNoInit()});
     if (s.getIsDefault())

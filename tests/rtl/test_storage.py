@@ -1697,7 +1697,7 @@ def test_a_scatter_row_declares_no_port_limit():
     # One cell per element is not addressed, so a `scatter` row has no port to
     # limit; a limit on it would bound the very realization a complete partition
     # resolves to.
-    for limit in ({"max_reads": 1}, {"max_writes": 1}):
+    for limit in ({"inst_reads": 1}, {"inst_writes": 1}):
         dev = default_device.copy()
         del dev.storage["register"]
         with pytest.raises(ValueError):

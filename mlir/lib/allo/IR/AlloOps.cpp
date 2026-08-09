@@ -489,8 +489,8 @@ LogicalResult DCPathStorageOp::verify() {
   if (getRdDelay().convertToDouble() < 0.0 ||
       getWrDelay().convertToDouble() < 0.0)
     return emitOpError("delay must be non-negative");
-  std::optional<uint64_t> pool = getMaxPorts();
-  for (std::optional<uint64_t> limit : {getMaxReads(), getMaxWrites(), pool}) {
+  std::optional<uint64_t> pool = getInstPorts();
+  for (std::optional<uint64_t> limit : {getInstReads(), getInstWrites(), pool}) {
     if (limit && *limit < 1)
       return emitOpError("a port limit must be at least one port");
     // A scatter row holds one cell per element and no addressed port.
@@ -500,21 +500,9 @@ LogicalResult DCPathStorageOp::verify() {
     // A pool below one of the directions it serves leaves that direction's own
     // limit unreachable, so the row describes two different structures.
     if (limit && pool && *limit > *pool)
-      return emitOpError("a direction's port limit exceeds `max_p`, but an "
+      return emitOpError("a direction's port limit exceeds `inst_p`, but an "
                          "access of either direction takes one port of the "
                          "pool");
-  }
-  // One instance cannot serve more reads than the row allows an array in total,
-  // and a row that caps reads at all has to say how many one instance covers.
-  if (std::optional<uint64_t> inst = getInstReads()) {
-    if (*inst < 1)
-      return emitOpError("`inst_rd` must be at least one port");
-    if (getIsScatter())
-      return emitOpError("a `scatter` row holds one cell per element and so "
-                         "has no port limit to declare");
-    if (!getMaxReads() || *inst > *getMaxReads())
-      return emitOpError("`inst_rd` exceeds `max_rd`, but an instance cannot "
-                         "serve more reads than the array may be given");
   }
   return verifyResourceUses(*this, getUsesAttr(), 2,
                             "two parameters (depth, width)");

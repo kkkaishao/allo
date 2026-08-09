@@ -832,7 +832,7 @@ void DatapathBuilder::bindMemoryPorts() {
     // multiplexer only where the array does not otherwise fit, and possible
     // only where the writes were split, an unsplittable set already being one
     // `always` block.
-    if (m.ports.pool && !m.external && !m.fitsStorage() &&
+    if (m.ports.instPool && !m.external && !m.fitsStorage() &&
         (m.writePortsBuilt <= 1 || m.writesIndependent)) {
       // The shared bus carries the write's address on the cycle it commits, so
       // a write that presents its terms early would drive the read's cycle too.
@@ -853,32 +853,48 @@ void DatapathBuilder::bindMemoryPorts() {
   // ports are what it follows from. A skew binds its ports by lane and leaves
   // the loop early, so this runs over every memory rather than inside.
   for (MemUnit &m : dp.mems) {
-    // Off `instReads`, what ONE instance serves, not off `reads`, which is what
-    // the array may be given altogether and so is already a multiple of it.
+    // Off `instReads`, what ONE instance serves, not off the array's own
+    // allowance, which is already a multiple of it. Not bounded by the copies
+    // budget either: the budget is what a CYCLE may issue, and a binding that
+    // needs more address buses than that still builds one copy per bus.
     unsigned per = m.ports.instReads.value_or(0);
-    if (m.ports.pool) {
+    // A bus carrying a write is on every copy, so a read riding one is served
+    // wherever it lands and costs no port of its own.
+    unsigned riding = 0;
+    if (m.ports.instPool) {
       // A pooled port serves either direction, and the binding may already have
       // ridden a write on a read's where the two never issue together, so what
       // the bank was BUILT with is the question and not the two directions
-      // separately. Within the pool one instance holds it.
-      if (m.portsBuilt <= *m.ports.pool)
+      // separately. Within one instance's pool, one instance holds it.
+      if (m.portsBuilt <= *m.ports.instPool)
         continue;
+      riding = m.readPortsBuilt + m.writePortsBuilt - m.portsBuilt;
       // Past it every copy takes every write and the reads share what is left,
       // so a written block RAM serves one read a copy, which is what the part
       // does: 1024x32 measures one tile at one read and two at two. Nothing
       // left is an array this row cannot hold at all.
-      per = std::min(per, *m.ports.pool > m.writePortsBuilt
-                              ? *m.ports.pool - m.writePortsBuilt
+      per = std::min(per, *m.ports.instPool > m.writePortsBuilt
+                              ? *m.ports.instPool - m.writePortsBuilt
                               : 0u);
     }
-    if (!per || m.readPortsBuilt <= per)
+    unsigned own = m.readPortsBuilt - riding;
+    if (!per || own <= per)
       continue;
-    m.instances = (m.readPortsBuilt + per - 1) / per;
+    m.instances = (own + per - 1) / per;
     // Each bank ranks the read ports that reach it and hands them out a whole
     // instance at a time. Per bank, not over the memory: `readPortsBuilt` is
     // the largest any one bank holds, so ranking every colour together would
     // run past it wherever two banks hold different ones and would put more
-    // reads on an instance than it has.
+    // reads on an instance than it has. A read on a write's bus goes to the
+    // first instance, where the port it rides already exists.
+    llvm::SmallDenseSet<unsigned> writePorts;
+    for (const MemUnit::Access &acc : m.accesses)
+      if (acc.isWrite)
+        writePorts.insert(acc.port);
+    for (const CallUnit &cu : dp.calls)
+      for (const CallUnit::MemArg &ma : cu.memArgs)
+        if (ma.mem == m.id && ma.isWrite)
+          writePorts.insert(ma.port);
     llvm::SmallVector<llvm::SmallVector<unsigned>> byBank(m.numBanks);
     auto reaches = [&](std::optional<unsigned> bank, unsigned port) {
       // A skew's `staticBank` is a slot, not a bank, and its accesses read
@@ -899,9 +915,11 @@ void DatapathBuilder::bindMemoryPorts() {
     for (auto [k, ports] : llvm::enumerate(byBank)) {
       llvm::sort(ports);
       ports.erase(std::unique(ports.begin(), ports.end()), ports.end());
-      for (auto [rank, port] : llvm::enumerate(ports)) {
-        assert(rank / per < m.instances && "a read ranked past the instances");
-        m.readInstance[MemUnit::instanceKey(k, port)] = rank / per;
+      unsigned rank = 0;
+      for (unsigned port : ports) {
+        unsigned inst = writePorts.contains(port) ? 0 : rank++ / per;
+        assert(inst < m.instances && "a read ranked past the instances");
+        m.readInstance[MemUnit::instanceKey(k, port)] = inst;
       }
     }
   }

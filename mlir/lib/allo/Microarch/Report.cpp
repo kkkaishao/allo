@@ -125,8 +125,8 @@ FuncUarch::FuncUarch(const Datapath &dp, llvm::StringRef symbol,
     mr.cost.writePorts = m.writePortsBuilt;
     mr.cost.ports = m.portsBuilt;
     mr.cost.instances = m.instances;
-    mr.cost.rowReads = m.ports.reads.value_or(0);
-    mr.cost.rowWrites = m.ports.writes.value_or(0);
+    mr.cost.rowReads = m.ports.reads().value_or(0);
+    mr.cost.rowWrites = m.ports.writes().value_or(0);
     mr.realization = realizationName(m.realization);
     mr.external = m.external;
     mr.scattered = m.scattered;

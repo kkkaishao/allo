@@ -71,44 +71,57 @@ struct MemKindTiming {
   RWDelay delay;
 };
 
-/// What one storage realization can serve in a cycle, per bank: ports of each
-/// direction, and the pool the two directions draw on together. Nullopt is no
-/// limit on that axis. The one port budget, reserved against by the scheduler
-/// and bound against by the datapath.
+/// How many instances of its storage row one array may be held in. POLICY and
+/// not hardware: a copy costs the row's area again and buys one instance's
+/// reads, so where that line sits is the compiler's choice. One number here
+/// until there is a reason to take it as an option.
+constexpr unsigned kStorageCopies = 2;
+
+/// The ports of ONE instance of a storage realization, per bank, and how many
+/// instances an array here may be spread over. Nullopt is no limit on that
+/// axis. What an array may be given in a cycle is neither of the two but
+/// derived from them, which is what the scheduler reserves against and the
+/// datapath binds against.
 ///
-/// A block RAM's two ports each read or write, so two writers and a concurrent
-/// reader take three of them and the pool is what says so. A row whose
-/// directions are independent structures declares no pool, as a LUT RAM's
-/// single write port against its replicated reads does.
+/// A block RAM instance's two ports each read or write, so two writers and a
+/// concurrent reader take three of them and the pool is what says so. A row
+/// whose directions are independent structures declares no pool, as a LUT RAM's
+/// single write port against its one addressed read does.
 struct StoragePorts {
-  std::optional<unsigned> reads;
-  std::optional<unsigned> writes;
-  std::optional<unsigned> pool;
-  /// How many of `reads` ONE instance of the structure serves. Reads past it
-  /// buy another copy of the whole array rather than a different structure, so
-  /// this is what the instance count divides by while `reads` stays what the
-  /// scheduler may issue in a cycle. Defaults to `reads`, one instance covering
-  /// the allowance. Writes have no counterpart: a copy that missed one would
-  /// stop holding the same array, so `writes` is already per instance.
   std::optional<unsigned> instReads;
+  std::optional<unsigned> instWrites;
+  std::optional<unsigned> instPool;
+  /// Instances an array here may be spread over. One where the ports were
+  /// stated for the whole array instead of for a structure it is held in: an
+  /// `allo.bind.storage type=` topology, or a stream's two ends.
+  unsigned copies = kStorageCopies;
+
+  /// Reads the array may be given at once: one instance's, once per copy.
+  std::optional<unsigned> reads() const;
+  /// Writes it may be given: one instance's. A copy that missed a write would
+  /// stop holding the same array, so copies buy no write port.
+  std::optional<unsigned> writes() const;
+  /// Accesses at once where the row pools the directions, IN SLOTS: a read
+  /// takes one slot of one copy, a write one slot of every copy.
+  std::optional<unsigned> slots() const;
 
   /// The tighter of the two budgets on every axis. A nullopt is no limit and
   /// yields to whatever the other side declares.
   StoragePorts meet(const StoragePorts &other) const;
 
-  /// Whether \p other asks for a port this budget does not have on some axis,
+  /// Whether \p other asks of one instance a port this one does not have,
   /// which is what makes a requested topology and a chosen realization
   /// comparable.
   bool exceededBy(const StoragePorts &other) const;
 
   /// Whether \p reads read ports, \p writes write ports and \p ports of them
-  /// altogether fit on every axis. The third is not the sum of the first two:
-  /// where a port serves either direction, one of them may carry a read and a
-  /// write that never issue together.
+  /// altogether fit. The third is not the sum of the first two: where a port
+  /// serves either direction, one of them may carry a read and a write that
+  /// never issue together.
   bool fit(unsigned reads, unsigned writes, unsigned ports) const;
 
   /// This budget as one phrase for a diagnostic ("2 read / 1 write over 2
-  /// shared ports"), an unlimited axis spelled as such.
+  /// shared ports in 2 copies"), an unlimited axis spelled as such.
   std::string describe() const;
 };
 
@@ -483,13 +496,22 @@ class MemoryBankModel {
 public:
   void observe(Operation *op);
   void finalize(const MemoryLibrary &lib);
-  /// The port resources \p op holds at once, as {resource key, ports per bank}:
-  /// one entry per bank it reaches. The limit repeats because it is a property
-  /// of the bank, not of the access. Empty when \p op is not a memory access,
-  /// or when its storage has no port to contend for (a constant table, a
-  /// complete partition).
-  llvm::SmallVector<std::pair<std::string, unsigned>>
-  resources(Operation *op) const;
+
+  /// What one access holds: the port resources, as {resource key, slots per
+  /// bank}, one entry per bank it reaches, and how many of those slots it takes
+  /// on each. The limit repeats because it is a property of the bank, not of
+  /// the access.
+  struct PortDemand {
+    llvm::SmallVector<std::pair<std::string, unsigned>> units;
+    /// A read takes one slot, a write one of every copy the array is spread
+    /// over: the copies all hold the same array and a write reaches all of
+    /// them.
+    unsigned slots = 1;
+  };
+  /// The ports \p op holds at once. Empty when \p op is not a memory access, or
+  /// when its storage has no port to contend for (a constant table, a complete
+  /// partition).
+  PortDemand resources(Operation *op) const;
 
 private:
   llvm::DenseMap<Value, MemoryChar> byMemref;
@@ -522,8 +544,14 @@ void populateMemoryResources(ProblemT &problem, const MemoryLibrary &lib) {
     banks.observe(op);
   banks.finalize(lib);
   for (Operation *op : problem.getOperations()) {
+    MemoryBankModel::PortDemand held = banks.resources(op);
     SmallVector<Problem::ResourceType> units;
-    for (auto &[key, limit] : banks.resources(op)) {
+    for (auto &[key, limit] : held.units) {
+      assert(held.slots <= limit &&
+             "an access takes more slots than its own budget has, which no "
+             "cycle can hold and the greedy placement would search forever "
+             "for; every limit is one instance's ports once per copy and a "
+             "write takes one of each, so it cannot outgrow the budget");
       Problem::ResourceType rsrc = problem.getOrInsertResourceType(key);
       problem.setLimit(rsrc, limit);
       units.push_back(rsrc);
@@ -531,6 +559,7 @@ void populateMemoryResources(ProblemT &problem, const MemoryLibrary &lib) {
     if (units.empty()) // non-memory, or storage with no port to contend for
       continue;
     problem.setLinkedResourceTypes(op, units);
+    problem.setResourceDemand(op, held.slots);
   }
 }
 

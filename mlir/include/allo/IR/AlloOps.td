@@ -598,23 +598,19 @@ def DCPathStorageOp : DCPath_Op<"dcp.storage",
     every access against the row its array resolves to and the emitter builds
     the ports at exactly those latencies, so the two cannot drift.
 
-    `max_rd`/`max_wr` are how many ports of each direction an array held here
-    may be given, omitted where there is no limit, and `max_p` how many it may
-    be given altogether, each serving a read or a write in a cycle. A `scatter`
-    row declares none of them, holding one cell per element and no addressed
-    port.
+    `inst_rd`/`inst_wr` are how many ports of each direction ONE INSTANCE of
+    the structure has, omitted where it has no limit, and `inst_p` how many it
+    has altogether, each serving a read or a write in a cycle. A `scatter` row
+    declares none of them, holding one cell per element and no addressed port.
 
     A block RAM's two ports each read or write, so two writers and a concurrent
-    reader take three of them and `max_p` is what says so. A row whose
+    reader take three of them and `inst_p` is what says so. A row whose
     directions are independent structures, as a LUT RAM's single write port and
-    its replicated reads are, declares no `max_p`.
+    its one addressed read are, declares no `inst_p`.
 
-    `inst_rd` is how many of those reads ONE instance of the structure serves,
-    which is a different number: reads past it are served by holding the array
-    in another instance, so they buy copies rather than a different structure.
-    Defaults to `max_rd`, one instance covering the whole allowance. A write is
-    not replicable, every copy needing it, so `max_wr` is already per instance
-    and has no counterpart here.
+    None of the three is what an ARRAY held here may be given, which is derived
+    instead: the compiler decides how many instances to hold an array in, every
+    copy taking every write and serving `inst_rd` reads of its own.
 
     `style` is the vendor attribute that pins an array to this structure,
     stamped on the emitted array declaration (Xilinx spells it
@@ -636,10 +632,9 @@ def DCPathStorageOp : DCPath_Op<"dcp.storage",
     UnitAttr:$is_scatter,
     I64Attr:$rd_latency, F32Attr:$rd_delay,
     I64Attr:$wr_latency, F32Attr:$wr_delay,
-    OptionalAttr<I64Attr>:$max_reads,
-    OptionalAttr<I64Attr>:$max_writes,
-    OptionalAttr<I64Attr>:$max_ports,
     OptionalAttr<I64Attr>:$inst_reads,
+    OptionalAttr<I64Attr>:$inst_writes,
+    OptionalAttr<I64Attr>:$inst_ports,
     OptionalAttr<StrAttr>:$ram_style,
     UnitAttr:$no_init,
     OptionalAttr<ArrayAttr>:$uses);
@@ -648,8 +643,8 @@ def DCPathStorageOp : DCPath_Op<"dcp.storage",
     (`no_init` $no_init^)?
     `rd` `=` $rd_latency `,` $rd_delay
     `wr` `=` $wr_latency `,` $wr_delay
-    (`max_rd` `=` $max_reads^)? (`max_wr` `=` $max_writes^)?
-    (`max_p` `=` $max_ports^)? (`inst_rd` `=` $inst_reads^)?
+    (`inst_rd` `=` $inst_reads^)? (`inst_wr` `=` $inst_writes^)?
+    (`inst_p` `=` $inst_ports^)?
     (`style` `=` $ram_style^)?
     (`uses` $uses^)? attr-dict
   }];

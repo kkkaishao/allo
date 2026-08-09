@@ -117,22 +117,20 @@ class Derived(NamedTuple):
 class StorageSpec(NamedTuple):
     """What a fabric declares about one storage realization apart from its
     timing: the resources it cannot exist without, what one instance spends over
-    ``(depth, width)``, and how many ports of each direction it has. A die
-    missing any of ``needs`` does not get the row.
+    ``(depth, width)``, and how many ports ONE INSTANCE of it has. A die missing
+    any of ``needs`` does not get the row.
 
     A port limit of ``None`` is no limit, which is what the scatter row takes:
-    one cell per element is not addressed. An array needing more ports than the
-    row has is built as a register file.
+    one cell per element is not addressed.
 
-    ``max_ports`` is the pool the two directions draw on together, declared
+    ``inst_ports`` is the pool the two directions draw on together, declared
     where a port serves a read or a write (a block RAM) and omitted where the
     directions are independent structures (a LUT RAM's write port against its
-    replicated reads).
+    one addressed read).
 
-    ``inst_reads`` is how many of ``max_reads`` ONE instance serves; reads past
-    it are held in another copy of the whole array. Defaults to ``max_reads``,
-    one instance covering the allowance. A write has no counterpart, every copy
-    needing it, so ``max_writes`` is already per instance.
+    None of the three says what an ARRAY held here may be given: the compiler
+    decides how many instances to hold it in, every copy taking every write and
+    serving ``inst_reads`` reads of its own.
 
     ``ram_style`` is the vendor attribute that pins an array to the row, so
     that what the part builds is what the device priced, and ``can_init`` is
@@ -140,10 +138,9 @@ class StorageSpec(NamedTuple):
 
     needs: tuple[str, ...]
     uses: Callable[[Mapping[str, Resource]], dict]
-    max_reads: int | None = None
-    max_writes: int | None = None
-    max_ports: int | None = None
     inst_reads: int | None = None
+    inst_writes: int | None = None
+    inst_ports: int | None = None
     ram_style: str | None = None
     can_init: bool = True
 

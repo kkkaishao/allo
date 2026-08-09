@@ -190,39 +190,37 @@ _STORAGE = {
     # Distributed RAM has one write port and ONE addressed read, the two being
     # separate structures (no pool). A second read address is a whole further
     # copy of the array: measured 640 / 1280 / 1920 / 2560 LUT as memory at
-    # 1024x32 for one through four reads. `max_reads` is then how many reads an
-    # array here may be given at once, which is two copies' worth.
+    # 1024x32 for one through four reads.
     "lutram": StorageSpec(
         ("slicem_lut",),
         lambda r: {r["slicem_lut"]: Tiled(64)},
-        max_reads=2,
-        max_writes=1,
         inst_reads=1,
+        inst_writes=1,
         ram_style="distributed",
     ),
     # A shift register writes only at its head and reads one addressed tap.
     "srl": StorageSpec(
         ("slicem_lut",),
         lambda r: {r["slicem_lut"]: Tiled(32)},
-        max_reads=1,
-        max_writes=1,
+        inst_reads=1,
+        inst_writes=1,
     ),
     # Two ports, each reading OR writing in a cycle: hence the pool, which two
     # writers and a concurrent reader together exceed.
     "bram": StorageSpec(
         ("bram36",),
         lambda r: {r["bram36"]: Tiled(36864)},
-        max_reads=2,
-        max_writes=2,
-        max_ports=2,
+        inst_reads=2,
+        inst_writes=2,
+        inst_ports=2,
         ram_style="block",
     ),
     "uram": StorageSpec(
         ("uram288",),
         lambda r: {r["uram288"]: Tiled(294912)},
-        max_reads=2,
-        max_writes=2,
-        max_ports=2,
+        inst_reads=2,
+        inst_writes=2,
+        inst_ports=2,
         ram_style="ultra",
         can_init=False,
     ),
@@ -318,10 +316,9 @@ def build(part: Part) -> Device:
             read_delay_ns=t.read_ns,
             write_delay_ns=t.write_ns,
             is_scatter=name == SCATTER_STORAGE,
-            max_reads=spec.max_reads,
-            max_writes=spec.max_writes,
-            max_ports=spec.max_ports,
             inst_reads=spec.inst_reads,
+            inst_writes=spec.inst_writes,
+            inst_ports=spec.inst_ports,
             ram_style=spec.ram_style,
             can_init=spec.can_init,
             uses=spec.uses(res),
