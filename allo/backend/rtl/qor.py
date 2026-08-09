@@ -58,9 +58,12 @@ class Utilization:
     resources adds other rows and nothing here switches on the list; the fields
     are the ``xcu55c`` names spelled out for a reader."""
 
-    lut: int = 0  # every LUT site, SRLs included
+    lut: int = 0  # every LUT site, state-holding ones included
     logic_lut: int = 0  # of those, the ones not holding state
-    srl: int = 0  # a LUT site holding a shift register (`slicem_lut`)
+    #: LUT sites holding state (`slicem_lut`): a shift register or a distributed
+    #: RAM. One resource on the die, and Vivado reports the two uses apart
+    #: ("LUT as Shift Register" against "LUT as Distributed RAM").
+    srl: int = 0
     ff: int = 0
     dsp: int = 0
     carry8: int = 0
@@ -146,12 +149,25 @@ class QoR:  # pylint: disable=too-many-instance-attributes
     #: structures with no cost row, by kind. Reported, never dropped: a silently
     #: unpriced structure reads as a cheaper design.
     unmodelled: dict[str, int]
-    mem_bits: int  # inferred RAM, APART from the fabric totals
-    regfile_arrays: int  # arrays that failed RAM inference
+    mem_bits: int  # stored bits, replicas included, apart from the fabric totals
+    #: arrays priced as a multi-write register file: their writes exceed what one
+    #: copy of their storage row provides, and replication cannot serve a write.
+    #: Reads over the budget are not here; they buy copies of the row.
+    regfile_arrays: int
     #: flip-flops the emitted design DECLARES, from the register ledger, and so a
     #: count. ``area.ff`` is the modelled figure beside it: what the part holds
     #: once the deep chains are extracted into SRLs.
     reg_bits: int
+    #: what fraction of each declared resource ``area`` occupies, keyed by the
+    #: device's own resource names. A resource the part does not declare is
+    #: absent rather than zero.
+    utilization: dict[str, float]
+
+    @property
+    def over_capacity(self) -> dict[str, float]:
+        """Resources the design asks for more of than the part has, keyed to the
+        fraction asked for. A design with any is not placeable there."""
+        return {k: v for k, v in self.utilization.items() if v > 1.0}
 
     @property
     def latency_is_exact(self) -> bool:
@@ -270,11 +286,6 @@ def estimate(report: CompileReport, device: Device = default_device) -> QoR:
             # to disagree.
             if m.realization in {"boundary", "scatter"}:
                 continue
-            if m.realization == "register_file":
-                bank = Utilization.of(price(regfile, (m.depth_words, m.width)))
-                charge("memories", f.func, bank * m.banks)
-                regfile_arrays += 1
-                continue
             if m.realization == "rom":
                 # A read-only table is emitted as a constant array read by an
                 # index, so the part builds it out of logic and it holds no
@@ -286,18 +297,29 @@ def estimate(report: CompileReport, device: Device = default_device) -> QoR:
                     Utilization.of(price(device.rom_uses, (m.depth_words, m.width))),
                 )
                 continue
-            mem_bits += m.bits
-            # A block RAM or UltraRAM the device was ASKED for is charged in
-            # its own tiles; which primitive an INFERRED RAM lands in the
-            # model cannot say, and the measurement says it costs no fabric.
+            # An addressed array costs its row, once per copy the reads need and
+            # once per bank: reads past one copy's budget are served by
+            # replicating the whole array. A write cannot be served that way,
+            # every copy needing each of them, so a write set over the budget is
+            # the one case that prices against the scatter row.
             row = device.storage.get(m.storage)
-            tiled = ("bram36", "uram288")
-            if row is not None and any(r in tiled for r, _ in row.uses):
+            if row is None or (
+                m.cost.row_writes and m.cost.write_ports > m.cost.row_writes
+            ):
                 charge(
                     "memories",
                     f.func,
-                    Utilization.of(price(row.uses, (m.depth_words, m.width))),
+                    Utilization.of(price(regfile, (m.depth_words, m.width))) * m.banks,
                 )
+                regfile_arrays += 1
+                continue
+            copies = m.cost.replicas * m.banks
+            mem_bits += m.bits * m.cost.replicas
+            charge(
+                "memories",
+                f.func,
+                Utilization.of(price(row.uses, (m.depth_words, m.width))) * copies,
+            )
 
         # A channel between two children is a queue this module builds, priced as
         # a register file since the register ledger does not hold it. A channel
@@ -338,4 +360,7 @@ def estimate(report: CompileReport, device: Device = default_device) -> QoR:
         mem_bits=mem_bits,
         regfile_arrays=regfile_arrays,
         reg_bits=report.microarch.reg_bits,
+        utilization=area.fraction_of(
+            {name: r.capacity for name, r in device.resources.items()}
+        ),
     )

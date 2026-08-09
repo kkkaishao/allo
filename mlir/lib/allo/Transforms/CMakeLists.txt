@@ -13,7 +13,7 @@ add_mlir_library(MLIRAlloTransforms
     DropTrivialFunc.cpp
     AssignBanks.cpp
     ResolveBanking.cpp
-    PropagatePartition.cpp
+    ReconcileArrayDirectives.cpp
     OutlineLooseProcesses.cpp
     RaiseCountedWhile.cpp
     ElideDeadInit.cpp

@@ -209,6 +209,26 @@ bool isConstantTable(Value memRef);
 /// directives comparable and their disagreement reportable.
 llvm::StringRef boundStorageOf(Value memref);
 
+/// The three orthogonal axes of one `allo.bind.storage` directive, mapped from
+/// its `type` string (port topology + RAM/ROM) and its `impl` string (which
+/// storage realization).
+struct BindStorage {
+  /// The topology asked for, empty where the directive names none. Absent is
+  /// not the dual-port default: an array that asked for nothing takes whatever
+  /// its realization has, and only an explicit topology narrows that.
+  std::optional<MemoryPortEnum> port;
+  MemoryKindEnum kind = MemoryKindEnum::RAM;
+  llvm::StringRef storage; // empty: no explicit choice, not "no storage"
+};
+
+/// The axes \p bind states, all defaulted for a null dictionary.
+BindStorage parseBindStorage(mlir::DictionaryAttr bind);
+
+/// Whether topology \p a serves everything \p b asks for. The three form a
+/// chain, `1p` under `s2p` under `t2p`, so two carriers of one array reconcile
+/// by taking the one that covers the other.
+bool topologyCovers(MemoryPortEnum a, MemoryPortEnum b);
+
 //===----------------------------------------------------------------------===//
 // Partition and static-bank queries. A DCP banking pass reuses these facts so
 // it materializes the *same* banks the scheduler bound its ResII against.

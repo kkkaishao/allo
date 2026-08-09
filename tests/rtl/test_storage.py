@@ -17,7 +17,7 @@ from allo.schedule import Schedule
 from allo.schedule.errors import InvalidScheduleArgumentError
 from allo.backend.base import run_pipeline
 from allo.backend.rtl import Memory, RegisterFile, qor
-from allo.backend.rtl.device import Tiled
+from allo.backend.rtl.device import Resource, Tiled
 from allo.backend.rtl.devices import default_device
 from allo.backend.rtl.schedule import RTL_PREPARE_PIPELINE
 
@@ -485,7 +485,7 @@ def test_the_bank_an_access_reaches_is_decided_once():
 
 def test_composed_banking():
     # Banking a COMPOSED array: a partition stated once where the array lives
-    # (`propagate-partition`) reaches every callee parameter, so each child
+    # (`reconcile-array-directives`) reaches every callee parameter, so each child
     # emits a port group per bank and the container materializes one memory per
     # bank with no crossbar of its own. Covers a container-local buffer and a
     # container argument.
@@ -892,7 +892,7 @@ def test_a_skew_must_name_its_distribution_dimension():
 
 
 def test_a_partitioned_container_local_buffer():
-    # `propagate-partition` gives every child the same `allo.part`, so the
+    # `reconcile-array-directives` gives every child the same `allo.part`, so the
     # container just materializes the banks they already agree on: `bk_prod`
     # writes STATIC banks (one single-bank port group each), while `bk_cons`
     # reads a DATA-DEPENDENT one (crossbarred inside the child). Same shape the
@@ -1151,6 +1151,37 @@ def test_a_constant_table_is_priced_as_the_logic_it_is_built_from():
     rtl = s.export("rtl")
     rtl.compile()
     assert qor.estimate(rtl.report).area.bram36 == 0
+
+
+def test_a_design_asking_for_more_of_a_resource_than_the_part_has_is_named():
+    # `capacity` is what the device declares it holds and the estimate is what
+    # the design asks for; a design over the part is not placeable there, so the
+    # fraction is reported rather than left for a reader to divide out.
+    @kernel
+    def k(A: i32[64], out: i32[64]):
+        buf: i32[64]
+        for i in range(64):
+            buf[i] = A[i] + 1
+        for i in range(64):
+            out[i] = buf[i] & 255
+
+    rtl = _to_rtl(k)
+    rtl.compile()
+    est = qor.estimate(rtl.report)
+    assert (
+        est.utilization["lut"]
+        == est.area.lut / default_device.resources["lut"].capacity
+    )
+    assert not est.over_capacity, "this fits a u55c many times over"
+
+    # The same design against a part with a handful of LUTs: the LUT rows go
+    # over and nothing else does.
+    small = default_device.copy()
+    for name in ("lut", "slicem_lut"):
+        small.resources[name] = Resource(name, 8)
+    over = qor.estimate(rtl.report, small).over_capacity
+    assert set(over) == {"lut", "slicem_lut"}
+    assert over["lut"] == est.area.lut / 8
 
 
 def test_a_banked_array_cannot_be_declared_with_contents():
@@ -1440,6 +1471,119 @@ def test_a_storage_that_powers_up_undefined_cannot_hold_declared_contents():
     s = ro.schedule()
     s.bind_storage("tbl", impl=Schedule.URAM, mem_type=s.RAM_T2P)
     s.export("rtl").schedule()
+
+
+@kernel
+def sh_prod(A: i32[64], buf: i32[64]):
+    for i in range(64):
+        buf[i] = A[i] + 1
+
+
+@kernel
+def sh_cons(buf: i32[64], out: i32[64]):
+    for i in range(64):
+        out[i] = buf[i] & 255
+
+
+@kernel
+def sh_top(A: i32[64], out: i32[64]):
+    buf: i32[64]
+    sh_prod(A, buf)
+    sh_cons(buf, out)
+
+
+def _shared_mems(rtl, owner):
+    """Every kernel's view of the one array named `owner`."""
+    return [
+        m
+        for f in rtl.report.microarch.funcs
+        for m in f.mems
+        if m.owner.rstrip("_") == owner
+    ]
+
+
+def test_a_storage_binding_reaches_every_kernel_the_array_is_visible_in():
+    # `bind_storage` is stated once where the array lives, and a callee sees only
+    # its own parameter, so left alone the child resolves the default row and
+    # reads a 2-cycle UltraRAM at 1-cycle timing: every element comes back
+    # shifted. The binding rides the same carrier classes the partition does.
+    s = sh_top.schedule()
+    s.bind_storage("buf", impl=Schedule.URAM, mem_type=s.RAM_T2P)
+    rtl = s.export("rtl")
+    rtl.compile()
+    mems = _shared_mems(rtl, "buf")
+    assert len(mems) == 3, "the owner and both children name it"
+    assert all(m.storage == "uram" and m.read_latency == 2 for m in mems)
+    A = np.arange(64, dtype=np.int32)
+    out = np.zeros(64, np.int32)
+    rtl.cosim(A, out)
+    assert np.array_equal(out, (A + 1) & 255)
+
+    # A boundary array is the same: its cells are the caller's, but the latency
+    # the two sides read them at is one number.
+    @kernel
+    def sh_arg_top(A: i32[64], out: i32[64]):
+        sh_cons(A, out)
+
+    s = sh_arg_top.schedule()
+    s.bind_storage("A", impl=Schedule.URAM, mem_type=s.RAM_T2P)
+    rtl = s.export("rtl")
+    rtl.compile()
+    shared = _shared_mems(rtl, "A") + _shared_mems(rtl, "buf")
+    assert len(shared) == 2 and all(m.read_latency == 2 for m in shared)
+    out = np.zeros(64, np.int32)
+    rtl.cosim(A, out)
+    assert np.array_equal(out, A & 255)
+
+
+def test_two_kernels_binding_one_array_to_different_structures_is_refused():
+    # One array is held in one structure, and a sub-kernel masters a port on the
+    # caller's, so only one of the two can be built. Refused on the `impl` axis
+    # whatever the timing says: `bram` and `lutram` are both 1-cycle here and
+    # still different hardware.
+    s = sh_top.schedule()
+    cs = sh_cons.schedule()
+    cs.bind_storage("buf", impl=Schedule.BRAM, mem_type=cs.RAM_T2P)
+    s.compose(cs)
+    s.bind_storage("buf", impl=Schedule.LUTRAM, mem_type=s.RAM_T2P)
+    with pytest.raises(RuntimeError, match="ALLO-E0018"):
+        s.export("rtl").schedule()
+
+
+def test_the_port_topology_two_kernels_ask_for_is_covered_not_matched():
+    # `type=` asks for a topology, and the three form a chain: t2p serves
+    # everything s2p does and s2p everything 1p does. A child asking for less
+    # than its caller is not a conflict, it just uses fewer of the ports the
+    # array has, so the array takes the topology that covers both.
+    def buf_ports(build):
+        s = sh_top.schedule()
+        build(s)
+        rtl = s.export("rtl")
+        rtl.compile()
+        mems = _shared_mems(rtl, "buf")
+        assert len(mems) == 3 and all(m.storage == "bram" for m in mems)
+        return {(m.cost.row_reads, m.cost.row_writes) for m in mems}, rtl
+
+    def mixed(s):
+        cs = sh_cons.schedule()
+        cs.bind_storage("buf", impl=Schedule.BRAM, mem_type=cs.RAM_1P)
+        s.compose(cs)
+        s.bind_storage("buf", impl=Schedule.BRAM, mem_type=s.RAM_T2P)
+
+    # The block RAM's own 2 read / 2 write reaches every kernel: the child's 1p
+    # narrowed nothing, because t2p covers it.
+    ports, rtl = buf_ports(mixed)
+    assert ports == {(2, 2)}
+    A = np.arange(64, dtype=np.int32)
+    out = np.zeros(64, np.int32)
+    rtl.cosim(A, out)
+    assert np.array_equal(out, (A + 1) & 255)
+
+    # 1p on its own does narrow it, so the assertion above has teeth.
+    only_1p, _ = buf_ports(
+        lambda s: s.bind_storage("buf", impl=Schedule.BRAM, mem_type=s.RAM_1P)
+    )
+    assert only_1p == {(1, 1)}
 
 
 def test_a_multi_cycle_read_registers_the_datum_not_the_address():

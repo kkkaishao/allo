@@ -655,7 +655,7 @@ void DatapathBuilder::recordCallDeps() {
 // access with no bank of its own, which a crossbar routes to every bank; every
 // access of an array with more of them than the relation is built for; and, on
 // the write side, every write of an array whose splitting is not proven safe.
-DatapathBuilder::PortCounts
+std::optional<DatapathBuilder::PortCounts>
 DatapathBuilder::bindPorts(MemUnit &m, std::optional<bool> writes,
                            unsigned base) {
   llvm::SmallVector<Datapath::PortVertex> verts;
@@ -743,9 +743,13 @@ DatapathBuilder::bindPorts(MemUnit &m, std::optional<bool> writes,
   // the collision it might have. Each still keeps a port of its own so the
   // block holds one assignment per write: two writes to different words in one
   // cycle must both commit, and a select would drop one.
+  //
+  // That block is per direction, so a both-directions pass cannot express it
+  // and declines; a binding giving every access its own port is never fewer
+  // ports than the per-direction one it falls back to.
   if (!split) {
-    assert(writes && *writes &&
-           "an unsplittable write set is bound on its own");
+    if (!writes)
+      return std::nullopt;
     for (unsigned i = 0; i < n; ++i)
       colour[i] = i;
     used = n;
@@ -816,8 +820,8 @@ void DatapathBuilder::bindMemoryPorts() {
     // both. On a row whose directions are separate structures, merging them
     // buys an address multiplexer and nothing else.
     auto separate = [&] {
-      PortCounts w = bindPorts(m, /*writes=*/true, /*base=*/0);
-      PortCounts r = bindPorts(m, /*writes=*/false, /*base=*/w.colours);
+      PortCounts w = bindPorts(m, /*writes=*/true, /*base=*/0).value();
+      PortCounts r = bindPorts(m, /*writes=*/false, /*base=*/w.colours).value();
       m.writePortsBuilt = w.writes;
       m.readPortsBuilt = r.reads;
       m.portsBuilt = w.writes + r.reads;
@@ -834,11 +838,12 @@ void DatapathBuilder::bindMemoryPorts() {
       // a write that presents its terms early would drive the read's cycle too.
       assert(m.writeLatency == 1 &&
              "a pooled row's write port realizes in one cycle");
-      PortCounts u = bindPorts(m, /*writes=*/std::nullopt, /*base=*/0);
-      if (u.total < m.portsBuilt) {
-        m.readPortsBuilt = u.reads;
-        m.writePortsBuilt = u.writes;
-        m.portsBuilt = u.total;
+      std::optional<PortCounts> u =
+          bindPorts(m, /*writes=*/std::nullopt, /*base=*/0);
+      if (u && u->total < m.portsBuilt) {
+        m.readPortsBuilt = u->reads;
+        m.writePortsBuilt = u->writes;
+        m.portsBuilt = u->total;
       } else {
         separate();
       }

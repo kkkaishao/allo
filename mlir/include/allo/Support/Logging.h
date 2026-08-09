@@ -56,6 +56,7 @@ enum class Code {
   DependenceInfeasible,       // no schedule satisfies the dependences
   RegionShapeNotScheduled,    // no scheduling regime for this region
   CompilerInconsistency,      // our own model disagrees with itself
+  StorageConflict,            // one array, two storage rows that disagree
 
   // A backend gap (`unsupported`).
   OperationNotModelled,        // this stage models no such operation
@@ -112,6 +113,8 @@ constexpr const char *codeTag(Code code) {
     return "ALLO-E0016";
   case Code::CompilerInconsistency:
     return "ALLO-E0017";
+  case Code::StorageConflict:
+    return "ALLO-E0018";
   case Code::OperationNotModelled:
     return "ALLO-N0001";
   case Code::MemrefResult:

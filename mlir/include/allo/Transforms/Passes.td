@@ -274,8 +274,8 @@ def AssignBanksPass : Pass<"assign-banks", "func::FuncOp"> {
   let summary = "Decide which bank of a partitioned array each access reaches";
   let description = [{
     Runs before the scheduler, once the `allo.part` attributes are final
-    (`propagate-partition`) and the access maps are in their final affine form
-    (after `loop-canonicalization` / `scalarize-memory`). It records the bank an
+    (`reconcile-array-directives`) and the access maps are in their final affine
+    form (after `loop-canonicalization` / `scalarize-memory`). It records the bank an
     access reaches as an `allo.bank` attribute on the access, which
     `convert-schedule-to-dcp` then moves onto the `dcp.load`/`dcp.store` op's
     own `bank` attribute.
@@ -617,10 +617,10 @@ def ExpandRegionBoundsPass
                            "mlir::allo::AlloDialect"];
 }
 
-def PropagatePartitionPass
-    : Pass<"propagate-partition", "ModuleOp"> {
-  let summary = "Give every carrier of one array the single `allo.part` its "
-                "kernels agree on";
+def ReconcileArrayDirectivesPass
+    : Pass<"reconcile-array-directives", "ModuleOp"> {
+  let summary = "Give every carrier of one array the single `allo.part` and "
+                "`allo.bind.storage` its kernels agree on";
   let description = [{
     A partition is a property of the ARRAY, but the array is named once per
     function it is visible in: a `memref.alloc`, a `memref.global`, a parameter
@@ -641,6 +641,14 @@ def PropagatePartitionPass
     and a block against a cyclic axis on one dimension is reported as the
     conflict `Skew` exists to answer. One sweep suffices, since which carriers
     denote one array follows from the call graph and never from the attributes.
+
+    `allo.bind.storage` rides the same classes, and its two axes reconcile
+    differently. `impl` names the structure the array is held in, of which there
+    is one: two carriers naming different rows are refused whatever their
+    latencies, since rows of equal timing are still different hardware. `type`
+    asks for a port topology, and those form a chain (`t2p` serves everything
+    `s2p` does, `s2p` everything `1p` does), so the carriers take the one that
+    covers the others and a side that asked for less is not in conflict.
 
     Runs before `sdc-scheduling`, so a callee is scheduled knowing its banks:
     banking a composed array pays off only if the *callee* issues N accesses per

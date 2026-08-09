@@ -109,6 +109,14 @@ class MemoryCost:
     #: pooled storage may carry both a read and a write that never issue
     #: together, and then one address bus carries both.
     ports: int
+    #: copies of the storage row the array is held in, one per budget's worth of
+    #: read ports. What the row's price is multiplied by.
+    replicas: int = 1
+    #: ports one copy of the row provides, 0 for no limit. The row narrowed by
+    #: the topology the array asked for, which the device table alone does not
+    #: give.
+    row_reads: int = 0
+    row_writes: int = 0
 
     @classmethod
     def from_json(cls, d: dict) -> MemoryCost:
@@ -118,6 +126,9 @@ class MemoryCost:
             read_ports=d["read_ports"],
             write_ports=d["write_ports"],
             ports=d["ports"],
+            replicas=d.get("replicas", 1),
+            row_reads=d.get("row_reads", 0),
+            row_writes=d.get("row_writes", 0),
         )
 
 

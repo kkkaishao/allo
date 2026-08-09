@@ -253,9 +253,20 @@ struct MemUnit {
     return ports.fit(readPortsBuilt, writePortsBuilt, portsBuilt);
   }
 
+  /// Copies of `storage` the array is held in. Reads past one instance's budget
+  /// are served by replicating the whole array, each copy taking every write, so
+  /// reads over the budget cost copies rather than changing the structure. A
+  /// write cannot be served that way, every copy needing it, so the two
+  /// directions are not symmetric.
+  unsigned replicas() const {
+    unsigned per = ports.reads.value_or(0);
+    return per && readPortsBuilt > per ? (readPortsBuilt + per - 1) / per : 1;
+  }
+
   /// What this module builds to hold the array, decided by
-  /// `classifyRealizations` from the port binding and read by the emitter, the
-  /// report and the cost model.
+  /// `classifyRealizations` from the port binding and read by the emitter and
+  /// the report. Not by the cost model, which prices an addressed array by
+  /// `replicas` of its row whichever of the two addressed cases it is.
   enum class Realization {
     /// Nothing: the cells are the caller's and this module holds ports on
     /// them. Every argument array, addressed or scattered.
@@ -268,9 +279,10 @@ struct MemUnit {
     Scatter,
     /// An addressed array whose bound ports its `storage` row can serve.
     Ram,
-    /// An addressed array whose bound ports exceed that row. The emission is
-    /// the same, but no RAM template matches it, so the part builds flip-flops
-    /// at the row's latency without its density.
+    /// An addressed array whose bound ports exceed that row. Emitted in the
+    /// same shape as a Ram, which the synthesizer serves by replicating the
+    /// array per read port; the two differ only in that a Ram carries the row's
+    /// `ram_style` and this does not.
     RegisterFile,
   };
   Realization realization = Realization::Ram;

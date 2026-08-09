@@ -85,7 +85,8 @@ static LogicalResult checkMemories(func::FuncOp func, const MemoryLibrary &lib,
                                    DenseSet<Value> &boundaryArrays, bool isTop);
 static LogicalResult checkComposition(func::FuncOp func,
                                       const DeviceModel &dev);
-static LogicalResult checkPartitionAgreement(func::FuncOp func);
+static LogicalResult checkArgumentAgreement(func::FuncOp func,
+                                            const MemoryLibrary &lib);
 static LogicalResult verifyFunc(
     func::FuncOp func, ModuleOp module, const DeviceModel &dev,
     llvm::DenseMap<std::pair<Operation *, unsigned>, bool> &streamArgIsInput,
@@ -450,7 +451,7 @@ LogicalResult checkMemories(func::FuncOp func, const MemoryLibrary &memLib,
       return failure();
     }
   }
-  return checkPartitionAgreement(func);
+  return checkArgumentAgreement(func, memLib);
 }
 
 // Whether two memrefs are banked identically, axis for axis. Bank count alone
@@ -468,10 +469,19 @@ static bool sameBanking(BankLayout &a, BankLayout &b) {
   return true;
 }
 
-// A sub-kernel masters one port group per bank and indexes each in that bank's
-// own element space, so caller and callee must agree on the whole banking; at a
-// different layout the child addresses the wrong elements.
-LogicalResult checkPartitionAgreement(func::FuncOp func) {
+// What caller and callee must agree on for one array argument. The array is
+// built once, by whoever owns the storage, and the sub-kernel masters a port on
+// it, so both sides describe one structure.
+//
+// Banking: a sub-kernel masters one port group per bank and indexes each in
+// that bank's own element space, so at a different layout the child addresses
+// the wrong elements.
+//
+// Storage: the row carries the access latency every side was scheduled at and
+// the latency the emitter builds ports at, so two rows time one memory two ways
+// and the shorter one samples before the data is valid.
+LogicalResult checkArgumentAgreement(func::FuncOp func,
+                                     const MemoryLibrary &lib) {
   SymbolTableCollection syms;
   WalkResult r = func.walk([&](func::CallOp call) {
     auto callee =
@@ -479,20 +489,47 @@ LogicalResult checkPartitionAgreement(func::FuncOp func) {
     if (!callee || callee.isExternal())
       return WalkResult::advance();
     for (auto [k, actual] : llvm::enumerate(call.getArgOperands())) {
-      if (!isa<MemRefType>(actual.getType()) || isa<BlockArgument>(actual) ||
-          isConstantTable(actual))
+      if (!isa<MemRefType>(actual.getType()) || isConstantTable(actual))
         continue;
+      BlockArgument param = callee.getArgument(k);
       BankLayout here = bankLayoutOf(actual);
-      BankLayout there = bankLayoutOf(callee.getArgument(k));
-      if (sameBanking(here, there))
+      BankLayout there = bankLayoutOf(param);
+      if (!isa<BlockArgument>(actual) && !sameBanking(here, there)) {
+        error(Stage::Prep, Code::ArrayLayoutConflict, call)
+            << "Array argument " << k << " of sub-kernel '" << call.getCallee()
+            << "' is partitioned into " << there.numBanks
+            << " bank(s) there but into " << here.numBanks
+            << " in the caller; a sub-kernel addresses each bank in that "
+               "bank's own space, so the two partitions must match. Give the "
+               "array the same partition factor in both kernels";
+        return WalkResult::interrupt();
+      }
+      // Unlike banking, this holds for a boundary array too: its cells are the
+      // caller's, but the latency both sides read them at is one number.
+      std::string mine = characterize(actual, lib).storage;
+      std::string theirs = characterize(param, lib).storage;
+      if (mine == theirs)
         continue;
-      error(Stage::Prep, Code::ArrayLayoutConflict, call)
+      // Off `row` rather than `timing`: a name the device does not declare is
+      // the callee's own check to report, and `timing` asserts on it.
+      auto cycles = [&](StringRef name) {
+        const StorageRealization *s = lib.row(name);
+        std::string out;
+        llvm::raw_string_ostream os(out);
+        if (s)
+          os << "read " << s->timing.latency.read << ", write "
+             << s->timing.latency.write << " cycle(s)";
+        else
+          os << "undeclared";
+        return out;
+      };
+      error(Stage::Prep, Code::StorageConflict, call)
           << "Array argument " << k << " of sub-kernel '" << call.getCallee()
-          << "' is partitioned into " << there.numBanks
-          << " bank(s) there but into " << here.numBanks
-          << " in the caller; a sub-kernel addresses each bank in that "
-             "bank's own space, so the two partitions must match. Give the "
-             "array the same partition factor in both kernels";
+          << "' is held in storage '" << mine << "' (" << cycles(mine)
+          << ") in the caller but in '" << theirs << "' (" << cycles(theirs)
+          << ") there; the array is built once and the sub-kernel masters a "
+             "port on it, so the two would time one memory differently. Bind "
+             "it to the same storage in both kernels";
       return WalkResult::interrupt();
     }
     return WalkResult::advance();

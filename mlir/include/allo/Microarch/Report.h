@@ -62,6 +62,13 @@ struct MemCost {
   // `ports` is not their sum: a port of a pooled storage may carry both a read
   // and a write that never issue together.
   unsigned readPorts = 0, writePorts = 0, ports = 0;
+  // Copies of the storage row the array is held in, one per budget's worth of
+  // read ports (`MemUnit::replicas`). What the cost model multiplies by.
+  unsigned replicas = 1;
+  // Read and write ports one copy of the row provides, 0 for no limit. The row
+  // narrowed by the topology the array asked for, which the device table alone
+  // does not give.
+  unsigned rowReads = 0, rowWrites = 0;
 };
 
 /// One array, and the storage decision taken for it.

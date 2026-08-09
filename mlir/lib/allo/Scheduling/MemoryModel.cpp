@@ -58,21 +58,6 @@ static AttrT carrierAttr(Value memRef, StringRef name) {
   return {};
 }
 
-// The three orthogonal axes of an `allo.bind.storage` directive, mapped from
-// its `type` string (port topology + RAM/ROM) and `impl` string (which storage
-// realization). An ABSENT `type` is the dual-port RAM default and an absent
-// `impl` is an absent CHOICE, resolved against the library's default.
-namespace {
-struct BindStorage {
-  // The topology asked for, empty where the directive names none. Absent is not
-  // the dual-port default: an array that asked for nothing takes whatever its
-  // realization has, and only an explicit topology narrows that.
-  std::optional<MemoryPortEnum> port;
-  MemoryKindEnum kind = MemoryKindEnum::RAM;
-  StringRef storage; // empty: no explicit choice, not "no storage"
-};
-} // namespace
-
 // The tighter of two limits on one axis; nullopt is no limit and yields.
 static std::optional<unsigned> tighter(std::optional<unsigned> a,
                                        std::optional<unsigned> b) {
@@ -117,7 +102,7 @@ std::string StoragePorts::describe() const {
   return s;
 }
 
-static BindStorage parseBindStorage(DictionaryAttr bind) {
+BindStorage allo::parseBindStorage(DictionaryAttr bind) {
   BindStorage bs;
   if (!bind)
     return bs;
@@ -146,6 +131,21 @@ static BindStorage parseBindStorage(DictionaryAttr bind) {
   if (auto im = bind.getAs<StringAttr>("impl"))
     bs.storage = im.getValue();
   return bs;
+}
+
+bool allo::topologyCovers(MemoryPortEnum a, MemoryPortEnum b) {
+  auto rank = [](MemoryPortEnum p) -> unsigned {
+    switch (p) {
+    case MemoryPortEnum::SinglePort:
+      return 0;
+    case MemoryPortEnum::SimpleDualPort:
+      return 1;
+    case MemoryPortEnum::TrueDualPort:
+      return 2;
+    }
+    llvm_unreachable("unhandled MemoryPortEnum");
+  };
+  return rank(a) >= rank(b);
 }
 
 // What a topology asks for, per bank. A SimpleDualPort (S2P) RAM has one

@@ -118,11 +118,11 @@ def memories(microarch) -> list[dict]:
             "width": m.width,
             "banks": m.banks,
             "writes": m.writes,
+            "storage": m.storage,
             "from_calls": m.cost.call_writes,
-            "regions": m.cost.writing_regions,
-            "needs": m.cost.ports_needed_write,
-            "needs_total": m.cost.ports_needed_total,
+            "write_ports": m.cost.write_ports,
             "read_ports": m.cost.read_ports,
+            "ports": m.cost.ports,
             "external": m.external,
         }
         for f in microarch.funcs
@@ -152,6 +152,9 @@ def area_of(q) -> dict:
         "regfile_arrays": q.regfile_arrays,
         "unmodelled": q.unmodelled,
         "counted": sorted(q.counted),
+        # Resources the design asks for more of than the part has. Per run, not
+        # summed: a total that fits says nothing about the runs inside it.
+        "over_capacity": {k: round(v, 3) for k, v in q.over_capacity.items()},
     }
 
 
@@ -545,6 +548,7 @@ def area_table(results: list[dict]) -> str:
     )
     regfile = 0
     unmodelled: dict[str, int] = {}
+    over_capacity: dict[str, str] = {}
     for r in sorted(rows, key=lambda r: -r["area"]["lut"]):
         a = r["area"]
         for f in tot:
@@ -552,6 +556,10 @@ def area_table(results: list[dict]) -> str:
         for k, n in a.get("unmodelled", {}).items():
             unmodelled[k] = unmodelled.get(k, 0) + n
         regfile += a["regfile_arrays"]
+        if a.get("over_capacity"):
+            over_capacity[f"{_key_of(r)} {r['scheduler'][:6]}"] = ", ".join(
+                f"{k} {v:.2f}x" for k, v in sorted(a["over_capacity"].items())
+            )
         lines.append(
             f"{_key_of(r):<34} {r['scheduler'][:6]:<6} {a['lut']:>8}"
             f" {a['unit_lut']:>8} {a['mux_lut']:>8} {a['control_lut']:>8}"
@@ -571,10 +579,14 @@ def area_table(results: list[dict]) -> str:
         f"the objective charges {tot['reg_bits']} flip-flops for chains "
         f"that cost {tot['reg_ff']} FF + {tot['srl']} SRL: {over:.1f}x over"
     )
-    if regfile:
+    lines.append(
+        f"storage costs {tot['mem_lut']} LUTs, of which {regfile} array(s) are "
+        f"multi-write register files (their writes exceed one copy of the row)"
+    )
+    if over_capacity:
         lines.append(
-            f"{regfile} arrays infer no RAM and cost {tot['mem_lut']} LUTs of "
-            f"register file"
+            f"OVER THE PART ({len(over_capacity)} run(s) do not fit): "
+            + ", ".join(f"{k} {v}" for k, v in sorted(over_capacity.items()))
         )
     if unmodelled:
         lines.append(f"UNMODELLED (scored as zero): {unmodelled}")

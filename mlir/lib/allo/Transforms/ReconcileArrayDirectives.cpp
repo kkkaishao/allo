@@ -3,9 +3,9 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-#include "allo-c/Schedule.h" // kPartitionAttr
+#include "allo-c/Schedule.h" // kPartitionAttr, kBindStorageAttr
 #include "allo/IR/AlloAttrs.h"
-#include "allo/Scheduling/MemoryModel.h" // joinPartitions, bankLayoutOf
+#include "allo/Scheduling/MemoryModel.h" // joinPartitions, parseBindStorage
 #include "allo/Scheduling/RegionGraph.h" // buildAndSortCallsiteGraph
 #include "allo/Support/Logging.h"
 #include "allo/Transforms/Passes.h"
@@ -17,7 +17,7 @@
 #include "llvm/ADT/DenseMap.h"
 
 namespace mlir::allo {
-#define GEN_PASS_DEF_PROPAGATEPARTITIONPASS
+#define GEN_PASS_DEF_RECONCILEARRAYDIRECTIVESPASS
 #include "allo/Transforms/Passes.h.inc"
 } // namespace mlir::allo
 
@@ -48,6 +48,19 @@ struct Carrier {
       cast<func::FuncOp>(op).setArgAttr(*argNumber, kPartitionAttr, p);
     else
       op->setAttr(kPartitionAttr, p);
+  }
+
+  DictionaryAttr bind() {
+    if (argNumber)
+      return cast<func::FuncOp>(op).getArgAttrOfType<DictionaryAttr>(
+          *argNumber, kBindStorageAttr);
+    return op->getAttrOfType<DictionaryAttr>(kBindStorageAttr);
+  }
+  void setBind(DictionaryAttr b) {
+    if (argNumber)
+      cast<func::FuncOp>(op).setArgAttr(*argNumber, kBindStorageAttr, b);
+    else
+      op->setAttr(kBindStorageAttr, b);
   }
 };
 
@@ -98,12 +111,12 @@ static std::string describeCarrier(Carrier &c) {
   return out;
 }
 
-// Union-find over carriers. Two carriers are the SAME STORAGE when a call
-// passes one as the other's argument: a sub-kernel MASTERS PORTS on the
+// Union-find over carriers. Two carriers name one physical array when a call
+// passes one as the other's argument: a sub-kernel masters ports on the
 // caller's array rather than receiving a copy. Two callsites handing different
-// arrays to one callee unify those arrays too, which is the transitive closure
-// the callee's single body demands.
-struct Storage {
+// arrays to one callee unify those arrays too, the transitive closure the
+// callee's single body demands.
+struct Arrays {
   SmallVector<Carrier> carriers;
   SmallVector<unsigned> parent;
   DenseMap<std::pair<Operation *, int>, unsigned> index;
@@ -125,9 +138,10 @@ struct Storage {
   void unite(unsigned a, unsigned b) { parent[find(a)] = find(b); }
 };
 
-struct PropagatePartitionPass
-    : public allo::impl::PropagatePartitionPassBase<PropagatePartitionPass> {
-  using PropagatePartitionPassBase::PropagatePartitionPassBase;
+struct ReconcileArrayDirectivesPass
+    : public allo::impl::ReconcileArrayDirectivesPassBase<
+          ReconcileArrayDirectivesPass> {
+  using ReconcileArrayDirectivesPassBase::ReconcileArrayDirectivesPassBase;
 
   void runOnOperation() override {
     ModuleOp module = getOperation();
@@ -141,31 +155,31 @@ struct PropagatePartitionPass
     if (failed(callsOr))
       return signalPassFailure();
 
-    Storage storage;
-    if (failed(unifyAcrossCalls(*callsOr, storage)))
+    Arrays arrays;
+    if (failed(unifyAcrossCalls(*callsOr, arrays)))
       return signalPassFailure();
 
     // Group in discovery order: the diagnostics below name the carriers that
     // disagree, and a hashed iteration would leave WHICH one to the allocator.
     SmallVector<SmallVector<unsigned>> classes;
     DenseMap<unsigned, unsigned> classOf;
-    for (unsigned i = 0, e = storage.carriers.size(); i < e; ++i) {
-      auto [slot, fresh] = classOf.try_emplace(storage.find(i), classes.size());
+    for (unsigned i = 0, e = arrays.carriers.size(); i < e; ++i) {
+      auto [slot, fresh] = classOf.try_emplace(arrays.find(i), classes.size());
       if (fresh)
         classes.emplace_back();
       classes[slot->second].push_back(i);
     }
 
     for (ArrayRef<unsigned> members : classes)
-      if (failed(reconcile(storage, members)))
+      if (failed(reconcile(arrays, members)) ||
+          failed(reconcileBinding(arrays, members)))
         return signalPassFailure();
   }
 
   // One carrier per array per function, unified along every call-argument edge.
   // An async spawn is a `func.call` like any other, so a dataflow process's
   // parameters join the same class its container's buffer is in.
-  LogicalResult unifyAcrossCalls(ArrayRef<Operation *> calls,
-                                 Storage &storage) {
+  LogicalResult unifyAcrossCalls(ArrayRef<Operation *> calls, Arrays &arrays) {
     SymbolTableCollection syms;
     for (Operation *op : calls) {
       auto call = cast<func::CallOp>(op);
@@ -180,11 +194,11 @@ struct PropagatePartitionPass
         Carrier param{callee, unsigned(k), type};
         std::optional<Carrier> array = carrierOf(actual);
         if (array) {
-          storage.unite(storage.add(*array), storage.add(param));
+          arrays.unite(arrays.add(*array), arrays.add(param));
           continue;
         }
-        // An array whose storage this pass cannot name propagates nothing; a
-        // partition stated at one end has no carrier to reconcile the other on.
+        // An array this pass cannot name a carrier for reconciles nothing; a
+        // directive stated at one end has nowhere to reach the other.
         BankLayout here = bankLayoutOf(actual);
         if (!param.part() && here.numBanks == 1 && !here.registers)
           continue;
@@ -203,11 +217,11 @@ struct PropagatePartitionPass
   // carriers, then write the result back to all of them. ONE sweep reaches the
   // fixpoint, since which carriers denote one array follows from the call graph
   // alone and never from the attributes, and the join is associative.
-  LogicalResult reconcile(Storage &storage, ArrayRef<unsigned> members) {
-    MemRefType type = storage.carriers[members.front()].type;
+  LogicalResult reconcile(Arrays &arrays, ArrayRef<unsigned> members) {
+    MemRefType type = arrays.carriers[members.front()].type;
     PartitionAttr joined;
     for (unsigned m : members) {
-      Carrier &c = storage.carriers[m];
+      Carrier &c = arrays.carriers[m];
       assert(c.type.getRank() == type.getRank() &&
              "a call argument and its parameter have the same memref type");
       PartitionAttr here = c.part();
@@ -223,7 +237,7 @@ struct PropagatePartitionPass
              << ". One array has one layout, and a sub-kernel addresses it in "
                 "the banks its caller allocated. The array is named by:";
         for (unsigned n : members)
-          diag << "\n  -> " << describeCarrier(storage.carriers[n]);
+          diag << "\n  -> " << describeCarrier(arrays.carriers[n]);
         return failure();
       }
       joined = *next;
@@ -232,7 +246,7 @@ struct PropagatePartitionPass
       return success();
 
     for (unsigned m : members) {
-      Carrier &c = storage.carriers[m];
+      Carrier &c = arrays.carriers[m];
       if (c.part() == joined)
         continue;
       // Reaching the top's arguments changes the DESIGN's boundary: each bank
@@ -244,6 +258,64 @@ struct PropagatePartitionPass
             << " its sub-kernels agree on, so the design's boundary now "
                "carries one port group per bank";
       c.setPart(joined);
+    }
+    return success();
+  }
+
+  // Settle the same array's `allo.bind.storage`. Its two axes reconcile
+  // differently.
+  //
+  // `impl` names the structure and one array is held in one of them, so two
+  // carriers naming different rows are refused whatever their timing: rows of
+  // equal latency are still different hardware and only one gets built.
+  //
+  // `type` asks for a port topology and those form a chain, so the carriers
+  // take the one that covers the others. A side that asked for less is not in
+  // conflict; it used fewer of the ports the array has.
+  LogicalResult reconcileBinding(Arrays &arrays, ArrayRef<unsigned> members) {
+    DictionaryAttr impl, port; // the carrier each axis was taken from
+    for (unsigned m : members) {
+      Carrier &c = arrays.carriers[m];
+      DictionaryAttr here = c.bind();
+      if (!here)
+        continue;
+      BindStorage bs = parseBindStorage(here);
+      if (!bs.storage.empty()) {
+        if (impl && parseBindStorage(impl).storage != bs.storage) {
+          auto diag = error(Stage::Prep, Code::StorageConflict, c.op);
+          diag
+              << "Array storage conflict: " << describeCarrier(c)
+              << " is bound to '" << bs.storage << "' and the same array to '"
+              << parseBindStorage(impl).storage
+              << "' elsewhere. One array is held in one structure, and a "
+                 "sub-kernel masters a port on the caller's, so the two cannot "
+                 "both be built. The array is named by:";
+          for (unsigned n : members)
+            diag << "\n  -> " << describeCarrier(arrays.carriers[n]);
+          return failure();
+        }
+        impl = here;
+      }
+      // The most capable topology wins, and with it the string that spelled it,
+      // so nothing here has to compose a `type` the vocabulary may not have.
+      if (bs.port &&
+          (!port || !topologyCovers(*parseBindStorage(port).port, *bs.port)))
+        port = here;
+    }
+    if (!impl && !port)
+      return success();
+
+    MLIRContext *ctx = &getContext();
+    SmallVector<NamedAttribute> fields;
+    if (port)
+      fields.emplace_back(StringAttr::get(ctx, "type"), port.get("type"));
+    if (impl)
+      fields.emplace_back(StringAttr::get(ctx, "impl"), impl.get("impl"));
+    auto joined = DictionaryAttr::get(ctx, fields);
+    for (unsigned m : members) {
+      Carrier &c = arrays.carriers[m];
+      if (c.bind() != joined)
+        c.setBind(joined);
     }
     return success();
   }

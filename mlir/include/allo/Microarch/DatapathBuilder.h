@@ -189,10 +189,15 @@ struct DatapathBuilder {
   /// `MemUnit::Access::port` / `CallUnit::MemArg::port`. \p writes picks a
   /// direction, or nullopt takes both together. \p base offsets the numbering
   /// so a second, separate colouring cannot collide with the first.
-  PortCounts bindPorts(MemUnit &m, std::optional<bool> writes, unsigned base);
+  ///
+  /// Returns nullopt only from a both-directions pass whose writes did not
+  /// split, which it cannot express; the binding is then left untouched. A pass
+  /// given a direction always binds.
+  std::optional<PortCounts> bindPorts(MemUnit &m, std::optional<bool> writes,
+                                      unsigned base);
   /// Decide each memory's `MemUnit::Realization`. Runs after
-  /// `bindMemoryPorts`, whose port counts separate a RAM from the register
-  /// file an over-budget array falls to.
+  /// `bindMemoryPorts`, whose port counts are what separate an array that fits
+  /// its row from one that overruns it.
   void classifyRealizations();
   /// Record each top-level region's composition predecessors
   /// (`rb.predecessors`): the earlier top-level siblings it must start after.

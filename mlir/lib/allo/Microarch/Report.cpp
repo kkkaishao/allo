@@ -124,6 +124,9 @@ FuncUarch::FuncUarch(const Datapath &dp, llvm::StringRef symbol,
     mr.cost.readPorts = m.readPortsBuilt;
     mr.cost.writePorts = m.writePortsBuilt;
     mr.cost.ports = m.portsBuilt;
+    mr.cost.replicas = m.replicas();
+    mr.cost.rowReads = m.ports.reads.value_or(0);
+    mr.cost.rowWrites = m.ports.writes.value_or(0);
     mr.realization = realizationName(m.realization);
     mr.external = m.external;
     mr.scattered = m.scattered;
@@ -242,6 +245,9 @@ std::string MicroarchReport::toJSON() const {
                   j.attribute("read_ports", (int64_t)m.cost.readPorts);
                   j.attribute("write_ports", (int64_t)m.cost.writePorts);
                   j.attribute("ports", (int64_t)m.cost.ports);
+                  j.attribute("replicas", (int64_t)m.cost.replicas);
+                  j.attribute("row_reads", (int64_t)m.cost.rowReads);
+                  j.attribute("row_writes", (int64_t)m.cost.rowWrites);
                 });
                 j.attribute("external", m.external);
                 j.attribute("scattered", m.scattered);

@@ -60,7 +60,7 @@ def run_schedule(
         f"unroll-under-pipeline={'true' if prepass.unroll_under_pipeline else 'false'} "
         f"perfectize={'true' if prepass.perfectize else 'false'}}}"
     )
-    part = f"propagate-partition{{top={top}}}"
+    part = f"reconcile-array-directives{{top={top}}}"
     scalarize = f"scalarize-memory{{max-elements={prepass.scalarize_threshold}}}"
     pipeline = (
         f"builtin.module(canonicalize,cse,func.func(raise-to-affine,cse,"
