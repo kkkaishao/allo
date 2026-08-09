@@ -139,6 +139,11 @@ def area_of(q) -> dict:
         "ff": q.area.ff,
         "dsp": q.area.dsp,
         "carry8": q.area.carry8,
+        # The two memory primitives. Without them a row-selection change reads
+        # as pure LUT savings, the cost having moved somewhere the table does
+        # not show.
+        "bram36": q.area.bram36,
+        "uram288": q.area.uram288,
         "unit_lut": lut.get("units", 0),
         "mux_lut": lut.get("muxes", 0),
         "reg_lut": lut.get("regs", 0),
@@ -528,7 +533,7 @@ def area_table(results: list[dict]) -> str:
     head = (
         f"{'benchmark/variant':<34} {'sched':<6} {'LUT':>8} {'untLUT':>8}"
         f" {'muxLUT':>8} {'ctlLUT':>8} {'memLUT':>8} {'SRL':>6} {'DSP':>5}"
-        f" {'regFF':>8} {'decFF':>8} {'ramKb':>7}"
+        f" {'BRAM':>5} {'URAM':>5} {'regFF':>8} {'decFF':>8} {'ramKb':>7}"
     )
     lines = [head, "-" * len(head)]
     tot = dict.fromkeys(
@@ -540,6 +545,8 @@ def area_table(results: list[dict]) -> str:
             "mem_lut",
             "srl",
             "dsp",
+            "bram36",
+            "uram288",
             "reg_ff",
             "reg_bits",
             "mem_bits",
@@ -563,14 +570,16 @@ def area_table(results: list[dict]) -> str:
         lines.append(
             f"{_key_of(r):<34} {r['scheduler'][:6]:<6} {a['lut']:>8}"
             f" {a['unit_lut']:>8} {a['mux_lut']:>8} {a['control_lut']:>8}"
-            f" {a['mem_lut']:>8} {a['srl']:>6} {a['dsp']:>5} {a['reg_ff']:>8}"
-            f" {a['reg_bits']:>8} {a['mem_bits'] / 1024:>7.1f}"
+            f" {a['mem_lut']:>8} {a['srl']:>6} {a['dsp']:>5}"
+            f" {a.get('bram36', 0):>5} {a.get('uram288', 0):>5}"
+            f" {a['reg_ff']:>8} {a['reg_bits']:>8} {a['mem_bits'] / 1024:>7.1f}"
         )
     lines.append("-" * len(head))
     lines.append(
         f"{'TOTAL':<34} {'':<6} {tot['lut']:>8} {tot['unit_lut']:>8}"
         f" {tot['mux_lut']:>8} {tot['control_lut']:>8} {tot['mem_lut']:>8}"
-        f" {tot['srl']:>6} {tot['dsp']:>5} {tot['reg_ff']:>8}"
+        f" {tot['srl']:>6} {tot['dsp']:>5} {tot['bram36']:>5}"
+        f" {tot['uram288']:>5} {tot['reg_ff']:>8}"
         f" {tot['reg_bits']:>8} {tot['mem_bits'] / 1024:>7.1f}"
     )
     over = tot["reg_bits"] / max(tot["reg_ff"], 1)
@@ -580,8 +589,9 @@ def area_table(results: list[dict]) -> str:
         f"that cost {tot['reg_ff']} FF + {tot['srl']} SRL: {over:.1f}x over"
     )
     lines.append(
-        f"storage costs {tot['mem_lut']} LUTs, of which {regfile} array(s) are "
-        f"multi-write register files (their writes exceed one copy of the row)"
+        f"storage costs {tot['mem_lut']} LUTs, {tot['bram36']} BRAM and "
+        f"{tot['uram288']} URAM, of which {regfile} array(s) are multi-write "
+        f"register files (their writes exceed one copy of the row)"
     )
     if over_capacity:
         lines.append(
