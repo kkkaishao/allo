@@ -507,7 +507,7 @@ StallShell DatapathEmitter::deriveStallShell(const uarch::RegionBlock &rb,
       sent.push_back({in, flag, valid, streamReady(s)});
     }
     auto &drv = streamDrives[s.id];
-    drv.data.push_back({valid, resolveSource(acc.data)});
+    drv.puts.push_back({valid, Value(), resolveSource(acc.data)});
     drv.valid = drv.valid ? c.orBits(drv.valid, valid) : valid;
     // A stage-0 put keys its hazard on the pass that would write it (`fed` &
     // pred); a stage>=1 put's valid is already registered (delayed) and
@@ -601,14 +601,11 @@ void DatapathEmitter::finalizeStreamPorts() {
     }
     const StreamDrive &drv = streamDrives[s.id];
     // The puts' pulses are mutually exclusive (one access per cycle), so the
-    // data mux is a plain priority chain over them; the last arm is the
-    // fall-through, read only when `valid` is low and thus a don't-care.
+    // token is the same one-hot select every shared port takes; nothing reads
+    // it while `valid` is low.
     auto putData = [&] {
-      assert(!drv.data.empty() && "a written channel with no put");
-      Value data = drv.data.back().second;
-      for (unsigned k = drv.data.size() - 1; k-- > 0;)
-        data = c.mux(drv.data[k].first, drv.data[k].second, data);
-      return data;
+      assert(!drv.puts.empty() && "a written channel with no put");
+      return commitSink(drv.puts, Idle::DontCare).data;
     };
     if (s.internal) {
       emitInternalChannel(s, putData());

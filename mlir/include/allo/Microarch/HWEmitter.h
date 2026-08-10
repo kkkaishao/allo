@@ -254,68 +254,72 @@ struct DatapathEmitter {
   DenseMap<unsigned, circt::Backedge> unitBE;    // unit id -> result backedge
   DenseMap<unsigned, Value> muxVal;              // mux id -> resolved output
 
+  /// ONE ACCESSOR's drive of a shared physical port: the terms it presents and
+  /// the pulse that says it is presenting. A port is reached by several
+  /// accessors (the accesses of different regions, a child mastering it) while
+  /// each of `hw.output`, `seq.write` and an element register takes it exactly
+  /// once, so an arm is BUILT where its accessor emits, since the terms are
+  /// accessor state (delayed counters, a stall hold, a child's own output), and
+  /// only COMBINED once every region has emitted. `commitSink` is that combine
+  /// and is the same rule for every port below.
+  struct SinkArm {
+    /// This accessor is driving now: a store's commit pulse, a region's
+    /// accesses presenting, a child's run window. Null only where the arm holds
+    /// the port alone and drives it unconditionally.
+    Value fired;
+    Value addr; // null on a sink that carries no address
+    Value data; // null on a sink that carries no datum
+  };
+  /// What a shared port carries in a cycle no arm fires.
+  enum class Idle {
+    DontCare, // nothing samples it: a write whose enable is low
+    Hold,     // it must keep the last value: an address bus another region owns
+  };
+  /// Reduce \p arms onto one driver per term, plus the OR of their pulses. At
+  /// most one arm fires in a cycle (`portGraph` separates any two that could
+  /// overlap), so the priority order carries no meaning.
+  SinkArm commitSink(ArrayRef<SinkArm> arms, Idle idle);
+
   /// One channel's port drives, accumulated over every access to it: a FIFO has
   /// a single {data,valid,ready} triple that several accesses time-share, and
   /// `hw.output` takes each port exactly once, so `finalizeStreamPorts` drives
   /// the ports after all regions have emitted.
   struct StreamDrive {
-    Value valid;                                  // OR of the puts' pulses
-    Value ready;                                  // OR of the gets' pulses
-    SmallVector<std::pair<Value, Value>, 1> data; // (put pulse, its data)
+    Value valid;                  // OR of the puts' pulses
+    Value ready;                  // OR of the gets' pulses
+    SmallVector<SinkArm, 1> puts; // each put's pulse and the token it presents
   };
   SmallVector<StreamDrive> streamDrives; // by StreamId (sized on first use)
 
-  /// One store to a scattered argument, as its element ports see it. The SAME
-  /// N ports are shared by every write to that argument, so they cannot be
-  /// driven where the store is emitted; `finalizeScatteredPorts` drives each
-  /// element once, after all regions have emitted. The commit pulse is
-  /// region-scoped (timed against that region's stall shell and issue), which
-  /// is why it is BUILT at the store and only COMBINED there.
-  struct ScatterWrite {
-    Value we;    // this store's commit pulse
-    Value index; // the element it targets, at the memory's address width
-    Value data;  // the datum it presents
-  };
-  DenseMap<unsigned, SmallVector<ScatterWrite, 1>> scatterWrites; // by MemId
+  /// Stores to a scattered memory, by MemId: `addr` is the element targeted, at
+  /// the memory's address width, and the commit demuxes each arm onto every
+  /// element. `finalizeScatteredPorts` drives an argument's element ports or
+  /// builds an internal array's registers from them.
+  DenseMap<unsigned, SmallVector<SinkArm, 1>> scatterWrites;
 
   /// One store to an internal array, held back so the stores COLOURED onto the
   /// same write port can be muxed onto one `seq.write`. A port per static write
   /// defeats block-RAM inference and drops the array into a register file; the
   /// colouring spreads the stores over at most two ports, which infer a true
-  /// dual port. Combined by `finalizeSharedWritePorts`, for the same reason
-  /// `ScatterWrite` exists: the writes come from different regions and calls,
-  /// so a port can only be driven once all of them have emitted.
+  /// dual port. The bank and port ROUTE the arm; they are not part of what it
+  /// presents.
   struct SharedWrite {
     unsigned bank; // the bank this store commits to (0 when unbanked)
     unsigned port; // the write port it was coloured onto
-    Value addr;
-    Value data;
-    Value we; // commit pulse, already delayed for the device write latency
+    SinkArm arm;   // `fired` already delayed for the device write latency
   };
   DenseMap<unsigned, SmallVector<SharedWrite, 2>> sharedWrites; // by MemId
 
-  /// What ONE ACCESSOR presents on a shared read port: a region's own accesses,
-  /// having already selected between themselves (`sharedAddress`), or a child
-  /// driving the port it masters. An address is accessor state (delayed
-  /// counters, a stall hold, a child's own output), so it is BUILT where the
-  /// accessor emits and only COMBINED by `finalizeSharedReadPorts`. Two levels,
-  /// because the two selects are different signals: within a region an access's
-  /// activation pulse, between accessors which of them is driving.
-  struct SharedRead {
-    Value addr;
-    /// This accessor is driving now: a region's accesses presenting, or a
-    /// child's run window. Null where it holds the port alone and drives it
-    /// unconditionally.
-    Value fired;
-  };
   /// One shared read port, keyed by (memory, bank, port). The `seq.read` is
   /// built by `sharedReadPort` when the first access on it emits and its datum
   /// is available from that moment, which is what lets every access take it
-  /// before the address that fetches it exists.
+  /// before the address that fetches it exists. An arm's `fired` is the second
+  /// of two selects: within a region `sharedAddress` has already picked between
+  /// that region's own accesses.
   struct SharedReadPort {
     Value data;
     circt::Backedge addr;
-    SmallVector<SharedRead, 1> arms;
+    SmallVector<SinkArm, 1> arms;
   };
   /// A MapVector for the same reason `boundaryWrites` is one: the finalize
   /// iterates it to drive the ports, and the module must not depend on a hash
@@ -323,23 +327,16 @@ struct DatapathEmitter {
   llvm::MapVector<std::tuple<unsigned, unsigned, unsigned>, SharedReadPort>
       sharedReads;
 
-  /// The same, for a store to an external array. The port group is a module
-  /// output that several stores may drive, so only `finalizeBoundaryWritePorts`
-  /// drives it, once every region has emitted. Indexed by
+  /// Stores to an external array's port group, indexed by
   /// `MemUnit::Access::portIdx`, the group's slot in `Datapath::writePorts`.
-  struct BoundaryWrite {
-    Value addr;
-    Value data;
-    Value we;
-  };
   /// A MapVector, not a DenseMap: `finalizeBoundaryWritePorts` iterates it to
   /// drive the ports, and the emitted module must not depend on a hash order.
-  llvm::MapVector<unsigned, SmallVector<BoundaryWrite, 2>> boundaryWrites;
+  llvm::MapVector<unsigned, SmallVector<SinkArm, 2>> boundaryWrites;
 
   /// The same for a boundary READ port group's address output, indexed by
   /// `MemUnit::Access::portIdx`. A group the reads of several regions share is
   /// one module output, so only `finalizeSharedReadPorts` may drive it.
-  llvm::MapVector<unsigned, SmallVector<SharedRead, 1>> boundaryReads;
+  llvm::MapVector<unsigned, SmallVector<SinkArm, 1>> boundaryReads;
 
   /// A kernel-local channel's body wires: what a boundary channel reads off its
   /// module ports, an internal one reads off its own `seq.fifo`. Backedges,
@@ -595,11 +592,6 @@ struct DatapathEmitter {
   /// output likewise. Call exactly once, with the same timing as the write
   /// finalizes.
   void finalizeSharedReadPorts();
-  /// The address bus \p arms drive between them: the one region's address where
-  /// it holds the port alone, otherwise a priority mux over which of them is
-  /// presenting, falling back to a register holding the last address so a read
-  /// frozen mid-flight keeps re-presenting it.
-  Value regionSelectedAddress(ArrayRef<SharedRead> arms);
   /// Whether the reads on boundary port group \p portIdx of \p m sit in more
   /// than one region, so the group needs a select over which is presenting.
   static bool multiRegionPort(const uarch::MemUnit &m, unsigned portIdx);
