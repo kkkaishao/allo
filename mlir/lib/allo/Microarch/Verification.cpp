@@ -386,6 +386,23 @@ void assertModelInvariants(const Datapath &dp) {
             containerOwnsNoDatapath(rb, dp)) &&
            "a counted container reached emission carrying work of its own; the "
            "reifier gives every run of loose ops a child region");
+    // A container's own units are the gating logic its children read, not a
+    // datapath: it has no per-iteration issue pulse to time a recurrence
+    // identity against. A COUNTED one's predicate is sampled in-cycle, where a
+    // conditional one's condition cone may take `t_cond` cycles and so may be
+    // an IP.
+    if (rb.shape != RegionBlock::Shape::Container)
+      continue;
+    for (UnitId uid : rb.units) {
+      const FuncUnit &u = dp.units[uid];
+      assert(llvm::all_of(
+                 u.inputInits,
+                 [](llvm::ArrayRef<Source> inits) { return inits.empty(); }) &&
+             "a container's own unit carries a recurrence init, which it has "
+             "no issue pulse to time");
+      assert((u.identity.comb || rb.conditional) &&
+             "a counted container's own unit must be native (comb)");
+    }
   }
 
   // `verify-rtl-legality` owns the shapes a CONCURRENT container admits and the

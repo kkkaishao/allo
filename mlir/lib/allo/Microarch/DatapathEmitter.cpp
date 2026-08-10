@@ -254,29 +254,10 @@ void DatapathEmitter::declareUnits(const uarch::RegionBlock &rb) {
 
 // Compute units of region \p rb: native -> comb; IP -> an instance of the
 // extern operator module, internally pipelined by its latency.
-void DatapathEmitter::emitUnits(const uarch::RegionBlock &rb, UnitMode mode) {
-  // A leaf's backedges are declared earlier, before its reads resolve; a
-  // container's units are the last thing it emits, so they declare their own.
-  if (mode == UnitMode::Container)
-    declareUnits(rb);
+void DatapathEmitter::emitUnits(const uarch::RegionBlock &rb) {
   StallShell sh = shellFor(rb.id);
   for (uarch::UnitId uid : rb.units) {
     const uarch::FuncUnit &u = dp.units[uid];
-    if (mode != UnitMode::Leaf) {
-      // Skipping the recurrence re-injection below is a no-op here rather than
-      // a silent drop: a container has no per-iteration issue pulse to time one
-      // against.
-      assert(llvm::all_of(u.inputInits,
-                          [](llvm::ArrayRef<uarch::Source> inits) {
-                            return inits.empty();
-                          }) &&
-             "a container's own unit carries no recurrence init");
-      // A guard predicate is a start-0 compute the children gate on, so the IP
-      // path is unreachable for it; a while's condition cone may take cycles
-      // (`t_cond`), which its mode says.
-      assert((u.identity.comb || mode == UnitMode::Condition) &&
-             "a container predicate must be a native (comb) unit");
-    }
     SmallVector<Value> operands;
     for (unsigned k = 0; k < u.inputs.size(); ++k) {
       Value v =
@@ -285,19 +266,19 @@ void DatapathEmitter::emitUnits(const uarch::RegionBlock &rb, UnitMode mode) {
       // spends below the recurrence distance, each gated by the issue pulse
       // delayed to this op's stage. Innermost first, so a later iteration's mux
       // sits nearer the port and the windows need no mutual exclusion. A shared
-      // port carries none: its identities are arms of the input mux above.
-      if (mode == UnitMode::Leaf)
-        for (auto [n, init] : llvm::enumerate(u.inputInits[k])) {
-          Value issue = controlOf.lookup(rb.id).issue;
-          assert(issue && "recurrence input in a region with no controller");
-          Value iterN = c.R(comb::AndOp::create(c.b, c.loc, issue,
-                                                atIteration(rb, n), false));
-          // A recurrence input belongs to an unshared unit (a shared port
-          // carries its identities as mux arms), so the one bound op's stage is
-          // the gate's.
-          Value gate = c.activationPulse(iterN, u.boundOps.front().stage, sh);
-          v = c.mux(gate, resolveSource(init), v);
-        }
+      // port carries none: its identities are arms of the input mux above, and
+      // a container's own units carry none at all.
+      for (auto [n, init] : llvm::enumerate(u.inputInits[k])) {
+        Value issue = controlOf.lookup(rb.id).issue;
+        assert(issue && "recurrence input in a region with no controller");
+        Value iterN = c.R(
+            comb::AndOp::create(c.b, c.loc, issue, atIteration(rb, n), false));
+        // A recurrence input belongs to an unshared unit (a shared port
+        // carries its identities as mux arms), so the one bound op's stage is
+        // the gate's.
+        Value gate = c.activationPulse(iterN, u.boundOps.front().stage, sh);
+        v = c.mux(gate, resolveSource(init), v);
+      }
       operands.push_back(v);
     }
 
@@ -342,19 +323,13 @@ void DatapathEmitter::emitUnits(const uarch::RegionBlock &rb, UnitMode mode) {
 std::pair<Value, unsigned>
 DatapathEmitter::emitConditionRegion(const uarch::RegionBlock &rb,
                                      const uarch::Source &condSrc) {
-  // Same emission order as a leaf region's `emit`, but over this container's
-  // OWN condition cone: `UnitMode::Condition`.
-  emitRegisters(rb);
-  declareUnits(rb);
-  // No issue pulse here, and none is needed: a container's condition reads are
-  // continuous reads of a stable element, which `bindMemoryPorts` keeps one to
-  // a port for exactly that reason.
-  emitReads(rb, /*issue=*/Value());
-  emitUnits(rb, UnitMode::Condition);
-  resolveRegHeads(rb);
-  // The condition's own external reads address by the survivor, so this runs
-  // after emitUnits, exactly as in a leaf region's `emit`.
-  emitExternalReadAddrs(rb, /*issue=*/Value());
+  // The same order a leaf region's datapath emits in, over this container's own
+  // condition cone. No issue pulse here, and none is needed: the cone's reads
+  // are continuous reads of a stable element, which `bindMemoryPorts` keeps one
+  // to a port for exactly that reason.
+  emitBeforeUnits(rb, /*issue=*/Value());
+  emitUnits(rb);
+  emitAfterUnits(rb, /*issue=*/Value());
   return {resolveSource(condSrc), readyCycle(condSrc)};
 }
 
@@ -966,22 +941,31 @@ void DatapathEmitter::emitCalls(const uarch::RegionBlock &rb, Value issue,
 DatapathFeedback DatapathEmitter::emit(const uarch::RegionBlock &rb,
                                        Value issue) {
   bindStreamReads(rb);
-  emitRegisters(rb);
-  declareUnits(rb); // unit backedges must exist before a read address resolves
-  emitReads(rb, issue);
+  emitBeforeUnits(rb, issue);
   DatapathFeedback fb;
-  // Calls precede units/reg-heads/accesses: a call's scalar result is an
-  // ordinary Source a chained unit reads directly. The reverse edge (a call
-  // operand computed by this region's unit) closes through the unit backedges.
+  // Calls precede the units: a call's scalar result is an ordinary Source a
+  // chained unit reads directly. The reverse edge (a call operand computed by
+  // this region's unit) closes through the unit backedges.
   emitCalls(rb, issue, fb);
   emitUnits(rb);
-  resolveRegHeads(rb);
-  // Both run after the units: a boundary read's address and a store's data may
-  // be computed by one, and only here is that a filled value rather than a
-  // dangling backedge.
-  emitExternalReadAddrs(rb, issue);
+  emitAfterUnits(rb, issue);
+  // Last of all: a store's data may be computed by a unit, and only here is
+  // that a filled value rather than a dangling backedge.
   emitWrites(rb, issue, fb);
   return fb;
+}
+
+void DatapathEmitter::emitBeforeUnits(const uarch::RegionBlock &rb,
+                                      Value issue) {
+  emitRegisters(rb);
+  declareUnits(rb);
+  emitReads(rb, issue);
+}
+
+void DatapathEmitter::emitAfterUnits(const uarch::RegionBlock &rb,
+                                     Value issue) {
+  resolveRegHeads(rb);
+  emitExternalReadAddrs(rb, issue);
 }
 
 } // namespace mlir::allo::uarch

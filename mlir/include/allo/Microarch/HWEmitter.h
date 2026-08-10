@@ -456,6 +456,17 @@ struct DatapathEmitter {
   /// Region \p region's stall shell; rigid for an unregistered region.
   StallShell shellFor(unsigned region) const { return shellOf.lookup(region); }
 
+  /// A region's datapath emits in ONE order, and the units are its pivot: the
+  /// pair below states that order once for both the leaf path (`emit`) and a
+  /// container's condition cone (`emitConditionRegion`).
+  ///
+  /// Before: the delay chains, the unit backedges (a read address may read a
+  /// unit emitted later) and the reads, whose data the units consume.
+  void emitBeforeUnits(const uarch::RegionBlock &rb, Value issue);
+  /// After: the register heads, then the boundary read addresses, which may be
+  /// computed by a unit and so need its filled value rather than its backedge.
+  void emitAfterUnits(const uarch::RegionBlock &rb, Value issue);
+
   void emitRegisters(const uarch::RegionBlock &rb);
   /// Backedge every unit output before any consumer resolves it, so a read
   /// address or another unit input may reference a unit emitted later.
@@ -487,26 +498,11 @@ struct DatapathEmitter {
   /// are `emitReads`. Runs after the units, so an address computed by
   /// one resolves to its filled value rather than a dangling backedge.
   void emitExternalReadAddrs(const uarch::RegionBlock &rb, Value issue);
-  /// Where a region's units are being emitted from, which decides whether a
-  /// recurrence input re-injects its reduction identity.
-  enum class UnitMode {
-    /// A leaf region: it has a per-iteration issue pulse, so a loop-carried
-    /// input re-injects `inputInits[k][n]` on its n-th run. Its backedges are
-    /// declared earlier, before the reads resolve.
-    Leaf,
-    /// A container's own PREDICATE units, a start-0 combinational compute over
-    /// the counter and iter-arg survivors. A container has no issue pulse, and
-    /// correspondingly no recurrence init to re-inject. Declares its own
-    /// backedges, after the survivors are set and before the children are
-    /// sequenced, so a child guard reads its parent's predicate.
-    Container,
-    /// A sequential while's own CONDITION cone (`emitConditionRegion`). Same
-    /// no-recurrence rule as `Container`, but the cone may be MULTI-CYCLE (a
-    /// memory read or an IP compare), which is what the CHECK/RUN regime's
-    /// `t_cond` wait exists for, so it carries no `comb` restriction.
-    Condition,
-  };
-  void emitUnits(const uarch::RegionBlock &rb, UnitMode mode = UnitMode::Leaf);
+  /// Region \p rb's compute units: native -> comb, IP -> an instance of the
+  /// extern operator module. A loop-carried input re-injects `inputInits[k][n]`
+  /// on the n-th iteration; a container's own units carry none
+  /// (`assertModelInvariants`), so this is the same code wherever it runs.
+  void emitUnits(const uarch::RegionBlock &rb);
   /// Emit a sequential (CHECK/RUN) while's condition cone: the container's OWN
   /// condition memory reads plus its compute. Returns the settled condition
   /// with its ready latency `t_cond`, the cycles after CHECK-start at which it

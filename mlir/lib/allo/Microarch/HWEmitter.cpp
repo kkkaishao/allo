@@ -339,7 +339,9 @@ Value HWEmitter::emitContainer(const uarch::RegionBlock &rb, Value start) {
   // The container's own combinational units (a nested guard's predicate over
   // this counter) emit once the counter and iter-arg survivors are live, so a
   // guard child reads its predicate as a Source::Unit when it emits below.
-  datapath.emitUnits(rb, DatapathEmitter::UnitMode::Container);
+  // They are the last thing it emits, so they declare their own backedges.
+  datapath.declareUnits(rb);
+  datapath.emitUnits(rb);
 
   lastDrain.setValue(ctx.risingEdge(sequence(rb.children, ic.rc.issue,
                                              /*retrig=*/true)));
