@@ -57,19 +57,19 @@ struct DatapathBuilder {
   llvm::DenseMap<Value, Source> ioOf;
   llvm::DenseMap<Operation *, unsigned> regionIdxOf;
 
-  // Interconnect-derivation scratch (transient; see deriveInterconnect).
-  // A register is keyed by (held value, consuming region): the SAME value (an
-  // enclosing loop's counter) can be read in several nested regions, each
-  // needing its own delay chain built in its own region.
+  // Interconnect-derivation scratch (transient; see resolveEdges).
+  // A delay chain is keyed by (held value, consuming region): the SAME value
+  // (an enclosing loop's counter) can be read in several nested regions, each
+  // needing its own chain built in its own region.
   using RegKey = std::pair<::mlir::Value, unsigned>;
-  struct RegDepth { // a register-fed input slot, patched once its chain exists
-    Source *slot;
-    RegKey key;
-    unsigned depth;
-  };
-  struct RegHead { // what drives a chain's head, and when it lands there
-    Source base;
-    unsigned ready;
+  struct Edge {  // an input slot's driver, and the delay it owes before landing
+    Source base; // what drives the head of the chain
+    RegKey key;  // the chain this slot taps
+    unsigned depth; // the tap it reads
+    unsigned ready; // cycle `base` lands at within its iteration
+    // The address reduction folded this operand into a scaled counter, so no
+    // chain owes it a tap and its slot stays empty.
+    bool reduced = false;
   };
   struct MuxBuild { // one slot's per-op drivers, muxed after the chains exist
     Source *slot;
@@ -79,9 +79,9 @@ struct DatapathBuilder {
     llvm::SmallVector<Source, 2> sources;    // parallel to ops
     llvm::SmallVector<Mux::Phase, 2> phases; // parallel to ops
   };
-  llvm::MapVector<RegKey, llvm::SmallVector<unsigned>> depthsByKey;
-  llvm::DenseMap<RegKey, RegHead> headByKey;
-  llvm::SmallVector<RegDepth> pending;
+  // Keyed by the slot each edge will patch, which takes at most one: the
+  // address reduction withdraws by slot, and chains are built in record order.
+  llvm::MapVector<Source *, Edge> edges;
   std::deque<MuxBuild> muxBuilds; // a deque so `record`'s slot pointers into
                                   // `sources` survive later pushes
 
@@ -253,20 +253,21 @@ struct DatapathBuilder {
   /// plus the one edge that does not read \p v at all (an un-latched own
   /// iter-arg = the loop recurrence).
   Resolved resolveOperand(Value v, Operation *consumer, unsigned ii);
-  /// Materialize one shift-register chain carrying \p key, deep enough for the
-  /// largest of \p depths, with a tap at each distinct depth. Returns its id.
-  RegId insertRegister(Value key, ArrayRef<unsigned> depths, RegHead head,
-                       RegionId region);
-  /// Resolve every unit input / memory address / store-data / stream driver,
-  /// threading non-zero-depth edges through inserted register chains.
-  void deriveInterconnect();
+  /// Resolve every unit input / memory address / store-data / stream driver
+  /// into an `Edge`. Records what each slot reads and how late; materializes
+  /// nothing, so what the delays cost is still open when it returns.
+  void resolveEdges();
+  /// Realize the delays the edges owe: the address reduction first, since a
+  /// term it folds into a scaled counter withdraws its edge, then the chains
+  /// over what is left, then the muxes that pick between them.
+  void realizeDelays();
   /// Size the (empty) input-slot vectors every resolve phase fills.
   void allocateInputSlots();
   /// Group a skewed memory's accesses into lanes that can share one port per
   /// bank, or leave it crossbarring when they cannot.
   void assignLanes(MemUnit &m);
   /// Record a resolved edge into \p slot: a depth-0 edge ties directly, a
-  /// deeper one is deferred (its register chain is built in insertRegisters).
+  /// deeper one is deferred to `edges` and patched by `insertRegisters`.
   void recordEdge(const Resolved &r, Source &slot, unsigned regionIdx);
   /// `recordEdge` for a slot that is a bare Source with no input port beside it
   /// to hold a recurrence identity (`FuncUnit::inputInits`): an address, a
@@ -280,10 +281,11 @@ struct DatapathBuilder {
   /// Resolve every memory address / store data and stream data + predicate.
   void resolveAccessOperands();
   /// Decide which accesses carry their address in a register that advances
-  /// with the loop counters, and record the scaled counters that needs.
+  /// with the loop counters, record the scaled counters that needs, and
+  /// withdraw the edge of every operand no residual is left reading.
   void planAddressGenerators();
-  /// Build the register chains the deferred edges need, patch their slots, and
-  /// materialize the shared-unit muxes.
+  /// Build one chain per (value, region) the surviving edges tap, patch their
+  /// slots, and materialize the shared-unit muxes.
   void insertRegisters();
 };
 

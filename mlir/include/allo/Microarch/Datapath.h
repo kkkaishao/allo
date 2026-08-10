@@ -460,6 +460,11 @@ struct MemUnit {
   llvm::SmallVector<Access, 2> accesses;
 };
 
+/// Which of \p acc's address operands a residual still reads, by position in
+/// `Access::addr`. The reduction folded every other operand into a scaled
+/// counter, so nothing resolves its slot and the slot stays empty.
+llvm::BitVector residualReads(const MemUnit::Access &acc);
+
 /// One bound access, referenced as (owning cell id, access index): a memory
 /// access is `dp.mems[id].accesses[idx]`, a stream access
 /// `dp.streams[id].accesses[idx]`.

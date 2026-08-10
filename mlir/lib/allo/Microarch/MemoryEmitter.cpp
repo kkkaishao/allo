@@ -83,8 +83,10 @@ Value DatapathEmitter::buildAddr(const uarch::MemUnit::Access &acc,
     // first). Appended at the datapath width, which is what `evalAffine` reads
     // its operands at.
     SmallVector<Value> idx; // the access's own index sources, dims then symbols
+    // An operand the reduction folded into a scaled counter has an empty slot
+    // and no position in this residual, so nothing reads the gap it leaves.
     for (const uarch::Source &s : acc.addr)
-      idx.push_back(resolveSource(s));
+      idx.push_back(s ? resolveSource(s) : Value());
     for (const uarch::MemUnit::Access::ScaledTerm &t : r.reads) {
       const uarch::RegionControl &rc = controlOf.lookup(t.region);
       assert(t.slot < rc.scaledCounters.size() &&

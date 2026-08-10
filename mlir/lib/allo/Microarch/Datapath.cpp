@@ -153,6 +153,28 @@ std::string SourceSite::describe() const {
   llvm_unreachable("unhandled SourceSite::Slot");
 }
 
+llvm::BitVector residualReads(const MemUnit::Access &acc) {
+  llvm::BitVector read(acc.addr.size());
+  unsigned numDims = acc.addrMap.getNumDims();
+  for (AffineExpr e : {acc.offset.residual, acc.bank.residual}) {
+    if (!e)
+      continue;
+    e.walk([&](AffineExpr x) {
+      unsigned p;
+      if (auto d = dyn_cast<AffineDimExpr>(x))
+        p = d.getPosition();
+      else if (auto s = dyn_cast<AffineSymbolExpr>(x))
+        p = numDims + s.getPosition();
+      else
+        return;
+      // Past the operand list: a digit `Reduced::reads` supplies instead.
+      if (p < read.size())
+        read.set(p);
+    });
+  }
+  return read;
+}
+
 void forEachSource(
     const Datapath &dp,
     llvm::function_ref<void(const Source &, const SourceSite &)> fn) {
@@ -181,8 +203,9 @@ void forEachSource(
 
   for (const MemUnit &m : dp.mems)
     for (const MemUnit::Access &acc : m.accesses) {
+      llvm::BitVector read = residualReads(acc);
       for (auto [k, s] : llvm::enumerate(acc.addr))
-        visit(s, Slot::MemAddress, k, acc.op, /*required=*/true);
+        visit(s, Slot::MemAddress, k, acc.op, /*required=*/read[k]);
       // A load leaves `data` None by construction.
       visit(acc.data, Slot::MemWriteData, 0, acc.op, /*required=*/acc.isWrite);
     }

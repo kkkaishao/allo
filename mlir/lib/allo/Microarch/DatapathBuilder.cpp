@@ -836,26 +836,14 @@ Resolved DatapathBuilder::resolveOperand(Value v, Operation *consumer,
   return edge(base, v, readyCycleOf(def), /*distance=*/0);
 }
 
-RegId DatapathBuilder::insertRegister(Value key, ArrayRef<unsigned> depths,
-                                      RegHead head, RegionId region) {
-  Register reg;
-  reg.id = dp.regs.size();
-  reg.value = key;
-  reg.type = key.getType();
-  // The chain is as long as its deepest consumer needs; the shallower ones read
-  // their own tap off it (Source::Reg's `outPort`).
-  reg.depth = *llvm::max_element(depths);
-  reg.input = head.base;
-  reg.ready = head.ready;
-  dp.regions[region].regs.push_back(reg.id);
-  dp.regs.push_back(reg);
-  return reg.id;
-}
-
-void DatapathBuilder::deriveInterconnect() {
+void DatapathBuilder::resolveEdges() {
   allocateInputSlots();
   resolveUnitInputs();
   resolveAccessOperands();
+}
+
+void DatapathBuilder::realizeDelays() {
+  planAddressGenerators();
   insertRegisters();
 }
 
@@ -907,12 +895,10 @@ void DatapathBuilder::recordEdge(const Resolved &r, Source &slot,
     slot = r.base;
     return;
   }
-  RegKey key{r.key, regionIdx};
-  depthsByKey[key].push_back(r.depth);
-  assert((!headByKey.count(key) || headByKey[key].ready == r.ready) &&
-         "one value's edges disagree on when it lands");
-  headByKey[key] = {r.base, r.ready};
-  pending.push_back({&slot, key, r.depth});
+  Edge e{r.base, RegKey{r.key, regionIdx}, r.depth, r.ready};
+  bool isNew = edges.insert({&slot, e}).second;
+  assert(isNew && "an input slot reads one driver, so it takes one edge");
+  (void)isNew;
 }
 
 void DatapathBuilder::recordCarriedEdge(const Resolved &r, Value operand,
@@ -1149,15 +1135,16 @@ reduceCone(Datapath &dp, AffineExpr e, AffineMap addrMap,
 // scaled counters those registers need. A term that does not qualify stays in
 // the residual, so this only ever removes arithmetic.
 //
-// Runs after `resolveAccessOperands` (a term has to resolve to a counter) and
-// after `recordRegionBounds` (a stride is a constant only if the counter's
-// bounds are). `splitAddress` is the same decomposition the scheduler priced
-// the access with.
+// Runs after `resolveEdges` (a term has to resolve to a counter) and after
+// `recordRegionBounds` (a stride is a constant only if the counter's bounds
+// are), and BEFORE any chain is built, so a term it reduces costs no register.
+// `splitAddress` is the same decomposition the scheduler priced the access
+// with.
 //
-// An operand arriving through a delay chain is peeled to its HEAD: the scaled
-// counter is delayed once for the whole sum rather than per operand, so
-// counters wanted at different cycles cannot share that one delay; the first
-// one's cycle decides and the rest stay in the residual.
+// An operand still owed a delay is read off its EDGE: the scaled counter is
+// delayed once for the whole sum rather than per operand, so counters wanted at
+// different cycles cannot share that one delay; the first one's cycle decides
+// and the rest stay in the residual.
 //
 // The split runs on the IN-BANK OFFSET (the flat index for an unbanked
 // memref), which is what lets a banked access reduce at all: `buf[i, 4*j]`
@@ -1170,12 +1157,12 @@ void DatapathBuilder::planAddressGenerators() {
       // handed to `splitAddress` is a pure one.
       SmallVector<std::optional<unsigned>> region(acc.addr.size());
       std::optional<unsigned> delay;
-      for (unsigned p = 0, e = acc.addr.size(); p < e; ++p) {
+      for (unsigned p = 0, n = acc.addr.size(); p < n; ++p) {
         Source s = acc.addr[p];
         unsigned d = 0;
-        if (s.kind == Source::Kind::Reg) {
-          d = s.outPort;
-          s = dp.regs[s.id].input;
+        if (auto *it = edges.find(&acc.addr[p]); it != edges.end()) {
+          s = it->second.base;
+          d = it->second.depth;
         }
         if (s.kind != Source::Kind::Counter || (delay && *delay != d))
           continue;
@@ -1194,6 +1181,16 @@ void DatapathBuilder::planAddressGenerators() {
       bool anyRegister = !acc.offset.terms.empty() || !acc.bank.terms.empty() ||
                          !acc.offset.reads.empty() || !acc.bank.reads.empty();
       acc.addrDelay = anyRegister ? delay.value_or(0) : 0;
+      // An operand no residual is left reading has no consumer at all: its slot
+      // stays empty, and the delay it was owed is withdrawn before a chain is
+      // built to carry it.
+      llvm::BitVector read = residualReads(acc);
+      for (unsigned p = 0, n = acc.addr.size(); p < n; ++p) {
+        if (read[p])
+          continue;
+        if (auto *it = edges.find(&acc.addr[p]); it != edges.end())
+          it->second.reduced = true;
+      }
     }
   }
 }
@@ -1278,15 +1275,36 @@ void DatapathBuilder::resolveAccessOperands() {
 }
 
 void DatapathBuilder::insertRegisters() {
-  // One register per (value, region) key, keyed by its RegId, to patch the
-  // pending slots that read it (each in the same region the register lives in).
+  // One chain per (value, region) key, as long as its deepest SURVIVING tap;
+  // the shallower consumers read their own tap off it (Source::Reg's
+  // `outPort`). A tap the address reduction withdrew buys no chain, so a chain
+  // nothing else taps is never built.
   llvm::DenseMap<RegKey, RegId> keyToReg;
-  for (auto &kv : depthsByKey)
-    keyToReg[kv.first] = insertRegister(kv.first.first, kv.second,
-                                        headByKey[kv.first], kv.first.second);
+  for (auto &[slot, e] : edges) {
+    if (e.reduced)
+      continue;
+    auto [it, isNew] = keyToReg.try_emplace(e.key, dp.regs.size());
+    if (!isNew) {
+      Register &reg = dp.regs[it->second];
+      assert(reg.ready == e.ready &&
+             "one value's edges disagree on when it lands");
+      reg.depth = std::max(reg.depth, e.depth);
+      continue;
+    }
+    Register reg;
+    reg.id = dp.regs.size();
+    reg.value = e.key.first;
+    reg.type = reg.value.getType();
+    reg.depth = e.depth;
+    reg.input = e.base;
+    reg.ready = e.ready;
+    dp.regions[e.key.second].regs.push_back(reg.id);
+    dp.regs.push_back(reg);
+  }
 
-  for (const RegDepth &p : pending)
-    *p.slot = Source{Source::Kind::Reg, keyToReg[p.key], p.depth};
+  for (auto &[slot, e] : edges)
+    if (!e.reduced)
+      *slot = Source{Source::Kind::Reg, keyToReg[e.key], e.depth};
 
   // Materialize sharing muxes: the sources are final once the registers are
   // built and the pending slots patched. One shared driver needs no mux.
@@ -1562,11 +1580,13 @@ void DatapathBuilder::build() {
   recordCallDeps();               // composition DAG on the instance substrate
   recordRegionBounds(regionOps);  // induction bounds, at that width
   recordResults();                // scalar func-result output ports
-  deriveInterconnect();
-  planAddressGenerators(); // address strength reduction (needs resolved terms)
+  // What every input slot reads and how late it needs it, then what carries it
+  // there: scaled counters, delay chains, muxes.
+  resolveEdges();
+  realizeDelays();
   // Ports last of all: an access holds one only once it knows which bank it
-  // commits to and which skew lane it holds, both settled by the interconnect
-  // pass above, and the boundary port list is one group per bound port.
+  // commits to and which skew lane it holds, both settled by the two passes
+  // above, and the boundary port list is one group per bound port.
   planAccessPorts();
   bindMemoryPorts();
   enumerateBoundaryPorts();
