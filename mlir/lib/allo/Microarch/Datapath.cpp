@@ -358,7 +358,11 @@ double muxLevelDelay(const OperatorLibrary &lib) {
   // and not the marginal one: a level of a wide one-hot select pays routing
   // comparable to a whole register-to-register hop, not the LUT hop a narrow
   // cone pays.
-  return lib.combDelay(OpKind::Or, 1);
+  //
+  // The row alone under-predicts a wide select, `muxLevels` seeing fan-in and
+  // not width, so it carries an explicit margin rather than the optimism a
+  // reject gate cannot afford (`kMuxDelayMargin`).
+  return kMuxDelayMargin * lib.combDelay(OpKind::Or, 1);
 }
 
 double unitSlack(const FuncUnit &u, float cycleTime) {

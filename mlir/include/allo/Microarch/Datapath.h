@@ -700,8 +700,19 @@ struct Mux {
 /// count. Zero for a single source, which is a wire.
 unsigned muxLevels(unsigned sources);
 
+/// A safety factor on `muxLevelDelay`, carried until the width term is
+/// characterized. Its one consumer that matters, `checkCombPathsMeetPeriod`,
+/// is a reject gate, so the error directions are not symmetric:
+/// under-predicting passes a fold that then misses timing in silicon and
+/// reports nothing, over-predicting rejects one that would have fitted and says
+/// what to do about it. Sized from the gap a one-bit OR row leaves on a wide
+/// select. Not a measurement and not a tuning knob: replace it with a width
+/// term rather than adjusting it.
+inline constexpr double kMuxDelayMargin = 1.4;
+
 /// What one such level costs in ns: the device's OR row, since the select is
-/// an AND-OR reduction rather than a chain of 2:1 selects.
+/// an AND-OR reduction rather than a chain of 2:1 selects, times
+/// `kMuxDelayMargin`.
 double muxLevelDelay(const OperatorLibrary &lib);
 
 /// The sub-cycle room \p u's bound ops have left, in ns: the smallest
