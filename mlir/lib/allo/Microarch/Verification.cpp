@@ -128,8 +128,8 @@ LogicalResult checkCombPathsMeetPeriod(const Datapath &dp, float cycleTime,
   // proved. A cell without one is an internal invariant broken, not a fault
   // to report.
   for (const FuncUnit &u : dp.units)
-    for (const auto &[op, residue] : u.boundOps)
-      assert(op->hasAttr("z") &&
+    for (const FuncUnit::BoundOp &bo : u.boundOps)
+      assert(bo.op->hasAttr("z") &&
              "a cell reached the datapath the scheduling stage never placed");
 
   bool ok = true;
@@ -140,11 +140,11 @@ LogicalResult checkCombPathsMeetPeriod(const Datapath &dp, float cycleTime,
       continue;
     // Anchor on the tightest bound op, the one the slack came from.
     Operation *worst = u.repOp();
-    for (const auto &[op, residue] : u.boundOps) {
-      auto z = op->getAttrOfType<FloatAttr>("z");
+    for (const FuncUnit::BoundOp &bo : u.boundOps) {
+      auto z = bo.op->getAttrOfType<FloatAttr>("z");
       auto wz = worst->getAttrOfType<FloatAttr>("z");
       if (z && (!wz || z.getValueAsDouble() > wz.getValueAsDouble()))
-        worst = op;
+        worst = bo.op;
     }
     // `mux` covers the whole input cone, so it may come from a shared
     // predecessor rather than from a multiplexer on this unit.
@@ -352,7 +352,7 @@ LogicalResult checkEmitterSubset(dcp::DCPathModuleOp func, const Datapath &dp) {
     case Source::Kind::Survivor:
       return true;
     case Source::Kind::Unit:
-      return sequential || dcpStart(dp.producingOp(s)) == 0;
+      return sequential || dp.units[s.id].boundOps[s.outPort].stage == 0;
     default:
       return false; // a memory / IP / raw driver
     }
@@ -427,8 +427,8 @@ static void assertStructuralInvariants(const Datapath &dp) {
       // `reclassifyRoms` and `assignLanes` both skip the arguments, which is
       // what lets the two plans that read this module's OWN cells share an arm
       // with the boundary cases.
-      assert((!m.external || (acc.plan != PortPlan::Table &&
-                              acc.plan != PortPlan::Lane)) &&
+      assert((!m.external ||
+              (acc.plan != PortPlan::Table && acc.plan != PortPlan::Lane)) &&
              "an argument array is neither a constant table nor skewed");
     }
   }

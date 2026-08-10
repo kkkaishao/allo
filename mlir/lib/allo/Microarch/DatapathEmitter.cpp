@@ -78,18 +78,19 @@ Value DatapathEmitter::resolveSource(const uarch::Source &s) {
     SmallVector<Value> values, selects;
     for (auto [k, src] : llvm::enumerate(mx.sources)) {
       Operation *op = mx.selectOps[k];
+      unsigned stage = mx.selectStages[k];
       const uarch::Mux::Phase &ph = mx.phases[k];
       const uarch::RegionBlock &rb = dp.regions[mx.region];
-      Value sel = c.activationPulse(issue, op, sh);
+      Value sel = c.activationPulse(issue, stage, sh);
       if (ph.kind == uarch::Mux::Phase::At) {
         Value &window = atOf[{op, ph.iter}];
         if (!window)
-          window = c.activationPulse(atIteration(rb, ph.iter), op, sh);
+          window = c.activationPulse(atIteration(rb, ph.iter), stage, sh);
         sel = c.andBits(sel, window);
       } else if (ph.kind == uarch::Mux::Phase::From) {
         Value &window = fromOf[{op, ph.iter}];
         if (!window)
-          window = c.activationPulse(firstIterations(rb, ph.iter), op, sh);
+          window = c.activationPulse(firstIterations(rb, ph.iter), stage, sh);
         sel = c.andBits(sel, c.notBit(window));
       }
       values.push_back(resolveSource(src));
@@ -165,27 +166,43 @@ Value DatapathEmitter::atIteration(const uarch::RegionBlock &rb,
   return c.icmpEqV(iv, at ? at : lb);
 }
 
+// Read off the model, never off the producing op: the stages were frozen when
+// the model was built and the IR is provenance from here on.
 unsigned DatapathEmitter::readyCycle(const uarch::Source &s) const {
-  // A call is the one producing op whose result does NOT land at
-  // `dcpStart + dcpLatency`: it lands at its region-relative issue plus the
-  // CALLEE's whole start->done depth. Indeterminate calls are guarded earlier.
-  if (s.kind == uarch::Source::Kind::Call) {
+  switch (s.kind) {
+  // A call is the one producer whose result does NOT land at `stage +
+  // latency`: it lands at its region-relative issue plus the CALLEE's whole
+  // start->done depth. Indeterminate calls are guarded earlier.
+  case uarch::Source::Kind::Call: {
     const uarch::CallUnit &cu = dp.calls[s.id];
     assert(cu.latency && "readyCycle of an indeterminate call result");
     return cu.start + static_cast<unsigned>(*cu.latency);
   }
+  case uarch::Source::Kind::Unit: {
+    const uarch::FuncUnit &u = dp.units[s.id];
+    return u.boundOps[s.outPort].stage + u.latency;
+  }
+  case uarch::Source::Kind::Mem: {
+    const uarch::MemUnit &m = dp.mems[s.id];
+    return m.accesses[s.outPort].stage + m.readLatency;
+  }
+  // A get is a combinational front-read of the FIFO, so it lands at issue.
+  case uarch::Source::Kind::Stream:
+    return dp.streams[s.id].accesses[s.outPort].stage;
   // A held source has no landing stage: a literal is constant, an IO port
   // stable for the whole kernel, and a counter or survivor a register settled
   // by the time the region reading it issues.
-  if (s.kind == uarch::Source::Kind::Const ||
-      s.kind == uarch::Source::Kind::IO ||
-      s.kind == uarch::Source::Kind::Counter ||
-      s.kind == uarch::Source::Kind::Survivor)
+  case uarch::Source::Kind::Const:
+  case uarch::Source::Kind::IO:
+  case uarch::Source::Kind::Counter:
+  case uarch::Source::Kind::Survivor:
     return 0;
-  Operation *op = dp.producingOp(s);
-  assert(op && "readyCycle only modelled for a Unit / memory read / "
-               "stream get / constant / call result");
-  return readyCycleOf(op);
+  case uarch::Source::Kind::Reg:
+  case uarch::Source::Kind::Mux:
+  case uarch::Source::Kind::None:
+    break;
+  }
+  llvm_unreachable("readyCycle only models a producing or held Source");
 }
 
 // The resolved (already stage-delayed) index sources of an access, dims then
@@ -275,7 +292,10 @@ void DatapathEmitter::emitUnits(const uarch::RegionBlock &rb, UnitMode mode) {
           assert(issue && "recurrence input in a region with no controller");
           Value iterN = c.R(comb::AndOp::create(c.b, c.loc, issue,
                                                 atIteration(rb, n), false));
-          Value gate = c.activationPulse(iterN, u.repOp(), sh);
+          // A recurrence input belongs to an unshared unit (a shared port
+          // carries its identities as mux arms), so the one bound op's stage is
+          // the gate's.
+          Value gate = c.activationPulse(iterN, u.boundOps.front().stage, sh);
           v = c.mux(gate, resolveSource(init), v);
         }
       operands.push_back(v);
@@ -470,7 +490,7 @@ StallShell DatapathEmitter::deriveStallShell(const uarch::RegionBlock &rb,
     // `valid`, and suppress the output-full hazard when it is low, so the
     // pipeline never freezes waiting for space it will not write.
     Value pred = acc.when ? resolveSource(acc.when) : Value();
-    Value valid = c.activationPulse(issue, acc.op, sh);
+    Value valid = c.activationPulse(issue, acc.stage, sh);
     if (pred)
       valid = c.andBits(valid, pred);
     // An input-side freeze holds a stage>=1 put's chain pulse high after the

@@ -42,14 +42,14 @@ void verifyBinding(const Datapath &dp) {
       const FuncUnit &u = dp.units[uid];
       // The emitter builds one operator from the unit's identity, so a bound op
       // of any other identity would be miscompiled.
-      for (const auto &bo : u.boundOps)
-        assert(operatorIdentity(cast<dcp::DCPathComputeOp>(bo.first)) ==
+      for (const FuncUnit::BoundOp &bo : u.boundOps)
+        assert(operatorIdentity(cast<dcp::DCPathComputeOp>(bo.op)) ==
                    u.identity &&
                "shared unit binds an op of a different operator identity");
       for (unsigned i = 0, e = u.boundOps.size(); i < e; ++i) {
-        auto ri = reservationOf(rb, u, u.boundOps[i].second);
+        auto ri = reservationOf(rb, u, u.boundOps[i].residue);
         for (unsigned j = i + 1; j < e; ++j) {
-          auto rj = reservationOf(rb, u, u.boundOps[j].second);
+          auto rj = reservationOf(rb, u, u.boundOps[j].residue);
           (void)ri;
           (void)rj;
           assert(reservationsDisjoint(ri, rj) &&

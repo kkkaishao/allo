@@ -541,9 +541,9 @@ Value EmitContext::delayValid(Value sig, unsigned n, const StallShell &sh) {
   return chain.last();
 }
 
-Value EmitContext::activationPulse(Value pulse, Operation *op,
+Value EmitContext::activationPulse(Value pulse, unsigned stage,
                                    const StallShell &sh) {
-  return delayValid(pulse, dcpStart(op), sh);
+  return delayValid(pulse, stage, sh);
 }
 
 Value EmitContext::icmpEq(Value a, int64_t cst) {

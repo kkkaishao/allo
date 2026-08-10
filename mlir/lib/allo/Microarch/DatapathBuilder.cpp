@@ -393,6 +393,7 @@ void DatapathBuilder::bindMemory(Operation *op, Value memref, RegionBlock &rb) {
   acc.op = op;
   acc.isWrite = isWrite;
   acc.region = rb.id;
+  acc.stage = dcpStart(op);
   dp.mems[mid].accesses.push_back(std::move(acc));
   rb.memAccesses.push_back({mid, aidx});
   if (!isWrite)
@@ -419,12 +420,10 @@ void DatapathBuilder::bindCompute(dcp::DCPathComputeOp comp, RegionBlock &rb) {
   }
   // The unit's reservation slot: its issue cycle, taken modulo II in a cyclic
   // region since successive iterations overlap there.
-  int64_t t = dcpStart(comp);
+  unsigned stage = dcpStart(comp);
   unsigned ii = rb.ii.value_or(1);
-  unsigned residue = rb.kind == RegionBlock::Kind::Cyclic
-                         ? static_cast<unsigned>(t % ii)
-                         : static_cast<unsigned>(t);
-  u.boundOps.push_back({comp, residue});
+  unsigned residue = rb.kind == RegionBlock::Kind::Cyclic ? stage % ii : stage;
+  u.boundOps.push_back({comp, stage, residue});
   producerOf[comp.getResult()] = Source{Source::Kind::Unit, u.id, 0};
   dp.opToUnit[comp] = u.id;
   rb.units.push_back(u.id);
@@ -947,8 +946,8 @@ void DatapathBuilder::resolveUnitInputs() {
     for (unsigned k = 0; k < nPorts; ++k) {
       SmallVector<Resolved, 2> edges;
       unsigned arms = 0;
-      for (const auto &bo : u.boundOps) {
-        edges.push_back(resolveOperand(bo.first->getOperand(k), bo.first, ii));
+      for (const FuncUnit::BoundOp &bo : u.boundOps) {
+        edges.push_back(resolveOperand(bo.op->getOperand(k), bo.op, ii));
         arms += 1 + edges.back().inits.size();
       }
       muxBuilds.push_back(
@@ -957,7 +956,7 @@ void DatapathBuilder::resolveUnitInputs() {
       mb.sources.resize(arms);
       unsigned arm = 0;
       for (auto [j, r] : llvm::enumerate(edges)) {
-        Operation *opj = u.boundOps[j].first;
+        Operation *opj = u.boundOps[j].op;
         // Each identity rides an arm of its own rather than a mux in front of
         // the port: a shared port carries a different op's operand each cycle,
         // leaving no cycle to time such a mux against. An unresolvable init is
@@ -1296,6 +1295,11 @@ void DatapathBuilder::insertRegisters() {
     mx.sources.assign(mb.sources.begin(), mb.sources.end());
     mx.selectOps.assign(mb.ops.begin(), mb.ops.end());
     mx.phases.assign(mb.phases.begin(), mb.phases.end());
+    // The stage each arm's pulse is delayed to, read here rather than at emit:
+    // this is the last pass that touches a schedule cycle, so it is the last
+    // point at which the two can still agree.
+    for (Operation *op : mb.ops)
+      mx.selectStages.push_back(dcpStart(op));
     dp.regions[mb.region].muxes.push_back(mx.id);
     slot = Source{Source::Kind::Mux, mx.id, 0};
     dp.muxes.push_back(std::move(mx));
@@ -1334,7 +1338,7 @@ void DatapathBuilder::allocateUnits(ArrayRef<SmallVector<UnitId, 2>> groups) {
   // from it are the ones the trivial allocation would have produced.
   for (UnitId old = 0, e = dp.units.size(); old < e; ++old)
     if (leader[old] != old)
-      for (const std::pair<Operation *, unsigned> &bo : dp.units[old].boundOps)
+      for (const FuncUnit::BoundOp &bo : dp.units[old].boundOps)
         allocated[remap[leader[old]]].boundOps.push_back(bo);
   dp.units = std::move(allocated);
 
@@ -1351,8 +1355,8 @@ void DatapathBuilder::allocateUnits(ArrayRef<SmallVector<UnitId, 2>> groups) {
   // the whole of what holds a UnitId at this phase: no `record*` pass has run.
   for (const FuncUnit &u : dp.units)
     for (auto [slot, bo] : llvm::enumerate(u.boundOps)) {
-      dp.opToUnit[bo.first] = u.id;
-      producerOf[bo.first->getResult(0)] =
+      dp.opToUnit[bo.op] = u.id;
+      producerOf[bo.op->getResult(0)] =
           Source{Source::Kind::Unit, u.id, static_cast<unsigned>(slot)};
     }
 }

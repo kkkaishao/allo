@@ -141,7 +141,7 @@ GreedyShareBinding::plan(const Datapath &dp, const BindingContext &ctx) const {
     llvm::SmallVector<Bin> bins;
     for (unsigned i = 0, e = rb.units.size(); i < e; ++i) {
       const FuncUnit &u = dp.units[rb.units[i]];
-      auto ru = reservationOf(rb, u, u.boundOps.front().second);
+      auto ru = reservationOf(rb, u, u.boundOps.front().residue);
       unsigned own = readsRecurrence(rb, u.repOp()) ? 2 : 1;
       Bin *dest = nullptr;
       for (Bin &bin : bins) {
@@ -150,7 +150,7 @@ GreedyShareBinding::plan(const Datapath &dp, const BindingContext &ctx) const {
         bool free = llvm::all_of(bin.members, [&](unsigned m) {
           const FuncUnit &mu = dp.units[rb.units[m]];
           return reservationsDisjoint(
-              reservationOf(rb, mu, mu.boundOps.front().second), ru);
+              reservationOf(rb, mu, mu.boundOps.front().residue), ru);
         });
         if (free && cone.tryFold(bin.members, i, bin.arms + own)) {
           dest = &bin;

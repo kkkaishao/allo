@@ -131,10 +131,17 @@ struct FuncUnit {
   // a combinational unit. Clock-enable is the only contract the emitter builds.
   StallContractEnum stall = StallContractEnum::Ce;
 
-  // Ops bound here, each with its issue cycle (residue mod II in a cyclic
-  // region). Sharing puts several non-conflicting ops in this list. NEVER
-  // empty: a unit exists because ops are bound to it.
-  llvm::SmallVector<std::pair<Operation *, unsigned>, 1> boundOps;
+  /// One op bound here, and when it issues. Both cycles are carried: `stage` is
+  /// what a consumer's pulse is delayed by, `residue` what the reservation
+  /// table contends on, and they differ in a cyclic region at II > 1.
+  struct BoundOp {
+    Operation *op = nullptr;
+    unsigned stage = 0;   // schedule cycle within its region
+    unsigned residue = 0; // `stage % ii` when cyclic, else `stage`
+  };
+  // Ops bound here. Sharing puts several non-conflicting ops in this list.
+  // NEVER empty: a unit exists because ops are bound to it.
+  llvm::SmallVector<BoundOp, 1> boundOps;
 
   /// The representative bound op: the one whose operands shape the unit's
   /// input ports and whose location names it. The choice of `front()` is
@@ -143,7 +150,7 @@ struct FuncUnit {
   Operation *repOp() const {
     assert(!boundOps.empty() &&
            "a unit with no bound op has no representative");
-    return boundOps.front().first;
+    return boundOps.front().op;
   }
 
   // One resolved driver per input operand port (post-binding). A *fused*
@@ -362,6 +369,7 @@ struct MemUnit {
     Operation *op = nullptr;
     bool isWrite = false;
     unsigned region = 0; // the RegionBlock this access is scheduled in
+    unsigned stage = 0;  // scheduled cycle within the region
     /// The port of its bank this access drives, assigned by `bindMemoryPorts`.
     /// Two accesses share a port only where the model proves they never issue
     /// in the same cycle, so the port carries a select rather than an arbiter.
@@ -631,12 +639,14 @@ struct Mux {
   };
   llvm::SmallVector<Source, 2> sources;
   // The op whose issue selects each source (parallel to `sources`): the select
-  // is `delayValid(issue, dcpStart(op))`, the same per-op activation pulse a
-  // store's write-enable uses, narrowed by `phases`. The MRT guarantees the ops
-  // are mutually exclusive (disjoint residues) and `phases` partitions one op's
-  // pulse across its arms, so the emitter builds a one-hot select.
+  // is that op's activation pulse, the same signal a store's write-enable uses,
+  // narrowed by `phases`. The MRT guarantees the ops are mutually exclusive
+  // (disjoint residues) and `phases` partitions one op's pulse across its arms,
+  // so the emitter builds a one-hot select. The op identifies which pulse an
+  // arm rides; `selectStages` is the cycle that pulse is delayed to.
   llvm::SmallVector<Operation *, 2> selectOps;
-  llvm::SmallVector<Phase, 2> phases; // parallel to `sources`
+  llvm::SmallVector<unsigned, 2> selectStages; // parallel to `selectOps`
+  llvm::SmallVector<Phase, 2> phases;          // parallel to `sources`
   RegionId region = 0; // region whose issue pulse times the selects
   Type type;           // the muxed value's type, whose width prices the select
 };
@@ -1086,7 +1096,10 @@ void forEachSource(
     llvm::function_ref<void(const Source &, const SourceSite &)> fn);
 
 //===----------------------------------------------------------------------===//
-// Timing readers over the scheduled dcp IR. `readyCycleOf` is the single
+// Timing readers over the scheduled dcp IR, for the BUILDER only: every cycle
+// the emitter needs is frozen onto the model (`FuncUnit::BoundOp::stage`,
+// `MemUnit::Access::stage`, `StreamChannel::Access::stage`,
+// `Mux::selectStages`, `CallUnit::start`). `readyCycleOf` is the single
 // authority for the cycle a producing op's result lands, relative to its
 // issuing pulse.
 //===----------------------------------------------------------------------===//

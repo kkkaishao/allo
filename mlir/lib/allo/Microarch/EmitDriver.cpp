@@ -233,7 +233,7 @@ static unsigned compRegBits(hw::HWModuleOp mod) {
 // (validateDatapath). `opModules` caches extern operator modules across
 // functions.
 static FailureOr<std::pair<hw::HWModuleOp, iface::ModuleInterface>>
-emitModule(dcp::DCPathModuleOp func, uarch::Datapath &dp, OpBuilder &b,
+emitModule(dcp::DCPathModuleOp func, const uarch::Datapath &dp, OpBuilder &b,
            llvm::StringMap<Operation *> &opModules, float cycleTime,
            const OperatorLibrary &lib, MicroarchReport &report,
            const uarch::CalleeCtx *callees = nullptr) {
@@ -389,7 +389,9 @@ LogicalResult emitDatapathToHW(ModuleOp module, StringRef binding,
     });
     uarch::CalleeCtx cc{modules, ifaceModels};
     const uarch::CalleeCtx *callees = hasInvoke ? &cc : nullptr;
-    Datapath dp(f, *policy, dev, cycleTime, callees, /*isTop=*/f == topFunc);
+    // Sealed on construction: the builder decides, and everything below reads.
+    const Datapath dp(f, *policy, dev, cycleTime, callees,
+                      /*isTop=*/f == topFunc);
     LLVM_DEBUG({
       llvm::dbgs() << "// datapath for @" << f.getSymName() << "\n";
       dp.dump(llvm::dbgs());

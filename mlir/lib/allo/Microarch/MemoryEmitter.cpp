@@ -489,13 +489,13 @@ Value DatapathEmitter::sharedAddress(const uarch::MemUnit &m,
   // twice.
   if (idxs.size() == 1) {
     if (fired)
-      *fired = c.activationPulse(issue, m.accesses[idxs.front()].op, sh);
+      *fired = c.activationPulse(issue, m.accesses[idxs.front()].stage, sh);
     return addrOf(idxs.front());
   }
   SmallVector<Value> addrs, sels;
   for (unsigned i : idxs) {
     addrs.push_back(addrOf(i));
-    sels.push_back(c.activationPulse(issue, m.accesses[i].op, sh));
+    sels.push_back(c.activationPulse(issue, m.accesses[i].stage, sh));
   }
   // Any of them presenting is this region driving the port, which is what a
   // port another region also holds selects on.
@@ -539,7 +539,7 @@ void DatapathEmitter::emitExternalReadAddrs(const uarch::RegionBlock &rb,
 }
 
 // The drain stage a store contributes to its region's `done`. The write is
-// PRESENTED at `dcpStart` and COMMITS `writeLatency` cycles later; `emitDone`
+// PRESENTED at its stage and COMMITS `writeLatency` cycles later; `emitDone`
 // rides its own latch register for the last of those cycles (done reads 1 at
 // `lastIssue + drainStage + 1`), so the stage is the commit cycle minus one.
 static unsigned storeDrainOf(const uarch::MemUnit &m,
@@ -547,7 +547,7 @@ static unsigned storeDrainOf(const uarch::MemUnit &m,
   assert(m.writeLatency >= 1 &&
          "a zero-cycle write has no commit edge for the done latch to ride; "
          "checkDeviceCapability must have rejected the device row");
-  return dcpStart(acc.op) + m.writeLatency - 1;
+  return acc.stage + m.writeLatency - 1;
 }
 
 void DatapathEmitter::emitWrites(const uarch::RegionBlock &rb, Value issue,
@@ -581,13 +581,13 @@ void DatapathEmitter::emitWrites(const uarch::RegionBlock &rb, Value issue,
     }
     // A `seq.hlmem` write port realizes exactly one cycle, so an internal
     // memory whose device latency is deeper presents address, data and enable
-    // `writeLatency - 1` cycles late; the datum still lands at `dcpStart +
+    // `writeLatency - 1` cycles late; the datum still lands at `stage +
     // writeLatency` (see `storeDrainOf`). A boundary port is the caller's
-    // memory rather than an hlmem, and takes its terms at `dcpStart`.
+    // memory rather than an hlmem, and takes its terms at its stage.
     unsigned pre = m.external ? 0 : m.writeLatency - 1;
     auto late = [&](Value v) { return c.shiftChain(v, pre, sh).last(); };
     Value we =
-        c.delayValid(c.activationPulse(commitPulse(), acc.op, sh), pre, sh);
+        c.delayValid(c.activationPulse(commitPulse(), acc.stage, sh), pre, sh);
     Value data = late(resolveSource(acc.data));
     switch (acc.plan) {
     case PortPlan::Table:
@@ -662,8 +662,8 @@ void DatapathEmitter::emitWrites(const uarch::RegionBlock &rb, Value issue,
       bankOf.push_back(bank);
       addrs.emplace_back(bank, late(memAddr(m, bs.offset)));
       datas.emplace_back(bank, late(resolveSource(acc.data)));
-      wes.push_back(
-          c.delayValid(c.activationPulse(commitPulse(), acc.op, sh), pre, sh));
+      wes.push_back(c.delayValid(
+          c.activationPulse(commitPulse(), acc.stage, sh), pre, sh));
     }
     auto wlat = c.b.getI64IntegerAttr(1);
     for (unsigned k = 0; k < m.numBanks; ++k) {

@@ -100,8 +100,8 @@ struct RegionControl {
 // compute completion.
 //===----------------------------------------------------------------------===//
 struct DatapathFeedback {
-  // The deepest store's schedule stage (max dcpStart over the region's
-  // stores); 0 if it stores nothing. `done` waits until the last iteration's
+  // The deepest store's schedule stage (max `stage` over the region's stores);
+  // 0 if it stores nothing. `done` waits until the last iteration's
   // last store has committed, so a multi-store region cannot complete
   // prematurely. A stream put folds into this too.
   unsigned storeDrain = 0;
@@ -197,7 +197,9 @@ struct ControlEmitter {
 //===----------------------------------------------------------------------===//
 struct DatapathEmitter {
   EmitContext &c;
-  uarch::Datapath &dp;
+  // The SEALED model. Emission is a pure function of it: nothing below decides
+  // anything, and a stage that would have to is in the wrong place.
+  const uarch::Datapath &dp;
   circt::hw::HWModulePortAccessor &pa;
   const DenseMap<unsigned, Operation *> &unitModule;
 
@@ -370,7 +372,7 @@ struct DatapathEmitter {
   // a plain leaf with no calls).
   const uarch::CalleeCtx *callees = nullptr;
 
-  DatapathEmitter(EmitContext &c, uarch::Datapath &dp,
+  DatapathEmitter(EmitContext &c, const uarch::Datapath &dp,
                   circt::hw::HWModulePortAccessor &pa,
                   const DenseMap<unsigned, Operation *> &unitModule,
                   const uarch::CalleeCtx *callees = nullptr)
@@ -629,10 +631,10 @@ struct HWEmitter {
   EmitContext ctx;
   ControlEmitter control;
   DatapathEmitter datapath;
-  uarch::Datapath &dp;
+  const uarch::Datapath &dp;
   circt::hw::HWModulePortAccessor &pa;
 
-  HWEmitter(OpBuilder &b, Location loc, uarch::Datapath &dp,
+  HWEmitter(OpBuilder &b, Location loc, const uarch::Datapath &dp,
             circt::hw::HWModulePortAccessor &pa,
             const DenseMap<unsigned, Operation *> &unitModule,
             circt::BackedgeBuilder &bb, Type i1, Type i32,

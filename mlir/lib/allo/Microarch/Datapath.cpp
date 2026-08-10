@@ -72,7 +72,7 @@ llvm::StringRef shapeName(RegionBlock::Shape s) {
 Operation *Datapath::producingOp(const Source &s) const {
   switch (s.kind) {
   case Source::Kind::Unit:
-    return units[s.id].boundOps[s.outPort].first;
+    return units[s.id].boundOps[s.outPort].op;
   case Source::Kind::Mem: // outPort = the read access index
     return mems[s.id].accesses[s.outPort].op;
   case Source::Kind::Stream: // outPort = the get access index
@@ -311,8 +311,8 @@ double unitSlack(const FuncUnit &u, float cycleTime,
                  const OperatorLibrary &lib) {
   double in = unitInDelay(u, lib);
   double slack = cycleTime;
-  for (const auto &[op, residue] : u.boundOps) {
-    auto z = op->getAttrOfType<FloatAttr>("z");
+  for (const FuncUnit::BoundOp &bo : u.boundOps) {
+    auto z = bo.op->getAttrOfType<FloatAttr>("z");
     slack = std::min(slack, cycleTime - (z ? z.getValueAsDouble() : 0.0) - in);
   }
   return slack;
@@ -377,7 +377,7 @@ Datapath::PortRelation Datapath::portGraph(MemId id,
     for (auto [i, acc] : llvm::enumerate(m.accesses))
       if (acc.isWrite == dir) {
         unsigned ii = regions[acc.region].ii.value_or(0);
-        unsigned start = dcpStart(acc.op);
+        unsigned start = acc.stage;
         add({topOf(acc.region), acc.region, ii ? start % ii : start, -1,
              bankOf(acc.staticBank)},
             i, dir, /*independent=*/false);
@@ -468,7 +468,7 @@ void Datapath::dump(llvm::raw_ostream &os) const {
       os << "    unit u" << uid << ": " << u.identity.realizationName()
          << " lat=" << u.latency << (u.pipelined ? " pipelined" : " sequential")
          << " : " << u.identity.resultType << "  [" << u.repOp()->getName()
-         << " @" << u.boundOps.front().second << "] <= ";
+         << " @" << u.boundOps.front().residue << "] <= ";
       printSourceList(u.inputs, os);
       // A recurrence input's reduction identities, one per early iteration.
       for (auto [k, inits] : llvm::enumerate(u.inputInits))
@@ -492,10 +492,9 @@ void Datapath::dump(llvm::raw_ostream &os) const {
       // suffixed by the iteration window a phased arm drives ('iN' the
       // reduction identity of iteration N, 'rN' the iterations from N on).
       os << " sel@[";
-      for (auto [k, op] : llvm::enumerate(x.selectOps)) {
+      for (auto [k, stage] : llvm::enumerate(x.selectStages)) {
         const Mux::Phase &ph = x.phases[k];
-        os << (k ? ", " : "")
-           << cast<IntegerAttr>(op->getAttr("start")).getInt();
+        os << (k ? ", " : "") << stage;
         if (ph.kind != Mux::Phase::Always)
           os << (ph.kind == Mux::Phase::At ? "i" : "r") << ph.iter;
       }

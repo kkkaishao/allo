@@ -281,11 +281,12 @@ struct EmitContext {
   /// `n`, at the cost of admitting only one pulse at a time. Sound exactly
   /// where `regionSinglePass` holds, and asserts it.
   Value delayPulseCounted(Value pulse, unsigned n, const StallShell &sh);
-  /// A scheduled op's activation pulse: \p pulse delayed to the op's pipeline
-  /// stage (its `dcpStart`). The one name for "this op fires now", used for a
-  /// store's write-enable, a shared-unit input's mux select and an
-  /// accumulator's init gate alike.
-  Value activationPulse(Value pulse, Operation *op, const StallShell &sh);
+  /// A scheduled cell's activation pulse: \p pulse delayed to \p stage, the
+  /// cycle within its region the cell issues at. The one name for "this cell
+  /// fires now", used for a store's write-enable, a shared-unit input's mux
+  /// select and an accumulator's init gate alike. The stage comes off the
+  /// model, never off the op.
+  Value activationPulse(Value pulse, unsigned stage, const StallShell &sh);
   /// Combinational (0-cycle) equality of an i32 value `a` against a constant.
   Value icmpEq(Value a, int64_t c);
   /// Combinational (0-cycle) equality of two same-width values (a runtime
