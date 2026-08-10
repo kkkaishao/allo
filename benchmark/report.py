@@ -119,14 +119,30 @@ def memories(microarch) -> list[dict]:
             "banks": m.banks,
             "writes": m.writes,
             "storage": m.storage,
-            # What it was actually built as, which is not the row: a write set
-            # no copy count can serve is realized as registers instead.
+            # What it was actually built as, which is not the row: a boundary
+            # holds no cells here, a ROM is logic and a complete partition is
+            # registers.
             "realization": m.realization,
             "instances": m.cost.instances,
+            # Copies the schedule reserved against; `instances` past it is read
+            # bandwidth no cycle was cut for.
+            "copies_budget": m.cost.copies_budget,
             "from_calls": m.cost.call_writes,
+            # Which side of the array's reads the buses were coloured for: this
+            # module's own accesses, or the ports its children master. The two
+            # share one colouring, so the split says whose demand a bus carries.
+            "reads": m.reads,
+            "call_reads": m.cost.call_reads,
             "write_ports": m.cost.write_ports,
             "read_ports": m.cost.read_ports,
             "ports": m.cost.ports,
+            # What one cycle asks of one bank, against the ports built for it.
+            # The gap is what the binding spent separating accesses the schedule
+            # never issues together, and every port past the first that a read
+            # holds is a further copy of the whole array.
+            "read_concurrency": m.cost.read_concurrency,
+            "write_concurrency": m.cost.write_concurrency,
+            "boundary_ports": m.cost.boundary_ports,
             "external": m.external,
         }
         for f in microarch.funcs
@@ -158,7 +174,6 @@ def area_of(q) -> dict:
         # charges for the same registers.
         "reg_bits": q.reg_bits,
         "mem_bits": q.mem_bits,
-        "regfile_arrays": q.regfile_arrays,
         "unmodelled": q.unmodelled,
         "counted": sorted(q.counted),
         # Resources the design asks for more of than the part has. Per run, not
@@ -557,7 +572,6 @@ def area_table(results: list[dict]) -> str:
         ),
         0,
     )
-    regfile = 0
     unmodelled: dict[str, int] = {}
     over_capacity: dict[str, str] = {}
     for r in sorted(rows, key=lambda r: -r["area"]["lut"]):
@@ -566,7 +580,6 @@ def area_table(results: list[dict]) -> str:
             tot[f] += a[f]
         for k, n in a.get("unmodelled", {}).items():
             unmodelled[k] = unmodelled.get(k, 0) + n
-        regfile += a["regfile_arrays"]
         if a.get("over_capacity"):
             over_capacity[f"{_key_of(r)} {r['scheduler'][:6]}"] = ", ".join(
                 f"{k} {v:.2f}x" for k, v in sorted(a["over_capacity"].items())
@@ -594,8 +607,7 @@ def area_table(results: list[dict]) -> str:
     )
     lines.append(
         f"storage costs {tot['mem_lut']} LUTs, {tot['bram36']} BRAM and "
-        f"{tot['uram288']} URAM, of which {regfile} array(s) are multi-write "
-        f"register files (their writes exceed one copy of the row)"
+        f"{tot['uram288']} URAM"
     )
     if over_capacity:
         lines.append(

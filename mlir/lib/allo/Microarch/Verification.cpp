@@ -193,22 +193,31 @@ LogicalResult checkDeviceCapability(dcp::DCPathModuleOp func,
     // a store lands on the next edge, neither carrying a delay to absorb one.
     assert((!m.scattered || (m.readLatency == 0 && m.writeLatency == 1)) &&
            "a scattered memory must be timed as registers");
-    // Only a WRITE set can put an array here: every copy of a row needs every
-    // write, so one instance's write ports are the ceiling however many copies
-    // are built, and on a pooled row writes that fill the pool leave a read no
-    // port anywhere. Reads alone never reach this and say nothing, the copies
-    // being what serves them.
-    if (m.realization == MemUnit::Realization::RegisterFile)
-      warn(Stage::Emit, func)
+    // Only a WRITE set reaches this: every copy of a row needs every write, so
+    // one instance's write ports are the ceiling however many copies are built,
+    // and on a pooled row writes that fill the pool leave a read no port
+    // anywhere. Reads alone never reach it and say nothing, the copies being
+    // what serves them.
+    //
+    // `characterize` budgets a derived row one write short of its pool so the
+    // schedule cannot ask for this, which leaves two ways in: a topology the
+    // user stated, and writers of concurrent regions, which are billed apart
+    // and only meet here.
+    if (m.realization() == MemUnit::Realization::Ram && !m.fitsStorage()) {
+      error(Stage::Emit, Code::StoragePortsExceeded, m.memref.getDefiningOp())
           << "Array " << m.memref.getType() << " is built with "
           << m.writePortsBuilt << " concurrent write ports per bank, and one "
           << m.storage << " has " << m.ports.describe()
-          << ", so no number of copies holds it: it is realized as registers, "
-             "one cell per element, which costs the whole array in logic. "
-             "Partition it so the writers land in different banks, bind it to "
-             "a storage with more write ports, or let fewer of them issue at "
-             "once. Only accesses the model proves never issue together share "
-             "a port";
+          << ", so no number of copies holds it. "
+          << (m.ports.stated ? "Ask `bind_storage` for a topology with more "
+                               "write ports, partition the array so the "
+                               "writers land in different banks, or "
+                             : "Partition the array so the writers land in "
+                               "different banks, or ")
+          << "let fewer of them issue at once. Only accesses the model proves "
+             "never issue together share a port";
+      return failure();
+    }
   }
 
   // `ce` is the only IP port ABI the emitter realizes. `free` has no enable, so
@@ -287,6 +296,23 @@ LogicalResult checkEmitterSubset(dcp::DCPathModuleOp func, const Datapath &dp) {
   // `verify-rtl-legality` owns the shapes a CONCURRENT container admits and the
   // caller/callee partition agreement, both settled before scheduling.
 
+  // A skew hands out one port per bank per LANE, and a lane is assigned from
+  // the accesses of this module. A sub-kernel's port holds none, so there is no
+  // lane for it to share a bank's port on.
+  for (const CallUnit &cu : dp.calls)
+    for (const CallUnit::MemArg &ma : cu.memArgs)
+      if (ma.plan == PortPlan::Lane) {
+        unsupported(Stage::Emit, Code::SkewedArgumentToCallee,
+                    dp.mems[ma.mem].memref.getDefiningOp())
+            << "Array " << dp.mems[ma.mem].memref.getType()
+            << " is skew-partitioned and passed to a sub-kernel, which is not "
+               "lowered yet: a skewed bank serves a whole lane from one port, "
+               "and a child's port belongs to no lane. Drop the skew on this "
+               "array, or inline the callee so its accesses take lanes of "
+               "their own";
+        return failure();
+      }
+
   // Stream protocol: a channel's {data,valid,ready} triple is time-shared by
   // all its accesses, sound only if the scheduler keeps them ordered and
   // non-overlapping. Ends are checked pre-schedule; timing is checked here.
@@ -349,7 +375,7 @@ LogicalResult checkEmitterSubset(dcp::DCPathModuleOp func, const Datapath &dp) {
       return failure();
     }
   }
-  // A leaf `while` with an in-loop store needs no check: emitAccesses gates the
+  // A leaf `while` with an in-loop store needs no check: emitWrites gates the
   // store's write-enable by `issue & cond`, so a doomed exit iteration commits
   // nothing.
 
@@ -398,6 +424,12 @@ static void assertStructuralInvariants(const Datapath &dp) {
                               acc.portIdx) &&
              "an access's port slot is out of its boundary port list");
       (void)hasPort;
+      // `reclassifyRoms` and `assignLanes` both skip the arguments, which is
+      // what lets the two plans that read this module's OWN cells share an arm
+      // with the boundary cases.
+      assert((!m.external || (acc.plan != PortPlan::Table &&
+                              acc.plan != PortPlan::Lane)) &&
+             "an argument array is neither a constant table nor skewed");
     }
   }
   assert(listed == 0 && "every memory access belongs to exactly one region");

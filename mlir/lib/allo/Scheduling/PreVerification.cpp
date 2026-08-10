@@ -509,9 +509,11 @@ LogicalResult checkArgumentAgreement(func::FuncOp func,
         return WalkResult::interrupt();
       }
       // Unlike banking, this holds for a boundary array too: its cells are the
-      // caller's, but the latency both sides read them at is one number.
-      std::string mine = characterize(actual, lib).storage;
-      std::string theirs = characterize(param, lib).storage;
+      // caller's, but the latency both sides read them at is one number. Two
+      // records compared, not two characterizations: the two sides are separate
+      // memrefs and only what was recorded for each can say they agree.
+      std::string mine = resolvedStorageOf(actual);
+      std::string theirs = resolvedStorageOf(param);
       if (mine == theirs)
         continue;
       // Off `row` rather than `timing`: a name the device does not declare is

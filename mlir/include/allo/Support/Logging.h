@@ -57,6 +57,7 @@ enum class Code {
   RegionShapeNotScheduled,    // no scheduling regime for this region
   CompilerInconsistency,      // our own model disagrees with itself
   StorageConflict,            // one array, two storage rows that disagree
+  StoragePortsExceeded,       // more concurrent ports than any structure holds
 
   // A backend gap (`unsupported`).
   OperationNotModelled,        // this stage models no such operation
@@ -74,6 +75,7 @@ enum class Code {
   PlacementFailed,             // no feasible cycle for an operation
   NoExactScheduler,            // this build has no OR-Tools
   PartitionedInitializedArray, // banked contents, realized as one bank
+  SkewedArgumentToCallee,      // a skewed array crossing into a call
 };
 
 /// The one table: a code's stable spelling.
@@ -115,6 +117,8 @@ constexpr const char *codeTag(Code code) {
     return "ALLO-E0017";
   case Code::StorageConflict:
     return "ALLO-E0018";
+  case Code::StoragePortsExceeded:
+    return "ALLO-E0019";
   case Code::OperationNotModelled:
     return "ALLO-N0001";
   case Code::MemrefResult:
@@ -143,6 +147,8 @@ constexpr const char *codeTag(Code code) {
     return "ALLO-N0014";
   case Code::PartitionedInitializedArray:
     return "ALLO-N0015";
+  case Code::SkewedArgumentToCallee:
+    return "ALLO-N0016";
   }
   return "";
 }

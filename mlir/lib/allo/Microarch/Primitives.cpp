@@ -14,6 +14,7 @@
 
 #include "mlir/Dialect/Arith/IR/Arith.h" // arith::CmpIPredicate
 #include "mlir/IR/BuiltinTypes.h"
+#include "llvm/Support/MathExtras.h"
 #include "llvm/Support/SaveAndRestore.h"
 
 using namespace mlir;
@@ -71,8 +72,135 @@ void recordMemoryInit(seq::HLMemOp mem, ArrayRef<APInt> words) {
   mem->setAttr(kMemoryInitAttr, ArrayAttr::get(mem.getContext(), vals));
 }
 
-// arith and comb name the same ten integer-compare predicates; map across the
-// two enums.
+//===----------------------------------------------------------------------===//
+// Memory-banking crossbar: one access reaching a bank decided at run time.
+//===----------------------------------------------------------------------===//
+
+Value readCrossbar(EmitContext &c, ArrayRef<Value> bankValues, Value bank) {
+  Value out = bankValues[0]; // bank 0 falls through the priority chain
+  for (unsigned k = 1; k < bankValues.size(); ++k)
+    out = c.mux(c.icmpEq(bank, k), bankValues[k], out);
+  return out;
+}
+
+Value writeDemux(EmitContext &c, Value we, Value bank, unsigned k) {
+  return bank ? c.andBits(we, c.icmpEq(bank, k)) : we;
+}
+
+//===----------------------------------------------------------------------===//
+// Address arithmetic. An address, a bank digit and a scaled counter are all
+// non-negative by construction, so every width change on the address path is
+// the UNSIGNED resize and every divisor a compile-time constant.
+//===----------------------------------------------------------------------===//
+
+// A literal of \p v's own width. Address arithmetic is carried at whatever
+// width the addressed memory needs, so every operand of a `comb` op below has
+// to be built against the value it accompanies rather than a fixed i32.
+static Value konstLike(OpBuilder &b, Location loc, Value v, int64_t k) {
+  return hw::ConstantOp::create(b, loc, v.getType(), k).getResult();
+}
+
+Value addrAt(OpBuilder &b, Location loc, Value v, unsigned width) {
+  return resize(b, loc, v, width, /*isSigned=*/false);
+}
+
+// Unsigned divide by a compile-time constant: a shift for a power of two, else
+// a real divider (synthesis folds a constant divisor into a multiply-shift).
+static Value divConst(OpBuilder &b, Location loc, Value v, int64_t d) {
+  if (d == 1)
+    return v;
+  if (llvm::isPowerOf2_64(d))
+    return comb::ShrUOp::create(b, loc, v,
+                                konstLike(b, loc, v, llvm::Log2_64(d)), false)
+        .getResult();
+  return comb::DivUOp::create(b, loc, v, konstLike(b, loc, v, d), false)
+      .getResult();
+}
+
+// Multiply by a compile-time constant. A power-of-two coefficient is a shift;
+// anything else stays a `comb.mul` deliberately, since synthesis recodes a
+// constant multiplier into a shift-add network better than a decomposition
+// emitted here could.
+static Value mulConst(OpBuilder &b, Location loc, Value v, int64_t k) {
+  if (k == 1)
+    return v;
+  if (k > 0 && llvm::isPowerOf2_64(static_cast<uint64_t>(k)))
+    return comb::ShlOp::create(b, loc, v,
+                               konstLike(b, loc, v, llvm::Log2_64(k)), false)
+        .getResult();
+  return comb::MulOp::create(b, loc, v, konstLike(b, loc, v, k), false)
+      .getResult();
+}
+
+static Value modConst(OpBuilder &b, Location loc, Value v, int64_t d) {
+  if (d == 1)
+    return konstLike(b, loc, v, 0);
+  if (llvm::isPowerOf2_64(d))
+    return comb::AndOp::create(b, loc, v, konstLike(b, loc, v, d - 1), false)
+        .getResult();
+  return comb::ModUOp::create(b, loc, v, konstLike(b, loc, v, d), false)
+      .getResult();
+}
+
+// Evaluate an affine index expression to a hw value \p width bits wide,
+// emitting comb ops. `idx` holds the resolved value of each map operand (dims
+// then symbols), each at the datapath width. Shared by the two places a map
+// reaches the datapath: a memory access's address (bankAddress) and a
+// standalone affine.apply (emitCompute).
+Value evalAffine(OpBuilder &b, Location loc, AffineExpr e, ValueRange idx,
+                 unsigned numDims, unsigned width) {
+  Type t = b.getIntegerType(width);
+  if (auto cst = dyn_cast<AffineConstantExpr>(e))
+    return hw::ConstantOp::create(b, loc, t, cst.getValue()).getResult();
+  if (auto d = dyn_cast<AffineDimExpr>(e))
+    return addrAt(b, loc, idx[d.getPosition()], width);
+  if (auto sym = dyn_cast<AffineSymbolExpr>(e))
+    return addrAt(b, loc, idx[numDims + sym.getPosition()], width);
+  auto bin = cast<AffineBinaryOpExpr>(e);
+  if (e.getKind() == AffineExprKind::Add)
+    return comb::AddOp::create(
+               b, loc, evalAffine(b, loc, bin.getLHS(), idx, numDims, width),
+               evalAffine(b, loc, bin.getRHS(), idx, numDims, width), false)
+        .getResult();
+  if (e.getKind() == AffineExprKind::Mul) {
+    Value lhs = evalAffine(b, loc, bin.getLHS(), idx, numDims, width);
+    // An affine coefficient is always constant, so this is a shift-or-multiply
+    // rather than a general multiplier. A semi-affine map is representable
+    // though, so a non-constant one still lowers.
+    if (auto k = dyn_cast<AffineConstantExpr>(bin.getRHS()))
+      return mulConst(b, loc, lhs, k.getValue());
+    return comb::MulOp::create(
+               b, loc, lhs,
+               evalAffine(b, loc, bin.getRHS(), idx, numDims, width), false)
+        .getResult();
+  }
+  // floordiv/mod by a constant is delinearization left by a coalesced nest over
+  // a non-negative index. Neither is congruent modulo 2^width, so both compute
+  // wide and narrow afterwards.
+  auto rc = dyn_cast<AffineConstantExpr>(bin.getRHS());
+  assert(rc && rc.getValue() > 0 &&
+         "affine div/mod by a non-constant or non-positive divisor");
+  int64_t f = rc.getValue();
+  // With one congruent exception, the one a bank digit always ends in: `x mod
+  // 2^k` IS the low k bits, so that subtree is built k bits wide and the mask
+  // disappears with it. `addressCost` prices it at the same narrowed width.
+  if (e.getKind() == AffineExprKind::Mod && f > 1 &&
+      llvm::isPowerOf2_64(static_cast<uint64_t>(f))) {
+    unsigned k =
+        std::min<unsigned>(width, llvm::Log2_64(static_cast<uint64_t>(f)));
+    return addrAt(b, loc, evalAffine(b, loc, bin.getLHS(), idx, numDims, k),
+                  width);
+  }
+  Value lhs =
+      evalAffine(b, loc, bin.getLHS(), idx, numDims, kDatapathAddressWidth);
+  assert((e.getKind() == AffineExprKind::FloorDiv ||
+          e.getKind() == AffineExprKind::Mod) &&
+         "unexpected affine op");
+  Value q = e.getKind() == AffineExprKind::FloorDiv ? divConst(b, loc, lhs, f)
+                                                    : modConst(b, loc, lhs, f);
+  return addrAt(b, loc, q, width);
+}
+
 static comb::ICmpPredicate combICmpPredicate(arith::CmpIPredicate p) {
   using A = arith::CmpIPredicate;
   using C = comb::ICmpPredicate;

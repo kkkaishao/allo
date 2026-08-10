@@ -150,10 +150,6 @@ class QoR:  # pylint: disable=too-many-instance-attributes
     #: unpriced structure reads as a cheaper design.
     unmodelled: dict[str, int]
     mem_bits: int  # stored bits, every instance counted, apart from the fabric totals
-    #: arrays priced as a multi-write register file: their writes exceed what one
-    #: copy of their storage row provides, and replication cannot serve a write.
-    #: Reads over the budget are not here; they buy copies of the row.
-    regfile_arrays: int
     #: flip-flops the emitted design DECLARES, from the register ledger, and so a
     #: count. ``area.ff`` is the modelled figure beside it: what the part holds
     #: once the deep chains are extracted into SRLs.
@@ -189,17 +185,16 @@ def _operator_costs(device: Device) -> dict[str, tuple]:
     return out
 
 
-def _register_file(device: Device):
-    """What an array no copy count can hold gets realized as: every word gets a
-    data multiplexer and a write decode, which is what a complete partition
-    builds too. The device's ``is_scatter`` row, a row the compiler may choose
-    and price like any other, since the compiler names no storage of its own
-    and neither does this estimator."""
+def _scatter_row(device: Device):
+    """The device's ``is_scatter`` row: one cell per element, selected rather
+    than addressed. What a queue between two children is priced at, the
+    register ledger not holding it and the compiler naming no storage of its
+    own for it."""
     row = next((s for s in device.storage.values() if s.is_scatter), None)
     if row is None:
         raise ValueError(
             f"device {device.name!r} marks no scatter storage, so there is "
-            "nothing to price an array whose writes no copy count can serve"
+            "nothing to price a structure held one cell per element"
         )
     return row.uses
 
@@ -228,13 +223,12 @@ def estimate(report: CompileReport, device: Device = default_device) -> QoR:
     """
     price = device.price
     ip_costs = _operator_costs(device)
-    regfile = _register_file(device)
+    scatter = _scatter_row(device)
 
     by_kind: dict[str, Utilization] = {}
     by_func: dict[str, Utilization] = {}
     unmodelled: Counter = Counter()
     mem_bits = 0
-    regfile_arrays = 0
 
     def charge(kind: str, func: str, spent: Utilization) -> None:
         by_kind[kind] = by_kind.get(kind, Utilization()) + spent
@@ -305,18 +299,6 @@ def estimate(report: CompileReport, device: Device = default_device) -> QoR:
                 # built for. Reported rather than charged as something else.
                 unmodelled[m.storage] += 1
                 continue
-            # An array no number of copies of its row can hold, which is a write
-            # set over one instance's. READ off the emitter's classification,
-            # like the two above it: this used to re-derive the predicate here
-            # and the two halves could then disagree about what was built.
-            if m.realization == "register_file":
-                charge(
-                    "memories",
-                    f.func,
-                    Utilization.of(price(regfile, (m.depth_words, m.width))) * m.banks,
-                )
-                regfile_arrays += 1
-                continue
             # An addressed array costs its row once per instance the compiler
             # decided on and once per bank. The instance count is read off the
             # report, not recomputed here, for the same reason.
@@ -328,16 +310,17 @@ def estimate(report: CompileReport, device: Device = default_device) -> QoR:
                 Utilization.of(price(row.uses, (m.depth_words, m.width))) * copies,
             )
 
-        # A channel between two children is a queue this module builds, priced as
-        # a register file since the register ledger does not hold it. A channel
-        # that does not cross a call is a boundary port or an intra-module queue
-        # the report does not distinguish, so it is charged nowhere.
+        # A channel between two children is a queue this module builds, priced
+        # one cell per element since the register ledger does not hold it. A
+        # channel that does not cross a call is a boundary port or an
+        # intra-module queue the report does not distinguish, so it is charged
+        # nowhere.
         for s in f.streams:
             if s.crosses_call:
                 charge(
                     "memories",
                     f.func,
-                    Utilization.of(price(regfile, (s.depth, s.width))),
+                    Utilization.of(price(scatter, (s.depth, s.width))),
                 )
 
     area = Utilization()
@@ -365,7 +348,6 @@ def estimate(report: CompileReport, device: Device = default_device) -> QoR:
         counted=frozenset({"dsp"}),
         unmodelled=dict(unmodelled),
         mem_bits=mem_bits,
-        regfile_arrays=regfile_arrays,
         reg_bits=report.microarch.reg_bits,
         utilization=area.fraction_of(
             {name: r.capacity for name, r in device.resources.items()}

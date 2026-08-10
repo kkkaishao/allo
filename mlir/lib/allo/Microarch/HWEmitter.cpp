@@ -457,6 +457,10 @@ void HWEmitter::emit() {
   // boundary groups, merged onto the same colours so its OWNER can.
   datapath.finalizeSharedWritePorts();
   datapath.finalizeBoundaryWritePorts();
+  // An internal read port is one address bus for every read coloured onto it,
+  // so it is driven here for the same reason: only now has each of them built
+  // the address it presents.
+  datapath.finalizeSharedReadPorts();
   // Scalar results: the returning region's survivor register, stable once its
   // region (and thus `done`) has risen; the cosim samples it at `done`.
   for (const uarch::Result &r : dp.results)

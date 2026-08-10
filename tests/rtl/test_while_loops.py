@@ -372,7 +372,7 @@ def test_while_multistage_flush_cosim():
 
 def test_while_in_loop_store_cosim():
     # A leaf flushing-while that writes memory in its body. The doomed exit
-    # iteration is issued but must commit nothing: emitAccesses gates each
+    # iteration is issued but must commit nothing: emitWrites gates each
     # store's write-enable by the continue-condition (`issue & cond`), the same
     # rule the loop-carried survivors follow. Covers a single-stage store, a
     # multi-stage store fed by an in-loop carried scalar (deeper drain), and the

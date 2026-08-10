@@ -47,8 +47,6 @@ llvm::StringRef realizationName(MemUnit::Realization r) {
     return "scatter";
   case MemUnit::Realization::Ram:
     return "ram";
-  case MemUnit::Realization::RegisterFile:
-    return "register_file";
   }
   llvm_unreachable("every realization is named");
 }
@@ -125,9 +123,13 @@ FuncUarch::FuncUarch(const Datapath &dp, llvm::StringRef symbol,
     mr.cost.writePorts = m.writePortsBuilt;
     mr.cost.ports = m.portsBuilt;
     mr.cost.instances = m.instances;
+    mr.cost.copiesBudget = m.ports.copies();
     mr.cost.rowReads = m.ports.instReads.value_or(0);
     mr.cost.rowWrites = m.ports.instWrites.value_or(0);
-    mr.realization = realizationName(m.realization);
+    mr.cost.readConcurrency = m.readConcurrency;
+    mr.cost.writeConcurrency = m.writeConcurrency;
+    mr.cost.boundaryPorts = m.boundaryPorts;
+    mr.realization = realizationName(m.realization());
     mr.external = m.external;
     mr.scattered = m.scattered;
     mr.writesIndependent = m.writesIndependent;
@@ -246,8 +248,14 @@ std::string MicroarchReport::toJSON() const {
                   j.attribute("write_ports", (int64_t)m.cost.writePorts);
                   j.attribute("ports", (int64_t)m.cost.ports);
                   j.attribute("instances", (int64_t)m.cost.instances);
+                  j.attribute("copies_budget", (int64_t)m.cost.copiesBudget);
                   j.attribute("row_reads", (int64_t)m.cost.rowReads);
                   j.attribute("row_writes", (int64_t)m.cost.rowWrites);
+                  j.attribute("read_concurrency",
+                              (int64_t)m.cost.readConcurrency);
+                  j.attribute("write_concurrency",
+                              (int64_t)m.cost.writeConcurrency);
+                  j.attribute("boundary_ports", (int64_t)m.cost.boundaryPorts);
                 });
                 j.attribute("external", m.external);
                 j.attribute("scattered", m.scattered);

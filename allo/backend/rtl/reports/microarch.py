@@ -114,11 +114,25 @@ class MemoryCost:
     #: multiplied by; a count read off the emission, not a formula re-applied
     #: here.
     instances: int = 1
+    #: instances the SCHEDULE reserved against, which ``instances`` above may
+    #: exceed: the binding replicates for whatever read bandwidth it was left to
+    #: serve, and this is the budget it overran.
+    copies_budget: int = 1
     #: ports ONE INSTANCE of the row provides, 0 for no limit, which
     #: ``instances`` above is the multiplier of. The row narrowed by the
     #: topology the array asked for, which the device table alone does not give.
     row_reads: int = 0
     row_writes: int = 0
+    #: a lower bound on what one cycle asks of one bank, per direction. The
+    #: ports above are what was built to serve it, and the gap is what the
+    #: binding spent separating accesses the schedule never issues together.
+    #: Zero for a ROM or a scattered array, neither addressed.
+    read_concurrency: int = 0
+    write_concurrency: int = 0
+    #: module interface groups this array contributes: one per bound boundary
+    #: port, one per group a child masters on it, or one per element of a
+    #: scattered argument.
+    boundary_ports: int = 0
 
     @classmethod
     def from_json(cls, d: dict) -> MemoryCost:
@@ -129,8 +143,12 @@ class MemoryCost:
             write_ports=d["write_ports"],
             ports=d["ports"],
             instances=d.get("instances", 1),
+            copies_budget=d.get("copies_budget", 1),
             row_reads=d.get("row_reads", 0),
             row_writes=d.get("row_writes", 0),
+            read_concurrency=d.get("read_concurrency", 0),
+            write_concurrency=d.get("write_concurrency", 0),
+            boundary_ports=d.get("boundary_ports", 0),
         )
 
 
@@ -157,9 +175,8 @@ class Memory:
     rom: bool
     skewed: bool
     #: what the module built to hold it: ``"boundary"`` (the cells are the
-    #: caller's), ``"rom"``, ``"scatter"``, ``"ram"``, or ``"register_file"``
-    #: for an array whose bound ports over-ran its storage row. The emitter's
-    #: own decision, read back rather than re-derived.
+    #: caller's), ``"rom"``, ``"scatter"`` or ``"ram"``. The emitter's own
+    #: decision, read back rather than re-derived.
     realization: str
     #: whether the partition BOUGHT the bandwidth it costs: every access reaches
     #: one bank. An access the analysis could not fix takes a port on every

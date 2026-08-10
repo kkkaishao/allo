@@ -262,6 +262,12 @@ bool isConstantTable(Value memRef);
 /// directives comparable and their disagreement reportable.
 llvm::StringRef boundStorageOf(Value memref);
 
+/// The realization `recordArrayStorage` resolved \p memref to (`kStorageAttr`),
+/// which is what it was ASKED for only where the user bound it. A lookup, so
+/// two carriers of one array agree because there is one record, not because two
+/// derivations were written the same way.
+std::string resolvedStorageOf(Value memref);
+
 /// The two orthogonal axes of one `allo.bind.storage` directive, mapped from
 /// its `type` string (which port topology) and its `impl` string (which storage
 /// realization). The RAM/ROM half of a `type` spelling is not an axis: read-only
@@ -353,7 +359,8 @@ struct MemoryChar {
   /// budget for the scheduler and the emitter both.
   StoragePorts ports;
   bool constantTable = false; // realized as a combinational constant array
-  /// Resolved `dcp.storage` realization. EMPTY only for the one array that has
+  /// The `dcp.storage` realization recorded for this array (`kStorageAttr`),
+  /// read rather than re-resolved. EMPTY only for the one array that has
   /// nowhere to go, a complete partition on a device marking no `scatter` row,
   /// which `PreVerification` reports against the array.
   std::string storage;
@@ -364,11 +371,25 @@ struct MemoryChar {
   bool unlimited() const { return layout.registers || constantTable; }
 };
 
-/// Characterize a memref's storage shape from its partition/storage
-/// attributes, independent of any scheduling region. \p lib resolves the two
-/// rows the array itself does not name: what an unbound array takes, and what a
-/// completely partitioned one scatters into. It has to be the same device the
-/// access latencies were stamped from, or the two disagree.
+/// Where an array carries the `dcp.storage` realization it RESOLVED to. On the
+/// array's carrier, so `dcp-resolve-banking` copies it onto every bank alloc
+/// and a per-bank array answers what the whole one did.
+///
+/// Empty names the one array with nowhere to go, a complete partition on a
+/// device marking no `scatter` row, which `PreVerification` reports.
+constexpr llvm::StringLiteral kStorageAttr = "allo.storage";
+
+/// Resolve every array of \p module to a `dcp.storage` realization and record
+/// it under `kStorageAttr`. Runs ONCE, before any layer asks what an array was
+/// realized as: the resolution is a cost model over the device, and re-running
+/// it per consumer is how two layers come to disagree about one array.
+void recordArrayStorage(ModuleOp module, const MemoryLibrary &lib);
+
+/// Characterize a memref's storage shape from its partition attributes and the
+/// realization `recordArrayStorage` resolved for it, independent of any
+/// scheduling region. \p lib supplies what the device states about that
+/// realization, and has to be the same device the access latencies were stamped
+/// from, or the two disagree.
 MemoryChar characterize(Value memref, const MemoryLibrary &lib);
 
 /// The ports the `allo.bind.storage type=` topology on \p memref asks for, or

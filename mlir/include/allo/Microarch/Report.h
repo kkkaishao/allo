@@ -66,10 +66,22 @@ struct MemCost {
   // decided once the ports are bound. What the cost model multiplies by, read
   // rather than re-derived.
   unsigned instances = 1;
+  // Instances the SCHEDULE reserved against (`StoragePorts::copies`), which
+  // `instances` above may exceed: the binding replicates for whatever read
+  // bandwidth it was left to serve, and this is the budget it overran.
+  unsigned copiesBudget = 1;
   // Read and write ports ONE INSTANCE of the row provides, 0 for no limit,
   // which `instances` beside it is the multiplier of. The row narrowed by the
   // topology the array asked for, which the device table alone does not give.
   unsigned rowReads = 0, rowWrites = 0;
+  // A lower bound on what one cycle asks of this bank, per direction
+  // (`MemUnit::readConcurrency`). The ports above are what was built to serve
+  // it, and the gap is what the binding spent separating accesses the schedule
+  // never issues together. Zero for a ROM or a scattered array, neither
+  // addressed.
+  unsigned readConcurrency = 0, writeConcurrency = 0;
+  // Module interface groups this array contributes (`MemUnit::boundaryPorts`).
+  unsigned boundaryPorts = 0;
 };
 
 /// One array, and the storage decision taken for it.
@@ -87,8 +99,8 @@ struct MemReport {
   bool external = false, scattered = false, writesIndependent = false;
   bool rom = false, skewed = false;
   /// What the module built to hold it (`MemUnit::Realization`, spelled
-  /// "boundary" / "rom" / "scatter" / "ram" / "register_file"), read back from
-  /// the emitter rather than re-derived.
+  /// "boundary" / "rom" / "scatter" / "ram"), read back from the emitter rather
+  /// than re-derived.
   std::string realization;
   /// Whether the partition BOUGHT the bandwidth it costs: every access reaches
   /// one bank. An access the analysis could not fix takes a port on every bank,

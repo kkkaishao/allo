@@ -71,6 +71,10 @@ inline constexpr unsigned kDatapathAddressWidth = kIndexWidth;
 Value resize(OpBuilder &b, Location loc, Value v, unsigned width,
              bool isSigned);
 
+/// \p v resized to \p width bits as an ADDRESS: unsigned, an address, a bank
+/// digit and a scaled counter all being non-negative by construction.
+Value addrAt(OpBuilder &b, Location loc, Value v, unsigned width);
+
 /// Evaluate an affine index expression to a \p width -bit hw value, emitting
 /// comb ops. \p idx holds the resolved value of each map operand (dims then
 /// symbols), each `kDatapathAddressWidth` wide.

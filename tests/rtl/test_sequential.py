@@ -401,9 +401,19 @@ def test_concurrent_shared_array_access():
 
     lw1 = _latency(ibw1)
     lw2 = _latency(ibw2)
-    lrd = _latency(ibrd)
     mod = _to_rtl(ibw_top)
-    assert "seq.hlmem" in mod.mlir  # the shared buffer stays on-chip
+    # Two writers, neither ordered against the other, so no addressed row has a
+    # port for each and the buffer is held in registers. On-chip either way,
+    # which is what this checks.
+    assert mod.microarch.mem("t").storage == "register"
+    # The reader's span is taken from THIS compile, not from `ibrd` alone: `t`
+    # is registers here and addressed storage when the child is compiled on its
+    # own, and the row is what times its reads.
+    lrd = next(
+        c.latency
+        for c in mod.microarch.top.calls
+        if c.callee.endswith("ibrd")
+    )
     out = np.zeros(16, np.int32)
     r = mod.cosim(A16, out)
     assert np.array_equal(out, np.concatenate([A16[:8] + 1, A16[8:] * 2]) - 3)

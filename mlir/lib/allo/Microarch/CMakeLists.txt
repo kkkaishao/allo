@@ -5,8 +5,10 @@ add_mlir_library(MLIRAlloMicroarch
     BindingPolicy.cpp
     Datapath.cpp
     DatapathBuilder.cpp
+    Memory.cpp
     ControlEmitter.cpp
     DatapathEmitter.cpp
+    MemoryEmitter.cpp
     HWEmitter.cpp
     EmitDriver.cpp
     Primitives.cpp

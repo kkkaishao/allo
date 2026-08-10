@@ -292,6 +292,35 @@ struct DatapathEmitter {
   };
   DenseMap<unsigned, SmallVector<SharedWrite, 2>> sharedWrites; // by MemId
 
+  /// What ONE ACCESSOR presents on a shared read port: a region's own accesses,
+  /// having already selected between themselves (`sharedAddress`), or a child
+  /// driving the port it masters. An address is accessor state (delayed
+  /// counters, a stall hold, a child's own output), so it is BUILT where the
+  /// accessor emits and only COMBINED by `finalizeSharedReadPorts`. Two levels,
+  /// because the two selects are different signals: within a region an access's
+  /// activation pulse, between accessors which of them is driving.
+  struct SharedRead {
+    Value addr;
+    /// This accessor is driving now: a region's accesses presenting, or a
+    /// child's run window. Null where it holds the port alone and drives it
+    /// unconditionally.
+    Value fired;
+  };
+  /// One shared read port, keyed by (memory, bank, port). The `seq.read` is
+  /// built by `sharedReadPort` when the first access on it emits and its datum
+  /// is available from that moment, which is what lets every access take it
+  /// before the address that fetches it exists.
+  struct SharedReadPort {
+    Value data;
+    circt::Backedge addr;
+    SmallVector<SharedRead, 1> arms;
+  };
+  /// A MapVector for the same reason `boundaryWrites` is one: the finalize
+  /// iterates it to drive the ports, and the module must not depend on a hash
+  /// order.
+  llvm::MapVector<std::tuple<unsigned, unsigned, unsigned>, SharedReadPort>
+      sharedReads;
+
   /// The same, for a store to an external array. The port group is a module
   /// output that several stores may drive, so only `finalizeBoundaryWritePorts`
   /// drives it, once every region has emitted. Indexed by
@@ -304,6 +333,11 @@ struct DatapathEmitter {
   /// A MapVector, not a DenseMap: `finalizeBoundaryWritePorts` iterates it to
   /// drive the ports, and the emitted module must not depend on a hash order.
   llvm::MapVector<unsigned, SmallVector<BoundaryWrite, 2>> boundaryWrites;
+
+  /// The same for a boundary READ port group's address output, indexed by
+  /// `MemUnit::Access::portIdx`. A group the reads of several regions share is
+  /// one module output, so only `finalizeSharedReadPorts` may drive it.
+  llvm::MapVector<unsigned, SmallVector<SharedRead, 1>> boundaryReads;
 
   /// A kernel-local channel's body wires: what a boundary channel reads off its
   /// module ports, an internal one reads off its own `seq.fifo`. Backedges,
@@ -363,9 +397,6 @@ struct DatapathEmitter {
   /// The cycle a freshly-produced Source's value lands, relative to the issuing
   /// pulse of the iteration that produced it. Used by survivor capture.
   unsigned readyCycle(const uarch::Source &s) const;
-  /// The resolved (already stage-delayed) index sources an access's affine map
-  /// is evaluated over, dims then symbols.
-  llvm::SmallVector<Value> addrSources(const uarch::MemUnit::Access &acc);
   /// One cone \p r of this access's address as hardware at \p width: a
   /// constant, one register per strength-reduced term, and whatever did not
   /// reduce, evaluated.
@@ -385,6 +416,10 @@ struct DatapathEmitter {
                      const uarch::MemUnit::Access &acc);
   /// The element registers of a scattered INTERNAL array, in element order.
   SmallVector<Value> scatterValues(unsigned id);
+  /// \p v delayed to land with the datum of a read of \p m: a bank select and a
+  /// constant table's own output both have to reach the consumer on the cycle
+  /// the data does.
+  Value atReadData(const uarch::MemUnit &m, Value v, const StallShell &sh);
 
   /// Bind external read-data input ports into readData (once, before regions).
   void bindReadPorts();
@@ -426,13 +461,21 @@ struct DatapathEmitter {
   /// Backedge every unit output before any consumer resolves it, so a read
   /// address or another unit input may reference a unit emitted later.
   void declareUnits(const uarch::RegionBlock &rb);
-  void emitInternalReads(const uarch::RegionBlock &rb, Value issue);
-  /// The address one read port presents for the accesses bound to it: each
-  /// drives it on its own issue cycle, held with the datapath so a read frozen
-  /// by back-pressure keeps re-presenting its address. \p idxs indexes
-  /// `m.accesses`, all in the region \p sh and \p issue belong to.
+  /// Bind the datum of every read scheduled in region \p rb into `readData`,
+  /// before `emitUnits` consumes it. One arm per `PortPlan`; the one it cannot
+  /// serve is a boundary port group, whose address may be computed by a unit
+  /// (`emitExternalReadAddrs`) and whose datum `bindReadPorts` already bound.
+  void emitReads(const uarch::RegionBlock &rb, Value issue);
+  /// The address ONE REGION's accesses on a port present: each drives it on its
+  /// own issue cycle, held with the datapath so a read frozen by back-pressure
+  /// keeps re-presenting its address. \p idxs indexes `m.accesses`, all in the
+  /// region \p sh and \p issue belong to. \p fired, when given, additionally
+  /// receives "one of them is presenting now", which is what a port ANOTHER
+  /// region also holds selects on; ask for it only there, since a lone region
+  /// on a port drives it unconditionally and would build the pulse for nothing.
   Value sharedAddress(const uarch::MemUnit &m, ArrayRef<unsigned> idxs,
-                      Value issue, const StallShell &sh);
+                      Value issue, const StallShell &sh,
+                      Value *fired = nullptr);
   /// Stamp an emitted `seq.read`/`seq.write` with the physical port it drives
   /// (`kMemPortAttr`), which puts a port's read and write in one `always`
   /// block and so makes them one port of a dual-port RAM.
@@ -440,19 +483,9 @@ struct DatapathEmitter {
     op->setAttr(kMemPortAttr, c.b.getI64IntegerAttr(port));
     return op;
   }
-  /// The skewed halves of the two above: one port per bank per LANE instead of
-  /// per bank per access, the bandwidth a skewed layout exists to buy.
-  void emitSkewedInternalReads(const uarch::RegionBlock &rb);
-  void emitSkewedInternalWrites(const uarch::RegionBlock &rb, Value commit,
-                                DatapathFeedback &fb);
-  /// Read crossbar for each data-dependent external (argument) read in region
-  /// \p rb: drive every bank interface's address with the offset, read each
-  /// bank's data port, and mux by the runtime bank. Bound into readData before
-  /// emitUnits consumes it, like emitInternalReads.
-  void emitExternalReads(const uarch::RegionBlock &rb);
   /// Drive the read-address port of each single-interface external port group
   /// in region \p rb (unbanked or statically banked); the data-dependent ones
-  /// are `emitExternalReads`. Runs after the units, so an address computed by
+  /// are `emitReads`. Runs after the units, so an address computed by
   /// one resolves to its filled value rather than a dangling backedge.
   void emitExternalReadAddrs(const uarch::RegionBlock &rb, Value issue);
   /// Where a region's units are being emitted from, which decides whether a
@@ -484,11 +517,11 @@ struct DatapathEmitter {
   std::pair<Value, unsigned> emitConditionRegion(const uarch::RegionBlock &rb,
                                                  const uarch::Source &condSrc);
   void resolveRegHeads(const uarch::RegionBlock &rb);
-  /// External read addresses + all writes (external ports / internal
-  /// seq.write), gated by \p issue, folding the deepest store's stage into
-  /// \p fb.storeDrain.
-  void emitAccesses(const uarch::RegionBlock &rb, Value issue,
-                    DatapathFeedback &fb);
+  /// Every write scheduled in region \p rb, gated by \p issue, folding the
+  /// deepest store's stage into \p fb.storeDrain. One arm per `PortPlan`, as
+  /// `emitReads`.
+  void emitWrites(const uarch::RegionBlock &rb, Value issue,
+                  DatapathFeedback &fb);
 
   /// Instantiate each CallUnit (dcp.instance) in region \p rb as a child
   /// `hw.instance` and fold the child's `done` into \p fb.callDone. Runs BEFORE
@@ -496,6 +529,15 @@ struct DatapathEmitter {
   /// is an ordinary datapath Source a register chain or a store may read.
   void emitCalls(const uarch::RegionBlock &rb, Value issue,
                  DatapathFeedback &fb);
+  /// Master each memref operand of child \p cu from its instance outputs
+  /// \p outs. One arm per `PortPlan`, as `emitReads` and `emitWrites`.
+  /// \p rdBackedge holds the read-data promise each of the child's read ports
+  /// waits on; \p runWindow is the window the child owns a port a second
+  /// accessor also holds, built on demand.
+  void masterCallPorts(const uarch::CallUnit &cu, llvm::StringMap<Value> &outs,
+                       llvm::StringMap<circt::Backedge> &rdBackedge,
+                       llvm::function_ref<Value()> runWindow,
+                       const StallShell &sh);
   /// The start pulse of one child, from the start-policy table read on this
   /// node's contract and its region's composition class.
   Value startForCall(const uarch::CallUnit &cu, Value issue,
@@ -541,6 +583,30 @@ struct DatapathEmitter {
   /// output port and drives nothing.
   void finalizeScatteredPorts();
   void finalizeSharedWritePorts();
+  /// The `seq.read` of \p m's bank \p bank on read port \p port, built on the
+  /// first access to reach it and reused by every later one. Its address is a
+  /// backedge: the accesses sharing a port drive it on their own cycles, so it
+  /// is only known once they have all emitted.
+  Value sharedReadPort(const uarch::MemUnit &m, unsigned bank, unsigned port);
+  /// Drive each shared read port's one address bus from the arms the regions
+  /// holding it contributed, and each shared boundary read group's address
+  /// output likewise. Call exactly once, with the same timing as the write
+  /// finalizes.
+  void finalizeSharedReadPorts();
+  /// The address bus \p arms drive between them: the one region's address where
+  /// it holds the port alone, otherwise a priority mux over which of them is
+  /// presenting, falling back to a register holding the last address so a read
+  /// frozen mid-flight keeps re-presenting it.
+  Value regionSelectedAddress(ArrayRef<SharedRead> arms);
+  /// Whether the reads on boundary port group \p portIdx of \p m sit in more
+  /// than one region, so the group needs a select over which is presenting.
+  static bool multiRegionPort(const uarch::MemUnit &m, unsigned portIdx);
+  /// Whether read port \p port of \p m's bank \p bank is held by more than one
+  /// ACCESSOR: a region whose own accesses reach it, or a child that masters
+  /// it. The two kinds say they are driving in different ways, so this counts
+  /// holders rather than regions.
+  bool sharedInternalPort(const uarch::MemUnit &m, unsigned bank,
+                          unsigned port) const;
   /// Drive each merged boundary write port group from the stores coloured onto
   /// it. Call exactly once, with the same timing as the two above.
   void finalizeBoundaryWritePorts();

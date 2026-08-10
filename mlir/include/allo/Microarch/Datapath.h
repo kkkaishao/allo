@@ -17,6 +17,7 @@
 #include "mlir/IR/Operation.h"
 #include "mlir/IR/Types.h"
 #include "mlir/IR/Value.h"
+#include "llvm/ADT/BitVector.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/STLFunctionalExtras.h" // function_ref
 #include "llvm/ADT/SmallVector.h"
@@ -181,6 +182,30 @@ struct Register {
   unsigned ready = 0;
 };
 
+/// How an access REACHES its memory, which is a separate question from what the
+/// memory IS (`MemUnit::Realization`): a skew is not a kind of storage, it is a
+/// way of handing out ports on an ordinary addressed array. Decided once per
+/// access by `planAccessPorts` and dispatched on by both emit paths. A port a
+/// child masters (`CallUnit::MemArg`) plans like an access.
+enum class PortPlan {
+  /// No address port at all: one cell (or one boundary port) per element, and
+  /// an access picks its element by comparing the index. What a complete
+  /// partition buys, and why it may serve any number of accesses at once.
+  ElementWise,
+  /// A combinational constant table, indexed and then registered to the read
+  /// latency the schedule timed the access at. No port to contend for.
+  Table,
+  /// One address bus per colour, carrying every access `bindMemoryPorts` proved
+  /// never issues with the others on it, each driving it on its own activation.
+  Coloured,
+  /// A skewed array's lane: one port per bank, taken by whichever of the lane's
+  /// accesses the rotation sends there.
+  Lane,
+  /// A bank decided at run time: a port on EVERY bank, the datum selected by
+  /// the bank digit aligned with it.
+  Crossbar,
+};
+
 /// A memref-backed memory with banks and ports. Which `dcp.storage` the device
 /// realizes it in is resolved by the memory model; this model records the name,
 /// but physical selection (address decode, per-primitive ports) is left to
@@ -233,9 +258,8 @@ struct MemUnit {
   llvm::SmallVector<ElemPort> elemPorts;
   std::string storage; // resolved `dcp.storage` realization
   /// The vendor attribute pinning the array to `storage`, from that row. Empty
-  /// where the row declares none. Stamped on the emitted declaration only where
-  /// the array is realized as a `Ram`, a register file having been decided
-  /// against the row.
+  /// where the row declares none. Stamped on every `Ram` this module declares,
+  /// the row being its own decision rather than the synthesizer's.
   std::string ramStyle;
 
   /// Ports one instance of `storage` provides, from its `dcp.storage` row
@@ -250,6 +274,19 @@ struct MemUnit {
   /// may carry both a read and a write. A skewed bank serves a whole lane from
   /// one port. Zero for a scattered memory and for a ROM, neither addressed.
   unsigned readPortsBuilt = 0, writePortsBuilt = 0, portsBuilt = 0;
+
+  /// Accesses of one bank the model cannot separate in time, per direction: a
+  /// lower bound on what the schedule asks of this array in a cycle, against
+  /// which the ports above are what was built for it. The two differ wherever
+  /// the binding separates a pair the schedule never issues together, so the
+  /// gap is what replication is being spent on. `portConcurrency` says how it
+  /// is bounded. Zero for an unmeasured array: a ROM or a scattered array,
+  /// neither addressed.
+  unsigned readConcurrency = 0, writeConcurrency = 0;
+  /// Module interface groups this array contributes: one per bound boundary
+  /// port, one per group a child masters on it, or one per element of a
+  /// scattered argument. Zero for an internal array.
+  unsigned boundaryPorts = 0;
 
   /// Whether `storage` can hold the ports this memory is built with, over as
   /// many copies as that takes. Reads never decide it: a further read is a
@@ -273,10 +310,9 @@ struct MemUnit {
     return (uint64_t(bank) << 32) | port;
   }
 
-  /// What this module builds to hold the array, decided by
-  /// `classifyRealizations` from the port binding and read by the emitter and
-  /// the report. Not by the cost model, which prices an addressed array by
-  /// `instances` of its row whichever of the two addressed cases it is.
+  /// What this module builds to hold the array, read by the emitter and the
+  /// report. A NAME for what the three facts below already say, not a further
+  /// decision, so it is spelled once here rather than stored beside them.
   enum class Realization {
     /// Nothing: the cells are the caller's and this module holds ports on
     /// them. Every argument array, addressed or scattered.
@@ -287,15 +323,22 @@ struct MemUnit {
     /// One register per element, selected by comparison rather than addressed,
     /// which is what buys a complete partition its unlimited ports.
     Scatter,
-    /// An addressed array whose bound ports its `storage` row can serve.
+    /// An addressed array, held in as many copies of its `storage` row as its
+    /// read ports take. The only realization an internal addressed array has:
+    /// `characterize` keeps a pooled row's write budget one port short of the
+    /// pool, so the reads always have somewhere to go, and a binding that
+    /// overruns the row anyway is reported rather than realized as something
+    /// else.
     Ram,
-    /// An addressed array whose bound ports exceed that row. Emitted in the
-    /// same shape as a Ram, which the synthesizer serves by replicating the
-    /// array per read port; the two differ only in that a Ram carries the row's
-    /// `ram_style` and this does not.
-    RegisterFile,
   };
-  Realization realization = Realization::Ram;
+  /// An argument is a boundary whatever shape its cells have upstream: this
+  /// module builds none of them and only holds ports on them.
+  Realization realization() const {
+    return external    ? Realization::Boundary
+           : isRom     ? Realization::Rom
+           : scattered ? Realization::Scatter
+                       : Realization::Ram;
+  }
 
   // Access latency of `storage`, the same numbers the scheduler stamped onto
   // this memref's `dcp.load`/`dcp.store` (asserted per access in
@@ -324,6 +367,8 @@ struct MemUnit {
     /// in the same cycle, so the port carries a select rather than an arbiter.
     /// Under a skewed layout it is the access's `lane`.
     unsigned port = 0;
+    /// How this access reaches the storage, and so which emit path it takes.
+    PortPlan plan = PortPlan::Coloured;
     /// This access's slot in the module's boundary port list: an index into
     /// `Datapath::readPorts` or `writePorts` by `isWrite`, and thus its port
     /// identity at the boundary. `kNoPort` for an access to an internal
@@ -447,6 +492,9 @@ struct CallUnit {
     /// `bindMemoryPorts` assignment the caller's own accesses take
     /// (`MemUnit::Access::port`).
     unsigned port = 0;
+    /// How this port reaches the storage. Never `Crossbar`: a child masters one
+    /// bank, already indexed in that bank's own space.
+    PortPlan plan = PortPlan::Coloured;
     /// The child says its write ports on this argument never collide, so the
     /// array backing them may give each its own `always` block
     /// (`MemUnit::writesIndependent`, `iface::Memory::independent`).
@@ -955,10 +1003,21 @@ struct Datapath {
     int bank = -1;
   };
 
-  /// The accesses of \p id in direction \p writes that hold a port, and the
-  /// "can issue in one cycle" relation over them, one adjacency bitset per
-  /// vertex. A child's port counts as an access. \p writes selects one
-  /// direction; nullopt takes both, writes before reads.
+  /// The accesses of one array that hold a port, and the "can issue in one
+  /// cycle" relation over them. A child's port counts as an access.
+  struct PortRelation {
+    llvm::SmallVector<PortVertex> verts;
+    /// Which vertices vertex `i` may issue with; never itself.
+    llvm::SmallVector<llvm::BitVector> adj;
+    unsigned size() const { return verts.size(); }
+    void link(unsigned i, unsigned j) {
+      adj[i].set(j);
+      adj[j].set(i);
+    }
+  };
+
+  /// The relation over the accesses of \p id. \p writes selects one direction;
+  /// nullopt takes both, writes before reads.
   ///
   /// Conservative in the safe direction. Only an ordering the model already
   /// proves separates a pair: two top-level regions touching one array are
@@ -967,13 +1026,15 @@ struct Datapath {
   /// different modulo residues never share a cycle, and two accesses committing
   /// to different banks contend for nothing. Anything else counts as
   /// simultaneous, so a non-edge is a proof and an edge is the absence of one.
-  ///
-  /// Empty (shorter than \p verts) above the 64 vertices a bitset holds, where
-  /// the relation is not built and every caller treats each access as
-  /// simultaneous.
-  llvm::SmallVector<uint64_t>
-  portGraph(MemId id, std::optional<bool> writes,
-            llvm::SmallVectorImpl<PortVertex> &verts) const;
+  PortRelation portGraph(MemId id, std::optional<bool> writes) const;
+
+  /// A LOWER BOUND on the accesses of \p id in direction \p writes that one
+  /// cycle has to serve: the largest `portGraph` clique a greedy expansion from
+  /// each vertex finds. Never above the true maximum, so a gap against the
+  /// ports built is real rather than an artefact of the bound. Exact at the
+  /// sizes that decide anything, a clique of one or two. Zero for a direction
+  /// with no access.
+  unsigned portConcurrency(MemId id, bool writes) const;
 };
 
 //===----------------------------------------------------------------------===//

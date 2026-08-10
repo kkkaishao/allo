@@ -202,14 +202,78 @@ bool mlir::allo::isConstantTable(Value memRef) {
   });
 }
 
+// Whether anything may READ this array. An argument's cells belong to whoever
+// passed it and its readers are not visible here, so it is always taken as
+// read; so is an array crossing into a sub-kernel, whichever way the child
+// accesses it. Both are the safe answer, and both are what makes the budget
+// below the SAME number on the two sides of a call, which it has to be: the two
+// hold ports on one structure.
+static bool mayBeRead(Value memRef) {
+  if (isa<BlockArgument>(memRef))
+    return true;
+  return llvm::any_of(memRef.getUsers(), [](Operation *u) {
+    if (isa<func::CallOp, dcp::DCPathInstanceOp>(u))
+      return true;
+    auto a = asMemAccess(u);
+    return a && !a->isWrite;
+  });
+}
+
+static bool writtenThrough(Value memRef);
+
+// Whether \p call may write \p memRef: a callee with no body may write anything
+// it is handed, and one with a body writes it where a parameter it lands on is
+// written through.
+static bool calleeWrites(func::CallOp call, Value memRef) {
+  auto callee = SymbolTable::lookupNearestSymbolFrom<func::FuncOp>(
+      call, call.getCalleeAttr());
+  if (!callee || callee.isExternal())
+    return true;
+  for (auto [k, actual] : llvm::enumerate(call.getArgOperands()))
+    if (actual == memRef && writtenThrough(callee.getArgument(k)))
+      return true;
+  return false;
+}
+
+// Whether \p memRef is written anywhere at or below this point: a store here,
+// or a call that writes it. The call graph is acyclic (`PreVerification`
+// refuses a cyclic one), so the walk terminates.
+static bool writtenThrough(Value memRef) {
+  return llvm::any_of(memRef.getUsers(), [&](Operation *u) {
+    if (auto call = dyn_cast<func::CallOp>(u))
+      return calleeWrites(call, memRef);
+    auto a = asMemAccess(u);
+    return a && a->isWrite;
+  });
+}
+
+// Sub-kernel calls that WRITE \p memRef. Two of them run together wherever
+// their footprints do not collide, since only a collision orders a pair, and
+// then the array needs a write port each. This function's own stores are not
+// counted: however many they are, they belong to one accessor the schedule
+// serializes against whatever budget the row gives, and a call is ordered
+// against them by the region they sit in.
+static unsigned writingCalls(Value memRef) {
+  unsigned n = 0;
+  for (Operation *u : memRef.getUsers())
+    if (auto call = dyn_cast<func::CallOp>(u))
+      n += calleeWrites(call, memRef);
+  return n;
+}
+
 // The name of the storage realization a memref resolves to, the input to
-// per-realization access timing, in the order the four sources outrank each
+// per-realization access timing, in the order the five sources outrank each
 // other:
 //
 //   * a complete partition takes the device's `scatter` row whatever
 //     `bind.storage impl` says, since once every bank holds one word there is
 //     no addressed structure left;
 //   * else an explicit `bind.storage impl`, the user's own choice;
+//   * else the `scatter` row again for a LOCAL array several sub-kernels
+//     write, since an addressed structure has no more write ports than it has
+//     ports and only registers take a write decoder per writer. Not for an
+//     argument: its cells are the caller's, and this module only holds ports
+//     on them;
 //   * else the device's `default` row where it marks one, which is a device
 //     stating the policy itself and turns the derivation off;
 //   * else the row `rowFor` derives from what the array COSTS on this part.
@@ -217,10 +281,10 @@ bool mlir::allo::isConstantTable(Value memRef) {
 // An empty result is a device that can hold this array nowhere, which
 // `PreVerification` reports.
 //
-// Off the array's own shape and the device alone, so every caller reaches the
-// same row: the scheduler times against it before there is a schedule, and the
+// Run ONCE per array, by `recordArrayStorage`. Every layer after reads the
+// record: the scheduler times against it before there is a schedule, and the
 // emitter builds it after.
-static std::string resolveStorage(Value memRef, const MemoryLibrary &lib) {
+static std::string deriveStorage(Value memRef, const MemoryLibrary &lib) {
   BankLayout layout = bankLayoutOf(memRef);
   if (layout.registers)
     return lib.scatterStorage;
@@ -228,6 +292,8 @@ static std::string resolveStorage(Value memRef, const MemoryLibrary &lib) {
       parseBindStorage(carrierAttr<DictionaryAttr>(memRef, kBindStorageAttr));
   if (!bs.storage.empty())
     return bs.storage.str();
+  if (!isa<BlockArgument>(memRef) && writingCalls(memRef) > 1)
+    return lib.scatterStorage;
   if (!lib.defaultStorage.empty())
     return lib.defaultStorage;
   auto type = dyn_cast<MemRefType>(memRef.getType());
@@ -238,6 +304,91 @@ static std::string resolveStorage(Value memRef, const MemoryLibrary &lib) {
   // minimum is charged once per bank and very much can.
   return lib.rowFor(layout.bankWords(), datapathWidth(type.getElementType()),
                     globalInitOf(memRef).has_value());
+}
+
+std::string allo::resolvedStorageOf(Value memRef) {
+  auto rec = carrierAttr<StringAttr>(memRef, kStorageAttr);
+  assert(rec && "`recordArrayStorage` resolves every array before any layer "
+                "asks what it was realized as");
+  return rec.str();
+}
+
+// Write \p value onto the carrier `carrierAttr` reads.
+static void setCarrierAttr(Value memRef, StringRef name, Attribute value) {
+  if (Operation *def = memRef.getDefiningOp()) {
+    if (auto get = dyn_cast<memref::GetGlobalOp>(def)) {
+      auto global = SymbolTable::lookupNearestSymbolFrom<memref::GlobalOp>(
+          get, get.getNameAttr());
+      assert(global && "get_global references an undefined memref.global");
+      global->setAttr(name, value);
+      return;
+    }
+    def->setAttr(name, value);
+    return;
+  }
+  auto barg = cast<BlockArgument>(memRef);
+  cast<FunctionOpInterface>(barg.getOwner()->getParentOp())
+      .setArgAttr(barg.getArgNumber(), name, value);
+}
+
+// The parameter each memref argument of \p call binds, with the array passed
+// to it. Empty for a callee with no body.
+static void
+calleeParams(func::CallOp call,
+             llvm::SmallVectorImpl<std::pair<Value, Value>> &out) {
+  auto callee = SymbolTable::lookupNearestSymbolFrom<func::FuncOp>(
+      call, call.getCalleeAttr());
+  if (!callee || callee.isExternal())
+    return;
+  for (auto [k, actual] : llvm::enumerate(call.getArgOperands()))
+    if (isa<MemRefType>(actual.getType()))
+      out.emplace_back(actual, callee.getArgument(k));
+}
+
+void allo::recordArrayStorage(ModuleOp module, const MemoryLibrary &lib) {
+  // A parameter a call binds is not an OWNER of its array: the cells are the
+  // caller's, and inputs to the resolution like who writes the array are only
+  // all visible where they live. Its record is carried in rather than derived,
+  // which is also what keeps the two sides of a call one decision.
+  llvm::DenseSet<void *> bound;
+  llvm::SmallVector<std::pair<Value, Value>> params;
+  module.walk([&](func::CallOp call) { calleeParams(call, params); });
+  for (auto [actual, param] : params)
+    bound.insert(param.getAsOpaquePointer());
+
+  llvm::SmallVector<std::pair<Value, std::string>> work;
+  auto own = [&](Value memRef) {
+    if (isa<MemRefType>(memRef.getType()) &&
+        !bound.contains(memRef.getAsOpaquePointer()))
+      work.emplace_back(memRef, deriveStorage(memRef, lib));
+  };
+  // Every root an access can name: an allocation, a reference to a declared
+  // global, or an array a function was handed from outside the module.
+  module.walk([&](Operation *op) {
+    if (isa<memref::AllocOp, memref::AllocaOp, memref::GetGlobalOp>(op))
+      own(op->getResult(0));
+    if (auto fn = dyn_cast<FunctionOpInterface>(op); fn && !fn.isExternal())
+      for (BlockArgument arg : fn.getArguments())
+        own(arg);
+  });
+
+  while (!work.empty()) {
+    auto [memRef, row] = work.pop_back_val();
+    setCarrierAttr(memRef, kStorageAttr,
+                   StringAttr::get(module.getContext(), row));
+    llvm::SmallVector<std::pair<Value, Value>> reached;
+    for (Operation *u : memRef.getUsers())
+      if (auto call = dyn_cast<func::CallOp>(u))
+        calleeParams(call, reached);
+    for (auto [actual, param] : reached)
+      if (actual == memRef) {
+        // A parameter naming its own `impl=` keeps what IT resolves to, so a
+        // user binding one array to two rows is still a disagreement
+        // `checkArgumentAgreement` reports rather than one silently overridden.
+        StringRef bind = boundStorageOf(param);
+        work.emplace_back(param, bind.empty() ? row : bind.str());
+      }
+  }
 }
 
 StringRef allo::boundStorageOf(Value memRef) {
@@ -856,13 +1007,13 @@ MemoryLibrary::Timing MemoryLibrary::timing(Operation *op) const {
   auto a = asMemAccess(op);
   if (!a)
     return {};
-  // A stream is a FIFO, timed by its own row rather than via `resolveStorage`
+  // A stream is a FIFO, timed by its own row rather than by a realization
   // (which also returns empty for an array with no declared realization).
   // Branch on the access kind, not the resolved name, or the two cases collide.
   std::string name;
   MemKindTiming t = fifo;
   if (a->kind != AccessKind::Stream) {
-    name = resolveStorage(a->root, *this);
+    name = resolvedStorageOf(a->root);
     // The one way a resolution comes back empty is a completely partitioned
     // array on a device marking no `scatter` row, which `PreVerification`
     // rejects; reaching here means that check was bypassed.
@@ -878,7 +1029,7 @@ MemoryChar allo::characterize(Value memref, const MemoryLibrary &lib) {
   MemoryChar c;
   c.constantTable = isConstantTable(memref);
   c.layout = bankLayoutOf(memref);
-  c.storage = resolveStorage(memref, lib);
+  c.storage = resolvedStorageOf(memref);
   // The realization decides what the array has and a `type=` topology narrows
   // it, the meet keeping the tighter of the two. `PreVerification` reports a
   // topology asking for more than the row has.
@@ -890,5 +1041,18 @@ MemoryChar allo::characterize(Value memref, const MemoryLibrary &lib) {
     c.ports = row->ports;
   if (auto want = requestedPortsOf(memref))
     c.ports = c.ports.meet(*want);
+  // Writes that fill a POOLED row's ports leave a read no port on any copy, so
+  // the array would fit nowhere however many copies it took. Keep one port of
+  // the pool for the reads and let the schedule serialize the writes against
+  // it: a longer schedule is a structure the part has, and the alternative is
+  // an array no row holds.
+  //
+  // A budget the scheduler bills against and the binding builds to, so the two
+  // stay one number. Not applied where the ports are `stated`: the user named
+  // the topology, and a demand it cannot meet is theirs to hear about.
+  if (c.ports.instPool && !c.ports.stated && mayBeRead(memref))
+    c.ports.instWrites =
+        std::max(1u, std::min(c.ports.instWrites.value_or(*c.ports.instPool),
+                              *c.ports.instPool - 1));
   return c;
 }

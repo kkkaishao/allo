@@ -318,10 +318,10 @@ double unitSlack(const FuncUnit &u, float cycleTime,
   return slack;
 }
 
-llvm::SmallVector<uint64_t>
-Datapath::portGraph(MemId id, std::optional<bool> writes,
-                    llvm::SmallVectorImpl<PortVertex> &verts) const {
+Datapath::PortRelation Datapath::portGraph(MemId id,
+                                           std::optional<bool> writes) const {
   const MemUnit &m = mems[id];
+  PortRelation rel;
   // Top-level ancestor of a region: the granularity `recordSiblingDeps` orders
   // at, and a container's children stay serial below it.
   auto topOf = [&](RegionId r) {
@@ -331,15 +331,20 @@ Datapath::portGraph(MemId id, std::optional<bool> writes,
   };
   // Does call \p a precede \p b transitively? A channel-joined pair in a
   // concurrent container is deliberately NOT ordered, and writes from such a
-  // pair really are simultaneous.
+  // pair really are simultaneous. Memoized: the pair loop below is quadratic in
+  // the accesses and this walk is the only part of it that is not constant.
+  llvm::DenseMap<std::pair<CallId, CallId>, bool> precedes;
   auto callPrecedes = [&](CallId a, CallId b) {
+    auto [it, isNew] = precedes.try_emplace({a, b}, false);
+    if (!isNew)
+      return it->second;
     llvm::SmallVector<CallId> work{b};
     llvm::SmallDenseSet<CallId> seen{b};
     while (!work.empty()) {
       CallId c = work.pop_back_val();
       for (const CallUnit::Pred &p : calls[c].predecessors) {
         if (p.call == a)
-          return true;
+          return precedes[{a, b}] = true;
         if (seen.insert(p.call).second)
           work.push_back(p.call);
       }
@@ -361,7 +366,7 @@ Datapath::portGraph(MemId id, std::optional<bool> writes,
   };
   llvm::SmallVector<When> ws;
   auto add = [&](const When &w, unsigned access, bool write, bool independent) {
-    verts.push_back({access, w.call, independent, write, w.bank});
+    rel.verts.push_back({access, w.call, independent, write, w.bank});
     ws.push_back(w);
   };
   // Writes before reads, and this function's own accesses before the ports its
@@ -383,12 +388,6 @@ Datapath::portGraph(MemId id, std::optional<bool> writes,
           add({topOf(cu.region), cu.region, 0, int(cu.id), bankOf(ma.bank)},
               kNoAccess, dir, ma.independent);
   }
-  // The bitsets are 64 wide. Above that the relation is not built and every
-  // caller treats each access as simultaneous, which only over-states and so
-  // never merges a port unsafely.
-  if (ws.size() > 64)
-    return {};
-
   // A container drives its children serially, so two accesses in different
   // regions under one top are ordered UNLESS a concurrent container is in the
   // chain, which places every child at 0.
@@ -416,14 +415,31 @@ Datapath::portGraph(MemId id, std::optional<bool> writes,
     }
     return true;
   };
-  llvm::SmallVector<uint64_t> adj(ws.size(), 0);
+  rel.adj.assign(ws.size(), llvm::BitVector(ws.size()));
   for (unsigned i = 0; i < ws.size(); ++i)
     for (unsigned j = i + 1; j < ws.size(); ++j)
-      if (overlaps(ws[i], ws[j])) {
-        adj[i] |= uint64_t(1) << j;
-        adj[j] |= uint64_t(1) << i;
-      }
-  return adj;
+      if (overlaps(ws[i], ws[j]))
+        rel.link(i, j);
+  return rel;
+}
+
+unsigned Datapath::portConcurrency(MemId id, bool writes) const {
+  PortRelation rel = portGraph(id, writes);
+  unsigned n = rel.size();
+  // Grow a clique from each vertex, always taking the lowest remaining
+  // candidate. A vertex is never adjacent to itself, so intersecting with the
+  // one just taken drops it from the candidate set.
+  unsigned best = n ? 1 : 0;
+  for (unsigned s = 0; s < n; ++s) {
+    llvm::BitVector cand = rel.adj[s];
+    unsigned size = 1;
+    while (cand.any()) {
+      cand &= rel.adj[cand.find_first()];
+      ++size;
+    }
+    best = std::max(best, size);
+  }
+  return best;
 }
 
 void Datapath::dump(llvm::raw_ostream &os) const {
