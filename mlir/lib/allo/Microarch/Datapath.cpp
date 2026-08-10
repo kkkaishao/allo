@@ -69,6 +69,18 @@ llvm::StringRef shapeName(RegionBlock::Shape s) {
   llvm_unreachable("unhandled RegionBlock::Shape");
 }
 
+llvm::StringRef startPolicyName(CallUnit::StartPolicy p) {
+  switch (p) {
+  case CallUnit::StartPolicy::Handshake:
+    return "handshake";
+  case CallUnit::StartPolicy::Broadcast:
+    return "broadcast";
+  case CallUnit::StartPolicy::TimeTriggered:
+    return "timed";
+  }
+  llvm_unreachable("unhandled CallUnit::StartPolicy");
+}
+
 Operation *Datapath::producingOp(const Source &s) const {
   switch (s.kind) {
   case Source::Kind::Unit:
@@ -99,9 +111,46 @@ std::optional<int64_t> Datapath::constantOf(const Source &s) const {
   return ia ? std::optional<int64_t>(ia.getInt()) : std::nullopt;
 }
 
+unsigned Datapath::readyCycle(const Source &s) const {
+  switch (s.kind) {
+  // A call is the one producer whose result does NOT land at `stage +
+  // latency`: it lands at its region-relative issue plus the CALLEE's whole
+  // start->done depth. Indeterminate calls are guarded earlier.
+  case Source::Kind::Call: {
+    const CallUnit &cu = calls[s.id];
+    assert(cu.latency && "readyCycle of an indeterminate call result");
+    return cu.start + static_cast<unsigned>(*cu.latency);
+  }
+  case Source::Kind::Unit: {
+    const FuncUnit &u = units[s.id];
+    return u.boundOps[s.outPort].stage + u.latency;
+  }
+  case Source::Kind::Mem: {
+    const MemUnit &m = mems[s.id];
+    return m.accesses[s.outPort].stage + m.readLatency;
+  }
+  // A get is a combinational front-read of the FIFO, so it lands at issue.
+  case Source::Kind::Stream:
+    return streams[s.id].accesses[s.outPort].stage;
+  // A held source has no landing stage: a literal is constant, an IO port
+  // stable for the whole kernel, and a counter or survivor a register settled
+  // by the time the region reading it issues.
+  case Source::Kind::Const:
+  case Source::Kind::IO:
+  case Source::Kind::Counter:
+  case Source::Kind::Survivor:
+    return 0;
+  case Source::Kind::Reg:
+  case Source::Kind::Mux:
+  case Source::Kind::None:
+    break;
+  }
+  llvm_unreachable("readyCycle only models a producing or held Source");
+}
+
 Datapath::Datapath(dcp::DCPathModuleOp func, const BindingPolicy &policy,
                    const DeviceModel &dev, float cycleTime,
-                   const CalleeCtx *callees, bool isTop) {
+                   const CalleeCtx &callees, bool isTop) {
   // What the model is OF, settled here rather than half here and half in the
   // builder: both are properties of the request, not of anything derived.
   this->func = func;
@@ -308,9 +357,7 @@ double muxLevelDelay(const OperatorLibrary &lib) {
   // width buys mux LUTs (`set_mux_uses`) rather than levels. The full row delay
   // and not the marginal one: a level of a wide one-hot select pays routing
   // comparable to a whole register-to-register hop, not the LUT hop a narrow
-  // cone pays. This still under-predicts a wide select by about 1.4x, since a
-  // mux level's delay grows with the data width and `muxLevels` does not see
-  // that.
+  // cone pays.
   return lib.combDelay(OpKind::Or, 1);
 }
 
@@ -362,11 +409,9 @@ Datapath::PortRelation Datapath::portGraph(MemId id,
     int call; // CallId, or -1 for a region-local access
     int bank; // the bank it commits to, or -1 when it may reach any
   };
-  // A skew records a SLOT in `staticBank`, and two slots rotate onto one bank,
-  // so only an unskewed array's index names the memory an access reaches.
-  auto bankOf = [&](std::optional<unsigned> b) {
-    return m.skewed || !b ? -1 : int(*b);
-  };
+  // `staticBank` is empty under a skew, where two slots rotate onto one bank
+  // and neither names the memory an access reaches.
+  auto bankOf = [](std::optional<unsigned> b) { return b ? int(*b) : -1; };
   llvm::SmallVector<When> ws;
   auto add = [&](const When &w, unsigned access, bool write, bool independent) {
     rel.verts.push_back({access, w.call, independent, write, w.bank});
@@ -460,6 +505,7 @@ void Datapath::dump(llvm::raw_ostream &os) const {
       os << " ii=" << *rb.ii;
     if (rb.tripCount)
       os << " trip=" << *rb.tripCount;
+    os << " drain=" << rb.drainStage;
     if (!rb.predecessors.empty()) {
       os << " after=[";
       llvm::interleaveComma(rb.predecessors, os, [&](RegionId p) { os << p; });
@@ -544,7 +590,8 @@ void Datapath::dump(llvm::raw_ostream &os) const {
   for (const CallUnit &cu : this->calls) {
     os << "  call k" << cu.id << ": " << cu.callee << " @r" << cu.region
        << " start=" << cu.start << (cu.async ? " spawn" : "")
-       << (cu.determinate ? " determinate" : " indeterminate");
+       << (cu.determinate ? " determinate" : " indeterminate") << " via "
+       << startPolicyName(cu.startPolicy);
     if (!cu.predecessors.empty()) {
       os << " after=[";
       llvm::interleaveComma(cu.predecessors, os, [&](const CallUnit::Pred &p) {

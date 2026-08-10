@@ -236,11 +236,24 @@ class Call:
     callee: str
     count: int
     spawns: int  # of those, `await` spawns rather than scheduled calls
+    #: How those calls are RELEASED, counted: on a predecessor's ``done``, on
+    #: the container's own start, or at a scheduled offset.
+    handshake: int = 0
+    broadcast: int = 0
+    timed: int = 0
     latency: int | None = None  # the child's declared span, when static
 
     @classmethod
     def from_json(cls, d: dict) -> Call:
-        return cls(d["callee"], d["count"], d["spawns"], d.get("latency"))
+        return cls(
+            d["callee"],
+            d["count"],
+            d["spawns"],
+            d.get("handshake", 0),
+            d.get("broadcast", 0),
+            d.get("timed", 0),
+            d.get("latency"),
+        )
 
 
 @dataclass(frozen=True)

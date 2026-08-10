@@ -287,10 +287,8 @@ void DatapathBuilder::deriveShapes() {
 }
 
 void DatapathBuilder::bindCall(dcp::DCPathInstanceOp inv, RegionBlock &rb) {
-  assert(callees && "a dcp.instance in a leaf datapath needs callee context "
-                    "(a rerouted container)");
-  auto it = callees->ifaces.find(inv.getCallee());
-  assert(it != callees->ifaces.end() &&
+  auto it = callees.ifaces.find(inv.getCallee());
+  assert(it != callees.ifaces.end() &&
          "the callee interface must be registered (emitted bottom-up first)");
   const auto &mi = it->second;
 
@@ -407,16 +405,18 @@ void DatapathBuilder::bindMemory(Operation *op, Value memref, RegionBlock &rb) {
   // One empty slot per index operand, positional: the map names them by
   // position, so the two are recorded together and neither is resized later.
   acc.addr.assign(operands.size(), Source{});
-  // Which bank this access reaches: the one bank an unbanked memref has, else
-  // the one `assign-banks` decided, or all of them when it decided none.
-  acc.staticBank =
+  // What `assign-banks` decided, split by what it MEANS: a skew resolves a slot
+  // that rotates onto a bank at run time, everything else resolves the bank
+  // itself. The layout says which, so the two never have to be told apart by a
+  // flag decided in a later stage.
+  std::optional<unsigned> assigned =
       m.numBanks == 1 ? std::optional<unsigned>(0) : assignedBankOf(op);
-  // Under a skew the recorded index is a SLOT, which no derivation off the map
-  // can confirm (the bank it names is only fixed at run time), so this would be
-  // comparing two different things. Otherwise `bankAddress` builds the offset
-  // WITHIN this bank out of `addrMap`, so where the map still resolves a bank
-  // on its own it has to be the decided one. It often cannot: the decision read
-  // the loop steps too.
+  (m.layout.skew() ? acc.slot : acc.staticBank) = assigned;
+  // A slot is what no derivation off the map can confirm (the bank it names is
+  // only fixed at run time), so this would be comparing two different things.
+  // Otherwise `bankAddress` builds the offset WITHIN this bank out of
+  // `addrMap`, so where the map still resolves a bank on its own it has to be
+  // the decided one. It often cannot: the decision read the loop steps too.
   if (m.numBanks > 1 && !m.layout.skew()) {
     std::optional<int64_t> derived = staticBankOf(
         m.layout, acc.addrMap, cast<MemRefType>(m.memref.getType()).getShape());
@@ -617,6 +617,37 @@ void DatapathBuilder::recordCallDeps() {
           add(sa.src.id, /*viaResult=*/true);
     }
   }
+
+  // The release policy, in a second pass so every predecessor edge exists: it
+  // turns on whether a call has any and on what kind they are.
+  for (const RegionBlock &rb : dp.regions) {
+    bool concurrent = rb.determinacy == DeterminacyEnum::Concurrent;
+    for (CallId cid : rb.callUnits) {
+      CallUnit &cu = dp.calls[cid];
+      bool gated = !cu.predecessors.empty();
+      // A SCHEDULED composition placed every child at a cycle, so an ungated
+      // one is released at its offset and a gated one waits on the join.
+      if (!concurrent) {
+        cu.startPolicy = gated ? CallUnit::StartPolicy::Handshake
+                               : CallUnit::StartPolicy::TimeTriggered;
+        continue;
+      }
+      // A CONCURRENT container has no schedule to release against, so an edge
+      // is time-triggerable only where the producer's completion cycle is
+      // known: a spawn has no offset at all, a result hand-off holds only from
+      // `done`, and an indeterminate producer has no cycle to name.
+      bool mustJoin =
+          gated && (cu.async || llvm::any_of(cu.predecessors,
+                                             [&](const CallUnit::Pred &p) {
+                                               return p.viaResult ||
+                                                      !dp.calls[p.call]
+                                                           .determinate;
+                                             }));
+      cu.startPolicy = mustJoin  ? CallUnit::StartPolicy::Handshake
+                       : cu.async ? CallUnit::StartPolicy::Broadcast
+                                  : CallUnit::StartPolicy::TimeTriggered;
+    }
+  }
 }
 
 Source DatapathBuilder::resolveValue(Value v) {
@@ -647,10 +678,10 @@ Source DatapathBuilder::resolveValue(Value v) {
   if (arg == 0)
     return Source{Source::Kind::Counter, rid, 0};
   // The rest are the loop-carried values, readable only where the region
-  // LATCHES them into a survivor. A childless counted reduction fuses its
-  // accumulator in, so only `resolveOperand`'s recurrence edge reads it.
-  const RegionBlock &owner = dp.regions[rid];
-  if (!owner.container && !owner.conditional)
+  // LATCHES them into a survivor (`RegionBlock::container`). A childless loop
+  // fuses its accumulator in, so only `resolveOperand`'s recurrence edge reads
+  // it, and a reader that reaches here gets None and is reported.
+  if (!dp.regions[rid].container)
     return {};
   return Source{Source::Kind::Survivor, rid, arg - 1};
 }
@@ -1140,6 +1171,12 @@ reduceCone(Datapath &dp, AffineExpr e, AffineMap addrMap,
 // The split runs on the IN-BANK OFFSET (the flat index for an unbanked
 // memref), which is what lets a banked access reduce at all: `buf[i, 4*j]`
 // under a cyclic-4 last axis offsets by `i*extent + j`, as linear as any.
+//
+// Both cones are derived SYMBOLICALLY (`addressExprsOf`) here and only later
+// evaluated: composing the row-major strides on a coalesced nest's
+// `iv -> (iv floordiv N, iv mod N)` cancels it back to `iv`, where the same
+// thing built out of `comb` ops is a multiply, a mask and a shift that no later
+// pass can fold away.
 void DatapathBuilder::planAddressGenerators() {
   for (MemUnit &m : dp.mems) {
     auto shape = cast<MemRefType>(m.memref.getType()).getShape();
@@ -1165,6 +1202,13 @@ void DatapathBuilder::planAddressGenerators() {
       }
       AddressExprs e =
           addressExprsOf(m.layout, acc.addrMap, shape, acc.staticBank);
+      // The width the cone is priced at against the width the emitter builds
+      // the bank's address port at: the first comes off the layout's bank
+      // shape, the second off `depthWords`, and this is where both exist.
+      assert(e.width == addressWidthOf(static_cast<int64_t>(m.depthWords)) &&
+             "the width the address was priced at is not the one it is built "
+             "at");
+      acc.hasBankCone = static_cast<bool>(e.bank);
       acc.offset = reduceCone(dp, e.offset, acc.addrMap, region);
       acc.bank = reduceCone(dp, e.bank, acc.addrMap, region);
       // Both cones read the same operands, so one delay covers them, and a
@@ -1239,6 +1283,11 @@ void DatapathBuilder::resolveAccessOperands() {
             isTransientDin(token)) {
           restamp(acc, dcpStart(acc.op) + 1);
           ++shift;
+          // What the region's drain may now exceed the composed span by: the
+          // deepest access carries its own channel's accumulated shift, so the
+          // bound is the largest of them and not their sum.
+          RegionBlock &rb = dp.regions[ridx];
+          rb.streamShift = std::max(rb.streamShift, shift);
           r = resolveOperand(token, acc.op, ii);
         }
         recordCarriedEdge(r, token, acc.op, acc.data, ridx);
@@ -1262,6 +1311,44 @@ void DatapathBuilder::resolveAccessOperands() {
         recordCarriedEdge(pr, pred, acc.op, acc.when, ridx);
       }
     }
+  }
+}
+
+// When each region has finished, relative to the issue pulse of the iteration
+// that reaches it. `emitDone` counts a leaf's `done` off this, and the emitter
+// holds what it actually built to it.
+//
+// Three things a region can still owe past its issue, all in the same units:
+// a store presented at its stage commits `writeLatency` cycles later, and the
+// done latch rides the last of those, so it drains at the commit minus one; a
+// put presents at its stage; a survivor latches on the cycle its result lands.
+// A call result is NOT one of them: it is self-timed by the child's `done`
+// rather than statically captured, so it contributes no drain here.
+//
+// Safe to read a result's Source before `insertRegisters`: a result slot is
+// tied by `resolveValue` and never handed to `edges`, so nothing patches it
+// later and the emitter reads the same Source this does.
+void DatapathBuilder::recordDrainStages() {
+  for (RegionBlock &rb : dp.regions) {
+    unsigned drain = 0;
+    for (AccRef r : rb.memAccesses) {
+      const MemUnit &m = dp.mems[r.id];
+      const MemUnit::Access &acc = m.accesses[r.idx];
+      assert((!acc.isWrite || m.writeLatency >= 1) &&
+             "a zero-cycle write has no commit edge for the done latch to "
+             "ride; `assertModelInvariants` holds the device row to that");
+      if (acc.isWrite)
+        drain = std::max(drain, acc.stage + m.writeLatency - 1);
+    }
+    for (AccRef r : rb.streamAccesses) {
+      const StreamChannel::Access &acc = dp.streams[r.id].accesses[r.idx];
+      if (acc.isPut)
+        drain = std::max(drain, acc.stage);
+    }
+    for (const RegionResult &r : rb.results)
+      if (r.value && r.value.kind != Source::Kind::Call)
+        drain = std::max(drain, dp.readyCycle(r.value));
+    rb.drainStage = drain;
   }
 }
 
@@ -1445,6 +1532,11 @@ void DatapathBuilder::recordSiblingDeps(ArrayRef<Operation *> regionOps) {
   // (1) A shared memref. A CallUnit masters memref operands without a
   // MemUnit::Access, so it counts as a sharer too, or a child could read a
   // buffer concurrently with an earlier writer.
+  //
+  // `Datapath::portGraph` depends on this chaining EVERY sharer, since that is
+  // what lets it read two accesses under different top-level ancestors as never
+  // simultaneous. Exempting a pair here would let two regions share a port they
+  // can both drive at once.
   for (const MemUnit &m : dp.mems) {
     for (const MemUnit::Access &a : m.accesses)
       addSharer(a.region);
@@ -1574,16 +1666,25 @@ void DatapathBuilder::build() {
   // What every input slot reads and how late it needs it, then what carries it
   // there: scaled counters, delay chains, muxes.
   resolveEdges();
-  realizeDelays();
-  // Ports last of all: an access holds one only once it knows which bank it
-  // commits to and which skew lane it holds, and the boundary port list is one
-  // group per bound port.
+  recordDrainStages(); // when each region finishes (needs the final stages)
+  // The top-level composition DAG, BEFORE the ports and not after: `portGraph`
+  // reads two accesses under different top-level ancestors as unable to issue
+  // together, and this pass is what makes that true.
+  recordSiblingDeps(regionOps);
+  // Ports before the delays, and the two are independent: an access holds a
+  // port once it knows which bank it commits to and which skew lane it holds,
+  // both settled by the region walk, and no pass here reads a Register or a
+  // Mux. Ordered this way so address strength reduction can see whether the bus
+  // it feeds is shared, which it does not yet use.
   assignLanes();
   planAccessPorts();
   bindMemoryPorts();
   enumerateBoundaryPorts();
   measurePorts(); // what the ports cost against what the schedule asks
-  recordSiblingDeps(regionOps); // top-level composition DAG (concurrency gates)
+  // The delays the edges owe. Last of the derivations: it withdraws the edges
+  // the address reduction folded away, so nothing may resolve a Source after
+  // it.
+  realizeDelays();
   verifyBinding(dp); // MRT legality: no unit shared by conflicting ops
 }
 

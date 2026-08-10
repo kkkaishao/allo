@@ -100,10 +100,11 @@ struct RegionControl {
 // compute completion.
 //===----------------------------------------------------------------------===//
 struct DatapathFeedback {
-  // The deepest store's schedule stage (max `stage` over the region's stores);
-  // 0 if it stores nothing. `done` waits until the last iteration's
-  // last store has committed, so a multi-store region cannot complete
-  // prematurely. A stream put folds into this too.
+  // The deepest store's commit cycle as the writes were EMITTED (a stream put
+  // folds in too); 0 if the region stores nothing. `RegionBlock::drainStage` is
+  // the same number decided on the model, and `emitRegion` holds the two
+  // together: this is the hardware witness for that check, not an input to
+  // anything.
   unsigned storeDrain = 0;
   // The `done` of a CallUnit region's child instance. When set it IS the
   // region's completion, bypassing the store-drain `emitDone`. Null for a
@@ -177,17 +178,17 @@ struct ControlEmitter {
                                         Value complete) const;
 
   /// The region's completion signal, one latched level for every regime: it
-  /// rises when \p lastIssue delayed \p drainStage cycles lands, or immediately
-  /// on \p emptyDone (null when unreachable). The latch's register cycle is the
-  /// store/result commit cycle, so a sibling starting on this done reads every
-  /// committed store and survivor. A \p retrig region resets on \p start and
-  /// reads 0 on the \p start cycle itself, since a completion pulse COINCIDING
-  /// with \p start would otherwise latch high on the first pass and never
-  /// produce a later rising edge. \p sh holds the pulse through back-pressure,
-  /// the last store/token not being committed until it is accepted.
-  Value emitDone(unsigned region, unsigned drainStage, Value lastIssue,
-                 Value emptyDone, Value start, bool retrig,
-                 const StallShell &sh) const;
+  /// rises when \p lastIssue delayed `rb.drainStage` cycles lands, or
+  /// immediately on \p emptyDone (null when unreachable). The latch's register
+  /// cycle is the store/result commit cycle, so a sibling starting on this done
+  /// reads every committed store and survivor. A \p retrig region resets on \p
+  /// start and reads 0 on the \p start cycle itself, since a completion pulse
+  /// COINCIDING with \p start would otherwise latch high on the first pass and
+  /// never produce a later rising edge. \p sh holds the pulse through
+  /// back-pressure, the last store/token not being committed until it is
+  /// accepted.
+  Value emitDone(const uarch::RegionBlock &rb, Value lastIssue, Value emptyDone,
+                 Value start, bool retrig, const StallShell &sh) const;
 };
 
 //===----------------------------------------------------------------------===//
@@ -367,12 +368,12 @@ struct DatapathEmitter {
 
   // The child modules a `dcp.instance`'s CallUnit instantiates (null for
   // a plain leaf with no calls).
-  const uarch::CalleeCtx *callees = nullptr;
+  const uarch::CalleeCtx &callees;
 
   DatapathEmitter(EmitContext &c, const uarch::Datapath &dp,
                   circt::hw::HWModulePortAccessor &pa,
                   const llvm::StringMap<Operation *> &opModules,
-                  const uarch::CalleeCtx *callees = nullptr)
+                  const uarch::CalleeCtx &callees)
       : c(c), dp(dp), pa(pa), opModules(opModules), callees(callees) {}
 
   static uint64_t accKey(unsigned m, unsigned a) {
@@ -393,9 +394,6 @@ struct DatapathEmitter {
   /// The counter value \p rb's n-th iteration holds, `lb + n*step` at that
   /// width; null for n == 0, which is \p lb itself.
   Value ivAt(const uarch::RegionBlock &rb, unsigned n, Value lb);
-  /// The cycle a freshly-produced Source's value lands, relative to the issuing
-  /// pulse of the iteration that produced it. Used by survivor capture.
-  unsigned readyCycle(const uarch::Source &s) const;
   /// One cone \p r of this access's address as hardware at \p width: a
   /// constant, one register per strength-reduced term, and whatever did not
   /// reduce, evaluated.
@@ -403,8 +401,8 @@ struct DatapathEmitter {
                   const uarch::MemUnit::Access::Reduced &r, unsigned width);
   /// The address hardware of an access: the element index within the bank it
   /// reaches, plus the bank digit when that is decided at runtime. The runtime
-  /// dual of the static split (`dcp-resolve-banking`), both deriving from the
-  /// memref's `BankLayout` and routing an element to the same bank.
+  /// dual of the static split (`dcp-resolve-banking`), routing an element to
+  /// the same bank off the cones `planAddressGenerators` reduced.
   BankSplit bankAddress(const uarch::MemUnit &m,
                         const uarch::MemUnit::Access &acc);
   /// Narrow a linear address to a memory's clog2(depth)-bit index (hlmem).
@@ -626,7 +624,7 @@ struct HWEmitter {
             circt::hw::HWModulePortAccessor &pa,
             const llvm::StringMap<Operation *> &opModules,
             circt::BackedgeBuilder &bb, Type i1, Type i32,
-            const uarch::CalleeCtx *callees = nullptr)
+            const uarch::CalleeCtx &callees)
       : ctx(b, loc, bb, i1, i32), control(ctx),
         datapath(ctx, dp, pa, opModules, callees), dp(dp), pa(pa) {}
 

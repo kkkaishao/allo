@@ -80,11 +80,12 @@ static unsigned compRegBits(hw::HWModuleOp mod) {
 // (validateDatapath). `opModules` caches extern operator modules across
 // functions.
 static FailureOr<std::pair<hw::HWModuleOp, iface::ModuleInterface>>
-emitModule(dcp::DCPathModuleOp func, const uarch::Datapath &dp, OpBuilder &b,
+emitModule(const uarch::Datapath &dp, OpBuilder &b,
            llvm::StringMap<Operation *> &opModules, float cycleTime,
            const OperatorLibrary &lib, MicroarchReport &report,
-           const uarch::CalleeCtx *callees = nullptr) {
+           const uarch::CalleeCtx &callees) {
   auto *ctx = b.getContext();
+  dcp::DCPathModuleOp func = dp.func;
   Location loc = func.getLoc();
   if (failed(validateDatapath(func, dp, cycleTime, lib)))
     return failure();
@@ -221,24 +222,20 @@ LogicalResult emitDatapathToHW(ModuleOp module, StringRef binding,
       return failure();
 
     // One emission path, whichever way the function composes: leaf, sequential
-    // container and dataflow differ only in the start policy they pick.
-    bool hasInvoke = false;
-    f.walk([&](dcp::DCPathInstanceOp) {
-      hasInvoke = true;
-      return WalkResult::interrupt();
-    });
-    uarch::CalleeCtx cc{modules, ifaceModels};
-    const uarch::CalleeCtx *callees = hasInvoke ? &cc : nullptr;
+    // container and dataflow differ only in the start policy they pick. The
+    // callee context is passed whether or not this function calls anything: the
+    // post-order above means it names every module emitted so far, and a leaf
+    // simply never looks anything up in it.
+    const uarch::CalleeCtx cc{modules, ifaceModels};
     // Sealed on construction: the builder decides, and everything below reads.
-    const Datapath dp(f, *policy, dev, cycleTime, callees,
-                      /*isTop=*/f == topFunc);
+    const Datapath dp(f, *policy, dev, cycleTime, cc, /*isTop=*/f == topFunc);
     LLVM_DEBUG({
       llvm::dbgs() << "// datapath for @" << f.getSymName() << "\n";
       dp.dump(llvm::dbgs());
     });
     b.setInsertionPoint(f);
-    auto pairOr = emitModule(f, dp, b, opModules, cycleTime, dev.operators,
-                             report, callees);
+    auto pairOr =
+        emitModule(dp, b, opModules, cycleTime, dev.operators, report, cc);
     if (failed(pairOr))
       return failure();
     registerModule(f.getSymName(), pairOr->first, std::move(pairOr->second));

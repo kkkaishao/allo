@@ -13,7 +13,6 @@
 
 #include "allo/IR/AlloOps.h" // kIndependentWritesAttr
 #include "allo/Microarch/HWEmitter.h"
-#include "allo/Scheduling/AddressModel.h" // addressExprsOf
 
 #include "circt/Dialect/Comb/CombOps.h"
 #include "circt/Dialect/Seq/SeqOps.h"
@@ -109,24 +108,19 @@ Value DatapathEmitter::buildAddr(const uarch::MemUnit::Access &acc,
 // banked and unbanked, since an unpartitioned memref is a one-bank layout whose
 // offset is the flat index and whose digit nothing builds.
 //
-// Both halves are derived SYMBOLICALLY (`addressExprsOf`) and only then
-// evaluated: composing the row-major strides on a coalesced nest's
-// `iv -> (iv floordiv N, iv mod N)` cancels it back to `iv`, where the same
-// thing built out of `comb` ops is a multiply, a mask and a shift that no later
-// pass can fold away.
+// Both halves were derived symbolically and split in `planAddressGenerators`,
+// so nothing here decides anything: it evaluates the two `Reduced` cones the
+// model carries.
 BankSplit DatapathEmitter::bankAddress(const uarch::MemUnit &m,
                                        const uarch::MemUnit::Access &acc) {
   assert(acc.addrMap && "dcp memory access without an affine map");
-  ArrayRef<int64_t> shape = cast<MemRefType>(m.memref.getType()).getShape();
-  AddressExprs e = addressExprsOf(m.layout, acc.addrMap, shape, acc.staticBank);
-  assert(e.width == addrWidth(m) &&
-         "the width the address was priced at is not the one it is built at");
-  Value offset = buildAddr(acc, acc.offset, e.width);
+  Value offset = buildAddr(acc, acc.offset, addrWidth(m));
   // The digit stays at the datapath width, being compared against literal bank
   // numbers rather than used as an address. It reduces like the offset:
   // `counter mod F` is a register that wraps, not a `mod` on the setup path.
-  Value bank =
-      e.bank ? buildAddr(acc, acc.bank, kDatapathAddressWidth) : Value();
+  Value bank = acc.hasBankCone
+                   ? buildAddr(acc, acc.bank, kDatapathAddressWidth)
+                   : Value();
   // A read freezes its address on stall or the in-flight read is lost (KPN);
   // a write skips the stalled cycle through its gated write enable. Both
   // halves freeze together or they name different elements.
@@ -283,14 +277,6 @@ void DatapathEmitter::emitReads(const uarch::RegionBlock &rb, Value issue) {
     if (acc.isWrite)
       continue;
     switch (acc.plan) {
-    case PortPlan::Table: {
-      // A constant table read: index the aggregate_constant combinationally,
-      // then register to the scheduled read latency so timing matches a RAM.
-      Value idx = memAddr(m, bankAddress(m, acc).offset);
-      readData[accKey(m.id, r.idx)] = atReadData(
-          m, c.R(hw::ArrayGetOp::create(c.b, c.loc, romArray[m.id], idx)), sh);
-      break;
-    }
     case PortPlan::ElementWise: {
       // No address port: a read selects over the cells, and a constant
       // subscript folds the select away. An argument's cells arrive on its
@@ -306,9 +292,14 @@ void DatapathEmitter::emitReads(const uarch::RegionBlock &rb, Value issue) {
           readCrossbar(c, elems, scatterIndex(m, acc));
       break;
     }
-    case PortPlan::Lane:
-      lanes[{r.id, acc.lane}].push_back(r.idx);
+    case PortPlan::Table: {
+      // A constant table read: index the aggregate_constant combinationally,
+      // then register to the scheduled read latency so timing matches a RAM.
+      Value idx = memAddr(m, bankAddress(m, acc).offset);
+      readData[accKey(m.id, r.idx)] = atReadData(
+          m, c.R(hw::ArrayGetOp::create(c.b, c.loc, romArray[m.id], idx)), sh);
       break;
+    }
     case PortPlan::Coloured:
       // A compile-time bank reads its own memory: no crossbar, and no read port
       // on the other banks. An unbanked memref is the same case at bank 0. An
@@ -317,6 +308,9 @@ void DatapathEmitter::emitReads(const uarch::RegionBlock &rb, Value issue) {
       // region has not emitted yet (`emitExternalReadAddrs`).
       if (!m.external)
         shared[{r.id, *acc.staticBank, acc.port}].push_back(r.idx);
+      break;
+    case PortPlan::Lane:
+      lanes[{r.id, acc.lane}].push_back(r.idx);
       break;
     case PortPlan::Crossbar: {
       // Read every bank at the (bank-independent) offset, then select by the
@@ -613,12 +607,6 @@ void DatapathEmitter::emitWrites(const uarch::RegionBlock &rb, Value issue,
         c.delayValid(c.activationPulse(commitPulse(), acc.stage, sh), pre, sh);
     Value data = late(resolveSource(acc.data));
     switch (acc.plan) {
-    case PortPlan::Table:
-      llvm_unreachable("a constant table has no write port; an array "
-                       "anything writes is never classified as one");
-    case PortPlan::Lane:
-      llvm_unreachable("a lane's stores are delayed and demuxed together, "
-                       "below, so they leave the loop above this");
     case PortPlan::ElementWise:
       // The cells are shared by every store, so this only records the terms:
       // `finalizeScatteredPorts` drives an ARGUMENT's element ports, or builds
@@ -626,6 +614,9 @@ void DatapathEmitter::emitWrites(const uarch::RegionBlock &rb, Value issue,
       // contributed.
       scatterWrites[m.id].push_back({we, scatterIndex(m, acc), data});
       break;
+    case PortPlan::Table:
+      llvm_unreachable("a constant table has no write port; an array "
+                       "anything writes is never classified as one");
     case PortPlan::Coloured: {
       // A compile-time bank writes its own memory: no demux, and no write port
       // on the other banks. An unbanked memref is the same case at bank 0. One
@@ -642,6 +633,9 @@ void DatapathEmitter::emitWrites(const uarch::RegionBlock &rb, Value issue,
                                       {we, late(memAddr(m, bs.offset)), data}});
       break;
     }
+    case PortPlan::Lane:
+      llvm_unreachable("a lane's stores are delayed and demuxed together, "
+                       "below, so they leave the loop above this");
     case PortPlan::Crossbar: {
       // Drive every bank; the runtime bank gates each write-enable so only the
       // target bank commits (an N-way demux). Such a store reaches every bank,
@@ -830,22 +824,6 @@ void DatapathEmitter::masterCallPorts(
     }
     const uarch::MemUnit &m = dp.mems[ma.mem];
     switch (ma.plan) {
-    case PortPlan::Crossbar:
-      llvm_unreachable("a child masters one bank, indexed in that bank's own "
-                       "space, so it never crossbars");
-    case PortPlan::Lane:
-      llvm_unreachable("a child masters a port on a skewed array; a lane is "
-                       "assigned from this module's own accesses and the "
-                       "child holds none. `checkEmitterSubset` refuses it");
-    case PortPlan::Table: {
-      // A constant table the child only reads: one `hw.array_get` registered
-      // to the latency the child was timed against, so the datum lands
-      // exactly where a RAM's would.
-      Value elem = c.R(hw::ArrayGetOp::create(c.b, c.loc, romArray[m.id],
-                                              memAddr(m, outs[ma.addr])));
-      rdBackedge[ma.data].setValue(atReadData(m, elem, sh));
-      break;
-    }
     case PortPlan::ElementWise: {
       // A scattered array holds no addressable port, so the child's addressed
       // one is served off the element registers: a select for its read, a
@@ -858,6 +836,15 @@ void DatapathEmitter::masterCallPorts(
         scatterWrites[m.id].push_back({outs[ma.we], idx, outs[ma.data]});
       else
         rdBackedge[ma.data].setValue(readCrossbar(c, scatterValues(m.id), idx));
+      break;
+    }
+    case PortPlan::Table: {
+      // A constant table the child only reads: one `hw.array_get` registered
+      // to the latency the child was timed against, so the datum lands
+      // exactly where a RAM's would.
+      Value elem = c.R(hw::ArrayGetOp::create(c.b, c.loc, romArray[m.id],
+                                              memAddr(m, outs[ma.addr])));
+      rdBackedge[ma.data].setValue(atReadData(m, elem, sh));
       break;
     }
     case PortPlan::Coloured: {
@@ -894,7 +881,14 @@ void DatapathEmitter::masterCallPorts(
           {fired, addr, Value()});
       break;
     }
-    }
+    
+    case PortPlan::Lane:
+      llvm_unreachable("a child masters a port on a skewed array; a lane is "
+                       "assigned from this module's own accesses and the "
+                       "child holds none. `checkEmitterSubset` refuses it");
+    case PortPlan::Crossbar:
+      llvm_unreachable("a child masters one bank, indexed in that bank's own "
+                       "space, so it never crossbars");}
   }
 }
 

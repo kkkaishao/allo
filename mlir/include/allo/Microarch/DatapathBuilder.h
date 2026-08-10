@@ -88,12 +88,12 @@ struct DatapathBuilder {
   const BindingPolicy &policy; // decides resource sharing
   const DeviceModel &dev;      // device storage + operator timing
   float cycleTime;             // the period the schedule was cut against
-  const CalleeCtx *callees;    // child modules/ifaces for a dcp.instance
+  const CalleeCtx &callees;    // child modules/ifaces for a dcp.instance
                                // (null for a plain leaf, no calls)
 
   DatapathBuilder(Datapath &dp, dcp::DCPathModuleOp func,
                   const BindingPolicy &policy, const DeviceModel &dev,
-                  float cycleTime, const CalleeCtx *callees = nullptr)
+                  float cycleTime, const CalleeCtx &callees)
       : dp(dp), func(func), policy(policy), dev(dev), cycleTime(cycleTime),
         callees(callees) {}
 
@@ -134,9 +134,11 @@ struct DatapathBuilder {
   /// device and the layout say about it. Runs before the region walk, so an
   /// array's WHOLE use is in view when a property of the use is decided: an
   /// initialized array nothing writes is a constant table, and only a sweep
-  /// that has seen every access and every child port group can say so. Visits
-  /// the same ops in the same order the binding walk does, since the order it
-  /// creates them in IS the MemId order, and that orders the boundary ports.
+  /// that has seen every access and every child port group can say so. Must
+  /// reach the same SET of ops the binding walk does, which only looks a
+  /// MemUnit up; the order here is what fixes MemId order, and the order that
+  /// fixes the boundary ports is `m.accesses`, which the binding walk alone
+  /// decides.
   void collectStorageFacts(llvm::ArrayRef<Operation *> regionOps);
   /// The MemUnit backing \p memref. A lookup, not a factory:
   /// `collectStorageFacts` has already built every one of them.
@@ -237,7 +239,9 @@ struct DatapathBuilder {
   void measurePorts();
   /// Record each top-level region's composition predecessors
   /// (`rb.predecessors`): the earlier top-level siblings it must start after.
-  /// Runs last (needs the final memref accesses and region tree).
+  /// Needs the bound accesses and the region tree, so it runs after the region
+  /// walk; and it runs BEFORE the port passes, which read the ordering it
+  /// establishes (`Datapath::portGraph`).
   void recordSiblingDeps(llvm::ArrayRef<Operation *> regionOps);
   /// Scalar (non-memref) function arguments become input IOPorts.
   void bindIOArgs();
@@ -276,6 +280,10 @@ struct DatapathBuilder {
   /// Realize the delays the edges owe: the address reduction first, since a
   /// term it folds into a scaled counter withdraws its edge, then the chains
   /// over what is left, then the muxes that pick between them.
+  ///
+  /// The LAST derivation `build()` runs, after the ports, which read nothing it
+  /// produces. Not the other way round because withdrawing an edge is the one
+  /// thing here that is not additive, so no pass may resolve a Source after it.
   void realizeDelays();
   /// Record a resolved edge into \p slot: a depth-0 edge ties directly, a
   /// deeper one is deferred to `edges` and patched by `insertRegisters`.
@@ -298,6 +306,10 @@ struct DatapathBuilder {
   /// Build one chain per (value, region) the surviving edges tap, patch their
   /// slots, and materialize the shared-unit muxes.
   void insertRegisters();
+  /// Record each region's terminal cycle (`RegionBlock::drainStage`). Runs
+  /// after `resolveEdges`, which re-stamps a stream put's stage and so is the
+  /// last pass that moves one.
+  void recordDrainStages();
 };
 
 } // namespace mlir::allo::uarch

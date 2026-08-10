@@ -120,10 +120,8 @@ void DatapathBuilder::collectStorageFacts(ArrayRef<Operation *> regionOps) {
       // A child's array operand, and the direction of every port it masters on
       // it. The callee interface is registered before this caller is built, so
       // a child that only reads leaves the array a table.
-      assert(callees && "a dcp.instance in a leaf datapath needs callee "
-                        "context (a rerouted container)");
-      auto it = callees->ifaces.find(inv.getCallee());
-      assert(it != callees->ifaces.end() &&
+      auto it = callees.ifaces.find(inv.getCallee());
+      assert(it != callees.ifaces.end() &&
              "the callee interface must be registered (emitted bottom-up)");
       for (auto [k, operand] : llvm::enumerate(inv.getInputs())) {
         if (!isa<MemRefType>(operand.getType()))
@@ -335,13 +333,13 @@ void DatapathBuilder::assignLanes() {
     // One access without a slot and the array is back to crossbarring: a lane
     // shares a port on the strength of every user holding a distinct slot.
     if (llvm::any_of(m.accesses,
-                     [](const MemUnit::Access &a) { return !a.staticBank; }))
+                     [](const MemUnit::Access &a) { return !a.slot; }))
       continue;
     m.skewed = true;
     llvm::DenseMap<std::tuple<unsigned, unsigned, unsigned>, unsigned> used;
     for (MemUnit::Access &acc : m.accesses) {
-      assert(*acc.staticBank < m.numBanks && "a slot indexes the skew's banks");
-      acc.lane = used[{acc.region, acc.isWrite, *acc.staticBank}]++;
+      assert(*acc.slot < m.numBanks && "a slot indexes the skew's banks");
+      acc.lane = used[{acc.region, acc.isWrite, *acc.slot}]++;
     }
   }
 }
@@ -472,9 +470,7 @@ void DatapathBuilder::bindMemoryPorts() {
           writePorts.insert(ma.port);
     llvm::SmallVector<llvm::SmallVector<unsigned>> byBank(m.numBanks);
     auto reaches = [&](std::optional<unsigned> bank, unsigned port) {
-      // A skew's `staticBank` is a slot, not a bank, and its accesses read
-      // every bank through the crossbar, as an unassigned access does.
-      if (bank && !m.skewed)
+      if (bank)
         byBank[*bank].push_back(port);
       else
         for (auto &ports : byBank)

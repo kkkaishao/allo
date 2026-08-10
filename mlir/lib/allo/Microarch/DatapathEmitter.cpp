@@ -21,11 +21,12 @@ namespace mlir::allo::uarch {
 Value DatapathEmitter::resolveSource(const uarch::Source &s) {
   switch (s.kind) {
   case uarch::Source::Kind::Unit: {
-    // A same-region operator result. `declareUnits` declares its backedge
-    // before any read resolves, so a miss means this consumer sits outside the
-    // owning region.
+    // An operator result. `unitVal` is module-scope and never cleared, since a
+    // container's units stay readable while a nested child emits, so a miss
+    // means the owning region has not emitted yet rather than that it is the
+    // wrong region.
     Value v = unitVal.lookup(s.id);
-    assert(v && "unit source read outside the region that declared it");
+    assert(v && "unit source read before its region declared it");
     return v;
   }
   case uarch::Source::Kind::Reg:
@@ -166,47 +167,6 @@ Value DatapathEmitter::atIteration(const uarch::RegionBlock &rb,
   return c.icmpEqV(iv, at ? at : lb);
 }
 
-// Read off the model, never off the producing op: the stages were frozen when
-// the model was built and the IR is provenance from here on.
-unsigned DatapathEmitter::readyCycle(const uarch::Source &s) const {
-  switch (s.kind) {
-  // A call is the one producer whose result does NOT land at `stage +
-  // latency`: it lands at its region-relative issue plus the CALLEE's whole
-  // start->done depth. Indeterminate calls are guarded earlier.
-  case uarch::Source::Kind::Call: {
-    const uarch::CallUnit &cu = dp.calls[s.id];
-    assert(cu.latency && "readyCycle of an indeterminate call result");
-    return cu.start + static_cast<unsigned>(*cu.latency);
-  }
-  case uarch::Source::Kind::Unit: {
-    const uarch::FuncUnit &u = dp.units[s.id];
-    return u.boundOps[s.outPort].stage + u.latency;
-  }
-  case uarch::Source::Kind::Mem: {
-    const uarch::MemUnit &m = dp.mems[s.id];
-    return m.accesses[s.outPort].stage + m.readLatency;
-  }
-  // A get is a combinational front-read of the FIFO, so it lands at issue.
-  case uarch::Source::Kind::Stream:
-    return dp.streams[s.id].accesses[s.outPort].stage;
-  // A held source has no landing stage: a literal is constant, an IO port
-  // stable for the whole kernel, and a counter or survivor a register settled
-  // by the time the region reading it issues.
-  case uarch::Source::Kind::Const:
-  case uarch::Source::Kind::IO:
-  case uarch::Source::Kind::Counter:
-  case uarch::Source::Kind::Survivor:
-    return 0;
-  case uarch::Source::Kind::Reg:
-  case uarch::Source::Kind::Mux:
-  case uarch::Source::Kind::None:
-    break;
-  }
-  llvm_unreachable("readyCycle only models a producing or held Source");
-}
-
-// The resolved (already stage-delayed) index sources of an access, dims then
-// symbols.
 // Shift-register chains for region \p rb's registers (index delays, pipeline
 // holds). Each chain's head input is a backedge resolved once the units exist.
 void DatapathEmitter::emitRegisters(const uarch::RegionBlock &rb) {
@@ -330,7 +290,7 @@ DatapathEmitter::emitConditionRegion(const uarch::RegionBlock &rb,
   emitBeforeUnits(rb, /*issue=*/Value());
   emitUnits(rb);
   emitAfterUnits(rb, /*issue=*/Value());
-  return {resolveSource(condSrc), readyCycle(condSrc)};
+  return {resolveSource(condSrc), dp.readyCycle(condSrc)};
 }
 
 // Resolve region \p rb's register head inputs once its units exist.
@@ -756,46 +716,31 @@ void DatapathEmitter::emitComposedChannel(const uarch::StreamChannel &s) {
     w.prodReady.setValue(allNotFull);
 }
 
-// The start pulse of one child, read off the node's contract and its region's
-// composition class:
-//
-//   * HANDSHAKE, the rising edge of the predecessors' joined `done`, for a
-//     gated child of a SCHEDULED composition and, in a CONCURRENT one, for a
-//     child whose ordering cannot be expressed as an offset: a spawn, a
-//     consumer of a scalar result (that port only holds from the producer's
-//     `done`), or a child gated by an indeterminate producer. A
-//     CHANNEL-CONNECTED pair never reaches here, back-pressure already being
-//     their ordering;
-//   * BROADCAST, the container's own start, for an ungated spawn;
-//   * TIME-TRIGGERED at the scheduled offset otherwise. An ungated call's
-//     operands need not be ready at the region's issue pulse (a scalar argument
-//     loaded from memory is the reachable case), so releasing it at issue would
-//     latch garbage. The offset rides the region's shell, so it stretches with
-//     a stall.
-//
-// A child's `done` is a level its own start clears, so on a retriggered region
-// it still reads the previous pass's 1 until the child is released. The
-// predecessor join and the region's completion conjunction mean "completed THIS
-// pass" and therefore read it through `completedSince(issue)`, in a SCHEDULED
-// composition only: there `issue` is the pass-start pulse the calls are placed
-// against, where a CONCURRENT region has no such boundary.
+// Wire the start pulse of one child. WHICH policy is `cu.startPolicy`, decided
+// by `recordCallDeps`; what differs here is only how each one is built, and the
+// composition class picks between two spellings of two of them.
 Value DatapathEmitter::startForCall(const uarch::CallUnit &cu, Value issue,
                                     ArrayRef<Value> predDones, bool concurrent,
                                     const StallShell &sh) {
-  if (!concurrent)
-    return predDones.empty() ? c.delayValid(issue, cu.start, sh)
-                             : c.startFor(issue, predDones);
-  bool handshake =
-      !predDones.empty() &&
-      (cu.async ||
-       llvm::any_of(cu.predecessors, [&](const uarch::CallUnit::Pred &p) {
-         return p.viaResult || !dp.calls[p.call].determinate;
-       }));
-  if (handshake)
-    return c.startFor(/*regionStart=*/Value(), predDones);
-  if (cu.async)
+  switch (cu.startPolicy) {
+  case uarch::CallUnit::StartPolicy::Handshake:
+    // A child's `done` is a level its own start clears, so on a retriggered
+    // region it still reads the previous pass's 1 until the child is released.
+    // The join means "completed THIS pass" and so reads it through
+    // `completedSince(issue)`, in a SCHEDULED composition only: there `issue`
+    // is the pass-start pulse the calls are placed against, where a CONCURRENT
+    // region has no such boundary.
+    assert(!predDones.empty() && "a handshake start has nothing to join");
+    return c.startFor(concurrent ? Value() : issue, predDones);
+  case uarch::CallUnit::StartPolicy::Broadcast:
     return issue;
-  return c.delayValid(issue, cu.start, StallShell{});
+  case uarch::CallUnit::StartPolicy::TimeTriggered:
+    // The offset rides the region's shell where there is one, so it stretches
+    // with a stall; a concurrent container paces its children by back-pressure
+    // and has no shell.
+    return c.delayValid(issue, cu.start, concurrent ? StallShell{} : sh);
+  }
+  llvm_unreachable("unhandled CallUnit::StartPolicy");
 }
 
 // Instantiate each CallUnit (dcp.instance) in region \p rb as a child
@@ -824,9 +769,8 @@ void DatapathEmitter::emitCalls(const uarch::RegionBlock &rb, Value issue,
       predDones.push_back(d);
     }
     Value startK = startForCall(cu, issue, predDones, concurrent, sh);
-    assert(callees && "a CallUnit needs callee context");
-    auto mit = callees->modules.find(cu.callee);
-    assert(mit != callees->modules.end() &&
+    auto mit = callees.modules.find(cu.callee);
+    assert(mit != callees.modules.end() &&
            "the callee module must be registered (emitted bottom-up first)");
     hw::HWModuleOp child = mit->second;
 

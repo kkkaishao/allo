@@ -306,10 +306,10 @@ RegionControl ControlEmitter::emitAcyclic(unsigned region, Value start,
 // survivor. Keying on `lastIssue` rather than a store-retire count keeps a
 // region that retires several stores in one cycle from completing early. A
 // `retrig` region resets its completion state on `start`.
-Value ControlEmitter::emitDone(unsigned region, unsigned drainStage,
-                               Value lastIssue, Value emptyDone, Value start,
-                               bool retrig, const StallShell &sh) const {
-  Value fire = c.delayValid(lastIssue, drainStage, sh);
+Value ControlEmitter::emitDone(const uarch::RegionBlock &rb, Value lastIssue,
+                               Value emptyDone, Value start, bool retrig,
+                               const StallShell &sh) const {
+  Value fire = c.delayValid(lastIssue, rb.drainStage, sh);
   // The final put is not committed until accepted, so gate the completion pulse
   // on the region's clock-enable: `done` holds through back-pressure on the
   // last token. A no-op under a rigid shell.
@@ -322,7 +322,7 @@ Value ControlEmitter::emitDone(unsigned region, unsigned drainStage,
                 "cost would have to be built here, not just written down");
   auto dNext = c.bb.get(c.i1);
   Value done = c.reg(dNext, c.f1);
-  nameValue(done, regionSignal(region, "done"));
+  nameValue(done, regionSignal(rb.id, "done"));
   // `retrig` clears the held `done` on `start`, giving a fresh 0->1 edge each
   // pass.
   Value held = retrig ? c.mux(start, c.f1, done) : done;

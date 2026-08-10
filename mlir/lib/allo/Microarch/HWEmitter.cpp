@@ -128,16 +128,34 @@ Value HWEmitter::emitRegion(const uarch::RegionBlock &rb, Value start,
   // every CONTINUING iteration (the doomed exit iteration must not commit).
   Value captureOn =
       rb.conditional ? ctx.andBits(rc.issue, term.cond) : lastIssue;
-  unsigned resultDrain = captureResults(rb, captureOn, start);
-  unsigned drainStage = std::max(fb.storeDrain, resultDrain);
-  // The model against the hardware. A stream region is excluded because
-  // `resolveAccessOperands` re-stamps its put stages, a call-holding leaf
-  // because it also waits on the child's `done`.
-  assert((!rb.modelledDrain || !rb.streamAccesses.empty() ||
-          !rb.callUnits.empty() ||
-          static_cast<int64_t>(drainStage) == *rb.modelledDrain) &&
-         "the composed span's drain disagrees with the built datapath's; a "
-         "consumer placed against it samples on the wrong cycle");
+  [[maybe_unused]] unsigned resultDrain = captureResults(rb, captureOn, start);
+  // The model decides when this region finishes; these two are what F and the
+  // capture pass ACTUALLY emitted, kept so the decision stays checkable against
+  // the hardware built from it rather than only against the composed span.
+  assert(std::max(fb.storeDrain, resultDrain) == rb.drainStage &&
+         "the built datapath's terminal cycle is not the one the model "
+         "recorded");
+  // The model against the hardware, in the direction that is a fault: drained
+  // PAST what the span composed, so a consumer released at that offset samples
+  // before this region has committed. `resolveAccessOperands` re-stamps a
+  // stream put's stage, so a region it reached may sit `streamShift` cycles
+  // out and no further. A call-holding leaf is excluded outright, since it
+  // also waits on the child's `done`, which the span does not model.
+  assert((!rb.modelledDrain || !rb.callUnits.empty() ||
+          static_cast<int64_t>(rb.drainStage) <=
+              *rb.modelledDrain + int64_t(rb.streamShift)) &&
+         "the built datapath drains past the composed span; a consumer placed "
+         "against it samples before this region has committed");
+  // Draining EARLY is pessimism rather than a fault, and one shape reaches it
+  // legitimately: the device prices a stream read at latency 1 while the
+  // emitter builds the FIFO's show-ahead output at 0, so a region yielding a
+  // `get` composes one cycle longer than it runs. Everywhere else the two still
+  // have to agree exactly.
+  assert((!rb.modelledDrain || !rb.callUnits.empty() ||
+          !rb.streamAccesses.empty() ||
+          static_cast<int64_t>(rb.drainStage) == *rb.modelledDrain) &&
+         "the built datapath drains before the composed span, so the composed "
+         "latency is longer than the hardware takes");
 
   // An empty counted leaf (lb >= ub) issues nothing, so it completes on
   // `start`, delayed one cycle so the pulse doesn't land on `start` itself:
@@ -152,8 +170,8 @@ Value HWEmitter::emitRegion(const uarch::RegionBlock &rb, Value start,
                    !rb.memAccesses.empty();
   Value done = fb.callDone && !looseWork
                    ? fb.callDone
-                   : control.emitDone(rb.id, drainStage, lastIssue, emptyDone,
-                                      start, retrig, shell);
+                   : control.emitDone(rb, lastIssue, emptyDone, start,
+                                      retrig, shell);
   if (fb.callDone && looseWork)
     done = ctx.andBits(fb.callDone, done);
   // Resolving the promise RAUWs every consumer and erases the placeholders, so
@@ -185,9 +203,9 @@ Value HWEmitter::lastIssuePulse(const RegionControl &rc,
 // register on the cycle it lands, while the result is still on its Source: a
 // free-running datapath overwrites it once the run ends. \p captureOn is the
 // issue pulse the capture keys off; a result produced at a later stage delays
-// its capture to match. Returns the LATEST-landing result's stage, which the
-// region folds into its `drainStage` so `done` rises with the deepest survivor
-// latched. A store-ful region yields no result and returns stage 0.
+// its capture to match. Returns the LATEST-landing result's stage, which is one
+// of the terms of `RegionBlock::drainStage` and is returned so `emitRegion` can
+// check the two agree. A store-ful region yields no result and returns 0.
 unsigned HWEmitter::captureResults(const uarch::RegionBlock &rb,
                                    Value captureOn, Value start) {
   StallShell sh = datapath.shellFor(rb.id);
@@ -198,7 +216,7 @@ unsigned HWEmitter::captureResults(const uarch::RegionBlock &rb,
     if (r.value.kind == uarch::Source::Kind::Call)
       continue; // a call result: emitCalls sets the survivor from the child's
                 // held output port (self-timed by `done`), not a static capture
-    unsigned stage = datapath.readyCycle(r.value);
+    unsigned stage = dp.readyCycle(r.value);
     Value cap = ctx.delayValid(captureOn, stage, sh);
     Value res = datapath.resolveSource(r.value);
     // A loop-carried result preloads its init at `start`, so a run that never

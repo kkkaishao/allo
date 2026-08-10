@@ -122,6 +122,9 @@ struct CallReport {
   unsigned count = 0;
   unsigned spawns = 0;            // of those, `await` spawns rather than calls
   std::optional<int64_t> latency; // the child's declared span, when static
+  /// How those calls are released (`CallUnit::StartPolicy`), counted. A
+  /// composition-policy change moves these even where the latency does not.
+  unsigned handshake = 0, broadcast = 0, timed = 0;
 };
 
 /// What the cost model needs of one region and no reader does. Grouped apart

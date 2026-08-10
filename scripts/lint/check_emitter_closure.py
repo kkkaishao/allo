@@ -9,12 +9,16 @@ check: the emitter takes `const Datapath &`. Closure is not, because holding an
 `Operation *` for provenance is legitimate while asking it a question is not.
 
 So this bans the READ set: an emitter translation unit may not pull a fact out
-of the IR it is lowering. Every such fact belongs on the model, frozen when the
-model was built, or the same number has two homes and they can disagree. Two
-real costs paid for that before the rule existed: an operator latency resolved
-by symbol lookup at emit time, which pinned `cleanupDcpOps` to the very end and
-made block order load-bearing; and a schedule cycle re-stamped mid-build, which
-switched off the emitter's own model-against-hardware check.
+of the IR it is lowering, whether by asking an attribute for it or by re-running
+the derivation that produced it. Every such fact belongs on the model, frozen
+when the model was built, or the same number has two homes and they can
+disagree. Two real costs paid for that before the rule existed: an operator
+latency resolved by symbol lookup at emit time, which pinned `cleanupDcpOps` to
+the very end and made block order load-bearing; and a schedule cycle re-stamped
+mid-build, which switched off the emitter's own model-against-hardware check.
+
+A scheduling-layer header is not banned outright: `LatencyModel.h`'s boundary
+costs are constants both halves must agree on, which is one home, not two.
 
 Writing an attribute is NOT banned: the emitter stamps `seq.hlmem` and
 `seq.read`/`seq.write` ops it has just built, which is hardware construction
@@ -51,6 +55,14 @@ BANNED = (
     (r"\bdcpStart\s*\(", "reads the schedule off the IR; use the cell's `stage`"),
     (r"\bdcpLatency\s*\(", "reads the schedule off the IR; use the cell's latency"),
     (r"\breadyCycleOf\s*\(", "reads the schedule off the IR; use `readyCycle`"),
+    (
+        r"\baddressExprsOf\s*\(",
+        "re-derives the address cones; use `Access::offset`/`bank`",
+    ),
+    (
+        r"\bsplitAddress\s*\(",
+        "re-derives the address split; use `Access::offset`/`bank`",
+    ),
 )
 
 # A `//` or `///` line, so prose naming a banned symbol does not fail the check.

@@ -36,7 +36,11 @@ bool reservationsDisjoint(const Reservation &a, const Reservation &b) {
                        [&](unsigned c) { return cyclesA.contains(c); });
 }
 
-void verifyBinding(const Datapath &dp) {
+// Every check here is an assert, so the whole sweep is debug-only: a release
+// build would otherwise compute O(units * boundOps^2) reservations and throw
+// them away.
+void verifyBinding([[maybe_unused]] const Datapath &dp) {
+#ifndef NDEBUG
   for (const RegionBlock &rb : dp.regions)
     for (UnitId uid : rb.units) {
       const FuncUnit &u = dp.units[uid];
@@ -47,16 +51,14 @@ void verifyBinding(const Datapath &dp) {
                    u.identity &&
                "shared unit binds an op of a different operator identity");
       for (unsigned i = 0, e = u.boundOps.size(); i < e; ++i) {
-        auto ri = reservationOf(rb, u, u.boundOps[i].residue);
-        for (unsigned j = i + 1; j < e; ++j) {
-          auto rj = reservationOf(rb, u, u.boundOps[j].residue);
-          (void)ri;
-          (void)rj;
-          assert(reservationsDisjoint(ri, rj) &&
+        Reservation ri = reservationOf(rb, u, u.boundOps[i].residue);
+        for (unsigned j = i + 1; j < e; ++j)
+          assert(reservationsDisjoint(
+                     ri, reservationOf(rb, u, u.boundOps[j].residue)) &&
                  "binding hazard: two ops share a unit in the same cycle");
-        }
       }
     }
+#endif
 }
 
 } // namespace mlir::allo::uarch

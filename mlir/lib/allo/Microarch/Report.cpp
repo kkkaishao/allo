@@ -135,10 +135,12 @@ FuncUarch::FuncUarch(const Datapath &dp, llvm::StringRef symbol,
     mr.writesIndependent = m.writesIndependent;
     mr.rom = m.isRom;
     mr.skewed = m.skewed;
+    // A skew resolves a slot rather than a bank, and that is still a resolved
+    // partition: it is what lets the array share one port per lane.
     mr.partitionResolved =
         m.numBanks <= 1 ||
         llvm::all_of(m.accesses, [](const MemUnit::Access &a) {
-          return a.staticBank.has_value();
+          return a.staticBank || a.slot;
         });
     mems.push_back(std::move(mr));
   }
@@ -154,6 +156,17 @@ FuncUarch::FuncUarch(const Datapath &dp, llvm::StringRef symbol,
     ++c.count;
     c.spawns += cu.async;
     c.latency = cu.latency;
+    switch (cu.startPolicy) {
+    case CallUnit::StartPolicy::Handshake:
+      ++c.handshake;
+      break;
+    case CallUnit::StartPolicy::Broadcast:
+      ++c.broadcast;
+      break;
+    case CallUnit::StartPolicy::TimeTriggered:
+      ++c.timed;
+      break;
+    }
   }
   for (auto &[name, c] : byCallee)
     calls.push_back(std::move(c));
@@ -281,6 +294,9 @@ std::string MicroarchReport::toJSON() const {
                 j.attribute("callee", c.callee);
                 j.attribute("count", (int64_t)c.count);
                 j.attribute("spawns", (int64_t)c.spawns);
+                j.attribute("handshake", (int64_t)c.handshake);
+                j.attribute("broadcast", (int64_t)c.broadcast);
+                j.attribute("timed", (int64_t)c.timed);
                 if (c.latency)
                   j.attribute("latency", *c.latency);
               });
