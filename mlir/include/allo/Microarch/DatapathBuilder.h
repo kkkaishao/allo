@@ -189,9 +189,14 @@ struct DatapathBuilder {
   /// Bind every memory access and child port to a port of its bank
   /// (`MemUnit::Access::port`, `CallUnit::MemArg::port`) and record how many
   /// ports each bank is built with. The boundary port enumeration, the emitter
-  /// and the report all read it. Runs after `deriveInterconnect`, the first
-  /// point at which an access knows its bank and its skew lane.
+  /// and the report all read it. Runs after `planAccessPorts`, which settles
+  /// how each access reaches its memory.
   void bindMemoryPorts();
+  /// Group a skewed memory's accesses into lanes that can share one port per
+  /// bank (`MemUnit::skewed`, `Access::lane`), or leave it crossbarring when
+  /// they cannot. The first of the port decisions, since the plan below reads
+  /// whether the skew held.
+  void assignLanes();
   /// Decide how each access and each child-mastered port reaches its memory
   /// (`MemUnit::Access::plan`, `CallUnit::MemArg::plan`). Runs before
   /// `bindMemoryPorts`, which hands out ports along the plan it settles.
@@ -261,11 +266,6 @@ struct DatapathBuilder {
   /// term it folds into a scaled counter withdraws its edge, then the chains
   /// over what is left, then the muxes that pick between them.
   void realizeDelays();
-  /// Size the (empty) input-slot vectors every resolve phase fills.
-  void allocateInputSlots();
-  /// Group a skewed memory's accesses into lanes that can share one port per
-  /// bank, or leave it crossbarring when they cannot.
-  void assignLanes(MemUnit &m);
   /// Record a resolved edge into \p slot: a depth-0 edge ties directly, a
   /// deeper one is deferred to `edges` and patched by `insertRegisters`.
   void recordEdge(const Resolved &r, Source &slot, unsigned regionIdx);

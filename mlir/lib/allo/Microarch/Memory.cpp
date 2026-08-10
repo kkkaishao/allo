@@ -316,22 +316,25 @@ DatapathBuilder::bindPorts(MemUnit &m, std::optional<bool> writes,
 // Same-slot accesses always collide, so each takes the next lane, the port the
 // model billed it. Numbered per region and reads apart from writes, the
 // granularity a port is contended at.
-void DatapathBuilder::assignLanes(MemUnit &m) {
-  // A constant table has no ports to share (it is combinational), and an
-  // argument's ports are boundary interfaces the manifest already published,
-  // one set per access, which is why `assign-banks` assigns it no slot either.
-  if (!m.layout.skew() || m.external || m.isRom)
-    return;
-  // One access without a slot and the array is back to crossbarring: a lane
-  // shares a port on the strength of every user holding a distinct slot.
-  if (llvm::any_of(m.accesses,
-                   [](const MemUnit::Access &a) { return !a.staticBank; }))
-    return;
-  m.skewed = true;
-  llvm::DenseMap<std::tuple<unsigned, unsigned, unsigned>, unsigned> used;
-  for (MemUnit::Access &acc : m.accesses) {
-    assert(*acc.staticBank < m.numBanks && "a slot indexes the skew's banks");
-    acc.lane = used[{acc.region, acc.isWrite, *acc.staticBank}]++;
+void DatapathBuilder::assignLanes() {
+  for (MemUnit &m : dp.mems) {
+    // A constant table has no ports to share (it is combinational), and an
+    // argument's ports are boundary interfaces the manifest already published,
+    // one set per access, which is why `assign-banks` assigns it no slot
+    // either.
+    if (!m.layout.skew() || m.external || m.isRom)
+      continue;
+    // One access without a slot and the array is back to crossbarring: a lane
+    // shares a port on the strength of every user holding a distinct slot.
+    if (llvm::any_of(m.accesses,
+                     [](const MemUnit::Access &a) { return !a.staticBank; }))
+      continue;
+    m.skewed = true;
+    llvm::DenseMap<std::tuple<unsigned, unsigned, unsigned>, unsigned> used;
+    for (MemUnit::Access &acc : m.accesses) {
+      assert(*acc.staticBank < m.numBanks && "a slot indexes the skew's banks");
+      acc.lane = used[{acc.region, acc.isWrite, *acc.staticBank}]++;
+    }
   }
 }
 

@@ -391,18 +391,42 @@ void DatapathBuilder::bindStream(Operation *op, RegionBlock &rb) {
 void DatapathBuilder::bindMemory(Operation *op, Value memref, RegionBlock &rb) {
   bool isWrite = isa<dcp::DCPathStoreOp>(op);
   auto mid = memIdOf(memref);
+  MemUnit &m = dp.mems[mid];
   // A mismatch would time a port against a cycle the consumer's register
   // depth was not solved for; both read the same device table.
-  assert(dcpLatency(op) ==
-             (isWrite ? dp.mems[mid].writeLatency : dp.mems[mid].readLatency) &&
+  assert(dcpLatency(op) == (isWrite ? m.writeLatency : m.readLatency) &&
          "scheduled access latency disagrees with the device memory model");
-  unsigned aidx = dp.mems[mid].accesses.size();
+  unsigned aidx = m.accesses.size();
   MemUnit::Access acc;
   acc.op = op;
   acc.isWrite = isWrite;
   acc.region = rb.id;
   acc.stage = dcpStart(op);
-  dp.mems[mid].accesses.push_back(std::move(acc));
+  SmallVector<Value> operands;
+  dcpAddressing(op, acc.addrMap, operands);
+  // One empty slot per index operand, positional: the map names them by
+  // position, so the two are recorded together and neither is resized later.
+  acc.addr.assign(operands.size(), Source{});
+  // Which bank this access reaches: the one bank an unbanked memref has, else
+  // the one `assign-banks` decided, or all of them when it decided none.
+  acc.staticBank =
+      m.numBanks == 1 ? std::optional<unsigned>(0) : assignedBankOf(op);
+  // Under a skew the recorded index is a SLOT, which no derivation off the map
+  // can confirm (the bank it names is only fixed at run time), so this would be
+  // comparing two different things. Otherwise `bankAddress` builds the offset
+  // WITHIN this bank out of `addrMap`, so where the map still resolves a bank
+  // on its own it has to be the decided one. It often cannot: the decision read
+  // the loop steps too.
+  if (m.numBanks > 1 && !m.layout.skew()) {
+    std::optional<int64_t> derived = staticBankOf(
+        m.layout, acc.addrMap, cast<MemRefType>(m.memref.getType()).getShape());
+    assert((!acc.staticBank || !derived ||
+            *derived == static_cast<int64_t>(*acc.staticBank)) &&
+           "the assigned bank is not the one this access's address map "
+           "reaches");
+    (void)derived;
+  }
+  m.accesses.push_back(std::move(acc));
   rb.memAccesses.push_back({mid, aidx});
   if (!isWrite)
     producerOf[op->getResult(0)] = Source{Source::Kind::Mem, mid, aidx};
@@ -837,7 +861,14 @@ Resolved DatapathBuilder::resolveOperand(Value v, Operation *consumer,
 }
 
 void DatapathBuilder::resolveEdges() {
-  allocateInputSlots();
+  // One empty slot per operand port, sized before anything fills them: a
+  // recorded edge holds a pointer into these vectors, so they may not grow
+  // once resolution starts. A memory access is sized where it is bound.
+  for (FuncUnit &u : dp.units) {
+    unsigned n = u.repOp()->getNumOperands();
+    u.inputs.assign(n, Source{});
+    u.inputInits.resize(n); // parallel; filled for recurrence inputs below
+  }
   resolveUnitInputs();
   resolveAccessOperands();
 }
@@ -845,46 +876,6 @@ void DatapathBuilder::resolveEdges() {
 void DatapathBuilder::realizeDelays() {
   planAddressGenerators();
   insertRegisters();
-}
-
-void DatapathBuilder::allocateInputSlots() {
-  for (FuncUnit &u : dp.units) {
-    unsigned n = u.repOp()->getNumOperands();
-    u.inputs.assign(n, Source{});
-    u.inputInits.resize(n); // parallel; filled for recurrence inputs below
-  }
-  for (MemUnit &m : dp.mems) {
-    for (MemUnit::Access &acc : m.accesses) {
-      SmallVector<Value> operands;
-      dcpAddressing(acc.op, acc.addrMap, operands);
-      acc.addr.assign(operands.size(), Source{});
-      // Which bank this access reaches: the one `assign-banks` decided, or all
-      // of them when it decided none. The one write of `staticBank`, so it
-      // covers the unbanked memrefs too.
-      if (m.numBanks == 1) {
-        acc.staticBank = 0; // the one bank there is
-        continue;
-      }
-      acc.staticBank = assignedBankOf(acc.op);
-      // Under a skew the recorded index is a SLOT, which no derivation off the
-      // map can confirm (the bank it names is only fixed at run time), so the
-      // assert below would be comparing two different things.
-      if (m.layout.skew())
-        continue;
-      // `bankAddress` builds the offset WITHIN this bank out of `addrMap`, so
-      // where the map still resolves a bank on its own it has to be the decided
-      // one. It often cannot: the decision read the loop steps too.
-      std::optional<int64_t> derived =
-          staticBankOf(m.layout, acc.addrMap,
-                       cast<MemRefType>(m.memref.getType()).getShape());
-      assert((!acc.staticBank || !derived ||
-              *derived == static_cast<int64_t>(*acc.staticBank)) &&
-             "the assigned bank is not the one this access's address map "
-             "reaches");
-      (void)derived;
-    }
-    assignLanes(m);
-  }
 }
 
 void DatapathBuilder::recordEdge(const Resolved &r, Source &slot,
@@ -1585,8 +1576,9 @@ void DatapathBuilder::build() {
   resolveEdges();
   realizeDelays();
   // Ports last of all: an access holds one only once it knows which bank it
-  // commits to and which skew lane it holds, both settled by the two passes
-  // above, and the boundary port list is one group per bound port.
+  // commits to and which skew lane it holds, and the boundary port list is one
+  // group per bound port.
+  assignLanes();
   planAccessPorts();
   bindMemoryPorts();
   enumerateBoundaryPorts();
