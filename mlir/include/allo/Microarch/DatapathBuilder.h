@@ -201,23 +201,38 @@ struct DatapathBuilder {
   /// (`MemUnit::Access::plan`, `CallUnit::MemArg::plan`). Runs before
   /// `bindMemoryPorts`, which hands out ports along the plan it settles.
   void planAccessPorts();
-  /// Ports one bank comes out of a `bindPorts` colouring with: split by
+  /// Ports one bank comes out of a `planPorts` colouring with: split by
   /// direction, and counted outright, which is below their sum wherever a port
   /// carries both. `colours` is the whole memory's count, where a second
   /// colouring of the other direction starts numbering.
   struct PortCounts {
     unsigned reads = 0, writes = 0, total = 0, colours = 0;
   };
-  /// Colour one memory's port graph and write the result into
-  /// `MemUnit::Access::port` / `CallUnit::MemArg::port`. \p writes picks a
-  /// direction, or nullopt takes both together. \p base offsets the numbering
-  /// so a second, separate colouring cannot collide with the first.
+  /// One candidate binding of a memory's ports, decided without touching the
+  /// model so two of them can be compared before either is committed.
+  struct PortAssignment {
+    /// The port each vertex of `Datapath::portGraph`'s order takes, already
+    /// offset by the `base` it was planned at.
+    llvm::SmallVector<unsigned> colour;
+    PortCounts counts;
+    /// Whether the writes landed on ports separate enough to be separate
+    /// `always` blocks. Meaningful only when `writes` covered them.
+    bool writesIndependent = false;
+    /// The direction this covers, or none for a both-directions colouring.
+    /// `commitPorts` replays the same vertex walk from it.
+    std::optional<bool> writes;
+  };
+  /// Colour one memory's port graph. \p writes picks a direction, or nullopt
+  /// takes both together. \p base offsets the numbering so a second, separate
+  /// colouring cannot collide with the first.
   ///
   /// Returns nullopt only from a both-directions pass whose writes did not
-  /// split, which it cannot express; the binding is then left untouched. A pass
-  /// given a direction always binds.
-  std::optional<PortCounts> bindPorts(MemUnit &m, std::optional<bool> writes,
-                                      unsigned base);
+  /// split, which it cannot express. A pass given a direction always plans.
+  std::optional<PortAssignment>
+  planPorts(const MemUnit &m, std::optional<bool> writes, unsigned base);
+  /// Write \p pa into `MemUnit::Access::port` / `CallUnit::MemArg::port`, and
+  /// `MemUnit::writesIndependent` where it covered the writes.
+  void commitPorts(MemUnit &m, const PortAssignment &pa);
   /// Record what each memory's ports cost against what its schedule asks:
   /// `MemUnit::{readConcurrency, writeConcurrency, boundaryPorts}`, and report
   /// an array replicated past the copies the schedule reserved or published

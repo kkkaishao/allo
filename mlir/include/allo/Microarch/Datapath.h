@@ -305,10 +305,16 @@ struct MemUnit {
   /// scattered argument. Zero for an internal array.
   unsigned boundaryPorts = 0;
 
-  /// Whether `storage` can hold the ports this memory is built with, over as
-  /// many copies as that takes. Reads never decide it: a further read is a
-  /// further copy. What decides it is the writes, which every copy needs.
-  bool fitsStorage() const { return ports.holds(writePortsBuilt, portsBuilt); }
+  /// Whether `storage` can hold \p writes write ports and \p total ports in
+  /// all, over as many copies as that takes. Reads never decide it: a further
+  /// read is a further copy. What decides it is the writes, which every copy
+  /// needs. Takes a candidate rather than reading the committed counts, so a
+  /// binding still being chosen can ask.
+  bool fitsStorage(unsigned writes, unsigned total) const {
+    return ports.holds(writes, total);
+  }
+  /// The same of the binding this memory committed to.
+  bool fitsStorage() const { return fitsStorage(writePortsBuilt, portsBuilt); }
 
   /// Instances of `storage` this bank is held in, decided by `bindMemoryPorts`
   /// once the ports are bound. Reads past one instance's are served by another

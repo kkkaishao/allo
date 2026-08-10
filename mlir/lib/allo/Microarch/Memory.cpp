@@ -145,16 +145,16 @@ void DatapathBuilder::collectStorageFacts(ArrayRef<Operation *> regionOps) {
   }
 }
 
-// Bind \p m: which port of its bank each access drives, and how many ports one
-// bank is therefore built with.
+// Plan \p m: which port of its bank each access would drive, and how many ports
+// one bank would therefore be built with.
 //
 // Two accesses share a port only where `portGraph` has no edge between them,
 // which proves they never issue in the same cycle, so the port carries a select
 // over them rather than an arbiter. Two shapes take a port of their own: an
 // access `contendsWithAll` relates to every other, and, on the write side,
 // every write of an array whose splitting is not proven safe.
-std::optional<DatapathBuilder::PortCounts>
-DatapathBuilder::bindPorts(MemUnit &m, std::optional<bool> writes,
+std::optional<DatapathBuilder::PortAssignment>
+DatapathBuilder::planPorts(const MemUnit &m, std::optional<bool> writes,
                            unsigned base) {
   Datapath::PortRelation rel = dp.portGraph(m.id, writes);
   ArrayRef<Datapath::PortVertex> verts = rel.verts;
@@ -268,35 +268,20 @@ DatapathBuilder::bindPorts(MemUnit &m, std::optional<bool> writes,
       colour[i] = i;
     used = n;
   }
+  PortAssignment out;
+  out.writes = writes;
   // Only a colouring that included the writes has anything to say about them.
   if (!writes || *writes) {
     llvm::SmallDenseSet<unsigned> writeColours;
     for (unsigned i = 0; i < n; ++i)
       if (verts[i].write)
         writeColours.insert(colour[i]);
-    m.writesIndependent = split && writeColours.size() > 1;
+    out.writesIndependent = split && writeColours.size() > 1;
   }
-
-  // The vertex order `portGraph` builds: writes before reads, and within each
-  // this function's accesses before the ports its children master.
-  unsigned v = 0;
-  for (bool dir : {true, false}) {
-    if (writes && *writes != dir)
-      continue;
-    for (MemUnit::Access &acc : m.accesses)
-      if (acc.isWrite == dir)
-        acc.port = base + colour[v++];
-    for (CallUnit &cu : dp.calls)
-      for (CallUnit::MemArg &ma : cu.memArgs)
-        if (ma.mem == m.id && ma.isWrite == dir)
-          ma.port = base + colour[v++];
-  }
-  assert(v == n && "the port binding walks `portGraph`'s vertex order");
 
   // Ports one bank is built with: a bank is its own `seq.hlmem` and only the
   // accesses reaching it take its ports.
-  PortCounts out;
-  out.colours = used;
+  out.counts.colours = used;
   for (unsigned k = 0; k < m.numBanks; ++k) {
     llvm::SmallDenseSet<unsigned> all, rd, wr;
     for (unsigned i = 0; i < n; ++i)
@@ -304,11 +289,34 @@ DatapathBuilder::bindPorts(MemUnit &m, std::optional<bool> writes,
         all.insert(colour[i]);
         (verts[i].write ? wr : rd).insert(colour[i]);
       }
-    out.total = std::max<unsigned>(out.total, all.size());
-    out.reads = std::max<unsigned>(out.reads, rd.size());
-    out.writes = std::max<unsigned>(out.writes, wr.size());
+    out.counts.total = std::max<unsigned>(out.counts.total, all.size());
+    out.counts.reads = std::max<unsigned>(out.counts.reads, rd.size());
+    out.counts.writes = std::max<unsigned>(out.counts.writes, wr.size());
   }
+  for (unsigned c : colour)
+    out.colour.push_back(base + c);
   return out;
+}
+
+void DatapathBuilder::commitPorts(MemUnit &m, const PortAssignment &pa) {
+  // The vertex order `portGraph` builds: writes before reads, and within each
+  // this function's accesses before the ports its children master.
+  unsigned v = 0;
+  for (bool dir : {true, false}) {
+    if (pa.writes && *pa.writes != dir)
+      continue;
+    for (MemUnit::Access &acc : m.accesses)
+      if (acc.isWrite == dir)
+        acc.port = pa.colour[v++];
+    for (CallUnit &cu : dp.calls)
+      for (CallUnit::MemArg &ma : cu.memArgs)
+        if (ma.mem == m.id && ma.isWrite == dir)
+          ma.port = pa.colour[v++];
+  }
+  assert(v == pa.colour.size() &&
+         "the port binding walks `portGraph`'s vertex order");
+  if (!pa.writes || *pa.writes)
+    m.writesIndependent = pa.writesIndependent;
 }
 
 // Group a skewed memory's accesses into LANES: within a lane the slots are
@@ -381,35 +389,40 @@ void DatapathBuilder::bindMemoryPorts() {
     // A direction at a time, reads numbered past the writes so no port carries
     // both. On a row whose directions are separate structures, merging them
     // buys an address multiplexer and nothing else.
-    auto separate = [&] {
-      PortCounts w = bindPorts(m, /*writes=*/true, /*base=*/0).value();
-      PortCounts r = bindPorts(m, /*writes=*/false, /*base=*/w.colours).value();
-      m.writePortsBuilt = w.writes;
-      m.readPortsBuilt = r.reads;
-      m.portsBuilt = w.writes + r.reads;
-    };
-    separate();
+    PortAssignment w = planPorts(m, /*writes=*/true, /*base=*/0).value();
+    PortAssignment r =
+        planPorts(m, /*writes=*/false, /*base=*/w.counts.colours).value();
+    unsigned separateTotal = w.counts.writes + r.counts.reads;
     // Where the row's ports are a pool, each serving either direction, a read
     // may ride a write's port and one address bus carries both. Worth the
     // multiplexer only where the array does not otherwise fit, and possible
     // only where the writes were split, an unsplittable set already being one
     // `always` block.
-    if (m.ports.instPool && !m.external && !m.fitsStorage() &&
-        (m.writePortsBuilt <= 1 || m.writesIndependent)) {
+    std::optional<PortAssignment> pooled;
+    if (m.ports.instPool && !m.external &&
+        !m.fitsStorage(w.counts.writes, separateTotal) &&
+        (w.counts.writes <= 1 || w.writesIndependent)) {
       // The shared bus carries the write's address on the cycle it commits, so
       // a write that presents its terms early would drive the read's cycle too.
       assert(m.writeLatency == 1 &&
              "a pooled row's write port realizes in one cycle");
-      std::optional<PortCounts> u =
-          bindPorts(m, /*writes=*/std::nullopt, /*base=*/0);
-      if (u && u->total < m.portsBuilt) {
-        m.readPortsBuilt = u->reads;
-        m.writePortsBuilt = u->writes;
-        m.portsBuilt = u->total;
-      } else {
-        separate();
-      }
+      // A pooled binding that saves no port is the multiplexer for nothing.
+      pooled = planPorts(m, /*writes=*/std::nullopt, /*base=*/0);
+      if (pooled && pooled->counts.total >= separateTotal)
+        pooled.reset();
     }
+    if (pooled) {
+      commitPorts(m, *pooled);
+      m.readPortsBuilt = pooled->counts.reads;
+      m.writePortsBuilt = pooled->counts.writes;
+      m.portsBuilt = pooled->counts.total;
+      continue;
+    }
+    commitPorts(m, w);
+    commitPorts(m, r);
+    m.writePortsBuilt = w.counts.writes;
+    m.readPortsBuilt = r.counts.reads;
+    m.portsBuilt = separateTotal;
   }
   // Instances of its row each bank is held in, decided here because the bound
   // ports are what it follows from. A skew binds its ports by lane and leaves
