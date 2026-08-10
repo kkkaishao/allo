@@ -433,15 +433,27 @@ StallShell DatapathEmitter::deriveStallShell(const uarch::RegionBlock &rb,
          "defers a starved or back-pressured pass by GATING its issue, so a "
          "controller whose issue cannot be gated would drop the pass and "
          "sample `_data` with no regard for `_valid`");
+  // Resolved once and split by direction, which is what every phase below
+  // filters on; a stage decides what an access CONTRIBUTES, not whether the
+  // phase looks at it.
+  struct Acc {
+    const uarch::StreamChannel &ch;
+    const uarch::StreamChannel::Access &acc;
+  };
+  SmallVector<Acc> gets, puts;
+  for (uarch::AccRef r : rb.streamAccesses) {
+    const uarch::StreamChannel &s = dp.streams[r.id];
+    const uarch::StreamChannel::Access &acc = s.accesses[r.idx];
+    (acc.isPut ? puts : gets).push_back({s, acc});
+  }
+
   // Stage-0 inputs (read at issue) join into `stage0Valid`; a predicated get
   // treats a non-needed input as available (`valid | ~pred`). Built before the
   // puts because a stage-0 put shares the join: a pass that cannot issue
   // writes no token, so it needs no space.
   Value stage0Valid;
-  for (uarch::AccRef r : rb.streamAccesses) {
-    const uarch::StreamChannel &s = dp.streams[r.id];
-    const uarch::StreamChannel::Access &acc = s.accesses[r.idx];
-    if (acc.isPut || acc.stage != 0)
+  for (auto [s, acc] : gets) {
+    if (acc.stage != 0)
       continue;
     Value valid = streamValid(s);
     if (acc.when)
@@ -460,11 +472,7 @@ StallShell DatapathEmitter::deriveStallShell(const uarch::RegionBlock &rb,
     Value flag, valid, ready;
   };
   SmallVector<Sent> sent;
-  for (uarch::AccRef r : rb.streamAccesses) {
-    const uarch::StreamChannel &s = dp.streams[r.id];
-    const uarch::StreamChannel::Access &acc = s.accesses[r.idx];
-    if (!acc.isPut)
-      continue;
+  for (auto [s, acc] : puts) {
     // A predicated put produces a token only where its predicate holds: gate
     // `valid`, and suppress the output-full hazard when it is low, so the
     // pipeline never freezes waiting for space it will not write.
@@ -499,10 +507,8 @@ StallShell DatapathEmitter::deriveStallShell(const uarch::RegionBlock &rb,
   // bubble past a missing token, so fold that stall into `chainEnable` beside
   // the output-full freeze. Only registered state is read here.
   Value midStall;
-  for (uarch::AccRef r : rb.streamAccesses) {
-    const uarch::StreamChannel &s = dp.streams[r.id];
-    const uarch::StreamChannel::Access &acc = s.accesses[r.idx];
-    if (acc.isPut || acc.stage == 0)
+  for (auto [s, acc] : gets) {
+    if (acc.stage == 0)
       continue;
     Value active = c.delayValid(issue, acc.stage, sh);
     Value want = acc.when ? c.andBits(active, resolveSource(acc.when)) : active;
@@ -539,11 +545,7 @@ StallShell DatapathEmitter::deriveStallShell(const uarch::RegionBlock &rb,
   // Drive each `_ready`: a stage-0 get pops exactly where the pass issues,
   // which already joins every stage-0 input; a deeper get accepts when the
   // chain advances; a predicated get pops only where its predicate holds.
-  for (uarch::AccRef r : rb.streamAccesses) {
-    const uarch::StreamChannel &s = dp.streams[r.id];
-    const uarch::StreamChannel::Access &acc = s.accesses[r.idx];
-    if (acc.isPut)
-      continue;
+  for (auto [s, acc] : gets) {
     Value pred = acc.when ? resolveSource(acc.when) : Value();
     Value ready = acc.stage == 0 ? c.andBits(atIssue, issueEnable)
                                  : c.andBits(c.delayValid(issue, acc.stage, sh),
@@ -889,16 +891,10 @@ void DatapathEmitter::emitCalls(const uarch::RegionBlock &rb, Value issue,
           setSurvivor(cu.region, k, outs[port]);
     }
 
-    // Scoped to this pass for the join above and the conjunction below, which
-    // would otherwise read the previous pass's latched 1. Built on demand so a
-    // region whose calls share no port emits it exactly where it used to.
-    Value completed;
-    auto completion = [&] {
-      if (!completed)
-        completed =
-            concurrent ? outs[kDone] : c.completedSince(outs[kDone], issue);
-      return completed;
-    };
+    // Scoped to this pass for the join below and the conjunction in the run
+    // window, which would otherwise read the previous pass's latched 1.
+    Value completed =
+        concurrent ? outs[kDone] : c.completedSince(outs[kDone], issue);
     // The window this child owns the ports it masters. A child drives its
     // addresses continuously and has no per-access pulse, so this is what a
     // port a second accessor also holds selects on.
@@ -908,21 +904,25 @@ void DatapathEmitter::emitCalls(const uarch::RegionBlock &rb, Value issue,
     // completion COMBINATIONALLY as well: a gated sibling's start is the rising
     // edge of this one's `done` (`startFor`), so the two run on the very same
     // cycle and clearing a cycle later would leave both claiming the bus.
+    //
+    // Built on demand, and this one really is worth deferring: it costs a
+    // flip-flop per call, and only a port this child SHARES with another
+    // accessor ever selects on it.
     Value driving;
     auto runWindow = [&] {
       if (!driving) {
         Backedge next = c.bb.get(c.i1);
         Value armed = c.orBits(startK, c.reg(next, c.f1));
-        next.setValue(c.mux(completion(), c.f1, armed));
-        driving = c.andBits(armed, c.notBit(completion()));
+        next.setValue(c.mux(completed, c.f1, armed));
+        driving = c.andBits(armed, c.notBit(completed));
       }
       return driving;
     };
 
     masterCallPorts(cu, outs, rdBackedge, runWindow, sh);
 
-    doneByCid[cu.id] = completion();
-    dones.push_back(completion());
+    doneByCid[cu.id] = completed;
+    dones.push_back(completed);
     if (!cu.streamArgs.empty())
       callOuts[cu.id] = std::move(outs);
   }
