@@ -201,7 +201,7 @@ struct DatapathEmitter {
   // anything, and a stage that would have to is in the wrong place.
   const uarch::Datapath &dp;
   circt::hw::HWModulePortAccessor &pa;
-  const DenseMap<unsigned, Operation *> &unitModule;
+  const llvm::StringMap<Operation *> &opModules;
 
   // A region's controller outputs, the G->F seam. `counter` is null for an
   // acyclic region; `wantIssue` is null when the region has no stall shell.
@@ -374,9 +374,9 @@ struct DatapathEmitter {
 
   DatapathEmitter(EmitContext &c, const uarch::Datapath &dp,
                   circt::hw::HWModulePortAccessor &pa,
-                  const DenseMap<unsigned, Operation *> &unitModule,
+                  const llvm::StringMap<Operation *> &opModules,
                   const uarch::CalleeCtx *callees = nullptr)
-      : c(c), dp(dp), pa(pa), unitModule(unitModule), callees(callees) {}
+      : c(c), dp(dp), pa(pa), opModules(opModules), callees(callees) {}
 
   static uint64_t accKey(unsigned m, unsigned a) {
     return (uint64_t(m) << 32) | a;
@@ -636,11 +636,11 @@ struct HWEmitter {
 
   HWEmitter(OpBuilder &b, Location loc, const uarch::Datapath &dp,
             circt::hw::HWModulePortAccessor &pa,
-            const DenseMap<unsigned, Operation *> &unitModule,
+            const llvm::StringMap<Operation *> &opModules,
             circt::BackedgeBuilder &bb, Type i1, Type i32,
             const uarch::CalleeCtx *callees = nullptr)
       : ctx(b, loc, bb, i1, i32), control(ctx),
-        datapath(ctx, dp, pa, unitModule, callees), dp(dp), pa(pa) {}
+        datapath(ctx, dp, pa, opModules, callees), dp(dp), pa(pa) {}
 
   /// The counted terminator of region \p rb: each bound resolved from its
   /// runtime Source (a dynamic trip) or the constant fast path. Empty for an

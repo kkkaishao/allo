@@ -125,8 +125,11 @@ struct ModuleInterface {
   std::vector<Operator> operators;
 
   ModuleInterface() = default;
-  /// Build the boundary from \p dp, whose `readPorts` / `writePorts` are the
-  /// one enumeration of its external memory accesses.
+  /// Build the WHOLE boundary from \p dp, whose `readPorts` / `writePorts` are
+  /// the one enumeration of its external memory accesses. Nothing is filled in
+  /// afterwards: the port declarations, the extern operator modules and the
+  /// cosim model are all derived FROM this object, so a field it left empty
+  /// would be a shape two of them could disagree about.
   explicit ModuleInterface(const uarch::Datapath &dp);
 
   /// Every memory interface of argument \p arg, reads before writes and flat

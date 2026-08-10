@@ -5,15 +5,18 @@
 
 #include "allo/Microarch/Primitives.h"
 
-#include "allo-c/Schedule.h"       // kMemoryInitAttr
-#include "allo/Microarch/Naming.h" // regionSignal
+#include "allo-c/Schedule.h"          // kMemoryInitAttr
+#include "allo/Microarch/Interface.h" // iface::ModuleInterface (the ports)
+#include "allo/Microarch/Naming.h"    // regionSignal
 
 #include "circt/Dialect/Comb/CombOps.h"
 #include "circt/Dialect/HW/HWOps.h"
+#include "circt/Dialect/SV/SVDialect.h" // sv::isNameValid
 #include "circt/Dialect/Seq/SeqOps.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h" // arith::CmpIPredicate
 #include "mlir/IR/BuiltinTypes.h"
+#include "llvm/ADT/StringSet.h"
 #include "llvm/Support/MathExtras.h"
 #include "llvm/Support/SaveAndRestore.h"
 
@@ -22,6 +25,123 @@ using namespace mlir::allo;
 using namespace circt;
 
 namespace mlir::allo::uarch {
+
+//===----------------------------------------------------------------------===//
+// Module boundaries: the ports one is declared with, and wiring one up.
+//===----------------------------------------------------------------------===//
+
+llvm::SmallVector<hw::PortInfo>
+declareModulePorts(const iface::ModuleInterface &model, OpBuilder &b) {
+  using PortInfo = hw::PortInfo;
+  using Dir = hw::ModulePort::Direction;
+  auto *ctx = b.getContext();
+  Type i1 = b.getI1Type(), i32 = b.getIntegerType(32);
+  // A data port's hw width is its field bit width, so `iType(w)` reproduces
+  // `datapathType`/`memElemType` for the data ports.
+  auto iType = [&](unsigned w) -> Type { return b.getIntegerType(w); };
+  SmallVector<PortInfo> ports;
+  // The port names are the manifest, authored before CIRCT's LegalizeNames
+  // runs, so a name ExportVerilog would rewrite or uniquify desyncs cosim from
+  // the Verilog. These check the composed result.
+  llvm::StringSet<> seen;
+  auto port = [&](const Twine &n, Type t, Dir d) {
+    std::string s = n.str();
+    assert(sv::isNameValid(s, /*caseInsensitiveKeywords=*/false) &&
+           "module port name is not a legal SystemVerilog identifier; the JSON "
+           "manifest would desync from the emitted Verilog");
+    bool fresh = seen.insert(s).second;
+    assert(fresh && "duplicate module port name; the JSON manifest would "
+                    "desync from the emitted Verilog");
+    (void)fresh;
+    ports.push_back(PortInfo{{StringAttr::get(ctx, s), t, d}});
+  };
+  port(kClk, i1, Dir::Input);
+  port(kRst, i1, Dir::Input);
+  port(kStart, i1, Dir::Input);
+  // Scalar kernel arguments; memref args become memory ports instead. One
+  // named after a control port trips the duplicate check above.
+  for (const iface::Scalar &s : model.scalars)
+    port(s.name, iType(s.width), Dir::Input);
+  // Stream FIFO ports, input side. Module inputs must stay contiguous at the
+  // front, since HWModulePortAccessor maps body args to the first `numInputs`
+  // ports positionally, so {data, valid} / {ready} go here.
+  for (const iface::FIFO &s : model.streams) {
+    if (s.isInput) {
+      port(s.data, iType(s.width), Dir::Input);
+      port(s.valid, i1, Dir::Input);
+    } else {
+      port(s.ready, i1, Dir::Input);
+    }
+  }
+  // A partitioned argument presents one interface per bank (a data-dependent
+  // access spans all of them, a static access one); `model.reads[i]` holds an
+  // access's per-bank interfaces.
+  for (const auto &acc : model.reads)
+    for (const iface::Memory &r : acc)
+      port(r.data, iType(r.width), Dir::Input);
+  // A fully-partitioned argument gets one input per element, no address or
+  // latency, read combinationally in any number at once. A write-only argument
+  // has no input side.
+  for (const iface::RegisterFile &rf : model.registers)
+    for (const iface::RegisterFile::Element &e : rf.elements)
+      if (!e.in.empty())
+        port(e.in, iType(rf.width), Dir::Input);
+  port(kDone, i1, Dir::Output);
+  // Stream FIFO ports, output side: an input stream's back-pressure {ready}, an
+  // output stream's {data, valid}.
+  for (const iface::FIFO &s : model.streams) {
+    if (s.isInput) {
+      port(s.ready, i1, Dir::Output);
+    } else {
+      port(s.data, iType(s.width), Dir::Output);
+      port(s.valid, i1, Dir::Output);
+    }
+  }
+  for (const auto &acc : model.reads)
+    for (const iface::Memory &r : acc)
+      port(r.addr, i32, Dir::Output);
+  for (const auto &acc : model.writes)
+    for (const iface::Memory &w : acc) {
+      port(w.addr, i32, Dir::Output);
+      port(w.data, iType(w.width), Dir::Output);
+      port(w.we, i1, Dir::Output);
+    }
+  // A written scattered argument leaves on one data + write-enable pair per
+  // element: the storage is the driver's, so an element commits only where the
+  // module says it did.
+  for (const iface::RegisterFile &rf : model.registers)
+    for (const iface::RegisterFile::Element &e : rf.elements)
+      if (!e.out.empty()) {
+        port(e.out, iType(rf.width), Dir::Output);
+        port(e.we, i1, Dir::Output);
+      }
+  // Scalar function results: one output port each, driven by the returning
+  // region's survivor and valid when `done` rises (emit()).
+  for (const iface::Result &r : model.results)
+    port(r.name, iType(r.width), Dir::Output);
+  return ports;
+}
+
+llvm::StringMap<Value> instantiateChild(OpBuilder &b, Location loc,
+                                        hw::HWModuleOp mod,
+                                        llvm::StringRef name,
+                                        llvm::StringMap<Value> &ins) {
+  using Dir = hw::ModulePort::Direction;
+  SmallVector<Value> operands(mod.getNumInputPorts());
+  for (const hw::PortInfo &p : mod.getPortList())
+    if (p.dir == Dir::Input) {
+      auto it = ins.find(p.name.getValue());
+      assert(it != ins.end() && "unwired child input port");
+      operands[p.argNum] = it->second;
+    }
+  auto inst =
+      hw::InstanceOp::create(b, loc, mod, b.getStringAttr(name), operands);
+  llvm::StringMap<Value> outs;
+  for (const hw::PortInfo &p : mod.getPortList())
+    if (p.dir == Dir::Output)
+      outs[p.name.getValue()] = inst.getResult(p.argNum);
+  return outs;
+}
 
 //===----------------------------------------------------------------------===//
 // Shared free helpers.

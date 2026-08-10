@@ -6,6 +6,7 @@
 #include "allo/Microarch/Interface.h"
 
 #include "mlir/IR/BuiltinTypes.h"
+#include "llvm/ADT/StringMap.h"
 #include "llvm/Support/JSON.h"
 
 using namespace mlir;
@@ -34,6 +35,12 @@ layoutOf(const uarch::MemUnit &mu) {
 } // namespace
 
 ModuleInterface::ModuleInterface(const uarch::Datapath &dp) {
+  // Legalized here, so the key the manifest uses is the emitted Verilog module
+  // name: a nested callee `top.child` would otherwise be rewritten downstream
+  // by ExportVerilog.
+  symbol = dcp::DCPathModuleOp(dp.func).getSymName().str();
+  module = uarch::verilogName(symbol);
+
   ArrayRef<uarch::AccRef> reads = dp.readPorts, writes = dp.writePorts;
   // Every IOPort is a scalar kernel argument; a scalar result is a `dp.results`
   // entry, declared further down.
@@ -123,6 +130,39 @@ ModuleInterface::ModuleInterface(const uarch::Datapath &dp) {
 
   for (const uarch::Result &r : dp.results)
     results.push_back({datapathWidth(r.type), r.name});
+
+  // One entry per extern operator module this kernel instantiates, with the
+  // ports it is declared with: `declareOperatorModules` builds the extern from
+  // this rather than deriving the same shape a second time. A native (comb)
+  // unit emits inline and declares nothing. Deduplicated by module name, which
+  // is also what decides whether two units may share a module at all.
+  llvm::StringMap<const allo::OperatorIdentity *> listed;
+  for (const uarch::FuncUnit &u : dp.units) {
+    if (u.identity.comb)
+      continue;
+    std::string modName = uarch::operatorModuleName(u);
+    auto [claim, fresh] = listed.try_emplace(modName, &u.identity);
+    assert(*claim->second == u.identity &&
+           "two operator identities share one module name");
+    if (!fresh)
+      continue;
+    Operator entry{
+        modName, u.identity.ipSymbol, uarch::operatorPredicate(u), {}};
+    // Widths off the IDENTITY, which is what the module name separates, so the
+    // ports cannot disagree with it.
+    for (auto [k, argType] : llvm::enumerate(u.identity.argTypes))
+      entry.ports.push_back({std::string(1, static_cast<char>('a' + k)),
+                             datapathWidth(argType), Operator::Role::Data});
+    entry.ports.push_back({uarch::kClk.str(), 1, Operator::Role::Clk});
+    // `ce == 0` freezes the IP in lockstep with the shell; a free-running one
+    // has no such port.
+    if (u.stall == allo::StallContractEnum::Ce)
+      entry.ports.push_back({uarch::kCe.str(), 1, Operator::Role::Ce});
+    entry.ports.push_back({uarch::kOpOut.str(),
+                           datapathWidth(u.identity.resultType),
+                           Operator::Role::Out});
+    operators.push_back(std::move(entry));
+  }
 }
 
 llvm::SmallVector<const Memory *, 2>

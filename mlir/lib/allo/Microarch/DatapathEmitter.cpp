@@ -317,9 +317,13 @@ void DatapathEmitter::emitUnits(const uarch::RegionBlock &rb, UnitMode mode) {
         // advancing while the shell's shift chains stall, folding a stale
         // result. `validateDatapath` rejects that pairing up front.
         assert(!sh && "a free-running IP operator in a back-pressured region");
-      result = hw::InstanceOp::create(c.b, c.loc, unitModule.lookup(u.id),
-                                      unitInstanceName(u), operands)
-                   ->getResult(0);
+      // Keyed by the module name the manifest declared it under, which is the
+      // same name `Naming.h` spells from this unit's identity.
+      Operation *mod = opModules.lookup(operatorModuleName(u));
+      assert(mod && "an IP unit with no extern operator module declared");
+      result =
+          hw::InstanceOp::create(c.b, c.loc, mod, unitInstanceName(u), operands)
+              ->getResult(0);
     }
     unitBE[uid].setValue(result);
     unitVal[u.id] = result;
