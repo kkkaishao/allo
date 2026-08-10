@@ -102,6 +102,12 @@ class FabricTiming(NamedTuple):
     #: a 32-bit divider measures 23.7 ns against an 8-bit one's 4.3.
     comb: Mapping[CombKind, Cost]
     storage: Mapping[str, StorageTiming]
+    #: A channel's own timing. ``read_latency`` is 0 because ``seq.fifo`` is
+    #: show-ahead: the head is on the wire in the cycle ``valid`` is high, which
+    #: is what the emitter builds and what a consumer's register depth is solved
+    #: against. NOT CHARACTERIZED: the two delays are copied from the ``srl``
+    #: row, an SRL-backed FIFO's output being an SRL read. Retake them with a
+    #: FIFO DUT before trusting a chaining decision that turns on them.
     stream: StorageTiming
     reg_ns: float = 0.0
 

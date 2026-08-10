@@ -97,7 +97,7 @@ TIMING: Mapping[Grade, FabricTiming] = {
             "uram": StorageTiming(2, 1, 1.057, 0.485),
             "srl": StorageTiming(1, 1, 1.268, 1.196),
         },
-        stream=StorageTiming(1, 1, 1.268, 1.196),
+        stream=StorageTiming(0, 1, 1.268, 1.196),
         reg_ns=0.410,
     ),
 }

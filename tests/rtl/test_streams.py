@@ -1036,27 +1036,38 @@ def test_stream_shell_freeze_is_token_exact():
     n = 8
     x = np.arange(n, dtype=np.int32) * 5 - 11
 
-    # (1) A put whose stage is a multiple of the II shares the stage-0 get's
-    # phase, so an input-starvation freeze catches its `valid` mid flight and the
-    # chain holds it high; without the `sent` latch the token is recaptured.
+    # (1) A stage>=1 put's `valid` is a delayed issue pulse riding the chain, so
+    # a freeze holds it high after the handshake has fired and a ready consumer
+    # recaptures the token; the `sent` latch retires it.
+    #
+    # The freeze has to reach `chainEnable`, and the accumulator is what gets it
+    # there rather than decoration: a starved STAGE-0 get only defers the pass
+    # (`issueEnable`) while the chain keeps advancing, so on its own it never
+    # holds the put's pulse. A loop-carried accumulator makes the region
+    # `cycleIndexedState`, which merges the two halves of the shell, and only
+    # then does an input starvation freeze the chain the pulse sits in.
     @kernel
     def fz_put(x_in: Stream[i32], y_out: Stream[i32]):
+        acc: i32 = 0
         for i in range(n, name="i"):
-            v: i32 = x_in.get()
-            # Adds rather than a multiply: an integer multiply binds to a DSP
-            # core whose latency moves the put off the phase under test.
-            y_out.put(v + v + v + 7)
+            acc += x_in.get()
+            y_out.put(acc + 7)
 
-    s = fz_put.schedule()
-    s.pipeline("i", ii=2)  # put lands at stage 2 == 0 (mod II)
-    rtl = s.export("rtl")
+    rtl = _to_rtl(fz_put)
     loop = rtl.schedule().func("fz_put").cyclic()[0]
     put = next(o for o in loop.ops if o.kind == "stream.put")
-    assert loop.interval == 2 and put.t % loop.interval == 0, (loop.interval, put.t)
+    # `deriveStallShell` arms the latch on exactly this, so it is the whole
+    # precondition; the stage's residue modulo the II decides nothing. This
+    # shape is the latch's ONLY coverage: compiling the latch out fails this 5
+    # runs out of 5 and fails nothing else in the suite, so a change that stops
+    # reaching `chainEnable` here silently retires the check.
+    assert put.t >= 1, put.t
     for gap in (0.0, 0.6):
         y = np.zeros(n, np.int32)
         rtl.cosim(x, y, stall_prob=gap)
-        assert np.array_equal(y, x * 3 + 7), f"gap={gap}: {list(y)}"
+        assert np.array_equal(y, np.cumsum(x, dtype=np.int32) + 7), (
+            f"gap={gap}: {list(y)}"
+        )
 
     # (2) A starved input at II==1 must freeze rather than bubble: a bubble
     # still advances the shift chains, so a loop-carried accumulator folds in
