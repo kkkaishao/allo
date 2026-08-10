@@ -37,7 +37,7 @@ namespace mlir::allo::uarch {
 // Pure DCP structural readers.
 //===----------------------------------------------------------------------===//
 
-static Value dcpMemref(Operation *op) {
+Value dcpMemref(Operation *op) {
   if (auto l = dyn_cast<dcp::DCPathLoadOp>(op))
     return l.getMemref();
   if (auto s = dyn_cast<dcp::DCPathStoreOp>(op))
@@ -65,6 +65,17 @@ static Block *regionBody(Operation *regionOp) {
   if (auto sel = dyn_cast<dcp::DCPathSelectOp>(regionOp))
     return &sel.getThenRegion().front();
   return &cast<dcp::DCPathSequentialOp>(regionOp).getBody().front();
+}
+
+void forEachBodyOp(Operation *regionOp,
+                   llvm::function_ref<void(Operation *)> fn) {
+  for (Operation &op : regionBody(regionOp)->without_terminator())
+    fn(&op);
+  // A dual guard's else branch, which `regionBody` does not report.
+  if (auto sel = dyn_cast<dcp::DCPathSelectOp>(regionOp))
+    if (!sel.getElseRegion().empty())
+      for (Operation &op : sel.getElseRegion().front().without_terminator())
+        fn(&op);
 }
 
 // Trace a pipeline iter-arg (0-based) back to the value assigned to it each
@@ -323,7 +334,7 @@ void DatapathBuilder::bindCall(dcp::DCPathInstanceOp inv, RegionBlock &rb) {
       cu.scalarIns.push_back({Source{}, sc->name, sc->width});
       continue;
     }
-    auto mem = getOrCreateMem(operand);
+    auto mem = memIdOf(operand);
     bool isBoundary = isa<BlockArgument>(operand);
     for (const iface::Memory *m : mi.portsForArg(static_cast<int>(k))) {
       CallUnit::MemArg ma;
@@ -379,10 +390,7 @@ void DatapathBuilder::bindStream(Operation *op, RegionBlock &rb) {
 
 void DatapathBuilder::bindMemory(Operation *op, Value memref, RegionBlock &rb) {
   bool isWrite = isa<dcp::DCPathStoreOp>(op);
-  auto mid = getOrCreateMem(memref);
-  // Fires only if `getOrCreateMem`'s ROM scan and this binding disagree.
-  assert(!(isWrite && dp.mems[mid].isRom) &&
-         "store bound to a memory classified read-only");
+  auto mid = memIdOf(memref);
   // A mismatch would time a port against a cycle the consumer's register
   // depth was not solved for; both read the same device table.
   assert(dcpLatency(op) ==
@@ -530,7 +538,7 @@ void DatapathBuilder::recordCallScalars() {
 
 void DatapathBuilder::recordCallDeps() {
   // The MemIds a call touches, by role. Two calls share an array iff MemId
-  // identity says so (`getOrCreateMem` keys on the storage root).
+  // identity says so (a MemUnit keys on the storage root).
   auto memsOf = [&](const CallUnit &cu, std::optional<bool> write) {
     SmallVector<MemId, 4> ms;
     for (const CallUnit::MemArg &ma : cu.memArgs)
@@ -1501,8 +1509,6 @@ void DatapathBuilder::recordSiblingDeps(ArrayRef<Operation *> regionOps) {
 //===----------------------------------------------------------------------===//
 
 void DatapathBuilder::build() {
-  dp.func = func;
-
   collectConstants();
 
   // dcp region ops in program order. Pre-order so an enclosing container is
@@ -1517,18 +1523,15 @@ void DatapathBuilder::build() {
   // pass below sees a scalar func arg as an IO source.
   bindIOArgs();
 
+  // Every array the function touches, with everything the device and the layout
+  // say about it. Before the walk, so a binding looks its memory up rather than
+  // deciding anything about it.
+  collectStorageFacts(regionOps);
+
   for (unsigned ridx = 0, e = regionOps.size(); ridx < e; ++ridx) {
     Operation *regionOp = regionOps[ridx];
     auto rb = addRegion(regionOp, ridx);
-    for (Operation &opRef : regionBody(regionOp)->without_terminator())
-      bindResource(&opRef, rb);
-    // A dual guard binds its else-branch loose ops too, since regionBody gives
-    // only the then block. Nested regions are walked in their own iteration.
-    if (auto sel = dyn_cast<dcp::DCPathSelectOp>(regionOp))
-      if (!sel.getElseRegion().empty())
-        for (Operation &opRef :
-             sel.getElseRegion().front().without_terminator())
-          bindResource(&opRef, rb);
+    forEachBodyOp(regionOp, [&](Operation *op) { bindResource(op, rb); });
     dp.regions.push_back(std::move(rb));
   }
 
@@ -1557,7 +1560,6 @@ void DatapathBuilder::build() {
   recordRegionResults(regionOps); // per-region results/recurrence + predicate
   recordCallScalars();            // each dcp.instance's scalar operand drivers
   recordCallDeps();               // composition DAG on the instance substrate
-  reclassifyRoms();               // read-only is a property of the USE
   recordRegionBounds(regionOps);  // induction bounds, at that width
   recordResults();                // scalar func-result output ports
   deriveInterconnect();

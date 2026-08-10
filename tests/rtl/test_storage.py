@@ -1165,6 +1165,40 @@ def test_a_constant_table_is_priced_as_the_logic_it_is_built_from():
     assert qor.estimate(rtl.report).area.bram36 == 0
 
 
+def test_a_table_a_sub_kernel_only_reads_is_still_a_table():
+    # Read-only is a property of the USE, and a sub-kernel is one of the users.
+    # The pre-schedule predicate cannot see which way a child touches an array,
+    # so it has to disqualify every array crossing a call; only a sweep that has
+    # the callee's port directions in hand can say the child merely reads it and
+    # leave the array a combinational table. Nothing in the benchmark bed pairs
+    # a table with a call, so this is the only thing holding that path.
+    tbl_vals = (np.arange(8, dtype=np.int32) * 9) & 0xFF
+
+    @kernel
+    def rom_reader(tbl: i32[8], A: i32[8], B: i32[8]):
+        for i in range(8):
+            B[i] = tbl[A[i] % 8] + A[i]
+
+    @kernel
+    def rom_caller(A: i32[8], B: i32[8]):
+        tbl: i32[8] = tbl_vals
+        rom_reader(tbl, A, B)
+
+    rtl = _to_rtl(rom_caller)
+    rtl.compile()
+    # The CALLER's copy: the callee sees the same array as a boundary argument,
+    # whose cells belong to whoever passed it.
+    caller = next(f for f in rtl.report.microarch.funcs if f.func == "rom_caller")
+    mem = next(m for m in caller.mems if m.owner.startswith("tbl"))
+    assert mem.realization == "rom", "a child that only reads leaves it a table"
+    assert mem.cost.call_reads == 1 and mem.cost.call_writes == 0
+    assert "seq.hlmem" not in rtl.mlir, "a table needs no writable storage"
+
+    B = np.zeros(8, np.int32)
+    rtl.cosim(A8, B)
+    assert np.array_equal(B, tbl_vals[A8 % 8] + A8)
+
+
 def test_a_design_asking_for_more_of_a_resource_than_the_part_has_is_named():
     # `capacity` is what the device declares it holds and the estimate is what
     # the design asks for; a design over the part is not placeable there, so the

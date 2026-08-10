@@ -13,8 +13,9 @@
 
 #include "allo/Microarch/DatapathBuilder.h"
 
-#include "allo/Microarch/Naming.h"           // uniqueOwnerOf, memBase, elemBase
-#include "allo/Scheduling/MemoryModel.h"     // characterize (storage shape)
+#include "allo/Microarch/Interface.h"    // iface::ModuleInterface (child ports)
+#include "allo/Microarch/Naming.h"       // uniqueOwnerOf, memBase, elemBase
+#include "allo/Scheduling/MemoryModel.h" // characterize (storage shape)
 #include "allo/Scheduling/OperatorLibrary.h" // DeviceModel (the storage rows)
 #include "allo/Support/AliasAnalysis.h"      // resolveRoot (storage identity)
 #include "allo/Support/Logging.h"
@@ -29,9 +30,19 @@ using namespace mlir::allo::logging;
 
 namespace mlir::allo::uarch {
 
-MemId DatapathBuilder::getOrCreateMem(Value memref) {
+MemId DatapathBuilder::memIdOf(Value memref) {
   // Key on the storage root, not the operand as written, so a buffer threaded
   // out of a region is the SAME memory to its producer and its consumer.
+  auto it = memOf.find(resolveRoot(memref));
+  assert(it != memOf.end() &&
+         "`collectStorageFacts` builds a MemUnit for every array the function "
+         "touches, so a lookup here cannot miss");
+  return it->second;
+}
+
+// Build the MemUnit for \p memref, or hand back the one it already has.
+static MemId createMem(Datapath &dp, llvm::DenseMap<Value, MemId> &memOf,
+                       const DeviceModel &dev, Value memref) {
   memref = resolveRoot(memref);
   if (auto it = memOf.find(memref); it != memOf.end())
     return it->second;
@@ -46,13 +57,11 @@ MemId DatapathBuilder::getOrCreateMem(Value memref) {
   // (allo.part / allo.bind.storage): ONE characterization, so the ports billed
   // and the ports built cannot disagree.
   MemoryChar mc = allo::characterize(memref, dev.memory);
-  // An initialized global the kernel stores to needs a real write port, so it
-  // is a ROM only if nothing writes it: `MemoryChar::constantTable`, the same
-  // predicate the scheduler's port model bills against.
-  if (auto init = allo::globalInitOf(memref)) {
+  // The power-on contents, when the array reads through an initialized global.
+  // Whether that makes it a constant TABLE is a property of the use, settled by
+  // `collectStorageFacts` once every writer is in view.
+  if (auto init = allo::globalInitOf(memref))
     m.romInit = *init;
-    m.isRom = mc.constantTable;
-  }
   m.layout = mc.layout;
   m.numBanks = m.layout.numBanks;
   // THE expression behind `scattered` (see its declaration for where the cells
@@ -87,16 +96,52 @@ MemId DatapathBuilder::getOrCreateMem(Value memref) {
   return id;
 }
 
-void DatapathBuilder::reclassifyRoms() {
+void DatapathBuilder::collectStorageFacts(ArrayRef<Operation *> regionOps) {
+  // Whether anything writes each array, indexed by MemId. This is the whole
+  // reason the sweep exists: read-only is a property of the USE, and an array's
+  // uses are in view only once every region body and every callee interface has
+  // been looked at. Deciding it per access, as it is first touched, can only
+  // answer conservatively.
+  llvm::SmallVector<bool> written;
+  auto touch = [&](Value memref, bool isWrite) {
+    MemId id = createMem(dp, memOf, dev, memref);
+    written.resize(dp.mems.size(), false);
+    written[id] = written[id] || isWrite;
+  };
+  for (Operation *regionOp : regionOps)
+    forEachBodyOp(regionOp, [&](Operation *op) {
+      if (Value memref = dcpMemref(op)) {
+        touch(memref, isa<dcp::DCPathStoreOp>(op));
+        return;
+      }
+      auto inv = dyn_cast<dcp::DCPathInstanceOp>(op);
+      if (!inv)
+        return;
+      // A child's array operand, and the direction of every port it masters on
+      // it. The callee interface is registered before this caller is built, so
+      // a child that only reads leaves the array a table.
+      assert(callees && "a dcp.instance in a leaf datapath needs callee "
+                        "context (a rerouted container)");
+      auto it = callees->ifaces.find(inv.getCallee());
+      assert(it != callees->ifaces.end() &&
+             "the callee interface must be registered (emitted bottom-up)");
+      for (auto [k, operand] : llvm::enumerate(inv.getInputs())) {
+        if (!isa<MemRefType>(operand.getType()))
+          continue;
+        bool isWrite = false;
+        for (const iface::Memory *p : it->second.portsForArg(int(k)))
+          isWrite |= p->write;
+        touch(operand, isWrite);
+      }
+    });
+
+  // An initialized array nothing writes is a combinational constant table. An
+  // ARGUMENT never is: its cells are the caller's, and a block argument reads
+  // through no global, so it carries no contents to begin with.
   for (MemUnit &m : dp.mems) {
-    if (!m.romInit || m.external)
-      continue;
-    bool written = llvm::any_of(
-        m.accesses, [](const MemUnit::Access &a) { return a.isWrite; });
-    for (const CallUnit &cu : dp.calls)
-      for (const CallUnit::MemArg &ma : cu.memArgs)
-        written |= ma.mem == m.id && ma.isWrite;
-    m.isRom = !written;
+    assert(!(m.romInit && m.external) &&
+           "an argument array reads through no initialized global");
+    m.isRom = m.romInit && !m.external && !written[m.id];
   }
 }
 

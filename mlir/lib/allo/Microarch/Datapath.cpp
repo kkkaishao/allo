@@ -102,6 +102,9 @@ std::optional<int64_t> Datapath::constantOf(const Source &s) const {
 Datapath::Datapath(dcp::DCPathModuleOp func, const BindingPolicy &policy,
                    const DeviceModel &dev, float cycleTime,
                    const CalleeCtx *callees, bool isTop) {
+  // What the model is OF, settled here rather than half here and half in the
+  // builder: both are properties of the request, not of anything derived.
+  this->func = func;
   atTop = isTop;
   DatapathBuilder builder(*this, func, policy, dev, cycleTime, callees);
   builder.build();

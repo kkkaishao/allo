@@ -17,6 +17,15 @@
 
 namespace mlir::allo::uarch {
 
+/// The memref a `dcp.load` / `dcp.store` accesses; null for any other op.
+Value dcpMemref(Operation *op);
+/// Every op of \p regionOp that binds a resource: its body, plus a guard's ELSE
+/// branch, which the body alone does not report. A nested region is visited in
+/// its own turn, so this does not recurse. Shared by the facts sweep and the
+/// binding walk, which must enumerate the same ops in the same order.
+void forEachBodyOp(Operation *regionOp,
+                   llvm::function_ref<void(Operation *)> fn);
+
 /// The producer of a value plus the register depth a consumer needs to read it.
 struct Resolved {
   Source base;    // the producing cell output
@@ -121,9 +130,17 @@ struct DatapathBuilder {
   /// A `dcp.compute` -> a FuncUnit, combinational or IP-realized, holding the
   /// op at its reservation slot (its issue cycle, modulo II when cyclic).
   void bindCompute(dcp::DCPathComputeOp comp, RegionBlock &rb);
-  /// Allocate (or reuse) a MemUnit for \p memref (external iff a func
-  /// argument).
-  MemId getOrCreateMem(Value memref);
+  /// Build one MemUnit per array the function touches, holding everything the
+  /// device and the layout say about it. Runs before the region walk, so an
+  /// array's WHOLE use is in view when a property of the use is decided: an
+  /// initialized array nothing writes is a constant table, and only a sweep
+  /// that has seen every access and every child port group can say so. Visits
+  /// the same ops in the same order the binding walk does, since the order it
+  /// creates them in IS the MemId order, and that orders the boundary ports.
+  void collectStorageFacts(llvm::ArrayRef<Operation *> regionOps);
+  /// The MemUnit backing \p memref. A lookup, not a factory:
+  /// `collectStorageFacts` has already built every one of them.
+  MemId memIdOf(Value memref);
   /// Allocate (or reuse) a StreamChannel for the `!allo.stream` value \p stream
   /// (a func block arg). \p isInput sets the channel direction on first
   /// touch (a get => input, a put => output).
@@ -143,12 +160,6 @@ struct DatapathBuilder {
   /// Runs after `recordCallScalars`, whose Sources carry the scalar-result
   /// edges.
   void recordCallDeps();
-  /// Re-decide which initialized arrays are constant TABLES, once the child
-  /// port directions are known. The scheduler's predicate, read at
-  /// `getOrCreateMem` time, conservatively disqualifies any array handed to a
-  /// sub-kernel; here, with every access and child port group bound, an array
-  /// nothing writes is a ROM.
-  void reclassifyRoms();
   /// Derive every cyclic region's `counterType`, the width its iteration
   /// counter and therefore its bounds are built at, from that loop's own
   /// induction range. A consumer wanting another width adapts at ITS end (an

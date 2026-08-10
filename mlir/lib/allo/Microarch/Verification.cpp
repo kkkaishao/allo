@@ -421,9 +421,9 @@ static void assertStructuralInvariants(const Datapath &dp) {
                               acc.portIdx) &&
              "an access's port slot is out of its boundary port list");
       (void)hasPort;
-      // `reclassifyRoms` and `assignLanes` both skip the arguments, which is
-      // what lets the two plans that read this module's OWN cells share an arm
-      // with the boundary cases.
+      // An argument is never a constant table and `assignLanes` skips it, which
+      // is what lets the two plans that read this module's OWN cells share an
+      // arm with the boundary cases.
       assert((!m.external ||
               (acc.plan != PortPlan::Table && acc.plan != PortPlan::Lane)) &&
              "an argument array is neither a constant table nor skewed");
