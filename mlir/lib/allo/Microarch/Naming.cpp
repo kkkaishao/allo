@@ -189,7 +189,7 @@ std::string memCellName(llvm::StringRef owner, unsigned numBanks, unsigned bank,
 
 // The memrefs of the module are the sibling namespace the tie-break runs in; an
 // internal memory has no boundary port carrying an already-resolved owner.
-static std::string memOwnerName(const Datapath &dp, const MemUnit &m) {
+std::string memOwnerName(const Datapath &dp, const MemUnit &m) {
   llvm::SmallVector<Value> siblings;
   for (const MemUnit &o : dp.mems)
     siblings.push_back(o.memref);

@@ -519,49 +519,7 @@ void DatapathBuilder::measurePorts() {
     for (const CallUnit &cu : dp.calls)
       for (const CallUnit::MemArg &ma : cu.memArgs)
         m.boundaryPorts += ma.mem == m.id && ma.isBoundary;
-
-    // The copies the scheduler priced the array at are what it reserved its
-    // read bandwidth against, so a binding taking more of them has bought
-    // bandwidth no cycle was cut for. Nothing here can refuse it, the schedule
-    // being already fixed, so it is reported rather than dropped. The
-    // concurrency beside it says which of the two is at fault: equal to the
-    // ports, the schedule really does ask for them all at once and the array
-    // wants partitioning or a wider row; below them, the binding separated
-    // accesses that never meet.
-    if (m.instances > m.ports.copies())
-      logging::log(Level::Warn, Stage::Emit, m.memref.getLoc())
-          << ownerOfMem(m.id) << ": " << m.readPortsBuilt << " read ports on "
-          << m.storage << " take " << m.instances
-          << " copies of it per bank, past the " << m.ports.copies()
-          << " the schedule reserved (" << m.readConcurrency
-          << " of its reads may issue in one cycle)";
-
-    // One boundary group is one interface the CALLER has to build, and the
-    // ports bound above are all this module can drive at once on a bank. Past
-    // them the caller backs bandwidth nothing here asks for. Only an ADDRESSED
-    // argument has a budget at all: an internal array publishes no group, and a
-    // scattered one publishes cells rather than buses, which is the whole of
-    // what its realization buys. Reported and not refused, the interface being
-    // the manifest the caller was already compiled against.
-    unsigned budget = m.numBanks * m.portsBuilt;
-    if (budget && m.boundaryPorts > budget)
-      logging::log(Level::Warn, Stage::Emit, m.memref.getLoc())
-          << ownerOfMem(m.id) << ": the caller provides " << m.boundaryPorts
-          << " interface groups for this argument, "
-          << (m.boundaryPorts - budget)
-          << " past what this module can drive at once (" << m.portsBuilt
-          << " ports per bank, " << m.numBanks
-          << " banks). Every accessor takes a group of its own, so a "
-             "sub-kernel reaching the array adds one whether or not its port "
-             "already shares a bus with another's";
   }
-}
-
-std::string DatapathBuilder::ownerOfMem(MemId id) const {
-  llvm::SmallVector<Value> memRefs;
-  for (const MemUnit &m : dp.mems)
-    memRefs.push_back(m.memref);
-  return uniqueOwnerOf(dp.mems[id].memref, memRefs, memOwner(id));
 }
 
 void DatapathBuilder::enumerateBoundaryPorts() {
@@ -573,7 +531,7 @@ void DatapathBuilder::enumerateBoundaryPorts() {
   for (MemUnit &m : dp.mems) {
     if (!m.external)
       continue;
-    std::string owner = ownerOfMem(m.id);
+    std::string owner = memOwnerName(dp, m);
     // A scattered argument's ports are per element, enumerated once for the
     // memory (not per access), since every access reads them all and selects.
     // Its accesses keep the default portIdx/portBase; nothing addresses them.
@@ -627,7 +585,7 @@ void DatapathBuilder::enumerateBoundaryPorts() {
   for (CallUnit &cu : dp.calls)
     for (CallUnit::MemArg &ma : cu.memArgs)
       if (ma.isBoundary)
-        ma.topBase = memBase(ownerOfMem(ma.mem), ma.isWrite,
+        ma.topBase = memBase(memOwnerName(dp, dp.mems[ma.mem]), ma.isWrite,
                              group[key(ma.mem, ma.isWrite)]++);
 }
 

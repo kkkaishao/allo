@@ -3,10 +3,18 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+//===----------------------------------------------------------------------===//
+// Everything checked between the model being sealed and hardware being built,
+// cut by WHO IS AT FAULT: the design (`checkInputLegality`), this backend
+// (`checkEmitterSubset`), or an upstream pass (`assertModelInvariants`). The
+// diagnostic each may raise follows from that, and nothing else decides where a
+// check belongs.
+//===----------------------------------------------------------------------===//
+
 #include "allo/Microarch/Verification.h"
 
 #include "allo-c/Schedule.h"       // kPartitionAttr
-#include "allo/Microarch/Naming.h" // operatorModuleName
+#include "allo/Microarch/Naming.h" // operatorModuleName, memOwnerName
 #include "allo/Support/Logging.h"
 
 #include "mlir/Dialect/MemRef/IR/MemRef.h" // memref::GetGlobalOp
@@ -21,47 +29,122 @@ using namespace mlir::allo::logging;
 namespace mlir::allo::uarch {
 
 //===----------------------------------------------------------------------===//
-// 1. Model well-formedness.
+// 1. What the design asks for and this device cannot give.
 //===----------------------------------------------------------------------===//
 
-// Supported subset: top-level siblings in program order, plus container loops
-// whose children sequence within one outer iteration.
-LogicalResult verifyDatapath(dcp::DCPathModuleOp func, const Datapath &dp) {
+LogicalResult checkInputLegality(dcp::DCPathModuleOp func, const Datapath &dp) {
   // A kernel with no schedulable region computes nothing.
   if (dp.regions.empty())
     warn(Stage::Emit, func)
         << "Kernel '" << func.getSymName()
         << "' has no schedulable region: it emits as hardware that does "
            "nothing and completes immediately";
-  // The builder already reported the offending edge; the depths it left are
-  // placeholders, so fail before hardware is built from them.
-  if (dp.infeasible)
-    return failure();
 
-  // An unresolved (None) Source is a cross-region SSA hand-off the builder
-  // could not thread; reject it here rather than asserting in `resolveSource`.
-  // `forEachSource` owns the slot list and which slots may be empty.
-  bool found = false;
-  SourceSite badSite{};
-  forEachSource(dp, [&](const Source &s, const SourceSite &site) {
-    if (found || !site.required || s)
-      return;
-    found = true;
-    badSite = site;
-  });
-  if (found) {
-    // Wording matches the builder's own hand-off rejection.
-    unsupported(Stage::Emit, Code::CrossRegionHandOff,
-                badSite.op ? badSite.op : func.getOperation())
-        << "A cross-region value hand-off is not lowered yet: "
-        << badSite.describe() << " is unresolved";
-    return failure();
+  for (const MemUnit &m : dp.mems) {
+    // A constant table is combinational logic with no port limit, so a
+    // partition of one buys no bandwidth.
+    if (m.isRom)
+      if (auto gg = m.memref.getDefiningOp<memref::GetGlobalOp>()) {
+        auto global = SymbolTable::lookupNearestSymbolFrom<memref::GlobalOp>(
+            gg, gg.getNameAttr());
+        if (global && global->hasAttr(kPartitionAttr))
+          warn(Stage::Emit, func)
+              << "Partition on the constant table '" << gg.getName()
+              << "' buys nothing: a read-only table is realized as "
+                 "combinational logic, which reads through as many ports as "
+                 "the schedule asks for";
+      }
+
+    // The copies the scheduler priced the array at are what it reserved its
+    // read bandwidth against, so a binding taking more of them has bought
+    // bandwidth no cycle was cut for. Nothing here can refuse it, the schedule
+    // being already fixed, so it is reported rather than dropped. The
+    // concurrency beside it says which of the two is at fault: equal to the
+    // ports, the schedule really does ask for them all at once and the array
+    // wants partitioning or a wider row; below them, the binding separated
+    // accesses that never meet.
+    if (m.instances > m.ports.copies())
+      logging::log(Level::Warn, Stage::Emit, m.memref.getLoc())
+          << memOwnerName(dp, m) << ": " << m.readPortsBuilt
+          << " read ports on " << m.storage << " take " << m.instances
+          << " copies of it per bank, past the " << m.ports.copies()
+          << " the schedule reserved (" << m.readConcurrency
+          << " of its reads may issue in one cycle)";
+
+    // One boundary group is one interface the CALLER has to build, and the
+    // ports bound for the array are all this module can drive at once on a
+    // bank. Past them the caller backs bandwidth nothing here asks for. Only an
+    // ADDRESSED argument has a budget at all: an internal array publishes no
+    // group, and a scattered one publishes cells rather than buses, which is
+    // the whole of what its realization buys. Reported and not refused, the
+    // interface being the manifest the caller was already compiled against.
+    unsigned budget = m.numBanks * m.portsBuilt;
+    if (budget && m.boundaryPorts > budget)
+      logging::log(Level::Warn, Stage::Emit, m.memref.getLoc())
+          << memOwnerName(dp, m) << ": the caller provides " << m.boundaryPorts
+          << " interface groups for this argument, "
+          << (m.boundaryPorts - budget)
+          << " past what this module can drive at once (" << m.portsBuilt
+          << " ports per bank, " << m.numBanks
+          << " banks). Every accessor takes a group of its own, so a "
+             "sub-kernel reaching the array adds one whether or not its port "
+             "already shares a bus with another's";
+
+    // Only a WRITE set reaches this: every copy of a row needs every write, so
+    // one instance's write ports are the ceiling however many copies are built,
+    // and on a pooled row writes that fill the pool leave a read no port
+    // anywhere. Reads alone never reach it and say nothing, the copies being
+    // what serves them.
+    //
+    // `characterize` budgets a derived row one write short of its pool so the
+    // schedule cannot ask for this, which leaves two ways in: a topology the
+    // user stated, and writers of concurrent regions, which are billed apart
+    // and only meet here.
+    if (m.realization() == MemUnit::Realization::Ram && !m.fitsStorage()) {
+      error(Stage::Emit, Code::StoragePortsExceeded, m.memref.getDefiningOp())
+          << "Array " << m.memref.getType() << " is built with "
+          << m.writePortsBuilt << " concurrent write ports per bank, and one "
+          << m.storage << " has " << m.ports.describe()
+          << ", so no number of copies holds it. "
+          << (m.ports.stated ? "Ask `bind_storage` for a topology with more "
+                               "write ports, partition the array so the "
+                               "writers land in different banks, or "
+                             : "Partition the array so the writers land in "
+                               "different banks, or ")
+          << "let fewer of them issue at once. Only accesses the model proves "
+             "never issue together share a port";
+      return failure();
+    }
+  }
+
+  // `ce` is the only IP port ABI the emitter realizes. `free` has no enable, so
+  // it keeps clocking and desynchronizes in a back-pressured region, but is
+  // fine elsewhere; `elastic` is rejected before scheduling.
+  llvm::SmallDenseSet<unsigned> backPressured;
+  for (const StreamChannel &s : dp.streams)
+    for (const StreamChannel::Access &acc : s.accesses)
+      backPressured.insert(acc.region);
+  llvm::DenseMap<UnitId, unsigned> unitRegion;
+  for (const RegionBlock &rb : dp.regions)
+    for (UnitId uid : rb.units)
+      unitRegion[uid] = rb.id;
+  for (const FuncUnit &u : dp.units) {
+    if (u.identity.comb || u.stall == allo::StallContractEnum::Ce)
+      continue;
+    if (backPressured.count(unitRegion.lookup(u.id))) {
+      error(Stage::Emit, Code::StallContractUnusable, u.repOp())
+          << "Operator IP '" << operatorModuleName(u)
+          << "' is free-running (no clock enable) but sits in a stream region, "
+             "whose datapath freezes under back-pressure; the IP would keep "
+             "advancing and fold a stale result. Declare style='ce'";
+      return failure();
+    }
   }
   return success();
 }
 
 //===----------------------------------------------------------------------===//
-// 2. Device-contract limits.
+// 2. What this emitter does not lower yet.
 //===----------------------------------------------------------------------===//
 
 namespace {
@@ -123,15 +206,6 @@ LogicalResult checkCombPathsMeetPeriod(const Datapath &dp, float cycleTime,
   constexpr double kSlop = 1e-3;
   AddedDelay added(dp, muxLevelDelay(lib));
 
-  // The multiplexer is the only unaccounted delay: every cell reaching the
-  // datapath is placed by a solve, which stamps the sub-cycle start it
-  // proved. A cell without one is an internal invariant broken, not a fault
-  // to report.
-  for (const FuncUnit &u : dp.units)
-    for (const FuncUnit::BoundOp &bo : u.boundOps)
-      assert(bo.z &&
-             "a cell reached the datapath the scheduling stage never placed");
-
   bool ok = true;
   for (const FuncUnit &u : dp.units) {
     double mux = added.ofUnit(u.id);
@@ -163,135 +237,27 @@ LogicalResult checkCombPathsMeetPeriod(const Datapath &dp, float cycleTime,
 
 } // namespace
 
-LogicalResult checkDeviceCapability(dcp::DCPathModuleOp func,
-                                    const Datapath &dp, float cycleTime,
-                                    const OperatorLibrary &lib) {
-  // Memory rows the SCHEDULER honors, so a structure that silently realizes
-  // them differently would place every consumer on the wrong cycle.
-  for (const MemUnit &m : dp.mems) {
-    assert((!m.romInit || m.numBanks == 1) &&
-           "`PreVerification` refuses a banked array declared with contents");
-    // A constant table is combinational logic with no port limit, so a
-    // partition of one buys no bandwidth.
-    if (m.isRom)
-      if (auto gg = m.memref.getDefiningOp<memref::GetGlobalOp>()) {
-        auto global = SymbolTable::lookupNearestSymbolFrom<memref::GlobalOp>(
-            gg, gg.getNameAttr());
-        if (global && global->hasAttr(kPartitionAttr))
-          warn(Stage::Emit, func)
-              << "Partition on the constant table '" << gg.getName()
-              << "' buys nothing: a read-only table is realized as "
-                 "combinational logic, which reads through as many ports as "
-                 "the schedule asks for";
-      }
-    assert(m.writeLatency >= 1 && "a 0-cycle write port reached emission");
-    // The scatter realization is registers, and the emitter builds them at
-    // exactly that timing: a read is a combinational select over the cells and
-    // a store lands on the next edge, neither carrying a delay to absorb one.
-    assert((!m.scattered || (m.readLatency == 0 && m.writeLatency == 1)) &&
-           "a scattered memory must be timed as registers");
-    // Only a WRITE set reaches this: every copy of a row needs every write, so
-    // one instance's write ports are the ceiling however many copies are built,
-    // and on a pooled row writes that fill the pool leave a read no port
-    // anywhere. Reads alone never reach it and say nothing, the copies being
-    // what serves them.
-    //
-    // `characterize` budgets a derived row one write short of its pool so the
-    // schedule cannot ask for this, which leaves two ways in: a topology the
-    // user stated, and writers of concurrent regions, which are billed apart
-    // and only meet here.
-    if (m.realization() == MemUnit::Realization::Ram && !m.fitsStorage()) {
-      error(Stage::Emit, Code::StoragePortsExceeded, m.memref.getDefiningOp())
-          << "Array " << m.memref.getType() << " is built with "
-          << m.writePortsBuilt << " concurrent write ports per bank, and one "
-          << m.storage << " has " << m.ports.describe()
-          << ", so no number of copies holds it. "
-          << (m.ports.stated ? "Ask `bind_storage` for a topology with more "
-                               "write ports, partition the array so the "
-                               "writers land in different banks, or "
-                             : "Partition the array so the writers land in "
-                               "different banks, or ")
-          << "let fewer of them issue at once. Only accesses the model proves "
-             "never issue together share a port";
-      return failure();
-    }
+LogicalResult checkEmitterSubset(dcp::DCPathModuleOp func, const Datapath &dp,
+                                 float cycleTime, const OperatorLibrary &lib) {
+  // An unresolved (None) Source is a cross-region SSA hand-off the builder
+  // could not thread; reject it here rather than asserting in `resolveSource`.
+  // `forEachSource` owns the slot list and which slots may be empty.
+  bool found = false;
+  SourceSite badSite{};
+  forEachSource(dp, [&](const Source &s, const SourceSite &site) {
+    if (found || !site.required || s)
+      return;
+    found = true;
+    badSite = site;
+  });
+  if (found) {
+    // Wording matches the builder's own hand-off rejection.
+    unsupported(Stage::Emit, Code::CrossRegionHandOff,
+                badSite.op ? badSite.op : func.getOperation())
+        << "A cross-region value hand-off is not lowered yet: "
+        << badSite.describe() << " is unresolved";
+    return failure();
   }
-
-  // `ce` is the only IP port ABI the emitter realizes. `free` has no enable, so
-  // it keeps clocking and desynchronizes in a back-pressured region, but is
-  // fine elsewhere; `elastic` is rejected before scheduling.
-  llvm::SmallDenseSet<unsigned> backPressured;
-  for (const StreamChannel &s : dp.streams)
-    for (const StreamChannel::Access &acc : s.accesses)
-      backPressured.insert(acc.region);
-  llvm::DenseMap<UnitId, unsigned> unitRegion;
-  for (const RegionBlock &rb : dp.regions)
-    for (UnitId uid : rb.units)
-      unitRegion[uid] = rb.id;
-  for (const FuncUnit &u : dp.units) {
-    if (u.identity.comb || u.stall == allo::StallContractEnum::Ce)
-      continue;
-    assert(u.stall != allo::StallContractEnum::Elastic &&
-           "an elastic IP reached emission");
-    if (backPressured.count(unitRegion.lookup(u.id))) {
-      error(Stage::Emit, Code::StallContractUnusable, u.repOp())
-          << "Operator IP '" << operatorModuleName(u)
-          << "' is free-running (no clock enable) but sits in a stream region, "
-             "whose datapath freezes under back-pressure; the IP would keep "
-             "advancing and fold a stale result. Declare style='ce'";
-      return failure();
-    }
-  }
-
-  return checkCombPathsMeetPeriod(dp, cycleTime, lib);
-}
-
-//===----------------------------------------------------------------------===//
-// 3. What this emitter lowers.
-//===----------------------------------------------------------------------===//
-
-// Whether a counted container holds no work of its own: the reifier gives every
-// run of loose ops its own child region, so this checks what a unit READS
-// rather than whether units exist. A conditional container is exempt.
-[[maybe_unused]] static bool containerOwnsNoDatapath(const RegionBlock &rb,
-                                                     const Datapath &dp) {
-  if (!rb.memAccesses.empty() || !rb.streamAccesses.empty() ||
-      !rb.callUnits.empty())
-    return false;
-  for (UnitId uid : rb.units)
-    for (const Source &s : dp.units[uid].inputs)
-      if (s.kind == Source::Kind::Survivor &&
-          llvm::is_contained(rb.children, s.id))
-        return false;
-  return true;
-}
-
-LogicalResult checkEmitterSubset(dcp::DCPathModuleOp func, const Datapath &dp) {
-  // Region shapes, mirroring `emitRegion`'s dispatch on the same stored
-  // discriminant.
-  for (const RegionBlock &rb : dp.regions) {
-    // The op verifier already enforces that a counted `dcp.pipeline` carries
-    // its trip either as the `trip` attribute or as the `dynamicBound` operand.
-    assert((rb.kind != RegionBlock::Kind::Cyclic || rb.conditional ||
-            rb.tripCount || rb.ubSource) &&
-           "a counted cyclic region reached emission with neither a constant "
-           "nor a dynamic trip; the reifier owns that");
-    // `emitLoopCall` advances on the child's `done`, so it would silently drop
-    // a second child or any loose datapath.
-    assert(
-        (rb.shape != RegionBlock::Shape::CallNode ||
-         (rb.callUnits.size() <= 1 && rb.units.empty() && rb.regs.empty())) &&
-        "a loop body holding a sub-kernel call alongside other work reached "
-        "the leaf loop-over-calls controller; the scheduler must decompose "
-        "it into sub-regions");
-    assert((rb.shape != RegionBlock::Shape::Container || rb.conditional ||
-            containerOwnsNoDatapath(rb, dp)) &&
-           "a counted container reached emission carrying work of its own; the "
-           "reifier gives every run of loose ops a child region");
-  }
-
-  // `verify-rtl-legality` owns the shapes a CONCURRENT container admits and the
-  // caller/callee partition agreement, both settled before scheduling.
 
   // A skew hands out one port per bank per LANE, and a lane is assigned from
   // the accesses of this module. A sub-kernel's port holds none, so there is no
@@ -310,39 +276,9 @@ LogicalResult checkEmitterSubset(dcp::DCPathModuleOp func, const Datapath &dp) {
         return failure();
       }
 
-  // Stream protocol: a channel's {data,valid,ready} triple is time-shared by
-  // all its accesses, sound only if the scheduler keeps them ordered and
-  // non-overlapping. Ends are checked pre-schedule; timing is checked here.
-  for (const StreamChannel &s : dp.streams) {
-    // Distinct cycles in program order within a region, spanning under one II.
-    // Per DIRECTION, since that is what shares a wire: a put drives
-    // {data, valid} and a get {ready}, so a local channel's ends may coincide.
-    for (const RegionBlock &rb : dp.regions)
-      for (bool put : {false, true}) {
-        const StreamChannel::Access *first = nullptr, *prev = nullptr;
-        for (AccRef r : rb.streamAccesses) {
-          if (r.id != s.id)
-            continue;
-          const StreamChannel::Access &acc = s.accesses[r.idx];
-          if (acc.isPut != put)
-            continue;
-          assert((!prev || acc.stage > prev->stage) &&
-                 "two accesses to one stream are scheduled on the same cycle, "
-                 "or out of program order; they share a single handshake, so "
-                 "their token order is lost. The scheduler owns this");
-          prev = &acc;
-          first = first ? first : &acc;
-        }
-        assert((!prev || !rb.ii || prev->stage - first->stage < *rb.ii) &&
-               "accesses to one stream span a whole initiation interval, so "
-               "successive iterations overlap on its handshake. The scheduler "
-               "owns this");
-      }
-  }
-
   // Condition timing: a flushing leaf while or guard samples it in-cycle,
   // needing a stage-0 Unit or settled Survivor, while a sequential CHECK/RUN
-  // while waits t_cond cycles. `verifyDatapath` already rejects a `None`.
+  // while waits t_cond cycles. A `None` is rejected above.
   auto conditionOk = [&](const Source &s, bool sequential) {
     switch (s.kind) {
     // A scheduled prologue predicate is settled at the region start.
@@ -376,23 +312,114 @@ LogicalResult checkEmitterSubset(dcp::DCPathModuleOp func, const Datapath &dp) {
   // store's write-enable by `issue & cond`, so a doomed exit iteration commits
   // nothing.
 
-  // Operator realizability is settled before scheduling: an op with neither an
-  // IP row nor a `combKindOf` lowering never becomes a `dcp.compute`. A comb
-  // realization needs no further check: it is a `CombOpKind`, and `emitCompute`
-  // covers the enum.
-  for (const FuncUnit &u : dp.units)
-    assert(u.identity.realized() &&
-           "an unrealizable operator reached emission");
-  return success();
+  return checkCombPathsMeetPeriod(dp, cycleTime, lib);
 }
 
 //===----------------------------------------------------------------------===//
-// 4. Structural backstops: invariants an upstream pass owns, asserted here so
-// a regression in that pass fails at the seam rather than miscompiling.
+// 3. Invariants an upstream pass owns, asserted at this seam so a regression in
+// that pass fails here rather than miscompiling.
 //===----------------------------------------------------------------------===//
 
-static void assertStructuralInvariants(const Datapath &dp) {
+// Whether a counted container holds no work of its own: the reifier gives every
+// run of loose ops its own child region, so this checks what a unit READS
+// rather than whether units exist. A conditional container is exempt.
+[[maybe_unused]] static bool containerOwnsNoDatapath(const RegionBlock &rb,
+                                                     const Datapath &dp) {
+  if (!rb.memAccesses.empty() || !rb.streamAccesses.empty() ||
+      !rb.callUnits.empty())
+    return false;
+  for (UnitId uid : rb.units)
+    for (const Source &s : dp.units[uid].inputs)
+      if (s.kind == Source::Kind::Survivor &&
+          llvm::is_contained(rb.children, s.id))
+        return false;
+  return true;
+}
+
+void assertModelInvariants(const Datapath &dp) {
 #ifndef NDEBUG
+  // Memory rows the SCHEDULER honors, so a structure that silently realizes
+  // them differently would place every consumer on the wrong cycle.
+  for (const MemUnit &m : dp.mems) {
+    assert((!m.romInit || m.numBanks == 1) &&
+           "`PreVerification` refuses a banked array declared with contents");
+    assert(m.writeLatency >= 1 && "a 0-cycle write port reached emission");
+    // The scatter realization is registers, and the emitter builds them at
+    // exactly that timing: a read is a combinational select over the cells and
+    // a store lands on the next edge, neither carrying a delay to absorb one.
+    assert((!m.scattered || (m.readLatency == 0 && m.writeLatency == 1)) &&
+           "a scattered memory must be timed as registers");
+  }
+
+  // `elastic` is rejected before scheduling, and every cell reaching the
+  // datapath is placed by a solve, which stamps the sub-cycle start it proved.
+  for (const FuncUnit &u : dp.units) {
+    assert(u.stall != allo::StallContractEnum::Elastic &&
+           "an elastic IP reached emission");
+    // Operator realizability is settled before scheduling: an op with neither
+    // an IP row nor a `combKindOf` lowering never becomes a `dcp.compute`.
+    assert(u.identity.realized() &&
+           "an unrealizable operator reached emission");
+    for (const FuncUnit::BoundOp &bo : u.boundOps)
+      assert(bo.z &&
+             "a cell reached the datapath the scheduling stage never placed");
+  }
+
+  // Region shapes, mirroring `emitRegion`'s dispatch on the same stored
+  // discriminant.
+  for (const RegionBlock &rb : dp.regions) {
+    // The op verifier already enforces that a counted `dcp.pipeline` carries
+    // its trip either as the `trip` attribute or as the `dynamicBound` operand.
+    assert((rb.kind != RegionBlock::Kind::Cyclic || rb.conditional ||
+            rb.tripCount || rb.ubSource) &&
+           "a counted cyclic region reached emission with neither a constant "
+           "nor a dynamic trip; the reifier owns that");
+    // `emitLoopCall` advances on the child's `done`, so it would silently drop
+    // a second child or any loose datapath.
+    assert(
+        (rb.shape != RegionBlock::Shape::CallNode ||
+         (rb.callUnits.size() <= 1 && rb.units.empty() && rb.regs.empty())) &&
+        "a loop body holding a sub-kernel call alongside other work reached "
+        "the leaf loop-over-calls controller; the scheduler must decompose "
+        "it into sub-regions");
+    assert((rb.shape != RegionBlock::Shape::Container || rb.conditional ||
+            containerOwnsNoDatapath(rb, dp)) &&
+           "a counted container reached emission carrying work of its own; the "
+           "reifier gives every run of loose ops a child region");
+  }
+
+  // `verify-rtl-legality` owns the shapes a CONCURRENT container admits and the
+  // caller/callee partition agreement, both settled before scheduling.
+
+  // Stream protocol: a channel's {data,valid,ready} triple is time-shared by
+  // all its accesses, sound only if the scheduler keeps them ordered and
+  // non-overlapping. Ends are checked pre-schedule; timing is checked here.
+  for (const StreamChannel &s : dp.streams)
+    // Distinct cycles in program order within a region, spanning under one II.
+    // Per DIRECTION, since that is what shares a wire: a put drives
+    // {data, valid} and a get {ready}, so a local channel's ends may coincide.
+    for (const RegionBlock &rb : dp.regions)
+      for (bool put : {false, true}) {
+        const StreamChannel::Access *first = nullptr, *prev = nullptr;
+        for (AccRef r : rb.streamAccesses) {
+          if (r.id != s.id)
+            continue;
+          const StreamChannel::Access &acc = s.accesses[r.idx];
+          if (acc.isPut != put)
+            continue;
+          assert((!prev || acc.stage > prev->stage) &&
+                 "two accesses to one stream are scheduled on the same cycle, "
+                 "or out of program order; they share a single handshake, so "
+                 "their token order is lost. The scheduler owns this");
+          prev = &acc;
+          first = first ? first : &acc;
+        }
+        assert((!prev || !rb.ii || prev->stage - first->stage < *rb.ii) &&
+               "accesses to one stream span a whole initiation interval, so "
+               "successive iterations overlap on its handshake. The scheduler "
+               "owns this");
+      }
+
   // Every access is listed by exactly the region that issues it, and exactly
   // the EXTERNAL accesses hold a boundary port slot.
   unsigned listed = 0;
@@ -458,11 +485,17 @@ static void assertStructuralInvariants(const Datapath &dp) {
 
 LogicalResult validateDatapath(dcp::DCPathModuleOp func, const Datapath &dp,
                                float cycleTime, const OperatorLibrary &lib) {
-  if (failed(verifyDatapath(func, dp)) ||
-      failed(checkDeviceCapability(func, dp, cycleTime, lib)) ||
-      failed(checkEmitterSubset(func, dp)))
+  // The builder already reported the offending edge, and the depths it left are
+  // placeholders, so nothing below would be measuring the design that was
+  // asked for.
+  if (dp.infeasible)
     return failure();
-  assertStructuralInvariants(dp);
+  assertModelInvariants(dp);
+  // The design's own faults first: what the user can change is worth hearing
+  // before what this backend has not built yet.
+  if (failed(checkInputLegality(func, dp)) ||
+      failed(checkEmitterSubset(func, dp, cycleTime, lib)))
+    return failure();
   return success();
 }
 

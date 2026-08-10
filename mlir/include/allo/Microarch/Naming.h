@@ -139,6 +139,11 @@ std::string resultPortName(unsigned i, unsigned n);
 // never the manifest, so CIRCT is free to uniquify them.
 //===----------------------------------------------------------------------===//
 
+/// What an array is called before any bank, instance or field suffix: the one
+/// resolution of a MemUnit's owner token, disambiguated against the module's
+/// other memrefs. Every composed memory name and every diagnostic naming an
+/// array starts here.
+std::string memOwnerName(const Datapath &dp, const MemUnit &m);
 /// On-chip storage for the buffer named \p owner: bank \p bank when it is one
 /// of \p numBanks, and instance \p inst when the bank is held in \p instances
 /// of them. An index that has only one value is left off. The Datapath overload

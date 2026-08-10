@@ -183,9 +183,6 @@ struct DatapathBuilder {
   /// call is bound. Owner names come from `uniqueOwnerOf` against the module's
   /// whole memref list, so two arguments sharing a source name still differ.
   void enumerateBoundaryPorts();
-  /// The name \p id's ports are spelled from, unique against every other memref
-  /// of the module.
-  std::string ownerOfMem(MemId id) const;
   /// Bind every memory access and child port to a port of its bank
   /// (`MemUnit::Access::port`, `CallUnit::MemArg::port`) and record how many
   /// ports each bank is built with. The boundary port enumeration, the emitter
@@ -234,10 +231,9 @@ struct DatapathBuilder {
   /// `MemUnit::writesIndependent` where it covered the writes.
   void commitPorts(MemUnit &m, const PortAssignment &pa);
   /// Record what each memory's ports cost against what its schedule asks:
-  /// `MemUnit::{readConcurrency, writeConcurrency, boundaryPorts}`, and report
-  /// an array replicated past the copies the schedule reserved or published
-  /// wider than the buses behind it. Nothing structural depends on it; it runs
-  /// after `enumerateBoundaryPorts`, whose groups it counts.
+  /// `MemUnit::{readConcurrency, writeConcurrency, boundaryPorts}`. Measures
+  /// only; what the measurements are worth reporting is `checkInputLegality`.
+  /// Runs after `enumerateBoundaryPorts`, whose groups it counts.
   void measurePorts();
   /// Record each top-level region's composition predecessors
   /// (`rb.predecessors`): the earlier top-level siblings it must start after.

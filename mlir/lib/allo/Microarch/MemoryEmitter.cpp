@@ -548,7 +548,7 @@ static unsigned storeDrainOf(const uarch::MemUnit &m,
                              const uarch::MemUnit::Access &acc) {
   assert(m.writeLatency >= 1 &&
          "a zero-cycle write has no commit edge for the done latch to ride; "
-         "checkDeviceCapability must have rejected the device row");
+         "`assertModelInvariants` holds the device row to that");
   return acc.stage + m.writeLatency - 1;
 }
 
@@ -593,8 +593,8 @@ void DatapathEmitter::emitWrites(const uarch::RegionBlock &rb, Value issue,
     Value data = late(resolveSource(acc.data));
     switch (acc.plan) {
     case PortPlan::Table:
-      llvm_unreachable("a constant table has no write port; `verifyDatapath` "
-                       "refuses a store to one");
+      llvm_unreachable("a constant table has no write port; an array "
+                       "anything writes is never classified as one");
     case PortPlan::Lane:
       llvm_unreachable("a lane's stores are delayed and demuxed together, "
                        "below, so they leave the loop above this");
