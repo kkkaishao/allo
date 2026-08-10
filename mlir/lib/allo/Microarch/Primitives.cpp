@@ -229,9 +229,11 @@ static comb::ICmpPredicate combICmpPredicate(arith::CmpIPredicate p) {
   llvm_unreachable("unknown arith::CmpIPredicate");
 }
 
-Value emitCompute(OpBuilder &b, Location loc, CombOpKindEnum kind,
-                  ValueRange operands, Type resultType, Operation *srcOp) {
+Value emitCompute(OpBuilder &b, Location loc, const OperatorIdentity &id,
+                  ValueRange operands, Type resultType) {
   using E = CombOpKindEnum;
+  assert(id.comb && "emitCompute realizes the native path of an identity");
+  CombOpKindEnum kind = *id.comb;
   // A constant affine map takes no operands, and the unary kinds take one, so
   // neither read is unconditional.
   Value lhs = operands.empty() ? Value() : operands[0];
@@ -248,9 +250,8 @@ Value emitCompute(OpBuilder &b, Location loc, CombOpKindEnum kind,
   // an IV is read outside an address. Via evalAffine, so a power-of-two divisor
   // stays shift+mask.
   case E::Apply: {
-    assert(srcOp->getAttr("map") &&
-           "dcp.compute<apply> must carry the original affine map");
-    AffineMap map = cast<AffineMapAttr>(srcOp->getAttr("map")).getValue();
+    assert(id.map && "an apply identity must carry the original affine map");
+    AffineMap map = cast<AffineMapAttr>(id.map).getValue();
     assert(map.getNumResults() == 1 && "affine.apply yields one result");
     return evalAffine(b, loc, map.getResult(0), operands, map.getNumDims());
   }
@@ -322,8 +323,7 @@ Value emitCompute(OpBuilder &b, Location loc, CombOpKindEnum kind,
     return minmax(comb::ICmpPredicate::ugt);
   // Integer compare, with the predicate carried from arith.cmpi.
   case E::Cmpi: {
-    auto pred =
-        cast<arith::CmpIPredicateAttr>(srcOp->getAttr("predicate")).getValue();
+    auto pred = cast<arith::CmpIPredicateAttr>(id.predicate).getValue();
     return comb::ICmpOp::create(b, loc, combICmpPredicate(pred), lhs, rhs,
                                 false)
         ->getResult(0);

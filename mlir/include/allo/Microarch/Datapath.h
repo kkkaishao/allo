@@ -127,6 +127,12 @@ struct FuncUnit {
   OperatorIdentity identity;
   unsigned latency = 0;  // result available `latency` cycles after issue
   bool pipelined = true; // accepts a new input every cycle
+  /// The delay this unit's inputs must settle within, in ns, from the same
+  /// library row the scheduler priced it against. MARGINAL for a comb unit,
+  /// since `z` already carries the register floor the solve seeds a
+  /// start-in-cycle at, and charging the full row would spend that floor twice.
+  /// Zero for an operation that renames bits rather than computing them.
+  double inDelay = 0.0;
   // The IP's port/back-pressure contract (from its `dcp.operator`); unused for
   // a combinational unit. Clock-enable is the only contract the emitter builds.
   StallContractEnum stall = StallContractEnum::Ce;
@@ -138,6 +144,10 @@ struct FuncUnit {
     Operation *op = nullptr;
     unsigned stage = 0;   // schedule cycle within its region
     unsigned residue = 0; // `stage % ii` when cyclic, else `stage`
+    /// The sub-cycle start the solve proved for this op, in ns. EMPTY means the
+    /// solve never placed the cell: a post-solve synthesizer stamps `stage` and
+    /// stops, so this absence is the marker for "unpriced", not a default.
+    std::optional<double> z;
   };
   // Ops bound here. Sharing puts several non-conflicting ops in this list.
   // NEVER empty: a unit exists because ops are bound to it.
@@ -662,12 +672,10 @@ unsigned muxLevels(unsigned sources);
 double muxLevelDelay(const OperatorLibrary &lib);
 
 /// The sub-cycle room \p u's bound ops have left, in ns: the smallest
-/// `cycleTime - z(op) - inDelay(u)` over them, where `z` is the sub-cycle start
-/// the scheduler solved and `inDelay` the row it priced the unit against. This
-/// bounds the combinational delay binding may add in front of the unit. Never
-/// negative on a schedule the chaining model accepted.
-double unitSlack(const FuncUnit &u, float cycleTime,
-                 const OperatorLibrary &lib);
+/// `cycleTime - z - inDelay` over them, both read off the model. This bounds
+/// the combinational delay binding may add in front of the unit. Never negative
+/// on a schedule the chaining model accepted.
+double unitSlack(const FuncUnit &u, float cycleTime);
 
 /// A top-level scalar INPUT port (a scalar kernel argument). Memref arguments
 /// become external `MemUnit`s instead and a scalar function result is a

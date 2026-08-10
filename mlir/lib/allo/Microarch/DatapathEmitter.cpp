@@ -303,8 +303,8 @@ void DatapathEmitter::emitUnits(const uarch::RegionBlock &rb, UnitMode mode) {
 
     Value result;
     if (u.identity.comb) {
-      result = emitCompute(c.b, c.loc, *u.identity.comb, operands,
-                           datapathType(u.identity.resultType, c.b), u.repOp());
+      result = emitCompute(c.b, c.loc, u.identity, operands,
+                           datapathType(u.identity.resultType, c.b));
     } else {
       // An IP instance takes its data operands, then clock, then (for a
       // clock-enabled contract) a `ce` bit that rides the region's

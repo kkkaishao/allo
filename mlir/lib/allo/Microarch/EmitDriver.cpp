@@ -67,16 +67,15 @@ declareOperatorModules(dcp::DCPathModuleOp func, const uarch::Datapath &dp,
   for (const uarch::FuncUnit &u : dp.units) {
     if (u.identity.comb)
       continue;
-    Operation *srcOp = u.repOp();
-    assert(u.inputs.size() == srcOp->getNumOperands() &&
-           "IP unit input count must match its bound op's operand count");
     IntegerType outW = datapathType(u.identity.resultType, b);
     std::string modName = operatorModuleName(u);
     iface::Operator entry{
         modName, u.identity.ipSymbol, operatorPredicate(u), {}};
     SmallVector<PortInfo> ep;
-    for (unsigned k = 0; k < u.inputs.size(); ++k) {
-      IntegerType w = datapathType(srcOp->getOperand(k).getType(), b);
+    // Operand widths off the IDENTITY, which is what decides whether two units
+    // may share a module name at all, so the ports cannot disagree with it.
+    for (unsigned k = 0; k < u.identity.argTypes.size(); ++k) {
+      IntegerType w = datapathType(u.identity.argTypes[k], b);
       std::string pn(1, static_cast<char>('a' + k));
       ep.push_back({{StringAttr::get(ctx, pn), w, Dir::Input}});
       entry.ports.push_back({pn, w.getWidth(), iface::Operator::Role::Data});

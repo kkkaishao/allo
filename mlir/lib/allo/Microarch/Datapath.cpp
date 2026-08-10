@@ -288,33 +288,10 @@ double muxLevelDelay(const OperatorLibrary &lib) {
   return lib.combDelay(OpKind::Or, 1);
 }
 
-/// The delay `u`'s inputs must settle within, read from the same library row
-/// the scheduler priced it against.
-static double unitInDelay(const FuncUnit &u, const OperatorLibrary &lib) {
-  // The one exception the library row does not carry, which the scheduler takes
-  // too (`lookup`): an op that renames bits rather than computing them.
-  if (isZeroDelay(u.repOp()))
-    return 0.0;
-  // The marginal delay: this is subtracted from `z`, which already carries the
-  // register floor the solve seeds every start-in-cycle at
-  // (`computeStartTimesInCycle`). Charging the full row would spend that floor
-  // twice and report a feasible schedule's unit as over-period.
-  if (u.identity.comb)
-    return lib.combMarginalDelay(*u.identity.comb, combParamWidth(u.repOp()));
-  auto opr = SymbolTable::lookupNearestSymbolFrom<dcp::DCPathOperatorOp>(
-      u.repOp(), cast<dcp::DCPathComputeOp>(u.repOp()).getOpTypeAttr());
-  assert(opr && "an IP unit names a live dcp.operator");
-  return opr.getInDelay().convertToDouble();
-}
-
-double unitSlack(const FuncUnit &u, float cycleTime,
-                 const OperatorLibrary &lib) {
-  double in = unitInDelay(u, lib);
+double unitSlack(const FuncUnit &u, float cycleTime) {
   double slack = cycleTime;
-  for (const FuncUnit::BoundOp &bo : u.boundOps) {
-    auto z = bo.op->getAttrOfType<FloatAttr>("z");
-    slack = std::min(slack, cycleTime - (z ? z.getValueAsDouble() : 0.0) - in);
-  }
+  for (const FuncUnit::BoundOp &bo : u.boundOps)
+    slack = std::min(slack, cycleTime - bo.z.value_or(0.0) - u.inDelay);
   return slack;
 }
 

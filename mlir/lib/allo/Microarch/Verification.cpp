@@ -129,26 +129,23 @@ LogicalResult checkCombPathsMeetPeriod(const Datapath &dp, float cycleTime,
   // to report.
   for (const FuncUnit &u : dp.units)
     for (const FuncUnit::BoundOp &bo : u.boundOps)
-      assert(bo.op->hasAttr("z") &&
+      assert(bo.z &&
              "a cell reached the datapath the scheduling stage never placed");
 
   bool ok = true;
   for (const FuncUnit &u : dp.units) {
     double mux = added.ofUnit(u.id);
-    double slack = unitSlack(u, cycleTime, lib);
+    double slack = unitSlack(u, cycleTime);
     if (mux <= slack + kSlop)
       continue;
     // Anchor on the tightest bound op, the one the slack came from.
-    Operation *worst = u.repOp();
-    for (const FuncUnit::BoundOp &bo : u.boundOps) {
-      auto z = bo.op->getAttrOfType<FloatAttr>("z");
-      auto wz = worst->getAttrOfType<FloatAttr>("z");
-      if (z && (!wz || z.getValueAsDouble() > wz.getValueAsDouble()))
-        worst = bo.op;
-    }
+    const FuncUnit::BoundOp *worst = &u.boundOps.front();
+    for (const FuncUnit::BoundOp &bo : u.boundOps)
+      if (bo.z && (!worst->z || *bo.z > *worst->z))
+        worst = &bo;
     // `mux` covers the whole input cone, so it may come from a shared
     // predecessor rather than from a multiplexer on this unit.
-    unsupported(Stage::Emit, Code::BindingMuxOverPeriod, worst)
+    unsupported(Stage::Emit, Code::BindingMuxOverPeriod, worst->op)
         << "Binding put " << llvm::format("%.2f", mux)
         << " ns of multiplexer on the path reaching this operation (its unit "
            "is shared between "

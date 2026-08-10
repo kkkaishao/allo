@@ -408,22 +408,33 @@ void DatapathBuilder::bindCompute(dcp::DCPathComputeOp comp, RegionBlock &rb) {
     // Combinational: emitted inline as a `comb` primitive (latency 0).
     u.latency = 0;
     u.pipelined = true;
+    u.inDelay =
+        dev.operators.combMarginalDelay(*u.identity.comb, combParamWidth(comp));
   } else {
     // IP: the `dcp.operator` the identity names is the one copy of its timing
-    // and stall contract.
+    // and stall contract, read here so nothing below has to resolve the symbol
+    // again.
     auto opr = SymbolTable::lookupNearestSymbolFrom<dcp::DCPathOperatorOp>(
         comp, comp.getOpTypeAttr());
     assert(opr && "a dcp.compute op_type must reference a live dcp.operator");
     u.latency = static_cast<unsigned>(opr.getLatency());
     u.pipelined = opr.getPipelined();
     u.stall = opr.getStall();
+    u.inDelay = opr.getInDelay().convertToDouble();
   }
+  // The one exception no library row carries, which the scheduler takes too: an
+  // operation that renames bits rather than computing them costs nothing.
+  if (isZeroDelay(comp))
+    u.inDelay = 0.0;
   // The unit's reservation slot: its issue cycle, taken modulo II in a cyclic
   // region since successive iterations overlap there.
   unsigned stage = dcpStart(comp);
   unsigned ii = rb.ii.value_or(1);
   unsigned residue = rb.kind == RegionBlock::Kind::Cyclic ? stage % ii : stage;
-  u.boundOps.push_back({comp, stage, residue});
+  std::optional<double> z;
+  if (auto attr = comp->getAttrOfType<FloatAttr>("z"))
+    z = attr.getValueAsDouble();
+  u.boundOps.push_back({comp, stage, residue, z});
   producerOf[comp.getResult()] = Source{Source::Kind::Unit, u.id, 0};
   dp.opToUnit[comp] = u.id;
   rb.units.push_back(u.id);

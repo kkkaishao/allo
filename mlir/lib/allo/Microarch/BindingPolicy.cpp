@@ -63,7 +63,7 @@ struct ShareCone {
       owner[dp.units[uid].repOp()] = i;
     for (auto [i, uid] : llvm::enumerate(rb.units)) {
       const FuncUnit &u = dp.units[uid];
-      slack[i] = unitSlack(u, ctx.cycleTime, ctx.lib);
+      slack[i] = unitSlack(u, ctx.cycleTime);
       Operation *y = u.repOp();
       for (Value v : y->getOperands()) {
         Operation *x = v.getDefiningOp();

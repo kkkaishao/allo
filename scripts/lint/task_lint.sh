@@ -6,9 +6,9 @@ set -euo pipefail
 
 CWD=$(dirname "$(realpath "$0")")
 
-# Which checks to run. `format` needs nothing but black/clang-format, so CI runs
-# it before paying for a build; `pylint` resolves imports and so needs an
-# installed allo, including the generated `allo/_mlir`.
+# Which checks to run. `format` reads the source and nothing else, so CI runs it
+# before paying for a build; `pylint` resolves imports and so needs an installed
+# allo, including the generated `allo/_mlir`.
 STAGE=${1:-all}
 case "$STAGE" in
   all | format | pylint) ;;
@@ -27,6 +27,9 @@ if [ "$STAGE" = "all" ] || [ "$STAGE" = "format" ]; then
 
   echo "Check C/C++ formats using clang-format..."
   python3 $CWD/check_cpp_format.py
+
+  echo "Check the RTL emitter reads no IR..."
+  python3 $CWD/check_emitter_closure.py
 fi
 
 if [ "$STAGE" = "all" ] || [ "$STAGE" = "pylint" ]; then

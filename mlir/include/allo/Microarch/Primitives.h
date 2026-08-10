@@ -85,14 +85,15 @@ Value addrAt(OpBuilder &b, Location loc, Value v, unsigned width);
 Value evalAffine(OpBuilder &b, Location loc, AffineExpr e, ValueRange idx,
                  unsigned numDims, unsigned width = kDatapathAddressWidth);
 /// The comb op realizing a combinational compute unit, reading as many of
-/// \p operands as \p kind's arity needs. Every `CombOpKind` has a case here,
+/// \p operands as its kind's arity needs. Every `CombOpKind` has a case here,
 /// which is what makes the enum the whole native vocabulary.
-/// \p resultType is the unit's hw result type. The width-preserving binary ops
-/// ignore it; the unary casts (extsi/extui/trunci) resize to it.
-/// \p srcOp is the source dcp.compute op, carrying any op-specific attribute
-/// the kind needs (e.g. arith.cmpi's `predicate`).
-Value emitCompute(OpBuilder &b, Location loc, allo::CombOpKindEnum kind,
-                  ValueRange operands, Type resultType, Operation *srcOp);
+/// \p id is the unit's identity, which carries the kind and the two
+/// op-specific attributes a kind can need (a compare's `predicate`, an
+/// `affine.apply`'s `map`); the identity is what the model froze them onto, so
+/// this reads no IR. \p resultType is the unit's hw result type: the
+/// width-preserving binary ops ignore it, the unary casts resize to it.
+Value emitCompute(OpBuilder &b, Location loc, const allo::OperatorIdentity &id,
+                  ValueRange operands, Type resultType);
 
 /// Declare a module's boundary ports from its port model, in the canonical ABI
 /// order: clk/rst/start, then scalar + stream-input + read-data *inputs*, done,
