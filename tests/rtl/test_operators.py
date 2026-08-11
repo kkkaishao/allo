@@ -202,8 +202,6 @@ def test_the_device_prices_a_realization_through_the_compiler():
     assert dev.price(dev.storage["bram"].uses, (1024, 32)) == {"bram36": 1}
 
 
-# The same measured points as a `Table`, read as a line between them instead of
-# a staircase, which is what a quantity continuous in its parameter does.
 def test_interp_interpolates_the_points_a_table_would_hold_flat():
     dev = default_device.copy()
     lut = dev.resources["lut"]
@@ -211,7 +209,6 @@ def test_interp_interpolates_the_points_a_table_would_hold_flat():
     dev.set_comb_delay(CombKind.ADD, 1.2, uses={lut: Interp(points)})
     dev.set_comb_delay(CombKind.SUB, 1.2, uses={lut: Table(points)})
     interp, table = dev.comb_uses["add"], dev.comb_uses["sub"]
-    # The measurements themselves are reproduced exactly by both.
     for w, v in points.items():
         assert dev.price(interp, (w,)) == dev.price(table, (w,)) == {"lut": v}
     # Between them the staircase still reads the lower row.
@@ -219,11 +216,8 @@ def test_interp_interpolates_the_points_a_table_would_hold_flat():
     assert dev.price(table, (20,)) == {"lut": 10}
 
 
-# A measurement is read rather than extrapolated, and the two ends of a row
-# are not alike. Below the first point the narrowest measurement bounds the
-# structure asked about, so it stands. Above the last there is no such bound,
-# and the reader is told which row and which domain rather than handed the
-# widest measurement the device happens to hold.
+# Below the first point the narrowest measurement bounds the structure asked
+# about, so it stands; above the last point there is no such bound.
 def test_a_measured_cost_is_bounded_below_and_refused_above():
     dev = default_device.copy()
     lut = dev.resources["lut"]
@@ -241,10 +235,8 @@ def test_a_measured_cost_is_bounded_below_and_refused_above():
         dev.comb_delay(CombKind.MUL, 128)
 
 
-# The same rule reaching a program: an operation whose width no measurement of
-# the device covers is refused against that operation, rather than priced by
-# the widest row the device happens to hold. An add past the widest measurement
-# is a path that cannot close the period it was scheduled under.
+# An add past the widest measured width is a path that cannot be shown to close
+# the period it was scheduled under.
 def test_an_operation_outside_the_measured_widths_is_refused():
     i256 = APInt(256, signed=True)
 
@@ -258,8 +250,6 @@ def test_an_operation_outside_the_measured_widths_is_refused():
         _to_rtl(wide).schedule()
 
 
-# Two arms of any shape around a breakpoint, which is what `step` is a fixed
-# case of: `step`'s upper arm is constant and cannot grow with its parameter.
 def test_piecewise_selects_an_arm_of_any_shape():
     dev = default_device.copy()
     lut = dev.resources["lut"]
@@ -272,8 +262,8 @@ def test_piecewise_selects_an_arm_of_any_shape():
     assert dev.price(uses, (20,)) == {"lut": 400}
 
 
-# A `tiled` factor reads one parameter or the whole tuple, and which one it is
-# is the number of factors the term carries.
+# Which of the two spellings applies follows from the number of factors the
+# term carries.
 def test_tiled_tiles_one_parameter_or_the_whole_tuple():
     dev = default_device.copy()
     # One factor per parameter: the ceiling is taken on the depth alone, which
@@ -283,7 +273,7 @@ def test_tiled_tiles_one_parameter_or_the_whole_tuple():
     # One factor at arity two: the product sits inside the ceiling instead.
     whole_tuple = (("ff", (Tiled(1024),)),)
     assert dev.price(whole_tuple, (256, 8)) == {"ff": math.ceil(256 * 8 / 1024)}
-    # And the op verifier takes both spellings.
+    # The op verifier takes both spellings.
     _parse_device(
         "allo.dcp.chain uses [#allo.res_use<@ff, "
         "[#allo.cost<tiled, [32.0]>, #allo.cost<linear, [0.0, 1.0]>]>]"
@@ -293,8 +283,7 @@ def test_tiled_tiles_one_parameter_or_the_whole_tuple():
     )
 
 
-# A cost the evaluator could not read is a declaration error, reported where it
-# is declared rather than reaching the scheduler.
+# A cost the evaluator cannot read is reported where it is declared.
 def test_a_cost_that_cannot_be_evaluated_is_rejected():
     # `piecewise` chooses between exactly two arms.
     with pytest.raises(Exception, match="piecewise takes 2 arm"):
@@ -388,10 +377,8 @@ def test_operator_ip_overlay_shifts_schedule():
     assert lat0 is not None and lat1 is not None
 
 
-# The library holds every row an operation could run on and selects between
-# them, rather than keeping whichever was declared last. Two f32 adders of the
-# same signature are both candidates and the shorter is chosen; `mnemonic` is
-# what gives the second core a symbol of its own.
+# Two f32 adders of the same signature are both candidates; `mnemonic` is what
+# gives the second core a symbol of its own.
 def test_the_shorter_of_two_candidates_is_selected():
     @operator_ip(
         optype=OperatorType.ADD,
@@ -416,9 +403,6 @@ def test_the_shorter_of_two_candidates_is_selected():
     assert f"add_f32_f32_f32_l{FADD}" not in impls
 
 
-# A candidate longer than the built-in leaves the built-in selected: declaring a
-# core adds it to the candidate set rather than replacing what the fabric
-# already measured.
 def test_a_longer_candidate_does_not_displace_the_builtin():
     @operator_ip(
         optype=OperatorType.ADD,
@@ -443,18 +427,16 @@ def test_a_longer_candidate_does_not_displace_the_builtin():
 
 
 # An integer multiply matches two rows: the measured DSP core and the
-# combinational MUL row, which is latency 0. The core is selected, because an IP
-# outranks a combinational realization whatever the latencies compare to. A
-# 32-bit combinational multiply is most of the clock period, and whether one
-# fits is the scheduler's question rather than the library's.
+# combinational multiply row at latency 0. An IP outranks a combinational
+# realization whatever their latencies compare to.
 def test_integer_multiply_binds_its_ip_not_the_comb_row():
     @kernel
     def imulk(x: i32[8], y: i32[8], out: i32[8]):
         for i in range(8):
             out[i] = x[i] * y[i]
 
-    # The fabric offers the multiply at more than one depth, and the shortest is
-    # the one the library ranks first, so that is the core to look for.
+    # The fabric offers the multiply at more than one depth and ranks the
+    # shortest first, so that is the core to look for.
     core = min(
         (o for o in default_device.operators if o.symbol.startswith("mul_i32_")),
         key=lambda o: o.timing.latency,
@@ -584,8 +566,8 @@ def test_free_running_operator_cosim():
             C[i] = A[i] + B[i]
 
     dev = default_device.copy()
-    # A candidate beside the fabric's own f32 adders, shorter than any of them,
-    # so it is the one the operation binds.
+    # Shorter than any of the fabric's own f32 adders, so this is the candidate
+    # the operation binds.
     dev.add_operator(fadd_free)
     rtl = _to_rtl(addk, device=dev)
     # The manifest declares each instantiated operator's realized port shape.
@@ -802,8 +784,7 @@ def test_behavior_language_follows_the_domain():
     i128, wadd = _wide_add_ip(128)
 
     # Shorter than the built-in 64-bit multiply core, so this is the candidate
-    # the library selects. A symbol names one piece of hardware, so two cores of
-    # the same kind and signature are told apart by their depth.
+    # the library selects.
     @operator_ip(optype=OperatorType.MUL, latency=1, pipelined=True, style="ce")
     def imul(a: i64, b: i64) -> i64: ...
 
@@ -1526,9 +1507,6 @@ def _rounded(value: float) -> int:
     return math.floor(value + 0.5)
 
 
-# A term carries one factor per parameter, or the single `tiled` that reads the
-# whole tuple; which factor is the `tiled` is not part of the rule, since each
-# reads its own parameter.
 def test_a_tiled_factor_may_sit_anywhere_in_a_term():
     dev = default_device.copy()
     ff = dev.resources["ff"]
@@ -1536,8 +1514,8 @@ def test_a_tiled_factor_may_sit_anywhere_in_a_term():
     assert dev.price(dev.chain_uses, (256, 8)) == {"ff": 8 * 8}
     dev.set_chain_uses({ff: (Linear(1.0), Tiled(32))})
     assert dev.price(dev.chain_uses, (8, 256)) == {"ff": 8 * 8}
-    # Anything other than a full set of factors, or one `tiled` alone, is the
-    # arity error whatever the forms are and wherever they sit.
+    # Anything other than a full set of factors, or one `tiled` alone, is an
+    # arity error.
     for wrong in ((Linear(1.0),), (Tiled(32), Linear(1.0), Const(1.0))):
         with pytest.raises(ValueError, match="2 factor"):
             dev.set_chain_uses({ff: wrong})
@@ -1546,8 +1524,7 @@ def test_a_tiled_factor_may_sit_anywhere_in_a_term():
 
 
 # Delay is continuous in the operand width, so every characterized row is read
-# as a line through its measurements rather than as a staircase that under-states
-# every width between two of them.
+# as a line through its measurements.
 def test_every_comb_delay_row_interpolates_its_measurements():
     for mod, dev in _fabrics():
         grade = next(g for g in mod.TIMING if g.name == dev.grade)
@@ -1555,8 +1532,8 @@ def test_every_comb_delay_row_interpolates_its_measurements():
             assert cost.form == "interp", (mod.NAME, kind)
             for p, v in _points(cost).items():
                 assert dev.comb_delay(kind, int(p)) == pytest.approx(v, abs=1e-9)
-    # Between two measurements the curve is the line joining them; 48 bits is
-    # their midpoint, where the staircase read the 32-bit row.
+    # Between two measurements the curve is the line joining them, and 48 bits
+    # is the midpoint of 32 and 64.
     dev = default_device
     for kind in ("add", "mul", "div"):
         lo, hi = dev.comb_delay(kind, 32), dev.comb_delay(kind, 64)
@@ -1566,7 +1543,7 @@ def test_every_comb_delay_row_interpolates_its_measurements():
 
 # An area row is a staircase only where the quantity really steps: a DSP count
 # is a whole number of slices, while the fabric logic around them grows with the
-# width. Both reproduce what was measured.
+# width.
 def test_comb_area_rows_reproduce_their_measurements():
     for _, dev in _fabrics():
         for kind in ("shl", "shr", "mul", "div", "rem"):
@@ -1584,8 +1561,8 @@ def test_comb_area_rows_reproduce_their_measurements():
 
 
 # An extracted chain occupies `ceil(depth/32)` SLICEM sites a bit, which is the
-# formula the table it replaces was generated from. The formula holds past the
-# last row that table carried, where the staircase clamped flat.
+# formula the sampled table was generated from, and it holds past the last row
+# that table carried.
 def test_the_srl_site_count_is_the_formula_its_table_sampled():
     sites = {1: 0, 4: 1} | {32 * i + 1: i + 1 for i in range(1, 17)}
 
@@ -1598,19 +1575,17 @@ def test_the_srl_site_count_is_the_formula_its_table_sampled():
             got = dev.price(dev.chain_uses, (depth, 1))["slicem_lut"]
             assert got == sampled(depth), (dev.name, depth)
         assert dev.price(dev.chain_uses, (1024, 1))["slicem_lut"] == 32
-        # The flip-flop terms are unchanged: a chain below the extraction cliff
-        # is `depth * width` registers, one above it a head and tail per bit
-        # plus one per stage.
+        # A chain below the extraction cliff is `depth * width` registers, one
+        # above it a head and tail per bit plus one per stage.
         for depth in (1, 2, 3, 4, 5, 64, 1024):
             for width in (1, 8, 32):
                 want = depth * width if depth < 4 else 2 * width + depth - 1
                 assert dev.price(dev.chain_uses, (depth, width))["ff"] == want
 
 
-# A select's LUT count per bit is measured up to a fan-in of 39 and read as the
-# measured staircase there. Past it the least-squares line through those points
-# takes over, since a region shares an operator over more sources than the sweep
-# covered and a staircase would charge nothing for the rest.
+# A select's LUT count per bit is measured up to a fan-in of 39 and read as that
+# staircase there; past it the least-squares line through those points takes
+# over, since a region can share an operator over more sources than the sweep.
 def test_the_mux_curve_is_measured_over_its_sweep_and_fitted_past_it():
     from allo.backend.rtl.devices.spec import MUX_LUT_PER_BIT
 
@@ -1625,13 +1600,12 @@ def test_the_mux_curve_is_measured_over_its_sweep_and_fitted_past_it():
         # The seam is under a fifth of a LUT: the fit at the last measured point
         # against the measurement there.
         assert abs(base + slope * last - MUX_LUT_PER_BIT[last]) < 0.2
-        # A staircase would have charged a 128-way select what a 39-way one costs.
         assert dev.price(dev.mux_uses, (128, 1))["lut"] > MUX_LUT_PER_BIT[last]
 
 
-# Several rows under one archetype are several cores, each declared under its own
-# symbol. `mnemonic` is what tells apart two rows of one kind and signature, and
-# the archetype's own row keeps the name it always had.
+# Several rows under one archetype are several cores, each declared under its
+# own symbol: `mnemonic` tells apart two rows of one kind and signature, and the
+# archetype's own row keeps the plain name.
 def test_a_fabric_declares_every_row_of_an_archetype():
     from allo.backend.rtl.devices import ultrascalex
     from allo.backend.rtl.devices import ip as catalog
@@ -1651,8 +1625,8 @@ def test_a_fabric_declares_every_row_of_an_archetype():
         },
     )
     saved = ultrascalex.IP[catalog.fadd]
-    # The fabric's own entry is already a candidate set where it measured more
-    # than one core, so the fabricated row joins it rather than nesting inside.
+    # The fabric's entry is already a candidate set where it measured more than
+    # one core, so the fabricated row joins it rather than nesting inside.
     ultrascalex.IP[catalog.fadd] = (
         *(saved if isinstance(saved, tuple) else (saved,)),
         fast,
@@ -1677,14 +1651,11 @@ def test_a_fabric_declares_every_row_of_an_archetype():
     assert {f"add_f32_f32_f32_l{FADD}", f"add_dsp_f32_f32_f32_l{FADD - 2}"} <= set(
         injected
     )
-    # Both are candidates and the shorter one is what the operation binds.
     impls = _impls(rtl.schedule())
     assert f"add_dsp_f32_f32_f32_l{FADD - 2}" in impls
     assert f"add_f32_f32_f32_l{FADD}" not in impls
 
 
-# Withdrawing a candidate is the primitive a shadowing declaration stood in for:
-# the core goes, and what it spends goes with it.
 def test_remove_operator_withdraws_a_candidate_and_its_cost():
     @operator_ip(
         optype=OperatorType.ADD,

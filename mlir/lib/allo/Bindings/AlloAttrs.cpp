@@ -98,9 +98,7 @@ struct PyPartitionAttr : mpx::PyConcreteAttribute<PyPartitionAttr> {
 
 /// Enum-backed attributes all share the same `get` / `value` shape, so
 /// generate a CRTP subclass per attr from its CAPI hooks. `get` takes either
-/// the enum case or its mnemonic, and a caller outside the compiler should
-/// pass the mnemonic: the numbering is the .td's and transcribing it here
-/// would go stale the moment a case is inserted.
+/// the enum case or its mnemonic.
 #define ALLO_ENUM_ATTR(PyClass, PyName, IsAFn, GetFn, GetByNameFn, GetValueFn, \
                        GetIdFn)                                                \
   struct PyClass : mpx::PyConcreteAttribute<PyClass> {                         \
@@ -162,9 +160,8 @@ ALLO_ENUM_ATTR(PyCostFormAttr, "CostFormAttr", alloAttributeIsACostForm,
 
 #undef ALLO_ENUM_ATTR
 
-/// The two structural attributes below bind authoring and evaluation, which is
-/// all Python asks of a cost. Reading one back apart is the compiler's job, so
-/// the accessors the CAPI carries for it stay unbound.
+/// The two structural attributes below bind authoring and evaluation only; the
+/// field accessors the CAPI carries for them stay unbound.
 
 /// CostAttr: #allo.cost<form, [coeffs], [arms]>
 ///   form: the CostFormEnum case; arms: the two arms of a `piecewise`, and

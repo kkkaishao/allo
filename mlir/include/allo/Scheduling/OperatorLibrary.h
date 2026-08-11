@@ -145,17 +145,12 @@ public:
   static OperatorLibrary fromModule(ModuleOp module);
 
   /// Resolve the characterization for \p op: the row `selectImplementation`
-  /// picks out of the candidates matching it, else the default row.
+  /// picks out of the candidates matching it, else the default row. Pure: the
+  /// answer depends only on the library and on \p op's own name, types and
+  /// attributes.
   ///
-  /// Pure and memoized nowhere: the answer depends only on the library and on
-  /// \p op's own name, types and attributes. That is what lets its callers,
-  /// spread from problem building to reification, agree without threading a
-  /// decision between them.
-  ///
-  /// A row the device never measured at \p op's width answers for nothing: the
-  /// gap is reported against \p op and the characterization comes back
-  /// unrealized, which is what the pre-schedule realizability check refuses the
-  /// program on.
+  /// A row the device never measured at \p op's width comes back unrealized,
+  /// with the gap reported against \p op.
   OperatorChar lookup(Operation *op) const;
 
   /// Whether \p op needs an IP realization (a float or advanced compute op) but
@@ -180,9 +175,8 @@ public:
   /// \p width here is a width the compiler picks for a structure it builds (the
   /// datapath's index width for address arithmetic, one bit for a multiplexer
   /// level), never a program's operand width, which `lookup` reads. Below the
-  /// row's first measured point it reads that point, which bounds a structure
-  /// narrower than anything the device was characterized at; above the last
-  /// there is no such bound, and the compiler builds nothing that wide.
+  /// row's first measured point it reads that point; above the last measured
+  /// point the value is unbounded.
   double combDelay(OpKind kind, int64_t width) const;
 
   /// What one instance of \p kind at \p width adds to a path that already left
@@ -193,8 +187,7 @@ public:
   /// The same two, for a caller holding a reified realization (a
   /// `dcp.compute`'s `comb_kind`). Falls back to the default row, not to 0.0,
   /// so an `affine.apply` is priced the way it was scheduled. \p width is the
-  /// realized operation's own, which `lookup` already read the row at, so a
-  /// reification that got this far is inside the measured points.
+  /// realized operation's own, already inside the row's measured points.
   double combDelay(CombOpKindEnum kind, int64_t width) const;
   double combMarginalDelay(CombOpKindEnum kind, int64_t width) const;
 
@@ -235,10 +228,8 @@ private:
                                  ArrayRef<int64_t> params) const;
 
   /// Which of \p candidates \p op is realized on, at \p width bits; null for an
-  /// empty set. An IP outranks the combinational row whatever their latencies,
-  /// since whether a combinational realization fits the period is a scheduling
-  /// question this layer cannot answer. Among IPs the shortest wins, then the
-  /// cheapest, then the first by symbol.
+  /// empty set. An IP outranks the combinational row whatever their latencies.
+  /// Among IPs the shortest wins, then the cheapest, then the first by symbol.
   const OperatorEntry *
   selectImplementation(ArrayRef<const OperatorEntry *> candidates,
                        int64_t width) const;

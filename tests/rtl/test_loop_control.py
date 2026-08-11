@@ -535,7 +535,7 @@ def test_stencil3d_grid_boundary_cosim():
     res = rtl.schedule()
     assert res.func("stencil3d").latency is not None
     # The boundary copies carry no dependence, so what paces them is their two
-    # stores per iteration against the one write port distributed RAM has.
+    # stores per iteration against distributed RAM's one write port.
     assert min(_iis(res.cyclic())) == 2
 
     coeff = np.array([2, 3], np.int32)

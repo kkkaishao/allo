@@ -71,7 +71,7 @@ inline constexpr unsigned kDatapathAddressWidth = kIndexWidth;
 Value resize(OpBuilder &b, Location loc, Value v, unsigned width,
              bool isSigned);
 
-/// \p v resized to \p width bits as an ADDRESS: unsigned, an address, a bank
+/// \p v resized to \p width bits as an address: unsigned, an address, a bank
 /// digit and a scaled counter all being non-negative by construction.
 Value addrAt(OpBuilder &b, Location loc, Value v, unsigned width);
 
@@ -89,8 +89,7 @@ Value evalAffine(OpBuilder &b, Location loc, AffineExpr e, ValueRange idx,
 /// which is what makes the enum the whole native vocabulary.
 /// \p id is the unit's identity, which carries the kind and the two
 /// op-specific attributes a kind can need (a compare's `predicate`, an
-/// `affine.apply`'s `map`); the identity is what the model froze them onto, so
-/// this reads no IR. \p resultType is the unit's hw result type: the
+/// `affine.apply`'s `map`). \p resultType is the unit's hw result type: the
 /// width-preserving binary ops ignore it, the unary casts resize to it.
 Value emitCompute(OpBuilder &b, Location loc, const allo::OperatorIdentity &id,
                   ValueRange operands, Type resultType);
@@ -285,8 +284,7 @@ struct EmitContext {
   /// A scheduled cell's activation pulse: \p pulse delayed to \p stage, the
   /// cycle within its region the cell issues at. The one name for "this cell
   /// fires now", used for a store's write-enable, a shared-unit input's mux
-  /// select and an accumulator's init gate alike. The stage comes off the
-  /// model, never off the op.
+  /// select and an accumulator's init gate alike.
   Value activationPulse(Value pulse, unsigned stage, const StallShell &sh);
   /// Combinational (0-cycle) equality of an i32 value `a` against a constant.
   Value icmpEq(Value a, int64_t c);

@@ -43,9 +43,9 @@ constexpr llvm::StringLiteral kMemoryInitAttr = "allo.mem.init";
 constexpr llvm::StringLiteral kIndependentWritesAttr =
     "allo.mem.independent_writes";
 /// On a `seq.read`/`seq.write`: which physical port of the memory it drives.
-/// The accesses carrying one value never issue in the same cycle, so they are
-/// emitted in one `always` block, which makes a read and a write on the same
-/// port one port of a dual-port RAM instead of two.
+/// Accesses sharing a port never issue in the same cycle and are emitted in one
+/// `always` block, so a read and a write on one port take one port of a
+/// dual-port RAM.
 constexpr llvm::StringLiteral kMemPortAttr = "allo.mem.port";
 /// On a `seq.hlmem`: the vendor attribute pinning the array to the structure
 /// the device priced it as (`ram_style` on Xilinx parts).

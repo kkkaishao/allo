@@ -210,7 +210,7 @@ Value writeDemux(EmitContext &c, Value we, Value bank, unsigned k) {
 //===----------------------------------------------------------------------===//
 // Address arithmetic. An address, a bank digit and a scaled counter are all
 // non-negative by construction, so every width change on the address path is
-// the UNSIGNED resize and every divisor a compile-time constant.
+// the unsigned resize and every divisor a compile-time constant.
 //===----------------------------------------------------------------------===//
 
 // A literal of \p v's own width. Address arithmetic is carried at whatever
@@ -302,7 +302,7 @@ Value evalAffine(OpBuilder &b, Location loc, AffineExpr e, ValueRange idx,
          "affine div/mod by a non-constant or non-positive divisor");
   int64_t f = rc.getValue();
   // With one congruent exception, the one a bank digit always ends in: `x mod
-  // 2^k` IS the low k bits, so that subtree is built k bits wide and the mask
+  // 2^k` is the low k bits, so that subtree is built k bits wide and the mask
   // disappears with it. `addressCost` prices it at the same narrowed width.
   if (e.getKind() == AffineExprKind::Mod && f > 1 &&
       llvm::isPowerOf2_64(static_cast<uint64_t>(f))) {

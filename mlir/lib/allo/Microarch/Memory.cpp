@@ -4,20 +4,19 @@
  */
 
 //===----------------------------------------------------------------------===//
-// The memory subsystem's MODEL half: one `MemUnit` per array, what each access
-// reaches it by (`PortPlan`), which port of which bank it drives, what this
-// module builds to hold it (`MemUnit::Realization`), and the boundary port
-// groups an argument publishes. How those decisions become hardware is
-// MemoryEmitter.cpp.
+// The memory subsystem's model half: one `MemUnit` per array, what each access
+// reaches it by (`PortPlan`), which port of which bank it drives, what holds it
+// (`MemUnit::Realization`), and the boundary port groups an argument publishes.
+// The hardware for those decisions is built in MemoryEmitter.cpp.
 //===----------------------------------------------------------------------===//
 
 #include "allo/Microarch/DatapathBuilder.h"
 
-#include "allo/Microarch/Interface.h"    // iface::ModuleInterface (child ports)
-#include "allo/Microarch/Naming.h"       // uniqueOwnerOf, memBase, elemBase
-#include "allo/Scheduling/MemoryModel.h" // characterize (storage shape)
-#include "allo/Scheduling/OperatorLibrary.h" // DeviceModel (the storage rows)
-#include "allo/Support/AliasAnalysis.h"      // resolveRoot (storage identity)
+#include "allo/Microarch/Interface.h"
+#include "allo/Microarch/Naming.h"
+#include "allo/Scheduling/MemoryModel.h"
+#include "allo/Scheduling/OperatorLibrary.h"
+#include "allo/Support/AliasAnalysis.h"
 #include "allo/Support/Logging.h"
 
 #include "llvm/ADT/STLExtras.h"
@@ -32,7 +31,7 @@ namespace mlir::allo::uarch {
 
 MemId DatapathBuilder::memIdOf(Value memref) {
   // Key on the storage root, not the operand as written, so a buffer threaded
-  // out of a region is the SAME memory to its producer and its consumer.
+  // out of a region is the same memory to its producer and its consumer.
   auto it = memOf.find(resolveRoot(memref));
   assert(it != memOf.end() &&
          "`collectStorageFacts` builds a MemUnit for every array the function "
@@ -53,43 +52,36 @@ static MemId createMem(Datapath &dp, llvm::DenseMap<Value, MemId> &memOf,
   m.external = isa<BlockArgument>(memref);
   auto mt = cast<MemRefType>(memref.getType());
   m.width = mt.getElementTypeBitWidth();
-  // Banking / ports from the same storage model the scheduler binds against
-  // (allo.part / allo.bind.storage): ONE characterization, so the ports billed
-  // and the ports built cannot disagree.
+  // Banking and ports from the same storage model the scheduler binds against
+  // (allo.part / allo.bind.storage), so the ports billed and the ports built
+  // cannot disagree.
   MemoryChar mc = allo::characterize(memref, dev.memory);
-  // The power-on contents, when the array reads through an initialized global.
-  // Whether that makes it a constant TABLE is a property of the use, settled by
-  // `collectStorageFacts` once every writer is in view.
+  // Power-on contents, when the array reads through an initialized global.
+  // Whether that makes it a constant table is settled by `collectStorageFacts`,
+  // once every writer is in view.
   if (auto init = allo::globalInitOf(memref))
     m.romInit = *init;
   m.layout = mc.layout;
   m.numBanks = m.layout.numBanks;
-  // THE expression behind `scattered` (see its declaration for where the cells
-  // live): the ROW says whether the array is held one cell per element, which a
-  // complete partition is one way of reaching and several writing accessors
-  // another. A callee's array argument is the one place neither changes
-  // anything: the storage is the parent's and the child masters an addressed
-  // port on it.
+  // The device row says whether the array is held one cell per element. A
+  // callee's array argument never is: the storage is the parent's and the child
+  // masters an addressed port on it.
   m.scattered = dev.memory.isScatter(mc.storage) && (!m.external || dp.atTop);
   m.storage = mc.storage;
-  // Everything the device states about the resolved realization, from the same
-  // rows the scheduler timed this memref's accesses against. The emitter builds
-  // ports at these latencies; do not re-derive from the name.
+  // Timing and style from the same device row the scheduler timed this memref's
+  // accesses against. The emitter builds ports at these latencies.
   const StorageRealization *sr = dev.memory.row(m.storage);
   assert(sr && "`PreVerification` rejects an array whose storage realization "
                "the device does not declare");
   m.readLatency = sr->timing.latency.read;
   m.writeLatency = sr->timing.latency.write;
   m.ramStyle = sr->ramStyle;
-  // Port budget from that same characterization, so the ports the scheduler
-  // reserved and the ports `bindMemoryPorts` assigns are one number.
   m.ports = mc.ports;
   assert(mt.hasStaticShape() &&
          "datapath memory requires a static shape (a dynamic memref sizes to "
          "depthWords 0)");
-  // Per-bank depth from the same element-space decomposition the emitter's
-  // crossbar and the host-side layout use, so a bank's address space is exactly
-  // the elements it holds (`ceil` per partitioned dim, not of the total).
+  // Per-bank depth: a bank's address space is exactly the elements it holds
+  // (`ceil` per partitioned dim, not of the total).
   m.depthWords = static_cast<unsigned>(m.layout.bankWords());
   dp.mems.push_back(std::move(m));
   memOf[memref] = id;
@@ -97,11 +89,9 @@ static MemId createMem(Datapath &dp, llvm::DenseMap<Value, MemId> &memOf,
 }
 
 void DatapathBuilder::collectStorageFacts(ArrayRef<Operation *> regionOps) {
-  // Whether anything writes each array, indexed by MemId. This is the whole
-  // reason the sweep exists: read-only is a property of the USE, and an array's
-  // uses are in view only once every region body and every callee interface has
-  // been looked at. Deciding it per access, as it is first touched, can only
-  // answer conservatively.
+  // Whether anything writes each array, indexed by MemId. Read-only is a
+  // property of the use, so it is settled only once every region body and every
+  // callee interface has been looked at.
   llvm::SmallVector<bool> written;
   auto touch = [&](Value memref, bool isWrite) {
     MemId id = createMem(dp, memOf, dev, memref);
@@ -118,8 +108,7 @@ void DatapathBuilder::collectStorageFacts(ArrayRef<Operation *> regionOps) {
       if (!inv)
         return;
       // A child's array operand, and the direction of every port it masters on
-      // it. The callee interface is registered before this caller is built, so
-      // a child that only reads leaves the array a table.
+      // it. The callee interface is registered before this caller is built.
       auto it = callees.ifaces.find(inv.getCallee());
       assert(it != callees.ifaces.end() &&
              "the callee interface must be registered (emitted bottom-up)");
@@ -134,8 +123,8 @@ void DatapathBuilder::collectStorageFacts(ArrayRef<Operation *> regionOps) {
     });
 
   // An initialized array nothing writes is a combinational constant table. An
-  // ARGUMENT never is: its cells are the caller's, and a block argument reads
-  // through no global, so it carries no contents to begin with.
+  // argument never is: a block argument reads through no global, so it carries
+  // no contents to begin with.
   for (MemUnit &m : dp.mems) {
     assert(!(m.romInit && m.external) &&
            "an argument array reads through no initialized global");
@@ -149,8 +138,8 @@ void DatapathBuilder::collectStorageFacts(ArrayRef<Operation *> regionOps) {
 // Two accesses share a port only where `portGraph` has no edge between them,
 // which proves they never issue in the same cycle, so the port carries a select
 // over them rather than an arbiter. Two shapes take a port of their own: an
-// access `contendsWithAll` relates to every other, and, on the write side,
-// every write of an array whose splitting is not proven safe.
+// access `contendsWithAll` relates to, and every write of an array whose
+// splitting is not proven safe.
 std::optional<DatapathBuilder::PortAssignment>
 DatapathBuilder::planPorts(const MemUnit &m, std::optional<bool> writes,
                            unsigned base) {
@@ -160,20 +149,11 @@ DatapathBuilder::planPorts(const MemUnit &m, std::optional<bool> writes,
   llvm::SmallVector<unsigned> colour(n, 0);
   unsigned used = 0;
 
-  // What a pair on one port shares its address by decides how far apart they
-  // may sit, and every pair the relation leaves unrelated may share. Two writes
-  // need nothing, an address being a don't-care in any cycle its enable is low.
-  // A read and a write share by the write's own enable, likewise a signal in
-  // its own right. Two reads share by a select over their activation pulses,
-  // and where they belong to different ACCESSORS the emitter adds a second
-  // select over which of them is driving: a region's accesses presenting, or a
-  // child's run window.
-  //
   // Two shapes share with nothing. An access with no bank of its own is routed
   // to every bank by a crossbar, so it reaches whatever any other reaches. And
-  // a read with no pulse of its own cannot be selected between: a container's
-  // own reads form its condition cone, live on every cycle its children run,
-  // and a guard sequences its arms rather than running a datapath at all.
+  // a read with no activation pulse cannot be selected between: a container's
+  // own reads are live on every cycle its children run, and a guard sequences
+  // its arms rather than running a datapath at all.
   auto contendsWithAll = [&](unsigned i) {
     if (verts[i].bank < 0)
       return true;
@@ -196,10 +176,9 @@ DatapathBuilder::planPorts(const MemUnit &m, std::optional<bool> writes,
     colour[i] = taken.find_first_unset();
     used = std::max(used, colour[i] + 1);
   }
-  // Greedy first fit bounds the ports, it does not minimize them. Two read
-  // ports with no edge across them are one port carrying both selects, which is
-  // one address bus fewer and, past what one instance serves, one copy of the
-  // array fewer. Write ports stay as they are: dropping below two clears
+  // Greedy first fit bounds the ports, it does not minimize them: two read
+  // ports with no edge across them merge into one carrying both selects. Write
+  // ports stay as they are, since dropping below two clears
   // `writesIndependent`, which puts every write in one `always` block and
   // infers no RAM at all.
   llvm::SmallVector<llvm::BitVector> members(used, llvm::BitVector(n));
@@ -211,7 +190,7 @@ DatapathBuilder::planPorts(const MemUnit &m, std::optional<bool> writes,
     if (verts[i].write)
       reads.reset(colour[i]);
   }
-  // Into the lowest port that will take it. A port merged away is never a
+  // Merge into the lowest port that will take it. A port merged away is never a
   // target afterwards, so one pass over the ports in order is a fixed point.
   for (unsigned b = 1; b < used; ++b)
     if (reads[b])
@@ -232,10 +211,8 @@ DatapathBuilder::planPorts(const MemUnit &m, std::optional<bool> writes,
 
   // Whether the writes may go on separate ports, which are separate `always`
   // blocks with nothing between them to resolve a collision. Only a pair proven
-  // to address different words may: two accesses of one region, which a memory
-  // dependence made the scheduler separate, and two write ports of one child
-  // that declared them independent. Two different children, or a child and a
-  // local access, are related by nothing.
+  // to address different words may: two accesses of one region, or two write
+  // ports of one child that declared them independent.
   bool split = true;
   auto proven = [&](unsigned i, unsigned j) {
     if (verts[i].call < 0 && verts[j].call < 0)
@@ -254,11 +231,8 @@ DatapathBuilder::planPorts(const MemUnit &m, std::optional<bool> writes,
   // An unsplittable set of writes stays on one `always` block, which arbitrates
   // the collision it might have. Each still keeps a port of its own so the
   // block holds one assignment per write: two writes to different words in one
-  // cycle must both commit, and a select would drop one.
-  //
-  // That block is per direction, so a both-directions pass cannot express it
-  // and declines; a binding giving every access its own port is never fewer
-  // ports than the per-direction one it falls back to.
+  // cycle must both commit, and a select would drop one. That block is per
+  // direction, so a both-directions pass cannot express it and declines.
   if (!split) {
     if (!writes)
       return std::nullopt;
@@ -317,17 +291,15 @@ void DatapathBuilder::commitPorts(MemUnit &m, const PortAssignment &pa) {
     m.writesIndependent = pa.writesIndependent;
 }
 
-// Group a skewed memory's accesses into LANES: within a lane the slots are
+// Group a skewed memory's accesses into lanes: within a lane the slots are
 // distinct, so the accesses reach distinct banks and share one port on each.
-// Same-slot accesses always collide, so each takes the next lane, the port the
-// model billed it. Numbered per region and reads apart from writes, the
-// granularity a port is contended at.
+// Same-slot accesses always collide, so each takes the next lane. Numbered per
+// region and reads apart from writes, the granularity a port is contended at.
 void DatapathBuilder::assignLanes() {
   for (MemUnit &m : dp.mems) {
     // A constant table has no ports to share (it is combinational), and an
     // argument's ports are boundary interfaces the manifest already published,
-    // one set per access, which is why `assign-banks` assigns it no slot
-    // either.
+    // one set per access, so `assign-banks` gives it no slot either.
     if (!m.layout.skew() || m.external || m.isRom)
       continue;
     // One access without a slot and the array is back to crossbarring: a lane
@@ -345,7 +317,7 @@ void DatapathBuilder::assignLanes() {
 }
 
 void DatapathBuilder::planAccessPorts() {
-  // What the STORAGE or the layout decides, which every access of the array
+  // What the storage or the layout decides, which every access of the array
   // then takes; empty where the access's own bank decides it.
   auto uniform = [](const MemUnit &m) -> std::optional<PortPlan> {
     if (m.isRom)
@@ -371,8 +343,7 @@ void DatapathBuilder::bindMemoryPorts() {
     // array is one cell per element and a constant table is combinational.
     if (m.scattered || m.isRom)
       continue;
-    // A skew answers this at the same granularity: a lane's accesses hold
-    // distinct slots, so they reach distinct banks and share one port on each.
+    // A skew binds by lane, which already holds distinct slots.
     if (m.skewed) {
       llvm::SmallDenseSet<unsigned> lanes[2];
       for (MemUnit::Access &acc : m.accesses) {
@@ -394,8 +365,7 @@ void DatapathBuilder::bindMemoryPorts() {
     // Where the row's ports are a pool, each serving either direction, a read
     // may ride a write's port and one address bus carries both. Worth the
     // multiplexer only where the array does not otherwise fit, and possible
-    // only where the writes were split, an unsplittable set already being one
-    // `always` block.
+    // only where the writes were split.
     std::optional<PortAssignment> pooled;
     if (m.ports.instPool && !m.external &&
         !m.fitsStorage(w.counts.writes, separateTotal) &&
@@ -422,30 +392,28 @@ void DatapathBuilder::bindMemoryPorts() {
     m.readPortsBuilt = r.counts.reads;
     m.portsBuilt = separateTotal;
   }
-  // Instances of its row each bank is held in, decided here because the bound
-  // ports are what it follows from. A skew binds its ports by lane and leaves
-  // the loop early, so this runs over every memory rather than inside.
+  // Instances of its row each bank is held in, which follows from the bound
+  // ports. A skew binds its ports by lane and leaves the loop above early, so
+  // this runs over every memory rather than inside it.
   for (MemUnit &m : dp.mems) {
-    // Off `instReads`, what ONE instance serves, not off the array's own
+    // Off `instReads`, what one instance serves, not off the array's own
     // allowance, which is already a multiple of it. Not bounded by the copies
-    // budget either: the budget is what a CYCLE may issue, and a binding that
-    // needs more address buses than that still builds one copy per bus.
+    // budget either: that budget is what a cycle may issue, and a binding
+    // needing more address buses still builds one copy per bus.
     unsigned per = m.ports.instReads.value_or(0);
     // A bus carrying a write is on every copy, so a read riding one is served
     // wherever it lands and costs no port of its own.
     unsigned riding = 0;
     if (m.ports.instPool) {
-      // A pooled port serves either direction, and the binding may already have
-      // ridden a write on a read's where the two never issue together, so what
-      // the bank was BUILT with is the question and not the two directions
-      // separately. Within one instance's pool, one instance holds it.
+      // A pooled port serves either direction and the binding may already have
+      // ridden a read on a write's, so the question is what the bank was built
+      // with rather than the two directions separately.
       if (m.portsBuilt <= *m.ports.instPool)
         continue;
       riding = m.readPortsBuilt + m.writePortsBuilt - m.portsBuilt;
       // Past it every copy takes every write and the reads share what is left,
-      // so a written block RAM serves one read a copy, which is what the part
-      // does: 1024x32 measures one tile at one read and two at two. Nothing
-      // left is an array this row cannot hold at all.
+      // so a written block RAM serves one read per copy. Measured on the part:
+      // 1024x32 is one tile at one read and two at two.
       per = std::min(per, *m.ports.instPool > m.writePortsBuilt
                               ? *m.ports.instPool - m.writePortsBuilt
                               : 0u);
@@ -457,9 +425,8 @@ void DatapathBuilder::bindMemoryPorts() {
     // Each bank ranks the read ports that reach it and hands them out a whole
     // instance at a time. Per bank, not over the memory: `readPortsBuilt` is
     // the largest any one bank holds, so ranking every colour together would
-    // run past it wherever two banks hold different ones and would put more
-    // reads on an instance than it has. A read on a write's bus goes to the
-    // first instance, where the port it rides already exists.
+    // put more reads on an instance than it has. A read on a write's bus goes
+    // to the first instance, where the port it rides already exists.
     llvm::SmallDenseSet<unsigned> writePorts;
     for (const MemUnit::Access &acc : m.accesses)
       if (acc.isWrite)
@@ -498,15 +465,14 @@ void DatapathBuilder::bindMemoryPorts() {
 
 void DatapathBuilder::measurePorts() {
   for (MemUnit &m : dp.mems) {
-    // Neither is addressed, so neither contends for a port and the comparison
-    // has nothing to compare: the same pair `bindMemoryPorts` skips.
+    // Neither is addressed, so neither contends for a port.
     if (!m.scattered && !m.isRom) {
       m.readConcurrency = dp.portConcurrency(m.id, /*writes=*/false);
       m.writeConcurrency = dp.portConcurrency(m.id, /*writes=*/true);
     }
     // A scattered argument publishes its cells rather than an address bus, so
-    // its groups are the elements; every other array publishes one per bound
-    // port, plus one for each group a child masters on it.
+    // its groups are the elements. Every other array publishes one per bound
+    // port, plus one per group a child masters on it.
     m.boundaryPorts = m.elemPorts.size();
     for (AccRef r : dp.readPorts)
       m.boundaryPorts += r.id == m.id;
@@ -529,11 +495,11 @@ void DatapathBuilder::enumerateBoundaryPorts() {
       continue;
     std::string owner = memOwnerName(dp, m);
     // A scattered argument's ports are per element, enumerated once for the
-    // memory (not per access), since every access reads them all and selects.
-    // Its accesses keep the default portIdx/portBase; nothing addresses them.
+    // memory rather than per access, since every access reads them all and
+    // selects. Its accesses keep the default portIdx/portBase.
     if (m.scattered) {
-      // The directions actually used decide the names: an argument used one way
-      // takes the bare `A_k`, used both ways its two ports need telling apart.
+      // The directions used decide the names: an argument used one way takes
+      // the bare `A_k`, used both ways its two ports need telling apart.
       bool reads = false, writes = false;
       for (const MemUnit::Access &acc : m.accesses)
         (acc.isWrite ? writes : reads) = true;
@@ -551,15 +517,11 @@ void DatapathBuilder::enumerateBoundaryPorts() {
     }
     // One boundary port group per bound port: accesses that provably never
     // issue together share a port, and so share the interface the caller backs
-    // the array with, driving it through a select on their own activation. A
-    // group per access instead makes every caller provide that many interfaces
-    // for bandwidth the schedule never asks for.
+    // the array with, driving it through a select on their own activation.
     //
     // Keyed by bank as well as port, since a port index is one per bank and two
-    // accesses routed to different banks are different interfaces. A
-    // data-dependent banked access spans every interface, and `bindMemoryPorts`
-    // already gave it a port of its own. One map per direction, since the two
-    // number their groups in their own port list.
+    // accesses routed to different banks are different interfaces. One map per
+    // direction, since the two number their groups in their own port list.
     llvm::SmallDenseMap<std::pair<unsigned, unsigned>, unsigned> groupOfPort[2];
     for (auto [a, acc] : llvm::enumerate(m.accesses)) {
       auto &ports = acc.isWrite ? dp.writePorts : dp.readPorts;
@@ -576,7 +538,7 @@ void DatapathBuilder::enumerateBoundaryPorts() {
       ports.push_back({m.id, unsigned(a)});
     }
   }
-  // One port group per accessor of a (memory, role), concurrent and un-muxed: a
+  // One port group per accessor of a (memory, role), concurrent and un-muxed. A
   // mux would time-share the port a second accessor exists to avoid.
   for (CallUnit &cu : dp.calls)
     for (CallUnit::MemArg &ma : cu.memArgs)

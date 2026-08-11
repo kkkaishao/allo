@@ -26,9 +26,9 @@ using namespace circt;
 
 namespace {
 
-/// The accesses of one physical port: its read, its write, and every write of
-/// the memory where the writes could not be split at all. They share one
-/// `always` block, which is what a read and a write of one RAM port are.
+/// The accesses of one physical port: its read and its write, or every write
+/// of the memory where the writes could not be split. They share one `always`
+/// block, the shape a RAM port infers from.
 struct MemPort {
   SmallVector<seq::WritePortOp> writes;
   seq::ReadPortOp read; // null where the port only writes
@@ -58,8 +58,8 @@ void lowerMemory(seq::HLMemOp mem) {
   Value clk = mem.getClk();
   StringRef name = mem.getName();
   auto array = sv::RegOp::create(b, loc, arrayTy, mem.getNameAttr());
-  // Pin the array to the structure the device priced it as; left to itself the
-  // synthesizer picks one of its own.
+  // Pin the array to the structure the device priced it as; without this the
+  // synthesizer chooses.
   if (auto style = mem->getAttrOfType<StringAttr>(kRamStyleAttr)) {
     std::string expr = ("\"" + style.getValue() + "\"").str();
     sv::setSVAttributes(
@@ -85,9 +85,9 @@ void lowerMemory(seq::HLMemOp mem) {
 
   // One `always` block per physical port (`allo.mem.port`): the write and the
   // read bound to one port address the array in a single process off one
-  // address, which is the shape a dual-port RAM infers from. An access carrying
-  // no tag shares with nothing, since a FIFO's two ends, lowered before this
-  // pass, can push and pop in one cycle.
+  // address, the shape a dual-port RAM infers from. An access carrying no tag
+  // shares with nothing, a FIFO's two ends being able to push and pop in one
+  // cycle.
   SmallVector<MemPort> ports;
   llvm::DenseMap<unsigned, unsigned> byTag;
   auto portOf = [&](Operation *op) -> MemPort & {
@@ -128,9 +128,8 @@ void lowerMemory(seq::HLMemOp mem) {
   Value hwClk = seq::FromClockOp::create(b, clk.getLoc(), clk);
   for (MemPort &group : ports) {
     // A port has one address bus: its write owns it on the cycle it commits and
-    // its read takes it the rest of the time. What the read takes back on a
-    // write cycle is a datum nothing samples, the two having been proved never
-    // to issue together.
+    // its read takes it the rest of the time. What the read returns on a write
+    // cycle is unsampled, the two never issuing together.
     Value addr, reg;
     std::string rdName;
     if (group.read) {
@@ -168,8 +167,7 @@ void lowerMemory(seq::HLMemOp mem) {
       continue;
     // The port reads at latency 1; anything deeper is an output pipeline
     // register on the data, which is the register a block RAM or an UltraRAM
-    // has. Registering the address instead lands on the same cycle and throws
-    // that register away.
+    // has.
     Location rloc = group.read.getLoc();
     Value data = sv::ReadInOutOp::create(b, rloc, reg);
     for (unsigned d = 1; d < group.read.getLatency(); ++d)

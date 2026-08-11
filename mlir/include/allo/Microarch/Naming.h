@@ -139,10 +139,8 @@ std::string resultPortName(unsigned i, unsigned n);
 // never the manifest, so CIRCT is free to uniquify them.
 //===----------------------------------------------------------------------===//
 
-/// What an array is called before any bank, instance or field suffix: the one
-/// resolution of a MemUnit's owner token, disambiguated against the module's
-/// other memrefs. Every composed memory name and every diagnostic naming an
-/// array starts here.
+/// What an array is called before any bank, instance or field suffix: a
+/// MemUnit's owner token, disambiguated against the module's other memrefs.
 std::string memOwnerName(const Datapath &dp, const MemUnit &m);
 /// On-chip storage for the buffer named \p owner: bank \p bank when it is one
 /// of \p numBanks, and instance \p inst when the bank is held in \p instances
@@ -153,11 +151,9 @@ std::string memCellName(llvm::StringRef owner, unsigned numBanks, unsigned bank,
 std::string memCellName(const Datapath &dp, const MemUnit &m, unsigned bank,
                         unsigned inst = 0);
 /// The buffer's own name, carrying no instance index: what the report calls the
-/// array and what a reader looks it up by. Apart from `memCellName` because how
-/// many cells hold an array is not part of its identity.
+/// array and what a reader looks it up by.
 std::string memArrayName(const Datapath &dp, const MemUnit &m);
 /// `<owner>_<k>`: element \p k of an internal array scattered into registers.
-/// The index is bare, as `elemBase` spells a scattered argument's.
 std::string memElemName(const Datapath &dp, const MemUnit &m, unsigned k);
 /// `r<region>_<sig>`: a region's control-plane signal (`run`, `issue`, `iv`,
 /// `phase`, `done`, `ce`). The StringRef form takes an already-formed tag

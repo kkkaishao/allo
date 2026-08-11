@@ -502,7 +502,7 @@ def DCPathOperatorOp : DCPath_Op<"dcp.operator",
     with. Combinational ops do NOT get a `dcp.operator`; they take the
     `dcp.compute` `comb_kind` path, with their chaining delay in `dcp.device`.
 
-    `uses` prices the IP core over ONE parameter, an operand width, exactly as
+    `uses` prices the IP core over one parameter, an operand width, exactly as
     `dcp.comb`'s does: one `#allo.res_use` per term and a resource's cost the
     sum of its terms. `signature` already
     pins the widths, so in practice every factor is a `const` and the parameter
@@ -555,7 +555,7 @@ def DCPathCombOp : DCPath_Op<"dcp.comb",
     kind (`add`/`sub`/`cmp`/...), coarser than a `dcp.compute`'s `comb_kind`
     because a device characterizes "an integer add", not `addi` against `subi`.
 
-    `uses` prices it over ONE parameter, an operand width: one
+    `uses` prices it over one parameter, an operand width: one
     `#allo.res_use` per term, and what a resource costs is the sum of the terms
     naming it.
 
@@ -598,28 +598,24 @@ def DCPathStorageOp : DCPath_Op<"dcp.storage",
     every access against the row its array resolves to and the emitter builds
     the ports at exactly those latencies, so the two cannot drift.
 
-    `inst_rd`/`inst_wr` are how many ports of each direction ONE INSTANCE of
-    the structure has, omitted where it has no limit, and `inst_p` how many it
-    has altogether, each serving a read or a write in a cycle. A `scatter` row
-    declares none of them, holding one cell per element and no addressed port.
+    `inst_rd`/`inst_wr` are how many ports of each direction one instance of the
+    structure has, omitted where it has no limit, and `inst_p` how many it has
+    altogether, each serving a read or a write in a cycle. A `scatter` row
+    declares none of them. A block RAM's two ports each read or write, so two
+    writers and a concurrent reader take three of them and `inst_p` says so; a
+    row whose directions are independent structures, as a LUT RAM's single write
+    port and its one addressed read are, declares no `inst_p`.
 
-    A block RAM's two ports each read or write, so two writers and a concurrent
-    reader take three of them and `inst_p` is what says so. A row whose
-    directions are independent structures, as a LUT RAM's single write port and
-    its one addressed read are, declares no `inst_p`.
-
-    None of the three is what an ARRAY held here may be given, which is derived
-    instead: the compiler decides how many instances to hold an array in, every
-    copy taking every write and serving `inst_rd` reads of its own.
+    All three limit one instance, not the array held here: the compiler decides
+    how many instances an array takes, every copy taking every write and serving
+    `inst_rd` reads of its own.
 
     `style` is the vendor attribute that pins an array to this structure,
     stamped on the emitted array declaration (Xilinx spells it
-    `ram_style = "block"`). Omitted where the part has no such attribute, and
-    the synthesizer then chooses for itself.
+    `ram_style = "block"`). Omitted where the part has no such attribute.
 
     `no_init` marks a structure that powers up undefined, as an UltraRAM does.
-    An array declared with compile-time contents is refused there rather than
-    silently built out of something else.
+    An array declared with compile-time contents is refused there.
 
     `uses` carries one `#allo.res_use` per term, and what a resource costs is
     the sum of the terms naming it. Storage carries TWO parameters,

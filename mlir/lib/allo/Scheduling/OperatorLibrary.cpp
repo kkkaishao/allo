@@ -157,8 +157,7 @@ bool allIntegerOperands(Operation *op) {
 // Every library row that could realize \p op, in declaration order: an advanced
 // row matches its raw mnemonic and exact element-type list, an IP row its
 // abstract kind and exact element-type list, a comb row its abstract kind.
-// A device offering both an IP and a comb realization of one kind puts two rows
-// here; `selectImplementation` ranks them.
+// `selectImplementation` ranks the result.
 llvm::SmallVector<const OperatorEntry *, 2>
 matchEntries(const std::vector<OperatorEntry> &advanced,
              const std::vector<OperatorEntry> &entries, Operation *op) {
@@ -259,9 +258,9 @@ OperatorLibrary OperatorLibrary::fromModule(ModuleOp module) {
   dcp::DCPathDeviceOp device;
   module.walk([&](dcp::DCPathDeviceOp d) { device = d; });
 
-  // Comb and IP rows share `entries`, both as candidates for an operation of
-  // their kind. Order carries no ranking beyond the last comb row of a kind
-  // winning over an earlier one; `selectImplementation` decides the rest.
+  // Comb and IP rows share `entries`, both candidates for an operation of their
+  // kind. The last comb row of a kind wins over an earlier one;
+  // `selectImplementation` decides the rest.
   if (device) {
     lib.regFloor = device.getRegDelay().convertToDouble();
     for (dcp::DCPathCombOp comb :
@@ -293,8 +292,7 @@ OperatorLibrary OperatorLibrary::fromModule(ModuleOp module) {
   }
 
   // IP rows in injection order, built-in then user. Two cores of one kind and
-  // signature are both candidates, and the ranking rather than the injection
-  // order says which an operation binds.
+  // signature are both candidates; the ranking, not the order, picks one.
   module.walk([&](dcp::DCPathOperatorOp op) {
     OperatorEntry e;
     e.latency = (uint32_t)op.getLatency();
@@ -324,9 +322,8 @@ OperatorLibrary OperatorLibrary::fromModule(ModuleOp module) {
 const OperatorEntry *OperatorLibrary::selectImplementation(
     ArrayRef<const OperatorEntry *> candidates, int64_t width) const {
   // Shortest, then cheapest at this width, then the first symbol: a total order
-  // over the IPs, so the choice does not depend on the order they were injected
-  // in. A core the device did not measure at this width ranks last rather than
-  // free.
+  // over the IPs, independent of injection order. A core the device did not
+  // measure at this width ranks last rather than free.
   auto rank = [&](const OperatorEntry *e) {
     return std::make_tuple(
         e->latency,
@@ -342,7 +339,7 @@ const OperatorEntry *OperatorLibrary::selectImplementation(
   if (best)
     return best;
   // No IP: the combinational row, the last of its kind the device declared,
-  // which is the one `combEntry` reads too.
+  // which is what `combEntry` reads.
   for (const OperatorEntry *e : candidates)
     if (e->comb)
       best = e;
@@ -504,8 +501,7 @@ OperatorChar OperatorLibrary::lookup(Operation *op) const {
   assert(!asMemAccess(op) &&
          "the operator library was asked to time a memory access");
 
-  // Every row is characterized over one parameter, an operand width, which is
-  // also what the price tie-break between two candidates is read at.
+  // Every row is characterized over one parameter, an operand width.
   int64_t width = combParamWidth(op);
   const OperatorEntry *e =
       selectImplementation(matchEntries(advancedEntries, entries, op), width);
@@ -528,10 +524,9 @@ OperatorChar OperatorLibrary::lookup(Operation *op) const {
     e = &defaultEntry;
   }
 
-  // What the row is worth at this operation's width, both numbers together: a
-  // row the device measured over other widths gives it neither a delay nor an
-  // area. Reported here, where the width and the row meet, and left unrealized
-  // so the pre-schedule realizability check refuses the program.
+  // A row measured over other widths gives this operation neither a delay nor
+  // an area, so it comes back unrealized and the pre-schedule realizability
+  // check refuses the program.
   std::optional<double> delay =
       e->comb ? e->delay.evaluate(width) : std::optional<double>(0.0);
   std::optional<int64_t> price = priceOf(e->uses, {width});

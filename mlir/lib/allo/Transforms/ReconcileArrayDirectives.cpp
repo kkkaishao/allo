@@ -66,7 +66,7 @@ struct Carrier {
 
 // The carrier \p memref resolves to, or nullopt when this pass cannot name one.
 // A rank-preserving `memref.cast` is followed, since `allo.part` names
-// dimensions and a cast leaves them lined up; a view that RESHAPES is not, as
+// dimensions and a cast leaves them lined up; a view that reshapes is not, as
 // its dimensions are not the underlying array's.
 static std::optional<Carrier> carrierOf(Value memref) {
   while (auto castOp = memref.getDefiningOp<memref::CastOp>()) {
@@ -160,7 +160,7 @@ struct ReconcileArrayDirectivesPass
       return signalPassFailure();
 
     // Group in discovery order: the diagnostics below name the carriers that
-    // disagree, and a hashed iteration would leave WHICH one to the allocator.
+    // disagree, and a hashed iteration would leave which one to the allocator.
     SmallVector<SmallVector<unsigned>> classes;
     DenseMap<unsigned, unsigned> classOf;
     for (unsigned i = 0, e = arrays.carriers.size(); i < e; ++i) {
@@ -214,7 +214,7 @@ struct ReconcileArrayDirectivesPass
   }
 
   // Settle one physical array: join every partition stated on any of its
-  // carriers, then write the result back to all of them. ONE sweep reaches the
+  // carriers, then write the result back to all of them. One sweep reaches the
   // fixpoint, since which carriers denote one array follows from the call graph
   // alone and never from the attributes, and the join is associative.
   LogicalResult reconcile(Arrays &arrays, ArrayRef<unsigned> members) {
@@ -249,7 +249,7 @@ struct ReconcileArrayDirectivesPass
       Carrier &c = arrays.carriers[m];
       if (c.part() == joined)
         continue;
-      // Reaching the top's arguments changes the DESIGN's boundary: each bank
+      // Reaching the top's arguments changes the design's boundary: each bank
       // becomes its own port group and the host shards the array by bank.
       if (c.op == topFunc.getOperation())
         info(Stage::Prep, topFunc)
@@ -262,16 +262,11 @@ struct ReconcileArrayDirectivesPass
     return success();
   }
 
-  // Settle the same array's `allo.bind.storage`. Its two axes reconcile
-  // differently.
-  //
-  // `impl` names the structure and one array is held in one of them, so two
-  // carriers naming different rows are refused whatever their timing: rows of
-  // equal latency are still different hardware and only one gets built.
-  //
-  // `type` asks for a port topology and those form a chain, so the carriers
-  // take the one that covers the others. A side that asked for less is not in
-  // conflict; it used fewer of the ports the array has.
+  // Settle the same array's `allo.bind.storage`, whose two axes reconcile
+  // differently. `impl` names the structure and one array is held in one of
+  // them, so two carriers naming different rows are refused. `type` asks for a
+  // port topology and those form a chain, so the carriers take the one covering
+  // the others; a side that asked for less is not in conflict.
   LogicalResult reconcileBinding(Arrays &arrays, ArrayRef<unsigned> members) {
     DictionaryAttr impl, port; // the carrier each axis was taken from
     for (unsigned m : members) {
@@ -296,8 +291,8 @@ struct ReconcileArrayDirectivesPass
         }
         impl = here;
       }
-      // The most capable topology wins, and with it the string that spelled it,
-      // so nothing here has to compose a `type` the vocabulary may not have.
+      // Carry over the string that spelled the winning topology, rather than
+      // composing a `type` the vocabulary may not have.
       if (bs.port &&
           (!port || !topologyCovers(*parseBindStorage(port).port, *bs.port)))
         port = here;

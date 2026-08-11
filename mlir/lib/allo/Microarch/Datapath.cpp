@@ -113,9 +113,9 @@ std::optional<int64_t> Datapath::constantOf(const Source &s) const {
 
 unsigned Datapath::readyCycle(const Source &s) const {
   switch (s.kind) {
-  // A call is the one producer whose result does NOT land at `stage +
-  // latency`: it lands at its region-relative issue plus the CALLEE's whole
-  // start->done depth. Indeterminate calls are guarded earlier.
+  // A call result does not land at `stage + latency`: it lands at its
+  // region-relative issue plus the callee's whole start->done depth.
+  // Indeterminate calls are guarded earlier.
   case Source::Kind::Call: {
     const CallUnit &cu = calls[s.id];
     assert(cu.latency && "readyCycle of an indeterminate call result");
@@ -151,8 +151,6 @@ unsigned Datapath::readyCycle(const Source &s) const {
 Datapath::Datapath(dcp::DCPathModuleOp func, const BindingPolicy &policy,
                    const DeviceModel &dev, float cycleTime,
                    const CalleeCtx &callees, bool isTop) {
-  // What the model is OF, settled here rather than half here and half in the
-  // builder: both are properties of the request, not of anything derived.
   this->func = func;
   atTop = isTop;
   DatapathBuilder builder(*this, func, policy, dev, cycleTime, callees);
@@ -357,11 +355,9 @@ double muxLevelDelay(const OperatorLibrary &lib) {
   // width buys mux LUTs (`set_mux_uses`) rather than levels. The full row delay
   // and not the marginal one: a level of a wide one-hot select pays routing
   // comparable to a whole register-to-register hop, not the LUT hop a narrow
-  // cone pays.
-  //
-  // The row alone under-predicts a wide select, `muxLevels` seeing fan-in and
-  // not width, so it carries an explicit margin rather than the optimism a
-  // reject gate cannot afford (`kMuxDelayMargin`).
+  // cone pays. The row alone under-predicts a wide select, `muxLevels` seeing
+  // fan-in and not width, so it carries an explicit margin
+  // (`kMuxDelayMargin`).
   return kMuxDelayMargin * lib.combDelay(OpKind::Or, 1);
 }
 
@@ -385,8 +381,8 @@ Datapath::PortRelation Datapath::portGraph(MemId id,
   };
   // Does call \p a precede \p b transitively? A channel-joined pair in a
   // concurrent container is deliberately NOT ordered, and writes from such a
-  // pair really are simultaneous. Memoized: the pair loop below is quadratic in
-  // the accesses and this walk is the only part of it that is not constant.
+  // pair really are simultaneous. Memoized, since the pair loop below is
+  // quadratic in the accesses.
   llvm::DenseMap<std::pair<CallId, CallId>, bool> precedes;
   auto callPrecedes = [&](CallId a, CallId b) {
     auto [it, isNew] = precedes.try_emplace({a, b}, false);
@@ -406,7 +402,7 @@ Datapath::PortRelation Datapath::portGraph(MemId id,
     return false;
   };
 
-  // When each vertex runs, beside the identity `PortVertex` publishes.
+  // When each vertex runs, beside the identity in `PortVertex`.
   struct When {
     RegionId top, region;
     unsigned residue;

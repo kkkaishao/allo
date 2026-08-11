@@ -54,9 +54,7 @@ MLIR_CAPI_EXPORTED MlirTypeID alloPartitionAttrGetTypeID(void);
 // `Get` takes the underlying I32 enum case, which `GetValue` round-trips.
 // `GetByName` takes the case's mnemonic instead, the spelling that appears in
 // the assembly (`mul` of `#allo<op_kind mul>`), and returns a null attribute
-// for a name the enum does not have. A caller outside the compiler uses it
-// rather than transcribing the numbering, which goes stale when a case is
-// inserted.
+// for a name the enum does not have.
 //===----------------------------------------------------------------------===//
 
 #define ALLO_ENUM_ATTR_CAPI_DECL(Name)                                         \
@@ -90,9 +88,8 @@ ALLO_ENUM_ATTR_CAPI_DECL(CostForm)
 //===----------------------------------------------------------------------===//
 // CostAttr  (#allo.cost<form, [coeffs], [arms]>)
 //
-// `form` is an `allo::CostFormEnum` case, which `alloCostFormAttrGetByName`
-// resolves from its mnemonic. `arms` holds the two arms of a `piecewise` and
-// is empty for every other form.
+// `form` is an `allo::CostFormEnum` case. `arms` holds the two arms of a
+// `piecewise` and is empty for every other form.
 //===----------------------------------------------------------------------===//
 
 MLIR_CAPI_EXPORTED bool alloAttributeIsACost(MlirAttribute attr);
@@ -118,8 +115,7 @@ MLIR_CAPI_EXPORTED MlirAttribute alloCostAttrUnmeasuredAt(MlirAttribute attr,
                                                           int64_t param);
 
 /// The first and last point a `table` or an `interp` was measured at. False,
-/// leaving both alone, for every other form, which is a shape and has no
-/// measured domain.
+/// leaving both alone, for every other form.
 MLIR_CAPI_EXPORTED bool alloCostAttrGetMeasuredDomain(MlirAttribute attr,
                                                       int64_t *first,
                                                       int64_t *last);
@@ -163,18 +159,15 @@ typedef void (*AlloResourceUseCallback)(MlirStringRef resource, int64_t amount,
 /// Evaluates `uses`, an `#allo.res_use` array, at the `nParams` parameters of
 /// its realization's kind (an operand width; a multiplexer's fan-in and width;
 /// a chain's or a storage's depth and width). A null `uses` spends nothing.
-///
-/// False, with no call made, when a cost was not measured at its parameter: a
-/// measurement is read, never extrapolated.
+/// False, with no call made, when a cost was not measured at its parameter.
 MLIR_CAPI_EXPORTED bool
 alloEvaluateResourceUse(MlirAttribute uses, intptr_t nParams,
                         const int64_t *params, AlloResourceUseCallback callback,
                         void *userData);
 
-/// Evaluates one `#allo.cost` at `param` into `*value`, without rounding.
-/// Separate from the array evaluator above, whose rounding to a resource count
-/// would erase a sub-nanosecond `dcp.comb` delay. False, leaving `*value`
-/// alone, when `param` falls outside the cost's measured points.
+/// Evaluates one `#allo.cost` at `param` into `*value`, unrounded, unlike the
+/// array evaluator above. False, leaving `*value` alone, when `param` falls
+/// outside the cost's measured points.
 MLIR_CAPI_EXPORTED bool alloEvaluateCost(MlirAttribute cost, int64_t param,
                                          double *value);
 

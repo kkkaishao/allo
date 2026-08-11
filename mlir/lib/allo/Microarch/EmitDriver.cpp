@@ -39,9 +39,8 @@ namespace mlir::allo::uarch {
 
 // Declare one extern `hw.module` per operator the manifest lists, deduplicated
 // across the whole module (`opModules`, which the emitter then looks a unit's
-// module up in by name). The manifest is the SOURCE of the port shape, so the
-// declaration and the simulation model built from the same entry cannot
-// disagree about it.
+// module up in by name). The manifest entry is the source of the port shape,
+// shared with the simulation model built from it.
 //
 // The module name stems from the `dcp.operator`'s own `sym_name`, and that
 // declaration stays live until every kernel has emitted, so the symbol is
@@ -95,8 +94,7 @@ emitModule(const uarch::Datapath &dp, OpBuilder &b,
 
   // The single source for every boundary port name, shared by declaration,
   // manifest and cosim harness; it also carries the extern operator modules
-  // this kernel instantiates. Complete when it is constructed, so everything
-  // below reads it rather than adding to it.
+  // this kernel instantiates. Complete once constructed.
   iface::ModuleInterface model(dp);
   declareOperatorModules(model.operators, b, loc, opModules);
   hw::ModulePortInfo portInfo(declareModulePorts(model, b));
@@ -223,11 +221,8 @@ LogicalResult emitDatapathToHW(ModuleOp module, StringRef binding,
 
     // One emission path, whichever way the function composes: leaf, sequential
     // container and dataflow differ only in the start policy they pick. The
-    // callee context is passed whether or not this function calls anything: the
-    // post-order above means it names every module emitted so far, and a leaf
-    // simply never looks anything up in it.
+    // post-order walk above means `cc` names every module emitted so far.
     const uarch::CalleeCtx cc{modules, ifaceModels};
-    // Sealed on construction: the builder decides, and everything below reads.
     const Datapath dp(f, *policy, dev, cycleTime, cc, /*isTop=*/f == topFunc);
     LLVM_DEBUG({
       llvm::dbgs() << "// datapath for @" << f.getSymName() << "\n";

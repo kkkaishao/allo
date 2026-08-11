@@ -135,8 +135,8 @@ FuncUarch::FuncUarch(const Datapath &dp, llvm::StringRef symbol,
     mr.writesIndependent = m.writesIndependent;
     mr.rom = m.isRom;
     mr.skewed = m.skewed;
-    // A skew resolves a slot rather than a bank, and that is still a resolved
-    // partition: it is what lets the array share one port per lane.
+    // A skew resolves a slot rather than a bank, which still counts as
+    // resolved: the array shares one port per lane.
     mr.partitionResolved =
         m.numBanks <= 1 ||
         llvm::all_of(m.accesses, [](const MemUnit::Access &a) {

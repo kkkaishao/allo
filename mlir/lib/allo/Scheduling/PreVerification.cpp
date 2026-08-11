@@ -371,10 +371,9 @@ LogicalResult checkMemories(func::FuncOp func, const MemoryLibrary &memLib,
              "registers; the two cannot both hold. Drop one of them";
       return failure();
     }
-    // The contents are one array of words and the emitter realizes them as one
-    // bank: a constant table is a single `hw.aggregate_constant` and a written
-    // one a single `initial` block. A complete partition is not banking and
-    // stays legal.
+    // The emitter realizes compile-time contents as one bank: a constant table
+    // is a single `hw.aggregate_constant` and a written one a single `initial`
+    // block. A complete partition is not banking and stays legal.
     if (globalInitOf(array) && mc.layout.numBanks > 1) {
       unsupported(Stage::Prep, Code::PartitionedInitializedArray, anchor)
           << "Array " << array.getType()
@@ -412,7 +411,7 @@ LogicalResult checkMemories(func::FuncOp func, const MemoryLibrary &memLib,
     // The two axes of one directive: `type=` asks for a port topology and
     // `impl=` picks the structure that has to provide it. `characterize` keeps
     // the tighter of the two, so a directive asking for more than its structure
-    // has would silently run at the structure's ports; report it here instead.
+    // has would otherwise run at the structure's ports.
     if (auto want = requestedPortsOf(array); want && !row->ports.holds(*want)) {
       error(Stage::Prep, Code::ArrayLayoutConflict, anchor)
           << "Array " << array.getType() << " asks for a port topology of "
@@ -421,11 +420,9 @@ LogicalResult checkMemories(func::FuncOp func, const MemoryLibrary &memLib,
           << ". Drop the `type` or bind it to a storage that has them";
       return failure();
     }
-    // A structure that powers up undefined cannot be the one holding an array
-    // declared with contents; asked for it anyway, the synthesizer quietly
-    // builds something else and the design occupies what it was not priced as.
-    // A read-only table escapes this: it is realized as logic and never reaches
-    // this storage at all.
+    // A structure that powers up undefined cannot hold an array declared with
+    // contents. A read-only table escapes this: it is realized as logic and
+    // never reaches this storage.
     if (!row->canInit && globalInitOf(array) && !mc.constantTable) {
       error(Stage::Prep, Code::StorageTimingUnrealizable, anchor)
           << "Array " << array.getType()
@@ -474,16 +471,16 @@ static bool sameBanking(BankLayout &a, BankLayout &b) {
 }
 
 // What caller and callee must agree on for one array argument. The array is
-// built once, by whoever owns the storage, and the sub-kernel masters a port on
-// it, so both sides describe one structure.
+// built once and the sub-kernel masters a port on it, so both sides describe
+// one structure.
 //
 // Banking: a sub-kernel masters one port group per bank and indexes each in
 // that bank's own element space, so at a different layout the child addresses
 // the wrong elements.
 //
-// Storage: the row carries the access latency every side was scheduled at and
-// the latency the emitter builds ports at, so two rows time one memory two ways
-// and the shorter one samples before the data is valid.
+// Storage: the row carries the latency every side was scheduled at and the
+// latency the emitter builds ports at, so two rows time one memory two ways and
+// the shorter one samples before the data is valid.
 LogicalResult checkArgumentAgreement(func::FuncOp func,
                                      const MemoryLibrary &lib) {
   SymbolTableCollection syms;
@@ -509,15 +506,13 @@ LogicalResult checkArgumentAgreement(func::FuncOp func,
         return WalkResult::interrupt();
       }
       // Unlike banking, this holds for a boundary array too: its cells are the
-      // caller's, but the latency both sides read them at is one number. Two
-      // records compared, not two characterizations: the two sides are separate
-      // memrefs and only what was recorded for each can say they agree.
+      // caller's, but the latency both sides read them at is one number.
       std::string mine = resolvedStorageOf(actual);
       std::string theirs = resolvedStorageOf(param);
       if (mine == theirs)
         continue;
-      // Off `row` rather than `timing`: a name the device does not declare is
-      // the callee's own check to report, and `timing` asserts on it.
+      // `row` rather than `timing`: `timing` asserts on a name the device does
+      // not declare, which is the callee's own check to report.
       auto cycles = [&](StringRef name) {
         const StorageRealization *s = lib.row(name);
         std::string out;

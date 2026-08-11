@@ -221,8 +221,8 @@ def test_port_name_grammar():
 
     # A bare owner that is a keyword still needs the escape: an on-chip buffer
     # named `buf` carries no role suffix and collides with the gate primitive.
-    # Deeper than the auto-partition threshold, since a completely partitioned
-    # array is realized per element and its cells carry an index that already
+    # Deeper than the auto-partition threshold: a completely partitioned array
+    # is realized per element, and those cells carry an index that already
     # separates them from the keyword.
     @kernel
     def kwbuf(A: i32[32], out: i32[32]):

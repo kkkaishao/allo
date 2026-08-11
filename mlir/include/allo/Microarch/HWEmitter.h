@@ -100,11 +100,9 @@ struct RegionControl {
 // compute completion.
 //===----------------------------------------------------------------------===//
 struct DatapathFeedback {
-  // The deepest store's commit cycle as the writes were EMITTED (a stream put
-  // folds in too); 0 if the region stores nothing. `RegionBlock::drainStage` is
-  // the same number decided on the model, and `emitRegion` holds the two
-  // together: this is the hardware witness for that check, not an input to
-  // anything.
+  // The deepest store's commit cycle as the writes were emitted (a stream put
+  // folds in too); 0 if the region stores nothing. `emitRegion` checks it
+  // against `RegionBlock::drainStage`, the same number decided on the model.
   unsigned storeDrain = 0;
   // The `done` of a CallUnit region's child instance. When set it IS the
   // region's completion, bypassing the store-drain `emitDone`. Null for a
@@ -183,9 +181,9 @@ struct ControlEmitter {
   /// cycle is the store/result commit cycle, so a sibling starting on this done
   /// reads every committed store and survivor. A \p retrig region resets on \p
   /// start and reads 0 on the \p start cycle itself, since a completion pulse
-  /// COINCIDING with \p start would otherwise latch high on the first pass and
+  /// coinciding with \p start would otherwise latch high on the first pass and
   /// never produce a later rising edge. \p sh holds the pulse through
-  /// back-pressure, the last store/token not being committed until it is
+  /// back-pressure, the last store or token not being committed until it is
   /// accepted.
   Value emitDone(const uarch::RegionBlock &rb, Value lastIssue, Value emptyDone,
                  Value start, bool retrig, const StallShell &sh) const;
@@ -198,8 +196,7 @@ struct ControlEmitter {
 //===----------------------------------------------------------------------===//
 struct DatapathEmitter {
   EmitContext &c;
-  // The SEALED model. Emission is a pure function of it: nothing below decides
-  // anything, and a stage that would have to is in the wrong place.
+  // The sealed model. Emission is a pure function of it.
   const uarch::Datapath &dp;
   circt::hw::HWModulePortAccessor &pa;
   const llvm::StringMap<Operation *> &opModules;
@@ -241,7 +238,7 @@ struct DatapathEmitter {
     return ArrayRef<Value>(memBanks[m.id])
         .slice(bank * m.instances, m.instances);
   }
-  /// One backedge per element of a SCATTERED INTERNAL array, in flat row-major
+  /// One backedge per element of a scattered internal array, in flat row-major
   /// order: the register's own output. Declared with the array so a read can
   /// select over the elements before the stores that drive them have emitted,
   /// and resolved by `finalizeScatteredPorts` once they all have.
@@ -255,14 +252,12 @@ struct DatapathEmitter {
   DenseMap<unsigned, circt::Backedge> unitBE;    // unit id -> result backedge
   DenseMap<unsigned, Value> muxVal;              // mux id -> resolved output
 
-  /// ONE ACCESSOR's drive of a shared physical port: the terms it presents and
+  /// One accessor's drive of a shared physical port: the terms it presents and
   /// the pulse that says it is presenting. A port is reached by several
   /// accessors (the accesses of different regions, a child mastering it) while
   /// each of `hw.output`, `seq.write` and an element register takes it exactly
-  /// once, so an arm is BUILT where its accessor emits, since the terms are
-  /// accessor state (delayed counters, a stall hold, a child's own output), and
-  /// only COMBINED once every region has emitted. `commitSink` is that combine
-  /// and is the same rule for every port below.
+  /// once, so an arm is built where its accessor emits and only combined by
+  /// `commitSink` once every region has emitted.
   struct SinkArm {
     /// This accessor is driving now: a store's commit pulse, a region's
     /// accesses presenting, a child's run window. Null only where the arm holds
@@ -298,12 +293,11 @@ struct DatapathEmitter {
   /// builds an internal array's registers from them.
   DenseMap<unsigned, SmallVector<SinkArm, 1>> scatterWrites;
 
-  /// One store to an internal array, held back so the stores COLOURED onto the
+  /// One store to an internal array, held back so the stores coloured onto the
   /// same write port can be muxed onto one `seq.write`. A port per static write
   /// defeats block-RAM inference and drops the array into a register file; the
   /// colouring spreads the stores over at most two ports, which infer a true
-  /// dual port. The bank and port ROUTE the arm; they are not part of what it
-  /// presents.
+  /// dual port.
   struct SharedWrite {
     unsigned bank; // the bank this store commits to (0 when unbanked)
     unsigned port; // the write port it was coloured onto
@@ -311,20 +305,18 @@ struct DatapathEmitter {
   };
   DenseMap<unsigned, SmallVector<SharedWrite, 2>> sharedWrites; // by MemId
 
-  /// One shared read port, keyed by (memory, bank, port). The `seq.read` is
-  /// built by `sharedReadPort` when the first access on it emits and its datum
-  /// is available from that moment, which is what lets every access take it
-  /// before the address that fetches it exists. An arm's `fired` is the second
-  /// of two selects: within a region `sharedAddress` has already picked between
-  /// that region's own accesses.
+  /// One shared read port, keyed by (memory, bank, port). `sharedReadPort`
+  /// builds the `seq.read` on the first access to reach it, so its datum is
+  /// available before the address that fetches it exists. An arm's `fired` is
+  /// the second of two selects: within a region `sharedAddress` has already
+  /// picked between that region's own accesses.
   struct SharedReadPort {
     Value data;
     circt::Backedge addr;
     SmallVector<SinkArm, 1> arms;
   };
-  /// A MapVector for the same reason `boundaryWrites` is one: the finalize
-  /// iterates it to drive the ports, and the module must not depend on a hash
-  /// order.
+  /// A MapVector, not a DenseMap: the finalize iterates it to drive the ports,
+  /// and the emitted module must not depend on a hash order.
   llvm::MapVector<std::tuple<unsigned, unsigned, unsigned>, SharedReadPort>
       sharedReads;
 
@@ -334,7 +326,7 @@ struct DatapathEmitter {
   /// drive the ports, and the emitted module must not depend on a hash order.
   llvm::MapVector<unsigned, SmallVector<SinkArm, 2>> boundaryWrites;
 
-  /// The same for a boundary READ port group's address output, indexed by
+  /// The same for a boundary read port group's address output, indexed by
   /// `MemUnit::Access::portIdx`. A group the reads of several regions share is
   /// one module output, so only `finalizeSharedReadPorts` may drive it.
   llvm::MapVector<unsigned, SmallVector<SinkArm, 1>> boundaryReads;
@@ -411,7 +403,7 @@ struct DatapathEmitter {
   /// width (compared against literal element numbers, not used to index).
   Value scatterIndex(const uarch::MemUnit &m,
                      const uarch::MemUnit::Access &acc);
-  /// The element registers of a scattered INTERNAL array, in element order.
+  /// The element registers of a scattered internal array, in element order.
   SmallVector<Value> scatterValues(unsigned id);
   /// \p v delayed to land with the datum of a read of \p m: a bank select and a
   /// constant table's own output both have to reach the consumer on the cycle
@@ -454,15 +446,14 @@ struct DatapathEmitter {
   /// Region \p region's stall shell; rigid for an unregistered region.
   StallShell shellFor(unsigned region) const { return shellOf.lookup(region); }
 
-  /// A region's datapath emits in ONE order, and the units are its pivot: the
-  /// pair below states that order once for both the leaf path (`emit`) and a
-  /// container's condition cone (`emitConditionRegion`).
-  ///
-  /// Before: the delay chains, the unit backedges (a read address may read a
-  /// unit emitted later) and the reads, whose data the units consume.
+  /// The part of \p rb's datapath that precedes the units, for both the leaf
+  /// path (`emit`) and a container's condition cone (`emitConditionRegion`):
+  /// the delay chains, the unit backedges (a read address may read a unit
+  /// emitted later) and the reads, whose data the units consume.
   void emitBeforeUnits(const uarch::RegionBlock &rb, Value issue);
-  /// After: the register heads, then the boundary read addresses, which may be
-  /// computed by a unit and so need its filled value rather than its backedge.
+  /// The part that follows the units: the register heads, then the boundary
+  /// read addresses, which may be computed by a unit and so need its filled
+  /// value rather than its backedge.
   void emitAfterUnits(const uarch::RegionBlock &rb, Value issue);
 
   void emitRegisters(const uarch::RegionBlock &rb);
@@ -474,13 +465,12 @@ struct DatapathEmitter {
   /// serve is a boundary port group, whose address may be computed by a unit
   /// (`emitExternalReadAddrs`) and whose datum `bindReadPorts` already bound.
   void emitReads(const uarch::RegionBlock &rb, Value issue);
-  /// The address ONE REGION's accesses on a port present: each drives it on its
+  /// The address one region's accesses on a port present: each drives it on its
   /// own issue cycle, held with the datapath so a read frozen by back-pressure
   /// keeps re-presenting its address. \p idxs indexes `m.accesses`, all in the
   /// region \p sh and \p issue belong to. \p fired, when given, additionally
-  /// receives "one of them is presenting now", which is what a port ANOTHER
-  /// region also holds selects on; ask for it only there, since a lone region
-  /// on a port drives it unconditionally and would build the pulse for nothing.
+  /// receives "one of them is presenting now", which a port another region also
+  /// holds selects on; a lone region on a port drives it unconditionally.
   Value sharedAddress(const uarch::MemUnit &m, ArrayRef<unsigned> idxs,
                       Value issue, const StallShell &sh,
                       Value *fired = nullptr);
@@ -499,7 +489,7 @@ struct DatapathEmitter {
   /// Region \p rb's compute units: native -> comb, IP -> an instance of the
   /// extern operator module. A loop-carried input re-injects `inputInits[k][n]`
   /// on the n-th iteration; a container's own units carry none
-  /// (`assertModelInvariants`), so this is the same code wherever it runs.
+  /// (`assertModelInvariants`).
   void emitUnits(const uarch::RegionBlock &rb);
   /// Emit a sequential (CHECK/RUN) while's condition cone: the container's OWN
   /// condition memory reads plus its compute. Returns the settled condition
@@ -590,9 +580,9 @@ struct DatapathEmitter {
   /// than one region, so the group needs a select over which is presenting.
   static bool multiRegionPort(const uarch::MemUnit &m, unsigned portIdx);
   /// Whether read port \p port of \p m's bank \p bank is held by more than one
-  /// ACCESSOR: a region whose own accesses reach it, or a child that masters
-  /// it. The two kinds say they are driving in different ways, so this counts
-  /// holders rather than regions.
+  /// accessor: a region whose own accesses reach it, or a child that masters
+  /// it. Counts holders rather than regions, the two kinds saying they are
+  /// driving in different ways.
   bool sharedInternalPort(const uarch::MemUnit &m, unsigned bank,
                           unsigned port) const;
   /// Drive each merged boundary write port group from the stores coloured onto

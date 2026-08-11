@@ -56,10 +56,9 @@ public:
     resourceCycles[op] = cycles;
   }
 
-  /// How many units of EVERY resource it links to \p op holds at once. One
+  /// How many units of every resource linked to \p op it holds at once. One
   /// unless set: a write to an array held in several copies reaches all of
-  /// them, taking a port of each, and every limit it is billed against counts
-  /// those copies too.
+  /// them, taking a port of each.
   unsigned getResourceDemand(Operation *op) {
     return resourceDemand.lookup(op).value_or(1);
   }

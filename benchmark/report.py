@@ -119,9 +119,8 @@ def memories(microarch) -> list[dict]:
             "banks": m.banks,
             "writes": m.writes,
             "storage": m.storage,
-            # What it was actually built as, which is not the row: a boundary
-            # holds no cells here, a ROM is logic and a complete partition is
-            # registers.
+            # What it was built as, which is not the row: a boundary holds no
+            # cells here, a ROM is logic and a complete partition is registers.
             "realization": m.realization,
             "instances": m.cost.instances,
             # Copies the schedule reserved against; `instances` past it is read
@@ -129,17 +128,15 @@ def memories(microarch) -> list[dict]:
             "copies_budget": m.cost.copies_budget,
             "from_calls": m.cost.call_writes,
             # Which side of the array's reads the buses were coloured for: this
-            # module's own accesses, or the ports its children master. The two
-            # share one colouring, so the split says whose demand a bus carries.
+            # module's own accesses, or the ports its children master.
             "reads": m.reads,
             "call_reads": m.cost.call_reads,
             "write_ports": m.cost.write_ports,
             "read_ports": m.cost.read_ports,
             "ports": m.cost.ports,
             # What one cycle asks of one bank, against the ports built for it.
-            # The gap is what the binding spent separating accesses the schedule
-            # never issues together, and every port past the first that a read
-            # holds is a further copy of the whole array.
+            # Every port past the first that a read holds is a further copy of
+            # the whole array.
             "read_concurrency": m.cost.read_concurrency,
             "write_concurrency": m.cost.write_concurrency,
             "boundary_ports": m.cost.boundary_ports,
@@ -159,9 +156,6 @@ def area_of(q) -> dict:
         "ff": q.area.ff,
         "dsp": q.area.dsp,
         "carry8": q.area.carry8,
-        # The two memory primitives. Without them a row-selection change reads
-        # as pure LUT savings, the cost having moved somewhere the table does
-        # not show.
         "bram36": q.area.bram36,
         "uram288": q.area.uram288,
         "unit_lut": lut.get("units", 0),
@@ -176,8 +170,8 @@ def area_of(q) -> dict:
         "mem_bits": q.mem_bits,
         "unmodelled": q.unmodelled,
         "counted": sorted(q.counted),
-        # Resources the design asks for more of than the part has. Per run, not
-        # summed: a total that fits says nothing about the runs inside it.
+        # Resources the design asks for more of than the part has, per run and
+        # never summed.
         "over_capacity": {k: round(v, 3) for k, v in q.over_capacity.items()},
     }
 

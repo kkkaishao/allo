@@ -43,8 +43,7 @@ MUX_LUT_PER_BIT = {
 #: LUTs per bit of a select, as a cost over its fan-in: the measured staircase
 #: across the swept range, and past it the least-squares line through those
 #: points (slope 0.408449, intercept 0.263495, within 0.20 LUT of the last
-#: measurement). A region shares an operator over more sources than the sweep
-#: covered, where a staircase would clamp flat and charge nothing for the rest.
+#: measurement).
 MUX_LUT_COST = Piecewise(
     max(MUX_LUT_PER_BIT) + 1,
     Table(MUX_LUT_PER_BIT),
@@ -56,12 +55,11 @@ MUX_LUT_COST = Piecewise(
 #: Measured 1.6x to 3.3x of ``depth*width`` over 64..512 deep and 8..32 wide.
 MULTIWRITE_LUT_PER_BIT = 2.0
 
-#: Entries of a constant table one LUT covers, for ONE output bit. A LUT6
-#: computes any function of six inputs, so it is exactly a 64-entry one-bit
-#: lookup, and a table costs ``width * ceil(depth / 64)`` of them; the wide
-#: multiplexers stitching a deeper table together ride the slice's own F7/F8
-#: and cost nothing further. An upper bound: a table whose contents are regular
-#: minimizes below it.
+#: Entries of a constant table one LUT covers, per output bit. A LUT6 computes
+#: any function of six inputs, so it is a 64-entry one-bit lookup and a table
+#: costs ``width * ceil(depth / 64)`` of them; the wide multiplexers stitching a
+#: deeper table together ride the slice's own F7/F8 and cost nothing further.
+#: This is an upper bound: a table with regular contents minimizes below it.
 ROM_ENTRIES_PER_LUT = 64
 
 
@@ -103,11 +101,10 @@ class FabricTiming(NamedTuple):
     comb: Mapping[CombKind, Cost]
     storage: Mapping[str, StorageTiming]
     #: A channel's own timing. ``read_latency`` is 0 because ``seq.fifo`` is
-    #: show-ahead: the head is on the wire in the cycle ``valid`` is high, which
-    #: is what the emitter builds and what a consumer's register depth is solved
-    #: against. NOT CHARACTERIZED: the two delays are copied from the ``srl``
-    #: row, an SRL-backed FIFO's output being an SRL read. Retake them with a
-    #: FIFO DUT before trusting a chaining decision that turns on them.
+    #: show-ahead: the head is on the wire in the cycle ``valid`` is high. The
+    #: two delays are not characterized; they are copied from the ``srl`` row,
+    #: an SRL-backed FIFO's output being an SRL read. Retake them with a FIFO
+    #: DUT before trusting a chaining decision that turns on them.
     stream: StorageTiming
     reg_ns: float = 0.0
 
@@ -123,24 +120,20 @@ class Derived(NamedTuple):
 class StorageSpec(NamedTuple):
     """What a fabric declares about one storage realization apart from its
     timing: the resources it cannot exist without, what one instance spends over
-    ``(depth, width)``, and how many ports ONE INSTANCE of it has. A die missing
-    any of ``needs`` does not get the row.
+    ``(depth, width)``, and how many ports one instance has. A die missing any
+    of ``needs`` does not get the row.
 
     A port limit of ``None`` is no limit, which is what the scatter row takes:
-    one cell per element is not addressed.
+    one cell per element is not addressed. ``inst_ports`` is the pool the two
+    directions draw on together, declared where a port serves a read or a write
+    (a block RAM) and omitted where the directions are independent structures (a
+    LUT RAM's write port against its one addressed read). All three are per
+    instance, not per array: the compiler decides how many instances hold an
+    array, every copy taking every write and serving ``inst_reads`` reads of its
+    own.
 
-    ``inst_ports`` is the pool the two directions draw on together, declared
-    where a port serves a read or a write (a block RAM) and omitted where the
-    directions are independent structures (a LUT RAM's write port against its
-    one addressed read).
-
-    None of the three says what an ARRAY held here may be given: the compiler
-    decides how many instances to hold it in, every copy taking every write and
-    serving ``inst_reads`` reads of its own.
-
-    ``ram_style`` is the vendor attribute that pins an array to the row, so
-    that what the part builds is what the device priced, and ``can_init`` is
-    whether the structure comes up holding contents at all."""
+    ``ram_style`` is the vendor attribute that pins an array to the row;
+    ``can_init`` is whether the structure comes up holding contents."""
 
     needs: tuple[str, ...]
     uses: Callable[[Mapping[str, Resource]], dict]
@@ -157,8 +150,8 @@ class IPRow(NamedTuple):
     own symbol and area.
 
     Several rows of one archetype are candidates the library chooses between.
-    ``mnemonic`` overrides the stem of the symbol, which is how two rows that
-    share a latency are still named apart; ``None`` takes the archetype's own.
+    ``mnemonic`` overrides the stem of the symbol so two rows sharing a latency
+    are named apart; ``None`` takes the archetype's own.
     """
 
     latency: int

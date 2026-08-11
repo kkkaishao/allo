@@ -19,10 +19,10 @@ namespace mlir::allo::uarch {
 
 /// The memref a `dcp.load` / `dcp.store` accesses; null for any other op.
 Value dcpMemref(Operation *op);
-/// Every op of \p regionOp that binds a resource: its body, plus a guard's ELSE
-/// branch, which the body alone does not report. A nested region is visited in
-/// its own turn, so this does not recurse. Shared by the facts sweep and the
-/// binding walk, which must enumerate the same ops in the same order.
+/// Every op of \p regionOp that binds a resource: its body, plus a guard's else
+/// branch. A nested region is visited in its own turn, so this does not
+/// recurse. The facts sweep and the binding walk must enumerate the same ops in
+/// the same order.
 void forEachBodyOp(Operation *regionOp,
                    llvm::function_ref<void(Operation *)> fn);
 
@@ -58,9 +58,8 @@ struct DatapathBuilder {
   llvm::DenseMap<Operation *, unsigned> regionIdxOf;
 
   // Interconnect-derivation scratch (transient; see resolveEdges).
-  // A delay chain is keyed by (held value, consuming region): the SAME value
-  // (an enclosing loop's counter) can be read in several nested regions, each
-  // needing its own chain built in its own region.
+  // A delay chain is keyed by (held value, consuming region): one value read in
+  // several nested regions needs its own chain in each.
   using RegKey = std::pair<::mlir::Value, unsigned>;
   struct Edge {  // an input slot's driver, and the delay it owes before landing
     Source base; // what drives the head of the chain
@@ -79,8 +78,8 @@ struct DatapathBuilder {
     llvm::SmallVector<Source, 2> sources;    // parallel to ops
     llvm::SmallVector<Mux::Phase, 2> phases; // parallel to ops
   };
-  // Keyed by the slot each edge will patch, which takes at most one: the
-  // address reduction withdraws by slot, and chains are built in record order.
+  // Keyed by the slot each edge patches; a slot takes at most one. Chains are
+  // built in record order.
   llvm::MapVector<Source *, Edge> edges;
   std::deque<MuxBuild> muxBuilds; // a deque so `record`'s slot pointers into
                                   // `sources` survive later pushes
@@ -130,18 +129,14 @@ struct DatapathBuilder {
   /// A `dcp.compute` -> a FuncUnit, combinational or IP-realized, holding the
   /// op at its reservation slot (its issue cycle, modulo II when cyclic).
   void bindCompute(dcp::DCPathComputeOp comp, RegionBlock &rb);
-  /// Build one MemUnit per array the function touches, holding everything the
-  /// device and the layout say about it. Runs before the region walk, so an
-  /// array's WHOLE use is in view when a property of the use is decided: an
-  /// initialized array nothing writes is a constant table, and only a sweep
-  /// that has seen every access and every child port group can say so. Must
-  /// reach the same SET of ops the binding walk does, which only looks a
-  /// MemUnit up; the order here is what fixes MemId order, and the order that
-  /// fixes the boundary ports is `m.accesses`, which the binding walk alone
-  /// decides.
+  /// Build one MemUnit per array the function touches, holding what the device
+  /// and the layout say about it, and classify an initialized array nothing
+  /// writes as a constant table. Runs before the region walk and must reach the
+  /// same set of ops it does. This order fixes MemId order; the boundary port
+  /// order follows `m.accesses`, which the binding walk decides.
   void collectStorageFacts(llvm::ArrayRef<Operation *> regionOps);
   /// The MemUnit backing \p memref. A lookup, not a factory:
-  /// `collectStorageFacts` has already built every one of them.
+  /// `collectStorageFacts` has already built them all.
   MemId memIdOf(Value memref);
   /// Allocate (or reuse) a StreamChannel for the `!allo.stream` value \p stream
   /// (a func block arg). \p isInput sets the channel direction on first
@@ -187,28 +182,27 @@ struct DatapathBuilder {
   void enumerateBoundaryPorts();
   /// Bind every memory access and child port to a port of its bank
   /// (`MemUnit::Access::port`, `CallUnit::MemArg::port`) and record how many
-  /// ports each bank is built with. The boundary port enumeration, the emitter
-  /// and the report all read it. Runs after `planAccessPorts`, which settles
+  /// ports each bank is built with. Runs after `planAccessPorts`, which settles
   /// how each access reaches its memory.
   void bindMemoryPorts();
   /// Group a skewed memory's accesses into lanes that can share one port per
   /// bank (`MemUnit::skewed`, `Access::lane`), or leave it crossbarring when
-  /// they cannot. The first of the port decisions, since the plan below reads
-  /// whether the skew held.
+  /// they cannot. Runs before `planAccessPorts`, which reads whether the skew
+  /// held.
   void assignLanes();
   /// Decide how each access and each child-mastered port reaches its memory
   /// (`MemUnit::Access::plan`, `CallUnit::MemArg::plan`). Runs before
   /// `bindMemoryPorts`, which hands out ports along the plan it settles.
   void planAccessPorts();
   /// Ports one bank comes out of a `planPorts` colouring with: split by
-  /// direction, and counted outright, which is below their sum wherever a port
-  /// carries both. `colours` is the whole memory's count, where a second
-  /// colouring of the other direction starts numbering.
+  /// direction, plus `total`, which is below their sum wherever a port carries
+  /// both. `colours` is the whole memory's count, where a second colouring of
+  /// the other direction starts numbering.
   struct PortCounts {
     unsigned reads = 0, writes = 0, total = 0, colours = 0;
   };
-  /// One candidate binding of a memory's ports, decided without touching the
-  /// model so two of them can be compared before either is committed.
+  /// One candidate binding of a memory's ports, held outside the model so two
+  /// can be compared before either is committed.
   struct PortAssignment {
     /// The port each vertex of `Datapath::portGraph`'s order takes, already
     /// offset by the `base` it was planned at.
@@ -223,10 +217,9 @@ struct DatapathBuilder {
   };
   /// Colour one memory's port graph. \p writes picks a direction, or nullopt
   /// takes both together. \p base offsets the numbering so a second, separate
-  /// colouring cannot collide with the first.
-  ///
-  /// Returns nullopt only from a both-directions pass whose writes did not
-  /// split, which it cannot express. A pass given a direction always plans.
+  /// colouring cannot collide with the first. Returns nullopt only from a
+  /// both-directions pass whose writes did not split; a pass given a direction
+  /// always plans.
   std::optional<PortAssignment>
   planPorts(const MemUnit &m, std::optional<bool> writes, unsigned base);
   /// Write \p pa into `MemUnit::Access::port` / `CallUnit::MemArg::port`, and
@@ -234,13 +227,13 @@ struct DatapathBuilder {
   void commitPorts(MemUnit &m, const PortAssignment &pa);
   /// Record what each memory's ports cost against what its schedule asks:
   /// `MemUnit::{readConcurrency, writeConcurrency, boundaryPorts}`. Measures
-  /// only; what the measurements are worth reporting is `checkInputLegality`.
-  /// Runs after `enumerateBoundaryPorts`, whose groups it counts.
+  /// only; `checkInputLegality` decides what is worth reporting. Runs after
+  /// `enumerateBoundaryPorts`, whose groups it counts.
   void measurePorts();
   /// Record each top-level region's composition predecessors
   /// (`rb.predecessors`): the earlier top-level siblings it must start after.
-  /// Needs the bound accesses and the region tree, so it runs after the region
-  /// walk; and it runs BEFORE the port passes, which read the ordering it
+  /// Runs after the region walk, which supplies the bound accesses and the
+  /// region tree, and before the port passes, which read the ordering it
   /// establishes (`Datapath::portGraph`).
   void recordSiblingDeps(llvm::ArrayRef<Operation *> regionOps);
   /// Scalar (non-memref) function arguments become input IOPorts.
@@ -274,16 +267,14 @@ struct DatapathBuilder {
   /// iter-arg = the loop recurrence).
   Resolved resolveOperand(Value v, Operation *consumer, unsigned ii);
   /// Resolve every unit input / memory address / store-data / stream driver
-  /// into an `Edge`. Records what each slot reads and how late; materializes
-  /// nothing, so what the delays cost is still open when it returns.
+  /// into an `Edge`, recording what each slot reads and how late. Materializes
+  /// nothing.
   void resolveEdges();
   /// Realize the delays the edges owe: the address reduction first, since a
   /// term it folds into a scaled counter withdraws its edge, then the chains
-  /// over what is left, then the muxes that pick between them.
-  ///
-  /// The LAST derivation `build()` runs, after the ports, which read nothing it
-  /// produces. Not the other way round because withdrawing an edge is the one
-  /// thing here that is not additive, so no pass may resolve a Source after it.
+  /// over what is left, then the muxes that pick between them. The last
+  /// derivation `build()` runs; withdrawing an edge is not additive, so no pass
+  /// may resolve a Source after it.
   void realizeDelays();
   /// Record a resolved edge into \p slot: a depth-0 edge ties directly, a
   /// deeper one is deferred to `edges` and patched by `insertRegisters`.
@@ -307,8 +298,7 @@ struct DatapathBuilder {
   /// slots, and materialize the shared-unit muxes.
   void insertRegisters();
   /// Record each region's terminal cycle (`RegionBlock::drainStage`). Runs
-  /// after `resolveEdges`, which re-stamps a stream put's stage and so is the
-  /// last pass that moves one.
+  /// after `resolveEdges`, the last pass that moves a stream put's stage.
   void recordDrainStages();
 };
 

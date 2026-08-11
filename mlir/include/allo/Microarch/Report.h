@@ -51,33 +51,26 @@ struct MuxClass {
 };
 
 /// What the cost model needs of one array and no reader does: the ports it was
-/// bound with, and who drives them. Grouped apart because a reader asking what
-/// an array became is answered by the fields above it.
+/// bound with, and who drives them.
 struct MemCost {
-  // Ports a child drives: several ports of one child are that child's own
-  // boundary, several children are concurrent writers, and only the second is
-  // a banking problem.
+  // Ports a child drives. Several ports of one child are that child's own
+  // boundary; several children writing is what makes a banking problem.
   unsigned callReads = 0, callWrites = 0;
   // Ports one bank is built with (`MemUnit::readPortsBuilt` and its twins).
   // `ports` is not their sum: a port of a pooled storage may carry both a read
   // and a write that never issue together.
   unsigned readPorts = 0, writePorts = 0, ports = 0;
   // Instances of the storage row each bank is held in (`MemUnit::instances`),
-  // decided once the ports are bound. What the cost model multiplies by, read
-  // rather than re-derived.
+  // decided once the ports are bound. The cost model multiplies by this.
   unsigned instances = 1;
-  // Instances the SCHEDULE reserved against (`StoragePorts::copies`), which
-  // `instances` above may exceed: the binding replicates for whatever read
-  // bandwidth it was left to serve, and this is the budget it overran.
+  // Instances the schedule reserved against (`StoragePorts::copies`), which
+  // `instances` above may exceed when the binding replicates further.
   unsigned copiesBudget = 1;
-  // Read and write ports ONE INSTANCE of the row provides, 0 for no limit,
-  // which `instances` beside it is the multiplier of. The row narrowed by the
-  // topology the array asked for, which the device table alone does not give.
+  // Read and write ports one instance of the row provides, 0 for no limit;
+  // `instances` beside it is the multiplier.
   unsigned rowReads = 0, rowWrites = 0;
   // A lower bound on what one cycle asks of this bank, per direction
-  // (`MemUnit::readConcurrency`). The ports above are what was built to serve
-  // it, and the gap is what the binding spent separating accesses the schedule
-  // never issues together. Zero for a ROM or a scattered array, neither
+  // (`MemUnit::readConcurrency`). Zero for a ROM or a scattered array, neither
   // addressed.
   unsigned readConcurrency = 0, writeConcurrency = 0;
   // Module interface groups this array contributes (`MemUnit::boundaryPorts`).
@@ -99,8 +92,7 @@ struct MemReport {
   bool external = false, scattered = false, writesIndependent = false;
   bool rom = false, skewed = false;
   /// What the module built to hold it (`MemUnit::Realization`, spelled
-  /// "boundary" / "rom" / "scatter" / "ram"), read back from the emitter rather
-  /// than re-derived.
+  /// "boundary" / "rom" / "scatter" / "ram").
   std::string realization;
   /// Whether the partition BOUGHT the bandwidth it costs: every access reaches
   /// one bank. An access the analysis could not fix takes a port on every bank,
@@ -122,8 +114,7 @@ struct CallReport {
   unsigned count = 0;
   unsigned spawns = 0;            // of those, `await` spawns rather than calls
   std::optional<int64_t> latency; // the child's declared span, when static
-  /// How those calls are released (`CallUnit::StartPolicy`), counted. A
-  /// composition-policy change moves these even where the latency does not.
+  /// How those calls are released (`CallUnit::StartPolicy`), counted.
   unsigned handshake = 0, broadcast = 0, timed = 0;
 };
 

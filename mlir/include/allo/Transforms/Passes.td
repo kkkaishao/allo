@@ -275,8 +275,8 @@ def AssignBanksPass : Pass<"assign-banks", "func::FuncOp"> {
   let description = [{
     Runs before the scheduler, once the `allo.part` attributes are final
     (`reconcile-array-directives`) and the access maps are in their final affine
-    form (after `loop-canonicalization` / `scalarize-memory`). It records the bank an
-    access reaches as an `allo.bank` attribute on the access, which
+    form (after `loop-canonicalization` / `scalarize-memory`). It records the
+    bank an access reaches as an `allo.bank` attribute on the access, which
     `convert-schedule-to-dcp` then moves onto the `dcp.load`/`dcp.store` op's
     own `bank` attribute.
 
@@ -370,7 +370,7 @@ def ResolveBankingPass : Pass<"dcp-resolve-banking"> {
 
     And the granularity differs: the bank decision is PER ACCESS (that is what
     the port model bills and what the emitter routes on), while this pass is all
-    or nothing PER ARRAY, since one unassigned user needs a crossbar over the
+    or nothing per array, since one unassigned user needs a crossbar over the
     very banks a split removes. That costs nothing in the schedule. An unsplit
     array's assigned accesses still reach one bank each and its unassigned ones
     still reach all of them, so the split changes which IR carries the banks,
@@ -622,7 +622,7 @@ def ReconcileArrayDirectivesPass
   let summary = "Give every carrier of one array the single `allo.part` and "
                 "`allo.bind.storage` its kernels agree on";
   let description = [{
-    A partition is a property of the ARRAY, but the array is named once per
+    A partition is a property of the array, but the array is named once per
     function it is visible in: a `memref.alloc`, a `memref.global`, a parameter
     of each kernel it is passed to. Each place carries its own `allo.part`, and
     every consumer reads whichever one is nearest, so left alone a callee is
@@ -645,10 +645,10 @@ def ReconcileArrayDirectivesPass
     `allo.bind.storage` rides the same classes, and its two axes reconcile
     differently. `impl` names the structure the array is held in, of which there
     is one: two carriers naming different rows are refused whatever their
-    latencies, since rows of equal timing are still different hardware. `type`
-    asks for a port topology, and those form a chain (`t2p` serves everything
-    `s2p` does, `s2p` everything `1p` does), so the carriers take the one that
-    covers the others and a side that asked for less is not in conflict.
+    latencies. `type` asks for a port topology, and those form a chain (`t2p`
+    serves everything `s2p` does, `s2p` everything `1p` does), so the carriers
+    take the one that covers the others and a side that asked for less is not in
+    conflict.
 
     Runs before `sdc-scheduling`, so a callee is scheduled knowing its banks:
     banking a composed array pays off only if the *callee* issues N accesses per

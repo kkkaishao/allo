@@ -101,9 +101,8 @@ def Interp(points: dict[int, float]) -> Cost:
     parameter between two points takes their linear interpolation, and one
     outside the first and last is not measured at all.
 
-    For a quantity that is continuous in its parameter, such as an operator's
-    delay in its operand width, which a staircase under-states at every
-    parameter between two of its points.
+    For a quantity continuous in its parameter, such as an operator's delay in
+    its operand width.
     """
     if not points:
         raise ValueError("a cost table needs at least one point")
@@ -116,8 +115,7 @@ def Interp(points: dict[int, float]) -> Cost:
 def Piecewise(bp: float, below: Cost, above: Cost) -> Cost:
     """``p < breakpoint ? below(p) : above(p)``, with arms of any form.
 
-    The general form of :func:`Step`, whose lower arm is forced proportional and
-    whose upper arm is forced constant.
+    The general form of :func:`Step`.
     """
     return Cost("piecewise", (float(bp),), (below, above))
 
@@ -207,8 +205,7 @@ def _measured_over(cost: Cost) -> str:
 
 def _unmeasured(uses: Spend, params: Sequence[int]) -> str:
     """Which cost of ``uses`` the compiler's evaluator declined to read at
-    ``params``, named for a diagnostic. Found by asking the evaluator factor by
-    factor, so the rule stays the compiler's."""
+    ``params``, named for a diagnostic."""
     for name, factors in uses:
         if len(factors) != len(params):
             continue  # a lone Tiled, which reads the whole tuple
@@ -231,8 +228,6 @@ def Tiled(bits_per_tile: int) -> Cost:
 
 
 @dataclass(frozen=True)
-# One field per fact the device states about the structure, so the count tracks
-# its vocabulary rather than any coupling between them.
 class Storage:  # pylint: disable=too-many-instance-attributes
     """A storage realization: one buildable structure an array can live in.
 
@@ -257,22 +252,19 @@ class Storage:  # pylint: disable=too-many-instance-attributes
     # limit. A completely partitioned array resolves here whatever it would
     # otherwise have taken, and a device declares at most one.
     is_scatter: bool = False
-    # Ports of each direction ONE INSTANCE of the structure has, ``None`` for no
-    # limit. What an array held here may be given is not stated but derived: the
-    # compiler decides how many instances to hold it in, every copy taking every
-    # write and serving ``inst_reads`` reads of its own.
+    # Ports of each direction one instance of the structure has, `None` for no
+    # limit. The limit is per instance, not per array: the compiler decides how
+    # many instances hold an array, every copy taking every write.
     inst_reads: int | None = None
     inst_writes: int | None = None
     # Ports one instance has altogether, each serving a read or a write in a
-    # cycle. A block RAM's two ports are one pool, so two writers and a
-    # concurrent reader need three of them and it has two. ``None`` where the
-    # directions are independent structures, as a LUT RAM's single write port
-    # against its one addressed read is. Never below either direction's limit.
+    # cycle, never below either direction's limit. `None` where the directions
+    # are independent structures, as a LUT RAM's single write port and its one
+    # addressed read are.
     inst_ports: int | None = None
     # The vendor attribute that pins an array to this structure, stamped on the
     # emitted array declaration (Xilinx spells it `ram_style = "block"`).
-    # ``None`` where the part has no such attribute or nothing can be pinned to
-    # the row, and the synthesizer then picks a structure of its own.
+    # `None` leaves the choice to the synthesizer.
     ram_style: str | None = None
     # Whether the structure can come up holding contents. False for one that
     # powers up undefined, as an UltraRAM does: an array declared with
@@ -406,7 +398,7 @@ class Device:
         model the scheduler will, rather than a second copy of the shapes.
 
         Raises where a cost was not measured at its parameter: a `Table` and an
-        `Interp` hold measurements, which are read and never extrapolated."""
+        `Interp` are read and never extrapolated."""
         if not uses:
             return {}
         from ..._mlir.dialects.allo import ResourceUseAttr
@@ -452,8 +444,6 @@ class Device:
         self.resources[name] = r
         return r
 
-    # Every argument is one independent fact the device declares about the row,
-    # and they are keyword-only, so grouping them would only add a name to spell.
     # pylint: disable-next=too-many-arguments
     def add_storage(
         self,
@@ -483,18 +473,13 @@ class Device:
         marks at most one, and one that marks none cannot hold a complete
         partition.
 
-        ``inst_reads`` / ``inst_writes`` are how many ports of each direction
-        ONE INSTANCE of the structure has, omitted where it has no limit. A
-        scatter row declares neither, having no addressed port to count.
-
-        ``inst_ports`` is how many one instance has altogether, each serving a
-        read or a write in a cycle. Declare it wherever the two directions draw
-        on one pool, as a block RAM's two ports do; omit it where they are
-        independent structures, as a LUT RAM's single write port and its one
-        addressed read are.
-
-        None of the three bounds an ARRAY: how many instances one is held in is
-        the compiler's to decide, every copy taking every write.
+        ``inst_reads`` / ``inst_writes`` are the ports of each direction one
+        instance has, omitted where there is no limit; a scatter row declares
+        neither, having no addressed port to count. ``inst_ports`` is how many
+        one instance has altogether, declared wherever the two directions draw
+        on one pool as a block RAM's two ports do. None of the three bounds an
+        array: how many instances hold one is the compiler's to decide, every
+        copy taking every write.
 
         ``ram_style`` is the vendor attribute that pins an array to this
         structure, stamped on the emitted declaration. Omit it and the
@@ -525,9 +510,6 @@ class Device:
                     f"storage {name!r} holds one cell per element, so it has no "
                     f"{role} to declare"
                 )
-        # A pool below one of the directions it serves would make that
-        # direction's own limit unreachable, so the row would be describing two
-        # different structures.
         for role, limit in limits[:2]:
             if inst_ports is not None and limit is not None and limit > inst_ports:
                 raise ValueError(
@@ -576,9 +558,8 @@ class Device:
     def set_default_storage(self, storage: Storage) -> Device:
         """Hold every array with no ``bind_storage`` here, whatever it costs.
 
-        An OVERRIDE, and a device needs none: left unset, the compiler picks
-        the cheapest row on this part that it can pin the array to, among those
-        at the least access latency. Set it to state the policy yourself.
+        Optional: left unset, the compiler picks the cheapest row on this part
+        that it can pin the array to, among those at the least access latency.
 
         Takes a realization, so defaulting to a :class:`Resource` is a type
         error rather than a name that fails to resolve much later."""
@@ -666,10 +647,9 @@ class Device:
     def set_rom_uses(self, uses: dict[Resource, Sequence]) -> Device:
         """What one ``depth`` x ``width`` constant table spends.
 
-        A read-only table is not held in a storage realization at all: it is
-        emitted as a constant array read by an index, so the part builds it out
-        of logic. That is why it is a whole-device row like the multiplexer and
-        the delay chain rather than a ``dcp.storage`` an array binds to."""
+        A read-only table is not held in a storage realization: it is emitted as
+        a constant array read by an index, and the part builds it out of
+        logic."""
         self.rom_uses = self._spend("a constant table", "depth, width", uses)
         return self
 
@@ -716,9 +696,7 @@ class Device:
 
     def remove_operator(self, operator: OperatorIP | str) -> Device:
         """Drop a core, named by handle or by symbol, and what it spends with
-        it. Several cores of one kind and signature are candidates the library
-        chooses between, so withdrawing one is how a device offers fewer.
-        Raises where the device does not declare it."""
+        it. Raises where the device does not declare it."""
         symbol = operator.symbol if isinstance(operator, OperatorIP) else operator
         found = next((o for o in self.operators if o.symbol == symbol), None)
         if found is None:
@@ -818,7 +796,6 @@ def operator_descs(operators: Sequence[OperatorIP]) -> list[OpDesc]:
 # --- injection into the scheduled module -----------------------------------
 
 
-# See mlir/include/allo/IR/AlloAttrs.td
 def inject_operators(module, device: Device):
     """Inject each device operator as a module-level ``dcp.operator`` symbol the
     scheduler and reifier match concrete ``arith.*``/``math.*`` ops onto. The

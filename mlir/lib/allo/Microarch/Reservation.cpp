@@ -36,9 +36,8 @@ bool reservationsDisjoint(const Reservation &a, const Reservation &b) {
                        [&](unsigned c) { return cyclesA.contains(c); });
 }
 
-// Every check here is an assert, so the whole sweep is debug-only: a release
-// build would otherwise compute O(units * boundOps^2) reservations and throw
-// them away.
+// Checks every unit's bound ops for identity and reservation conflicts.
+// Debug-only: the sweep costs O(units * boundOps^2) reservations.
 void verifyBinding([[maybe_unused]] const Datapath &dp) {
 #ifndef NDEBUG
   for (const RegionBlock &rb : dp.regions)

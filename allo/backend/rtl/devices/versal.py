@@ -108,9 +108,8 @@ SCATTER_STORAGE = "register"
 #: the number covers the whole path a caller sees. The trailing comment on each
 #: row is that core's achieved Fmax in MHz, a record of the characterization run
 #: and not an input to the cost model. Several rows under one archetype declare
-#: several cores, which the library then chooses between; every one of them
-#: closes at the part's default frequency, since a core that misses it is not a
-#: realization the library may pick.
+#: several cores for the library to choose between; every row closes at the
+#: part's default frequency.
 IP: Mapping[OperatorIP, IPRow | tuple[IPRow, ...]] = {
     ip.fadd: IPRow(7, {"lut": 330, "ff": 238, "dsp": 2, "carry8": 10}),  # 436
     ip.fsub: IPRow(7, {"lut": 330, "ff": 238, "dsp": 2, "carry8": 10}),  # 436
@@ -186,10 +185,10 @@ _STORAGE = {
             r["ff"]: (Linear(1.0), Linear(1.0)),
         },
     ),
-    # Distributed RAM has one write port and ONE addressed read, the two being
-    # separate structures (no pool). A second read address is a whole further
-    # copy of the array: measured 640 / 1280 / 1920 / 2560 LUT as memory at
-    # 1024x32 for one through four reads.
+    # Distributed RAM has one write port and one addressed read, in separate
+    # structures (no pool). A second read address costs a further copy of the
+    # array: measured 640 / 1280 / 1920 / 2560 LUT as memory at 1024x32 for one
+    # through four reads.
     "lutram": StorageSpec(
         ("slicem_lut",),
         lambda r: {r["slicem_lut"]: Tiled(64)},
@@ -204,8 +203,8 @@ _STORAGE = {
         inst_reads=1,
         inst_writes=1,
     ),
-    # Two ports, each reading OR writing in a cycle: hence the pool, which two
-    # writers and a concurrent reader together exceed.
+    # Two ports, each reading or writing in a cycle; two writers and a
+    # concurrent reader together exceed the pool.
     "bram": StorageSpec(
         ("bram36",),
         lambda r: {r["bram36"]: Tiled(36864)},
@@ -236,10 +235,9 @@ def _comb_uses(r: Mapping[str, Resource]) -> dict[CombKind, dict | None]:
     compare = {lut: Linear(0.5), carry8: Tiled(16)}
     minmax = {lut: Linear(1.5), carry8: Tiled(16)}
     shift = {lut: Interp({8: 15, 16: 44, 32: 107, 64: 265, 96: 427, 128: 573})}
-    # The DSP count is a whole number of slices and steps; the fabric logic
-    # around them grows with the width. Past 64 bits the partial-product tree
-    # takes more carry chains than `Tiled` charges, measured 11 against 8 at
-    # 128 bits.
+    # The DSP count steps in whole slices; the fabric logic around them grows
+    # with width. Past 64 bits the partial-product tree takes more carry chains
+    # than `Tiled` charges: measured 11 against 8 at 128 bits.
     multiply = {
         lut: Interp({8: 36, 16: 0, 32: 10, 64: 19, 96: 82, 128: 255}),
         dsp: Table({8: 0, 16: 1, 32: 3, 64: 6, 96: 15, 128: 21}),

@@ -402,21 +402,20 @@ void DatapathBuilder::bindMemory(Operation *op, Value memref, RegionBlock &rb) {
   acc.stage = dcpStart(op);
   SmallVector<Value> operands;
   dcpAddressing(op, acc.addrMap, operands);
-  // One empty slot per index operand, positional: the map names them by
-  // position, so the two are recorded together and neither is resized later.
+  // One empty slot per index operand, positional and never resized later: the
+  // map names them by position.
   acc.addr.assign(operands.size(), Source{});
-  // What `assign-banks` decided, split by what it MEANS: a skew resolves a slot
+  // What `assign-banks` decided, split by what it means: a skew resolves a slot
   // that rotates onto a bank at run time, everything else resolves the bank
-  // itself. The layout says which, so the two never have to be told apart by a
-  // flag decided in a later stage.
+  // itself.
   std::optional<unsigned> assigned =
       m.numBanks == 1 ? std::optional<unsigned>(0) : assignedBankOf(op);
   (m.layout.skew() ? acc.slot : acc.staticBank) = assigned;
-  // A slot is what no derivation off the map can confirm (the bank it names is
-  // only fixed at run time), so this would be comparing two different things.
-  // Otherwise `bankAddress` builds the offset WITHIN this bank out of
-  // `addrMap`, so where the map still resolves a bank on its own it has to be
-  // the decided one. It often cannot: the decision read the loop steps too.
+  // Skipped under a skew, where the map names a bank only at run time and there
+  // is nothing to compare. Otherwise `bankAddress` builds the offset within
+  // this bank out of `addrMap`, so where the map still resolves a bank on its
+  // own it has to be the decided one. It often cannot: the decision read the
+  // loop steps too.
   if (m.numBanks > 1 && !m.layout.skew()) {
     std::optional<int64_t> derived = staticBankOf(
         m.layout, acc.addrMap, cast<MemRefType>(m.memref.getType()).getShape());
@@ -444,8 +443,7 @@ void DatapathBuilder::bindCompute(dcp::DCPathComputeOp comp, RegionBlock &rb) {
         dev.operators.combMarginalDelay(*u.identity.comb, combParamWidth(comp));
   } else {
     // IP: the `dcp.operator` the identity names is the one copy of its timing
-    // and stall contract, read here so nothing below has to resolve the symbol
-    // again.
+    // and stall contract.
     auto opr = SymbolTable::lookupNearestSymbolFrom<dcp::DCPathOperatorOp>(
         comp, comp.getOpTypeAttr());
     assert(opr && "a dcp.compute op_type must reference a live dcp.operator");
@@ -454,7 +452,7 @@ void DatapathBuilder::bindCompute(dcp::DCPathComputeOp comp, RegionBlock &rb) {
     u.stall = opr.getStall();
     u.inDelay = opr.getInDelay().convertToDouble();
   }
-  // The one exception no library row carries, which the scheduler takes too: an
+  // The one exception no library row carries, taken by the scheduler too: an
   // operation that renames bits rather than computing them costs nothing.
   if (isZeroDelay(comp))
     u.inDelay = 0.0;
@@ -618,32 +616,29 @@ void DatapathBuilder::recordCallDeps() {
     }
   }
 
-  // The release policy, in a second pass so every predecessor edge exists: it
-  // turns on whether a call has any and on what kind they are.
+  // The release policy, in a second pass so every predecessor edge exists.
   for (const RegionBlock &rb : dp.regions) {
     bool concurrent = rb.determinacy == DeterminacyEnum::Concurrent;
     for (CallId cid : rb.callUnits) {
       CallUnit &cu = dp.calls[cid];
       bool gated = !cu.predecessors.empty();
-      // A SCHEDULED composition placed every child at a cycle, so an ungated
+      // A scheduled composition placed every child at a cycle, so an ungated
       // one is released at its offset and a gated one waits on the join.
       if (!concurrent) {
         cu.startPolicy = gated ? CallUnit::StartPolicy::Handshake
                                : CallUnit::StartPolicy::TimeTriggered;
         continue;
       }
-      // A CONCURRENT container has no schedule to release against, so an edge
+      // A concurrent container has no schedule to release against, so an edge
       // is time-triggerable only where the producer's completion cycle is
       // known: a spawn has no offset at all, a result hand-off holds only from
       // `done`, and an indeterminate producer has no cycle to name.
       bool mustJoin =
-          gated && (cu.async || llvm::any_of(cu.predecessors,
-                                             [&](const CallUnit::Pred &p) {
-                                               return p.viaResult ||
-                                                      !dp.calls[p.call]
-                                                           .determinate;
-                                             }));
-      cu.startPolicy = mustJoin  ? CallUnit::StartPolicy::Handshake
+          gated && (cu.async ||
+                    llvm::any_of(cu.predecessors, [&](const CallUnit::Pred &p) {
+                      return p.viaResult || !dp.calls[p.call].determinate;
+                    }));
+      cu.startPolicy = mustJoin   ? CallUnit::StartPolicy::Handshake
                        : cu.async ? CallUnit::StartPolicy::Broadcast
                                   : CallUnit::StartPolicy::TimeTriggered;
     }
@@ -678,7 +673,7 @@ Source DatapathBuilder::resolveValue(Value v) {
   if (arg == 0)
     return Source{Source::Kind::Counter, rid, 0};
   // The rest are the loop-carried values, readable only where the region
-  // LATCHES them into a survivor (`RegionBlock::container`). A childless loop
+  // latches them into a survivor (`RegionBlock::container`). A childless loop
   // fuses its accumulator in, so only `resolveOperand`'s recurrence edge reads
   // it, and a reader that reaches here gets None and is reported.
   if (!dp.regions[rid].container)
@@ -1159,11 +1154,11 @@ reduceCone(Datapath &dp, AffineExpr e, AffineMap addrMap,
 //
 // Runs after `resolveEdges` (a term has to resolve to a counter) and after
 // `recordRegionBounds` (a stride is a constant only if the counter's bounds
-// are), and BEFORE any chain is built, so a term it reduces costs no register.
+// are), and before any chain is built, so a term it reduces costs no register.
 // `splitAddress` is the same decomposition the scheduler priced the access
 // with.
 //
-// An operand still owed a delay is read off its EDGE: the scaled counter is
+// An operand still owed a delay is read off its edge: the scaled counter is
 // delayed once for the whole sum rather than per operand, so counters wanted at
 // different cycles cannot share that one delay; the first one's cycle decides
 // and the rest stay in the residual.
@@ -1172,11 +1167,10 @@ reduceCone(Datapath &dp, AffineExpr e, AffineMap addrMap,
 // memref), which is what lets a banked access reduce at all: `buf[i, 4*j]`
 // under a cyclic-4 last axis offsets by `i*extent + j`, as linear as any.
 //
-// Both cones are derived SYMBOLICALLY (`addressExprsOf`) here and only later
+// Both cones are derived symbolically (`addressExprsOf`) here and only later
 // evaluated: composing the row-major strides on a coalesced nest's
-// `iv -> (iv floordiv N, iv mod N)` cancels it back to `iv`, where the same
-// thing built out of `comb` ops is a multiply, a mask and a shift that no later
-// pass can fold away.
+// `iv -> (iv floordiv N, iv mod N)` cancels back to `iv`, which the same
+// expression built out of `comb` ops cannot.
 void DatapathBuilder::planAddressGenerators() {
   for (MemUnit &m : dp.mems) {
     auto shape = cast<MemRefType>(m.memref.getType()).getShape();
@@ -1204,7 +1198,7 @@ void DatapathBuilder::planAddressGenerators() {
           addressExprsOf(m.layout, acc.addrMap, shape, acc.staticBank);
       // The width the cone is priced at against the width the emitter builds
       // the bank's address port at: the first comes off the layout's bank
-      // shape, the second off `depthWords`, and this is where both exist.
+      // shape, the second off `depthWords`.
       assert(e.width == addressWidthOf(static_cast<int64_t>(m.depthWords)) &&
              "the width the address was priced at is not the one it is built "
              "at");
@@ -1216,9 +1210,8 @@ void DatapathBuilder::planAddressGenerators() {
       bool anyRegister = !acc.offset.terms.empty() || !acc.bank.terms.empty() ||
                          !acc.offset.reads.empty() || !acc.bank.reads.empty();
       acc.addrDelay = anyRegister ? delay.value_or(0) : 0;
-      // An operand no residual is left reading has no consumer at all: its slot
-      // stays empty, and the delay it was owed is withdrawn before a chain is
-      // built to carry it.
+      // An operand no residual is left reading has no consumer: its slot stays
+      // empty and the delay it was owed is withdrawn before a chain carries it.
       llvm::BitVector read = residualReads(acc);
       for (unsigned p = 0, n = acc.addr.size(); p < n; ++p) {
         if (read[p])
@@ -1283,9 +1276,9 @@ void DatapathBuilder::resolveAccessOperands() {
             isTransientDin(token)) {
           restamp(acc, dcpStart(acc.op) + 1);
           ++shift;
-          // What the region's drain may now exceed the composed span by: the
-          // deepest access carries its own channel's accumulated shift, so the
-          // bound is the largest of them and not their sum.
+          // What the region's drain may exceed the composed span by: each
+          // access carries its own channel's accumulated shift, so the bound is
+          // the largest of them and not their sum.
           RegionBlock &rb = dp.regions[ridx];
           rb.streamShift = std::max(rb.streamShift, shift);
           r = resolveOperand(token, acc.op, ii);
@@ -1315,19 +1308,18 @@ void DatapathBuilder::resolveAccessOperands() {
 }
 
 // When each region has finished, relative to the issue pulse of the iteration
-// that reaches it. `emitDone` counts a leaf's `done` off this, and the emitter
-// holds what it actually built to it.
+// that reaches it. `emitDone` counts a leaf's `done` off this.
 //
 // Three things a region can still owe past its issue, all in the same units:
 // a store presented at its stage commits `writeLatency` cycles later, and the
 // done latch rides the last of those, so it drains at the commit minus one; a
 // put presents at its stage; a survivor latches on the cycle its result lands.
-// A call result is NOT one of them: it is self-timed by the child's `done`
-// rather than statically captured, so it contributes no drain here.
+// A call result is not one of them, being self-timed by the child's `done`
+// rather than statically captured.
 //
 // Safe to read a result's Source before `insertRegisters`: a result slot is
 // tied by `resolveValue` and never handed to `edges`, so nothing patches it
-// later and the emitter reads the same Source this does.
+// later.
 void DatapathBuilder::recordDrainStages() {
   for (RegionBlock &rb : dp.regions) {
     unsigned drain = 0;
@@ -1353,10 +1345,9 @@ void DatapathBuilder::recordDrainStages() {
 }
 
 void DatapathBuilder::insertRegisters() {
-  // One chain per (value, region) key, as long as its deepest SURVIVING tap;
+  // One chain per (value, region) key, as long as its deepest surviving tap;
   // the shallower consumers read their own tap off it (Source::Reg's
-  // `outPort`). A tap the address reduction withdrew buys no chain, so a chain
-  // nothing else taps is never built.
+  // `outPort`). A tap the address reduction withdrew buys no chain.
   llvm::DenseMap<RegKey, RegId> keyToReg;
   for (auto &[slot, e] : edges) {
     if (e.reduced)
@@ -1410,9 +1401,8 @@ void DatapathBuilder::insertRegisters() {
     mx.sources.assign(mb.sources.begin(), mb.sources.end());
     mx.selectOps.assign(mb.ops.begin(), mb.ops.end());
     mx.phases.assign(mb.phases.begin(), mb.phases.end());
-    // The stage each arm's pulse is delayed to, read here rather than at emit:
-    // this is the last pass that touches a schedule cycle, so it is the last
-    // point at which the two can still agree.
+    // The stage each arm's pulse is delayed to, frozen here because this is the
+    // last pass that touches a schedule cycle.
     for (Operation *op : mb.ops)
       mx.selectStages.push_back(dcpStart(op));
     dp.regions[mb.region].muxes.push_back(mx.id);
@@ -1533,10 +1523,8 @@ void DatapathBuilder::recordSiblingDeps(ArrayRef<Operation *> regionOps) {
   // MemUnit::Access, so it counts as a sharer too, or a child could read a
   // buffer concurrently with an earlier writer.
   //
-  // `Datapath::portGraph` depends on this chaining EVERY sharer, since that is
-  // what lets it read two accesses under different top-level ancestors as never
-  // simultaneous. Exempting a pair here would let two regions share a port they
-  // can both drive at once.
+  // `Datapath::portGraph` depends on this chaining every sharer: exempting a
+  // pair here would let two regions share a port they can both drive at once.
   for (const MemUnit &m : dp.mems) {
     for (const MemUnit::Access &a : m.accesses)
       addSharer(a.region);
@@ -1624,9 +1612,8 @@ void DatapathBuilder::build() {
   // pass below sees a scalar func arg as an IO source.
   bindIOArgs();
 
-  // Every array the function touches, with everything the device and the layout
-  // say about it. Before the walk, so a binding looks its memory up rather than
-  // deciding anything about it.
+  // Every array the function touches, before the walk so a binding looks its
+  // memory up rather than deciding anything about it.
   collectStorageFacts(regionOps);
 
   for (unsigned ridx = 0, e = regionOps.size(); ridx < e; ++ridx) {
@@ -1667,15 +1654,14 @@ void DatapathBuilder::build() {
   // there: scaled counters, delay chains, muxes.
   resolveEdges();
   recordDrainStages(); // when each region finishes (needs the final stages)
-  // The top-level composition DAG, BEFORE the ports and not after: `portGraph`
-  // reads two accesses under different top-level ancestors as unable to issue
-  // together, and this pass is what makes that true.
+  // The top-level composition DAG, before the ports: `portGraph` reads two
+  // accesses under different top-level ancestors as unable to issue together,
+  // and this pass is what makes that true.
   recordSiblingDeps(regionOps);
   // Ports before the delays, and the two are independent: an access holds a
   // port once it knows which bank it commits to and which skew lane it holds,
   // both settled by the region walk, and no pass here reads a Register or a
-  // Mux. Ordered this way so address strength reduction can see whether the bus
-  // it feeds is shared, which it does not yet use.
+  // Mux.
   assignLanes();
   planAccessPorts();
   bindMemoryPorts();

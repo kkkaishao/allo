@@ -260,7 +260,7 @@ def StallContractAttr : EnumAttr<Allo_Dialect, StallContractEnum, "stall">;
 // realization's kind carries (an operator's operand width, a multiplexer's
 // fan-in and width, a delay chain's depth and width).
 //
-// Each form is a function of ONE parameter, a multi-parameter term is the
+// Each form is a function of one parameter, a multi-parameter term is the
 // PRODUCT of one form per parameter, and a cost is the SUM of the terms naming
 // one resource (see `ResourceUse`). That keeps the evaluator a one-parameter
 // switch and still covers every measured shape: `0.4*k` per bit is linear in k
@@ -285,12 +285,9 @@ def CostTable     : I32EnumAttrCase<"Table",     4, "table">;
 def CostTiled     : I32EnumAttrCase<"Tiled",     5, "tiled">;
 // The same [p0, v0, p1, v1, ...] points as `table`, read continuously: a
 // parameter between two points takes their linear interpolation. This fits a
-// continuous quantity measured at a few points, such as an operator's delay,
-// which a staircase under-states everywhere between them.
+// continuous quantity measured at a few points, such as an operator's delay.
 def CostInterp    : I32EnumAttrCase<"Interp",    6, "interp">;
 // coeffs[0] < p ? arms[1](p) : arms[0](p), with both arms costs of any form.
-// Generalizes `step`, whose lower arm is forced proportional and whose upper
-// arm is forced constant.
 def CostPiecewise : I32EnumAttrCase<"Piecewise", 7, "piecewise">;
 def CostFormEnum : I32EnumAttr<"CostFormEnum",
     "Shape of a resource cost as a function of one parameter",
@@ -310,10 +307,9 @@ def CostAttr : Allo_Attr<"Cost"> {
     is quadratic. A shape that is not structural belongs in a `table`, which
     is what the measurement produced in the first place.
 
-    A shape holds at every parameter. A `table` and an `interp` hold the
-    measurements themselves, so they answer only between their first and last
-    point: outside that domain there is nothing measured to read, and a caller
-    reports the gap rather than extrapolating one end flat.
+    A shape holds at every parameter. A `table` and an `interp` answer only
+    between their first and last measured point, and a caller reports the gap
+    rather than extrapolating outside it.
   }];
   let parameters = (ins
     "allo::CostFormEnum":$form,
@@ -326,13 +322,12 @@ def CostAttr : Allo_Attr<"Cost"> {
   let cppNamespace = "mlir::allo";
   let genVerifyDecl = 1;
   let extraClassDeclaration = [{
-    /// This cost at \p param, UNROUNDED so a product of factors rounds once at
+    /// This cost at \p param, unrounded so a product of factors rounds once at
     /// the end rather than once per factor. A `tiled` factor reads \p param
     /// alone; its whole-tuple reading is `evaluateResourceUse`'s.
     ///
     /// Nullopt where \p param falls outside a `table` or an `interp`'s measured
-    /// points: a measurement is read, never extrapolated, so the caller reports
-    /// the domain `unmeasuredAt` names instead of taking a number.
+    /// points; `unmeasuredAt` names the cost.
     std::optional<double> evaluate(int64_t param) const;
 
     /// The `table` or `interp` this cost reads at \p param whose measured

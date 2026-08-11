@@ -129,28 +129,23 @@ Value HWEmitter::emitRegion(const uarch::RegionBlock &rb, Value start,
   Value captureOn =
       rb.conditional ? ctx.andBits(rc.issue, term.cond) : lastIssue;
   [[maybe_unused]] unsigned resultDrain = captureResults(rb, captureOn, start);
-  // The model decides when this region finishes; these two are what F and the
-  // capture pass ACTUALLY emitted, kept so the decision stays checkable against
-  // the hardware built from it rather than only against the composed span.
   assert(std::max(fb.storeDrain, resultDrain) == rb.drainStage &&
          "the built datapath's terminal cycle is not the one the model "
          "recorded");
-  // The model against the hardware, in the direction that is a fault: drained
-  // PAST what the span composed, so a consumer released at that offset samples
-  // before this region has committed. `resolveAccessOperands` re-stamps a
-  // stream put's stage, so a region it reached may sit `streamShift` cycles
-  // out and no further. A call-holding leaf is excluded outright, since it
-  // also waits on the child's `done`, which the span does not model.
+  // Draining past the composed span is a fault: a consumer released at that
+  // offset samples before this region has committed. `resolveAccessOperands`
+  // re-stamps a stream put's stage, so a region it reached may sit
+  // `streamShift` cycles out and no further. A call-holding leaf also waits on
+  // the child's `done`, which the span does not model.
   assert((!rb.modelledDrain || !rb.callUnits.empty() ||
           static_cast<int64_t>(rb.drainStage) <=
               *rb.modelledDrain + int64_t(rb.streamShift)) &&
          "the built datapath drains past the composed span; a consumer placed "
          "against it samples before this region has committed");
-  // Draining EARLY is pessimism rather than a fault, and one shape reaches it
+  // Draining early is pessimism rather than a fault, and one shape reaches it
   // legitimately: the device prices a stream read at latency 1 while the
   // emitter builds the FIFO's show-ahead output at 0, so a region yielding a
-  // `get` composes one cycle longer than it runs. Everywhere else the two still
-  // have to agree exactly.
+  // `get` composes one cycle longer than it runs.
   assert((!rb.modelledDrain || !rb.callUnits.empty() ||
           !rb.streamAccesses.empty() ||
           static_cast<int64_t>(rb.drainStage) == *rb.modelledDrain) &&
@@ -168,10 +163,10 @@ Value HWEmitter::emitRegion(const uarch::RegionBlock &rb, Value start,
   // datapath waits for both, ANDing two held levels so the later wins.
   bool looseWork = !rb.streamAccesses.empty() || !rb.units.empty() ||
                    !rb.memAccesses.empty();
-  Value done = fb.callDone && !looseWork
-                   ? fb.callDone
-                   : control.emitDone(rb, lastIssue, emptyDone, start,
-                                      retrig, shell);
+  Value done =
+      fb.callDone && !looseWork
+          ? fb.callDone
+          : control.emitDone(rb, lastIssue, emptyDone, start, retrig, shell);
   if (fb.callDone && looseWork)
     done = ctx.andBits(fb.callDone, done);
   // Resolving the promise RAUWs every consumer and erases the placeholders, so
@@ -203,9 +198,9 @@ Value HWEmitter::lastIssuePulse(const RegionControl &rc,
 // register on the cycle it lands, while the result is still on its Source: a
 // free-running datapath overwrites it once the run ends. \p captureOn is the
 // issue pulse the capture keys off; a result produced at a later stage delays
-// its capture to match. Returns the LATEST-landing result's stage, which is one
-// of the terms of `RegionBlock::drainStage` and is returned so `emitRegion` can
-// check the two agree. A store-ful region yields no result and returns 0.
+// its capture to match. Returns the latest-landing result's stage, one of the
+// terms of `RegionBlock::drainStage`, which `emitRegion` checks against it. A
+// store-ful region yields no result and returns 0.
 unsigned HWEmitter::captureResults(const uarch::RegionBlock &rb,
                                    Value captureOn, Value start) {
   StallShell sh = datapath.shellFor(rb.id);
@@ -357,7 +352,6 @@ Value HWEmitter::emitContainer(const uarch::RegionBlock &rb, Value start) {
   // The container's own combinational units (a nested guard's predicate over
   // this counter) emit once the counter and iter-arg survivors are live, so a
   // guard child reads its predicate as a Source::Unit when it emits below.
-  // They are the last thing it emits, so they declare their own backedges.
   datapath.declareUnits(rb);
   datapath.emitUnits(rb);
 
@@ -477,9 +471,8 @@ void HWEmitter::emit() {
   // boundary groups, merged onto the same colours so its OWNER can.
   datapath.finalizeSharedWritePorts();
   datapath.finalizeBoundaryWritePorts();
-  // An internal read port is one address bus for every read coloured onto it,
-  // so it is driven here for the same reason: only now has each of them built
-  // the address it presents.
+  // An internal read port is one address bus for every read coloured onto it;
+  // only now has each of them built the address it presents.
   datapath.finalizeSharedReadPorts();
   // Scalar results: the returning region's survivor register, stable once its
   // region (and thus `done`) has risen; the cosim samples it at `done`.

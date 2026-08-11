@@ -61,8 +61,8 @@ class Utilization:
     lut: int = 0  # every LUT site, state-holding ones included
     logic_lut: int = 0  # of those, the ones not holding state
     #: LUT sites holding state (`slicem_lut`): a shift register or a distributed
-    #: RAM. One resource on the die, and Vivado reports the two uses apart
-    #: ("LUT as Shift Register" against "LUT as Distributed RAM").
+    #: RAM. Vivado reports the two uses apart ("LUT as Shift Register" against
+    #: "LUT as Distributed RAM").
     srl: int = 0
     ff: int = 0
     dsp: int = 0
@@ -187,9 +187,7 @@ def _operator_costs(device: Device) -> dict[str, tuple]:
 
 def _scatter_row(device: Device):
     """The device's ``is_scatter`` row: one cell per element, selected rather
-    than addressed. What a queue between two children is priced at, the
-    register ledger not holding it and the compiler naming no storage of its
-    own for it."""
+    than addressed. What a queue between two children is priced at."""
     row = next((s for s in device.storage.values() if s.is_scatter), None)
     if row is None:
         raise ValueError(
@@ -275,17 +273,12 @@ def estimate(report: CompileReport, device: Device = default_device) -> QoR:
                 charge("muxes", f.func, one * m.count)
 
         for m in f.mems:
-            # A boundary port, or cells the register ledger already holds. The
-            # emitter's own classification, not a predicate re-derived here:
-            # deciding it a second time is how the estimate and the design come
-            # to disagree.
+            # A boundary port, or cells the register ledger already holds.
             if m.realization in {"boundary", "scatter"}:
                 continue
             if m.realization == "rom":
-                # A read-only table is emitted as a constant array read by an
-                # index, so the part builds it out of logic and it holds no
-                # memory bits at all. Its `storage` row is only where its read
-                # latency came from; nothing is realized there.
+                # A read-only table is built out of logic and holds no memory
+                # bits; its `storage` row only supplied the read latency.
                 charge(
                     "memories",
                     f.func,
@@ -294,14 +287,12 @@ def estimate(report: CompileReport, device: Device = default_device) -> QoR:
                 continue
             row = device.storage.get(m.storage)
             if row is None:
-                # This part declares no such row, which happens only when a
-                # report is priced against a device other than the one it was
-                # built for. Reported rather than charged as something else.
+                # This part declares no such row, which happens when a report
+                # is priced against a device other than the one it was built for.
                 unmodelled[m.storage] += 1
                 continue
-            # An addressed array costs its row once per instance the compiler
-            # decided on and once per bank. The instance count is read off the
-            # report, not recomputed here, for the same reason.
+            # An addressed array costs its row once per instance and once per
+            # bank.
             copies = m.cost.instances * m.banks
             mem_bits += m.bits * m.cost.instances
             charge(

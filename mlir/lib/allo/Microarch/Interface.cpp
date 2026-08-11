@@ -35,9 +35,8 @@ layoutOf(const uarch::MemUnit &mu) {
 } // namespace
 
 ModuleInterface::ModuleInterface(const uarch::Datapath &dp) {
-  // Legalized here, so the key the manifest uses is the emitted Verilog module
-  // name: a nested callee `top.child` would otherwise be rewritten downstream
-  // by ExportVerilog.
+  // Legalized here so the manifest key is the emitted Verilog module name;
+  // ExportVerilog would otherwise rewrite a nested callee like `top.child`.
   symbol = dcp::DCPathModuleOp(dp.func).getSymName().str();
   module = uarch::verilogName(symbol);
 
@@ -57,7 +56,7 @@ ModuleInterface::ModuleInterface(const uarch::Datapath &dp) {
                        portValid(base), portReady(base)});
   }
 
-  // A scattered ARGUMENT is declared per element, off the memory rather than
+  // A scattered argument is declared per element, off the memory rather than
   // off its accesses, so it appears in neither `reads` nor `writes`. A
   // scattered internal array is registers in the body and reaches no port.
   for (const uarch::MemUnit &mu : dp.mems) {
@@ -132,10 +131,9 @@ ModuleInterface::ModuleInterface(const uarch::Datapath &dp) {
     results.push_back({datapathWidth(r.type), r.name});
 
   // One entry per extern operator module this kernel instantiates, with the
-  // ports it is declared with: `declareOperatorModules` builds the extern from
-  // this rather than deriving the same shape a second time. A native (comb)
-  // unit emits inline and declares nothing. Deduplicated by module name, which
-  // is also what decides whether two units may share a module at all.
+  // ports it is declared with, which `declareOperatorModules` builds the extern
+  // from. A native (comb) unit emits inline and declares nothing. Deduplicated
+  // by module name, which also decides whether two units may share a module.
   llvm::StringMap<const allo::OperatorIdentity *> listed;
   for (const uarch::FuncUnit &u : dp.units) {
     if (u.identity.comb)
@@ -148,8 +146,7 @@ ModuleInterface::ModuleInterface(const uarch::Datapath &dp) {
       continue;
     Operator entry{
         modName, u.identity.ipSymbol, uarch::operatorPredicate(u), {}};
-    // Widths off the IDENTITY, which is what the module name separates, so the
-    // ports cannot disagree with it.
+    // Widths come from the identity, which is what the module name separates.
     for (auto [k, argType] : llvm::enumerate(u.identity.argTypes))
       entry.ports.push_back({std::string(1, static_cast<char>('a' + k)),
                              datapathWidth(argType), Operator::Role::Data});

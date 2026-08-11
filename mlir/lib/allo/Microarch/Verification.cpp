@@ -5,10 +5,9 @@
 
 //===----------------------------------------------------------------------===//
 // Everything checked between the model being sealed and hardware being built,
-// cut by WHO IS AT FAULT: the design (`checkInputLegality`), this backend
+// cut by who is at fault: the design (`checkInputLegality`), this backend
 // (`checkEmitterSubset`), or an upstream pass (`assertModelInvariants`). The
-// diagnostic each may raise follows from that, and nothing else decides where a
-// check belongs.
+// diagnostic each may raise follows from that.
 //===----------------------------------------------------------------------===//
 
 #include "allo/Microarch/Verification.h"
@@ -55,14 +54,12 @@ LogicalResult checkInputLegality(dcp::DCPathModuleOp func, const Datapath &dp) {
                  "the schedule asks for";
       }
 
-    // The copies the scheduler priced the array at are what it reserved its
-    // read bandwidth against, so a binding taking more of them has bought
-    // bandwidth no cycle was cut for. Nothing here can refuse it, the schedule
-    // being already fixed, so it is reported rather than dropped. The
-    // concurrency beside it says which of the two is at fault: equal to the
-    // ports, the schedule really does ask for them all at once and the array
-    // wants partitioning or a wider row; below them, the binding separated
-    // accesses that never meet.
+    // The copies the scheduler priced the array at are the read bandwidth it
+    // reserved, so a binding taking more has bought bandwidth no cycle was cut
+    // for. Warned rather than refused, the schedule being already fixed. The
+    // concurrency says which side is at fault: equal to the ports, the schedule
+    // does ask for them all at once and the array wants partitioning or a wider
+    // row; below them, the binding separated accesses that never meet.
     if (m.instances > m.ports.copies())
       logging::log(Level::Warn, Stage::Emit, m.memref.getLoc())
           << memOwnerName(dp, m) << ": " << m.readPortsBuilt
@@ -71,13 +68,12 @@ LogicalResult checkInputLegality(dcp::DCPathModuleOp func, const Datapath &dp) {
           << " the schedule reserved (" << m.readConcurrency
           << " of its reads may issue in one cycle)";
 
-    // One boundary group is one interface the CALLER has to build, and the
+    // One boundary group is one interface the caller has to build, and the
     // ports bound for the array are all this module can drive at once on a
-    // bank. Past them the caller backs bandwidth nothing here asks for. Only an
-    // ADDRESSED argument has a budget at all: an internal array publishes no
-    // group, and a scattered one publishes cells rather than buses, which is
-    // the whole of what its realization buys. Reported and not refused, the
-    // interface being the manifest the caller was already compiled against.
+    // bank. Only an addressed argument has a budget: an internal array
+    // publishes no group, and a scattered one publishes cells rather than
+    // buses. Warned rather than refused, the interface being the manifest the
+    // caller was already compiled against.
     unsigned budget = m.numBanks * m.portsBuilt;
     if (budget && m.boundaryPorts > budget)
       logging::log(Level::Warn, Stage::Emit, m.memref.getLoc())
@@ -90,16 +86,14 @@ LogicalResult checkInputLegality(dcp::DCPathModuleOp func, const Datapath &dp) {
              "sub-kernel reaching the array adds one whether or not its port "
              "already shares a bus with another's";
 
-    // Only a WRITE set reaches this: every copy of a row needs every write, so
+    // Only a write set reaches this: every copy of a row needs every write, so
     // one instance's write ports are the ceiling however many copies are built,
     // and on a pooled row writes that fill the pool leave a read no port
-    // anywhere. Reads alone never reach it and say nothing, the copies being
-    // what serves them.
+    // anywhere. Reads alone never reach it, the copies being what serves them.
     //
-    // `characterize` budgets a derived row one write short of its pool so the
-    // schedule cannot ask for this, which leaves two ways in: a topology the
-    // user stated, and writers of concurrent regions, which are billed apart
-    // and only meet here.
+    // `characterize` budgets a derived row one write short of its pool, which
+    // leaves two ways in: a topology the user stated, and writers of concurrent
+    // regions, which are billed apart and only meet here.
     if (m.realization() == MemUnit::Realization::Ram && !m.fitsStorage()) {
       error(Stage::Emit, Code::StoragePortsExceeded, m.memref.getDefiningOp())
           << "Array " << m.memref.getType() << " is built with "
@@ -259,9 +253,8 @@ LogicalResult checkEmitterSubset(dcp::DCPathModuleOp func, const Datapath &dp,
     return failure();
   }
 
-  // A skew hands out one port per bank per LANE, and a lane is assigned from
-  // the accesses of this module. A sub-kernel's port holds none, so there is no
-  // lane for it to share a bank's port on.
+  // A skew hands out one port per bank per lane, and a lane is assigned from
+  // the accesses of this module, so a sub-kernel's port belongs to no lane.
   for (const CallUnit &cu : dp.calls)
     for (const CallUnit::MemArg &ma : cu.memArgs)
       if (ma.plan == PortPlan::Lane) {
@@ -316,8 +309,7 @@ LogicalResult checkEmitterSubset(dcp::DCPathModuleOp func, const Datapath &dp,
 }
 
 //===----------------------------------------------------------------------===//
-// 3. Invariants an upstream pass owns, asserted at this seam so a regression in
-// that pass fails here rather than miscompiling.
+// 3. Invariants an upstream pass owns, asserted at this seam.
 //===----------------------------------------------------------------------===//
 
 // Whether a counted container holds no work of its own: the reifier gives every
@@ -338,8 +330,8 @@ LogicalResult checkEmitterSubset(dcp::DCPathModuleOp func, const Datapath &dp,
 
 void assertModelInvariants(const Datapath &dp) {
 #ifndef NDEBUG
-  // Memory rows the SCHEDULER honors, so a structure that silently realizes
-  // them differently would place every consumer on the wrong cycle.
+  // Memory rows the scheduler honors: a structure realizing them differently
+  // would place every consumer on the wrong cycle.
   for (const MemUnit &m : dp.mems) {
     assert((!m.romInit || m.numBanks == 1) &&
            "`PreVerification` refuses a banked array declared with contents");
@@ -388,9 +380,9 @@ void assertModelInvariants(const Datapath &dp) {
            "reifier gives every run of loose ops a child region");
     // A container's own units are the gating logic its children read, not a
     // datapath: it has no per-iteration issue pulse to time a recurrence
-    // identity against. A COUNTED one's predicate is sampled in-cycle, where a
-    // conditional one's condition cone may take `t_cond` cycles and so may be
-    // an IP.
+    // identity against. A counted container's predicate is sampled in-cycle,
+    // where a conditional one's condition cone may take `t_cond` cycles and so
+    // may be an IP.
     if (rb.shape != RegionBlock::Shape::Container)
       continue;
     for (UnitId uid : rb.units) {
@@ -465,9 +457,7 @@ void assertModelInvariants(const Datapath &dp) {
                               acc.portIdx) &&
              "an access's port slot is out of its boundary port list");
       (void)hasPort;
-      // An argument is never a constant table and `assignLanes` skips it, which
-      // is what lets the two plans that read this module's OWN cells share an
-      // arm with the boundary cases.
+      // An argument is never a constant table, and `assignLanes` skips it.
       assert((!m.external ||
               (acc.plan != PortPlan::Table && acc.plan != PortPlan::Lane)) &&
              "an argument array is neither a constant table nor skewed");
@@ -502,14 +492,13 @@ void assertModelInvariants(const Datapath &dp) {
 
 LogicalResult validateDatapath(dcp::DCPathModuleOp func, const Datapath &dp,
                                float cycleTime, const OperatorLibrary &lib) {
-  // The builder already reported the offending edge, and the depths it left are
-  // placeholders, so nothing below would be measuring the design that was
-  // asked for.
+  // The builder already reported the offending edge, and the depths it left
+  // are placeholders, so nothing below would measure the design as asked for.
   if (dp.infeasible)
     return failure();
   assertModelInvariants(dp);
-  // The design's own faults first: what the user can change is worth hearing
-  // before what this backend has not built yet.
+  // The design's own faults are reported before what this backend has not
+  // built yet.
   if (failed(checkInputLegality(func, dp)) ||
       failed(checkEmitterSubset(func, dp, cycleTime, lib)))
     return failure();

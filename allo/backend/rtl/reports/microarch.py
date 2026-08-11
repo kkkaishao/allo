@@ -110,23 +110,20 @@ class MemoryCost:
     #: together, and then one address bus carries both.
     ports: int
     #: instances of the storage row each bank is held in, as the compiler
-    #: decided them once the ports were bound. What the row's price is
-    #: multiplied by; a count read off the emission, not a formula re-applied
-    #: here.
+    #: decided them once the ports were bound. The row's price is multiplied by
+    #: it.
     instances: int = 1
-    #: instances the SCHEDULE reserved against, which ``instances`` above may
-    #: exceed: the binding replicates for whatever read bandwidth it was left to
-    #: serve, and this is the budget it overran.
+    #: instances the schedule reserved against, which ``instances`` above may
+    #: exceed when the binding replicates further for read bandwidth.
     copies_budget: int = 1
-    #: ports ONE INSTANCE of the row provides, 0 for no limit, which
-    #: ``instances`` above is the multiplier of. The row narrowed by the
-    #: topology the array asked for, which the device table alone does not give.
+    #: ports one instance of the row provides, 0 for no limit, which
+    #: ``instances`` above is the multiplier of. The device row narrowed by the
+    #: topology the array asked for.
     row_reads: int = 0
     row_writes: int = 0
-    #: a lower bound on what one cycle asks of one bank, per direction. The
-    #: ports above are what was built to serve it, and the gap is what the
-    #: binding spent separating accesses the schedule never issues together.
-    #: Zero for a ROM or a scattered array, neither addressed.
+    #: a lower bound on what one cycle asks of one bank, per direction; the
+    #: ports above are what was built to serve it. Zero for a ROM or a scattered
+    #: array, neither addressed.
     read_concurrency: int = 0
     write_concurrency: int = 0
     #: module interface groups this array contributes: one per bound boundary
@@ -175,8 +172,7 @@ class Memory:
     rom: bool
     skewed: bool
     #: what the module built to hold it: ``"boundary"`` (the cells are the
-    #: caller's), ``"rom"``, ``"scatter"`` or ``"ram"``. The emitter's own
-    #: decision, read back rather than re-derived.
+    #: caller's), ``"rom"``, ``"scatter"`` or ``"ram"``.
     realization: str
     #: whether the partition BOUGHT the bandwidth it costs: every access reaches
     #: one bank. An access the analysis could not fix takes a port on every
@@ -236,7 +232,7 @@ class Call:
     callee: str
     count: int
     spawns: int  # of those, `await` spawns rather than scheduled calls
-    #: How those calls are RELEASED, counted: on a predecessor's ``done``, on
+    #: How those calls are released, counted: on a predecessor's ``done``, on
     #: the container's own start, or at a scheduled offset.
     handshake: int = 0
     broadcast: int = 0

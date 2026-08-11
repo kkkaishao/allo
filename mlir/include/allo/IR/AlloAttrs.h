@@ -36,8 +36,8 @@ namespace mlir::allo {
 /// A lone `tiled` factor is the exception to the one-factor-per-parameter rule:
 /// it reads the whole tuple, since `ceil(depth*width/bits)` does not separate.
 ///
-/// Nullopt where a factor is not measured at its parameter
-/// (`CostAttr::evaluate`); `unmeasuredUse` names the row for the diagnostic.
+/// Nullopt where a factor is not measured at its parameter; `unmeasuredUse`
+/// names the offending cost.
 std::optional<llvm::SmallVector<std::pair<mlir::SymbolRefAttr, int64_t>>>
 evaluateResourceUse(mlir::ArrayAttr uses, llvm::ArrayRef<int64_t> params);
 

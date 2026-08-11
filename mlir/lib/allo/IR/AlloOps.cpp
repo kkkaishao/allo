@@ -464,9 +464,7 @@ static LogicalResult verifyUsesResolve(Operation *op, ArrayAttr uses,
 LogicalResult DCPathCombOp::verify() {
   // Sampled at representative widths rather than checked symbolically: a cost
   // form is piecewise, so non-negativity is not a property of the
-  // coefficients. A width the row was not measured at is skipped rather than
-  // sampled: the measured domain is part of the declaration, and no fabric
-  // characterizes a one-bit operator.
+  // coefficients. A width the row was not measured at is skipped.
   for (int64_t w : {1, 8, 16, 32, 64}) {
     std::optional<double> d = getDelay().evaluate(w);
     if (d && *d < 0.0)
@@ -490,15 +488,13 @@ LogicalResult DCPathStorageOp::verify() {
       getWrDelay().convertToDouble() < 0.0)
     return emitOpError("delay must be non-negative");
   std::optional<uint64_t> pool = getInstPorts();
-  for (std::optional<uint64_t> limit : {getInstReads(), getInstWrites(), pool}) {
+  for (std::optional<uint64_t> limit :
+       {getInstReads(), getInstWrites(), pool}) {
     if (limit && *limit < 1)
       return emitOpError("a port limit must be at least one port");
-    // A scatter row holds one cell per element and no addressed port.
     if (limit && getIsScatter())
       return emitOpError("a `scatter` row holds one cell per element and so "
                          "has no port limit to declare");
-    // A pool below one of the directions it serves leaves that direction's own
-    // limit unreachable, so the row describes two different structures.
     if (limit && pool && *limit > *pool)
       return emitOpError("a direction's port limit exceeds `inst_p`, but an "
                          "access of either direction takes one port of the "
@@ -1372,9 +1368,8 @@ CostAttr CostAttr::unmeasuredAt(int64_t param) const {
   switch (getForm()) {
   case CostFormEnum::Table:
   case CostFormEnum::Interp:
-    // Only above the last point. Below the first, the narrowest measurement
-    // bounds a structure narrower than anything the row was measured at, so
-    // reading it over-states rather than guesses.
+    // Only above the last point: below the first, the narrowest measurement
+    // over-states rather than guesses.
     return p > c[c.size() - 2] ? *this : CostAttr();
   case CostFormEnum::Piecewise:
     return getArms()[p < c[0] ? 0 : 1].unmeasuredAt(param);
@@ -1470,9 +1465,8 @@ mlir::allo::evaluateResourceUse(ArrayAttr uses,
       double term = 1.0;
       if (factors.size() == 1 &&
           factors.front().getForm() == CostFormEnum::Tiled) {
-        // A lone `tiled` reads the whole tuple: a tile holds so many bits
-        // however the array is cut, so the product sits inside the ceiling. One
-        // among a full set of factors instead tiles its own parameter.
+        // A lone `tiled` reads the whole tuple, so the product sits inside the
+        // ceiling. One among a full set of factors tiles its own parameter.
         assert(!params.empty() &&
                "a tiled cost needs a parameter tuple to tile");
         double bits = 1.0;

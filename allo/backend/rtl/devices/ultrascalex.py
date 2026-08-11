@@ -166,9 +166,8 @@ SCATTER_STORAGE = "register"
 #: the number covers the whole path a caller sees. The trailing comment on each
 #: row is that core's achieved Fmax in MHz, a record of the characterization run
 #: and not an input to the cost model. Several rows under one archetype declare
-#: several cores, which the library then chooses between; every one of them
-#: closes at the part's default frequency, since a core that misses it is not a
-#: realization the library may pick.
+#: several cores for the library to choose between; every row closes at the
+#: part's default frequency.
 IP: Mapping[OperatorIP, IPRow | tuple[IPRow, ...]] = {
     ip.fadd: (
         IPRow(7, {"lut": 270, "ff": 238, "dsp": 2, "carry8": 10}),  # 432
@@ -230,10 +229,9 @@ IP: Mapping[OperatorIP, IPRow | tuple[IPRow, ...]] = {
 #: Rows that replace the base entry for their archetype at one grade, with a
 #: tuple on either side standing for the whole candidate set.
 IP_BY_GRADE: Mapping[Grade, Mapping[OperatorIP, IPRow | tuple[IPRow, ...]]] = {
-    # Two shallower cores close on -2L and miss the same 300 MHz clock on -2LV,
-    # so each is a candidate at the faster grade alone: the 2-cycle unsigned
-    # 8-bit divider (311 MHz against 249) and the 24-cycle double divider (308
-    # against 208).
+    # The 2-cycle unsigned 8-bit divider (311 MHz against 249) and the 24-cycle
+    # double divider (308 against 208) close on -2L and miss the same 300 MHz
+    # clock on -2LV, so each is a candidate at this grade only.
     GRADE_2L: {
         ip.udiv8: (
             IPRow(4, {"lut": 127, "ff": 166, "carry8": 18}),  # 311
@@ -248,9 +246,9 @@ IP_BY_GRADE: Mapping[Grade, Mapping[OperatorIP, IPRow | tuple[IPRow, ...]]] = {
             IPRow(24, {"lut": 3270, "ff": 2064, "carry8": 398}),  # 308
         ),
     },
-    # The low-voltage grade closes nothing the -2L table declares for integer
-    # division, and needs a deeper multiply besides, so most of its integer
-    # arithmetic is a row of its own.
+    # The low-voltage grade closes none of the -2L integer division rows and
+    # needs a deeper multiply, so most of its integer arithmetic is a row of
+    # its own.
     GRADE_2LV: {
         ip.fdiv: IPRow(16, {"lut": 804, "ff": 699, "carry8": 111}),  # 361
         ip.imul32: IPRow(3, {"ff": 32, "dsp": 3}),  # 341
@@ -283,10 +281,10 @@ _STORAGE = {
             r["ff"]: (Linear(1.0), Linear(1.0)),
         },
     ),
-    # Distributed RAM has one write port and ONE addressed read, the two being
-    # separate structures (no pool). A second read address is a whole further
-    # copy of the array: measured 640 / 1280 / 1920 / 2560 LUT as memory at
-    # 1024x32 for one through four reads.
+    # Distributed RAM has one write port and one addressed read, in separate
+    # structures (no pool). A second read address costs a further copy of the
+    # array: measured 640 / 1280 / 1920 / 2560 LUT as memory at 1024x32 for one
+    # through four reads.
     "lutram": StorageSpec(
         ("slicem_lut",),
         lambda r: {r["slicem_lut"]: Tiled(64)},
@@ -301,8 +299,8 @@ _STORAGE = {
         inst_reads=1,
         inst_writes=1,
     ),
-    # Two ports, each reading OR writing in a cycle: hence the pool, which two
-    # writers and a concurrent reader together exceed.
+    # Two ports, each reading or writing in a cycle; two writers and a
+    # concurrent reader together exceed the pool.
     "bram": StorageSpec(
         ("bram36",),
         lambda r: {r["bram36"]: Tiled(36864)},
@@ -333,10 +331,9 @@ def _comb_uses(r: Mapping[str, Resource]) -> dict[CombKind, dict | None]:
     compare = {lut: Linear(1.0), carry8: Tiled(16)}
     minmax = {lut: Linear(2.0), carry8: Tiled(16)}
     shift = {lut: Interp({8: 15, 16: 44, 32: 107, 64: 265, 96: 427, 128: 573})}
-    # The DSP count is a whole number of slices and steps; the fabric logic
-    # around them grows with the width. Past 64 bits the partial-product tree
-    # takes more carry chains than `Tiled` charges, measured 31 against 8 at
-    # 128 bits.
+    # The DSP count steps in whole slices; the fabric logic around them grows
+    # with width. Past 64 bits the partial-product tree takes more carry chains
+    # than `Tiled` charges: measured 31 against 8 at 128 bits.
     multiply = {
         lut: Interp({8: 39, 16: 0, 32: 15, 64: 41, 96: 153, 128: 316}),
         dsp: Table({8: 0, 16: 1, 32: 3, 64: 10, 96: 21, 128: 34}),

@@ -301,8 +301,8 @@ def test_a_dynamic_bank_costs_a_port_on_every_bank():
     # Two banks, three crossbarred reads: six read ports, three on each bank.
     assert len(re.findall(r"\bseq\.read\b", mod.mlir)) == 6
     # A distributed RAM instance serves one addressed read, so a bank taking
-    # three of them is held in three copies and all three are emitted: the reads
-    # split over them and every write reaches all.
+    # three of them is held in three copies: the reads split over them and every
+    # write reaches all.
     assert mod.mlir.count("= seq.hlmem") == 6
     # ... which is one more than the two banks hold, so the read loop runs at
     # II=2 while the copy loop stays fully pipelined.
@@ -676,8 +676,8 @@ def test_partition_factors_join_to_the_finer_one():
     s = fj_top.schedule()
     s.compose(ps, cs)
     mod = s.export("rtl")
-    # By bank, the instance suffix stripped: how many copies of the row a bank
-    # is held in follows from its read ports and is not what this is about.
+    # By bank, with the instance suffix stripped: the number of copies a bank is
+    # held in follows from its read ports and is not what this checks.
     cells = {
         (re.sub(r"_c\d+$", "", name), depth)
         for name, depth in re.findall(r"seq\.hlmem @(\w+) [^:]*: <(\d+)x", mod.mlir)
@@ -816,7 +816,7 @@ def test_a_skewed_partition_serves_a_row_and_a_column():
     # one addressed read. Under cyclic the four row reads bank statically (one
     # port each) and the four column reads crossbar (a port on every bank):
     # 4 + 4*4 = 20 reads, five to a bank, five copies of each. Under the skew
-    # the eight reads fall into two LANES of four distinct slots and a lane
+    # the eight reads fall into two lanes of four distinct slots and a lane
     # shares one port per bank: 2 * 4 = 8 reads, two to a bank, two copies.
     assert skew.mlir.count("= seq.hlmem") == 8
     assert cyc.mlir.count("= seq.hlmem") == 20
@@ -1133,7 +1133,7 @@ def test_constant_table_reads_are_unlimited_port():
 def test_a_constant_table_is_priced_as_the_logic_it_is_built_from():
     # A ROM holds no memory bits and occupies no storage row: it is emitted as a
     # constant array read by an index, so the part builds it out of LUTs. One
-    # LUT6 is a 64-entry one-bit lookup, so a 64-deep table costs its width.
+    # LUT6 is a 64-entry one-bit lookup, so a 64-deep table costs one per bit.
     table = (np.arange(64, dtype=np.int32) * 7) & 0xFF
 
     @kernel
@@ -1155,9 +1155,8 @@ def test_a_constant_table_is_priced_as_the_logic_it_is_built_from():
     assert est.mem_bits == 0, "a constant table is logic, not memory"
     assert est.by_kind["memories"].lut == 32
 
-    # Binding it to a block RAM changes nothing: the emission ignores the row
-    # (only its read latency is taken from it), so charging a BRAM tile would be
-    # pricing a structure the design does not contain.
+    # Binding it to a block RAM changes nothing: the emission takes only the
+    # read latency from the row, so no BRAM tile is charged.
     s = rom.schedule()
     s.bind_storage("tbl", impl=Schedule.BRAM, mem_type=s.RAM_T2P)
     rtl = s.export("rtl")
@@ -1166,12 +1165,9 @@ def test_a_constant_table_is_priced_as_the_logic_it_is_built_from():
 
 
 def test_a_table_a_sub_kernel_only_reads_is_still_a_table():
-    # Read-only is a property of the USE, and a sub-kernel is one of the users.
-    # The pre-schedule predicate cannot see which way a child touches an array,
-    # so it has to disqualify every array crossing a call; only a sweep that has
-    # the callee's port directions in hand can say the child merely reads it and
-    # leave the array a combinational table. Nothing in the benchmark bed pairs
-    # a table with a call, so this is the only thing holding that path.
+    # Read-only is a property of the use, and a sub-kernel is one of the users:
+    # only a sweep holding the callee's port directions can tell that a child
+    # merely reads an array and leave it a combinational table.
     tbl_vals = (np.arange(8, dtype=np.int32) * 9) & 0xFF
 
     @kernel
@@ -1186,8 +1182,8 @@ def test_a_table_a_sub_kernel_only_reads_is_still_a_table():
 
     rtl = _to_rtl(rom_caller)
     rtl.compile()
-    # The CALLER's copy: the callee sees the same array as a boundary argument,
-    # whose cells belong to whoever passed it.
+    # The caller's copy: to the callee the array is a boundary argument, whose
+    # cells belong to whoever passed it.
     caller = next(f for f in rtl.report.microarch.funcs if f.func == "rom_caller")
     mem = next(m for m in caller.mems if m.owner.startswith("tbl"))
     assert mem.realization == "rom", "a child that only reads leaves it a table"
@@ -1200,9 +1196,6 @@ def test_a_table_a_sub_kernel_only_reads_is_still_a_table():
 
 
 def test_a_design_asking_for_more_of_a_resource_than_the_part_has_is_named():
-    # `capacity` is what the device declares it holds and the estimate is what
-    # the design asks for; a design over the part is not placeable there, so the
-    # fraction is reported rather than left for a reader to divide out.
     @kernel
     def k(A: i32[64], out: i32[64]):
         buf: i32[64]
@@ -1221,7 +1214,7 @@ def test_a_design_asking_for_more_of_a_resource_than_the_part_has_is_named():
     assert not est.over_capacity, "this fits a u55c many times over"
 
     # The same design against a part with a handful of LUTs: the LUT rows go
-    # over and nothing else does.
+    # over capacity and nothing else does.
     small = default_device.copy()
     for name in ("lut", "slicem_lut"):
         small.resources[name] = Resource(name, 8)
@@ -1231,9 +1224,8 @@ def test_a_design_asking_for_more_of_a_resource_than_the_part_has_is_named():
 
 
 def test_a_banked_array_cannot_be_declared_with_contents():
-    # The contents are one array of words and the emitter realizes them as one
-    # bank, so a banking partition on such an array is refused rather than
-    # silently dropped. A complete partition is not banking and stays legal.
+    # Declared contents are realized as one bank, so a banking partition on such
+    # an array is refused. A complete partition is not banking and stays legal.
     table = (np.arange(16, dtype=np.int32) * 7) & 0xFF
 
     @kernel
@@ -1489,10 +1481,8 @@ def test_an_undeclared_storage_is_reported():
 
 
 def test_a_storage_that_powers_up_undefined_cannot_hold_declared_contents():
-    # An UltraRAM comes up with no contents, so an array that must start holding
-    # them is not something it can be. Asked for it anyway, the synthesizer
-    # quietly builds a block RAM instead and the design occupies what it was
-    # never priced as, which is exactly the drift a diagnostic here prevents.
+    # An UltraRAM powers up with no contents, so an array that must start
+    # holding them cannot be one.
     @kernel
     def rmw(A: i32[8], B: i32[8]):
         tbl: i32[8] = [1, 2, 3, 4, 5, 6, 7, 8]
@@ -1549,10 +1539,10 @@ def _shared_mems(rtl, owner):
 
 
 def test_a_storage_binding_reaches_every_kernel_the_array_is_visible_in():
-    # `bind_storage` is stated once where the array lives, and a callee sees only
-    # its own parameter, so left alone the child resolves the default row and
-    # reads a 2-cycle UltraRAM at 1-cycle timing: every element comes back
-    # shifted. The binding rides the same carrier classes the partition does.
+    # `bind_storage` is stated once where the array lives, and a callee sees
+    # only its own parameter, so a child left on the default row would read a
+    # 2-cycle UltraRAM at 1-cycle timing and every element would come back
+    # shifted.
     s = sh_top.schedule()
     s.bind_storage("buf", impl=Schedule.URAM, mem_type=s.RAM_T2P)
     rtl = s.export("rtl")
@@ -1583,10 +1573,8 @@ def test_a_storage_binding_reaches_every_kernel_the_array_is_visible_in():
 
 
 def test_two_kernels_binding_one_array_to_different_structures_is_refused():
-    # One array is held in one structure, and a sub-kernel masters a port on the
-    # caller's, so only one of the two can be built. Refused on the `impl` axis
-    # whatever the timing says: `bram` and `lutram` are both 1-cycle here and
-    # still different hardware.
+    # Refused on the `impl` axis whatever the timing says: `bram` and `lutram`
+    # are both 1-cycle here and still different hardware.
     s = sh_top.schedule()
     cs = sh_cons.schedule()
     cs.bind_storage("buf", impl=Schedule.BRAM, mem_type=cs.RAM_T2P)
@@ -1597,10 +1585,8 @@ def test_two_kernels_binding_one_array_to_different_structures_is_refused():
 
 
 def test_the_port_topology_two_kernels_ask_for_is_covered_not_matched():
-    # `type=` asks for a topology, and the three form a chain: t2p serves
-    # everything s2p does and s2p everything 1p does. A child asking for less
-    # than its caller is not a conflict, it just uses fewer of the ports the
-    # array has, so the array takes the topology that covers both.
+    # The three topologies form a chain: t2p serves everything s2p does, and s2p
+    # everything 1p does, so the array takes the one that covers both kernels.
     def buf_ports(build):
         s = sh_top.schedule()
         build(s)
@@ -1616,8 +1602,8 @@ def test_the_port_topology_two_kernels_ask_for_is_covered_not_matched():
         s.compose(cs)
         s.bind_storage("buf", impl=Schedule.BRAM, mem_type=s.RAM_T2P)
 
-    # The block RAM's own 2 read / 2 write reaches every kernel: the child's 1p
-    # narrowed nothing, because t2p covers it.
+    # The block RAM's 2 read / 2 write reaches every kernel: t2p covers the
+    # child's 1p, so the 1p narrows nothing.
     ports, rtl = buf_ports(mixed)
     assert ports == {(2, 2)}
     A = np.arange(64, dtype=np.int32)
@@ -1625,7 +1611,7 @@ def test_the_port_topology_two_kernels_ask_for_is_covered_not_matched():
     rtl.cosim(A, out)
     assert np.array_equal(out, (A + 1) & 255)
 
-    # 1p on its own does narrow it, so the assertion above has teeth.
+    # 1p stated on the owner does narrow it.
     only_1p, _ = buf_ports(
         lambda s: s.bind_storage("buf", impl=Schedule.BRAM, mem_type=s.RAM_1P)
     )
@@ -1633,11 +1619,10 @@ def test_the_port_topology_two_kernels_ask_for_is_covered_not_matched():
 
 
 def test_a_multi_cycle_read_registers_the_datum_not_the_address():
-    # A 2-cycle read is a port that reads in one cycle and holds the datum in an
-    # output register, which is the register a block RAM and an UltraRAM have.
-    # Registering the address instead lands the same datum on the same cycle and
-    # throws that register away, leaving the array with the deeper timing and
-    # nothing to build it out of.
+    # A 2-cycle read is a port that reads in one cycle and holds the datum in
+    # the output register a block RAM and an UltraRAM have. Registering the
+    # address instead lands the same datum on the same cycle but throws that
+    # register away.
     @kernel
     def k(A: i32[32], out: i32[32]):
         buf: i32[32] = 0
@@ -1729,8 +1714,7 @@ def test_the_device_names_the_storage_a_scatter_goes_into():
 
 def test_a_scatter_row_declares_no_port_limit():
     # One cell per element is not addressed, so a `scatter` row has no port to
-    # limit; a limit on it would bound the very realization a complete partition
-    # resolves to.
+    # limit.
     for limit in ({"inst_reads": 1}, {"inst_writes": 1}):
         dev = default_device.copy()
         del dev.storage["register"]
@@ -1745,11 +1729,9 @@ def test_a_scatter_row_declares_no_port_limit():
 
 
 def test_reads_share_the_ports_the_row_has_rather_than_taking_one_each():
-    # Six reads of one array in one region. The scheduler bills the row's read
-    # ports, so it staggers them across cycles; the port binding then puts them
-    # on that many ports rather than one each, and the array still infers a RAM.
-    # The two halves have to agree: a schedule cut to fit two ports whose
-    # emission built six would spend the II and get the register file anyway.
+    # Six reads of one array in one region: the scheduler bills the row's two
+    # read ports and staggers the reads across cycles, and the binding puts them
+    # on those two ports rather than one each.
     @kernel
     def k(A: i32[32], out: i32[8]):
         buf: i32[32] = 0
@@ -1775,11 +1757,9 @@ def test_reads_share_the_ports_the_row_has_rather_than_taking_one_each():
     # so its three ports really are three and it has all three.
     assert mem.cost.ports == 3 and mem.realization == "ram"
 
-    # A block RAM's two ports are ONE pool, each serving a read or a write in a
-    # cycle, so two read ports and the fill loop's write port cannot each take
-    # one. The fill loop and the drain loop never run together, so the write
-    # rides a read's port instead: two ports, one block RAM, and the vendor
-    # attribute pinning it there.
+    # A block RAM's two ports are one pool, each serving a read or a write in a
+    # cycle. The fill loop and the drain loop never run together, so the write
+    # rides a read's port: two ports over three accesses, and one block RAM.
     s = k.schedule()
     s.bind_storage("buf", impl=Schedule.BRAM, mem_type=s.RAM_T2P)
     mem, rtl = buf_of(s.export("rtl"))
@@ -1791,15 +1771,11 @@ def test_reads_share_the_ports_the_row_has_rather_than_taking_one_each():
 
 
 def test_a_row_with_one_write_port_is_scheduled_to_one_rather_than_overrun():
-    # Two stores per iteration against a row with a single write port. The
-    # scheduler bills that one port, so it puts the stores on different cycles
-    # (II 2, not 1) and the binding lands them both on it: the array stays a
-    # RAM, where billing two and building one would have silently produced a
-    # register file at the II of a RAM.
-    #
-    # Deeper than the auto-partition threshold on purpose: a completely
-    # partitioned array is realized as registers and never reaches a port at
-    # all, so only a deeper one puts the binding under test.
+    # Two stores per iteration against a row with a single write port: the
+    # scheduler bills that port, so the stores land on different cycles (II 2)
+    # and the binding puts them both on it. Deeper than the auto-partition
+    # threshold, since a completely partitioned array is realized as registers
+    # and never reaches a port at all.
     @kernel
     def k(A: i32[32], out: i32[32]):
         buf: i32[32] = 0
@@ -1828,8 +1804,7 @@ def test_a_row_with_one_write_port_is_scheduled_to_one_rather_than_overrun():
 
     # Two write ports where the row has two: each gets its own `always` block,
     # which is what infers a true dual port. The drain loop's read rides one of
-    # them, since the two loops never run together and a pooled port serves
-    # either direction, so the three accesses still fit the two ports it has.
+    # them, so the three accesses still fit the two ports the row has.
     s = k.schedule()
     s.bind_storage("buf", impl=Schedule.BRAM, mem_type=s.RAM_T2P)
     mem, est, rtl = buf_of(s.export("rtl"))
@@ -1838,8 +1813,8 @@ def test_a_row_with_one_write_port_is_scheduled_to_one_rather_than_overrun():
     assert mem.cost.ports == 2 and mem.realization == "ram"
     assert "independent" in rtl.mlir and est.area.bram36 == 1
     # The port a read and a write share addresses the array once, in one
-    # `always` block: two address buses over three accesses is what a dual-port
-    # RAM has to see, and three would infer nothing.
+    # `always` block: a dual-port RAM has to see two address buses over the
+    # three accesses, and three would infer nothing.
     assert re.search(
         r"buf_\[(\w+)\] <= \w+;.*\n.*buf__rd0_reg <= buf_\[\1\]", rtl.verilog
     ), "the shared port's write and read take one address"
@@ -2362,9 +2337,9 @@ def test_buffer_threaded_across_regions_is_one_memory(depth):
                 B[i] = t[0]
 
     mod = _to_rtl(cross)
-    # Counted off the memories rather than off the emitted cells: `t` is small
-    # enough to be auto-partitioned, so it is realized as one register per
-    # element and holds no `seq.hlmem` to count.
+    # Counted off the memories rather than the emitted cells: `t` is small
+    # enough to be auto-partitioned, so it is one register per element and
+    # holds no `seq.hlmem` to count.
     assert len([m for f in mod.microarch.funcs for m in f.mems if not m.external]) == 1
     B = np.zeros(8, np.int32)
     mod.cosim(A8, B)
@@ -2990,7 +2965,7 @@ def test_a_data_dependent_subscript_keeps_its_storage():
     s = roam.schedule()
     s.pipeline("i")
     mod = s.export("rtl")
-    # Still ONE storage, and `register` is realized as it is priced: a cell per
+    # Still one storage, and `register` is realized as it is priced: a cell per
     # element, so no addressed memory is built for it at all.
     assert len([m for f in mod.microarch.funcs for m in f.mems if not m.external]) == 1
     assert mod.microarch.mem("buf_").storage == "register"

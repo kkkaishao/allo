@@ -21,10 +21,8 @@ namespace mlir::allo::uarch {
 Value DatapathEmitter::resolveSource(const uarch::Source &s) {
   switch (s.kind) {
   case uarch::Source::Kind::Unit: {
-    // An operator result. `unitVal` is module-scope and never cleared, since a
-    // container's units stay readable while a nested child emits, so a miss
-    // means the owning region has not emitted yet rather than that it is the
-    // wrong region.
+    // An operator result. `unitVal` is module-scope and never cleared: a
+    // container's units stay readable while a nested child emits.
     Value v = unitVal.lookup(s.id);
     assert(v && "unit source read before its region declared it");
     return v;
@@ -233,9 +231,6 @@ void DatapathEmitter::emitUnits(const uarch::RegionBlock &rb) {
         assert(issue && "recurrence input in a region with no controller");
         Value iterN = c.R(
             comb::AndOp::create(c.b, c.loc, issue, atIteration(rb, n), false));
-        // A recurrence input belongs to an unshared unit (a shared port
-        // carries its identities as mux arms), so the one bound op's stage is
-        // the gate's.
         Value gate = c.activationPulse(iterN, u.boundOps.front().stage, sh);
         v = c.mux(gate, resolveSource(init), v);
       }
@@ -283,10 +278,7 @@ void DatapathEmitter::emitUnits(const uarch::RegionBlock &rb) {
 std::pair<Value, unsigned>
 DatapathEmitter::emitConditionRegion(const uarch::RegionBlock &rb,
                                      const uarch::Source &condSrc) {
-  // The same order a leaf region's datapath emits in, over this container's own
-  // condition cone. No issue pulse here, and none is needed: the cone's reads
-  // are continuous reads of a stable element, which `bindMemoryPorts` keeps one
-  // to a port for exactly that reason.
+  // The same order a leaf region's datapath emits in, with no issue pulse.
   emitBeforeUnits(rb, /*issue=*/Value());
   emitUnits(rb);
   emitAfterUnits(rb, /*issue=*/Value());
@@ -393,9 +385,8 @@ StallShell DatapathEmitter::deriveStallShell(const uarch::RegionBlock &rb,
          "defers a starved or back-pressured pass by GATING its issue, so a "
          "controller whose issue cannot be gated would drop the pass and "
          "sample `_data` with no regard for `_valid`");
-  // Resolved once and split by direction, which is what every phase below
-  // filters on; a stage decides what an access CONTRIBUTES, not whether the
-  // phase looks at it.
+  // The accesses split by direction, which is what every phase below filters
+  // on.
   struct Acc {
     const uarch::StreamChannel &ch;
     const uarch::StreamChannel::Access &acc;
@@ -716,9 +707,8 @@ void DatapathEmitter::emitComposedChannel(const uarch::StreamChannel &s) {
     w.prodReady.setValue(allNotFull);
 }
 
-// Wire the start pulse of one child. WHICH policy is `cu.startPolicy`, decided
-// by `recordCallDeps`; what differs here is only how each one is built, and the
-// composition class picks between two spellings of two of them.
+// Wire the start pulse of one child, built as `cu.startPolicy` says; the
+// composition class picks between two spellings of two of the policies.
 Value DatapathEmitter::startForCall(const uarch::CallUnit &cu, Value issue,
                                     ArrayRef<Value> predDones, bool concurrent,
                                     const StallShell &sh) {
@@ -726,9 +716,9 @@ Value DatapathEmitter::startForCall(const uarch::CallUnit &cu, Value issue,
   case uarch::CallUnit::StartPolicy::Handshake:
     // A child's `done` is a level its own start clears, so on a retriggered
     // region it still reads the previous pass's 1 until the child is released.
-    // The join means "completed THIS pass" and so reads it through
-    // `completedSince(issue)`, in a SCHEDULED composition only: there `issue`
-    // is the pass-start pulse the calls are placed against, where a CONCURRENT
+    // The join means "completed this pass" and so reads it through
+    // `completedSince(issue)`, in a scheduled composition only: there `issue`
+    // is the pass-start pulse the calls are placed against, where a concurrent
     // region has no such boundary.
     assert(!predDones.empty() && "a handshake start has nothing to join");
     return c.startFor(concurrent ? Value() : issue, predDones);
@@ -839,19 +829,16 @@ void DatapathEmitter::emitCalls(const uarch::RegionBlock &rb, Value issue,
     // window, which would otherwise read the previous pass's latched 1.
     Value completed =
         concurrent ? outs[kDone] : c.completedSince(outs[kDone], issue);
-    // The window this child owns the ports it masters. A child drives its
-    // addresses continuously and has no per-access pulse, so this is what a
-    // port a second accessor also holds selects on.
+    // The window this child owns the ports it masters, which a port a second
+    // accessor also holds selects on. A child drives its addresses
+    // continuously and has no per-access pulse.
     //
-    // Armed from its release, which is in the window combinationally since the
-    // register only carries it from the next cycle, and closed by its
-    // completion COMBINATIONALLY as well: a gated sibling's start is the rising
-    // edge of this one's `done` (`startFor`), so the two run on the very same
-    // cycle and clearing a cycle later would leave both claiming the bus.
+    // Armed from its release and closed by its completion, both
+    // combinationally: a gated sibling's start is the rising edge of this one's
+    // `done` (`startFor`), so the two run on the same cycle and clearing a
+    // cycle later would leave both claiming the bus.
     //
-    // Built on demand, and this one really is worth deferring: it costs a
-    // flip-flop per call, and only a port this child SHARES with another
-    // accessor ever selects on it.
+    // Built on demand, costing a flip-flop per call.
     Value driving;
     auto runWindow = [&] {
       if (!driving) {

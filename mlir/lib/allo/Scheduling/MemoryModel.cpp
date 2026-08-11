@@ -83,9 +83,8 @@ bool StoragePorts::holds(unsigned nwrites, unsigned nports) const {
   // A copy hosts every write and has what is left over for them.
   unsigned own = nports - nwrites;
   unsigned perCopy = instPool ? *instPool - nwrites : instReads.value_or(own);
-  // Another copy is always available unless the ports are stated, so the reads
-  // only fail where a copy has nothing left to give them: the writes fill one
-  // instance on their own.
+  // Unless the ports are stated another copy is always available, so the reads
+  // fail only where the writes fill one instance on their own.
   return stated ? own <= perCopy : own == 0 || perCopy > 0;
 }
 
@@ -161,10 +160,8 @@ std::optional<StoragePorts> allo::requestedPortsOf(Value memref) {
   // Per bank. A SimpleDualPort (S2P) RAM has one dedicated port of each
   // direction, so its two ends never contend and it declares no pool; every
   // other topology shares its ports between the directions, a ROM spelling
-  // asking for the same ports as the RAM it mirrors.
-  //
-  // `stated`: the request names the ports the ARRAY is to have, so a copy the
-  // compiler added on top would give it more than it asked for.
+  // asking for the same ports as the RAM it mirrors. `stated` because the
+  // request names the ports the array is to have, leaving no room for a copy.
   switch (*bs.port) {
   case MemoryPortEnum::SinglePort:
     return StoragePorts{1u, 1u, 1u, true};
@@ -202,12 +199,9 @@ bool mlir::allo::isConstantTable(Value memRef) {
   });
 }
 
-// Whether anything may READ this array. An argument's cells belong to whoever
-// passed it and its readers are not visible here, so it is always taken as
-// read; so is an array crossing into a sub-kernel, whichever way the child
-// accesses it. Both are the safe answer, and both are what makes the budget
-// below the SAME number on the two sides of a call, which it has to be: the two
-// hold ports on one structure.
+// Whether anything may read this array. An argument and an array crossing into
+// a sub-kernel are always taken as read, which keeps the port budget the same
+// number on both sides of a call, where the two hold ports on one structure.
 static bool mayBeRead(Value memRef) {
   if (isa<BlockArgument>(memRef))
     return true;
@@ -247,12 +241,10 @@ static bool writtenThrough(Value memRef) {
   });
 }
 
-// Sub-kernel calls that WRITE \p memRef. Two of them run together wherever
-// their footprints do not collide, since only a collision orders a pair, and
-// then the array needs a write port each. This function's own stores are not
-// counted: however many they are, they belong to one accessor the schedule
-// serializes against whatever budget the row gives, and a call is ordered
-// against them by the region they sit in.
+// Sub-kernel calls that write \p memRef. Two of them run together wherever
+// their footprints do not collide, and the array then needs a write port each.
+// This function's own stores are not counted: they belong to one accessor the
+// schedule serializes against whatever budget the row gives.
 static unsigned writingCalls(Value memRef) {
   unsigned n = 0;
   for (Operation *u : memRef.getUsers())
@@ -262,28 +254,25 @@ static unsigned writingCalls(Value memRef) {
 }
 
 // The name of the storage realization a memref resolves to, the input to
-// per-realization access timing, in the order the five sources outrank each
+// per-realization access timing. Five sources, in the order they outrank each
 // other:
 //
 //   * a complete partition takes the device's `scatter` row whatever
 //     `bind.storage impl` says, since once every bank holds one word there is
 //     no addressed structure left;
-//   * else an explicit `bind.storage impl`, the user's own choice;
-//   * else the `scatter` row again for a LOCAL array several sub-kernels
-//     write, since an addressed structure has no more write ports than it has
-//     ports and only registers take a write decoder per writer. Not for an
-//     argument: its cells are the caller's, and this module only holds ports
-//     on them;
-//   * else the device's `default` row where it marks one, which is a device
-//     stating the policy itself and turns the derivation off;
-//   * else the row `rowFor` derives from what the array COSTS on this part.
+//   * else an explicit `bind.storage impl`;
+//   * else the `scatter` row again for a local array several sub-kernels write,
+//     since an addressed structure has no more write ports than it has ports
+//     and only registers take a write decoder per writer. Not for an argument,
+//     whose cells this module only holds ports on;
+//   * else the device's `default` row where it marks one;
+//   * else the row `rowFor` derives from what the array costs on this part.
 //
 // An empty result is a device that can hold this array nowhere, which
 // `PreVerification` reports.
 //
-// Run ONCE per array, by `recordArrayStorage`. Every layer after reads the
-// record: the scheduler times against it before there is a schedule, and the
-// emitter builds it after.
+// Called once per array, by `recordArrayStorage`; every later layer reads the
+// record it leaves.
 static std::string deriveStorage(Value memRef, const MemoryLibrary &lib) {
   BankLayout layout = bankLayoutOf(memRef);
   if (layout.registers)
@@ -299,9 +288,9 @@ static std::string deriveStorage(Value memRef, const MemoryLibrary &lib) {
   auto type = dyn_cast<MemRefType>(memRef.getType());
   if (!type)
     return {};
-  // Per BANK, which is the structure that gets built: the bank count is a
-  // common factor across the rows and cannot reorder them, but a row's tiling
-  // minimum is charged once per bank and very much can.
+  // Priced per bank, the structure that gets built: the bank count is a common
+  // factor across the rows and cannot reorder them, but a row's tiling minimum
+  // is charged once per bank and can.
   return lib.rowFor(layout.bankWords(), datapathWidth(type.getElementType()),
                     globalInitOf(memRef).has_value());
 }
@@ -333,9 +322,8 @@ static void setCarrierAttr(Value memRef, StringRef name, Attribute value) {
 
 // The parameter each memref argument of \p call binds, with the array passed
 // to it. Empty for a callee with no body.
-static void
-calleeParams(func::CallOp call,
-             llvm::SmallVectorImpl<std::pair<Value, Value>> &out) {
+static void calleeParams(func::CallOp call,
+                         llvm::SmallVectorImpl<std::pair<Value, Value>> &out) {
   auto callee = SymbolTable::lookupNearestSymbolFrom<func::FuncOp>(
       call, call.getCalleeAttr());
   if (!callee || callee.isExternal())
@@ -346,10 +334,10 @@ calleeParams(func::CallOp call,
 }
 
 void allo::recordArrayStorage(ModuleOp module, const MemoryLibrary &lib) {
-  // A parameter a call binds is not an OWNER of its array: the cells are the
-  // caller's, and inputs to the resolution like who writes the array are only
-  // all visible where they live. Its record is carried in rather than derived,
-  // which is also what keeps the two sides of a call one decision.
+  // A parameter a call binds does not own its array, and inputs to the
+  // resolution such as who writes it are only all visible at the owner. Its
+  // record is carried in rather than derived, keeping the two sides of a call
+  // one decision.
   llvm::DenseSet<void *> bound;
   llvm::SmallVector<std::pair<Value, Value>> params;
   module.walk([&](func::CallOp call) { calleeParams(call, params); });
@@ -382,8 +370,8 @@ void allo::recordArrayStorage(ModuleOp module, const MemoryLibrary &lib) {
         calleeParams(call, reached);
     for (auto [actual, param] : reached)
       if (actual == memRef) {
-        // A parameter naming its own `impl=` keeps what IT resolves to, so a
-        // user binding one array to two rows is still a disagreement
+        // A parameter naming its own `impl=` keeps what that resolves to, so
+        // one array bound to two rows stays a disagreement
         // `checkArgumentAgreement` reports rather than one silently overridden.
         StringRef bind = boundStorageOf(param);
         work.emplace_back(param, bind.empty() ? row : bind.str());
@@ -417,8 +405,7 @@ void MemoryBankModel::finalize(const MemoryLibrary &lib) {
   }
 }
 
-MemoryBankModel::PortDemand
-MemoryBankModel::resources(Operation *op) const {
+MemoryBankModel::PortDemand MemoryBankModel::resources(Operation *op) const {
   auto memRef = storageOf(op);
   if (!memRef)
     return {};
@@ -434,9 +421,8 @@ MemoryBankModel::resources(Operation *op) const {
   // both at once, which makes two writers and a concurrent reader three ports
   // of a block RAM rather than two writes plus one read.
   //
-  // Billed in SLOTS, one instance's ports once per copy: a read takes a slot of
-  // the one copy that serves it and a write a slot of every copy, so a row's
-  // copies are worth exactly what they buy.
+  // Billed in slots, one instance's ports once per copy: a read takes a slot of
+  // the one copy that serves it, a write a slot of every copy.
   auto a = asMemAccess(op);
   assert(a && "storageOf named a storage root, so this is a memory access");
   unsigned copies = info.ports.copies();
@@ -914,15 +900,14 @@ MemoryLibrary MemoryLibrary::fromModule(ModuleOp module) {
   for (auto r : body.getOps<dcp::DCPathResourceOp>())
     m.capacity[r.getSymName()] = r.getCapacity();
   for (auto s : body.getOps<dcp::DCPathStorageOp>()) {
-    m.storage.push_back(
-        {s.getSymName().str(),
-         timing(s),
-         {limit(s.getInstReads()), limit(s.getInstWrites()),
-          limit(s.getInstPorts())},
-         s.getRamStyle().value_or("").str(),
-         !s.getNoInit(),
-         s.getIsScatter(),
-         s.getUsesAttr()});
+    m.storage.push_back({s.getSymName().str(),
+                         timing(s),
+                         {limit(s.getInstReads()), limit(s.getInstWrites()),
+                          limit(s.getInstPorts())},
+                         s.getRamStyle().value_or("").str(),
+                         !s.getNoInit(),
+                         s.getIsScatter(),
+                         s.getUsesAttr()});
     if (s.getIsDefault())
       m.defaultStorage = s.getSymName().str();
     if (s.getIsScatter())
@@ -961,10 +946,9 @@ std::optional<double> MemoryLibrary::fractionOfPart(StringRef storage,
 
 std::string MemoryLibrary::rowFor(int64_t words, unsigned width,
                                   bool needsInit) const {
-  // Only a row the device can PIN is a candidate: choosing a structure and
-  // leaving the synthesizer to agree is the delegation this whole model is
-  // against. A row without a vendor attribute is reachable through
-  // `bind_storage impl=` alone, which is the user taking that risk knowingly.
+  // Only a row the device can pin is a candidate, so the structure chosen here
+  // is the one built. A row with no vendor attribute stays reachable through
+  // `bind_storage impl=`.
   llvm::SmallVector<std::pair<const StorageRealization *, double>> viable;
   for (const StorageRealization &s : this->storage) {
     if (s.scatter || s.ramStyle.empty() || (needsInit && !s.canInit))
@@ -981,8 +965,8 @@ std::string MemoryLibrary::rowFor(int64_t words, unsigned width,
   auto fastest = latency(llvm::min_element(viable, [&](auto &a, auto &b) {
                            return latency(a.first) < latency(b.first);
                          })->first);
-  // Strictly cheaper to displace, so two rows the device prices the same break
-  // by declaration order and the choice stays the device's own.
+  // Strictly cheaper to displace, so rows priced the same break by declaration
+  // order.
   const StorageRealization *pick = nullptr;
   double best = 0.0;
   for (auto &[s, cost] : viable)
@@ -1032,24 +1016,17 @@ MemoryChar allo::characterize(Value memref, const MemoryLibrary &lib) {
   c.storage = resolvedStorageOf(memref);
   // The realization decides what the array has and a `type=` topology narrows
   // it, the meet keeping the tighter of the two. `PreVerification` reports a
-  // topology asking for more than the row has.
-  //
-  // An argument is held in the same budget: whatever backs it upstream is the
-  // structure it resolved to, and the boundary publishes one interface per port
-  // bound here.
+  // topology asking for more than the row has. An argument is held in the same
+  // budget as the structure backing it upstream, the boundary publishing one
+  // interface per port bound here.
   if (const StorageRealization *row = lib.row(c.storage))
     c.ports = row->ports;
   if (auto want = requestedPortsOf(memref))
     c.ports = c.ports.meet(*want);
-  // Writes that fill a POOLED row's ports leave a read no port on any copy, so
-  // the array would fit nowhere however many copies it took. Keep one port of
-  // the pool for the reads and let the schedule serialize the writes against
-  // it: a longer schedule is a structure the part has, and the alternative is
-  // an array no row holds.
-  //
-  // A budget the scheduler bills against and the binding builds to, so the two
-  // stay one number. Not applied where the ports are `stated`: the user named
-  // the topology, and a demand it cannot meet is theirs to hear about.
+  // Writes filling a pooled row's ports would leave a read no port on any copy
+  // and the array would fit nowhere. Reserve one port of the pool for the reads
+  // and let the schedule serialize the writes against it. Skipped where the
+  // ports are `stated`, the user having named the topology.
   if (c.ports.instPool && !c.ports.stated && mayBeRead(memref))
     c.ports.instWrites =
         std::max(1u, std::min(c.ports.instWrites.value_or(*c.ports.instPool),

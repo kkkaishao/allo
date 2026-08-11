@@ -97,8 +97,8 @@ MlirLogicalResult alloRunSDCSchedulingPipeline(
   allo::SchedulerOptions opts{
       *kind, budget > 0.0 ? budget : allo::kDefaultSolveBudget, allocate,
       workers > 0 ? workers : allo::kDefaultSolveWorkers, seed};
-  // The storage decision, taken once and recorded on every array. First,
-  // because every layer below reads the record rather than resolving again.
+  // The storage decision, taken once and recorded on every array before any
+  // layer below reads it.
   allo::recordArrayStorage(mod, allo::MemoryLibrary::fromModule(mod));
   if (failed(allo::runPreScheduleVerification(mod, topName, cycleTimeNs)))
     return mlirLogicalResultFailure();
