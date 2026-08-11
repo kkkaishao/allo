@@ -336,11 +336,12 @@ inline int64_t drainOf(circt::scheduling::Problem &problem,
 }
 
 /// One value a region spends a DELAY REGISTER chain on. The chain is as long as
-/// its deepest reader needs and costs one flip-flop per bit per cycle of that:
+/// its deepest reader needs, and costs what the device charges for a chain of
+/// that many stages at this width:
 ///
 /// ```
 /// depth(v) = max over reads ( t_read + ii * distance ) - ( t_def + latency )
-/// cost(v)  = width * depth(v)
+/// cost(v)  = chainPrice( stages(v), width )
 /// ```
 ///
 /// No register is shared between two values (`insertRegister` keys one chain
@@ -348,10 +349,10 @@ inline int64_t drainOf(circt::scheduling::Problem &problem,
 /// the schedule rather than a MAXLIVE coupled to an allocation, and so a term
 /// an objective can carry directly.
 ///
-/// It over-states a cyclic region by up to the II: the emitter folds the chain
-/// to `ceil(depth / ii)` registers (`EmitContext::foldedChain`). The objective
-/// prices the unfolded chain, so it is conservative about anything that buys
-/// area by lengthening a lifetime.
+/// `stages(v)` is `depth(v)`, except at II > 1 where the emitter FOLDS the
+/// chain onto the region's phase: one register holds a tap for a whole
+/// interval, so `depth` cycles of delay are built from `ceil(depth / ii)` of
+/// them (`EmitContext::foldedChain`).
 struct RegisterTerm {
   Operation *def;
   /// Cycles after `def` issues before the value is readable.
@@ -431,10 +432,16 @@ inline bool usesExactScheduler(SchedulerKind kind) {
 
 /// Defaults for one solve. The budget is in OR-Tools deterministic time units
 /// (roughly a core-second) and is charged per solve, so a cyclic search spends
-/// it again at every initiation interval it probes. One worker and a fixed seed
-/// make two identical compiles emit identical RTL.
+/// it again at every initiation interval it probes. Determinism comes from the
+/// fixed seed plus the interleaved portfolio `solverParameters` selects above
+/// one worker, not from being single-threaded; a solve that exhausts its budget
+/// can still differ run to run.
+///
+/// The worker count is not only a speed knob: the same deterministic budget
+/// buys more search, so a budget-limited region can settle on a different
+/// schedule than it does at one worker.
 inline constexpr double kDefaultSolveBudget = 30.0;
-inline constexpr int kDefaultSolveWorkers = 1;
+inline constexpr int kDefaultSolveWorkers = 8;
 inline constexpr int kDefaultSolveSeed = 0;
 
 /// What the caller asked the scheduler for.

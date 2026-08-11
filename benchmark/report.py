@@ -193,6 +193,9 @@ _BUDGET = re.compile(r"ran out of budget")
 # ALLO_LOG_LEVEL=info and is absent otherwise; it prices what a better raise
 # could still recover.
 _RAISED = re.compile(r"Raised (\d+) loop\(s\) and (\d+) further memref access")
+# PROBE (temporary): the scheduler's own drain-floor measurements, on
+# ALLO_DRAIN_PROBE=1. Kept as raw lines for an offline script to parse.
+_PROBE = re.compile(r"^ALLOPROBE(?:II)? .*$", re.M)
 
 
 def _load(key):
@@ -210,12 +213,14 @@ def measure_one(
     freq: float | None = None,
     budget: float | None = None,
     binding: str = "trivial",
+    workers: int | None = None,
 ) -> dict:
     """Schedule (and by default compile) one variant, returning its metrics.
 
     ``freq`` overrides the device's default clock (MHz), i.e. the period the
     chaining half of every problem is cut against. ``budget`` overrides what one
-    exact solve may spend, in deterministic time units. ``binding`` is the
+    exact solve may spend, in deterministic time units. ``workers`` overrides how
+    many search workers one exact solve runs. ``binding`` is the
     operator-sharing policy, i.e. how many physical units the schedule is
     realized on."""
     bench = _load(key)
@@ -225,6 +230,7 @@ def measure_one(
         "scheduler": scheduler,
         "freq_mhz": freq,
         "budget": budget,
+        "workers": workers,
         "binding": binding,
         "stage": "build",
         "status": "error",
@@ -245,6 +251,8 @@ def measure_one(
         knobs = {"scheduler": scheduler}
         if budget is not None:
             knobs["budget"] = budget
+        if workers is not None:
+            knobs["workers"] = workers
         rtl = sched.export("rtl", **opts).set_scheduler_opt(**knobs)
         t1 = time.time()
         res = rtl.schedule()
@@ -330,6 +338,7 @@ def _run_child(
     freq: float | None,
     budget: float | None,
     binding: str,
+    workers: int | None,
 ) -> dict:
     key, variant, scheduler = item
     env = dict(os.environ)
@@ -351,6 +360,8 @@ def _run_child(
         cmd += ["--freq", str(freq)]
     if budget is not None:
         cmd += ["--budget", str(budget)]
+    if workers is not None:
+        cmd += ["--workers", str(workers)]
     t0 = time.time()
     try:
         p = subprocess.run(
@@ -376,6 +387,7 @@ def _run_child(
                 {"ii": int(a), "bound": int(b)} for a, b in _II_GAP.findall(text)
             ]
             d["budget_exhausted"] = len(_BUDGET.findall(text))
+            d["probes"] = _PROBE.findall(text)
             d["raised"] = [
                 sum(int(m[i]) for m in _RAISED.findall(text)) for i in (0, 1)
             ]
@@ -593,11 +605,14 @@ def area_table(results: list[dict]) -> str:
         f" {tot['uram288']:>5} {tot['reg_ff']:>8}"
         f" {tot['reg_bits']:>8} {tot['mem_bits'] / 1024:>7.1f}"
     )
+    # Not a mispricing: the scheduling objective charges `chainPrice`, not this
+    # bit count, and the ratio below IS the shift-register discount the device
+    # row already models.
     over = tot["reg_bits"] / max(tot["reg_ff"], 1)
     lines.append("")
     lines.append(
-        f"the objective charges {tot['reg_bits']} flip-flops for chains "
-        f"that cost {tot['reg_ff']} FF + {tot['srl']} SRL: {over:.1f}x over"
+        f"chains declare {tot['reg_bits']} register bits, held in "
+        f"{tot['reg_ff']} FF + {tot['srl']} SRL: {over:.1f}x extracted"
     )
     lines.append(
         f"storage costs {tot['mem_lut']} LUTs, {tot['bram36']} BRAM and "
@@ -697,6 +712,13 @@ def main():
         "op), 'greedy-share' or 'planned', which builds the allocation the "
         "exact scheduler decided",
     )
+    ap.add_argument(
+        "--workers",
+        type=int,
+        help="search workers one exact solve runs (default 1). Above one the "
+        "portfolio is interleaved, so the deterministic budget still bounds a "
+        "deterministic search; the axis a parallel-solve change is swept over",
+    )
     ap.add_argument("--timeout", type=int, default=900, help="wall seconds per run")
     ap.add_argument("-o", "--out", default="qor.json")
     ap.add_argument("--per-region", action="store_true")
@@ -729,6 +751,7 @@ def main():
                     args.freq,
                     args.budget,
                     args.binding,
+                    args.workers,
                 )
             )
         )
@@ -763,9 +786,10 @@ def main():
     ]
     clock = f", freq={args.freq}MHz" if args.freq else ""
     pool_size = f", budget={args.budget}" if args.budget else ""
+    nproc = f", workers={args.workers}" if args.workers else ""
     print(
         f"{len(work)} runs, {args.jobs} jobs, stage={args.stage}"
-        f", binding={args.binding}{clock}{pool_size}",
+        f", binding={args.binding}{clock}{pool_size}{nproc}",
         flush=True,
     )
 
@@ -780,6 +804,7 @@ def main():
                 args.freq,
                 args.budget,
                 args.binding,
+                args.workers,
             )
             for w in work
         ]

@@ -54,8 +54,10 @@ class SchedulerOptions:
         budget: what one exact solve may spend, in the solver's deterministic
             time units (roughly a second of one core each).
         workers: how many search workers one exact solve runs. Above one the
-            search is a race, so which incumbent the budget stops on depends on
-            thread timing and two identical compiles can emit different RTL.
+            portfolio is interleaved, so the deterministic budget still bounds a
+            deterministic search. Not only a speed knob: the same budget buys
+            more search, so a budget-limited region can settle on a different
+            schedule than it does at one worker.
         seed: the exact solver's random seed. Shifts which optimum of equal cost
             a solve lands on.
     """
@@ -63,5 +65,5 @@ class SchedulerOptions:
     scheduler: str = "heuristic"
     cycle_ns: float = 5.0
     budget: float = 30.0
-    workers: int = 1
+    workers: int = 8
     seed: int = 0

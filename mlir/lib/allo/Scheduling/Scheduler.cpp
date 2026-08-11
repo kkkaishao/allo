@@ -280,6 +280,15 @@ public:
   LogicalResult schedule() override;
 };
 
+/// What set the resource-min II: the pool that needed the most cycles, what it
+/// was asked for against what it serves, and one operation holding it, so a
+/// diagnostic can point at source rather than at an internal resource key.
+struct BindingResource {
+  circt::scheduling::Problem::ResourceType rsrc;
+  unsigned demand = 0, limit = 0;
+  Operation *witness = nullptr;
+};
+
 // This class solves the `ModuloOccupancyProblem` using the iterative heuristic
 // presented in [2].
 class ModuloSimplexScheduler : public CyclicSimplexScheduler {
@@ -336,7 +345,9 @@ protected:
   LogicalResult scheduleOperation(Operation *n);
   LogicalResult growIIByDeDinechin(Operation *n);
   LogicalResult growIIUniformly(Operation *n);
-  unsigned computeResMinII();
+  /// The fewest cycles one iteration's resource demand can be issued in.
+  /// \p binding receives what set it, untouched where nothing does.
+  unsigned computeResMinII(BindingResource &binding);
 
 public:
   ModuloSimplexScheduler(ModuloOccupancyProblem &prob, Operation *lastOp,
@@ -1232,14 +1243,26 @@ LogicalResult SharedOperatorsSimplexScheduler::schedule() {
     if (isLimited(op, prob))
       limitedOps.push_back(op);
 
-  // Build a priority list of limited ops (sorted by resource-free start
-  // time, a topological order); fixing operators in this order keeps the
-  // acyclic problem feasible. TODO: use a better priority (ASAP/ALAP, height).
-  std::stable_sort(limitedOps.begin(), limitedOps.end(),
-                   [&](Operation *a, Operation *b) {
-                     return getStartTime(startTimeVariables[a]) <
-                            getStartTime(startTimeVariables[b]);
-                   });
+  // Placement order: earliest first, and the largest reservation first where
+  // two operations start at the same time. Earliest-first is a topological
+  // order, which is what keeps the acyclic problem feasible under pinning; the
+  // scan below is first fit over rectangles, and first fit is only respectable
+  // largest-first.
+  //
+  // The cyclic path also breaks ties by least slack, which does not come
+  // across: reading an ALAP means maximizing the start times, and dependences
+  // are the only rows this tableau has, so an operation with no outgoing one
+  // (every store) is unbounded above and the solve has no answer to give.
+  auto rectangle = [&](Operation *op) {
+    return prob.getResourceCycles(op) * prob.getResourceDemand(op);
+  };
+  llvm::stable_sort(limitedOps, [&](Operation *a, Operation *b) {
+    unsigned ta = getStartTime(startTimeVariables[a]);
+    unsigned tb = getStartTime(startTimeVariables[b]);
+    if (ta != tb)
+      return ta < tb;
+    return rectangle(a) > rectangle(b);
+  });
 
   // Store the number of operations using a resource type in a particular time
   // step.
@@ -1601,19 +1624,24 @@ LogicalResult ModuloSimplexScheduler::growIIByDeDinechin(Operation *n) {
   return mrt.enter(n, tauN + deltaN);
 }
 
-unsigned ModuloSimplexScheduler::computeResMinII() {
+unsigned ModuloSimplexScheduler::computeResMinII(BindingResource &binding) {
   unsigned resMinII = 1;
   SmallDenseMap<Problem::ResourceType, unsigned> uses;
+  SmallDenseMap<Problem::ResourceType, Operation *> witness;
   for (auto *op : prob.getOperations()) {
     auto maybeRsrcs = prob.getLinkedResourceTypes(op);
     if (!maybeRsrcs)
       continue;
 
     for (auto rsrc : *maybeRsrcs) {
-      if (prob.getLimit(rsrc).value_or(0) > 0)
+      if (prob.getLimit(rsrc).value_or(0) > 0) {
         // occupancy: the whole window a non-pipelined unit is held for, times
         // the units the operation holds at once
         uses[rsrc] += prob.getResourceCycles(op) * prob.getResourceDemand(op);
+        // The operations come in a stable order, so the one a diagnostic points
+        // at does not depend on walk order.
+        witness.try_emplace(rsrc, op);
+      }
     }
   }
 
@@ -1622,7 +1650,11 @@ unsigned ModuloSimplexScheduler::computeResMinII() {
   // limit >= 2.)
   for (auto pair : uses) {
     unsigned limit = *prob.getLimit(pair.first);
-    resMinII = std::max(resMinII, (pair.second + limit - 1) / limit);
+    unsigned need = (pair.second + limit - 1) / limit;
+    if (need <= resMinII)
+      continue;
+    resMinII = need;
+    binding = {pair.first, pair.second, limit, witness.lookup(pair.first)};
   }
 
   return resMinII;
@@ -1640,7 +1672,8 @@ LogicalResult ModuloSimplexScheduler::schedule() {
   parameterS = 0;
   // Seed the II at the resource-min II, but never below the pipeline
   // directive's target; the search only grows it from there.
-  unsigned resMinII = computeResMinII();
+  BindingResource binding;
+  unsigned resMinII = computeResMinII(binding);
   parameterT = std::max(resMinII, minII);
   info(Stage::Sched, prob.getContainingOp())
       << "Initiation interval search seeded at II=" << parameterT
@@ -1663,6 +1696,23 @@ LogicalResult ModuloSimplexScheduler::schedule() {
   // downstream can justify.
   lowerBoundII = parameterT;
   boundSettled = true;
+
+  // What set the bound, said where it can be acted on: banking or replicating
+  // an array lowers a port-bound interval, reassociating a reduction lowers a
+  // recurrence-bound one, and a directive floor is the user's own.
+  if (lowerBoundII > 1) {
+    if (lowerBoundII > std::max(resMinII, minII))
+      info(Stage::Sched, prob.getContainingOp())
+          << "II cannot go below " << lowerBoundII
+          << " here: a loop-carried recurrence takes that long to come round";
+    else if (resMinII >= minII && binding.witness)
+      info(Stage::Sched, binding.witness)
+          << "II cannot go below " << resMinII
+          << " here: one iteration takes " << binding.demand
+          << " slots of a resource serving " << binding.limit
+          << " per cycle. Banking or replicating what this access reaches is "
+             "what lowers that bound";
+  }
 
   // Determine which operations are subject to resource constraints, and whether
   // any of them is non-pipelined (occupies its unit for more than one cycle).
@@ -1809,9 +1859,16 @@ void OccupancyProblem::assignUnits(unsigned ii) {
       llvm::DenseSet<std::pair<unsigned, unsigned>> taken;
       for (Operation *op : users) {
         unsigned cls = *getStartTime(op) % ii;
-        while (!taken.insert({cursor % *units, cls}).second)
-          ++cursor;
-        assignedUnit[op] = cursor++ % *units;
+        unsigned k = cursor % *units;
+        for (unsigned tried = 1; taken.count({k, cls}) && tried < *units;
+             ++tried)
+          k = (k + 1) % *units;
+        assert(!taken.count({k, cls}) &&
+               "the busiest congruence class needs more instances than the "
+               "allocation decided");
+        taken.insert({k, cls});
+        assignedUnit[op] = k;
+        cursor = k + 1;
       }
     } else {
       // First fit over occupancy windows in start order, rotating the instance

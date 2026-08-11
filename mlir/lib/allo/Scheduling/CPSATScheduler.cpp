@@ -7,6 +7,7 @@
 #include "allo/Scheduling/Scheduler.h"
 #include "allo/Support/Logging.h"
 
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/StringSwitch.h"
 #include "llvm/Support/Format.h"
 
@@ -16,6 +17,8 @@
 #include "ortools/sat/cp_model_solver.h"
 
 #include <cmath>
+#include <limits>
+#include <type_traits>
 #endif
 
 using namespace mlir;
@@ -46,12 +49,19 @@ using namespace operations_research::sat;
 namespace {
 
 /// Solver configuration for one solve. The time limit is deterministic rather
-/// than wall-clock, so two identical compiles emit identical RTL.
+/// than wall-clock, which is what lets two identical compiles emit identical
+/// RTL. A solve that exhausts that limit has been seen to differ run to run
+/// even so, which is unexplained.
 SatParameters solverParameters(const SchedulerOptions &opts) {
   SatParameters params;
   params.set_num_workers(opts.workers);
   params.set_random_seed(opts.seed);
   params.set_max_deterministic_time(opts.budget);
+  // Several workers otherwise race, and which incumbent the budget stops on
+  // would depend on thread timing. Interleaved, the portfolio advances in a
+  // fixed order under the deterministic limit above.
+  if (opts.workers > 1)
+    params.set_interleave_search(true);
   return params;
 }
 
@@ -296,21 +306,29 @@ void minimizeCost(CpModelBuilder &model, IntVar primary,
   // purpose: a tight bound turns the tie-break into a comparable share of the
   // objective, at a large search cost for negligible area.
   int64_t area = static_cast<int64_t>(starts.size()) * pulse;
+  // At II > 1 the emitter folds every chain onto the region's phase, holding
+  // `depth` taps in `ceil(depth / ii)` registers (`EmitContext::foldedChain`).
+  // The variable below is therefore the registers BUILT rather than the cycles
+  // spanned, and the table is indexed by that same count.
+  int64_t fold = std::max<int64_t>(ii, 1);
+  int64_t stages = (horizon + fold - 1) / fold;
   // One chain price table per width: a region carries many values of the same
   // type, and tabulating the device's cost is the expensive half.
   DenseMap<int64_t, SmallVector<int64_t>> chainPrices;
   for (const RegisterTerm &term : span.regs) {
     auto [entry, isNew] = chainPrices.try_emplace(term.width);
     if (isNew)
-      for (int64_t d = 0; d <= horizon; ++d)
-        entry->second.push_back(span.device.chainPrice(d, term.width));
+      for (int64_t n = 0; n <= stages; ++n)
+        entry->second.push_back(span.device.chainPrice(n, term.width));
     ArrayRef<int64_t> table = entry->second;
-    IntVar depth = model.NewIntVar(operations_research::Domain(0, horizon));
+    IntVar built = model.NewIntVar(operations_research::Domain(0, stages));
     IntVar def = startVars.at(term.def);
+    // Only bounded from below. A chain price is nondecreasing in its length, so
+    // a minimizing solve lands `built` on the fold of the deepest read.
     for (auto [reader, distance] : term.reads)
       model.AddLessOrEqual(startVars.at(reader) + distance * ii - term.latency,
-                           def + depth);
-    addPiecewiseCost(model, depth, table, vars, weights);
+                           def + LinearExpr::Term(built, fold));
+    addPiecewiseCost(model, built, table, vars, weights);
     area += *llvm::max_element(table);
   }
   for (const AllocationVar &alloc : allocs) {
@@ -409,6 +427,156 @@ void reportUnsolved(Problem &prob, const CpSolverResponse &response,
       << "); keeping the heuristic schedule";
 }
 
+/// Lower bound on the drain of ANY schedule of \p prob.
+///
+/// Two facts bound where an output can commit. Its own longest path is one. The
+/// other is resource contention: for any set S of operations that must all pass
+/// one capped resource before the output commits,
+///
+/// ```
+/// start(v) >= minHead(S) + ceil( sum demand(u) / limit ) - 1 + minTail(S, v)
+/// ```
+///
+/// since every member of S issues between the earliest head in it and
+/// `start(v)` less the shortest path onward, a window whose capacity has to
+/// cover them all. The longest path is this with S a singleton, where the
+/// middle term vanishes.
+///
+/// Valid at every initiation interval, so the cyclic search computes it once:
+/// within one iteration a window of length L touches `min(L, ii)` congruence
+/// classes, each admitting `limit` units from that iteration, and work above
+/// `ii * limit` is an interval `computeResMinII` already ruled out.
+template <typename ProblemT>
+int64_t drainFloor(ProblemT &prob, const Chaining &chaining,
+                   ArrayRef<DrainTerm> terms) {
+  constexpr int64_t kUnreached = std::numeric_limits<int64_t>::min();
+
+  // The edges the model imposes, weighted as it weights them, in both
+  // directions: heads are read off one end and tails off the other. Only the
+  // edges that stay WITHIN one iteration bound this iteration's outputs, which
+  // is every edge of a straight-line region and the distance-0 ones of a
+  // modulo problem.
+  DenseMap<Operation *, SmallVector<std::pair<Operation *, int64_t>>> in, out;
+  auto edge = [&](Operation *src, Operation *dst, int64_t weight) {
+    in[dst].push_back({src, weight});
+    out[src].push_back({dst, weight});
+  };
+  for (Operation *op : prob.getOperations())
+    for (auto &dep : prob.getDependences(op)) {
+      if constexpr (std::is_same_v<ProblemT, ChainingModuloProblem>)
+        if (prob.getDistance(dep).value_or(0) != 0)
+          continue;
+      edge(dep.getSource(), op, prob.latencyOf(dep.getSource()));
+    }
+  // A chain break is intra-iteration whichever problem this is.
+  for (auto &dep : chaining.breaks)
+    edge(dep.getSource(), dep.getDestination(),
+         prob.latencyOf(dep.getSource()) + 1);
+
+  // Longest path in, memoized; the seeded zero keeps a cycle from recursing
+  // forever if the distance-0 subgraph were ever not acyclic.
+  DenseMap<Operation *, int64_t> heads;
+  auto head = [&](auto &self, Operation *op) -> int64_t {
+    auto seen = heads.find(op);
+    if (seen != heads.end())
+      return seen->second;
+    heads[op] = 0;
+    int64_t longest = 0;
+    auto edges = in.find(op);
+    if (edges != in.end())
+      for (auto [src, weight] : edges->second)
+        longest = std::max(longest, self(self, src) + weight);
+    heads[op] = longest;
+    return longest;
+  };
+
+  int64_t bound = 0;
+  for (const DrainTerm &term : terms)
+    bound = std::max(bound, head(head, term.op) + term.offset);
+
+  SmallVector<std::pair<Problem::ResourceType, int64_t>> capped;
+  for (Problem::ResourceType rsrc : prob.getResourceTypes())
+    if (unsigned limit = prob.getLimit(rsrc).value_or(0))
+      capped.push_back({rsrc, limit});
+  if (capped.empty())
+    return bound;
+
+  struct Contender {
+    int64_t head, tail, demand;
+  };
+  // The strongest bound over the threshold sets of a group. At fixed
+  // thresholds widening a set only adds work, so the maximum lies on one of
+  // them and the subsets themselves need no enumerating.
+  auto strongest = [](SmallVectorImpl<Contender> &group, int64_t limit) {
+    llvm::sort(group, [](const Contender &a, const Contender &b) {
+      return a.tail > b.tail;
+    });
+    int64_t best = 0;
+    for (const Contender &first : group) {
+      int64_t work = 0;
+      for (const Contender &c : group) {
+        if (c.head < first.head)
+          continue;
+        work += c.demand;
+        best =
+            std::max(best, first.head + (work + limit - 1) / limit - 1 + c.tail);
+      }
+    }
+    return best;
+  };
+
+  DenseSet<Operation *> feeding;
+  for (const DrainTerm &term : terms) {
+    // Longest path on to this output, absent for an operation that cannot
+    // reach it.
+    DenseMap<Operation *, int64_t> tails;
+    auto tail = [&](auto &self, Operation *op) -> int64_t {
+      if (op == term.op)
+        return 0;
+      auto seen = tails.find(op);
+      if (seen != tails.end())
+        return seen->second;
+      tails[op] = kUnreached;
+      int64_t longest = kUnreached;
+      auto edges = out.find(op);
+      if (edges != out.end())
+        for (auto [dst, weight] : edges->second) {
+          int64_t onward = self(self, dst);
+          if (onward != kUnreached)
+            longest = std::max(longest, weight + onward);
+        }
+      tails[op] = longest;
+      return longest;
+    };
+    for (auto [rsrc, limit] : capped) {
+      SmallVector<Contender> group;
+      for (Operation *op : prob.getOperations()) {
+        if (!prob.usesResource(op, rsrc))
+          continue;
+        int64_t onward = tail(tail, op);
+        if (onward == kUnreached)
+          continue;
+        feeding.insert(op);
+        group.push_back({head(head, op), onward, prob.getResourceDemand(op)});
+      }
+      if (!group.empty())
+        bound = std::max(bound, strongest(group, limit) + term.offset);
+    }
+  }
+
+  // Every operation feeding any output issues by the drain whatever path it
+  // takes there, which bounds the drain where no single output orders them all.
+  for (auto [rsrc, limit] : capped) {
+    SmallVector<Contender> group;
+    for (Operation *op : feeding)
+      if (prob.usesResource(op, rsrc))
+        group.push_back({head(head, op), 0, prob.getResourceDemand(op)});
+    if (!group.empty())
+      bound = std::max(bound, strongest(group, limit));
+  }
+  return bound;
+}
+
 } // namespace
 
 //===----------------------------------------------------------------------===//
@@ -441,6 +609,18 @@ LogicalResult mlir::allo::scheduleCPSAT(ChainingSharedOperatorsProblem &prob,
                                   opts.kind == SchedulerKind::ExactChaining);
 
   const auto &ops = prob.getOperations();
+
+  // The cyclic search's entry cut, at the one interval a straight-line region
+  // has. `drainFloor` bounds the drain of any schedule from below, so reaching
+  // it proves this one is as short as the region gets and leaves only the area
+  // tie-break. `scheduleSimplex` has already written the start times and their
+  // sub-cycle offsets, so shipping its schedule needs nothing further. An
+  // allocation still to decide is worth the solve anyway.
+  bool allocates = false;
+  for (Problem::ResourceType rsrc : prob.getResourceTypes())
+    allocates |= prob.getAllocatable(rsrc).has_value();
+  if (!allocates && drainFloor(prob, chaining, span.drain) >= span.drainOf(prob))
+    return success();
 
   // Horizon: the whole region laid out end to end (each op after the previous
   // one's end, its occupancy window, plus a spare cycle), wide enough that
@@ -547,52 +727,6 @@ namespace {
 /// initiation interval admits no schedule; `Exhausted` is the solver giving
 /// up, which proves nothing.
 enum class ModuloOutcome { Scheduled, Infeasible, Exhausted };
-
-/// A lower bound on the region's drain at ANY initiation interval: the longest
-/// chain of intra-iteration (distance-0) edges reaching an output. An edge
-/// spanning iterations is relaxed by one II per iteration it spans, so only the
-/// distance-0 subgraph bounds a start time regardless of interval width, and
-/// resources only push starts later. This is what keeps the branch and bound's
-/// cut tight once the drain dwarfs the trip.
-///
-/// Only \p chaining's break edges lengthen a path here; where the period is
-/// stated in the model instead there are no break edges, and the bound is
-/// simply looser, still sound.
-int64_t drainFloor(ChainingModuloProblem &prob, const Chaining &chaining,
-                   ArrayRef<DrainTerm> terms) {
-  // Incoming edges by destination, weighted as the model weights them.
-  DenseMap<Operation *, SmallVector<std::pair<Operation *, int64_t>>> incoming;
-  for (Operation *op : prob.getOperations())
-    for (auto &dep : prob.getDependences(op))
-      if (prob.getDistance(dep).value_or(0) == 0)
-        incoming[op].push_back(
-            {dep.getSource(), prob.latencyOf(dep.getSource())});
-  for (auto &dep : chaining.breaks)
-    incoming[dep.getDestination()].push_back(
-        {dep.getSource(), prob.latencyOf(dep.getSource()) + 1});
-
-  // Longest path, memoized; the seeded zero keeps a cycle from recursing
-  // forever if the distance-0 subgraph were ever not acyclic.
-  DenseMap<Operation *, int64_t> asap;
-  auto reach = [&](auto &self, Operation *op) -> int64_t {
-    auto seen = asap.find(op);
-    if (seen != asap.end())
-      return seen->second;
-    asap[op] = 0;
-    int64_t longest = 0;
-    auto edges = incoming.find(op);
-    if (edges != incoming.end())
-      for (auto [src, weight] : edges->second)
-        longest = std::max(longest, self(self, src) + weight);
-    asap[op] = longest;
-    return longest;
-  };
-
-  int64_t bound = 0;
-  for (const DrainTerm &term : terms)
-    bound = std::max(bound, reach(reach, term.op) + term.offset);
-  return bound;
-}
 
 /// Solve \p prob at the FIXED initiation interval \p ii, writing the start
 /// times into \p starts when one exists. Fixing the II keeps the model linear:
@@ -950,6 +1084,16 @@ LogicalResult noExactScheduler(Operation *containingOp, StringRef which) {
       << which << " problem";
   return failure();
 }
+/// A lower bound on the region's drain at ANY initiation interval: the longest
+/// chain of intra-iteration (distance-0) edges reaching an output. An edge
+/// spanning iterations is relaxed by one II per iteration it spans, so only the
+/// distance-0 subgraph bounds a start time regardless of interval width, and
+/// resources only push starts later. This is what keeps the branch and bound's
+/// cut tight once the drain dwarfs the trip.
+///
+/// Only \p chaining's break edges lengthen a path here; where the period is
+/// stated in the model instead there are no break edges, and the bound is
+/// simply looser, still sound.
 } // namespace
 
 LogicalResult mlir::allo::scheduleCPSAT(ChainingSharedOperatorsProblem &prob,
