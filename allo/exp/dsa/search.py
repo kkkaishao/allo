@@ -30,9 +30,9 @@ See ``todos/search.md`` for the full per-stage algorithm analysis.
 
 from __future__ import annotations
 
-from collections import deque
+import heapq
 from dataclasses import dataclass, field
-from math import prod
+from math import inf, prod
 
 import ml_dtypes
 import numpy as np
@@ -47,11 +47,14 @@ from .core import (
     ScalarProxy,
     _index_params,
     access_map,
+    access_names,
     arity,
+    layout_params,
     buffer_weights,
     compute_params,
     dense_strides,
-    layout_params,
+    is_mover,
+    mover_domains,
     param_roles,
     pin_access,
     residence,
@@ -288,6 +291,9 @@ class Match:
     # the diagnostic. Stage 2b then adds the residence params to the same dict.
     shape_params: dict | None = None
     alpha: dict = field(default_factory=dict)  # compute param -> bound immediate
+    # Schedule param -> chosen value: the configuration Stage 1 picked for this site
+    # (``InstructionSpec.configure``). Empty unless the ISA declared @I.schedule.
+    schedule: dict = field(default_factory=dict)
 
     @property
     def bound_values(self) -> list:
@@ -506,6 +512,7 @@ class _Choice:
     operands: list
     shape_params: dict | None  # solved sizes, or None if the shapes do not fit
     alpha: dict  # compute params bound from the source's constants
+    schedule: dict = field(default_factory=dict)  # chosen schedule params
 
 
 def _pattern_has(node, kind) -> bool:
@@ -597,6 +604,7 @@ def match_program(catalog: Catalog, source_module) -> Selection:
         op = def_op[v]
         fitting = None  # cheapest candidate that also *fits* the source shapes
         fallback = None  # first structural match that does not fit (error reporting)
+        unconfigurable: list = []  # fitting matches with no legal @schedule assignment
         for instr, root in catalog.candidates(source_tag(op)):
             bindings, alpha, within, interior = {}, {}, {}, set()
             if not _match_pattern(root, v, def_op, alpha, bindings, within, interior):
@@ -622,7 +630,15 @@ def match_program(catalog: Catalog, source_module) -> Selection:
                 if fallback is None:
                     fallback = _Choice(0.0, instr, operands, None, alpha)
                 continue
-            cost = instr.spec.cost_of(fit) + sum(
+            # Configure before costing: an instruction with schedule params is only a
+            # candidate here if some legal assignment of them exists, and its price is
+            # the price of the cheapest one (`InstructionSpec.configure`).
+            config = instr.spec.configure(fit)
+            if config is None:
+                unconfigurable.append(instr.name)
+                continue
+            chosen, own_cost = config
+            cost = own_cost + sum(
                 materialize(_canon(ov)).cost
                 for ov in operands
                 if _canon(ov) in def_op and use.get(_canon(ov), 0) == 1
@@ -631,12 +647,18 @@ def match_program(catalog: Catalog, source_module) -> Selection:
             # earlier-declared one — deterministic, and the right default when a
             # parametric op degenerates to exactly the fixed one it would expand into.
             if fitting is None or cost < fitting.cost:
-                fitting = _Choice(cost, instr, operands, fit, alpha)
-        chosen = fitting or fallback
-        if chosen is None:
+                fitting = _Choice(cost, instr, operands, fit, alpha, chosen)
+        best = fitting or fallback
+        if best is None:
+            if unconfigurable:
+                raise NoMatchError(
+                    f"{source_tag(op)}: {sorted(set(unconfigurable))} match and fit, "
+                    f"but no legal configuration of their @schedule params exists for "
+                    f"this site — the hardware cannot be configured to run it"
+                )
             raise NoMatchError(_no_match_error(op, catalog))
-        memo[v] = chosen
-        return chosen
+        memo[v] = best
+        return best
 
     matches: list[Match] = []
     visited: set = set()
@@ -646,7 +668,11 @@ def match_program(catalog: Catalog, source_module) -> Selection:
             return
         visited.add(v)
         ch = materialize(v)
-        matches.append(Match(ch.instruction, ch.operands, v, ch.shape_params, ch.alpha))
+        matches.append(
+            Match(
+                ch.instruction, ch.operands, v, ch.shape_params, ch.alpha, ch.schedule
+            )
+        )
         for ov in ch.operands:
             if _canon(ov) in def_op:
                 schedule(_canon(ov))
@@ -904,7 +930,11 @@ def solve_layouts(isa, selection: Selection) -> Selection:
 
     A group with no concrete map at all is free, and takes the dense row-major packing
     — the host's — because a cost model with no memory model prices every ordering the
-    same, so anything else would be a coin flip dressed up as a choice."""
+    same, so anything else would be a coin flip dressed up as a choice.
+
+    None of this reaches a **mover**: the planner is what inserts one, so it takes part
+    in no unification. A mover's own residence params are chosen instead, by the router,
+    one assignment per movement-graph edge — see ``_order_assignments``."""
     io = _io_buffer(isa)
     block = selection.func.regions[0].blocks[0]
 
@@ -1099,8 +1129,13 @@ class CompiledProgram:
         lines.append("  program:")
         for rec in self.emits:
             # `#v` marks a computational attribute (α) — an immediate in the
-            # instruction word, not an address.
-            args = [str(a) for a in rec.addr] + [f"#{v}" for v in rec.compute]
+            # instruction word, not an address; `@v` a schedule param, a field the
+            # compiler *chose* rather than solved or bound.
+            args = (
+                [str(a) for a in rec.addr]
+                + [f"#{v}" for v in rec.compute]
+                + [f"@{v}" for v in rec.schedule]
+            )
             lines.append(f"    {rec.name}({', '.join(args)})")
         lines.append("  outputs:")
         for off, shape, label in self.outputs:
@@ -1227,10 +1262,7 @@ def _movement_catalog(isa) -> list[str]:
     value is decided by residence, never by the buffer pair."""
     moves = []
     for spec in isa.instructions:
-        if len(spec.sources) != 1 or len(spec.destinations) != 1:
-            continue
-        _, _, results = trace_instruction(spec)
-        if len(results) != 1 or results[0].kind != "identity":
+        if not is_mover(spec):
             continue
         if compute_params(spec):
             # The planner inserts moves itself, so there is no source constant to
@@ -1240,15 +1272,23 @@ def _movement_catalog(isa) -> list[str]:
                 f"params (α) — nothing supplies them"
             )
         roles, offset_of = param_roles(spec)
-        loose = [i for i, r in roles.items() if r in ("stride", "layout")]
+        names = access_names(spec)
+        loose = [
+            names[i]
+            for i, r in roles.items()
+            if r == "stride" and names[i] not in spec.schedule_residence
+        ]
         if loose:
-            # Residence params are pinned by unifying the maps of a value's *matched*
-            # accesses; a move is inserted by the planner, so it takes part in no such
-            # unification and nothing would supply them.
+            # A residence param on a mover is not *solved* — nothing unifies with it,
+            # because the planner is what inserts the move — so it has to be chosen,
+            # and choosing needs a domain. An ordering's is intrinsic (its rank!); a
+            # stride's is the integers, so the ISA has to say which of them the
+            # hardware can actually encode.
             raise AcceleratorDescriptionError(
-                f"{spec.name}: a data-movement instruction cannot take solvable "
-                f"stride / ordering params {loose} — write the relayout it performs "
-                f"explicitly"
+                f"{spec.name}: a data-movement instruction's stride param(s) {loose} "
+                f"have no domain — a stride is otherwise pinned by unifying the maps "
+                f"of a value's matched accesses, and a move takes part in no "
+                f"unification. Give it one with @I.schedule({loose[0]}=[...])"
             )
         if _alias_groups(offset_of):
             # A move is inserted between two *independently placed* locations, so it
@@ -1306,6 +1346,8 @@ class _Move:
     name: str
     read: _Loc
     write: _Loc
+    chosen: dict = field(default_factory=dict)  # access params the router chose
+    schedule: list = field(default_factory=list)  # fresh schedule params, in order
 
 
 @dataclass
@@ -1317,6 +1359,7 @@ class _Compute:
     shape_params: dict  # access param -> solved size
     reusable: set  # source-operand indices whose slot the result may reuse in place
     alpha: list  # computational attributes (α), bound from the source's constants
+    schedule: list  # schedule params, in declaration order (the chosen configuration)
 
 
 def _alias_groups(offset_of: dict) -> list:
@@ -1411,17 +1454,44 @@ def _colocatable(m: Match) -> set:
 
 
 class _ExpandRecorder:
-    """Collects the instruction calls an ``@expand`` body issues.
+    """Collects the instruction calls an ``@expand`` body issues, **configuring** each.
 
-    Same protocol as ``OracleProgram``: ``Instruction.__call__`` records into
-    whatever ``isa._active_oracle`` holds."""
+    Same protocol as ``OracleProgram``: ``Instruction.__call__`` records into whatever
+    ``isa._active_oracle`` holds. The difference from an ``@oracle`` body is who is
+    writing the assembly. An oracle is hand-written, so its emits are taken as given;
+    an expansion is the *compiler's own lowering*, so the schedule params of what it
+    issues are the compiler's to choose — by the same rule as at a matched site
+    (``InstructionSpec.configure``: the cheapest assignment the predicate admits).
 
-    def __init__(self, name: str):
+    The shape params to configure against are read back out of the address list, where
+    a shape param's slot holds its solved size — the same recovery ``_issue`` does to
+    price an emitted instruction."""
+
+    def __init__(self, isa, name: str):
+        self.isa = isa
         self.name = name
         self.emits: list[EmitRecord] = []
 
     def record_emit(self, name, addr, compute):
-        self.emits.append(EmitRecord(name, list(addr), list(compute)))
+        spec = self.isa._ops[name].spec
+        roles, _ = param_roles(spec)
+        config = spec.configure({i: addr[i] for i, r in roles.items() if r == "shape"})
+        if config is None:
+            raise CompileError(
+                f"{self.name}: its @expand issues '{name}' with no legal @schedule "
+                f"configuration — the expansion asks for a configuration the hardware "
+                f"cannot be put into, so the layer-level instruction's own @schedule "
+                f"predicate is admitting more than it can actually lower"
+            )
+        chosen, _cost = config
+        self.emits.append(
+            EmitRecord(
+                name,
+                list(addr),
+                list(compute),
+                [chosen[n] for n in spec.schedule_domains],
+            )
+        )
 
 
 def expand_emits(isa, spec, addr: list) -> list:
@@ -1451,7 +1521,7 @@ def expand_emits(isa, spec, addr: list) -> list:
             f"tiles the expansion issues address sub-blocks whose residence is not "
             f"the layer's map"
         )
-    recorder = _ExpandRecorder(spec.name)
+    recorder = _ExpandRecorder(isa, spec.name)
     prev = isa._active_oracle
     isa._active_oracle = recorder
     try:
@@ -1530,6 +1600,17 @@ class _Edge:
     dst: str
     name: str
     relayout: tuple | None
+    # Ordering params -> the permutation this edge was built with. A mover with an
+    # ordering param is one instruction offering a *family* of relayouts; each member
+    # is its own edge, so choosing a route is what chooses the ordering.
+    chosen: dict = field(default_factory=dict)
+    # Fresh schedule params, in declaration order — a mover configures like any other
+    # instruction, so a burst width or a mode field is chosen here too.
+    schedule: list = field(default_factory=list)
+    # What this step costs: the mover's own `InstructionSpec.cost_of`, so routing is
+    # minimized against the same number selection is. 1.0 when the ISA declares
+    # nothing, which is the hop count this used to be.
+    cost: float = 1.0
 
     def follow(self, res: tuple) -> tuple | None:
         """The residence a value laid out as ``res`` has after this move, or ``None``
@@ -1545,7 +1626,21 @@ def _move_edges(isa, moves: list, size: int) -> list:
 
     A move that does not *fit* the value is not an edge: ``_solve_move_params`` sizes
     each mover against the value, so a fixed-size relayout only ever appears for the
-    values it can actually carry."""
+    values it can actually carry.
+
+    A mover **configures** exactly like a matched instruction: ``configurations`` is
+    handed the residence params it chooses rather than solves (``mover_domains``) and
+    returns every assignment its ``@schedule`` predicate admits, priced. One assignment
+    is one edge, so choosing a route is what chooses the configuration — that is how a
+    layout-reconfiguring move is expressible (MINISA's ``Set*VNLayout``) without the ISA
+    author writing one instruction per permutation, and how a machine states that its
+    permutation network cannot reach every packing: the predicate simply admits fewer.
+
+    Each edge is priced by its mover's own ``cost_of``, at this value's size and this
+    edge's configuration. That is the whole of "pricing a relayout": an ISA that charges
+    a repacking dma more than a plain copy — or a wide burst less per element than a
+    narrow one — states it the same way it states any other instruction's cost, and
+    ``_explore`` routes against it."""
     edges = []
     for name in moves:
         spec = isa._ops[name].spec
@@ -1554,64 +1649,88 @@ def _move_edges(isa, moves: list, size: int) -> list:
         except CompileError:
             continue
         patterns, _, _ = trace_instruction(spec)
-        read = residence(access_map(patterns[0], params))
-        write = residence(access_map(patterns[1], params))
-        edges.append(
-            _Edge(
-                spec.sources[0].name,
-                spec.destinations[0].name,
-                name,
-                None if read == write else (read, write),
+        slot = {n: i for i, n in enumerate(access_names(spec))}
+        for chosen, cost in spec.configurations(params, mover_domains(spec)):
+            # An access param's choice fills its own address slot, exactly as a solved
+            # shape param does; a fresh schedule param goes in the instruction word.
+            residence_params = {slot[n]: v for n, v in chosen.items() if n in slot}
+            bound = params | residence_params
+            read = residence(access_map(patterns[0], bound))
+            write = residence(access_map(patterns[1], bound))
+            edges.append(
+                _Edge(
+                    spec.sources[0].name,
+                    spec.destinations[0].name,
+                    name,
+                    None if read == write else (read, write),
+                    residence_params,
+                    [chosen[n] for n in spec.schedule_domains],
+                    cost,
+                )
             )
-        )
     return edges
 
 
-def _reachable(edges: list, starts) -> list:
-    """Every ``(buffer, residence)`` state a value can be moved into, nearest first."""
-    seen = list(starts)
-    queue = deque(seen)
-    while queue:
-        buf, res = queue.popleft()
-        for edge in edges:
-            carried = edge.follow(res) if edge.src == buf else None
-            if carried is None or (edge.dst, carried) in seen:
-                continue
-            seen.append((edge.dst, carried))
-            queue.append((edge.dst, carried))
-    return seen
-
-
-def _route(edges: list, starts, goal: tuple) -> list | None:
-    """Shortest path from any of ``starts`` to ``goal`` over ``(buffer, residence)``
-    states, as ``[(state, move name | None), ...]`` starting at the reached start, or
-    ``None`` if unreachable. BFS = fewest hops.
+def _explore(edges: list, starts) -> tuple[list, dict]:
+    """Dijkstra over ``(buffer, residence)`` states: every state a value can be moved
+    into, **cheapest first**, and the tree of cheapest predecessors
+    (``state -> (previous state, edge) | None``).
 
     Routing over *states* rather than buffers is what makes a relayout something the
     planner can find on its own: a value that is in the right buffer but the wrong
     layout is simply a state one repacking edge away — including a repack from a buffer
-    to itself, which as a plain buffer path would have been a zero-hop no-op."""
+    to itself, which as a plain buffer path would have been a zero-hop no-op. The
+    predecessor is the *edge* rather than its name, because an edge also carries the
+    ordering assignment it was built with — the move's own residence params.
+
+    Distance is the sum of ``_Edge.cost``, so a machine that prices its movers gets
+    routed by price rather than by hop count. When it prices none of them every edge
+    costs 1.0 and this is exactly the breadth-first search it replaces: the insertion
+    counter keeps equal-cost states settling in discovery order, so the paths (and the
+    tie-breaks between them) are unchanged."""
+    dist = {s: 0.0 for s in starts}
     prev: dict = {s: None for s in starts}
-    queue = deque(prev)
-    while queue:
-        state = queue.popleft()
-        if state == goal:
-            path = []
-            while state is not None:
-                path.append((state, prev[state][1] if prev[state] else None))
-                state = prev[state][0] if prev[state] else None
-            return list(reversed(path))
+    heap = [(0.0, i, s) for i, s in enumerate(starts)]
+    tick, settled, seen = len(heap), [], set()
+    while heap:
+        d, _, state = heapq.heappop(heap)
+        if state in seen:
+            continue
+        seen.add(state)
+        settled.append(state)
         buf, res = state
         for edge in edges:
             if edge.src != buf:
                 continue
             carried = edge.follow(res)
-            nxt = (edge.dst, carried)
-            if carried is None or nxt in prev:
+            if carried is None:
                 continue
-            prev[nxt] = (state, edge.name)
-            queue.append(nxt)
-    return None
+            nxt = (edge.dst, carried)
+            if d + edge.cost < dist.get(nxt, inf):
+                dist[nxt] = d + edge.cost
+                prev[nxt] = (state, edge)
+                heapq.heappush(heap, (dist[nxt], tick, nxt))
+                tick += 1
+    return settled, prev
+
+
+def _reachable(edges: list, starts) -> list:
+    """Every ``(buffer, residence)`` state a value can be moved into, cheapest first."""
+    return _explore(edges, starts)[0]
+
+
+def _route(edges: list, starts, goal: tuple) -> list | None:
+    """The cheapest path from any of ``starts`` to ``goal``, as
+    ``[(state, edge | None), ...]`` beginning at the reached start, or ``None`` if
+    ``goal`` is unreachable."""
+    _, prev = _explore(edges, starts)
+    if goal not in prev:
+        return None
+    path, state = [], goal
+    while state is not None:
+        path.append((state, prev[state][1] if prev[state] else None))
+        state = prev[state][0] if prev[state] else None
+    return list(reversed(path))
 
 
 def plan(isa, selection: Selection) -> CompiledProgram:
@@ -1650,9 +1769,9 @@ def plan(isa, selection: Selection) -> CompiledProgram:
     def route_move(cur: _Loc, path: list, sink: list) -> _Loc:
         """Append a move per hop along ``path`` (states from ``_route``, starting at
         ``cur``'s own state); return the final location."""
-        for (name, res), move in path[1:]:
+        for (name, res), edge in path[1:]:
             dst = make_loc(cur.value, isa.buffers[name], res)
-            sink.append(_Move(move, cur, dst))
+            sink.append(_Move(edge.name, cur, dst, edge.chosen, edge.schedule))
             cur = dst
         return cur
 
@@ -1674,9 +1793,10 @@ def plan(isa, selection: Selection) -> CompiledProgram:
         """A location of ``value`` in ``target`` laid out as ``want``.
 
         A value that is in the right buffer but the wrong layout is not resident: it is
-        one repacking edge away, and finding that edge is the same BFS as finding a
+        one repacking edge away, and finding that edge is the same search as finding a
         route between buffers. Which is the point — a relayout is data movement, so the
-        planner inserts it exactly the way it inserts any other move."""
+        planner inserts it exactly the way it inserts any other move, and prices it the
+        same way too."""
         here = loc.get(value, {})
         if (target.name, want) in here:
             return here[(target.name, want)]
@@ -1712,9 +1832,26 @@ def plan(isa, selection: Selection) -> CompiledProgram:
         }
         where = ", ".join(f"'{b}' as {show_map(r)}" for b, r in here)
         if not anywhere:
+            starts = {b for b, _r in here}
+            live = {e.name for e in avail}
+            # A mover that leaves one of these buffers but contributed no edge was
+            # refused *for this value* — by its own @schedule predicate, or for not
+            # fitting the size. That is a configuration failure rather than a missing
+            # instruction, and the two want different fixes.
+            silent = sorted(
+                name
+                for name in moves
+                if name not in live and isa._ops[name].spec.sources[0].name in starts
+            )
+            note = (
+                f" — {silent} leave(s) those buffers but no legal configuration of "
+                f"them exists for a value of {prod(_shape(value))} element(s)"
+                if silent
+                else ""
+            )
             return AllocationError(
-                f"{who}: no data-movement route from {sorted({b for b, _r in here})} "
-                f"to '{target.name}'"
+                f"{who}: no data-movement route from {sorted(starts)} "
+                f"to '{target.name}'{note}"
             )
         return LayoutError(
             f"{who}: needs a value of shape {_shape(value)} in '{target.name}' laid "
@@ -1754,6 +1891,7 @@ def plan(isa, selection: Selection) -> CompiledProgram:
                 m.shape_params,
                 _reusable_operands(m.instruction) & _colocatable(m),
                 [m.alpha[i] for i in range(len(compute_params(spec)))],
+                [m.schedule[n] for n in spec.schedule_domains],
             )
         )
 
@@ -1929,7 +2067,7 @@ def plan(isa, selection: Selection) -> CompiledProgram:
         # residence — but only the *round trip* has to preserve it, not each leg: a
         # machine whose only path to the backing store is a repacking dma spills fine
         # as long as the reload repacks back. So the store residence is searched for,
-        # nearest first, rather than assumed to be the victim's own.
+        # cheapest first, rather than assumed to be the victim's own.
         home = (victim.buffer.name, victim.map)
         avail = edges(victim.value)
         down = up = None
@@ -2010,14 +2148,18 @@ def plan(isa, selection: Selection) -> CompiledProgram:
             # inserted in Stage 3 and never went through Stage-2 solve.
             spec = isa._ops[st.name].spec
             _, offset_buffer = param_roles(spec)
+            # `st.chosen` are the residence params the router chose by choosing this
+            # edge; they fill their own slots in the address list exactly as a solved
+            # shape param does.
             shape_params = _solve_move_params(spec, prod(_shape(st.read.value)))
+            shape_params |= st.chosen
             addr = _addr(
                 offset_buffer,
                 [st.read, st.write],
                 shape_params,
                 arity(spec.access_fn),
             )
-            emits.append(EmitRecord(st.name, addr, []))
+            emits.append(EmitRecord(st.name, addr, [], st.schedule))
         else:
             spec = isa._ops[st.name].spec
             addr = _addr(
@@ -2027,7 +2169,7 @@ def plan(isa, selection: Selection) -> CompiledProgram:
                 arity(spec.access_fn),
             )
             if spec.expand_fn is None:
-                emits.append(EmitRecord(st.name, addr, st.alpha))
+                emits.append(EmitRecord(st.name, addr, st.alpha, st.schedule))
             else:
                 emits.extend(expand_emits(isa, spec, addr))
 

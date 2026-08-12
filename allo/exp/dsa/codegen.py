@@ -18,7 +18,6 @@ shapes, so the IR satisfies the ``define`` verifier without annotations.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from itertools import permutations
 
 from ..._mlir import ir
 from ..._mlir.ir import InsertionPoint, Location, Module
@@ -36,6 +35,7 @@ from .core import (
     arity,
     compute_params,
     layout_params,
+    order_assignments,
     trace_instruction,
 )
 
@@ -107,9 +107,6 @@ def emit_catalog(context: ir.Context, isa: ISA, program=None):
 # signature). The frontend still sees a single mnemonic with a *solved* parameter --
 # which is what an assembler prints -- and the catalog shows the configurations the
 # hardware actually has.
-_VARIANT_LIMIT = 24  # a full S_4; beyond that a catalog is a search space, not a list
-
-
 def define_symbol(spec: InstructionSpec, assignment) -> str:
     """The catalog symbol for one ordering specialization of an instruction."""
     if not assignment:
@@ -118,7 +115,11 @@ def define_symbol(spec: InstructionSpec, assignment) -> str:
 
 
 def _orderings(spec: InstructionSpec, program) -> list[tuple]:
-    """The ordering assignments to emit a define for, in emission order."""
+    """The ordering assignments to emit a define for, in emission order.
+
+    A compiled program is asked which orderings it actually used; without one the
+    catalog falls back to the param's whole domain (``core.order_assignments``, the
+    same enumeration the movement graph builds its edges from)."""
     params = layout_params(spec)
     if not params:
         return [()]
@@ -128,17 +129,7 @@ def _orderings(spec: InstructionSpec, program) -> list[tuple]:
             if kind == "emit" and rec.name == spec.name:
                 used.setdefault(tuple(rec.addr[i] for i, _rank in params), None)
         return list(used)
-    combos = [()]
-    for _i, rank in params:
-        combos = [c + (p,) for c in combos for p in permutations(range(rank))]
-    if len(combos) > _VARIANT_LIMIT:
-        raise AcceleratorDescriptionError(
-            f"{spec.name}: its {len(params)} ordering param(s) have "
-            f"{len(combos)} combinations, over the {_VARIANT_LIMIT} a catalog "
-            f"enumerates — compile a program instead, which emits only the "
-            f"orderings it solves for"
-        )
-    return combos
+    return [tuple(a[i] for i, _rank in params) for a in order_assignments(spec)]
 
 
 @dataclass
@@ -405,7 +396,11 @@ def _emit_cast(r, spec, operands, context) -> ir.Value:
 
 
 def _result_type(r, context) -> ir.Type:
-    return ir.RankedTensorType.get(list(r.shape), r.dtype.materialize(context))
+    # A parametric dim becomes a dynamic ``?``, exactly as the region's block-arg
+    # types do — the contraction/conv family infers its result shape from the traced
+    # proxy rather than from operand IR types, so it has to do that mapping itself.
+    dims = [d if isinstance(d, int) else K_DYNAMIC for d in r.shape]
+    return ir.RankedTensorType.get(dims, r.dtype.materialize(context))
 
 
 def _i64(xs) -> ir.Attribute:

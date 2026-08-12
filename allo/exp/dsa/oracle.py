@@ -84,6 +84,9 @@ class EmitRecord:
     name: str  # instruction mnemonic
     addr: list  # address-param values (static ints)
     compute: list  # computational attributes (α): the instruction's immediates
+    # Schedule params: instruction-word fields the compiler *chose*. They change the
+    # configuration, never the value, so the simulator ignores them.
+    schedule: list = field(default_factory=list)
 
 
 @dataclass

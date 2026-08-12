@@ -19,6 +19,7 @@ The user describes an accelerator by declaring buffers and instructions on an
 from __future__ import annotations
 
 import inspect
+import itertools
 import math
 from collections.abc import Sequence
 from dataclasses import dataclass, field
@@ -462,34 +463,89 @@ class InstructionSpec:
         self.access_fn = None
         self.compute_fn = None
         self.expand_fn = None  # optional @I.expand: lower one match to a tile run
+        # optional @I.schedule: the free schedule params and when a choice is legal
+        self.schedule_fn = None
+        self.schedule_domains: dict = {}  # fresh param name -> the values it may take
+        # Domains declared for *access* params, which turns them from solved into
+        # chosen. Only a mover's residence params qualify — see `_check_schedule`.
+        self.schedule_residence: dict = {}
         self.doc = None  # the defining function's docstring (carried onto Instruction)
 
     @property
     def buffers(self) -> list[BufferSpec]:
         return self.sources + self.destinations
 
-    def _over_params(self, fn, shape_params: dict, what: str) -> float:
-        """Call ``fn`` with the solved shape params it declares *by name* (the
-        ``@access`` parameter names)."""
-        names = list(inspect.signature(self.access_fn).parameters)
-        solved = {names[i]: v for i, v in shape_params.items()}
+    def _over_params(self, fn, shape_params: dict, what: str, chosen: dict = {}):
+        """Call ``fn`` with the params it declares *by name*: the solved shape params
+        (under their ``@access`` parameter names) plus any ``chosen`` schedule params.
+        """
+        names = access_names(self)
+        bound = {names[i]: v for i, v in shape_params.items()} | chosen
         wanted = list(inspect.signature(fn).parameters)
-        missing = [n for n in wanted if n not in solved]
+        missing = [n for n in wanted if n not in bound]
         if missing:
             raise AcceleratorDescriptionError(
-                f"{self.name}: {what} needs shape param(s) {missing}, but only "
-                f"{sorted(solved)} solved — a {what} param must be an @access shape param"
+                f"{self.name}: {what} needs param(s) {missing}, but only "
+                f"{sorted(bound)} are bound — a {what} param must be an @access shape "
+                f"param or a declared @schedule param"
             )
-        return float(fn(**{n: solved[n] for n in wanted}))
+        return fn(**{n: bound[n] for n in wanted})
 
-    def trips_at(self, shape_params: dict) -> float:
+    def trips_at(self, shape_params: dict, chosen: dict = {}) -> float:
         """How many times this instruction occupies its unit at a site whose shape
         params solved to ``shape_params`` (1 unless ``ISA.bind`` declared otherwise)."""
         if self.trips is None:
             return 1.0
-        return self._over_params(self.trips, shape_params, "trips")
+        return float(self._over_params(self.trips, shape_params, "trips", chosen))
 
-    def cost_of(self, shape_params: dict) -> float:
+    def configurations(self, shape_params: dict, free: dict = {}) -> list[tuple]:
+        """Every configuration of this instruction's **chosen** params that its
+        ``@schedule`` predicate admits at a site whose shape params solved to
+        ``shape_params``, each paired with its cost, in declaration order.
+
+        A chosen param is the third kind of instruction parameter. An ``@access`` param
+        is *solved* — from the source shapes (Stage 2) or from a neighbour's residence
+        (Stage 2b); a compute param (α) is *bound* from a constant in the source, and
+        the computed value depends on it. A chosen param is neither: it is **freely
+        picked, and the value does not depend on it**. That is what the configuration of
+        a schedule-ISA machine carries — a fold factor, a spatial/temporal split, a
+        packing — and it reaches the compiler through exactly two channels, legality and
+        cost, which are this method's predicate and its pricing.
+
+        ``free`` names *access* params the caller has decided are chosen rather than
+        solved, with their domains: a mover's residence params (``mover_domains``),
+        which nothing unifies with because the planner is what inserts the move. They
+        bind by name like everything else, so one predicate and one cost function see
+        fresh schedule params and free residence params alike.
+
+        This is the single place a finite parameter domain is enumerated. The empty
+        product yields one empty assignment, so a predicate with no domains at all is
+        still evaluated — it then simply restricts which *shapes* are acceptable."""
+        domains = free | self.schedule_domains
+        out = []
+        for combo in itertools.product(*domains.values()):
+            chosen = dict(zip(domains, combo))
+            if self.schedule_fn is not None and not self._over_params(
+                self.schedule_fn, shape_params, "schedule", chosen
+            ):
+                continue
+            out.append((chosen, self.cost_of(shape_params, chosen)))
+        return out
+
+    def configure(
+        self, shape_params: dict, free: dict = {}
+    ) -> tuple[dict, float] | None:
+        """The cheapest configuration of this instruction, or ``None`` when the
+        ``@schedule`` predicate admits none — the instruction cannot be configured for
+        this site, so it is not a candidate there. That is how a machine states a limit
+        it has no other way to state: an array too small for the requested fold, a field
+        too narrow for the requested count. Ties go to the earlier-declared assignment.
+        """
+        return min(
+            self.configurations(shape_params, free), key=lambda c: c[1], default=None
+        )
+
+    def cost_of(self, shape_params: dict, chosen: dict = {}) -> float:
         """This instruction's search cost at a site whose shape params solved to
         ``shape_params`` (``{access-param index -> size}``, from Stage 2). Resolved
         in three steps, most specific first:
@@ -508,10 +564,10 @@ class InstructionSpec:
         if self.cost is not None:
             if not callable(self.cost):
                 return float(self.cost)
-            return self._over_params(self.cost, shape_params, "cost")
+            return float(self._over_params(self.cost, shape_params, "cost", chosen))
         if self.unit_latency is not None and self.unit_latency.declared:
             lat = self.unit_latency
-            return lat.depth + lat.ii * self.trips_at(shape_params)
+            return lat.depth + lat.ii * self.trips_at(shape_params, chosen)
         return 1.0
 
 
@@ -529,6 +585,38 @@ class InstructionBuilder:
     def compute(self, fn):
         self.spec.compute_fn = fn
         return fn
+
+    def schedule(self, fn=None, **domains):
+        """Declare this instruction's free **schedule params** and when a choice of
+        them is legal.
+
+        The keyword arguments name the params and give each a finite domain
+        (``@I.schedule(fold=[1, 2, 4])``); the body is a *predicate* over the
+        ``@access`` shape params and the chosen values, and returns whether that
+        configuration is one the hardware can actually run. ``core.InstructionSpec
+        .configure`` picks the cheapest admitted assignment, and an instruction that
+        admits none is not a candidate at that site.
+
+        This is ACT's ``e_theta`` — the validity constraint a field width or an array
+        dimension imposes — and it is the only place an ISA can state a limit that is
+        neither a shape nor a value. Declaring no domains is allowed and useful: the
+        predicate then simply restricts which *shapes* the instruction accepts.
+
+        A domain may also name an existing ``@access`` param, which does not introduce
+        a param but **turns that one from solved into chosen**. Only a mover's residence
+        params qualify (a shape param is pinned by the source program, an offset by the
+        allocator, and a matched instruction's residence by unification), and that is
+        what makes a data-movement instruction with a free stride expressible — the
+        author supplies the domain the frontend has no way to invent. An ordering param
+        needs no declaration at all: its domain is intrinsic, and declaring one narrows
+        it."""
+
+        def decorator(fn):
+            self.spec.schedule_fn = fn
+            self.spec.schedule_domains = {n: tuple(v) for n, v in domains.items()}
+            return fn
+
+        return decorator(fn) if fn is not None else decorator
 
     def expand(self, fn):
         self.spec.expand_fn = fn
@@ -564,7 +652,7 @@ class Instruction(Generic[P, R]):
         self.isa = isa
         self.spec = spec
         self.name = spec.name
-        self.addr_params = list(inspect.signature(spec.access_fn).parameters)
+        self.addr_params = access_names(spec)
         self.compute_params = compute_params(spec)
         self.layout_params = dict(layout_params(spec))  # addr index -> ordered rank
         self.__name__ = spec.name
@@ -729,10 +817,12 @@ class ISA:
                 raise AcceleratorDescriptionError(f"{spec.name}: missing @I.access")
             if spec.compute_fn is None:
                 raise AcceleratorDescriptionError(f"{spec.name}: missing @I.compute")
+            if spec.schedule_fn is not None:
+                _check_schedule(spec)
             if spec.expand_fn is not None:
                 # @expand is called with the instruction's solved address params, so
                 # it must take exactly the @access signature.
-                access_params = list(inspect.signature(spec.access_fn).parameters)
+                access_params = access_names(spec)
                 expand_params = list(inspect.signature(spec.expand_fn).parameters)
                 if expand_params != access_params:
                     raise AcceleratorDescriptionError(
@@ -865,18 +955,40 @@ def arity(fn) -> int:
     return len(inspect.signature(fn).parameters)
 
 
+def access_names(spec: InstructionSpec) -> list[str]:
+    """The ``@I.access`` parameter names, in address-slot order — the one mapping
+    between an address param's *index* (how the emit and the solvers key it) and its
+    *name* (how a predicate, a cost function or an assembler call refers to it)."""
+    return list(inspect.signature(spec.access_fn).parameters)
+
+
+def access_patterns(spec: InstructionSpec) -> list[PatternExpr]:
+    """The instruction's access patterns, traced over symbolic address params."""
+    params = [IndexExpr.param(i) for i in range(arity(spec.access_fn))]
+    patterns = spec.access_fn(*params)
+    return list(patterns) if isinstance(patterns, (tuple, list)) else [patterns]
+
+
+def _access_chain(spec: InstructionSpec):
+    """Per access: ``(buffer position, the value-preserving relayouts stripped to reach
+    the root, the buffer-rooted node)``.
+
+    The one traversal the param classifiers share, so they cannot drift apart about
+    what counts as a root."""
+    for pos, p in enumerate(access_patterns(spec)):
+        node, stripped = p, []
+        while node.kind in ("expand", "collapse", "transpose"):
+            stripped.append(node)
+            node = node.source
+        yield pos, stripped, node
+
+
 def layout_params(spec: InstructionSpec) -> list[tuple[int, int]]:
     """``(access-param index, rank)`` for each dimension-ordering param, in parameter
     order. The rank is how many dims that ordering permutes, i.e. the size of its
     finite domain's alphabet — so the domain is that many factorial."""
-    params = [IndexExpr.param(i) for i in range(arity(spec.access_fn))]
-    patterns = spec.access_fn(*params)
-    patterns = list(patterns) if isinstance(patterns, (tuple, list)) else [patterns]
     found: dict[int, int] = {}
-    for p in patterns:
-        node = p
-        while node.kind in ("expand", "collapse", "transpose"):
-            node = node.source
+    for _pos, _stripped, node in _access_chain(spec):
         if node.kind == "layout" and isinstance(node.order, IndexExpr):
             rank = len(node.counts)
             if found.setdefault(node.order.param_index, rank) != rank:
@@ -886,6 +998,61 @@ def layout_params(spec: InstructionSpec) -> list[tuple[int, int]]:
                     f"in another — one ordering permutes one set of dims"
                 )
     return sorted(found.items())
+
+
+# A catalog lists the configurations the hardware *has*; past a full S_4 it would be
+# a search space instead, and so would the movement graph built from the same domains.
+_VARIANT_LIMIT = 24
+
+
+def _order_domains(spec: InstructionSpec) -> dict[int, tuple]:
+    """Each ordering param's own domain — the ``rank!`` permutations it may take —
+    keyed by access-param index, bounded so the product stays enumerable."""
+    domains = {
+        i: tuple(itertools.permutations(range(rank))) for i, rank in layout_params(spec)
+    }
+    total = math.prod(len(d) for d in domains.values())
+    if total > _VARIANT_LIMIT:
+        raise AcceleratorDescriptionError(
+            f"{spec.name}: its {len(domains)} ordering param(s) have {total} "
+            f"combinations, over the {_VARIANT_LIMIT} this frontend enumerates"
+        )
+    return domains
+
+
+def order_assignments(spec: InstructionSpec) -> list[dict]:
+    """Every assignment of this instruction's ordering params, as ``{access-param
+    index -> permutation}``, in parameter order. What a catalog specializes into one
+    ``allo.define`` apiece."""
+    combos: list[dict] = [{}]
+    for i, domain in _order_domains(spec).items():
+        combos = [c | {i: p} for c in combos for p in domain]
+    return combos
+
+
+def mover_domains(spec: InstructionSpec) -> dict[str, tuple]:
+    """The residence params a **mover** chooses, as ``name -> domain``.
+
+    On a matched instruction a stride or a dimension ordering is *solved* — unified
+    against the maps the value's other accesses describe (Stage 2b). A mover unifies
+    with nothing, because the planner is what inserts it, so the same params are
+    *chosen* instead, and choosing needs something to choose from. An ordering's domain
+    is intrinsic (its ``rank!`` permutations); a stride's is not, so ``@I.schedule``
+    must declare it. A declared domain wins over the intrinsic one, which is how a
+    machine says its permutation network cannot reach every packing."""
+    names = access_names(spec)
+    intrinsic = {names[i]: d for i, d in _order_domains(spec).items()}
+    return intrinsic | spec.schedule_residence
+
+
+def is_mover(spec: InstructionSpec) -> bool:
+    """Whether this instruction is *data movement*: one source, one destination, an
+    identity compute. The planner inserts these itself (routing, spilling), which is
+    exactly what makes their residence params the compiler's to choose."""
+    if len(spec.sources) != 1 or len(spec.destinations) != 1:
+        return False
+    _, _, results = trace_instruction(spec)
+    return len(results) == 1 and results[0].kind == "identity"
 
 
 def compute_params(spec: InstructionSpec) -> list[str]:
@@ -906,6 +1073,59 @@ def compute_params(spec: InstructionSpec) -> list[str]:
     return [p.name for p in params[len(spec.buffers) :]]
 
 
+def _check_schedule(spec: InstructionSpec) -> None:
+    """Check an ``@I.schedule`` declaration, and split it.
+
+    A domain naming an ``@access`` param does not introduce a param — it **turns that
+    one from solved into chosen**, which is only meaningful for a mover's residence
+    params (``mover_domains``). Every other name is a fresh schedule param. The
+    predicate may read either, plus the access shape params."""
+    names = access_names(spec)
+    roles, _ = param_roles(spec)
+    for name, domain in list(spec.schedule_domains.items()):
+        if not domain:
+            raise AcceleratorDescriptionError(
+                f"{spec.name}: schedule param '{name}' has an empty domain, so no "
+                f"configuration of this instruction could ever be legal"
+            )
+        if name not in names:
+            continue
+        role = roles[names.index(name)]
+        if role not in ("stride", "layout"):
+            raise AcceleratorDescriptionError(
+                f"{spec.name}: '{name}' is a '{role}' access param, which the compiler "
+                f"does not choose — a shape param is pinned by the source program and "
+                f"an offset param by the allocator. Only a residence param (a stride "
+                f"or a dimension ordering) can be given a domain"
+            )
+        if not is_mover(spec):
+            raise AcceleratorDescriptionError(
+                f"{spec.name}: '{name}' is a residence param of an instruction that is "
+                f"*matched*, so it is solved by unifying the maps of the value's "
+                f"accesses (Stage 2b) and a domain would go unused. Only a "
+                f"data-movement instruction, which the planner inserts and which "
+                f"therefore unifies with nothing, chooses its own residence"
+            )
+        if role == "layout":
+            rank = dict(layout_params(spec))[names.index(name)]
+            domain = tuple(
+                as_permutation(v, rank, f"{spec.name}: {name}") for v in domain
+            )
+        spec.schedule_residence[name] = domain
+        del spec.schedule_domains[name]
+    unknown = [
+        n
+        for n in inspect.signature(spec.schedule_fn).parameters
+        if n not in names and n not in spec.schedule_domains
+    ]
+    if unknown:
+        raise AcceleratorDescriptionError(
+            f"{spec.name}: @schedule reads {unknown}, which is neither an @access "
+            f"param nor one of its declared schedule params "
+            f"{sorted(spec.schedule_domains)}"
+        )
+
+
 def trace_instruction(spec: InstructionSpec):
     """Trace an instruction's access + compute regions into Python DAGs.
 
@@ -919,9 +1139,7 @@ def trace_instruction(spec: InstructionSpec):
     what that destination's access pattern writes. Neither region can catch a
     mismatch alone.
     """
-    params = [IndexExpr.param(i) for i in range(arity(spec.access_fn))]
-    patterns = spec.access_fn(*params)
-    patterns = list(patterns) if isinstance(patterns, (tuple, list)) else [patterns]
+    patterns = access_patterns(spec)
     if len(patterns) != len(spec.buffers):
         raise AcceleratorDescriptionError(
             f"{spec.name}: access yields {len(patterns)} patterns, "
@@ -1185,9 +1403,6 @@ def param_roles(spec: InstructionSpec):
     more than one entry: the ISA is stating that those operands sit at the same
     address — an in-place instruction (QKV's ``softmax`` reads and writes one ``addr``).
     That is a *constraint on allocation*, so every reference has to be kept."""
-    params = [IndexExpr.param(i) for i in range(arity(spec.access_fn))]
-    patterns = spec.access_fn(*params)
-    patterns = list(patterns) if isinstance(patterns, (tuple, list)) else [patterns]
     roles: dict = {}
     offset_refs: dict = {}
 
@@ -1197,14 +1412,12 @@ def param_roles(spec: InstructionSpec):
                 f"{spec.name}: param p{idx} used as both '{roles[idx]}' and '{role}'"
             )
 
-    for buf_pos, p in enumerate(patterns):
-        node = p
-        while node.kind in ("expand", "collapse"):
-            if node.kind == "expand":
-                for d in node.output_shape:
+    for buf_pos, stripped, node in _access_chain(spec):
+        for relayout in stripped:  # relayouts carry no params besides expand's shape
+            if relayout.kind == "expand":
+                for d in relayout.output_shape:
                     for i in _index_params(d):
                         mark(i, "shape")
-            node = node.source  # relayouts carry no params besides expand's shape
         for axis, item in enumerate(node.basis):
             for i in _index_params(item):
                 mark(i, "offset")
@@ -1217,7 +1430,7 @@ def param_roles(spec: InstructionSpec):
                 mark(i, "stride")
         if node.kind == "layout" and isinstance(node.order, IndexExpr):
             mark(node.order.param_index, "layout")
-    for i in range(len(params)):
+    for i in range(arity(spec.access_fn)):
         if i not in roles:
             raise AcceleratorDescriptionError(
                 f"{spec.name}: param p{i} is never used by the access pattern"
