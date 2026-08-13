@@ -138,7 +138,7 @@ def test_a_device_prices_its_multiplexers_and_delay_chains():
     dev = default_device.copy()
     lut, ff = dev.resources["lut"], dev.resources["ff"]
     dev.set_mux_uses({lut: (Linear(0.4), Linear(1.0))})
-    dev.set_chain_uses({ff: (Step(4, 1.0, 2.0), Linear(1.0))})
+    dev.set_chain_uses_norst({ff: (Step(4, 1.0, 2.0), Linear(1.0))})
 
     text = _to_rtl(k, device=dev).dcp
     assert "allo.dcp.mux uses" in text and "allo.dcp.chain uses" in text
@@ -177,10 +177,10 @@ def test_a_cost_sums_the_terms_that_name_one_resource():
 
     dev = default_device.copy()
     ff = dev.resources["ff"]
-    dev.set_chain_uses(
+    dev.set_chain_uses_norst(
         {ff: [(Const(2.0), Linear(1.0)), (Linear(1.0, base=-1.0), Const(1.0))]}
     )
-    assert dev.price(dev.chain_uses, (64, 32))["ff"] == 2 * 32 + 64 - 1
+    assert dev.price(dev.chain_uses_norst, (64, 32))["ff"] == 2 * 32 + 64 - 1
     # Both terms ride one `uses`, naming `@ff` twice.
     chain = [l for l in _to_rtl(k, device=dev).dcp.splitlines() if "dcp.chain" in l]
     assert len(chain) == 1 and chain[0].count("allo.res_use<@ff") == 2

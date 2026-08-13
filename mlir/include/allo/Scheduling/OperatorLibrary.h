@@ -211,8 +211,9 @@ public:
   /// sharing one functional unit puts in front of each of its operand ports.
   int64_t muxPrice(int64_t sources, int64_t width) const;
 
-  /// What carrying a `width`-bit value across `depth` cycles costs. Zero at
-  /// depth 0, which is a wire and not a chain.
+  /// What carrying a `width`-bit value across `depth` cycles costs, in the
+  /// reset-free form a value run is emitted in. Zero at depth 0, which is a
+  /// wire and not a chain.
   int64_t chainPrice(int64_t depth, int64_t width) const;
 
   /// What ONE cycle of an activation pulse chain costs: one more stage of a
@@ -251,7 +252,7 @@ private:
   ArrayAttr muxUses;                       // `dcp.mux`, over (k, width)
   CostAttr muxDelay;      // `dcp.mux` delay over fan-in (ns, at 32-bit width)
   CostAttr muxDelayWidth; // its unitless width factor; null with `muxDelay`
-  ArrayAttr chainUses;    // `dcp.chain`, over (depth, width)
+  ArrayAttr chainUses;    // `dcp.chain`, reset-free, over (depth, width)
   double regFloor = 0.0;  // `dcp.device`'s `reg_delay`
 };
 

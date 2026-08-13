@@ -662,13 +662,14 @@ class Device:
         return self
 
     def set_chain_uses(self, uses: dict[Resource, Sequence]) -> Device:
-        """What one ``depth``-stage, ``width``-bit value delay chain spends."""
+        """What one ``depth``-stage, ``width``-bit delay chain spends when it
+        carries a synchronous reset, which is what a control run holds."""
         self.chain_uses = self._spend("a delay chain", "depth, width", uses)
         return self
 
     def set_chain_uses_norst(self, uses: dict[Resource, Sequence]) -> Device:
-        """The same chain without a synchronous reset, the form every value and
-        pulse run is emitted in."""
+        """The same chain without the reset, the form every value and pulse run
+        is emitted in and the row ``dcp.chain`` carries."""
         self.chain_uses_norst = self._spend(
             "a reset-free delay chain", "depth, width", uses
         )
@@ -968,8 +969,10 @@ def inject_device(module, device: Device):
                         else None
                     ),
                 )
-            if device.chain_uses:
-                DCPathChainOp(uses=_uses_attr(device.chain_uses))
+            # The reset-free row: every chain a schedule pays for carries a value
+            # or an activation pulse, and neither holds a reset.
+            if device.chain_uses_norst:
+                DCPathChainOp(uses=_uses_attr(device.chain_uses_norst))
             if device.stream_timing is not None:
                 DCPathStreamTimingOp(**_timing(device.stream_timing))
 

@@ -679,7 +679,8 @@ def DCPathChainOp : DCPath_Op<"dcp.chain",
   let description = [{
     A `depth`-stage, `width`-bit register chain: what carrying a value across a
     schedule's slack costs. One row for the whole device, for the same reason
-    `dcp.mux` is.
+    `dcp.mux` is. The chain carries no reset, which is the form every value and
+    activation-pulse run is emitted in.
 
     `uses` is over TWO parameters, `(depth, width)`. Past a measured depth the
     synthesizer stops building flip-flops and extracts a shift register, which

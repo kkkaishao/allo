@@ -288,13 +288,13 @@ void addPiecewiseCost(CpModelBuilder &model, IntVar size,
 /// weighted so the two never interact: `primary` is settled first, and the
 /// tie-break decides only among schedules that reach it.
 ///
-/// The tie-break is the region's AREA, every term of it in what the device
+/// The tie-break is the region's area, every term of it in what the device
 /// spends: the delay chain each value carried across slack costs
 /// (`RegisterTerm`), one stage of a one-bit activation pulse chain per cycle of
 /// every start offset, and the table above per allocatable operator. A chain is
-/// NOT `width * depth` flip-flops: past a measured depth the synthesizer stops
-/// building them and extracts a shift register instead, so the cost stops
-/// rising with the width and the term keeps only the gradient the part keeps.
+/// not `width * depth` flip-flops: neither run holds a reset, so past a
+/// measured depth the synthesizer extracts a shift register and the cost stops
+/// rising with the depth outside the steps a new site adds.
 void minimizeCost(CpModelBuilder &model, IntVar primary,
                   ArrayRef<IntVar> starts, const SpanObjective &span,
                   DenseMap<Operation *, IntVar> &startVars,
