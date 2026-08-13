@@ -83,6 +83,9 @@ struct DatapathBuilder {
   llvm::MapVector<Source *, Edge> edges;
   std::deque<MuxBuild> muxBuilds; // a deque so `record`'s slot pointers into
                                   // `sources` survive later pushes
+  // Where the cell containers sat when `resolveEdges` finished; the delay
+  // passes assert they have not moved, `edges` keying slots by pointer.
+  const void *unitsBase = nullptr, *memsBase = nullptr, *streamsBase = nullptr;
 
   const BindingPolicy &policy; // decides resource sharing
   const DeviceModel &dev;      // device storage + operator timing
@@ -264,8 +267,13 @@ struct DatapathBuilder {
   /// Resolve an operand \p v consumed by \p consumer (in a region with
   /// initiation interval \p ii) to its producing Source plus register depth,
   /// plus the one edge that does not read \p v at all (an un-latched own
-  /// iter-arg = the loop recurrence).
-  Resolved resolveOperand(Value v, Operation *consumer, unsigned ii);
+  /// iter-arg = the loop recurrence). An enclosing region's counter is held
+  /// for the whole nested pass and ties in with no chain, EXCEPT on an
+  /// address slot (\p addressSlot): the reduction reads edge depths to fold
+  /// counters into scaled strides, and withdraws the chain itself where it
+  /// succeeds.
+  Resolved resolveOperand(Value v, Operation *consumer, unsigned ii,
+                          bool addressSlot = false);
   /// Resolve every unit input / memory address / store-data / stream driver
   /// into an `Edge`, recording what each slot reads and how late. Materializes
   /// nothing.

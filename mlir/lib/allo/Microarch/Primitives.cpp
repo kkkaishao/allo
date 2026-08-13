@@ -197,14 +197,33 @@ void recordMemoryInit(seq::HLMemOp mem, ArrayRef<APInt> words) {
 //===----------------------------------------------------------------------===//
 
 Value readCrossbar(EmitContext &c, ArrayRef<Value> bankValues, Value bank) {
-  Value out = bankValues[0]; // bank 0 falls through the priority chain
-  for (unsigned k = 1; k < bankValues.size(); ++k)
-    out = c.mux(c.icmpEq(bank, k), bankValues[k], out);
-  return out;
+  c.muxLedger.add(MuxRole::Crossbar, bankValues.size(),
+                  datapathWidth(bankValues[0].getType()));
+  // The selects are exclusive by construction, so the reduction is the
+  // log-depth AND-OR `muxLevels` prices rather than an N-1 priority chain,
+  // and the compare runs at the index's live clog2(N) bits rather than its
+  // carried width. A no-match select reads 0, a don't-care (the program
+  // would be out of bounds).
+  return c.oneHotSelect(bankValues, oneHotDecode(c, bank, bankValues.size()));
+}
+
+SmallVector<Value> oneHotDecode(EmitContext &c, Value idx, unsigned n) {
+  if (n == 1)
+    return {c.t1}; // one target: an in-bounds index can only name it
+  Value sel = addrAt(c.b, c.loc, idx, llvm::Log2_32_Ceil(n));
+  SmallVector<Value> lines;
+  for (unsigned k = 0; k < n; ++k)
+    lines.push_back(c.icmpEq(sel, k));
+  return lines;
 }
 
 Value writeDemux(EmitContext &c, Value we, Value bank, unsigned k) {
-  return bank ? c.andBits(we, c.icmpEq(bank, k)) : we;
+  if (!bank)
+    return we;
+  // One decoder arm: a compare at the bank tag's width plus a 1-bit gate,
+  // charged as a 2:1 cone at that width, which prices about the same fabric.
+  c.muxLedger.add(MuxRole::Crossbar, 2, datapathWidth(bank.getType()));
+  return c.andBits(we, c.icmpEq(bank, k));
 }
 
 //===----------------------------------------------------------------------===//
@@ -482,8 +501,8 @@ std::vector<RegClass> RegLedger::classes() const {
   std::vector<RegClass> out;
   out.reserve(runs.size());
   for (const auto &[key, count] : runs) {
-    auto [role, width, depth] = key;
-    out.push_back({role, width, depth, count});
+    auto [role, width, depth, reset, enable] = key;
+    out.push_back({role, width, depth, count, reset, enable});
   }
   return out;
 }
@@ -498,8 +517,37 @@ unsigned RegLedger::bits() const {
 void RegLedger::dump(llvm::raw_ostream &os) const {
   for (const RegClass &c : classes())
     os << "  " << roleName(c.role) << " x" << c.count << ": " << c.depth
-       << " deep, " << c.width << " bits\n";
+       << " deep, " << c.width << " bits" << (c.reset ? ", rst" : "")
+       << (c.enable ? ", ce" : "") << "\n";
   os << "  total " << bits() << " flip-flops\n";
+}
+
+llvm::StringRef muxRoleName(MuxRole role) {
+  switch (role) {
+  case MuxRole::Address:
+    return "address";
+  case MuxRole::Commit:
+    return "commit";
+  case MuxRole::Crossbar:
+    return "crossbar";
+  }
+  llvm_unreachable("every MuxRole has a name");
+}
+
+std::vector<MuxCone> MuxLedger::classes() const {
+  std::vector<MuxCone> out;
+  out.reserve(cones.size());
+  for (const auto &[key, count] : cones) {
+    auto [role, fanin, width] = key;
+    out.push_back({role, fanin, width, count});
+  }
+  return out;
+}
+
+void MuxLedger::dump(llvm::raw_ostream &os) const {
+  for (const MuxCone &c : classes())
+    os << "  " << muxRoleName(c.role) << " x" << c.count << ": " << c.fanin
+       << ":1, " << c.width << " bits\n";
 }
 
 //===----------------------------------------------------------------------===//
@@ -510,31 +558,70 @@ Value EmitContext::konst(Type t, int64_t v) {
   return R(hw::ConstantOp::create(b, loc, t, v));
 }
 
+// Only control state needs a synchronous reset. A value run's data is
+// don't-care until its valid pulse arrives, and a pulse run only needs a
+// defined power-on 0, which the initial value provides and the fabric's INIT
+// carries for free; the reset is what blocks shift-register extraction.
+static bool holdsReset(RegRole role) {
+  return role != RegRole::Value && role != RegRole::Pulse;
+}
+
+Value EmitContext::initialFor(Value rstVal) {
+  auto k = rstVal.getDefiningOp<hw::ConstantOp>();
+  assert(k && "a reset-free register powers on to a constant");
+  Value &v = initials[k.getValueAttr()];
+  if (!v)
+    v = seq::createConstantInitialValue(b, loc, k.getValueAttr());
+  return v;
+}
+
 Value EmitContext::reg(Value in, Value rstVal, RegRole role) {
   if (!inChainRun)
-    ledger.add(role, datapathWidth(in.getType()), 1);
-  return R(seq::CompRegOp::create(b, loc, in, clk, rst, rstVal));
+    ledger.add(role, datapathWidth(in.getType()), 1, holdsReset(role));
+  if (holdsReset(role))
+    return R(seq::CompRegOp::create(b, loc, in, clk, rst, rstVal));
+  return R(seq::CompRegOp::create(b, loc, in, clk, /*reset=*/Value(),
+                                  /*rstValue=*/Value(), initialFor(rstVal)));
 }
 
 Value EmitContext::enabledReg(Value in, Value ce, Value rstVal, RegRole role) {
-  Backedge selfNext = bb.get(in.getType());
-  Value self = reg(selfNext, rstVal, role);
-  selfNext.setValue(mux(ce, in, self));
-  return self;
+  // A real clock enable, not the feedback-mux spelling: `seq.compreg.ce` is
+  // not self-referential, so CSE can merge identical runs, and the export
+  // pipeline lowers it after that. Cell-identical on the fabric either way.
+  if (!inChainRun)
+    ledger.add(role, datapathWidth(in.getType()), 1, holdsReset(role),
+               /*enable=*/true);
+  if (holdsReset(role))
+    return R(seq::CompRegClockEnabledOp::create(
+        b, loc, in.getType(), in, clk, ce, StringAttr(), rst, rstVal,
+        /*initialValue=*/Value(), hw::InnerSymAttr()));
+  return R(seq::CompRegClockEnabledOp::create(
+      b, loc, in.getType(), in, clk, ce, StringAttr(), /*reset=*/Value(),
+      /*resetValue=*/Value(), initialFor(rstVal), hw::InnerSymAttr()));
 }
 
 Value EmitContext::stallHold(Value in, const StallShell &sh) {
   if (!sh)
     return in; // rigid: the address is just the live index
-  Backedge heldNext = bb.get(in.getType());
-  Value held = reg(heldNext, konst(in.getType(), 0));
-  Value out = mux(sh.chainEnable, in, held);
-  heldNext.setValue(out);
-  return out;
+  if (!inChainRun)
+    ledger.add(RegRole::Control, datapathWidth(in.getType()), 1,
+               /*reset=*/true, /*enable=*/true);
+  Value held = R(seq::CompRegClockEnabledOp::create(
+      b, loc, in.getType(), in, clk, sh.chainEnable, StringAttr(), rst,
+      konst(in.getType(), 0), /*initialValue=*/Value(), hw::InnerSymAttr()));
+  return mux(sh.chainEnable, in, held);
 }
 
 Value EmitContext::latchReg(Value init, Value next, Value load, Value advance,
                             RegRole role) {
+  assert(holdsReset(role) && "a latch is control state and keeps its reset");
+  if (!inChainRun)
+    ledger.add(role, datapathWidth(init.getType()), 1, /*reset=*/true,
+               /*enable=*/true);
+  // Kept in the self-holding spelling: a latch is a recurrence by nature,
+  // one per region result, so the CE form's CSE gain does not apply and the
+  // preload-vs-capture shape stays readable off the cone.
+  llvm::SaveAndRestore charged(inChainRun, true);
   Backedge selfNext = bb.get(init.getType());
   Value self = reg(selfNext, konst(init.getType(), 0), role);
   selfNext.setValue(mux(load, init, mux(advance, next, self)));
@@ -579,11 +666,12 @@ ShiftChain EmitContext::shiftChain(Value in, unsigned depth,
     for (unsigned s = 1; s <= depth; ++s) {
       // An elastic shell advances every stage only while enabled, so all taps
       // freeze together; a rigid shell is a plain unconditional shift.
-      cur = sh ? enabledReg(cur, sh.chainEnable, rz) : reg(cur, rz);
+      cur = sh ? enabledReg(cur, sh.chainEnable, rz, role) : reg(cur, rz, role);
       chain.stages.push_back(cur);
     }
   }
-  ledger.add(role, datapathWidth(in.getType()), depth);
+  ledger.add(role, datapathWidth(in.getType()), depth, holdsReset(role),
+             /*enable=*/bool(sh));
   return chain;
 }
 
@@ -602,13 +690,14 @@ ShiftChain EmitContext::foldedChain(Value in, unsigned depth, unsigned ii,
   {
     llvm::SaveAndRestore charged(inChainRun, true);
     for (unsigned j = 0; j < n; ++j) {
-      cur = enabledReg(cur, ce, rz);
+      cur = enabledReg(cur, ce, rz, RegRole::Value);
       held.push_back(cur);
     }
   }
   // The run is the registers BUILT, not the cycles spanned: a fold holds the
   // same `depth` taps in `n` of them.
-  ledger.add(RegRole::Value, datapathWidth(in.getType()), n);
+  ledger.add(RegRole::Value, datapathWidth(in.getType()), n, /*reset=*/false,
+             /*enable=*/true);
   ShiftChain chain;
   chain.stages.push_back(in); // stage 0 = the source, as in a plain chain
   for (unsigned k = 1; k <= depth; ++k)
@@ -629,18 +718,21 @@ Value EmitContext::delayPulseCounted(Value pulse, unsigned n,
   // `pulse` arms the counter at 0; it counts every advancing cycle and fires at
   // n-1, so the output rises exactly n cycles after the input, as a chain tap
   // does. Under an elastic shell it counts only while enabled.
+  IntegerType cntTy = b.getIntegerType(std::max(1u, llvm::Log2_64_Ceil(n)));
   Backedge armedNext = bb.get(i1);
-  Backedge countNext = bb.get(i32);
+  Backedge countNext = bb.get(cntTy);
   const RegRole role = RegRole::Counted;
+  Value cz = konst(cntTy, 0);
   Value armed = sh ? enabledReg(armedNext, sh.chainEnable, f1, role)
                    : reg(armedNext, f1, role);
-  Value count = sh ? enabledReg(countNext, sh.chainEnable, zero32, role)
-                   : reg(countNext, zero32, role);
+  Value count = sh ? enabledReg(countNext, sh.chainEnable, cz, role)
+                   : reg(countNext, cz, role);
   Value fire = andBits(armed, icmpEq(count, n - 1));
   armedNext.setValue(mux(pulse, t1, mux(fire, f1, armed)));
   countNext.setValue(mux(
-      pulse, zero32,
-      mux(armed, R(comb::AddOp::create(b, loc, count, one32, false)), count)));
+      pulse, cz,
+      mux(armed, R(comb::AddOp::create(b, loc, count, konst(cntTy, 1), false)),
+          count)));
   if (!regionTag.empty()) {
     nameValue(armed, regionSignal(regionTag, "wait" + std::to_string(n)));
     nameValue(count,
@@ -650,15 +742,35 @@ Value EmitContext::delayPulseCounted(Value pulse, unsigned n,
 }
 
 Value EmitContext::delayValid(Value sig, unsigned n, const StallShell &sh) {
-  if (n >= kCountedDelayCycles && regionSinglePass)
-    return delayPulseCounted(sig, n, sh);
-  ShiftChain chain = shiftChain(sig, n, sh, RegRole::Pulse);
-  // Label each stage with the cycle it is valid at, so a waveform reads
-  // `r1_v3`: region 1, three cycles after issue.
-  for (auto [k, stage] : llvm::enumerate(chain.stages))
-    if (k && !regionTag.empty())
-      nameValue(stage, regionSignal(regionTag, "v" + std::to_string(k)));
-  return chain.last();
+  assert(sig.getType() == i1 && "a valid is one bit");
+  if (n == 0)
+    return sig;
+  if (n >= kCountedDelayCycles && regionSinglePass) {
+    if (Value hit = countedPulses.lookup({sig, n, sh.chainEnable}))
+      return hit;
+    Value fire = delayPulseCounted(sig, n, sh);
+    countedPulses[{sig, n, sh.chainEnable}] = fire;
+    return fire;
+  }
+  ShiftChain &chain = pulseChains[{sig, sh.chainEnable}];
+  if (chain.stages.empty())
+    chain.stages.push_back(sig); // stage 0 = the source itself
+  if (unsigned have = chain.depth(); have < n) {
+    Value cur = chain.stages.back();
+    llvm::SaveAndRestore charged(inChainRun, true);
+    for (unsigned k = have + 1; k <= n; ++k) {
+      cur = sh ? enabledReg(cur, sh.chainEnable, f1, RegRole::Pulse)
+               : reg(cur, f1, RegRole::Pulse);
+      // Label each stage with the cycle it is valid at, so a waveform reads
+      // `r1_v3`: region 1, three cycles after issue.
+      if (!regionTag.empty())
+        nameValue(cur, regionSignal(regionTag, "v" + std::to_string(k)));
+      chain.stages.push_back(cur);
+    }
+    ledger.extend(RegRole::Pulse, 1, have, n, holdsReset(RegRole::Pulse),
+                  /*enable=*/bool(sh));
+  }
+  return chain.stages[n];
 }
 
 Value EmitContext::activationPulse(Value pulse, unsigned stage,
@@ -668,7 +780,7 @@ Value EmitContext::activationPulse(Value pulse, unsigned stage,
 
 Value EmitContext::icmpEq(Value a, int64_t cst) {
   return R(comb::ICmpOp::create(b, loc, comb::ICmpPredicate::eq, a,
-                                konst(i32, cst), false));
+                                konstLike(b, loc, a, cst), false));
 }
 
 Value EmitContext::icmpEqV(Value lhs, Value rhs) {

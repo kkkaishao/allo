@@ -121,13 +121,18 @@ RegionControl ControlEmitter::emitPipelined(unsigned region, int64_t ii,
   Value wantIssue = running;
   Value phase;
   if (ii > 1) {
-    auto phaseNext = c.bb.get(c.i32);
-    phase = c.reg(phaseNext, c.zero32, RegRole::Counter);
+    // The phase runs [0, ii), so it is built at clog2(ii) bits; `icmpEq`
+    // compares at that width.
+    IntegerType phaseTy = c.b.getIntegerType(llvm::Log2_64_Ceil(ii));
+    auto phaseNext = c.bb.get(phaseTy);
+    Value pz = c.konst(phaseTy, 0);
+    phase = c.reg(phaseNext, pz, RegRole::Counter);
     nameValue(phase, regionSignal(region, "phase"));
     wantIssue = c.R(
         comb::AndOp::create(c.b, c.loc, running, c.icmpEq(phase, 0), false));
-    Value phasep1 = c.R(comb::AddOp::create(c.b, c.loc, phase, c.one32, false));
-    Value phaseAdv = c.mux(c.icmpEq(phase, ii - 1), c.zero32, phasep1);
+    Value phasep1 =
+        c.R(comb::AddOp::create(c.b, c.loc, phase, c.konst(phaseTy, 1), false));
+    Value phaseAdv = c.mux(c.icmpEq(phase, ii - 1), pz, phasep1);
     // The phase is the region's time base rather than an issue gate: it
     // reloads on `start` and free-runs with the chains folded onto it, so a
     // frozen cycle holds them together and the cadence resumes where it
@@ -135,7 +140,7 @@ RegionControl ControlEmitter::emitPipelined(unsigned region, int64_t ii,
     // which keeps that pass a whole `ii` late and the modulo reservation
     // intact.
     phaseNext.setValue(
-        c.mux(term.gateStart(c, start), c.zero32,
+        c.mux(term.gateStart(c, start), pz,
               c.mux(sh ? sh.chainEnable : c.t1, phaseAdv, phase)));
   }
   // Gated issue: a stalled cycle (enable low) issues nothing, so the counter,
@@ -213,6 +218,9 @@ ControlEmitter::emitCountedIteration(const uarch::RegionBlock &rb,
   // An empty region completes one cycle after `start`, not on it: `done` is a
   // level cleared by `start`, so a pulse landing there would leave it high with
   // no 0->1 edge for the next node to start on.
+  static_assert(kEmptyRegionCycles == 1 + kDoneLatchCycles,
+                "an empty region is one registered start pulse feeding the "
+                "done latch; a different declared cost must be built here");
   Value empty = c.reg(c.andBits(start, term.isEmpty(c)), c.f1);
   Value done = c.holdDone(c.orBits(empty, c.andBits(complete, last)), start);
   nameValue(done, regionSignal(rb.id, "done"));

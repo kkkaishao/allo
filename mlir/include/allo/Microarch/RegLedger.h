@@ -40,9 +40,14 @@ llvm::StringRef roleName(RegRole role);
 /// The run, not the register, is the cost unit. Past the synthesizer's
 /// shift-register extraction threshold a run stops costing flip-flops per
 /// stage, so a cost model handed only a register total cannot price it.
+/// `reset` and `enable` complete that shape: a synchronous reset blocks the
+/// extraction and pays fabric per bit, while a clock enable is free, so a cost
+/// model needs both to pick the right characterization row.
 struct RegClass {
   RegRole role = RegRole::Control;
   unsigned width = 0, depth = 0, count = 0;
+  bool reset = true;   // holds a synchronous reset to its reset value
+  bool enable = false; // samples only under a condition (d = ce ? in : q)
 };
 
 /// Every register one module's emission built. Filled at the one point that
@@ -52,10 +57,26 @@ class RegLedger {
 public:
   /// Charge one run of \p depth registers of \p width bits. A depth of zero is
   /// no run at all (a chain a consumer reads at tap 0 builds nothing).
-  void add(RegRole role, unsigned width, unsigned depth) {
+  void add(RegRole role, unsigned width, unsigned depth, bool reset = true,
+           bool enable = false) {
     assert(width && "a register holds at least one bit");
     if (depth)
-      ++runs[{role, width, depth}];
+      ++runs[{role, width, depth, reset, enable}];
+  }
+
+  /// Re-charge a run extended in place from \p from to \p to stages deep:
+  /// only the new stages were built, so the old run's charge is replaced
+  /// rather than added to.
+  void extend(RegRole role, unsigned width, unsigned from, unsigned to,
+              bool reset = true, bool enable = false) {
+    assert(from < to && "an extension adds at least one stage");
+    if (from) {
+      auto it = runs.find({role, width, from, reset, enable});
+      assert(it != runs.end() && it->second && "extending a run never charged");
+      if (!--it->second)
+        runs.erase(it);
+    }
+    add(role, width, to, reset, enable);
   }
 
   /// Every class, in a deterministic order, so a report built from this does
@@ -68,7 +89,45 @@ public:
   void dump(llvm::raw_ostream &os) const;
 
 private:
-  std::map<std::tuple<RegRole, unsigned, unsigned>, unsigned> runs;
+  std::map<std::tuple<RegRole, unsigned, unsigned, bool, bool>, unsigned> runs;
+};
+
+/// Why a select cone exists. These are the interconnect the emitter builds
+/// around storage after the binding, a population disjoint from the
+/// allocation's own mux cells (which the region report prices from the model).
+enum class MuxRole {
+  Address,  // a shared port's one-hot address select
+  Commit,   // a shared write or held read port's priority commit chain
+  Crossbar, // routing a run-time-banked or scattered access
+};
+
+llvm::StringRef muxRoleName(MuxRole role);
+
+/// One class of select cone: `count` cones, each `fanin` sources wide at
+/// `width` bits. A k:1 cone costs about (k-1) 2:1 muxes per bit, so these two
+/// numbers are the whole cost shape.
+struct MuxCone {
+  MuxRole role = MuxRole::Address;
+  unsigned fanin = 0, width = 0, count = 0;
+};
+
+/// Every select cone the emission builds around storage, charged where it is
+/// built, mirroring RegLedger.
+class MuxLedger {
+public:
+  /// Charge one cone of \p fanin sources at \p width bits. Fewer than two
+  /// sources select nothing and charge nothing.
+  void add(MuxRole role, unsigned fanin, unsigned width) {
+    if (fanin >= 2 && width)
+      ++cones[{role, fanin, width}];
+  }
+
+  std::vector<MuxCone> classes() const;
+
+  void dump(llvm::raw_ostream &os) const;
+
+private:
+  std::map<std::tuple<MuxRole, unsigned, unsigned>, unsigned> cones;
 };
 
 } // namespace mlir::allo::uarch

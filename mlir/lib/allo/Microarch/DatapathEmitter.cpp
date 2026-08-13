@@ -27,8 +27,13 @@ Value DatapathEmitter::resolveSource(const uarch::Source &s) {
     assert(v && "unit source read before its region declared it");
     return v;
   }
-  case uarch::Source::Kind::Reg:
-    return regStages[s.id].tap(s.outPort);
+  case uarch::Source::Kind::Reg: {
+    // A counter chain runs at the region's own counter width; the tap
+    // sign-extends back to the width the value is read at.
+    const uarch::Register &rg = dp.regs[s.id];
+    return resize(c.b, c.loc, regStages[s.id].tap(s.outPort),
+                  datapathWidth(rg.value.getType()), /*isSigned=*/true);
+  }
   case uarch::Source::Kind::Mem:
     return readData.lookup(accKey(s.id, s.outPort));
   case uarch::Source::Kind::Stream:
@@ -285,10 +290,16 @@ DatapathEmitter::emitConditionRegion(const uarch::RegionBlock &rb,
   return {resolveSource(condSrc), dp.readyCycle(condSrc)};
 }
 
-// Resolve region \p rb's register head inputs once its units exist.
+// Resolve region \p rb's register head inputs once its units exist. A chain
+// narrower than its value (a counter chain) truncates at the head; the taps
+// extend back.
 void DatapathEmitter::resolveRegHeads(const uarch::RegionBlock &rb) {
-  for (uarch::RegId rid : rb.regs)
-    regHeadBE.find(rid)->second.setValue(resolveSource(dp.regs[rid].input));
+  for (uarch::RegId rid : rb.regs) {
+    const uarch::Register &rg = dp.regs[rid];
+    regHeadBE.find(rid)->second.setValue(
+        resize(c.b, c.loc, resolveSource(rg.input), datapathWidth(rg.type),
+               /*isSigned=*/true));
+  }
 }
 
 // A kernel-local channel's `seq.fifo` cannot be built until every access has
@@ -657,8 +668,8 @@ void DatapathEmitter::emitComposedChannel(const uarch::StreamChannel &s) {
     Value data = out[k], valid = notEmpty;
     if (nInit) {
       // `rem` counts the initial tokens still to serve, k .. 1; the datum is
-      // picked by the running index (idx = nInit - rem) and the rem==1 token
-      // falls through as the chain's default.
+      // picked by the running index (idx = nInit - rem), a one-hot select
+      // since `rem` equals exactly one value while `serving` holds.
       unsigned remW = 1;
       while ((1u << remW) <= nInit)
         ++remW;
@@ -680,11 +691,12 @@ void DatapathEmitter::emitComposedChannel(const uarch::StreamChannel &s) {
                        bits.zextOrTrunc(cast<IntegerType>(payload).getWidth())
                            .getZExtValue());
       };
-      Value fromInit = token(nInit - 1);
-      for (unsigned v = 2; v <= nInit; ++v)
-        fromInit = c.mux(c.icmpEqV(rem, c.konst(remTy, v)), token(nInit - v),
-                         fromInit);
-      data = c.mux(serving, fromInit, out[k]);
+      SmallVector<Value> vals, sels;
+      for (unsigned v = 1; v <= nInit; ++v) {
+        vals.push_back(token(nInit - v));
+        sels.push_back(c.icmpEqV(rem, c.konst(remTy, v)));
+      }
+      data = c.mux(serving, c.oneHotSelect(vals, sels), out[k]);
       valid = c.orBits(serving, notEmpty);
       rdEn = c.andBits(rdEn, c.notBit(serving));
       Value dec = c.R(comb::SubOp::create(c.b, c.loc, rem, c.konst(remTy, 1)));

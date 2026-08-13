@@ -121,10 +121,15 @@ struct BankSplit {
                 // access is statically banked and the caller routes it itself
   Value offset; // its linear index inside that bank (over `bankShape`)
 };
-/// N:1 result mux: select `bankValues[bank]` (a priority chain, bank in [0,N),
-/// with bank 0 falling through). Values are pre-read from every bank; the
-/// caller aligns \p bank with the read latency.
+/// N:1 result mux: a one-hot select of `bankValues[bank]`, bank in [0,N).
+/// Values are pre-read from every bank; the caller aligns \p bank with the
+/// read latency.
 Value readCrossbar(EmitContext &c, ArrayRef<Value> bankValues, Value bank);
+
+/// Decode \p idx into one line per target: line k = (idx == k), compared once
+/// at the index's live clog2(n) bits so every consumer shares the narrow
+/// compare instead of building its own at the carried width.
+SmallVector<Value> oneHotDecode(EmitContext &c, Value idx, unsigned n);
 
 /// The 1:N write mirror of `readCrossbar`: the write-enable of bank \p k when
 /// one address/datum is broadcast to every bank interface and only the
@@ -202,9 +207,23 @@ struct EmitContext {
   // emitted design rather than a model of it; `checkRegLedger` holds the two
   // together on every emission.
   RegLedger ledger;
+  // Every select cone built around storage after the binding (shared-port
+  // selects, commit sinks, crossbars), charged where it is built. The
+  // allocation's own mux cells are priced from the model, not here.
+  MuxLedger muxLedger;
   // Set while a chain builder runs: it charges the whole run at once, so its
   // stages must not each charge one of their own.
   bool inChainRun = false;
+  // Power-on immutables by constant, shared across every reset-free register
+  // of the module (the hw.module body is a graph region, so use sites need
+  // not follow the definition).
+  llvm::DenseMap<Attribute, Value> initials;
+  // Pulse-delay memos: one chain per (source, chain enable) extended to the
+  // deepest requested stage and tapped, and one counter per exact
+  // (source, depth, enable), so consumers share stages instead of each
+  // building a private chain the ledger would count again.
+  llvm::DenseMap<std::pair<Value, Value>, ShiftChain> pulseChains;
+  llvm::DenseMap<std::tuple<Value, unsigned, Value>, Value> countedPulses;
 
   EmitContext(OpBuilder &b, Location loc, circt::BackedgeBuilder &bb, Type i1,
               Type i32)
@@ -214,16 +233,25 @@ struct EmitContext {
   /// Combinational (0-cycle) constant.
   Value konst(Type t, int64_t v);
 
+  /// The power-on value a reset-free register carries, as the shared
+  /// `seq.initial` immutable for \p rstVal's constant. One per distinct
+  /// constant: a 64-stage chain must not build 64 initial regions.
+  Value initialFor(Value rstVal);
+
   /// Registered (1-cycle): out[t+1] = in[t], sampled unconditionally on every
-  /// clock; out = `rstVal` while in reset (`seq.compreg`).
+  /// clock. A control-state role resets to `rstVal` (`seq.compreg` with a
+  /// synchronous reset); a Value or Pulse role instead powers on to it and
+  /// carries no reset, the reset being what blocks shift-register extraction on
+  /// the fabric.
   ///
-  /// The ONE place a register is built, which is what makes `ledger` exact.
-  /// \p role is what the register is FOR, charged as a run of one unless a
-  /// chain builder is already charging the whole run it belongs to.
+  /// The one place a register is built (with `enabledReg` below), which is
+  /// what makes `ledger` exact. \p role is what the register is FOR, charged
+  /// as a run of one unless a chain builder is already charging the whole run
+  /// it belongs to.
   Value reg(Value in, Value rstVal, RegRole role = RegRole::Control);
   /// Clock-enabled register (1-cycle when enabled): out[t+1] = ce[t] ? in[t] :
-  /// out[t]. It samples `in` on the clock edge only when `ce` is high, else
-  /// holds; out = `rstVal` while in reset. Edge-triggered, NOT a
+  /// out[t], built as `seq.compreg.ce` so identical runs stay CSE-able. Reset
+  /// vs power-on follows the same role split as `reg`. Edge-triggered, not a
   /// level-sensitive latch.
   Value enabledReg(Value in, Value ce, Value rstVal,
                    RegRole role = RegRole::Control);
@@ -250,7 +278,8 @@ struct EmitContext {
   /// rigid shell, and only while `chainEnable` is high under an elastic one, so
   /// the taps freeze together and the "index == cycles delayed" contract holds
   /// under stall too. Returns the taps: `stages[k]` = `in` delayed k cycles,
-  /// each stage reset to 0, `stages[0]` = `in` itself.
+  /// each stage powering on to 0 (or reset to 0 for a control-state role),
+  /// `stages[0]` = `in` itself.
   ///
   /// Charges the ledger ONE run of `depth`, since that is the shape a
   /// synthesizer prices: only the caller knows whether the run carries a datum
@@ -271,11 +300,14 @@ struct EmitContext {
   /// every `ii` cycles, i.e. a schedule-paced cyclic leaf.
   ShiftChain foldedChain(Value in, unsigned depth, unsigned ii, Value phase,
                          unsigned ready, const StallShell &sh);
-  /// A 1-bit signal delayed `n` cycles (issue -> a store's pipeline stage): the
-  /// last tap of an `n`-deep `shiftChain`. Resets to 0, so no spurious valid.
-  /// A deep delay in a single-pass region is built as `delayPulseCounted`
-  /// instead, since `n` registers to hold one pulse is a cost that tracks the
-  /// SCHEDULE rather than the datapath.
+  /// A 1-bit signal delayed `n` cycles (issue -> a store's pipeline stage):
+  /// tap `n` of the one pulse chain per (signal, time base), extended on demand
+  /// so every consumer shares its stages, which is the tap rule
+  /// `insertRegisters` applies to value chains. Powers on to 0, so no spurious
+  /// valid. A deep delay in a single-pass region is built as
+  /// `delayPulseCounted` instead (memoized per exact depth, a counter admitting
+  /// no taps): `n` registers to hold one pulse is a cost that tracks the
+  /// schedule rather than the datapath.
   Value delayValid(Value sig, unsigned n, const StallShell &sh);
   /// One pulse delayed `n` cycles by a counter: `log2(n)` registers instead of
   /// `n`, at the cost of admitting only one pulse at a time. Sound exactly
@@ -286,7 +318,8 @@ struct EmitContext {
   /// fires now", used for a store's write-enable, a shared-unit input's mux
   /// select and an accumulator's init gate alike.
   Value activationPulse(Value pulse, unsigned stage, const StallShell &sh);
-  /// Combinational (0-cycle) equality of an i32 value `a` against a constant.
+  /// Combinational (0-cycle) equality of `a` against a constant built at
+  /// `a`'s own width, so a narrow counter compares narrow.
   Value icmpEq(Value a, int64_t c);
   /// Combinational (0-cycle) equality of two same-width values (a runtime
   /// compare, e.g. a counter against a data-dependent trip bound).

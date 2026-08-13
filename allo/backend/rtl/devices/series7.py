@@ -99,6 +99,21 @@ TIMING: Mapping[Grade, FabricTiming] = {
         },
         stream=StorageTiming(0, 1, 2.815, 3.449),
         reg_ns=1.086,
+        # One-hot select cones, routed, marginal over the register floor and
+        # monotone over fan-in; the width factor is pinned to 1.0 at 32 bits.
+        mux=Interp(
+            {
+                2: 1.123,
+                3: 1.123,
+                4: 2.610,
+                8: 2.610,
+                12: 3.264,
+                16: 3.505,
+                24: 4.575,
+                40: 4.575,
+            }
+        ),
+        mux_w=Interp({1: 0.53, 8: 0.73, 16: 0.83, 32: 1.0, 64: 1.75}),
     ),
 }
 
@@ -288,6 +303,19 @@ def _chain_uses(r: Mapping[str, Resource]) -> dict:
     }
 
 
+def _chain_uses_norst(r: Mapping[str, Resource]) -> dict:
+    """The same chain without a synchronous reset: the SRL keeps every interior
+    stage, so only the two end registers stay in flip-flops and the reset's
+    per-stage FF and per-bit LUT vanish."""
+    return {
+        r["ff"]: (Step(SRL_MIN_DEPTH, 1.0, 2.0), Linear(1.0)),
+        r["slicem_lut"]: (
+            Piecewise(SRL_MIN_DEPTH, Const(0.0), Tiled(32)),
+            Linear(1.0),
+        ),
+    }
+
+
 def build(part: Part) -> Device:
     """The :class:`Device` for one 7-series die."""
     timing = TIMING.get(part.grade)
@@ -340,7 +368,10 @@ def build(part: Part) -> Device:
             )
 
     d.set_mux_uses({res["lut"]: (MUX_LUT_COST, Linear(1.0))})
+    if timing.mux:
+        d.set_mux_delay(timing.mux, timing.mux_w)
     d.set_chain_uses(_chain_uses(res))
+    d.set_chain_uses_norst(_chain_uses_norst(res))
     # A constant table is logic, not storage: one LUT is a 64-entry lookup.
     d.set_rom_uses({res["lut"]: (Tiled(ROM_ENTRIES_PER_LUT), Linear(1.0))})
     d.set_register_floor(timing.reg_ns)

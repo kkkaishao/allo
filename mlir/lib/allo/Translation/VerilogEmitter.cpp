@@ -12,6 +12,7 @@
 #include "circt/Dialect/Seq/SeqPasses.h"
 #include "circt/Dialect/Verif/VerifDialect.h"
 
+#include "mlir/Conversion/ReconcileUnrealizedCasts/ReconcileUnrealizedCasts.h"
 #include "mlir/Pass/PassManager.h"
 #include "mlir/Transforms/Passes.h"
 
@@ -35,6 +36,10 @@ static void addLowerToSV(PassManager &pm) {
   // assertions ExportVerilog understands.
   hwPM.addPass(circt::createLowerVerifToSVPass());
   pm.addPass(circt::createLowerSeqToSVPass());
+  // SeqToSV replaces a `seq.initial`'s results with dangling unrealized casts
+  // as it splices the body into `sv.initial`; they are dead by then, and
+  // ExportVerilog refuses any op it does not know.
+  pm.addPass(createReconcileUnrealizedCastsPass());
   pm.nest<circt::hw::HWModuleOp>().addPass(circt::createLowerHWToSVPass());
 }
 

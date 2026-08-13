@@ -28,9 +28,10 @@ empty:
              `planned` under the heuristic scheduler does, so the probe states
              how many variants it actually distinguished rather than letting a
              row count imply it.
-    cycles   the measured cosim cycle count. `cosim` already holds an exact
-             latency contract to it, so a binding that moved the schedule shows
-             up as a number rather than as a silent pass.
+    cycles   the measured cosim cycle count. `cosim` holds the kernel's
+             published contract to it, failing a run that outlasts the figure,
+             so a binding that moved the schedule shows up as a number rather
+             than as a silent pass.
 
 Each run is a subprocess for the reason `report.py` uses one: a solver that does
 not terminate, an assert that fires and a simulator that dies are all results,
@@ -47,6 +48,7 @@ import shutil
 import subprocess
 import sys
 import time
+import warnings
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -116,6 +118,7 @@ def verify_one(
 
     ``binding`` is the operator-sharing policy and the axis this probe exists
     for; ``cycles`` overrides the derived simulation budget."""
+    from allo.backend.rtl import LatencyModelWarning
     from benchmark.spec import find
 
     bench = find(key)
@@ -143,6 +146,7 @@ def verify_one(
         fn = rtl.schedule().func(rtl.top)
         out["latency"] = fn.latency
         out["latency_exact"] = fn.latency_is_exact
+        out["determinacy"] = fn.determinacy
 
         out["stage"] = "compile"
         rtl.compile()
@@ -158,9 +162,17 @@ def verify_one(
         )
 
         out["stage"] = "cosim"
-        out["cycles"] = rtl.cosim(
-            *args, timeout=cycles or _cycle_budget(fn.latency)
-        ).cycles
+        # `cosim`'s oracle raises on the unsound direction, which lands in
+        # `error` below; its pessimism warning would otherwise die with the
+        # child's stderr, so it is carried in the row instead.
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always", LatencyModelWarning)
+            out["cycles"] = rtl.cosim(
+                *args, timeout=cycles or _cycle_budget(fn.latency)
+            ).cycles
+        early = [w for w in caught if issubclass(w.category, LatencyModelWarning)]
+        if early:
+            out["latency_warn"] = " ".join(str(early[0].message).split())[:200]
 
         out["stage"] = "compare"
         bad = _mismatch(bench, args, expected)
@@ -276,6 +288,28 @@ def coverage_note(results: list[dict], bindings: list[str]) -> str:
         f"across {bindings}; the other {len(same)} checked one hardware "
         f"{len(bindings)} times"
     )
+
+
+def oracle_note(results: list[dict]) -> str:
+    """How much of the sweep the latency oracle held to a number, and every run
+    that beat its own exact contract. A kernel whose span is data-dependent
+    publishes no figure, so its row rests on the functional comparison alone."""
+    ran = [r for r in results if r.get("cycles") is not None]
+    if not ran:
+        return ""
+    held = [
+        r
+        for r in ran
+        if r.get("latency") is not None and r.get("determinacy") != "concurrent"
+    ]
+    lines = [
+        f"{len(held)} of {len(ran)} cosim runs were held to a published latency; "
+        f"the other {len(ran) - len(held)} publish no static span to hold"
+    ]
+    for r in ran:
+        if r.get("latency_warn"):
+            lines.append(f"  early: {_key_of(r)} [{r['binding']}] {r['latency_warn']}")
+    return "\n".join(lines)
 
 
 def failure_report(results: list[dict]) -> str:
@@ -394,9 +428,9 @@ def main():
     Path(args.out).write_text(json.dumps(results, indent=1))
     print(f"\nwrote {args.out}\n")
     print(variant_table(results, bindings))
-    note = coverage_note(results, bindings)
-    if note:
-        print("\n" + note)
+    for note in (coverage_note(results, bindings), oracle_note(results)):
+        if note:
+            print("\n" + note)
 
     tally: dict = {}
     for r in results:

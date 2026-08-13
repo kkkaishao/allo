@@ -29,23 +29,21 @@ pytestmark = pytest.mark.skipif(
 )
 
 _DEF = re.compile(r"^%([\w.$-]+) = (.*)$")
-_COMPREG = re.compile(r'^seq\.compreg (?:name "([^"]*)" )?%([\w.$-]+),')
+_COMPREG = re.compile(r'^seq\.compreg(\.ce)? (?:name "([^"]*)" )?%([\w.$-]+),')
 _MUX = re.compile(r"^comb\.mux (?:bin )?%([\w.$-]+), %([\w.$-]+), %([\w.$-]+)")
 
 
 def _survivors(rtl):
     """Every survivor register in the emitted module as sorted (name, shape).
 
-    A survivor is named ``r<region>_sv<k>`` (`uarch::survivorName`); a guard
-    emits two under one name (the then-arm's and the else-arm's, muxed by the
-    predicate), which MLIR uniquifies in SSA but not in the `name` attribute.
-    The shape is read off the register's next-value cone: ``latch`` is
-    ``latchReg(init, value, start, capture)``, preloaded with the loop-carried
-    identity and re-latched on each capture pulse (so a run that never
-    captures yields the identity rather than a stale prior value); ``enabled``
-    is ``enabledReg(value, capture, 0)``, with no recurrence, emitted for an
-    acyclic region's yield and for each arm of a result-mux guard. A mux over
-    a mux is ``latch``; a single self-referential mux is ``enabled``.
+    A survivor is named ``r<region>_sv<k>`` (`uarch::survivorName`). The shape
+    is read off the register's spelling: ``enabled`` is a ``seq.compreg.ce``
+    capturing on its enable with no recurrence, emitted for an acyclic
+    region's yield and for a guard's single result survivor; ``latch`` is
+    ``latchReg(init, value, start, capture)``, a plain register under
+    ``mux(start, init, mux(capture, value, self))``, preloaded with the
+    loop-carried identity so a run that never captures yields the identity
+    rather than a stale prior value.
     """
     defs = {}
     for line in rtl.mlir.splitlines():
@@ -57,18 +55,16 @@ def _survivors(rtl):
         reg = _COMPREG.match(rhs)
         if not reg:
             continue
-        name = reg.group(1) or ssa
+        name = reg.group(2) or ssa
         if "_sv" not in name:
             continue
-        outer = _MUX.match(defs.get(reg.group(2), ""))
-        if not outer:
-            out.append((name, "other"))
-        elif outer.group(3) == ssa:  # mux(capture, value, self)
+        if reg.group(1):  # seq.compreg.ce: a plain capture, no recurrence
             out.append((name, "enabled"))
-        else:  # mux(start, init, mux(capture, value, self))
-            inner = _MUX.match(defs.get(outer.group(3), ""))
-            shape = "latch" if inner and inner.group(3) == ssa else "other"
-            out.append((name, shape))
+            continue
+        outer = _MUX.match(defs.get(reg.group(3), ""))
+        inner = _MUX.match(defs.get(outer.group(3), "")) if outer else None
+        shape = "latch" if inner and inner.group(3) == ssa else "other"
+        out.append((name, shape))
     return sorted(out)
 
 
@@ -200,10 +196,10 @@ def test_conditional_container_survivors():
     assert np.array_equal(B, np.array([8, 16, 24, 32, 40, 48, 56, 0], np.int32))
 
 
-def test_guard_result_mux_captures_both_arms():
-    # A result-mux guard: both arms capture into their own enabled register,
-    # on THAT arm's drain pulse, and the survivor a consumer reads is
-    # `cond ? then : else`.
+def test_guard_result_survivor_captures_both_arms():
+    # A result guard: both arms capture into one enabled survivor. The arms'
+    # drain pulses are disjoint, so the then pulse selects the datum and their
+    # OR enables the capture, and a consumer reads a plain held register.
     @kernel
     def rmux(a: i32[4, 16], out: i32[4]):
         for g in range(4):
@@ -215,11 +211,10 @@ def test_guard_result_mux_captures_both_arms():
 
     rtl = _to_rtl(rmux)
     # r1 latches the guard's own predicate (`g < 2`, an expression the scheduler
-    # placed), then two same-named registers under r2, the then-arm's and the
-    # else-arm's, plus r3, the guarded reduction inside the then arm.
+    # placed), then the guard's one survivor under r2, plus r3, the guarded
+    # reduction inside the then arm.
     assert _survivors(rtl) == [
         ("r1_sv0", "enabled"),
-        ("r2_sv0", "enabled"),
         ("r2_sv0", "enabled"),
         ("r3_sv0", "latch"),
     ]

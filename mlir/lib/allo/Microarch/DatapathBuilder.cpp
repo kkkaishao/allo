@@ -378,6 +378,8 @@ void DatapathBuilder::bindStream(Operation *op, RegionBlock &rb) {
   acc.isPut = !get;
   acc.region = rb.id;
   acc.stage = static_cast<unsigned>(dcpStart(op));
+  if (auto attr = op->getAttrOfType<FloatAttr>("in_delay"))
+    acc.inDelay = attr.getValueAsDouble();
   dp.streams[sid].accesses.push_back(acc);
   rb.streamAccesses.push_back({sid, aidx});
   // A get produces a token; a put consumes one, and its data driver is
@@ -400,6 +402,10 @@ void DatapathBuilder::bindMemory(Operation *op, Value memref, RegionBlock &rb) {
   acc.isWrite = isWrite;
   acc.region = rb.id;
   acc.stage = dcpStart(op);
+  if (auto attr = op->getAttrOfType<FloatAttr>("in_delay"))
+    acc.inDelay = attr.getValueAsDouble();
+  if (auto attr = op->getAttrOfType<FloatAttr>("port_delay"))
+    acc.portDelay = attr.getValueAsDouble();
   SmallVector<Value> operands;
   dcpAddressing(op, acc.addrMap, operands);
   // One empty slot per index operand, positional and never resized later: the
@@ -782,7 +788,7 @@ void DatapathBuilder::recordResults() {
 //===----------------------------------------------------------------------===//
 
 Resolved DatapathBuilder::resolveOperand(Value v, Operation *consumer,
-                                         unsigned ii) {
+                                         unsigned ii, bool addressSlot) {
   int64_t tY = dcpStart(consumer);
   Operation *regionOp = consumer->getParentOp();
 
@@ -873,10 +879,15 @@ Resolved DatapathBuilder::resolveOperand(Value v, Operation *consumer,
     return {};
   if (isHeld(base))
     return {base, Value(), 0, 0, true};
-  // The counter presents its index at cycle 0 of ITS region, so a consumer
-  // scheduled at tY delays it that far.
-  if (base.kind == Source::Kind::Counter)
+  // The region's own counter presents its index at cycle 0 of the iteration,
+  // so a consumer scheduled at tY delays it that far. An enclosing region's
+  // counter advances only between passes, so a nested consumer reads it live;
+  // an address slot keeps the edge (see the declaration).
+  if (base.kind == Source::Kind::Counter) {
+    if (!addressSlot && base.id != regionIdxOf.lookup(regionOp))
+      return {base, Value(), 0, 0, true};
     return edge(base, v, /*ready=*/0, /*distance=*/0);
+  }
   // A scheduled producer: readable only from the region it issues in, and only
   // after it lands.
   Operation *def = v.getDefiningOp();
@@ -897,6 +908,11 @@ void DatapathBuilder::resolveEdges() {
   }
   resolveUnitInputs();
   resolveAccessOperands();
+  // `edges` keys are pointers into these containers; a pass that grows one
+  // after this point dangles the whole edge table.
+  unitsBase = dp.units.data();
+  memsBase = dp.mems.data();
+  streamsBase = dp.streams.data();
 }
 
 void DatapathBuilder::realizeDelays() {
@@ -1147,6 +1163,21 @@ reduceCone(Datapath &dp, AffineExpr e, AffineMap addrMap,
   return out;
 }
 
+// What `buildAddr` still builds after the address delay register: the residual
+// cone, and the adder joining it to the register the term sum landed in. Priced
+// by the same function the whole cone is, with that register standing as the
+// one input the sum became.
+static double postRegisterDelay(const MemUnit::Access::Reduced &r,
+                                const AddressDelays &delays, unsigned width) {
+  if (!r.residual)
+    return 0.0;
+  SplitAddress sp;
+  if (r.base || !r.terms.empty())
+    sp.terms.push_back({});
+  sp.residual = r.residual;
+  return splitAddressCost(sp, delays, width).delay;
+}
+
 // Address strength reduction: decide which TERMS of each access's address can
 // come from registers that advance with the loop counters, and record the
 // scaled counters those registers need. A term that does not qualify stays in
@@ -1172,6 +1203,11 @@ reduceCone(Datapath &dp, AffineExpr e, AffineMap addrMap,
 // `iv -> (iv floordiv N, iv mod N)` cancels back to `iv`, which the same
 // expression built out of `comb` ops cannot.
 void DatapathBuilder::planAddressGenerators() {
+  assert(dp.units.data() == unitsBase && dp.mems.data() == memsBase &&
+         dp.streams.data() == streamsBase &&
+         "a cell container grew after resolveEdges; the edge table's slot "
+         "pointers are dangling");
+  AddressDelays delays = addressDelaysOf(dev.operators);
   for (MemUnit &m : dp.mems) {
     auto shape = cast<MemRefType>(m.memref.getType()).getShape();
     for (MemUnit::Access &acc : m.accesses) {
@@ -1210,6 +1246,17 @@ void DatapathBuilder::planAddressGenerators() {
       bool anyRegister = !acc.offset.terms.empty() || !acc.bank.terms.empty() ||
                          !acc.offset.reads.empty() || !acc.bank.reads.empty();
       acc.addrDelay = anyRegister ? delay.value_or(0) : 0;
+      // With the sum landing in that register, the cone the scheduler charged
+      // the setup path is no longer on it: only the residual built after the
+      // register is. Both cones run beside each other, so the delay is the max.
+      assert(acc.inDelay >= acc.portDelay &&
+             "an access's priced setup is its port's delay plus its address");
+      acc.addrSetup =
+          acc.addrDelay
+              ? std::max(postRegisterDelay(acc.offset, delays, e.width),
+                         postRegisterDelay(acc.bank, delays,
+                                           AddressDelays::refWidth))
+              : acc.inDelay - acc.portDelay;
       // An operand no residual is left reading has no consumer: its slot stays
       // empty and the delay it was owed is withdrawn before a chain carries it.
       llvm::BitVector read = residualReads(acc);
@@ -1232,8 +1279,9 @@ void DatapathBuilder::resolveAccessOperands() {
       AffineMap ignored;
       dcpAddressing(acc.op, ignored, operands);
       for (unsigned k = 0, e = operands.size(); k < e; ++k)
-        recordCarriedEdge(resolveOperand(operands[k], acc.op, ii), operands[k],
-                          acc.op, acc.addr[k], ridx);
+        recordCarriedEdge(
+            resolveOperand(operands[k], acc.op, ii, /*addressSlot=*/true),
+            operands[k], acc.op, acc.addr[k], ridx);
       if (acc.isWrite) {
         Value datum = cast<dcp::DCPathStoreOp>(acc.op).getValue();
         recordCarriedEdge(resolveOperand(datum, acc.op, ii), datum, acc.op,
@@ -1272,8 +1320,11 @@ void DatapathBuilder::resolveAccessOperands() {
         // AXI-S data stability: a stage>=1 put's valid pulse persists into the
         // drain under back-pressure, so a transient din could commit stale
         // data. Bump its stage by one to route it through a frozen register.
+        // A held enclosing counter resolves at depth 0 but is frozen with its
+        // container while this region is back-pressured, so it is no
+        // transient din.
         if (r.ok && r.depth == 0 && dcpStart(acc.op) >= 1 &&
-            isTransientDin(token)) {
+            r.base.kind != Source::Kind::Counter && isTransientDin(token)) {
           restamp(acc, dcpStart(acc.op) + 1);
           ++shift;
           // What the region's drain may exceed the composed span by: each
@@ -1345,6 +1396,10 @@ void DatapathBuilder::recordDrainStages() {
 }
 
 void DatapathBuilder::insertRegisters() {
+  assert(dp.units.data() == unitsBase && dp.mems.data() == memsBase &&
+         dp.streams.data() == streamsBase &&
+         "a cell container grew after resolveEdges; the edge table's slot "
+         "pointers are dangling");
   // One chain per (value, region) key, as long as its deepest surviving tap;
   // the shallower consumers read their own tap off it (Source::Reg's
   // `outPort`). A tap the address reduction withdrew buys no chain.
@@ -1363,7 +1418,12 @@ void DatapathBuilder::insertRegisters() {
     Register reg;
     reg.id = dp.regs.size();
     reg.value = e.key.first;
-    reg.type = reg.value.getType();
+    // A counter chain carries the region's own counter width, not the 32-bit
+    // index the value is typed at; the emitter narrows at the head and
+    // sign-extends back at each tap.
+    reg.type = e.base.kind == Source::Kind::Counter
+                   ? dp.regions[e.base.id].counterType
+                   : reg.value.getType();
     reg.depth = e.depth;
     reg.input = e.base;
     reg.ready = e.ready;

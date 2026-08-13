@@ -33,7 +33,7 @@ from .reports import (
 from .options import PrepassOptions, SchedulerOptions
 from .schedule import has_exact_scheduler
 from .qor import QoR, Utilization, estimate
-from .core import RTL
+from .core import RTL, LatencyModelWarning
 from .sim.shell import CosimResult
 
 __all__ = [
@@ -67,5 +67,6 @@ __all__ = [
     "Utilization",
     "estimate",
     "RTL",
+    "LatencyModelWarning",
     "CosimResult",
 ]

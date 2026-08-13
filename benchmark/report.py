@@ -308,7 +308,24 @@ def measure_one(
             # emitted text: the register ledger, the per-region allocation, the
             # storage each array was given, and what all of it prices at.
             uarch = rtl.microarch
-            out["area"] = area_of(rtl.estimation)
+            qor = rtl.estimation
+            out["area"] = area_of(qor)
+            # The clock the model says the built design holds, beside the one it
+            # was cut to, and the worst paths that clock comes from, decomposed.
+            out["fmax"] = round(qor.fmax, 1)
+            out["fmax_target"] = round(qor.fmax_target, 1)
+            out["critical_paths"] = [
+                {
+                    "total_ns": round(p.total, 3),
+                    "slack_ns": round(p.slack, 3),
+                    "endpoint": p.endpoint,
+                    "where": p.where,
+                    "steps": [
+                        {"what": s.what, "ns": round(s.delay, 3)} for s in p.steps
+                    ],
+                }
+                for p in qor.critical_paths[:3]
+            ]
             out.update(registers(uarch))
             out["alloc"] = allocation(uarch)
             out["mem_ports"] = memories(uarch)

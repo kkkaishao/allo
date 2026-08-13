@@ -100,6 +100,12 @@ TIMING: Mapping[Grade, FabricTiming] = {
         },
         stream=StorageTiming(0, 1, 1.574, 1.718),
         reg_ns=0.419,
+        # One-hot select cones, routed, marginal over the register floor and
+        # monotone over fan-in; the width factor is pinned to 1.0 at 32 bits.
+        mux=Interp(
+            {2: 0.200, 3: 0.287, 4: 0.644, 6: 0.777, 8: 1.214, 16: 1.214, 40: 1.238}
+        ),
+        mux_w=Interp({1: 0.17, 8: 0.77, 16: 0.77, 32: 1.0, 64: 1.0}),
     ),
     GRADE_2LV: FabricTiming(
         comb={
@@ -156,6 +162,19 @@ TIMING: Mapping[Grade, FabricTiming] = {
         },
         stream=StorageTiming(0, 1, 1.311, 1.698),
         reg_ns=0.638,
+        mux=Interp(
+            {
+                2: 0.315,
+                3: 0.315,
+                4: 0.596,
+                6: 1.062,
+                8: 1.113,
+                16: 1.192,
+                24: 1.540,
+                40: 1.582,
+            }
+        ),
+        mux_w=Interp({1: 0.36, 8: 0.59, 16: 0.59, 32: 1.0, 64: 1.20}),
     ),
 }
 
@@ -381,6 +400,19 @@ def _chain_uses(r: Mapping[str, Resource]) -> dict:
     }
 
 
+def _chain_uses_norst(r: Mapping[str, Resource]) -> dict:
+    """The same chain without a synchronous reset: the SRL keeps every interior
+    stage, so only the two end registers stay in flip-flops and the reset's
+    per-stage FF and per-bit LUT vanish."""
+    return {
+        r["ff"]: (Step(SRL_MIN_DEPTH, 1.0, 2.0), Linear(1.0)),
+        r["slicem_lut"]: (
+            Piecewise(SRL_MIN_DEPTH, Const(0.0), Tiled(32)),
+            Linear(1.0),
+        ),
+    }
+
+
 def build(part: Part) -> Device:
     """The :class:`Device` for one UltraScale+ die."""
     timing = TIMING.get(part.grade)
@@ -433,7 +465,10 @@ def build(part: Part) -> Device:
             )
 
     d.set_mux_uses({res["lut"]: (MUX_LUT_COST, Linear(1.0))})
+    if timing.mux:
+        d.set_mux_delay(timing.mux, timing.mux_w)
     d.set_chain_uses(_chain_uses(res))
+    d.set_chain_uses_norst(_chain_uses_norst(res))
     # A constant table is logic, not storage: one LUT is a 64-entry lookup.
     d.set_rom_uses({res["lut"]: (Tiled(ROM_ENTRIES_PER_LUT), Linear(1.0))})
     d.set_register_floor(timing.reg_ns)

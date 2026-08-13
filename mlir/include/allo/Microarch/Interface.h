@@ -11,6 +11,7 @@
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/StringRef.h"
 
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -116,6 +117,13 @@ struct ModuleInterface {
   // when the symbol needed legalizing (`top.child` -> `top_child`), and the
   // simulator only knows the former.
   std::string module, symbol;
+  /// This module's start->done contract, republished from the `dcp.module`:
+  /// `latency` in cycles, absent when the span is data-dependent;
+  /// `latencyBound` marking it a worst case a caller waits out rather than an
+  /// exact count; `determinacy` the class a caller composes against.
+  std::optional<int64_t> latency;
+  bool latencyBound = false;
+  std::string determinacy;
   std::vector<Scalar> scalars;
   std::vector<FIFO> streams;
   std::vector<std::vector<Memory>> reads;

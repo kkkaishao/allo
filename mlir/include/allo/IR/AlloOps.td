@@ -659,9 +659,16 @@ def DCPathMuxOp : DCPath_Op<"dcp.mux",
 
     `uses` is over TWO parameters, `(k, width)`. The measured cost is a fan-in
     curve per bit times the width, so it is one term.
+
+    `delay` is the routed marginal delay of the same select in ns over its
+    fan-in, measured at a 32-bit reference width; `delay_width` scales it by
+    the actual width. Both optional: an uncharacterized device is priced by a
+    conservative formula instead.
   }];
-  let arguments = (ins ArrayAttr:$uses);
-  let assemblyFormat = "`uses` $uses attr-dict";
+  let arguments = (ins ArrayAttr:$uses, OptionalAttr<CostAttr>:$delay,
+      OptionalAttr<CostAttr>:$delay_width);
+  let assemblyFormat =
+      "`uses` $uses (`delay` `=` $delay^)? (`dwidth` `=` $delay_width^)? attr-dict";
   let hasVerifier = 1;
 }
 

@@ -67,10 +67,13 @@ std::vector<MuxClass> muxClasses(const Datapath &dp, const RegionBlock &rb) {
 } // namespace
 
 FuncUarch::FuncUarch(const Datapath &dp, llvm::StringRef symbol,
-                     llvm::StringRef module, const RegLedger &ledger)
+                     llvm::StringRef module, const RegLedger &ledger,
+                     const MuxLedger &muxes,
+                     std::vector<TimingPath> criticalPaths)
     : func(symbol.str()), module(module.str()), top(dp.atTop),
-      regs(ledger.classes()), readPorts(dp.readPorts.size()),
-      writePorts(dp.writePorts.size()) {
+      regs(ledger.classes()), muxCones(muxes.classes()),
+      readPorts(dp.readPorts.size()), writePorts(dp.writePorts.size()),
+      criticalPaths(std::move(criticalPaths)) {
   for (const RegionBlock &rb : dp.regions) {
     RegionUarch r;
     r.order = rb.id;
@@ -188,6 +191,24 @@ std::string MicroarchReport::toJSON() const {
           j.attribute("top", f.top);
           j.attribute("read_ports", (int64_t)f.readPorts);
           j.attribute("write_ports", (int64_t)f.writePorts);
+          j.attribute("critical_ns", f.criticalPath());
+          j.attributeArray("critical_paths", [&] {
+            for (const TimingPath &p : f.criticalPaths)
+              j.object([&] {
+                j.attribute("total_ns", p.total);
+                j.attribute("slack_ns", p.slack);
+                j.attribute("endpoint", p.endpoint);
+                if (!p.where.empty())
+                  j.attribute("where", p.where);
+                j.attributeArray("steps", [&] {
+                  for (const TimingStep &s : p.steps)
+                    j.object([&] {
+                      j.attribute("what", s.what);
+                      j.attribute("ns", s.delay);
+                    });
+                });
+              });
+          });
           j.attributeArray("regions", [&] {
             for (const RegionUarch &r : f.regions)
               j.object([&] {
@@ -235,6 +256,17 @@ std::string MicroarchReport::toJSON() const {
                 j.attribute("width", (int64_t)c.width);
                 j.attribute("depth", (int64_t)c.depth);
                 j.attribute("count", (int64_t)c.count);
+                j.attribute("reset", c.reset);
+                j.attribute("enable", c.enable);
+              });
+          });
+          j.attributeArray("mux_cones", [&] {
+            for (const MuxCone &m : f.muxCones)
+              j.object([&] {
+                j.attribute("role", muxRoleName(m.role));
+                j.attribute("fanin", (int64_t)m.fanin);
+                j.attribute("width", (int64_t)m.width);
+                j.attribute("count", (int64_t)m.count);
               });
           });
           j.attributeArray("mems", [&] {

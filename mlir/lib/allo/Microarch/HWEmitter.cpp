@@ -132,29 +132,45 @@ Value HWEmitter::emitRegion(const uarch::RegionBlock &rb, Value start,
   assert(std::max(fb.storeDrain, resultDrain) == rb.drainStage &&
          "the built datapath's terminal cycle is not the one the model "
          "recorded");
+#ifndef NDEBUG
+  // A determinate call is priced into the drain at its contract and the emitted
+  // child honours it (the driver asserts that), so folding the same term back
+  // in lets the bounds below hold for a call-holding region too. An
+  // indeterminate call has no span, and leaves the drain beyond checking.
+  int64_t builtDrain = rb.drainStage;
+  bool doneTimed = false;
+  for (uarch::CallId cid : rb.callUnits) {
+    const uarch::CallUnit &cu = dp.calls[cid];
+    if (cu.determinate)
+      builtDrain =
+          std::max(builtDrain,
+                   int64_t(cu.start) + std::max<int64_t>(*cu.latency, 1) - 1);
+    else
+      doneTimed = true;
+  }
   // Draining past the composed span is a fault: a consumer released at that
   // offset samples before this region has committed. `resolveAccessOperands`
   // re-stamps a stream put's stage, so a region it reached may sit
-  // `streamShift` cycles out and no further. A call-holding leaf also waits on
-  // the child's `done`, which the span does not model.
-  assert((!rb.modelledDrain || !rb.callUnits.empty() ||
-          static_cast<int64_t>(rb.drainStage) <=
-              *rb.modelledDrain + int64_t(rb.streamShift)) &&
+  // `streamShift` cycles out and no further.
+  assert((!rb.modelledDrain || doneTimed ||
+          builtDrain <= *rb.modelledDrain + int64_t(rb.streamShift)) &&
          "the built datapath drains past the composed span; a consumer placed "
          "against it samples before this region has committed");
-  // Draining early is pessimism rather than a fault, and one shape reaches it
-  // legitimately: the device prices a stream read at latency 1 while the
-  // emitter builds the FIFO's show-ahead output at 0, so a region yielding a
-  // `get` composes one cycle longer than it runs.
-  assert((!rb.modelledDrain || !rb.callUnits.empty() ||
-          !rb.streamAccesses.empty() ||
-          static_cast<int64_t>(rb.drainStage) == *rb.modelledDrain) &&
+  // Draining early is pessimism rather than a fault: the composed latency
+  // claims cycles the hardware does not take and every consumer waits them.
+  // Together with the bound above, a region with no stream shift is pinned to
+  // exact equality.
+  assert((!rb.modelledDrain || doneTimed || builtDrain >= *rb.modelledDrain) &&
          "the built datapath drains before the composed span, so the composed "
          "latency is longer than the hardware takes");
+#endif
 
   // An empty counted leaf (lb >= ub) issues nothing, so it completes on
   // `start`, delayed one cycle so the pulse doesn't land on `start` itself:
   // `done` is a level and retrigger needs a real 0->1 edge.
+  static_assert(kEmptyRegionCycles == 1 + kDoneLatchCycles,
+                "an empty region is one registered start pulse feeding the "
+                "done latch; a different declared cost must be built here");
   Value emptyDone =
       (rb.kind == uarch::RegionBlock::Kind::Cyclic && !rb.conditional)
           ? ctx.delayValid(ctx.andBits(start, term.isEmpty(ctx)), 1, shell)
@@ -424,19 +440,18 @@ Value HWEmitter::emitGuard(const uarch::RegionBlock &rb, Value start) {
                           ? elseStart
                           : ctx.risingEdge(sequence(rb.elseChildren, elseStart,
                                                     /*retrig=*/true));
-  // Each yielded result is `cond ? then-value : else-value`, latched when its
-  // arm drains; only the taken arm fires, so the mux ignores the other's stale
-  // survivor.
+  // Each yielded result is the taken arm's value, latched into one survivor
+  // when that arm drains: the two drain pulses are disjoint (exactly one arm
+  // runs a pass), so the pulse both selects the datum and enables the capture,
+  // and a reader sees a plain held register.
   for (auto [k, r] : llvm::enumerate(rb.results)) {
     Value tv = datapath.resolveSource(r.value);
     Value ev = datapath.resolveSource(r.elseValue);
-    Value thenSurv = ctx.enabledReg(tv, thenDrained, ctx.konst(tv.getType(), 0),
-                                    RegRole::Survivor);
-    Value elseSurv = ctx.enabledReg(ev, elseDrained, ctx.konst(ev.getType(), 0),
-                                    RegRole::Survivor);
-    nameValue(thenSurv, survivorName(rb.id, k));
-    nameValue(elseSurv, survivorName(rb.id, k));
-    datapath.setSurvivor(rb.id, k, ctx.mux(cond, thenSurv, elseSurv));
+    Value surv = ctx.enabledReg(ctx.mux(thenDrained, tv, ev),
+                                ctx.orBits(thenDrained, elseDrained),
+                                ctx.konst(tv.getType(), 0), RegRole::Survivor);
+    nameValue(surv, survivorName(rb.id, k));
+    datapath.setSurvivor(rb.id, k, surv);
   }
   // Exactly one arm runs, so the region completes on whichever drains. Latch
   // done (a level); clear on start so a retriggered guard re-edges.

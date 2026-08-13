@@ -958,6 +958,13 @@ std::string MemoryLibrary::rowFor(int64_t words, unsigned width,
   }
   if (viable.empty())
     return {};
+  // Capacity before latency: a row this one bank alone overflows cannot
+  // realize it however fast it reads, so a deeper row that fits (uram past
+  // bram's capacity) must stay reachable. With nothing fitting, every row
+  // stands and the utilization accounting reports the overflow.
+  auto fits = [](const auto &v) { return v.second <= 1.0; };
+  if (llvm::any_of(viable, fits))
+    llvm::erase_if(viable, [&](const auto &v) { return !fits(v); });
   // Read latency first, then write: a deeper row is out however cheap it is.
   auto latency = [](const StorageRealization *s) {
     return std::pair(s->timing.latency.read, s->timing.latency.write);

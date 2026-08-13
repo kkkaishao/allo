@@ -85,6 +85,18 @@ static void convertOp(Operation &op, OpBuilder &b, IRMapping &map,
     if (at && at->startInCycle)
       dst->setAttr("z", b.getF32FloatAttr(*at->startInCycle));
   };
+  // An access also carries the setup delay the solve priced it against
+  // (`accessCharacterization`: the port's own delay plus the address cone)
+  // and the port delay alone, asked of the original op here because the
+  // characterization does not read the dcp form.
+  auto setAccessTiming = [&](Operation *dst) {
+    setZ(dst);
+    dst->setAttr(
+        "in_delay",
+        b.getF32FloatAttr(
+            accessCharacterization(&op, dev.operators, dev.memory).inDelay));
+    dst->setAttr("port_delay", b.getF32FloatAttr(dev.memory.timing(&op).delay));
+  };
   // Keep an op verbatim inside the region, preserving its scheduled start so
   // the schedule export can still report it.
   auto cloneKept = [&]() {
@@ -93,6 +105,7 @@ static void convertOp(Operation &op, OpBuilder &b, IRMapping &map,
       c->setAttr("start", b.getI64IntegerAttr(start));
       setZ(c);
     }
+    return c;
   };
 
   // A memory access's latency is the accessed memref's read/write latency,
@@ -111,7 +124,7 @@ static void convertOp(Operation &op, OpBuilder &b, IRMapping &map,
     auto nw = DCPathLoadOp::create(
         b, loc, l.getType(), rm(l.getMemRef()), remap(l.getMapOperands()),
         addrMap(), (uint64_t)start, memLatency(), bank, IntegerAttr());
-    setZ(nw);
+    setAccessTiming(nw);
     map.map(l.getResult(), nw.getResult());
     return;
   }
@@ -119,7 +132,7 @@ static void convertOp(Operation &op, OpBuilder &b, IRMapping &map,
     auto nw = DCPathLoadOp::create(
         b, loc, l.getType(), rm(l.getMemRef()), remap(l.getIndices()),
         addrMap(), (uint64_t)start, memLatency(), bank, IntegerAttr());
-    setZ(nw);
+    setAccessTiming(nw);
     map.map(l.getResult(), nw.getResult());
     return;
   }
@@ -128,7 +141,7 @@ static void convertOp(Operation &op, OpBuilder &b, IRMapping &map,
         b, loc, rm(s.getValueToStore()), rm(s.getMemRef()),
         remap(s.getMapOperands()), addrMap(), (uint64_t)start, memLatency(),
         bank, IntegerAttr());
-    setZ(nw);
+    setAccessTiming(nw);
     return;
   }
   if (auto s = dyn_cast<memref::StoreOp>(&op)) {
@@ -136,12 +149,12 @@ static void convertOp(Operation &op, OpBuilder &b, IRMapping &map,
                                     rm(s.getMemRef()), remap(s.getIndices()),
                                     addrMap(), (uint64_t)start, memLatency(),
                                     bank, IntegerAttr());
-    setZ(nw);
+    setAccessTiming(nw);
     return;
   }
   // Streams stay as FIFO ops, not compute; keep them verbatim with their start.
   if (isa<StreamGetOp, StreamPutOp>(&op)) {
-    cloneKept();
+    setAccessTiming(cloneKept());
     return;
   }
   // Declarations stay verbatim so loads that read them still resolve their

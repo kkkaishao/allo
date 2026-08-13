@@ -11,6 +11,7 @@
 #include "allo/Microarch/BindingPolicy.h"
 
 #include "allo/Microarch/Reservation.h"
+#include "allo/Scheduling/OperatorLibrary.h" // combParamWidth, muxCone's rows
 
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/MapVector.h"
@@ -55,7 +56,7 @@ bool readsRecurrence(const RegionBlock &rb, Operation *op) {
 struct ShareCone {
   ShareCone(const Datapath &dp, const RegionBlock &rb,
             const BindingContext &ctx)
-      : level(muxLevelDelay(ctx.lib)), fanin(rb.units.size(), 1),
+      : lib(ctx.lib), fanin(rb.units.size(), 1), width(rb.units.size(), 1),
         preds(rb.units.size()), slack(rb.units.size()) {
     // At plan time a unit is one op, so a producer names its unit directly.
     llvm::DenseMap<Operation *, unsigned> owner;
@@ -65,6 +66,7 @@ struct ShareCone {
       const FuncUnit &u = dp.units[uid];
       slack[i] = unitSlack(u, ctx.cycleTime);
       Operation *y = u.repOp();
+      width[i] = std::max<int64_t>(1, combParamWidth(y));
       for (Value v : y->getOperands()) {
         Operation *x = v.getDefiningOp();
         auto it = x ? owner.find(x) : owner.end();
@@ -105,7 +107,7 @@ private:
     double in = 0.0;
     for (unsigned p : preds[i])
       in = std::max(in, added(p));
-    return memo[i] = in + muxLevels(fanin[i]) * level;
+    return memo[i] = in + muxCone(lib, fanin[i], width[i]);
   }
 
   /// Whether every member's cone fits the slack its schedule left it.
@@ -117,8 +119,9 @@ private:
     return true;
   }
 
-  double level; // one LUT level of a one-hot select's AND-OR reduction
+  const OperatorLibrary &lib;        // prices each select cone (`muxCone`)
   llvm::SmallVector<unsigned> fanin; // input mux sources (1 = an unshared wire)
+  llvm::SmallVector<unsigned> width; // the muxed operand's width, per unit
   llvm::SmallVector<llvm::SmallVector<unsigned, 2>> preds;
   llvm::SmallVector<double> slack;
   llvm::SmallVector<double> memo;

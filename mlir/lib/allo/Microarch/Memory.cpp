@@ -337,6 +337,32 @@ void DatapathBuilder::planAccessPorts() {
       ma.plan = uniform(dp.mems[ma.mem]).value_or(PortPlan::Coloured);
 }
 
+// Copies of its row a bank bound with (\p reads, \p writes, \p total) ports
+// is held in, and the reads one copy serves (`per`). Every copy takes every
+// write and serves `instReads` reads; a read riding a pooled write bus is
+// served wherever that bus lands and costs no port of its own, and past the
+// pool every copy takes every write with the reads sharing what is left. Not
+// bounded by the copies budget: that budget is what a cycle may issue, and a
+// binding needing more address buses still builds one copy per bus.
+static std::pair<unsigned, unsigned> instancesFor(const StoragePorts &ports,
+                                                  unsigned reads,
+                                                  unsigned writes,
+                                                  unsigned total) {
+  unsigned per = ports.instReads.value_or(0);
+  if (ports.instPool) {
+    if (total <= *ports.instPool)
+      return {1, per};
+    unsigned riding = reads + writes - total;
+    // Measured on the part: 1024x32 is one tile at one read and two at two.
+    per =
+        std::min(per, *ports.instPool > writes ? *ports.instPool - writes : 0u);
+    reads -= riding;
+  }
+  if (!per || reads <= per)
+    return {1, per};
+  return {(reads + per - 1) / per, per};
+}
+
 void DatapathBuilder::bindMemoryPorts() {
   for (MemUnit &m : dp.mems) {
     // Neither is addressed, so neither has a port to contend for: a scattered
@@ -363,21 +389,36 @@ void DatapathBuilder::bindMemoryPorts() {
         planPorts(m, /*writes=*/false, /*base=*/w.counts.colours).value();
     unsigned separateTotal = w.counts.writes + r.counts.reads;
     // Where the row's ports are a pool, each serving either direction, a read
-    // may ride a write's port and one address bus carries both. Worth the
-    // multiplexer only where the array does not otherwise fit, and possible
-    // only where the writes were split.
+    // may ride a write's port and one address bus carries both. Possible only
+    // where the writes were split.
     std::optional<PortAssignment> pooled;
     if (m.ports.instPool && !m.external &&
-        !m.fitsStorage(w.counts.writes, separateTotal) &&
         (w.counts.writes <= 1 || w.writesIndependent)) {
       // The shared bus carries the write's address on the cycle it commits, so
       // a write that presents its terms early would drive the read's cycle too.
       assert(m.writeLatency == 1 &&
              "a pooled row's write port realizes in one cycle");
-      // A pooled binding that saves no port is the multiplexer for nothing.
       pooled = planPorts(m, /*writes=*/std::nullopt, /*base=*/0);
-      if (pooled && pooled->counts.total >= separateTotal)
+    }
+    if (pooled) {
+      if (m.fitsStorage(w.counts.writes, separateTotal)) {
+        // Both bindings fit, so the outcomes decide: the multiplexer a shared
+        // bus buys is addrWidth bits while a copy is a whole tile, so pooled
+        // stands only where it builds strictly fewer copies.
+        unsigned sep = instancesFor(m.ports, r.counts.reads, w.counts.writes,
+                                    separateTotal)
+                           .first;
+        unsigned pool =
+            instancesFor(m.ports, pooled->counts.reads, pooled->counts.writes,
+                         pooled->counts.total)
+                .first;
+        if (pool >= sep)
+          pooled.reset();
+      } else if (pooled->counts.total >= separateTotal) {
+        // The separate binding does not fit the row; a pooled one that saves
+        // no port fits no better, and is the multiplexer for nothing.
         pooled.reset();
+      }
     }
     if (pooled) {
       commitPorts(m, *pooled);
@@ -393,35 +434,15 @@ void DatapathBuilder::bindMemoryPorts() {
     m.portsBuilt = separateTotal;
   }
   // Instances of its row each bank is held in, which follows from the bound
-  // ports. A skew binds its ports by lane and leaves the loop above early, so
-  // this runs over every memory rather than inside it.
+  // ports, by the same arithmetic the pooled decision above compared. A skew
+  // binds its ports by lane and leaves the loop above early, so this runs
+  // over every memory rather than inside it.
   for (MemUnit &m : dp.mems) {
-    // Off `instReads`, what one instance serves, not off the array's own
-    // allowance, which is already a multiple of it. Not bounded by the copies
-    // budget either: that budget is what a cycle may issue, and a binding
-    // needing more address buses still builds one copy per bus.
-    unsigned per = m.ports.instReads.value_or(0);
-    // A bus carrying a write is on every copy, so a read riding one is served
-    // wherever it lands and costs no port of its own.
-    unsigned riding = 0;
-    if (m.ports.instPool) {
-      // A pooled port serves either direction and the binding may already have
-      // ridden a read on a write's, so the question is what the bank was built
-      // with rather than the two directions separately.
-      if (m.portsBuilt <= *m.ports.instPool)
-        continue;
-      riding = m.readPortsBuilt + m.writePortsBuilt - m.portsBuilt;
-      // Past it every copy takes every write and the reads share what is left,
-      // so a written block RAM serves one read per copy. Measured on the part:
-      // 1024x32 is one tile at one read and two at two.
-      per = std::min(per, *m.ports.instPool > m.writePortsBuilt
-                              ? *m.ports.instPool - m.writePortsBuilt
-                              : 0u);
-    }
-    unsigned own = m.readPortsBuilt - riding;
-    if (!per || own <= per)
+    auto [instances, per] = instancesFor(m.ports, m.readPortsBuilt,
+                                         m.writePortsBuilt, m.portsBuilt);
+    if (instances == 1)
       continue;
-    m.instances = (own + per - 1) / per;
+    m.instances = instances;
     // Each bank ranks the read ports that reach it and hands them out a whole
     // instance at a time. Per bank, not over the memory: `readPortsBuilt` is
     // the largest any one bank holds, so ranking every colour together would
@@ -480,7 +501,7 @@ void DatapathBuilder::measurePorts() {
       m.boundaryPorts += r.id == m.id;
     for (const CallUnit &cu : dp.calls)
       for (const CallUnit::MemArg &ma : cu.memArgs)
-        m.boundaryPorts += ma.mem == m.id && ma.isBoundary;
+        m.boundaryPorts += ma.mem == m.id && ma.isBoundary && ma.ownsGroup;
   }
 }
 
@@ -489,6 +510,12 @@ void DatapathBuilder::enumerateBoundaryPorts() {
     return (uint64_t(mem) << 1) | unsigned(write);
   };
   llvm::DenseMap<uint64_t, unsigned> group;
+  // The group already opened for a (bank, port) colour, so a child mastered
+  // on the colour joins it instead of opening a second interface on the same
+  // bus. Coloured plans only: a data-dependent access spans every bank and
+  // shares with nobody.
+  llvm::DenseMap<std::tuple<uint64_t, unsigned, unsigned>, std::string>
+      colourBase;
 
   for (MemUnit &m : dp.mems) {
     if (!m.external)
@@ -535,16 +562,33 @@ void DatapathBuilder::enumerateBoundaryPorts() {
       acc.portIdx = ports.size();
       acc.portBase =
           memBase(owner, acc.isWrite, group[key(m.id, acc.isWrite)]++);
+      if (acc.plan == PortPlan::Coloured)
+        colourBase[{key(m.id, acc.isWrite), acc.staticBank.value_or(0),
+                    acc.port}] = acc.portBase;
       ports.push_back({m.id, unsigned(a)});
     }
   }
-  // One port group per accessor of a (memory, role), concurrent and un-muxed. A
-  // mux would time-share the port a second accessor exists to avoid.
+  // One port group per (bank, port) colour: holders of one colour provably
+  // never drive it in the same cycle (`bindMemoryPorts`), so they share the
+  // interface the caller backs the bus with, as coloured accesses already do.
+  // Concurrent masters carry distinct colours and keep distinct groups.
   for (CallUnit &cu : dp.calls)
-    for (CallUnit::MemArg &ma : cu.memArgs)
-      if (ma.isBoundary)
+    for (CallUnit::MemArg &ma : cu.memArgs) {
+      if (!ma.isBoundary)
+        continue;
+      if (ma.plan != PortPlan::Coloured) {
         ma.topBase = memBase(memOwnerName(dp, dp.mems[ma.mem]), ma.isWrite,
                              group[key(ma.mem, ma.isWrite)]++);
+        continue;
+      }
+      auto [it, isNew] =
+          colourBase.try_emplace({key(ma.mem, ma.isWrite), ma.bank, ma.port});
+      if (isNew)
+        it->second = memBase(memOwnerName(dp, dp.mems[ma.mem]), ma.isWrite,
+                             group[key(ma.mem, ma.isWrite)]++);
+      ma.ownsGroup = isNew;
+      ma.topBase = it->second;
+    }
 }
 
 } // namespace mlir::allo::uarch

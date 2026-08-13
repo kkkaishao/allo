@@ -285,8 +285,11 @@ OperatorLibrary OperatorLibrary::fromModule(ModuleOp module) {
       lib.resourcePrices[r.getSymName()] =
           std::max<int64_t>(1, llvm::divideNearest<int64_t>(
                                    kPriceResolution * widest, r.getCapacity()));
-    for (auto m : device.getBody().getOps<dcp::DCPathMuxOp>())
+    for (auto m : device.getBody().getOps<dcp::DCPathMuxOp>()) {
       lib.muxUses = m.getUsesAttr();
+      lib.muxDelay = m.getDelayAttr();
+      lib.muxDelayWidth = m.getDelayWidthAttr();
+    }
     for (auto c : device.getBody().getOps<dcp::DCPathChainOp>())
       lib.chainUses = c.getUsesAttr();
   }

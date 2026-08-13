@@ -107,6 +107,12 @@ class FabricTiming(NamedTuple):
     #: DUT before trusting a chaining decision that turns on them.
     stream: StorageTiming
     reg_ns: float = 0.0
+    #: The routed marginal delay of a one-hot select over its fan-in at a
+    #: 32-bit reference width, and the unitless factor its actual width scales
+    #: it by (pinned to 1.0 at 32). From the mux DUT sweep; None where that
+    #: grade has not been measured.
+    mux: Cost | None = None
+    mux_w: Cost | None = None
 
 
 class Derived(NamedTuple):

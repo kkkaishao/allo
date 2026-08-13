@@ -68,8 +68,9 @@ static void declareOperatorModules(ArrayRef<iface::Operator> operators,
 /// A child instance's registers live in the child's body and are not walked.
 static unsigned compRegBits(hw::HWModuleOp mod) {
   unsigned bits = 0;
-  mod.walk([&](seq::CompRegOp r) {
-    bits += datapathWidth(r.getResult().getType());
+  mod.walk([&](Operation *op) {
+    if (isa<seq::CompRegOp, seq::CompRegClockEnabledOp>(op))
+      bits += datapathWidth(op->getResult(0).getType());
   });
   return bits;
 }
@@ -86,7 +87,9 @@ emitModule(const uarch::Datapath &dp, OpBuilder &b,
   auto *ctx = b.getContext();
   dcp::DCPathModuleOp func = dp.func;
   Location loc = func.getLoc();
-  if (failed(validateDatapath(func, dp, cycleTime, lib)))
+  FailureOr<std::vector<uarch::TimingPath>> criticalPaths =
+      validateDatapath(func, dp, cycleTime, lib);
+  if (failed(criticalPaths))
     return failure();
 
   Type i1 = b.getI1Type();
@@ -101,6 +104,7 @@ emitModule(const uarch::Datapath &dp, OpBuilder &b,
   StringAttr modName = StringAttr::get(ctx, model.module);
 
   RegLedger ledger;
+  MuxLedger muxLedger;
   auto hwMod = hw::HWModuleOp::create(
       b, loc, modName, portInfo,
       [&](OpBuilder &ib, hw::HWModulePortAccessor &pa) {
@@ -111,6 +115,7 @@ emitModule(const uarch::Datapath &dp, OpBuilder &b,
         e.ctx.rst = pa.getInput(kRst);
         e.emit();
         ledger = std::move(e.ctx.ledger);
+        muxLedger = std::move(e.ctx.muxLedger);
       });
   // Every register came through `EmitContext::reg`, so the ledger is the
   // emitted design's own flip-flop count and not a model of it. Checked here
@@ -118,7 +123,8 @@ emitModule(const uarch::Datapath &dp, OpBuilder &b,
   assert(compRegBits(hwMod) == ledger.bits() &&
          "a register was built outside EmitContext::reg, so the ledger is no "
          "longer a count of the emitted design");
-  report.funcs.emplace_back(dp, model.symbol, model.module, ledger);
+  report.funcs.emplace_back(dp, model.symbol, model.module, ledger, muxLedger,
+                            std::move(*criticalPaths));
 
   // The caller derives the cosim manifest JSON from this port model and threads
   // it back in as a callee model.
@@ -224,6 +230,22 @@ LogicalResult emitDatapathToHW(ModuleOp module, StringRef binding,
     // post-order walk above means `cc` names every module emitted so far.
     const uarch::CalleeCtx cc{modules, ifaceModels};
     const Datapath dp(f, *policy, dev, cycleTime, cc, /*isTop=*/f == topFunc);
+#ifndef NDEBUG
+    // A determinate call is released by a static offset with no handshake, so
+    // the latency it declares must equal the callee's own whole-kernel
+    // contract; the two are stamped by different reifies and nothing else
+    // compares them.
+    for (const uarch::CallUnit &cu : dp.calls) {
+      dcp::DCPathModuleOp callee = byName.lookup(cu.callee);
+      if (!cu.determinate || !callee)
+        continue;
+      assert(cu.latency && callee.getLatency() &&
+             *cu.latency == static_cast<int64_t>(*callee.getLatency()) &&
+             "a determinate call's declared latency diverges from its "
+             "callee's contract; a consumer released at that offset samples "
+             "the wrong cycle");
+    }
+#endif
     LLVM_DEBUG({
       llvm::dbgs() << "// datapath for @" << f.getSymName() << "\n";
       dp.dump(llvm::dbgs());

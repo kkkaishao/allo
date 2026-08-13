@@ -220,6 +220,12 @@ public:
   /// this layer having to know the symbol it says it under.
   int64_t pulsePrice() const;
 
+  /// The measured `dcp.mux` delay row over fan-in and its unitless width
+  /// factor, null attrs on an uncharacterized device. `uarch::muxCone` is the
+  /// one reader.
+  CostAttr muxDelayRow() const { return muxDelay; }
+  CostAttr muxDelayWidthRow() const { return muxDelayWidth; }
+
 private:
   /// What \p uses spends at \p params, every resource at its price. Null
   /// \p uses is free, which is what a device saying nothing about a row means.
@@ -243,8 +249,10 @@ private:
   OperatorEntry defaultEntry;
   llvm::StringMap<int64_t> resourcePrices; // one `dcp.resource`, priced
   ArrayAttr muxUses;                       // `dcp.mux`, over (k, width)
-  ArrayAttr chainUses;                     // `dcp.chain`, over (depth, width)
-  double regFloor = 0.0;                   // `dcp.device`'s `reg_delay`
+  CostAttr muxDelay;      // `dcp.mux` delay over fan-in (ns, at 32-bit width)
+  CostAttr muxDelayWidth; // its unitless width factor; null with `muxDelay`
+  ArrayAttr chainUses;    // `dcp.chain`, over (depth, width)
+  double regFloor = 0.0;  // `dcp.device`'s `reg_delay`
 };
 
 /// The device as the compiler reads it: what it can COMPUTE and what it can

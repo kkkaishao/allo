@@ -30,12 +30,16 @@ class RegClass:
 
     The run, not the register, is the cost unit: past the synthesizer's
     shift-register extraction threshold a run stops costing flip-flops per
-    stage, so a model handed only a register total cannot price it."""
+    stage, so a model handed only a register total cannot price it. ``reset``
+    and ``enable`` complete that shape: a synchronous reset blocks the
+    extraction and pays fabric per bit, a clock enable is free."""
 
     role: RegRole
     width: int
     depth: int
     count: int
+    reset: bool = True
+    enable: bool = False
 
     @property
     def bits(self) -> int:
@@ -43,7 +47,14 @@ class RegClass:
 
     @classmethod
     def from_json(cls, d: dict) -> RegClass:
-        return cls(RegRole(d["role"]), d["width"], d["depth"], d["count"])
+        return cls(
+            RegRole(d["role"]),
+            d["width"],
+            d["depth"],
+            d["count"],
+            d["reset"],
+            d["enable"],
+        )
 
 
 @dataclass(frozen=True)
@@ -90,6 +101,23 @@ class MuxClass:
 
 
 @dataclass(frozen=True)
+class MuxCone:
+    """``count`` select cones the emitter built around storage: shared-port
+    address selects, commit sinks and bank/scatter crossbars. A population
+    disjoint from :class:`MuxClass`, which is the allocation's own muxes."""
+
+    role: str  # "address" / "commit" / "crossbar"
+    fanin: int
+    width: int
+    count: int
+
+    @classmethod
+    def from_json(cls, d: dict) -> MuxCone:
+        return cls(d["role"], d["fanin"], d["width"], d["count"])
+
+
+@dataclass(frozen=True)
+# pylint: disable-next=too-many-instance-attributes
 class MemoryCost:
     """What the cost model needs of one array and no reader does: the ports it
     was bound with, and who drives them.
@@ -309,6 +337,56 @@ class RegionUarch:
 
 
 @dataclass(frozen=True)
+class TimingStep:
+    """One step of a combinational path: what the signal passes through, and
+    what the path spends there. A step is one model cell, so it can be a lump
+    the model prices without decomposing (an address cone, a select)."""
+
+    what: str
+    delay: float  # ns
+
+    @classmethod
+    def from_json(cls, d: dict) -> TimingStep:
+        return cls(d["what"], d["ns"])
+
+
+@dataclass(frozen=True)
+class TimingPath:
+    """One combinational path, start point first: a register or port launches
+    it, each step adds its delay, and it is captured at ``endpoint``. ``total``
+    is the sum of the steps by construction."""
+
+    total: float  # ns
+    slack: float  # period - total; negative means it misses the clock
+    endpoint: str
+    where: str  # source anchor of the endpoint, empty when it has none
+    steps: tuple[TimingStep, ...]
+
+    def describe(self, indent: str = "") -> str:
+        """The path as a table: each step's own delay, the running total, and
+        what the signal passes through."""
+        head = (
+            f"{indent}{self.total:.2f} ns, {self.slack:+.2f} ns slack, reaching "
+            f"{self.endpoint}" + (f" at {self.where}" if self.where else "")
+        )
+        lines, run = [head], 0.0
+        for s in self.steps:
+            run += s.delay
+            lines.append(f"{indent}  {s.delay:6.2f} {run:8.2f}  {s.what}")
+        return "\n".join(lines)
+
+    @classmethod
+    def from_json(cls, d: dict) -> TimingPath:
+        return cls(
+            total=d["total_ns"],
+            slack=d["slack_ns"],
+            endpoint=d["endpoint"],
+            where=d.get("where", ""),
+            steps=tuple(TimingStep.from_json(s) for s in d["steps"]),
+        )
+
+
+@dataclass(frozen=True)
 class FuncUarch:
     """One emitted module."""
 
@@ -321,9 +399,21 @@ class FuncUarch:
     #: module-wide: a register run belongs to the value it carries, not to a
     #: region, and the ledger counts it where it is BUILT.
     regs: list[RegClass] = field(default_factory=list)
+    #: module-wide for the same reason: the select cones built around storage.
+    mux_cones: list[MuxCone] = field(default_factory=list)
     mems: list[Memory] = field(default_factory=list)
     streams: list[Stream] = field(default_factory=list)
     calls: list[Call] = field(default_factory=list)
+    #: this module's worst combinational paths, longest first. What nobody
+    #: prices is not in them, so they estimate and never substitute for place
+    #: and route.
+    critical_paths: tuple[TimingPath, ...] = ()
+
+    @property
+    def critical_ns(self) -> float:
+        """The longest path's total, in ns; zero only where none was published,
+        every emitted module holding at least one register hop."""
+        return self.critical_paths[0].total if self.critical_paths else 0.0
 
     @property
     def reg_bits(self) -> int:
@@ -350,9 +440,11 @@ class FuncUarch:
             write_ports=d["write_ports"],
             regions=[RegionUarch.from_json(r) for r in d["regions"]],
             regs=[RegClass.from_json(c) for c in d["regs"]],
+            mux_cones=[MuxCone.from_json(m) for m in d["mux_cones"]],
             mems=[Memory.from_json(m) for m in d["mems"]],
             streams=[Stream.from_json(s) for s in d["streams"]],
             calls=[Call.from_json(c) for c in d["calls"]],
+            critical_paths=tuple(TimingPath.from_json(p) for p in d["critical_paths"]),
         )
 
 

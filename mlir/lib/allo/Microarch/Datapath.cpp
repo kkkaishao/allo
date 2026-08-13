@@ -13,6 +13,8 @@
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/Support/raw_ostream.h"
 
+#include <algorithm>
+
 using namespace mlir;
 using namespace mlir::allo;
 
@@ -350,15 +352,22 @@ unsigned muxLevels(unsigned sources) {
   return sources <= 1 ? 0 : llvm::Log2_32_Ceil(sources);
 }
 
-double muxLevelDelay(const OperatorLibrary &lib) {
-  // Priced at one bit, since every bit of an OR level settles in parallel, so
-  // width buys mux LUTs (`set_mux_uses`) rather than levels. The full row delay
-  // and not the marginal one: a level of a wide one-hot select pays routing
-  // comparable to a whole register-to-register hop, not the LUT hop a narrow
-  // cone pays. The row alone under-predicts a wide select, `muxLevels` seeing
-  // fan-in and not width, so it carries an explicit margin
-  // (`kMuxDelayMargin`).
-  return kMuxDelayMargin * lib.combDelay(OpKind::Or, 1);
+double muxCone(const OperatorLibrary &lib, unsigned sources, unsigned width) {
+  if (sources <= 1)
+    return 0.0;
+  CostAttr row = lib.muxDelayRow();
+  if (!row)
+    // Unmeasured device: the OR row per level with a margin, which over-counts
+    // a routed cone two- to three-fold on the measured fabrics. Safe direction.
+    return muxLevels(sources) * kMuxDelayMargin * lib.combDelay(OpKind::Or, 1);
+  auto clampEval = [](CostAttr c, int64_t p) {
+    auto [lo, hi] = c.measuredDomain();
+    return *c.evaluate(std::clamp(p, lo, hi));
+  };
+  double d = clampEval(row, sources);
+  if (CostAttr wf = lib.muxDelayWidthRow())
+    d *= clampEval(wf, width);
+  return d;
 }
 
 double unitSlack(const FuncUnit &u, float cycleTime) {

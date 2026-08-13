@@ -219,6 +219,7 @@ class Operator:
 
 
 @dataclass(frozen=True)
+# pylint: disable-next=too-many-instance-attributes
 class ModuleInterface:
     """The whole boundary of one module. ``reads``/``writes`` group by access, an
     inner tuple holding the access's per-bank interfaces: one entry unbanked, N
@@ -236,6 +237,14 @@ class ModuleInterface:
     registers: tuple[RegisterFile, ...]
     results: tuple[Result, ...]
     operators: tuple[Operator, ...]
+    #: the composition class a caller composes against: ``counted_static``,
+    #: ``indeterminate`` or ``concurrent``.
+    determinacy: str
+    #: whether ``latency`` is a worst case a caller waits out rather than an
+    #: exact count.
+    latency_is_bound: bool
+    #: the module's start->done span in cycles, None when it is data-dependent.
+    latency: int | None = None
 
     def ports_for_arg(self, arg: int) -> list[Memory]:
         """Every memory interface of argument ``arg``, reads before writes and
@@ -260,6 +269,17 @@ class ModuleInterface:
         stream is single-ended within a module, so it has exactly one."""
         return next((s for s in self.streams if s.arg == arg), None)
 
+    @property
+    def latency_is_exact(self) -> bool:
+        """Whether ``latency`` is the exact span the hardware realizes, and so a
+        number a measured cycle count may be held to. A bounded or concurrent
+        module publishes a figure that is deliberately not tight."""
+        return (
+            self.latency is not None
+            and self.determinacy == "counted_static"
+            and not self.latency_is_bound
+        )
+
     @classmethod
     def from_json(cls, d: dict) -> ModuleInterface:
         return cls(
@@ -273,6 +293,9 @@ class ModuleInterface:
             tuple(RegisterFile.from_json(r) for r in d["registers"]),
             tuple(Result.from_json(r) for r in d["results"]),
             tuple(Operator.from_json(o) for o in d["operators"]),
+            d["determinacy"],
+            d["latency_bound"],
+            d.get("latency"),
         )
 
 

@@ -349,7 +349,17 @@ class Device:
         # The three structures the emitter builds that nothing chooses between,
         # so they are one row each rather than a named realization.
         self.mux_uses: Spend = ()
+        # The routed marginal delay of a one-hot select over its fan-in at a
+        # 32-bit reference width, and the unitless factor its actual width
+        # scales it by. None on an uncharacterized device, which the compiler
+        # prices by a conservative formula instead.
+        self.mux_delay: Cost | None = None
+        self.mux_delay_width: Cost | None = None
         self.chain_uses: Spend = ()
+        # A value or pulse chain carries no reset, which is what lets the
+        # fabric extract a shift register; the ledger's `reset` flag picks
+        # between the two rows.
+        self.chain_uses_norst: Spend = ()
         self.rom_uses: Spend = ()
         self.storage: dict[str, Storage] = {}
         # The default is a NAME, not a handle: redeclaring a row (a copied
@@ -639,9 +649,29 @@ class Device:
         self.mux_uses = self._spend("a multiplexer", "fan-in, width", uses)
         return self
 
+    def set_mux_delay(self, delay_ns: Cost, width_factor: Cost | None = None) -> Device:
+        """The routed marginal delay of that select in ns as a function of its
+        fan-in, measured at a 32-bit reference width; ``width_factor`` is the
+        unitless function of the actual width that scales it."""
+        if not isinstance(delay_ns, Cost):
+            raise TypeError("mux delay must be a Cost over the fan-in")
+        if width_factor is not None and not isinstance(width_factor, Cost):
+            raise TypeError("mux width factor must be a Cost over the width")
+        self.mux_delay = delay_ns
+        self.mux_delay_width = width_factor
+        return self
+
     def set_chain_uses(self, uses: dict[Resource, Sequence]) -> Device:
         """What one ``depth``-stage, ``width``-bit value delay chain spends."""
         self.chain_uses = self._spend("a delay chain", "depth, width", uses)
+        return self
+
+    def set_chain_uses_norst(self, uses: dict[Resource, Sequence]) -> Device:
+        """The same chain without a synchronous reset, the form every value and
+        pulse run is emitted in."""
+        self.chain_uses_norst = self._spend(
+            "a reset-free delay chain", "depth, width", uses
+        )
         return self
 
     def set_rom_uses(self, uses: dict[Resource, Sequence]) -> Device:
@@ -727,6 +757,7 @@ class Device:
         for what, spent in (
             ("mux", self.mux_uses),
             ("chain", self.chain_uses),
+            ("reset-free chain", self.chain_uses_norst),
             ("constant table", self.rom_uses),
         ):
             if not spent:
@@ -746,6 +777,7 @@ class Device:
         d.operator_uses = dict(self.operator_uses)
         d.mux_uses = self.mux_uses
         d.chain_uses = self.chain_uses
+        d.chain_uses_norst = self.chain_uses_norst
         d.rom_uses = self.rom_uses
         d.storage = dict(self.storage)
         d.default_storage = self.default_storage
@@ -927,7 +959,15 @@ def inject_device(module, device: Device):
                     **_timing(s),
                 )
             if device.mux_uses:
-                DCPathMuxOp(uses=_uses_attr(device.mux_uses))
+                DCPathMuxOp(
+                    uses=_uses_attr(device.mux_uses),
+                    delay=device.mux_delay._attr() if device.mux_delay else None,
+                    delay_width=(
+                        device.mux_delay_width._attr()
+                        if device.mux_delay_width
+                        else None
+                    ),
+                )
             if device.chain_uses:
                 DCPathChainOp(uses=_uses_attr(device.chain_uses))
             if device.stream_timing is not None:

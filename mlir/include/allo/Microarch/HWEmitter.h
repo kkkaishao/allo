@@ -273,7 +273,7 @@ struct DatapathEmitter {
   };
   /// Reduce \p arms onto one driver per term, plus the OR of their pulses. At
   /// most one arm fires in a cycle (`portGraph` separates any two that could
-  /// overlap), so the priority order carries no meaning.
+  /// overlap), so the reduction is a one-hot select.
   SinkArm commitSink(ArrayRef<SinkArm> arms, Idle idle);
 
   /// One channel's port drives, accumulated over every access to it: a FIFO has
@@ -320,16 +320,17 @@ struct DatapathEmitter {
   llvm::MapVector<std::tuple<unsigned, unsigned, unsigned>, SharedReadPort>
       sharedReads;
 
-  /// Stores to an external array's port group, indexed by
-  /// `MemUnit::Access::portIdx`, the group's slot in `Datapath::writePorts`.
-  /// A MapVector, not a DenseMap: `finalizeBoundaryWritePorts` iterates it to
+  /// Stores to an external array's port group, keyed by the group's base name
+  /// (a StringRef into the immutable model's `portBase`/`topBase`) so a child
+  /// mastering the same (bank, port) colour joins the accesses' arms. A
+  /// MapVector, not a DenseMap: `finalizeBoundaryWritePorts` iterates it to
   /// drive the ports, and the emitted module must not depend on a hash order.
-  llvm::MapVector<unsigned, SmallVector<SinkArm, 2>> boundaryWrites;
+  llvm::MapVector<llvm::StringRef, SmallVector<SinkArm, 2>> boundaryWrites;
 
-  /// The same for a boundary read port group's address output, indexed by
-  /// `MemUnit::Access::portIdx`. A group the reads of several regions share is
-  /// one module output, so only `finalizeSharedReadPorts` may drive it.
-  llvm::MapVector<unsigned, SmallVector<SinkArm, 1>> boundaryReads;
+  /// The same for a boundary read port group's address output. A group several
+  /// regions or children share is one module output, so only
+  /// `finalizeSharedReadPorts` may drive it.
+  llvm::MapVector<llvm::StringRef, SmallVector<SinkArm, 1>> boundaryReads;
 
   /// A kernel-local channel's body wires: what a boundary channel reads off its
   /// module ports, an internal one reads off its own `seq.fifo`. Backedges,
@@ -576,9 +577,6 @@ struct DatapathEmitter {
   /// output likewise. Call exactly once, with the same timing as the write
   /// finalizes.
   void finalizeSharedReadPorts();
-  /// Whether the reads on boundary port group \p portIdx of \p m sit in more
-  /// than one region, so the group needs a select over which is presenting.
-  static bool multiRegionPort(const uarch::MemUnit &m, unsigned portIdx);
   /// Whether read port \p port of \p m's bank \p bank is held by more than one
   /// accessor: a region whose own accesses reach it, or a child that masters
   /// it. Counts holders rather than regions, the two kinds saying they are

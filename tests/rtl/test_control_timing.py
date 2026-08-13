@@ -592,3 +592,37 @@ def test_normalizing_a_strided_loop_lets_its_nest_coalesce():
         out = np.zeros((8, 8), np.int32)
         mod.cosim(A, out)
         assert np.array_equal(out, A + 1)
+
+
+# ---------------------------------------------------------------------------
+# The estimated clock
+# ---------------------------------------------------------------------------
+
+
+# The QoR publishes the clock the model says the design holds: the longest path
+# it can account for, which is the schedule's own worst cycle plus whatever the
+# emitter built after the cut. Nothing here shares a port or a unit, so nothing
+# was built after it and the estimate stays inside the period the schedule was
+# cut to.
+def test_the_qor_publishes_the_clock_the_model_holds():
+    @kernel
+    def vsum(A: i32[64], B: i32[64], C: i32[64]):
+        for i in range(64):
+            C[i] = A[i] + B[i]
+
+    rtl = _to_rtl(vsum)
+    est = rtl.estimation
+    period = 1000.0 / est.fmax_target
+    worst = max(f.critical_ns for f in rtl.microarch.funcs)
+    assert worst > 0 and est.fmax == pytest.approx(1000.0 / worst)
+    assert worst <= period + 1e-9
+    assert est.fmax >= est.fmax_target
+
+    # A path is a decomposition and not a second number: it starts where a
+    # register or a port launches it, its steps sum to its total, and several
+    # are kept so one compile shows more than one thing to fix.
+    assert len(est.critical_paths) > 1
+    for p in est.critical_paths:
+        assert p.steps and p.steps[0].what.startswith("launch:")
+        assert sum(s.delay for s in p.steps) == pytest.approx(p.total)
+        assert p.slack == pytest.approx(period - p.total)

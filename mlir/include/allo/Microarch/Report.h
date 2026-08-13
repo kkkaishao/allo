@@ -129,6 +129,25 @@ struct RegionCost {
   unsigned counterWidth = 0, addrStrides = 0;
 };
 
+/// One step of a combinational path: what the signal passes through, and what
+/// the path spends there. A step is one model cell, so it can be a lump the
+/// model prices without decomposing (an address cone, a select).
+struct TimingStep {
+  std::string what;
+  double delay = 0.0; // ns
+};
+
+/// One combinational path, start point first: a register or port launches it,
+/// each step adds its own delay, and it is captured at `endpoint`. `total` is
+/// the sum of the steps by construction.
+struct TimingPath {
+  double total = 0.0; // ns
+  double slack = 0.0; // period - total; negative means it misses the clock
+  std::string endpoint;
+  std::string where; // source anchor of the endpoint, when it has one
+  std::vector<TimingStep> steps;
+};
+
 /// One region's allocation. `order` is the join key to the schedule report's
 /// `RegionReport::order`: both are program order within the func.
 struct RegionUarch {
@@ -151,14 +170,28 @@ struct FuncUarch {
   // Module-wide: a register run belongs to the value it carries, not to a
   // region, and the ledger counts it where it is BUILT.
   std::vector<RegClass> regs;
+  // Module-wide for the same reason: the select cones the emission built
+  // around storage, disjoint from each region's allocation muxes.
+  std::vector<MuxCone> muxCones;
   std::vector<MemReport> mems;
   std::vector<StreamReport> streams;
   std::vector<CallReport> calls;
   unsigned readPorts = 0, writePorts = 0; // boundary port groups
+  /// This module's worst combinational paths, longest first, as
+  /// `validateDatapath` measured them.
+  std::vector<TimingPath> criticalPaths;
 
-  /// Project \p dp, plus the registers its emission built.
+  /// The longest path's total, in ns; zero only on a default-constructed
+  /// report, every emitted module holding at least one register hop.
+  double criticalPath() const {
+    return criticalPaths.empty() ? 0.0 : criticalPaths.front().total;
+  }
+
+  /// Project \p dp, plus the registers and select cones its emission built and
+  /// the paths `validateDatapath` measured while checking it.
   FuncUarch(const Datapath &dp, llvm::StringRef symbol, llvm::StringRef module,
-            const RegLedger &ledger);
+            const RegLedger &ledger, const MuxLedger &muxes,
+            std::vector<TimingPath> criticalPaths);
   FuncUarch() = default;
 };
 

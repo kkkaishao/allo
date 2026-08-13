@@ -12,14 +12,18 @@
 
 #include "allo/Microarch/Verification.h"
 
-#include "allo-c/Schedule.h"       // kPartitionAttr
-#include "allo/Microarch/Naming.h" // operatorModuleName, memOwnerName
+#include "allo-c/Schedule.h"             // kPartitionAttr
+#include "allo/Microarch/Naming.h"       // operatorModuleName, memOwnerName
+#include "allo/Microarch/Report.h"       // TimingPath
+#include "allo/Scheduling/MemoryModel.h" // datapathWidth
 #include "allo/Support/Logging.h"
 
 #include "mlir/Dialect/MemRef/IR/MemRef.h" // memref::GetGlobalOp
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/Support/Format.h"
+
+#include <algorithm>
 
 using namespace mlir;
 using namespace mlir::allo;
@@ -143,21 +147,21 @@ LogicalResult checkInputLegality(dcp::DCPathModuleOp func, const Datapath &dp) {
 
 namespace {
 
-/// The multiplexer delay a shared BINDING adds, propagated along the chains it
-/// lengthens. It is the one delay the schedule cannot have accounted for:
-/// every other cell reaching the datapath carries the sub-cycle start (`z`) a
-/// solve proved for it, muxes being the only thing built after the cut.
+/// The multiplexer delay a shared binding adds to a unit's input cone,
+/// propagated along the chains it lengthens. The most any branch adds, not what
+/// the worst-arriving branch adds, since a refusal has to bound every branch.
 ///
 /// The scheduler proved `z(op) + inDelay(op) <= period` over a datapath whose
-/// unit inputs are all driven directly, and each addition shifts its
-/// consumer's arrival by a constant. The delta is therefore additive along a
-/// combinational path, so propagating it alone against each op's remaining
-/// sub-cycle slack is exact.
+/// unit inputs are all driven directly, and each addition shifts its consumer's
+/// arrival by a constant. The delta is therefore additive along a combinational
+/// path, so propagating it alone against each op's remaining sub-cycle slack is
+/// exact.
 struct AddedDelay {
-  AddedDelay(const Datapath &dp, double level) : dp(dp), level(level) {}
+  AddedDelay(const Datapath &dp, const OperatorLibrary &lib)
+      : dp(dp), lib(lib) {}
 
   const Datapath &dp;
-  double level; // one LUT level of the one-hot select's AND-OR reduction
+  const OperatorLibrary &lib; // prices each select cone (`muxCone`)
   llvm::DenseMap<UnitId, double> memo;
 
   /// What arrives at \p id's input ports, its own delay excluded.
@@ -181,7 +185,7 @@ struct AddedDelay {
       double in = 0.0;
       for (const Source &src : m.sources)
         in = std::max(in, ofSource(src));
-      return in + muxLevels(m.sources.size()) * level;
+      return in + muxCone(lib, m.sources.size(), datapathWidth(m.type));
     }
     // Anything else is held when the cycle starts: a register tap, a port, a
     // literal, a survivor, or a unit whose own output is registered.
@@ -191,17 +195,181 @@ struct AddedDelay {
   }
 };
 
-/// Every unit's inputs still settle within the period, the multiplexers a
-/// shared binding grew included. ONE fault with one remedy, so a REJECT:
-/// binding is a choice the user can withdraw.
-LogicalResult checkCombPathsMeetPeriod(const Datapath &dp, float cycleTime,
-                                       const OperatorLibrary &lib) {
+/// When each value settles within its cycle, which input set it, and what the
+/// cell producing it added. A reported path is one chain of this walk, so its
+/// steps sum to its total by construction.
+///
+/// Arrivals are recomposed from the same device rows the schedule was cut
+/// against (`FuncUnit::inDelay` is marginal, the register floor charged once at
+/// the start point) rather than read off `z`, which carries whatever slack the
+/// solve left.
+struct PathTrace {
+  PathTrace(const Datapath &dp, const OperatorLibrary &lib)
+      : dp(dp), lib(lib), floor(lib.registerFloor()) {}
+
+  const Datapath &dp;
+  const OperatorLibrary &lib;
+  /// One register hop with no logic in it: clock-to-out at the launching end
+  /// and setup at the capturing one, which every path pays once.
+  double floor;
+
+  struct Arrival {
+    double at = 0.0;  // when the value settles, from the launching edge
+    double own = 0.0; // what the cell producing it adds
+    double cut = 0.0; // how much of `at` the cones grown after the cut added
+    Source from;      // the input that set `at`; None at a start point
+    std::string what; // the cell, as the report names it
+  };
+
+  /// The schedule's own view of \p s: what reaches it through cells the solve
+  /// priced, the cones grown after it excluded.
+  double scheduled(const Source &s) {
+    Arrival a = of(s);
+    return a.at - a.cut;
+  }
+
+  Arrival of(const Source &s) {
+    if (!s)
+      return {};
+    uint64_t k = (uint64_t)s.kind << 48 | (uint64_t)s.id << 16 | s.outPort;
+    if (auto it = memo.find(k); it != memo.end())
+      return it->second;
+    // Seeded before recursing, so a fused recurrence's self-referential input
+    // terminates at the register its own pipeline is.
+    memo[k] = launch("a recurrence register");
+    Arrival a = derive(s);
+    memo[k] = a;
+    return a;
+  }
+
+  /// The steps into \p s, start point first, appended to \p out.
+  void stepsInto(const Source &s, std::vector<TimingStep> &out) {
+    Arrival a = of(s);
+    if (a.from)
+      stepsInto(a.from, out);
+    out.push_back({a.what, a.own});
+  }
+
+private:
+  llvm::DenseMap<uint64_t, Arrival> memo;
+
+  Arrival launch(llvm::StringRef what) {
+    return {floor, floor, 0.0, Source{}, ("launch: " + what).str()};
+  }
+
+  /// The input that settles last. A cell with none launches from the floor.
+  Arrival worst(llvm::ArrayRef<Source> ins) {
+    Arrival best;
+    best.at = floor;
+    for (const Source &in : ins) {
+      if (!in)
+        continue;
+      Arrival a = of(in);
+      if (!best.from || a.at > best.at) {
+        best = a;
+        best.from = in;
+      }
+    }
+    return best;
+  }
+
+  Arrival derive(const Source &s) {
+    switch (s.kind) {
+    case Source::Kind::Unit: {
+      const FuncUnit &u = dp.units[s.id];
+      std::string what =
+          (u.identity.realizationName() + " at " +
+           llvm::Twine(datapathWidth(u.identity.resultType)) + " bits")
+              .str();
+      // A registered result launches its consumers rather than chaining into
+      // them.
+      if (u.latency)
+        return launch(what + " (registered)");
+      Arrival in = worst(u.inputs);
+      return {in.at + u.inDelay, u.inDelay, in.cut, in.from, what};
+    }
+    case Source::Kind::Mux: {
+      const Mux &m = dp.muxes[s.id];
+      unsigned width = datapathWidth(m.type);
+      double cone = muxCone(lib, m.sources.size(), width);
+      Arrival in = worst(m.sources);
+      return {in.at + cone, cone, in.cut + cone, in.from,
+              ("a sharing multiplexer, " + llvm::Twine(m.sources.size()) +
+               ":1 at " + llvm::Twine(width) + " bits")
+                  .str()};
+    }
+    case Source::Kind::Mem: {
+      const MemUnit &m = dp.mems[s.id];
+      const MemUnit::Access &acc = m.accesses[s.outPort];
+      std::string what = "a read of " + memOwnerName(dp, m);
+      if (m.readLatency)
+        return launch(what);
+      // A ROM or a scattered array reads combinationally, so its own cone is
+      // on the reader's path. `inDelay` covers the address arithmetic and the
+      // read itself, undecomposed.
+      Arrival in = worst(acc.addr);
+      return {in.at + acc.inDelay, acc.inDelay, in.cut, in.from,
+              what + " (combinational)"};
+    }
+    case Source::Kind::Stream:
+      return launch("a stream read");
+    case Source::Kind::Reg:
+      return launch("a delay register");
+    case Source::Kind::Counter:
+      return launch("a loop counter");
+    case Source::Kind::Survivor:
+      return launch("a survivor register");
+    case Source::Kind::Call:
+      return launch("a sub-kernel result");
+    case Source::Kind::IO:
+      return launch("an input port");
+    case Source::Kind::Const:
+      // Wires from a tie-off, but the capture at the far end still costs
+      // setup, which `floor` is where it is charged.
+      return launch("a constant");
+    case Source::Kind::None:
+      break;
+    }
+    return {};
+  }
+};
+
+/// Every combinational path built after the cut still settles within the
+/// period: the multiplexers a shared binding grew in front of the units, and
+/// the select the port colouring grew in front of an access's bus. A unit
+/// overrun is refused, binding being a choice the user can withdraw; every
+/// other slot sits on the default path with no such choice and is reported
+/// instead, as the paths in \p paths the QoR turns into a clock.
+LogicalResult checkCombPathsMeetPeriod(dcp::DCPathModuleOp func,
+                                       const Datapath &dp, float cycleTime,
+                                       const OperatorLibrary &lib,
+                                       std::vector<TimingPath> &paths) {
   // One picosecond of slop, the resolution the scheduler's own model carries.
   constexpr double kSlop = 1e-3;
-  AddedDelay added(dp, muxLevelDelay(lib));
+  AddedDelay added(dp, lib);
+  PathTrace trace(dp, lib);
 
   bool ok = true;
   for (const FuncUnit &u : dp.units) {
+    // The two arrival models, held together: recomposed from the device rows,
+    // cones grown after the cut excluded, an input arrives no later than the
+    // sub-cycle start the solve placed the op at. Past it the two disagree
+    // about a price, which `FuncUnit::inDelay` being re-derived at bind time
+    // rather than copied from the priced row can do, so it is a diagnostic.
+    double placed = 0.0;
+    for (const FuncUnit::BoundOp &bo : u.boundOps)
+      placed = std::max(placed, bo.z.value_or(0.0));
+    for (const Source &in : u.inputs) {
+      if (!in)
+        continue;
+      double sched = trace.scheduled(in);
+      if (sched > placed + kSlop)
+        debug(Stage::Emit, u.repOp())
+            << "an input settles at " << llvm::format("%.2f", sched)
+            << " ns, past the " << llvm::format("%.2f", placed)
+            << " ns sub-cycle start the solve placed this operation at; the "
+               "two arrival models disagree about a price";
+    }
     double mux = added.ofUnit(u.id);
     double slack = unitSlack(u, cycleTime);
     if (mux <= slack + kSlop)
@@ -226,13 +394,159 @@ LogicalResult checkCombPathsMeetPeriod(const Datapath &dp, float cycleTime,
            "kernel, or raise the target period";
     ok = false;
   }
+
+  // What each access ends its path with, on top of whatever reaches it: the
+  // address arithmetic still on the setup path (`addrSetup`), the select its
+  // (bank, port) colour carries (one arm per holder, this module's accesses and
+  // its children's ports alike), and the port's own delay. A crossbar access is
+  // alone on its colour; its bank crossbar is not priced here yet.
+  struct Tail {
+    llvm::SmallVector<TimingStep, 3> addr, data;
+    bool addrRegistered = false; // the address launches from its delay register
+  };
+  llvm::DenseMap<std::tuple<MemId, unsigned, unsigned>, unsigned> holders;
+  for (const MemUnit &m : dp.mems)
+    for (const MemUnit::Access &acc : m.accesses)
+      if (acc.plan == PortPlan::Coloured)
+        ++holders[{m.id, acc.staticBank.value_or(0), acc.port}];
+  for (const CallUnit &cu : dp.calls)
+    for (const CallUnit::MemArg &ma : cu.memArgs)
+      if (ma.plan == PortPlan::Coloured)
+        ++holders[{ma.mem, ma.bank, ma.port}];
+  llvm::DenseMap<Operation *, Tail> tails;
+  for (const MemUnit &m : dp.mems)
+    for (const MemUnit::Access &acc : m.accesses) {
+      Tail &t = tails[acc.op];
+      std::string owner = memOwnerName(dp, m);
+      // With the term sum landing in a delay register, the address path starts
+      // at that register rather than at the operands feeding it.
+      t.addrRegistered = acc.addrDelay > 0;
+      if (acc.addrSetup > 0.0)
+        t.addr.push_back({"the address arithmetic of " + owner, acc.addrSetup});
+      if (acc.plan == PortPlan::Coloured) {
+        unsigned k =
+            holders.lookup({m.id, acc.staticBank.value_or(0), acc.port});
+        double sel =
+            muxCone(lib, k, llvm::Log2_32_Ceil(std::max(2u, m.depthWords)));
+        if (sel > 0.0)
+          t.addr.push_back(
+              {("a shared-port address select, " + llvm::Twine(k) + ":1").str(),
+               sel});
+        double dsel = muxCone(lib, k, m.width);
+        if (dsel > 0.0)
+          t.data.push_back(
+              {("a shared-port data select, " + llvm::Twine(k) + ":1").str(),
+               dsel});
+      }
+      t.addr.push_back(
+          {"the " + m.storage + " port of " + owner, acc.portDelay});
+      t.data.push_back(
+          {"the " + m.storage + " port of " + owner, acc.portDelay});
+    }
+  for (const StreamChannel &ch : dp.streams)
+    for (const StreamChannel::Access &acc : ch.accesses) {
+      Tail &t = tails[acc.op];
+      t.addr.push_back({"a stream port", acc.inDelay});
+      t.data = t.addr;
+    }
+
+  // Every capture point: where a path ends. Prefix-free by construction, so no
+  // path is a piece of another: an interior combinational cell is not a
+  // capture, and a unit's own input port is one only where the unit registers
+  // it.
+  forEachSource(dp, [&](const Source &s, const SourceSite &site) {
+    // An absent driver hangs no path; the reduced-address case reads stride
+    // registers instead, priced with them below.
+    if (!s)
+      return;
+    llvm::ArrayRef<TimingStep> tail;
+    bool registered = false;
+    switch (site.slot) {
+    case SourceSite::Slot::UnitInit:
+    case SourceSite::Slot::MuxInput:
+      return; // the interior of a cone, ending at the slot that consumes it
+    case SourceSite::Slot::UnitInput: {
+      // A combinational unit hands its result on; only a registered one
+      // captures here.
+      auto it = dp.opToUnit.find(site.op);
+      if (it == dp.opToUnit.end() || !dp.units[it->second].latency)
+        return;
+      break;
+    }
+    case SourceSite::Slot::MemAddress: {
+      const Tail &t = tails.at(site.op);
+      tail = t.addr;
+      registered = t.addrRegistered;
+      break;
+    }
+    case SourceSite::Slot::MemWriteData:
+    case SourceSite::Slot::StreamData:
+    case SourceSite::Slot::StreamPredicate:
+      tail = tails.at(site.op).data;
+      break;
+    default:
+      break; // a register, a survivor, a result or a boundary captures it
+    }
+
+    TimingPath p;
+    p.endpoint = site.describe();
+    if (site.op)
+      p.where = logging::detail::describe(site.op->getLoc());
+    else if (site.slot == SourceSite::Slot::RegisterInput &&
+             dp.regs[site.index].value)
+      // A register is a model cell and owns no op, so it is anchored on the
+      // value it carries.
+      p.where = logging::detail::describe(dp.regs[site.index].value.getLoc());
+    if (registered)
+      p.steps.push_back({"launch: the address delay register", trace.floor});
+    else
+      trace.stepsInto(s, p.steps);
+    p.steps.insert(p.steps.end(), tail.begin(), tail.end());
+    for (const TimingStep &st : p.steps)
+      p.total += st.delay;
+    p.slack = cycleTime - p.total;
+    paths.push_back(std::move(p));
+  });
+
+  // The stride-register update, the one reg-to-reg cone with no scheduler
+  // counterpart. Priced off the emitted shape: the step add, the carry add, the
+  // wrap compare beside its fix, and the wrap plus issue/running selects, each
+  // a marginal row over the one register floor the hop already pays.
+  for (const RegionBlock &rb : dp.regions)
+    for (const RegionBlock::AddrStride &st : rb.addrStrides) {
+      double sel = lib.combMarginalDelay(OpKind::Select, st.width);
+      TimingPath p;
+      p.endpoint = "an address stride register";
+      p.where = logging::detail::describe(rb.op->getLoc());
+      p.steps.push_back(
+          {"launch: an address stride register", lib.registerFloor()});
+      if (st.step)
+        p.steps.push_back(
+            {"the stride step", lib.combMarginalDelay(OpKind::Add, st.width)});
+      if (st.hasCarry)
+        p.steps.push_back({"the carry from the digit below",
+                           lib.combMarginalDelay(OpKind::Add, st.width)});
+      if (st.wrap)
+        p.steps.push_back(
+            {"the wrap test and its fix",
+             std::max(lib.combMarginalDelay(OpKind::Cmp, st.width),
+                      lib.combMarginalDelay(OpKind::Sub, st.width)) +
+                 sel});
+      p.steps.push_back({"the issue and running selects", 2 * sel});
+      for (const TimingStep &s : p.steps)
+        p.total += s.delay;
+      p.slack = cycleTime - p.total;
+      paths.push_back(std::move(p));
+    }
+
   return success(ok);
 }
 
 } // namespace
 
 LogicalResult checkEmitterSubset(dcp::DCPathModuleOp func, const Datapath &dp,
-                                 float cycleTime, const OperatorLibrary &lib) {
+                                 float cycleTime, const OperatorLibrary &lib,
+                                 std::vector<TimingPath> &paths) {
   // An unresolved (None) Source is a cross-region SSA hand-off the builder
   // could not thread; reject it here rather than asserting in `resolveSource`.
   // `forEachSource` owns the slot list and which slots may be empty.
@@ -305,7 +619,7 @@ LogicalResult checkEmitterSubset(dcp::DCPathModuleOp func, const Datapath &dp,
   // store's write-enable by `issue & cond`, so a doomed exit iteration commits
   // nothing.
 
-  return checkCombPathsMeetPeriod(dp, cycleTime, lib);
+  return checkCombPathsMeetPeriod(func, dp, cycleTime, lib, paths);
 }
 
 //===----------------------------------------------------------------------===//
@@ -490,19 +804,60 @@ void assertModelInvariants(const Datapath &dp) {
 #endif
 }
 
-LogicalResult validateDatapath(dcp::DCPathModuleOp func, const Datapath &dp,
-                               float cycleTime, const OperatorLibrary &lib) {
+FailureOr<std::vector<TimingPath>>
+validateDatapath(dcp::DCPathModuleOp func, const Datapath &dp, float cycleTime,
+                 const OperatorLibrary &lib) {
   // The builder already reported the offending edge, and the depths it left
   // are placeholders, so nothing below would measure the design as asked for.
   if (dp.infeasible)
     return failure();
   assertModelInvariants(dp);
   // The design's own faults are reported before what this backend has not
-  // built yet.
+  // built yet. The period check measures while it checks, so the paths come out
+  // of the traversal that already visits every priced cell.
+  std::vector<TimingPath> paths;
   if (failed(checkInputLegality(func, dp)) ||
-      failed(checkEmitterSubset(func, dp, cycleTime, lib)))
+      failed(checkEmitterSubset(func, dp, cycleTime, lib, paths)))
     return failure();
-  return success();
+
+  // A hundredth of a nanosecond, the grid the schedule's own delays are given
+  // on: a path that misses by less than that misses by nothing the model can
+  // see, and reporting it would be reporting the rounding.
+  constexpr double kQuantum = 0.01;
+  unsigned missed = llvm::count_if(
+      paths, [&](const TimingPath &p) { return p.slack < -kQuantum; });
+  llvm::stable_sort(paths, [](const TimingPath &a, const TimingPath &b) {
+    return a.total > b.total;
+  });
+  // One path per capture site: a store whose address and data both miss says
+  // one thing, and a report spending its slots on the same operation hides the
+  // next two findings.
+  llvm::SmallDenseSet<llvm::StringRef> seen;
+  llvm::erase_if(paths, [&](const TimingPath &p) {
+    return !p.where.empty() && !seen.insert(p.where).second;
+  });
+  paths.resize(std::min<size_t>(paths.size(), kReportedPaths));
+  // A module with no datapath at all still holds the controller's own
+  // registers, so the shortest path any design has is one register hop.
+  if (paths.empty())
+    paths.push_back({lib.registerFloor(),
+                     cycleTime - lib.registerFloor(),
+                     "a control register",
+                     "",
+                     {{"launch: a control register", lib.registerFloor()}}});
+
+  if (missed)
+    logging::log(Level::Warn, Stage::Emit, func)
+        << missed << " combinational path(s) of this kernel miss the "
+        << llvm::format("%.2f", cycleTime) << " ns clock. The worst takes "
+        << llvm::format("%.2f", paths.front().total) << " ns ("
+        << llvm::format("%+.2f", paths.front().slack) << " ns slack) reaching "
+        << paths.front().endpoint
+        << (paths.front().where.empty() ? "" : " at " + paths.front().where)
+        << "; the design builds and simulates, and it is the part that may not "
+           "hold the clock. The QoR report's `fmax` and its critical paths say "
+           "where the time goes";
+  return paths;
 }
 
 } // namespace mlir::allo::uarch

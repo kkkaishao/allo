@@ -12,7 +12,7 @@ import pytest
 
 from allo import kernel
 from allo.lang import i32, f32, index, Stream
-from allo.backend.rtl import RegionKind, has_exact_scheduler
+from allo.backend.rtl import LatencyModelWarning, RegionKind, has_exact_scheduler
 
 sys.path.insert(0, os.path.dirname(__file__))
 from _common import Dcp, Mod, _to_rtl, _sched, _latency, _outer  # noqa: E402
@@ -164,6 +164,64 @@ def test_async_dataflow_container_is_concurrent():
     # every leaf is back-pressured, so nothing here is counted_static
     assert _kernels(res) == {"concurrent", "indeterminate"}
     assert _latency(dp) is None and _latency(dc) is None
+
+
+# ---------------------------------------------------------------------------
+# The published contract
+# ---------------------------------------------------------------------------
+
+
+# The manifest republishes the kernel's own class and span, so a consumer times
+# itself against the boundary document instead of reaching around it to the
+# schedule report. Both are stamped from the same op attributes and must agree.
+def test_the_manifest_publishes_the_kernel_contract():
+    N = 4
+
+    @kernel
+    def counted(A: i32[N], B: i32[N]):
+        for i in range(N):
+            B[i] = A[i] + 1
+
+    @kernel
+    def dynamic(A: i32[N], B: i32[N], n: index):
+        for i in range(n):
+            B[i] = A[i] + 1
+
+    for k, determinacy, exact in (
+        (counted, "counted_static", True),
+        (dynamic, "indeterminate", False),
+    ):
+        rtl = _to_rtl(k)
+        iface = rtl.interfaces.of_symbol(rtl.top)
+        fn = rtl.schedule().func(rtl.top)
+        assert iface.determinacy == determinacy
+        assert iface.latency_is_exact is exact
+        assert (iface.latency is not None) is exact
+        assert (iface.latency, iface.latency_is_bound) == (
+            fn.latency,
+            fn.latency_is_bound,
+        )
+
+
+# The cosim oracle's two directions, driven with a measurement rather than a
+# real run: a hardware that outlasts its published span is what the check
+# exists to catch, and no kernel in the suite produces one. Outlasting it FAILS
+# (a caller time-triggered against the figure samples early); beating it warns,
+# since it only costs the caller cycles it did not have to wait.
+def test_the_latency_oracle_fails_only_the_unsound_direction():
+    @kernel
+    def counted(A: i32[8], B: i32[8]):
+        for i in range(8):
+            B[i] = A[i] + 1
+
+    rtl = _to_rtl(counted)
+    span = rtl.interfaces.of_symbol(rtl.top).latency
+    # pylint: disable=protected-access
+    rtl._check_latency(span)
+    with pytest.raises(RuntimeError, match="UNSOUND"):
+        rtl._check_latency(span + 1)
+    with pytest.warns(LatencyModelWarning):
+        rtl._check_latency(span - 1)
 
 
 # ---------------------------------------------------------------------------

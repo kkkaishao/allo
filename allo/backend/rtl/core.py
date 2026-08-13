@@ -44,6 +44,12 @@ _NORMALIZE_PIPELINE = "builtin.module(dcp-resolve-banking)"
 _DERIVED_OPTIONS = {"cycle_ns"}
 
 
+class LatencyModelWarning(UserWarning):
+    """A cosim ran for fewer cycles than the exact contract the kernel
+    publishes. A caller only waits longer than it had to, so this is a warning
+    and not a failure; its own class so a test run can filter it to an error."""
+
+
 # pylint: disable-next=too-many-instance-attributes
 class RTL(Backend[P, R]):
     name = "rtl"
@@ -300,28 +306,45 @@ class RTL(Backend[P, R]):
         return result
 
     def _check_latency(self, cycles: int) -> None:
-        """Hold the latency model to the hardware: a kernel whose span is an
-        exact static contract must run for exactly that many cycles. The only
+        """Hold the published contract to the hardware: the manifest's
+        ``latency`` is the figure a caller times its consumers against, so a run
+        that outlasts it samples before this kernel writes and fails, while one
+        that finishes early only costs the caller cycles and warns. The only
         check in the compiler that compares a model against a measurement rather
         than against another model.
         """
+        iface = self.interfaces.of_symbol(self.top)
         fn = self.schedule().func(self.top)
-        # A bounded, indeterminate or concurrent kernel publishes a figure that
-        # is deliberately not tight, so only an exact contract is held to a
-        # measured count.
-        if not fn.latency_is_exact:
+        # Two documents, one contract, stamped from the same attributes.
+        assert (iface.latency, iface.latency_is_bound, iface.determinacy) == (
+            fn.latency,
+            fn.latency_is_bound,
+            fn.determinacy,
+        ), "the manifest and the schedule report disagree about the kernel's span"
+        # Nothing to hold it to: a data-dependent span publishes no figure, and
+        # a concurrent kernel's is a completion floor that times nothing.
+        if iface.latency is None or iface.determinacy == "concurrent":
             return
-        modelled = fn.latency
-        assert modelled is not None  # implied by latency_is_exact
-        if modelled == cycles:
-            return
-        msg = (
-            f"DEV-ONLY: latency model disagrees with the hardware for '{fn.name}': "
-            f"declared latency = {modelled}, measured {cycles} cycles "
-            f"(delta {cycles - modelled:+d}), which may indicate a bug in "
-            "the compiler or the RTL."
-        )
-        warnings.warn(msg, stacklevel=2)
+        if cycles > iface.latency:
+            kind = "bounds" if iface.latency_is_bound else "is"
+            raise RuntimeError(
+                f"the latency contract is UNSOUND for '{self.top}': it publishes "
+                f"{iface.latency} cycles, which {kind} the whole start->done "
+                f"span, and the hardware ran {cycles} "
+                f"({cycles - iface.latency:+d}); a caller time-triggered against "
+                "the published figure samples before this kernel writes"
+            )
+        # A bound is an upper one, so slack under it is the point; only an exact
+        # contract is held to the cycle.
+        if cycles < iface.latency and not iface.latency_is_bound:
+            warnings.warn(
+                f"DEV-ONLY: the latency model is pessimistic for '{self.top}': "
+                f"declared latency = {iface.latency}, measured {cycles} cycles "
+                f"(delta {cycles - iface.latency:+d}), which may indicate a bug "
+                "in the compiler or the RTL.",
+                LatencyModelWarning,
+                stacklevel=2,
+            )
 
     # pylint: disable-next=arguments-differ
     def run(self, mode: str, *args: Any, **kwargs: Any) -> Any:

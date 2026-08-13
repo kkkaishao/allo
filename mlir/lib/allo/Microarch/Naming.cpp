@@ -263,6 +263,8 @@ void nameValue(Value v, llvm::StringRef name) {
   // attr, since sv.namehint is ignored on a reg; any other value uses namehint.
   if (auto reg = dyn_cast<seq::CompRegOp>(op))
     reg.setNameAttr(StringAttr::get(op->getContext(), name));
+  else if (auto ce = dyn_cast<seq::CompRegClockEnabledOp>(op))
+    ce.setNameAttr(StringAttr::get(op->getContext(), name));
   else
     op->setAttr("sv.namehint", StringAttr::get(op->getContext(), name));
 }

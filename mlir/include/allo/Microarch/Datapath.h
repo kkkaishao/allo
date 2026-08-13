@@ -362,6 +362,12 @@ struct MemUnit {
     bool isWrite = false;
     unsigned region = 0; // the RegionBlock this access is scheduled in
     unsigned stage = 0;  // scheduled cycle within the region
+    /// The setup delay the schedule priced this access against, in ns
+    /// (`accessCharacterization`: the address cone plus the port's own delay).
+    /// `portDelay` is the port's own share alone, which is what bounds a select
+    /// sitting in front of a registered address.
+    double inDelay = 0.0;
+    double portDelay = 0.0;
     /// The port of its bank this access drives, assigned by `bindMemoryPorts`.
     /// Two accesses share a port only where the model proves they never issue
     /// in the same cycle, so the port carries a select rather than an arbiter.
@@ -444,6 +450,11 @@ struct MemUnit {
     /// live, so their sum is delayed once rather than each operand separately.
     /// The residual's operands arrive already delayed and are not covered.
     unsigned addrDelay = 0;
+    /// What the address costs on this access's setup path, in ns, `portDelay`
+    /// excluded. Without a delay register that is the whole cone (`inDelay`
+    /// less the port's own share); with one it is only what `buildAddr` builds
+    /// after that register, the term sum having landed in it a cycle earlier.
+    double addrSetup = 0.0;
   };
   llvm::SmallVector<Access, 2> accesses;
 };
@@ -511,6 +522,10 @@ struct CallUnit {
     bool independent = false;
     std::string addr, data, we; // child port names; `we` empty for a read
     std::string topBase; // top boundary port base (indexed); empty = internal
+    /// Whether this MemArg opened `topBase`'s group. A child mastered on a
+    /// (bank, port) colour another holder already opened shares that group
+    /// instead, and only the opener declares it in the interface.
+    bool ownsGroup = true;
   };
   llvm::SmallVector<MemArg, 2> memArgs;
 
@@ -629,7 +644,10 @@ struct StreamChannel {
     bool isPut = false;
     unsigned region = 0; // the RegionBlock this access is scheduled in
     unsigned stage = 0;  // scheduled cycle within the region (dcpStart)
-    Source data;         // put: the token's data driver (puts only)
+    /// The setup delay the schedule priced this access against, in ns
+    /// (`accessCharacterization`), as on `MemUnit::Access`.
+    double inDelay = 0.0;
+    Source data; // put: the token's data driver (puts only)
     // A predicated access (an i1 `pred` operand from a masked `if`) consumes or
     // produces its token only where this holds. Delayed to `stage` like `data`;
     // None for an unconditional access.
@@ -678,16 +696,18 @@ struct Mux {
 /// count. Zero for a single source, which is a wire.
 unsigned muxLevels(unsigned sources);
 
-/// A safety factor on `muxLevelDelay`, carried until the width term is
-/// characterized. Sized from the gap a one-bit OR row leaves on a wide select.
-/// Not a measurement and not a tuning knob: replace it with a width term
-/// rather than adjusting it.
+/// A safety factor on the formula fallback below, sized from the gap a
+/// one-bit OR row leaves on a wide select. Unused on a device with a measured
+/// `dcp.mux` delay row.
 inline constexpr double kMuxDelayMargin = 1.4;
 
-/// What one such level costs in ns: the device's OR row, since the select is
-/// an AND-OR reduction rather than a chain of 2:1 selects, times
-/// `kMuxDelayMargin`.
-double muxLevelDelay(const OperatorLibrary &lib);
+/// The routed marginal delay of a one-hot select over \p sources arms of
+/// \p width bits, in ns: the device's measured `dcp.mux` delay row, clamped
+/// to its measured domain (fan-in past the sweep grows one LUT level per
+/// several-fold, which the clamp under-counts slightly). A device without the
+/// row is priced at `muxLevels` times a margined one-bit OR row, the
+/// conservative direction. Zero for a single source, which is a wire.
+double muxCone(const OperatorLibrary &lib, unsigned sources, unsigned width);
 
 /// The sub-cycle room \p u's bound ops have left, in ns: the smallest
 /// `cycleTime - z - inDelay` over them, both read off the model. This bounds

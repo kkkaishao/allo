@@ -209,7 +209,9 @@ class DcpFunc(_Scope):
 # --- structural reading of the emitted RTL -----------------------------------
 
 _DEF = re.compile(r"^%([\w.$-]+) = (.+)$")
-_COMPREG = re.compile(r'^seq\.compreg (?:name "([^"]*)" )?%([\w.$-]+),')
+_COMPREG = re.compile(
+    r'^seq\.compreg(\.ce)? (?:name "([^"]*)" )?%([\w.$-]+), %[\w.$-]+(?:, %([\w.$-]+))?'
+)
 _MUX = re.compile(r"^comb\.mux (?:bin )?%([\w.$-]+), %([\w.$-]+), %([\w.$-]+)")
 _HINT = re.compile(r'sv\.namehint = "([^"]+)"')
 _OPERAND = re.compile(r"%([\w.$-]+)")
@@ -240,7 +242,7 @@ class Mod:
         # multi-result op (an `hw.instance`) defines no single value and so has
         # no entry in `defs`.
         self.text = "\n".join(body)
-        self.defs, self.hint, self.regs = {}, {}, []
+        self.defs, self.hint, self.regs, self.ce = {}, {}, [], {}
         for s in body:
             m = _DEF.match(s)
             if not m:
@@ -252,7 +254,9 @@ class Mod:
                 self.hint[res] = h.group(1)
             r = _COMPREG.match(rhs)
             if r:
-                self.regs.append((r.group(1) or res, res, r.group(2)))
+                self.regs.append((r.group(2) or res, res, r.group(3)))
+                if r.group(1):  # a `seq.compreg.ce` names its enable directly
+                    self.ce[res] = r.group(4)
 
     def hinted(self, name):
         """The single SSA value labelled ``sv.namehint = name``."""
@@ -290,11 +294,12 @@ class Mod:
     def enable_of(self, reg, inp):
         """The enable selecting ``reg``'s next value, or None if unconditional.
 
-        An enabled cell is ``reg = compreg(mux(en, in, reg))``, so the register
-        holds itself on the false arm. Both ``enabledReg`` (a chain stage) and
-        ``stallHold`` (a held address) emit exactly this pair; which node is
-        called the output is the only difference, and it does not matter here.
+        An enabled cell is a ``seq.compreg.ce``, which names its enable as an
+        operand; a plain register spelled as a self-hold
+        (``compreg(mux(en, in, reg))``, the latch form) yields the mux select.
         """
+        if reg in self.ce:
+            return self.ce[reg]
         m = self.mux(inp)
         return m[0] if m and m[2] == reg else None
 

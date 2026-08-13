@@ -35,10 +35,17 @@ layoutOf(const uarch::MemUnit &mu) {
 } // namespace
 
 ModuleInterface::ModuleInterface(const uarch::Datapath &dp) {
+  dcp::DCPathModuleOp fn(dp.func);
   // Legalized here so the manifest key is the emitted Verilog module name;
   // ExportVerilog would otherwise rewrite a nested callee like `top.child`.
-  symbol = dcp::DCPathModuleOp(dp.func).getSymName().str();
+  symbol = fn.getSymName().str();
   module = uarch::verilogName(symbol);
+
+  // The timing contract, republished verbatim from the op that declares it.
+  if (std::optional<uint64_t> lat = fn.getLatency())
+    latency = (int64_t)*lat;
+  latencyBound = latency.has_value() && fn.getLatencyBound();
+  determinacy = stringifyDeterminacyEnum(fn.getDeterminacy()).str();
 
   ArrayRef<uarch::AccRef> reads = dp.readPorts, writes = dp.writePorts;
   // Every IOPort is a scalar kernel argument; a scalar result is a `dp.results`
@@ -101,11 +108,12 @@ ModuleInterface::ModuleInterface(const uarch::Datapath &dp) {
   // naming as a normal port.
   for (const uarch::CallUnit &cu : dp.calls)
     for (const uarch::CallUnit::MemArg &ma : cu.memArgs) {
-      if (!ma.isBoundary)
+      if (!ma.isBoundary || !ma.ownsGroup)
         continue;
-      // One port group per accessor, so several accessors of one argument get
-      // separate groups backed by the same array; a cyclic argument gets one
-      // group per bank.
+      // One port group per (bank, port) colour: a child sharing a colour
+      // shares the group (and the opener alone declares it), so concurrent
+      // accessors keep separate groups backed by the same array and a cyclic
+      // argument gets one group per bank.
       const auto &mu = dp.mems[ma.mem];
       unsigned w =
           datapathWidth(cast<MemRefType>(mu.memref.getType()).getElementType());
@@ -284,24 +292,30 @@ std::string ModuleInterface::toJSON() const {
                                {"ports", std::move(ports)}});
   }
 
-  Value root = Object{{"module", module},
-                      {"symbol", symbol},
-                      // The fixed control ABI, published so no consumer
-                      // hard-codes it.
-                      {"control", Object{{"clk", uarch::kClk},
-                                         {"rst", uarch::kRst},
-                                         {"start", uarch::kStart},
-                                         {"done", uarch::kDone}}},
-                      {"scalars", std::move(scalars)},
-                      {"streams", std::move(streams)},
-                      {"reads", mems(reads)},
-                      {"writes", mems(writes)},
-                      {"registers", std::move(registers)},
-                      {"results", std::move(results)},
-                      {"operators", std::move(operators)}};
+  Object root{{"module", module},
+              {"symbol", symbol},
+              // The start->done contract. `latency` is absent rather than
+              // null when the span is data-dependent, so a consumer cannot
+              // read a number where none was published.
+              {"latency_bound", latencyBound},
+              {"determinacy", determinacy},
+              // The fixed control ABI, published so no consumer hard-codes it.
+              {"control", Object{{"clk", uarch::kClk},
+                                 {"rst", uarch::kRst},
+                                 {"start", uarch::kStart},
+                                 {"done", uarch::kDone}}},
+              {"scalars", std::move(scalars)},
+              {"streams", std::move(streams)},
+              {"reads", mems(reads)},
+              {"writes", mems(writes)},
+              {"registers", std::move(registers)},
+              {"results", std::move(results)},
+              {"operators", std::move(operators)}};
+  if (latency)
+    root["latency"] = *latency;
   std::string s;
   llvm::raw_string_ostream os(s);
-  os << root;
+  os << Value(std::move(root));
   return s;
 }
 
