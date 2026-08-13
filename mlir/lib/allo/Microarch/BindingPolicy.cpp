@@ -45,8 +45,8 @@ bool carriedOperand(const RegionBlock &rb, Value v) {
 
 /// Whether \p op reads a loop recurrence on any operand.
 bool readsRecurrence(const RegionBlock &rb, Operation *op) {
-  return llvm::any_of(
-      op->getOperands(), [&](Value v) { return carriedOperand(rb, v); });
+  return llvm::any_of(op->getOperands(),
+                      [&](Value v) { return carriedOperand(rb, v); });
 }
 
 /// Whether \p v is held for the whole of \p rb's run: defined outside the
@@ -228,8 +228,8 @@ SharingProblem sharingProblemOf(const Datapath &dp, const RegionBlock &rb,
     members[it->second].push_back(i);
     SharingProblem::Unit &unit = problem.units[i];
     unit.cls = it->second;
-    unit.slackPicos = std::max<int64_t>(
-        0, std::floor(unitSlack(u, ctx.cycleTime) * 1000.0));
+    unit.slackPicos =
+        std::max<int64_t>(0, std::floor(unitSlack(u, ctx.cycleTime) * 1000.0));
     Operation *y = u.repOp();
     for (auto [k, v] : llvm::enumerate(y->getOperands())) {
       unit.initArms.push_back(carriedOperand(rb, v) ? 1 : 0);

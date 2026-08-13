@@ -153,10 +153,11 @@ struct DatapathBuilder {
   /// `scalarIns`. Separate from `bindResource`: a Source resolution needs the
   /// complete region model (see `resolveValue`).
   void recordCallScalars();
-  /// Record every CallUnit's composition predecessors (`cu.predecessors`). A
-  /// SCHEDULED composition orders its children by their placed `start` and only
-  /// gates an earlier or indeterminate producer; a CONCURRENT one places every
-  /// child at 0 and orders them by hazard direction (RAW / WAW / WAR) instead.
+  /// Record every CallUnit's composition predecessors (`cu.predecessors`),
+  /// hazard-directed (RAW / WAW / WAR) in both composition classes: a
+  /// read-read pair commutes and overlaps. A SCHEDULED composition gates only
+  /// an earlier-placed or indeterminate hazard producer; a CONCURRENT one has
+  /// no placement, so a hazard the channels do not order is the whole rule.
   /// Runs after `recordCallScalars`, whose Sources carry the scalar-result
   /// edges.
   void recordCallDeps();

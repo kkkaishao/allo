@@ -463,6 +463,57 @@ def test_independent_siblings_run_concurrently_cosim():
     assert np.array_equal(D, B * 2)
 
 
+def test_read_read_siblings_overlap_cosim():
+    # Two sibling sweeps that only READ one shared array are a read-read pair:
+    # no hazard orders them, so the composer starts them together and each
+    # takes a read port of its own. Locked on the control structure and on the
+    # published span staying exact under the overlap.
+    @kernel
+    def rrshare(A: i32[64], C: i32[64], D: i32[64]):
+        for i in range(64):
+            C[i] = A[i] + 1
+        for i in range(64):
+            D[i] = A[i] * 2
+
+    rtl = _to_rtl(rrshare)
+    m = Mod(rtl.mlir, "rrshare")
+    _, run1 = m.reg_named("r1_run")
+    assert "r0_done" not in {m.hint.get(v, v) for v in m.cone(run1, limit=256)}
+
+    lat = _latency(rrshare)
+    assert lat is not None
+    A = np.arange(64, dtype=np.int32)
+    C = np.zeros(64, np.int32)
+    D = np.zeros(64, np.int32)
+    r = rtl.cosim(A, C, D)
+    assert r.cycles == lat  # the overlapped span is still an exact contract
+    assert np.array_equal(C, A + 1)
+    assert np.array_equal(D, A * 2)
+
+
+def test_war_siblings_stay_ordered_cosim():
+    # A reader followed by a writer of the same array is a WAR hazard: the
+    # writer must wait for the read sweep to drain, so its run register is
+    # gated on the reader's done. The numerics prove the old values were read.
+    @kernel
+    def war(A: i32[64], C: i32[64]):
+        for i in range(64):
+            C[i] = A[i] + 1
+        for i in range(64):
+            A[i] = 7
+
+    rtl = _to_rtl(war)
+    m = Mod(rtl.mlir, "war")
+    _, run1 = m.reg_named("r1_run")
+    assert "r0_done" in {m.hint.get(v, v) for v in m.cone(run1, limit=256)}
+
+    A = np.arange(64, dtype=np.int32)
+    C = np.zeros(64, np.int32)
+    rtl.cosim(A, C)
+    assert np.array_equal(C, np.arange(64, dtype=np.int32) + 1)
+    assert np.array_equal(A, np.full(64, 7, np.int32))
+
+
 # ---------------------------------------------------------------------------
 # Value resolution: one Value -> Source lookup for every slot in the L2 model,
 # including the block-argument case a nested read or a loop bound resolves

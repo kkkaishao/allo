@@ -11,8 +11,14 @@
 #include "allo/Scheduling/LatencyModel.h"
 
 #include "allo/IR/AlloOps.h"
-#include "allo/Support/AliasAnalysis.h" // resolveRoot (storage identity)
+#include "allo/Scheduling/Footprint.h"    // summarizeOp / summarizeCall
+#include "allo/Scheduling/MemoryAccess.h" // asMemAccess
+#include "allo/Scheduling/MemoryModel.h"  // assignedBankOf, bankLayoutOf
+#include "allo/Scheduling/RegionGraph.h"  // isSyncSubKernelCall
+#include "allo/Support/AliasAnalysis.h"   // resolveRoot (storage identity)
 
+#include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/IR/SymbolTable.h"
 #include "llvm/ADT/MapVector.h"
 #include "llvm/ADT/SmallPtrSet.h"
 
@@ -77,6 +83,152 @@ std::optional<int64_t> mlir::allo::composeSequence(ArrayRef<SpanNode> nodes) {
   return sum;
 }
 
+// Reads and writes of the array bound to operand \p argIdx of \p inv, from the
+// reified callee's own accesses, nested instances included. Reification is
+// bottom-up, so the callee module exists before any caller composes against
+// it, and modules cannot instantiate themselves.
+static std::pair<bool, bool>
+dcpArgAccess(dcp::DCPathInstanceOp inv, unsigned argIdx,
+             llvm::SmallPtrSetImpl<Operation *> &active) {
+  auto mod = SymbolTable::lookupNearestSymbolFrom<dcp::DCPathModuleOp>(
+      inv, inv.getCalleeAttr());
+  assert(mod && "a dcp.instance names a reified callee (built bottom-up)");
+  bool isNew = active.insert(mod).second;
+  assert(isNew && "a dcp module cannot instantiate itself transitively");
+  (void)isNew;
+  Value arg = mod.getBody().front().getArgument(argIdx);
+  bool reads = false, writes = false;
+  mod.walk([&](Operation *op) {
+    if (auto load = dyn_cast<dcp::DCPathLoadOp>(op)) {
+      reads |= resolveRoot(load.getMemref()) == arg;
+    } else if (auto store = dyn_cast<dcp::DCPathStoreOp>(op)) {
+      writes |= resolveRoot(store.getMemref()) == arg;
+    } else if (auto nested = dyn_cast<dcp::DCPathInstanceOp>(op)) {
+      for (auto [k, operand] : llvm::enumerate(nested.getInputs()))
+        if (isa<MemRefType>(operand.getType()) && resolveRoot(operand) == arg) {
+          auto [r, w] = dcpArgAccess(nested, k, active);
+          reads |= r;
+          writes |= w;
+        }
+    }
+  });
+  active.erase(mod);
+  return {reads, writes};
+}
+
+void mlir::allo::hazardEdges(ArrayRef<MemTouch> touch,
+                             llvm::function_ref<void(unsigned, unsigned)> add) {
+  auto emit = [&](unsigned p, unsigned c) {
+    if (p != c)
+      add(p, c);
+  };
+  llvm::SmallVector<int64_t, 4> banks;
+  for (const MemTouch &t : touch)
+    if (t.bank && !llvm::is_contained(banks, *t.bank))
+      banks.push_back(*t.bank);
+  // The reader-writer walk over one bank's touches: a bank-less touch joins
+  // every bank's walk, so it pairs with everything.
+  auto walk = [&](std::optional<int64_t> bank) {
+    std::optional<unsigned> lastWriter;
+    llvm::SmallVector<unsigned, 4> readers;
+    for (const MemTouch &t : touch) {
+      if (bank && t.bank && *t.bank != *bank)
+        continue;
+      if (lastWriter)
+        emit(*lastWriter, t.node);
+      if (!t.writes) {
+        readers.push_back(t.node);
+        continue;
+      }
+      for (unsigned r : readers)
+        emit(r, t.node);
+      readers.clear();
+      lastWriter = t.node;
+    }
+  };
+  if (banks.empty())
+    return walk(std::nullopt);
+  for (int64_t b : banks)
+    walk(b);
+}
+
+// The touches of one sibling node, over either IR form: the scheduler's loops
+// and calls, or the reifier's dcp regions and instances. An access op touches
+// at the bank `assign-banks` resolved it to; a call or an unclassifiable op
+// touches bank-less (it may reach any bank).
+namespace {
+struct NodeTouches {
+  // root -> (bank, writes), merged per (root, bank)
+  llvm::MapVector<Value,
+                  llvm::SmallVector<std::pair<std::optional<int64_t>, bool>, 2>>
+      mem;
+  llvm::SmallVector<Value, 2> streams;
+};
+} // namespace
+
+static NodeTouches nodeTouches(ArrayRef<Operation *> ops) {
+  NodeTouches nt;
+  auto mem = [&](Value root, std::optional<int64_t> bank, bool writes) {
+    auto &list = nt.mem[root];
+    for (auto &e : list)
+      if (e.first == bank) {
+        e.second |= writes;
+        return;
+      }
+    list.push_back({bank, writes});
+  };
+  auto stream = [&](Value root) {
+    if (!llvm::is_contained(nt.streams, root))
+      nt.streams.push_back(root);
+  };
+  auto bankOf = [](Operation *o) -> std::optional<int64_t> {
+    if (std::optional<unsigned> b = assignedBankOf(o))
+      return int64_t(*b);
+    return std::nullopt;
+  };
+  for (Operation *top : ops)
+    top->walk([&](Operation *o) {
+      if (auto inv = dyn_cast<dcp::DCPathInstanceOp>(o)) {
+        for (auto [k, operand] : llvm::enumerate(inv.getInputs())) {
+          if (isa<MemRefType>(operand.getType())) {
+            llvm::SmallPtrSet<Operation *, 8> active;
+            auto [r, w] = dcpArgAccess(inv, k, active);
+            if (r || w)
+              mem(resolveRoot(operand), std::nullopt, w);
+          } else if (isa<StreamType>(operand.getType())) {
+            stream(resolveRoot(operand));
+          }
+        }
+        return;
+      }
+      if (auto load = dyn_cast<dcp::DCPathLoadOp>(o)) {
+        mem(resolveRoot(load.getMemref()), bankOf(o), /*writes=*/false);
+        return;
+      }
+      if (auto store = dyn_cast<dcp::DCPathStoreOp>(o)) {
+        mem(resolveRoot(store.getMemref()), bankOf(o), /*writes=*/true);
+        return;
+      }
+      if (auto a = asMemAccess(o)) {
+        if (a->kind == AccessKind::Stream) {
+          stream(a->root);
+          return;
+        }
+        mem(a->root, bankOf(o), a->isWrite);
+        return;
+      }
+      Summary s;
+      if (!(isSyncSubKernelCall(o) && summarizeCall(cast<func::CallOp>(o), s)))
+        summarizeOp(o, s);
+      for (auto &kv : s.mem)
+        if (kv.second.reads || kv.second.writes)
+          mem(kv.first, std::nullopt, kv.second.writes);
+      for (Value v : s.streams)
+        stream(v);
+    });
+  return nt;
+}
+
 std::vector<llvm::SmallVector<unsigned, 2>>
 mlir::allo::siblingPredecessors(ArrayRef<SmallVector<Operation *>> nodeOps) {
   // Which node owns each op, so a cross-node SSA use can name the producer's
@@ -92,19 +244,25 @@ mlir::allo::siblingPredecessors(ArrayRef<SmallVector<Operation *>> nodeOps) {
       preds[c].push_back(p);
   };
 
-  // One shared resource orders every node touching it, chained in program order
-  // so the rest follows transitively.
-  llvm::MapVector<Value, llvm::SmallVector<unsigned, 4>> sharers;
+  // Every toucher of a shared resource, in node order, with the direction and
+  // bank the node touches it at. A stream is a FIFO whose token order is the
+  // program's, so its touchers are ordered regardless of direction.
+  llvm::MapVector<Value, llvm::SmallVector<MemTouch, 4>> mems;
+  llvm::MapVector<Value, llvm::SmallVector<unsigned, 4>> streams;
+  for (auto [i, ops] : llvm::enumerate(nodeOps)) {
+    NodeTouches nt = nodeTouches(ops);
+    for (auto &kv : nt.mem)
+      for (auto [bank, writes] : kv.second)
+        mems[kv.first].push_back({unsigned(i), writes, bank});
+    for (Value stream : nt.streams)
+      streams[stream].push_back(i);
+  }
+
   // A scalar survivor: SSA dominance already puts the producer first.
   for (auto [i, ops] : llvm::enumerate(nodeOps))
     for (Operation *top : ops)
       top->walk([&, i = i](Operation *o) {
         for (Value v : o->getOperands()) {
-          if (isa<MemRefType, StreamType>(v.getType())) {
-            auto &touchers = sharers[resolveRoot(v)];
-            if (!llvm::is_contained(touchers, unsigned(i)))
-              touchers.push_back(i);
-          }
           Operation *def = v.getDefiningOp();
           if (!def)
             continue;
@@ -121,9 +279,27 @@ mlir::allo::siblingPredecessors(ArrayRef<SmallVector<Operation *>> nodeOps) {
                  "a computing op outside every region drives a node's input");
         }
       });
-  for (auto &entry : sharers)
+
+  for (auto &entry : streams)
     for (unsigned j = 1; j < entry.second.size(); ++j)
       addPred(entry.second[j - 1], entry.second[j]);
+  // A memref orders only its hazard pairs (`hazardEdges`); two nodes that only
+  // READ stay unordered: they overlap, and `Datapath::portGraph` reads the
+  // unordered pair as simultaneous, pricing the separate ports that takes. A
+  // skewed layout is the exception: its lanes share a port per slot across
+  // regions, so every toucher pair stays chained.
+  for (auto &entry : mems) {
+    auto &touch = entry.second;
+    if (bankLayoutOf(entry.first).skew()) {
+      for (unsigned j = 1; j < touch.size(); ++j)
+        addPred(touch[j - 1].node, touch[j].node);
+      continue;
+    }
+    hazardEdges(touch, [&](unsigned p, unsigned c) { addPred(p, c); });
+  }
+  // `addPred` orders by discovery; hand each list back in program order.
+  for (auto &p : preds)
+    llvm::sort(p);
   return preds;
 }
 

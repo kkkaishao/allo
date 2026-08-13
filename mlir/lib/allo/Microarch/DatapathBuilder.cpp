@@ -601,16 +601,16 @@ void DatapathBuilder::recordCallDeps() {
       };
       for (unsigned j = 0; j < i; ++j) {
         const CallUnit &p = dp.calls[rb.callUnits[j]];
-        // A CONCURRENT container places every child at 0, so hazard DIRECTION
-        // (RAW / WAW / WAR) is the whole ordering, between children the
-        // channels do not order. A SCHEDULED one orders by `start`.
-        bool hazard =
-            concurrent
-                ? !channelled(p, cu) &&
-                      (shares(memsOf(p, true), memsOf(cu, std::nullopt)) ||
-                       shares(memsOf(cu, true), memsOf(p, false)))
-                : (p.start < cu.start || !p.latency) &&
-                      shares(memsOf(p, std::nullopt), memsOf(cu, std::nullopt));
+        // Hazard DIRECTION (RAW / WAW / WAR) is the ordering in both
+        // composition classes: a read-read pair commutes and overlaps, taking
+        // a port each (`portGraph`). A CONCURRENT container orders every such
+        // pair the channels do not; a SCHEDULED one only where the placement
+        // or a missing contract leaves the earlier child's completion ahead.
+        bool directed = shares(memsOf(p, true), memsOf(cu, std::nullopt)) ||
+                        shares(memsOf(cu, true), memsOf(p, false));
+        bool hazard = concurrent
+                          ? directed && !channelled(p, cu)
+                          : directed && (p.start < cu.start || !p.latency);
         if (hazard)
           add(p.id, /*viaResult=*/false);
       }
@@ -1530,14 +1530,14 @@ void DatapathBuilder::allocateUnits(ArrayRef<SmallVector<UnitId, 2>> groups) {
 // earlier top-level siblings it must start after, all attributed to the
 // top-level ancestor. Per-region binding keeps functional units from
 // conflicting across regions, so the signals are the (1) to (3) below: a shared
-// memref, a shared channel, a cross-region SSA edge. The emitter starts a
-// predecessor-free region concurrently with the kernel `start` and gates the
-// rest on their producers' joined `done`.
+// memref (hazard pairs only), a shared channel, a cross-region SSA edge. The
+// emitter starts a predecessor-free region concurrently with the kernel
+// `start` and gates the rest on their producers' joined `done`.
 //
-// `siblingPredecessors` answers the same question off the IR, so it
-// over-approximates; this works off the BUILT model. The model wants the
-// superset: a spurious edge there only lengthens a span, while one HERE would
-// serialize real hardware.
+// `siblingPredecessors` answers the same question off the IR, and the two must
+// agree: the composed span is published as an exact contract, so an edge only
+// one side has is either a span the hardware beats or hardware the span never
+// paid for.
 void DatapathBuilder::recordSiblingDeps(ArrayRef<Operation *> regionOps) {
   // Top-level ancestor of a region (walk the container chain to the root).
   auto topOf = [&](RegionId r) {
@@ -1564,8 +1564,8 @@ void DatapathBuilder::recordSiblingDeps(ArrayRef<Operation *> regionOps) {
       preds.push_back(producer);
   };
 
-  // One shared resource orders the top-level regions that touch it: chain them
-  // in program order, so the rest follows transitively.
+  // One shared resource orders the top-level regions that touch it, chained in
+  // program order so the rest follows transitively.
   SmallVector<RegionId, 4> tops;
   auto addSharer = [&](RegionId region) {
     RegionId t = topOf(region);
@@ -1579,20 +1579,43 @@ void DatapathBuilder::recordSiblingDeps(ArrayRef<Operation *> regionOps) {
     tops.clear();
   };
 
-  // (1) A shared memref. A CallUnit masters memref operands without a
-  // MemUnit::Access, so it counts as a sharer too, or a child could read a
-  // buffer concurrently with an earlier writer.
-  //
-  // `Datapath::portGraph` depends on this chaining every sharer: exempting a
-  // pair here would let two regions share a port they can both drive at once.
+  // (1) A shared memref, ordered by its hazard pairs (`hazardEdges`, at bank
+  // granularity): two regions that only READ the array, or that touch
+  // different banks, overlap, and `Datapath::portGraph` reads any unordered
+  // pair as simultaneous, so they take separate ports. A CallUnit masters
+  // memref operands without a MemUnit::Access, so it counts as a sharer too,
+  // at its ports' directions but bank-less. A skewed layout shares one port
+  // per lane slot across regions (`assignLanes`), so it keeps every toucher
+  // ordered.
   for (const MemUnit &m : dp.mems) {
+    SmallVector<MemTouch, 8> touch;
+    auto note = [&](RegionId region, bool writes, std::optional<int64_t> bank) {
+      RegionId t = topOf(region);
+      for (MemTouch &e : touch)
+        if (e.node == t && e.bank == bank) {
+          e.writes |= writes;
+          return;
+        }
+      touch.push_back({t, writes, bank});
+    };
     for (const MemUnit::Access &a : m.accesses)
-      addSharer(a.region);
+      note(a.region, a.isWrite,
+           !m.layout.skew() && a.staticBank
+               ? std::optional<int64_t>(*a.staticBank)
+               : std::nullopt);
     for (const CallUnit &cu : dp.calls)
       for (const CallUnit::MemArg &ma : cu.memArgs)
         if (ma.mem == m.id)
-          addSharer(cu.region);
-    chainSharers();
+          note(cu.region, ma.isWrite, std::nullopt);
+    llvm::stable_sort(touch, [](const MemTouch &a, const MemTouch &b) {
+      return a.node < b.node; // program order (a top's id orders it)
+    });
+    if (m.layout.skew()) {
+      for (unsigned j = 1; j < touch.size(); ++j)
+        addPred(touch[j - 1].node, touch[j].node);
+      continue;
+    }
+    hazardEdges(touch, [&](unsigned p, unsigned c) { addPred(p, c); });
   }
 
   // (2) A shared channel: a FIFO is one port carrying the program's token

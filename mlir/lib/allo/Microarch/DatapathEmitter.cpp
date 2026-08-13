@@ -725,7 +725,7 @@ Value DatapathEmitter::startForCall(const uarch::CallUnit &cu, Value issue,
                                     ArrayRef<Value> predDones, bool concurrent,
                                     const StallShell &sh) {
   switch (cu.startPolicy) {
-  case uarch::CallUnit::StartPolicy::Handshake:
+  case uarch::CallUnit::StartPolicy::Handshake: {
     // A child's `done` is a level its own start clears, so on a retriggered
     // region it still reads the previous pass's 1 until the child is released.
     // The join means "completed this pass" and so reads it through
@@ -733,7 +733,17 @@ Value DatapathEmitter::startForCall(const uarch::CallUnit &cu, Value issue,
     // is the pass-start pulse the calls are placed against, where a concurrent
     // region has no such boundary.
     assert(!predDones.empty() && "a handshake start has nothing to join");
-    return c.startFor(concurrent ? Value() : issue, predDones);
+    if (concurrent)
+      return c.startFor(Value(), predDones);
+    // A scheduled join also waits for the call's own placed cycle: the gates
+    // are only the hazard producers, so their dones can settle before the
+    // cycle the schedule proved this child's operands ready at. Rides the
+    // region's shell exactly as a TimeTriggered release does.
+    llvm::SmallVector<Value> ready(predDones);
+    Value placed = c.delayValid(issue, cu.start, sh);
+    ready.push_back(c.orBits(c.holdDone(placed, issue), placed));
+    return c.startFor(issue, ready);
+  }
   case uarch::CallUnit::StartPolicy::Broadcast:
     return issue;
   case uarch::CallUnit::StartPolicy::TimeTriggered:

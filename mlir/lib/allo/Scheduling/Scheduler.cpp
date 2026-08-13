@@ -1707,9 +1707,8 @@ LogicalResult ModuloSimplexScheduler::schedule() {
           << " here: a loop-carried recurrence takes that long to come round";
     else if (resMinII >= minII && binding.witness)
       info(Stage::Sched, binding.witness)
-          << "II cannot go below " << resMinII
-          << " here: one iteration takes " << binding.demand
-          << " slots of a resource serving " << binding.limit
+          << "II cannot go below " << resMinII << " here: one iteration takes "
+          << binding.demand << " slots of a resource serving " << binding.limit
           << " per cycle. Banking or replicating what this access reaches is "
              "what lowers that bound";
   }

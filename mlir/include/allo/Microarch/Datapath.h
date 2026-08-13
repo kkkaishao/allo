@@ -908,12 +908,13 @@ struct RegionBlock {
   // Composition predecessors: the earlier top-level sibling regions this one
   // must start after, set by `recordSiblingDeps`. Only top-level regions
   // populate it, container children staying serial. A region depends on an
-  // earlier sibling iff they touch a shared memref (a data hazard or a
-  // read-port conflict) or a cross-region SSA edge (a scalar survivor);
-  // functional units are auto-disjoint under per-region binding, so memory is
-  // the only cross-region resource. A region with no predecessors starts
-  // concurrently with the kernel, one with predecessors on their joined `done`.
-  // Producers precede consumers in program order, so the relation is a DAG.
+  // earlier sibling iff they touch a shared memref with a hazard between them
+  // (RAW / WAW / WAR; read-read pairs overlap and take separate ports), a
+  // shared stream, or a cross-region SSA edge (a scalar survivor); functional
+  // units are auto-disjoint under per-region binding, so memory is the only
+  // cross-region resource. A region with no predecessors starts concurrently
+  // with the kernel, one with predecessors on their joined `done`. Producers
+  // precede consumers in program order, so the relation is a DAG.
   llvm::SmallVector<RegionId, 2> predecessors;
 
   // Region nesting. A container region drives its `children` in its body; each
@@ -1066,12 +1067,13 @@ struct Datapath {
   /// nullopt takes both, writes before reads.
   ///
   /// Conservative in the safe direction. Only an ordering the model already
-  /// proves separates a pair: two top-level regions touching one array are
-  /// ordered by `recordSiblingDeps`, which `build()` runs before any caller of
-  /// this; two calls by `recordCallDeps` unless a channel joins them in a
-  /// concurrent container; two region-local accesses at different modulo
-  /// residues never share a cycle; and two accesses committing to different
-  /// banks contend for nothing. Anything else counts as simultaneous.
+  /// proves separates a pair: two top-level regions are separated by a path in
+  /// the sibling DAG (`recordSiblingDeps`, run by `build()` before any caller
+  /// of this); two calls by a `recordCallDeps` edge or by disjoint
+  /// TimeTriggered contract intervals of one scheduled region; two
+  /// region-local accesses at different modulo residues never share a cycle;
+  /// and two accesses committing to different banks contend for nothing.
+  /// Anything else counts as simultaneous.
   PortRelation portGraph(MemId id, std::optional<bool> writes) const;
 
   /// A lower bound on the accesses of \p id in direction \p writes that one

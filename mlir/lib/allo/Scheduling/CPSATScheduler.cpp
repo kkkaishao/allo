@@ -248,10 +248,9 @@ unsigned demandWithHeadroom(ProblemT &prob, Problem::ResourceType rsrc,
   double slack = cycleTime;
   for (Operation *op : prob.getOperations())
     if (prob.usesResource(op, rsrc))
-      slack = std::min(slack, double(cycleTime) -
-                                  *prob.getStartTimeInCycle(op) -
-                                  *prob.getIncomingDelay(
-                                      *prob.getLinkedOperatorType(op)));
+      slack = std::min(
+          slack, double(cycleTime) - *prob.getStartTimeInCycle(op) -
+                     *prob.getIncomingDelay(*prob.getLinkedOperatorType(op)));
   unsigned n = prob.demandFor(rsrc, ii);
   while (n < unit->ceiling && unit->headroomNs[n] > slack)
     ++n;
@@ -291,8 +290,7 @@ SmallVector<AllocationVar> allocationVars(CpModelBuilder &model, ProblemT &prob,
     for (double ns : unit->headroomNs)
       cone.push_back(picos(ns));
     if (int64_t top = *llvm::max_element(cone)) {
-      alloc.headroom =
-          model.NewIntVar(operations_research::Domain(0, top));
+      alloc.headroom = model.NewIntVar(operations_research::Domain(0, top));
       model.AddElement(n, cone, *alloc.headroom);
     }
     allocs.push_back(alloc);
@@ -602,8 +600,8 @@ int64_t drainFloor(ProblemT &prob, const Chaining &chaining,
         if (c.head < first.head)
           continue;
         work += c.demand;
-        best =
-            std::max(best, first.head + (work + limit - 1) / limit - 1 + c.tail);
+        best = std::max(best,
+                        first.head + (work + limit - 1) / limit - 1 + c.tail);
       }
     }
     return best;
@@ -703,7 +701,8 @@ LogicalResult mlir::allo::scheduleCPSAT(ChainingSharedOperatorsProblem &prob,
   bool allocates = false;
   for (Problem::ResourceType rsrc : prob.getResourceTypes())
     allocates |= prob.getAllocatable(rsrc).has_value();
-  if (!allocates && drainFloor(prob, chaining, span.drain) >= span.drainOf(prob))
+  if (!allocates &&
+      drainFloor(prob, chaining, span.drain) >= span.drainOf(prob))
     return success();
 
   // Horizon: the whole region laid out end to end (each op after the previous
@@ -1058,11 +1057,10 @@ LogicalResult mlir::allo::scheduleCPSAT(ChainingModuloProblem &prob,
     Allocated decided;
     bool proven = false;
     int64_t drain = 0;
-    ModuloOutcome outcome = solveAtII(prob, lastOp, chaining, cycleTime, span,
-                                      opts, drainBound, ii,
-                                      window + ii * contending,
-                                      /*hint=*/warm.placed && ii == greedyII,
-                                      starts, decided, proven, drain);
+    ModuloOutcome outcome = solveAtII(
+        prob, lastOp, chaining, cycleTime, span, opts, drainBound, ii,
+        window + ii * contending,
+        /*hint=*/warm.placed && ii == greedyII, starts, decided, proven, drain);
     if (outcome == ModuloOutcome::Infeasible) {
       // INFEASIBLE is a proof only where nothing bounded the solve; under the
       // incumbent's bound it is the weaker "nothing here beats it".
@@ -1196,7 +1194,7 @@ mlir::allo::solveSharing(SharingProblem &problem, ArrayRef<unsigned> hint,
     return assign;
 
   CpModelBuilder model;
-  SmallVector<BoolVar> rep(n); // the unit keeps its own instance
+  SmallVector<BoolVar> rep(n);            // the unit keeps its own instance
   llvm::DenseMap<uint64_t, BoolVar> join; // j * n + i: unit i runs on unit j
   for (unsigned i = 0; i < n; ++i)
     rep[i] = model.NewBoolVar();

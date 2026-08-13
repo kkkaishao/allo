@@ -166,16 +166,39 @@ std::optional<int64_t> composeSequence(llvm::ArrayRef<SpanNode> nodes);
 ///
 /// Three signals, the same three the emitter composes on
 /// (`DatapathBuilder::recordSiblingDeps`): a shared memref, a shared stream
-/// channel, and a cross-region SSA use. Everything else runs CONCURRENTLY.
+/// channel, and a cross-region SSA use. A shared memref orders only its hazard
+/// pairs (RAW / WAW / WAR): two nodes that only READ it overlap, and
+/// `Datapath::portGraph` prices the separate ports that takes. A stream's
+/// token order is the program's, so its touchers are ordered regardless of
+/// direction, and a skewed layout keeps every toucher ordered (its lanes
+/// share a port per slot across regions). Everything else runs CONCURRENTLY.
 ///
-/// Deliberately CONSERVATIVE, and it has to stay that way: a value merely
-/// PASSED through a node counts as a touch, and two nodes that only READ one
-/// array are still ordered, because they share its ports. A spurious edge only
-/// serializes the model; a missing one claims an overlap the hardware does not
-/// have. `RegionGraph`'s polyhedral refinement is therefore NOT used here: it
-/// drops exactly the edges the emitter keeps.
+/// The edges must MATCH what `recordSiblingDeps` builds: the span is published
+/// as an exact contract, so a spurious edge here reports a hand-off the
+/// hardware overlaps, and a missing one claims an overlap it does not have.
+/// `RegionGraph`'s polyhedral refinement is therefore NOT used here: it drops
+/// edges the emitter keeps.
 std::vector<llvm::SmallVector<unsigned, 2>>
 siblingPredecessors(llvm::ArrayRef<llvm::SmallVector<Operation *>> nodeOps);
+
+/// One node's (or region's) touch of a shared array, for `hazardEdges`.
+struct MemTouch {
+  unsigned node;
+  bool writes;
+  /// The statically-resolved bank, or nullopt for a touch that may reach any
+  /// (a crossbar access, a child's mastered port).
+  std::optional<int64_t> bank;
+};
+
+/// Invoke \p addPred(p, c), p <= c skipped when equal, for each pair of
+/// \p touch (sorted by node) the hazard rule orders: per bank, each reader
+/// after the last writer and each writer after every reader since. A bank is
+/// its own storage, so touches of different banks never pair; a bank-less
+/// touch joins every bank. Read-read pairs stay unordered. The one edge rule
+/// `siblingPredecessors` and `DatapathBuilder::recordSiblingDeps` both
+/// compose on, which is what keeps the span and the hardware in lock-step.
+void hazardEdges(llvm::ArrayRef<MemTouch> touch,
+                 llvm::function_ref<void(unsigned, unsigned)> addPred);
 
 /// A func's top-level span: its regions composed over their dependence DAG.
 ///

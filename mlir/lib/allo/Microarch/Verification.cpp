@@ -828,8 +828,8 @@ validateDatapath(dcp::DCPathModuleOp func, const Datapath &dp, float cycleTime,
   // of the traversal that already visits every priced cell.
   std::vector<TimingPath> paths;
   if (failed(checkInputLegality(func, dp)) ||
-      failed(checkEmitterSubset(func, dp, cycleTime, lib, plannedBinding,
-                                paths)))
+      failed(
+          checkEmitterSubset(func, dp, cycleTime, lib, plannedBinding, paths)))
     return failure();
 
   // A hundredth of a nanosecond, the grid the schedule's own delays are given

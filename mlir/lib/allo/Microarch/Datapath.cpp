@@ -423,6 +423,28 @@ Datapath::PortRelation Datapath::portGraph(MemId id,
           add({topOf(cu.region), cu.region, 0, int(cu.id), bankOf(ma.bank)},
               kNoAccess, dir, ma.independent);
   }
+  // Does top-level region \p a transitively precede \p b (a < b)? The sibling
+  // DAG (`recordSiblingDeps`) orders hazard pairs only, so two tops with no
+  // path between them really do overlap. Memoized, as `callPrecedes` is.
+  llvm::DenseMap<std::pair<RegionId, RegionId>, bool> topReach;
+  auto topPrecedes = [&](RegionId a, RegionId b) {
+    auto [it, isNew] = topReach.try_emplace({a, b}, false);
+    if (!isNew)
+      return it->second;
+    llvm::SmallVector<RegionId> work{b};
+    llvm::SmallDenseSet<RegionId> seen{b};
+    while (!work.empty()) {
+      RegionId r = work.pop_back_val();
+      for (RegionId p : regions[r].predecessors) {
+        if (p == a)
+          return topReach[{a, b}] = true;
+        if (seen.insert(p).second)
+          work.push_back(p);
+      }
+    }
+    return false;
+  };
+
   // A container drives its children serially, so two accesses in different
   // regions under one top are ordered UNLESS a concurrent container is in the
   // chain, which places every child at 0.
@@ -439,10 +461,28 @@ Datapath::PortRelation Datapath::portGraph(MemId id,
     // contend for nothing however they are scheduled.
     if (a.bank >= 0 && b.bank >= 0 && a.bank != b.bank)
       return false;
+    // Under different top-level ancestors the sibling DAG decides: an ordered
+    // pair hands off, an unordered one runs concurrently.
     if (a.top != b.top)
-      return false;
-    if (a.call >= 0 && b.call >= 0)
-      return !callPrecedes(a.call, b.call) && !callPrecedes(b.call, a.call);
+      return !topPrecedes(std::min(a.top, b.top), std::max(a.top, b.top));
+    if (a.call >= 0 && b.call >= 0) {
+      if (callPrecedes(a.call, b.call) || callPrecedes(b.call, a.call))
+        return false;
+      // An unordered pair of one SCHEDULED region still cannot meet when the
+      // earlier contract drains before the later release: a TimeTriggered
+      // child runs exactly [start, start+latency), and no child of such a
+      // region is released before its placed cycle (`startForCall`).
+      const CallUnit &x = calls[a.call], &y = calls[b.call];
+      auto apart = [](const CallUnit &p, const CallUnit &q) {
+        return p.startPolicy == CallUnit::StartPolicy::TimeTriggered &&
+               p.latency &&
+               int64_t(p.start) + std::max<int64_t>(*p.latency, 1) <=
+                   int64_t(q.start);
+      };
+      return x.region != y.region ||
+             regions[x.region].determinacy == DeterminacyEnum::Concurrent ||
+             (!apart(x, y) && !apart(y, x));
+    }
     if (a.call < 0 && b.call < 0) {
       if (a.region == b.region)
         return a.residue == b.residue;

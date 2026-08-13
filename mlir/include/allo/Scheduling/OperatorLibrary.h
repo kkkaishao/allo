@@ -552,13 +552,14 @@ void populateOperatorAllocation(ProblemT &problem, const OperatorLibrary &lib) {
     for (unsigned n = 1; n < ceiling; ++n) {
       unsigned members = (ceiling + n - 1) / n;
       unsigned arms = members + std::min(members, cls.carried);
-      headroom[n] = muxCone(
-          lib, arms, static_cast<unsigned>(std::max<int64_t>(1, cls.portWidth)));
+      headroom[n] =
+          muxCone(lib, arms,
+                  static_cast<unsigned>(std::max<int64_t>(1, cls.portWidth)));
     }
     Problem::ResourceType rsrc = problem.getOrInsertResourceType(key);
-    problem.setAllocatable(rsrc,
-                           typename ProblemT::AllocatableUnit{
-                               ceiling, std::move(price), std::move(headroom)});
+    problem.setAllocatable(
+        rsrc, typename ProblemT::AllocatableUnit{ceiling, std::move(price),
+                                                 std::move(headroom)});
     for (Operation *op : cls.ops) {
       llvm::SmallVector<Problem::ResourceType> units;
       if (auto linked = problem.getLinkedResourceTypes(op))
