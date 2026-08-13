@@ -343,6 +343,7 @@ private:
 LogicalResult checkCombPathsMeetPeriod(dcp::DCPathModuleOp func,
                                        const Datapath &dp, float cycleTime,
                                        const OperatorLibrary &lib,
+                                       bool plannedBinding,
                                        std::vector<TimingPath> &paths) {
   // One picosecond of slop, the resolution the scheduler's own model carries.
   constexpr double kSlop = 1e-3;
@@ -374,6 +375,14 @@ LogicalResult checkCombPathsMeetPeriod(dcp::DCPathModuleOp func,
     double slack = unitSlack(u, cycleTime);
     if (mux <= slack + kSlop)
       continue;
+    // A planned fold realizes the solve's own allocation, and the solve held
+    // `z + inDelay + headroom(N) <= period` for every operation it folded, so
+    // an overrun here is a broken contract between the two, not a refusal. The
+    // refusal below still stands in a release build.
+    assert(!plannedBinding &&
+           "a planned binding grew a select cone past the period the schedule "
+           "solve reserved headroom for; the allocation headroom model "
+           "(`addAllocationHeadroom`) and the emitted cone disagree");
     // Anchor on the tightest bound op, the one the slack came from.
     const FuncUnit::BoundOp *worst = &u.boundOps.front();
     for (const FuncUnit::BoundOp &bo : u.boundOps)
@@ -546,6 +555,7 @@ LogicalResult checkCombPathsMeetPeriod(dcp::DCPathModuleOp func,
 
 LogicalResult checkEmitterSubset(dcp::DCPathModuleOp func, const Datapath &dp,
                                  float cycleTime, const OperatorLibrary &lib,
+                                 bool plannedBinding,
                                  std::vector<TimingPath> &paths) {
   // An unresolved (None) Source is a cross-region SSA hand-off the builder
   // could not thread; reject it here rather than asserting in `resolveSource`.
@@ -619,7 +629,8 @@ LogicalResult checkEmitterSubset(dcp::DCPathModuleOp func, const Datapath &dp,
   // store's write-enable by `issue & cond`, so a doomed exit iteration commits
   // nothing.
 
-  return checkCombPathsMeetPeriod(func, dp, cycleTime, lib, paths);
+  return checkCombPathsMeetPeriod(func, dp, cycleTime, lib, plannedBinding,
+                                  paths);
 }
 
 //===----------------------------------------------------------------------===//
@@ -806,7 +817,7 @@ void assertModelInvariants(const Datapath &dp) {
 
 FailureOr<std::vector<TimingPath>>
 validateDatapath(dcp::DCPathModuleOp func, const Datapath &dp, float cycleTime,
-                 const OperatorLibrary &lib) {
+                 const OperatorLibrary &lib, bool plannedBinding) {
   // The builder already reported the offending edge, and the depths it left
   // are placeholders, so nothing below would measure the design as asked for.
   if (dp.infeasible)
@@ -817,7 +828,8 @@ validateDatapath(dcp::DCPathModuleOp func, const Datapath &dp, float cycleTime,
   // of the traversal that already visits every priced cell.
   std::vector<TimingPath> paths;
   if (failed(checkInputLegality(func, dp)) ||
-      failed(checkEmitterSubset(func, dp, cycleTime, lib, paths)))
+      failed(checkEmitterSubset(func, dp, cycleTime, lib, plannedBinding,
+                                paths)))
     return failure();
 
   // A hundredth of a nanosecond, the grid the schedule's own delays are given

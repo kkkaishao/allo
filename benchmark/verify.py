@@ -342,8 +342,9 @@ def main():
         "--binding",
         default="trivial,greedy-share",
         help="comma-separated axis: 'trivial' (one unit per op), 'greedy-share' "
-        "(fold every compatible pair) or 'planned' (the allocation the scheduler "
-        "decided, which needs --scheduler exact to be anything else)",
+        "(fold every compatible pair), 'exact-share' (one CP-SAT fold solve per "
+        "region) or 'planned' (the allocation the scheduler decided, which "
+        "needs --scheduler exact to be anything else)",
     )
     ap.add_argument(
         "--scheduler",

@@ -36,9 +36,12 @@ LogicalResult checkInputLegality(dcp::DCPathModuleOp func, const Datapath &dp);
 /// \p lib prices the muxes and the units they feed. `logging::unsupported`
 /// where a binding can be withdrawn; elsewhere the path is reported and not
 /// refused, missing a target period being a quality-of-result finding rather
-/// than an illegal design.
+/// than an illegal design. \p plannedBinding says the folds realize the
+/// schedule solve's own allocation, which reserved headroom for every select
+/// it bought, so a unit overrun is a broken invariant instead of a refusal.
 LogicalResult checkEmitterSubset(dcp::DCPathModuleOp func, const Datapath &dp,
                                  float cycleTime, const OperatorLibrary &lib,
+                                 bool plannedBinding,
                                  std::vector<TimingPath> &paths);
 
 /// Invariants an upstream pass owns, asserted at this seam. `assert` only, so
@@ -50,10 +53,9 @@ void assertModelInvariants(const Datapath &dp);
 /// the report publishes and the QoR turns into a clock. Structures nobody
 /// prices are not in them, so they estimate and never substitute for place and
 /// route. Never empty: a module with no datapath still holds one register hop.
-FailureOr<std::vector<TimingPath>> validateDatapath(dcp::DCPathModuleOp func,
-                                                    const Datapath &dp,
-                                                    float cycleTime,
-                                                    const OperatorLibrary &lib);
+FailureOr<std::vector<TimingPath>>
+validateDatapath(dcp::DCPathModuleOp func, const Datapath &dp, float cycleTime,
+                 const OperatorLibrary &lib, bool plannedBinding);
 
 } // namespace mlir::allo::uarch
 

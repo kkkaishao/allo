@@ -12,12 +12,15 @@
 
 #include "allo/Microarch/Reservation.h"
 #include "allo/Scheduling/OperatorLibrary.h" // combParamWidth, muxCone's rows
+#include "allo/Scheduling/Scheduler.h"       // solveSharing
 
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/MapVector.h"
 #include "llvm/ADT/STLExtras.h"
 
 #include <algorithm>
+#include <cmath>
+#include <map>
 
 namespace mlir::allo::uarch {
 
@@ -127,53 +130,149 @@ private:
   llvm::SmallVector<double> memo;
 };
 
+/// First-fit sharing for one region: for each unit, the region-local index of
+/// the unit it runs on, its own where unshared — the shape `solveSharing`
+/// returns, so the greedy plan can seed it.
+llvm::SmallVector<unsigned> greedyShare(const Datapath &dp,
+                                        const RegionBlock &rb,
+                                        const BindingContext &ctx) {
+  ShareCone cone(dp, rb, ctx);
+  // Each bin is one physical unit's ops, indexed as `rb.units`. `arms` is the
+  // mux the bin has grown: one source per member, plus one for each member
+  // that re-injects a reduction identity on its own arm.
+  struct Bin {
+    llvm::SmallVector<unsigned, 2> members;
+    unsigned arms = 0;
+  };
+  llvm::SmallVector<Bin> bins;
+  for (unsigned i = 0, e = rb.units.size(); i < e; ++i) {
+    const FuncUnit &u = dp.units[rb.units[i]];
+    auto ru = reservationOf(rb, u, u.boundOps.front().residue);
+    unsigned own = readsRecurrence(rb, u.repOp()) ? 2 : 1;
+    Bin *dest = nullptr;
+    for (Bin &bin : bins) {
+      if (dp.units[rb.units[bin.members.front()]].identity != u.identity)
+        continue;
+      bool free = llvm::all_of(bin.members, [&](unsigned m) {
+        const FuncUnit &mu = dp.units[rb.units[m]];
+        return reservationsDisjoint(
+            reservationOf(rb, mu, mu.boundOps.front().residue), ru);
+      });
+      if (free && cone.tryFold(bin.members, i, bin.arms + own)) {
+        dest = &bin;
+        break;
+      }
+    }
+    if (dest) {
+      dest->members.push_back(i);
+      dest->arms += own;
+    } else {
+      bins.push_back({{i}, own});
+    }
+  }
+  llvm::SmallVector<unsigned> assign(rb.units.size());
+  for (Bin &bin : bins)
+    for (unsigned m : bin.members)
+      assign[m] = bin.members.front();
+  return assign;
+}
+
+/// The groups \p assign folds, appended to \p groups in representative order.
+void appendGroups(const RegionBlock &rb, llvm::ArrayRef<unsigned> assign,
+                  std::vector<llvm::SmallVector<UnitId, 2>> &groups) {
+  llvm::MapVector<unsigned, llvm::SmallVector<UnitId, 2>> byRep;
+  for (auto [i, rep] : llvm::enumerate(assign))
+    byRep[rep].push_back(rb.units[i]);
+  for (auto &[rep, group] : byRep)
+    if (group.size() > 1)
+      groups.push_back(std::move(group));
+}
+
+/// One region as a `SharingProblem`: the arrays `ShareCone` reads, priced with
+/// the rows the emit gate walks. The cone tables round up and the slacks down,
+/// so an admitted fold clears `checkCombPathsMeetPeriod` by construction.
+SharingProblem sharingProblemOf(const Datapath &dp, const RegionBlock &rb,
+                                const BindingContext &ctx) {
+  SharingProblem problem;
+  problem.units.resize(rb.units.size());
+  llvm::DenseMap<Operation *, unsigned> owner;
+  for (auto [i, uid] : llvm::enumerate(rb.units))
+    owner[dp.units[uid].repOp()] = i;
+  std::map<std::string, unsigned> classIdx;
+  llvm::SmallVector<llvm::SmallVector<unsigned>> members;
+  for (auto [i, uid] : llvm::enumerate(rb.units)) {
+    const FuncUnit &u = dp.units[uid];
+    auto [it, isNew] = classIdx.try_emplace(u.identity.key(), members.size());
+    if (isNew)
+      members.emplace_back();
+    members[it->second].push_back(i);
+    SharingProblem::Unit &unit = problem.units[i];
+    unit.cls = it->second;
+    unit.ownArms = readsRecurrence(rb, u.repOp()) ? 2 : 1;
+    unit.slackPicos = std::max<int64_t>(
+        0, std::floor(unitSlack(u, ctx.cycleTime) * 1000.0));
+    Operation *y = u.repOp();
+    for (Value v : y->getOperands()) {
+      Operation *x = v.getDefiningOp();
+      auto o = x ? owner.find(x) : owner.end();
+      if (o != owner.end() && !dcpLatency(x) && dcpStart(x) == dcpStart(y))
+        unit.preds.push_back(o->second);
+    }
+  }
+  problem.classes.resize(members.size());
+  for (auto [cls, mem] : llvm::enumerate(members)) {
+    Operation *y = dp.units[rb.units[mem.front()]].repOp();
+    auto width = static_cast<unsigned>(std::max<int64_t>(1, combParamWidth(y)));
+    auto ports = static_cast<int64_t>(y->getNumOperands());
+    SharingProblem::UnitClass &c = problem.classes[cls];
+    c.instancePrice =
+        ctx.lib.instancePrice(dp.units[rb.units[mem.front()]].identity, width);
+    unsigned maxArms = 0;
+    for (unsigned m : mem)
+      maxArms += problem.units[m].ownArms;
+    c.muxPrice.resize(maxArms + 1, 0);
+    c.conePicos.resize(maxArms + 1, 0);
+    for (unsigned a = 2; a <= maxArms; ++a) {
+      c.muxPrice[a] = ports * ctx.lib.muxPrice(a, width);
+      c.conePicos[a] =
+          static_cast<int64_t>(std::ceil(muxCone(ctx.lib, a, width) * 1000.0));
+    }
+    for (unsigned p = 0; p < mem.size(); ++p) {
+      const FuncUnit &a = dp.units[rb.units[mem[p]]];
+      auto ra = reservationOf(rb, a, a.boundOps.front().residue);
+      for (unsigned q = p + 1; q < mem.size(); ++q) {
+        const FuncUnit &b = dp.units[rb.units[mem[q]]];
+        if (!reservationsDisjoint(
+                ra, reservationOf(rb, b, b.boundOps.front().residue)))
+          problem.conflicts.push_back({mem[p], mem[q]});
+      }
+    }
+  }
+  return problem;
+}
+
 } // namespace
 
 std::vector<llvm::SmallVector<UnitId, 2>>
 GreedyShareBinding::plan(const Datapath &dp, const BindingContext &ctx) const {
   std::vector<llvm::SmallVector<UnitId, 2>> groups;
+  for (const RegionBlock &rb : dp.regions)
+    appendGroups(rb, greedyShare(dp, rb, ctx), groups);
+  return groups;
+}
+
+std::vector<llvm::SmallVector<UnitId, 2>>
+ExactShareBinding::plan(const Datapath &dp, const BindingContext &ctx) const {
+  std::vector<llvm::SmallVector<UnitId, 2>> groups;
+  bool exact = hasExactScheduler();
   for (const RegionBlock &rb : dp.regions) {
-    ShareCone cone(dp, rb, ctx);
-    // Each bin is one physical unit's ops, indexed as `rb.units`. `arms` is the
-    // mux the bin has grown: one source per member, plus one for each member
-    // that re-injects a reduction identity on its own arm.
-    struct Bin {
-      llvm::SmallVector<unsigned, 2> members;
-      unsigned arms = 0;
-    };
-    llvm::SmallVector<Bin> bins;
-    for (unsigned i = 0, e = rb.units.size(); i < e; ++i) {
-      const FuncUnit &u = dp.units[rb.units[i]];
-      auto ru = reservationOf(rb, u, u.boundOps.front().residue);
-      unsigned own = readsRecurrence(rb, u.repOp()) ? 2 : 1;
-      Bin *dest = nullptr;
-      for (Bin &bin : bins) {
-        if (dp.units[rb.units[bin.members.front()]].identity != u.identity)
-          continue;
-        bool free = llvm::all_of(bin.members, [&](unsigned m) {
-          const FuncUnit &mu = dp.units[rb.units[m]];
-          return reservationsDisjoint(
-              reservationOf(rb, mu, mu.boundOps.front().residue), ru);
-        });
-        if (free && cone.tryFold(bin.members, i, bin.arms + own)) {
-          dest = &bin;
-          break;
-        }
-      }
-      if (dest) {
-        dest->members.push_back(i);
-        dest->arms += own;
-      } else {
-        bins.push_back({{i}, own});
-      }
+    llvm::SmallVector<unsigned> assign = greedyShare(dp, rb, ctx);
+    if (exact) {
+      SharingProblem problem = sharingProblemOf(dp, rb, ctx);
+      if (auto solved = solveSharing(problem, assign, rb.op))
+        assign = std::move(*solved);
     }
-    for (Bin &bin : bins)
-      if (bin.members.size() > 1) {
-        llvm::SmallVector<UnitId, 2> group;
-        for (unsigned m : bin.members)
-          group.push_back(rb.units[m]);
-        groups.push_back(std::move(group));
-      }
+    appendGroups(rb, assign, groups);
   }
   return groups;
 }
@@ -201,6 +300,8 @@ std::unique_ptr<BindingPolicy> bindingPolicyFor(llvm::StringRef name) {
     return std::make_unique<TrivialBinding>();
   if (name == "greedy-share")
     return std::make_unique<GreedyShareBinding>();
+  if (name == "exact-share")
+    return std::make_unique<ExactShareBinding>();
   if (name == "planned")
     return std::make_unique<PlannedBinding>();
   return nullptr;

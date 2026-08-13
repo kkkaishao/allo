@@ -61,7 +61,7 @@ class RTL(Backend[P, R]):
         device: Device | None = None,
         freq_mhz: float | None = None,
         simulator: str = "verilator",
-        binding: str = "trivial",
+        binding: str | None = None,
     ):
         """Build an RTL handle for one hardware configuration.
 
@@ -76,11 +76,17 @@ class RTL(Backend[P, R]):
             freq_mhz: target frequency, overriding the device default. Drives
                 both the SDC cycle time and the cosim clock.
             simulator: the engine cocotb drives for ``cosim``.
-            binding: operator-sharing policy. ``"trivial"`` gives every
-                operation its own unit; ``"greedy-share"`` folds every
-                compatible pair the clock allows; ``"planned"`` builds the
-                allocation the scheduler decided, which only an exact scheduler
-                makes, so under the heuristic it is the trivial binding.
+            binding: operator-sharing policy. ``None`` (the default) follows
+                the scheduler, resolved when the schedule is built: an exact
+                scheduler binds ``"planned"``, the heuristic ``"exact-share"``.
+                ``"trivial"`` gives every operation its own unit;
+                ``"greedy-share"`` folds every compatible pair the clock
+                allows; ``"exact-share"`` decides the folds with one CP-SAT
+                solve per region, minimizing modelled area under the clock
+                (without OR-Tools it degrades to the greedy plan);
+                ``"planned"`` builds the allocation the scheduler decided,
+                which only an exact scheduler makes, so under the heuristic it
+                is the trivial binding.
         """
         super().__init__(kernel)
         self._device = device if device is not None else default_device
@@ -146,6 +152,16 @@ class RTL(Backend[P, R]):
         II, latency and per-op start times. Computed once and reused by
         ``compile()``, so it always describes the RTL that ``cosim`` runs."""
         if self._schedule_result is None:
+            # The default binding follows the scheduler, settled here because
+            # this is where the knobs stop turning: the exact solve carries its
+            # own allocation with its headroom, so `planned` realizes it; the
+            # heuristic decides none, so `exact-share` solves the fold instead.
+            if self.binding is None:
+                self.binding = (
+                    "exact-share"
+                    if self._sched_opts.scheduler == "heuristic"
+                    else "planned"
+                )
             # The schedule is reified in place, so it runs on a copy. Operator
             # and device timing is injected into that copy only, keeping the CPU
             # functional path clear of it.

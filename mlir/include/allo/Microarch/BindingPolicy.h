@@ -46,6 +46,16 @@ struct GreedyShareBinding : BindingPolicy {
   plan(const Datapath &dp, const BindingContext &ctx) const override;
 };
 
+/// Exact within-region sharing: the same fold domain as `GreedyShareBinding`,
+/// decided by one CP-SAT solve per region (`solveSharing`) minimizing modelled
+/// area, with every input cone held to the period under the same recursion the
+/// emit-side gate walks. The greedy plan seeds the solve, and stands in for it
+/// in a build without OR-Tools.
+struct ExactShareBinding : BindingPolicy {
+  std::vector<llvm::SmallVector<UnitId, 2>>
+  plan(const Datapath &dp, const BindingContext &ctx) const override;
+};
+
 /// Build the allocation the scheduler decided: fold together every unit whose
 /// bound op names the same `dcp.compute` `unit` symbol. An op the scheduler
 /// left unallocated names no symbol and keeps its own unit.
@@ -54,8 +64,8 @@ struct PlannedBinding : BindingPolicy {
   plan(const Datapath &dp, const BindingContext &ctx) const override;
 };
 
-/// The policy named by a pass option ("trivial" / "greedy-share" / "planned");
-/// null on an unknown name.
+/// The policy named by a pass option ("trivial" / "greedy-share" /
+/// "exact-share" / "planned"); null on an unknown name.
 std::unique_ptr<BindingPolicy> bindingPolicyFor(llvm::StringRef name);
 
 } // namespace mlir::allo::uarch

@@ -82,13 +82,13 @@ static unsigned compRegBits(hw::HWModuleOp mod) {
 static FailureOr<std::pair<hw::HWModuleOp, iface::ModuleInterface>>
 emitModule(const uarch::Datapath &dp, OpBuilder &b,
            llvm::StringMap<Operation *> &opModules, float cycleTime,
-           const OperatorLibrary &lib, MicroarchReport &report,
-           const uarch::CalleeCtx &callees) {
+           const OperatorLibrary &lib, bool plannedBinding,
+           MicroarchReport &report, const uarch::CalleeCtx &callees) {
   auto *ctx = b.getContext();
   dcp::DCPathModuleOp func = dp.func;
   Location loc = func.getLoc();
   FailureOr<std::vector<uarch::TimingPath>> criticalPaths =
-      validateDatapath(func, dp, cycleTime, lib);
+      validateDatapath(func, dp, cycleTime, lib, plannedBinding);
   if (failed(criticalPaths))
     return failure();
 
@@ -175,7 +175,8 @@ LogicalResult emitDatapathToHW(ModuleOp module, StringRef binding,
   if (!policy) {
     error(Stage::Emit, Code::UnknownOption, module)
         << "Unknown binding policy '" << binding
-        << "'; the policies are 'trivial', 'greedy-share' and 'planned'";
+        << "'; the policies are 'trivial', 'greedy-share', 'exact-share' and "
+           "'planned'";
     return failure();
   }
 
@@ -251,8 +252,8 @@ LogicalResult emitDatapathToHW(ModuleOp module, StringRef binding,
       dp.dump(llvm::dbgs());
     });
     b.setInsertionPoint(f);
-    auto pairOr =
-        emitModule(dp, b, opModules, cycleTime, dev.operators, report, cc);
+    auto pairOr = emitModule(dp, b, opModules, cycleTime, dev.operators,
+                             binding == "planned", report, cc);
     if (failed(pairOr))
       return failure();
     registerModule(f.getSymName(), pairOr->first, std::move(pairOr->second));

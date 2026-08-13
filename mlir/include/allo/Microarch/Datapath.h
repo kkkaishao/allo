@@ -690,25 +690,6 @@ struct Mux {
   Type type;           // the muxed value's type, whose width prices the select
 };
 
-/// The combinational depth, in LUT levels, of the select a mux of \p sources
-/// sources costs: `ceil(log2 k)`, since the emitter builds a one-hot AND-OR
-/// reduction (`EmitContext::oneHotSelect`) and each level halves the term
-/// count. Zero for a single source, which is a wire.
-unsigned muxLevels(unsigned sources);
-
-/// A safety factor on the formula fallback below, sized from the gap a
-/// one-bit OR row leaves on a wide select. Unused on a device with a measured
-/// `dcp.mux` delay row.
-inline constexpr double kMuxDelayMargin = 1.4;
-
-/// The routed marginal delay of a one-hot select over \p sources arms of
-/// \p width bits, in ns: the device's measured `dcp.mux` delay row, clamped
-/// to its measured domain (fan-in past the sweep grows one LUT level per
-/// several-fold, which the clamp under-counts slightly). A device without the
-/// row is priced at `muxLevels` times a margined one-bit OR row, the
-/// conservative direction. Zero for a single source, which is a wire.
-double muxCone(const OperatorLibrary &lib, unsigned sources, unsigned width);
-
 /// The sub-cycle room \p u's bound ops have left, in ns: the smallest
 /// `cycleTime - z - inDelay` over them, both read off the model. This bounds
 /// the combinational delay binding may add in front of the unit. Never negative

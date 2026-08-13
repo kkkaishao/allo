@@ -111,10 +111,14 @@ int64_t picos(double ns) { return std::llround(ns * kPicosPerNs); }
 /// Only def-use edges carry a combinational path; an auxiliary edge (memory
 /// order, stream order, loop-carried recurrence) always passes through a port
 /// or register.
+///
+/// Returns the per-operation sub-cycle variables, for constraints stated on
+/// top of the system (`addAllocationHeadroom`).
 template <class ProblemT>
-void addSubCycleTimes(CpModelBuilder &model, ProblemT &prob,
-                      DenseMap<Operation *, IntVar> &startVars, float cycleTime,
-                      float regFloor) {
+DenseMap<Operation *, IntVar>
+addSubCycleTimes(CpModelBuilder &model, ProblemT &prob,
+                 DenseMap<Operation *, IntVar> &startVars, float cycleTime,
+                 float regFloor) {
   int64_t period = picos(cycleTime);
   // Nothing in a cycle starts before its operands leave a register, so the
   // fabric floor is every `z`'s lower bound. A chain from a registered producer
@@ -153,20 +157,24 @@ void addSubCycleTimes(CpModelBuilder &model, ProblemT &prob,
       LinearExpr ready = lat == 0 ? inCycle.at(src) + out : LinearExpr(out);
       model.AddGreaterOrEqual(inCycle.at(op), ready).OnlyEnforceIf(sameCycle);
     }
+  return inCycle;
 }
 
 /// State \p chaining on the model: a chain-breaking edge widens an existing
-/// precedence by one cycle; a period uses the sub-cycle encoding above.
+/// precedence by one cycle; a period uses the sub-cycle encoding above, whose
+/// variables are passed back (empty in the break-edge form).
 template <class ProblemT>
-void addChaining(CpModelBuilder &model, ProblemT &prob,
-                 DenseMap<Operation *, IntVar> &startVars,
-                 const Chaining &chaining, float regFloor) {
+DenseMap<Operation *, IntVar>
+addChaining(CpModelBuilder &model, ProblemT &prob,
+            DenseMap<Operation *, IntVar> &startVars, const Chaining &chaining,
+            float regFloor) {
   for (const Problem::Dependence &dep : chaining.breaks)
     model.AddLessOrEqual(startVars.at(dep.getSource()) +
                              prob.latencyOf(dep.getSource()) + 1,
                          startVars.at(dep.getDestination()));
   if (chaining.period)
-    addSubCycleTimes(model, prob, startVars, *chaining.period, regFloor);
+    return addSubCycleTimes(model, prob, startVars, *chaining.period, regFloor);
+  return DenseMap<Operation *, IntVar>();
 }
 
 /// Every operation's inputs settle within the period.
@@ -222,19 +230,47 @@ struct AllocationVar {
   /// what a fold saves and what it grows are in the model exactly.
   IntVar price;
   int64_t maxPrice = 0;
+  /// The fullest instance's select-cone delay in picoseconds, `headroomNs`
+  /// read at `units`; absent where no count this resource can take builds a
+  /// select.
+  std::optional<IntVar> headroom;
 };
+
+/// The tightest count of \p rsrc the schedule CURRENTLY on \p prob admits:
+/// the busiest-slot demand, opened until the select cone fits the sub-cycle
+/// slack that schedule leaves the resource's operations. Pairing this count
+/// with those start times satisfies the headroom constraint, so as a hint it
+/// stays a feasible point and as a fallback it stays buildable.
+template <class ProblemT>
+unsigned demandWithHeadroom(ProblemT &prob, Problem::ResourceType rsrc,
+                            unsigned ii, float cycleTime) {
+  auto unit = prob.getAllocatable(rsrc);
+  double slack = cycleTime;
+  for (Operation *op : prob.getOperations())
+    if (prob.usesResource(op, rsrc))
+      slack = std::min(slack, double(cycleTime) -
+                                  *prob.getStartTimeInCycle(op) -
+                                  *prob.getIncomingDelay(
+                                      *prob.getLinkedOperatorType(op)));
+  unsigned n = prob.demandFor(rsrc, ii);
+  while (n < unit->ceiling && unit->headroomNs[n] > slack)
+    ++n;
+  return n;
+}
 
 /// Declare `N_r` for every allocatable resource: how many copies of one
 /// operator this region builds, in `[1, ceiling]`. The caller states the
 /// capacity constraint against it.
 ///
 /// \p hint says the heuristic's start times are being hinted too, and then the
-/// count hinted is the TIGHTEST one those start times admit (what the greedy
-/// binder would have built from them), not the trivial one; on a region whose
-/// budget runs out, the hint is what ships.
-SmallVector<AllocationVar> allocationVars(CpModelBuilder &model,
-                                          OccupancyProblem &prob, unsigned ii,
-                                          bool hint) {
+/// count hinted is the TIGHTEST one those start times admit with the select
+/// cone charged (what the greedy binder could have built from them); on a
+/// region whose budget runs out, `applyDemandAllocation` ships that same
+/// count.
+template <class ProblemT>
+SmallVector<AllocationVar> allocationVars(CpModelBuilder &model, ProblemT &prob,
+                                          unsigned ii, bool hint,
+                                          float cycleTime) {
   SmallVector<AllocationVar> allocs;
   for (Problem::ResourceType rsrc : prob.getResourceTypes()) {
     auto unit = prob.getAllocatable(rsrc);
@@ -243,15 +279,61 @@ SmallVector<AllocationVar> allocationVars(CpModelBuilder &model,
     assert(unit->ceiling > 0 && "an allocatable resource with no operation");
     IntVar n = model.NewIntVar(operations_research::Domain(1, unit->ceiling));
     if (hint)
-      model.AddHint(n, prob.demandFor(rsrc, ii));
+      model.AddHint(n, demandWithHeadroom(prob, rsrc, ii, cycleTime));
     std::vector<int64_t> table(unit->price.begin(), unit->price.end());
     int64_t hi = *llvm::max_element(unit->price);
     IntVar price = model.NewIntVar(
         operations_research::Domain(*llvm::min_element(table), hi));
     model.AddElement(n, table, price);
-    allocs.push_back({rsrc, n, price, hi});
+    AllocationVar alloc{rsrc, n, price, hi, std::nullopt};
+    std::vector<int64_t> cone;
+    cone.reserve(unit->headroomNs.size());
+    for (double ns : unit->headroomNs)
+      cone.push_back(picos(ns));
+    if (int64_t top = *llvm::max_element(cone)) {
+      alloc.headroom =
+          model.NewIntVar(operations_research::Domain(0, top));
+      model.AddElement(n, cone, *alloc.headroom);
+    }
+    allocs.push_back(alloc);
   }
   return allocs;
+}
+
+/// Hold every operation of an allocatable operator to the period with the
+/// select cone its decided count implies: `z + inDelay + headroom(N) <=
+/// period`. This is what lets a `planned` binding realize the allocation as
+/// built: a count only shrinks where its multiplexer fits inside the slack the
+/// same solve leaves, so the emit-side gate has nothing left to refuse.
+///
+/// The break-edge chaining form carries no sub-cycle variables, so they are
+/// created here on demand; the break edges already keep the plain system
+/// satisfiable at any placement, so adding it tightens the model only by the
+/// headroom itself.
+template <class ProblemT>
+void addAllocationHeadroom(CpModelBuilder &model, ProblemT &prob,
+                           DenseMap<Operation *, IntVar> &startVars,
+                           DenseMap<Operation *, IntVar> &inCycle,
+                           ArrayRef<AllocationVar> allocs, float cycleTime,
+                           float regFloor) {
+  if (llvm::none_of(allocs, [](const AllocationVar &a) {
+        return a.headroom.has_value();
+      }))
+    return;
+  if (inCycle.empty())
+    inCycle = addSubCycleTimes(model, prob, startVars, cycleTime, regFloor);
+  int64_t period = picos(cycleTime);
+  for (const AllocationVar &alloc : allocs) {
+    if (!alloc.headroom)
+      continue;
+    for (Operation *op : prob.getOperations()) {
+      if (!prob.usesResource(op, alloc.rsrc))
+        continue;
+      int64_t in =
+          picos(*prob.getIncomingDelay(*prob.getLinkedOperatorType(op)));
+      model.AddLessOrEqual(inCycle.at(op) + *alloc.headroom, period - in);
+    }
+  }
 }
 
 /// Add \p price at \p size to a weighted sum, for a price tabulated at every
@@ -400,14 +482,16 @@ void applyAllocation(OccupancyProblem &prob, const Allocated &decided,
 }
 
 /// Fall back to the tightest allocation the schedule already on the problem
-/// admits, for a solve that decided none. Without it, a region whose budget
-/// ran out keeps the trivial allocation (one instance per operation) instead
-/// of what the schedule actually supports.
-void applyDemandAllocation(OccupancyProblem &prob, unsigned ii) {
+/// admits, for a solve that decided none: the busiest-cycle demand with the
+/// select cone held against the slack that schedule leaves. Without it, a
+/// region whose budget ran out keeps the trivial allocation (one instance per
+/// operation) instead of what the schedule actually supports.
+template <class ProblemT>
+void applyDemandAllocation(ProblemT &prob, unsigned ii, float cycleTime) {
   Allocated decided;
   for (Problem::ResourceType rsrc : prob.getResourceTypes())
     if (prob.getAllocatable(rsrc))
-      decided.push_back({rsrc, prob.demandFor(rsrc, ii)});
+      decided.push_back({rsrc, demandWithHeadroom(prob, rsrc, ii, cycleTime)});
   applyAllocation(prob, decided, ii);
 }
 
@@ -649,7 +733,8 @@ LogicalResult mlir::allo::scheduleCPSAT(ChainingSharedOperatorsProblem &prob,
       model.AddLessOrEqual(startVars.at(dep.getSource()) +
                                prob.latencyOf(dep.getSource()),
                            startVars.at(dep.getDestination()));
-  addChaining(model, prob, startVars, chaining, opts.regFloor);
+  DenseMap<Operation *, IntVar> inCycle =
+      addChaining(model, prob, startVars, chaining, opts.regFloor);
 
   // An op occupies one instance of every unit it links to for its whole window,
   // so a cumulative constraint per resource matches `verifyOccupancy`. A
@@ -670,9 +755,11 @@ LogicalResult mlir::allo::scheduleCPSAT(ChainingSharedOperatorsProblem &prob,
   // as the capacity. Occupancy windows on a line form an interval graph, so a
   // capacity is an assignment: `N` units suffice when no cycle needs more.
   SmallVector<AllocationVar> allocs =
-      allocationVars(model, prob, /*ii=*/0, /*hint=*/true);
+      allocationVars(model, prob, /*ii=*/0, /*hint=*/true, cycleTime);
   for (const AllocationVar &alloc : allocs)
     cumulativeOn(alloc.rsrc, alloc.units);
+  addAllocationHeadroom(model, prob, startVars, inCycle, allocs, cycleTime,
+                        opts.regFloor);
 
   // What the region is charged, bounded by what the heuristic already reached.
   int64_t heuristicDrain = span.drainOf(prob);
@@ -690,7 +777,7 @@ LogicalResult mlir::allo::scheduleCPSAT(ChainingSharedOperatorsProblem &prob,
   if (response.status() != CpSolverStatus::OPTIMAL &&
       response.status() != CpSolverStatus::FEASIBLE) {
     reportUnsolved(prob, response, opts.budget);
-    applyDemandAllocation(prob, /*ii=*/0);
+    applyDemandAllocation(prob, /*ii=*/0, cycleTime);
     return success();
   }
 
@@ -743,8 +830,8 @@ enum class ModuloOutcome { Scheduled, Infeasible, Exhausted };
 /// \p drainBound is the incumbent's, so INFEASIBLE here means nothing beats the
 /// incumbent at this II rather than a proof the interval is impossible.
 ModuloOutcome solveAtII(ChainingModuloProblem &prob, Operation *lastOp,
-                        const Chaining &chaining, const SpanObjective &span,
-                        const SchedulerOptions &opts,
+                        const Chaining &chaining, float cycleTime,
+                        const SpanObjective &span, const SchedulerOptions &opts,
                         std::optional<int64_t> drainBound, unsigned ii,
                         unsigned horizon, bool hint,
                         DenseMap<Operation *, unsigned> &starts,
@@ -778,7 +865,8 @@ ModuloOutcome solveAtII(ChainingModuloProblem &prob, Operation *lastOp,
       model.AddLessOrEqual(startVars.at(src) + separation,
                            startVars.at(dep.getDestination()));
     }
-  addChaining(model, prob, startVars, chaining, opts.regFloor);
+  DenseMap<Operation *, IntVar> inCycle =
+      addChaining(model, prob, startVars, chaining, opts.regFloor);
 
   // One-hot congruence class per contending op. `t = ii*lap + sum(p*slot[p])`
   // defines class and modulo at once with no reification: slot[p] IS membership
@@ -830,7 +918,8 @@ ModuloOutcome solveAtII(ChainingModuloProblem &prob, Operation *lastOp,
   // The same sum against the count being decided. Allocatable operators occupy
   // one cycle here, so an op sits in one class and a per-class count is
   // realizable as an assignment. `N_r >= ceil(total/ii)` is implied, cut here.
-  SmallVector<AllocationVar> allocs = allocationVars(model, prob, ii, hint);
+  SmallVector<AllocationVar> allocs =
+      allocationVars(model, prob, ii, hint, cycleTime);
   for (const AllocationVar &alloc : allocs) {
     int64_t total = 0;
     for (Operation *op : ops)
@@ -840,6 +929,8 @@ ModuloOutcome solveAtII(ChainingModuloProblem &prob, Operation *lastOp,
     for (unsigned slot = 0; slot < ii; ++slot)
       model.AddLessOrEqual(usesIn(alloc.rsrc, slot), alloc.units);
   }
+  addAllocationHeadroom(model, prob, startVars, inCycle, allocs, cycleTime,
+                        opts.regFloor);
 
   // `(trip - 1) * ii` is constant at a fixed II, so minimizing the span here is
   // minimizing the drain; the outer search carries the II term. With no span to
@@ -967,8 +1058,9 @@ LogicalResult mlir::allo::scheduleCPSAT(ChainingModuloProblem &prob,
     Allocated decided;
     bool proven = false;
     int64_t drain = 0;
-    ModuloOutcome outcome = solveAtII(prob, lastOp, chaining, span, opts,
-                                      drainBound, ii, window + ii * contending,
+    ModuloOutcome outcome = solveAtII(prob, lastOp, chaining, cycleTime, span,
+                                      opts, drainBound, ii,
+                                      window + ii * contending,
                                       /*hint=*/warm.placed && ii == greedyII,
                                       starts, decided, proven, drain);
     if (outcome == ModuloOutcome::Infeasible) {
@@ -1028,7 +1120,7 @@ LogicalResult mlir::allo::scheduleCPSAT(ChainingModuloProblem &prob,
           << "Exact scheduling found nothing shorter than the heuristic's "
              "schedule at II="
           << greedyII << "; keeping it";
-    applyDemandAllocation(prob, greedyII);
+    applyDemandAllocation(prob, greedyII, cycleTime);
     return success();
   }
 
@@ -1070,6 +1162,190 @@ LogicalResult mlir::allo::scheduleCPSAT(ChainingModuloProblem &prob,
   return finishSchedule(prob, cycleTime, opts.regFloor);
 }
 
+//===----------------------------------------------------------------------===//
+// Exact operator sharing: one bind-time solve per region.
+//===----------------------------------------------------------------------===//
+
+/// Deterministic time budget for one region's sharing solve. Small next to a
+/// schedule's: the model is a few booleans per same-class unit pair.
+static constexpr double kSharingSolveBudget = 10.0;
+
+std::optional<SmallVector<unsigned>>
+mlir::allo::solveSharing(SharingProblem &problem, ArrayRef<unsigned> hint,
+                         Operation *anchor) {
+  auto n = static_cast<unsigned>(problem.units.size());
+  llvm::DenseSet<uint64_t> collide;
+  for (auto [a, b] : problem.conflicts)
+    collide.insert(uint64_t(a) * n + b);
+  // Who may fold onto whom: same class, no collision, onto a smaller index
+  // only, so a group's representative is its first member.
+  SmallVector<SmallVector<unsigned>> cands(n), joiners(n);
+  SmallVector<unsigned> assign(n);
+  bool foldable = false;
+  for (unsigned i = 0; i < n; ++i) {
+    assign[i] = i;
+    for (unsigned j = 0; j < i; ++j)
+      if (problem.units[i].cls == problem.units[j].cls &&
+          !collide.contains(uint64_t(j) * n + i)) {
+        cands[i].push_back(j);
+        joiners[j].push_back(i);
+        foldable = true;
+      }
+  }
+  if (!foldable)
+    return assign;
+
+  CpModelBuilder model;
+  SmallVector<BoolVar> rep(n); // the unit keeps its own instance
+  llvm::DenseMap<uint64_t, BoolVar> join; // j * n + i: unit i runs on unit j
+  for (unsigned i = 0; i < n; ++i)
+    rep[i] = model.NewBoolVar();
+  for (unsigned i = 0; i < n; ++i) {
+    SmallVector<BoolVar> choice{rep[i]};
+    for (unsigned j : cands[i]) {
+      BoolVar x = model.NewBoolVar();
+      model.AddImplication(x, rep[j]);
+      join[uint64_t(j) * n + i] = x;
+      choice.push_back(x);
+    }
+    model.AddExactlyOne(choice);
+  }
+  auto lit = [&](unsigned i, unsigned j) {
+    return i == j ? rep[i] : join.find(uint64_t(j) * n + i)->second;
+  };
+  // A colliding pair may not meet through a common representative either.
+  for (auto [a, b] : problem.conflicts)
+    for (unsigned j : cands[a])
+      if (auto x = join.find(uint64_t(j) * n + b); x != join.end())
+        model.AddAtMostOne({lit(a, j), x->second});
+
+  // Per potential representative: the arms its select grew (zero while it
+  // shares nothing), and the cone and price read off its class's tables at
+  // that count.
+  int64_t horizon = 0;
+  for (SharingProblem::Unit &u : problem.units)
+    horizon = std::max(horizon, u.slackPicos);
+  SmallVector<std::optional<IntVar>> cone(n);
+  SmallVector<IntVar> arrive(n);
+  for (unsigned j = 0; j < n; ++j)
+    arrive[j] = model.NewIntVar(operations_research::Domain(0, horizon));
+  // Area dominates; below it, fewer folds win ties, so a free device shares
+  // nothing rather than folding at whim.
+  int64_t w = n + 1;
+  LinearExpr objective;
+  for (unsigned i = 0; i < n; ++i)
+    objective += LinearExpr::Term(
+        rep[i], problem.classes[problem.units[i].cls].instancePrice * w - 1);
+  for (unsigned j = 0; j < n; ++j) {
+    if (joiners[j].empty())
+      continue;
+    const SharingProblem::UnitClass &cls =
+        problem.classes[problem.units[j].cls];
+    BoolVar shared = model.NewBoolVar();
+    SmallVector<BoolVar> in;
+    int64_t maxArms = problem.units[j].ownArms;
+    LinearExpr arms = LinearExpr::Term(shared, problem.units[j].ownArms);
+    for (unsigned i : joiners[j]) {
+      BoolVar x = lit(i, j);
+      in.push_back(x);
+      model.AddImplication(x, shared);
+      arms += LinearExpr::Term(x, problem.units[i].ownArms);
+      maxArms += problem.units[i].ownArms;
+    }
+    model.AddBoolOr(in).OnlyEnforceIf(shared);
+    IntVar armCount =
+        model.NewIntVar(operations_research::Domain(0, maxArms));
+    model.AddEquality(armCount, arms);
+    std::vector<int64_t> cones(cls.conePicos.begin(),
+                               cls.conePicos.begin() + maxArms + 1);
+    IntVar c = model.NewIntVar(
+        operations_research::Domain(0, *llvm::max_element(cones)));
+    model.AddElement(armCount, cones, c);
+    cone[j] = c;
+    model.AddGreaterOrEqual(arrive[j], c);
+    std::vector<int64_t> prices(cls.muxPrice.begin(),
+                                cls.muxPrice.begin() + maxArms + 1);
+    IntVar price = model.NewIntVar(
+        operations_research::Domain(0, *llvm::max_element(prices)));
+    model.AddElement(armCount, prices, price);
+    objective += LinearExpr::Term(price, w);
+  }
+  model.Minimize(objective);
+
+  // The gate's recursion (`AddedDelay`), over bins instead of built sources:
+  // what arrives at a bin is its own select on top of the worst same-cycle
+  // producer bin, and every member's slack must hold the whole cone.
+  for (unsigned y = 0; y < n; ++y)
+    for (unsigned p : problem.units[y].preds) {
+      SmallVector<unsigned> ys(cands[y]);
+      ys.push_back(y);
+      SmallVector<unsigned> ps(cands[p]);
+      ps.push_back(p);
+      for (unsigned jy : ys)
+        for (unsigned jp : ps) {
+          if (jy == jp)
+            continue;
+          LinearExpr reach = arrive[jp];
+          if (cone[jy])
+            reach += *cone[jy];
+          model.AddLessOrEqual(reach, arrive[jy])
+              .OnlyEnforceIf({lit(y, jy), lit(p, jp)});
+        }
+    }
+  for (unsigned i = 0; i < n; ++i) {
+    model.AddLessOrEqual(arrive[i], problem.units[i].slackPicos)
+        .OnlyEnforceIf(rep[i]);
+    for (unsigned j : cands[i])
+      model.AddLessOrEqual(arrive[j], problem.units[i].slackPicos)
+          .OnlyEnforceIf(lit(i, j));
+  }
+
+  // The greedy plan seeds the search. It may sit outside this model where its
+  // own cone test under-counted (that is what this solve is for), which only
+  // costs the hint.
+  for (unsigned i = 0; i < n; ++i) {
+    model.AddHint(rep[i], hint[i] == i);
+    if (hint[i] != i)
+      model.AddHint(lit(i, hint[i]), true);
+  }
+
+  SchedulerOptions opts;
+  opts.budget = kSharingSolveBudget;
+  CpSolverResponse response =
+      SolveWithParameters(model.Build(), solverParameters(opts));
+  if (response.status() != CpSolverStatus::OPTIMAL &&
+      response.status() != CpSolverStatus::FEASIBLE) {
+    assert(response.status() != CpSolverStatus::INFEASIBLE &&
+           response.status() != CpSolverStatus::MODEL_INVALID &&
+           "every unit keeping its own instance satisfies this encoding, so "
+           "the model is satisfiable by construction");
+    warn(Stage::Emit, anchor)
+        << "Exact sharing gave up after " << llvm::format("%g", opts.budget)
+        << " deterministic time units (solver status "
+        << CpSolverStatus_Name(response.status())
+        << "); keeping the greedy plan";
+    return std::nullopt;
+  }
+  unsigned folded = 0;
+  for (unsigned i = 0; i < n; ++i)
+    for (unsigned j : cands[i])
+      if (SolutionBooleanValue(response, lit(i, j))) {
+        assign[i] = j;
+        ++folded;
+        break;
+      }
+  if (response.status() != CpSolverStatus::OPTIMAL)
+    warn(Stage::Emit, anchor)
+        << "Exact sharing ran out of budget before proving this region's fold "
+           "optimal; it shipped the best plan it had found";
+  info(Stage::Emit, anchor)
+      << "Exact sharing folded " << folded << " of " << n
+      << " units away (spent "
+      << llvm::format("%.3f", response.deterministic_time()) << " of "
+      << llvm::format("%g", opts.budget) << " deterministic time units)";
+  return assign;
+}
+
 #else // !ALLO_ENABLE_ORTOOLS
 
 namespace {
@@ -1109,6 +1385,14 @@ LogicalResult mlir::allo::scheduleCPSAT(ChainingModuloProblem &prob,
                                         const SpanObjective &span,
                                         const SchedulerOptions &opts) {
   return noExactScheduler(prob.getContainingOp(), "cyclic");
+}
+
+/// Nothing to solve with: the exact-share policy falls back to the greedy plan
+/// rather than refusing, sharing being an optimization and not a semantic.
+std::optional<SmallVector<unsigned>>
+mlir::allo::solveSharing(SharingProblem &problem, ArrayRef<unsigned> hint,
+                         Operation *anchor) {
+  return std::nullopt;
 }
 
 #endif // ALLO_ENABLE_ORTOOLS

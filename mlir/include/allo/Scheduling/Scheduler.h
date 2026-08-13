@@ -115,6 +115,12 @@ public:
     /// LUT6 absorbs three source/select pairs), so the total is not monotone
     /// in the count and no linear term can stand for it.
     llvm::SmallVector<int64_t> price;
+    /// The DELAY of the same multiplexer at `n` instances, in ns, indexed like
+    /// `price`: the select cone in front of the fullest instance (`muxCone`).
+    /// Zero at the ceiling, where nothing shares. A solve charges it on every
+    /// linked operation's sub-cycle start, so a count only shrinks where the
+    /// cone fits the slack the same schedule leaves.
+    llvm::SmallVector<double> headroomNs;
   };
 
   void setAllocatable(ResourceType rsrc, AllocatableUnit unit) {
@@ -468,6 +474,49 @@ std::optional<SchedulerKind> parseSchedulerKind(StringRef name);
 
 /// Whether this build has the CP-SAT exact scheduler compiled in.
 bool hasExactScheduler();
+
+/// One region's operator-sharing problem, decided at bind time with the
+/// schedule already fixed: which same-class units to fold onto one instance.
+/// Numeric throughout, so the emitter hands one over without this header
+/// knowing its model. Tables are indexed by select ARMS (one per member, plus
+/// one per member that re-injects a recurrence); a bin of one builds no select,
+/// so indices 0 and 1 are zero.
+struct SharingProblem {
+  struct UnitClass {
+    /// One instance of the operator, in the device's currency.
+    int64_t instancePrice = 0;
+    /// All ports' selects at that many arms.
+    llvm::SmallVector<int64_t> muxPrice;
+    /// One port's select delay at that many arms, in picoseconds.
+    llvm::SmallVector<int64_t> conePicos;
+  };
+  struct Unit {
+    unsigned cls = 0;     // index into `classes`; only equal ones may fold
+    unsigned ownArms = 1; // 2 where the operation re-injects a recurrence
+    /// The room the schedule left for this operation's whole input cone.
+    int64_t slackPicos = 0;
+    /// Same-cycle combinational producers, by unit index: their bin's cone
+    /// reaches this unit's inputs on top of its own select.
+    llvm::SmallVector<unsigned, 2> preds;
+  };
+  llvm::SmallVector<UnitClass> classes;
+  llvm::SmallVector<Unit> units;
+  /// Same-class pairs `(i, j)`, `i < j`, that may not share an instance: their
+  /// reservations collide.
+  llvm::SmallVector<std::pair<unsigned, unsigned>> conflicts;
+};
+
+/// Decide the fold exactly: returns, for each unit, the unit it runs on (the
+/// smallest member of its group; itself where unshared). Minimizes the
+/// modelled area, instances plus multiplexers with fewer folds breaking ties,
+/// holding every unit's input cone within `slackPicos` under the recursion the
+/// emit gate walks (`AddedDelay`): a bin's select plus everything a same-cycle
+/// producer's bin adds. \p hint seeds the search, so the greedy plan is the
+/// incumbent to beat. \p anchor is where diagnostics land. Returns nullopt in
+/// a build without OR-Tools or when the budget expires with nothing usable.
+std::optional<SmallVector<unsigned>> solveSharing(SharingProblem &problem,
+                                                  ArrayRef<unsigned> hint,
+                                                  Operation *anchor);
 
 /// Solve \p prob exactly with CP-SAT, minimizing \p span under the target clock
 /// period \p cycleTime. Reports `unsupported` and fails in a build without

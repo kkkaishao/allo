@@ -348,28 +348,6 @@ static void printSourceList(ArrayRef<Source> ss, raw_ostream &os) {
   os << "]";
 }
 
-unsigned muxLevels(unsigned sources) {
-  return sources <= 1 ? 0 : llvm::Log2_32_Ceil(sources);
-}
-
-double muxCone(const OperatorLibrary &lib, unsigned sources, unsigned width) {
-  if (sources <= 1)
-    return 0.0;
-  CostAttr row = lib.muxDelayRow();
-  if (!row)
-    // Unmeasured device: the OR row per level with a margin, which over-counts
-    // a routed cone two- to three-fold on the measured fabrics. Safe direction.
-    return muxLevels(sources) * kMuxDelayMargin * lib.combDelay(OpKind::Or, 1);
-  auto clampEval = [](CostAttr c, int64_t p) {
-    auto [lo, hi] = c.measuredDomain();
-    return *c.evaluate(std::clamp(p, lo, hi));
-  };
-  double d = clampEval(row, sources);
-  if (CostAttr wf = lib.muxDelayWidthRow())
-    d *= clampEval(wf, width);
-  return d;
-}
-
 double unitSlack(const FuncUnit &u, float cycleTime) {
   double slack = cycleTime;
   for (const FuncUnit::BoundOp &bo : u.boundOps)

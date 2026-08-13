@@ -726,8 +726,8 @@ def main():
         "--binding",
         default="trivial",
         help="operator-sharing policy: 'trivial' (the default, one unit per "
-        "op), 'greedy-share' or 'planned', which builds the allocation the "
-        "exact scheduler decided",
+        "op), 'greedy-share', 'exact-share' or 'planned', which builds the "
+        "allocation the exact scheduler decided",
     )
     ap.add_argument(
         "--workers",

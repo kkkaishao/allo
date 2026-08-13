@@ -946,7 +946,7 @@ def test_shared_multiply_mux():
 
     a, b, c = (np.array([v], np.float32) for v in (7, 6, 5))
     ref = np.array([7 * 6 * 5], np.float32)
-    unshared = _to_rtl(chain)
+    unshared = _to_rtl(chain, binding="trivial")
     shared = _to_rtl(chain, binding="greedy-share")
     # every multiply is an IP instance, so a dropped instance == a shared unit
     assert shared.mlir.count("hw.instance") < unshared.mlir.count("hw.instance")
@@ -954,6 +954,26 @@ def test_shared_multiply_mux():
         o = np.zeros(1, np.float32)
         mod.cosim(a, b, c, o)
         assert np.array_equal(o, ref)
+
+
+def test_exact_share_folds_profitable_ip():
+    # 'exact-share' decides the same fold domain as 'greedy-share' with one
+    # CP-SAT solve per region, minimizing modelled area under the clock. An IP
+    # fold that saves a whole fmul against a 2:1 mux per port sits in that
+    # optimum, so the instance drops here too, and the shared datapath stays
+    # functionally identical to the trivially-bound one.
+    @kernel
+    def chain(A: f32[1], B: f32[1], C: f32[1], o: f32[1]):
+        o[0] = A[0] * B[0] * C[0]
+
+    a, b, c = (np.array([v], np.float32) for v in (7, 6, 5))
+    shared = _to_rtl(chain, binding="exact-share")
+    assert shared.mlir.count("hw.instance") < _to_rtl(
+        chain, binding="trivial"
+    ).mlir.count("hw.instance")
+    o = np.zeros(1, np.float32)
+    shared.cosim(a, b, c, o)
+    assert np.array_equal(o, np.array([7 * 6 * 5], np.float32))
 
 
 def test_bit_slice_lowers_to_arithmetic():

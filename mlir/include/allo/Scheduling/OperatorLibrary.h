@@ -211,6 +211,12 @@ public:
   /// sharing one functional unit puts in front of each of its operand ports.
   int64_t muxPrice(int64_t sources, int64_t width) const;
 
+  /// What one instance of a REIFIED realization costs: the IP row \p identity
+  /// names, or the comb row of its kind, at \p width. The bind-time twin of
+  /// the price `lookup` resolves, for a caller no longer holding the original
+  /// operation. Zero where the device declares no such row.
+  int64_t instancePrice(const OperatorIdentity &identity, int64_t width) const;
+
   /// What carrying a `width`-bit value across `depth` cycles costs, in the
   /// reset-free form a value run is emitted in. Zero at depth 0, which is a
   /// wire and not a chain.
@@ -222,7 +228,7 @@ public:
   int64_t pulsePrice() const;
 
   /// The measured `dcp.mux` delay row over fan-in and its unitless width
-  /// factor, null attrs on an uncharacterized device. `uarch::muxCone` is the
+  /// factor, null attrs on an uncharacterized device. `muxCone` below is the
   /// one reader.
   CostAttr muxDelayRow() const { return muxDelay; }
   CostAttr muxDelayWidthRow() const { return muxDelayWidth; }
@@ -255,6 +261,25 @@ private:
   ArrayAttr chainUses;    // `dcp.chain`, reset-free, over (depth, width)
   double regFloor = 0.0;  // `dcp.device`'s `reg_delay`
 };
+
+/// The combinational depth, in LUT levels, of the select a mux of \p sources
+/// sources costs: `ceil(log2 k)`, since the emitter builds a one-hot AND-OR
+/// reduction (`EmitContext::oneHotSelect`) and each level halves the term
+/// count. Zero for a single source, which is a wire.
+unsigned muxLevels(unsigned sources);
+
+/// A safety factor on the formula fallback below, sized from the gap a
+/// one-bit OR row leaves on a wide select. Unused on a device with a measured
+/// `dcp.mux` delay row.
+inline constexpr double kMuxDelayMargin = 1.4;
+
+/// The routed marginal delay of a one-hot select over \p sources arms of
+/// \p width bits, in ns: the device's measured `dcp.mux` delay row, clamped
+/// to its measured domain (fan-in past the sweep grows one LUT level per
+/// several-fold, which the clamp under-counts slightly). A device without the
+/// row is priced at `muxLevels` times a margined one-bit OR row, the
+/// conservative direction. Zero for a single source, which is a wire.
+double muxCone(const OperatorLibrary &lib, unsigned sources, unsigned width);
 
 /// The device as the compiler reads it: what it can COMPUTE and what it can
 /// STORE IN. Two peer models of one `dcp.device`, neither part of the other,
@@ -455,6 +480,13 @@ template <class ProblemT>
 void populateOperatorAllocation(ProblemT &problem, const OperatorLibrary &lib) {
   using namespace circt::scheduling;
   constexpr bool isCyclic = std::is_base_of_v<CyclicProblem, ProblemT>;
+  // The loop whose carried values a shared unit re-injects; its own induction
+  // variable is not carried.
+  Operation *container = problem.getContainingOp();
+  Value inductionVar;
+  if (auto loop = dyn_cast<LoopLikeOpInterface>(container))
+    if (auto iv = loop.getSingleInductionVar())
+      inductionVar = *iv;
   // One identity's operations, in problem order. Sorted keying, not insertion
   // order, so two compiles declare the resources in the same order.
   struct OperatorClass {
@@ -463,6 +495,7 @@ void populateOperatorAllocation(ProblemT &problem, const OperatorLibrary &lib) {
     int64_t unitPrice = 0;
     int64_t ports = 0;     // operand ports one instance multiplexes
     int64_t portWidth = 0; // bits each of them carries
+    unsigned carried = 0;  // ops reading a loop-carried value (one extra arm)
   };
   std::map<std::string, OperatorClass> byIdentity;
   for (Operation *op : problem.getOperations()) {
@@ -488,6 +521,14 @@ void populateOperatorAllocation(ProblemT &problem, const OperatorLibrary &lib) {
       if (t.isIntOrFloat())
         cls.portWidth =
             std::max<int64_t>(cls.portWidth, t.getIntOrFloatBitWidth());
+    // A shared unit re-injects a loop-carried operand (the reduction identity)
+    // on a select arm of its own, so such an operation prices as two arms.
+    if (isCyclic && llvm::any_of(op->getOperands(), [&](Value v) {
+          auto barg = dyn_cast<BlockArgument>(v);
+          return barg && barg.getOwner()->getParentOp() == container &&
+                 v != inductionVar;
+        }))
+      ++cls.carried;
   }
 
   for (auto &[key, cls] : byIdentity) {
@@ -503,9 +544,21 @@ void populateOperatorAllocation(ProblemT &problem, const OperatorLibrary &lib) {
                  cls.ports * (busy * lib.muxPrice(share + 1, cls.portWidth) +
                               (n - busy) * lib.muxPrice(share, cls.portWidth));
     }
+    // The delay of the same multiplexer, for the solve to hold against the
+    // period: the fullest instance hosts `ceil(ceiling / n)` operations, plus
+    // one re-injection arm per carried operand among them. Building every
+    // instance shares nothing and charges nothing.
+    llvm::SmallVector<double> headroom(ceiling + 1, 0.0);
+    for (unsigned n = 1; n < ceiling; ++n) {
+      unsigned members = (ceiling + n - 1) / n;
+      unsigned arms = members + std::min(members, cls.carried);
+      headroom[n] = muxCone(
+          lib, arms, static_cast<unsigned>(std::max<int64_t>(1, cls.portWidth)));
+    }
     Problem::ResourceType rsrc = problem.getOrInsertResourceType(key);
-    problem.setAllocatable(
-        rsrc, typename ProblemT::AllocatableUnit{ceiling, std::move(price)});
+    problem.setAllocatable(rsrc,
+                           typename ProblemT::AllocatableUnit{
+                               ceiling, std::move(price), std::move(headroom)});
     for (Operation *op : cls.ops) {
       llvm::SmallVector<Problem::ResourceType> units;
       if (auto linked = problem.getLinkedResourceTypes(op))

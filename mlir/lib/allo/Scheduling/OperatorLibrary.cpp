@@ -18,7 +18,9 @@
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/TypeSwitch.h"
 #include "llvm/Support/FormatVariadic.h"
+#include "llvm/Support/MathExtras.h"
 
+#include <algorithm>
 #include <limits>
 #include <map>
 #include <tuple>
@@ -443,6 +445,51 @@ int64_t OperatorLibrary::muxPrice(int64_t sources, int64_t width) const {
   assert(price && "a multiplexer row holds over every fan-in a region can "
                   "share an operator over");
   return *price;
+}
+
+int64_t OperatorLibrary::instancePrice(const OperatorIdentity &identity,
+                                       int64_t width) const {
+  const OperatorEntry *e = nullptr;
+  if (identity.comb) {
+    e = combEntry(opKindOf(*identity.comb));
+  } else {
+    // An IP symbol is unique across the device, so a match is the row.
+    for (const OperatorEntry &row : advancedEntries)
+      if (row.symbol == identity.ipSymbol)
+        e = &row;
+    for (const OperatorEntry &row : entries)
+      if (row.symbol == identity.ipSymbol)
+        e = &row;
+  }
+  if (!e)
+    return 0;
+  std::optional<int64_t> price = priceOf(e->uses, {width});
+  assert(price && "a realization the scheduler priced through `lookup` is "
+                  "inside the row's measured widths");
+  return *price;
+}
+
+unsigned mlir::allo::muxLevels(unsigned sources) {
+  return sources <= 1 ? 0 : llvm::Log2_32_Ceil(sources);
+}
+
+double mlir::allo::muxCone(const OperatorLibrary &lib, unsigned sources,
+                           unsigned width) {
+  if (sources <= 1)
+    return 0.0;
+  CostAttr row = lib.muxDelayRow();
+  if (!row)
+    // Unmeasured device: the OR row per level with a margin, which over-counts
+    // a routed cone two- to three-fold on the measured fabrics. Safe direction.
+    return muxLevels(sources) * kMuxDelayMargin * lib.combDelay(OpKind::Or, 1);
+  auto clampEval = [](CostAttr c, int64_t p) {
+    auto [lo, hi] = c.measuredDomain();
+    return *c.evaluate(std::clamp(p, lo, hi));
+  };
+  double d = clampEval(row, sources);
+  if (CostAttr wf = lib.muxDelayWidthRow())
+    d *= clampEval(wf, width);
+  return d;
 }
 
 int64_t OperatorLibrary::chainPrice(int64_t depth, int64_t width) const {
