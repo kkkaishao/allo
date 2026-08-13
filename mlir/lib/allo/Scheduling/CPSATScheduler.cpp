@@ -1219,16 +1219,18 @@ mlir::allo::solveSharing(SharingProblem &problem, ArrayRef<unsigned> hint,
       if (auto x = join.find(uint64_t(j) * n + b); x != join.end())
         model.AddAtMostOne({lit(a, j), x->second});
 
-  // Per potential representative: the arms its select grew (zero while it
-  // shares nothing), and the cone and price read off its class's tables at
-  // that count.
+  // Per potential representative and operand port: the arms its select grew
+  // (zero while it shares nothing), with the cone and price read off the
+  // port's tables at that count. A port whose candidates all read one held
+  // value stays a wire in every fold, so it is skipped whole; the emitter
+  // collapses exactly that case.
   int64_t horizon = 0;
   for (SharingProblem::Unit &u : problem.units)
     horizon = std::max(horizon, u.slackPicos);
-  SmallVector<std::optional<IntVar>> cone(n);
   SmallVector<IntVar> arrive(n);
   for (unsigned j = 0; j < n; ++j)
     arrive[j] = model.NewIntVar(operations_research::Domain(0, horizon));
+  llvm::DenseMap<std::pair<unsigned, unsigned>, IntVar> coneAt; // (host, port)
   // Area dominates; below it, fewer folds win ties, so a free device shares
   // nothing rather than folding at whim.
   int64_t w = n + 1;
@@ -1239,44 +1241,56 @@ mlir::allo::solveSharing(SharingProblem &problem, ArrayRef<unsigned> hint,
   for (unsigned j = 0; j < n; ++j) {
     if (joiners[j].empty())
       continue;
-    const SharingProblem::UnitClass &cls =
-        problem.classes[problem.units[j].cls];
+    const SharingProblem::Unit &uj = problem.units[j];
+    const SharingProblem::UnitClass &cls = problem.classes[uj.cls];
     BoolVar shared = model.NewBoolVar();
     SmallVector<BoolVar> in;
-    int64_t maxArms = problem.units[j].ownArms;
-    LinearExpr arms = LinearExpr::Term(shared, problem.units[j].ownArms);
     for (unsigned i : joiners[j]) {
-      BoolVar x = lit(i, j);
-      in.push_back(x);
-      model.AddImplication(x, shared);
-      arms += LinearExpr::Term(x, problem.units[i].ownArms);
-      maxArms += problem.units[i].ownArms;
+      in.push_back(lit(i, j));
+      model.AddImplication(in.back(), shared);
     }
     model.AddBoolOr(in).OnlyEnforceIf(shared);
-    IntVar armCount =
-        model.NewIntVar(operations_research::Domain(0, maxArms));
-    model.AddEquality(armCount, arms);
-    std::vector<int64_t> cones(cls.conePicos.begin(),
-                               cls.conePicos.begin() + maxArms + 1);
-    IntVar c = model.NewIntVar(
-        operations_research::Domain(0, *llvm::max_element(cones)));
-    model.AddElement(armCount, cones, c);
-    cone[j] = c;
-    model.AddGreaterOrEqual(arrive[j], c);
-    std::vector<int64_t> prices(cls.muxPrice.begin(),
-                                cls.muxPrice.begin() + maxArms + 1);
-    IntVar price = model.NewIntVar(
-        operations_research::Domain(0, *llvm::max_element(prices)));
-    model.AddElement(armCount, prices, price);
-    objective += LinearExpr::Term(price, w);
+    for (unsigned p = 0, e = cls.ports.size(); p < e; ++p) {
+      unsigned key = uj.drivers[p];
+      if (key && llvm::all_of(joiners[j], [&](unsigned i) {
+            return problem.units[i].drivers[p] == key;
+          }))
+        continue; // one held driver across every candidate: a wire
+      int64_t maxArms = 1 + uj.initArms[p];
+      LinearExpr arms = LinearExpr::Term(shared, 1 + uj.initArms[p]);
+      for (unsigned i : joiners[j]) {
+        unsigned add = 1 + problem.units[i].initArms[p];
+        arms += LinearExpr::Term(lit(i, j), add);
+        maxArms += add;
+      }
+      IntVar armCount =
+          model.NewIntVar(operations_research::Domain(0, maxArms));
+      model.AddEquality(armCount, arms);
+      const SharingProblem::Port &port = cls.ports[p];
+      std::vector<int64_t> cones(port.conePicos.begin(),
+                                 port.conePicos.begin() + maxArms + 1);
+      if (int64_t top = *llvm::max_element(cones)) {
+        IntVar c = model.NewIntVar(operations_research::Domain(0, top));
+        model.AddElement(armCount, cones, c);
+        coneAt.try_emplace({j, p}, c);
+        model.AddGreaterOrEqual(arrive[j], c);
+      }
+      std::vector<int64_t> prices(port.muxPrice.begin(),
+                                  port.muxPrice.begin() + maxArms + 1);
+      if (int64_t top = *llvm::max_element(prices)) {
+        IntVar price = model.NewIntVar(operations_research::Domain(0, top));
+        model.AddElement(armCount, prices, price);
+        objective += LinearExpr::Term(price, w);
+      }
+    }
   }
   model.Minimize(objective);
 
   // The gate's recursion (`AddedDelay`), over bins instead of built sources:
-  // what arrives at a bin is its own select on top of the worst same-cycle
-  // producer bin, and every member's slack must hold the whole cone.
+  // a producer's cone arrives through the select of the port it drives, and
+  // every member's slack must hold its whole bin's cone.
   for (unsigned y = 0; y < n; ++y)
-    for (unsigned p : problem.units[y].preds) {
+    for (auto [port, p] : problem.units[y].preds) {
       SmallVector<unsigned> ys(cands[y]);
       ys.push_back(y);
       SmallVector<unsigned> ps(cands[p]);
@@ -1286,8 +1300,8 @@ mlir::allo::solveSharing(SharingProblem &problem, ArrayRef<unsigned> hint,
           if (jy == jp)
             continue;
           LinearExpr reach = arrive[jp];
-          if (cone[jy])
-            reach += *cone[jy];
+          if (auto c = coneAt.find({jy, port}); c != coneAt.end())
+            reach += c->second;
           model.AddLessOrEqual(reach, arrive[jy])
               .OnlyEnforceIf({lit(y, jy), lit(p, jp)});
         }

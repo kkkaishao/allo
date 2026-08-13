@@ -31,18 +31,33 @@ TrivialBinding::plan(const Datapath &, const BindingContext &) const {
 
 namespace {
 
-/// Whether \p op reads a loop recurrence: an un-latched iter-arg of its own
-/// leaf pipeline. Such an operand costs a second mux arm, for the reduction
-/// identity it re-injects (`Mux::Phase`). Asked of the IR because a policy runs
-/// before the interconnect exists.
-bool readsRecurrence(const RegionBlock &rb, Operation *op) {
+/// Whether \p v is an un-latched iter-arg of \p rb's own leaf pipeline.
+/// Reading it costs an extra mux arm on that port, for the reduction identity
+/// it re-injects (`Mux::Phase`). Asked of the IR because a policy runs before
+/// the interconnect exists.
+bool carriedOperand(const RegionBlock &rb, Value v) {
   if (rb.container || rb.kind != RegionBlock::Kind::Cyclic)
     return false;
   Block *body = &cast<dcp::DCPathPipelineOp>(rb.op).getBody().front();
-  return llvm::any_of(op->getOperands(), [&](Value v) {
-    auto barg = dyn_cast<BlockArgument>(v);
-    return barg && barg.getOwner() == body && barg.getArgNumber() >= 1;
-  });
+  auto barg = dyn_cast<BlockArgument>(v);
+  return barg && barg.getOwner() == body && barg.getArgNumber() >= 1;
+}
+
+/// Whether \p op reads a loop recurrence on any operand.
+bool readsRecurrence(const RegionBlock &rb, Operation *op) {
+  return llvm::any_of(
+      op->getOperands(), [&](Value v) { return carriedOperand(rb, v); });
+}
+
+/// Whether \p v is held for the whole of \p rb's run: defined outside the
+/// region, it reaches it as a literal, a boundary port, a survivor or an
+/// enclosing counter, one source at every issue cycle. A value the region
+/// schedules lands at a different register tap per consumer cycle instead.
+bool heldOutside(const RegionBlock &rb, Value v) {
+  Operation *at = v.getDefiningOp();
+  if (!at)
+    at = cast<BlockArgument>(v).getOwner()->getParentOp();
+  return !rb.op->isAncestor(at);
 }
 
 /// What one candidate binding costs a region's clock.
@@ -189,8 +204,9 @@ void appendGroups(const RegionBlock &rb, llvm::ArrayRef<unsigned> assign,
 }
 
 /// One region as a `SharingProblem`: the arrays `ShareCone` reads, priced with
-/// the rows the emit gate walks. The cone tables round up and the slacks down,
-/// so an admitted fold clears `checkCombPathsMeetPeriod` by construction.
+/// the rows the emit gate walks, per operand port at that port's own width.
+/// The cone tables round up and the slacks down, so an admitted fold clears
+/// `checkCombPathsMeetPeriod` by construction.
 SharingProblem sharingProblemOf(const Datapath &dp, const RegionBlock &rb,
                                 const BindingContext &ctx) {
   SharingProblem problem;
@@ -200,42 +216,60 @@ SharingProblem sharingProblemOf(const Datapath &dp, const RegionBlock &rb,
     owner[dp.units[uid].repOp()] = i;
   std::map<std::string, unsigned> classIdx;
   llvm::SmallVector<llvm::SmallVector<unsigned>> members;
+  // Held-driver keys, interned per class: equal keys name one value.
+  llvm::SmallVector<llvm::DenseMap<Value, unsigned>> heldKeys;
   for (auto [i, uid] : llvm::enumerate(rb.units)) {
     const FuncUnit &u = dp.units[uid];
     auto [it, isNew] = classIdx.try_emplace(u.identity.key(), members.size());
-    if (isNew)
+    if (isNew) {
       members.emplace_back();
+      heldKeys.emplace_back();
+    }
     members[it->second].push_back(i);
     SharingProblem::Unit &unit = problem.units[i];
     unit.cls = it->second;
-    unit.ownArms = readsRecurrence(rb, u.repOp()) ? 2 : 1;
     unit.slackPicos = std::max<int64_t>(
         0, std::floor(unitSlack(u, ctx.cycleTime) * 1000.0));
     Operation *y = u.repOp();
-    for (Value v : y->getOperands()) {
+    for (auto [k, v] : llvm::enumerate(y->getOperands())) {
+      unit.initArms.push_back(carriedOperand(rb, v) ? 1 : 0);
+      unsigned key = 0;
+      if (heldOutside(rb, v))
+        key = heldKeys[unit.cls]
+                  .try_emplace(v, heldKeys[unit.cls].size() + 1)
+                  .first->second;
+      unit.drivers.push_back(key);
       Operation *x = v.getDefiningOp();
       auto o = x ? owner.find(x) : owner.end();
       if (o != owner.end() && !dcpLatency(x) && dcpStart(x) == dcpStart(y))
-        unit.preds.push_back(o->second);
+        unit.preds.push_back({static_cast<unsigned>(k), o->second});
     }
   }
   problem.classes.resize(members.size());
   for (auto [cls, mem] : llvm::enumerate(members)) {
     Operation *y = dp.units[rb.units[mem.front()]].repOp();
-    auto width = static_cast<unsigned>(std::max<int64_t>(1, combParamWidth(y)));
-    auto ports = static_cast<int64_t>(y->getNumOperands());
     SharingProblem::UnitClass &c = problem.classes[cls];
     c.instancePrice =
-        ctx.lib.instancePrice(dp.units[rb.units[mem.front()]].identity, width);
-    unsigned maxArms = 0;
-    for (unsigned m : mem)
-      maxArms += problem.units[m].ownArms;
-    c.muxPrice.resize(maxArms + 1, 0);
-    c.conePicos.resize(maxArms + 1, 0);
-    for (unsigned a = 2; a <= maxArms; ++a) {
-      c.muxPrice[a] = ports * ctx.lib.muxPrice(a, width);
-      c.conePicos[a] =
-          static_cast<int64_t>(std::ceil(muxCone(ctx.lib, a, width) * 1000.0));
+        ctx.lib.instancePrice(dp.units[rb.units[mem.front()]].identity,
+                              std::max<int64_t>(1, combParamWidth(y)));
+    for (auto [k, t] : llvm::enumerate(y->getOperandTypes())) {
+      unsigned maxArms = 0;
+      for (unsigned m : mem) {
+        assert(problem.units[m].initArms.size() == y->getNumOperands() &&
+               "one identity, one signature");
+        maxArms += 1 + problem.units[m].initArms[k];
+      }
+      SharingProblem::Port port;
+      port.muxPrice.assign(maxArms + 1, 0);
+      port.conePicos.assign(maxArms + 1, 0);
+      auto width = static_cast<unsigned>(
+          t.isIntOrIndexOrFloat() ? std::max<int64_t>(1, datapathWidth(t)) : 1);
+      for (unsigned a = 2; a <= maxArms; ++a) {
+        port.muxPrice[a] = ctx.lib.muxPrice(a, width);
+        port.conePicos[a] = static_cast<int64_t>(
+            std::ceil(muxCone(ctx.lib, a, width) * 1000.0));
+      }
+      c.ports.push_back(std::move(port));
     }
     for (unsigned p = 0; p < mem.size(); ++p) {
       const FuncUnit &a = dp.units[rb.units[mem[p]]];

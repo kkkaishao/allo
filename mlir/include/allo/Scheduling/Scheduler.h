@@ -478,29 +478,40 @@ bool hasExactScheduler();
 /// One region's operator-sharing problem, decided at bind time with the
 /// schedule already fixed: which same-class units to fold onto one instance.
 /// Numeric throughout, so the emitter hands one over without this header
-/// knowing its model. Tables are indexed by select ARMS (one per member, plus
-/// one per member that re-injects a recurrence); a bin of one builds no select,
-/// so indices 0 and 1 are zero.
+/// knowing its model. A shared instance grows one select per operand port,
+/// with one arm per member plus each member's re-injected recurrence
+/// identities, so tables are per port and indexed by ARMS; a select of one
+/// arm is a wire, so indices 0 and 1 are zero.
 struct SharingProblem {
+  struct Port {
+    /// The select at this port's own width, by arms.
+    llvm::SmallVector<int64_t> muxPrice;
+    /// Its delay in picoseconds, by arms.
+    llvm::SmallVector<int64_t> conePicos;
+  };
   struct UnitClass {
     /// One instance of the operator, in the device's currency.
     int64_t instancePrice = 0;
-    /// All ports' selects at that many arms.
-    llvm::SmallVector<int64_t> muxPrice;
-    /// One port's select delay at that many arms, in picoseconds.
-    llvm::SmallVector<int64_t> conePicos;
+    llvm::SmallVector<Port, 0> ports;
   };
   struct Unit {
-    unsigned cls = 0;     // index into `classes`; only equal ones may fold
-    unsigned ownArms = 1; // 2 where the operation re-injects a recurrence
+    unsigned cls = 0; // index into `classes`; only equal ones may fold
     /// The room the schedule left for this operation's whole input cone.
     int64_t slackPicos = 0;
-    /// Same-cycle combinational producers, by unit index: their bin's cone
-    /// reaches this unit's inputs on top of its own select.
-    llvm::SmallVector<unsigned, 2> preds;
+    /// Same-cycle combinational producers, as (port, unit): a producer's cone
+    /// arrives through the select of the port it drives.
+    llvm::SmallVector<std::pair<unsigned, unsigned>, 2> preds;
+    /// Per port: select arms past its own data arm, one per recurrence
+    /// identity the operation re-injects there.
+    llvm::SmallVector<unsigned, 2> initArms;
+    /// Per port: nonzero key = the operand is one HELD value (a wire at any
+    /// issue cycle), equal keys naming equal values. A port whose members all
+    /// carry one key collapses to that wire and builds no select; 0 marks a
+    /// scheduled or carried operand, which never collapses.
+    llvm::SmallVector<unsigned, 2> drivers;
   };
-  llvm::SmallVector<UnitClass> classes;
-  llvm::SmallVector<Unit> units;
+  llvm::SmallVector<UnitClass, 0> classes;
+  llvm::SmallVector<Unit, 0> units;
   /// Same-class pairs `(i, j)`, `i < j`, that may not share an instance: their
   /// reservations collide.
   llvm::SmallVector<std::pair<unsigned, unsigned>> conflicts;
