@@ -137,21 +137,38 @@ struct SpanNode {
   /// An INSTANCE element rather than a region of this func: `contract` is the
   /// callee's whole start->done span, counted to its own `done` rising.
   bool instance = false;
+  /// The contract composed here (an instance's, or one a leaf priced into its
+  /// drain) is a published ceiling (`latency_bound`), not an exact count.
+  bool contractBound = false;
   /// Body elements of a done-paced region, in program order. `std::vector`
   /// rather than `SmallVector`: the element type is this one, still incomplete
   /// here, and only `std::vector` is specified to accept that.
   std::vector<SpanNode> children;
+  /// A Guard's else-arm elements, in program order; `children` holds its
+  /// then-arm's. Empty for an absent or empty else, which completes in the
+  /// arming cycle.
+  std::vector<SpanNode> elseChildren;
 };
 
 /// The per-invocation span of \p n: its start pulse to its `done` rising. It is
 /// WHOLE, including the node's own arming cost, so a composer only ever sums
 /// spans. A LEAF runs its own solved schedule and drains it; a DONE-PACED
 /// region runs its body elements in sequence, each handed to the next through
-/// its own `done` latch.
+/// its own `done` latch. A GUARD composes the deeper arm, a CEILING rather
+/// than an exact count (`spanHoldsBound`), so what contains one may publish
+/// only a `latency_bound`.
 ///
 /// nullopt whenever any element is data-dependent, which leaves the enclosing
 /// span unknown rather than guessed.
 std::optional<int64_t> composeSpan(const SpanNode &n);
+
+/// Whether the span composed of \p n is a ceiling rather than an exact count:
+/// a guard runs whichever arm its predicate takes, an assumed trip is a worst
+/// case, and a bounded contract hands its callee's own ceiling on. Meaningful
+/// only where `composeSpan` returned a value; the composition arithmetic is
+/// monotone and every region is done-paced in hardware, so a ceiling composes
+/// into a ceiling.
+bool spanHoldsBound(const SpanNode &n);
 
 /// A run of nodes composed in PROGRAM ORDER, hence the sum of their spans: each
 /// starts on its predecessor's `done` edge, which costs nothing (`startFor` is
@@ -233,6 +250,11 @@ struct RegionTiming {
   DeterminacyEnum determinacy = DeterminacyEnum::Indeterminate;
   /// Present only for `counted_static`, and then it is exact.
   std::optional<int64_t> staticLatency;
+  /// A ceiling on the span where one composes but is not exact
+  /// (`spanHoldsBound`): a guard's deeper arm, or a bounded contract beneath.
+  /// Never set beside `staticLatency`; published as `latency_bound`, which a
+  /// caller may wait out but nothing may time-trigger against.
+  std::optional<int64_t> boundedLatency;
 };
 
 /// Derive \p regionOp's pacing from the region itself.

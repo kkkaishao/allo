@@ -624,9 +624,13 @@ FuncScheduler::buildSpanNode(const SchedRegion &region) {
   }
   Operation *anchor = region.anchor();
   // An `if` if-conversion left opaque runs under a predicate, which becomes a
-  // `dcp.select` the reify side reads back as a Guard.
+  // `dcp.select` the reify side reads back as a Guard. Its branches hold the
+  // arms' scheduled sub-regions, composed by `composeSpan`'s ceiling rule.
   if (isa<AffineIfOp, scf::IfOp>(anchor)) {
     n.shape = RegionShape::Guard;
+    n.children = buildSpanNodes(anchor->getRegion(0).front());
+    if (!anchor->getRegion(1).empty())
+      n.elseChildren = buildSpanNodes(anchor->getRegion(1).front());
     return n;
   }
   if (!isa<AffineForOp, scf::ForOp>(anchor))

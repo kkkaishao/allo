@@ -462,6 +462,8 @@ def DCPathRegionOpInterface : OpInterface<"DCPathRegionOpInterface"> {
       "void", "setLatency", (ins "::std::optional<uint64_t>":$span)>,
     InterfaceMethod<"Whether the span above is an upper bound, not exact",
       "bool", "getLatencyBound">,
+    InterfaceMethod<"Mark the published span as an upper bound",
+      "void", "setLatencyBound", (ins "bool":$bound)>,
     InterfaceMethod<"Which controller family paces this region",
       "::std::optional<::mlir::allo::DeterminacyEnum>", "getDeterminacy">,
     InterfaceMethod<"Publish this region's pacing class",
@@ -953,8 +955,9 @@ def DCPathSelectOp : DCPath_Op<"dcp.select",
     includes a result-mux (`cond ? then : else`) on those values, but the bodies
     are still gated. `else` is optional, and present iff there are results (a
     mux needs both sources). Enable, registers and result-mux are derived at
-    lowering. Latency is optional: absent for a data-dependent guard (unknown),
-    present when an affine active-count is known.
+    lowering. `latency`, when present, is a ceiling flagged `latency_bound`:
+    the deeper arm's span plus the guard's boundary, absent when either arm's
+    span is data-dependent.
   }];
   let arguments = (ins
     I1:$condition,

@@ -39,14 +39,24 @@ std::optional<int64_t> mlir::allo::composeSpan(const SpanNode &n) {
   // composes inside it.
   if (n.instance)
     return n.contract;
-  // A guard runs under a predicate, so it has no compile-time span.
-  if (n.shape == RegionShape::Guard)
-    return std::nullopt;
   // A stall shell stretches a run by whatever back-pressure costs it, so what
-  // composes below is a floor and not a contract. Tested ahead of the bound,
-  // since a floor is the wrong direction to hand a consumer either way.
+  // composes below is a floor and not a contract. Tested ahead of the bound
+  // and of a guard's ceiling, since a floor is the wrong direction to hand a
+  // consumer either way.
   if (n.elastic)
     return std::nullopt;
+  // A guard's span is a ceiling: it arms (`emitGuard`'s check pulse), runs
+  // whichever arm the predicate takes in sequence, and latches `done`, so the
+  // deeper arm bounds both. An empty arm's start pulse is its drain, hence
+  // the 0. `spanHoldsBound` keeps the result off any exact contract.
+  if (n.shape == RegionShape::Guard) {
+    std::optional<int64_t> thenSpan = composeSequence(n.children);
+    std::optional<int64_t> elseSpan = composeSequence(n.elseChildren);
+    if (!thenSpan || !elseSpan)
+      return std::nullopt;
+    return kGuardBoundary.arm + std::max(*thenSpan, *elseSpan) +
+           kDoneLatchCycles;
+  }
   // A data-dependent trip has no composable span; a carried bound stands in
   // where the builder judged one usable.
   if (!n.trip)
@@ -81,6 +91,15 @@ std::optional<int64_t> mlir::allo::composeSequence(ArrayRef<SpanNode> nodes) {
     sum += *span;
   }
   return sum;
+}
+
+bool mlir::allo::spanHoldsBound(const SpanNode &n) {
+  // A guard is a ceiling by construction, so its arms need no visit.
+  if (n.shape == RegionShape::Guard || n.contractBound ||
+      (!n.trip && n.assumedSpan))
+    return true;
+  return llvm::any_of(n.children,
+                      [](const SpanNode &c) { return spanHoldsBound(c); });
 }
 
 // Reads and writes of the array bound to operand \p argIdx of \p inv, from the
@@ -351,17 +370,29 @@ SpanNode mlir::allo::dcpSpanNode(Operation *op, bool topLevel) {
   if (auto inv = dyn_cast<DCPathInstanceOp>(op)) {
     // A callee's `latency` is already a start->done contract, counted to its
     // own `done` rising. It crosses a module boundary, so it is the one
-    // composed number this side cannot derive.
+    // composed number this side cannot derive. A callee that published only a
+    // ceiling (`latency_bound`) is not counted_static, and its contract
+    // composes onward as a ceiling too.
     n.instance = true;
     n.contract = asInt64(inv.getLatency());
+    n.contractBound =
+        n.contract && inv.getDeterminacy() != DeterminacyEnum::CountedStatic;
     return n;
   }
   auto region = cast<DCPathRegionOpInterface>(op);
   n.shape = dcpRegionShape(op);
   n.nested = hasEnclosingRegion(op);
   n.elastic = isElastic(op);
-  if (n.shape == RegionShape::Guard)
-    return n; // a `dcp.select`: predicated, so no static span
+  if (n.shape == RegionShape::Guard) {
+    // A `dcp.select`: each arm is a done-paced sequence of its own, composed
+    // by `composeSpan`'s ceiling rule.
+    auto sel = cast<DCPathSelectOp>(op);
+    n.children = dcpSpanNodes(sel.getThenRegion().front(), /*topLevel=*/false);
+    if (!sel.getElseRegion().empty())
+      n.elseChildren =
+          dcpSpanNodes(sel.getElseRegion().front(), /*topLevel=*/false);
+    return n;
+  }
   if (n.shape == RegionShape::Container || n.shape == RegionShape::CallNode) {
     n.trip = asInt64(region.getTrip());
     n.children = dcpSpanNodes(op->getRegion(0).front(), /*topLevel=*/false);
@@ -369,11 +400,15 @@ SpanNode mlir::allo::dcpSpanNode(Operation *op, bool topLevel) {
   }
   // `drainTerms` prices a call into the drain from its CONTRACT, so a leaf
   // holding one without has no static span: its terminal cycle is a `done`.
-  // Only an ACYCLIC leaf holds a call at all, a cyclic one being a `CallNode`.
+  // A bounded contract makes the drain a ceiling instead. Only an ACYCLIC
+  // leaf holds a call at all, a cyclic one being a `CallNode`.
   bool waitsOnADone = false;
   for (Operation &inner : op->getRegion(0).front())
-    if (auto inv = dyn_cast<DCPathInstanceOp>(&inner))
+    if (auto inv = dyn_cast<DCPathInstanceOp>(&inner)) {
       waitsOnADone |= !inv.getLatency();
+      n.contractBound |= inv.getLatency() &&
+                         inv.getDeterminacy() != DeterminacyEnum::CountedStatic;
+    }
   if (!waitsOnADone)
     n.drain = asInt64(region.getDrain());
   if (isa<DCPathSequentialOp>(op)) {
@@ -413,17 +448,30 @@ RegionTiming mlir::allo::dcpRegionTiming(Operation *regionOp) {
     return t;
   }
   // CONDITIONAL: a guard or a while. Its own control decides when it ends, so
-  // no static span describes it.
+  // no exact span describes it; a guard whose arms both compose still carries
+  // the deeper arm's span as a ceiling.
   auto pipe = dyn_cast<DCPathPipelineOp>(regionOp);
-  if (isa<DCPathSelectOp>(regionOp) || (pipe && pipe.isWhileLoop())) {
+  if (pipe && pipe.isWhileLoop()) {
     t.determinacy = DeterminacyEnum::Conditional;
     return t;
   }
+  SpanNode n = dcpSpanNode(regionOp, /*topLevel=*/false);
+  std::optional<int64_t> span = composeSpan(n);
+  if (isa<DCPathSelectOp>(regionOp)) {
+    t.determinacy = DeterminacyEnum::Conditional;
+    t.boundedLatency = span;
+    return t;
+  }
   // COUNTED_STATIC when a span composes exactly, which is the contract a
-  // container may time-trigger against; INDETERMINATE otherwise, completing on
-  // its real `done`.
-  t.staticLatency = composeSpan(dcpSpanNode(regionOp, /*topLevel=*/false));
-  t.determinacy = t.staticLatency ? DeterminacyEnum::CountedStatic
-                                  : DeterminacyEnum::Indeterminate;
+  // container may time-trigger against; a span holding a ceiling (a guard, a
+  // bounded contract) is only waitable, so the region stays INDETERMINATE, as
+  // does one with no composable span at all.
+  if (span && spanHoldsBound(n)) {
+    t.boundedLatency = span;
+    return t;
+  }
+  t.staticLatency = span;
+  t.determinacy =
+      span ? DeterminacyEnum::CountedStatic : DeterminacyEnum::Indeterminate;
   return t;
 }

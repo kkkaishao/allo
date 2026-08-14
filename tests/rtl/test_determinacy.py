@@ -224,6 +224,79 @@ def test_the_latency_oracle_fails_only_the_unsound_direction():
         rtl._check_latency(span - 1)
 
 
+# A guard's span is a ceiling, the deeper arm's, published through
+# `latency_bound`: the kernel keeps a waitable figure instead of losing its
+# contract to one `if`. The bound is tight, so a run taking the deeper arm at
+# every guard lands exactly on it, and any other run stays under it; the cosim
+# oracle holds both directions on every run here.
+@needs_verilator
+def test_a_guard_publishes_the_deeper_arms_span_as_a_bound():
+    N, M = 8, 4
+
+    @kernel
+    def gsum(A: i32[N, M], flag: i32[M], out: i32[M]):
+        for j in range(M):
+            if flag[j] > 0:
+                acc: i32 = 0
+                for k in range(N):
+                    acc += A[k, j]
+                out[j] = acc
+
+    rtl = _to_rtl(gsum)
+    fn = rtl.schedule().func(rtl.top)
+    assert fn.latency is not None and fn.latency_is_bound
+    assert fn.determinacy == "indeterminate"  # waitable, never time-triggered
+    guard = rtl.schedule().regions(RegionKind.GUARD, wrappers=True)
+    assert guard and all(r.latency and r.latency_is_bound for r in guard)
+    iface = rtl.interfaces.of_symbol(rtl.top)
+    assert (iface.latency, iface.latency_is_bound) == (fn.latency, True)
+
+    A = np.arange(N * M, dtype=np.int32).reshape(N, M)
+    out = np.zeros(M, np.int32)
+    taken = rtl.cosim(A, np.ones(M, np.int32), out)
+    assert taken.cycles == fn.latency  # every guard takes the deeper arm
+    assert np.array_equal(out, A.sum(0))
+    out = np.zeros(M, np.int32)
+    skipped = rtl.cosim(A, np.zeros(M, np.int32), out)
+    assert skipped.cycles < fn.latency  # empty arms complete in two cycles
+
+
+# A bounded callee's contract composes onward as a bound: the instance carries
+# (latency, determinacy != counted_static), so the caller publishes a ceiling
+# of its own rather than overclaiming an exact span or dropping the figure.
+@needs_verilator
+def test_a_callers_span_composes_a_bounded_callee_as_a_bound():
+    N = 8
+
+    @kernel
+    def bc_leaf(a: i32[N], flag: i32, out: i32[N]):
+        if flag > 0:
+            for i in range(N):
+                out[i] = a[i] + 1
+        else:
+            out[0] = 0
+
+    @kernel
+    def bc_top(a: i32[N], flag: i32, out: i32[N]):
+        bc_leaf(a, flag, out)
+        for i in range(N):
+            out[i] = out[i] * 2
+
+    rtl = _to_rtl(bc_top)
+    for name in ("bc_leaf", "bc_top"):
+        fn = rtl.schedule().func(name)
+        assert fn.latency is not None and fn.latency_is_bound
+        assert fn.determinacy == "indeterminate"
+
+    a = np.arange(N, dtype=np.int32)
+    out = np.zeros(N, np.int32)
+    span = rtl.interfaces.of_symbol(rtl.top).latency
+    assert rtl.cosim(a, np.int32(1), out).cycles == span  # deeper arm, tight
+    assert np.array_equal(out, (a + 1) * 2)
+    out = np.zeros(N, np.int32)
+    assert rtl.cosim(a, np.int32(0), out).cycles < span
+
+
 # ---------------------------------------------------------------------------
 # What `indeterminate` costs a call: the partitioner must isolate it
 # ---------------------------------------------------------------------------

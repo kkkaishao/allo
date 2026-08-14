@@ -614,10 +614,14 @@ static void setDcpLatencies(DCPathModuleOp mod) {
     // Total, so a region with no static span is not left carrying whatever
     // `RegionAttrs` guessed before the region existed. An assume-bounded one is
     // the exception: `dcpSpanNode` reads that back as its `assumedSpan`.
-    if (t.staticLatency)
+    if (t.staticLatency) {
       region.setLatency(static_cast<uint64_t>(*t.staticLatency));
-    else if (!region.getLatencyBound())
+    } else if (t.boundedLatency) {
+      region.setLatency(static_cast<uint64_t>(*t.boundedLatency));
+      region.setLatencyBound(true);
+    } else if (!region.getLatencyBound()) {
       region.setLatency(std::nullopt);
+    }
     region.setDeterminacy(t.determinacy);
   });
 
@@ -650,19 +654,23 @@ static void setDcpLatencies(DCPathModuleOp mod) {
         allKnown = false;
     });
     if (container) {
-      // A span needs both every child's own contract and a static placement for
-      // them; a call inside a `while` or an unpredicated `if` has neither.
-      bool staticSpan = known && allKnown && !bounded;
-      if (staticSpan) {
+      // A span composes when every child carries a contract and every region
+      // has a placement; `bounded` marks the total a ceiling (a guard, an
+      // assumed trip, a bounded callee), which a caller may wait out. A
+      // concurrent composition's figure is a completion floor, never a bound.
+      bool composable = known && allKnown;
+      if (composable) {
         mod.setLatency(*total);
+        mod.setLatencyBound(!structural && bounded);
         checkLatencyBound(mod, *total, structural);
       }
       // A container holding an `await` spawn or a stream-wired child is
       // `concurrent`; a purely scheduled composition is `counted_static` or
       // `indeterminate`.
-      mod.setDeterminacy(structural   ? DeterminacyEnum::Concurrent
-                         : staticSpan ? DeterminacyEnum::CountedStatic
-                                      : DeterminacyEnum::Indeterminate);
+      mod.setDeterminacy(structural ? DeterminacyEnum::Concurrent
+                         : composable && !bounded
+                             ? DeterminacyEnum::CountedStatic
+                             : DeterminacyEnum::Indeterminate);
       // Only the kernel's class is stamped: it crosses a module boundary a
       // caller cannot see across. A region's own the emitter derives itself.
       return;
@@ -836,10 +844,7 @@ struct Reifier {
     n.trip = constantTripOf(loop);
     if (n.trip) {
       r.latency = composeSpan(n);
-      r.latencyBound = llvm::any_of(body, [](Operation &o) {
-        auto region = dyn_cast<DCPathRegionOpInterface>(&o);
-        return region && region.getLatencyBound();
-      });
+      r.latencyBound = r.latency.has_value() && spanHoldsBound(n);
     }
     return r;
   }
