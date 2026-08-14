@@ -1155,13 +1155,74 @@ def test_a_constant_table_is_priced_as_the_logic_it_is_built_from():
     assert est.mem_bits == 0, "a constant table is logic, not memory"
     assert est.by_kind["memories"].lut == 32
 
-    # Binding it to a block RAM changes nothing: the emission takes only the
-    # read latency from the row, so no BRAM tile is charged.
+    # The table is a storage row like any other, so binding the array elsewhere
+    # holds: it becomes a real memory that powers on with the same contents.
     s = rom.schedule()
     s.bind_storage("tbl", impl=Schedule.BRAM, mem_type=s.RAM_T2P)
     rtl = s.export("rtl")
     rtl.compile()
-    assert qor.estimate(rtl.report).area.bram36 == 0
+    assert qor.estimate(rtl.report).area.bram36 == 1
+    B = np.zeros(8, np.int32)
+    rtl.cosim(A8, B)
+    assert np.array_equal(B, table[A8 % 64])
+
+
+def test_a_table_too_deep_to_read_quickly_becomes_a_memory():
+    # A table's read is a cone through its LUTs and grows with the depth, where
+    # an addressed row's read delay is flat. Past the depth where the memory
+    # that would otherwise hold the array reads faster, the array is that
+    # memory instead -- one powering on with the same contents, so the kernel
+    # cannot tell which it got except by timing.
+    def table(depth):
+        vals = ((np.arange(depth, dtype=np.int32) * 2654435) >> 3) & 0xFFFF
+
+        @kernel
+        def look(A: i32[8], B: i32[8]):
+            tbl: i32[depth] = vals
+            for i in range(8):
+                idx: index = A[i] % depth
+                B[i] = tbl[idx]
+
+        m = _to_rtl(look)
+        mem = next(
+            mm
+            for f in m.report.microarch.funcs
+            for mm in f.mems
+            if mm.depth_words == depth
+        )
+        mlir = m.mlir
+        B = np.zeros(8, np.int32)
+        m.cosim(A8, B)
+        assert np.array_equal(B, vals[A8 % depth]), (depth, list(B))
+        return mem.realization, mem.storage, mlir
+
+    shallow, shallow_row, shallow_mlir = table(256)
+    assert (shallow, shallow_row) == ("rom", "rom")
+    assert "hw.aggregate_constant" in shallow_mlir
+
+    deep, deep_row, deep_mlir = table(1024)
+    assert (deep, deep_row) == ("ram", "bram")
+    # A real memory, and one that comes up holding the table: the contents ride
+    # to the backing register as an `initial` block.
+    assert "hw.aggregate_constant" not in deep_mlir
+    assert "seq.hlmem @tbl" in deep_mlir
+
+
+def test_binding_a_written_array_to_the_table_row_is_refused():
+    # The table has compile-time contents and no write port, so an array
+    # anything stores to cannot be held there. Reachable only by asking for it.
+    @kernel
+    def rmw(A: i32[8], B: i32[8]):
+        tbl: i32[8] = [1, 2, 3, 4, 5, 6, 7, 8]
+        for i in range(8):
+            tbl[i] = tbl[i] + A[i]
+        for i in range(8):
+            B[i] = tbl[i]
+
+    s = rmw.schedule()
+    s.bind_storage("tbl", impl=Schedule.ROM, mem_type=s.RAM_1P)
+    with pytest.raises(RuntimeError):
+        s.export("rtl").schedule()
 
 
 def test_a_table_a_sub_kernel_only_reads_is_still_a_table():
@@ -1496,8 +1557,9 @@ def test_a_storage_that_powers_up_undefined_cannot_hold_declared_contents():
     with pytest.raises(RuntimeError):
         s.export("rtl").schedule()
 
-    # A read-only table escapes it: it is realized as logic and never reaches
-    # the storage at all.
+    # A read-only table is refused there too. Left alone it is realized as
+    # logic, but an explicit `impl=` names the structure to build, and one that
+    # powers up undefined cannot be the one holding declared contents.
     @kernel
     def ro(A: i32[8], B: i32[8]):
         tbl: i32[8] = [1, 2, 3, 4, 5, 6, 7, 8]
@@ -1506,7 +1568,9 @@ def test_a_storage_that_powers_up_undefined_cannot_hold_declared_contents():
 
     s = ro.schedule()
     s.bind_storage("tbl", impl=Schedule.URAM, mem_type=s.RAM_T2P)
-    s.export("rtl").schedule()
+    with pytest.raises(RuntimeError):
+        s.export("rtl").schedule()
+    assert "hw.aggregate_constant" in _to_rtl(ro).mlir
 
 
 @kernel

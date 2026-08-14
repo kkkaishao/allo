@@ -487,13 +487,19 @@ LogicalResult DCPathStorageOp::verify() {
   if (getRdDelay().convertToDouble() < 0.0 ||
       getWrDelay().convertToDouble() < 0.0)
     return emitOpError("delay must be non-negative");
+  if (getIsScatter() && getIsTable())
+    return emitOpError("a row is one structure: `scatter` is a cell per "
+                       "element and `table` a constant lookup");
+  if (getIsTable() && getNoInit())
+    return emitOpError("a `table` row holds compile-time contents, so it "
+                       "cannot be one that powers up undefined");
   std::optional<uint64_t> pool = getInstPorts();
   for (std::optional<uint64_t> limit :
        {getInstReads(), getInstWrites(), pool}) {
     if (limit && *limit < 1)
       return emitOpError("a port limit must be at least one port");
-    if (limit && getIsScatter())
-      return emitOpError("a `scatter` row holds one cell per element and so "
+    if (limit && (getIsScatter() || getIsTable()))
+      return emitOpError("a `scatter` or `table` row is not addressed and so "
                          "has no port limit to declare");
     if (limit && pool && *limit > *pool)
       return emitOpError("a direction's port limit exceeds `inst_p`, but an "

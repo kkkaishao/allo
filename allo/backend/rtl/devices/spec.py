@@ -9,7 +9,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import NamedTuple
 
-from ..device import CombKind, Cost, Linear, Piecewise, Resource, Table
+from ..device import CombKind, Const, Cost, Linear, Piecewise, Resource, Table, Tiled
 
 #: Below this depth a delay chain stays in flip-flops; at or above it Vivado
 #: extracts a shift register, even with every stage reset. An SRL32E holds 32
@@ -56,11 +56,22 @@ MUX_LUT_COST = Piecewise(
 MULTIWRITE_LUT_PER_BIT = 2.0
 
 #: Entries of a constant table one LUT covers, per output bit. A LUT6 computes
-#: any function of six inputs, so it is a 64-entry one-bit lookup and a table
-#: costs ``width * ceil(depth / 64)`` of them; the wide multiplexers stitching a
-#: deeper table together ride the slice's own F7/F8 and cost nothing further.
-#: This is an upper bound: a table with regular contents minimizes below it.
+#: any function of six inputs, so it is a 64-entry one-bit lookup.
 ROM_ENTRIES_PER_LUT = 64
+
+#: LUT sites a ``depth`` x ``width`` constant table takes: one per 64 entries of
+#: each bit, plus one more per eight of those to select between them (the
+#: narrower selects ride the slice's own F7/F8 and take no site of their own).
+#: Measured on every fabric, which spell this cell alike: exactly 32 / 160 /
+#: 288 / 576 / 1152 LUT6 at 64 / 256 / 512 / 1024 / 2048 x 32, and within 1.4%
+#: at 4096 and 16384. A table with regular contents minimizes below it.
+ROM_LUT_COST = [
+    (Tiled(ROM_ENTRIES_PER_LUT), Linear(1.0)),
+    (
+        Piecewise(2 * ROM_ENTRIES_PER_LUT, Const(0.0), Tiled(8 * ROM_ENTRIES_PER_LUT)),
+        Linear(1.0),
+    ),
+]
 
 
 class Grade(NamedTuple):
@@ -102,9 +113,10 @@ class FabricTiming(NamedTuple):
     storage: Mapping[str, StorageTiming]
     #: A channel's own timing. ``read_latency`` is 0 because ``seq.fifo`` is
     #: show-ahead: the head is on the wire in the cycle ``valid`` is high. The
-    #: two delays are not characterized; they are copied from the ``srl`` row,
-    #: an SRL-backed FIFO's output being an SRL read. Retake them with a FIFO
-    #: DUT before trusting a chaining decision that turns on them.
+    #: two delays are not characterized; they are copied from the ``lutram``
+    #: row, an SRL-backed FIFO's output being a distributed-RAM read. Retake
+    #: them with a FIFO DUT before trusting a chaining decision that turns on
+    #: them.
     stream: StorageTiming
     reg_ns: float = 0.0
     #: The routed marginal delay of a one-hot select over its fan-in at a
@@ -113,6 +125,13 @@ class FabricTiming(NamedTuple):
     #: grade has not been measured.
     mux: Cost | None = None
     mux_w: Cost | None = None
+    #: The routed delay of a constant table's read over its DEPTH at the same
+    #: 32-bit reference width, and the factor its width scales it by. The one
+    #: read delay that grows with the array: a table deep enough not to close is
+    #: held in a memory instead. None where the grade has not been measured,
+    #: which leaves the table unrealizable there.
+    rom: Cost | None = None
+    rom_w: Cost | None = None
 
 
 class Derived(NamedTuple):
@@ -148,6 +167,9 @@ class StorageSpec(NamedTuple):
     inst_ports: int | None = None
     ram_style: str | None = None
     can_init: bool = True
+    #: Whether this is the constant table: a lookup built out of logic, no
+    #: address bus and no port limit, priced and timed over the array's shape.
+    is_table: bool = False
 
 
 class IPRow(NamedTuple):

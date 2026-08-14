@@ -80,7 +80,7 @@ class BindStorageImpl(Enum):
     BRAM = "bram"
     LUTRAM = "lutram"
     URAM = "uram"
-    SRL = "srl"
+    ROM = "rom"
 
 
 class BindStorageType(Enum):
@@ -120,7 +120,7 @@ class Schedule(Generic[P, R]):
     BRAM = BindStorageImpl.BRAM
     LUTRAM = BindStorageImpl.LUTRAM
     URAM = BindStorageImpl.URAM
-    SRL = BindStorageImpl.SRL
+    ROM = BindStorageImpl.ROM
 
     RAM_1P = BindStorageType.RAM_1P
     RAM_1WNR = BindStorageType.RAM_1WNR

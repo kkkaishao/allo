@@ -24,7 +24,7 @@ from . import ip
 from .spec import (
     MULTIWRITE_LUT_PER_BIT,
     MUX_LUT_COST,
-    ROM_ENTRIES_PER_LUT,
+    ROM_LUT_COST,
     SRL_MIN_DEPTH,
     Derived,
     FabricTiming,
@@ -96,7 +96,9 @@ TIMING: Mapping[Grade, FabricTiming] = {
             "lutram": StorageTiming(1, 1, 1.574, 1.718),
             "bram": StorageTiming(1, 1, 1.345, 0.510),
             "uram": StorageTiming(2, 1, 1.379, 0.444),
-            "srl": StorageTiming(1, 1, 1.574, 1.718),
+            # A table is never written; `rom` carries the read at the reference
+            # shape, which `rom` below refines at the array's own.
+            "rom": StorageTiming(1, 1, 1.864, 0.0),
         },
         stream=StorageTiming(0, 1, 1.574, 1.718),
         reg_ns=0.419,
@@ -106,6 +108,21 @@ TIMING: Mapping[Grade, FabricTiming] = {
             {2: 0.200, 3: 0.287, 4: 0.644, 6: 0.777, 8: 1.214, 16: 1.214, 40: 1.238}
         ),
         mux_w=Interp({1: 0.17, 8: 0.77, 16: 0.77, 32: 1.0, 64: 1.0}),
+        # A constant table's read, routed, over its depth at the same reference
+        # width. It grows with the address where every addressed row's is flat,
+        # which is what decides how deep a table is still worth building.
+        rom=Interp(
+            {
+                64: 0.654,
+                256: 1.380,
+                512: 1.753,
+                1024: 1.864,
+                2048: 2.328,
+                4096: 2.703,
+                16384: 3.254,
+            }
+        ),
+        rom_w=Interp({1: 0.66, 8: 0.92, 16: 0.92, 32: 1.0, 64: 1.10}),
     ),
     GRADE_2LV: FabricTiming(
         comb={
@@ -158,7 +175,7 @@ TIMING: Mapping[Grade, FabricTiming] = {
             "lutram": StorageTiming(1, 1, 1.311, 1.698),
             "bram": StorageTiming(1, 1, 1.871, 0.646),
             "uram": StorageTiming(2, 1, 2.391, 0.754),
-            "srl": StorageTiming(1, 1, 1.311, 1.698),
+            "rom": StorageTiming(1, 1, 2.282, 0.0),
         },
         stream=StorageTiming(0, 1, 1.311, 1.698),
         reg_ns=0.638,
@@ -175,6 +192,18 @@ TIMING: Mapping[Grade, FabricTiming] = {
             }
         ),
         mux_w=Interp({1: 0.36, 8: 0.59, 16: 0.59, 32: 1.0, 64: 1.20}),
+        rom=Interp(
+            {
+                64: 0.844,
+                256: 1.828,
+                512: 2.087,
+                1024: 2.282,
+                2048: 2.395,
+                4096: 2.713,
+                16384: 3.240,
+            }
+        ),
+        rom_w=Interp({1: 0.63, 8: 0.80, 16: 0.89, 32: 1.0, 64: 1.02}),
     ),
 }
 
@@ -292,6 +321,11 @@ IP_BY_GRADE: Mapping[Grade, Mapping[OperatorIP, IPRow | tuple[IPRow, ...]]] = {
 }
 
 
+#: SLICEM sites one bit of a 64-deep distributed RAM occupies: two, the array
+#: standing once per address bus, plus the packing overhead of the second copy.
+#: Measured at the 32-bit reference width.
+LUTRAM_SITES_PER_BIT = 2.5
+
 _STORAGE = {
     "register": StorageSpec(
         ("lut", "ff"),
@@ -304,19 +338,26 @@ _STORAGE = {
     # structures (no pool). A second read address costs a further copy of the
     # array: measured 640 / 1280 / 1920 / 2560 LUT as memory at 1024x32 for one
     # through four reads.
+    #
+    # A SLICEM LUT holds 64 bits, so a bit of a `d`-deep array takes
+    # `ceil(d/64)` sites, and a write port against a separate read address
+    # takes the array twice over. Measured 80 / 320 / 640 SLICEM at 64 / 256 /
+    # 512 x 32, which `LUTRAM_SITES_PER_BIT` lands on exactly.
     "lutram": StorageSpec(
         ("slicem_lut",),
-        lambda r: {r["slicem_lut"]: Tiled(64)},
+        lambda r: {r["slicem_lut"]: (Tiled(64), Linear(LUTRAM_SITES_PER_BIT))},
         inst_reads=1,
         inst_writes=1,
         ram_style="distributed",
     ),
-    # A shift register writes only at its head and reads one addressed tap.
-    "srl": StorageSpec(
-        ("slicem_lut",),
-        lambda r: {r["slicem_lut"]: Tiled(32)},
-        inst_reads=1,
-        inst_writes=1,
+    # A read-only table is not storage at all: one LUT6 is a 64-entry one-bit
+    # lookup and has no address bus to contend for. Its read is the cone
+    # through those LUTs, which is why it is the one row timed over the array's
+    # own shape.
+    "rom": StorageSpec(
+        ("lut",),
+        lambda r: {r["lut"]: ROM_LUT_COST},
+        is_table=True,
     ),
     # Two ports, each reading or writing in a cycle; two writers and a
     # concurrent reader together exceed the pool.
@@ -434,6 +475,8 @@ def build(part: Part) -> Device:
         spec = _STORAGE[name]
         if not all(n in res for n in spec.needs):
             continue
+        if spec.is_table and timing.rom is None:
+            continue  # unmeasured at this grade: no table can be timed here
         d.add_storage(
             name,
             read_latency=t.read_latency,
@@ -441,12 +484,15 @@ def build(part: Part) -> Device:
             read_delay_ns=t.read_ns,
             write_delay_ns=t.write_ns,
             is_scatter=name == SCATTER_STORAGE,
+            is_table=spec.is_table,
             inst_reads=spec.inst_reads,
             inst_writes=spec.inst_writes,
             inst_ports=spec.inst_ports,
             ram_style=spec.ram_style,
             can_init=spec.can_init,
             uses=spec.uses(res),
+            read_delay_depth=timing.rom if spec.is_table else None,
+            read_delay_width=timing.rom_w if spec.is_table else None,
         )
     d.set_stream_timing(*timing.stream)
 
@@ -469,8 +515,6 @@ def build(part: Part) -> Device:
         d.set_mux_delay(timing.mux, timing.mux_w)
     d.set_chain_uses(_chain_uses(res))
     d.set_chain_uses_norst(_chain_uses_norst(res))
-    # A constant table is logic, not storage: one LUT is a 64-entry lookup.
-    d.set_rom_uses({res["lut"]: (Tiled(ROM_ENTRIES_PER_LUT), Linear(1.0))})
     d.set_register_floor(timing.reg_ns)
     d.set_default_frequency(part.grade.default_freq_mhz)
     return d.validate()

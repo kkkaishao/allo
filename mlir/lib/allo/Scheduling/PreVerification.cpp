@@ -371,6 +371,18 @@ LogicalResult checkMemories(func::FuncOp func, const MemoryLibrary &memLib,
              "registers; the two cannot both hold. Drop one of them";
       return failure();
     }
+    // Only an initialized array nothing writes is a constant table: the row is
+    // a lookup built out of logic, with no port to take a store. Reachable
+    // only through an explicit binding, since nothing else resolves here.
+    if (memLib.isTable(storage) && !isa<BlockArgument>(array) &&
+        !isConstantTable(array)) {
+      error(Stage::Prep, Code::ArrayLayoutConflict, anchor)
+          << "Array " << array.getType() << " is bound to storage '" << storage
+          << "', which is a constant table: it holds compile-time contents and "
+             "has no write port. Declare the array with its contents and write "
+             "it nowhere, or bind it to a storage that can be written";
+      return failure();
+    }
     // The emitter realizes compile-time contents as one bank: a constant table
     // is a single `hw.aggregate_constant` and a written one a single `initial`
     // block. A complete partition is not banking and stays legal.
@@ -490,7 +502,7 @@ LogicalResult checkArgumentAgreement(func::FuncOp func,
     if (!callee || callee.isExternal())
       return WalkResult::advance();
     for (auto [k, actual] : llvm::enumerate(call.getArgOperands())) {
-      if (!isa<MemRefType>(actual.getType()) || isConstantTable(actual))
+      if (!isa<MemRefType>(actual.getType()))
         continue;
       BlockArgument param = callee.getArgument(k);
       BankLayout here = bankLayoutOf(actual);

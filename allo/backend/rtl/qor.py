@@ -302,15 +302,6 @@ def estimate(report: CompileReport, device: Device = default_device) -> QoR:
             # A boundary port, or cells the register ledger already holds.
             if m.realization in {"boundary", "scatter"}:
                 continue
-            if m.realization == "rom":
-                # A read-only table is built out of logic and holds no memory
-                # bits; its `storage` row only supplied the read latency.
-                charge(
-                    "memories",
-                    f.func,
-                    Utilization.of(price(device.rom_uses, (m.depth_words, m.width))),
-                )
-                continue
             row = device.storage.get(m.storage)
             if row is None:
                 # This part declares no such row, which happens when a report
@@ -318,9 +309,11 @@ def estimate(report: CompileReport, device: Device = default_device) -> QoR:
                 unmodelled[m.storage] += 1
                 continue
             # An addressed array costs its row once per instance and once per
-            # bank.
+            # bank. A constant table is one lookup built out of logic, so it is
+            # priced the same way and holds no memory bits.
             copies = m.cost.instances * m.banks
-            mem_bits += m.bits * m.cost.instances
+            if m.realization != "rom":
+                mem_bits += m.bits * m.cost.instances
             charge(
                 "memories",
                 f.func,

@@ -56,11 +56,12 @@ static MemId createMem(Datapath &dp, llvm::DenseMap<Value, MemId> &memOf,
   // (allo.part / allo.bind.storage), so the ports billed and the ports built
   // cannot disagree.
   MemoryChar mc = allo::characterize(memref, dev.memory);
-  // Power-on contents, when the array reads through an initialized global.
-  // Whether that makes it a constant table is settled by `collectStorageFacts`,
-  // once every writer is in view.
+  // Power-on contents, when the array reads through an initialized global, and
+  // whether the resolved row makes them a combinational table rather than a
+  // memory that starts with them.
   if (auto init = allo::globalInitOf(memref))
     m.romInit = *init;
+  m.isRom = mc.constantTable;
   m.layout = mc.layout;
   m.numBanks = m.layout.numBanks;
   // The device row says whether the array is held one cell per element. A
@@ -89,9 +90,9 @@ static MemId createMem(Datapath &dp, llvm::DenseMap<Value, MemId> &memOf,
 }
 
 void DatapathBuilder::collectStorageFacts(ArrayRef<Operation *> regionOps) {
-  // Whether anything writes each array, indexed by MemId. Read-only is a
-  // property of the use, so it is settled only once every region body and every
-  // callee interface has been looked at.
+  // Whether anything writes each array, indexed by MemId: the check that the
+  // recorded realization holds here, since a table with a writer would drop
+  // every store.
   llvm::SmallVector<bool> written;
   auto touch = [&](Value memref, bool isWrite) {
     MemId id = createMem(dp, memOf, dev, memref);
@@ -122,13 +123,13 @@ void DatapathBuilder::collectStorageFacts(ArrayRef<Operation *> regionOps) {
       }
     });
 
-  // An initialized array nothing writes is a combinational constant table. An
-  // argument never is: a block argument reads through no global, so it carries
-  // no contents to begin with.
   for (MemUnit &m : dp.mems) {
     assert(!(m.romInit && m.external) &&
            "an argument array reads through no initialized global");
-    m.isRom = m.romInit && !m.external && !written[m.id];
+    assert((!m.isRom || (m.romInit && !written[m.id])) &&
+           "an array resolved to the device's `table` row is initialized and "
+           "written by nobody, which `isConstantTable` decided before the "
+           "storage record was taken");
   }
 }
 

@@ -141,10 +141,18 @@ struct StorageRealization {
   /// Whether this is the row that is not a memory: one cell per element, no
   /// address, which is where a complete partition goes.
   bool scatter = false;
+  /// Whether this is the row that is not a memory either: a constant lookup
+  /// built out of logic, no address bus and no port limit, which is where a
+  /// read-only initialized array goes.
+  bool table = false;
   /// What one instance spends over `(depth, width)`, the row's `uses`
   /// verbatim. Held as the attribute because the price is only meaningful at an
   /// array's own shape. Null where the device left the row unpriced.
   mlir::ArrayAttr uses;
+  /// The read delay over the array's depth, and the factor its width scales it
+  /// by. Null on a row whose delay is the same at every shape, where
+  /// `timing.delay.read` stands alone.
+  CostAttr rdDelayDepth, rdDelayWidth;
 };
 
 /// The storage-timing library, filled from the `dcp.storage` and
@@ -187,6 +195,21 @@ public:
     return !scatterStorage.empty() && storage == scatterStorage;
   }
 
+  /// Whether \p storage is the row the device marked `table`: a combinational
+  /// constant lookup, no address bus, no port limit. False for every row when
+  /// the device marks none, which realizes every constant table as a memory
+  /// there.
+  bool isTable(llvm::StringRef storage) const {
+    return !tableStorage.empty() && storage == tableStorage;
+  }
+
+  /// The read delay (ns) of \p storage holding \p words x \p width: the row's
+  /// own `rd_delay`, or its depth curve scaled by its width factor where it
+  /// declares one. THE read delay: a row whose cone grows with the array is
+  /// timed and chosen by one number.
+  double readDelay(llvm::StringRef storage, int64_t words,
+                   unsigned width) const;
+
   /// What one bank of \p words x \p width of \p storage spends, as a fraction
   /// of the part: the worst of its resources, the axis a design runs out on.
   /// Nullopt where the row is unpriced, where a cost is not measured at this
@@ -201,7 +224,13 @@ public:
   /// latency being the contract the schedule is built on. \p needsInit excludes
   /// a row that powers up undefined. Empty where the device declares nothing it
   /// can both pin and price, and `defaultStorage` then stands.
-  std::string rowFor(int64_t words, unsigned width, bool needsInit) const;
+  ///
+  /// \p canTable admits the `table` row, which only an initialized array
+  /// nothing writes may take, and which is kept only while its read is no
+  /// slower than the memory it would displace: the table is the cheapest row
+  /// at every shape, so its cone is what bounds how deep it is worth building.
+  std::string rowFor(int64_t words, unsigned width, bool needsInit,
+                     bool canTable) const;
 
   // The `dcp.storage` marked `default`, empty where the device marks none, in
   // which case `rowFor` chooses. A name rather than a handle, so replacing a
@@ -211,6 +240,10 @@ public:
   // `scatter`, EMPTY when the device marks none. The compiler names no storage
   // of its own, so this is the one place the two axes meet.
   std::string scatterStorage;
+  // What a read-only initialized array resolves to where its cone closes: the
+  // `dcp.storage` marked `table`, EMPTY when the device marks none, which
+  // realizes every constant table as a memory.
+  std::string tableStorage;
   std::vector<StorageRealization> storage; // the `dcp.storage` rows
   MemKindTiming fifo;                      // `dcp.stream_timing`
   /// How much of each `dcp.resource` the part has, which turns a row's spend
@@ -228,19 +261,21 @@ public:
 /// declared contents, or nullopt when it has none.
 std::optional<Attribute> globalInitOf(Value memRef);
 
-/// Whether \p memRef is a CONSTANT TABLE: it has a `memref.global` initializer
-/// and nothing writes it. Read-only is a property of the USE, not the
+/// Whether \p memRef is ELIGIBLE to be a constant table: it has a
+/// `memref.global` initializer and nothing writes it, here or through a
+/// sub-kernel it is handed to. Read-only is a property of the USE, not the
 /// declaration: an initialized array stored to even once is a real memory that
 /// merely starts with contents.
 ///
+/// Eligibility, not the realization: whether the table is what gets BUILT is
+/// `recordArrayStorage`'s decision, since a table deep enough not to close is
+/// better held in a memory that starts with the same contents. Read it through
+/// `MemoryChar::constantTable`, never here.
+///
 /// A constant table lowers to `hw.aggregate_constant` read by one
 /// `hw.array_get` per access: combinational, no handshake, genuinely
-/// UNLIMITED-port. Narrower than `MemoryChar::readOnly`: an explicit
-/// `bind.storage type="rom_1p"` is a real memory whose ports the user chose.
-///
-/// Handing the array to a SUB-KERNEL also disqualifies it: a child MASTERS
-/// PORTS, driving addr/data/we into storage the parent owns, and a constant
-/// table has none to master.
+/// UNLIMITED-port. A child that only READS one is served the same way, off the
+/// parent's table; a child that writes is what disqualifies the array.
 bool isConstantTable(Value memRef);
 
 /// The `allo.bind.storage impl=` written on \p memref: what was ASKED for,
@@ -345,7 +380,10 @@ struct MemoryChar {
   /// row's, narrowed by the `allo.bind.storage type=` topology. One budget for
   /// the scheduler and the emitter both.
   StoragePorts ports;
-  bool constantTable = false; // realized as a combinational constant array
+  /// Realized as a combinational constant array: the resolved row is the
+  /// device's `table` and this carrier OWNS the array. A parameter is not, the
+  /// cells being the caller's and this side holding an addressed port on them.
+  bool constantTable = false;
   /// The `dcp.storage` realization recorded for this array (`kStorageAttr`),
   /// read rather than re-resolved. Empty only for the one array that has
   /// nowhere to go, a complete partition on a device marking no `scatter` row,

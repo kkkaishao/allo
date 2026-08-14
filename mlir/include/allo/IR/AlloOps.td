@@ -595,10 +595,23 @@ def DCPathStorageOp : DCPath_Op<"dcp.storage",
     declares at most one, under whatever name its primitives go by, and a
     device that declares none cannot hold a complete partition.
 
+    `table` marks the row that is not a memory either: a read-only constant
+    array, built out of logic as one combinational lookup per access, with no
+    address bus and therefore no port limit. Only an initialized array nothing
+    writes can resolve here, and unlike every other row its read delay grows
+    with the array, which is what `rd_delay_depth`/`rd_delay_width` carry and
+    what keeps a deep table from being chosen where it cannot close.
+
     `rd_latency`/`wr_latency` are the cycles an access costs and
     `rd_delay`/`wr_delay` its combinational delay in ns: the scheduler times
     every access against the row its array resolves to and the emitter builds
     the ports at exactly those latencies, so the two cannot drift.
+
+    `rd_delay_depth` and `rd_delay_width` refine the read delay where it depends
+    on the array's SHAPE: the delay at a depth, scaled by a factor of the width
+    measured at a reference width. Both optional, and where they are given
+    `rd_delay` is the same curve at the row's reference shape, which is what a
+    caller with no array in hand reads.
 
     `inst_rd`/`inst_wr` are how many ports of each direction one instance of the
     structure has, omitted where it has no limit, and `inst_p` how many it has
@@ -628,8 +641,11 @@ def DCPathStorageOp : DCPath_Op<"dcp.storage",
     SymbolNameAttr:$sym_name,
     UnitAttr:$is_default,
     UnitAttr:$is_scatter,
+    UnitAttr:$is_table,
     I64Attr:$rd_latency, F32Attr:$rd_delay,
     I64Attr:$wr_latency, F32Attr:$wr_delay,
+    OptionalAttr<CostAttr>:$rd_delay_depth,
+    OptionalAttr<CostAttr>:$rd_delay_width,
     OptionalAttr<I64Attr>:$inst_reads,
     OptionalAttr<I64Attr>:$inst_writes,
     OptionalAttr<I64Attr>:$inst_ports,
@@ -638,9 +654,10 @@ def DCPathStorageOp : DCPath_Op<"dcp.storage",
     OptionalAttr<ArrayAttr>:$uses);
   let assemblyFormat = [{
     $sym_name (`default` $is_default^)? (`scatter` $is_scatter^)?
-    (`no_init` $no_init^)?
+    (`table` $is_table^)? (`no_init` $no_init^)?
     `rd` `=` $rd_latency `,` $rd_delay
     `wr` `=` $wr_latency `,` $wr_delay
+    (`rd_depth` `=` $rd_delay_depth^)? (`rd_width` `=` $rd_delay_width^)?
     (`inst_rd` `=` $inst_reads^)? (`inst_wr` `=` $inst_writes^)?
     (`inst_p` `=` $inst_ports^)?
     (`style` `=` $ram_style^)?

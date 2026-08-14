@@ -185,15 +185,20 @@ std::optional<Attribute> mlir::allo::globalInitOf(Value memRef) {
   return std::nullopt;
 }
 
+static bool calleeWrites(func::CallOp call, Value memRef);
+
 bool mlir::allo::isConstantTable(Value memRef) {
   if (!globalInitOf(memRef))
     return false;
   // A write is an `affine`/`memref` store before reification and a `dcp.store`
-  // after, so cover both. A sub-kernel call disqualifies the array whichever
-  // way the child accesses it (see the header).
-  return llvm::none_of(memRef.getUsers(), [](Operation *u) {
-    if (isa<dcp::DCPathStoreOp, func::CallOp, dcp::DCPathInstanceOp>(u))
+  // after, so cover both. A child that only reads is served off the parent's
+  // table (`PortPlan::Table`), so only a child that WRITES disqualifies it; a
+  // reified instance is opaque here and always does.
+  return llvm::none_of(memRef.getUsers(), [&](Operation *u) {
+    if (isa<dcp::DCPathStoreOp, dcp::DCPathInstanceOp>(u))
       return true;
+    if (auto call = dyn_cast<func::CallOp>(u))
+      return calleeWrites(call, memRef);
     auto a = asMemAccess(u);
     return a && a->isWrite;
   });
@@ -265,7 +270,9 @@ static unsigned writingCalls(Value memRef) {
 //     since an addressed structure has no more write ports than it has ports
 //     and only registers take a write decoder per writer. Not for an argument,
 //     whose cells this module only holds ports on;
-//   * else the device's `default` row where it marks one;
+//   * else the device's `default` row where it marks one. Not for a constant
+//     table, which is resolved by cost: the `table` row is a realization only
+//     it can take, and whether it closes depends on its own shape;
 //   * else the row `rowFor` derives from what the array costs on this part.
 //
 // An empty result is a device that can hold this array nowhere, which
@@ -283,7 +290,8 @@ static std::string deriveStorage(Value memRef, const MemoryLibrary &lib) {
     return bs.storage.str();
   if (!isa<BlockArgument>(memRef) && writingCalls(memRef) > 1)
     return lib.scatterStorage;
-  if (!lib.defaultStorage.empty())
+  bool canTable = isConstantTable(memRef);
+  if (!lib.defaultStorage.empty() && !canTable)
     return lib.defaultStorage;
   auto type = dyn_cast<MemRefType>(memRef.getType());
   if (!type)
@@ -292,7 +300,7 @@ static std::string deriveStorage(Value memRef, const MemoryLibrary &lib) {
   // factor across the rows and cannot reorder them, but a row's tiling minimum
   // is charged once per bank and can.
   return lib.rowFor(layout.bankWords(), datapathWidth(type.getElementType()),
-                    globalInitOf(memRef).has_value());
+                    globalInitOf(memRef).has_value(), canTable);
 }
 
 std::string allo::resolvedStorageOf(Value memRef) {
@@ -907,11 +915,16 @@ MemoryLibrary MemoryLibrary::fromModule(ModuleOp module) {
                          s.getRamStyle().value_or("").str(),
                          !s.getNoInit(),
                          s.getIsScatter(),
-                         s.getUsesAttr()});
+                         s.getIsTable(),
+                         s.getUsesAttr(),
+                         s.getRdDelayDepthAttr(),
+                         s.getRdDelayWidthAttr()});
     if (s.getIsDefault())
       m.defaultStorage = s.getSymName().str();
     if (s.getIsScatter())
       m.scatterStorage = s.getSymName().str();
+    if (s.getIsTable())
+      m.tableStorage = s.getSymName().str();
   }
   for (auto st : body.getOps<dcp::DCPathStreamTimingOp>())
     m.fifo = timing(st);
@@ -944,14 +957,37 @@ std::optional<double> MemoryLibrary::fractionOfPart(StringRef storage,
   return worst;
 }
 
-std::string MemoryLibrary::rowFor(int64_t words, unsigned width,
-                                  bool needsInit) const {
+double MemoryLibrary::readDelay(StringRef storage, int64_t words,
+                                unsigned width) const {
+  const StorageRealization *s = row(storage);
+  if (!s)
+    return 0.0;
+  if (!s->rdDelayDepth)
+    return s->timing.delay.read;
+  // Outside the measured depths the curve holds at its end, as every other
+  // measured row is read: a deeper table than was ever built is priced at the
+  // deepest one that was.
+  auto clampEval = [](CostAttr c, int64_t p) {
+    auto [lo, hi] = c.measuredDomain();
+    return *c.evaluate(std::clamp(p, lo, hi));
+  };
+  double d = clampEval(s->rdDelayDepth, words);
+  if (s->rdDelayWidth)
+    d *= clampEval(s->rdDelayWidth, width);
+  return d;
+}
+
+std::string MemoryLibrary::rowFor(int64_t words, unsigned width, bool needsInit,
+                                  bool canTable) const {
   // Only a row the device can pin is a candidate, so the structure chosen here
   // is the one built. A row with no vendor attribute stays reachable through
-  // `bind_storage impl=`.
+  // `bind_storage impl=`; the `table` row carries none because it is not an
+  // array declaration the synthesizer is told anything about.
   llvm::SmallVector<std::pair<const StorageRealization *, double>> viable;
   for (const StorageRealization &s : this->storage) {
-    if (s.scatter || s.ramStyle.empty() || (needsInit && !s.canInit))
+    if (s.scatter || (needsInit && !s.canInit))
+      continue;
+    if (s.table ? !canTable : s.ramStyle.empty())
       continue;
     if (auto cost = fractionOfPart(s.name, words, width))
       viable.emplace_back(&s, *cost);
@@ -966,22 +1002,41 @@ std::string MemoryLibrary::rowFor(int64_t words, unsigned width,
   if (llvm::any_of(viable, fits))
     llvm::erase_if(viable, [&](const auto &v) { return !fits(v); });
   // Read latency first, then write: a deeper row is out however cheap it is.
+  // Strictly cheaper to displace, so rows priced the same break by declaration
+  // order.
   auto latency = [](const StorageRealization *s) {
     return std::pair(s->timing.latency.read, s->timing.latency.write);
   };
-  auto fastest = latency(llvm::min_element(viable, [&](auto &a, auto &b) {
-                           return latency(a.first) < latency(b.first);
-                         })->first);
-  // Strictly cheaper to displace, so rows priced the same break by declaration
-  // order.
-  const StorageRealization *pick = nullptr;
-  double best = 0.0;
-  for (auto &[s, cost] : viable)
-    if (latency(s) == fastest && (!pick || cost < best)) {
-      pick = s;
-      best = cost;
-    }
-  return pick->name;
+  auto cheapestAtLeastLatency =
+      [&](llvm::ArrayRef<std::pair<const StorageRealization *, double>> rows) {
+        const StorageRealization *pick = nullptr;
+        double best = 0.0;
+        auto fastest = latency(llvm::min_element(rows, [&](auto &a, auto &b) {
+                                 return latency(a.first) < latency(b.first);
+                               })->first);
+        for (auto &[s, cost] : rows)
+          if (latency(s) == fastest && (!pick || cost < best)) {
+            pick = s;
+            best = cost;
+          }
+        return pick;
+      };
+  // What bounds a constant table's depth. The table is the cheapest row at
+  // every shape these parts hold, so cost alone would take it at any size; what
+  // it spends instead is READ DELAY, the one that grows with the array where an
+  // addressed row's is flat. Take it only while it is no slower than the memory
+  // that would otherwise hold it, which starts holding the same contents.
+  llvm::SmallVector<std::pair<const StorageRealization *, double>> memories(
+      llvm::make_filter_range(viable,
+                              [](const auto &v) { return !v.first->table; }));
+  if (!memories.empty()) {
+    const StorageRealization *mem = cheapestAtLeastLatency(memories);
+    double bar = readDelay(mem->name, words, width);
+    llvm::erase_if(viable, [&](const auto &v) {
+      return v.first->table && readDelay(v.first->name, words, width) > bar;
+    });
+  }
+  return cheapestAtLeastLatency(viable)->name;
 }
 
 MemKindTiming MemoryLibrary::timing(StringRef name) const {
@@ -1011,6 +1066,11 @@ MemoryLibrary::Timing MemoryLibrary::timing(Operation *op) const {
     assert(!name.empty() &&
            "an array access resolves to a storage realization");
     t = timing(name);
+    // At the array's own shape where the row's read delay depends on it, which
+    // is the number `rowFor` chose the row by.
+    if (auto mt = dyn_cast<MemRefType>(a->root.getType()))
+      t.delay.read = readDelay(name, bankLayoutOf(a->root).bankWords(),
+                               datapathWidth(mt.getElementType()));
   }
   return a->isWrite ? Timing{t.latency.write, t.delay.write, name}
                     : Timing{t.latency.read, t.delay.read, name};
@@ -1018,9 +1078,12 @@ MemoryLibrary::Timing MemoryLibrary::timing(Operation *op) const {
 
 MemoryChar allo::characterize(Value memref, const MemoryLibrary &lib) {
   MemoryChar c;
-  c.constantTable = isConstantTable(memref);
   c.layout = bankLayoutOf(memref);
   c.storage = resolvedStorageOf(memref);
+  // The realization is the recorded decision, not a second derivation of it.
+  // An argument is never the table itself: the cells are the caller's and this
+  // side masters an addressed port on them, which is a port to contend for.
+  c.constantTable = lib.isTable(c.storage) && !isa<BlockArgument>(memref);
   // The realization decides what the array has and a `type=` topology narrows
   // it, the meet keeping the tighter of the two. `PreVerification` reports a
   // topology asking for more than the row has. An argument is held in the same

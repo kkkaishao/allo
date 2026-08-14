@@ -24,7 +24,7 @@ from . import ip
 from .spec import (
     MULTIWRITE_LUT_PER_BIT,
     MUX_LUT_COST,
-    ROM_ENTRIES_PER_LUT,
+    ROM_LUT_COST,
     SRL_MIN_DEPTH,
     Derived,
     FabricTiming,
@@ -95,7 +95,9 @@ TIMING: Mapping[Grade, FabricTiming] = {
             "lutram": StorageTiming(1, 1, 1.268, 1.196),
             "bram": StorageTiming(1, 1, 1.299, 0.673),
             "uram": StorageTiming(2, 1, 1.057, 0.485),
-            "srl": StorageTiming(1, 1, 1.268, 1.196),
+            # A table is never written; `rom` carries the read at the reference
+            # shape, which `rom` below refines at the array's own.
+            "rom": StorageTiming(1, 1, 1.779, 0.0),
         },
         stream=StorageTiming(0, 1, 1.268, 1.196),
         reg_ns=0.410,
@@ -114,6 +116,21 @@ TIMING: Mapping[Grade, FabricTiming] = {
             }
         ),
         mux_w=Interp({1: 0.64, 8: 0.90, 16: 0.94, 32: 1.0, 64: 1.25}),
+        # A constant table's read, routed, over its depth at the same reference
+        # width. It grows with the address where every addressed row's is flat,
+        # which is what decides how deep a table is still worth building.
+        rom=Interp(
+            {
+                64: 0.912,
+                256: 1.362,
+                512: 1.535,
+                1024: 1.779,
+                2048: 1.919,
+                4096: 1.963,
+                16384: 2.437,
+            }
+        ),
+        rom_w=Interp({1: 0.70, 8: 0.83, 16: 0.92, 32: 1.0, 64: 1.06}),
     ),
 }
 
@@ -192,6 +209,12 @@ IP: Mapping[OperatorIP, IPRow | tuple[IPRow, ...]] = {
 }
 
 
+#: SLICEM sites one bit of a 64-deep distributed RAM occupies: two, the array
+#: standing once per address bus, plus the packing overhead of the second copy.
+#: Measured at the 32-bit reference width (120 / 480 / 960 sites at 64 / 256 /
+#: 512 x 32).
+LUTRAM_SITES_PER_BIT = 3.75
+
 _STORAGE = {
     "register": StorageSpec(
         ("lut", "ff"),
@@ -206,17 +229,19 @@ _STORAGE = {
     # through four reads.
     "lutram": StorageSpec(
         ("slicem_lut",),
-        lambda r: {r["slicem_lut"]: Tiled(64)},
+        lambda r: {r["slicem_lut"]: (Tiled(64), Linear(LUTRAM_SITES_PER_BIT))},
         inst_reads=1,
         inst_writes=1,
         ram_style="distributed",
     ),
-    # A shift register writes only at its head and reads one addressed tap.
-    "srl": StorageSpec(
-        ("slicem_lut",),
-        lambda r: {r["slicem_lut"]: Tiled(32)},
-        inst_reads=1,
-        inst_writes=1,
+    # A read-only table is not storage at all: one LUT6 is a 64-entry one-bit
+    # lookup, so it costs `width * ceil(depth/64)` of them and has no address
+    # bus to contend for. Its read is the cone through those LUTs, which is why
+    # it is the one row timed over the array's own shape.
+    "rom": StorageSpec(
+        ("lut",),
+        lambda r: {r["lut"]: ROM_LUT_COST},
+        is_table=True,
     ),
     # Two ports, each reading or writing in a cycle; two writers and a
     # concurrent reader together exceed the pool.
@@ -334,6 +359,8 @@ def build(part: Part) -> Device:
         spec = _STORAGE[name]
         if not all(n in res for n in spec.needs):
             continue
+        if spec.is_table and timing.rom is None:
+            continue  # unmeasured at this grade: no table can be timed here
         d.add_storage(
             name,
             read_latency=t.read_latency,
@@ -341,12 +368,15 @@ def build(part: Part) -> Device:
             read_delay_ns=t.read_ns,
             write_delay_ns=t.write_ns,
             is_scatter=name == SCATTER_STORAGE,
+            is_table=spec.is_table,
             inst_reads=spec.inst_reads,
             inst_writes=spec.inst_writes,
             inst_ports=spec.inst_ports,
             ram_style=spec.ram_style,
             can_init=spec.can_init,
             uses=spec.uses(res),
+            read_delay_depth=timing.rom if spec.is_table else None,
+            read_delay_width=timing.rom_w if spec.is_table else None,
         )
     d.set_stream_timing(*timing.stream)
 
@@ -369,8 +399,6 @@ def build(part: Part) -> Device:
         d.set_mux_delay(timing.mux, timing.mux_w)
     d.set_chain_uses(_chain_uses(res))
     d.set_chain_uses_norst(_chain_uses_norst(res))
-    # A constant table is logic, not storage: one LUT is a 64-entry lookup.
-    d.set_rom_uses({res["lut"]: (Tiled(ROM_ENTRIES_PER_LUT), Linear(1.0))})
     d.set_register_floor(timing.reg_ns)
     d.set_default_frequency(part.grade.default_freq_mhz)
     return d.validate()

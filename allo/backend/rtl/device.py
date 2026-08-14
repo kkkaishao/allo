@@ -252,6 +252,10 @@ class Storage:  # pylint: disable=too-many-instance-attributes
     # limit. A completely partitioned array resolves here whatever it would
     # otherwise have taken, and a device declares at most one.
     is_scatter: bool = False
+    # The other row that is not a memory: a constant lookup built out of logic,
+    # no address bus and no port limit. Only a read-only array declared with
+    # contents can resolve here, and a device declares at most one.
+    is_table: bool = False
     # Ports of each direction one instance of the structure has, `None` for no
     # limit. The limit is per instance, not per array: the compiler decides how
     # many instances hold an array, every copy taking every write.
@@ -273,6 +277,12 @@ class Storage:  # pylint: disable=too-many-instance-attributes
     # What it spends. Storage carries two parameters, `(depth, width)`, so each
     # entry is two cost factors or one `Tiled`.
     uses: Spend = ()
+    # The read delay over the array's DEPTH, and the factor its width scales it
+    # by, for a row whose cone grows with the array (a constant table's does;
+    # an addressed row's does not). Where they are given, `read_delay_ns` is the
+    # same curve at the row's reference shape.
+    read_delay_depth: Cost | None = None
+    read_delay_width: Cost | None = None
 
 
 @dataclass(frozen=True)
@@ -360,7 +370,6 @@ class Device:
         # fabric extract a shift register; the ledger's `reset` flag picks
         # between the two rows.
         self.chain_uses_norst: Spend = ()
-        self.rom_uses: Spend = ()
         self.storage: dict[str, Storage] = {}
         # The default is a NAME, not a handle: redeclaring a row (a copied
         # device retuned) must not leave it pointing at the replaced one.
@@ -464,12 +473,15 @@ class Device:
         read_delay_ns: float = 0.0,
         write_delay_ns: float = 0.0,
         is_scatter: bool = False,
+        is_table: bool = False,
         inst_reads: int | None = None,
         inst_writes: int | None = None,
         inst_ports: int | None = None,
         ram_style: str | None = None,
         can_init: bool = True,
         uses: dict[Resource, Cost | Sequence] | None = None,
+        read_delay_depth: Cost | None = None,
+        read_delay_width: Cost | None = None,
     ) -> Storage:
         """Declare a storage realization and return the handle ``bind_storage``
         and :meth:`set_default_storage` refer to.
@@ -482,6 +494,14 @@ class Device:
         element, which is what a completely partitioned array becomes. A device
         marks at most one, and one that marks none cannot hold a complete
         partition.
+
+        ``is_table`` marks the other row that is not a memory: a constant
+        lookup built out of logic, which is what a read-only array declared
+        with contents becomes. A device marks at most one, and one that marks
+        none realizes every such array as a memory that powers on holding them.
+        Its read delay grows with the array, so it declares
+        ``read_delay_depth``; a table too deep to close at the target clock is
+        held in a memory instead.
 
         ``inst_reads`` / ``inst_writes`` are the ports of each direction one
         instance has, omitted where there is no limit; a scatter row declares
@@ -515,9 +535,9 @@ class Device:
         for role, limit in limits:
             if limit is not None and limit < 1:
                 raise ValueError(f"storage {name!r}: {role} must be at least one port")
-            if limit is not None and is_scatter:
+            if limit is not None and (is_scatter or is_table):
                 raise ValueError(
-                    f"storage {name!r} holds one cell per element, so it has no "
+                    f"storage {name!r} is not addressed, so it has no "
                     f"{role} to declare"
                 )
         for role, limit in limits[:2]:
@@ -526,14 +546,30 @@ class Device:
                     f"storage {name!r}: {role}={limit} exceeds inst_ports={inst_ports},"
                     " but an access of either direction takes one port of the pool"
                 )
-        other = next(
-            (s for s in self.storage.values() if s.is_scatter and s.name != name), None
-        )
-        if is_scatter and other is not None:
+        if is_scatter and is_table:
             raise ValueError(
-                f"device {self.name!r} already scatters into {other.name!r}; "
-                "a device has at most one storage an array can be scattered into"
+                f"storage {name!r} is one structure: `is_scatter` is a cell per "
+                "element and `is_table` a constant lookup"
             )
+        if is_table and not can_init:
+            raise ValueError(
+                f"storage {name!r} holds compile-time contents, so it cannot be "
+                "one that powers up undefined"
+            )
+        for mark, what in ((is_scatter, "is_scatter"), (is_table, "is_table")):
+            other = next(
+                (
+                    s
+                    for s in self.storage.values()
+                    if getattr(s, what) and s.name != name
+                ),
+                None,
+            )
+            if mark and other is not None:
+                raise ValueError(
+                    f"device {self.name!r} already marks {other.name!r} "
+                    f"{what}; a device has at most one such storage"
+                )
         s = Storage(
             name=name,
             read_latency=int(read_latency),
@@ -541,12 +577,15 @@ class Device:
             read_delay_ns=float(read_delay_ns),
             write_delay_ns=float(write_delay_ns),
             is_scatter=bool(is_scatter),
+            is_table=bool(is_table),
             inst_reads=None if inst_reads is None else int(inst_reads),
             inst_writes=None if inst_writes is None else int(inst_writes),
             inst_ports=None if inst_ports is None else int(inst_ports),
             ram_style=ram_style,
             can_init=bool(can_init),
             uses=self._spend(f"storage {name!r}", "depth, width", uses),
+            read_delay_depth=read_delay_depth,
+            read_delay_width=read_delay_width,
         )
         self.storage[name] = s
         return s
@@ -675,15 +714,6 @@ class Device:
         )
         return self
 
-    def set_rom_uses(self, uses: dict[Resource, Sequence]) -> Device:
-        """What one ``depth`` x ``width`` constant table spends.
-
-        A read-only table is not held in a storage realization: it is emitted as
-        a constant array read by an index, and the part builds it out of
-        logic."""
-        self.rom_uses = self._spend("a constant table", "depth, width", uses)
-        return self
-
     def set_register_floor(self, delay_ns: float) -> Device:
         """The register-to-register floor (ns): a source flip-flop's clock-to-out
         plus the routing every path pays, measured with nothing between the
@@ -752,20 +782,27 @@ class Device:
             )
         if self.stream_timing is None:
             raise ValueError(f"device {self.name!r} declares no stream timing")
-        # The estimator prices every mux, delay chain and constant table through
-        # the one whole-device row, so an absent row reads as free rather than
-        # as unmodelled.
+        # The estimator prices every mux and delay chain through the one
+        # whole-device row, so an absent row reads as free rather than as
+        # unmodelled.
         for what, spent in (
             ("mux", self.mux_uses),
             ("chain", self.chain_uses),
             ("reset-free chain", self.chain_uses_norst),
-            ("constant table", self.rom_uses),
         ):
             if not spent:
                 raise ValueError(
                     f"device {self.name!r} declares no {what} cost; every {what} "
                     "in the design would then price at nothing"
                 )
+        table = next((s for s in self.storage.values() if s.is_table), None)
+        if table is not None and table.read_delay_depth is None:
+            raise ValueError(
+                f"device {self.name!r} declares the constant table {table.name!r} "
+                "without a `read_delay_depth`; its cone is what decides how deep "
+                "a table may be, and one delay for every depth would let a table "
+                "no clock can close be chosen"
+            )
         return self
 
     def copy(self) -> Device:
@@ -779,7 +816,6 @@ class Device:
         d.mux_uses = self.mux_uses
         d.chain_uses = self.chain_uses
         d.chain_uses_norst = self.chain_uses_norst
-        d.rom_uses = self.rom_uses
         d.storage = dict(self.storage)
         d.default_storage = self.default_storage
         d.stream_timing = self.stream_timing
@@ -951,12 +987,19 @@ def inject_device(module, device: Device):
                     sym_name=s.name,
                     is_default=s.name == device.default_storage,
                     is_scatter=s.is_scatter,
+                    is_table=s.is_table,
                     inst_reads=_port_limit(i64, s.inst_reads),
                     inst_writes=_port_limit(i64, s.inst_writes),
                     inst_ports=_port_limit(i64, s.inst_ports),
                     ram_style=s.ram_style,
                     no_init=not s.can_init,
                     uses=_uses_attr(s.uses),
+                    rd_delay_depth=(
+                        s.read_delay_depth._attr() if s.read_delay_depth else None
+                    ),
+                    rd_delay_width=(
+                        s.read_delay_width._attr() if s.read_delay_width else None
+                    ),
                     **_timing(s),
                 )
             if device.mux_uses:
