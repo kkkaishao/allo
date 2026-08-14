@@ -97,6 +97,33 @@ static SmallVector<DrainTerm> drainTerms(OccupancyProblem &problem,
   return terms;
 }
 
+// The cycle count one iteration paces by when iterations do not overlap: the
+// schedule depth, with the anchor's cycle re-derived so a stream put commits
+// at its stage (the rule `drainTerms` applies). The put's write latency lands
+// in the FIFO's own register, so pacing by it would wait a phantom cycle
+// every iteration. Every other anchor charge is kept: a store's write must
+// land, and a call's `done` needs its re-arm cycle.
+static int64_t pacedDepth(ChainingModuloProblem &problem, Operation *anchor) {
+  int64_t depth = 1;
+  for (Operation *op : problem.getOperations()) {
+    if (op == anchor)
+      continue;
+    if (std::optional<unsigned> start = problem.getStartTime(op))
+      depth = std::max(depth, static_cast<int64_t>(*start) +
+                                  std::max<int64_t>(1, problem.latencyOf(op)));
+  }
+  int64_t anchorAt = 0;
+  for (auto &dep : problem.getDependences(anchor)) {
+    if (problem.getDistance(dep).value_or(0) != 0)
+      continue;
+    Operation *src = dep.getSource();
+    int64_t commit = isa<StreamPutOp>(src) ? 0 : problem.latencyOf(src);
+    anchorAt = std::max(
+        anchorAt, static_cast<int64_t>(*problem.getStartTime(src)) + commit);
+  }
+  return std::max(depth, anchorAt + 1);
+}
+
 // The flip-flops one cycle of delay on \p type costs, or 0 for a value not
 // carried in a register at all (a memref, a stream). An index is charged at
 // `kIndexWidth`, an upper bound since the emitter may build that address
@@ -380,7 +407,7 @@ LogicalResult FuncScheduler::scheduleCyclic(LoopLikeOpInterface body,
   std::optional<unsigned> solvedII = problem.getInitiationInterval();
   assert(solvedII && "a modulo problem that solved carries an interval");
   recordSolve(problem, "cyclic", solvedII, solveStart);
-  int64_t depth = problem.scheduleDepth();
+  int64_t depth = pacedDepth(problem, anchor);
   // Iterations that do not overlap issue one body length apart, which is the
   // interval the region RUNS at whatever the solve settled on.
   unsigned ii = pipelined ? *solvedII : static_cast<unsigned>(depth);
