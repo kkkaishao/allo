@@ -25,6 +25,7 @@
 
 #include <algorithm>
 #include <deque>
+#include <limits>
 #include <numeric>
 
 using namespace mlir;
@@ -1358,6 +1359,44 @@ void DatapathBuilder::resolveAccessOperands() {
   }
 }
 
+// The pulse-delay depth from which a counter is cheaper than a chain on this
+// device's rows: the smallest n where the counter `delayPulseCounted` builds
+// (clog2(n)+1 registers, an increment, a compare and their selects) prices
+// below the 1-bit n-stage chain it replaces. A device pricing neither side
+// keeps the default, held clear of ordinary pipeline-stage depths so a small
+// chain keeps the tapped shape; one whose chains never cost more never counts.
+static unsigned countedDelayThreshold(const OperatorLibrary &lib) {
+  auto counterWins = [&](uint64_t n) {
+    int64_t b = std::max<int64_t>(1, llvm::Log2_64_Ceil(n));
+    OperatorIdentity add, cmp;
+    add.comb = CombOpKindEnum::Addi;
+    cmp.comb = CombOpKindEnum::Cmpi;
+    int64_t counter = (b + 1) * lib.pulsePrice() + lib.instancePrice(add, b) +
+                      lib.instancePrice(cmp, b) + 2 * lib.muxPrice(2, b) +
+                      2 * lib.muxPrice(2, 1);
+    return counter < lib.chainPrice(n, 1);
+  };
+  constexpr uint64_t kProbeLimit = 1 << 20;
+  if (lib.chainPrice(kProbeLimit, 1) == 0)
+    return 64; // no chain row: cost cannot decide, keep the bounded shape
+  uint64_t hi = 4;
+  while (hi <= kProbeLimit && !counterWins(hi))
+    hi *= 2;
+  if (hi > kProbeLimit)
+    return std::numeric_limits<unsigned>::max();
+  // clog2(n) is constant over (hi/2, hi] and the chain row is nondecreasing,
+  // so the first winning depth inside the octave is a binary search.
+  uint64_t lo = hi / 2;
+  while (lo + 1 < hi) {
+    uint64_t mid = lo + (hi - lo) / 2;
+    if (counterWins(mid))
+      hi = mid;
+    else
+      lo = mid;
+  }
+  return hi;
+}
+
 // When each region has finished, relative to the issue pulse of the iteration
 // that reaches it. `emitDone` counts a leaf's `done` off this.
 //
@@ -1717,6 +1756,7 @@ void DatapathBuilder::build() {
 
   deriveShapes();       // controller discriminant (needs every child)
   deriveCounterTypes(); // counter width (each loop's own range)
+  dp.countedDelayCycles = countedDelayThreshold(dev.operators);
   // Everything below resolves Values to Sources, and so runs here rather than
   // during the walk: `resolveValue` needs the complete region model.
   // Every op the reify leaves in the module body binds no hardware:

@@ -614,7 +614,9 @@ struct HWEmitter {
             circt::BackedgeBuilder &bb, Type i1, Type i32,
             const uarch::CalleeCtx &callees)
       : ctx(b, loc, bb, i1, i32), control(ctx),
-        datapath(ctx, dp, pa, opModules, callees), dp(dp), pa(pa) {}
+        datapath(ctx, dp, pa, opModules, callees), dp(dp), pa(pa) {
+    ctx.countedDelayCycles = dp.countedDelayCycles;
+  }
 
   /// The counted terminator of region \p rb: each bound resolved from its
   /// runtime Source (a dynamic trip) or the constant fast path. Empty for an

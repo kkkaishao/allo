@@ -519,7 +519,8 @@ unsigned Datapath::portConcurrency(MemId id, bool writes) const {
 
 void Datapath::dump(llvm::raw_ostream &os) const {
   auto func = this->func;
-  os << "datapath @" << func.getSymName() << " {\n";
+  os << "datapath @" << func.getSymName()
+     << " countedDelay=" << countedDelayCycles << " {\n";
 
   // The controller discriminant as the emitter reads it: shape, then
   // termination class.

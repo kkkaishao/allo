@@ -1007,6 +1007,12 @@ struct Datapath {
   /// hardware is emitted.
   bool infeasible = false;
 
+  /// The pulse-delay depth from which `delayValid` builds a counter instead of
+  /// extending a chain: the crossover of the device's chain row against the
+  /// counter's own registers and arithmetic, stamped by the builder. The
+  /// default stands on a device that prices neither side.
+  unsigned countedDelayCycles = 64;
+
   Datapath() = default;
   /// \p dev is the device the scheduler priced this kernel against: its
   /// storage model resolves each MemUnit's implementation and access latency,

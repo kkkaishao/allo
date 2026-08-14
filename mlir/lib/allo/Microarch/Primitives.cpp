@@ -705,11 +705,6 @@ ShiftChain EmitContext::foldedChain(Value in, unsigned depth, unsigned ii,
   return chain;
 }
 
-// Above this many cycles a counter (log2(n) registers + a comparator) is
-// cheaper than a chain (n registers). Set well clear of ordinary pipeline-stage
-// delays, so a small chain keeps the shape structural tests read.
-static constexpr unsigned kCountedDelayCycles = 64;
-
 Value EmitContext::delayPulseCounted(Value pulse, unsigned n,
                                      const StallShell &sh) {
   assert(regionSinglePass && "a counted delay drops every pulse but the first, "
@@ -745,7 +740,7 @@ Value EmitContext::delayValid(Value sig, unsigned n, const StallShell &sh) {
   assert(sig.getType() == i1 && "a valid is one bit");
   if (n == 0)
     return sig;
-  if (n >= kCountedDelayCycles && regionSinglePass) {
+  if (n >= countedDelayCycles && regionSinglePass) {
     if (Value hit = countedPulses.lookup({sig, n, sh.chainEnable}))
       return hit;
     Value fire = delayPulseCounted(sig, n, sh);

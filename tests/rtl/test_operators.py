@@ -634,6 +634,31 @@ def test_free_running_ip_outside_stream_region_emits():
     assert not inst, inst
 
 
+# A deep pulse delay in a single-pass region is a counter only past the
+# device-priced crossover of the chain row against the counter's own cost. On
+# the default device the crossover sits around a thousand cycles: a depth of a
+# hundred stays a tapped chain, and one of four thousand still counts.
+def test_a_pulse_delay_counts_only_past_the_priced_crossover():
+    import re
+
+    def emit(latency):
+        @operator_ip(optype="sqrt", latency=latency, pipelined=True, style="ce")
+        def slowsqrt(a: f32) -> f32: ...
+
+        dev = default_device.copy()
+        dev.add_operator(slowsqrt)
+
+        @kernel
+        def waitk(A: f32[1]):
+            A[0] = amath.sqrt(A[0])
+
+        return _to_rtl(waitk, device=dev).verilog
+
+    v = emit(100)
+    assert re.search(r"r\d+_v\d{2,}", v) and not re.search(r"_wait\d+", v)
+    assert re.search(r"_wait\d+", emit(4000))
+
+
 # --- legalize-arith: keep vs. expand ------------------------------------------
 # The RTL prepare pipeline runs `legalize-arith` (not the device-blind
 # `arith-expand`): a composite arith op the device provides an operator IP for is

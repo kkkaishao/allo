@@ -18,6 +18,7 @@
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringMap.h"
 
+#include <limits>
 #include <string>
 #include <utility>
 
@@ -202,6 +203,11 @@ struct EmitContext {
   // would drop every pulse but the first. False outside any region.
   bool regionSinglePass = false;
 
+  // The pulse-delay depth from which `delayValid` builds a counter instead of
+  // extending a chain, stamped from `Datapath::countedDelayCycles` (the
+  // device-row crossover). An unstamped context never counts.
+  unsigned countedDelayCycles = std::numeric_limits<unsigned>::max();
+
   // Every register this module's emission builds, by run. `reg` below is the
   // one `seq.compreg` creation in the backend, so this is a count of the
   // emitted design rather than a model of it; `checkRegLedger` holds the two
@@ -304,10 +310,10 @@ struct EmitContext {
   /// tap `n` of the one pulse chain per (signal, time base), extended on demand
   /// so every consumer shares its stages, which is the tap rule
   /// `insertRegisters` applies to value chains. Powers on to 0, so no spurious
-  /// valid. A deep delay in a single-pass region is built as
-  /// `delayPulseCounted` instead (memoized per exact depth, a counter admitting
-  /// no taps): `n` registers to hold one pulse is a cost that tracks the
-  /// schedule rather than the datapath.
+  /// valid. A delay past `countedDelayCycles` in a single-pass region is built
+  /// as `delayPulseCounted` instead (memoized per exact depth, a counter
+  /// admitting no taps): `n` registers to hold one pulse is a cost that tracks
+  /// the schedule rather than the datapath.
   Value delayValid(Value sig, unsigned n, const StallShell &sh);
   /// One pulse delayed `n` cycles by a counter: `log2(n)` registers instead of
   /// `n`, at the cost of admitting only one pulse at a time. Sound exactly
