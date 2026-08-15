@@ -127,15 +127,9 @@ BankSplit DatapathEmitter::bankAddress(const uarch::MemUnit &m,
           ? addrAt(c.b, c.loc, buildAddr(acc, acc.bank, kDatapathAddressWidth),
                    std::max(1u, llvm::Log2_64_Ceil(m.numBanks)))
           : Value();
-  // A read freezes its address on stall or the in-flight read is lost (KPN); a
-  // write skips the stalled cycle through its gated write enable. Both halves
-  // freeze together or they name different elements.
-  if (!acc.isWrite) {
-    StallShell sh = shellFor(acc.region);
-    if (bank)
-      bank = c.stallHold(bank, sh);
-    offset = c.stallHold(offset, sh);
-  }
+  // No hold here: a boundary read address is held once where it leaves the
+  // module (`sharedAddress`, the crossbar read), and an internal port keeps
+  // its in-flight datum through its read enable instead.
   return {bank, offset};
 }
 
@@ -314,11 +308,13 @@ void DatapathEmitter::emitReads(const uarch::RegionBlock &rb, Value issue) {
     case PortPlan::Crossbar: {
       // Read every bank at the (bank-independent) offset, then select by the
       // runtime bank, aligned with the read data. Such an access reaches every
-      // bank, so it holds a port of its own on each.
+      // bank, so it holds a port of its own on each. A boundary address is
+      // held against back-pressure before it widens; an internal port freezes
+      // through its read enable instead.
       auto bs = bankAddress(m, acc);
       SmallVector<Value> vals;
       if (m.external) {
-        Value addr = boundaryAddr(c, bs.offset);
+        Value addr = boundaryAddr(c, c.stallHold(bs.offset, sh));
         for (const auto &[bank, base] : extPorts(m, acc)) {
           pa.setOutput(portAddr(base), addr);
           vals.push_back(pa.getInput(portData(base)));
@@ -326,11 +322,11 @@ void DatapathEmitter::emitReads(const uarch::RegionBlock &rb, Value issue) {
       } else {
         Value addr = memAddr(m, bs.offset);
         for (unsigned k = 0; k < m.numBanks; ++k)
-          vals.push_back(
-              c.R(atPort(seq::ReadPortOp::create(
-                             c.b, c.loc, memReadCell(m, k, acc.port),
-                             ValueRange{addr}, /*rdEn=*/Value(), m.readLatency),
-                         acc.port)));
+          vals.push_back(c.R(atPort(
+              seq::ReadPortOp::create(
+                  c.b, c.loc, memReadCell(m, k, acc.port), ValueRange{addr},
+                  /*rdEn=*/sh ? sh.chainEnable : Value(), m.readLatency),
+              acc.port)));
       }
       readData[accKey(m.id, r.idx)] =
           readCrossbar(c, vals, atReadData(m, bs.bank, sh));
@@ -354,10 +350,10 @@ void DatapathEmitter::emitReads(const uarch::RegionBlock &rb, Value issue) {
     // so it proves nothing about what else touches this bank.
     SmallVector<Value> vals;
     for (unsigned k = 0; k < m.numBanks; ++k)
-      vals.push_back(
-          c.R(seq::ReadPortOp::create(c.b, c.loc, memReadCell(m, k, key.second),
-                                      ValueRange{laneSelect(c, tagged, k)},
-                                      /*rdEn=*/Value(), m.readLatency)));
+      vals.push_back(c.R(seq::ReadPortOp::create(
+          c.b, c.loc, memReadCell(m, k, key.second),
+          ValueRange{laneSelect(c, tagged, k)},
+          /*rdEn=*/sh ? sh.chainEnable : Value(), m.readLatency)));
     // Each access picks its own bank's datum back out, delayed with it.
     for (auto [i, t] : llvm::zip(idxs, tagged))
       readData[accKey(m.id, i)] =
@@ -380,7 +376,10 @@ void DatapathEmitter::emitReads(const uarch::RegionBlock &rb, Value issue) {
     Value addr =
         sharedAddress(m, idxs, issue, sh,
                       sharedInternalPort(m, bank, port) ? &fired : nullptr);
-    sharedReads[key].arms.push_back({fired, addr, Value()});
+    SharedReadPort &p = sharedReads[key];
+    p.arms.push_back({fired, addr, Value()});
+    ++p.owners;
+    p.ownerRegion = rb.id;
   }
 }
 
@@ -404,10 +403,13 @@ Value DatapathEmitter::sharedReadPort(const uarch::MemUnit &m, unsigned bank,
   SharedReadPort &p = sharedReads[{m.id, bank, port}];
   if (!p.data) {
     p.addr = c.bb.get(c.b.getIntegerType(addrWidth(m)));
+    // The read enable is a promise too: whether one owner's shell may freeze
+    // the port is only known once every holder has contributed.
+    p.rdEnBE = c.bb.get(c.i1);
     p.data = c.R(
         atPort(seq::ReadPortOp::create(c.b, c.loc, memReadCell(m, bank, port),
                                        ValueRange{Value(p.addr)},
-                                       /*rdEn=*/Value(), m.readLatency),
+                                       Value(p.rdEnBE), m.readLatency),
                port));
   }
   return p.data;
@@ -466,8 +468,17 @@ void DatapathEmitter::finalizeSharedReadPorts() {
            "holding it never emitted its accesses");
     return commitSink(arms, Idle::Hold).addr;
   };
-  for (auto &[key, p] : sharedReads)
+  for (auto &[key, p] : sharedReads) {
+    // The port freezes with its owner where that is unambiguous: a lone
+    // region's chain enable keeps the in-flight datum in the port's own
+    // register. Several holders read every cycle off the held bus instead
+    // (a constant-true enable, which the hlmem lowering folds away). The
+    // shell is read here, resolved, not captured at contribution time.
+    StallShell sh = p.owners == 1 && p.ownerRegion ? shellFor(*p.ownerRegion)
+                                                   : StallShell{};
+    p.rdEnBE.setValue(sh ? sh.chainEnable : c.t1);
     p.addr.setValue(address(p.arms));
+  }
   for (auto &[base, arms] : boundaryReads)
     pa.setOutput(portAddr(base), address(arms));
 }
@@ -479,22 +490,26 @@ void DatapathEmitter::finalizeSharedReadPorts() {
 Value DatapathEmitter::sharedAddress(const uarch::MemUnit &m,
                                      ArrayRef<unsigned> idxs, Value issue,
                                      const StallShell &sh, Value *fired) {
+  // Select and hold at the bank's own address width; a boundary port widens
+  // after, so neither runs at the 32-bit boundary contract.
   auto addrOf = [&](unsigned i) {
-    Value off = bankAddress(m, m.accesses[i]).offset;
-    return m.external ? boundaryAddr(c, off) : memAddr(m, off);
+    return memAddr(m, bankAddress(m, m.accesses[i]).offset);
+  };
+  // One hold after the select: a read frozen by back-pressure keeps
+  // re-presenting its address until its datum is taken.
+  auto out = [&](Value addr) {
+    addr = c.stallHold(addr, sh);
+    return m.external ? boundaryAddr(c, addr) : addr;
   };
   // Every pulse below says when its access is presenting; only an access alone
   // on a port no one else holds needs none and drives it unconditionally.
   assert((issue || (idxs.size() == 1 && !fired)) &&
          "a region with no issue pulse cannot say when it is driving a port; "
          "`bindMemoryPorts` leaves such a read alone on one");
-  // One access needs no select, and its address is already held against this
-  // region's shell (`bankAddress`), so a second hold would be the same
-  // register twice.
   if (idxs.size() == 1) {
     if (fired)
       *fired = c.activationPulse(issue, m.accesses[idxs.front()].stage, sh);
-    return addrOf(idxs.front());
+    return out(addrOf(idxs.front()));
   }
   SmallVector<Value> addrs, sels;
   for (unsigned i : idxs) {
@@ -508,7 +523,7 @@ Value DatapathEmitter::sharedAddress(const uarch::MemUnit &m,
   if (fired)
     for (Value s : sels)
       *fired = *fired ? c.orBits(*fired, s) : s;
-  return c.stallHold(c.oneHotSelect(addrs, sels), sh);
+  return out(c.oneHotSelect(addrs, sels));
 }
 
 // Drive the read-address port of each single-interface external read in region
@@ -864,13 +879,15 @@ void DatapathEmitter::masterCallPorts(
       }
       // The port may also be held by a sibling call or by the parent's own
       // accesses, so the datum comes off the one `seq.read` they share and the
-      // address joins its arms.
+      // address joins its arms. A child paces itself, so it brings no read
+      // enable; as an owner it keeps the port unfrozen.
       rdBackedge[ma.data].setValue(sharedReadPort(m, ma.bank, ma.port));
       Value fired;
       if (sharedInternalPort(m, ma.bank, ma.port))
         fired = runWindow();
-      sharedReads[{m.id, ma.bank, ma.port}].arms.push_back(
-          {fired, addr, Value()});
+      SharedReadPort &p = sharedReads[{m.id, ma.bank, ma.port}];
+      p.arms.push_back({fired, addr, Value()});
+      ++p.owners;
       break;
     }
 

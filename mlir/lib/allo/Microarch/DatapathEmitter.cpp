@@ -188,8 +188,8 @@ void DatapathEmitter::emitRegisters(const uarch::RegionBlock &rb) {
     // the consuming unit's recurrence input (emitUnits), not the register.
     regStages[rg.id] =
         phase && rg.depth > 1
-            ? c.foldedChain(head, rg.depth, ii, phase, rg.ready, sh)
-            : c.shiftChain(head, rg.depth, sh);
+            ? c.foldedChain(head, rg.depth, ii, phase, rg.ready, sh, rg.taps)
+            : c.shiftChain(head, rg.depth, sh, RegRole::Value, rg.taps);
     // Name each held stage `<value>_d<k>`. Stage 0 is the undelayed input,
     // already named by its producer, so leave it alone rather than relabel a
     // shared wire. A folded chain repeats one register across the `ii` taps it
@@ -848,9 +848,18 @@ void DatapathEmitter::emitCalls(const uarch::RegionBlock &rb, Value issue,
     }
 
     // Scoped to this pass for the join below and the conjunction in the run
-    // window, which would otherwise read the previous pass's latched 1.
+    // window, which would otherwise read the previous pass's latched 1. A
+    // CallNode (loop-over-call) region is paced by each invocation's
+    // completion PULSE instead, and its child has no sibling to join, so the
+    // pass-scoped level is built only where the run window asks for it.
+    bool loopCalled = rb.shape == uarch::RegionBlock::Shape::CallNode;
+    assert((!loopCalled || (rb.callUnits.size() == 1 && !concurrent)) &&
+           "a CallNode region is one scheduled child (`validateDatapath`)");
+    Value edge = loopCalled ? c.risingEdge(outs[kDone]) : Value();
     Value completed =
-        concurrent ? outs[kDone] : c.completedSince(outs[kDone], issue);
+        loopCalled
+            ? Value()
+            : (concurrent ? outs[kDone] : c.completedSince(outs[kDone], issue));
     // The window this child owns the ports it masters, which a port a second
     // accessor also holds selects on. A child drives its addresses
     // continuously and has no per-access pulse.
@@ -864,6 +873,8 @@ void DatapathEmitter::emitCalls(const uarch::RegionBlock &rb, Value issue,
     Value driving;
     auto runWindow = [&] {
       if (!driving) {
+        if (!completed)
+          completed = c.completedSinceEdge(edge, issue);
         Backedge next = c.bb.get(c.i1);
         Value armed = c.orBits(startK, c.reg(next, c.f1));
         next.setValue(c.mux(completed, c.f1, armed));
@@ -874,8 +885,9 @@ void DatapathEmitter::emitCalls(const uarch::RegionBlock &rb, Value issue,
 
     masterCallPorts(cu, outs, rdBackedge, runWindow, sh);
 
-    doneByCid[cu.id] = completed;
-    dones.push_back(completed);
+    if (!loopCalled)
+      doneByCid[cu.id] = completed;
+    dones.push_back(loopCalled ? edge : completed);
     if (!cu.streamArgs.empty())
       callOuts[cu.id] = std::move(outs);
   }

@@ -132,6 +132,12 @@ void lowerMemory(seq::HLMemOp mem) {
     // cycle is unsampled, the two never issuing together.
     Value addr, reg;
     std::string rdName;
+    // A constant-true enable is no enable: the emitter promises one on every
+    // shared port and resolves it to true where no owner may freeze it.
+    Value rdEn = group.read ? group.read.getRdEn() : Value();
+    if (auto k = rdEn ? rdEn.getDefiningOp<hw::ConstantOp>() : nullptr)
+      if (k.getValue().isOne())
+        rdEn = Value();
     if (group.read) {
       rdName = (name + "_rd" + Twine(group.readIdx)).str();
       assert(group.writes.size() <= 1 &&
@@ -154,28 +160,43 @@ void lowerMemory(seq::HLMemOp mem) {
           sv::PAssignOp::create(b, wloc, slot, write.getInData());
         });
       }
-      // A read enable is not modelled, so a FIFO's `rdEn` reaches here and is
-      // dropped.
+      // The read enable is the port's ENB: with it low the read register
+      // holds, keeping an in-flight datum alive under back-pressure.
       if (group.read) {
         Location rloc = group.read.getLoc();
-        Value slot = sv::ArrayIndexInOutOp::create(b, rloc, array, addr);
-        sv::PAssignOp::create(b, rloc, reg,
-                              sv::ReadInOutOp::create(b, rloc, slot));
+        auto readSlot = [&] {
+          Value slot = sv::ArrayIndexInOutOp::create(b, rloc, array, addr);
+          sv::PAssignOp::create(b, rloc, reg,
+                                sv::ReadInOutOp::create(b, rloc, slot));
+        };
+        if (rdEn)
+          sv::IfOp::create(b, rloc, rdEn, readSlot);
+        else
+          readSlot();
       }
     });
     if (!group.read)
       continue;
     // The port reads at latency 1; anything deeper is an output pipeline
     // register on the data, which is the register a block RAM or an UltraRAM
-    // has.
+    // has. The enable gates every stage, or the frozen datum would march out.
     Location rloc = group.read.getLoc();
     Value data = sv::ReadInOutOp::create(b, rloc, reg);
-    for (unsigned d = 1; d < group.read.getLatency(); ++d)
-      data = seq::CompRegOp::create(
-          b, rloc, data, clk, b.getStringAttr(rdName + "_dly" + Twine(d)));
+    for (unsigned d = 1; d < group.read.getLatency(); ++d) {
+      auto name = b.getStringAttr(rdName + "_dly" + Twine(d));
+      data = rdEn
+                 ? seq::CompRegClockEnabledOp::create(
+                       b, rloc, data.getType(), data, clk, rdEn, name,
+                       /*reset=*/Value(), /*resetValue=*/Value(),
+                       /*initialValue=*/Value(), hw::InnerSymAttr())
+                       .getResult()
+                 : seq::CompRegOp::create(b, rloc, data, clk, name).getResult();
+    }
     group.read.replaceAllUsesWith(data);
     group.read.erase();
   }
+  // A combinational read has no register to enable, so a FIFO's `rdEn`
+  // reaches here and is dropped; its pointer logic already consumed it.
   for (seq::ReadPortOp read : combReads) {
     Location rloc = read.getLoc();
     Value slot =

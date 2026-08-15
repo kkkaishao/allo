@@ -1452,6 +1452,8 @@ void DatapathBuilder::insertRegisters() {
       assert(reg.ready == e.ready &&
              "one value's edges disagree on when it lands");
       reg.depth = std::max(reg.depth, e.depth);
+      if (e.depth)
+        reg.taps.push_back(e.depth);
       continue;
     }
     Register reg;
@@ -1466,8 +1468,15 @@ void DatapathBuilder::insertRegisters() {
     reg.depth = e.depth;
     reg.input = e.base;
     reg.ready = e.ready;
+    if (e.depth)
+      reg.taps.push_back(e.depth);
     dp.regions[e.key.second].regs.push_back(reg.id);
     dp.regs.push_back(reg);
+  }
+  for (auto &[key, rid] : keyToReg) {
+    auto &taps = dp.regs[rid].taps;
+    llvm::sort(taps);
+    taps.erase(std::unique(taps.begin(), taps.end()), taps.end());
   }
 
   for (auto &[slot, e] : edges)

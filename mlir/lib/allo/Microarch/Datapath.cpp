@@ -348,11 +348,24 @@ static void printSourceList(ArrayRef<Source> ss, raw_ostream &os) {
   os << "]";
 }
 
-double unitSlack(const FuncUnit &u, float cycleTime) {
+std::optional<double> unitSlack(const FuncUnit &u, const OperatorLibrary &lib,
+                                float cycleTime) {
   double slack = cycleTime;
-  for (const FuncUnit::BoundOp &bo : u.boundOps)
-    slack = std::min(slack, cycleTime - bo.z.value_or(0.0) - u.inDelay);
-  return slack;
+  for (const FuncUnit::BoundOp &bo : u.boundOps) {
+    if (!bo.z)
+      return std::nullopt;
+    slack = std::min(slack, cycleTime - *bo.z - u.inDelay);
+  }
+  // The identity re-injection select `emitUnits` builds in front of a
+  // recurrence port: one arm per early iteration plus the carried value. A
+  // path enters through one port, so the deepest port's cone bounds them all.
+  double cone = 0.0;
+  for (auto [k, inits] : llvm::enumerate(u.inputInits))
+    if (!inits.empty())
+      cone = std::max(
+          cone, muxCone(lib, inits.size() + 1,
+                        datapathWidth(u.repOp()->getOperand(k).getType())));
+  return slack - cone;
 }
 
 Datapath::PortRelation Datapath::portGraph(MemId id,

@@ -36,6 +36,7 @@ struct ModuleInterface;
 } // namespace mlir::allo::iface
 namespace mlir::allo {
 struct DeviceModel;
+class OperatorLibrary;
 } // namespace mlir::allo
 
 namespace mlir::allo::uarch {
@@ -188,6 +189,11 @@ struct Register {
   /// of the depth formula, and the phase an II-folded chain captures on. Not
   /// re-derivable from `input`, whose shared unit names a representative op.
   unsigned ready = 0;
+  /// The depths consumers actually read (each `Source::Reg`'s `outPort`),
+  /// sorted ascending, zero excluded; the deepest equals `depth`. A
+  /// synthesizer breaks shift-register extraction at every tap, so the ledger
+  /// charges one run per maximal inter-tap segment rather than one of `depth`.
+  llvm::SmallVector<unsigned, 2> taps;
 };
 
 /// How an access reaches its memory, a separate question from what the memory
@@ -691,10 +697,14 @@ struct Mux {
 };
 
 /// The sub-cycle room \p u's bound ops have left, in ns: the smallest
-/// `cycleTime - z - inDelay` over them, both read off the model. This bounds
-/// the combinational delay binding may add in front of the unit. Never negative
-/// on a schedule the chaining model accepted.
-double unitSlack(const FuncUnit &u, float cycleTime);
+/// `cycleTime - z - inDelay` over them, less the reduction-identity select a
+/// recurrence port carries (priced off \p lib), which sits inside the proved
+/// cycle and consumes the room first. This bounds the combinational delay
+/// binding may add in front of the unit. Empty where any bound op carries no
+/// `z`: the solve never placed it, so its room is unknown rather than maximal
+/// and binding must not fold onto it.
+std::optional<double> unitSlack(const FuncUnit &u, const OperatorLibrary &lib,
+                                float cycleTime);
 
 /// A top-level scalar input port (a scalar kernel argument). Memref arguments
 /// become external `MemUnit`s and a scalar function result becomes a `Result`,

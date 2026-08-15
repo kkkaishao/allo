@@ -372,14 +372,20 @@ LogicalResult checkCombPathsMeetPeriod(dcp::DCPathModuleOp func,
                "two arrival models disagree about a price";
     }
     double mux = added.ofUnit(u.id);
-    double slack = unitSlack(u, cycleTime);
-    if (mux <= slack + kSlop)
+    // No binding-grown cone reaches this unit: a structural overrun (a
+    // recurrence-identity select on a tight schedule) has no binding remedy and
+    // reports through the published paths instead.
+    if (mux <= kSlop)
+      continue;
+    std::optional<double> slack = unitSlack(u, lib, cycleTime);
+    if (slack && mux <= *slack + kSlop)
       continue;
     // A planned fold realizes the solve's own allocation, and the solve held
     // `z + inDelay + headroom(N) <= period` for every operation it folded, so
-    // an overrun here is a broken contract between the two, not a refusal. The
-    // refusal below still stands in a release build.
-    assert(!plannedBinding &&
+    // an overrun on a priced unit is a broken contract between the two, not a
+    // refusal. An unpriced unit the solve never placed stays a refusal in
+    // either build.
+    assert(!(plannedBinding && slack) &&
            "a planned binding grew a select cone past the period the schedule "
            "solve reserved headroom for; the allocation headroom model "
            "(`addAllocationHeadroom`) and the emitted cone disagree");
@@ -395,7 +401,7 @@ LogicalResult checkCombPathsMeetPeriod(dcp::DCPathModuleOp func,
         << " ns of multiplexer on the path reaching this operation (its unit "
            "is shared between "
         << u.boundOps.size() << " operations), which is "
-        << llvm::format("%.2f", mux - slack)
+        << llvm::format("%.2f", mux - slack.value_or(0.0))
         << " ns more than the schedule left it against a "
         << llvm::format("%.2f", cycleTime)
         << " ns clock. The schedule was cut before the multiplexer existed, so "

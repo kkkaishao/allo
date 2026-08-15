@@ -20,6 +20,8 @@
 #include "llvm/Support/MathExtras.h"
 #include "llvm/Support/SaveAndRestore.h"
 
+#include <algorithm>
+
 using namespace mlir;
 using namespace mlir::allo;
 using namespace circt;
@@ -655,8 +657,28 @@ Value EmitContext::oneHotSelect(ArrayRef<Value> values,
   return R(comb::OrOp::create(b, loc, type, terms, false));
 }
 
+// Charge one chain run split at its consumed taps: a synthesizer breaks a
+// shift register at every tap, so each maximal inter-tap segment is its own
+// run and a short segment falls back to flip-flops.
+static void chargeChainRuns(RegLedger &ledger, RegRole role, unsigned width,
+                            unsigned depth, ArrayRef<unsigned> taps, bool reset,
+                            bool enable) {
+  if (taps.empty()) {
+    ledger.add(role, width, depth, reset, enable);
+    return;
+  }
+  assert(taps.back() == depth && "the deepest tap is the chain's depth");
+  unsigned prev = 0;
+  for (unsigned t : taps) {
+    assert(t > prev && "taps are sorted, unique and start past the source");
+    ledger.add(role, width, t - prev, reset, enable);
+    prev = t;
+  }
+}
+
 ShiftChain EmitContext::shiftChain(Value in, unsigned depth,
-                                   const StallShell &sh, RegRole role) {
+                                   const StallShell &sh, RegRole role,
+                                   ArrayRef<unsigned> taps) {
   ShiftChain chain;
   chain.stages.push_back(in); // stage 0 = the source (a depth-0 tap reads it)
   Value rz = konst(in.getType(), 0);
@@ -670,14 +692,15 @@ ShiftChain EmitContext::shiftChain(Value in, unsigned depth,
       chain.stages.push_back(cur);
     }
   }
-  ledger.add(role, datapathWidth(in.getType()), depth, holdsReset(role),
-             /*enable=*/bool(sh));
+  chargeChainRuns(ledger, role, datapathWidth(in.getType()), depth, taps,
+                  holdsReset(role), /*enable=*/bool(sh));
   return chain;
 }
 
 ShiftChain EmitContext::foldedChain(Value in, unsigned depth, unsigned ii,
                                     Value phase, unsigned ready,
-                                    const StallShell &sh) {
+                                    const StallShell &sh,
+                                    ArrayRef<unsigned> taps) {
   assert(ii > 1 && "a fold at II 1 is the plain chain, one register per tap");
   // A stall freezes the phase, so the capture term stays high across it and
   // would otherwise shift the chain once per stalled cycle.
@@ -695,9 +718,16 @@ ShiftChain EmitContext::foldedChain(Value in, unsigned depth, unsigned ii,
     }
   }
   // The run is the registers BUILT, not the cycles spanned: a fold holds the
-  // same `depth` taps in `n` of them.
-  ledger.add(RegRole::Value, datapathWidth(in.getType()), n, /*reset=*/false,
-             /*enable=*/true);
+  // same `depth` taps in `n` of them, and cycle tap k reads register
+  // ceil(k / ii), which is where the run splits.
+  llvm::SmallVector<unsigned> regTaps;
+  for (unsigned t : taps) {
+    assert(t >= 1 && "a zero tap reads the source, not the chain");
+    regTaps.push_back((t - 1) / ii + 1);
+  }
+  regTaps.erase(std::unique(regTaps.begin(), regTaps.end()), regTaps.end());
+  chargeChainRuns(ledger, RegRole::Value, datapathWidth(in.getType()), n,
+                  regTaps, /*reset=*/false, /*enable=*/true);
   ShiftChain chain;
   chain.stages.push_back(in); // stage 0 = the source, as in a plain chain
   for (unsigned k = 1; k <= depth; ++k)
@@ -832,7 +862,10 @@ Value EmitContext::holdDone(Value setPulse, Value start) {
 }
 
 Value EmitContext::completedSince(Value level, Value passStart) {
-  Value edge = risingEdge(level);
+  return completedSinceEdge(risingEdge(level), passStart);
+}
+
+Value EmitContext::completedSinceEdge(Value edge, Value passStart) {
   return andBits(orBits(holdDone(edge, passStart), edge), notBit(passStart));
 }
 

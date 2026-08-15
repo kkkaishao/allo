@@ -82,7 +82,8 @@ struct ShareCone {
       owner[dp.units[uid].repOp()] = i;
     for (auto [i, uid] : llvm::enumerate(rb.units)) {
       const FuncUnit &u = dp.units[uid];
-      slack[i] = unitSlack(u, ctx.cycleTime);
+      // An unpriced unit (no `z`) gets no room, so no fold's cone may reach it.
+      slack[i] = unitSlack(u, ctx.lib, ctx.cycleTime).value_or(0.0);
       Operation *y = u.repOp();
       width[i] = std::max<int64_t>(1, combParamWidth(y));
       for (Value v : y->getOperands()) {
@@ -228,8 +229,9 @@ SharingProblem sharingProblemOf(const Datapath &dp, const RegionBlock &rb,
     members[it->second].push_back(i);
     SharingProblem::Unit &unit = problem.units[i];
     unit.cls = it->second;
-    unit.slackPicos =
-        std::max<int64_t>(0, std::floor(unitSlack(u, ctx.cycleTime) * 1000.0));
+    unit.slackPicos = std::max<int64_t>(
+        0, std::floor(unitSlack(u, ctx.lib, ctx.cycleTime).value_or(0.0) *
+                      1000.0));
     Operation *y = u.repOp();
     for (auto [k, v] : llvm::enumerate(y->getOperands())) {
       unit.initArms.push_back(carriedOperand(rb, v) ? 1 : 0);

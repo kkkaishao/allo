@@ -328,11 +328,12 @@ Value HWEmitter::emitLoopCall(const uarch::RegionBlock &rb, Value start) {
          "a loop-over-call region with stream accesses would need a stall "
          "shell, which this controller does not build");
   // Bounds are at the child's index-port width (this region's `counterType`).
-  // The controller is paced by the child `done` edge, a backedge since
-  // emitCalls needs the counter first.
+  // The controller is paced by the child's per-invocation completion pulse
+  // (fb.callDone for a CallNode region), a backedge since emitCalls needs the
+  // counter first.
   Backedge callDone = ctx.bb.get(ctx.i1);
-  IterationControl ic = control.emitCountedIteration(
-      rb, terminatorOf(rb), start, ctx.risingEdge(callDone));
+  IterationControl ic =
+      control.emitCountedIteration(rb, terminatorOf(rb), start, callDone);
 
   // An empty loop never fires the child, whose own run gating keeps every
   // write-enable low.

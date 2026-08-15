@@ -39,7 +39,9 @@ llvm::StringRef roleName(RegRole role);
 ///
 /// The run, not the register, is the cost unit. Past the synthesizer's
 /// shift-register extraction threshold a run stops costing flip-flops per
-/// stage, so a cost model handed only a register total cannot price it.
+/// stage, so a cost model handed only a register total cannot price it. A
+/// multi-tapped chain is charged as one run per maximal inter-tap segment,
+/// the pieces extraction can actually form.
 /// `reset` and `enable` complete that shape: a synchronous reset blocks the
 /// extraction and pays fabric per bit, while a clock enable is free, so a cost
 /// model needs both to pick the right characterization row.

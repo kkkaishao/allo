@@ -287,11 +287,14 @@ struct EmitContext {
   /// each stage powering on to 0 (or reset to 0 for a control-state role),
   /// `stages[0]` = `in` itself.
   ///
-  /// Charges the ledger ONE run of `depth`, since that is the shape a
-  /// synthesizer prices: only the caller knows whether the run carries a datum
-  /// or a pulse, so \p role comes from there.
+  /// Charges the ledger one run per maximal inter-tap segment of \p taps (the
+  /// consumed depths, sorted, deepest == \p depth), since extraction breaks at
+  /// every tap; an empty \p taps charges one run of `depth`. Only the caller
+  /// knows whether the run carries a datum or a pulse, so \p role comes from
+  /// there.
   ShiftChain shiftChain(Value in, unsigned depth, const StallShell &sh,
-                        RegRole role = RegRole::Value);
+                        RegRole role = RegRole::Value,
+                        ArrayRef<unsigned> taps = {});
   /// `shiftChain`'s tap table folded to an initiation interval: with a fresh
   /// datum landing on \p in only every \p ii cycles, `ceil(depth / ii)`
   /// registers hold every live value, each capturing once per iteration when
@@ -303,9 +306,11 @@ struct EmitContext {
   /// a pulse: a datum reaches register `j` only on the `j`-th capture after it
   /// lands, so a chain that stops capturing at the last issue strands its last
   /// `ceil(depth / ii) - 1` iterations. Sound only where one iteration issues
-  /// every `ii` cycles, i.e. a schedule-paced cyclic leaf.
+  /// every `ii` cycles, i.e. a schedule-paced cyclic leaf. \p taps splits the
+  /// ledger charge as in `shiftChain`, mapped onto the registers built.
   ShiftChain foldedChain(Value in, unsigned depth, unsigned ii, Value phase,
-                         unsigned ready, const StallShell &sh);
+                         unsigned ready, const StallShell &sh,
+                         ArrayRef<unsigned> taps = {});
   /// A 1-bit signal delayed `n` cycles (issue -> a store's pipeline stage):
   /// tap `n` of the one pulse chain per (signal, time base), extended on demand
   /// so every consumer shares its stages, which is the tap rule
@@ -362,6 +367,9 @@ struct EmitContext {
   /// rising edge, 1 from that edge on (0 added latency; it rises the same cycle
   /// \p level does).
   Value completedSince(Value level, Value passStart);
+  /// `completedSince` with the level's rising-edge pulse already in hand, so a
+  /// caller that also consumes the pulse does not build its register twice.
+  Value completedSinceEdge(Value edge, Value passStart);
   /// Split a one-cycle \p when pulse by predicate \p cond into {taken,
   /// notTaken} = {when & cond, when & ~cond}: `taken` (re)starts a container's
   /// children, `notTaken` completes the region without issuing them.

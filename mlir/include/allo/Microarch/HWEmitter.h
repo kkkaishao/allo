@@ -104,8 +104,10 @@ struct DatapathFeedback {
   // folds in too); 0 if the region stores nothing. `emitRegion` checks it
   // against `RegionBlock::drainStage`, the same number decided on the model.
   unsigned storeDrain = 0;
-  // The `done` of a CallUnit region's child instance. When set it IS the
-  // region's completion, bypassing the store-drain `emitDone`. Null for a
+  // A CallUnit region's completion. For a CallNode (loop-over-call) region it
+  // is the child's per-invocation completion PULSE, which paces the counter;
+  // for a scheduled or concurrent composition it is the joined pass-scoped
+  // done LEVEL, which IS (part of) the region's completion. Null for a
   // call-free region.
   Value callDone;
 };
@@ -307,13 +309,21 @@ struct DatapathEmitter {
 
   /// One shared read port, keyed by (memory, bank, port). `sharedReadPort`
   /// builds the `seq.read` on the first access to reach it, so its datum is
-  /// available before the address that fetches it exists. An arm's `fired` is
-  /// the second of two selects: within a region `sharedAddress` has already
-  /// picked between that region's own accesses.
+  /// available before the address that fetches it exists; the address and the
+  /// read enable ride backedges `finalizeSharedReadPorts` resolves once every
+  /// holder is known. An arm's `fired` is the second of two selects: within a
+  /// region `sharedAddress` has already picked between that region's own
+  /// accesses.
   struct SharedReadPort {
     Value data;
+    circt::Backedge rdEnBE;
     circt::Backedge addr;
     SmallVector<SinkArm, 1> arms;
+    /// The one region holding the port, when a region (not a child) does: the
+    /// finalize reads its RESOLVED shell off `shellOf`, since the chainEnable
+    /// at contribution time is still a promise.
+    std::optional<unsigned> ownerRegion;
+    unsigned owners = 0; // regions plus mastering children holding the port
   };
   /// A MapVector, not a DenseMap: the finalize iterates it to drive the ports,
   /// and the emitted module must not depend on a hash order.
