@@ -505,6 +505,7 @@ AddressCost mlir::allo::splitAddressCost(const SplitAddress &addr,
   // One bare register per term, then the residual: each input past the first
   // costs one adder.
   AddressCost c;
+  c.carried = addr.terms.size() + addr.reads.size();
   unsigned chain = addr.terms.size();
   unsigned inputs = chain + (addr.residual ? 1 : 0);
   c.adders = inputs ? inputs - 1 : 0;
@@ -608,6 +609,7 @@ AddressCost mlir::allo::addressCostOf(Operation *op,
   c.adders += b.adders;
   c.multipliers += b.multipliers;
   c.dividers += b.dividers;
+  c.carried += b.carried;
   c.delay = std::max(c.delay, b.delay);
   return c;
 }

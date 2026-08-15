@@ -737,8 +737,8 @@ ShiftChain EmitContext::foldedChain(Value in, unsigned depth, unsigned ii,
 
 Value EmitContext::delayPulseCounted(Value pulse, unsigned n,
                                      const StallShell &sh) {
-  assert(regionSinglePass && "a counted delay drops every pulse but the first, "
-                             "so it needs a region that issues one pass");
+  assert(sh.singlePass && "a counted delay drops every pulse but the first, "
+                          "so its owning region must issue one pass");
   assert(n >= 1 && "a zero-cycle delay is the signal itself");
   // `pulse` arms the counter at 0; it counts every advancing cycle and fires at
   // n-1, so the output rises exactly n cycles after the input, as a chain tap
@@ -758,10 +758,11 @@ Value EmitContext::delayPulseCounted(Value pulse, unsigned n,
       pulse, cz,
       mux(armed, R(comb::AddOp::create(b, loc, count, konst(cntTy, 1), false)),
           count)));
-  if (!regionTag.empty()) {
-    nameValue(armed, regionSignal(regionTag, "wait" + std::to_string(n)));
-    nameValue(count,
-              regionSignal(regionTag, "wait" + std::to_string(n) + "_c"));
+  std::string tag =
+      sh.region ? "r" + std::to_string(*sh.region) : regionTag;
+  if (!tag.empty()) {
+    nameValue(armed, regionSignal(tag, "wait" + std::to_string(n)));
+    nameValue(count, regionSignal(tag, "wait" + std::to_string(n) + "_c"));
   }
   return fire;
 }
@@ -770,7 +771,7 @@ Value EmitContext::delayValid(Value sig, unsigned n, const StallShell &sh) {
   assert(sig.getType() == i1 && "a valid is one bit");
   if (n == 0)
     return sig;
-  if (n >= countedDelayCycles && regionSinglePass) {
+  if (n >= countedDelayCycles && sh.singlePass) {
     if (Value hit = countedPulses.lookup({sig, n, sh.chainEnable}))
       return hit;
     Value fire = delayPulseCounted(sig, n, sh);
@@ -781,15 +782,18 @@ Value EmitContext::delayValid(Value sig, unsigned n, const StallShell &sh) {
   if (chain.stages.empty())
     chain.stages.push_back(sig); // stage 0 = the source itself
   if (unsigned have = chain.depth(); have < n) {
+    std::string tag =
+        sh.region ? "r" + std::to_string(*sh.region) : regionTag;
     Value cur = chain.stages.back();
     llvm::SaveAndRestore charged(inChainRun, true);
     for (unsigned k = have + 1; k <= n; ++k) {
       cur = sh ? enabledReg(cur, sh.chainEnable, f1, RegRole::Pulse)
                : reg(cur, f1, RegRole::Pulse);
       // Label each stage with the cycle it is valid at, so a waveform reads
-      // `r1_v3`: region 1, three cycles after issue.
-      if (!regionTag.empty())
-        nameValue(cur, regionSignal(regionTag, "v" + std::to_string(k)));
+      // `r1_v3`: region 1, three cycles after issue. Named after the OWNING
+      // region, so a chain another region extends keeps one name family.
+      if (!tag.empty())
+        nameValue(cur, regionSignal(tag, "v" + std::to_string(k)));
       chain.stages.push_back(cur);
     }
     ledger.extend(RegRole::Pulse, 1, have, n, holdsReset(RegRole::Pulse),

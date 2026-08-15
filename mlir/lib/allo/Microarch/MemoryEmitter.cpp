@@ -13,6 +13,7 @@
 
 #include "allo/IR/AlloOps.h" // kIndependentWritesAttr
 #include "allo/Microarch/HWEmitter.h"
+#include "allo/Support/Logging.h" // the ram_style / arbitrated-writes note
 
 #include "circt/Dialect/Comb/CombOps.h"
 #include "circt/Dialect/Seq/SeqOps.h"
@@ -232,9 +233,19 @@ void DatapathEmitter::createInternalMemories() {
           mem->setAttr(kIndependentWritesAttr, c.b.getUnitAttr());
         // Pin the array to the row it is realized in. Leaving it unsaid hands
         // the structure to the synthesizer, which then builds something the
-        // cost model did not price.
-        if (!m.ramStyle.empty())
+        // cost model did not price. Arbitrated writes are the known exception:
+        // they share one `always` block, no RAM is inferred, and the pin sits
+        // on a register array the cost model priced as the row.
+        if (!m.ramStyle.empty()) {
           mem->setAttr(kRamStyleAttr, c.b.getStringAttr(m.ramStyle));
+          if (m.writePortsBuilt > 1 && !m.writesIndependent)
+            logging::debug(logging::Stage::Emit)
+                << memCellName(dp, m, k, i) << " is pinned to ram_style '"
+                << m.ramStyle
+                << "' but its writes are arbitrated in one block, which "
+                   "infers no RAM; the style row's price does not match what "
+                   "synthesis builds";
+        }
         // An initialized array the kernel also writes is a real memory that
         // starts with contents. `seq.hlmem` carries no initializer, so the
         // words ride to the seq->SV pipeline, which gives the backing reg an

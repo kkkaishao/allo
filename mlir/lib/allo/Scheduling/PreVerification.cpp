@@ -767,8 +767,10 @@ LogicalResult checkChannelCycles(func::FuncOp func,
 // Address cost: the check, and the report behind it.
 //
 // An address is folded into the access's affine map rather than standing as its
-// own op, so chaining can only accept or reject it, never split it. Per-access
-// lines are `debug` level; a normal compile sees only rejections.
+// own op, so chaining cannot split it. A cone with no register-carried term is
+// refused when it misses the period; one with terms only warns, since the
+// emitter may land the sum in the address delay register (`addrSetup`).
+// Per-access lines are `debug` level.
 //===----------------------------------------------------------------------===//
 static LogicalResult checkAddressCost(func::FuncOp funcOp,
                                       const DeviceModel &dev,
@@ -806,7 +808,10 @@ static LogicalResult checkAddressCost(func::FuncOp funcOp,
     double charged =
         accessCharacterization(op, dev.operators, dev.memory).inDelay;
     bool over = charged > cycleTimeNs;
-    if (over) {
+    if (over && cost.carried == 0) {
+      // A cone that reduced to nothing is combinational into the port whole:
+      // an address is folded into the access's map rather than scheduled as an
+      // operation of its own, so there is nowhere to place a register.
       ++overCycle;
       fits = false;
       unsupported(Stage::Prep, Code::AddressOverPeriod, op)
@@ -815,12 +820,26 @@ static LogicalResult checkAddressCost(func::FuncOp funcOp,
           << " ns, which with the storage port's own setup is "
           << llvm::format("%.2f", charged) << " ns against a "
           << llvm::format("%.2f", cycleTimeNs)
-          << " ns clock period. The backend cannot pipeline an address: it is "
-             "folded into the access's address map rather than scheduled as an "
-             "operation of its own, so there is nowhere to place a register. "
-             "Compute the subscript into a variable so it becomes a "
-             "schedulable value, partition by a power of two so the bank digit "
-             "is a mask rather than a divider, or lower the target frequency";
+          << " ns clock period, and none of it follows a loop counter, so "
+             "there is nowhere to place a register. Compute the subscript "
+             "into a variable so it becomes a schedulable value, partition by "
+             "a power of two so the bank digit is a mask rather than a "
+             "divider, or lower the target frequency";
+    } else if (over) {
+      // Part of the sum follows a counter and can land in the address delay
+      // register, so the emitted path may be shorter than this pre-schedule
+      // number; a missed period reports rather than refuses, and the post-cut
+      // timing walk publishes the path actually built.
+      ++overCycle;
+      warn(Stage::Prep, op)
+          << "computing the address " << addr << " takes "
+          << llvm::format("%.2f", cost.delay)
+          << " ns, which with the storage port's own setup is "
+          << llvm::format("%.2f", charged) << " ns against a "
+          << llvm::format("%.2f", cycleTimeNs)
+          << " ns clock period. Part of the sum can land in an address delay "
+             "register, so the built path may be shorter; see the published "
+             "critical paths for what was built";
     }
     // Only warn when the address still fits; the rejection above already
     // covers the failing case.

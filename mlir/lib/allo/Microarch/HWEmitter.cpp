@@ -61,8 +61,7 @@ Terminator HWEmitter::terminatorOf(const uarch::RegionBlock &rb) {
 // in the Terminator and the survivor mechanism.
 Value HWEmitter::emitRegion(const uarch::RegionBlock &rb, Value start,
                             bool retrig) {
-  RegionTag tag(ctx, rb.id,
-                rb.singlePass()); // naming scope for this region's cells
+  RegionTag tag(ctx, rb.id); // naming scope for this region's cells
   // The controller is selected by (shape x termination): one switch over the
   // table in `RegionBlock::Shape`. `Leaf` falls out and is built inline below.
   switch (rb.shape) {
@@ -96,13 +95,15 @@ Value HWEmitter::emitRegion(const uarch::RegionBlock &rb, Value start,
 
   // H (elasticity): a stream region's enables depend on handshakes not yet
   // emitted, so it registers a promise (two backedges) that G, F and the done
-  // drain wire against, RAUWed at the end. A stream-free region is rigid.
+  // drain wire against, RAUWed at the end. A stream-free region is rigid; the
+  // shell still carries the owner stamp `shellFor` gives every shell.
   Backedge chainEnableBE, issueEnableBE;
-  StallShell shell; // rigid unless the region has stream accesses
+  StallShell shell = datapath.shellFor(rb.id);
   if (!rb.streamAccesses.empty()) {
     chainEnableBE = ctx.bb.get(ctx.i1);
     issueEnableBE = ctx.bb.get(ctx.i1);
-    shell = {chainEnableBE, issueEnableBE};
+    shell.chainEnable = chainEnableBE;
+    shell.issueEnable = issueEnableBE;
     datapath.setShell(rb.id, shell);
   }
 
@@ -321,7 +322,7 @@ HWEmitter::setupCarriedIterArgs(const uarch::RegionBlock &rb, Value start,
 // instance fires N times, each invocation advancing on its real `done`, a held
 // level cleared on its start whose rising edge marks each completion.
 Value HWEmitter::emitLoopCall(const uarch::RegionBlock &rb, Value start) {
-  RegionTag tag(ctx, rb.id, rb.singlePass());
+  RegionTag tag(ctx, rb.id);
   // A loop-over-call body is one child instance and nothing else
   // (`validateDatapath`), so the region is rigid: it derives no stall shell.
   assert(rb.streamAccesses.empty() &&
@@ -352,7 +353,7 @@ Value HWEmitter::emitLoopCall(const uarch::RegionBlock &rb, Value start) {
 // handed child-to-child crosses as a survivor register. Returns a latched
 // completion level.
 Value HWEmitter::emitContainer(const uarch::RegionBlock &rb, Value start) {
-  RegionTag tag(ctx, rb.id, rb.singlePass());
+  RegionTag tag(ctx, rb.id);
   // The controller is paced by `lastDrain`, the last child's done edge,
   // resolved once the children emit.
   Backedge lastDrain = ctx.bb.get(ctx.i1);
@@ -388,7 +389,7 @@ Value HWEmitter::emitContainer(const uarch::RegionBlock &rb, Value start) {
 // flushing family as a leaf while.
 Value HWEmitter::emitConditionalContainer(const uarch::RegionBlock &rb,
                                           Value start) {
-  RegionTag tag(ctx, rb.id, rb.singlePass());
+  RegionTag tag(ctx, rb.id);
 
   // The outer iter-arg registers are this region's survivors, advanced when an
   // outer iteration drains (`lastDrain`, resolved after the children emit).
@@ -420,7 +421,7 @@ Value HWEmitter::emitConditionalContainer(const uarch::RegionBlock &rb,
 // both branches. Run-once: no iteration or iter-args, since the predicate is
 // independent of the children.
 Value HWEmitter::emitGuard(const uarch::RegionBlock &rb, Value start) {
-  RegionTag tag(ctx, rb.id, rb.singlePass());
+  RegionTag tag(ctx, rb.id);
   // The predicate as a Source: a scheduled condition region's survivor (a
   // data-dependent scf guard), or the parent container's combinational
   // predicate unit (an affine guard, emitted by the container beforehand).

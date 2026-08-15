@@ -926,8 +926,16 @@ MemoryLibrary MemoryLibrary::fromModule(ModuleOp module) {
     if (s.getIsTable())
       m.tableStorage = s.getSymName().str();
   }
-  for (auto st : body.getOps<dcp::DCPathStreamTimingOp>())
+  for (auto st : body.getOps<dcp::DCPathStreamTimingOp>()) {
     m.fifo = timing(st);
+    // The emitter builds one FIFO shape: `seq.fifo` is show-ahead (the head is
+    // on the wire while `valid` is high) and a put commits in one cycle, with
+    // no presentation pipeline for anything deeper. A row declaring otherwise
+    // would schedule hardware that is not built.
+    assert(m.fifo.latency.read == 0 && m.fifo.latency.write == 1 &&
+           "a stream row's latencies must match the built FIFO: read 0 "
+           "(show-ahead), write 1");
+  }
   return m;
 }
 

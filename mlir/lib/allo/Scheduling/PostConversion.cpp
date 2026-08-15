@@ -182,7 +182,8 @@ static void convertOp(Operation &op, OpBuilder &b, IRMapping &map,
   // one of two exclusive paths: a combinational op carries a `comb_kind`, an IP
   // op references its injected `dcp.operator` via `op_type`.
   if (op.getNumResults() == 1 && at && !isa<arith::ConstantOp>(op)) {
-    OperatorIdentity id = dev.operators.lookup(&op).identity;
+    OperatorChar oc = dev.operators.lookup(&op);
+    OperatorIdentity id = oc.identity;
     assert(id.realized() && "a scheduled compute op with no realization");
     CombOpKindEnumAttr combKind;
     FlatSymbolRefAttr opType;
@@ -201,6 +202,10 @@ static void convertOp(Operation &op, OpBuilder &b, IRMapping &map,
     for (NamedAttribute attr : op.getAttrs())
       nw->setAttr(attr.getName(), attr.getValue());
     setZ(nw);
+    // The setup delay the solve priced this op against, carried on the op so
+    // the emitter's model holds the schedule's own number rather than
+    // re-deriving one from the device.
+    nw->setAttr("in_delay", b.getF32FloatAttr(oc.timing.inDelay));
     map.map(op.getResult(0), nw.getResult());
     return;
   }

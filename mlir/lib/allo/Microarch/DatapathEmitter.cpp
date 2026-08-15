@@ -520,7 +520,7 @@ StallShell DatapathEmitter::deriveStallShell(const uarch::RegionBlock &rb,
   nameValue(chainEnable, regionSignal(rb.id, "ce"));
   if (issueEnable != chainEnable)
     nameValue(issueEnable, regionSignal(rb.id, "ien"));
-  return {chainEnable, issueEnable};
+  return {chainEnable, issueEnable, rb.id, rb.singlePass()};
 }
 
 // Drive each channel from the terms every region contributed. A BOUNDARY
@@ -749,8 +749,8 @@ Value DatapathEmitter::startForCall(const uarch::CallUnit &cu, Value issue,
   case uarch::CallUnit::StartPolicy::TimeTriggered:
     // The offset rides the region's shell where there is one, so it stretches
     // with a stall; a concurrent container paces its children by back-pressure
-    // and has no shell.
-    return c.delayValid(issue, cu.start, concurrent ? StallShell{} : sh);
+    // and delays on the raw clock, the owner stamp kept.
+    return c.delayValid(issue, cu.start, concurrent ? sh.rigid() : sh);
   }
   llvm_unreachable("unhandled CallUnit::StartPolicy");
 }

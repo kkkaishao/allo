@@ -45,6 +45,9 @@ struct AddressCost {
   unsigned adders = 0; // carry chains, including a coefficient's shift-adds
   unsigned multipliers = 0; // generic multipliers (a NON-constant coefficient)
   unsigned dividers = 0;    // dividers / remainder units
+  /// Register-carried pieces (`SplitAddress` terms and reads, both cones):
+  /// zero means the whole cone is residual and no register can shorten it.
+  unsigned carried = 0;
 
   /// Nothing is instantiated: the address is wiring off an existing value.
   bool trivial() const {

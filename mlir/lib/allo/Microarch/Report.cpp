@@ -150,7 +150,8 @@ FuncUarch::FuncUarch(const Datapath &dp, llvm::StringRef symbol,
 
   for (const StreamChannel &s : dp.streams)
     streams.push_back({ownerOf(s.stream, chanOwner(s.id)),
-                       datapathWidth(s.payload), s.depth, !s.callEnds.empty()});
+                       datapathWidth(s.payload), s.depth, !s.callEnds.empty(),
+                       s.internal});
 
   std::map<std::string, CallReport> byCallee;
   for (const CallUnit &cu : dp.calls) {
@@ -318,6 +319,7 @@ std::string MicroarchReport::toJSON() const {
                 j.attribute("width", (int64_t)s.width);
                 j.attribute("depth", (int64_t)s.depth);
                 j.attribute("crosses_call", s.crossesCall);
+                j.attribute("internal", s.internal);
               });
           });
           j.attributeArray("calls", [&] {

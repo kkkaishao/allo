@@ -320,13 +320,12 @@ def estimate(report: CompileReport, device: Device = default_device) -> QoR:
                 Utilization.of(price(row.uses, (m.depth_words, m.width))) * copies,
             )
 
-        # A channel between two children is a queue this module builds, priced
-        # one cell per element since the register ledger does not hold it. A
-        # channel that does not cross a call is a boundary port or an
-        # intra-module queue the report does not distinguish, so it is charged
-        # nowhere.
+        # A channel wired between children or created in this body is a queue
+        # this module builds, priced one cell per element since the register
+        # ledger does not hold it. What remains is a boundary port, whose
+        # queue lives in the module that builds it.
         for s in f.streams:
-            if s.crosses_call:
+            if s.crosses_call or s.internal:
                 charge(
                     "memories",
                     f.func,

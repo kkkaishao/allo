@@ -247,10 +247,13 @@ class Stream:
     width: int
     depth: int
     crosses_call: bool  # an end of it is a child port, not a local access
+    internal: bool  # created in this body: its ``seq.fifo`` lives here
 
     @classmethod
     def from_json(cls, d: dict) -> Stream:
-        return cls(d["owner"], d["width"], d["depth"], d["crosses_call"])
+        return cls(
+            d["owner"], d["width"], d["depth"], d["crosses_call"], d["internal"]
+        )
 
 
 @dataclass(frozen=True)

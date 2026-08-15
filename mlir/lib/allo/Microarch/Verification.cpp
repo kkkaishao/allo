@@ -354,9 +354,11 @@ LogicalResult checkCombPathsMeetPeriod(dcp::DCPathModuleOp func,
   for (const FuncUnit &u : dp.units) {
     // The two arrival models, held together: recomposed from the device rows,
     // cones grown after the cut excluded, an input arrives no later than the
-    // sub-cycle start the solve placed the op at. Past it the two disagree
-    // about a price, which `FuncUnit::inDelay` being re-derived at bind time
-    // rather than copied from the priced row can do, so it is a diagnostic.
+    // sub-cycle start the solve placed the op at. `FuncUnit::inDelay` is the
+    // solve's own stamped number, so a price cannot disagree; what still can
+    // is structure, a recurrence loop the recomposition charges into one
+    // cycle where the hardware splits it at the carry register. Hence a
+    // diagnostic, not an assert.
     double placed = 0.0;
     for (const FuncUnit::BoundOp &bo : u.boundOps)
       placed = std::max(placed, bo.z.value_or(0.0));
@@ -369,7 +371,7 @@ LogicalResult checkCombPathsMeetPeriod(dcp::DCPathModuleOp func,
             << "an input settles at " << llvm::format("%.2f", sched)
             << " ns, past the " << llvm::format("%.2f", placed)
             << " ns sub-cycle start the solve placed this operation at; the "
-               "two arrival models disagree about a price";
+               "two arrival models disagree about this path's structure";
     }
     double mux = added.ofUnit(u.id);
     // No binding-grown cone reaches this unit: a structural overrun (a

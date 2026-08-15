@@ -173,8 +173,21 @@ struct StallShell {
   // rather than dropping it. Implies `chainEnable` and is strictly stronger
   // wherever the region may drain a deferred pass away, leaving a bubble.
   Value issueEnable; // G consumes; null => rigid (issue ungated)
+  // The owning region, stamped by `shellFor`: the region whose pass discipline
+  // the delayed pulses obey, not necessarily the one currently emitting. Names
+  // the delay cells; unset on a bare rigid shell.
+  std::optional<unsigned> region;
+  // Whether the owner has at most one pass in flight
+  // (`RegionBlock::singlePass`), which is what lets `delayValid` time a long
+  // delay with a counter: a pipelined region's chain taps each hold a
+  // DIFFERENT in-flight iteration, so a counter would drop every pulse but
+  // the first.
+  bool singlePass = false;
   /// Whether this region is latency-insensitive at all (has a stall shell).
   explicit operator bool() const { return chainEnable != Value(); }
+  /// This shell with the enables dropped: the raw clock as the time base, the
+  /// owner's pass discipline kept (a concurrent container's timed offsets).
+  StallShell rigid() const { return {Value(), Value(), region, singlePass}; }
 };
 
 //===----------------------------------------------------------------------===//
@@ -193,15 +206,9 @@ struct EmitContext {
   Value zero32, one32, f1, t1; // set by initLiterals()
 
   // The region being emitted, as a naming prefix (`r3`). Naming only, with no
-  // semantics attached.
+  // semantics attached: a delay cell is named after the shell that OWNS it,
+  // and this is only the fallback for a shell carrying no region.
   std::string regionTag;
-
-  // Whether at most ONE pass of the region being emitted is in flight, which is
-  // what lets `delayValid` time a long delay with a counter instead of a shift
-  // register. A pipelined region is the counterexample: its chain taps each
-  // hold a DIFFERENT in-flight iteration, so collapsing them to one counter
-  // would drop every pulse but the first. False outside any region.
-  bool regionSinglePass = false;
 
   // The pulse-delay depth from which `delayValid` builds a counter instead of
   // extending a chain, stamped from `Datapath::countedDelayCycles` (the
@@ -315,14 +322,14 @@ struct EmitContext {
   /// tap `n` of the one pulse chain per (signal, time base), extended on demand
   /// so every consumer shares its stages, which is the tap rule
   /// `insertRegisters` applies to value chains. Powers on to 0, so no spurious
-  /// valid. A delay past `countedDelayCycles` in a single-pass region is built
-  /// as `delayPulseCounted` instead (memoized per exact depth, a counter
-  /// admitting no taps): `n` registers to hold one pulse is a cost that tracks
-  /// the schedule rather than the datapath.
+  /// valid. A delay past `countedDelayCycles` under a single-pass owner
+  /// (`sh.singlePass`) is built as `delayPulseCounted` instead (memoized per
+  /// exact depth, a counter admitting no taps): `n` registers to hold one
+  /// pulse is a cost that tracks the schedule rather than the datapath.
   Value delayValid(Value sig, unsigned n, const StallShell &sh);
   /// One pulse delayed `n` cycles by a counter: `log2(n)` registers instead of
   /// `n`, at the cost of admitting only one pulse at a time. Sound exactly
-  /// where `regionSinglePass` holds, and asserts it.
+  /// where the pulse's owner is single-pass (`sh.singlePass`), and asserts it.
   Value delayPulseCounted(Value pulse, unsigned n, const StallShell &sh);
   /// A scheduled cell's activation pulse: \p pulse delayed to \p stage, the
   /// cycle within its region the cell issues at. The one name for "this cell
@@ -378,21 +385,15 @@ struct EmitContext {
   void initLiterals();
 };
 
-/// Scoped setter for `EmitContext::regionTag` and `regionSinglePass`, restoring
-/// the enclosing container's values on exit.
+/// Scoped setter for `EmitContext::regionTag`, restoring the enclosing
+/// container's value on exit.
 struct RegionTag {
   EmitContext &c;
   std::string saved;
-  bool savedSinglePass;
-  RegionTag(EmitContext &c, unsigned region, bool singlePass = false)
-      : c(c), saved(c.regionTag), savedSinglePass(c.regionSinglePass) {
+  RegionTag(EmitContext &c, unsigned region) : c(c), saved(c.regionTag) {
     c.regionTag = "r" + std::to_string(region);
-    c.regionSinglePass = singlePass;
   }
-  ~RegionTag() {
-    c.regionTag = saved;
-    c.regionSinglePass = savedSinglePass;
-  }
+  ~RegionTag() { c.regionTag = saved; }
 };
 
 } // namespace mlir::allo::uarch

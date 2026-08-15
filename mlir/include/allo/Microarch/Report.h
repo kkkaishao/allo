@@ -106,6 +106,7 @@ struct StreamReport {
   std::string owner;
   unsigned width = 0, depth = 0;
   bool crossesCall = false; // an end of it is a child port, not a local access
+  bool internal = false;    // created in this body: its `seq.fifo` lives here
 };
 
 /// Sub-kernel invocations of one callee.

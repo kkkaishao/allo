@@ -126,10 +126,11 @@ struct FuncUnit {
   OperatorIdentity identity;
   unsigned latency = 0;  // result available `latency` cycles after issue
   bool pipelined = true; // accepts a new input every cycle
-  /// The delay this unit's inputs must settle within, in ns, from the library
-  /// row the scheduler priced it against. Marginal for a comb unit, since `z`
-  /// already carries the register floor a start-in-cycle is seeded at. Zero for
-  /// an operation that renames bits rather than computing them.
+  /// The delay this unit's inputs must settle within, in ns, copied from the
+  /// `in_delay` the reifier stamped beside `z`, i.e. the row the solve priced
+  /// it against. Marginal for a comb unit, since `z` already carries the
+  /// register floor a start-in-cycle is seeded at. Zero for an operation that
+  /// renames bits rather than computing them.
   double inDelay = 0.0;
   // The IP's port/back-pressure contract (from its `dcp.operator`); unused for
   // a combinational unit. Clock-enable is the only contract the emitter builds.

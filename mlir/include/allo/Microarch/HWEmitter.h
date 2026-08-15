@@ -454,8 +454,15 @@ struct DatapathEmitter {
   /// registers a PROMISE (two backedges) before F and G emit against it, then
   /// re-registers the derived shell once `deriveStallShell` resolves them.
   void setShell(unsigned region, const StallShell &sh) { shellOf[region] = sh; }
-  /// Region \p region's stall shell; rigid for an unregistered region.
-  StallShell shellFor(unsigned region) const { return shellOf.lookup(region); }
+  /// Region \p region's stall shell; rigid for an unregistered region. Always
+  /// stamped with the owner and its pass discipline, the model-side facts a
+  /// primitive delaying this region's pulses reads off the shell.
+  StallShell shellFor(unsigned region) const {
+    StallShell sh = shellOf.lookup(region);
+    sh.region = region;
+    sh.singlePass = dp.regions[region].singlePass();
+    return sh;
+  }
 
   /// The part of \p rb's datapath that precedes the units, for both the leaf
   /// path (`emit`) and a container's condition cone (`emitConditionRegion`):

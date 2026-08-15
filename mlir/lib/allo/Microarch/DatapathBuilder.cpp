@@ -22,6 +22,7 @@
 #include "mlir/IR/BuiltinAttributes.h"
 #include "llvm/ADT/MapVector.h"
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/Support/Format.h"
 
 #include <algorithm>
 #include <deque>
@@ -284,6 +285,19 @@ void DatapathBuilder::deriveShapes() {
     assert(
         (!rb.conditional || rb.determinacy == DeterminacyEnum::Conditional) &&
         "a while region must be declared conditional");
+#ifndef NDEBUG
+    // The acyclic boundary family is decided twice: the latency composer from
+    // the op's nesting (`dcpSpanNode`) and the controller from the model's
+    // parent edge (`!rb.parent`). Hold the two predicates together.
+    bool nested = false;
+    for (Operation *p = rb.op->getParentOp(); p && !nested;
+         p = p->getParentOp())
+      nested = isa<dcp::DCPathRegionOpInterface>(p);
+    assert(rb.parent.has_value() == nested &&
+           "the model's parent edge disagrees with the op's nesting, so the "
+           "controller and the latency composer would pick different "
+           "boundary families");
+#endif
   }
 }
 
@@ -446,23 +460,21 @@ void DatapathBuilder::bindCompute(dcp::DCPathComputeOp comp, RegionBlock &rb) {
     // Combinational: emitted inline as a `comb` primitive (latency 0).
     u.latency = 0;
     u.pipelined = true;
-    u.inDelay =
-        dev.operators.combMarginalDelay(*u.identity.comb, combParamWidth(comp));
   } else {
-    // IP: the `dcp.operator` the identity names is the one copy of its timing
-    // and stall contract.
+    // IP: the `dcp.operator` the identity names is the one copy of its stall
+    // contract.
     auto opr = SymbolTable::lookupNearestSymbolFrom<dcp::DCPathOperatorOp>(
         comp, comp.getOpTypeAttr());
     assert(opr && "a dcp.compute op_type must reference a live dcp.operator");
     u.latency = static_cast<unsigned>(opr.getLatency());
     u.pipelined = opr.getPipelined();
     u.stall = opr.getStall();
-    u.inDelay = opr.getInDelay().convertToDouble();
   }
-  // The one exception no library row carries, taken by the scheduler too: an
-  // operation that renames bits rather than computing them costs nothing.
-  if (isZeroDelay(comp))
-    u.inDelay = 0.0;
+  // The setup delay the reifier stamped, the same number the solve was cut
+  // against; re-deriving it from the device here could disagree with it.
+  auto inDelay = comp->getAttrOfType<FloatAttr>("in_delay");
+  assert(inDelay && "a dcp.compute carries the in_delay the schedule priced");
+  u.inDelay = inDelay.getValueAsDouble();
   // The unit's reservation slot: its issue cycle, taken modulo II in a cyclic
   // region since successive iterations overlap there.
   unsigned stage = dcpStart(comp);
@@ -1179,6 +1191,17 @@ static double postRegisterDelay(const MemUnit::Access::Reduced &r,
   return splitAddressCost(sp, delays, width).delay;
 }
 
+// The whole cone as built, before any delay register: each reduced term
+// arrives from its stride register and the residual runs beside the summing
+// chain. Reconstructed for the debug diff against the stamped price.
+static double builtConeDelay(const MemUnit::Access::Reduced &r,
+                             const AddressDelays &delays, unsigned width) {
+  SplitAddress sp;
+  sp.terms.resize(r.terms.size());
+  sp.residual = r.residual;
+  return splitAddressCost(sp, delays, width).delay;
+}
+
 // Address strength reduction: decide which TERMS of each access's address can
 // come from registers that advance with the loop counters, and record the
 // scaled counters those registers need. A term that does not qualify stays in
@@ -1258,6 +1281,20 @@ void DatapathBuilder::planAddressGenerators() {
                          postRegisterDelay(acc.bank, delays,
                                            AddressDelays::refWidth))
               : acc.inDelay - acc.portDelay;
+      // The pricing is optimistic on the reduction gap: the scheduler split
+      // over the IR loops, while this split also needs constant bounds and one
+      // shared delay. A cone built longer than priced is that gap
+      // materializing; the post-cut walk still measures the real path.
+      double priced = acc.inDelay - acc.portDelay;
+      double built =
+          std::max(builtConeDelay(acc.offset, delays, e.width),
+                   builtConeDelay(acc.bank, delays, AddressDelays::refWidth));
+      if (built > priced + 0.011)
+        debug(Stage::Emit, acc.op)
+            << "the address cone built here is " << llvm::format("%.2f", built)
+            << " ns against the " << llvm::format("%.2f", priced)
+            << " ns the schedule priced; a term the pricing reduced stayed in "
+               "the residual";
       // An operand no residual is left reading has no consumer: its slot stays
       // empty and the delay it was owed is withdrawn before a chain carries it.
       llvm::BitVector read = residualReads(acc);
