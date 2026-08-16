@@ -43,10 +43,9 @@ alloEmitSplitVerilog(MlirModule module, MlirStringRef directory);
 /// Schedules `top` and reifies the schedule into `module` in place as
 /// `allo.dcp.*` ops, streaming back through `callback` the schedule report as
 /// JSON: per-func regions with their per-op start times, plus the per-region
-/// and whole-kernel latency. `scheduler` is "heuristic", "exact" (CP-SAT, only
-/// in a build with OR-Tools) or "exact-chaining". `budget` is what one exact
-/// solve may spend, in deterministic time units; zero or less takes the
-/// default. `allocate` lets an exact solve decide how many copies of each
+/// and whole-kernel latency. `scheduler` is "heuristic" or "exact" (CP-SAT).
+/// `budget` is what one exact solve may spend, in deterministic time units;
+/// zero or less takes the default. `allocate` lets an exact solve decide how many copies of each
 /// operator a region builds. `workers` (zero or less takes the default) and
 /// `seed` tune the CP-SAT search; changing either makes a compile
 /// non-reproducible. Returns failure (callback not invoked) on any failed

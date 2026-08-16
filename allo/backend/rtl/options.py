@@ -46,9 +46,7 @@ class SchedulerOptions:
     Args:
         scheduler: the solver that settles the resource half of each problem.
             ``"heuristic"`` is the SDC simplex plus greedy placement; ``"exact"``
-            is CP-SAT over the same problem, keeping the chain-breaking pre-pass;
-            ``"exact-chaining"`` additionally decides where to break a too-long
-            combinational chain in the solver.
+            is CP-SAT over the same problem.
         cycle_ns: the period every combinational chain was cut to. Derived from
             the handle's ``freq_mhz``, which the cosim clock also reads.
         budget: what one exact solve may spend, in the solver's deterministic

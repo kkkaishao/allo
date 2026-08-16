@@ -255,6 +255,12 @@ public:
 /// weigh one cycle more than a plain dependence. Schedule-independent, so a
 /// caller may run it before or after solving.
 ///
+/// The edges state the period exactly over integer start times: an
+/// over-period pair must sit a cycle apart in any schedule (same-cycle
+/// endpoints pull every zero-latency intermediate into their cycle), and a
+/// schedule separating every such pair leaves no cycle holding an over-period
+/// chain. Register placement inside a broken chain stays the solver's.
+///
 /// Visits operations in topological order and marks one "handled" only once
 /// every predecessor's chain map is complete, so a successor never inherits a
 /// half-built map.
@@ -423,14 +429,10 @@ enum class SchedulerKind {
   /// The SDC simplex plus greedy modulo / shared-operator placement.
   Heuristic,
   /// CP-SAT over the same problem: exact under the model. The chain breaks
-  /// stay the pre-pass's, so only resource placement differs from the
+  /// stay the pre-pass's, which state the period exactly (see
+  /// `computeChainBreaks`), so only resource placement differs from the
   /// heuristic.
   Exact,
-  /// As above, but the chain breaks are decided in the constraint program too.
-  /// The pre-pass breaks a too-long chain at its ORIGIN; deciding it in the
-  /// model lets the solver put the break where it is cheapest, against the same
-  /// span and area objective.
-  ExactChaining,
 };
 
 /// Whether \p kind solves the resource half with CP-SAT.
@@ -468,8 +470,8 @@ struct SchedulerOptions {
   float regFloor = 0.0f;
 };
 
-/// \p name ("heuristic" / "exact" / "exact-chaining") as a kind, or nullopt
-/// when it names none of them.
+/// \p name ("heuristic" / "exact") as a kind, or nullopt when it names
+/// neither.
 std::optional<SchedulerKind> parseSchedulerKind(StringRef name);
 
 /// One region's operator-sharing problem, decided at bind time with the

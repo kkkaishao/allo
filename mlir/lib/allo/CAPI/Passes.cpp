@@ -87,7 +87,7 @@ MlirLogicalResult alloRunSDCSchedulingPipeline(
     allo::logging::error(allo::logging::Stage::Sched,
                          allo::logging::Code::UnknownOption, mod)
         << "Unknown scheduler '" << schedulerName
-        << "'; expected \"heuristic\", \"exact\" or \"exact-chaining\"";
+        << "'; expected \"heuristic\" or \"exact\"";
     return mlirLogicalResultFailure();
   }
   // The target clock period, the exact-solve budget and its worker count take

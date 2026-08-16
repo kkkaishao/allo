@@ -26,7 +26,6 @@ std::optional<SchedulerKind> mlir::allo::parseSchedulerKind(StringRef name) {
   return llvm::StringSwitch<std::optional<SchedulerKind>>(name)
       .Case("heuristic", SchedulerKind::Heuristic)
       .Case("exact", SchedulerKind::Exact)
-      .Case("exact-chaining", SchedulerKind::ExactChaining)
       .Default(std::nullopt);
 }
 
@@ -51,31 +50,22 @@ SatParameters solverParameters(const SchedulerOptions &opts) {
   return params;
 }
 
-/// How the model states the clock period: either the chain-breaking edges the
-/// pre-pass computed (each costs a cycle on top of plain precedence), or the
-/// period itself, which `addChaining` encodes as sub-cycle start times.
-struct Chaining {
-  SmallVector<Problem::Dependence> breaks;
-  std::optional<float> period;
-};
-
-/// Build the chaining constraint: the pre-pass's break edges, or \p cycleTime
-/// itself when \p exactChaining.
+/// How the model states the clock period: the chain-breaking edges the
+/// pre-pass computed, each costing a cycle on top of plain precedence. The
+/// edges hold the period exactly over integer start times (see
+/// `computeChainBreaks`), so no sub-cycle constraint is needed for
+/// feasibility.
 template <class ProblemT>
-Chaining chainingFor(ProblemT &prob, float cycleTime, float regFloor,
-                     bool exactChaining) {
-  Chaining chaining;
-  if (exactChaining) {
-    chaining.period = cycleTime;
-    return chaining;
-  }
-  auto broke = mlir::allo::computeChainBreaks(prob, cycleTime, regFloor,
-                                              chaining.breaks);
+SmallVector<Problem::Dependence> chainBreaksFor(ProblemT &prob, float cycleTime,
+                                                float regFloor) {
+  SmallVector<Problem::Dependence> breaks;
+  auto broke =
+      mlir::allo::computeChainBreaks(prob, cycleTime, regFloor, breaks);
   assert(succeeded(broke) && "chain breaking is a pure function of the problem "
                              "and the cycle time, and the heuristic just ran "
                              "it successfully");
   (void)broke;
-  return chaining;
+  return breaks;
 }
 
 /// Sub-cycle time in picoseconds, rounded to nearest: CP-SAT is integer, and a
@@ -85,11 +75,14 @@ Chaining chainingFor(ProblemT &prob, float cycleTime, float regFloor,
 constexpr double kPicosPerNs = 1000.0;
 int64_t picos(double ns) { return std::llround(ns * kPicosPerNs); }
 
-/// States the period as a model constraint rather than as pre-pass edges: one
-/// sub-cycle start time `z` per operation, in picoseconds from the start of its
-/// cycle, matching what `computeStartTimesInCycle` computes afterwards.
+/// The period as a model constraint: one sub-cycle start time `z` per
+/// operation, in picoseconds from the start of its cycle, matching what
+/// `computeStartTimesInCycle` computes afterwards.
 /// `z(v) <= P - inDelay(v)`, and where a def-use producer u ends in the cycle v
 /// starts, `z(v) >= (lat(u) == 0 ? z(u) : 0) + outDelay(u)`.
+///
+/// Redundant against the break edges for feasibility; stated only so
+/// `addAllocationHeadroom` can hold a select cone against sub-cycle slack.
 ///
 /// Precedence already forces `t_v - t_u >= lat(u)`, so gating on the `<=` half
 /// alone (via `sameCycle`) detects "ends in the same cycle".
@@ -146,21 +139,16 @@ addSubCycleTimes(CpModelBuilder &model, ProblemT &prob,
   return inCycle;
 }
 
-/// State \p chaining on the model: a chain-breaking edge widens an existing
-/// precedence by one cycle; a period uses the sub-cycle encoding above, whose
-/// variables are passed back (empty in the break-edge form).
+/// State \p breaks on the model: a chain-breaking edge widens an existing
+/// precedence by one cycle.
 template <class ProblemT>
-DenseMap<Operation *, IntVar>
-addChaining(CpModelBuilder &model, ProblemT &prob,
-            DenseMap<Operation *, IntVar> &startVars, const Chaining &chaining,
-            float regFloor) {
-  for (const Problem::Dependence &dep : chaining.breaks)
+void addChainBreaks(CpModelBuilder &model, ProblemT &prob,
+                    DenseMap<Operation *, IntVar> &startVars,
+                    ArrayRef<Problem::Dependence> breaks) {
+  for (const Problem::Dependence &dep : breaks)
     model.AddLessOrEqual(startVars.at(dep.getSource()) +
                              prob.latencyOf(dep.getSource()) + 1,
                          startVars.at(dep.getDestination()));
-  if (chaining.period)
-    return addSubCycleTimes(model, prob, startVars, *chaining.period, regFloor);
-  return DenseMap<Operation *, IntVar>();
 }
 
 /// Every operation's inputs settle within the period.
@@ -289,22 +277,20 @@ SmallVector<AllocationVar> allocationVars(CpModelBuilder &model, ProblemT &prob,
 /// same solve leaves, which is what lets a `planned` binding realize the
 /// allocation as built.
 ///
-/// The break-edge chaining form carries no sub-cycle variables, so they are
-/// created here on demand; the break edges already keep the plain system
-/// satisfiable at any placement, so this tightens the model only by the
-/// headroom itself.
+/// The model carries no sub-cycle variables otherwise, so they are created
+/// here on demand; the break edges already keep the plain system satisfiable
+/// at any placement, so this tightens the model only by the headroom itself.
 template <class ProblemT>
 void addAllocationHeadroom(CpModelBuilder &model, ProblemT &prob,
                            DenseMap<Operation *, IntVar> &startVars,
-                           DenseMap<Operation *, IntVar> &inCycle,
                            ArrayRef<AllocationVar> allocs, float cycleTime,
                            float regFloor) {
   if (llvm::none_of(allocs, [](const AllocationVar &a) {
         return a.headroom.has_value();
       }))
     return;
-  if (inCycle.empty())
-    inCycle = addSubCycleTimes(model, prob, startVars, cycleTime, regFloor);
+  DenseMap<Operation *, IntVar> inCycle =
+      addSubCycleTimes(model, prob, startVars, cycleTime, regFloor);
   int64_t period = picos(cycleTime);
   for (const AllocationVar &alloc : allocs) {
     if (!alloc.headroom)
@@ -514,7 +500,7 @@ void reportUnsolved(Problem &prob, const CpSolverResponse &response,
 /// classes, each admitting `limit` units from that iteration, and work above
 /// `ii * limit` is an interval `computeResMinII` already ruled out.
 template <typename ProblemT>
-int64_t drainFloor(ProblemT &prob, const Chaining &chaining,
+int64_t drainFloor(ProblemT &prob, ArrayRef<Problem::Dependence> breaks,
                    ArrayRef<DrainTerm> terms) {
   constexpr int64_t kUnreached = std::numeric_limits<int64_t>::min();
 
@@ -536,7 +522,7 @@ int64_t drainFloor(ProblemT &prob, const Chaining &chaining,
       edge(dep.getSource(), op, prob.latencyOf(dep.getSource()));
     }
   // A chain break is intra-iteration whichever problem this is.
-  for (auto &dep : chaining.breaks)
+  for (const auto &dep : breaks)
     edge(dep.getSource(), dep.getDestination(),
          prob.latencyOf(dep.getSource()) + 1);
 
@@ -672,8 +658,8 @@ LogicalResult mlir::allo::scheduleCPSAT(ChainingSharedOperatorsProblem &prob,
 
   // The pre-pass is schedule-independent, so taking its edges hands CP-SAT the
   // chain breaks the heuristic just used.
-  Chaining chaining = chainingFor(prob, cycleTime, opts.regFloor,
-                                  opts.kind == SchedulerKind::ExactChaining);
+  SmallVector<Problem::Dependence> breaks =
+      chainBreaksFor(prob, cycleTime, opts.regFloor);
 
   const auto &ops = prob.getOperations();
 
@@ -686,8 +672,7 @@ LogicalResult mlir::allo::scheduleCPSAT(ChainingSharedOperatorsProblem &prob,
   bool allocates = false;
   for (Problem::ResourceType rsrc : prob.getResourceTypes())
     allocates |= prob.getAllocatable(rsrc).has_value();
-  if (!allocates &&
-      drainFloor(prob, chaining, span.drain) >= span.drainOf(prob))
+  if (!allocates && drainFloor(prob, breaks, span.drain) >= span.drainOf(prob))
     return success();
 
   // Horizon: the whole region laid out end to end (each op after the previous
@@ -717,8 +702,7 @@ LogicalResult mlir::allo::scheduleCPSAT(ChainingSharedOperatorsProblem &prob,
       model.AddLessOrEqual(startVars.at(dep.getSource()) +
                                prob.latencyOf(dep.getSource()),
                            startVars.at(dep.getDestination()));
-  DenseMap<Operation *, IntVar> inCycle =
-      addChaining(model, prob, startVars, chaining, opts.regFloor);
+  addChainBreaks(model, prob, startVars, breaks);
 
   // An op occupies one instance of every unit it links to for its whole window,
   // so a cumulative constraint per resource matches `verifyOccupancy`. A
@@ -742,7 +726,7 @@ LogicalResult mlir::allo::scheduleCPSAT(ChainingSharedOperatorsProblem &prob,
       allocationVars(model, prob, /*ii=*/0, /*hint=*/true, cycleTime);
   for (const AllocationVar &alloc : allocs)
     cumulativeOn(alloc.rsrc, alloc.units);
-  addAllocationHeadroom(model, prob, startVars, inCycle, allocs, cycleTime,
+  addAllocationHeadroom(model, prob, startVars, allocs, cycleTime,
                         opts.regFloor);
 
   // What the region is charged, bounded by what the heuristic already reached.
@@ -814,7 +798,7 @@ enum class ModuloOutcome { Scheduled, Infeasible, Exhausted };
 /// \p drainBound is the incumbent's, so INFEASIBLE here means nothing beats the
 /// incumbent at this II rather than a proof the interval is impossible.
 ModuloOutcome solveAtII(ChainingModuloProblem &prob, Operation *lastOp,
-                        const Chaining &chaining, float cycleTime,
+                        ArrayRef<Problem::Dependence> breaks, float cycleTime,
                         const SpanObjective &span, const SchedulerOptions &opts,
                         std::optional<int64_t> drainBound, unsigned ii,
                         unsigned horizon, bool hint,
@@ -849,8 +833,7 @@ ModuloOutcome solveAtII(ChainingModuloProblem &prob, Operation *lastOp,
       model.AddLessOrEqual(startVars.at(src) + separation,
                            startVars.at(dep.getDestination()));
     }
-  DenseMap<Operation *, IntVar> inCycle =
-      addChaining(model, prob, startVars, chaining, opts.regFloor);
+  addChainBreaks(model, prob, startVars, breaks);
 
   // One-hot congruence class per contending op. `t = ii*lap + sum(p*slot[p])`
   // defines class and modulo at once with no reification: slot[p] IS membership
@@ -913,7 +896,7 @@ ModuloOutcome solveAtII(ChainingModuloProblem &prob, Operation *lastOp,
     for (unsigned slot = 0; slot < ii; ++slot)
       model.AddLessOrEqual(usesIn(alloc.rsrc, slot), alloc.units);
   }
-  addAllocationHeadroom(model, prob, startVars, inCycle, allocs, cycleTime,
+  addAllocationHeadroom(model, prob, startVars, allocs, cycleTime,
                         opts.regFloor);
 
   // `(trip - 1) * ii` is constant at a fixed II, so minimizing the span here is
@@ -968,10 +951,10 @@ LogicalResult mlir::allo::scheduleCPSAT(ChainingModuloProblem &prob,
   assert((!warm.placed || greedyII >= warm.lowerBoundII) &&
          "placement only ever grows the II");
 
-  // The heuristic ran the pre-pass whichever form this takes, so the schedule
-  // this falls back to meets the period either way.
-  Chaining chaining = chainingFor(prob, cycleTime, opts.regFloor,
-                                  opts.kind == SchedulerKind::ExactChaining);
+  // The heuristic ran the same pre-pass, so the schedule this falls back to
+  // meets the period.
+  SmallVector<Problem::Dependence> breaks =
+      chainBreaksFor(prob, cycleTime, opts.regFloor);
 
   // Window: region laid out end to end (satisfying precedence and chain breaks)
   // plus one II per contending op, widened to the heuristic's own reach. Must
@@ -1012,7 +995,7 @@ LogicalResult mlir::allo::scheduleCPSAT(ChainingModuloProblem &prob,
   if (bySpan && warm.placed)
     heuristicSpan = iiWeight * greedyII + span.drainOf(prob);
   std::optional<int64_t> best = heuristicSpan;
-  int64_t floorDrain = bySpan ? drainFloor(prob, chaining, span.drain) : 0;
+  int64_t floorDrain = bySpan ? drainFloor(prob, breaks, span.drain) : 0;
 
   // Whether this region has an allocation to decide at all, which the cut
   // below admits a span tie for.
@@ -1043,7 +1026,7 @@ LogicalResult mlir::allo::scheduleCPSAT(ChainingModuloProblem &prob,
     bool proven = false;
     int64_t drain = 0;
     ModuloOutcome outcome = solveAtII(
-        prob, lastOp, chaining, cycleTime, span, opts, drainBound, ii,
+        prob, lastOp, breaks, cycleTime, span, opts, drainBound, ii,
         window + ii * contending,
         /*hint=*/warm.placed && ii == greedyII, starts, decided, proven, drain);
     if (outcome == ModuloOutcome::Infeasible) {
