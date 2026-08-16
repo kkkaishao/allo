@@ -834,6 +834,149 @@ def test_operator_over_period_derates_the_clock():
     assert int(rtl.cosim(x, y).result) == ((exact + 2**47) % 2**48) - 2**47
 
 
+# Selection ranks period fit above latency: a shallow core whose own delay
+# misses the clock loses to a deeper one that holds it, and the clock is not
+# derated. At a clock both fit, the shallow one wins back.
+def test_a_core_that_misses_the_clock_loses_to_one_that_holds_it():
+    wide = APInt(48, signed=True)
+
+    @operator_ip(
+        optype=OperatorType.ADD,
+        mnemonic="add_shallow",
+        latency=2,
+        in_delay_ns=9.0,
+        pipelined=True,
+        style="ce",
+    )
+    def add_shallow(a: wide, b: wide) -> wide: ...
+
+    @operator_ip(
+        optype=OperatorType.ADD,
+        mnemonic="add_deep",
+        latency=6,
+        in_delay_ns=1.0,
+        pipelined=True,
+        style="ce",
+    )
+    def add_deep(a: wide, b: wide) -> wide: ...
+
+    @kernel
+    def dot(x: i32[8], y: i32[8]) -> wide:
+        acc: wide = 0
+        for k in range(8, name="k"):
+            acc = acc + x[k] * y[k]
+        return acc
+
+    dev = default_device.copy()
+    dev.add_operator(add_shallow)
+    dev.add_operator(add_deep)
+
+    fast = _to_rtl(dot, device=dev, freq_mhz=200).schedule()
+    assert add_deep.symbol in _impls(fast)
+    assert fast.cycle_ns == pytest.approx(5.0)
+
+    slow = _to_rtl(dot, device=dev, freq_mhz=50).schedule()
+    assert add_shallow.symbol in _impls(slow)
+    assert slow.cycle_ns == pytest.approx(20.0)
+
+
+# When another operator derates the clock, selection re-ranks at the achieved
+# period: a core that missed the target fits the raised period and wins back
+# its shorter latency.
+def test_selection_reranks_at_the_derated_period():
+    w48 = APInt(48, signed=True)
+    w40 = APInt(40, signed=True)
+
+    @operator_ip(
+        optype=OperatorType.ADD,
+        mnemonic="add_shallow",
+        latency=2,
+        in_delay_ns=8.0,
+        pipelined=True,
+        style="ce",
+    )
+    def add_shallow(a: w48, b: w48) -> w48: ...
+
+    @operator_ip(
+        optype=OperatorType.ADD,
+        mnemonic="add_deep",
+        latency=6,
+        in_delay_ns=1.0,
+        pipelined=True,
+        style="ce",
+    )
+    def add_deep(a: w48, b: w48) -> w48: ...
+
+    @operator_ip(
+        optype=OperatorType.ADD,
+        mnemonic="add_slow",
+        latency=2,
+        in_delay_ns=9.0,
+        pipelined=True,
+        style="ce",
+    )
+    def add_slow(a: w40, b: w40) -> w40: ...
+
+    @kernel
+    def dot(x: i32[8], y: i32[8]) -> w48:
+        acc: w48 = 0
+        pre: w40 = 0
+        for k in range(8, name="k"):
+            pre = pre + x[k] * y[k]
+            acc = acc + pre
+        return acc
+
+    dev = default_device.copy()
+    dev.add_operator(add_shallow)
+    dev.add_operator(add_deep)
+    dev.add_operator(add_slow)
+
+    sched = _to_rtl(dot, device=dev, freq_mhz=200).schedule()
+    # The 40-bit add's only core derates the clock past the 48-bit shallow
+    # core's need, so the shallow core is selected, not the deep one.
+    assert sched.cycle_ns is not None and 9.0 < sched.cycle_ns < 10.0
+    assert add_slow.symbol in _impls(sched)
+    assert add_shallow.symbol in _impls(sched)
+    assert add_deep.symbol not in _impls(sched)
+
+
+# The stall contract holds for every candidate core, not only the one selection
+# ranks first: which core wins is settled only once the period is.
+def test_an_elastic_candidate_is_refused_whichever_core_ranks_first():
+    wide = APInt(48, signed=True)
+
+    @operator_ip(
+        optype=OperatorType.ADD,
+        mnemonic="add_ce",
+        latency=2,
+        in_delay_ns=0.5,
+        pipelined=True,
+        style="ce",
+    )
+    def add_ce(a: wide, b: wide) -> wide: ...
+
+    @operator_ip(
+        optype=OperatorType.ADD,
+        mnemonic="add_elastic",
+        latency=6,
+        in_delay_ns=0.5,
+        pipelined=True,
+        style="elastic",
+    )
+    def add_elastic(a: wide, b: wide) -> wide: ...
+
+    @kernel
+    def addk(x: wide[8], y: wide[8], out: wide[8]):
+        for i in range(8):
+            out[i] = x[i] + y[i]
+
+    dev = default_device.copy()
+    dev.add_operator(add_ce)
+    dev.add_operator(add_elastic)
+    with pytest.raises(RuntimeError, match="elastic"):
+        _to_rtl(addk, device=dev).schedule()
+
+
 def test_behavior_language_follows_the_domain():
     # A core's behavior language follows from the core: an integer one is native
     # RTL (exact at any width), a float one is C over the DPI, and a user

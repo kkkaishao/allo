@@ -981,6 +981,8 @@ void mlir::allo::runPostScheduleConversion(ModuleOp module,
                                            ScheduleModel &model) {
   loadDependentDialects(*module->getContext());
   auto dev = DeviceModel::fromModule(module);
+  // Reify selects rows the way the schedule did: at the resolved period.
+  dev.operators.setSelectionPeriod(model.cycleTimeNs);
   // One `dcp.unit` per allocated instance, declared at the top of the module so
   // the symbols resolve whatever order the funcs below are reified in.
   OpBuilder b(module.getBody(), module.getBody()->begin());

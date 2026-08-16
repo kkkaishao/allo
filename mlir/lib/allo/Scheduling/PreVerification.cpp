@@ -282,8 +282,11 @@ LogicalResult checkOperations(func::FuncOp func, const OperatorLibrary &lib) {
              "support";
       return WalkResult::interrupt();
     }
-    if (!id.comb && failed(checkStallContract(op, id.ipSymbol)))
-      return WalkResult::interrupt();
+    // Every candidate IP, not the selected row: which one wins is settled
+    // only once the period is, and any of them must be realizable.
+    for (StringRef symbol : lib.candidateIPs(op))
+      if (failed(checkStallContract(op, symbol)))
+        return WalkResult::interrupt();
     return WalkResult::advance();
   });
   return failure(r.wasInterrupted());

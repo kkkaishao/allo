@@ -27,6 +27,7 @@
 #include "llvm/ADT/StringRef.h"
 
 #include <cstdint>
+#include <limits>
 #include <map>
 #include <optional>
 #include <string>
@@ -146,12 +147,25 @@ public:
 
   /// Resolve the characterization for \p op: the row `selectImplementation`
   /// picks out of the candidates matching it, else the default row. Pure: the
-  /// answer depends only on the library and on \p op's own name, types and
-  /// attributes.
+  /// answer depends only on the library (its selection period included) and on
+  /// \p op's own name, types and attributes.
   ///
   /// A row the device never measured at \p op's width comes back unrealized,
   /// with the gap reported against \p op.
   OperatorChar lookup(Operation *op) const;
+
+  /// The clock period (ns) selection ranks IP rows against: a row that fits it
+  /// outranks one that does not. Set when the module's period resolves and
+  /// before any problem is built, and set again on a derate, so every lookup a
+  /// schedule registers ranks against the period it is scheduled at. Unset
+  /// ranks as if the period were unbounded.
+  void setSelectionPeriod(float ns) { selectionPeriodNs = ns; }
+
+  /// The symbol of every IP row that could realize \p op, whichever of them
+  /// the period makes `selectImplementation` pick. What the pre-schedule stall
+  /// contract check has to hold, since selection is settled only once the
+  /// period is.
+  SmallVector<StringRef, 2> candidateIPs(Operation *op) const;
 
   /// Whether \p op needs an IP realization (a float or advanced compute op) but
   /// its candidate set is empty, so the caller can report an error instead of
@@ -241,7 +255,9 @@ private:
 
   /// Which of \p candidates \p op is realized on, at \p width bits; null for an
   /// empty set. An IP outranks the combinational row whatever their latencies.
-  /// Among IPs the shortest wins, then the cheapest, then the first by symbol.
+  /// Among IPs, one that fits the selection period outranks one that does not;
+  /// among misses the least need wins, which is what the period derates to.
+  /// Then the shortest, then the cheapest, then the first by symbol.
   const OperatorEntry *
   selectImplementation(ArrayRef<const OperatorEntry *> candidates,
                        int64_t width) const;
@@ -259,6 +275,7 @@ private:
   CostAttr muxDelayWidth; // its unitless width factor; null with `muxDelay`
   ArrayAttr chainUses;    // `dcp.chain`, reset-free, over (depth, width)
   double regFloor = 0.0;  // `dcp.device`'s `reg_delay`
+  float selectionPeriodNs = std::numeric_limits<float>::infinity();
 };
 
 /// The combinational depth, in LUT levels, of a select over \p sources

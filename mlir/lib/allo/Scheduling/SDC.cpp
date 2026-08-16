@@ -937,7 +937,10 @@ static void loadDependentDialects(MLIRContext &context) {
 //
 // The walk prices through the same characterization `populateOperatorTypes`
 // registers, over every op a problem can hold: a region op, a call and a
-// declaration contribute no operator row.
+// declaration contribute no operator row. Selection ranks fit-first against
+// the target here, so an op with any candidate inside the target derates
+// nothing, and one with none is priced at its least-need candidate, the row
+// the raised period re-selects.
 static float minSchedulablePeriod(ArrayRef<func::FuncOp> funcs,
                                   const DeviceModel &dev, float target,
                                   float regFloor) {
@@ -1008,9 +1011,10 @@ LogicalResult mlir::allo::runSDCScheduler(ModuleOp module, StringRef top,
   // the least period every row does, once for the whole module (one clock
   // domain), and everything downstream holds the raised period. The miss is a
   // report; the schedule stays valid at the frequency actually achieved.
+  loadedDev.operators.setSelectionPeriod(cycleTime);
   float scheduled = minSchedulablePeriod(*orderOr, loadedDev, cycleTime,
                                          regFloor);
-  if (scheduled > cycleTime)
+  if (scheduled > cycleTime) {
     warn(Stage::Sched, topFunc)
         << "The requested " << format("%.2f", cycleTime) << " ns clock period ("
         << format("%.0f", 1000.0f / cycleTime)
@@ -1018,6 +1022,11 @@ LogicalResult mlir::allo::runSDCScheduler(ModuleOp module, StringRef top,
         << format("%.2f", scheduled) << " ns ("
         << format("%.0f", 1000.0f / scheduled)
         << " MHz). The QoR report prices the design at the achieved period";
+    // Re-rank at the achieved period: a row that missed the target may fit
+    // the raised period and win back a shorter latency. Every op keeps a row
+    // that fits, since the walk raised the period to its least need.
+    loadedDev.operators.setSelectionPeriod(scheduled);
+  }
   model.cycleTimeNs = scheduled;
 
   if (scheduled <= regFloor) {

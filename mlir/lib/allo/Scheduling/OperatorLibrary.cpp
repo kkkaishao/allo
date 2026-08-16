@@ -328,12 +328,23 @@ OperatorLibrary OperatorLibrary::fromModule(ModuleOp module) {
 
 const OperatorEntry *OperatorLibrary::selectImplementation(
     ArrayRef<const OperatorEntry *> candidates, int64_t width) const {
-  // Shortest, then cheapest at this width, then the first symbol: a total order
-  // over the IPs, independent of injection order. A core the device did not
-  // measure at this width ranks last rather than free.
+  // What a row needs for a cycle of its own, in the same float arithmetic the
+  // derate walk prices it at (`minSchedulablePeriod`).
+  auto needOf = [floor = static_cast<float>(regFloor)](const OperatorEntry *e) {
+    return std::max(floor + static_cast<float>(e->inDelay),
+                    static_cast<float>(e->outDelay));
+  };
+  // Fitting the selection period ranks first, so a deep pipeline beats a
+  // shallow core the clock cannot hold; among misses the least need wins,
+  // which is what the period derates to. Then shortest, then cheapest at this
+  // width, then the first symbol: a total order over the IPs, independent of
+  // injection order. A core the device did not measure at this width ranks
+  // last rather than free.
   auto rank = [&](const OperatorEntry *e) {
+    float need = needOf(e);
+    bool unfit = need > selectionPeriodNs;
     return std::make_tuple(
-        e->latency,
+        unfit, unfit ? need : 0.0f, e->latency,
         priceOf(e->uses, {width}).value_or(std::numeric_limits<int64_t>::max()),
         StringRef(e->symbol));
   };
@@ -700,4 +711,12 @@ bool OperatorLibrary::requiresUnmatchedIP(Operation *op) const {
 
 bool OperatorLibrary::hasDirectRealization(Operation *op) const {
   return !matchEntries(advancedEntries, entries, op).empty();
+}
+
+SmallVector<StringRef, 2> OperatorLibrary::candidateIPs(Operation *op) const {
+  SmallVector<StringRef, 2> symbols;
+  for (const OperatorEntry *e : matchEntries(advancedEntries, entries, op))
+    if (!e->comb)
+      symbols.push_back(e->symbol);
+  return symbols;
 }
