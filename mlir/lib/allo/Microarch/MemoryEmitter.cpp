@@ -26,12 +26,6 @@ using namespace circt;
 
 namespace mlir::allo::uarch {
 
-// The bits one bank of \p m needs to address itself, which is the width its
-// whole address cone is carried at.
-static unsigned addrWidth(const uarch::MemUnit &m) {
-  return llvm::Log2_64_Ceil(declaredDepth(m.depthWords));
-}
-
 // An address on its way out of the module. A boundary address port is
 // `kDatapathAddressWidth` wide for every argument, the contract the manifest
 // and the cosim harness are written against, so a narrow in-bank address widens
@@ -40,22 +34,22 @@ static Value boundaryAddr(EmitContext &c, Value addr) {
   return addrAt(c.b, c.loc, addr, kDatapathAddressWidth);
 }
 
-// Which of several sources bank \p k takes, each tagged with the bank it
-// reaches: the inverse of `readCrossbar`. At most one tag equals `k` at a time,
-// since a lane holds distinct slots and distinct slots are distinct banks at
-// every rotation, so the selects are one-hot; with no tag on `k` the result
-// is 0, a don't-care behind the port's own enable.
-static Value laneSelect(EmitContext &c,
-                        ArrayRef<std::pair<Value, Value>> tagged, unsigned k) {
-  if (tagged.size() == 1)
-    return tagged.front().second;
-  c.muxLedger.add(MuxRole::Crossbar, tagged.size(),
-                  datapathWidth(tagged.front().second.getType()));
-  SmallVector<Value> vals, sels;
-  for (const auto &[bank, val] : tagged) {
-    vals.push_back(val);
+// Which of \p vals bank \p k takes, each tagged by the bank it reaches
+// (\p banks, parallel to it): the inverse of `readCrossbar`. At most one tag
+// equals `k` at a time, since a lane holds distinct slots and distinct slots
+// are distinct banks at every rotation, so the selects are one-hot; with no tag
+// on `k` the result is 0, a don't-care behind the port's own enable.
+static Value laneSelect(EmitContext &c, ArrayRef<Value> banks,
+                        ArrayRef<Value> vals, unsigned k) {
+  assert(banks.size() == vals.size() &&
+         "a lane's bank tags are parallel to its values");
+  if (vals.size() == 1)
+    return vals.front();
+  c.muxLedger.add(MuxRole::Crossbar, vals.size(),
+                  datapathWidth(vals.front().getType()));
+  SmallVector<Value> sels;
+  for (Value bank : banks)
     sels.push_back(c.icmpEq(bank, k));
-  }
   return c.oneHotSelect(vals, sels);
 }
 
@@ -117,7 +111,7 @@ Value DatapathEmitter::buildAddr(const uarch::MemUnit::Access &acc,
 BankSplit DatapathEmitter::bankAddress(const uarch::MemUnit &m,
                                        const uarch::MemUnit::Access &acc) {
   assert(acc.addrMap && "dcp memory access without an affine map");
-  Value offset = buildAddr(acc, acc.offset, addrWidth(m));
+  Value offset = buildAddr(acc, acc.offset, memAddrWidth(m));
   // The digit's cone is built at the datapath width so its intermediates keep
   // their range, then narrowed to clog2(numBanks): consumers delay it and
   // compare it against literal bank numbers, and `icmpEq` follows its width.
@@ -134,10 +128,11 @@ BankSplit DatapathEmitter::bankAddress(const uarch::MemUnit &m,
   return {bank, offset};
 }
 
-// Narrow to the clog2(depth)-bit index `seq.hlmem` / `hw.array_get` expects,
-// which is also the width `bankAddress` carries its arithmetic at.
+// Narrow a child's port address to the clog2(depth)-bit index `seq.hlmem` /
+// `hw.array_get` expects. This module's own accesses need no narrowing:
+// `bankAddress` already carries its arithmetic at that width.
 Value DatapathEmitter::memAddr(const uarch::MemUnit &m, Value addr) {
-  return addrAt(c.b, c.loc, addr, addrWidth(m));
+  return addrAt(c.b, c.loc, addr, memAddrWidth(m));
 }
 
 // Which element of a scattered memory \p acc names, at the memory's own
@@ -170,9 +165,10 @@ void DatapathEmitter::bindReadPorts() {
     for (auto [i, acc] : llvm::enumerate(m.accesses))
       // A write, or a plan whose datum is a select over several ports rather
       // than one port's: both are bound by `emitReads`.
+      // A Coloured access is statically banked, so it holds the one interface
+      // `acc.portBase` names rather than a per-bank expansion of it.
       if (!acc.isWrite && acc.plan == PortPlan::Coloured)
-        readData[accKey(m.id, i)] =
-            pa.getInput(portData(extPorts(m, acc).front().second));
+        readData[accKey(m.id, i)] = pa.getInput(portData(acc.portBase));
   }
 }
 
@@ -300,7 +296,7 @@ void DatapathEmitter::emitReads(const uarch::RegionBlock &rb, Value issue) {
     case PortPlan::Table: {
       // A constant table read: index the aggregate_constant combinationally,
       // then register to the scheduled read latency so timing matches a RAM.
-      Value idx = memAddr(m, bankAddress(m, acc).offset);
+      Value idx = bankAddress(m, acc).offset;
       readData[accKey(m.id, r.idx)] = atReadData(
           m, c.R(hw::ArrayGetOp::create(c.b, c.loc, romArray[m.id], idx)), sh);
       break;
@@ -331,7 +327,7 @@ void DatapathEmitter::emitReads(const uarch::RegionBlock &rb, Value issue) {
           vals.push_back(pa.getInput(portData(base)));
         }
       } else {
-        Value addr = memAddr(m, bs.offset);
+        Value addr = bs.offset;
         for (unsigned k = 0; k < m.numBanks; ++k)
           vals.push_back(c.R(atPort(
               seq::ReadPortOp::create(
@@ -345,31 +341,8 @@ void DatapathEmitter::emitReads(const uarch::RegionBlock &rb, Value issue) {
     }
     }
   }
-  // One read port per bank per lane rather than per bank per access. A lane's
-  // accesses hold distinct slots, so bank k takes the offset of whichever of
-  // them reaches it and hands its datum back to that one: F accesses over F
-  // banks at one port each, where a crossbar would take a port on every bank
-  // for every access.
-  for (auto &[key, idxs] : lanes) {
-    const uarch::MemUnit &m = dp.mems[key.first];
-    SmallVector<std::pair<Value, Value>> tagged; // (runtime bank, in-bank addr)
-    for (unsigned i : idxs) {
-      BankSplit bs = bankAddress(m, m.accesses[i]);
-      tagged.emplace_back(bs.bank, memAddr(m, bs.offset));
-    }
-    // Untagged: a lane is assigned by the skew rather than by the port graph,
-    // so it proves nothing about what else touches this bank.
-    SmallVector<Value> vals;
-    for (unsigned k = 0; k < m.numBanks; ++k)
-      vals.push_back(c.R(seq::ReadPortOp::create(
-          c.b, c.loc, memReadCell(m, k, key.second),
-          ValueRange{laneSelect(c, tagged, k)},
-          /*rdEn=*/sh ? sh.chainEnable : Value(), m.readLatency)));
-    // Each access picks its own bank's datum back out, delayed with it.
-    for (auto [i, t] : llvm::zip(idxs, tagged))
-      readData[accKey(m.id, i)] =
-          readCrossbar(c, vals, atReadData(m, t.first, sh));
-  }
+  for (auto &[key, idxs] : lanes)
+    emitLaneReads(dp.mems[key.first], key.second, idxs, sh);
   // Reads coloured onto one port of one bank: `bindMemoryPorts` proved they
   // never issue in the same cycle, so one bus carries them all under a select
   // on their own activation.
@@ -386,16 +359,38 @@ void DatapathEmitter::emitReads(const uarch::RegionBlock &rb, Value issue) {
     Value fired;
     Value addr =
         sharedAddress(m, idxs, issue, sh,
-                      sharedInternalPort(m, bank, port) ? &fired : nullptr);
+                      portHasSeveralHolders(m, bank, port) ? &fired : nullptr);
     SharedReadPort &p = sharedReads[key];
     p.arms.push_back({fired, addr, Value()});
-    ++p.owners;
     p.ownerRegion = rb.id;
   }
 }
 
-bool DatapathEmitter::sharedInternalPort(const uarch::MemUnit &m, unsigned bank,
-                                         unsigned port) const {
+void DatapathEmitter::emitLaneReads(const uarch::MemUnit &m, unsigned port,
+                                    ArrayRef<unsigned> idxs,
+                                    const StallShell &sh) {
+  SmallVector<Value> banks, offs;
+  for (unsigned i : idxs) {
+    BankSplit bs = bankAddress(m, m.accesses[i]);
+    banks.push_back(bs.bank);
+    offs.push_back(bs.offset);
+  }
+  // Untagged: a lane is assigned by the skew rather than by the port graph,
+  // so it proves nothing about what else touches this bank.
+  SmallVector<Value> vals;
+  for (unsigned k = 0; k < m.numBanks; ++k)
+    vals.push_back(c.R(seq::ReadPortOp::create(
+        c.b, c.loc, memReadCell(m, k, port),
+        ValueRange{laneSelect(c, banks, offs, k)},
+        /*rdEn=*/sh ? sh.chainEnable : Value(), m.readLatency)));
+  // Each access picks its own bank's datum back out, delayed with it.
+  for (auto [i, bank] : llvm::zip(idxs, banks))
+    readData[accKey(m.id, i)] = readCrossbar(c, vals, atReadData(m, bank, sh));
+}
+
+bool DatapathEmitter::portHasSeveralHolders(const uarch::MemUnit &m,
+                                            unsigned bank,
+                                            unsigned port) const {
   // A region is one holder however many of its accesses reach the port, since
   // they have already selected between themselves; a call is another.
   llvm::SmallDenseSet<uint64_t> holders;
@@ -413,7 +408,7 @@ Value DatapathEmitter::sharedReadPort(const uarch::MemUnit &m, unsigned bank,
                                       unsigned port) {
   SharedReadPort &p = sharedReads[{m.id, bank, port}];
   if (!p.data) {
-    p.addr = c.bb.get(c.b.getIntegerType(addrWidth(m)));
+    p.addr = c.bb.get(c.b.getIntegerType(memAddrWidth(m)));
     // The read enable is a promise too: whether one owner's shell may freeze
     // the port is only known once every holder has contributed.
     p.rdEnBE = c.bb.get(c.i1);
@@ -485,8 +480,9 @@ void DatapathEmitter::finalizeSharedReadPorts() {
     // register. Several holders read every cycle off the held bus instead
     // (a constant-true enable, which the hlmem lowering folds away). The
     // shell is read here, resolved, not captured at contribution time.
-    StallShell sh = p.owners == 1 && p.ownerRegion ? shellFor(*p.ownerRegion)
-                                                   : StallShell{};
+    StallShell sh = p.arms.size() == 1 && p.ownerRegion
+                        ? shellFor(*p.ownerRegion)
+                        : StallShell{};
     p.rdEnBE.setValue(sh ? sh.chainEnable : c.t1);
     p.addr.setValue(address(p.arms));
   }
@@ -504,7 +500,7 @@ Value DatapathEmitter::sharedAddress(const uarch::MemUnit &m,
   // Select and hold at the bank's own address width; a boundary port widens
   // after, so neither runs at the 32-bit boundary contract.
   auto addrOf = [&](unsigned i) {
-    return memAddr(m, bankAddress(m, m.accesses[i]).offset);
+    return bankAddress(m, m.accesses[i]).offset;
   };
   // One hold after the select: a read frozen by back-pressure keeps
   // re-presenting its address until its datum is taken.
@@ -564,22 +560,10 @@ void DatapathEmitter::emitExternalReadAddrs(const uarch::RegionBlock &rb,
     // accesses, or a child mastered on the colour) cannot drive it here;
     // `finalizeSharedReadPorts` does, once every holder has presented.
     Value fired;
-    bool held = sharedInternalPort(m, acc.staticBank.value_or(0), acc.port);
+    bool held = portHasSeveralHolders(m, acc.staticBank.value_or(0), acc.port);
     Value addr = sharedAddress(m, idxs, issue, sh, held ? &fired : nullptr);
     boundaryReads[acc.portBase].push_back({fired, addr, Value()});
   }
-}
-
-// The drain stage a store contributes to its region's `done`. The write is
-// presented at its stage and commits `writeLatency` cycles later; `emitDone`
-// rides its own latch register for the last of those cycles (done reads 1 at
-// `lastIssue + drainStage + 1`), so the stage is the commit cycle minus one.
-static unsigned storeDrainOf(const uarch::MemUnit &m,
-                             const uarch::MemUnit::Access &acc) {
-  assert(m.writeLatency >= 1 &&
-         "a zero-cycle write has no commit edge for the done latch to ride; "
-         "`assertModelInvariants` holds the device row to that");
-  return acc.stage + m.writeLatency - 1;
 }
 
 void DatapathEmitter::emitWrites(const uarch::RegionBlock &rb, Value issue,
@@ -606,7 +590,7 @@ void DatapathEmitter::emitWrites(const uarch::RegionBlock &rb, Value issue,
     const uarch::MemUnit::Access &acc = m.accesses[r.idx];
     if (!acc.isWrite)
       continue;
-    fb.storeDrain = std::max<unsigned>(fb.storeDrain, storeDrainOf(m, acc));
+    fb.storeDrain = std::max<unsigned>(fb.storeDrain, storeDrainCycle(m, acc));
     if (acc.plan == PortPlan::Lane) {
       lanes[{r.id, acc.lane}].push_back(r.idx);
       continue;
@@ -614,7 +598,7 @@ void DatapathEmitter::emitWrites(const uarch::RegionBlock &rb, Value issue,
     // A `seq.hlmem` write port realizes exactly one cycle, so an internal
     // memory whose device latency is deeper presents address, data and enable
     // `writeLatency - 1` cycles late; the datum still lands at `stage +
-    // writeLatency` (see `storeDrainOf`). A boundary port takes its terms at
+    // writeLatency` (see `storeDrainCycle`). A boundary port takes its terms at
     // its stage.
     unsigned pre = m.external ? 0 : m.writeLatency - 1;
     auto late = [&](Value v) { return c.shiftChain(v, pre, sh).last(); };
@@ -643,9 +627,8 @@ void DatapathEmitter::emitWrites(const uarch::RegionBlock &rb, Value issue,
         boundaryWrites[acc.portBase].push_back(
             {we, boundaryAddr(c, bs.offset), data});
       else
-        sharedWrites[m.id].push_back({*acc.staticBank,
-                                      acc.port,
-                                      {we, late(memAddr(m, bs.offset)), data}});
+        sharedWrites[m.id].push_back(
+            {*acc.staticBank, acc.port, {we, late(bs.offset), data}});
       break;
     }
     case PortPlan::Lane:
@@ -664,7 +647,7 @@ void DatapathEmitter::emitWrites(const uarch::RegionBlock &rb, Value issue,
         }
         break;
       }
-      Value addr = late(memAddr(m, bs.offset));
+      Value addr = late(bs.offset);
       Value bank = late(bs.bank);
       for (unsigned k = 0; k < m.numBanks; ++k)
         for (Value cell : memWriteCells(m, k))
@@ -676,40 +659,40 @@ void DatapathEmitter::emitWrites(const uarch::RegionBlock &rb, Value issue,
     }
     }
   }
-  // One write port per bank per lane. Bank k takes the address and data of
-  // whichever of the lane's accesses reaches it, and its write-enable is the OR
-  // of their demuxed enables, so an access commits on its own bank and nowhere
-  // else. The OR has at most one live arm, as `laneSelect` does.
-  for (auto &[key, idxs] : lanes) {
-    const uarch::MemUnit &m = dp.mems[key.first];
-    unsigned pre = m.writeLatency - 1;
-    auto late = [&](Value v) { return c.shiftChain(v, pre, sh).last(); };
-    SmallVector<std::pair<Value, Value>> addrs, datas;
-    SmallVector<Value> wes, bankOf;
-    for (unsigned i : idxs) {
-      const uarch::MemUnit::Access &acc = m.accesses[i];
-      BankSplit bs = bankAddress(m, acc);
-      Value bank = late(bs.bank);
-      bankOf.push_back(bank);
-      addrs.emplace_back(bank, late(memAddr(m, bs.offset)));
-      datas.emplace_back(bank, late(resolveSource(acc.data)));
-      wes.push_back(c.delayValid(
-          c.activationPulse(commitPulse(), acc.stage, sh), pre, sh));
-    }
-    auto wlat = c.b.getI64IntegerAttr(1);
-    for (unsigned k = 0; k < m.numBanks; ++k) {
-      Value we = writeDemux(c, wes[0], bankOf[0], k);
-      for (unsigned i = 1; i < idxs.size(); ++i)
-        we = c.orBits(we, writeDemux(c, wes[i], bankOf[i], k));
-      // Untagged: a skew assigns its ports by lane rather than by the port
-      // graph, so nothing proves this store and a read of the same bank stay
-      // out of each other's cycle, and only that proof lets the two share one
-      // address.
-      for (Value cell : memWriteCells(m, k))
-        seq::WritePortOp::create(c.b, c.loc, cell,
-                                 ValueRange{laneSelect(c, addrs, k)},
-                                 laneSelect(c, datas, k), we, wlat);
-    }
+  for (auto &[key, idxs] : lanes)
+    emitLaneWrites(dp.mems[key.first], idxs, commitPulse, sh);
+}
+
+void DatapathEmitter::emitLaneWrites(const uarch::MemUnit &m,
+                                     ArrayRef<unsigned> idxs,
+                                     llvm::function_ref<Value()> commit,
+                                     const StallShell &sh) {
+  unsigned pre = m.writeLatency - 1;
+  auto late = [&](Value v) { return c.shiftChain(v, pre, sh).last(); };
+  SmallVector<Value> addrs, datas, wes, bankOf;
+  for (unsigned i : idxs) {
+    const uarch::MemUnit::Access &acc = m.accesses[i];
+    BankSplit bs = bankAddress(m, acc);
+    Value bank = late(bs.bank);
+    bankOf.push_back(bank);
+    addrs.push_back(late(bs.offset));
+    datas.push_back(late(resolveSource(acc.data)));
+    wes.push_back(
+        c.delayValid(c.activationPulse(commit(), acc.stage, sh), pre, sh));
+  }
+  auto wlat = c.b.getI64IntegerAttr(1);
+  for (unsigned k = 0; k < m.numBanks; ++k) {
+    Value we = writeDemux(c, wes[0], bankOf[0], k);
+    for (unsigned i = 1; i < idxs.size(); ++i)
+      we = c.orBits(we, writeDemux(c, wes[i], bankOf[i], k));
+    // Untagged: a skew assigns its ports by lane rather than by the port
+    // graph, so nothing proves this store and a read of the same bank stay
+    // out of each other's cycle, and only that proof lets the two share one
+    // address.
+    for (Value cell : memWriteCells(m, k))
+      seq::WritePortOp::create(c.b, c.loc, cell,
+                               ValueRange{laneSelect(c, bankOf, addrs, k)},
+                               laneSelect(c, bankOf, datas, k), we, wlat);
   }
 }
 
@@ -771,14 +754,22 @@ void DatapathEmitter::finalizeScatteredPorts() {
     ArrayRef<SinkArm> writes;
     if (auto it = scatterWrites.find(m.id); it != scatterWrites.end())
       writes = it->second;
+    // Nothing stores to it: an argument's cells arrive from the caller and
+    // never leave, and an internal array's elements hold their reset value for
+    // the whole run, so each is that constant rather than a register.
+    if (writes.empty()) {
+      if (!m.external)
+        for (Backedge &be : scatterElems[m.id])
+          be.setValue(c.konst(memElemType(m, c.b), 0));
+      continue;
+    }
     // One narrow decode per store, shared by every element: the alternative,
     // a compare per (store, element) pair at the index's carried width, was
     // the scatter's whole LUT bill.
     SmallVector<SmallVector<Value>> hot;
     for (const SinkArm &w : writes) {
       hot.push_back(oneHotDecode(c, w.addr, m.depthWords));
-      c.muxLedger.add(MuxRole::Crossbar, m.depthWords,
-                      llvm::Log2_32_Ceil(std::max(2u, m.depthWords)));
+      c.muxLedger.add(MuxRole::Crossbar, m.depthWords, memAddrWidth(m));
     }
     // Demuxed onto element k first, so the select is the pulse and not the
     // index: two stores in different regions can name element k at once (an
@@ -791,8 +782,6 @@ void DatapathEmitter::finalizeScatteredPorts() {
       return commitSink(at, Idle::DontCare);
     };
     if (m.external) {
-      if (writes.empty())
-        continue; // read-only: the caller's cells arrive and never leave
       for (auto [k, p] : llvm::enumerate(m.elemPorts)) {
         SinkArm out = driveOf(k);
         pa.setOutput(p.out, out.data);
@@ -800,16 +789,10 @@ void DatapathEmitter::finalizeScatteredPorts() {
       }
       continue;
     }
-    // An element no store reaches holds its reset value for the whole run, so
-    // it is that constant rather than a register.
     IntegerType elemTy = memElemType(m, c.b);
     for (auto [k, be] : llvm::enumerate(scatterElems[m.id])) {
       SinkArm out = driveOf(k);
       Value zero = c.konst(elemTy, 0);
-      if (!out.fired) {
-        be.setValue(zero);
-        continue;
-      }
       Value cell = c.enabledReg(out.data, out.fired, zero, RegRole::Storage);
       nameValue(cell, memElemName(dp, m, k));
       be.setValue(cell);
@@ -836,7 +819,7 @@ void DatapathEmitter::masterCallPorts(
             {outs[ma.we], outs[ma.addr], outs[ma.data]});
       } else {
         Value fired;
-        if (sharedInternalPort(dp.mems[ma.mem], ma.bank, ma.port))
+        if (portHasSeveralHolders(dp.mems[ma.mem], ma.bank, ma.port))
           fired = runWindow();
         boundaryReads[ma.topBase].push_back({fired, outs[ma.addr], Value()});
       }
@@ -894,11 +877,10 @@ void DatapathEmitter::masterCallPorts(
       // enable; as an owner it keeps the port unfrozen.
       rdBackedge[ma.data].setValue(sharedReadPort(m, ma.bank, ma.port));
       Value fired;
-      if (sharedInternalPort(m, ma.bank, ma.port))
+      if (portHasSeveralHolders(m, ma.bank, ma.port))
         fired = runWindow();
       SharedReadPort &p = sharedReads[{m.id, ma.bank, ma.port}];
       p.arms.push_back({fired, addr, Value()});
-      ++p.owners;
       break;
     }
 

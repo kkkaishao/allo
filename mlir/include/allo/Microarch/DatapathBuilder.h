@@ -28,11 +28,12 @@ void forEachBodyOp(Operation *regionOp,
 
 /// The producer of a value plus the register depth a consumer needs to read it.
 struct Resolved {
-  Source base;    // the producing cell output
+  // The producing cell output; None => producer outside this region / not
+  // modelled, which every caller reads as an unresolved edge.
+  Source base;
   Value key;      // register key (the produced SSA value; null => never reg)
   unsigned depth; // pipeline-register depth for this edge
   unsigned ready = 0; // cycle `base` lands at within its iteration
-  bool ok = false;    // false => producer outside this region / not modelled
   // Reduction identities of the loop-carried iter_arg this edge reads, one per
   // iteration: `inits[n]` is re-injected at iteration n, and `base` carries the
   // edge from `inits.size()` on, that size being the recurrence distance. Empty
@@ -81,7 +82,8 @@ struct DatapathBuilder {
   // Keyed by the slot each edge patches; a slot takes at most one. Chains are
   // built in record order.
   llvm::MapVector<Source *, Edge> edges;
-  std::deque<MuxBuild> muxBuilds; // a deque so `record`'s slot pointers into
+  std::deque<MuxBuild> muxBuilds; // a deque so `recordEdge` /
+                                  // `recordCarriedEdge` slot pointers into
                                   // `sources` survive later pushes
   // Where the cell containers sat when `resolveEdges` finished; the delay
   // passes assert they have not moved, `edges` keying slots by pointer.
@@ -148,7 +150,7 @@ struct DatapathBuilder {
   /// Record how each region produces its results (`rb.results`) and, where it
   /// has one, its control predicate (`rb.condition`). A region result is a
   /// survivor register; a loop's k-th result is its k-th iter-arg's last value.
-  void recordRegionResults(llvm::ArrayRef<Operation *> regionOps);
+  void recordRegionResults();
   /// Resolve each `dcp.instance`'s scalar operands into its CallUnit's
   /// `scalarIns`. Separate from `bindResource`: a Source resolution needs the
   /// complete region model (see `resolveValue`).
@@ -171,7 +173,7 @@ struct DatapathBuilder {
   /// RegionBlock: a runtime bound from the `lbBound`/`dynamicBound`/`stepBound`
   /// operand, a compile-time one as a literal cell. Needs `counterType`, the
   /// width those literals are tied in at.
-  void recordRegionBounds(llvm::ArrayRef<Operation *> regionOps);
+  void recordRegionBounds();
   /// A literal \p v of type \p t as a Source, appending the ConstCell that
   /// holds it. For a value the model needs but no `arith.constant` in the body
   /// produces, such as an induction bound written as an attribute.
@@ -189,6 +191,12 @@ struct DatapathBuilder {
   /// ports each bank is built with. Runs after `planAccessPorts`, which settles
   /// how each access reaches its memory.
   void bindMemoryPorts();
+  /// Record the instances of its row each bank is held in
+  /// (`MemUnit::instances`) and which of them serves each read port
+  /// (`MemUnit::readInstance`), by the same arithmetic `bindMemoryPorts`'
+  /// pooled decision compared. A skew binds its ports by lane and leaves that
+  /// loop early, so this runs over every memory rather than inside it.
+  void assignReadInstances();
   /// Group a skewed memory's accesses into lanes that can share one port per
   /// bank (`MemUnit::skewed`, `Access::lane`), or leave it crossbarring when
   /// they cannot. Runs before `planAccessPorts`, which reads whether the skew
@@ -231,7 +239,7 @@ struct DatapathBuilder {
   void commitPorts(MemUnit &m, const PortAssignment &pa);
   /// Record what each memory's ports cost against what its schedule asks:
   /// `MemUnit::{readConcurrency, writeConcurrency, boundaryPorts}`. Measures
-  /// only; `checkInputLegality` decides what is worth reporting. Runs after
+  /// only; `checkStorageLegality` decides what is worth reporting. Runs after
   /// `enumerateBoundaryPorts`, whose groups it counts.
   void measurePorts();
   /// Record each top-level region's composition predecessors
@@ -239,7 +247,7 @@ struct DatapathBuilder {
   /// Runs after the region walk, which supplies the bound accesses and the
   /// region tree, and before the port passes, which read the ordering it
   /// establishes (`Datapath::portGraph`).
-  void recordSiblingDeps(llvm::ArrayRef<Operation *> regionOps);
+  void recordSiblingDeps();
   /// Scalar (non-memref) function arguments become input IOPorts.
   void bindIOArgs();
   /// Scalar (non-memref) function results become `dp.results` output ports,
@@ -279,12 +287,6 @@ struct DatapathBuilder {
   /// into an `Edge`, recording what each slot reads and how late. Materializes
   /// nothing.
   void resolveEdges();
-  /// Realize the delays the edges owe: the address reduction first, since a
-  /// term it folds into a scaled counter withdraws its edge, then the chains
-  /// over what is left, then the muxes that pick between them. The last
-  /// derivation `build()` runs; withdrawing an edge is not additive, so no pass
-  /// may resolve a Source after it.
-  void realizeDelays();
   /// Record a resolved edge into \p slot: a depth-0 edge ties directly, a
   /// deeper one is deferred to `edges` and patched by `insertRegisters`.
   void recordEdge(const Resolved &r, Source &slot, unsigned regionIdx);
@@ -297,8 +299,10 @@ struct DatapathBuilder {
                          Source &slot, unsigned regionIdx);
   /// Resolve every unit input (single, or shared-then-muxed).
   void resolveUnitInputs();
-  /// Resolve every memory address / store data and stream data + predicate.
-  void resolveAccessOperands();
+  /// Resolve every memory access's address operands and store datum.
+  void resolveMemoryOperands();
+  /// Resolve every stream access's put datum and get/put predicate.
+  void resolveStreamOperands();
   /// Decide which accesses carry their address in a register that advances
   /// with the loop counters, record the scaled counters that needs, and
   /// withdraw the edge of every operand no residual is left reading.
@@ -306,6 +310,10 @@ struct DatapathBuilder {
   /// Build one chain per (value, region) the surviving edges tap, patch their
   /// slots, and materialize the shared-unit muxes.
   void insertRegisters();
+  /// Materialize the sharing muxes: one shared driver needs no mux. Runs last
+  /// in `insertRegisters`, the sources being final only once the registers are
+  /// built and the pending slots patched.
+  void materializeMuxes();
   /// Record each region's terminal cycle (`RegionBlock::drainStage`). Runs
   /// after `resolveEdges`, the last pass that moves a stream put's stage.
   void recordDrainStages();

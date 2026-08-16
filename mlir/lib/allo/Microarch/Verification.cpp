@@ -5,15 +5,17 @@
 
 //===----------------------------------------------------------------------===//
 // Everything checked between the model being sealed and hardware being built,
-// cut by who is at fault: the design (`checkInputLegality`), this backend
-// (`checkEmitterSubset`), or an upstream pass (`assertModelInvariants`). The
-// diagnostic each may raise follows from that.
+// cut by who is at fault: the design (`checkStorageLegality`,
+// `checkStallContracts`), this backend (`checkEmitterSubset`), or an upstream
+// pass (`assertModelInvariants`). The diagnostic each may raise follows from
+// that.
 //===----------------------------------------------------------------------===//
 
 #include "allo/Microarch/Verification.h"
 
 #include "allo-c/Schedule.h"             // kPartitionAttr
 #include "allo/Microarch/Naming.h"       // operatorModuleName, memOwnerName
+#include "allo/Microarch/Primitives.h"   // memAddrWidth
 #include "allo/Microarch/Report.h"       // TimingPath
 #include "allo/Scheduling/MemoryModel.h" // datapathWidth
 #include "allo/Support/Logging.h"
@@ -35,7 +37,13 @@ namespace mlir::allo::uarch {
 // 1. What the design asks for and this device cannot give.
 //===----------------------------------------------------------------------===//
 
-LogicalResult checkInputLegality(dcp::DCPathModuleOp func, const Datapath &dp) {
+namespace {
+
+/// What the design asks of its arrays and this device cannot give: reported
+/// against the user, who can change the kernel, the schedule directives, the
+/// period or the part. `logging::error` and `logging::warn` only.
+LogicalResult checkStorageLegality(dcp::DCPathModuleOp func,
+                                   const Datapath &dp) {
   // A kernel with no schedulable region computes nothing.
   if (dp.regions.empty())
     warn(Stage::Emit, func)
@@ -46,17 +54,17 @@ LogicalResult checkInputLegality(dcp::DCPathModuleOp func, const Datapath &dp) {
   for (const MemUnit &m : dp.mems) {
     // A constant table is combinational logic with no port limit, so a
     // partition of one buys no bandwidth.
-    if (m.isRom)
-      if (auto gg = m.memref.getDefiningOp<memref::GetGlobalOp>()) {
-        auto global = SymbolTable::lookupNearestSymbolFrom<memref::GlobalOp>(
-            gg, gg.getNameAttr());
-        if (global && global->hasAttr(kPartitionAttr))
-          warn(Stage::Emit, func)
-              << "Partition on the constant table '" << gg.getName()
-              << "' buys nothing: a read-only table is realized as "
-                 "combinational logic, which reads through as many ports as "
-                 "the schedule asks for";
-      }
+    auto gg = m.memref.getDefiningOp<memref::GetGlobalOp>();
+    if (m.isRom && gg) {
+      auto global = SymbolTable::lookupNearestSymbolFrom<memref::GlobalOp>(
+          gg, gg.getNameAttr());
+      if (global && global->hasAttr(kPartitionAttr))
+        warn(Stage::Emit, func)
+            << "Partition on the constant table '" << gg.getName()
+            << "' buys nothing: a read-only table is realized as "
+               "combinational logic, which reads through as many ports as "
+               "the schedule asks for";
+    }
 
     // The copies the scheduler priced the array at are the read bandwidth it
     // reserved, so a binding taking more has bought bandwidth no cycle was cut
@@ -114,10 +122,18 @@ LogicalResult checkInputLegality(dcp::DCPathModuleOp func, const Datapath &dp) {
       return failure();
     }
   }
+  return success();
+}
 
-  // `ce` is the only IP port ABI the emitter realizes. `free` has no enable, so
-  // it keeps clocking and desynchronizes in a back-pressured region, but is
-  // fine elsewhere; `elastic` is rejected before scheduling.
+/// `ce` is the only IP port ABI the emitter realizes. `free` has no enable, so
+/// it keeps clocking and desynchronizes in a back-pressured region, but is
+/// fine elsewhere; `elastic` is rejected before scheduling.
+LogicalResult checkStallContracts(const Datapath &dp) {
+  if (llvm::all_of(dp.units, [](const FuncUnit &u) {
+        return u.identity.comb || u.stall == allo::StallContractEnum::Ce;
+      }))
+    return success();
+
   llvm::SmallDenseSet<unsigned> backPressured;
   for (const StreamChannel &s : dp.streams)
     for (const StreamChannel::Access &acc : s.accesses)
@@ -140,6 +156,8 @@ LogicalResult checkInputLegality(dcp::DCPathModuleOp func, const Datapath &dp) {
   }
   return success();
 }
+
+} // namespace
 
 //===----------------------------------------------------------------------===//
 // 2. What this emitter does not lower yet.
@@ -334,21 +352,74 @@ private:
   }
 };
 
-/// Every combinational path built after the cut still settles within the
-/// period: the multiplexers a shared binding grew in front of the units, and
-/// the select the port colouring grew in front of an access's bus. A unit
-/// overrun is refused, binding being a choice the user can withdraw; every
-/// other slot sits on the default path with no such choice and is reported
-/// instead, as the paths in \p paths the QoR turns into a clock.
-LogicalResult checkCombPathsMeetPeriod(dcp::DCPathModuleOp func,
-                                       const Datapath &dp, float cycleTime,
-                                       const OperatorLibrary &lib,
-                                       bool plannedBinding,
-                                       std::vector<TimingPath> &paths) {
+/// What each access ends its path with, on top of whatever reaches it: the
+/// address arithmetic still on the setup path (`addrSetup`), the select its
+/// (bank, port) colour carries (one arm per holder, this module's accesses and
+/// its children's ports alike), and the port's own delay. A crossbar access is
+/// alone on its colour; its bank crossbar is not priced here yet.
+struct Tail {
+  llvm::SmallVector<TimingStep, 3> addr, data;
+  bool addrRegistered = false; // the address launches from its delay register
+};
+
+/// The tail of every memory and stream access, keyed by the op that issues it.
+/// A read grows no data tail: only a write captures at a data port.
+llvm::DenseMap<Operation *, Tail> accessTails(const Datapath &dp,
+                                              const OperatorLibrary &lib) {
+  llvm::DenseMap<std::tuple<MemId, unsigned, unsigned>, unsigned> holders;
+  for (const MemUnit &m : dp.mems)
+    for (const MemUnit::Access &acc : m.accesses)
+      if (acc.plan == PortPlan::Coloured)
+        ++holders[{m.id, acc.staticBank.value_or(0), acc.port}];
+  for (const CallUnit &cu : dp.calls)
+    for (const CallUnit::MemArg &ma : cu.memArgs)
+      if (ma.plan == PortPlan::Coloured)
+        ++holders[{ma.mem, ma.bank, ma.port}];
+  llvm::DenseMap<Operation *, Tail> tails;
+  for (const MemUnit &m : dp.mems) {
+    std::string owner = memOwnerName(dp, m);
+    for (const MemUnit::Access &acc : m.accesses) {
+      Tail &t = tails[acc.op];
+      // With the term sum landing in a delay register, the address path starts
+      // at that register rather than at the operands feeding it.
+      t.addrRegistered = acc.addrDelay > 0;
+      if (acc.addrSetup > 0.0)
+        t.addr.push_back({"the address arithmetic of " + owner, acc.addrSetup});
+      if (acc.plan == PortPlan::Coloured) {
+        unsigned k =
+            holders.lookup({m.id, acc.staticBank.value_or(0), acc.port});
+        double sel = muxCone(lib, k, memAddrWidth(m));
+        if (sel > 0.0)
+          t.addr.push_back(
+              {("a shared-port address select, " + llvm::Twine(k) + ":1").str(),
+               sel});
+        double dsel = acc.isWrite ? muxCone(lib, k, m.width) : 0.0;
+        if (dsel > 0.0)
+          t.data.push_back(
+              {("a shared-port data select, " + llvm::Twine(k) + ":1").str(),
+               dsel});
+      }
+      TimingStep port{"the " + m.storage + " port of " + owner, acc.portDelay};
+      t.addr.push_back(port);
+      if (acc.isWrite)
+        t.data.push_back(std::move(port));
+    }
+  }
+  for (const StreamChannel &ch : dp.streams)
+    for (const StreamChannel::Access &acc : ch.accesses)
+      tails[acc.op].data.push_back({"a stream port", acc.inDelay});
+  return tails;
+}
+
+/// The two arrival models held together, and the refusal when a shared binding
+/// grew a multiplexer past the period the schedule was cut against. Binding is
+/// a choice the user can withdraw, so this is the only part that can fail.
+LogicalResult checkBindingMuxHeadroom(const Datapath &dp, float cycleTime,
+                                      const OperatorLibrary &lib,
+                                      bool plannedBinding, PathTrace &trace) {
   // One picosecond of slop, the resolution the scheduler's own model carries.
   constexpr double kSlop = 1e-3;
   AddedDelay added(dp, lib);
-  PathTrace trace(dp, lib);
 
   bool ok = true;
   for (const FuncUnit &u : dp.units) {
@@ -359,9 +430,14 @@ LogicalResult checkCombPathsMeetPeriod(dcp::DCPathModuleOp func,
     // is structure, a recurrence loop the recomposition charges into one
     // cycle where the hardware splits it at the carry register. Hence a
     // diagnostic, not an assert.
-    double placed = 0.0;
+    //
+    // The tightest bound op is both the arrival to check against and what a
+    // refusal below is anchored on.
+    const FuncUnit::BoundOp *worst = &u.boundOps.front();
     for (const FuncUnit::BoundOp &bo : u.boundOps)
-      placed = std::max(placed, bo.z.value_or(0.0));
+      if (bo.z && (!worst->z || *bo.z > *worst->z))
+        worst = &bo;
+    double placed = worst->z.value_or(0.0);
     for (const Source &in : u.inputs) {
       if (!in)
         continue;
@@ -391,11 +467,6 @@ LogicalResult checkCombPathsMeetPeriod(dcp::DCPathModuleOp func,
            "a planned binding grew a select cone past the period the schedule "
            "solve reserved headroom for; the allocation headroom model "
            "(`addAllocationHeadroom`) and the emitted cone disagree");
-    // Anchor on the tightest bound op, the one the slack came from.
-    const FuncUnit::BoundOp *worst = &u.boundOps.front();
-    for (const FuncUnit::BoundOp &bo : u.boundOps)
-      if (bo.z && (!worst->z || *bo.z > *worst->z))
-        worst = &bo;
     // `mux` covers the whole input cone, so it may come from a shared
     // predecessor rather than from a multiplexer on this unit.
     unsupported(Stage::Emit, Code::BindingMuxOverPeriod, worst->op)
@@ -411,69 +482,19 @@ LogicalResult checkCombPathsMeetPeriod(dcp::DCPathModuleOp func,
            "kernel, or raise the target period";
     ok = false;
   }
+  return success(ok);
+}
 
-  // What each access ends its path with, on top of whatever reaches it: the
-  // address arithmetic still on the setup path (`addrSetup`), the select its
-  // (bank, port) colour carries (one arm per holder, this module's accesses and
-  // its children's ports alike), and the port's own delay. A crossbar access is
-  // alone on its colour; its bank crossbar is not priced here yet.
-  struct Tail {
-    llvm::SmallVector<TimingStep, 3> addr, data;
-    bool addrRegistered = false; // the address launches from its delay register
-  };
-  llvm::DenseMap<std::tuple<MemId, unsigned, unsigned>, unsigned> holders;
-  for (const MemUnit &m : dp.mems)
-    for (const MemUnit::Access &acc : m.accesses)
-      if (acc.plan == PortPlan::Coloured)
-        ++holders[{m.id, acc.staticBank.value_or(0), acc.port}];
-  for (const CallUnit &cu : dp.calls)
-    for (const CallUnit::MemArg &ma : cu.memArgs)
-      if (ma.plan == PortPlan::Coloured)
-        ++holders[{ma.mem, ma.bank, ma.port}];
-  llvm::DenseMap<Operation *, Tail> tails;
-  for (const MemUnit &m : dp.mems)
-    for (const MemUnit::Access &acc : m.accesses) {
-      Tail &t = tails[acc.op];
-      std::string owner = memOwnerName(dp, m);
-      // With the term sum landing in a delay register, the address path starts
-      // at that register rather than at the operands feeding it.
-      t.addrRegistered = acc.addrDelay > 0;
-      if (acc.addrSetup > 0.0)
-        t.addr.push_back({"the address arithmetic of " + owner, acc.addrSetup});
-      if (acc.plan == PortPlan::Coloured) {
-        unsigned k =
-            holders.lookup({m.id, acc.staticBank.value_or(0), acc.port});
-        double sel =
-            muxCone(lib, k, llvm::Log2_32_Ceil(std::max(2u, m.depthWords)));
-        if (sel > 0.0)
-          t.addr.push_back(
-              {("a shared-port address select, " + llvm::Twine(k) + ":1").str(),
-               sel});
-        double dsel = muxCone(lib, k, m.width);
-        if (dsel > 0.0)
-          t.data.push_back(
-              {("a shared-port data select, " + llvm::Twine(k) + ":1").str(),
-               dsel});
-      }
-      t.addr.push_back(
-          {"the " + m.storage + " port of " + owner, acc.portDelay});
-      t.data.push_back(
-          {"the " + m.storage + " port of " + owner, acc.portDelay});
-    }
-  for (const StreamChannel &ch : dp.streams)
-    for (const StreamChannel::Access &acc : ch.accesses) {
-      Tail &t = tails[acc.op];
-      t.addr.push_back({"a stream port", acc.inDelay});
-      t.data = t.addr;
-    }
-
-  // Every capture point: where a path ends. Prefix-free by construction, so no
-  // path is a piece of another: an interior combinational cell is not a
-  // capture, and a unit's own input port is one only where the unit registers
-  // it.
+/// Every capture point: where a path ends, appended to \p paths. Prefix-free by
+/// construction, so no path is a piece of another: an interior combinational
+/// cell is not a capture, and a unit's own input port is one only where the
+/// unit registers it.
+void appendCapturePaths(const Datapath &dp, float cycleTime,
+                        const llvm::DenseMap<Operation *, Tail> &tails,
+                        PathTrace &trace, std::vector<TimingPath> &paths) {
   forEachSource(dp, [&](const Source &s, const SourceSite &site) {
     // An absent driver hangs no path; the reduced-address case reads stride
-    // registers instead, priced with them below.
+    // registers instead, priced with them by `appendStridePaths`.
     if (!s)
       return;
     llvm::ArrayRef<TimingStep> tail;
@@ -486,7 +507,9 @@ LogicalResult checkCombPathsMeetPeriod(dcp::DCPathModuleOp func,
       // A combinational unit hands its result on; only a registered one
       // captures here.
       auto it = dp.opToUnit.find(site.op);
-      if (it == dp.opToUnit.end() || !dp.units[it->second].latency)
+      assert(it != dp.opToUnit.end() &&
+             "a unit's rep op is registered in opToUnit");
+      if (!dp.units[it->second].latency)
         return;
       break;
     }
@@ -524,11 +547,16 @@ LogicalResult checkCombPathsMeetPeriod(dcp::DCPathModuleOp func,
     p.slack = cycleTime - p.total;
     paths.push_back(std::move(p));
   });
+}
 
-  // The stride-register update, the one reg-to-reg cone with no scheduler
-  // counterpart. Priced off the emitted shape: the step add, the carry add, the
-  // wrap compare beside its fix, and the wrap plus issue/running selects, each
-  // a marginal row over the one register floor the hop already pays.
+/// The stride-register update, the one reg-to-reg cone with no scheduler
+/// counterpart, appended to \p paths. Priced off the emitted shape: the step
+/// add, the carry add, the wrap compare beside its fix, and the wrap plus
+/// issue/running selects, each a marginal row over the one register floor the
+/// hop already pays.
+void appendStridePaths(const Datapath &dp, float cycleTime,
+                       const OperatorLibrary &lib,
+                       std::vector<TimingPath> &paths) {
   for (const RegionBlock &rb : dp.regions)
     for (const RegionBlock::AddrStride &st : rb.addrStrides) {
       double sel = lib.combMarginalDelay(OpKind::Select, st.width);
@@ -555,12 +583,39 @@ LogicalResult checkCombPathsMeetPeriod(dcp::DCPathModuleOp func,
       p.slack = cycleTime - p.total;
       paths.push_back(std::move(p));
     }
-
-  return success(ok);
 }
 
-} // namespace
+/// Every combinational path built after the cut still settles within the
+/// period: the multiplexers a shared binding grew in front of the units, and
+/// the select the port colouring grew in front of an access's bus. A unit
+/// overrun is refused, binding being a choice the user can withdraw; every
+/// other slot sits on the default path with no such choice and is reported
+/// instead, as the paths in \p paths the QoR turns into a clock.
+LogicalResult checkCombPathsMeetPeriod(const Datapath &dp, float cycleTime,
+                                       const OperatorLibrary &lib,
+                                       bool plannedBinding,
+                                       std::vector<TimingPath> &paths) {
+  PathTrace trace(dp, lib);
+  // A refusal still publishes the paths, so the verdict is taken first and
+  // returned last.
+  LogicalResult ok =
+      checkBindingMuxHeadroom(dp, cycleTime, lib, plannedBinding, trace);
+  llvm::DenseMap<Operation *, Tail> tails = accessTails(dp, lib);
+  appendCapturePaths(dp, cycleTime, tails, trace, paths);
+  appendStridePaths(dp, cycleTime, lib, paths);
+  return ok;
+}
 
+/// Shapes this backend does not lower yet, including the one the clock rules
+/// out: the schedule was cut against \p cycleTime (ns) over a datapath with no
+/// sharing muxes and no port selects, so what grows them is measured here, at
+/// every capture point `forEachSource` enumerates, and appended to \p paths.
+/// \p lib prices the muxes and the units they feed. `logging::unsupported`
+/// where a binding can be withdrawn; elsewhere the path is reported and not
+/// refused, missing a target period being a quality-of-result finding rather
+/// than an illegal design. \p plannedBinding says the folds realize the
+/// schedule solve's own allocation, which reserved headroom for every select
+/// it bought, so a unit overrun is a broken invariant instead of a refusal.
 LogicalResult checkEmitterSubset(dcp::DCPathModuleOp func, const Datapath &dp,
                                  float cycleTime, const OperatorLibrary &lib,
                                  bool plannedBinding,
@@ -637,9 +692,10 @@ LogicalResult checkEmitterSubset(dcp::DCPathModuleOp func, const Datapath &dp,
   // store's write-enable by `issue & cond`, so a doomed exit iteration commits
   // nothing.
 
-  return checkCombPathsMeetPeriod(func, dp, cycleTime, lib, plannedBinding,
-                                  paths);
+  return checkCombPathsMeetPeriod(dp, cycleTime, lib, plannedBinding, paths);
 }
+
+} // namespace
 
 //===----------------------------------------------------------------------===//
 // 3. Invariants an upstream pass owns, asserted at this seam.
@@ -661,7 +717,9 @@ LogicalResult checkEmitterSubset(dcp::DCPathModuleOp func, const Datapath &dp,
   return true;
 }
 
-void assertModelInvariants(const Datapath &dp) {
+/// Invariants an upstream pass owns, asserted at this seam. `assert` only, so
+/// this compiles away in a release build.
+static void assertModelInvariants(const Datapath &dp) {
 #ifndef NDEBUG
   // Memory rows the scheduler honors: a structure realizing them differently
   // would place every consumer on the wrong cycle.
@@ -789,7 +847,6 @@ void assertModelInvariants(const Datapath &dp) {
       assert((!hasPort || (acc.isWrite ? dp.writePorts : dp.readPorts).size() >
                               acc.portIdx) &&
              "an access's port slot is out of its boundary port list");
-      (void)hasPort;
       // An argument is never a constant table, and `assignLanes` skips it.
       assert((!m.external ||
               (acc.plan != PortPlan::Table && acc.plan != PortPlan::Lane)) &&
@@ -823,6 +880,11 @@ void assertModelInvariants(const Datapath &dp) {
 #endif
 }
 
+/// How many of a module's worst paths the report keeps. More than one because a
+/// compile is an iteration: the second and third findings are often the ones
+/// the same fix also addresses.
+constexpr unsigned kReportedPaths = 3;
+
 FailureOr<std::vector<TimingPath>>
 validateDatapath(dcp::DCPathModuleOp func, const Datapath &dp, float cycleTime,
                  const OperatorLibrary &lib, bool plannedBinding) {
@@ -835,7 +897,8 @@ validateDatapath(dcp::DCPathModuleOp func, const Datapath &dp, float cycleTime,
   // built yet. The period check measures while it checks, so the paths come out
   // of the traversal that already visits every priced cell.
   std::vector<TimingPath> paths;
-  if (failed(checkInputLegality(func, dp)) ||
+  if (failed(checkStorageLegality(func, dp)) ||
+      failed(checkStallContracts(dp)) ||
       failed(
           checkEmitterSubset(func, dp, cycleTime, lib, plannedBinding, paths)))
     return failure();

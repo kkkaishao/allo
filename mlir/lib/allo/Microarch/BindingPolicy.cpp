@@ -43,6 +43,28 @@ bool carriedOperand(const RegionBlock &rb, Value v) {
   return barg && barg.getOwner() == body && barg.getArgNumber() >= 1;
 }
 
+/// Each region-local unit's representative op mapped to its index in
+/// `rb.units`. At plan time a unit is one op, so a producer names its unit.
+llvm::DenseMap<Operation *, unsigned> unitOwners(const Datapath &dp,
+                                                 const RegionBlock &rb) {
+  llvm::DenseMap<Operation *, unsigned> owner;
+  for (auto [i, uid] : llvm::enumerate(rb.units))
+    owner[dp.units[uid].repOp()] = i;
+  return owner;
+}
+
+/// The region-local unit driving \p v, when it produces \p v combinationally in
+/// \p y's own issue cycle so its input mux lengthens \p y's cone too.
+std::optional<unsigned>
+combPred(const llvm::DenseMap<Operation *, unsigned> &owner, Value v,
+         Operation *y) {
+  Operation *x = v.getDefiningOp();
+  auto it = x ? owner.find(x) : owner.end();
+  if (it != owner.end() && !dcpLatency(x) && dcpStart(x) == dcpStart(y))
+    return it->second;
+  return std::nullopt;
+}
+
 /// Whether \p op reads a loop recurrence on any operand.
 bool readsRecurrence(const RegionBlock &rb, Operation *op) {
   return llvm::any_of(op->getOperands(),
@@ -76,22 +98,17 @@ struct ShareCone {
             const BindingContext &ctx)
       : lib(ctx.lib), fanin(rb.units.size(), 1), width(rb.units.size(), 1),
         preds(rb.units.size()), slack(rb.units.size()) {
-    // At plan time a unit is one op, so a producer names its unit directly.
-    llvm::DenseMap<Operation *, unsigned> owner;
-    for (auto [i, uid] : llvm::enumerate(rb.units))
-      owner[dp.units[uid].repOp()] = i;
+    llvm::DenseMap<Operation *, unsigned> owner = unitOwners(dp, rb);
     for (auto [i, uid] : llvm::enumerate(rb.units)) {
       const FuncUnit &u = dp.units[uid];
       // An unpriced unit (no `z`) gets no room, so no fold's cone may reach it.
       slack[i] = unitSlack(u, ctx.lib, ctx.cycleTime).value_or(0.0);
       Operation *y = u.repOp();
       width[i] = std::max<int64_t>(1, combParamWidth(y));
-      for (Value v : y->getOperands()) {
-        Operation *x = v.getDefiningOp();
-        auto it = x ? owner.find(x) : owner.end();
-        if (it != owner.end() && !dcpLatency(x) && dcpStart(x) == dcpStart(y))
-          preds[i].push_back(it->second);
-      }
+      // One op feeding two operands takes two entries; `added` maxes over them.
+      for (Value v : y->getOperands())
+        if (auto p = combPred(owner, v, y))
+          preds[i].push_back(*p);
     }
   }
 
@@ -161,18 +178,19 @@ llvm::SmallVector<unsigned> greedyShare(const Datapath &dp,
     unsigned arms = 0;
   };
   llvm::SmallVector<Bin> bins;
+  auto resOf = [&](const FuncUnit &u) {
+    return reservationOf(rb, u, u.boundOps.front().residue);
+  };
   for (unsigned i = 0, e = rb.units.size(); i < e; ++i) {
     const FuncUnit &u = dp.units[rb.units[i]];
-    auto ru = reservationOf(rb, u, u.boundOps.front().residue);
+    auto ru = resOf(u);
     unsigned own = readsRecurrence(rb, u.repOp()) ? 2 : 1;
     Bin *dest = nullptr;
     for (Bin &bin : bins) {
       if (dp.units[rb.units[bin.members.front()]].identity != u.identity)
         continue;
       bool free = llvm::all_of(bin.members, [&](unsigned m) {
-        const FuncUnit &mu = dp.units[rb.units[m]];
-        return reservationsDisjoint(
-            reservationOf(rb, mu, mu.boundOps.front().residue), ru);
+        return reservationsDisjoint(resOf(dp.units[rb.units[m]]), ru);
       });
       if (free && cone.tryFold(bin.members, i, bin.arms + own)) {
         dest = &bin;
@@ -204,6 +222,22 @@ void appendGroups(const RegionBlock &rb, llvm::ArrayRef<unsigned> assign,
       groups.push_back(std::move(group));
 }
 
+/// One operand port's price table, indexed by arm count up to \p maxArms: the
+/// mux area and the cone delay it adds, both at \p width. An unreachable count
+/// (0, 1) stays zero.
+SharingProblem::Port pricedPort(const OperatorLibrary &lib, unsigned maxArms,
+                                unsigned width) {
+  SharingProblem::Port port;
+  port.muxPrice.assign(maxArms + 1, 0);
+  port.conePicos.assign(maxArms + 1, 0);
+  for (unsigned a = 2; a <= maxArms; ++a) {
+    port.muxPrice[a] = lib.muxPrice(a, width);
+    port.conePicos[a] =
+        static_cast<int64_t>(std::ceil(muxCone(lib, a, width) * 1000.0));
+  }
+  return port;
+}
+
 /// One region as a `SharingProblem`: the arrays `ShareCone` reads, priced with
 /// the rows the emit gate walks, per operand port at that port's own width.
 /// The cone tables round up and the slacks down, so an admitted fold clears
@@ -212,9 +246,7 @@ SharingProblem sharingProblemOf(const Datapath &dp, const RegionBlock &rb,
                                 const BindingContext &ctx) {
   SharingProblem problem;
   problem.units.resize(rb.units.size());
-  llvm::DenseMap<Operation *, unsigned> owner;
-  for (auto [i, uid] : llvm::enumerate(rb.units))
-    owner[dp.units[uid].repOp()] = i;
+  llvm::DenseMap<Operation *, unsigned> owner = unitOwners(dp, rb);
   std::map<std::string, unsigned> classIdx;
   llvm::SmallVector<llvm::SmallVector<unsigned>> members;
   // Held-driver keys, interned per class: equal keys name one value.
@@ -241,13 +273,14 @@ SharingProblem sharingProblemOf(const Datapath &dp, const RegionBlock &rb,
                   .try_emplace(v, heldKeys[unit.cls].size() + 1)
                   .first->second;
       unit.drivers.push_back(key);
-      Operation *x = v.getDefiningOp();
-      auto o = x ? owner.find(x) : owner.end();
-      if (o != owner.end() && !dcpLatency(x) && dcpStart(x) == dcpStart(y))
-        unit.preds.push_back({static_cast<unsigned>(k), o->second});
+      if (auto p = combPred(owner, v, y))
+        unit.preds.push_back({static_cast<unsigned>(k), *p});
     }
   }
   problem.classes.resize(members.size());
+  auto resOf = [&](const FuncUnit &u) {
+    return reservationOf(rb, u, u.boundOps.front().residue);
+  };
   for (auto [cls, mem] : llvm::enumerate(members)) {
     Operation *y = dp.units[rb.units[mem.front()]].repOp();
     SharingProblem::UnitClass &c = problem.classes[cls];
@@ -261,27 +294,15 @@ SharingProblem sharingProblemOf(const Datapath &dp, const RegionBlock &rb,
                "one identity, one signature");
         maxArms += 1 + problem.units[m].initArms[k];
       }
-      SharingProblem::Port port;
-      port.muxPrice.assign(maxArms + 1, 0);
-      port.conePicos.assign(maxArms + 1, 0);
       auto width = static_cast<unsigned>(
           t.isIntOrIndexOrFloat() ? std::max<int64_t>(1, datapathWidth(t)) : 1);
-      for (unsigned a = 2; a <= maxArms; ++a) {
-        port.muxPrice[a] = ctx.lib.muxPrice(a, width);
-        port.conePicos[a] = static_cast<int64_t>(
-            std::ceil(muxCone(ctx.lib, a, width) * 1000.0));
-      }
-      c.ports.push_back(std::move(port));
+      c.ports.push_back(pricedPort(ctx.lib, maxArms, width));
     }
     for (unsigned p = 0; p < mem.size(); ++p) {
-      const FuncUnit &a = dp.units[rb.units[mem[p]]];
-      auto ra = reservationOf(rb, a, a.boundOps.front().residue);
-      for (unsigned q = p + 1; q < mem.size(); ++q) {
-        const FuncUnit &b = dp.units[rb.units[mem[q]]];
-        if (!reservationsDisjoint(
-                ra, reservationOf(rb, b, b.boundOps.front().residue)))
+      auto ra = resOf(dp.units[rb.units[mem[p]]]);
+      for (unsigned q = p + 1; q < mem.size(); ++q)
+        if (!reservationsDisjoint(ra, resOf(dp.units[rb.units[mem[q]]])))
           problem.conflicts.push_back({mem[p], mem[q]});
-      }
     }
   }
   return problem;

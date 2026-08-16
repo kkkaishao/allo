@@ -6,9 +6,9 @@
 #ifndef ALLO_MICROARCH_DATAPATH_H
 #define ALLO_MICROARCH_DATAPATH_H
 
-#include "allo/IR/AlloAttrs.h"                // MemoryPortEnum
-#include "allo/IR/AlloOps.h"                  // dcp::DCPathModuleOp
-#include "allo/Scheduling/MemoryModel.h"      // BankLayout
+#include "allo/IR/AlloAttrs.h"           // StallContractEnum, DeterminacyEnum
+#include "allo/IR/AlloOps.h"             // dcp::DCPathModuleOp
+#include "allo/Scheduling/MemoryModel.h" // BankLayout
 #include "allo/Scheduling/OperatorIdentity.h" // what one unit realizes
 #include "allo/Scheduling/RegionGraph.h"      // RegionShape
 
@@ -181,7 +181,7 @@ struct FuncUnit {
 /// `tap` (see Source).
 struct Register {
   RegId id = 0;
-  Value value; // the L0 value being held (for provenance / debug)
+  Value value; // the L0 value being held; also its width and name at emit
   Type type;
   unsigned depth = 0; // chain length in cycles (>= 1 for a real register)
   Source input;       // driver of the chain head (the producing cell output)
@@ -604,9 +604,6 @@ struct CallUnit {
   StartPolicy startPolicy = StartPolicy::TimeTriggered;
 };
 
-/// A start policy as one lower-case word, for the dump and the report.
-llvm::StringRef startPolicyName(CallUnit::StartPolicy p);
-
 /// A FIFO channel: a `!allo.stream` value, handshaked (valid/ready) rather than
 /// addressed. A channel is either an *input* (the kernel reads it via
 /// `allo.stream.get`) or an *output* (writes it via `allo.stream.put`); its
@@ -910,7 +907,7 @@ struct RegionBlock {
   // against which `HWEmitter::emitRegion` checks `drainStage`. A divergence is
   // a consumer placed at an offset the hardware does not honour.
   std::optional<int64_t> modelledDrain;
-  /// Cycles `resolveAccessOperands` inserted into this region's stream
+  /// Cycles `resolveStreamOperands` inserted into this region's stream
   /// schedule (the transient-din bump), maximized over its channels. The span
   /// was composed off the unshifted schedule, so this bounds how far past
   /// `modelledDrain` the built drain may sit.
@@ -1033,12 +1030,6 @@ struct Datapath {
            const DeviceModel &dev, float cycleTime, const CalleeCtx &callees,
            bool isTop = false);
 
-  /// The dcp op whose execution produces \p s's value, or null when the Source
-  /// has no producing op: a literal, the iteration counter, a kernel input
-  /// port, a held value (Reg / Survivor) or a derived mux. The single
-  /// definition of the Source to op mapping.
-  Operation *producingOp(const Source &s) const;
-
   /// \p s's compile-time value, when it is an integer literal cell; empty for
   /// every Source whose value is only known at run time.
   std::optional<int64_t> constantOf(const Source &s) const;
@@ -1047,6 +1038,12 @@ struct Datapath {
   /// iteration that produced it. Zero for a held source (a literal, a port, a
   /// counter, a survivor), which is settled before the reader issues.
   unsigned readyCycle(const Source &s) const;
+
+  /// The top-level region \p r sits under, walking the container chain to the
+  /// root. The granularity `recordSiblingDeps` orders at, and the one
+  /// `portGraph` reads that ordering back at, so both ask here rather than
+  /// each walking the chain itself.
+  RegionId topRegionOf(RegionId r) const;
 
   void dump(llvm::raw_ostream &os) const;
 
@@ -1129,7 +1126,8 @@ struct SourceSite {
                       // (a counted region has none => None)
   };
   Slot slot;
-  /// Which port / operand / result of the owner this is.
+  /// Which port / operand / result of the owner this is; a RegId for
+  /// `RegisterInput` and a RegionId for `RegionBound` / `RegionCondition`.
   unsigned index = 0;
   /// The dcp op this slot belongs to, for a located diagnostic. Null for a slot
   /// owned by a region or by the function rather than by one op.
@@ -1166,6 +1164,12 @@ unsigned dcpLatency(Operation *op);
 /// stream get is a combinational front-read, latency 0). Zero for an at-issue
 /// value with no producing op (a constant, the iteration counter).
 unsigned readyCycleOf(Operation *op);
+
+/// The cycle a store to \p m commits, relative to its region's issue: the done
+/// latch registers one cycle after this, so it is the commit cycle minus one.
+/// The model side and the emitter side reduce their own maxima over it, but
+/// they agree on the per-store number here.
+unsigned storeDrainCycle(const MemUnit &m, const MemUnit::Access &acc);
 
 /// A region's controller shape as one lower-case word, the single spelling
 /// shared by the debug dump and the microarch report.

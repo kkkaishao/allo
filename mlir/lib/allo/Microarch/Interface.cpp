@@ -32,10 +32,30 @@ layoutOf(const uarch::MemUnit &mu) {
     axes.push_back({(int)a.dim, a.factor, bankKindName(a.kind).str()});
   return {{shape.begin(), shape.end()}, std::move(axes)};
 }
+
+// One boundary interface on \p mu. Every field but the five passed in is
+// derived from the memory, so the two declaration sites cannot drift apart.
+Memory memPort(const uarch::MemUnit &mu, bool write, bool independent,
+               unsigned bank, unsigned factor, llvm::StringRef base) {
+  auto [shape, axes] = layoutOf(mu);
+  return {argOf(mu.memref),
+          write,
+          write && independent,
+          (int)bank,
+          (int)factor,
+          mu.width,
+          write ? mu.writeLatency : mu.readLatency,
+          base.str(),
+          portAddr(base),
+          portData(base),
+          write ? portWe(base) : std::string(),
+          std::move(shape),
+          std::move(axes)};
+}
 } // namespace
 
 ModuleInterface::ModuleInterface(const uarch::Datapath &dp) {
-  dcp::DCPathModuleOp fn(dp.func);
+  auto fn = dp.func;
   // Legalized here so the manifest key is the emitted Verilog module name;
   // ExportVerilog would otherwise rewrite a nested callee like `top.child`.
   symbol = fn.getSymName().str();
@@ -47,7 +67,6 @@ ModuleInterface::ModuleInterface(const uarch::Datapath &dp) {
   latencyBound = latency.has_value() && fn.getLatencyBound();
   determinacy = stringifyDeterminacyEnum(fn.getDeterminacy()).str();
 
-  ArrayRef<uarch::AccRef> reads = dp.readPorts, writes = dp.writePorts;
   // Every IOPort is a scalar kernel argument; a scalar result is a `dp.results`
   // entry, declared further down.
   for (const uarch::IOPort &io : dp.ios)
@@ -85,23 +104,16 @@ ModuleInterface::ModuleInterface(const uarch::Datapath &dp) {
   auto group = [&](uarch::AccRef r, bool write) {
     const auto &mu = dp.mems[r.id];
     const auto &acc = mu.accesses[r.idx];
-    unsigned w =
-        datapathWidth(cast<MemRefType>(mu.memref.getType()).getElementType());
-    int factor = externalBank(mu, acc).factor;
-    unsigned lat = write ? mu.writeLatency : mu.readLatency;
-    auto [shape, axes] = layoutOf(mu);
+    unsigned factor = externalBank(mu, acc).factor;
     std::vector<Memory> g;
     for (const auto &[bank, base] : extPorts(mu, acc))
-      g.push_back({argOf(mu.memref), write, write && mu.writesIndependent,
-                   (int)bank, factor, w, lat, base, portAddr(base),
-                   portData(base), write ? portWe(base) : std::string(), shape,
-                   axes});
+      g.push_back(memPort(mu, write, mu.writesIndependent, bank, factor, base));
     return g;
   };
-  for (uarch::AccRef r : reads)
-    this->reads.push_back(group(r, /*write=*/false));
-  for (uarch::AccRef r : writes)
-    this->writes.push_back(group(r, /*write=*/true));
+  for (uarch::AccRef r : dp.readPorts)
+    reads.push_back(group(r, /*write=*/false));
+  for (uarch::AccRef r : dp.writePorts)
+    writes.push_back(group(r, /*write=*/true));
 
   // A CallUnit-mastered boundary argument has no MemUnit::Access (the child
   // drives the port), so it is declared here with the same `<name>_<role><i>`
@@ -115,24 +127,9 @@ ModuleInterface::ModuleInterface(const uarch::Datapath &dp) {
       // accessors keep separate groups backed by the same array and a cyclic
       // argument gets one group per bank.
       const auto &mu = dp.mems[ma.mem];
-      unsigned w =
-          datapathWidth(cast<MemRefType>(mu.memref.getType()).getElementType());
-      const auto &base = ma.topBase;
-      auto [shape, axes] = layoutOf(mu);
-      Memory m{argOf(mu.memref),
-               ma.isWrite,
-               ma.isWrite && ma.independent,
-               (int)ma.bank,
-               (int)ma.factor,
-               w,
-               ma.isWrite ? mu.writeLatency : mu.readLatency,
-               base,
-               portAddr(base),
-               portData(base),
-               ma.isWrite ? portWe(base) : std::string(),
-               shape,
-               axes};
-      (ma.isWrite ? this->writes : this->reads).push_back({m});
+      Memory m = memPort(mu, ma.isWrite, ma.independent, ma.bank, ma.factor,
+                         ma.topBase);
+      (ma.isWrite ? writes : reads).push_back({m});
     }
 
   for (const uarch::Result &r : dp.results)

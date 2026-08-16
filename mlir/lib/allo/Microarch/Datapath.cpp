@@ -8,7 +8,6 @@
 
 #include "allo/IR/AlloOps.h"
 #include "allo/Scheduling/OperatorLibrary.h" // unit input delay
-#include "allo/Support/BitAnalysis.h"
 
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/Support/raw_ostream.h"
@@ -71,39 +70,17 @@ llvm::StringRef shapeName(RegionBlock::Shape s) {
   llvm_unreachable("unhandled RegionBlock::Shape");
 }
 
-llvm::StringRef startPolicyName(CallUnit::StartPolicy p) {
-  switch (p) {
-  case CallUnit::StartPolicy::Handshake:
-    return "handshake";
-  case CallUnit::StartPolicy::Broadcast:
-    return "broadcast";
-  case CallUnit::StartPolicy::TimeTriggered:
-    return "timed";
-  }
-  llvm_unreachable("unhandled CallUnit::StartPolicy");
+unsigned storeDrainCycle(const MemUnit &m, const MemUnit::Access &acc) {
+  assert(m.writeLatency >= 1 &&
+         "a zero-cycle write has no commit edge for the done latch to ride; "
+         "`assertModelInvariants` holds the device row to that");
+  return acc.stage + m.writeLatency - 1;
 }
 
-Operation *Datapath::producingOp(const Source &s) const {
-  switch (s.kind) {
-  case Source::Kind::Unit:
-    return units[s.id].boundOps[s.outPort].op;
-  case Source::Kind::Mem: // outPort = the read access index
-    return mems[s.id].accesses[s.outPort].op;
-  case Source::Kind::Stream: // outPort = the get access index
-    return streams[s.id].accesses[s.outPort].op;
-  case Source::Kind::Call:
-    return calls[s.id].invoke;
-  case Source::Kind::None:
-  case Source::Kind::Reg:
-  case Source::Kind::Mux:
-  case Source::Kind::IO:
-  case Source::Kind::Const:
-  case Source::Kind::Counter:
-  case Source::Kind::Survivor:
-    // At-issue, held, or produced outside this region.
-    return nullptr;
-  }
-  llvm_unreachable("unhandled Source::Kind");
+RegionId Datapath::topRegionOf(RegionId r) const {
+  while (regions[r].parent)
+    r = *regions[r].parent;
+  return r;
 }
 
 std::optional<int64_t> Datapath::constantOf(const Source &s) const {
@@ -244,11 +221,12 @@ void forEachSource(
   }
   for (const Register &r : dp.regs)
     visit(r.input, Slot::RegisterInput, r.id, nullptr, /*required=*/true);
-  for (const Mux &x : dp.muxes)
+  for (const Mux &x : dp.muxes) {
+    assert(x.selectOps.size() == x.sources.size() &&
+           "a mux's selects are parallel to its arms");
     for (auto [k, s] : llvm::enumerate(x.sources))
-      visit(s, Slot::MuxInput, k,
-            x.selectOps.empty() ? nullptr : x.selectOps[k],
-            /*required=*/true);
+      visit(s, Slot::MuxInput, k, x.selectOps[k], /*required=*/true);
+  }
 
   for (const MemUnit &m : dp.mems)
     for (const MemUnit::Access &acc : m.accesses) {
@@ -348,6 +326,19 @@ static void printSourceList(ArrayRef<Source> ss, raw_ostream &os) {
   os << "]";
 }
 
+// A start policy as one lower-case word, for the debug dump.
+static llvm::StringRef startPolicyName(CallUnit::StartPolicy p) {
+  switch (p) {
+  case CallUnit::StartPolicy::Handshake:
+    return "handshake";
+  case CallUnit::StartPolicy::Broadcast:
+    return "broadcast";
+  case CallUnit::StartPolicy::TimeTriggered:
+    return "timed";
+  }
+  llvm_unreachable("unhandled CallUnit::StartPolicy");
+}
+
 std::optional<double> unitSlack(const FuncUnit &u, const OperatorLibrary &lib,
                                 float cycleTime) {
   double slack = cycleTime;
@@ -368,53 +359,62 @@ std::optional<double> unitSlack(const FuncUnit &u, const OperatorLibrary &lib,
   return slack - cone;
 }
 
+// Does \p a reach \p b by walking `preds` backwards from \p b? Memoized in
+// \p memo, whose keys are the pair asked about; the callers ask over a pair
+// loop quadratic in the accesses.
+static bool reachesMemo(
+    unsigned a, unsigned b,
+    llvm::DenseMap<std::pair<unsigned, unsigned>, bool> &memo,
+    llvm::function_ref<void(unsigned, llvm::SmallVectorImpl<unsigned> &)>
+        preds) {
+  auto [it, isNew] = memo.try_emplace({a, b}, false);
+  if (!isNew)
+    return it->second;
+  llvm::SmallVector<unsigned> work{b}, ps;
+  llvm::SmallDenseSet<unsigned> seen{b};
+  while (!work.empty()) {
+    ps.clear();
+    preds(work.pop_back_val(), ps);
+    for (unsigned p : ps) {
+      if (p == a)
+        return it->second = true;
+      if (seen.insert(p).second)
+        work.push_back(p);
+    }
+  }
+  return false;
+}
+
 Datapath::PortRelation Datapath::portGraph(MemId id,
                                            std::optional<bool> writes) const {
   const MemUnit &m = mems[id];
   PortRelation rel;
   // Top-level ancestor of a region: the granularity `recordSiblingDeps` orders
   // at, and a container's children stay serial below it.
-  auto topOf = [&](RegionId r) {
-    while (regions[r].parent)
-      r = *regions[r].parent;
-    return r;
-  };
   // Does call \p a precede \p b transitively? A channel-joined pair in a
   // concurrent container is deliberately NOT ordered, and writes from such a
   // pair really are simultaneous. Memoized, since the pair loop below is
   // quadratic in the accesses.
   llvm::DenseMap<std::pair<CallId, CallId>, bool> precedes;
   auto callPrecedes = [&](CallId a, CallId b) {
-    auto [it, isNew] = precedes.try_emplace({a, b}, false);
-    if (!isNew)
-      return it->second;
-    llvm::SmallVector<CallId> work{b};
-    llvm::SmallDenseSet<CallId> seen{b};
-    while (!work.empty()) {
-      CallId c = work.pop_back_val();
-      for (const CallUnit::Pred &p : calls[c].predecessors) {
-        if (p.call == a)
-          return precedes[{a, b}] = true;
-        if (seen.insert(p.call).second)
-          work.push_back(p.call);
-      }
-    }
-    return false;
+    return reachesMemo(a, b, precedes,
+                       [&](unsigned c, llvm::SmallVectorImpl<unsigned> &out) {
+                         for (const CallUnit::Pred &p : calls[c].predecessors)
+                           out.push_back(p.call);
+                       });
   };
 
-  // When each vertex runs, beside the identity in `PortVertex`.
+  // When each vertex runs, parallel to `rel.verts`, which holds its identity.
   struct When {
     RegionId top, region;
     unsigned residue;
-    int call; // CallId, or -1 for a region-local access
-    int bank; // the bank it commits to, or -1 when it may reach any
   };
   // `staticBank` is empty under a skew, where two slots rotate onto one bank
   // and neither names the memory an access reaches.
   auto bankOf = [](std::optional<unsigned> b) { return b ? int(*b) : -1; };
   llvm::SmallVector<When> ws;
-  auto add = [&](const When &w, unsigned access, bool write, bool independent) {
-    rel.verts.push_back({access, w.call, independent, write, w.bank});
+  auto add = [&](const When &w, const PortVertex &v) {
+    rel.verts.push_back(v);
     ws.push_back(w);
   };
   // Writes before reads, and this function's own accesses before the ports its
@@ -426,36 +426,26 @@ Datapath::PortRelation Datapath::portGraph(MemId id,
       if (acc.isWrite == dir) {
         unsigned ii = regions[acc.region].ii.value_or(0);
         unsigned start = acc.stage;
-        add({topOf(acc.region), acc.region, ii ? start % ii : start, -1,
-             bankOf(acc.staticBank)},
-            i, dir, /*independent=*/false);
+        add({topRegionOf(acc.region), acc.region, ii ? start % ii : start},
+            {unsigned(i), -1, /*independent=*/false, dir,
+             bankOf(acc.staticBank)});
       }
     for (const CallUnit &cu : calls)
       for (const CallUnit::MemArg &ma : cu.memArgs)
         if (ma.mem == id && ma.isWrite == dir)
-          add({topOf(cu.region), cu.region, 0, int(cu.id), bankOf(ma.bank)},
-              kNoAccess, dir, ma.independent);
+          add({topRegionOf(cu.region), cu.region, 0},
+              {kNoAccess, int(cu.id), ma.independent, dir, int(ma.bank)});
   }
   // Does top-level region \p a transitively precede \p b (a < b)? The sibling
   // DAG (`recordSiblingDeps`) orders hazard pairs only, so two tops with no
   // path between them really do overlap. Memoized, as `callPrecedes` is.
   llvm::DenseMap<std::pair<RegionId, RegionId>, bool> topReach;
   auto topPrecedes = [&](RegionId a, RegionId b) {
-    auto [it, isNew] = topReach.try_emplace({a, b}, false);
-    if (!isNew)
-      return it->second;
-    llvm::SmallVector<RegionId> work{b};
-    llvm::SmallDenseSet<RegionId> seen{b};
-    while (!work.empty()) {
-      RegionId r = work.pop_back_val();
-      for (RegionId p : regions[r].predecessors) {
-        if (p == a)
-          return topReach[{a, b}] = true;
-        if (seen.insert(p).second)
-          work.push_back(p);
-      }
-    }
-    return false;
+    return reachesMemo(a, b, topReach,
+                       [&](unsigned r, llvm::SmallVectorImpl<unsigned> &out) {
+                         for (RegionId p : regions[r].predecessors)
+                           out.push_back(p);
+                       });
   };
 
   // A container drives its children serially, so two accesses in different
@@ -469,34 +459,36 @@ Datapath::PortRelation Datapath::portGraph(MemId id,
         return false;
     }
   };
-  auto overlaps = [&](const When &a, const When &b) {
+  auto overlaps = [&](unsigned i, unsigned j) {
+    const When &a = ws[i], &b = ws[j];
+    const PortVertex &va = rel.verts[i], &vb = rel.verts[j];
     // A bank is its own `seq.hlmem`, so two accesses that name different ones
     // contend for nothing however they are scheduled.
-    if (a.bank >= 0 && b.bank >= 0 && a.bank != b.bank)
+    if (va.bank >= 0 && vb.bank >= 0 && va.bank != vb.bank)
       return false;
     // Under different top-level ancestors the sibling DAG decides: an ordered
     // pair hands off, an unordered one runs concurrently.
     if (a.top != b.top)
       return !topPrecedes(std::min(a.top, b.top), std::max(a.top, b.top));
-    if (a.call >= 0 && b.call >= 0) {
-      if (callPrecedes(a.call, b.call) || callPrecedes(b.call, a.call))
+    if (va.call >= 0 && vb.call >= 0) {
+      if (callPrecedes(va.call, vb.call) || callPrecedes(vb.call, va.call))
         return false;
       // An unordered pair of one SCHEDULED region still cannot meet when the
       // earlier contract drains before the later release: a TimeTriggered
       // child runs exactly [start, start+latency), and no child of such a
       // region is released before its placed cycle (`startForCall`).
-      const CallUnit &x = calls[a.call], &y = calls[b.call];
+      const CallUnit &x = calls[va.call], &y = calls[vb.call];
       auto apart = [](const CallUnit &p, const CallUnit &q) {
         return p.startPolicy == CallUnit::StartPolicy::TimeTriggered &&
                p.latency &&
                int64_t(p.start) + std::max<int64_t>(*p.latency, 1) <=
                    int64_t(q.start);
       };
-      return x.region != y.region ||
-             regions[x.region].determinacy == DeterminacyEnum::Concurrent ||
+      return a.region != b.region ||
+             regions[a.region].determinacy == DeterminacyEnum::Concurrent ||
              (!apart(x, y) && !apart(y, x));
     }
-    if (a.call < 0 && b.call < 0) {
+    if (va.call < 0 && vb.call < 0) {
       if (a.region == b.region)
         return a.residue == b.residue;
       return underConcurrent(a.region) || underConcurrent(b.region);
@@ -506,7 +498,7 @@ Datapath::PortRelation Datapath::portGraph(MemId id,
   rel.adj.assign(ws.size(), llvm::BitVector(ws.size()));
   for (unsigned i = 0; i < ws.size(); ++i)
     for (unsigned j = i + 1; j < ws.size(); ++j)
-      if (overlaps(ws[i], ws[j]))
+      if (overlaps(i, j))
         rel.link(i, j);
   return rel;
 }

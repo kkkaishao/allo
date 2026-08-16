@@ -56,6 +56,43 @@ Terminator HWEmitter::terminatorOf(const uarch::RegionBlock &rb) {
       lb, ctx.R(comb::AddOp::create(ctx.b, ctx.loc, lb, span, false)), step);
 }
 
+// Check region \p rb's built drain against the span its consumers were placed
+// against. A determinate call is priced into the drain at its contract and the
+// emitted child honours it (the driver asserts that), so folding the same term
+// back in lets the bounds hold for a call-holding region too. An indeterminate
+// call has no span, and leaves the drain beyond checking.
+static void checkDrainAgainstComposedSpan(const uarch::Datapath &dp,
+                                          const uarch::RegionBlock &rb) {
+#ifndef NDEBUG
+  int64_t builtDrain = rb.drainStage;
+  bool doneTimed = false;
+  for (uarch::CallId cid : rb.callUnits) {
+    const uarch::CallUnit &cu = dp.calls[cid];
+    if (cu.determinate)
+      builtDrain =
+          std::max(builtDrain,
+                   int64_t(cu.start) + std::max<int64_t>(*cu.latency, 1) - 1);
+    else
+      doneTimed = true;
+  }
+  // Draining past the composed span is a fault: a consumer released at that
+  // offset samples before this region has committed. `resolveStreamOperands`
+  // re-stamps a stream put's stage, so a region it reached may sit
+  // `streamShift` cycles out and no further.
+  assert((!rb.modelledDrain || doneTimed ||
+          builtDrain <= *rb.modelledDrain + int64_t(rb.streamShift)) &&
+         "the built datapath drains past the composed span; a consumer placed "
+         "against it samples before this region has committed");
+  // Draining early is pessimism rather than a fault: the composed latency
+  // claims cycles the hardware does not take and every consumer waits them.
+  // Together with the bound above, a region with no stream shift is pinned to
+  // exact equality.
+  assert((!rb.modelledDrain || doneTimed || builtDrain >= *rb.modelledDrain) &&
+         "the built datapath drains before the composed span, so the composed "
+         "latency is longer than the hardware takes");
+#endif
+}
+
 // Emit one region: control -> datapath -> resolve the F->G condition, capture
 // results, done. The leaf regimes (counted / dynamic-trip / while) differ only
 // in the Terminator and the survivor mechanism.
@@ -133,38 +170,7 @@ Value HWEmitter::emitRegion(const uarch::RegionBlock &rb, Value start,
   assert(std::max(fb.storeDrain, resultDrain) == rb.drainStage &&
          "the built datapath's terminal cycle is not the one the model "
          "recorded");
-#ifndef NDEBUG
-  // A determinate call is priced into the drain at its contract and the emitted
-  // child honours it (the driver asserts that), so folding the same term back
-  // in lets the bounds below hold for a call-holding region too. An
-  // indeterminate call has no span, and leaves the drain beyond checking.
-  int64_t builtDrain = rb.drainStage;
-  bool doneTimed = false;
-  for (uarch::CallId cid : rb.callUnits) {
-    const uarch::CallUnit &cu = dp.calls[cid];
-    if (cu.determinate)
-      builtDrain =
-          std::max(builtDrain,
-                   int64_t(cu.start) + std::max<int64_t>(*cu.latency, 1) - 1);
-    else
-      doneTimed = true;
-  }
-  // Draining past the composed span is a fault: a consumer released at that
-  // offset samples before this region has committed. `resolveAccessOperands`
-  // re-stamps a stream put's stage, so a region it reached may sit
-  // `streamShift` cycles out and no further.
-  assert((!rb.modelledDrain || doneTimed ||
-          builtDrain <= *rb.modelledDrain + int64_t(rb.streamShift)) &&
-         "the built datapath drains past the composed span; a consumer placed "
-         "against it samples before this region has committed");
-  // Draining early is pessimism rather than a fault: the composed latency
-  // claims cycles the hardware does not take and every consumer waits them.
-  // Together with the bound above, a region with no stream shift is pinned to
-  // exact equality.
-  assert((!rb.modelledDrain || doneTimed || builtDrain >= *rb.modelledDrain) &&
-         "the built datapath drains before the composed span, so the composed "
-         "latency is longer than the hardware takes");
-#endif
+  checkDrainAgainstComposedSpan(dp, rb);
 
   // An empty counted leaf (lb >= ub) issues nothing, so it completes on
   // `start`, delayed one cycle so the pulse doesn't land on `start` itself:
@@ -180,12 +186,14 @@ Value HWEmitter::emitRegion(const uarch::RegionBlock &rb, Value start,
   // datapath waits for both, ANDing two held levels so the later wins.
   bool looseWork = !rb.streamAccesses.empty() || !rb.units.empty() ||
                    !rb.memAccesses.empty();
-  Value done =
-      fb.callDone && !looseWork
-          ? fb.callDone
-          : control.emitDone(rb, lastIssue, emptyDone, start, retrig, shell);
-  if (fb.callDone && looseWork)
-    done = ctx.andBits(fb.callDone, done);
+  // A pure call region builds no done latch at all: the child's level is the
+  // region's.
+  Value done = fb.callDone;
+  if (!fb.callDone || looseWork) {
+    Value drained =
+        control.emitDone(rb, lastIssue, emptyDone, start, retrig, shell);
+    done = fb.callDone ? ctx.andBits(fb.callDone, drained) : drained;
+  }
   // Resolving the promise RAUWs every consumer and erases the placeholders, so
   // re-register the region with the resolved values; a later region must not
   // read the placeholders.
@@ -466,6 +474,9 @@ Value HWEmitter::emitGuard(const uarch::RegionBlock &rb, Value start) {
 // and channels) once, then the func-scope sibling regions composed by their
 // dependence DAG. Nested regions emit inside their container.
 void HWEmitter::emit() {
+  ctx.clk = ctx.R(seq::ToClockOp::create(ctx.b, ctx.loc, pa.getInput(kClk)));
+  ctx.clkRaw = pa.getInput(kClk);
+  ctx.rst = pa.getInput(kRst);
   ctx.initLiterals();
   datapath.bindReadPorts();
   datapath.createInternalMemories();

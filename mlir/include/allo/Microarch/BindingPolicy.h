@@ -28,6 +28,9 @@ struct BindingPolicy {
   virtual ~BindingPolicy() = default;
   virtual std::vector<llvm::SmallVector<UnitId, 2>>
   plan(const Datapath &dp, const BindingContext &ctx) const = 0;
+  /// Whether the fold this policy returns realizes the solve's own allocation
+  /// rather than one decided here, so a unit the solve named must be built.
+  virtual bool realizesSolvePlan() const { return false; }
 };
 
 /// Every op keeps its own unit: `plan` returns no groups.
@@ -62,6 +65,7 @@ struct ExactShareBinding : BindingPolicy {
 struct PlannedBinding : BindingPolicy {
   std::vector<llvm::SmallVector<UnitId, 2>>
   plan(const Datapath &dp, const BindingContext &ctx) const override;
+  bool realizesSolvePlan() const override { return true; }
 };
 
 /// The policy named by a pass option ("trivial" / "greedy-share" /

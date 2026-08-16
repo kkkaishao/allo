@@ -17,7 +17,6 @@
 #include "allo/Scheduling/MemoryModel.h"
 #include "allo/Scheduling/OperatorLibrary.h"
 #include "allo/Support/AliasAnalysis.h"
-#include "allo/Support/Logging.h"
 
 #include "llvm/ADT/STLExtras.h"
 
@@ -25,7 +24,6 @@
 
 using namespace mlir;
 using namespace mlir::allo;
-using namespace mlir::allo::logging;
 
 namespace mlir::allo::uarch {
 
@@ -123,7 +121,7 @@ void DatapathBuilder::collectStorageFacts(ArrayRef<Operation *> regionOps) {
       }
     });
 
-  for (MemUnit &m : dp.mems) {
+  for ([[maybe_unused]] MemUnit &m : dp.mems) {
     assert(!(m.romInit && m.external) &&
            "an argument array reads through no initialized global");
     assert((!m.isRom || (m.romInit && !written[m.id])) &&
@@ -434,10 +432,10 @@ void DatapathBuilder::bindMemoryPorts() {
     m.readPortsBuilt = r.counts.reads;
     m.portsBuilt = separateTotal;
   }
-  // Instances of its row each bank is held in, which follows from the bound
-  // ports, by the same arithmetic the pooled decision above compared. A skew
-  // binds its ports by lane and leaves the loop above early, so this runs
-  // over every memory rather than inside it.
+  assignReadInstances();
+}
+
+void DatapathBuilder::assignReadInstances() {
   for (MemUnit &m : dp.mems) {
     auto [instances, per] = instancesFor(m.ports, m.readPortsBuilt,
                                          m.writePortsBuilt, m.portsBuilt);
@@ -450,13 +448,6 @@ void DatapathBuilder::bindMemoryPorts() {
     // put more reads on an instance than it has. A read on a write's bus goes
     // to the first instance, where the port it rides already exists.
     llvm::SmallDenseSet<unsigned> writePorts;
-    for (const MemUnit::Access &acc : m.accesses)
-      if (acc.isWrite)
-        writePorts.insert(acc.port);
-    for (const CallUnit &cu : dp.calls)
-      for (const CallUnit::MemArg &ma : cu.memArgs)
-        if (ma.mem == m.id && ma.isWrite)
-          writePorts.insert(ma.port);
     llvm::SmallVector<llvm::SmallVector<unsigned>> byBank(m.numBanks);
     auto reaches = [&](std::optional<unsigned> bank, unsigned port) {
       if (bank)
@@ -466,12 +457,19 @@ void DatapathBuilder::bindMemoryPorts() {
           ports.push_back(port);
     };
     for (const MemUnit::Access &acc : m.accesses)
-      if (!acc.isWrite)
+      if (acc.isWrite)
+        writePorts.insert(acc.port);
+      else
         reaches(acc.staticBank, acc.port);
     for (const CallUnit &cu : dp.calls)
-      for (const CallUnit::MemArg &ma : cu.memArgs)
-        if (ma.mem == m.id && !ma.isWrite)
+      for (const CallUnit::MemArg &ma : cu.memArgs) {
+        if (ma.mem != m.id)
+          continue;
+        if (ma.isWrite)
+          writePorts.insert(ma.port);
+        else
           reaches(ma.bank, ma.port);
+      }
     for (auto [k, ports] : llvm::enumerate(byBank)) {
       llvm::sort(ports);
       ports.erase(std::unique(ports.begin(), ports.end()), ports.end());
@@ -496,14 +494,14 @@ void DatapathBuilder::measurePorts() {
     // its groups are the elements. Every other array publishes one per bound
     // port, plus one per group a child masters on it.
     m.boundaryPorts = m.elemPorts.size();
-    for (AccRef r : dp.readPorts)
-      m.boundaryPorts += r.id == m.id;
-    for (AccRef r : dp.writePorts)
-      m.boundaryPorts += r.id == m.id;
-    for (const CallUnit &cu : dp.calls)
-      for (const CallUnit::MemArg &ma : cu.memArgs)
-        m.boundaryPorts += ma.mem == m.id && ma.isBoundary && ma.ownsGroup;
   }
+  for (AccRef r : dp.readPorts)
+    ++dp.mems[r.id].boundaryPorts;
+  for (AccRef r : dp.writePorts)
+    ++dp.mems[r.id].boundaryPorts;
+  for (const CallUnit &cu : dp.calls)
+    for (const CallUnit::MemArg &ma : cu.memArgs)
+      dp.mems[ma.mem].boundaryPorts += ma.isBoundary && ma.ownsGroup;
 }
 
 void DatapathBuilder::enumerateBoundaryPorts() {
@@ -569,6 +567,12 @@ void DatapathBuilder::enumerateBoundaryPorts() {
       ports.push_back({m.id, unsigned(a)});
     }
   }
+  // Open a new boundary group for an argument a child masters: the next index
+  // on that (memory, direction) counter.
+  auto openGroup = [&](CallUnit::MemArg &ma) {
+    return memBase(memOwnerName(dp, dp.mems[ma.mem]), ma.isWrite,
+                   group[key(ma.mem, ma.isWrite)]++);
+  };
   // One port group per (bank, port) colour: holders of one colour provably
   // never drive it in the same cycle (`bindMemoryPorts`), so they share the
   // interface the caller backs the bus with, as coloured accesses already do.
@@ -578,15 +582,13 @@ void DatapathBuilder::enumerateBoundaryPorts() {
       if (!ma.isBoundary)
         continue;
       if (ma.plan != PortPlan::Coloured) {
-        ma.topBase = memBase(memOwnerName(dp, dp.mems[ma.mem]), ma.isWrite,
-                             group[key(ma.mem, ma.isWrite)]++);
+        ma.topBase = openGroup(ma);
         continue;
       }
       auto [it, isNew] =
           colourBase.try_emplace({key(ma.mem, ma.isWrite), ma.bank, ma.port});
       if (isNew)
-        it->second = memBase(memOwnerName(dp, dp.mems[ma.mem]), ma.isWrite,
-                             group[key(ma.mem, ma.isWrite)]++);
+        it->second = openGroup(ma);
       ma.ownsGroup = isNew;
       ma.topBase = it->second;
     }

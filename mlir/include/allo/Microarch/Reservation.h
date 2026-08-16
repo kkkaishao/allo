@@ -26,9 +26,9 @@ Reservation reservationOf(const RegionBlock &region, const FuncUnit &unit,
                           unsigned residue);
 
 /// Whether two reservations may coexist on one shared unit: their occupied
-/// cycles must not intersect. Different regions conservatively conflict, since
-/// cross-region sharing is unsupported. With equal `OperatorIdentity` this is
-/// the full legality test; the timing side of a fold (the mux it grows must fit
+/// cycles must not intersect. Both must belong to the same region, a unit being
+/// owned by exactly one. With equal `OperatorIdentity` this is the full
+/// legality test; the timing side of a fold (the mux it grows must fit
 /// `unitSlack`) lives with the policy.
 bool reservationsDisjoint(const Reservation &a, const Reservation &b);
 

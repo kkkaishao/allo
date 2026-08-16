@@ -55,6 +55,7 @@ std::string memOwner(MemId m) { return "m" + std::to_string(m); }
 std::string unitOwner(UnitId u) { return "u" + std::to_string(u); }
 std::string chanOwner(StreamId s) { return "ch" + std::to_string(s); }
 std::string regOwner(RegId r) { return "reg" + std::to_string(r); }
+std::string regionTagOf(unsigned r) { return "r" + std::to_string(r); }
 
 std::string ownerOf(Location loc, llvm::StringRef fallback) {
   // Charset only: the keyword escape belongs to the composed name, so an
@@ -65,21 +66,20 @@ std::string ownerOf(Location loc, llvm::StringRef fallback) {
 }
 
 std::string ownerOf(Value v, llvm::StringRef fallback) {
-  if (auto name = nameFromLoc(v.getLoc()))
-    return sanitizeCppIdentifier(*name);
   // An unnamed value keys on its own identity, the argument position, never
   // on where its port lands in the port list.
-  if (auto ba = dyn_cast<BlockArgument>(v))
-    return argOwner(ba.getArgNumber());
-  return fallback.str();
+  auto ba = dyn_cast<BlockArgument>(v);
+  return ownerOf(v.getLoc(), ba ? argOwner(ba.getArgNumber()) : fallback.str());
 }
 
 std::string uniqueOwnerOf(Value v, llvm::ArrayRef<Value> siblings,
                           llvm::StringRef fallback) {
   std::string own = ownerOf(v, fallback);
+  // Only one versus more than one decides the suffix, so stop at the second.
   unsigned ties = 0;
   for (Value s : siblings)
-    ties += ownerOf(s, fallback) == own;
+    if (ownerOf(s, fallback) == own && ++ties > 1)
+      break;
   if (ties <= 1)
     return own;
   // Two values sharing a source name would collide in port/cell naming. Each
@@ -206,7 +206,7 @@ std::string memArrayName(const Datapath &dp, const MemUnit &m) {
 }
 
 std::string memElemName(const Datapath &dp, const MemUnit &m, unsigned k) {
-  return verilogName(memOwnerName(dp, m) + "_" + std::to_string(k));
+  return elemBase(memOwnerName(dp, m), k);
 }
 
 std::string regionSignal(llvm::StringRef tag, llvm::StringRef sig) {
@@ -214,7 +214,7 @@ std::string regionSignal(llvm::StringRef tag, llvm::StringRef sig) {
 }
 
 std::string regionSignal(unsigned region, llvm::StringRef sig) {
-  return regionSignal("r" + std::to_string(region), sig);
+  return regionSignal(regionTagOf(region), sig);
 }
 
 std::string regTapName(llvm::StringRef owner, unsigned k) {

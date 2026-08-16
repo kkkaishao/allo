@@ -16,6 +16,47 @@ using namespace circt;
 
 namespace mlir::allo::uarch {
 
+Value DatapathEmitter::resolveMux(uarch::MuxId id) {
+  if (Value v = muxVal.lookup(id))
+    return v;
+  const uarch::Mux &mx = dp.muxes[id];
+  Value issue = controlOf.lookup(mx.region).issue;
+  assert(issue && "mux in a region with no controller");
+  // Timed against the OWNING region's shell (`mx.region`), not whichever
+  // region is emitting: the select rides that region's issue pulse.
+  StallShell sh = shellFor(mx.region);
+  // A recurrence operand's iteration windows, delayed to their op's stage and
+  // built once per (op, iteration). The At arms and the From arm that
+  // complements them partition that op's pulse by construction. The two kinds
+  // are cached apart because one op may carry recurrences of different
+  // distances, whose `iter` numbers then mean different things.
+  DenseMap<std::pair<Operation *, unsigned>, Value> atOf, fromOf;
+  SmallVector<Value> values, selects;
+  const uarch::RegionBlock &rb = dp.regions[mx.region];
+  for (auto [k, src] : llvm::enumerate(mx.sources)) {
+    Operation *op = mx.selectOps[k];
+    unsigned stage = mx.selectStages[k];
+    const uarch::Mux::Phase &ph = mx.phases[k];
+    Value sel = c.activationPulse(issue, stage, sh);
+    if (ph.kind == uarch::Mux::Phase::At) {
+      Value &window = atOf[{op, ph.iter}];
+      if (!window)
+        window = c.activationPulse(atIteration(rb, ph.iter), stage, sh);
+      sel = c.andBits(sel, window);
+    } else if (ph.kind == uarch::Mux::Phase::From) {
+      Value &window = fromOf[{op, ph.iter}];
+      if (!window)
+        window = c.activationPulse(firstIterations(rb, ph.iter), stage, sh);
+      sel = c.andBits(sel, c.notBit(window));
+    }
+    values.push_back(resolveSource(src));
+    selects.push_back(sel);
+  }
+  Value v = c.oneHotSelect(values, selects);
+  muxVal[id] = v;
+  return v;
+}
+
 // Resolve a datapath Source to the SSA value driving it, exhaustive over
 // Source::Kind.
 Value DatapathEmitter::resolveSource(const uarch::Source &s) {
@@ -61,49 +102,8 @@ Value DatapathEmitter::resolveSource(const uarch::Source &s) {
   case uarch::Source::Kind::IO:
     // A scalar kernel argument, exposed as its own module input port.
     return pa.getInput(scalarPortName(dp, dp.ios[s.id]));
-  case uarch::Source::Kind::Mux: {
-    // A shared unit's input: the bound ops hold disjoint MRT residues, so the
-    // `activationPulse` selects are one-hot and an AND-OR reduction serves.
-    // With no op issuing the result is zero, which no consumer samples.
-    if (Value v = muxVal.lookup(s.id))
-      return v;
-    const uarch::Mux &mx = dp.muxes[s.id];
-    Value issue = controlOf.lookup(mx.region).issue;
-    assert(issue && "mux in a region with no controller");
-    // Timed against the OWNING region's shell (`mx.region`), not whichever
-    // region is emitting: the select rides that region's issue pulse.
-    StallShell sh = shellFor(mx.region);
-    // A recurrence operand's iteration windows, delayed to their op's stage and
-    // built once per (op, iteration). The At arms and the From arm that
-    // complements them partition that op's pulse by construction. The two kinds
-    // are cached apart because one op may carry recurrences of different
-    // distances, whose `iter` numbers then mean different things.
-    DenseMap<std::pair<Operation *, unsigned>, Value> atOf, fromOf;
-    SmallVector<Value> values, selects;
-    for (auto [k, src] : llvm::enumerate(mx.sources)) {
-      Operation *op = mx.selectOps[k];
-      unsigned stage = mx.selectStages[k];
-      const uarch::Mux::Phase &ph = mx.phases[k];
-      const uarch::RegionBlock &rb = dp.regions[mx.region];
-      Value sel = c.activationPulse(issue, stage, sh);
-      if (ph.kind == uarch::Mux::Phase::At) {
-        Value &window = atOf[{op, ph.iter}];
-        if (!window)
-          window = c.activationPulse(atIteration(rb, ph.iter), stage, sh);
-        sel = c.andBits(sel, window);
-      } else if (ph.kind == uarch::Mux::Phase::From) {
-        Value &window = fromOf[{op, ph.iter}];
-        if (!window)
-          window = c.activationPulse(firstIterations(rb, ph.iter), stage, sh);
-        sel = c.andBits(sel, c.notBit(window));
-      }
-      values.push_back(resolveSource(src));
-      selects.push_back(sel);
-    }
-    Value v = c.oneHotSelect(values, selects);
-    muxVal[s.id] = v;
-    return v;
-  }
+  case uarch::Source::Kind::Mux:
+    return resolveMux(s.id);
   case uarch::Source::Kind::Survivor: {
     // A sibling region's held result, latched by setSurvivor when the producing
     // region completed, before this consumer emitted.
@@ -219,6 +219,9 @@ void DatapathEmitter::declareUnits(const uarch::RegionBlock &rb) {
 // extern operator module, internally pipelined by its latency.
 void DatapathEmitter::emitUnits(const uarch::RegionBlock &rb) {
   StallShell sh = shellFor(rb.id);
+  // Null for a container's condition cone, whose control is not set yet; that
+  // path carries no `inputInits`, the only reader.
+  Value issue = controlOf.lookup(rb.id).issue;
   for (uarch::UnitId uid : rb.units) {
     const uarch::FuncUnit &u = dp.units[uid];
     SmallVector<Value> operands;
@@ -232,7 +235,6 @@ void DatapathEmitter::emitUnits(const uarch::RegionBlock &rb) {
       // port carries none: its identities are arms of the input mux above, and
       // a container's own units carry none at all.
       for (auto [n, init] : llvm::enumerate(u.inputInits[k])) {
-        Value issue = controlOf.lookup(rb.id).issue;
         assert(issue && "recurrence input in a region with no controller");
         Value iterN = c.R(
             comb::AndOp::create(c.b, c.loc, issue, atIteration(rb, n), false));
@@ -583,6 +585,47 @@ void DatapathEmitter::emitInternalChannel(const uarch::StreamChannel &s,
   w.ready.setValue(c.notBit(fifo.getFull()));
 }
 
+DatapathEmitter::ShimEnd
+DatapathEmitter::initPrependShim(const uarch::StreamChannel &s, unsigned k,
+                                 unsigned nSinks, Value out, Value notEmpty,
+                                 Value cReady, Value rdEn) {
+  Type payload = datapathType(s.payload, c.b);
+  auto init = cast<ArrayAttr>(s.init);
+  unsigned nInit = init.size();
+  unsigned remW = 1;
+  while ((1u << remW) <= nInit)
+    ++remW;
+  Type remTy = c.b.getIntegerType(remW);
+  Backedge remNext = c.bb.get(remTy);
+  Value rem = c.reg(remNext, c.konst(remTy, nInit));
+  nameValue(rem, channelSignal(ownerOf(s.stream, chanOwner(s.id)),
+                               nSinks > 1 ? "init_rem" + std::to_string(k)
+                                          : std::string("init_rem")));
+  Value serving = c.R(comb::ICmpOp::create(c.b, c.loc, comb::ICmpPredicate::ne,
+                                           rem, c.konst(remTy, 0)));
+  auto token = [&](unsigned idx) {
+    Attribute a = init[idx];
+    APInt bits = isa<IntegerAttr>(a)
+                     ? cast<IntegerAttr>(a).getValue()
+                     : cast<FloatAttr>(a).getValue().bitcastToAPInt();
+    return c.konst(
+        payload,
+        bits.zextOrTrunc(cast<IntegerType>(payload).getWidth()).getZExtValue());
+  };
+  SmallVector<Value> vals, sels;
+  for (unsigned v = 1; v <= nInit; ++v) {
+    vals.push_back(token(nInit - v));
+    sels.push_back(c.icmpEqV(rem, c.konst(remTy, v)));
+  }
+  ShimEnd e;
+  e.data = c.mux(serving, c.oneHotSelect(vals, sels), out);
+  e.valid = c.orBits(serving, notEmpty);
+  e.rdEn = c.andBits(rdEn, c.notBit(serving));
+  Value dec = c.R(comb::SubOp::create(c.b, c.loc, rem, c.konst(remTy, 1)));
+  remNext.setValue(c.mux(c.andBits(serving, cReady), dec, rem));
+  return e;
+}
+
 // The queue(s) behind a channel wired between CHILD PORTS: one `seq.fifo` per
 // CONSUMER end, all pushed by the producer on the same cycle, the fan-out tee.
 // The producer may write only when every consumer can accept (the bounded
@@ -667,40 +710,11 @@ void DatapathEmitter::emitComposedChannel(const uarch::StreamChannel &s) {
     Value rdEn = c.andBits(cReady, notEmpty);
     Value data = out[k], valid = notEmpty;
     if (nInit) {
-      // `rem` counts the initial tokens still to serve, k .. 1; the datum is
-      // picked by the running index (idx = nInit - rem), a one-hot select
-      // since `rem` equals exactly one value while `serving` holds.
-      unsigned remW = 1;
-      while ((1u << remW) <= nInit)
-        ++remW;
-      Type remTy = c.b.getIntegerType(remW);
-      Backedge remNext = c.bb.get(remTy);
-      Value rem = c.reg(remNext, c.konst(remTy, nInit));
-      nameValue(rem,
-                channelSignal(ownerOf(s.stream, chanOwner(s.id)),
-                              sinks.size() > 1 ? "init_rem" + std::to_string(k)
-                                               : std::string("init_rem")));
-      Value serving = c.R(comb::ICmpOp::create(
-          c.b, c.loc, comb::ICmpPredicate::ne, rem, c.konst(remTy, 0)));
-      auto token = [&](unsigned idx) {
-        Attribute a = init[idx];
-        APInt bits = isa<IntegerAttr>(a)
-                         ? cast<IntegerAttr>(a).getValue()
-                         : cast<FloatAttr>(a).getValue().bitcastToAPInt();
-        return c.konst(payload,
-                       bits.zextOrTrunc(cast<IntegerType>(payload).getWidth())
-                           .getZExtValue());
-      };
-      SmallVector<Value> vals, sels;
-      for (unsigned v = 1; v <= nInit; ++v) {
-        vals.push_back(token(nInit - v));
-        sels.push_back(c.icmpEqV(rem, c.konst(remTy, v)));
-      }
-      data = c.mux(serving, c.oneHotSelect(vals, sels), out[k]);
-      valid = c.orBits(serving, notEmpty);
-      rdEn = c.andBits(rdEn, c.notBit(serving));
-      Value dec = c.R(comb::SubOp::create(c.b, c.loc, rem, c.konst(remTy, 1)));
-      remNext.setValue(c.mux(c.andBits(serving, cReady), dec, rem));
+      ShimEnd e =
+          initPrependShim(s, k, sinks.size(), out[k], notEmpty, cReady, rdEn);
+      data = e.data;
+      valid = e.valid;
+      rdEn = e.rdEn;
     }
     auto fifo = seq::FIFOOp::create(
         c.b, c.loc, payload, c.i1, c.i1, Type(), Type(), pData, rdEn, wrEn,
@@ -755,6 +769,57 @@ Value DatapathEmitter::startForCall(const uarch::CallUnit &cu, Value issue,
   llvm_unreachable("unhandled CallUnit::StartPolicy");
 }
 
+unsigned DatapathEmitter::consumerSlot(const uarch::StreamChannel &ch,
+                                       uarch::CallId call, unsigned arg) const {
+  unsigned slot = 0;
+  for (const uarch::StreamChannel::CallEnd &e : ch.callEnds)
+    if (dp.calls[e.call].streamArgs[e.arg].isInput) {
+      if (e.call == call && e.arg == arg)
+        break;
+      ++slot;
+    }
+  return slot;
+}
+
+llvm::StringMap<Value> DatapathEmitter::childInstanceInputs(
+    const uarch::CallUnit &cu, Value startK,
+    llvm::StringMap<circt::Backedge> &rdBackedge) {
+  llvm::StringMap<Value> ins;
+  ins[kClk] = c.clkRaw;
+  ins[kRst] = c.rst;
+  ins[kStart] = startK;
+  for (const uarch::CallUnit::MemArg &ma : cu.memArgs) {
+    if (ma.isWrite)
+      continue;
+    if (ma.isBoundary)
+      ins[ma.data] = pa.getInput(portData(ma.topBase));
+    else {
+      auto be = c.bb.get(memElemType(dp.mems[ma.mem], c.b));
+      ins[ma.data] = be;
+      rdBackedge.try_emplace(ma.data, be);
+    }
+  }
+  // Channel ends: the child drives two of the three handshake wires and reads
+  // the third. What it reads is a promise the channel realization resolves
+  // once every end exists.
+  for (auto [k, sa] : llvm::enumerate(cu.streamArgs)) {
+    ComposedWires &w = composedWires[sa.chan];
+    if (!sa.isInput) {
+      ins[sa.ready] = w.prodReady;
+      continue;
+    }
+    unsigned slot = consumerSlot(dp.streams[sa.chan], cu.id, k);
+    ins[sa.data] = w.sinkData[slot];
+    ins[sa.valid] = w.sinkValid[slot];
+  }
+  // Scalar operands: drive each child scalar-input port from its resolved
+  // Source, sampled at the child's start.
+  for (const uarch::CallUnit::ScalarArg &sa : cu.scalarIns)
+    ins[sa.port] = resize(c.b, c.loc, resolveSource(sa.src), sa.width,
+                          /*isSigned=*/true);
+  return ins;
+}
+
 // Instantiate each CallUnit (dcp.instance) in region \p rb as a child
 // hw.instance. The child masters each memref operand's memory: it drives the
 // addr/data/we, so the leaf wires those instance-output ports to the buffer's
@@ -786,50 +851,8 @@ void DatapathEmitter::emitCalls(const uarch::RegionBlock &rb, Value issue,
            "the callee module must be registered (emitted bottom-up first)");
     hw::HWModuleOp child = mit->second;
 
-    // Instance inputs by child port name: clk/rst/`start` plus each read's data
-    // input. An internal read consumes a backedge resolved after the instance;
-    // a boundary read passes the top's data input straight through.
-    llvm::StringMap<Value> ins;
-    ins[kClk] = c.clkRaw;
-    ins[kRst] = c.rst;
-    ins[kStart] = startK;
     llvm::StringMap<circt::Backedge> rdBackedge;
-    for (const uarch::CallUnit::MemArg &ma : cu.memArgs) {
-      if (ma.isWrite)
-        continue;
-      if (ma.isBoundary)
-        ins[ma.data] = pa.getInput(portData(ma.topBase));
-      else {
-        auto be = c.bb.get(memElemType(dp.mems[ma.mem], c.b));
-        ins[ma.data] = be;
-        rdBackedge.try_emplace(ma.data, be);
-      }
-    }
-    // Channel ends: the child drives two of the three handshake wires and reads
-    // the third. What it reads is a promise the channel realization resolves
-    // once every end exists.
-    for (auto [k, sa] : llvm::enumerate(cu.streamArgs)) {
-      ComposedWires &w = composedWires[sa.chan];
-      if (!sa.isInput) {
-        ins[sa.ready] = w.prodReady;
-        continue;
-      }
-      unsigned slot = 0;
-      for (const uarch::StreamChannel::CallEnd &e :
-           dp.streams[sa.chan].callEnds)
-        if (dp.calls[e.call].streamArgs[e.arg].isInput) {
-          if (e.call == cu.id && e.arg == k)
-            break;
-          ++slot;
-        }
-      ins[sa.data] = w.sinkData[slot];
-      ins[sa.valid] = w.sinkValid[slot];
-    }
-    // Scalar operands: drive each child scalar-input port from its resolved
-    // Source, sampled at the child's start.
-    for (const uarch::CallUnit::ScalarArg &sa : cu.scalarIns)
-      ins[sa.port] = resize(c.b, c.loc, resolveSource(sa.src), sa.width,
-                            /*isSigned=*/true);
+    llvm::StringMap<Value> ins = childInstanceInputs(cu, startK, rdBackedge);
 
     auto outs = instantiateChild(c.b, c.loc, child,
                                  childInstanceName(cu.callee, cu.id), ins);
@@ -844,6 +867,8 @@ void DatapathEmitter::emitCalls(const uarch::RegionBlock &rb, Value issue,
       for (auto [k, res] : llvm::enumerate(dp.regions[cu.region].results))
         if (res.value.kind == uarch::Source::Kind::Call &&
             res.value.id == cu.id && res.value.outPort == r)
+          // Left unnamed, unlike the other survivors: the value is a child
+          // instance result, which already carries the instance's port name.
           setSurvivor(cu.region, k, outs[port]);
     }
 

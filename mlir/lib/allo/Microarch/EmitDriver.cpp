@@ -66,7 +66,7 @@ static void declareOperatorModules(ArrayRef<iface::Operator> operators,
 
 /// Flip-flops in \p mod's own body, which is what the ledger claims to count.
 /// A child instance's registers live in the child's body and are not walked.
-static unsigned compRegBits(hw::HWModuleOp mod) {
+[[maybe_unused]] static unsigned compRegBits(hw::HWModuleOp mod) {
   unsigned bits = 0;
   mod.walk([&](Operation *op) {
     if (isa<seq::CompRegOp, seq::CompRegClockEnabledOp>(op))
@@ -110,9 +110,6 @@ emitModule(const uarch::Datapath &dp, OpBuilder &b,
       [&](OpBuilder &ib, hw::HWModulePortAccessor &pa) {
         BackedgeBuilder bb(ib, loc);
         HWEmitter e(ib, loc, dp, pa, opModules, bb, i1, i32, callees);
-        e.ctx.clk = e.ctx.R(seq::ToClockOp::create(ib, loc, pa.getInput(kClk)));
-        e.ctx.clkRaw = pa.getInput(kClk);
-        e.ctx.rst = pa.getInput(kRst);
         e.emit();
         ledger = std::move(e.ctx.ledger);
         muxLedger = std::move(e.ctx.muxLedger);
@@ -169,8 +166,6 @@ LogicalResult emitDatapathToHW(ModuleOp module, StringRef binding,
   // `dcp.compute` names, which stays live for the whole of emission.
   DeviceModel dev = DeviceModel::fromModule(module);
 
-  auto scheduled = llvm::to_vector(module.getOps<dcp::DCPathModuleOp>());
-
   auto policy = bindingPolicyFor(binding);
   if (!policy) {
     error(Stage::Emit, Code::UnknownOption, module)
@@ -183,7 +178,7 @@ LogicalResult emitDatapathToHW(ModuleOp module, StringRef binding,
   // Bottom-up over the call DAG: a container always finds its children already
   // registered.
   llvm::StringMap<dcp::DCPathModuleOp> byName;
-  for (dcp::DCPathModuleOp f : scheduled)
+  for (dcp::DCPathModuleOp f : module.getOps<dcp::DCPathModuleOp>())
     byName[f.getSymName()] = f;
   dcp::DCPathModuleOp topFunc = byName.lookup(top);
   if (!topFunc) {
@@ -253,7 +248,7 @@ LogicalResult emitDatapathToHW(ModuleOp module, StringRef binding,
     });
     b.setInsertionPoint(f);
     auto pairOr = emitModule(dp, b, opModules, cycleTime, dev.operators,
-                             binding == "planned", report, cc);
+                             policy->realizesSolvePlan(), report, cc);
     if (failed(pairOr))
       return failure();
     registerModule(f.getSymName(), pairOr->first, std::move(pairOr->second));

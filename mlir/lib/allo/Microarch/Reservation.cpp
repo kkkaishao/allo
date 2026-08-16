@@ -29,33 +29,32 @@ Reservation reservationOf(const RegionBlock &region, const FuncUnit &unit,
 }
 
 bool reservationsDisjoint(const Reservation &a, const Reservation &b) {
-  if (a.region != b.region)
-    return false; // cross-region sharing isn't modelled; treated as a conflict
+  assert(a.region == b.region && "cross-region sharing is not modelled");
   llvm::SmallDenseSet<unsigned, 8> cyclesA(a.cycles.begin(), a.cycles.end());
   return llvm::none_of(b.cycles,
                        [&](unsigned c) { return cyclesA.contains(c); });
 }
 
 // Checks every unit's bound ops for identity and reservation conflicts.
-// Debug-only: the sweep costs O(units * boundOps^2) reservations.
+// Debug-only: the sweep costs O(units * boundOps^2) comparisons.
 void verifyBinding([[maybe_unused]] const Datapath &dp) {
 #ifndef NDEBUG
   for (const RegionBlock &rb : dp.regions)
     for (UnitId uid : rb.units) {
       const FuncUnit &u = dp.units[uid];
-      // The emitter builds one operator from the unit's identity, so a bound op
-      // of any other identity would be miscompiled.
-      for (const FuncUnit::BoundOp &bo : u.boundOps)
+      llvm::SmallVector<Reservation, 4> held;
+      for (const FuncUnit::BoundOp &bo : u.boundOps) {
+        // The emitter builds one operator from the unit's identity, so a bound
+        // op of any other identity would be miscompiled.
         assert(operatorIdentity(cast<dcp::DCPathComputeOp>(bo.op)) ==
                    u.identity &&
                "shared unit binds an op of a different operator identity");
-      for (unsigned i = 0, e = u.boundOps.size(); i < e; ++i) {
-        Reservation ri = reservationOf(rb, u, u.boundOps[i].residue);
-        for (unsigned j = i + 1; j < e; ++j)
-          assert(reservationsDisjoint(
-                     ri, reservationOf(rb, u, u.boundOps[j].residue)) &&
-                 "binding hazard: two ops share a unit in the same cycle");
+        held.push_back(reservationOf(rb, u, bo.residue));
       }
+      for (unsigned i = 0, e = held.size(); i < e; ++i)
+        for (unsigned j = i + 1; j < e; ++j)
+          assert(reservationsDisjoint(held[i], held[j]) &&
+                 "binding hazard: two ops share a unit in the same cycle");
     }
 #endif
 }

@@ -7,6 +7,7 @@
 #define ALLO_MICROARCH_PRIMITIVES_H
 
 #include "allo/Microarch/Datapath.h"
+#include "allo/Microarch/Naming.h" // regionTagOf
 #include "allo/Microarch/RegLedger.h"
 
 #include "circt/Dialect/HW/HWOps.h"
@@ -15,10 +16,12 @@
 
 #include "mlir/IR/AffineExpr.h"
 #include "mlir/IR/Builders.h"
+#include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringMap.h"
 
 #include <limits>
+#include <optional>
 #include <string>
 #include <utility>
 
@@ -44,6 +47,9 @@ IntegerType memElemType(const uarch::MemUnit &m, OpBuilder &b);
 /// address 1 bit; the spare is never read. One rule, since a leaf's accesses
 /// and a composed container's child ports must agree on the address width.
 unsigned declaredDepth(unsigned words);
+/// The bits an address of \p m carries: clog2 of its declared depth. The one
+/// spelling, since a bus, a backedge and the mux priced against it must agree.
+unsigned memAddrWidth(const uarch::MemUnit &m);
 /// The element bit patterns of a compile-time array initializer, in NATURAL
 /// order (element 0 first), each resized to \p width and padded with zero to
 /// exactly \p depth words. A float table carries its values as their IEEE bit
@@ -268,6 +274,9 @@ struct EmitContext {
   /// level-sensitive latch.
   Value enabledReg(Value in, Value ce, Value rstVal,
                    RegRole role = RegRole::Control);
+  /// A register on \p sh's time base: clock-enabled by `chainEnable` under an
+  /// elastic shell, an unconditional `reg` under a rigid one.
+  Value shellReg(Value in, Value rstVal, const StallShell &sh, RegRole role);
   /// Stall-hold: transparent (combinational passthrough) while \p sh's
   /// `chainEnable` is high, holds its last enabled value while low. out = ce ?
   /// in : held; held[t+1] = out[t]. Unlike `enabledReg` it adds NO latency when
@@ -342,15 +351,11 @@ struct EmitContext {
   /// Combinational (0-cycle) equality of two same-width values (a runtime
   /// compare, e.g. a counter against a data-dependent trip bound).
   Value icmpEqV(Value lhs, Value rhs);
-  /// Combinational (0-cycle) unsigned `lhs >= rhs` of two same-width values.
-  Value icmpUgeV(Value lhs, Value rhs);
   /// Combinational (0-cycle) SIGNED `lhs >= rhs` of two same-width values (the
   /// induction bound test `iv+step >= ub`): signed so a negative compile-time
   /// lower bound (`affine.for %i = -4 to 4`) compares correctly. Identical to
   /// the unsigned test for a non-negative counter.
   Value icmpSgeV(Value lhs, Value rhs);
-  /// Combinational (0-cycle) `v != 0` (a runtime non-empty / zero-trip test).
-  Value isNonZero(Value v);
   /// Combinational (0-cycle) logical NOT of an i1 (`v XOR 1`).
   Value notBit(Value v);
   /// Combinational (0-cycle) AND of two i1s.
@@ -391,7 +396,7 @@ struct RegionTag {
   EmitContext &c;
   std::string saved;
   RegionTag(EmitContext &c, unsigned region) : c(c), saved(c.regionTag) {
-    c.regionTag = "r" + std::to_string(region);
+    c.regionTag = regionTagOf(region);
   }
   ~RegionTag() { c.regionTag = saved; }
 };

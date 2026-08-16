@@ -318,12 +318,12 @@ struct DatapathEmitter {
     Value data;
     circt::Backedge rdEnBE;
     circt::Backedge addr;
+    /// One arm per holder: the regions plus the mastering children.
     SmallVector<SinkArm, 1> arms;
     /// The one region holding the port, when a region (not a child) does: the
     /// finalize reads its RESOLVED shell off `shellOf`, since the chainEnable
     /// at contribution time is still a promise.
     std::optional<unsigned> ownerRegion;
-    unsigned owners = 0; // regions plus mastering children holding the port
   };
   /// A MapVector, not a DenseMap: the finalize iterates it to drive the ports,
   /// and the emitted module must not depend on a hash order.
@@ -385,6 +385,10 @@ struct DatapathEmitter {
 
   /// Resolve a datapath Source to the SSA value driving it.
   Value resolveSource(const uarch::Source &s);
+  /// A shared unit's input mux: the bound ops hold disjoint MRT residues, so
+  /// the `activationPulse` selects are one-hot and an AND-OR reduction serves.
+  /// With no op issuing the result is zero, which no consumer samples.
+  Value resolveMux(uarch::MuxId id);
   /// The window a recurrence input reads its reduction identities in: region
   /// \p rb's counter still inside its first \p dist iterations. A level, valid
   /// when the region issues, which a consumer delays to its own stage.
@@ -408,10 +412,12 @@ struct DatapathEmitter {
   /// the same bank off the cones `planAddressGenerators` reduced.
   BankSplit bankAddress(const uarch::MemUnit &m,
                         const uarch::MemUnit::Access &acc);
-  /// Narrow a linear address to a memory's clog2(depth)-bit index (hlmem).
+  /// Narrow a child's port address to this memory's clog2(depth)-bit index
+  /// (hlmem). `bankAddress` already returns an offset at that width.
   Value memAddr(const uarch::MemUnit &m, Value addr);
-  /// Which element of a scattered memory an access names, at the datapath
-  /// width (compared against literal element numbers, not used to index).
+  /// Which element of a scattered memory an access names, at the memory's own
+  /// address width (compared against literal element numbers, not used to
+  /// index).
   Value scatterIndex(const uarch::MemUnit &m,
                      const uarch::MemUnit::Access &acc);
   /// The element registers of a scattered internal array, in element order.
@@ -438,8 +444,6 @@ struct DatapathEmitter {
     slot.issue = rc.issue;
     if (rc.wantIssue)
       slot.wantIssue = rc.wantIssue;
-    if (rc.running)
-      slot.running = rc.running;
     if (rc.phase)
       slot.phase = rc.phase;
     if (!rc.scaledCounters.empty())
@@ -483,6 +487,13 @@ struct DatapathEmitter {
   /// serve is a boundary port group, whose address may be computed by a unit
   /// (`emitExternalReadAddrs`) and whose datum `bindReadPorts` already bound.
   void emitReads(const uarch::RegionBlock &rb, Value issue);
+  /// One read port of \p m per bank on lane \p port, rather than one per bank
+  /// per access. The lane's accesses (\p idxs, indexing `m.accesses`) hold
+  /// distinct slots, so bank k takes the offset of whichever of them reaches it
+  /// and hands its datum back to that one: F accesses over F banks at one port
+  /// each, where a crossbar would take a port on every bank for every access.
+  void emitLaneReads(const uarch::MemUnit &m, unsigned port,
+                     ArrayRef<unsigned> idxs, const StallShell &sh);
   /// The address one region's accesses on a port present: each drives it on its
   /// own issue cycle, held with the datapath so a read frozen by back-pressure
   /// keeps re-presenting its address. \p idxs indexes `m.accesses`, all in the
@@ -490,8 +501,7 @@ struct DatapathEmitter {
   /// receives "one of them is presenting now", which a port another region also
   /// holds selects on; a lone region on a port drives it unconditionally.
   Value sharedAddress(const uarch::MemUnit &m, ArrayRef<unsigned> idxs,
-                      Value issue, const StallShell &sh,
-                      Value *fired = nullptr);
+                      Value issue, const StallShell &sh, Value *fired);
   /// Stamp an emitted `seq.read`/`seq.write` with the physical port it drives
   /// (`kMemPortAttr`), which puts a port's read and write in one `always`
   /// block and so makes them one port of a dual-port RAM.
@@ -523,6 +533,14 @@ struct DatapathEmitter {
   /// `emitReads`.
   void emitWrites(const uarch::RegionBlock &rb, Value issue,
                   DatapathFeedback &fb);
+  /// One write port of \p m per bank on one lane. Bank k takes the address and
+  /// data of whichever of the lane's accesses (\p idxs, indexing `m.accesses`)
+  /// reaches it, and its write-enable is the OR of their demuxed enables, so an
+  /// access commits on its own bank and nowhere else. The OR has at most one
+  /// live arm, as `laneSelect` does. \p commit is called only where a store
+  /// exists, the pulse being built lazily.
+  void emitLaneWrites(const uarch::MemUnit &m, ArrayRef<unsigned> idxs,
+                      llvm::function_ref<Value()> commit, const StallShell &sh);
 
   /// Instantiate each CallUnit (dcp.instance) in region \p rb as a child
   /// `hw.instance` and fold the child's `done` into \p fb.callDone. Runs BEFORE
@@ -530,6 +548,19 @@ struct DatapathEmitter {
   /// is an ordinary datapath Source a register chain or a store may read.
   void emitCalls(const uarch::RegionBlock &rb, Value issue,
                  DatapathFeedback &fb);
+  /// Child \p cu's instance inputs by child port name: clk/rst/`start`, each
+  /// read's data input, each channel end and each scalar operand. An internal
+  /// read consumes a backedge, handed back through \p rdBackedge and resolved
+  /// after the instance; a boundary read passes the top's data input straight
+  /// through.
+  llvm::StringMap<Value>
+  childInstanceInputs(const uarch::CallUnit &cu, Value startK,
+                      llvm::StringMap<circt::Backedge> &rdBackedge);
+  /// Which consumer end of channel \p ch the (\p call, \p arg) stream operand
+  /// is: the index of its `{data, valid}` pair and of its own FIFO in the
+  /// fan-out tee, counting the input ends only.
+  unsigned consumerSlot(const uarch::StreamChannel &ch, uarch::CallId call,
+                        unsigned arg) const;
   /// Master each memref operand of child \p cu from its instance outputs
   /// \p outs. One arm per `PortPlan`, as `emitReads` and `emitWrites`.
   /// \p rdBackedge holds the read-data promise each of the child's read ports
@@ -549,6 +580,18 @@ struct DatapathEmitter {
   /// channel's init-prepend shim, and a pass-through where one end is a
   /// boundary port of this module rather than a child.
   void emitComposedChannel(const uarch::StreamChannel &s);
+  /// What a seeded channel's shim presents to its consumer, replacing the
+  /// FIFO's own triple.
+  struct ShimEnd {
+    Value data, valid, rdEn;
+  };
+  /// The init-prepend shim in front of consumer \p k of seeded channel \p s,
+  /// one of \p nSinks. `rem` counts the initial tokens still to serve,
+  /// nInit .. 1; the datum is picked by the running index (idx = nInit - rem),
+  /// a one-hot select since `rem` equals exactly one value while it serves.
+  ShimEnd initPrependShim(const uarch::StreamChannel &s, unsigned k,
+                          unsigned nSinks, Value out, Value notEmpty,
+                          Value cReady, Value rdEn);
 
   /// Declare each kernel-local channel's body wires (`streamWires`) before any
   /// region reads them; `finalizeStreamPorts` builds the FIFO that resolves
@@ -598,8 +641,8 @@ struct DatapathEmitter {
   /// accessor: a region whose own accesses reach it, or a child that masters
   /// it. Counts holders rather than regions, the two kinds saying they are
   /// driving in different ways.
-  bool sharedInternalPort(const uarch::MemUnit &m, unsigned bank,
-                          unsigned port) const;
+  bool portHasSeveralHolders(const uarch::MemUnit &m, unsigned bank,
+                             unsigned port) const;
   /// Drive each merged boundary write port group from the stores coloured onto
   /// it. Call exactly once, with the same timing as the two above.
   void finalizeBoundaryWritePorts();

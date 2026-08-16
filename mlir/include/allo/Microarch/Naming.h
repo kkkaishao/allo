@@ -80,6 +80,7 @@ std::string memOwner(MemId m);        // m0
 std::string unitOwner(UnitId u);      // u5
 std::string chanOwner(StreamId s);    // ch1
 std::string regOwner(RegId r);        // reg3
+std::string regionTagOf(unsigned r);  // r3, the prefix of a region's own cells
 
 //===----------------------------------------------------------------------===//
 // Field suffixes: the leaves of every port name.

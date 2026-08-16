@@ -10,9 +10,10 @@
 #include "allo/Scheduling/MemoryModel.h" // bankKindName
 
 #include "mlir/IR/BuiltinTypes.h"
-#include "llvm/ADT/DenseSet.h"
 #include "llvm/Support/JSON.h"
 #include "llvm/Support/raw_ostream.h"
+
+#include <map>
 
 using namespace mlir;
 using namespace mlir::allo;
@@ -95,11 +96,10 @@ FuncUarch::FuncUarch(const Datapath &dp, llvm::StringRef symbol,
            u.pipelined});
     }
     r.muxes = muxClasses(dp, rb);
-    for (MuxId mid : rb.muxes) {
-      unsigned k = dp.muxes[mid].sources.size();
-      r.cost.muxInputs += k;
+    for (const MuxClass &m : r.muxes) {
+      r.cost.muxInputs += m.count * m.fanin;
       // A k:1 mux costs about (k-1) 2:1 muxes per bit.
-      r.cost.muxBits += datapathWidth(dp.muxes[mid].type) * (k - 1);
+      r.cost.muxBits += m.count * m.width * (m.fanin - 1);
     }
     regions.push_back(std::move(r));
   }

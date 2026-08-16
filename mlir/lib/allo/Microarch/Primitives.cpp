@@ -5,7 +5,6 @@
 
 #include "allo/Microarch/Primitives.h"
 
-#include "allo-c/Schedule.h"          // kMemoryInitAttr
 #include "allo/Microarch/Interface.h" // iface::ModuleInterface (the ports)
 #include "allo/Microarch/Naming.h"    // regionSignal
 
@@ -37,7 +36,7 @@ declareModulePorts(const iface::ModuleInterface &model, OpBuilder &b) {
   using PortInfo = hw::PortInfo;
   using Dir = hw::ModulePort::Direction;
   auto *ctx = b.getContext();
-  Type i1 = b.getI1Type(), i32 = b.getIntegerType(32);
+  Type i1 = b.getI1Type();
   // A data port's hw width is its field bit width, so `iType(w)` reproduces
   // `datapathType`/`memElemType` for the data ports.
   auto iType = [&](unsigned w) -> Type { return b.getIntegerType(w); };
@@ -101,10 +100,10 @@ declareModulePorts(const iface::ModuleInterface &model, OpBuilder &b) {
   }
   for (const auto &acc : model.reads)
     for (const iface::Memory &r : acc)
-      port(r.addr, i32, Dir::Output);
+      port(r.addr, iType(kDatapathAddressWidth), Dir::Output);
   for (const auto &acc : model.writes)
     for (const iface::Memory &w : acc) {
-      port(w.addr, i32, Dir::Output);
+      port(w.addr, iType(kDatapathAddressWidth), Dir::Output);
       port(w.data, iType(w.width), Dir::Output);
       port(w.we, i1, Dir::Output);
     }
@@ -170,6 +169,10 @@ Value resize(OpBuilder &b, Location loc, Value v, unsigned width,
 }
 
 unsigned declaredDepth(unsigned words) { return std::max(2u, words); }
+
+unsigned memAddrWidth(const uarch::MemUnit &m) {
+  return llvm::Log2_64_Ceil(declaredDepth(m.depthWords));
+}
 
 SmallVector<APInt> initWords(ElementsAttr init, unsigned width,
                              unsigned depth) {
@@ -273,12 +276,11 @@ static Value mulConst(OpBuilder &b, Location loc, Value v, int64_t k) {
       .getResult();
 }
 
+// A power-of-two divisor never reaches here: `evalAffine` builds that subtree
+// narrow instead, which is the same mask.
 static Value modConst(OpBuilder &b, Location loc, Value v, int64_t d) {
   if (d == 1)
     return konstLike(b, loc, v, 0);
-  if (llvm::isPowerOf2_64(d))
-    return comb::AndOp::create(b, loc, v, konstLike(b, loc, v, d - 1), false)
-        .getResult();
   return comb::ModUOp::create(b, loc, v, konstLike(b, loc, v, d), false)
       .getResult();
 }
@@ -334,12 +336,13 @@ Value evalAffine(OpBuilder &b, Location loc, AffineExpr e, ValueRange idx,
   }
   Value lhs =
       evalAffine(b, loc, bin.getLHS(), idx, numDims, kDatapathAddressWidth);
-  assert((e.getKind() == AffineExprKind::FloorDiv ||
-          e.getKind() == AffineExprKind::Mod) &&
-         "unexpected affine op");
-  Value q = e.getKind() == AffineExprKind::FloorDiv ? divConst(b, loc, lhs, f)
-                                                    : modConst(b, loc, lhs, f);
-  return addrAt(b, loc, q, width);
+  // Not an `assert`: under NDEBUG an unhandled kind would fall through to the
+  // mod arm and emit a wrong address rather than stop.
+  if (e.getKind() == AffineExprKind::FloorDiv)
+    return addrAt(b, loc, divConst(b, loc, lhs, f), width);
+  if (e.getKind() == AffineExprKind::Mod)
+    return addrAt(b, loc, modConst(b, loc, lhs, f), width);
+  llvm_unreachable("unexpected affine op");
 }
 
 static comb::ICmpPredicate combICmpPredicate(arith::CmpIPredicate p) {
@@ -516,14 +519,6 @@ unsigned RegLedger::bits() const {
   return total;
 }
 
-void RegLedger::dump(llvm::raw_ostream &os) const {
-  for (const RegClass &c : classes())
-    os << "  " << roleName(c.role) << " x" << c.count << ": " << c.depth
-       << " deep, " << c.width << " bits" << (c.reset ? ", rst" : "")
-       << (c.enable ? ", ce" : "") << "\n";
-  os << "  total " << bits() << " flip-flops\n";
-}
-
 llvm::StringRef muxRoleName(MuxRole role) {
   switch (role) {
   case MuxRole::Address:
@@ -544,12 +539,6 @@ std::vector<MuxCone> MuxLedger::classes() const {
     out.push_back({role, fanin, width, count});
   }
   return out;
-}
-
-void MuxLedger::dump(llvm::raw_ostream &os) const {
-  for (const MuxCone &c : classes())
-    os << "  " << muxRoleName(c.role) << " x" << c.count << ": " << c.fanin
-       << ":1, " << c.width << " bits\n";
 }
 
 //===----------------------------------------------------------------------===//
@@ -602,15 +591,17 @@ Value EmitContext::enabledReg(Value in, Value ce, Value rstVal, RegRole role) {
       /*resetValue=*/Value(), initialFor(rstVal), hw::InnerSymAttr()));
 }
 
+Value EmitContext::shellReg(Value in, Value rstVal, const StallShell &sh,
+                            RegRole role) {
+  return sh ? enabledReg(in, sh.chainEnable, rstVal, role)
+            : reg(in, rstVal, role);
+}
+
 Value EmitContext::stallHold(Value in, const StallShell &sh) {
   if (!sh)
     return in; // rigid: the address is just the live index
-  if (!inChainRun)
-    ledger.add(RegRole::Control, datapathWidth(in.getType()), 1,
-               /*reset=*/true, /*enable=*/true);
-  Value held = R(seq::CompRegClockEnabledOp::create(
-      b, loc, in.getType(), in, clk, sh.chainEnable, StringAttr(), rst,
-      konst(in.getType(), 0), /*initialValue=*/Value(), hw::InnerSymAttr()));
+  Value held =
+      enabledReg(in, sh.chainEnable, konst(in.getType(), 0), RegRole::Control);
   return mux(sh.chainEnable, in, held);
 }
 
@@ -688,7 +679,7 @@ ShiftChain EmitContext::shiftChain(Value in, unsigned depth,
     for (unsigned s = 1; s <= depth; ++s) {
       // An elastic shell advances every stage only while enabled, so all taps
       // freeze together; a rigid shell is a plain unconditional shift.
-      cur = sh ? enabledReg(cur, sh.chainEnable, rz, role) : reg(cur, rz, role);
+      cur = shellReg(cur, rz, sh, role);
       chain.stages.push_back(cur);
     }
   }
@@ -748,18 +739,15 @@ Value EmitContext::delayPulseCounted(Value pulse, unsigned n,
   Backedge countNext = bb.get(cntTy);
   const RegRole role = RegRole::Counted;
   Value cz = konst(cntTy, 0);
-  Value armed = sh ? enabledReg(armedNext, sh.chainEnable, f1, role)
-                   : reg(armedNext, f1, role);
-  Value count = sh ? enabledReg(countNext, sh.chainEnable, cz, role)
-                   : reg(countNext, cz, role);
+  Value armed = shellReg(armedNext, f1, sh, role);
+  Value count = shellReg(countNext, cz, sh, role);
   Value fire = andBits(armed, icmpEq(count, n - 1));
   armedNext.setValue(mux(pulse, t1, mux(fire, f1, armed)));
   countNext.setValue(mux(
       pulse, cz,
       mux(armed, R(comb::AddOp::create(b, loc, count, konst(cntTy, 1), false)),
           count)));
-  std::string tag =
-      sh.region ? "r" + std::to_string(*sh.region) : regionTag;
+  std::string tag = sh.region ? regionTagOf(*sh.region) : regionTag;
   if (!tag.empty()) {
     nameValue(armed, regionSignal(tag, "wait" + std::to_string(n)));
     nameValue(count, regionSignal(tag, "wait" + std::to_string(n) + "_c"));
@@ -782,13 +770,11 @@ Value EmitContext::delayValid(Value sig, unsigned n, const StallShell &sh) {
   if (chain.stages.empty())
     chain.stages.push_back(sig); // stage 0 = the source itself
   if (unsigned have = chain.depth(); have < n) {
-    std::string tag =
-        sh.region ? "r" + std::to_string(*sh.region) : regionTag;
+    std::string tag = sh.region ? regionTagOf(*sh.region) : regionTag;
     Value cur = chain.stages.back();
     llvm::SaveAndRestore charged(inChainRun, true);
     for (unsigned k = have + 1; k <= n; ++k) {
-      cur = sh ? enabledReg(cur, sh.chainEnable, f1, RegRole::Pulse)
-               : reg(cur, f1, RegRole::Pulse);
+      cur = shellReg(cur, f1, sh, RegRole::Pulse);
       // Label each stage with the cycle it is valid at, so a waveform reads
       // `r1_v3`: region 1, three cycles after issue. Named after the OWNING
       // region, so a chain another region extends keeps one name family.
@@ -817,18 +803,9 @@ Value EmitContext::icmpEqV(Value lhs, Value rhs) {
       comb::ICmpOp::create(b, loc, comb::ICmpPredicate::eq, lhs, rhs, false));
 }
 
-Value EmitContext::icmpUgeV(Value lhs, Value rhs) {
-  return R(
-      comb::ICmpOp::create(b, loc, comb::ICmpPredicate::uge, lhs, rhs, false));
-}
 Value EmitContext::icmpSgeV(Value lhs, Value rhs) {
   return R(
       comb::ICmpOp::create(b, loc, comb::ICmpPredicate::sge, lhs, rhs, false));
-}
-
-Value EmitContext::isNonZero(Value v) {
-  return R(comb::ICmpOp::create(b, loc, comb::ICmpPredicate::ne, v,
-                                konst(v.getType(), 0), false));
 }
 
 Value EmitContext::notBit(Value v) {

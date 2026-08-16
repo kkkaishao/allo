@@ -7,7 +7,6 @@
 #define ALLO_MICROARCH_REGLEDGER_H
 
 #include "llvm/ADT/StringRef.h"
-#include "llvm/Support/raw_ostream.h"
 
 #include <cassert>
 #include <map>
@@ -88,8 +87,6 @@ public:
   /// Flip-flops across every class.
   unsigned bits() const;
 
-  void dump(llvm::raw_ostream &os) const;
-
 private:
   std::map<std::tuple<RegRole, unsigned, unsigned, bool, bool>, unsigned> runs;
 };
@@ -125,8 +122,6 @@ public:
   }
 
   std::vector<MuxCone> classes() const;
-
-  void dump(llvm::raw_ostream &os) const;
 
 private:
   std::map<std::tuple<MuxRole, unsigned, unsigned>, unsigned> cones;

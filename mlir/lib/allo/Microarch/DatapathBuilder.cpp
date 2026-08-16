@@ -10,9 +10,9 @@
 
 #include "allo/IR/AlloOps.h"
 #include "allo/Scheduling/AddressModel.h" // splitAddress (strength reduction)
-#include "allo/Scheduling/LatencyModel.h" // composeSpan (the one composer)
-#include "allo/Scheduling/MemoryModel.h"  // characterize (storage shape)
-#include "allo/Scheduling/OperatorLibrary.h" // operatorIdentity, characterize
+#include "allo/Scheduling/LatencyModel.h" // siblingPredecessors (sibling order)
+#include "allo/Scheduling/MemoryModel.h"  // assignedBankOf (bank decisions)
+#include "allo/Scheduling/OperatorLibrary.h" // operatorIdentity
 #include "allo/Support/AliasAnalysis.h"      // resolveRoot (storage identity)
 #include "allo/Support/Logging.h"            // unmodelled-op diagnostic
 #include "allo/Translation/EmitterState.h" // nameFromLoc, sanitizeCppIdentifier
@@ -398,7 +398,7 @@ void DatapathBuilder::bindStream(Operation *op, RegionBlock &rb) {
   dp.streams[sid].accesses.push_back(acc);
   rb.streamAccesses.push_back({sid, aidx});
   // A get produces a token; a put consumes one, and its data driver is
-  // resolved in deriveInterconnect like a store's.
+  // resolved in resolveStreamOperands like a store's.
   if (get)
     producerOf[get.getResult()] = Source{Source::Kind::Stream, sid, aidx};
 }
@@ -432,6 +432,7 @@ void DatapathBuilder::bindMemory(Operation *op, Value memref, RegionBlock &rb) {
   std::optional<unsigned> assigned =
       m.numBanks == 1 ? std::optional<unsigned>(0) : assignedBankOf(op);
   (m.layout.skew() ? acc.slot : acc.staticBank) = assigned;
+#ifndef NDEBUG
   // Skipped under a skew, where the map names a bank only at run time and there
   // is nothing to compare. Otherwise `bankAddress` builds the offset within
   // this bank out of `addrMap`, so where the map still resolves a bank on its
@@ -444,8 +445,8 @@ void DatapathBuilder::bindMemory(Operation *op, Value memref, RegionBlock &rb) {
             *derived == static_cast<int64_t>(*acc.staticBank)) &&
            "the assigned bank is not the one this access's address map "
            "reaches");
-    (void)derived;
   }
+#endif
   m.accesses.push_back(std::move(acc));
   rb.memAccesses.push_back({mid, aidx});
   if (!isWrite)
@@ -519,9 +520,9 @@ void DatapathBuilder::bindResource(Operation *op, RegionBlock &rb) {
   dp.infeasible = true;
 }
 
-void DatapathBuilder::recordRegionResults(ArrayRef<Operation *> regionOps) {
-  for (Operation *regionOp : regionOps) {
-    RegionBlock &rb = dp.regions[regionIdxOf.lookup(regionOp)];
+void DatapathBuilder::recordRegionResults() {
+  for (RegionBlock &rb : dp.regions) {
+    Operation *regionOp = rb.op;
 
     // A guard yields from its two ARMS, not from one body terminator, and its
     // predicate is an explicit operand rather than a body value.
@@ -612,6 +613,8 @@ void DatapathBuilder::recordCallDeps() {
           }
         cu.predecessors.push_back({p, viaResult});
       };
+      SmallVector<MemId, 4> cuMems = memsOf(cu, std::nullopt);
+      SmallVector<MemId, 4> cuWrites = memsOf(cu, true);
       for (unsigned j = 0; j < i; ++j) {
         const CallUnit &p = dp.calls[rb.callUnits[j]];
         // Hazard DIRECTION (RAW / WAW / WAR) is the ordering in both
@@ -619,8 +622,8 @@ void DatapathBuilder::recordCallDeps() {
         // a port each (`portGraph`). A CONCURRENT container orders every such
         // pair the channels do not; a SCHEDULED one only where the placement
         // or a missing contract leaves the earlier child's completion ahead.
-        bool directed = shares(memsOf(p, true), memsOf(cu, std::nullopt)) ||
-                        shares(memsOf(cu, true), memsOf(p, false));
+        bool directed = shares(memsOf(p, true), cuMems) ||
+                        shares(cuWrites, memsOf(p, false));
         bool hazard = concurrent
                           ? directed && !channelled(p, cu)
                           : directed && (p.start < cu.start || !p.latency);
@@ -730,7 +733,7 @@ void DatapathBuilder::deriveCounterTypes() {
       rb.counterType = IntegerType::get(func.getContext(), counterWidth(rb));
 }
 
-void DatapathBuilder::recordRegionBounds(ArrayRef<Operation *> regionOps) {
+void DatapathBuilder::recordRegionBounds() {
   // A runtime induction bound (ub / lb / step) crosses the same F->G channel a
   // data survivor does; an unresolvable one is reported, not silently run.
   auto recordBound = [&](Operation *pipe, Value b, Source &into) {
@@ -744,12 +747,11 @@ void DatapathBuilder::recordRegionBounds(ArrayRef<Operation *> regionOps) {
       dp.infeasible = true;
     }
   };
-  for (Operation *op : regionOps)
-    if (auto pipe = dyn_cast<dcp::DCPathPipelineOp>(op)) {
-      RegionBlock &rb = dp.regions[regionIdxOf.lookup(op)];
-      recordBound(op, pipe.getDynamicBound(), rb.ubSource);
-      recordBound(op, pipe.getLbBound(), rb.lbSource);
-      recordBound(op, pipe.getStepBound(), rb.stepSource);
+  for (RegionBlock &rb : dp.regions)
+    if (auto pipe = dyn_cast<dcp::DCPathPipelineOp>(rb.op)) {
+      recordBound(rb.op, pipe.getDynamicBound(), rb.ubSource);
+      recordBound(rb.op, pipe.getLbBound(), rb.lbSource);
+      recordBound(rb.op, pipe.getStepBound(), rb.stepSource);
       // A compile-time bound ties in as a literal cell. The ub is derivable
       // only when lb and step are literal too; otherwise `tripCount` carries
       // `lb + trip*step` to `terminatorOf`, since no cell can hold arithmetic.
@@ -827,78 +829,80 @@ Resolved DatapathBuilder::resolveOperand(Value v, Operation *consumer,
       dp.infeasible = true;
       depth = 0;
     }
-    return {base, key, static_cast<unsigned>(depth), ready, true};
+    return {base, key, static_cast<unsigned>(depth), ready};
   };
 
   // The one operand that does not read `v` at all: an unlatched iter_arg of the
   // consumer's own region is the loop recurrence, so the edge runs back to
   // whatever the loop assigns it, `distance` iterations away.
-  if (auto barg = dyn_cast<BlockArgument>(v))
-    if (auto pipe =
-            dyn_cast<dcp::DCPathPipelineOp>(barg.getOwner()->getParentOp());
-        pipe == regionOp && barg.getArgNumber() >= 1 &&
-        !dp.regions[regionIdxOf.lookup(pipe)].container) {
-      unsigned iterArg = barg.getArgNumber() - 1;
-      SmallVector<unsigned, 2> chain;
-      Value next = traceIterArgSource(pipe, iterArg, chain);
-      unsigned distance = chain.size();
-      Source base = next ? resolveValue(next) : Source{};
-      Operation *def = next ? next.getDefiningOp() : nullptr;
-      Resolved r;
-      // A held `next` never moves while this loop runs, so from iteration
-      // `distance` on the recurrence reads it unchanged, off a wire. Anything
-      // else must be produced by an op this region schedules, since only then
-      // is there an iteration of it to reach back to.
-      if (isHeld(base))
-        r = {base, Value(), 0, 0, true};
-      else if (base && def && def->getParentOp() == regionOp) {
-        r = edge(base, next, readyCycleOf(def), distance);
-        // The one edge whose delay counts cycles between two iterations, so
-        // this region may not defer an issue on its own.
-        dp.regions[regionIdxOf.lookup(regionOp)].cycleIndexedState = true;
-      } else {
-        // Anchored on the loop, where the faulty carried assignment is, rather
-        // than on the consumer `validateDatapath` would anchor on.
-        unsupported(Stage::Emit, Code::CrossRegionHandOff, pipe)
-            << "Value " << iterArg
-            << " carried by this loop is assigned from a value the loop's own "
-               "datapath cannot read; such a cross-region value hand-off is "
-               "not lowered yet";
-        dp.infeasible = true;
-        return {};
-      }
-      // The emitter re-injects the identities on this consumer input, since the
-      // recurrence register may sit elsewhere in the cycle. One per iteration
-      // below `distance`: a chained carry shifts one iter_arg into the next, so
-      // iteration n reads the init of the stage n steps down the chain, which
-      // is what `chain` enumerates.
-      for (unsigned stage : chain)
-        r.inits.push_back(resolveValue(pipe.getInits()[stage]));
-      // An unresolvable init leaves the accumulator to free-run from reset.
-      // Only this site knows an init was expected; None is normal elsewhere.
-      if (!llvm::all_of(r.inits, [](Source s) { return bool(s); })) {
-        unsupported(Stage::Emit, Code::CrossRegionHandOff, pipe)
-            << "Loop-carried accumulator has an initial value this region "
-               "cannot read; such a cross-region value hand-off is not "
-               "lowered yet";
-        dp.infeasible = true;
-        r.inits.clear();
-      }
-      return r;
+  unsigned ridx = regionIdxOf.lookup(regionOp);
+  auto barg = dyn_cast<BlockArgument>(v);
+  auto pipe =
+      barg ? dyn_cast<dcp::DCPathPipelineOp>(barg.getOwner()->getParentOp())
+           : dcp::DCPathPipelineOp();
+  if (barg && pipe == regionOp && barg.getArgNumber() >= 1 &&
+      !dp.regions[ridx].container) {
+    unsigned iterArg = barg.getArgNumber() - 1;
+    SmallVector<unsigned, 2> chain;
+    Value next = traceIterArgSource(pipe, iterArg, chain);
+    unsigned distance = chain.size();
+    Source base = next ? resolveValue(next) : Source{};
+    Operation *def = next ? next.getDefiningOp() : nullptr;
+    Resolved r;
+    // A held `next` never moves while this loop runs, so from iteration
+    // `distance` on the recurrence reads it unchanged, off a wire. Anything
+    // else must be produced by an op this region schedules, since only then
+    // is there an iteration of it to reach back to.
+    if (isHeld(base))
+      r = {base, Value(), 0, 0};
+    else if (base && def && def->getParentOp() == regionOp) {
+      r = edge(base, next, readyCycleOf(def), distance);
+      // The one edge whose delay counts cycles between two iterations, so
+      // this region may not defer an issue on its own.
+      dp.regions[ridx].cycleIndexedState = true;
+    } else {
+      // Anchored on the loop, where the faulty carried assignment is, rather
+      // than on the consumer `validateDatapath` would anchor on.
+      unsupported(Stage::Emit, Code::CrossRegionHandOff, pipe)
+          << "Value " << iterArg
+          << " carried by this loop is assigned from a value the loop's own "
+             "datapath cannot read; such a cross-region value hand-off is "
+             "not lowered yet";
+      dp.infeasible = true;
+      return {};
     }
+    // The emitter re-injects the identities on this consumer input, since the
+    // recurrence register may sit elsewhere in the cycle. One per iteration
+    // below `distance`: a chained carry shifts one iter_arg into the next, so
+    // iteration n reads the init of the stage n steps down the chain, which
+    // is what `chain` enumerates.
+    for (unsigned stage : chain)
+      r.inits.push_back(resolveValue(pipe.getInits()[stage]));
+    // An unresolvable init leaves the accumulator to free-run from reset.
+    // Only this site knows an init was expected; None is normal elsewhere.
+    if (!llvm::all_of(r.inits, [](Source s) { return bool(s); })) {
+      unsupported(Stage::Emit, Code::CrossRegionHandOff, pipe)
+          << "Loop-carried accumulator has an initial value this region "
+             "cannot read; such a cross-region value hand-off is not "
+             "lowered yet";
+      dp.infeasible = true;
+      r.inits.clear();
+    }
+    return r;
+  }
 
   Source base = resolveValue(v);
   if (!base)
     return {};
   if (isHeld(base))
-    return {base, Value(), 0, 0, true};
+    return {base, Value(), 0, 0};
   // The region's own counter presents its index at cycle 0 of the iteration,
   // so a consumer scheduled at tY delays it that far. An enclosing region's
   // counter advances only between passes, so a nested consumer reads it live;
   // an address slot keeps the edge (see the declaration).
   if (base.kind == Source::Kind::Counter) {
-    if (!addressSlot && base.id != regionIdxOf.lookup(regionOp))
-      return {base, Value(), 0, 0, true};
+    if (!addressSlot && base.id != ridx)
+      return {base, Value(), 0, 0};
     return edge(base, v, /*ready=*/0, /*distance=*/0);
   }
   // A scheduled producer: readable only from the region it issues in, and only
@@ -920,7 +924,8 @@ void DatapathBuilder::resolveEdges() {
     u.inputInits.resize(n); // parallel; filled for recurrence inputs below
   }
   resolveUnitInputs();
-  resolveAccessOperands();
+  resolveMemoryOperands();
+  resolveStreamOperands();
   // `edges` keys are pointers into these containers; a pass that grows one
   // after this point dangles the whole edge table.
   unitsBase = dp.units.data();
@@ -928,14 +933,9 @@ void DatapathBuilder::resolveEdges() {
   streamsBase = dp.streams.data();
 }
 
-void DatapathBuilder::realizeDelays() {
-  planAddressGenerators();
-  insertRegisters();
-}
-
 void DatapathBuilder::recordEdge(const Resolved &r, Source &slot,
                                  unsigned regionIdx) {
-  if (!r.ok)
+  if (!r.base)
     return;
   if (r.depth == 0) {
     slot = r.base;
@@ -1275,26 +1275,29 @@ void DatapathBuilder::planAddressGenerators() {
       // register is. Both cones run beside each other, so the delay is the max.
       assert(acc.inDelay >= acc.portDelay &&
              "an access's priced setup is its port's delay plus its address");
+      double priced = acc.inDelay - acc.portDelay;
       acc.addrSetup =
           acc.addrDelay
               ? std::max(postRegisterDelay(acc.offset, delays, e.width),
                          postRegisterDelay(acc.bank, delays,
                                            AddressDelays::refWidth))
-              : acc.inDelay - acc.portDelay;
+              : priced;
       // The pricing is optimistic on the reduction gap: the scheduler split
       // over the IR loops, while this split also needs constant bounds and one
       // shared delay. A cone built longer than priced is that gap
       // materializing; the post-cut walk still measures the real path.
-      double priced = acc.inDelay - acc.portDelay;
-      double built =
-          std::max(builtConeDelay(acc.offset, delays, e.width),
-                   builtConeDelay(acc.bank, delays, AddressDelays::refWidth));
-      if (built > priced + 0.011)
-        debug(Stage::Emit, acc.op)
-            << "the address cone built here is " << llvm::format("%.2f", built)
-            << " ns against the " << llvm::format("%.2f", priced)
-            << " ns the schedule priced; a term the pricing reduced stayed in "
-               "the residual";
+      if (logging::detail::enabled(Level::Debug)) {
+        double built =
+            std::max(builtConeDelay(acc.offset, delays, e.width),
+                     builtConeDelay(acc.bank, delays, AddressDelays::refWidth));
+        if (built > priced + 0.011)
+          debug(Stage::Emit, acc.op)
+              << "the address cone built here is "
+              << llvm::format("%.2f", built) << " ns against the "
+              << llvm::format("%.2f", priced)
+              << " ns the schedule priced; a term the pricing reduced stayed "
+                 "in the residual";
+      }
       // An operand no residual is left reading has no consumer: its slot stays
       // empty and the delay it was owed is withdrawn before a chain carries it.
       llvm::BitVector read = residualReads(acc);
@@ -1308,7 +1311,7 @@ void DatapathBuilder::planAddressGenerators() {
   }
 }
 
-void DatapathBuilder::resolveAccessOperands() {
+void DatapathBuilder::resolveMemoryOperands() {
   for (MemUnit &m : dp.mems)
     for (MemUnit::Access &acc : m.accesses) {
       unsigned ridx = regionIdxOf.lookup(acc.op->getParentOp());
@@ -1326,7 +1329,9 @@ void DatapathBuilder::resolveAccessOperands() {
                           acc.data, ridx);
       }
     }
+}
 
+void DatapathBuilder::resolveStreamOperands() {
   // Re-stamp an access's schedule cycle. `start` is the single source both the
   // datapath and `dcpStart` read, so the attribute and the cached stage move
   // together.
@@ -1361,7 +1366,7 @@ void DatapathBuilder::resolveAccessOperands() {
         // A held enclosing counter resolves at depth 0 but is frozen with its
         // container while this region is back-pressured, so it is no
         // transient din.
-        if (r.ok && r.depth == 0 && dcpStart(acc.op) >= 1 &&
+        if (r.base && r.depth == 0 && dcpStart(acc.op) >= 1 &&
             r.base.kind != Source::Kind::Counter && isTransientDin(token)) {
           restamp(acc, dcpStart(acc.op) + 1);
           ++shift;
@@ -1374,15 +1379,14 @@ void DatapathBuilder::resolveAccessOperands() {
         }
         recordCarriedEdge(r, token, acc.op, acc.data, ridx);
       }
-      auto pred = isa<StreamGetOp>(acc.op)
-                      ? cast<StreamGetOp>(acc.op).getPred()
-                      : cast<StreamPutOp>(acc.op).getPred();
+      auto pred = acc.isPut ? cast<StreamPutOp>(acc.op).getPred()
+                            : cast<StreamGetOp>(acc.op).getPred();
       if (pred) {
         // Unlike `acc.data` (a None Source trips an assert), a None `acc.when`
         // reads as "unconditional", so an unresolved predicate would silently
         // turn a masked get/put into an every-cycle one.
         auto pr = resolveOperand(pred, acc.op, ii);
-        if (!pr.ok) {
+        if (!pr.base) {
           unsupported(Stage::Emit, Code::CrossRegionHandOff, acc.op)
               << "Predicate of this stream access is produced by a value the "
                  "region cannot read; such a cross-region value hand-off is "
@@ -1453,11 +1457,8 @@ void DatapathBuilder::recordDrainStages() {
     for (AccRef r : rb.memAccesses) {
       const MemUnit &m = dp.mems[r.id];
       const MemUnit::Access &acc = m.accesses[r.idx];
-      assert((!acc.isWrite || m.writeLatency >= 1) &&
-             "a zero-cycle write has no commit edge for the done latch to "
-             "ride; `assertModelInvariants` holds the device row to that");
       if (acc.isWrite)
-        drain = std::max(drain, acc.stage + m.writeLatency - 1);
+        drain = std::max(drain, storeDrainCycle(m, acc));
     }
     for (AccRef r : rb.streamAccesses) {
       const StreamChannel::Access &acc = dp.streams[r.id].accesses[r.idx];
@@ -1520,8 +1521,10 @@ void DatapathBuilder::insertRegisters() {
     if (!e.reduced)
       *slot = Source{Source::Kind::Reg, keyToReg[e.key], e.depth};
 
-  // Materialize sharing muxes: the sources are final once the registers are
-  // built and the pending slots patched. One shared driver needs no mux.
+  materializeMuxes();
+}
+
+void DatapathBuilder::materializeMuxes() {
   auto sameSource = [](const Source &a, const Source &b) {
     return a.kind == b.kind && a.id == b.id && a.outPort == b.outPort;
   };
@@ -1611,6 +1614,29 @@ void DatapathBuilder::allocateUnits(ArrayRef<SmallVector<UnitId, 2>> groups) {
     }
 }
 
+// The built relation against `siblingPredecessors`: each edge the latency model
+// has beyond the built model is a pair the span serializes and the hardware
+// overlaps.
+static void diffSiblingDeps(const Datapath &dp) {
+  SmallVector<RegionId> topIds;
+  SmallVector<SmallVector<Operation *>> nodeOps;
+  for (const RegionBlock &rb : dp.regions) {
+    if (rb.parent)
+      continue;
+    topIds.push_back(rb.id);
+    nodeOps.push_back({rb.op});
+  }
+  auto modelled = siblingPredecessors(nodeOps);
+  for (auto [i, rid] : llvm::enumerate(topIds))
+    for (unsigned p : modelled[i])
+      if (!llvm::is_contained(dp.regions[rid].predecessors, topIds[p]))
+        debug(Stage::Emit, dp.regions[rid].op)
+            << "Latency model orders region " << topIds[p] << " before region "
+            << rid
+            << ", the built model does not: the composed span pays for "
+               "a hand-off the hardware overlaps";
+}
+
 // Composition predecessors of each top-level region (`rb.predecessors`): the
 // earlier top-level siblings it must start after, all attributed to the
 // top-level ancestor. Per-region binding keeps functional units from
@@ -1623,23 +1649,16 @@ void DatapathBuilder::allocateUnits(ArrayRef<SmallVector<UnitId, 2>> groups) {
 // agree: the composed span is published as an exact contract, so an edge only
 // one side has is either a span the hardware beats or hardware the span never
 // paid for.
-void DatapathBuilder::recordSiblingDeps(ArrayRef<Operation *> regionOps) {
-  // Top-level ancestor of a region (walk the container chain to the root).
-  auto topOf = [&](RegionId r) {
-    while (dp.regions[r].parent)
-      r = *dp.regions[r].parent;
-    return r;
-  };
-
+void DatapathBuilder::recordSiblingDeps() {
   // Every op inside a top-level region maps to that region's id, a nested child
   // folding into it. A value defined outside any region has no entry.
   DenseMap<Operation *, RegionId> opTop;
-  for (Operation *regionOp : regionOps) {
-    RegionId rid = regionIdxOf.lookup(regionOp);
-    if (dp.regions[rid].parent)
+  for (const RegionBlock &rb : dp.regions) {
+    if (rb.parent)
       continue; // walk only from a top-level root
-    opTop[regionOp] = rid;
-    regionOp->walk([&](Operation *o) { opTop[o] = rid; });
+    RegionId rid = rb.id;
+    opTop[rb.op] = rid;
+    rb.op->walk([&](Operation *o) { opTop[o] = rid; });
   }
 
   auto addPred = [&](RegionId producer, RegionId consumer) {
@@ -1647,21 +1666,6 @@ void DatapathBuilder::recordSiblingDeps(ArrayRef<Operation *> regionOps) {
     auto &preds = dp.regions[consumer].predecessors;
     if (!llvm::is_contained(preds, producer))
       preds.push_back(producer);
-  };
-
-  // One shared resource orders the top-level regions that touch it, chained in
-  // program order so the rest follows transitively.
-  SmallVector<RegionId, 4> tops;
-  auto addSharer = [&](RegionId region) {
-    RegionId t = topOf(region);
-    if (!llvm::is_contained(tops, t))
-      tops.push_back(t);
-  };
-  auto chainSharers = [&]() {
-    llvm::sort(tops);
-    for (unsigned j = 1; j < tops.size(); ++j)
-      addPred(tops[j - 1], tops[j]);
-    tops.clear();
   };
 
   // (1) A shared memref, ordered by its hazard pairs (`hazardEdges`, at bank
@@ -1675,7 +1679,7 @@ void DatapathBuilder::recordSiblingDeps(ArrayRef<Operation *> regionOps) {
   for (const MemUnit &m : dp.mems) {
     SmallVector<MemTouch, 8> touch;
     auto note = [&](RegionId region, bool writes, std::optional<int64_t> bank) {
-      RegionId t = topOf(region);
+      RegionId t = dp.topRegionOf(region);
       for (MemTouch &e : touch)
         if (e.node == t && e.bank == bank) {
           e.writes |= writes;
@@ -1707,9 +1711,17 @@ void DatapathBuilder::recordSiblingDeps(ArrayRef<Operation *> regionOps) {
   // order, so two regions touching it must run in sequence, else they drive it
   // together and (for two gets) pop the same token twice.
   for (const StreamChannel &s : dp.streams) {
-    for (const StreamChannel::Access &a : s.accesses)
-      addSharer(a.region);
-    chainSharers();
+    // The top-level regions touching this channel, chained in program order so
+    // the rest follows transitively.
+    SmallVector<RegionId, 4> tops;
+    for (const StreamChannel::Access &a : s.accesses) {
+      RegionId t = dp.topRegionOf(a.region);
+      if (!llvm::is_contained(tops, t))
+        tops.push_back(t);
+    }
+    llvm::sort(tops);
+    for (unsigned j = 1; j < tops.size(); ++j)
+      addPred(tops[j - 1], tops[j]);
   }
 
   // (3) Cross-region SSA edges: an op in one top-level region uses a value
@@ -1737,28 +1749,8 @@ void DatapathBuilder::recordSiblingDeps(ArrayRef<Operation *> regionOps) {
     }
   });
 
-  // The two relations, diffed: each edge `siblingPredecessors` has beyond this
-  // one is a pair the span serializes and the hardware overlaps.
-  if (!logging::detail::enabled(Level::Debug))
-    return;
-  SmallVector<RegionId> topIds;
-  SmallVector<SmallVector<Operation *>> nodeOps;
-  for (Operation *regionOp : regionOps) {
-    RegionId rid = regionIdxOf.lookup(regionOp);
-    if (dp.regions[rid].parent)
-      continue;
-    topIds.push_back(rid);
-    nodeOps.push_back({regionOp});
-  }
-  auto modelled = siblingPredecessors(nodeOps);
-  for (auto [i, rid] : llvm::enumerate(topIds))
-    for (unsigned p : modelled[i])
-      if (!llvm::is_contained(dp.regions[rid].predecessors, topIds[p]))
-        debug(Stage::Emit, dp.regions[rid].op)
-            << "Latency model orders region " << topIds[p] << " before region "
-            << rid
-            << ", the built model does not: the composed span pays for "
-               "a hand-off the hardware overlaps";
+  if (logging::detail::enabled(Level::Debug))
+    diffSiblingDeps(dp);
 }
 
 //===----------------------------------------------------------------------===//
@@ -1814,11 +1806,11 @@ void DatapathBuilder::build() {
             isDeclarationOp(&op)) &&
            "an operation outside every region reached the datapath");
 #endif
-  recordRegionResults(regionOps); // per-region results/recurrence + predicate
-  recordCallScalars();            // each dcp.instance's scalar operand drivers
-  recordCallDeps();               // composition DAG on the instance substrate
-  recordRegionBounds(regionOps);  // induction bounds, at that width
-  recordResults();                // scalar func-result output ports
+  recordRegionResults(); // per-region results/recurrence + predicate
+  recordCallScalars();   // each dcp.instance's scalar operand drivers
+  recordCallDeps();      // composition DAG on the instance substrate
+  recordRegionBounds();  // induction bounds, at that width
+  recordResults();       // scalar func-result output ports
   // What every input slot reads and how late it needs it, then what carries it
   // there: scaled counters, delay chains, muxes.
   resolveEdges();
@@ -1826,7 +1818,7 @@ void DatapathBuilder::build() {
   // The top-level composition DAG, before the ports: `portGraph` reads two
   // accesses under different top-level ancestors as unable to issue together,
   // and this pass is what makes that true.
-  recordSiblingDeps(regionOps);
+  recordSiblingDeps();
   // Ports before the delays, and the two are independent: an access holds a
   // port once it knows which bank it commits to and which skew lane it holds,
   // both settled by the region walk, and no pass here reads a Register or a
@@ -1836,10 +1828,12 @@ void DatapathBuilder::build() {
   bindMemoryPorts();
   enumerateBoundaryPorts();
   measurePorts(); // what the ports cost against what the schedule asks
-  // The delays the edges owe. Last of the derivations: it withdraws the edges
-  // the address reduction folded away, so nothing may resolve a Source after
-  // it.
-  realizeDelays();
+  // The delays the edges owe: the address reduction first, since a term it
+  // folds into a scaled counter withdraws its edge, then the chains over what
+  // is left, then the muxes that pick between them. Last of the derivations, so
+  // no pass may resolve a Source after it.
+  planAddressGenerators();
+  insertRegisters();
   verifyBinding(dp); // MRT legality: no unit shared by conflicting ops
 }
 
