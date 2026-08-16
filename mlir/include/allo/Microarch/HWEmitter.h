@@ -105,9 +105,9 @@ struct DatapathFeedback {
   // against `RegionBlock::drainStage`, the same number decided on the model.
   unsigned storeDrain = 0;
   // A CallUnit region's completion. For a CallNode (loop-over-call) region it
-  // is the child's per-invocation completion PULSE, which paces the counter;
+  // is the child's per-invocation completion pulse, which paces the counter;
   // for a scheduled or concurrent composition it is the joined pass-scoped
-  // done LEVEL, which IS (part of) the region's completion. Null for a
+  // done level, which forms part of the region's completion. Null for a
   // call-free region.
   Value callDone;
 };
@@ -320,9 +320,9 @@ struct DatapathEmitter {
     circt::Backedge addr;
     /// One arm per holder: the regions plus the mastering children.
     SmallVector<SinkArm, 1> arms;
-    /// The one region holding the port, when a region (not a child) does: the
-    /// finalize reads its RESOLVED shell off `shellOf`, since the chainEnable
-    /// at contribution time is still a promise.
+    /// The one region holding the port, when a region (not a child) does. The
+    /// finalize reads its resolved shell off `shellOf`, the chainEnable at
+    /// contribution time being still a promise.
     std::optional<unsigned> ownerRegion;
   };
   /// A MapVector, not a DenseMap: the finalize iterates it to drive the ports,
@@ -331,10 +331,10 @@ struct DatapathEmitter {
       sharedReads;
 
   /// Stores to an external array's port group, keyed by the group's base name
-  /// (a StringRef into the immutable model's `portBase`/`topBase`) so a child
-  /// mastering the same (bank, port) colour joins the accesses' arms. A
-  /// MapVector, not a DenseMap: `finalizeBoundaryWritePorts` iterates it to
-  /// drive the ports, and the emitted module must not depend on a hash order.
+  /// (a StringRef into the model's `portBase`/`topBase`) so a child mastering
+  /// the same (bank, port) colour joins the accesses' arms. A MapVector, not a
+  /// DenseMap: `finalizeBoundaryWritePorts` iterates it to drive the ports, and
+  /// the emitted module must not depend on a hash order.
   llvm::MapVector<llvm::StringRef, SmallVector<SinkArm, 2>> boundaryWrites;
 
   /// The same for a boundary read port group's address output. A group several
@@ -458,9 +458,9 @@ struct DatapathEmitter {
   /// registers a PROMISE (two backedges) before F and G emit against it, then
   /// re-registers the derived shell once `deriveStallShell` resolves them.
   void setShell(unsigned region, const StallShell &sh) { shellOf[region] = sh; }
-  /// Region \p region's stall shell; rigid for an unregistered region. Always
-  /// stamped with the owner and its pass discipline, the model-side facts a
-  /// primitive delaying this region's pulses reads off the shell.
+  /// Region \p region's stall shell; rigid for an unregistered region. Stamped
+  /// with the owning region and its pass discipline, which a primitive
+  /// delaying this region's pulses reads off the shell.
   StallShell shellFor(unsigned region) const {
     StallShell sh = shellOf.lookup(region);
     sh.region = region;
@@ -490,8 +490,7 @@ struct DatapathEmitter {
   /// One read port of \p m per bank on lane \p port, rather than one per bank
   /// per access. The lane's accesses (\p idxs, indexing `m.accesses`) hold
   /// distinct slots, so bank k takes the offset of whichever of them reaches it
-  /// and hands its datum back to that one: F accesses over F banks at one port
-  /// each, where a crossbar would take a port on every bank for every access.
+  /// and hands its datum back to that one.
   void emitLaneReads(const uarch::MemUnit &m, unsigned port,
                      ArrayRef<unsigned> idxs, const StallShell &sh);
   /// The address one region's accesses on a port present: each drives it on its
@@ -536,9 +535,9 @@ struct DatapathEmitter {
   /// One write port of \p m per bank on one lane. Bank k takes the address and
   /// data of whichever of the lane's accesses (\p idxs, indexing `m.accesses`)
   /// reaches it, and its write-enable is the OR of their demuxed enables, so an
-  /// access commits on its own bank and nowhere else. The OR has at most one
-  /// live arm, as `laneSelect` does. \p commit is called only where a store
-  /// exists, the pulse being built lazily.
+  /// access commits on its own bank and nowhere else. At most one arm of that
+  /// OR is live. \p commit builds the store pulse lazily, called only where a
+  /// store exists.
   void emitLaneWrites(const uarch::MemUnit &m, ArrayRef<unsigned> idxs,
                       llvm::function_ref<Value()> commit, const StallShell &sh);
 
@@ -587,8 +586,8 @@ struct DatapathEmitter {
   };
   /// The init-prepend shim in front of consumer \p k of seeded channel \p s,
   /// one of \p nSinks. `rem` counts the initial tokens still to serve,
-  /// nInit .. 1; the datum is picked by the running index (idx = nInit - rem),
-  /// a one-hot select since `rem` equals exactly one value while it serves.
+  /// nInit down to 1, and the datum is a one-hot select on the running index
+  /// idx = nInit - rem.
   ShimEnd initPrependShim(const uarch::StreamChannel &s, unsigned k,
                           unsigned nSinks, Value out, Value notEmpty,
                           Value cReady, Value rdEn);
@@ -639,8 +638,8 @@ struct DatapathEmitter {
   void finalizeSharedReadPorts();
   /// Whether read port \p port of \p m's bank \p bank is held by more than one
   /// accessor: a region whose own accesses reach it, or a child that masters
-  /// it. Counts holders rather than regions, the two kinds saying they are
-  /// driving in different ways.
+  /// it. Counts holders rather than regions, the two kinds signalling that they
+  /// drive in different ways.
   bool portHasSeveralHolders(const uarch::MemUnit &m, unsigned bank,
                              unsigned port) const;
   /// Drive each merged boundary write port group from the stores coloured onto

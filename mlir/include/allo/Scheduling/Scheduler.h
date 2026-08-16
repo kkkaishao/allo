@@ -115,11 +115,11 @@ public:
     /// LUT6 absorbs three source/select pairs), so the total is not monotone
     /// in the count and no linear term can stand for it.
     llvm::SmallVector<int64_t> price;
-    /// The DELAY of the same multiplexer at `n` instances, in ns, indexed like
-    /// `price`: the select cone in front of the fullest instance (`muxCone`).
-    /// Zero at the ceiling, where nothing shares. A solve charges it on every
-    /// linked operation's sub-cycle start, so a count only shrinks where the
-    /// cone fits the slack the same schedule leaves.
+    /// The delay of the select cone in front of the fullest instance at `n`
+    /// instances, in ns, indexed like `price`. Zero at the ceiling, where
+    /// nothing shares. A solve charges it on every linked operation's sub-cycle
+    /// start, so a count only shrinks where the cone fits the slack the same
+    /// schedule leaves.
     llvm::SmallVector<double> headroomNs;
   };
 
@@ -341,7 +341,7 @@ inline int64_t drainOf(circt::scheduling::Problem &problem,
   return drain;
 }
 
-/// One value a region spends a DELAY REGISTER chain on. The chain is as long as
+/// One value a region spends a delay register chain on. The chain is as long as
 /// its deepest reader needs, and costs what the device charges for a chain of
 /// that many stages at this width:
 ///
@@ -351,11 +351,11 @@ inline int64_t drainOf(circt::scheduling::Problem &problem,
 /// ```
 ///
 /// No register is shared between two values (`insertRegister` keys one chain
-/// per value and region), which makes this a SUM over values that is linear in
+/// per value and region), which makes this a sum over values that is linear in
 /// the schedule rather than a MAXLIVE coupled to an allocation, and so a term
 /// an objective can carry directly.
 ///
-/// `stages(v)` is `depth(v)`, except at II > 1 where the emitter FOLDS the
+/// `stages(v)` is `depth(v)`, except at II > 1 where the emitter folds the
 /// chain onto the region's phase: one register holds a tap for a whole
 /// interval, so `depth` cycles of delay are built from `ceil(depth / ii)` of
 /// them (`EmitContext::foldedChain`).
@@ -438,14 +438,12 @@ inline bool usesExactScheduler(SchedulerKind kind) {
 
 /// Defaults for one solve. The budget is in OR-Tools deterministic time units
 /// (roughly a core-second) and is charged per solve, so a cyclic search spends
-/// it again at every initiation interval it probes. Determinism comes from the
-/// fixed seed plus the interleaved portfolio `solverParameters` selects above
-/// one worker, not from being single-threaded; a solve that exhausts its budget
-/// can still differ run to run.
-///
-/// The worker count is not only a speed knob: the same deterministic budget
-/// buys more search, so a budget-limited region can settle on a different
-/// schedule than it does at one worker.
+/// it again at every initiation interval it probes. Reproducibility comes from
+/// the fixed seed plus the interleaved portfolio `solverParameters` selects
+/// above one worker; a solve that exhausts its budget can still differ run to
+/// run. The worker count is not only a speed knob: the same deterministic
+/// budget buys more search, so a budget-limited region can settle on a
+/// different schedule at a different worker count.
 inline constexpr double kDefaultSolveBudget = 30.0;
 inline constexpr int kDefaultSolveWorkers = 8;
 inline constexpr int kDefaultSolveSeed = 0;
@@ -477,7 +475,7 @@ std::optional<SchedulerKind> parseSchedulerKind(StringRef name);
 /// Numeric throughout, so the emitter hands one over without this header
 /// knowing its model. A shared instance grows one select per operand port,
 /// with one arm per member plus each member's re-injected recurrence
-/// identities, so tables are per port and indexed by ARMS; a select of one
+/// identities, so tables are per port and indexed by arms; a select of one
 /// arm is a wire, so indices 0 and 1 are zero.
 struct SharingProblem {
   struct Port {
@@ -501,9 +499,9 @@ struct SharingProblem {
     /// Per port: select arms past its own data arm, one per recurrence
     /// identity the operation re-injects there.
     llvm::SmallVector<unsigned, 2> initArms;
-    /// Per port: nonzero key = the operand is one HELD value (a wire at any
-    /// issue cycle), equal keys naming equal values. A port whose members all
-    /// carry one key collapses to that wire and builds no select; 0 marks a
+    /// Per port: a nonzero key marks a held operand (a wire at any issue
+    /// cycle), equal keys naming equal values. A port whose members all carry
+    /// one key collapses to that wire and builds no select; 0 marks a
     /// scheduled or carried operand, which never collapses.
     llvm::SmallVector<unsigned, 2> drivers;
   };
@@ -519,9 +517,9 @@ struct SharingProblem {
 /// modelled area, instances plus multiplexers with fewer folds breaking ties,
 /// holding every unit's input cone within `slackPicos` under the recursion the
 /// emit gate walks (`AddedDelay`): a bin's select plus everything a same-cycle
-/// producer's bin adds. \p hint seeds the search, so the greedy plan is the
-/// incumbent to beat. \p anchor is where diagnostics land. Returns nullopt
-/// when the budget expires with nothing usable.
+/// producer's bin adds. \p hint seeds the search as an incumbent. \p anchor is
+/// where diagnostics land. Returns nullopt when the budget expires with
+/// nothing usable.
 std::optional<SmallVector<unsigned>> solveSharing(SharingProblem &problem,
                                                   ArrayRef<unsigned> hint,
                                                   Operation *anchor);

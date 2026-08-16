@@ -85,8 +85,8 @@ struct DatapathBuilder {
   std::deque<MuxBuild> muxBuilds; // a deque so `recordEdge` /
                                   // `recordCarriedEdge` slot pointers into
                                   // `sources` survive later pushes
-  // Where the cell containers sat when `resolveEdges` finished; the delay
-  // passes assert they have not moved, `edges` keying slots by pointer.
+  // Where the cell containers sat when `resolveEdges` finished. `edges` keys
+  // slots by pointer, so the delay passes assert they have not moved.
   const void *unitsBase = nullptr, *memsBase = nullptr, *streamsBase = nullptr;
 
   const BindingPolicy &policy; // decides resource sharing
@@ -157,8 +157,8 @@ struct DatapathBuilder {
   void recordCallScalars();
   /// Record every CallUnit's composition predecessors (`cu.predecessors`),
   /// hazard-directed (RAW / WAW / WAR) in both composition classes: a
-  /// read-read pair commutes and overlaps. A SCHEDULED composition gates only
-  /// an earlier-placed or indeterminate hazard producer; a CONCURRENT one has
+  /// read-read pair commutes and overlaps. A scheduled composition gates only
+  /// an earlier-placed or indeterminate hazard producer; a concurrent one has
   /// no placement, so a hazard the channels do not order is the whole rule.
   /// Runs after `recordCallScalars`, whose Sources carry the scalar-result
   /// edges.
@@ -193,9 +193,9 @@ struct DatapathBuilder {
   void bindMemoryPorts();
   /// Record the instances of its row each bank is held in
   /// (`MemUnit::instances`) and which of them serves each read port
-  /// (`MemUnit::readInstance`), by the same arithmetic `bindMemoryPorts`'
-  /// pooled decision compared. A skew binds its ports by lane and leaves that
-  /// loop early, so this runs over every memory rather than inside it.
+  /// (`MemUnit::readInstance`), by the same arithmetic `bindMemoryPorts`
+  /// compares for its pooled decision. Runs over every memory, since a skew
+  /// binds its ports by lane and leaves that loop early.
   void assignReadInstances();
   /// Group a skewed memory's accesses into lanes that can share one port per
   /// bank (`MemUnit::skewed`, `Access::lane`), or leave it crossbarring when
@@ -277,10 +277,10 @@ struct DatapathBuilder {
   /// initiation interval \p ii) to its producing Source plus register depth,
   /// plus the one edge that does not read \p v at all (an un-latched own
   /// iter-arg = the loop recurrence). An enclosing region's counter is held
-  /// for the whole nested pass and ties in with no chain, EXCEPT on an
-  /// address slot (\p addressSlot): the reduction reads edge depths to fold
-  /// counters into scaled strides, and withdraws the chain itself where it
-  /// succeeds.
+  /// for the whole nested pass and ties in with no chain; on an address slot
+  /// (\p addressSlot) it keeps its depth, the address reduction reading edge
+  /// depths to fold counters into scaled strides and withdrawing the chain
+  /// where it succeeds.
   Resolved resolveOperand(Value v, Operation *consumer, unsigned ii,
                           bool addressSlot = false);
   /// Resolve every unit input / memory address / store-data / stream driver

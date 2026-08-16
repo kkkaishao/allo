@@ -20,9 +20,9 @@ namespace mlir::allo::uarch {
 /// cut by who is at fault: the design, this backend, or an upstream pass. The
 /// one call the emit driver makes. Returns this module's few worst
 /// combinational paths, longest first, which the report publishes and the QoR
-/// turns into a clock. Structures nobody prices are not in them, so they
-/// estimate and never substitute for place and route. Never empty: a module
-/// with no datapath still holds one register hop.
+/// turns into a clock. Structures the operator library does not price are
+/// absent from them, so they are estimates and no substitute for place and
+/// route. Never empty: a module with no datapath still holds one register hop.
 FailureOr<std::vector<TimingPath>>
 validateDatapath(dcp::DCPathModuleOp func, const Datapath &dp, float cycleTime,
                  const OperatorLibrary &lib, bool plannedBinding);

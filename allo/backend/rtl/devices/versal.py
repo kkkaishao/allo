@@ -95,8 +95,8 @@ TIMING: Mapping[Grade, FabricTiming] = {
             "lutram": StorageTiming(1, 1, 1.268, 1.196),
             "bram": StorageTiming(1, 1, 1.299, 0.673),
             "uram": StorageTiming(2, 1, 1.057, 0.485),
-            # A table is never written; `rom` carries the read at the reference
-            # shape, which `rom` below refines at the array's own.
+            # A table is never written; this row carries the read at the
+            # reference shape, refined by `rom` below at the array's own.
             "rom": StorageTiming(1, 1, 1.779, 0.0),
         },
         stream=StorageTiming(0, 1, 1.268, 1.196),
@@ -117,8 +117,8 @@ TIMING: Mapping[Grade, FabricTiming] = {
         ),
         mux_w=Interp({1: 0.64, 8: 0.90, 16: 0.94, 32: 1.0, 64: 1.25}),
         # A constant table's read, routed, over its depth at the same reference
-        # width. It grows with the address where every addressed row's is flat,
-        # which is what decides how deep a table is still worth building.
+        # width. It grows with the depth where an addressed row's read delay is
+        # flat, which bounds how deep a table is worth building.
         rom=Interp(
             {
                 64: 0.912,
@@ -234,10 +234,10 @@ _STORAGE = {
         inst_writes=1,
         ram_style="distributed",
     ),
-    # A read-only table is not storage at all: one LUT6 is a 64-entry one-bit
+    # A read-only table is logic, not storage: one LUT6 is a 64-entry one-bit
     # lookup, so it costs `width * ceil(depth/64)` of them and has no address
-    # bus to contend for. Its read is the cone through those LUTs, which is why
-    # it is the one row timed over the array's own shape.
+    # bus to contend for. Its read is the cone through those LUTs, so it is the
+    # one row timed over the array's own shape.
     "rom": StorageSpec(
         ("lut",),
         lambda r: {r["lut"]: ROM_LUT_COST},
@@ -326,9 +326,8 @@ def _chain_uses(r: Mapping[str, Resource]) -> dict:
 
 
 def _chain_uses_norst(r: Mapping[str, Resource]) -> dict:
-    """The same chain without a synchronous reset: the SRL keeps every interior
-    stage, so only the two end registers stay in flip-flops and the reset's
-    per-stage FF and per-bit LUT vanish."""
+    """The same chain with no synchronous reset: the SRL absorbs every interior
+    stage, so only the two end registers stay in flip-flops."""
     return {
         r["ff"]: (Step(SRL_MIN_DEPTH, 1.0, 2.0), Linear(1.0)),
         r["slicem_lut"]: (

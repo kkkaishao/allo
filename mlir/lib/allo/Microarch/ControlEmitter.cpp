@@ -121,8 +121,7 @@ RegionControl ControlEmitter::emitPipelined(unsigned region, int64_t ii,
   Value wantIssue = running;
   Value phase;
   if (ii > 1) {
-    // The phase runs [0, ii), so it is built at clog2(ii) bits; `icmpEq`
-    // compares at that width.
+    // The phase runs [0, ii), so it is built at clog2(ii) bits.
     IntegerType phaseTy = c.b.getIntegerType(llvm::Log2_64_Ceil(ii));
     auto phaseNext = c.bb.get(phaseTy);
     Value pz = c.konst(phaseTy, 0);

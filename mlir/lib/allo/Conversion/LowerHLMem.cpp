@@ -132,8 +132,7 @@ void lowerMemory(seq::HLMemOp mem) {
     // cycle is unsampled, the two never issuing together.
     Value addr, reg;
     std::string rdName;
-    // A constant-true enable is no enable: the emitter promises one on every
-    // shared port and resolves it to true where no owner may freeze it.
+    // A constant-true enable is no enable and is dropped.
     Value rdEn = group.read ? group.read.getRdEn() : Value();
     if (auto k = rdEn ? rdEn.getDefiningOp<hw::ConstantOp>() : nullptr)
       if (k.getValue().isOne())
@@ -160,8 +159,7 @@ void lowerMemory(seq::HLMemOp mem) {
           sv::PAssignOp::create(b, wloc, slot, write.getInData());
         });
       }
-      // The read enable is the port's ENB: with it low the read register
-      // holds, keeping an in-flight datum alive under back-pressure.
+      // The read enable is the port's ENB: low holds the read register.
       if (group.read) {
         Location rloc = group.read.getLoc();
         auto readSlot = [&] {
@@ -179,7 +177,7 @@ void lowerMemory(seq::HLMemOp mem) {
       continue;
     // The port reads at latency 1; anything deeper is an output pipeline
     // register on the data, which is the register a block RAM or an UltraRAM
-    // has. The enable gates every stage, or the frozen datum would march out.
+    // has. The enable gates every stage.
     Location rloc = group.read.getLoc();
     Value data = sv::ReadInOutOp::create(b, rloc, reg);
     for (unsigned d = 1; d < group.read.getLatency(); ++d) {
@@ -195,8 +193,7 @@ void lowerMemory(seq::HLMemOp mem) {
     group.read.replaceAllUsesWith(data);
     group.read.erase();
   }
-  // A combinational read has no register to enable, so a FIFO's `rdEn`
-  // reaches here and is dropped; its pointer logic already consumed it.
+  // A combinational read has no register to enable, so `rdEn` is dropped.
   for (seq::ReadPortOp read : combReads) {
     Location rloc = read.getLoc();
     Value slot =

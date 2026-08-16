@@ -39,11 +39,11 @@ llvm::StringRef roleName(RegRole role);
 /// The run, not the register, is the cost unit. Past the synthesizer's
 /// shift-register extraction threshold a run stops costing flip-flops per
 /// stage, so a cost model handed only a register total cannot price it. A
-/// multi-tapped chain is charged as one run per maximal inter-tap segment,
-/// the pieces extraction can actually form.
-/// `reset` and `enable` complete that shape: a synchronous reset blocks the
-/// extraction and pays fabric per bit, while a clock enable is free, so a cost
-/// model needs both to pick the right characterization row.
+/// multi-tapped chain is charged as one run per maximal inter-tap segment, the
+/// pieces extraction can form. `reset` and `enable` complete that shape: a
+/// synchronous reset blocks the extraction and pays fabric per bit, a clock
+/// enable is free, and a cost model needs both to pick its characterization
+/// row.
 struct RegClass {
   RegRole role = RegRole::Control;
   unsigned width = 0, depth = 0, count = 0;
@@ -65,9 +65,8 @@ public:
       ++runs[{role, width, depth, reset, enable}];
   }
 
-  /// Re-charge a run extended in place from \p from to \p to stages deep:
-  /// only the new stages were built, so the old run's charge is replaced
-  /// rather than added to.
+  /// Re-charge a run extended in place from \p from to \p to stages deep: the
+  /// old run's charge is replaced, not added to.
   void extend(RegRole role, unsigned width, unsigned from, unsigned to,
               bool reset = true, bool enable = false) {
     assert(from < to && "an extension adds at least one stage");
@@ -91,9 +90,9 @@ private:
   std::map<std::tuple<RegRole, unsigned, unsigned, bool, bool>, unsigned> runs;
 };
 
-/// Why a select cone exists. These are the interconnect the emitter builds
-/// around storage after the binding, a population disjoint from the
-/// allocation's own mux cells (which the region report prices from the model).
+/// Why a select cone exists. These are the interconnect built around storage
+/// after the binding, disjoint from the allocation's own mux cells, which the
+/// region report prices from the model.
 enum class MuxRole {
   Address,  // a shared port's one-hot address select
   Commit,   // a shared write or held read port's priority commit chain
@@ -103,8 +102,7 @@ enum class MuxRole {
 llvm::StringRef muxRoleName(MuxRole role);
 
 /// One class of select cone: `count` cones, each `fanin` sources wide at
-/// `width` bits. A k:1 cone costs about (k-1) 2:1 muxes per bit, so these two
-/// numbers are the whole cost shape.
+/// `width` bits. A k:1 cone costs about (k-1) 2:1 muxes per bit.
 struct MuxCone {
   MuxRole role = MuxRole::Address;
   unsigned fanin = 0, width = 0, count = 0;

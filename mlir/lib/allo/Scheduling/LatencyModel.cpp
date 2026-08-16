@@ -41,14 +41,13 @@ std::optional<int64_t> mlir::allo::composeSpan(const SpanNode &n) {
     return n.contract;
   // A stall shell stretches a run by whatever back-pressure costs it, so what
   // composes below is a floor and not a contract. Tested ahead of the bound
-  // and of a guard's ceiling, since a floor is the wrong direction to hand a
-  // consumer either way.
+  // and of a guard's ceiling, a floor being the wrong direction either way.
   if (n.elastic)
     return std::nullopt;
-  // A guard's span is a ceiling: it arms (`emitGuard`'s check pulse), runs
-  // whichever arm the predicate takes in sequence, and latches `done`, so the
-  // deeper arm bounds both. An empty arm's start pulse is its drain, hence
-  // the 0. `spanHoldsBound` keeps the result off any exact contract.
+  // A guard's span is a ceiling: it arms, runs whichever arm the predicate
+  // takes in sequence, and latches `done`, so the deeper arm bounds both. An
+  // empty arm composes to 0. `spanHoldsBound` keeps the result off any exact
+  // contract.
   if (n.shape == RegionShape::Guard) {
     std::optional<int64_t> thenSpan = composeSequence(n.children);
     std::optional<int64_t> elseSpan = composeSequence(n.elseChildren);
@@ -104,8 +103,7 @@ bool mlir::allo::spanHoldsBound(const SpanNode &n) {
 
 // Reads and writes of the array bound to operand \p argIdx of \p inv, from the
 // reified callee's own accesses, nested instances included. Reification is
-// bottom-up, so the callee module exists before any caller composes against
-// it, and modules cannot instantiate themselves.
+// bottom-up, so the callee module exists before any caller composes against it.
 static std::pair<bool, bool>
 dcpArgAccess(dcp::DCPathInstanceOp inv, unsigned argIdx,
              llvm::SmallPtrSetImpl<Operation *> &active) {
@@ -303,10 +301,9 @@ mlir::allo::siblingPredecessors(ArrayRef<SmallVector<Operation *>> nodeOps) {
     for (unsigned j = 1; j < entry.second.size(); ++j)
       addPred(entry.second[j - 1], entry.second[j]);
   // A memref orders only its hazard pairs (`hazardEdges`); two nodes that only
-  // READ stay unordered: they overlap, and `Datapath::portGraph` reads the
-  // unordered pair as simultaneous, pricing the separate ports that takes. A
-  // skewed layout is the exception: its lanes share a port per slot across
-  // regions, so every toucher pair stays chained.
+  // read stay unordered, and `Datapath::portGraph` prices the separate ports
+  // their overlap takes. A skewed layout is the exception: its lanes share a
+  // port per slot across regions, so every toucher pair stays chained.
   for (auto &entry : mems) {
     auto &touch = entry.second;
     if (bankLayoutOf(entry.first).skew()) {
@@ -369,10 +366,9 @@ SpanNode mlir::allo::dcpSpanNode(Operation *op, bool topLevel) {
   SpanNode n;
   if (auto inv = dyn_cast<DCPathInstanceOp>(op)) {
     // A callee's `latency` is already a start->done contract, counted to its
-    // own `done` rising. It crosses a module boundary, so it is the one
-    // composed number this side cannot derive. A callee that published only a
-    // ceiling (`latency_bound`) is not counted_static, and its contract
-    // composes onward as a ceiling too.
+    // own `done` rising, and the one composed number this side cannot derive.
+    // A callee that published only a ceiling (`latency_bound`) is not
+    // counted_static, and its contract composes onward as a ceiling.
     n.instance = true;
     n.contract = asInt64(inv.getLatency());
     n.contractBound =
@@ -398,10 +394,10 @@ SpanNode mlir::allo::dcpSpanNode(Operation *op, bool topLevel) {
     n.children = dcpSpanNodes(op->getRegion(0).front(), /*topLevel=*/false);
     return n;
   }
-  // `drainTerms` prices a call into the drain from its CONTRACT, so a leaf
-  // holding one without has no static span: its terminal cycle is a `done`.
-  // A bounded contract makes the drain a ceiling instead. Only an ACYCLIC
-  // leaf holds a call at all, a cyclic one being a `CallNode`.
+  // `drainTerms` prices a call into the drain from its contract, so a leaf
+  // holding one without has no static span: its terminal cycle is a `done`. A
+  // bounded contract makes the drain a ceiling instead. Only an acyclic leaf
+  // holds a call at all, a cyclic one being a `CallNode`.
   bool waitsOnADone = false;
   for (Operation &inner : op->getRegion(0).front())
     if (auto inv = dyn_cast<DCPathInstanceOp>(&inner)) {
@@ -448,7 +444,7 @@ RegionTiming mlir::allo::dcpRegionTiming(Operation *regionOp) {
     return t;
   }
   // CONDITIONAL: a guard or a while. Its own control decides when it ends, so
-  // no exact span describes it; a guard whose arms both compose still carries
+  // no exact span describes it, though a guard whose arms both compose carries
   // the deeper arm's span as a ceiling.
   auto pipe = dyn_cast<DCPathPipelineOp>(regionOp);
   if (pipe && pipe.isWhileLoop()) {
@@ -463,7 +459,7 @@ RegionTiming mlir::allo::dcpRegionTiming(Operation *regionOp) {
     return t;
   }
   // COUNTED_STATIC when a span composes exactly, which is the contract a
-  // container may time-trigger against; a span holding a ceiling (a guard, a
+  // container may time-trigger against. A span holding a ceiling (a guard, a
   // bounded contract) is only waitable, so the region stays INDETERMINATE, as
   // does one with no composable span at all.
   if (span && spanHoldsBound(n)) {

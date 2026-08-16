@@ -633,10 +633,10 @@ def test_free_running_ip_outside_stream_region_emits():
     assert not inst, inst
 
 
-# A deep pulse delay in a single-pass region is a counter only past the
+# A pulse delay in a single-pass region becomes a counter only past the
 # device-priced crossover of the chain row against the counter's own cost. On
-# the default device the crossover sits around a thousand cycles: a depth of a
-# hundred stays a tapped chain, and one of four thousand still counts.
+# the default device that crossover sits near a thousand cycles: depth 100 is
+# a tapped chain, depth 4000 a counter.
 def test_a_pulse_delay_counts_only_past_the_priced_crossover():
     import re
 
@@ -959,13 +959,11 @@ def test_float_and_int_arithmetic():
 
 def test_exact_share_folds_profitable_ip():
     # Two chained float multiplies (fmul latency 4) issue at disjoint cycles,
-    # so the MRT lets them share one physical unit. 'exact-share', the binding
-    # the heuristic scheduler implies, decides the fold with one CP-SAT solve
-    # per region, minimizing modelled area under the clock; saving a whole
-    # fmul against a 2:1 mux per port sits in that optimum, so the instance
-    # drops, and the shared datapath stays functionally identical to the
-    # trivially-bound one. (Integer multiply is combinational -- no instance
-    # to share -- so sharing is exercised on a float IP operator.)
+    # so the MRT lets them share one physical unit. 'exact-share' minimizes
+    # modelled area under the clock, and saving an fmul against a 2:1 mux per
+    # port sits in that optimum, so one instance drops and the shared datapath
+    # computes what the trivially-bound one does. Integer multiply is
+    # combinational, with no instance to share, so a float IP operator is used.
     @kernel
     def chain(A: f32[1], B: f32[1], C: f32[1], o: f32[1]):
         o[0] = A[0] * B[0] * C[0]
@@ -1226,9 +1224,8 @@ def test_shared_reduction_reinjects_its_identity():
 def test_planned_allocation_is_never_looser_than_exact_share():
     # The exact scheduler decides how many copies of each operator a region
     # builds and 'planned' builds exactly that. Its search starts from, and
-    # falls back on, the tightest count its own schedule admits, so on this
-    # chain it reaches the same fold binding-time exact sharing finds and
-    # never loses to it.
+    # falls back on, the tightest count its own schedule admits, so it uses no
+    # more instances than binding-time exact sharing does.
     @kernel
     def chain(A: f32[1], B: f32[1], C: f32[1], D: f32[1], o: f32[1]):
         o[0] = A[0] * B[0] * C[0] * D[0]

@@ -96,8 +96,8 @@ TIMING: Mapping[Grade, FabricTiming] = {
             "lutram": StorageTiming(1, 1, 1.574, 1.718),
             "bram": StorageTiming(1, 1, 1.345, 0.510),
             "uram": StorageTiming(2, 1, 1.379, 0.444),
-            # A table is never written; `rom` carries the read at the reference
-            # shape, which `rom` below refines at the array's own.
+            # A table is never written; this row carries the read at the
+            # reference shape, refined by `rom` below at the array's own.
             "rom": StorageTiming(1, 1, 1.864, 0.0),
         },
         stream=StorageTiming(0, 1, 1.574, 1.718),
@@ -109,8 +109,8 @@ TIMING: Mapping[Grade, FabricTiming] = {
         ),
         mux_w=Interp({1: 0.17, 8: 0.77, 16: 0.77, 32: 1.0, 64: 1.0}),
         # A constant table's read, routed, over its depth at the same reference
-        # width. It grows with the address where every addressed row's is flat,
-        # which is what decides how deep a table is still worth building.
+        # width. It grows with the depth where an addressed row's read delay is
+        # flat, which bounds how deep a table is worth building.
         rom=Interp(
             {
                 64: 0.654,
@@ -337,12 +337,9 @@ _STORAGE = {
     # Distributed RAM has one write port and one addressed read, in separate
     # structures (no pool). A second read address costs a further copy of the
     # array: measured 640 / 1280 / 1920 / 2560 LUT as memory at 1024x32 for one
-    # through four reads.
-    #
-    # A SLICEM LUT holds 64 bits, so a bit of a `d`-deep array takes
-    # `ceil(d/64)` sites, and a write port against a separate read address
-    # takes the array twice over. Measured 80 / 320 / 640 SLICEM at 64 / 256 /
-    # 512 x 32, which `LUTRAM_SITES_PER_BIT` lands on exactly.
+    # through four reads. A SLICEM LUT holds 64 bits, so a bit of a `d`-deep
+    # array takes `ceil(d/64)` sites; measured 80 / 320 / 640 SLICEM at 64 /
+    # 256 / 512 x 32, which `LUTRAM_SITES_PER_BIT` lands on exactly.
     "lutram": StorageSpec(
         ("slicem_lut",),
         lambda r: {r["slicem_lut"]: (Tiled(64), Linear(LUTRAM_SITES_PER_BIT))},
@@ -350,10 +347,9 @@ _STORAGE = {
         inst_writes=1,
         ram_style="distributed",
     ),
-    # A read-only table is not storage at all: one LUT6 is a 64-entry one-bit
+    # A read-only table is logic, not storage: one LUT6 is a 64-entry one-bit
     # lookup and has no address bus to contend for. Its read is the cone
-    # through those LUTs, which is why it is the one row timed over the array's
-    # own shape.
+    # through those LUTs, so it is the one row timed over the array's own shape.
     "rom": StorageSpec(
         ("lut",),
         lambda r: {r["lut"]: ROM_LUT_COST},
@@ -442,9 +438,8 @@ def _chain_uses(r: Mapping[str, Resource]) -> dict:
 
 
 def _chain_uses_norst(r: Mapping[str, Resource]) -> dict:
-    """The same chain without a synchronous reset: the SRL keeps every interior
-    stage, so only the two end registers stay in flip-flops and the reset's
-    per-stage FF and per-bit LUT vanish."""
+    """The same chain with no synchronous reset: the SRL absorbs every interior
+    stage, so only the two end registers stay in flip-flops."""
     return {
         r["ff"]: (Step(SRL_MIN_DEPTH, 1.0, 2.0), Linear(1.0)),
         r["slicem_lut"]: (

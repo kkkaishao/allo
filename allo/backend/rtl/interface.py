@@ -237,13 +237,12 @@ class ModuleInterface:
     registers: tuple[RegisterFile, ...]
     results: tuple[Result, ...]
     operators: tuple[Operator, ...]
-    #: the composition class a caller composes against: ``counted_static``,
-    #: ``indeterminate`` or ``concurrent``.
+    #: composition class: ``counted_static``, ``indeterminate`` or
+    #: ``concurrent``.
     determinacy: str
-    #: whether ``latency`` is a worst case a caller waits out rather than an
-    #: exact count.
+    #: whether ``latency`` is a worst case rather than an exact count.
     latency_is_bound: bool
-    #: the module's start->done span in cycles, None when it is data-dependent.
+    #: start->done span in cycles, None when data-dependent.
     latency: int | None = None
 
     def ports_for_arg(self, arg: int) -> list[Memory]:
@@ -272,8 +271,7 @@ class ModuleInterface:
     @property
     def latency_is_exact(self) -> bool:
         """Whether ``latency`` is the exact span the hardware realizes, and so a
-        number a measured cycle count may be held to. A bounded or concurrent
-        module publishes a figure that is deliberately not tight."""
+        figure a measured cycle count may be held to."""
         return (
             self.latency is not None
             and self.determinacy == "counted_static"

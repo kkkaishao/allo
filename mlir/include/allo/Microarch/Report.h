@@ -130,17 +130,16 @@ struct RegionCost {
   unsigned counterWidth = 0, addrStrides = 0;
 };
 
-/// One step of a combinational path: what the signal passes through, and what
-/// the path spends there. A step is one model cell, so it can be a lump the
-/// model prices without decomposing (an address cone, a select).
+/// One step of a combinational path: what the signal passes through and what it
+/// spends there. A step is one model cell, which may be a lump the model prices
+/// without decomposing (an address cone, a select).
 struct TimingStep {
   std::string what;
   double delay = 0.0; // ns
 };
 
-/// One combinational path, start point first: a register or port launches it,
-/// each step adds its own delay, and it is captured at `endpoint`. `total` is
-/// the sum of the steps by construction.
+/// One combinational path, its steps ordered from the launching register or
+/// port to the capture at `endpoint`. `total` is the sum of the step delays.
 struct TimingPath {
   double total = 0.0; // ns
   double slack = 0.0; // period - total; negative means it misses the clock
@@ -171,8 +170,8 @@ struct FuncUarch {
   // Module-wide: a register run belongs to the value it carries, not to a
   // region, and the ledger counts it where it is BUILT.
   std::vector<RegClass> regs;
-  // Module-wide for the same reason: the select cones the emission built
-  // around storage, disjoint from each region's allocation muxes.
+  // Module-wide: the select cones the emission built around storage, disjoint
+  // from each region's allocation muxes.
   std::vector<MuxCone> muxCones;
   std::vector<MemReport> mems;
   std::vector<StreamReport> streams;
@@ -182,14 +181,14 @@ struct FuncUarch {
   /// `validateDatapath` measured them.
   std::vector<TimingPath> criticalPaths;
 
-  /// The longest path's total, in ns; zero only on a default-constructed
-  /// report, every emitted module holding at least one register hop.
+  /// The longest path's total, in ns. Zero only on a default-constructed
+  /// report: every emitted module holds at least one register hop.
   double criticalPath() const {
     return criticalPaths.empty() ? 0.0 : criticalPaths.front().total;
   }
 
   /// Project \p dp, plus the registers and select cones its emission built and
-  /// the paths `validateDatapath` measured while checking it.
+  /// the paths `validateDatapath` measured.
   FuncUarch(const Datapath &dp, llvm::StringRef symbol, llvm::StringRef module,
             const RegLedger &ledger, const MuxLedger &muxes,
             std::vector<TimingPath> criticalPaths);

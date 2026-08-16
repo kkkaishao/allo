@@ -57,10 +57,10 @@ Terminator HWEmitter::terminatorOf(const uarch::RegionBlock &rb) {
 }
 
 // Check region \p rb's built drain against the span its consumers were placed
-// against. A determinate call is priced into the drain at its contract and the
-// emitted child honours it (the driver asserts that), so folding the same term
-// back in lets the bounds hold for a call-holding region too. An indeterminate
-// call has no span, and leaves the drain beyond checking.
+// against. A determinate call is priced into the drain at its contract, which
+// the emitted child honours, so folding the same term back in makes the bounds
+// hold for a call-holding region too. An indeterminate call has no span and
+// leaves the drain unchecked.
 static void checkDrainAgainstComposedSpan(const uarch::Datapath &dp,
                                           const uarch::RegionBlock &rb) {
 #ifndef NDEBUG
@@ -85,8 +85,7 @@ static void checkDrainAgainstComposedSpan(const uarch::Datapath &dp,
          "against it samples before this region has committed");
   // Draining early is pessimism rather than a fault: the composed latency
   // claims cycles the hardware does not take and every consumer waits them.
-  // Together with the bound above, a region with no stream shift is pinned to
-  // exact equality.
+  // With the bound above, a region with no stream shift is pinned to equality.
   assert((!rb.modelledDrain || doneTimed || builtDrain >= *rb.modelledDrain) &&
          "the built datapath drains before the composed span, so the composed "
          "latency is longer than the hardware takes");
@@ -132,8 +131,8 @@ Value HWEmitter::emitRegion(const uarch::RegionBlock &rb, Value start,
 
   // H (elasticity): a stream region's enables depend on handshakes not yet
   // emitted, so it registers a promise (two backedges) that G, F and the done
-  // drain wire against, RAUWed at the end. A stream-free region is rigid; the
-  // shell still carries the owner stamp `shellFor` gives every shell.
+  // drain wire against, RAUWed at the end. A stream-free region is rigid, its
+  // shell carrying only the owner stamp `shellFor` gives every shell.
   Backedge chainEnableBE, issueEnableBE;
   StallShell shell = datapath.shellFor(rb.id);
   if (!rb.streamAccesses.empty()) {
@@ -186,8 +185,6 @@ Value HWEmitter::emitRegion(const uarch::RegionBlock &rb, Value start,
   // datapath waits for both, ANDing two held levels so the later wins.
   bool looseWork = !rb.streamAccesses.empty() || !rb.units.empty() ||
                    !rb.memAccesses.empty();
-  // A pure call region builds no done latch at all: the child's level is the
-  // region's.
   Value done = fb.callDone;
   if (!fb.callDone || looseWork) {
     Value drained =
@@ -338,8 +335,7 @@ Value HWEmitter::emitLoopCall(const uarch::RegionBlock &rb, Value start) {
          "shell, which this controller does not build");
   // Bounds are at the child's index-port width (this region's `counterType`).
   // The controller is paced by the child's per-invocation completion pulse
-  // (fb.callDone for a CallNode region), a backedge since emitCalls needs the
-  // counter first.
+  // (`fb.callDone`), a backedge since emitCalls needs the counter first.
   Backedge callDone = ctx.bb.get(ctx.i1);
   IterationControl ic =
       control.emitCountedIteration(rb, terminatorOf(rb), start, callDone);
@@ -451,9 +447,8 @@ Value HWEmitter::emitGuard(const uarch::RegionBlock &rb, Value start) {
                           : ctx.risingEdge(sequence(rb.elseChildren, elseStart,
                                                     /*retrig=*/true));
   // Each yielded result is the taken arm's value, latched into one survivor
-  // when that arm drains: the two drain pulses are disjoint (exactly one arm
-  // runs a pass), so the pulse both selects the datum and enables the capture,
-  // and a reader sees a plain held register.
+  // when that arm drains. The two drain pulses are disjoint (exactly one arm
+  // runs a pass), so the pulse both selects the datum and enables the capture.
   for (auto [k, r] : llvm::enumerate(rb.results)) {
     Value tv = datapath.resolveSource(r.value);
     Value ev = datapath.resolveSource(r.elseValue);

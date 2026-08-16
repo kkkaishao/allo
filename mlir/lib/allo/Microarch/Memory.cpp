@@ -54,9 +54,9 @@ static MemId createMem(Datapath &dp, llvm::DenseMap<Value, MemId> &memOf,
   // (allo.part / allo.bind.storage), so the ports billed and the ports built
   // cannot disagree.
   MemoryChar mc = allo::characterize(memref, dev.memory);
-  // Power-on contents, when the array reads through an initialized global, and
-  // whether the resolved row makes them a combinational table rather than a
-  // memory that starts with them.
+  // Power-on contents, when the array reads through an initialized global. The
+  // resolved row decides whether they become a combinational table or a memory
+  // that starts with them.
   if (auto init = allo::globalInitOf(memref))
     m.romInit = *init;
   m.isRom = mc.constantTable;
@@ -88,9 +88,8 @@ static MemId createMem(Datapath &dp, llvm::DenseMap<Value, MemId> &memOf,
 }
 
 void DatapathBuilder::collectStorageFacts(ArrayRef<Operation *> regionOps) {
-  // Whether anything writes each array, indexed by MemId: the check that the
-  // recorded realization holds here, since a table with a writer would drop
-  // every store.
+  // Whether anything writes each array, indexed by MemId, which checks the
+  // recorded realization holds: a table with a writer would drop every store.
   llvm::SmallVector<bool> written;
   auto touch = [&](Value memref, bool isWrite) {
     MemId id = createMem(dp, memOf, dev, memref);
@@ -336,13 +335,13 @@ void DatapathBuilder::planAccessPorts() {
       ma.plan = uniform(dp.mems[ma.mem]).value_or(PortPlan::Coloured);
 }
 
-// Copies of its row a bank bound with (\p reads, \p writes, \p total) ports
-// is held in, and the reads one copy serves (`per`). Every copy takes every
-// write and serves `instReads` reads; a read riding a pooled write bus is
-// served wherever that bus lands and costs no port of its own, and past the
-// pool every copy takes every write with the reads sharing what is left. Not
-// bounded by the copies budget: that budget is what a cycle may issue, and a
-// binding needing more address buses still builds one copy per bus.
+// Copies of its row a bank bound with (\p reads, \p writes, \p total) ports is
+// held in, and the reads one copy serves (`per`). Every copy takes every write
+// and serves `instReads` reads; past the pool the reads share what the writes
+// leave, and a read riding a pooled write bus is served wherever that bus lands
+// at no port of its own. Not bounded by the copies budget: that budget is what
+// a cycle may issue, and a binding needing more address buses still builds one
+// copy per bus.
 static std::pair<unsigned, unsigned> instancesFor(const StoragePorts &ports,
                                                   unsigned reads,
                                                   unsigned writes,
@@ -401,9 +400,9 @@ void DatapathBuilder::bindMemoryPorts() {
     }
     if (pooled) {
       if (m.fitsStorage(w.counts.writes, separateTotal)) {
-        // Both bindings fit, so the outcomes decide: the multiplexer a shared
-        // bus buys is addrWidth bits while a copy is a whole tile, so pooled
-        // stands only where it builds strictly fewer copies.
+        // Both bindings fit, so the outcomes decide: a shared bus buys an
+        // addrWidth multiplexer while a copy is a whole tile, so pooled stands
+        // only where it builds strictly fewer copies.
         unsigned sep = instancesFor(m.ports, r.counts.reads, w.counts.writes,
                                     separateTotal)
                            .first;
@@ -414,8 +413,8 @@ void DatapathBuilder::bindMemoryPorts() {
         if (pool >= sep)
           pooled.reset();
       } else if (pooled->counts.total >= separateTotal) {
-        // The separate binding does not fit the row; a pooled one that saves
-        // no port fits no better, and is the multiplexer for nothing.
+        // The separate binding does not fit the row, and a pooled one that
+        // saves no port fits no better: the multiplexer for nothing.
         pooled.reset();
       }
     }

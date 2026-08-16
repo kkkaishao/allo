@@ -471,8 +471,8 @@ void DatapathBuilder::bindCompute(dcp::DCPathComputeOp comp, RegionBlock &rb) {
     u.pipelined = opr.getPipelined();
     u.stall = opr.getStall();
   }
-  // The setup delay the reifier stamped, the same number the solve was cut
-  // against; re-deriving it from the device here could disagree with it.
+  // The stamped setup delay, the same number the solve was cut against; a
+  // delay re-derived from the device here could disagree with it.
   auto inDelay = comp->getAttrOfType<FloatAttr>("in_delay");
   assert(inDelay && "a dcp.compute carries the in_delay the schedule priced");
   u.inDelay = inDelay.getValueAsDouble();
@@ -617,10 +617,10 @@ void DatapathBuilder::recordCallDeps() {
       SmallVector<MemId, 4> cuWrites = memsOf(cu, true);
       for (unsigned j = 0; j < i; ++j) {
         const CallUnit &p = dp.calls[rb.callUnits[j]];
-        // Hazard DIRECTION (RAW / WAW / WAR) is the ordering in both
+        // Hazard direction (RAW / WAW / WAR) is the ordering in both
         // composition classes: a read-read pair commutes and overlaps, taking
-        // a port each (`portGraph`). A CONCURRENT container orders every such
-        // pair the channels do not; a SCHEDULED one only where the placement
+        // a port each (`portGraph`). A concurrent container orders every such
+        // pair the channels do not; a scheduled one only where the placement
         // or a missing contract leaves the earlier child's completion ahead.
         bool directed = shares(memsOf(p, true), cuMems) ||
                         shares(cuWrites, memsOf(p, false));
@@ -1176,10 +1176,10 @@ reduceCone(Datapath &dp, AffineExpr e, AffineMap addrMap,
   return out;
 }
 
-// What `buildAddr` still builds after the address delay register: the residual
-// cone, and the adder joining it to the register the term sum landed in. Priced
-// by the same function the whole cone is, with that register standing as the
-// one input the sum became.
+// What `buildAddr` builds after the address delay register: the residual cone
+// plus the adder joining it to the register the term sum landed in. Priced by
+// the same function as the whole cone, that register standing in as the one
+// input the sum became.
 static double postRegisterDelay(const MemUnit::Access::Reduced &r,
                                 const AddressDelays &delays, unsigned width) {
   if (!r.residual)
@@ -1193,7 +1193,7 @@ static double postRegisterDelay(const MemUnit::Access::Reduced &r,
 
 // The whole cone as built, before any delay register: each reduced term
 // arrives from its stride register and the residual runs beside the summing
-// chain. Reconstructed for the debug diff against the stamped price.
+// chain.
 static double builtConeDelay(const MemUnit::Access::Reduced &r,
                              const AddressDelays &delays, unsigned width) {
   SplitAddress sp;
@@ -1270,9 +1270,9 @@ void DatapathBuilder::planAddressGenerators() {
       bool anyRegister = !acc.offset.terms.empty() || !acc.bank.terms.empty() ||
                          !acc.offset.reads.empty() || !acc.bank.reads.empty();
       acc.addrDelay = anyRegister ? delay.value_or(0) : 0;
-      // With the sum landing in that register, the cone the scheduler charged
-      // the setup path is no longer on it: only the residual built after the
-      // register is. Both cones run beside each other, so the delay is the max.
+      // With the term sum landing in the delay register, only the residual
+      // built after that register sits on the setup path. Both cones run
+      // beside each other, so the delay is the max.
       assert(acc.inDelay >= acc.portDelay &&
              "an access's priced setup is its port's delay plus its address");
       double priced = acc.inDelay - acc.portDelay;
@@ -1282,10 +1282,9 @@ void DatapathBuilder::planAddressGenerators() {
                          postRegisterDelay(acc.bank, delays,
                                            AddressDelays::refWidth))
               : priced;
-      // The pricing is optimistic on the reduction gap: the scheduler split
-      // over the IR loops, while this split also needs constant bounds and one
-      // shared delay. A cone built longer than priced is that gap
-      // materializing; the post-cut walk still measures the real path.
+      // The scheduler's split needs only the IR loops; this one also needs
+      // constant bounds and one shared delay, so the built cone can run longer
+      // than the priced one.
       if (logging::detail::enabled(Level::Debug)) {
         double built =
             std::max(builtConeDelay(acc.offset, delays, e.width),
@@ -1403,9 +1402,8 @@ void DatapathBuilder::resolveStreamOperands() {
 // The pulse-delay depth from which a counter is cheaper than a chain on this
 // device's rows: the smallest n where the counter `delayPulseCounted` builds
 // (clog2(n)+1 registers, an increment, a compare and their selects) prices
-// below the 1-bit n-stage chain it replaces. A device pricing neither side
-// keeps the default, held clear of ordinary pipeline-stage depths so a small
-// chain keeps the tapped shape; one whose chains never cost more never counts.
+// below the 1-bit n-stage chain it replaces. A device that prices neither side
+// keeps the default; one whose chains never cost more never counts.
 static unsigned countedDelayThreshold(const OperatorLibrary &lib) {
   auto counterWins = [&](uint64_t n) {
     int64_t b = std::max<int64_t>(1, llvm::Log2_64_Ceil(n));
@@ -1614,9 +1612,8 @@ void DatapathBuilder::allocateUnits(ArrayRef<SmallVector<UnitId, 2>> groups) {
     }
 }
 
-// The built relation against `siblingPredecessors`: each edge the latency model
-// has beyond the built model is a pair the span serializes and the hardware
-// overlaps.
+// Report each edge `siblingPredecessors` has beyond the built relation: a pair
+// the composed span serializes and the hardware overlaps.
 static void diffSiblingDeps(const Datapath &dp) {
   SmallVector<RegionId> topIds;
   SmallVector<SmallVector<Operation *>> nodeOps;
@@ -1648,7 +1645,7 @@ static void diffSiblingDeps(const Datapath &dp) {
 // `siblingPredecessors` answers the same question off the IR, and the two must
 // agree: the composed span is published as an exact contract, so an edge only
 // one side has is either a span the hardware beats or hardware the span never
-// paid for.
+// paid for (`diffSiblingDeps`).
 void DatapathBuilder::recordSiblingDeps() {
   // Every op inside a top-level region maps to that region's id, a nested child
   // folding into it. A value defined outside any region has no entry.
@@ -1669,7 +1666,7 @@ void DatapathBuilder::recordSiblingDeps() {
   };
 
   // (1) A shared memref, ordered by its hazard pairs (`hazardEdges`, at bank
-  // granularity): two regions that only READ the array, or that touch
+  // granularity): two regions that only read the array, or that touch
   // different banks, overlap, and `Datapath::portGraph` reads any unordered
   // pair as simultaneous, so they take separate ports. A CallUnit masters
   // memref operands without a MemUnit::Access, so it counts as a sharer too,

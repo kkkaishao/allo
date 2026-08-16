@@ -37,16 +37,15 @@ namespace {
 
 /// Solver configuration for one solve. The time limit is deterministic rather
 /// than wall-clock, which is what lets two identical compiles emit identical
-/// RTL. A solve that exhausts that limit has been seen to differ run to run
-/// even so, which is unexplained.
+/// RTL. A solve that exhausts the limit can still differ run to run.
 SatParameters solverParameters(const SchedulerOptions &opts) {
   SatParameters params;
   params.set_num_workers(opts.workers);
   params.set_random_seed(opts.seed);
   params.set_max_deterministic_time(opts.budget);
-  // Several workers otherwise race, and which incumbent the budget stops on
-  // would depend on thread timing. Interleaved, the portfolio advances in a
-  // fixed order under the deterministic limit above.
+  // Interleaved, the portfolio advances in a fixed order under the
+  // deterministic limit; racing workers would make the incumbent the budget
+  // stops on depend on thread timing.
   if (opts.workers > 1)
     params.set_interleave_search(true);
   return params;
@@ -223,11 +222,11 @@ struct AllocationVar {
   std::optional<IntVar> headroom;
 };
 
-/// The tightest count of \p rsrc the schedule CURRENTLY on \p prob admits:
-/// the busiest-slot demand, opened until the select cone fits the sub-cycle
-/// slack that schedule leaves the resource's operations. Pairing this count
-/// with those start times satisfies the headroom constraint, so as a hint it
-/// stays a feasible point and as a fallback it stays buildable.
+/// The tightest count of \p rsrc the schedule currently on \p prob admits: the
+/// busiest-slot demand, opened until the select cone fits the sub-cycle slack
+/// that schedule leaves the resource's operations. This count paired with those
+/// start times satisfies the headroom constraint, so it is a feasible point as
+/// a hint and buildable as a fallback.
 template <class ProblemT>
 unsigned demandWithHeadroom(ProblemT &prob, Problem::ResourceType rsrc,
                             unsigned ii, float cycleTime) {
@@ -249,10 +248,9 @@ unsigned demandWithHeadroom(ProblemT &prob, Problem::ResourceType rsrc,
 /// capacity constraint against it.
 ///
 /// \p hint says the heuristic's start times are being hinted too, and then the
-/// count hinted is the TIGHTEST one those start times admit with the select
-/// cone charged (what the greedy binder could have built from them); on a
-/// region whose budget runs out, `applyDemandAllocation` ships that same
-/// count.
+/// count hinted is the tightest one those start times admit with the select
+/// cone charged. On a region whose budget runs out, `applyDemandAllocation`
+/// ships that same count.
 template <class ProblemT>
 SmallVector<AllocationVar> allocationVars(CpModelBuilder &model, ProblemT &prob,
                                           unsigned ii, bool hint,
@@ -287,13 +285,13 @@ SmallVector<AllocationVar> allocationVars(CpModelBuilder &model, ProblemT &prob,
 
 /// Hold every operation of an allocatable operator to the period with the
 /// select cone its decided count implies: `z + inDelay + headroom(N) <=
-/// period`. This is what lets a `planned` binding realize the allocation as
-/// built: a count only shrinks where its multiplexer fits inside the slack the
-/// same solve leaves, so the emit-side gate has nothing left to refuse.
+/// period`. A count then only shrinks where its multiplexer fits the slack the
+/// same solve leaves, which is what lets a `planned` binding realize the
+/// allocation as built.
 ///
 /// The break-edge chaining form carries no sub-cycle variables, so they are
 /// created here on demand; the break edges already keep the plain system
-/// satisfiable at any placement, so adding it tightens the model only by the
+/// satisfiable at any placement, so this tightens the model only by the
 /// headroom itself.
 template <class ProblemT>
 void addAllocationHeadroom(CpModelBuilder &model, ProblemT &prob,
@@ -374,9 +372,9 @@ void minimizeCost(CpModelBuilder &model, IntVar primary,
   // objective, at a large search cost for negligible area.
   int64_t area = static_cast<int64_t>(starts.size()) * pulse;
   // At II > 1 the emitter folds every chain onto the region's phase, holding
-  // `depth` taps in `ceil(depth / ii)` registers (`EmitContext::foldedChain`).
-  // The variable below is therefore the registers BUILT rather than the cycles
-  // spanned, and the table is indexed by that same count.
+  // `depth` taps in `ceil(depth / ii)` registers (`EmitContext::foldedChain`),
+  // so the variable below counts registers built rather than cycles spanned and
+  // the table is indexed by that count.
   int64_t fold = std::max<int64_t>(ii, 1);
   int64_t stages = (horizon + fold - 1) / fold;
   // One chain price table per width: a region carries many values of the same
@@ -496,9 +494,9 @@ void reportUnsolved(Problem &prob, const CpSolverResponse &response,
       << "); keeping the heuristic schedule";
 }
 
-/// Lower bound on the drain of ANY schedule of \p prob.
+/// Lower bound on the drain of any schedule of \p prob.
 ///
-/// Two facts bound where an output can commit. Its own longest path is one. The
+/// Two facts bound where an output can commit. One is its own longest path. The
 /// other is resource contention: for any set S of operations that must all pass
 /// one capped resource before the output commits,
 ///
@@ -522,9 +520,9 @@ int64_t drainFloor(ProblemT &prob, const Chaining &chaining,
 
   // The edges the model imposes, weighted as it weights them, in both
   // directions: heads are read off one end and tails off the other. Only the
-  // edges that stay WITHIN one iteration bound this iteration's outputs, which
-  // is every edge of a straight-line region and the distance-0 ones of a
-  // modulo problem.
+  // edges that stay within one iteration bound this iteration's outputs, which
+  // is every edge of a straight-line region and the distance-0 ones of a modulo
+  // problem.
   DenseMap<Operation *, SmallVector<std::pair<Operation *, int64_t>>> in, out;
   auto edge = [&](Operation *src, Operation *dst, int64_t weight) {
     in[dst].push_back({src, weight});
@@ -679,12 +677,12 @@ LogicalResult mlir::allo::scheduleCPSAT(ChainingSharedOperatorsProblem &prob,
 
   const auto &ops = prob.getOperations();
 
-  // The cyclic search's entry cut, at the one interval a straight-line region
-  // has. `drainFloor` bounds the drain of any schedule from below, so reaching
-  // it proves this one is as short as the region gets and leaves only the area
-  // tie-break. `scheduleSimplex` has already written the start times and their
-  // sub-cycle offsets, so shipping its schedule needs nothing further. An
-  // allocation still to decide is worth the solve anyway.
+  // The same entry cut the cyclic search takes, at the one interval a
+  // straight-line region has: reaching `drainFloor` proves this schedule is as
+  // short as the region gets and leaves only the area tie-break.
+  // `scheduleSimplex` has written the start times and their sub-cycle offsets,
+  // so its schedule ships as is. An allocation still to decide is worth the
+  // solve anyway.
   bool allocates = false;
   for (Problem::ResourceType rsrc : prob.getResourceTypes())
     allocates |= prob.getAllocatable(rsrc).has_value();
@@ -1205,10 +1203,9 @@ mlir::allo::solveSharing(SharingProblem &problem, ArrayRef<unsigned> hint,
         model.AddAtMostOne({lit(a, j), x->second});
 
   // Per potential representative and operand port: the arms its select grew
-  // (zero while it shares nothing), with the cone and price read off the
-  // port's tables at that count. A port whose candidates all read one held
-  // value stays a wire in every fold, so it is skipped whole; the emitter
-  // collapses exactly that case.
+  // (zero while it shares nothing), with the cone and price read off the port's
+  // tables at that count. A port whose candidates all read one held value stays
+  // a wire in every fold, which the emitter collapses, so it is skipped whole.
   int64_t horizon = 0;
   for (SharingProblem::Unit &u : problem.units)
     horizon = std::max(horizon, u.slackPicos);
@@ -1216,8 +1213,8 @@ mlir::allo::solveSharing(SharingProblem &problem, ArrayRef<unsigned> hint,
   for (unsigned j = 0; j < n; ++j)
     arrive[j] = model.NewIntVar(operations_research::Domain(0, horizon));
   llvm::DenseMap<std::pair<unsigned, unsigned>, IntVar> coneAt; // (host, port)
-  // Area dominates; below it, fewer folds win ties, so a free device shares
-  // nothing rather than folding at whim.
+  // Area dominates; below it, fewer folds win ties, so a device that prices
+  // everything at zero shares nothing.
   int64_t w = n + 1;
   LinearExpr objective;
   for (unsigned i = 0; i < n; ++i)
@@ -1299,9 +1296,8 @@ mlir::allo::solveSharing(SharingProblem &problem, ArrayRef<unsigned> hint,
           .OnlyEnforceIf(lit(i, j));
   }
 
-  // The greedy plan seeds the search. It may sit outside this model where its
-  // own cone test under-counted (that is what this solve is for), which only
-  // costs the hint.
+  // The greedy plan seeds the search. Where its own cone test under-counted the
+  // plan sits outside this model, which costs no more than the hint.
   for (unsigned i = 0; i < n; ++i) {
     model.AddHint(rep[i], hint[i] == i);
     if (hint[i] != i)

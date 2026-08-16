@@ -119,8 +119,8 @@ struct ModuleInterface {
   std::string module, symbol;
   /// This module's start->done contract, republished from the `dcp.module`:
   /// `latency` in cycles, absent when the span is data-dependent;
-  /// `latencyBound` marking it a worst case a caller waits out rather than an
-  /// exact count; `determinacy` the class a caller composes against.
+  /// `latencyBound` marks it a worst case rather than an exact count;
+  /// `determinacy` is the class a caller composes against.
   std::optional<int64_t> latency;
   bool latencyBound = false;
   std::string determinacy;

@@ -7,8 +7,7 @@
 // Everything checked between the model being sealed and hardware being built,
 // cut by who is at fault: the design (`checkStorageLegality`,
 // `checkStallContracts`), this backend (`checkEmitterSubset`), or an upstream
-// pass (`assertModelInvariants`). The diagnostic each may raise follows from
-// that.
+// pass (`assertModelInvariants`).
 //===----------------------------------------------------------------------===//
 
 #include "allo/Microarch/Verification.h"
@@ -39,9 +38,8 @@ namespace mlir::allo::uarch {
 
 namespace {
 
-/// What the design asks of its arrays and this device cannot give: reported
-/// against the user, who can change the kernel, the schedule directives, the
-/// period or the part. `logging::error` and `logging::warn` only.
+/// What the design asks of its arrays and this device cannot give, reported
+/// against the user. `logging::error` and `logging::warn` only.
 LogicalResult checkStorageLegality(dcp::DCPathModuleOp func,
                                    const Datapath &dp) {
   // A kernel with no schedulable region computes nothing.
@@ -166,14 +164,14 @@ LogicalResult checkStallContracts(const Datapath &dp) {
 namespace {
 
 /// The multiplexer delay a shared binding adds to a unit's input cone,
-/// propagated along the chains it lengthens. The most any branch adds, not what
-/// the worst-arriving branch adds, since a refusal has to bound every branch.
+/// propagated along the chains it lengthens. It is the most any branch adds,
+/// not what the worst-arriving branch adds, a refusal having to bound every
+/// branch.
 ///
 /// The scheduler proved `z(op) + inDelay(op) <= period` over a datapath whose
 /// unit inputs are all driven directly, and each addition shifts its consumer's
-/// arrival by a constant. The delta is therefore additive along a combinational
-/// path, so propagating it alone against each op's remaining sub-cycle slack is
-/// exact.
+/// arrival by a constant. The delta is additive along a combinational path, so
+/// propagating it alone against each op's remaining sub-cycle slack is exact.
 struct AddedDelay {
   AddedDelay(const Datapath &dp, const OperatorLibrary &lib)
       : dp(dp), lib(lib) {}
@@ -215,7 +213,7 @@ struct AddedDelay {
 
 /// When each value settles within its cycle, which input set it, and what the
 /// cell producing it added. A reported path is one chain of this walk, so its
-/// steps sum to its total by construction.
+/// steps sum to its total.
 ///
 /// Arrivals are recomposed from the same device rows the schedule was cut
 /// against (`FuncUnit::inDelay` is marginal, the register floor charged once at
@@ -228,7 +226,7 @@ struct PathTrace {
   const Datapath &dp;
   const OperatorLibrary &lib;
   /// One register hop with no logic in it: clock-to-out at the launching end
-  /// and setup at the capturing one, which every path pays once.
+  /// plus setup at the capturing one. Every path pays it once.
   double floor;
 
   struct Arrival {
@@ -253,7 +251,7 @@ struct PathTrace {
     if (auto it = memo.find(k); it != memo.end())
       return it->second;
     // Seeded before recursing, so a fused recurrence's self-referential input
-    // terminates at the register its own pipeline is.
+    // terminates at its own pipeline register.
     memo[k] = launch("a recurrence register");
     Arrival a = derive(s);
     memo[k] = a;
@@ -343,7 +341,7 @@ private:
       return launch("an input port");
     case Source::Kind::Const:
       // Wires from a tie-off, but the capture at the far end still costs
-      // setup, which `floor` is where it is charged.
+      // setup, charged here as `floor`.
       return launch("a constant");
     case Source::Kind::None:
       break;
@@ -356,7 +354,7 @@ private:
 /// address arithmetic still on the setup path (`addrSetup`), the select its
 /// (bank, port) colour carries (one arm per holder, this module's accesses and
 /// its children's ports alike), and the port's own delay. A crossbar access is
-/// alone on its colour; its bank crossbar is not priced here yet.
+/// alone on its colour, and its bank crossbar is not priced.
 struct Tail {
   llvm::SmallVector<TimingStep, 3> addr, data;
   bool addrRegistered = false; // the address launches from its delay register
@@ -411,9 +409,10 @@ llvm::DenseMap<Operation *, Tail> accessTails(const Datapath &dp,
   return tails;
 }
 
-/// The two arrival models held together, and the refusal when a shared binding
-/// grew a multiplexer past the period the schedule was cut against. Binding is
-/// a choice the user can withdraw, so this is the only part that can fail.
+/// The two arrival models checked against each other, and the refusal when a
+/// shared binding grew a multiplexer past the period the schedule was cut
+/// against. Binding is a choice the user can withdraw, so this is the only part
+/// that can fail.
 LogicalResult checkBindingMuxHeadroom(const Datapath &dp, float cycleTime,
                                       const OperatorLibrary &lib,
                                       bool plannedBinding, PathTrace &trace) {
@@ -423,16 +422,16 @@ LogicalResult checkBindingMuxHeadroom(const Datapath &dp, float cycleTime,
 
   bool ok = true;
   for (const FuncUnit &u : dp.units) {
-    // The two arrival models, held together: recomposed from the device rows,
-    // cones grown after the cut excluded, an input arrives no later than the
-    // sub-cycle start the solve placed the op at. `FuncUnit::inDelay` is the
-    // solve's own stamped number, so a price cannot disagree; what still can
-    // is structure, a recurrence loop the recomposition charges into one
-    // cycle where the hardware splits it at the carry register. Hence a
-    // diagnostic, not an assert.
+    // Cross-check of the two arrival models: with the cones grown after the cut
+    // excluded, an input recomposed from the device rows arrives no later than
+    // the sub-cycle start the solve placed the op at. `FuncUnit::inDelay` is
+    // the solve's own stamped number, so prices cannot disagree; structure can,
+    // as with a recurrence loop the recomposition charges into one cycle where
+    // the hardware splits it at the carry register. Hence a diagnostic, not an
+    // assert.
     //
-    // The tightest bound op is both the arrival to check against and what a
-    // refusal below is anchored on.
+    // The tightest bound op is both the arrival to check against and the anchor
+    // of the refusal below.
     const FuncUnit::BoundOp *worst = &u.boundOps.front();
     for (const FuncUnit::BoundOp &bo : u.boundOps)
       if (bo.z && (!worst->z || *bo.z > *worst->z))
@@ -458,11 +457,10 @@ LogicalResult checkBindingMuxHeadroom(const Datapath &dp, float cycleTime,
     std::optional<double> slack = unitSlack(u, lib, cycleTime);
     if (slack && mux <= *slack + kSlop)
       continue;
-    // A planned fold realizes the solve's own allocation, and the solve held
+    // A planned fold realizes the solve's own allocation, which held
     // `z + inDelay + headroom(N) <= period` for every operation it folded, so
-    // an overrun on a priced unit is a broken contract between the two, not a
-    // refusal. An unpriced unit the solve never placed stays a refusal in
-    // either build.
+    // an overrun on a priced unit breaks that contract rather than earning a
+    // refusal. An unpriced unit the solve never placed stays a refusal.
     assert(!(plannedBinding && slack) &&
            "a planned binding grew a select cone past the period the schedule "
            "solve reserved headroom for; the allocation headroom model "
@@ -485,10 +483,10 @@ LogicalResult checkBindingMuxHeadroom(const Datapath &dp, float cycleTime,
   return success(ok);
 }
 
-/// Every capture point: where a path ends, appended to \p paths. Prefix-free by
-/// construction, so no path is a piece of another: an interior combinational
-/// cell is not a capture, and a unit's own input port is one only where the
-/// unit registers it.
+/// Every capture point, appended to \p paths. Prefix-free by construction, so
+/// no path is a piece of another: an interior combinational cell is not a
+/// capture, and a unit's own input port is one only where the unit registers
+/// it.
 void appendCapturePaths(const Datapath &dp, float cycleTime,
                         const llvm::DenseMap<Operation *, Tail> &tails,
                         PathTrace &trace, std::vector<TimingPath> &paths) {
@@ -589,8 +587,7 @@ void appendStridePaths(const Datapath &dp, float cycleTime,
 /// period: the multiplexers a shared binding grew in front of the units, and
 /// the select the port colouring grew in front of an access's bus. A unit
 /// overrun is refused, binding being a choice the user can withdraw; every
-/// other slot sits on the default path with no such choice and is reported
-/// instead, as the paths in \p paths the QoR turns into a clock.
+/// other slot has no such choice and is reported through \p paths instead.
 LogicalResult checkCombPathsMeetPeriod(const Datapath &dp, float cycleTime,
                                        const OperatorLibrary &lib,
                                        bool plannedBinding,
@@ -614,8 +611,8 @@ LogicalResult checkCombPathsMeetPeriod(const Datapath &dp, float cycleTime,
 /// where a binding can be withdrawn; elsewhere the path is reported and not
 /// refused, missing a target period being a quality-of-result finding rather
 /// than an illegal design. \p plannedBinding says the folds realize the
-/// schedule solve's own allocation, which reserved headroom for every select
-/// it bought, so a unit overrun is a broken invariant instead of a refusal.
+/// schedule solve's own allocation, which reserved headroom for every select it
+/// bought, so a unit overrun there is a broken invariant, not a refusal.
 LogicalResult checkEmitterSubset(dcp::DCPathModuleOp func, const Datapath &dp,
                                  float cycleTime, const OperatorLibrary &lib,
                                  bool plannedBinding,
@@ -880,9 +877,7 @@ static void assertModelInvariants(const Datapath &dp) {
 #endif
 }
 
-/// How many of a module's worst paths the report keeps. More than one because a
-/// compile is an iteration: the second and third findings are often the ones
-/// the same fix also addresses.
+/// How many of a module's worst paths the report keeps.
 constexpr unsigned kReportedPaths = 3;
 
 FailureOr<std::vector<TimingPath>>
@@ -895,7 +890,7 @@ validateDatapath(dcp::DCPathModuleOp func, const Datapath &dp, float cycleTime,
   assertModelInvariants(dp);
   // The design's own faults are reported before what this backend has not
   // built yet. The period check measures while it checks, so the paths come out
-  // of the traversal that already visits every priced cell.
+  // of that traversal.
   std::vector<TimingPath> paths;
   if (failed(checkStorageLegality(func, dp)) ||
       failed(checkStallContracts(dp)) ||
@@ -904,17 +899,15 @@ validateDatapath(dcp::DCPathModuleOp func, const Datapath &dp, float cycleTime,
     return failure();
 
   // A hundredth of a nanosecond, the grid the schedule's own delays are given
-  // on: a path that misses by less than that misses by nothing the model can
-  // see, and reporting it would be reporting the rounding.
+  // on: a path missing by less than that misses by nothing the model can see.
   constexpr double kQuantum = 0.01;
   unsigned missed = llvm::count_if(
       paths, [&](const TimingPath &p) { return p.slack < -kQuantum; });
   llvm::stable_sort(paths, [](const TimingPath &a, const TimingPath &b) {
     return a.total > b.total;
   });
-  // One path per capture site: a store whose address and data both miss says
-  // one thing, and a report spending its slots on the same operation hides the
-  // next two findings.
+  // One path per source anchor, so a store whose address and data both miss
+  // does not spend every reported slot on one operation.
   llvm::SmallDenseSet<llvm::StringRef> seen;
   llvm::erase_if(paths, [&](const TimingPath &p) {
     return !p.where.empty() && !seen.insert(p.where).second;

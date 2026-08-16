@@ -216,10 +216,9 @@ def test_single_access_channel_still_pipelines(stall):
     assert np.array_equal(B, A16 * 2 + 1)
 
 
-# Pipelining off paces the loop by its schedule depth, and a put commits in
-# its issue cycle (the FIFO's own register absorbs the write latency), so the
-# depth ends one cycle after the put's stage. Pacing by the write latency
-# would wait a phantom cycle every iteration.
+# Pipelining off paces the loop by its schedule depth. A put commits in its
+# issue cycle, the FIFO's own register absorbing the write latency, so the
+# depth ends one cycle after the put's stage.
 @pytest.mark.parametrize("stall", _STALLS)
 def test_nonpipelined_put_commits_in_its_issue_cycle(stall):
     @kernel

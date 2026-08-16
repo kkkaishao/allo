@@ -138,25 +138,24 @@ struct SpanNode {
   /// callee's whole start->done span, counted to its own `done` rising.
   bool instance = false;
   /// The contract composed here (an instance's, or one a leaf priced into its
-  /// drain) is a published ceiling (`latency_bound`), not an exact count.
+  /// drain) is a ceiling (`latency_bound`), not an exact count.
   bool contractBound = false;
   /// Body elements of a done-paced region, in program order. `std::vector`
   /// rather than `SmallVector`: the element type is this one, still incomplete
   /// here, and only `std::vector` is specified to accept that.
   std::vector<SpanNode> children;
-  /// A Guard's else-arm elements, in program order; `children` holds its
+  /// A guard's else-arm elements, in program order; `children` holds its
   /// then-arm's. Empty for an absent or empty else, which completes in the
   /// arming cycle.
   std::vector<SpanNode> elseChildren;
 };
 
-/// The per-invocation span of \p n: its start pulse to its `done` rising. It is
-/// WHOLE, including the node's own arming cost, so a composer only ever sums
-/// spans. A LEAF runs its own solved schedule and drains it; a DONE-PACED
-/// region runs its body elements in sequence, each handed to the next through
-/// its own `done` latch. A GUARD composes the deeper arm, a CEILING rather
-/// than an exact count (`spanHoldsBound`), so what contains one may publish
-/// only a `latency_bound`.
+/// The per-invocation span of \p n: its start pulse to its `done` rising,
+/// including the node's own arming cost, so a composer only ever sums spans. A
+/// leaf runs its own solved schedule and drains it; a done-paced region runs
+/// its body elements in sequence, each handed to the next through its own
+/// `done` latch; a guard composes the deeper arm, a ceiling rather than an
+/// exact count (`spanHoldsBound`).
 ///
 /// nullopt whenever any element is data-dependent, which leaves the enclosing
 /// span unknown rather than guessed.
@@ -164,10 +163,9 @@ std::optional<int64_t> composeSpan(const SpanNode &n);
 
 /// Whether the span composed of \p n is a ceiling rather than an exact count:
 /// a guard runs whichever arm its predicate takes, an assumed trip is a worst
-/// case, and a bounded contract hands its callee's own ceiling on. Meaningful
-/// only where `composeSpan` returned a value; the composition arithmetic is
-/// monotone and every region is done-paced in hardware, so a ceiling composes
-/// into a ceiling.
+/// case, and a bounded contract hands its callee's ceiling on. Meaningful only
+/// where `composeSpan` returned a value; the composition arithmetic is
+/// monotone, so a ceiling composes into a ceiling.
 bool spanHoldsBound(const SpanNode &n);
 
 /// A run of nodes composed in PROGRAM ORDER, hence the sum of their spans: each
@@ -184,17 +182,15 @@ std::optional<int64_t> composeSequence(llvm::ArrayRef<SpanNode> nodes);
 /// Three signals, the same three the emitter composes on
 /// (`DatapathBuilder::recordSiblingDeps`): a shared memref, a shared stream
 /// channel, and a cross-region SSA use. A shared memref orders only its hazard
-/// pairs (RAW / WAW / WAR): two nodes that only READ it overlap, and
+/// pairs (RAW / WAW / WAR): two nodes that only read it overlap, and
 /// `Datapath::portGraph` prices the separate ports that takes. A stream's
 /// token order is the program's, so its touchers are ordered regardless of
-/// direction, and a skewed layout keeps every toucher ordered (its lanes
-/// share a port per slot across regions). Everything else runs CONCURRENTLY.
+/// direction, and a skewed layout keeps every toucher ordered (its lanes share
+/// a port per slot across regions). Everything else runs concurrently.
 ///
-/// The edges must MATCH what `recordSiblingDeps` builds: the span is published
-/// as an exact contract, so a spurious edge here reports a hand-off the
-/// hardware overlaps, and a missing one claims an overlap it does not have.
-/// `RegionGraph`'s polyhedral refinement is therefore NOT used here: it drops
-/// edges the emitter keeps.
+/// The edges must match what `recordSiblingDeps` builds, since the span is
+/// published as an exact contract. `RegionGraph`'s polyhedral refinement is
+/// therefore not used here: it drops edges the emitter keeps.
 std::vector<llvm::SmallVector<unsigned, 2>>
 siblingPredecessors(llvm::ArrayRef<llvm::SmallVector<Operation *>> nodeOps);
 
@@ -207,13 +203,13 @@ struct MemTouch {
   std::optional<int64_t> bank;
 };
 
-/// Invoke \p addPred(p, c), p <= c skipped when equal, for each pair of
-/// \p touch (sorted by node) the hazard rule orders: per bank, each reader
-/// after the last writer and each writer after every reader since. A bank is
-/// its own storage, so touches of different banks never pair; a bank-less
-/// touch joins every bank. Read-read pairs stay unordered. The one edge rule
-/// `siblingPredecessors` and `DatapathBuilder::recordSiblingDeps` both
-/// compose on, which is what keeps the span and the hardware in lock-step.
+/// Invoke \p addPred(p, c) for each pair of \p touch (sorted by node) the
+/// hazard rule orders: per bank, each reader after the last writer and each
+/// writer after every reader since. A node paired with itself is skipped. A
+/// bank is its own storage, so touches of different banks never pair; a
+/// bank-less touch joins every bank. Read-read pairs stay unordered. This is
+/// the one edge rule `siblingPredecessors` and
+/// `DatapathBuilder::recordSiblingDeps` both compose on.
 void hazardEdges(llvm::ArrayRef<MemTouch> touch,
                  llvm::function_ref<void(unsigned, unsigned)> addPred);
 
@@ -252,7 +248,7 @@ struct RegionTiming {
   std::optional<int64_t> staticLatency;
   /// A ceiling on the span where one composes but is not exact
   /// (`spanHoldsBound`): a guard's deeper arm, or a bounded contract beneath.
-  /// Never set beside `staticLatency`; published as `latency_bound`, which a
+  /// Never set beside `staticLatency`. Published as `latency_bound`, which a
   /// caller may wait out but nothing may time-trigger against.
   std::optional<int64_t> boundedLatency;
 };

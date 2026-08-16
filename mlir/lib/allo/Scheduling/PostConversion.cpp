@@ -86,9 +86,8 @@ static void convertOp(Operation &op, OpBuilder &b, IRMapping &map,
       dst->setAttr("z", b.getF32FloatAttr(*at->startInCycle));
   };
   // An access also carries the setup delay the solve priced it against
-  // (`accessCharacterization`: the port's own delay plus the address cone)
-  // and the port delay alone, asked of the original op here because the
-  // characterization does not read the dcp form.
+  // (`accessCharacterization`: the port's own delay plus the address cone) and
+  // the port delay alone, both read off the original op.
   auto setAccessTiming = [&](Operation *dst) {
     setZ(dst);
     dst->setAttr(
@@ -202,9 +201,8 @@ static void convertOp(Operation &op, OpBuilder &b, IRMapping &map,
     for (NamedAttribute attr : op.getAttrs())
       nw->setAttr(attr.getName(), attr.getValue());
     setZ(nw);
-    // The setup delay the solve priced this op against, carried on the op so
-    // the emitter's model holds the schedule's own number rather than
-    // re-deriving one from the device.
+    // The setup delay the solve priced this op against, so the emitter's model
+    // holds the schedule's own number instead of re-deriving one.
     nw->setAttr("in_delay", b.getF32FloatAttr(oc.timing.inDelay));
     map.map(op.getResult(0), nw.getResult());
     return;
@@ -660,7 +658,7 @@ static void setDcpLatencies(DCPathModuleOp mod) {
     });
     if (container) {
       // A span composes when every child carries a contract and every region
-      // has a placement; `bounded` marks the total a ceiling (a guard, an
+      // has a placement. `bounded` marks the total a ceiling (a guard, an
       // assumed trip, a bounded callee), which a caller may wait out. A
       // concurrent composition's figure is a completion floor, never a bound.
       bool composable = known && allKnown;

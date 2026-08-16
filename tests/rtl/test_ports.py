@@ -110,11 +110,11 @@ def test_banked_argument_names_every_bank():
     assert np.array_equal(B, A[idx])
 
 
-# THE ONE-COUNTER CASE. `D` is written by the parent and then handed to a child
-# instance: the two writes are serial, so the binding colours them onto one
-# port and the child joins the parent's `D_wr0` group instead of opening a
-# second interface on the same bus. The child's read group is numbered off the
-# same counter, after the parent's (absent) reads, so it is `D_rd0`.
+# One counter numbers an array's groups across parent and child. `D` is
+# written by the parent and then handed to a child instance; the two writes
+# are serial, so the binding colours them onto one port and the child joins
+# the parent's `D_wr0` group. The child's read is numbered after the parent's
+# (absent) reads, so it is `D_rd0`.
 def test_call_write_joins_the_parents_boundary_group():
     @kernel
     def _bump(D: i32[8]):
@@ -371,11 +371,11 @@ def test_internal_signal_names():
 # ---------------------------------------------------------------------------
 
 
-# A boundary array READ-mastered by two serial children (the minimal atax
-# shape). The binding colours provably-serial accessors onto one port, so both
-# children share the one A read group, each driving its address only in its
-# own run window. `t` is the internal buffer chaining them; the loose RMW seed
-# makes the container mixed (leaf-routed) and keeps the init live.
+# A boundary array read by two serial children (the minimal atax shape). The
+# binding colours provably-serial accessors onto one port, so both children
+# share the one A read group, each driving its address only in its own run
+# window. `t` is the internal buffer chaining them; the loose RMW seed makes
+# the container mixed (leaf-routed) and keeps the init live.
 def test_two_serial_children_reading_one_boundary_array_share_a_group():
     @kernel
     def acc_t(A: i32[8], t: i32[8]):
@@ -408,8 +408,8 @@ def test_two_serial_children_reading_one_boundary_array_share_a_group():
 
 # The write-side mirror: two children writing disjoint halves of one boundary
 # array. The disjoint slices leave the calls free to overlap, so the binding
-# colours the writes apart and each keeps its own group; each child self-gates
-# its own we outside its run, so the idle master never writes. `s` is a
+# colours the writes apart and each keeps its own group; each child gates its
+# own we outside its run, so the idle master never writes. `s` is a
 # loose-written internal both children read (mixed container).
 def test_two_children_writing_one_boundary_array_mux_addr_data_we():
     @kernel
@@ -471,7 +471,7 @@ def test_disjoint_writers_get_separate_port_groups():
     assert np.array_equal(B, np.concatenate([A[:8] + 1, A[8:] * 2]))
 
 
-# A boundary array the PARENT writes and a child then read-modify-writes. The
+# A boundary array the parent writes and a child then read-modify-writes. The
 # shared-memref sibling edge keeps them serial, so the two writes share one
 # top port group, the child's arm selected on its run window.
 def test_call_shares_boundary_arg_with_parent_write():

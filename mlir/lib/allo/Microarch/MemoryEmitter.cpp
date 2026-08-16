@@ -13,7 +13,7 @@
 
 #include "allo/IR/AlloOps.h" // kIndependentWritesAttr
 #include "allo/Microarch/HWEmitter.h"
-#include "allo/Support/Logging.h" // the ram_style / arbitrated-writes note
+#include "allo/Support/Logging.h" // logging::debug
 
 #include "circt/Dialect/Comb/CombOps.h"
 #include "circt/Dialect/Seq/SeqOps.h"
@@ -36,9 +36,9 @@ static Value boundaryAddr(EmitContext &c, Value addr) {
 
 // Which of \p vals bank \p k takes, each tagged by the bank it reaches
 // (\p banks, parallel to it): the inverse of `readCrossbar`. At most one tag
-// equals `k` at a time, since a lane holds distinct slots and distinct slots
-// are distinct banks at every rotation, so the selects are one-hot; with no tag
-// on `k` the result is 0, a don't-care behind the port's own enable.
+// equals `k`, since a lane holds distinct slots and distinct slots are distinct
+// banks at every rotation, so the selects are one-hot; with no tag on `k` the
+// result is 0, a don't-care behind the port's own enable.
 static Value laneSelect(EmitContext &c, ArrayRef<Value> banks,
                         ArrayRef<Value> vals, unsigned k) {
   assert(banks.size() == vals.size() &&
@@ -113,18 +113,17 @@ BankSplit DatapathEmitter::bankAddress(const uarch::MemUnit &m,
   assert(acc.addrMap && "dcp memory access without an affine map");
   Value offset = buildAddr(acc, acc.offset, memAddrWidth(m));
   // The digit's cone is built at the datapath width so its intermediates keep
-  // their range, then narrowed to clog2(numBanks): consumers delay it and
-  // compare it against literal bank numbers, and `icmpEq` follows its width.
-  // It reduces like the offset: `counter mod F` is a register that wraps, not
-  // a `mod` on the setup path.
+  // their range, then narrowed to clog2(numBanks), the width `icmpEq` compares
+  // it against literal bank numbers at. It reduces like the offset: `counter
+  // mod F` is a register that wraps, not a `mod` on the setup path.
   Value bank =
       acc.hasBankCone
           ? addrAt(c.b, c.loc, buildAddr(acc, acc.bank, kDatapathAddressWidth),
                    std::max(1u, llvm::Log2_64_Ceil(m.numBanks)))
           : Value();
-  // No hold here: a boundary read address is held once where it leaves the
-  // module (`sharedAddress`, the crossbar read), and an internal port keeps
-  // its in-flight datum through its read enable instead.
+  // The hold is elsewhere: a boundary read address is held once where it leaves
+  // the module (`sharedAddress`, the crossbar read), and an internal port keeps
+  // its in-flight datum through its read enable.
   return {bank, offset};
 }
 
@@ -164,9 +163,8 @@ void DatapathEmitter::bindReadPorts() {
       continue;
     for (auto [i, acc] : llvm::enumerate(m.accesses))
       // A write, or a plan whose datum is a select over several ports rather
-      // than one port's: both are bound by `emitReads`.
-      // A Coloured access is statically banked, so it holds the one interface
-      // `acc.portBase` names rather than a per-bank expansion of it.
+      // than one port's: both are bound by `emitReads`. A Coloured access is
+      // statically banked and holds the one interface `acc.portBase` names.
       if (!acc.isWrite && acc.plan == PortPlan::Coloured)
         readData[accKey(m.id, i)] = pa.getInput(portData(acc.portBase));
   }
@@ -229,9 +227,9 @@ void DatapathEmitter::createInternalMemories() {
           mem->setAttr(kIndependentWritesAttr, c.b.getUnitAttr());
         // Pin the array to the row it is realized in. Leaving it unsaid hands
         // the structure to the synthesizer, which then builds something the
-        // cost model did not price. Arbitrated writes are the known exception:
-        // they share one `always` block, no RAM is inferred, and the pin sits
-        // on a register array the cost model priced as the row.
+        // cost model did not price. Arbitrated writes are the exception: they
+        // share one `always` block, no RAM is inferred, and the pin sits on a
+        // register array the cost model priced as the row.
         if (!m.ramStyle.empty()) {
           mem->setAttr(kRamStyleAttr, c.b.getStringAttr(m.ramStyle));
           if (m.writePortsBuilt > 1 && !m.writesIndependent)
@@ -315,9 +313,9 @@ void DatapathEmitter::emitReads(const uarch::RegionBlock &rb, Value issue) {
     case PortPlan::Crossbar: {
       // Read every bank at the (bank-independent) offset, then select by the
       // runtime bank, aligned with the read data. Such an access reaches every
-      // bank, so it holds a port of its own on each. A boundary address is
-      // held against back-pressure before it widens; an internal port freezes
-      // through its read enable instead.
+      // bank, so it holds a port of its own on each. A boundary address is held
+      // against back-pressure before it widens; an internal port freezes
+      // through its read enable.
       auto bs = bankAddress(m, acc);
       SmallVector<Value> vals;
       if (m.external) {
@@ -409,8 +407,8 @@ Value DatapathEmitter::sharedReadPort(const uarch::MemUnit &m, unsigned bank,
   SharedReadPort &p = sharedReads[{m.id, bank, port}];
   if (!p.data) {
     p.addr = c.bb.get(c.b.getIntegerType(memAddrWidth(m)));
-    // The read enable is a promise too: whether one owner's shell may freeze
-    // the port is only known once every holder has contributed.
+    // The read enable is a backedge: whether one owner's shell may freeze the
+    // port is known only once every holder has contributed.
     p.rdEnBE = c.bb.get(c.i1);
     p.data = c.R(
         atPort(seq::ReadPortOp::create(c.b, c.loc, memReadCell(m, bank, port),
@@ -440,9 +438,9 @@ DatapathEmitter::SinkArm DatapathEmitter::commitSink(ArrayRef<SinkArm> arms,
     c.muxLedger.add(MuxRole::Commit, arms.size() + (idle == Idle::Hold ? 1 : 0),
                     datapathWidth(term(arms.front()).getType()));
     // The arms are exclusive by construction (the binding proved two drivers
-    // never enabled together), so the reduction is the log-depth AND-OR
-    // `muxLevels` prices rather than an arms-1 priority chain. With nothing
-    // fired it reads 0, a don't-care behind `out.fired`.
+    // never enabled together), so the reduction is a log-depth AND-OR rather
+    // than an arms-1 priority chain. With nothing fired it reads 0, a
+    // don't-care behind `out.fired`.
     SmallVector<Value> vals, sels;
     for (const SinkArm &a : arms) {
       vals.push_back(term(a));
@@ -477,9 +475,8 @@ void DatapathEmitter::finalizeSharedReadPorts() {
   for (auto &[key, p] : sharedReads) {
     // The port freezes with its owner where that is unambiguous: a lone
     // region's chain enable keeps the in-flight datum in the port's own
-    // register. Several holders read every cycle off the held bus instead
-    // (a constant-true enable, which the hlmem lowering folds away). The
-    // shell is read here, resolved, not captured at contribution time.
+    // register. Several holders read every cycle off the held bus instead, a
+    // constant-true enable the hlmem lowering folds away.
     StallShell sh = p.arms.size() == 1 && p.ownerRegion
                         ? shellFor(*p.ownerRegion)
                         : StallShell{};
@@ -497,13 +494,11 @@ void DatapathEmitter::finalizeSharedReadPorts() {
 Value DatapathEmitter::sharedAddress(const uarch::MemUnit &m,
                                      ArrayRef<unsigned> idxs, Value issue,
                                      const StallShell &sh, Value *fired) {
-  // Select and hold at the bank's own address width; a boundary port widens
-  // after, so neither runs at the 32-bit boundary contract.
   auto addrOf = [&](unsigned i) {
     return bankAddress(m, m.accesses[i]).offset;
   };
-  // One hold after the select: a read frozen by back-pressure keeps
-  // re-presenting its address until its datum is taken.
+  // Selected and held at the bank's own address width, a boundary port widening
+  // only after, so neither runs at the 32-bit boundary contract.
   auto out = [&](Value addr) {
     addr = c.stallHold(addr, sh);
     return m.external ? boundaryAddr(c, addr) : addr;
@@ -763,9 +758,9 @@ void DatapathEmitter::finalizeScatteredPorts() {
           be.setValue(c.konst(memElemType(m, c.b), 0));
       continue;
     }
-    // One narrow decode per store, shared by every element: the alternative,
-    // a compare per (store, element) pair at the index's carried width, was
-    // the scatter's whole LUT bill.
+    // One narrow decode per store, shared by every element, rather than a
+    // compare per (store, element) pair at the index's carried width, which
+    // dominates the scatter's LUT bill.
     SmallVector<SmallVector<Value>> hot;
     for (const SinkArm &w : writes) {
       hot.push_back(oneHotDecode(c, w.addr, m.depthWords));
@@ -810,8 +805,8 @@ void DatapathEmitter::masterCallPorts(
     llvm::function_ref<Value()> runWindow, const StallShell &sh) {
   for (const uarch::CallUnit::MemArg &ma : cu.memArgs) {
     if (ma.isBoundary) {
-      // The child's drive is one arm of its colour's boundary group, so a
-      // holder it provably never issues with (another child, or a region's own
+      // The child's drive is one arm of its colour's boundary group: a holder
+      // it provably never issues with (another child, or a region's own
       // accesses) shares the bus, selected on the run window. Concurrent
       // masters carry distinct colours and keep distinct groups.
       if (ma.isWrite) {
@@ -873,8 +868,8 @@ void DatapathEmitter::masterCallPorts(
       }
       // The port may also be held by a sibling call or by the parent's own
       // accesses, so the datum comes off the one `seq.read` they share and the
-      // address joins its arms. A child paces itself, so it brings no read
-      // enable; as an owner it keeps the port unfrozen.
+      // address joins its arms. A child paces itself and brings no read enable,
+      // so as an owner it keeps the port unfrozen.
       rdBackedge[ma.data].setValue(sharedReadPort(m, ma.bank, ma.port));
       Value fired;
       if (portHasSeveralHolders(m, ma.bank, ma.port))

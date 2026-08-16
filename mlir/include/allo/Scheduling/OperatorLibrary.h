@@ -211,10 +211,10 @@ public:
   /// sharing one functional unit puts in front of each of its operand ports.
   int64_t muxPrice(int64_t sources, int64_t width) const;
 
-  /// What one instance of a REIFIED realization costs: the IP row \p identity
-  /// names, or the comb row of its kind, at \p width. The bind-time twin of
-  /// the price `lookup` resolves, for a caller no longer holding the original
-  /// operation. Zero where the device declares no such row.
+  /// What one instance of the realization \p identity names costs at \p width:
+  /// its IP row, or the comb row of its kind. The bind-time twin of the price
+  /// `lookup` resolves, for a caller not holding the original operation. Zero
+  /// where the device declares no such row.
   int64_t instancePrice(const OperatorIdentity &identity, int64_t width) const;
 
   /// What carrying a `width`-bit value across `depth` cycles costs, in the
@@ -228,8 +228,7 @@ public:
   int64_t pulsePrice() const;
 
   /// The measured `dcp.mux` delay row over fan-in and its unitless width
-  /// factor, null attrs on an uncharacterized device. `muxCone` below is the
-  /// one reader.
+  /// factor, null attrs on an uncharacterized device. Read by `muxCone`.
   CostAttr muxDelayRow() const { return muxDelay; }
   CostAttr muxDelayWidthRow() const { return muxDelayWidth; }
 
@@ -262,20 +261,20 @@ private:
   double regFloor = 0.0;  // `dcp.device`'s `reg_delay`
 };
 
-/// The combinational depth, in LUT levels, of the select a mux of \p sources
-/// sources costs: `ceil(log2 k)`, since the emitter builds a one-hot AND-OR
-/// reduction (`EmitContext::oneHotSelect`) and each level halves the term
-/// count. Zero for a single source, which is a wire.
+/// The combinational depth, in LUT levels, of a select over \p sources
+/// sources: `ceil(log2 k)`, the emitter building a one-hot AND-OR reduction
+/// (`EmitContext::oneHotSelect`) whose every level halves the term count. Zero
+/// for a single source, which is a wire.
 unsigned muxLevels(unsigned sources);
 
-/// A safety factor on the formula fallback below, sized from the gap a
-/// one-bit OR row leaves on a wide select. Unused on a device with a measured
+/// A safety factor on the formula fallback below, sized from the gap a one-bit
+/// OR row leaves on a wide select. Unused on a device with a measured
 /// `dcp.mux` delay row.
 inline constexpr double kMuxDelayMargin = 1.4;
 
 /// The routed marginal delay of a one-hot select over \p sources arms of
-/// \p width bits, in ns: the device's measured `dcp.mux` delay row, clamped
-/// to its measured domain (fan-in past the sweep grows one LUT level per
+/// \p width bits, in ns: the device's measured `dcp.mux` delay row, clamped to
+/// its measured domain (fan-in past the sweep grows one LUT level per
 /// several-fold, which the clamp under-counts slightly). A device without the
 /// row is priced at `muxLevels` times a margined one-bit OR row, the
 /// conservative direction. Zero for a single source, which is a wire.

@@ -33,8 +33,8 @@ layoutOf(const uarch::MemUnit &mu) {
   return {{shape.begin(), shape.end()}, std::move(axes)};
 }
 
-// One boundary interface on \p mu. Every field but the five passed in is
-// derived from the memory, so the two declaration sites cannot drift apart.
+// One boundary interface on \p mu; every field but the five passed in is
+// derived from the memory.
 Memory memPort(const uarch::MemUnit &mu, bool write, bool independent,
                unsigned bank, unsigned factor, llvm::StringRef base) {
   auto [shape, axes] = layoutOf(mu);
@@ -61,7 +61,7 @@ ModuleInterface::ModuleInterface(const uarch::Datapath &dp) {
   symbol = fn.getSymName().str();
   module = uarch::verilogName(symbol);
 
-  // The timing contract, republished verbatim from the op that declares it.
+  // The timing contract, republished from the op that declares it.
   if (std::optional<uint64_t> lat = fn.getLatency())
     latency = (int64_t)*lat;
   latencyBound = latency.has_value() && fn.getLatencyBound();
@@ -122,10 +122,9 @@ ModuleInterface::ModuleInterface(const uarch::Datapath &dp) {
     for (const uarch::CallUnit::MemArg &ma : cu.memArgs) {
       if (!ma.isBoundary || !ma.ownsGroup)
         continue;
-      // One port group per (bank, port) colour: a child sharing a colour
-      // shares the group (and the opener alone declares it), so concurrent
-      // accessors keep separate groups backed by the same array and a cyclic
-      // argument gets one group per bank.
+      // One port group per (bank, port) colour, declared by the child that
+      // opens it: concurrent accessors keep separate groups backed by the same
+      // array, and a cyclic argument gets one group per bank.
       const auto &mu = dp.mems[ma.mem];
       Memory m = memPort(mu, ma.isWrite, ma.independent, ma.bank, ma.factor,
                          ma.topBase);
@@ -291,9 +290,8 @@ std::string ModuleInterface::toJSON() const {
 
   Object root{{"module", module},
               {"symbol", symbol},
-              // The start->done contract. `latency` is absent rather than
-              // null when the span is data-dependent, so a consumer cannot
-              // read a number where none was published.
+              // The start->done contract. `latency` is omitted, not null, when
+              // the span is data-dependent.
               {"latency_bound", latencyBound},
               {"determinacy", determinacy},
               // The fixed control ABI, published so no consumer hard-codes it.

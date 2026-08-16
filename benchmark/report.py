@@ -193,8 +193,8 @@ _BUDGET = re.compile(r"ran out of budget")
 # ALLO_LOG_LEVEL=info and is absent otherwise; it prices what a better raise
 # could still recover.
 _RAISED = re.compile(r"Raised (\d+) loop\(s\) and (\d+) further memref access")
-# PROBE (temporary): the scheduler's own drain-floor measurements, on
-# ALLO_DRAIN_PROBE=1. Kept as raw lines for an offline script to parse.
+# The scheduler's drain-floor measurements, emitted under ALLO_DRAIN_PROBE=1.
+# Kept as raw lines for an offline script to parse.
 _PROBE = re.compile(r"^ALLOPROBE(?:II)? .*$", re.M)
 
 
@@ -314,8 +314,8 @@ def measure_one(
             uarch = rtl.microarch
             qor = rtl.estimation
             out["area"] = area_of(qor)
-            # The clock the model says the built design holds, beside the one it
-            # was cut to, and the worst paths that clock comes from, decomposed.
+            # The modelled clock beside the target it was cut to, plus the
+            # worst paths that clock comes from.
             out["fmax"] = round(qor.fmax, 1)
             out["fmax_target"] = round(qor.fmax_target, 1)
             out["critical_paths"] = [
@@ -626,9 +626,8 @@ def area_table(results: list[dict]) -> str:
         f" {tot['uram288']:>5} {tot['reg_ff']:>8}"
         f" {tot['reg_bits']:>8} {tot['mem_bits'] / 1024:>7.1f}"
     )
-    # Not a mispricing: the scheduling objective charges `chainPrice`, not this
-    # bit count, and the ratio below IS the shift-register discount the device
-    # row already models.
+    # The ratio below is the shift-register discount the device row models; the
+    # scheduling objective charges `chainPrice`, not this bit count.
     over = tot["reg_bits"] / max(tot["reg_ff"], 1)
     lines.append("")
     lines.append(

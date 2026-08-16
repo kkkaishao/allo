@@ -62,9 +62,9 @@ ROM_ENTRIES_PER_LUT = 64
 #: LUT sites a ``depth`` x ``width`` constant table takes: one per 64 entries of
 #: each bit, plus one more per eight of those to select between them (the
 #: narrower selects ride the slice's own F7/F8 and take no site of their own).
-#: Measured on every fabric, which spell this cell alike: exactly 32 / 160 /
-#: 288 / 576 / 1152 LUT6 at 64 / 256 / 512 / 1024 / 2048 x 32, and within 1.4%
-#: at 4096 and 16384. A table with regular contents minimizes below it.
+#: Every fabric measures alike here: exactly 32 / 160 / 288 / 576 / 1152 LUT6
+#: at 64 / 256 / 512 / 1024 / 2048 x 32, and within 1.4% at 4096 and 16384. A
+#: table with regular contents minimizes below it.
 ROM_LUT_COST = [
     (Tiled(ROM_ENTRIES_PER_LUT), Linear(1.0)),
     (
@@ -125,7 +125,7 @@ class FabricTiming(NamedTuple):
     #: grade has not been measured.
     mux: Cost | None = None
     mux_w: Cost | None = None
-    #: The routed delay of a constant table's read over its DEPTH at the same
+    #: The routed delay of a constant table's read over its depth at the same
     #: 32-bit reference width, and the factor its width scales it by. The one
     #: read delay that grows with the array: a table deep enough not to close is
     #: held in a memory instead. None where the grade has not been measured,

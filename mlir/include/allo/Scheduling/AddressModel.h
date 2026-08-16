@@ -23,7 +23,7 @@ struct BankLayout;
 /// bank varies at runtime builds a second cone for the digit, a real divider
 /// whenever the factor is not a power of two.
 struct AddressExprs {
-  AffineExpr offset;  // the element index WITHIN the bank this access reaches
+  AffineExpr offset;  // the element index inside the bank this access reaches
   AffineExpr bank;    // which bank, or null when it is decided at compile time
   unsigned width = 0; // bits `offset` is carried at (one bank's, not the whole)
 };
@@ -43,10 +43,10 @@ AddressExprs addressExprsOf(const BankLayout &layout, AffineMap map,
 struct AddressCost {
   double delay = 0.0;  // ns, longest path from an operand to the address
   unsigned adders = 0; // carry chains, including a coefficient's shift-adds
-  unsigned multipliers = 0; // generic multipliers (a NON-constant coefficient)
+  unsigned multipliers = 0; // generic multipliers (a non-constant coefficient)
   unsigned dividers = 0;    // dividers / remainder units
-  /// Register-carried pieces (`SplitAddress` terms and reads, both cones):
-  /// zero means the whole cone is residual and no register can shorten it.
+  /// Register-carried pieces (`SplitAddress` terms and reads). Zero means the
+  /// cone is entirely residual and no register can shorten it.
   unsigned carried = 0;
 
   /// Nothing is instantiated: the address is wiring off an existing value.

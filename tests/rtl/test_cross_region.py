@@ -37,11 +37,9 @@ def _survivors(rtl):
     """Every survivor register in the emitted module as sorted (name, shape).
 
     A survivor is named ``r<region>_sv<k>`` (`uarch::survivorName`). The shape
-    is read off the register's spelling: ``enabled`` is a ``seq.compreg.ce``
-    capturing on its enable with no recurrence, emitted for an acyclic
-    region's yield and for a guard's single result survivor; ``latch`` is
-    ``latchReg(init, value, start, capture)``, a plain register under
-    ``mux(start, init, mux(capture, value, self))``, preloaded with the
+    is read off the register's spelling: ``enabled`` is a ``seq.compreg.ce``,
+    a capture on its enable with no recurrence; ``latch`` is a plain register
+    under ``mux(start, init, mux(capture, value, self))``, preloaded with the
     loop-carried identity so a run that never captures yields the identity
     rather than a stale prior value.
     """
@@ -197,9 +195,9 @@ def test_conditional_container_survivors():
 
 
 def test_guard_result_survivor_captures_both_arms():
-    # A result guard: both arms capture into one enabled survivor. The arms'
+    # Both arms of a result guard capture into one enabled survivor: their
     # drain pulses are disjoint, so the then pulse selects the datum and their
-    # OR enables the capture, and a consumer reads a plain held register.
+    # OR enables the capture.
     @kernel
     def rmux(a: i32[4, 16], out: i32[4]):
         for g in range(4):
@@ -210,9 +208,8 @@ def test_guard_result_survivor_captures_both_arms():
             out[g] = acc
 
     rtl = _to_rtl(rmux)
-    # r1 latches the guard's own predicate (`g < 2`, an expression the scheduler
-    # placed), then the guard's one survivor under r2, plus r3, the guarded
-    # reduction inside the then arm.
+    # r1 latches the guard predicate (`g < 2`), r2 is the guard's one survivor
+    # and r3 the guarded reduction inside the then arm.
     assert _survivors(rtl) == [
         ("r1_sv0", "enabled"),
         ("r2_sv0", "enabled"),
@@ -464,10 +461,9 @@ def test_independent_siblings_run_concurrently_cosim():
 
 
 def test_read_read_siblings_overlap_cosim():
-    # Two sibling sweeps that only READ one shared array are a read-read pair:
-    # no hazard orders them, so the composer starts them together and each
-    # takes a read port of its own. Locked on the control structure and on the
-    # published span staying exact under the overlap.
+    # Two sibling sweeps that only read one shared array have no hazard
+    # between them, so the composer starts them together rather than gating
+    # the second on the first's done.
     @kernel
     def rrshare(A: i32[64], C: i32[64], D: i32[64]):
         for i in range(64):
@@ -486,15 +482,15 @@ def test_read_read_siblings_overlap_cosim():
     C = np.zeros(64, np.int32)
     D = np.zeros(64, np.int32)
     r = rtl.cosim(A, C, D)
-    assert r.cycles == lat  # the overlapped span is still an exact contract
+    assert r.cycles == lat  # the overlapped span is an exact contract
     assert np.array_equal(C, A + 1)
     assert np.array_equal(D, A * 2)
 
 
 def test_war_siblings_stay_ordered_cosim():
     # A reader followed by a writer of the same array is a WAR hazard: the
-    # writer must wait for the read sweep to drain, so its run register is
-    # gated on the reader's done. The numerics prove the old values were read.
+    # writer waits for the read sweep to drain, so its run register is gated
+    # on the reader's done and the reads see the old values.
     @kernel
     def war(A: i32[64], C: i32[64]):
         for i in range(64):

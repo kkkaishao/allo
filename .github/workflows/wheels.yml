@@ -80,11 +80,10 @@ jobs:
           path: ~/.local/share/or-tools-${{ env.ORTOOLS_VERSION }}
           key: wheels-ortools-${{ matrix.name }}-${{ env.ORTOOLS_VERSION }}
 
-      # Built from source as static archives, unlike CI's prebuilt download:
-      # the release binaries are shared-library-only and cover neither
-      # linux-aarch64 (Ubuntu) nor a macOS these runners can load, and static
-      # archives fold into the extension library like LLVM/CIRCT do, keeping
-      # the wheel self-contained without a vendoring/repair step.
+      # Built from source as static archives: the OR-Tools release binaries
+      # are shared-library-only and cover neither linux-aarch64 nor a macOS
+      # these runners can load. Static archives fold into the extension
+      # library, keeping the wheel self-contained.
       - name: Build OR-Tools
         if: steps.ortools-cache.outputs.cache-hit != 'true'
         run: |

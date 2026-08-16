@@ -480,7 +480,7 @@ double mlir::allo::muxCone(const OperatorLibrary &lib, unsigned sources,
   CostAttr row = lib.muxDelayRow();
   if (!row)
     // Unmeasured device: the OR row per level with a margin, which over-counts
-    // a routed cone two- to three-fold on the measured fabrics. Safe direction.
+    // a routed cone two- to three-fold on the measured fabrics.
     return muxLevels(sources) * kMuxDelayMargin * lib.combDelay(OpKind::Or, 1);
   auto clampEval = [](CostAttr c, int64_t p) {
     auto [lo, hi] = c.measuredDomain();

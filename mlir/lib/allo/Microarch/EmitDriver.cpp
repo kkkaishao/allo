@@ -228,8 +228,7 @@ LogicalResult emitDatapathToHW(ModuleOp module, StringRef binding,
 #ifndef NDEBUG
     // A determinate call is released by a static offset with no handshake, so
     // the latency it declares must equal the callee's own whole-kernel
-    // contract; the two are stamped by different reifies and nothing else
-    // compares them.
+    // contract. The two are stamped independently and compared nowhere else.
     for (const uarch::CallUnit &cu : dp.calls) {
       dcp::DCPathModuleOp callee = byName.lookup(cu.callee);
       if (!cu.determinate || !callee)

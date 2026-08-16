@@ -98,11 +98,10 @@ static SmallVector<DrainTerm> drainTerms(OccupancyProblem &problem,
 }
 
 // The cycle count one iteration paces by when iterations do not overlap: the
-// schedule depth, with the anchor's cycle re-derived so a stream put commits
-// at its stage (the rule `drainTerms` applies). The put's write latency lands
-// in the FIFO's own register, so pacing by it would wait a phantom cycle
-// every iteration. Every other anchor charge is kept: a store's write must
-// land, and a call's `done` needs its re-arm cycle.
+// schedule depth, with the anchor's cycle re-derived so a stream put commits at
+// its stage (the rule `drainTerms` applies), since a put's write latency lands
+// in the FIFO's own register. Every other anchor charge stands: a store's write
+// must land, and a call's `done` needs its re-arm cycle.
 static int64_t pacedDepth(ChainingModuloProblem &problem, Operation *anchor) {
   int64_t depth = 1;
   for (Operation *op : problem.getOperations()) {
@@ -563,7 +562,7 @@ LogicalResult FuncScheduler::scheduleWhileCondition(scf::WhileOp w) {
   FailureOr<SmallVector<Operation *>> cone = conditionCone(w);
   if (failed(cone))
     return failure();
-  if (cone->empty()) // settled before the loop: the CHECK waits out nothing
+  if (cone->empty()) // settled before the loop: the check waits out nothing
     return success();
   info(Stage::Sched, w.getOperation())
       << "Scheduling the while's own condition cone of " << cone->size()

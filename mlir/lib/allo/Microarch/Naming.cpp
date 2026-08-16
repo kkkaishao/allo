@@ -75,7 +75,7 @@ std::string ownerOf(Value v, llvm::StringRef fallback) {
 std::string uniqueOwnerOf(Value v, llvm::ArrayRef<Value> siblings,
                           llvm::StringRef fallback) {
   std::string own = ownerOf(v, fallback);
-  // Only one versus more than one decides the suffix, so stop at the second.
+  // Only one versus more than one matters, so stop at the second tie.
   unsigned ties = 0;
   for (Value s : siblings)
     if (ownerOf(s, fallback) == own && ++ties > 1)

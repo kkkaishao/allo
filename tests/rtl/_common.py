@@ -294,9 +294,9 @@ class Mod:
     def enable_of(self, reg, inp):
         """The enable selecting ``reg``'s next value, or None if unconditional.
 
-        An enabled cell is a ``seq.compreg.ce``, which names its enable as an
-        operand; a plain register spelled as a self-hold
-        (``compreg(mux(en, in, reg))``, the latch form) yields the mux select.
+        A ``seq.compreg.ce`` names its enable as an operand; a plain register
+        spelled as a self-hold (``compreg(mux(en, in, reg))``) yields the mux
+        select.
         """
         if reg in self.ce:
             return self.ce[reg]

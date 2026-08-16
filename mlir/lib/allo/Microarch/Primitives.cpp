@@ -205,10 +205,8 @@ Value readCrossbar(EmitContext &c, ArrayRef<Value> bankValues, Value bank) {
   c.muxLedger.add(MuxRole::Crossbar, bankValues.size(),
                   datapathWidth(bankValues[0].getType()));
   // The selects are exclusive by construction, so the reduction is the
-  // log-depth AND-OR `muxLevels` prices rather than an N-1 priority chain,
-  // and the compare runs at the index's live clog2(N) bits rather than its
-  // carried width. A no-match select reads 0, a don't-care (the program
-  // would be out of bounds).
+  // log-depth AND-OR `muxLevels` prices rather than an N-1 priority chain. A
+  // no-match select reads 0, a don't-care: the access is out of bounds.
   return c.oneHotSelect(bankValues, oneHotDecode(c, bank, bankValues.size()));
 }
 
@@ -336,8 +334,6 @@ Value evalAffine(OpBuilder &b, Location loc, AffineExpr e, ValueRange idx,
   }
   Value lhs =
       evalAffine(b, loc, bin.getLHS(), idx, numDims, kDatapathAddressWidth);
-  // Not an `assert`: under NDEBUG an unhandled kind would fall through to the
-  // mod arm and emit a wrong address rather than stop.
   if (e.getKind() == AffineExprKind::FloorDiv)
     return addrAt(b, loc, divConst(b, loc, lhs, f), width);
   if (e.getKind() == AffineExprKind::Mod)
@@ -551,8 +547,8 @@ Value EmitContext::konst(Type t, int64_t v) {
 
 // Only control state needs a synchronous reset. A value run's data is
 // don't-care until its valid pulse arrives, and a pulse run only needs a
-// defined power-on 0, which the initial value provides and the fabric's INIT
-// carries for free; the reset is what blocks shift-register extraction.
+// defined power-on 0, which the fabric's INIT carries for free. The reset is
+// what blocks shift-register extraction.
 static bool holdsReset(RegRole role) {
   return role != RegRole::Value && role != RegRole::Pulse;
 }
@@ -576,9 +572,8 @@ Value EmitContext::reg(Value in, Value rstVal, RegRole role) {
 }
 
 Value EmitContext::enabledReg(Value in, Value ce, Value rstVal, RegRole role) {
-  // A real clock enable, not the feedback-mux spelling: `seq.compreg.ce` is
-  // not self-referential, so CSE can merge identical runs, and the export
-  // pipeline lowers it after that. Cell-identical on the fabric either way.
+  // `seq.compreg.ce` is not self-referential, so CSE merges identical runs
+  // before the export pipeline lowers it.
   if (!inChainRun)
     ledger.add(role, datapathWidth(in.getType()), 1, holdsReset(role),
                /*enable=*/true);
@@ -611,9 +606,8 @@ Value EmitContext::latchReg(Value init, Value next, Value load, Value advance,
   if (!inChainRun)
     ledger.add(role, datapathWidth(init.getType()), 1, /*reset=*/true,
                /*enable=*/true);
-  // Kept in the self-holding spelling: a latch is a recurrence by nature,
-  // one per region result, so the CE form's CSE gain does not apply and the
-  // preload-vs-capture shape stays readable off the cone.
+  // Built in the self-holding spelling: a latch is a recurrence, one per region
+  // result, so the clock-enabled form's CSE gain does not apply.
   llvm::SaveAndRestore charged(inChainRun, true);
   Backedge selfNext = bb.get(init.getType());
   Value self = reg(selfNext, konst(init.getType(), 0), role);
@@ -648,9 +642,9 @@ Value EmitContext::oneHotSelect(ArrayRef<Value> values,
   return R(comb::OrOp::create(b, loc, type, terms, false));
 }
 
-// Charge one chain run split at its consumed taps: a synthesizer breaks a
-// shift register at every tap, so each maximal inter-tap segment is its own
-// run and a short segment falls back to flip-flops.
+// Charge one chain run split at its consumed taps: extraction breaks a shift
+// register at every tap, so each maximal inter-tap segment is its own run and a
+// short segment falls back to flip-flops.
 static void chargeChainRuns(RegLedger &ledger, RegRole role, unsigned width,
                             unsigned depth, ArrayRef<unsigned> taps, bool reset,
                             bool enable) {
@@ -708,7 +702,7 @@ ShiftChain EmitContext::foldedChain(Value in, unsigned depth, unsigned ii,
       held.push_back(cur);
     }
   }
-  // The run is the registers BUILT, not the cycles spanned: a fold holds the
+  // The run is the registers built, not the cycles spanned: a fold holds the
   // same `depth` taps in `n` of them, and cycle tap k reads register
   // ceil(k / ii), which is where the run splits.
   llvm::SmallVector<unsigned> regTaps;
@@ -776,7 +770,7 @@ Value EmitContext::delayValid(Value sig, unsigned n, const StallShell &sh) {
     for (unsigned k = have + 1; k <= n; ++k) {
       cur = shellReg(cur, f1, sh, RegRole::Pulse);
       // Label each stage with the cycle it is valid at, so a waveform reads
-      // `r1_v3`: region 1, three cycles after issue. Named after the OWNING
+      // `r1_v3`: region 1, three cycles after issue. Named after the owning
       // region, so a chain another region extends keeps one name family.
       if (!tag.empty())
         nameValue(cur, regionSignal(tag, "v" + std::to_string(k)));

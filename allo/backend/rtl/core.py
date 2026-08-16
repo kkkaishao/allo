@@ -46,8 +46,7 @@ _DERIVED_OPTIONS = {"cycle_ns"}
 
 class LatencyModelWarning(UserWarning):
     """A cosim ran for fewer cycles than the exact contract the kernel
-    publishes. A caller only waits longer than it had to, so this is a warning
-    and not a failure; its own class so a test run can filter it to an error."""
+    publishes. Its own class so a test run can filter it to an error."""
 
 
 # pylint: disable-next=too-many-instance-attributes
@@ -83,8 +82,8 @@ class RTL(Backend[P, R]):
         )
         self._cycle_time = 1000.0 / self.freq_mhz
         self.simulator = simulator
-        # The operator-sharing binding follows the scheduler, resolved when
-        # the schedule is built; `use_trivial_binding` is the one override.
+        # Operator-sharing binding, resolved from the scheduler when the
+        # schedule is built. `use_trivial_binding` overrides it.
         self.binding: str | None = None
         self._sched_opts = SchedulerOptions(cycle_ns=self._cycle_time)
         self._prepass_opts = PrepassOptions()
@@ -140,11 +139,9 @@ class RTL(Backend[P, R]):
     def use_trivial_binding(self) -> RTL:
         """Give every operation its own unit, folding nothing.
 
-        A development diagnostic, not part of the normal flow: it strips
-        binding-time sharing out of the datapath, so a miscompile can be
-        cornered to, or cleared of, the sharing muxes. Users get the binding
-        the scheduler implies: ``exact-share`` under the heuristic,
-        ``planned`` under an exact scheduler.
+        A development diagnostic that strips binding-time sharing out of the
+        datapath. The default binding follows the scheduler: ``exact-share``
+        under the heuristic, ``planned`` under an exact scheduler.
         """
         assert self._schedule_result is None, (
             "the schedule is already built, and everything downstream describes "
@@ -158,10 +155,9 @@ class RTL(Backend[P, R]):
         II, latency and per-op start times. Computed once and reused by
         ``compile()``, so it always describes the RTL that ``cosim`` runs."""
         if self._schedule_result is None:
-            # The default binding follows the scheduler, settled here because
-            # this is where the knobs stop turning: the exact solve carries its
-            # own allocation with its headroom, so `planned` realizes it; the
-            # heuristic decides none, so `exact-share` solves the fold instead.
+            # The default binding follows the scheduler: an exact solve carries
+            # its own allocation, so `planned` realizes it; the heuristic
+            # decides none, so `exact-share` solves the fold instead.
             if self.binding is None:
                 self.binding = (
                     "exact-share"
@@ -328,23 +324,20 @@ class RTL(Backend[P, R]):
         return result
 
     def _check_latency(self, cycles: int) -> None:
-        """Hold the published contract to the hardware: the manifest's
-        ``latency`` is the figure a caller times its consumers against, so a run
-        that outlasts it samples before this kernel writes and fails, while one
-        that finishes early only costs the caller cycles and warns. The only
-        check in the compiler that compares a model against a measurement rather
-        than against another model.
+        """Hold the published latency contract to the measured cycle count: a
+        run that outlasts it fails, a run that finishes early warns. The only
+        check in the compiler that compares a model against a measurement
+        rather than against another model.
         """
         iface = self.interfaces.of_symbol(self.top)
         fn = self.schedule().func(self.top)
-        # Two documents, one contract, stamped from the same attributes.
         assert (iface.latency, iface.latency_is_bound, iface.determinacy) == (
             fn.latency,
             fn.latency_is_bound,
             fn.determinacy,
         ), "the manifest and the schedule report disagree about the kernel's span"
-        # Nothing to hold it to: a data-dependent span publishes no figure, and
-        # a concurrent kernel's is a completion floor that times nothing.
+        # A data-dependent span publishes no figure, and a concurrent kernel's
+        # is a completion floor, so neither is held to a count.
         if iface.latency is None or iface.determinacy == "concurrent":
             return
         if cycles > iface.latency:
@@ -356,8 +349,8 @@ class RTL(Backend[P, R]):
                 f"({cycles - iface.latency:+d}); a caller time-triggered against "
                 "the published figure samples before this kernel writes"
             )
-        # A bound is an upper one, so slack under it is the point; only an exact
-        # contract is held to the cycle.
+        # Slack under a bound is expected; only an exact contract is held to
+        # the cycle.
         if cycles < iface.latency and not iface.latency_is_bound:
             warnings.warn(
                 f"DEV-ONLY: the latency model is pessimistic for '{self.top}': "

@@ -41,10 +41,10 @@ struct TrivialBinding : BindingPolicy {
 
 /// Exact within-region sharing: fold same-operator-type units whose MRT
 /// reservations are disjoint, decided by one CP-SAT solve per region
-/// (`solveSharing`) minimizing modelled area, with every input cone held to
-/// the period under the same recursion the emit-side gate walks. A greedy
-/// first-fit plan seeds the solve, and stands in when the solve's budget
-/// expires with nothing usable.
+/// (`solveSharing`) minimizing modelled area, with every input cone held to the
+/// period under the same recursion the emit-side gate walks. A greedy first-fit
+/// plan seeds the solve and stands in when its budget expires with nothing
+/// usable.
 struct ExactShareBinding : BindingPolicy {
   std::vector<llvm::SmallVector<UnitId, 2>>
   plan(const Datapath &dp, const BindingContext &ctx) const override;

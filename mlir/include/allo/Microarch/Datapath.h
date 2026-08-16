@@ -126,9 +126,9 @@ struct FuncUnit {
   OperatorIdentity identity;
   unsigned latency = 0;  // result available `latency` cycles after issue
   bool pipelined = true; // accepts a new input every cycle
-  /// The delay this unit's inputs must settle within, in ns, copied from the
-  /// `in_delay` the reifier stamped beside `z`, i.e. the row the solve priced
-  /// it against. Marginal for a comb unit, since `z` already carries the
+  /// The delay this unit's inputs must settle within, in ns, taken from the
+  /// `in_delay` stamped beside `z`, i.e. the library row the solve priced it
+  /// against. Marginal for a combinational unit, since `z` already carries the
   /// register floor a start-in-cycle is seeded at. Zero for an operation that
   /// renames bits rather than computing them.
   double inDelay = 0.0;
@@ -190,10 +190,10 @@ struct Register {
   /// of the depth formula, and the phase an II-folded chain captures on. Not
   /// re-derivable from `input`, whose shared unit names a representative op.
   unsigned ready = 0;
-  /// The depths consumers actually read (each `Source::Reg`'s `outPort`),
-  /// sorted ascending, zero excluded; the deepest equals `depth`. A
-  /// synthesizer breaks shift-register extraction at every tap, so the ledger
-  /// charges one run per maximal inter-tap segment rather than one of `depth`.
+  /// The depths consumers read (each `Source::Reg`'s `outPort`), sorted
+  /// ascending, zero excluded; the deepest equals `depth`. Shift-register
+  /// extraction breaks at every tap, so the ledger charges one SRL run per
+  /// maximal inter-tap segment rather than one of `depth`.
   llvm::SmallVector<unsigned, 2> taps;
 };
 
@@ -530,8 +530,8 @@ struct CallUnit {
     std::string addr, data, we; // child port names; `we` empty for a read
     std::string topBase; // top boundary port base (indexed); empty = internal
     /// Whether this MemArg opened `topBase`'s group. A child mastered on a
-    /// (bank, port) colour another holder already opened shares that group
-    /// instead, and only the opener declares it in the interface.
+    /// (bank, port) colour another holder already opened shares that group,
+    /// and only the opener declares it in the interface.
     bool ownsGroup = true;
   };
   llvm::SmallVector<MemArg, 2> memArgs;
@@ -697,10 +697,9 @@ struct Mux {
 /// The sub-cycle room \p u's bound ops have left, in ns: the smallest
 /// `cycleTime - z - inDelay` over them, less the reduction-identity select a
 /// recurrence port carries (priced off \p lib), which sits inside the proved
-/// cycle and consumes the room first. This bounds the combinational delay
-/// binding may add in front of the unit. Empty where any bound op carries no
-/// `z`: the solve never placed it, so its room is unknown rather than maximal
-/// and binding must not fold onto it.
+/// cycle. Bounds the combinational delay binding may add in front of the unit.
+/// Empty where any bound op carries no `z`: its room is unknown rather than
+/// maximal, so binding must not fold onto it.
 std::optional<double> unitSlack(const FuncUnit &u, const OperatorLibrary &lib,
                                 float cycleTime);
 
@@ -919,10 +918,10 @@ struct RegionBlock {
   // earlier sibling iff they touch a shared memref with a hazard between them
   // (RAW / WAW / WAR; read-read pairs overlap and take separate ports), a
   // shared stream, or a cross-region SSA edge (a scalar survivor); functional
-  // units are auto-disjoint under per-region binding, so memory is the only
-  // cross-region resource. A region with no predecessors starts concurrently
-  // with the kernel, one with predecessors on their joined `done`. Producers
-  // precede consumers in program order, so the relation is a DAG.
+  // units are auto-disjoint under per-region binding. A region with no
+  // predecessors starts concurrently with the kernel, one with predecessors on
+  // their joined `done`. Producers precede consumers in program order, so the
+  // relation is a DAG.
   llvm::SmallVector<RegionId, 2> predecessors;
 
   // Region nesting. A container region drives its `children` in its body; each
@@ -1018,7 +1017,7 @@ struct Datapath {
   /// The pulse-delay depth from which `delayValid` builds a counter instead of
   /// extending a chain: the crossover of the device's chain row against the
   /// counter's own registers and arithmetic, stamped by the builder. The
-  /// default stands on a device that prices neither side.
+  /// default applies on a device that prices neither side.
   unsigned countedDelayCycles = 64;
 
   Datapath() = default;
@@ -1040,9 +1039,8 @@ struct Datapath {
   unsigned readyCycle(const Source &s) const;
 
   /// The top-level region \p r sits under, walking the container chain to the
-  /// root. The granularity `recordSiblingDeps` orders at, and the one
-  /// `portGraph` reads that ordering back at, so both ask here rather than
-  /// each walking the chain itself.
+  /// root. The granularity `recordSiblingDeps` orders at and `portGraph` reads
+  /// that ordering back at.
   RegionId topRegionOf(RegionId r) const;
 
   void dump(llvm::raw_ostream &os) const;
@@ -1165,10 +1163,10 @@ unsigned dcpLatency(Operation *op);
 /// value with no producing op (a constant, the iteration counter).
 unsigned readyCycleOf(Operation *op);
 
-/// The cycle a store to \p m commits, relative to its region's issue: the done
-/// latch registers one cycle after this, so it is the commit cycle minus one.
-/// The model side and the emitter side reduce their own maxima over it, but
-/// they agree on the per-store number here.
+/// The drain cycle a store to \p m contributes, relative to its region's
+/// issue: `stage + writeLatency - 1`, one less than the commit cycle because
+/// the done latch registers a cycle after it. Model side and emitter side each
+/// reduce their own maximum over this per-store number.
 unsigned storeDrainCycle(const MemUnit &m, const MemUnit::Access &acc);
 
 /// A region's controller shape as one lower-case word, the single spelling

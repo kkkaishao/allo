@@ -252,9 +252,9 @@ class Storage:  # pylint: disable=too-many-instance-attributes
     # limit. A completely partitioned array resolves here whatever it would
     # otherwise have taken, and a device declares at most one.
     is_scatter: bool = False
-    # The other row that is not a memory: a constant lookup built out of logic,
-    # no address bus and no port limit. Only a read-only array declared with
-    # contents can resolve here, and a device declares at most one.
+    # A constant lookup built out of logic: no address bus, no port limit. Only
+    # a read-only array declared with contents resolves here, and a device
+    # declares at most one.
     is_table: bool = False
     # Ports of each direction one instance of the structure has, `None` for no
     # limit. The limit is per instance, not per array: the compiler decides how
@@ -277,10 +277,10 @@ class Storage:  # pylint: disable=too-many-instance-attributes
     # What it spends. Storage carries two parameters, `(depth, width)`, so each
     # entry is two cost factors or one `Tiled`.
     uses: Spend = ()
-    # The read delay over the array's DEPTH, and the factor its width scales it
-    # by, for a row whose cone grows with the array (a constant table's does;
-    # an addressed row's does not). Where they are given, `read_delay_ns` is the
-    # same curve at the row's reference shape.
+    # Read delay (ns) as a function of the array's depth, and the factor its
+    # width scales it by, for a row whose cone grows with the array (a constant
+    # table's does, an addressed row's does not). Where they are given,
+    # `read_delay_ns` is the same curve at the row's reference shape.
     read_delay_depth: Cost | None = None
     read_delay_width: Cost | None = None
 
@@ -359,16 +359,15 @@ class Device:
         # The three structures the emitter builds that nothing chooses between,
         # so they are one row each rather than a named realization.
         self.mux_uses: Spend = ()
-        # The routed marginal delay of a one-hot select over its fan-in at a
+        # Routed marginal delay (ns) of a one-hot select over its fan-in at a
         # 32-bit reference width, and the unitless factor its actual width
         # scales it by. None on an uncharacterized device, which the compiler
         # prices by a conservative formula instead.
         self.mux_delay: Cost | None = None
         self.mux_delay_width: Cost | None = None
         self.chain_uses: Spend = ()
-        # A value or pulse chain carries no reset, which is what lets the
-        # fabric extract a shift register; the ledger's `reset` flag picks
-        # between the two rows.
+        # A chain with no reset, which is what lets the fabric extract a shift
+        # register; the ledger's `reset` flag picks between the two rows.
         self.chain_uses_norst: Spend = ()
         self.storage: dict[str, Storage] = {}
         # The default is a NAME, not a handle: redeclaring a row (a copied
@@ -495,13 +494,12 @@ class Device:
         marks at most one, and one that marks none cannot hold a complete
         partition.
 
-        ``is_table`` marks the other row that is not a memory: a constant
-        lookup built out of logic, which is what a read-only array declared
-        with contents becomes. A device marks at most one, and one that marks
-        none realizes every such array as a memory that powers on holding them.
-        Its read delay grows with the array, so it declares
-        ``read_delay_depth``; a table too deep to close at the target clock is
-        held in a memory instead.
+        ``is_table`` marks the constant lookup built out of logic, which is what
+        a read-only array declared with contents becomes. A device marks at most
+        one, and one that marks none holds every such array in a memory that
+        powers on with the contents. A table's read delay grows with the array,
+        so the row declares ``read_delay_depth``; a table too deep to close at
+        the target clock is held in a memory instead.
 
         ``inst_reads`` / ``inst_writes`` are the ports of each direction one
         instance has, omitted where there is no limit; a scatter row declares
@@ -690,7 +688,7 @@ class Device:
 
     def set_mux_delay(self, delay_ns: Cost, width_factor: Cost | None = None) -> Device:
         """The routed marginal delay of that select in ns as a function of its
-        fan-in, measured at a 32-bit reference width; ``width_factor`` is the
+        fan-in, measured at a 32-bit reference width. ``width_factor`` is the
         unitless function of the actual width that scales it."""
         if not isinstance(delay_ns, Cost):
             raise TypeError("mux delay must be a Cost over the fan-in")
@@ -707,8 +705,8 @@ class Device:
         return self
 
     def set_chain_uses_norst(self, uses: dict[Resource, Sequence]) -> Device:
-        """The same chain without the reset, the form every value and pulse run
-        is emitted in and the row ``dcp.chain`` carries."""
+        """What the same chain spends with no reset, the form every value and
+        pulse run is emitted in and the row ``dcp.chain`` carries."""
         self.chain_uses_norst = self._spend(
             "a reset-free delay chain", "depth, width", uses
         )
@@ -1012,8 +1010,8 @@ def inject_device(module, device: Device):
                         else None
                     ),
                 )
-            # The reset-free row: every chain a schedule pays for carries a value
-            # or an activation pulse, and neither holds a reset.
+            # Every chain a schedule pays for carries a value or an activation
+            # pulse, neither of which holds a reset.
             if device.chain_uses_norst:
                 DCPathChainOp(uses=_uses_attr(device.chain_uses_norst))
             if device.stream_timing is not None:

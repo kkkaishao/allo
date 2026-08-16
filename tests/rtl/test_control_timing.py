@@ -599,11 +599,9 @@ def test_normalizing_a_strided_loop_lets_its_nest_coalesce():
 # ---------------------------------------------------------------------------
 
 
-# The QoR publishes the clock the model says the design holds: the longest path
-# it can account for, which is the schedule's own worst cycle plus whatever the
-# emitter built after the cut. Nothing here shares a port or a unit, so nothing
-# was built after it and the estimate stays inside the period the schedule was
-# cut to.
+# The QoR reports fmax from the longest modelled path. This kernel shares no
+# port and no unit, so nothing is built after the schedule's cut and the
+# estimate stays inside the target period.
 def test_the_qor_publishes_the_clock_the_model_holds():
     @kernel
     def vsum(A: i32[64], B: i32[64], C: i32[64]):
@@ -618,9 +616,8 @@ def test_the_qor_publishes_the_clock_the_model_holds():
     assert worst <= period + 1e-9
     assert est.fmax >= est.fmax_target
 
-    # A path is a decomposition and not a second number: it starts where a
-    # register or a port launches it, its steps sum to its total, and several
-    # are kept so one compile shows more than one thing to fix.
+    # A path starts at a register or port launch and its steps sum to its
+    # total; several paths are reported per compile.
     assert len(est.critical_paths) > 1
     for p in est.critical_paths:
         assert p.steps and p.steps[0].what.startswith("launch:")

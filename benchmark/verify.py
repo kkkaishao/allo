@@ -14,8 +14,8 @@ the bed's own claim, that a schedule may change the hardware and never the
 function, is the thing under test.
 
 The axis is the BINDING, i.e. how many physical units the schedule is realized
-on: the binding the scheduler implies, against the trivial control (one unit
-per op), so a sharing bug that needs a real workload to expose is caught over
+on: the binding the scheduler implies, against the trivial control of one unit
+per op, so a sharing bug that needs a real workload to expose is caught over
 the whole bed rather than by another unit test. `--scheduler` is a scalar and
 not a second axis on purpose: the two compose, and a sweep of the product
 answers a question nobody asked.
@@ -29,9 +29,9 @@ empty:
              how many variants it actually distinguished rather than letting a
              row count imply it.
     cycles   the measured cosim cycle count. `cosim` holds the kernel's
-             published contract to it, failing a run that outlasts the figure,
-             so a binding that moved the schedule shows up as a number rather
-             than as a silent pass.
+             published latency contract to it, failing a run that outlasts the
+             figure, so a binding that moved the schedule shows up as a number
+             rather than as a silent pass.
 
 Each run is a subprocess for the reason `report.py` uses one: a solver that does
 not terminate, an assert that fires and a simulator that dies are all results,
@@ -166,9 +166,9 @@ def verify_one(
         )
 
         out["stage"] = "cosim"
-        # `cosim`'s oracle raises on the unsound direction, which lands in
-        # `error` below; its pessimism warning would otherwise die with the
-        # child's stderr, so it is carried in the row instead.
+        # A run that outlasts the published latency raises and lands in `error`
+        # below; the pessimism warning would die with the child's stderr, so it
+        # is carried in the row instead.
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always", LatencyModelWarning)
             out["cycles"] = rtl.cosim(
@@ -295,9 +295,9 @@ def coverage_note(results: list[dict], bindings: list[str]) -> str:
 
 
 def oracle_note(results: list[dict]) -> str:
-    """How much of the sweep the latency oracle held to a number, and every run
-    that beat its own exact contract. A kernel whose span is data-dependent
-    publishes no figure, so its row rests on the functional comparison alone."""
+    """How many runs were held to a published latency, and every run that beat
+    its own contract. A kernel whose span is data-dependent publishes no
+    figure, so its row rests on the functional comparison alone."""
     ran = [r for r in results if r.get("cycles") is not None]
     if not ran:
         return ""

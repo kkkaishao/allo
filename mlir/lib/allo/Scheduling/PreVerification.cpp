@@ -55,7 +55,7 @@ namespace {
 // One end of a channel: which call holds it, and which way tokens move.
 struct CallEnd {
   Operation *call;
-  bool isInput; // the child GETS from the channel
+  bool isInput; // the child gets from the channel
 };
 
 // A channel as this function sees it: the ends it issues itself, the ends its
@@ -66,7 +66,7 @@ struct Channel {
   ArrayAttr init;
   SmallVector<Operation *> accesses; // this function's own get / put ops
   bool anyPut = false, anyGet = false;
-  unsigned producers = 0; // CHILDREN writing it; a local put is not one
+  unsigned producers = 0; // children writing it; a local put is not one
   SmallVector<CallEnd> callEnds;
 };
 } // namespace
@@ -371,9 +371,9 @@ LogicalResult checkMemories(func::FuncOp func, const MemoryLibrary &memLib,
              "registers; the two cannot both hold. Drop one of them";
       return failure();
     }
-    // Only an initialized array nothing writes is a constant table: the row is
-    // a lookup built out of logic, with no port to take a store. Reachable
-    // only through an explicit binding, since nothing else resolves here.
+    // A `table` row is a lookup built out of logic with no port to take a
+    // store, so only an initialized array nothing writes may bind to one.
+    // Reached only through an explicit binding.
     if (memLib.isTable(storage) && !isa<BlockArgument>(array) &&
         !isConstantTable(array)) {
       error(Stage::Prep, Code::ArrayLayoutConflict, anchor)
@@ -809,9 +809,8 @@ static LogicalResult checkAddressCost(func::FuncOp funcOp,
         accessCharacterization(op, dev.operators, dev.memory).inDelay;
     bool over = charged > cycleTimeNs;
     if (over && cost.carried == 0) {
-      // A cone that reduced to nothing is combinational into the port whole:
-      // an address is folded into the access's map rather than scheduled as an
-      // operation of its own, so there is nowhere to place a register.
+      // No term follows a counter, so the whole cone is combinational into the
+      // port and there is nowhere to place a register.
       ++overCycle;
       fits = false;
       unsupported(Stage::Prep, Code::AddressOverPeriod, op)
@@ -827,8 +826,8 @@ static LogicalResult checkAddressCost(func::FuncOp funcOp,
              "divider, or lower the target frequency";
     } else if (over) {
       // Part of the sum follows a counter and can land in the address delay
-      // register, so the emitted path may be shorter than this pre-schedule
-      // number; a missed period reports rather than refuses, and the post-cut
+      // register, so the built path may be shorter than this pre-schedule
+      // number. A missed period reports rather than refuses; the post-cut
       // timing walk publishes the path actually built.
       ++overCycle;
       warn(Stage::Prep, op)

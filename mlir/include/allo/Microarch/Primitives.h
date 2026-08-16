@@ -47,8 +47,8 @@ IntegerType memElemType(const uarch::MemUnit &m, OpBuilder &b);
 /// address 1 bit; the spare is never read. One rule, since a leaf's accesses
 /// and a composed container's child ports must agree on the address width.
 unsigned declaredDepth(unsigned words);
-/// The bits an address of \p m carries: clog2 of its declared depth. The one
-/// spelling, since a bus, a backedge and the mux priced against it must agree.
+/// The bits an address of \p m carries: clog2 of its declared depth. Buses,
+/// backedges and the muxes priced against them share this width.
 unsigned memAddrWidth(const uarch::MemUnit &m);
 /// The element bit patterns of a compile-time array initializer, in NATURAL
 /// order (element 0 first), each resized to \p width and padded with zero to
@@ -133,9 +133,8 @@ struct BankSplit {
 /// read latency.
 Value readCrossbar(EmitContext &c, ArrayRef<Value> bankValues, Value bank);
 
-/// Decode \p idx into one line per target: line k = (idx == k), compared once
-/// at the index's live clog2(n) bits so every consumer shares the narrow
-/// compare instead of building its own at the carried width.
+/// Decode \p idx into one line per target: line k = (idx == k), compared at the
+/// index's live clog2(n) bits so consumers share one narrow compare.
 SmallVector<Value> oneHotDecode(EmitContext &c, Value idx, unsigned n);
 
 /// The 1:N write mirror of `readCrossbar`: the write-enable of bank \p k when
@@ -180,19 +179,18 @@ struct StallShell {
   // wherever the region may drain a deferred pass away, leaving a bubble.
   Value issueEnable; // G consumes; null => rigid (issue ungated)
   // The owning region, stamped by `shellFor`: the region whose pass discipline
-  // the delayed pulses obey, not necessarily the one currently emitting. Names
-  // the delay cells; unset on a bare rigid shell.
+  // the delayed pulses obey. Names the delay cells; unset on a bare rigid
+  // shell.
   std::optional<unsigned> region;
   // Whether the owner has at most one pass in flight
   // (`RegionBlock::singlePass`), which is what lets `delayValid` time a long
-  // delay with a counter: a pipelined region's chain taps each hold a
-  // DIFFERENT in-flight iteration, so a counter would drop every pulse but
-  // the first.
+  // delay with a counter: a pipelined region's chain taps each hold a distinct
+  // in-flight iteration, so a counter would drop every pulse but the first.
   bool singlePass = false;
   /// Whether this region is latency-insensitive at all (has a stall shell).
   explicit operator bool() const { return chainEnable != Value(); }
   /// This shell with the enables dropped: the raw clock as the time base, the
-  /// owner's pass discipline kept (a concurrent container's timed offsets).
+  /// owner's pass discipline kept.
   StallShell rigid() const { return {Value(), Value(), region, singlePass}; }
 };
 
@@ -212,13 +210,13 @@ struct EmitContext {
   Value zero32, one32, f1, t1; // set by initLiterals()
 
   // The region being emitted, as a naming prefix (`r3`). Naming only, with no
-  // semantics attached: a delay cell is named after the shell that OWNS it,
-  // and this is only the fallback for a shell carrying no region.
+  // semantics attached: a delay cell is named after the shell that owns it, and
+  // this is the fallback for a shell carrying no region.
   std::string regionTag;
 
   // The pulse-delay depth from which `delayValid` builds a counter instead of
-  // extending a chain, stamped from `Datapath::countedDelayCycles` (the
-  // device-row crossover). An unstamped context never counts.
+  // extending a chain, stamped from `Datapath::countedDelayCycles`. An
+  // unstamped context never counts.
   unsigned countedDelayCycles = std::numeric_limits<unsigned>::max();
 
   // Every register this module's emission builds, by run. `reg` below is the
@@ -234,8 +232,7 @@ struct EmitContext {
   // stages must not each charge one of their own.
   bool inChainRun = false;
   // Power-on immutables by constant, shared across every reset-free register
-  // of the module (the hw.module body is a graph region, so use sites need
-  // not follow the definition).
+  // of the module.
   llvm::DenseMap<Attribute, Value> initials;
   // Pulse-delay memos: one chain per (source, chain enable) extended to the
   // deepest requested stage and tapped, and one counter per exact
@@ -254,7 +251,7 @@ struct EmitContext {
 
   /// The power-on value a reset-free register carries, as the shared
   /// `seq.initial` immutable for \p rstVal's constant. One per distinct
-  /// constant: a 64-stage chain must not build 64 initial regions.
+  /// constant, so a 64-stage chain builds one initial region.
   Value initialFor(Value rstVal);
 
   /// Registered (1-cycle): out[t+1] = in[t], sampled unconditionally on every
@@ -264,7 +261,7 @@ struct EmitContext {
   /// the fabric.
   ///
   /// The one place a register is built (with `enabledReg` below), which is
-  /// what makes `ledger` exact. \p role is what the register is FOR, charged
+  /// what makes `ledger` exact. \p role is what the register is for, charged
   /// as a run of one unless a chain builder is already charging the whole run
   /// it belongs to.
   Value reg(Value in, Value rstVal, RegRole role = RegRole::Control);
@@ -305,9 +302,9 @@ struct EmitContext {
   ///
   /// Charges the ledger one run per maximal inter-tap segment of \p taps (the
   /// consumed depths, sorted, deepest == \p depth), since extraction breaks at
-  /// every tap; an empty \p taps charges one run of `depth`. Only the caller
-  /// knows whether the run carries a datum or a pulse, so \p role comes from
-  /// there.
+  /// every tap; an empty \p taps charges one run of `depth`. \p role comes from
+  /// the caller, which is what knows whether the run carries a datum or a
+  /// pulse.
   ShiftChain shiftChain(Value in, unsigned depth, const StallShell &sh,
                         RegRole role = RegRole::Value,
                         ArrayRef<unsigned> taps = {});
@@ -329,12 +326,10 @@ struct EmitContext {
                          ArrayRef<unsigned> taps = {});
   /// A 1-bit signal delayed `n` cycles (issue -> a store's pipeline stage):
   /// tap `n` of the one pulse chain per (signal, time base), extended on demand
-  /// so every consumer shares its stages, which is the tap rule
-  /// `insertRegisters` applies to value chains. Powers on to 0, so no spurious
-  /// valid. A delay past `countedDelayCycles` under a single-pass owner
-  /// (`sh.singlePass`) is built as `delayPulseCounted` instead (memoized per
-  /// exact depth, a counter admitting no taps): `n` registers to hold one
-  /// pulse is a cost that tracks the schedule rather than the datapath.
+  /// so every consumer shares its stages. Powers on to 0, so no spurious valid.
+  /// A delay past `countedDelayCycles` under a single-pass owner
+  /// (`sh.singlePass`) is built as `delayPulseCounted` instead, memoized per
+  /// exact depth since a counter admits no taps.
   Value delayValid(Value sig, unsigned n, const StallShell &sh);
   /// One pulse delayed `n` cycles by a counter: `log2(n)` registers instead of
   /// `n`, at the cost of admitting only one pulse at a time. Sound exactly
@@ -380,7 +375,7 @@ struct EmitContext {
   /// \p level does).
   Value completedSince(Value level, Value passStart);
   /// `completedSince` with the level's rising-edge pulse already in hand, so a
-  /// caller that also consumes the pulse does not build its register twice.
+  /// caller that also consumes the pulse shares its register.
   Value completedSinceEdge(Value edge, Value passStart);
   /// Split a one-cycle \p when pulse by predicate \p cond into {taken,
   /// notTaken} = {when & cond, when & ~cond}: `taken` (re)starts a container's

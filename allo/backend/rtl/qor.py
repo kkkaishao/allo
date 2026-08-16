@@ -131,14 +131,13 @@ class QoR:  # pylint: disable=too-many-instance-attributes
     latency_min: int | None
     #: what each region's solve decided, keyed ``"<func>#<order>"``.
     interval: dict[str, int]
-    #: the clock this design's longest accountable combinational path holds,
-    #: below ``fmax_target`` where the structures grown after the schedule ate
-    #: the room it left. Estimated off summed device rows, with no placement or
-    #: routing in it, so never a substitute for the part's own timing report.
+    #: MHz the design's longest accountable combinational path holds. Estimated
+    #: from summed device rows, with no placement or routing in it, so not a
+    #: substitute for the part's own timing report.
     fmax: float
     fmax_target: float  # MHz, the period the schedule was cut to
-    #: the paths that clock comes from, longest first and across every module,
-    #: each decomposed into the cells the signal passes through.
+    #: the paths behind ``fmax``, longest first across every module, each
+    #: decomposed into the cells the signal passes through.
     critical_paths: tuple[TimingPath, ...]
     area: Utilization
     #: the fabric total split by what spends it: units / muxes / regs / memories
@@ -176,8 +175,7 @@ class QoR:  # pylint: disable=too-many-instance-attributes
         return self.latency is not None
 
     def timing_report(self, limit: int = 3) -> str:
-        """The worst paths as text: what each step costs, what it runs through,
-        and where it ends."""
+        """The worst paths as text: what each step costs and where it ends."""
         period = 1000.0 / self.fmax_target
         head = (
             f"estimated {self.fmax:.1f} MHz against a {self.fmax_target:.1f} MHz "
@@ -255,9 +253,9 @@ def estimate(report: CompileReport, device: Device = default_device) -> QoR:
         by_func.setdefault(f.func, Utilization())
 
         # A register RUN is the cost unit, not a register: past the extraction
-        # threshold the flip-flop count stops tracking depth. The reset flag
-        # picks the row, since the reset is what blocks extraction; the enable
-        # is measured cell-identical either way and prices nothing.
+        # threshold the flip-flop count stops tracking depth. A reset blocks
+        # extraction and so picks the row; an enable is measured cell-identical
+        # either way.
         for c in f.regs:
             uses = device.chain_uses if c.reset else device.chain_uses_norst
             run = Utilization.of(price(uses, (c.depth, c.width)))
@@ -291,9 +289,8 @@ def estimate(report: CompileReport, device: Device = default_device) -> QoR:
                 one = Utilization.of(price(device.mux_uses, (m.fanin, m.width)))
                 charge("muxes", f.func, one * m.count)
 
-        # The select cones the emitter built around storage (shared-port
-        # selects, commit sinks, crossbars): part of what the memory plane
-        # costs, so they are charged beside the storage rows.
+        # Select cones around storage (shared-port selects, commit sinks,
+        # crossbars) are charged to the memory plane.
         for m in f.mux_cones:
             one = Utilization.of(price(device.mux_uses, (m.fanin, m.width)))
             charge("memories", f.func, one * m.count)
@@ -322,8 +319,8 @@ def estimate(report: CompileReport, device: Device = default_device) -> QoR:
 
         # A channel wired between children or created in this body is a queue
         # this module builds, priced one cell per element since the register
-        # ledger does not hold it. What remains is a boundary port, whose
-        # queue lives in the module that builds it.
+        # ledger does not hold it. The rest are boundary ports, whose queues
+        # live in the module that builds them.
         for s in f.streams:
             if s.crosses_call or s.internal:
                 charge(
@@ -339,7 +336,7 @@ def estimate(report: CompileReport, device: Device = default_device) -> QoR:
     sched = report.schedule
     top = sched.func(report.microarch.top.func)
     exact = top.latency_is_exact
-    # The design's paths are its modules', which run on one clock.
+    # Every module runs on the same clock, so their paths merge into one list.
     critical_paths = tuple(
         sorted(
             (p for f in report.microarch.funcs for p in f.critical_paths),

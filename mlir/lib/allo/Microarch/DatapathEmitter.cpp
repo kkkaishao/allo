@@ -22,7 +22,7 @@ Value DatapathEmitter::resolveMux(uarch::MuxId id) {
   const uarch::Mux &mx = dp.muxes[id];
   Value issue = controlOf.lookup(mx.region).issue;
   assert(issue && "mux in a region with no controller");
-  // Timed against the OWNING region's shell (`mx.region`), not whichever
+  // Timed against the owning region's shell (`mx.region`), not whichever
   // region is emitting: the select rides that region's issue pulse.
   StallShell sh = shellFor(mx.region);
   // A recurrence operand's iteration windows, delayed to their op's stage and
@@ -673,7 +673,7 @@ void DatapathEmitter::emitComposedChannel(const uarch::StreamChannel &s) {
   auto consumerReady = [&](const uarch::StreamChannel::CallEnd &e) {
     return callOuts[e.call][dp.calls[e.call].streamArgs[e.arg].ready];
   };
-  if (!pData) { // a boundary INPUT feeds the readers
+  if (!pData) { // a boundary input feeds the readers
     pData = pa.getInput(portData(base));
     pValid = pa.getInput(portValid(base));
     // A single reader takes it straight, queue-free.
@@ -867,15 +867,15 @@ void DatapathEmitter::emitCalls(const uarch::RegionBlock &rb, Value issue,
       for (auto [k, res] : llvm::enumerate(dp.regions[cu.region].results))
         if (res.value.kind == uarch::Source::Kind::Call &&
             res.value.id == cu.id && res.value.outPort == r)
-          // Left unnamed, unlike the other survivors: the value is a child
-          // instance result, which already carries the instance's port name.
+          // Left unnamed: the value is a child instance result, which already
+          // carries the instance's port name.
           setSurvivor(cu.region, k, outs[port]);
     }
 
     // Scoped to this pass for the join below and the conjunction in the run
     // window, which would otherwise read the previous pass's latched 1. A
     // CallNode (loop-over-call) region is paced by each invocation's
-    // completion PULSE instead, and its child has no sibling to join, so the
+    // completion pulse instead, and its child has no sibling to join, so the
     // pass-scoped level is built only where the run window asks for it.
     bool loopCalled = rb.shape == uarch::RegionBlock::Shape::CallNode;
     assert((!loopCalled || (rb.callUnits.size() == 1 && !concurrent)) &&

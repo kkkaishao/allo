@@ -389,8 +389,6 @@ Datapath::PortRelation Datapath::portGraph(MemId id,
                                            std::optional<bool> writes) const {
   const MemUnit &m = mems[id];
   PortRelation rel;
-  // Top-level ancestor of a region: the granularity `recordSiblingDeps` orders
-  // at, and a container's children stay serial below it.
   // Does call \p a precede \p b transitively? A channel-joined pair in a
   // concurrent container is deliberately NOT ordered, and writes from such a
   // pair really are simultaneous. Memoized, since the pair loop below is
@@ -473,7 +471,7 @@ Datapath::PortRelation Datapath::portGraph(MemId id,
     if (va.call >= 0 && vb.call >= 0) {
       if (callPrecedes(va.call, vb.call) || callPrecedes(vb.call, va.call))
         return false;
-      // An unordered pair of one SCHEDULED region still cannot meet when the
+      // An unordered pair of one scheduled region still cannot meet when the
       // earlier contract drains before the later release: a TimeTriggered
       // child runs exactly [start, start+latency), and no child of such a
       // region is released before its placed cycle (`startForCall`).

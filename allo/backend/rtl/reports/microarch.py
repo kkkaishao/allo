@@ -30,9 +30,9 @@ class RegClass:
 
     The run, not the register, is the cost unit: past the synthesizer's
     shift-register extraction threshold a run stops costing flip-flops per
-    stage, so a model handed only a register total cannot price it. ``reset``
-    and ``enable`` complete that shape: a synchronous reset blocks the
-    extraction and pays fabric per bit, a clock enable is free."""
+    stage, so a model handed only a register total cannot price it. A
+    synchronous reset blocks that extraction and pays fabric per bit; a clock
+    enable is free."""
 
     role: RegRole
     width: int
@@ -102,9 +102,9 @@ class MuxClass:
 
 @dataclass(frozen=True)
 class MuxCone:
-    """``count`` select cones the emitter built around storage: shared-port
-    address selects, commit sinks and bank/scatter crossbars. A population
-    disjoint from :class:`MuxClass`, which is the allocation's own muxes."""
+    """``count`` select cones around storage: shared-port address selects,
+    commit sinks and bank/scatter crossbars. Disjoint from :class:`MuxClass`,
+    which holds the allocation's own muxes."""
 
     role: str  # "address" / "commit" / "crossbar"
     fanin: int
@@ -340,8 +340,8 @@ class RegionUarch:
 @dataclass(frozen=True)
 class TimingStep:
     """One step of a combinational path: what the signal passes through, and
-    what the path spends there. A step is one model cell, so it can be a lump
-    the model prices without decomposing (an address cone, a select)."""
+    what the path spends there in ns. A step is one model cell, so it can be a
+    lump the model prices without decomposing (an address cone, a select)."""
 
     what: str
     delay: float  # ns
@@ -400,20 +400,19 @@ class FuncUarch:
     #: module-wide: a register run belongs to the value it carries, not to a
     #: region, and the ledger counts it where it is BUILT.
     regs: list[RegClass] = field(default_factory=list)
-    #: module-wide for the same reason: the select cones built around storage.
+    #: module-wide, like ``regs``: the select cones built around storage.
     mux_cones: list[MuxCone] = field(default_factory=list)
     mems: list[Memory] = field(default_factory=list)
     streams: list[Stream] = field(default_factory=list)
     calls: list[Call] = field(default_factory=list)
-    #: this module's worst combinational paths, longest first. What nobody
-    #: prices is not in them, so they estimate and never substitute for place
-    #: and route.
+    #: this module's worst combinational paths, longest first. Structures with
+    #: no delay model are absent from them, so they are estimates and no
+    #: substitute for place and route.
     critical_paths: tuple[TimingPath, ...] = ()
 
     @property
     def critical_ns(self) -> float:
-        """The longest path's total, in ns; zero only where none was published,
-        every emitted module holding at least one register hop."""
+        """The longest path's total in ns, zero where none was published."""
         return self.critical_paths[0].total if self.critical_paths else 0.0
 
     @property

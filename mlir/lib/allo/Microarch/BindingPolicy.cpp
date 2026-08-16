@@ -54,7 +54,7 @@ llvm::DenseMap<Operation *, unsigned> unitOwners(const Datapath &dp,
 }
 
 /// The region-local unit driving \p v, when it produces \p v combinationally in
-/// \p y's own issue cycle so its input mux lengthens \p y's cone too.
+/// \p y's own issue cycle so its input mux lengthens \p y's cone.
 std::optional<unsigned>
 combPred(const llvm::DenseMap<Operation *, unsigned> &owner, Value v,
          Operation *y) {
@@ -74,7 +74,7 @@ bool readsRecurrence(const RegionBlock &rb, Operation *op) {
 /// Whether \p v is held for the whole of \p rb's run: defined outside the
 /// region, it reaches it as a literal, a boundary port, a survivor or an
 /// enclosing counter, one source at every issue cycle. A value the region
-/// schedules lands at a different register tap per consumer cycle instead.
+/// schedules lands at a different register tap per consumer cycle.
 bool heldOutside(const RegionBlock &rb, Value v) {
   Operation *at = v.getDefiningOp();
   if (!at)
@@ -164,8 +164,8 @@ private:
 };
 
 /// First-fit sharing for one region: for each unit, the region-local index of
-/// the unit it runs on, its own where unshared — the shape `solveSharing`
-/// returns, so the greedy plan can seed it.
+/// the unit it runs on, its own where unshared. Same shape `solveSharing`
+/// returns, so this plan can seed it.
 llvm::SmallVector<unsigned> greedyShare(const Datapath &dp,
                                         const RegionBlock &rb,
                                         const BindingContext &ctx) {
@@ -238,9 +238,9 @@ SharingProblem::Port pricedPort(const OperatorLibrary &lib, unsigned maxArms,
   return port;
 }
 
-/// One region as a `SharingProblem`: the arrays `ShareCone` reads, priced with
-/// the rows the emit gate walks, per operand port at that port's own width.
-/// The cone tables round up and the slacks down, so an admitted fold clears
+/// One region as a `SharingProblem`: the arrays `ShareCone` reads, priced per
+/// operand port at that port's own width with the rows the emit gate walks. The
+/// cone tables round up and the slacks down, so an admitted fold clears
 /// `checkCombPathsMeetPeriod` by construction.
 SharingProblem sharingProblemOf(const Datapath &dp, const RegionBlock &rb,
                                 const BindingContext &ctx) {

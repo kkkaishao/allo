@@ -595,12 +595,11 @@ def DCPathStorageOp : DCPath_Op<"dcp.storage",
     declares at most one, under whatever name its primitives go by, and a
     device that declares none cannot hold a complete partition.
 
-    `table` marks the row that is not a memory either: a read-only constant
+    `table` marks a row that is not a memory either: a read-only constant
     array, built out of logic as one combinational lookup per access, with no
     address bus and therefore no port limit. Only an initialized array nothing
-    writes can resolve here, and unlike every other row its read delay grows
-    with the array, which is what `rd_delay_depth`/`rd_delay_width` carry and
-    what keeps a deep table from being chosen where it cannot close.
+    writes resolves here. Its read delay grows with the array, which is what
+    `rd_delay_depth`/`rd_delay_width` carry.
 
     `rd_latency`/`wr_latency` are the cycles an access costs and
     `rd_delay`/`wr_delay` its combinational delay in ns: the scheduler times
@@ -608,8 +607,8 @@ def DCPathStorageOp : DCPath_Op<"dcp.storage",
     the ports at exactly those latencies, so the two cannot drift.
 
     `rd_delay_depth` and `rd_delay_width` refine the read delay where it depends
-    on the array's SHAPE: the delay at a depth, scaled by a factor of the width
-    measured at a reference width. Both optional, and where they are given
+    on the array's shape: the delay at a depth, scaled by a factor of the width
+    measured at a reference width. Both optional; where they are given,
     `rd_delay` is the same curve at the row's reference shape, which is what a
     caller with no array in hand reads.
 
@@ -680,8 +679,8 @@ def DCPathMuxOp : DCPath_Op<"dcp.mux",
     curve per bit times the width, so it is one term.
 
     `delay` is the routed marginal delay of the same select in ns over its
-    fan-in, measured at a 32-bit reference width; `delay_width` scales it by
-    the actual width. Both optional: an uncharacterized device is priced by a
+    fan-in, measured at a 32-bit reference width; `delay_width` scales it by the
+    actual width. Both optional: a device declaring neither is priced by a
     conservative formula instead.
   }];
   let arguments = (ins ArrayAttr:$uses, OptionalAttr<CostAttr>:$delay,
@@ -698,7 +697,7 @@ def DCPathChainOp : DCPath_Op<"dcp.chain",
   let description = [{
     A `depth`-stage, `width`-bit register chain: what carrying a value across a
     schedule's slack costs. One row for the whole device, for the same reason
-    `dcp.mux` is. The chain carries no reset, which is the form every value and
+    `dcp.mux` is. The chain carries no reset, the form every value and
     activation-pulse run is emitted in.
 
     `uses` is over TWO parameters, `(depth, width)`. Past a measured depth the

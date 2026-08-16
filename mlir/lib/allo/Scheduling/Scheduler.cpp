@@ -280,8 +280,8 @@ public:
   LogicalResult schedule() override;
 };
 
-/// What set the resource-min II: the pool that needed the most cycles, what it
-/// was asked for against what it serves, and one operation holding it, so a
+/// What set the resource-min II: the pool that needed the most cycles, its
+/// demand against its per-cycle limit, and one operation holding it, so a
 /// diagnostic can point at source rather than at an internal resource key.
 struct BindingResource {
   circt::scheduling::Problem::ResourceType rsrc;
@@ -1243,16 +1243,14 @@ LogicalResult SharedOperatorsSimplexScheduler::schedule() {
     if (isLimited(op, prob))
       limitedOps.push_back(op);
 
-  // Placement order: earliest first, and the largest reservation first where
-  // two operations start at the same time. Earliest-first is a topological
-  // order, which is what keeps the acyclic problem feasible under pinning; the
-  // scan below is first fit over rectangles, and first fit is only respectable
-  // largest-first.
+  // Placement order: earliest first, then the largest reservation first among
+  // operations starting at the same time. Earliest-first is a topological
+  // order, which keeps the acyclic problem feasible under pinning; the scan
+  // below is first fit over rectangles, which needs largest-first to behave.
   //
-  // The cyclic path also breaks ties by least slack, which does not come
-  // across: reading an ALAP means maximizing the start times, and dependences
-  // are the only rows this tableau has, so an operation with no outgoing one
-  // (every store) is unbounded above and the solve has no answer to give.
+  // Slack is not available as a further tie-break here: an ALAP would maximize
+  // the start times, and with dependences the only rows in this tableau an
+  // operation without an outgoing one (any store) is unbounded above.
   auto rectangle = [&](Operation *op) {
     return prob.getResourceCycles(op) * prob.getResourceDemand(op);
   };
@@ -1638,8 +1636,8 @@ unsigned ModuloSimplexScheduler::computeResMinII(BindingResource &binding) {
         // occupancy: the whole window a non-pipelined unit is held for, times
         // the units the operation holds at once
         uses[rsrc] += prob.getResourceCycles(op) * prob.getResourceDemand(op);
-        // The operations come in a stable order, so the one a diagnostic points
-        // at does not depend on walk order.
+        // The operation list is in a stable order, so the witness a diagnostic
+        // points at is deterministic.
         witness.try_emplace(rsrc, op);
       }
     }
@@ -1697,9 +1695,9 @@ LogicalResult ModuloSimplexScheduler::schedule() {
   lowerBoundII = parameterT;
   boundSettled = true;
 
-  // What set the bound, said where it can be acted on: banking or replicating
-  // an array lowers a port-bound interval, reassociating a reduction lowers a
-  // recurrence-bound one, and a directive floor is the user's own.
+  // Report what set the bound, so it can be acted on: banking or replicating an
+  // array lowers a port-bound interval, reassociating a reduction lowers a
+  // recurrence-bound one.
   if (lowerBoundII > 1) {
     if (lowerBoundII > std::max(resMinII, minII))
       info(Stage::Sched, prob.getContainingOp())

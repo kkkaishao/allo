@@ -171,9 +171,8 @@ def test_async_dataflow_container_is_concurrent():
 # ---------------------------------------------------------------------------
 
 
-# The manifest republishes the kernel's own class and span, so a consumer times
-# itself against the boundary document instead of reaching around it to the
-# schedule report. Both are stamped from the same op attributes and must agree.
+# The manifest republishes the kernel's determinacy class and span, and agrees
+# with the schedule report it is stamped from.
 def test_the_manifest_publishes_the_kernel_contract():
     N = 4
 
@@ -203,11 +202,9 @@ def test_the_manifest_publishes_the_kernel_contract():
         )
 
 
-# The cosim oracle's two directions, driven with a measurement rather than a
-# real run: a hardware that outlasts its published span is what the check
-# exists to catch, and no kernel in the suite produces one. Outlasting it FAILS
-# (a caller time-triggered against the figure samples early); beating it warns,
-# since it only costs the caller cycles it did not have to wait.
+# The cosim latency oracle, driven with a measurement rather than a real run.
+# A run that outlasts the published span raises, since a caller time-triggered
+# against the figure would sample early; one that beats it only warns.
 def test_the_latency_oracle_fails_only_the_unsound_direction():
     @kernel
     def counted(A: i32[8], B: i32[8]):
@@ -224,11 +221,9 @@ def test_the_latency_oracle_fails_only_the_unsound_direction():
         rtl._check_latency(span - 1)
 
 
-# A guard's span is a ceiling, the deeper arm's, published through
-# `latency_bound`: the kernel keeps a waitable figure instead of losing its
-# contract to one `if`. The bound is tight, so a run taking the deeper arm at
-# every guard lands exactly on it, and any other run stays under it; the cosim
-# oracle holds both directions on every run here.
+# A guard publishes the deeper arm's span as a bound, so the kernel keeps a
+# waitable figure. The bound is tight: a run taking the deeper arm at every
+# guard lands exactly on it and any other run stays under it.
 @needs_verilator
 def test_a_guard_publishes_the_deeper_arms_span_as_a_bound():
     N, M = 8, 4
@@ -258,12 +253,12 @@ def test_a_guard_publishes_the_deeper_arms_span_as_a_bound():
     assert np.array_equal(out, A.sum(0))
     out = np.zeros(M, np.int32)
     skipped = rtl.cosim(A, np.zeros(M, np.int32), out)
-    assert skipped.cycles < fn.latency  # empty arms complete in two cycles
+    assert skipped.cycles < fn.latency  # empty arms complete early
 
 
-# A bounded callee's contract composes onward as a bound: the instance carries
-# (latency, determinacy != counted_static), so the caller publishes a ceiling
-# of its own rather than overclaiming an exact span or dropping the figure.
+# A bounded callee composes onward as a bound: the instance carries its
+# (latency, determinacy), so the caller publishes a ceiling of its own rather
+# than an exact span or no figure at all.
 @needs_verilator
 def test_a_callers_span_composes_a_bounded_callee_as_a_bound():
     N = 8

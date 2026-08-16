@@ -1155,8 +1155,8 @@ def test_a_constant_table_is_priced_as_the_logic_it_is_built_from():
     assert est.mem_bits == 0, "a constant table is logic, not memory"
     assert est.by_kind["memories"].lut == 32
 
-    # The table is a storage row like any other, so binding the array elsewhere
-    # holds: it becomes a real memory that powers on with the same contents.
+    # Binding the array to a block RAM overrides the table: it becomes a real
+    # memory that powers on with the same contents.
     s = rom.schedule()
     s.bind_storage("tbl", impl=Schedule.BRAM, mem_type=s.RAM_T2P)
     rtl = s.export("rtl")
@@ -1168,11 +1168,10 @@ def test_a_constant_table_is_priced_as_the_logic_it_is_built_from():
 
 
 def test_a_table_too_deep_to_read_quickly_becomes_a_memory():
-    # A table's read is a cone through its LUTs and grows with the depth, where
-    # an addressed row's read delay is flat. Past the depth where the memory
-    # that would otherwise hold the array reads faster, the array is that
-    # memory instead -- one powering on with the same contents, so the kernel
-    # cannot tell which it got except by timing.
+    # A table's read is a LUT cone that grows with the depth, while an
+    # addressed memory's read delay is flat. Past the depth at which the
+    # memory reads faster, the array is realized as that memory, powering on
+    # with the same contents.
     def table(depth):
         vals = ((np.arange(depth, dtype=np.int32) * 2654435) >> 3) & 0xFFFF
 
@@ -1202,15 +1201,15 @@ def test_a_table_too_deep_to_read_quickly_becomes_a_memory():
 
     deep, deep_row, deep_mlir = table(1024)
     assert (deep, deep_row) == ("ram", "bram")
-    # A real memory, and one that comes up holding the table: the contents ride
-    # to the backing register as an `initial` block.
+    # The memory comes up holding the table: the contents reach the backing
+    # register as an `initial` block.
     assert "hw.aggregate_constant" not in deep_mlir
     assert "seq.hlmem @tbl" in deep_mlir
 
 
 def test_binding_a_written_array_to_the_table_row_is_refused():
-    # The table has compile-time contents and no write port, so an array
-    # anything stores to cannot be held there. Reachable only by asking for it.
+    # The table row has compile-time contents and no write port, so an array
+    # that is stored to cannot be bound there.
     @kernel
     def rmw(A: i32[8], B: i32[8]):
         tbl: i32[8] = [1, 2, 3, 4, 5, 6, 7, 8]
@@ -1557,9 +1556,9 @@ def test_a_storage_that_powers_up_undefined_cannot_hold_declared_contents():
     with pytest.raises(RuntimeError):
         s.export("rtl").schedule()
 
-    # A read-only table is refused there too. Left alone it is realized as
-    # logic, but an explicit `impl=` names the structure to build, and one that
-    # powers up undefined cannot be the one holding declared contents.
+    # A read-only table is refused too: an explicit `impl=` names the structure
+    # to build, and this one cannot hold declared contents. Unbound, the same
+    # table is realized as logic.
     @kernel
     def ro(A: i32[8], B: i32[8]):
         tbl: i32[8] = [1, 2, 3, 4, 5, 6, 7, 8]
