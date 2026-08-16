@@ -85,4 +85,9 @@ BENCHMARK = Benchmark(
     reference=reference,
     outputs=(1,),
     tolerance=(2e-3, 2e-3),
+    skip={
+        "v2": "flattening i1 x j1 leaves the triangular predicate a real "
+        "floordiv-30 cone past the 300 MHz period, refused now that a "
+        "standalone apply is priced honestly (ALLO-N0010)"
+    },
 )

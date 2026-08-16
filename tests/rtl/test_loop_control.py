@@ -1437,3 +1437,52 @@ def test_pipelined_imperfect_nest_falls_back_to_sub_regions():
     assert nest[0].depth == 0 and nest[0].is_wrapper
     assert [r.depth for r in nest[1:]] == [1, 1]
     assert all(r.ops for r in nest[1:])
+
+
+# A counted bound past the signed 32-bit index carrier would wrap the counter
+# it is compared against, so the compile is refused instead.
+def test_a_loop_bound_past_the_index_carrier_is_refused():
+    @kernel
+    def big(out: i32[1]):
+        acc: i32 = 0
+        for i in range(2**31):
+            acc += 1
+        out[0] = acc
+
+    with pytest.raises(RuntimeError, match="ALLO-N0018"):
+        _sched(big)
+
+
+# Coalescing this 3x5 nest would leave `counter floordiv 5` as a genuine
+# divider feeding the data-side read of `i`, so the gate keeps the nest; the
+# addresses alone would have composed the divider away.
+def test_a_data_read_induction_variable_blocks_coalescing():
+    @kernel
+    def ivdata(out: i32[15]):
+        for i in range(3):
+            for j in range(5):
+                out[i * 5 + j] = i
+
+    rtl = _to_rtl(ivdata)
+    rtl.schedule()
+    assert "dcp.compute comb apply" not in rtl.dcp
+    out = np.zeros(15, np.int32)
+    rtl.cosim(out)
+    assert np.array_equal(out, np.repeat(np.arange(3, dtype=np.int32), 5))
+
+
+# The same shape over power-of-two trips still coalesces: `counter floordiv 4`
+# is a shift, so the recovered value survives as a free standalone apply.
+def test_a_pow2_nest_with_a_data_read_still_coalesces():
+    @kernel
+    def ivdata4(out: i32[16]):
+        for i in range(4):
+            for j in range(4):
+                out[i * 4 + j] = i
+
+    rtl = _to_rtl(ivdata4)
+    rtl.schedule()
+    assert "dcp.compute comb apply" in rtl.dcp
+    out = np.zeros(16, np.int32)
+    rtl.cosim(out)
+    assert np.array_equal(out, np.repeat(np.arange(4, dtype=np.int32), 4))

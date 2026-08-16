@@ -40,6 +40,9 @@ struct UnitReport {
   unsigned boundOps = 1;
   bool comb = false; // native combinational, against an IP instance
   bool pipelined = true;
+  // A standalone apply unit's cone, the operator counts of `applyExprOf`, so
+  // the estimator can price the map; all zero for every other unit.
+  unsigned adders = 0, multipliers = 0, dividers = 0;
 };
 
 /// A class of multiplexer: `count` of them, each `fanin` sources wide at

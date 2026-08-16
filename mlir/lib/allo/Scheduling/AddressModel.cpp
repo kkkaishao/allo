@@ -482,6 +482,12 @@ AffineExpr mlir::allo::simplifiedForHardware(AffineExpr e, unsigned numDims,
   return best;
 }
 
+AffineExpr mlir::allo::applyExprOf(AffineMap map) {
+  assert(map.getNumResults() == 1 && "affine.apply yields one result");
+  return simplifiedForHardware(map.getResult(0), map.getNumDims(),
+                               map.getNumSymbols());
+}
+
 AddressExprs mlir::allo::addressExprsOf(const BankLayout &layout, AffineMap map,
                                         ArrayRef<int64_t> shape,
                                         std::optional<unsigned> assignedBank) {

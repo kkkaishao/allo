@@ -82,6 +82,12 @@ struct AddressDelays {
 /// Read the comb rows an address cone can be built from.
 AddressDelays addressDelaysOf(const OperatorLibrary &lib);
 
+/// The ONE hardware form of a standalone apply's single-result map:
+/// `simplifiedForHardware` over its result. What the scheduler prices, the
+/// pre-schedule gates walk, and `emitCompute` builds; kept in one place so the
+/// layers cannot drift onto different forms.
+AffineExpr applyExprOf(AffineMap map);
+
 /// The cost of \p e when its arithmetic is carried at \p width bits.
 ///
 /// Prices what synthesis actually builds, not the ops emitted:

@@ -19,11 +19,16 @@
 #include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/Dialect/Utils/StaticValueUtils.h" // getConstantIntValue
+#include "mlir/IR/Matchers.h"
 #include "mlir/IR/SymbolTable.h"
 #include "mlir/Interfaces/LoopLikeInterface.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/MapVector.h"
 #include "llvm/Support/Format.h"
+#include "llvm/Support/MathExtras.h"
+
+#include <cmath>
 
 using namespace mlir;
 using namespace mlir::allo;
@@ -80,6 +85,7 @@ static LogicalResult checkChannels(
 static LogicalResult checkOperations(func::FuncOp func,
                                      const OperatorLibrary &lib);
 static LogicalResult checkSignature(func::FuncOp func);
+static LogicalResult checkIndexWidth(func::FuncOp func);
 static LogicalResult checkStallContract(Operation *op, StringRef symbol);
 static LogicalResult checkMemories(func::FuncOp func, const MemoryLibrary &lib,
                                    DenseSet<Value> &boundaryArrays, bool isTop);
@@ -145,7 +151,7 @@ LogicalResult verifyFunc(
     func::FuncOp func, ModuleOp module, const DeviceModel &dev,
     llvm::DenseMap<std::pair<Operation *, unsigned>, bool> &streamArgIsInput,
     DenseSet<Value> &boundaryArrays, bool isTop) {
-  if (failed(checkSignature(func)) ||
+  if (failed(checkSignature(func)) || failed(checkIndexWidth(func)) ||
       failed(checkOperations(func, dev.operators)) ||
       failed(checkMemories(func, dev.memory, boundaryArrays, isTop)) ||
       failed(checkComposition(func, dev)))
@@ -166,6 +172,80 @@ LogicalResult checkSignature(func::FuncOp func) {
       return failure();
     }
   return success();
+}
+
+// Whether \p v is provably non-negative: a counted-loop induction variable
+// with a constant non-negative lower bound, or a non-negative constant.
+static bool nonNegativeOperand(Value v) {
+  if (auto loop = affine::getForInductionVarOwner(v))
+    return loop.hasConstantLowerBound() && loop.getConstantLowerBound() >= 0;
+  if (auto loop = scf::getForInductionVarOwner(v)) {
+    std::optional<int64_t> lb = getConstantIntValue(loop.getLowerBound());
+    return lb && *lb >= 0;
+  }
+  IntegerAttr::ValueType cst;
+  return matchPattern(v, m_ConstantInt(&cst)) && cst.isNonNegative();
+}
+
+// Whether \p e is provably non-negative over \p operands (dims then symbols):
+// sums and products of non-negatives, or a division with a constant positive
+// divisor over one.
+static bool provablyNonNegative(AffineExpr e, ValueRange operands,
+                                unsigned numDims) {
+  if (auto c = dyn_cast<AffineConstantExpr>(e))
+    return c.getValue() >= 0;
+  if (auto d = dyn_cast<AffineDimExpr>(e))
+    return nonNegativeOperand(operands[d.getPosition()]);
+  if (auto s = dyn_cast<AffineSymbolExpr>(e))
+    return nonNegativeOperand(operands[numDims + s.getPosition()]);
+  auto bin = cast<AffineBinaryOpExpr>(e);
+  if (!provablyNonNegative(bin.getLHS(), operands, numDims))
+    return false;
+  switch (e.getKind()) {
+  case AffineExprKind::Add:
+  case AffineExprKind::Mul:
+    return provablyNonNegative(bin.getRHS(), operands, numDims);
+  case AffineExprKind::FloorDiv:
+  case AffineExprKind::CeilDiv:
+  case AffineExprKind::Mod: {
+    auto k = dyn_cast<AffineConstantExpr>(bin.getRHS());
+    return k && k.getValue() > 0;
+  }
+  default:
+    return false;
+  }
+}
+
+// A standalone apply is emitted by `evalAffine`, whose floordiv/mod lowering
+// is unsigned: exact only with a constant positive divisor over a non-negative
+// argument. An access map's subscript is in-bounds and so non-negative by
+// construction; a standalone apply has no such guarantee, so a division this
+// cannot prove is refused.
+static LogicalResult checkApplyDivision(affine::AffineApplyOp apply) {
+  AffineMap map = apply.getAffineMap();
+  bool ok = true;
+  // The form the emitter builds, not the op's own: `applyExprOf` may fold a
+  // division away or refold one in.
+  applyExprOf(map).walk([&](AffineExpr e) {
+    auto kind = e.getKind();
+    if (kind != AffineExprKind::FloorDiv && kind != AffineExprKind::CeilDiv &&
+        kind != AffineExprKind::Mod)
+      return;
+    auto bin = cast<AffineBinaryOpExpr>(e);
+    auto k = dyn_cast<AffineConstantExpr>(bin.getRHS());
+    if (k && k.getValue() > 0 &&
+        provablyNonNegative(bin.getLHS(), apply.getOperands(),
+                            map.getNumDims()))
+      return;
+    ok = false;
+    unsupported(Stage::Prep, Code::AffineDivisionUnsupported, apply)
+        << "The division in the index expression " << e
+        << " is built as unsigned hardware, which needs a constant positive "
+           "divisor over a provably non-negative argument, and this one is "
+           "not proven either. Compute the expression in arithmetic ops "
+           "instead, which lower with signed semantics";
+  });
+  return success(ok);
 }
 
 LogicalResult checkOperations(func::FuncOp func, const OperatorLibrary &lib) {
@@ -190,6 +270,9 @@ LogicalResult checkOperations(func::FuncOp func, const OperatorLibrary &lib) {
              "nothing can build. Express it in arithmetic instead";
       return WalkResult::interrupt();
     }
+    if (auto apply = dyn_cast<affine::AffineApplyOp>(op))
+      if (failed(checkApplyDivision(apply)))
+        return WalkResult::interrupt();
     // The identity names the IP row's symbol or the native comb lowering,
     // and is empty when the device offers neither.
     OperatorIdentity id = operatorIdentity(op, lib);
@@ -222,6 +305,117 @@ LogicalResult checkStallContract(Operation *op, StringRef symbol) {
       << "' declares the elastic (valid/ready, variable-latency) stall "
          "contract, which is not realized. Declare style='ce'";
   return failure();
+}
+
+//===--------------------------------------------------------------------===//
+// Index width: every compile-time value the datapath carries as an `index`
+// (a counted loop's bounds, an index literal, an array's linear extent) must
+// fit the `kIndexWidth` carrier. The width derivations downstream clamp to
+// that width, so a value past it would wrap silently instead of failing.
+//===--------------------------------------------------------------------===//
+
+// Whether \p v fits the signed `kIndexWidth` carrier.
+static bool fitsIndex(int64_t v) {
+  return APInt(64, static_cast<uint64_t>(v), /*isSigned=*/true)
+             .getSignificantBits() <= kIndexWidth;
+}
+
+static void refuseIndexWidth(Operation *op, StringRef what, int64_t v) {
+  unsupported(Stage::Prep, Code::IndexWidthExceeded, op)
+      << "The " << what << " " << v << " does not fit the " << kIndexWidth
+      << "-bit index carrier the datapath builds, so its hardware would wrap "
+         "silently";
+}
+
+// The bounds of \p op's counted loop, each present when compile-time.
+struct LoopBounds {
+  std::optional<int64_t> lb, ub, step;
+};
+
+static std::optional<LoopBounds> loopBoundsOf(Operation *op) {
+  if (auto loop = dyn_cast<affine::AffineForOp>(op)) {
+    LoopBounds b;
+    if (loop.hasConstantLowerBound())
+      b.lb = loop.getConstantLowerBound();
+    if (loop.hasConstantUpperBound())
+      b.ub = loop.getConstantUpperBound();
+    b.step = loop.getStepAsInt();
+    return b;
+  }
+  if (auto loop = dyn_cast<scf::ForOp>(op))
+    return LoopBounds{getConstantIntValue(loop.getLowerBound()),
+                      getConstantIntValue(loop.getUpperBound()),
+                      getConstantIntValue(loop.getStep())};
+  return std::nullopt;
+}
+
+// The first offending value of \p b, with its name, or nullopt. Individual
+// bounds are vetted before the derived one-past value, so its arithmetic
+// cannot overflow an int64.
+static std::optional<std::pair<StringRef, int64_t>>
+oversizedBound(const LoopBounds &b) {
+  if (b.lb && !fitsIndex(*b.lb))
+    return {{"loop lower bound", *b.lb}};
+  if (b.ub && !fitsIndex(*b.ub))
+    return {{"loop upper bound", *b.ub}};
+  if (b.step && !fitsIndex(*b.step))
+    return {{"loop step", *b.step}};
+  // The one-past value the counter's terminator compares against
+  // (`counterWidth`'s `last`) can exceed the bound by up to a step.
+  if (b.lb && b.ub && b.step && *b.step > 0 && *b.ub > *b.lb) {
+    int64_t trip = llvm::divideCeilSigned(*b.ub - *b.lb, *b.step);
+    int64_t last = *b.lb + trip * *b.step;
+    if (!fitsIndex(last))
+      return {{"loop bound one-past value", last}};
+  }
+  return std::nullopt;
+}
+
+LogicalResult checkIndexWidth(func::FuncOp func) {
+  // The linear extent decides the address width; each memref is checked at
+  // its root (an argument or an allocation), not per access.
+  auto oversizedExtent = [](Type t) {
+    auto mt = dyn_cast<MemRefType>(t);
+    if (!mt || !mt.hasStaticShape())
+      return false;
+    int64_t elements = 1;
+    for (int64_t d : mt.getShape())
+      if (llvm::MulOverflow(elements, d, elements) ||
+          elements > (int64_t(1) << kIndexWidth))
+        return true;
+    return false;
+  };
+  for (BlockArgument arg : func.getArguments())
+    if (oversizedExtent(arg.getType())) {
+      refuseIndexWidth(func, "array extent",
+                       cast<MemRefType>(arg.getType()).getNumElements());
+      return failure();
+    }
+  WalkResult r = func.walk([&](Operation *op) {
+    if (std::optional<LoopBounds> b = loopBoundsOf(op)) {
+      if (auto bad = oversizedBound(*b)) {
+        refuseIndexWidth(op, bad->first, bad->second);
+        return WalkResult::interrupt();
+      }
+      return WalkResult::advance();
+    }
+    if (auto cst = dyn_cast<arith::ConstantOp>(op);
+        cst && isa<IndexType>(cst.getType())) {
+      int64_t v = cast<IntegerAttr>(cst.getValue()).getInt();
+      if (!fitsIndex(v)) {
+        refuseIndexWidth(op, "index literal", v);
+        return WalkResult::interrupt();
+      }
+    }
+    for (Type t : op->getResultTypes())
+      if (oversizedExtent(t)) {
+        refuseIndexWidth(op, "array extent",
+                         cast<MemRefType>(t).getNumElements());
+        return WalkResult::interrupt();
+      }
+    return WalkResult::advance();
+  });
+  return failure(r.wasInterrupted());
 }
 
 //===--------------------------------------------------------------------===//
@@ -781,6 +975,28 @@ static LogicalResult checkAddressCost(func::FuncOp funcOp,
   double worstNow = 0.0;
 
   funcOp.walk([&](Operation *op) {
+    // A standalone apply is one monolithic operator whose cone is its map
+    // (`lookup` prices it whole), so past the period there is no register to
+    // split it and the schedule-time backstop would refuse it unanchored.
+    if (auto apply = dyn_cast<affine::AffineApplyOp>(op)) {
+      AddressCost cost =
+          addressCost(applyExprOf(apply.getAffineMap()),
+                      addressDelaysOf(dev.operators), AddressDelays::refWidth);
+      double delay = std::round(cost.delay * 100.0) / 100.0;
+      if (delay > cycleTimeNs) {
+        fits = false;
+        std::string map;
+        llvm::raw_string_ostream os(map);
+        os << apply.getAffineMap();
+        unsupported(Stage::Prep, Code::AddressOverPeriod, op)
+            << "computing " << map << " takes " << llvm::format("%.2f", delay)
+            << " ns against a " << llvm::format("%.2f", cycleTimeNs)
+            << " ns clock period, and it is one combinational operator. "
+               "Compute the expression in arithmetic ops so each step can be "
+               "scheduled and registered, or lower the target frequency";
+      }
+      return;
+    }
     std::optional<MemAccess> a = asMemAccess(op);
     if (!a || a->kind != AccessKind::Array)
       return;

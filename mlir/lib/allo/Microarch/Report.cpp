@@ -6,8 +6,9 @@
 #include "allo/Microarch/Report.h"
 
 #include "allo/Microarch/Datapath.h"
-#include "allo/Microarch/Naming.h"       // operatorModuleName, ownerOf
-#include "allo/Scheduling/MemoryModel.h" // bankKindName
+#include "allo/Microarch/Naming.h"        // operatorModuleName, ownerOf
+#include "allo/Scheduling/AddressModel.h" // applyExprOf, addressCost
+#include "allo/Scheduling/MemoryModel.h"  // bankKindName
 
 #include "mlir/IR/BuiltinTypes.h"
 #include "llvm/Support/JSON.h"
@@ -88,12 +89,20 @@ FuncUarch::FuncUarch(const Datapath &dp, llvm::StringRef symbol,
     for (UnitId uid : rb.units) {
       const FuncUnit &u = dp.units[uid];
       r.computeOps += u.boundOps.size();
-      r.units.push_back(
-          {u.identity.key(), u.identity.ipSymbol,
-           u.identity.comb ? std::string() : operatorModuleName(u),
-           datapathWidth(u.identity.resultType), u.latency,
-           (unsigned)u.boundOps.size(), u.identity.comb.has_value(),
-           u.pipelined});
+      UnitReport ur{u.identity.key(), u.identity.ipSymbol,
+                    u.identity.comb ? std::string() : operatorModuleName(u),
+                    datapathWidth(u.identity.resultType), u.latency,
+                    (unsigned)u.boundOps.size(), u.identity.comb.has_value(),
+                    u.pipelined};
+      if (u.identity.comb == CombOpKindEnum::Apply) {
+        AffineMap map = cast<AffineMapAttr>(u.identity.map).getValue();
+        AddressCost cone = addressCost(applyExprOf(map), AddressDelays{},
+                                       AddressDelays::refWidth);
+        ur.adders = cone.adders;
+        ur.multipliers = cone.multipliers;
+        ur.dividers = cone.dividers;
+      }
+      r.units.push_back(std::move(ur));
     }
     r.muxes = muxClasses(dp, rb);
     for (const MuxClass &m : r.muxes) {
@@ -238,6 +247,12 @@ std::string MicroarchReport::toJSON() const {
                       j.attribute("bound_ops", (int64_t)u.boundOps);
                       j.attribute("comb", u.comb);
                       j.attribute("pipelined", u.pipelined);
+                      if (u.adders)
+                        j.attribute("adders", (int64_t)u.adders);
+                      if (u.multipliers)
+                        j.attribute("multipliers", (int64_t)u.multipliers);
+                      if (u.dividers)
+                        j.attribute("dividers", (int64_t)u.dividers);
                     });
                 });
                 j.attributeArray("muxes", [&] {

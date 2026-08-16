@@ -76,6 +76,8 @@ enum class Code {
   // ALLO-N0014 is retired and is not reused.
   PartitionedInitializedArray, // banked contents, realized as one bank
   SkewedArgumentToCallee,      // a skewed array crossing into a call
+  AffineDivisionUnsupported,   // a floordiv/mod no unsigned lowering serves
+  IndexWidthExceeded,          // a compile-time value past the index carrier
 };
 
 /// The one table: a code's stable spelling.
@@ -147,6 +149,10 @@ constexpr const char *codeTag(Code code) {
     return "ALLO-N0015";
   case Code::SkewedArgumentToCallee:
     return "ALLO-N0016";
+  case Code::AffineDivisionUnsupported:
+    return "ALLO-N0017";
+  case Code::IndexWidthExceeded:
+    return "ALLO-N0018";
   }
   return "";
 }

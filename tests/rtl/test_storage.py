@@ -3330,3 +3330,14 @@ def test_unrolled_copies_of_one_array_get_distinct_symbols():
         exp[i] = A8x[i] + (A8x[i] & 31)
         exp[i + 4] = A8x[i] + ((A8x[i] + 3) & 31)
     assert np.array_equal(out, exp)
+
+
+# An array whose linear extent needs more address bits than the index carrier
+# has would wrap its addresses, so the compile is refused instead.
+def test_an_array_past_the_index_carrier_is_refused():
+    @kernel
+    def bigarr(A: i32[2**33], out: i32[1]):
+        out[0] = A[0]
+
+    with pytest.raises(RuntimeError, match="ALLO-N0018"):
+        _sched(bigarr)

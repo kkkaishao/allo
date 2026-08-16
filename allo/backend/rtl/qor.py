@@ -40,6 +40,7 @@ COMB_KIND = {
     "extui": None,
     "trunci": None,
     "index_cast": None,
+    "index_castui": None,
     "negf": None,
 }
 
@@ -279,6 +280,17 @@ def estimate(report: CompileReport, device: Device = default_device) -> QoR:
                     charge("units", f.func, Utilization.of(price(cost[0], (cost[1],))))
                     continue
                 mnemonic = unit.identity.split("(", 1)[0]
+                if mnemonic == "apply":
+                    # A standalone apply is its map's cone: the report exports
+                    # the operator counts, each priced as its comb row at the
+                    # index carrier width the cone is built at.
+                    cone = (
+                        comb(CombKind.ADD, unit.width) * unit.adders
+                        + comb(CombKind.MUL, unit.width) * unit.multipliers
+                        + comb(CombKind.DIV, unit.width) * unit.dividers
+                    )
+                    charge("units", f.func, cone)
+                    continue
                 if mnemonic not in COMB_KIND:
                     unmodelled[mnemonic] += 1
                     continue

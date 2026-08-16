@@ -5,8 +5,9 @@
 
 #include "allo/Microarch/Primitives.h"
 
-#include "allo/Microarch/Interface.h" // iface::ModuleInterface (the ports)
-#include "allo/Microarch/Naming.h"    // regionSignal
+#include "allo/Microarch/Interface.h"     // iface::ModuleInterface (the ports)
+#include "allo/Microarch/Naming.h"        // regionSignal
+#include "allo/Scheduling/AddressModel.h" // applyExprOf
 
 #include "circt/Dialect/Comb/CombOps.h"
 #include "circt/Dialect/HW/HWOps.h"
@@ -387,13 +388,13 @@ Value emitCompute(OpBuilder &b, Location loc, const OperatorIdentity &id,
   // reaching the unreachable below.
   switch (kind) {
   // affine.apply: the map rides on the op, left by loop-canonicalization when
-  // an IV is read outside an address. Via evalAffine, so a power-of-two divisor
-  // stays shift+mask.
+  // an IV is read outside an address. Built as `applyExprOf`, the form the
+  // schedule priced; via evalAffine, so a power-of-two divisor stays
+  // shift+mask.
   case E::Apply: {
     assert(id.map && "an apply identity must carry the original affine map");
     AffineMap map = cast<AffineMapAttr>(id.map).getValue();
-    assert(map.getNumResults() == 1 && "affine.apply yields one result");
-    return evalAffine(b, loc, map.getResult(0), operands, map.getNumDims());
+    return evalAffine(b, loc, applyExprOf(map), operands, map.getNumDims());
   }
   // Width-changing unary casts resize operand[0] via a comb sign/zero-extend or
   // a low-bit extract; 0-latency, so they slot into the schedule like any comb.
@@ -407,6 +408,9 @@ Value emitCompute(OpBuilder &b, Location loc, const OperatorIdentity &id,
   case E::IndexCast:
     return resize(b, loc, lhs, cast<IntegerType>(resultType).getWidth(),
                   /*isSigned=*/true);
+  case E::IndexCastUi:
+    return resize(b, loc, lhs, cast<IntegerType>(resultType).getWidth(),
+                  /*isSigned=*/false);
   // Float negate: the float rides as its integer bit pattern, so flipping its
   // sign bit is a single XOR, no IP.
   case E::Negf: {

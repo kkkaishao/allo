@@ -13,7 +13,7 @@ import numpy as np
 import pytest
 
 from allo import kernel
-from allo.lang import bf16, f16, f32, i32, i64, u32, KernelOptions
+from allo.lang import bf16, f16, f32, i8, i32, i64, u32, KernelOptions
 from allo.lang.core import APInt
 from allo.lang.ip import operator_ip, OperatorType
 from allo.operators import math as amath
@@ -39,6 +39,7 @@ from _common import (
     _impls,
     _iis,
     _latency,
+    _walk,
     FADD,
     comb_ns,
     comb_step_ns,
@@ -1663,3 +1664,181 @@ def test_remove_operator_withdraws_a_candidate_and_its_cost():
     # A core the device does not declare cannot be withdrawn.
     with pytest.raises(ValueError):
         dev.remove_operator(add_fast.symbol)
+
+
+# --- index casts and standalone affine expressions ---------------------------
+
+
+# The frontend only builds the signed `index_cast`, so the unsigned variant is
+# injected by rewriting the cast in place. The emitter must zero-extend it: the
+# i8 bits 0xC8 subscript A[200], where sign extension into the 9-bit address
+# reads A[456]. A 512-deep array so the extension bits survive the address
+# truncation; at 256 the two lowerings agree.
+def test_index_castui_zero_extends():
+    from allo._mlir import ir
+    from allo._mlir.dialects import arith as arith_d
+
+    @kernel
+    def castui(idx: i8[1], A: i32[512], out: i32[1]):
+        out[0] = A[idx[0]]
+
+    rtl = _to_rtl(castui)
+    module = rtl.module
+    with module.context, ir.Location.unknown():
+        casts = [
+            op
+            for op in _walk(module.operation)
+            if op.name == "arith.index_cast"
+            and str(op.operands[0].type) == "i8"
+        ]
+        assert casts, "the i8 subscript lowers through one index_cast"
+        for op in casts:
+            new = arith_d.IndexCastUIOp(
+                op.results[0].type, op.operands[0], ip=ir.InsertionPoint(op)
+            )
+            op.results[0].replace_all_uses_with(new.operation.results[0])
+            op.erase()
+
+    idx = np.array([-56], np.int8)  # bit pattern 0xC8, 200 read unsigned
+    A = np.arange(512, dtype=np.int32)
+    out = np.zeros(1, np.int32)
+    rtl.cosim(idx, A, out)
+    assert out[0] == 200
+
+
+# `evalAffine` lowers a standalone apply's floordiv unsigned, so an argument
+# that can go negative is refused before scheduling. The frontend never builds
+# one; the apply is injected over the loop counter.
+def test_signed_affine_division_is_refused():
+    from allo._mlir import ir
+
+    @kernel
+    def sdiv(out: i32[16]):
+        for i in range(16):
+            out[i] = 7
+
+    rtl = _to_rtl(sdiv)
+    _inject_apply(
+        rtl,
+        lambda d0: ir.AffineExpr.get_floor_div(d0 - 100, ir.AffineConstantExpr.get(3)),
+    )
+    with pytest.raises(RuntimeError, match="ALLO-N0017"):
+        rtl.schedule()
+
+
+def _inject_apply(rtl, build_expr, dims=1):
+    """Insert `apply(build_expr(d0..))` over ``dims`` copies of the loop
+    counter, cast to i32 as the stored value of the kernel's one store. The
+    frontend leaves no standalone apply behind, so the pricing path is reached
+    by injection."""
+    from allo._mlir import ir
+    from allo._mlir.dialects import affine as affine_d
+    from allo._mlir.dialects import arith as arith_d
+
+    module = rtl.module
+    with module.context, ir.Location.unknown():
+        stores = [op for op in _walk(module.operation) if op.name == "affine.store"]
+        loops = [op for op in _walk(module.operation) if op.name == "affine.for"]
+        assert len(stores) == 1 and len(loops) == 1
+        iv = loops[0].regions[0].blocks[0].arguments[0]
+        exprs = [ir.AffineDimExpr.get(i) for i in range(dims)]
+        amap = ir.AffineMap.get(dims, 0, [build_expr(*exprs)])
+        ip = ir.InsertionPoint(stores[0])
+        apply_op = affine_d.AffineApplyOp(
+            amap, [iv] * dims, results=[ir.IndexType.get()], ip=ip
+        )
+        cast = arith_d.IndexCastOp(
+            ir.IntegerType.get_signless(32), apply_op.operation.results[0], ip=ip
+        )
+        stores[0].operands[0] = cast.operation.results[0]
+
+
+# A standalone apply is priced as its map's cone rather than as the free
+# default row: `d0 * 3` is one shift-add, so the schedule carries one add
+# step, and the emitted cone computes the map.
+def test_a_standalone_apply_is_priced_as_its_cone():
+    @kernel
+    def scaled(out: i32[16]):
+        for i in range(16):
+            out[i] = 7
+
+    rtl = _to_rtl(scaled)
+    _inject_apply(rtl, lambda d0: d0 * 3)
+    rtl.schedule()
+    applies = [
+        op
+        for op in _walk(rtl.dcp_module.operation, "allo.dcp.compute")
+        if "map" in op.attributes
+    ]
+    assert len(applies) == 1
+    stamped = applies[0].attributes["in_delay"].value
+    assert stamped == pytest.approx(round(comb_step_ns("add"), 2), abs=1e-3)
+    out = np.zeros(16, np.int32)
+    rtl.cosim(out)
+    assert np.array_equal(out, np.arange(16, dtype=np.int32) * 3)
+    # The report row exports the cone's operator counts, and the estimator
+    # prices them rather than dropping the unit as unmodelled.
+    units = [
+        u
+        for f in rtl.microarch.funcs
+        for r in f.regions
+        for u in r.units
+        if u.identity.startswith("apply")
+    ]
+    assert len(units) == 1
+    assert (units[0].adders, units[0].multipliers, units[0].dividers) == (1, 0, 0)
+    assert "apply" not in rtl.estimation.unmodelled
+
+
+# Every layer reads `applyExprOf`, the map's simplified form: term collection
+# folds this cone to `d1 * 3`, one shift-add, priced, reported, and built as
+# such rather than as the three-adder raw form.
+def test_an_apply_is_priced_on_its_simplified_form():
+    @kernel
+    def folded(out: i32[16]):
+        for i in range(16):
+            out[i] = 7
+
+    rtl = _to_rtl(folded)
+    _inject_apply(rtl, lambda d0, d1: (d0 + d1) * 3 - d0 * 3, dims=2)
+    rtl.schedule()
+    applies = [
+        op
+        for op in _walk(rtl.dcp_module.operation, "allo.dcp.compute")
+        if "map" in op.attributes
+    ]
+    assert len(applies) == 1
+    assert applies[0].attributes["in_delay"].value == pytest.approx(
+        round(comb_step_ns("add"), 2), abs=1e-3
+    )
+    out = np.zeros(16, np.int32)
+    rtl.cosim(out)
+    assert np.array_equal(out, np.arange(16, dtype=np.int32) * 3)
+    units = [
+        u
+        for f in rtl.microarch.funcs
+        for r in f.regions
+        for u in r.units
+        if u.identity.startswith("apply")
+    ]
+    assert [(u.adders, u.multipliers, u.dividers) for u in units] == [(1, 0, 0)]
+
+
+# The map is ONE operator: a division cone past the clock period has no seam a
+# register could land on, so it is refused before scheduling, anchored on the
+# apply and naming the map.
+def test_an_apply_division_over_the_period_is_refused():
+    from allo._mlir import ir
+
+    @kernel
+    def divs(out: i32[16]):
+        for i in range(16):
+            out[i] = 7
+
+    rtl = _to_rtl(divs)
+    _inject_apply(
+        rtl,
+        lambda d0: ir.AffineExpr.get_floor_div(d0 + 5, ir.AffineConstantExpr.get(3)),
+    )
+    with pytest.raises(RuntimeError, match="ALLO-N0010"):
+        rtl.schedule()

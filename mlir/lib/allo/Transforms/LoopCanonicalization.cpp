@@ -426,13 +426,24 @@ recoveredInductionVars(MutableArrayRef<affine::AffineForOp> band) {
   return iv;
 }
 
-// Whether coalescing \p band leaves a real divider on the address of any array
-// it accesses. Recovering an induction variable divides by a trip count, but
-// the memref's row-major linearization may compose that divider away, so the
-// decision is made on the composed expression rather than on the trip counts.
+// Whether coalescing \p band leaves a real divider behind. Recovering an
+// induction variable divides by a trip count. An array access may compose that
+// divider away in the memref's row-major linearization, so accesses are judged
+// on the composed expression; any other consumer (a value read, an if
+// predicate, a bound) is left holding the recovery itself.
 bool coalescingCostsADivider(MutableArrayRef<affine::AffineForOp> band) {
   MLIRContext *ctx = band.front().getContext();
   SmallVector<AffineExpr> recovered = recoveredInductionVars(band);
+  for (auto [k, loop] : llvm::enumerate(band)) {
+    bool escapes =
+        !llvm::all_of(loop.getInductionVar().getUsers(), [](Operation *user) {
+          return asMemAccess(user).has_value();
+        });
+    if (escapes && addressCost(recovered[k], AddressDelays{},
+                               AddressDelays::refWidth)
+                       .dividers)
+      return true;
+  }
   llvm::DenseMap<Value, unsigned> level;
   for (auto [k, loop] : llvm::enumerate(band))
     level[loop.getInductionVar()] = k;

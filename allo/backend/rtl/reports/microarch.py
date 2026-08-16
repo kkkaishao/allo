@@ -70,6 +70,11 @@ class Unit:
     pipelined: bool
     impl: str | None = None  # the device operator symbol; None for a native unit
     module: str | None = None  # the extern RTL module; None for a native unit
+    #: a standalone apply unit's cone, the operator counts of its map; zero
+    #: everywhere else
+    adders: int = 0
+    multipliers: int = 0
+    dividers: int = 0
 
     @classmethod
     def from_json(cls, d: dict) -> Unit:
@@ -82,6 +87,9 @@ class Unit:
             pipelined=d["pipelined"],
             impl=d.get("impl"),
             module=d.get("module"),
+            adders=d.get("adders", 0),
+            multipliers=d.get("multipliers", 0),
+            dividers=d.get("dividers", 0),
         )
 
 

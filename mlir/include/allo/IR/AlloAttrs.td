@@ -220,13 +220,14 @@ def CombMinsi     : I32EnumAttrCase<"Minsi",     21, "minsi">;
 def CombMaxsi     : I32EnumAttrCase<"Maxsi",     22, "maxsi">;
 def CombMinui     : I32EnumAttrCase<"Minui",     23, "minui">;
 def CombMaxui     : I32EnumAttrCase<"Maxui",     24, "maxui">;
+def CombIndexCastUi : I32EnumAttrCase<"IndexCastUi", 25, "index_castui">;
 
 def CombOpKindEnum : I32EnumAttr<"CombOpKindEnum",
     "The combinational op a comb-path dcp.compute realizes",
     [CombAddi, CombSubi, CombMuli, CombDivsi, CombDivui, CombRemsi, CombRemui,
      CombAndi, CombOri, CombXori, CombShli, CombShrsi, CombShrui, CombCmpi,
      CombSelect, CombExtsi, CombExtui, CombTrunci, CombIndexCast, CombApply,
-     CombNegf, CombMinsi, CombMaxsi, CombMinui, CombMaxui]> {
+     CombNegf, CombMinsi, CombMaxsi, CombMinui, CombMaxui, CombIndexCastUi]> {
   let cppNamespace = "mlir::allo";
   let genSpecializedAttr = 0;
 }

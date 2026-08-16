@@ -21,6 +21,7 @@
 #include "llvm/Support/MathExtras.h"
 
 #include <algorithm>
+#include <cmath>
 #include <limits>
 #include <map>
 #include <tuple>
@@ -61,14 +62,15 @@ using namespace mlir::allo;
   X(Extsi, ICastI, arith::ExtSIOp)                                             \
   X(Extui, ICastI, arith::ExtUIOp)                                             \
   X(Trunci, ICastI, arith::TruncIOp)                                           \
-  X(IndexCast, ICastI, arith::IndexCastOp, arith::IndexCastUIOp)               \
+  X(IndexCast, ICastI, arith::IndexCastOp)                                     \
+  X(IndexCastUi, ICastI, arith::IndexCastUIOp)                                 \
   X(Negf, Neg, arith::NegFOp)                                                  \
   X(Minsi, Min, arith::MinSIOp)                                                \
   X(Minui, Min, arith::MinUIOp)                                                \
   X(Maxsi, Max, arith::MaxSIOp)                                                \
   X(Maxui, Max, arith::MaxUIOp)                                                \
-  /* An address expression, priced by the DEFAULT row: no device row covers */ \
-  /* a whole affine map, whose delay is its own operators' (`addressDelay`) */ \
+  /* An address expression: no device row covers a whole affine map, so    */ \
+  /* `lookup` prices its cone through the address model (`addressCost`)    */ \
   X(Apply, Unknown, affine::AffineApplyOp)
 
 std::optional<CombOpKindEnum> mlir::allo::combKindOf(Operation *op) {
@@ -556,12 +558,40 @@ OperatorChar OperatorLibrary::lookup(Operation *op) const {
   const OperatorEntry *e =
       selectImplementation(matchEntries(advancedEntries, entries, op), width);
   if (!e) {
-    // Matching nothing is ordinary: a constant, a yield terminator, or
-    // `affine.apply` cost nothing real here (apply takes the default row's
-    // delay, matching `combDelay(CombOpKindEnum::Apply)`). A float->float
-    // arith op reaching here would miscompile at latency 0, so assert
-    // instead; extend `classify()`/`needsIP()` (`validateDatapath` repeats
-    // this check for a release build).
+    // A standalone apply's hardware is its map's cone (`evalAffine`), so it is
+    // priced by the address model: marginal delay at the index width, area
+    // from the operators the cone instantiates. The type name carries the
+    // quantized delay; allocation still groups by identity, which holds the
+    // map, so only same-map applies share a unit.
+    if (auto apply = dyn_cast<affine::AffineApplyOp>(op)) {
+      AddressCost cost =
+          addressCost(applyExprOf(apply.getAffineMap()), addressDelaysOf(*this),
+                      AddressDelays::refWidth);
+      double delay = std::round(cost.delay * 100.0) / 100.0;
+      auto combPrice = [&](OpKind kind) -> int64_t {
+        const OperatorEntry *row = combEntry(kind);
+        if (!row)
+          return 0;
+        std::optional<int64_t> p = priceOf(row->uses, {AddressDelays::refWidth});
+        assert(p && "a comb row an address cone builds from is measured at the "
+                    "index width");
+        return *p;
+      };
+      OperatorChar c;
+      c.timing.typeName = "comb.apply@" + llvm::formatv("{0:F2}", delay).str();
+      c.timing.latency = 0;
+      c.timing.inDelay = c.timing.outDelay = delay;
+      c.price = cost.adders * combPrice(OpKind::Add) +
+                cost.multipliers * combPrice(OpKind::Mul) +
+                cost.dividers * combPrice(OpKind::Div);
+      c.identity = identityOf(op, combKindOf(op), "");
+      return c;
+    }
+    // Matching nothing is ordinary: a constant or a yield terminator costs
+    // nothing real here. A float->float arith op reaching here would
+    // miscompile at latency 0, so assert instead; extend
+    // `classify()`/`needsIP()` (`validateDatapath` repeats this check for a
+    // release build).
     auto isFloat = [](Type t) { return isa<FloatType>(t); };
     bool floatIn = llvm::any_of(elementTypes(op->getOperandTypes()), isFloat);
     bool floatOut = llvm::any_of(elementTypes(op->getResultTypes()), isFloat);
