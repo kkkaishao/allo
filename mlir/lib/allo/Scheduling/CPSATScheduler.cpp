@@ -187,12 +187,15 @@ SmallVector<unsigned> readSelection(const CpSolverResponse &response,
 }
 
 /// What the decided rows cost the device: the term the cyclic search adds to
-/// an interval's allocation area when comparing intervals.
+/// an interval's allocation area when comparing intervals. A pair in
+/// \p covered is priced by a shared class instead and skipped here.
 int64_t selectionPrice(ArrayRef<SelectionChoice> choices,
-                       ArrayRef<unsigned> chosen) {
+                       ArrayRef<unsigned> chosen,
+                       const DenseSet<std::pair<unsigned, unsigned>> &covered) {
   int64_t price = 0;
-  for (auto [choice, m] : llvm::zip(choices, chosen))
-    price += choice.cands[m].price;
+  for (auto [i, choice] : llvm::enumerate(choices))
+    if (!covered.contains({static_cast<unsigned>(i), chosen[i]}))
+      price += choice.cands[chosen[i]].price;
   return price;
 }
 
@@ -223,8 +226,10 @@ void applySelection(circt::scheduling::ChainingProblem &prob,
 //===----------------------------------------------------------------------===//
 // Shared classes: the composition of selection and allocation on one model.
 // One class per candidate row several operations could run on, its instance
-// count decided WITH which operations select it. Acyclic only: the modulo
-// form needs slot-membership products and is not built yet.
+// count decided WITH which operations select it. Membership is collected once
+// per region; an acyclic model states the capacity as a cumulative over
+// occupancy intervals, a modulo model as a per-slot sum of slot-and-selection
+// products.
 //===----------------------------------------------------------------------===//
 
 /// One shared class. A static member (an operation whose realization is not a
@@ -235,6 +240,11 @@ struct SharedClassVar {
   /// One instance's price and its select shape, the inputs of the (members,
   /// units) tables below.
   int64_t unitPrice = 0, ports = 0, width = 1;
+  /// Members reading a loop-carried operand, counted over everyone who COULD
+  /// join: a shared unit re-injects such an operand on a select arm of its own
+  /// (`populateOperatorAllocation`), charged conservatively since the cone is
+  /// tabulated before the membership is decided. Zero on an acyclic region.
+  unsigned carried = 0;
   /// Static members: the operation, its occupancy, and its incoming delay in
   /// picoseconds (what the headroom is held against).
   SmallVector<std::tuple<Operation *, unsigned, int64_t>> statics;
@@ -284,35 +294,52 @@ int64_t sharedPrice(const OperatorLibrary &lib, const SharedClassVar &cls,
                                           (n - busy) * armPrice(share));
 }
 
-/// The fullest instance's select cone at (\p k, \p n), in ns. No re-injection
-/// arms: shared classes are acyclic, and only a cyclic member carries a
-/// recurrence identity to re-inject.
+/// The fullest instance's select cone at (\p k, \p n), in ns: `ceil(k / n)`
+/// source arms plus one re-injection arm per carried member among them. Zero
+/// once every member has its own instance: nothing shares, so there is no
+/// select to re-inject through either.
 double sharedConeNs(const OperatorLibrary &lib, const SharedClassVar &cls,
                     int64_t k, int64_t n) {
-  if (n == 0 || k == 0)
+  if (n == 0 || k <= n)
     return 0.0;
-  return muxCone(lib, static_cast<unsigned>((k + n - 1) / n),
+  auto fullest = static_cast<unsigned>((k + n - 1) / n);
+  unsigned arms = fullest + std::min(fullest, cls.carried);
+  return muxCone(lib, arms,
                  static_cast<unsigned>(std::max<int64_t>(1, cls.width)));
 }
 
-/// Build the shared classes of an acyclic model: for every row at least two
-/// operations could run on, a cumulative whose capacity is the count being
-/// decided, with a fixed interval per static member and an optional one per
-/// conditional member, and the price and select cone read off (members,
-/// units) tables through one flattened element constraint.
-///
-/// Only in allocation mode (the caller gates): with the trivial binding the
-/// emitter builds one unit per operation, so a fold priced here would never
-/// be built.
-SharedClasses
-addSharedClasses(CpModelBuilder &model, ChainingSharedOperatorsProblem &prob,
-                 const OperatorLibrary &lib, ArrayRef<SelectionChoice> choices,
-                 const SelectionVars &sels,
-                 DenseMap<Operation *, IntVar> &startVars,
-                 DenseMap<Operation *, IntVar> &inCycle, float cycleTime) {
+/// Collect the shared classes of one region: for every candidate row, who
+/// could run on it and the shape of one instance. Metadata only, no model
+/// variables, so the cyclic search collects once and builds each fixed-II
+/// model on it. In a cyclic region a multi-cycle static stays out (a count
+/// per congruence slot is not an assignment for it, the same refusal as
+/// `populateOperatorAllocation`), and every conditional member occupies one
+/// cycle (`selectionCandidates` keeps only pipelined rows there).
+template <class ProblemT>
+SharedClasses collectSharedClasses(ProblemT &prob, const OperatorLibrary &lib,
+                                   ArrayRef<SelectionChoice> choices) {
+  constexpr bool isCyclic =
+      std::is_base_of_v<circt::scheduling::CyclicProblem, ProblemT>;
   SharedClasses shared;
   if (choices.empty())
     return shared;
+  DenseMap<Operation *, unsigned> choiceOf;
+  for (auto [i, choice] : llvm::enumerate(choices))
+    choiceOf.try_emplace(choice.op, static_cast<unsigned>(i));
+  // The loop whose carried values a shared unit re-injects; its own induction
+  // variable is not carried.
+  Operation *container = prob.getContainingOp();
+  Value inductionVar;
+  if (auto loop = dyn_cast<LoopLikeOpInterface>(container))
+    if (auto iv = loop.getSingleInductionVar())
+      inductionVar = *iv;
+  auto readsCarried = [&](Operation *op) {
+    return isCyclic && llvm::any_of(op->getOperands(), [&](Value v) {
+             auto barg = dyn_cast<BlockArgument>(v);
+             return barg && barg.getOwner()->getParentOp() == container &&
+                    v != inductionVar;
+           });
+  };
   auto occOf = [](const OperatorChar &c) {
     return c.pipelined ? 1u : std::max(1u, c.timing.latency);
   };
@@ -327,11 +354,14 @@ addSharedClasses(CpModelBuilder &model, ChainingSharedOperatorsProblem &prob,
   // classes, so two compiles declare the same model.
   std::map<std::string, SharedClassVar> byIdentity;
   for (Operation *op : prob.getOperations()) {
-    if (std::optional<unsigned> i = sels.of(op)) {
-      for (auto [m, cand] : llvm::enumerate(choices[*i].cands)) {
+    if (auto it = choiceOf.find(op); it != choiceOf.end()) {
+      bool carried = readsCarried(op);
+      for (auto [m, cand] : llvm::enumerate(choices[it->second].cands)) {
         SharedClassVar &cls = byIdentity[cand.identity.key()];
         shapeOf(cls, op, cand);
-        cls.conds.push_back({*i, static_cast<unsigned>(m), occOf(cand)});
+        cls.conds.push_back(
+            {it->second, static_cast<unsigned>(m), occOf(cand)});
+        cls.carried += carried;
       }
       continue;
     }
@@ -340,18 +370,57 @@ addSharedClasses(CpModelBuilder &model, ChainingSharedOperatorsProblem &prob,
     OperatorChar c = lib.lookup(op);
     if (!c.identity.realized() || c.identity.comb)
       continue;
+    unsigned occ = occOf(c);
+    if (isCyclic && occ > 1)
+      continue;
     SharedClassVar &cls = byIdentity[c.identity.key()];
     shapeOf(cls, op, c);
-    cls.statics.push_back({op, occOf(c), picos(c.timing.inDelay)});
+    cls.statics.push_back({op, occ, picos(c.timing.inDelay)});
+    cls.carried += readsCarried(op);
   }
 
-  int64_t period = picos(cycleTime);
   for (auto &[key, cls] : byIdentity) {
-    auto ceiling = static_cast<int64_t>(cls.statics.size() + cls.conds.size());
-    if (ceiling < 2)
+    if (cls.statics.size() + cls.conds.size() < 2)
       continue;
     cls.rsrc = prob.getOrInsertResourceType(key);
     cls.onProblem = prob.getAllocatable(cls.rsrc).has_value();
+    for (const SharedClassVar::Cond &cond : cls.conds)
+      shared.covered.insert({cond.choice, cond.cand});
+    shared.owned.insert(cls.rsrc);
+    shared.classes.push_back(std::move(cls));
+  }
+  return shared;
+}
+
+/// The operations a class holds or could hold, static and conditional alike:
+/// what a modulo model gives a congruence slot beyond what already contends.
+DenseSet<Operation *> sharedMemberOps(SharedClasses &shared,
+                                      ArrayRef<SelectionChoice> choices) {
+  DenseSet<Operation *> members;
+  for (SharedClassVar &cls : shared.classes) {
+    for (auto [op, occ, in] : cls.statics)
+      members.insert(op);
+    for (const SharedClassVar::Cond &cond : cls.conds)
+      members.insert(choices[cond.choice].op);
+  }
+  return members;
+}
+
+/// Declare each collected class's decision variables on one model: the count
+/// and the joined membership, the price and select cone read off (members,
+/// units) tables through one flattened element constraint each, and the cone
+/// held against every member's sub-cycle start. Capacity is the caller's:
+/// what fits `units` instances differs between a straight line and a modulo
+/// table.
+void addSharedClassVars(CpModelBuilder &model, const OperatorLibrary &lib,
+                        SharedClasses &shared,
+                        ArrayRef<SelectionChoice> choices,
+                        const SelectionVars &sels,
+                        DenseMap<Operation *, IntVar> &inCycle,
+                        float cycleTime) {
+  int64_t period = picos(cycleTime);
+  for (SharedClassVar &cls : shared.classes) {
+    auto ceiling = static_cast<int64_t>(cls.statics.size() + cls.conds.size());
     auto staticCount = static_cast<int64_t>(cls.statics.size());
     cls.units = model.NewIntVar(
         operations_research::Domain(staticCount ? 1 : 0, ceiling));
@@ -362,15 +431,6 @@ addSharedClasses(CpModelBuilder &model, ChainingSharedOperatorsProblem &prob,
       joined += sels.sel[cond.choice][cond.cand];
     model.AddEquality(cls.members, joined);
     model.AddLessOrEqual(cls.units, cls.members);
-
-    CumulativeConstraint cum = model.AddCumulative(cls.units);
-    for (auto [op, occ, in] : cls.statics)
-      cum.AddDemand(model.NewFixedSizeIntervalVar(startVars.at(op), occ), 1);
-    for (const SharedClassVar::Cond &cond : cls.conds)
-      cum.AddDemand(model.NewOptionalFixedSizeIntervalVar(
-                        startVars.at(choices[cond.choice].op), cond.occ,
-                        sels.sel[cond.choice][cond.cand]),
-                    1);
 
     // The (members, units) tables, flattened onto one index.
     std::vector<int64_t> prices((ceiling + 1) * (ceiling + 1));
@@ -407,11 +467,33 @@ addSharedClasses(CpModelBuilder &model, ChainingSharedOperatorsProblem &prob,
     for (const SharedClassVar::Cond &cond : cls.conds)
       hintMembers += cond.cand == choices[cond.choice].preferred;
     model.AddHint(cls.units, hintMembers);
+  }
+}
 
+/// Build the shared classes of an acyclic model: the collected membership,
+/// its variables, and the capacity as a cumulative whose demands are a fixed
+/// interval per static member and an optional one per conditional member.
+///
+/// Only in allocation mode (the caller gates): with the trivial binding the
+/// emitter builds one unit per operation, so a fold priced here would never
+/// be built.
+SharedClasses
+addSharedClasses(CpModelBuilder &model, ChainingSharedOperatorsProblem &prob,
+                 const OperatorLibrary &lib, ArrayRef<SelectionChoice> choices,
+                 const SelectionVars &sels,
+                 DenseMap<Operation *, IntVar> &startVars,
+                 DenseMap<Operation *, IntVar> &inCycle, float cycleTime) {
+  SharedClasses shared = collectSharedClasses(prob, lib, choices);
+  addSharedClassVars(model, lib, shared, choices, sels, inCycle, cycleTime);
+  for (SharedClassVar &cls : shared.classes) {
+    CumulativeConstraint cum = model.AddCumulative(cls.units);
+    for (auto [op, occ, in] : cls.statics)
+      cum.AddDemand(model.NewFixedSizeIntervalVar(startVars.at(op), occ), 1);
     for (const SharedClassVar::Cond &cond : cls.conds)
-      shared.covered.insert({cond.choice, cond.cand});
-    shared.owned.insert(cls.rsrc);
-    shared.classes.push_back(std::move(cls));
+      cum.AddDemand(model.NewOptionalFixedSizeIntervalVar(
+                        startVars.at(choices[cond.choice].op), cond.occ,
+                        sels.sel[cond.choice][cond.cand]),
+                    1);
   }
   return shared;
 }
@@ -822,16 +904,45 @@ Allocated readAllocation(const CpSolverResponse &response,
   return decided;
 }
 
+/// The instance count each shared class settled on in \p response, aligned
+/// with `shared.classes`. Read apart from the writeback because the cyclic
+/// search runs many solves and only the adopted one's counts stand.
+SmallVector<unsigned> readSharedUnits(const CpSolverResponse &response,
+                                      SharedClasses &shared) {
+  SmallVector<unsigned> units;
+  for (SharedClassVar &cls : shared.classes)
+    units.push_back(
+        static_cast<unsigned>(SolutionIntegerValue(response, cls.units)));
+  return units;
+}
+
+/// What the decided classes cost at the membership \p chosen implies and the
+/// counts \p classUnits record: the host-side mirror of the model's price
+/// element, for the cyclic search to compare intervals with.
+int64_t sharedAreaOf(const OperatorLibrary &lib, SharedClasses &shared,
+                     ArrayRef<SelectionChoice> choices,
+                     ArrayRef<unsigned> chosen, ArrayRef<unsigned> classUnits) {
+  int64_t area = 0;
+  for (auto [cls, units] : llvm::zip(shared.classes, classUnits)) {
+    auto k = static_cast<int64_t>(cls.statics.size());
+    for (const SharedClassVar::Cond &cond : cls.conds)
+      k += chosen[cond.choice] == cond.cand;
+    area += sharedPrice(lib, cls, k, units);
+  }
+  return area;
+}
+
 /// Write the adopted membership of every shared class back onto the problem:
 /// link each decided member to the class resource, set the problem-side
 /// allocatable view to the tables at the decided member count, and append the
-/// decided instance counts for `applyAllocation` to realize. A class fewer
-/// than two members joined dissolves: each operation keeps its own instance.
-void applySharedClasses(ChainingSharedOperatorsProblem &prob,
-                        const OperatorLibrary &lib, SharedClasses &shared,
+/// decided instance counts (\p classUnits, aligned with the classes) for
+/// `applyAllocation` to realize. A class fewer than two members joined
+/// dissolves: each operation keeps its own instance.
+void applySharedClasses(OccupancyProblem &prob, const OperatorLibrary &lib,
+                        SharedClasses &shared,
                         ArrayRef<SelectionChoice> choices,
-                        ArrayRef<unsigned> chosen, const CpSolverResponse &pick,
-                        Allocated &decided) {
+                        ArrayRef<unsigned> chosen,
+                        ArrayRef<unsigned> classUnits, Allocated &decided) {
   auto link = [&](Operation *op, Problem::ResourceType rsrc, unsigned occ) {
     SmallVector<Problem::ResourceType> units;
     if (auto linked = prob.getLinkedResourceTypes(op))
@@ -840,7 +951,7 @@ void applySharedClasses(ChainingSharedOperatorsProblem &prob,
     prob.setLinkedResourceTypes(op, units);
     prob.setResourceCycles(op, occ);
   };
-  for (SharedClassVar &cls : shared.classes) {
+  for (auto [cls, decidedUnits] : llvm::zip(shared.classes, classUnits)) {
     SmallVector<std::pair<Operation *, unsigned>> joined;
     for (const SharedClassVar::Cond &cond : cls.conds)
       if (chosen[cond.choice] == cond.cand)
@@ -848,7 +959,7 @@ void applySharedClasses(ChainingSharedOperatorsProblem &prob,
     auto k = static_cast<int64_t>(cls.statics.size() + joined.size());
     if (k < 2)
       continue;
-    int64_t units = SolutionIntegerValue(pick, cls.units);
+    auto units = static_cast<int64_t>(decidedUnits);
     assert(units >= 1 && units <= k &&
            "the model bounds the count by the membership it decided");
     if (!cls.onProblem)
@@ -1322,8 +1433,8 @@ LogicalResult mlir::allo::scheduleCPSAT(ChainingSharedOperatorsProblem &prob,
   if (!sels.empty()) {
     SmallVector<unsigned> chosen = readSelection(pick, sels);
     applySelection(prob, choices, chosen);
-    applySharedClasses(prob, span.device, shared, choices, chosen, pick,
-                       decided);
+    applySharedClasses(prob, span.device, shared, choices, chosen,
+                       readSharedUnits(pick, shared), decided);
   }
   applyAllocation(prob, decided, /*ii=*/0);
   return finishSchedule(prob, cycleTime, opts.regFloor);
@@ -1359,16 +1470,20 @@ enum class ModuloOutcome { Scheduled, Infeasible, Exhausted };
 ///
 /// \p choices are the realization decisions this model carries (empty
 /// \p breaks then, the period stated through the sub-cycle system); \p chosen
-/// receives the candidate settled per choice.
+/// receives the candidate settled per choice. \p sharedMeta is the region's
+/// one collection of shared classes; this model builds its own variables on
+/// it, and \p classUnits receives the counts settled, aligned with it.
 ModuloOutcome solveAtII(ChainingModuloProblem &prob, Operation *lastOp,
                         ArrayRef<Problem::Dependence> breaks,
-                        ArrayRef<SelectionChoice> choices, float cycleTime,
+                        ArrayRef<SelectionChoice> choices,
+                        SharedClasses &sharedMeta, float cycleTime,
                         const SpanObjective &span, const SchedulerOptions &opts,
                         std::optional<int64_t> drainBound, int64_t floorDrain,
                         unsigned ii, unsigned horizon, bool hint,
                         DenseMap<Operation *, unsigned> &starts,
                         Allocated &decided, SmallVector<unsigned> &chosen,
-                        bool &spanProven, bool &areaProven, int64_t &drain) {
+                        SmallVector<unsigned> &classUnits, bool &spanProven,
+                        bool &areaProven, int64_t &drain) {
   const auto &ops = prob.getOperations();
 
   CpModelBuilder model;
@@ -1408,16 +1523,22 @@ ModuloOutcome solveAtII(ChainingModuloProblem &prob, Operation *lastOp,
   if (!sels.empty())
     inCycle = addSubCycleTimes(model, prob, startVars, cycleTime, opts.regFloor,
                                &sels);
+  // This model's own view of the collected classes; the copy carries the
+  // per-model variables, the collection stays pristine for the writeback.
+  SharedClasses shared = sharedMeta;
+  addSharedClassVars(model, span.device, shared, choices, sels, inCycle,
+                     cycleTime);
+  DenseSet<Operation *> sharedMembers = sharedMemberOps(shared, choices);
 
-  // One-hot congruence class per contending op. `t = ii*lap + sum(p*slot[p])`
-  // defines class and modulo at once with no reification: slot[p] IS membership
-  // in class p, which the sums below need.
+  // One-hot congruence class per contending op and per shared-class member.
+  // `t = ii*lap + sum(p*slot[p])` defines class and modulo at once with no
+  // reification: slot[p] IS membership in class p, which the sums below need.
   DenseMap<Operation *, SmallVector<BoolVar>> slotsOf;
   SmallVector<int64_t> classes(ii);
   for (unsigned p = 0; p < ii; ++p)
     classes[p] = p;
   for (Operation *op : ops) {
-    if (!prob.contendsForUnit(op))
+    if (!prob.contendsForUnit(op) && !sharedMembers.contains(op))
       continue;
     SmallVector<BoolVar> slots;
     slots.reserve(ii);
@@ -1456,11 +1577,38 @@ ModuloOutcome solveAtII(ChainingModuloProblem &prob, Operation *lastOp,
       model.AddLessOrEqual(usesIn(rsrc, slot), static_cast<int64_t>(limit));
   }
 
+  // A shared class's capacity, per congruence slot: a static member occupies
+  // its slot outright, a conditional one only where its row is selected, as
+  // the AND of the two literals. Every member occupies one cycle
+  // (`collectSharedClasses` admits no other in a cyclic region), so no window
+  // wraps the table, and `ii * units >= members` is the demand cut.
+  for (SharedClassVar &cls : shared.classes) {
+    model.AddGreaterOrEqual(
+        LinearExpr::Term(cls.units, static_cast<int64_t>(ii)), cls.members);
+    for (unsigned slot = 0; slot < ii; ++slot) {
+      LinearExpr used;
+      for (auto [op, occ, in] : cls.statics) {
+        assert(occ == 1 && "a multi-cycle member joins no cyclic class");
+        used += slotsOf.at(op)[slot];
+      }
+      for (const SharedClassVar::Cond &cond : cls.conds) {
+        assert(cond.occ == 1 && "a cyclic candidate row is pipelined");
+        const BoolVar &sat = slotsOf.at(choices[cond.choice].op)[slot];
+        const BoolVar &sel = sels.sel[cond.choice][cond.cand];
+        BoolVar joins = model.NewBoolVar();
+        model.AddBoolAnd({sat, sel}).OnlyEnforceIf(joins);
+        model.AddBoolOr({joins, sat.Not(), sel.Not()});
+        used += joins;
+      }
+      model.AddLessOrEqual(used, cls.units);
+    }
+  }
+
   // The same sum against the count being decided. Allocatable operators occupy
   // one cycle here, so an op sits in one class and a per-class count is
   // realizable as an assignment. `N_r >= ceil(total/ii)` is implied, cut here.
   SmallVector<AllocationVar> allocs =
-      allocationVars(model, prob, ii, hint, cycleTime);
+      allocationVars(model, prob, ii, hint, cycleTime, &shared.owned);
   for (const AllocationVar &alloc : allocs) {
     int64_t total = 0;
     for (Operation *op : ops)
@@ -1498,14 +1646,9 @@ ModuloOutcome solveAtII(ChainingModuloProblem &prob, Operation *lastOp,
   // The area solve, under the span the first settled, on what is left of the
   // budget.
   model.AddLessOrEqual(primary, SolutionIntegerValue(first, primary));
-  // No shared classes at a fixed interval yet: conditional membership there
-  // needs slot-times-selection products, so a decided operation keeps its own
-  // instance and its row's price rides the per-operation terms.
-  SharedClasses noShared;
   minimizeArea(model, orderedStarts, span, startVars, allocs, ii, horizon,
-               latExpr, sels, noShared);
-  rehintFrom(model, ops.getArrayRef(), startVars, allocs, sels, noShared,
-             first);
+               latExpr, sels, shared);
+  rehintFrom(model, ops.getArrayRef(), startVars, allocs, sels, shared, first);
   SchedulerOptions rest = opts;
   rest.budget = std::max(opts.budget - first.deterministic_time(), 0.0);
   CpSolverResponse second =
@@ -1519,6 +1662,7 @@ ModuloOutcome solveAtII(ChainingModuloProblem &prob, Operation *lastOp,
     starts[op] = SolutionIntegerValue(pick, startVars.at(op));
   decided = readAllocation(pick, allocs);
   chosen = readSelection(pick, sels);
+  classUnits = readSharedUnits(pick, shared);
   drain = drainVar ? SolutionIntegerValue(pick, *drainVar) : 0;
   return ModuloOutcome::Scheduled;
 }
@@ -1560,6 +1704,16 @@ LogicalResult mlir::allo::scheduleCPSAT(ChainingModuloProblem &prob,
   if (choices.empty())
     breaks = chainBreaksFor(prob, cycleTime, opts.regFloor);
 
+  // The classes selection and allocation compose over, collected once:
+  // membership does not depend on the interval, so every fixed-II model
+  // builds its variables on this one collection and the adopted counts are
+  // written back through it. Only in allocation mode, where the binding
+  // realizes what is decided here.
+  SharedClasses sharedMeta;
+  if (opts.allocate)
+    sharedMeta = collectSharedClasses(prob, span.device, choices);
+  DenseSet<Operation *> sharedMembers = sharedMemberOps(sharedMeta, choices);
+
   DenseMap<Operation *, std::pair<int64_t, int64_t>> latRange =
       latencyRange(choices);
   auto minLat = [&](Operation *op) -> int64_t {
@@ -1568,9 +1722,9 @@ LogicalResult mlir::allo::scheduleCPSAT(ChainingModuloProblem &prob,
   };
 
   // Window: region laid out end to end (satisfying precedence and chain
-  // breaks, at each op's longest realization) plus one II per contending op,
-  // widened to the heuristic's own reach. Must be provably sufficient, since
-  // INFEASIBLE here counts as proof.
+  // breaks, at each op's longest realization) plus one II per contending op
+  // (a shared-class member contends too), widened to the heuristic's own
+  // reach. Must be provably sufficient, since INFEASIBLE here counts as proof.
   const auto &ops = prob.getOperations();
   int64_t sequential = 0;
   int64_t greedyReach = 0;
@@ -1579,7 +1733,7 @@ LogicalResult mlir::allo::scheduleCPSAT(ChainingModuloProblem &prob,
     auto it = latRange.find(op);
     sequential +=
         (it != latRange.end() ? it->second.second : prob.latencyOf(op)) + 1;
-    if (prob.contendsForUnit(op))
+    if (prob.contendsForUnit(op) || sharedMembers.contains(op))
       ++contending;
     if (warm.placed)
       greedyReach = std::max(greedyReach, int64_t(*prob.getStartTime(op)));
@@ -1621,6 +1775,7 @@ LogicalResult mlir::allo::scheduleCPSAT(ChainingModuloProblem &prob,
   DenseMap<Operation *, unsigned> bestStarts;
   Allocated bestAllocation;
   SmallVector<unsigned> bestChosen;
+  SmallVector<unsigned> bestClassUnits;
   int64_t bestArea = 0;
   unsigned bestII = 0;
   bool bestSpanProven = false;
@@ -1643,14 +1798,15 @@ LogicalResult mlir::allo::scheduleCPSAT(ChainingModuloProblem &prob,
     DenseMap<Operation *, unsigned> starts;
     Allocated decided;
     SmallVector<unsigned> chosen;
+    SmallVector<unsigned> classUnits;
     bool spanProven = false;
     bool areaProven = false;
     int64_t drain = 0;
     ModuloOutcome outcome = solveAtII(
-        prob, lastOp, breaks, choices, cycleTime, span, opts, drainBound,
-        bySpan ? floorDrain : 0, ii, window + ii * contending,
+        prob, lastOp, breaks, choices, sharedMeta, cycleTime, span, opts,
+        drainBound, bySpan ? floorDrain : 0, ii, window + ii * contending,
         /*hint=*/warm.placed && ii == greedyII, starts, decided, chosen,
-        spanProven, areaProven, drain);
+        classUnits, spanProven, areaProven, drain);
     if (outcome == ModuloOutcome::Infeasible) {
       // INFEASIBLE is a proof only where nothing bounded the solve; under the
       // incumbent's bound it is the weaker "nothing here beats it".
@@ -1669,7 +1825,10 @@ LogicalResult mlir::allo::scheduleCPSAT(ChainingModuloProblem &prob,
     // Improvement is lexicographic: span first, then the instances built and
     // the rows decided.
     int64_t solved = iiWeight * ii + drain;
-    int64_t area = areaOf(prob, decided) + selectionPrice(choices, chosen);
+    int64_t area =
+        areaOf(prob, decided) +
+        selectionPrice(choices, chosen, sharedMeta.covered) +
+        sharedAreaOf(span.device, sharedMeta, choices, chosen, classUnits);
     if (!adopted || solved < *best || (solved == *best && area < bestArea)) {
       best = solved;
       bestArea = area;
@@ -1679,6 +1838,7 @@ LogicalResult mlir::allo::scheduleCPSAT(ChainingModuloProblem &prob,
       bestStarts = std::move(starts);
       bestAllocation = std::move(decided);
       bestChosen = std::move(chosen);
+      bestClassUnits = std::move(classUnits);
       adopted = true;
     }
     if (!bySpan)
@@ -1718,8 +1878,11 @@ LogicalResult mlir::allo::scheduleCPSAT(ChainingModuloProblem &prob,
   prob.setInitiationInterval(bestII);
   for (Operation *op : ops)
     prob.setStartTime(op, bestStarts.at(op));
-  if (!choices.empty())
+  if (!choices.empty()) {
     applySelection(prob, choices, bestChosen);
+    applySharedClasses(prob, span.device, sharedMeta, choices, bestChosen,
+                       bestClassUnits, bestAllocation);
+  }
   applyAllocation(prob, bestAllocation, bestII);
 
   {

@@ -471,10 +471,9 @@ struct SchedulerOptions {
   /// Only meaningful alongside a binding that folds them: with the trivial
   /// binding the emitter builds one unit per operation anyway. The heuristic
   /// ignores it. An operation whose realization the exact solver decides
-  /// (`selectionCandidates`) is composed differently: a straight-line solve
-  /// puts it in the class of whichever row it decides (a shared class), while
-  /// a modulo solve leaves it its own instance, where bind-time sharing may
-  /// still fold equal decided rows.
+  /// (`selectionCandidates`) is composed through a shared class instead: the
+  /// solve puts it in the class of whichever row it decides, straight-line
+  /// and modulo alike.
   bool allocate = false;
   int workers = kDefaultSolveWorkers;
   int seed = kDefaultSolveSeed;

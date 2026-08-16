@@ -1146,6 +1146,50 @@ def test_converged_selections_fold_onto_one_instance():
     assert int(exact.cosim(*vals).result) == (7 * 8) * (3 + 4) * (5 + 6)
 
 
+# The same composition inside a pipeline: the recurrence multiply holds the
+# loop at II=6, the three slack adds converge on one row, and the modulo model
+# folds them onto ONE instance by spreading them over distinct congruence
+# slots. At 100 MHz the three-arm select cone fits the period outright, so the
+# full fold is the unambiguous optimum; at a tight clock the same model backs
+# off to more instances instead.
+def test_converged_selections_fold_in_a_pipeline():
+    wide = APInt(48, signed=True)
+    dev, add_fast, add_cheap, mul_deep = _selection_cores(wide)
+    # Equal, expensive cores, as in the acyclic fold test.
+    dev.set_operator_uses(add_fast, {dev.resources["lut"]: Const(5000.0)})
+    dev.set_operator_uses(add_cheap, {dev.resources["lut"]: Const(5000.0)})
+
+    @kernel
+    def prodsum(a: i32[12]) -> wide:
+        acc: wide = 1
+        for k in range(4, name="k"):
+            x: wide = a[3 * k]
+            y: wide = a[3 * k + 1]
+            z: wide = a[3 * k + 2]
+            u: wide = x + y
+            v: wide = y + z
+            acc = acc * (u + v)
+        return acc
+
+    exact = _to_rtl(prodsum, device=dev, freq_mhz=100).set_scheduler_opt(
+        scheduler="exact"
+    )
+    winners = _impls(exact.schedule()) & {add_fast.symbol, add_cheap.symbol}
+    assert len(winners) == 1
+    winner = winners.pop()
+    loser = ({add_fast.symbol, add_cheap.symbol} - {winner}).pop()
+    # One module definition plus one instantiation: the three adds share it.
+    assert exact.mlir.count(winner) == 2
+    assert exact.mlir.count(loser) == 0
+
+    a = np.arange(1, 13, dtype=np.int32)
+    expect = 1
+    for k in range(4):
+        x, y, z = (int(a[3 * k + j]) for j in range(3))
+        expect *= x + 2 * y + z
+    assert int(exact.cosim(a).result) == expect
+
+
 def test_behavior_language_follows_the_domain():
     # A core's behavior language follows from the core: an integer one is native
     # RTL (exact at any width), a float one is C over the DPI, and a user
