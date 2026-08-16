@@ -13,7 +13,6 @@ import pytest
 from allo import kernel
 from allo.lang import i32, f32, index
 from allo.lang.ip import OperatorType
-from allo.backend.rtl import has_exact_scheduler
 from allo.backend.rtl.devices import default_device
 
 sys.path.insert(0, os.path.dirname(__file__))
@@ -265,7 +264,6 @@ def test_while_flushing_pipeline_cosim():
         assert out[0] == gold(limit)
 
 
-@pytest.mark.skipif(not has_exact_scheduler(), reason="build has no OR-Tools")
 def test_while_pipeline_operators_are_allocated():
     # A flushing while is a pipeline like any counted loop, so the exact
     # scheduler decides how many copies of each operator its body builds.
@@ -285,7 +283,7 @@ def test_while_pipeline_operators_are_allocated():
             out[c] = (A[c] * A[c + 1]) * (A[c + 2] * A[c + 3])
             c = c + 1
 
-    mod = _to_rtl(wmul, binding="planned").set_scheduler_opt(scheduler="exact")
+    mod = _to_rtl(wmul).set_scheduler_opt(scheduler="exact")
     assert mod.schedule().cyclic()[0].conditional  # a flushing while, not a for
     mod.compile()
     (region,) = [r for f in mod.microarch.funcs for r in f.regions]

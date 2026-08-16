@@ -11,15 +11,12 @@
 #include "llvm/ADT/StringSwitch.h"
 #include "llvm/Support/Format.h"
 
-#ifdef ALLO_ENABLE_ORTOOLS
-#include "circt/Scheduling/Utilities.h"
 #include "ortools/sat/cp_model.h"
 #include "ortools/sat/cp_model_solver.h"
 
 #include <cmath>
 #include <limits>
 #include <type_traits>
-#endif
 
 using namespace mlir;
 using namespace mlir::allo;
@@ -32,16 +29,6 @@ std::optional<SchedulerKind> mlir::allo::parseSchedulerKind(StringRef name) {
       .Case("exact-chaining", SchedulerKind::ExactChaining)
       .Default(std::nullopt);
 }
-
-bool mlir::allo::hasExactScheduler() {
-#ifdef ALLO_ENABLE_ORTOOLS
-  return true;
-#else
-  return false;
-#endif
-}
-
-#ifdef ALLO_ENABLE_ORTOOLS
 
 using namespace circt::scheduling;
 using namespace operations_research::sat;
@@ -1357,54 +1344,3 @@ mlir::allo::solveSharing(SharingProblem &problem, ArrayRef<unsigned> hint,
       << llvm::format("%g", opts.budget) << " deterministic time units)";
   return assign;
 }
-
-#else // !ALLO_ENABLE_ORTOOLS
-
-namespace {
-/// Unreachable through `runSDCScheduler`, which rejects `scheduler="exact"` on
-/// an OR-Tools-free build before any region is solved. Kept so the two entry
-/// points exist in both configurations.
-LogicalResult noExactScheduler(Operation *containingOp, StringRef which) {
-  unsupported(Stage::Sched, Code::NoExactScheduler, containingOp)
-      << "This build has no exact scheduler: it was configured without "
-         "OR-Tools. Rebuild with -DALLO_ENABLE_ORTOOLS=ON, or schedule with "
-         "scheduler=\"heuristic\" (the default). Requested for the "
-      << which << " problem";
-  return failure();
-}
-/// A lower bound on the region's drain at ANY initiation interval: the longest
-/// chain of intra-iteration (distance-0) edges reaching an output. An edge
-/// spanning iterations is relaxed by one II per iteration it spans, so only the
-/// distance-0 subgraph bounds a start time regardless of interval width, and
-/// resources only push starts later. This is what keeps the branch and bound's
-/// cut tight once the drain dwarfs the trip.
-///
-/// Only \p chaining's break edges lengthen a path here; where the period is
-/// stated in the model instead there are no break edges, and the bound is
-/// simply looser, still sound.
-} // namespace
-
-LogicalResult mlir::allo::scheduleCPSAT(ChainingSharedOperatorsProblem &prob,
-                                        Operation *lastOp, float cycleTime,
-                                        const SpanObjective &span,
-                                        const SchedulerOptions &opts) {
-  return noExactScheduler(prob.getContainingOp(), "acyclic");
-}
-
-LogicalResult mlir::allo::scheduleCPSAT(ChainingModuloProblem &prob,
-                                        Operation *lastOp, float cycleTime,
-                                        unsigned minII,
-                                        const SpanObjective &span,
-                                        const SchedulerOptions &opts) {
-  return noExactScheduler(prob.getContainingOp(), "cyclic");
-}
-
-/// Nothing to solve with: the exact-share policy falls back to the greedy plan
-/// rather than refusing, sharing being an optimization and not a semantic.
-std::optional<SmallVector<unsigned>>
-mlir::allo::solveSharing(SharingProblem &problem, ArrayRef<unsigned> hint,
-                         Operation *anchor) {
-  return std::nullopt;
-}
-
-#endif // ALLO_ENABLE_ORTOOLS

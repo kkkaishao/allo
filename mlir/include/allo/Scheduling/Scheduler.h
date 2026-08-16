@@ -420,9 +420,9 @@ struct SpanObjective {
 enum class SchedulerKind {
   /// The SDC simplex plus greedy modulo / shared-operator placement.
   Heuristic,
-  /// CP-SAT over the same problem: exact under the model, and available only
-  /// in a build with OR-Tools. The chain breaks stay the pre-pass's, so only
-  /// resource placement differs from the heuristic.
+  /// CP-SAT over the same problem: exact under the model. The chain breaks
+  /// stay the pre-pass's, so only resource placement differs from the
+  /// heuristic.
   Exact,
   /// As above, but the chain breaks are decided in the constraint program too.
   /// The pre-pass breaks a too-long chain at its ORIGIN; deciding it in the
@@ -431,7 +431,7 @@ enum class SchedulerKind {
   ExactChaining,
 };
 
-/// Whether \p kind solves the resource half with CP-SAT, i.e. needs OR-Tools.
+/// Whether \p kind solves the resource half with CP-SAT.
 inline bool usesExactScheduler(SchedulerKind kind) {
   return kind != SchedulerKind::Heuristic;
 }
@@ -471,9 +471,6 @@ struct SchedulerOptions {
 /// \p name ("heuristic" / "exact" / "exact-chaining") as a kind, or nullopt
 /// when it names none of them.
 std::optional<SchedulerKind> parseSchedulerKind(StringRef name);
-
-/// Whether this build has the CP-SAT exact scheduler compiled in.
-bool hasExactScheduler();
 
 /// One region's operator-sharing problem, decided at bind time with the
 /// schedule already fixed: which same-class units to fold onto one instance.
@@ -523,16 +520,14 @@ struct SharingProblem {
 /// holding every unit's input cone within `slackPicos` under the recursion the
 /// emit gate walks (`AddedDelay`): a bin's select plus everything a same-cycle
 /// producer's bin adds. \p hint seeds the search, so the greedy plan is the
-/// incumbent to beat. \p anchor is where diagnostics land. Returns nullopt in
-/// a build without OR-Tools or when the budget expires with nothing usable.
+/// incumbent to beat. \p anchor is where diagnostics land. Returns nullopt
+/// when the budget expires with nothing usable.
 std::optional<SmallVector<unsigned>> solveSharing(SharingProblem &problem,
                                                   ArrayRef<unsigned> hint,
                                                   Operation *anchor);
 
 /// Solve \p prob exactly with CP-SAT, minimizing \p span under the target clock
-/// period \p cycleTime. Reports `unsupported` and fails in a build without
-/// OR-Tools, so callers dispatch on the requested kind and never on the build
-/// configuration.
+/// period \p cycleTime.
 LogicalResult scheduleCPSAT(ChainingSharedOperatorsProblem &prob,
                             Operation *lastOp, float cycleTime,
                             const SpanObjective &span,

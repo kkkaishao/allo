@@ -8,10 +8,6 @@ from __future__ import annotations
 from ..base import run_pipeline
 from ..._mlir.dialects.allo import run_sdc_scheduling
 
-# re-exported through allo.backend.rtl so callers do not reach into _mlir
-# pylint: disable-next=unused-import
-from ..._mlir.dialects.allo import has_exact_scheduler
-
 from .options import PrepassOptions, SchedulerOptions
 from .reports.schedule import ScheduleResult
 

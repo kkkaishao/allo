@@ -251,9 +251,7 @@ class Stream:
 
     @classmethod
     def from_json(cls, d: dict) -> Stream:
-        return cls(
-            d["owner"], d["width"], d["depth"], d["crosses_call"], d["internal"]
-        )
+        return cls(d["owner"], d["width"], d["depth"], d["crosses_call"], d["internal"])
 
 
 @dataclass(frozen=True)

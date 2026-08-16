@@ -61,11 +61,10 @@ class RTL(Backend[P, R]):
         device: Device | None = None,
         freq_mhz: float | None = None,
         simulator: str = "verilator",
-        binding: str | None = None,
     ):
         """Build an RTL handle for one hardware configuration.
 
-        These four fix the target and how hardware is built for it. The
+        These three fix the target and how hardware is built for it. The
         compiler's own knobs are set on the handle with
         :meth:`set_scheduler_opt`, by the field names of
         :class:`SchedulerOptions` and :class:`PrepassOptions`.
@@ -76,17 +75,6 @@ class RTL(Backend[P, R]):
             freq_mhz: target frequency, overriding the device default. Drives
                 both the SDC cycle time and the cosim clock.
             simulator: the engine cocotb drives for ``cosim``.
-            binding: operator-sharing policy. ``None`` (the default) follows
-                the scheduler, resolved when the schedule is built: an exact
-                scheduler binds ``"planned"``, the heuristic ``"exact-share"``.
-                ``"trivial"`` gives every operation its own unit;
-                ``"greedy-share"`` folds every compatible pair the clock
-                allows; ``"exact-share"`` decides the folds with one CP-SAT
-                solve per region, minimizing modelled area under the clock
-                (without OR-Tools it degrades to the greedy plan);
-                ``"planned"`` builds the allocation the scheduler decided,
-                which only an exact scheduler makes, so under the heuristic it
-                is the trivial binding.
         """
         super().__init__(kernel)
         self._device = device if device is not None else default_device
@@ -95,7 +83,9 @@ class RTL(Backend[P, R]):
         )
         self._cycle_time = 1000.0 / self.freq_mhz
         self.simulator = simulator
-        self.binding = binding
+        # The operator-sharing binding follows the scheduler, resolved when
+        # the schedule is built; `use_trivial_binding` is the one override.
+        self.binding: str | None = None
         self._sched_opts = SchedulerOptions(cycle_ns=self._cycle_time)
         self._prepass_opts = PrepassOptions()
         self.arg_types = kernel.parse_argument_annotations()
@@ -145,6 +135,22 @@ class RTL(Backend[P, R]):
         self._prepass_opts = replace(
             self._prepass_opts, **{k: v for k, v in opts.items() if k in prepass}
         )
+        return self
+
+    def use_trivial_binding(self) -> RTL:
+        """Give every operation its own unit, folding nothing.
+
+        A development diagnostic, not part of the normal flow: it strips
+        binding-time sharing out of the datapath, so a miscompile can be
+        cornered to, or cleared of, the sharing muxes. Users get the binding
+        the scheduler implies: ``exact-share`` under the heuristic,
+        ``planned`` under an exact scheduler.
+        """
+        assert self._schedule_result is None, (
+            "the schedule is already built, and everything downstream describes "
+            "it, so a binding forced now would not reach the design"
+        )
+        self.binding = "trivial"
         return self
 
     def schedule(self) -> ScheduleResult:

@@ -112,5 +112,3 @@ MlirLogicalResult alloRunSDCSchedulingPipeline(
   callback(MlirStringRef{report.data(), report.size()}, userData);
   return mlirLogicalResultSuccess();
 }
-
-bool alloHasExactScheduler() { return allo::hasExactScheduler(); }

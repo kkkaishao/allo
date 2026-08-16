@@ -18,7 +18,6 @@ from allo.lang.core import APInt
 from allo.lang.ip import operator_ip, OperatorType
 from allo.operators import math as amath
 from allo.operators import arith as allo_arith
-from allo.backend.rtl import has_exact_scheduler
 from allo.backend.rtl.devices import default_device
 from allo.backend.rtl.device import (
     CombKind,
@@ -958,44 +957,24 @@ def test_float_and_int_arithmetic():
     assert np.array_equal(Ci, (Ai @ Bi).astype(np.int32))
 
 
-def test_shared_multiply_mux():
-    # Two chained float multiplies (fmul latency 4) issue at disjoint cycles, so
-    # the MRT lets them share one physical unit. The 'greedy-share' binding policy
-    # folds them onto one multiply and deriveInterconnect grows a 2:1 input mux per
-    # port; the shared datapath must be functionally identical to the trivially-
-    # bound one. (Integer multiply is combinational -- no instance to share -- so
-    # sharing is exercised on a float IP operator.)
-    @kernel
-    def chain(A: f32[1], B: f32[1], C: f32[1], o: f32[1]):
-        o[0] = A[0] * B[0] * C[0]
-
-    a, b, c = (np.array([v], np.float32) for v in (7, 6, 5))
-    ref = np.array([7 * 6 * 5], np.float32)
-    unshared = _to_rtl(chain, binding="trivial")
-    shared = _to_rtl(chain, binding="greedy-share")
-    # every multiply is an IP instance, so a dropped instance == a shared unit
-    assert shared.mlir.count("hw.instance") < unshared.mlir.count("hw.instance")
-    for mod in (unshared, shared):
-        o = np.zeros(1, np.float32)
-        mod.cosim(a, b, c, o)
-        assert np.array_equal(o, ref)
-
-
 def test_exact_share_folds_profitable_ip():
-    # 'exact-share' decides the same fold domain as 'greedy-share' with one
-    # CP-SAT solve per region, minimizing modelled area under the clock. An IP
-    # fold that saves a whole fmul against a 2:1 mux per port sits in that
-    # optimum, so the instance drops here too, and the shared datapath stays
-    # functionally identical to the trivially-bound one.
+    # Two chained float multiplies (fmul latency 4) issue at disjoint cycles,
+    # so the MRT lets them share one physical unit. 'exact-share', the binding
+    # the heuristic scheduler implies, decides the fold with one CP-SAT solve
+    # per region, minimizing modelled area under the clock; saving a whole
+    # fmul against a 2:1 mux per port sits in that optimum, so the instance
+    # drops, and the shared datapath stays functionally identical to the
+    # trivially-bound one. (Integer multiply is combinational -- no instance
+    # to share -- so sharing is exercised on a float IP operator.)
     @kernel
     def chain(A: f32[1], B: f32[1], C: f32[1], o: f32[1]):
         o[0] = A[0] * B[0] * C[0]
 
     a, b, c = (np.array([v], np.float32) for v in (7, 6, 5))
-    shared = _to_rtl(chain, binding="exact-share")
+    shared = _to_rtl(chain)
     assert shared.mlir.count("hw.instance") < _to_rtl(
-        chain, binding="trivial"
-    ).mlir.count("hw.instance")
+        chain
+    ).use_trivial_binding().mlir.count("hw.instance")
     o = np.zeros(1, np.float32)
     shared.cosim(a, b, c, o)
     assert np.array_equal(o, np.array([7 * 6 * 5], np.float32))
@@ -1232,77 +1211,33 @@ def test_shared_reduction_reinjects_its_identity():
     for i in range(0, 64, 4):
         want = np.float32(want + A[i])
 
-    shared = _to_rtl(fred, binding="greedy-share")
+    shared = _to_rtl(fred)
     assert _shared_units(shared), "the reduction's adder was not shared at all"
     # The recurrence port carries one arm per bound op plus the identity's.
     assert max(_mux_fanins(shared)) > max(u for u in _shared_units(shared))
 
-    for mod in (_to_rtl(fred), shared):
+    for mod in (_to_rtl(fred).use_trivial_binding(), shared):
         B, out = np.zeros(64, np.float32), np.zeros(1, np.float32)
         mod.cosim(A.copy(), B, out)
         assert abs(out[0] - want) < 1e-3
         assert np.allclose(B[0::4], A[0::4] + A[1::4], rtol=1e-5)
 
 
-def test_shared_mux_delay_accumulates_along_a_chain():
-    # A mux's delay does not stop at the unit it feeds: two shared units on one
-    # combinational chain both shift what they drive, so the binder charges the
-    # whole cone rather than one fold at a time. Charging one fold at a time
-    # admits plans the period check then refuses. What holds at every clock is
-    # that greedy sharing produces a datapath, the same one trivial binding
-    # computes.
-    @kernel
-    def chain(A: i32[64], B: i32[64]):
-        for i in range(0, 64, 4):
-            a0: i32 = A[i] + A[i + 1]
-            a1: i32 = A[i + 2] + A[i + 3]
-            b0: i32 = a0 + a1
-            b1: i32 = a0 - a1
-            B[i] = b0 + b1
-            B[i + 1] = b0 - b1
-            B[i + 2] = a0 + b0
-            B[i + 3] = a1 + b1
-
-    A = np.random.default_rng(3).integers(-50, 50, size=64).astype(np.int32)
-    ref = np.zeros(64, np.int32)
-    for i in range(0, 64, 4):
-        a0, a1 = A[i] + A[i + 1], A[i + 2] + A[i + 3]
-        b0, b1 = a0 + a1, a0 - a1
-        ref[i], ref[i + 1] = b0 + b1, b0 - b1
-        ref[i + 2], ref[i + 3] = a0 + b0, a1 + b1
-
-    # The schedule moves with the clock, so the fold count is no invariant. What
-    # is invariant is that sharing never refuses a clock the trivial binding
-    # (one unit per operation) accepts.
-    for freq in (200, 300, 400, 450, 500):
-        try:
-            _to_rtl(chain, binding="trivial", freq_mhz=freq).mlir
-        except RuntimeError:
-            continue  # a clock this kernel cannot hold however it is bound
-        _to_rtl(chain, binding="greedy-share", freq_mhz=freq).mlir
-    assert _shared_units(_to_rtl(chain, binding="greedy-share"))
-    for mod in (_to_rtl(chain), _to_rtl(chain, binding="greedy-share")):
-        B = np.zeros(64, np.int32)
-        mod.cosim(A.copy(), B)
-        assert np.array_equal(B, ref)
-
-
-@pytest.mark.skipif(not has_exact_scheduler(), reason="build has no OR-Tools")
-def test_planned_allocation_is_never_looser_than_greedy():
+def test_planned_allocation_is_never_looser_than_exact_share():
     # The exact scheduler decides how many copies of each operator a region
-    # builds and 'planned' builds exactly that. Its search starts from, and falls
-    # back on, the tightest count its own schedule admits, which is what the
-    # area-agnostic greedy binder would fold that schedule to. So the decided
-    # allocation ties with greedy sharing and never loses to it.
+    # builds and 'planned' builds exactly that. Its search starts from, and
+    # falls back on, the tightest count its own schedule admits, so on this
+    # chain it reaches the same fold binding-time exact sharing finds and
+    # never loses to it.
     @kernel
     def chain(A: f32[1], B: f32[1], C: f32[1], D: f32[1], o: f32[1]):
         o[0] = A[0] * B[0] * C[0] * D[0]
 
     args = [np.array([v], np.float32) for v in (7, 6, 5, 2)]
     ref = np.array([7 * 6 * 5 * 2], np.float32)
-    greedy = _to_rtl(chain, binding="greedy-share")
-    planned = _to_rtl(chain, binding="planned").set_scheduler_opt(scheduler="exact")
-    assert planned.mlir.count("hw.instance") <= greedy.mlir.count("hw.instance")
+    shared = _to_rtl(chain)
+    planned = _to_rtl(chain).set_scheduler_opt(scheduler="exact")
+    assert planned.mlir.count("hw.instance") <= shared.mlir.count("hw.instance")
     o = np.zeros(1, np.float32)
     planned.cosim(*args, o)
     assert np.array_equal(o, ref)

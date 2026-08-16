@@ -39,21 +39,12 @@ struct TrivialBinding : BindingPolicy {
   plan(const Datapath &dp, const BindingContext &ctx) const override;
 };
 
-/// Greedy within-region sharing: fold same-operator-type units whose MRT
-/// reservations are disjoint onto one unit, while the multiplexers so far grown
-/// still fit the clock along the whole combinational chain each of them
-/// lengthens, not just at the unit they sit on. Area-agnostic: it shares every
-/// compatible op whose timing allows.
-struct GreedyShareBinding : BindingPolicy {
-  std::vector<llvm::SmallVector<UnitId, 2>>
-  plan(const Datapath &dp, const BindingContext &ctx) const override;
-};
-
-/// Exact within-region sharing: the same fold domain as `GreedyShareBinding`,
-/// decided by one CP-SAT solve per region (`solveSharing`) minimizing modelled
-/// area, with every input cone held to the period under the same recursion the
-/// emit-side gate walks. The greedy plan seeds the solve, and stands in for it
-/// in a build without OR-Tools.
+/// Exact within-region sharing: fold same-operator-type units whose MRT
+/// reservations are disjoint, decided by one CP-SAT solve per region
+/// (`solveSharing`) minimizing modelled area, with every input cone held to
+/// the period under the same recursion the emit-side gate walks. A greedy
+/// first-fit plan seeds the solve, and stands in when the solve's budget
+/// expires with nothing usable.
 struct ExactShareBinding : BindingPolicy {
   std::vector<llvm::SmallVector<UnitId, 2>>
   plan(const Datapath &dp, const BindingContext &ctx) const override;
@@ -68,8 +59,8 @@ struct PlannedBinding : BindingPolicy {
   bool realizesSolvePlan() const override { return true; }
 };
 
-/// The policy named by a pass option ("trivial" / "greedy-share" /
-/// "exact-share" / "planned"); null on an unknown name.
+/// The policy named by a pass option ("trivial" / "exact-share" / "planned");
+/// null on an unknown name.
 std::unique_ptr<BindingPolicy> bindingPolicyFor(llvm::StringRef name);
 
 } // namespace mlir::allo::uarch

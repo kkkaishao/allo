@@ -31,7 +31,6 @@ from .reports import (
     ScheduleResult,
 )
 from .options import PrepassOptions, SchedulerOptions
-from .schedule import has_exact_scheduler
 from .qor import QoR, Utilization, estimate
 from .core import RTL, LatencyModelWarning
 from .sim.shell import CosimResult
@@ -62,7 +61,6 @@ __all__ = [
     "ScheduleResult",
     "PrepassOptions",
     "SchedulerOptions",
-    "has_exact_scheduler",
     "QoR",
     "Utilization",
     "estimate",

@@ -25,28 +25,21 @@ endif()
 find_package(MLIR CONFIG REQUIRED)
 
 find_package(ortools CONFIG QUIET)
-option(ALLO_ENABLE_ORTOOLS
-       "Build the CP-SAT exact scheduler (requires OR-Tools)" OFF)
-if(ALLO_ENABLE_ORTOOLS AND NOT ortools_FOUND)
+if(NOT ortools_FOUND)
   message(FATAL_ERROR
-    "ALLO_ENABLE_ORTOOLS=ON but no OR-Tools cmake package was found. Point "
-    "CMAKE_PREFIX_PATH at the install prefix holding lib/cmake/ortools (its "
-    "config also resolves absl/protobuf from there), or set "
-    "-DALLO_ENABLE_ORTOOLS=OFF.")
+    "No OR-Tools cmake package was found. Point CMAKE_PREFIX_PATH at the "
+    "install prefix holding lib/cmake/ortools (its config also resolves "
+    "absl/protobuf from there).")
 endif()
 
 find_package(CIRCT CONFIG REQUIRED)
 message(STATUS "Using MLIRConfig.cmake in: ${MLIR_DIR}")
 message(STATUS "Using LLVMConfig.cmake in: ${LLVM_DIR}")
 message(STATUS "Using CIRCTConfig.cmake in: ${CIRCT_DIR}")
-if(ALLO_ENABLE_ORTOOLS)
-  message(STATUS "Using ortoolsConfig.cmake in: ${ortools_DIR}")
-else()
-  message(STATUS "OR-Tools disabled: the exact (CP-SAT) scheduler is not built")
-endif()
-if(ortools_FOUND)
-  set(CMAKE_INSTALL_RPATH_USE_LINK_PATH ON)
-endif()
+message(STATUS "Using ortoolsConfig.cmake in: ${ortools_DIR}")
+# A prebuilt OR-Tools ships shared libraries, found at runtime through the
+# link path.
+set(CMAKE_INSTALL_RPATH_USE_LINK_PATH ON)
 
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${PROJECT_BINARY_DIR}/bin)
 set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${PROJECT_BINARY_DIR}/lib)
@@ -68,11 +61,9 @@ include_directories(${CMAKE_CURRENT_SOURCE_DIR}/include)
 
 # Third-party headers must be SYSTEM includes
 include_directories(SYSTEM ${spdlog_SOURCE_DIR}/include)
-if(ortools_FOUND)
-  get_target_property(ALLO_ORTOOLS_INCLUDE_DIRS
-                      ortools::ortools INTERFACE_INCLUDE_DIRECTORIES)
-  include_directories(SYSTEM ${ALLO_ORTOOLS_INCLUDE_DIRS})
-endif()
+get_target_property(ALLO_ORTOOLS_INCLUDE_DIRS
+                    ortools::ortools INTERFACE_INCLUDE_DIRECTORIES)
+include_directories(SYSTEM ${ALLO_ORTOOLS_INCLUDE_DIRS})
 
 add_definitions(${LLVM_DEFINITIONS})
 

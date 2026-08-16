@@ -929,15 +929,6 @@ LogicalResult mlir::allo::runSDCScheduler(ModuleOp module, StringRef top,
                                           float cycleTime,
                                           const SchedulerOptions &opts,
                                           ScheduleModel &model) {
-  // Fail before any work when the exact scheduler was asked for and this build
-  // has none, rather than region by region: the fix is to the build.
-  if (usesExactScheduler(opts.kind) && !hasExactScheduler()) {
-    unsupported(Stage::Sched, Code::NoExactScheduler, module)
-        << "An exact scheduler was requested but this build was configured "
-           "without OR-Tools. Rebuild with -DALLO_ENABLE_ORTOOLS=ON, or use "
-           "the default scheduler=\"heuristic\"";
-    return failure();
-  }
   loadDependentDialects(*module->getContext());
   // Timing characterization for every op (latency + delays), built from the
   // injected `dcp.device` + `dcp.operator` IR, once for scheduling and reify.

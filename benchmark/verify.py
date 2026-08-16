@@ -3,7 +3,7 @@
 
 """Correctness over the benchmark bed, swept over the BINDING axis.
 
-    python -m benchmark.verify                    # trivial and greedy-share
+    python -m benchmark.verify                    # trivial and exact-share
     python -m benchmark.verify --binding planned --scheduler exact
     python -m benchmark.verify -k gemm
 
@@ -14,11 +14,11 @@ the bed's own claim, that a schedule may change the hardware and never the
 function, is the thing under test.
 
 The axis is the BINDING, i.e. how many physical units the schedule is realized
-on. `tests/rtl` runs the trivial binding only, so a sharing bug that needs a real
-workload to expose has nothing standing in front of it; sweeping the axis over
-the whole bed is that guard, and it is why an axis here rather than another unit
-test. `--scheduler` is a scalar and not a second axis on purpose: the two
-compose, and a sweep of the product answers a question nobody asked.
+on: the binding the scheduler implies, against the trivial control (one unit
+per op), so a sharing bug that needs a real workload to expose is caught over
+the whole bed rather than by another unit test. `--scheduler` is a scalar and
+not a second axis on purpose: the two compose, and a sweep of the product
+answers a question nobody asked.
 
 Two things it reports beyond pass and fail, both because a green run can be
 empty:
@@ -138,12 +138,16 @@ def verify_one(
     try:
         parts = bench.build()
         sched = bench.schedules[variant](parts)
-        rtl = sched.export("rtl", binding=binding).set_scheduler_opt(
-            scheduler=scheduler
-        )
+        rtl = sched.export("rtl").set_scheduler_opt(scheduler=scheduler)
+        if binding == "trivial":
+            rtl.use_trivial_binding()
 
         out["stage"] = "schedule"
         fn = rtl.schedule().func(rtl.top)
+        assert rtl.binding == binding, (
+            f"binding follows the scheduler: {scheduler!r} implies "
+            f"{rtl.binding!r}, not {binding!r}"
+        )
         out["latency"] = fn.latency
         out["latency_exact"] = fn.latency_is_exact
         out["determinacy"] = fn.determinacy
@@ -340,11 +344,10 @@ def main():
     ap.add_argument("-k", "--filter", default="", help="substring of suite/name")
     ap.add_argument(
         "--binding",
-        default="trivial,greedy-share",
-        help="comma-separated axis: 'trivial' (one unit per op), 'greedy-share' "
-        "(fold every compatible pair), 'exact-share' (one CP-SAT fold solve per "
-        "region) or 'planned' (the allocation the scheduler decided, which "
-        "needs --scheduler exact to be anything else)",
+        default="trivial,exact-share",
+        help="comma-separated axis. The binding follows the scheduler "
+        "('exact-share' under the heuristic, 'planned' under an exact one); "
+        "'trivial' (one unit per op) is the dev control that joins either",
     )
     ap.add_argument(
         "--scheduler",
@@ -375,7 +378,6 @@ def main():
         return
 
     sys.path.insert(0, str(REPO))
-    from allo.backend.rtl import has_exact_scheduler
     from benchmark.spec import discover
 
     if shutil.which("verilator") is None:
@@ -383,15 +385,12 @@ def main():
     bindings = [b for b in args.binding.split(",") if b]
     if not bindings:
         raise SystemExit("no binding to run")
-    if args.scheduler.startswith("exact") and not has_exact_scheduler():
+    derived = "planned" if args.scheduler.startswith("exact") else "exact-share"
+    bad = sorted(set(bindings) - {"trivial", derived})
+    if bad:
         raise SystemExit(
-            "this build has no OR-Tools, so the exact schedulers are absent"
-        )
-    if "planned" in bindings and not args.scheduler.startswith("exact"):
-        print(
-            "NOTE: `planned` under the heuristic scheduler IS the trivial "
-            "binding, so those runs check one hardware twice",
-            file=sys.stderr,
+            f"binding follows the scheduler: under '{args.scheduler}' the axis "
+            f"may hold 'trivial' and '{derived}', not {bad}"
         )
 
     work = [

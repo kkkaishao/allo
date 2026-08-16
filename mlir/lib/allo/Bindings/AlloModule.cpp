@@ -130,7 +130,6 @@ NB_MODULE(_allo, m) {
       nb::arg("module"), nb::arg("top"), nb::arg("cycle_time"),
       nb::arg("scheduler") = "heuristic", nb::arg("budget") = 0.0,
       nb::arg("allocate") = false, nb::arg("workers") = 0, nb::arg("seed") = 0);
-  allo.def("has_exact_scheduler", &alloHasExactScheduler);
 
   //===--------------------------------------------------------------------===//
   // schedule

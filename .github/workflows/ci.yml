@@ -141,8 +141,6 @@ jobs:
         uses: ./.github/actions/build-mlir-circt
 
       - name: Install Allo
-        env:
-          ALLO_ENABLE_ORTOOLS: "1"
         run: |
           export CMAKE_PREFIX_PATH="$HOME/.local/share/or-tools-${ORTOOLS_VERSION}"
           pip install -v -e '.[dev]' \

@@ -56,9 +56,6 @@ MLIR_CAPI_EXPORTED MlirLogicalResult alloRunSDCSchedulingPipeline(
     MlirStringRef scheduler, double budget, bool allocate, int workers,
     int seed, MlirStringCallback callback, void *userData);
 
-/// Whether this build accepts `scheduler = "exact"`, i.e. links OR-Tools.
-MLIR_CAPI_EXPORTED bool alloHasExactScheduler(void);
-
 #ifdef __cplusplus
 }
 #endif

@@ -12,7 +12,7 @@ import pytest
 
 from allo import kernel
 from allo.lang import i32, f32, index, Stream
-from allo.backend.rtl import LatencyModelWarning, RegionKind, has_exact_scheduler
+from allo.backend.rtl import LatencyModelWarning, RegionKind
 
 sys.path.insert(0, os.path.dirname(__file__))
 from _common import Dcp, Mod, _to_rtl, _sched, _latency, _outer  # noqa: E402
@@ -471,9 +471,7 @@ def test_a_determinate_call_still_shares_its_span():
 # occupies the cycle it issues in. Charging it `latency - 1` cycles underflowed
 # that zero into 2^32, which made the exact scheduler's drain bound narrower
 # than the term it bounds and CP-SAT called the region infeasible.
-@pytest.mark.parametrize(
-    "scheduler", ["heuristic"] + (["exact"] if has_exact_scheduler() else [])
-)
+@pytest.mark.parametrize("scheduler", ["heuristic", "exact"])
 def test_an_indeterminate_calls_region_drains_at_its_own_start(scheduler):
     @kernel
     def ic_drain(A: i32[8], B: i32[1]):

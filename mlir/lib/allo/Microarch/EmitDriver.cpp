@@ -170,8 +170,7 @@ LogicalResult emitDatapathToHW(ModuleOp module, StringRef binding,
   if (!policy) {
     error(Stage::Emit, Code::UnknownOption, module)
         << "Unknown binding policy '" << binding
-        << "'; the policies are 'trivial', 'greedy-share', 'exact-share' and "
-           "'planned'";
+        << "'; the policies are 'trivial', 'exact-share' and 'planned'";
     return failure();
   }
 

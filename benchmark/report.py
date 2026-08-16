@@ -220,9 +220,9 @@ def measure_one(
     ``freq`` overrides the device's default clock (MHz), i.e. the period the
     chaining half of every problem is cut against. ``budget`` overrides what one
     exact solve may spend, in deterministic time units. ``workers`` overrides how
-    many search workers one exact solve runs. ``binding`` is the
-    operator-sharing policy, i.e. how many physical units the schedule is
-    realized on."""
+    many search workers one exact solve runs. ``binding`` is ``"trivial"`` (one
+    unit per op) or ``"auto"``, the binding the scheduler implies; the recorded
+    row carries the resolved name."""
     bench = _load(key)
     out: dict = {
         "key": key,
@@ -245,7 +245,8 @@ def measure_one(
         sched = bench.schedules[variant](parts)
 
         out["stage"] = "schedule"
-        opts = {"binding": binding}
+        assert binding in ("trivial", "auto"), binding
+        opts = {}
         if freq is not None:
             opts["freq_mhz"] = freq
         knobs = {"scheduler": scheduler}
@@ -254,8 +255,11 @@ def measure_one(
         if workers is not None:
             knobs["workers"] = workers
         rtl = sched.export("rtl", **opts).set_scheduler_opt(**knobs)
+        if binding == "trivial":
+            rtl.use_trivial_binding()
         t1 = time.time()
         res = rtl.schedule()
+        out["binding"] = rtl.binding
         out["schedule_s"] = round(time.time() - t1, 2)
 
         fn = res.func(rtl.top)
@@ -706,7 +710,7 @@ def main():
     ap.add_argument(
         "--scheduler",
         default="heuristic,exact",
-        help="comma-separated; `exact` is dropped on a build without OR-Tools",
+        help="comma-separated axis of solver kinds",
     )
     ap.add_argument(
         "--freq",
@@ -725,9 +729,9 @@ def main():
     ap.add_argument(
         "--binding",
         default="trivial",
-        help="operator-sharing policy: 'trivial' (the default, one unit per "
-        "op), 'greedy-share', 'exact-share' or 'planned', which builds the "
-        "allocation the exact scheduler decided",
+        help="'trivial' (the default, one unit per op) or 'auto', the binding "
+        "the scheduler implies: 'exact-share' under the heuristic, 'planned' "
+        "under an exact one",
     )
     ap.add_argument(
         "--workers",
@@ -781,16 +785,9 @@ def main():
         return
 
     sys.path.insert(0, str(REPO))
-    from allo.backend.rtl import has_exact_scheduler
     from benchmark.spec import discover
 
     schedulers = [s for s in args.scheduler.split(",") if s]
-    if not has_exact_scheduler() and any(s.startswith("exact") for s in schedulers):
-        print(
-            "this build has no OR-Tools, so the exact modes are dropped",
-            file=sys.stderr,
-        )
-        schedulers = [s for s in schedulers if not s.startswith("exact")]
     if not schedulers:
         raise SystemExit("no scheduler to run")
 

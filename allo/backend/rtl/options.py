@@ -48,7 +48,7 @@ class SchedulerOptions:
             ``"heuristic"`` is the SDC simplex plus greedy placement; ``"exact"``
             is CP-SAT over the same problem, keeping the chain-breaking pre-pass;
             ``"exact-chaining"`` additionally decides where to break a too-long
-            combinational chain in the solver. Both exact modes need OR-Tools.
+            combinational chain in the solver.
         cycle_ns: the period every combinational chain was cut to. Derived from
             the handle's ``freq_mhz``, which the cosim clock also reads.
         budget: what one exact solve may spend, in the solver's deterministic

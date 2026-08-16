@@ -311,24 +311,13 @@ SharingProblem sharingProblemOf(const Datapath &dp, const RegionBlock &rb,
 } // namespace
 
 std::vector<llvm::SmallVector<UnitId, 2>>
-GreedyShareBinding::plan(const Datapath &dp, const BindingContext &ctx) const {
-  std::vector<llvm::SmallVector<UnitId, 2>> groups;
-  for (const RegionBlock &rb : dp.regions)
-    appendGroups(rb, greedyShare(dp, rb, ctx), groups);
-  return groups;
-}
-
-std::vector<llvm::SmallVector<UnitId, 2>>
 ExactShareBinding::plan(const Datapath &dp, const BindingContext &ctx) const {
   std::vector<llvm::SmallVector<UnitId, 2>> groups;
-  bool exact = hasExactScheduler();
   for (const RegionBlock &rb : dp.regions) {
     llvm::SmallVector<unsigned> assign = greedyShare(dp, rb, ctx);
-    if (exact) {
-      SharingProblem problem = sharingProblemOf(dp, rb, ctx);
-      if (auto solved = solveSharing(problem, assign, rb.op))
-        assign = std::move(*solved);
-    }
+    SharingProblem problem = sharingProblemOf(dp, rb, ctx);
+    if (auto solved = solveSharing(problem, assign, rb.op))
+      assign = std::move(*solved);
     appendGroups(rb, assign, groups);
   }
   return groups;
@@ -355,8 +344,6 @@ PlannedBinding::plan(const Datapath &dp, const BindingContext &) const {
 std::unique_ptr<BindingPolicy> bindingPolicyFor(llvm::StringRef name) {
   if (name == "trivial")
     return std::make_unique<TrivialBinding>();
-  if (name == "greedy-share")
-    return std::make_unique<GreedyShareBinding>();
   if (name == "exact-share")
     return std::make_unique<ExactShareBinding>();
   if (name == "planned")
