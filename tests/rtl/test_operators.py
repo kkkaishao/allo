@@ -1076,6 +1076,76 @@ def test_exact_selection_in_a_pipeline_leaves_the_recurrence_its_short_core():
     assert int(exact.cosim(a, b, c).result) == expect
 
 
+# Selection and allocation composed on the same ops: two slack adds behind a
+# deep multiply chain converge on ONE row and fold onto ONE instance, because
+# the model prices what a converged selection saves (one core plus a select
+# against two cores). The multiplies stay unfolded: their core is declared
+# free, so folding them would buy nothing and cost the select.
+def test_converged_selections_fold_onto_one_instance():
+    wide = APInt(48, signed=True)
+
+    @operator_ip(
+        optype=OperatorType.ADD,
+        mnemonic="add_fast",
+        latency=1,
+        in_delay_ns=1.0,
+        pipelined=True,
+        style="ce",
+    )
+    def add_fast(a: wide, b: wide) -> wide: ...
+
+    @operator_ip(
+        optype=OperatorType.ADD,
+        mnemonic="add_cheap",
+        latency=3,
+        in_delay_ns=1.0,
+        pipelined=True,
+        style="ce",
+    )
+    def add_cheap(a: wide, b: wide) -> wide: ...
+
+    @operator_ip(
+        optype=OperatorType.MUL,
+        mnemonic="mul_deep",
+        latency=6,
+        in_delay_ns=1.0,
+        pipelined=True,
+        style="ce",
+    )
+    def mul_deep(a: wide, b: wide) -> wide: ...
+
+    @kernel
+    def mix(
+        a: i32[1], b: i32[1], c: i32[1], d: i32[1], e: i32[1], f: i32[1]
+    ) -> wide:
+        u: wide = a[0]
+        u = u + b[0]
+        v: wide = c[0]
+        v = v + d[0]
+        p: wide = e[0]
+        p = p * f[0]
+        return p * u * v
+
+    dev = default_device.copy()
+    dev.add_operators(add_fast, add_cheap, mul_deep)
+    # Equal, expensive cores: whichever row wins, converging on it and sharing
+    # one instance beats two instances of anything.
+    dev.set_operator_uses(add_fast, {dev.resources["lut"]: Const(5000.0)})
+    dev.set_operator_uses(add_cheap, {dev.resources["lut"]: Const(5000.0)})
+
+    exact = _to_rtl(mix, device=dev).set_scheduler_opt(scheduler="exact")
+    winners = _impls(exact.schedule()) & {add_fast.symbol, add_cheap.symbol}
+    assert len(winners) == 1
+    winner = winners.pop()
+    loser = ({add_fast.symbol, add_cheap.symbol} - {winner}).pop()
+    # One module definition plus one instantiation: the two adds share it.
+    assert exact.mlir.count(winner) == 2
+    assert exact.mlir.count(loser) == 0
+
+    vals = [np.array([x], np.int32) for x in (3, 4, 5, 6, 7, 8)]
+    assert int(exact.cosim(*vals).result) == (7 * 8) * (3 + 4) * (5 + 6)
+
+
 def test_behavior_language_follows_the_domain():
     # A core's behavior language follows from the core: an integer one is native
     # RTL (exact at any width), a float one is C over the DPI, and a user

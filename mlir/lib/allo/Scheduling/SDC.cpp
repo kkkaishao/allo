@@ -338,9 +338,14 @@ void FuncScheduler::annotateAllocation(OccupancyProblem &problem) {
     SmallVector<Operation *> users = problem.usersOf(rsrc);
     assert(!users.empty() && "an allocated resource nothing runs on");
     // One resource is one operator identity, so every operation on it names
-    // the same `dcp.operator`.
-    unsigned base = model.addUnits(
-        dev.operators.lookup(users.front()).identity.ipSymbol, *units);
+    // the same `dcp.operator`. A member whose row the solve decided names it
+    // through the recorded selection, not the library's own pick.
+    Operation *first = users.front();
+    const OpSchedule *at = model.scheduleOf(first);
+    OperatorChar oc = at && !at->selectedImpl.empty()
+                          ? dev.operators.lookup(first, at->selectedImpl)
+                          : dev.operators.lookup(first);
+    unsigned base = model.addUnits(oc.identity.ipSymbol, *units);
     for (Operation *op : users)
       model.setUnit(op, base + *problem.getAssignedUnit(op));
   }

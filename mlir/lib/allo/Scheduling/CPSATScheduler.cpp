@@ -220,6 +220,202 @@ void applySelection(circt::scheduling::ChainingProblem &prob,
         << " realization decisions off the library's own ranking";
 }
 
+//===----------------------------------------------------------------------===//
+// Shared classes: the composition of selection and allocation on one model.
+// One class per candidate row several operations could run on, its instance
+// count decided WITH which operations select it. Acyclic only: the modulo
+// form needs slot-membership products and is not built yet.
+//===----------------------------------------------------------------------===//
+
+/// One shared class. A static member (an operation whose realization is not a
+/// solver decision) is always on it; a conditional member joins on its `sel`
+/// literal, so the class prices what folding a CONVERGED selection saves.
+struct SharedClassVar {
+  Problem::ResourceType rsrc;
+  /// One instance's price and its select shape, the inputs of the (members,
+  /// units) tables below.
+  int64_t unitPrice = 0, ports = 0, width = 1;
+  /// Static members: the operation, its occupancy, and its incoming delay in
+  /// picoseconds (what the headroom is held against).
+  SmallVector<std::tuple<Operation *, unsigned, int64_t>> statics;
+  /// Conditional members: the choice, the candidate naming this row, and that
+  /// candidate's occupancy.
+  struct Cond {
+    unsigned choice, cand, occ;
+  };
+  SmallVector<Cond> conds;
+  /// Whether `populateOperatorAllocation` declared this row, i.e. its static
+  /// members are already linked to it; a row only selection reaches is
+  /// written onto the problem at adoption.
+  bool onProblem = false;
+  /// The count to build, and how many members actually joined. `units <=
+  /// members`: more instances than members is never cheaper and leaves no
+  /// smaller cone, and the bound keeps the decided count inside the
+  /// realizable table slice.
+  IntVar units, members;
+  IntVar price;
+  std::optional<IntVar> headroom;
+};
+
+/// The classes of one model, with the (choice, candidate) pairs they price
+/// (so the per-operation price terms skip them) and the rows they own (so
+/// `allocationVars` does not price them a second time).
+struct SharedClasses {
+  SmallVector<SharedClassVar, 0> classes;
+  DenseSet<std::pair<unsigned, unsigned>> covered;
+  DenseSet<Problem::ResourceType> owned;
+  bool empty() const { return classes.empty(); }
+};
+
+/// What \p n instances hosting \p k members of \p cls cost: the instances
+/// plus the select in front of every port, members spread round-robin as
+/// `assignUnits` spreads them (`k % n` instances host one more). The table
+/// `populateOperatorAllocation` builds is this at k fixed to the ceiling;
+/// here the membership is decided, so the price is a function of both.
+int64_t sharedPrice(const OperatorLibrary &lib, const SharedClassVar &cls,
+                    int64_t k, int64_t n) {
+  if (n == 0)
+    return 0;
+  int64_t busy = k % n, share = k / n;
+  auto armPrice = [&](int64_t arms) {
+    return arms < 1 ? 0 : lib.muxPrice(arms, cls.width);
+  };
+  return n * cls.unitPrice + cls.ports * (busy * armPrice(share + 1) +
+                                          (n - busy) * armPrice(share));
+}
+
+/// The fullest instance's select cone at (\p k, \p n), in ns. No re-injection
+/// arms: shared classes are acyclic, and only a cyclic member carries a
+/// recurrence identity to re-inject.
+double sharedConeNs(const OperatorLibrary &lib, const SharedClassVar &cls,
+                    int64_t k, int64_t n) {
+  if (n == 0 || k == 0)
+    return 0.0;
+  return muxCone(lib, static_cast<unsigned>((k + n - 1) / n),
+                 static_cast<unsigned>(std::max<int64_t>(1, cls.width)));
+}
+
+/// Build the shared classes of an acyclic model: for every row at least two
+/// operations could run on, a cumulative whose capacity is the count being
+/// decided, with a fixed interval per static member and an optional one per
+/// conditional member, and the price and select cone read off (members,
+/// units) tables through one flattened element constraint.
+///
+/// Only in allocation mode (the caller gates): with the trivial binding the
+/// emitter builds one unit per operation, so a fold priced here would never
+/// be built.
+SharedClasses
+addSharedClasses(CpModelBuilder &model, ChainingSharedOperatorsProblem &prob,
+                 const OperatorLibrary &lib, ArrayRef<SelectionChoice> choices,
+                 const SelectionVars &sels,
+                 DenseMap<Operation *, IntVar> &startVars,
+                 DenseMap<Operation *, IntVar> &inCycle, float cycleTime) {
+  SharedClasses shared;
+  if (choices.empty())
+    return shared;
+  auto occOf = [](const OperatorChar &c) {
+    return c.pipelined ? 1u : std::max(1u, c.timing.latency);
+  };
+  auto shapeOf = [](SharedClassVar &cls, Operation *op, const OperatorChar &c) {
+    cls.unitPrice = c.price;
+    cls.ports = op->getNumOperands();
+    for (Type t : op->getOperandTypes())
+      if (t.isIntOrFloat())
+        cls.width = std::max<int64_t>(cls.width, t.getIntOrFloatBitWidth());
+  };
+  // Membership, keyed and sorted like `populateOperatorAllocation` keys its
+  // classes, so two compiles declare the same model.
+  std::map<std::string, SharedClassVar> byIdentity;
+  for (Operation *op : prob.getOperations()) {
+    if (std::optional<unsigned> i = sels.of(op)) {
+      for (auto [m, cand] : llvm::enumerate(choices[*i].cands)) {
+        SharedClassVar &cls = byIdentity[cand.identity.key()];
+        shapeOf(cls, op, cand);
+        cls.conds.push_back({*i, static_cast<unsigned>(m), occOf(cand)});
+      }
+      continue;
+    }
+    if (isSyncSubKernelCall(op) || asMemAccess(op))
+      continue;
+    OperatorChar c = lib.lookup(op);
+    if (!c.identity.realized() || c.identity.comb)
+      continue;
+    SharedClassVar &cls = byIdentity[c.identity.key()];
+    shapeOf(cls, op, c);
+    cls.statics.push_back({op, occOf(c), picos(c.timing.inDelay)});
+  }
+
+  int64_t period = picos(cycleTime);
+  for (auto &[key, cls] : byIdentity) {
+    auto ceiling = static_cast<int64_t>(cls.statics.size() + cls.conds.size());
+    if (ceiling < 2)
+      continue;
+    cls.rsrc = prob.getOrInsertResourceType(key);
+    cls.onProblem = prob.getAllocatable(cls.rsrc).has_value();
+    auto staticCount = static_cast<int64_t>(cls.statics.size());
+    cls.units = model.NewIntVar(
+        operations_research::Domain(staticCount ? 1 : 0, ceiling));
+    cls.members =
+        model.NewIntVar(operations_research::Domain(staticCount, ceiling));
+    LinearExpr joined(staticCount);
+    for (const SharedClassVar::Cond &cond : cls.conds)
+      joined += sels.sel[cond.choice][cond.cand];
+    model.AddEquality(cls.members, joined);
+    model.AddLessOrEqual(cls.units, cls.members);
+
+    CumulativeConstraint cum = model.AddCumulative(cls.units);
+    for (auto [op, occ, in] : cls.statics)
+      cum.AddDemand(model.NewFixedSizeIntervalVar(startVars.at(op), occ), 1);
+    for (const SharedClassVar::Cond &cond : cls.conds)
+      cum.AddDemand(model.NewOptionalFixedSizeIntervalVar(
+                        startVars.at(choices[cond.choice].op), cond.occ,
+                        sels.sel[cond.choice][cond.cand]),
+                    1);
+
+    // The (members, units) tables, flattened onto one index.
+    std::vector<int64_t> prices((ceiling + 1) * (ceiling + 1));
+    std::vector<int64_t> cones(prices.size());
+    for (int64_t k = 0; k <= ceiling; ++k)
+      for (int64_t n = 0; n <= ceiling; ++n) {
+        prices[k * (ceiling + 1) + n] = sharedPrice(lib, cls, k, n);
+        cones[k * (ceiling + 1) + n] = picos(sharedConeNs(lib, cls, k, n));
+      }
+    IntVar idx = model.NewIntVar(operations_research::Domain(
+        0, static_cast<int64_t>(prices.size()) - 1));
+    model.AddEquality(idx,
+                      LinearExpr::Term(cls.members, ceiling + 1) + cls.units);
+    cls.price = model.NewIntVar(
+        operations_research::Domain(0, *llvm::max_element(prices)));
+    model.AddElement(idx, prices, cls.price);
+    if (int64_t top = *llvm::max_element(cones)) {
+      cls.headroom = model.NewIntVar(operations_research::Domain(0, top));
+      model.AddElement(idx, cones, *cls.headroom);
+      for (auto [op, occ, in] : cls.statics)
+        model.AddLessOrEqual(inCycle.at(op) + *cls.headroom, period - in);
+      for (const SharedClassVar::Cond &cond : cls.conds) {
+        const OperatorChar &cand = choices[cond.choice].cands[cond.cand];
+        model
+            .AddLessOrEqual(inCycle.at(choices[cond.choice].op) + *cls.headroom,
+                            period - picos(cand.timing.inDelay))
+            .OnlyEnforceIf(sels.sel[cond.choice][cond.cand]);
+      }
+    }
+
+    // A feasible hint alongside the start and selection hints: the members
+    // the hinted selection joins, each its own instance (a cone of nothing).
+    int64_t hintMembers = staticCount;
+    for (const SharedClassVar::Cond &cond : cls.conds)
+      hintMembers += cond.cand == choices[cond.choice].preferred;
+    model.AddHint(cls.units, hintMembers);
+
+    for (const SharedClassVar::Cond &cond : cls.conds)
+      shared.covered.insert({cond.choice, cond.cand});
+    shared.owned.insert(cls.rsrc);
+    shared.classes.push_back(std::move(cls));
+  }
+  return shared;
+}
+
 /// The period as a model constraint: one sub-cycle start time `z` per
 /// operation, in picoseconds from the start of its cycle, matching what
 /// `computeStartTimesInCycle` computes afterwards.
@@ -422,14 +618,20 @@ unsigned demandWithHeadroom(ProblemT &prob, Problem::ResourceType rsrc,
 /// count hinted is the tightest one those start times admit with the select
 /// cone charged. On a region whose budget runs out, `applyDemandAllocation`
 /// ships that same count.
+///
+/// \p owned are the rows a shared class already carries (`addSharedClasses`),
+/// skipped so one model never prices a row twice.
 template <class ProblemT>
-SmallVector<AllocationVar> allocationVars(CpModelBuilder &model, ProblemT &prob,
-                                          unsigned ii, bool hint,
-                                          float cycleTime) {
+SmallVector<AllocationVar>
+allocationVars(CpModelBuilder &model, ProblemT &prob, unsigned ii, bool hint,
+               float cycleTime,
+               const DenseSet<Problem::ResourceType> *owned = nullptr) {
   SmallVector<AllocationVar> allocs;
   for (Problem::ResourceType rsrc : prob.getResourceTypes()) {
     auto unit = prob.getAllocatable(rsrc);
     if (!unit)
+      continue;
+    if (owned && owned->contains(rsrc))
       continue;
     assert(unit->ceiling > 0 && "an allocatable resource with no operation");
     IntVar n = model.NewIntVar(operations_research::Domain(1, unit->ceiling));
@@ -541,7 +743,9 @@ void addPiecewiseCost(CpModelBuilder &model, IntVar size,
 ///
 /// A decided realization joins the area on both sides: its instance costs its
 /// row's price, and a register chain from it starts its decided latency after
-/// its issue, both read through \p sels / \p latencyOf.
+/// its issue, both read through \p sels / \p latencyOf. A candidate a shared
+/// class prices (\p shared) is skipped here, its cost riding the class's
+/// (members, units) table instead.
 ///
 /// Below the area, earlier starts win: a start-time sum at unit weight, kept
 /// under any single area unit, settles ties deterministically.
@@ -550,7 +754,7 @@ void minimizeArea(CpModelBuilder &model, ArrayRef<IntVar> starts,
                   DenseMap<Operation *, IntVar> &startVars,
                   ArrayRef<AllocationVar> allocs, int64_t ii, int64_t horizon,
                   llvm::function_ref<LinearExpr(Operation *)> latencyOf,
-                  const SelectionVars &sels) {
+                  const SelectionVars &sels, const SharedClasses &shared) {
   SmallVector<IntVar> vars(starts.begin(), starts.end());
   SmallVector<int64_t> weights(starts.size(), 1);
   // One unit of area outweighs the whole start-time sum.
@@ -583,9 +787,12 @@ void minimizeArea(CpModelBuilder &model, ArrayRef<IntVar> starts,
   LinearExpr objective = LinearExpr::WeightedSum(vars, weights);
   for (const AllocationVar &alloc : allocs)
     objective += LinearExpr::Term(alloc.price, areaWeight);
+  for (const SharedClassVar &cls : shared.classes)
+    objective += LinearExpr::Term(cls.price, areaWeight);
   for (auto [i, choice] : llvm::enumerate(sels.choices))
     for (auto [m, cand] : llvm::enumerate(choice.cands))
-      if (cand.price)
+      if (cand.price && !shared.covered.contains({static_cast<unsigned>(i),
+                                                  static_cast<unsigned>(m)}))
         objective += LinearExpr::Term(sels.sel[i][m], cand.price * areaWeight);
   if (int64_t pulse = span.device.pulsePrice(); pulse && !starts.empty()) {
     IntVar deepest = model.NewIntVar(operations_research::Domain(0, horizon));
@@ -615,12 +822,57 @@ Allocated readAllocation(const CpSolverResponse &response,
   return decided;
 }
 
+/// Write the adopted membership of every shared class back onto the problem:
+/// link each decided member to the class resource, set the problem-side
+/// allocatable view to the tables at the decided member count, and append the
+/// decided instance counts for `applyAllocation` to realize. A class fewer
+/// than two members joined dissolves: each operation keeps its own instance.
+void applySharedClasses(ChainingSharedOperatorsProblem &prob,
+                        const OperatorLibrary &lib, SharedClasses &shared,
+                        ArrayRef<SelectionChoice> choices,
+                        ArrayRef<unsigned> chosen, const CpSolverResponse &pick,
+                        Allocated &decided) {
+  auto link = [&](Operation *op, Problem::ResourceType rsrc, unsigned occ) {
+    SmallVector<Problem::ResourceType> units;
+    if (auto linked = prob.getLinkedResourceTypes(op))
+      units.assign(linked->begin(), linked->end());
+    units.push_back(rsrc);
+    prob.setLinkedResourceTypes(op, units);
+    prob.setResourceCycles(op, occ);
+  };
+  for (SharedClassVar &cls : shared.classes) {
+    SmallVector<std::pair<Operation *, unsigned>> joined;
+    for (const SharedClassVar::Cond &cond : cls.conds)
+      if (chosen[cond.choice] == cond.cand)
+        joined.push_back({choices[cond.choice].op, cond.occ});
+    auto k = static_cast<int64_t>(cls.statics.size() + joined.size());
+    if (k < 2)
+      continue;
+    int64_t units = SolutionIntegerValue(pick, cls.units);
+    assert(units >= 1 && units <= k &&
+           "the model bounds the count by the membership it decided");
+    if (!cls.onProblem)
+      for (auto [op, occ, in] : cls.statics)
+        link(op, cls.rsrc, occ);
+    for (auto [op, occ] : joined)
+      link(op, cls.rsrc, occ);
+    OccupancyProblem::AllocatableUnit unit;
+    unit.ceiling = static_cast<unsigned>(k);
+    for (int64_t n = 0; n <= k; ++n) {
+      unit.price.push_back(sharedPrice(lib, cls, k, n));
+      unit.headroomNs.push_back(sharedConeNs(lib, cls, k, n));
+    }
+    prob.setAllocatable(cls.rsrc, unit);
+    decided.push_back({cls.rsrc, static_cast<unsigned>(units)});
+  }
+}
+
 /// Point the model's hints at the schedule \p from found, for the area solve
 /// that runs on the same model next.
 void rehintFrom(CpModelBuilder &model, ArrayRef<Operation *> ops,
                 DenseMap<Operation *, IntVar> &startVars,
                 ArrayRef<AllocationVar> allocs, const SelectionVars &sels,
-                const CpSolverResponse &from) {
+                const SharedClasses &shared, const CpSolverResponse &from) {
   model.ClearHints();
   for (Operation *op : ops)
     model.AddHint(startVars.at(op),
@@ -630,6 +882,8 @@ void rehintFrom(CpModelBuilder &model, ArrayRef<Operation *> ops,
   for (const SmallVector<BoolVar, 2> &row : sels.sel)
     for (const BoolVar &var : row)
       model.AddHint(var, SolutionBooleanValue(from, var));
+  for (const SharedClassVar &cls : shared.classes)
+    model.AddHint(cls.units, SolutionIntegerValue(from, cls.units));
 }
 
 /// What \p decided costs the device: every resource, at the price of the count
@@ -955,6 +1209,14 @@ LogicalResult mlir::allo::scheduleCPSAT(ChainingSharedOperatorsProblem &prob,
     inCycle = addSubCycleTimes(model, prob, startVars, cycleTime, opts.regFloor,
                                &sels);
 
+  // The composition of the two decisions: which row each operation runs on,
+  // and how many instances of each row to build, priced together. Only in
+  // allocation mode, where the binding realizes what is decided here.
+  SharedClasses shared;
+  if (opts.allocate)
+    shared = addSharedClasses(model, prob, span.device, choices, sels,
+                              startVars, inCycle, cycleTime);
+
   // An op occupies one instance of every unit it links to for its whole window,
   // so a cumulative constraint per resource matches `verifyOccupancy`. A
   // multi-unit op contributes the same window to each.
@@ -973,8 +1235,8 @@ LogicalResult mlir::allo::scheduleCPSAT(ChainingSharedOperatorsProblem &prob,
   // An allocatable operator takes the same shape, with the count being decided
   // as the capacity. Occupancy windows on a line form an interval graph, so a
   // capacity is an assignment: `N` units suffice when no cycle needs more.
-  SmallVector<AllocationVar> allocs =
-      allocationVars(model, prob, /*ii=*/0, /*hint=*/true, cycleTime);
+  SmallVector<AllocationVar> allocs = allocationVars(
+      model, prob, /*ii=*/0, /*hint=*/true, cycleTime, &shared.owned);
   for (const AllocationVar &alloc : allocs)
     cumulativeOn(alloc.rsrc, alloc.units);
   addAllocationHeadroom(model, prob, startVars, allocs, cycleTime,
@@ -1019,10 +1281,11 @@ LogicalResult mlir::allo::scheduleCPSAT(ChainingSharedOperatorsProblem &prob,
   // budget.
   model.AddLessOrEqual(drain, solvedDrain);
   minimizeArea(model, orderedStarts, span, startVars, allocs, /*ii=*/0, horizon,
-               latExpr, sels);
+               latExpr, sels, shared);
   SchedulerOptions rest = opts;
   if (ranFirst) {
-    rehintFrom(model, ops.getArrayRef(), startVars, allocs, sels, first);
+    rehintFrom(model, ops.getArrayRef(), startVars, allocs, sels, shared,
+               first);
     rest.budget = std::max(opts.budget - first.deterministic_time(), 0.0);
   }
   CpSolverResponse second =
@@ -1055,9 +1318,14 @@ LogicalResult mlir::allo::scheduleCPSAT(ChainingSharedOperatorsProblem &prob,
 
   for (Operation *op : ops)
     prob.setStartTime(op, SolutionIntegerValue(pick, startVars.at(op)));
-  if (!sels.empty())
-    applySelection(prob, choices, readSelection(pick, sels));
-  applyAllocation(prob, readAllocation(pick, allocs), /*ii=*/0);
+  Allocated decided = readAllocation(pick, allocs);
+  if (!sels.empty()) {
+    SmallVector<unsigned> chosen = readSelection(pick, sels);
+    applySelection(prob, choices, chosen);
+    applySharedClasses(prob, span.device, shared, choices, chosen, pick,
+                       decided);
+  }
+  applyAllocation(prob, decided, /*ii=*/0);
   return finishSchedule(prob, cycleTime, opts.regFloor);
 }
 
@@ -1230,9 +1498,14 @@ ModuloOutcome solveAtII(ChainingModuloProblem &prob, Operation *lastOp,
   // The area solve, under the span the first settled, on what is left of the
   // budget.
   model.AddLessOrEqual(primary, SolutionIntegerValue(first, primary));
+  // No shared classes at a fixed interval yet: conditional membership there
+  // needs slot-times-selection products, so a decided operation keeps its own
+  // instance and its row's price rides the per-operation terms.
+  SharedClasses noShared;
   minimizeArea(model, orderedStarts, span, startVars, allocs, ii, horizon,
-               latExpr, sels);
-  rehintFrom(model, ops.getArrayRef(), startVars, allocs, sels, first);
+               latExpr, sels, noShared);
+  rehintFrom(model, ops.getArrayRef(), startVars, allocs, sels, noShared,
+             first);
   SchedulerOptions rest = opts;
   rest.budget = std::max(opts.budget - first.deterministic_time(), 0.0);
   CpSolverResponse second =

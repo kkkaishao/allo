@@ -381,9 +381,10 @@ NodeTiming accessCharacterization(Operation *op, const OperatorLibrary &opLib,
 /// pipelined-only limit drops (an occupancy window that varied with the
 /// decision would move the interval bound the search starts from).
 ///
-/// An operation with choices keeps its own instance:
-/// `populateOperatorAllocation` skips it, and bind-time sharing still folds
-/// equal decided rows.
+/// An operation with choices joins no STATIC class:
+/// `populateOperatorAllocation` skips it, and the exact solve either folds it
+/// into the class of the row it decides (acyclic, via a shared class) or
+/// leaves it its own instance for bind-time sharing (modulo).
 SmallVector<OperatorChar, 2>
 selectionCandidates(Operation *op, const OperatorLibrary &lib, bool cyclic);
 
@@ -529,8 +530,11 @@ inline void populateOperatorOccupancy(ChainingModuloProblem &problem,
 /// differ.
 ///
 /// \p exactSelects says the exact solver will decide realizations: an
-/// operation with selection candidates then joins no class, since a class
-/// groups one STATIC identity and the solve may move the operation off it.
+/// operation with selection candidates then joins no class HERE, since a
+/// class groups one STATIC identity and the solve may move the operation off
+/// it. The acyclic exact model re-composes such operations into the class of
+/// whichever row they decide (its shared classes), merging with the static
+/// members this declares.
 template <class ProblemT>
 void populateOperatorAllocation(ProblemT &problem, const OperatorLibrary &lib,
                                 bool exactSelects) {
