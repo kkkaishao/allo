@@ -87,7 +87,8 @@ BENCHMARK = Benchmark(
     tolerance=(2e-3, 2e-3),
     skip={
         "v2": "flattening i1 x j1 leaves the triangular predicate a real "
-        "floordiv-30 cone past the 300 MHz period, refused now that a "
-        "standalone apply is priced honestly (ALLO-N0010)"
+        "floordiv-30 cone far past the 300 MHz period; the scheduler would "
+        "derate the clock to fit it whole, so the variant is not comparable "
+        "at the bed's frequency"
     },
 )

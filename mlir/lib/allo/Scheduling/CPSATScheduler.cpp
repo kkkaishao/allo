@@ -114,8 +114,8 @@ addSubCycleTimes(CpModelBuilder &model, ProblemT &prob,
   for (Operation *op : prob.getOperations()) {
     int64_t in = picos(*prob.getIncomingDelay(*prob.getLinkedOperatorType(op)));
     assert(in + floor <= period &&
-           "an operator whose own delay exceeds the period is rejected by the "
-           "chain-breaking pre-pass, which the heuristic ran before this");
+           "an operator whose own delay exceeds the period cannot reach a "
+           "solve: `runSDCScheduler` derates the period to fit every row");
     inCycle.try_emplace(
         op, model.NewIntVar(operations_research::Domain(floor, period - in)));
   }

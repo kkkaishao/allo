@@ -52,7 +52,7 @@ enum class Code {
   ChannelEndMissing,          // a stream channel is missing an end
   DataflowCycleUnseeded,      // a feedback cycle with no initial tokens
   RecursiveCallGraph,         // the call graph is cyclic
-  OperatorOverPeriod,         // one operator exceeds the clock period
+  OperatorOverPeriod,         // a clock period with no room for any logic
   DependenceInfeasible,       // no schedule satisfies the dependences
   RegionShapeNotScheduled,    // no scheduling regime for this region
   CompilerInconsistency,      // our own model disagrees with itself
@@ -69,8 +69,8 @@ enum class Code {
   ContainerWithDatapath,       // a dataflow container with loose compute
   ChannelMultiProducer,        // several writers on one channel
   StreamArgumentBidirectional, // a stream argument read and written
-  AddressOverPeriod,           // an address cone we cannot register
-  BindingMuxOverPeriod,        // a mux over the slack the schedule left
+  // ALLO-N0010 is retired and is not reused.
+  BindingMuxOverPeriod, // a mux over the slack the schedule left
   // ALLO-N0012 is retired and is not reused.
   PlacementFailed, // no feasible cycle for an operation
   // ALLO-N0014 is retired and is not reused.
@@ -139,8 +139,6 @@ constexpr const char *codeTag(Code code) {
     return "ALLO-N0008";
   case Code::StreamArgumentBidirectional:
     return "ALLO-N0009";
-  case Code::AddressOverPeriod:
-    return "ALLO-N0010";
   case Code::BindingMuxOverPeriod:
     return "ALLO-N0011";
   case Code::PlacementFailed:

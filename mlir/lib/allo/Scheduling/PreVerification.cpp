@@ -28,8 +28,6 @@
 #include "llvm/Support/Format.h"
 #include "llvm/Support/MathExtras.h"
 
-#include <cmath>
-
 using namespace mlir;
 using namespace mlir::allo;
 using namespace mlir::allo::logging;
@@ -958,45 +956,19 @@ LogicalResult checkChannelCycles(func::FuncOp func,
 }
 
 //===----------------------------------------------------------------------===//
-// Address cost: the check, and the report behind it.
+// Address cost: what each access's address arithmetic prices at.
 //
-// An address is folded into the access's affine map rather than standing as its
-// own op, so chaining cannot split it. A cone with no register-carried term is
-// refused when it misses the period; one with terms only warns, since the
-// emitter may land the sum in the address delay register (`addrSetup`).
+// An address is folded into the access's affine map rather than standing as
+// its own op, so chaining cannot split it; its cone reaches the solve through
+// the access's own incoming delay, and a cone past the clock period raises
+// the scheduled period rather than failing here (`runSDCScheduler`).
 // Per-access lines are `debug` level.
 //===----------------------------------------------------------------------===//
-static LogicalResult checkAddressCost(func::FuncOp funcOp,
-                                      const DeviceModel &dev,
-                                      float cycleTimeNs) {
-  bool fits = true;
-  unsigned total = 0, nonTrivial = 0, overCycle = 0, banked = 0,
-           withDivider = 0;
+static void reportAddressCost(func::FuncOp funcOp, const DeviceModel &dev) {
+  unsigned total = 0, nonTrivial = 0, banked = 0, withDivider = 0;
   double worstNow = 0.0;
 
   funcOp.walk([&](Operation *op) {
-    // A standalone apply is one monolithic operator whose cone is its map
-    // (`lookup` prices it whole), so past the period there is no register to
-    // split it and the schedule-time backstop would refuse it unanchored.
-    if (auto apply = dyn_cast<affine::AffineApplyOp>(op)) {
-      AddressCost cost =
-          addressCost(applyExprOf(apply.getAffineMap()),
-                      addressDelaysOf(dev.operators), AddressDelays::refWidth);
-      double delay = std::round(cost.delay * 100.0) / 100.0;
-      if (delay > cycleTimeNs) {
-        fits = false;
-        std::string map;
-        llvm::raw_string_ostream os(map);
-        os << apply.getAffineMap();
-        unsupported(Stage::Prep, Code::AddressOverPeriod, op)
-            << "computing " << map << " takes " << llvm::format("%.2f", delay)
-            << " ns against a " << llvm::format("%.2f", cycleTimeNs)
-            << " ns clock period, and it is one combinational operator. "
-               "Compute the expression in arithmetic ops so each step can be "
-               "scheduled and registered, or lower the target frequency";
-      }
-      return;
-    }
     std::optional<MemAccess> a = asMemAccess(op);
     if (!a || a->kind != AccessKind::Array)
       return;
@@ -1013,52 +985,12 @@ static LogicalResult checkAddressCost(func::FuncOp funcOp,
     worstNow = std::max(worstNow, cost.delay);
     if (cost.dividers)
       ++withDivider;
-    // Name both cones, since either can be the one that does not fit.
     std::string addr;
     llvm::raw_string_ostream os(addr);
     os << e.offset;
     if (e.bank)
       os << " (bank " << e.bank << ")";
-    // The access's own inDelay adds the port's setup to the address cone,
-    // which is what the solver sees.
-    double charged =
-        accessCharacterization(op, dev.operators, dev.memory).inDelay;
-    bool over = charged > cycleTimeNs;
-    if (over && cost.carried == 0) {
-      // No term follows a counter, so the whole cone is combinational into the
-      // port and there is nowhere to place a register.
-      ++overCycle;
-      fits = false;
-      unsupported(Stage::Prep, Code::AddressOverPeriod, op)
-          << "computing the address " << addr << " takes "
-          << llvm::format("%.2f", cost.delay)
-          << " ns, which with the storage port's own setup is "
-          << llvm::format("%.2f", charged) << " ns against a "
-          << llvm::format("%.2f", cycleTimeNs)
-          << " ns clock period, and none of it follows a loop counter, so "
-             "there is nowhere to place a register. Compute the subscript "
-             "into a variable so it becomes a schedulable value, partition by "
-             "a power of two so the bank digit is a mask rather than a "
-             "divider, or lower the target frequency";
-    } else if (over) {
-      // Part of the sum follows a counter and can land in the address delay
-      // register, so the built path may be shorter than this pre-schedule
-      // number. A missed period reports rather than refuses; the post-cut
-      // timing walk publishes the path actually built.
-      ++overCycle;
-      warn(Stage::Prep, op)
-          << "computing the address " << addr << " takes "
-          << llvm::format("%.2f", cost.delay)
-          << " ns, which with the storage port's own setup is "
-          << llvm::format("%.2f", charged) << " ns against a "
-          << llvm::format("%.2f", cycleTimeNs)
-          << " ns clock period. Part of the sum can land in an address delay "
-             "register, so the built path may be shorter; see the published "
-             "critical paths for what was built";
-    }
-    // Only warn when the address still fits; the rejection above already
-    // covers the failing case.
-    if (cost.dividers && !over)
+    if (cost.dividers)
       warn(Stage::Prep, op)
           << "The address " << addr << " costs "
           << llvm::format("%.2f", cost.delay)
@@ -1069,27 +1001,23 @@ static LogicalResult checkAddressCost(func::FuncOp funcOp,
              "subscript is neither. Choose a power-of-two partition factor, or "
              "index the array by a loop counter";
     debug(Stage::Prep, op) << "Address " << addr << ": "
-                           << llvm::format("%.2f", cost.delay) << " ns"
-                           << (over ? " (OVER the clock period)" : "") << " at "
+                           << llvm::format("%.2f", cost.delay) << " ns at "
                            << e.width << "b [" << cost.adders << " add, "
                            << cost.dividers << " div, " << cost.multipliers
                            << " mul]";
   });
 
   if (!total)
-    return success(fits);
+    return;
   debug(Stage::Prep) << "Address arithmetic in " << funcOp.getSymName().str()
                      << ": " << nonTrivial << "/" << total
                      << " array accesses cost logic, worst "
-                     << llvm::format("%.2f", worstNow) << " ns (" << overCycle
-                     << " over the " << llvm::format("%.2f", cycleTimeNs)
-                     << " ns period, " << withDivider << " carrying a divider, "
-                     << banked << " decoding a bank at runtime)";
-  return success(fits);
+                     << llvm::format("%.2f", worstNow) << " ns ("
+                     << withDivider << " carrying a divider, " << banked
+                     << " decoding a bank at runtime)";
 }
 
-LogicalResult allo::runPreScheduleVerification(ModuleOp module, StringRef top,
-                                               float cycleTimeNs) {
+LogicalResult allo::runPreScheduleVerification(ModuleOp module, StringRef top) {
   module->getContext()->getOrLoadDialect<func::FuncDialect>();
 
   auto topFunc = module.lookupSymbol<func::FuncOp>(top);
@@ -1116,7 +1044,6 @@ LogicalResult allo::runPreScheduleVerification(ModuleOp module, StringRef top,
   // Last, because it prices the addresses the banking above has just been held
   // legal: a rejected partition would make the cost meaningless.
   for (func::FuncOp fn : *closureOr)
-    if (failed(checkAddressCost(fn, dev, cycleTimeNs)))
-      return failure();
+    reportAddressCost(fn, dev);
   return success();
 }

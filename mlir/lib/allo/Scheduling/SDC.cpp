@@ -24,8 +24,12 @@
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
 
+#include "llvm/ADT/StringSet.h"
+#include "llvm/Support/Format.h"
+
 #include <chrono>
 
+using llvm::format;
 using namespace mlir;
 using namespace mlir::affine;
 using namespace mlir::allo;
@@ -924,6 +928,54 @@ static void loadDependentDialects(MLIRContext &context) {
   context.getOrLoadDialect<memref::MemRefDialect>();
 }
 
+// The least clock period the solve can hold: every operation must fit a cycle
+// of its own, `regFloor + inDelay` to reach its first register and `outDelay`
+// to leave its last, the two bounds the chaining model needs of a single
+// operator. A target below the result is raised rather than refused, so an
+// over-period operator lowers the achieved frequency instead of failing the
+// compile. Each offending row is named once, with what would shorten it.
+//
+// The walk prices through the same characterization `populateOperatorTypes`
+// registers, over every op a problem can hold: a region op, a call and a
+// declaration contribute no operator row.
+static float minSchedulablePeriod(ArrayRef<func::FuncOp> funcs,
+                                  const DeviceModel &dev, float target,
+                                  float regFloor) {
+  float least = target;
+  llvm::StringSet<> named;
+  for (func::FuncOp fn : funcs)
+    fn.walk([&](Operation *op) {
+      if (op->getNumRegions() || isa<func::CallOp>(op))
+        return;
+      NodeTiming t = asMemAccess(op)
+                         ? accessCharacterization(op, dev.operators, dev.memory)
+                         : dev.operators.lookup(op).timing;
+      float need = std::max(regFloor + (float)t.inDelay, (float)t.outDelay);
+      if (need <= target)
+        return;
+      least = std::max(least, need);
+      if (!named.insert(t.typeName).second)
+        return;
+      const char *advice =
+          isa<AffineApplyOp>(op)
+              ? "Its whole map is one combinational cone; compute the "
+                "expression in arithmetic ops so each step can be scheduled "
+                "and registered"
+          : asMemAccess(op)
+              ? "The address cone ahead of the port is what costs; compute "
+                "the subscript into a variable so it becomes a schedulable "
+                "value, or partition by a power of two so the bank digit is "
+                "a mask rather than a divider"
+              : "It is one operator, so no register can split it";
+      warn(Stage::Sched, op) << "'" << t.typeName << "' needs "
+                             << format("%.2f", need)
+                             << " ns for a cycle of its own, over the "
+                             << format("%.2f", target)
+                             << " ns clock period. " << advice;
+    });
+  return least;
+}
+
 LogicalResult mlir::allo::runSDCScheduler(ModuleOp module, StringRef top,
                                           float cycleTime,
                                           const SchedulerOptions &opts,
@@ -951,9 +1003,26 @@ LogicalResult mlir::allo::runSDCScheduler(ModuleOp module, StringRef top,
   // (which would cost an N-deep chain N floors) and not off the period (which
   // would leave `unitSlack` disagreeing with the solve by one floor).
   float regFloor = loadedDev.operators.registerFloor();
-  if (cycleTime <= regFloor) {
+
+  // Derate rather than refuse: a target no single operator fits is raised to
+  // the least period every row does, once for the whole module (one clock
+  // domain), and everything downstream holds the raised period. The miss is a
+  // report; the schedule stays valid at the frequency actually achieved.
+  float scheduled = minSchedulablePeriod(*orderOr, loadedDev, cycleTime,
+                                         regFloor);
+  if (scheduled > cycleTime)
+    warn(Stage::Sched, topFunc)
+        << "The requested " << format("%.2f", cycleTime) << " ns clock period ("
+        << format("%.0f", 1000.0f / cycleTime)
+        << " MHz) is not schedulable on this device; scheduling at "
+        << format("%.2f", scheduled) << " ns ("
+        << format("%.0f", 1000.0f / scheduled)
+        << " MHz). The QoR report prices the design at the achieved period";
+  model.cycleTimeNs = scheduled;
+
+  if (scheduled <= regFloor) {
     error(Stage::Sched, Code::OperatorOverPeriod, module)
-        << "The requested clock period of " << cycleTime
+        << "The requested clock period of " << scheduled
         << " ns is at or below this device's register-to-register floor of "
         << regFloor << " ns, so no cycle has room for any logic at all";
     return failure();
@@ -966,7 +1035,7 @@ LogicalResult mlir::allo::runSDCScheduler(ModuleOp module, StringRef top,
     // `allo.assume.*` hints. Outlives the solve: the span composition reads its
     // value ranges to bound a symbolic trip.
     DependenceAnalysis deps(fn);
-    FuncScheduler sched(deps, loadedDev, model, cycleTime, optsWithFloor);
+    FuncScheduler sched(deps, loadedDev, model, scheduled, optsWithFloor);
     if (failed(sched.run(fn)))
       return failure();
   }

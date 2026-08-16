@@ -100,7 +100,7 @@ MlirLogicalResult alloRunSDCSchedulingPipeline(
   // The storage decision, taken once and recorded on every array before any
   // layer below reads it.
   allo::recordArrayStorage(mod, allo::MemoryLibrary::fromModule(mod));
-  if (failed(allo::runPreScheduleVerification(mod, topName, cycleTimeNs)))
+  if (failed(allo::runPreScheduleVerification(mod, topName)))
     return mlirLogicalResultFailure();
   // The solved schedule travels between the two halves in memory, not as IR
   // attributes, so its `Operation *` keys cannot outlive the ops they name.

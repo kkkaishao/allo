@@ -225,7 +225,8 @@ std::string mlir::allo::ScheduleModel::toJSON() const {
         {"directive", u.directive}, {"where", u.where}, {"reason", u.reason}});
   Value root = Object{{"funcs", std::move(funcs)},
                       {"solves", std::move(solveEntries)},
-                      {"unhonored_directives", std::move(unhonoredEntries)}};
+                      {"unhonored_directives", std::move(unhonoredEntries)},
+                      {"cycle_ns", (double)cycleTimeNs}};
   std::string s;
   llvm::raw_string_ostream os(s);
   os << root;

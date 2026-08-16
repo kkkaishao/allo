@@ -206,7 +206,11 @@ class RTL(Backend[P, R]):
                     "RTL does not support returning arrays; use an out-parameter "
                     "instead"
                 )
-            self.schedule()
+            schedule = self.schedule()
+            # The period the schedule holds: the target, or the one the
+            # scheduler lowered the clock to when the target was unreachable.
+            # Emission checks and reports against it.
+            cycle_ns = schedule.cycle_ns or self._cycle_time
             # Emit on a copy, so `dcp` keeps reading the scheduled module.
             work = ir_ext.clone_module(self._dcp_ir)
             run_pipeline(work, _NORMALIZE_PIPELINE)
@@ -218,7 +222,7 @@ class RTL(Backend[P, R]):
             )
             try:
                 manifests = emit_datapath_to_hw(
-                    work, self.binding, self.top, self._cycle_time
+                    work, self.binding, self.top, cycle_ns
                 )
             finally:
                 handler.detach()

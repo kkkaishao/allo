@@ -277,6 +277,11 @@ public:
   /// Filled by the SOLVER, like `solves`.
   std::vector<UnhonoredDirective> unhonored;
 
+  /// The clock period the schedule holds, in ns: the target, or the least
+  /// period every device row fits when the target is unreachable
+  /// (`runSDCScheduler` derates it). What emission prices and checks against.
+  float cycleTimeNs = 0.0f;
+
 private:
   llvm::DenseMap<Operation *, OpSchedule> ops;
   std::vector<AllocatedUnit> units;

@@ -189,6 +189,10 @@ class ScheduleResult:
     #: the compiler's account of itself: what it was asked for and what that
     #: cost. Not a property of the design (see :class:`CompilerReport`).
     compiler: CompilerReport = field(default_factory=CompilerReport)
+    #: the clock period the schedule holds (ns): the target, or the least
+    #: period every device operator fits when the target was unreachable and
+    #: the scheduler lowered the clock. Emission and QoR price against this.
+    cycle_ns: float | None = None
 
     @classmethod
     def from_json(
@@ -205,6 +209,7 @@ class ScheduleResult:
                 for u in d.get("unhonored_directives", [])
             ],
             compiler=CompilerReport.from_json(d, options),
+            cycle_ns=d.get("cycle_ns"),
         )
 
     def func(self, suffix: str) -> FuncSchedule:

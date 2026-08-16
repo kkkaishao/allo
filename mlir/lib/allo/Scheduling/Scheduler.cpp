@@ -491,16 +491,17 @@ LogicalResult
 mlir::allo::computeChainBreaks(ChainingProblem &prob, float cycleTime,
                                float regFloor,
                                SmallVectorImpl<Problem::Dependence> &result) {
-  // The period is a hard constraint, so no operator may exceed it on its own.
-  for (auto opr : prob.getOperatorTypes())
-    if (*prob.getIncomingDelay(opr) > cycleTime ||
-        *prob.getOutgoingDelay(opr) > cycleTime) {
-      error(Stage::Sched, Code::OperatorOverPeriod, prob.getContainingOp())
-          << "Operator '" << opr.getValue()
-          << "' does not fit the requested clock period of "
-          << format("%g", cycleTime) << " ns on its own";
-      return failure();
-    }
+  // Every operator fits a cycle of its own: `runSDCScheduler` raises the
+  // period to the least every row does before any problem is built, so a
+  // violation here is an operation the derate walk did not price.
+  assert(llvm::all_of(prob.getOperatorTypes(),
+                      [&](Problem::OperatorType opr) {
+                        return regFloor + *prob.getIncomingDelay(opr) <=
+                                   cycleTime &&
+                               *prob.getOutgoingDelay(opr) <= cycleTime;
+                      }) &&
+         "an operator exceeds the derated period; `minSchedulablePeriod` "
+         "prices every operation a problem registers");
 
   // chains[v][u]: the delay arriving at `v` along the longest combinational
   // chain starting at `u`. A key is also the "handled" marker, so nothing is

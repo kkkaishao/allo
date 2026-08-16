@@ -260,6 +260,8 @@ public:
 /// half-built map.
 /// \p regFloor is the earliest sub-cycle time any operation may start at, so
 /// every chain begins having already spent it.
+/// Every operator fits \p cycleTime on its own (asserted): `runSDCScheduler`
+/// derates the period before any problem is built.
 LogicalResult computeChainBreaks(
     circt::scheduling::ChainingProblem &prob, float cycleTime, float regFloor,
     SmallVectorImpl<circt::scheduling::Problem::Dependence> &result);
@@ -580,18 +582,19 @@ inline LogicalResult solveSchedulingProblem(
 }
 
 /// Reject a kernel the backend cannot schedule at all: an unmodelled memory
-/// effect, an unrealizable operator, an illegal channel or partition, and an
-/// address cone that does not fit in \p cycleTime. Everything here is a
-/// property of the input, so it is settled before a single problem is built.
-///
-/// \p cycleTime is the RESOLVED target period in ns (the caller applies the
-/// default), so this and `runSDCScheduler` price against one number.
-LogicalResult runPreScheduleVerification(ModuleOp module, StringRef top,
-                                         float cycleTime);
+/// effect, an unrealizable operator, an illegal channel or partition.
+/// Everything here is a property of the input, so it is settled before a
+/// single problem is built. Timing is not among the refusals: an operator or
+/// address cone past the clock period derates the period at schedule time
+/// instead.
+LogicalResult runPreScheduleVerification(ModuleOp module, StringRef top);
 
 /// Solve the schedule of every func reachable from \p top, recording it in
 /// \p model. The IR is left in affine/scf form; nothing is materialized.
-/// \p cycleTime is the resolved target period in ns, as above.
+/// \p cycleTime is the RESOLVED target period in ns (the caller applies the
+/// default). A target no single operator fits is raised to the least period
+/// every device row does, with a warning naming the rows; the period the
+/// schedule holds is published as `model.cycleTimeNs` either way.
 LogicalResult runSDCScheduler(ModuleOp module, StringRef top, float cycleTime,
                               const SchedulerOptions &opts,
                               ScheduleModel &model);

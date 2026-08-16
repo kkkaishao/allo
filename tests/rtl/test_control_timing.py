@@ -460,11 +460,9 @@ def test_an_address_cone_is_charged_to_the_port_it_feeds():
                     )
 
     def fits(k, mhz):
-        try:
-            _sched(k, freq_mhz=mhz)
-            return True
-        except RuntimeError:
-            return False
+        # The schedule keeps the asked-for period only while every cone fits
+        # it; one past the period lowers the clock instead of failing.
+        return _sched(k, freq_mhz=mhz).cycle_ns < 1000.0 / mhz + 1e-6
 
     base = default_device.default_freq_mhz
     assert fits(flat, base) and fits(cone, base)

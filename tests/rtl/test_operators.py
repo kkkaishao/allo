@@ -799,6 +799,41 @@ def test_wide_int_operator_ip_cosim():
     assert int(rtl.cosim(x, y).result) == ((exact + 2**47) % 2**48) - 2**47
 
 
+def test_operator_over_period_derates_the_clock():
+    # An operator whose own delay exceeds the target period is not refused:
+    # the scheduler lowers the clock to the least period every row fits and
+    # reports it. The schedule, the emitted design and the QoR all hold the
+    # achieved period; the target stays on the compiler's account of itself.
+    wide = APInt(48, signed=True)
+
+    @operator_ip(
+        optype=OperatorType.ADD, latency=3, in_delay_ns=9.0, pipelined=True, style="ce"
+    )
+    def slow_add(a: wide, b: wide) -> wide: ...
+
+    @kernel
+    def dot(x: i32[8], y: i32[8]) -> wide:
+        acc: wide = 0
+        for k in range(8, name="k"):
+            acc = acc + x[k] * y[k]
+        return acc
+
+    dev = default_device.copy()
+    dev.add_operator(slow_add)
+    rtl = _to_rtl(dot, device=dev, freq_mhz=200)
+    sched = rtl.schedule()
+    # 9 ns into the adder's first register, plus the fabric's register floor.
+    assert sched.cycle_ns is not None and 9.0 < sched.cycle_ns < 10.0
+    assert sched.compiler.options.cycle_ns == pytest.approx(5.0)
+    assert rtl.estimation.fmax_target == pytest.approx(1000.0 / sched.cycle_ns)
+
+    rng = np.random.default_rng(0)
+    x = rng.integers(-(2**31), 2**31, size=8, dtype=np.int64).astype(np.int32)
+    y = rng.integers(-(2**31), 2**31, size=8, dtype=np.int64).astype(np.int32)
+    exact = sum(int(a) * int(b) for a, b in zip(x, y))
+    assert int(rtl.cosim(x, y).result) == ((exact + 2**47) % 2**48) - 2**47
+
+
 def test_behavior_language_follows_the_domain():
     # A core's behavior language follows from the core: an integer one is native
     # RTL (exact at any width), a float one is C over the DPI, and a user
@@ -1825,9 +1860,9 @@ def test_an_apply_is_priced_on_its_simplified_form():
 
 
 # The map is ONE operator: a division cone past the clock period has no seam a
-# register could land on, so it is refused before scheduling, anchored on the
-# apply and naming the map.
-def test_an_apply_division_over_the_period_is_refused():
+# register could land on, so the scheduler lowers the clock to fit it whole
+# and reports the achieved period.
+def test_an_apply_division_over_the_period_derates_the_clock():
     from allo._mlir import ir
 
     @kernel
@@ -1840,5 +1875,6 @@ def test_an_apply_division_over_the_period_is_refused():
         rtl,
         lambda d0: ir.AffineExpr.get_floor_div(d0 + 5, ir.AffineConstantExpr.get(3)),
     )
-    with pytest.raises(RuntimeError, match="ALLO-N0010"):
-        rtl.schedule()
+    sched = rtl.schedule()
+    assert sched.cycle_ns > PERIOD_NS
+    assert sched.compiler.options.cycle_ns == pytest.approx(PERIOD_NS)
