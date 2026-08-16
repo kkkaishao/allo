@@ -378,8 +378,9 @@ struct RegisterTerm {
 };
 
 /// What a region's span is charged, and so what the exact scheduler minimizes:
-/// `(trip - 1) * ii + drain`, the part of `leafSpan` a solve controls, with the
-/// region's register cost as the tie-break below it.
+/// `(trip - 1) * ii + drain`, the part of `leafSpan` a solve controls, with
+/// the region's area decided in a second solve under the span the first one
+/// settles.
 ///
 /// The heuristic ignores this and keeps minimizing the anchor's start time, an
 /// over-constrained proxy for the quantity actually charged.
@@ -441,8 +442,9 @@ inline bool usesExactScheduler(SchedulerKind kind) {
 }
 
 /// Defaults for one solve. The budget is in OR-Tools deterministic time units
-/// (roughly a core-second) and is charged per solve, so a cyclic search spends
-/// it again at every initiation interval it probes. Reproducibility comes from
+/// (roughly a core-second) and is charged per solve, shared by a solve's span
+/// and area passes, so a cyclic search spends it again at every initiation
+/// interval it probes. Reproducibility comes from
 /// the fixed seed plus the interleaved portfolio `solverParameters` selects
 /// above one worker; a solve that exhausts its budget can still differ run to
 /// run. The worker count is not only a speed knob: the same deterministic
