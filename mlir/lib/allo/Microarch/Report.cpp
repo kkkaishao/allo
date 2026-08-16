@@ -11,9 +11,12 @@
 #include "allo/Scheduling/MemoryModel.h"  // bankKindName
 
 #include "mlir/IR/BuiltinTypes.h"
+#include "llvm/ADT/APInt.h"
 #include "llvm/Support/JSON.h"
+#include "llvm/Support/MathExtras.h"
 #include "llvm/Support/raw_ostream.h"
 
+#include <limits>
 #include <map>
 
 using namespace mlir;
@@ -51,6 +54,238 @@ llvm::StringRef realizationName(MemUnit::Realization r) {
     return "ram";
   }
   llvm_unreachable("every realization is named");
+}
+
+/// A signed hull [lo, hi] of the values a cell can carry.
+using Hull = std::pair<int64_t, int64_t>;
+
+/// The hull, when it fits int64; unknown on overflow.
+std::optional<Hull> hull(__int128 lo, __int128 hi) {
+  assert(lo <= hi && "a hull is ordered");
+  if (lo < std::numeric_limits<int64_t>::min() ||
+      hi > std::numeric_limits<int64_t>::max())
+    return std::nullopt;
+  return Hull{(int64_t)lo, (int64_t)hi};
+}
+
+/// Significant bits of a hull, the signed convention `counterWidth` sizes by.
+unsigned bitsOfHull(Hull h) {
+  auto bits = [](int64_t v) {
+    return (unsigned)APInt(64, (uint64_t)v, /*isSigned=*/true)
+        .getSignificantBits();
+  };
+  return std::max(bits(h.first), bits(h.second));
+}
+
+std::optional<Hull> rangeOfSource(const Datapath &dp, const Source &s,
+                                  unsigned fuel);
+
+/// Interval-evaluate an affine expr; dims and symbols read \p u's inputs.
+std::optional<Hull> rangeOfExpr(const Datapath &dp, const FuncUnit &u,
+                                AffineExpr e, unsigned numDims, unsigned fuel) {
+  auto operand = [&](unsigned pos) -> std::optional<Hull> {
+    return pos < u.inputs.size() ? rangeOfSource(dp, u.inputs[pos], fuel)
+                                 : std::nullopt;
+  };
+  if (auto c = dyn_cast<AffineConstantExpr>(e))
+    return Hull{c.getValue(), c.getValue()};
+  if (auto d = dyn_cast<AffineDimExpr>(e))
+    return operand(d.getPosition());
+  if (auto sym = dyn_cast<AffineSymbolExpr>(e))
+    return operand(numDims + sym.getPosition());
+  auto bin = cast<AffineBinaryOpExpr>(e);
+  auto lhs = rangeOfExpr(dp, u, bin.getLHS(), numDims, fuel);
+  auto rhs = rangeOfExpr(dp, u, bin.getRHS(), numDims, fuel);
+  if (!lhs || !rhs)
+    return std::nullopt;
+  auto [a, b] = *lhs;
+  auto [c, d] = *rhs;
+  switch (bin.getKind()) {
+  case AffineExprKind::Add:
+    return hull((__int128)a + c, (__int128)b + d);
+  case AffineExprKind::Mul: {
+    __int128 p[] = {(__int128)a * c, (__int128)a * d, (__int128)b * c,
+                    (__int128)b * d};
+    return hull(*std::min_element(p, p + 4), *std::max_element(p, p + 4));
+  }
+  case AffineExprKind::FloorDiv:
+    if (c != d || c <= 0)
+      return std::nullopt;
+    return Hull{llvm::divideFloorSigned(a, c), llvm::divideFloorSigned(b, c)};
+  case AffineExprKind::CeilDiv:
+    if (c != d || c <= 0)
+      return std::nullopt;
+    return Hull{llvm::divideCeilSigned(a, c), llvm::divideCeilSigned(b, c)};
+  case AffineExprKind::Mod:
+    if (c != d || c <= 0)
+      return std::nullopt;
+    return a >= 0 && b < c ? lhs : std::optional<Hull>(Hull{0, c - 1});
+  default:
+    return std::nullopt;
+  }
+}
+
+std::optional<Hull> rangeOfUnitMath(const Datapath &dp, const FuncUnit &u,
+                                    unsigned fuel);
+
+/// The hull of unit \p u's result, transferred through its comb kind. An IP,
+/// a kind with no monotone transfer, and a hull the result carrier could WRAP
+/// answer unknown.
+std::optional<Hull> rangeOfUnit(const Datapath &dp, const FuncUnit &u,
+                                unsigned fuel) {
+  std::optional<Hull> h = rangeOfUnitMath(dp, u, fuel);
+  if (h && bitsOfHull(*h) > datapathWidth(u.identity.resultType))
+    return std::nullopt;
+  return h;
+}
+
+std::optional<Hull> rangeOfUnitMath(const Datapath &dp, const FuncUnit &u,
+                                    unsigned fuel) {
+  using K = CombOpKindEnum;
+  if (!u.identity.comb)
+    return std::nullopt;
+  K kind = *u.identity.comb;
+  if (kind == K::Apply) {
+    AffineMap map = cast<AffineMapAttr>(u.identity.map).getValue();
+    return rangeOfExpr(dp, u, applyExprOf(map), map.getNumDims(), fuel);
+  }
+  auto in = [&](unsigned k) -> std::optional<Hull> {
+    return k < u.inputs.size() ? rangeOfSource(dp, u.inputs[k], fuel)
+                               : std::nullopt;
+  };
+  if (kind == K::Select) {
+    auto x = in(1), y = in(2);
+    if (!x || !y)
+      return std::nullopt;
+    return Hull{std::min(x->first, y->first), std::max(x->second, y->second)};
+  }
+  auto x = in(0);
+  if (!x)
+    return std::nullopt;
+  auto [a, b] = *x;
+  switch (kind) {
+  case K::Extsi:
+  case K::IndexCast:
+    return x;
+  case K::Extui:
+  case K::IndexCastUi: // reinterprets the bits unsigned: sound only proven >= 0
+    return a >= 0 ? x : std::nullopt;
+  case K::Trunci: // the wrapper refuses a hull the narrower carrier wraps
+    return x;
+  case K::Shli:
+  case K::Shrsi:
+  case K::Shrui: {
+    std::optional<int64_t> sh =
+        u.inputs.size() > 1 ? dp.constantOf(u.inputs[1]) : std::nullopt;
+    if (!sh || *sh < 0 || *sh > 62 || (kind == K::Shrui && a < 0))
+      return std::nullopt;
+    int64_t p = int64_t(1) << *sh;
+    if (kind == K::Shli)
+      return hull((__int128)a * p, (__int128)b * p);
+    // An arithmetic (or proven-non-negative logical) shift floors either sign.
+    return Hull{llvm::divideFloorSigned(a, p), llvm::divideFloorSigned(b, p)};
+  }
+  case K::Addi:
+  case K::Subi:
+  case K::Muli:
+  case K::Minsi:
+  case K::Maxsi:
+  case K::Minui:
+  case K::Maxui: {
+    auto y = in(1);
+    if (!y)
+      return std::nullopt;
+    auto [c, d] = *y;
+    switch (kind) {
+    case K::Addi:
+      return hull((__int128)a + c, (__int128)b + d);
+    case K::Subi:
+      return hull((__int128)a - d, (__int128)b - c);
+    case K::Muli: {
+      __int128 p[] = {(__int128)a * c, (__int128)a * d, (__int128)b * c,
+                      (__int128)b * d};
+      return hull(*std::min_element(p, p + 4), *std::max_element(p, p + 4));
+    }
+    case K::Minui:
+    case K::Maxui:
+      if (a < 0 || c < 0)
+        return std::nullopt;
+      [[fallthrough]];
+    case K::Minsi:
+    case K::Maxsi:
+      return kind == K::Minsi || kind == K::Minui
+                 ? Hull{std::min(a, c), std::min(b, d)}
+                 : Hull{std::max(a, c), std::max(b, d)};
+    default:
+      llvm_unreachable("the outer case narrowed the kind");
+    }
+  }
+  default:
+    return std::nullopt;
+  }
+}
+
+/// The hull of the value \p s carries: a forward interval walk over the
+/// model's cells. Unknown is always sound; \p fuel bounds recursion through
+/// recurrences.
+std::optional<Hull> rangeOfSource(const Datapath &dp, const Source &s,
+                                  unsigned fuel) {
+  if (!fuel--)
+    return std::nullopt;
+  switch (s.kind) {
+  case Source::Kind::Const:
+    if (auto c = dp.constantOf(s))
+      return Hull{*c, *c};
+    return std::nullopt;
+  case Source::Kind::Reg: // a chain holds an older sample of the same value
+    return rangeOfSource(dp, dp.regs[s.id].input, fuel);
+  case Source::Kind::Counter: {
+    const RegionBlock &rb = dp.regions[s.id];
+    auto pipe = dyn_cast_or_null<dcp::DCPathPipelineOp>(rb.op);
+    std::optional<int64_t> trip = rb.tripCount ? rb.tripCount : rb.tripBound;
+    if (!pipe || rb.conditional || !trip || pipe.getLbBound() ||
+        pipe.getStepBound())
+      return std::nullopt;
+    // hull{lb, lb + trip*step}: the one-past value included, the same numbers
+    // `counterWidth` sizes the register by.
+    __int128 lb = pipe.getLb().value_or(0);
+    __int128 last = lb + (__int128)*trip * pipe.getStep().value_or(1);
+    return hull(std::min(lb, last), std::max(lb, last));
+  }
+  case Source::Kind::Unit:
+    return rangeOfUnit(dp, dp.units[s.id], fuel);
+  default: // IO, Survivor, Mem, Mux, Stream, Call
+    return std::nullopt;
+  }
+}
+
+/// The driving cell of a chain, as one word; a unit spells its realization.
+std::string sourceClassOf(const Datapath &dp, const Source &s) {
+  switch (s.kind) {
+  case Source::Kind::Unit:
+    return dp.units[s.id].identity.realizationName().str();
+  case Source::Kind::Reg:
+    return "reg";
+  case Source::Kind::Mem:
+    return "mem";
+  case Source::Kind::Mux:
+    return "mux";
+  case Source::Kind::IO:
+    return "io";
+  case Source::Kind::Const:
+    return "const";
+  case Source::Kind::Counter:
+    return "counter";
+  case Source::Kind::Survivor:
+    return "survivor";
+  case Source::Kind::Stream:
+    return "stream";
+  case Source::Kind::Call:
+    return "call";
+  case Source::Kind::None:
+    return "none";
+  }
+  llvm_unreachable("every source kind is named");
 }
 
 /// The multiplexers of one region, aggregated by (fan-in, width).
@@ -109,6 +344,20 @@ FuncUarch::FuncUarch(const Datapath &dp, llvm::StringRef symbol,
       r.cost.muxInputs += m.count * m.fanin;
       // A k:1 mux costs about (k-1) 2:1 muxes per bit.
       r.cost.muxBits += m.count * m.width * (m.fanin - 1);
+    }
+    for (RegId rid : rb.regs) {
+      const Register &rg = dp.regs[rid];
+      ChainReport cr;
+      cr.region = rb.id;
+      cr.width = datapathWidth(rg.type);
+      llvm::raw_string_ostream(cr.carried) << rg.type;
+      cr.depth = rg.depth;
+      cr.ii = rb.ii.value_or(1);
+      cr.taps = rg.taps.size();
+      cr.source = sourceClassOf(dp, rg.input);
+      if (auto h = rangeOfSource(dp, rg.input, /*fuel=*/16))
+        cr.rangeBits = bitsOfHull(*h);
+      chains.push_back(std::move(cr));
     }
     regions.push_back(std::move(r));
   }
@@ -274,6 +523,20 @@ std::string MicroarchReport::toJSON() const {
                 j.attribute("count", (int64_t)c.count);
                 j.attribute("reset", c.reset);
                 j.attribute("enable", c.enable);
+              });
+          });
+          j.attributeArray("chains", [&] {
+            for (const ChainReport &c : f.chains)
+              j.object([&] {
+                j.attribute("region", c.region);
+                j.attribute("width", (int64_t)c.width);
+                j.attribute("carried", c.carried);
+                j.attribute("depth", (int64_t)c.depth);
+                j.attribute("ii", (int64_t)c.ii);
+                j.attribute("taps", (int64_t)c.taps);
+                j.attribute("source", c.source);
+                if (c.rangeBits)
+                  j.attribute("range_bits", (int64_t)*c.rangeBits);
               });
           });
           j.attributeArray("mux_cones", [&] {

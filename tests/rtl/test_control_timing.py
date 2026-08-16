@@ -623,3 +623,39 @@ def test_the_qor_publishes_the_clock_the_model_holds():
         assert p.steps and p.steps[0].what.startswith("launch:")
         assert sum(s.delay for s in p.steps) == pytest.approx(p.total)
         assert p.slack == pytest.approx(period - p.total)
+
+
+# ---------------------------------------------------------------------------
+# The value-chain report
+# ---------------------------------------------------------------------------
+
+
+# The microarch report holds one row per value delay chain of the model, with
+# the value range the interval walk proves through its driving cells. Reading
+# the IV as data forces a chain to align it with the memory read, and the walk
+# follows it back to the counter's constant bounds.
+def test_a_chain_report_carries_the_proven_range():
+    @kernel
+    def ranged(a: i32[16], out: i32[16]):
+        for i in range(16):
+            out[i] = a[i] * 3 + i
+
+    rtl = _to_rtl(ranged)
+    f = rtl.microarch.func("ranged")
+    assert f.chains, "the IV must be delayed to meet the read's landing"
+    from_counter = [c for c in f.chains if c.source == "counter"]
+    assert from_counter, f"no counter-fed chain in {f.chains}"
+    for c in from_counter:
+        # i runs [0, 16); the hull includes one-past, sized like the counter.
+        assert c.range_bits == 6 and c.width >= c.range_bits
+    # Chains are a subset of the value-role ledger: read-data alignment delays
+    # are charged there but built outside the model.
+    from allo.backend.rtl.reports.microarch import RegRole
+
+    plain = sum(c.width * c.depth for c in f.chains)
+    assert 0 < plain <= f.reg_bits_by_role()[RegRole.VALUE]
+
+    x = np.arange(16, dtype=np.int32)
+    out = np.zeros(16, np.int32)
+    rtl.cosim(x, out)
+    assert np.array_equal(out, x * 3 + np.arange(16))

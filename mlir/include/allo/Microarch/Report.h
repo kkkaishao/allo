@@ -45,6 +45,20 @@ struct UnitReport {
   unsigned adders = 0, multipliers = 0, dividers = 0;
 };
 
+/// One value delay chain, a `uarch::Register` projected: what it carries, how
+/// deep it runs, and who drives it. `rangeBits` is the width of the value
+/// range a model-level interval walk proved, absent when it could not.
+struct ChainReport {
+  int64_t region = 0;  // owning region's order (`RegionUarch::order`)
+  unsigned width = 0;  // built carrier bits
+  std::string carried; // the held type spelled ("index", "i32", "f32")
+  unsigned depth = 0;  // chain length in cycles
+  unsigned ii = 1;     // owning region's interval; folds registers at > 1
+  unsigned taps = 0;   // distinct consumer read depths
+  std::string source;  // driving cell class, or a unit's mnemonic / IP symbol
+  std::optional<unsigned> rangeBits;
+};
+
 /// A class of multiplexer: `count` of them, each `fanin` sources wide at
 /// `width` bits. Aggregated rather than enumerated because the cost of a mux is
 /// a function of exactly those two numbers, and nothing downstream needs to
@@ -173,6 +187,10 @@ struct FuncUarch {
   // Module-wide: a register run belongs to the value it carries, not to a
   // region, and the ledger counts it where it is BUILT.
   std::vector<RegClass> regs;
+  // Every value delay chain the model holds (`dp.regs`), one row each. The
+  // ledger's value-role classes above also count chains built OUTSIDE the
+  // model (read-data alignment, stall holds), so these sum to less.
+  std::vector<ChainReport> chains;
   // Module-wide: the select cones the emission built around storage, disjoint
   // from each region's allocation muxes.
   std::vector<MuxCone> muxCones;

@@ -9,6 +9,7 @@ from .compile import CompileReport
 from .compiler import CompilerReport, SolveReport
 from .microarch import (
     Call,
+    Chain,
     FuncUarch,
     Memory,
     MemoryCost,
@@ -39,6 +40,7 @@ __all__ = [
     "CompilerReport",
     "SolveReport",
     "Call",
+    "Chain",
     "FuncUarch",
     "Memory",
     "MemoryCost",

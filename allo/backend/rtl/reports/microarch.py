@@ -94,6 +94,36 @@ class Unit:
 
 
 @dataclass(frozen=True)
+class Chain:
+    """One value delay chain: a datum carried across cycle boundaries.
+
+    ``range_bits`` is the width of the value range a model-level interval walk
+    proved for the carried datum, ``None`` where it could not."""
+
+    region: int  # owning region's order
+    width: int  # built carrier bits
+    carried: str  # the held type spelled ("index", "i32", "f32")
+    depth: int  # chain length in cycles
+    ii: int  # owning region's interval; folds registers at > 1
+    taps: int  # distinct consumer read depths
+    source: str  # driving cell class, or a unit's mnemonic / IP symbol
+    range_bits: int | None = None
+
+    @classmethod
+    def from_json(cls, d: dict) -> Chain:
+        return cls(
+            region=d["region"],
+            width=d["width"],
+            carried=d["carried"],
+            depth=d["depth"],
+            ii=d["ii"],
+            taps=d["taps"],
+            source=d["source"],
+            range_bits=d.get("range_bits"),
+        )
+
+
+@dataclass(frozen=True)
 class MuxClass:
     """``count`` multiplexers, each ``fanin`` sources wide at ``width`` bits.
     Aggregated rather than enumerated: a mux costs a function of exactly those
@@ -408,6 +438,10 @@ class FuncUarch:
     #: module-wide: a register run belongs to the value it carries, not to a
     #: region, and the ledger counts it where it is BUILT.
     regs: list[RegClass] = field(default_factory=list)
+    #: every value delay chain the model holds, one row each. The ledger's
+    #: value-role classes in ``regs`` also count chains built outside the
+    #: model (read-data alignment, stall holds), so these sum to less.
+    chains: list[Chain] = field(default_factory=list)
     #: module-wide, like ``regs``: the select cones built around storage.
     mux_cones: list[MuxCone] = field(default_factory=list)
     mems: list[Memory] = field(default_factory=list)
@@ -448,6 +482,7 @@ class FuncUarch:
             write_ports=d["write_ports"],
             regions=[RegionUarch.from_json(r) for r in d["regions"]],
             regs=[RegClass.from_json(c) for c in d["regs"]],
+            chains=[Chain.from_json(c) for c in d.get("chains", [])],
             mux_cones=[MuxCone.from_json(m) for m in d["mux_cones"]],
             mems=[Memory.from_json(m) for m in d["mems"]],
             streams=[Stream.from_json(s) for s in d["streams"]],
