@@ -69,8 +69,8 @@ using namespace mlir::allo;
   X(Minui, Min, arith::MinUIOp)                                                \
   X(Maxsi, Max, arith::MaxSIOp)                                                \
   X(Maxui, Max, arith::MaxUIOp)                                                \
-  /* An address expression: no device row covers a whole affine map, so    */ \
-  /* `lookup` prices its cone through the address model (`addressCost`)    */ \
+  /* An address expression: no device row covers a whole affine map, so    */  \
+  /* `lookup` prices its cone through the address model (`addressCost`)    */  \
   X(Apply, Unknown, affine::AffineApplyOp)
 
 std::optional<CombOpKindEnum> mlir::allo::combKindOf(Operation *op) {
@@ -583,7 +583,8 @@ OperatorChar OperatorLibrary::lookup(Operation *op) const {
         const OperatorEntry *row = combEntry(kind);
         if (!row)
           return 0;
-        std::optional<int64_t> p = priceOf(row->uses, {AddressDelays::refWidth});
+        std::optional<int64_t> p =
+            priceOf(row->uses, {AddressDelays::refWidth});
         assert(p && "a comb row an address cone builds from is measured at the "
                     "index width");
         return *p;
@@ -635,16 +636,28 @@ OperatorChar OperatorLibrary::lookup(Operation *op) const {
            "one it covers";
     return OperatorChar{};
   }
+  return characterize(op, *e, width);
+}
+
+OperatorChar OperatorLibrary::characterize(Operation *op,
+                                           const OperatorEntry &e,
+                                           int64_t width) const {
+  std::optional<double> delay =
+      e.comb ? e.delay.evaluate(width) : std::optional<double>(0.0);
+  std::optional<int64_t> price = priceOf(e.uses, {width});
+  assert(delay && price &&
+         "the caller checked the row is measured at this "
+         "width");
 
   // The stable Problem::OperatorType key: an IP row's symbol, a comb row's
   // `comb.<kind>.w<N>`, else `default`.
   OperatorChar c;
   c.timing.typeName =
-      !e->symbol.empty() ? e->symbol
-      : e->comb
-          ? ("comb." + stringifyOpKindEnum(e->kind) + ".w" + Twine(width)).str()
+      !e.symbol.empty() ? e.symbol
+      : e.comb
+          ? ("comb." + stringifyOpKindEnum(e.kind) + ".w" + Twine(width)).str()
           : std::string("default");
-  c.timing.latency = e->latency;
+  c.timing.latency = e.latency;
   // A comb row carries its marginal delay: what the operator adds to a path
   // that already left a register. The floor the measurement also saw is paid
   // once per cycle, as the lower bound on every sub-cycle start time, so
@@ -653,13 +666,13 @@ OperatorChar OperatorLibrary::lookup(Operation *op) const {
   // Incoming and outgoing hold the same number because
   // `ChainingProblem::checkDelays` rejects a zero-latency operator whose two
   // delays differ: for a combinational cell they describe one path.
-  if (e->comb)
+  if (e.comb)
     c.timing.inDelay = c.timing.outDelay = std::max(0.0, *delay - regFloor);
   else {
-    c.timing.inDelay = e->inDelay;
-    c.timing.outDelay = e->outDelay;
+    c.timing.inDelay = e.inDelay;
+    c.timing.outDelay = e.outDelay;
   }
-  c.pipelined = e->pipelined;
+  c.pipelined = e.pipelined;
   // A shift by a literal is wiring, not a shifter, and so is a resize that
   // changes no width. It takes a type name of its own because the problem
   // registers timing per name: sharing the row would make two spellings of that
@@ -673,11 +686,39 @@ OperatorChar OperatorLibrary::lookup(Operation *op) const {
   c.price = *price;
   // The realization is the row's own symbol when it is an IP, else the native
   // lowering the reifier picks; the default row reaches the comb arm too.
-  if (!e->symbol.empty())
-    c.identity = identityOf(op, std::nullopt, e->symbol);
+  if (!e.symbol.empty())
+    c.identity = identityOf(op, std::nullopt, e.symbol);
   else
     c.identity = identityOf(op, combKindOf(op), "");
   return c;
+}
+
+OperatorChar OperatorLibrary::lookup(Operation *op, StringRef symbol) const {
+  for (const OperatorEntry *e : matchEntries(advancedEntries, entries, op))
+    if (e->symbol == symbol)
+      return characterize(op, *e, combParamWidth(op));
+  llvm_unreachable("a decided realization names one of its op's candidates");
+}
+
+SmallVector<OperatorChar, 2>
+OperatorLibrary::candidateChars(Operation *op) const {
+  SmallVector<OperatorChar, 2> out;
+  int64_t width = combParamWidth(op);
+  for (const OperatorEntry *e : matchEntries(advancedEntries, entries, op)) {
+    if (e->comb)
+      continue;
+    // The same float fit test `selectImplementation` ranks by, so the set here
+    // and the row `lookup` picks never disagree about what fits.
+    float need =
+        std::max(static_cast<float>(regFloor) + static_cast<float>(e->inDelay),
+                 static_cast<float>(e->outDelay));
+    if (need > selectionPeriodNs)
+      continue;
+    if (!priceOf(e->uses, {width}))
+      continue; // unmeasured at this width: it cannot realize the op
+    out.push_back(characterize(op, *e, width));
+  }
+  return out;
 }
 
 std::string OperatorIdentity::key() const {
@@ -719,4 +760,34 @@ SmallVector<StringRef, 2> OperatorLibrary::candidateIPs(Operation *op) const {
     if (!e->comb)
       symbols.push_back(e->symbol);
   return symbols;
+}
+
+SmallVector<OperatorChar, 2>
+mlir::allo::selectionCandidates(Operation *op, const OperatorLibrary &lib,
+                                bool cyclic) {
+  if (isSyncSubKernelCall(op) || asMemAccess(op) || isZeroDelay(op))
+    return {};
+  OperatorChar own = lib.lookup(op);
+  if (own.identity.ipSymbol.empty())
+    return {}; // comb and default realizations stay the library's
+  SmallVector<OperatorChar, 2> cands = lib.candidateChars(op);
+  llvm::erase_if(cands, [&](const OperatorChar &c) {
+    return (cyclic && !c.pipelined) ||
+           (c.timing.latency == 0 && c.timing.inDelay != c.timing.outDelay);
+  });
+  if (cands.size() < 2)
+    return {};
+  const auto *pick = llvm::find_if(cands, [&](const OperatorChar &c) {
+    return c.timing.typeName == own.timing.typeName;
+  });
+  if (pick == cands.end())
+    return {}; // the library's pick fell to a scope limit above
+  auto differs = [&](const OperatorChar &c) {
+    return c.timing.latency != pick->timing.latency ||
+           c.timing.inDelay != pick->timing.inDelay ||
+           c.timing.outDelay != pick->timing.outDelay || c.price != pick->price;
+  };
+  if (llvm::none_of(cands, differs))
+    return {}; // nothing a schedule can see distinguishes them
+  return cands;
 }

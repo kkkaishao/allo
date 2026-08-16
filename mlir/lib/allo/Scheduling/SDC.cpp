@@ -96,7 +96,9 @@ static SmallVector<DrainTerm> drainTerms(OccupancyProblem &problem,
     if (!def || isDeclarationOp(def) || isSyncSubKernelCall(def) ||
         !problem.hasOperation(def))
       continue;
-    terms.push_back({def, problem.latencyOf(def)});
+    // The definer's latency is read live (`plusLatency`): which row realizes
+    // it may itself be an exact solve's decision.
+    terms.push_back({def, 0, /*plusLatency=*/true});
   }
   return terms;
 }
@@ -167,7 +169,7 @@ static SmallVector<RegisterTerm> registerTerms(OccupancyProblem &problem,
       return;
     auto [slot, isNew] = slotOf.try_emplace(v, terms.size());
     if (isNew)
-      terms.push_back({def, problem.latencyOf(def), width, {}});
+      terms.push_back({def, width, {}});
     terms[slot->second].reads.push_back({reader, distance});
   };
 
@@ -295,8 +297,10 @@ private:
 } // namespace
 
 /// Record the solved schedule in \p model: every registered op's start cycle
-/// and sub-cycle start. What the region as a whole solved to is a
-/// `RegionSolution` the caller opens with `model.addRegion`.
+/// and sub-cycle start, and any realization an exact solve moved off the
+/// library's own pick. The decision travels as the op's linked operator type
+/// (an IP row's type name is its symbol), so a linked name that differs from
+/// what `lookup` resolves is the solver's selection.
 void FuncScheduler::annotateStarts(
     circt::scheduling::ChainingProblem &problem) {
   for (Operation *op : problem.getOperations()) {
@@ -311,6 +315,12 @@ void FuncScheduler::annotateStarts(
     model.setStart(op, *start);
     if (std::optional<float> z = problem.getStartTimeInCycle(op))
       model.setStartInCycle(op, *z);
+    if (usesExactScheduler(opts.kind) && !isSyncSubKernelCall(op) &&
+        !asMemAccess(op)) {
+      StringRef linked = problem.getLinkedOperatorType(op)->getValue();
+      if (linked != dev.operators.lookup(op).timing.typeName)
+        model.setSelectedImpl(op, linked);
+    }
   }
 }
 
@@ -392,7 +402,8 @@ LogicalResult FuncScheduler::scheduleCyclic(LoopLikeOpInterface body,
   populateOperatorOccupancy(problem, dev.operators);
   populateCallOccupancy(problem);
   if (opts.allocate)
-    populateOperatorAllocation(problem, dev.operators);
+    populateOperatorAllocation(problem, dev.operators,
+                               usesExactScheduler(opts.kind));
   Operation *anchor = bodyBlock->getTerminator();
   // The trip this solution records is the INNERMOST loop's, the one its solved
   // `length`/`ii` describe. Every level above drives its child as a container,
@@ -482,7 +493,8 @@ LogicalResult FuncScheduler::scheduleWhile(scf::WhileOp w,
   // is needed, since `whileFlushingPipelines` rejects a body with a sync call.
   populateOperatorOccupancy(problem, dev.operators);
   if (opts.allocate)
-    populateOperatorAllocation(problem, dev.operators);
+    populateOperatorAllocation(problem, dev.operators,
+                               usesExactScheduler(opts.kind));
   Operation *anchor = w.getYieldOp().getOperation();
   // Honor a requested target II (>=1) as a lower bound. `ii=-1` (pipelining
   // off) is not modeled for while loops.
@@ -589,7 +601,8 @@ LogicalResult FuncScheduler::scheduleAcyclic(ArrayRef<Operation *> ops,
   populateOperatorTypes(problem, dev.operators, dev.memory);
   populateMemoryResources(problem, dev.memory);
   if (opts.allocate)
-    populateOperatorAllocation(problem, dev.operators);
+    populateOperatorAllocation(problem, dev.operators,
+                               usesExactScheduler(opts.kind));
   // A straight-line region runs once, so its whole cost is its drain, and it
   // carries nothing between iterations it does not have.
   SpanObjective span(problem, spanEscapingValues(ops),
@@ -970,11 +983,10 @@ static float minSchedulablePeriod(ArrayRef<func::FuncOp> funcs,
                 "value, or partition by a power of two so the bank digit is "
                 "a mask rather than a divider"
               : "It is one operator, so no register can split it";
-      warn(Stage::Sched, op) << "'" << t.typeName << "' needs "
-                             << format("%.2f", need)
-                             << " ns for a cycle of its own, over the "
-                             << format("%.2f", target)
-                             << " ns clock period. " << advice;
+      warn(Stage::Sched, op)
+          << "'" << t.typeName << "' needs " << format("%.2f", need)
+          << " ns for a cycle of its own, over the " << format("%.2f", target)
+          << " ns clock period. " << advice;
     });
   return least;
 }
@@ -1012,8 +1024,8 @@ LogicalResult mlir::allo::runSDCScheduler(ModuleOp module, StringRef top,
   // domain), and everything downstream holds the raised period. The miss is a
   // report; the schedule stays valid at the frequency actually achieved.
   loadedDev.operators.setSelectionPeriod(cycleTime);
-  float scheduled = minSchedulablePeriod(*orderOr, loadedDev, cycleTime,
-                                         regFloor);
+  float scheduled =
+      minSchedulablePeriod(*orderOr, loadedDev, cycleTime, regFloor);
   if (scheduled > cycleTime) {
     warn(Stage::Sched, topFunc)
         << "The requested " << format("%.2f", cycleTime) << " ns clock period ("

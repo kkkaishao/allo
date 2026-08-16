@@ -30,6 +30,10 @@ struct OpSchedule {
   /// Which allocated instance runs it: an index into
   /// `ScheduleModel::allocatedUnits`. Empty unless an exact solve allocated.
   std::optional<unsigned> unit;
+  /// The `dcp.operator` row an exact solve selected for it, empty where the
+  /// library's own selection stands. The reify realizes the op on this row,
+  /// the same one the schedule priced.
+  std::string selectedImpl;
 };
 
 /// The solved schedule of ONE region: what the solver DECIDED, and nothing the
@@ -165,7 +169,7 @@ public:
   /// the reify for a cone the solver never saw, never by both.
   void setStart(Operation *op, int64_t start) {
     bool inserted =
-        ops.try_emplace(op, OpSchedule{start, std::nullopt, std::nullopt})
+        ops.try_emplace(op, OpSchedule{start, std::nullopt, std::nullopt, {}})
             .second;
     assert(inserted && "an op carries one start time");
     (void)inserted;
@@ -203,6 +207,14 @@ public:
     auto it = ops.find(op);
     assert(it != ops.end() && "an instance belongs to a scheduled op");
     it->second.unit = index;
+  }
+
+  /// Record that an exact solve realized \p op on the row \p symbol rather
+  /// than the one the library selects on its own.
+  void setSelectedImpl(Operation *op, llvm::StringRef symbol) {
+    auto it = ops.find(op);
+    assert(it != ops.end() && "a realization belongs to a scheduled op");
+    it->second.selectedImpl = symbol.str();
   }
 
   /// Every instance the allocation decided to build, module-wide.

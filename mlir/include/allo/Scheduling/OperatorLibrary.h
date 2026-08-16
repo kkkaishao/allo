@@ -154,6 +154,19 @@ public:
   /// with the gap reported against \p op.
   OperatorChar lookup(Operation *op) const;
 
+  /// The characterization of the specific candidate row \p symbol for \p op,
+  /// for a caller holding a realization an exact solve decided
+  /// (`OpSchedule::selectedImpl`) rather than the library's own pick.
+  OperatorChar lookup(Operation *op, StringRef symbol) const;
+
+  /// Every IP row that could realize \p op at the selection period, each as the
+  /// characterization `lookup` would resolve had selection picked it: the
+  /// non-comb rows of `matchEntries` that fit the period and are measured at
+  /// \p op's width, in declaration order. The row `lookup` resolves is always
+  /// among them when it is an IP: selection ranks fit rows first, and a derate
+  /// raises the period until one fits.
+  SmallVector<OperatorChar, 2> candidateChars(Operation *op) const;
+
   /// The clock period (ns) selection ranks IP rows against: a row that fits it
   /// outranks one that does not. Set when the module's period resolves and
   /// before any problem is built, and set again on a derate, so every lookup a
@@ -253,6 +266,13 @@ private:
   std::optional<int64_t> priceOf(ArrayAttr uses,
                                  ArrayRef<int64_t> params) const;
 
+  /// The characterization \p op takes when the row \p e realizes it, at
+  /// \p width bits: the tail of `lookup`, shared with `candidateChars`. The
+  /// row's delay and price must be measured at \p width; `lookup` reports the
+  /// gap and `candidateChars` skips the row.
+  OperatorChar characterize(Operation *op, const OperatorEntry &e,
+                            int64_t width) const;
+
   /// Which of \p candidates \p op is realized on, at \p width bits; null for an
   /// empty set. An IP outranks the combinational row whatever their latencies.
   /// Among IPs, one that fits the selection period outranks one that does not;
@@ -351,6 +371,21 @@ scheduledCallLatency(Operation *op) {
 /// them added up.
 NodeTiming accessCharacterization(Operation *op, const OperatorLibrary &opLib,
                                   const MemoryLibrary &memLib);
+
+/// The rows an exact solve may choose among for \p op, the library's own pick
+/// among them: at least two fit, measured IP candidates that differ somewhere
+/// a schedule can see (latency, a delay, a price). Empty where the
+/// realization is not a solver decision: a comb or default realization, a
+/// zero-delay rename, a single usable candidate, a zero-latency row with
+/// unequal delays (`checkDelays` rejects it), or under \p cyclic a pick the
+/// pipelined-only limit drops (an occupancy window that varied with the
+/// decision would move the interval bound the search starts from).
+///
+/// An operation with choices keeps its own instance:
+/// `populateOperatorAllocation` skips it, and bind-time sharing still folds
+/// equal decided rows.
+SmallVector<OperatorChar, 2>
+selectionCandidates(Operation *op, const OperatorLibrary &lib, bool cyclic);
 
 /// Assign an operator type (latency + chaining delays) to every operation
 /// \p problem holds. Three sources, because a problem holds three kinds of
@@ -492,8 +527,13 @@ inline void populateOperatorOccupancy(ChainingModuloProblem &problem,
 /// UPPER bound on the multiplexer, since two operations sharing a driver need
 /// no select between them and the emitter builds one only where the drivers
 /// differ.
+///
+/// \p exactSelects says the exact solver will decide realizations: an
+/// operation with selection candidates then joins no class, since a class
+/// groups one STATIC identity and the solve may move the operation off it.
 template <class ProblemT>
-void populateOperatorAllocation(ProblemT &problem, const OperatorLibrary &lib) {
+void populateOperatorAllocation(ProblemT &problem, const OperatorLibrary &lib,
+                                bool exactSelects) {
   using namespace circt::scheduling;
   constexpr bool isCyclic = std::is_base_of_v<CyclicProblem, ProblemT>;
   // The loop whose carried values a shared unit re-injects; its own induction
@@ -522,6 +562,9 @@ void populateOperatorAllocation(ProblemT &problem, const OperatorLibrary &lib) {
     OperatorChar c = lib.lookup(op);
     if (!c.identity.realized() || c.identity.comb)
       continue;
+    if (exactSelects && !selectionCandidates(op, lib, isCyclic).empty())
+      continue; // the realization is the solver's decision; the op keeps its
+                // own instance and bind-time sharing may still fold it
     // A non-pipelined unit is busy for its whole latency; a pipelined one
     // contends only for its issue slot.
     unsigned occ = c.pipelined ? 1 : std::max(1u, c.timing.latency);

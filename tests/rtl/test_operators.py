@@ -977,6 +977,105 @@ def test_an_elastic_candidate_is_refused_whichever_core_ranks_first():
         _to_rtl(addk, device=dev).schedule()
 
 
+def _selection_cores(wide):
+    """Three cores for the solver-side selection tests: a short expensive add,
+    a deep cheap add, and a deep multiply to make slack beside itself."""
+
+    @operator_ip(
+        optype=OperatorType.ADD,
+        mnemonic="add_fast",
+        latency=1,
+        in_delay_ns=1.0,
+        pipelined=True,
+        style="ce",
+    )
+    def add_fast(a: wide, b: wide) -> wide: ...
+
+    @operator_ip(
+        optype=OperatorType.ADD,
+        mnemonic="add_cheap",
+        latency=3,
+        in_delay_ns=1.0,
+        pipelined=True,
+        style="ce",
+    )
+    def add_cheap(a: wide, b: wide) -> wide: ...
+
+    @operator_ip(
+        optype=OperatorType.MUL,
+        mnemonic="mul_deep",
+        latency=6,
+        in_delay_ns=1.0,
+        pipelined=True,
+        style="ce",
+    )
+    def mul_deep(a: wide, b: wide) -> wide: ...
+
+    dev = default_device.copy()
+    dev.add_operators(add_fast, add_cheap, mul_deep)
+    dev.set_operator_uses(add_fast, {dev.resources["lut"]: Const(400.0)})
+    dev.set_operator_uses(add_cheap, {dev.resources["lut"]: Const(10.0)})
+    return dev, add_fast, add_cheap, mul_deep
+
+
+# Which core realizes an operation is the exact solver's own decision, made
+# with the schedule: the span is settled first, so the add on the drain path
+# keeps the short core, and the add whose latency hides in the slack beside
+# the deep multiply takes the cheap one. The library's own ranking is latency
+# first, so the heuristic ships the short core for both.
+def test_exact_selection_spends_slack_on_the_cheaper_core():
+    wide = APInt(48, signed=True)
+    dev, add_fast, add_cheap, mul_deep = _selection_cores(wide)
+
+    @kernel
+    def mix(a: i32[1], b: i32[1], c: i32[1], d: i32[1]) -> wide:
+        p: wide = a[0]
+        p = p * b[0]
+        u: wide = c[0]
+        u = u + d[0]
+        return p + u
+
+    assert add_cheap.symbol not in _impls(_to_rtl(mix, device=dev).schedule())
+
+    exact = _to_rtl(mix, device=dev).set_scheduler_opt(scheduler="exact")
+    impls = _impls(exact.schedule())
+    assert {add_fast.symbol, add_cheap.symbol, mul_deep.symbol} <= impls
+
+    vals = [np.array([v], np.int32) for v in (312, -75, 4444, 9)]
+    expect = 312 * -75 + (4444 + 9)
+    assert int(exact.cosim(*vals).result) == expect
+
+
+# The same decision inside a pipeline: the carried accumulate cannot take the
+# deep add at II=1 (its latency would not close the recurrence), the join on
+# the drain path keeps the short core with it, and only the slack add beside
+# the multiply goes cheap.
+def test_exact_selection_in_a_pipeline_leaves_the_recurrence_its_short_core():
+    wide = APInt(48, signed=True)
+    dev, add_fast, add_cheap, mul_deep = _selection_cores(wide)
+
+    @kernel
+    def loopy(a: i32[8], b: i32[8], c: i32[8]) -> wide:
+        acc: wide = 0
+        for k in range(8, name="k"):
+            p: wide = a[k]
+            p = p * p
+            u: wide = b[k]
+            u = u + c[k]
+            acc = acc + (p + u)
+        return acc
+
+    exact = _to_rtl(loopy, device=dev).set_scheduler_opt(scheduler="exact")
+    sched = exact.schedule()
+    impls = _impls(sched)
+    assert {add_fast.symbol, add_cheap.symbol, mul_deep.symbol} <= impls
+
+    rng = np.random.default_rng(2)
+    a, b, c = (rng.integers(-500, 500, size=8, dtype=np.int32) for _ in range(3))
+    expect = sum(int(x) * int(x) + int(y) + int(z) for x, y, z in zip(a, b, c))
+    assert int(exact.cosim(a, b, c).result) == expect
+
+
 def test_behavior_language_follows_the_domain():
     # A core's behavior language follows from the core: an integer one is native
     # RTL (exact at any width), a float one is C over the DPI, and a user

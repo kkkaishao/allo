@@ -181,7 +181,11 @@ static void convertOp(Operation &op, OpBuilder &b, IRMapping &map,
   // one of two exclusive paths: a combinational op carries a `comb_kind`, an IP
   // op references its injected `dcp.operator` via `op_type`.
   if (op.getNumResults() == 1 && at && !isa<arith::ConstantOp>(op)) {
-    OperatorChar oc = dev.operators.lookup(&op);
+    // The row an exact solve selected outranks the library's own pick: the
+    // reify must realize what the schedule priced.
+    OperatorChar oc = at->selectedImpl.empty()
+                          ? dev.operators.lookup(&op)
+                          : dev.operators.lookup(&op, at->selectedImpl);
     OperatorIdentity id = oc.identity;
     assert(id.realized() && "a scheduled compute op with no realization");
     CombOpKindEnumAttr combKind;

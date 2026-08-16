@@ -54,7 +54,9 @@ SatParameters solverParameters(const SchedulerOptions &opts) {
 /// pre-pass computed, each costing a cycle on top of plain precedence. The
 /// edges hold the period exactly over integer start times (see
 /// `computeChainBreaks`), so no sub-cycle constraint is needed for
-/// feasibility.
+/// feasibility. They hold for the delays of the rows currently linked, so a
+/// model that decides realizations itself uses the sub-cycle system instead
+/// (`addSubCycleTimes` with selection).
 template <class ProblemT>
 SmallVector<Problem::Dependence> chainBreaksFor(ProblemT &prob, float cycleTime,
                                                 float regFloor) {
@@ -75,14 +77,161 @@ SmallVector<Problem::Dependence> chainBreaksFor(ProblemT &prob, float cycleTime,
 constexpr double kPicosPerNs = 1000.0;
 int64_t picos(double ns) { return std::llround(ns * kPicosPerNs); }
 
+//===----------------------------------------------------------------------===//
+// Realization selection: which of several usable device rows an operation runs
+// on, decided by the solve alongside its start time.
+//===----------------------------------------------------------------------===//
+
+/// One operation whose realization the solve decides, and the rows it may
+/// choose among. Model-independent, so the cyclic search builds one model per
+/// interval off the same choices.
+struct SelectionChoice {
+  Operation *op;
+  SmallVector<OperatorChar, 2> cands;
+  /// The candidate `lookup` resolves on its own: the warm-start hint, and the
+  /// row every fallback path leaves linked.
+  unsigned preferred = 0;
+};
+
+/// The operations whose realization a solve decides, each with its usable
+/// rows (`selectionCandidates`, which also keeps such an operation out of
+/// every allocation class), and the library's own pick located among them.
+template <class ProblemT>
+SmallVector<SelectionChoice, 0> selectionChoices(ProblemT &prob,
+                                                 const OperatorLibrary &lib) {
+  constexpr bool cyclic = std::is_base_of_v<CyclicProblem, ProblemT>;
+  SmallVector<SelectionChoice, 0> choices;
+  for (Operation *op : prob.getOperations()) {
+    SmallVector<OperatorChar, 2> cands = selectionCandidates(op, lib, cyclic);
+    if (cands.empty())
+      continue;
+    std::string own = lib.lookup(op).timing.typeName;
+    const auto *pos = llvm::find_if(
+        cands, [&](const OperatorChar &c) { return c.timing.typeName == own; });
+    assert(pos != cands.end() &&
+           "a non-empty candidate set holds the library's own pick");
+    auto preferred = static_cast<unsigned>(pos - cands.begin());
+    choices.push_back({op, std::move(cands), preferred});
+  }
+  return choices;
+}
+
+/// The one-hot decision per choice on ONE model, hinted at the library's own
+/// pick. Aligned with the choices it was built from.
+struct SelectionVars {
+  ArrayRef<SelectionChoice> choices;
+  SmallVector<SmallVector<BoolVar, 2>, 4> sel;
+  DenseMap<Operation *, unsigned> index; // op -> position in `choices`
+
+  bool empty() const { return choices.empty(); }
+  /// The position of \p op's choice, nullopt where the solve does not decide
+  /// its realization.
+  std::optional<unsigned> of(Operation *op) const {
+    auto it = index.find(op);
+    return it == index.end() ? std::nullopt : std::optional(it->second);
+  }
+  /// The decided latency of choice \p i, as the one-hot weighted sum.
+  LinearExpr latency(unsigned i) const {
+    SmallVector<int64_t> lats;
+    for (const OperatorChar &c : choices[i].cands)
+      lats.push_back(c.timing.latency);
+    return LinearExpr::WeightedSum(sel[i], lats);
+  }
+};
+
+SelectionVars addSelection(CpModelBuilder &model,
+                           ArrayRef<SelectionChoice> choices) {
+  SelectionVars sels;
+  sels.choices = choices;
+  for (auto [i, choice] : llvm::enumerate(choices)) {
+    SmallVector<BoolVar, 2> row;
+    for (unsigned m = 0; m < choice.cands.size(); ++m) {
+      row.push_back(model.NewBoolVar());
+      model.AddHint(row.back(), m == choice.preferred);
+    }
+    model.AddExactlyOne(row);
+    sels.sel.push_back(std::move(row));
+    sels.index.try_emplace(choice.op, i);
+  }
+  return sels;
+}
+
+/// The latency extremes selection leaves each decided op, keyed by op. The
+/// minimum keeps `drainFloor` a bound on every selection; the maximum keeps
+/// the horizon covering one.
+DenseMap<Operation *, std::pair<int64_t, int64_t>>
+latencyRange(ArrayRef<SelectionChoice> choices) {
+  DenseMap<Operation *, std::pair<int64_t, int64_t>> range;
+  for (const SelectionChoice &choice : choices) {
+    int64_t lo = std::numeric_limits<int64_t>::max(), hi = 0;
+    for (const OperatorChar &c : choice.cands) {
+      lo = std::min<int64_t>(lo, c.timing.latency);
+      hi = std::max<int64_t>(hi, c.timing.latency);
+    }
+    range.try_emplace(choice.op, lo, hi);
+  }
+  return range;
+}
+
+/// The candidate index each choice settled on in \p response.
+SmallVector<unsigned> readSelection(const CpSolverResponse &response,
+                                    const SelectionVars &sels) {
+  SmallVector<unsigned> chosen;
+  for (const SmallVector<BoolVar, 2> &row : sels.sel) {
+    unsigned m = 0;
+    while (!SolutionBooleanValue(response, row[m]))
+      ++m;
+    chosen.push_back(m);
+  }
+  return chosen;
+}
+
+/// What the decided rows cost the device: the term the cyclic search adds to
+/// an interval's allocation area when comparing intervals.
+int64_t selectionPrice(ArrayRef<SelectionChoice> choices,
+                       ArrayRef<unsigned> chosen) {
+  int64_t price = 0;
+  for (auto [choice, m] : llvm::zip(choices, chosen))
+    price += choice.cands[m].price;
+  return price;
+}
+
+/// Write the decided realization of every choice back onto the problem, so
+/// everything downstream of the solve (the sub-cycle recompute, verification,
+/// the reify) reads the decided rows. An IP row's operator type is keyed by
+/// its symbol, so relinking is what carries the decision out.
+void applySelection(circt::scheduling::ChainingProblem &prob,
+                    ArrayRef<SelectionChoice> choices,
+                    ArrayRef<unsigned> chosen) {
+  unsigned moved = 0;
+  for (auto [choice, m] : llvm::zip(choices, chosen)) {
+    const OperatorChar &cand = choice.cands[m];
+    Problem::OperatorType opr =
+        prob.getOrInsertOperatorType(cand.timing.typeName);
+    prob.setLatency(opr, cand.timing.latency);
+    prob.setIncomingDelay(opr, cand.timing.inDelay);
+    prob.setOutgoingDelay(opr, cand.timing.outDelay);
+    prob.setLinkedOperatorType(choice.op, opr);
+    moved += m != choice.preferred;
+  }
+  if (moved)
+    info(Stage::Sched, prob.getContainingOp())
+        << "Exact scheduling moved " << moved << " of " << choices.size()
+        << " realization decisions off the library's own ranking";
+}
+
 /// The period as a model constraint: one sub-cycle start time `z` per
 /// operation, in picoseconds from the start of its cycle, matching what
 /// `computeStartTimesInCycle` computes afterwards.
 /// `z(v) <= P - inDelay(v)`, and where a def-use producer u ends in the cycle v
 /// starts, `z(v) >= (lat(u) == 0 ? z(u) : 0) + outDelay(u)`.
 ///
-/// Redundant against the break edges for feasibility; stated only so
-/// `addAllocationHeadroom` can hold a select cone against sub-cycle slack.
+/// Two callers. Without \p sels, redundant against the break edges for
+/// feasibility, stated only so `addAllocationHeadroom` can hold a select cone
+/// against sub-cycle slack. With \p sels it IS the model's period statement:
+/// the break edges hold only for the rows the library picked, so a model that
+/// re-decides rows drops them and every delay here follows the row decided,
+/// one conditional bound per candidate.
 ///
 /// Precedence already forces `t_v - t_u >= lat(u)`, so gating on the `<=` half
 /// alone (via `sameCycle`) detects "ends in the same cycle".
@@ -97,7 +246,7 @@ template <class ProblemT>
 DenseMap<Operation *, IntVar>
 addSubCycleTimes(CpModelBuilder &model, ProblemT &prob,
                  DenseMap<Operation *, IntVar> &startVars, float cycleTime,
-                 float regFloor) {
+                 float regFloor, const SelectionVars *sels = nullptr) {
   int64_t period = picos(cycleTime);
   // Nothing in a cycle starts before its operands leave a register, so the
   // fabric floor is every `z`'s lower bound. A chain from a registered producer
@@ -105,6 +254,21 @@ addSubCycleTimes(CpModelBuilder &model, ProblemT &prob,
   int64_t floor = picos(regFloor);
   DenseMap<Operation *, IntVar> inCycle;
   for (Operation *op : prob.getOperations()) {
+    if (std::optional<unsigned> i = sels ? sels->of(op) : std::nullopt) {
+      // The op's own need follows the row decided: the domain takes the least
+      // candidate, and the decided one is enforced alongside. A candidate the
+      // picosecond grid leaves no cycle room for is pruned by that constraint
+      // rather than asserted, the float fit test having admitted it.
+      SmallVector<int64_t> ins;
+      for (const OperatorChar &c : sels->choices[*i].cands)
+        ins.push_back(picos(c.timing.inDelay));
+      IntVar z = model.NewIntVar(
+          operations_research::Domain(floor, period - *llvm::min_element(ins)));
+      model.AddLessOrEqual(z + LinearExpr::WeightedSum(sels->sel[*i], ins),
+                           period);
+      inCycle.try_emplace(op, z);
+      continue;
+    }
     int64_t in = picos(*prob.getIncomingDelay(*prob.getLinkedOperatorType(op)));
     assert(in + floor <= period &&
            "an operator whose own delay exceeds the period cannot reach a "
@@ -125,14 +289,26 @@ addSubCycleTimes(CpModelBuilder &model, ProblemT &prob,
       Operation *src = dep.getSource();
       Problem::OperatorType srcOpr = *prob.getLinkedOperatorType(src);
       int64_t lat = *prob.getLatency(srcOpr);
-      int64_t out = picos(*prob.getOutgoingDelay(srcOpr));
+      std::optional<unsigned> si = sels ? sels->of(src) : std::nullopt;
+      LinearExpr srcLat = si ? sels->latency(*si) : LinearExpr(lat);
       LinearExpr separation = startVars.at(op) - startVars.at(src);
       BoolVar sameCycle = model.NewBoolVar();
-      model.AddLessOrEqual(separation, lat).OnlyEnforceIf(sameCycle);
-      model.AddGreaterOrEqual(separation, lat + 1)
+      model.AddLessOrEqual(separation, srcLat).OnlyEnforceIf(sameCycle);
+      model.AddGreaterOrEqual(separation, srcLat + 1)
           .OnlyEnforceIf(sameCycle.Not());
       // A multi-cycle producer contributes only its outgoing delay: its last
       // register stage is what the cycle starts from.
+      if (si) {
+        for (auto [m, cand] : llvm::enumerate(sels->choices[*si].cands)) {
+          int64_t out = picos(cand.timing.outDelay);
+          LinearExpr ready = cand.timing.latency == 0 ? inCycle.at(src) + out
+                                                      : LinearExpr(out);
+          model.AddGreaterOrEqual(inCycle.at(op), ready)
+              .OnlyEnforceIf({sameCycle, sels->sel[*si][m]});
+        }
+        continue;
+      }
+      int64_t out = picos(*prob.getOutgoingDelay(srcOpr));
       LinearExpr ready = lat == 0 ? inCycle.at(src) + out : LinearExpr(out);
       model.AddGreaterOrEqual(inCycle.at(op), ready).OnlyEnforceIf(sameCycle);
     }
@@ -176,9 +352,11 @@ LogicalResult finishSchedule(ChainingProblem &prob, float cycleTime,
   return success();
 }
 
-/// The region's drain as a variable: the max of `start(op) + offset` over the
-/// same terms `drainOf` maxes over, stated as lower bounds only, which is tight
-/// since the objective minimizes it.
+/// The region's drain as a variable: the max of each term's commit cycle over
+/// the same terms `drainOf` maxes over, stated as lower bounds only, which is
+/// tight since the objective minimizes it. A `plusLatency` term commits its
+/// definer's latency later, which \p latencyOf reads as the model states it
+/// (a decided realization's is the one-hot sum).
 ///
 /// \p bound caps it at an incumbent's, so the solver only searches schedules
 /// that would beat it; an INFEASIBLE result then means "nothing beats the
@@ -186,12 +364,17 @@ LogicalResult finishSchedule(ChainingProblem &prob, float cycleTime,
 IntVar drainVariable(CpModelBuilder &model,
                      DenseMap<Operation *, IntVar> &startVars,
                      ArrayRef<DrainTerm> terms, int64_t horizon,
-                     std::optional<int64_t> bound) {
+                     std::optional<int64_t> bound,
+                     llvm::function_ref<LinearExpr(Operation *)> latencyOf) {
   assert((!bound || *bound >= 0) && "incumbent cut before building the model");
   IntVar drain = model.NewIntVar(operations_research::Domain(
       0, bound ? std::min(*bound, horizon) : horizon));
-  for (const DrainTerm &term : terms)
-    model.AddLessOrEqual(startVars.at(term.op) + term.offset, drain);
+  for (const DrainTerm &term : terms) {
+    LinearExpr commit = startVars.at(term.op) + term.offset;
+    if (term.plusLatency)
+      commit += latencyOf(term.op);
+    model.AddLessOrEqual(commit, drain);
+  }
   return drain;
 }
 
@@ -277,20 +460,26 @@ SmallVector<AllocationVar> allocationVars(CpModelBuilder &model, ProblemT &prob,
 /// same solve leaves, which is what lets a `planned` binding realize the
 /// allocation as built.
 ///
-/// The model carries no sub-cycle variables otherwise, so they are created
-/// here on demand; the break edges already keep the plain system satisfiable
-/// at any placement, so this tightens the model only by the headroom itself.
+/// \p sharedInCycle is the sub-cycle system a selection model already built,
+/// reused so one model never carries two; null creates one on demand. The
+/// break edges already keep the plain system satisfiable at any placement, so
+/// without selection this tightens the model only by the headroom itself.
 template <class ProblemT>
 void addAllocationHeadroom(CpModelBuilder &model, ProblemT &prob,
                            DenseMap<Operation *, IntVar> &startVars,
                            ArrayRef<AllocationVar> allocs, float cycleTime,
-                           float regFloor) {
+                           float regFloor,
+                           DenseMap<Operation *, IntVar> *sharedInCycle) {
   if (llvm::none_of(allocs, [](const AllocationVar &a) {
         return a.headroom.has_value();
       }))
     return;
-  DenseMap<Operation *, IntVar> inCycle =
-      addSubCycleTimes(model, prob, startVars, cycleTime, regFloor);
+  DenseMap<Operation *, IntVar> own;
+  if (!sharedInCycle) {
+    own = addSubCycleTimes(model, prob, startVars, cycleTime, regFloor);
+    sharedInCycle = &own;
+  }
+  DenseMap<Operation *, IntVar> &inCycle = *sharedInCycle;
   int64_t period = picos(cycleTime);
   for (const AllocationVar &alloc : allocs) {
     if (!alloc.headroom)
@@ -350,12 +539,18 @@ void addPiecewiseCost(CpModelBuilder &model, IntVar size,
 /// maximum start, not the sum. A guard family's own chain rides other source
 /// signals this approximation does not see.
 ///
+/// A decided realization joins the area on both sides: its instance costs its
+/// row's price, and a register chain from it starts its decided latency after
+/// its issue, both read through \p sels / \p latencyOf.
+///
 /// Below the area, earlier starts win: a start-time sum at unit weight, kept
 /// under any single area unit, settles ties deterministically.
 void minimizeArea(CpModelBuilder &model, ArrayRef<IntVar> starts,
                   const SpanObjective &span,
                   DenseMap<Operation *, IntVar> &startVars,
-                  ArrayRef<AllocationVar> allocs, int64_t ii, int64_t horizon) {
+                  ArrayRef<AllocationVar> allocs, int64_t ii, int64_t horizon,
+                  llvm::function_ref<LinearExpr(Operation *)> latencyOf,
+                  const SelectionVars &sels) {
   SmallVector<IntVar> vars(starts.begin(), starts.end());
   SmallVector<int64_t> weights(starts.size(), 1);
   // One unit of area outweighs the whole start-time sum.
@@ -380,22 +575,25 @@ void minimizeArea(CpModelBuilder &model, ArrayRef<IntVar> starts,
     // Only bounded from below. A chain price is nondecreasing in its length, so
     // a minimizing solve lands `built` on the fold of the deepest read.
     for (auto [reader, distance] : term.reads)
-      model.AddLessOrEqual(startVars.at(reader) + distance * ii - term.latency,
-                           def + LinearExpr::Term(built, fold));
+      model.AddLessOrEqual(startVars.at(reader) + distance * ii,
+                           def + latencyOf(term.def) +
+                               LinearExpr::Term(built, fold));
     addPiecewiseCost(model, built, table, areaWeight, vars, weights);
   }
-  for (const AllocationVar &alloc : allocs) {
-    vars.push_back(alloc.price);
-    weights.push_back(areaWeight);
-  }
+  LinearExpr objective = LinearExpr::WeightedSum(vars, weights);
+  for (const AllocationVar &alloc : allocs)
+    objective += LinearExpr::Term(alloc.price, areaWeight);
+  for (auto [i, choice] : llvm::enumerate(sels.choices))
+    for (auto [m, cand] : llvm::enumerate(choice.cands))
+      if (cand.price)
+        objective += LinearExpr::Term(sels.sel[i][m], cand.price * areaWeight);
   if (int64_t pulse = span.device.pulsePrice(); pulse && !starts.empty()) {
     IntVar deepest = model.NewIntVar(operations_research::Domain(0, horizon));
     for (IntVar start : starts)
       model.AddLessOrEqual(start, deepest);
-    vars.push_back(deepest);
-    weights.push_back(pulse * areaWeight);
+    objective += LinearExpr::Term(deepest, pulse * areaWeight);
   }
-  model.Minimize(LinearExpr::WeightedSum(vars, weights));
+  model.Minimize(objective);
 }
 
 /// Whether \p response carries a schedule to read.
@@ -421,13 +619,17 @@ Allocated readAllocation(const CpSolverResponse &response,
 /// that runs on the same model next.
 void rehintFrom(CpModelBuilder &model, ArrayRef<Operation *> ops,
                 DenseMap<Operation *, IntVar> &startVars,
-                ArrayRef<AllocationVar> allocs, const CpSolverResponse &from) {
+                ArrayRef<AllocationVar> allocs, const SelectionVars &sels,
+                const CpSolverResponse &from) {
   model.ClearHints();
   for (Operation *op : ops)
     model.AddHint(startVars.at(op),
                   SolutionIntegerValue(from, startVars.at(op)));
   for (const AllocationVar &alloc : allocs)
     model.AddHint(alloc.units, SolutionIntegerValue(from, alloc.units));
+  for (const SmallVector<BoolVar, 2> &row : sels.sel)
+    for (const BoolVar &var : row)
+      model.AddHint(var, SolutionBooleanValue(from, var));
 }
 
 /// What \p decided costs the device: every resource, at the price of the count
@@ -507,10 +709,18 @@ void reportUnsolved(Problem &prob, const CpSolverResponse &response,
 /// within one iteration a window of length L touches `min(L, ii)` congruence
 /// classes, each admitting `limit` units from that iteration, and work above
 /// `ii * limit` is an interval `computeResMinII` already ruled out.
+///
+/// \p latencyOf must under-approximate every latency the model can decide
+/// (the least candidate of a decided realization), or the floor cuts the
+/// optimum.
 template <typename ProblemT>
 int64_t drainFloor(ProblemT &prob, ArrayRef<Problem::Dependence> breaks,
-                   ArrayRef<DrainTerm> terms) {
+                   ArrayRef<DrainTerm> terms,
+                   llvm::function_ref<int64_t(Operation *)> latencyOf) {
   constexpr int64_t kUnreached = std::numeric_limits<int64_t>::min();
+  auto offsetOf = [&](const DrainTerm &term) {
+    return term.offset + (term.plusLatency ? latencyOf(term.op) : 0);
+  };
 
   // The edges the model imposes, weighted as it weights them, in both
   // directions: heads are read off one end and tails off the other. Only the
@@ -527,12 +737,11 @@ int64_t drainFloor(ProblemT &prob, ArrayRef<Problem::Dependence> breaks,
       if constexpr (std::is_same_v<ProblemT, ChainingModuloProblem>)
         if (prob.getDistance(dep).value_or(0) != 0)
           continue;
-      edge(dep.getSource(), op, prob.latencyOf(dep.getSource()));
+      edge(dep.getSource(), op, latencyOf(dep.getSource()));
     }
   // A chain break is intra-iteration whichever problem this is.
   for (const auto &dep : breaks)
-    edge(dep.getSource(), dep.getDestination(),
-         prob.latencyOf(dep.getSource()) + 1);
+    edge(dep.getSource(), dep.getDestination(), latencyOf(dep.getSource()) + 1);
 
   // Longest path in, memoized; the seeded zero keeps a cycle from recursing
   // forever if the distance-0 subgraph were ever not acyclic.
@@ -553,7 +762,7 @@ int64_t drainFloor(ProblemT &prob, ArrayRef<Problem::Dependence> breaks,
 
   int64_t bound = 0;
   for (const DrainTerm &term : terms)
-    bound = std::max(bound, head(head, term.op) + term.offset);
+    bound = std::max(bound, head(head, term.op) + offsetOf(term));
 
   SmallVector<std::pair<Problem::ResourceType, int64_t>> capped;
   for (Problem::ResourceType rsrc : prob.getResourceTypes())
@@ -621,7 +830,7 @@ int64_t drainFloor(ProblemT &prob, ArrayRef<Problem::Dependence> breaks,
         group.push_back({head(head, op), onward, prob.getResourceDemand(op)});
       }
       if (!group.empty())
-        bound = std::max(bound, strongest(group, limit) + term.offset);
+        bound = std::max(bound, strongest(group, limit) + offsetOf(term));
     }
   }
 
@@ -655,7 +864,8 @@ int64_t drainFloor(ProblemT &prob, ArrayRef<Problem::Dependence> breaks,
 /// branch and bound. Two solves on one model: the first minimizes the drain
 /// alone, the second minimizes the area under the drain the first settled, so
 /// a budget that runs short is spent proving the span before polishing the
-/// area.
+/// area. Both decide which row realizes an operation the device offers
+/// several for (`selectionChoices`), alongside its start time.
 LogicalResult mlir::allo::scheduleCPSAT(ChainingSharedOperatorsProblem &prob,
                                         Operation *lastOp, float cycleTime,
                                         const SpanObjective &span,
@@ -667,32 +877,51 @@ LogicalResult mlir::allo::scheduleCPSAT(ChainingSharedOperatorsProblem &prob,
           mlir::allo::scheduleSimplex(prob, lastOp, cycleTime, opts.regFloor)))
     return failure();
 
+  // Which row realizes each multi-candidate operation is this solve's
+  // decision too, made alongside the start times.
+  SmallVector<SelectionChoice, 0> choices = selectionChoices(prob, span.device);
+
   // The pre-pass is schedule-independent, so taking its edges hands CP-SAT the
-  // chain breaks the heuristic just used.
-  SmallVector<Problem::Dependence> breaks =
-      chainBreaksFor(prob, cycleTime, opts.regFloor);
+  // chain breaks the heuristic just used. They state the period only for the
+  // rows the library picked, so a model that re-decides rows drops them and
+  // states the period through the sub-cycle system instead.
+  SmallVector<Problem::Dependence> breaks;
+  if (choices.empty())
+    breaks = chainBreaksFor(prob, cycleTime, opts.regFloor);
 
   const auto &ops = prob.getOperations();
+
+  DenseMap<Operation *, std::pair<int64_t, int64_t>> latRange =
+      latencyRange(choices);
+  auto minLat = [&](Operation *op) -> int64_t {
+    auto it = latRange.find(op);
+    return it != latRange.end() ? it->second.first : prob.latencyOf(op);
+  };
+  auto maxLat = [&](Operation *op) -> int64_t {
+    auto it = latRange.find(op);
+    return it != latRange.end() ? it->second.second : prob.latencyOf(op);
+  };
 
   // The same entry cut the cyclic search takes, at the one interval a
   // straight-line region has: reaching `drainFloor` proves this schedule is as
   // short as the region gets and leaves only the area to decide.
   // `scheduleSimplex` has written the start times and their sub-cycle offsets,
-  // so its schedule ships as is. An allocation still to decide is worth the
-  // solve anyway.
-  int64_t floorDrain = drainFloor(prob, breaks, span.drain);
+  // so its schedule ships as is. An allocation or a realization still to
+  // decide is worth the solve anyway.
+  int64_t floorDrain = drainFloor(prob, breaks, span.drain, minLat);
   bool allocates = false;
   for (Problem::ResourceType rsrc : prob.getResourceTypes())
     allocates |= prob.getAllocatable(rsrc).has_value();
-  if (!allocates && floorDrain >= span.drainOf(prob))
+  if (!allocates && choices.empty() && floorDrain >= span.drainOf(prob))
     return success();
 
   // Horizon: the whole region laid out end to end (each op after the previous
-  // one's end, its occupancy window, plus a spare cycle), wide enough that
-  // every precedence, chain break and reservation is satisfiable.
+  // one's end at its longest realization, its occupancy window, plus a spare
+  // cycle), wide enough that every precedence, chain break and reservation is
+  // satisfiable whatever rows are decided.
   int64_t horizon = 0;
   for (Operation *op : ops)
-    horizon += prob.latencyOf(op) + prob.getResourceCycles(op) + 1;
+    horizon += maxLat(op) + prob.getResourceCycles(op) + 1;
 
   CpModelBuilder model;
   DenseMap<Operation *, IntVar> startVars;
@@ -706,15 +935,25 @@ LogicalResult mlir::allo::scheduleCPSAT(ChainingSharedOperatorsProblem &prob,
     startVars.try_emplace(op, var);
     orderedStarts.push_back(var);
   }
+  SelectionVars sels = addSelection(model, choices);
+  auto latExpr = [&](Operation *op) -> LinearExpr {
+    if (std::optional<unsigned> i = sels.of(op))
+      return sels.latency(*i);
+    return LinearExpr(prob.latencyOf(op));
+  };
 
   // Precedence, as `buildTableau` emits it: a dependence separates its
-  // endpoints by the source's latency.
+  // endpoints by the source's latency, decided or fixed.
   for (Operation *op : ops)
     for (auto &dep : prob.getDependences(op))
       model.AddLessOrEqual(startVars.at(dep.getSource()) +
-                               prob.latencyOf(dep.getSource()),
+                               latExpr(dep.getSource()),
                            startVars.at(dep.getDestination()));
   addChainBreaks(model, prob, startVars, breaks);
+  DenseMap<Operation *, IntVar> inCycle;
+  if (!sels.empty())
+    inCycle = addSubCycleTimes(model, prob, startVars, cycleTime, opts.regFloor,
+                               &sels);
 
   // An op occupies one instance of every unit it links to for its whole window,
   // so a cumulative constraint per resource matches `verifyOccupancy`. A
@@ -739,7 +978,7 @@ LogicalResult mlir::allo::scheduleCPSAT(ChainingSharedOperatorsProblem &prob,
   for (const AllocationVar &alloc : allocs)
     cumulativeOn(alloc.rsrc, alloc.units);
   addAllocationHeadroom(model, prob, startVars, allocs, cycleTime,
-                        opts.regFloor);
+                        opts.regFloor, sels.empty() ? nullptr : &inCycle);
 
   // What the region is charged, bounded by what the heuristic already reached
   // and below by the floor, which speeds the span proof.
@@ -751,8 +990,8 @@ LogicalResult mlir::allo::scheduleCPSAT(ChainingSharedOperatorsProblem &prob,
   assert(floorDrain <= heuristicDrain &&
          "the drain floor is a lower bound on every schedule, the heuristic's "
          "included");
-  IntVar drain =
-      drainVariable(model, startVars, span.drain, horizon, heuristicDrain);
+  IntVar drain = drainVariable(model, startVars, span.drain, horizon,
+                               heuristicDrain, latExpr);
   model.AddGreaterOrEqual(drain, floorDrain);
 
   // The span solve, skipped where the floor already proves the heuristic's
@@ -779,11 +1018,11 @@ LogicalResult mlir::allo::scheduleCPSAT(ChainingSharedOperatorsProblem &prob,
   // The area solve, under the span the first settled, on what is left of the
   // budget.
   model.AddLessOrEqual(drain, solvedDrain);
-  minimizeArea(model, orderedStarts, span, startVars, allocs, /*ii=*/0,
-               horizon);
+  minimizeArea(model, orderedStarts, span, startVars, allocs, /*ii=*/0, horizon,
+               latExpr, sels);
   SchedulerOptions rest = opts;
   if (ranFirst) {
-    rehintFrom(model, ops.getArrayRef(), startVars, allocs, first);
+    rehintFrom(model, ops.getArrayRef(), startVars, allocs, sels, first);
     rest.budget = std::max(opts.budget - first.deterministic_time(), 0.0);
   }
   CpSolverResponse second =
@@ -816,6 +1055,8 @@ LogicalResult mlir::allo::scheduleCPSAT(ChainingSharedOperatorsProblem &prob,
 
   for (Operation *op : ops)
     prob.setStartTime(op, SolutionIntegerValue(pick, startVars.at(op)));
+  if (!sels.empty())
+    applySelection(prob, choices, readSelection(pick, sels));
   applyAllocation(prob, readAllocation(pick, allocs), /*ii=*/0);
   return finishSchedule(prob, cycleTime, opts.regFloor);
 }
@@ -847,14 +1088,19 @@ enum class ModuloOutcome { Scheduled, Infeasible, Exhausted };
 /// \p drainBound is the incumbent's, so INFEASIBLE here means nothing beats
 /// the incumbent at this II rather than a proof the interval is impossible.
 /// \p floorDrain is `drainFloor`'s bound, valid at every interval.
+///
+/// \p choices are the realization decisions this model carries (empty
+/// \p breaks then, the period stated through the sub-cycle system); \p chosen
+/// receives the candidate settled per choice.
 ModuloOutcome solveAtII(ChainingModuloProblem &prob, Operation *lastOp,
-                        ArrayRef<Problem::Dependence> breaks, float cycleTime,
+                        ArrayRef<Problem::Dependence> breaks,
+                        ArrayRef<SelectionChoice> choices, float cycleTime,
                         const SpanObjective &span, const SchedulerOptions &opts,
                         std::optional<int64_t> drainBound, int64_t floorDrain,
                         unsigned ii, unsigned horizon, bool hint,
                         DenseMap<Operation *, unsigned> &starts,
-                        Allocated &decided, bool &spanProven, bool &areaProven,
-                        int64_t &drain) {
+                        Allocated &decided, SmallVector<unsigned> &chosen,
+                        bool &spanProven, bool &areaProven, int64_t &drain) {
   const auto &ops = prob.getOperations();
 
   CpModelBuilder model;
@@ -871,6 +1117,12 @@ ModuloOutcome solveAtII(ChainingModuloProblem &prob, Operation *lastOp,
       anchorIndex = orderedStarts.size();
     orderedStarts.push_back(var);
   }
+  SelectionVars sels = addSelection(model, choices);
+  auto latExpr = [&](Operation *op) -> LinearExpr {
+    if (std::optional<unsigned> i = sels.of(op))
+      return sels.latency(*i);
+    return LinearExpr(prob.latencyOf(op));
+  };
 
   // Precedence. An edge spanning `distance` iterations is relaxed by one II
   // per iteration it spans, matching the cyclic constraint row `buildTableau`
@@ -878,13 +1130,16 @@ ModuloOutcome solveAtII(ChainingModuloProblem &prob, Operation *lastOp,
   for (Operation *op : ops)
     for (auto &dep : prob.getDependences(op)) {
       Operation *src = dep.getSource();
-      int64_t separation =
-          prob.latencyOf(src) -
-          static_cast<int64_t>(ii) * prob.getDistance(dep).value_or(0);
-      model.AddLessOrEqual(startVars.at(src) + separation,
+      model.AddLessOrEqual(startVars.at(src) + latExpr(src) -
+                               static_cast<int64_t>(ii) *
+                                   prob.getDistance(dep).value_or(0),
                            startVars.at(dep.getDestination()));
     }
   addChainBreaks(model, prob, startVars, breaks);
+  DenseMap<Operation *, IntVar> inCycle;
+  if (!sels.empty())
+    inCycle = addSubCycleTimes(model, prob, startVars, cycleTime, opts.regFloor,
+                               &sels);
 
   // One-hot congruence class per contending op. `t = ii*lap + sum(p*slot[p])`
   // defines class and modulo at once with no reification: slot[p] IS membership
@@ -948,14 +1203,15 @@ ModuloOutcome solveAtII(ChainingModuloProblem &prob, Operation *lastOp,
       model.AddLessOrEqual(usesIn(alloc.rsrc, slot), alloc.units);
   }
   addAllocationHeadroom(model, prob, startVars, allocs, cycleTime,
-                        opts.regFloor);
+                        opts.regFloor, sels.empty() ? nullptr : &inCycle);
 
   // `(trip - 1) * ii` is constant at a fixed II, so minimizing the span here is
   // minimizing the drain; the outer search carries the II term. With no span to
   // compose, the anchor's start time takes the primary slot instead.
   std::optional<IntVar> drainVar;
   if (span.trip) {
-    drainVar = drainVariable(model, startVars, span.drain, horizon, drainBound);
+    drainVar = drainVariable(model, startVars, span.drain, horizon, drainBound,
+                             latExpr);
     model.AddGreaterOrEqual(*drainVar, floorDrain);
   }
   IntVar primary = drainVar.value_or(orderedStarts[anchorIndex]);
@@ -974,8 +1230,9 @@ ModuloOutcome solveAtII(ChainingModuloProblem &prob, Operation *lastOp,
   // The area solve, under the span the first settled, on what is left of the
   // budget.
   model.AddLessOrEqual(primary, SolutionIntegerValue(first, primary));
-  minimizeArea(model, orderedStarts, span, startVars, allocs, ii, horizon);
-  rehintFrom(model, ops.getArrayRef(), startVars, allocs, first);
+  minimizeArea(model, orderedStarts, span, startVars, allocs, ii, horizon,
+               latExpr, sels);
+  rehintFrom(model, ops.getArrayRef(), startVars, allocs, sels, first);
   SchedulerOptions rest = opts;
   rest.budget = std::max(opts.budget - first.deterministic_time(), 0.0);
   CpSolverResponse second =
@@ -988,6 +1245,7 @@ ModuloOutcome solveAtII(ChainingModuloProblem &prob, Operation *lastOp,
   for (Operation *op : ops)
     starts[op] = SolutionIntegerValue(pick, startVars.at(op));
   decided = readAllocation(pick, allocs);
+  chosen = readSelection(pick, sels);
   drain = drainVar ? SolutionIntegerValue(pick, *drainVar) : 0;
   return ModuloOutcome::Scheduled;
 }
@@ -1017,20 +1275,37 @@ LogicalResult mlir::allo::scheduleCPSAT(ChainingModuloProblem &prob,
   assert((!warm.placed || greedyII >= warm.lowerBoundII) &&
          "placement only ever grows the II");
 
-  // The heuristic ran the same pre-pass, so the schedule this falls back to
-  // meets the period.
-  SmallVector<Problem::Dependence> breaks =
-      chainBreaksFor(prob, cycleTime, opts.regFloor);
+  // Which row realizes each multi-candidate operation is this solve's
+  // decision too, made alongside the placement at each interval.
+  SmallVector<SelectionChoice, 0> choices = selectionChoices(prob, span.device);
 
-  // Window: region laid out end to end (satisfying precedence and chain breaks)
-  // plus one II per contending op, widened to the heuristic's own reach. Must
-  // be provably sufficient, since INFEASIBLE here counts as proof.
+  // The heuristic ran the same pre-pass, so the schedule this falls back to
+  // meets the period. The edges state the period only for the rows the
+  // library picked, so a model that re-decides rows drops them and states the
+  // period through the sub-cycle system instead.
+  SmallVector<Problem::Dependence> breaks;
+  if (choices.empty())
+    breaks = chainBreaksFor(prob, cycleTime, opts.regFloor);
+
+  DenseMap<Operation *, std::pair<int64_t, int64_t>> latRange =
+      latencyRange(choices);
+  auto minLat = [&](Operation *op) -> int64_t {
+    auto it = latRange.find(op);
+    return it != latRange.end() ? it->second.first : prob.latencyOf(op);
+  };
+
+  // Window: region laid out end to end (satisfying precedence and chain
+  // breaks, at each op's longest realization) plus one II per contending op,
+  // widened to the heuristic's own reach. Must be provably sufficient, since
+  // INFEASIBLE here counts as proof.
   const auto &ops = prob.getOperations();
   int64_t sequential = 0;
   int64_t greedyReach = 0;
   unsigned contending = 0;
   for (Operation *op : ops) {
-    sequential += prob.latencyOf(op) + 1;
+    auto it = latRange.find(op);
+    sequential +=
+        (it != latRange.end() ? it->second.second : prob.latencyOf(op)) + 1;
     if (prob.contendsForUnit(op))
       ++contending;
     if (warm.placed)
@@ -1061,7 +1336,8 @@ LogicalResult mlir::allo::scheduleCPSAT(ChainingModuloProblem &prob,
   if (bySpan && warm.placed)
     heuristicSpan = iiWeight * greedyII + span.drainOf(prob);
   std::optional<int64_t> best = heuristicSpan;
-  int64_t floorDrain = bySpan ? drainFloor(prob, breaks, span.drain) : 0;
+  int64_t floorDrain =
+      bySpan ? drainFloor(prob, breaks, span.drain, minLat) : 0;
 
   // Whether this region has an allocation to decide at all, which the cut
   // below admits a span tie for.
@@ -1071,6 +1347,7 @@ LogicalResult mlir::allo::scheduleCPSAT(ChainingModuloProblem &prob,
 
   DenseMap<Operation *, unsigned> bestStarts;
   Allocated bestAllocation;
+  SmallVector<unsigned> bestChosen;
   int64_t bestArea = 0;
   unsigned bestII = 0;
   bool bestSpanProven = false;
@@ -1081,8 +1358,10 @@ LogicalResult mlir::allo::scheduleCPSAT(ChainingModuloProblem &prob,
   for (unsigned ii = warm.lowerBoundII; ii <= upperII; ++ii) {
     // Cut: this interval's span already reaches the incumbent's before a
     // single operation is placed, and every later interval is worse. Where an
-    // allocation is decided, admit a tie since it can still win on area.
-    if (best && iiWeight * ii + floorDrain >= *best + (allocates ? 1 : 0))
+    // allocation or a realization is decided, admit a tie since it can still
+    // win on area.
+    if (best && iiWeight * ii + floorDrain >=
+                    *best + ((allocates || !choices.empty()) ? 1 : 0))
       break;
     std::optional<int64_t> drainBound;
     if (best)
@@ -1090,14 +1369,15 @@ LogicalResult mlir::allo::scheduleCPSAT(ChainingModuloProblem &prob,
 
     DenseMap<Operation *, unsigned> starts;
     Allocated decided;
+    SmallVector<unsigned> chosen;
     bool spanProven = false;
     bool areaProven = false;
     int64_t drain = 0;
-    ModuloOutcome outcome =
-        solveAtII(prob, lastOp, breaks, cycleTime, span, opts, drainBound,
-                  bySpan ? floorDrain : 0, ii, window + ii * contending,
-                  /*hint=*/warm.placed && ii == greedyII, starts, decided,
-                  spanProven, areaProven, drain);
+    ModuloOutcome outcome = solveAtII(
+        prob, lastOp, breaks, choices, cycleTime, span, opts, drainBound,
+        bySpan ? floorDrain : 0, ii, window + ii * contending,
+        /*hint=*/warm.placed && ii == greedyII, starts, decided, chosen,
+        spanProven, areaProven, drain);
     if (outcome == ModuloOutcome::Infeasible) {
       // INFEASIBLE is a proof only where nothing bounded the solve; under the
       // incumbent's bound it is the weaker "nothing here beats it".
@@ -1113,9 +1393,10 @@ LogicalResult mlir::allo::scheduleCPSAT(ChainingModuloProblem &prob,
       break;
     }
     // Adopt on a strict improvement, or on the first exact schedule at all.
-    // Improvement is lexicographic: span first, then the instances built.
+    // Improvement is lexicographic: span first, then the instances built and
+    // the rows decided.
     int64_t solved = iiWeight * ii + drain;
-    int64_t area = areaOf(prob, decided);
+    int64_t area = areaOf(prob, decided) + selectionPrice(choices, chosen);
     if (!adopted || solved < *best || (solved == *best && area < bestArea)) {
       best = solved;
       bestArea = area;
@@ -1124,6 +1405,7 @@ LogicalResult mlir::allo::scheduleCPSAT(ChainingModuloProblem &prob,
       bestAreaProven = areaProven;
       bestStarts = std::move(starts);
       bestAllocation = std::move(decided);
+      bestChosen = std::move(chosen);
       adopted = true;
     }
     if (!bySpan)
@@ -1163,6 +1445,8 @@ LogicalResult mlir::allo::scheduleCPSAT(ChainingModuloProblem &prob,
   prob.setInitiationInterval(bestII);
   for (Operation *op : ops)
     prob.setStartTime(op, bestStarts.at(op));
+  if (!choices.empty())
+    applySelection(prob, choices, bestChosen);
   applyAllocation(prob, bestAllocation, bestII);
 
   {

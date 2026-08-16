@@ -330,22 +330,27 @@ LogicalResult scheduleSimplex(ChainingSharedOperatorsProblem &prob,
 //===----------------------------------------------------------------------===//
 
 /// One region OUTPUT's contribution to the region's drain: it commits at
-/// `start(op) + offset`. The drain is the max over these (`drainOf`), and the
-/// exact scheduler bounds its own drain variable below by each one, so what a
-/// solve minimizes and what `leafSpan` charges are ONE expression.
+/// `start(op) + offset`, plus the linked operator's latency where
+/// `plusLatency`. A value handed onward commits when it lands, and WHICH row
+/// produces it may itself be a solver decision, so its latency is read off the
+/// problem at composition time rather than baked into the offset.
 struct DrainTerm {
   Operation *op;
   int64_t offset;
+  bool plusLatency = false;
 };
 
 /// The drain of a SOLVED problem: the cycle its deepest output commits.
 inline int64_t drainOf(circt::scheduling::Problem &problem,
                        ArrayRef<DrainTerm> terms) {
   int64_t drain = 0;
-  for (const DrainTerm &term : terms)
-    drain =
-        std::max(drain, static_cast<int64_t>(*problem.getStartTime(term.op)) +
-                            term.offset);
+  for (const DrainTerm &term : terms) {
+    int64_t at =
+        static_cast<int64_t>(*problem.getStartTime(term.op)) + term.offset;
+    if (term.plusLatency)
+      at += *problem.getLatency(*problem.getLinkedOperatorType(term.op));
+    drain = std::max(drain, at);
+  }
   return drain;
 }
 
@@ -367,10 +372,11 @@ inline int64_t drainOf(circt::scheduling::Problem &problem,
 /// chain onto the region's phase: one register holds a tap for a whole
 /// interval, so `depth` cycles of delay are built from `ceil(depth / ii)` of
 /// them (`EmitContext::foldedChain`).
+///
+/// `latency` above is the definer's, read live off the model rather than held
+/// here: which row realizes the definer may itself be a solver decision.
 struct RegisterTerm {
   Operation *def;
-  /// Cycles after `def` issues before the value is readable.
-  int64_t latency;
   /// Flip-flops one cycle of delay costs.
   int64_t width;
   /// Each reader, and the iteration distance its read spans.
@@ -432,7 +438,9 @@ enum class SchedulerKind {
   /// CP-SAT over the same problem: exact under the model. The chain breaks
   /// stay the pre-pass's, which state the period exactly (see
   /// `computeChainBreaks`), so only resource placement differs from the
-  /// heuristic.
+  /// heuristic. Where a device offers several usable rows for one operation,
+  /// which row realizes it is also this solver's decision; the heuristic keeps
+  /// the library's own pick.
   Exact,
 };
 
@@ -462,7 +470,9 @@ struct SchedulerOptions {
   /// (`populateOperatorAllocation`) rather than leave every operation its own.
   /// Only meaningful alongside a binding that folds them: with the trivial
   /// binding the emitter builds one unit per operation anyway. The heuristic
-  /// ignores it.
+  /// ignores it. An operation whose realization the exact solver decides
+  /// (`selectionCandidates`) joins no class either way: it keeps its own
+  /// instance, and bind-time sharing may still fold equal decided rows.
   bool allocate = false;
   int workers = kDefaultSolveWorkers;
   int seed = kDefaultSolveSeed;
