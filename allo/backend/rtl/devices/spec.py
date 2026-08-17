@@ -179,7 +179,9 @@ class IPRow(NamedTuple):
 
     Several rows of one archetype are candidates the library chooses between.
     ``mnemonic`` overrides the stem of the symbol so two rows sharing a latency
-    are named apart; ``None`` takes the archetype's own.
+    are named apart; ``None`` takes the archetype's own. ``area`` splits
+    state-holding LUT sites (a core's internal shift registers) into
+    ``slicem_lut``, apart from the ``lut`` logic sites.
     """
 
     latency: int

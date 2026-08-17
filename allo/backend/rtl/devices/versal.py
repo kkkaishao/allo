@@ -141,22 +141,23 @@ SCATTER_STORAGE = "register"
 #: row is that core's achieved Fmax in MHz, a record of the characterization run
 #: and not an input to the cost model. Several rows under one archetype declare
 #: several cores for the library to choose between; every row closes at the
-#: part's default frequency.
+#: part's default frequency. ``lut`` is logic sites only: the shift registers a
+#: core holds internally are split out as ``slicem_lut``.
 IP: Mapping[OperatorIP, IPRow | tuple[IPRow, ...]] = {
-    ip.fadd: IPRow(7, {"lut": 330, "ff": 238, "dsp": 2, "carry8": 10}),  # 436
-    ip.fsub: IPRow(7, {"lut": 330, "ff": 238, "dsp": 2, "carry8": 10}),  # 436
-    ip.fmul: IPRow(4, {"lut": 168, "ff": 109, "dsp": 2, "carry8": 9}),  # 502
-    ip.fdiv: IPRow(16, {"lut": 1490, "ff": 699, "carry8": 111}),  # 452
+    ip.fadd: IPRow(7, {"lut": 317, "slicem_lut": 13, "ff": 238, "dsp": 2, "carry8": 10}),  # 436
+    ip.fsub: IPRow(7, {"lut": 317, "slicem_lut": 13, "ff": 238, "dsp": 2, "carry8": 10}),  # 436
+    ip.fmul: IPRow(4, {"lut": 167, "slicem_lut": 1, "ff": 109, "dsp": 2, "carry8": 9}),  # 502
+    ip.fdiv: IPRow(16, {"lut": 1451, "slicem_lut": 39, "ff": 699, "carry8": 111}),  # 452
     ip.fcmp: IPRow(1, {"lut": 105, "ff": 2, "carry8": 7}),  # 502
-    ip.dadd: IPRow(14, {"lut": 954, "ff": 861, "dsp": 3, "carry8": 26}),  # 502
-    ip.dsub: IPRow(14, {"lut": 954, "ff": 861, "dsp": 3, "carry8": 26}),  # 502
-    ip.dmul: IPRow(9, {"lut": 360, "ff": 397, "dsp": 7, "carry8": 15}),  # 531
-    ip.ddiv: IPRow(32, {"lut": 6288, "ff": 3027, "carry8": 396}),  # 388
+    ip.dadd: IPRow(14, {"lut": 864, "slicem_lut": 90, "ff": 861, "dsp": 3, "carry8": 26}),  # 502
+    ip.dsub: IPRow(14, {"lut": 864, "slicem_lut": 90, "ff": 861, "dsp": 3, "carry8": 26}),  # 502
+    ip.dmul: IPRow(9, {"lut": 298, "slicem_lut": 62, "ff": 397, "dsp": 7, "carry8": 15}),  # 531
+    ip.ddiv: IPRow(32, {"lut": 6216, "slicem_lut": 72, "ff": 3027, "carry8": 396}),  # 388
     ip.dcmp: IPRow(1, {"lut": 197, "ff": 2, "carry8": 12}),  # 456
-    ip.bfadd: IPRow(4, {"lut": 251, "ff": 118, "carry8": 12}),  # 440
-    ip.bfsub: IPRow(4, {"lut": 251, "ff": 118, "carry8": 12}),  # 440
+    ip.bfadd: IPRow(4, {"lut": 250, "slicem_lut": 1, "ff": 118, "carry8": 12}),  # 440
+    ip.bfsub: IPRow(4, {"lut": 250, "slicem_lut": 1, "ff": 118, "carry8": 12}),  # 440
     ip.bfmul: IPRow(2, {"lut": 91, "ff": 34, "dsp": 1, "carry8": 6}),  # 482
-    ip.i2f: IPRow(3, {"lut": 244, "ff": 99, "carry8": 11}),  # 478
+    ip.i2f: IPRow(3, {"lut": 243, "slicem_lut": 1, "ff": 99, "carry8": 11}),  # 478
     ip.f2i: IPRow(3, {"lut": 222, "ff": 127, "carry8": 6}),  # 612
     ip.fcvt: IPRow(2, {"lut": 54, "ff": 99, "carry8": 1}),  # 787
     ip.bf2f: IPRow(2, {"lut": 36, "ff": 53, "carry8": 1}),  # 792
@@ -165,46 +166,46 @@ IP: Mapping[OperatorIP, IPRow | tuple[IPRow, ...]] = {
         IPRow(1, {"dsp": 1}),  # 470
     ),
     ip.imul32: IPRow(2, {"ff": 32, "dsp": 3}),  # 407
-    ip.imul64: IPRow(3, {"lut": 23, "ff": 64, "dsp": 6}),  # 409
-    ip.idiv8: IPRow(12, {"lut": 212, "ff": 264, "carry8": 18}),  # 737
+    ip.imul64: IPRow(3, {"slicem_lut": 23, "ff": 64, "dsp": 6}),  # 409
+    ip.idiv8: IPRow(12, {"lut": 210, "slicem_lut": 2, "ff": 264, "carry8": 18}),  # 737
     ip.udiv8: (
-        IPRow(12, {"lut": 212, "ff": 264, "carry8": 18}),  # 737
-        IPRow(10, {"lut": 195, "ff": 245, "carry8": 18}),  # 737
+        IPRow(12, {"lut": 210, "slicem_lut": 2, "ff": 264, "carry8": 18}),  # 737
+        IPRow(10, {"lut": 194, "slicem_lut": 1, "ff": 245, "carry8": 18}),  # 737
     ),
-    ip.irem8: IPRow(12, {"lut": 212, "ff": 264, "carry8": 18}),  # 737
+    ip.irem8: IPRow(12, {"lut": 210, "slicem_lut": 2, "ff": 264, "carry8": 18}),  # 737
     ip.urem8: (
-        IPRow(12, {"lut": 212, "ff": 264, "carry8": 18}),  # 737
-        IPRow(10, {"lut": 195, "ff": 245, "carry8": 18}),  # 737
+        IPRow(12, {"lut": 210, "slicem_lut": 2, "ff": 264, "carry8": 18}),  # 737
+        IPRow(10, {"lut": 194, "slicem_lut": 1, "ff": 245, "carry8": 18}),  # 737
     ),
-    ip.idiv16: IPRow(20, {"lut": 675, "ff": 904, "carry8": 55}),  # 672
+    ip.idiv16: IPRow(20, {"lut": 673, "slicem_lut": 2, "ff": 904, "carry8": 55}),  # 672
     ip.udiv16: (
-        IPRow(20, {"lut": 675, "ff": 904, "carry8": 55}),  # 672
-        IPRow(8, {"lut": 643, "ff": 574, "carry8": 51}),  # 378
+        IPRow(20, {"lut": 673, "slicem_lut": 2, "ff": 904, "carry8": 55}),  # 672
+        IPRow(8, {"lut": 642, "slicem_lut": 1, "ff": 574, "carry8": 51}),  # 378
     ),
-    ip.irem16: IPRow(20, {"lut": 675, "ff": 904, "carry8": 55}),  # 672
+    ip.irem16: IPRow(20, {"lut": 673, "slicem_lut": 2, "ff": 904, "carry8": 55}),  # 672
     ip.urem16: (
-        IPRow(20, {"lut": 675, "ff": 904, "carry8": 55}),  # 672
-        IPRow(8, {"lut": 643, "ff": 574, "carry8": 51}),  # 378
+        IPRow(20, {"lut": 673, "slicem_lut": 2, "ff": 904, "carry8": 55}),  # 672
+        IPRow(8, {"lut": 642, "slicem_lut": 1, "ff": 574, "carry8": 51}),  # 378
     ),
-    ip.idiv32: IPRow(36, {"lut": 2372, "ff": 3336, "carry8": 173}),  # 650
+    ip.idiv32: IPRow(36, {"lut": 2368, "slicem_lut": 4, "ff": 3336, "carry8": 173}),  # 650
     ip.udiv32: (
-        IPRow(36, {"lut": 2372, "ff": 3336, "carry8": 173}),  # 650
-        IPRow(16, {"lut": 2307, "ff": 2166, "carry8": 165}),  # 380
+        IPRow(36, {"lut": 2368, "slicem_lut": 4, "ff": 3336, "carry8": 173}),  # 650
+        IPRow(16, {"lut": 2306, "slicem_lut": 1, "ff": 2166, "carry8": 165}),  # 380
     ),
-    ip.irem32: IPRow(36, {"lut": 2372, "ff": 3336, "carry8": 173}),  # 650
+    ip.irem32: IPRow(36, {"lut": 2368, "slicem_lut": 4, "ff": 3336, "carry8": 173}),  # 650
     ip.urem32: (
-        IPRow(36, {"lut": 2372, "ff": 3336, "carry8": 173}),  # 650
-        IPRow(16, {"lut": 2307, "ff": 2166, "carry8": 165}),  # 380
+        IPRow(36, {"lut": 2368, "slicem_lut": 4, "ff": 3336, "carry8": 173}),  # 650
+        IPRow(16, {"lut": 2306, "slicem_lut": 1, "ff": 2166, "carry8": 165}),  # 380
     ),
-    ip.idiv64: IPRow(68, {"lut": 8838, "ff": 12808, "carry8": 601}),  # 528
+    ip.idiv64: IPRow(68, {"lut": 8832, "slicem_lut": 6, "ff": 12808, "carry8": 601}),  # 528
     ip.udiv64: (
-        IPRow(68, {"lut": 8838, "ff": 12808, "carry8": 601}),  # 528
-        IPRow(66, {"lut": 8708, "ff": 12677, "carry8": 585}),  # 550
+        IPRow(68, {"lut": 8832, "slicem_lut": 6, "ff": 12808, "carry8": 601}),  # 528
+        IPRow(66, {"lut": 8706, "slicem_lut": 2, "ff": 12677, "carry8": 585}),  # 550
     ),
-    ip.irem64: IPRow(68, {"lut": 8838, "ff": 12808, "carry8": 601}),  # 528
+    ip.irem64: IPRow(68, {"lut": 8832, "slicem_lut": 6, "ff": 12808, "carry8": 601}),  # 528
     ip.urem64: (
-        IPRow(68, {"lut": 8838, "ff": 12808, "carry8": 601}),  # 528
-        IPRow(66, {"lut": 8708, "ff": 12677, "carry8": 585}),  # 550
+        IPRow(68, {"lut": 8832, "slicem_lut": 6, "ff": 12808, "carry8": 601}),  # 528
+        IPRow(66, {"lut": 8706, "slicem_lut": 2, "ff": 12677, "carry8": 585}),  # 550
     ),
 }
 
