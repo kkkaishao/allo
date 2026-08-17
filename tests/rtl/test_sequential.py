@@ -399,20 +399,24 @@ def test_concurrent_shared_array_access():
         ibw2(A, t)
         ibrd(t, out)
 
-    lw1 = _latency(ibw1)
-    lw2 = _latency(ibw2)
     mod = _to_rtl(ibw_top)
     # Two writers, neither ordered against the other, so no addressed row has a
     # port for each and the buffer is held in registers.
     assert mod.microarch.mem("t").storage == "register"
-    # The reader's span comes from this compile: `t` is registers here and
-    # addressed storage when the child is compiled on its own, and the row is
-    # what times its reads.
-    lrd = next(c.latency for c in mod.microarch.top.calls if c.callee.endswith("ibrd"))
+
+    # Every span comes from this compile: `t` is registers here and addressed
+    # storage when a child is compiled on its own, and the realization is what
+    # times its accesses.
+    def span(name):
+        return next(
+            c.latency for c in mod.microarch.top.calls if c.callee.endswith(name)
+        )
+
     out = np.zeros(16, np.int32)
     r = mod.cosim(A16, out)
     assert np.array_equal(out, np.concatenate([A16[:8] + 1, A16[8:] * 2]) - 3)
-    assert r.cycles == max(lw1, lw2) + lrd  # the writers overlap; the reader waits
+    # The writers overlap; the reader waits.
+    assert r.cycles == max(span("ibw1"), span("ibw2")) + span("ibrd")
 
 
 # Two pure-seq calls on disjoint arrays have no shared-memref dependence, so

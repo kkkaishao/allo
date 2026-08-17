@@ -1089,21 +1089,24 @@ def test_constant_rom_cosim():
         assert out[0] == SQ[x]
 
 
-def test_single_element_constant_table():
-    # The depth-1 ROM edge case: a `hw.aggregate_constant` needs the spare field
-    # too, and the padding must land PAST element 0 (a hw.array indexes element
-    # 0 as its last field, so the initializer is reversed).
+def test_a_padded_constant_table():
+    # The non-power-of-two ROM edge case: the `hw.aggregate_constant` needs
+    # spare fields, and the padding must land PAST the real elements (a
+    # hw.array indexes element 0 as its last field, so the initializer is
+    # reversed). The indices stay variable on purpose: a literal index folds
+    # to the element it names and drops the table outright.
     @kernel
-    def onerom(A: i32[8], B: i32[8]):
-        tbl: i32[1] = [77]
+    def padrom(A: i32[8], B: i32[8]):
+        tbl: i32[3] = [77, 88, 99]
         for i in range(8):
-            B[i] = tbl[0] + A[i]
+            B[i] = tbl[A[i] % 3] + A[i]
 
-    mod = _to_rtl(onerom)
+    mod = _to_rtl(padrom)
     assert "aggregate_constant" in mod.mlir  # a table, not an hlmem
     B = np.zeros(8, np.int32)
     mod.cosim(A8, B)
-    assert np.array_equal(B, 77 + A8)
+    tbl = np.array([77, 88, 99], np.int32)
+    assert np.array_equal(B, tbl[A8 % 3] + A8)
 
 
 def test_constant_table_reads_are_unlimited_port():

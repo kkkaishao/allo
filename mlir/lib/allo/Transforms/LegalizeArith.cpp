@@ -14,6 +14,7 @@
 #include "mlir/Dialect/Arith/Transforms/Passes.h"
 #include "mlir/IR/Matchers.h"
 #include "mlir/Transforms/DialectConversion.h"
+#include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "llvm/ADT/TypeSwitch.h"
 #include "llvm/Support/MathExtras.h"
 
@@ -438,7 +439,7 @@ static Value resizeToType(PatternRewriter &rewriter, Location loc, Value v,
 /// A constant of \p type carrying the low bits of \p k.
 static Value konstOf(PatternRewriter &rewriter, Location loc, Type type,
                      uint64_t k) {
-  unsigned w = cast<IntegerType>(type).getWidth();
+  unsigned w = type.isIndex() ? 64 : cast<IntegerType>(type).getWidth();
   return arith::ConstantOp::create(rewriter, loc,
                                    IntegerAttr::get(type, APInt(w, k)))
       .getResult();
@@ -587,6 +588,132 @@ struct MagicRemSI : MagicBase<arith::RemSIOp> {
   }
 };
 
+//===----------------------------------------------------------------------===//
+// Constant tables and constant multiplies -> wiring and shift-adds.
+//===----------------------------------------------------------------------===//
+
+/// The element a constant-table read at literal indices names, or nullopt
+/// where the read stays a real access (a variable index, an uninitialized or
+/// written array, an out-of-range literal).
+static std::optional<TypedAttr> constantTableElement(affine::AffineLoadOp op) {
+  std::optional<Attribute> init = globalInitOf(op.getMemRef());
+  if (!init || !isConstantTable(op.getMemRef()))
+    return std::nullopt;
+  auto dense = dyn_cast<DenseElementsAttr>(*init);
+  if (!dense)
+    return std::nullopt;
+  SmallVector<Attribute> operands;
+  for (Value idx : op.getMapOperands()) {
+    APInt cst;
+    if (!matchPattern(idx, m_ConstantInt(&cst)))
+      return std::nullopt;
+    operands.push_back(IntegerAttr::get(IndexType::get(op.getContext()),
+                                        cst.getSExtValue()));
+  }
+  SmallVector<Attribute> indices;
+  if (failed(op.getAffineMap().constantFold(operands, indices)))
+    return std::nullopt;
+  int64_t flat = 0;
+  for (auto [attr, dim] :
+       llvm::zip(indices, op.getMemRefType().getShape())) {
+    int64_t i = cast<IntegerAttr>(attr).getInt();
+    if (i < 0 || i >= dim)
+      return std::nullopt;
+    flat = flat * dim + i;
+  }
+  Type et = dense.getElementType();
+  if (isa<IntegerType>(et))
+    return IntegerAttr::get(et, dense.getValues<APInt>()[flat]);
+  if (isa<FloatType>(et))
+    return FloatAttr::get(et, dense.getValues<APFloat>()[flat]);
+  return std::nullopt;
+}
+
+struct FoldConstantTableRead : OpRewritePattern<affine::AffineLoadOp> {
+  using OpRewritePattern::OpRewritePattern;
+  LogicalResult matchAndRewrite(affine::AffineLoadOp op,
+                                PatternRewriter &rewriter) const override {
+    std::optional<TypedAttr> elem = constantTableElement(op);
+    if (!elem)
+      return failure();
+    rewriter.replaceOpWithNewOp<arith::ConstantOp>(op, *elem);
+    return success();
+  }
+};
+
+/// One nonzero digit of a literal factor's non-adjacent form.
+struct NafDigit {
+  unsigned shift;
+  bool negative;
+};
+
+/// The shift-add recoding of `op`'s literal factor, where the network is small
+/// enough to beat a multiplier. Digits at or above the factor's width
+/// contribute nothing modulo two to that width and are dropped, which keeps
+/// the recoding exact for either sign; a wider factor keeps its multiplier,
+/// which a DSP slice serves better than a deep adder tree.
+static std::optional<SmallVector<NafDigit, 5>> nafPlan(Operation *op) {
+  constexpr unsigned kMaxNafAdders = 3;
+  if (!isa<IntegerType, IndexType>(op->getResult(0).getType()))
+    return std::nullopt;
+  APInt cst;
+  if (!matchPattern(op->getOperand(1), m_ConstantInt(&cst)))
+    return std::nullopt;
+  unsigned width = cst.getBitWidth();
+  SmallVector<NafDigit, 5> digits;
+  APInt v = cst.sext(width + 2);
+  for (unsigned i = 0; !v.isZero(); ++i, v.ashrInPlace(1)) {
+    if (!v[0])
+      continue;
+    bool neg = v[1]; // v = 3 mod 4 takes digit -1 so the next digit is zero
+    if (i < width)
+      digits.push_back({i, neg});
+    if (neg)
+      v += 1;
+    else
+      v -= 1;
+  }
+  if (digits.empty())
+    return std::nullopt; // a zero factor is the folder's, not a network
+  bool positive = llvm::any_of(digits, [](NafDigit d) { return !d.negative; });
+  if (digits.size() - 1 + (positive ? 0 : 1) > kMaxNafAdders)
+    return std::nullopt;
+  return digits;
+}
+
+struct NafConstMul : OpRewritePattern<arith::MulIOp> {
+  using OpRewritePattern::OpRewritePattern;
+  LogicalResult matchAndRewrite(arith::MulIOp op,
+                                PatternRewriter &rewriter) const override {
+    std::optional<SmallVector<NafDigit, 5>> plan = nafPlan(op);
+    if (!plan)
+      return failure();
+    Location loc = op.getLoc();
+    Value x = op.getLhs();
+    Type ty = op.getType();
+    auto term = [&](NafDigit d) -> Value {
+      if (d.shift == 0)
+        return x;
+      return arith::ShLIOp::create(rewriter, loc, x,
+                                   konstOf(rewriter, loc, ty, d.shift));
+    };
+    // Positive digits first, so the accumulator starts without a negate; a
+    // factor with none starts the subtractions from zero.
+    Value acc;
+    for (NafDigit d : *plan)
+      if (!d.negative)
+        acc = acc ? Value(arith::AddIOp::create(rewriter, loc, acc, term(d)))
+                  : term(d);
+    if (!acc)
+      acc = konstOf(rewriter, loc, ty, 0);
+    for (NafDigit d : *plan)
+      if (d.negative)
+        acc = arith::SubIOp::create(rewriter, loc, acc, term(d));
+    rewriter.replaceOp(op, acc);
+    return success();
+  }
+};
+
 // The RTL-path, device-IP-aware replacement for `arith-expand`. A composite
 // arith op the device can realize directly (a matching `dcp.operator`) is KEPT,
 // so the scheduler binds it to that IP; every other one is EXPANDED into
@@ -606,18 +733,29 @@ struct LegalizeArithPass
     // multiply would not fit. With no period stated every typed division
     // stays on its IP; an index division has no IP and expands regardless.
     unsigned maxMulWidth = 0;
-    if (expandConstDiv && periodNs > 0.0)
+    if (expandConstArith && periodNs > 0.0)
       for (unsigned w = 2; w <= 129; ++w)
         if (std::optional<double> delay = lib.measuredCombDelay(OpKind::Mul, w))
           if (*delay <= periodNs)
             maxMulWidth = w;
+
+    // Table reads at literal indices fold to a fixpoint first, so a multiply
+    // sees its literal factor before it is judged: the conversion below visits
+    // each op once, which is too early for an operand another rewrite
+    // constant-folds.
+    RewritePatternSet folds(&getContext());
+    folds.add<FoldConstantTableRead>(&getContext());
+    if (expandConstArith)
+      folds.add<NafConstMul>(&getContext());
+    if (failed(applyPatternsGreedily(module, std::move(folds))))
+      return signalPassFailure();
 
     // Reuse the upstream expansion patterns
     RewritePatternSet patterns(&getContext());
     arith::populateArithExpandOpsPatterns(patterns);
     patterns.add<LowerBitGetSlice, LowerBitSetSlice, ReduceDivUI, ReduceRemUI,
                  ReduceDivSI, ReduceRemSI>(&getContext());
-    if (expandConstDiv)
+    if (expandConstArith)
       patterns.add<MagicDivUI, MagicRemUI, MagicDivSI, MagicRemSI>(
           &getContext(), maxMulWidth);
 
@@ -640,7 +778,7 @@ struct LegalizeArithPass
     // either; a constant one the reciprocal patterns plan for goes to them
     // when the flag asks. Every other divisor stays and is bound to a device
     // core or priced as a divider.
-    bool expand = expandConstDiv;
+    bool expand = expandConstArith;
     target.addDynamicallyLegalOp<arith::DivUIOp, arith::RemUIOp>(
         [expand, maxMulWidth](Operation *op) {
           if (powerOfTwoDivisor(op->getOperand(1)))

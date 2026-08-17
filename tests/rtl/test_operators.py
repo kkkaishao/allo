@@ -2275,6 +2275,64 @@ def test_a_typed_constant_division_expands_where_the_multiply_fits():
     ] == ["divui_u32_u32_u32_l16"]
 
 
+# A constant table read at literal indices folds to the element it names, and
+# a multiply by a small literal recodes to that constant's shift-add network:
+# a 3-tap filter builds no multiplier, no DSP and no table.
+def test_a_constant_table_coefficient_multiply_is_shift_adds():
+    taps = np.array([3, 10, 3], np.int32)
+
+    @kernel
+    def fir(A: i32[64], out: i32[64]):
+        w: i32[3] = taps
+        for i in range(62):
+            out[i] = A[i] * w[0] + A[i + 1] * w[1] + A[i + 2] * w[2]
+
+    rtl = _to_rtl(fir)
+    rtl.schedule()
+    rtl.compile()
+    assert not [
+        op.impl for iface in rtl.interfaces.values() for op in iface.operators
+    ]
+    assert rtl.estimation.area.dsp == 0
+    assert not [
+        m for f in rtl.microarch.funcs for m in f.mems if m.realization == "rom"
+    ]
+    A = (np.arange(64, dtype=np.int32) - 32) * 7
+    out = np.zeros(64, np.int32)
+    rtl.cosim(A, out)
+    golden = np.zeros(64, np.int32)
+    golden[:62] = A[:62] * 3 + A[1:63] * 10 + A[2:64] * 3
+    assert np.array_equal(out, golden)
+
+
+# The recoding is exact for either sign of the factor; a factor whose
+# non-adjacent form needs more than three add/subs keeps the multiplier IP,
+# which a DSP slice serves better than a deep adder tree.
+def test_a_small_constant_multiply_recodes_and_a_wide_one_keeps_the_ip():
+    @kernel
+    def scale(A: i32[32], b: i32[32], c: i32[32], d: i32[32]):
+        for i in range(32):
+            b[i] = A[i] * 6
+            c[i] = A[i] * -5
+            d[i] = A[i] * 341
+
+    rtl = _to_rtl(scale)
+    rtl.schedule()
+    rtl.compile()
+    impls = [
+        op.impl for iface in rtl.interfaces.values() for op in iface.operators
+    ]
+    assert len(impls) == 1 and impls[0].startswith("mul_i32")
+    A = (np.arange(32, dtype=np.int32) - 16) * 1000
+    b = np.zeros(32, np.int32)
+    c = np.zeros(32, np.int32)
+    d = np.zeros(32, np.int32)
+    rtl.cosim(A, b, c, d)
+    assert np.array_equal(b, A * 6)
+    assert np.array_equal(c, A * -5)
+    assert np.array_equal(d, A * 341)
+
+
 # The map is ONE operator: a division cone past the clock period has no seam a
 # register could land on, so the scheduler lowers the clock to fit it whole
 # and reports the achieved period.

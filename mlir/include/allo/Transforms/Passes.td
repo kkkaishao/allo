@@ -584,21 +584,33 @@ def LegalizeArithPass : Pass<"legalize-arith", "ModuleOp"> {
     injected `dcp.operator` / `dcp.device` IR, so this pass must run after operator
     injection and before scheduling.
 
-    Under `expand-const-div`, a `divsi`/`divui`/`remsi`/`remui` by a constant
-    that is not a power of two is reduced to a reciprocal multiply and shift,
-    a signed one with the sign carried around the magnitude's multiply. An
-    index op expands regardless: it carries no width for an IP signature to
-    match, so it would otherwise be priced as a full combinational divider,
-    one operator no register can split. A typed op has a divider IP to fall
-    back on, so it expands only where the product multiply fits the clock
-    period stated in `period-ns`, and keeps the IP everywhere else. The
+    A read of a constant table (an initialized, never-written `memref.global`)
+    at literal indices folds to the element it names: after unrolling, a
+    filter's coefficient reads all take this shape, and the fold is what lets
+    a multiply see its literal factor. A table some variable read still
+    addresses keeps its storage for those reads.
+
+    Under `expand-const-arith`, a `divsi`/`divui`/`remsi`/`remui` by a
+    constant that is not a power of two is reduced to a reciprocal multiply
+    and shift, a signed one with the sign carried around the magnitude's
+    multiply. An index op expands regardless: it carries no width for an IP
+    signature to match, so it would otherwise be priced as a full
+    combinational divider, one operator no register can split. A typed op has
+    a divider IP to fall back on, so it expands only where the product
+    multiply fits the clock period stated in `period-ns`, and keeps the IP
+    everywhere else. Under the same flag, a `muli` by a literal whose
+    non-adjacent form takes at most three add/subs recodes into that
+    shift-add network, exact modulo the result width for either sign; the
+    shifts are by literals and so are wiring. A wider factor keeps its
+    multiplier, which a DSP slice serves better than a deep adder tree. The
     pipeline sets the flag only on its second run: before subscripts are
-    raised to affine maps, a division under an access still has the chance to
-    become a carried register digit.
+    raised to affine maps, arithmetic under an access still has the chance to
+    become a carried register digit or part of an affine map.
   }];
-  let options = [Option<"expandConstDiv", "expand-const-div", "bool", "false",
+  let options = [Option<"expandConstArith", "expand-const-arith", "bool", "false",
                         "Reduce division by a non-power-of-two constant to a "
-                        "reciprocal multiply and shift">,
+                        "reciprocal multiply and shift, and a multiply by a "
+                        "small constant to its shift-add network">,
                  Option<"periodNs", "period-ns", "double", "0.0",
                         "Clock period a typed reciprocal multiply must fit; "
                         "0 keeps every typed division on its IP">];

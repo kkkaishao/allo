@@ -65,7 +65,7 @@ def run_schedule(
         f"{reassoc},{rotate},narrow-demanded-bits),drop-trivial-func,"
         f"{part},func.func(assign-banks),canonicalize,cse,"
         f"func.func(expand-region-bounds),"
-        f"legalize-arith{{expand-const-div=true period-ns={options.cycle_ns}}},"
+        f"legalize-arith{{expand-const-arith=true period-ns={options.cycle_ns}}},"
         f"canonicalize,cse)"
     )
     run_pipeline(module, pipeline)
