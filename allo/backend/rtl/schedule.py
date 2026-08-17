@@ -64,7 +64,8 @@ def run_schedule(
         f"canonicalize,fold-if-statements,cse,{scalarize},"
         f"{reassoc},{rotate},narrow-demanded-bits),drop-trivial-func,"
         f"{part},func.func(assign-banks),canonicalize,cse,"
-        f"func.func(expand-region-bounds),legalize-arith,canonicalize,cse)"
+        f"func.func(expand-region-bounds),"
+        f"legalize-arith{{expand-const-div=true}},canonicalize,cse)"
     )
     run_pipeline(module, pipeline)
     diagnostics: list[str] = []

@@ -583,7 +583,18 @@ def LegalizeArithPass : Pass<"legalize-arith", "ModuleOp"> {
     native combinational op and need no IP. The keep/expand decision reads the
     injected `dcp.operator` / `dcp.device` IR, so this pass must run after operator
     injection and before scheduling.
+
+    Under `expand-const-div`, an index-typed `divui`/`remui` by a constant that
+    is not a power of two is reduced to a reciprocal multiply and shift. An
+    index op carries no width for an IP signature to match, so it would
+    otherwise be priced as a full combinational divider, one operator no
+    register can split. The pipeline sets the flag only on its second run:
+    before subscripts are raised to affine maps, a division under an access
+    still has the chance to become a carried register digit.
   }];
+  let options = [Option<"expandConstDiv", "expand-const-div", "bool", "false",
+                        "Reduce index-typed division by a non-power-of-two "
+                        "constant to a reciprocal multiply and shift">];
   let dependentDialects = ["mlir::arith::ArithDialect"];
 }
 

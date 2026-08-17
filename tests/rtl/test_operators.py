@@ -1115,9 +1115,7 @@ def test_converged_selections_fold_onto_one_instance():
     def mul_deep(a: wide, b: wide) -> wide: ...
 
     @kernel
-    def mix(
-        a: i32[1], b: i32[1], c: i32[1], d: i32[1], e: i32[1], f: i32[1]
-    ) -> wide:
+    def mix(a: i32[1], b: i32[1], c: i32[1], d: i32[1], e: i32[1], f: i32[1]) -> wide:
         u: wide = a[0]
         u = u + b[0]
         v: wide = c[0]
@@ -2079,8 +2077,7 @@ def test_index_castui_zero_extends():
         casts = [
             op
             for op in _walk(module.operation)
-            if op.name == "arith.index_cast"
-            and str(op.operands[0].type) == "i8"
+            if op.name == "arith.index_cast" and str(op.operands[0].type) == "i8"
         ]
         assert casts, "the i8 subscript lowers through one index_cast"
         for op in casts:
@@ -2213,6 +2210,29 @@ def test_an_apply_is_priced_on_its_simplified_form():
         if u.identity.startswith("apply")
     ]
     assert [(u.adders, u.multipliers, u.dividers) for u in units] == [(1, 0, 0)]
+
+
+# An index division by a non-power-of-two constant is a reciprocal multiply
+# sized by the dividend's proven range, so it schedules at the requested
+# period instead of derating the module for a combinational divider. The
+# typed path is untouched and still binds the device's divider IP.
+def test_a_constant_index_division_is_a_reciprocal_multiply():
+    @kernel
+    def label(out: i32[180], rem: i32[180]):
+        for n in range(180):
+            out[n] = n // 18
+            rem[n] = n % 18
+
+    rtl = _to_rtl(label)
+    sched = rtl.schedule()
+    assert (sched.cycle_ns or PERIOD_NS) == pytest.approx(PERIOD_NS)
+    rtl.compile()
+    assert "comb.divu" not in rtl.mlir and "comb.modu" not in rtl.mlir
+    out = np.zeros(180, np.int32)
+    rem = np.zeros(180, np.int32)
+    rtl.cosim(out, rem)
+    assert np.array_equal(out, np.arange(180) // 18)
+    assert np.array_equal(rem, np.arange(180) % 18)
 
 
 # The map is ONE operator: a division cone past the clock period has no seam a

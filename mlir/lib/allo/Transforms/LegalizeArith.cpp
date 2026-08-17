@@ -4,13 +4,17 @@
  */
 
 #include "allo/IR/AlloOps.h"
+#include "allo/Scheduling/MemoryModel.h" // kIndexWidth
 #include "allo/Scheduling/OperatorLibrary.h"
 #include "allo/Transforms/Passes.h"
 
+#include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Arith/Transforms/Passes.h"
 #include "mlir/IR/Matchers.h"
 #include "mlir/Transforms/DialectConversion.h"
+#include "llvm/ADT/TypeSwitch.h"
+#include "llvm/Support/MathExtras.h"
 
 #include <algorithm>
 
@@ -226,6 +230,219 @@ struct ReduceRemSI : OpRewritePattern<arith::RemSIOp> {
   }
 };
 
+//===----------------------------------------------------------------------===//
+// Constant divisors, general case -> reciprocal multiply.
+//
+// An index-typed operand carries no width, so an index division matches no
+// device IP row and is priced as a full-width combinational divider, one
+// operator no register can split. A constant divisor never needs one:
+// `n divui d` is `(n * M) >> (w + ceil(log2 d))` with `M` the rounded-up
+// reciprocal, exact for every `n` below `2^w`. The dividend's range decides
+// `w`: an induction-variable expression usually proves a narrow bound, and
+// the multiply then fits the clock; anything unbounded falls back to the
+// datapath's index width.
+//===----------------------------------------------------------------------===//
+
+/// Largest value the expression \p v can take, read as unsigned bits: walked
+/// over constants, affine induction variables and the arithmetic an index
+/// expression is built from. nullopt where the walk meets anything it cannot
+/// bound.
+static std::optional<uint64_t> unsignedBound(Value v, unsigned depth = 0) {
+  if (depth > 8)
+    return std::nullopt;
+  APInt cst;
+  if (matchPattern(v, m_ConstantInt(&cst)))
+    return cst.getActiveBits() > 63
+               ? std::nullopt
+               : std::optional<uint64_t>(cst.getZExtValue());
+  if (auto barg = dyn_cast<BlockArgument>(v)) {
+    auto loop = dyn_cast<affine::AffineForOp>(barg.getOwner()->getParentOp());
+    if (loop && barg == loop.getInductionVar() &&
+        loop.hasConstantLowerBound() && loop.hasConstantUpperBound() &&
+        loop.getConstantLowerBound() >= 0 &&
+        loop.getConstantUpperBound() > loop.getConstantLowerBound())
+      return static_cast<uint64_t>(loop.getConstantUpperBound()) - 1;
+    return std::nullopt;
+  }
+  Operation *op = v.getDefiningOp();
+  if (!op)
+    return std::nullopt;
+  auto operand = [&](unsigned k) {
+    return unsignedBound(op->getOperand(k), depth + 1);
+  };
+  // The right operand when it is a constant below 2^63.
+  auto konst = [&]() -> std::optional<uint64_t> {
+    APInt k;
+    if (matchPattern(op->getOperand(1), m_ConstantInt(&k)) &&
+        k.getActiveBits() <= 63)
+      return k.getZExtValue();
+    return std::nullopt;
+  };
+  // Everything the result type can hold: a truncation wraps rather than
+  // clamps, but whatever it wraps to still fits the type.
+  auto typeMax = [&]() -> uint64_t {
+    Type t = op->getResult(0).getType();
+    unsigned w = t.isIndex() ? 64 : t.getIntOrFloatBitWidth();
+    return w >= 64 ? UINT64_MAX : (uint64_t(1) << w) - 1;
+  };
+  return llvm::TypeSwitch<Operation *, std::optional<uint64_t>>(op)
+      .Case<arith::AddIOp>([&](auto) -> std::optional<uint64_t> {
+        auto a = operand(0), b = operand(1);
+        if (!a || !b)
+          return std::nullopt;
+        return llvm::SaturatingAdd(*a, *b);
+      })
+      .Case<arith::MulIOp>([&](auto) -> std::optional<uint64_t> {
+        auto a = operand(0), b = operand(1);
+        if (!a || !b)
+          return std::nullopt;
+        return llvm::SaturatingMultiply(*a, *b);
+      })
+      .Case<arith::ShLIOp>([&](auto) -> std::optional<uint64_t> {
+        auto a = operand(0);
+        auto k = konst();
+        if (!a || !k || *k >= 64)
+          return std::nullopt;
+        return llvm::SaturatingMultiply(*a, uint64_t(1) << *k);
+      })
+      .Case<arith::ShRUIOp>([&](auto) -> std::optional<uint64_t> {
+        auto a = operand(0);
+        auto k = konst();
+        return a && k && *k < 64 ? std::optional<uint64_t>(*a >> *k) : a;
+      })
+      .Case<arith::DivUIOp>([&](auto) -> std::optional<uint64_t> {
+        auto a = operand(0);
+        auto d = konst();
+        return a && d && *d ? std::optional<uint64_t>(*a / *d) : a;
+      })
+      .Case<arith::RemUIOp>([&](auto) -> std::optional<uint64_t> {
+        auto a = operand(0);
+        auto d = konst();
+        if (d && *d)
+          return std::min(a.value_or(UINT64_MAX), *d - 1);
+        return std::nullopt;
+      })
+      .Case<arith::AndIOp>([&](auto) -> std::optional<uint64_t> {
+        auto a = operand(0);
+        auto m = konst();
+        if (m)
+          return std::min(a.value_or(UINT64_MAX), *m);
+        return a;
+      })
+      .Case<arith::SelectOp>([&](auto) -> std::optional<uint64_t> {
+        auto a = unsignedBound(op->getOperand(1), depth + 1);
+        auto b = unsignedBound(op->getOperand(2), depth + 1);
+        if (!a || !b)
+          return std::nullopt;
+        return std::max(*a, *b);
+      })
+      .Case<arith::IndexCastUIOp, arith::ExtUIOp, arith::TruncIOp>(
+          [&](auto) -> std::optional<uint64_t> {
+            return std::min(operand(0).value_or(UINT64_MAX), typeMax());
+          })
+      .Default([](auto) { return std::nullopt; });
+}
+
+/// The divisor when the reciprocal patterns apply: an index-typed op dividing
+/// by a positive constant that is not a power of two. Shared by the patterns
+/// and the conversion target, so what is marked illegal is exactly what
+/// rewrites.
+static std::optional<uint64_t> magicDivisor(Operation *op) {
+  if (!op->getResult(0).getType().isIndex())
+    return std::nullopt;
+  APInt cst;
+  if (!matchPattern(op->getOperand(1), m_ConstantInt(&cst)) ||
+      cst.getActiveBits() > kIndexWidth)
+    return std::nullopt;
+  uint64_t d = cst.getZExtValue();
+  if (d == 0 || llvm::isPowerOf2_64(d))
+    return std::nullopt;
+  return d;
+}
+
+/// Bits of the dividend's proven range, capped at the datapath's index width.
+static unsigned dividendWidth(Value n) {
+  uint64_t bound =
+      std::min<uint64_t>(unsignedBound(n).value_or(UINT64_MAX),
+                         (uint64_t(1) << kIndexWidth) - 1);
+  return bound ? llvm::Log2_64(bound) + 1 : 1;
+}
+
+/// The rounded-up reciprocal: floor(n / d) == (n * magic) >> shift for every
+/// n below 2^w. The multiplier fits w+1 bits.
+static uint64_t magicMultiplier(uint64_t d, unsigned w, unsigned &shift) {
+  shift = w + llvm::Log2_64_Ceil(d);
+  APInt num = APInt::getOneBitSet(shift + 1, shift);
+  return (num + (d - 1)).udiv(APInt(shift + 1, d)).getZExtValue();
+}
+
+/// `(n * magic) >> shift` at the product's width, `2w+1` bits. Only called
+/// with `d <= 2^w - 1`, which keeps the shift below that width.
+static Value magicQuotient(PatternRewriter &rewriter, Location loc, Value n,
+                           uint64_t d, unsigned w) {
+  unsigned shift;
+  uint64_t magic = magicMultiplier(d, w, shift);
+  Type wide = rewriter.getIntegerType(2 * w + 1);
+  auto cst = [&](uint64_t k) {
+    return arith::ConstantOp::create(
+               rewriter, loc,
+               rewriter.getIntegerAttr(wide, static_cast<int64_t>(k)))
+        .getResult();
+  };
+  Value nw = arith::IndexCastUIOp::create(rewriter, loc, wide, n);
+  Value prod = arith::MulIOp::create(rewriter, loc, nw, cst(magic));
+  return arith::ShRUIOp::create(rewriter, loc, prod, cst(shift));
+}
+
+struct MagicDivUI : OpRewritePattern<arith::DivUIOp> {
+  using OpRewritePattern::OpRewritePattern;
+  LogicalResult matchAndRewrite(arith::DivUIOp op,
+                                PatternRewriter &rewriter) const override {
+    std::optional<uint64_t> d = magicDivisor(op);
+    if (!d)
+      return failure();
+    unsigned w = dividendWidth(op.getLhs());
+    if ((uint64_t(1) << w) - 1 < *d) {
+      rewriter.replaceOpWithNewOp<arith::ConstantIndexOp>(op, 0);
+      return success();
+    }
+    Value q = magicQuotient(rewriter, op.getLoc(), op.getLhs(), *d, w);
+    rewriter.replaceOpWithNewOp<arith::IndexCastUIOp>(op, op.getType(), q);
+    return success();
+  }
+};
+
+struct MagicRemUI : OpRewritePattern<arith::RemUIOp> {
+  using OpRewritePattern::OpRewritePattern;
+  LogicalResult matchAndRewrite(arith::RemUIOp op,
+                                PatternRewriter &rewriter) const override {
+    std::optional<uint64_t> d = magicDivisor(op);
+    if (!d)
+      return failure();
+    unsigned w = dividendWidth(op.getLhs());
+    if ((uint64_t(1) << w) - 1 < *d) {
+      rewriter.replaceOp(op, op.getLhs()); // n < d, so the remainder is n
+      return success();
+    }
+    // n - (n floordiv d) * d, all in the dividend's own width: the quotient
+    // times the divisor never exceeds the dividend.
+    Location loc = op.getLoc();
+    Type narrow = rewriter.getIntegerType(w);
+    Value q = arith::TruncIOp::create(
+        rewriter, loc, narrow,
+        magicQuotient(rewriter, loc, op.getLhs(), *d, w));
+    Value n = arith::IndexCastUIOp::create(rewriter, loc, narrow, op.getLhs());
+    Value qd = arith::MulIOp::create(
+        rewriter, loc, q,
+        arith::ConstantOp::create(
+            rewriter, loc,
+            rewriter.getIntegerAttr(narrow, static_cast<int64_t>(*d))));
+    Value r = arith::SubIOp::create(rewriter, loc, n, qd);
+    rewriter.replaceOpWithNewOp<arith::IndexCastUIOp>(op, op.getType(), r);
+    return success();
+  }
+};
+
 // The RTL-path, device-IP-aware replacement for `arith-expand`. A composite
 // arith op the device can realize directly (a matching `dcp.operator`) is KEPT,
 // so the scheduler binds it to that IP; every other one is EXPANDED into
@@ -245,6 +462,8 @@ struct LegalizeArithPass
     arith::populateArithExpandOpsPatterns(patterns);
     patterns.add<LowerBitGetSlice, LowerBitSetSlice, ReduceDivUI, ReduceRemUI,
                  ReduceDivSI, ReduceRemSI>(&getContext());
+    if (expandConstDiv)
+      patterns.add<MagicDivUI, MagicRemUI>(&getContext());
 
     ConversionTarget target(getContext());
     target.addLegalDialect<arith::ArithDialect>();
@@ -264,10 +483,19 @@ struct LegalizeArithPass
     // A power-of-two divisor makes the op a shift, so it does not survive
     // either. Every other divisor stays and is bound to a device core or
     // priced as a divider.
-    target.addDynamicallyLegalOp<arith::DivSIOp, arith::DivUIOp, arith::RemSIOp,
-                                 arith::RemUIOp>([](Operation *op) {
-      return !powerOfTwoDivisor(op->getOperand(1)).has_value();
-    });
+    target.addDynamicallyLegalOp<arith::DivSIOp, arith::RemSIOp>(
+        [](Operation *op) {
+          return !powerOfTwoDivisor(op->getOperand(1)).has_value();
+        });
+    // The unsigned pair additionally loses its index-typed constant-divisor
+    // form to the reciprocal patterns when the flag asks for them.
+    bool expand = expandConstDiv;
+    target.addDynamicallyLegalOp<arith::DivUIOp, arith::RemUIOp>(
+        [expand](Operation *op) {
+          if (powerOfTwoDivisor(op->getOperand(1)))
+            return false;
+          return !(expand && magicDivisor(op));
+        });
 
     if (failed(applyPartialConversion(module, target, std::move(patterns))))
       signalPassFailure();
