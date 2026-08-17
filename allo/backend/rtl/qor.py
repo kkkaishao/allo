@@ -226,13 +226,15 @@ def estimate(report: CompileReport, device: Device = default_device) -> QoR:
     """Price ``report``'s structures against ``device``.
 
     Every module the emission built is priced separately: a design with
-    sub-kernels spends its area in all of them. Validated against real
-    synthesis of four bed kernels, LUT lands between 1.02x and 1.28x and
-    flip-flops between 1.07x and 1.75x of measured, so this is fit to COMPARE
-    two schedules and not to quote as a utilization figure. Structures with no
-    cost row are reported in :attr:`QoR.unmodelled` rather than dropped; the
-    emitter's control glue (run/issue/done logic, memory port muxing) is
-    aggregated away rather than priced structure by structure.
+    sub-kernels spends its area in all of them. Validated against a routed
+    18-design bed sweep: float-datapath designs land within 1.0x to 1.2x of
+    measured on LUT, FF and state sites, while control-heavy designs still
+    over-charge LUT up to ~2.5x (cones, counters and constant operands priced
+    op by op), so this is fit to COMPARE two schedules and not to quote as a
+    utilization figure. Structures with no cost row are reported in
+    :attr:`QoR.unmodelled` rather than dropped; the emitter's control glue
+    (run/issue/done logic, memory port muxing) is aggregated away rather than
+    priced structure by structure.
     """
     price = device.price
     ip_costs = _operator_costs(device)
@@ -340,6 +342,20 @@ def estimate(report: CompileReport, device: Device = default_device) -> QoR:
                     f.func,
                     Utilization.of(price(scatter, (s.depth, s.width))),
                 )
+
+    # The rows count LUT instances; a routed report counts sites after LUT
+    # combining, which is what the device's packing fraction bridges. State
+    # sites do not combine and stay as counted.
+    if device.lut_packing != 1.0:
+
+        def packed(u: Utilization) -> Utilization:
+            logic = round(u.logic_lut * device.lut_packing)
+            return Utilization(
+                logic + u.srl, logic, u.srl, u.ff, u.dsp, u.carry8, u.bram36, u.uram288
+            )
+
+        by_kind = {k: packed(v) for k, v in by_kind.items()}
+        by_func = {k: packed(v) for k, v in by_func.items()}
 
     area = Utilization()
     for spent in by_kind.values():

@@ -381,6 +381,10 @@ class Device:
         # register; the ledger's `reset` flag picks between the two rows.
         self.chain_uses_norst: Spend = ()
         self.storage: dict[str, Storage] = {}
+        # Routed logic sites per modeled LUT: the area rows count LUT instances,
+        # and post-route LUT combining packs several into fewer sites, so an
+        # estimate quoted against a utilization report scales by this.
+        self.lut_packing: float = 1.0
         # The default is a NAME, not a handle: redeclaring a row (a copied
         # device retuned) must not leave it pointing at the replaced one.
         self.default_storage: str | None = None
@@ -748,6 +752,15 @@ class Device:
         self.default_freq_mhz = float(freq_mhz)
         return self
 
+    def set_lut_packing(self, sites_per_lut: float) -> Device:
+        """Routed logic sites per modeled LUT, measured by routing real designs
+        and dividing sites by instances. Scales only the quoted estimate; every
+        comparison between realizations is made in unpacked instances."""
+        if not 0.0 < sites_per_lut <= 1.0:
+            raise ValueError("lut packing is a fraction of instances kept")
+        self.lut_packing = float(sites_per_lut)
+        return self
+
     def add_operator(self, operator: OperatorIP) -> Device:
         """Declare a core this device offers."""
         if not isinstance(operator, OperatorIP):
@@ -830,6 +843,7 @@ class Device:
         d.chain_uses = self.chain_uses
         d.chain_uses_norst = self.chain_uses_norst
         d.storage = dict(self.storage)
+        d.lut_packing = self.lut_packing
         d.default_storage = self.default_storage
         d.stream_timing = self.stream_timing
         d.operators = list(self.operators)

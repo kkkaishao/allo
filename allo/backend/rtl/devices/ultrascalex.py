@@ -511,6 +511,8 @@ def build(part: Part) -> Device:
         d.set_mux_delay(timing.mux, timing.mux_w)
     d.set_chain_uses(_chain_uses(res))
     d.set_chain_uses_norst(_chain_uses_norst(res))
+    # Routed bed designs pack 1.22-1.25 LUT instances per occupied site.
+    d.set_lut_packing(0.80)
     d.set_register_floor(timing.reg_ns)
     d.set_default_frequency(part.grade.default_freq_mhz)
     d.realizer = vivado.realize

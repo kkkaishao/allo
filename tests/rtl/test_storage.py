@@ -1153,7 +1153,8 @@ def test_a_constant_table_is_priced_as_the_logic_it_is_built_from():
     assert mem.realization == "rom"
     est = qor.estimate(rtl.report)
     assert est.mem_bits == 0, "a constant table is logic, not memory"
-    assert est.by_kind["memories"].lut == 32
+    # One LUT6 per bit of the 64-deep table, quoted after LUT packing.
+    assert est.by_kind["memories"].lut == round(32 * rtl.device.lut_packing)
 
     # Binding the array to a block RAM overrides the table: it becomes a real
     # memory that powers on with the same contents.
