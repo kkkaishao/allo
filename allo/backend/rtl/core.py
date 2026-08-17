@@ -9,13 +9,18 @@ import json
 import warnings
 
 from dataclasses import fields, replace
+from pathlib import Path
 from typing import Any, ParamSpec, TypeVar
 
 from ..base import Backend, run_pipeline
 from ..cpu import CPU
 from ..._mlir.ir import Module
 from ..._mlir._mlir_libs._allo import ir_ext
-from ..._mlir.dialects.allo import emit_verilog, emit_datapath_to_hw
+from ..._mlir.dialects.allo import (
+    emit_verilog,
+    emit_split_verilog,
+    emit_datapath_to_hw,
+)
 from .device import (
     Device,
     inject_operators,
@@ -47,6 +52,12 @@ _DERIVED_OPTIONS = {"cycle_ns"}
 class LatencyModelWarning(UserWarning):
     """A cosim ran for fewer cycles than the exact contract the kernel
     publishes. Its own class so a test run can filter it to an error."""
+
+
+class RealizationWarning(UserWarning):
+    """A scaffolded project instantiates an extern module its device cannot
+    build; it synthesizes as a black box until an implementation is supplied.
+    Its own class so a test run can filter it to an error."""
 
 
 # pylint: disable-next=too-many-instance-attributes
@@ -98,11 +109,17 @@ class RTL(Backend[P, R]):
         self._cpu: CPU[P, R] | None = None
         self._interfaces: Interfaces | None = None
         self._microarch: MicroarchReport | None = None
+        self._manifest: dict | None = None
 
     @property
     def top(self) -> str:
         """The DUT module name"""
         return self.kernel.func_name
+
+    @property
+    def device(self) -> Device:
+        """The device this handle compiles for"""
+        return self._device
 
     # -- scheduling -------------------------------------------------------
 
@@ -221,9 +238,7 @@ class RTL(Backend[P, R]):
                 lambda d: bool(diagnostics.append(d.message)) or True
             )
             try:
-                manifests = emit_datapath_to_hw(
-                    work, self.binding, self.top, cycle_ns
-                )
+                manifests = emit_datapath_to_hw(work, self.binding, self.top, cycle_ns)
             finally:
                 handler.detach()
             if manifests is None:
@@ -236,6 +251,8 @@ class RTL(Backend[P, R]):
             envelope = json.loads(manifests)
             self._interfaces = Interfaces.from_json(envelope["interfaces"])
             self._microarch = MicroarchReport.from_json(envelope["microarch"])
+            # The boundary document verbatim, for `scaffold_project` to write.
+            self._manifest = envelope["interfaces"]
             self._hw_ir = work
         return self._hw_ir
 
@@ -377,5 +394,31 @@ class RTL(Backend[P, R]):
         """Run the kernel with CPU functional simulation"""
         return self.csim(*args, **kwargs)
 
-    def scaffold_project(self, project: str | None = None, *, exist_ok: bool = True):
-        raise NotImplementedError("RTL project scaffolding is not implemented")
+    def scaffold_project(
+        self, project: str | None = None, *, exist_ok: bool = True
+    ) -> Path:
+        """Write the compiled design as a project directory: the emitted RTL
+        one file per module, the port manifest, and whatever the device's
+        realizer contributes (operator-core wrappers and build scripts).
+        Extern modules the realizer cannot build raise a
+        :class:`RealizationWarning` and stay black boxes."""
+        module = self.compile()
+        root = Path(project or f"{self.top}.prj")
+        root.mkdir(parents=True, exist_ok=exist_ok)
+        # Verilog export lowers the module in place, so split-emit a copy and
+        # keep the compiled module pristine for `verilog` and `cosim`.
+        work = ir_ext.clone_module(module)
+        ok = emit_split_verilog(work, str(root))
+        assert ok, "RTL Verilog emission failed"
+        (root / "manifest.json").write_text(json.dumps(self._manifest, indent=2))
+        if self._device.realizer is not None:
+            realized = self._device.realizer(self.interfaces, self._device)
+            for name, text in realized.files.items():
+                (root / name).write_text(text)
+            if realized.missing:
+                warnings.warn(
+                    "extern operator modules with no realization: "
+                    + "; ".join(realized.missing),
+                    RealizationWarning,
+                )
+        return root

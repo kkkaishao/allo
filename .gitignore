@@ -100,3 +100,6 @@ tests/xlscc_tests/**/test
 /allo/_mlir
 .cache
 drafts
+
+# Benchmark synthesis bed artifacts
+benchmark/synth_work/

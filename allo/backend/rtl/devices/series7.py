@@ -20,7 +20,7 @@ from ..device import (
     Table,
     Tiled,
 )
-from . import ip
+from . import ip, vivado
 from .spec import (
     MULTIWRITE_LUT_PER_BIT,
     MUX_LUT_COST,
@@ -403,6 +403,7 @@ def build(part: Part) -> Device:
     d.set_chain_uses_norst(_chain_uses_norst(res))
     d.set_register_floor(timing.reg_ns)
     d.set_default_frequency(part.grade.default_freq_mhz)
+    d.realizer = vivado.realize
     return d.validate()
 
 

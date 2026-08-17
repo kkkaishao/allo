@@ -6,13 +6,24 @@ expressed, and how both reach the IR."""
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
 from enum import Enum
 from functools import lru_cache
+from typing import NamedTuple
 
 from ...lang.ip import OperatorIP, OperatorType
 from .sim.ip_models import OpDesc, Ty
+
+
+class Realization(NamedTuple):
+    """What a device contributes to a scaffolded project beyond the emitted
+    RTL: source files and build scripts keyed by file name, plus the extern
+    modules it cannot build. File names and contents are the realizer's own
+    vocabulary; nothing here interprets them."""
+
+    files: dict[str, str]
+    missing: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -378,6 +389,10 @@ class Device:
         # on their `symbol`.
         self.operators: list[OperatorIP] = []
         self.default_freq_mhz: float = 100.0
+        # Builds the extern operator modules the emitter instantiates, called
+        # as ``realizer(interfaces, device)``; ``None`` when the fabric ships
+        # no realization and the externs stay black boxes.
+        self.realizer: Callable[..., Realization] | None = None
 
     def _spend(
         self,
@@ -820,6 +835,7 @@ class Device:
         d.operators = list(self.operators)
         d.default_freq_mhz = self.default_freq_mhz
         d.reg_delay_ns = self.reg_delay_ns
+        d.realizer = self.realizer
         return d
 
 
