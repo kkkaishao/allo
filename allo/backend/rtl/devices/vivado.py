@@ -330,9 +330,11 @@ def _ip_tcl(part: str, cores: dict[str, tuple[str, str]]) -> str:
             f"  create_ip -name {kind} -vendor xilinx.com"
             f" -library ip -module_name {impl}_core -dir $ipdir",
             f"  set_property -dict [list {props}] [get_ips {impl}_core]",
-            f"  set_property generate_synth_checkpoint false [get_files {xci}]",
-            f"  generate_target synthesis [get_ips {impl}_core]",
+            "} else {",
+            f"  read_ip {xci}",
             "}",
+            f"set_property generate_synth_checkpoint false [get_files {xci}]",
+            f"generate_target synthesis [get_ips {impl}_core]",
         ]
     return "\n".join(lines) + "\n"
 
