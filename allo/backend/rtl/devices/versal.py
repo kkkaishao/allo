@@ -210,11 +210,11 @@ IP: Mapping[OperatorIP, IPRow | tuple[IPRow, ...]] = {
 }
 
 
-#: SLICEM sites one bit of a 64-deep distributed RAM occupies: two, the array
-#: standing once per address bus, plus the packing overhead of the second copy.
-#: Measured at the 32-bit reference width (120 / 480 / 960 sites at 64 / 256 /
-#: 512 x 32).
-LUTRAM_SITES_PER_BIT = 3.75
+#: SLICEM sites one bit of a 64-deep distributed RAM occupies for one instance,
+#: a write port and one addressed read. A further read is a further instance
+#: (`inst_reads` below), so the row prices a single copy: half the two-read DUT
+#: series (120 / 480 / 960 sites at 64 / 256 / 512 x 32, 32-bit reference).
+LUTRAM_SITES_PER_BIT = 1.875
 
 _STORAGE = {
     "register": StorageSpec(
@@ -226,8 +226,7 @@ _STORAGE = {
     ),
     # Distributed RAM has one write port and one addressed read, in separate
     # structures (no pool). A second read address costs a further copy of the
-    # array: measured 640 / 1280 / 1920 / 2560 LUT as memory at 1024x32 for one
-    # through four reads.
+    # array, charged as a further instance.
     "lutram": StorageSpec(
         ("slicem_lut",),
         lambda r: {r["slicem_lut"]: (Tiled(64), Linear(LUTRAM_SITES_PER_BIT))},

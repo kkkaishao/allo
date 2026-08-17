@@ -322,10 +322,12 @@ IP_BY_GRADE: Mapping[Grade, Mapping[OperatorIP, IPRow | tuple[IPRow, ...]]] = {
 }
 
 
-#: SLICEM sites one bit of a 64-deep distributed RAM occupies: two, the array
-#: standing once per address bus, plus the packing overhead of the second copy.
-#: Measured at the 32-bit reference width.
-LUTRAM_SITES_PER_BIT = 2.5
+#: SLICEM sites one bit of a 64-deep distributed RAM occupies for one instance,
+#: a write port and one addressed read. A further read is a further instance
+#: (`inst_reads` below), so the row prices a single copy: measured 640 LUT as
+#: memory at 1024x32 with one read, and the two-read DUT series (80 / 320 / 640
+#: at 64 / 256 / 512 x 32) lands on exactly twice this.
+LUTRAM_SITES_PER_BIT = 1.25
 
 _STORAGE = {
     "register": StorageSpec(
@@ -337,10 +339,10 @@ _STORAGE = {
     ),
     # Distributed RAM has one write port and one addressed read, in separate
     # structures (no pool). A second read address costs a further copy of the
-    # array: measured 640 / 1280 / 1920 / 2560 LUT as memory at 1024x32 for one
-    # through four reads. A SLICEM LUT holds 64 bits, so a bit of a `d`-deep
-    # array takes `ceil(d/64)` sites; measured 80 / 320 / 640 SLICEM at 64 /
-    # 256 / 512 x 32, which `LUTRAM_SITES_PER_BIT` lands on exactly.
+    # array, charged as a further instance: measured 640 / 1280 / 1920 / 2560
+    # LUT as memory at 1024x32 for one through four reads, 640 per copy. A
+    # SLICEM LUT holds 64 bits, so a bit of a `d`-deep array takes
+    # `ceil(d/64)` sites.
     "lutram": StorageSpec(
         ("slicem_lut",),
         lambda r: {r["slicem_lut"]: (Tiled(64), Linear(LUTRAM_SITES_PER_BIT))},
