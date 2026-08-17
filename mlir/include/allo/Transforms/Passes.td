@@ -584,17 +584,24 @@ def LegalizeArithPass : Pass<"legalize-arith", "ModuleOp"> {
     injected `dcp.operator` / `dcp.device` IR, so this pass must run after operator
     injection and before scheduling.
 
-    Under `expand-const-div`, an index-typed `divui`/`remui` by a constant that
-    is not a power of two is reduced to a reciprocal multiply and shift. An
-    index op carries no width for an IP signature to match, so it would
-    otherwise be priced as a full combinational divider, one operator no
-    register can split. The pipeline sets the flag only on its second run:
-    before subscripts are raised to affine maps, a division under an access
-    still has the chance to become a carried register digit.
+    Under `expand-const-div`, a `divsi`/`divui`/`remsi`/`remui` by a constant
+    that is not a power of two is reduced to a reciprocal multiply and shift,
+    a signed one with the sign carried around the magnitude's multiply. An
+    index op expands regardless: it carries no width for an IP signature to
+    match, so it would otherwise be priced as a full combinational divider,
+    one operator no register can split. A typed op has a divider IP to fall
+    back on, so it expands only where the product multiply fits the clock
+    period stated in `period-ns`, and keeps the IP everywhere else. The
+    pipeline sets the flag only on its second run: before subscripts are
+    raised to affine maps, a division under an access still has the chance to
+    become a carried register digit.
   }];
   let options = [Option<"expandConstDiv", "expand-const-div", "bool", "false",
-                        "Reduce index-typed division by a non-power-of-two "
-                        "constant to a reciprocal multiply and shift">];
+                        "Reduce division by a non-power-of-two constant to a "
+                        "reciprocal multiply and shift">,
+                 Option<"periodNs", "period-ns", "double", "0.0",
+                        "Clock period a typed reciprocal multiply must fit; "
+                        "0 keeps every typed division on its IP">];
   let dependentDialects = ["mlir::arith::ArithDialect"];
 }
 

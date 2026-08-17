@@ -398,6 +398,14 @@ double OperatorLibrary::combMarginalDelay(OpKind kind, int64_t width) const {
   return std::max(0.0, combDelay(kind, width) - regFloor);
 }
 
+std::optional<double> OperatorLibrary::measuredCombDelay(OpKind kind,
+                                                         int64_t width) const {
+  const OperatorEntry *e = combEntry(kind);
+  if (!e || e->delay.unmeasuredAt(width))
+    return std::nullopt;
+  return *e->delay.evaluate(width);
+}
+
 double OperatorLibrary::combMarginalDelay(CombOpKindEnum kind,
                                           int64_t width) const {
   return std::max(0.0, combDelay(kind, width) - regFloor);

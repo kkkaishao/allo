@@ -2235,6 +2235,46 @@ def test_a_constant_index_division_is_a_reciprocal_multiply():
     assert np.array_equal(rem, np.arange(180) % 18)
 
 
+# A typed constant division expands to the reciprocal only where its product
+# multiply fits the clock; a full-width dividend keeps the divider IP. The
+# signed form carries the sign around the magnitude, preserving `//`'s
+# truncation toward zero, INT_MIN included.
+def test_a_typed_constant_division_expands_where_the_multiply_fits():
+    @kernel
+    def narrow(A: i8[256], q: i8[256], r: i8[256]):
+        for i in range(256):
+            q[i] = A[i] // 3
+            r[i] = A[i] % 5
+
+    rtl = _to_rtl(narrow)
+    rtl.schedule()
+    rtl.compile()
+    assert not [
+        op.impl
+        for iface in rtl.interfaces.values()
+        for op in iface.operators
+        if "div" in op.impl or "rem" in op.impl
+    ]
+    A = np.arange(-128, 128, dtype=np.int8)
+    q = np.zeros(256, np.int8)
+    r = np.zeros(256, np.int8)
+    rtl.cosim(A, q, r)
+    assert np.array_equal(q, np.trunc(A / 3).astype(np.int8))
+    assert np.array_equal(r, (A - np.trunc(A / 5) * 5).astype(np.int8))
+
+    @kernel
+    def wide(A: u32[8], out: u32[8]):
+        for i in range(8):
+            out[i] = A[i] // 18
+
+    rtl = _to_rtl(wide)
+    rtl.schedule()
+    rtl.compile()
+    assert [
+        op.impl for iface in rtl.interfaces.values() for op in iface.operators
+    ] == ["divui_u32_u32_u32_l16"]
+
+
 # The map is ONE operator: a division cone past the clock period has no seam a
 # register could land on, so the scheduler lowers the clock to fit it whole
 # and reports the achieved period.

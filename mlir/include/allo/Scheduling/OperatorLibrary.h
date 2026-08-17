@@ -211,6 +211,11 @@ public:
   /// row contributes as an outgoing delay.
   double combMarginalDelay(OpKind kind, int64_t width) const;
 
+  /// \ref combDelay where the row measured \p width, nullopt above its last
+  /// measured point or with no row at all: the safe form for a caller probing
+  /// candidate widths rather than pricing a scheduled structure.
+  std::optional<double> measuredCombDelay(OpKind kind, int64_t width) const;
+
   /// The same two, for a caller holding a reified realization (a
   /// `dcp.compute`'s `comb_kind`). Falls back to the default row, not to 0.0,
   /// so an `affine.apply` is priced the way it was scheduled. \p width is the
