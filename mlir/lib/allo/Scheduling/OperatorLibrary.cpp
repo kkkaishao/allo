@@ -473,6 +473,10 @@ int64_t OperatorLibrary::muxPrice(int64_t sources, int64_t width) const {
 
 int64_t OperatorLibrary::instancePrice(const OperatorIdentity &identity,
                                        int64_t width) const {
+  // Wiring: pricing it as its mnemonic's row would make folding two renames
+  // look like saving a real structure, when it only builds one.
+  if (identity.rename)
+    return 0;
   const OperatorEntry *e = nullptr;
   if (identity.comb) {
     e = combEntry(opKindOf(*identity.comb));

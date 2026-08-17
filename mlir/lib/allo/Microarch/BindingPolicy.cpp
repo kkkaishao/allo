@@ -90,20 +90,29 @@ bool heldOutside(const RegionBlock &rb, Value v) {
 /// period` over a mux-free datapath, leaving each unit `unitSlack` of room for
 /// the whole cone reaching it, which is what a fold has to fit inside.
 ///
-/// `checkCombPathsMeetPeriod` stays the authority; this is its conservative
-/// pre-image, the same recursion read off the ops rather than the Sources it
-/// has yet to build, and it can only over-count levels.
+/// `checkCombPathsMeetPeriod` stays the authority, and this is the same
+/// recursion read off the ops rather than the Sources it has yet to build. In
+/// particular a shared producer contributes the max over ALL its members'
+/// inputs: the structural path through every mux arm exists whichever slot the
+/// select sits in, and static timing knows no slots.
 struct ShareCone {
   ShareCone(const Datapath &dp, const RegionBlock &rb,
             const BindingContext &ctx)
       : lib(ctx.lib), fanin(rb.units.size(), 1), width(rb.units.size(), 1),
+        rep(rb.units.size()), pack(rb.units.size()), base(rb.units.size(), 1),
         preds(rb.units.size()), slack(rb.units.size()) {
     llvm::DenseMap<Operation *, unsigned> owner = unitOwners(dp, rb);
     for (auto [i, uid] : llvm::enumerate(rb.units)) {
+      rep[i] = i;
+      pack[i].push_back(i);
       const FuncUnit &u = dp.units[uid];
       // An unpriced unit (no `z`) gets no room, so no fold's cone may reach it.
       slack[i] = unitSlack(u, ctx.lib, ctx.cycleTime).value_or(0.0);
       Operation *y = u.repOp();
+      // A recurrence identity is re-injected through a select the emitter
+      // builds fold or no fold, so it is the unshared baseline, not an
+      // addition: the emit gate walks it too.
+      base[i] = fanin[i] = readsRecurrence(rb, y) ? 2 : 1;
       width[i] = std::max<int64_t>(1, combParamWidth(y));
       // One op feeding two operands takes two entries; `added` maxes over them.
       for (Value v : y->getOperands())
@@ -116,34 +125,51 @@ struct ShareCone {
   /// have \p arms sources. Keeps the fold iff every cone it deepens still meets
   /// the period, and reports whether it did.
   bool tryFold(llvm::ArrayRef<unsigned> members, unsigned add, unsigned arms) {
-    llvm::SmallVector<unsigned, 4> saved(members.size());
-    for (auto [k, m] : llvm::enumerate(members)) {
-      saved[k] = fanin[m];
-      fanin[m] = arms;
-    }
-    unsigned savedAdd = fanin[add];
-    fanin[add] = arms;
+    unsigned r = rep[members.front()];
+    unsigned savedBin = fanin[r], savedAdd = fanin[add];
+    fanin[r] = fanin[add] = arms;
+    rep[add] = r;
+    pack[r].push_back(add);
     if (fits())
       return true;
-    for (auto [k, m] : llvm::enumerate(members))
-      fanin[m] = saved[k];
+    pack[r].pop_back();
+    rep[add] = add;
+    fanin[r] = savedBin;
     fanin[add] = savedAdd;
     return false;
   }
 
+  /// Load a whole assignment (unit -> representative, \p arms summed per
+  /// representative) and report whether every cone fits: the exact solve's
+  /// plan re-checked under this recursion before it is built.
+  bool holds(llvm::ArrayRef<unsigned> assign, llvm::ArrayRef<unsigned> arms) {
+    for (auto [i, r] : llvm::enumerate(assign)) {
+      if (r == i)
+        continue;
+      rep[i] = r;
+      pack[r].push_back(static_cast<unsigned>(i));
+    }
+    for (unsigned i = 0, e = rep.size(); i < e; ++i)
+      fanin[i] = pack[rep[i]].size() > 1 ? arms[rep[i]] : base[i];
+    return fits();
+  }
+
 private:
-  /// The multiplexer delay reaching member \p i's inputs, its own mux included.
+  /// The multiplexer delay reaching the bin member \p i folded into, its own
+  /// select included: the max over every member's producers, each an arm.
   double added(unsigned i) {
-    if (memo[i] >= 0.0)
-      return memo[i];
+    unsigned r = rep[i];
+    if (memo[r] >= 0.0)
+      return memo[r];
     // Seeded before the walk so a revisit reads 0 rather than recurring
     // forever: two bins may feed each other once ops issuing on different
     // cycles share units.
-    memo[i] = 0.0;
+    memo[r] = 0.0;
     double in = 0.0;
-    for (unsigned p : preds[i])
-      in = std::max(in, added(p));
-    return memo[i] = in + muxCone(lib, fanin[i], width[i]);
+    for (unsigned m : pack[r])
+      for (unsigned p : preds[m])
+        in = std::max(in, added(p));
+    return memo[r] = in + muxCone(lib, fanin[r], width[r]);
   }
 
   /// Whether every member's cone fits the slack its schedule left it.
@@ -155,12 +181,16 @@ private:
     return true;
   }
 
-  const OperatorLibrary &lib;        // prices each select cone (`muxCone`)
-  llvm::SmallVector<unsigned> fanin; // input mux sources (1 = an unshared wire)
+  const OperatorLibrary &lib; // prices each select cone (`muxCone`)
+  /// Input mux sources, meaningful at a bin's representative (1 = a wire).
+  llvm::SmallVector<unsigned> fanin;
   llvm::SmallVector<unsigned> width; // the muxed operand's width, per unit
+  llvm::SmallVector<unsigned> rep;   // the bin each unit folded into
+  llvm::SmallVector<llvm::SmallVector<unsigned, 2>> pack; // members, per rep
+  llvm::SmallVector<unsigned> base; // unshared arms: 2 past a recurrence init
   llvm::SmallVector<llvm::SmallVector<unsigned, 2>> preds;
   llvm::SmallVector<double> slack;
-  llvm::SmallVector<double> memo;
+  llvm::SmallVector<double> memo; // per representative
 };
 
 /// First-fit sharing for one region: for each unit, the region-local index of
@@ -316,8 +346,17 @@ ExactShareBinding::plan(const Datapath &dp, const BindingContext &ctx) const {
   for (const RegionBlock &rb : dp.regions) {
     llvm::SmallVector<unsigned> assign = greedyShare(dp, rb, ctx);
     SharingProblem problem = sharingProblemOf(dp, rb, ctx);
-    if (auto solved = solveSharing(problem, assign, rb.op))
-      assign = std::move(*solved);
+    if (auto solved = solveSharing(problem, assign, rb.op)) {
+      // The solve's cone constraint charges each member its own producers,
+      // but the built mux is one structure whose every arm is a timed path.
+      // Re-check its plan under the emit gate's recursion and keep the greedy
+      // plan, admitted fold by fold, when a cross-member arm would bust.
+      llvm::SmallVector<unsigned> arms(rb.units.size(), 0);
+      for (auto [i, r] : llvm::enumerate(*solved))
+        arms[r] += readsRecurrence(rb, dp.units[rb.units[i]].repOp()) ? 2 : 1;
+      if (ShareCone(dp, rb, ctx).holds(*solved, arms))
+        assign = std::move(*solved);
+    }
     appendGroups(rb, assign, groups);
   }
   return groups;
