@@ -282,6 +282,9 @@ def estimate(report: CompileReport, device: Device = default_device) -> QoR:
                     charge("units", f.func, Utilization.of(price(cost[0], (cost[1],))))
                     continue
                 mnemonic = unit.identity.split("(", 1)[0]
+                if mnemonic.startswith("rename."):
+                    # A shift by a literal or a width-kept resize: wiring.
+                    continue
                 if mnemonic == "apply":
                     # A standalone apply is its map's cone: the report exports
                     # the operator counts, each priced as its comb row at the

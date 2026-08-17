@@ -35,6 +35,10 @@ struct OperatorIdentity {
   Type resultType;
   Attribute predicate; // a compare's `predicate`; null otherwise
   Attribute map;       // an `affine.apply`'s `map`; null otherwise
+  /// A bit rename (a shift by a literal, a width-kept resize): wiring, priced
+  /// at nothing. Part of the identity so a rename never shares a class with
+  /// the real operator its mnemonic spells.
+  bool rename = false;
 
   /// Whether an operation of this identity gets a functional unit.
   bool realized() const { return comb || !ipSymbol.empty(); }
@@ -43,7 +47,7 @@ struct OperatorIdentity {
     return comb == o.comb && ipSymbol == o.ipSymbol &&
            llvm::ArrayRef<Type>(argTypes) == llvm::ArrayRef<Type>(o.argTypes) &&
            resultType == o.resultType && predicate == o.predicate &&
-           map == o.map;
+           map == o.map && rename == o.rename;
   }
   bool operator!=(const OperatorIdentity &o) const { return !(*this == o); }
 

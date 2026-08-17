@@ -206,8 +206,12 @@ static void convertOp(Operation &op, OpBuilder &b, IRMapping &map,
       nw->setAttr(attr.getName(), attr.getValue());
     setZ(nw);
     // The setup delay the solve priced this op against, so the emitter's model
-    // holds the schedule's own number instead of re-deriving one.
+    // holds the schedule's own number instead of re-deriving one. The rename
+    // decision travels the same way: the original operands it is judged on do
+    // not survive into `dcp`.
     nw->setAttr("in_delay", b.getF32FloatAttr(oc.timing.inDelay));
+    if (isZeroDelay(&op))
+      nw->setAttr("rename", b.getUnitAttr());
     map.map(op.getResult(0), nw.getResult());
     return;
   }

@@ -243,6 +243,9 @@ OperatorIdentity identityOf(Operation *op, std::optional<CombOpKindEnum> comb,
   id.resultType = op->getResult(0).getType();
   id.predicate = op->getAttr("predicate");
   id.map = op->getAttr("map");
+  // On an arith op the rename is decided here; a `dcp.compute` carries the
+  // decision as the attribute `reify` stamped.
+  id.rename = op->hasAttr("rename") || isZeroDelay(op);
   return id;
 }
 
@@ -681,17 +684,18 @@ OperatorChar OperatorLibrary::characterize(Operation *op,
     c.timing.outDelay = e.outDelay;
   }
   c.pipelined = e.pipelined;
-  // A shift by a literal is wiring, not a shifter, and so is a resize that
-  // changes no width. It takes a type name of its own because the problem
-  // registers timing per name: sharing the row would make two spellings of that
-  // row disagree.
-  if (isZeroDelay(op)) {
-    c.timing.typeName = "rename." + c.timing.typeName;
-    c.timing.inDelay = c.timing.outDelay = 0.0;
-  }
   // An IP's signature pins the width, so there the factors are constants and
   // this is the measured core.
   c.price = *price;
+  // A shift by a literal is wiring, not a shifter, and so is a resize that
+  // changes no width. It takes a type name of its own because the problem
+  // registers timing per name: sharing the row would make two spellings of that
+  // row disagree. Wiring builds no logic, so it also prices at nothing.
+  if (isZeroDelay(op)) {
+    c.timing.typeName = "rename." + c.timing.typeName;
+    c.timing.inDelay = c.timing.outDelay = 0.0;
+    c.price = 0;
+  }
   // The realization is the row's own symbol when it is an IP, else the native
   // lowering the reifier picks; the default row reaches the comb arm too.
   if (!e.symbol.empty())
@@ -730,7 +734,7 @@ OperatorLibrary::candidateChars(Operation *op) const {
 }
 
 std::string OperatorIdentity::key() const {
-  std::string s = realizationName().str();
+  std::string s = (rename ? "rename." : "") + realizationName().str();
   llvm::raw_string_ostream os(s);
   os << '(';
   llvm::interleaveComma(argTypes, os);
