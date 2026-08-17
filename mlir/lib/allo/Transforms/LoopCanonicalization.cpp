@@ -439,10 +439,12 @@ bool coalescingCostsADivider(MutableArrayRef<affine::AffineForOp> band) {
         !llvm::all_of(loop.getInductionVar().getUsers(), [](Operation *user) {
           return asMemAccess(user).has_value();
         });
-    if (escapes && addressCost(recovered[k], AddressDelays{},
-                               AddressDelays::refWidth)
-                       .dividers)
-      return true;
+    if (escapes) {
+      AddressCost c = addressCost(recovered[k], AddressDelays{},
+                                  AddressDelays::refWidth);
+      if (c.dividers || c.reciprocals)
+        return true;
+    }
   }
   llvm::DenseMap<Value, unsigned> level;
   for (auto [k, loop] : llvm::enumerate(band))
@@ -469,12 +471,13 @@ bool coalescingCostsADivider(MutableArrayRef<affine::AffineForOp> band) {
         }
         AffineMap coalesced = a->map.replaceDimsAndSymbols(
             dims, syms, next, a->map.getNumSymbols());
-        // A structural question: what decides is whether a divider survives the
-        // fold, not how long it takes, so the delay table is empty.
+        // A structural question: what decides is whether a division survives
+        // the fold, whatever it is realized as, not how long it takes, so the
+        // delay table is empty.
         auto shape = cast<MemRefType>(a->root.getType()).getShape();
-        if (addressCost(coalesced, shape, AddressDelays{},
-                        AddressDelays::refWidth)
-                .dividers)
+        AddressCost c = addressCost(coalesced, shape, AddressDelays{},
+                                    AddressDelays::refWidth);
+        if (c.dividers || c.reciprocals)
           return WalkResult::interrupt();
         return WalkResult::advance();
       })

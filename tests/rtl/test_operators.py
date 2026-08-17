@@ -2294,3 +2294,64 @@ def test_an_apply_division_over_the_period_derates_the_clock():
     sched = rtl.schedule()
     assert sched.cycle_ns > PERIOD_NS
     assert sched.compiler.options.cycle_ns == pytest.approx(PERIOD_NS)
+
+
+# The cone's division is built and priced as the reciprocal multiply: no
+# divider unit, the multiplier's shift-adds counted as adders, and the
+# hardware still computes the map.
+def test_an_apply_division_builds_the_reciprocal():
+    from allo._mlir import ir
+
+    @kernel
+    def rdiv(out: i32[16]):
+        for i in range(16):
+            out[i] = 7
+
+    rtl = _to_rtl(rdiv)
+    _inject_apply(
+        rtl,
+        lambda d0: ir.AffineExpr.get_floor_div(d0 + 5, ir.AffineConstantExpr.get(3)),
+    )
+    rtl.schedule()
+    units = [
+        u
+        for f in rtl.microarch.funcs
+        for r in f.regions
+        for u in r.units
+        if u.identity.startswith("apply")
+    ]
+    assert len(units) == 1
+    assert units[0].dividers == 0 and units[0].adders > 1
+    out = np.zeros(16, np.int32)
+    rtl.cosim(out)
+    assert np.array_equal(out, (np.arange(16) + 5) // 3)
+
+
+def test_an_apply_residue_builds_the_reciprocal():
+    from allo._mlir import ir
+
+    @kernel
+    def rmod(out: i32[16]):
+        for i in range(16):
+            out[i] = 7
+
+    rtl = _to_rtl(rmod)
+    _inject_apply(
+        rtl,
+        lambda d0: ir.AffineExpr.get_mod(
+            d0 * 3 + 2, ir.AffineConstantExpr.get(5)
+        ),
+    )
+    rtl.schedule()
+    units = [
+        u
+        for f in rtl.microarch.funcs
+        for r in f.regions
+        for u in r.units
+        if u.identity.startswith("apply")
+    ]
+    assert len(units) == 1
+    assert units[0].dividers == 0
+    out = np.zeros(16, np.int32)
+    rtl.cosim(out)
+    assert np.array_equal(out, (np.arange(16) * 3 + 2) % 5)

@@ -247,8 +247,12 @@ Value addrAt(OpBuilder &b, Location loc, Value v, unsigned width) {
   return resize(b, loc, v, width, /*isSigned=*/false);
 }
 
-// Unsigned divide by a compile-time constant: a shift for a power of two, else
-// a real divider (synthesis folds a constant divisor into a multiply-shift).
+static Value mulConst(OpBuilder &b, Location loc, Value v, int64_t k);
+
+// Unsigned divide by a compile-time constant: a shift for a power of two,
+// else the reciprocal multiply, `(v * M) >> shift` at the product's width,
+// priced by `addressCost` from the same `magicMultiplier`. A divisor past the
+// operand's range leaves a zero quotient.
 static Value divConst(OpBuilder &b, Location loc, Value v, int64_t d) {
   if (d == 1)
     return v;
@@ -256,8 +260,17 @@ static Value divConst(OpBuilder &b, Location loc, Value v, int64_t d) {
     return comb::ShrUOp::create(b, loc, v,
                                 konstLike(b, loc, v, llvm::Log2_64(d)), false)
         .getResult();
-  return comb::DivUOp::create(b, loc, v, konstLike(b, loc, v, d), false)
-      .getResult();
+  unsigned w = cast<IntegerType>(v.getType()).getWidth();
+  assert(w <= 62 && "the reciprocal multiplier of a wider operand overflows");
+  if (static_cast<uint64_t>(d) >= (uint64_t(1) << w))
+    return konstLike(b, loc, v, 0);
+  unsigned shift;
+  uint64_t magic = magicMultiplier(d, w, shift);
+  Value wide = addrAt(b, loc, v, 2 * w + 1);
+  Value prod = mulConst(b, loc, wide, static_cast<int64_t>(magic));
+  Value q = comb::ShrUOp::create(b, loc, prod, konstLike(b, loc, prod, shift),
+                                 false);
+  return addrAt(b, loc, q, w);
 }
 
 // Multiply by a compile-time constant. A power-of-two coefficient is a shift;
@@ -276,12 +289,17 @@ static Value mulConst(OpBuilder &b, Location loc, Value v, int64_t k) {
 }
 
 // A power-of-two divisor never reaches here: `evalAffine` builds that subtree
-// narrow instead, which is the same mask.
+// narrow instead, which is the same mask. Everything else is
+// `v - (v / d) * d` over the reciprocal quotient, in the operand's own width,
+// which the product never exceeds.
 static Value modConst(OpBuilder &b, Location loc, Value v, int64_t d) {
   if (d == 1)
     return konstLike(b, loc, v, 0);
-  return comb::ModUOp::create(b, loc, v, konstLike(b, loc, v, d), false)
-      .getResult();
+  unsigned w = cast<IntegerType>(v.getType()).getWidth();
+  if (static_cast<uint64_t>(d) >= (uint64_t(1) << std::min(w, 62u)))
+    return v;
+  Value qd = mulConst(b, loc, divConst(b, loc, v, d), d);
+  return comb::SubOp::create(b, loc, v, qd, false).getResult();
 }
 
 // Evaluate an affine index expression to a hw value \p width bits wide,

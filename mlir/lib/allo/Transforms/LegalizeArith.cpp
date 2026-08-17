@@ -4,7 +4,8 @@
  */
 
 #include "allo/IR/AlloOps.h"
-#include "allo/Scheduling/MemoryModel.h" // kIndexWidth
+#include "allo/Scheduling/AddressModel.h" // magicMultiplier
+#include "allo/Scheduling/MemoryModel.h"  // kIndexWidth
 #include "allo/Scheduling/OperatorLibrary.h"
 #include "allo/Transforms/Passes.h"
 
@@ -374,6 +375,9 @@ struct MagicPlan {
 /// The plan when the reciprocal patterns apply to \p op, or nullopt. Shared by
 /// the patterns and the conversion target, so what is marked illegal is
 /// exactly what rewrites.
+///
+/// TODO: a negative constant divisor keeps its op today; it could expand as
+/// the magnitude's reciprocal with one more negation of the quotient.
 static std::optional<MagicPlan> magicPlan(Operation *op, bool isSigned,
                                           unsigned maxMulWidth) {
   APInt cst;
@@ -406,14 +410,6 @@ static std::optional<MagicPlan> magicPlan(Operation *op, bool isSigned,
   if (p.folds() || 2 * p.width + 1 <= maxMulWidth)
     return p;
   return std::nullopt;
-}
-
-/// The rounded-up reciprocal: floor(n / d) == (n * magic) >> shift for every
-/// n below 2^w. The multiplier fits w+1 bits.
-static uint64_t magicMultiplier(uint64_t d, unsigned w, unsigned &shift) {
-  shift = w + llvm::Log2_64_Ceil(d);
-  APInt num = APInt::getOneBitSet(shift + 1, shift);
-  return (num + (d - 1)).udiv(APInt(shift + 1, d)).getZExtValue();
 }
 
 /// Zero-extend or truncate \p v to \p width bits, index through the unsigned

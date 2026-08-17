@@ -52,6 +52,25 @@ static unsigned nafWeight(uint64_t v) {
   return w;
 }
 
+uint64_t mlir::allo::magicMultiplier(uint64_t d, unsigned w, unsigned &shift) {
+  shift = w + llvm::Log2_64_Ceil(d);
+  llvm::APInt num = llvm::APInt::getOneBitSet(shift + 1, shift);
+  return (num + (d - 1)).udiv(llvm::APInt(shift + 1, d)).getZExtValue();
+}
+
+// Adders and levels of the shift-add network a positive constant multiply
+// recodes to, at \p width.
+static std::pair<unsigned, double> constMulCost(uint64_t k,
+                                                const AddressDelays &delays,
+                                                unsigned width) {
+  unsigned terms = nafWeight(k);
+  unsigned adds = terms ? terms - 1 : 0;
+  double delay =
+      adds ? std::max(1u, llvm::Log2_64_Ceil(terms)) * scaled(delays.add, width)
+           : 0.0;
+  return {adds, delay};
+}
+
 AddressCost mlir::allo::addressCost(AffineExpr e, const AddressDelays &delays,
                                     unsigned width) {
   // A leaf costs nothing: a constant is wiring, a dim / symbol arrives from
@@ -81,6 +100,7 @@ AddressCost mlir::allo::addressCost(AffineExpr e, const AddressDelays &delays,
   c.adders = lhs.adders + rhs.adders;
   c.multipliers = lhs.multipliers + rhs.multipliers;
   c.dividers = lhs.dividers + rhs.dividers;
+  c.reciprocals = lhs.reciprocals + rhs.reciprocals;
   // Two operands converge here, so the path through this node is the LONGER of
   // them plus this node's own delay.
   double in = std::max(lhs.delay, rhs.delay);
@@ -117,11 +137,35 @@ AddressCost mlir::allo::addressCost(AffineExpr e, const AddressDelays &delays,
   case AffineExprKind::CeilDiv:
   case AffineExprKind::Mod:
     // A power-of-two divisor is a shift or a mask, which is wiring (`divConst`
-    // and `modConst` lower it that way). Anything else is a real divider,
-    // whatever the affine kind.
+    // and `modConst` lower it that way).
     if (konst && konst.getValue() > 0 &&
         llvm::isPowerOf2_64(static_cast<uint64_t>(konst.getValue()))) {
       c.delay = in;
+      return c;
+    }
+    // Any other constant is the reciprocal multiply `divConst` builds: the
+    // multiplier's shift-adds at the product width, the shift wiring. A
+    // residue adds the divisor's own multiply and the subtract; a ceildiv,
+    // never materialized today, is priced as the pre-biased floordiv.
+    if (konst && konst.getValue() > 1 &&
+        konst.getValue() < (int64_t(1) << AddressDelays::refWidth)) {
+      uint64_t d = static_cast<uint64_t>(konst.getValue());
+      unsigned shift;
+      uint64_t magic = magicMultiplier(d, AddressDelays::refWidth, shift);
+      auto [adds, mulDelay] =
+          constMulCost(magic, delays, 2 * AddressDelays::refWidth + 1);
+      ++c.reciprocals;
+      c.adders += adds;
+      c.delay = in + mulDelay;
+      if (e.getKind() == AffineExprKind::Mod) {
+        auto [dAdds, dDelay] = constMulCost(d, delays, AddressDelays::refWidth);
+        c.adders += dAdds + 1;
+        c.delay += dDelay + scaled(delays.add, AddressDelays::refWidth);
+      }
+      if (e.getKind() == AffineExprKind::CeilDiv) {
+        ++c.adders;
+        c.delay += scaled(delays.add, AddressDelays::refWidth);
+      }
       return c;
     }
     ++c.dividers;
@@ -522,6 +566,7 @@ AddressCost mlir::allo::splitAddressCost(const SplitAddress &addr,
   c.adders += r.adders;
   c.multipliers += r.multipliers;
   c.dividers += r.dividers;
+  c.reciprocals += r.reciprocals;
   c.delay =
       chain ? std::max(c.delay, r.delay) + scaled(delays.add, width) : r.delay;
   return c;
@@ -615,6 +660,7 @@ AddressCost mlir::allo::addressCostOf(Operation *op,
   c.adders += b.adders;
   c.multipliers += b.multipliers;
   c.dividers += b.dividers;
+  c.reciprocals += b.reciprocals;
   c.carried += b.carried;
   c.delay = std::max(c.delay, b.delay);
   return c;

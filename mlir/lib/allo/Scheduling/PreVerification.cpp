@@ -986,28 +986,28 @@ static void reportAddressCost(func::FuncOp funcOp, const DeviceModel &dev) {
       return;
     ++nonTrivial;
     worstNow = std::max(worstNow, cost.delay);
-    if (cost.dividers)
+    if (cost.dividers || cost.reciprocals)
       ++withDivider;
     std::string addr;
     llvm::raw_string_ostream os(addr);
     os << e.offset;
     if (e.bank)
       os << " (bank " << e.bank << ")";
-    if (cost.dividers)
+    if (cost.dividers || cost.reciprocals)
       warn(Stage::Prep, op)
           << "The address " << addr << " costs "
           << llvm::format("%.2f", cost.delay)
           << " ns because it divides at "
              "runtime. A divisor that is a power of two is a mask, and a "
              "dividend that advances with a loop counter is a register the "
-             "controller maintains; a divider is what is left when the "
-             "subscript is neither. Choose a power-of-two partition factor, or "
-             "index the array by a loop counter";
+             "controller maintains; a subscript that is neither pays a "
+             "reciprocal multiply in the cone. Choose a power-of-two "
+             "partition factor, or index the array by a loop counter";
     debug(Stage::Prep, op) << "Address " << addr << ": "
                            << llvm::format("%.2f", cost.delay) << " ns at "
                            << e.width << "b [" << cost.adders << " add, "
-                           << cost.dividers << " div, " << cost.multipliers
-                           << " mul]";
+                           << cost.dividers << " div, " << cost.reciprocals
+                           << " recip, " << cost.multipliers << " mul]";
   });
 
   if (!total)
