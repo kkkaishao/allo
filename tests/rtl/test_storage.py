@@ -2452,6 +2452,34 @@ def test_a_forwarded_buffer_costs_no_storage():
     assert np.array_equal(B, A8[0] + A8[1] + A8)
 
 
+def test_a_callee_write_shares_the_port_of_ordered_regions():
+    # Three writers of one buffer, a declaration init, an init loop, and a
+    # child's write port, run in program order under one serial loop, so all
+    # three share one write port. The golden reads one element from the child
+    # and one from the loop, so a write lost to the shared port breaks it.
+    @kernel
+    def bump(a: i32[4], v: i32):
+        a[v] = v + 40
+
+    @kernel
+    def seqw(A: i32[8], out: i32[8]):
+        buf: i32[4] = 0
+        for t in range(8):
+            for i in range(4):
+                buf[i] = A[t] + i
+            bump(buf, 2)
+            out[t] = buf[2] + buf[3]
+
+    mod = _to_rtl(seqw)
+    buf = next(
+        m for f in mod.microarch.funcs for m in f.mems if m.realization == "ram"
+    )
+    assert buf.cost.write_ports == 1
+    out = np.zeros(8, np.int32)
+    mod.cosim(A8, out)
+    assert np.array_equal(out, 42 + A8 + 3)
+
+
 # --- dead-initializer elision -----------------------------------------------
 
 _NO_ELIDE = RTL_PREPARE_PIPELINE.replace("elide-dead-init,\n", "")

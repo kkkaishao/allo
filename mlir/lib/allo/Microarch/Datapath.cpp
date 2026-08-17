@@ -491,7 +491,14 @@ Datapath::PortRelation Datapath::portGraph(MemId id,
         return a.residue == b.residue;
       return underConcurrent(a.region) || underConcurrent(b.region);
     }
-    return true;
+    // A mixed pair, one access of this function against a port a child
+    // masters: a call's window lies inside its region's span, so different
+    // regions under a serial top hand off exactly as two direct accesses do.
+    // In one region the call runs beside the access, and the pair stays
+    // concurrent.
+    if (a.region == b.region)
+      return true;
+    return underConcurrent(a.region) || underConcurrent(b.region);
   };
   rel.adj.assign(ws.size(), llvm::BitVector(ws.size()));
   for (unsigned i = 0; i < ws.size(); ++i)
