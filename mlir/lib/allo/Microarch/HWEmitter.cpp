@@ -391,8 +391,9 @@ bool HWEmitter::advancesOnPulse(const uarch::RegionBlock &rb) const {
   // The last child must hand its results over safely at the pulse: a
   // call-free leaf exposes each result's live wire (`liveResult`), a
   // conditional container's iter-args settle at least a cycle before its
-  // exit, and a guard's survivor latches on the pulse itself, so no carried
-  // value may source from one (its arms' commits already trail the pulse).
+  // exit, and a guard's survivor, which latches on the pulse itself, is
+  // sampled through its capture D wire (`nextValueFor`), whose sources the
+  // arms' own hand-off rule has already settled.
   const uarch::RegionBlock &last = dp.regions[rb.children.back()];
   bool lastOk = false;
   switch (last.shape) {
@@ -403,10 +404,7 @@ bool HWEmitter::advancesOnPulse(const uarch::RegionBlock &rb) const {
     lastOk = last.conditional;
     break;
   case uarch::RegionBlock::Shape::Guard:
-    lastOk = llvm::none_of(rb.results, [&](const uarch::RegionResult &r) {
-      return r.value.kind == uarch::Source::Kind::Survivor &&
-             r.value.id == last.id;
-    });
+    lastOk = true;
     break;
   case uarch::RegionBlock::Shape::CallNode:
     break;
@@ -452,6 +450,16 @@ Value HWEmitter::nextValueFor(const uarch::RegionBlock &rb, unsigned k,
       assert(live && "a pulse-advanced container's live result was not "
                      "recorded");
       return live;
+    }
+    // A guard survivor latches on the pulse itself, so rebuild its latch's D
+    // wire: the captured datum in this very cycle (settled registers behind
+    // one select), the register on any event-free one.
+    if (last.shape == uarch::RegionBlock::Shape::Guard) {
+      auto [en, datum] = guardCapture.lookup(
+          DatapathEmitter::accKey(r.value.id, r.value.outPort));
+      assert(en && "a pulse-advanced container's guard capture was not "
+                   "recorded");
+      return ctx.mux(en, datum, datapath.resolveSource(r.value));
     }
   }
   return datapath.resolveSource(r.value);
@@ -591,16 +599,23 @@ Value HWEmitter::emitGuard(const uarch::RegionBlock &rb, Value start) {
   for (auto [k, r] : llvm::enumerate(rb.results)) {
     Value tv = datapath.resolveSource(r.value);
     Value ev = datapath.resolveSource(r.elseValue);
-    Value surv = ctx.enabledReg(ctx.mux(thenDrained, tv, ev),
-                                ctx.orBits(thenDrained, elseDrained),
-                                ctx.konst(tv.getType(), 0), RegRole::Survivor);
+    Value datum = ctx.mux(thenDrained, tv, ev);
+    Value en = ctx.orBits(thenDrained, elseDrained);
+    Value surv = ctx.enabledReg(datum, en, ctx.konst(tv.getType(), 0),
+                                RegRole::Survivor);
     nameValue(surv, survivorName(rb.id, k));
     datapath.setSurvivor(rb.id, k, surv);
+    // The capture terms let a pulse-advanced container rebuild this latch's D
+    // wire and sample the survivor in the capture cycle itself.
+    guardCapture[DatapathEmitter::accKey(rb.id, k)] = {en, datum};
   }
   // Exactly one arm runs, so the region completes on whichever drains. Latch
   // done (a level); clear on start so a retriggered guard re-edges. The set
   // pulse is recorded for the hand-off and advance chains; `handoffSafe`
-  // gates its use to a result-less guard, whose pulse trails every commit.
+  // gates a SIBLING hand-off to a result-less guard (a successor's datapath
+  // samples survivor registers, which only settle a cycle after the pulse),
+  // while a pulse-advanced container takes a yielded result through the
+  // capture D wire.
   Value pulse = ctx.orBits(thenDrained, elseDrained);
   donePulse[rb.id] = pulse;
   Value done = ctx.holdDone(pulse, start);

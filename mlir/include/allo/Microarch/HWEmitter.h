@@ -716,6 +716,12 @@ struct HWEmitter {
   /// launches in the latch cycle itself, so an init sourced from one of these
   /// survivors reads the D wire instead of the stale output.
   llvm::DenseMap<uint64_t, Value> throughValue;
+  /// A guard survivor's capture terms {enable, datum}, keyed
+  /// accKey(region, port). The survivor latches on the guard's completion
+  /// pulse itself, so a pulse-advanced container sampling it in that cycle
+  /// rebuilds the latch's D wire from these (`nextValueFor`) instead of
+  /// reading the stale register.
+  llvm::DenseMap<uint64_t, std::pair<Value, Value>> guardCapture;
 
   HWEmitter(OpBuilder &b, Location loc, const uarch::Datapath &dp,
             circt::hw::HWModulePortAccessor &pa,

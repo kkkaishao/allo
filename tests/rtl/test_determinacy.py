@@ -290,6 +290,65 @@ def test_a_result_less_guards_pulse_chains_through_the_iteration():
     assert np.array_equal(out, A.sum(0))
 
 
+# A result-yielding guard no longer holds its container to the latched done:
+# the advance rides the guard's completion pulse, and the carried scalar
+# latches through the capture D wire, whose datum the arm hand-off rule has
+# already settled. One latch cycle recovered per iteration, under the bound.
+@needs_verilator
+def test_a_carried_result_rides_the_guards_pulse():
+    N, M = 5, 6
+
+    @kernel
+    def gcarry(A: i32[N, M], out: i32[1]):
+        t: i32 = 0
+        for j in range(M):
+            if A[0, j] > 0:  # memory predicate: a prologue leaf, then the guard
+                acc: i32 = 0
+                for k in range(N):
+                    acc += A[k, j]
+                t = t + acc
+        out[0] = t
+
+    rtl = _to_rtl(gcarry)
+    fn = rtl.schedule().func(rtl.top)
+    assert fn.latency is not None and fn.latency_is_bound
+
+    A = np.ones((N, M), np.int32)  # every arm taken: recovery is the only slack
+    out = np.zeros(1, np.int32)
+    r = rtl.cosim(A, out)
+    assert r.cycles == fn.latency - M
+    assert out[0] == A.sum()
+
+
+# The self-referential shape: the guard's predicate reads the very scalar the
+# guard yields. The predicate leaf launches a cycle after the pulse-advance,
+# when the iter-arg register has already latched the D-wire value.
+@needs_verilator
+def test_a_guard_predicate_reads_the_scalar_its_own_pulse_latched():
+    N, M = 5, 6
+
+    @kernel
+    def gclip(A: i32[N, M], out: i32[1]):
+        t: i32 = 0
+        for j in range(M):
+            if t < 40:
+                acc: i32 = 0
+                for k in range(N):
+                    acc += A[k, j]
+                t = t + acc
+        out[0] = t
+
+    rtl = _to_rtl(gclip)
+    fn = rtl.schedule().func(rtl.top)
+    assert fn.latency is not None and fn.latency_is_bound
+
+    A = np.ones((N, M), np.int32)  # column sums keep t < 40: every arm taken
+    out = np.zeros(1, np.int32)
+    r = rtl.cosim(A, out)
+    assert r.cycles == fn.latency - M
+    assert out[0] == A.sum()
+
+
 # A bounded callee composes onward as a bound: the instance carries its
 # (latency, determinacy), so the caller publishes a ceiling of its own rather
 # than an exact span or no figure at all.
