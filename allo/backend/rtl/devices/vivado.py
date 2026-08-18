@@ -171,6 +171,16 @@ for _w in (8, 16, 32, 64):
 
 del _a, _mul, _stem, _w
 
+# The narrow core under `imulw33`'s 64-bit signature: the 33x33 product's low
+# 64 bits, which the shim feeds the extended operands' low 33 bits.
+RECIPES[ip.imulw33] = VivadoCore(
+    "mult_gen",
+    "PortAWidth=33,PortBWidth=33,"
+    "PortAType=Signed,PortBType=Signed,"
+    "Multiplier_Construction=Use_Mults,OptGoal=Speed,"
+    "Use_Custom_Output_Width=true,OutputWidthHigh=63,OutputWidthLow=0",
+)
+
 _RECIPE_BY_NAME = {a.func_name: r for a, r in RECIPES.items()}
 
 # Operation-channel opcodes of the Programmable compare core (PG060). One core
@@ -274,13 +284,16 @@ def _fp_shim(op: Operator, recipe: VivadoCore) -> str:
     )
 
 
-def _mult_shim(op: Operator) -> str:
+def _mult_shim(op: Operator, arche: OperatorIP) -> str:
+    """A `fed_width` core's ports are narrower than the module's: the operands
+    are extensions, so their low bits are the whole value."""
     data, clk, ce, out = _split(op)
     a, b = data
+    sl = f"[{arche.fed_width - 1}:0]" if arche.fed_width else ""
     return (
         f"{_header(op)}"
         f"  {op.impl}_core u (.CLK({clk}), .CE({ce}), "
-        f".A({a.name}), .B({b.name}), .P({out.name}));\n"
+        f".A({a.name}{sl}), .B({b.name}{sl}), .P({out.name}));\n"
         "endmodule\n"
     )
 
@@ -373,7 +386,7 @@ def generate(interfaces: Interfaces, device: Device) -> Generated:
             if recipe.core == "floating_point":
                 shims[op.module] = _fp_shim(op, recipe)
             elif recipe.core == "mult_gen":
-                shims[op.module] = _mult_shim(op)
+                shims[op.module] = _mult_shim(op, arche)
             else:
                 shims[op.module] = _div_shim(op, arche)
     return Generated(

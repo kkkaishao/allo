@@ -719,6 +719,8 @@ void DCPathOperatorOp::print(OpAsmPrinter &p) {
   if (getPipelined())
     p << " pipelined";
   p << ' ' << stringifyStallContractEnum(getStall());
+  if (std::optional<int64_t> fw = getFedWidth())
+    p << " fed " << *fw;
   if (ArrayAttr uses = getUsesAttr())
     p << " uses " << uses;
 }
@@ -760,6 +762,13 @@ ParseResult DCPathOperatorOp::parse(OpAsmParser &p, OperationState &result) {
                       b.getBoolAttr(pipelined));
   result.addAttribute(getStallAttrName(result.name),
                       StallContractEnumAttr::get(b.getContext(), *s));
+  if (succeeded(p.parseOptionalKeyword("fed"))) {
+    int64_t fw;
+    if (p.parseInteger(fw))
+      return failure();
+    result.addAttribute(getFedWidthAttrName(result.name),
+                        b.getI64IntegerAttr(fw));
+  }
   if (succeeded(p.parseOptionalKeyword("uses"))) {
     ArrayAttr uses;
     if (p.parseAttribute(uses))

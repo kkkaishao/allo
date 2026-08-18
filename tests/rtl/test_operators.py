@@ -2282,7 +2282,7 @@ def test_a_typed_constant_division_expands_where_the_multiply_fits():
     impls = [
         op.impl for iface in rtl.interfaces.values() for op in iface.operators
     ]
-    assert impls and all(im.startswith("mul_i64") for im in impls)
+    assert impls and all(im.startswith("mulw_i64") for im in impls)
     A = np.array(
         [0, 1, 17, 18, 4294967295, 4294967294, 2147483647, 12345], np.uint32
     )
@@ -2311,6 +2311,44 @@ def test_a_typed_constant_division_expands_where_the_multiply_fits():
     assert [
         op.impl for iface in rtl.interfaces.values() for op in iface.operators
     ] == ["divsi_i64_i64_i64_l68"]
+
+
+# A genuinely wide product of narrow operands binds the narrow widening core:
+# a 33x33 multiplier is real hardware, where a delivered 64x64 core netlist
+# prunes nothing however its inputs are extended. A product of full 64-bit
+# values must keep the full core, since the narrow one computes another number.
+def test_a_widening_product_binds_the_narrow_multiplier():
+    @kernel
+    def widen(A: i32[16], B: i32[16], out: i64[16]):
+        for i in range(16):
+            out[i] = A[i] * B[i]
+
+    rtl = _to_rtl(widen)
+    rtl.schedule()
+    rtl.compile()
+    assert [
+        op.impl for iface in rtl.interfaces.values() for op in iface.operators
+    ] == ["mulw_i64_i64_i64_l3"]
+    rng = np.random.default_rng(11)
+    A = rng.integers(-(2**31), 2**31, 16).astype(np.int32)
+    B = rng.integers(-(2**31), 2**31, 16).astype(np.int32)
+    A[0], B[0] = -2147483648, -2147483648
+    A[1], B[1] = 2147483647, -2147483648
+    out = np.zeros(16, np.int64)
+    rtl.cosim(A.copy(), B.copy(), out)
+    assert np.array_equal(out, A.astype(np.int64) * B.astype(np.int64))
+
+    @kernel
+    def full(A: i64[8], B: i64[8], out: i64[8]):
+        for i in range(8):
+            out[i] = A[i] * B[i]
+
+    rtl = _to_rtl(full)
+    rtl.schedule()
+    rtl.compile()
+    assert [
+        op.impl for iface in rtl.interfaces.values() for op in iface.operators
+    ] == ["mul_i64_i64_i64_l6"]
 
 
 # A constant table read at literal indices folds to the element it names, and

@@ -170,6 +170,7 @@ class OperatorIP(IP[P, R]):
         out_delay_ns: float = 0.0,
         pipelined: bool = False,
         style: Literal["free", "elastic", "ce"] | None = None,
+        fed_width: int | None = None,
     ):
         super().__init__(
             fn,
@@ -180,6 +181,9 @@ class OperatorIP(IP[P, R]):
             style=style,
         )
         self.optype = optype
+        # Restricts the row to ops whose operands carry no more significant
+        # bits: the same core measured with pruned, extension-fed inputs.
+        self.fed_width = fed_width
         # The readable base of the symbol, not what makes it unique. Defaults
         # to the kind's own string.
         self.mnemonic = mnemonic or (
@@ -238,6 +242,7 @@ def operator_ip(
     out_delay_ns: float = 0.0,
     pipelined: bool = False,
     style: Literal["free", "elastic", "ce"] | None = None,
+    fed_width: int | None = None,
 ) -> OperatorIP[P, R]: ...
 
 
@@ -251,6 +256,7 @@ def operator_ip(
     out_delay_ns: float = 0.0,
     pipelined: bool = False,
     style: Literal["free", "elastic", "ce"] | None = None,
+    fed_width: int | None = None,
 ) -> Callable[[Callable[P, R]], OperatorIP[P, R]]: ...
 
 
@@ -264,6 +270,7 @@ def operator_ip(
     out_delay_ns: float = 0.0,
     pipelined: bool = False,
     style: Literal["free", "elastic", "ce"] | None = None,
+    fed_width: int | None = None,
 ) -> OperatorIP[P, R] | Callable[[Callable[P, R]], OperatorIP[P, R]]:
     """Declare an operator core: an external block the compiler binds ops of
     ``optype`` onto. The body is ``...``; the parameters declare the signature,
@@ -281,6 +288,7 @@ def operator_ip(
             out_delay_ns=out_delay_ns,
             pipelined=pipelined,
             style=style,
+            fed_width=fed_width,
         )
 
     return build(fn) if fn is not None else build

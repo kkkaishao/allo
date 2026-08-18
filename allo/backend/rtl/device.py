@@ -942,6 +942,7 @@ def inject_operators(module, device: Device):
                 pipelined=t.pipelined,
                 stall=stall,
                 uses=_uses_attr(device.operator_uses.get(op.symbol), device.name),
+                fed_width=getattr(op, "fed_width", None),
                 ip=insert,
             )
 

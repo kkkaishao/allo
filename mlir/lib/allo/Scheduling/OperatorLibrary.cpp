@@ -158,9 +158,32 @@ bool allIntegerOperands(Operation *op) {
   });
 }
 
+// The significant bits \p op's operands actually carry: an extension counts
+// its source (a zero-extension plus the sign bit it pins), a constant its own
+// significant bits, anything else its full width. What gates a `fed_width`
+// row: the measured pruning only happens where synthesis sees the extensions.
+unsigned fedWidthOf(Operation *op) {
+  unsigned fed = 1;
+  for (Value v : op->getOperands()) {
+    unsigned w = datapathWidth(v.getType());
+    APInt cst;
+    if (matchPattern(v, m_ConstantInt(&cst)))
+      w = cst.getSignificantBits();
+    else if (Operation *d = v.getDefiningOp()) {
+      if (isa<arith::ExtSIOp>(d))
+        w = datapathWidth(d->getOperand(0).getType());
+      else if (isa<arith::ExtUIOp>(d))
+        w = datapathWidth(d->getOperand(0).getType()) + 1;
+    }
+    fed = std::max(fed, w);
+  }
+  return fed;
+}
+
 // Every library row that could realize \p op, in declaration order: an advanced
 // row matches its raw mnemonic and exact element-type list, an IP row its
 // abstract kind and exact element-type list, a comb row its abstract kind.
+// A `fedWidth` row also needs the operands proven that narrow.
 // `selectImplementation` ranks the result.
 llvm::SmallVector<const OperatorEntry *, 2>
 matchEntries(const std::vector<OperatorEntry> &advanced,
@@ -187,7 +210,8 @@ matchEntries(const std::vector<OperatorEntry> &advanced,
         out.push_back(&e);
     } else if (ArrayRef<Type>(e.argTypes) == a &&
                ArrayRef<Type>(e.resTypes) == r) {
-      out.push_back(&e);
+      if (!e.fedWidth || fedWidthOf(op) <= e.fedWidth)
+        out.push_back(&e);
     }
   }
   return out;
@@ -311,6 +335,7 @@ OperatorLibrary OperatorLibrary::fromModule(ModuleOp module) {
     e.outDelay = op.getOutDelay().convertToDouble();
     e.symbol = op.getSymName().str();
     e.uses = op.getUsesAttr();
+    e.fedWidth = (unsigned)op.getFedWidth().value_or(0);
     auto sig = op.getSignature();
     e.argTypes = elementTypes(sig.getInputs());
     e.resTypes = elementTypes(sig.getResults());

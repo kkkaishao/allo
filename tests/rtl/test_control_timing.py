@@ -380,7 +380,7 @@ def test_a_symbolic_bound_binds_like_any_other_arithmetic():
     # reciprocal, whose product rides the pipelined multiplier, and the region
     # holding it is at least as deep as that core is long.
     res = _sched(band())
-    assert any(im.startswith("mul_i64") for im in _impls(res))
+    assert any(im.startswith("mulw_i64") for im in _impls(res))
     spans = [r for r in res.regions() if r.kind == "acyclic" and r.ops]
     assert max(r.last_t() for r in spans) >= IMUL64
 

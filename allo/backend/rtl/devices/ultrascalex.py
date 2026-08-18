@@ -256,6 +256,7 @@ IP: Mapping[OperatorIP, IPRow | tuple[IPRow, ...]] = {
         IPRow(1, {"ff": 32, "dsp": 3}),  # 320
     ),
     ip.imul64: IPRow(6, {"slicem_lut": 64, "ff": 81, "dsp": 10}),  # 333
+    ip.imulw33: IPRow(3, {"ff": 34, "dsp": 4}),  # 431
     ip.idiv8: IPRow(4, {"lut": 126, "slicem_lut": 1, "ff": 166, "carry8": 18}),  # 311
     ip.udiv8: IPRow(4, {"lut": 126, "slicem_lut": 1, "ff": 166, "carry8": 18}),  # 311
     ip.irem8: IPRow(4, {"lut": 126, "slicem_lut": 1, "ff": 166, "carry8": 18}),  # 311

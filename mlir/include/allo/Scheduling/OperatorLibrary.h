@@ -79,6 +79,9 @@ struct OperatorEntry {
   bool pipelined = true; // accepts a new input every cycle
   double inDelay = 0.0;  // ns, IP rows: the signature pins the width
   double outDelay = 0.0;
+  /// Nonzero on a row measured with its inputs extensions of this many
+  /// significant bits: a candidate only for operations proven that narrow.
+  unsigned fedWidth = 0;
   /// Comb rows: the delay as a function of the operand width. Null on an IP
   /// row, whose signature fixes one width and so one delay.
   CostAttr delay;

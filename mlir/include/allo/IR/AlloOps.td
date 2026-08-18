@@ -512,6 +512,12 @@ def DCPathOperatorOp : DCPath_Op<"dcp.operator",
     rule the verifier and the evaluator both switch on is worth more than the
     notation a per-op exception would save.
 
+    `fed_width`, when present, restricts the row to operations whose operands
+    carry no more significant bits than it: the same core measured with its
+    inputs known to be extensions, where synthesis prunes the array. Such a
+    row is only a candidate where the operands prove that narrow, and the
+    plain row keeps every other operation.
+
     Its resource references are NESTED (`@u55c::@lut`). The resources belong to
     the device, this op does not, and a symbol reference has to resolve from
     where it is written.
@@ -525,7 +531,8 @@ def DCPathOperatorOp : DCPath_Op<"dcp.operator",
     F32Attr:$out_delay,
     DefaultValuedAttr<BoolAttr, "true">:$pipelined,
     DefaultValuedAttr<StallContractAttr, "::mlir::allo::StallContractEnum::Ce">:$stall,
-    OptionalAttr<ArrayAttr>:$uses);
+    OptionalAttr<ArrayAttr>:$uses,
+    OptionalAttr<I64Attr>:$fed_width);
   let hasCustomAssemblyFormat = 1;
   let hasVerifier = 1;
 }

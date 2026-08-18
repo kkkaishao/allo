@@ -117,6 +117,16 @@ def imul32(a: i32, b: i32) -> i32: ...
 def imul64(a: i64, b: i64) -> i64: ...
 
 
+# A 64-bit product whose operands PROVE narrow: a genuine 33x33 core, its
+# 66-bit product sliced to the low 64, exact modulo 2^64 for operands of at
+# most 33 significant bits, which is what `fed_width` restricts the row to.
+# A widening 32x32 product and a reciprocal's magic multiply are the feeders;
+# a delivered 64x64 core netlist prunes nothing, so the narrow core is real
+# hardware rather than an optimization hope.
+@operator_ip(optype=OperatorType.MUL, mnemonic="mulw", fed_width=33, **_ARCHETYPE)
+def imulw33(a: i64, b: i64) -> i64: ...
+
+
 # Integer divide and remainder. `divsi` and `divui` compute different numbers
 # and Xilinx builds them from different cores, but MLIR's `i32` is signless and
 # both classify as `div`, so each binds by its own MLIR mnemonic instead of by
@@ -211,6 +221,7 @@ CATALOG = (
     imul16,
     imul32,
     imul64,
+    imulw33,
     idiv8,
     idiv16,
     idiv32,
