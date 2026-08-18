@@ -13,7 +13,7 @@ import numpy as np
 import pytest
 
 from allo import kernel
-from allo.lang import bf16, f16, f32, i8, i32, i64, u32, KernelOptions
+from allo.lang import bf16, f16, f32, i8, i16, i32, i64, u16, u32, KernelOptions
 from allo.lang.core import APInt
 from allo.lang.ip import operator_ip, OperatorType
 from allo.operators import math as amath
@@ -2459,6 +2459,41 @@ def test_a_variable_index_division_binds_the_typed_divider():
     rtl.cosim(np.int32(7), out)
     k = np.arange(64)
     assert np.array_equal(out, k % 7 + k // 7)
+
+
+# A mixed-signedness pair promotes to a signed type holding both ranges
+# (i16 with u16 gives i17), so the comparison and the division follow the
+# operand values rather than C's unsigned-domain reinterpretation. The i17
+# division that promotion mints has no divider row; it widens to the i32 row
+# instead of derating the clock as a combinational divider.
+def test_a_mixed_sign_pair_computes_values_not_bit_patterns():
+    @kernel
+    def mixed(a: i16[16], b: u16[16], lt: i32[16], q: i32[16], r: i32[16]):
+        for i in range(16):
+            lt[i] = a[i] < b[i]
+            q[i] = a[i] // b[i]
+            r[i] = a[i] % b[i]
+
+    rtl = _to_rtl(mixed)
+    sched = rtl.schedule()
+    assert sched.cycle_ns == pytest.approx(PERIOD_NS)
+    impls = _impls(sched)
+    assert any(m.startswith("divsi_i32") for m in impls)
+    assert any(m.startswith("remsi_i32") for m in impls)
+    rtl.compile()
+    av = np.arange(-8, 8, dtype=np.int64)
+    bv = np.array(
+        [3, 40000, 7, 65535, 5, 50000, 3, 40000] * 2, dtype=np.int64
+    )
+    lt_out = np.zeros(16, np.int32)
+    q_out = np.zeros(16, np.int32)
+    r_out = np.zeros(16, np.int32)
+    rtl.cosim(av.astype(np.int16), bv.astype(np.uint16), lt_out, q_out, r_out)
+    # Integer `//` and `%` truncate toward zero, computed on the values.
+    q_g = np.where(av < 0, -(-av // bv), av // bv)
+    assert np.array_equal(lt_out, (av < bv).astype(np.int32))
+    assert np.array_equal(q_out, q_g)
+    assert np.array_equal(r_out, av - q_g * bv)
 
 
 # The map is ONE operator: a division cone past the clock period has no seam a

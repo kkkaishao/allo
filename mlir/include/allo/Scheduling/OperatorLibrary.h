@@ -224,6 +224,11 @@ public:
   /// instead of a combinational multiply. 0 with no such row.
   unsigned maxPipelinedMulWidth() const;
 
+  /// The narrowest integer width of at least \p width an advanced row
+  /// declares for the raw mnemonic \p mnem, or 0 when no row reaches it.
+  unsigned smallestAdvancedRowWidth(llvm::StringRef mnem,
+                                    unsigned width) const;
+
   /// The same two, for a caller holding a reified realization (a
   /// `dcp.compute`'s `comb_kind`). Falls back to the default row, not to 0.0,
   /// so an `affine.apply` is priced the way it was scheduled. \p width is the

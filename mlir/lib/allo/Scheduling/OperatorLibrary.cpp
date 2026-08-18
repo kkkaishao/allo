@@ -445,6 +445,21 @@ unsigned OperatorLibrary::maxPipelinedMulWidth() const {
   return w;
 }
 
+unsigned OperatorLibrary::smallestAdvancedRowWidth(llvm::StringRef mnem,
+                                                   unsigned width) const {
+  unsigned best = 0;
+  for (const OperatorEntry &e : advancedEntries) {
+    if (e.mlirOp != mnem || e.argTypes.empty())
+      continue;
+    auto ity = dyn_cast<IntegerType>(e.argTypes[0]);
+    if (!ity || ity.getWidth() < width)
+      continue;
+    if (!best || ity.getWidth() < best)
+      best = ity.getWidth();
+  }
+  return best;
+}
+
 double OperatorLibrary::combMarginalDelay(CombOpKindEnum kind,
                                           int64_t width) const {
   return std::max(0.0, combDelay(kind, width) - regFloor);

@@ -1554,6 +1554,17 @@ def test_cpp_typing_compile():
     _assert_contains(ir, "arith.addi", ": i32")
 
 
+# The hls style promotes a mixed-sign pair to a signed type holding both
+# ranges: u32 with i32 divides as i33, zero- and sign-extended by source.
+def test_hls_typing_mixed_sign_promotes_signed():
+    @kernel
+    def top(x: u32, y: i32, out: i32[1]):
+        out[0] = x // y
+
+    ir = _compile_ir(top)
+    _assert_contains(ir, "arith.extui", "arith.extsi", "arith.divsi", ": i33")
+
+
 def test_return_scalar_value():
     @kernel
     def top(x: i32, y: i32) -> i32:
