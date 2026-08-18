@@ -1436,8 +1436,10 @@ def test_bit_field_write_drops_redundant_masks():
         for i in range(16):
             B[i] = A[i]
 
-    # A mask over a field that already holds data is load-bearing and stays, as
-    # is one over a signed shift, whose high bits are the replicated sign.
+    # A mask over a field that already holds data is load-bearing and stays an
+    # AND. A low mask over a signed shift is load-bearing too (the high bits are
+    # the replicated sign), but a low mask is a zero-extended truncation, so it
+    # survives as the casts, which are wiring, not as an AND unit.
     @kernel
     def overwrite(A: u32[16], V: u32[16], B: u32[16]):
         for i in range(16):
@@ -1453,7 +1455,7 @@ def test_bit_field_write_drops_redundant_masks():
 
     assert _op_kinds(pack)["andi"] == 0
     assert _op_kinds(overwrite)["andi"] == 1
-    assert _op_kinds(signed_mask)["andi"] == 1
+    assert _op_kinds(signed_mask)["andi"] == 0
     # The payoff: a word rebuilt field by field costs no more than copying it.
     assert _latency(pack) == _latency(copy)
 
@@ -2331,6 +2333,32 @@ def test_a_small_constant_multiply_recodes_and_a_wide_one_keeps_the_ip():
     assert np.array_equal(b, A * 6)
     assert np.array_equal(c, A * -5)
     assert np.array_equal(d, A * 341)
+
+
+# A product of two loop counters spans the counters' ranges, not the `index`
+# carrier it is written in: under the `% 16` mask the multiply narrows to four
+# bits and no multiplier IP or DSP survives.
+def test_a_masked_counter_product_narrows_past_the_index_width():
+    taps = np.arange(16, dtype=np.int32) * 5 - 40
+
+    @kernel
+    def twiddle(out: i32[16, 16]):
+        w: i32[16] = taps
+        for i in range(16):
+            for j in range(16):
+                out[i, j] = w[(i * j) % 16]
+
+    rtl = _to_rtl(twiddle)
+    rtl.schedule()
+    rtl.compile()
+    assert not [
+        op.impl for iface in rtl.interfaces.values() for op in iface.operators
+    ]
+    assert rtl.estimation.area.dsp == 0
+    out = np.zeros((16, 16), np.int32)
+    rtl.cosim(out)
+    i, j = np.meshgrid(np.arange(16), np.arange(16), indexing="ij")
+    assert np.array_equal(out, taps[(i * j) % 16])
 
 
 # The map is ONE operator: a division cone past the clock period has no seam a

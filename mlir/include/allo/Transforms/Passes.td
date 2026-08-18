@@ -560,9 +560,18 @@ def NarrowDemandedBitsPass
     clears is one the value provably never sets, which a forward walk over the
     casts, shifts and bitwise operators establishes (`llvm::KnownBits` carries
     the algebra). Writing a bit field splices with such a mask on every field
-    after the first. A mask over bits the value can set, one overwriting a field
-    that already holds data or one over a signed shift's replicated sign, is
-    load-bearing and stays.
+    after the first. A load-bearing mask stays: one overwriting a mid-word
+    field stays an AND, and a low mask, being a zero-extended truncation,
+    becomes the resize casts, which are wiring.
+
+    Values are narrowed forward as well. An interval walk over constants,
+    constant loop bounds and the monotone arith transfers bounds each value,
+    and a ring or bitwise operator whose bound needs fewer bits than its
+    carrier is rebuilt at that width behind resize casts, which are wiring. In
+    particular an `index` operator, otherwise built at the one width the
+    datapath gives `index`, enters the integer domain at its value's width: a
+    product of two loop counters under a `% 2^k` mask ends as a k-bit fabric
+    multiply instead of an `index`-wide multiplier IP.
   }];
   let dependentDialects = ["mlir::arith::ArithDialect"];
 }
