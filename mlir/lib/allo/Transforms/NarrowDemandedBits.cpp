@@ -7,12 +7,15 @@
 #include "allo/Support/BitAnalysis.h"    // knownBits
 #include "allo/Transforms/Passes.h"
 
+#include "mlir/Dialect/Affine/Analysis/LoopAnalysis.h"
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/Matchers.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
+#include "llvm/ADT/DenseSet.h"
+#include "llvm/ADT/ScopeExit.h"
 #include "llvm/ADT/TypeSwitch.h"
 
 namespace mlir::allo {
@@ -107,6 +110,163 @@ std::optional<Hull> hullOfExpr(AffineExpr e, unsigned numDims,
   }
 }
 
+//===----------------------------------------------------------------------===//
+// Loop-carried hulls
+//===----------------------------------------------------------------------===//
+
+Hull hullUnion(Hull a, Hull b) {
+  return {std::min(a.first, b.first), std::max(a.second, b.second)};
+}
+
+/// One iteration of a carried value's transfer, decomposed against its own
+/// iter-arg: the value either translates by `delta` or resets into `join`.
+/// Select, min and max return one of their operands, which is what makes the
+/// alternation exact. `trunc` is the narrowest truncation the walk looked
+/// through; the envelope must fit it or the transfer wraps mid-cone.
+struct Step {
+  Hull delta{0, 0};
+  std::optional<Hull> join;
+  unsigned trunc = std::numeric_limits<unsigned>::max();
+};
+
+/// Recurrences whose hull is in flight, keyed (loop, result index): a transfer
+/// whose supposedly independent side reads its own (or a coupled) iter-arg
+/// re-enters here and must see unknown rather than recurse forever.
+thread_local llvm::DenseSet<std::pair<Operation *, unsigned>> inFlightHulls;
+
+/// Decompose \p v as a transfer of iter-arg \p arg. The seam casts the
+/// narrowing rewrites leave behind are value-preserving here: extension
+/// exactly, truncation once `recurrenceHull` has held the envelope against
+/// the narrowest width the walk passed through.
+std::optional<Step> stepOf(Value v, Value arg, unsigned depth) {
+  if (v == arg)
+    return Step{};
+  if (!depth--)
+    return std::nullopt;
+  Operation *op = v.getDefiningOp();
+  if (!op)
+    return std::nullopt;
+  if (isa<arith::ExtSIOp>(op))
+    return stepOf(op->getOperand(0), arg, depth);
+  if (auto tr = dyn_cast<arith::TruncIOp>(op)) {
+    std::optional<Step> s = stepOf(tr.getIn(), arg, depth);
+    if (s)
+      s->trunc = std::min(
+          s->trunc, cast<IntegerType>(tr.getType()).getWidth());
+    return s;
+  }
+  // A translated step shifts the reset hulls too: a reset deeper in the cone
+  // still rides every operator above it.
+  auto translate = [&](Value stepped, Value other,
+                       bool negate) -> std::optional<Step> {
+    std::optional<Step> s = stepOf(stepped, arg, depth);
+    if (!s)
+      return std::nullopt;
+    std::optional<Hull> e = hullOf(other, depth);
+    if (!e)
+      return std::nullopt;
+    auto shift = [&](Hull h) {
+      return negate ? mkHull((__int128)h.first - e->second,
+                             (__int128)h.second - e->first)
+                    : mkHull((__int128)h.first + e->first,
+                             (__int128)h.second + e->second);
+    };
+    std::optional<Hull> d = shift(s->delta);
+    if (!d)
+      return std::nullopt;
+    s->delta = *d;
+    if (s->join) {
+      std::optional<Hull> j = shift(*s->join);
+      if (!j)
+        return std::nullopt;
+      s->join = *j;
+    }
+    return s;
+  };
+  // Each arm is either a further transfer or an independent reset hull.
+  auto alternate = [&](Value a, Value b) -> std::optional<Step> {
+    Step out;
+    bool stepped = false;
+    for (Value arm : {a, b}) {
+      if (std::optional<Step> s = stepOf(arm, arg, depth)) {
+        out.delta = stepped ? hullUnion(out.delta, s->delta) : s->delta;
+        stepped = true;
+        out.trunc = std::min(out.trunc, s->trunc);
+        if (s->join)
+          out.join = out.join ? hullUnion(*out.join, *s->join) : *s->join;
+        continue;
+      }
+      std::optional<Hull> h = hullOf(arm, depth);
+      if (!h)
+        return std::nullopt;
+      out.join = out.join ? hullUnion(*out.join, *h) : *h;
+    }
+    return out;
+  };
+  return llvm::TypeSwitch<Operation *, std::optional<Step>>(op)
+      .Case<arith::AddIOp>([&](auto) -> std::optional<Step> {
+        if (auto s = translate(op->getOperand(0), op->getOperand(1), false))
+          return s;
+        return translate(op->getOperand(1), op->getOperand(0), false);
+      })
+      .Case<arith::SubIOp>([&](auto) {
+        return translate(op->getOperand(0), op->getOperand(1), true);
+      })
+      .Case<arith::SelectOp>([&](arith::SelectOp sel) {
+        return alternate(sel.getTrueValue(), sel.getFalseValue());
+      })
+      .Case<arith::MinSIOp, arith::MaxSIOp, arith::MinUIOp, arith::MaxUIOp>(
+          [&](auto) {
+            return alternate(op->getOperand(0), op->getOperand(1));
+          })
+      .Default([](auto) { return std::nullopt; });
+}
+
+/// The hull of \p fo's \p idx-th carried value: what the body reads, or with
+/// \p forResult the loop's final result. Over a constant trip the value stays
+/// inside (init u join) + steps * [min(delta, 0), max(delta, 0)]. The refusal
+/// always tests the full-trip envelope against the carrier, so no reachable
+/// value, intermediate or final, can wrap.
+std::optional<Hull> recurrenceHull(affine::AffineForOp fo, unsigned idx,
+                                   bool forResult, unsigned depth) {
+  auto ity = dyn_cast<IntegerType>(fo.getResult(idx).getType());
+  if (!ity)
+    return std::nullopt;
+  auto key = std::make_pair(fo.getOperation(), idx);
+  if (!inFlightHulls.insert(key).second)
+    return std::nullopt;
+  llvm::scope_exit guard([&] { inFlightHulls.erase(key); });
+  std::optional<uint64_t> trip = affine::getConstantTripCount(fo);
+  // The envelope multiplies the trip, so bound it to keep the products exact.
+  if (!trip || *trip == 0 || *trip > (uint64_t(1) << 32))
+    return std::nullopt;
+  std::optional<Hull> init = hullOf(fo.getInits()[idx], depth);
+  if (!init)
+    return std::nullopt;
+  Value yielded =
+      cast<affine::AffineYieldOp>(fo.getBody()->getTerminator()).getOperand(
+          idx);
+  std::optional<Step> st = stepOf(yielded, fo.getRegionIterArgs()[idx], depth);
+  if (!st) {
+    // A transfer that never reads its own iter-arg is a plain reset.
+    std::optional<Hull> h = hullOf(yielded, depth);
+    if (!h)
+      return std::nullopt;
+    st = Step{{0, 0}, *h};
+  }
+  Hull base = st->join ? hullUnion(*init, *st->join) : *init;
+  auto env = [&](__int128 steps) {
+    return mkHull(base.first + steps * std::min<__int128>(st->delta.first, 0),
+                  base.second +
+                      steps * std::max<__int128>(st->delta.second, 0));
+  };
+  std::optional<Hull> full = env(*trip);
+  unsigned cap = std::min(ity.getWidth(), st->trunc);
+  if (!full || bitsOfHull(*full) > cap)
+    return std::nullopt;
+  return forResult ? full : env(*trip - 1);
+}
+
 /// The hull of the value \p v carries: a forward interval walk over constants,
 /// constant loop bounds and the monotone arith transfers. Unknown is always
 /// sound. A hull the value's own carrier could wrap is refused, so a returned
@@ -120,12 +280,18 @@ std::optional<Hull> hullOf(Value v, unsigned depth) {
                ? std::optional<Hull>(
                      Hull{cst.getSExtValue(), cst.getSExtValue()})
                : std::nullopt;
-  if (isa<BlockArgument>(v)) {
-    affine::AffineForOp fo = affine::getForInductionVarOwner(v);
-    if (!fo || !fo.hasConstantLowerBound() || !fo.hasConstantUpperBound() ||
-        fo.getConstantLowerBound() >= fo.getConstantUpperBound())
-      return std::nullopt;
-    return Hull{fo.getConstantLowerBound(), fo.getConstantUpperBound() - 1};
+  if (auto ba = dyn_cast<BlockArgument>(v)) {
+    if (affine::AffineForOp fo = affine::getForInductionVarOwner(v)) {
+      if (!fo.hasConstantLowerBound() || !fo.hasConstantUpperBound() ||
+          fo.getConstantLowerBound() >= fo.getConstantUpperBound())
+        return std::nullopt;
+      return Hull{fo.getConstantLowerBound(), fo.getConstantUpperBound() - 1};
+    }
+    auto fo = dyn_cast<affine::AffineForOp>(ba.getOwner()->getParentOp());
+    if (fo && ba.getOwner() == fo.getBody() && ba.getArgNumber() > 0)
+      return recurrenceHull(fo, ba.getArgNumber() - 1, /*forResult=*/false,
+                            depth);
+    return std::nullopt;
   }
   Operation *op = v.getDefiningOp();
   if (!op)
@@ -150,6 +316,10 @@ std::optional<Hull> hullOf(Value v, unsigned depth) {
             AffineMap m = ap.getAffineMap();
             return hullOfExpr(m.getResult(0), m.getNumDims(), ap.getOperands(),
                               depth);
+          })
+          .Case<affine::AffineForOp>([&](affine::AffineForOp fo) {
+            return recurrenceHull(fo, cast<OpResult>(v).getResultNumber(),
+                                  /*forResult=*/true, depth);
           })
           .Case<arith::AddIOp>([&](auto) {
             return binary([](int64_t a, int64_t b, int64_t c, int64_t d) {
@@ -293,7 +463,9 @@ unsigned carrierWidth(Type t) {
 // trunc_w(a `op` b) -> trunc_w(a) `op` trunc_w(b), moving the truncation toward
 // the leaves so the operator is built at the width its consumer reads. The
 // truncations left behind meet the extends bit growth introduced and fold,
-// exposing the next operator up to the same rewrite.
+// exposing the next operator up to the same rewrite. A select is bit-wise in
+// its two arms, so the truncation sinks into them while its condition passes
+// through; min and max read the high bits and stop the sink.
 struct SinkTruncThroughRingOp : OpRewritePattern<arith::TruncIOp> {
   using OpRewritePattern::OpRewritePattern;
 
@@ -302,11 +474,21 @@ struct SinkTruncThroughRingOp : OpRewritePattern<arith::TruncIOp> {
     Operation *op = trunc.getIn().getDefiningOp();
     // Without a single use the wide result stays live, so the wide operator
     // survives and this only adds truncations.
-    if (!op || !isRingOp(op) || !op->hasOneUse())
+    if (!op || !op->hasOneUse())
       return failure();
-
     Type narrow = trunc.getType();
     Location loc = op->getLoc();
+    if (auto sel = dyn_cast<arith::SelectOp>(op)) {
+      Value t =
+          arith::TruncIOp::create(rewriter, loc, narrow, sel.getTrueValue());
+      Value f =
+          arith::TruncIOp::create(rewriter, loc, narrow, sel.getFalseValue());
+      rewriter.replaceOpWithNewOp<arith::SelectOp>(trunc, sel.getCondition(),
+                                                   t, f);
+      return success();
+    }
+    if (!isRingOp(op))
+      return failure();
     OperationState state(loc, op->getName());
     for (Value operand : op->getOperands())
       state.addOperands(
@@ -385,6 +567,90 @@ struct NarrowFromHull : RewritePattern {
                       .getResult()
                 : arith::ExtSIOp::create(rewriter, loc, ty, narrow)
                       .getResult());
+    return success();
+  }
+};
+
+// Narrow an affine.for's integer iter-args to their recurrence hulls. The
+// loop's signature is what demands the carrier width: once the carried value
+// crosses the boundary narrow, its survivor register shrinks with it, and the
+// body cone follows through the seam casts and the surrounding patterns. The
+// result hull is the full-trip envelope, a superset of every value the body
+// reads, so it is the register's width.
+struct NarrowIterArgs : OpRewritePattern<affine::AffineForOp> {
+  using OpRewritePattern::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(affine::AffineForOp fo,
+                                PatternRewriter &rewriter) const override {
+    if (fo.getInits().empty())
+      return failure();
+    SmallVector<Type> ntys;
+    bool any = false;
+    for (OpResult r : fo.getResults()) {
+      auto ity = dyn_cast<IntegerType>(r.getType());
+      // A returned or re-yielded result would strand its widening cast in a
+      // span of its own, spending a region boundary on pure wiring; those
+      // keep the carrier.
+      bool escapes = llvm::any_of(r.getUsers(), [](Operation *u) {
+        return u->hasTrait<OpTrait::IsTerminator>();
+      });
+      std::optional<Hull> h = ity && !escapes && ity.getWidth() > 1
+                                  ? hullOf(r, kHullDepth)
+                                  : std::nullopt;
+      bool narrows = h && bitsOfHull(*h) < ity.getWidth();
+      ntys.push_back(narrows ? rewriter.getIntegerType(bitsOfHull(*h))
+                             : r.getType());
+      any |= narrows;
+    }
+    if (!any)
+      return failure();
+    Location loc = fo.getLoc();
+    // Both types are integer wherever they differ; the width says which cast.
+    auto resize = [&](Value v, Type ty) -> Value {
+      if (v.getType() == ty)
+        return v;
+      if (cast<IntegerType>(ty).getWidth() <
+          cast<IntegerType>(v.getType()).getWidth())
+        return arith::TruncIOp::create(rewriter, loc, ty, v).getResult();
+      return arith::ExtSIOp::create(rewriter, loc, ty, v).getResult();
+    };
+    SmallVector<Value> inits;
+    for (auto [init, nty] : llvm::zip(fo.getInits(), ntys))
+      inits.push_back(resize(init, nty));
+    auto nw = affine::AffineForOp::create(
+        rewriter, loc, fo.getLowerBoundOperands(), fo.getLowerBoundMap(),
+        fo.getUpperBoundOperands(), fo.getUpperBoundMap(), fo.getStepAsInt(),
+        inits);
+    // The directives ride the loop op (pipeline, unroll), so they move.
+    nw->setDiscardableAttrs(fo->getDiscardableAttrDictionary());
+    Block *body = nw.getBody();
+    rewriter.setInsertionPointToStart(body);
+    SmallVector<Value> repl{body->getArgument(0)};
+    for (auto [k, arg] : llvm::enumerate(fo.getRegionIterArgs()))
+      repl.push_back(resize(body->getArgument(k + 1), arg.getType()));
+    rewriter.mergeBlocks(fo.getBody(), body, repl);
+    auto yield = cast<affine::AffineYieldOp>(body->getTerminator());
+    SmallVector<Value> yops;
+    for (auto [v, nty] : llvm::zip(yield.getOperands(), ntys)) {
+      if (v.getType() == nty) {
+        yops.push_back(v);
+        continue;
+      }
+      // The cast goes beside its producer, not at the yield: stranded after
+      // the child loops it would reify as a span of its own and spend a
+      // region boundary on pure wiring.
+      if (Operation *def = v.getDefiningOp(); def && def->getBlock() == body)
+        rewriter.setInsertionPointAfter(def);
+      else
+        rewriter.setInsertionPointToStart(body);
+      yops.push_back(resize(v, nty));
+    }
+    rewriter.modifyOpInPlace(yield, [&] { yield->setOperands(yops); });
+    rewriter.setInsertionPointAfter(nw);
+    SmallVector<Value> results;
+    for (auto [k, r] : llvm::enumerate(nw.getResults()))
+      results.push_back(resize(r, fo.getResult(k).getType()));
+    rewriter.replaceOp(fo, results);
     return success();
   }
 };
@@ -468,7 +734,7 @@ struct NarrowDemandedBitsPass
     MLIRContext *ctx = &getContext();
     RewritePatternSet patterns(ctx);
     patterns.add<SinkTruncThroughRingOp, DropRedundantMask, NarrowFromHull,
-                 MaskToTrunc, FoldCastThroughIndex>(ctx);
+                 NarrowIterArgs, MaskToTrunc, FoldCastThroughIndex>(ctx);
     // The cast folds are what make the rewrite chain: without them a sunk
     // truncation stops on top of an extend instead of collapsing into it.
     arith::TruncIOp::getCanonicalizationPatterns(patterns, ctx);

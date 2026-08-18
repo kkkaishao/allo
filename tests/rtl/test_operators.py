@@ -6,6 +6,7 @@
 import collections
 import math
 import os
+import re
 import shutil
 import sys
 
@@ -1829,6 +1830,51 @@ def test_narrow_demanded_bits_wraps_exactly():
     # clock's period on this part.
     r = _to_rtl(dot, freq_mhz=200).cosim(x, y)
     assert int(r.result) == wrapped
+
+
+# A loop-carried integer scalar spans its recurrence envelope, not its
+# declared carrier: a guarded counter stepping by 2 over 50 trips stays within
+# [0, 100], an argmax-style position within the IV's range. The survivor
+# register and the whole carried cone are built at that width, while a
+# data-stepped accumulator (its increment loaded from memory) has no envelope
+# and keeps the carrier.
+def test_a_carried_scalar_narrows_to_its_recurrence_envelope():
+    N = 50
+
+    @kernel
+    def track(A: i32[N], out: i32[3]):
+        t: i32 = 0
+        idx: i32 = 0
+        s: i32 = 0
+        for i in range(N):
+            if A[i] > 0:
+                t = t + 2
+                idx = i
+            s = s + A[i]
+        out[0] = t
+        out[1] = idx
+        out[2] = s
+
+    rtl = _to_rtl(track)
+    m = rtl.mlir
+    widths = {
+        name: width
+        for name, width in re.findall(
+            r"%(r\d+_sv\d+) = seq\.compreg[^\n]*: (i\d+)", m
+        )
+    }
+    svw = sorted(widths.values())
+    # t rides [0, 100] (i8), idx [0, 49] (i7); the data-stepped s keeps i32.
+    assert svw == ["i32", "i7", "i8"], widths
+
+    rng = np.random.default_rng(3)
+    A = rng.integers(-40, 40, size=N).astype(np.int32)
+    out = np.zeros(3, np.int32)
+    rtl.cosim(A, out)
+    taken = A > 0
+    assert out[0] == 2 * int(taken.sum())
+    assert out[1] == int(np.max(np.where(taken)[0]))
+    assert out[2] == int(A.sum())
 
 
 def test_int_product_reduction_cosim():
