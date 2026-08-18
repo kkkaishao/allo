@@ -354,9 +354,9 @@ static std::optional<uint64_t> unsignedBound(Value v, unsigned depth = 0) {
 
 /// Bits of the dividend's proven range, capped at \p cap bits.
 static unsigned boundWidth(Value n, unsigned cap) {
-  uint64_t bound = std::min<uint64_t>(
-      unsignedBound(n).value_or(UINT64_MAX),
-      cap >= 64 ? UINT64_MAX : (uint64_t(1) << cap) - 1);
+  uint64_t bound =
+      std::min<uint64_t>(unsignedBound(n).value_or(UINT64_MAX),
+                         cap >= 64 ? UINT64_MAX : (uint64_t(1) << cap) - 1);
   return bound ? llvm::Log2_64(bound) + 1 : 1;
 }
 
@@ -531,8 +531,7 @@ static Value mulByConst(PatternRewriter &rewriter, Location loc, Value x,
   unsigned w = ty.isIndex() ? 64 : cast<IntegerType>(ty).getWidth();
   if (auto digits = nafDigits(APInt(w, d)))
     return nafBuild(rewriter, loc, x, *digits, ty);
-  return arith::MulIOp::create(rewriter, loc, x,
-                               konstOf(rewriter, loc, ty, d));
+  return arith::MulIOp::create(rewriter, loc, x, konstOf(rewriter, loc, ty, d));
 }
 
 /// `(n * magic) >> shift` at the product's width, `2w+1` bits. Only called
@@ -565,13 +564,13 @@ static Value remainderFrom(PatternRewriter &rewriter, Location loc, Value n,
 static Value signedMagicQuotient(PatternRewriter &rewriter, Location loc,
                                  Value n, const MagicPlan &p, Type type) {
   Value zero = konstOf(rewriter, loc, type, 0);
-  Value isNeg = arith::CmpIOp::create(rewriter, loc,
-                                      arith::CmpIPredicate::slt, n, zero);
+  Value isNeg =
+      arith::CmpIOp::create(rewriter, loc, arith::CmpIPredicate::slt, n, zero);
   Value neg = arith::SubIOp::create(rewriter, loc, zero, n);
   Value mag = arith::SelectOp::create(rewriter, loc, isNeg, neg, n);
-  Value qa = resizeToType(
-      rewriter, loc, magicQuotient(rewriter, loc, mag, p.divisor, p.width),
-      type);
+  Value qa =
+      resizeToType(rewriter, loc,
+                   magicQuotient(rewriter, loc, mag, p.divisor, p.width), type);
   Value qneg = arith::SubIOp::create(rewriter, loc, zero, qa);
   return arith::SelectOp::create(rewriter, loc, isNeg, qneg, qa);
 }
@@ -584,8 +583,8 @@ static Value signedMagicQuotient(PatternRewriter &rewriter, Location loc,
 //===----------------------------------------------------------------------===//
 
 /// The unsigned quotient at width `p.width`, returned in that width.
-static Value ipMagicQuotientU(PatternRewriter &rewriter, Location loc,
-                              Value n0, const MagicPlan &p) {
+static Value ipMagicQuotientU(PatternRewriter &rewriter, Location loc, Value n0,
+                              const MagicPlan &p) {
   unsigned w = p.width;
   auto info = llvm::UnsignedDivisionByConstantInfo::get(APInt(w, p.divisor));
   Type nty = rewriter.getIntegerType(w);
@@ -615,15 +614,15 @@ static Value ipMagicQuotientU(PatternRewriter &rewriter, Location loc,
       arith::ShRUIOp::create(rewriter, loc, diff,
                              konstOf(rewriter, loc, nty, 1)),
       t);
-  return arith::ShRUIOp::create(
-      rewriter, loc, sum, konstOf(rewriter, loc, nty, info.PostShift));
+  return arith::ShRUIOp::create(rewriter, loc, sum,
+                                konstOf(rewriter, loc, nty, info.PostShift));
 }
 
 /// The signed quotient at the op's own integer type, `p.width` wide: mulhs,
 /// the add-back where the magic is negative, and the final round toward zero
 /// off the quotient's own sign. `INT_MIN` needs no carve-out here.
-static Value ipMagicQuotientS(PatternRewriter &rewriter, Location loc,
-                              Value n, const MagicPlan &p) {
+static Value ipMagicQuotientS(PatternRewriter &rewriter, Location loc, Value n,
+                              const MagicPlan &p) {
   unsigned w = p.width;
   assert(n.getType() == rewriter.getIntegerType(w) &&
          "the signed form runs at the type width; index went through i32");
@@ -640,8 +639,8 @@ static Value ipMagicQuotientS(PatternRewriter &rewriter, Location loc,
   if (info.Magic.isNegative())
     q = arith::AddIOp::create(rewriter, loc, q, n);
   if (info.ShiftAmount)
-    q = arith::ShRSIOp::create(
-        rewriter, loc, q, konstOf(rewriter, loc, nty, info.ShiftAmount));
+    q = arith::ShRSIOp::create(rewriter, loc, q,
+                               konstOf(rewriter, loc, nty, info.ShiftAmount));
   return arith::AddIOp::create(
       rewriter, loc, q,
       arith::ShRUIOp::create(rewriter, loc, q,
@@ -722,8 +721,7 @@ struct MagicDivSI : MagicBase<arith::DivSIOp> {
     }
     Value q;
     if (p->nonneg)
-      q = resizeToType(rewriter, loc,
-                       quotientU(rewriter, loc, op.getLhs(), *p),
+      q = resizeToType(rewriter, loc, quotientU(rewriter, loc, op.getLhs(), *p),
                        op.getType());
     else if (p->viaIp)
       q = ipMagicQuotientS(rewriter, loc, op.getLhs(), *p);
@@ -755,10 +753,9 @@ struct MagicRemSI : MagicBase<arith::RemSIOp> {
     }
     // n - (n divsi d) * d at the full width: the sign follows the dividend,
     // and the product never exceeds it, so nothing wraps.
-    Value q = p->viaIp
-                  ? ipMagicQuotientS(rewriter, loc, op.getLhs(), *p)
-                  : signedMagicQuotient(rewriter, loc, op.getLhs(), *p,
-                                        op.getType());
+    Value q = p->viaIp ? ipMagicQuotientS(rewriter, loc, op.getLhs(), *p)
+                       : signedMagicQuotient(rewriter, loc, op.getLhs(), *p,
+                                             op.getType());
     Value qd = mulByConst(rewriter, loc, q, p->divisor, op.getType());
     rewriter.replaceOpWithNewOp<arith::SubIOp>(op, op.getLhs(), qd);
     return success();
@@ -772,9 +769,8 @@ struct MagicRemSI : MagicBase<arith::RemSIOp> {
 struct IndexDivToTyped : RewritePattern {
   IndexDivToTyped(MLIRContext *ctx, bool expand, unsigned maxMulWidth,
                   unsigned maxIpMulWidth)
-      : RewritePattern(MatchAnyOpTypeTag(), /*benefit=*/1, ctx),
-        expand(expand), maxMulWidth(maxMulWidth),
-        maxIpMulWidth(maxIpMulWidth) {}
+      : RewritePattern(MatchAnyOpTypeTag(), /*benefit=*/1, ctx), expand(expand),
+        maxMulWidth(maxMulWidth), maxIpMulWidth(maxIpMulWidth) {}
   bool expand;
   unsigned maxMulWidth;
   unsigned maxIpMulWidth;
@@ -804,10 +800,10 @@ struct IndexDivToTyped : RewritePattern {
     Value r = rewriter.create(state)->getResult(0);
     Type ity = op->getResult(0).getType();
     rewriter.replaceOp(
-        op, isSigned
-                ? arith::IndexCastOp::create(rewriter, loc, ity, r).getResult()
-                : arith::IndexCastUIOp::create(rewriter, loc, ity, r)
-                      .getResult());
+        op,
+        isSigned
+            ? arith::IndexCastOp::create(rewriter, loc, ity, r).getResult()
+            : arith::IndexCastUIOp::create(rewriter, loc, ity, r).getResult());
     return success();
   }
 };
@@ -832,9 +828,8 @@ static bool widensToDivRow(Operation *op, const OperatorLibrary &lib) {
 struct WidenDivToRow : RewritePattern {
   WidenDivToRow(MLIRContext *ctx, bool expand, unsigned maxMulWidth,
                 unsigned maxIpMulWidth, const OperatorLibrary &lib)
-      : RewritePattern(MatchAnyOpTypeTag(), /*benefit=*/1, ctx),
-        expand(expand), maxMulWidth(maxMulWidth),
-        maxIpMulWidth(maxIpMulWidth), lib(lib) {}
+      : RewritePattern(MatchAnyOpTypeTag(), /*benefit=*/1, ctx), expand(expand),
+        maxMulWidth(maxMulWidth), maxIpMulWidth(maxIpMulWidth), lib(lib) {}
   bool expand;
   unsigned maxMulWidth;
   unsigned maxIpMulWidth;
@@ -864,8 +859,8 @@ struct WidenDivToRow : RewritePattern {
     state.addOperands({grow(op->getOperand(0)), grow(op->getOperand(1))});
     state.addTypes(wide);
     Value r = rewriter.create(state)->getResult(0);
-    rewriter.replaceOpWithNewOp<arith::TruncIOp>(
-        op, op->getResult(0).getType(), r);
+    rewriter.replaceOpWithNewOp<arith::TruncIOp>(op, op->getResult(0).getType(),
+                                                 r);
     return success();
   }
 };
@@ -889,15 +884,14 @@ static std::optional<TypedAttr> constantTableElement(affine::AffineLoadOp op) {
     APInt cst;
     if (!matchPattern(idx, m_ConstantInt(&cst)))
       return std::nullopt;
-    operands.push_back(IntegerAttr::get(IndexType::get(op.getContext()),
-                                        cst.getSExtValue()));
+    operands.push_back(
+        IntegerAttr::get(IndexType::get(op.getContext()), cst.getSExtValue()));
   }
   SmallVector<Attribute> indices;
   if (failed(op.getAffineMap().constantFold(operands, indices)))
     return std::nullopt;
   int64_t flat = 0;
-  for (auto [attr, dim] :
-       llvm::zip(indices, op.getMemRefType().getShape())) {
+  for (auto [attr, dim] : llvm::zip(indices, op.getMemRefType().getShape())) {
     int64_t i = cast<IntegerAttr>(attr).getInt();
     if (i < 0 || i >= dim)
       return std::nullopt;
@@ -935,10 +929,97 @@ struct NafConstMul : OpRewritePattern<arith::MulIOp> {
     std::optional<SmallVector<NafDigit, 5>> digits = nafDigits(cst);
     if (!digits)
       return failure();
-    rewriter.replaceOp(
-        op, nafBuild(rewriter, op.getLoc(), op.getLhs(), *digits,
-                     op.getType()));
+    rewriter.replaceOp(op, nafBuild(rewriter, op.getLoc(), op.getLhs(), *digits,
+                                    op.getType()));
     return success();
+  }
+};
+
+// Whether \p v is, transitively through adds, a sum already holding a
+// product: the sibling leaf of a reduction tree, or the running sum of an
+// unrolled accumulation. Such an addend arrives a core's depth after the
+// multiply could issue, so fusing over it serializes at the row's latency per
+// link where the plain adders chained inside one period (the bed priced that
+// at +19..65% latency). Past the walk's depth it stays conservative.
+static bool sumsProducts(Value v, unsigned depth = 8) {
+  Operation *d = v.getDefiningOp();
+  if (!d)
+    return false;
+  if (isa<arith::MulIOp, MulAddOp>(d))
+    return true;
+  if (depth == 0)
+    return true;
+  if (auto add = dyn_cast<arith::AddIOp>(d))
+    return sumsProducts(add.getLhs(), depth - 1) ||
+           sumsProducts(add.getRhs(), depth - 1);
+  return false;
+}
+
+// Fusing must not put the core's latency on a recurrence: an accumulation
+// (`acc += a * b`) would come round at the row's depth per turn instead of an
+// adder's. Three local shapes cover the reductions as `reassociate-reductions`
+// leaves them: an operand the enclosing loop carries, a result yielded to it,
+// and a depth-1 memory accumulation, a store of the result over a load an
+// operand made.
+static bool onRecurrence(arith::AddIOp op, arith::MulIOp mul, Value addend) {
+  auto carried = [](Value v) {
+    auto arg = dyn_cast<BlockArgument>(v);
+    return arg && isa<affine::AffineForOp>(arg.getOwner()->getParentOp()) &&
+           arg.getArgNumber() > 0; // arg 0 is the induction variable
+  };
+  if (carried(addend) || carried(mul.getLhs()) || carried(mul.getRhs()))
+    return true;
+  SmallVector<Value, 3> loaded;
+  for (Value v : {addend, mul.getLhs(), mul.getRhs()})
+    if (auto ld = v.getDefiningOp<affine::AffineLoadOp>())
+      loaded.push_back(ld.getMemRef());
+  return llvm::any_of(op->getUsers(), [&](Operation *u) {
+    if (u->hasTrait<OpTrait::IsTerminator>())
+      return true;
+    auto st = dyn_cast<affine::AffineStoreOp>(u);
+    return st && llvm::is_contained(loaded, st.getMemRef());
+  });
+}
+
+// A multiply feeding one add becomes the device's fused core: the pair is
+// `(a * b + c) mod 2^N`, which `allo.muladd` names, and the multiply-to-add
+// hop then stays inside the core instead of crossing the fabric. Minted only
+// where an advanced `muladd` row declares this exact signature; a constant
+// factor is left to `NafConstMul`, whose shift-add expansion is cheaper.
+struct FuseMulAdd : OpRewritePattern<arith::AddIOp> {
+  FuseMulAdd(MLIRContext *ctx, OperatorLibrary &lib)
+      : OpRewritePattern(ctx), lib(lib) {}
+  OperatorLibrary &lib;
+  LogicalResult matchAndRewrite(arith::AddIOp op,
+                                PatternRewriter &rewriter) const override {
+    auto ity = dyn_cast<IntegerType>(op.getType());
+    if (!ity)
+      return failure();
+    for (bool mulOnLhs : {true, false}) {
+      Value mv = mulOnLhs ? op.getLhs() : op.getRhs();
+      Value addend = mulOnLhs ? op.getRhs() : op.getLhs();
+      auto mul = mv.getDefiningOp<arith::MulIOp>();
+      if (!mul || !mul->hasOneUse())
+        continue;
+      APInt cst;
+      if (matchPattern(mul.getLhs(), m_ConstantInt(&cst)) ||
+          matchPattern(mul.getRhs(), m_ConstantInt(&cst)))
+        continue;
+      // A serial chain's late value feeds the MULTIPLY side and costs
+      // nothing; an addend that already sums products would stall the core
+      // (see `sumsProducts`).
+      if (sumsProducts(addend))
+        continue;
+      Type args[] = {ity, ity, ity};
+      Type ress[] = {ity};
+      if (!lib.hasAdvancedRow("muladd", args, ress) ||
+          onRecurrence(op, mul, addend))
+        continue;
+      rewriter.replaceOpWithNewOp<MulAddOp>(op, mul.getLhs(), mul.getRhs(),
+                                            addend);
+      return success();
+    }
+    return failure();
   }
 };
 
@@ -980,6 +1061,16 @@ struct LegalizeArithPass
     if (failed(applyPatternsGreedily(module, std::move(folds))))
       return signalPassFailure();
 
+    // Fusion runs after the folds settle, never beside them: a multiply whose
+    // factor is still a foldable table read would fuse onto a DSP core where
+    // the fold plus NAF build cheaper constant shift-adds.
+    if (expandConstArith) {
+      RewritePatternSet fuse(&getContext());
+      fuse.add<FuseMulAdd>(&getContext(), lib);
+      if (failed(applyPatternsGreedily(module, std::move(fuse))))
+        return signalPassFailure();
+    }
+
     // Reuse the upstream expansion patterns
     RewritePatternSet patterns(&getContext());
     arith::populateArithExpandOpsPatterns(patterns);
@@ -1017,8 +1108,7 @@ struct LegalizeArithPass
     target.addDynamicallyLegalOp<arith::DivUIOp, arith::RemUIOp>(
         [expand, maxMulWidth, maxIpMulWidth, &lib](Operation *op) {
           if (powerOfTwoDivisor(op->getOperand(1)) ||
-              op->getResult(0).getType().isIndex() ||
-              widensToDivRow(op, lib))
+              op->getResult(0).getType().isIndex() || widensToDivRow(op, lib))
             return false;
           return !(expand && magicPlan(op, /*isSigned=*/false, maxMulWidth,
                                        maxIpMulWidth));
@@ -1026,8 +1116,7 @@ struct LegalizeArithPass
     target.addDynamicallyLegalOp<arith::DivSIOp, arith::RemSIOp>(
         [expand, maxMulWidth, maxIpMulWidth, &lib](Operation *op) {
           if (powerOfTwoDivisor(op->getOperand(1)) ||
-              op->getResult(0).getType().isIndex() ||
-              widensToDivRow(op, lib))
+              op->getResult(0).getType().isIndex() || widensToDivRow(op, lib))
             return false;
           return !(expand && magicPlan(op, /*isSigned=*/true, maxMulWidth,
                                        maxIpMulWidth));

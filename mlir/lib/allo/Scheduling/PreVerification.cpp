@@ -51,7 +51,7 @@ static bool isComputeOp(Operation *op) {
 // model it.
 static bool isPricedOp(Operation *op) {
   return isa<arith::ArithDialect, math::MathDialect>(op->getDialect()) ||
-         isa<affine::AffineApplyOp>(op);
+         isa<affine::AffineApplyOp, MulAddOp>(op);
 }
 
 namespace {
@@ -1015,8 +1015,8 @@ static void reportAddressCost(func::FuncOp funcOp, const DeviceModel &dev) {
   debug(Stage::Prep) << "Address arithmetic in " << funcOp.getSymName().str()
                      << ": " << nonTrivial << "/" << total
                      << " array accesses cost logic, worst "
-                     << llvm::format("%.2f", worstNow) << " ns ("
-                     << withDivider << " carrying a divider, " << banked
+                     << llvm::format("%.2f", worstNow) << " ns (" << withDivider
+                     << " carrying a divider, " << banked
                      << " decoding a bank at runtime)";
 }
 

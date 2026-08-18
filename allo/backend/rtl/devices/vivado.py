@@ -13,6 +13,7 @@ sees its vocabulary.
 
 from __future__ import annotations
 
+import re
 from typing import NamedTuple
 
 from ....lang.ip import OperatorIP
@@ -38,7 +39,11 @@ class VivadoCore(NamedTuple):
     constant comes from the predicate instead.
     """
 
-    core: str  # `create_ip -name`: floating_point / mult_gen / div_gen
+    # `create_ip -name`: floating_point / mult_gen / div_gen; or `rtl`, which
+    # generates no core at all: the shim computes `shape` (an SV expression
+    # over the data ports) behind the row's latency, and synthesis infers the
+    # DSPs, which is the only Vivado build of a fused multiply-add.
+    core: str
     shape: str  # `Key=Value` pairs, comma separated
     no_dsp: str = ""  # DSP-free fragment, empty where the core has no such knob
     operation: str = ""  # operation-channel constant, as binary tdata bits
@@ -170,6 +175,11 @@ for _w in (8, 16, 32, 64):
         RECIPES[_a] = _div(_w, "Unsigned" if _a.optype.endswith("ui") else "Signed")
 
 del _a, _mul, _stem, _w
+
+# The fused multiply-add has no LogiCORE: `mult_gen` offers no post-adder and
+# `xbip_dsp48_macro` is a single slice, too narrow for a 32-bit product. The
+# `rtl` build lets synthesis infer the DSP cascade with the addend absorbed.
+RECIPES[ip.imuladd32] = VivadoCore("rtl", "a * b + c")
 
 # The narrow core under `imulw33`'s 64-bit signature: the 33x33 product's low
 # 64 bits, which the shim feeds the extended operands' low 33 bits.
@@ -324,6 +334,43 @@ def _div_shim(op: Operator, arche: OperatorIP) -> str:
     )
 
 
+def _rtl_shim(op: Operator, arche: OperatorIP, expr: str) -> str:
+    """An ``rtl`` recipe's whole build, for the one shape it carries today,
+    ``x * y + z`` over the data ports: an input stage, the product staged on
+    registers of its own (which is what synthesis pipelines the DSP cascade
+    with; a product summed before its first register keeps the whole cascade
+    in one cycle), the addend delayed alongside, and the add as the last
+    stage, where the final slice's ALU absorbs it."""
+    m = re.fullmatch(r"(\w+) \* (\w+) \+ (\w+)", expr)
+    assert m, "an rtl recipe builds `x * y + z` today"
+    x, y, z = m.groups()
+    data, clk, ce, out = _split(op)
+    w = out.width
+    lat = arche.timing.latency
+    assert lat >= 3, "the staged product needs input, product and add stages"
+    widths = {p.name: p.width for p in data}
+    regs = [f"  reg [{widths[n] - 1}:0] {n}_q;" for n in (x, y)]
+    shifts = [f"      {n}_q <= {n};" for n in (x, y)]
+    prod, addend = "m0", f"{z}"
+    regs.append(f"  reg [{w - 1}:0] m0;")
+    shifts.append(f"      m0 <= {x}_q * {y}_q;")
+    for k in range(1, lat - 2):
+        regs.append(f"  reg [{w - 1}:0] m{k};")
+        shifts.append(f"      m{k} <= m{k - 1};")
+        prod = f"m{k}"
+    for k in range(lat - 1):
+        regs.append(f"  reg [{widths[z] - 1}:0] {z}_d{k};")
+        shifts.append(f"      {z}_d{k} <= {addend};")
+        addend = f"{z}_d{k}"
+    regs.append(f"  reg [{w - 1}:0] r;")
+    shifts.append(f"      r <= {prod} + {addend};")
+    body = "\n".join(regs) + "\n"
+    body += f"  always @(posedge {clk}) begin\n"
+    body += f"    if ({ce}) begin\n" + "\n".join(shifts) + "\n    end\n"
+    body += f"  end\n  assign {out.name} = r;\n"
+    return f"{_header(op)}{body}endmodule\n"
+
+
 def _ip_tcl(part: str, cores: dict[str, tuple[str, str]]) -> str:
     """One `create_ip` block per core, rooted at the script's own directory so
     the script runs from anywhere; an existing `.xci` is reused."""
@@ -376,6 +423,9 @@ def generate(interfaces: Interfaces, device: Device) -> Generated:
                     f"{op.module}: predicate '{op.predicate}' has no compare opcode"
                 )
                 continue
+            if recipe.core == "rtl":
+                shims[op.module] = _rtl_shim(op, arche, recipe.shape)
+                continue
             no_dsp = bool(recipe.no_dsp) and "dsp" not in dict(
                 device.operator_uses.get(op.impl, ())
             )
@@ -402,5 +452,9 @@ def realize(interfaces: Interfaces, device: Device) -> Realization:
     neutral shape a scaffold writes. Stateless, so a copied device keeps a
     realizer that answers for the copy."""
     g = generate(interfaces, device)
-    files = {"shims.v": g.shims, "gen_ip.tcl": g.ip_tcl} if g.cores else {}
+    files = {}
+    if g.shims:
+        files["shims.v"] = g.shims
+    if g.cores:
+        files["gen_ip.tcl"] = g.ip_tcl
     return Realization(files=files, missing=g.missing)

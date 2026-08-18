@@ -49,16 +49,22 @@ def test_recipes_cover_the_catalog():
 
 def test_every_declared_row_resolves():
     # Every fabric row must reach a recipe whose core family has a base and a
-    # latency knob, so a re-characterization cannot outrun the realizer.
+    # latency knob, so a re-characterization cannot outrun the realizer. An
+    # `rtl` recipe generates no core; its shape is the staged expression.
     for table in _tables():
         for arche, _ in _rows(table):
             recipe = vivado.RECIPES[arche]
+            if recipe.core == "rtl":
+                assert re.fullmatch(r"\w+ \* \w+ \+ \w+", recipe.shape)
+                continue
             assert recipe.core in vivado.CE_BASE
             assert "{lat}" in vivado.LATENCY[recipe.core]
 
 
 def test_config_fragments_are_key_value_pairs():
     for recipe in vivado.RECIPES.values():
+        if recipe.core == "rtl":
+            continue  # no create_ip: the shape is an expression, not CONFIG
         fragments = (
             vivado.CE_BASE[recipe.core],
             recipe.shape,
@@ -168,9 +174,13 @@ def test_generate_builds_the_row_the_area_measured():
 
 
 def test_generate_wraps_integer_cores():
+    # `t` has two consumers, so it keeps the plain multiplier core; the
+    # single-use `x * z` over a ready addend fuses and builds the `rtl` shim.
     @kernel
     def ik(x: i32, z: i32) -> i32:
-        return x * z + x // z + x % z
+        t: i32 = x * x
+        u: i32 = x * z + z
+        return (t + x // z) + (u + x % z) + t
 
     rtl, g = _generate(ik)
     assert g.missing == ()
@@ -178,6 +188,7 @@ def test_generate_wraps_integer_cores():
     div = _shim_of(g, by_stem["divsi"].module)
     rem = _shim_of(g, by_stem["remsi"].module)
     mul = _shim_of(g, by_stem["mul"].module)
+    mad = _shim_of(g, by_stem["muladd"].module)
     # The divider core packs quotient over remainder; each mnemonic slices its
     # own half of the one dout channel.
     for shim in (div, rem):
@@ -186,6 +197,10 @@ def test_generate_wraps_integer_cores():
     assert "assign y = dout[63:32];" in div
     assert "assign y = dout[31:0];" in rem
     assert ".CLK(clk), .CE(ce), .A(a), .B(b), .P(y)" in mul
+    # The fused core is the shim itself: a staged product, the addend delayed
+    # beside it, the add in the last stage, and no generated IP.
+    assert "m0 <= a_q * b_q;" in mad and "r <= m0 + c_d1;" in mad
+    assert "muladd" not in g.ip_tcl
     assert "CONFIG.latency_configuration Manual" in _tcl_of(g, by_stem["divsi"].impl)
     assert "CONFIG.PipeStages" in _tcl_of(g, by_stem["mul"].impl)
 

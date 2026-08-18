@@ -2620,3 +2620,58 @@ def test_an_apply_residue_builds_the_reciprocal():
     out = np.zeros(16, np.int32)
     rtl.cosim(out)
     assert np.array_equal(out, (np.arange(16) * 3 + 2) % 5)
+
+
+# A multiply whose only consumer is one add is the device's fused core where a
+# `muladd` row exists: the pair becomes `allo.muladd` and binds the row, so the
+# multiply-to-add hop never crosses the fabric. A width no row declares stays
+# unfused; so does a multiply with a second consumer, or a constant factor
+# (NAF's territory).
+def test_a_multiply_feeding_one_add_fuses_onto_the_device_row():
+    @kernel
+    def mac(A: i32[16], B: i32[16], C: i32[16], out: i32[16]):
+        for i in range(16):
+            out[i] = A[i] * B[i] + C[i]
+
+    rtl = mac.schedule().export("rtl")
+    assert "muladd_i32_i32_i32_i32_l3" in rtl.mlir
+    # The pair fused whole: no standalone multiplier core remains.
+    assert "mul_i32_i32_i32" not in rtl.mlir
+
+    rng = np.random.default_rng(7)
+    A = rng.integers(-(2**31), 2**31, 16, dtype=np.int32)
+    B = rng.integers(-(2**31), 2**31, 16, dtype=np.int32)
+    C = rng.integers(-(2**31), 2**31, 16, dtype=np.int32)
+    out = np.zeros(16, np.int32)
+    rtl.cosim(A, B, C, out)
+    ref = (A.astype(np.int64) * B.astype(np.int64) + C.astype(np.int64)).astype(
+        np.int32
+    )
+    assert np.array_equal(out, ref)
+
+    @kernel
+    def mac16(A: i16[16], B: i16[16], C: i16[16], out: i16[16]):
+        for i in range(16):
+            out[i] = A[i] * B[i] + C[i]
+
+    @kernel
+    def shared(A: i32[16], B: i32[16], o1: i32[16], o2: i32[16]):
+        for i in range(16):
+            t: i32 = A[i] * B[i]
+            o1[i] = t + A[i]
+            o2[i] = t + B[i]
+
+    @kernel
+    def constf(A: i32[16], out: i32[16]):
+        for i in range(16):
+            out[i] = A[i] * 100 + A[i]
+
+    # A reduction tree's leaf: the addend is the sibling product, which the
+    # fused core would wait a whole multiplier for.
+    @kernel
+    def tree(A: i32[16], B: i32[16], out: i32[16]):
+        for i in range(16):
+            out[i] = A[i] * A[i] + B[i] * B[i]
+
+    for kern in (mac16, shared, constf, tree):
+        assert "muladd" not in kern.schedule().export("rtl").mlir

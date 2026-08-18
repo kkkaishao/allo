@@ -117,6 +117,13 @@ def imul32(a: i32, b: i32) -> i32: ...
 def imul64(a: i64, b: i64) -> i64: ...
 
 
+# A fused multiply-add: `(a * b + c) mod 2^N`, the product's low bits plus the
+# addend, so the multiply-to-add hop never leaves the core. Signedness-
+# transparent like the plain multiply. Matched by `allo.muladd`'s mnemonic.
+@operator_ip(optype="muladd", **_ARCHETYPE)
+def imuladd32(a: i32, b: i32, c: i32) -> i32: ...
+
+
 # A 64-bit product whose operands PROVE narrow: a genuine 33x33 core, its
 # 66-bit product sliced to the low 64, exact modulo 2^64 for operands of at
 # most 33 significant bits, which is what `fed_width` restricts the row to.
@@ -222,6 +229,7 @@ CATALOG = (
     imul32,
     imul64,
     imulw33,
+    imuladd32,
     idiv8,
     idiv16,
     idiv32,

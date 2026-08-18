@@ -306,6 +306,25 @@ def BitSetSliceOp : Allo_Op<"bit.set_slice", [
   }];
 }
 
+def MulAddOp : Allo_Op<"muladd", [
+  Pure, SameOperandsAndResultType
+  ]> {
+  let summary = "A fused integer multiply-add, one device core";
+  let description = [{
+    Computes `(a * b + c) mod 2^N`, the same value as `arith.addi(arith.muli(a,
+    b), c)` at width N, so it is signedness-transparent like `arith.muli`.
+    Minted by `legalize-arith` only where the device declares a matching
+    `muladd` operator row; the multiply-to-add hop then never leaves the core,
+    which is what a fabric's post-adder offers.
+  }];
+  let arguments = (ins SignlessIntegerLike:$a, SignlessIntegerLike:$b,
+                       SignlessIntegerLike:$c);
+  let results = (outs SignlessIntegerLike:$result);
+  let assemblyFormat = [{
+    $a `,` $b `,` $c attr-dict `:` type($result)
+  }];
+}
+
 //===----------------------------------------------------------------------===//
 // Analysis / scheduling hints
 //

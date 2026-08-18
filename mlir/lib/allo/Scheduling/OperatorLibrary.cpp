@@ -244,7 +244,9 @@ bool needsIP(Operation *op) {
   case OpKind::FCastF:
     return true;
   case OpKind::Unknown:
-    return isa<math::MathDialect>(op->getDialect());
+    // `allo.muladd` exists only because a device row matched it, so like a
+    // math op it has no combinational fallback.
+    return isa<math::MathDialect>(op->getDialect()) || isa<MulAddOp>(op);
   default:
     return false;
   }
@@ -438,9 +440,8 @@ unsigned OperatorLibrary::maxPipelinedMulWidth() const {
   unsigned w = 0;
   for (const OperatorEntry &e : entries)
     if (e.kind == OpKind::Mul && !e.comb && e.pipelined &&
-        !e.argTypes.empty() && llvm::all_of(e.argTypes, [](Type t) {
-          return isa<IntegerType>(t);
-        }))
+        !e.argTypes.empty() &&
+        llvm::all_of(e.argTypes, [](Type t) { return isa<IntegerType>(t); }))
       w = std::max(w, cast<IntegerType>(e.argTypes[0]).getWidth());
   return w;
 }
@@ -458,6 +459,17 @@ unsigned OperatorLibrary::smallestAdvancedRowWidth(llvm::StringRef mnem,
       best = ity.getWidth();
   }
   return best;
+}
+
+bool OperatorLibrary::hasAdvancedRow(llvm::StringRef mnem, TypeRange args,
+                                     TypeRange results) const {
+  auto aTys = elementTypes(args);
+  auto rTys = elementTypes(results);
+  return llvm::any_of(advancedEntries, [&](const OperatorEntry &e) {
+    return e.mlirOp == mnem &&
+           ArrayRef<Type>(e.argTypes) == ArrayRef<Type>(aTys) &&
+           ArrayRef<Type>(e.resTypes) == ArrayRef<Type>(rTys);
+  });
 }
 
 double OperatorLibrary::combMarginalDelay(CombOpKindEnum kind,

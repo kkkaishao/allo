@@ -229,6 +229,11 @@ public:
   unsigned smallestAdvancedRowWidth(llvm::StringRef mnem,
                                     unsigned width) const;
 
+  /// Whether an advanced row declares mnemonic \p mnem at exactly \p args ->
+  /// \p results: what a pattern asks before minting an op with that name.
+  bool hasAdvancedRow(llvm::StringRef mnem, TypeRange args,
+                      TypeRange results) const;
+
   /// The same two, for a caller holding a reified realization (a
   /// `dcp.compute`'s `comb_kind`). Falls back to the default row, not to 0.0,
   /// so an `affine.apply` is priced the way it was scheduled. \p width is the
