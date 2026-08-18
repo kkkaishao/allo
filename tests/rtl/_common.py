@@ -30,6 +30,7 @@ FADD = FSUB = _LAT[("add", "float32")]  # floating-point add/sub latency (cycles
 FMUL = _LAT[("mul", "float32")]  # floating-point multiply latency
 FDIV = _LAT[("div", "float32")]  # floating-point divide latency
 IMUL = _LAT[("mul", "int32")]  # 32-bit integer multiply (a DSP core, not comb)
+IMUL64 = _LAT[("mul", "int64")]  # 64-bit integer multiply, the reciprocal's ride
 IDIV = _LAT[("divsi", "int32")]  # 32-bit signed integer divide
 MEM = default_device.storage["lutram"].read_latency  # default read/write
 MEM_URAM = default_device.storage["uram"].read_latency

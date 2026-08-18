@@ -25,7 +25,7 @@ from _common import (  # noqa: E402
     _iis,
     comb_ns,
     comb_step_ns,
-    IDIV,
+    IMUL64,
     REG_NS,
     PERIOD_NS,
 )
@@ -374,14 +374,15 @@ def test_a_symbolic_bound_binds_like_any_other_arithmetic():
     # else.
     _to_rtl(band()).compile()
 
-    # And it is the device's own divider core that carries it, which is what
-    # says the bound's arithmetic is bound like any other integer arithmetic
-    # rather than left as an unrealizable index cone: the region holding it is
-    # at least as deep as that core is long.
+    # And it is a device core that carries it, which is what says the bound's
+    # arithmetic is bound like any other integer arithmetic rather than left
+    # as an unrealizable index cone: the constant divide expands to its
+    # reciprocal, whose product rides the pipelined multiplier, and the region
+    # holding it is at least as deep as that core is long.
     res = _sched(band())
-    assert any(im.startswith("divsi_i32") for im in _impls(res))
+    assert any(im.startswith("mul_i64") for im in _impls(res))
     spans = [r for r in res.regions() if r.kind == "acyclic" and r.ops]
-    assert max(r.last_t() for r in spans) >= IDIV
+    assert max(r.last_t() for r in spans) >= IMUL64
 
 
 def test_a_sequential_whiles_condition_is_cut_like_any_other_chain():

@@ -2237,9 +2237,10 @@ def test_a_constant_index_division_is_a_reciprocal_multiply():
     assert np.array_equal(rem, np.arange(180) % 18)
 
 
-# A typed constant division expands to the reciprocal only where its product
-# multiply fits the clock; a full-width dividend keeps the divider IP. The
-# signed form carries the sign around the magnitude, preserving `//`'s
+# A typed constant division always expands to the reciprocal: a narrow
+# dividend's product multiply fits the clock combinationally, a full-width
+# one rides the pipelined multiplier core, and only a dividend too wide for
+# the widest such core keeps the divider IP. The signed forms preserve `//`'s
 # truncation toward zero, INT_MIN included.
 def test_a_typed_constant_division_expands_where_the_multiply_fits():
     @kernel
@@ -2264,17 +2265,52 @@ def test_a_typed_constant_division_expands_where_the_multiply_fits():
     assert np.array_equal(q, np.trunc(A / 3).astype(np.int8))
     assert np.array_equal(r, (A - np.trunc(A / 5) * 5).astype(np.int8))
 
+    # `// 18` strips its even factor before the reciprocal; `// 7` unsigned is
+    # the overflowed-magic form with the add fixup; `// 7` signed rounds toward
+    # zero off the quotient's own sign.
     @kernel
-    def wide(A: u32[8], out: u32[8]):
+    def wide(A: u32[8], q: u32[8], u: u32[8], B: i32[8], s: i32[8], r: i32[8]):
         for i in range(8):
-            out[i] = A[i] // 18
+            q[i] = A[i] // 18
+            u[i] = A[i] // 7
+            s[i] = B[i] // 7
+            r[i] = B[i] % 7
 
     rtl = _to_rtl(wide)
     rtl.schedule()
     rtl.compile()
+    impls = [
+        op.impl for iface in rtl.interfaces.values() for op in iface.operators
+    ]
+    assert impls and all(im.startswith("mul_i64") for im in impls)
+    A = np.array(
+        [0, 1, 17, 18, 4294967295, 4294967294, 2147483647, 12345], np.uint32
+    )
+    B = np.array(
+        [-2147483648, 2147483647, -7, 7, -1, 1, 0, -123456789], np.int32
+    )
+    q = np.zeros(8, np.uint32)
+    u = np.zeros(8, np.uint32)
+    s = np.zeros(8, np.int32)
+    r = np.zeros(8, np.int32)
+    rtl.cosim(A.copy(), q, u, B.copy(), s, r)
+    assert np.array_equal(q, A // 18)
+    assert np.array_equal(u, A // 7)
+    truncated = np.trunc(B / 7).astype(np.int32)
+    assert np.array_equal(s, truncated)
+    assert np.array_equal(r, B - truncated * 7)
+
+    @kernel
+    def past_the_row(A: i64[8], out: i64[8]):
+        for i in range(8):
+            out[i] = A[i] // 3
+
+    rtl = _to_rtl(past_the_row)
+    rtl.schedule()
+    rtl.compile()
     assert [
         op.impl for iface in rtl.interfaces.values() for op in iface.operators
-    ] == ["divui_u32_u32_u32_l16"]
+    ] == ["divsi_i64_i64_i64_l68"]
 
 
 # A constant table read at literal indices folds to the element it names, and

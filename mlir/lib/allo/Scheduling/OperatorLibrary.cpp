@@ -409,6 +409,17 @@ std::optional<double> OperatorLibrary::measuredCombDelay(OpKind kind,
   return *e->delay.evaluate(width);
 }
 
+unsigned OperatorLibrary::maxPipelinedMulWidth() const {
+  unsigned w = 0;
+  for (const OperatorEntry &e : entries)
+    if (e.kind == OpKind::Mul && !e.comb && e.pipelined &&
+        !e.argTypes.empty() && llvm::all_of(e.argTypes, [](Type t) {
+          return isa<IntegerType>(t);
+        }))
+      w = std::max(w, cast<IntegerType>(e.argTypes[0]).getWidth());
+  return w;
+}
+
 double OperatorLibrary::combMarginalDelay(CombOpKindEnum kind,
                                           int64_t width) const {
   return std::max(0.0, combDelay(kind, width) - regFloor);

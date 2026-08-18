@@ -216,6 +216,11 @@ public:
   /// candidate widths rather than pricing a scheduled structure.
   std::optional<double> measuredCombDelay(OpKind kind, int64_t width) const;
 
+  /// The widest integer multiplier the device offers as a pipelined IP row:
+  /// the width up to which a reciprocal's product can ride registered stages
+  /// instead of a combinational multiply. 0 with no such row.
+  unsigned maxPipelinedMulWidth() const;
+
   /// The same two, for a caller holding a reified realization (a
   /// `dcp.compute`'s `comb_kind`). Falls back to the default row, not to 0.0,
   /// so an `affine.apply` is priced the way it was scheduled. \p width is the
